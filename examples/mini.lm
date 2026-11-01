@@ -1,0 +1,344 @@
+// mini.lm: a register-based VM for a small Lua-like language.
+//
+// Illustrative: Loimi isn't implemented yet. This is meant to show how the
+// features in docs/language.md fit together in one realistic interpreter.
+//
+//   function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end
+//   print(fib(30))
+
+import std.gc.{Gc, Heap};
+import std.obj.{Shape, ShapeId};
+import std.text.{Str, Symbol, Interner};
+import std.collections.HashMap;
+import std.rt.{ValueStack, FrameStack, Window, Cursor};
+import std.bc;
+import std.diag.Diagnostics;
+
+#![heap = std.gc.MarkSweep]
+
+// ─── Values ──────────────────────────────────────────────────────────────
+
+value Value repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    Str(Gc<Str>),
+    Obj(Gc<Object>),
+    Fn(Gc<Proto>),
+    Native(Gc<NativeFn>),
+}
+
+object Object {
+    shape: Gc<Shape>,
+    slots: [Value],              // trailing variable-length slots
+}
+
+object Proto {
+    code: bc.Code<Mini>,         // verified code, with inline caches
+    consts: []Value,
+    nregs: u8,
+    nparams: u8,
+    name: Gc<Str>,
+    lines: bc.LineTable,
+    handlers: bc.ExceptionTable,
+}
+
+object NativeFn {
+    name: Gc<Str>,
+    f: fn(*Interp, []Value) -> Result<Value, Value> uses reenter,
+}
+
+// ─── Interpreter context (cold state; one register points at it) ────────
+
+struct Frame {
+    ret_pc: Cursor<u32>,
+    regs: Window<Value>,
+    k: *const Value,
+    proto: Gc<Proto>,
+    ret_reg: u8,                 // caller register that receives the result
+}
+
+struct Interp {
+    heap: Heap,
+    strings: Interner,
+    stack: ValueStack<Value>,    // reserved address space; never moves
+    frames: FrameStack<Frame>,
+    proto: Gc<Proto>,            // currently executing function
+    globals: HashMap<Symbol, Value>,
+    root_shape: Gc<Shape>,
+    sync: Mini.Sync,             // pc/top written here at effectful calls
+}
+
+enum Arith { Add, Sub, Mul }
+enum Cond { Lt, Le, Eq }
+
+// ─── Slow paths (ordinary functions with declared effects) ──────────────
+
+fn error(ctx: *Interp, msg: str) -> Value uses gc {
+    Str(ctx.heap.new_str(fmt!("{}: {}", ctx.current_line(), msg)))   // current_line reads ctx.sync
+}
+
+fn arith_slow(ctx: *Interp, op: Arith, a: Value, b: Value) -> Result<Value, Value> uses gc {
+    let (x, y) = match (to_f64(a), to_f64(b)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => return Err(error(ctx, fmt!("attempt to perform arithmetic on {}", type_name(a, b)))),
+    };
+    // Int overflow lands here too: Lua 5.4 wraps, but this language promotes to float.
+    Ok(Num(op.float(x, y)))
+}
+
+fn compare_slow(ctx: *Interp, cc: Cond, a: Value, b: Value) -> Result<bool, Value> uses gc {
+    match (a, b, cc) {
+        (_, _, .Eq) => Ok(raw_equal(a, b)),
+        (Str(x), Str(y), _) => Ok(cc.apply_ord(x.bytes().cmp(y.bytes()))),
+        _ => match (to_f64(a), to_f64(b)) {
+            (Some(x), Some(y)) => Ok(cc.apply(x, y)),
+            _ => Err(error(ctx, "attempt to compare incompatible values")),
+        },
+    }
+}
+
+// ─── The VM ──────────────────────────────────────────────────────────────
+
+#[dispatch(tailcall)]            // override per build: --dispatch=goto|switch
+vm Mini {
+    context ctx: *Interp;
+
+    state {
+        pc:   Cursor<u32>,
+        regs: Window<Value>,
+        k:    *const Value,
+    }
+
+    // Read by the verifier and by `verify` clauses: the function being checked.
+    verify_context proto: Gc<Proto>;
+
+    operand reg   = regs[it]  verify it < proto.nregs;
+    operand kst   = k[it]     verify it < proto.consts.len;
+    operand imm   = it;
+    operand label = pc + it   verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+        format sJ   { op: 8, sj: s24 }
+    }
+
+    cache PropIC { shape: ShapeId, slot: u32 }
+
+    // ── Loads and moves ──
+
+    op LOADK(dst: reg, c: kst)    : ABx  { dst = c; next }
+    op LOADI(dst: reg, i: imm)    : AsBx { dst = Int(i as i32); next }
+    op LOADNIL(dst: reg)          : ABC  { dst = Nil; next }
+    op MOVE(dst: reg, src: reg)   : ABC  { dst = src; next }
+
+    // ── Arithmetic: one declaration, three ops ──
+
+    inline for (name, aop) in [("ADD", Arith.Add), ("SUB", Arith.Sub), ("MUL", Arith.Mul)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {                                     // one bit test per arm
+                (Int(x), Int(y)) => if let Some(r) = aop.int_checked(x, y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(aop.float(x, y)); next },
+                _ => {},
+            }
+            cold { dst = arith_slow(ctx, aop, a, b)?; next }   // sync inserted automatically
+        }
+    }
+
+    // ── Compare-and-branch ──
+
+    inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] {
+        op #name(a: reg, b: reg, target: label) : ABsC {
+            let taken = match (a, b) {
+                (Int(x), Int(y)) => cc.apply(x, y),
+                (Num(x), Num(y)) => cc.apply(x, y),
+                _ => cold { compare_slow(ctx, cc, a, b)? },
+            };
+            if taken { jump target } else { next }
+        }
+    }
+
+    op JMP(target: label) : sJ { jump target }
+
+    // ── Globals ──
+
+    op GETGLOBAL(dst: reg, name: kst) : ABx {
+        dst = ctx.globals.get(as_sym(name)).unwrap_or(Nil);
+        next
+    }
+    op SETGLOBAL(src: reg, name: kst) : ABx {
+        ctx.globals.insert(as_sym(name), src);  // host memory, not GC heap: no effect
+        next
+    }
+
+    // ── Objects, with quickened property access ──
+
+    op NEWOBJ(dst: reg) : ABC {
+        dst = Obj(ctx.heap.new(Object { shape: ctx.root_shape, slots: [] }));  // inline fast path
+        next
+    }
+
+    family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
+        generic {
+            let Obj(o) = obj else cold { raise error(ctx, "attempt to index a non-object") };
+            let Some(slot) = o.shape.lookup(as_sym(name)) else { dst = Nil; next };
+            cache.shape = o.shape.id;
+            cache.slot = slot;
+            dst = o.slots[slot];
+            become GETPROP_MONO;
+            next
+        }
+        GETPROP_MONO {
+            if let Obj(o) = obj and o.shape.id == cache.shape {
+                dst = unsafe { o.slots.at_unchecked(cache.slot) };  // same shape ⇒ slot in range
+                next
+            }
+            cold { become generic; redo }
+        }
+    }
+
+    op SETPROP(obj: reg, name: kst, src: reg) : ABC {
+        let Obj(o) = obj else cold { raise error(ctx, "attempt to index a non-object") };
+        if let Some(slot) = o.shape.lookup(as_sym(name)) {
+            o.slots[slot] = src;          // barrier inserted per heap policy (none for MarkSweep)
+            next
+        }
+        cold { add_property(ctx, o, as_sym(name), src); next }   // uses gc: shape transition
+    }
+
+    // ── Calls ──
+
+    // R[base] = R[base](R[base+1], ..., R[base+nargs])
+    op CALL(base: reg, nargs: imm) : ABC {
+        match base {
+            Fn(p) => {
+                if nargs != p.nparams { cold { raise error(ctx, "wrong number of arguments") } }
+                let callee = regs.slide(base.raw + 1);
+                if !ctx.stack.fits(callee, p.nregs) { cold { raise error(ctx, "stack overflow") } }
+                ctx.frames.push(Frame { ret_pc: pc.after(), regs, k, proto: ctx.proto, ret_reg: base.raw });
+                ctx.proto = p;
+                regs = callee;
+                k = p.consts.ptr();
+                jump p.code.start()
+            }
+            Native(n) => {
+                // `n.f` uses reenter: the compiler syncs pc/top before the call
+                // and reloads state afterwards.
+                let args = regs.slice(base.raw + 1, nargs);
+                base = (n.f)(ctx, args)?;
+                next
+            }
+            _ => cold { raise error(ctx, "attempt to call a non-function") },
+        }
+    }
+
+    op RETURN(src: reg) : ABC {
+        let v = src;
+        let Some(f) = ctx.frames.pop_guest() else { exit v };   // returning from the entry function
+        restore(f);
+        unsafe { regs.at(f.ret_reg) = v };     // ret_reg came from a verified CALL operand
+        jump pc                                // restore() set pc to the instruction after the CALL
+    }
+
+    fn restore(f: Frame) {
+        pc = f.ret_pc; regs = f.regs; k = f.k; ctx.proto = f.proto;
+    }
+
+    // ── Superinstructions (chosen from `--vm-stats` output) ──
+
+    super LOADK_ADD = LOADK; ADD;
+    super MOVE_RETURN = MOVE; RETURN;
+
+    // ── Entry and error path ──
+
+    entry run(p: Gc<Proto>) {
+        ctx.frames.push_entry_marker();
+        ctx.proto = p;
+        regs = ctx.stack.window_at_top(p.nregs)?;
+        k = p.consts.ptr();
+        jump p.code.start()
+    }
+
+    on raise(err: Value) {
+        loop {
+            if let Some(h) = ctx.proto.handlers.find(pc) {
+                regs[h.reg] = err;
+                jump h.target
+            }
+            let Some(f) = ctx.frames.pop_guest() else { fail err };   // reached the entry marker
+            restore(f);
+        }
+    }
+
+    // ── Instrumentation (no cost unless switched on) ──
+
+    variant count wraps all { before { ctx.stats.ops[op.id] += 1; } }
+    variant trace wraps all { before { eprintln!("{}", Mini.disasm_one(ctx.proto, pc)); } }
+}
+
+fn as_sym(v: Value) -> Symbol {
+    let Str(s) = v else unreachable;   // constants used as names are always interned strings
+    s.sym
+}
+
+// ─── Compiler (abridged): AST → Mini bytecode via the generated builder ─
+
+fn compile_function(ctx: *Interp, f: *ast.Function, d: *Diagnostics) -> ?Gc<Proto> uses gc {
+    var b = Mini.Builder.new(ctx.arena());
+    var scope = std.ast.Scopes.new();
+    for p in f.params { scope.declare(p.name, b.regs.alloc_local()); }
+    compile_block(&b, &scope, f.body, d);
+    b.LOADNIL(b.regs.temp()); b.RETURN(b.regs.last());
+    // Builds code, the constant pool, line and exception tables, runs the
+    // generated peephole pass for `super` ops, then the generated verifier.
+    match b.finish(f.name) {
+        Ok(verified) => Some(ctx.heap.new(Proto.from(verified))),
+        Err(e) => { d.internal(e); None },     // verifier rejections here are compiler bugs
+    }
+}
+
+fn compile_expr(b: *Mini.Builder, s: *Scopes, e: ast.Expr, dst: Reg) {
+    match e {
+        .Int(i) if i.fits_i16() => b.LOADI(dst, i as i16),
+        .Num(x)     => b.LOADK(dst, b.konst(Num(x))),
+        .Local(r)   => if r != dst { b.MOVE(dst, r) },
+        .Binary(op, l, r) => {
+            let t = b.regs.scoped(2);                 // temps freed at end of scope
+            compile_expr(b, s, l, t[0]);
+            compile_expr(b, s, r, t[1]);
+            b.at(e.span);                            // line table entry
+            match op { .Add => b.ADD(dst, t[0], t[1]), .Sub => b.SUB(dst, t[0], t[1]), .Mul => b.MUL(dst, t[0], t[1]) }
+        }
+        ...
+    }
+}
+
+fn compile_while(b: *Mini.Builder, s: *Scopes, w: ast.While) {
+    let top = b.label_here();
+    let exit = b.label();
+    let (x, y) = compile_operands(b, s, w.cond);     // e.g. `i < n`
+    b.JLE(y, x, exit);                               // !(x < y) ⇔ y <= x; falls back to JMP if out of range
+    compile_block(b, s, w.body);
+    b.JMP(top);
+    b.bind(exit);
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────
+
+export "C" fn main(argc: i32, argv: **u8) -> i32 {
+    let args = std.os.args(argc, argv);
+    let Ok(src) = std.io.read_file(args[1]) else { eprintln!("cannot read {}", args[1]); return 1 };
+    var ctx = Interp.new();
+    install_builtins(&ctx);                          // print, len, ...
+    var diags = Diagnostics.new();
+    let Some(chunk) = compile(&ctx, src, &diags) else { diags.render(std.io.stderr()); return 1 };
+    if std.os.env("MINI_TRACE").is_some() { Mini.set_dispatch(&ctx, Mini.tables.trace); }
+    match Mini.run(&ctx, chunk) {
+        Ok(_) => 0,
+        Err(e) => { eprintln!("error: {}", tostring(e)); eprint!("{}", ctx.traceback()); 1 },
+    }
+}

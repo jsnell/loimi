@@ -216,6 +216,9 @@ operand label = pc + it    verify is_insn_boundary(pc + it);
 operand upv   = ctx.closure.upvals[it] verify it < proto.nupvals;
 ```
 
+`verify` clauses may refer to the `verify_context` declared in the vm
+(typically the function prototype being checked, `verify_context proto: Gc<Proto>;`).
+
 If the expression is a place (like `regs[it]`), the operand is assignable:
 `dst = Int(1)` writes the register. `x.raw` gives the undecoded field. The raw
 field's width and signedness come from the format, so one `label` kind serves
@@ -353,7 +356,8 @@ request). The handler's state registers survive the call untouched, so the fast
 path is compiled as if the slow path weren't there. The block can still use
 state and control words: the outlined function returns a small code ("next",
 "jump to X", "raise E") and the handler performs the transfer. Branches into
-cold blocks are weighted as unlikely.
+cold blocks are weighted as unlikely. A `cold` block is also an expression:
+`let ok = match (a, b) { ..., _ => cold { compare_slow(ctx, a, b)? } };`
 
 ---
 
@@ -452,7 +456,7 @@ opcode in place.
 ```loimi
 family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
     generic {
-        let Obj(o) = obj else cold { raise type_error(ctx, "index", obj)? };
+        let Obj(o) = obj else cold { raise type_error(ctx, "index", obj) };
         let Some(slot) = o.shape.lookup(name.as_symbol()) else { dst = Nil; next };
         cache.shape = o.shape.id; cache.slot = slot;
         dst = o.slot(slot);
