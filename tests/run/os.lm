@@ -1,0 +1,12 @@
+// args: 
+import std.io;
+import std.os;
+fn main() {
+    io.print_int(os.arg_count() as i64); io.println("");
+    match io.read_file("/nonexistent/file") { Some(_) => io.println("?"), None => io.println("no file") }
+    let me = io.read_file("tests/run/os.lm").unwrap();
+    io.println(me[0..8]);
+}
+// expect: 1
+// expect: no file
+// expect: // args:

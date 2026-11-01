@@ -1,0 +1,117 @@
+// Strings: building, comparison, parsing, interning.
+
+import std.mem;
+import std.map;
+import std.hash;
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+extern "C" fn strtod(s: *u8, end: **u8) -> f64;
+
+/// A growable byte string.
+pub struct StrBuf { bytes: mem.Vec<u8> }
+
+pub fn StrBuf.new() -> StrBuf { StrBuf { bytes: mem.Vec.new() } }
+
+pub fn StrBuf.push(b: *StrBuf, c: u8) { b.bytes.push(c); }
+
+pub fn StrBuf.push_str(b: *StrBuf, s: str) {
+    b.bytes.reserve(s.len);
+    mem.memcpy(b.bytes.ptr + b.bytes.len, s.ptr, s.len);
+    b.bytes.len += s.len;
+}
+
+pub fn StrBuf.push_int(b: *StrBuf, x: i64) {
+    var buf: [u8; 24] = [0; 24];
+    var i: u64 = 24;
+    var u: u64 = if x < 0 { 0 -% (x as u64) } else { x as u64 };
+    loop {
+        i -= 1;
+        buf[i] = '0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 { break; }
+    }
+    if x < 0 { i -= 1; buf[i] = '-'; }
+    b.push_str(buf[i..24]);
+}
+
+/// Shortest representation that reads back as the same double ("%.17g"
+/// trimmed: tries increasing precision).
+pub fn StrBuf.push_f64(b: *StrBuf, x: f64) {
+    var buf: [u8; 40] = [0; 40];
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 40, "%.*g\0".ptr, prec, x);
+        let back = strtod(&buf[0], 0 as **u8);
+        if back == x or x != x { break; }
+        prec += 1;
+    }
+    b.push_str(buf[0..n as u64]);
+}
+
+pub fn StrBuf.as_str(b: *StrBuf) -> str { b.bytes.items() }
+
+pub fn StrBuf.clear(b: *StrBuf) { b.bytes.clear(); }
+
+pub fn StrBuf.free(b: *StrBuf) { b.bytes.free(); }
+
+pub fn starts_with(s: str, prefix: str) -> bool {
+    s.len >= prefix.len and s[0..prefix.len].eq(prefix)
+}
+
+pub fn find(s: str, c: u8) -> ?u64 {
+    for i in 0..s.len {
+        if s[i] == c { return Some(i); }
+    }
+    None
+}
+
+pub fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
+pub fn is_alpha(c: u8) -> bool { (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' }
+pub fn is_space(c: u8) -> bool { c == ' ' or c == '\t' or c == '\n' or c == '\r' }
+
+/// Parse a decimal integer (optional sign). None on any other character or overflow.
+pub fn parse_int(s: str) -> ?i64 {
+    if s.len == 0 { return None; }
+    var i: u64 = 0;
+    let neg = s[0] == '-';
+    if neg or s[0] == '+' { i = 1; }
+    if i == s.len { return None; }
+    var v: i64 = 0;
+    while i < s.len {
+        let c = s[i];
+        if !is_digit(c) { return None; }
+        v = v.mul_checked(10)?.add_checked((c - '0') as i64)?;
+        i += 1;
+    }
+    Some(if neg { 0 - v } else { v })
+}
+
+/// Parse a floating-point number (C syntax).
+pub fn parse_f64(s: str) -> ?f64 {
+    if s.len == 0 or s.len > 63 { return None; }
+    var buf: [u8; 64] = [0; 64];
+    mem.memcpy(&buf[0], s.ptr, s.len);
+    var end: *u8 = &buf[0];
+    let v = strtod(&buf[0], &end);
+    if (end as u64) - (&buf[0] as u64) != s.len { return None; }
+    Some(v)
+}
+
+/// Interned strings: equal strings get equal ids.
+pub struct Interner { ids: map.HashMap<str, u32>, names: mem.Vec<str>, arena: mem.Arena }
+
+pub fn Interner.new() -> Interner {
+    Interner { ids: map.HashMap.new(), names: mem.Vec.new(), arena: mem.Arena.new() }
+}
+
+pub fn Interner.intern(it: *Interner, s: str) -> u32 {
+    if let Some(id) = it.ids.get(s) { return id; }
+    let owned = it.arena.str(s);
+    let id = it.names.len as u32;
+    it.names.push(owned);
+    it.ids.insert(owned, id);
+    id
+}
+
+pub fn Interner.name(it: *Interner, id: u32) -> str { it.names.at(id as u64) }

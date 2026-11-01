@@ -1573,6 +1573,14 @@ impl<'a> Checker<'a> {
             }
             ExprKind::DotVariant(name) => return self.variant_ctor_expected(cx, name, args, exp, span),
             ExprKind::Field(base, name) => {
+                if let Some(m) = self.module_path(cx, base) {
+                    if let Some((Def::GenericFn(g), is_pub)) = self.scopes[m].get(&name.name).cloned() {
+                        if !is_pub {
+                            return Err(Diag::new(name.span, format!("`{}` is private", name.name)));
+                        }
+                        return self.generic_call(cx, g, vec![], vec![], args, exp, span);
+                    }
+                }
                 if let Some(g) = self.generic_type_path(cx, base) {
                     let inst = self.instance_from_expected(g, exp);
                     if let Some(t) = &inst {
@@ -1943,7 +1951,9 @@ impl<'a> Checker<'a> {
                 t.is_numeric()
                     || matches!(t, Ty::Bool | Ty::Ptr(_) | Ty::Fn(..) | Ty::Value(_))
                     || matches!(&t, Ty::Enum(e) if !self.prog.enums[*e as usize].has_payload())
-                    || matches!(&t, Ty::Option(inner) if inner.is_nullable_ptr())
+                    || matches!(&t, Ty::Option(inner) if inner.is_nullable_ptr() || inner.is_numeric()
+                        || matches!(**inner, Ty::Bool | Ty::Value(_))
+                        || matches!(&**inner, Ty::Enum(e) if !self.prog.enums[*e as usize].has_payload()))
             }
             Lt | Le | Gt | Ge => t.is_numeric() || matches!(t, Ty::Ptr(_)),
             LAnd | LOr => unreachable!(),

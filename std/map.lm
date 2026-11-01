@@ -1,0 +1,105 @@
+// Hash map with open addressing and linear probing. Keys need
+// `k.hash() -> u64` and `k.eq(other) -> bool` methods (see std.hash).
+
+import std.mem;
+import std.hash;
+
+const EMPTY: u8 = 0;
+const FULL: u8 = 1;
+const DELETED: u8 = 2;
+
+pub struct Slot<K, V> { key: K, value: V, state: u8 }
+
+pub struct HashMap<K, V> { slots: *Slot<K, V>, cap: u64, len: u64, used: u64 }
+
+pub fn HashMap<K, V>.new() -> HashMap<K, V> {
+    HashMap { slots: mem.alloc(8), cap: 8, len: 0, used: 0 }
+}
+
+/// Index of `key`, or of the slot where it would be inserted.
+fn HashMap<K, V>.probe(m: *HashMap<K, V>, key: K) -> (u64, bool) {
+    let mask = m.cap - 1;
+    var i = key.hash() & mask;
+    var tomb: ?u64 = None;
+    loop {
+        let s = m.slots + i;
+        if s.state == EMPTY {
+            return (tomb ?? i, false);
+        }
+        if s.state == FULL and s.key.eq(key) {
+            return (i, true);
+        }
+        if s.state == DELETED and tomb.is_none() {
+            tomb = Some(i);
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+fn HashMap<K, V>.grow(m: *HashMap<K, V>) {
+    let old = m.slots;
+    let n = m.cap;
+    m.cap = n * 2;
+    m.slots = mem.alloc(m.cap);
+    m.len = 0;
+    m.used = 0;
+    for i in 0..n {
+        let s = old + i;
+        if s.state == FULL { m.insert(s.key, s.value); }
+    }
+    mem.release(old);
+}
+
+/// Insert or replace. Returns true if the key was new.
+pub fn HashMap<K, V>.insert(m: *HashMap<K, V>, key: K, value: V) -> bool {
+    if (m.used + 1) * 4 > m.cap * 3 { m.grow(); }
+    let (i, found) = m.probe(key);
+    let s = m.slots + i;
+    if found {
+        s.value = value;
+        return false;
+    }
+    if s.state == EMPTY { m.used += 1; }
+    s.key = key;
+    s.value = value;
+    s.state = FULL;
+    m.len += 1;
+    true
+}
+
+pub fn HashMap<K, V>.get(m: *HashMap<K, V>, key: K) -> ?V {
+    let (i, found) = m.probe(key);
+    if found { Some((m.slots + i).value) } else { None }
+}
+
+pub fn HashMap<K, V>.get_ptr(m: *HashMap<K, V>, key: K) -> ?*V {
+    let (i, found) = m.probe(key);
+    if found { Some(&(m.slots + i).value) } else { None }
+}
+
+pub fn HashMap<K, V>.contains(m: *HashMap<K, V>, key: K) -> bool {
+    m.probe(key).1
+}
+
+pub fn HashMap<K, V>.remove(m: *HashMap<K, V>, key: K) -> bool {
+    let (i, found) = m.probe(key);
+    if !found { return false; }
+    (m.slots + i).state = DELETED;
+    m.len -= 1;
+    true
+}
+
+/// Iteration: `var i: u64 = 0; while let Some(s) = m.next(&i) { ... s.key, s.value ... }`
+pub fn HashMap<K, V>.next(m: *HashMap<K, V>, at: *u64) -> ?*Slot<K, V> {
+    while *at < m.cap {
+        let s = m.slots + *at;
+        *at += 1;
+        if s.state == FULL { return Some(s); }
+    }
+    None
+}
+
+pub fn HashMap<K, V>.free(m: *HashMap<K, V>) {
+    mem.release(m.slots);
+    m.len = 0;
+}

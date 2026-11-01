@@ -166,6 +166,10 @@ impl<'p> Codegen<'p> {
         self.decls.insert("declare void @llvm.trap() noreturn");
         let _ = writeln!(self.globals, "@loimi.argc = global i32 0");
         let _ = writeln!(self.globals, "@loimi.argv = global ptr null");
+        let _ = writeln!(self.fns, "define internal i32 @loimi_argc() {{\n  %v = load i32, ptr @loimi.argc\n  ret i32 %v\n}}");
+        let _ = writeln!(self.fns, "define internal ptr @loimi_argv() {{\n  %v = load ptr, ptr @loimi.argv\n  ret ptr %v\n}}");
+        self.decls.0.remove("loimi_argc");
+        self.decls.0.remove("loimi_argv");
         // Runtime support: panic.
         let _ = writeln!(
             self.fns,
@@ -1154,6 +1158,24 @@ impl<'a, 'p> FnGen<'a, 'p> {
             return self.inst(format!("{} {} {}, {}", ins, lt, x, y));
         }
         let signed = matches!(t, Ty::Int(it) if it.signed);
+        if let Ty::Option(inner) = t {
+            if !inner.is_nullable_ptr() && matches!(op, Eq | Ne) {
+                let (sa, pa) = self.option_parts(t, &x);
+                let (sb, pb) = self.option_parts(t, &y);
+                let it = self.ty(inner);
+                let peq = if inner.is_float() {
+                    self.inst(format!("fcmp oeq {} {}, {}", it, pa, pb))
+                } else if crate::values::is_boxed(self.p(), inner) {
+                    "true".to_string()
+                } else {
+                    self.inst(format!("icmp eq {} {}, {}", it, pa, pb))
+                };
+                let same_tag = self.inst(format!("icmp eq i1 {}, {}", sa, sb));
+                let pay = self.inst(format!("select i1 {}, i1 {}, i1 true", sa, peq));
+                let r = self.inst(format!("and i1 {}, {}", same_tag, pay));
+                return if op == Eq { r } else { self.inst(format!("xor i1 {}, true", r)) };
+            }
+        }
         if crate::values::is_boxed(self.p(), t) {
             let mut parts = Vec::new();
             for k in 0..2 {

@@ -1,0 +1,21 @@
+// Process environment.
+
+extern "C" fn loimi_argc() -> i32;
+extern "C" fn loimi_argv() -> **u8;
+extern "C" fn strlen(s: *u8) -> u64;
+extern "C" fn exit(code: i32);
+
+/// Number of command-line arguments (including the program name).
+pub fn arg_count() -> u64 { loimi_argc() as u64 }
+
+/// Command-line argument `i` (0 is the program name).
+pub fn arg(i: u64) -> ?str {
+    if i >= arg_count() { return None; }
+    let p = loimi_argv()[i];
+    Some(p.slice(strlen(p)))
+}
+
+pub fn quit(code: i32) -> never {
+    exit(code);
+    unreachable
+}

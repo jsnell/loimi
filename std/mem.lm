@@ -1,0 +1,144 @@
+// Memory: allocation, growable vectors, arenas.
+
+extern "C" fn malloc(n: u64) -> *u8;
+extern "C" fn calloc(n: u64, size: u64) -> *u8;
+extern "C" fn realloc(p: *u8, n: u64) -> *u8;
+extern "C" fn free(p: *u8);
+extern "C" fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+extern "C" fn memmove(dst: *u8, src: *u8, n: u64) -> *u8;
+extern "C" fn memset(dst: *u8, c: i32, n: u64) -> *u8;
+extern "C" fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+
+/// Allocate `n` zeroed values of type T.
+pub fn alloc<T>(n: u64) -> *T {
+    let p = calloc(if n == 0 { 1 } else { n }, size_of<T>());
+    if (p as u64) == 0 { panic_oom(); }
+    p as *T
+}
+
+/// Resize an allocation made with `alloc`.
+pub fn grow<T>(p: *T, n: u64) -> *T {
+    let q = realloc(p as *u8, n * size_of<T>());
+    if (q as u64) == 0 { panic_oom(); }
+    q as *T
+}
+
+pub fn release<T>(p: *T) {
+    free(p as *u8);
+}
+
+pub fn copy<T>(dst: *T, src: *T, n: u64) {
+    memmove(dst as *u8, src as *u8, n * size_of<T>());
+}
+
+extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn abort();
+
+fn panic_oom() {
+    let m = "out of memory\n";
+    write(2, m.ptr, m.len);
+    abort();
+}
+
+/// A growable array.
+pub struct Vec<T> { ptr: *T, len: u64, cap: u64 }
+
+pub fn Vec<T>.new() -> Vec<T> { Vec { ptr: alloc(1), len: 0, cap: 1 } }
+
+pub fn Vec<T>.with_capacity(n: u64) -> Vec<T> {
+    let c = if n == 0 { 1 } else { n };
+    Vec { ptr: alloc(c), len: 0, cap: c }
+}
+
+pub fn Vec<T>.reserve(v: *Vec<T>, extra: u64) {
+    if v.len + extra <= v.cap { return; }
+    var c = v.cap * 2;
+    if c < v.len + extra { c = v.len + extra; }
+    v.ptr = grow(v.ptr, c);
+    v.cap = c;
+}
+
+pub fn Vec<T>.push(v: *Vec<T>, x: T) {
+    if v.len == v.cap {
+        v.cap = v.cap * 2;
+        v.ptr = grow(v.ptr, v.cap);
+    }
+    v.ptr[v.len] = x;
+    v.len += 1;
+}
+
+pub fn Vec<T>.pop(v: *Vec<T>) -> ?T {
+    if v.len == 0 { return None; }
+    v.len -= 1;
+    Some(v.ptr[v.len])
+}
+
+pub fn Vec<T>.get(v: *Vec<T>, i: u64) -> ?T {
+    if i < v.len { Some(v.ptr[i]) } else { None }
+}
+
+/// Element `i`, bounds-checked.
+pub fn Vec<T>.at(v: *Vec<T>, i: u64) -> T {
+    v.items()[i]
+}
+
+/// Pointer to element `i`, bounds-checked.
+pub fn Vec<T>.ptr_at(v: *Vec<T>, i: u64) -> *T {
+    if i >= v.len { v.items()[i]; }
+    v.ptr + i
+}
+
+pub fn Vec<T>.set(v: *Vec<T>, i: u64, x: T) {
+    v.items()[i] = x;
+}
+
+pub fn Vec<T>.last(v: *Vec<T>) -> ?T {
+    if v.len == 0 { None } else { Some(v.ptr[v.len - 1]) }
+}
+
+pub fn Vec<T>.items(v: *Vec<T>) -> []T { v.ptr.slice(v.len) }
+
+pub fn Vec<T>.truncate(v: *Vec<T>, n: u64) {
+    if n < v.len { v.len = n; }
+}
+
+pub fn Vec<T>.clear(v: *Vec<T>) { v.len = 0; }
+
+pub fn Vec<T>.free(v: *Vec<T>) {
+    free(v.ptr as *u8);
+    v.len = 0;
+    v.cap = 0;
+}
+
+/// Bump allocator: allocations are freed all at once.
+pub struct Arena { chunk: *u8, used: u64, size: u64, chunks: Vec<*u8> }
+
+pub fn Arena.new() -> Arena {
+    Arena { chunk: malloc(65536), used: 0, size: 65536, chunks: Vec.new() }
+}
+
+pub fn Arena.alloc_bytes(a: *Arena, n: u64, align: u64) -> *u8 {
+    var off = (a.used + align - 1) & (0 -% align);
+    if off + n > a.size {
+        a.chunks.push(a.chunk);
+        let sz = if n + align > 65536 { n + align } else { 65536 };
+        a.chunk = malloc(sz);
+        a.size = sz;
+        off = 0;
+    }
+    a.used = off + n;
+    a.chunk + off
+}
+
+/// Copy a string into the arena.
+pub fn Arena.str(a: *Arena, s: str) -> str {
+    let p = a.alloc_bytes(s.len, 1);
+    memcpy(p, s.ptr, s.len);
+    p.slice(s.len)
+}
+
+pub fn Arena.free(a: *Arena) {
+    for i in 0..a.chunks.len { free(a.chunks.at(i)); }
+    free(a.chunk);
+    a.chunks.free();
+}

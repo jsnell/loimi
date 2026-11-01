@@ -47,3 +47,30 @@ pub fn print_f64(x: f64) {
 pub fn print_bool(b: bool) {
     print(if b { "true" } else { "false" });
 }
+
+extern "C" fn fopen(path: *u8, mode: *u8) -> *u8;
+extern "C" fn fclose(f: *u8) -> i32;
+extern "C" fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern "C" fn fseek(f: *u8, off: i64, whence: i32) -> i32;
+extern "C" fn ftell(f: *u8) -> i64;
+extern "C" fn malloc(n: u64) -> *u8;
+extern "C" fn free(p: *u8);
+extern "C" fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+
+/// Read a whole file. The returned string is heap-allocated.
+pub fn read_file(path: str) -> ?str {
+    let cpath = malloc(path.len + 1);
+    memcpy(cpath, path.ptr, path.len);
+    cpath[path.len] = 0;
+    let f = fopen(cpath, "rb\0".ptr);
+    free(cpath);
+    if (f as u64) == 0 { return None; }
+    fseek(f, 0, 2);
+    let n = ftell(f);
+    fseek(f, 0, 0);
+    if n < 0 { fclose(f); return None; }
+    let buf = malloc(n as u64 + 1);
+    let got = fread(buf, 1, n as u64, f);
+    fclose(f);
+    Some(buf.slice(got))
+}

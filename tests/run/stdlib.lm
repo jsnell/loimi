@@ -1,0 +1,64 @@
+import std.io;
+import std.mem;
+import std.map;
+import std.text;
+
+fn main() {
+    var v: mem.Vec<i64> = mem.Vec.new();
+    for i in 0..1000 { v.push(i); }
+    var total = 0;
+    while let Some(x) = v.pop() { total += x; }
+    io.print_int(total); io.println("");
+
+    var m: map.HashMap<str, i64> = map.HashMap.new();
+    m.insert("one", 1);
+    m.insert("two", 2);
+    m.insert("three", 3);
+    m.insert("two", 22);
+    io.print_int(m.get("two").unwrap()); io.println("");
+    io.print_int(m.len as i64); io.println("");
+    m.remove("one");
+    io.print_bool(m.contains("one")); io.println("");
+
+    var big: map.HashMap<u64, u64> = map.HashMap.new();
+    let n: u64 = 10000;
+    for i in 0..n { big.insert(i * 7, i); }
+    var ok = true;
+    for i in 0..n { if big.get(i * 7) != Some(i) { ok = false; } }
+    io.print_bool(ok and big.len == 10000); io.println("");
+
+    var b = text.StrBuf.new();
+    b.push_str("x = ");
+    b.push_int(-123);
+    b.push_str(", y = ");
+    b.push_f64(0.1);
+    b.push_str(", z = ");
+    b.push_f64(1.0 / 3.0);
+    io.println(b.as_str());
+
+    var it = text.Interner.new();
+    let a = it.intern("foo");
+    let c = it.intern("bar");
+    var buf = text.StrBuf.new();
+    buf.push_str("fo");
+    buf.push('o');
+    io.print_bool(it.intern(buf.as_str()) == a and a != c); io.println("");
+    io.println(it.name(c));
+
+    io.print_int(text.parse_int("-4567").unwrap()); io.println("");
+    io.print_bool(text.parse_int("12a").is_none()); io.println("");
+    io.print_bool(text.parse_int("99999999999999999999").is_none()); io.println("");
+    io.print_f64(text.parse_f64("2.5e3").unwrap()); io.println("");
+}
+// expect: 499500
+// expect: 22
+// expect: 3
+// expect: false
+// expect: true
+// expect: x = -123, y = 0.1, z = 0.3333333333333333
+// expect: true
+// expect: bar
+// expect: -4567
+// expect: true
+// expect: true
+// expect: 2500

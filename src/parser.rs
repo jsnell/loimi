@@ -572,7 +572,7 @@ impl Parser {
     }
 
     fn parse_bin(&mut self, min: u8) -> Res<Expr> {
-        let mut lhs = if min <= 1 { self.parse_coalesce()? } else { self.parse_unary()? };
+        let mut lhs = if min <= 1 { self.parse_coalesce()? } else { self.parse_cast()? };
         if min <= 1 {
             return Ok(lhs);
         }
@@ -631,7 +631,12 @@ impl Parser {
             let span = start.to(e.span);
             return Ok(Expr { kind: ExprKind::Unary(op, Box::new(e)), span });
         }
-        let mut e = self.parse_postfix()?;
+        self.parse_postfix()
+    }
+
+    /// Unary expression followed by `as` casts (casts bind looser than unary operators).
+    fn parse_cast(&mut self) -> Res<Expr> {
+        let mut e = self.parse_unary()?;
         while self.eat_kw("as") {
             let t = self.parse_type()?;
             let span = e.span.to(t.span);
