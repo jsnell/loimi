@@ -1,0 +1,78 @@
+import std.io;
+
+extern "C" fn malloc(n: u64) -> *u8;
+extern "C" fn realloc(p: *u8, n: u64) -> *u8;
+
+struct Vec<T> { ptr: *T, len: u64, cap: u64 }
+
+fn Vec<T>.new() -> Vec<T> { Vec { ptr: malloc(8) as *T, len: 0, cap: 0 } }
+
+fn Vec<T>.push(v: *Vec<T>, x: T) {
+    if v.len == v.cap {
+        v.cap = if v.cap == 0 { 4 } else { v.cap * 2 };
+        v.ptr = realloc(v.ptr as *u8, v.cap * size_of<T>()) as *T;
+    }
+    v.ptr[v.len] = x;
+    v.len += 1;
+}
+
+fn Vec<T>.get(v: *Vec<T>, i: u64) -> ?T {
+    if i < v.len { Some(v.ptr[i]) } else { None }
+}
+
+fn Vec<T>.items(v: *Vec<T>) -> []T { v.ptr.slice(v.len) }
+
+enum Tree<T> { Leaf, Node(*Tree<T>, T, *Tree<T>) }
+
+struct Pair<A, B> { a: A, b: B }
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> { Pair { a: p.b, b: p.a } }
+
+fn max<T>(a: T, b: T) -> T { if a > b { a } else { b } }
+
+fn sum(xs: []i64) -> i64 {
+    var t = 0;
+    for i in 0..xs.len { t += xs[i]; }
+    t
+}
+
+fn count<T>(t: *Tree<T>) -> i64 {
+    match *t {
+        Leaf => 0,
+        Node(l, _, r) => 1 + count(l) + count(r),
+    }
+}
+
+fn main() {
+    var v: Vec<i64> = Vec.new();
+    for i in 0..100 { v.push(i * i); }
+    io.print_int(v.len as i64); io.println("");
+    io.print_int(sum(v.items())); io.println("");
+    match v.get(7) { Some(x) => io.print_int(x), None => io.print("none") }
+    io.println("");
+    io.print_bool(v.get(100).is_none()); io.println("");
+
+    var names: Vec<str> = Vec.new();
+    names.push("alpha");
+    names.push("beta");
+    io.println(names.get(1).unwrap());
+
+    let p = swap(Pair { a: 1, b: 2.5 });
+    io.print_f64(p.a); io.println("");
+    io.print_int(max(3, 9)); io.println("");
+    io.print_f64(max(1.5, -2.0)); io.println("");
+
+    var leaf: Tree<i32> = .Leaf;
+    var n1: Tree<i32> = .Node(&leaf, 1, &leaf);
+    var n2: Tree<i32> = .Node(&n1, 2, &leaf);
+    io.print_int(count(&n2)); io.println("");
+}
+// expect: 100
+// expect: 328350
+// expect: 49
+// expect: true
+// expect: beta
+// expect: 2.5
+// expect: 9
+// expect: 1.5
+// expect: 2

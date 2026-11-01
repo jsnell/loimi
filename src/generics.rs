@@ -1,0 +1,384 @@
+//! Generics by monomorphization: instantiation of generic structs, enums,
+//! functions and methods, and inference of type arguments.
+
+use std::collections::HashMap;
+
+use crate::ast::*;
+use crate::check::{mk, Checker, FnCx};
+use crate::diag::{Diag, Res, Span};
+use crate::tir::*;
+
+#[derive(Clone)]
+pub enum GenDecl {
+    Struct(StructDecl),
+    Enum(EnumDecl),
+}
+
+pub struct GenericType {
+    pub module: usize,
+    pub name: String,
+    pub params: Vec<String>,
+    pub decl: GenDecl,
+}
+
+pub struct GenericFn {
+    pub module: usize,
+    pub decl: FnDecl,
+    pub params: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct Generics {
+    pub types: Vec<GenericType>,
+    pub type_inst: HashMap<(u32, Vec<Ty>), Ty>,
+    /// Instance type → (generic type, arguments).
+    pub inst_of: HashMap<Ty, (u32, Vec<Ty>)>,
+    pub fns: Vec<GenericFn>,
+    pub fn_inst: HashMap<(u32, Vec<Ty>), FnId>,
+    /// (generic type, method name) → generic fn.
+    pub methods: HashMap<(u32, String), u32>,
+}
+
+pub fn contains_param(t: &Ty, g: &Generics) -> bool {
+    match t {
+        Ty::Param(_) => true,
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) => contains_param(x, g),
+        Ty::Result(a, b) => contains_param(a, g) || contains_param(b, g),
+        Ty::Tuple(ts) => ts.iter().any(|t| contains_param(t, g)),
+        Ty::Fn(ps, r) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
+        Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
+            Some((_, args)) => args.iter().any(|t| contains_param(t, g)),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+impl<'a> Checker<'a> {
+    /// Run `f` with type parameters bound.
+    pub fn with_tenv<T>(&mut self, env: Vec<(String, Ty)>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.tenv, env);
+        let r = f(self);
+        self.tenv = saved;
+        r
+    }
+
+    pub fn instantiate_type(&mut self, g: u32, args: Vec<Ty>, span: Span) -> Res<Ty> {
+        let gt = &self.generics.types[g as usize];
+        if args.len() != gt.params.len() {
+            return Err(Diag::new(span, format!("`{}` takes {} type argument(s)", gt.name, gt.params.len())));
+        }
+        if let Some(t) = self.generics.type_inst.get(&(g, args.clone())) {
+            return Ok(t.clone());
+        }
+        let module = gt.module;
+        let pattern = args.iter().any(|a| contains_param(a, &self.generics));
+        let name = format!(
+            "{}.{}<{}>",
+            self.module_prefix(module),
+            gt.name,
+            args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ")
+        );
+        let env: Vec<(String, Ty)> = gt.params.iter().cloned().zip(args.iter().cloned()).collect();
+        let decl = gt.decl.clone();
+        let ty = match &decl {
+            GenDecl::Struct(_) => {
+                let id = self.prog.structs.len() as u32;
+                self.prog.structs.push(StructDef { name, fields: vec![], pattern });
+                Ty::Struct(id)
+            }
+            GenDecl::Enum(_) => {
+                let id = self.prog.enums.len() as u32;
+                self.prog.enums.push(EnumDef { name, tag: IntTy::I32, variants: vec![], pattern });
+                Ty::Enum(id)
+            }
+        };
+        self.generics.type_inst.insert((g, args.clone()), ty.clone());
+        self.generics.inst_of.insert(ty.clone(), (g, args));
+        match decl {
+            GenDecl::Struct(s) => {
+                let fields = self.with_tenv(env, |c| -> Res<Vec<(String, Ty)>> {
+                    let mut out = Vec::new();
+                    for (f, t) in &s.fields {
+                        out.push((f.name.clone(), c.resolve_type(module, t)?));
+                    }
+                    Ok(out)
+                })?;
+                let Ty::Struct(id) = ty else { unreachable!() };
+                self.prog.structs[id as usize].fields = fields;
+            }
+            GenDecl::Enum(e) => {
+                let (tag, variants) = self.with_tenv(env, |c| c.enum_variants(module, &e))?;
+                let Ty::Enum(id) = ty else { unreachable!() };
+                self.prog.enums[id as usize].tag = tag;
+                self.prog.enums[id as usize].variants = variants;
+            }
+        }
+        Ok(ty)
+    }
+
+    pub fn instantiate_fn(&mut self, g: u32, args: Vec<Ty>, span: Span) -> Res<FnId> {
+        if let Some(f) = self.generics.fn_inst.get(&(g, args.clone())) {
+            return Ok(*f);
+        }
+        let gf = &self.generics.fns[g as usize];
+        let module = gf.module;
+        let decl = gf.decl.clone();
+        let env: Vec<(String, Ty)> = gf.params.iter().cloned().zip(args.iter().cloned()).collect();
+        let id = self.prog.fns.len() as FnId;
+        self.prog.fns.push(crate::check::placeholder_fn(span));
+        self.generics.fn_inst.insert((g, args.clone()), id);
+        let targs = args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ");
+        let base = match &decl.recv {
+            Some(r) => format!("{}<{}>.{}", r.name, targs, decl.name.name),
+            None => format!("{}<{}>", decl.name.name, targs),
+        };
+        let symbol = format!("{}.{}", self.module_prefix(module), base);
+        self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)))?;
+        self.prog.fns[id as usize].name = base;
+        self.pending.push((id, module, decl, env));
+        Ok(id)
+    }
+
+    /// Resolve a type with the given generic parameters as inference variables.
+    fn pattern_type(&mut self, module: usize, params: &[String], t: &TypeExpr) -> Res<Ty> {
+        let env = params.iter().enumerate().map(|(i, p)| (p.clone(), Ty::Param(i as u32))).collect();
+        self.with_tenv(env, |c| c.resolve_type(module, t))
+    }
+
+    pub fn unify(&self, pat: &Ty, act: &Ty, b: &mut [Option<Ty>]) -> bool {
+        match (pat, act) {
+            (Ty::Param(i), _) => match &b[*i as usize] {
+                Some(t) => t == act,
+                None => {
+                    b[*i as usize] = Some(act.clone());
+                    true
+                }
+            },
+            (Ty::Ptr(x), Ty::Ptr(y)) | (Ty::Slice(x), Ty::Slice(y)) | (Ty::Option(x), Ty::Option(y)) => self.unify(x, y, b),
+            (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.unify(x, y, b),
+            (Ty::Result(a1, b1), Ty::Result(a2, b2)) => self.unify(a1, a2, b) && self.unify(b1, b2, b),
+            (Ty::Tuple(xs), Ty::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y, b)),
+            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) => {
+                p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y, b)) && self.unify(r1, r2, b)
+            }
+            (Ty::Struct(_), Ty::Struct(_)) | (Ty::Enum(_), Ty::Enum(_)) if pat != act => {
+                match (self.generics.inst_of.get(pat), self.generics.inst_of.get(act)) {
+                    (Some((g1, a1)), Some((g2, a2))) if g1 == g2 => {
+                        let (a1, a2) = (a1.clone(), a2.clone());
+                        a1.iter().zip(a2.iter()).all(|(x, y)| self.unify(x, y, b))
+                    }
+                    _ => false,
+                }
+            }
+            _ => pat == act,
+        }
+    }
+
+    pub fn subst(&mut self, t: &Ty, b: &[Option<Ty>], span: Span) -> Res<Option<Ty>> {
+        Ok(Some(match t {
+            Ty::Param(i) => match &b[*i as usize] {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            },
+            Ty::Ptr(x) => match self.subst(x, b, span)? {
+                Some(x) => Ty::Ptr(Box::new(x)),
+                None => return Ok(None),
+            },
+            Ty::Slice(x) => match self.subst(x, b, span)? {
+                Some(x) => Ty::Slice(Box::new(x)),
+                None => return Ok(None),
+            },
+            Ty::Option(x) => match self.subst(x, b, span)? {
+                Some(x) => Ty::Option(Box::new(x)),
+                None => return Ok(None),
+            },
+            Ty::Array(x, n) => match self.subst(x, b, span)? {
+                Some(x) => Ty::Array(Box::new(x), *n),
+                None => return Ok(None),
+            },
+            Ty::Result(x, y) => match (self.subst(x, b, span)?, self.subst(y, b, span)?) {
+                (Some(x), Some(y)) => Ty::Result(Box::new(x), Box::new(y)),
+                _ => return Ok(None),
+            },
+            Ty::Tuple(ts) => {
+                let mut out = Vec::new();
+                for t in ts {
+                    match self.subst(t, b, span)? {
+                        Some(t) => out.push(t),
+                        None => return Ok(None),
+                    }
+                }
+                Ty::Tuple(out)
+            }
+            Ty::Fn(ps, r) => {
+                let mut out = Vec::new();
+                for t in ps {
+                    match self.subst(t, b, span)? {
+                        Some(t) => out.push(t),
+                        None => return Ok(None),
+                    }
+                }
+                match self.subst(r, b, span)? {
+                    Some(r) => Ty::Fn(out, Box::new(r)),
+                    None => return Ok(None),
+                }
+            }
+            Ty::Struct(_) | Ty::Enum(_) if contains_param(t, &self.generics) => {
+                let (g, args) = self.generics.inst_of.get(t).cloned().unwrap();
+                let mut out = Vec::new();
+                for a in &args {
+                    match self.subst(a, b, span)? {
+                        Some(a) => out.push(a),
+                        None => return Ok(None),
+                    }
+                }
+                self.instantiate_type(g, out, span)?
+            }
+            t => t.clone(),
+        }))
+    }
+
+    /// Call of generic fn `g`. `pre` are already-checked leading arguments
+    /// (a method receiver); `known` fixes some type parameters up front.
+    pub fn generic_call(
+        &mut self,
+        cx: &mut FnCx,
+        g: u32,
+        pre: Vec<TExpr>,
+        known: Vec<Option<Ty>>,
+        args: &[Expr],
+        exp: Option<&Ty>,
+        span: Span,
+    ) -> Res<TExpr> {
+        let gf = &self.generics.fns[g as usize];
+        let module = gf.module;
+        let params = gf.params.clone();
+        let decl = gf.decl.clone();
+        let mut b: Vec<Option<Ty>> = known;
+        b.resize(params.len(), None);
+        let mut ptys = Vec::new();
+        for p in &decl.params {
+            ptys.push(self.pattern_type(module, &params, &p.ty)?);
+        }
+        let ret = match &decl.ret {
+            Some(t) => self.pattern_type(module, &params, t)?,
+            None => Ty::Unit,
+        };
+        let n = pre.len() + args.len();
+        if n != ptys.len() {
+            return Err(Diag::new(span, format!("expected {} argument(s), got {}", ptys.len(), n)));
+        }
+        if let Some(e) = exp {
+            let mut tmp = b.clone();
+            if self.unify(&ret, e, &mut tmp) {
+                b = tmp;
+            }
+        }
+        let mut vals: Vec<TExpr> = Vec::new();
+        for (i, r) in pre.into_iter().enumerate() {
+            let mut r = r;
+            // Auto-reference/dereference the receiver.
+            let pt = &ptys[i];
+            let mut tmp = b.clone();
+            if !self.unify(pt, &r.ty, &mut tmp) {
+                if let Ty::Ptr(_) = pt {
+                    let s = r.span;
+                    let t = Ty::Ptr(Box::new(r.ty.clone()));
+                    r = mk(t, TK::AddrOf(Box::new(r)), s);
+                } else if let Ty::Ptr(inner) = r.ty.clone() {
+                    let s = r.span;
+                    r = mk(*inner, TK::Deref(Box::new(r)), s);
+                }
+            }
+            if !self.unify(pt, &r.ty, &mut b) {
+                return Err(Diag::new(r.span, format!("receiver type mismatch for `{}`", decl.name.name)));
+            }
+            vals.push(r);
+        }
+        let off = vals.len();
+        for (i, a) in args.iter().enumerate() {
+            let pt = ptys[off + i].clone();
+            let want = self.subst(&pt, &b, span)?;
+            let v = self.expr(cx, a, want.as_ref())?;
+            let v = match &want {
+                Some(t) => self.coerce(v, t)?,
+                None => {
+                    if !self.unify(&pt, &v.ty, &mut b) {
+                        return Err(Diag::new(a.span, format!("argument of type `{}` does not match", self.ty_name(&v.ty))));
+                    }
+                    v
+                }
+            };
+            vals.push(v);
+        }
+        let mut targs = Vec::new();
+        for (i, t) in b.iter().enumerate() {
+            match t {
+                Some(t) => targs.push(t.clone()),
+                None => return Err(Diag::new(span, format!("cannot infer type parameter `{}`", params[i]))),
+            }
+        }
+        let fid = self.instantiate_fn(g, targs, span)?;
+        let f = &self.prog.fns[fid as usize];
+        let fty = Ty::Fn(f.param_tys.clone(), Box::new(f.ret.clone()));
+        let ret = f.ret.clone();
+        let pts = f.param_tys.clone();
+        let mut out = Vec::new();
+        for (v, t) in vals.into_iter().zip(pts.iter()) {
+            out.push(self.coerce(v, t)?);
+        }
+        crate::vmcheck::check_call_effects(self, cx, fid, span)?;
+        Ok(mk(ret, TK::Call(Box::new(mk(fty, TK::FnRef(fid), span)), out), span))
+    }
+
+    /// Infer the instance of generic type `g` from the expected type.
+    pub fn instance_from_expected(&self, g: u32, exp: Option<&Ty>) -> Option<Ty> {
+        let e = exp?;
+        let e = match e {
+            Ty::Option(inner) if !self.generics.inst_of.contains_key(e) => &**inner,
+            e => e,
+        };
+        match self.generics.inst_of.get(e) {
+            Some((g2, _)) if *g2 == g => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    /// Struct literal of a generic struct: infer arguments from the fields.
+    pub fn generic_struct_lit(&mut self, cx: &mut FnCx, g: u32, fields: &[(Ident, Expr)], exp: Option<&Ty>, span: Span) -> Res<Ty> {
+        if let Some(t) = self.instance_from_expected(g, exp) {
+            return Ok(t);
+        }
+        let gt = &self.generics.types[g as usize];
+        let module = gt.module;
+        let params = gt.params.clone();
+        let GenDecl::Struct(sd) = gt.decl.clone() else {
+            return Err(Diag::new(span, format!("`{}` is not a struct", gt.name)));
+        };
+        let mut b: Vec<Option<Ty>> = vec![None; params.len()];
+        for (f, e) in fields {
+            let Some((_, ft)) = sd.fields.iter().find(|(n, _)| n.name == f.name) else { continue };
+            let pt = self.pattern_type(module, &params, ft)?;
+            if !contains_param(&pt, &self.generics) {
+                continue;
+            }
+            // Check a clone to learn the type; the literal is checked again later.
+            let mut probe = FnCx::new(cx.module, cx.ret.clone());
+            probe.scopes = cx.scopes.clone();
+            probe.locals = cx.locals.clone();
+            probe.vm = cx.vm.clone();
+            if let Ok(v) = self.expr(&mut probe, e, None) {
+                self.unify(&pt, &v.ty, &mut b);
+            }
+        }
+        let mut targs = Vec::new();
+        for (i, t) in b.into_iter().enumerate() {
+            match t {
+                Some(t) => targs.push(t),
+                None => return Err(Diag::new(span, format!("cannot infer type parameter `{}`", params[i]))),
+            }
+        }
+        self.instantiate_type(g, targs, span)
+    }
+}

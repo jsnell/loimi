@@ -210,6 +210,7 @@ impl Parser {
         }
         if self.eat_kw("struct") {
             let name = self.ident()?;
+            let generics = self.parse_generics()?;
             self.expect("{")?;
             let mut fields = Vec::new();
             while !self.is("}") {
@@ -222,10 +223,11 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Struct(StructDecl { name, fields, is_pub }));
+            return Ok(Item::Struct(StructDecl { name, generics, fields, is_pub }));
         }
         if self.eat_kw("enum") {
             let name = self.ident()?;
+            let generics = self.parse_generics()?;
             let repr = if self.eat(":") { Some(self.parse_type()?) } else { None };
             self.expect("{")?;
             let mut variants = Vec::new();
@@ -248,7 +250,7 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Enum(EnumDecl { name, repr, variants, is_pub }));
+            return Ok(Item::Enum(EnumDecl { name, generics, repr, variants, is_pub }));
         }
         if self.eat_kw("const") {
             let name = self.ident()?;
@@ -293,6 +295,7 @@ impl Parser {
     pub fn parse_fn(&mut self, attrs: Attrs, linkage: Linkage, is_pub: bool) -> Res<FnDecl> {
         self.expect_kw("fn")?;
         let first = self.ident()?;
+        let generics = self.parse_generics()?;
         let (recv, name) = if self.eat(".") { (Some(first), self.ident()?) } else { (None, first) };
         self.expect("(")?;
         let mut params = Vec::new();
@@ -324,7 +327,21 @@ impl Parser {
             }
         }
         let body = if self.eat(";") { None } else { Some(self.parse_block()?) };
-        Ok(FnDecl { name, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+        Ok(FnDecl { name, generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+    }
+
+    fn parse_generics(&mut self) -> Res<Vec<Ident>> {
+        let mut gs = Vec::new();
+        if self.eat("<") {
+            while !self.is(">") {
+                gs.push(self.ident()?);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(">")?;
+        }
+        Ok(gs)
     }
 
     // ── types ────────────────────────────────────────────────────────

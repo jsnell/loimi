@@ -43,6 +43,8 @@ pub enum Ty {
     Struct(u32),
     Enum(u32),
     Value(u32),
+    /// Type parameter being inferred (only during generic-call checking).
+    Param(u32),
 }
 
 impl Ty {
@@ -223,6 +225,8 @@ pub enum TPK {
 pub struct StructDef {
     pub name: String,
     pub fields: Vec<(String, Ty)>,
+    /// An instance over inference variables; never emitted.
+    pub pattern: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +241,7 @@ pub struct EnumDef {
     pub name: String,
     pub tag: IntTy,
     pub variants: Vec<VariantDef>,
+    pub pattern: bool,
 }
 
 impl EnumDef {

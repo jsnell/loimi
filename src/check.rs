@@ -15,6 +15,8 @@ pub enum Def {
     Const(u32),
     Module(usize),
     Vm(u32),
+    GenericType(u32),
+    GenericFn(u32),
 }
 
 pub struct ConstInfo {
@@ -75,7 +77,10 @@ pub struct Checker<'a> {
     pub scopes: Vec<HashMap<String, (Def, bool)>>,
     pub methods: HashMap<(Ty, String), FnId>,
     pub consts: Vec<ConstInfo>,
-    pub pending: Vec<(FnId, usize, FnDecl)>,
+    pub pending: Vec<(FnId, usize, FnDecl, Vec<(String, Ty)>)>,
+    pub generics: crate::generics::Generics,
+    /// Type parameters in scope (while resolving generic instances).
+    pub tenv: Vec<(String, Ty)>,
     pub vm_decls: Vec<(usize, crate::vmast::VmDecl)>,
     pub dispatch_override: Option<Dispatch>,
     pub vms: Vec<crate::vmcheck::VmInfo>,
@@ -105,6 +110,8 @@ impl<'a> Checker<'a> {
             vm_decls: vec![],
             dispatch_override: None,
             vms: vec![],
+            generics: Default::default(),
+            tenv: vec![],
         }
     }
 
@@ -129,9 +136,29 @@ impl<'a> Checker<'a> {
             let prefix = self.module_prefix(m);
             for item in &module.items {
                 match item {
+                    Item::Struct(s) if !s.generics.is_empty() => {
+                        let id = self.generics.types.len() as u32;
+                        self.generics.types.push(crate::generics::GenericType {
+                            module: m,
+                            name: s.name.name.clone(),
+                            params: s.generics.iter().map(|g| g.name.clone()).collect(),
+                            decl: crate::generics::GenDecl::Struct(s.clone()),
+                        });
+                        self.define(m, &s.name, Def::GenericType(id), s.is_pub)?;
+                    }
+                    Item::Enum(e) if !e.generics.is_empty() => {
+                        let id = self.generics.types.len() as u32;
+                        self.generics.types.push(crate::generics::GenericType {
+                            module: m,
+                            name: e.name.name.clone(),
+                            params: e.generics.iter().map(|g| g.name.clone()).collect(),
+                            decl: crate::generics::GenDecl::Enum(e.clone()),
+                        });
+                        self.define(m, &e.name, Def::GenericType(id), e.is_pub)?;
+                    }
                     Item::Struct(s) => {
                         let id = self.prog.structs.len() as u32;
-                        self.prog.structs.push(StructDef { name: format!("{}.{}", prefix, s.name.name), fields: vec![] });
+                        self.prog.structs.push(StructDef { name: format!("{}.{}", prefix, s.name.name), fields: vec![], pattern: false });
                         self.define(m, &s.name, Def::Struct(id), s.is_pub)?;
                     }
                     Item::Enum(e) => {
@@ -140,6 +167,7 @@ impl<'a> Checker<'a> {
                             name: format!("{}.{}", prefix, e.name.name),
                             tag: IntTy::I32,
                             variants: vec![],
+                            pattern: false,
                         });
                         self.define(m, &e.name, Def::Enum(id), e.is_pub)?;
                     }
@@ -151,6 +179,17 @@ impl<'a> Checker<'a> {
                             variants: vec![],
                         });
                         self.define(m, &v.name, Def::Value(id), v.is_pub)?;
+                    }
+                    Item::Fn(f) if !f.generics.is_empty() => {
+                        let id = self.generics.fns.len() as u32;
+                        self.generics.fns.push(crate::generics::GenericFn {
+                            module: m,
+                            decl: f.clone(),
+                            params: f.generics.iter().map(|g| g.name.clone()).collect(),
+                        });
+                        if f.recv.is_none() {
+                            self.define(m, &f.name, Def::GenericFn(id), f.is_pub)?;
+                        }
                     }
                     Item::Fn(f) => {
                         let id = self.prog.fns.len() as FnId;
@@ -208,7 +247,7 @@ impl<'a> Checker<'a> {
         for (m, module) in self.modules.iter().enumerate() {
             for item in &module.items {
                 match item {
-                    Item::Struct(s) => {
+                    Item::Struct(s) if s.generics.is_empty() => {
                         let Some((Def::Struct(id), _)) = self.scopes[m].get(&s.name.name).cloned() else { unreachable!() };
                         let mut fields = Vec::new();
                         for (f, t) in &s.fields {
@@ -219,26 +258,9 @@ impl<'a> Checker<'a> {
                         }
                         self.prog.structs[id as usize].fields = fields;
                     }
-                    Item::Enum(e) => {
+                    Item::Enum(e) if e.generics.is_empty() => {
                         let Some((Def::Enum(id), _)) = self.scopes[m].get(&e.name.name).cloned() else { unreachable!() };
-                        let tag = match &e.repr {
-                            Some(t) => match self.resolve_type(m, t)? {
-                                Ty::Int(it) => it,
-                                _ => return Err(Diag::new(t.span, "enum representation must be an integer type")),
-                            },
-                            None => IntTy::I32,
-                        };
-                        let mut variants = Vec::new();
-                        let mut next = 0i128;
-                        for v in &e.variants {
-                            let mut fields = Vec::new();
-                            for f in &v.fields {
-                                fields.push(self.resolve_type(m, f)?);
-                            }
-                            let discr = v.discr.unwrap_or(next);
-                            next = discr + 1;
-                            variants.push(VariantDef { name: v.name.name.clone(), fields, discr });
-                        }
+                        let (tag, variants) = self.enum_variants(m, e)?;
                         let def = &mut self.prog.enums[id as usize];
                         def.tag = tag;
                         def.variants = variants;
@@ -252,9 +274,23 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        // Pass 4: function signatures.
+        // Pass 4: function signatures; methods of generic types.
         for (id, m, f) in &fn_decls {
             self.declare_fn(*id, *m, f, None)?;
+        }
+        for g in 0..self.generics.fns.len() {
+            let gf = &self.generics.fns[g];
+            let Some(recv) = gf.decl.recv.clone() else { continue };
+            let (m, mname) = (gf.module, gf.decl.name.clone());
+            let Some((Def::GenericType(t), _)) = self.scopes[m].get(&recv.name).cloned() else {
+                return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
+            };
+            if self.generics.types[t as usize].params.len() != self.generics.fns[g].params.len() {
+                return Err(Diag::new(recv.span, "a method of a generic type takes exactly the type's parameters"));
+            }
+            if self.generics.methods.insert((t, mname.name.clone()), g as u32).is_some() {
+                return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
+            }
         }
         // Pass 5: vm declarations (generates handler functions).
         for i in 0..self.vm_decls.len() {
@@ -262,10 +298,10 @@ impl<'a> Checker<'a> {
         }
         // Pass 6: bodies.
         for (id, m, f) in fn_decls {
-            self.pending.push((id, m, f));
+            self.pending.push((id, m, f, vec![]));
         }
-        while let Some((id, m, f)) = self.pending.pop() {
-            self.check_fn_body(id, m, &f, None)?;
+        while let Some((id, m, f, env)) = self.pending.pop() {
+            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None))?;
         }
         Ok(())
     }
@@ -281,7 +317,7 @@ impl<'a> Checker<'a> {
         };
         let prefix = self.module_prefix(m);
         let mut name = f.name.name.clone();
-        if let Some(recv) = &f.recv {
+        if let (Some(recv), true) = (&f.recv, f.generics.is_empty()) {
             let rty = self.resolve_type_name(m, recv)?;
             name = format!("{}.{}", recv.name, f.name.name);
             let key = (rty, f.name.name.clone());
@@ -378,12 +414,41 @@ impl<'a> Checker<'a> {
             Ty::Struct(i) => short(&self.prog.structs[*i as usize].name),
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
+            Ty::Param(i) => format!("?T{}", i),
         }
     }
 
+    pub fn enum_variants(&mut self, m: usize, e: &EnumDecl) -> Res<(IntTy, Vec<VariantDef>)> {
+        let tag = match &e.repr {
+            Some(t) => match self.resolve_type(m, t)? {
+                Ty::Int(it) => it,
+                _ => return Err(Diag::new(t.span, "enum representation must be an integer type")),
+            },
+            None => IntTy::I32,
+        };
+        let mut variants = Vec::new();
+        let mut next = 0i128;
+        for v in &e.variants {
+            let mut fields = Vec::new();
+            for f in &v.fields {
+                fields.push(self.resolve_type(m, f)?);
+            }
+            let discr = v.discr.unwrap_or(next);
+            next = discr + 1;
+            variants.push(VariantDef { name: v.name.name.clone(), fields, discr });
+        }
+        Ok((tag, variants))
+    }
+
     pub fn resolve_type_name(&self, m: usize, id: &Ident) -> Res<Ty> {
+        if let Some((_, t)) = self.tenv.iter().rev().find(|(n, _)| *n == id.name) {
+            return Ok(t.clone());
+        }
         if let Some(t) = prim_type(&id.name) {
             return Ok(t);
+        }
+        if let Some((Def::GenericType(_), _)) = self.scopes[m].get(&id.name) {
+            return Err(Diag::new(id.span, format!("`{}` needs type arguments", id.name)));
         }
         match self.scopes[m].get(&id.name) {
             Some((Def::Struct(i), _)) => Ok(Ty::Struct(*i)),
@@ -405,7 +470,24 @@ impl<'a> Checker<'a> {
                     return Ok(Ty::Result(Box::new(a), Box::new(b)));
                 }
                 if !args.is_empty() {
-                    return Err(Diag::new(t.span, "generic types are not supported yet"));
+                    let (gm, gname) = if path.len() == 1 {
+                        (m, &path[0])
+                    } else if path.len() == 2 {
+                        match self.scopes[m].get(&path[0].name) {
+                            Some((Def::Module(target), _)) => (*target, &path[1]),
+                            _ => return Err(Diag::new(path[0].span, format!("unknown module `{}`", path[0].name))),
+                        }
+                    } else {
+                        return Err(Diag::new(t.span, "unsupported type path"));
+                    };
+                    let Some((Def::GenericType(g), _)) = self.scopes[gm].get(&gname.name).cloned() else {
+                        return Err(Diag::new(gname.span, format!("`{}` is not a generic type", gname.name)));
+                    };
+                    let mut targs = Vec::new();
+                    for a in args {
+                        targs.push(self.resolve_type(m, a)?);
+                    }
+                    return self.instantiate_type(g, targs, t.span);
                 }
                 if path.len() == 1 {
                     self.resolve_type_name(m, &path[0])?
@@ -870,7 +952,10 @@ impl<'a> Checker<'a> {
             }
             ExprKind::StructLit(path, fields) => {
                 let ty = if path.len() == 1 {
-                    self.resolve_type_name(cx.module, &path[0])?
+                    match self.scopes[cx.module].get(&path[0].name).cloned() {
+                        Some((Def::GenericType(g), _)) => self.generic_struct_lit(cx, g, fields, exp, span)?,
+                        _ => self.resolve_type_name(cx.module, &path[0])?,
+                    }
                 } else {
                     return Err(Diag::new(span, "qualified struct literals are not supported yet"));
                 };
@@ -1406,7 +1491,7 @@ impl<'a> Checker<'a> {
 
     fn auto_deref_for_index(&self, mut b: TExpr) -> TExpr {
         while let Ty::Ptr(inner) = &b.ty {
-            if matches!(**inner, Ty::Slice(_) | Ty::Array(..)) {
+            if matches!(**inner, Ty::Array(..)) {
                 let t = (**inner).clone();
                 let span = b.span;
                 b = mk(t, TK::Deref(Box::new(b)), span);
@@ -1447,6 +1532,9 @@ impl<'a> Checker<'a> {
     fn call(&mut self, cx: &mut FnCx, callee: &Expr, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         match &callee.kind {
             ExprKind::Ident(name) if cx.lookup(name).is_none() => {
+                if let Some((Def::GenericFn(g), _)) = self.scopes[cx.module].get(name).cloned() {
+                    return self.generic_call(cx, g, vec![], vec![], args, exp, span);
+                }
                 if let Some(r) = self.builtin_call(cx, name, args, exp, span)? {
                     return Ok(r);
                 }
@@ -1485,6 +1573,26 @@ impl<'a> Checker<'a> {
             }
             ExprKind::DotVariant(name) => return self.variant_ctor_expected(cx, name, args, exp, span),
             ExprKind::Field(base, name) => {
+                if let Some(g) = self.generic_type_path(cx, base) {
+                    let inst = self.instance_from_expected(g, exp);
+                    if let Some(t) = &inst {
+                        if let Some(idx) = self.variant_index(t, &name.name) {
+                            return self.make_variant(cx, &t.clone(), idx, args, span);
+                        }
+                    }
+                    let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() else {
+                        let gname = self.generics.types[g as usize].name.clone();
+                        return Err(Diag::new(
+                            name.span,
+                            format!("no function `{}` in `{}` (or its type arguments cannot be inferred)", name.name, gname),
+                        ));
+                    };
+                    let known = match inst {
+                        Some(t) => self.generics.inst_of[&t].1.iter().cloned().map(Some).collect(),
+                        None => vec![],
+                    };
+                    return self.generic_call(cx, gf, vec![], known, args, exp, span);
+                }
                 if let Some(def) = self.vm_item(cx, base, &name.name) {
                     let f = self.def_value(def, &name.name, callee.span)?;
                     return self.finish_call(cx, f, vec![], args, span);
@@ -1546,10 +1654,34 @@ impl<'a> Checker<'a> {
         Ok(mk(*ret, TK::Call(Box::new(f), pre), span))
     }
 
+    /// `Vec` (a generic type named in expression position).
+    fn generic_type_path(&self, cx: &FnCx, e: &Expr) -> Option<u32> {
+        match &e.kind {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.scopes[cx.module].get(n) {
+                Some((Def::GenericType(g), _)) => Some(*g),
+                _ => None,
+            },
+            ExprKind::Field(base, n) => {
+                let m = self.module_path(cx, base)?;
+                match self.scopes[m].get(&n.name) {
+                    Some((Def::GenericType(g), true)) => Some(*g),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], span: Span) -> Res<TExpr> {
         let mut base_ty = recv.ty.clone();
         while let Ty::Ptr(inner) = base_ty {
             base_ty = *inner;
+        }
+        if let Some((g, targs)) = self.generics.inst_of.get(&base_ty).cloned() {
+            if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
+                let known = targs.into_iter().map(Some).collect();
+                return self.generic_call(cx, gf, vec![recv], known, args, None, span);
+            }
         }
         if let Some(fid) = self.methods.get(&(base_ty.clone(), name.name.clone())).copied() {
             let fdef = &self.prog.fns[fid as usize];
@@ -1593,7 +1725,7 @@ impl<'a> Checker<'a> {
         let recv = {
             let mut r = recv;
             while let Ty::Ptr(inner) = &r.ty {
-                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64) && name != "offset" {
+                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64) && name != "offset" && name != "slice" {
                     let t = (**inner).clone();
                     let s = r.span;
                     r = mk(t, TK::Deref(Box::new(r)), s);
@@ -1874,7 +2006,7 @@ impl SpanOf for FnDecl {
     }
 }
 
-fn placeholder_fn(span: Span) -> FnDef {
+pub fn placeholder_fn(span: Span) -> FnDef {
     FnDef {
         name: String::new(),
         symbol: String::new(),

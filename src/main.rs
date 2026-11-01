@@ -2,6 +2,7 @@ mod ast;
 mod check;
 mod codegen;
 mod diag;
+mod generics;
 mod layout;
 mod lexer;
 mod parser;

@@ -207,6 +207,8 @@ pub struct Param {
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     pub name: Ident,
+    /// Type parameters: `fn f<T>(..)`, or of the receiver: `fn Vec<T>.push(..)`.
+    pub generics: Vec<Ident>,
     /// `fn Type.method(...)`
     pub recv: Option<Ident>,
     pub params: Vec<Param>,
@@ -221,6 +223,7 @@ pub struct FnDecl {
 #[derive(Clone, Debug)]
 pub struct StructDecl {
     pub name: Ident,
+    pub generics: Vec<Ident>,
     pub fields: Vec<(Ident, TypeExpr)>,
     pub is_pub: bool,
 }
@@ -235,6 +238,7 @@ pub struct Variant {
 #[derive(Clone, Debug)]
 pub struct EnumDecl {
     pub name: Ident,
+    pub generics: Vec<Ident>,
     pub repr: Option<TypeExpr>,
     pub variants: Vec<Variant>,
     pub is_pub: bool,

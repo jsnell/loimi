@@ -26,6 +26,7 @@ pub fn align_of(p: &Program, t: &Ty) -> u64 {
             let tag = (e.tag.bits as u64 / 8).max(1);
             if e.has_payload() { tag.max(8) } else { tag }
         }
+        Ty::Param(_) => 8,
     }
 }
 
@@ -82,5 +83,6 @@ pub fn size_of(p: &Program, t: &Ty) -> u64 {
                 tag
             }
         }
+        Ty::Param(_) => 8,
     }
 }
