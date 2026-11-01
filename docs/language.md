@@ -62,6 +62,7 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
+- `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
@@ -438,14 +439,16 @@ and operand kinds unchanged.
 ### 7.1 Inline caches
 
 ```loimi
-cache PropIC { shape: ShapeId, slot: u32 }
+cache PropIC { shape: weak ShapeId, slot: u32 }
 ```
 
 A cache is stored **inline in the code stream**, after the instruction (as in
 CPython 3.11+), and is attached with `+`: `op GETPROP(...) : ABC + PropIC`.
 `next` skips it automatically, the verifier forbids jumps into it, the builder
 reserves and zero-fills it, and the disassembler prints it. Inside the handler,
-`cache.shape` reads and writes the words directly.
+`cache.shape` reads and writes the words directly. Fields marked `weak`
+don't keep their target alive. When the target dies, the GC resets the entry
+to zero, which the handler sees as a miss (`stdlib/gc.md` §8).
 
 ### 7.2 Families and `become`
 

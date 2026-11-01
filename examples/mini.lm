@@ -127,7 +127,7 @@ vm Mini {
         format sJ   { op: 8, sj: s24 }
     }
 
-    cache PropIC { shape: ShapeId, slot: u32 }
+    cache PropIC { shape: weak ShapeId, slot: u32 }
 
     // ── Loads and moves ──
 

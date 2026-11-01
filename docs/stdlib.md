@@ -151,33 +151,36 @@ Generic machinery that each vm's generated `Builder` plugs into:
 
 ## `std.gc`
 
+Full design: [`stdlib/gc.md`](stdlib/gc.md).
+
 - Heap policies (compile-time parameter `#![heap = ...]`):
   - `MarkSweep` (default): non-moving, size-segregated, lazy sweeping,
     no write barrier.
   - `Incremental`: tri-color with a snapshot-at-the-beginning barrier, for
     bounded pause times.
-  - `Generational`: non-moving sticky-mark-bits nursery with a card-marking
-    barrier.
-- Allocation: per-thread bump region with an inlined fast path and a `cold`
-  refill path marked `uses gc`.
-- `Root<T>` (handles for host data structures), `Weak<T>`, finalizers, and
-  `EphemeronTable` (weak-keyed maps, needed for JS `WeakMap` and Lua weak
-  tables).
-- Heap statistics, a heap-verification debug mode (trace and check every
-  object), and a GC-stress mode that collects on every allocation. Stress mode
-  is how missing roots are found, and Loimi's effects make it rarely necessary.
+  - `Generational`: non-moving sticky-mark-bits generations with an
+    object-logging barrier.
+- Allocation: per-size-class free lists with an inlined fast path of about
+  five instructions, and a `cold` refill path marked `uses gc`.
+- Precise roots generated from `vm` state kinds, frame structs, and effect
+  spills. Inline caches in bytecode are *weak* roots, reset when their targets die.
+- `Root<T>`, `GcVec<T>`, `Weak<T>`, finalizers (run outside the collector),
+  and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
+- Stress mode, heap verification, poisoning, and heap snapshots.
 
 ## `std.obj`: objects and shapes
 
-- `Shape`: hidden classes with a transition tree (`shape.add(sym) -> Shape`),
-  stable `ShapeId`s for inline caches, and slot-index lookup.
-- `Object`: shape plus inline slots plus overflow slots. Switches to
-  dictionary mode beyond a threshold or after deletes.
-- Helpers for the standard inline-cache patterns: monomorphic and polymorphic
-  (up to N shapes) property caches, and global-variable caches keyed by a
-  dictionary version counter.
-- Prototype chains with validity cells (cached lookups through the prototype
-  chain are invalidated when a prototype's shape changes).
+Full design: [`stdlib/obj.md`](stdlib/obj.md).
+
+- A compile-time `Model` configuration chooses attributes, prototypes,
+  ordering, element storage, and thresholds per guest language.
+- `Shape`: hidden classes in a transition tree with weak edges, stable
+  `ShapeId`s, and lazily built lookup tables.
+- `Object`: shape, inline slots (sized by allocation-site templates), overflow
+  slots, optional elements. Falls back to dictionary mode.
+- Inline cache layouts and state machine (mono, poly, megamorphic with a
+  global `MegaCache`), validity cells for prototype-chain hits, and property
+  cells for globals.
 
 ## `std.rt`: runtime support
 
