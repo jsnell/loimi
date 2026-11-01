@@ -78,6 +78,7 @@ pub struct Checker<'a> {
     pub pending: Vec<(FnId, usize, FnDecl)>,
     pub vm_decls: Vec<(usize, crate::vmast::VmDecl)>,
     pub dispatch_override: Option<Dispatch>,
+    pub vms: Vec<crate::vmcheck::VmInfo>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -103,6 +104,7 @@ impl<'a> Checker<'a> {
             pending: vec![],
             vm_decls: vec![],
             dispatch_override: None,
+            vms: vec![],
         }
     }
 
@@ -321,6 +323,8 @@ impl<'a> Checker<'a> {
             cc: CallConv::C,
             span: f.name.span,
             vm: None,
+            vm_role: VmRole::None,
+            vm_state: vec![],
         };
         Ok(())
     }
@@ -1251,7 +1255,7 @@ impl<'a> Checker<'a> {
         Err(Diag::new(span, format!("unknown name `{}`", name)))
     }
 
-    fn def_value(&mut self, def: Def, name: &str, span: Span) -> Res<TExpr> {
+    pub fn def_value(&mut self, def: Def, name: &str, span: Span) -> Res<TExpr> {
         match def {
             Def::Fn(id) => {
                 let f = &self.prog.fns[id as usize];
@@ -1304,7 +1308,32 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `Vm.X` / `Vm.emit.X`: generated vm items live in the vm's module as `Vm__X`.
+    pub fn vm_item(&self, cx: &FnCx, base: &Expr, name: &str) -> Option<Def> {
+        let vm_of = |e: &Expr| -> Option<u32> {
+            match &e.kind {
+                ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.scopes[cx.module].get(n) {
+                    Some((Def::Vm(i), _)) => Some(*i),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let (vm, prefix) = match &base.kind {
+            ExprKind::Field(b2, mid) if mid.name == "emit" => (vm_of(b2)?, "emit_"),
+            _ => (vm_of(base)?, ""),
+        };
+        let (m, decl) = &self.vm_decls[vm as usize];
+        self.scopes[*m].get(&format!("{}__{}{}", decl.name.name, prefix, name)).map(|(d, _)| d.clone())
+    }
+
     fn field(&mut self, cx: &mut FnCx, base: &Expr, name: &Ident, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        if let Some(r) = crate::vmcheck::vm_field(self, cx, base, name, span)? {
+            return Ok(r);
+        }
+        if let Some(def) = self.vm_item(cx, base, &name.name) {
+            return self.def_value(def, &name.name, span);
+        }
         if let Some(m) = self.module_path(cx, base) {
             let Some((def, is_pub)) = self.scopes[m].get(&name.name).cloned() else {
                 return Err(Diag::new(name.span, format!("`{}` not found in module", name.name)));
@@ -1456,6 +1485,10 @@ impl<'a> Checker<'a> {
             }
             ExprKind::DotVariant(name) => return self.variant_ctor_expected(cx, name, args, exp, span),
             ExprKind::Field(base, name) => {
+                if let Some(def) = self.vm_item(cx, base, &name.name) {
+                    let f = self.def_value(def, &name.name, callee.span)?;
+                    return self.finish_call(cx, f, vec![], args, span);
+                }
                 if self.module_path(cx, base).is_none() {
                     if let Some(t) = self.type_path(cx, base) {
                         if let Some(idx) = self.variant_index(&t, &name.name) {
@@ -1484,7 +1517,7 @@ impl<'a> Checker<'a> {
         self.finish_call(cx, f, vec![], args, span)
     }
 
-    fn finish_call(&mut self, cx: &mut FnCx, f: TExpr, mut pre: Vec<TExpr>, args: &[Expr], span: Span) -> Res<TExpr> {
+    pub fn finish_call(&mut self, cx: &mut FnCx, f: TExpr, mut pre: Vec<TExpr>, args: &[Expr], span: Span) -> Res<TExpr> {
         let Ty::Fn(params, ret) = f.ty.clone() else {
             return Err(Diag::new(f.span, format!("cannot call a value of type `{}`", self.ty_name(&f.ty))));
         };
@@ -1723,6 +1756,36 @@ impl<'a> Checker<'a> {
             let b = self.expr_coerce(cx, r, &Ty::Bool)?;
             return Ok(mk(Ty::Bool, TK::Binary(op, Box::new(a), Box::new(b)), span));
         }
+        if matches!(op, Add | Sub) {
+            // Pointer arithmetic: `p + n`, `p - n` (in elements).
+            let a = self.expr(cx, l, exp)?;
+            if let Ty::Ptr(_) = a.ty {
+                let n = self.expr(cx, r, Some(&Ty::i64()))?;
+                if !n.ty.is_int() {
+                    return Err(Diag::new(r.span, "pointer offset must be an integer"));
+                }
+                let n = if n.ty == Ty::i64() { n } else { let s = n.span; mk(Ty::i64(), TK::Cast(Box::new(n)), s) };
+                let n = if op == Sub { mk(Ty::i64(), TK::Unary(UnOp::Neg, Box::new(n)), span) } else { n };
+                let t = a.ty.clone();
+                return Ok(mk(t, TK::Intrinsic(Intr::PtrOffset, vec![a, n]), span));
+            }
+            let operand_exp = exp;
+            let (a, b) = if is_literal_expr(l) && !is_literal_expr(r) {
+                let b = self.expr(cx, r, operand_exp)?;
+                let a = self.expr_coerce(cx, l, &b.ty.clone())?;
+                (a, b)
+            } else {
+                let at = a.ty.clone();
+                let b = self.expr(cx, r, Some(&at))?;
+                let b = if a.ty == Ty::Never { b } else { self.coerce(b, &at)? };
+                (a, b)
+            };
+            if !a.ty.is_numeric() {
+                return Err(Diag::new(span, format!("operator `{:?}` is not defined for `{}`", op, self.ty_name(&a.ty))));
+            }
+            let t = a.ty.clone();
+            return Ok(mk(t, TK::Binary(op, Box::new(a), Box::new(b)), span));
+        }
         let operand_exp = if op.is_cmp() { None } else { exp };
         let (a, b) = if matches!(op, Shl | Shr) {
             let a = self.expr(cx, l, operand_exp)?;
@@ -1825,6 +1888,8 @@ fn placeholder_fn(span: Span) -> FnDef {
         cc: CallConv::C,
         span,
         vm: None,
+        vm_role: VmRole::None,
+        vm_state: vec![],
     }
 }
 

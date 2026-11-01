@@ -161,18 +161,22 @@ pub enum TK {
 
 #[derive(Clone, Debug)]
 pub enum TVm {
-    /// Dispatch to the next instruction (`pc + size`).
-    Next,
+    /// Dispatch to the instruction at the given pc (`next` and `redo`
+    /// are lowered to this by the checker).
     Jump(B),
-    Redo,
     Exit(B),
     Raise(B),
-    Fail(B),
     /// Rewrite the current instruction's opcode.
     Become(u32),
     Cold(B),
-    /// Read the current instruction word at `pc + offset` words.
+    /// The code word at `pc + offset` (a place).
     Word(u32),
+    /// In a superinstruction part: advance pc by `size` and continue with part `next`.
+    Fallthrough(u32, u32),
+    /// Part `i` of a superinstruction handler.
+    Part(u32, B),
+    /// The pending error value (in `on raise`).
+    RaiseSlot,
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +271,9 @@ pub struct FnDef {
     pub span: Span,
     /// Set for vm handlers / entries: index into Program::vms.
     pub vm: Option<u32>,
+    pub vm_role: VmRole,
+    /// Locals holding the vm state (handlers, entries), or pointers to it (vm fns).
+    pub vm_state: Vec<LocalId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,59 +307,42 @@ pub enum Dispatch {
     Switch,
 }
 
-#[derive(Clone, Debug)]
-pub struct FieldDef {
-    pub name: String,
-    pub shift: u32,
-    pub bits: u32,
-    pub signed: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmRole {
+    None,
+    /// Handler for the op with this index.
+    Handler(u32),
+    Entry,
+    Raise,
+    VmFn,
 }
 
 #[derive(Clone, Debug)]
-pub struct OpDef {
+pub struct VmOp {
     pub name: String,
     pub opcode: u32,
-    pub handler: FnId,
-    /// Words occupied (instruction + inline cache).
+    pub fid: FnId,
+    /// Words occupied (instruction + inline cache; sum of parts for supers).
     pub size: u32,
-    pub format: usize,
-    /// Operand kinds in order (indices into VmDef::operand_names) and the
-    /// format field each one maps to.
-    pub operands: Vec<(String, String, usize)>,
-    pub family: Option<String>,
-    pub super_parts: Vec<u32>,
-}
-
-#[derive(Clone, Debug)]
-pub struct FormatDef {
-    pub name: String,
-    pub fields: Vec<FieldDef>,
-}
-
-#[derive(Clone, Debug)]
-pub struct VmEntry {
-    pub name: String,
-    pub func: FnId,
+    pub parts: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct VmDef {
     pub name: String,
+    pub symbol: String,
     pub dispatch: Dispatch,
     pub word: IntTy,
-    pub opcode_bits: u32,
-    /// Context + state, in handler parameter order.
-    pub state: Vec<(String, Ty)>,
+    pub op_shift: u32,
+    pub op_bits: u32,
+    pub state_tys: Vec<Ty>,
+    pub state_names: Vec<String>,
+    pub pc_idx: usize,
     pub ret: Ty,
-    pub formats: Vec<FormatDef>,
-    pub ops: Vec<OpDef>,
-    pub entries: Vec<VmEntry>,
+    pub ops: Vec<VmOp>,
+    pub entries: Vec<FnId>,
     pub on_raise: Option<FnId>,
     pub raise_ty: Option<Ty>,
-    /// Instrumentation variants: name and wrapper handler per opcode.
-    pub variants: Vec<(String, Vec<FnId>)>,
-    /// Builder functions generated for each op (emit into a code buffer).
-    pub span: Span,
 }
 
 #[derive(Default)]

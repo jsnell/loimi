@@ -133,6 +133,9 @@ impl<'p> Codegen<'p> {
                 }
                 continue;
             }
+            if !crate::vmgen::standalone(p, f) {
+                continue;
+            }
             let text = FnGen::new(&mut self, i as FnId).run();
             self.fns.push_str(&text);
         }
@@ -152,6 +155,8 @@ impl<'p> Codegen<'p> {
             }
             let _ = writeln!(self.fns, "}}");
         }
+        crate::vmgen::emit_tables(p, &mut self.globals, &mut self.fns);
+        self.decls.insert("declare void @llvm.trap() noreturn");
         let _ = writeln!(self.globals, "@loimi.argc = global i32 0");
         let _ = writeln!(self.globals, "@loimi.argv = global ptr null");
         // Runtime support: panic.
@@ -308,6 +313,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if !self.terminated {
             self.term("unreachable");
         }
+        crate::vmgen::epilogue(&mut self);
         let linkage = if f.linkage == Linkage::Export { "" } else { "internal " };
         let mut attrs = vec!["nounwind"];
         match f.inline {

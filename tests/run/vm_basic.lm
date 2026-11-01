@@ -1,0 +1,111 @@
+// matrix: dispatch
+import std.io;
+
+struct Machine { limit: i64 }
+
+vm Calc {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+    }
+
+    cache Hits { n: u32 }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op MOV(dst: reg, src: reg) : ABC { dst = src; next }
+    op JLT(a: reg, b: reg, target: label) : ABsC {
+        if a < b { jump target }
+        next
+    }
+    op CHECK(a: reg) : ABC {
+        if a > ctx.limit { raise a }
+        next
+    }
+    op COUNT(dst: reg) : ABC + Hits {
+        cache.n = cache.n + 1;
+        dst = cache.n as i64;
+        next
+    }
+    family INC(dst: reg) : ABC {
+        generic { dst = dst + 1; become INC_FAST; next }
+        INC_FAST { dst = dst + 100; next }
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_MOV = ADD; MOV;
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> i64 {
+        ctx = m;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+
+    on raise(e: i64) { exit 0 - e }
+}
+
+fn sum_program(code: []u32, n: i16) -> u64 {
+    var at: u64 = 0;
+    at = Calc.emit.LOADI(code, at, 0, 0);     // r0 = i
+    at = Calc.emit.LOADI(code, at, 1, 0);     // r1 = sum
+    at = Calc.emit.LOADI(code, at, 2, n);     // r2 = n
+    at = Calc.emit.LOADI(code, at, 3, 1);     // r3 = 1
+    at = Calc.emit.ADD(code, at, 1, 1, 0);    // loop: sum += i
+    at = Calc.emit.MOV(code, at, 4, 1);       //       r4 = sum
+    at = Calc.emit.ADD(code, at, 0, 0, 3);    //       i += 1
+    at = Calc.emit.JLT(code, at, 0, 2, -3);   //       if i < n goto loop
+    at = Calc.emit.CHECK(code, at, 4);
+    at = Calc.emit.RET(code, at, 4);
+    at
+}
+
+fn main() {
+    var m = Machine { limit: 1000000 };
+    var code: [u32; 32] = [0; 32];
+    var regs: [i64; 8] = [0; 8];
+    sum_program(code[..], 100);
+    io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");
+
+    // Superinstruction fusion: ADD followed by MOV becomes ADD_MOV.
+    io.println(Calc.op_name(code[4]));
+    Calc.optimize(code[..]);
+    io.println(Calc.op_name(code[4]));
+    io.println(Calc.op_name(code[5]));
+    io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");
+
+    // Raise: the result exceeds the limit.
+    m.limit = 100;
+    io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");
+
+    // Inline cache and quickening.
+    var at: u64 = 0;
+    at = Calc.emit.LOADI(code[..], at, 0, 0);
+    at = Calc.emit.INC(code[..], at, 0);
+    at = Calc.emit.COUNT(code[..], at, 1);
+    at = Calc.emit.RET(code[..], at, 0);
+    io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");
+    io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");
+    io.println(Calc.op_name(code[1]));
+    io.print_int(regs[1]); io.println("");
+    io.print_int(Calc.op_size(code[2]) as i64); io.println("");
+}
+// expect: 4950
+// expect: ADD
+// expect: ADD_MOV
+// expect: MOV
+// expect: 4950
+// expect: -4950
+// expect: 1
+// expect: 100
+// expect: INC_FAST
+// expect: 2
+// expect: 2

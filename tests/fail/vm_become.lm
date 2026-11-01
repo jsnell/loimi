@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format A { op: 8, a: 8 } format B { op: 8, a: 8, b: 8 } }
+    op X(a: reg) : A { become Y; next }
+    op Y(a: reg, b: reg) : B { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: must have the same format, cache and operand kinds

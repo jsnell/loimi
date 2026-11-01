@@ -6,8 +6,10 @@ mod layout;
 mod lexer;
 mod parser;
 mod tir;
+mod values;
 mod vmast;
 mod vmcheck;
+mod vmexpand;
 mod vmgen;
 mod vmparse;
 
@@ -81,7 +83,8 @@ fn load(sm: &mut SourceMap, root: &Path) -> Result<Vec<ast::Module>, Diag> {
 
 fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
     let input = opts.input.as_ref().unwrap();
-    let modules = load(sm, input)?;
+    let mut modules = load(sm, input)?;
+    vmexpand::expand(sm, &mut modules)?;
     let mut c = check::Checker::new(&modules);
     c.dispatch_override = opts.dispatch;
     c.run()?;

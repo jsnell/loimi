@@ -1,0 +1,8 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op NOP() : A { next }
+    entry run(c: *u32) -> i64 { pc = c; next }
+}
+fn main() {}
+// error: `next` is only allowed in op handlers
