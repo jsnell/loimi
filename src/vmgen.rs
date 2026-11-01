@@ -21,6 +21,24 @@ pub struct HandlerGen {
     pub op_labels: Vec<String>,
     pub raise_slot: String,
     pub labels_global: String,
+    /// Tail-call handlers receive the current instruction word in a register.
+    pub insn_slot: Option<String>,
+}
+
+fn takes_insn(p: &Program, f: &FnDef) -> bool {
+    match (f.vm, f.vm_role) {
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        _ => false,
+    }
+}
+
+/// Extra codegen-only parameter of tail-call handlers.
+pub fn extra_param(p: &Program, f: &FnDef) -> Option<String> {
+    if takes_insn(p, f) {
+        Some(format!("i{} %insn", p.vms[f.vm.unwrap() as usize].word.bits))
+    } else {
+        None
+    }
 }
 
 pub fn table_name(vd: &VmDef) -> String {
@@ -50,7 +68,14 @@ pub fn handler_prologue(g: &mut FnGen) {
         op_labels: vec![],
         raise_slot: format!("@\"{}.raise_slot\"", vd.symbol),
         labels_global: format!("@\"{}.labels\"", f.symbol),
+        insn_slot: None,
     };
+    if takes_insn(p, f) {
+        let wt = Ty::Int(vd.word);
+        let slot = g.alloca(&wt);
+        g.store(&wt, "%insn", &slot);
+        hg.insn_slot = Some(slot);
+    }
     if combined {
         hg.dispatch_label = g.fresh_label("dispatch");
         hg.raise_label = g.fresh_label("raise");
@@ -137,12 +162,31 @@ pub fn epilogue(g: &mut FnGen) {
 
 /// Opcode of the word at `pc`, as i64.
 fn opcode_of(g: &mut FnGen, vd: &VmDef, pc: &str) -> String {
+    opcode_and_word(g, vd, pc).0
+}
+
+/// (opcode as i64, the word) at `pc`.
+fn opcode_and_word(g: &mut FnGen, vd: &VmDef, pc: &str) -> (String, String) {
     let wt = format!("i{}", vd.word.bits);
     let w = g.inst(format!("load {}, ptr {}", wt, pc));
+    let word = w.clone();
     let sh = if vd.op_shift == 0 { w } else { g.inst(format!("lshr {} {}, {}", wt, w, vd.op_shift)) };
     let mask = (1u64 << vd.op_bits) - 1;
     let m = if vd.op_shift + vd.op_bits >= vd.word.bits as u32 { sh } else { g.inst(format!("and {} {}, {}", wt, sh, mask)) };
-    if vd.word.bits == 64 { m } else { g.inst(format!("zext {} {} to i64", wt, m)) }
+    let opc = if vd.word.bits == 64 { m } else { g.inst(format!("zext {} {} to i64", wt, m)) };
+    (opc, word)
+}
+
+/// The current instruction word (from the register in tail-call handlers).
+fn current_word(g: &mut FnGen, vd: &VmDef) -> String {
+    let hg = g.vm.clone().unwrap();
+    match &hg.insn_slot {
+        Some(s) => g.inst(format!("load i{}, ptr {}", vd.word.bits, s)),
+        None => {
+            let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            g.inst(format!("load i{}, ptr {}", vd.word.bits, pc))
+        }
+    }
 }
 
 fn state_args(g: &mut FnGen, vd: &VmDef) -> String {
@@ -156,9 +200,9 @@ fn state_args(g: &mut FnGen, vd: &VmDef) -> String {
 }
 
 /// Transfer control to `target` (already stored in the pc slot).
-fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str) {
+fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
     let hg = g.vm.clone().unwrap();
-    let args = state_args(g, vd);
+    let args = format!("{}, i{} {}", state_args(g, vd), vd.word.bits, insn);
     let rt = ret_llty(g.p(), &vd.ret);
     let kind = if hg.role == VmRole::Entry { "" } else { "musttail " };
     if rt == "void" {
@@ -188,11 +232,11 @@ fn dispatch(g: &mut FnGen, target: &str) {
             g.term(format!("indirectbr ptr {}, [{}]", h, dests.join(", ")));
         }
     } else {
-        let opc = opcode_of(g, vd, target);
+        let (opc, word) = opcode_and_word(g, vd, target);
         let n = 1usize << vd.op_bits;
         let a = g.inst(format!("getelementptr inbounds [{} x ptr], ptr {}, i64 0, i64 {}", n, table_name(vd), opc));
         let h = g.inst(format!("load ptr, ptr {}", a));
-        tail_to(g, vd, &h);
+        tail_to(g, vd, &h, &word);
     }
 }
 
@@ -210,7 +254,10 @@ pub fn word_place(g: &mut FnGen, off: u32) -> String {
 pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     match v {
         TVm::Cold(b) => {
-            g.emit("call preserve_allcc void @loimi.cold()");
+            // A cold call-site attribute on a no-op intrinsic: the block is
+            // treated as unlikely, and no machine code is emitted.
+            g.cg.decls.insert("declare void @llvm.sideeffect()");
+            g.emit("call void @llvm.sideeffect() cold");
             g.val(b)
         }
         TVm::Jump(t) => {
@@ -238,7 +285,8 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 g.br(&hg.raise_label);
             } else {
                 let sym = format!("@\"{}\"", p.fns[vd.on_raise.unwrap() as usize].symbol);
-                tail_to(g, vd, &sym);
+                let w = current_word(g, vd);
+                tail_to(g, vd, &sym, &w);
             }
             g.poison(&e.ty)
         }
@@ -258,6 +306,11 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let nw = g.inst(format!("or {} {}, {}", wt, cleared, (*opc as u64) << vd.op_shift));
             g.emit(format!("store {} {}, ptr {}", wt, nw, pc));
             "zeroinitializer".into()
+        }
+        TVm::Word(0) if g.vm.as_ref().is_some_and(|h| h.insn_slot.is_some()) => {
+            let p = g.p();
+            let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
+            current_word(g, vd)
         }
         TVm::Word(_) => {
             let pl = g.place(e);
@@ -298,7 +351,12 @@ fn part_label(g: &mut FnGen, j: u32) -> String {
 /// Module-level definitions for tail-call vms: dispatch table, invalid-op
 /// handler, raise slot.
 pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
-    let _ = writeln!(fns, "define internal preserve_allcc void @loimi.cold() cold noinline nounwind {{\n  ret void\n}}\n");
+    // Calls to this mark a block as cold. The empty asm keeps the call from
+    // being deleted; preserve_all keeps it from clobbering any register.
+    let _ = writeln!(
+        fns,
+        "define internal preserve_allcc void @loimi.cold() cold noinline nounwind {{\n  call void asm sideeffect \"\", \"\"()\n  ret void\n}}\n"
+    );
     for vd in &p.vms {
         if vd.dispatch == Dispatch::TailCall {
             let n = 1usize << vd.op_bits;
@@ -311,7 +369,8 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
                 }
             }
             let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
-            let params: Vec<String> = vd.state_tys.iter().map(|t| llty(p, t)).collect();
+            let mut params: Vec<String> = vd.state_tys.iter().map(|t| llty(p, t)).collect();
+            params.push(format!("i{}", vd.word.bits));
             let _ = writeln!(
                 fns,
                 "define internal preserve_nonecc {} {}({}) noreturn nounwind {{\n  call void @llvm.trap()\n  unreachable\n}}\n",
@@ -356,7 +415,8 @@ pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty, _span: Span) {
         g.br(&hg.raise_label);
     } else {
         let sym = format!("@\"{}\"", p.fns[vd.on_raise.unwrap() as usize].symbol);
-        tail_to(g, vd, &sym);
+        let w = current_word(g, vd);
+        tail_to(g, vd, &sym, &w);
     }
 }
 

@@ -305,6 +305,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
         }
+        if let Some(x) = crate::vmgen::extra_param(p, f) {
+            params.push(x);
+        }
         crate::vmgen::handler_prologue(&mut self);
         let body = f.body.as_ref().unwrap();
         let v = self.val(body);
@@ -456,7 +459,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 format!("{{ ptr {}, i64 {} }}", g, s.len())
             }
             TK::Unit | TK::Zeroed => "zeroinitializer".into(),
-            TK::Local(_) | TK::Deref(_) | TK::Index(..) | TK::Vm(TVm::Word(_)) => {
+            TK::Local(_) | TK::Deref(_) | TK::Index(..) => {
                 let p = self.place(e);
                 self.load(&e.ty, &p)
             }

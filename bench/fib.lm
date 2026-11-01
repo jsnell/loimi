@@ -1,0 +1,114 @@
+// Benchmark: recursive fib(32) on a dynamically typed register VM.
+// See bench/fib.c for the equivalent hand-written C interpreter.
+import std.io;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+
+struct Frame { ret: *u32, regs: *Value }
+struct Ctx { base: *Frame }
+
+fn to_num(v: Value) -> f64 {
+    match v { Num(x) => x, Int(i) => i as f64, Nil => 0.0 }
+}
+
+fn arith_slow(op: i64, a: Value, b: Value) -> Value {
+    let (x, y) = (to_num(a), to_num(b));
+    if op == 0 { Num(x + y) } else { Num(x - y) }
+}
+
+vm B {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value, fp: *Frame }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand raw = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
+    op MOV(dst: reg, src: reg) : ABC { dst = src; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.add_checked(y) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x + y); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(0, a, b); next }
+    }
+    op SUB(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.sub_checked(y) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x - y); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(1, a, b); next }
+    }
+    op JLT(a: reg, b: reg, target: label) : ABsC {
+        if let (Int(x), Int(y)) = (a, b) {
+            if x < y { jump target }
+            next
+        }
+        cold {
+            if to_num(a) < to_num(b) { jump target }
+            next
+        }
+    }
+    op CALL(base: raw, target: label) : AsBx {
+        fp.ret = pc + 1;
+        fp.regs = regs;
+        fp = fp + 1;
+        regs = regs + base;
+        jump target
+    }
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.base { exit v }
+        fp = fp - 1;
+        regs[0] = v;
+        regs = fp.regs;
+        jump fp.ret
+    }
+
+    entry run(c: *Ctx, code: *u32, r: *Value) -> Value {
+        ctx = c;
+        fp = c.base;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+extern "C" fn malloc(n: u64) -> *u8;
+
+fn main() {
+    var code: [u32; 32] = [0; 32];
+    let c = code[..];
+    var at: u64 = 0;
+    at = B.emit.LOADI(c, at, 0, 32);     // 0: r0 = n
+    at = B.emit.CALL(c, at, 0, 2);       // 1: r0 = fib(r0)
+    at = B.emit.RET(c, at, 0);           // 2
+    at = B.emit.LOADI(c, at, 1, 2);      // 3: fib: r1 = 2
+    at = B.emit.JLT(c, at, 0, 1, 9);     // 4: if n < 2 goto 13
+    at = B.emit.LOADI(c, at, 1, 1);      // 5: r1 = 1
+    at = B.emit.SUB(c, at, 2, 0, 1);     // 6: r2 = n - 1
+    at = B.emit.CALL(c, at, 2, -4);      // 7: r2 = fib(r2)
+    at = B.emit.LOADI(c, at, 1, 2);      // 8: r1 = 2
+    at = B.emit.SUB(c, at, 3, 0, 1);     // 9: r3 = n - 2
+    at = B.emit.CALL(c, at, 3, -7);      // 10: r3 = fib(r3)
+    at = B.emit.ADD(c, at, 0, 2, 3);     // 11: r0 = r2 + r3
+    at = B.emit.RET(c, at, 0);           // 12
+    at = B.emit.RET(c, at, 0);           // 13: return n
+    var ctx = Ctx { base: malloc(1024 * 16) as *Frame };
+    let regs = malloc(4096 * 8) as *Value;
+    match B.run(&ctx, &code[0], regs) {
+        Int(r) => io.print_int(r as i64),
+        _ => io.print("?"),
+    }
+    io.println("");
+}
