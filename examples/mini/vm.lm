@@ -142,9 +142,35 @@ pub vm Mini {
     op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
     op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
 
-    op GETGLOBAL(dst: reg, name: kst) : ABx {
-        dst = value.table_get(ctx.globals, name);
-        next
+    // Global reads are quickened: the generic op finds the global's slot
+    // in the globals table and caches its index inline; GETGLOBAL_C then
+    // only checks that the key in that slot is still the same string.
+    // (The compiler interns string constants, so identity works.)
+    cache GlobalIC { slot: u32 }
+
+    family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
+        generic {
+            if let Some(i) = value.table_find(ctx.globals, name) {
+                cache.slot = i as u32;
+                dst = ctx.globals.slots.data[2 * i + 1];
+                become GETGLOBAL_C;
+                next
+            }
+            dst = Nil;
+            next
+        }
+        GETGLOBAL_C {
+            let g = ctx.globals;
+            let i = cache.slot as u64;
+            if likely(i < g.cap) {
+                let slots = g.slots.data.ptr;
+                if slots[2 * i] == name {
+                    dst = slots[2 * i + 1];
+                    next
+                }
+            }
+            cold { become GETGLOBAL; redo }
+        }
     }
     op SETGLOBAL(src: reg, name: kst) : ABx {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
@@ -356,6 +382,11 @@ pub vm Mini {
         k = fp.proto.consts.data.ptr;
         jump fp.resume
     }
+
+    // Compare-and-branch pairs produced by every `if` and `while`.
+    super LT_TEST = LT; TEST;
+    super LE_TEST = LE; TEST;
+    super EQ_TEST = EQ; TEST;
 
     entry run(c: *Ctx, p: Gc<Proto>) -> V {
         ctx = c;

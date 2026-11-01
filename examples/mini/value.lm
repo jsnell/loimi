@@ -96,6 +96,18 @@ pub fn table_get(t: Gc<Table>, k: V) -> V {
     }
 }
 
+/// Index of the slot holding key `k`, if present.
+pub fn table_find(t: Gc<Table>, k: V) -> ?u64 {
+    let mask = t.cap - 1;
+    var i = key_hash(k) & mask;
+    loop {
+        let key = t.slots.data[2 * i];
+        if key == V.Nil { return None; }
+        if raw_equal(key, k) { return Some(i); }
+        i = (i + 1) & mask;
+    }
+}
+
 fn table_insert(t: Gc<Table>, k: V, v: V) {
     let mask = t.cap - 1;
     var i = key_hash(k) & mask;

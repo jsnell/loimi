@@ -400,6 +400,11 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
             let np = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, size));
             g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
+            // The next part decodes its own word.
+            if let Some(slot) = &hg.insn_slot {
+                let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, np));
+                g.emit(format!("store i{} {}, ptr {}", vd.word.bits, w, slot));
+            }
             let l = part_label(g, *part);
             g.br(&l);
             g.poison(&e.ty)

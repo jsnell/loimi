@@ -8,6 +8,7 @@ import std.text;
 import std.gc;
 import std.os;
 import std.hash;
+import std.map;
 import value;
 import value.{V, Str, Arr, Table, Proto};
 import vm.{Mini};
@@ -184,6 +185,8 @@ struct Parser {
     tok: Token,
     heap: *gc.Heap,
     fs: *FuncState,
+    /// String constants interned across all functions of the chunk.
+    strings: map.HashMap<str, V>,
 }
 
 fn Parser.advance(p: *Parser) { p.tok = p.lx.next(); }
@@ -227,6 +230,14 @@ fn Parser.patch(p: *Parser, at: u64, target: u64) {
 }
 
 fn Parser.constant(p: *Parser, v: V) -> u32 {
+    // One string object per distinct string, across the whole chunk.
+    var v = v;
+    if let S(s) = v {
+        match p.strings.get(s.data) {
+            Some(existing) => v = existing,
+            None => { p.strings.insert(s.data, v); }
+        }
+    }
     let fs = p.fs;
     for i in 0..fs.consts.len {
         let c = fs.consts.at(i);
@@ -296,7 +307,10 @@ fn Parser.discharge(p: *Parser, e: E, dst: u32) {
         K(k) => { p.emit(Mini.LOADK(d, k as u16)); }
         Local(r) => { if r != dst { p.emit(Mini.MOVE(d, r as u8)); } }
         Temp(r) => { if r != dst { p.emit(Mini.MOVE(d, r as u8)); } }
-        Global(k) => { p.emit(Mini.GETGLOBAL(d, k as u16)); }
+        Global(k) => {
+            p.emit(Mini.GETGLOBAL(d, k as u16));
+            p.emit(0);   // inline cache word
+        }
         Field(t, k) => { p.emit(Mini.GETFIELD(d, t as u8, k as u8)); }
         Index(t, k) => { p.emit(Mini.GETINDEX(d, t as u8, k as u8)); }
         Reloc(at) => {
@@ -799,6 +813,7 @@ pub fn compile(h: *gc.Heap, src: str) -> Gc<Proto> {
         tok: Token { kind: T.Eof, text: "", line: 1, num: V.Nil },
         heap: h,
         fs: &fs,
+        strings: map.HashMap.new(),
     };
     p.advance();
     p.block();

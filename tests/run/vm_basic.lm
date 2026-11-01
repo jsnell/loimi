@@ -78,6 +78,7 @@ fn main() {
     // Superinstruction fusion: ADD followed by MOV becomes ADD_MOV.
     io.println(Calc.op_name(code[4]));
     Calc.optimize(code[..]);
+    regs[4] = 0;   // the fused MOV must recompute it
     io.println(Calc.op_name(code[4]));
     io.println(Calc.op_name(code[5]));
     io.print_int(Calc.run(&m, &code[0], &regs[0])); io.println("");

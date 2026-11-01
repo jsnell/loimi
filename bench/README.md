@@ -26,9 +26,12 @@ The Lua-like example interpreter (`examples/mini`), running recursive
 
 | Mode | fib(30) | loop |
 |---|---|---|
-| tail-call | 71 ms | 197 ms |
-| goto | 73 ms | 186 ms |
-| switch | 84 ms | 217 ms |
+| tail-call | 50 ms | 214 ms |
+| goto | 48 ms | 210 ms |
+| switch | 52 ms | 233 ms |
+
+(With the global-variable inline cache and compare-and-branch
+superinstructions. Before them, fib(30) took 71–84 ms.)
 
 Notes:
 
