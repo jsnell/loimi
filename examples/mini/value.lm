@@ -10,7 +10,9 @@ pub object Str { hash: u64, data: [u8] }
 pub object Arr { data: [V] }
 /// Open-addressing hash table; `slots` holds key/value pairs, Nil keys are empty.
 pub object Table { count: u64, cap: u64, slots: Gc<Arr> }
-pub object Proto { name: Gc<Str>, nparams: u32, nregs: u32, consts: Gc<Arr>, code: [u32] }
+/// Source line of each instruction.
+pub object Lines { data: [u32] }
+pub object Proto { name: Gc<Str>, nparams: u32, nregs: u32, consts: Gc<Arr>, lines: Gc<Lines>, code: [u32] }
 
 pub value V repr nanbox {
     Num(f64) unboxed,

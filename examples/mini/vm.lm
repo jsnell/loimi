@@ -395,7 +395,17 @@ pub vm Mini {
     }
 
     on raise(e: V) {
-        ctx.error = e;
+        // Prefix the message with the line of the failing instruction.
+        let p = fp.proto;
+        let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
+        var line: u32 = 0;
+        if i < p.lines.data.len { line = p.lines.data[i]; }
+        ctx.out.clear();
+        ctx.out.push_str("line ");
+        ctx.out.push_int(line as i64);
+        ctx.out.push_str(": ");
+        value.write_value(&ctx.out, e);
+        ctx.error = S(value.new_str(&ctx.heap, ctx.out.as_str()));
         ctx.fp = fp;
         exit Nil
     }

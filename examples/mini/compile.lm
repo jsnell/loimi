@@ -10,7 +10,7 @@ import std.os;
 import std.hash;
 import std.map;
 import value;
-import value.{V, Str, Arr, Table, Proto};
+import value.{V, Str, Arr, Table, Proto, Lines};
 import vm.{Mini};
 
 // ── lexer ────────────────────────────────────────────────────────────
@@ -164,6 +164,7 @@ struct FuncState {
     name: str,
     breaks: mem.Vec<u64>,
     loop_depth: u32,
+    lines: mem.Vec<u32>,
 }
 
 enum E {
@@ -187,9 +188,14 @@ struct Parser {
     fs: *FuncState,
     /// String constants interned across all functions of the chunk.
     strings: map.HashMap<str, V>,
+    /// Line of the last consumed token (recorded for each instruction).
+    line: u32,
 }
 
-fn Parser.advance(p: *Parser) { p.tok = p.lx.next(); }
+fn Parser.advance(p: *Parser) {
+    p.line = p.tok.line;
+    p.tok = p.lx.next();
+}
 
 fn Parser.check(p: *Parser, k: T, what: str) {
     if p.tok.kind != k {
@@ -211,6 +217,7 @@ fn Parser.accept(p: *Parser, k: T) -> bool {
 
 fn Parser.emit(p: *Parser, w: u32) -> u64 {
     p.fs.code.push(w);
+    p.fs.lines.push(p.line);
     p.fs.code.len - 1
 }
 
@@ -757,6 +764,7 @@ fn FuncState.new(name: str) -> FuncState {
         name: name,
         breaks: mem.Vec.new(),
         loop_depth: 0,
+        lines: mem.Vec.new(),
     }
 }
 
@@ -766,7 +774,9 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
     let consts = value.new_arr(h, fs.consts.len);
     for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
     let nregs = if fs.maxreg == 0 { 1 } else { fs.maxreg };
-    let proto = new(h, Proto { name: value.new_str(h, fs.name), nparams: fs.nparams, nregs: nregs, consts: consts }, fs.code.len);
+    let lines = new(h, Lines {}, fs.lines.len);
+    for i in 0..fs.lines.len { lines.data[i] = fs.lines.at(i); }
+    let proto = new(h, Proto { name: value.new_str(h, fs.name), nparams: fs.nparams, nregs: nregs, consts: consts, lines: lines }, fs.code.len);
     for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
     if let Some(bad) = Mini.verify(proto.code, proto) {
         var b = text.StrBuf.new();
@@ -779,6 +789,7 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
     fs.consts.free();
     fs.locals.free();
     fs.breaks.free();
+    fs.lines.free();
     proto
 }
 
@@ -814,6 +825,7 @@ pub fn compile(h: *gc.Heap, src: str) -> Gc<Proto> {
         heap: h,
         fs: &fs,
         strings: map.HashMap.new(),
+        line: 1,
     };
     p.advance();
     p.block();
