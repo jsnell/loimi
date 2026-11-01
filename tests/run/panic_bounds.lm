@@ -1,0 +1,7 @@
+fn get(xs: []i64, i: u64) -> i64 { xs[i] }
+fn main() {
+    let a = [1, 2, 3];
+    get(a[..], 3);
+}
+// expect-exit: 134
+// expect-stderr: panic_bounds.lm:1:36: index out of bounds

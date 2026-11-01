@@ -1,0 +1,49 @@
+// Minimal I/O on top of libc.
+
+extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+
+pub fn print(s: str) {
+    write(1, s.ptr, s.len);
+}
+
+pub fn println(s: str) {
+    write(1, s.ptr, s.len);
+    write(1, "\n".ptr, 1);
+}
+
+pub fn eprint(s: str) {
+    write(2, s.ptr, s.len);
+}
+
+pub fn eprintln(s: str) {
+    write(2, s.ptr, s.len);
+    write(2, "\n".ptr, 1);
+}
+
+pub fn print_int(x: i64) {
+    var buf: [u8; 24];
+    var i: u64 = 24;
+    var u: u64 = if x < 0 { 0 -% (x as u64) } else { x as u64 };
+    loop {
+        i -= 1;
+        buf[i] = '0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 { break; }
+    }
+    if x < 0 {
+        i -= 1;
+        buf[i] = '-';
+    }
+    print(buf[i..24]);
+}
+
+pub fn print_f64(x: f64) {
+    var buf: [u8; 64];
+    let n = snprintf(&buf[0], 64, "%.14g\0".ptr, x);
+    print(buf[0..n as u64]);
+}
+
+pub fn print_bool(b: bool) {
+    print(if b { "true" } else { "false" });
+}

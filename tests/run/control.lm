@@ -1,0 +1,109 @@
+import std.io;
+
+fn classify(n: i64) -> str {
+    match n {
+        0 => "zero",
+        1..=9 => "small",
+        10 | 20 | 30 => "round",
+        _ => "other",
+    }
+}
+
+fn first_even(xs: []i64) -> ?i64 {
+    var i: u64 = 0;
+    while i < xs.len {
+        let x = xs[i];
+        if x % 2 == 0 { return Some(x); }
+        i += 1;
+    }
+    None
+}
+
+fn sum_until_negative(xs: []i64) -> i64 {
+    var i: u64 = 0;
+    loop {
+        if i == xs.len { break xs.len as i64 * 1000; }
+        if xs[i] < 0 { break i as i64; }
+        i += 1;
+    }
+}
+
+fn with_defer(log: *[u8; 8], n: *u64) -> i64 {
+    defer { log[*n] = 'c'; *n += 1; }
+    log[*n] = 'a'; *n += 1;
+    if *n > 0 {
+        defer { log[*n] = 'b'; *n += 1; }
+        return 7;
+    }
+    0
+}
+
+fn parse_digit(c: u8) -> Result<i64, str> {
+    if c >= '0' and c <= '9' { Ok((c - '0') as i64) } else { Err("not a digit") }
+}
+
+fn sum_digits(s: str) -> Result<i64, str> {
+    var t = 0;
+    for i in 0..s.len {
+        t += parse_digit(s[i])?;
+    }
+    Ok(t)
+}
+
+fn get_x(p: ?*i64) -> i64 {
+    let Some(x) = p else { return -1; };
+    *x
+}
+
+fn main() {
+    io.println(classify(0));
+    io.println(classify(5));
+    io.println(classify(20));
+    io.println(classify(99));
+    let xs = [3, 5, 8, 9];
+    if let Some(e) = first_even(xs[..]) and e > 5 { io.print_int(e); io.println(""); }
+    io.print_int(sum_until_negative([1, 2, -3, 4][..])); io.println("");
+    io.print_int(sum_until_negative([1, 2][..])); io.println("");
+    var log: [u8; 8] = [0; 8];
+    var n: u64 = 0;
+    io.print_int(with_defer(&log, &n)); io.println("");
+    io.println(log[0..n]);
+    match sum_digits("1234") { Ok(v) => io.print_int(v), Err(e) => io.print(e) }
+    io.println("");
+    match sum_digits("12x4") { Ok(v) => io.print_int(v), Err(e) => io.print(e) }
+    io.println("");
+    var v = 42;
+    io.print_int(get_x(Some(&v))); io.println("");
+    io.print_int(get_x(None)); io.println("");
+    var count = 0;
+    for i in 0..10 {
+        if i % 3 == 0 { continue; }
+        if i == 8 { break; }
+        count += i;
+    }
+    io.print_int(count); io.println("");
+    let pair = (3, -4);
+    let (a, b) = pair;
+    match pair {
+        (0, _) => io.println("x zero"),
+        (_, y) if y < 0 => io.println("y negative"),
+        _ => io.println("other"),
+    }
+    io.print_int(a * b); io.println("");
+}
+// expect: zero
+// expect: small
+// expect: round
+// expect: other
+// expect: 8
+// expect: 2
+// expect: 2000
+// expect: 7
+// expect: abc
+// expect: 10
+// expect: not a digit
+// expect: 42
+// expect: -1
+// expect: 19
+// expect: y negative
+// expect: -12

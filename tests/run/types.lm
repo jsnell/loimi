@@ -1,0 +1,79 @@
+import std.io;
+
+const N: i64 = 4 * 8 + 2;
+const NAME: str = "loimi";
+
+enum Color: u8 { Red = 1, Green = 2, Blue = 4 }
+
+struct Node { value: i64, next: ?*Node }
+
+extern "C" fn malloc(n: u64) -> *u8;
+extern "C" fn free(p: *u8);
+
+fn list_sum(head: ?*Node) -> i64 {
+    var total = 0;
+    var cur = head;
+    while let Some(n) = cur {
+        total += n.value;
+        cur = n.next;
+    }
+    total
+}
+
+fn main() {
+    io.print_int(N); io.println("");
+    io.println(NAME);
+    io.print_int(Color.Blue as i64 + Color.Red as i64); io.println("");
+    let c = Color.Green;
+    io.print_bool(c == .Green); io.println("");
+    // Casts.
+    io.print_int((300 as u8) as i64); io.println("");
+    io.print_int((-1 as i8) as u8 as i64); io.println("");
+    io.print_int((3.99 as i64)); io.println("");
+    io.print_int((1e30 as i32) as i64); io.println("");
+    io.print_f64(7 as f64 / 2.0); io.println("");
+    io.print_int(size_of<Node>() as i64); io.println("");
+    // Heap-allocated linked list through raw pointers.
+    var head: ?*Node = None;
+    for i in 1..5 {
+        let n = malloc(size_of<Node>()) as *Node;
+        *n = Node { value: i * 10, next: head };
+        head = Some(n);
+    }
+    io.print_int(list_sum(head)); io.println("");
+    // Bit operations.
+    let x: u32 = 0xF0;
+    io.print_int((x >> 4) as i64); io.println("");
+    io.print_int(x.popcount() as i64); io.println("");
+    io.print_int((1 as u64 << 40).ctz() as i64); io.println("");
+    io.print_int((5 ^ 3) | 8); io.println("");
+    let w: u8 = 250;
+    io.print_int((w +% 10) as i64); io.println("");
+    io.print_int(f64.from_bits((2.5).to_bits()) as i64); io.println("");
+    // Arrays and slices.
+    var a: [i64; 5] = [1, 2, 3, 4, 5];
+    a[2] = 30;
+    let s = a[1..4];
+    io.print_int(s[1] + s.len as i64); io.println("");
+    let p = &a[0];
+    io.print_int(p.offset(4)[0]); io.println("");
+}
+// expect: 34
+// expect: loimi
+// expect: 5
+// expect: true
+// expect: 44
+// expect: 255
+// expect: 3
+// expect: 2147483647
+// expect: 3.5
+// expect: 16
+// expect: 100
+// expect: 15
+// expect: 4
+// expect: 40
+// expect: 14
+// expect: 4
+// expect: 2
+// expect: 33
+// expect: 5

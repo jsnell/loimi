@@ -1,0 +1,4 @@
+enum E { A, B, C }
+fn f(e: E) -> i64 { match e { A => 1, B => 2 } }
+fn main() {}
+// error: non-exhaustive match: missing C

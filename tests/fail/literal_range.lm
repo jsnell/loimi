@@ -1,0 +1,2 @@
+fn main() { let x: u8 = 256; }
+// error: literal `256` does not fit in `u8`

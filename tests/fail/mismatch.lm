@@ -1,0 +1,3 @@
+fn f() -> i64 { true }
+fn main() {}
+// error: mismatched types: expected `i64`, found `bool`

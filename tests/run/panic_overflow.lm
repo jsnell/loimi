@@ -1,0 +1,6 @@
+fn add(a: i32, b: i32) -> i32 { a + b }
+fn main() {
+    add(2147483647, 1);
+}
+// expect-exit: 134
+// expect-stderr: integer overflow
