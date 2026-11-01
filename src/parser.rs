@@ -463,7 +463,17 @@ impl Parser {
         self.err(format!("expected `;` or `}}`, found {}", self.describe()))
     }
 
+    fn starts_block_like(&self) -> bool {
+        self.is("{")
+            || matches!(self.peek(), Tok::Ident(s) if matches!(s.as_str(), "if" | "match" | "while" | "loop" | "for"))
+            || ((self.is_kw("unsafe") || self.is_kw("cold")) && self.is_at(1, "{"))
+    }
+
     fn parse_expr_stmt_inner(&mut self) -> Res<Expr> {
+        // Block-like expressions in statement position end at their `}`.
+        if self.starts_block_like() {
+            return self.parse_primary();
+        }
         let lhs = self.parse_expr()?;
         let start = lhs.span;
         let op = match self.peek() {

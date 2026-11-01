@@ -1831,7 +1831,9 @@ impl<'a> Checker<'a> {
             (Ty::Ptr(_) | Ty::Fn(..), Ty::Ptr(_)) => true,
             (Ty::Ptr(_), Ty::Int(it)) | (Ty::Int(it), Ty::Ptr(_)) => it.bits == 64,
             (Ty::Enum(e), Ty::Int(_)) => !self.prog.enums[*e as usize].has_payload(),
-            (Ty::Value(_), Ty::Int(it)) | (Ty::Int(it), Ty::Value(_)) => it.bits == 64,
+            (Ty::Value(v), Ty::Int(it)) | (Ty::Int(it), Ty::Value(v)) => {
+                it.bits == 64 && self.prog.values[*v as usize].repr != ValueRepr::Boxed
+            }
             _ => false,
         }
     }

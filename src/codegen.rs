@@ -64,7 +64,13 @@ pub fn llty(p: &Program, t: &Ty) -> String {
                 format!("i{}", e.tag.bits)
             }
         }
-        Ty::Value(_) => "i64".into(),
+        Ty::Value(i) => {
+            if p.values[*i as usize].repr == ValueRepr::Boxed {
+                "{ i64, i64 }".into()
+            } else {
+                "i64".into()
+            }
+        }
     }
 }
 
@@ -830,6 +836,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.branch_ok(&c, fail);
             }
             TPK::Tuple(ps) => {
+                if crate::values::try_merged_tuple(self, ps, t, ptr, fail) {
+                    return;
+                }
                 let lt = self.ty(t);
                 for (i, sp) in ps.iter().enumerate() {
                     if matches!(sp.kind, TPK::Wild) {
@@ -1141,6 +1150,16 @@ impl<'a, 'p> FnGen<'a, 'p> {
             return self.inst(format!("{} {} {}, {}", ins, lt, x, y));
         }
         let signed = matches!(t, Ty::Int(it) if it.signed);
+        if crate::values::is_boxed(self.p(), t) {
+            let mut parts = Vec::new();
+            for k in 0..2 {
+                let xa = self.inst(format!("extractvalue {{ i64, i64 }} {}, {}", x, k));
+                let ya = self.inst(format!("extractvalue {{ i64, i64 }} {}, {}", y, k));
+                parts.push(self.inst(format!("icmp eq i64 {}, {}", xa, ya)));
+            }
+            let both = self.inst(format!("and i1 {}, {}", parts[0], parts[1]));
+            return if op == BinOp::Eq { both } else { self.inst(format!("xor i1 {}, true", both)) };
+        }
         if op.is_cmp() {
             let c = match (op, signed) {
                 (Eq, _) => "eq",

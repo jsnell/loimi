@@ -1,0 +1,114 @@
+import std.io;
+
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    Ref(*Obj),
+}
+
+value L repr lowtag {
+    Int(i32),
+    Nil,
+    Ref(*Obj),
+}
+
+value B repr boxed {
+    Num(f64),
+    Int(i64),
+    Nil,
+}
+
+fn show(v: V) {
+    match v {
+        Num(x) => { io.print("num "); io.print_f64(x); }
+        Int(i) => { io.print("int "); io.print_int(i as i64); }
+        Nil => io.print("nil"),
+        Bool(b) => { io.print("bool "); io.print_bool(b); }
+        Ref(o) => { io.print("obj "); io.print_int(o.id); }
+    }
+    io.println("");
+}
+
+fn add(a: V, b: V) -> V {
+    match (a, b) {
+        (Int(x), Int(y)) => {
+            if let Some(r) = x.add_checked(y) { return Int(r); }
+            Num(x as f64 + y as f64)
+        }
+        (Num(x), Num(y)) => Num(x + y),
+        (Int(x), Num(y)) => Num(x as f64 + y),
+        (Num(x), Int(y)) => Num(x + y as f64),
+        _ => Nil,
+    }
+}
+
+fn ladd(a: L, b: L) -> L {
+    match (a, b) {
+        (Int(x), Int(y)) => Int(x +% y),
+        _ => Nil,
+    }
+}
+
+fn badd(a: B, b: B) -> B {
+    match (a, b) {
+        (Int(x), Int(y)) => Int(x + y),
+        (Num(x), Num(y)) => Num(x + y),
+        _ => Nil,
+    }
+}
+
+fn main() {
+    var o = Obj { id: 77 };
+    show(V.Num(1.5));
+    show(V.Int(-12));
+    show(V.Nil);
+    show(V.Bool(true));
+    show(V.Ref(&o));
+    show(add(V.Int(2), V.Int(40)));
+    show(add(V.Int(2147483647), V.Int(1)));
+    show(add(V.Num(0.25), V.Num(0.5)));
+    show(add(V.Int(1), V.Num(0.5)));
+    show(add(V.Nil, V.Int(1)));
+    // NaN canonicalization: a NaN payload can never look like a tagged value.
+    let nan = f64.from_bits(0xFFFF_0000_DEAD_BEEF);
+    match V.Num(nan) { Num(_) => io.println("nan is num"), _ => io.println("nan forged a tag!") }
+    io.print_int((V.Int(-1) as u64 >> 48) as i64); io.println("");
+    io.print_bool(V.Int(3) == V.Int(3)); io.println("");
+    // lowtag
+    match ladd(L.Int(-5), L.Int(3)) { Int(x) => io.print_int(x as i64), _ => io.print("?") }
+    io.println("");
+    match L.Ref(&o) { Ref(p) => io.print_int(p.id), _ => io.print("?") }
+    io.println("");
+    match ladd(L.Nil, L.Int(3)) { Nil => io.println("nil"), _ => io.println("?") }
+    // boxed
+    match badd(B.Int(1 << 40), B.Int(1)) { Int(x) => io.print_int(x), _ => io.print("?") }
+    io.println("");
+    match badd(B.Num(1.0), B.Num(2.0)) { Num(x) => io.print_f64(x), _ => io.print("?") }
+    io.println("");
+    io.print_bool(B.Nil == B.Nil); io.println("");
+    io.print_int(size_of<B>() as i64); io.println("");
+}
+// expect: num 1.5
+// expect: int -12
+// expect: nil
+// expect: bool true
+// expect: obj 77
+// expect: int 42
+// expect: num 2147483648
+// expect: num 0.75
+// expect: num 1.5
+// expect: nil
+// expect: nan is num
+// expect: 65529
+// expect: true
+// expect: -2
+// expect: 77
+// expect: nil
+// expect: 1099511627777
+// expect: 3
+// expect: true
+// expect: 16

@@ -56,7 +56,8 @@ pub fn size_of(p: &Program, t: &Ty) -> u64 {
         Ty::F64 => 8,
         Ty::Bool => 1,
         Ty::Unit | Ty::Never => 0,
-        Ty::Ptr(_) | Ty::Fn(..) | Ty::Value(_) => 8,
+        Ty::Ptr(_) | Ty::Fn(..) => 8,
+        Ty::Value(i) => if p.values[*i as usize].repr == ValueRepr::Boxed { 16 } else { 8 },
         Ty::Slice(_) => 16,
         Ty::Array(e, n) => size_of(p, e) * n,
         Ty::Option(inner) => {
