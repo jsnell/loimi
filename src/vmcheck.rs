@@ -537,11 +537,14 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
         exprs.push(if n > 1 { mk(Ty::Never, TK::Vm(TVm::Part(j as u32, Box::new(e))), span) } else { e });
     }
     let span = c.vms[vm as usize].ops[k].span;
-    let body = if exprs.len() == 1 {
+    let mut body = if exprs.len() == 1 {
         exprs.pop().unwrap()
     } else {
         mk(Ty::Never, TK::Block(exprs.into_iter().map(TStmt::Expr).collect(), None), span)
     };
+    if n == 1 {
+        crate::tirwalk::extend_cold(&mut body);
+    }
     let fd = &mut c.prog.fns[fid as usize];
     fd.params = state.clone();
     fd.locals = cx.locals;

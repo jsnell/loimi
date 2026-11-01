@@ -17,6 +17,19 @@ Results (Intel i7-6700, clang 19, 2026-11-01):
 | Loimi, `--dispatch=tailcall` | 67 ms |
 | Loimi, `--dispatch=switch` | 72 ms |
 
+After cold-block outlining (later the same day), the same benchmark
+measured tail-call 70 ms, goto 60 ms, C 67 ms, switch 75 ms. Expect about
+5% run-to-run drift on this machine.
+
+The Lua-like example interpreter (`examples/mini`), running recursive
+`fib(30)` and a 20M-iteration numeric `for` loop:
+
+| Mode | fib(30) | loop |
+|---|---|---|
+| tail-call | 71 ms | 197 ms |
+| goto | 73 ms | 186 ms |
+| switch | 84 ms | 217 ms |
+
 Notes:
 
 - The generated handlers are as tight as the C ones: `pc`, `regs`, the

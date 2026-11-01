@@ -23,6 +23,9 @@ pub struct Codegen<'p> {
     pub decls: Decls,
     pub str_count: u32,
     pub mark_fns: std::collections::HashMap<String, String>,
+    /// Outlined cold blocks waiting to be emitted: (handler, body, captured locals, symbol).
+    pub cold_queue: Vec<(FnId, TExpr, Vec<LocalId>, String)>,
+    pub cold_count: u32,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -105,6 +108,8 @@ impl<'p> Codegen<'p> {
             decls: Decls::default(),
             str_count: 0,
             mark_fns: Default::default(),
+            cold_queue: vec![],
+            cold_count: 0,
         }
     }
 
@@ -156,6 +161,12 @@ impl<'p> Codegen<'p> {
             }
             let text = FnGen::new(&mut self, i as FnId).run();
             self.fns.push_str(&text);
+            while let Some((fid, body, captured, sym)) = self.cold_queue.pop() {
+                let mut g = FnGen::new(&mut self, fid);
+                g.cold = Some((body, captured, sym));
+                let text = g.run();
+                self.fns.push_str(&text);
+            }
         }
         // Program entry wrapper.
         if let Some(m) = p.fns.iter().find(|f| f.symbol == "main.main" && f.body.is_some()) {
@@ -221,6 +232,8 @@ pub struct FnGen<'a, 'p> {
     pub vm: Option<crate::vmgen::HandlerGen>,
     /// Locals in scope (and initialized), innermost last: roots at calls that may collect.
     pub live: Vec<Vec<LocalId>>,
+    /// Generating an outlined cold block of this handler: (body, captured locals, symbol).
+    pub cold: Option<(TExpr, Vec<LocalId>, String)>,
 }
 
 impl<'a, 'p> FnGen<'a, 'p> {
@@ -237,6 +250,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             defers: vec![],
             vm: None,
             live: vec![vec![]],
+            cold: None,
         }
     }
 
@@ -338,7 +352,21 @@ impl<'a, 'p> FnGen<'a, 'p> {
             params.push(x);
         }
         crate::vmgen::handler_prologue(&mut self);
-        let body = f.body.as_ref().unwrap();
+        let cold = self.cold.take();
+        let body = match &cold {
+            Some((b, captured, sym)) => {
+                // Captured locals arrive through thread-local slots.
+                for &l in captured {
+                    let t = f.locals[l as usize].ty.clone();
+                    let v = self.load(&t, &format!("@\"{}.c{}\"", sym, l));
+                    let slot = self.slots[l as usize].clone();
+                    self.store(&t, &v, &slot);
+                    self.live[0].push(l);
+                }
+                b
+            }
+            None => f.body.as_ref().unwrap(),
+        };
         let v = self.val(body);
         if !self.terminated {
             if f.ret.is_unitlike() {
@@ -354,6 +382,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
         crate::vmgen::epilogue(&mut self);
         let linkage = if f.linkage == Linkage::Export { "" } else { "internal " };
         let mut attrs = vec!["nounwind"];
+        if cold.is_some() {
+            attrs.push("cold");
+            attrs.push("noinline");
+        }
+        let symbol = match &cold {
+            Some((_, _, s)) => s.clone(),
+            None => f.symbol.clone(),
+        };
         match f.inline {
             Some(true) => attrs.push("alwaysinline"),
             Some(false) => attrs.push("noinline"),
@@ -372,7 +408,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             linkage,
             cc_str(f.cc),
             ret_llty(p, &f.ret),
-            f.symbol,
+            symbol,
             params.join(", "),
             attrs.join(" ")
         );

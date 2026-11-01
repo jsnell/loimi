@@ -8,6 +8,7 @@ mod layout;
 mod lexer;
 mod parser;
 mod tir;
+mod tirwalk;
 mod values;
 mod vmast;
 mod vmcheck;
@@ -188,6 +189,9 @@ fn main() -> ExitCode {
     let status = Command::new(&clang)
         .arg(if opts.release { "-O3" } else { "-O1" })
         .arg("-Wno-override-module")
+        // Executables: absolute addressing lets dispatch index the table directly.
+        .arg("-fno-pic")
+        .arg("-no-pie")
         .arg("-x")
         .arg("ir")
         .arg(&ll)

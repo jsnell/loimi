@@ -327,6 +327,10 @@ pub fn word_place(g: &mut FnGen, off: u32) -> String {
 pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     match v {
         TVm::Cold(b) => {
+            if can_outline(g, b) {
+                outline(g, b);
+                return g.poison(&e.ty);
+            }
             // A cold call-site attribute on a no-op intrinsic: the block is
             // treated as unlikely, and no machine code is emitted.
             g.cg.decls.insert("declare void @llvm.sideeffect()");
@@ -437,6 +441,49 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     }
 }
 
+/// A cold block in a tail-call op handler that ends in control words on
+/// every path can move to its own function, reached by `musttail`: the hot
+/// path then makes no calls and needs no stack frame.
+fn can_outline(g: &FnGen, b: &TExpr) -> bool {
+    let Some(hg) = &g.vm else { return false };
+    if std::env::var_os("LOIMI_NO_OUTLINE").is_some() {
+        return false;
+    }
+    if hg.combined || b.ty != Ty::Never {
+        return false;
+    }
+    let p = g.p();
+    match g.f().vm_role {
+        VmRole::Handler(k) => p.vms[hg.vm as usize].ops[k as usize].parts.is_empty(),
+        _ => false,
+    }
+}
+
+fn outline(g: &mut FnGen, b: &TExpr) {
+    let p = g.p();
+    let f = g.f();
+    let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
+    let n = g.cg.cold_count;
+    g.cg.cold_count += 1;
+    let sym = format!("{}.cold{}", f.symbol, n);
+    let mut used = Vec::new();
+    let mut declared = Vec::new();
+    crate::tirwalk::locals(b, &mut used, &mut declared);
+    let captured: Vec<LocalId> =
+        used.into_iter().filter(|l| !declared.contains(l) && !f.vm_state.contains(l)).collect();
+    for &l in &captured {
+        let t = f.locals[l as usize].ty.clone();
+        let gname = format!("@\"{}.c{}\"", sym, l);
+        let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", gname, llty(p, &t));
+        let slot = g.slots[l as usize].clone();
+        let v = g.load(&t, &slot);
+        g.store(&t, &v, &gname);
+    }
+    let w = current_word(g, vd);
+    tail_to(g, vd, &format!("@\"{}\"", sym), &w);
+    g.cg.cold_queue.push((g.fid, b.clone(), captured, sym));
+}
+
 fn word_mask(bits: u8) -> i64 {
     if bits >= 64 { -1 } else { ((1u64 << bits) - 1) as i64 }
 }
@@ -494,7 +541,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
                 params.join(", ")
             );
             if let Some(rt) = &vd.raise_ty {
-                let _ = writeln!(globals, "@\"{}.raise_slot\" = internal thread_local global {} zeroinitializer", vd.symbol, llty(p, rt));
+                let _ = writeln!(globals, "@\"{}.raise_slot\" = internal thread_local(initialexec) global {} zeroinitializer", vd.symbol, llty(p, rt));
             }
         }
     }

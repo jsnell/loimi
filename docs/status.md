@@ -33,10 +33,16 @@ in [`language.md`](language.md). Updated 2026-11-01.
   before an effectful call from a handler, for example publishing `fp` or
   the stack top for the GC's root scanner. The design's fixed `ctx.sync` area
   became user-defined code.
-- **`cold` blocks are not outlined yet.** They are marked unlikely (a
-  `cold` call-site attribute on `llvm.sideeffect`), which moves them out of
-  the hot path's layout, but they still share the handler's register
-  allocation.
+- **Cold blocks are outlined with `musttail`, not with `preserve_most`
+  calls.** In tail-call mode, a `cold` block in an op handler that ends in
+  control words moves to its own function with the handler's signature,
+  and the handler reaches it with `musttail`. The hot path makes no call,
+  so it needs no stack frame. Handler locals the cold code uses travel
+  through thread-local slots (`initialexec`), written only on the cold path.
+  `if c { cold { .. } }` followed by code ending in a control word gets that
+  continuation copied into the cold block, so it can be outlined too. Other
+  cold blocks, and all cold blocks in goto/switch mode, stay inline and are
+  marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
 - **vm functions** can read and write state but cannot use control words.
 - **Effects** must be declared; they are not inferred for private functions.

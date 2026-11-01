@@ -235,8 +235,8 @@ pub vm Mini {
 
     op EQ(dst: reg, a: reg, b: reg) : ABC {
         if a == b { dst = Bool(true); next }
-        dst = Bool(value.raw_equal(a, b));
-        next
+        if let (Int(_), Int(_)) = (a, b) { dst = Bool(false); next }
+        cold { dst = Bool(value.raw_equal(a, b)); next }
     }
     op LT(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) { dst = Bool(x < y); next }
@@ -332,8 +332,10 @@ pub vm Mini {
             jump p.code.ptr
         }
         if let Native(id) = f {
-            regs[base] = native(ctx, id, regs + base + 1, nargs as u64);
-            next
+            cold {
+                regs[base] = native(ctx, id, regs + base + 1, nargs as u64);
+                next
+            }
         }
         cold { raise error(ctx, "attempt to call a ", f) }
     }

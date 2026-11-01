@@ -154,7 +154,7 @@ pub fn mark_fn(cg: &mut Codegen, t: &Ty) -> String {
 /// Runtime definitions: `loimi_trace_object`, the shadow-stack top.
 pub fn emit_runtime(cg: &mut Codegen) {
     let p = cg.p;
-    let _ = writeln!(cg.globals, "@loimi.shadow_top = internal thread_local global ptr null");
+    let _ = writeln!(cg.globals, "@loimi.shadow_top = internal thread_local(initialexec) global ptr null");
     let _ = writeln!(
         cg.fns,
         "define internal ptr @loimi_shadow_top() {{\n  %v = load ptr, ptr @loimi.shadow_top\n  ret ptr %v\n}}\n"
