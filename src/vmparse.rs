@@ -31,6 +31,10 @@ impl Parser {
             is_pub,
         };
         while !self.eat("}") {
+            if self.is_kw("inline") && self.is_kw_at(1, "for") {
+                self.expand_inline_for()?;
+                continue;
+            }
             let item_attrs = self.parse_attrs()?;
             let kw = match self.peek() {
                 Tok::Ident(s) => s.clone(),

@@ -208,29 +208,20 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
 
-    op ADD(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Int(x), Int(y)) => if let Some(r) = x.add_checked(y) { dst = Int(r); next },
-            (Num(x), Num(y)) => { dst = Num(x + y); next }
-            _ => {}
+    // One declaration, three ops.
+    inline for (name, checked, sym, code) in [
+        ("ADD", "add_checked", +, 0),
+        ("SUB", "sub_checked", -, 1),
+        ("MUL", "mul_checked", *, 2),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                _ => {}
+            }
+            cold { dst = arith_slow(ctx, code, a, b)?; next }
         }
-        cold { dst = arith_slow(ctx, 0, a, b)?; next }
-    }
-    op SUB(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Int(x), Int(y)) => if let Some(r) = x.sub_checked(y) { dst = Int(r); next },
-            (Num(x), Num(y)) => { dst = Num(x - y); next }
-            _ => {}
-        }
-        cold { dst = arith_slow(ctx, 1, a, b)?; next }
-    }
-    op MUL(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) { dst = Int(r); next },
-            (Num(x), Num(y)) => { dst = Num(x * y); next }
-            _ => {}
-        }
-        cold { dst = arith_slow(ctx, 2, a, b)?; next }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
         if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }

@@ -134,10 +134,136 @@ impl Parser {
 
     // ── items ────────────────────────────────────────────────────────
 
+    /// `inline for (a, b) in [(x1, y1), (x2, y2)] { tokens }`: expand the
+    /// body once per element, substituting each variable's tokens (wrapped
+    /// in parentheses when more than one token). `#a` turns a string or
+    /// identifier value into an identifier. The expansion is spliced into
+    /// the token stream in place of the construct.
+    pub fn expand_inline_for(&mut self) -> Res<()> {
+        let start = self.pos;
+        let span = self.span();
+        self.expect_kw("inline")?;
+        self.expect_kw("for")?;
+        let mut vars = Vec::new();
+        if self.eat("(") {
+            while !self.is(")") {
+                vars.push(self.ident()?.name);
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
+        } else {
+            vars.push(self.ident()?.name);
+        }
+        self.expect_kw("in")?;
+        self.expect("[")?;
+        // Elements: balanced token groups separated by top-level commas.
+        let mut elements: Vec<Vec<Vec<Token>>> = Vec::new();
+        while !self.is("]") {
+            let group = self.balanced_until(&[",", "]"])?;
+            let values = if vars.len() > 1 {
+                if group.len() < 2 || group[0].tok != Tok::Punct("(") {
+                    return Err(Diag::new(group.first().map(|t| t.span).unwrap_or(span), "expected a tuple of values"));
+                }
+                split_top_level(&group[1..group.len() - 1])
+            } else {
+                vec![group]
+            };
+            if values.len() != vars.len() {
+                return Err(Diag::new(span, format!("expected {} value(s) per element", vars.len())));
+            }
+            elements.push(values);
+            if !self.eat(",") {
+                break;
+            }
+        }
+        self.expect("]")?;
+        self.expect("{")?;
+        let mut body = self.balanced_until(&["}"])?;
+        self.expect("}")?;
+        if body.is_empty() {
+            body = vec![];
+        }
+        let mut out = Vec::new();
+        for values in &elements {
+            let mut i = 0;
+            while i < body.len() {
+                let t = &body[i];
+                if t.tok == Tok::Punct("#") {
+                    if let Some(Token { tok: Tok::Ident(v), span, .. }) = body.get(i + 1) {
+                        if let Some(k) = vars.iter().position(|x| x == v) {
+                            let name = match values[k].as_slice() {
+                                [Token { tok: Tok::Str(s), .. }] => String::from_utf8_lossy(s).into_owned(),
+                                [Token { tok: Tok::Ident(s), .. }] => s.clone(),
+                                _ => return Err(Diag::new(*span, format!("`#{}` needs a string or identifier value", v))),
+                            };
+                            out.push(Token { tok: Tok::Ident(name), span: *span, space_before: true });
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+                if let Tok::Ident(v) = &t.tok {
+                    if let Some(k) = vars.iter().position(|x| x == v) {
+                        let val = &values[k];
+                        let wrap = val.len() > 1;
+                        if wrap {
+                            out.push(Token { tok: Tok::Punct("("), span: t.span, space_before: true });
+                        }
+                        for vt in val {
+                            out.push(Token { tok: vt.tok.clone(), span: vt.span, space_before: vt.space_before });
+                        }
+                        if wrap {
+                            out.push(Token { tok: Tok::Punct(")"), span: t.span, space_before: false });
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+                out.push(t.clone());
+                i += 1;
+            }
+        }
+        let end = self.pos;
+        self.toks.splice(start..end, out);
+        self.pos = start;
+        Ok(())
+    }
+
+    /// Tokens up to (not including) one of `stops` at nesting depth 0.
+    fn balanced_until(&mut self, stops: &[&str]) -> Res<Vec<Token>> {
+        let mut depth = 0i32;
+        let mut out = Vec::new();
+        loop {
+            let t = self.peek().clone();
+            if t == Tok::Eof {
+                return self.err("unexpected end of file in `inline for`");
+            }
+            if depth == 0 {
+                if let Tok::Punct(p) = t {
+                    if stops.contains(&p) {
+                        return Ok(out);
+                    }
+                }
+            }
+            match t {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,
+                _ => {}
+            }
+            out.push(self.bump());
+        }
+    }
+
     pub fn parse_module(&mut self) -> Res<(Vec<Item>, Attrs)> {
         let mut items = Vec::new();
         let mut mod_attrs = Attrs::default();
         while *self.peek() != Tok::Eof {
+            if self.is_kw("inline") && self.is_kw_at(1, "for") {
+                self.expand_inline_for()?;
+                continue;
+            }
             if self.is("#") && self.is_at(1, "!") {
                 self.bump();
                 self.bump();
@@ -1090,6 +1216,27 @@ impl Parser {
             _ => self.err(format!("expected pattern, found {}", self.describe())),
         }
     }
+}
+
+fn split_top_level(toks: &[Token]) -> Vec<Vec<Token>> {
+    let mut out = vec![vec![]];
+    let mut depth = 0i32;
+    for t in toks {
+        match t.tok {
+            Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+            Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,
+            Tok::Punct(",") if depth == 0 => {
+                out.push(vec![]);
+                continue;
+            }
+            _ => {}
+        }
+        out.last_mut().unwrap().push(t.clone());
+    }
+    if out.last().is_some_and(|v| v.is_empty()) {
+        out.pop();
+    }
+    out
 }
 
 fn field(e: Expr, name: Ident) -> Expr {

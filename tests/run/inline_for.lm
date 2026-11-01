@@ -1,0 +1,25 @@
+import std.io;
+
+inline for (name, v) in [("one", 1), ("two", 2), ("forty_two", 6 * 7)] {
+    fn #name() -> i64 { v }
+}
+
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+    inline for (op_name, sym) in [(ADD, +), (SUB, -), (MUL, *)] {
+        op #op_name(d: reg, a: reg, b: reg) : A { d = a sym b; next }
+    }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *u32, regs: *i64) -> i64 { pc = c; r = regs; jump pc }
+}
+
+fn main() {
+    io.print_int(one() + two() + forty_two()); io.println("");
+    var code: [u32; 4] = [V.MUL(2, 0, 1), V.SUB(2, 2, 0), V.ADD(2, 2, 1), V.RET(2)];
+    var regs: [i64; 3] = [6, 7, 0];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 45
+// expect: 43

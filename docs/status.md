@@ -8,7 +8,7 @@ in [`language.md`](language.md). Updated 2026-11-01.
 | Area | Status |
 |---|---|
 | Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`). |
-| Core language | structs, enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking, `let ... else`, `if let` chains, loops with `break` values, `defer`, consts, casts, checked/wrapping arithmetic, overflow and bounds checks (overflow traps in debug builds). |
+| Core language | `inline for` (module level and in `vm` blocks), structs, enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking, `let ... else`, `if let` chains, loops with `break` values, `defer`, consts, casts, checked/wrapping arithmetic, overflow and bounds checks (overflow traps in debug builds). |
 | Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Methods resolve per instance, so `HashMap<K, V>` works with any key type that has `hash`/`eq` methods (no traits needed yet). |
 | `value` types | `nanbox`, `lowtag`, `boxed` representations; NaN canonicalization; tuple patterns merged into one test (xor/or/mask, umax). |
 | `vm` declarations | state, context, operand kinds, fixed-width formats, inline caches, `family` + `become`, `super`, vm functions, entries, `on raise`/`raise`, `cold`, `sync`. |
@@ -50,7 +50,10 @@ in [`language.md`](language.md). Updated 2026-11-01.
   and "cannot fall off the end" are not implemented.
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
   not through an external `set_dispatch`.
-- **Not yet built**: `inline for`, traits/interfaces, a moving,
+- **`inline for`** is token-level expansion: values are token sequences
+  (so operators like `+` work), and `#var` makes an identifier from a
+  string or identifier value.
+- **Not yet built**: traits/interfaces, a moving,
   incremental or generational GC, weak references, ephemerons, finalizers,
   `std.lex`/`parse`/`diag`/`bc`/`obj`/`num`/`rt`/`prof`/`test`, line tables,
   variable-length encodings, atomic `become` for shared code, and the C
