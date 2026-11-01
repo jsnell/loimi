@@ -22,6 +22,7 @@ pub struct Diag {
     pub notes: Vec<(Span, String)>,
 }
 
+#[allow(dead_code)]
 impl Diag {
     pub fn new(span: Span, msg: impl Into<String>) -> Diag {
         Diag { span, msg: msg.into(), notes: Vec::new() }

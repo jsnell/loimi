@@ -9,12 +9,14 @@ use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 use crate::vmast::*;
 
+#[allow(dead_code)]
 pub struct OperandKind {
     pub name: String,
     pub body: Expr,
     pub verify: Option<Expr>,
 }
 
+#[allow(dead_code)]
 pub struct OpInfo {
     pub name: String,
     pub opcode: u32,
@@ -31,6 +33,7 @@ pub struct OpInfo {
     pub span: Span,
 }
 
+#[allow(dead_code)]
 pub struct VmInfo {
     pub module: usize,
     pub name: String,
@@ -133,7 +136,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let word = IntTy { signed: false, bits: l.word_bits as u8 };
 
     let mut state: Vec<(String, Ty)> = Vec::new();
-    let mut add_state = |c: &mut Checker, p: &Param, state: &mut Vec<(String, Ty)>| -> Res<()> {
+    let add_state = |c: &mut Checker, p: &Param, state: &mut Vec<(String, Ty)>| -> Res<()> {
         if state.iter().any(|(n, _)| *n == p.name.name) {
             return Err(Diag::new(p.name.span, format!("state variable `{}` declared twice", p.name.name)));
         }

@@ -276,6 +276,7 @@ pub enum Item {
     Value(crate::vmast::ValueDecl),
 }
 
+#[allow(dead_code)]
 pub struct Module {
     pub path: Vec<String>,
     pub file: u32,

@@ -9,8 +9,6 @@ use crate::codegen::{llty, Codegen, FnGen};
 use crate::layout;
 use crate::tir::*;
 
-const HEADER: u64 = 24;
-
 /// Does a value of this type hold GC references?
 pub fn is_traced(p: &Program, t: &Ty) -> bool {
     match t {

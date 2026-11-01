@@ -112,7 +112,7 @@ pub fn epilogue(g: &mut FnGen) {
     let vd = &p.vms[hg.vm as usize];
     let entry_fid = g.fid;
     let entry_slots = g.slots.clone();
-    let mut emit_body = |g: &mut FnGen, fid: FnId, label: &str| {
+    let emit_body = |g: &mut FnGen, fid: FnId, label: &str| {
         let hf = &p.fns[fid as usize];
         g.fid = fid;
         let mut slots = Vec::new();
@@ -727,10 +727,6 @@ pub fn test_value_variant(g: &mut FnGen, t: &Ty, idx: u32, subs: &[TPat], ptr: &
 
 pub fn make_value(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) -> String {
     crate::values::make(g, t, idx, args, vals)
-}
-
-pub fn value_tag(_g: &mut FnGen, _a: &TExpr, _v: &str) -> String {
-    unreachable!()
 }
 
 pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty, _span: Span) {

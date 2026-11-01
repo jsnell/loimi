@@ -36,6 +36,7 @@ pub struct OpParam {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct OpDecl {
     pub name: Ident,
     pub params: Vec<OpParam>,

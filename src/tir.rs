@@ -10,7 +10,6 @@ pub struct IntTy {
 }
 
 impl IntTy {
-    pub const I8: IntTy = IntTy { signed: true, bits: 8 };
     pub const I32: IntTy = IntTy { signed: true, bits: 32 };
     pub const I64: IntTy = IntTy { signed: true, bits: 64 };
     pub const U8: IntTy = IntTy { signed: false, bits: 8 };
@@ -109,8 +108,6 @@ pub enum Intr {
     BitsToFloat,
     Sqrt,
     Floor,
-    /// Value types: construct variant (variant index in arg 0 as Int).
-    ValueTag,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
 }
@@ -131,6 +128,7 @@ pub enum TK {
     Bool(bool),
     Str(Vec<u8>),
     Unit,
+    #[allow(dead_code)]
     Zeroed,
     Local(LocalId),
     FnRef(FnId),
@@ -255,6 +253,7 @@ pub struct VariantDef {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct EnumDef {
     pub name: String,
     pub tag: IntTy,
@@ -273,11 +272,10 @@ pub enum CallConv {
     C,
     /// Interpreter handlers in tail-call mode.
     PreserveNone,
-    /// Outlined cold blocks.
-    PreserveMost,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct FnDef {
     pub name: String,
     pub symbol: String,
@@ -359,6 +357,7 @@ pub struct VmOp {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct VmDef {
     pub name: String,
     pub symbol: String,

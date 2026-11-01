@@ -95,7 +95,6 @@ fn cc_str(cc: CallConv) -> &'static str {
     match cc {
         CallConv::C => "",
         CallConv::PreserveNone => "preserve_nonecc ",
-        CallConv::PreserveMost => "preserve_mostcc ",
     }
 }
 
@@ -1489,7 +1488,6 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 decl(self.cg, &format!("declare double @llvm.{}.f64(double)", n));
                 self.inst(format!("call double @llvm.{}.f64(double {})", n, vals[0]))
             }
-            Intr::ValueTag => crate::vmgen::value_tag(self, &args[0], &vals[0]),
             Intr::GcMark => {
                 crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
                 "zeroinitializer".into()
