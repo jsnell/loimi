@@ -1,0 +1,25 @@
+-- Lots of garbage: strings and tables, while keeping some alive.
+local keep = {}
+for i = 1, 2000 do
+  local s = "item" .. i
+  local t = {}
+  t.name = s
+  if i % 100 == 0 then keep[i / 100] = t end
+end
+local out = ""
+for i = 1, 20 do out = out .. keep[i].name .. " " end
+print(out)
+function build(n)
+  if n == 0 then return {} end
+  local t = {}
+  t.child = build(n - 1)
+  t.label = "depth" .. n
+  return t
+end
+local tree = build(30)
+local d = 0
+local node = tree
+while node.child do d = d + 1 node = node.child end
+print(d, tree.label)
+-- expect: item100 item200 item300 item400 item500 item600 item700 item800 item900 item1000 item1100 item1200 item1300 item1400 item1500 item1600 item1700 item1800 item1900 item2000 
+-- expect: 30	depth30

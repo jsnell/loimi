@@ -1,0 +1,165 @@
+// Runtime values of the Mini language: NaN-boxed values, and GC-managed
+// strings, tables and function prototypes.
+
+import std.gc;
+import std.mem;
+import std.hash;
+import std.text;
+
+pub object Str { hash: u64, data: [u8] }
+pub object Arr { data: [V] }
+/// Open-addressing hash table; `slots` holds key/value pairs, Nil keys are empty.
+pub object Table { count: u64, cap: u64, slots: Gc<Arr> }
+pub object Proto { name: Gc<Str>, nparams: u32, nregs: u32, consts: Gc<Arr>, code: [u32] }
+
+pub value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    S(Gc<Str>),
+    T(Gc<Table>),
+    F(Gc<Proto>),
+    Native(i32),
+}
+
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str { hash: hash.bytes(s) }, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
+    let a = new(h, Arr {}, n);
+    for i in 0..n { a.data[i] = V.Nil; }
+    a
+}
+
+pub fn new_table(h: *gc.Heap) -> Gc<Table> {
+    new(h, Table { count: 0, cap: 8, slots: new_arr(h, 16) })
+}
+
+pub fn truthy(v: V) -> bool {
+    match v {
+        Nil => false,
+        Bool(b) => b,
+        _ => true,
+    }
+}
+
+pub fn type_name(v: V) -> str {
+    match v {
+        Num(_) | Int(_) => "number",
+        Nil => "nil",
+        Bool(_) => "boolean",
+        S(_) => "string",
+        T(_) => "table",
+        F(_) | Native(_) => "function",
+    }
+}
+
+/// Primitive equality: numbers by value, strings by content, others by identity.
+pub fn raw_equal(a: V, b: V) -> bool {
+    match (a, b) {
+        (Int(x), Int(y)) => x == y,
+        (Num(x), Num(y)) => x == y,
+        (Int(x), Num(y)) => x as f64 == y,
+        (Num(x), Int(y)) => x == y as f64,
+        (S(x), S(y)) => x.hash == y.hash and x.data.eq(y.data),
+        _ => a == b,
+    }
+}
+
+fn key_hash(k: V) -> u64 {
+    match k {
+        Int(i) => hash.mix(i as u64),
+        Num(x) => {
+            if x == x.floor() and x >= -2147483648.0 and x <= 2147483647.0 {
+                hash.mix((x as i32) as u64)
+            } else {
+                hash.mix(x.to_bits())
+            }
+        }
+        S(s) => s.hash,
+        _ => hash.mix(k as u64),
+    }
+}
+
+pub fn table_get(t: Gc<Table>, k: V) -> V {
+    let mask = t.cap - 1;
+    var i = key_hash(k) & mask;
+    loop {
+        let key = t.slots.data[2 * i];
+        if key == V.Nil { return V.Nil; }
+        if raw_equal(key, k) { return t.slots.data[2 * i + 1]; }
+        i = (i + 1) & mask;
+    }
+}
+
+fn table_insert(t: Gc<Table>, k: V, v: V) {
+    let mask = t.cap - 1;
+    var i = key_hash(k) & mask;
+    loop {
+        let key = t.slots.data[2 * i];
+        if key == V.Nil {
+            t.slots.data[2 * i] = k;
+            t.slots.data[2 * i + 1] = v;
+            t.count += 1;
+            return;
+        }
+        if raw_equal(key, k) {
+            t.slots.data[2 * i + 1] = v;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Set a key. (Assigning nil stores nil; keys are never removed.)
+pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
+    if (t.count + 1) * 4 > t.cap * 3 {
+        let old = t.slots;
+        let n = t.cap;
+        t.cap = n * 2;
+        t.slots = new_arr(h, t.cap * 2);
+        t.count = 0;
+        for i in 0..n {
+            let key = old.data[2 * i];
+            if key != V.Nil { table_insert(t, key, old.data[2 * i + 1]); }
+        }
+    }
+    table_insert(t, k, v);
+}
+
+pub fn to_num(v: V) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// Number from a double: an Int when it is integral and fits.
+pub fn number(x: f64) -> V {
+    V.Num(x)
+}
+
+pub fn write_value(b: *text.StrBuf, v: V) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => {
+            if x == x.floor() and x > -1e15 and x < 1e15 {
+                b.push_int(x as i64);
+                b.push_str(".0");
+            } else {
+                b.push_f64(x);
+            }
+        }
+        Nil => b.push_str("nil"),
+        Bool(x) => b.push_str(if x { "true" } else { "false" }),
+        S(s) => b.push_str(s.data),
+        T(t) => { b.push_str("table: "); b.push_int(t as i64); }
+        F(p) => { b.push_str("function: "); b.push_str(p.name.data); }
+        Native(_) => b.push_str("function: builtin"),
+    }
+}

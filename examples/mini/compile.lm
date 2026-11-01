@@ -1,0 +1,801 @@
+// Mini compiler: source text → register bytecode, in a single pass.
+// Expressions are tracked as descriptors (as in Lua's expdesc) so that
+// values are only materialized in a register when needed.
+
+import std.io;
+import std.mem;
+import std.text;
+import std.gc;
+import std.os;
+import std.hash;
+import value;
+import value.{V, Str, Arr, Table, Proto};
+import vm.{Mini};
+
+// ── lexer ────────────────────────────────────────────────────────────
+
+enum T {
+    Eof, Name, Number, String,
+    And, Break, Do, Else, Elseif, End, False, For, Function, If, Local, Nil, Not, Or, Return, Then, True, While,
+    Plus, Minus, Star, Slash, Percent, Concat, Eq, Ne, Lt, Le, Gt, Ge, Assign,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Dot, Semi,
+}
+
+struct Token { kind: T, text: str, line: u32, num: V }
+
+struct Lexer { src: str, pos: u64, line: u32 }
+
+fn keyword(s: str) -> T {
+    if s.eq("and") { return T.And; }
+    if s.eq("break") { return T.Break; }
+    if s.eq("do") { return T.Do; }
+    if s.eq("else") { return T.Else; }
+    if s.eq("elseif") { return T.Elseif; }
+    if s.eq("end") { return T.End; }
+    if s.eq("false") { return T.False; }
+    if s.eq("for") { return T.For; }
+    if s.eq("function") { return T.Function; }
+    if s.eq("if") { return T.If; }
+    if s.eq("local") { return T.Local; }
+    if s.eq("nil") { return T.Nil; }
+    if s.eq("not") { return T.Not; }
+    if s.eq("or") { return T.Or; }
+    if s.eq("return") { return T.Return; }
+    if s.eq("then") { return T.Then; }
+    if s.eq("true") { return T.True; }
+    if s.eq("while") { return T.While; }
+    T.Name
+}
+
+fn Lexer.peek(lx: *Lexer, off: u64) -> u8 {
+    if lx.pos + off < lx.src.len { lx.src[lx.pos + off] } else { 0 }
+}
+
+fn fail(line: u32, msg: str) -> never {
+    io.eprint("syntax error on line ");
+    var b = text.StrBuf.new();
+    b.push_int(line as i64);
+    b.push_str(": ");
+    b.push_str(msg);
+    io.eprintln(b.as_str());
+    os.quit(1)
+}
+
+fn Lexer.next(lx: *Lexer) -> Token {
+    // Whitespace and comments.
+    loop {
+        let c = lx.peek(0);
+        if c == '\n' { lx.line += 1; lx.pos += 1; continue; }
+        if text.is_space(c) { lx.pos += 1; continue; }
+        if c == '-' and lx.peek(1) == '-' {
+            while lx.pos < lx.src.len and lx.peek(0) != '\n' { lx.pos += 1; }
+            continue;
+        }
+        break;
+    }
+    let start = lx.pos;
+    let line = lx.line;
+    if lx.pos >= lx.src.len {
+        return Token { kind: T.Eof, text: "", line: line, num: V.Nil };
+    }
+    let c = lx.peek(0);
+    if text.is_alpha(c) {
+        while text.is_alpha(lx.peek(0)) or text.is_digit(lx.peek(0)) { lx.pos += 1; }
+        let s = lx.src[start..lx.pos];
+        return Token { kind: keyword(s), text: s, line: line, num: V.Nil };
+    }
+    if text.is_digit(c) {
+        var is_float = false;
+        while text.is_digit(lx.peek(0)) { lx.pos += 1; }
+        if lx.peek(0) == '.' and text.is_digit(lx.peek(1)) {
+            is_float = true;
+            lx.pos += 1;
+            while text.is_digit(lx.peek(0)) { lx.pos += 1; }
+        }
+        if lx.peek(0) == 'e' or lx.peek(0) == 'E' {
+            is_float = true;
+            lx.pos += 1;
+            if lx.peek(0) == '+' or lx.peek(0) == '-' { lx.pos += 1; }
+            while text.is_digit(lx.peek(0)) { lx.pos += 1; }
+        }
+        let s = lx.src[start..lx.pos];
+        var num = V.Nil;
+        if !is_float {
+            if let Some(i) = text.parse_int(s) and i >= -2147483648 and i <= 2147483647 {
+                num = V.Int(i as i32);
+            }
+        }
+        if num == V.Nil {
+            let Some(f) = text.parse_f64(s) else { fail(line, "malformed number") };
+            num = V.Num(f);
+        }
+        return Token { kind: T.Number, text: s, line: line, num: num };
+    }
+    if c == '"' or c == '\'' {
+        lx.pos += 1;
+        while lx.peek(0) != c {
+            if lx.pos >= lx.src.len or lx.peek(0) == '\n' { fail(line, "unfinished string"); }
+            if lx.peek(0) == '\\' { lx.pos += 1; }
+            lx.pos += 1;
+        }
+        lx.pos += 1;
+        return Token { kind: T.String, text: lx.src[start + 1..lx.pos - 1], line: line, num: V.Nil };
+    }
+    lx.pos += 1;
+    let two = lx.peek(0);
+    var kind = T.Eof;
+    match c {
+        '+' => kind = T.Plus,
+        '-' => kind = T.Minus,
+        '*' => kind = T.Star,
+        '/' => kind = T.Slash,
+        '%' => kind = T.Percent,
+        '(' => kind = T.LParen,
+        ')' => kind = T.RParen,
+        '{' => kind = T.LBrace,
+        '}' => kind = T.RBrace,
+        '[' => kind = T.LBracket,
+        ']' => kind = T.RBracket,
+        ',' => kind = T.Comma,
+        ';' => kind = T.Semi,
+        '.' => if two == '.' { lx.pos += 1; kind = T.Concat; } else { kind = T.Dot; },
+        '=' => if two == '=' { lx.pos += 1; kind = T.Eq; } else { kind = T.Assign; },
+        '<' => if two == '=' { lx.pos += 1; kind = T.Le; } else { kind = T.Lt; },
+        '>' => if two == '=' { lx.pos += 1; kind = T.Ge; } else { kind = T.Gt; },
+        '~' => if two == '=' { lx.pos += 1; kind = T.Ne; } else { fail(line, "unexpected '~'"); },
+        _ => fail(line, "unexpected character"),
+    }
+    Token { kind: kind, text: lx.src[start..lx.pos], line: line, num: V.Nil }
+}
+
+// ── function state and expression descriptors ───────────────────────
+
+struct Local { name: str, reg: u32 }
+
+struct FuncState {
+    code: mem.Vec<u32>,
+    consts: mem.Vec<V>,
+    locals: mem.Vec<Local>,
+    nactive: u32,
+    freereg: u32,
+    maxreg: u32,
+    nparams: u32,
+    name: str,
+    breaks: mem.Vec<u64>,
+    loop_depth: u32,
+}
+
+enum E {
+    Nil,
+    True,
+    False,
+    K(u32),
+    I(i32),
+    Local(u32),
+    Temp(u32),
+    Global(u32),
+    Field(u32, u32),
+    Index(u32, u32),
+    Reloc(u64),
+}
+
+struct Parser {
+    lx: Lexer,
+    tok: Token,
+    heap: *gc.Heap,
+    fs: *FuncState,
+}
+
+fn Parser.advance(p: *Parser) { p.tok = p.lx.next(); }
+
+fn Parser.check(p: *Parser, k: T, what: str) {
+    if p.tok.kind != k {
+        var b = text.StrBuf.new();
+        b.push_str("expected ");
+        b.push_str(what);
+        b.push_str(" near '");
+        b.push_str(p.tok.text);
+        b.push_str("'");
+        fail(p.tok.line, b.as_str());
+    }
+    p.advance();
+}
+
+fn Parser.accept(p: *Parser, k: T) -> bool {
+    if p.tok.kind == k { p.advance(); return true; }
+    false
+}
+
+fn Parser.emit(p: *Parser, w: u32) -> u64 {
+    p.fs.code.push(w);
+    p.fs.code.len - 1
+}
+
+fn Parser.pc(p: *Parser) -> u64 { p.fs.code.len }
+
+/// Point the jump at `at` to `target`.
+fn Parser.patch(p: *Parser, at: u64, target: u64) {
+    let w = p.fs.code.at(at);
+    let off = target as i64 - at as i64;
+    let op = Mini.opcode(w);
+    if op == Mini.OP_JMP {
+        p.fs.code.set(at, Mini.JMP(off as i32));
+    } else {
+        if off < -32768 or off > 32767 { fail(p.tok.line, "control structure too long"); }
+        p.fs.code.set(at, (w & 0xFFFF) | (((off as i32) as u32 & 0xFFFF) << 16));
+    }
+}
+
+fn Parser.constant(p: *Parser, v: V) -> u32 {
+    let fs = p.fs;
+    for i in 0..fs.consts.len {
+        let c = fs.consts.at(i);
+        let same = match (c, v) {
+            (S(a), S(b)) => a.data.eq(b.data),
+            _ => c == v,
+        };
+        if same { return i as u32; }
+    }
+    if fs.consts.len >= 65535 { fail(p.tok.line, "too many constants"); }
+    fs.consts.push(v);
+    (fs.consts.len - 1) as u32
+}
+
+fn Parser.string_const(p: *Parser, s: str) -> u32 {
+    // Process escapes.
+    var b = text.StrBuf.new();
+    var i: u64 = 0;
+    while i < s.len {
+        var c = s[i];
+        if c == '\\' and i + 1 < s.len {
+            i += 1;
+            c = match s[i] { 'n' => '\n', 't' => '\t', 'r' => '\r', '0' => 0, x => x };
+        }
+        b.push(c);
+        i += 1;
+    }
+    let k = p.constant(V.S(value.new_str(p.heap, b.as_str())));
+    b.free();
+    k
+}
+
+fn Parser.reserve(p: *Parser, n: u32) -> u32 {
+    let r = p.fs.freereg;
+    p.fs.freereg += n;
+    if p.fs.freereg > p.fs.maxreg { p.fs.maxreg = p.fs.freereg; }
+    if p.fs.freereg > 250 { fail(p.tok.line, "function or expression needs too many registers"); }
+    r
+}
+
+fn Parser.free_reg(p: *Parser, r: u32) {
+    if r >= p.fs.nactive {
+        p.fs.freereg -= 1;
+        if r != p.fs.freereg { fail(p.tok.line, "internal error: register freed out of order"); }
+    }
+}
+
+fn Parser.free_exp(p: *Parser, e: E) {
+    match e {
+        Temp(r) => p.free_reg(r),
+        Field(t, _) => p.free_reg(t),
+        Index(t, k) => {
+            if k > t { p.free_reg(k); p.free_reg(t); } else { p.free_reg(t); p.free_reg(k); }
+        }
+        _ => {}
+    }
+}
+
+/// Emit code that leaves the value of `e` in `dst` (no freeing).
+fn Parser.discharge(p: *Parser, e: E, dst: u32) {
+    let d = dst as u8;
+    match e {
+        Nil => { p.emit(Mini.LOADNIL(d)); }
+        True => { p.emit(Mini.LOADBOOL(d, 1)); }
+        False => { p.emit(Mini.LOADBOOL(d, 0)); }
+        I(i) => { p.emit(Mini.LOADI(d, i as i16)); }
+        K(k) => { p.emit(Mini.LOADK(d, k as u16)); }
+        Local(r) => { if r != dst { p.emit(Mini.MOVE(d, r as u8)); } }
+        Temp(r) => { if r != dst { p.emit(Mini.MOVE(d, r as u8)); } }
+        Global(k) => { p.emit(Mini.GETGLOBAL(d, k as u16)); }
+        Field(t, k) => { p.emit(Mini.GETFIELD(d, t as u8, k as u8)); }
+        Index(t, k) => { p.emit(Mini.GETINDEX(d, t as u8, k as u8)); }
+        Reloc(at) => {
+            let w = p.fs.code.at(at);
+            p.fs.code.set(at, (w & 0xFFFF00FF) | (dst << 8));
+        }
+    }
+}
+
+/// Put `e` in the next free register.
+fn Parser.to_next_reg(p: *Parser, e: E) -> u32 {
+    p.free_exp(e);
+    let r = p.reserve(1);
+    p.discharge(e, r);
+    r
+}
+
+/// Any register holding the value of `e` (a local's own register if possible).
+fn Parser.any_reg(p: *Parser, e: E) -> E {
+    match e {
+        Local(_) | Temp(_) => e,
+        _ => E.Temp(p.to_next_reg(e)),
+    }
+}
+
+fn reg_of(e: E) -> u32 {
+    match e {
+        Local(r) => r,
+        Temp(r) => r,
+        _ => 0,
+    }
+}
+
+fn Parser.store_to_local(p: *Parser, e: E, r: u32) {
+    p.free_exp(e);
+    p.discharge(e, r);
+}
+
+// ── expressions ─────────────────────────────────────────────────────
+
+fn Parser.find_local(p: *Parser, name: str) -> ?u32 {
+    var i = p.fs.locals.len;
+    while i > 0 {
+        i -= 1;
+        let l = p.fs.locals.at(i);
+        if l.name.eq(name) { return Some(l.reg); }
+    }
+    None
+}
+
+fn small_int(v: V) -> ?i32 {
+    if let Int(i) = v and i >= -32768 and i <= 32767 { return Some(i); }
+    None
+}
+
+fn Parser.primary(p: *Parser) -> E {
+    let t = p.tok;
+    match t.kind {
+        Name => {
+            p.advance();
+            if let Some(r) = p.find_local(t.text) { return E.Local(r); }
+            let k = p.constant(V.S(value.new_str(p.heap, t.text)));
+            E.Global(k)
+        }
+        LParen => {
+            p.advance();
+            let e = p.expr();
+            p.check(T.RParen, "')'");
+            // A parenthesized call or field read is just a value.
+            p.any_reg(e)
+        }
+        _ => fail(t.line, "unexpected symbol"),
+    }
+}
+
+fn Parser.field_key(p: *Parser, t: E, k: u32) -> E {
+    if k <= 255 { return E.Field(reg_of(t), k); }
+    let kr = p.reserve(1);
+    p.emit(Mini.LOADK(kr as u8, k as u16));
+    E.Index(reg_of(t), kr)
+}
+
+fn Parser.suffixed(p: *Parser) -> E {
+    var e = p.primary();
+    loop {
+        match p.tok.kind {
+            Dot => {
+                p.advance();
+                let name = p.tok;
+                p.check(T.Name, "field name");
+                let t = p.any_reg(e);
+                let k = p.constant(V.S(value.new_str(p.heap, name.text)));
+                e = p.field_key(t, k);
+            }
+            LBracket => {
+                p.advance();
+                let t = p.any_reg(e);
+                let ke = p.expr();
+                let k = p.any_reg(ke);
+                p.check(T.RBracket, "']'");
+                e = E.Index(reg_of(t), reg_of(k));
+            }
+            LParen => {
+                p.advance();
+                let base = p.to_next_reg(e);
+                var nargs: u32 = 0;
+                if p.tok.kind != T.RParen {
+                    loop {
+                        let a = p.expr();
+                        p.to_next_reg(a);
+                        nargs += 1;
+                        if !p.accept(T.Comma) { break; }
+                    }
+                }
+                p.check(T.RParen, "')'");
+                p.emit(Mini.CALL(base as u8, nargs as u8));
+                p.fs.freereg = base + 1;
+                e = E.Temp(base);
+            }
+            _ => return e,
+        }
+    }
+}
+
+fn Parser.simple(p: *Parser) -> E {
+    let t = p.tok;
+    match t.kind {
+        Number => {
+            p.advance();
+            if let Some(i) = small_int(t.num) { return E.I(i); }
+            E.K(p.constant(t.num))
+        }
+        String => {
+            p.advance();
+            E.K(p.string_const(t.text))
+        }
+        Nil => { p.advance(); E.Nil }
+        True => { p.advance(); E.True }
+        False => { p.advance(); E.False }
+        LBrace => {
+            p.advance();
+            p.check(T.RBrace, "'}' (table constructors take no items)");
+            E.Reloc(p.emit(Mini.NEWTABLE(0)))
+        }
+        _ => p.suffixed(),
+    }
+}
+
+/// (left priority, right priority) of a binary operator.
+fn priority(k: T) -> (u32, u32) {
+    match k {
+        Or => (1, 1),
+        And => (2, 2),
+        Eq | Ne | Lt | Le | Gt | Ge => (3, 3),
+        Concat => (5, 4),
+        Plus | Minus => (6, 6),
+        Star | Slash | Percent => (7, 7),
+        _ => (0, 0),
+    }
+}
+
+const UNARY: u32 = 8;
+
+fn Parser.expr(p: *Parser) -> E { p.subexpr(0) }
+
+fn Parser.subexpr(p: *Parser, limit: u32) -> E {
+    var e: E = E.Nil;
+    if p.tok.kind == T.Not or p.tok.kind == T.Minus {
+        let op = p.tok.kind;
+        p.advance();
+        let operand = p.subexpr(UNARY);
+        var folded = false;
+        if op == T.Minus {
+            if let I(i) = operand { e = E.I(0 - i); folded = true; }
+        }
+        if !folded {
+            let r = p.any_reg(operand);
+            p.free_exp(r);
+            let w = if op == T.Not { Mini.NOT(0, reg_of(r) as u8) } else { Mini.NEG(0, reg_of(r) as u8) };
+            e = E.Reloc(p.emit(w));
+        }
+    } else {
+        e = p.simple();
+    }
+    loop {
+        let op = p.tok.kind;
+        let (lp, rp) = priority(op);
+        if lp <= limit { break; }
+        p.advance();
+        if op == T.And or op == T.Or {
+            let r = p.to_next_reg(e);
+            let w = if op == T.And { Mini.TEST(r as u8, 0) } else { Mini.TESTT(r as u8, 0) };
+            let j = p.emit(w);
+            let rhs = p.subexpr(rp);
+            p.store_to_local(rhs, r);
+            p.patch(j, p.pc());
+            e = E.Temp(r);
+            continue;
+        }
+        let l = p.any_reg(e);
+        let rhs = p.subexpr(rp);
+        let r = p.any_reg(rhs);
+        p.free_exp(r);
+        p.free_exp(l);
+        let (a, b) = (reg_of(l) as u8, reg_of(r) as u8);
+        let w = match op {
+            Plus => Mini.ADD(0, a, b),
+            Minus => Mini.SUB(0, a, b),
+            Star => Mini.MUL(0, a, b),
+            Slash => Mini.DIV(0, a, b),
+            Percent => Mini.MOD(0, a, b),
+            Concat => Mini.CONCAT(0, a, b),
+            Eq | Ne => Mini.EQ(0, a, b),
+            Lt => Mini.LT(0, a, b),
+            Le => Mini.LE(0, a, b),
+            Gt => Mini.LT(0, b, a),
+            Ge => Mini.LE(0, b, a),
+            _ => fail(p.tok.line, "bad operator"),
+        };
+        e = E.Reloc(p.emit(w));
+        if op == T.Ne {
+            let t = p.to_next_reg(e);
+            p.free_reg(t);
+            e = E.Reloc(p.emit(Mini.NOT(0, t as u8)));
+        }
+    }
+    e
+}
+
+// ── statements ──────────────────────────────────────────────────────
+
+fn block_end(k: T) -> bool {
+    k == T.End or k == T.Else or k == T.Elseif or k == T.Eof
+}
+
+fn Parser.block(p: *Parser) {
+    let saved_locals = p.fs.locals.len;
+    let saved_active = p.fs.nactive;
+    while !block_end(p.tok.kind) {
+        if p.tok.kind == T.Return {
+            p.statement();
+            break;
+        }
+        p.statement();
+    }
+    p.fs.locals.truncate(saved_locals);
+    p.fs.nactive = saved_active;
+    p.fs.freereg = saved_active;
+}
+
+fn Parser.add_local(p: *Parser, name: str, r: u32) {
+    p.fs.locals.push(Local { name: name, reg: r });
+    p.fs.nactive = r + 1;
+    if p.fs.freereg < p.fs.nactive { p.fs.freereg = p.fs.nactive; }
+}
+
+fn Parser.cond(p: *Parser) -> u64 {
+    let c = p.expr();
+    let r = p.any_reg(c);
+    p.free_exp(r);
+    p.emit(Mini.TEST(reg_of(r) as u8, 0))
+}
+
+fn Parser.statement(p: *Parser) {
+    let line = p.tok.line;
+    match p.tok.kind {
+        Semi => p.advance(),
+        Local => {
+            p.advance();
+            let name = p.tok.text;
+            p.check(T.Name, "local name");
+            let r = if p.accept(T.Assign) {
+                let e = p.expr();
+                p.to_next_reg(e)
+            } else {
+                let r = p.reserve(1);
+                p.emit(Mini.LOADNIL(r as u8));
+                r
+            };
+            p.add_local(name, r);
+        }
+        Function => {
+            p.advance();
+            let name = p.tok.text;
+            p.check(T.Name, "function name");
+            let proto = p.function_body(name);
+            let k = p.constant(V.F(proto));
+            let r = p.reserve(1);
+            p.emit(Mini.LOADK(r as u8, k as u16));
+            let nk = p.constant(V.S(value.new_str(p.heap, name)));
+            p.emit(Mini.SETGLOBAL(r as u8, nk as u16));
+            p.free_reg(r);
+        }
+        If => {
+            p.advance();
+            var jumps_to_end: mem.Vec<u64> = mem.Vec.new();
+            var j: ?u64 = Some(p.cond());
+            p.check(T.Then, "'then'");
+            p.block();
+            loop {
+                if p.tok.kind == T.Elseif {
+                    jumps_to_end.push(p.emit(Mini.JMP(0)));
+                    if let Some(x) = j { p.patch(x, p.pc()); }
+                    p.advance();
+                    j = Some(p.cond());
+                    p.check(T.Then, "'then'");
+                    p.block();
+                } else if p.tok.kind == T.Else {
+                    jumps_to_end.push(p.emit(Mini.JMP(0)));
+                    if let Some(x) = j { p.patch(x, p.pc()); }
+                    p.advance();
+                    p.block();
+                    j = None;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if let Some(x) = j { p.patch(x, p.pc()); }
+            p.check(T.End, "'end'");
+            for i in 0..jumps_to_end.len { p.patch(jumps_to_end.at(i), p.pc()); }
+            jumps_to_end.free();
+        }
+        While => {
+            p.advance();
+            let start = p.pc();
+            let j = p.cond();
+            p.check(T.Do, "'do'");
+            let saved = p.fs.breaks.len;
+            p.fs.loop_depth += 1;
+            p.block();
+            p.fs.loop_depth -= 1;
+            p.check(T.End, "'end'");
+            let back = p.emit(Mini.JMP(0));
+            p.patch(back, start);
+            p.patch(j, p.pc());
+            p.patch_breaks(saved);
+        }
+        For => {
+            p.advance();
+            let name = p.tok.text;
+            p.check(T.Name, "loop variable");
+            p.check(T.Assign, "'='");
+            let base = p.fs.freereg;
+            let a = p.expr();
+            p.to_next_reg(a);
+            p.check(T.Comma, "','");
+            let b = p.expr();
+            p.to_next_reg(b);
+            if p.accept(T.Comma) {
+                let s = p.expr();
+                p.to_next_reg(s);
+            } else {
+                let r = p.reserve(1);
+                p.emit(Mini.LOADI(r as u8, 1));
+            }
+            p.check(T.Do, "'do'");
+            let saved_locals = p.fs.locals.len;
+            p.add_local("(for index)", base);
+            p.add_local("(for limit)", base + 1);
+            p.add_local("(for step)", base + 2);
+            p.reserve(1);
+            p.add_local(name, base + 3);
+            let prep = p.emit(Mini.FORPREP(base as u8, 0));
+            let saved = p.fs.breaks.len;
+            p.fs.loop_depth += 1;
+            p.block();
+            p.fs.loop_depth -= 1;
+            p.check(T.End, "'end'");
+            let lp = p.emit(Mini.FORLOOP(base as u8, 0));
+            p.patch(lp, prep + 1);
+            p.patch(prep, p.pc());
+            p.patch_breaks(saved);
+            p.fs.locals.truncate(saved_locals);
+            p.fs.nactive = base;
+            p.fs.freereg = base;
+        }
+        Break => {
+            p.advance();
+            if p.fs.loop_depth == 0 { fail(line, "break outside a loop"); }
+            p.fs.breaks.push(p.emit(Mini.JMP(0)));
+        }
+        Return => {
+            p.advance();
+            if block_end(p.tok.kind) or p.tok.kind == T.Semi {
+                p.emit(Mini.RET0());
+            } else {
+                let e = p.expr();
+                let r = p.any_reg(e);
+                p.emit(Mini.RET(reg_of(r) as u8));
+                p.free_exp(r);
+            }
+            p.accept(T.Semi);
+        }
+        _ => {
+            let target = p.suffixed();
+            if p.accept(T.Assign) {
+                let rhs = p.expr();
+                match target {
+                    Local(r) => p.store_to_local(rhs, r),
+                    Global(k) => {
+                        let v = p.any_reg(rhs);
+                        p.emit(Mini.SETGLOBAL(reg_of(v) as u8, k as u16));
+                        p.free_exp(v);
+                    }
+                    Field(t, k) => {
+                        let v = p.any_reg(rhs);
+                        p.emit(Mini.SETFIELD(t as u8, k as u8, reg_of(v) as u8));
+                        p.free_exp(v);
+                        p.free_reg(t);
+                    }
+                    Index(t, k) => {
+                        let v = p.any_reg(rhs);
+                        p.emit(Mini.SETINDEX(t as u8, k as u8, reg_of(v) as u8));
+                        p.free_exp(v);
+                        p.free_exp(target);
+                    }
+                    _ => fail(line, "cannot assign to this expression"),
+                }
+            } else {
+                match target {
+                    Temp(_) => p.free_exp(target),
+                    _ => fail(line, "syntax error: expected a statement"),
+                }
+            }
+        }
+    }
+}
+
+fn Parser.patch_breaks(p: *Parser, from: u64) {
+    for i in from..p.fs.breaks.len { p.patch(p.fs.breaks.at(i), p.pc()); }
+    p.fs.breaks.truncate(from);
+}
+
+fn FuncState.new(name: str) -> FuncState {
+    FuncState {
+        code: mem.Vec.new(),
+        consts: mem.Vec.new(),
+        locals: mem.Vec.new(),
+        nactive: 0,
+        freereg: 0,
+        maxreg: 0,
+        nparams: 0,
+        name: name,
+        breaks: mem.Vec.new(),
+        loop_depth: 0,
+    }
+}
+
+fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
+    p.emit(Mini.RET0());
+    let h = p.heap;
+    let consts = value.new_arr(h, fs.consts.len);
+    for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
+    let nregs = if fs.maxreg == 0 { 1 } else { fs.maxreg };
+    let proto = new(h, Proto { name: value.new_str(h, fs.name), nparams: fs.nparams, nregs: nregs, consts: consts }, fs.code.len);
+    for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
+    Mini.optimize(proto.code);
+    fs.code.free();
+    fs.consts.free();
+    fs.locals.free();
+    fs.breaks.free();
+    proto
+}
+
+fn Parser.function_body(p: *Parser, name: str) -> Gc<Proto> {
+    var fs = FuncState.new(name);
+    let parent = p.fs;
+    p.fs = &fs;
+    p.check(T.LParen, "'('");
+    if p.tok.kind != T.RParen {
+        loop {
+            let pname = p.tok.text;
+            p.check(T.Name, "parameter name");
+            let r = p.reserve(1);
+            p.add_local(pname, r);
+            fs.nparams += 1;
+            if !p.accept(T.Comma) { break; }
+        }
+    }
+    p.check(T.RParen, "')'");
+    p.block();
+    p.check(T.End, "'end'");
+    let proto = p.finish(&fs);
+    p.fs = parent;
+    proto
+}
+
+/// Compile a chunk. Allocates in `h` but never collects.
+pub fn compile(h: *gc.Heap, src: str) -> Gc<Proto> {
+    var fs = FuncState.new("main chunk");
+    var p = Parser {
+        lx: Lexer { src: src, pos: 0, line: 1 },
+        tok: Token { kind: T.Eof, text: "", line: 1, num: V.Nil },
+        heap: h,
+        fs: &fs,
+    };
+    p.advance();
+    p.block();
+    if p.tok.kind != T.Eof { fail(p.tok.line, "'<eof>' expected"); }
+    p.finish(&fs)
+}

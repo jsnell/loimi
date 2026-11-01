@@ -1314,8 +1314,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             (Ty::F32, Ty::F64) => self.inst(format!("fpext float {} to double", v)),
             (Ty::F64, Ty::F32) => self.inst(format!("fptrunc double {} to float", v)),
-            (Ty::Ptr(_) | Ty::Fn(..), Ty::Ptr(_)) => v,
-            (Ty::Ptr(_), Ty::Int(_)) => self.inst(format!("ptrtoint ptr {} to {}", v, tt)),
+            (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => v,
+            (Ty::Ptr(_) | Ty::Gc(_), Ty::Int(_)) => self.inst(format!("ptrtoint ptr {} to {}", v, tt)),
             (Ty::Int(_), Ty::Ptr(_)) => self.inst(format!("inttoptr {} {} to ptr", ft, v)),
             _ => v,
         }

@@ -1,0 +1,7 @@
+print("before")
+local t = nil
+print(t.x)
+print("not reached")
+-- expect: before
+-- expect-stderr: error: attempt to index a nil value
+-- expect-exit: 1

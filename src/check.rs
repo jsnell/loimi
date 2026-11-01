@@ -1088,6 +1088,35 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.block(cx, b, exp),
             ExprKind::If(conds, then, els) => {
+                // `if c { 1 } else { x }`: type the literal from the other branch.
+                let mut hint: Option<Ty> = None;
+                if exp.is_none() {
+                    if let (Some(Stmt::Expr { expr: t, semi: false }), Some(e)) = (then.stmts.last(), els) {
+                        let else_tail = match &e.kind {
+                            ExprKind::Block(b) => match b.stmts.last() {
+                                Some(Stmt::Expr { expr, semi: false }) => Some(expr),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if is_literal_expr(t) && then.stmts.len() == 1 {
+                            if let Some(et) = else_tail {
+                                if !is_literal_expr(et) {
+                                    let mut probe = FnCx::new(cx.module, cx.ret.clone());
+                                    probe.scopes = cx.scopes.clone();
+                                    probe.locals = cx.locals.clone();
+                                    probe.vm = cx.vm.clone();
+                                    if let Ok(v) = self.expr(&mut probe, e, None) {
+                                        if v.ty.is_numeric() {
+                                            hint = Some(v.ty);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let exp = if hint.is_some() { hint.as_ref() } else { exp };
                 cx.scopes.push(vec![]);
                 let tconds = self.conds(cx, conds)?;
                 let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };

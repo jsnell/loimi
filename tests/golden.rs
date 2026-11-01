@@ -99,3 +99,61 @@ fn compile_errors() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
+
+/// The Mini interpreter (examples/mini): run every script in
+/// examples/mini/tests normally and with GC stress (collect at every
+/// safepoint), comparing with `-- expect:` lines.
+#[test]
+fn mini_scripts() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let exe = std::env::temp_dir().join(format!("loimi-mini-{}", std::process::id()));
+    let out = loimi().arg("build").arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let mut failures = Vec::new();
+    let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "mini"))
+        .collect();
+    scripts.sort();
+    for f in scripts {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let lua_directives = |key: &str| -> Vec<String> {
+            let pat = format!("-- {}:", key);
+            text.lines()
+                .filter_map(|l| l.trim_start().strip_prefix(&pat).map(|r| r.strip_prefix(' ').unwrap_or(r).to_string()))
+                .collect()
+        };
+        let expect = lua_directives("expect");
+        let exit: i32 = lua_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
+        let stderr_want = lua_directives("expect-stderr");
+        for stress in [false, true] {
+            let mut cmd = Command::new(&exe);
+            cmd.arg(&f);
+            if stress {
+                cmd.arg("stress");
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), if stress { " (gc stress)" } else { "" });
+            let got: Vec<&str> = stdout.lines().collect();
+            if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
+                failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
+                continue;
+            }
+            if out.status.code() != Some(exit) {
+                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
+            }
+            for s in &stderr_want {
+                if !stderr.contains(s.as_str()) {
+                    failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&exe);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}

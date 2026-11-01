@@ -139,8 +139,14 @@ pub fn collect(h: *Heap) uses gc {
     h.count = kept;
     h.live_bytes = live;
     h.allocated = 0;
-    h.threshold = if live > h.min_heap { live } else { h.min_heap };
+    h.threshold = if h.stress { 0 } else if live > h.min_heap { live } else { h.min_heap };
     h.collections += 1;
+}
+
+/// Stress mode: collect at every safepoint (finds missing roots quickly).
+pub fn Heap.set_stress(h: *Heap, on: bool) {
+    h.stress = on;
+    h.threshold = if on { 0 } else { h.min_heap };
 }
 
 /// Collect if enough has been allocated since the last collection.

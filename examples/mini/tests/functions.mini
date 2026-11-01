@@ -1,0 +1,29 @@
+function fib(n)
+  if n < 2 then return n end
+  return fib(n - 1) + fib(n - 2)
+end
+print(fib(25))
+
+function fact(n)
+  if n <= 1 then return 1 end
+  return n * fact(n - 1)
+end
+print(fact(10), fact(20))
+
+function add3(a, b, c) return a + b + c end
+print(add3(1, 2, 3))
+
+function noret() local x = 1 end
+print(noret())
+
+function ack(m, n)
+  if m == 0 then return n + 1 end
+  if n == 0 then return ack(m - 1, 1) end
+  return ack(m - 1, ack(m, n - 1))
+end
+print(ack(2, 3))
+-- expect: 75025
+-- expect: 3628800	2.43290200817664e+18
+-- expect: 6
+-- expect: nil
+-- expect: 9

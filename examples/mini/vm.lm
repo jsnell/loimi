@@ -1,0 +1,372 @@
+// The Mini virtual machine: a register machine in the style of Lua 5.
+
+import std.gc;
+import std.io;
+import std.text;
+import value;
+import value.{V, Str, Arr, Table, Proto};
+
+extern "C" fn fmod(a: f64, b: f64) -> f64;
+
+/// One activation record. `resume` is where this frame continues after
+/// the call it is making returns.
+pub struct Frame { proto: Gc<Proto>, base: *V, resume: *u32 }
+
+pub struct Ctx {
+    heap: gc.Heap,
+    stack: *V,
+    stack_end: *V,
+    frames: *Frame,
+    frames_end: *Frame,
+    fp: *Frame,
+    globals: Gc<Table>,
+    error: V,
+    out: text.StrBuf,
+}
+
+/// GC roots: globals, the pending error, and every active frame's registers.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    gc_mark(h, c.globals);
+    gc_mark(h, c.error);
+    var f = c.frames;
+    while f <= c.fp {
+        gc_mark(h, f.proto);
+        let n = f.proto.nregs as u64;
+        for i in 0..n { gc_mark(h, f.base[i]); }
+        f = f + 1;
+    }
+}
+
+/// An error message mentioning the type of `v`: "<msg><type> value".
+fn error(c: *Ctx, msg: str, v: V) -> V {
+    var b = text.StrBuf.new();
+    b.push_str(msg);
+    b.push_str(value.type_name(v));
+    b.push_str(" value");
+    let s = value.new_str(&c.heap, b.as_str());
+    b.free();
+    V.S(s)
+}
+
+fn error_msg(c: *Ctx, msg: str) -> V {
+    V.S(value.new_str(&c.heap, msg))
+}
+
+fn arith_slow(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
+    let x = value.to_num(a) ?? 0.0;
+    let y = value.to_num(b) ?? 0.0;
+    if value.to_num(a).is_none() { return Err(error(c, "attempt to perform arithmetic on a ", a)); }
+    if value.to_num(b).is_none() { return Err(error(c, "attempt to perform arithmetic on a ", b)); }
+    let r = match op {
+        0 => x + y,
+        1 => x - y,
+        2 => x * y,
+        3 => x / y,
+        _ => x - (x / y).floor() * y,
+    };
+    Ok(V.Num(r))
+}
+
+fn less(c: *Ctx, a: V, b: V, or_equal: bool) -> Result<bool, V> {
+    match (a, b) {
+        (S(x), S(y)) => {
+            let n = if x.data.len < y.data.len { x.data.len } else { y.data.len };
+            for i in 0..n {
+                if x.data[i] != y.data[i] { return Ok(x.data[i] < y.data[i]); }
+            }
+            Ok(if or_equal { x.data.len <= y.data.len } else { x.data.len < y.data.len })
+        }
+        _ => {
+            let (Some(x), Some(y)) = (value.to_num(a), value.to_num(b)) else {
+                return Err(error(c, "attempt to compare a ", if value.to_num(a).is_none() { a } else { b }));
+            };
+            Ok(if or_equal { x <= y } else { x < y })
+        }
+    }
+}
+
+fn concat(c: *Ctx, a: V, b: V) -> Result<V, V> {
+    for v in 0..2 {
+        let x = if v == 0 { a } else { b };
+        match x {
+            S(_) | Int(_) | Num(_) => {}
+            _ => return Err(error(c, "attempt to concatenate a ", x)),
+        }
+    }
+    c.out.clear();
+    value.write_value(&c.out, a);
+    value.write_value(&c.out, b);
+    Ok(V.S(value.new_str(&c.heap, c.out.as_str())))
+}
+
+fn native(c: *Ctx, id: i32, args: *V, n: u64) -> V {
+    // 0: print
+    c.out.clear();
+    for i in 0..n {
+        if i > 0 { c.out.push('\t'); }
+        value.write_value(&c.out, args[i]);
+    }
+    c.out.push('\n');
+    io.print(c.out.as_str());
+    let _ = id;
+    V.Nil
+}
+
+pub vm Mini {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V, k: *V, fp: *Frame }
+
+    operand reg = regs[it];
+    operand kst = k[it];
+    operand imm = it;
+    operand raw = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    // The collector walks frames up to ctx.fp.
+    sync { ctx.fp = fp; }
+
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
+    op LOADNIL(dst: reg) : ABC { dst = Nil; next }
+    op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+
+    op GETGLOBAL(dst: reg, name: kst) : ABx {
+        dst = value.table_get(ctx.globals, name);
+        next
+    }
+    op SETGLOBAL(src: reg, name: kst) : ABx {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        value.table_set(&ctx.heap, ctx.globals, name, src);
+        next
+    }
+    op NEWTABLE(dst: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = T(value.new_table(&ctx.heap));
+        next
+    }
+    op GETFIELD(dst: reg, t: reg, key: kst) : ABC {
+        if let T(tab) = t { dst = value.table_get(tab, key); next }
+        cold { raise error(ctx, "attempt to index a ", t) }
+    }
+    op SETFIELD(t: reg, key: kst, v: reg) : ABC {
+        if let T(tab) = t {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            value.table_set(&ctx.heap, tab, key, v);
+            next
+        }
+        cold { raise error(ctx, "attempt to index a ", t) }
+    }
+    op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
+        if let T(tab) = t { dst = value.table_get(tab, key); next }
+        cold { raise error(ctx, "attempt to index a ", t) }
+    }
+    op SETINDEX(t: reg, key: reg, v: reg) : ABC {
+        if let T(tab) = t {
+            if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            value.table_set(&ctx.heap, tab, key, v);
+            next
+        }
+        cold { raise error(ctx, "attempt to index a ", t) }
+    }
+
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.add_checked(y) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x + y); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(ctx, 0, a, b)?; next }
+    }
+    op SUB(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.sub_checked(y) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x - y); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(ctx, 1, a, b)?; next }
+    }
+    op MUL(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x * y); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(ctx, 2, a, b)?; next }
+    }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }
+        cold { dst = arith_slow(ctx, 3, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            let r = x % y;
+            dst = Int(if r < 0 { r + y } else { r });
+            next
+        }
+        cold { dst = arith_slow(ctx, 4, a, b)?; next }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        match a {
+            Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
+            Num(x) => { dst = Num(-x); next }
+            _ => {}
+        }
+        cold { dst = arith_slow(ctx, 1, Int(0), a)?; next }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
+    op CONCAT(dst: reg, a: reg, b: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = concat(ctx, a, b)?;
+        next
+    }
+
+    op EQ(dst: reg, a: reg, b: reg) : ABC {
+        if a == b { dst = Bool(true); next }
+        dst = Bool(value.raw_equal(a, b));
+        next
+    }
+    op LT(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x < y); next }
+        cold { dst = Bool(less(ctx, a, b, false)?); next }
+    }
+    op LE(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x <= y); next }
+        cold { dst = Bool(less(ctx, a, b, true)?); next }
+    }
+
+    op JMP(target: label) : sJ { jump target }
+    /// Jump if falsy.
+    op TEST(a: reg, target: label) : AsBx {
+        if !value.truthy(a) { jump target }
+        next
+    }
+    /// Jump if truthy.
+    op TESTT(a: reg, target: label) : AsBx {
+        if value.truthy(a) { jump target }
+        next
+    }
+
+    /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the loop variable.
+    op FORPREP(a: raw, target: label) : AsBx {
+        match (regs[a], regs[a + 1], regs[a + 2]) {
+            (Int(i), Int(l), Int(s)) => {
+                if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
+                if (s > 0 and i > l) or (s < 0 and i < l) { jump target }
+                regs[a + 3] = Int(i);
+                next
+            }
+            _ => {}
+        }
+        cold {
+            let (Some(i), Some(l), Some(s)) = (value.to_num(regs[a]), value.to_num(regs[a + 1]), value.to_num(regs[a + 2])) else {
+                raise error_msg(ctx, "'for' values must be numbers")
+            };
+            if s == 0.0 { raise error_msg(ctx, "'for' step is zero") }
+            regs[a] = Num(i);
+            regs[a + 1] = Num(l);
+            regs[a + 2] = Num(s);
+            if (s > 0.0 and i > l) or (s < 0.0 and i < l) { jump target }
+            regs[a + 3] = Num(i);
+            next
+        }
+    }
+    op FORLOOP(a: raw, target: label) : AsBx {
+        match (regs[a], regs[a + 1], regs[a + 2]) {
+            (Int(i), Int(l), Int(s)) => {
+                if let Some(n) = i.add_checked(s) {
+                    if (s > 0 and n <= l) or (s < 0 and n >= l) {
+                        regs[a] = Int(n);
+                        regs[a + 3] = Int(n);
+                        jump target
+                    }
+                }
+                next
+            }
+            (Num(i), Num(l), Num(s)) => {
+                let n = i + s;
+                if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
+                    regs[a] = Num(n);
+                    regs[a + 3] = Num(n);
+                    jump target
+                }
+                next
+            }
+            _ => next,
+        }
+    }
+
+    /// R[base] = R[base](R[base+1] .. R[base+nargs])
+    op CALL(base: raw, nargs: imm) : ABC {
+        let f = regs[base];
+        if let F(p) = f {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            let callee = regs + base + 1;
+            let n = p.nregs as u64;
+            if callee + n > ctx.stack_end or fp + 1 >= ctx.frames_end {
+                cold { raise error_msg(ctx, "stack overflow") }
+            }
+            var i = nargs as u64;
+            while i < n {
+                callee[i] = Nil;
+                i += 1;
+            }
+            fp.resume = pc + 1;
+            fp = fp + 1;
+            fp.proto = p;
+            fp.base = callee;
+            regs = callee;
+            k = p.consts.data.ptr;
+            jump p.code.ptr
+        }
+        if let Native(id) = f {
+            regs[base] = native(ctx, id, regs + base + 1, nargs as u64);
+            next
+        }
+        cold { raise error(ctx, "attempt to call a ", f) }
+    }
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.frames { exit v }
+        *(regs - 1) = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.proto.consts.data.ptr;
+        jump fp.resume
+    }
+    op RET0() : ABC {
+        if fp == ctx.frames { exit Nil }
+        *(regs - 1) = Nil;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.proto.consts.data.ptr;
+        jump fp.resume
+    }
+
+    entry run(c: *Ctx, p: Gc<Proto>) -> V {
+        ctx = c;
+        fp = c.frames;
+        fp.proto = p;
+        fp.base = c.stack;
+        regs = c.stack;
+        for i in 0..p.nregs as u64 { regs[i] = V.Nil; }
+        k = p.consts.data.ptr;
+        c.fp = fp;
+        jump p.code.ptr
+    }
+
+    on raise(e: V) {
+        ctx.error = e;
+        ctx.fp = fp;
+        exit Nil
+    }
+}
