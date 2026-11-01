@@ -307,6 +307,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if t.is_unitlike() {
             return;
         }
+        if v == "zeroinitializer" {
+            let size = layout::size_of(self.p(), t);
+            if size > 64 {
+                self.cg.decls.insert("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)");
+                self.emit(format!("call void @llvm.memset.p0.i64(ptr {}, i8 0, i64 {}, i1 false)", ptr, size));
+                return;
+            }
+        }
         let lt = self.ty(t);
         self.emit(format!("store {} {}, ptr {}", lt, v, ptr));
     }
@@ -529,6 +537,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 acc
             }
             TK::ArrayRepeat(v, n) => {
+                if matches!(v.kind, TK::Int(0) | TK::Bool(false) | TK::Zeroed) || matches!(v.kind, TK::Float(f) if f.to_bits() == 0) {
+                    return "zeroinitializer".into();
+                }
                 let x = self.val(v);
                 let slot = self.alloca(&e.ty);
                 let et = self.ty(&v.ty);

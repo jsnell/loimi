@@ -27,6 +27,7 @@ impl Parser {
             on_raise: None,
             variants: vec![],
             sync: None,
+            verify_ctx: vec![],
             is_pub,
         };
         while !self.eat("}") {
@@ -197,6 +198,14 @@ impl Parser {
                     self.expect(")")?;
                     let body = self.vm_block()?;
                     vm.on_raise = Some(RaiseDecl { param: Param { name: pn, ty }, body });
+                }
+                "verify_context" => {
+                    self.bump();
+                    let n = self.ident()?;
+                    self.expect(":")?;
+                    let ty = self.parse_type()?;
+                    self.expect(";")?;
+                    vm.verify_ctx.push(Param { name: n, ty });
                 }
                 "sync" => {
                     self.bump();

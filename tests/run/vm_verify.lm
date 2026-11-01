@@ -1,0 +1,74 @@
+import std.io;
+
+struct Proto { nregs: u32, nconsts: u32 }
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = it verify (it as u32) < proto.nconsts;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    cache C { x: u32 }
+
+    op LOADK(dst: reg, k: kst) : ABC { dst = k as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JLT(a: reg, target: label) : AsBx { if a < 10 { jump target } next }
+    op CACHED(dst: reg) : ABC + C { cache.x = cache.x + 1; next }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var p = Proto { nregs: 4, nconsts: 2 };
+    var code: [u32; 8] = [0; 8];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.LOADK(c, at, 0, 1);
+    at = V.emit.CACHED(c, at, 1);       // occupies 2 words
+    at = V.emit.ADD(c, at, 0, 0, 0);
+    at = V.emit.JLT(c, at, 0, -1);      // back to the ADD
+    at = V.emit.RET(c, at, 0);
+    show(V.verify(c[0..at], &p));
+
+    code[4] = V.JLT(0, -2);              // into the middle of CACHED's inline cache
+    show(V.verify(c[0..at], &p));
+    code[4] = V.JLT(0, -1);
+
+    code[3] = V.ADD(0, 0, 7);            // register 7 is out of range
+    show(V.verify(c[0..at], &p));
+    code[3] = V.ADD(0, 0, 0);
+
+    code[0] = V.LOADK(0, 2);             // constant 2 is out of range
+    show(V.verify(c[0..at], &p));
+    code[0] = V.LOADK(0, 1);
+
+    code[5] = 200;                       // not an opcode
+    show(V.verify(c[0..at], &p));
+    code[5] = V.RET(0);
+
+    show(V.verify(c[0..2], &p));         // CACHED cut off by the end
+
+    var regs: [i64; 4] = [0; 4];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: ok
+// expect: bad at 4
+// expect: bad at 3
+// expect: bad at 0
+// expect: bad at 5
+// expect: bad at 1
+// expect: 16

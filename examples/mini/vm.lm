@@ -117,11 +117,14 @@ pub vm Mini {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    operand reg = regs[it];
-    operand kst = k[it];
+    // The generated verifier (Mini.verify) checks these against the prototype.
+    verify_context proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
     operand imm = it;
-    operand raw = it;
-    operand label = pc + it;
+    operand callbase = it verify (it as u32) < proto.nregs;
+    operand forbase = it verify (it as u32) + 3 < proto.nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
@@ -257,7 +260,7 @@ pub vm Mini {
     }
 
     /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the loop variable.
-    op FORPREP(a: raw, target: label) : AsBx {
+    op FORPREP(a: forbase, target: label) : AsBx {
         match (regs[a], regs[a + 1], regs[a + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
@@ -280,7 +283,7 @@ pub vm Mini {
             next
         }
     }
-    op FORLOOP(a: raw, target: label) : AsBx {
+    op FORLOOP(a: forbase, target: label) : AsBx {
         match (regs[a], regs[a + 1], regs[a + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if let Some(n) = i.add_checked(s) {
@@ -306,7 +309,7 @@ pub vm Mini {
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs])
-    op CALL(base: raw, nargs: imm) : ABC {
+    op CALL(base: callbase, nargs: imm) : ABC {
         let f = regs[base];
         if let F(p) = f {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }

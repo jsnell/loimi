@@ -754,6 +754,12 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
     let nregs = if fs.maxreg == 0 { 1 } else { fs.maxreg };
     let proto = new(h, Proto { name: value.new_str(h, fs.name), nparams: fs.nparams, nregs: nregs, consts: consts }, fs.code.len);
     for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
+    if let Some(bad) = Mini.verify(proto.code, proto) {
+        var b = text.StrBuf.new();
+        b.push_str("internal error: generated code fails verification at instruction ");
+        b.push_int(bad as i64);
+        fail(0, b.as_str());
+    }
     Mini.optimize(proto.code);
     fs.code.free();
     fs.consts.free();

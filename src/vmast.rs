@@ -91,6 +91,8 @@ pub struct VmDecl {
     pub on_raise: Option<RaiseDecl>,
     pub variants: Vec<VariantDecl>,
     pub sync: Option<Block>,
+    /// Parameters of the generated verifier (`verify_context proto: Gc<Proto>;`).
+    pub verify_ctx: Vec<Param>,
     pub is_pub: bool,
 }
 
