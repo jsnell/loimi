@@ -2,6 +2,10 @@
 
 ## Implementation plan
 
+Progress (2026-11-01): M0–M4 are done, and most of M5 (verifier, families,
+inline caches, supers, variants; not `--vm-stats`). The first proof
+interpreter, `examples/mini`, runs. See [`status.md`](status.md).
+
 The compiler starts in **Rust**, emitting LLVM IR through the LLVM C API
 (`inkwell` or `llvm-sys`), pinned to one LLVM major version (≥ 19). Self-hosting
 is a non-goal until the language has stabilized. One natural dogfooding target
@@ -18,7 +22,7 @@ Each milestone ends with something measurable.
 | M3 | `value` types: `nanbox`, `lowtag`, `boxed`; tuple-pattern tag merging | microbenchmarks show `(Int, Int)` = one test; repr switch is a one-line change |
 | M4 | `std.gc` MarkSweep, `object`, `Gc<T>`, effects + sync points, shadow-stack roots | GC-stress mode passes the test suite with no explicit rooting in user code; a deliberately missing effect is a compile error |
 | M5 | Generated verifier, `Verified<V>`, families/`become`, inline caches, `super`, `--vm-stats`, variants | bytecode fuzzer: 24h under ASan with no crashes; instrumentation variants add 0% when off |
-| M6 | Stdlib front-end pieces: `std.lex`, `std.parse`, `std.diag`, `std.bc`, `std.obj`, `std.num` | `examples/mini.lm` runs for real |
+| M6 | Stdlib front-end pieces: `std.lex`, `std.parse`, `std.diag`, `std.bc`, `std.obj`, `std.num` | the example interpreters use them instead of hand-written equivalents |
 | M7 | **Proof interpreters**: a Lua 5.4 subset and a small Scheme | see below |
 
 ## What success looks like
@@ -64,7 +68,7 @@ quickening on/off.
 7. **How unsafe is `Window`?** A register window is one pointer with no
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing
-   from verified operands (like `ret_reg` in `examples/mini.lm`) worth it?
+   from verified operands worth it?
 8. **Syntax.** Everything is provisional. Control words (`next`, `jump`,
    `become`, `redo`) read well, but `inline for` generating items and `#name`
    splicing may want a proper macro design.
