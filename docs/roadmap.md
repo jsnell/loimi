@@ -2,8 +2,8 @@
 
 ## Implementation plan
 
-Progress (2026-11-01): M0–M4 are done, and most of M5 (verifier, families,
-inline caches, supers, variants; not `--vm-stats`). The first proof
+Progress (2026-11-01): M0–M5 are done (M5: verifier, families, inline
+caches, supers, variants, `--vm-stats`). The first proof
 interpreter, `examples/mini`, runs. See [`status.md`](status.md).
 
 The compiler starts in **Rust**, emitting LLVM IR through the LLVM C API

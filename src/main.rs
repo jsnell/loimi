@@ -30,10 +30,11 @@ struct Opts {
     run_args: Vec<String>,
     dispatch: Option<tir::Dispatch>,
     keep_ll: bool,
+    vm_stats: bool,
 }
 
 const USAGE: &str = "\
-usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch]
+usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -92,7 +93,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
     c.dispatch_override = opts.dispatch;
     c.run()?;
     let prog = c.prog;
-    let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release });
+    let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats });
     Ok(cg.generate())
 }
 
@@ -108,6 +109,7 @@ fn parse_args() -> Result<Opts, String> {
         run_args: vec![],
         dispatch: None,
         keep_ll: false,
+        vm_stats: false,
     };
     match cmd.as_str() {
         "build" => {}
@@ -120,6 +122,7 @@ fn parse_args() -> Result<Opts, String> {
             "--release" | "-O" => o.release = true,
             "--emit-llvm" => o.emit_llvm = true,
             "--keep-ll" => o.keep_ll = true,
+            "--vm-stats" => o.vm_stats = true,
             "--" => {
                 o.run_args = args.by_ref().collect();
             }

@@ -1,0 +1,28 @@
+// args: --vm-stats
+import std.io;
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } format J { op: 8, a: 8, sbx: s16 } }
+    op INC(x: reg) : A { x = x + 1; next }
+    op DBL(x: reg) : A { x = x * 2; next }
+    op LOOP(x: reg, t: label) : J { if x < 1000 { jump t } next }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *u32, regs: *i64) -> i64 { pc = c; r = regs; jump pc }
+}
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    at = V.emit.INC(code[..], at, 0);
+    at = V.emit.DBL(code[..], at, 0);
+    at = V.emit.LOOP(code[..], at, 0, -2);
+    at = V.emit.RET(code[..], at, 0);
+    var regs: [i64; 2] = [0; 2];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 1022
+// expect-stderr: == vm stats: V ==
+// expect-stderr: super INC_DBL = INC; DBL;
+// expect-stderr: super DBL_LOOP = DBL; LOOP;

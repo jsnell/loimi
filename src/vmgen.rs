@@ -79,6 +79,11 @@ pub fn handler_prologue(g: &mut FnGen) {
         g.store(&wt, "%insn", &slot);
         hg.insn_slot = Some(slot);
     }
+    if let (VmRole::Handler(k), None) = (f.vm_role, &g.cold) {
+        if !combined {
+            count_op(g, k);
+        }
+    }
     if combined {
         hg.dispatch_label = g.fresh_label("dispatch");
         hg.raise_label = g.fresh_label("raise");
@@ -124,6 +129,9 @@ pub fn epilogue(g: &mut FnGen) {
             h.role = hf.vm_role;
         }
         g.label(label);
+        if let VmRole::Handler(k) = hf.vm_role {
+            count_op(g, k);
+        }
         g.val(hf.body.as_ref().unwrap());
         if !g.terminated {
             g.term("unreachable");
@@ -487,6 +495,158 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
     g.cg.cold_queue.push((g.fid, b.clone(), captured, sym));
+}
+
+/// `--vm-stats`: count this op and the (previous op, this op) pair.
+fn count_op(g: &mut FnGen, k: u32) {
+    if !g.cg.opts.vm_stats {
+        return;
+    }
+    let p = g.p();
+    let vd = &p.vms[g.f().vm.unwrap() as usize];
+    let n = vd.ops.len();
+    let sym = &vd.symbol;
+    let cp = g.inst(format!("getelementptr inbounds [{} x i64], ptr @\"{}.stats.counts\", i64 0, i64 {}", n, sym, k));
+    let c = g.inst(format!("load i64, ptr {}", cp));
+    let c1 = g.inst(format!("add i64 {}, 1", c));
+    g.emit(format!("store i64 {}, ptr {}", c1, cp));
+    // Only pairs where this op directly follows the previous one in the
+    // code can become superinstructions.
+    let f = g.f();
+    let pc_slot = g.slots[f.vm_state[vd.pc_idx] as usize].clone();
+    let pc = g.inst(format!("load ptr, ptr {}", pc_slot));
+    let expected = g.inst(format!("load ptr, ptr @\"{}.stats.next\"", sym));
+    let adjacent = g.inst(format!("icmp eq ptr {}, {}", pc, expected));
+    let last0 = g.inst(format!("load i64, ptr @\"{}.stats.last\"", sym));
+    let last = g.inst(format!("select i1 {}, i64 {}, i64 {}", adjacent, last0, n));
+    let after = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, vd.ops[k as usize].size));
+    g.emit(format!("store ptr {}, ptr @\"{}.stats.next\"", after, sym));
+    let row = g.inst(format!("mul i64 {}, {}", last, n));
+    let idx = g.inst(format!("add i64 {}, {}", row, k));
+    let pp = g.inst(format!("getelementptr inbounds i64, ptr @\"{}.stats.pairs\", i64 {}", sym, idx));
+    let pc = g.inst(format!("load i64, ptr {}", pp));
+    let pc1 = g.inst(format!("add i64 {}, 1", pc));
+    g.emit(format!("store i64 {}, ptr {}", pc1, pp));
+    g.emit(format!("store i64 {}, ptr @\"{}.stats.last\"", k, sym));
+}
+
+/// `--vm-stats`: counters, and a report printed at exit (op counts, and
+/// frequent pairs as `super` declarations).
+pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
+    if !cg.opts.vm_stats {
+        return;
+    }
+    let p = cg.p;
+    let mut dtors = Vec::new();
+    for vd in &p.vms {
+        let n = vd.ops.len();
+        let sym = vd.symbol.clone();
+        let _ = writeln!(cg.globals, "@\"{}.stats.counts\" = internal global [{} x i64] zeroinitializer", sym, n);
+        let _ = writeln!(cg.globals, "@\"{}.stats.pairs\" = internal global [{} x i64] zeroinitializer", sym, (n + 1) * n);
+        // `last` starts at the sentinel row n (no previous op).
+        let _ = writeln!(cg.globals, "@\"{}.stats.last\" = internal global i64 {}", sym, n);
+        let _ = writeln!(cg.globals, "@\"{}.stats.next\" = internal global ptr null", sym);
+        let mut names = Vec::new();
+        for o in &vd.ops {
+            let s = cg.string_const(format!("{}\0", o.name).as_bytes());
+            names.push(format!("ptr {}", s));
+        }
+        let _ = writeln!(cg.globals, "@\"{}.stats.names\" = internal constant [{} x ptr] [{}]", sym, n, names.join(", "));
+        // Whether each op may appear in a suggested pair (supers may not).
+        let plain: Vec<String> = vd.ops.iter().map(|o| format!("i1 {}", o.parts.is_empty())).collect();
+        let _ = writeln!(cg.globals, "@\"{}.stats.plain\" = internal constant [{} x i1] [{}]", sym, n, plain.join(", "));
+        let head = cg.string_const(format!("\n== vm stats: {} ==\n%14s  %6s  op\n\0", vd.name).as_bytes());
+        let row = cg.string_const(b"%14llu  %5.1f%%  %s\n\0");
+        let pairs_head = cg.string_const(b"\nfrequent adjacent pairs (at least 1%% of executed ops), as superinstructions:\n\0");
+        let pair_row = cg.string_const(b"    super %s_%s = %s; %s;    // %llu, %.1f%%\n\0");
+        let count_hdr = cg.string_const(b"count\0");
+        let pct_hdr = cg.string_const(b"%\0");
+        let f = format!("@\"{}.stats.report\"", sym);
+        let _ = writeln!(
+            cg.fns,
+            r#"define internal void {f}() {{
+entry:
+  %err = load ptr, ptr @stderr
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {head}, ptr {count_hdr}, ptr {pct_hdr})
+  br label %sum
+sum:
+  %si = phi i64 [ 0, %entry ], [ %si1, %sum ]
+  %tot = phi i64 [ 0, %entry ], [ %tot1, %sum ]
+  %scp = getelementptr inbounds [{n} x i64], ptr @"{sym}.stats.counts", i64 0, i64 %si
+  %sc = load i64, ptr %scp
+  %tot1 = add i64 %tot, %sc
+  %si1 = add i64 %si, 1
+  %sdone = icmp eq i64 %si1, {n}
+  br i1 %sdone, label %ops, label %sum
+ops:
+  %totf = uitofp i64 %tot1 to double
+  %totz = icmp eq i64 %tot1, 0
+  br i1 %totz, label %done, label %oploop
+oploop:
+  %oi = phi i64 [ 0, %ops ], [ %oi1, %opnext ]
+  %ocp = getelementptr inbounds [{n} x i64], ptr @"{sym}.stats.counts", i64 0, i64 %oi
+  %oc = load i64, ptr %ocp
+  %onz = icmp ne i64 %oc, 0
+  br i1 %onz, label %opprint, label %opnext
+opprint:
+  %ocf = uitofp i64 %oc to double
+  %opct0 = fmul double %ocf, 100.0
+  %opct = fdiv double %opct0, %totf
+  %onp = getelementptr inbounds [{n} x ptr], ptr @"{sym}.stats.names", i64 0, i64 %oi
+  %on = load ptr, ptr %onp
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {row}, i64 %oc, double %opct, ptr %on)
+  br label %opnext
+opnext:
+  %oi1 = add i64 %oi, 1
+  %odone = icmp eq i64 %oi1, {n}
+  br i1 %odone, label %pairs, label %oploop
+pairs:
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {pairs_head})
+  br label %ploop
+ploop:
+  %pi = phi i64 [ 0, %pairs ], [ %pi1, %pnext ]
+  %pcp = getelementptr inbounds i64, ptr @"{sym}.stats.pairs", i64 %pi
+  %pc = load i64, ptr %pcp
+  %pc100 = mul i64 %pc, 100
+  %pbig = icmp uge i64 %pc100, %tot1
+  %pnz = icmp ne i64 %pc, 0
+  %pok0 = and i1 %pbig, %pnz
+  %pa = udiv i64 %pi, {n}
+  %pb = urem i64 %pi, {n}
+  %paplp = getelementptr inbounds [{n} x i1], ptr @"{sym}.stats.plain", i64 0, i64 %pa
+  %papl = load i1, ptr %paplp
+  %pbplp = getelementptr inbounds [{n} x i1], ptr @"{sym}.stats.plain", i64 0, i64 %pb
+  %pbpl = load i1, ptr %pbplp
+  %pok1 = and i1 %pok0, %papl
+  %pok = and i1 %pok1, %pbpl
+  br i1 %pok, label %pprint, label %pnext
+pprint:
+  %panp = getelementptr inbounds [{n} x ptr], ptr @"{sym}.stats.names", i64 0, i64 %pa
+  %pa_name = load ptr, ptr %panp
+  %pbnp = getelementptr inbounds [{n} x ptr], ptr @"{sym}.stats.names", i64 0, i64 %pb
+  %pb_name = load ptr, ptr %pbnp
+  %pcf = uitofp i64 %pc to double
+  %ppct0 = fmul double %pcf, 100.0
+  %ppct = fdiv double %ppct0, %totf
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {pair_row}, ptr %pa_name, ptr %pb_name, ptr %pa_name, ptr %pb_name, i64 %pc, double %ppct)
+  br label %pnext
+pnext:
+  %pi1 = add i64 %pi, 1
+  %pdone = icmp eq i64 %pi1, {nn}
+  br i1 %pdone, label %done, label %ploop
+done:
+  ret void
+}}
+"#,
+            nn = n * n,
+        );
+        dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
+    }
+    if !dtors.is_empty() {
+        let _ = writeln!(cg.globals, "@llvm.global_dtors = appending global [{} x {{ i32, ptr, ptr }}] [{}]", dtors.len(), dtors.join(", "));
+        let _ = writeln!(cg.globals, "@stderr = external global ptr");
+        cg.decls.insert("declare i32 @fprintf(ptr, ptr, ...)");
+    }
 }
 
 fn word_mask(bits: u8) -> i64 {

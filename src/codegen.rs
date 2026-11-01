@@ -12,6 +12,8 @@ use crate::tir::*;
 pub struct Options {
     /// Trap on integer overflow of `+ - *`.
     pub overflow_checks: bool,
+    /// Count executed ops and op pairs; print a report at exit.
+    pub vm_stats: bool,
 }
 
 pub struct Codegen<'p> {
@@ -186,6 +188,7 @@ impl<'p> Codegen<'p> {
         }
         crate::vmgen::emit_tables(p, &mut self.globals, &mut self.fns);
         crate::gcgen::emit_runtime(&mut self);
+        crate::vmgen::emit_stats(&mut self);
         self.decls.insert("declare void @llvm.trap() noreturn");
         let _ = writeln!(self.globals, "@loimi.argc = global i32 0");
         let _ = writeln!(self.globals, "@loimi.argv = global ptr null");

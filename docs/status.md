@@ -14,7 +14,7 @@ in [`language.md`](language.md). Updated 2026-11-01.
 | `vm` declarations | state, context, operand kinds, fixed-width formats, inline caches, `family` + `become`, `super`, vm functions, entries, `on raise`/`raise`, `cold`, `sync`. |
 | Dispatch | `tailcall` (`preserve_none` + `musttail`, instruction word passed in a register), `goto` (one function, replicated `indirectbr`), `switch`. |
 | Generated per vm | encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode constants, `op_size`, `op_name`, the superinstruction peephole (`Vm.optimize`), and the verifier (`Vm.verify`). |
-| Instrumentation | `variant NAME wraps all|[OPS] { before { .. } }`, switched with `use_variant`. |
+| Instrumentation | `variant NAME wraps all|[OPS] { before { .. } }`, switched with `use_variant`. `loimi build --vm-stats` counts executed ops and adjacent op pairs, and prints frequent pairs at exit as `super` declarations. |
 | GC | `object` types (with trailing arrays), `Gc<T>`, `new(heap, ..)`, `gc_mark`; `std.gc` mark-sweep written in Loimi; compiler-generated tracing (including pointers inside values); shadow-stack frames for traced locals; effects (`uses sync/gc/reenter`). |
 | Standard library | `std.io`, `std.os`, `std.mem` (`Vec`, `Arena`, allocation), `std.hash`, `std.map` (`HashMap`), `std.text` (`StrBuf`, `Interner`, number parsing/printing), `std.gc`. |
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |

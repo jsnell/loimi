@@ -387,6 +387,9 @@ pub vm Mini {
     super LT_TEST = LT; TEST;
     super LE_TEST = LE; TEST;
     super EQ_TEST = EQ; TEST;
+    // Suggested by `loimi build --vm-stats` on recursive code.
+    super LOADI_SUB = LOADI; SUB;
+    super ADD_RET = ADD; RET;
 
     entry run(c: *Ctx, p: Gc<Proto>) -> V {
         ctx = c;
