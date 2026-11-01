@@ -128,6 +128,8 @@ pub enum VmExpr {
     Raise(P<Expr>),
     Fail(P<Expr>),
     Become(Ident),
+    /// `use_variant NAME` / `use_variant default`: switch dispatch tables.
+    UseVariant(Ident),
     Cold(Block),
 }
 

@@ -19,6 +19,8 @@ pub struct HandlerGen {
     pub raise_label: String,
     pub invalid_label: String,
     pub op_labels: Vec<String>,
+    /// Combined mode: labels of instrumentation wrappers, per variant (op index → label).
+    pub wrapper_labels: Vec<Vec<(u32, String)>>,
     pub raise_slot: String,
     pub labels_global: String,
     /// Tail-call handlers receive the current instruction word in a register.
@@ -27,7 +29,7 @@ pub struct HandlerGen {
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
         _ => false,
     }
 }
@@ -66,6 +68,7 @@ pub fn handler_prologue(g: &mut FnGen) {
         raise_label: String::new(),
         invalid_label: String::new(),
         op_labels: vec![],
+        wrapper_labels: vec![],
         raise_slot: format!("@\"{}.raise_slot\"", vd.symbol),
         labels_global: format!("@\"{}.labels\"", f.symbol),
         insn_slot: None,
@@ -81,6 +84,12 @@ pub fn handler_prologue(g: &mut FnGen) {
         hg.raise_label = g.fresh_label("raise");
         hg.invalid_label = g.fresh_label("invalid");
         hg.op_labels = vd.ops.iter().map(|o| format!("op.{}.{}", o.name, o.opcode)).collect();
+        hg.wrapper_labels = vd
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(v, (_, ws))| ws.iter().map(|(k, _)| (*k, format!("var.{}.{}", v, k))).collect())
+            .collect();
         if let Some(rt) = &vd.raise_ty {
             hg.raise_slot = g.alloca(rt);
         }
@@ -126,6 +135,11 @@ pub fn epilogue(g: &mut FnGen) {
     if let Some(rf) = vd.on_raise {
         emit_body(g, rf, &hg.raise_label);
     }
+    for (v, (_, ws)) in vd.variants.iter().enumerate() {
+        for (j, (_, fid)) in ws.iter().enumerate() {
+            emit_body(g, *fid, &hg.wrapper_labels[v][j].1);
+        }
+    }
     g.fid = entry_fid;
     g.slots = entry_slots;
     if let Some(h) = g.vm.as_mut() {
@@ -136,6 +150,7 @@ pub fn epilogue(g: &mut FnGen) {
     g.emit("call void @llvm.trap()");
     g.term("unreachable");
     let n = 1usize << vd.op_bits;
+    let sym = g.f().symbol.clone();
     if vd.dispatch == Dispatch::Switch {
         g.label(&hg.dispatch_label);
         let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
@@ -143,22 +158,68 @@ pub fn epilogue(g: &mut FnGen) {
         let wt = format!("i{}", vd.word.bits);
         let mut cases = String::new();
         for (k, op) in vd.ops.iter().enumerate() {
-            let _ = write!(cases, " {} {}, label %{}", wt, op.opcode, hg.op_labels[k]);
+            let _ = write!(cases, " i32 {}, label %{}", op.opcode, hg.op_labels[k]);
         }
-        let opc_w = if vd.word.bits == 64 { opc } else { g.inst(format!("trunc i64 {} to {}", opc, wt)) };
-        g.term(format!("switch {} {}, label %{} [{} ]", wt, opc_w, hg.invalid_label, cases));
+        let case = if let Some(ti) = vd.tbl_idx {
+            // With variants, the table maps opcodes to case ids.
+            for (v, ws) in hg.wrapper_labels.iter().enumerate() {
+                for (k, l) in ws {
+                    let _ = write!(cases, " i32 {}, label %{}", n as u32 * (v as u32 + 1) + k, l);
+                }
+            }
+            let t = g.inst(format!("load ptr, ptr {}", hg.state_slots[ti]));
+            let a = g.inst(format!("getelementptr inbounds i32, ptr {}, i64 {}", t, opc));
+            g.inst(format!("load i32, ptr {}", a))
+        } else {
+            let _ = wt;
+            g.inst(format!("trunc i64 {} to i32", opc))
+        };
+        g.term(format!("switch i32 {}, label %{} [{} ]", case, hg.invalid_label, cases));
+        for t in 0..=vd.variants.len() {
+            if t > 0 || vd.tbl_idx.is_some() {
+                let mut ids = Vec::new();
+                for i in 0..n {
+                    let id = match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                        Some(k) => match (t > 0).then(|| hg.wrapper_labels[t - 1].iter().any(|(w, _)| *w as usize == k)) {
+                            Some(true) => n as u32 * t as u32 + k as u32,
+                            _ => vd.ops[k].opcode,
+                        },
+                        None => u32::MAX,
+                    };
+                    ids.push(format!("i32 {}", id));
+                }
+                let _ = writeln!(g.cg.globals, "{} = internal constant [{} x i32] [{}]", combined_table(&sym, t), n, ids.join(", "));
+            }
+        }
     } else {
-        let sym = &g.f().symbol;
-        let mut entries = Vec::new();
-        for i in 0..n {
-            let l = match vd.ops.iter().position(|o| o.opcode as usize == i) {
-                Some(k) => &hg.op_labels[k],
-                None => &hg.invalid_label,
-            };
-            entries.push(format!("ptr blockaddress(@\"{}\", %{})", sym, l));
+        for t in 0..=vd.variants.len() {
+            let mut entries = Vec::new();
+            for i in 0..n {
+                let l = match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                    Some(k) => {
+                        let w = if t > 0 { hg.wrapper_labels[t - 1].iter().find(|(w, _)| *w as usize == k) } else { None };
+                        match w {
+                            Some((_, l)) => l,
+                            None => &hg.op_labels[k],
+                        }
+                    }
+                    None => &hg.invalid_label,
+                };
+                entries.push(format!("ptr blockaddress(@\"{}\", %{})", sym, l));
+            }
+            let _ = writeln!(g.cg.globals, "{} = internal constant [{} x ptr] [{}]", combined_table(&sym, t), n, entries.join(", "));
         }
-        let _ = writeln!(g.cg.globals, "{} = internal constant [{} x ptr] [{}]", hg.labels_global, n, entries.join(", "));
     }
+}
+
+/// Name of dispatch table `t` (0 = default) of a combined-mode entry.
+fn combined_table(entry_sym: &str, t: usize) -> String {
+    if t == 0 { format!("@\"{}.labels\"", entry_sym) } else { format!("@\"{}.labels.{}\"", entry_sym, t) }
+}
+
+/// Name of dispatch table `t` of a tail-call vm.
+fn tail_table(vd: &VmDef, t: usize) -> String {
+    if t == 0 { table_name(vd) } else { format!("@\"{}.table.{}\"", vd.symbol, t) }
 }
 
 /// Opcode of the word at `pc`, as i64.
@@ -225,17 +286,28 @@ fn dispatch(g: &mut FnGen, target: &str) {
             g.br(&hg.dispatch_label);
         } else {
             let opc = opcode_of(g, vd, target);
-            let n = 1usize << vd.op_bits;
-            let a = g.inst(format!("getelementptr inbounds [{} x ptr], ptr {}, i64 0, i64 {}", n, hg.labels_global, opc));
+            let tbl = match vd.tbl_idx {
+                Some(ti) => g.inst(format!("load ptr, ptr {}", hg.state_slots[ti])),
+                None => hg.labels_global.clone(),
+            };
+            let a = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", tbl, opc));
             let h = g.inst(format!("load ptr, ptr {}", a));
             let mut dests: Vec<String> = hg.op_labels.iter().map(|l| format!("label %{}", l)).collect();
+            for ws in &hg.wrapper_labels {
+                for (_, l) in ws {
+                    dests.push(format!("label %{}", l));
+                }
+            }
             dests.push(format!("label %{}", hg.invalid_label));
             g.term(format!("indirectbr ptr {}, [{}]", h, dests.join(", ")));
         }
     } else {
         let (opc, word) = opcode_and_word(g, vd, target);
-        let n = 1usize << vd.op_bits;
-        let a = g.inst(format!("getelementptr inbounds [{} x ptr], ptr {}, i64 0, i64 {}", n, table_name(vd), opc));
+        let tbl = match vd.tbl_idx {
+            Some(ti) => g.inst(format!("load ptr, ptr {}", hg.state_slots[ti])),
+            None => table_name(vd),
+        };
+        let a = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", tbl, opc));
         let h = g.inst(format!("load ptr, ptr {}", a));
         tail_to(g, vd, &h, &word);
     }
@@ -328,6 +400,31 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             g.br(&l);
             g.poison(&e.ty)
         }
+        TVm::TableAddr(t) => {
+            let hg = g.vm.clone().unwrap();
+            let p = g.p();
+            let vd = &p.vms[hg.vm as usize];
+            if hg.combined {
+                // The labels table of the entry this code is inlined into.
+                let sym = hg.labels_global.trim_start_matches("@\"").trim_end_matches(".labels\"").to_string();
+                combined_table(&sym, *t as usize)
+            } else {
+                tail_table(vd, *t as usize)
+            }
+        }
+        TVm::Chain(k) => {
+            let hg = g.vm.clone().unwrap();
+            let p = g.p();
+            let vd = &p.vms[hg.vm as usize];
+            if hg.combined {
+                g.br(&hg.op_labels[*k as usize]);
+            } else {
+                let sym = format!("@\"{}\"", p.fns[vd.ops[*k as usize].fid as usize].symbol);
+                let w = current_word(g, vd);
+                tail_to(g, vd, &sym, &w);
+            }
+            g.poison(&e.ty)
+        }
         TVm::Synced(sync, call) => {
             g.val(sync);
             g.val(call)
@@ -374,6 +471,19 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
                 }
             }
             let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
+            for (v, (_, ws)) in vd.variants.iter().enumerate() {
+                let mut entries = Vec::new();
+                for i in 0..n {
+                    match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                        Some(k) => {
+                            let f = ws.iter().find(|(w, _)| *w as usize == k).map(|(_, f)| *f).unwrap_or(vd.ops[k].fid);
+                            entries.push(format!("ptr @\"{}\"", p.fns[f as usize].symbol));
+                        }
+                        None => entries.push(format!("ptr {}", inv)),
+                    }
+                }
+                let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", tail_table(vd, v + 1), n, entries.join(", "));
+            }
             let mut params: Vec<String> = vd.state_tys.iter().map(|t| llty(p, t)).collect();
             params.push(format!("i{}", vd.word.bits));
             let _ = writeln!(
@@ -394,7 +504,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
 /// emitted inside their entries).
 pub fn standalone(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
         _ => true,
     }
 }

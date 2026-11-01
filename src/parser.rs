@@ -929,7 +929,7 @@ impl Parser {
         let next_is_call_or_field = self.is_at(1, "(") || self.is_at(1, ".") || self.is_at(1, "=");
         match s {
             "next" | "redo" => !next_is_call_or_field,
-            "jump" | "exit" | "raise" | "fail" | "become" => {
+            "jump" | "exit" | "raise" | "fail" | "become" | "use_variant" => {
                 !next_is_call_or_field && !matches!(self.peek_at(1), Tok::Punct(";") | Tok::Punct("}"))
             }
             _ => false,
@@ -949,6 +949,7 @@ impl Parser {
             "raise" => VmExpr::Raise(Box::new(self.parse_expr()?)),
             "fail" => VmExpr::Fail(Box::new(self.parse_expr()?)),
             "become" => VmExpr::Become(self.ident()?),
+            "use_variant" => VmExpr::UseVariant(self.ident()?),
             _ => unreachable!(),
         };
         Ok(Expr { kind: ExprKind::Vm(kind), span: start.to(self.prev_span()) })

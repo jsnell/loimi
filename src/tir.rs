@@ -187,6 +187,10 @@ pub enum TVm {
     Part(u32, B),
     /// The pending error value (in `on raise`).
     RaiseSlot,
+    /// Address of dispatch table `i` (0 = default, 1.. = variants).
+    TableAddr(u32),
+    /// Continue with the real handler of op `i` (from an instrumentation wrapper).
+    Chain(u32),
     /// A call that may collect or observe vm state: run the vm's `sync`
     /// block, keep traced locals visible to the GC, then call.
     Synced(B, B),
@@ -340,6 +344,8 @@ pub enum VmRole {
     Entry,
     Raise,
     VmFn,
+    /// Instrumentation wrapper: (variant index, op index).
+    Wrapper(u32, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -368,6 +374,10 @@ pub struct VmDef {
     pub entries: Vec<FnId>,
     pub on_raise: Option<FnId>,
     pub raise_ty: Option<Ty>,
+    /// Instrumentation variants: name and (op index, wrapper fn) pairs.
+    pub variants: Vec<(String, Vec<(u32, FnId)>)>,
+    /// State index of the hidden dispatch-table register (vms with variants).
+    pub tbl_idx: Option<usize>,
 }
 
 #[derive(Default)]

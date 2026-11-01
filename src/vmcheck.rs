@@ -147,6 +147,12 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     for p in &d.state {
         add_state(c, p, &mut state)?;
     }
+    let tbl_idx = if d.variants.is_empty() {
+        None
+    } else {
+        state.push(("__tbl".to_string(), Ty::Ptr(Box::new(Ty::u8()))));
+        Some(state.len() - 1)
+    };
     let pc_idx = state
         .iter()
         .position(|(n, _)| n == "pc")
@@ -324,6 +330,8 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         entries: entries.iter().map(|(f, _)| *f).collect(),
         on_raise: raise_fid,
         raise_ty: raise_ty.clone(),
+        variants: vec![],
+        tbl_idx,
     });
     c.vms.push(VmInfo {
         module: m,
@@ -353,6 +361,80 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     if let (Some(fid), Some(r)) = (raise_fid, &d.on_raise) {
         check_raise(c, vm, fid, r)?;
     }
+    // Instrumentation variants: a wrapper per wrapped op.
+    for (vi, var) in d.variants.iter().enumerate() {
+        if var.name.name == "default" || d.variants[..vi].iter().any(|x| x.name.name == var.name.name) {
+            return Err(Diag::new(var.name.span, format!("bad or duplicate variant name `{}`", var.name.name)));
+        }
+        let ops: Vec<usize> = match &var.wraps {
+            None => (0..c.vms[i].ops.len()).collect(),
+            Some(list) => {
+                let mut v = Vec::new();
+                for o in list {
+                    let k = c.vms[i]
+                        .ops
+                        .iter()
+                        .position(|x| x.name == o.name)
+                        .ok_or_else(|| Diag::new(o.span, format!("unknown op `{}`", o.name)))?;
+                    v.push(k);
+                }
+                v
+            }
+        };
+        let mut wrappers = Vec::new();
+        for k in ops {
+            let opname = c.vms[i].ops[k].name.clone();
+            let fid = new_fn(
+                c,
+                format!("{}.variant.{}.{}", prefix, var.name.name, opname),
+                format!("{} ({})", opname, var.name.name),
+                state_tys.clone(),
+                ret.clone(),
+                cc,
+                vm,
+                VmRole::Wrapper(vi as u32, k as u32),
+                var.before.span,
+            );
+            check_wrapper(c, vm, fid, k, &var.before)?;
+            wrappers.push((k as u32, fid));
+        }
+        c.prog.vms[i].variants.push((var.name.name.clone(), wrappers));
+    }
+    Ok(())
+}
+
+fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) -> Res<()> {
+    let info = &c.vms[vm as usize];
+    let m = info.module;
+    let opcode = info.ops[k].opcode;
+    let mut cx = FnCx::new(m, info.ret.clone());
+    let state = declare_state(c, vm, &mut cx);
+    let opc = cx.declare("opcode", Ty::Int(IntTy::U32), false);
+    cx.vm = Some(HandlerCx {
+        vm,
+        is_handler: true,
+        allow_control: true,
+        op: Some(k),
+        part: None,
+        operands: vec![],
+        state: state.clone(),
+        by_ptr: false,
+    });
+    let b = c.block(&mut cx, before, Some(&Ty::Unit))?;
+    let span = before.span;
+    let body = mk(
+        Ty::Never,
+        TK::Block(
+            vec![TStmt::Let(opc, Some(mk(Ty::Int(IntTy::U32), TK::Int(opcode as i128), span))), TStmt::Expr(b)],
+            Some(Box::new(mk(Ty::Never, TK::Vm(TVm::Chain(k as u32)), span))),
+        ),
+        span,
+    );
+    let fd = &mut c.prog.fns[fid as usize];
+    fd.params = state.clone();
+    fd.locals = cx.locals;
+    fd.body = Some(body);
+    fd.vm_state = state;
     Ok(())
 }
 
@@ -491,7 +573,16 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
     });
     let b = c.block(&mut cx, &e.body, Some(&ret))?;
     let b = c.coerce(b, &ret)?;
-    let inits: Vec<TStmt> = state.iter().map(|&s| TStmt::Let(s, None)).collect();
+    let mut inits: Vec<TStmt> = state.iter().map(|&s| TStmt::Let(s, None)).collect();
+    if let Some(ti) = c.prog.vms[vm as usize].tbl_idx {
+        let t = Ty::Ptr(Box::new(Ty::u8()));
+        let sp = e.body.span;
+        inits.push(TStmt::Expr(mk(
+            Ty::Unit,
+            TK::Assign(Box::new(mk(t.clone(), TK::Local(state[ti]), sp)), Box::new(mk(t, TK::Vm(TVm::TableAddr(0)), sp))),
+            sp,
+        )));
+    }
     let span = b.span;
     let body = mk(ret, TK::Block(inits, Some(Box::new(b))), span);
     let fd = &mut c.prog.fns[fid as usize];
@@ -610,6 +701,24 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
                 ));
             }
             Ok(mk(Ty::Unit, TK::Vm(TVm::Become(b.opcode)), span))
+        }
+        VmExpr::UseVariant(name) => {
+            let vd = &c.prog.vms[vmi];
+            let idx = if name.name == "default" {
+                0
+            } else {
+                let Some(i) = c.vm_decls[vmi].1.variants.iter().position(|v| v.name.name == name.name) else {
+                    return Err(Diag::new(name.span, format!("unknown variant `{}`", name.name)));
+                };
+                i as u32 + 1
+            };
+            let Some(ti) = vd.tbl_idx else {
+                return Err(Diag::new(name.span, "this vm declares no variants"));
+            };
+            let t = Ty::Ptr(Box::new(Ty::u8()));
+            let target = mk(t.clone(), TK::Local(h.state[ti]), span);
+            let v = mk(t, TK::Vm(TVm::TableAddr(idx)), span);
+            Ok(mk(Ty::Unit, TK::Assign(Box::new(target), Box::new(v)), span))
         }
         VmExpr::Cold(_) => unreachable!(),
     }

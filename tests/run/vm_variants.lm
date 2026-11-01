@@ -1,0 +1,67 @@
+// matrix: dispatch
+import std.io;
+
+struct Ctx { counts: [i64; 8], adds_traced: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JLT(a: reg, target: label) : AsBx { if a < 100 { jump target } next }
+    op COUNT_ON() : ABC { use_variant count; next }
+    op TRACE_ON() : ABC { use_variant trace; next }
+    op OFF() : ABC { use_variant default; next }
+    op RET(src: reg) : ABC { exit src }
+
+    // Count every executed instruction.
+    variant count wraps all {
+        before { ctx.counts[opcode] += 1; }
+    }
+    // Only ADD is wrapped; other ops run their plain handlers.
+    variant trace wraps [ADD] {
+        before { ctx.adds_traced += 1; }
+    }
+
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var ctx = Ctx { counts: [0; 8], adds_traced: 0 };
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 1);
+    at = V.emit.COUNT_ON(c, at);
+    at = V.emit.ADD(c, at, 0, 0, 1);      // loop: r0 += 1
+    at = V.emit.JLT(c, at, 0, -1);        //       while r0 < 100
+    at = V.emit.TRACE_ON(c, at);
+    at = V.emit.ADD(c, at, 0, 0, 1);
+    at = V.emit.ADD(c, at, 0, 0, 1);
+    at = V.emit.OFF(c, at);
+    at = V.emit.ADD(c, at, 0, 0, 1);
+    at = V.emit.RET(c, at, 0);
+    var regs: [i64; 4] = [0; 4];
+    io.print_int(V.run(&ctx, &code[0], &regs[0])); io.println("");
+    // While counting: 100 ADDs, 100 JLTs, then TRACE_ON once.
+    io.print_int(ctx.counts[V.OP_ADD as u64]); io.println("");
+    io.print_int(ctx.counts[V.OP_JLT as u64]); io.println("");
+    io.print_int(ctx.counts[V.OP_TRACE_ON as u64]); io.println("");
+    io.print_int(ctx.counts[V.OP_LOADI as u64]); io.println("");
+    io.print_int(ctx.adds_traced); io.println("");
+}
+// expect: 103
+// expect: 100
+// expect: 100
+// expect: 1
+// expect: 0
+// expect: 2
