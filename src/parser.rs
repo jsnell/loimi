@@ -208,7 +208,8 @@ impl Parser {
             }
             return Ok(Item::Fn(self.parse_fn(attrs, linkage, is_pub)?));
         }
-        if self.eat_kw("struct") {
+        if self.is_kw("struct") || self.is_kw("object") {
+            let is_object = self.bump().tok == Tok::Ident("object".into());
             let name = self.ident()?;
             let generics = self.parse_generics()?;
             self.expect("{")?;
@@ -223,7 +224,7 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Struct(StructDecl { name, generics, fields, is_pub }));
+            return Ok(Item::Struct(StructDecl { name, generics, is_object, fields, is_pub }));
         }
         if self.eat_kw("enum") {
             let name = self.ident()?;
@@ -358,6 +359,9 @@ impl Parser {
                 TypeKind::Slice(Box::new(self.parse_type()?))
             } else {
                 let elem = self.parse_type()?;
+                if self.eat("]") {
+                    return Ok(TypeExpr { kind: TypeKind::Trailing(Box::new(elem)), span: start.to(self.prev_span()) });
+                }
                 self.expect(";")?;
                 let n = self.parse_expr()?;
                 self.expect("]")?;

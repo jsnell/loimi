@@ -26,6 +26,7 @@ impl Parser {
             entries: vec![],
             on_raise: None,
             variants: vec![],
+            sync: None,
             is_pub,
         };
         while !self.eat("}") {
@@ -196,6 +197,10 @@ impl Parser {
                     self.expect(")")?;
                     let body = self.vm_block()?;
                     vm.on_raise = Some(RaiseDecl { param: Param { name: pn, ty }, body });
+                }
+                "sync" => {
+                    self.bump();
+                    vm.sync = Some(self.vm_block()?);
                 }
                 "variant" => {
                     self.bump();

@@ -90,6 +90,7 @@ pub struct VmDecl {
     pub entries: Vec<EntryDecl>,
     pub on_raise: Option<RaiseDecl>,
     pub variants: Vec<VariantDecl>,
+    pub sync: Option<Block>,
     pub is_pub: bool,
 }
 

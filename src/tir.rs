@@ -45,6 +45,8 @@ pub enum Ty {
     Value(u32),
     /// Type parameter being inferred (only during generic-call checking).
     Param(u32),
+    /// Traced reference into the GC heap.
+    Gc(Box<Ty>),
 }
 
 impl Ty {
@@ -71,7 +73,7 @@ impl Ty {
     }
     /// Option of a pointer-like type uses null as None.
     pub fn is_nullable_ptr(&self) -> bool {
-        matches!(self, Ty::Ptr(_) | Ty::Fn(..))
+        matches!(self, Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_))
     }
 }
 
@@ -109,6 +111,8 @@ pub enum Intr {
     Floor,
     /// Value types: construct variant (variant index in arg 0 as Int).
     ValueTag,
+    /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
+    GcMark,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +163,10 @@ pub enum TK {
     Try(B),
     Unreachable,
     Vm(TVm),
+    /// `new(heap, Obj { .. })` / `new(heap, Obj { .. }, n)`: allocate a GC object.
+    New { heap: B, init: B, len: Option<B> },
+    /// The trailing array of an object, as a slice.
+    Trailing(B),
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +187,9 @@ pub enum TVm {
     Part(u32, B),
     /// The pending error value (in `on raise`).
     RaiseSlot,
+    /// A call that may collect or observe vm state: run the vm's `sync`
+    /// block, keep traced locals visible to the GC, then call.
+    Synced(B, B),
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +238,9 @@ pub struct StructDef {
     pub fields: Vec<(String, Ty)>,
     /// An instance over inference variables; never emitted.
     pub pattern: bool,
+    /// GC-managed `object`: its type id, and the element type of a trailing array.
+    pub object: Option<u32>,
+    pub trailing: Option<(String, Ty)>,
 }
 
 #[derive(Clone, Debug)]
@@ -279,7 +293,13 @@ pub struct FnDef {
     pub vm_role: VmRole,
     /// Locals holding the vm state (handlers, entries), or pointers to it (vm fns).
     pub vm_state: Vec<LocalId>,
+    /// Effects: EFF_SYNC | EFF_GC | EFF_REENTER.
+    pub effects: u8,
 }
+
+pub const EFF_SYNC: u8 = 1;
+pub const EFF_GC: u8 = 2;
+pub const EFF_REENTER: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueRepr {

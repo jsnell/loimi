@@ -84,7 +84,7 @@ impl<'a> Checker<'a> {
         let ty = match &decl {
             GenDecl::Struct(_) => {
                 let id = self.prog.structs.len() as u32;
-                self.prog.structs.push(StructDef { name, fields: vec![], pattern });
+                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object: None, trailing: None });
                 Ty::Struct(id)
             }
             GenDecl::Enum(_) => {
@@ -328,8 +328,8 @@ impl<'a> Checker<'a> {
         for (v, t) in vals.into_iter().zip(pts.iter()) {
             out.push(self.coerce(v, t)?);
         }
-        crate::vmcheck::check_call_effects(self, cx, fid, span)?;
-        Ok(mk(ret, TK::Call(Box::new(mk(fty, TK::FnRef(fid), span)), out), span))
+        let call = mk(ret, TK::Call(Box::new(mk(fty, TK::FnRef(fid), span)), out), span);
+        crate::vmcheck::wrap_effects(self, cx, fid, call)
     }
 
     /// Infer the instance of generic type `g` from the expected type.

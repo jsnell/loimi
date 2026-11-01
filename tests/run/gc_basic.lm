@@ -1,0 +1,85 @@
+import std.io;
+import std.gc;
+import std.mem;
+
+object Node { value: i64, next: ?Gc<Node> }
+object Str { hash: u64, data: [u8] }
+
+value V repr nanbox { Num(f64) unboxed, Int(i32), S(Gc<Str>), N(Gc<Node>), Nil }
+
+fn make_list(h: *gc.Heap, n: i64) -> ?Gc<Node> {
+    var head: ?Gc<Node> = None;
+    for i in 0..n {
+        head = Some(new(h, Node { value: i, next: head }));
+    }
+    head
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t = 0;
+    var c = l;
+    while let Some(n) = c {
+        t += n.value;
+        c = n.next;
+    }
+    t
+}
+
+fn string(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str { hash: 0 }, s.len);
+    for i in 0..s.len { o.data[i] = s[i]; }
+    o
+}
+
+fn churn(h: *gc.Heap, keep: ?Gc<Node>) -> i64 uses gc {
+    for i in 0..10 { make_list(h, 1000); }
+    let local = make_list(h, 5);
+    gc.collect(h);
+    sum(keep) + sum(local)
+}
+
+// A "VM stack" of values, scanned as a root.
+struct Stack { slots: *V, top: u64 }
+
+fn scan_stack(h: *gc.Heap, data: *u8) {
+    let st = data as *Stack;
+    for i in 0..st.top { gc_mark(h, st.slots[i]); }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let keep = make_list(h, 100);
+    io.print_int(churn(h, keep)); io.println("");
+    io.print_int(heap.count as i64); io.println("");
+    io.print_int(heap.freed as i64); io.println("");
+
+    let s = string(h, "hello");
+    gc.collect(h);
+    io.println(s.data);
+
+    var st = Stack { slots: mem.alloc(16), top: 0 };
+    heap.add_scanner(&st as *u8, scan_stack);
+    st.slots[0] = V.S(string(h, "on the stack"));
+    st.slots[1] = V.Int(7);
+    st.slots[2] = V.N(new(h, Node { value: 42, next: None }));
+    st.top = 3;
+    string(h, "garbage");
+    let before = heap.freed;
+    gc.collect(h);
+    io.print_int((heap.freed - before) as i64); io.println("");
+    match st.slots[0] { S(x) => io.println(x.data), _ => io.println("?") }
+    match st.slots[2] { N(n) => io.print_int(n.value), _ => io.print("?") }
+    io.println("");
+    st.top = 0;
+    gc.collect(h);
+    io.print_int(heap.count as i64); io.println("");
+}
+// expect: 4960
+// expect: 105
+// expect: 10000
+// expect: hello
+// expect: 1
+// expect: on the stack
+// expect: 42
+// expect: 101

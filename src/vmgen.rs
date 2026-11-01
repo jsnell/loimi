@@ -109,6 +109,7 @@ pub fn epilogue(g: &mut FnGen) {
             }
         }
         g.slots = slots;
+        g.live = vec![vec![]];
         if let Some(h) = g.vm.as_mut() {
             h.parts.clear();
             h.role = hf.vm_role;
@@ -327,6 +328,10 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             g.br(&l);
             g.poison(&e.ty)
         }
+        TVm::Synced(sync, call) => {
+            g.val(sync);
+            g.val(call)
+        }
         TVm::Part(j, body) => {
             let l = part_label(g, *j);
             g.label(&l);
@@ -420,8 +425,4 @@ pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty, _span: Span) {
     }
 }
 
-pub fn before_call(_g: &mut FnGen, _f: &TExpr) -> Option<()> {
-    None
-}
 
-pub fn after_call(_g: &mut FnGen, _f: &TExpr, _pre: Option<()>) {}

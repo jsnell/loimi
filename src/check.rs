@@ -41,11 +41,23 @@ pub struct FnCx {
     pub loops: Vec<LoopCx>,
     pub next_loop: u32,
     pub vm: Option<crate::vmcheck::HandlerCx>,
+    pub effects: u8,
+    pub fn_name: String,
 }
 
 impl FnCx {
     pub fn new(module: usize, ret: Ty) -> FnCx {
-        FnCx { module, locals: vec![], scopes: vec![vec![]], ret, loops: vec![], next_loop: 0, vm: None }
+        FnCx {
+            module,
+            locals: vec![],
+            scopes: vec![vec![]],
+            ret,
+            loops: vec![],
+            next_loop: 0,
+            vm: None,
+            effects: 0,
+            fn_name: String::new(),
+        }
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
         let id = self.locals.len() as LocalId;
@@ -81,6 +93,7 @@ pub struct Checker<'a> {
     pub generics: crate::generics::Generics,
     /// Type parameters in scope (while resolving generic instances).
     pub tenv: Vec<(String, Ty)>,
+    pub object_count: u32,
     pub vm_decls: Vec<(usize, crate::vmast::VmDecl)>,
     pub dispatch_override: Option<Dispatch>,
     pub vms: Vec<crate::vmcheck::VmInfo>,
@@ -112,6 +125,7 @@ impl<'a> Checker<'a> {
             vms: vec![],
             generics: Default::default(),
             tenv: vec![],
+            object_count: 0,
         }
     }
 
@@ -158,7 +172,19 @@ impl<'a> Checker<'a> {
                     }
                     Item::Struct(s) => {
                         let id = self.prog.structs.len() as u32;
-                        self.prog.structs.push(StructDef { name: format!("{}.{}", prefix, s.name.name), fields: vec![], pattern: false });
+                        let object = if s.is_object {
+                            self.object_count += 1;
+                            Some(self.object_count - 1)
+                        } else {
+                            None
+                        };
+                        self.prog.structs.push(StructDef {
+                            name: format!("{}.{}", prefix, s.name.name),
+                            fields: vec![],
+                            pattern: false,
+                            object,
+                            trailing: None,
+                        });
                         self.define(m, &s.name, Def::Struct(id), s.is_pub)?;
                     }
                     Item::Enum(e) => {
@@ -250,13 +276,22 @@ impl<'a> Checker<'a> {
                     Item::Struct(s) if s.generics.is_empty() => {
                         let Some((Def::Struct(id), _)) = self.scopes[m].get(&s.name.name).cloned() else { unreachable!() };
                         let mut fields = Vec::new();
-                        for (f, t) in &s.fields {
+                        let mut trailing = None;
+                        for (i, (f, t)) in s.fields.iter().enumerate() {
                             if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
                                 return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
+                            }
+                            if let TypeKind::Trailing(elem) = &t.kind {
+                                if !s.is_object || i + 1 != s.fields.len() {
+                                    return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
+                                }
+                                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
+                                continue;
                             }
                             fields.push((f.name.clone(), self.resolve_type(m, t)?));
                         }
                         self.prog.structs[id as usize].fields = fields;
+                        self.prog.structs[id as usize].trailing = trailing;
                     }
                     Item::Enum(e) if e.generics.is_empty() => {
                         let Some((Def::Enum(id), _)) = self.scopes[m].get(&e.name.name).cloned() else { unreachable!() };
@@ -361,6 +396,7 @@ impl<'a> Checker<'a> {
             vm: None,
             vm_role: VmRole::None,
             vm_state: vec![],
+            effects: effects_of(&f.attrs)?,
         };
         Ok(())
     }
@@ -370,6 +406,8 @@ impl<'a> Checker<'a> {
         let def = self.prog.fns[id as usize].clone();
         let mut cx = FnCx::new(m, def.ret.clone());
         cx.vm = vm;
+        cx.effects = def.effects;
+        cx.fn_name = def.name.clone();
         let mut params = Vec::new();
         for (p, t) in f.params.iter().zip(def.param_tys.iter()) {
             params.push(cx.declare(&p.name.name, t.clone(), true));
@@ -415,6 +453,7 @@ impl<'a> Checker<'a> {
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
             Ty::Param(i) => format!("?T{}", i),
+            Ty::Gc(t) => format!("Gc<{}>", self.ty_name(t)),
         }
     }
 
@@ -461,6 +500,16 @@ impl<'a> Checker<'a> {
     pub fn resolve_type(&mut self, m: usize, t: &TypeExpr) -> Res<Ty> {
         Ok(match &t.kind {
             TypeKind::Named(path, args) => {
+                if path.len() == 1 && path[0].name == "Gc" && !self.scopes[m].contains_key("Gc") {
+                    if args.len() != 1 {
+                        return Err(Diag::new(t.span, "Gc takes one type argument"));
+                    }
+                    let inner = self.resolve_type(m, &args[0])?;
+                    if !matches!(&inner, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
+                        return Err(Diag::new(args[0].span, "Gc<T> needs an `object` type"));
+                    }
+                    return Ok(Ty::Gc(Box::new(inner)));
+                }
                 if path.len() == 1 && path[0].name == "Result" {
                     if args.len() != 2 {
                         return Err(Diag::new(t.span, "Result takes two type arguments"));
@@ -538,6 +587,9 @@ impl<'a> Checker<'a> {
                 Ty::Fn(out, Box::new(self.resolve_type(m, r)?))
             }
             TypeKind::Never => Ty::Never,
+            TypeKind::Trailing(_) => {
+                return Err(Diag::new(t.span, "a trailing array `[T]` is only allowed as the last field of an `object`"))
+            }
         })
     }
 
@@ -1446,6 +1498,15 @@ impl<'a> Checker<'a> {
         let b = self.auto_deref(b);
         match b.ty.clone() {
             Ty::Struct(sid) => {
+                if let Some((tn, et)) = &self.prog.structs[sid as usize].trailing {
+                    if *tn == name.name {
+                        let et = et.clone();
+                        let TK::Deref(obj) = b.kind else {
+                            return Err(Diag::new(name.span, "trailing arrays are only reachable through a Gc reference"));
+                        };
+                        return Ok(mk(Ty::Slice(Box::new(et)), TK::Trailing(obj), span));
+                    }
+                }
                 let fields = &self.prog.structs[sid as usize].fields;
                 let Some(idx) = fields.iter().position(|(n, _)| *n == name.name) else {
                     return Err(Diag::new(
@@ -1477,13 +1538,19 @@ impl<'a> Checker<'a> {
 
     /// Follow pointers: `p.x` where `p: *Point`.
     pub fn auto_deref(&self, mut b: TExpr) -> TExpr {
-        while let Ty::Ptr(inner) = &b.ty {
-            if matches!(**inner, Ty::Struct(_) | Ty::Tuple(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Array(..)) {
-                let t = (**inner).clone();
-                let span = b.span;
-                b = mk(t, TK::Deref(Box::new(b)), span);
-            } else {
-                break;
+        loop {
+            match &b.ty {
+                Ty::Ptr(inner) if matches!(**inner, Ty::Struct(_) | Ty::Tuple(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Array(..) | Ty::Gc(_)) => {
+                    let t = (**inner).clone();
+                    let span = b.span;
+                    b = mk(t, TK::Deref(Box::new(b)), span);
+                }
+                Ty::Gc(inner) => {
+                    let t = (**inner).clone();
+                    let span = b.span;
+                    b = mk(t, TK::Deref(Box::new(b)), span);
+                }
+                _ => break,
             }
         }
         b
@@ -1656,10 +1723,12 @@ impl<'a> Checker<'a> {
                 pre.push(v);
             }
         }
-        if let TK::FnRef(id) = f.kind {
-            crate::vmcheck::check_call_effects(self, cx, id, span)?;
+        let callee = if let TK::FnRef(id) = f.kind { Some(id) } else { None };
+        let call = mk(*ret, TK::Call(Box::new(f), pre), span);
+        match callee {
+            Some(id) => crate::vmcheck::wrap_effects(self, cx, id, call),
+            None => Ok(call),
         }
-        Ok(mk(*ret, TK::Call(Box::new(f), pre), span))
     }
 
     /// `Vec` (a generic type named in expression position).
@@ -1682,7 +1751,7 @@ impl<'a> Checker<'a> {
 
     fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], span: Span) -> Res<TExpr> {
         let mut base_ty = recv.ty.clone();
-        while let Ty::Ptr(inner) = base_ty {
+        while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
             base_ty = *inner;
         }
         if let Some((g, targs)) = self.generics.inst_of.get(&base_ty).cloned() {
@@ -1825,6 +1894,46 @@ impl<'a> Checker<'a> {
         if self.scopes[cx.module].contains_key(name) {
             return Ok(None);
         }
+        if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
+            return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
+        }
+        if name == "new" {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(Diag::new(span, "`new` takes a heap, an object literal, and (for trailing arrays) a length"));
+            }
+            let h = self.expr(cx, &args[0], None)?;
+            if !matches!(h.ty, Ty::Ptr(_)) {
+                return Err(Diag::new(args[0].span, "the first argument of `new` must be a pointer to a heap"));
+            }
+            let want = match _exp {
+                Some(Ty::Gc(t)) => Some((**t).clone()),
+                _ => None,
+            };
+            let init = self.expr(cx, &args[1], want.as_ref())?;
+            let Ty::Struct(sid) = init.ty else {
+                return Err(Diag::new(args[1].span, "`new` needs an object literal"));
+            };
+            let sd = &self.prog.structs[sid as usize];
+            if sd.object.is_none() {
+                return Err(Diag::new(args[1].span, format!("`{}` is a struct, not an `object`", self.ty_name(&init.ty))));
+            }
+            let len = match (&sd.trailing, args.len()) {
+                (Some(_), 3) => Some(Box::new(self.expr_coerce(cx, &args[2], &Ty::Int(IntTy::U64))?)),
+                (None, 2) => None,
+                (Some(_), _) => return Err(Diag::new(span, "this object has a trailing array: pass its length")),
+                (None, _) => return Err(Diag::new(span, "this object has no trailing array")),
+            };
+            let t = Ty::Gc(Box::new(init.ty.clone()));
+            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len }, span)));
+        }
+        if name == "gc_mark" {
+            if args.len() != 2 {
+                return Err(Diag::new(span, "`gc_mark` takes a heap and a value"));
+            }
+            let h = self.expr(cx, &args[0], None)?;
+            let v = self.expr(cx, &args[1], None)?;
+            return Ok(Some(mk(Ty::Unit, TK::Intrinsic(Intr::GcMark, vec![h, v]), span)));
+        }
         let (intr, ret) = match name {
             "likely" => (Intr::Likely, Ty::Bool),
             "unlikely" => (Intr::Unlikely, Ty::Bool),
@@ -1949,7 +2058,7 @@ impl<'a> Checker<'a> {
             And | Or | Xor => t.is_int() || t == Ty::Bool,
             Eq | Ne => {
                 t.is_numeric()
-                    || matches!(t, Ty::Bool | Ty::Ptr(_) | Ty::Fn(..) | Ty::Value(_))
+                    || matches!(t, Ty::Bool | Ty::Ptr(_) | Ty::Fn(..) | Ty::Value(_) | Ty::Gc(_))
                     || matches!(&t, Ty::Enum(e) if !self.prog.enums[*e as usize].has_payload())
                     || matches!(&t, Ty::Option(inner) if inner.is_nullable_ptr() || inner.is_numeric()
                         || matches!(**inner, Ty::Bool | Ty::Value(_))
@@ -1970,7 +2079,8 @@ impl<'a> Checker<'a> {
         match (from, to) {
             (a, b) if num(a) && num(b) => true,
             (Ty::Bool, Ty::Int(_)) => true,
-            (Ty::Ptr(_) | Ty::Fn(..), Ty::Ptr(_)) => true,
+            (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => true,
+            (Ty::Gc(_), Ty::Int(it)) => it.bits == 64,
             (Ty::Ptr(_), Ty::Int(it)) | (Ty::Int(it), Ty::Ptr(_)) => it.bits == 64,
             (Ty::Enum(e), Ty::Int(_)) => !self.prog.enums[*e as usize].has_payload(),
             (Ty::Value(v), Ty::Int(it)) | (Ty::Int(it), Ty::Value(v)) => {
@@ -2034,11 +2144,28 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         vm: None,
         vm_role: VmRole::None,
         vm_state: vec![],
+        effects: 0,
     }
 }
 
 fn short(s: &str) -> String {
     s.rsplit('.').next().unwrap_or(s).to_string()
+}
+
+pub fn effects_of(attrs: &Attrs) -> Res<u8> {
+    let mut e = 0;
+    for (n, args, span) in &attrs.list {
+        if n != "uses" {
+            continue;
+        }
+        e |= match args[0].as_str() {
+            "sync" => EFF_SYNC,
+            "gc" => EFF_SYNC | EFF_GC,
+            "reenter" => EFF_SYNC | EFF_GC | EFF_REENTER,
+            x => return Err(Diag::new(*span, format!("unknown effect `{}` (sync, gc or reenter)", x))),
+        };
+    }
+    Ok(e)
 }
 
 pub fn prim_type(name: &str) -> Option<Ty> {

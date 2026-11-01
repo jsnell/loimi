@@ -43,6 +43,7 @@ pub struct VmInfo {
     pub ret: Ty,
     pub raise_ty: Option<Ty>,
     pub fns: HashMap<String, FnId>,
+    pub sync: Option<Block>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +120,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm: Some(vm),
         vm_role: role,
         vm_state: vec![],
+        effects: 0,
     });
     id
 }
@@ -262,6 +264,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             None => Ty::Unit,
         };
         let fid = new_fn(c, format!("{}.fn.{}", prefix, f.name.name), f.name.name.clone(), pt, r, CallConv::C, vm, VmRole::VmFn, f.name.span);
+        c.prog.fns[fid as usize].effects = crate::check::effects_of(&f.attrs)?;
         if fns.insert(f.name.name.clone(), fid).is_some() {
             return Err(Diag::new(f.name.span, format!("vm function `{}` defined twice", f.name.name)));
         }
@@ -322,7 +325,20 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         on_raise: raise_fid,
         raise_ty: raise_ty.clone(),
     });
-    c.vms.push(VmInfo { module: m, name: d.name.name.clone(), word, state, pc_idx, kinds, caches, ops, ret: ret.clone(), raise_ty, fns });
+    c.vms.push(VmInfo {
+        module: m,
+        name: d.name.name.clone(),
+        word,
+        state,
+        pc_idx,
+        kinds,
+        caches,
+        ops,
+        ret: ret.clone(),
+        raise_ty,
+        fns,
+        sync: d.sync.clone(),
+    });
 
     // Bodies.
     for (fid, f) in fn_decls {
@@ -351,6 +367,8 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     let st = info.state.clone();
     let ret = c.prog.fns[fid as usize].ret.clone();
     let mut cx = FnCx::new(m, ret.clone());
+    cx.effects = c.prog.fns[fid as usize].effects;
+    cx.fn_name = f.name.name.clone();
     let mut params = Vec::new();
     let mut state = Vec::new();
     for (n, t) in &st {
@@ -685,6 +703,44 @@ pub fn check_raise_ty(c: &mut Checker, cx: &mut FnCx, e: &Ty, span: Span) -> Res
     }
 }
 
-pub fn check_call_effects(_c: &mut Checker, _cx: &mut FnCx, _f: FnId, _span: Span) -> Res<()> {
-    Ok(())
+fn effect_name(e: u8) -> &'static str {
+    if e & EFF_REENTER != 0 {
+        "reenter"
+    } else if e & EFF_GC != 0 {
+        "gc"
+    } else {
+        "sync"
+    }
+}
+
+/// Check a call against the caller's effects. In handlers, effectful calls
+/// are wrapped so that codegen syncs vm state and roots traced locals.
+pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, f: FnId, call: TExpr) -> Res<TExpr> {
+    let e = c.prog.fns[f as usize].effects;
+    let missing = e & !cx.effects;
+    if missing == 0 {
+        return Ok(call);
+    }
+    let span = call.span;
+    if let Some(h) = cx.vm.clone() {
+        if h.allow_control && h.is_handler {
+            let sync = match c.vms[h.vm as usize].sync.clone() {
+                Some(b) => c.block(cx, &b, Some(&Ty::Unit))?,
+                None => mk(Ty::Unit, TK::Unit, span),
+            };
+            let t = call.ty.clone();
+            return Ok(mk(t, TK::Vm(TVm::Synced(Box::new(sync), Box::new(call))), span));
+        }
+        if h.allow_control {
+            // Entries run before dispatch starts: nothing to sync yet.
+            return Ok(call);
+        }
+    }
+    let callee = c.prog.fns[f as usize].name.clone();
+    let caller = if cx.fn_name.is_empty() { "this function".to_string() } else { format!("`{}`", cx.fn_name) };
+    let eff = effect_name(missing);
+    Err(Diag::new(
+        span,
+        format!("`{}` uses {}, but {} does not declare it; add `uses {}` to its signature", callee, eff, caller, eff),
+    ))
 }

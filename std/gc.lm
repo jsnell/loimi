@@ -1,0 +1,165 @@
+// Garbage-collected heap: precise, non-moving mark-sweep.
+//
+// Objects are allocated with `new(heap, Obj { .. })`. Allocation never
+// collects; collection happens only in functions that `use gc`
+// (`collect`, `maybe_collect`), so the compiler knows every place where
+// roots must be visible. Roots are:
+//   - traced locals of functions on the call stack at a `uses gc` call
+//     (the compiler registers them in shadow-stack frames),
+//   - scanners added with `Heap.add_scanner` (for example the VM stack).
+// The compiler generates the tracing of each object type (including
+// pointers inside NaN-boxed values) as `loimi_trace_object`.
+
+import std.mem;
+
+extern "C" fn loimi_trace_object(h: *Heap, obj: *u8, tid: u32);
+extern "C" fn loimi_shadow_top() -> *ShadowFrame;
+extern "C" fn calloc(n: u64, size: u64) -> *u8;
+extern "C" fn free(p: *u8);
+extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn abort();
+
+const HEADER: u64 = 24;
+
+/// Lives just before every object.
+struct Header { next: *Header, size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
+
+/// Shadow-stack frame written by compiled code; entries follow `n`.
+pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
+struct ShadowEntry { slot: *u8, mark: fn(*Heap, *u8) }
+
+struct Scanner { data: *u8, scan: fn(*Heap, *u8) }
+
+pub struct Heap {
+    objects: *Header,
+    count: u64,
+    live_bytes: u64,
+    allocated: u64,
+    threshold: u64,
+    min_heap: u64,
+    stack: mem.Vec<*u8>,
+    scanners: mem.Vec<Scanner>,
+    collections: u64,
+    freed: u64,
+    stress: bool,
+}
+
+pub fn Heap.new() -> Heap {
+    Heap {
+        objects: 0 as *Header,
+        count: 0,
+        live_bytes: 0,
+        allocated: 0,
+        threshold: 1 << 20,
+        min_heap: 1 << 20,
+        stack: mem.Vec.new(),
+        scanners: mem.Vec.new(),
+        collections: 0,
+        freed: 0,
+        stress: false,
+    }
+}
+
+/// Called by compiled code for `new`.
+pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let p = calloc(1, HEADER + size);
+    if (p as u64) == 0 {
+        let m = "out of memory\n";
+        write(2, m.ptr, m.len);
+        abort();
+    }
+    let hd = p as *Header;
+    hd.next = h.objects;
+    hd.size = (HEADER + size) as u32;
+    hd.tid = tid as u16;
+    hd.len = n;
+    h.objects = hd;
+    h.count += 1;
+    h.allocated += HEADER + size;
+    p + HEADER
+}
+
+/// Mark the object at `p` (null is ignored). Called by generated tracing code.
+pub fn mark_ptr(h: *Heap, p: *u8) {
+    if (p as u64) == 0 { return; }
+    let hd = (p - HEADER) as *Header;
+    if hd.mark != 0 { return; }
+    hd.mark = 1;
+    h.stack.push(p);
+}
+
+/// Register a root scanner: `scan(heap, data)` must `gc_mark` every
+/// reference it owns.
+pub fn Heap.add_scanner(h: *Heap, data: *u8, scan: fn(*Heap, *u8)) {
+    h.scanners.push(Scanner { data: data, scan: scan });
+}
+
+fn drain(h: *Heap) {
+    while let Some(p) = h.stack.pop() {
+        let hd = (p - HEADER) as *Header;
+        loimi_trace_object(h, p, hd.tid as u32);
+    }
+}
+
+/// Run a full collection.
+pub fn collect(h: *Heap) uses gc {
+    for i in 0..h.scanners.len {
+        let s = h.scanners.at(i);
+        s.scan(h, s.data);
+    }
+    var fr = loimi_shadow_top();
+    while (fr as u64) != 0 {
+        let entries = (fr as *u8 + 16) as *ShadowEntry;
+        for i in 0..fr.n {
+            let e = entries + i;
+            e.mark(h, e.slot);
+        }
+        fr = fr.prev;
+    }
+    drain(h);
+    // Sweep.
+    var live: u64 = 0;
+    var kept: u64 = 0;
+    var link: **Header = &h.objects;
+    var cur = h.objects;
+    while (cur as u64) != 0 {
+        let next = cur.next;
+        if cur.mark != 0 {
+            cur.mark = 0;
+            live += cur.size as u64;
+            kept += 1;
+            link = &cur.next;
+        } else {
+            *link = next;
+            h.freed += 1;
+            free(cur as *u8);
+        }
+        cur = next;
+    }
+    h.count = kept;
+    h.live_bytes = live;
+    h.allocated = 0;
+    h.threshold = if live > h.min_heap { live } else { h.min_heap };
+    h.collections += 1;
+}
+
+/// Collect if enough has been allocated since the last collection.
+pub fn maybe_collect(h: *Heap) uses gc {
+    if h.allocated > h.threshold or h.stress {
+        collect(h);
+    }
+}
+
+/// Free every object (no finalizers run).
+pub fn Heap.free(h: *Heap) {
+    var cur = h.objects;
+    while (cur as u64) != 0 {
+        let next = cur.next;
+        free(cur as *u8);
+        cur = next;
+    }
+    h.objects = 0 as *Header;
+    h.count = 0;
+    h.stack.free();
+    h.scanners.free();
+}

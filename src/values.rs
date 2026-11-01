@@ -34,7 +34,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         };
         let small_ok = |t: &Ty| match t {
             Ty::Int(it) => it.bits <= 32,
-            Ty::Bool | Ty::Ptr(_) => true,
+            Ty::Bool | Ty::Ptr(_) | Ty::Gc(_) => true,
             _ => false,
         };
         let tag = match repr {
@@ -106,7 +106,7 @@ fn payload_bits(g: &mut FnGen, pt: &Ty, v: &str) -> String {
     match pt {
         Ty::F64 => g.inst(format!("bitcast double {} to i64", v)),
         Ty::Bool => g.inst(format!("zext i1 {} to i64", v)),
-        Ty::Ptr(_) => g.inst(format!("ptrtoint ptr {} to i64", v)),
+        Ty::Ptr(_) | Ty::Gc(_) => g.inst(format!("ptrtoint ptr {} to i64", v)),
         Ty::Int(it) if it.bits == 64 => v.to_string(),
         Ty::Int(it) => g.inst(format!("zext i{} {} to i64", it.bits, v)),
         _ => unreachable!(),
@@ -132,14 +132,14 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
                         Ty::Int(it) if it.signed => g.inst(format!("zext i{} {} to i64", it.bits, vals[0])),
                         _ => payload_bits(g, pt, &vals[0]),
                     };
-                    let b = if matches!(pt, Ty::Ptr(_)) { g.inst(format!("and i64 {}, {}", b, 0xFFFF_FFFF_FFFFu64)) } else { b };
+                    let b = if matches!(pt, Ty::Ptr(_) | Ty::Gc(_)) { g.inst(format!("and i64 {}, {}", b, 0xFFFF_FFFF_FFFFu64)) } else { b };
                     g.inst(format!("or i64 {}, {}", b, tag))
                 }
             }
         }
         ValueRepr::LowTag => match &var.payload {
             None => var.tag.to_string(),
-            Some(Ty::Ptr(_)) => {
+            Some(Ty::Ptr(_) | Ty::Gc(_)) => {
                 let b = g.inst(format!("ptrtoint ptr {} to i64", vals[0]));
                 g.inst(format!("or i64 {}, {}", b, var.tag))
             }
@@ -166,7 +166,7 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
 }
 
 /// i1: does `v` (loaded value) hold variant `idx`?
-fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
+pub fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
     match d.repr {
         ValueRepr::NanBox if var.unboxed => g.inst(format!("icmp ult i64 {}, {}", v, (NAN_TAG_BASE << 48) as i64)),
@@ -186,7 +186,7 @@ fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
 }
 
 /// Extract the payload of variant `idx` from `v` (known to hold it).
-fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
+pub fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
     let pt = var.payload.as_ref().unwrap();
     let raw = match d.repr {
@@ -194,14 +194,14 @@ fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
             if var.unboxed {
                 return g.inst(format!("bitcast i64 {} to double", v));
             }
-            if let Ty::Ptr(_) = pt {
+            if let Ty::Ptr(_) | Ty::Gc(_) = pt {
                 let m = g.inst(format!("and i64 {}, {}", v, 0xFFFF_FFFF_FFFFu64));
                 return g.inst(format!("inttoptr i64 {} to ptr", m));
             }
             v.to_string()
         }
         ValueRepr::LowTag => {
-            if let Ty::Ptr(_) = pt {
+            if let Ty::Ptr(_) | Ty::Gc(_) = pt {
                 let m = g.inst(format!("and i64 {}, {}", v, -(1i64 << LOW_BITS)));
                 return g.inst(format!("inttoptr i64 {} to ptr", m));
             }
@@ -212,7 +212,7 @@ fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
             let p = g.inst(format!("extractvalue {{ i64, i64 }} {}, 1", v));
             match pt {
                 Ty::F64 => return g.inst(format!("bitcast i64 {} to double", p)),
-                Ty::Ptr(_) => return g.inst(format!("inttoptr i64 {} to ptr", p)),
+                Ty::Ptr(_) | Ty::Gc(_) => return g.inst(format!("inttoptr i64 {} to ptr", p)),
                 _ => p,
             }
         }

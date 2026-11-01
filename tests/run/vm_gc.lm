@@ -1,0 +1,102 @@
+// matrix: dispatch
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+value V repr nanbox { Num(f64) unboxed, Int(i32), S(Gc<Str>), Nil }
+
+struct Ctx { heap: gc.Heap, base: *V, top: *V, syncs: i64 }
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.base;
+    while p < c.top {
+        gc_mark(h, *p);
+        p = p + 1;
+    }
+}
+
+fn concat(h: *gc.Heap, a: Gc<Str>, b: Gc<Str>) -> Gc<Str> {
+    let n = a.data.len + b.data.len;
+    let s = new(h, Str {}, n);
+    for i in 0..a.data.len { s.data[i] = a.data[i]; }
+    for i in 0..b.data.len { s.data[a.data.len + i] = b.data[i]; }
+    s
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    // Make the live part of the register file visible to the collector.
+    sync {
+        ctx.top = regs + 8;
+        ctx.syncs += 1;
+    }
+
+    op STR(dst: reg, ch: imm) : ABC {
+        let s = new(&ctx.heap, Str {}, 1);
+        s.data[0] = ch;
+        dst = S(s);
+        next
+    }
+    op CAT(dst: reg, a: reg, b: reg) : ABC {
+        if let (S(x), S(y)) = (a, b) {
+            dst = S(concat(&ctx.heap, x, y));
+            next
+        }
+        dst = Nil;
+        next
+    }
+    op CLEAR(dst: reg) : ABC { dst = Nil; next }
+    op GC() : ABC {
+        // Only the handler local `keep` refers to r0's value during the
+        // collection: the compiler registers it as a root.
+        let keep = regs[0];
+        regs[0] = Nil;
+        gc.collect(&ctx.heap);
+        regs[0] = keep;
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32) -> V {
+        ctx = c;
+        pc = code;
+        regs = c.base;
+        jump pc
+    }
+}
+
+fn main() {
+    var ctx = Ctx { heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V, syncs: 0 };
+    var regs: [V; 8] = [V.Nil; 8];
+    ctx.base = &regs[0];
+    ctx.top = &regs[0];
+    ctx.heap.add_scanner(&ctx as *u8, scan);
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    at = M.emit.STR(c, at, 0, 'a');
+    at = M.emit.STR(c, at, 1, 'b');
+    at = M.emit.CAT(c, at, 0, 0, 1);    // r0 = "ab"
+    at = M.emit.STR(c, at, 2, 'x');
+    at = M.emit.CLEAR(c, at, 2);        // "x" becomes garbage
+    at = M.emit.GC(c, at);
+    at = M.emit.STR(c, at, 3, 'c');
+    at = M.emit.CAT(c, at, 0, 0, 3);    // r0 = "abc"
+    at = M.emit.GC(c, at);
+    at = M.emit.RET(c, at, 0);
+    match M.run(&ctx, &code[0]) {
+        S(s) => io.println(s.data),
+        _ => io.println("?"),
+    }
+    io.print_int(ctx.heap.freed as i64); io.println("");
+    io.print_int(ctx.syncs); io.println("");
+}
+// expect: abc
+// expect: 3
+// expect: 2

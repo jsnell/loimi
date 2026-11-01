@@ -27,6 +27,8 @@ pub enum TypeKind {
     Tuple(Vec<TypeExpr>),
     Fn(Vec<TypeExpr>, P<TypeExpr>),
     Never,
+    /// `[T]`: trailing variable-length array (last field of an `object`).
+    Trailing(P<TypeExpr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +226,7 @@ pub struct FnDecl {
 pub struct StructDecl {
     pub name: Ident,
     pub generics: Vec<Ident>,
+    pub is_object: bool,
     pub fields: Vec<(Ident, TypeExpr)>,
     pub is_pub: bool,
 }

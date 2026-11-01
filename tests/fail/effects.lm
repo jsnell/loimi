@@ -1,0 +1,4 @@
+import std.gc;
+fn helper(h: *gc.Heap) { gc.collect(h); }
+fn main() {}
+// error: `collect` uses gc, but `helper` does not declare it; add `uses gc` to its signature

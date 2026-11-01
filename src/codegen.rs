@@ -22,6 +22,7 @@ pub struct Codegen<'p> {
     pub fns: String,
     pub decls: Decls,
     pub str_count: u32,
+    pub mark_fns: std::collections::HashMap<String, String>,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -72,6 +73,7 @@ pub fn llty(p: &Program, t: &Ty) -> String {
             }
         }
         Ty::Param(_) => unreachable!("type parameter in codegen"),
+        Ty::Gc(_) => "ptr".into(),
     }
 }
 
@@ -94,7 +96,16 @@ fn cc_str(cc: CallConv) -> &'static str {
 
 impl<'p> Codegen<'p> {
     pub fn new(p: &'p Program, sm: &'p SourceMap, opts: Options) -> Codegen<'p> {
-        Codegen { p, sm, opts, globals: String::new(), fns: String::new(), decls: Decls::default(), str_count: 0 }
+        Codegen {
+            p,
+            sm,
+            opts,
+            globals: String::new(),
+            fns: String::new(),
+            decls: Decls::default(),
+            str_count: 0,
+            mark_fns: Default::default(),
+        }
     }
 
     pub fn string_const(&mut self, s: &[u8]) -> String {
@@ -163,6 +174,7 @@ impl<'p> Codegen<'p> {
             let _ = writeln!(self.fns, "}}");
         }
         crate::vmgen::emit_tables(p, &mut self.globals, &mut self.fns);
+        crate::gcgen::emit_runtime(&mut self);
         self.decls.insert("declare void @llvm.trap() noreturn");
         let _ = writeln!(self.globals, "@loimi.argc = global i32 0");
         let _ = writeln!(self.globals, "@loimi.argv = global ptr null");
@@ -207,6 +219,8 @@ pub struct FnGen<'a, 'p> {
     defers: Vec<Vec<TExpr>>,
     /// VM handler state (set by vmgen when generating handlers).
     pub vm: Option<crate::vmgen::HandlerGen>,
+    /// Locals in scope (and initialized), innermost last: roots at calls that may collect.
+    pub live: Vec<Vec<LocalId>>,
 }
 
 impl<'a, 'p> FnGen<'a, 'p> {
@@ -222,6 +236,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             loops: vec![],
             defers: vec![],
             vm: None,
+            live: vec![vec![]],
         }
     }
 
@@ -309,6 +324,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             params.push(format!("{} {}", llty(p, t), pname));
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
+            self.live[0].push(lid);
         }
         if let Some(x) = crate::vmgen::extra_param(p, f) {
             params.push(x);
@@ -538,6 +554,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             TK::Variant(idx, args) => self.variant(&e.ty, *idx, args),
             TK::Block(stmts, tail) => {
                 self.defers.push(vec![]);
+                self.live.push(vec![]);
                 for s in stmts {
                     self.stmt(s);
                 }
@@ -545,6 +562,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Some(t) => self.val(t),
                     None => self.poison(&e.ty),
                 };
+                self.live.pop();
                 let ds = self.defers.pop().unwrap();
                 if !self.terminated {
                     for d in ds.iter().rev() {
@@ -558,9 +576,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let l_then = self.fresh_label("then");
                 let l_else = self.fresh_label("else");
                 let l_end = self.fresh_label("endif");
+                self.live.push(vec![]);
                 self.conds(conds, &l_else);
                 self.label(&l_then);
                 let v = self.val(then);
+                self.live.pop();
                 if let Some(s) = &slot {
                     if !self.terminated {
                         self.store(&e.ty, &v, s);
@@ -598,6 +618,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let l_end = self.fresh_label("endmatch");
                 for arm in arms {
                     let l_next = self.fresh_label("arm");
+                    self.live.push(vec![]);
                     self.test_pat(&arm.pat, &sp, &l_next);
                     if let Some(g) = &arm.guard {
                         let c = self.val(g);
@@ -606,6 +627,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                         self.label(&l_ok);
                     }
                     let v = self.val(&arm.body);
+                    self.live.pop();
                     if let Some(s) = &slot {
                         if !self.terminated {
                             self.store(&e.ty, &v, s);
@@ -710,6 +732,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.poison(&e.ty)
             }
             TK::Vm(v) => crate::vmgen::vm_expr(self, e, v),
+            TK::New { heap, init, len } => crate::gcgen::new_object(self, e, heap, init, len.as_deref()),
+            TK::Trailing(obj) => crate::gcgen::trailing(self, obj),
         }
     }
 
@@ -747,6 +771,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     };
                     self.store(&t, &v, &slot);
                 }
+                self.live.last_mut().unwrap().push(*id);
             }
             TStmt::LetPat(p, init, els) => {
                 let sp = self.place_copy(init);
@@ -821,6 +846,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let v = self.load(t, ptr);
                 let slot = self.slots[*id as usize].clone();
                 self.store(t, &v, &slot);
+                self.live.last_mut().unwrap().push(*id);
             }
             TPK::Int(v) => {
                 let x = self.load(t, ptr);
@@ -1317,7 +1343,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         } else {
             rt.clone()
         };
-        let pre = crate::vmgen::before_call(self, f);
+        let pre = crate::gcgen::push_frame(self, f);
         let call = format!("call {}{} {}({})", cc_str(cc), fnty, callee, avs.join(", "));
         let r = if rt == "void" {
             self.emit(&call);
@@ -1325,7 +1351,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         } else {
             self.inst(&call)
         };
-        crate::vmgen::after_call(self, f, pre);
+        crate::gcgen::pop_frame(self, pre);
         if e.ty == Ty::Never {
             self.term("unreachable");
         }
@@ -1414,6 +1440,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.inst(format!("call double @llvm.{}.f64(double {})", n, vals[0]))
             }
             Intr::ValueTag => crate::vmgen::value_tag(self, &args[0], &vals[0]),
+            Intr::GcMark => {
+                crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
+                "zeroinitializer".into()
+            }
         }
     }
 }
