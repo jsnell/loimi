@@ -900,7 +900,7 @@ fn count_op(g: &mut FnGen, k: u32) {
     g.emit(format!("store i64 {}, ptr @\"{}.stats.last\"", k, sym));
     // Longer sequences: in the runtime (`stats_rt.c`).
     let adj = g.inst(format!("zext i1 {} to i64", adjacent));
-    g.emit(format!("call void @loimi_stats_seq(ptr @\"{}.stats.seq\", i64 {}, i64 {})", sym, adj, k));
+    g.emit(format!("call void @{}(ptr @\"{}.stats.seq\", i64 {}, i64 {})", stats_rt_sym("seq"), sym, adj, k));
 }
 
 /// `--vm-stats`: counters, and a report printed at exit (op counts, and
@@ -988,13 +988,14 @@ opnext:
   %odone = icmp eq i64 %oi1, {n}
   br i1 %odone, label %pairs, label %oploop
 pairs:
-  call void @loimi_stats_suggest(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.pairs", i64 {n}, ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1, ptr @"{sym}.stats.supers", i64 {nsw})
+  call void @{suggest}(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.pairs", i64 {n}, ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1, ptr @"{sym}.stats.supers", i64 {nsw})
   br label %done
 done:
   ret void
 }}
 "#,
             nsw = super_words.len(),
+            suggest = stats_rt_sym("suggest"),
         );
         dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
     }
@@ -1002,9 +1003,36 @@ done:
         let _ = writeln!(cg.globals, "@llvm.global_dtors = appending global [{} x {{ i32, ptr, ptr }}] [{}]", dtors.len(), dtors.join(", "));
         let _ = writeln!(cg.globals, "@stderr = external global ptr");
         cg.decls.insert("declare i32 @fprintf(ptr, ptr, ...)");
-        cg.decls.insert("declare void @loimi_stats_seq(ptr, i64, i64)");
-        cg.decls.insert("declare void @loimi_stats_suggest(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)");
+        cg.decls.insert(format!("declare void @{}(ptr, i64, i64)", stats_rt_sym("seq")));
+        cg.decls.insert(format!("declare void @{}(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)", stats_rt_sym("suggest")));
     }
+}
+
+/// The C source of the `--vm-stats` runtime.
+const STATS_RT: &str = include_str!("stats_rt.c");
+
+/// The symbol of the stats runtime's `loimi_stats_<name>`, suffixed with
+/// a hash of the runtime's source. The functions are also weak: two
+/// `--vm-stats` libraries linked into one host (even whole-archive) share
+/// one copy, and libraries built with different versions of the runtime
+/// keep their own.
+pub fn stats_rt_sym(name: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in STATS_RT.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("loimi_stats_{}_{:08x}", name, h as u32)
+}
+
+/// The stats runtime's C source, its entry points renamed to
+/// `stats_rt_sym`.
+pub fn stats_rt_source() -> String {
+    format!(
+        "#define loimi_stats_seq {}\n#define loimi_stats_suggest {}\n{}",
+        stats_rt_sym("seq"),
+        stats_rt_sym("suggest"),
+        STATS_RT
+    )
 }
 
 fn word_mask(bits: u8) -> i64 {

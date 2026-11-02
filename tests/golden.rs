@@ -708,7 +708,8 @@ fn c_library_panics() {
 
 /// `--vm-stats` in a static library: the stats runtime goes into the
 /// archive, and the report prints when the host exits, its suggestions
-/// overlapping neither each other nor the vm's supers.
+/// overlapping neither each other nor the vm's supers; two such
+/// libraries link into one host.
 #[test]
 fn vm_stats_library() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -733,10 +734,41 @@ fn vm_stats_library() {
     assert!(out.status.success(), "host: {}", String::from_utf8_lossy(&out.stderr));
     let out = limited(&exe).arg("demo").output().unwrap();
     let report = String::from_utf8_lossy(&out.stderr).to_string();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "demo failed:\n{}", report);
     assert!(report.contains("== vm stats: Rx =="), "no report at exit:\n{}", report);
     assert!(report.contains("suggested superinstructions"), "no suggestions:\n{}", report);
+    // A second `--vm-stats` library in the same host, whole-archive so
+    // that both copies of the stats runtime are linked: no clash.
+    let lib2 = dir.join("libp.a");
+    let out = loimi()
+        .arg("build")
+        .arg(root.join("tests/embed/panic.lm"))
+        .args(["--lib", "--vm-stats", "-o"])
+        .arg(&lib2)
+        .arg("--header")
+        .arg(dir.join("panic.h"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = dir.join("two");
+    let out = limited(&clang)
+        .args(["-Wall", "-Werror", "-I"])
+        .arg(&dir)
+        .arg(root.join("tests/embed/two_stats_host.c"))
+        .arg("-Wl,--whole-archive")
+        .arg(&lib)
+        .arg(&lib2)
+        .args(["-Wl,--no-whole-archive", "-lm", "-o"])
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "two libraries: {}", String::from_utf8_lossy(&out.stderr));
+    let out = limited(&exe).output().unwrap();
+    let report = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "two libraries failed:\n{}", report);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "rx 1\nrvm 6\n");
+    assert!(report.contains("== vm stats: Rx ==") && report.contains("== vm stats: R =="), "reports:\n{}", report);
 }
 
 /// `--sanitize=address` with `--lib` and `--shared`: the library carries

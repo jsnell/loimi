@@ -7,6 +7,10 @@
 // window restarts when an op does not directly follow the previous one
 // in the code) and a hash table of the sequences of 2 to 4 ops ending at
 // each op, with their counts.
+//
+// The compiler renames the two entry points with a hash of this file
+// (`vmgen::stats_rt_sym`), and they are weak, so that several
+// `--vm-stats` libraries link into one host.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +52,7 @@ static loimi_seq_entry *seq_find(loimi_seq *s, uint64_t key, uint32_t len, int i
     }
 }
 
-__attribute__((visibility("hidden"))) void loimi_stats_seq(loimi_seq *s, int64_t adjacent, int64_t op) {
+__attribute__((weak, visibility("hidden"))) void loimi_stats_seq(loimi_seq *s, int64_t adjacent, int64_t op) {
     if (!s->tab) {
         s->tab = calloc(SEQ_CAP, sizeof(loimi_seq_entry));
         if (!s->tab) return;
@@ -142,10 +146,10 @@ static void print_super(const loimi_cand *c, const char **names, uint64_t total,
 //
 // `pairs[a * nops + b]` counts op a directly followed by op b; `supers`
 // lists the vm's supers as (number of parts, part opcodes...).
-__attribute__((visibility("hidden"))) void loimi_stats_suggest(loimi_seq *s, const uint64_t *pairs, uint64_t nops,
-                                                               const char **names, const uint8_t *plain,
-                                                               uint64_t total, const uint32_t *supers,
-                                                               uint64_t nsuper_words) {
+__attribute__((weak, visibility("hidden"))) void loimi_stats_suggest(loimi_seq *s, const uint64_t *pairs, uint64_t nops,
+                                                                     const char **names, const uint8_t *plain,
+                                                                     uint64_t total, const uint32_t *supers,
+                                                                     uint64_t nsuper_words) {
     if (total == 0) return;
     uint64_t cap = 1024, n = 0, nexist = 0;
     loimi_cand *cand = calloc(cap, sizeof(*cand));

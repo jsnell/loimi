@@ -483,7 +483,7 @@ fn compiler_main() -> ExitCode {
     // `--vm-stats`: the runtime for sequences longer than pairs.
     let stats_rt = if opts.vm_stats {
         let p = tmpdir.join("loimi_stats_rt.c");
-        if let Err(e) = std::fs::write(&p, include_str!("stats_rt.c")) {
+        if let Err(e) = std::fs::write(&p, vmgen::stats_rt_source()) {
             eprintln!("error: cannot write {}: {}", p.display(), e);
             return ExitCode::from(1);
         }
