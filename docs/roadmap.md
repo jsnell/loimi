@@ -40,7 +40,7 @@ Each milestone ends with something measurable.
 | M2 | `tailcall` and `goto` dispatch, `cold` outlining with `preserve_most`, decode-ahead | same toy VM in all 3 modes; per-mode benchmark table; inspect asm for zero state spills in hot handlers |
 | M3 | `value` types: `nanbox`, `lowtag`, `boxed`; tuple-pattern tag merging | microbenchmarks show `(Int, Int)` = one test; repr switch is a one-line change |
 | M4 | `std.gc` MarkSweep, `object`, `Gc<T>`, effects + sync points, shadow-stack roots | GC-stress mode passes the test suite with no explicit rooting in user code; a deliberately missing effect is a compile error |
-| M5 | Generated verifier, `Verified<V>`, families/`become`, inline caches, `super`, `--vm-stats`, variants | bytecode fuzzer: 24h under ASan with no crashes; instrumentation variants add 0% when off |
+| M5 | Generated verifier, `Verified<V>`, families/`become`, inline caches, `super`, `--vm-stats`, variants | a bytecode fuzzer (ASan builds, a smoke run in `cargo test`, short campaigns after verifier changes) finds no crashes in verified code; instrumentation variants add 0% when off |
 | M6 | Stdlib front-end pieces: `std.lex`, `std.parse`, `std.diag`, `std.bc`, `std.obj`, `std.num` | the example interpreters use them instead of hand-written equivalents |
 | M7 | **Proof interpreters**: a Lua 5.4 subset and a small Scheme | see below |
 
