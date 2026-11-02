@@ -1365,6 +1365,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 (Ge, false) => "uge",
                 _ => unreachable!(),
             };
+            if let Ty::Int(it) = t {
+                if !matches!(it.bits, 8 | 16 | 32 | 64) {
+                    // Odd widths (i48 payloads): compare in i64 with both
+                    // operands shifted to the top, one `shl` each, instead
+                    // of LLVM's sign-extension (`shl` + `sar`) of each.
+                    let k = 64 - it.bits as u32;
+                    let mut w = Vec::new();
+                    for v in [&x, &y] {
+                        let z = self.inst(format!("zext {} {} to i64", lt, v));
+                        w.push(self.inst(format!("shl i64 {}, {}", z, k)));
+                    }
+                    return self.inst(format!("icmp {} i64 {}, {}", c, w[0], w[1]));
+                }
+            }
             return self.inst(format!("icmp {} {} {}, {}", c, lt, x, y));
         }
         if matches!(op, Add | Sub | Mul) && self.cg.opts.overflow_checks && t.is_int() {
@@ -1412,7 +1426,38 @@ impl<'a, 'p> FnGen<'a, 'p> {
             };
             return self.inst(format!("{} {} {}, {}", ins, lt, x, m));
         }
+        if let (Div | Rem, Ty::Int(it)) = (op, t) {
+            if it.bits > 32 && it.bits < 64 && y.parse::<i64>().is_err() {
+                return self.narrow_div(*it, if op == Div { "udiv" } else { "urem" }, ins, &x, &y);
+            }
+        }
         self.inst(format!("{} {} {}, {}", ins, lt, x, y))
+    }
+
+    /// Division of odd-width integers wider than 32 bits (i48 payloads),
+    /// which LLVM does with a 64-bit divide: when both operands are
+    /// non-negative and below 2^31, which interpreters' integers mostly
+    /// are, use a 32-bit unsigned divide instead, two to three times
+    /// faster on many x86 cores (LLVM's "bypass slow division", which it
+    /// applies to i64 only on some CPU tunings).
+    fn narrow_div(&mut self, it: IntTy, ins32: &str, ins: &str, x: &str, y: &str) -> String {
+        let nt = format!("i{}", it.bits);
+        let o = self.inst(format!("or {} {}, {}", nt, x, y));
+        let hi = self.inst(format!("lshr {} {}, 31", nt, o));
+        let small = self.inst(format!("icmp eq {} {}, 0", nt, hi));
+        let (l_fast, l_slow, l_join) = (self.fresh_label("divfast"), self.fresh_label("divslow"), self.fresh_label("divjoin"));
+        self.cond_br(&small, &l_fast, &l_slow);
+        self.label(&l_fast);
+        let xs = self.inst(format!("trunc {} {} to i32", nt, x));
+        let ys = self.inst(format!("trunc {} {} to i32", nt, y));
+        let rs = self.inst(format!("{} i32 {}, {}", ins32, xs, ys));
+        let rf = self.inst(format!("zext i32 {} to {}", rs, nt));
+        self.br(&l_join);
+        self.label(&l_slow);
+        let rw = self.inst(format!("{} {} {}, {}", ins, nt, x, y));
+        self.br(&l_join);
+        self.label(&l_join);
+        self.inst(format!("phi {} [ {}, %{} ], [ {}, %{} ]", nt, rf, l_fast, rw, l_slow))
     }
 
     /// `x op y` (add, sub or mul) on integer type `it` with overflow

@@ -2,6 +2,8 @@
 // overflow detection at the declared width, shifts, casts and layout.
 import std.io;
 
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+
 struct S { a: u8, b: i48, c: u24 }
 
 fn p(x: i64) { io.print_int(x); io.println(""); }
@@ -55,10 +57,37 @@ fn main() {
     p(size_of<i48>() as i64);
     p(size_of<u24>() as i64);
     p(size_of<S>() as i64);
+    // Division (32-bit fast path for small non-negative operands, 64-bit
+    // otherwise) and comparisons at 48 bits.
+    let ds: [i48; 6] = [100, -100, 140737488355327, -140737488355328, 2147483647, 2147483648];
+    let dv: [i48; 4] = [7, -7, 2147483647, 65536];
+    var acc: i64 = 0;
+    for i in 0..6 {
+        for j in 0..4 {
+            let (a, b) = (ds[i], dv[j]);
+            acc = acc *% 31 +% (a / b) as i64 +% 7 * (a % b) as i64;
+            if a < b { acc = acc + 1; }
+            if a <= b { acc = acc + 2; }
+            if a > b { acc = acc + 4; }
+            if a == b { acc = acc + 8; }
+        }
+    }
+    p(acc);
+    let ua: u48 = 281474976710655;
+    p((ua / 3) as i64);
+    p((ua % 1000) as i64);
+    var dd: u48 = 1000;
+    p((ua % dd) as i64);
+    io.print_bool(ua > dd); io.print_bool((5 as u48) < dd); io.println("");
     var s = S { a: 1, b: -2, c: 16777215 };
     s.b = s.b * 3;
     p(s.b as i64);
     p(s.c as i64);
+    // C varargs: odd widths are passed extended to 64 bits.
+    var buf: [u8; 64] = [0; 64];
+    let neg: i48 = -140737488355328;
+    let n = snprintf(&buf[0], 64, "%lld %llu\0".ptr, neg, ua);
+    io.println(buf[0..n as u64]);
 }
 // expect: 140737488355327
 // expect: overflow
@@ -90,5 +119,11 @@ fn main() {
 // expect: 8
 // expect: 4
 // expect: 24
+// expect: 172705787114821952
+// expect: 93824992236885
+// expect: 655
+// expect: 655
+// expect: truetrue
 // expect: -6
 // expect: 16777215
+// expect: -140737488355328 281474976710655
