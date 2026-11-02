@@ -12,34 +12,42 @@ well with Loimi because every handler is its own symbol.
 
 ## Current results
 
-Commit c2dac13 (before the last two entries of the changelog, which
-are within noise on this table). `--dispatch=tailcall` and `goto` are
-the same source.
+Commit 87cd496. `--dispatch=tailcall` and `goto` are the same source.
+This run was on a busier machine than earlier ones (PUC-Lua itself ran
+3-5% slower than in the starting-point run).
 
 | Benchmark | Mini tailcall | Mini goto | PUC-Lua 5.4 | LuaJIT -joff | LuaJIT | Mini/Lua | Mini/-joff |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| binary_trees | 1.430 | 1.455 | 2.506 | 1.387 | 0.970 | 0.57 | 1.03 |
-| closures | 0.487 | 0.529 | 1.218 | 0.924 | 0.763 | 0.40 | 0.53 |
-| fannkuch | 1.380 | 1.277 | 1.662 | 1.382 | 0.304 | 0.83 | 1.00 |
-| fib | 1.132 | 1.200 | 1.593 | 1.121 | 0.203 | 0.71 | 1.01 |
-| hash_strings | 1.404 | 1.445 | 1.604 | 1.089 | 0.212 | 0.87 | 1.29 |
-| interp | 1.329 | 1.260 | 1.937 | 1.062 | 0.369 | 0.69 | 1.25 |
-| mandelbrot | 0.993 | 0.975 | 1.196 | 0.785 | 0.157 | 0.83 | 1.26 |
-| nbody | 0.598 | 0.573 | 1.232 | 0.504 | 0.088 | 0.49 | 1.19 |
-| oo_methods | 0.823 | 0.837 | 1.327 | 0.990 | 0.183 | 0.62 | 0.83 |
-| queens | 0.974 | 0.999 | 1.193 | 0.915 | 0.469 | 0.82 | 1.06 |
-| sieve | 0.814 | 0.807 | 1.316 | 0.758 | 0.223 | 0.62 | 1.07 |
-| sort | 0.918 | 0.924 | 1.076 | 0.834 | 0.309 | 0.85 | 1.10 |
-| spectral_norm | 1.742 | 1.673 | 1.691 | 1.130 | 0.072 | 1.03 | 1.54 |
-| string_build | 1.065 | 1.049 | 1.758 | 0.752 | 0.387 | 0.61 | 1.42 |
+| binary_trees | 1.235 | 1.285 | 2.588 | 1.394 | 0.977 | 0.48 | 0.89 |
+| closures | 0.495 | 0.531 | 1.231 | 0.942 | 0.790 | 0.40 | 0.53 |
+| fannkuch | 1.351 | 1.146 | 1.707 | 1.427 | 0.316 | 0.79 | 0.95 |
+| fib | 1.058 | 1.131 | 1.620 | 1.120 | 0.197 | 0.65 | 0.94 |
+| hash_strings | 1.187 | 1.127 | 1.640 | 1.109 | 0.234 | 0.72 | 1.07 |
+| interp | 1.298 | 1.207 | 2.105 | 1.113 | 0.381 | 0.62 | 1.17 |
+| mandelbrot | 0.996 | 0.935 | 1.216 | 0.797 | 0.158 | 0.82 | 1.25 |
+| nbody | 0.594 | 0.565 | 1.180 | 0.527 | 0.090 | 0.50 | 1.13 |
+| oo_methods | 0.809 | 0.921 | 1.381 | 1.028 | 0.189 | 0.59 | 0.79 |
+| queens | 1.017 | 1.004 | 1.260 | 0.974 | 0.524 | 0.81 | 1.04 |
+| sieve | 0.821 | 0.775 | 1.273 | 0.873 | 0.295 | 0.64 | 0.94 |
+| sort | 0.931 | 0.893 | 1.137 | 0.871 | 0.320 | 0.82 | 1.07 |
+| spectral_norm | 1.720 | 1.668 | 1.770 | 1.190 | 0.073 | 0.97 | 1.45 |
+| string_build | 0.853 | 0.831 | 1.915 | 0.803 | 0.450 | 0.45 | 1.06 |
 
-binary_trees measured 1.21-1.37 s in other runs of the same build;
-spectral_norm measured 1.66-1.74 s (Mini/Lua 0.90-1.03).
+In quieter runs spectral_norm measured 1.65-1.68 s (Mini/Lua 0.89-0.91)
+and binary_trees 1.21-1.33 s.
 
-**Dispatch mode.** `goto` is within noise of `tailcall` on almost every
-benchmark (fannkuch and interp a little faster with goto, closures and
-fib a little slower). There is no consistent winner, so the default
-(`tailcall`) stays.
+Mini is faster than PUC-Lua on all 14 benchmarks, and faster than or
+within about 10% of LuaJIT's assembly interpreter (-joff) on 9 of them.
+The largest remaining gaps to -joff are spectral_norm (1.45x: per-op
+cost in a call-heavy float loop), mandelbrot and nbody (1.13-1.25x:
+float handlers are ~18 instructions where LuaJIT's are ~10), and interp
+(about 1.1x).
+
+**Dispatch mode.** Neither mode wins consistently. In the last two full
+runs `goto` was faster on fannkuch (by 10-15%), interp, mandelbrot and
+sieve, and slower on closures, oo_methods (by 5-15%), fib and
+binary_trees; most differences are within noise. The default
+(`tailcall`) stays. Mini does not need to change it.
 
 ## Starting point
 
@@ -124,3 +132,26 @@ Before → after, Mini tailcall, seconds.
     spectral_norm 1.68-1.74 → 1.66.
 13. **Closure caching `code`/`k`/`nregs`** (not committed). Saving the
     `proto` indirection in CALL was within noise.
+14. **String-key paths in GETINDEX/SETINDEX** (c34c44d). String keys go
+    straight to the hash part with the stored hash, and an existing key
+    is overwritten in place. hash_strings 1.40 → 1.13. Tried and dropped
+    (within noise): hash part at most half full instead of 3/4, a
+    first-probe fast path, and hashing interned strings by address.
+15. **NaN-safety through `let`; 64-bit register indexing**
+    (dfcf270). The compiler's NaN-safe analysis follows immutable
+    `let`s (FORLOOP's float path lost its canonicalization), and Mini's
+    `regs[a + 1]` with an 8-bit operand no longer computes in u8. Both
+    within noise.
+16. **Compare-and-branch ops** (b73ffa0). JEQ/JLT/JLE and the K forms
+    take a polarity and are followed by a JMP word with the offset.
+    Conditions use them instead of compare + TEST, which stored a
+    boolean, reloaded it and tested its truthiness.
+    interp 1.33 → 1.16, fib 1.10 → 1.01, fannkuch 1.38 → 1.31,
+    sort 0.92 → 0.88. Float-first quickening of the ordered compares
+    (like item 10) was within noise and dropped.
+17. **Multi-operand CONCAT** (c6addb9). `a .. b .. c` builds one
+    string from consecutive registers, as in Lua, instead of creating
+    and interning every intermediate. string_build 1.06 → 0.81.
+18. **Field IC misses in cold blocks** (87cd496). Removes a stack frame
+    from every GETFIELD hit (LLVM did not shrink-wrap the miss call).
+    Within noise.
