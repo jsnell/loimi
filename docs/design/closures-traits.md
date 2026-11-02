@@ -245,6 +245,38 @@ Parser: `trait`, `impl .. for ..;`, bounds in generic parameter lists.
 Checker: a trait table, an impl table, bound checks in the instantiation
 paths, defaults. No codegen changes.
 
+## Step 1 scope (being implemented)
+
+Section 0 does not change this design: trait method signatures carry
+effects like any function type, an impl's method may have fewer, and
+calls stay direct, so rooting is decided per call as before. The first
+version is deliberately smaller than section 2:
+
+- `trait Name { fn m(a: Self, ..) -> R uses E; .. }`: signatures only,
+  over `Self`. No default bodies, no generic traits (`trait Hooks<K>`), no
+  generic trait methods, no associated types or constants. `pub trait`
+  exports it like other items.
+- `impl Trait for Type;` for a concrete, non-generic type (a struct,
+  enum, value type or primitive such as `i64` or `str`). It is checked
+  after all signatures are known: for every trait method, `fn Type.m`
+  must exist with the same parameter and result types (with `Self` =
+  `Type`), and effects that are a subset of the trait's. Duplicate impls
+  are an error. There is no orphan rule yet.
+- Bounds `T: A + B` (trait names may be module-qualified, `hash.Hash`)
+  on the type parameters of generic structs, enums, functions and methods
+  (receiver and method parameters). They are checked when a concrete
+  instance is created, with the error at the instantiating type or call:
+  "`Sym` does not implement `Hash` (needed by `HashMap<Sym, i64>`)".
+  Instances that still contain type parameters (inside generic
+  signatures) are not checked; their concrete instances are.
+- Generic bodies are still checked per instance; method calls on a
+  bounded `T` resolve as today. No `dyn`, no codegen changes.
+- `std.hash` gets `trait Hash { hash, eq }` with impls for the integer
+  types and `str`, and `std.map.HashMap<K: hash.Hash, V>`.
+
+Left for later: defaults, generic impls (`impl Hash for Vec<T>`),
+checking generic bodies against their bounds, `Pratt` as a trait.
+
 ## Recommendation
 
 1. Effects on function types (section 0). This is a soundness fix, and both
