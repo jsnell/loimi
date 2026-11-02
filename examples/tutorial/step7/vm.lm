@@ -445,7 +445,7 @@ pub vm Pip {
         jump fp.ret
     }
 
-    entry run(m: *Machine, main: *Proto) -> Result<(), str> {
+    entry run(m: *Machine, main: *Proto) -> Result<(), str> uses gc {
         ctx = m;
         fp = m.frames;
         fp.proto = main;

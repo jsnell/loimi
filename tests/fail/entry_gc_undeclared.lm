@@ -1,0 +1,16 @@
+// An op may collect, so every run may: the entry declares `uses gc`.
+// error: entry `run` runs vm code that may collect, so its callers must root their traced locals: declare it `entry run(..) -> i64 uses gc`
+import std.gc;
+
+struct Ctx { heap: gc.Heap }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op GC() : X { gc.collect(&ctx.heap); next }
+    op HALT() : X { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 { ctx = c; jump code }
+}
+
+fn main() {}

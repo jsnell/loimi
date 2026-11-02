@@ -142,7 +142,10 @@ rejected (run by `cargo test`).
   are synced in place (in a vm function, through the state pointers it
   sees), and callers of such a vm function root their traced locals there.
   Function types carry them (`fn(*Heap) uses gc`), so calls through function
-  pointers are checked, synced and rooted like direct calls. There are no
+  pointers are checked, synced and rooted like direct calls. Entries
+  declare what their vm code reaches: `uses gc` once any op, vm function
+  or `on raise` may collect, so an entry's function type says it may
+  collect and cannot be converted to one that does not. There are no
   effect variables: a generic function cannot take "a callback with any
   effects" and inherit them.
 - **Verifier**: opcodes, extents, operand `verify` clauses, superinstruction

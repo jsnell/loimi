@@ -121,7 +121,7 @@ vm R {
     op FAIL(a: reg) : ABC { raise a }
 
     /// A top-level run, from the bottom of the stack.
-    entry run(c: *Ctx, f: u64, arg: i64) -> Result<i64, i64> {
+    entry run(c: *Ctx, f: u64, arg: i64) -> Result<i64, i64> uses gc {
         ctx = c;
         fp = c.frames;
         fp.base = 0;
@@ -159,7 +159,7 @@ fn show(c: *Ctx, r: Result<i64, i64>) {
     io.println("");
 }
 
-fn main() {
+fn main() uses gc {
     var code: [u32; 64] = [0; 64];
     let k = code[..];
     var funcs: [*u32; 6] = [0 as *u32; 6];

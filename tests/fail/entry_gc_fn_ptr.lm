@@ -1,0 +1,19 @@
+// An entry whose vm code may collect cannot become a plain function
+// pointer: calls through it would root nothing.
+// error: this function uses gc, but the expected type `fn(*Ctx, *u32) -> i64` does not allow it
+import std.gc;
+
+struct Ctx { heap: gc.Heap }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op GC() : X { gc.collect(&ctx.heap); next }
+    op HALT() : X { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; jump code }
+}
+
+fn main() {
+    let f: fn(*Ctx, *u32) -> i64 = M.run;
+}

@@ -484,7 +484,7 @@ pub vm Pip {
     super ADDK_JMP = ADDK; JMP;
     super ADD_JMP = ADD; JMP;
 
-    entry run(m: *Machine, main: *Proto) -> Result<(), str> {
+    entry run(m: *Machine, main: *Proto) -> Result<(), str> uses gc {
         ctx = m;
         fp = m.frames;
         fp.proto = main;

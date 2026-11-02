@@ -52,7 +52,7 @@ vm M {
     }
     op RET(src: reg) : ABC { exit src }
 
-    entry run(c: *Ctx, code: *u32) -> V { ctx = c; pc = code; regs = c.base; jump pc }
+    entry run(c: *Ctx, code: *u32) -> V uses gc { ctx = c; pc = code; regs = c.base; jump pc }
 }
 
 fn main() uses gc {

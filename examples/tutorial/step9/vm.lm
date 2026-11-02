@@ -493,7 +493,7 @@ pub vm Pip {
     super ADDK_JMP = ADDK; JMP;
     super ADD_JMP = ADD; JMP;
 
-    entry run(m: *Machine, main: *Proto) -> Result<(), str> {
+    entry run(m: *Machine, main: *Proto) -> Result<(), str> uses gc {
         ctx = m;
         fp = m.frames;
         fp.proto = main;
@@ -518,7 +518,7 @@ pub vm Pip {
         }
     }
 
-    entry run_budget(m: *Machine, main: *Proto) -> Result<(), str> {
+    entry run_budget(m: *Machine, main: *Proto) -> Result<(), str> uses gc {
         use_variant budget;
         ctx = m;
         fp = m.frames;

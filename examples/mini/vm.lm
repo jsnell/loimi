@@ -1029,7 +1029,7 @@ pub vm Mini {
 
     /// A top-level run of `cl` from the bottom of the stack (the
     /// standalone interpreter).
-    entry run(c: *Ctx, cl: Gc<Closure>) -> Result<V, V> {
+    entry run(c: *Ctx, cl: Gc<Closure>) -> Result<V, V> uses gc {
         ctx = c;
         let p = cl.proto;
         fp = c.frames;

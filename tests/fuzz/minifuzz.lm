@@ -246,7 +246,7 @@ fn dump(p: Gc<Proto>) {
 /// Generate, verify and run one program. Returns whether it verified.
 /// Nothing collects while the protos are built (allocation never
 /// collects); during the run they are reachable from the main closure.
-fn one(ctx: *Ctx, seed: u64) -> bool {
+fn one(ctx: *Ctx, seed: u64) -> bool uses gc {
     var r = Rng { s: seed };
     let h = &ctx.heap;
     var none: mem.Vec<Gc<Proto>> = mem.Vec.new();

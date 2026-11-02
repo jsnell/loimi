@@ -66,6 +66,11 @@ pub struct VmInfo {
     /// `#[require_verified]`: entries start only in verified code (`jump v`
     /// with `v: Verified<Vm>`), unless inside `unsafe { }`.
     pub require_verified: bool,
+    /// The first call in vm code (ops, `on raise`, vm functions, cold
+    /// blocks, variants) that may collect: (span, callee). Every entry
+    /// then has to declare `uses gc` (or `reenter`), so that the effect
+    /// is part of its function type.
+    pub collects: Option<(Span, String)>,
 }
 
 /// An inline cache layout: per field its name, type and first word
@@ -485,12 +490,19 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             pt.push(c.resolve_type(m, &p.ty)?);
         }
         let fid = new_fn(c, format!("{}.{}", prefix, e.name.name), e.name.name.clone(), pt, ret.clone(), CallConv::C, vm, VmRole::Entry, e.name.span);
-        // `uses reenter`: a nested entry. Calling it runs guest code, so its
-        // callers need the effect (in vm code: sync before, reload after).
+        // `uses gc`: the vm code it runs may collect, so its callers root
+        // their traced locals (checked below: required when vm code makes
+        // such a call). `uses reenter`: a nested entry. Calling it runs
+        // guest code, so its callers need the effect (in vm code: sync
+        // before, reload after). Both are part of the entry's function
+        // type, so a conversion to a function type without them is an error.
         let eff = crate::check::effects_of(&e.effects)?;
-        if eff != 0 && eff != EFF_SYNC | EFF_GC | EFF_REENTER {
+        if eff != 0 && eff != EFF_SYNC | EFF_GC && eff != EFF_SYNC | EFF_GC | EFF_REENTER {
             let span = e.effects.list[0].2;
-            return Err(Diag::new(span, "an entry can only declare `uses reenter` (it runs guest code)"));
+            return Err(Diag::new(
+                span,
+                "an entry declares `uses gc` (its vm code may collect) or `uses reenter` (a nested entry), nothing else",
+            ));
         }
         c.prog.fns[fid as usize].effects = eff;
         let gname = Ident { name: format!("{}__{}", d.name.name, e.name.name), span: e.name.span };
@@ -564,6 +576,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             _ => unreachable!("vmexpand generates Vm__Verified"),
         },
         require_verified: d.attrs.has("require_verified"),
+        collects: None,
     });
 
     // Bodies.
@@ -635,6 +648,24 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             wrappers.push((k as u32, fid));
         }
         c.prog.vms[i].variants.push((var.name.name.clone(), wrappers));
+    }
+    // Vm code that may collect runs inside every entry's call: the entry
+    // declares it, so its callers (also through function pointers) root
+    // their traced locals.
+    if let Some((site, callee)) = c.vms[i].collects.clone() {
+        for (e, fid) in d.entries.iter().zip(c.prog.vms[i].entries.clone()) {
+            if c.prog.fns[fid as usize].effects & EFF_GC == 0 {
+                let ret = crate::vmexpand::type_src(&e.ret);
+                return Err(Diag::new(
+                    e.name.span,
+                    format!(
+                        "entry `{}` runs vm code that may collect, so its callers must root their traced locals: declare it `entry {}(..) -> {} uses gc`",
+                        e.name.name, e.name.name, ret
+                    ),
+                )
+                .note(site, format!("{} may collect here", callee)));
+            }
+        }
     }
     check_shared_next(c, i)
 }
@@ -1044,6 +1075,8 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
     let m = info.module;
     let ret = info.ret.clone();
     let mut cx = FnCx::new(m, ret.clone());
+    cx.effects = c.prog.fns[fid as usize].effects;
+    cx.fn_name = e.name.name.clone();
     let mut params = Vec::new();
     let pts = c.prog.fns[fid as usize].param_tys.clone();
     for (p, t) in e.params.iter().zip(pts.iter()) {
@@ -1519,13 +1552,25 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     }
     let span = call.span;
     if let Some(h) = cx.vm.clone() {
+        if h.entry {
+            // Entries run before dispatch starts: nothing to sync yet. A
+            // call that may collect is the entry's own effect, which it
+            // declares (`uses gc`), as any function would.
+            if missing & EFF_GC == 0 {
+                return Ok(call);
+            }
+            let caller = format!("entry `{}`", cx.fn_name);
+            return Err(Diag::new(
+                span,
+                format!("{} may collect, but {} does not declare it; declare `uses gc` after its result type", callee, caller),
+            ));
+        }
         // Vm code may collect while a run is active: callers of the vm's
         // entries root their traced locals across the call, as for a call
-        // to a `uses gc` function.
-        if missing & EFF_GC != 0 {
-            for e in c.prog.vms[h.vm as usize].entries.clone() {
-                c.prog.fns[e as usize].sync_effects |= EFF_GC;
-            }
+        // to a `uses gc` function. The entries must declare it (checked
+        // once the whole vm is checked).
+        if missing & EFF_GC != 0 && c.vms[h.vm as usize].collects.is_none() {
+            c.vms[h.vm as usize].collects = Some((span, callee.clone()));
         }
         // A plain vm function is inlined into vm code, and sees the
         // caller's state through pointers: its effectful calls are synced

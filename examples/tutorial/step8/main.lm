@@ -44,7 +44,7 @@ fn disassemble(prog: *Program) {
 const STACK: u64 = 1 << 20;
 const FRAMES: u64 = 1 << 16;
 
-fn main() -> i32 {
+fn main() -> i32 uses gc {
     let Some(path) = os.arg(1) else { io.eprintln("usage: step8 <file.pip> [--disasm] [--disasm-after] [--gc-stress]"); return 2; };
     let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
     var disasm = false;

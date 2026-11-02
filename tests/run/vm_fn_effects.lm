@@ -63,7 +63,7 @@ vm M {
     }
     op RET(src: reg) : ABC { exit src }
 
-    entry run(c: *Ctx, code: *u32) -> V {
+    entry run(c: *Ctx, code: *u32) -> V uses gc {
         ctx = c;
         pc = code;
         regs = c.base;
@@ -71,7 +71,7 @@ vm M {
     }
 }
 
-fn main() {
+fn main() uses gc {
     var ctx = Ctx {
         heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V, syncs: 0,
         hook: collect_hook, plain: plain_hook,

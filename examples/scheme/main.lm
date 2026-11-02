@@ -31,7 +31,7 @@ fn dump(p: Gc<value.Proto>) {
     for i in 0..p.protos.data.len { dump(p.protos.data[i]); }
 }
 
-fn main() -> i32 {
+fn main() -> i32 uses gc {
     let Some(path) = os.arg(1) else {
         io.eprintln("usage: scheme <program.scm> [stress | disasm]");
         return 2;

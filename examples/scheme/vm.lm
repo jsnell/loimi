@@ -631,7 +631,7 @@ pub vm Scheme {
     #[allow(super_overlap)]
     super MOVE_TAILCALL = MOVE; TAILCALL;
 
-    entry run(c: *Ctx, cl: Gc<Closure>) -> V {
+    entry run(c: *Ctx, cl: Gc<Closure>) -> V uses gc {
         ctx = c;
         let p = cl.proto;
         c.stack[0] = Imm(value.IMM_UNSPEC);

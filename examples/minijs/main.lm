@@ -16,7 +16,7 @@ import compile;
 import builtins;
 import prelude;
 
-fn run(ctx: *Ctx, src: str) -> bool {
+fn run(ctx: *Ctx, src: str) -> bool uses gc {
     let proto = compile.compile(ctx, src);
     let f = new(&ctx.heap, Fn { proto: proto, props: None, home: V.Undef, parent: V.Undef, native: 0, hint: proto.hint, ctor_proto: None, ctor_shape: None }, 0);
     JS.run(ctx, f);
@@ -45,7 +45,7 @@ fn stats(c: *Ctx) {
     io.eprintln(b.as_str());
 }
 
-fn main() -> i32 {
+fn main() -> i32 uses gc {
     let Some(path) = os.arg(1) else {
         io.eprintln("usage: minijs <program.js> [stress|verify]");
         return 2;

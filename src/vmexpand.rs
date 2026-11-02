@@ -654,7 +654,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     let mask = (1u64 << l.op_bits) - 1;
     let mut s = String::new();
     let vis = if v.is_pub { "pub " } else { "" };
-    if v.entries.iter().any(|e| e.effects.get("uses").is_some()) {
+    if v.entries.iter().any(|e| e.effects.list.iter().any(|(_, a, _)| a.first().is_some_and(|x| x == "reenter"))) {
         // Nested runs (entries declared `uses reenter`) active on this
         // thread; each such entry adds one while it runs.
         let _ = writeln!(s, "#[thread_local]\n{vis}var {n}__depth: u32 = 0;");
@@ -808,7 +808,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
 /// vm's module, so names resolve as in the declaration). Types the
 /// checker rejects as cache fields print as `u64`: the checker reports
 /// them first, with the declaration's span.
-fn type_src(t: &TypeExpr) -> String {
+pub fn type_src(t: &TypeExpr) -> String {
     match &t.kind {
         TypeKind::Named(path, args) => {
             let p = path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".");

@@ -1371,7 +1371,7 @@ pub vm JS {
     #[allow(super_overlap)]
     super MUL_F_MUL_F = MUL_F; MUL_F;
 
-    entry run(c: *Ctx, cl: Gc<Fn>) -> V {
+    entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
         ctx = c;
         let p = cl.proto;
         c.stack[0] = Undef;

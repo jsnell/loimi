@@ -1,0 +1,15 @@
+// An entry's own call that may collect is its effect too.
+// error: `collect` may collect, but entry `run` does not declare it; declare `uses gc` after its result type
+import std.gc;
+
+struct Ctx { heap: gc.Heap }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(c: *Ctx, code: *u32) -> i64 { ctx = c; gc.collect(&c.heap); jump code }
+}
+
+fn main() {}

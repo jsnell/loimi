@@ -108,7 +108,7 @@ fn bug(seed: u64, what: str) {
 }
 
 /// One program: compile a corpus file, break it, verify it, run it.
-fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st: *Stats) {
+fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st: *Stats) uses gc {
     var r = Rng { s: seed };
     var arena = mem.Arena.new();
     var names = text.Interner.new();
@@ -166,7 +166,7 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st:
     names.free();
 }
 
-fn main() -> i32 {
+fn main() -> i32 uses gc {
     let (Some(a), Some(b)) = (os.arg(1), os.arg(2)) else {
         io.eprintln("usage: fuzz FIRST-SEED COUNT FILE.pip... [--gc-stress] [-v]");
         return 2;

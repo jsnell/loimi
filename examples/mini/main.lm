@@ -15,7 +15,7 @@ import compile;
 import lib;
 import state;
 
-fn main() -> i32 {
+fn main() -> i32 uses gc {
     let Some(path) = os.arg(1) else {
         io.eprintln("usage: mini <script>");
         return 2;

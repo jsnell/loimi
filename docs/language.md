@@ -842,6 +842,9 @@ code. `on raise` is an ordinary handler: it receives the live state, so the
 An entry declared `entry call(..) -> R uses reenter` is a *nested
 entry*: it starts a run above the frames of a run that is already
 active, for host code (a native) that calls guest code. See section 10.
+An entry whose vm code may collect declares `uses gc`
+(`entry run(..) -> R uses gc`), which its callers then need too
+(section 5, "Effects on function types").
 
 ### 3.7 Dispatch strategies
 
@@ -1010,6 +1013,19 @@ struct Hooks {
   like a `uses gc` function, a closure's body may only make the calls its
   type allows, and a plain function or `block fn` converts to a `block fn`
   type with more effects (section 1.2).
+- **Entries** carry the effects of the vm code they run. If any op,
+  `on raise`, vm function, cold block or variant may collect (it makes
+  a `uses gc` or `uses reenter` call), every entry of the vm declares
+  `uses gc` (`entry run(c: *Ctx, cl: Gc<Closure>) -> Result<V, V>
+  uses gc`), or `uses reenter` if it is a nested entry (section 10).
+  The effect is part of `Mini.run`'s function type, so its callers
+  declare it too and root their traced locals across the run, and the
+  entry converts only to function types that include it: a plain
+  `fn(*Ctx, Gc<Closure>) -> Result<V, V>` holding it would make calls
+  that root nothing. An entry's own body calling a `uses gc` function
+  needs the declaration as well. `reenter` reached from vm code does
+  not make a plain entry `reenter`: the entry starts a run with no
+  other run of the vm active, so its caller has no vm state to reload.
 - Calls through a trait bound have the effects of the trait's method
   declaration; an impl's method may have fewer.
 - Generic code carries effects through: `T` bound to `fn() uses gc` keeps

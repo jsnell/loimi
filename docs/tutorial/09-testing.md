@@ -67,7 +67,7 @@ ops too; the ones whose parts jump are listed.) A second entry switches
 tables before dispatching:
 
 ```loimi
-    entry run_budget(m: *Machine, main: *Proto) -> Result<(), str> {
+    entry run_budget(m: *Machine, main: *Proto) -> Result<(), str> uses gc {
         use_variant budget;
 ```
 
