@@ -221,4 +221,42 @@ before `super()`.
 
 ## Performance
 
-See the table at the end of this file (`bench/minijs/compare.py`).
+CPU seconds (user + system), best of 3, `--dispatch=tailcall`, on the
+shared 8-core development machine while other agents were running
+(load average about 8), so absolute numbers are inflated and noisy;
+the ratios are more meaningful. QuickJS is a bytecode interpreter like
+MiniJS; `node --jitless` is V8's Ignition interpreter.
+
+| Benchmark | MiniJS | QuickJS | node --jitless | MiniJS/QuickJS | MiniJS/jitless |
+|---|---:|---:|---:|---:|---:|
+| awfy_micro | 1.20 | 2.89 | 2.50 | 0.42 | 0.48 |
+| binary_trees | 1.70 | 7.18 | 2.82 | 0.24 | 0.60 |
+| bitops | 1.26 | 2.17 | 2.03 | 0.58 | 0.62 |
+| closures | 1.97 | 3.71 | 2.01 | 0.53 | 0.98 |
+| deltablue | 1.22 | 3.67 | 2.19 | 0.33 | 0.56 |
+| fannkuch | 0.71 | 1.94 | 1.90 | 0.37 | 0.37 |
+| json | 1.72 | 3.03 | 2.13 | 0.57 | 0.81 |
+| nbody | 0.88 | 1.92 | 2.55 | 0.46 | 0.34 |
+| properties | 1.70 | 2.27 | 2.11 | 0.75 | 0.81 |
+| raytrace | 0.95 | 3.21 | 2.16 | 0.30 | 0.44 |
+| richards | 1.20 | 2.81 | 1.94 | 0.43 | 0.62 |
+| sort | 1.37 | 2.73 | 1.94 | 0.50 | 0.71 |
+| spectral_norm | 1.25 | 1.98 | 2.54 | 0.63 | 0.49 |
+| strings | 2.17 | 2.97 | 2.02 | 0.73 | 1.07 |
+
+MiniJS is faster than QuickJS on all 14 (0.24-0.75x) and faster than
+V8's interpreter on 13 (closures by a hair); on strings it is 7% slower
+(V8's strings are ropes with cheap slices and character access, MiniJS
+flattens and copies). The largest remaining
+costs, from a sampling profile (every handler is its own symbol):
+`CALL`/`RET` (15-27% of call-heavy programs: frame push, clearing the
+callee's registers, no inlining), the `MOVE`s that stage arguments, and
+the cached property loads themselves (`GETPROP_IN` is five instructions
+plus the dispatch, 25-30% of nbody and richards).
+
+What mattered, in order: inline caches for own properties and for
+prototype methods (validity cells), ropes for `+=`, pinning shapes so
+that sites stay monomorphic across collections, polymorphic entries
+with a refill budget instead of thrashing a monomorphic site, the `NEW`
+fast path with exact allocation sizes, a larger minimum heap, mixed
+int/float arithmetic inline, and natives called from `CALL`'s hot path.
