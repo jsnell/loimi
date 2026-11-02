@@ -1,0 +1,9 @@
+fn main() {
+    var s: i64 = 0;
+    inline for (name, v) in [(a, 1), (b, 2)] {
+        let #name = v;
+        s += nope;
+    }
+}
+// error: unknown name `nope`
+// error: inline_for_stmt_body.lm:5:14

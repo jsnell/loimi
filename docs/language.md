@@ -200,8 +200,44 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
 }
 ```
 
-Inside a `vm`, a loop variable may not have the name of a state variable:
-it would replace every use of that name in the body.
+`inline for` is token-level expansion. The body is copied once per
+element, and every identifier token equal to a loop variable is replaced
+by that element's tokens (in parentheses when there is more than one
+token, so `v * 10` with `v = 2 + 3` is `(2 + 3) * 10`). That includes
+field names (`r.f`) and binders (`let v`), so pick loop variable names
+that do not collide with names in the body. `#v` turns a string or
+identifier value into an identifier.
+
+It can appear at module level, among the items of a `vm`, and as a
+statement in any block: function bodies, op handlers, vm functions,
+entries.
+
+```loimi
+fn sum_fields(r: *Regs) -> i64 {
+    var total: i64 = 0;
+    inline for f in [a, b, c] { total += r.f }
+    total
+}
+```
+
+**Scoping.** In statement position, the copies become statements of the
+enclosing block, each ending with `;`; there is no new scope. So
+`let #name = ..;` declares a local of the enclosing block that later
+statements (and later copies) see, a plain `let tmp` in the body is
+shadowed by the next copy's `let tmp`, and `next`, `break` or `return` in
+a copy act on the enclosing handler or loop. Write `{ .. }` inside the body
+for a scope per copy. A spliced `#name` is an ordinary identifier at the
+place it lands: it resolves, and binds, exactly as if it had been written
+there. The same holds at module level and in a `vm`, where `#name`
+usually names an item (`fn #name`, `op #name`).
+
+Errors point into the original source: a token copied from the body keeps
+its position in the body, and a substituted token its position in the
+element list. Nested `inline for`s expand outside-in; an inner loop may
+use the outer variables in its element list, but may not reuse their
+names as its own variables. Inside a `vm` (also in handler and vm function
+bodies), a loop variable may not have the name of a state variable: it
+would replace every use of that name in the body.
 
 ### 1.5 Modules and interop
 
