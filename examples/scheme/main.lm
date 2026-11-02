@@ -29,6 +29,12 @@ fn main() -> i32 {
     };
     var ctx = Ctx.new();
     ctx.cont_proto = Some(vm.cont_proto(&ctx.heap));
+    // Collect after allocating 4 times the live data (at least 2 MiB, at
+    // most 256 MiB): a quarter to a half fewer collections than the
+    // default 100% on the allocation-heavy benchmarks (nboyer, earley,
+    // mperm, paraffins, graphs 10-20% faster), and no slower elsewhere.
+    ctx.heap.set_growth(400, 2 << 20);
+    ctx.heap.set_max_budget(256 << 20);
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
     for id in 0..builtins.NPRIMS {
         let (name, _, _) = builtins.prim_info(id);

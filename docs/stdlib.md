@@ -339,7 +339,11 @@ within noise; Scheme at 200% runs nboyer, graphs and mperm 4-10% faster
 but string 27% slower (41 to 52 ms) and primes and array1 3-4% slower;
 an 8 MiB minimum makes Scheme's small allocation-heavy programs (deriv,
 divrec, cpstak) 6-10% slower, as the heap leaves the CPU caches. Mini
-and Scheme can opt in with `set_growth`.
+and Scheme can opt in with `set_growth`. `Heap.set_max_budget(bytes)`
+caps the budget (0, the default, is no cap), so that a large growth
+factor bounds the heap at the live data plus `bytes` rather than at a
+multiple of it once the live data is large. Scheme uses 400%, a 2 MiB
+minimum and a 256 MiB cap (see `bench/scheme/README.md`).
 
 ## `std.obj`: objects and shapes
 

@@ -55,6 +55,15 @@ fn main() uses gc {
     io.print_bool(b * 2 < a); io.println("");
     io.print_bool(b > 0); io.println("");
 
+    // A budget cap: 300% of about 4.8 MB is more than 2 MiB, so the cap
+    // applies, and there are more collections than without it.
+    w.heap.set_max_budget(2 << 20);
+    io.print_bool(w.heap.threshold == 2 << 20); io.println("");
+    let d = run(&w, 100000, 1000000);
+    io.print_bool(d > b); io.println("");
+    w.heap.set_max_budget(0);
+    io.print_bool(w.heap.threshold == w.heap.live_bytes * 3); io.println("");
+
     // A large minimum dominates for a small live set.
     w.heap.set_growth(100, 64 << 20);
     io.print_bool(w.heap.threshold == 64 << 20); io.println("");
@@ -69,6 +78,10 @@ fn main() uses gc {
 }
 // expect: 100
 // expect: 4999950000
+// expect: true
+// expect: true
+// expect: 4999950000
+// expect: true
 // expect: true
 // expect: true
 // expect: 4999950000
