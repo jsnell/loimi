@@ -1,0 +1,33 @@
+// Methods defined through aliases: on an instance of a generic type
+// (`type IntBox = Box<i64>; fn IntBox.show`) and on a primitive, called
+// directly and through a trait bound. A trait impl for the instance used
+// to fail with "no method `Box<i64>.show`" although `b.show()` worked.
+import std.io;
+
+struct Box<T> { v: T }
+type IntBox = Box<i64>;
+fn IntBox.get(b: *IntBox) -> i64 { b.v }
+
+trait Show { fn show(x: Self); }
+fn IntBox.show(b: IntBox) { io.print("box "); io.print_int(b.v); io.println(""); }
+impl Show for IntBox;
+
+type Word = u32;
+fn Word.show(w: Word) { io.print("word "); io.print_int(w as i64); io.println(""); }
+impl Show for Word;
+
+fn sh<T: Show>(x: T) { x.show(); }
+
+fn main() {
+    var b: IntBox = Box { v: 4 };
+    io.print_int(b.get()); io.println("");
+    b.show();
+    sh(Box { v: 3 });
+    let w: u32 = 21;
+    sh(w);
+}
+
+// expect: 4
+// expect: box 4
+// expect: box 3
+// expect: word 21
