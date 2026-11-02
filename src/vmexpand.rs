@@ -1590,6 +1590,18 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
     Ok(())
 }
 
+/// Generated code calls C functions through declarations named
+/// `__extern_X`, which link to `X`: a module may declare `X` itself.
+fn c_externs(items: &mut [Item]) {
+    for it in items {
+        if let Item::Fn(f) = it {
+            if let (Linkage::Extern, Some(c)) = (f.linkage, f.name.name.strip_prefix("__extern_")) {
+                f.link_name = Some(c.to_string());
+            }
+        }
+    }
+}
+
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     for m in modules.iter_mut() {
@@ -1612,7 +1624,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     src.push_str(&generate_stack(sm, v, &l, jit)?);
                 }
                 if (has_stack(v) || !v.checks.is_empty() || !v.supers.is_empty()) && !externs {
-                    // The verifier's scratch arrays (see check::declare_fn).
+                    // The verifier's scratch arrays (see `c_externs`).
                     src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
                     externs = true;
                 }
@@ -1624,7 +1636,8 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 let fid = sm.add(format!("<vm {} expansion>", v.name.name), src.clone());
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);
-                let (items, _) = p.parse_module()?;
+                let (mut items, _) = p.parse_module()?;
+                c_externs(&mut items);
                 check_generated_names(v, &items)?;
                 extra.extend(items);
             }

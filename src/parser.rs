@@ -799,7 +799,7 @@ impl Parser {
             }
         }
         let body = if self.eat(";") { None } else { Some(self.parse_block()?) };
-        Ok(FnDecl { name, generics, bounds, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+        Ok(FnDecl { name, generics, bounds, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub, link_name: None })
     }
 
     /// `<T, U: A + m.B + Hooks<T>>`: the parameters and the bounds of each.

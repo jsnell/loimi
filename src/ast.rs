@@ -250,6 +250,12 @@ pub struct FnDecl {
     pub linkage: Linkage,
     pub attrs: Attrs,
     pub is_pub: bool,
+    /// The C symbol of an `extern "C"` declaration, when it is not the
+    /// function's name. Never written in source: only compiler-generated
+    /// declarations set it (see `vmexpand::c_externs`), so that they can
+    /// call C functions without clashing with the module's own
+    /// declarations of them.
+    pub link_name: Option<String>,
 }
 
 /// A trait named in a bound or an impl: `Hash`, `hash.Hash`, `Hooks<K, E>`.

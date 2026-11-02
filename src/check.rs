@@ -710,11 +710,7 @@ impl<'a> Checker<'a> {
         }
         let symbol = symbol.unwrap_or_else(|| match f.linkage {
             Linkage::Internal => format!("{}.{}", prefix, name),
-            // `extern "C" fn __extern_calloc(..)` links to `calloc`: how
-            // generated vm code declares C functions without clashing
-            // with a declaration of its own in the vm's module.
-            Linkage::Extern if f.name.name.starts_with("__extern_") => f.name.name["__extern_".len()..].to_string(),
-            _ => f.name.name.clone(),
+            _ => f.link_name.clone().unwrap_or_else(|| f.name.name.clone()),
         });
         if f.linkage == Linkage::Extern && f.body.is_some() {
             return Err(Diag::new(f.name.span, "extern functions cannot have a body"));
