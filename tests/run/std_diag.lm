@@ -69,6 +69,15 @@ fn main() {
     let h = sm.add("big.txt", big.as_str());
     render(&sm, diag.error(diag.span(h, 123456, 123460), "far away"));
 
+    // A long line is cut to a window around the span.
+    var long = text.StrBuf.new();
+    for _ in 0..100 { long.push('x'); }
+    long.push_str(" bad ");
+    for _ in 0..300 { long.push('y'); }
+    let lf = sm.add("long.txt", long.as_str());
+    render(&sm, diag.error(diag.span(lf, 101, 104), "cut"));
+    render(&sm, diag.error(diag.span(lf, 2, 3), "cut at the end only"));
+
     // The sink copies messages, counts by severity, and summarizes.
     var ds = diag.Diagnostics.new();
     io.print_bool(ds.has_errors()); io.print(" ");
@@ -125,6 +134,14 @@ fn main() {
 // expect:   --> big.txt:123457:1
 // expect: 123457 | oops
 // expect:        | ^^^^
+// expect: error: cut
+// expect:   --> long.txt:1:102
+// expect:     1 | ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bad yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy...
+// expect:       |                                                                ^^^
+// expect: error: cut at the end only
+// expect:   --> long.txt:1:3
+// expect:     1 | xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bad yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy...
+// expect:       |   ^
 // expect: false 3 2 1 true bad token #1
 // expect: error: bad token #1
 // expect:   --> script.mini:1:1

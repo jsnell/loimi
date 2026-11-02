@@ -202,6 +202,11 @@ pub fn Diag.free(d: *Diag) { d.notes.free(); }
 
 // ── rendering ───────────────────────────────────────────────────────
 
+/// Source lines longer than this are shown cut to this many bytes, starting
+/// SNIPPET_BEFORE bytes before the span.
+const SNIPPET_MAX: u64 = 160;
+const SNIPPET_BEFORE: u64 = 60;
+
 /// Append the `  --> file:line:col` line, the source line and the carets.
 fn SourceMap.render_snippet(sm: *SourceMap, out: *text.StrBuf, s: Span, label: str) {
     let lc = sm.line_col(s.file, s.lo);
@@ -217,22 +222,36 @@ fn SourceMap.render_snippet(sm: *SourceMap, out: *text.StrBuf, s: Span, label: s
     for _ in num.len()..gutter { out.push(' '); }
     out.push_str(num.as_str());
     num.free();
+    // A long line (minified or generated source) is cut to a window of
+    // SNIPPET_MAX bytes around the start of the span, marked with "...".
+    let start = (lc.col - 1) as u64;
+    var lo: u64 = 0;
+    var hi = line.len;
+    if line.len > SNIPPET_MAX {
+        if start > SNIPPET_BEFORE { lo = start - SNIPPET_BEFORE; }
+        if lo + SNIPPET_MAX < hi { hi = lo + SNIPPET_MAX; }
+        if hi - lo < SNIPPET_MAX { lo = hi - SNIPPET_MAX; }
+    }
+    let shown = line[lo..hi];
+    let pre: str = if lo > 0 { "..." } else { "" };
     out.push_str(" |");
-    if line.len > 0 {
+    if shown.len > 0 {
         out.push(' ');
-        out.push_str(line);
+        out.push_str(pre);
+        out.push_str(shown);
+        if hi < line.len { out.push_str("..."); }
     }
     out.push('\n');
-    // Underline: at least one caret, at most to the end of the line. Tabs
-    // in the prefix are copied so the carets line up.
+    // Underline: at least one caret, at most to the end of the shown
+    // text. Tabs in the prefix are copied so the carets line up.
     for _ in 0..gutter + 1 { out.push(' '); }
     out.push_str("| ");
-    let start = (lc.col - 1) as u64;
-    for i in 0..start {
+    out.push_str(if lo > 0 { "   " } else { "" });
+    for i in lo..start {
         out.push(if i < line.len and line[i] == '\t' { '\t' } else { ' ' });
     }
     var width = s.len() as u64;
-    if start + width > line.len { width = if line.len > start { line.len - start } else { 0 }; }
+    if start + width > hi { width = if hi > start { hi - start } else { 0 }; }
     if width == 0 { width = 1; }
     for _ in 0..width { out.push('^'); }
     if label.len > 0 {
