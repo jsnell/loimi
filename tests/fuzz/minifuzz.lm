@@ -355,6 +355,7 @@ fn main() -> i32 uses gc {
         out: text.StrBuf.new(),
         open: None,
         open_level: 0 as *V,
+        host: vm.no_host,
     };
     ctx.frames_end = ctx.frames + 16;
     // Frame 0 starts with a one-register closure, until a program runs.

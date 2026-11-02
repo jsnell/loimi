@@ -457,3 +457,99 @@ fn variant_wraps_all_goto_build_time() {
     assert!(out.status.success(), "build failed after {:?}:\n{}", took, String::from_utf8_lossy(&out.stderr));
     assert!(took.as_secs() < 60, "building step 9 with `wraps all` in goto mode took {:?}", took);
 }
+
+/// Build `lib` as a static archive and as a shared object (with the C
+/// header from `--header`), compile `host` against each with clang, and
+/// compare the host's output with `expected`. `header_golden`: the header
+/// must equal this file.
+fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golden: Option<&Path>) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("loimi-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let want = std::fs::read_to_string(expected).unwrap();
+    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
+    let variants: [(&str, &[&str]); 4] = [
+        ("static", &["--lib"]),
+        ("static-release", &["--lib", "--release"]),
+        ("shared", &["--shared"]),
+        ("shared-initial-exec", &["--shared", "--release", "--tls=initial-exec"]),
+    ];
+    let mut failures = Vec::new();
+    for (variant, flags) in variants {
+        let vdir = dir.join(variant);
+        std::fs::create_dir_all(&vdir).unwrap();
+        let shared = flags.contains(&"--shared");
+        let libfile = vdir.join(if shared { "liblm.so" } else { "liblm.a" });
+        let header = vdir.join(header_file(host));
+        let out = loimi().arg("build").arg(lib).args(flags).arg("-o").arg(&libfile).arg("--header").arg(&header).output().unwrap();
+        if !out.status.success() {
+            failures.push(format!("{} {}: build failed:\n{}", name, variant, String::from_utf8_lossy(&out.stderr)));
+            continue;
+        }
+        if let Some(g) = header_golden {
+            let got = std::fs::read_to_string(&header).unwrap();
+            if got != std::fs::read_to_string(g).unwrap() {
+                failures.push(format!("{} {}: header differs from {}:\n{}", name, variant, g.display(), got));
+            }
+        }
+        let exe = vdir.join("host");
+        let mut cc = limited(&clang);
+        cc.arg("-Wall").arg("-Werror").arg("-I").arg(&vdir).arg(host);
+        if shared {
+            cc.arg("-L").arg(&vdir).arg("-llm").arg(format!("-Wl,-rpath,{}", vdir.display()));
+        } else {
+            cc.arg(&libfile);
+        }
+        let out = cc.arg("-lm").arg("-o").arg(&exe).output().unwrap();
+        if !out.status.success() {
+            failures.push(format!("{} {}: compiling {} failed:\n{}", name, variant, host.display(), String::from_utf8_lossy(&out.stderr)));
+            continue;
+        }
+        let out = limited(&exe).current_dir(root).output().unwrap();
+        let got = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{} {}: exit {:?}\n--- expected\n{}--- got\n{}--- stderr\n{}",
+                name,
+                variant,
+                out.status.code(),
+                want,
+                got,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// The header a host includes: the first `#include "..."`.
+fn header_file(host: &Path) -> String {
+    let text = std::fs::read_to_string(host).unwrap();
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("#include \"").and_then(|r| r.strip_suffix('"')))
+        .expect("host includes a generated header")
+        .to_string()
+}
+
+/// `export "C"` functions called from C through the generated header:
+/// every mapped type, `std.rt` protect/throw, static and shared builds.
+#[test]
+fn c_library() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let d = root.join("tests/embed");
+    c_host_run("c-library", &d.join("api.lm"), &d.join("host.c"), &d.join("host.expected"), Some(&d.join("api.h")));
+}
+
+/// Mini embedded in a C host (examples/embed/host.c): two states alive at
+/// once, globals both ways, C natives, syntax and runtime errors, refused
+/// re-entry, and an allocation-heavy script under GC stress.
+#[test]
+fn mini_embedded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    c_host_run("mini-embed", &root.join("examples/mini/embed.lm"), &e.join("host.c"), &e.join("host.expected"), None);
+}

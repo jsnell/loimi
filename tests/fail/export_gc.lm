@@ -1,0 +1,7 @@
+// GC references cannot cross into C, even in an executable's header.
+// args: --header /dev/null
+// error: parameter `o: Gc<Obj>` has no C equivalent: `Gc<T>` cannot cross into C
+import std.gc;
+object Obj { x: i64 }
+export "C" fn peek(o: Gc<Obj>) -> i64 { o.x }
+fn main() {}

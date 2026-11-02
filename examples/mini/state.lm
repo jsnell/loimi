@@ -1,0 +1,60 @@
+// Creating and freeing an interpreter state. Shared by the standalone
+// interpreter (main.lm) and the embedding API (embed.lm).
+
+import std.gc;
+import std.mem;
+import std.text;
+import value;
+import value.{V, Strings};
+import vm.{Ctx, Frame};
+import vm;
+import lib;
+
+const STACK_SLOTS: u64 = 1 << 20;
+const FRAMES: u64 = 1 << 16;
+
+/// A fresh state: a heap with its string table, the globals with the
+/// standard library installed, and empty VM stacks. Natives with ids from
+/// `vm.HOST_NATIVE` up go to `host`. Once the state is at its final
+/// address, register it with `attach`.
+pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V>) -> Ctx {
+    var heap = gc.Heap.new();
+    value.init_strings(&heap);
+    // Collect after allocating twice the live data (at least 1 MB): 17%
+    // faster on binary_trees than the default, the rest within noise.
+    heap.set_growth(200, 1 << 20);
+    let globals = value.new_table(&heap);
+    lib.install(&heap, globals);
+    let stack: *V = mem.alloc(STACK_SLOTS);
+    let frames: *Frame = mem.alloc(FRAMES);
+    Ctx {
+        heap: heap,
+        stack: stack,
+        stack_end: stack + STACK_SLOTS,
+        frames: frames,
+        frames_end: frames + FRAMES,
+        fp: frames,
+        globals: globals,
+        error: V.Nil,
+        out: text.StrBuf.new(),
+        open: None,
+        open_level: 0 as *V,
+        host: host,
+    }
+}
+
+/// Make the heap scan `c` (its globals and VM stack) for roots.
+pub fn attach(c: *Ctx) {
+    c.heap.add_scanner(c as *u8, vm.scan_roots);
+}
+
+/// Free everything `c` owns.
+pub fn free_ctx(c: *Ctx) {
+    let st = c.heap.user as *Strings;
+    mem.release(st.slots);
+    mem.release(st);
+    c.heap.free();
+    mem.release(c.stack);
+    mem.release(c.frames);
+    c.out.free();
+}

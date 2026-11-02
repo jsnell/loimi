@@ -14,7 +14,7 @@
 //! | `?*T`, `?fn(..)`         | the pointer type; NULL is `None`         |
 //! | `fn(A, B) -> R`          | `R (*)(A, B)`                            |
 //! | `str`                    | `loimi_str`, `{ const char *ptr; size_t len; }` |
-//! | enum without payloads    | its tag integer type                     |
+//! | enum E without payloads  | `E`, a typedef of its tag integer type, and constants `E_Variant` |
 //!
 //! Everything else (structs, tuples, arrays and `Option`/`Result` by
 //! value, other slices, `Gc<T>`, `value` types, enums with payloads) has no
@@ -40,6 +40,8 @@ struct Gen<'p> {
     p: &'p Program,
     /// C name -> Loimi struct name, for the opaque declarations.
     opaque: BTreeMap<String, String>,
+    /// C name -> enum id, for the typedefs and constants.
+    enums: BTreeMap<String, u32>,
 }
 
 fn short(s: &str) -> &str {
@@ -131,7 +133,17 @@ impl<'p> Gen<'p> {
                 if e.has_payload() {
                     return Err(format!("enum `{}` has payloads; pass a pointer to a struct instead", short(&e.name)));
                 }
-                base(&format!("{}int{}_t", if e.tag.signed { "" } else { "u" }, e.tag.bits))
+                let c = short(&e.name).to_string();
+                if c.contains('<') {
+                    return Err(format!("generic enum `{}` has no C name", c));
+                }
+                if let Some(&prev) = self.enums.get(&c) {
+                    if prev != *i {
+                        return Err(format!("two exported enums are both named `{}` in C", c));
+                    }
+                }
+                self.enums.insert(c.clone(), *i);
+                base(&c)
             }
             Ty::Struct(i) => {
                 return Err(format!(
@@ -206,7 +218,7 @@ fn prototype(g: &mut Gen, f: &FnDef) -> Result<String, Diag> {
 
 /// Check that every `export "C"` function has a C signature.
 pub fn check_exports(p: &Program) -> Result<(), Diag> {
-    let mut g = Gen { p, opaque: BTreeMap::new() };
+    let mut g = Gen { p, opaque: BTreeMap::new(), enums: BTreeMap::new() };
     for f in exports(p) {
         prototype(&mut g, f)?;
     }
@@ -215,7 +227,7 @@ pub fn check_exports(p: &Program) -> Result<(), Diag> {
 
 /// The header for `p`'s exports. `guard` names the include guard.
 pub fn generate(p: &Program, source: &str, guard: &str) -> Result<String, Diag> {
-    let mut g = Gen { p, opaque: BTreeMap::new() };
+    let mut g = Gen { p, opaque: BTreeMap::new(), enums: BTreeMap::new() };
     let mut protos = Vec::new();
     for f in exports(p) {
         protos.push(prototype(&mut g, f)?);
@@ -237,6 +249,27 @@ pub fn generate(p: &Program, source: &str, guard: &str) -> Result<String, Diag> 
             out.push_str(&format!("typedef struct {0} {0};\n", c));
         }
         out.push('\n');
+    }
+    for (c, &i) in &g.enums {
+        let e = &p.enums[i as usize];
+        out.push_str(&format!(
+            "/* enum {} */\ntypedef {}int{}_t {};\n",
+            c,
+            if e.tag.signed { "" } else { "u" },
+            e.tag.bits,
+            c
+        ));
+        if e.variants.iter().all(|v| i32::try_from(v.discr).is_ok()) {
+            let vs: Vec<String> = e.variants.iter().map(|v| format!("{}_{} = {}", c, v.name, v.discr)).collect();
+            out.push_str(&format!("enum {{ {} }};\n\n", vs.join(", ")));
+        } else {
+            // Out of range for C enum constants.
+            for v in &e.variants {
+                let suffix = if v.discr > i64::MAX as i128 { "ULL" } else { "LL" };
+                out.push_str(&format!("#define {0}_{1} (({0}){2}{3})\n", c, v.name, v.discr, suffix));
+            }
+            out.push('\n');
+        }
     }
     for d in protos {
         out.push_str(&d);
