@@ -1,5 +1,9 @@
 // Garbage-collected heap: precise, non-moving mark-sweep.
 //
+// Small objects (header included, up to 512 bytes) come from size-class
+// free lists carved out of 64 KiB chunks; sweeping walks the chunks and
+// rebuilds the free lists. Larger objects are calloc'd and kept on a list.
+//
 // Objects are allocated with `new(heap, Obj { .. })`. Allocation never
 // collects; collection happens only in functions that `use gc`
 // (`collect`, `maybe_collect`), so the compiler knows every place where
@@ -20,9 +24,19 @@ extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn abort();
 
 const HEADER: u64 = 24;
+/// Size classes are multiples of 16 bytes, header included: class c holds
+/// objects of up to 16 * c bytes, for c in 1..NCLASS.
+const NCLASS: u64 = 33;
+const CHUNK: u64 = 65536;
+/// The `tid` of a free small-object slot.
+const FREE: u16 = 0xFFFF;
 
-/// Lives just before every object.
+/// Lives just before every object. `next` links large objects (and free
+/// small slots); `size` is the slot size.
 struct Header { next: *Header, size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
+
+/// A chunk of `n` small-object slots of `size` bytes each.
+struct Chunk { base: *u8, size: u64, n: u64 }
 
 /// Shadow-stack frame written by compiled code; entries follow `n`.
 pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
@@ -31,7 +45,13 @@ struct ShadowEntry { slot: *u8, mark: fn(*Heap, *u8) }
 struct Scanner { data: *u8, scan: fn(*Heap, *u8) }
 
 pub struct Heap {
+    /// Large objects.
     objects: *Header,
+    /// Free small slots per size class.
+    free: [*Header; 33],
+    chunks: mem.Vec<Chunk>,
+    /// Called after marking, before sweeping (for weak tables).
+    sweepers: mem.Vec<Scanner>,
     count: u64,
     live_bytes: u64,
     allocated: u64,
@@ -47,6 +67,9 @@ pub struct Heap {
 pub fn Heap.new() -> Heap {
     Heap {
         objects: 0 as *Header,
+        free: [0 as *Header; 33],
+        chunks: mem.Vec.new(),
+        sweepers: mem.Vec.new(),
         count: 0,
         live_bytes: 0,
         allocated: 0,
@@ -60,14 +83,34 @@ pub fn Heap.new() -> Heap {
     }
 }
 
-/// Called by compiled code for `new`.
+/// Called by compiled code for `new`. The object is zeroed.
 pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
-    let p = calloc(1, HEADER + size);
-    if (p as u64) == 0 {
-        let m = "out of memory\n";
-        write(2, m.ptr, m.len);
-        abort();
+    let c = (HEADER + size + 15) >> 4;
+    if c < NCLASS {
+        let hd = h.free[c];
+        if (hd as u64) != 0 {
+            h.free[c] = hd.next;
+            hd.tid = tid as u16;
+            hd.len = n;
+            h.count += 1;
+            h.allocated += c << 4;
+            let p = hd as *u8 + HEADER;
+            mem.memset(p, 0, size);
+            return p;
+        }
     }
+    alloc_slow(h, size, tid, n)
+}
+
+#[inline(never)]
+fn alloc_slow(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let c = (HEADER + size + 15) >> 4;
+    if c < NCLASS {
+        add_chunk(h, c);
+        return alloc(h, size, tid, n);
+    }
+    let p = calloc(1, HEADER + size);
+    if (p as u64) == 0 { oom(); }
     let hd = p as *Header;
     hd.next = h.objects;
     hd.size = (HEADER + size) as u32;
@@ -77,6 +120,37 @@ pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     h.count += 1;
     h.allocated += HEADER + size;
     p + HEADER
+}
+
+fn oom() {
+    let m = "out of memory\n";
+    write(2, m.ptr, m.len);
+    abort();
+}
+
+/// Carve a new chunk into free slots of class `c`.
+fn add_chunk(h: *Heap, c: u64) {
+    let size = c << 4;
+    let n = CHUNK / size;
+    let base = calloc(1, n * size);
+    if (base as u64) == 0 { oom(); }
+    h.chunks.push(Chunk { base: base, size: size, n: n });
+    var i = n;
+    while i > 0 {
+        i -= 1;
+        let hd = (base + i * size) as *Header;
+        hd.size = size as u32;
+        hd.tid = FREE;
+        hd.next = h.free[c];
+        h.free[c] = hd;
+    }
+}
+
+/// Whether the object at `p` survived marking. Meaningful only in a
+/// sweeper (see `add_sweeper`).
+pub fn is_marked(p: *u8) -> bool {
+    let hd = (p - HEADER) as *Header;
+    hd.mark != 0
 }
 
 /// Mark the object at `p` (null is ignored). Called by generated tracing code.
@@ -92,6 +166,13 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
 /// reference it owns.
 pub fn Heap.add_scanner(h: *Heap, data: *u8, scan: fn(*Heap, *u8)) {
     h.scanners.push(Scanner { data: data, scan: scan });
+}
+
+/// Register a sweeper: `sweep(heap, data)` runs after marking and before
+/// sweeping, and may drop references to unmarked objects (`is_marked`),
+/// which makes them weak.
+pub fn Heap.add_sweeper(h: *Heap, data: *u8, sweep: fn(*Heap, *u8)) {
+    h.sweepers.push(Scanner { data: data, scan: sweep });
 }
 
 fn drain(h: *Heap) {
@@ -117,9 +198,41 @@ pub fn collect(h: *Heap) uses gc {
         fr = fr.prev;
     }
     drain(h);
-    // Sweep.
+    for i in 0..h.sweepers.len {
+        let s = h.sweepers.at(i);
+        s.scan(h, s.data);
+    }
+    // Sweep the small objects, rebuilding the free lists in address order.
     var live: u64 = 0;
     var kept: u64 = 0;
+    var freed: u64 = 0;
+    for c in 0..NCLASS { h.free[c] = 0 as *Header; }
+    var ci = h.chunks.len;
+    while ci > 0 {
+        ci -= 1;
+        let ch = h.chunks.at(ci);
+        let c = ch.size >> 4;
+        var head = h.free[c];
+        var i = ch.n;
+        while i > 0 {
+            i -= 1;
+            let hd = (ch.base + i * ch.size) as *Header;
+            if hd.tid != FREE {
+                if hd.mark != 0 {
+                    hd.mark = 0;
+                    kept += 1;
+                    live += ch.size;
+                    continue;
+                }
+                hd.tid = FREE;
+                freed += 1;
+            }
+            hd.next = head;
+            head = hd;
+        }
+        h.free[c] = head;
+    }
+    // Large objects.
     var link: **Header = &h.objects;
     var cur = h.objects;
     while (cur as u64) != 0 {
@@ -131,11 +244,12 @@ pub fn collect(h: *Heap) uses gc {
             link = &cur.next;
         } else {
             *link = next;
-            h.freed += 1;
+            freed += 1;
             free(cur as *u8);
         }
         cur = next;
     }
+    h.freed += freed;
     h.count = kept;
     h.live_bytes = live;
     h.allocated = 0;
@@ -165,7 +279,11 @@ pub fn Heap.free(h: *Heap) {
         cur = next;
     }
     h.objects = 0 as *Header;
+    for i in 0..h.chunks.len { free(h.chunks.at(i).base); }
+    h.chunks.free();
+    for c in 0..NCLASS { h.free[c] = 0 as *Header; }
     h.count = 0;
     h.stack.free();
     h.scanners.free();
+    h.sweepers.free();
 }
