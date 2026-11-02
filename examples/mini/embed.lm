@@ -42,15 +42,18 @@ enum MiniStatus: i32 { Ok, Syntax, Runtime }
 /// The type of a value (mini_get_type, mini_arg_type).
 enum MiniType: i32 { Nil, Boolean, Number, String, Table, Function }
 
-/// A C function callable from Mini: returns 0 with its result set by a
+/// A native callable from Mini: returns 0 with its result set by a
 /// `mini_return_*` call (nil if none), or nonzero after `mini_raise`. It
-/// may call back into Mini (`mini_call`, `mini_dostring`).
-struct Native { f: fn(*MiniState, *u8) -> i32 uses reenter, ud: *u8 }
+/// may call back into Mini (`mini_call`, `mini_dostring`). A C native is
+/// its function closed over its user data (`mini_register`).
+type Native = closure fn(*MiniState) -> i32 uses reenter;
 
 pub struct MiniState {
     /// First, so the VM's `*Ctx` is also the `*MiniState`.
     ctx: Ctx,
     natives: mem.Vec<Native>,
+    /// The natives' environments.
+    arena: mem.Arena,
     /// The message of the last failed mini_dostring or mini_call.
     err: text.StrBuf,
     /// The native running now: its arguments and result.
@@ -81,13 +84,13 @@ fn host_call(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> uses reenter {
     let s = c as *MiniState;
     let i = (id - vm.HOST_NATIVE) as u64;
     if i >= s.natives.len { return Err(V.S(value.new_str(&c.heap, "unknown native"))); }
-    let nf = s.natives.at(i);
+    let native = s.natives.at(i);
     let (sa, sn, sr) = (s.args, s.nargs, s.ret);
     let top = s.vals.len;
     s.args = args;
     s.nargs = n;
     s.ret = V.Nil;
-    let status = nf.f(s, nf.ud);
+    let status = native(s);
     let r = s.ret;
     s.args = sa;
     s.nargs = sn;
@@ -123,6 +126,7 @@ export "C" fn mini_new() -> *MiniState {
     state.attach(&s.ctx);
     s.ctx.heap.add_scanner(s as *u8, scan_api);
     s.natives = mem.Vec.new();
+    s.arena = mem.Arena.new();
     s.err = text.StrBuf.new();
     s.args = 0 as *V;
     s.nargs = 0;
@@ -135,6 +139,7 @@ export "C" fn mini_new() -> *MiniState {
 export "C" fn mini_free(s: *MiniState) {
     state.free_ctx(&s.ctx);
     s.natives.free();
+    s.arena.free();
     s.vals.free();
     s.err.free();
     mem.release(s);
@@ -322,7 +327,7 @@ export "C" fn mini_get_string(s: *MiniState, name: *u8) -> str { as_str(get(s, n
 /// Make global `name` a function that calls `f(state, ud)`.
 export "C" fn mini_register(s: *MiniState, name: *u8, f: fn(*MiniState, *u8) -> i32 uses reenter, ud: *u8) {
     let id = vm.HOST_NATIVE + s.natives.len as i32;
-    s.natives.push(Native { f: f, ud: ud });
+    s.natives.push(new(&s.arena, |st| f(st, ud)));
     set(s, name, V.Native(id));
 }
 

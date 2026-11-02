@@ -122,7 +122,7 @@ fn main() {
     var v: Vec<i64> = Vec.new();
     v.push(3); v.push(9); v.push(1); v.push(5);
     v.sort_by(cfg.less);
-    for i in 0..v.len { io.print_int(v.at(i)); io.print(" "); }
+    for i in 0..v.len { io.print(" "); io.print_int(v.at(i)); }
     io.println("");
     let tag = 42;
     cfg.on_done = Some(new(a, |n| { io.print("done "); io.print_int(n + tag); io.println(""); }));
@@ -161,7 +161,7 @@ fn main() {
 // expect: 10 12
 // expect: 25
 // expect: 18
-// expect: 9 5 3 1
+// expect:  9 5 3 1
 // expect: done 46
 // expect: 406
 // expect: 5 0
