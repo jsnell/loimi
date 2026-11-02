@@ -301,6 +301,17 @@ fn real_let(n: &str, jw: bool, p: &str) -> String {
     }
 }
 
+/// A generated function `sig` whose body is `body {`, then an arm
+/// `opcode => value,` per entry of `arms`, then `default`: how the
+/// per-opcode tables (`op_size`, `op_name`, ..) are written.
+fn match_fn(s: &mut String, sig: &str, body: &str, arms: impl Iterator<Item = (u32, String)>, default: &str) {
+    let _ = writeln!(s, "{sig} {{ {body} {{");
+    for (op, v) in arms {
+        let _ = writeln!(s, "  {op} => {v},");
+    }
+    let _ = writeln!(s, "  {default}, }} }}");
+}
+
 /// Source expression decoding field (bits, shift, signed) of word `__w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
     // As in handlers: operand fields are 64-bit.
@@ -649,15 +660,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         }
     }
     let _ = writeln!(s, "  _ => \"\", }} }}");
-    let _ = writeln!(s, "{vis}fn {n}__operand_name(w: {w}, i: u64) -> str {{ match {n}__base_op(w) {{");
-    for o in &l.ops {
-        if !o.parts.is_empty() || o.fields.is_empty() {
-            continue;
-        }
+    let names = l.ops.iter().filter(|o| o.parts.is_empty() && !o.fields.is_empty()).map(|o| {
         let arms: Vec<String> = o.fields.iter().enumerate().map(|(j, f)| format!("{} => \"{}\"", j, f.0)).collect();
-        let _ = writeln!(s, "  {} => match i {{ {}, _ => \"\" }},", o.opcode, arms.join(", "));
-    }
-    let _ = writeln!(s, "  _ => \"\", }} }}");
+        (o.opcode, format!("match i {{ {}, _ => \"\" }}", arms.join(", ")))
+    });
+    match_fn(&mut s, &format!("{vis}fn {n}__operand_name(w: {w}, i: u64) -> str"), &format!("match {n}__base_op(w)"), names, "_ => \"\"");
     let _ = writeln!(s, "{vis}fn {n}__check_name(i: u64) -> str {{ match i {{");
     for (i, (name, _)) in v.checks.iter().enumerate() {
         let _ = writeln!(s, "  {} => \"{}\",", i, name.name);
@@ -1030,27 +1037,15 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} __at + {} }}", o.name, ps.join(", "), body, size);
     }
     // Sizes and names.
-    let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
-    for (i, o) in l.ops.iter().enumerate() {
-        let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, i));
-    }
-    let _ = writeln!(s, "  _ => 1, }} }}");
+    let by_op = format!("{rl}match {n}__opcode(w)");
+    let ops = || l.ops.iter().enumerate();
+    match_fn(&mut s, &format!("{vis}fn {n}__op_size(w: {w}) -> u64"), &by_op, ops().map(|(i, o)| (o.opcode, l.size_src(n, i))), "_ => 1");
     // Per word on its own: a superinstruction's first part.
-    let _ = writeln!(s, "{vis}fn {n}__base_size(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
-    for (i, o) in l.ops.iter().enumerate() {
-        let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, l.base(i)));
-    }
-    let _ = writeln!(s, "  _ => 1, }} }}");
-    let _ = writeln!(s, "{vis}fn {n}__base_op(w: {w}) -> {w} {{ {rl}match {n}__opcode(w) {{");
-    for (i, o) in l.ops.iter().enumerate() {
-        let _ = writeln!(s, "  {} => {},", o.opcode, l.ops[l.base(i)].opcode);
-    }
-    let _ = writeln!(s, "  x => x, }} }}");
-    let _ = writeln!(s, "fn {n}__family(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
-    for o in &l.ops {
-        let _ = writeln!(s, "  {} => {},", o.opcode, o.family);
-    }
-    let _ = writeln!(s, "  _ => {}, }} }}", u64::MAX);
+    match_fn(&mut s, &format!("{vis}fn {n}__base_size(w: {w}) -> u64"), &by_op, ops().map(|(i, o)| (o.opcode, l.size_src(n, l.base(i)))), "_ => 1");
+    let base_op = |i: usize| l.ops[l.base(i)].opcode.to_string();
+    match_fn(&mut s, &format!("{vis}fn {n}__base_op(w: {w}) -> {w}"), &by_op, ops().map(|(i, o)| (o.opcode, base_op(i))), "x => x");
+    let family = l.ops.iter().map(|o| (o.opcode, o.family.to_string()));
+    match_fn(&mut s, &format!("fn {n}__family(w: {w}) -> u64"), &by_op, family, &format!("_ => {}", u64::MAX));
     // Operand metadata for tools (fuzzers, assemblers): per op, the kind,
     // width and signedness of each operand field, in encoder order. A
     // word answers for the op it stands for alone (a super's head for its
@@ -1067,32 +1062,23 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         v.operands.iter().enumerate().filter(|(_, k)| is_label_kind(v, &k.name.name)).map(|(i, _)| format!("k == {}", i)).collect();
     let _ = writeln!(s, "{vis}fn {n}__kind_is_label(k: u64) -> bool {{ {} }}", if labels.is_empty() { "false".into() } else { labels.join(" or ") });
     let kind_ix = |name: &str| v.operands.iter().position(|k| k.name.name == name).unwrap_or(nk);
+    let by_base = format!("{rl}match {n}__base_op(w)");
+    // Ops with operands, not supers.
+    let with_fields = || l.ops.iter().enumerate().filter(|(_, o)| o.parts.is_empty() && !o.fields.is_empty());
     let per_field = |s: &mut String, fname: &str, ret: &str, none: &str, f: &dyn Fn(usize, usize) -> String| {
-        let _ = writeln!(s, "{vis}fn {n}__{fname}(w: {w}, i: u64) -> {ret} {{ {rl}match {n}__base_op(w) {{");
-        for (k, o) in l.ops.iter().enumerate() {
-            if !o.parts.is_empty() || o.fields.is_empty() {
-                continue;
-            }
+        let arms = with_fields().map(|(k, o)| {
             let arms: Vec<String> = (0..o.fields.len()).map(|j| format!("{} => {}", j, f(k, j))).collect();
-            let _ = writeln!(s, "  {} => match i {{ {}, _ => {} }},", o.opcode, arms.join(", "), none);
-        }
-        let _ = writeln!(s, "  _ => {}, }} }}", none);
+            (o.opcode, format!("match i {{ {}, _ => {} }}", arms.join(", "), none))
+        });
+        match_fn(s, &format!("{vis}fn {n}__{fname}(w: {w}, i: u64) -> {ret}"), &by_base, arms, &format!("_ => {none}"));
     };
-    let _ = writeln!(s, "{vis}fn {n}__operand_count(w: {w}) -> u64 {{ {rl}match {n}__base_op(w) {{");
-    for o in &l.ops {
-        if o.parts.is_empty() && !o.fields.is_empty() {
-            let _ = writeln!(s, "  {} => {},", o.opcode, o.fields.len());
-        }
-    }
-    let _ = writeln!(s, "  _ => 0, }} }}");
+    let counts = with_fields().map(|(_, o)| (o.opcode, o.fields.len().to_string()));
+    match_fn(&mut s, &format!("{vis}fn {n}__operand_count(w: {w}) -> u64"), &by_base, counts, "_ => 0");
     per_field(&mut s, "operand_kind", "u64", &nk.to_string(), &|k, j| kind_ix(&l.ops[k].kinds[j]).to_string());
     per_field(&mut s, "operand_bits", "u64", "0", &|k, j| l.ops[k].fields[j].1.to_string());
     per_field(&mut s, "operand_signed", "bool", "false", &|k, j| l.ops[k].fields[j].3.to_string());
-    let _ = writeln!(s, "{vis}fn {n}__op_name(w: {w}) -> str {{ {rl}match {n}__opcode(w) {{");
-    for o in &l.ops {
-        let _ = writeln!(s, "  {} => \"{}\",", o.opcode, o.name);
-    }
-    let _ = writeln!(s, "  _ => \"<invalid>\", }} }}");
+    let names = l.ops.iter().map(|o| (o.opcode, format!("\"{}\"", o.name)));
+    match_fn(&mut s, &format!("{vis}fn {n}__op_name(w: {w}) -> str"), &by_op, names, "_ => \"<invalid>\"");
     // `Vm.Op`: one variant per op as host tools see it (no supers, a
     // family as its generic op), its discriminant the opcode; and
     // `Vm.op_of(w)`, the op word `w` stands for alone, as an `Op`, so
@@ -1100,12 +1086,8 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let base: Vec<usize> = (0..l.ops.len()).filter(|&i| l.ops[i].parts.is_empty() && l.ops[i].family == i).collect();
     let variants: Vec<String> = base.iter().map(|&i| format!("{} = {}", l.ops[i].name, l.ops[i].opcode)).collect();
     let _ = writeln!(s, "{vis}enum {n}__Op {{ {} }}", variants.join(", "));
-    let _ = writeln!(s, "{vis}fn {n}__op_of(w: {w}) -> {n}__Op {{ {rl}match {n}__opcode(w) {{");
-    for o in &l.ops {
-        let f = &l.ops[o.family];
-        let _ = writeln!(s, "  {} => {n}__Op.{},", o.opcode, f.name);
-    }
-    let _ = writeln!(s, "  _ => __panic(\"{n}.op_of: invalid opcode\"), }} }}");
+    let op_of = l.ops.iter().map(|o| (o.opcode, format!("{n}__Op.{}", l.ops[o.family].name)));
+    match_fn(&mut s, &format!("{vis}fn {n}__op_of(w: {w}) -> {n}__Op"), &by_op, op_of, &format!("_ => __panic(\"{n}.op_of: invalid opcode\")"));
     // Superinstruction peephole: rewrite the first word of each matching
     // sequence. The other words keep their opcodes, so jumps into the
     // middle of a fused sequence still execute the original ops. Words
@@ -1751,39 +1733,21 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let ctx_params: String = params.iter().map(|p| format!(", {p}")).collect();
     let ctx_args: String = args.iter().map(|a| format!(", {a}")).collect();
     // Counts with the verify context.
-    let _ = writeln!(s, "fn {n}__stack_counts(__w: {w}{ctx_params}) -> (i64, i64, bool) {{ {rl}match {n}__base_op(__w) {{");
-    for (k, o) in l.ops.iter().enumerate() {
-        if !o.parts.is_empty() {
-            continue;
-        }
-        let e = v.ops[k].stack.as_ref().unwrap();
-        let _ = writeln!(s, "  {} => {{ {}({}, {}, {}) }},", o.opcode, binds(o), count(&e.ins), count(&e.outs), e.rest);
-    }
-    let _ = writeln!(s, "  _ => (0, 0, false), }} }}");
+    let by_base = format!("{rl}match {n}__base_op(__w)");
+    // Ops (not supers) with their stack effects.
+    let effects = || l.ops.iter().enumerate().filter(|(_, o)| o.parts.is_empty()).map(|(k, o)| (o, v.ops[k].stack.as_ref().unwrap()));
+    let counts = effects().map(|(o, e)| (o.opcode, format!("{{ {}({}, {}, {}) }}", binds(o), count(&e.ins), count(&e.outs), e.rest)));
+    match_fn(&mut s, &format!("fn {n}__stack_counts(__w: {w}{ctx_params}) -> (i64, i64, bool)"), &by_base, counts, "_ => (0, 0, false)");
     // Counts for tools, without the context.
-    let _ = writeln!(s, "{vis}fn {n}__stack_effect(__w: {w}) -> ?(u32, u32) {{ {rl}match {n}__base_op(__w) {{");
-    for (k, o) in l.ops.iter().enumerate() {
-        if !o.parts.is_empty() {
-            continue;
-        }
-        let e = v.ops[k].stack.as_ref().unwrap();
+    let fixed = effects().filter(|(o, e)| {
         let params: Vec<String> = o.fields.iter().map(|f| f.0.clone()).collect();
         let all = e.ins.iter().chain(e.outs.iter()).all(|i| i.count.as_ref().is_none_or(|c| operand_only(c, &params)));
-        if e.rest || !all {
-            continue;
-        }
-        let _ = writeln!(s, "  {} => {{ {}Some((({}) as u32, ({}) as u32)) }},", o.opcode, binds(o), count(&e.ins), count(&e.outs));
-    }
-    let _ = writeln!(s, "  _ => None, }} }}");
-    let _ = writeln!(s, "{vis}fn {n}__stack_effect_text(__w: {w}) -> str {{ {rl}match {n}__base_op(__w) {{");
-    for (k, o) in l.ops.iter().enumerate() {
-        if !o.parts.is_empty() {
-            continue;
-        }
-        let e = v.ops[k].stack.as_ref().unwrap();
-        let _ = writeln!(s, "  {} => {},", o.opcode, str_lit(&eff_text(e)));
-    }
-    let _ = writeln!(s, "  _ => \"\", }} }}");
+        !e.rest && all
+    });
+    let fixed = fixed.map(|(o, e)| (o.opcode, format!("{{ {}Some((({}) as u32, ({}) as u32)) }}", binds(o), count(&e.ins), count(&e.outs))));
+    match_fn(&mut s, &format!("{vis}fn {n}__stack_effect(__w: {w}) -> ?(u32, u32)"), &by_base, fixed, "_ => None");
+    let texts = effects().map(|(o, e)| (o.opcode, str_lit(&eff_text(e))));
+    match_fn(&mut s, &format!("{vis}fn {n}__stack_effect_text(__w: {w}) -> str"), &by_base, texts, "_ => \"\"");
     // The pass. `__d[i]` is the depth before word i plus one (0: not
     // reached yet); `__work` holds each reached word once.
     let entry = match &v.stack_entry {
