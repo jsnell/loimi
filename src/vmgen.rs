@@ -445,7 +445,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         }
         TVm::Jump(t) => {
             let tv = g.val(t);
-            if g.cg.opts.jit && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
+            if crate::jitgen::counting(g) && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
                 let pc_local = g.f().vm_state[g.p().vms[g.vm.as_ref().unwrap().vm as usize].pc_idx];
                 let kind = crate::jitgen::jump_kind(t, pc_local);
                 jit_dispatch(g, &tv, kind);
@@ -494,7 +494,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
             let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
-            if g.cg.opts.jit && !hg.combined {
+            if crate::jitgen::counting(g) && !hg.combined {
                 // The JIT may have replaced words of this code: it restores
                 // them (and drops the compiled code) before the rewrite.
                 g.emit(format!("call void @loimi_jit_become(ptr {})", pc));
@@ -572,7 +572,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             if hg.combined {
                 g.br(&hg.op_labels[*k as usize]);
             } else {
-                let sym = format!("@\"{}\"", p.fns[vd.ops[*k as usize].fid as usize].symbol);
+                let sym = format!("@\"{}\"", crate::jitgen::callee_symbol(g, vd.ops[*k as usize].fid));
                 let w = current_word(g, vd);
                 tail_to(g, vd, &sym, &w);
             }
@@ -588,7 +588,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             }
             // Entries have no current instruction; the shared copy ignores it.
             let w = if g.vm.as_ref().unwrap().role == VmRole::Entry { "0".to_string() } else { current_word(g, vd) };
-            tail_to(g, vd, &format!("@\"{}\"", p.fns[*fid as usize].symbol), &w);
+            tail_to(g, vd, &format!("@\"{}\"", crate::jitgen::callee_symbol(g, *fid)), &w);
             g.poison(&e.ty)
         }
         TVm::SharedArg(fid, i) => {
@@ -645,10 +645,18 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     let sym = match &stencil_sym {
         Some(s) => s.clone(),
         None => {
-            let n = g.cg.cold_count;
-            g.cg.cold_count += 1;
-            let sym = format!("{}.cold{}", f.symbol, n);
-            if g.cg.opts.jit {
+            // Counting copies number their own, so that the default
+            // functions are named as in a default build.
+            let sym = if g.jit_count {
+                g.cg.cold_count_jc += 1;
+                format!("{}.cold{}", crate::jitgen::counting_symbol(&f.symbol), g.cg.cold_count_jc - 1)
+            } else {
+                g.cg.cold_count += 1;
+                format!("{}.cold{}", f.symbol, g.cg.cold_count - 1)
+            };
+            // The stencil calls the cold functions of the counting copy,
+            // if there is one.
+            if g.jit_count || (g.cg.opts.jit && !g.cg.jit_counted.contains(&g.fid)) {
                 g.cg.cold_syms.entry(g.fid).or_default().push(sym.clone());
             }
             sym
@@ -681,7 +689,8 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
     if stencil_sym.is_none() {
-        g.cg.cold_queue.push((g.fid, body, captured, sym));
+        let count = g.jit_count;
+        g.cg.cold_queue.push((g.fid, body, captured, sym, count));
     }
 }
 
@@ -962,7 +971,7 @@ fn part_label(g: &mut FnGen, j: u32) -> String {
 
 /// Module-level definitions for tail-call vms: dispatch table, invalid-op
 /// handler, raise slot.
-pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: bool) {
+pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: bool, counted: &std::collections::HashSet<FnId>) {
     let jit_vm = if jit { crate::jitgen::jit_vm(p).ok() } else { None };
     // Calls to this mark a block as cold. The empty asm keeps the call from
     // being deleted; preserve_all keeps it from clobbering any register.
@@ -983,7 +992,25 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: boo
                     None => entries.push(format!("ptr {}", inv)),
                 }
             }
-            let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
+            if enter.is_some() {
+                // `--jit-stencils`: the table is writable. With the JIT on,
+                // the runtime points it at the counting copies, listed in
+                // `loimi_jit_ctable` (null: the op has none).
+                let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
+                let mut ce = Vec::new();
+                for i in 0..n {
+                    match vd.ops.iter().find(|o| o.opcode as usize == i) {
+                        Some(o) if counted.contains(&o.fid) => {
+                            ce.push(format!("ptr @\"{}\"", crate::jitgen::counting_symbol(&p.fns[o.fid as usize].symbol)))
+                        }
+                        _ => ce.push("ptr null".into()),
+                    }
+                }
+                let _ = writeln!(globals, "@loimi_jit_ctable = constant [{} x ptr] [{}]", n, ce.join(", "));
+                let _ = writeln!(globals, "@loimi_jit_table = constant ptr {}", table_name(vd));
+            } else {
+                let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
+            }
             for (v, (_, ws)) in vd.variants.iter().enumerate() {
                 let mut entries = Vec::new();
                 for i in 0..n {

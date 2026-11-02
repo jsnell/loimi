@@ -36,19 +36,24 @@ extern const struct jit_reloc loimi_jit_relocs[];
 extern const struct jit_stencil loimi_jit_stencils[];
 extern void *const loimi_jit_syms[];
 extern const uint8_t loimi_jit_rodata[];
+extern const uint8_t loimi_jit_hcode[];
+extern const int64_t loimi_jit_hcode_len;
+extern const struct jit_reloc loimi_jit_hrelocs[];
+extern const int32_t loimi_jit_nhrelocs;
 extern const int64_t loimi_jit_rodata_len;
 extern const int32_t loimi_jit_ntls;
 extern void loimi_jit_tls(int64_t *out);
 extern const struct jit_opinfo loimi_jit_opinfo[];
 extern const uint32_t loimi_jit_nops, loimi_jit_enter_op, loimi_jit_op_bits;
 extern const char *const loimi_jit_opnames[];
+extern void **const loimi_jit_table;
+extern void *const loimi_jit_ctable[];
 
 #define HOT_SLOTS 4096
 void **loimi_jit_entries;
-uint8_t loimi_jit_on;
 uint16_t loimi_jit_hotcount[HOT_SLOTS];
 
-enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA };
+enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER };
 enum { R_64 = 1, R_PC32 = 2, R_PLT32 = 4, R_32 = 10, R_32S = 11, R_TPOFF32 = 23 };
 enum { S_NONE, S_COMPILED, S_FAILED };
 #define MAX_COMPILES 8
@@ -67,7 +72,7 @@ static uint16_t threshold = 50;
 static struct rec **recs;
 static size_t nrecs, caprecs;
 static size_t nentries, capentries;
-static uint8_t *region, *region_end, *bump, *rodata;
+static uint8_t *region, *region_end, *bump, *rodata, *helpers;
 static int64_t *tlsoff;
 static struct {
     uint64_t compiles, failures, invalidations, insns, exits, bytes, patched, ns, max_ns;
@@ -98,8 +103,23 @@ __attribute__((constructor)) static void jit_init(void) {
     enabled = e && *e && strcmp(e, "0") != 0;
     const char *h = getenv("LOIMI_JIT_HOT");
     if (h && atoi(h) > 0 && atoi(h) < 65535) threshold = (uint16_t)atoi(h);
-    if (!enabled) threshold = 65535;
-    loimi_jit_on = enabled;
+    /* With the JIT on, the interpreter runs the counting copies of the
+     * handlers that have them (calls, returns, label jumps, `become`).
+     * With it off, the table stays the default build's. */
+    if (enabled) {
+        /* The table is read-only data, as in a default build (LLVM
+         * treats its loads as invariant, and a writable table cost a few
+         * percent with the JIT off): unprotect it for the update. */
+        uintptr_t a = (uintptr_t)loimi_jit_table & ~(uintptr_t)4095;
+        uintptr_t e = ((uintptr_t)(loimi_jit_table + loimi_jit_nops) + 4095) & ~(uintptr_t)4095;
+        if (mprotect((void *)a, e - a, PROT_READ | PROT_WRITE) == 0) {
+            for (uint32_t i = 0; i < loimi_jit_nops; i++)
+                if (loimi_jit_ctable[i]) loimi_jit_table[i] = loimi_jit_ctable[i];
+            mprotect((void *)a, e - a, PROT_READ);
+        } else {
+            enabled = 0;
+        }
+    }
     for (int i = 0; i < HOT_SLOTS; i++) loimi_jit_hotcount[i] = threshold;
     const char *s = getenv("LOIMI_JIT_STATS");
     stats = enabled && s && *s && strcmp(s, "0") != 0;
@@ -113,6 +133,32 @@ __attribute__((constructor)) static void jit_init(void) {
     inited = 1;
 }
 
+static int fits32s(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
+
+/* Write relocation `rl` at P, with S the target's address or value. */
+static int patch(uint8_t *P, const struct jit_reloc *rl, int64_t S) {
+    int64_t v = S + rl->addend;
+    switch (rl->type) {
+    case R_64: memcpy(P, &v, 8); return 1;
+    case R_PC32:
+    case R_PLT32:
+        v -= (int64_t)(intptr_t)P;
+        if (!fits32s(v)) return 0;
+        memcpy(P, &(int32_t){(int32_t)v}, 4);
+        return 1;
+    case R_32:
+        if (v < 0 || v > (int64_t)UINT32_MAX) return 0;
+        memcpy(P, &(uint32_t){(uint32_t)v}, 4);
+        return 1;
+    case R_32S:
+    case R_TPOFF32:
+        if (!fits32s(v)) return 0;
+        memcpy(P, &(int32_t){(int32_t)v}, 4);
+        return 1;
+    }
+    return 0;
+}
+
 /* Executable memory near the program: stencils reach its functions and
  * data with 32-bit displacements (x86-64 small code model). */
 static int init_region(void) {
@@ -122,7 +168,6 @@ static int init_region(void) {
     if (p == MAP_FAILED) p = mmap((void *)0x40000000, size, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         enabled = 0;
-        loimi_jit_on = 0;
         return 0;
     }
     region = p;
@@ -139,6 +184,35 @@ static int init_region(void) {
     rodata = region;
     tlsoff = calloc(loimi_jit_ntls + 1, sizeof *tlsoff);
     loimi_jit_tls(tlsoff);
+    /* The helpers: functions of the interpreter that stencils call, which
+     * have their own copy (so the interpreter's are compiled as in a
+     * default build). Copied and relocated once. */
+    size_t hl = ((size_t)loimi_jit_hcode_len + 4095) & ~(size_t)4095;
+    helpers = bump;
+    if (hl) {
+        mprotect(helpers, hl, PROT_READ | PROT_WRITE);
+        memcpy(helpers, loimi_jit_hcode, (size_t)loimi_jit_hcode_len);
+        for (int32_t k = 0; k < loimi_jit_nhrelocs; k++) {
+            const struct jit_reloc *rl = &loimi_jit_hrelocs[k];
+            int64_t S;
+            switch (rl->kind) {
+            case K_SYM: S = (int64_t)(intptr_t)loimi_jit_syms[rl->arg]; break;
+            case K_TLS: S = tlsoff[rl->arg]; break;
+            case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
+            case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
+            default: S = 0; break;
+            }
+            if (!patch(helpers + rl->off, rl, S)) {
+                /* Cannot happen near the program; give up on the JIT. */
+                munmap(region, size);
+                region = NULL;
+                enabled = 0;
+                return 0;
+            }
+        }
+        mprotect(helpers, hl, PROT_READ | PROT_EXEC);
+        bump += hl;
+    }
     return 1;
 }
 
@@ -210,8 +284,6 @@ static int64_t field(uint32_t w, int64_t arg) {
     if (!sgn) return (int64_t)u;
     return (int64_t)(u ^ (1ull << (bits - 1))) - (int64_t)(1ull << (bits - 1));
 }
-
-static int fits32s(int64_t v) { return v >= INT32_MIN && v <= INT32_MAX; }
 
 static uint32_t new_entry(void *native) {
     if (nentries == capentries) {
@@ -293,28 +365,10 @@ static int compile(struct rec *r) {
                 break;
             case K_TLS: S = tlsoff[rl->arg]; break;
             case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
+            case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
             default: goto fail;
             }
-            int64_t v = S + rl->addend;
-            switch (rl->type) {
-            case R_64: memcpy(P, &v, 8); break;
-            case R_PC32:
-            case R_PLT32:
-                v -= (int64_t)(intptr_t)P;
-                if (!fits32s(v)) goto fail;
-                memcpy(P, &(int32_t){(int32_t)v}, 4);
-                break;
-            case R_32:
-                if (v < 0 || v > (int64_t)UINT32_MAX) goto fail;
-                memcpy(P, &(uint32_t){(uint32_t)v}, 4);
-                break;
-            case R_32S:
-            case R_TPOFF32:
-                if (!fits32s(v)) goto fail;
-                memcpy(P, &(int32_t){(int32_t)v}, 4);
-                break;
-            default: goto fail;
-            }
+            if (!patch(P, rl, S)) goto fail;
         }
     }
     mprotect((void *)pa, pe - pa, PROT_READ | PROT_EXEC);

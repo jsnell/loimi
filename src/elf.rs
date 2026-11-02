@@ -34,6 +34,7 @@ const K_NEXT: u16 = 3;
 const K_JUMP: u16 = 4;
 const K_TLS: u16 = 5;
 const K_RODATA: u16 = 6;
+const K_HELPER: u16 = 7;
 
 struct Section {
     name: String,
@@ -114,6 +115,7 @@ fn parse(data: Vec<u8>) -> Result<Elf, String> {
     Ok(Elf { data, sections, syms })
 }
 
+#[derive(Clone, Copy)]
 struct Reloc {
     off: u32,
     ty: u32,
@@ -129,6 +131,8 @@ pub struct Tables {
     pub rejected: Vec<(String, String)>,
     pub count: usize,
     pub bytes: usize,
+    pub helper_bytes: usize,
+    pub helpers: usize,
 }
 
 fn parse_field(rest: &str) -> Option<u64> {
@@ -140,6 +144,112 @@ fn parse_field(rest: &str) -> Option<u64> {
         _ => return None,
     };
     Some(off | shift << 8 | bits << 16 | signed << 24)
+}
+
+/// What the relocations of stencils and helpers refer to, collected as
+/// they are read.
+struct Cx<'a> {
+    known: &'a HashSet<String>,
+    syms: Vec<String>,
+    sym_ix: HashMap<String, usize>,
+    tls: Vec<String>,
+    tls_ix: HashMap<String, usize>,
+    /// Read-only sections copied into the JIT's data: section → offset.
+    rodata: Vec<u8>,
+    ro_ix: HashMap<usize, usize>,
+}
+
+impl Cx<'_> {
+    /// The patch records of text section `si`. `holes`: a stencil (a
+    /// helper must not use holes). A call to another function of the
+    /// object (a helper) is a `K_HELPER` record with arg (section << 32 |
+    /// offset), resolved once the helper code is laid out.
+    fn relocs(&mut self, elf: &Elf, si: usize, holes: bool) -> Result<Vec<Reloc>, String> {
+        let mut rs = Vec::new();
+        for rsec in elf.sections.iter().filter(|r| r.ty == SHT_RELA && r.info as usize == si) {
+            for k in 0..rsec.size / 24 {
+                let e = rsec.off + k * 24;
+                let r_off = u64_at(&elf.data, e) as u32;
+                let info = u64_at(&elf.data, e + 8);
+                let addend = u64_at(&elf.data, e + 16) as i64;
+                let (sidx, ty) = ((info >> 32) as usize, info as u32);
+                let s = &elf.syms[sidx];
+                if !matches!(ty, R_X86_64_64 | R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_32 | R_X86_64_32S | R_X86_64_TPOFF32) {
+                    return Err(format!("relocation type {} against {}", ty, s.name));
+                }
+                let hole = s.name.starts_with("__jit.");
+                if hole && !holes {
+                    return Err(format!("a helper uses hole {}", s.name));
+                }
+                let (kind, arg) = if s.shndx == 0 {
+                    if let Some(r) = s.name.strip_prefix("__jit.w.") {
+                        (K_WORD, r.parse::<u64>().map_err(|_| format!("bad hole {}", s.name))?)
+                    } else if let Some(r) = s.name.strip_prefix("__jit.f.") {
+                        (K_FIELD, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
+                    } else if let Some(r) = s.name.strip_prefix("__jit.n.") {
+                        (K_NEXT, r.parse::<i64>().map_err(|_| format!("bad hole {}", s.name))? as u64)
+                    } else if let Some(r) = s.name.strip_prefix("__jit.j.") {
+                        (K_JUMP, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
+                    } else if ty == R_X86_64_TPOFF32 {
+                        if !self.known.contains(&s.name) {
+                            return Err(format!("unknown thread-local {}", s.name));
+                        }
+                        (K_TLS, ix(&mut self.tls, &mut self.tls_ix, &s.name) as u64)
+                    } else {
+                        (K_SYM, ix(&mut self.syms, &mut self.sym_ix, &s.name) as u64)
+                    }
+                } else {
+                    let t = s.shndx as usize;
+                    let ts = elf.sections.get(t).ok_or("bad section index")?;
+                    if ts.flags & SHF_EXECINSTR != 0 {
+                        if ts.name.starts_with(".text.__jit.") {
+                            return Err(format!("reference to stencil {}", ts.name));
+                        }
+                        if ty != R_X86_64_PLT32 && !s.name.is_empty() && s.name != ts.name && self.known.contains(&s.name) {
+                            // The function's address, not a call: the
+                            // interpreter's copy, so that it compares
+                            // equal to the interpreter's.
+                            (K_SYM, ix(&mut self.syms, &mut self.sym_ix, &s.name) as u64)
+                        } else {
+                            (K_HELPER, (t as u64) << 32 | s.value)
+                        }
+                    } else {
+                        if ts.flags & SHF_ALLOC == 0 || ts.flags & SHF_WRITE != 0 {
+                            return Err(format!("reference to section {}", ts.name));
+                        }
+                        if elf.sections.iter().any(|r| r.ty == SHT_RELA && r.info as usize == t) {
+                            return Err(format!("data with relocations ({})", ts.name));
+                        }
+                        let base = match self.ro_ix.get(&t) {
+                            Some(&b) => b,
+                            None => {
+                                let a = ts.align.max(1) as usize;
+                                while self.rodata.len() % a != 0 {
+                                    self.rodata.push(0);
+                                }
+                                let b = self.rodata.len();
+                                self.rodata.extend_from_slice(&elf.data[ts.off..ts.off + ts.size]);
+                                self.ro_ix.insert(t, b);
+                                b
+                            }
+                        };
+                        (K_RODATA, base as u64 + s.value)
+                    }
+                };
+                rs.push(Reloc { off: r_off, ty, kind, addend, arg });
+            }
+        }
+        Ok(rs)
+    }
+}
+
+fn ix(v: &mut Vec<String>, m: &mut HashMap<String, usize>, name: &str) -> usize {
+    if let Some(&i) = m.get(name) {
+        return i;
+    }
+    v.push(name.to_string());
+    m.insert(name.to_string(), v.len() - 1);
+    v.len() - 1
 }
 
 /// `ops`: (opcode, name) of every op; `nops`: 2^op_bits; `ir`: the
@@ -157,20 +267,12 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         let name = if let Some(r) = rest.strip_prefix('"') { r.split('"').next().unwrap_or("") } else { rest.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).next().unwrap_or("") };
         known.insert(name.to_string());
     }
-    let mut code: Vec<u8> = Vec::new();
-    let mut relocs: Vec<Reloc> = Vec::new();
-    // Per stencil index (opcode, or nops for the exit stencil): (code
-    // offset, length, first reloc, reloc count, trim distance or -1).
-    let mut stencils: BTreeMap<u32, (usize, usize, usize, usize, i64)> = BTreeMap::new();
-    let mut syms: Vec<String> = Vec::new();
-    let mut sym_ix: HashMap<String, usize> = HashMap::new();
-    let mut tls: Vec<String> = Vec::new();
-    let mut tls_ix: HashMap<String, usize> = HashMap::new();
-    // Read-only sections copied into the JIT's data: section → offset.
-    let mut rodata: Vec<u8> = Vec::new();
-    let mut ro_ix: HashMap<usize, usize> = HashMap::new();
+    let mut cx = Cx { known: &known, syms: Vec::new(), sym_ix: HashMap::new(), tls: Vec::new(), tls_ix: HashMap::new(), rodata: Vec::new(), ro_ix: HashMap::new() };
     let mut rejected = Vec::new();
     let by_name: HashMap<&str, u32> = ops.iter().map(|(o, n)| (n.as_str(), *o)).collect();
+    // The stencils: (index (opcode, or nops for the exit stencil), name,
+    // section, relocations).
+    let mut found: Vec<(u32, String, usize, Vec<Reloc>)> = Vec::new();
     for (si, sec) in elf.sections.iter().enumerate() {
         let Some(fname) = sec.name.strip_prefix(".text.") else { continue };
         let idx = if fname == "__jit.exit" {
@@ -183,86 +285,78 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         } else {
             continue;
         };
-        let bytes = &elf.data[sec.off..sec.off + sec.size];
-        let mut rs = Vec::new();
-        let mut why: Option<String> = None;
-        for rsec in elf.sections.iter().filter(|r| r.ty == SHT_RELA && r.info as usize == si) {
-            for k in 0..rsec.size / 24 {
-                let e = rsec.off + k * 24;
-                let r_off = u64_at(&elf.data, e) as u32;
-                let info = u64_at(&elf.data, e + 8);
-                let addend = u64_at(&elf.data, e + 16) as i64;
-                let (sidx, ty) = ((info >> 32) as usize, info as u32);
-                let s = &elf.syms[sidx];
-                if !matches!(ty, R_X86_64_64 | R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_32 | R_X86_64_32S | R_X86_64_TPOFF32) {
-                    why = Some(format!("relocation type {} against {}", ty, s.name));
-                    break;
-                }
-                let (kind, arg) = if s.shndx == 0 {
-                    if let Some(r) = s.name.strip_prefix("__jit.w.") {
-                        (K_WORD, r.parse::<u64>().map_err(|_| format!("bad hole {}", s.name))?)
-                    } else if let Some(r) = s.name.strip_prefix("__jit.f.") {
-                        (K_FIELD, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
-                    } else if let Some(r) = s.name.strip_prefix("__jit.n.") {
-                        (K_NEXT, r.parse::<i64>().map_err(|_| format!("bad hole {}", s.name))? as u64)
-                    } else if let Some(r) = s.name.strip_prefix("__jit.j.") {
-                        (K_JUMP, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
-                    } else if ty == R_X86_64_TPOFF32 {
-                        if !known.contains(&s.name) {
-                            why = Some(format!("unknown thread-local {}", s.name));
-                            break;
-                        }
-                        let n = tls.len();
-                        let i = *tls_ix.entry(s.name.clone()).or_insert_with(|| {
-                            tls.push(s.name.clone());
-                            n
-                        });
-                        (K_TLS, i as u64)
-                    } else {
-                        let n = syms.len();
-                        let i = *sym_ix.entry(s.name.clone()).or_insert_with(|| {
-                            syms.push(s.name.clone());
-                            n
-                        });
-                        (K_SYM, i as u64)
-                    }
-                } else {
-                    let t = s.shndx as usize;
-                    let ts = elf.sections.get(t).ok_or("bad section index")?;
-                    if ts.flags & SHF_ALLOC == 0 || ts.flags & (SHF_WRITE | SHF_EXECINSTR) != 0 {
-                        why = Some(format!("reference to section {}", ts.name));
-                        break;
-                    }
-                    if elf.sections.iter().any(|r| r.ty == SHT_RELA && r.info as usize == t) {
-                        why = Some(format!("data with relocations ({})", ts.name));
-                        break;
-                    }
-                    let base = match ro_ix.get(&t) {
-                        Some(&b) => b,
-                        None => {
-                            let a = ts.align.max(1) as usize;
-                            while rodata.len() % a != 0 {
-                                rodata.push(0);
-                            }
-                            let b = rodata.len();
-                            rodata.extend_from_slice(&elf.data[ts.off..ts.off + ts.size]);
-                            ro_ix.insert(t, b);
-                            b
-                        }
-                    };
-                    (K_RODATA, base as u64 + s.value)
-                };
-                rs.push(Reloc { off: r_off, ty, kind, addend, arg });
-            }
-            if why.is_some() {
-                break;
-            }
-        }
         let name = if idx == nops { "<exit>".to_string() } else { fname.trim_start_matches("__jit.op.").to_string() };
-        if let Some(w) = why {
-            rejected.push((name, w));
+        match cx.relocs(&elf, si, true) {
+            Ok(rs) => found.push((idx, name, si, rs)),
+            Err(w) => rejected.push((name, w)),
+        }
+    }
+    // Helpers: the functions the stencils call, and those they call.
+    let deps = |rs: &[Reloc]| -> Vec<usize> { rs.iter().filter(|r| r.kind == K_HELPER).map(|r| (r.arg >> 32) as usize).collect() };
+    let mut helpers: BTreeMap<usize, Result<Vec<Reloc>, String>> = BTreeMap::new();
+    let mut work: Vec<usize> = found.iter().flat_map(|f| deps(&f.3)).collect();
+    while let Some(h) = work.pop() {
+        if helpers.contains_key(&h) {
             continue;
         }
+        let r = cx.relocs(&elf, h, false);
+        if let Ok(rs) = &r {
+            work.extend(deps(rs));
+        }
+        helpers.insert(h, r);
+    }
+    // A helper that calls one that cannot be used cannot be used either.
+    loop {
+        let bad: Vec<(usize, String)> = helpers
+            .iter()
+            .filter_map(|(h, r)| {
+                let rs = r.as_ref().ok()?;
+                let d = deps(rs).into_iter().find(|d| helpers[d].is_err())?;
+                Some((*h, format!("calls {}: {}", elf.sections[d].name, helpers[&d].as_ref().err().unwrap())))
+            })
+            .collect();
+        if bad.is_empty() {
+            break;
+        }
+        for (h, why) in bad {
+            helpers.insert(h, Err(why));
+        }
+    }
+    // The helper code: each helper once, 16-byte aligned.
+    let mut hcode: Vec<u8> = Vec::new();
+    let mut hbase: HashMap<usize, usize> = HashMap::new();
+    let mut hrelocs: Vec<Reloc> = Vec::new();
+    for (h, r) in &helpers {
+        let Ok(rs) = r else { continue };
+        let sec = &elf.sections[*h];
+        while hcode.len() % 16 != 0 {
+            hcode.push(0xcc);
+        }
+        hbase.insert(*h, hcode.len());
+        for rl in rs {
+            hrelocs.push(Reloc { off: rl.off + hcode.len() as u32, ..*rl });
+        }
+        hcode.extend_from_slice(&elf.data[sec.off..sec.off + sec.size]);
+    }
+    let resolve = |rl: &mut Reloc| {
+        if rl.kind == K_HELPER {
+            rl.arg = hbase[&((rl.arg >> 32) as usize)] as u64 + (rl.arg & 0xffff_ffff);
+        }
+    };
+    hrelocs.iter_mut().for_each(resolve);
+    let mut code: Vec<u8> = Vec::new();
+    let mut relocs: Vec<Reloc> = Vec::new();
+    // Per stencil index: (code offset, length, first reloc, reloc count,
+    // trim distance or -1).
+    let mut stencils: BTreeMap<u32, (usize, usize, usize, usize, i64)> = BTreeMap::new();
+    for (idx, name, si, mut rs) in found {
+        if let Some(d) = deps(&rs).into_iter().find(|d| helpers[d].is_err()) {
+            rejected.push((name, format!("calls {}: {}", elf.sections[d].name, helpers[&d].as_ref().err().unwrap())));
+            continue;
+        }
+        rs.iter_mut().for_each(resolve);
+        let sec = &elf.sections[si];
+        let bytes = &elf.data[sec.off..sec.off + sec.size];
         // The stencil ends in `jmp __jit.n.D`: the copy can drop it when
         // the code for pc + D follows.
         let n = bytes.len();
@@ -276,6 +370,7 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         code.extend_from_slice(bytes);
         relocs.extend(rs);
     }
+    let Cx { syms, tls, rodata, .. } = cx;
     if !stencils.contains_key(&nops) {
         let why = rejected.iter().find(|r| r.0 == "<exit>").map(|r| r.1.clone()).unwrap_or_default();
         return Err(format!("the exit stencil is missing ({})", why));
@@ -294,6 +389,14 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         .map(|r| format!("{{ i32, i16, i16, i64, i64 }} {{ i32 {}, i16 {}, i16 {}, i64 {}, i64 {} }}", r.off, r.ty, r.kind, r.addend, r.arg as i64))
         .collect();
     let _ = writeln!(ir, "@loimi_jit_relocs = constant [{} x {{ i32, i16, i16, i64, i64 }}] [{}]", rl.len(), rl.join(", "));
+    let hl: Vec<String> = hrelocs
+        .iter()
+        .map(|r| format!("{{ i32, i16, i16, i64, i64 }} {{ i32 {}, i16 {}, i16 {}, i64 {}, i64 {} }}", r.off, r.ty, r.kind, r.addend, r.arg as i64))
+        .collect();
+    let _ = writeln!(ir, "@loimi_jit_hcode = constant [{} x i8] c\"{}\", align 16", hcode.len().max(1), bytes_lit(if hcode.is_empty() { &[0] } else { &hcode }));
+    let _ = writeln!(ir, "@loimi_jit_hcode_len = constant i64 {}", hcode.len());
+    let _ = writeln!(ir, "@loimi_jit_hrelocs = constant [{} x {{ i32, i16, i16, i64, i64 }}] [{}]", hl.len(), hl.join(", "));
+    let _ = writeln!(ir, "@loimi_jit_nhrelocs = constant i32 {}", hl.len());
     let mut st = Vec::new();
     for i in 0..=nops {
         let (o, l, r, nr, t, present) = match stencils.get(&i) {
@@ -330,5 +433,5 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     if !tls.is_empty() && !known.contains("llvm.threadlocal.address.p0") {
         let _ = writeln!(ir, "declare ptr @llvm.threadlocal.address.p0(ptr)");
     }
-    Ok(Tables { ir, rejected, count: stencils.len(), bytes: code.len() })
+    Ok(Tables { ir, rejected, count: stencils.len(), bytes: code.len(), helper_bytes: hcode.len(), helpers: hbase.len() })
 }

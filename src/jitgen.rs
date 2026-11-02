@@ -65,6 +65,74 @@ pub fn jit_vm(p: &Program) -> Result<usize, String> {
     }
 }
 
+/// Whether `g` emits code that counts for the JIT (and enters compiled
+/// code directly): a counting copy or a stencil.
+pub fn counting(g: &FnGen) -> bool {
+    g.jit_count || g.stencil.is_some()
+}
+
+/// The symbol of a function's counting copy.
+pub fn counting_symbol(sym: &str) -> String {
+    format!("{}.jc", sym)
+}
+
+/// The handler-convention function `fid` as a direct tail call from `g`
+/// reaches it: its counting copy from counting code, if it has one.
+pub fn callee_symbol(g: &FnGen, fid: FnId) -> String {
+    let sym = &g.p().fns[fid as usize].symbol;
+    if counting(g) && g.cg.jit_counted.contains(&fid) { counting_symbol(sym) } else { sym.clone() }
+}
+
+/// The functions of vm `vi` that get a counting copy in a JIT build: op
+/// handlers and shared `-> never` functions that make a jump the JIT
+/// counts or intercepts (a call, a return, a label jump) or a `become`
+/// (cold blocks included), and those that tail-call one of them directly.
+/// Everything else dispatches through the table, which the runtime points
+/// at the counting copies when the JIT is on. With the JIT off the
+/// interpreter is therefore the default build's: the copies are never
+/// reached. `on raise` does not count: its jumps (to a handler) dispatch
+/// normally, and reach compiled code through the enter handler.
+pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
+    let vd = &p.vms[vi];
+    let mut refs: Vec<(FnId, Vec<FnId>)> = Vec::new();
+    let mut out = std::collections::HashSet::new();
+    for (fid, f) in p.fns.iter().enumerate() {
+        if f.vm != Some(vi as u32) || !matches!(f.vm_role, VmRole::Handler(_) | VmRole::Shared(_)) {
+            continue;
+        }
+        let Some(body) = &f.body else { continue };
+        let pc_local = f.vm_state[vd.pc_idx];
+        let mut base = false;
+        let mut callees = Vec::new();
+        crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
+            TK::Vm(TVm::Jump(t)) => {
+                if !matches!(jump_kind(t, pc_local), JumpKind::Const(_)) {
+                    base = true;
+                }
+            }
+            TK::Vm(TVm::Become(..)) => base = true,
+            TK::Vm(TVm::Shared(c, ..)) => callees.push(*c),
+            TK::Vm(TVm::Chain(k)) => callees.push(vd.ops[*k as usize].fid),
+            _ => {}
+        });
+        if base {
+            out.insert(fid as FnId);
+        }
+        refs.push((fid as FnId, callees));
+    }
+    loop {
+        let n = out.len();
+        for (f, cs) in &refs {
+            if cs.iter().any(|c| out.contains(c)) {
+                out.insert(*f);
+            }
+        }
+        if out.len() == n {
+            return out;
+        }
+    }
+}
+
 /// The opcode the JIT writes over instructions that have compiled code:
 /// the highest one no op uses.
 pub fn enter_opcode(vd: &VmDef) -> u32 {
@@ -220,21 +288,14 @@ pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
     g.label(&no);
 }
 
-/// Hot counting before a dispatch to `target` (JIT builds, interpreter
-/// and stencils): decrement the counter of the target's hash slot; at
+/// Hot counting before a dispatch to `target` (counting copies and
+/// stencils): decrement the counter of the target's hash slot; at
 /// zero, continue in `Vm.jit_hot`, which may compile the code there.
 /// `backward_only`: count only if the target is at or before pc (loops).
 /// Returns with the insertion point on the path that dispatches normally.
 pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
     let hg = g.vm.clone().unwrap();
     let go = g.fresh_label("hotgo");
-    // Nothing to count with the JIT off: a load and a predictable branch
-    // instead of a read-modify-write that loops would carry.
-    let on = g.inst("load i8, ptr @loimi_jit_on");
-    let on = g.inst(format!("icmp ne i8 {}, 0", on));
-    let cnt0 = g.fresh_label("hoton");
-    g.cond_br(&on, &cnt0, &go);
-    g.label(&cnt0);
     if backward_only {
         let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
         let back = g.inst(format!("icmp ule ptr {}, {}", target, pc));
@@ -300,7 +361,6 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
         pc = vd.pc_idx,
     );
     let _ = writeln!(globals, "@loimi_jit_entries = external global ptr");
-    let _ = writeln!(globals, "@loimi_jit_on = external global i8");
     let _ = writeln!(globals, "@loimi_jit_hotcount = external global [{} x i16]", HOT_SLOTS);
     let _ = writeln!(fns, "declare void @loimi_jit_hot(ptr)\ndeclare void @loimi_jit_become(ptr)");
     // Per opcode: { the size of its first word's instruction (a super's
@@ -415,15 +475,37 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
     cg.stencils = out;
 }
 
-/// The stencil module: the interpreter's IR with every definition made
-/// `available_externally` (inlinable, but referenced by name, so the
-/// stencils call the interpreter's own functions and use its globals),
-/// plus the stencils.
+/// The stencil module: the interpreter's IR, plus the stencils.
+/// - Globals and handler-convention functions (cold blocks, `on raise`,
+///   shared `-> never` functions) become `available_externally`: the
+///   stencils use the interpreter's own, by name.
+/// - Other functions (helpers) stay `internal`. The ones the stencils call
+///   and do not inline are compiled into the object, and `elf.rs` turns
+///   them into helper code that the JIT copies once. The interpreter
+///   therefore never has to take a helper's address for the stencils,
+///   which would change how LLVM inlines it there.
+/// - Other definitions (`main`, exports) become `available_externally`,
+///   so that only what the stencils reach is compiled.
 pub fn stencil_module(ir: &str, stencils: &str) -> String {
     let mut out = String::with_capacity(ir.len() + stencils.len());
     for line in ir.lines() {
         if let Some(rest) = line.strip_prefix("define internal ") {
-            out.push_str("define available_externally dso_local ");
+            if rest.starts_with("preserve_nonecc ") {
+                out.push_str("define available_externally dso_local ");
+                out.push_str(rest);
+            } else {
+                // No jump tables: they are data with relocations.
+                out.push_str("define internal ");
+                match rest.strip_suffix('{') {
+                    Some(head) => {
+                        out.push_str(head);
+                        out.push_str("\"no-jump-tables\"=\"true\" {");
+                    }
+                    None => out.push_str(rest),
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("define ") {
+            out.push_str("define available_externally ");
             out.push_str(rest);
         } else if line.starts_with('@') && line.contains(" = internal ") {
             // dso_local: the stencils address the program's symbols

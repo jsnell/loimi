@@ -235,9 +235,11 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, s
     ir.push_str(&t.ir);
     if std::env::var_os("LOIMI_JIT_REPORT").is_some() {
         eprintln!(
-            "jit-stencils: {} stencils, {} bytes of code, built in {:.2} s",
+            "jit-stencils: {} stencils, {} bytes of code, {} helpers ({} bytes), built in {:.2} s",
             t.count,
             t.bytes,
+            t.helpers,
+            t.helper_bytes,
             t0.elapsed().as_secs_f64()
         );
         for (op, why) in &t.rejected {
