@@ -15,9 +15,9 @@ differs from the design.
 **Results so far.** `examples/mini` implements a Lua 5.4 subset
 ([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
 from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
-0.36–0.76× of Lua's time. On 11 of them it is faster than LuaJIT's
-hand-written assembly interpreter (`luajit -joff`), and within 8% of it
-on the other three.
+0.36–0.76× of Lua's time. It is also faster than LuaJIT's hand-written
+assembly interpreter (`luajit -joff`) on 11 of them, and within 8% on
+the other three.
 See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
 
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on

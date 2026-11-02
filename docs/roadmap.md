@@ -8,8 +8,11 @@ Progress (2026-11-02):
 - M7 has two proof interpreters, `examples/mini` (a Lua 5.4 subset) and
   `examples/scheme` (an R7RS-small subset).
 - **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
-  clean-room benchmarks, by 0.40–0.97× of Lua's time. It is within 10% of
-  LuaJIT's interpreter (`-joff`) or faster on 10 of them. See
+  clean-room benchmarks, by 0.36–0.76× of Lua's time.
+- **The stretch goal is met.** Mini is faster than LuaJIT's interpreter
+  (`-joff`) on 11 of the 14, and within 8% on the rest.
+- MiniJS beats `node --jitless` and QuickJS on all 14 of its clean-room
+  benchmarks. See
   [`bench/mini/RESULTS.md`](../bench/mini/RESULTS.md).
 
 See [`status.md`](status.md) for details.
