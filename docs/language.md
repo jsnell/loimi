@@ -1346,12 +1346,12 @@ family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
             dst = unsafe { o.slot_unchecked(cache.slot) };   // shape match implies slot is in range
             next
         }
-        cold { become generic; redo }
+        cold { become GETPROP; redo }
     }
 }
 ```
 
-The `generic` member is what the compiler emits. Specialized members are only
+The `generic` member, named after the family (`become GETPROP`), is what the compiler emits. Specialized members are only
 reached through `become`. `Vm.deopt(v)` maps every member back to
 `generic`, for debuggers and for code serialization: it rewrites each
 instruction word to its family's generic op, splits superinstructions

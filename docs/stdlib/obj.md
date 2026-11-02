@@ -240,13 +240,13 @@ family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
         if let Some(o) = Model.as_object(obj) and o.shape.id == cache.shape {
             dst = unsafe { o.inline.at_unchecked(cache.slot.index) }; next
         }
-        cold { Model.ic.on_miss(&cache); become generic; redo }      // on_miss counts misses and picks poly/mega
+        cold { Model.ic.on_miss(&cache); become GETPROP; redo }      // on_miss counts misses and picks poly/mega
     }
     GETPROP_OUT {
         if let Some(o) = Model.as_object(obj) and o.shape.id == cache.shape {
             dst = unsafe { o.overflow.unwrap_unchecked().at_unchecked(cache.slot.index) }; next
         }
-        cold { Model.ic.on_miss(&cache); become generic; redo }
+        cold { Model.ic.on_miss(&cache); become GETPROP; redo }
     }
 }
 ```
