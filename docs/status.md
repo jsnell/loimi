@@ -180,8 +180,8 @@ rejected (run by `cargo test`).
   it offers a generic `Obj<V>` (or the interpreter declares its own
   object and slot-array types) and a generic `Model` over them; keys are u64 symbol ids; attributes,
   elements and global property cells are not built. Shape ids are never
-  reused, so inline caches need no reset after a collection. See the
-  "As implemented" notes in [`stdlib.md`](stdlib.md) and
+  reused, so inline caches need no reset after a collection. See
+  [`stdlib.md`](stdlib.md) and
   [`stdlib/obj.md`](stdlib/obj.md#as-implemented).
 - **`inline for`** is token-level expansion: values are token sequences
   (so operators like `+` work), and `#var` makes an identifier from a

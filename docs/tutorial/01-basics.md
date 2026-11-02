@@ -172,7 +172,8 @@ if you want the cleanup next to the allocation.
 The rest of the standard library is aimed at interpreters: `std.lex`,
 `std.parse`, `std.diag`, `std.num`, `std.bc`, `std.gc`, `std.obj`. The
 next chapters use most of them. [`docs/stdlib.md`](../stdlib.md)
-describes each one, with "As implemented" notes on what exists.
+describes each one: first the API that exists, then a "Design (not
+built)" part you should not plan around.
 
 ## What you get, and what you don't
 
