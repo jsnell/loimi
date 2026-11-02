@@ -746,7 +746,8 @@ pub vm JS {
     }
     /// `%` with a positive Int divisor is exact in integers when the
     /// dividend is integral (an Int, or a Num below 2^53).
-    op MOD(dst: reg, a: reg, b: reg) : ABC {
+    inline for (name, bkind) in [("MOD", reg), ("MODK", kst)] {
+    op #name(dst: reg, a: reg, b: bkind) : ABC {
         if let Int(y) = b and y > 0 {
             if let Int(x) = a and x >= 0 { dst = Int(x % y); next }
             var xi: i64 = 0;
@@ -763,6 +764,7 @@ pub vm JS {
         }
         if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
         cold { dst = arith(ctx, 4, a, b)?; next }
+    }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
         cold { dst = arith(ctx, 5, a, b)?; next }
@@ -793,8 +795,12 @@ pub vm JS {
         dst = Int(!int32(a));
         next
     }
-    inline for (name, code) in [("BAND", 0), ("BOR", 1), ("BXOR", 2), ("SHL", 3), ("SHR", 4), ("USHR", 5)] {
-        op #name(dst: reg, a: reg, b: reg) : ABC {
+    // The K forms take an Int constant (`h << 5`, `x | 0`, `i & 255`).
+    inline for (name, code, bkind) in [
+        ("BAND", 0, reg), ("BOR", 1, reg), ("BXOR", 2, reg), ("SHL", 3, reg), ("SHR", 4, reg), ("USHR", 5, reg),
+        ("BANDK", 0, kst), ("BORK", 1, kst), ("BXORK", 2, kst), ("SHLK", 3, kst), ("SHRK", 4, kst), ("USHRK", 5, kst),
+    ] {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
             if let (Int(x), Int(y)) = (a, b) {
                 if code == 0 { dst = Int(x & y); next }
                 if code == 1 { dst = Int(x | y); next }

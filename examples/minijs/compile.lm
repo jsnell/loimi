@@ -773,6 +773,31 @@ g.closure(n.fun, dst);
                 }
             }
             if n.op == T.Instanceof { fail(n.line, "instanceof is not supported"); }
+            // Bit operations and `%` with an Int constant.
+            let kop = n.op == T.Amp or n.op == T.Pipe or n.op == T.Caret or n.op == T.Shl or n.op == T.Shr or n.op == T.UShr or n.op == T.Percent;
+            if kop and n.b.kind == K.Num and let Int(_) = value.number(n.b.num) {
+                let a = g.any(n.a);
+                let k = g.konst(value.number(n.b.num));
+                if k < 256 {
+                    let (d, x, y) = (dst as u8, a as u8, k as u8);
+                    match n.op {
+                        Amp => g.emit(JS.BANDK(d, x, y)),
+                        Pipe => g.emit(JS.BORK(d, x, y)),
+                        Caret => g.emit(JS.BXORK(d, x, y)),
+                        Shl => g.emit(JS.SHLK(d, x, y)),
+                        Shr => g.emit(JS.SHRK(d, x, y)),
+                        UShr => g.emit(JS.USHRK(d, x, y)),
+                        _ => g.emit(JS.MODK(d, x, y)),
+                    };
+                    g.reset(m);
+                    return;
+                }
+                let b = g.temp();
+                g.load_const(value.number(n.b.num), b);
+                g.arith(n.op, dst, a, b);
+                g.reset(m);
+                return;
+            }
             let a = g.any_before(n.a, n.b);
             let b = g.any(n.b);
             g.arith(n.op, dst, a, b);
