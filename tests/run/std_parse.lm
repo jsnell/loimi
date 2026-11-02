@@ -1,0 +1,277 @@
+// std.parse: a Pratt parser for a Lua-like expression grammar, used twice
+// (building S-expressions and evaluating), with tokens from std.lex and
+// errors rendered by std.diag.
+
+import std.io;
+import std.diag;
+import std.lex;
+import std.mem;
+import std.num;
+import std.parse;
+import std.text;
+
+enum T { Eof, Num, Name, Plus, Minus, Star, Slash, Caret, Concat, Eq, Lt, And, Or, Not, LParen, RParen }
+
+/// Parser state: the cursor, the current token, and the operator table
+/// (which `atom` needs for parenthesized expressions).
+struct P<E> {
+    cur: lex.Cursor,
+    ops: lex.OpTable<T>,
+    kws: lex.Keywords<T>,
+    kind: T,
+    start: u64,
+    value: f64,
+    /// Calls of the before_rhs hook.
+    hooks: i64,
+    arena: mem.Arena,
+    pratt: *parse.Pratt<P<E>, T, E, lex.Error>,
+}
+
+fn P<E>.advance(p: *P<E>) -> Result<(), lex.Error> {
+    p.cur.skip_trivia()?;
+    p.start = p.cur.pos;
+    if p.cur.at_end() { p.kind = T.Eof; return Ok(()); }
+    if let Some(name) = p.cur.ident() { p.kind = p.kws.get(name) ?? T.Name; return Ok(()); }
+    if p.cur.at_number() {
+        p.kind = T.Num;
+        p.value = match p.cur.number()? { Int(i) => i as f64, Float(f) => f };
+        return Ok(());
+    }
+    if let Some(k) = p.ops.eat(&p.cur) { p.kind = k; return Ok(()); }
+    Err(p.cur.error_here("unexpected character"))
+}
+
+fn P<E>.error(p: *P<E>, msg: str) -> lex.Error {
+    var hi = p.cur.pos;
+    if hi == p.start { hi += 1; }
+    lex.Error { span: diag.span(p.cur.file, p.start, hi), msg: msg }
+}
+
+fn P<E>.text(p: *P<E>) -> str { p.cur.src[p.start..p.cur.pos] }
+
+fn new_parser<E>(src: str, file: u32) -> P<E> {
+    var p: P<E> = P {
+        cur: lex.Cursor.new(src, file, lex.lua()), ops: lex.OpTable.new(), kws: lex.Keywords.new(),
+        kind: T.Eof, start: 0, value: 0.0, hooks: 0, arena: mem.Arena.new(), pratt: 0 as *parse.Pratt<P<E>, T, E, lex.Error>,
+    };
+    let ops = ["+", "-", "*", "/", "^", "..", "==", "<", "(", ")"];
+    let kinds = [T.Plus, T.Minus, T.Star, T.Slash, T.Caret, T.Concat, T.Eq, T.Lt, T.LParen, T.RParen];
+    for i in 0..ops.len { p.ops.add(ops[i], kinds[i]); }
+    p.kws.add("and", T.And);
+    p.kws.add("or", T.Or);
+    p.kws.add("not", T.Not);
+    p
+}
+
+/// Lua's precedence levels.
+fn lua_operators<E>(pr: *parse.Pratt<P<E>, T, E, lex.Error>) {
+    pr.infix_left(T.Or, 1);
+    pr.infix_left(T.And, 2);
+    pr.infix_left(T.Eq, 3);
+    pr.infix_left(T.Lt, 3);
+    pr.infix_right(T.Concat, 5);
+    pr.infix_left(T.Plus, 6);
+    pr.infix_left(T.Minus, 6);
+    pr.infix_left(T.Star, 7);
+    pr.infix_left(T.Slash, 7);
+    pr.prefix(T.Minus, 8);
+    pr.prefix(T.Not, 8);
+    pr.infix_right(T.Caret, 10);
+}
+
+fn peek<E>(p: *P<E>) -> T { p.kind }
+
+fn advance<E>(p: *P<E>) -> Result<(), lex.Error> { p.advance() }
+
+/// `( expr )`, shared by both instantiations.
+fn paren<E>(p: *P<E>) -> Result<E, lex.Error> {
+    p.advance()?;
+    let e = p.pratt.expr(p)?;
+    if p.kind != T.RParen { return Err(p.error("expected ')'")); }
+    p.advance()?;
+    Ok(e)
+}
+
+// ── instantiation 1: S-expressions (E = str) ────────────────────────
+
+fn op_text(k: T) -> str {
+    match k {
+        Plus => "+", Minus => "-", Star => "*", Slash => "/", Caret => "^", Concat => "..",
+        Eq => "==", Lt => "<", And => "and", Or => "or", Not => "not", _ => "?",
+    }
+}
+
+fn sx_atom(p: *P<str>) -> Result<str, lex.Error> {
+    if p.kind == T.LParen { return paren(p); }
+    if p.kind != T.Num and p.kind != T.Name { return Err(p.error("expected an expression")); }
+    let s = p.arena.str(p.text());
+    p.advance()?;
+    Ok(s)
+}
+
+fn sx_unary(p: *P<str>, op: T, e: str) -> Result<str, lex.Error> {
+    var b = text.StrBuf.new();
+    b.push('(');
+    b.push_str(op_text(op));
+    b.push(' ');
+    b.push_str(e);
+    b.push(')');
+    let s = p.arena.str(b.as_str());
+    b.free();
+    Ok(s)
+}
+
+fn sx_binary(p: *P<str>, op: T, l: str, r: str) -> Result<str, lex.Error> {
+    var b = text.StrBuf.new();
+    b.push('(');
+    b.push_str(op_text(op));
+    b.push(' ');
+    b.push_str(l);
+    b.push(' ');
+    b.push_str(r);
+    b.push(')');
+    let s = p.arena.str(b.as_str());
+    b.free();
+    Ok(s)
+}
+
+/// Counts its calls, to show the hook runs once per infix operator.
+fn sx_before(p: *P<str>, op: T, l: str) -> Result<str, lex.Error> {
+    p.hooks += 1;
+    Ok(l)
+}
+
+fn show(sm: *diag.SourceMap, src: str) { show_with(sm, src, false); }
+
+/// Print the S-expression for `src` (and the number of before_rhs calls
+/// if `hook`), or the error.
+fn show_with(sm: *diag.SourceMap, src: str, hook: bool) {
+    let f = sm.add("expr", src);
+    var p: P<str> = new_parser(src, f);
+    var pr: parse.Pratt<P<str>, T, str, lex.Error> = parse.Pratt.new(peek, advance, sx_atom, sx_unary, sx_binary);
+    if hook { pr.before_rhs = Some(sx_before); }
+    lua_operators(&pr);
+    p.pratt = &pr;
+    let r: Result<str, lex.Error> = match p.advance() {
+        Ok(_) => match pr.expr(&p) {
+            Ok(e) => if p.kind == T.Eof { Ok(e) } else { Err(p.error("unexpected token after expression")) },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(e) => {
+            io.print(e);
+            if hook { io.print(" hooks: "); io.print_int(p.hooks); }
+            io.println("");
+        }
+        Err(e) => {
+            var d = e.diag();
+            var out = text.StrBuf.new();
+            sm.render(&d, &out);
+            io.print(out.as_str());
+        }
+    }
+    pr.free();
+}
+
+// ── instantiation 2: evaluation (E = f64) ───────────────────────────
+
+fn ev_atom(p: *P<f64>) -> Result<f64, lex.Error> {
+    if p.kind == T.LParen { return paren(p); }
+    if p.kind != T.Num { return Err(p.error("expected a number")); }
+    let v = p.value;
+    p.advance()?;
+    Ok(v)
+}
+
+fn ev_unary(p: *P<f64>, op: T, x: f64) -> Result<f64, lex.Error> {
+    Ok(if op == T.Minus { 0.0 - x } else { if x == 0.0 { 1.0 } else { 0.0 } })
+}
+
+fn pow(x: f64, n: f64) -> f64 {
+    var r = 1.0;
+    var i = 0.0;
+    while i < n { r = r * x; i += 1.0; }
+    r
+}
+
+fn ev_binary(p: *P<f64>, op: T, a: f64, b: f64) -> Result<f64, lex.Error> {
+    Ok(match op {
+        Plus => a + b,
+        Minus => a - b,
+        Star => a * b,
+        Slash => a / b,
+        Caret => pow(a, b),
+        Lt => if a < b { 1.0 } else { 0.0 },
+        Eq => if a == b { 1.0 } else { 0.0 },
+        _ => return Err(p.error("operator not supported by the evaluator")),
+    })
+}
+
+fn eval(src: str) {
+    var p: P<f64> = new_parser(src, 0);
+    var pr: parse.Pratt<P<f64>, T, f64, lex.Error> = parse.Pratt.new(peek, advance, ev_atom, ev_unary, ev_binary);
+    lua_operators(&pr);
+    p.pratt = &pr;
+    var b = text.StrBuf.new();
+    b.push_str(src);
+    b.push_str(" = ");
+    match p.advance() {
+        Ok(_) => match pr.expr(&p) {
+            Ok(v) => num.write_shortest(&b, v),
+            Err(e) => b.push_str(e.msg),
+        },
+        Err(e) => b.push_str(e.msg),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn main() {
+    var sm = diag.SourceMap.new();
+    show(&sm, "1 + 2 * 3");
+    show(&sm, "1 - 2 - 3");
+    show(&sm, "2 ^ 3 ^ 2");
+    show(&sm, "-x ^ 2");
+    show(&sm, "a .. b .. c + 1");
+    show(&sm, "(1 + 2) * 3");
+    show_with(&sm, "not a == b or c < d and e", true);
+    show(&sm, "- - x");
+    show(&sm, "1 +");
+    show(&sm, "(1 + 2");
+    show(&sm, "1 2");
+    show(&sm, "1 $ 2");
+    eval("1 + 2 * 3 - 4 / 8");
+    eval("2 ^ 3 ^ 2");
+    eval("-(2 + 3) * 2 < 0");
+    eval("1 .. 2");
+}
+// expect: (+ 1 (* 2 3))
+// expect: (- (- 1 2) 3)
+// expect: (^ 2 (^ 3 2))
+// expect: (- (^ x 2))
+// expect: (.. a (.. b (+ c 1)))
+// expect: (* (+ 1 2) 3)
+// expect: (or (== (not a) b) (and (< c d) e)) hooks: 4
+// expect: (- (- x))
+// expect: error: expected an expression
+// expect:   --> expr:1:4
+// expect:     1 | 1 +
+// expect:       |    ^
+// expect: error: expected ')'
+// expect:   --> expr:1:7
+// expect:     1 | (1 + 2
+// expect:       |       ^
+// expect: error: unexpected token after expression
+// expect:   --> expr:1:3
+// expect:     1 | 1 2
+// expect:       |   ^
+// expect: error: unexpected character
+// expect:   --> expr:1:3
+// expect:     1 | 1 $ 2
+// expect:       |   ^
+// expect: 1 + 2 * 3 - 4 / 8 = 6.5
+// expect: 2 ^ 3 ^ 2 = 512
+// expect: -(2 + 3) * 2 < 0 = 1
+// expect: 1 .. 2 = operator not supported by the evaluator

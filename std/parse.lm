@@ -1,0 +1,131 @@
+// Parsing helpers: a Pratt (precedence-climbing) expression parser driven
+// by a table of binding powers, calling back into the user's parser
+// through function pointers.
+//
+// Type parameters, used throughout:
+//   P  the user's parser state (the hooks receive a `*P`)
+//   K  the token kind: an enum without payloads (it is used as a table
+//      index through `k as u64`)
+//   E  the expression result: an AST node, an expression descriptor as in
+//      a single-pass compiler, or a value for an evaluator
+//   X  the error type
+//
+// Binding powers: an infix operator has a left power and a right power.
+// The operator binds if its left power is greater than the current
+// minimum, and its right operand is parsed with the right power as the
+// new minimum. Equal powers make the operator left-associative; a right
+// power one lower makes it right-associative (`infix_left`, `infix_right`).
+// Powers must be at least 1; 0 means "not an operator". A prefix operator
+// parses its operand with its own power, so unary minus at 12 binds
+// tighter than `*` at 10 but looser than right-associative `^` at 14:
+// `-x ^ 2` is `-(x ^ 2)`, as in Lua.
+
+import std.mem;
+
+/// The binding powers of an infix operator.
+pub struct Prec { left: u32, right: u32 }
+
+/// An operator table plus the hooks the driver calls.
+pub struct Pratt<P, K, E, X> {
+    /// Infix binding powers, indexed by `kind as u64`.
+    infix_bp: mem.Vec<Prec>,
+    /// Prefix binding powers, indexed by `kind as u64` (0: not prefix).
+    prefix_bp: mem.Vec<u32>,
+    /// The kind of the current token.
+    peek: fn(*P) -> K,
+    /// Consume the current token.
+    advance: fn(*P) -> Result<(), X>,
+    /// Parse an operand that does not start with a prefix operator: a
+    /// literal, a name, a parenthesized expression, and any postfix
+    /// suffixes (calls, indexing, field access).
+    atom: fn(*P) -> Result<E, X>,
+    /// Combine a prefix operator (already consumed) with its operand.
+    unary: fn(*P, K, E) -> Result<E, X>,
+    /// Combine `lhs op rhs`.
+    binary: fn(*P, K, E, E) -> Result<E, X>,
+    /// Optional: called after an infix operator is consumed and before its
+    /// right operand is parsed, with the left operand; returns the left
+    /// operand to use. Single-pass compilers use this to put the left
+    /// operand in a register, or to emit the jump of `and`/`or`.
+    before_rhs: ?fn(*P, K, E) -> Result<E, X>,
+}
+
+/// A parser with no operators yet. `unary` is only called for kinds given
+/// a prefix power with `prefix`.
+pub fn Pratt<P, K, E, X>.new(
+    peek: fn(*P) -> K,
+    advance: fn(*P) -> Result<(), X>,
+    atom: fn(*P) -> Result<E, X>,
+    unary: fn(*P, K, E) -> Result<E, X>,
+    binary: fn(*P, K, E, E) -> Result<E, X>,
+) -> Pratt<P, K, E, X> {
+    Pratt {
+        infix_bp: mem.Vec.new(), prefix_bp: mem.Vec.new(),
+        peek: peek, advance: advance, atom: atom, unary: unary, binary: binary, before_rhs: None,
+    }
+}
+
+/// Make `kind` an infix operator with the given binding powers.
+pub fn Pratt<P, K, E, X>.infix(pr: *Pratt<P, K, E, X>, kind: K, left: u32, right: u32) {
+    let i = kind as u64;
+    while pr.infix_bp.len <= i { pr.infix_bp.push(Prec { left: 0, right: 0 }); }
+    pr.infix_bp.set(i, Prec { left: left, right: right });
+}
+
+/// A left-associative infix operator: `a - b - c` is `(a - b) - c`.
+pub fn Pratt<P, K, E, X>.infix_left(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) { pr.infix(kind, bp, bp); }
+
+/// A right-associative infix operator (bp >= 2): `a ^ b ^ c` is `a ^ (b ^ c)`.
+pub fn Pratt<P, K, E, X>.infix_right(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) { pr.infix(kind, bp, bp - 1); }
+
+/// Make `kind` a prefix operator whose operand is parsed at power `bp`.
+pub fn Pratt<P, K, E, X>.prefix(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) {
+    let i = kind as u64;
+    while pr.prefix_bp.len <= i { pr.prefix_bp.push(0); }
+    pr.prefix_bp.set(i, bp);
+}
+
+/// The infix powers of `kind` (left 0 if it is not an infix operator).
+pub fn Pratt<P, K, E, X>.infix_of(pr: *Pratt<P, K, E, X>, kind: K) -> Prec {
+    let i = kind as u64;
+    if i < pr.infix_bp.len { pr.infix_bp.at(i) } else { Prec { left: 0, right: 0 } }
+}
+
+/// The prefix power of `kind` (0 if it is not a prefix operator).
+pub fn Pratt<P, K, E, X>.prefix_of(pr: *Pratt<P, K, E, X>, kind: K) -> u32 {
+    let i = kind as u64;
+    if i < pr.prefix_bp.len { pr.prefix_bp.at(i) } else { 0 }
+}
+
+/// Parse an expression whose operators all bind tighter than `min_bp`.
+/// Use 0 for a full expression. Hooks may call this recursively (for
+/// example for a parenthesized expression in `atom`).
+pub fn Pratt<P, K, E, X>.parse(pr: *Pratt<P, K, E, X>, p: *P, min_bp: u32) -> Result<E, X> {
+    let first = pr.peek(p);
+    let ubp = pr.prefix_of(first);
+    var lhs: E = if ubp > 0 {
+        pr.advance(p)?;
+        let operand = pr.parse(p, ubp)?;
+        pr.unary(p, first, operand)?
+    } else {
+        pr.atom(p)?
+    };
+    loop {
+        let op = pr.peek(p);
+        let b = pr.infix_of(op);
+        if b.left <= min_bp { break; }
+        pr.advance(p)?;
+        if let Some(h) = pr.before_rhs { lhs = h(p, op, lhs)?; }
+        let rhs = pr.parse(p, b.right)?;
+        lhs = pr.binary(p, op, lhs, rhs)?;
+    }
+    Ok(lhs)
+}
+
+/// Parse a full expression (`parse(p, 0)`).
+pub fn Pratt<P, K, E, X>.expr(pr: *Pratt<P, K, E, X>, p: *P) -> Result<E, X> { pr.parse(p, 0) }
+
+pub fn Pratt<P, K, E, X>.free(pr: *Pratt<P, K, E, X>) {
+    pr.infix_bp.free();
+    pr.prefix_bp.free();
+}
