@@ -158,18 +158,6 @@ fn mini_scripts() {
     }
 }
 
-/// Tests in examples/mini/tests/conformance that need standard library
-/// functions Mini does not have yet (string.*, math.*, table.*, io.*,
-/// tostring, type, assert, error, %.14g float formatting, ...).
-/// Remove entries as the library lands.
-const MINI_CONFORMANCE_SKIP: &[&str] = &[
-    "arith_float", "concat", "err_assert", "err_format_d", "gc_alloc", "lex_strings",
-    "lib_assert_error", "lib_format", "lib_io_write", "lib_math", "lib_print",
-    "lib_string_basic", "lib_table", "lib_tonumber", "lib_tostring", "lib_type",
-    "multret", "prog_algorithms", "prog_objects", "prog_strings",
-    "stmt_ipairs", "stmt_numfor", "stmt_pairs", "stmt_while",
-];
-
 /// The clean-room conformance tests (examples/mini/tests/conformance):
 /// NAME.lua must print exactly NAME.expected (output of real Lua 5.4).
 /// err_*.lua must also exit with a nonzero status; their .expected holds
@@ -191,9 +179,6 @@ fn mini_conformance() {
     let mut ran = 0;
     for f in scripts {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
-        if MINI_CONFORMANCE_SKIP.contains(&stem.as_str()) {
-            continue;
-        }
         ran += 1;
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
