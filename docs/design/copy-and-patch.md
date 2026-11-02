@@ -303,7 +303,13 @@ did not pay, section 10).
   C (`Mini.run`, `Mini.call`). This is LuaJIT's `JFUNC`/`JLOOP` patching,
   at every instruction. Words that other instructions read are left
   alone: a `then` operand word, and the later words of a super, whose
-  head may still run in the interpreter.
+  head may still run in the interpreter. Host code never sees enter
+  words: in a `--jit-stencils` build the generated readers of code words
+  (`Vm.disasm`, `op_name`, `op_size`, `label`, `set_label`, the field
+  getters, operand metadata, `Vm.verify`) first map a word through
+  `Vm.real_word`, which compares the opcode with `ENTER` and, for an
+  enter word, asks the runtime (`loimi_jit_word`: the entry index
+  records the code word it was made for) for the real word.
 - **Exits.** Compiled code leaves through the dispatch table: dynamic
   jumps, cold paths, and instructions without a stencil (their slot holds
   the exit stencil, `musttail tbl[opcode(*pc)]`). A continuation that

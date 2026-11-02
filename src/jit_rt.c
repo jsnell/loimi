@@ -121,6 +121,9 @@ static uint16_t threshold = 50;
 static struct rec **recs;
 static size_t nrecs, caprecs;
 static size_t nentries, capentries;
+/* Per entry index: the code word it was made for (see loimi_jit_word).
+ * Entry indices are never reused. */
+static uint32_t **entry_at;
 static ptrdiff_t wdelta;
 #define WR(p) ((p) + wdelta)
 static uint8_t *region, *region_end, *bump, *rodata, *helpers, *exit_code;
@@ -482,12 +485,14 @@ static void map_line(uint8_t *a, uint32_t len, uint32_t s) {
     fprintf(mapf, "%lx %lx %s%s\n", (unsigned long)(uintptr_t)a, (unsigned long)(uintptr_t)(a + len), nm, v ? "*" : "");
 }
 
-static uint32_t new_entry(void *native) {
+static uint32_t new_entry(void *native, uint32_t *at) {
     if (nentries == capentries) {
         capentries = capentries ? capentries * 2 : 4096;
         loimi_jit_entries = realloc(loimi_jit_entries, capentries * sizeof(void *));
+        entry_at = realloc(entry_at, capentries * sizeof *entry_at);
     }
     loimi_jit_entries[nentries] = native;
+    entry_at[nentries] = at;
     return (uint32_t)nentries++;
 }
 
@@ -516,7 +521,7 @@ static void sync_entries(struct rec *r) {
         int want = !(r->fl[pc] & (F_NOPATCH | F_INTERP)) && stencil_for(w) != loimi_jit_nops;
         if (want && r->ent[pc] < 0) {
             if (nentries >= (1ull << (32 - loimi_jit_op_bits))) want = 0;
-            else r->ent[pc] = (int32_t)new_entry(r->body[pc]);
+            else r->ent[pc] = (int32_t)new_entry(r->body[pc], r->code + pc);
         }
         if (want) {
             loimi_jit_entries[r->ent[pc]] = r->body[pc];
@@ -716,6 +721,24 @@ void loimi_jit_become(uint32_t *p, uint32_t opc) {
     } else {
         sync_entries(r);
     }
+}
+
+/* `Vm.real_word` (and so the generated host readers of code words:
+ * disasm, op_name, label, verify, ...): the real word of enter word w,
+ * from where its entry was made, if that word is still an enter word of
+ * that entry (a copy of a code object's words maps too, while the
+ * original is compiled); otherwise w. The record is looked up again
+ * rather than kept, as records go when their code is freed. */
+uint32_t loimi_jit_word(uint32_t w) {
+    if ((w & OPMASK) != loimi_jit_enter_op) return w;
+    uint64_t e = w >> loimi_jit_op_bits;
+    if (e >= nentries) return w;
+    uint32_t *p = entry_at[e];
+    struct rec *r = nrecs ? lookup(p) : NULL;
+    if (!r || r->state != S_COMPILED || !r->ent) return w;
+    uint64_t i = (uint64_t)(p - r->code);
+    if (r->ent[i] != (int32_t)e || !(r->fl[i] & F_ENTRY)) return w;
+    return r->w[i];
 }
 
 /* `Vm.optimize` and `Vm.deopt` rewrite words of a code object between

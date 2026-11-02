@@ -266,6 +266,40 @@ impl VmLayout {
     }
 }
 
+/// Whether host reads of code words go through the JIT: in a
+/// `--jit-stencils` build (whose vm has 32-bit words with the opcode in
+/// the low bits), compiled instructions' words are enter words, and
+/// `Vm.real_word` maps them back to the real words.
+fn maps_words(l: &VmLayout, jit: bool) -> bool {
+    jit && l.word_bits == 32 && l.op_shift == 0
+}
+
+/// The opcode of the JIT's enter words: as `jitgen::enter_opcode`, the
+/// highest opcode no op uses.
+fn enter_opcode(l: &VmLayout) -> u32 {
+    (0..1u32 << l.op_bits).rev().find(|x| !l.ops.iter().any(|o| o.opcode == *x)).unwrap_or(u32::MAX)
+}
+
+/// Source of the real word of code word expression `e` (`e` itself
+/// unless `jw`: see `maps_words`).
+fn real_src(n: &str, jw: bool, e: &str) -> String {
+    if jw {
+        format!("{n}__real_word({e})")
+    } else {
+        e.to_string()
+    }
+}
+
+/// The start of the body of a generated function taking code word `p`:
+/// rebind it to the real word, if `jw`.
+fn real_let(n: &str, jw: bool, p: &str) -> String {
+    if jw {
+        format!("let {p} = {n}__real_word({p}); ")
+    } else {
+        String::new()
+    }
+}
+
 /// Source expression decoding field (bits, shift, signed) of word `__w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
     // As in handlers: operand fields are 64-bit.
@@ -666,6 +700,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     }
     let nk = v.operands.len();
     let fail = |at: &str, reason: &str, op: &str| format!("return {n}__verr({at}, {n}__VerifyReason.{reason}, {op}, 0, {nk});");
+    let jw = maps_words(l, jit);
     let op_at = |at: &str| format!("{n}__opcode(__code[{at}]) as u64");
     let _ = writeln!(s, "{vis}fn {n}__verify({}) -> Result<{n}__Verified, {n}__VerifyError> {{", params.join(", "));
     let _ = writeln!(s, "  if __code.len == 0 {{ {} }}", fail("0", "Empty", &format!("{n}__NUM_OPS")));
@@ -685,7 +720,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 format!("if {n}__family(__code[__i + {off}]) != {} {{ {} }}", l.ops[*p].family, fail("__i", "SuperPart", &op_at("__i")))
             })
             .collect();
-        for c in l.fwd_conds(n, k, "__code[__i + {}]") {
+        for c in l.fwd_conds(n, k, &real_src(n, jw, "__code[__i + {}]")) {
             arms.push(format!("if !({c}) {{ {} }}", fail("__i", "Forward", &op_at("__i"))));
         }
         // `then OP`: the next instruction must be an OP; if this op may
@@ -730,7 +765,8 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 if let Some(c) = clause(&po.kinds[fi]) {
                     let _ = write!(
                         checks,
-                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = __code[__i + {off}]; let it = {}; if !({}) {{ return {n}__verr(__i + {off}, {n}__VerifyReason.Operand, {}, {fi}, {}); }} }} ",
+                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = {}; let it = {}; if !({}) {{ return {n}__verr(__i + {off}, {n}__VerifyReason.Operand, {}, {fi}, {}); }} }} ",
+                        real_src(n, jw, &format!("__code[__i + {off}]")),
                         decode_src(l.word_bits, *bits, *shift, *signed),
                         c,
                         po.opcode,
@@ -823,15 +859,28 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let mask = (1u64 << l.op_bits) - 1;
     let mut s = String::new();
     let vis = if v.is_pub { "pub " } else { "" };
+    let jw = maps_words(l, jit);
+    let rl = real_let(n, jw, "w");
+    // `Vm.real_word(w)`: the real word of code word w (with the JIT, a
+    // compiled instruction's word is an enter word; see maps_words).
+    if jw {
+        let _ = writeln!(
+            s,
+            "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {} {{ loimi_jit_word(w) }} else {{ w }} }}",
+            enter_opcode(l)
+        );
+    } else {
+        let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ w }}");
+    }
     if v.entries.iter().any(|e| e.effects.list.iter().any(|(_, a, _)| a.first().is_some_and(|x| x == "reenter"))) {
         // Nested runs (entries declared `uses reenter`) active on this
         // thread; each such entry adds one while it runs.
         let _ = writeln!(s, "#[thread_local]\n{vis}var {n}__depth: u32 = 0;");
     }
-    let _ = writeln!(s, "{vis}fn {n}__opcode(w: {w}) -> {w} {{ (w >> {}) & {} }}", l.op_shift, mask);
+    let _ = writeln!(s, "{vis}fn {n}__opcode(w: {w}) -> {w} {{ {rl}(w >> {}) & {} }}", l.op_shift, mask);
     let _ = writeln!(
         s,
-        "{vis}fn {n}__with_opcode(w: {w}, op: {w}) -> {w} {{ (w & !({mask} << {sh})) | ((op & {mask}) << {sh}) }}",
+        "{vis}fn {n}__with_opcode(w: {w}, op: {w}) -> {w} {{ {rl}(w & !({mask} << {sh})) | ((op & {mask}) << {sh}) }}",
         sh = l.op_shift
     );
     let _ = writeln!(s, "{vis}const {n}__NUM_OPS: u64 = {};", l.ops.len());
@@ -868,23 +917,23 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} __at + {} }}", o.name, ps.join(", "), body, size);
     }
     // Sizes and names.
-    let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
     for (i, o) in l.ops.iter().enumerate() {
         let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, i));
     }
     let _ = writeln!(s, "  _ => 1, }} }}");
     // Per word on its own: a superinstruction's first part.
-    let _ = writeln!(s, "{vis}fn {n}__base_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__base_size(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
     for (i, o) in l.ops.iter().enumerate() {
         let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, l.base(i)));
     }
     let _ = writeln!(s, "  _ => 1, }} }}");
-    let _ = writeln!(s, "{vis}fn {n}__base_op(w: {w}) -> {w} {{ match {n}__opcode(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__base_op(w: {w}) -> {w} {{ {rl}match {n}__opcode(w) {{");
     for (i, o) in l.ops.iter().enumerate() {
         let _ = writeln!(s, "  {} => {},", o.opcode, l.ops[l.base(i)].opcode);
     }
     let _ = writeln!(s, "  x => x, }} }}");
-    let _ = writeln!(s, "fn {n}__family(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
+    let _ = writeln!(s, "fn {n}__family(w: {w}) -> u64 {{ {rl}match {n}__opcode(w) {{");
     for o in &l.ops {
         let _ = writeln!(s, "  {} => {},", o.opcode, o.family);
     }
@@ -906,7 +955,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let _ = writeln!(s, "{vis}fn {n}__kind_is_label(k: u64) -> bool {{ {} }}", if labels.is_empty() { "false".into() } else { labels.join(" or ") });
     let kind_ix = |name: &str| v.operands.iter().position(|k| k.name.name == name).unwrap_or(nk);
     let per_field = |s: &mut String, fname: &str, ret: &str, none: &str, f: &dyn Fn(usize, usize) -> String| {
-        let _ = writeln!(s, "{vis}fn {n}__{fname}(w: {w}, i: u64) -> {ret} {{ match {n}__base_op(w) {{");
+        let _ = writeln!(s, "{vis}fn {n}__{fname}(w: {w}, i: u64) -> {ret} {{ {rl}match {n}__base_op(w) {{");
         for (k, o) in l.ops.iter().enumerate() {
             if !o.parts.is_empty() || o.fields.is_empty() {
                 continue;
@@ -916,7 +965,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         }
         let _ = writeln!(s, "  _ => {}, }} }}", none);
     };
-    let _ = writeln!(s, "{vis}fn {n}__operand_count(w: {w}) -> u64 {{ match {n}__base_op(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__operand_count(w: {w}) -> u64 {{ {rl}match {n}__base_op(w) {{");
     for o in &l.ops {
         if o.parts.is_empty() && !o.fields.is_empty() {
             let _ = writeln!(s, "  {} => {},", o.opcode, o.fields.len());
@@ -926,7 +975,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     per_field(&mut s, "operand_kind", "u64", &nk.to_string(), &|k, j| kind_ix(&l.ops[k].kinds[j]).to_string());
     per_field(&mut s, "operand_bits", "u64", "0", &|k, j| l.ops[k].fields[j].1.to_string());
     per_field(&mut s, "operand_signed", "bool", "false", &|k, j| l.ops[k].fields[j].3.to_string());
-    let _ = writeln!(s, "{vis}fn {n}__op_name(w: {w}) -> str {{ match {n}__opcode(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__op_name(w: {w}) -> str {{ {rl}match {n}__opcode(w) {{");
     for o in &l.ops {
         let _ = writeln!(s, "  {} => \"{}\",", o.opcode, o.name);
     }
@@ -1035,8 +1084,9 @@ fn is_label_kind(v: &VmDecl, kind: &str) -> bool {
 ///
 /// `set_label` and `label` have the shapes `std.bc` takes as its patch
 /// and jump-threading functions.
-fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
+fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let n = &v.name.name;
+    let jw = maps_words(l, jit);
     let w = format!("u{}", l.word_bits);
     let vis = if v.is_pub { "pub " } else { "" };
     let mut s = String::new();
@@ -1049,7 +1099,7 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
             labels.push((o.opcode, (bits, shift, signed)));
         }
     }
-    let _ = writeln!(s, "{vis}fn {n}__set_label(w: {w}, off: i64) -> ?{w} {{");
+    let _ = writeln!(s, "{vis}fn {n}__set_label(w: {w}, off: i64) -> ?{w} {{ {}", real_let(n, jw, "w"));
     let _ = writeln!(s, "  match {n}__opcode(w) {{");
     for (op, (bits, shift, signed)) in &labels {
         let mask = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
@@ -1071,7 +1121,7 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
     let _ = writeln!(s, "    _ => None,");
     let _ = writeln!(s, "  }}");
     let _ = writeln!(s, "}}");
-    let _ = writeln!(s, "{vis}fn {n}__label(__w: {w}) -> ?i64 {{");
+    let _ = writeln!(s, "{vis}fn {n}__label(__w: {w}) -> ?i64 {{ {}", real_let(n, jw, "__w"));
     let _ = writeln!(s, "  match {n}__opcode(__w) {{");
     for (op, (bits, shift, signed)) in &labels {
         let _ = writeln!(s, "    {op} => Some({} as i64),", decode_src(l.word_bits, *bits, *shift, *signed));
@@ -1086,9 +1136,10 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
                 let rt = if fld.signed { "i64" } else { "u64" };
                 let _ = writeln!(
                     s,
-                    "{vis}fn {n}__{}_{}(__w: {w}) -> {rt} {{ {} }}",
+                    "{vis}fn {n}__{}_{}(__w: {w}) -> {rt} {{ {}{} }}",
                     f.name.name,
                     fld.name.name,
+                    real_let(n, jw, "__w"),
                     decode_src(l.word_bits, fld.bits, shift, fld.signed)
                 );
             }
@@ -1133,8 +1184,9 @@ fn str_lit(s: &str) -> String {
 /// `bool`s, floats, and pointers in hex (`null` for 0). Invalid opcodes
 /// print as `<invalid 0x..>` (size 1), and an instruction that does not
 /// fit in the code as its name and `<truncated>`.
-fn generate_disasm(v: &VmDecl, l: &VmLayout) -> String {
+fn generate_disasm(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let n = &v.name.name;
+    let jw = maps_words(l, jit);
     let w = format!("u{}", l.word_bits);
     let wb = l.word_bits / 8;
     let vis = if v.is_pub { "pub " } else { "" };
@@ -1180,7 +1232,7 @@ fn generate_disasm(v: &VmDecl, l: &VmLayout) -> String {
     );
     // One component op, at word `__at`: name, operands, cache.
     let _ = writeln!(s, "{vis}fn {n}__disasm_op<B>(__code: []{w}, __at: u64, __out: *B) {{");
-    let _ = writeln!(s, "  let __w = __code[__at];");
+    let _ = writeln!(s, "  let __w = {};", real_src(n, jw, "__code[__at]"));
     let _ = writeln!(
         s,
         "  if {n}__opcode(__w) as u64 >= {n}__NUM_OPS {{ __out.push_str(\"<invalid \"); {n}__disasm_hex(__out, __w as u64); __out.push_str(\">\"); return; }}"
@@ -1235,14 +1287,14 @@ fn generate_disasm(v: &VmDecl, l: &VmLayout) -> String {
             let _ = write!(body, "__out.push_str(\"]\"); ");
         }
         if !body.is_empty() {
-            let _ = writeln!(s, "    {} => {{ let __w = __code[__at]; {}}}", o.opcode, body);
+            let _ = writeln!(s, "    {} => {{ let __w = {}; {}}}", o.opcode, real_src(n, jw, "__code[__at]"), body);
         }
     }
     let _ = writeln!(s, "    _ => {{}}\n  }}\n}}");
     // One instruction, with its offset; superinstructions with their parts.
     let _ = writeln!(s, "{vis}fn {n}__disasm_insn<B>(__code: []{w}, __i: u64, __out: *B) -> u64 {{");
     let _ = writeln!(s, "  if __i >= __code.len {{ return 0; }}");
-    let _ = writeln!(s, "  let __w = __code[__i];");
+    let _ = writeln!(s, "  let __w = {};", real_src(n, jw, "__code[__i]"));
     let _ = writeln!(s, "  {n}__disasm_offset(__out, __i); __out.push_str(\"  \");");
     let _ = writeln!(
         s,
@@ -1354,10 +1406,13 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.
                     src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64, pool: *u8);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\nextern \"C\" fn loimi_jit_rewritten(code: *u8);\n");
+                    if maps_words(&l, jit) {
+                        src.push_str("extern \"C\" fn loimi_jit_word(w: u32) -> u32;\n");
+                    }
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
-                src.push_str(&generate_labels(v, &l));
-                src.push_str(&generate_disasm(v, &l));
+                src.push_str(&generate_labels(v, &l, jit));
+                src.push_str(&generate_disasm(v, &l, jit));
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
                     eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
                 }

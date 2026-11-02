@@ -691,7 +691,15 @@ type-checks the mapping. From the declarations it **generates**:
   `field` of format `FMT` (`Vm.AsBx_sbx(w)`), as a `u64` or, for a
   signed field, an `i64`. A superinstruction's head word answers for its
   first part. `set_label` and `label` are the patch and jump-threading
-  functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`.
+  functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`;
+- `Vm.real_word(w)`: the instruction word that code word `w` stands
+  for. With the copy-and-patch JIT (`--jit-stencils`), compiled
+  instructions' words are *enter words* while the JIT holds the code;
+  every generated function above (and the disassembler and verifier)
+  maps a word through `real_word` first, so host code sees the real
+  words. Host code that inspects `code[i]` itself (hashing, comparing,
+  serializing) calls `Vm.real_word(code[i])`. Without the JIT it is the
+  identity and costs nothing.
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.
