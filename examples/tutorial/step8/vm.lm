@@ -477,7 +477,6 @@ pub vm Pip {
     // on the benchmarks. `Pip.optimize` fuses them after compilation. A
     // super whose part quickens turns into the super with that part's
     // new op, if there is one (GETGLOBAL_SUBK into GETGLOBAL_C_SUBK).
-    super SUBK_CALL = SUBK; CALL;
     super GETGLOBAL_SUBK = GETGLOBAL; SUBK;
     super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;
     super ADD_RET = ADD; RET;

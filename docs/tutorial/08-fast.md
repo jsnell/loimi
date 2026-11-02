@@ -232,7 +232,6 @@ declarations. On step 8:
 A **superinstruction** runs several ops with one dispatch:
 
 ```loimi
-    super SUBK_CALL = SUBK; CALL;
     super GETGLOBAL_SUBK = GETGLOBAL; SUBK;
     super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;
     super ADD_RET = ADD; RET;
@@ -253,11 +252,12 @@ original instruction, and fusion needs no control-flow analysis.
 ```
 
 `Pip.optimize` goes left to right and fuses, at each instruction, the
-longest super that starts there. `SUBK_CALL` and `GETGLOBAL_SUBK` share
-the `SUBK`, so in `GETGLOBAL; SUBK; CALL` the first one wins and
-`SUBK_CALL` does not run there; the compiler says so with a
-`super_overlap` warning. Here both pairs are frequent on their own, so
-the declarations stay.
+longest super that starts there, then moves on. That is why the
+suggested `SUBK_CALL` is not declared: it shares the `SUBK` with
+`GETGLOBAL_SUBK`, and in fib every `SUBK; CALL` is part of
+`GETGLOBAL; SUBK; CALL` (the call `fib(n - 1)`), where `GETGLOBAL_SUBK`
+takes the `SUBK` first, so `SUBK_CALL` would never run. Declaring both
+gets a `super_overlap` warning from the compiler.
 
 Quickening and supers interact: `Pip.optimize` runs on generic code, so
 it sees `GETGLOBAL; SUBK`. When the GETGLOBAL part quickens, the super's

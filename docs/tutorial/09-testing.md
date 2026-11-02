@@ -53,7 +53,7 @@ table whose handlers run some code before the real handler.
 
 ```loimi
     variant budget wraps [JMP, JF, JNLT, JNLE, JNLTK, JNLEK, JNGTK, JNGEK, JNEQ, JEQ, JNEQK, JEQK,
-                          CALL, ADDK_JMP, ADD_JMP, SUBK_CALL] {
+                          CALL, ADDK_JMP, ADD_JMP] {
         before {
             ctx.steps -= 1;
             if ctx.steps < 0 { cold { raise "step budget exhausted" } }
@@ -164,7 +164,7 @@ cd examples/tutorial/step9
 ```
 
 ```text
-3000 programs: 1887 rejected by the verifier, 572 finished, 268 raised an error, 273 ran out of steps
+3000 programs: 1861 rejected by the verifier, 572 finished, 293 raised an error, 274 ran out of steps
 ```
 
 About a third of the mutants pass the verifier, which is the useful
