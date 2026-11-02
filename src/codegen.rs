@@ -210,6 +210,7 @@ impl<'p> Codegen<'p> {
                 format!("{{ ptr {}, i64 {} }}", g, s.len())
             }
             TK::FnRef(id) => format!("@\"{}\"", p.fns[*id as usize].symbol),
+            TK::Zeroed => "zeroinitializer".into(),
             TK::Struct(es) | TK::Tuple(es) => {
                 if es.is_empty() {
                     return "zeroinitializer".into();

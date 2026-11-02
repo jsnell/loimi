@@ -1,0 +1,4 @@
+import std.text;
+struct M { n: i64, out: text.StrBuf }
+fn main() { let m = M { n: 1, ..zero }; }
+// error: `..zero` cannot set field `out` of type `StrBuf`: give it a value

@@ -1,0 +1,68 @@
+// `..zero` in struct literals, and `[]` as the empty slice.
+import std.io;
+import std.text;
+import std.diag;
+
+struct Machine {
+    name: str,
+    out: text.StrBuf,
+    sp: *i64,
+    depth: u32,
+    ratio: f64,
+    ok: bool,
+    last: ?i64,
+    regs: [u16; 4],
+    pair: (i8, ?*u8),
+    words: []u32,
+}
+
+struct Cfg { limit: i64, name: str, extra: ?u8 }
+
+const CFG: Cfg = Cfg { limit: 7, ..zero };
+var GCFG: Cfg = Cfg { ..zero };
+
+fn sum(xs: []u32) -> u64 {
+    var t: u64 = 0;
+    for i in 0..xs.len { t += xs[i] as u64; }
+    t
+}
+
+fn main() {
+    var m = Machine { out: text.StrBuf.new(), depth: 3, ..zero };
+    io.print_int(m.depth as i64);
+    io.print_int(m.name.len as i64);
+    io.print_int(m.sp as i64);
+    io.print_int(m.ratio as i64);
+    io.print_bool(m.ok);
+    io.print_bool(m.last.is_none());
+    io.print_int(m.regs[3] as i64);
+    io.print_int(m.pair.0 as i64);
+    io.print_bool(m.pair.1.is_none());
+    io.print_int(m.words.len as i64);
+    io.println("");
+    io.print_int(CFG.limit + CFG.name.len as i64 + GCFG.limit);
+    io.println("");
+    m.out.push_str("x");
+    io.println(m.out.as_str());
+
+    // A module-qualified struct, trailing comma.
+    let s = diag.Span { file: 1, ..zero, };
+    io.print_int(s.lo as i64 + s.hi as i64 + s.file as i64);
+    io.println("");
+
+    // The empty slice.
+    let e: []u32 = [];
+    io.print_int(e.len as i64);
+    io.print_int(sum([]) as i64);
+    let arr = [1 as u32, 2, 3];
+    m.words = arr[..];
+    io.print_int(sum(m.words) as i64);
+    m.words = [];
+    io.print_int(sum(m.words) as i64);
+    io.println("");
+}
+// expect: 3000falsetrue00true0
+// expect: 7
+// expect: x
+// expect: 1
+// expect: 0060

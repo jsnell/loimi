@@ -1,0 +1,2 @@
+fn main() { let e = []; }
+// error: cannot infer the type of an empty array

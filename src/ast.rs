@@ -102,7 +102,8 @@ pub enum ExprKind {
     Unary(UnOp, P<Expr>),
     Binary(BinOp, P<Expr>, P<Expr>),
     Cast(P<Expr>, TypeExpr),
-    StructLit(Vec<Ident>, Vec<(Ident, Expr)>),
+    /// `Type { f: e, .. }`; the span of a trailing `..zero`, if any.
+    StructLit(Vec<Ident>, Vec<(Ident, Expr)>, Option<Span>),
     Tuple(Vec<Expr>),
     Unit,
     ArrayLit(Vec<Expr>),

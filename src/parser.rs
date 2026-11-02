@@ -1590,7 +1590,19 @@ impl Parser {
     fn parse_struct_lit(&mut self, path: Vec<Ident>, start: Span) -> Res<Expr> {
         self.expect("{")?;
         let mut fields = Vec::new();
+        let mut rest = None;
         while !self.is("}") {
+            if self.is("..") {
+                let s = self.span();
+                self.bump();
+                let z = self.ident()?;
+                if z.name != "zero" {
+                    return Err(Diag::new(z.span, "expected `zero` after `..` (`..zero` sets the other fields to zero)"));
+                }
+                rest = Some(s.to(z.span));
+                self.eat(",");
+                break;
+            }
             let f = self.ident()?;
             let v = if self.eat(":") {
                 self.parse_expr()?
@@ -1603,7 +1615,7 @@ impl Parser {
             }
         }
         self.expect("}")?;
-        Ok(Expr { kind: ExprKind::StructLit(path, fields), span: start.to(self.prev_span()) })
+        Ok(Expr { kind: ExprKind::StructLit(path, fields, rest), span: start.to(self.prev_span()) })
     }
 
     fn parse_if(&mut self, start: Span) -> Res<Expr> {
