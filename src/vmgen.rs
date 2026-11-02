@@ -381,12 +381,15 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let hg = g.vm.clone().unwrap();
             g.load(&e.ty, &hg.raise_slot)
         }
-        TVm::Become(opc) => {
+        TVm::Become(opc, back) => {
             let hg = g.vm.clone().unwrap();
             let p = g.p();
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
-            let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            if *back > 0 {
+                pc = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 -{}", wt, pc, back));
+            }
             let w = g.inst(format!("load {}, ptr {}", wt, pc));
             let mask = ((1u64 << vd.op_bits) - 1) << vd.op_shift;
             let cleared = g.inst(format!("and {} {}, {}", wt, w, !mask as i64 & word_mask(vd.word.bits)));

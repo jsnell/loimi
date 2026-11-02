@@ -1,0 +1,153 @@
+// matrix: dispatch
+// Superinstructions: three parts, specialized family members as parts,
+// `become` inside a super, optimizing again after quickening, and the
+// verifier's view of fused code.
+import std.io;
+
+struct Counts { generic: i64, fast: i64 }
+
+vm V {
+    context ctx: *Counts;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op NEG(dst: reg, a: reg) : ABC { dst = 0 - a; next }
+    family ADD(dst: reg, a: reg, b: reg) : ABC {
+        generic {
+            ctx.generic += 1;
+            dst = a + b;
+            if a >= 0 { become ADD_P; }
+            next
+        }
+        ADD_P {
+            if a < 0 { become ADD; redo }
+            ctx.fast += 1;
+            dst = a + b;
+            next
+        }
+    }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op JMP(target: label) : sJ { jump target }
+    op RET(src: reg) : ABC { exit src }
+
+    super LOADI_ADD_MUL = LOADI; ADD; MUL;
+    super LOADI_ADDP_MUL = LOADI; ADD_P; MUL;
+    super ADD_RET = ADD; RET;
+    super ADDP_MUL = ADD_P; MUL;
+
+    entry run(c: *Counts, code: *u32, r: *i64) -> i64 {
+        ctx = c;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn names(code: []u32, n: u64) {
+    for i in 0..n {
+        if i > 0 { io.print(" "); }
+        io.print(V.op_name(code[i]));
+    }
+    io.println("");
+}
+
+fn main() {
+    var cnt = Counts { generic: 0, fast: 0 };
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 8] = [0; 8];
+    let c = code[..];
+
+    // Three parts; the middle one quickens, which rewrites the head to the
+    // super with the specialized member.
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 3);
+    at = V.emit.LOADI(c, at, 1, 4);
+    at = V.emit.ADD(c, at, 2, 0, 1);
+    at = V.emit.MUL(c, at, 3, 2, 2);
+    at = V.emit.RET(c, at, 3);
+    V.optimize(c[0..at]);
+    names(c, at);
+    show(V.verify(c[0..at]));
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    io.print_int(cnt.generic); io.print(" "); io.print_int(cnt.fast); io.println("");
+    show(V.verify(c[0..at]));
+    // Deoptimizing inside the super goes back to the generic super.
+    code[0] = V.LOADI(0, -3);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    names(c, at);
+
+    // The verifier checks the words after a super's head.
+    code[2] = V.RET(0);
+    show(V.verify(c[0..at]));
+    code[2] = V.ADD(2, 0, 1);
+    // A jump into the middle of a fused sequence is fine.
+    at = V.emit.JMP(c, at, -3);
+    show(V.verify(c[0..at]));
+
+    // No super with the quickened part: the super splits up.
+    at = 0;
+    at = V.emit.LOADI(c, at, 0, 5);
+    at = V.emit.LOADI(c, at, 1, 6);
+    at = V.emit.ADD(c, at, 2, 0, 1);
+    at = V.emit.RET(c, at, 2);
+    V.optimize(c[0..at]);
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+
+    // Supers of specialized members apply when optimizing again.
+    at = 0;
+    at = V.emit.LOADI(c, at, 0, 2);
+    at = V.emit.NEG(c, at, 1, 0);
+    at = V.emit.NEG(c, at, 1, 1);
+    at = V.emit.ADD(c, at, 2, 1, 0);
+    at = V.emit.MUL(c, at, 3, 2, 2);
+    at = V.emit.RET(c, at, 3);
+    V.optimize(c[0..at]);
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    V.optimize(c[0..at]);
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
+    show(V.verify(c[0..at]));
+}
+// expect: LOADI LOADI_ADD_MUL ADD MUL RET
+// expect: ok
+// expect: 49
+// expect: LOADI LOADI_ADDP_MUL ADD_P MUL RET
+// expect: 49
+// expect: 1 1
+// expect: ok
+// expect: 1
+// expect: LOADI LOADI_ADD_MUL ADD MUL RET
+// expect: bad at 1
+// expect: ok
+// expect: LOADI LOADI ADD_RET RET
+// expect: 11
+// expect: LOADI LOADI ADD_P RET
+// expect: 11
+// expect: LOADI NEG NEG ADD MUL RET
+// expect: 16
+// expect: LOADI NEG NEG ADDP_MUL MUL RET
+// expect: 16
+// expect: ok

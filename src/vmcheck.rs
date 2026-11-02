@@ -79,6 +79,8 @@ pub struct HandlerCx {
     pub op: Option<usize>,
     /// In a non-final superinstruction part: (next part, size of this part).
     pub part: Option<(u32, u32)>,
+    /// In any superinstruction part: (super op, part index, word offset of the part).
+    pub sup: Option<(usize, usize, u32)>,
     pub operands: Vec<(String, usize, LocalId)>,
     pub state: Vec<LocalId>,
     /// vm functions see the state through pointers.
@@ -102,6 +104,7 @@ impl HandlerCx {
             allow_control: true,
             op: None,
             part: None,
+            sup: None,
             operands: vec![],
             state,
             by_ptr: false,
@@ -712,6 +715,7 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
     let state = declare_state(c, vm, &mut cx);
     let mut exprs = Vec::new();
     let n = parts.len();
+    let mut off = 0;
     for (j, &p) in parts.iter().enumerate() {
         let op = &c.vms[vm as usize].ops[p];
         let span = op.span;
@@ -735,9 +739,11 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
         cx.vm = Some(HandlerCx {
             op: Some(p),
             part: if j + 1 < n { Some((j as u32 + 1, size)) } else { None },
+            sup: if n > 1 { Some((k, j, off)) } else { None },
             operands,
             ..HandlerCx::new(vm, state.clone())
         });
+        off += size;
         let r = c.block(&mut cx, &body, Some(&Ty::Never));
         cx.scopes.pop();
         let b = r?;
@@ -918,7 +924,25 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
                     format!("`become {}`: `{}` and `{}` must have the same format, cache and operand kinds", b.name, a.name, b.name),
                 ));
             }
-            Ok(mk(Ty::Unit, TK::Vm(TVm::Become(b.opcode)), span))
+            let Some((sk, j, off)) = h.sup else {
+                return Ok(mk(Ty::Unit, TK::Vm(TVm::Become(b.opcode, 0)), span));
+            };
+            // In a superinstruction: the part's own word becomes the new
+            // op (for jumps into the middle), and the head word becomes the
+            // super with this part replaced, if one is declared, or else
+            // the sequence's first op: the super is split up.
+            let mut parts = info.ops[sk].parts.clone();
+            parts[j] = t;
+            let head = match info.ops.iter().find(|o| o.parts == parts) {
+                Some(o) => o.opcode,
+                None => info.ops[parts[0]].opcode,
+            };
+            let head_e = mk(Ty::Unit, TK::Vm(TVm::Become(head, off)), span);
+            if j == 0 {
+                return Ok(head_e);
+            }
+            let own = mk(Ty::Unit, TK::Vm(TVm::Become(b.opcode, 0)), span);
+            Ok(mk(Ty::Unit, TK::Block(vec![TStmt::Expr(own), TStmt::Expr(head_e)], None), span))
         }
         VmExpr::UseVariant(name) => {
             let vd = &c.prog.vms[vmi];

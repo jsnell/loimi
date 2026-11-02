@@ -177,8 +177,9 @@ pub enum TVm {
     Jump(B),
     Exit(B),
     Raise(B),
-    /// Rewrite the current instruction's opcode.
-    Become(u32),
+    /// Rewrite the opcode of the word `back` words before pc (0: the
+    /// current instruction; more for the head of a superinstruction).
+    Become(u32, u32),
     Cold(B),
     /// The code word at `pc + offset` (a place).
     Word(u32),

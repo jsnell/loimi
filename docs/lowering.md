@@ -245,7 +245,9 @@ reach it, so it exists only for defense in depth.
   final `next`. LLVM then optimizes across the boundary (for example,
   forwarding the stored constant into `ADD`'s load).
 - Family members are ordinary ops that share a format. `become` stores the
-  opcode byte (section 3).
+  opcode byte (section 3). In a super's part, it stores the part's own word
+  and the super's first word (the opcode of the super with that part
+  replaced, chosen at compile time, or of the first part).
 
 ## 9. Effects and sync points
 

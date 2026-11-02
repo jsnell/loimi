@@ -617,11 +617,34 @@ atomic store, which the compiler emits when the vm is declared
 ```loimi
 super LOADK_ADD = LOADK; ADD;
 super MOVE_RETURN = MOVE; RETURN;
+super LOADI_ADD_F_RET = LOADI; ADD_F; RET1;   // any number of parts; family members too
 ```
 
 The compiler builds the handler by inlining the component bodies in order.
-Paths of the first component that end in `next` fall through into the second.
-Other control words (`jump`, `raise`, ...) keep their meaning.
+Paths of a component that end in `next` fall through into the next one.
+Other control words (`jump`, `raise`, ...) keep their meaning; `redo` in a
+later part runs that part's own word alone.
+
+A part can name any op, including a specialized family member
+(`GETGLOBAL_C`, `ADD_F`). No two supers may have the same parts.
+
+**`become` inside a super.** A part that executes `become X` rewrites its
+own word to `X`, as it would alone (so a jump into the middle sees the
+specialization). It also rewrites the super's first word: to the super
+whose parts are the same with this part replaced by `X`, if one is
+declared, and otherwise to the sequence's first op, which splits the
+super up. For example, with
+
+```loimi
+super LOADI_ADD = LOADI; ADD;
+super LOADI_ADD_F = LOADI; ADD_F;
+```
+
+the first time `LOADI_ADD`'s `ADD` part sees two floats and runs
+`become ADD_F`, the code changes to `LOADI_ADD_F, ADD_F`; when `ADD_F`
+deoptimizes with `become ADD`, it changes back. Without `LOADI_ADD_F`, it
+would become `LOADI, ADD_F`. `Vm.optimize` can be run again on quickened
+code to fuse supers of specialized members.
 
 With `fixed` encodings, the fused op **reuses the components' words**: the
 first word's opcode is rewritten to the super-op and the following words stay
@@ -629,6 +652,13 @@ as they are, so the super-op reads operands from both words. A jump into the
 second word still runs the original second instruction, so fusion is always
 safe, needs no control-flow analysis, and can happen at build time (peephole
 in `Mini.Builder`) or at run time (quickening).
+
+`Vm.optimize(code)` is the generated peephole pass. It compares words by
+the op they stand for alone (a super's head counts as its first part), so
+it can run again on code that has been optimized and quickened; where
+several supers match, the one with the most parts wins. The generated
+verifier treats every part's word as an instruction: jumps may land on
+it, and it must hold an op of the same family as the super's part.
 
 `loimi build --vm-stats` records opcode pair frequencies.
 `loimi vm suggest-supers` turns them into ranked `super` declarations.
