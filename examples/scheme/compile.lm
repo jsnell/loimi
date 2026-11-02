@@ -2053,6 +2053,19 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         }
     }
     let base = if !tail and dst + 1 == g.top() { dst } else { g.alloc() };
+    // A recursive call of the procedure being compiled (through its known
+    // global or its own letrec variable) with the right arity.
+    let l = g.fs.lam;
+    if !tail and !l.rest and l.nparams as u64 == nargs
+        and (self_global or (f.kind == K.Ref and (f.vr.lam as u64) == (l as u64) and !f.vr.assigned)) {
+        for i in 0..nargs {
+            let r = g.alloc();
+            g.to(n.list.at(i), r);
+        }
+        g.emit(Scheme.CALLSELF(base as u8, nargs as u8));
+        if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
+        return;
+    }
     if f.kind == K.Const and let Some(id) = value.prim_of(f.v)
         and id != builtins.P_APPLY and id != builtins.P_CALLCC {
         for i in 0..nargs {

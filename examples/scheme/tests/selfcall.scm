@@ -28,6 +28,22 @@
 (display (first-twice 2))
 (newline)
 ; expect: second
+; Non-tail recursion (CALLSELF): global, letrec, and deep (100000 frames).
+(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+(define (len l) (let walk ((l l)) (if (null? l) 0 (+ 1 (walk (cdr l))))))
+(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
+(display (list (fact 10) (len '(a b c)) (deep 100000)))
+(newline)
+; expect: (3628800 3 100000)
+; A recursive procedure whose variable is assigned calls the new value.
+(define (outer)
+  (define (r n) (if (= n 0) 'base (list (r (- n 1)))))
+  (let ((old r))
+    (set! r (lambda (n) 'new))
+    (old 2)))
+(display (outer))
+(newline)
+; expect: (new)
 ; Wrong argument counts still fail as calls do.
 (define (two a b) (if (= a 0) b (two (- a 1))))
 (two 1 2)

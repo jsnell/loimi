@@ -481,6 +481,31 @@ pub vm Scheme {
         next
     }
 
+    /// R[base] = this procedure (R[base+1] .. R[base+nargs]): a recursive
+    /// call, which the compiler emits only with the right number of
+    /// arguments, so the callee needs no checks. R[base] is not read.
+    op CALLSELF(base: callbase, nargs: imm) : ABC {
+        let cl = fp.cl;
+        let p = cl.proto;
+        let callee = regs + base + 1;
+        let n = p.nregs as u64;
+        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            cold { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
+        }
+        var i = nargs as u64;
+        while i < n {
+            callee[i] = Imm(value.IMM_UNSPEC);
+            i += 1;
+        }
+        fp.resume = pc + 1;
+        fp = fp + 1;
+        fp.cl = cl;
+        fp.base = callee;
+        fp.k = k;
+        regs = callee;
+        jump p.code.ptr
+    }
+
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).
     op CALL(base: callbase, nargs: imm) : ABC {
         if let Clo(cl) = regs[base] {
