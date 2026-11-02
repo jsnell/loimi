@@ -1347,13 +1347,21 @@ pub vm JS {
     super GETPROP_IN_GETPROP_IN = GETPROP_IN; GETPROP_IN;
     super GETLEN_JLT = GETLEN; JLT;
     super ADDI_JLT = ADDI; JLT;
+    // Overlaps another super, but runs outside MOVE; MOVE: 5% of binary_trees' ops, 4% of deltablue's.
+    #[allow(super_overlap)]
     super MOVE_CALL = MOVE; CALL;
     super GETMETHOD_P_CALL = GETMETHOD_P; CALL;
     super GETGLOBAL_LOADU = GETGLOBAL; LOADU;
+    // Overlaps another super, but runs outside the MOVE pairs: 6.6% of closures' ops.
+    #[allow(super_overlap)]
     super LOADU_MOVE = LOADU; MOVE;
     super GETINDEX_SETINDEX = GETINDEX; SETINDEX;
+    // Overlaps another super, but runs outside GETPROP_IN; GETPROP_IN: 1.7% of raytrace's ops.
+    #[allow(super_overlap)]
     super GETPROP_IN_GETMETHOD_P = GETPROP_IN; GETMETHOD_P;
     super MUL_F_ADD_F = MUL_F; ADD_F;
+    // Overlaps another super, but runs where no ADD_F follows: 14% of nbody's ops.
+    #[allow(super_overlap)]
     super MUL_F_MUL_F = MUL_F; MUL_F;
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V {

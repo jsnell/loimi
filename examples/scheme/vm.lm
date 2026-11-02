@@ -592,17 +592,26 @@ pub vm Scheme {
     super ZEROP_TEST = ZEROP; TEST;
     // Loops, argument set-up and list walking.
     super MOVE_MOVE = MOVE; MOVE;
+    // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.
+    #[allow(super_overlap)]
     super MOVE_JMP = MOVE; JMP;
     super ADDI_JMP = ADDI; JMP;
     super CDR_JMP = CDR; JMP;
+    // Overlaps another super, but runs outside CDR; JMP: 13-18% of takl's and ntakl's ops.
+    #[allow(super_overlap)]
     super CDR_CDR = CDR; CDR;
     super GETFREE_GETFREE = GETFREE; GETFREE;
     super ADD_RET = ADD; RET;
     super CONS_RET = CONS; RET;
-    super TEST_RET = TEST; RET;
+    // Overlaps another super, but runs outside LT; TESTT: 2-2.8% of takl's, ntakl's and nboyer's ops.
+    #[allow(super_overlap)]
     super TESTT_RET = TESTT; RET;
     super ADDI_CALL = ADDI; CALL;
+    // Overlaps another super, but runs outside MOVE; MOVE: 4.4% of conform's ops, 1-2% of several others.
+    #[allow(super_overlap)]
     super MOVE_CALL = MOVE; CALL;
+    // Overlaps another super, but runs outside MOVE; MOVE: 7% of fibc's ops, 4% of graphs'.
+    #[allow(super_overlap)]
     super MOVE_TAILCALL = MOVE; TAILCALL;
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V {
