@@ -1,6 +1,13 @@
 // The reader: source text → Scheme data (pairs, symbols, ...), allocated in
 // the GC heap. Reading allocates but never collects.
 //
+// Built on std.lex (a Cursor with line tracking, and whitespace and
+// comment skipping configured for `;` and nested `#| |#`) and std.num
+// (numerals). Scheme-specific: `#;` datum comments, string escapes
+// (`\x41;`, line continuations), `#\` characters, and the rule that an
+// atom is a number only if all of it parses as one (`1+` and `...` are
+// symbols).
+//
 // The source line of every list is recorded in a side table keyed by the
 // address of its first pair, so the compiler can attach lines to code
 // (the heap does not move objects, and nothing is collected until the
@@ -12,18 +19,33 @@ import std.os;
 import std.mem;
 import std.map;
 import std.text;
+import std.lex;
+import std.num;
 import value;
 import value.{V, Symtab, Pair, Vect};
 
 pub struct Reader {
-    src: str,
-    pos: u64,
-    line: u32,
+    cur: lex.Cursor,
     heap: *gc.Heap,
     syms: *Symtab,
     lines: *map.HashMap<u64, u32>,
     /// Record lines (false for the built-in prelude).
     track: bool,
+}
+
+/// Scheme's lexical conventions for std.lex.
+fn syntax() -> lex.Syntax {
+    var sy = lex.none();
+    sy.line_comment = ";";
+    sy.block_open = "#|";
+    sy.block_close = "|#";
+    sy.nested_comments = true;
+    sy.multiline_strings = true;
+    sy
+}
+
+pub fn Reader.new(src: str, heap: *gc.Heap, syms: *Symtab, lines: *map.HashMap<u64, u32>, track: bool) -> Reader {
+    Reader { cur: lex.Cursor.new(src, 0, syntax()), heap: heap, syms: syms, lines: lines, track: track }
 }
 
 pub fn fail(line: u32, msg: str) -> never {
@@ -36,42 +58,32 @@ pub fn fail(line: u32, msg: str) -> never {
     os.quit(1)
 }
 
-fn Reader.peek(r: *Reader, off: u64) -> u8 {
-    if r.pos + off < r.src.len { r.src[r.pos + off] } else { 0 }
-}
+fn Reader.peek(r: *Reader, off: u64) -> u8 { r.cur.peek_at(off) }
+
+fn Reader.at_end(r: *Reader) -> bool { r.cur.at_end() }
 
 fn delimiter(c: u8) -> bool {
-    c == 0 or text.is_space(c) or c == '(' or c == ')' or c == '[' or c == ']' or c == '"' or c == ';' or c == '\''
+    c == 0 or lex.is_space(c) or c == '(' or c == ')' or c == '[' or c == ']' or c == '"' or c == ';' or c == '\''
 }
 
-/// Skip whitespace and comments (`;`, nested `#| |#`, and `#;` datum comments).
+fn not_delimiter(c: u8) -> bool { !delimiter(c) }
+
+/// Line of byte offset `pos` (for errors reported after the cursor moved on).
+fn Reader.line_at(r: *Reader, pos: u64) -> u32 {
+    var line: u32 = 1;
+    for i in 0..pos {
+        if r.cur.src[i] == '\n' { line += 1; }
+    }
+    line
+}
+
+/// Skip whitespace and comments, including `#;` datum comments.
 fn Reader.skip(r: *Reader) {
     loop {
-        let c = r.peek(0);
-        if r.pos >= r.src.len { return; }
-        if c == '\n' { r.line += 1; r.pos += 1; continue; }
-        if text.is_space(c) { r.pos += 1; continue; }
-        if c == ';' {
-            while r.pos < r.src.len and r.peek(0) != '\n' { r.pos += 1; }
-            continue;
-        }
-        if c == '#' and r.peek(1) == '|' {
-            let start = r.line;
-            var depth = 1;
-            r.pos += 2;
-            while depth > 0 {
-                if r.pos >= r.src.len { fail(start, "unterminated block comment"); }
-                let d = r.peek(0);
-                if d == '\n' { r.line += 1; }
-                if d == '|' and r.peek(1) == '#' { depth -= 1; r.pos += 2; continue; }
-                if d == '#' and r.peek(1) == '|' { depth += 1; r.pos += 2; continue; }
-                r.pos += 1;
-            }
-            continue;
-        }
-        if c == '#' and r.peek(1) == ';' {
-            r.pos += 2;
-            let line = r.line;
+        if let Err(e) = r.cur.skip_trivia() { fail(r.line_at(e.span.lo as u64), e.msg); }
+        if r.peek(0) == '#' and r.peek(1) == ';' {
+            let line = r.cur.line;
+            r.cur.advance(2);
             if r.read().is_none() { fail(line, "datum comment at end of input"); }
             continue;
         }
@@ -101,38 +113,36 @@ fn Reader.note(r: *Reader, v: V, line: u32) {
 /// The next datum, or None at end of input.
 pub fn Reader.read(r: *Reader) -> ?V {
     r.skip();
-    if r.pos >= r.src.len { return None; }
-    let line = r.line;
+    if r.at_end() { return None; }
+    let line = r.cur.line;
     let c = r.peek(0);
     if c == '(' or c == '[' {
-        r.pos += 1;
+        r.cur.bump();
         return Some(r.list(if c == '(' { ')' } else { ']' }, line));
     }
     if c == ')' or c == ']' { fail(line, "unexpected ')'"); }
-    if c == '\'' { r.pos += 1; return Some(r.wrap("quote", line)); }
-    if c == '`' { r.pos += 1; return Some(r.wrap("quasiquote", line)); }
+    if c == '\'' { r.cur.bump(); return Some(r.wrap("quote", line)); }
+    if c == '`' { r.cur.bump(); return Some(r.wrap("quasiquote", line)); }
     if c == ',' {
-        r.pos += 1;
-        if r.peek(0) == '@' { r.pos += 1; return Some(r.wrap("unquote-splicing", line)); }
+        r.cur.bump();
+        if r.cur.eat('@') { return Some(r.wrap("unquote-splicing", line)); }
         return Some(r.wrap("unquote", line));
     }
     if c == '"' { return Some(r.string(line)); }
     if c == '#' {
         let d = r.peek(1);
         if d == '(' {
-            r.pos += 2;
+            r.cur.advance(2);
             let l = r.list(')', line);
             return Some(V.Vec(list_to_vect(r.heap, l)));
         }
         if d == '\\' {
-            r.pos += 2;
+            r.cur.advance(2);
             return Some(r.character(line));
         }
     }
     // An atom: number, boolean or symbol.
-    let start = r.pos;
-    while r.pos < r.src.len and !delimiter(r.peek(0)) { r.pos += 1; }
-    let s = r.src[start..r.pos];
+    let s = r.cur.eat_while(not_delimiter);
     if s.len == 0 { fail(line, "unexpected character"); }
     if s[0] == '#' {
         if s.eq("#t") or s.eq("#true") { return Some(value.t()); }
@@ -155,25 +165,20 @@ pub fn list_to_vect(h: *gc.Heap, l: V) -> Gc<Vect> {
     v
 }
 
-/// A number literal: an exact integer (a flonum if it does not fit in a
-/// fixnum) or a decimal flonum.
+/// A number literal (all of `s`): an exact integer, which is a flonum if
+/// it does not fit in a fixnum, or a decimal flonum. Scheme writes hex as
+/// `#x..`, so std.num's `0x` prefix is not accepted.
 pub fn parse_number(s: str) -> ?V {
     var i: u64 = 0;
     if s.len > 0 and (s[0] == '+' or s[0] == '-') { i = 1; }
-    if i >= s.len { return None; }
-    if !text.is_digit(s[i]) and !(s[i] == '.' and i + 1 < s.len and text.is_digit(s[i + 1])) { return None; }
-    var is_int = true;
-    for j in i..s.len {
-        if !text.is_digit(s[j]) { is_int = false; }
-    }
-    if is_int {
-        let body = if s[0] == '+' { s[1..s.len] } else { s };
-        if let Some(x) = text.parse_int(body) and x >= -2147483648 and x <= 2147483647 {
-            return Some(V.Int(x as i32));
+    if i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X') { return None; }
+    match num.parse_number(s) {
+        Ok(Int(x)) => {
+            if x >= -2147483648 and x <= 2147483647 { Some(V.Int(x as i32)) } else { Some(V.Num(x as f64)) }
         }
+        Ok(Float(f)) => Some(V.Num(f)),
+        Err(_) => None,
     }
-    let Some(f) = text.parse_f64(s) else { return None; };
-    Some(V.Num(f))
 }
 
 fn Reader.list(r: *Reader, close: u8, line: u32) -> V {
@@ -182,24 +187,23 @@ fn Reader.list(r: *Reader, close: u8, line: u32) -> V {
     var tail: ?Gc<Pair> = None;
     loop {
         r.skip();
-        if r.pos >= r.src.len { fail(line, "unterminated list"); }
+        if r.at_end() { fail(line, "unterminated list"); }
         let c = r.peek(0);
         if c == ')' or c == ']' {
-            if c != close { fail(r.line, "mismatched brackets"); }
-            r.pos += 1;
+            if c != close { fail(r.cur.line, "mismatched brackets"); }
+            r.cur.bump();
             break;
         }
         if c == '.' and delimiter(r.peek(1)) {
-            r.pos += 1;
-            let Some(t) = tail else { fail(r.line, "unexpected '.'") };
+            r.cur.bump();
+            let Some(t) = tail else { fail(r.cur.line, "unexpected '.'") };
             let Some(d) = r.read() else { fail(line, "unterminated list") };
             t.cdr = d;
             r.skip();
-            if r.peek(0) != close { fail(r.line, "expected ')' after dotted tail"); }
-            r.pos += 1;
+            if r.peek(0) != close { fail(r.cur.line, "expected ')' after dotted tail"); }
+            r.cur.bump();
             break;
         }
-        let item_line = r.line;
         let Some(d) = r.read() else { fail(line, "unterminated list") };
         let cell = new(h, Pair { car: d, cdr: value.nil() });
         match tail {
@@ -209,31 +213,25 @@ fn Reader.list(r: *Reader, close: u8, line: u32) -> V {
             }
         }
         tail = Some(cell);
-        let _ = item_line;
     }
     r.note(head, line);
     head
 }
 
 fn hex(c: u8) -> ?u32 {
-    if text.is_digit(c) { return Some((c - '0') as u32); }
-    if c >= 'a' and c <= 'f' { return Some((c - 'a') as u32 + 10); }
-    if c >= 'A' and c <= 'F' { return Some((c - 'A') as u32 + 10); }
-    None
+    let d = num.digit_value(c);
+    if d < 16 { Some(d) } else { None }
 }
 
 fn Reader.string(r: *Reader, line: u32) -> V {
-    r.pos += 1;
+    r.cur.bump();
     var b = text.StrBuf.new();
     loop {
-        if r.pos >= r.src.len { fail(line, "unterminated string"); }
-        let c = r.peek(0);
-        r.pos += 1;
+        if r.at_end() { fail(line, "unterminated string"); }
+        let c = r.cur.bump();
         if c == '"' { break; }
-        if c == '\n' { r.line += 1; }
         if c != '\\' { b.push(c); continue; }
-        let e = r.peek(0);
-        r.pos += 1;
+        let e = r.cur.bump();
         if e == 'n' { b.push('\n'); }
         else if e == 't' { b.push('\t'); }
         else if e == 'r' { b.push('\r'); }
@@ -243,23 +241,21 @@ fn Reader.string(r: *Reader, line: u32) -> V {
         else if e == '"' { b.push('"'); }
         else if e == 'x' {
             var v: u32 = 0;
-            while let Some(d) = hex(r.peek(0)) { v = v * 16 + d; r.pos += 1; }
-            if r.peek(0) == ';' { r.pos += 1; }
+            while let Some(d) = hex(r.peek(0)) { v = v * 16 + d; r.cur.bump(); }
+            r.cur.eat(';');
             value.push_utf8(&b, v as i32);
-        } else if e == '\n' or text.is_space(e) {
-            // Line continuation: skip the newline and leading whitespace.
+        } else if e == '\n' or lex.is_space(e) {
+            // Line continuation: \ <spaces> newline <spaces> produces nothing.
             var nl = e == '\n';
-            if nl { r.line += 1; }
-            while text.is_space(r.peek(0)) {
+            while lex.is_space(r.peek(0)) {
                 if r.peek(0) == '\n' {
                     if nl { break; }
                     nl = true;
-                    r.line += 1;
                 }
-                r.pos += 1;
+                r.cur.bump();
             }
         } else {
-            fail(r.line, "unknown string escape");
+            fail(r.cur.line, "unknown string escape");
         }
     }
     let s = value.new_str(r.heap, b.as_str());
@@ -269,11 +265,11 @@ fn Reader.string(r: *Reader, line: u32) -> V {
 
 /// After `#\`.
 fn Reader.character(r: *Reader, line: u32) -> V {
-    let start = r.pos;
+    let start = r.cur.pos;
     // The first character is always part of the char, even a delimiter.
-    r.pos += 1;
-    while r.pos < r.src.len and !delimiter(r.peek(0)) { r.pos += 1; }
-    let s = r.src[start..r.pos];
+    r.cur.bump();
+    r.cur.eat_while(not_delimiter);
+    let s = r.cur.since(start);
     if s.len == 1 { return value.chr(s[0] as i32); }
     if s.eq("space") { return value.chr(32); }
     if s.eq("newline") or s.eq("linefeed") { return value.chr(10); }

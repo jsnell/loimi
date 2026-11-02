@@ -1474,7 +1474,7 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
 // ── driver ──────────────────────────────────────────────────────────
 
 fn read_all(c: *Comp, src: str, track: bool, out: *mem.Vec<V>) {
-    var r = Reader { src: src, pos: 0, line: 1, heap: c.heap, syms: &c.ctx.syms, lines: &c.lines, track: track };
+    var r = Reader.new(src, c.heap, &c.ctx.syms, &c.lines, track);
     while let Some(x) = r.read() { out.push(x); }
 }
 
