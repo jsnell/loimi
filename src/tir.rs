@@ -487,6 +487,13 @@ pub struct VmDef {
     pub cont_fns: Vec<bool>,
 }
 
+impl VmDef {
+    /// The index of the op with opcode `opcode`, if one has it.
+    pub fn op_index(&self, opcode: usize) -> Option<usize> {
+        self.ops.iter().position(|o| o.opcode as usize == opcode)
+    }
+}
+
 /// A module-level `var`. `init` is a constant expression.
 #[derive(Clone, Debug)]
 pub struct GlobalDef {

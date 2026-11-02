@@ -639,13 +639,13 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     let mut info = Vec::new();
     let ty = "{ i16, i16, i16, i16, i16 }";
     for i in 0..n {
-        let e = match vd.ops.iter().find(|o| o.opcode == i) {
-            Some(o) => {
+        let e = match vd.op_index(i as usize) {
+            Some(k) => {
+                let o = &vd.ops[k];
                 let first = match o.parts.first() {
                     Some(&b) => &vd.ops[b as usize],
                     None => o,
                 };
-                let k = vd.ops.iter().position(|x| x.opcode == i).unwrap();
                 let flags = (first.then as u32) | ((!o.parts.is_empty() as u32) << 1) | ((rw[k] as u32) << 2);
                 format!("{ty} {{ i16 {}, i16 {}, i16 {}, i16 {}, i16 {} }}", first.size, o.opcode, flags, o.size, first.opcode)
             }
@@ -658,7 +658,7 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     // Op names, for LOIMI_JIT_DEBUG.
     let mut names = Vec::new();
     for i in 0..n {
-        let nm = vd.ops.iter().find(|o| o.opcode == i).map(|o| o.name.as_str()).unwrap_or("?");
+        let nm = vd.op_index(i as usize).map(|k| &vd.ops[k]).map(|o| o.name.as_str()).unwrap_or("?");
         let _ = writeln!(globals, "@loimi_jit_opname.{} = private constant [{} x i8] c\"{}\\00\"", i, nm.len() + 1, nm);
         names.push(format!("ptr @loimi_jit_opname.{}", i));
     }

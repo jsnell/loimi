@@ -265,7 +265,7 @@ pub fn epilogue(g: &mut FnGen) {
             if t > 0 || vd.tbl_idx.is_some() {
                 let mut ids = Vec::new();
                 for i in 0..n {
-                    let id = match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                    let id = match vd.op_index(i) {
                         Some(k) => match (t > 0).then(|| hg.wrapper_labels[t - 1].iter().any(|(w, _)| *w as usize == k)) {
                             Some(true) => n as u32 * t as u32 + k as u32,
                             _ => vd.ops[k].opcode,
@@ -281,7 +281,7 @@ pub fn epilogue(g: &mut FnGen) {
         for t in 0..=ntables {
             let mut entries = Vec::new();
             for i in 0..n {
-                let l = match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                let l = match vd.op_index(i) {
                     Some(k) => {
                         let w = if t > 0 { hg.wrapper_labels[t - 1].iter().find(|(w, _)| *w as usize == k) } else { None };
                         match w {
@@ -1047,7 +1047,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: boo
             let enter = if jit_vm == Some(vi) { Some(crate::jitgen::enter_opcode(vd) as usize) } else { None };
             let mut entries = Vec::new();
             for i in 0..n {
-                match vd.ops.iter().find(|o| o.opcode as usize == i) {
+                match vd.op_index(i).map(|k| &vd.ops[k]) {
                     Some(o) => entries.push(format!("ptr @\"{}\"", p.fns[o.fid as usize].symbol)),
                     None if enter == Some(i) => entries.push(format!("ptr @\"{}.jit_enter\"", vd.symbol)),
                     None => entries.push(format!("ptr {}", inv)),
@@ -1060,7 +1060,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: boo
                 let _ = writeln!(globals, "{} = internal constant [{} x ptr] [{}]", table_name(vd), n, entries.join(", "));
                 let mut ce = Vec::new();
                 for i in 0..n {
-                    match vd.ops.iter().find(|o| o.opcode as usize == i) {
+                    match vd.op_index(i).map(|k| &vd.ops[k]) {
                         Some(o) if counted.contains(&o.fid) => {
                             ce.push(format!("ptr @\"{}\"", crate::jitgen::counting_symbol(&p.fns[o.fid as usize].symbol)))
                         }
@@ -1075,7 +1075,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: boo
             for (v, (_, ws)) in vd.variants.iter().enumerate() {
                 let mut entries = Vec::new();
                 for i in 0..n {
-                    match vd.ops.iter().position(|o| o.opcode as usize == i) {
+                    match vd.op_index(i) {
                         Some(k) => {
                             let f = ws.iter().find(|(w, _)| *w as usize == k).map(|(_, f)| *f).unwrap_or(vd.ops[k].fid);
                             entries.push(format!("ptr @\"{}\"", p.fns[f as usize].symbol));
