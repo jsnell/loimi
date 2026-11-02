@@ -1,5 +1,11 @@
 # Adopting std.bc and std.obj in the examples
 
+> **Historical.** `std-bc.patch` is a record of the plan, not something
+> to apply: it predates `Verified<V>` and still uses the old API
+> (`Mini.verify(code, proto) -> ?u64` with the code in a trailing array,
+> `Mini.optimize(code)` on raw words). The examples have since moved on;
+> see `language.md` §6 for verification as it is now.
+
 **Applied (2026-11-02), on the current code rather than with this patch:**
 Mini's compiler uses std.bc (with `Mini.set_label`, labels for `break`
 and `if` exits), std.lex, std.parse and std.diag; Scheme's code generator
