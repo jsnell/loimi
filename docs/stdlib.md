@@ -12,10 +12,10 @@ says so. Some modules are design only; their sections say so at the top.
 
 | Module | Status | Source |
 |---|---|---|
-| `std.core` (built-ins) | built in part (no `fmt`, `assert`, `rotl`, ...) | the compiler |
+| `std.core` (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
 | `std.mem` | built | `std/mem.lm` |
 | `std.hash`, `std.map` | built (`HashMap` only) | `std/hash.lm`, `std/map.lm` |
-| `std.text` | built (`StrBuf`, `Interner`, small helpers) | `std/text.lm` |
+| `std.text` | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
 | `std.num` | built (no `BigInt`) | `std/num.lm` |
 | `std.io`, `std.os` | built (minimal) | `std/io.lm`, `std/os.lm` |
 | `std.lex` | built (a cursor toolkit, no generator) | `std/lex.lm` |
@@ -83,8 +83,8 @@ import.
 
 ### Design (not built)
 
-Not built: `fmt` (compile-time checked format strings; build messages
-with `text.StrBuf`), `assert` / `debug_assert` (write `if !c { trap(); }`),
+Not built: `fmt` as compile-time checked format strings (`text.StrBuf`
+has `fmt`/`add` with run-time `{}` placeholders, see `std.text`), `assert` / `debug_assert` (write `if !c { trap(); }`),
 `rotl`, `bswap`, `bitcast` (use `to_bits`/`from_bits` and `as`), the f64
 functions `fma`, `copysign`, `trunc`, `nextafter` (and `abs`, `ceil`,
 `is_nan`), `a.add_overflow(b)` as a method, `f64.to_i32_js()`, and
@@ -154,10 +154,21 @@ Everything here except `HashMap` is design only:
 - `StrBuf`, a growable byte string: `StrBuf.new()`, `push(byte)`,
   `push_str(s)`, `push_int(i64)`, `push_f64(f64)` (shortest `%g` that
   reads back as the same number), `as_str()`
-  (valid until the next push), `len()`, `clear()`, `free()`. Messages
-  with numbers in them are built with these calls (`std.num` has more
-  float formats).
-<!-- fmt: filled in by parent -->
+  (valid until the next push), `len()`, `clear()`, `free()`,
+  `push_u64(u64)`. `std.num` has more float formats.
+- Formatting, for messages: `b.fmt2("expected {} values, got {}", n, m)`
+  appends the format string with each `{}` replaced by the next
+  argument (`fmt` takes one argument, `fmt2` to `fmt4` two to four;
+  `{{` and `}}` are literal braces). `b.add(x)` appends one value. Both
+  return the buffer, so calls chain:
+  `b.fmt("unknown word `{}`", name).add(" at line ").add(line).as_str()`.
+  The format string is not checked at compile time: a `{}` without an
+  argument stays `{}`, and an argument without a `{}` is appended at the
+  end. Arguments are any type that implements the trait `text.Fmt`
+  (`fn fmt(x: Self, b: *StrBuf)`): `str`, all the `i*`/`u*` widths up to
+  64 bits (`u8` prints as a number; `push` appends a byte), `f64` (as
+  `push_f64`) and `bool`. A type of your own joins with
+  `fn T.fmt(x: T, b: *text.StrBuf) { .. }` and `impl text.Fmt for T;`.
 - `Interner`: `Interner.new()`, `intern(s) -> u32` (ids 0, 1, 2, ...;
   the string is copied into the interner's arena), `find(s) -> ?u32`,
   `name(id) -> str`, `free()`.

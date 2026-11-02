@@ -40,7 +40,7 @@ roughly C's level of abstraction. It has deliberately few novel features.
 i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
 [T; N]          // fixed array
-[]T             // slice (ptr + len), bounds-checked
+[]T             // slice (ptr + len), bounds-checked; [] is the empty one
 *T, *mut T      // raw non-null pointers; null is ?*T
 ?T              // option; ?*T is pointer-sized
 Result<T, E>
@@ -117,6 +117,23 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **String patterns.** On a `str`, `match` arms may be string literals:
+  `match name { "dup" => .., "swap" | "exch" => .., _ => .. }`. As with
+  integers, only `_` or a binding makes such a match exhaustive. A run
+  of string arms at the start of a `match` compiles to a `switch` on the
+  length and then a compare of the bytes in 8-, 4-, 2- and 1-byte loads
+  against constants; elsewhere (inside tuples, after a guarded arm, in
+  `if let`) each pattern tests the length and the bytes in turn.
+- **`..zero` in struct literals.** `Machine { heap: gc.Heap.new(), depth: 3, ..zero }`
+  sets every field not given to zero. It is allowed only where zero is a
+  valid value that needs no constructor: integers, floats, `bool`, `?T`
+  (None), slices (empty) and arrays and tuples of those. A field of type
+  `*T` or `Gc<T>` (never null), a struct (its constructor may set
+  invariants), an enum, a `value` type or a function must be given, and
+  so must private (`__`) fields; the error names the field. It also works
+  in `const` and global initializers.
+- **Empty slices.** `[]` where a slice type is expected is the empty
+  slice: `let s: []u32 = [];`, `f([])`, `x.words = [];`.
 - **Match guards.** `pat if cond => body` matches only when `cond` (which
   sees the pattern's bindings) is true; otherwise the later arms are
   tried. Guarded arms do not count toward exhaustiveness. Note the
