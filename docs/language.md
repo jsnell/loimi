@@ -698,8 +698,10 @@ type-checks the mapping. From the declarations it **generates**:
   every generated function above (and the disassembler and verifier)
   maps a word through `real_word` first, so host code sees the real
   words. Host code that inspects `code[i]` itself (hashing, comparing,
-  serializing) calls `Vm.real_word(code[i])`. Without the JIT it is the
-  identity and costs nothing.
+  serializing) calls `Vm.real_word(code[i])` on its instruction words
+  (inline cache words are never enter words, but may look like one: read
+  them as they are). Without the JIT it is the identity and costs
+  nothing.
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.
