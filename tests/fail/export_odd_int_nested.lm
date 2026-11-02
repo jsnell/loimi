@@ -1,0 +1,8 @@
+// Odd-width integers behind a pointer or in a function pointer's signature
+// (also through a type alias) have no C type: the header used to say
+// `int48_t`, which no C compiler knows.
+// args: --header /dev/null
+// error: parameter `f: fn(u24) -> i64` has no C equivalent
+type Cb = fn(u24) -> i64;
+export "C" fn call(f: Cb) -> i64 { f(3) }
+fn main() {}
