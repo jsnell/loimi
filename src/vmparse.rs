@@ -129,13 +129,13 @@ impl Parser {
                 }
                 "op" => {
                     self.bump();
-                    let (name, params, format, cache) = self.parse_op_head()?;
+                    let (name, params, format, cache, then) = self.parse_op_head()?;
                     let body = self.vm_block()?;
-                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None });
+                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then });
                 }
                 "family" => {
                     self.bump();
-                    let (name, params, format, cache) = self.parse_op_head()?;
+                    let (name, params, format, cache, then) = self.parse_op_head()?;
                     self.expect("{")?;
                     while !self.eat("}") {
                         let member = self.ident()?;
@@ -152,6 +152,7 @@ impl Parser {
                             cache: cache.clone(),
                             body,
                             family: Some(name.name.clone()),
+                            then: then.clone(),
                         });
                     }
                 }
@@ -263,7 +264,8 @@ impl Parser {
         b
     }
 
-    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>)> {
+    #[allow(clippy::type_complexity)]
+    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>, Option<Ident>)> {
         let name = self.ident()?;
         self.expect("(")?;
         let mut params = Vec::new();
@@ -280,7 +282,8 @@ impl Parser {
         self.expect(":")?;
         let format = self.ident()?;
         let cache = if self.eat("+") { Some(self.ident()?) } else { None };
-        Ok((name, params, format, cache))
+        let then = if self.eat_kw("then") { Some(self.ident()?) } else { None };
+        Ok((name, params, format, cache, then))
     }
 
     pub fn parse_value_decl(&mut self, is_pub: bool) -> Res<ValueDecl> {

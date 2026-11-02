@@ -587,6 +587,30 @@ reserves and zero-fills it, and the disassembler prints it. Inside the handler,
 don't keep their target alive. When the target dies, the GC resets the entry
 to zero, which the handler sees as a miss (`stdlib/gc.md` §8).
 
+### 7.1a The following instruction: `then`
+
+Lua-style conditional ops are followed by a JMP word that holds the branch
+offset, so the compiler's jump patching and the verifier treat it as an
+ordinary jump. `then OP` after the format (and cache) says that the next
+instruction is an `OP`, or a member of its family, and `then.x` reads its
+operand `x`: decoded from that word with `OP`'s format and evaluated by
+`OP`'s operand kind, with `pc` at that word.
+
+```loimi
+op JMP(target: label) : sJ { jump target }
+op LT(a: reg, b: reg) : ABC then JMP {
+    if a < b { jump then.target }
+    jump pc + 2                    // skip the JMP
+}
+```
+
+The JMP stays a separate instruction (`next` skips only `LT`); the
+generated verifier checks that it is there, and checks its operands at its
+own word. `then` operands are read-only, and not available in vm
+functions (pass them as arguments). This is the same idea as an inline
+cache (`cache.slot` is the word after the instruction), with the word
+typed as an instruction instead of a cache layout.
+
 ### 7.2 Families and `become`
 
 A `family` is a group of ops that share operands, format, and cache, with

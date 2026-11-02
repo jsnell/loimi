@@ -22,6 +22,8 @@ pub struct OpLayout {
     /// Index of the family's generic op (the op itself outside families;
     /// the first part's family for superinstructions).
     pub family: usize,
+    /// `then OP`: the op that must follow this one.
+    pub then: Option<usize>,
 }
 
 pub struct VmLayout {
@@ -110,7 +112,15 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
             Some(f) => v.ops.iter().position(|o| o.name.name == *f).unwrap_or(i),
             None => i,
         };
-        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache_words, parts: vec![], family });
+        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache_words, parts: vec![], family, then: None });
+    }
+    for (i, op) in v.ops.iter().enumerate() {
+        if let Some(t) = &op.then {
+            let Some(j) = v.ops.iter().position(|o| o.name.name == t.name) else {
+                return Err(Diag::new(t.span, format!("unknown op `{}`", t.name)));
+            };
+            ops[i].then = Some(j);
+        }
     }
     for s in &v.supers {
         let mut parts = Vec::new();
@@ -129,7 +139,7 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         }
         let opcode = ops.len() as u32;
         let family = ops[parts[0]].family;
-        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache_words: 0, parts, family });
+        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache_words: 0, parts, family, then: None });
     }
     if ops.len() as u64 > (1u64 << op_bits) {
         return Err(Diag::new(v.name.span, format!("{} ops do not fit in a {}-bit opcode field", ops.len(), op_bits)));
@@ -224,14 +234,19 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
     let _ = writeln!(s, "    if i + {n}__op_size(code[i]) > code.len {{ return Some(i); }}");
     let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
-        if o.parts.is_empty() {
-            continue;
-        }
-        let conds: Vec<String> = l.part_offsets(k)[1..]
+        let mut conds: Vec<String> = l.part_offsets(k)[1..]
             .iter()
             .map(|(off, p)| format!("{n}__family(code[i + {off}]) != {}", l.ops[*p].family))
             .collect();
-        let _ = writeln!(s, "      {} => {{ if {} {{ return Some(i); }} }}", o.opcode, conds.join(" or "));
+        // `then OP`: the next instruction must be an OP.
+        let b = l.base(k);
+        if let Some(t) = l.ops[b].then {
+            let sz = l.size(b);
+            conds.push(format!("i + {sz} >= code.len or {n}__family(code[i + {sz}]) != {}", l.ops[t].family));
+        }
+        if !conds.is_empty() {
+            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(i); }} }}", o.opcode, conds.join(" or "));
+        }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
     let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");

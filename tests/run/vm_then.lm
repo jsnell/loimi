@@ -1,0 +1,72 @@
+// matrix: dispatch
+// `then OP`: a conditional op followed by a JMP word reads the JMP's
+// operands as its own (`then.target`), typed by JMP's format and kinds.
+import std.io;
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JMP(target: label) : sJ { jump target }
+    // Jump to the following JMP's target if a < b, else skip the JMP.
+    op LT(a: reg, b: reg) : ABC then JMP {
+        if a < b { jump then.target }
+        jump pc + 2
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_LT = ADD; LT;
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 8] = [0; 8];
+    let c = code[..];
+    // r0 = 0; r1 = 10; r2 = 1; loop: r0 += r2; if r0 < r1 goto loop; ret r0
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 10);
+    at = V.emit.LOADI(c, at, 2, 1);
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.LT(c, at, 0, 1);
+    at = V.emit.JMP(c, at, -2);
+    at = V.emit.RET(c, at, 0);
+    show(V.verify(c[0..at]));
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+    V.optimize(c[0..at]);
+    io.println(V.op_name(code[3]));
+    show(V.verify(c[0..at]));
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+
+    // LT must be followed by a JMP.
+    code[5] = V.RET(0);
+    show(V.verify(c[0..at]));
+    show(V.verify(c[0..5]));
+}
+// expect: ok
+// expect: 10
+// expect: ADD_LT
+// expect: ok
+// expect: 10
+// expect: bad at 4
+// expect: bad at 4

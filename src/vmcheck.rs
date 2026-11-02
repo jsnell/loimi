@@ -27,6 +27,8 @@ pub struct OpInfo {
     /// (bits, shift, signed) per param.
     pub fields: Vec<(u32, u32, bool)>,
     pub parts: Vec<usize>,
+    /// `then OP`: the op that follows this one.
+    pub then: Option<usize>,
     pub size: u32,
     pub fid: FnId,
     pub body: Option<Block>,
@@ -126,10 +128,10 @@ fn raw_ty(_bits: u32, signed: bool) -> Ty {
     Ty::Int(IntTy { signed, bits: 64 })
 }
 
-/// Decode a field of the current code word.
-fn decode(word: IntTy, bits: u32, shift: u32, signed: bool, span: Span) -> TExpr {
+/// Decode a field of the code word at `pc + off`.
+fn decode(word: IntTy, off: u32, bits: u32, shift: u32, signed: bool, span: Span) -> TExpr {
     let wt = Ty::Int(word);
-    let w = mk(wt.clone(), TK::Vm(TVm::Word(0)), span);
+    let w = mk(wt.clone(), TK::Vm(TVm::Word(off)), span);
     let int = |v: u64| mk(wt.clone(), TK::Int(v as i128), span);
     let wb = word.bits as u32;
     let rt = raw_ty(bits, signed);
@@ -298,6 +300,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             kinds: kinds_of,
             fields: lo.fields.iter().map(|f| (f.1, f.2, f.3)).collect(),
             parts: lo.parts.clone(),
+            then: lo.then,
             size: l.size(k),
             fid,
             body,
@@ -726,7 +729,7 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             let raw = cx.temp(raw_ty(bits, signed));
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
-            lets.push(TStmt::Let(raw, Some(decode(word, bits, shift, signed, span))));
+            lets.push(TStmt::Let(raw, Some(decode(word, 0, bits, shift, signed, span))));
             operands.push((pname.clone(), kinds[pi], raw));
         }
         cx.vm = Some(HandlerCx {
@@ -993,6 +996,9 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
             return Ok(Some(mk(t, TK::Local(*raw), span)));
         }
     }
+    if bn == "then" {
+        return then_operand(c, cx, &h, name, span).map(Some);
+    }
     if bn == "cache" {
         if h.in_fn {
             return Err(Diag::new(base.span, "`cache` is not available in vm functions; pass the values as arguments"));
@@ -1010,6 +1016,43 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
         return Ok(Some(mk(Ty::Int(info.word), TK::Vm(TVm::Word(1 + fi as u32)), span)));
     }
     Ok(None)
+}
+
+/// `then.x`: operand `x` of the instruction after this one (declared with
+/// `then OP`), decoded from its word with OP's format and evaluated by its
+/// kind, with `pc` at that instruction.
+fn then_operand(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, name: &Ident, span: Span) -> Res<TExpr> {
+    let info = &c.vms[h.vm as usize];
+    let op = match h.op {
+        Some(op) if !h.in_fn => op,
+        _ => return Err(Diag::new(span, "`then` is only available in op handlers")),
+    };
+    let Some(t) = info.ops[op].then else {
+        return Err(Diag::new(span, format!("op `{}` does not declare `then OP`", info.ops[op].name)));
+    };
+    let to = &info.ops[t];
+    let Some(pi) = to.params.iter().position(|p| *p == name.name) else {
+        return Err(Diag::new(name.span, format!("op `{}` has no operand `{}`", to.name, name.name)));
+    };
+    let off = info.ops[op].size;
+    let (bits, shift, signed) = to.fields[pi];
+    let body = info.kinds[to.kinds[pi]].body.clone();
+    let word = info.word;
+    let pc_local = h.state[info.pc_idx];
+    let pc_ty = info.state[info.pc_idx].1.clone();
+    let raw = cx.temp(raw_ty(bits, signed));
+    cx.locals[raw as usize].name = format!("then.{}.raw", name.name);
+    let pc2 = cx.temp(pc_ty.clone());
+    cx.locals[pc2 as usize].name = "then.pc".into();
+    let n = mk(Ty::i64(), TK::Int(off as i128), span);
+    let pc_v = mk(pc_ty.clone(), TK::Local(pc_local), span);
+    let pc_init = mk(pc_ty, TK::Intrinsic(Intr::PtrOffset, vec![pc_v, n]), span);
+    cx.scopes.push(vec![("it".to_string(), raw), ("pc".to_string(), pc2)]);
+    let r = c.expr(cx, &body, None);
+    cx.scopes.pop();
+    let v = r?;
+    let lets = vec![TStmt::Let(raw, Some(decode(word, off, bits, shift, signed, span))), TStmt::Let(pc2, Some(pc_init))];
+    Ok(mk(v.ty.clone(), TK::Block(lets, Some(Box::new(v))), span))
 }
 
 fn vm_fn(c: &Checker, cx: &FnCx, name: &str) -> Option<FnId> {
