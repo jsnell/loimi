@@ -70,6 +70,46 @@ quickening on/off.
 2. **Moving GC.** Opt-in reloading after `gc` calls is designed but untested.
    Is a generational *moving* nursery worth the complexity compared with a
    non-moving sticky-mark-bits scheme? Benchmarks should decide.
+
+   **Decided (2026-11-02): non-moving, sticky mark bits**, opt-in per heap
+   (`heap.set_generational(true)`); see
+   [`stdlib/gc.md`](stdlib/gc.md#generational-mode-sticky-mark-bits-non-moving)
+   and [`lowering.md`](lowering.md#10-gc-barriers-and-allocation).
+   - *Why not moving.* All three interpreters keep raw pointers into
+     objects across safepoints: Mini's table parts (`aptr`, `hptr`) and
+     upvalue pointers, MiniJS's `Arr.ptr`, and every interpreter's `k`
+     pointer into its constant array. A copying nursery would need each
+     of them re-derived after every `gc` call, in handlers too. The
+     non-moving scheme needs only a write barrier.
+   - *The barrier* is object logging: one header byte test after each
+     store of a reference into an object, emitted by the compiler (raw
+     pointer stores call `gc.write_barrier`). With generations off it
+     costs within noise. Geomean against the commit before the work,
+     best of 3, interleaved, `--align-functions=64` (±3% placement
+     noise per benchmark): Mini 1.004, MiniJS 1.006. Its worst cases are
+     MiniJS `richards` (+3%, property stores) and Mini `closures` (+2%).
+     Getting there needed 2 MiB huge-page segments, cache coloring of
+     chunk starts, and letting LLVM drop barriers on stores into
+     just-allocated objects.
+   - *Measured* (same setup, generational vs the old collector): Mini
+     binary_trees −21%, MiniJS binary_trees −10%; Mini string_build +6%
+     and sieve +3%. On the full suites, geomean with generations against
+     without: Mini 0.989, MiniJS 0.996, Scheme 0.993. Scheme is mixed on
+     its allocation-heavy programs: mperm −8%, graphs −10%, paraffins
+     −12%, but nboyer +6%, earley +9%, string +27%. **Mini and MiniJS
+     turn it on, Scheme does not.** Final, against the old collector:
+     Mini 0.996, MiniJS 0.995, Scheme 0.973.
+   - *What limits it.* Every minor survivor is promoted (no aging), so
+     objects in use at a minor collection fill the old generation until
+     the next major; a small nursery made this worse than no generations,
+     so the nursery is the full growth budget. Sweeping is eager. Minor
+     collections sweep only the chunks allocated from, but that is still
+     every chunk the nursery passed through. Majors pay an extra pass to
+     clear the sticky marks.
+   - *Left open*: aging (which needs remembered-set entries kept while
+     they point at young survivors), card marking for large arrays
+     (stored into, they are retraced whole by each minor collection),
+     lazy sweeping, and epoch marks instead of the clearing pass.
 3. **Variable-length encodings and superinstructions.** Reusing words for
    fusion (language.md §7.3) is clean for fixed widths. For byte streams it
    needs either padding or "fused only at build time". Which one?

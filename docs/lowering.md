@@ -481,8 +481,13 @@ On x86-64 that is `testb $0x1,-0x9(%rax); jne`. The header shares a
 cache line with the object's first fields, which a store has usually just
 touched (a shape check before an inline-slot store, the length before an
 element store). Measured cost in a non-generational heap (no object ever
-has `LOG`): within noise on all three interpreters (see the roadmap,
-open question 2). The `remember` call keeps the handler from being a
+has `LOG`): geomean +0.4% on Mini and +0.6% on MiniJS, at worst +3%
+(MiniJS `richards`), within the placement noise (see the roadmap, open
+question 2). `std.gc.alloc` writes the type id, mark and flags bytes in
+one store after its refill path has merged, so for a store into an
+object allocated earlier in the same function, with no other stores in
+between that could alias the header, LLVM knows the flags are 0 and
+deletes the barrier (Mini's `CLOSURE` has none left). The `remember` call keeps the handler from being a
 leaf: in tail-call mode MiniJS's `SETPROP_IN` gains a `push`/`pop` pair
 that aligns the stack for it on the fast path too, since the slow path
 rejoins the dispatch.
