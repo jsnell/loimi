@@ -848,7 +848,8 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     // optimized again (after quickening, say); the longest match wins.
     let _ = writeln!(s, "{vis}fn {n}__optimize_words(code: []{w}) {{");
     if jit {
-        // The JIT's replaced words go back first (its code is dropped).
+        // The JIT's enter words go back first; afterwards it re-patches
+        // the code of the instructions whose words changed.
         let _ = writeln!(s, "  loimi_jit_invalidate(code.ptr as *u8);");
     }
     let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
@@ -870,7 +871,11 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         );
         first = false;
     }
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n}}");
+    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");
+    if jit {
+        let _ = writeln!(s, "  loimi_jit_rewritten(code.ptr as *u8);");
+    }
+    let _ = writeln!(s, "}}");
     // Deoptimization: every instruction word back to its family's
     // generic op, splitting supers (the head becomes its first part's
     // generic; the parts' words are instructions of their own). Members of
@@ -886,7 +891,11 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
     let _ = writeln!(s, "    var __k: u64 = 1;");
     let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
-    let _ = writeln!(s, "    __i += __size;\n  }}\n}}");
+    let _ = writeln!(s, "    __i += __size;\n  }}");
+    if jit {
+        let _ = writeln!(s, "  loimi_jit_rewritten(__code.ptr as *u8);");
+    }
+    let _ = writeln!(s, "}}");
     s
 }
 
@@ -1251,7 +1260,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 if jit {
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.
-                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\n");
+                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\nextern \"C\" fn loimi_jit_rewritten(code: *u8);\n");
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
                 src.push_str(&generate_labels(v, &l));

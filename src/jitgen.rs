@@ -133,6 +133,52 @@ pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
     }
 }
 
+/// Per op of vm `vd`: whether an instruction word holding it may be
+/// rewritten while its code is compiled. That is the case if it can
+/// `become` (its handler, or a shared function or op it continues in,
+/// rewrites the word), if it is a superinstruction (`Vm.deopt`, or a
+/// `become` in a later part), or if it is the first part of one
+/// (`Vm.optimize` fuses it). The JIT gives such instructions' compiled
+/// code a 5-byte prefix that it can turn into a jump to new code.
+pub fn rewritable_ops(p: &Program, vd: &VmDef) -> Vec<bool> {
+    let mut becomes: std::collections::HashMap<FnId, (bool, Vec<FnId>)> = std::collections::HashMap::new();
+    let mut work: Vec<FnId> = vd.ops.iter().map(|o| o.fid).collect();
+    while let Some(fid) = work.pop() {
+        if becomes.contains_key(&fid) {
+            continue;
+        }
+        let mut b = false;
+        let mut callees = Vec::new();
+        if let Some(body) = &p.fns[fid as usize].body {
+            crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
+                TK::Vm(TVm::Become(..)) => b = true,
+                TK::Vm(TVm::Shared(c, ..)) => callees.push(*c),
+                TK::Vm(TVm::Chain(k)) => callees.push(vd.ops[*k as usize].fid),
+                _ => {}
+            });
+        }
+        work.extend(callees.iter().copied());
+        becomes.insert(fid, (b, callees));
+    }
+    // Close over the functions each one continues in.
+    loop {
+        let mut changed = false;
+        let snapshot: Vec<(FnId, bool)> = becomes.iter().map(|(f, (b, _))| (*f, *b)).collect();
+        let get = |f: &FnId| snapshot.iter().any(|(g, b)| g == f && *b);
+        for (_, (b, cs)) in becomes.iter_mut() {
+            if !*b && cs.iter().any(get) {
+                *b = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let heads: Vec<u32> = vd.ops.iter().filter_map(|o| o.parts.first().copied()).collect();
+    vd.ops.iter().enumerate().map(|(k, o)| becomes[&o.fid].0 || !o.parts.is_empty() || heads.contains(&(k as u32))).collect()
+}
+
 /// The opcode the JIT writes over instructions that have compiled code:
 /// the highest one no op uses.
 pub fn enter_opcode(vd: &VmDef) -> u32 {
@@ -362,13 +408,15 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     );
     let _ = writeln!(globals, "@loimi_jit_entries = external global ptr");
     let _ = writeln!(globals, "@loimi_jit_hotcount = external global [{} x i16]", HOT_SLOTS);
-    let _ = writeln!(fns, "declare void @loimi_jit_hot(ptr)\ndeclare void @loimi_jit_become(ptr)");
+    let _ = writeln!(fns, "declare void @loimi_jit_hot(ptr)\ndeclare void @loimi_jit_become(ptr, i32)");
     // Per opcode: { the size of its first word's instruction (a super's
     // first part: the later parts' words are instructions too), the
     // opcode whose stencil to use (0xffff: invalid), flags, the size of
     // the whole op, the stencil to use if that one is missing (a super's
     // first part) }. Flag 1: reads the next word as its `then` operand;
-    // 2: a super (the words of its later parts must keep their opcodes).
+    // 2: a super (the words of its later parts must keep their opcodes);
+    // 4: its word may be rewritten at run time (`rewritable_ops`).
+    let rw = rewritable_ops(p, vd);
     let mut info = Vec::new();
     let ty = "{ i16, i16, i16, i16, i16 }";
     for i in 0..n {
@@ -378,7 +426,8 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
                     Some(&b) => &vd.ops[b as usize],
                     None => o,
                 };
-                let flags = (first.then as u32) | ((!o.parts.is_empty() as u32) << 1);
+                let k = vd.ops.iter().position(|x| x.opcode == i).unwrap();
+                let flags = (first.then as u32) | ((!o.parts.is_empty() as u32) << 1) | ((rw[k] as u32) << 2);
                 format!("{ty} {{ i16 {}, i16 {}, i16 {}, i16 {}, i16 {} }}", first.size, o.opcode, flags, o.size, first.opcode)
             }
             None => format!("{ty} {{ i16 0, i16 -1, i16 0, i16 0, i16 -1 }}"),

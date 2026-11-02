@@ -145,11 +145,16 @@ fn mini_scripts() {
 /// The copy-and-patch JIT prototype (`--jit-stencils`, x86-64 Linux):
 /// every script and conformance test with the JIT on and its hot
 /// threshold at 1, so code is compiled at its first call or backward
-/// jump (and again after each invalidation).
+/// jump (and again after each rewrite of its words), then again with
+/// recompiles off (`LOIMI_JIT_RECOMPILE=1`): rewrites of compiled code
+/// then make out-of-line copies and retarget instructions instead.
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_jit_stencils() {
     let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")];
+    mini_scripts_with(&["--jit-stencils"], &env, |_| true);
+    mini_conformance_with(&["--jit-stencils"], &env);
+    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")];
     mini_scripts_with(&["--jit-stencils"], &env, |_| true);
     mini_conformance_with(&["--jit-stencils"], &env);
 }
@@ -289,6 +294,7 @@ fn scheme_programs() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn scheme_jit_stencils() {
     scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
+    scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]);
 }
 
 fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
@@ -362,6 +368,9 @@ fn minijs_programs() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn minijs_jit_stencils() {
     minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
+    // Rewrites of compiled code without recompiles: out-of-line copies,
+    // retargets, and sites left to the interpreter.
+    minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]);
 }
 
 fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {

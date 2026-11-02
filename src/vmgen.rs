@@ -494,13 +494,14 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
             let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
-            if crate::jitgen::counting(g) && !hg.combined {
-                // The JIT may have replaced words of this code: it restores
-                // them (and drops the compiled code) before the rewrite.
-                g.emit(format!("call void @loimi_jit_become(ptr {})", pc));
-            }
             if *back > 0 {
                 pc = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 -{}", wt, pc, back));
+            }
+            if crate::jitgen::counting(g) && !hg.combined {
+                // The JIT may have replaced the word with an enter word: it
+                // makes the rewrite, and re-patches its compiled code.
+                g.emit(format!("call void @loimi_jit_become(ptr {}, i32 {})", pc, opc));
+                return "zeroinitializer".into();
             }
             let w = g.inst(format!("load {}, ptr {}", wt, pc));
             let mask = ((1u64 << vd.op_bits) - 1) << vd.op_shift;
