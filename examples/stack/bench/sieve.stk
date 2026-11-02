@@ -1,0 +1,17 @@
+\ arrays: sieve of Eratosthenes, repeated
+: sieve ( n -- count )
+  { n } n 1 + array { flags }
+  n 1 + 2 do true flags i ! loop
+  0 { count }
+  n 1 + 2 do
+    flags i @ if
+      count 1 + to count
+      i i * { k }
+      begin k n <= while false flags k ! k i + to k repeat
+    then
+  loop
+  count ;
+var total
+0 to total
+30 0 do 100000 sieve total + to total loop
+total print

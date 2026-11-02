@@ -1,0 +1,5 @@
+\ allocation: string building and short-lived arrays
+: build ( n -- s ) { n } "" n 0 do i 10 mod tostr concat loop ;
+: churn ( n -- k ) { n } 0 n 0 do [ i i 1 + i 2 + ] 1 @ + loop ;
+0 200 0 do 2000 build len + loop print
+3000000 churn print

@@ -1,0 +1,9 @@
+\ floats through locals and arrays: a 2-body-ish spring simulation
+: step ( arr -- )
+  { s }
+  s 0 @ { x } s 1 @ { v }
+  x -0.01 * v + to v
+  v 0.01 * x + to x
+  x s 0 ! v s 1 ! ;
+: run ( n -- x ) { n } [ 1.0 0.0 ] { s } n 0 do s step loop s 0 @ ;
+5000000 run print

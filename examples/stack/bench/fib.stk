@@ -1,0 +1,3 @@
+\ calls: naive Fibonacci
+: fib ( n -- f ) dup 2 < if exit then dup 1 - fib swap 2 - fib + ;
+32 fib print

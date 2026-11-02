@@ -441,6 +441,19 @@ pub vm Stak {
         cold { raise "int: not a number in the int range" }
     }
 
+    // Superinstructions, from `--vm-stats` on the benchmarks.
+    super PUSHI_ADD = PUSHI; ADD;
+    super PUSHI_SUB = PUSHI; SUB;
+    super PUSHI_MOD = PUSHI; MOD;
+    super PUSHI_AT = PUSHI; AT;
+    super PUSHI_LT_JZ = PUSHI; LT; JZ;
+    super PUSHK_MUL = PUSHK; MUL;
+    super PUSHK_ADD = PUSHK; ADD;
+    super LT_JZ = LT; JZ;
+    super LE_JZ = LE; JZ;
+    super GT_JZ = GT; JZ;
+    super LGET_LGET = LGET; LGET;
+
     entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc {
         ctx = m;
         fp = m.frames;

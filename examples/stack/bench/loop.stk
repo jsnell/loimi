@@ -1,0 +1,7 @@
+\ integer and float arithmetic in counted loops
+: ints ( n -- s ) 0 swap 0 do i 3 mod + i 7 + drop loop ;
+: floats ( n -- x ) 0.0 swap 0 do 0.5 * 1.0 + loop ;
+: both ( n -- ) { n } 0 n 0 do i 3 mod + dup 1000000 > if 1000000 - then loop print ;
+30000000 ints print
+30000000 floats print
+30000000 both
