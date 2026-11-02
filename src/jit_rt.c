@@ -45,6 +45,7 @@ extern const char *const loimi_jit_opnames[];
 
 #define HOT_SLOTS 4096
 void **loimi_jit_entries;
+uint8_t loimi_jit_on;
 uint16_t loimi_jit_hotcount[HOT_SLOTS];
 
 enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA };
@@ -98,6 +99,7 @@ __attribute__((constructor)) static void jit_init(void) {
     const char *h = getenv("LOIMI_JIT_HOT");
     if (h && atoi(h) > 0 && atoi(h) < 65535) threshold = (uint16_t)atoi(h);
     if (!enabled) threshold = 65535;
+    loimi_jit_on = enabled;
     for (int i = 0; i < HOT_SLOTS; i++) loimi_jit_hotcount[i] = threshold;
     const char *s = getenv("LOIMI_JIT_STATS");
     stats = enabled && s && *s && strcmp(s, "0") != 0;
@@ -120,6 +122,7 @@ static int init_region(void) {
     if (p == MAP_FAILED) p = mmap((void *)0x40000000, size, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
         enabled = 0;
+        loimi_jit_on = 0;
         return 0;
     }
     region = p;

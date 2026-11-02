@@ -170,7 +170,9 @@ pub enum JumpKind {
     Const(i64),
     /// Computed from pc and operands (a label), possibly through locals.
     PcRel,
-    /// Read from memory or another object (calls and returns).
+    /// The start of a verified code object (`jump p.code`: a call).
+    Entry,
+    /// Read from memory (returns).
     Dynamic,
 }
 
@@ -190,6 +192,7 @@ pub fn jump_kind(t: &TExpr, pc_local: LocalId) -> JumpKind {
             JumpKind::Const(_) => JumpKind::PcRel,
             k => k,
         },
+        TK::Field(code, 0) if matches!(code.ty, Ty::Slice(_)) => JumpKind::Entry,
         _ => JumpKind::Dynamic,
     }
 }
@@ -225,6 +228,13 @@ pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
 pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
     let hg = g.vm.clone().unwrap();
     let go = g.fresh_label("hotgo");
+    // Nothing to count with the JIT off: a load and a predictable branch
+    // instead of a read-modify-write that loops would carry.
+    let on = g.inst("load i8, ptr @loimi_jit_on");
+    let on = g.inst(format!("icmp ne i8 {}, 0", on));
+    let cnt0 = g.fresh_label("hoton");
+    g.cond_br(&on, &cnt0, &go);
+    g.label(&cnt0);
     if backward_only {
         let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
         let back = g.inst(format!("icmp ule ptr {}, {}", target, pc));
@@ -290,6 +300,7 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
         pc = vd.pc_idx,
     );
     let _ = writeln!(globals, "@loimi_jit_entries = external global ptr");
+    let _ = writeln!(globals, "@loimi_jit_on = external global i8");
     let _ = writeln!(globals, "@loimi_jit_hotcount = external global [{} x i16]", HOT_SLOTS);
     let _ = writeln!(fns, "declare void @loimi_jit_hot(ptr)\ndeclare void @loimi_jit_become(ptr)");
     // Per opcode: { the size of its first word's instruction (a super's

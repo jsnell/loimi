@@ -698,10 +698,13 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
         match kind {
             JumpKind::Const(_) => {}
             JumpKind::PcRel => crate::jitgen::hot_count(g, vd, target, true),
-            JumpKind::Dynamic => {
+            // Calls count (as LuaJIT's function headers do); returns do
+            // not: a caller gets hot through its own calls and loops.
+            JumpKind::Entry => {
                 crate::jitgen::enter_if_compiled(g, vd, target);
                 crate::jitgen::hot_count(g, vd, target, false)
             }
+            JumpKind::Dynamic => crate::jitgen::enter_if_compiled(g, vd, target),
         }
         dispatch(g, target);
         return;
@@ -740,9 +743,13 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
             }
             dispatch(g, target);
         }
-        JumpKind::Dynamic => {
+        JumpKind::Entry => {
             crate::jitgen::enter_if_compiled(g, vd, target);
             crate::jitgen::hot_count(g, vd, target, false);
+            dispatch(g, target);
+        }
+        JumpKind::Dynamic => {
+            crate::jitgen::enter_if_compiled(g, vd, target);
             dispatch(g, target);
         }
     }
