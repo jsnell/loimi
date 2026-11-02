@@ -1,0 +1,41 @@
+// matrix: dispatch
+// Lint `super_overlap`: GETG_SUBK = GETG; SUBK and SUBK_CALL = SUBK; CALL
+// share SUBK. `optimize` fuses left to right, so in GETG; SUBK; CALL the
+// first super takes SUBK and SUBK_CALL never runs there. The warning
+// says so; `#[allow(super_overlap)]` on a super (or the vm) silences it.
+// expect-stderr: warning[super_overlap]: superinstruction `SUBK_CALL` overlaps `GETG_SUBK`: in `GETG; SUBK; CALL`, `optimize` fuses `GETG_SUBK` and `SUBK_CALL` cannot run there
+// expect-no-stderr: `RET_ADD`
+import std.io;
+
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op GETG(dst: reg, v: imm) : ABC { dst = v as i64; next }
+    op SUBK(dst: reg, a: reg, k: imm) : ABC { dst = a - k as i64; next }
+    op CALL(a: reg) : ABC { regs[a.raw + 1] = a * 10; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op RET(a: reg) : ABC { exit a }
+
+    super GETG_SUBK = GETG; SUBK;
+    super SUBK_CALL = SUBK; CALL;
+    // ADD; RET and RET; ADD also overlap, deliberately.
+    super ADD_RET = ADD; RET;
+    #[allow(super_overlap)]
+    super RET_ADD = RET; ADD;
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [M.GETG(0, 9), M.SUBK(0, 0, 2), M.CALL(0), M.ADD(2, 0, 1), M.RET(2), 0, 0, 0];
+    var regs: [i64; 4] = [0; 4];
+    M.optimize(code[..5]);
+    for i in 0..5 { if i > 0 { io.print(" "); } io.print(M.op_name(code[i])); }
+    io.println("");
+    io.print_int(M.run(&code[0], &regs[0])); io.println("");
+}
+// expect: GETG_SUBK SUBK_CALL CALL ADD_RET RET
+// expect: 77

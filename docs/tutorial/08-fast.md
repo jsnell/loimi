@@ -252,6 +252,13 @@ original instruction, and fusion needs no control-flow analysis.
     for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
 ```
 
+`Pip.optimize` goes left to right and fuses, at each instruction, the
+longest super that starts there. `SUBK_CALL` and `GETGLOBAL_SUBK` share
+the `SUBK`, so in `GETGLOBAL; SUBK; CALL` the first one wins and
+`SUBK_CALL` does not run there; the compiler says so with a
+`super_overlap` warning. Here both pairs are frequent on their own, so
+the declarations stay.
+
 Quickening and supers interact: `Pip.optimize` runs on generic code, so
 it sees `GETGLOBAL; SUBK`. When the GETGLOBAL part quickens, the super's
 head is rewritten to the super with that part replaced

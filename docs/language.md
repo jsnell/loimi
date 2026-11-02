@@ -139,8 +139,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The only lint so far is
-  `match_fallout`.
+  the warnings that remain into errors. The lints are `match_fallout`
+  and `super_overlap` (section 7.3).
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -1028,10 +1028,33 @@ safe, needs no control-flow analysis, and can happen at build time (the
 
 `Vm.optimize(code)` is the generated peephole pass. It compares words by
 the op they stand for alone (a super's head counts as its first part), so
-it can run again on code that has been optimized and quickened; where
-several supers match, the one with the most parts wins. The generated
-verifier treats every part's word as an instruction: jumps may land on
-it, and it must hold an op of the same family as the super's part.
+it can run again on code that has been optimized and quickened. The
+generated verifier treats every part's word as an instruction: jumps may
+land on it, and it must hold an op of the same family as the super's part.
+
+**The matching rule.** `optimize` walks the code left to right. At each
+instruction it fuses the longest declared super that starts there, if
+any, and moves on to the next word, which is the super's second part.
+It does not look ahead: with `super GETGLOBAL_SUBK = GETGLOBAL; SUBK;`
+and `super SUBK_CALL = SUBK; CALL;`, the sequence `GETGLOBAL; SUBK; CALL`
+becomes `GETGLOBAL_SUBK` followed by the plain `CALL`, since the `SUBK`
+belongs to the first super. (The `SUBK` word does become a `SUBK_CALL`
+head, but it only runs if something jumps to it.) Declared supers where
+a proper suffix of one is a proper prefix of another get a warning,
+`super_overlap`, at the later declared one; declare the longer super if
+the whole sequence is hot, drop one of the two, or silence it with
+`#[allow(super_overlap)]` on that super or on the vm.
+
+**Supers of quickened members.** `optimize` usually runs on freshly
+emitted code, where every family is at its `generic` member, so a super
+whose parts are specialized members (`GETGLOBAL_C; SUBK`) only forms when
+`optimize` runs again after quickening, or by quickening inside a super:
+when the `GETGLOBAL` part of a `GETGLOBAL_SUBK` runs `become GETGLOBAL_C`,
+the head becomes `GETGLOBAL_C_SUBK` only if that super is declared, and
+is otherwise split back into its parts. To keep a super across
+quickening, declare both: the pair with the generic member, which
+`optimize` forms, and the pair with the quickened member, which the
+`become` turns it into.
 
 **Forwarding.** In `#[forward] super A_B = A; B;`, each part after the
 first is compiled twice for an operand that may name a register the

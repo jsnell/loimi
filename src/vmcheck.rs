@@ -200,10 +200,60 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
     id
 }
 
+/// Lint `super_overlap`: two supers where a proper suffix of one is a
+/// proper prefix of the other (`GETGLOBAL; SUBK` and `SUBK; CALL`).
+/// `Vm.optimize` fuses left to right, so in `GETGLOBAL; SUBK; CALL` the
+/// first super takes the shared `SUBK` and the second never runs there.
+/// One warning per super, at the later declared of each pair, naming the
+/// earlier ones it overlaps.
+fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayout) {
+    let supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
+    let span_of = |k: usize| d.supers.iter().find(|s| s.name.name == l.ops[k].name).map(|s| s.name.span);
+    let names = |ps: &[usize]| ps.iter().map(|&p| l.ops[p].name.as_str()).collect::<Vec<_>>().join("; ");
+    // The sequence in which `x` then `y` both match, if they overlap that way.
+    let overlap = |x: usize, y: usize| -> Option<Vec<usize>> {
+        let (px, py) = (&l.ops[x].parts, &l.ops[y].parts);
+        let k = (1..px.len().min(py.len())).find(|&k| px[px.len() - k..] == py[..k])?;
+        let mut seq = px.clone();
+        seq.extend_from_slice(&py[k..]);
+        Some(seq)
+    };
+    for (bi, &b) in supers.iter().enumerate() {
+        let Some(sb) = span_of(b) else { continue };
+        let mut partners = Vec::new();
+        let mut example = None;
+        for &a in &supers[..bi] {
+            let found = overlap(a, b).map(|s| (a, b, s)).or_else(|| overlap(b, a).map(|s| (b, a, s)));
+            if let Some((x, y, seq)) = found {
+                partners.push(format!("`{}`", l.ops[a].name));
+                example.get_or_insert((x, y, seq, a));
+            }
+        }
+        let Some((x, y, seq, a)) = example else { continue };
+        let mut w = Diag::warning(
+            "super_overlap",
+            sb,
+            format!(
+                "superinstruction `{}` overlaps {}: in `{}`, `optimize` fuses `{}` and `{}` cannot run there (the first super that matches, left to right, wins)",
+                l.ops[b].name,
+                partners.join(", "),
+                names(&seq),
+                l.ops[x].name,
+                l.ops[y].name
+            ),
+        );
+        if let Some(sa) = span_of(a) {
+            w = w.note(sa, format!("`{}` is declared here", l.ops[a].name));
+        }
+        c.warnings.push(w);
+    }
+}
+
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
     let mut l = crate::vmexpand::layout(&d)?;
+    warn_super_overlaps(c, &d, &l);
     let prefix = format!("{}.{}", c.module_prefix(m), d.name.name);
     let word = IntTy { signed: false, bits: l.word_bits as u8 };
 
