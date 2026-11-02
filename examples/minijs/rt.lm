@@ -125,6 +125,8 @@ pub fn Ctx.new() -> Ctx {
 /// Finish setting up once `c` has its final address.
 pub fn Ctx.init(c: *Ctx) {
     c.m.attach(&c.heap);
+    // Reading an absent property gives undefined: cache those reads too.
+    c.m.ic.absent = true;
     // Allocate three times the live data (at least 8 MiB) between
     // collections: as fast as a 64 MiB minimum at 100%, with a quarter
     // of the memory for programs with little live data.
@@ -627,7 +629,7 @@ pub fn Ctx.set_index(c: *Ctx, v: V, key: V, x: V) -> Result<(), V> {
 /// `k in v`.
 pub fn Ctx.has(c: *Ctx, v: V, k: u64) -> Result<bool, V> {
     match v {
-        O(o) => Ok(found(c.m.lookup(o, k))),
+        O(o) => Ok(c.m.has_mega(o, k)),
         A(a) => {
             if k == c.k_length { return Ok(true); }
             let i = c.key_index(k);

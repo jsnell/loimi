@@ -172,11 +172,15 @@ fn prim_get(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32) -> Result<(V, boo
     Ok((c.get(v, key)?, false))
 }
 
-/// SETPROP miss: store, and update the site (an obj.Site).
-fn write_miss(c: *Ctx, v: V, kv: V, x: V, site: *obj.Site) -> Result<obj.IcState, V> {
+/// SETPROP miss in state `st`: store, and update the site (an obj.Site).
+/// Other receivers than objects keep Poly and Mega sites as they are.
+fn write_miss(c: *Ctx, v: V, kv: V, x: V, site: *obj.Site, st: obj.IcState) -> Result<obj.IcState, V> {
     let key = key_of_const(c, kv);
-    let O(o) = v else { c.set(v, key, x)?; return Ok(obj.IcState.Generic); };
-    Ok(c.m.write_miss(site, o, key, x))
+    let O(o) = v else {
+        c.set(v, key, x)?;
+        return Ok(if st == obj.IcState.Poly or st == obj.IcState.Mega { st } else { obj.IcState.Generic });
+    };
+    Ok(c.m.write_miss_in(site, st, o, key, x))
 }
 
 /// Create a closure of child prototype `i` of the running function.
@@ -458,6 +462,7 @@ pub vm JS {
                     if st == obj.IcState.OwnIn { become #own_in; }
                     if st == obj.IcState.OwnOut { become #own_out; }
                     if st == obj.IcState.Proto { become #protom; }
+                    if st == obj.IcState.Poly { become #polym; }
                     next
                 }
                 let (v, p) = prim_get(ctx, obj, key, &cache.sid, &cache.slot)?;
@@ -578,13 +583,18 @@ pub vm JS {
         }
     }
 
+    // Store sites: std.obj's write state machine (write_miss_in). A
+    // monomorphic member that keeps missing becomes _POLY (up to eight
+    // own-slot entries), and a Poly entry that keeps filling up makes the
+    // site _MEGA (the slow path, without refilling).
     family SETPROP(obj: reg, key: kst, val: reg) : ABC + PropIC {
         generic {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site)?;
+            let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Generic)?;
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.OwnOut { become SETPROP_OUT; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
+            if st == obj.IcState.Poly { become SETPROP_POLY; }
             next
         }
         SETPROP_IN {
@@ -592,7 +602,15 @@ pub vm JS {
                 o.inline.ptr[cache.slot] = val;
                 next
             }
-            cold { become SETPROP; redo }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnIn)?;
+                if st == obj.IcState.OwnOut { become SETPROP_OUT; }
+                if st == obj.IcState.Add { become SETPROP_ADD; }
+                if st == obj.IcState.Poly { become SETPROP_POLY; }
+                if st == obj.IcState.Generic { become SETPROP; }
+                next
+            }
         }
         SETPROP_OUT {
             if let O(o) = obj and o.shape.id == cache.sid {
@@ -600,7 +618,15 @@ pub vm JS {
                 s.data.ptr[cache.slot & !obj.OUT] = val;
                 next
             }
-            cold { become SETPROP; redo }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnOut)?;
+                if st == obj.IcState.OwnIn { become SETPROP_IN; }
+                if st == obj.IcState.Add { become SETPROP_ADD; }
+                if st == obj.IcState.Poly { become SETPROP_POLY; }
+                if st == obj.IcState.Generic { become SETPROP; }
+                next
+            }
         }
         // A cached add: the shape check proves the object is not a
         // prototype (std.obj gives those other shapes).
@@ -610,6 +636,23 @@ pub vm JS {
                 next
             }
             cold { become SETPROP; redo }
+        }
+        SETPROP_POLY {
+            if let O(o) = obj and ctx.m.poly_set(o, cache.ent, val) { next }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Poly)?;
+                if st == obj.IcState.Mega { become SETPROP_MEGA; }
+                next
+            }
+        }
+        SETPROP_MEGA {
+            if let (O(o), S(ks)) = (obj, key) and ctx.m.mega_set(o, ks.key as u64, val) { next }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Mega)?;
+                next
+            }
         }
     }
 

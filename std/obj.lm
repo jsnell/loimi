@@ -99,6 +99,10 @@ pub const OUT: u32 = 0x80000000;
 pub const EMPTY_ID: u32 = 0;
 /// The id of the dictionary-mode shape; never stored in a cache.
 pub const DICT_ID: u32 = 0xFFFFFFFF;
+/// The slot of an absent-property hit (Poly and Mega entries): the key is
+/// on neither the receiver (its shape says so) nor its prototype chain
+/// (the cell says so; cell 0 means the receiver has no prototype).
+pub const ABSENT: u32 = 0xFFFFFFFF;
 /// Shape and Dict flag: the object (is or was a prototype and) may have
 /// a validity cell.
 pub const PROTO: u32 = 1;
@@ -581,6 +585,10 @@ pub struct Ics {
     /// (read-only properties, setters): the interpreter checks those in
     /// its slow path.
     readonly: u32,
+    /// Cache absent properties in Poly and Mega entries: their hits give
+    /// `nil` (so only for models where reading an absent property gives
+    /// nil, as in JavaScript and Lua). Off by default.
+    absent: bool,
     poly: mem.Vec<Poly>,
     mega: MegaCache,
 }
@@ -691,7 +699,7 @@ pub struct Model<O, S, V> {
 pub fn Model<O, S, V>.new(new_slots: fn(*gc.Heap, u64) -> S, nil: V) -> Model<O, S, V> {
     Model {
         shapes: Shapes.new(), new_slots: new_slots, nil: nil, dict_threshold: 64,
-        ic: Ics { refills: 8, resets: 8, readonly: 0, poly: mem.Vec.new(), mega: MegaCache.new(4096) },
+        ic: Ics { refills: 8, resets: 8, readonly: 0, absent: false, poly: mem.Vec.new(), mega: MegaCache.new(4096) },
     }
 }
 
@@ -1163,6 +1171,7 @@ pub fn Model<O, S, V>.proto_load(m: *Model<O, S, V>, o: O, slot: u32, cell: u32,
 /// A full check of a hit: shape, then own slot or prototype.
 pub fn Model<O, S, V>.hit(m: *Model<O, S, V>, o: O, h: *Hit) -> ?V {
     if o.shape.id != h.sid { return None; }
+    if h.slot == ABSENT { return m.absent(h.cell); }
     if h.cell == 0 { return Some(m.load_ref(o, h.slot)); }
     m.proto_load(o, h.slot, h.cell, h.depth)
 }
@@ -1174,8 +1183,10 @@ pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
     for i in 0..p.n {
         if p.sids[i] == sid {
             let c = p.cells[i];
-            if c == 0 { return Some(m.load_ref(o, p.slots[i])); }
-            return m.proto_load(o, p.slots[i], c, p.depths[i]);
+            let r = p.slots[i];
+            if r == ABSENT { return m.absent(c); }
+            if c == 0 { return Some(m.load_ref(o, r)); }
+            return m.proto_load(o, r, c, p.depths[i]);
         }
     }
     None
@@ -1185,8 +1196,34 @@ pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
 pub fn Model<O, S, V>.mega_get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
     let x = m.ic.mega.entry(o.shape.id, key);
     if x.sid != o.shape.id or x.key != key { return None; }
+    if x.slot == ABSENT { return m.absent(x.cell); }
     if x.cell == 0 { return Some(m.load_ref(o, x.slot)); }
     m.proto_load(o, x.slot, x.cell, x.depth)
+}
+
+/// A store through the shared MegaCache (no fill): true if it holds an
+/// own-slot hit for `o`'s shape and `key`. Only when no attributes are
+/// read-only (`ic.readonly` is 0): read sites fill the cache too.
+pub fn Model<O, S, V>.mega_set(m: *Model<O, S, V>, o: O, key: u64, v: V) -> bool {
+    let x = m.ic.mega.entry(o.shape.id, key);
+    if x.sid != o.shape.id or x.key != key or x.cell != 0 or x.slot == ABSENT or m.ic.readonly != 0 { return false; }
+    m.store_ref(o, x.slot, v);
+    true
+}
+
+/// `key in o` (own or inherited) through the shared MegaCache, filling it.
+pub fn Model<O, S, V>.has_mega(m: *Model<O, S, V>, o: O, key: u64) -> bool {
+    if o.dict.is_none() {
+        let x = m.ic.mega.entry(o.shape.id, key);
+        if x.sid == o.shape.id and x.key == key {
+            if x.slot == ABSENT {
+                if m.absent(x.cell).is_some() { return false; }
+            } else if x.cell == 0 or m.shapes.cvalid.ptr[x.cell] != 0 {
+                return true;
+            }
+        }
+    }
+    m.read_mega(&m.ic.mega, o, key).is_some()
 }
 
 /// Read `key` through the chain using MegaCache `c`, filling it on a miss
@@ -1198,8 +1235,25 @@ pub fn Model<O, S, V>.read_mega(m: *Model<O, S, V>, c: *MegaCache, o: O, key: u6
     }
     var h = Hit.empty();
     let v = m.read(o, key, &h);
+    if v.is_none() { m.absent_hit(o, &h); }
     if h.sid != EMPTY_ID { c.put(key, &h); }
     v
+}
+
+/// After a read of `o` found nothing: the hit that caches that (left
+/// empty for dictionary-mode receivers).
+fn Model<O, S, V>.absent_hit(m: *Model<O, S, V>, o: O, h: *Hit) {
+    if o.dict.is_some() or !m.ic.absent { return; }
+    // As in `read`: the cell first (it may move the chain to prototype
+    // shapes), then the receiver's shape id.
+    let c = match o.proto { Some(p) => m.cell(p), None => 0 };
+    *h = Hit { sid: o.shape.id, slot: ABSENT, cell: c, depth: 0 };
+}
+
+/// An absent-property hit with cell `c`: nil while the chain is unchanged.
+fn Model<O, S, V>.absent(m: *Model<O, S, V>, c: u32) -> ?V {
+    if c == 0 or m.shapes.cvalid.ptr[c] != 0 { return Some(m.nil); }
+    None
 }
 
 /// Read own property `key` using MegaCache `c`, filling it on a miss (for
@@ -1237,6 +1291,19 @@ pub fn Model<O, S, V>.read_miss(m: *Model<O, S, V>, s: *Site, st: IcState, o: O,
     if st == IcState.Mega { return (m.read_mega(&m.ic.mega, o, key), IcState.Mega); }
     var h = Hit.empty();
     let v = m.read(o, key, &h);
+    if v.is_none() {
+        // Absent properties are cached in Poly entries (monomorphic
+        // members cannot express them).
+        m.absent_hit(o, &h);
+        if h.sid != EMPTY_ID and st != IcState.Poly {
+            m.new_poly(s);
+            let p = m.ic.poly.ptr_at((s.ent - 1) as u64);
+            var old = Hit { sid: s.sid, slot: s.slot, cell: s.cell, depth: s.depth };
+            if st != IcState.Generic and st != IcState.Add and old.sid != EMPTY_ID { p.add(&old); }
+            p.add(&h);
+            return (v, IcState.Poly);
+        }
+    }
     if st == IcState.Poly {
         if h.sid == EMPTY_ID { return (v, IcState.Poly); }
         let p = m.ic.poly.ptr_at((s.ent - 1) as u64);
@@ -1251,12 +1318,8 @@ pub fn Model<O, S, V>.read_miss(m: *Model<O, S, V>, s: *Site, st: IcState, o: O,
     if st != IcState.Generic and st != IcState.Add {
         s.miss += 1;
         if s.miss >= m.ic.refills {
-            if s.ent == 0 {
-                m.ic.poly.push(Poly.new());
-                s.ent = m.ic.poly.len as u32;
-            }
+            m.new_poly(s);
             let p = m.ic.poly.ptr_at((s.ent - 1) as u64);
-            *p = Poly.new();
             var old = Hit { sid: s.sid, slot: s.slot, cell: s.cell, depth: s.depth };
             if old.sid != EMPTY_ID { p.add(&old); }
             if h.sid != EMPTY_ID { p.add(&h); }
@@ -1276,16 +1339,62 @@ pub fn Model<O, S, V>.read_miss(m: *Model<O, S, V>, s: *Site, st: IcState, o: O,
 /// object may have a validity cell. Properties with `ic.readonly`
 /// attributes are not cached.
 pub fn Model<O, S, V>.write_miss(m: *Model<O, S, V>, s: *Site, o: O, key: u64, v: V) -> IcState {
-    if o.dict.is_some() { m.set(o, key, v); return IcState.Generic; }
+    m.write_miss_in(s, IcState.Generic, o, key, v)
+}
+
+/// `write_miss` for a site in state `st`, with polymorphic stores: a
+/// monomorphic store site (OwnIn, OwnOut) that missed `ic.refills` times
+/// becomes Poly (own-slot hits only; `poly_set`), and a Poly entry that
+/// filled up `ic.resets` times makes the site Mega, which is the slow
+/// path every time but never refills.
+pub fn Model<O, S, V>.write_miss_in(m: *Model<O, S, V>, s: *Site, st: IcState, o: O, key: u64, v: V) -> IcState {
+    if st == IcState.Mega {
+        // Fill the shared MegaCache with existing own properties.
+        if o.dict.is_none() and m.ic.readonly == 0 and let Some(i) = m.find(o, key) {
+            var h = Hit { sid: o.shape.id, slot: slot_ref(i, o.inline.len as u32), cell: 0, depth: 0 };
+            m.ic.mega.put(key, &h);
+            m.store(o, i, v);
+            return IcState.Mega;
+        }
+        m.set(o, key, v);
+        return IcState.Mega;
+    }
+    if o.dict.is_some() { m.set(o, key, v); return if st == IcState.Poly { IcState.Poly } else { IcState.Generic }; }
     let w = m.find_word(o, key);
     if w != 0 {
         let i = ((w & LOW) - 1) as u32;
         m.store(o, i, v);
-        if ((w >> 32) as u32) & m.ic.readonly != 0 { return IcState.Generic; }
-        s.sid = o.shape.id;
-        s.slot = slot_ref(i, o.inline.len as u32);
+        if ((w >> 32) as u32) & m.ic.readonly != 0 { return if st == IcState.Poly { IcState.Poly } else { IcState.Generic }; }
+        var h = Hit { sid: o.shape.id, slot: slot_ref(i, o.inline.len as u32), cell: 0, depth: 0 };
+        if st == IcState.Poly {
+            let p = m.ic.poly.ptr_at((s.ent - 1) as u64);
+            if !p.add(&h) {
+                if p.resets >= m.ic.resets { return IcState.Mega; }
+                p.resets += 1;
+                p.n = 0;
+                p.add(&h);
+            }
+            return IcState.Poly;
+        }
+        if st == IcState.OwnIn or st == IcState.OwnOut {
+            s.miss += 1;
+            if s.miss >= m.ic.refills {
+                // `ent` may name an add target (state Add earlier): a
+                // fresh entry (a site goes Poly once).
+                m.ic.poly.push(Poly.new());
+                s.ent = m.ic.poly.len as u32;
+                let p = m.ic.poly.ptr_at((s.ent - 1) as u64);
+                var old = Hit { sid: s.sid, slot: s.slot, cell: 0, depth: 0 };
+                if old.sid != EMPTY_ID { p.add(&old); }
+                p.add(&h);
+                return IcState.Poly;
+            }
+        }
+        s.sid = h.sid;
+        s.slot = h.slot;
         return if s.slot & OUT == 0 { IcState.OwnIn } else { IcState.OwnOut };
     }
+    if st == IcState.Poly { m.add_attrs(o, key, v, 0); return IcState.Poly; }
     let old = o.shape;
     let i = old.count;
     m.add_attrs(o, key, v, 0);
@@ -1299,6 +1408,29 @@ pub fn Model<O, S, V>.write_miss(m: *Model<O, S, V>, s: *Site, o: O, key: u64, v
     s.sid = old.id;
     s.slot = i;
     IcState.Add
+}
+
+/// A store through Poly entry `ent` (index + 1 in `m.ic.poly`) of a
+/// write site: false if `o`'s shape has no own-slot entry.
+pub fn Model<O, S, V>.poly_set(m: *Model<O, S, V>, o: O, ent: u32, v: V) -> bool {
+    let p = m.ic.poly.ptr + (ent - 1) as u64;
+    let sid = o.shape.id;
+    for i in 0..p.n {
+        if p.sids[i] == sid {
+            m.store_ref(o, p.slots[i], v);
+            return true;
+        }
+    }
+    false
+}
+
+/// Give site `s` an empty Poly entry (its own, reused if it has one).
+fn Model<O, S, V>.new_poly(m: *Model<O, S, V>, s: *Site) {
+    if s.ent == 0 {
+        m.ic.poly.push(Poly.new());
+        s.ent = m.ic.poly.len as u32;
+    }
+    *m.ic.poly.ptr_at((s.ent - 1) as u64) = Poly.new();
 }
 
 /// A cached property add, after the vm checked `o.shape.id == site.sid`:

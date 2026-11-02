@@ -28,6 +28,9 @@ import ast;
 import ast.{T, K, VK, Node, Func, Class, Member, Var, fail, is_null, null_node, null_var, null_func, new_node, new_func, new_var};
 import parser.{Parser};
 import vm.{JS};
+import std.io;
+
+extern "C" fn getenv(name: *u8) -> ?*u8;
 
 // ── pass 1: resolve ─────────────────────────────────────────────────
 
@@ -1394,6 +1397,16 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
         fail(f.line, b.as_str());
     }
     JS.optimize(proto.code);
+    if getenv("MINIJS_DIS\0".ptr).is_some() {
+        // Debugging aid: the function's code after peephole fusion.
+        var b = text.StrBuf.new();
+        b.push_str("== ");
+        b.push_str(f.name);
+        b.push_str("\n");
+        JS.disasm(proto.code, &b);
+        io.eprint(b.as_str());
+        b.free();
+    }
     fs.code.free();
     fs.consts.free();
     fs.protos.free();
