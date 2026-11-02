@@ -150,6 +150,9 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
 }
 ```
 
+Inside a `vm`, a loop variable may not have the name of a state variable:
+it would replace every use of that name in the body.
+
 ### 1.5 Modules and interop
 
 `import std.gc.{Gc, Heap};`. `extern "C" fn` declares C functions, and

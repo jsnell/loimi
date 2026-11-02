@@ -77,7 +77,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
   snprintf and strtod). See the notes in [`stdlib.md`](stdlib.md).
 - **`inline for`** is token-level expansion: values are token sequences
   (so operators like `+` work), and `#var` makes an identifier from a
-  string or identifier value.
+  string or identifier value. Inside a `vm`, a loop variable named like a
+  state variable is an error.
 - **Not yet built**: closures and the rest of traits (default methods,
   generic traits; see the proposal in
   [`design/closures-traits.md`](design/closures-traits.md)), a moving,

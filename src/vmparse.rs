@@ -30,9 +30,12 @@ impl Parser {
             verify_ctx: vec![],
             is_pub,
         };
+        // `inline for` variables replace every matching token in the body,
+        // so one named like a state variable would silently replace it.
+        let mut loop_vars: Vec<Ident> = Vec::new();
         while !self.eat("}") {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
-                self.expand_inline_for()?;
+                loop_vars.extend(self.expand_inline_for()?);
                 continue;
             }
             let item_attrs = self.parse_attrs()?;
@@ -240,6 +243,14 @@ impl Parser {
                     vm.variants.push(VariantDecl { name: n, wraps, before });
                 }
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
+            }
+        }
+        for v in &loop_vars {
+            if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {
+                return Err(crate::diag::Diag::new(
+                    v.span,
+                    format!("`inline for` variable `{}` has the name of a vm state variable, which it would replace in the body", v.name),
+                ));
             }
         }
         Ok(vm)
