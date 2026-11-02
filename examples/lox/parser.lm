@@ -94,6 +94,9 @@ pub struct ClassDecl {
     /// The local id of `super`, if there is a superclass.
     super_local: u32,
     methods: mem.Vec<*Fun>,
+    /// The number of distinct `this.name = ...` targets in the methods: a
+    /// guess at how many fields instances get, for their inline slots.
+    nfields: u32,
 }
 
 /// What the code generator needs about a local: its register and whether
@@ -116,7 +119,7 @@ struct FnState {
     nconsts: u32,
 }
 
-struct ClassState { enclosing: ?*ClassState, has_super: bool }
+struct ClassState { enclosing: ?*ClassState, has_super: bool, fields: mem.Vec<str> }
 
 type Pratt = parse.Pratt<Parser, T, *Node, ()>;
 
@@ -333,7 +336,15 @@ fn assign(p: *Parser, op: T, l: *Node) -> Result<*Node, ()> {
     let r = p.pratt.parse(p, 0)?;
     match l.e {
         Var(v) => Ok(p.node(Expr.Assign(v, r), eq.line)),
-        Get(o, name) => Ok(p.node(Expr.Set(o, name, r), p.prev.line)),
+        Get(o, name) => {
+            // `this.name = ...` (this is a Group around a Var).
+            if let Group(_) = o.e and let Some(c) = p.cls {
+                var seen = false;
+                for i in 0..c.fields.len { if c.fields.at(i).eq(name) { seen = true; } }
+                if !seen { c.fields.push(name); }
+            }
+            Ok(p.node(Expr.Set(o, name, r), p.prev.line))
+        }
         _ => {
             p.error_at(eq, "Invalid assignment target.");
             Ok(r)
@@ -532,11 +543,16 @@ fn Parser.class_decl(p: *Parser) -> Result<Stmt, ()> {
     let target = p.declare(name);
     p.mark_initialized();
     let d = p.arena.alloc_bytes(size_of<ClassDecl>(), 8) as *ClassDecl;
-    *d = ClassDecl { name: name.text, target: target, line: name.line, superclass: None, super_local: 0, methods: mem.Vec.new() };
-    var cs = ClassState { enclosing: p.cls, has_super: false };
+    *d = ClassDecl {
+        name: name.text, target: target, line: name.line, superclass: None, super_local: 0,
+        methods: mem.Vec.new(), nfields: 0,
+    };
+    var cs = ClassState { enclosing: p.cls, has_super: false, fields: mem.Vec.new() };
     p.cls = Some(&cs);
     let r = p.class_body(d, name, &cs);
     p.cls = cs.enclosing;
+    d.nfields = if cs.fields.len > 32 { 32 } else { cs.fields.len as u32 };
+    cs.fields.free();
     r?;
     Ok(Stmt.Class(d))
 }

@@ -9,7 +9,8 @@ import std.io;
 import std.gc;
 import std.mem;
 import std.obj;
-import std.prof;
+// clox defines `clock()` as processor time, as C's clock() measures it.
+extern "C" fn clock() -> i64;
 import std.text;
 import value;
 import value.{Value, Proto, LStr, Cell, Closure, Class, Inst, Slots, Bound, Native, Model, Strings};
@@ -208,7 +209,7 @@ fn traceback(m: *Machine, msg: str, top: *Frame, pc: *u32) {
 }
 
 pub fn clock_native(args: *Value) -> Value {
-    Value.Num((prof.now_ns() as f64) / 1000000000.0)
+    Value.Num((clock() as f64) / 1000000.0)
 }
 
 #[require_verified]
@@ -272,8 +273,10 @@ pub vm Lox {
     }
     op NOT(dst: reg, a: reg) : ABC { dst = Bool(value.falsey(a)); next }
 
-    op EQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(value.equal(a, b)); next }
-    op NE(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!value.equal(a, b)); next }
+    inline for (eqname, nename, bkind) in [("EQ", "NE", reg), ("EQK", "NEK", kst)] {
+        op #eqname(dst: reg, a: reg, b: bkind) : ABC { dst = Bool(value.equal(a, b)); next }
+        op #nename(dst: reg, a: reg, b: bkind) : ABC { dst = Bool(!value.equal(a, b)); next }
+    }
     // `a <= b` is `!(a > b)` and `a >= b` is `!(a < b)`, as in clox (it
     // matters for NaN).
     inline for (name, test) in [("LT", x < y), ("GT", x > y), ("LE", !(x > y)), ("GE", !(x < y))] {
@@ -473,8 +476,9 @@ pub vm Lox {
     }
 
     /// Return R[src] to the caller, in its R[base] (our r0).
-    op RET(src: reg) : ABC {
-        let v = src;
+    op RET(src: reg) : ABC { ret(src) }
+    op RETNIL() : ABC { ret(Nil) }
+    fn ret(v: Value) -> never {
         if fp == ctx.frames { exit Ok(()) }
         regs[0] = v;
         fp = fp - 1;
@@ -662,11 +666,12 @@ pub vm Lox {
     }
 
     // ── classes ──────────────────────────────────────────────────────
-    op CLASS(dst: reg, name: kst) : ABC {
+    /// A new class; instances start with room for `nfields` fields inline.
+    op CLASS(dst: reg, name: kst, nfields: imm) : ABC {
         gc_point();
         let Str(s) = name else { cold { raise "internal error: class name" } };
         let methods = new(&ctx.heap, Inst { shape: ctx.m.root(0), dict: None, overflow: None, proto: None, class: None }, 0);
-        dst = Class(new(&ctx.heap, Class { name: s, methods: methods, init: Value.Nil, inline: 4 }));
+        dst = Class(new(&ctx.heap, Class { name: s, methods: methods, init: Value.Nil, inline: nfields as u32 }));
         next
     }
     op INHERIT(cls: reg, sup: reg) : ABC {

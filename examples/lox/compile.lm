@@ -68,6 +68,27 @@ fn C.small_num(c: *C, n: *Node) -> ?u8 {
     if k < 256 { Some(k as u8) } else { None }
 }
 
+/// If `n` is any literal with a constant index that fits 8 bits (for
+/// the K forms of `==` and `!=`).
+fn C.small_lit(c: *C, n: *Node) -> ?u8 {
+    let v = match n.e {
+        Num(x) => Value.Num(x),
+        Bool(b) => Value.Bool(b),
+        Nil => Value.Nil,
+        Str(s) => { let m = c.unit.m; Value.Str(m.strings.intern(&m.heap, s)) }
+        _ => return None,
+    };
+    let k = c.consts.add(v)?;
+    if k < 256 { Some(k as u8) } else { None }
+}
+
+fn is_lit(n: *Node) -> bool {
+    match n.e {
+        Num(_) | Bool(_) | Nil | Str(_) => true,
+        _ => false,
+    }
+}
+
 // ── variables ────────────────────────────────────────────────────────
 
 /// The register of a local that is not captured, if `n` reads one.
@@ -178,6 +199,19 @@ fn C.expr_to(c: *C, n: *Node, dst: u32) {
         }
         Binary(op, l, r) => {
             let mark = c.regs.mark();
+            // `x == literal` (either way round: a literal has no effects
+            // to order) compares with a constant.
+            if (op == T.EqEq or op == T.BangEq) and (is_lit(l) or is_lit(r)) {
+                let (x, lit) = if is_lit(r) { (l, r) } else { (r, l) };
+                let a = c.operand(x);
+                if let Some(k) = c.small_lit(lit) {
+                    c.code.set_loc(n.line);
+                    c.code.op(if op == T.EqEq { Lox.EQK(d, a as u8, k) } else { Lox.NEK(d, a as u8, k) });
+                    c.regs.reset(mark);
+                    return;
+                }
+                c.regs.reset(mark);
+            }
             let a = c.operand(l);
             if let Some(k) = c.small_num(r) and let Some(w) = arith_k(op, d, a as u8, k) {
                 c.code.set_loc(n.line);
@@ -279,6 +313,18 @@ fn C.jump_if_false(c: *C, cond: *Node, l: bc.Label) {
     let mark = c.regs.mark();
     match cond.e {
         Binary(op, x, y) => {
+            if (op == T.EqEq or op == T.BangEq) and (is_lit(x) or is_lit(y)) {
+                let (e, lit) = if is_lit(y) { (x, y) } else { (y, x) };
+                let a = c.operand(e) as u8;
+                if let Some(k) = c.small_lit(lit) {
+                    c.code.set_loc(cond.line);
+                    c.code.op(if op == T.EqEq { Lox.JNEQK(a, k) } else { Lox.JEQK(a, k) });
+                    c.code.jump(Lox.JMP(0), l);
+                    c.regs.reset(mark);
+                    return;
+                }
+                c.regs.reset(mark);
+            }
             let w: ?u32 = match op {
                 Lt | Le | Gt | Ge | EqEq | BangEq => {
                     let a = c.operand(x) as u8;
@@ -347,12 +393,28 @@ fn C.new_local(c: *C, id: u32, line: u32) -> u32 {
 fn C.stmt(c: *C, s: *Stmt) {
     match *s {
         Expr(e) => {
-            // An assignment to a local needs no result register.
-            if let Assign(v, x) = e.e and let Local(id) = v and !c.info(id).captured {
-                c.expr_to(x, c.info(id).slot);
-            } else {
-                let r = c.regs.alloc(1);
-                c.expr_to(e, r);
+            // Assignments as statements need no result register.
+            match e.e {
+                Assign(v, x) => {
+                    if let Local(id) = v and !c.info(id).captured {
+                        c.expr_to(x, c.info(id).slot);
+                    } else {
+                        let r = c.operand(x);
+                        c.code.set_loc(e.line);
+                        c.store_var(v, r, e.line);
+                    }
+                }
+                Set(o, name, v) => {
+                    let ro = c.operand(o);
+                    let rv = c.operand(v);
+                    let k = c.str_const(name, e.line);
+                    c.code.set_loc(e.line);
+                    c.code.op(Lox.SETPROP(ro as u8, k, rv as u8));
+                }
+                _ => {
+                    let r = c.regs.alloc(1);
+                    c.expr_to(e, r);
+                }
             }
         }
         Print(e) => {
@@ -447,7 +509,7 @@ fn C.stmt(c: *C, s: *Stmt) {
             } else {
                 let r = match e {
                     Some(x) => c.operand(x),
-                    None => { let r = c.regs.alloc(1); c.code.op(Lox.LOADNIL(r as u8)); r }
+                    None => { if line != 0 { c.code.set_loc(line); } c.code.op(Lox.RETNIL()); return; }
                 };
                 if line != 0 { c.code.set_loc(line); }
                 c.code.op(Lox.RET(r as u8));
@@ -479,7 +541,7 @@ fn C.class(c: *C, d: *ClassDecl) {
     match d.target {
         Local(id) => {
             let r = c.new_local(id, d.line);
-            c.code.op(Lox.CLASS(r as u8, name));
+            c.code.op(Lox.CLASS(r as u8, name, d.nfields as u8));
             if c.info(id).captured { c.code.op(Lox.NEWCELL(r as u8)); }
             c.regs.end_stmt();
             c.regs.activate(1);
@@ -487,7 +549,7 @@ fn C.class(c: *C, d: *ClassDecl) {
         Upval(_) => {}
         Global(g) => {
             let r = c.regs.alloc(1);
-            c.code.op(Lox.CLASS(r as u8, name));
+            c.code.op(Lox.CLASS(r as u8, name, d.nfields as u8));
             c.code.op(Lox.DEFGLOBAL(r as u8, c.symbol(g, d.line)));
             c.regs.end_stmt();
         }
