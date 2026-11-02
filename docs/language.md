@@ -378,6 +378,14 @@ type-checks the mapping. From the declarations it **generates**:
   (`r3`, `k[7] = "foo"`, `-> 0042`);
 - `Mini.verify` (section 6);
 - metadata tables (sizes, operand kinds, branch targets) for tools.
+- label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
+  jump label of word `w` (its first operand whose kind is `pc + it`) and
+  returns None if `off` does not fit the field or the op has no label;
+  `Vm.label(w) -> ?i64` decodes it; `Vm.FMT_field(w)` reads field
+  `field` of format `FMT` (`Vm.AsBx_sbx(w)`), as a `u64` or, for a
+  signed field, an `i64`. A superinstruction's head word answers for its
+  first part. `set_label` and `label` are the patch and jump-threading
+  functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`.
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.

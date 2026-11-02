@@ -369,6 +369,91 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     s
 }
 
+/// Is operand kind `kind` a jump label: `operand label = pc + it`?
+fn is_label_kind(v: &VmDecl, kind: &str) -> bool {
+    let Some(k) = v.operands.iter().find(|o| o.name.name == kind) else { return false };
+    let is = |e: &Expr, n: &str| matches!(&e.kind, ExprKind::Ident(x) if x == n);
+    match &k.body.kind {
+        ExprKind::Binary(BinOp::Add, a, b) => (is(a, "pc") && is(b, "it")) || (is(a, "it") && is(b, "pc")),
+        _ => false,
+    }
+}
+
+/// Label and field helpers (separate from the other generated items):
+///
+/// - `Vm.set_label(w, off) -> ?W`: word `w` with the offset of its jump
+///   label (the first operand whose kind is `pc + it`) set to `off`, or
+///   None if `off` does not fit the field or the op has no label. A
+///   superinstruction's head word uses its first part's operands.
+/// - `Vm.label(w) -> ?i64`: the label offset of word `w`, if its op has one.
+/// - `Vm.FMT_field(w)`: field `field` of format `FMT`, decoded like an
+///   operand (u64, or i64 for a signed field).
+///
+/// `set_label` and `label` have the shapes `std.bc` takes as its patch
+/// and jump-threading functions.
+fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    // (opcode, (bits, shift, signed)) of each op's label field.
+    let mut labels: Vec<(u32, (u32, u32, bool))> = Vec::new();
+    for o in &l.ops {
+        let base = &l.ops[l.base(o.opcode as usize)];
+        if let Some(fi) = base.kinds.iter().position(|k| is_label_kind(v, k)) {
+            let (_, bits, shift, signed) = base.fields[fi];
+            labels.push((o.opcode, (bits, shift, signed)));
+        }
+    }
+    let _ = writeln!(s, "{vis}fn {n}__set_label(w: {w}, off: i64) -> ?{w} {{");
+    let _ = writeln!(s, "  match {n}__opcode(w) {{");
+    for (op, (bits, shift, signed)) in &labels {
+        let mask = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let range = if *bits >= 64 && *signed {
+            String::new()
+        } else if *signed {
+            let lim = 1i128 << (bits - 1);
+            format!("if off < {} or off > {} {{ return None; }} ", -lim, lim - 1)
+        } else if *bits >= 63 {
+            "if off < 0 { return None; } ".to_string()
+        } else {
+            format!("if off < 0 or off > {} {{ return None; }} ", mask)
+        };
+        let _ = writeln!(
+            s,
+            "    {op} => {{ {range}Some((w & !(({mask} as {w}) << {shift})) | (((off as {w}) & {mask}) << {shift})) }}"
+        );
+    }
+    let _ = writeln!(s, "    _ => None,");
+    let _ = writeln!(s, "  }}");
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s, "{vis}fn {n}__label(w: {w}) -> ?i64 {{");
+    let _ = writeln!(s, "  match {n}__opcode(w) {{");
+    for (op, (bits, shift, signed)) in &labels {
+        let _ = writeln!(s, "    {op} => Some({} as i64),", decode_src(l.word_bits, *bits, *shift, *signed));
+    }
+    let _ = writeln!(s, "    _ => None,");
+    let _ = writeln!(s, "  }}");
+    let _ = writeln!(s, "}}");
+    for f in &v.formats {
+        let mut shift = 0;
+        for fld in &f.fields {
+            if fld.name.name != "op" {
+                let rt = if fld.signed { "i64" } else { "u64" };
+                let _ = writeln!(
+                    s,
+                    "{vis}fn {n}__{}_{}(w: {w}) -> {rt} {{ {} }}",
+                    f.name.name,
+                    fld.name.name,
+                    decode_src(l.word_bits, fld.bits, shift, fld.signed)
+                );
+            }
+            shift += fld.bits;
+        }
+    }
+    s
+}
+
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
     for m in modules.iter_mut() {
@@ -378,6 +463,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
                 let l = layout(v)?;
                 let mut src = generate(v, &l);
                 src.push_str(&generate_verifier(sm, v, &l));
+                src.push_str(&generate_labels(v, &l));
                 let fid = sm.add(format!("<vm {} expansion>", v.name.name), src.clone());
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);

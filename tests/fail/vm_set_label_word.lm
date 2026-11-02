@@ -1,0 +1,16 @@
+// `Vm.set_label` takes and returns the vm's code word type.
+struct M { x: i64 }
+
+vm V {
+    context ctx: *M;
+    state { pc: *u32 }
+    operand label = pc + it;
+    encoding fixed(u32) { format sJ { op: 8, sj: s24 } }
+    op JMP(t: label) : sJ { jump t }
+    entry run(m: *M, code: *u32) -> i64 { ctx = m; pc = code; jump pc }
+}
+
+fn main() {
+    let w: ?u64 = V.set_label(V.JMP(0), 4);
+}
+// error: mismatched types: expected `?u64`, found `?u32`

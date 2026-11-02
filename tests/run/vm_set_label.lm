@@ -1,0 +1,105 @@
+// Generated label helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
+// jump label of a word (the operand whose kind is `pc + it`) and returns
+// None when the offset does not fit; `Vm.label(w)` decodes it; per-format
+// field accessors `Vm.FMT_field(w)`. They plug into std.bc as the patch
+// and jump-threading functions.
+// matrix: dispatch
+import std.io;
+import std.bc;
+
+struct Machine { out: i64 }
+
+vm Lab {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADI(dst: reg, v: imm) : ABx { dst = v as i64; next }
+    op ADDI(dst: reg, v: imm) : ABx { dst = dst + v as i64; next }
+    op JMP(target: label) : sJ { jump target }
+    // Jump if the register is not zero; signed 16-bit offset.
+    op JNZ(a: reg, target: label) : AsBx { if a != 0 { jump target } next }
+    // Forward-only skip: unsigned 16-bit offset.
+    op SKIPZ(a: reg, target: label) : ABx { if a == 0 { jump target } next }
+    op DEC(a: reg) : ABC { a = a - 1; next }
+    op RET(a: reg) : ABC { ctx.out = a; exit 0 }
+
+    super DEC_JNZ = DEC; JNZ;
+    super JNZ_DEC = JNZ; DEC;
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> i64 { ctx = m; pc = code; regs = r; jump pc }
+}
+
+fn show(x: ?i64) {
+    match x { Some(v) => io.print_int(v), None => io.print("none") }
+    io.println("");
+}
+
+fn ok(x: ?u32) -> bool { x.is_some() }
+
+fn main() {
+    // Range checks per field.
+    let j = Lab.JMP(0);
+    io.print_bool(ok(Lab.set_label(j, 8388607))); io.print_bool(ok(Lab.set_label(j, -8388608)));
+    io.print_bool(ok(Lab.set_label(j, 8388608))); io.println("");
+    let b = Lab.JNZ(1, 0);
+    io.print_bool(ok(Lab.set_label(b, -32768))); io.print_bool(ok(Lab.set_label(b, 32768))); io.println("");
+    let s = Lab.SKIPZ(1, 0);
+    io.print_bool(ok(Lab.set_label(s, 65535))); io.print_bool(ok(Lab.set_label(s, -1))); io.println("");
+    // No label: None.
+    io.print_bool(ok(Lab.set_label(Lab.DEC(3), 1))); io.println("");
+    show(Lab.label(Lab.DEC(3)));
+    // Round trips, and the other fields are kept.
+    let Some(b2) = Lab.set_label(b, -5) else { return; };
+    show(Lab.label(b2));
+    io.print_int(Lab.AsBx_a(b2) as i64); io.print(" "); io.print_int(Lab.AsBx_sbx(b2)); io.println("");
+    let Some(j2) = Lab.set_label(j, -1000000) else { return; };
+    show(Lab.label(j2));
+    io.print_int(Lab.ABx_bx(Lab.LOADI(2, 4660)) as i64); io.println("");
+    // A superinstruction's head word carries its first part's label.
+    let sup = Lab.with_opcode(b2, Lab.OP_JNZ_DEC);
+    show(Lab.label(sup));
+    show(Lab.label(Lab.with_opcode(Lab.DEC(1), Lab.OP_DEC_JNZ)));
+
+    // As std.bc's patch function: count r0 from 5 down, summing into r1.
+    var c = bc.Code.new(Lab.op_size, Lab.set_label);
+    c.op(Lab.LOADI(0, 5));
+    c.op(Lab.LOADI(1, 0));
+    let top = c.label();
+    let done = c.label();
+    c.bind(top);
+    c.jump(Lab.SKIPZ(0, 0), done);
+    c.op(Lab.ADDI(1, 10));
+    c.op(Lab.DEC(0));
+    c.jump(Lab.JMP(0), top);
+    c.bind(done);
+    c.op(Lab.RET(1));
+    io.print_bool(c.check().is_none()); io.println("");
+    var m = Machine { out: 0 };
+    var regs: [i64; 4] = [0; 4];
+    Lab.run(&m, c.words().ptr, &regs[0]);
+    io.print_int(m.out); io.println("");
+}
+// expect: truetruefalse
+// expect: truefalse
+// expect: truefalse
+// expect: false
+// expect: none
+// expect: -5
+// expect: 1 -5
+// expect: -1000000
+// expect: 4660
+// expect: -5
+// expect: none
+// expect: true
+// expect: 50
