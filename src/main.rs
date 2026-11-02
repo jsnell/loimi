@@ -5,9 +5,11 @@ mod codegen;
 mod diag;
 mod gcgen;
 mod generics;
+mod header;
 mod layout;
 mod lexer;
 mod parser;
+mod rtgen;
 mod tir;
 mod tirwalk;
 mod values;
@@ -37,11 +39,35 @@ struct Opts {
     /// `-W error` / `--deny-warnings`: warnings fail the build.
     deny_warnings: bool,
     align_functions: Option<u32>,
+    /// What to build: an executable, a static archive or a shared object.
+    kind: OutKind,
+    /// `--header out.h`: also write a C header for the `export "C"` functions.
+    header: Option<PathBuf>,
+    /// `--tls=`: the TLS model for runtime thread-locals (default:
+    /// initial-exec, local-dynamic for `--shared`).
+    tls: Option<Tls>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutKind {
+    Exe,
+    /// `--lib`: a static archive of position-independent code.
+    Static,
+    /// `--shared`: a shared object.
+    Shared,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tls {
+    InitialExec,
+    LocalDynamic,
+    GeneralDynamic,
 }
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address] [-W error | --deny-warnings]
+                  [--lib | --shared] [--header out.h] [--tls=initial-exec|local-dynamic|global-dynamic]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -94,7 +120,8 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>)
     Ok(modules)
 }
 
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
+/// Compile to LLVM IR, and the C header if `--header` asked for one.
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     let mut modules = load(sm, input, &mut allows)?;
@@ -125,9 +152,42 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
         ));
     }
     let prog = c.prog;
-    let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats });
-    let ir = cg.generate();
-    Ok(if opts.sanitize_address { sanitize_address(&ir) } else { ir })
+    let library = opts.kind != OutKind::Exe;
+    if library {
+        header::check_exports(&prog)?;
+    }
+    let header = match &opts.header {
+        Some(path) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let guard: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+            let source = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            Some(header::generate(&prog, &source, &guard)?)
+        }
+        None => None,
+    };
+    if !library && !opts.emit_llvm && !prog.fns.iter().any(|f| f.symbol == "main.main" && f.body.is_some()) {
+        return Err(Diag::new(
+            Span { file: u32::MAX, lo: 0, hi: 0 },
+            "no `main` function (build a library with --lib or --shared)",
+        ));
+    }
+    let cg = codegen::Codegen::new(
+        &prog,
+        sm,
+        codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats, library },
+    );
+    let mut ir = cg.generate();
+    // Runtime thread-locals are emitted initial-exec: one offset from the
+    // thread pointer, fixed at load time. A shared object that may be
+    // dlopen'ed cannot rely on static TLS space, so it uses a dynamic
+    // model (one `__tls_get_addr` call per function that touches TLS).
+    let tls = opts.tls.unwrap_or(if opts.kind == OutKind::Shared { Tls::LocalDynamic } else { Tls::InitialExec });
+    match tls {
+        Tls::InitialExec => {}
+        Tls::LocalDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local(localdynamic)"),
+        Tls::GeneralDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local"),
+    }
+    Ok((if opts.sanitize_address { sanitize_address(&ir) } else { ir }, header))
 }
 
 /// The ASan runtime to link explicitly, if clang's own is missing.
@@ -196,6 +256,9 @@ fn parse_args() -> Result<Opts, String> {
         sanitize_address: false,
         deny_warnings: false,
         align_functions: None,
+        kind: OutKind::Exe,
+        header: None,
+        tls: None,
     };
     match cmd.as_str() {
         "build" => {}
@@ -208,6 +271,17 @@ fn parse_args() -> Result<Opts, String> {
             "--release" | "-O" => o.release = true,
             "--emit-llvm" => o.emit_llvm = true,
             "--keep-ll" => o.keep_ll = true,
+            "--lib" => o.kind = OutKind::Static,
+            "--shared" => o.kind = OutKind::Shared,
+            "--header" => o.header = Some(PathBuf::from(args.next().ok_or("--header needs a path")?)),
+            s if s.starts_with("--tls=") => {
+                o.tls = Some(match &s["--tls=".len()..] {
+                    "initial-exec" => Tls::InitialExec,
+                    "local-dynamic" => Tls::LocalDynamic,
+                    "global-dynamic" => Tls::GeneralDynamic,
+                    m => return Err(format!("unknown TLS model `{}` (initial-exec, local-dynamic, global-dynamic)", m)),
+                })
+            }
             "--vm-stats" => o.vm_stats = true,
             "--sanitize=address" => o.sanitize_address = true,
             "--deny-warnings" | "-Werror" => o.deny_warnings = true,
@@ -249,6 +323,14 @@ fn parse_args() -> Result<Opts, String> {
     if o.input.is_none() {
         return Err(USAGE.into());
     }
+    if o.kind != OutKind::Exe {
+        if o.run {
+            return Err("`loimi run` builds executables; --lib and --shared need `loimi build`".into());
+        }
+        if o.sanitize_address {
+            return Err("--sanitize=address builds executables only".into());
+        }
+    }
     Ok(o)
 }
 
@@ -273,8 +355,8 @@ fn compiler_main() -> ExitCode {
         }
     };
     let mut sm = SourceMap::default();
-    let ir = match compile(&mut sm, &opts) {
-        Ok(ir) => ir,
+    let (ir, header) = match compile(&mut sm, &opts) {
+        Ok(r) => r,
         Err(d) => {
             eprint!("{}", sm.render(&d));
             return ExitCode::from(1);
@@ -282,6 +364,12 @@ fn compiler_main() -> ExitCode {
     };
     let input = opts.input.as_ref().unwrap();
     let stem = input.file_stem().unwrap().to_string_lossy().to_string();
+    if let (Some(path), Some(text)) = (&opts.header, &header) {
+        if let Err(e) = std::fs::write(path, text) {
+            eprintln!("error: cannot write {}: {}", path.display(), e);
+            return ExitCode::from(1);
+        }
+    }
     if opts.emit_llvm {
         let out = opts.output.clone().unwrap_or_else(|| PathBuf::from(format!("{}.ll", stem)));
         if out.as_os_str() == "-" {
@@ -299,16 +387,31 @@ fn compiler_main() -> ExitCode {
         eprintln!("error: cannot write {}: {}", ll.display(), e);
         return ExitCode::from(1);
     }
-    let exe = opts.output.clone().unwrap_or_else(|| {
-        if opts.run { tmpdir.join(&stem) } else { PathBuf::from(&stem) }
+    let exe = opts.output.clone().unwrap_or_else(|| match opts.kind {
+        OutKind::Exe if opts.run => tmpdir.join(&stem),
+        OutKind::Exe => PathBuf::from(&stem),
+        OutKind::Static => PathBuf::from(format!("lib{}.a", stem)),
+        OutKind::Shared => PathBuf::from(format!("lib{}.so", stem)),
     });
     let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
     let mut cmd = Command::new(&clang);
-    cmd.arg(if opts.release { "-O3" } else { "-O1" })
-        .arg("-Wno-override-module")
+    cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module");
+    // The object goes into the archive.
+    let obj = tmpdir.join(format!("{}.o", stem));
+    match opts.kind {
         // Executables: absolute addressing lets dispatch index the table directly.
-        .arg("-fno-pic")
-        .arg("-no-pie");
+        OutKind::Exe => {
+            cmd.arg("-fno-pic").arg("-no-pie");
+        }
+        // Libraries: position-independent, so the archive links into PIE
+        // executables (the default on most systems) and shared objects.
+        OutKind::Static => {
+            cmd.arg("-fPIC").arg("-c");
+        }
+        OutKind::Shared => {
+            cmd.arg("-fPIC").arg("-shared");
+        }
+    }
     if let Some(n) = opts.align_functions {
         // Every function (vm handlers included) starts on an n-byte boundary,
         // so unrelated code changes do not shift handler placement. Useful for
@@ -341,7 +444,12 @@ fn compiler_main() -> ExitCode {
     if let Some(lib) = &asan_lib {
         cmd.arg("-x").arg("none").arg(lib);
     }
-    let status = cmd.arg("-o").arg(&exe).arg("-lm").status();
+    let target = if opts.kind == OutKind::Static { &obj } else { &exe };
+    cmd.arg("-o").arg(target);
+    if opts.kind != OutKind::Static {
+        cmd.arg("-lm");
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {
@@ -352,6 +460,22 @@ fn compiler_main() -> ExitCode {
             eprintln!("error: cannot run {}: {}", clang, e);
             return ExitCode::from(1);
         }
+    }
+    if opts.kind == OutKind::Static {
+        let ar = std::env::var("LOIMI_AR").unwrap_or_else(|_| "llvm-ar-19".into());
+        let _ = std::fs::remove_file(&exe);
+        match Command::new(&ar).arg("rcs").arg(&exe).arg(&obj).status() {
+            Ok(s) if s.success() => {}
+            Ok(_) => {
+                eprintln!("error: {} failed", ar);
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("error: cannot run {}: {} (set LOIMI_AR)", ar, e);
+                return ExitCode::from(1);
+            }
+        }
+        let _ = std::fs::remove_file(&obj);
     }
     if opts.keep_ll {
         eprintln!("IR kept at {}", ll.display());

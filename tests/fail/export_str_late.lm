@@ -1,0 +1,5 @@
+// A `str` parameter must fit in the argument registers, where C and LLVM
+// pass it alike (floats do not count: they go in SSE registers).
+// args: --lib
+// error: `str` parameter `s` comes after 5 integer or pointer arguments
+export "C" fn late(a: i64, b: i64, c: i64, d: i64, e: f64, f: i64, s: str) -> u64 { s.len }

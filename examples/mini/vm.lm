@@ -28,6 +28,15 @@ pub struct Ctx {
     /// Level of the first open upvalue (null when none), so that
     /// "anything to close at or above here?" is one compare.
     open_level: *V,
+    /// Natives with ids from HOST_NATIVE up, which an embedder registers
+    /// (embed.lm); `no_host` in the standalone interpreter.
+    host: fn(*Ctx, i32, *V, u64) -> Result<V, V>,
+}
+
+pub const HOST_NATIVE: i32 = 1000;
+
+pub fn no_host(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+    Err(error_msg(c, "unknown builtin"))
 }
 
 /// GC roots: globals, the pending error, open upvalues, and every active
@@ -69,7 +78,7 @@ fn find_upval(c: *Ctx, level: *V) -> Gc<UpVal> {
 }
 
 /// Close every open upvalue at or above `level`.
-fn close_upvals(c: *Ctx, level: *V) {
+pub fn close_upvals(c: *Ctx, level: *V) {
     loop {
         let Some(u) = c.open else { break; };
         if u.v < level { break; }
@@ -225,6 +234,7 @@ fn refuse(cl: Gc<Closure>) {
 
 /// The single dispatch point for natives. Natives allocate but never collect.
 fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+    if id >= HOST_NATIVE { return c.host(c, id, args, n); }
     lib.call(&c.heap, id, args, n)
 }
 

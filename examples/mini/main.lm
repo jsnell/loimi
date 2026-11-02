@@ -1,18 +1,19 @@
 // Mini: a small Lua-like language, implemented in Loimi.
 //
 //   loimi build examples/mini/main.lm -o mini && ./mini script.mini
+//
+// embed.lm builds the same interpreter as a C library.
 
 import std.io;
 import std.os;
-import std.gc;
-import std.mem;
 import std.text;
 import value;
 import value.{V};
-import vm.{Mini, Ctx, Frame};
+import vm.{Mini};
 import vm;
 import compile;
 import lib;
+import state;
 
 fn main() -> i32 {
     let Some(path) = os.arg(1) else {
@@ -24,33 +25,11 @@ fn main() -> i32 {
         io.eprintln(path);
         return 1;
     };
-    var heap = gc.Heap.new();
-    value.init_strings(&heap);
-    let globals = value.new_table(&heap);
-    var ctx = Ctx {
-        heap: heap,
-        stack: mem.alloc(1 << 20),
-        stack_end: 0 as *V,
-        frames: mem.alloc(1 << 16),
-        frames_end: 0 as *Frame,
-        fp: 0 as *Frame,
-        globals: globals,
-        error: V.Nil,
-        out: text.StrBuf.new(),
-        open: None,
-        open_level: 0 as *V,
-    };
-    ctx.stack_end = ctx.stack + (1 << 20);
-    ctx.frames_end = ctx.frames + (1 << 16);
-    ctx.fp = ctx.frames;
-    // Collect after allocating twice the live data (at least 1 MB): 17%
-    // faster on binary_trees than the default, the rest within noise.
-    ctx.heap.set_growth(200, 1 << 20);
+    var ctx = state.new_ctx(vm.no_host);
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
-    lib.install(&ctx.heap, ctx.globals);
     let proto = compile.compile(&ctx.heap, path, src);
     let main_closure = value.new_closure(&ctx.heap, proto);
-    ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);
+    state.attach(&ctx);
     Mini.run(&ctx, main_closure);
     lib.flush();
     if ctx.error != V.Nil {

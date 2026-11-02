@@ -117,7 +117,7 @@ fn verifies(which: u8, run: bool) -> bool {
         heap: heap, stack: stack, stack_end: stack + nregs as u64,
         frames: mem.alloc(16), frames_end: 0 as *Frame, fp: 0 as *Frame,
         globals: value.new_table(h), error: V.Nil, out: text.StrBuf.new(),
-        open: None, open_level: 0 as *V,
+        open: None, open_level: 0 as *V, host: vm.no_host,
     };
     ctx.frames_end = ctx.frames + 16;
     ctx.fp = ctx.frames;

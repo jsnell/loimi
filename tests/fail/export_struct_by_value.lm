@@ -1,0 +1,5 @@
+// A struct by value has no C equivalent in an export.
+// args: --lib
+// error: `export "C" fn origin`: result `Point` has no C equivalent: struct `Point` by value has no C equivalent here; pass `*Point`
+struct Point { x: i32, y: i32 }
+export "C" fn origin() -> Point { Point { x: 0, y: 0 } }

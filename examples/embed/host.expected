@@ -1,0 +1,22 @@
+A	1.5	3.0
+B	40	42
+A.y = 3
+B.y = 42
+types: 2 3 5 0
+6.5	hello, world
+A.msg = hello, mini! (12 bytes)
+nested mini_dostring: status 3: mini_dostring called while Mini code is running (from a native): re-entry is not supported
+true
+A.touched = 1
+A.stashed = from B B
+[A] status 1: line 3: unexpected symbol
+[A] status 2: line 1: attempt to index a nil value
+[A] status 2: line 1: add: numbers expected
+[A] status 2: line 2: stop at 2
+after errors:	3	4	30.0
+adds = 2
+stress ok	2000	hello, n1:2.0	hello, n2000:4000.0
+collections under stress: many
+A.result = 2000
+300
+B still here	40	42

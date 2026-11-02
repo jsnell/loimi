@@ -19,6 +19,7 @@ import std.num;
 import std.diag;
 import std.parse;
 import std.bc;
+import std.rt;
 import value;
 import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs};
 import vm.{Mini};
@@ -174,13 +175,23 @@ struct Parser {
 
 // ── errors ──────────────────────────────────────────────────────────
 
-/// Report a syntax error at `s` ("line N: msg", the line and a caret) and exit.
+/// Where `try_compile` wants the syntax error message (None: `compile`).
+#[thread_local]
+var error_out: ?*text.StrBuf = None;
+
+/// Report a syntax error at `s` ("line N: msg", the line and a caret) and
+/// exit; under `try_compile`, hand it "line N: msg" and unwind.
 fn Parser.fail_at(p: *Parser, s: diag.Span, msg: str) -> never {
     var b = text.StrBuf.new();
     b.push_str("line ");
     b.push_int(p.sm.line_col(s.file, s.lo).line as i64);
     b.push_str(": ");
     b.push_str(msg);
+    if let Some(out) = error_out {
+        out.push_str(b.as_str());
+        b.free();
+        rt.throw()
+    }
     var d = diag.error(s, b.as_str());
     p.sm.eprint(&d);
     os.quit(1)
@@ -1533,4 +1544,23 @@ pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
     tables.free();
     sm.free();
     proto
+}
+
+struct Job { h: *gc.Heap, name: str, src: str, proto: ?Gc<Proto> }
+
+fn compile_job(data: *u8) {
+    let j = data as *Job;
+    j.proto = Some(compile(j.h, j.name, j.src));
+}
+
+/// `compile`, for an embedder: a syntax error returns None and appends
+/// its message ("line N: msg") to `err` instead of exiting. The parser's
+/// own memory is leaked on that path (see std.rt).
+pub fn try_compile(h: *gc.Heap, name: str, src: str, err: *text.StrBuf) -> ?Gc<Proto> {
+    let saved = error_out;
+    error_out = Some(err);
+    var job = Job { h: h, name: name, src: src, proto: None };
+    let ok = rt.protect(compile_job, &job as *u8);
+    error_out = saved;
+    if ok { job.proto } else { None }
 }

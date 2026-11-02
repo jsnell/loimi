@@ -35,8 +35,11 @@ emits textual LLVM IR, which `clang-19` compiles and links. The vm tools
 verifier, label helpers, the disassembler) are generated as Loimi source
 (`src/vmexpand.rs`) and type-checked like user code; handlers and
 dispatch tables are generated as IR (`src/vmgen.rs`). Entries are
-internal functions: there are no C-ABI entry points, no `Mini.call`, and
-no C header yet, so embedding in a C host is not supported.
+internal functions: there are no generated C-ABI entry points and no
+`Mini.call`. A C host embeds an interpreter through `export "C"`
+functions written in Loimi, built with `--lib` (static archive) or
+`--shared`, with a header from `--header` (`src/header.rs`; see §4 and
+`language.md` §10.1).
 
 ## 2. Values (`nanbox`, `lowtag`, `boxed`)
 
@@ -297,6 +300,59 @@ define { i64, i64 } @Mini.run(ptr %ctx, i64 %closure) {      ; C ABI (design; en
 on the frame stack. It counts C-stack depth and fails with a guest
 stack-overflow error past the limit. (*Not yet implemented.*)
 
+**As implemented: libraries.** The interpreter writes its C API as
+`export "C"` functions (external linkage, C calling convention, `bool`
+`zeroext`); everything else stays `internal`, including `loimi.argc` and
+`loimi.argv`. A library build (`--lib`: `clang -c -fPIC` then
+`llvm-ar rcs`; `--shared`: `clang -shared -fPIC`) emits no `main`
+wrapper. There is no init function: all globals have static
+initializers, and runtime thread-locals start zeroed per thread.
+
+`std.rt.protect` is `@loimi_protect`, a `noinline` function that links a
+handler `{ prev, shadow_top, jmp_buf }` into the thread-local
+`@loimi.handler_top`, calls `_setjmp` (`returns_twice`), and calls the
+protected function; `@loimi_throw` `longjmp`s to the top handler, which
+restores `@loimi.shadow_top` and the handler chain.
+
+**TLS model.** The runtime's thread-locals (`@loimi.shadow_top`, the
+`cold` capture slots `@"Vm.op.X.cN"`, `-> never` argument slots, the
+result and raise slots, `@loimi.handler_top`) are emitted
+`thread_local(initialexec)`. In an executable or a static archive linked
+into one, that is one `%fs`-relative access. A shared object with
+initial-exec TLS is flagged `STATIC_TLS` and can only be `dlopen`'ed if
+the C library has static TLS space to spare (Mini uses 328 bytes; glibc
+keeps 512 spare by default). So `--shared` rewrites them to
+`thread_local(localdynamic)` (`--tls=` chooses). The access then calls
+`__tls_get_addr`. In handlers those accesses are only on the way into a
+`cold` block, but a handler that contains any call needs a stack frame,
+which the fast path then pays for too. Measured on Mini's benchmarks
+through `examples/embed/minirun.c` (minimum of 5 runs, on a loaded
+8-core machine; relative to the `-fno-pic` executable):
+
+| Benchmark | static archive, PIE host | `--shared`, initial-exec | `--shared`, local-dynamic | local-dynamic + TLSDESC |
+|---|---:|---:|---:|---:|
+| closures | 1.05 | 1.03, 1.04 | 1.14, 1.06 | 1.13, 1.03 |
+| binary_trees | 0.98 | 0.94 | 0.92 | 0.94 |
+| nbody | 1.05 | 1.08 | 1.07 | 0.96 |
+| fib | 1.02 | 1.03 | 1.05 | 1.06 |
+| oo_methods | | 1.00 | 1.07 | 1.04 |
+| sort | | 1.02 | 1.03 | 1.02 |
+| string_build | | 1.00 | 0.99 | 0.96 |
+
+(Two numbers: two separate runs.) Run-to-run noise on this machine is
+about ±5%, so the local-dynamic cost is 0–7% on call-heavy code
+(`closures`, `oo_methods`) and not measurable elsewhere. TLSDESC
+(`-mtls-dialect=gnu2`, tried by hand) replaces the `__tls_get_addr` call
+with a cheaper descriptor call and shrinks the frame to one `push`; it
+may halve the cost, but within the noise, so the driver does not use it
+yet. A host that links the shared object at startup (not `dlopen`) can
+build with `--tls=initial-exec` and pay nothing.
+
+Position-independent code itself (the static archive in a PIE host, or a
+shared object with initial-exec TLS) costs nothing measurable: dispatch
+loads the table address with one `lea` instead of an absolute
+address.
+
 ## 5. `goto` mode
 
 A single function with one basic block per handler. State variables are phis
@@ -423,3 +479,5 @@ way the handlers do.
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
 | optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |
 | target check: `preserve_none` available? otherwise warn and fall back to `goto` | portability |
+| executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
+| initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
