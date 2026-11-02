@@ -877,10 +877,6 @@ pub vm Mini {
     super SUB_F_ADD_F = SUB_F; ADD_F;
     super MULK_F_MUL_F = MULK_F; MUL_F;
     super ADD_F_JGTKN = ADD_F; JGTKN;
-    #[forward] super MUL_MULK_IF = MUL; MULK_IF;
-    #[forward] super MULK_IF_ADD_FI = MULK_IF; ADD_FI;
-    #[forward] super ADD_FI_RDIVK = ADD_FI; RDIVK;
-    #[forward] super RDIVK_RET1 = RDIVK; RET1;
     super ADD_F_FORLOOP = ADD_F; FORLOOP;
     super GETFIELD_MUL_F = GETFIELD; MUL_F;
     super GETFIELD_SUB_F = GETFIELD; SUB_F;
