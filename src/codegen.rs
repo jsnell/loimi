@@ -1373,13 +1373,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 Sub => "sub",
                 _ => "mul",
             };
-            let pre = if signed { "s" } else { "u" };
-            let intr = format!("llvm.{}{}.with.overflow.{}", pre, name, lt);
-            self.cg.decls.insert(format!("declare {{ {}, i1 }} @{}({}, {})", lt, intr, lt, lt));
-            let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, intr, lt, x, lt, y));
-            let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+            let Ty::Int(it) = t else { unreachable!() };
+            let (r, ov) = self.overflow_op(*it, name, &x, &y);
             self.check(&ov, "integer overflow", e.span);
-            return self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
+            return r;
         }
         if matches!(op, Div | Rem) && t.is_int() {
             let z = self.inst(format!("icmp eq {} {}, 0", lt, y));
@@ -1408,10 +1405,49 @@ impl<'a, 'p> FnGen<'a, 'p> {
         };
         if matches!(op, Shl | Shr) {
             let Ty::Int(it) = t else { unreachable!() };
-            let m = self.inst(format!("and {} {}, {}", lt, y, it.bits - 1));
+            let m = if it.bits.is_power_of_two() {
+                self.inst(format!("and {} {}, {}", lt, y, it.bits - 1))
+            } else {
+                self.inst(format!("urem {} {}, {}", lt, y, it.bits))
+            };
             return self.inst(format!("{} {} {}, {}", ins, lt, x, m));
         }
         self.inst(format!("{} {} {}, {}", ins, lt, x, y))
+    }
+
+    /// `x op y` (add, sub or mul) on integer type `it` with overflow
+    /// detection: (result, overflowed). Widths other than 8/16/32/64 (such
+    /// as `i48` value payloads) are computed in i64 with the operands
+    /// shifted into the high bits, so the overflow flag of the 64-bit
+    /// operation is the overflow of the narrow one; for `mul` only one
+    /// operand is shifted. (LLVM's own legalization of odd-width overflow
+    /// intrinsics sign-extends both operands and compares the result with
+    /// its re-extension, which is longer.)
+    pub fn overflow_op(&mut self, it: IntTy, op: &str, x: &str, y: &str) -> (String, String) {
+        let pre = if it.signed { "s" } else { "u" };
+        let native = matches!(it.bits, 8 | 16 | 32 | 64);
+        let lt = if native { format!("i{}", it.bits) } else { "i64".to_string() };
+        let name = format!("llvm.{}{}.with.overflow.{}", pre, op, lt);
+        self.cg.decls.insert(format!("declare {{ {}, i1 }} @{}({}, {})", lt, name, lt, lt));
+        if native {
+            let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, name, lt, x, lt, y));
+            let v = self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
+            let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+            return (v, ov);
+        }
+        let k = 64 - it.bits as u32;
+        let ext = if it.signed { "sext" } else { "zext" };
+        let nt = format!("i{}", it.bits);
+        let xw = self.inst(format!("{} {} {} to i64", ext, nt, x));
+        let yw = self.inst(format!("{} {} {} to i64", ext, nt, y));
+        let xs = self.inst(format!("shl i64 {}, {}", xw, k));
+        let ys = if op == "mul" { yw } else { self.inst(format!("shl i64 {}, {}", yw, k)) };
+        let r = self.inst(format!("call {{ i64, i1 }} @{}(i64 {}, i64 {})", name, xs, ys));
+        let v = self.inst(format!("extractvalue {{ i64, i1 }} {}, 0", r));
+        let ov = self.inst(format!("extractvalue {{ i64, i1 }} {}, 1", r));
+        let sh = self.inst(format!("{} i64 {}, {}", if it.signed { "ashr" } else { "lshr" }, v, k));
+        let n = self.inst(format!("trunc i64 {} to {}", sh, nt));
+        (n, ov)
     }
 
     /// `x as Kind` for a fieldless enum. With checks on (debug builds), a
@@ -1567,11 +1603,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Intr::SubChecked => "sub",
                     _ => "mul",
                 };
-                let name = format!("llvm.{}{}.with.overflow.{}", if it.signed { "s" } else { "u" }, op, lt);
-                decl(self.cg, &format!("declare {{ {}, i1 }} @{}({}, {})", lt, name, lt, lt));
-                let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, name, lt, vals[0], lt, vals[1]));
-                let v = self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
-                let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+                let (v, ov) = self.overflow_op(it, op, &vals[0], &vals[1]);
                 let ok = self.inst(format!("xor i1 {}, true", ov));
                 let ot = self.ty(&e.ty);
                 let a = self.inst(format!("insertvalue {} poison, i1 {}, 0", ot, ok));

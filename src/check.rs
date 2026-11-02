@@ -2676,8 +2676,24 @@ pub fn prim_type(name: &str) -> Option<Ty> {
         "f64" => Ty::F64,
         "bool" => Ty::Bool,
         "str" => Ty::str(),
-        _ => return None,
+        _ => return arbitrary_int(name).map(Ty::Int),
     })
+}
+
+/// `iN` / `uN` for any width 1..=64 (`i48`, `u61`, ...): LLVM integer
+/// types of that width, used mainly as `value` payloads.
+fn arbitrary_int(name: &str) -> Option<IntTy> {
+    let signed = match name.as_bytes().first()? {
+        b'i' => true,
+        b'u' => false,
+        _ => return None,
+    };
+    let digits = &name[1..];
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 2 {
+        return None;
+    }
+    let bits: u8 = digits.parse().ok()?;
+    (1..=64).contains(&bits).then_some(IntTy { signed, bits })
 }
 
 pub fn is_place(e: &TExpr) -> bool {

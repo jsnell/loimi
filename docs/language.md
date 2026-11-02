@@ -32,6 +32,7 @@ roughly C's level of abstraction. It has deliberately few novel features.
 
 ```loimi
 i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
+iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
 [T; N]          // fixed array
 []T             // slice (ptr + len), bounds-checked
 *T, *mut T      // raw non-null pointers; null is ?*T
@@ -124,6 +125,16 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
   `a.add_overflow(b) -> (T, bool)`. These map directly to LLVM's
   `*.with.overflow` intrinsics, which guest integer semantics need constantly.
+- **Arbitrary-width integers.** `iN` and `uN` for any `N` from 1 to 64 are
+  integer types of exactly that width (LLVM's `iN`): arithmetic wraps,
+  overflows and is checked at `N` bits, `as` sign- or zero-extends from `N`
+  bits, and shift amounts are taken modulo `N`. Their main use is `value`
+  payloads (`Int(i48)` in a nanbox, `Int(i61)` in a lowtag), where they
+  record exactly how many bits the encoding keeps. Overflow-checked
+  `+ - *` on an odd width are done in 64 bits with the operands shifted to
+  the top, so `x.add_checked(y)` on `i48` costs two shifts more than on
+  `i64` and no compares. In memory they take the next power-of-two size
+  (`i48`: 8 bytes, `u24`: 4).
 - Hints: `likely(c)`, `unlikely(c)`, `assume(c)`, `unreachable`, `#[cold]`,
   `#[inline(always)]`, `#[inline(never)]`.
 - `unsafe { }` permits raw pointer dereference and unchecked indexing.

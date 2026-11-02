@@ -1,0 +1,6 @@
+fn add(a: i48, b: i48) -> i48 { a + b }
+fn main() {
+    add(140737488355327, 1);
+}
+// expect-exit: 134
+// expect-stderr: integer overflow

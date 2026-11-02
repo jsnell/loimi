@@ -5,7 +5,7 @@ use crate::tir::*;
 
 pub fn align_of(p: &Program, t: &Ty) -> u64 {
     match t {
-        Ty::Int(it) => (it.bits as u64 / 8).max(1),
+        Ty::Int(it) => int_bytes(it.bits),
         Ty::F32 => 4,
         Ty::F64 => 8,
         Ty::Bool | Ty::Unit | Ty::Never => 1,
@@ -23,11 +23,17 @@ pub fn align_of(p: &Program, t: &Ty) -> u64 {
         Ty::Struct(i) => p.structs[*i as usize].fields.iter().map(|(_, t)| align_of(p, t)).max().unwrap_or(1),
         Ty::Enum(i) => {
             let e = &p.enums[*i as usize];
-            let tag = (e.tag.bits as u64 / 8).max(1);
+            let tag = int_bytes(e.tag.bits);
             if e.has_payload() { tag.max(8) } else { tag }
         }
         Ty::Param(_) | Ty::Gc(_) => 8,
     }
+}
+
+/// Size (= alignment) of an integer of `bits` bits: its store size rounded
+/// up to a power of two, as LLVM lays out `i48` (8 bytes) or `i24` (4).
+pub fn int_bytes(bits: u8) -> u64 {
+    (bits as u64).div_ceil(8).next_power_of_two()
 }
 
 pub fn round_up(x: u64, a: u64) -> u64 {
@@ -52,7 +58,7 @@ pub fn enum_payload_words(p: &Program, e: &EnumDef) -> u64 {
 
 pub fn size_of(p: &Program, t: &Ty) -> u64 {
     match t {
-        Ty::Int(it) => (it.bits as u64 / 8).max(1),
+        Ty::Int(it) => int_bytes(it.bits),
         Ty::F32 => 4,
         Ty::F64 => 8,
         Ty::Bool => 1,
@@ -76,7 +82,7 @@ pub fn size_of(p: &Program, t: &Ty) -> u64 {
         }
         Ty::Enum(i) => {
             let e = &p.enums[*i as usize];
-            let tag = (e.tag.bits as u64 / 8).max(1);
+            let tag = int_bytes(e.tag.bits);
             if e.has_payload() {
                 round_up(tag, 8) + enum_payload_words(p, e) * 8
             } else {
