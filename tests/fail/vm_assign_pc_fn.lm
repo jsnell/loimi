@@ -1,0 +1,15 @@
+// error: this takes the address of `pc` in an op or vm function
+// A vm function reaches the state through pointers: it may not move pc
+// for its caller either (here, by address).
+fn bump(p: **u32) { *p = *p + 1; }
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format X { op: 8, a: 8, b: 8, c: 8 } }
+    fn skip() { bump(&pc); }
+    op SKIP() : X { skip(); next }
+    op RET(a: reg) : X { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn main() {}

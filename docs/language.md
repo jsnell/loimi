@@ -746,6 +746,11 @@ A handler body has type `never`: **every path must end in a control word**.
 | `fail e` | leave the run loop, returning `Err(e)` |
 | `suspend v` | leave the run loop with state saved for resumption (generators, coroutines, async) |
 
+Handlers and vm functions do not assign `pc` (or take its address):
+`next`, `redo` and a superinstruction's next part are relative to the
+instruction, so `jump` is the way to go elsewhere. Entries and `on raise`
+may set it.
+
 Inside a handler, `expr?` on a `Result<T, E>` means "on `Err(e)`, `raise e`".
 `E` must be the vm's raise type.
 

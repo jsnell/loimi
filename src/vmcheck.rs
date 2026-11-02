@@ -338,6 +338,55 @@ fn check_const_writes(c: &Checker, vi: usize) -> Res<()> {
     Ok(())
 }
 
+/// Op handlers and vm functions leave `pc` to the control words: `next`,
+/// `redo` and a super part's fallthrough are relative to the instruction
+/// (a super's next part is compiled in, and the JIT patches `pc + d` as
+/// an offset from the instruction's own word), so a handler that moved
+/// `pc` and then said `next` would run the wrong code. `jump` takes any
+/// target. Entries and `on raise` may set `pc`.
+fn check_pc_writes(c: &Checker, vi: usize) -> Res<()> {
+    let pc_idx = c.prog.vms[vi].pc_idx;
+    for f in c.prog.fns.iter() {
+        if f.vm != Some(vi as u32) || !matches!(f.vm_role, VmRole::Handler(_) | VmRole::VmFn) {
+            continue;
+        }
+        let (Some(body), Some(&l)) = (&f.body, f.vm_state.get(pc_idx)) else { continue };
+        // The state local itself, or (in a vm function, which reaches the
+        // state through pointers) what it points to.
+        let is_pc = |e: &TExpr| match &e.kind {
+            TK::Local(x) => *x == l,
+            TK::Deref(p) => matches!(p.kind, TK::Local(x) if x == l),
+            _ => false,
+        };
+        let mut bad = None;
+        // A call of a vm function passes the state by address (it is
+        // checked itself).
+        let mut passed: Vec<*const TExpr> = Vec::new();
+        crate::tirwalk::for_each_expr(body, &mut |e| {
+            if bad.is_some() {
+                return;
+            }
+            match &e.kind {
+                TK::Call(f, args) if matches!(f.kind, TK::FnRef(g) if c.prog.fns[g as usize].vm_role == VmRole::VmFn) => {
+                    if let Some(a) = args.get(pc_idx) {
+                        passed.push(a as *const TExpr);
+                    }
+                }
+                TK::Assign(lhs, _) if is_pc(lhs) => bad = Some((e.span, "assigns")),
+                TK::AddrOf(p) if is_pc(p) && !passed.contains(&(e as *const TExpr)) => bad = Some((e.span, "takes the address of")),
+                _ => {}
+            }
+        });
+        if let Some((span, what)) = bad {
+            return Err(Diag::new(
+                span,
+                format!("this {} `pc` in an op or vm function: `next`, `redo` and supers assume it stays at the instruction; use `jump` to go elsewhere", what),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
@@ -701,6 +750,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         check_raise(c, vm, fid, r)?;
     }
     check_const_writes(c, i)?;
+    check_pc_writes(c, i)?;
     // Instrumentation variants: a wrapper per wrapped op.
     for (vi, var) in d.variants.iter().enumerate() {
         if var.name.name == "default" || d.variants[..vi].iter().any(|x| x.name.name == var.name.name) {
