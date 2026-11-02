@@ -1,0 +1,5 @@
+print(assert(1))
+assert(1 == 1, "fine")
+print("before")
+assert(false, "assertion failed here")
+print("not reached")

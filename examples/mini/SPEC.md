@@ -136,6 +136,19 @@ as in Lua 5.4.
   missing values are nil, as in Lua. All expressions are evaluated before
   any assignment happens.
 
+### 3.2 Evaluation order
+
+Function arguments, table constructor fields and operands of binary
+operators are evaluated left to right. (Lua leaves this unspecified;
+Mini programs should not depend on it.)
+
+### 3.3 Numerals and negative literals
+
+- Numerals may use `1e+2`, `1E2`, `0X1F` and uppercase hex digits.
+- `-2147483648` is unary minus applied to a numeral that is out of
+  range, so it is a float. Write `-2147483647 - 1` for the minimum
+  integer.
+
 ## 4. Statements
 
 ```
@@ -173,10 +186,13 @@ break                              -- must be the last statement in its block
   `pairs` or `ipairs`, written directly in the loop header.
   - `ipairs(t)` visits `t[1], t[2], ...` up to the first nil.
   - `pairs(t)` visits every key/value pair once, in an unspecified order.
+    Keys set as integral floats come back as integers.
   - During traversal a program may assign to existing fields, including
     assigning nil. It must not add new keys.
   - With one variable, `for k in pairs(t)`, the value is dropped.
-- **`;`** may separate statements.
+- **`;`** is an empty statement and may appear anywhere a statement can.
+- **Method declarations.** `function a.b:m()` is allowed, as are the
+  call forms `obj:m{...}` and `obj:m"str"`.
 
 ## 5. Standard library
 
@@ -197,7 +213,9 @@ part of Mini.
 - `tonumber(v)`:
   - A number is returned unchanged.
   - A string holding a decimal or hex integer numeral, or a decimal float
-    numeral, is converted. Surrounding whitespace is allowed.
+    numeral, is converted. An optional leading `-` or `+` and surrounding
+    whitespace (space, tab, newline, CR) are allowed. An integer numeral
+    outside the integer range gives a float.
   - Anything else gives nil.
 - `type(v)`: the type name as a string.
 - `pairs(t)` and `ipairs(t)`: only in generic `for` (§4).
@@ -215,7 +233,7 @@ part of Mini.
   - `floor` and `ceil` return an integer when the result fits the
     integer range, as in Lua 5.4.
   - `abs`, `max` and `min` keep the integer or float subtype of their
-    result.
+    result. On ties, `max` and `min` return the first argument.
   - The others return floats.
 
 **`string`:** functions are called as `string.f(s, ...)`. Method syntax on
@@ -225,7 +243,8 @@ strings, such as `s:sub(1, 2)`, is not part of Mini.
 - `string.byte(s [, i])`: one result only. The default for `i` is 1.
 - `string.char(...)`.
 - `string.rep(s, n)`.
-- `string.format(fmt, ...)`:
+- `string.format(fmt, ...)`. A negative argument to `%x` is out of the
+  subset:
   - Directives: `%d`, `%s`, `%f`, `%g`, `%x`, `%c` and `%%`.
   - Optional flag `-`, optional width, optional `.precision`.
   - `%d`, `%x` and `%c` need integer arguments, or floats with an
@@ -239,14 +258,21 @@ strings, such as `s:sub(1, 2)`, is not part of Mini.
 - `table.concat(t [, sep])`: elements 1..#t, each a string or number.
 
 **`io`:**
-- `io.write(...)`: writes strings and numbers, with numbers converted as
-  by `tostring`. Nothing is added between or after the arguments.
+- `io.write(...)`: writes strings and numbers, with nothing added
+  between or after the arguments. Integers are written in decimal, and
+  floats with `%.14g` and **no** `.0` suffix, as in Lua 5.4: `io.write(1.0)`
+  writes `1`.
+
+- `table.remove` on an empty table returns nil.
 
 ## 6. Errors
 
 A runtime error stops the program. It writes a message to standard error
 and exits with a nonzero status. Mini has no `pcall`, so errors cannot be
 caught. The message text is unspecified.
+
+Recursion at least 10000 calls deep must work. Deeper recursion may raise
+a "stack overflow" error.
 
 ## 7. Memory
 

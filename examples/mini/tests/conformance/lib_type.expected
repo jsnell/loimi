@@ -1,0 +1,7 @@
+nil	boolean	boolean
+number	number	number	number
+string	string	string
+table	table	function	function
+function	table	function	table
+string
+nil	nil

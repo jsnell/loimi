@@ -1,0 +1,13 @@
+print("double", 'single')
+print("it's", 'say "hi"')
+print("a\tb")
+print("line1\nline2")
+print("back\\slash", "quote\"", 'apos\'')
+print("\65\66\67", "\097bc", "\0491")
+print(#"a\0b", string.byte("a\0b", 2))
+print(#"\r", string.byte("\r"), string.byte("\n"), string.byte("\t"))
+print("x\
+y")
+print(#"", #"abc", #"\\")
+print("\255" > "\254", string.byte("\255"))
+print("")

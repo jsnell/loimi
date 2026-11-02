@@ -1,0 +1,12 @@
+print(tostring(nil), tostring(true), tostring(false))
+print(tostring(0), tostring(-5), tostring(2147483647), tostring((-2147483647 - 1)))
+print(tostring(3.0), tostring(-3.0), tostring(0.5), tostring(0.1), tostring(-0.0))
+print(tostring(1e15), tostring(1e14), tostring(123456789012345.0), tostring(1e16))
+print(tostring(1 / 3), tostring(2 / 3), tostring(100 / 7), tostring(3.14159265358979))
+print(tostring(1e-4), tostring(1e-5), tostring(2.5e-10), tostring(1e308 * 10), tostring(-1e308 * 10))
+print(tostring(2 ^ 24), tostring(2 ^ 31), tostring(12345.678))
+print(tostring("str"), tostring(""))
+print(type(tostring(1)), #tostring(12345))
+local t = {}
+print(string.sub(tostring(t), 1, 7) == "table: ", string.sub(tostring(tostring), 1, 10) == "function: ")
+print(tostring(t) == tostring(t))

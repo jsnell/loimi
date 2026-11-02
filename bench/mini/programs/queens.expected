@@ -1,0 +1,10 @@
+4-queens: 2
+5-queens: 10
+6-queens: 4
+7-queens: 40
+8-queens: 92
+9-queens: 352
+10-queens: 724
+11-queens: 2680
+12-queens: 14200
+total 54312

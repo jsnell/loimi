@@ -1,0 +1,9 @@
+nil	false	2	zero	empty
+1	nil	1	false
+true	true	false	false	false
+false	1
+1	2
+last	5
+default
+0 is true
+empty string is true
