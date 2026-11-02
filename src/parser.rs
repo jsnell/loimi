@@ -92,6 +92,24 @@ impl Parser {
             self.err(format!("expected `{}`, found {}", p, self.describe()))
         }
     }
+    /// Before closing a type-argument list: split a `>>`, `>>=` or `>=`
+    /// token so that `Vec<Box<T>>` closes both lists.
+    fn split_angle(&mut self) {
+        let rest = match self.peek() {
+            Tok::Punct(">>") => ">",
+            Tok::Punct(">>=") => ">=",
+            Tok::Punct(">=") => "=",
+            _ => return,
+        };
+        let t = &mut self.toks[self.pos];
+        let mut second = t.clone();
+        t.tok = Tok::Punct(">");
+        t.span.hi = t.span.lo + 1;
+        second.tok = Tok::Punct(rest);
+        second.span.lo += 1;
+        second.space_before = false;
+        self.toks.insert(self.pos + 1, second);
+    }
     pub fn expect_kw(&mut self, k: &str) -> Res<Span> {
         if self.is_kw(k) {
             Ok(self.bump().span)
@@ -529,8 +547,10 @@ impl Parser {
             }
             let mut args = Vec::new();
             if self.eat("<") {
+                self.split_angle();
                 while !self.is(">") {
                     args.push(self.parse_type()?);
+                    self.split_angle();
                     if !self.eat(",") {
                         break;
                     }
@@ -803,6 +823,15 @@ impl Parser {
                     }
                     _ => {
                         let name = self.ident()?;
+                        // `module.Type { .. }`: a struct literal of an imported type.
+                        if let ExprKind::Ident(m) = &e.kind {
+                            if is_upper(&name.name) && self.is("{") && !self.no_struct {
+                                let module = Ident { name: m.clone(), span: e.span };
+                                let start = e.span;
+                                e = self.parse_struct_lit(vec![module, name], start)?;
+                                continue;
+                            }
+                        }
                         e = field(e, name);
                     }
                 }
@@ -1032,6 +1061,7 @@ impl Parser {
                         self.bump();
                         self.bump();
                         let t = self.parse_type()?;
+                        self.split_angle();
                         self.expect(">")?;
                         self.expect("(")?;
                         self.expect(")")?;

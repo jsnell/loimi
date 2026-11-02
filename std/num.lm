@@ -1,0 +1,330 @@
+// Numbers: exact numeral parsing with overflow reporting, float
+// formatting, and guest-semantics arithmetic helpers.
+//
+// Parsing functions take the whole string: they never skip whitespace and
+// fail on trailing characters. Lexers find the extent of a numeral first
+// (see std.lex) and then convert it here.
+
+import std.mem;
+import std.text;
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+extern "C" fn strtod(s: *u8, end: **u8) -> f64;
+
+/// Why a numeral could not be converted.
+pub enum NumError {
+    /// Not a numeral of the expected syntax (includes the empty string).
+    Invalid,
+    /// Well-formed, but the value does not fit the result type.
+    Overflow,
+}
+
+/// A parsed number literal: an integer, or a float if it had a fraction or
+/// exponent (or, for decimal integers, if it did not fit in an i64).
+pub enum Number { Int(i64), Float(f64) }
+
+pub fn error_message(e: NumError) -> str {
+    match e {
+        Invalid => "malformed number",
+        Overflow => "number out of range",
+    }
+}
+
+// ── digits ──────────────────────────────────────────────────────────
+
+/// Value of an ASCII digit in bases up to 36 (`0-9`, `a-z`, `A-Z`), or 99.
+pub fn digit_value(c: u8) -> u32 {
+    if c >= '0' and c <= '9' { return (c - '0') as u32; }
+    if c >= 'a' and c <= 'z' { return (c - 'a') as u32 + 10; }
+    if c >= 'A' and c <= 'Z' { return (c - 'A') as u32 + 10; }
+    99
+}
+
+pub fn is_hex_digit(c: u8) -> bool { digit_value(c) < 16 }
+
+// ── integers ────────────────────────────────────────────────────────
+
+/// Parse unsigned digits (no sign, no prefix) in `radix` (2..=36).
+pub fn parse_u64(digits: str, radix: u32) -> Result<u64, NumError> {
+    if digits.len == 0 { return Err(NumError.Invalid); }
+    var v: u64 = 0;
+    var over = false;
+    for i in 0..digits.len {
+        let d = digit_value(digits[i]);
+        if d >= radix { return Err(NumError.Invalid); }
+        // Keep scanning after an overflow so that "12x" is Invalid, not Overflow.
+        if !over {
+            match v.mul_checked(radix as u64) {
+                Some(m) => match m.add_checked(d as u64) {
+                    Some(s) => v = s,
+                    None => over = true,
+                },
+                None => over = true,
+            }
+        }
+    }
+    if over { return Err(NumError.Overflow); }
+    Ok(v)
+}
+
+/// Parse unsigned digits in `radix`, keeping the low 64 bits on overflow
+/// (Lua's rule for hexadecimal integer literals).
+pub fn parse_u64_wrapping(digits: str, radix: u32) -> Result<u64, NumError> {
+    if digits.len == 0 { return Err(NumError.Invalid); }
+    var v: u64 = 0;
+    for i in 0..digits.len {
+        let d = digit_value(digits[i]);
+        if d >= radix { return Err(NumError.Invalid); }
+        v = v *% (radix as u64) +% d as u64;
+    }
+    Ok(v)
+}
+
+/// Apply an optional sign to a magnitude, checking the i64 range exactly
+/// (so "-9223372036854775808" is accepted).
+fn signed(neg: bool, mag: u64) -> Result<i64, NumError> {
+    if neg {
+        if mag > 0x8000000000000000 { return Err(NumError.Overflow); }
+        Ok((0 -% mag) as i64)
+    } else {
+        if mag > 0x7FFFFFFFFFFFFFFF { return Err(NumError.Overflow); }
+        Ok(mag as i64)
+    }
+}
+
+/// Split an optional leading `+` or `-`.
+fn split_sign(s: str) -> (bool, str) {
+    if s.len > 0 and (s[0] == '-' or s[0] == '+') { (s[0] == '-', s[1..s.len]) } else { (false, s) }
+}
+
+/// Parse an optionally signed integer in `radix` (no prefix).
+pub fn parse_i64(s: str, radix: u32) -> Result<i64, NumError> {
+    let (neg, rest) = split_sign(s);
+    signed(neg, parse_u64(rest, radix)?)
+}
+
+/// True if `s` (after the sign) starts with `0x` or `0X`.
+fn is_hex_prefixed(s: str) -> bool {
+    s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')
+}
+
+/// Parse an optionally signed decimal integer, or a hexadecimal one with a
+/// `0x`/`0X` prefix. Out-of-range values are `Overflow`.
+pub fn parse_int(s: str) -> Result<i64, NumError> {
+    let (neg, rest) = split_sign(s);
+    if is_hex_prefixed(rest) {
+        return signed(neg, parse_u64(rest[2..rest.len], 16)?);
+    }
+    signed(neg, parse_u64(rest, 10)?)
+}
+
+// ── floats ──────────────────────────────────────────────────────────
+
+/// Length of the longest prefix of `s[i..]` made of decimal digits.
+fn digits_len(s: str, i: u64) -> u64 {
+    var j = i;
+    while j < s.len and s[j] >= '0' and s[j] <= '9' { j += 1; }
+    j - i
+}
+
+/// Length of the decimal float numeral at the start of `s`:
+/// `digits [. digits] [(e|E) [+-] digits]`, where the integer part or the
+/// fraction may be empty but not both (`5.` and `.5` are valid, but a `.`
+/// followed by another `.` is not taken, so `1..2` scans as `1`). Returns 0
+/// if `s` does not start with one. A dangling exponent marker (`1e`, `1e+`)
+/// is not part of the numeral. No sign is accepted.
+pub fn decimal_len(s: str) -> u64 {
+    let int_digits = digits_len(s, 0);
+    var i = int_digits;
+    var frac_digits: u64 = 0;
+    if i < s.len and s[i] == '.' and !(i + 1 < s.len and s[i + 1] == '.') {
+        frac_digits = digits_len(s, i + 1);
+        if int_digits + frac_digits > 0 { i += 1 + frac_digits; }
+    }
+    if int_digits + frac_digits == 0 { return 0; }
+    if i < s.len and (s[i] == 'e' or s[i] == 'E') {
+        var j = i + 1;
+        if j < s.len and (s[j] == '+' or s[j] == '-') { j += 1; }
+        let e = digits_len(s, j);
+        if e > 0 { i = j + e; }
+    }
+    i
+}
+
+/// Convert validated numeral text with strtod (correctly rounded).
+fn strtod_str(s: str) -> f64 {
+    var small: [u8; 64] = [0; 64];
+    var p: *u8 = &small[0];
+    if s.len >= 64 { p = mem.alloc(s.len + 1); }
+    mem.memcpy(p, s.ptr, s.len);
+    p[s.len] = 0;
+    let v = strtod(p, 0 as **u8);
+    if s.len >= 64 { mem.release(p); }
+    v
+}
+
+/// Parse an optionally signed decimal float (`1`, `-2.5`, `.5`, `5.`,
+/// `1e-3`). Correctly rounded; magnitudes beyond the f64 range become
+/// infinities, as in C and Lua. Rejects `inf`, `nan`, hex floats and
+/// surrounding whitespace, which C's strtod would accept.
+pub fn parse_f64(s: str) -> Result<f64, NumError> {
+    let (_, rest) = split_sign(s);
+    let n = decimal_len(rest);
+    if n == 0 or n != rest.len { return Err(NumError.Invalid); }
+    Ok(strtod_str(s))
+}
+
+/// Parse a numeral as a lexer or `tonumber` sees it: an optional sign, then
+/// a hexadecimal integer (`0x1F`; Overflow if it does not fit), a decimal
+/// integer (`42`; a Float if it does not fit, as in Lua), or a decimal
+/// float (`4.2e1`).
+pub fn parse_number(s: str) -> Result<Number, NumError> {
+    let (neg, rest) = split_sign(s);
+    if is_hex_prefixed(rest) {
+        return Ok(Number.Int(signed(neg, parse_u64(rest[2..rest.len], 16)?)?));
+    }
+    let n = decimal_len(rest);
+    if n == 0 or n != rest.len { return Err(NumError.Invalid); }
+    if digits_len(rest, 0) == n {
+        match parse_u64(rest, 10) {
+            Ok(mag) => if let Ok(v) = signed(neg, mag) { return Ok(Number.Int(v)); },
+            Err(_) => {},
+        }
+    }
+    Ok(Number.Float(strtod_str(s)))
+}
+
+// ── formatting ──────────────────────────────────────────────────────
+
+/// Append `x` formatted like C's `"%.{prec}g"` (Lua's `tostring` uses 14).
+pub fn write_g(b: *text.StrBuf, x: f64, prec: i32) {
+    var buf: [u8; 48] = [0; 48];
+    let n = snprintf(&buf[0], 48, "%.*g\0".ptr, prec, x);
+    b.push_str(buf[0..n as u64]);
+}
+
+/// Append the shortest decimal representation that reads back as exactly
+/// `x` (`0.1` prints as `0.1`, `1/3` as `0.3333333333333333`). Like
+/// Python's `repr` without the `.0`: fixed notation when the decimal
+/// exponent is in [-4, 16), otherwise exponent notation (`1e+16`).
+pub fn write_shortest(b: *text.StrBuf, x: f64) {
+    var buf: [u8; 48] = [0; 48];
+    // Find the fewest significant digits that round-trip.
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 48, "%.*e\0".ptr, prec - 1, x);
+        if x != x or strtod(&buf[0], 0 as **u8) == x { break; }
+        prec += 1;
+    }
+    // The decimal exponent follows the 'e' (absent for inf and nan).
+    let s = buf[0..n as u64];
+    var exp: i64 = 0;
+    if let Some(e) = text.find(s, 'e') {
+        if let Ok(v) = parse_i64(s[e + 1..s.len], 10) { exp = v; }
+    }
+    // %g switches to exponent notation when exp >= precision; widen the
+    // precision so that integers like 100 print as "100", not "1e+02".
+    // Below 1e16 the extra digits are exact digits of the integer part.
+    var p = prec as i64;
+    if exp >= -4 and exp < 16 and exp + 1 > p { p = exp + 1; }
+    n = snprintf(&buf[0], 48, "%.*g\0".ptr, p as i32, x);
+    b.push_str(buf[0..n as u64]);
+}
+
+/// If the text appended since byte offset `start` looks like an integer
+/// (only a sign and digits), append `.0`, so that floats print as floats:
+/// `write_g(b, 3.0, 14); mark_float(b, start)` gives `3.0`, as Lua's
+/// `tostring` does. `inf`, `nan` and `1e+20` are left alone.
+pub fn mark_float(b: *text.StrBuf, start: u64) {
+    let s = b.as_str();
+    for i in start..s.len {
+        let c = s[i];
+        if c != '-' and (c < '0' or c > '9') { return; }
+    }
+    b.push_str(".0");
+}
+
+/// Append `x` in lowercase hexadecimal, without a prefix.
+pub fn write_hex(b: *text.StrBuf, x: u64) {
+    var buf: [u8; 16] = [0; 16];
+    var i: u64 = 16;
+    var u = x;
+    loop {
+        i -= 1;
+        buf[i] = "0123456789abcdef"[u & 15];
+        u = u >> 4;
+        if u == 0 { break; }
+    }
+    b.push_str(buf[i..16]);
+}
+
+// ── integer arithmetic ──────────────────────────────────────────────
+//
+// `x.add_checked(y)`, `x.sub_checked(y)` and `x.mul_checked(y)` are
+// built-in methods on every integer type (returning `?T`). The functions
+// below add the forms that guest languages need beyond those.
+
+/// Wrapped sum and whether it overflowed.
+pub fn add_overflow(a: i64, b: i64) -> (i64, bool) { (a +% b, a.add_checked(b).is_none()) }
+
+/// Wrapped difference and whether it overflowed.
+pub fn sub_overflow(a: i64, b: i64) -> (i64, bool) { (a -% b, a.sub_checked(b).is_none()) }
+
+/// Wrapped product and whether it overflowed.
+pub fn mul_overflow(a: i64, b: i64) -> (i64, bool) { (a *% b, a.mul_checked(b).is_none()) }
+
+/// Floor division (rounds toward negative infinity: Lua `//`, Python `//`).
+/// None if `b` is 0. `MIN // -1` wraps to MIN, as in Lua.
+pub fn floor_div(a: i64, b: i64) -> ?i64 {
+    if b == 0 { return None; }
+    if b == -1 { return Some(0 -% a); }
+    let q = a / b;
+    if (a % b != 0) and ((a ^ b) < 0) { Some(q - 1) } else { Some(q) }
+}
+
+/// Floor modulo (result has the sign of `b`: Lua `%`, Python `%`).
+/// None if `b` is 0. `MIN % -1` is 0.
+pub fn floor_mod(a: i64, b: i64) -> ?i64 {
+    if b == 0 { return None; }
+    if b == -1 { return Some(0); }
+    let r = a % b;
+    if r != 0 and ((r ^ b) < 0) { Some(r + b) } else { Some(r) }
+}
+
+/// Truncating division (rounds toward zero: C, JavaScript `|0`).
+/// None if `b` is 0. `MIN / -1` wraps to MIN.
+pub fn trunc_div(a: i64, b: i64) -> ?i64 {
+    if b == 0 { return None; }
+    if b == -1 { return Some(0 -% a); }
+    Some(a / b)
+}
+
+/// Truncating remainder (sign of `a`: C `%`). None if `b` is 0.
+pub fn trunc_rem(a: i64, b: i64) -> ?i64 {
+    if b == 0 { return None; }
+    if b == -1 { return Some(0); }
+    Some(a % b)
+}
+
+// ── float arithmetic ────────────────────────────────────────────────
+
+/// Float floor division, `floor(a / b)` (Lua `//` on floats).
+pub fn floor_div_f64(a: f64, b: f64) -> f64 { (a / b).floor() }
+
+/// Float floor modulo with the sign of `b` (Lua and Python `%`):
+/// `5.5 % -2` is `-0.5`; `x % inf` is `x` for x >= 0 and `inf` for x < 0
+/// (as in Lua); a zero divisor or infinite dividend gives NaN.
+pub fn floor_mod_f64(a: f64, b: f64) -> f64 {
+    let m = a % b;
+    if (m > 0.0 and b < 0.0) or (m < 0.0 and b > 0.0) { m + b } else { m }
+}
+
+/// `x` as an i64 if it is integral and in range (Lua's `math.tointeger`,
+/// and float keys that must normalize to integer keys).
+pub fn to_i64_exact(x: f64) -> ?i64 {
+    // The range is [-2^63, 2^63); both bounds are exact doubles.
+    if !(x >= -9223372036854775808.0 and x < 9223372036854775808.0) { return None; }
+    if x.floor() != x { return None; }
+    Some(x as i64)
+}

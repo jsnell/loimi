@@ -1,0 +1,351 @@
+// Diagnostics: source files and spans, line/column lookup, and messages
+// rendered with a source snippet and a caret underline:
+//
+//     error: unfinished string
+//       --> script.mini:3:9
+//         3 | print("hello)
+//           |       ^^^^^^^ string starts here
+//     note: strings cannot span lines
+//
+// The format matches the Loimi compiler's own diagnostics (src/diag.rs).
+//
+// Strings are borrowed: a SourceMap does not copy file names or text, and a
+// Diag does not copy its messages. A `Diagnostics` sink copies the messages
+// of the diagnostics pushed into it into its own arena, so they can be built
+// in a temporary StrBuf.
+
+import std.io;
+import std.mem;
+import std.text;
+
+// ── spans and source files ──────────────────────────────────────────
+
+/// A byte range `lo..hi` in source file `file` (an id from SourceMap.add).
+pub struct Span { file: u32, lo: u32, hi: u32 }
+
+pub fn span(file: u32, lo: u64, hi: u64) -> Span { Span { file: file, lo: lo as u32, hi: hi as u32 } }
+
+/// The smallest span covering both `a` and `b` (which must be in the same file).
+pub fn Span.to(a: Span, b: Span) -> Span {
+    Span { file: a.file, lo: if a.lo < b.lo { a.lo } else { b.lo }, hi: if a.hi > b.hi { a.hi } else { b.hi } }
+}
+
+pub fn Span.len(s: Span) -> u32 { s.hi - s.lo }
+
+/// A 1-based line and column. Columns count bytes.
+pub struct LineCol { line: u32, col: u32 }
+
+pub struct SourceFile {
+    name: str,
+    text: str,
+    /// Byte offset of the start of each line; built on first lookup.
+    line_starts: mem.Vec<u32>,
+    indexed: bool,
+}
+
+/// The source files of a program or session, addressed by id.
+pub struct SourceMap { files: mem.Vec<SourceFile> }
+
+pub fn SourceMap.new() -> SourceMap { SourceMap { files: mem.Vec.new() } }
+
+/// Register a file and return its id. `name` and `text` are borrowed and
+/// must outlive the map.
+pub fn SourceMap.add(sm: *SourceMap, name: str, text: str) -> u32 {
+    sm.files.push(SourceFile { name: name, text: text, line_starts: mem.Vec.new(), indexed: false });
+    (sm.files.len - 1) as u32
+}
+
+pub fn SourceMap.file(sm: *SourceMap, id: u32) -> *SourceFile { sm.files.ptr_at(id as u64) }
+
+pub fn SourceMap.name(sm: *SourceMap, id: u32) -> str { sm.file(id).name }
+
+pub fn SourceMap.text(sm: *SourceMap, id: u32) -> str { sm.file(id).text }
+
+/// The text a span covers.
+pub fn SourceMap.snippet(sm: *SourceMap, s: Span) -> str { sm.file(s.file).text[s.lo as u64..s.hi as u64] }
+
+fn SourceFile.index(f: *SourceFile) {
+    if f.indexed { return; }
+    f.line_starts.push(0);
+    for i in 0..f.text.len {
+        if f.text[i] == '\n' { f.line_starts.push((i + 1) as u32); }
+    }
+    f.indexed = true;
+}
+
+/// Number of lines (a final line without a newline counts; an empty file
+/// has one empty line).
+pub fn SourceMap.line_count(sm: *SourceMap, id: u32) -> u32 {
+    let f = sm.file(id);
+    f.index();
+    f.line_starts.len as u32
+}
+
+/// Line and column of byte offset `pos` (clamped to the end of the file).
+/// The line table is built on the first call and then binary-searched.
+pub fn SourceMap.line_col(sm: *SourceMap, id: u32, pos: u32) -> LineCol {
+    let f = sm.file(id);
+    f.index();
+    let p = if pos as u64 > f.text.len { f.text.len as u32 } else { pos };
+    // Largest i with line_starts[i] <= p.
+    let starts = f.line_starts.items();
+    var lo: u64 = 0;
+    var hi = starts.len;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if starts[mid] <= p { lo = mid; } else { hi = mid; }
+    }
+    LineCol { line: (lo + 1) as u32, col: p - starts[lo] + 1 }
+}
+
+/// Text of 1-based line `line`, without its line terminator ("" if out of range).
+pub fn SourceMap.line_text(sm: *SourceMap, id: u32, line: u32) -> str {
+    let f = sm.file(id);
+    f.index();
+    if line == 0 or line as u64 > f.line_starts.len { return ""; }
+    let lo = f.line_starts.at(line as u64 - 1) as u64;
+    var hi = f.text.len;
+    if (line as u64) < f.line_starts.len { hi = f.line_starts.at(line as u64) as u64 - 1; }
+    if hi > lo and f.text[hi - 1] == '\r' { hi -= 1; }
+    f.text[lo..hi]
+}
+
+/// Append `name:line:col` for the start of `s`.
+pub fn SourceMap.write_location(sm: *SourceMap, out: *text.StrBuf, s: Span) {
+    let lc = sm.line_col(s.file, s.lo);
+    out.push_str(sm.name(s.file));
+    out.push(':');
+    out.push_int(lc.line as i64);
+    out.push(':');
+    out.push_int(lc.col as i64);
+}
+
+pub fn SourceMap.free(sm: *SourceMap) {
+    for i in 0..sm.files.len { sm.files.ptr_at(i).line_starts.free(); }
+    sm.files.free();
+}
+
+// ── diagnostics ─────────────────────────────────────────────────────
+
+pub enum Severity { Error, Warning, Note, Help }
+
+pub fn severity_name(s: Severity) -> str {
+    match s {
+        Error => "error",
+        Warning => "warning",
+        Note => "note",
+        Help => "help",
+    }
+}
+
+/// A secondary message, optionally pointing at its own span.
+pub struct Note { severity: Severity, span: ?Span, msg: str }
+
+/// One diagnostic: a message, an optional primary span with a label
+/// (printed after the carets), and any number of notes.
+pub struct Diag {
+    severity: Severity,
+    msg: str,
+    span: ?Span,
+    label: str,
+    notes: mem.Vec<Note>,
+}
+
+pub fn Diag.new(severity: Severity, s: ?Span, msg: str) -> Diag {
+    Diag { severity: severity, msg: msg, span: s, label: "", notes: mem.Vec.new() }
+}
+
+pub fn error(s: Span, msg: str) -> Diag { Diag.new(Severity.Error, Some(s), msg) }
+
+pub fn warning(s: Span, msg: str) -> Diag { Diag.new(Severity.Warning, Some(s), msg) }
+
+/// Set the label printed after the primary span's carets.
+pub fn Diag.with_label(d: Diag, label: str) -> Diag {
+    var r = d;
+    r.label = label;
+    r
+}
+
+/// Add a `note:` line without a span.
+pub fn Diag.with_note(d: Diag, msg: str) -> Diag {
+    var r = d;
+    r.notes.push(Note { severity: Severity.Note, span: None, msg: msg });
+    r
+}
+
+/// Add a `note:` pointing at `s`.
+pub fn Diag.with_note_at(d: Diag, s: Span, msg: str) -> Diag {
+    var r = d;
+    r.notes.push(Note { severity: Severity.Note, span: Some(s), msg: msg });
+    r
+}
+
+/// Add a `help:` line without a span.
+pub fn Diag.with_help(d: Diag, msg: str) -> Diag {
+    var r = d;
+    r.notes.push(Note { severity: Severity.Help, span: None, msg: msg });
+    r
+}
+
+pub fn Diag.free(d: *Diag) { d.notes.free(); }
+
+// ── rendering ───────────────────────────────────────────────────────
+
+/// Append the `  --> file:line:col` line, the source line and the carets.
+fn SourceMap.render_snippet(sm: *SourceMap, out: *text.StrBuf, s: Span, label: str) {
+    let lc = sm.line_col(s.file, s.lo);
+    out.push_str("  --> ");
+    sm.write_location(out, s);
+    out.push('\n');
+    let line = sm.line_text(s.file, lc.line);
+    // Line number right-aligned in a gutter of at least 5 columns:
+    // "   12 | text".
+    var num = text.StrBuf.new();
+    num.push_int(lc.line as i64);
+    let gutter = if num.len() > 5 { num.len() } else { 5 };
+    for _ in num.len()..gutter { out.push(' '); }
+    out.push_str(num.as_str());
+    num.free();
+    out.push_str(" |");
+    if line.len > 0 {
+        out.push(' ');
+        out.push_str(line);
+    }
+    out.push('\n');
+    // Underline: at least one caret, at most to the end of the line. Tabs
+    // in the prefix are copied so the carets line up.
+    for _ in 0..gutter + 1 { out.push(' '); }
+    out.push_str("| ");
+    let start = (lc.col - 1) as u64;
+    for i in 0..start {
+        out.push(if i < line.len and line[i] == '\t' { '\t' } else { ' ' });
+    }
+    var width = s.len() as u64;
+    if start + width > line.len { width = if line.len > start { line.len - start } else { 0 }; }
+    if width == 0 { width = 1; }
+    for _ in 0..width { out.push('^'); }
+    if label.len > 0 {
+        out.push(' ');
+        out.push_str(label);
+    }
+    out.push('\n');
+}
+
+/// Append the rendered diagnostic (ending in a newline) to `out`.
+pub fn SourceMap.render(sm: *SourceMap, d: *Diag, out: *text.StrBuf) {
+    out.push_str(severity_name(d.severity));
+    out.push_str(": ");
+    out.push_str(d.msg);
+    out.push('\n');
+    if let Some(s) = d.span { sm.render_snippet(out, s, d.label); }
+    for i in 0..d.notes.len {
+        let n = d.notes.ptr_at(i);
+        out.push_str(severity_name(n.severity));
+        out.push_str(": ");
+        out.push_str(n.msg);
+        out.push('\n');
+        if let Some(s) = n.span { sm.render_snippet(out, s, ""); }
+    }
+}
+
+/// Render a diagnostic to stderr.
+pub fn SourceMap.eprint(sm: *SourceMap, d: *Diag) {
+    var b = text.StrBuf.new();
+    sm.render(d, &b);
+    io.eprint(b.as_str());
+    b.free();
+}
+
+// ── collecting diagnostics ──────────────────────────────────────────
+
+/// A sink that collects diagnostics (so one error doesn't hide the rest)
+/// and counts them by severity.
+pub struct Diagnostics {
+    items: mem.Vec<Diag>,
+    arena: mem.Arena,
+    errors: u32,
+    warnings: u32,
+}
+
+pub fn Diagnostics.new() -> Diagnostics {
+    Diagnostics { items: mem.Vec.new(), arena: mem.Arena.new(), errors: 0, warnings: 0 }
+}
+
+/// Add a diagnostic. Its message, label and notes are copied into the
+/// sink's arena; the sink takes over `d`'s note list.
+pub fn Diagnostics.push(ds: *Diagnostics, d: Diag) {
+    var c = d;
+    c.msg = ds.arena.str(d.msg);
+    c.label = ds.arena.str(d.label);
+    for i in 0..c.notes.len {
+        let n = c.notes.ptr_at(i);
+        n.msg = ds.arena.str(n.msg);
+    }
+    match c.severity {
+        Error => ds.errors += 1,
+        Warning => ds.warnings += 1,
+        _ => {},
+    }
+    ds.items.push(c);
+}
+
+/// Shorthand for `push(diag.error(s, msg))`.
+pub fn Diagnostics.error(ds: *Diagnostics, s: Span, msg: str) { ds.push(error(s, msg)); }
+
+/// Shorthand for `push(diag.warning(s, msg))`.
+pub fn Diagnostics.warning(ds: *Diagnostics, s: Span, msg: str) { ds.push(warning(s, msg)); }
+
+pub fn Diagnostics.len(ds: *Diagnostics) -> u64 { ds.items.len }
+
+/// The `i`th diagnostic, in the order they were pushed.
+pub fn Diagnostics.at(ds: *Diagnostics, i: u64) -> *Diag { ds.items.ptr_at(i) }
+
+pub fn Diagnostics.error_count(ds: *Diagnostics) -> u32 { ds.errors }
+
+pub fn Diagnostics.warning_count(ds: *Diagnostics) -> u32 { ds.warnings }
+
+pub fn Diagnostics.has_errors(ds: *Diagnostics) -> bool { ds.errors > 0 }
+
+fn plural(out: *text.StrBuf, n: u32, what: str) {
+    out.push_int(n as i64);
+    out.push(' ');
+    out.push_str(what);
+    if n != 1 { out.push('s'); }
+}
+
+/// Append a summary line such as `1 warning and 2 errors generated.`
+/// (nothing if there are no errors or warnings).
+pub fn Diagnostics.summary(ds: *Diagnostics, out: *text.StrBuf) {
+    if ds.errors == 0 and ds.warnings == 0 { return; }
+    if ds.warnings > 0 { plural(out, ds.warnings, "warning"); }
+    if ds.warnings > 0 and ds.errors > 0 { out.push_str(" and "); }
+    if ds.errors > 0 { plural(out, ds.errors, "error"); }
+    out.push_str(" generated.\n");
+}
+
+/// Append every diagnostic, then the summary.
+pub fn Diagnostics.render(ds: *Diagnostics, sm: *SourceMap, out: *text.StrBuf) {
+    for i in 0..ds.items.len { sm.render(ds.items.ptr_at(i), out); }
+    ds.summary(out);
+}
+
+/// Render everything to stderr.
+pub fn Diagnostics.eprint(ds: *Diagnostics, sm: *SourceMap) {
+    var b = text.StrBuf.new();
+    ds.render(sm, &b);
+    io.eprint(b.as_str());
+    b.free();
+}
+
+pub fn Diagnostics.clear(ds: *Diagnostics) {
+    for i in 0..ds.items.len { ds.items.ptr_at(i).free(); }
+    ds.items.clear();
+    ds.errors = 0;
+    ds.warnings = 0;
+}
+
+pub fn Diagnostics.free(ds: *Diagnostics) {
+    ds.clear();
+    ds.items.free();
+    ds.arena.free();
+}

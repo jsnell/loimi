@@ -1,0 +1,25 @@
+// A generic function used as a function pointer is instantiated from the
+// expected function type.
+
+import std.io;
+
+struct Ops<T> { pick: fn(T, T) -> T, show: fn(T) }
+
+fn first<T>(a: T, b: T) -> T { a }
+
+fn show_int(x: i64) { io.print_int(x); io.println(""); }
+fn show_f(x: f64) { io.print_f64(x); io.println(""); }
+
+fn apply<T>(ops: Ops<T>, a: T, b: T) { ops.show(ops.pick(a, b)); }
+
+fn main() {
+    let i: Ops<i64> = Ops { pick: first, show: show_int };
+    apply(i, 1, 2);
+    let f: Ops<f64> = Ops { pick: first, show: show_f };
+    apply(f, 2.5, 3.5);
+    let g: fn(bool, bool) -> bool = first;
+    io.print_bool(g(true, false)); io.println("");
+}
+// expect: 1
+// expect: 2.5
+// expect: true

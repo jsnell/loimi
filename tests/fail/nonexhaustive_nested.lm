@@ -1,0 +1,11 @@
+enum N { Int(i64), Float(f64) }
+
+fn f(r: Result<N, i32>) -> i64 {
+    match r {
+        Ok(Int(i)) => i,
+        Err(_) => 0,
+    }
+}
+
+fn main() {}
+// error: non-exhaustive match: missing Ok(_)

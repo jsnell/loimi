@@ -1,0 +1,133 @@
+// std.diag: source map lookups, rendering, and the Diagnostics sink.
+
+import std.io;
+import std.diag;
+import std.text;
+
+fn show_lc(sm: *diag.SourceMap, f: u32, pos: u32) {
+    let lc = sm.line_col(f, pos);
+    io.print_int(lc.line as i64);
+    io.print(":");
+    io.print_int(lc.col as i64);
+    io.print(" ");
+}
+
+fn render(sm: *diag.SourceMap, d: diag.Diag) {
+    var b = text.StrBuf.new();
+    var d = d;
+    sm.render(&d, &b);
+    io.print(b.as_str());
+    b.free();
+    d.free();
+}
+
+fn main() {
+    var sm = diag.SourceMap.new();
+    let src = "local x = 1\nprint(\"hello)\n\tif y then\r\nend\n";
+    let f = sm.add("script.mini", src);
+    let g = sm.add("empty.mini", "");
+
+    // Line/column lookup, including line starts, the end, and clamping.
+    show_lc(&sm, f, 0); show_lc(&sm, f, 11); show_lc(&sm, f, 12); show_lc(&sm, f, 18);
+    show_lc(&sm, f, 47); show_lc(&sm, f, 999); show_lc(&sm, g, 0);
+    io.println("|");
+    io.print_int(sm.line_count(f) as i64); io.print(" ");
+    io.print_int(sm.line_count(g) as i64); io.print(" [");
+    io.print(sm.line_text(f, 3)); io.print("] [");
+    io.print(sm.line_text(f, 5)); io.print("] [");
+    io.print(sm.line_text(f, 9)); io.println("]");
+    io.println(sm.snippet(diag.span(f, 6, 11)));
+
+    // An error with a label, a note with a span, and a help line.
+    render(&sm, diag.error(diag.span(f, 18, 25), "unfinished string")
+        .with_label("string starts here")
+        .with_note_at(diag.span(f, 6, 7), "the variable is declared here")
+        .with_help("close the string with '\"'"));
+
+    // A span running past the end of its line is cut at the line end; a
+    // tab before the span is kept so the carets line up; CR is dropped.
+    render(&sm, diag.warning(diag.span(f, 27, 41), "suspicious condition"));
+
+    // An empty span at the very end points one past the last line.
+    render(&sm, diag.Diag.new(diag.Severity.Error, Some(diag.span(f, 42, 42)), "unexpected end of file"));
+
+    // A diagnostic without a span, and a note.
+    render(&sm, diag.Diag.new(diag.Severity.Error, None, "no input files").with_note("pass a script path"));
+
+    // Line numbers wider than the gutter.
+    var big = text.StrBuf.new();
+    for _ in 0..123456 { big.push('\n'); }
+    big.push_str("oops");
+    let h = sm.add("big.txt", big.as_str());
+    render(&sm, diag.error(diag.span(h, 123456, 123460), "far away"));
+
+    // The sink copies messages, counts by severity, and summarizes.
+    var ds = diag.Diagnostics.new();
+    io.print_bool(ds.has_errors()); io.print(" ");
+    var msg = text.StrBuf.new();
+    msg.push_str("bad token #");
+    msg.push_int(1);
+    ds.push(diag.error(diag.span(f, 0, 5), msg.as_str()).with_label("here"));
+    msg.clear();
+    msg.push_str("XXXXXXXXXXXXXXXXXXXXXXX");
+    ds.warning(diag.span(f, 6, 7), "unused variable");
+    ds.error(diag.span(f, 12, 17), "unknown function");
+    io.print_int(ds.len() as i64); io.print(" ");
+    io.print_int(ds.error_count() as i64); io.print(" ");
+    io.print_int(ds.warning_count() as i64); io.print(" ");
+    io.print_bool(ds.has_errors()); io.print(" ");
+    io.println(ds.at(0).msg);
+    var out = text.StrBuf.new();
+    ds.render(&sm, &out);
+    io.print(out.as_str());
+    out.clear();
+    ds.clear();
+    ds.warning(diag.span(f, 0, 1), "one");
+    ds.summary(&out);
+    ds.clear();
+    ds.summary(&out);
+    io.print(out.as_str());
+    ds.free();
+    sm.free();
+}
+// expect: 1:1 1:12 2:1 2:7 5:1 5:1 1:1 |
+// expect: 5 1 [	if y then] [] []
+// expect: x = 1
+// expect: error: unfinished string
+// expect:   --> script.mini:2:7
+// expect:     2 | print("hello)
+// expect:       |       ^^^^^^^ string starts here
+// expect: note: the variable is declared here
+// expect:   --> script.mini:1:7
+// expect:     1 | local x = 1
+// expect:       |       ^
+// expect: help: close the string with '"'
+// expect: warning: suspicious condition
+// expect:   --> script.mini:3:2
+// expect:     3 | 	if y then
+// expect:       | 	^^^^^^^^^
+// expect: error: unexpected end of file
+// expect:   --> script.mini:5:1
+// expect:     5 |
+// expect:       | ^
+// expect: error: no input files
+// expect: note: pass a script path
+// expect: error: far away
+// expect:   --> big.txt:123457:1
+// expect: 123457 | oops
+// expect:        | ^^^^
+// expect: false 3 2 1 true bad token #1
+// expect: error: bad token #1
+// expect:   --> script.mini:1:1
+// expect:     1 | local x = 1
+// expect:       | ^^^^^ here
+// expect: warning: unused variable
+// expect:   --> script.mini:1:7
+// expect:     1 | local x = 1
+// expect:       |       ^
+// expect: error: unknown function
+// expect:   --> script.mini:2:1
+// expect:     2 | print("hello)
+// expect:       | ^^^^^
+// expect: 1 warning and 2 errors generated.
+// expect: 1 warning generated.

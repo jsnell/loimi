@@ -1,0 +1,18 @@
+// Nested type-argument lists that end in `>>` (lexed as one token).
+
+import std.io;
+import std.mem;
+
+struct Pair<A, B> { a: A, b: B }
+struct Holder<T> { items: mem.Vec<Pair<T, T>> }
+
+fn main() {
+    var h: Holder<i64> = Holder { items: mem.Vec.new() };
+    h.items.push(Pair { a: 1, b: 2 });
+    var vv: mem.Vec<mem.Vec<Pair<i64, i64>>> = mem.Vec.new();
+    vv.push(mem.Vec.new());
+    vv.ptr_at(0).push(h.items.at(0));
+    let n = size_of<Pair<i64, Pair<i64, i64>>>();
+    io.print_int(vv.at(0).at(0).b + n as i64); io.println("");
+}
+// expect: 26

@@ -1,0 +1,35 @@
+// Exhaustiveness checking looks inside nested patterns and tuples.
+
+import std.io;
+
+enum N { Int(i64), Float(f64) }
+enum E { Bad, Worse }
+
+fn describe(r: Result<N, E>) -> str {
+    match r {
+        Ok(Int(_)) => "int",
+        Ok(Float(_)) => "float",
+        Err(Bad) | Err(Worse) => "error",
+    }
+}
+
+fn both(a: bool, b: ?bool) -> i64 {
+    match (a, b) {
+        (true, _) => 1,
+        (false, Some(true)) => 2,
+        (false, Some(false)) => 3,
+        (false, None) => 4,
+    }
+}
+
+fn main() {
+    io.println(describe(Ok(N.Int(1))));
+    io.println(describe(Ok(N.Float(1.0))));
+    io.println(describe(Err(E.Worse)));
+    io.print_int(both(true, None) + both(false, Some(true)) * 10 + both(false, Some(false)) * 100 + both(false, None) * 1000);
+    io.println("");
+}
+// expect: int
+// expect: float
+// expect: error
+// expect: 4321

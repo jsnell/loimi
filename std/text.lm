@@ -51,6 +51,9 @@ pub fn StrBuf.push_f64(b: *StrBuf, x: f64) {
 
 pub fn StrBuf.as_str(b: *StrBuf) -> str { b.bytes.items() }
 
+/// Length in bytes.
+pub fn StrBuf.len(b: *StrBuf) -> u64 { b.bytes.len }
+
 pub fn StrBuf.clear(b: *StrBuf) { b.bytes.clear(); }
 
 pub fn StrBuf.free(b: *StrBuf) { b.bytes.free(); }
