@@ -20,13 +20,23 @@ ordinary MIR:
 
 - the handlers, with operand decoding, `next` expansion, and `cold` outlining;
 - one dispatch table per variant;
-- the verifier, builder, disassembler, and metadata from the format and
-  operand declarations;
+- the verifier, encoders and emitters, disassembler, peephole and deopt
+  passes, and metadata from the format and operand declarations;
 - C-ABI entry points (`Mini.run`, `Mini.call`).
 
 Everything after vm expansion is a normal compiler. The output can be
 bitcode, so a Loimi interpreter can be LTO-linked into a C/C++ host with
 `clang -flto`.
+
+**As implemented** (see [`status.md`](status.md)): there is no MIR or
+comptime stage. The compiler type-checks the AST into a typed tree and
+emits textual LLVM IR, which `clang-19` compiles and links. The vm tools
+(encoders, emitters, `op_size`/`op_name`, `optimize`, `deopt`, the
+verifier, label helpers, the disassembler) are generated as Loimi source
+(`src/vmexpand.rs`) and type-checked like user code; handlers and
+dispatch tables are generated as IR (`src/vmgen.rs`). Entries are
+internal functions: there are no C-ABI entry points, no `Mini.call`, and
+no C header yet, so embedding in a C host is not supported.
 
 ## 2. Values (`nanbox`, `lowtag`, `boxed`)
 
@@ -247,7 +257,7 @@ Notes:
 | `next` | `pc' = pc + size(op) + size(cache)`. Load handler from `tbl[opcode(*pc')]`, `musttail call` |
 | `jump t` | same, with `pc' = t` |
 | `redo` | same, with `pc' = pc` |
-| `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). Becomes `store atomic ... monotonic` under `#[threads(shared_code)]` |
+| `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). Would become `store atomic ... monotonic` under `#[threads(shared_code)]` (not yet implemented) |
 | `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function |
 | `raise e` | `store e` to `ctx.pending`, `musttail call @Mini.on_raise` |
 
@@ -275,7 +285,7 @@ one copy and the state never leaves its registers.
 ## 4. Entry points
 
 ```llvm
-define { i64, i64 } @Mini.run(ptr %ctx, i64 %closure) {      ; C ABI
+define { i64, i64 } @Mini.run(ptr %ctx, i64 %closure) {      ; C ABI (design; entries are internal today)
   ; run `entry run` as ordinary code to set up pc/regs/k, then:
   call preserve_nonecc void %first_handler(ptr %ctx, ptr %pc, ptr %regs, ptr %k, ptr %tbl)
   ; returns here when some handler does `exit` or `fail`
@@ -285,7 +295,7 @@ define { i64, i64 } @Mini.run(ptr %ctx, i64 %closure) {      ; C ABI
 
 `Mini.call` (reentrant) is the same function with a nested-entry marker pushed
 on the frame stack. It counts C-stack depth and fails with a guest
-stack-overflow error past the limit.
+stack-overflow error past the limit. (*Not yet implemented.*)
 
 ## 5. `goto` mode
 
@@ -335,7 +345,7 @@ table, so the interpreter stays instrumented until the table is switched back.
 When a vm declares no variants, `%tbl` is not a state register: handlers
 address the default table as a global constant, which frees a register.
 
-Unused opcode slots point at `@Mini.op.INVALID` (a trap). Verified code can't
+Unused opcode slots point at a trap handler (`@"Mini.invalid"` as implemented). Verified code can't
 reach it, so it exists only for defense in depth.
 
 ## 8. Superinstructions and families
@@ -388,6 +398,12 @@ verifier itself is generated MIR: a loop over the code that decodes each word
 with the same generated decoder the handlers use, then evaluates the `verify`
 clauses.
 
+As implemented, the accesses are unchecked as described, but
+`Verified<V>` does not exist: `run` takes a raw code pointer, and
+calling `Vm.verify` first is up to the embedder. The verifier is
+generated Loimi source (`src/vmexpand.rs`), decoding fields the same
+way the handlers do.
+
 ## 12. Driver settings
 
 | Setting | Why |
@@ -396,5 +412,5 @@ clauses.
 | branch tail-merge disabled for `goto`-mode run functions | keeps `indirectbr` replicated |
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
-| optional handler ordering from `--vm-stats` profiles | hot handlers placed together |
+| optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |
 | target check: `preserve_none` available? otherwise warn and fall back to `goto` | portability |

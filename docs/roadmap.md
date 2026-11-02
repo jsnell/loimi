@@ -28,7 +28,7 @@ Each milestone ends with something measurable.
 | # | Milestone | Done when |
 |---|---|---|
 | M0 | Core language → LLVM: functions, structs, enums, ints/floats, pointers, slices, `match`, modules, C interop | `gcd`, a hash map, and an arena compile and pass tests |
-| M1 | `vm` with `switch` dispatch, fixed encodings, operand kinds, generated builder and disassembler | a toy stack VM (arithmetic + jumps) runs and disassembles |
+| M1 | `vm` with `switch` dispatch, fixed encodings, operand kinds, generated encoders and disassembler | a toy stack VM (arithmetic + jumps) runs and disassembles |
 | M2 | `tailcall` and `goto` dispatch, `cold` outlining with `preserve_most`, decode-ahead | same toy VM in all 3 modes; per-mode benchmark table; inspect asm for zero state spills in hot handlers |
 | M3 | `value` types: `nanbox`, `lowtag`, `boxed`; tuple-pattern tag merging | microbenchmarks show `(Int, Int)` = one test; repr switch is a one-line change |
 | M4 | `std.gc` MarkSweep, `object`, `Gc<T>`, effects + sync points, shadow-stack roots | GC-stress mode passes the test suite with no explicit rooting in user code; a deliberately missing effect is a compile error |

@@ -55,13 +55,13 @@ infrastructure out of macros, compiler extensions, and convention:
 |---|---|---|
 | Fast dispatch | `switch`, computed goto (GCC extension), `musttail` + `preserve_none` (CPython 3.14), hand-written asm (LuaJIT), custom DSL (JSC's offlineasm) | `vm` declarations; dispatch strategy is a build flag (tail-call, goto, switch) over the same source |
 | Keep `pc`/`sp`/frame in registers | Hope the register allocator cooperates in one giant function | Declared `state`, pinned to registers via the calling convention |
-| Slow paths ruining hot paths | `UNLIKELY()`, manual outlining, `noinline` | `cold { }` blocks, outlined with a register-preserving calling convention |
+| Slow paths ruining hot paths | `UNLIKELY()`, manual outlining, `noinline` | `cold { }` blocks, outlined so that the hot path makes no call and keeps its registers |
 | "Save pc before anything that can error or GC" | Lua's `Protect()`/`savepc`, CPython's frame sync. Easy to forget, and forgetting causes heisenbugs | **Effects** (`sync`, `gc`, `reenter`); the compiler inserts state syncs and rejects calls that would miss one |
-| Instruction encoding | Hand-written bit shifts, plus a separate disassembler that drifts out of sync | Declared formats; encoder, decoder, builder, disassembler, and verifier are generated |
+| Instruction encoding | Hand-written bit shifts, plus a separate disassembler that drifts out of sync | Declared formats; encoders, decoders, emitters, disassembler and verifier are generated (`std.bc` builds code over them) |
 | Value representation | Hand-rolled NaN-boxing / pointer tagging macros | `value` types with a declared `repr`; `match` compiles to optimal bit tests, including multi-value checks |
 | Quickening and inline caches | Ad-hoc bytecode rewriting | `family` ops with `become`, typed inline `cache` words |
-| Superinstructions | Rarely done, because it's painful | `super A = X; Y;` plus a profiler that suggests candidates |
-| Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks |
+| Superinstructions | Rarely done, because it's painful | `super A = X; Y;`, plus `--vm-stats`, which counts op pairs and suggests `super` declarations |
+| Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks (nothing yet forces `run` to take verified code) |
 | Tracing and debugger hooks | A check in every handler, or a second copy of the interpreter | Instrumentation `variant`s: alternate dispatch tables, zero cost when off |
 
 ## Documents
