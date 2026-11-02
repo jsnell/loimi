@@ -347,8 +347,7 @@ pub vm Mini {
                 let p = tab.hptr + 2 * i;
                 if p[0] == key { dst = p[1]; next }
             }
-            dst = field_get_slow(tab, key, &cache.slot);
-            next
+            cold { dst = field_get_slow(tab, key, &cache.slot); next }
         }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
@@ -359,9 +358,11 @@ pub vm Mini {
                 let p = tab.hptr + 2 * i;
                 if p[0] == key { p[1] = v; next }
             }
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            field_set_slow(&ctx.heap, tab, key, v, &cache.slot);
-            next
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                field_set_slow(&ctx.heap, tab, key, v, &cache.slot);
+                next
+            }
         }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
@@ -424,8 +425,7 @@ pub vm Mini {
                 let p = tab.hptr + 2 * i;
                 if p[0] == key { regs[a] = p[1]; next }
             }
-            regs[a] = field_get_slow(tab, key, &cache.slot);
-            next
+            cold { regs[a] = field_get_slow(tab, key, &cache.slot); next }
         }
         cold { raise error(ctx, "attempt to index a ", o) }
     }
