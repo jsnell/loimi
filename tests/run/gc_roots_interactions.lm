@@ -1,0 +1,81 @@
+// Shadow-stack roots with other features: a generic function over a trait
+// with a `uses gc` default method, `defer` blocks that collect (the
+// block's locals must stay rooted while its defers run: `n` was freed),
+// `?` returns, `block fn` calls, loops with `continue` and `break` values.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+trait Act {
+    fn make(h: *gc.Heap, v: i64) -> Self;
+    fn churn(h: *gc.Heap) uses gc { for i in 0..300 { young(h, -1); } gc.collect(h); for i in 0..300 { young(h, -2); } }
+    fn get(x: Self) -> i64;
+}
+struct W { n: Gc<Node> }
+impl Act for W;
+fn W.make(h: *gc.Heap, v: i64) -> W { W { n: young(h, v) } }
+fn W.get(x: W) -> i64 { x.n.value }
+
+fn young(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+
+fn churn(h: *gc.Heap) uses gc { for i in 0..300 { young(h, -1); } gc.collect(h); for i in 0..300 { young(h, -2); } }
+
+fn gen<T: Act>(h: *gc.Heap, v: i64) -> i64 uses gc {
+    let x = T.make(h, v);
+    T.churn(h);
+    T.get(x)
+}
+
+fn deferred(h: *gc.Heap, out: *i64) uses gc {
+    let n = young(h, 7);
+    defer { churn(h); *out = n.value; }
+    let m = young(h, 8);
+    defer { churn(h); *out += m.value; }
+}
+
+fn tryer(h: *gc.Heap, fail: bool) -> ?i64 uses gc {
+    let a = young(h, 3);
+    let o: ?i64 = if fail { None } else { Some(1) };
+    defer churn(h);
+    let v = o?;
+    Some(v + a.value)
+}
+
+fn blk(h: *gc.Heap, f: block fn() -> i64 uses gc) -> i64 uses gc {
+    let a = young(h, 100);
+    let r = f();
+    r + a.value
+}
+
+fn loopy(h: *gc.Heap) -> i64 uses gc {
+    var t = 0;
+    for i in 0..3 {
+        let n = young(h, i);
+        if i == 1 { continue; }
+        churn(h);
+        t += n.value;
+    }
+    let r = loop { let q = young(h, 9); churn(h); break q.value; };
+    t + r
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    io.print_int(gen<W>(h, 5)); io.println("");
+    var out = 0;
+    deferred(h, &out);
+    io.print_int(out); io.println("");
+    io.print_int(tryer(h, false) ?? -1); io.println("");
+    io.print_int(tryer(h, true) ?? -1); io.println("");
+    io.print_int(blk(h, || { let z = young(h, 20); churn(h); z.value })); io.println("");
+    io.print_int(loopy(h)); io.println("");
+}
+
+// expect: 5
+// expect: 7
+// expect: 4
+// expect: -1
+// expect: 120
+// expect: 11

@@ -781,13 +781,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Some(t) => self.val(t),
                     None => self.poison(&e.ty),
                 };
-                self.live.pop();
+                // The block's locals stay live (rooted) while its defers run.
                 let ds = self.defers.pop().unwrap();
                 if !self.terminated {
                     for d in ds.iter().rev() {
                         self.val(d);
                     }
                 }
+                self.live.pop();
                 v
             }
             TK::If(conds, then, els) => {
