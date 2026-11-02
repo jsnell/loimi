@@ -6,7 +6,7 @@ import std.io;
 import std.mem;
 import std.text;
 import value;
-import value.{V, Sym, Closure, Symtab};
+import value.{V, Sym, Closure, Symtab, Proto};
 
 /// One activation record. `resume` is where this frame continues after the
 /// call it is making returns. `k` caches cl.proto.consts.
@@ -30,6 +30,11 @@ pub struct Ctx {
     /// Buffered standard output.
     out: text.StrBuf,
     tmp: text.StrBuf,
+    /// The prototype of escape continuations (vm.cont_proto).
+    cont_proto: ?Gc<Proto>,
+    /// Standard input, read whole on the first `read`, and the read position.
+    input: ?str,
+    input_pos: u64,
 }
 
 pub const STACK_SLOTS: u64 = 1 << 23;
@@ -49,6 +54,9 @@ pub fn Ctx.new() -> Ctx {
         error: value.unspec(),
         out: text.StrBuf.new(),
         tmp: text.StrBuf.new(),
+        cont_proto: None,
+        input: None,
+        input_pos: 0,
     };
     c.stack_end = c.stack + STACK_SLOTS;
     c.frames_end = c.frames + FRAME_SLOTS;
@@ -73,6 +81,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     for i in 0..c.syms.all.len { gc_mark(h, c.syms.all.at(i)); }
     for i in 0..c.gvals.len { gc_mark(h, c.gvals.at(i)); }
     gc_mark(h, c.error);
+    if let Some(p) = c.cont_proto { gc_mark(h, p); }
     // Every frame's whole window, not just the stack up to the top frame:
     // a callee's window can end below its caller's, and the caller's
     // registers above it must stay valid (they are read again, by a later

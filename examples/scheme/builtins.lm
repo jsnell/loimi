@@ -12,6 +12,7 @@ import std.io;
 import std.os;
 import std.mem;
 import std.text;
+import std.map;
 import value;
 import value.{V, Pair, Str, Sym, Vect};
 import rt.{Ctx};
@@ -23,9 +24,67 @@ extern "C" fn ceil(a: f64) -> f64;
 extern "C" fn trunc(a: f64) -> f64;
 extern "C" fn rint(a: f64) -> f64;
 extern "C" fn fmod(a: f64, b: f64) -> f64;
+extern "C" fn clock() -> i64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn tan(x: f64) -> f64;
+extern "C" fn asin(x: f64) -> f64;
+extern "C" fn acos(x: f64) -> f64;
+extern "C" fn atan(x: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn time(t: *u8) -> i64;
+extern "C" fn fdopen(fd: i32, mode: *u8) -> *u8;
+extern "C" fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+extern "C" fn malloc(n: u64) -> *u8;
+extern "C" fn realloc(p: *u8, n: u64) -> *u8;
 
-pub const NPRIMS: i32 = 126;
+/// All of standard input (read once, on the first `read`).
+fn stdin_text(c: *Ctx) -> str {
+    if let Some(s) = c.input { return s; }
+    let f = fdopen(0, "rb\0".ptr);
+    var cap: u64 = 65536;
+    var len: u64 = 0;
+    var buf = malloc(cap);
+    if (f as u64) != 0 {
+        loop {
+            if len == cap { cap *= 2; buf = realloc(buf, cap); }
+            let got = fread(buf + len, 1, cap - len, f);
+            if got == 0 { break; }
+            len += got;
+        }
+    }
+    let s = buf.slice(len);
+    c.input = Some(s);
+    s
+}
+
+fn record_err(c: *Ctx, rtd: V, v: V) -> V {
+    c.tmp.clear();
+    c.tmp.push_str("record accessor: expected a record of type ");
+    if let P(t) = rtd { value.print(&c.tmp, t.car, false); }
+    c.tmp.push_str(", got ");
+    value.print(&c.tmp, v, true);
+    V.S(value.new_str(&c.heap, c.tmp.as_str()))
+}
+
+/// (read): the next datum from standard input, or the eof object.
+fn read_stdin(c: *Ctx) -> V {
+    let all = stdin_text(c);
+    var lines: map.HashMap<u64, u32> = map.HashMap.new();
+    var r = read.Reader.new(all[c.input_pos..all.len], &c.heap, &c.syms, &lines, false);
+    let v = r.read();
+    c.input_pos += r.cur.pos;
+    match v {
+        Some(x) => x,
+        None => V.Imm(value.IMM_EOF),
+    }
+}
+
+pub const NPRIMS: i32 = 147;
 pub const P_APPLY: i32 = 55;
+pub const P_CALLCC: i32 = 132;
 
 /// (name, minimum arguments, maximum arguments or -1).
 pub fn prim_info(id: i32) -> (str, i32, i32) {
@@ -155,7 +214,28 @@ pub fn prim_info(id: i32) -> (str, i32, i32) {
         122 => ("boolean=?", 2, 2),
         123 => ("write-string", 1, 2),
         124 => ("write-char", 1, 2),
-        _ => ("square", 1, 1),
+        125 => ("square", 1, 1),
+        126 => ("read", 0, 1),
+        127 => ("current-output-port", 0, 0),
+        128 => ("flush-output-port", 0, 1),
+        129 => ("current-second", 0, 0),
+        130 => ("current-jiffy", 0, 0),
+        131 => ("jiffies-per-second", 0, 0),
+        132 => ("call-with-current-continuation", 1, 1),
+        133 => ("eof-object?", 1, 1),
+        134 => ("exp", 1, 1),
+        135 => ("log", 1, 2),
+        136 => ("sin", 1, 1),
+        137 => ("cos", 1, 1),
+        138 => ("tan", 1, 1),
+        139 => ("asin", 1, 1),
+        140 => ("acos", 1, 1),
+        141 => ("atan", 1, 2),
+        142 => ("exact-integer?", 1, 1),
+        143 => ("%record", 1, -1),
+        144 => ("%record?", 2, 2),
+        145 => ("%record-ref", 3, 3),
+        _ => ("%record-set!", 4, 4),
     }
 }
 
@@ -596,7 +676,7 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         69 => Ok(value.boolean(match a { Sym(_) => true, _ => false })),
         70 => Ok(value.boolean(match a { S(_) => true, _ => false })),
         71 => Ok(value.boolean(value.is_procedure(a))),
-        72 => Ok(value.boolean(match a { Vec(_) => true, _ => false })),
+        72 => Ok(value.boolean(match a { Vec(x) => x.rtd == value.nil(), _ => false })),
         73 => Ok(value.boolean(a == value.t() or a == value.f())),
         74 => Ok(value.boolean(value.char_of(a).is_some())),
         75 => {
@@ -771,6 +851,48 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         117 => Ok(value.boolean(a == b)),
         122 => Ok(value.boolean(a == b)),
         125 => arith(c, 2, a, a),
+        126 => Ok(read_stdin(c)),
+        127 => Ok(value.unspec()),
+        128 => { c.flush(); Ok(value.unspec()) }
+        129 => Ok(V.Num(time(0 as *u8) as f64)),
+        130 => Ok(V.Int((clock() / 1000) as i32)),
+        131 => Ok(V.Int(1000)),
+        133 => Ok(value.boolean(a == V.Imm(value.IMM_EOF))),
+        134 => { if a == V.Int(0) { return Ok(V.Int(1)); } Ok(V.Num(exp(num_arg(c, name, a)?))) }
+        135 => {
+            if a == V.Int(1) and n == 1 { return Ok(V.Int(0)); }
+            let x = log(num_arg(c, name, a)?);
+            if n == 2 { return Ok(V.Num(x / log(num_arg(c, name, b)?))); }
+            Ok(V.Num(x))
+        }
+        136 | 137 | 138 | 139 | 140 => {
+            let x = num_arg(c, name, a)?;
+            if a == V.Int(0) and id != 137 and id != 140 { return Ok(a); }
+            Ok(V.Num(match id { 136 => sin(x), 137 => cos(x), 138 => tan(x), 139 => asin(x), _ => acos(x) }))
+        }
+        141 => {
+            let y = num_arg(c, name, a)?;
+            if n == 2 { return Ok(V.Num(atan2(y, num_arg(c, name, b)?))); }
+            if a == V.Int(0) { return Ok(a); }
+            Ok(V.Num(atan(y)))
+        }
+        142 => Ok(value.boolean(match a { Int(_) => true, _ => false })),
+        // Records (define-record-type expands into these; see compile.lm).
+        143 => {
+            let r = value.new_vect(h, n - 1, value.f());
+            r.rtd = a;
+            for i in 1..n { r.data.ptr[i - 1] = args[i]; }
+            Ok(V.Vec(r))
+        }
+        144 => Ok(value.boolean(match b { Vec(x) => x.rtd == a, _ => false })),
+        145 | 146 => {
+            let Vec(r) = b else { return Err(record_err(c, a, b)); };
+            if r.rtd != a { return Err(record_err(c, a, b)); }
+            let Int(i) = args[2] else { return Err(rt.err_msg(c, "record: internal error")); };
+            if id == 145 { return Ok(r.data.ptr[i as u64]); }
+            r.data.ptr[i as u64] = args[3];
+            Ok(value.unspec())
+        }
         _ => Err(rt.err_msg(c, "apply: internal error")),
     }
 }
