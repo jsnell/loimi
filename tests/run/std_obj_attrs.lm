@@ -1,0 +1,114 @@
+// std.obj: per-property attribute bits (here JS-like: 1 = not enumerable,
+// 2 = read-only), in fast and dictionary mode; attributes are part of
+// the shape; write sites do not cache read-only properties; and the
+// JavaScript key order (integer indices first, ascending).
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<obj.Obj<Value>>) }
+
+const NONENUM: u32 = 1;
+const READONLY: u32 = 2;
+
+/// Keys 1000 and up stand for the integer indices key - 1000.
+fn index_of(data: *u8, k: u64) -> i64 { if k >= 1000 { (k - 1000) as i64 } else { -1 } }
+
+fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); io.println(""); }
+
+fn show_keys(label: str, ks: *mem.Vec<u64>) {
+    io.print(label);
+    for i in 0..ks.len { io.print(" "); io.print_int(ks.at(i) as i64); }
+    io.println("");
+}
+
+fn int(v: ?Value) -> i64 { match v { Some(Int(i)) => i as i64, _ => -1 } }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    var m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value> = obj.Model.new(obj.new_slots<Value>, Value.Nil);
+    m.attach(&heap);
+    m.ic.readonly = READONLY;
+    let none: ?Gc<obj.Obj<Value>> = None;
+
+    let a = obj.new_obj(&heap, m.root(4), none, 4);
+    m.set(a, 1, Value.Int(10));
+    m.define(a, 2, Value.Int(20), NONENUM);
+    m.set(a, 3, Value.Int(30));
+    let b = obj.new_obj(&heap, m.root(4), none, 4);
+    m.set(b, 1, Value.Int(11));
+    m.set(b, 2, Value.Int(21));
+    m.set(b, 3, Value.Int(31));
+    yes("attributes are in the shape", a.shape.id != b.shape.id);
+    yes("attrs", m.attrs(a, 2) == Some(NONENUM) and m.attrs(a, 1) == Some(0) and m.attrs(a, 9).is_none());
+    var ks: mem.Vec<u64> = mem.Vec.new();
+    m.keys_where(a, &ks, NONENUM);
+    show_keys("enumerable", &ks);
+    ks.clear();
+    m.keys(a, &ks);
+    show_keys("all", &ks);
+
+    // Changing attributes keeps the slots, and matches a fresh object
+    // built with those attributes.
+    yes("set_attrs", m.set_attrs(b, 2, NONENUM));
+    yes("same shape as a", a.shape.id == b.shape.id);
+    yes("values kept", int(m.get(b, 1)) == 11 and int(m.get(b, 2)) == 21 and int(m.get(b, 3)) == 31);
+    m.define(b, 2, Value.Int(22), 0);
+    yes("define changes attrs", m.attrs(b, 2) == Some(0) and int(m.get(b, 2)) == 22);
+
+    // Dictionary mode keeps attributes, and so does going back.
+    m.define(a, 4, Value.Int(40), READONLY | NONENUM);
+    m.delete(a, 1);
+    yes("dict", m.is_dict(a));
+    yes("dict attrs", m.attrs(a, 2) == Some(NONENUM) and m.attrs(a, 4) == Some(READONLY | NONENUM));
+    m.set_attrs(a, 3, READONLY);
+    ks.clear();
+    m.keys_where(a, &ks, NONENUM);
+    show_keys("dict enumerable", &ks);
+    m.optimize(a);
+    yes("fast again", !m.is_dict(a) and m.attrs(a, 3) == Some(READONLY) and m.attrs(a, 2) == Some(NONENUM));
+    yes("values", int(m.get(a, 2)) == 20 and int(m.get(a, 3)) == 30 and int(m.get(a, 4)) == 40);
+
+    // A write site caches an ordinary property but not a read-only one.
+    var s = obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 };
+    yes("cached", m.write_miss(&s, b, 3, Value.Int(5)) == obj.IcState.OwnIn);
+    var s2 = obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 };
+    yes("read-only not cached", m.write_miss(&s2, a, 3, Value.Int(5)) == obj.IcState.Generic);
+
+    // Key order: integer indices ascending, then the rest in insertion order.
+    let c = obj.new_obj(&heap, m.root(2), none, 2);
+    let order = [7, 1010, 3, 1002, 1100, 5, 1000, 1002 + 1];
+    for i in 0..order.len { m.set(c, order[i] as u64, Value.Int(i as i32)); }
+    ks.clear();
+    m.keys(c, &ks);
+    obj.index_keys_first(&ks, 0 as *u8, index_of);
+    show_keys("js order", &ks);
+    // Many index keys (the merge sort).
+    ks.clear();
+    let n: u64 = 100;
+    for i in 0..n { ks.push(1000 + (i * 37) % 100); ks.push(i % 3); }
+    obj.index_keys_first(&ks, 0 as *u8, index_of);
+    var sorted = true;
+    for i in 0..n { if ks.at(i) != 1000 + i { sorted = false; } }
+    for i in 0..n { if ks.at(n + i) != i % 3 { sorted = false; } }
+    yes("sorted", sorted);
+    ks.free();
+}
+// expect: attributes are in the shape true
+// expect: attrs true
+// expect: enumerable 1 3
+// expect: all 1 2 3
+// expect: set_attrs true
+// expect: same shape as a true
+// expect: values kept true
+// expect: define changes attrs true
+// expect: dict true
+// expect: dict attrs true
+// expect: dict enumerable 3
+// expect: fast again true
+// expect: values true
+// expect: cached true
+// expect: read-only not cached true
+// expect: js order 1000 1002 1003 1010 1100 7 3 5
+// expect: sorted true

@@ -75,7 +75,7 @@ fn Ctx.native(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) -> V 
 /// Define a native method `name` on object `o`.
 fn Ctx.def(c: *Ctx, o: Gc<Obj>, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) {
     let fv = c.native(name, f);
-    c.m.set(o, c.key(name), fv);
+    c.define_hidden(o, c.key(name), fv);
 }
 
 fn Ctx.def_global(c: *Ctx, name: str, v: V) {
@@ -91,8 +91,8 @@ fn Ctx.ctor(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>, proto: 
     let fv = c.native(name, f);
     let F(fo) = fv else { unreachable };
     let bag = c.fn_props(fo);
-    c.m.set(bag, c.k_prototype, V.O(proto));
-    c.m.set(proto, c.k_constructor, fv);
+    c.define_hidden(bag, c.k_prototype, V.O(proto));
+    c.define_hidden(proto, c.k_constructor, fv);
     c.def_global(name, fv);
     bag
 }
@@ -172,17 +172,17 @@ pub fn install(c: *Ctx) {
 
     let ep = c.err_proto();
     c.ctor("Error", error_ctor, ep);
-    c.m.set(ep, c.k_name, str_v(c, "Error"));
-    c.m.set(ep, c.k_message, V.S(c.empty_str()));
+    c.define_hidden(ep, c.k_name, str_v(c, "Error"));
+    c.define_hidden(ep, c.k_message, V.S(c.empty_str()));
     c.def(ep, "toString", to_string);
     let tp = c.typeerr_proto();
     c.ctor("TypeError", type_error_ctor, tp);
-    c.m.set(tp, c.k_name, str_v(c, "TypeError"));
+    c.define_hidden(tp, c.k_name, str_v(c, "TypeError"));
     inline_errors(c);
 
     let math = c.new_object_with(c.objproto, 32);
-    c.m.set(math, c.key("PI"), V.Num(3.141592653589793));
-    c.m.set(math, c.key("E"), V.Num(2.718281828459045));
+    c.define_hidden(math, c.key("PI"), V.Num(3.141592653589793));
+    c.define_hidden(math, c.key("E"), V.Num(2.718281828459045));
     c.def(math, "floor", math_floor);
     c.def(math, "ceil", math_ceil);
     c.def(math, "round", math_round);
@@ -208,13 +208,13 @@ pub fn install(c: *Ctx) {
 /// RangeError and ReferenceError: error constructors of their own.
 fn inline_errors(c: *Ctx) {
     let rp = c.new_object_with(c.errproto, 4);
-    rp.flags = value.OF_PROTO | value.OF_NONENUM;
+    c.mark_proto(rp);
     c.ctor("RangeError", range_error_ctor, rp);
-    c.m.set(rp, c.k_name, str_v(c, "RangeError"));
+    c.define_hidden(rp, c.k_name, str_v(c, "RangeError"));
     let fp = c.new_object_with(c.errproto, 4);
-    fp.flags = value.OF_PROTO | value.OF_NONENUM;
+    c.mark_proto(fp);
     c.ctor("ReferenceError", reference_error_ctor, fp);
-    c.m.set(fp, c.k_name, str_v(c, "ReferenceError"));
+    c.define_hidden(fp, c.k_name, str_v(c, "ReferenceError"));
 }
 
 // ── globals ─────────────────────────────────────────────────────────
@@ -363,7 +363,7 @@ fn object_keys(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
 fn object_create(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     match arg(args, n, 0) {
         O(p) => {
-            rt.mark_proto(p);
+            c.mark_proto(p);
             Ok(V.O(c.new_object_with(Some(p), 4)))
         }
         Null => Ok(V.O(c.new_object_with(None, 4))),

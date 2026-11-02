@@ -80,23 +80,18 @@ pub fn flat(v: V) -> V {
 /// constant pools.
 pub object Vals { data: [V] }
 
-/// An object with a hidden class (std.obj). `flags` holds the OF_* bits.
+/// An object with a hidden class (std.obj).
 pub object Obj {
     shape: Gc<obj.Shape>,
     dict: ?Gc<obj.Dict>,
     overflow: ?Gc<Vals>,
     proto: ?Gc<Obj>,
-    flags: u32,
     inline: [V],
 }
 
-/// The object is (or was) the prototype of another object: it may have a
-/// validity cell, so adding a property must go through std.obj.
-pub const OF_PROTO: u32 = 1;
-/// Every property is non-enumerable (built-in and class prototypes).
-pub const OF_NONENUM: u32 = 2;
-/// Its `constructor` property is non-enumerable (F.prototype objects).
-pub const OF_CTOR: u32 = 4;
+/// Property attribute (std.obj attribute bits): not enumerable (methods
+/// of built-in objects and classes, `constructor`, `prototype`).
+pub const NONENUM: u32 = 1;
 
 /// An array: `len` elements in `ptr[0..len]`, which points into `store`
 /// (capacity `store.data.len`).

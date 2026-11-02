@@ -2,7 +2,11 @@
 // changes, dictionary switches and object replacement, with a collection
 // after every operation, checked against a host-side model. Slot values
 // include references to boxes reachable only through the slots, and
-// discarded objects leave dead shapes behind for the sweeper.
+// discarded objects leave dead shapes behind for the sweeper. Cached
+// prototype hits (plain words) and read and write sites driven by
+// std.obj's cache state machine are checked against fresh lookups after
+// every step: an id names a layout forever, and a validity cell dies
+// with its object, so no stale entry may ever hit.
 import std.io;
 import std.gc;
 import std.mem;
@@ -25,7 +29,13 @@ struct World {
     /// Expected own values: objs × KEYS; ABSENT, n (Int), or n + 1000 (boxed).
     want: mem.Vec<i64>,
     proto: mem.Vec<i64>,
-    entries: mem.Vec<obj.ProtoEntry<Gc<Obj>>>,
+    entries: mem.Vec<obj.Hit>,
+    /// Per key: a read site and a write site, with their states.
+    rsites: mem.Vec<obj.Site>,
+    rstates: mem.Vec<obj.IcState>,
+    wsites: mem.Vec<obj.Site>,
+    wstates: mem.Vec<obj.IcState>,
+    site_hits: u64,
     ekeys: mem.Vec<u64>,
     hits: u64,
     shadows: u64,
@@ -36,7 +46,6 @@ struct World {
 fn scan(h: *gc.Heap, data: *u8) {
     let w = data as *World;
     for i in 0..w.objs.len { gc_mark(h, w.objs.at(i)); }
-    for i in 0..w.entries.len { w.entries.ptr_at(i).mark(h); }
 }
 
 fn World.rand(w: *World, n: u64) -> u64 {
@@ -102,7 +111,7 @@ fn World.check(w: *World, i: u64) {
 fn World.write_chain(w: *World, i: u64) {
     let o = w.objs.at(i);
     let e = w.entries.ptr_at(i);
-    if w.m.proto_hit(o, e).is_none() { return; }
+    if w.m.hit(o, e).is_none() or e.cell == 0 { return; }
     var cur = o.proto;
     var hops = w.rand(3);
     loop {
@@ -123,11 +132,58 @@ fn World.write_chain(w: *World, i: u64) {
     }
 }
 
+/// A read site for key `k`, as a vm runs it: the member for the site's
+/// state checks its hit, and a miss runs `read_miss`.
+fn World.site_read(w: *World, o: Gc<Obj>, i: u64, k: u64) {
+    let s = w.rsites.ptr_at(k);
+    let st = w.rstates.at(k);
+    var v: ?Value = None;
+    if (st == obj.IcState.OwnIn or st == obj.IcState.OwnOut) and o.shape.id == s.sid {
+        v = Some(w.m.load_ref(o, s.slot));
+    } else if st == obj.IcState.Proto and o.shape.id == s.sid {
+        v = w.m.proto_load(o, s.slot, s.cell, s.depth);
+    } else if st == obj.IcState.Poly {
+        v = w.m.poly_get(o, s.ent);
+    } else if st == obj.IcState.Mega {
+        v = w.m.mega_get(o, k);
+    }
+    if v.is_some() {
+        w.site_hits += 1;
+    } else {
+        let (x, ns) = w.m.read_miss(s, st, o, k);
+        w.rstates.set(k, ns);
+        v = x;
+    }
+    let got = match v { Some(x) => value_of(x), None => ABSENT };
+    let fresh = match w.m.get_chain(o, k) { Some(x) => value_of(x), None => ABSENT };
+    if got != fresh {
+        if w.errors < 5 { io.println("stale read site"); }
+        w.errors += 1;
+    }
+}
+
+/// A write site for key `k`: own stores and cached adds.
+fn World.site_write(w: *World, o: Gc<Obj>, k: u64, v: Value) {
+    let s = w.wsites.ptr_at(k);
+    let st = w.wstates.at(k);
+    if (st == obj.IcState.OwnIn or st == obj.IcState.OwnOut) and o.shape.id == s.sid {
+        w.m.store_ref(o, s.slot, v);
+        w.site_hits += 1;
+        return;
+    }
+    if st == obj.IcState.Add and o.shape.id == s.sid {
+        w.m.add_hit(o, s.ent, s.slot, v);
+        w.site_hits += 1;
+        return;
+    }
+    w.wstates.set(k, w.m.write_miss(s, o, k, v));
+}
+
 fn World.step(w: *World) {
     let i = w.rand(N);
     let o = w.objs.at(i);
     let k = w.rand(KEYS);
-    match w.rand(16) {
+    match w.rand(18) {
         0 | 1 | 2 | 3 | 4 | 5 => {
             let n = w.rand(1000) as i32;
             w.m.set(o, k, Value.Int(n));
@@ -158,14 +214,25 @@ fn World.step(w: *World) {
             }
         }
         11 => { if w.rand(2) == 0 { w.m.to_dict(o); } else { w.m.optimize(o); } }
+        13 => {
+            // Twice: the second read usually hits.
+            w.site_read(o, i, k);
+            w.site_read(o, i, k);
+        }
+        14 => {
+            // Twice: an add (or a store), then a store.
+            let n = w.rand(1000) as i32;
+            w.site_write(o, k, Value.Int(n));
+            w.site_write(o, k, Value.Int(n + 1));
+            w.want.set(i * KEYS + k, n as i64 + 1);
+        }
         12 => w.fresh(i),
         _ => {
             // A cached prototype read, then a hit check on the same receiver.
             let e = w.entries.ptr_at(i);
-            *e = obj.ProtoEntry.empty();
-            let v = w.m.get_proto_fill(o, k, e);
+            let v = w.m.read(o, k, e);
             w.ekeys.set(i, k);
-            if let Some(hv) = w.m.proto_hit(o, e) and let Some(x) = v {
+            if let Some(hv) = w.m.hit(o, e) and let Some(x) = v {
                 if value_of(hv) != value_of(x) { w.errors += 1; }
             }
             if w.rand(2) == 0 { w.write_chain(i); }
@@ -175,7 +242,7 @@ fn World.step(w: *World) {
     for j in 0..N {
         let e = w.entries.ptr_at(j);
         let oj = w.objs.at(j);
-        if let Some(hv) = w.m.proto_hit(oj, e) {
+        if let Some(hv) = w.m.hit(oj, e) {
             w.hits += 1;
             let fresh = match w.m.get_chain(oj, w.ekeys.at(j)) { Some(v) => value_of(v), None => ABSENT };
             if fresh != value_of(hv) {
@@ -192,17 +259,29 @@ fn main() uses gc {
         heap: gc.Heap.new(),
         m: obj.Model.new(new_slots, Value.Nil),
         objs: mem.Vec.new(), want: mem.Vec.new(), proto: mem.Vec.new(), entries: mem.Vec.new(), ekeys: mem.Vec.new(), hits: 0, shadows: 0,
+        rsites: mem.Vec.new(), rstates: mem.Vec.new(), wsites: mem.Vec.new(), wstates: mem.Vec.new(), site_hits: 0,
         seed: 12345, errors: 0,
     };
     w.m.attach(&w.heap);
     w.m.dict_threshold = 12;
+    // Small budgets, so sites go through every state.
+    w.m.ic.refills = 2;
+    w.m.ic.resets = 2;
+    // Keep few dead ids, so the table forgets now and then.
+    w.m.shapes.retain = 64;
+    for k in 0..KEYS {
+        w.rsites.push(obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 });
+        w.rstates.push(obj.IcState.Generic);
+        w.wsites.push(obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 });
+        w.wstates.push(obj.IcState.Generic);
+    }
     w.heap.add_scanner(&w as *u8, scan);
     w.heap.set_stress(true);
     let tmp = new(&w.heap, Obj { shape: w.m.root(0), dict: None, overflow: None, proto: None }, 0);
     for i in 0..N {
         w.objs.push(tmp);
         w.proto.push(-1);
-        w.entries.push(obj.ProtoEntry.empty());
+        w.entries.push(obj.Hit.empty());
         w.ekeys.push(0);
         for k in 0..KEYS { w.want.push(ABSENT); }
     }
@@ -215,9 +294,15 @@ fn main() uses gc {
     io.print("errors "); io.print_int(w.errors as i64); io.println("");
     io.print_bool(w.heap.collections >= 10000); io.println("");
     io.print_bool(w.m.shapes.swept > 0); io.println("");
-    io.print_bool(w.hits > 200 and w.shadows > 50); io.println("");
+    io.print_bool(w.hits > 200 and w.shadows > 20); io.println("");
+    io.print_bool(w.site_hits > 200); io.println("");
+    var mega = false;
+    for k in 0..KEYS { if w.rstates.at(k) == obj.IcState.Mega { mega = true; } }
+    io.print_bool(mega and w.m.shapes.reborn > 0 and w.m.shapes.forgotten > 0); io.println("");
 }
 // expect: errors 0
+// expect: true
+// expect: true
 // expect: true
 // expect: true
 // expect: true
