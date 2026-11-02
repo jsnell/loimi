@@ -908,16 +908,26 @@ pub vm JS {
                 if likely(p.fixed <= 255) {
                     let callee = regs + base + 1;
                     let n = p.nregs as u64;
-                    if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
                         cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
                     }
                     // Missing arguments are undefined; extra ones are dropped
-                    // (their registers are the callee's locals).
-                    var i = nargs as u64 + 1;
-                    if nargs as u32 > p.fixed { i = p.fixed as u64 + 1; }
-                    while i < n {
-                        callee[i] = Undef;
-                        i += 1;
+                    // (their registers are the callee's locals, cleared with
+                    // the rest). Two registers per store pair: the register
+                    // after the window may be cleared too (it is free).
+                    let fx = p.fixed as u64;
+                    if (nargs as u64) < fx {
+                        cold {
+                            var i = nargs as u64 + 1;
+                            while i <= fx { callee[i] = Undef; i += 1; }
+                        }
+                    }
+                    var q = callee + fx + 1;
+                    let e = callee + n;
+                    while q < e {
+                        q[0] = Undef;
+                        q[1] = Undef;
+                        q = q + 2;
                     }
                     fp.resume = pc + 1;
                     fp = fp + 1;
@@ -929,6 +939,8 @@ pub vm JS {
                     regs = callee;
                     jump p.code.ptr
                 }
+                // Natives: out of line, so that the bytecode path needs
+                // no stack frame.
                 if cl.native != 0 {
                     if nargs == 1 {
                         let f = regs[base];
@@ -938,9 +950,7 @@ pub vm JS {
                         if f == ctx.f_floor { become CALL_FLOOR; }
                         if f == ctx.f_sqrt { become CALL_SQRT; }
                     }
-                    if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-                    regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs as u64)?;
-                    next
+                    cold { call_native(base as u64, nargs as u64) }
                 }
             }
             cold {
@@ -1070,16 +1080,20 @@ pub vm JS {
             call_slow(base as u64, nargs as u64, rt.FR_NEW)
         }
     }
+    // The bottom frame is flagged FR_BOTTOM, so one test of the flags
+    // finds both `new` frames and the end of the run.
     op RET(src: reg) : ABC {
         var v = src;
         if fp.flags != 0 {
             cold {
-                match v {
-                    O(_) | A(_) | F(_) => {}
-                    _ => { v = regs[0]; }
+                if fp.flags & rt.FR_NEW != 0 {
+                    match v {
+                        O(_) | A(_) | F(_) => {}
+                        _ => { v = regs[0]; }
+                    }
+                    if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
+                    if let O(o) = regs[0] { observe(fp.cl, o); }
                 }
-                if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
-                if let O(o) = regs[0] { observe(fp.cl, o); }
                 if fp == ctx.frames { exit v }
                 *(regs - 1) = v;
                 fp = fp - 1;
@@ -1088,7 +1102,6 @@ pub vm JS {
                 jump fp.resume
             }
         }
-        if fp == ctx.frames { exit v }
         *(regs - 1) = v;
         fp = fp - 1;
         regs = fp.base;
@@ -1096,10 +1109,10 @@ pub vm JS {
         jump fp.resume
     }
     op RETU() : ABC {
-        if fp.flags != 0 or fp == ctx.frames {
+        if fp.flags != 0 {
             cold {
                 var v = V.Undef;
-                if fp.flags != 0 {
+                if fp.flags & rt.FR_NEW != 0 {
                     v = regs[0];
                     if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
                     if let O(o) = v { observe(fp.cl, o); }
@@ -1180,7 +1193,7 @@ pub vm JS {
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;
-        fp.flags = 0;
+        fp.flags = rt.FR_BOTTOM;
         k = p.consts.data.ptr;
         fp.k = k;
         c.fp = fp;

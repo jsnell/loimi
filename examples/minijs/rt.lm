@@ -22,6 +22,8 @@ pub struct Frame { cl: Gc<Fn>, base: *V, resume: *u32, k: *V, flags: u32 }
 
 /// The frame was entered by `new`: a non-object result is replaced by `this`.
 pub const FR_NEW: u32 = 1;
+/// The first frame of a run: returning from it ends the run.
+pub const FR_BOTTOM: u32 = 2;
 
 /// A builtin function: `f(ctx, this, args, nargs)`. Natives may allocate
 /// but never collect, and never call back into the VM.
