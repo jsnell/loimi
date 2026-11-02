@@ -104,12 +104,12 @@ fn mutate(r: *Rng, p: *Proto) {
         // One operand byte: usually a small number, sometimes anything.
         let shift = 8 * (1 + r.below(3));
         let v = if r.chance(80) { r.below(p.nregs as u64 + 3) } else { r.below(256) };
-        w = (w & (((255 as u64) << shift) as u32 ^ 0xFFFFFFFF)) | ((v << shift) as u32);
+        w = (w & ((255 << shift) ^ 0xFFFFFFFF)) | ((v << shift) as u32);
     } else if k < 65 {
         // Another opcode, same operands.
         w = (w & 0xFFFFFF00) | (r.below(Pip.NUM_OPS) as u32);
     } else if k < 85 {
-        w = w ^ (((1 as u64) << r.below(32)) as u32);
+        w = w ^ (1 << r.below(32));
     } else if k < 95 {
         // Another target, if the word is a jump.
         let off = r.below(p.code.len + 4) as i64 - i as i64 - 2;
