@@ -1,0 +1,23 @@
+// Struct literals of types from another module: `module.Type { .. }`.
+
+import std.io;
+import std.mem;
+import std.diag;
+
+fn main() {
+    let s = diag.Span { file: 0, lo: 3, hi: 10 };
+    io.print_int(s.len() as i64); io.println("");
+    // A generic struct, with its type arguments inferred.
+    var v: mem.Vec<i64> = mem.Vec { ptr: mem.alloc(4), len: 0, cap: 4 };
+    v.push(5);
+    io.print_int(v.at(0)); io.println("");
+    // Postfix operations apply to the literal.
+    io.print_int(diag.Span { file: 0, lo: 1, hi: 2 }.hi as i64); io.println("");
+    // In an `if` head, `x.Name {` is not a struct literal.
+    let k = 1;
+    if k == 1 { io.println("ok"); }
+}
+// expect: 7
+// expect: 5
+// expect: 2
+// expect: ok

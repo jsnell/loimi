@@ -1064,22 +1064,27 @@ impl<'a> Checker<'a> {
                 Ok(mk(to, TK::Cast(Box::new(v)), span))
             }
             ExprKind::StructLit(path, fields) => {
-                let ty = if path.len() == 1 {
-                    match self.scopes[cx.module].get(&path[0].name).cloned() {
-                        Some((Def::GenericType(g), _)) => self.generic_struct_lit(cx, g, fields, exp, span)?,
-                        _ => self.resolve_type_name(cx.module, &path[0])?,
-                    }
-                } else {
-                    return Err(Diag::new(span, "qualified struct literals are not supported yet"));
+                // `Type { .. }` or `module.Type { .. }`.
+                let (m, name) = match path.as_slice() {
+                    [name] => (cx.module, name),
+                    [module, name] => match self.scopes[cx.module].get(&module.name) {
+                        Some((Def::Module(target), _)) => (*target, name),
+                        _ => return Err(Diag::new(module.span, format!("unknown module `{}`", module.name))),
+                    },
+                    _ => return Err(Diag::new(span, "unsupported struct literal path")),
+                };
+                let ty = match self.scopes[m].get(&name.name).cloned() {
+                    Some((Def::GenericType(g), _)) => self.generic_struct_lit(cx, g, fields, exp, span)?,
+                    _ => self.resolve_type_name(m, name)?,
                 };
                 let Ty::Struct(sid) = ty else {
-                    return Err(Diag::new(span, format!("`{}` is not a struct", path[0].name)));
+                    return Err(Diag::new(span, format!("`{}` is not a struct", name.name)));
                 };
                 let defs = self.prog.structs[sid as usize].fields.clone();
                 let mut vals: Vec<Option<TExpr>> = vec![None; defs.len()];
                 for (f, v) in fields {
                     let Some(idx) = defs.iter().position(|(n, _)| *n == f.name) else {
-                        return Err(Diag::new(f.span, format!("no field `{}` in struct `{}`", f.name, path[0].name)));
+                        return Err(Diag::new(f.span, format!("no field `{}` in struct `{}`", f.name, name.name)));
                     };
                     if vals[idx].is_some() {
                         return Err(Diag::new(f.span, format!("field `{}` given twice", f.name)));

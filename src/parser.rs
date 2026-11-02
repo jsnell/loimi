@@ -823,6 +823,15 @@ impl Parser {
                     }
                     _ => {
                         let name = self.ident()?;
+                        // `module.Type { .. }`: a struct literal of an imported type.
+                        if let ExprKind::Ident(m) = &e.kind {
+                            if is_upper(&name.name) && self.is("{") && !self.no_struct {
+                                let module = Ident { name: m.clone(), span: e.span };
+                                let start = e.span;
+                                e = self.parse_struct_lit(vec![module, name], start)?;
+                                continue;
+                            }
+                        }
                         e = field(e, name);
                     }
                 }
