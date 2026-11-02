@@ -50,6 +50,9 @@ pub struct VmInfo {
     pub ret: Ty,
     pub raise_ty: Option<Ty>,
     pub fns: HashMap<String, FnId>,
+    /// Per vm function (not `-> never`): parameter names, and the cache
+    /// layout of each parameter declared `cache Name`.
+    pub fn_caches: HashMap<String, (Vec<String>, Vec<Option<usize>>)>,
     /// `-> never` vm functions, which may end in control words.
     pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
@@ -69,6 +72,8 @@ pub struct CacheInfo {
 pub struct NeverFn {
     pub decl: FnDecl,
     pub params: Vec<Ty>,
+    /// The cache layout of each parameter declared `cache Name`.
+    pub caches: Vec<Option<usize>>,
     pub shared: Option<FnId>,
     /// `#[inline]`: always inlined; `#[inline(never)]`: always shared.
     pub inline: Option<bool>,
@@ -105,6 +110,9 @@ pub struct HandlerCx {
     pub shared: Option<(usize, LocalId)>,
     /// `-> never` vm functions being inlined here (to catch recursion).
     pub inlining: Vec<usize>,
+    /// Parameters declared `cache Name` in scope: (name, handle local,
+    /// cache layout). The handle points to the op's first cache word.
+    pub cache_params: Vec<(String, LocalId, usize)>,
 }
 
 impl HandlerCx {
@@ -123,6 +131,7 @@ impl HandlerCx {
             cold: false,
             shared: None,
             inlining: vec![],
+            cache_params: vec![],
         }
     }
 }
@@ -336,12 +345,24 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     }
     // vm functions.
     let mut fns = HashMap::new();
+    let mut fn_caches = HashMap::new();
     let mut fn_decls = Vec::new();
     let mut never_fns: Vec<NeverFn> = Vec::new();
     for f in &d.fns {
         let mut pt: Vec<Ty> = state_tys.iter().map(|t| Ty::Ptr(Box::new(t.clone()))).collect();
+        // `c: cache Name` is a pointer to the calling op's first cache word.
+        let mut pc_caches = Vec::new();
         for p in &f.params {
-            pt.push(c.resolve_type(m, &p.ty)?);
+            if let TypeKind::Cache(cn) = &p.ty.kind {
+                let Some(ci) = caches.iter().position(|x: &CacheInfo| x.name == cn.name) else {
+                    return Err(Diag::new(cn.span, format!("unknown cache `{}`", cn.name)));
+                };
+                pt.push(Ty::Ptr(Box::new(Ty::Int(word))));
+                pc_caches.push(Some(ci));
+            } else {
+                pt.push(c.resolve_type(m, &p.ty)?);
+                pc_caches.push(None);
+            }
         }
         let r = match &f.ret {
             Some(t) => c.resolve_type(m, t)?,
@@ -365,6 +386,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             never_fns.push(NeverFn {
                 decl: f.clone(),
                 params: pt[state_tys.len()..].to_vec(),
+                caches: pc_caches,
                 shared,
                 inline,
                 uses_next: false,
@@ -376,6 +398,8 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         let fid = new_fn(c, format!("{}.fn.{}", prefix, f.name.name), f.name.name.clone(), pt, r, CallConv::C, vm, VmRole::VmFn, f.name.span);
         c.prog.fns[fid as usize].effects = crate::check::effects_of(&f.attrs)?;
         fns.insert(f.name.name.clone(), fid);
+        let pnames = f.params.iter().map(|p| p.name.name.clone()).collect();
+        fn_caches.insert(f.name.name.clone(), (pnames, pc_caches));
         fn_decls.push((fid, f.clone()));
     }
     // Entries.
@@ -447,6 +471,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         ret: ret.clone(),
         raise_ty,
         fns,
+        fn_caches,
         never_fns,
         sync: d.sync.clone(),
     });
@@ -549,6 +574,7 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     let nf = &info.never_fns[j];
     let decl = nf.decl.clone();
     let params = nf.params.clone();
+    let pcaches = nf.caches.clone();
     let shared = nf.shared;
     let mut cx = FnCx::new(m, info.ret.clone());
     cx.fn_name = decl.name.name.clone();
@@ -559,11 +585,19 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     cx.locals[size as usize].name = "next.size".into();
     let mut lets = vec![TStmt::Let(size, Some(arg(params.len(), &Ty::i64())))];
     cx.scopes.push(vec![]);
+    let mut cache_params = Vec::new();
     for (k, (p, t)) in decl.params.iter().zip(params.iter()).enumerate() {
-        let l = cx.declare(&p.name.name, t.clone(), true);
+        let l = declare_param(&mut cx, &p.name.name, t, pcaches[k], &mut cache_params);
         lets.push(TStmt::Let(l, Some(arg(k, t))));
     }
-    cx.vm = Some(HandlerCx { in_fn: true, cold: true, shared: Some((j, size)), inlining: vec![j], ..HandlerCx::new(vm, state.clone()) });
+    cx.vm = Some(HandlerCx {
+        in_fn: true,
+        cold: true,
+        shared: Some((j, size)),
+        inlining: vec![j],
+        cache_params,
+        ..HandlerCx::new(vm, state.clone())
+    });
     let b = c.block(&mut cx, decl.body.as_ref().unwrap(), Some(&Ty::Never))?;
     if b.ty != Ty::Never {
         return Err(never_falloff(&decl));
@@ -637,6 +671,7 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
         ));
     }
     let params = nf.params.clone();
+    let pcaches = nf.caches.clone();
     let decl = nf.decl.clone();
     if args.len() != params.len() {
         return Err(Diag::new(span, format!("`{}` takes {} argument(s), got {}", name, params.len(), args.len())));
@@ -644,8 +679,11 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
     let recursive = h.inlining.contains(&j);
     let share = nf.shared.is_some() && (nf.inline == Some(false) || h.cold || recursive);
     let mut vals = Vec::new();
-    for (a, t) in args.iter().zip(params.iter()) {
-        vals.push(c.expr_coerce(cx, a, t)?);
+    for (k, (a, t)) in args.iter().zip(params.iter()).enumerate() {
+        vals.push(match pcaches[k] {
+            Some(ci) => cache_arg(c, cx, &h, a, ci, &decl.params[k].name.name)?,
+            None => c.expr_coerce(cx, a, t)?,
+        });
     }
     if share {
         let fid = c.vms[vmi].never_fns[j].shared.unwrap();
@@ -676,13 +714,15 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
     let saved_scopes = std::mem::replace(&mut cx.scopes, vec![state_scope, vec![]]);
     let saved_loops = std::mem::take(&mut cx.loops);
     let mut lets = Vec::new();
-    for ((p, t), v) in decl.params.iter().zip(params.iter()).zip(vals) {
-        let l = cx.declare(&p.name.name, t.clone(), true);
+    let mut cache_params = Vec::new();
+    for (k, ((p, t), v)) in decl.params.iter().zip(params.iter()).zip(vals).enumerate() {
+        let l = declare_param(cx, &p.name.name, t, pcaches[k], &mut cache_params);
         lets.push(TStmt::Let(l, Some(v)));
     }
     let mut h2 = h.clone();
     h2.in_fn = true;
     h2.operands.clear();
+    h2.cache_params = cache_params;
     h2.inlining.push(j);
     cx.vm = Some(h2);
     let r = c.block(cx, decl.body.as_ref().unwrap(), Some(&Ty::Never));
@@ -713,10 +753,12 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
         state.push(id);
     }
     let pts = c.prog.fns[fid as usize].param_tys.clone();
-    for (p, t) in f.params.iter().zip(pts[st.len()..].iter()) {
-        params.push(cx.declare(&p.name.name, t.clone(), true));
+    let pcaches = info.fn_caches[&f.name.name].1.clone();
+    let mut cache_params = Vec::new();
+    for (k, (p, t)) in f.params.iter().zip(pts[st.len()..].iter()).enumerate() {
+        params.push(declare_param(&mut cx, &p.name.name, t, pcaches[k], &mut cache_params));
     }
-    cx.vm = Some(HandlerCx { is_handler: false, allow_control: false, by_ptr: true, ..HandlerCx::new(vm, state.clone()) });
+    cx.vm = Some(HandlerCx { is_handler: false, allow_control: false, by_ptr: true, cache_params, ..HandlerCx::new(vm, state.clone()) });
     let b = c.block(&mut cx, f.body.as_ref().unwrap(), Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let fd = &mut c.prog.fns[fid as usize];
@@ -1081,6 +1123,15 @@ fn bad_cache_type(t: &Ty) -> Option<&'static str> {
 
 pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<Option<TExpr>> {
     let Some(h) = cx.vm.clone() else { return Ok(None) };
+    if h.cache_params.iter().any(|(x, _, _)| x == name) {
+        return Err(Diag::new(
+            span,
+            format!("`{}` is a cache handle: use its fields (`{}.field`) or pass it to a vm function's `cache` parameter", name, name),
+        ));
+    }
+    if name == "cache" && h.op.is_some() && !h.in_fn {
+        return Err(Diag::new(span, "`cache` on its own can only be passed to a vm function parameter declared `cache Name`"));
+    }
     if let Some((_, kind, raw)) = h.operands.iter().find(|(n, _, _)| n == name) {
         let body = c.vms[h.vm as usize].kinds[*kind].body.clone();
         cx.scopes.push(vec![("it".to_string(), *raw)]);
@@ -1107,6 +1158,16 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
     if cx.lookup(bn).is_some() {
         return Ok(None);
     }
+    if let Some((_, l, ci)) = h.cache_params.iter().find(|(x, _, _)| x == bn) {
+        let info = &c.vms[h.vm as usize];
+        let Some((_, ft, off)) = info.caches[*ci].fields.iter().find(|f| f.0 == name.name) else {
+            return Err(Diag::new(name.span, format!("no field `{}` in cache `{}`", name.name, info.caches[*ci].name)));
+        };
+        let wb = (info.word.bits as u32 / 8).max(1);
+        let ht = cx.locals[*l as usize].ty.clone();
+        let hv = mk(ht, TK::Local(*l), base.span);
+        return Ok(Some(mk(ft.clone(), TK::Vm(TVm::WordAt(Box::new(hv), off * wb, wb)), span)));
+    }
     if name.name == "raw" {
         if let Some((_, _, raw)) = h.operands.iter().find(|(n, _, _)| n == bn) {
             let t = cx.locals[*raw as usize].ty.clone();
@@ -1118,11 +1179,11 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
     }
     if bn == "cache" {
         if h.in_fn {
-            return Err(Diag::new(base.span, "`cache` is not available in vm functions; pass the values as arguments"));
+            return Err(Diag::new(base.span, "`cache` is not available in vm functions; declare a parameter `c: cache Name`, pass `cache` to it and use `c.field`"));
         }
         let info = &c.vms[h.vm as usize];
         let Some(op) = h.op else {
-            return Err(Diag::new(base.span, "`cache` is only available in op handlers"));
+            return Err(Diag::new(base.span, "`cache` is only available in op handlers; a vm function can declare a parameter `c: cache Name`, take `cache` from the op and use `c.field`"));
         };
         let Some(ci) = info.ops[op].cache else {
             return Err(Diag::new(base.span, format!("op `{}` has no inline cache", info.ops[op].name)));
@@ -1202,7 +1263,82 @@ pub fn vm_fn_call(c: &mut Checker, cx: &mut FnCx, name: &str, args: &[Expr], spa
         }
     }
     let f = c.def_value(Def::Fn(fid), name, span)?;
-    c.finish_call(cx, f, pre, args, span).map(Some)
+    let (pnames, pcaches) = c.vms[h.vm as usize].fn_caches[name].clone();
+    if pcaches.iter().all(|x| x.is_none()) {
+        return c.finish_call(cx, f, pre, args, span).map(Some);
+    }
+    // Cache handles are not values: check those arguments here.
+    let Ty::Fn(ptys, ret, _) = f.ty.clone() else { unreachable!() };
+    if args.len() != pcaches.len() {
+        return Err(Diag::new(span, format!("expected {} argument(s), got {}", pcaches.len(), args.len())));
+    }
+    for (k, a) in args.iter().enumerate() {
+        let v = match pcaches[k] {
+            Some(ci) => cache_arg(c, cx, &h, a, ci, &pnames[k])?,
+            None => c.expr_coerce(cx, a, &ptys[pre.len()])?,
+        };
+        pre.push(v);
+    }
+    let call = mk(*ret, TK::Call(Box::new(f), pre), span);
+    wrap_effects(c, cx, call).map(Some)
+}
+
+/// Declare parameter `name` of a vm function. A `cache Name` handle is a
+/// hidden local, reachable only as `name.field` (see `vm_field`).
+fn declare_param(cx: &mut FnCx, name: &str, t: &Ty, cache: Option<usize>, out: &mut Vec<(String, LocalId, usize)>) -> LocalId {
+    match cache {
+        Some(ci) => {
+            let l = cx.temp(t.clone());
+            cx.locals[l as usize].name = format!("cache.{}", name);
+            cx.locals[l as usize].mutable = false;
+            out.push((name.to_string(), l, ci));
+            l
+        }
+        None => cx.declare(name, t.clone(), true),
+    }
+}
+
+/// The argument for parameter `pname: cache Name` (layout `ci`): `cache`
+/// in an op with that cache (a pointer to its first cache word), or a
+/// cache handle of the caller with the same layout.
+fn cache_arg(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, a: &Expr, ci: usize, pname: &str) -> Res<TExpr> {
+    let info = &c.vms[h.vm as usize];
+    let cname = info.caches[ci].name.clone();
+    let bad = |what: String| {
+        Diag::new(
+            a.span,
+            format!("`{}: cache {}` takes `cache` (in an op with cache `{}`) or a cache handle; {}", pname, cname, cname, what),
+        )
+    };
+    let ExprKind::Ident(n) = &a.kind else { return Err(bad("found an expression".into())) };
+    if cx.lookup(n).is_some() {
+        return Err(bad(format!("`{}` is a local", n)));
+    }
+    if let Some((_, l, hci)) = h.cache_params.iter().find(|(x, _, _)| x == n) {
+        if *hci != ci {
+            return Err(bad(format!("`{}` is a handle to cache `{}`", n, info.caches[*hci].name)));
+        }
+        let t = cx.locals[*l as usize].ty.clone();
+        return Ok(mk(t, TK::Local(*l), a.span));
+    }
+    if n != "cache" {
+        return Err(bad(format!("found `{}`", n)));
+    }
+    let op = match h.op {
+        Some(op) if !h.in_fn => op,
+        _ => return Err(bad("`cache` is only available in op handlers".into())),
+    };
+    if info.ops[op].cache != Some(ci) {
+        let has = match info.ops[op].cache {
+            Some(k) => format!("op `{}` has cache `{}`", info.ops[op].name, info.caches[k].name),
+            None => format!("op `{}` has no inline cache", info.ops[op].name),
+        };
+        return Err(bad(has));
+    }
+    let pt = info.state[info.pc_idx].1.clone();
+    let pc = mk(pt.clone(), TK::Local(h.state[info.pc_idx]), a.span);
+    let one = mk(Ty::i64(), TK::Int(1), a.span);
+    Ok(mk(pt, TK::Intrinsic(Intr::PtrOffset, vec![pc, one]), a.span))
 }
 
 pub fn check_raise_ty(c: &mut Checker, cx: &mut FnCx, e: &Ty, span: Span) -> Res<()> {

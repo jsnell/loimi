@@ -493,8 +493,9 @@ Rules for `-> never` vm functions:
   next part). A function that uses `next` can only be reached from op
   handlers, not from entries or `on raise`.
 - The body sees the vm state and its own parameters, but not the caller's
-  operands: pass `dst.raw` or values as arguments. `become` and `cache` are
-  not allowed, since they belong to the calling op.
+  operands: pass `dst.raw` or values as arguments. `become` is not
+  allowed, since it belongs to the calling op, and neither is `cache`;
+  pass the cache instead (`c: cache GlobalIC`, see below).
 - They can only be called where control words are allowed: op handlers,
   entries, `on raise`, and other `-> never` vm functions.
 
@@ -509,6 +510,45 @@ The shared copy is reached like an outlined cold block: the arguments, and
 the size `next` skips, go through thread-local slots, and the state stays
 in registers. `#[inline]` on the function inlines every call;
 `#[inline(never)]` makes every call in tail-call mode use the shared copy.
+
+**Passing the inline cache.** A vm function (either kind) can take the
+calling op's inline cache as a parameter of type `cache Name`, and the
+op passes `cache`:
+
+```loimi
+cache GlobalIC { version: u64, entry: ?*Entry }
+
+fn get_global(c: cache GlobalIC, dst: u64, key: Sym) -> never {
+    if let Some(e) = c.entry and c.version == ctx.globals.version {
+        regs[dst] = e.value; next
+    }
+    cold { regs[dst] = lookup_and_fill(c, key)?; next }
+}
+fn lookup_and_fill(c: cache GlobalIC, key: Sym) -> Result<Value, Value> { .. c.entry = Some(e); .. }
+
+op GETGLOBAL(dst: reg, key: kst) : ABx + GlobalIC { get_global(cache, dst.raw, key.as_sym()) }
+```
+
+`c` is a handle to the op's cache words: `c.field` reads and assigns
+them exactly as `cache.field` does in the op, with the same types and
+unaligned access for wide fields. The argument must be `cache` in an op
+whose cache has that layout, or another handle of the same layout (a vm
+function passing its `c` on); the handle is not a value otherwise
+(`c` alone, `let`, return types are errors). At run time it is the
+address of the instruction's first cache word, `pc + 1`:
+
+- in an inlined copy (hot call sites of `-> never` functions, and every
+  call of a plain vm function, which is always inlined), `c.field` folds
+  to the same `pc`-relative access as `cache.field`, so it costs nothing;
+- in a shared copy of a `-> never` function (calls from `cold` blocks,
+  recursive calls, `#[inline(never)]`), the address travels through a
+  thread-local slot like the other arguments. The shared copy therefore
+  reads and fills the cache of the instruction that called it, whichever
+  that is; every caller passes its own.
+
+A superinstruction part passes the part's own cache. `become` stays
+with the op: a helper that decides to re-specialize can return a value
+the op acts on.
 
 ### 3.6 Entries and the error path
 

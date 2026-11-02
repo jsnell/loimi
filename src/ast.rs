@@ -30,6 +30,8 @@ pub enum TypeKind {
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),
+    /// `cache Name`: a handle to an op's inline cache (vm function parameters).
+    Cache(Ident),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

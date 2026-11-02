@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u32 }
+    fn get(c: cache IC) -> *u32 { c }
+    op NOP() : A + IC { let p = get(cache); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `c` is a cache handle: use its fields

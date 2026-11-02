@@ -420,6 +420,11 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let a = word_align(g);
             g.inst(format!("load {}, ptr {}, align {}", t, pl, a))
         }
+        TVm::WordAt(_, _, a) => {
+            let pl = g.place(e);
+            let t = g.ty(&e.ty);
+            g.inst(format!("load {}, ptr {}, align {}", t, pl, a))
+        }
         TVm::Fallthrough(size, part) => {
             let hg = g.vm.clone().unwrap();
             let p = g.p();

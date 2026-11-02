@@ -850,6 +850,9 @@ impl<'a> Checker<'a> {
                 Ty::Fn(out, Box::new(self.resolve_type(m, r)?), e)
             }
             TypeKind::Never => Ty::Never,
+            TypeKind::Cache(_) => {
+                return Err(Diag::new(t.span, "a `cache Name` handle can only be the type of a vm function parameter"))
+            }
             TypeKind::Trailing(_) => {
                 return Err(Diag::new(t.span, "a trailing array `[T]` is only allowed as the last field of an `object`"))
             }
@@ -2764,7 +2767,7 @@ impl<'a> Checker<'a> {
                     _ => None,
                 };
                 let v = self.expr(cx, inner, inner_exp.as_ref())?;
-                if let (TK::Vm(TVm::Word(_)), Some(h)) = (&v.kind, &cx.vm) {
+                if let (TK::Vm(TVm::Word(_) | TVm::WordAt(..)), Some(h)) = (&v.kind, &cx.vm) {
                     let wb = self.vms[h.vm as usize].word.bits as u64 / 8;
                     if crate::layout::align_of(&self.prog, &v.ty) > wb {
                         return Err(Diag::new(
@@ -2926,7 +2929,7 @@ impl<'a> Checker<'a> {
                 Ty::Array(..) => self.check_assignable(cx, b, span),
                 _ => Ok(()),
             },
-            TK::Vm(TVm::Word(_)) => Ok(()),
+            TK::Vm(TVm::Word(_) | TVm::WordAt(..)) => Ok(()),
             TK::Block(_, Some(t)) if matches!(t.kind, TK::Local(_)) => Ok(()),
             _ => Err(Diag::new(span, "left side of assignment is not a place")),
         }
@@ -3039,7 +3042,7 @@ pub fn is_place(e: &TExpr) -> bool {
         TK::Local(_) | TK::Deref(_) | TK::Global(_) => true,
         TK::Field(b, _) => is_place(b) || matches!(b.ty, Ty::Slice(_)),
         TK::Index(b, _) => !matches!(b.ty, Ty::Array(..)) || is_place(b),
-        TK::Vm(TVm::Word(_)) => true,
+        TK::Vm(TVm::Word(_) | TVm::WordAt(..)) => true,
         _ => false,
     }
 }

@@ -662,6 +662,11 @@ impl Parser {
     }
 
     pub fn parse_type(&mut self) -> Res<TypeExpr> {
+        if self.in_vm && self.is_kw("cache") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            let start = self.bump().span;
+            let name = self.ident()?;
+            return Ok(TypeExpr { kind: TypeKind::Cache(name), span: start.to(self.prev_span()) });
+        }
         let start = self.span();
         let kind = if self.eat("*") {
             let _ = self.eat_kw("mut") || self.eat_kw("const");

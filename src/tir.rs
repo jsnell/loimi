@@ -183,6 +183,10 @@ pub enum TVm {
     Cold(B),
     /// The code word at `pc + offset` (a place).
     Word(u32),
+    /// A cache field through a cache handle: the place `bytes` bytes past
+    /// the pointer, accessed with alignment `align` (code words only
+    /// have the word's alignment).
+    WordAt(B, u32, u32),
     /// In a superinstruction part: advance pc by `size` and continue with part `next`.
     Fallthrough(u32, u32),
     /// Part `i` of a superinstruction handler.
