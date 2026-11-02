@@ -1316,7 +1316,7 @@ fn expr_reads(e: &Expr, x: &str) -> bool {
         ExprKind::Call(f, args) => go(f) || args.iter().any(go),
         ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
         ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
-        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, e)| go(e)),
+        ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, e)| go(e)),
         ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
         ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => block_reads(b, x),
         ExprKind::If(cs, t, f) => conds(cs) || block_reads(t, x) || f.as_ref().is_some_and(|e| go(e)),
