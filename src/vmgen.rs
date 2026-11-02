@@ -326,6 +326,12 @@ fn dispatch(g: &mut FnGen, target: &str) {
     }
 }
 
+/// The alignment of code words.
+pub fn word_align(g: &FnGen) -> u32 {
+    let p = g.p();
+    (p.vms[g.vm.as_ref().expect("code word access outside a handler").vm as usize].word.bits as u32 / 8).max(1)
+}
+
 pub fn word_place(g: &mut FnGen, off: u32) -> String {
     let hg = g.vm.clone().expect("code word access outside a handler");
     let p = g.p();
@@ -406,8 +412,13 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             current_word(g, vd)
         }
         TVm::Word(_) => {
+            // Code words are only word-aligned: a cache field wider than a
+            // word (a u64 or pointer in a u32 vm) is an unaligned access,
+            // which x86-64 and AArch64 do at full speed.
             let pl = g.place(e);
-            g.load(&e.ty, &pl)
+            let t = g.ty(&e.ty);
+            let a = word_align(g);
+            g.inst(format!("load {}, ptr {}, align {}", t, pl, a))
         }
         TVm::Fallthrough(size, part) => {
             let hg = g.vm.clone().unwrap();

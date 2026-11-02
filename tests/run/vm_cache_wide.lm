@@ -1,0 +1,174 @@
+// Inline cache fields wider than a code word: a pointer or u64 takes two
+// words of a u32 vm (four of a u16 vm), at an address that is only
+// word-aligned. Encoders, op_size, the verifier and optimize count them.
+// matrix: dispatch
+import std.io;
+
+struct Shape { id: u32, slot: u32 }
+type ShapeRef = *Shape;
+
+struct Obj { shape: *Shape, slots: [i64; 4] }
+
+vm V {
+    context objs: *Obj;
+    state { pc: *u32, regs: *i64 }
+    verify_context nregs: u64;
+
+    operand reg = regs[it] verify it < nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    // 1 + 2 + 2 + 1 + 2 + 1 = 9 words.
+    cache PropIC { tag: u8, shape: ?ShapeRef, hits: u64, slot: u32, scale: f64, seen: bool }
+
+    // GETPROP d, o: load slot `cache.slot` of object o if its shape is
+    // the cached one; otherwise fill the cache (and count hits).
+    family GETPROP(dst: reg, o: reg) : ABC + PropIC {
+        generic {
+            let obj = objs;
+            cache.shape = Some(obj.shape);
+            cache.slot = obj.shape.slot;
+            cache.tag = 7;
+            cache.scale = 0.5;
+            cache.seen = true;
+            dst = obj.slots[cache.slot];
+            become GETPROP_MONO;
+            next
+        }
+        GETPROP_MONO {
+            let obj = objs;
+            if let Some(s) = cache.shape and s == obj.shape {
+                cache.hits += 1;
+                dst = obj.slots[cache.slot];
+                next
+            }
+            become GETPROP;
+            redo
+        }
+    }
+    op HITS(dst: reg) : ABC + PropIC { dst = 0; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op DEC(dst: reg) : ABC { dst = dst - 1; next }
+    op JNZ(a: reg, target: label) : AsBx { if a != 0 { jump target } next }
+    op RET(src: reg) : ABC { exit src }
+    super GETPROP_ADD = GETPROP_MONO; ADD;
+
+    entry run(code: *u32, r: *i64, os: *Obj) -> i64 { pc = code; regs = r; objs = os; jump pc }
+}
+
+// A u16 vm: a u64 field takes four words.
+vm W {
+    state { pc: *u16, acc: u64 }
+    encoding fixed(u16) { format Z { op: 8, a: 8 } }
+    cache Big { v: u64, n: u16 }
+    op BUMP(a: imm) : Z + Big { cache.v = cache.v + 0x1_0000_0001; cache.n += 1; acc = acc + cache.v; next }
+    op END(a: imm) : Z { exit acc }
+    operand imm = it;
+    entry run(code: *u16) -> u64 { pc = code; acc = 0; jump pc }
+}
+
+// A u64 vm: a pointer fits one word, a u8 too.
+vm X {
+    state { pc: *u64, acc: u64 }
+    encoding fixed(u64) { format Z { op: 8, a: 8 } }
+    operand imm = it;
+    cache P { p: *u64, b: u8 }
+    op LOAD(a: imm) : Z + P { acc = acc + *cache.p + cache.b as u64; next }
+    op END(a: imm) : Z { exit acc }
+    entry run(code: *u64) -> u64 { pc = code; acc = 0; jump pc }
+}
+
+fn main() {
+    io.print_int(V.op_size(V.GETPROP(0, 0)) as i64); io.println("");
+    io.print_int(V.op_size(V.HITS(0)) as i64); io.println("");
+    var code: [u32; 64] = [0; 64];
+    let c = code[..];
+    var at: u64 = 0;
+    // r0 = 0; r1 = 3 (loop count); loop: r2 = o0.prop; r0 = r0 + r2; dec r1; jnz r1
+    let top = at;
+    at = V.emit.GETPROP(c, at, 2, 0);
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.DEC(c, at, 1);
+    at = V.emit.JNZ(c, at, 1, ((top as i64) - (at as i64)) as i16);
+    at = V.emit.HITS(c, at, 3);
+    at = V.emit.RET(c, at, 0);
+    io.print_int(at as i64); io.println("");
+    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print_int(i as i64); io.println(""); } }
+    // A jump into the cache is rejected.
+    code[top + 12] = V.JNZ(1, -5);
+    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); } }
+    code[top + 12] = V.JNZ(1, -12);
+
+    var shape = Shape { id: 1, slot: 2 };
+    var obj = Obj { shape: &shape, slots: [10, 20, 30, 40] };
+    var regs: [i64; 4] = [0, 3, 0, 0];
+    io.print_int(V.run(&code[0], &regs[0], &obj)); io.println("");
+    // The cache: tag at word 1, the shape pointer at words 2-3 (only
+    // 4-byte aligned), hits at 4-5, slot 6, scale 7-8, seen 9.
+    io.print_int(code[top + 1] as i64); io.println("");
+    let sp = (code[top + 2] as u64) | ((code[top + 3] as u64) << 32);
+    io.print_bool(sp == (&shape as u64)); io.println("");
+    io.print_int(code[top + 4] as i64); io.println("");
+    io.print_int(code[top + 6] as i64); io.println("");
+    io.print_bool(code[top + 9] == 1); io.println("");
+    io.print(V.op_name(code[top])); io.println("");
+
+    // optimize fuses GETPROP_MONO; ADD (10 + 1 words), and the fused code
+    // still verifies and runs.
+    V.optimize(c[0..at]);
+    io.print(V.op_name(code[top])); io.println("");
+    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print_int(i as i64); io.println(""); } }
+    regs = [0, 2, 0, 0];
+    io.print_int(V.run(&code[0], &regs[0], &obj)); io.println("");
+    io.print_int(code[top + 4] as i64); io.println("");
+    // A different shape misses: back to generic, refilled.
+    var shape2 = Shape { id: 2, slot: 0 };
+    obj.shape = &shape2;
+    regs = [0, 1, 0, 0];
+    io.print_int(V.run(&code[0], &regs[0], &obj)); io.println("");
+
+    var wcode: [u16; 16] = [0; 16];
+    let wc = wcode[..];
+    var wat: u64 = 0;
+    wat = W.emit.BUMP(wc, wat, 0);
+    wat = W.emit.BUMP(wc, wat, 0);
+    wat = W.emit.END(wc, wat, 0);
+    io.print_int(wat as i64); io.println("");
+    io.print_int(W.run(&wcode[0]) as i64); io.println("");
+    io.print_int(wcode[5] as i64); io.println("");
+
+    var cell: u64 = 40;
+    var xcode: [u64; 4] = [0; 4];
+    let xc = xcode[..];
+    var xat: u64 = X.emit.LOAD(xc, 0, 0);
+    xcode[1] = &cell as u64;
+    xcode[2] = 2;
+    xat = X.emit.END(xc, xat, 0);
+    io.print_int(xat as i64); io.println("");
+    io.print_int(X.run(&xcode[0]) as i64); io.println("");
+}
+// expect: 10
+// expect: 10
+// expect: 24
+// expect: verified
+// expect: bad at 12
+// expect: 90
+// expect: 7
+// expect: true
+// expect: 2
+// expect: 2
+// expect: true
+// expect: GETPROP_MONO
+// expect: GETPROP_ADD
+// expect: verified
+// expect: 60
+// expect: 4
+// expect: 10
+// expect: 13
+// expect: 8589934594
+// expect: 1
+// expect: 4
+// expect: 42

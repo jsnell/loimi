@@ -719,16 +719,44 @@ and operand kinds unchanged.
 ### 7.1 Inline caches
 
 ```loimi
-cache PropIC { shape: weak ShapeId, slot: u32 }
+cache PropIC { shape: ?*Shape, slot: u32 }
 ```
 
 A cache is stored **inline in the code stream**, after the instruction (as in
 CPython 3.11+), and is attached with `+`: `op GETPROP(...) : ABC + PropIC`.
 `next` skips it automatically, the verifier forbids jumps into it, the builder
 reserves and zero-fills it, and the disassembler prints it. Inside the handler,
-`cache.shape` reads and writes the words directly. Fields marked `weak`
-don't keep their target alive. When the target dies, the GC resets the entry
-to zero, which the handler sees as a miss (`stdlib/gc.md` §8).
+`cache.shape` reads and writes the words directly.
+
+**Field types and sizes.** A field is an integer, a float, `bool`, a
+pointer, a function pointer, or an option of a pointer (`?*Shape`, None
+is null, which is what a zero-filled cache holds). Each field starts a
+new code word and takes as many words as its type needs: in a `u32`
+vm, `u32` and smaller take one word, and `u64`, `f64` and pointers take
+two, so `PropIC` above is three words and `op_size` of `GETPROP` is 4.
+In a `u64` vm every field is one word. The generated encoders
+(`Vm.emit.X` reserves and zeroes all of them), `op_size`, the verifier's
+walk (no jump may land in any of them) and `optimize` count the words.
+
+The code array is an array of words, so a two-word field is only
+word-aligned: handlers read and write it with unaligned loads and stores
+(`align 4`), which cost nothing extra on x86-64 and AArch64. Taking its
+address (`&cache.shape`) is an error, since the pointer would claim an
+alignment the field does not have; read the field, or assign it. Fields
+no wider than a word may still be passed by address. Wide fields are
+written with ordinary stores, which are not atomic if the code is shared
+between threads.
+
+**No GC references.** A cache field cannot hold `Gc<T>`, a `value` type
+or anything else the collector traces: the collector does not scan
+bytecode, so the reference would neither keep its target alive nor be
+updated if it moved. (`weak` fields, which the GC would clear when their
+target dies, are not implemented either.) Cache something whose
+lifetime the interpreter controls instead: a shape id that is never
+reused, a pointer to a structure that is never freed or moved (shapes
+kept alive by a table), or a version number, and validate it on use.
+Weak caching of GC objects belongs in the library, where it can be
+written as a side table that the root scanner or a sweeper clears.
 
 ### 7.1a The following instruction: `then`
 

@@ -16,7 +16,8 @@ pub struct OpLayout {
     pub opcode: u32,
     /// (param name, field bits, field shift, signed)
     pub fields: Vec<(String, u32, u32, bool)>,
-    pub cache_words: u32,
+    /// Index of the op's inline cache layout (`op X(..) : F + Cache`).
+    pub cache: Option<usize>,
     /// For superinstructions: component op indices.
     pub parts: Vec<usize>,
     /// Index of the family's generic op (the op itself outside families;
@@ -31,6 +32,12 @@ pub struct VmLayout {
     pub op_shift: u32,
     pub op_bits: u32,
     pub ops: Vec<OpLayout>,
+    /// Code words per cache layout. A field takes as many words as its
+    /// type needs (a u64 or pointer takes two u32 words), which only the
+    /// checker knows: until it fills these in, each field counts as one
+    /// word, and the generated source uses `size_src` instead.
+    pub cache_words: Vec<u32>,
+    pub cache_names: Vec<String>,
 }
 
 fn field_ty(bits: u32, signed: bool) -> String {
@@ -98,21 +105,21 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
             return Err(Diag::new(op.name.span, format!("format `{}` has only {} operand field(s)", op.format.name, non_op.len())));
         }
         let fields = op.params.iter().zip(non_op.iter()).map(|(p, f)| (p.name.name.clone(), f.1, f.2, f.3)).collect();
-        let cache_words = match &op.cache {
-            Some(c) => v
-                .caches
-                .iter()
-                .find(|x| x.name.name == c.name)
-                .map(|x| x.fields.len() as u32)
-                .ok_or_else(|| Diag::new(c.span, format!("unknown cache `{}`", c.name)))?,
-            None => 0,
+        let cache = match &op.cache {
+            Some(c) => Some(
+                v.caches
+                    .iter()
+                    .position(|x| x.name.name == c.name)
+                    .ok_or_else(|| Diag::new(c.span, format!("unknown cache `{}`", c.name)))?,
+            ),
+            None => None,
         };
         let kinds = op.params.iter().map(|p| p.kind.name.clone()).collect();
         let family = match &op.family {
             Some(f) => v.ops.iter().position(|o| o.name.name == *f).unwrap_or(i),
             None => i,
         };
-        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache_words, parts: vec![], family, then: None });
+        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache, parts: vec![], family, then: None });
     }
     for (i, op) in v.ops.iter().enumerate() {
         if let Some(t) = &op.then {
@@ -139,39 +146,55 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         }
         let opcode = ops.len() as u32;
         let family = ops[parts[0]].family;
-        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache_words: 0, parts, family, then: None });
+        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache: None, parts, family, then: None });
     }
     if ops.len() as u64 > (1u64 << op_bits) {
         return Err(Diag::new(v.name.span, format!("{} ops do not fit in a {}-bit opcode field", ops.len(), op_bits)));
     }
-    Ok(VmLayout { word_bits, op_shift, op_bits, ops })
+    let cache_words = v.caches.iter().map(|c| c.fields.len() as u32).collect();
+    let cache_names = v.caches.iter().map(|c| c.name.name.clone()).collect();
+    Ok(VmLayout { word_bits, op_shift, op_bits, ops, cache_words, cache_names })
 }
 
 impl VmLayout {
     /// Words occupied by an op (instruction + inline cache; sum for supers).
     pub fn size(&self, i: usize) -> u32 {
         let o = &self.ops[i];
-        if o.parts.is_empty() { 1 + o.cache_words } else { o.parts.iter().map(|&p| self.size(p)).sum() }
+        match (o.parts.is_empty(), o.cache) {
+            (true, Some(c)) => 1 + self.cache_words[c],
+            (true, None) => 1,
+            (false, _) => o.parts.iter().map(|&p| self.size(p)).sum(),
+        }
+    }
+    /// `size` as a constant expression of the generated source, where
+    /// cache sizes are the constants `generate` defines.
+    pub fn size_src(&self, vm: &str, i: usize) -> String {
+        let o = &self.ops[i];
+        match (o.parts.is_empty(), o.cache) {
+            (true, Some(c)) => format!("(1 + {}__CW_{})", vm, self.cache_names[c]),
+            (true, None) => "1".to_string(),
+            (false, _) => format!("({})", o.parts.iter().map(|&p| self.size_src(vm, p)).collect::<Vec<_>>().join(" + ")),
+        }
+    }
+    /// `part_offsets` with offsets as source expressions.
+    pub fn part_offsets_src(&self, vm: &str, i: usize) -> Vec<(String, usize)> {
+        let o = &self.ops[i];
+        if o.parts.is_empty() {
+            return vec![("0".to_string(), i)];
+        }
+        let mut off: Vec<String> = Vec::new();
+        o.parts
+            .iter()
+            .map(|&p| {
+                let r = (if off.is_empty() { "0".to_string() } else { format!("({})", off.join(" + ")) }, p);
+                off.push(self.size_src(vm, p));
+                r
+            })
+            .collect()
     }
     /// The op a word stands for on its own: a superinstruction's first part.
     pub fn base(&self, i: usize) -> usize {
         self.ops[i].parts.first().copied().unwrap_or(i)
-    }
-    /// (word offset, op) of each part of op `i` (the op itself if not a super).
-    pub fn part_offsets(&self, i: usize) -> Vec<(u32, usize)> {
-        let o = &self.ops[i];
-        if o.parts.is_empty() {
-            return vec![(0, i)];
-        }
-        let mut off = 0;
-        o.parts
-            .iter()
-            .map(|&p| {
-                let r = (off, p);
-                off += self.size(p);
-                r
-            })
-            .collect()
     }
 }
 
@@ -456,7 +479,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     let _ = writeln!(s, "    if __i + {n}__op_size(__code[__i]) > __code.len {{ return Some(__i); }}");
     let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
-        let mut conds: Vec<String> = l.part_offsets(k)[1..]
+        let mut conds: Vec<String> = l.part_offsets_src(n, k)[1..]
             .iter()
             .map(|(off, p)| format!("{n}__family(__code[__i + {off}]) != {}", l.ops[*p].family))
             .collect();
@@ -464,7 +487,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
         // continue, something must come after that OP too.
         let b = l.base(k);
         if let Some(t) = l.ops[b].then {
-            let sz = l.size(b);
+            let sz = l.size_src(n, b);
             conds.push(format!("__i + {sz} >= __code.len or {n}__family(__code[__i + {sz}]) != {}", l.ops[t].family));
             if cont[b] {
                 conds.push(format!("__i + {sz} + {n}__base_size(__code[__i + {sz}]) >= __code.len"));
@@ -483,7 +506,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
         let mut checks = String::new();
-        for (off, p) in l.part_offsets(k).into_iter().take(1) {
+        for (off, p) in l.part_offsets_src(n, k).into_iter().take(1) {
             let po = &l.ops[p];
             for (fi, (_, bits, shift, signed)) in po.fields.iter().enumerate() {
                 if let Some(c) = clause(&po.kinds[fi]) {
@@ -518,6 +541,14 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         sh = l.op_shift
     );
     let _ = writeln!(s, "{vis}const {n}__NUM_OPS: u64 = {};", l.ops.len());
+    // Code words of each inline cache layout: every field starts a word
+    // and takes as many as its type needs.
+    let wb = l.word_bits / 8;
+    for c in &v.caches {
+        let words: Vec<String> = c.fields.iter().map(|(_, t, _)| format!("(size_of<{}>() + {})/{}", type_src(t), wb - 1, wb)).collect();
+        let total = if words.is_empty() { "0".to_string() } else { words.join(" + ") };
+        let _ = writeln!(s, "{vis}const {n}__CW_{}: u64 = {};", c.name.name, total);
+    }
     for (i, o) in l.ops.iter().enumerate() {
         let _ = writeln!(s, "{vis}const {n}__OP_{}: {w} = {};", o.name, o.opcode);
         if !o.parts.is_empty() {
@@ -531,10 +562,10 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         }
         let _ = writeln!(s, "{vis}fn {n}__{}({}) -> {w} {{ {} }}", o.name, params.join(", "), enc);
         let args: Vec<String> = o.fields.iter().map(|f| f.0.clone()).collect();
-        let size = l.size(i);
+        let size = l.size_src(n, i);
         let mut body = format!("code[at] = {n}__{}({});", o.name, args.join(", "));
-        for k in 1..size {
-            let _ = write!(body, " code[at + {}] = 0;", k);
+        if o.cache.is_some() {
+            let _ = write!(body, " var __k: u64 = 1; while __k < {size} {{ code[at + __k] = 0; __k += 1; }}");
         }
         let mut ps = vec![format!("code: []{w}"), "at: u64".to_string()];
         ps.extend(params);
@@ -543,13 +574,13 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     // Sizes and names.
     let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
     for (i, o) in l.ops.iter().enumerate() {
-        let _ = writeln!(s, "  {} => {},", o.opcode, l.size(i));
+        let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, i));
     }
     let _ = writeln!(s, "  _ => 1, }} }}");
     // Per word on its own: a superinstruction's first part.
     let _ = writeln!(s, "{vis}fn {n}__base_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
     for (i, o) in l.ops.iter().enumerate() {
-        let _ = writeln!(s, "  {} => {},", o.opcode, l.size(l.base(i)));
+        let _ = writeln!(s, "  {} => {},", o.opcode, l.size_src(n, l.base(i)));
     }
     let _ = writeln!(s, "  _ => 1, }} }}");
     let _ = writeln!(s, "{vis}fn {n}__base_op(w: {w}) -> {w} {{ match {n}__opcode(w) {{");
@@ -579,8 +610,8 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     let mut first = true;
     for k in supers {
         let o = &l.ops[k];
-        let mut conds = vec![format!("i + {} <= code.len", l.size(k))];
-        for (off, p) in l.part_offsets(k) {
+        let mut conds = vec![format!("i + {} <= code.len", l.size_src(n, k))];
+        for (off, p) in l.part_offsets_src(n, k) {
             conds.push(format!("{n}__base_op(code[i + {off}]) == {}", l.ops[p].opcode));
         }
         let _ = writeln!(
@@ -594,6 +625,27 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     }
     let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n}}");
     s
+}
+
+/// A type as source text, for the generated code (which is parsed in the
+/// vm's module, so names resolve as in the declaration). Types the
+/// checker rejects as cache fields print as `u64`: the checker reports
+/// them first, with the declaration's span.
+fn type_src(t: &TypeExpr) -> String {
+    match &t.kind {
+        TypeKind::Named(path, args) => {
+            let p = path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".");
+            if args.is_empty() {
+                p
+            } else {
+                format!("{}<{}>", p, args.iter().map(type_src).collect::<Vec<_>>().join(", "))
+            }
+        }
+        TypeKind::Ptr(inner) => format!("*{}", type_src(inner)),
+        TypeKind::Option(inner) => format!("?{}", type_src(inner)),
+        TypeKind::Fn(..) => "*u8".to_string(),
+        _ => "u64".to_string(),
+    }
 }
 
 /// Is operand kind `kind` a jump label: `operand label = pc + it`?

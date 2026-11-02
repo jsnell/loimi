@@ -45,7 +45,7 @@ pub struct VmInfo {
     pub state: Vec<(String, Ty)>,
     pub pc_idx: usize,
     pub kinds: Vec<OperandKind>,
-    pub caches: Vec<(String, Vec<String>)>,
+    pub caches: Vec<CacheInfo>,
     pub ops: Vec<OpInfo>,
     pub ret: Ty,
     pub raise_ty: Option<Ty>,
@@ -53,6 +53,13 @@ pub struct VmInfo {
     /// `-> never` vm functions, which may end in control words.
     pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
+}
+
+/// An inline cache layout: per field its name, type and first word
+/// (counted from the cache's start).
+pub struct CacheInfo {
+    pub name: String,
+    pub fields: Vec<(String, Ty, u32)>,
 }
 
 /// A vm function returning `never`. Its body is checked again at each
@@ -179,7 +186,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
-    let l = crate::vmexpand::layout(&d)?;
+    let mut l = crate::vmexpand::layout(&d)?;
     let prefix = format!("{}.{}", c.module_prefix(m), d.name.name);
     let word = IntTy { signed: false, bits: l.word_bits as u8 };
 
@@ -211,17 +218,34 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     if state[pc_idx].1 != Ty::Ptr(Box::new(Ty::Int(word))) {
         return Err(Diag::new(d.name.span, format!("`pc` must have type `*u{}` (pointer to the code word)", word.bits)));
     }
+    // Each cache field starts a code word and takes as many as its type
+    // needs. GC references are not allowed: the collector does not scan
+    // bytecode (see language.md §7.1).
     let mut caches = Vec::new();
-    for cd in &d.caches {
+    let wb = l.word_bits as u64 / 8;
+    for (ci, cd) in d.caches.iter().enumerate() {
         let mut fields = Vec::new();
-        for (f, t, _weak) in &cd.fields {
-            let ft = c.resolve_type(m, t)?;
-            if ft != Ty::Int(word) {
-                return Err(Diag::new(t.span, format!("cache fields must have the code word type `u{}`", word.bits)));
+        let mut off = 0u32;
+        for (f, t, weak) in &cd.fields {
+            if *weak {
+                return Err(Diag::new(
+                    t.span,
+                    "`weak` cache fields are not supported: inline caches cannot hold GC references (see language.md §7.1)",
+                ));
             }
-            fields.push(f.name.clone());
+            if fields.iter().any(|(n, _, _): &(String, Ty, u32)| *n == f.name) {
+                return Err(Diag::new(f.span, format!("duplicate field `{}` in cache `{}`", f.name, cd.name.name)));
+            }
+            let ft = c.resolve_type(m, t)?;
+            if let Some(why) = bad_cache_type(&ft) {
+                return Err(Diag::new(t.span, format!("cache field `{}` has type `{}`: {}", f.name, c.ty_name(&ft), why)));
+            }
+            let words = crate::layout::size_of(&c.prog, &ft).max(1).div_ceil(wb) as u32;
+            fields.push((f.name.clone(), ft, off));
+            off += words;
         }
-        caches.push((cd.name.name.clone(), fields));
+        l.cache_words[ci] = off;
+        caches.push(CacheInfo { name: cd.name.name.clone(), fields });
     }
     let kinds: Vec<OperandKind> = d
         .operands
@@ -267,7 +291,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 ks.push(ki);
             }
             let cache = match &od.cache {
-                Some(cn) => Some(caches.iter().position(|(n, _)| *n == cn.name).unwrap()),
+                Some(cn) => Some(caches.iter().position(|ci: &CacheInfo| ci.name == cn.name).unwrap()),
                 None => None,
             };
             (
@@ -1043,6 +1067,18 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
     }
 }
 
+/// Why `t` cannot be an inline cache field, if it cannot.
+fn bad_cache_type(t: &Ty) -> Option<&'static str> {
+    match t {
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Ptr(_) | Ty::Fn(..) => None,
+        Ty::Option(inner) if matches!(**inner, Ty::Ptr(_) | Ty::Fn(..)) => None,
+        Ty::Gc(_) | Ty::Value(_) | Ty::Option(_) => Some(
+            "inline caches cannot hold GC references, since the collector does not scan bytecode; cache a pointer to a non-moving structure, an id or a version number, and validate it on use",
+        ),
+        _ => Some("cache fields must be integers, floats, `bool`, pointers or function pointers"),
+    }
+}
+
 pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<Option<TExpr>> {
     let Some(h) = cx.vm.clone() else { return Ok(None) };
     if let Some((_, kind, raw)) = h.operands.iter().find(|(n, _, _)| n == name) {
@@ -1091,10 +1127,10 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
         let Some(ci) = info.ops[op].cache else {
             return Err(Diag::new(base.span, format!("op `{}` has no inline cache", info.ops[op].name)));
         };
-        let Some(fi) = info.caches[ci].1.iter().position(|f| *f == name.name) else {
-            return Err(Diag::new(name.span, format!("no field `{}` in cache `{}`", name.name, info.caches[ci].0)));
+        let Some((_, ft, off)) = info.caches[ci].fields.iter().find(|f| f.0 == name.name) else {
+            return Err(Diag::new(name.span, format!("no field `{}` in cache `{}`", name.name, info.caches[ci].name)));
         };
-        return Ok(Some(mk(Ty::Int(info.word), TK::Vm(TVm::Word(1 + fi as u32)), span)));
+        return Ok(Some(mk(ft.clone(), TK::Vm(TVm::Word(1 + off)), span)));
     }
     Ok(None)
 }

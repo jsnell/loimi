@@ -847,7 +847,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
             TK::Assign(lhs, rhs) => {
                 let v = self.val(rhs);
                 let p = self.place(lhs);
-                self.store(&lhs.ty, &v, &p);
+                if matches!(lhs.kind, TK::Vm(TVm::Word(_))) && !lhs.ty.is_unitlike() {
+                    // A code word or inline cache field: only word-aligned.
+                    let t = self.ty(&lhs.ty);
+                    let a = crate::vmgen::word_align(self);
+                    self.emit(format!("store {} {}, ptr {}, align {}", t, v, p, a));
+                } else {
+                    self.store(&lhs.ty, &v, &p);
+                }
                 "zeroinitializer".into()
             }
             TK::Coalesce(a, b) => {

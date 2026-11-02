@@ -1,0 +1,10 @@
+struct Shape { id: u32 }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { shape: weak *Shape }
+    op NOP() : A + IC { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `weak` cache fields are not supported

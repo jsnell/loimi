@@ -2764,6 +2764,19 @@ impl<'a> Checker<'a> {
                     _ => None,
                 };
                 let v = self.expr(cx, inner, inner_exp.as_ref())?;
+                if let (TK::Vm(TVm::Word(_)), Some(h)) = (&v.kind, &cx.vm) {
+                    let wb = self.vms[h.vm as usize].word.bits as u64 / 8;
+                    if crate::layout::align_of(&self.prog, &v.ty) > wb {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "cannot take the address of a `{}` cache field: code words are only {}-byte aligned; read and assign the field instead",
+                                self.ty_name(&v.ty),
+                                wb
+                            ),
+                        ));
+                    }
+                }
                 let v = if is_place(&v) {
                     v
                 } else {
