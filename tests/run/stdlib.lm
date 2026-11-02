@@ -44,6 +44,22 @@ fn main() {
     buf.push('o');
     io.print_bool(it.intern(buf.as_str()) == a and a != c); io.println("");
     io.println(it.name(c));
+    // Enough strings to grow the table several times; ids stay put.
+    var ok = true;
+    for i in 0..1000 {
+        buf.clear();
+        buf.push_str("k");
+        buf.push_int(i as i64);
+        if it.intern(buf.as_str()) != (i + 2) as u32 { ok = false; }
+    }
+    for i in 0..1000 {
+        buf.clear();
+        buf.push_str("k");
+        buf.push_int(i as i64);
+        if it.find(buf.as_str()) != Some((i + 2) as u32) or !it.name((i + 2) as u32).eq(buf.as_str()) { ok = false; }
+    }
+    if it.find("nope").is_some() or it.intern("foo") != a or it.intern("") != 1002 or it.intern("") != 1002 { ok = false; }
+    io.print_bool(ok); io.println("");
 
     io.print_int(text.parse_int("-4567").unwrap()); io.println("");
     io.print_bool(text.parse_int("12a").is_none()); io.println("");
@@ -58,6 +74,7 @@ fn main() {
 // expect: x = -123, y = 0.1, z = 0.3333333333333333
 // expect: true
 // expect: bar
+// expect: true
 // expect: -4567
 // expect: true
 // expect: true

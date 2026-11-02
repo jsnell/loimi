@@ -29,6 +29,7 @@ extern "C" fn log(x: f64) -> f64;
 extern "C" fn pow(x: f64, y: f64) -> f64;
 extern "C" fn ceil(x: f64) -> f64;
 extern "C" fn trunc(x: f64) -> f64;
+extern "C" fn memchr(s: *u8, c: i32, n: u64) -> *u8;
 
 /// Call native `id`.
 pub fn call(c: *Ctx, id: u32, this: V, args: *V, n: u64) -> Result<V, V> {
@@ -598,10 +599,18 @@ fn str_char_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
 }
 
 fn find_from(h: str, needle: str, from: u64) -> i64 {
-    if needle.len > h.len { return -1; }
+    let n = needle.len;
+    if n > h.len or from > h.len - n { return -1; }
+    if n == 0 { return from as i64; }
+    // memchr for the first byte, then compare the rest.
+    let c0 = needle[0] as i32;
+    let last = h.len - n;
     var i = from;
-    while i + needle.len <= h.len {
-        if h[i..i + needle.len].eq(needle) { return i as i64; }
+    while i <= last {
+        let p = memchr(h.ptr + i, c0, last - i + 1);
+        if (p as u64) == 0 { return -1; }
+        i = (p as u64) - (h.ptr as u64);
+        if n == 1 or mem.memcmp(h.ptr + i + 1, needle.ptr + 1, n - 1) == 0 { return i as i64; }
         i += 1;
     }
     -1

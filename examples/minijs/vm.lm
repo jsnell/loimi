@@ -504,10 +504,11 @@ pub vm JS {
                 }
                 cold { become #fam; redo }
             }
-            // Ropes too: `this` stays a rope (natives flatten it), and a
-            // site that sees both does not thrash.
+            // A rope receiver is replaced by its flat string in its
+            // register (so a loop calling `s.charCodeAt(i)` on a rope
+            // flattens once) and the site stays.
             #sprotom {
-                if match obj { S(_) | R(_) => true, _ => false } {
+                if let S(_) = obj {
                     let p = ctx.str_proto();
                     if p.shape.id == cache.sid {
                         pre
@@ -515,6 +516,7 @@ pub vm JS {
                         next
                     }
                 }
+                if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
                 cold { become #fam; redo }
             }
             // Up to eight (shape, own slot or prototype hit) pairs.
