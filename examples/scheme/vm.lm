@@ -129,6 +129,16 @@ pub vm Scheme {
             next
         }
     }
+    /// Check that a global is bound (the inlined body of a top-level
+    /// procedure runs only once its definition has).
+    family CHKGLOBAL(unused: imm, g: gl) : ABx {
+        generic {
+            if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+            become CHKGLOBAL_B;
+            next
+        }
+        CHKGLOBAL_B { next }
+    }
     /// set! of a global: it must already be bound.
     op SETGLOBAL(src: reg, g: gl) : ABx {
         if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }

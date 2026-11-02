@@ -34,7 +34,7 @@ import vm.{Scheme};
 
 // ── AST ─────────────────────────────────────────────────────────────
 
-enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or }
+enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or, GChk }
 
 /// Ops for builtins compiled inline.
 enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
@@ -76,6 +76,7 @@ struct Lam {
 ///   Const v | Ref var | GRef g | Set var a | GSet g a | GDef g a
 ///   If a b c | Lambda lam | Seq list | Call a list | Prim po list
 ///   Let vars list(inits) a(body) | Letrec vars list a | And list | Or list
+///   GChk g (fails if global g is unbound; effect only)
 struct Node {
     kind: K,
     line: u32,
@@ -110,6 +111,11 @@ struct Comp {
     redefined: map.HashMap<u64, bool>,
     line: u32,
     gensyms: u32,
+    /// Top-level definitions per global slot: how many, and the lambda of
+    /// a procedure definition; and the globals that are set!.
+    gdefs: map.HashMap<u64, u32>,
+    glams: map.HashMap<u64, *Lam>,
+    gsets: map.HashMap<u64, bool>,
 }
 
 fn Comp.node(c: *Comp, kind: K) -> *Node {
@@ -406,6 +412,7 @@ fn Comp.special(c: *Comp, name: str, x: V) -> ?*Node {
         let n = c.node(K.GSet);
         n.g = c.ctx.global(s);
         n.a = val;
+        c.gsets.insert(n.g as u64, true);
         return Some(n);
     }
     if name.eq("if") {
@@ -1064,6 +1071,9 @@ fn Comp.top(c: *Comp, x: V, out: *mem.Vec<*Node>) {
         let n = c.node(K.GDef);
         n.g = c.ctx.global(s);
         n.a = c.def_value(s, x, val, is_proc);
+        let k = n.g as u64;
+        c.gdefs.insert(k, (c.gdefs.get(k) ?? 0) + 1);
+        if n.a.kind == K.Lambda { c.glams.insert(k, n.a.lam); }
         out.push(n);
     } else {
         out.push(c.build(x));
@@ -1085,6 +1095,178 @@ fn Comp.scan_defs(c: *Comp, x: V) {
         c.scan_defs(p.car);
         cur = p.cdr;
     }
+}
+
+
+// ── inlining ────────────────────────────────────────────────────────
+//
+// A call of a small known procedure is replaced by its body, with the
+// parameters bound by a `let` (or replaced by the argument, when that is a
+// constant or an unassigned local). Known procedures are top-level
+// `(define (f ...) ...)`s that are the only definition of `f` and are
+// never set!, and unassigned letrec-bound lambdas. Bodies with lambdas
+// (or letrecs) in them and recursive bodies are not inlined. A call that
+// runs before the top-level definition would have failed with "unbound
+// variable" (or would have called a builtin of the same name) runs the
+// procedure instead; R7RS makes both an error.
+
+const INLINE_SIZE: u32 = 12;
+const INLINE_DEPTH: u32 = 3;
+const TOO_BIG: u32 = 1000000;
+
+/// The size of `n` in nodes, or TOO_BIG if it cannot be inlined (it has
+/// lambdas or refers to `self_g` / `self_v`).
+fn inline_size(n: *Node, self_g: u64, self_v: *Var) -> u32 {
+    if is_null(n) { return 0; }
+    match n.kind {
+        Lambda | Letrec => return TOO_BIG,
+        GRef => { if n.g as u64 == self_g { return TOO_BIG; } }
+        Ref | Set => { if (n.vr as u64) == (self_v as u64) { return TOO_BIG; } }
+        _ => {}
+    }
+    var size: u32 = 1;
+    size += inline_size(n.a, self_g, self_v);
+    size += inline_size(n.b, self_g, self_v);
+    size += inline_size(n.c, self_g, self_v);
+    for i in 0..n.list.len {
+        size += inline_size(n.list.at(i), self_g, self_v);
+        if size >= TOO_BIG { return TOO_BIG; }
+    }
+    if size >= TOO_BIG { TOO_BIG } else { size }
+}
+
+/// Variable substitution while copying: `from` → a node to clone.
+struct Subst { from: mem.Vec<*Var>, to: mem.Vec<*Node> }
+
+fn Subst.find(s: *Subst, v: *Var) -> ?*Node {
+    for i in 0..s.from.len {
+        if (s.from.at(i) as u64) == (v as u64) { return Some(s.to.at(i)); }
+    }
+    None
+}
+
+fn clone_node(n: *Node) -> *Node {
+    let m: *Node = mem.alloc(1);
+    *m = *n;
+    m.list = mem.Vec.new();
+    m.vars = mem.Vec.new();
+    m
+}
+
+fn Comp.fresh_var(c: *Comp, v: *Var) -> *Var {
+    let w = c.new_var(v.name);
+    w.assigned = v.assigned;
+    w
+}
+
+/// A copy of `n` with fresh variables for its binders.
+fn Comp.copy(c: *Comp, n: *Node, s: *Subst) -> *Node {
+    if is_null(n) { return n; }
+    if n.kind == K.Ref {
+        if let Some(t) = s.find(n.vr) {
+            let m = clone_node(t);
+            m.line = n.line;
+            return m;
+        }
+        return clone_node(n);
+    }
+    let m = clone_node(n);
+    if n.kind == K.Set and let Some(t) = s.find(n.vr) { m.vr = t.vr; }
+    if n.kind == K.Let {
+        for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
+        for i in 0..n.vars.len {
+            let w = c.fresh_var(n.vars.at(i));
+            let r = c.node(K.Ref);
+            r.vr = w;
+            s.from.push(n.vars.at(i));
+            s.to.push(r);
+            m.vars.push(w);
+        }
+        m.a = c.copy(n.a, s);
+        return m;
+    }
+    m.a = c.copy(n.a, s);
+    m.b = c.copy(n.b, s);
+    m.c = c.copy(n.c, s);
+    for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
+    m
+}
+
+/// The known procedure called by `f`, if any, with what it may not refer
+/// to (itself).
+fn Comp.known(c: *Comp, f: *Node) -> ?(*Lam, u64, *Var) {
+    if f.kind == K.GRef {
+        let g = f.g as u64;
+        if (c.gdefs.get(g) ?? 0) != 1 or c.gsets.contains(g) { return None; }
+        // Before its definition runs, a global named like a builtin is the builtin.
+        if value.prim_of(c.ctx.gvals.at(g)).is_some() { return None; }
+        let Some(l) = c.glams.get(g) else { return None; };
+        return Some((l, g, 0 as *Var));
+    }
+    if f.kind == K.Ref {
+        let v = f.vr;
+        if is_null_lam(v.lam) or v.assigned or v.force_box { return None; }
+        return Some((v.lam, 0xFFFFFFFFFFFFFFFF, v));
+    }
+    None
+}
+
+/// Inline the small known procedures called in `n`; returns the new node.
+fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
+    if is_null(n) { return n; }
+    if n.kind == K.Lambda {
+        n.lam.body = c.inl(n.lam.body, depth);
+        return n;
+    }
+    n.a = c.inl(n.a, depth);
+    n.b = c.inl(n.b, depth);
+    n.c = c.inl(n.c, depth);
+    for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
+    if n.kind != K.Call or depth >= INLINE_DEPTH { return n; }
+    let Some((l, g, self_v)) = c.known(n.a) else { return n; };
+    if l.rest or l.nparams as u64 != n.list.len { return n; }
+    if inline_size(l.body, g, self_v) > INLINE_SIZE { return n; }
+    // (let ((p arg) ...) body), substituting constants and unassigned
+    // locals for unassigned parameters.
+    var s = Subst { from: mem.Vec.new(), to: mem.Vec.new() };
+    let lt = c.node(K.Let);
+    lt.line = n.line;
+    for i in 0..n.list.len {
+        let p = l.params.at(i);
+        let a = n.list.at(i);
+        if !p.assigned and (a.kind == K.Const or (a.kind == K.Ref and !a.vr.assigned)) {
+            s.from.push(p);
+            s.to.push(a);
+            continue;
+        }
+        let w = c.fresh_var(p);
+        let r = c.node(K.Ref);
+        r.vr = w;
+        s.from.push(p);
+        s.to.push(r);
+        lt.vars.push(w);
+        lt.list.push(a);
+    }
+    let body = c.copy(l.body, &s);
+    s.from.free();
+    s.to.free();
+    var out = body;
+    if lt.vars.len > 0 {
+        lt.a = body;
+        out = lt;
+    }
+    if n.a.kind == K.GRef {
+        // (begin <check that f is bound> body)
+        let chk = c.node(K.GChk);
+        chk.line = n.line;
+        chk.g = n.a.g;
+        let sq = c.node(K.Seq);
+        sq.line = n.line;
+        sq.list.push(chk);
+        sq.list.push(out);
+        out = sq;
+    }
+    c.inl(out, depth + 1)
 }
 
 // ── contification ───────────────────────────────────────────────────
@@ -1110,7 +1292,7 @@ fn in_free(l: *Lam, v: *Var) -> bool {
 fn tail_refs_only(n: *Node, v: *Var, tail: bool, nargs: u64) -> bool {
     if is_null(n) { return true; }
     match n.kind {
-        Const | GRef => true,
+        Const | GRef | GChk => true,
         Ref => (n.vr as u64) != (v as u64),
         Set => (n.vr as u64) != (v as u64) and tail_refs_only(n.a, v, false, nargs),
         GSet | GDef => tail_refs_only(n.a, v, false, nargs),
@@ -1214,12 +1396,23 @@ fn bind_here(v: *Var, real: *Lam) {
     v.captured = false;
 }
 
+/// A reference to `v` from `real`: `v` is free in every lambda from
+/// `real` out to its owner.
+fn note_ref(v: *Var, real: *Lam) {
+    var l = real;
+    while (l as u64) != (v.owner as u64) {
+        v.captured = true;
+        if !in_free(l, v) { l.free.push(v); }
+        l = l.parent;
+    }
+}
+
 fn reown(n: *Node, real: *Lam) {
     if is_null(n) { return; }
     match n.kind {
-        Ref => { if (n.vr.owner as u64) != (real as u64) { n.vr.captured = true; } }
+        Ref => note_ref(n.vr, real),
         Set => {
-            if (n.vr.owner as u64) != (real as u64) { n.vr.captured = true; }
+            note_ref(n.vr, real);
             reown(n.a, real);
         }
         Lambda => reown_lambda(n.lam, real),
@@ -1249,6 +1442,7 @@ fn reown_lambda(l: *Lam, real: *Lam) {
         return;
     }
     l.parent = real;
+    l.free.truncate(0);
     for i in 0..l.params.len { bind_here(l.params.at(i), l); }
     reown(l.body, l);
 }
@@ -1369,7 +1563,7 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
             }
         }
         GRef => { g.emit(Scheme.GETGLOBAL(d, n.g as u16)); }
-        Set | GSet | GDef => {
+        Set | GSet | GDef | GChk => {
             g.effect(n);
             g.load_const(value.unspec(), dst);
         }
@@ -1424,6 +1618,7 @@ fn Gen.effect(g: *Gen, n: *Node) {
     let save = g.top();
     match n.kind {
         Const | Ref | GRef | Lambda => {}
+        GChk => { g.emit(Scheme.CHKGLOBAL(0, n.g as u16)); }
         Set => {
             let v = n.vr;
             let r = g.any(n.a);
@@ -2037,6 +2232,9 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         redefined: map.HashMap.new(),
         line: 0,
         gensyms: 0,
+        gdefs: map.HashMap.new(),
+        glams: map.HashMap.new(),
+        gsets: map.HashMap.new(),
     };
     var pre: mem.Vec<V> = mem.Vec.new();
     read_all(&c, prelude, false, &pre);
@@ -2048,6 +2246,8 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
     for i in 0..pre.len { c.top(pre.at(i), &nodes); }
     for i in 0..prog.len { c.scan_defs(prog.at(i)); }
     for i in 0..prog.len { c.top(prog.at(i), &nodes); }
+    for i in 0..nodes.len { nodes.set(i, c.inl(nodes.at(i), 0)); }
+    for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { contify(nodes.at(i)); }
     for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { g.effect(nodes.at(i)); }
