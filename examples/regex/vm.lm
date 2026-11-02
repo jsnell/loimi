@@ -60,6 +60,10 @@ pub struct Regex {
     /// Steps of the Pike VM, scratch.
     pike: ?*u8,
 
+    /// Instructions left, with a step limit (0: no limit).
+    steps: i64,
+    step_limit: i64,
+
     // ---- Errors ----
     ok: bool,
     err: text.StrBuf,
@@ -272,6 +276,27 @@ pub vm Rx {
     super SPLIT_LIT = SPLIT; LIT;
 
     entry exec(r: *Regex, code: Verified<Rx>, input: *u8, n: u64, at: u64) -> Result<bool, str> {
+        ctx = r;
+        inp = input;
+        end = n;
+        sp = at;
+        bt = r.bt_base;
+        jump code
+    }
+
+    // A second dispatch table that counts instructions, for a match with
+    // a step limit (rx_set_step_limit) and for the bytecode fuzzer, whose
+    // mutated programs may loop. Matches without a limit run the plain
+    // handlers and pay nothing for it.
+    variant budget wraps all {
+        before {
+            ctx.steps -= 1;
+            if ctx.steps < 0 { cold { fail "step limit exceeded" } }
+        }
+    }
+
+    entry exec_budget(r: *Regex, code: Verified<Rx>, input: *u8, n: u64, at: u64) -> Result<bool, str> {
+        use_variant budget;
         ctx = r;
         inp = input;
         end = n;

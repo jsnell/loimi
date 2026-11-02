@@ -39,6 +39,8 @@ fn empty_regex() -> Regex {
         start: 0,
         searching: false,
         pike: None,
+        steps: 0,
+        step_limit: 0,
         ok: false,
         err: text.StrBuf.new(),
         err_at: -1,
@@ -173,7 +175,7 @@ export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spa
         let p = match r.pike {
             Some(p) => p as *Pike,
             None => {
-                let p = Pike.new(r.pike_words.len, nslots + r.lim.nmarks as u64);
+                let p = Pike.new(r.pike_code.len(), nslots + r.lim.nmarks as u64);
                 r.pike = Some(p as *u8);
                 p
             }
@@ -188,7 +190,14 @@ export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spa
         for i in 0..r.lim.nmarks as u64 { r.marks[i] = -1; }
         r.start = at;
         r.searching = searching;
-        match Rx.exec(r, r.code, buf, len, at) {
+        var res: Result<bool, str> = Ok(false);
+        if r.step_limit > 0 {
+            r.steps = r.step_limit;
+            res = Rx.exec_budget(r, r.code, buf, len, at);
+        } else {
+            res = Rx.exec(r, r.code, buf, len, at);
+        }
+        match res {
             Ok(m) => found = m,
             Err(msg) => { set_error(r, msg, -1); r.ok = true; return -1; }
         }
@@ -207,6 +216,13 @@ fn skip(r: *Regex, input: *u8, s: u64, end: u64) -> u64 {
     while i < end and !r.first.has(input[i]) { i += 1; }
     i
 }
+
+/// Limit the backtracker to `n` instructions per rx_exec call (0: no
+/// limit, the default). Past it, rx_exec returns -1 and rx_error says
+/// "step limit exceeded". A limit costs about one decrement per
+/// instruction; no limit costs nothing (the counting handlers are a
+/// separate dispatch table).
+export "C" fn rx_set_step_limit(r: *Regex, n: i64) { r.step_limit = n; }
 
 /// Disassembly of the backtracker's program (RX_PIKE in `flags`: the
 /// Pike VM's). Valid until the next call on `r`.

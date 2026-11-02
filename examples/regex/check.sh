@@ -1,6 +1,8 @@
 #!/bin/sh
-# Build the regex library and its C host, then check both engines against
-# Python's `re` on the hand-written cases and on random cases.
+# Build the regex library and its C host, then: the demo, the bytecode
+# fuzzer, the verifier test, random byte patterns (both engines must
+# agree), and both engines against Python's `re` on the hand-written
+# cases and on random cases.
 #
 #   examples/regex/check.sh [--random N] [--seed S] [--asan]
 set -e
@@ -38,6 +40,15 @@ fi
 "$host" demo > "$out/demo.out"
 diff -u "$here/tests/demo.expected" "$out/demo.out"
 
+# The bytecode fuzzer (mutated programs through the verifier) is an
+# executable, so it can use --sanitize=address directly.
+if [ -n "$asan" ]; then
+    "$loimi" build "$here/fuzz.lm" --sanitize=address -o "$out/rxfuzz_asan"
+    timeout 300 "$out/rxfuzz_asan" 20000 "$seed"
+else
+    "$loimi" build "$here/fuzz.lm" --release -o "$out/rxfuzz"
+    timeout 300 "$out/rxfuzz" 20000 "$seed"
+fi
 "$loimi" run "$here/verify_test.lm" > "$out/verify.out"
 diff -u "$here/tests/verify.expected" "$out/verify.out"
 

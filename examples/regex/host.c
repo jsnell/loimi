@@ -77,6 +77,21 @@ static int demo(void) {
         free(big);
     }
 
+    /* A step limit stops catastrophic backtracking. */
+    {
+        const char *p = "(a|aa)+$", *s = "aaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+        re = rx_compile((void *)p, strlen(p));
+        rx_set_step_limit(re, 100000);
+        int64_t sp[2];
+        int rc = rx_exec(re, (void *)s, strlen(s), 0, RX_SEARCH, sp, 1);
+        loimi_str e = rx_error(re);
+        printf("%s with a step limit: rc=%d error='%.*s'\n", p, rc, (int)e.len, e.ptr);
+        rx_set_step_limit(re, 0);
+        rc = rx_exec(re, (void *)s, strlen(s), 0, RX_SEARCH, sp, 1);
+        printf("%s without: rc=%d\n", p, rc);
+        rx_free(re);
+    }
+
     const char *bad[] = { "a(b", "*a", "[z-a]", "a{3,2}", "\\q" };
     for (int i = 0; i < 5; i++) {
         re = rx_compile((void *)bad[i], strlen(bad[i]));
@@ -279,6 +294,7 @@ static int bench(int argc, char **argv) {
         const char *t = B->text == 1 ? path : B->text == 2 ? path2 : text;
         size_t tn = strlen(t);
         Regex *re = rx_compile((void *)B->pat, strlen(B->pat));
+        if (getenv("RX_STEP_LIMIT")) rx_set_step_limit(re, atoll(getenv("RX_STEP_LIMIT")));
         double best[2] = { 1e9, 1e9 };
         long cnt[2] = { 0, 0 };
         for (int e = 0; e < 2; e++) {
