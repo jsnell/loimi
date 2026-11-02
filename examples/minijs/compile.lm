@@ -201,6 +201,9 @@ fn Res.stmt(r: *Res, n: *Node) {
                 let d = n.list.at(i);
                 if (d.vr as u64) == 0 { d.vr = r.declare(d.text, VK.Let, d.flag); }
                 r.expr(d.a);
+                if n.op == T.Const and d.vr.kind == VK.Global and is_literal(d.a) {
+                    if is_null(d.vr.cval) { d.vr.cval = d.a; } else { d.vr.assigned = true; }
+                }
             }
         }
         ExprStmt => r.expr(n.a),
@@ -267,6 +270,20 @@ fn Res.stmt(r: *Res, n: *Node) {
         ClassDecl => r.class(n.cls),
         _ => fail(n.line, "unexpected statement"),
     }
+}
+
+fn is_literal(n: *Node) -> bool {
+    if is_null(n) { return false; }
+    match n.kind {
+        Num | Str | True | False | Null => true,
+        _ => false,
+    }
+}
+
+/// The literal a global constant always holds, if it is one.
+fn const_global(v: *Var) -> *Node {
+    if v.kind == VK.Global and !v.assigned and !v.undeclared { return v.cval; }
+    null_node()
 }
 
 fn Res.class(r: *Res, c: *Class) {
@@ -500,6 +517,8 @@ fn Gen.var_reg(g: *Gen, v: *Var) -> ?u32 {
 
 fn Gen.load_var(g: *Gen, v: *Var, dst: u32) {
     if v.kind == VK.Global {
+        let c = const_global(v);
+        if !is_null(c) { g.to(c, dst); return; }
         if v.undeclared {
             let k = g.str_const(v.name);
             g.emit(JS.THROWREF(0, k as u16));
@@ -620,6 +639,10 @@ fn Gen.const_value(g: *Gen, n: *Node) -> ?V {
         False => Some(V.Bool(false)),
         Num => Some(value.number(n.num)),
         Str => Some(V.S(g.ctx.key_str(g.ctx.key(n.text)))),
+        Name => {
+            let c = const_global(n.vr);
+            if is_null(c) { None } else { g.const_value(c) }
+        }
         _ => None,
     }
 }
@@ -922,7 +945,7 @@ fn Gen.update(g: *Gen, n: *Node, dst: u32, want: bool) {
         let old = g.temp();
         let nw = g.temp();
         g.load_var(t.vr, old);
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.store_var(t.vr, nw);
         if want { g.mov(dst, if prefix { nw } else { old }); }
@@ -934,13 +957,13 @@ fn Gen.update(g: *Gen, n: *Node, dst: u32, want: bool) {
     let nw = g.temp();
     if t.kind == K.Member {
         g.get_prop(old, o, t.text);
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.set_prop(o, t.text, nw);
     } else {
         let k = g.any(t.b);
         g.emit(JS.GETINDEX(old as u8, o as u8, k as u8));
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.emit(JS.SETINDEX(o as u8, k as u8, nw as u8));
     }
@@ -1610,8 +1633,18 @@ fn Gen.switch_stmt(g: *Gen, n: *Node) {
         labels.push(cl);
         if c.flag == 1 { default_label = Some(cl); continue; }
         let m = g.mark();
-        let t = g.any(c.a);
-        g.emit(JS.JEQ(1, d as u8, t as u8));
+        var done = false;
+        if let Some(kv) = g.const_value(c.a) {
+            let k = g.konst(kv);
+            if k < 256 {
+                g.emit(JS.JEQK(1, d as u8, k as u8));
+                done = true;
+            }
+        }
+        if !done {
+            let t = g.any(c.a);
+            g.emit(JS.JEQ(1, d as u8, t as u8));
+        }
         g.jump(cl);
         g.reset(m);
     }

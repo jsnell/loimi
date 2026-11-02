@@ -504,8 +504,10 @@ pub vm JS {
                 }
                 cold { become #fam; redo }
             }
+            // Ropes too: `this` stays a rope (natives flatten it), and a
+            // site that sees both does not thrash.
             #sprotom {
-                if let S(_) = obj {
+                if match obj { S(_) | R(_) => true, _ => false } {
                     let p = ctx.str_proto();
                     if p.shape.id == cache.sid {
                         pre
