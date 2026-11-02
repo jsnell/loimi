@@ -898,6 +898,9 @@ fn count_op(g: &mut FnGen, k: u32) {
     let pc1 = g.inst(format!("add i64 {}, 1", pc));
     g.emit(format!("store i64 {}, ptr {}", pc1, pp));
     g.emit(format!("store i64 {}, ptr @\"{}.stats.last\"", k, sym));
+    // Longer sequences: in the runtime (`stats_rt.c`).
+    let adj = g.inst(format!("zext i1 {} to i64", adjacent));
+    g.emit(format!("call void @loimi_stats_seq(ptr @\"{}.stats.seq\", i64 {}, i64 {})", sym, adj, k));
 }
 
 /// `--vm-stats`: counters, and a report printed at exit (op counts, and
@@ -916,6 +919,8 @@ pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
         // `last` starts at the sentinel row n (no previous op).
         let _ = writeln!(cg.globals, "@\"{}.stats.last\" = internal global i64 {}", sym, n);
         let _ = writeln!(cg.globals, "@\"{}.stats.next\" = internal global ptr null", sym);
+        // `loimi_seq` (stats_rt.c): window, length, table, entries used.
+        let _ = writeln!(cg.globals, "@\"{}.stats.seq\" = internal global [6 x i64] zeroinitializer", sym);
         let mut names = Vec::new();
         for o in &vd.ops {
             let s = cg.string_const(format!("{}\0", o.name).as_bytes());
@@ -1005,6 +1010,7 @@ pnext:
   %pdone = icmp eq i64 %pi1, {nn}
   br i1 %pdone, label %done, label %ploop
 done:
+  call void @loimi_stats_seq_report(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1)
   ret void
 }}
 "#,
@@ -1016,6 +1022,8 @@ done:
         let _ = writeln!(cg.globals, "@llvm.global_dtors = appending global [{} x {{ i32, ptr, ptr }}] [{}]", dtors.len(), dtors.join(", "));
         let _ = writeln!(cg.globals, "@stderr = external global ptr");
         cg.decls.insert("declare i32 @fprintf(ptr, ptr, ...)");
+        cg.decls.insert("declare void @loimi_stats_seq(ptr, i64, i64)");
+        cg.decls.insert("declare void @loimi_stats_seq_report(ptr, ptr, ptr, i64)");
     }
 }
 

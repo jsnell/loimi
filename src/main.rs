@@ -476,6 +476,17 @@ fn compiler_main() -> ExitCode {
         },
         None => None,
     };
+    // `--vm-stats`: the runtime for sequences longer than pairs.
+    let stats_rt = if opts.vm_stats {
+        let p = tmpdir.join("loimi_stats_rt.c");
+        if let Err(e) = std::fs::write(&p, include_str!("stats_rt.c")) {
+            eprintln!("error: cannot write {}: {}", p.display(), e);
+            return ExitCode::from(1);
+        }
+        Some(p)
+    } else {
+        None
+    };
     let ll = tmpdir.join(format!("{}.ll", stem));
     if let Err(e) = std::fs::write(&ll, &ir) {
         eprintln!("error: cannot write {}: {}", ll.display(), e);
@@ -535,6 +546,9 @@ fn compiler_main() -> ExitCode {
     }
     cmd.arg("-x").arg("ir").arg(&ll);
     if let Some(rt) = &jit_rt {
+        cmd.arg("-x").arg("c").arg(rt);
+    }
+    if let Some(rt) = &stats_rt {
         cmd.arg("-x").arg("c").arg(rt);
     }
     if let Some(lib) = &asan_lib {

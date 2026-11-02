@@ -1504,18 +1504,24 @@ it can run again on code that has been optimized and quickened. The
 generated verifier treats every part's word as an instruction: jumps may
 land on it, and it must hold an op of the same family as the super's part.
 
-**The matching rule.** `optimize` walks the code left to right. At each
-instruction it fuses the longest declared super that starts there, if
-any, and moves on to the next word, which is the super's second part.
-It does not look ahead: with `super GETGLOBAL_SUBK = GETGLOBAL; SUBK;`
-and `super SUBK_CALL = SUBK; CALL;`, the sequence `GETGLOBAL; SUBK; CALL`
-becomes `GETGLOBAL_SUBK` followed by the plain `CALL`, since the `SUBK`
-belongs to the first super. (The `SUBK` word does become a `SUBK_CALL`
-head, but it only runs if something jumps to it.) Declared supers where
-a proper suffix of one is a proper prefix of another get a warning,
-`super_overlap`, at the later declared one; declare the longer super if
-the whole sequence is hot, drop one of the two, or silence it with
-`#[allow(super_overlap)]` on that super or on the vm.
+**The matching rule.** `optimize` reads the code as a straight line and
+picks, by dynamic programming, the fusions that save the most
+dispatches (a super of n parts saves n - 1 each time it runs); every
+instruction where a super starts gets the one that is best from there
+on. On a tie it takes the longest match, and a fusion over none, which
+is what a greedy left-to-right pass would do: with only pairs, and
+wherever a long super does not block a better pair of fusions, the
+result is the same. Two supers can still not both run where they
+overlap: with `super GETGLOBAL_SUBK = GETGLOBAL; SUBK;` and `super
+SUBK_CALL = SUBK; CALL;`, the sequence `GETGLOBAL; SUBK; CALL` becomes
+`GETGLOBAL_SUBK` followed by the plain `CALL` (a tie, so the leftmost).
+(The `SUBK` word does become a `SUBK_CALL` head, but it only runs if
+something jumps to it.) With `A_B` and `B_C_D`, `A; B; C; D` becomes
+`A; B_C_D`. Declared supers where a proper suffix of one is a proper
+prefix of another get a warning, `super_overlap`, at the later declared
+one; declare the longer super if the whole sequence is hot, drop one of
+the two, or silence it with `#[allow(super_overlap)]` on that super or
+on the vm.
 
 **Supers of quickened members.** `optimize` usually runs on freshly
 emitted code, where every family is at its `generic` member, so a super
@@ -1546,8 +1552,13 @@ when the new super has it. There is no run-time test; the cost is
 opcodes (up to 7 per super) and code size.
 
 `loimi build --vm-stats` records opcode pair frequencies, and at exit
-prints the most frequent pairs as ranked `super` declarations. (The
-design's separate `loimi vm suggest-supers` command does not exist.)
+prints the most frequent pairs as ranked `super` declarations. It also
+counts sequences of 3 and 4 adjacent ops, and suggests those that run at
+least 1% of the time and are *dominant* (at least half the runs of their
+shorter prefix and suffix continue into them), so that a longer super
+saves more than pairs over the same ops could; they are ranked by
+dispatches saved, skipping any that overlaps a better one. (The design's
+separate `loimi vm suggest-supers` command does not exist.)
 
 ---
 

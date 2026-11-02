@@ -224,8 +224,10 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
 
 /// Lint `super_overlap`: two supers where a proper suffix of one is a
 /// proper prefix of the other (`GETGLOBAL; SUBK` and `SUBK; CALL`).
-/// `Vm.optimize` fuses left to right, so in `GETGLOBAL; SUBK; CALL` the
-/// first super takes the shared `SUBK` and the second never runs there.
+/// `Vm.optimize` can fuse only one of them there: the one that saves
+/// more dispatches, the leftmost on a tie (so in `GETGLOBAL; SUBK; CALL`
+/// the first super takes the shared `SUBK` and the second never runs
+/// there).
 /// One warning per super, at the later declared of each pair, naming the
 /// earlier ones it overlaps.
 fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayout) {
@@ -252,11 +254,13 @@ fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayou
             }
         }
         let Some((x, y, seq, a)) = example else { continue };
+        // `optimize` keeps the one that saves more (the leftmost on a tie).
+        let (x, y) = if l.ops[y].parts.len() > l.ops[x].parts.len() { (y, x) } else { (x, y) };
         let mut w = Diag::warning(
             "super_overlap",
             sb,
             format!(
-                "superinstruction `{}` overlaps {}: in `{}`, `optimize` fuses `{}` and `{}` cannot run there (the first super that matches, left to right, wins)",
+                "superinstruction `{}` overlaps {}: in `{}`, `optimize` fuses `{}` and `{}` cannot run there (`optimize` keeps the super that saves more dispatches, the leftmost on a tie)",
                 l.ops[b].name,
                 partners.join(", "),
                 names(&seq),

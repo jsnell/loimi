@@ -1096,36 +1096,82 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     // sequence. The other words keep their opcodes, so jumps into the
     // middle of a fused sequence still execute the original ops. Words
     // are compared by the op they stand for alone, so code can be
-    // optimized again (after quickening, say); the longest match wins.
+    // optimized again (after quickening, say).
+    //
+    // Which super each word gets is chosen by dynamic programming over
+    // the code, as a straight line: `__best[i]` is the most dispatches
+    // fusion can save from word i on, and each word gets the super (or
+    // none) that achieves it. Every super saves its length minus one. On
+    // a tie the choice is the greedy one (the longest match first, a
+    // match over none), so with only pairs (and wherever no longer super
+    // loses to a shorter one) this fuses exactly what a greedy
+    // left-to-right pass does; where a long super would block a better
+    // pair of fusions (`A_B` and `B_C_D` on `A B C D`), it takes the
+    // better ones. Each word gets its own best choice, also inside a
+    // fused sequence (for jumps there). A word where fusing loses gets the
+    // op it stands for alone (it may be the head of an earlier fusion).
     let _ = writeln!(s, "{vis}fn {n}__optimize_words(code: []{w}) {{");
     if jit {
         // The JIT's enter words go back first; afterwards it re-patches
         // the code of the instructions whose words changed.
         let _ = writeln!(s, "  loimi_jit_invalidate(code.ptr as *u8);");
     }
-    let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
     let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
     // Longest first; a super's forwarding variants before it, those with
     // more links first.
     supers.sort_by_key(|&k| (std::cmp::Reverse(l.ops[k].parts.len()), std::cmp::Reverse(l.ops[k].fwd.len())));
-    let mut first = true;
-    for k in supers {
-        let o = &l.ops[k];
-        let mut conds = vec![format!("i + {} <= code.len", l.size_src(n, k))];
-        for (off, p) in l.part_offsets_src(n, k) {
-            conds.push(format!("{n}__base_op(code[i + {off}]) == {}", l.ops[p].opcode));
-        }
-        conds.extend(l.fwd_conds(n, k, "code[i + {}]"));
+    if !supers.is_empty() {
         let _ = writeln!(
             s,
-            "    {}if {} {{ code[i] = {n}__with_opcode(code[i], {}); }}",
-            if first { "" } else { "else " },
-            conds.join(" and "),
-            o.opcode
+            "  let __n = code.len;\n\
+             \x20 let __best = __extern_calloc(__n + 1, 8) as *u64;\n\
+             \x20 let __pick = __extern_calloc(__n + 1, 8) as *u64;\n\
+             \x20 let __pos = __extern_calloc(__n + 1, 8) as *u64;\n\
+             \x20 var __m: u64 = 0;\n\
+             \x20 var i: u64 = 0;\n\
+             \x20 while i < __n {{ __pos[__m] = i; __m += 1; i += {n}__base_size(code[i]); }}\n\
+             \x20 var __j = __m;\n\
+             \x20 while __j > 0 {{\n\
+             \x20   __j -= 1;\n\
+             \x20   i = __pos[__j];\n\
+             \x20   let __nx = i + {n}__base_size(code[i]);\n\
+             \x20   var __b: u64 = if __nx <= __n {{ __best[__nx] }} else {{ 0 }};\n\
+             \x20   var __p: u64 = 0;\n\
+             \x20   var __got = false;"
         );
-        first = false;
+        for k in supers {
+            let o = &l.ops[k];
+            let size = l.size_src(n, k);
+            let mut conds = vec![format!("i + {size} <= __n")];
+            for (off, p) in l.part_offsets_src(n, k) {
+                conds.push(format!("{n}__base_op(code[i + {off}]) == {}", l.ops[p].opcode));
+            }
+            conds.extend(l.fwd_conds(n, k, "code[i + {}]"));
+            let _ = writeln!(
+                s,
+                "    if {} {{ let __v = {} + __best[i + {size}]; if __v > __b or (!__got and __v == __b) {{ __b = __v; __p = {} + 1; }} __got = true; }}",
+                conds.join(" and "),
+                o.parts.len() - 1,
+                o.opcode
+            );
+        }
+        let _ = writeln!(
+            s,
+            "    if __p == 0 and __got {{ __p = {n}__base_op(code[i]) as u64 + 1; }}\n\
+             \x20   __best[i] = __b;\n\
+             \x20   __pick[i] = __p;\n\
+             \x20 }}\n\
+             \x20 __j = 0;\n\
+             \x20 while __j < __m {{\n\
+             \x20   i = __pos[__j];\n\
+             \x20   if __pick[i] != 0 {{ code[i] = {n}__with_opcode(code[i], (__pick[i] - 1) as {w}); }}\n\
+             \x20   __j += 1;\n\
+             \x20 }}\n\
+             \x20 __extern_free(__best as *u8);\n\
+             \x20 __extern_free(__pick as *u8);\n\
+             \x20 __extern_free(__pos as *u8);"
+        );
     }
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");
     if jit {
         let _ = writeln!(s, "  loimi_jit_rewritten(code.ptr as *u8);");
     }
@@ -1552,7 +1598,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 if has_stack(v) {
                     src.push_str(&generate_stack(sm, v, &l, jit)?);
                 }
-                if (has_stack(v) || !v.checks.is_empty()) && !externs {
+                if (has_stack(v) || !v.checks.is_empty() || !v.supers.is_empty()) && !externs {
                     // The verifier's scratch arrays (see check::declare_fn).
                     src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
                     externs = true;
