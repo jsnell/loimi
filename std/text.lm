@@ -165,3 +165,10 @@ fn Interner.grow(it: *Interner) {
 }
 
 pub fn Interner.name(it: *Interner, id: u32) -> str { it.names.at(id as u64) }
+
+/// Release the table, the name list and the interned bytes.
+pub fn Interner.free(it: *Interner) {
+    mem.release(it.slots);
+    it.names.free();
+    it.arena.free();
+}

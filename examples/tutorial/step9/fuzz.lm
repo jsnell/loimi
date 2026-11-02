@@ -154,10 +154,7 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st:
     m.err.free();
     m.tmp.free();
     arena.free();
-    // (text.Interner has no free of its own.)
-    names.ids.free();
-    names.names.free();
-    names.arena.free();
+    names.free();
 }
 
 fn main() -> i32 {
