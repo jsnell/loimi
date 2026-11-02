@@ -1289,8 +1289,10 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
 /// it. Storing the variable in `sync` (`ctx.tos = tos`), where a root
 /// scanner marks it, is the fix.
 fn warn_unsynced_roots(c: &mut Checker, d: &VmDecl, i: usize, site: Span) {
-    for (k, p) in d.state.iter().enumerate() {
-        let ty = c.vms[i].state[k].1.clone();
+    for p in &d.state {
+        // By name: the checked state list starts with the context, if any.
+        let Some((_, ty)) = c.vms[i].state.iter().find(|(n, _)| *n == p.name.name) else { continue };
+        let ty = ty.clone();
         if !crate::gcgen::is_traced(&c.prog, &ty) {
             continue;
         }
@@ -1314,10 +1316,11 @@ fn warn_unsynced_roots(c: &mut Checker, d: &VmDecl, i: usize, site: Span) {
 }
 
 /// Whether `b` mentions the name `x` anywhere (conservatively: as a
-/// read).
+/// read). Every construct is looked into, closure bodies included, so no
+/// mention is missed, and literals and other leaves mention nothing.
 fn block_reads(b: &Block, x: &str) -> bool {
     let hit = |e: &Expr| matches!(&e.kind, ExprKind::Ident(n) if n == x);
-    AstAny { hit: &hit, vm: false, other: true }.block(b)
+    AstAny { hit: &hit, vm: true, closures: true }.block(b)
 }
 
 /// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for
@@ -1327,17 +1330,17 @@ pub(crate) fn block_assigns(b: &Block, x: &str) -> bool {
         ExprKind::Assign(l, _) | ExprKind::CompoundAssign(_, l, _) => matches!(&l.kind, ExprKind::Ident(n) if n == x),
         _ => false,
     };
-    AstAny { hit: &hit, vm: true, other: false }.block(b)
+    AstAny { hit: &hit, vm: true, closures: false }.block(b)
 }
 
 /// A search over an AST block: is there an expression `hit` holds for?
 /// `vm`: look into vm expressions (`jump`, `exit`, `raise`, `fail`,
-/// `cold`); `other`: the answer for expressions not looked into (other
-/// vm expressions, closures, literals, ...).
+/// `cold`); `closures`: look into closure bodies. Leaves (literals,
+/// `continue`, ..) and what is not looked into answer `false`.
 struct AstAny<'a> {
     hit: &'a dyn Fn(&Expr) -> bool,
     vm: bool,
-    other: bool,
+    closures: bool,
 }
 
 impl AstAny<'_> {
@@ -1357,7 +1360,16 @@ impl AstAny<'_> {
             Cond::Expr(e) | Cond::Let(_, e) => self.expr(e),
         });
         match &e.kind {
-            ExprKind::Ident(_) => false,
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Ident(_)
+            | ExprKind::DotVariant(_)
+            | ExprKind::Unit
+            | ExprKind::Continue
+            | ExprKind::SizeOf(_) => false,
             ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => go(l) || go(r),
             ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
             ExprKind::Call(f, args) => go(f) || args.iter().any(go),
@@ -1371,12 +1383,15 @@ impl AstAny<'_> {
             ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || self.block(b),
             ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
             ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
-            ExprKind::Vm(v) if self.vm => match v {
-                VmExpr::Jump(a) | VmExpr::Exit(a) | VmExpr::Raise(a) | VmExpr::Fail(a) => go(a),
-                VmExpr::Cold(b) => self.block(b),
-                _ => false,
-            },
-            _ => self.other,
+            ExprKind::Closure(_, _, body) => self.closures && go(body),
+            ExprKind::Vm(v) => {
+                self.vm
+                    && match v {
+                        VmExpr::Jump(a) | VmExpr::Exit(a) | VmExpr::Raise(a) | VmExpr::Fail(a) => go(a),
+                        VmExpr::Cold(b) => self.block(b),
+                        VmExpr::Next | VmExpr::Redo | VmExpr::Become(_) | VmExpr::UseVariant(_) => false,
+                    }
+            }
         }
     }
 }

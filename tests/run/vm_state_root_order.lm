@@ -1,0 +1,42 @@
+// expect-stderr: state variable `acc` holds GC references (`V`), but `sync` does not store it
+// expect-no-stderr: state variable `n`
+// expect-no-stderr: state variable `top`
+// Lint `state_root` with a vm context: each state variable is checked
+// with its own type. (The lint once paired the state list with the
+// checked one, which starts with the context, so it saw each variable
+// with the type of the one before: here it warned about the integer `n`
+// and missed `acc`, a traced variable after a non-traced one.)
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+value V repr nanbox { Num(f64) unboxed, S(Gc<Str>), Nil }
+
+struct Ctx { heap: gc.Heap, top: V }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, top: V, n: i64, acc: V }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    sync { ctx.top = top; }
+
+    op NEW() : N {
+        let s = new(&ctx.heap, Str {}, 1);
+        top = S(s);
+        n = n + 1;
+        next
+    }
+    op GC() : N { gc.collect(&ctx.heap); next }
+    op HALT() : N { acc = top; exit n }
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; top = Nil; n = 0; acc = Nil; jump code }
+}
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new(), top: V.Nil };
+    var code: [u32; 3] = [M.NEW(), M.GC(), M.HALT()];
+    io.print_int(M.run(&c, &code[0]));
+    io.println("");
+}
+// expect: 1
