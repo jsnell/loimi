@@ -1,0 +1,164 @@
+// matrix: dispatch
+// Stack effects: `op X(..) : F stack(in -- out)`. The verifier walks the
+// code's control flow from `stack_entry`, rejects underflow, paths that
+// meet with different depths, and code that ends (RET) with the wrong
+// depth, and records the maximum growth in the proof (`max_stack()`).
+// Counts may read operands (`xs[n]`) and the verify context
+// (`r[f.nout]`); `..` takes everything. `Vm.stack_effect(w)` gives tools
+// the effects that need no context, the disassembler prints them, and
+// superinstructions and quickened members check as their parts.
+import std.io;
+import std.text;
+
+struct Fn { nin: u32, nout: u32 }
+
+vm S {
+    state { pc: *u32, sp: *i64 }
+    verify_context f: *Fn;
+    stack_entry f.nin;
+
+    operand imm = it;
+    operand cnt = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format N { op: 8, x: 24 }
+        format J { op: 8, sx: s24 }
+    }
+
+    op PUSH(v: imm) : N stack(-- v) { sp = sp + 1; *sp = v as i64; next }
+    family ADD() : N stack(a b -- c) {
+        generic { become ADD_Q; redo }
+        ADD_Q { let b = *sp; sp = sp - 1; *sp = *sp + b; next }
+    }
+    op DUP() : N stack(a -- a a) { sp = sp + 1; *sp = *(sp - 1); next }
+    op DROP() : N stack(a --) { sp = sp - 1; next }
+    /// Sums the top `n` values.
+    op SUM(n: cnt) : N stack(xs[n] -- s) {
+        var s: i64 = 0;
+        for i in 0..n { s = s + *(sp - i); }
+        sp = sp - n + 1;
+        *sp = s;
+        next
+    }
+    op JZ(t: label) : J stack(c --) { let c = *sp; sp = sp - 1; if c == 0 { jump t } next }
+    op JMP(t: label) : J stack(--) { jump t }
+    op RET() : N stack(r[f.nout] --) { exit *sp }
+    op HALT() : N stack(.. --) { exit 0 }
+
+    super PUSH_ADD = PUSH; ADD;
+
+    entry run(code: Verified<S>, stack: *i64) -> i64 { pc = code.start(); sp = stack; jump code }
+}
+
+fn check(name: str, c: []u32, f: *Fn) {
+    var b = text.StrBuf.new();
+    b.push_str(name);
+    b.push_str(": ");
+    match S.verify(c, f) {
+        Ok(v) => { b.push_str("ok, max_stack "); b.push_int(v.max_stack() as i64); }
+        Err(e) => e.write(&b),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn main() {
+    let f0 = Fn { nin: 0, nout: 1 };
+    let f2 = Fn { nin: 2, nout: 1 };
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+
+    // 1 2 + 3 4 5 sum3 + RET: depth peaks at 4.
+    code[0] = S.PUSH(1); code[1] = S.PUSH(2); code[2] = S.ADD();
+    code[3] = S.PUSH(3); code[4] = S.PUSH(4); code[5] = S.PUSH(5);
+    code[6] = S.SUM(3); code[7] = S.ADD(); code[8] = S.RET();
+    check("straight", c[0..9], &f0);
+    var stack: [i64; 8] = [0; 8];
+    match S.verify(c[0..9], &f0) {
+        Ok(v) => {
+            // Supers and quickening keep the proof; the verifier sees the parts.
+            let o = S.optimize(v);
+            io.println(S.op_name(code[1]));
+            check("optimized", c[0..9], &f0);
+            io.print_int(S.run(o, &stack[0]));
+            io.println("");
+            io.println(S.op_name(code[2]));
+            check("quickened", c[0..9], &f0);
+        }
+        Err(_) => {}
+    }
+
+    // Arguments: two on entry, ADD them, RET one.
+    code[0] = S.ADD(); code[1] = S.RET();
+    check("args", c[0..2], &f2);
+    check("no args", c[0..2], &f0);
+
+    // if/else that agree: x JZ else; PUSH 1; JMP end; else: PUSH 2; end: RET.
+    code[0] = S.PUSH(0); code[1] = S.JZ(3); code[2] = S.PUSH(1); code[3] = S.JMP(2);
+    code[4] = S.PUSH(2); code[5] = S.RET();
+    check("branches", c[0..6], &f0);
+    // ... and disagree: the else branch pushes two.
+    code[0] = S.PUSH(0); code[1] = S.JZ(3); code[2] = S.PUSH(1); code[3] = S.JMP(3);
+    code[4] = S.PUSH(2); code[5] = S.PUSH(2); code[6] = S.RET();
+    check("mismatch", c[0..7], &f0);
+
+    // RET with the wrong depth; HALT takes anything.
+    code[0] = S.PUSH(1); code[1] = S.PUSH(2); code[2] = S.RET();
+    check("ret", c[0..3], &f0);
+    code[2] = S.HALT();
+    check("halt", c[0..3], &f0);
+
+    // A loop that grows the stack on every iteration.
+    code[0] = S.PUSH(1); code[1] = S.DUP(); code[2] = S.PUSH(1); code[3] = S.JZ(-2); code[4] = S.RET();
+    check("loop", c[0..5], &f0);
+
+    // Counted pops beyond the stack.
+    code[0] = S.PUSH(1); code[1] = S.SUM(2); code[2] = S.RET();
+    check("sum", c[0..3], &f0);
+
+    // Tools: effects without the verify context, and the disassembler.
+    let tools: [u32; 4] = [S.PUSH(7), S.SUM(5), S.RET(), S.HALT()];
+    for i in 0..4 {
+        let w = tools[i];
+        var b = text.StrBuf.new();
+        b.push_str(S.op_name(w));
+        b.push_str(" ");
+        b.push_str(S.stack_effect_text(w));
+        match S.stack_effect(w) {
+            Some((i, o)) => { b.push_str(": "); b.push_int(i as i64); b.push_str(" "); b.push_int(o as i64); }
+            None => b.push_str(": depends on the context"),
+        }
+        io.println(b.as_str());
+        b.free();
+    }
+    code[0] = S.PUSH(1); code[1] = S.PUSH(2); code[2] = S.ADD(); code[3] = S.RET();
+    S.optimize_words(c[0..4]);
+    var b = text.StrBuf.new();
+    S.disasm(c[0..4], &b);
+    io.print(b.as_str());
+    b.free();
+}
+// expect: straight: ok, max_stack 4
+// expect: PUSH_ADD
+// expect: optimized: ok, max_stack 4
+// expect: 15
+// expect: ADD_Q
+// expect: quickened: ok, max_stack 4
+// expect: args: ok, max_stack 0
+// expect: no args: word 0 (ADD): stack underflow: the instruction takes 2 value(s), the stack has 0
+// expect: branches: ok, max_stack 1
+// expect: mismatch: word 6 (RET): paths reach this instruction with different stack depths (1 and 2)
+// expect: ret: word 2 (RET): the instruction ends the code and takes exactly 1 value(s), but the stack has 2
+// expect: halt: ok, max_stack 2
+// expect: loop: word 1 (DUP): paths reach this instruction with different stack depths (1 and 2)
+// expect: sum: word 1 (SUM): stack underflow: the instruction takes 2 value(s), the stack has 1
+// expect: PUSH -- v: 0 1
+// expect: SUM xs[n] -- s: 5 1
+// expect: RET r[f.nout] --: depends on the context
+// expect: HALT .. --: depends on the context
+// expect:     0  PUSH v=1  ( -- v )
+// expect:     1  PUSH_ADD
+// expect:     1    PUSH v=2  ( -- v )
+// expect:     2    ADD  ( a b -- c )
+// expect:     3  RET  ( r[f.nout] -- )

@@ -7,7 +7,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 
 | Area | Status |
 |---|---|
-| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`, `--sanitize=address`, `--align-functions=N` to start every function on an N-byte boundary so that unrelated code changes do not move vm handlers, which makes A/B benchmarks steadier). Named warnings (`match_fallout`, `super_overlap`), silenced with `#[allow(name)]` on an item, vm item or match arm or `#![allow(name)]` per file; `-W error` / `--deny-warnings` makes them errors. |
+| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`, `--sanitize=address`, `--align-functions=N` to start every function on an N-byte boundary so that unrelated code changes do not move vm handlers, which makes A/B benchmarks steadier). Named warnings (`match_fallout`, `super_overlap`, `state_root`), silenced with `#[allow(name)]` on an item, vm item or match arm or `#![allow(name)]` per file; `-W error` / `--deny-warnings` makes them errors. |
 | Libraries and embedding | `loimi build --lib` (static archive of `-fPIC` code) and `--shared` (shared object), with no `main`; `export "C"` functions are the API. `--header out.h` writes a C header for them (integers, floats, `bool`, pointers, opaque struct pointers, nullable `?*T`, C function pointers, `str` as `loimi_str { const char *ptr; size_t len; }`, payload-less enums as a typedef plus `E_Variant` constants; other types are rejected with the reason). No init function. Runtime thread-locals are initial-exec, local-dynamic in `--shared` builds (`--tls=` overrides). `std.rt.protect`/`throw` recover from errors deep in code without an error path. `examples/mini/embed.lm` makes Mini a library (`mini_new`, `mini_dostring`, `mini_error`, globals, C natives, a rooted value stack, `mini_call`); `examples/embed/host.c` uses it. C natives may call back into Mini (`mini_call`, `mini_dostring`), as nested runs. See `language.md` §10.1. |
 | Core language | type aliases (`type Name = T;`, `pub type`, generic `type Map<V> = HashMap<str, V>;`; transparent), `inline for` (module level, in `vm` blocks, and as a statement in any block), structs (literals may be module-qualified: `diag.Span { .. }`), enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (through nested patterns and tuples) and guards (`pat if cond =>`; in vm code, a warning for an arm whose body is an `if` without `else` when a later arm could match), `let ... else`, `if let` chains, loops with `break` values, `for i in 0..n` ranges typed by the non-literal bound or an annotation (`for i: u8 in 0..10`), `defer`, consts, module-level `var`s (see below), casts (including integer to fieldless enum, checked in debug builds; `Kind.COUNT` gives the number of variants; `x as u64 < y` parses as a comparison), local inference across `if`/`match` branches (`if c { Ok(e) } else { Err(m) }` needs no annotation), checked/wrapping arithmetic, arbitrary-width integers `iN`/`uN` (1..=64), overflow and bounds checks (overflow traps in debug builds). |
 | Globals | `var NAME: T = init;` at module level (with `pub`, readable and assignable from other modules as `mod.NAME` or after `import mod.{NAME}`). Plain LLVM globals; `#[thread_local]` makes one copy per thread (`thread_local(initialexec)`). The initializer must be a constant expression: literals, consts, `[x; N]`, struct/tuple/array literals, enum variants without payload, `None`/`Some(..)`/`Ok(..)`/`Err(..)` of constants, and functions (for hooks). Globals are not GC roots: a global holding `Gc`/`Value` must be marked by a root scanner (`heap.add_scanner`). |
@@ -113,6 +113,10 @@ rejected (run by `cargo test`).
   cold blocks, and all cold blocks in goto/switch mode, stay inline and are
   marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
+  Stack VMs declare per-op stack effects instead (`op ADD() : N stack(a b
+  -- c)`, `language.md` §3.4a): the verifier checks depths and records
+  the maximum (`v.max_stack()`), but the names are not bound in the
+  handler, which moves its own stack pointer.
 - **`unsafe`** is required only for `p as Gc<T>`. Raw pointer
   dereference, indexing and arithmetic are allowed anywhere (the design
   draft required `unsafe` for them); see `language.md` §1.3 for why.
@@ -200,7 +204,7 @@ rejected (run by `cargo test`).
   `std.rt` (beyond `protect`/`throw`), `std.prof`/`test`, variable-length encodings, and atomic `become` for shared code.
 - **Generated tooling not built** (described in `language.md` and
   `lowering.md`, marked there): a `Builder` type (emitters plus `std.bc`
-  do its job), stack effects, generated C-ABI entry points
+  do its job), generated C-ABI entry points
   (entries are internal functions; embedders write `export "C"`
   wrappers), `loimi vm suggest-supers` (`--vm-stats` prints the
   suggestions itself), handler ordering from profiles, the

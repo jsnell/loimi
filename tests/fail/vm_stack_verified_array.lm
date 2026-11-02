@@ -1,0 +1,10 @@
+// error: vm `M` declares stack effects, so its proof records the maximum stack depth
+object Proto { n: u32, code: verified [u32] by M }
+vm M {
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X stack(.. --) { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

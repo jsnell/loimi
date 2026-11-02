@@ -140,8 +140,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The lints are `match_fallout`
-  and `super_overlap` (section 7.3).
+  the warnings that remain into errors. The lints are `match_fallout`,
+  `super_overlap` (section 7.3) and `state_root` (section 8).
 - **Attributes** are checked where they appear: an unknown or misplaced
   one is an error (with a "did you mean" for near misses), never
   ignored, since a misspelled `#[require_verified]` would silently drop
@@ -584,7 +584,7 @@ single pointer that the verifier understands:
 |---|---|
 | `Cursor<W>` | instruction pointer over code words of type `W` |
 | `Window<T>` | base of the current register window (register VMs) |
-| `StackTop<T>` | operand stack top (stack VMs); `push`, `pop`, `peek(n)` |
+| `StackTop<T>` | operand stack top (stack VMs); `push`, `pop`, `peek(n)` (*design only*: today a stack VM keeps a plain pointer, and its ops declare stack effects for the verifier, §3.4a) |
 | plain types | anything else (`*const Value`, `u32`, ...) |
 
 ### 3.2 Operand kinds
@@ -769,6 +769,61 @@ Because the size of each instruction is static, `next` compiles to
 **decodes ahead**: it loads the next instruction word and handler address at
 the top of the handler when the handler can't modify code, so the dispatch
 load overlaps with the handler's work.
+
+### 3.4a Stack effects (stack VMs)
+
+A stack VM declares what each op pops and pushes, after the format (and
+cache and `then`), in Forth notation:
+
+```loimi
+verify_context word: *Word, words: *mem.Vec<*Word>;
+stack_entry word.nin;                       // depth the code starts with
+
+op PUSHI(v: imm) : S stack(-- n) { .. }
+op ADD() : N stack(a b -- c) { .. }
+op MKARRAY(n: cnt) : N stack(xs[n] -- arr) { .. }
+op CALL(w: wref) : N stack(args[words.at(w).nin] -- rs[words.at(w).nout]) { .. }
+op RET() : N stack(rs[word.nout] --) { .. }
+op HALT() : N stack(.. --) { exit Ok(()) }
+```
+
+- Each item is one value, or `name[count]` for `count` values: an
+  expression over the op's operands (raw fields, as `it` in a verify
+  clause) and the verify context. Commas between items are optional; the
+  names are documentation (the disassembler prints them).
+- `..` first among the inputs takes every value on the stack.
+- If any op declares an effect, every op must (`stack(--)` for none);
+  family members share their family's.
+- `stack_entry EXPR;` (default 0) is the depth code starts with, from the
+  verify context (a function's arguments).
+
+The verifier (§6) walks the control flow: an op continues to the next
+instruction if it may continue (as for "run off the end") and goes to
+its label (`pc + it` operand) if it has one. It rejects an op that pops
+more than the stack holds, two paths that reach an instruction with
+different depths, and an op that ends the code (it neither continues nor
+has a label: RET, HALT, a tail call) with values left beyond the ones it
+takes, unless it takes `..`. It records the most the stack grows above
+`stack_entry` in the proof: `v.max_stack() -> u32` on `Verified<Vm>`, so
+the interpreter checks room for a call once (`sp + callee.code.max_stack()
+>= stack_end`) and its ops push and pop without checks. Such a vm keeps
+its proof in a `Verified<Vm>` field (a `verified [W] by Vm` array has no
+room for the bound), and `assume_verified(code, max_stack)` takes the
+bound too.
+
+What the handlers do with the stack is up to them (they move a pointer
+state register, perhaps with the top value cached in another), and the
+compiler does not check them against the declared effects: the effect is
+the contract, as a verify clause is for an operand. Ops that leave
+verified code with values on the stack (exception handlers jumping to a
+table target) are not followed; the target's depth is the vm's to
+ensure.
+
+For tools: `Vm.stack_effect(w) -> ?(u32, u32)` gives (pops, pushes) of
+the op word `w` stands for alone, when they depend only on its operands
+(None for `..` and counts that read the verify context), so a compiler
+can track depths from the declarations (`examples/stack` does), and
+`Vm.stack_effect_text(w)` the declared effect (`a b -- c`).
 
 ### 3.5 VM functions
 
@@ -1108,10 +1163,11 @@ or the first bad word and why it is bad. It checks:
   them, and when a part quickens the super can split up), and are checked
   as such;
 - `then OP`: the next instruction is an `OP` (or a member of its family);
-- for stack VMs, ops declare stack effects (`op ADD() stack(a, b -- r)`) and
-  the verifier computes the maximum depth per function and checks consistency
-  at control-flow merges, like the JVM verifier minus types (*not yet
-  implemented*);
+- for stack VMs, ops declare stack effects (`op ADD() : N stack(a b -- c)`,
+  §3.4a) and the verifier checks depths at every instruction (no
+  underflow, paths agree where they meet, code ends with the stack its
+  last op expects), like the JVM verifier minus types, and computes the
+  maximum depth (`v.max_stack()`);
 - code can't fall off the end: it is not empty, and its last instruction
   cannot continue past itself. An op may continue if its handler uses
   `next` or reads `pc` (to save a return address like `pc + 1`), directly,
@@ -1128,14 +1184,16 @@ verify context, nothing else; a verify context cannot be named `it` or `pc`.
 **Errors.** `Mini.VerifyError` has `at` (the word index), `reason` (an
 enum `Mini.VerifyReason`: `Empty`, `TooLong`, `BadOpcode`, `Truncated`,
 `SuperPart`, `Forward`, `Then`, `RunsOffEnd`, `Operand`, `Check` for a failing
-`verify` block, below), and for `Operand` the
-operand's index and kind. `e.message()` describes the reason, and
+`verify` block, below; stack VMs add `StackUnderflow`, `StackMismatch`,
+`StackExit`, `StackTooDeep`, `StackCount` and `BadTarget`), for `Operand` the
+operand's index and kind, and `msg`, a `verify` block's message. `e.message()` describes the reason, and
 `e.write(&out)` writes the whole diagnosis to any buffer with
 `push_str`/`push_int`:
 
 ```
 word 4 (LOADK): operand `c` (kst) fails `(it as u64) < nconsts`
 word 7 (ADD): execution can run off the end of the code after this instruction
+word 9 (DROP): stack underflow: the instruction takes 1 value(s), the stack has 0
 ```
 
 **`Verified<Mini>`** (also spelled `Mini.Verified`) is the proof: an
@@ -1236,8 +1294,20 @@ verify handlers {
 ```
 
 A failing check is `VerifyReason.Check`, written as ``check `handlers`
-fails``. With an owner context the table is the object's own, verified
+fails``. To say where and why, call `reject(at, msg)` in the block: it
+fails the check at word `at` with message `msg`, written like the
+generated checks (``word 4 (DUP): check `stack` fails: depth 3 > 2``).
+With an owner context the table is the object's own, verified
 with its code.
+
+`code` in a check is the **base view** of the code: every word as the op
+it stands for alone, its family's generic op (a superinstruction's head
+as its first part's), with inline caches zeroed, as `Vm.deopt` would
+leave it. So a check written against the plain ops still holds for code
+that went through `optimize` or quickening (verified again after loading
+from a cache, say). If the vm has supers or families, `code` is a copy;
+`is_insn_boundary` takes pointers into it. (`Vm.base_op(w)` maps one
+word the same way, for host code.)
 
 **Mutation.** Quickening (`become`) and `Mini.optimize` rewrite verified
 code in place, and both preserve verification: `become` only switches
@@ -1526,6 +1596,11 @@ enough to make it precise and cheap:
   effectful calls (section 5), and explicit `Root<T>` handles for host data
   structures. (As implemented: traced locals in shadow-stack frames, and
   root scanners registered with `heap.add_scanner`; there is no `Root<T>`.)
+  A **state variable of a traced type** (a stack VM's cached top of stack,
+  `state { .., tos: Value }`) lives in a register, which no scanner can
+  read: `sync` must store it (`ctx.tos = tos`) and the scanner mark the
+  copy. Lint `state_root` warns when vm code may collect and `sync` never
+  mentions such a variable. (The state is not rooted automatically.)
 - **Moving is opt-in.** The default `MarkSweep` is non-moving and
   size-segregated, which keeps interior pointers into the stack and objects
   stable across handlers. A moving policy makes the compiler reload spilled

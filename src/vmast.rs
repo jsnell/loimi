@@ -43,6 +43,24 @@ pub struct OpParam {
     pub kind: Ident,
 }
 
+/// One value of a stack effect: `a`, or `xs[n]` for a counted run of
+/// values (`n` an expression over the op's raw operand fields and the
+/// verify context).
+#[derive(Clone, Debug)]
+pub struct StackItem {
+    pub name: Ident,
+    pub count: Option<Expr>,
+}
+
+/// `stack(a b -- c)`: what an op pops and pushes on a stack VM's operand
+/// stack. `rest` is `..` before the inputs: the op takes every value.
+#[derive(Clone, Debug)]
+pub struct StackEffect {
+    pub rest: bool,
+    pub ins: Vec<StackItem>,
+    pub outs: Vec<StackItem>,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct OpDecl {
@@ -56,6 +74,8 @@ pub struct OpDecl {
     /// `then OP`: the instruction after this one is an OP (or a member of
     /// its family), and the body can read its operands as `then.x`.
     pub then: Option<Ident>,
+    /// `stack(a b -- c)`: the op's stack effect (stack VMs).
+    pub stack: Option<StackEffect>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +140,9 @@ pub struct VmDecl {
     /// `verify NAME { .. }`: checks the verifier runs after the code (side
     /// tables such as exception handler targets), in order.
     pub checks: Vec<(Ident, Block)>,
+    /// `stack_entry EXPR;`: the operand stack depth code starts with (an
+    /// expression of the verify context; 0 if absent).
+    pub stack_entry: Option<Expr>,
     pub is_pub: bool,
 }
 

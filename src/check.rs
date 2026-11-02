@@ -584,6 +584,12 @@ impl<'a> Checker<'a> {
                             format!("vm `{}` has `{}` code words, not `{}`", vname, self.ty_name(&word), self.ty_name(&et)),
                         ));
                     }
+                    if self.vm_decls[vm as usize].1.ops.iter().any(|o| o.stack.is_some()) {
+                        return Err(Diag::new(
+                            t.span,
+                            format!("vm `{vname}` declares stack effects, so its proof records the maximum stack depth: keep it in a `Verified<{vname}>` field, not a `verified [W] by {vname}` array"),
+                        ));
+                    }
                     match self.scopes[vm_m].get(&format!("{}__Verified", vname)) {
                         Some((Def::Struct(v), _)) => verified = Some(*v),
                         _ => unreachable!("vmexpand generates Vm__Verified"),
@@ -631,6 +637,10 @@ impl<'a> Checker<'a> {
         }
         let symbol = symbol.unwrap_or_else(|| match f.linkage {
             Linkage::Internal => format!("{}.{}", prefix, name),
+            // `extern "C" fn __extern_calloc(..)` links to `calloc`: how
+            // generated vm code declares C functions without clashing
+            // with a declaration of its own in the vm's module.
+            Linkage::Extern if f.name.name.starts_with("__extern_") => f.name.name["__extern_".len()..].to_string(),
             _ => f.name.name.clone(),
         });
         if f.linkage == Linkage::Extern && f.body.is_some() {

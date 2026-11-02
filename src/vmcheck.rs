@@ -818,6 +818,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 .note(site, format!("{} may collect here", callee)));
             }
         }
+        warn_unsynced_roots(c, &d, i, site);
     }
     check_shared_next(c, i)
 }
@@ -1257,6 +1258,71 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
     fd.body = Some(body);
     fd.vm_state = state;
     Ok(())
+}
+
+/// Lint `state_root`: vm code may collect, and a state variable holds GC
+/// references, but `sync` never reads it. A collection then cannot see
+/// what only a register holds (the root scanner reads memory), so the
+/// object it references may be freed while the register still points to
+/// it. Storing the variable in `sync` (`ctx.tos = tos`), where a root
+/// scanner marks it, is the fix.
+fn warn_unsynced_roots(c: &mut Checker, d: &VmDecl, i: usize, site: Span) {
+    for (k, p) in d.state.iter().enumerate() {
+        let ty = c.vms[i].state[k].1.clone();
+        if !crate::gcgen::is_traced(&c.prog, &ty) {
+            continue;
+        }
+        if d.sync.as_ref().is_some_and(|b| block_reads(b, &p.name.name)) {
+            continue;
+        }
+        let w = Diag::warning(
+            "state_root",
+            p.name.span,
+            format!(
+                "state variable `{}` holds GC references (`{}`), but `sync` does not store it: vm code may collect, and a collection sees only what a root scanner can read, not registers; store it in `sync` (`ctx.{} = {}`) and mark it in the scanner",
+                p.name.name,
+                c.ty_name(&ty),
+                p.name.name,
+                p.name.name
+            ),
+        )
+        .note(site, "vm code may collect here");
+        c.warnings.push(w);
+    }
+}
+
+/// Whether `b` mentions the name `x` anywhere (conservatively: as a
+/// read).
+fn block_reads(b: &Block, x: &str) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| expr_reads(e, x)) || els.as_ref().is_some_and(|b| block_reads(b, x)),
+        Stmt::Expr { expr, .. } | Stmt::Defer(expr) => expr_reads(expr, x),
+    })
+}
+
+fn expr_reads(e: &Expr, x: &str) -> bool {
+    let go = |e: &Expr| expr_reads(e, x);
+    let conds = |cs: &Vec<Cond>| cs.iter().any(|c| match c {
+        Cond::Expr(e) | Cond::Let(_, e) => expr_reads(e, x),
+    });
+    match &e.kind {
+        ExprKind::Ident(n) => n == x,
+        ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => go(l) || go(r),
+        ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
+        ExprKind::Call(f, args) => go(f) || args.iter().any(go),
+        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
+        ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, e)| go(e)),
+        ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => block_reads(b, x),
+        ExprKind::If(cs, t, f) => conds(cs) || block_reads(t, x) || f.as_ref().is_some_and(|e| go(e)),
+        ExprKind::While(cs, b) => conds(cs) || block_reads(b, x),
+        ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || block_reads(b, x),
+        ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
+        ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
+        // Anything else (closures, vm expressions, ...): assume it does.
+        _ => true,
+    }
 }
 
 /// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for

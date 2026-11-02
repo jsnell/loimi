@@ -31,6 +31,7 @@ impl Parser {
             verify_ctx: vec![],
             verify_owner: None,
             checks: vec![],
+            stack_entry: None,
             is_pub,
         };
         // `inline for` variables replace every matching token in the body,
@@ -162,13 +163,13 @@ impl Parser {
                 }
                 "op" => {
                     self.bump();
-                    let (name, params, format, cache, then) = self.parse_op_head()?;
+                    let (name, params, format, cache, then, stack) = self.parse_op_head()?;
                     let body = self.vm_block()?;
-                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then });
+                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then, stack });
                 }
                 "family" => {
                     self.bump();
-                    let (name, params, format, cache, then) = self.parse_op_head()?;
+                    let (name, params, format, cache, then, stack) = self.parse_op_head()?;
                     self.expect("{")?;
                     while !self.eat("}") {
                         let member = self.ident()?;
@@ -186,6 +187,7 @@ impl Parser {
                             body,
                             family: Some(name.name.clone()),
                             then: then.clone(),
+                            stack: stack.clone(),
                         });
                     }
                 }
@@ -298,6 +300,16 @@ impl Parser {
                     let b = self.parse_block()?;
                     vm.checks.push((n, b));
                 }
+                "stack_entry" => {
+                    // `stack_entry word.nin;`: the operand stack depth that
+                    // code starts with, from the verify context.
+                    self.bump();
+                    if vm.stack_entry.is_some() {
+                        return self.err("a vm has at most one `stack_entry`");
+                    }
+                    vm.stack_entry = Some(self.parse_expr()?);
+                    self.expect(";")?;
+                }
                 "sync" => {
                     self.bump();
                     vm.sync = Some(self.vm_block()?);
@@ -357,7 +369,7 @@ impl Parser {
     }
 
     #[allow(clippy::type_complexity)]
-    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>, Option<Ident>)> {
+    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>, Option<Ident>, Option<StackEffect>)> {
         let name = self.ident()?;
         self.expect("(")?;
         let mut params = Vec::new();
@@ -375,7 +387,53 @@ impl Parser {
         let format = self.ident()?;
         let cache = if self.eat("+") { Some(self.ident()?) } else { None };
         let then = if self.eat_kw("then") { Some(self.ident()?) } else { None };
-        Ok((name, params, format, cache, then))
+        let stack = if self.is_kw("stack") && self.is_at(1, "(") { Some(self.parse_stack_effect()?) } else { None };
+        Ok((name, params, format, cache, then, stack))
+    }
+
+    /// `stack(a b -- c)`, `stack(xs[n] -- arr)`, `stack(.. --)`. Commas
+    /// between items are optional.
+    fn parse_stack_effect(&mut self) -> Res<StackEffect> {
+        let lo = self.bump().span;
+        self.expect("(")?;
+        let (mut rest, mut after) = (false, false);
+        let (mut ins, mut outs) = (Vec::new(), Vec::new());
+        while !self.is(")") {
+            if self.is("-") && self.is_at(1, "-") {
+                if after {
+                    return self.err("a stack effect has one `--`");
+                }
+                self.bump();
+                self.bump();
+                after = true;
+                continue;
+            }
+            if self.eat(",") {
+                continue;
+            }
+            if self.is("..") {
+                if after || rest || !ins.is_empty() {
+                    return self.err("`..` (every value on the stack) can only come first among the inputs");
+                }
+                self.bump();
+                rest = true;
+                continue;
+            }
+            let name = self.ident()?;
+            let count = if self.eat("[") {
+                let e = self.parse_expr()?;
+                self.expect("]")?;
+                Some(e)
+            } else {
+                None
+            };
+            if after { &mut outs } else { &mut ins }.push(StackItem { name, count });
+        }
+        let hi = self.bump().span;
+        if !after {
+            return Err(Diag::new(lo.to(hi), "a stack effect needs `--` between the inputs and the outputs: `stack(a b -- c)`"));
+        }
+        Ok(StackEffect { rest, ins, outs })
     }
 
     pub fn parse_value_decl(&mut self, is_pub: bool) -> Res<ValueDecl> {

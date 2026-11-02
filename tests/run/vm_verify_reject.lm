@@ -1,0 +1,85 @@
+// `verify NAME { .. }` blocks see the base view of the code (each word as
+// the op it stands for alone: no superinstruction heads, no quickened
+// members), so a check written against the plain ops still holds after
+// `optimize` and quickening. `reject(at, msg)` fails the check at a word,
+// with a message, which `VerifyError.write` prints like the generated
+// checks.
+import std.io;
+import std.text;
+
+struct Lim { max_imm: u64 }
+
+vm V {
+    state { pc: *u32, acc: i64 }
+    verify_context lim: *Lim;
+
+    operand imm = it;
+
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    family LOAD(v: imm) : N {
+        generic { become LOAD_Q; redo }
+        LOAD_Q { acc = v as i64; next }
+    }
+    op ADD(v: imm) : N { acc = acc + v as i64; next }
+    op RET() : N { exit acc }
+
+    super LOAD_ADD = LOAD; ADD;
+
+    /// Immediates of LOAD and ADD stay below `lim.max_imm`.
+    verify imms {
+        for i in 0..code.len {
+            let op = V.opcode(code[i]);
+            if (op == V.OP_LOAD or op == V.OP_ADD) and V.N_x(code[i]) >= lim.max_imm {
+                reject(i, "immediate too large");
+            }
+        }
+        true
+    }
+    /// A plain `bool` check still works, without a position.
+    verify nonempty { code.len > 1 }
+
+    entry run(code: Verified<V>) -> i64 { pc = code.start(); acc = 0; jump code }
+}
+
+fn show(name: str, c: []u32, lim: *Lim) {
+    var b = text.StrBuf.new();
+    b.push_str(name);
+    b.push_str(": ");
+    match V.verify(c, lim) {
+        Ok(_) => b.push_str("ok"),
+        Err(e) => e.write(&b),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn main() {
+    var lim = Lim { max_imm: 100 };
+    var code: [u32; 4] = [V.LOAD(5), V.ADD(7), V.RET(), 0];
+    let c = code[0..3];
+    show("plain", c, &lim);
+    match V.verify(c, &lim) {
+        Ok(v) => {
+            let o = V.optimize(v);
+            io.println(V.op_name(code[0]));
+            show("optimized", c, &lim);
+            io.print_int(V.run(o));
+            io.println("");
+            io.println(V.op_name(code[0]));
+            show("quickened", c, &lim);
+        }
+        Err(_) => {}
+    }
+    lim.max_imm = 6;
+    show("too large", c, &lim);
+    show("short", code[2..3], &lim);
+}
+// expect: plain: ok
+// expect: LOAD_ADD
+// expect: optimized: ok
+// expect: 12
+// expect: LOAD_Q
+// expect: quickened: ok
+// expect: too large: word 1 (ADD): check `imms` fails: immediate too large
+// expect: short: check `nonempty` fails

@@ -1,0 +1,40 @@
+// expect-stderr: state variable `acc` holds GC references (`V`), but `sync` does not store it
+// expect-no-stderr: state variable `top`
+// A state variable of a traced type (a cached top of stack) lives in a
+// register: a collection in vm code cannot see it unless `sync` stores
+// it where a root scanner reads it. Lint `state_root` warns when vm code
+// may collect and `sync` never mentions such a variable (`top` here is
+// stored, `acc` is not).
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+value V repr nanbox { Num(f64) unboxed, S(Gc<Str>), Nil }
+
+struct Ctx { heap: gc.Heap, top: V }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, top: V, acc: V }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    sync { ctx.top = top; }
+
+    op NEW() : N {
+        let s = new(&ctx.heap, Str {}, 1);
+        top = S(s);
+        next
+    }
+    op GC() : N { gc.collect(&ctx.heap); next }
+    op HALT() : N { acc = top; exit 0 }
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; top = Nil; acc = Nil; jump code }
+}
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new(), top: V.Nil };
+    var code: [u32; 3] = [M.NEW(), M.GC(), M.HALT()];
+    io.print_int(M.run(&c, &code[0]));
+    io.println("");
+}
+// expect: 0

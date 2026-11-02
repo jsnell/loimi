@@ -560,14 +560,37 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         Some(clause_text(kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
     };
     let mut s = String::new();
+    let stack = has_stack(v);
+    // A stack vm's proof also records the maximum stack growth.
+    let proof = |code: &str, max: &str| {
+        if stack {
+            format!("{n}__Verified {{ __code: {code}, __max: {max} }}")
+        } else {
+            format!("{n}__Verified {{ __code: {code} }}")
+        }
+    };
     // The proof type and what can be done with it.
+    if stack {
+        let _ = writeln!(
+            s,
+            "{vis}struct {n}__Verified {{ __code: []{w}, __max: u32 }}\n\
+             {vis}fn {n}__Verified.max_stack(v: {n}__Verified) -> u32 {{ v.__max }}\n\
+             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}, max_stack: u32) -> {n}__Verified {{ {} }}",
+            proof("code", "max_stack")
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "{vis}struct {n}__Verified {{ __code: []{w} }}\n\
+             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}) -> {n}__Verified {{ {} }}",
+            proof("code", "0")
+        );
+    }
     let _ = writeln!(
         s,
-        "{vis}struct {n}__Verified {{ __code: []{w} }}\n\
-         {vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
+        "{vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
          {vis}fn {n}__Verified.len(v: {n}__Verified) -> u64 {{ v.__code.len }}\n\
          {vis}fn {n}__Verified.words(v: {n}__Verified) -> []{w} {{ v.__code }}\n\
-         #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}) -> {n}__Verified {{ {n}__Verified {{ __code: code }} }}\n\
          {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
          {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
     );
@@ -581,16 +604,17 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         let _ = writeln!(
             s,
             "var {n}__TRAP: [{w}; 1] = [{word}];\n\
-             {vis}fn {n}__placeholder() -> {n}__Verified {{ {n}__Verified {{ __code: {n}__TRAP[..] }} }}"
+             {vis}fn {n}__placeholder() -> {n}__Verified {{ {} }}",
+            proof(&format!("{n}__TRAP[..]"), "0")
         );
     }
     // Errors.
     let _ = writeln!(
         s,
-        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check }}\n\
-         {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64 }}\n\
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check{} }}\n\
+         {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64, msg: str }}\n\
          fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
-         \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind }})\n}}\n\
+         \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind, msg: \"\" }})\n}}\n\
          {vis}fn {n}__VerifyError.message(e: {n}__VerifyError) -> str {{\n\
          \x20 match e.reason {{\n\
          \x20   Empty => \"the code is empty\",\n\
@@ -602,8 +626,19 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
          \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
          \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
          \x20   Operand => \"an operand fails its kind's verify clause\",\n\
-         \x20   Check => \"a `verify` check of the vm fails\",\n\
-         \x20 }}\n}}"
+         \x20   Check => \"a `verify` check of the vm fails\",{}\n\
+         \x20 }}\n}}",
+        if stack { ", StackUnderflow, StackMismatch, StackExit, StackTooDeep, StackCount, BadTarget" } else { "" },
+        if stack {
+            "\n    StackUnderflow => \"stack underflow\",\n\
+             \x20   StackMismatch => \"paths reach this instruction with different stack depths\",\n\
+             \x20   StackExit => \"the instruction ends the code with values left on the stack\",\n\
+             \x20   StackTooDeep => \"the stack can grow past 2^31 values\",\n\
+             \x20   StackCount => \"a stack effect's count is out of range\",\n\
+             \x20   BadTarget => \"a jump target lies outside the code\","
+        } else {
+            ""
+        }
     );
     let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
     let _ = writeln!(s, "{vis}fn {n}__verify_clause(k: u64) -> str {{ match k {{");
@@ -633,12 +668,12 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         s,
         "{vis}fn {n}__VerifyError.write<B>(e: {n}__VerifyError, out: *B) {{\n\
          \x20 match e.reason {{\n\
-         \x20   Check => {{\n\
+         \x20   Check => if e.msg.len == 0 {{\n\
          \x20     out.push_str(\"check `\");\n\
          \x20     out.push_str({n}__check_name(e.operand));\n\
          \x20     out.push_str(\"` fails\");\n\
          \x20     return;\n\
-         \x20   }}\n\
+         \x20   }},\n\
          \x20   _ => {{}}\n\
          \x20 }}\n\
          \x20 out.push_str(\"word \");\n\
@@ -659,8 +694,22 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
          \x20     out.push_str({n}__verify_clause(e.kind));\n\
          \x20     out.push_str(\"`\");\n\
          \x20   }}\n\
+         \x20   Check => {{\n\
+         \x20     out.push_str(\"check `\");\n\
+         \x20     out.push_str({n}__check_name(e.operand));\n\
+         \x20     out.push_str(\"` fails: \");\n\
+         \x20     out.push_str(e.msg);\n\
+         \x20   }}\n\
+         {}\
          \x20   _ => out.push_str(e.message()),\n\
-         \x20 }}\n}}"
+         \x20 }}\n}}",
+        if stack {
+            "\x20   StackUnderflow => {{ out.push_str(\"stack underflow: the instruction takes \"); out.push_int(e.kind as i64); out.push_str(\" value(s), the stack has \"); out.push_int(e.operand as i64); }}\n\
+             \x20   StackMismatch => {{ out.push_str(\"paths reach this instruction with different stack depths (\"); out.push_int(e.operand as i64); out.push_str(\" and \"); out.push_int(e.kind as i64); out.push_str(\")\"); }}\n\
+             \x20   StackExit => {{ out.push_str(\"the instruction ends the code and takes exactly \"); out.push_int(e.kind as i64); out.push_str(\" value(s), but the stack has \"); out.push_int(e.operand as i64); }}\n"
+        } else {
+            ""
+        }
     );
     let _ = writeln!(
         s,
@@ -781,21 +830,84 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
     let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}");
-    // `verify NAME { .. }`: checks of side tables (exception handler
-    // targets, ...) against the code, once its boundaries are known.
-    for (i, (name, b)) in v.checks.iter().enumerate() {
-        if v.verify_ctx.iter().any(|p| p.name.name == "code") {
-            return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
-        }
-        let f = &sm.files[b.span.file as usize];
-        let text = f.text[b.span.lo as usize..b.span.hi as usize].replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, "));
+    let ctx_args: String = v.verify_ctx.iter().map(|p| format!(", {}", p.name.name)).collect();
+    let ctx_params: String = params[1..].iter().map(|p| format!(", {p}")).collect();
+    // Stack effects: the depth pass (see `generate_stack`).
+    if stack {
         let _ = writeln!(
             s,
-            "  {{ let code: []{w} = __code; let __ok: bool = {text}; if !__ok {{ return {n}__verr(0, {n}__VerifyReason.Check, {n}__NUM_OPS, {i}, {}); }} }}",
-            v.operands.len()
+            "  var __max: u32 = 0;\n\
+             \x20 {{\n\
+             \x20   let __d = __extern_calloc(__code.len, 8) as *i64;\n\
+             \x20   let __work = __extern_calloc(__code.len, 8) as *u64;\n\
+             \x20   let __r = {n}__stack_pass(__code{ctx_args}, __d, __work);\n\
+             \x20   __extern_free(__d as *u8);\n\
+             \x20   __extern_free(__work as *u8);\n\
+             \x20   match __r {{ Ok(__m) => {{ __max = __m; }} Err(__e) => {{ return Err(__e); }} }}\n\
+             \x20 }}"
         );
     }
-    let _ = writeln!(s, "  Ok({n}__Verified {{ __code: __code }})\n}}");
+    // `verify NAME { .. }`: checks of side tables (exception handler
+    // targets, ...) against the code, once its boundaries are known. They
+    // run in a function of their own, `Vm__checks`, over the base view of
+    // the code: every word as the op it stands for alone, its family's
+    // generic op (a superinstruction's head as its first part), with
+    // inline caches zeroed, as `deopt` would leave it. If the vm has no
+    // supers or families that is the code itself; otherwise a copy.
+    if !v.checks.is_empty() {
+        let copy = jw || l.ops.iter().enumerate().any(|(i, o)| !o.parts.is_empty() || o.family != i);
+        if copy {
+            let _ = writeln!(
+                s,
+                "  let __base = __extern_calloc(__code.len, {}) as *{w};\n\
+                 \x20 {n}__base_copy(__code, __base);\n\
+                 \x20 let __r = {n}__checks(__base.slice(__code.len), &__bits{ctx_args});\n\
+                 \x20 __extern_free(__base as *u8);",
+                l.word_bits / 8
+            );
+        } else {
+            let _ = writeln!(s, "  let __r = {n}__checks(__code, &__bits{ctx_args});");
+        }
+        let _ = writeln!(s, "  if let Err(__e) = __r {{ return Err(__e); }}");
+    }
+    let _ = writeln!(s, "  Ok({})\n}}", proof("__code", if stack { "__max" } else { "0" }));
+    if !v.checks.is_empty() {
+        let _ = writeln!(
+            s,
+            "fn {n}__base_copy(__src: []{w}, __dst: *{w}) {{\n\
+             \x20 var __i: u64 = 0;\n\
+             \x20 while __i < __src.len {{\n\
+             \x20   let __w = {};\n\
+             \x20   let __f = {n}__family(__w);\n\
+             \x20   __dst[__i] = if __f != {} {{ {n}__with_opcode(__w, __f as {w}) }} else {{ __w }};\n\
+             \x20   __i += {n}__base_size(__w);\n\
+             \x20 }}\n}}",
+            real_src(n, jw, "__src[__i]"),
+            u64::MAX
+        );
+        // `reject(at, msg)` in a check: fail at word `at`, with a message.
+        let _ = writeln!(
+            s,
+            "fn {n}__reject(code: []{w}, check: u64, at: u64, msg: str) -> Result<(), {n}__VerifyError> {{\n\
+             \x20 let op = if at < code.len {{ {n}__base_op(code[at]) as u64 }} else {{ {n}__NUM_OPS }};\n\
+             \x20 Err({n}__VerifyError {{ at: at, reason: {n}__VerifyReason.Check, op: op, operand: check, kind: {nk}, msg: if msg.len == 0 {{ \"rejected\" }} else {{ msg }} }})\n}}"
+        );
+        let _ = writeln!(s, "fn {n}__checks(code: []{w}, __bits: *[u8; 65536]{ctx_params}) -> Result<(), {n}__VerifyError> {{");
+        for (i, (name, b)) in v.checks.iter().enumerate() {
+            if v.verify_ctx.iter().any(|p| p.name.name == "code") {
+                return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
+            }
+            let f = &sm.files[b.span.file as usize];
+            let text = f.text[b.span.lo as usize..b.span.hi as usize].to_string();
+            let text = replace_call(&text, "is_insn_boundary", &format!("{n}__boundary(code, __bits, "));
+            let text = replace_call(&text, "reject", &format!("return {n}__reject(code, {i}, "));
+            let _ = writeln!(
+                s,
+                "  {{ let __ok: bool = {text}; if !__ok {{ return Err({n}__VerifyError {{ at: 0, reason: {n}__VerifyReason.Check, op: {n}__NUM_OPS, operand: {i}, kind: {nk}, msg: \"\" }}); }} }}"
+            );
+        }
+        let _ = writeln!(s, "  Ok(())\n}}");
+    }
     // `Vm.build_verified(heap, Obj { .. }, words, ctx..)`: create an object
     // whose last field is `code: verified [W] by Vm`, copy `words` into
     // it and verify them there. The `owner` verify context, if any, is the
@@ -1149,6 +1261,26 @@ fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     s
 }
 
+/// `text` with each call `name(` replaced by `repl` (which ends with the
+/// opening parenthesis), where `name` is a whole word.
+fn replace_call(text: &str, name: &str, repl: &str) -> String {
+    let pat = format!("{name}(");
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(p) = rest.find(&pat) {
+        let prev = rest[..p].chars().next_back().or_else(|| out.chars().next_back());
+        out.push_str(&rest[..p]);
+        if prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            out.push_str(&pat);
+        } else {
+            out.push_str(repl);
+        }
+        rest = &rest[p + pat.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A string as a Loimi string literal.
 fn str_lit(s: &str) -> String {
     let mut bytes = Vec::new();
@@ -1290,7 +1422,12 @@ fn generate_disasm(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
             let _ = writeln!(s, "    {} => {{ let __w = {}; {}}}", o.opcode, real_src(n, jw, "__code[__at]"), body);
         }
     }
-    let _ = writeln!(s, "    _ => {{}}\n  }}\n}}");
+    let _ = writeln!(s, "    _ => {{}}\n  }}");
+    if has_stack(v) {
+        // Stack vms: the op's declared effect.
+        let _ = writeln!(s, "  __out.push_str(\"  ( \"); __out.push_str({n}__stack_effect_text(__w)); __out.push_str(\" )\");");
+    }
+    let _ = writeln!(s, "}}");
     // One instruction, with its offset; superinstructions with their parts.
     let _ = writeln!(s, "{vis}fn {n}__disasm_insn<B>(__code: []{w}, __i: u64, __out: *B) -> u64 {{");
     let _ = writeln!(s, "  if __i >= __code.len {{ return 0; }}");
@@ -1398,6 +1535,7 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
+        let mut externs = false;
         for it in &m.items {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
@@ -1411,6 +1549,14 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     }
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
+                if has_stack(v) {
+                    src.push_str(&generate_stack(sm, v, &l, jit)?);
+                }
+                if (has_stack(v) || !v.checks.is_empty()) && !externs {
+                    // The verifier's scratch arrays (see check::declare_fn).
+                    src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
+                    externs = true;
+                }
                 src.push_str(&generate_labels(v, &l, jit));
                 src.push_str(&generate_disasm(v, &l, jit));
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
@@ -1427,4 +1573,200 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
         m.items.extend(extra);
     }
     Ok(())
+}
+
+/// Does the vm declare stack effects (`op ADD() : N stack(a b -- c)`)?
+pub fn has_stack(v: &VmDecl) -> bool {
+    v.ops.iter().any(|o| o.stack.is_some())
+}
+
+/// Stack VMs: the stack effects of the ops, for the verifier and tools.
+///
+/// - `Vm.stack_effect(w) -> ?(u32, u32)`: (pops, pushes) of the op word
+///   `w` stands for alone (a super's head: its first part), if its counts
+///   depend only on its own operands (`xs[n]` with `n` an operand); None
+///   for `..` and for counts that read the verify context.
+/// - `Vm.stack_effect_text(w) -> str`: the declared effect, `a b -- c`.
+/// - `Vm__stack_counts(w, ctx..)`: (pops, pushes, takes all), with the
+///   verify context.
+/// - `Vm__stack_pass(code, ctx.., depth, work)`: the verifier's stack
+///   check, a worklist pass over the base view of the code (each word as
+///   the op it stands for alone, so superinstructions and quickened
+///   members check as their parts): every path reaching an instruction
+///   agrees on the depth, no instruction pops more than the stack holds,
+///   and an instruction that ends the code (it neither continues nor has a
+///   label) leaves nothing but what it takes (unless it takes `..`).
+///   Returns the maximum growth above `stack_entry`.
+fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<String> {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let jw = maps_words(l, jit);
+    let text = |e: &Expr| -> String {
+        let f = &sm.files[e.span.file as usize];
+        f.text[e.span.lo as usize..e.span.hi as usize].to_string()
+    };
+    for o in &v.ops {
+        if o.stack.is_none() {
+            return Err(Diag::new(
+                o.name.span,
+                format!("vm `{n}` declares stack effects, so every op needs one: add `stack(--)` if `{}` neither pops nor pushes", o.name.name),
+            ));
+        }
+    }
+    let count = |items: &[StackItem]| -> String {
+        let fixed = items.iter().filter(|i| i.count.is_none()).count();
+        let mut terms = vec![fixed.to_string()];
+        for i in items {
+            if let Some(e) = &i.count {
+                terms.push(format!("(({}) as i64)", text(e)));
+            }
+        }
+        terms.join(" + ")
+    };
+    let eff_text = |e: &StackEffect| -> String {
+        let item = |i: &StackItem| match &i.count {
+            Some(c) => format!("{}[{}]", i.name.name, text(c).split_whitespace().collect::<Vec<_>>().join(" ")),
+            None => i.name.name.clone(),
+        };
+        let mut ins: Vec<String> = e.ins.iter().map(item).collect();
+        if e.rest {
+            ins.insert(0, "..".into());
+        }
+        let outs: Vec<String> = e.outs.iter().map(item).collect();
+        let mut s = ins.join(" ");
+        s.push_str(if ins.is_empty() { "--" } else { " --" });
+        if !outs.is_empty() {
+            s.push(' ');
+            s.push_str(&outs.join(" "));
+        }
+        s
+    };
+    // Whether a count expression reads only the op's operands.
+    let operand_only = |e: &Expr, params: &[String]| -> bool {
+        let Ok(toks) = crate::lexer::lex(0, &text(e)) else { return false };
+        let mut prev: Option<&crate::lexer::Tok> = None;
+        for t in &toks {
+            if let crate::lexer::Tok::Ident(x) = &t.tok {
+                let skip = matches!(prev, Some(crate::lexer::Tok::Punct("." | ":")))
+                    || matches!(prev, Some(crate::lexer::Tok::Ident(p)) if p == "as")
+                    || x == "as"
+                    || crate::check::prim_type(x).is_some();
+                if !skip && !params.contains(x) {
+                    return false;
+                }
+            }
+            prev = Some(&t.tok);
+        }
+        true
+    };
+    let mut s = String::new();
+    let rl = real_let(n, jw, "__w");
+    let binds = |o: &OpLayout| -> String {
+        o.fields
+            .iter()
+            .map(|(p, bits, shift, signed)| format!("let {p} = {}; ", decode_src(l.word_bits, *bits, *shift, *signed)))
+            .collect()
+    };
+    let mut params = vec![];
+    let mut args = vec![];
+    for p in &v.verify_ctx {
+        let f = &sm.files[p.ty.span.file as usize];
+        params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
+        args.push(p.name.name.clone());
+    }
+    let ctx_params: String = params.iter().map(|p| format!(", {p}")).collect();
+    let ctx_args: String = args.iter().map(|a| format!(", {a}")).collect();
+    // Counts with the verify context.
+    let _ = writeln!(s, "fn {n}__stack_counts(__w: {w}{ctx_params}) -> (i64, i64, bool) {{ {rl}match {n}__base_op(__w) {{");
+    for (k, o) in l.ops.iter().enumerate() {
+        if !o.parts.is_empty() {
+            continue;
+        }
+        let e = v.ops[k].stack.as_ref().unwrap();
+        let _ = writeln!(s, "  {} => {{ {}({}, {}, {}) }},", o.opcode, binds(o), count(&e.ins), count(&e.outs), e.rest);
+    }
+    let _ = writeln!(s, "  _ => (0, 0, false), }} }}");
+    // Counts for tools, without the context.
+    let _ = writeln!(s, "{vis}fn {n}__stack_effect(__w: {w}) -> ?(u32, u32) {{ {rl}match {n}__base_op(__w) {{");
+    for (k, o) in l.ops.iter().enumerate() {
+        if !o.parts.is_empty() {
+            continue;
+        }
+        let e = v.ops[k].stack.as_ref().unwrap();
+        let params: Vec<String> = o.fields.iter().map(|f| f.0.clone()).collect();
+        let all = e.ins.iter().chain(e.outs.iter()).all(|i| i.count.as_ref().is_none_or(|c| operand_only(c, &params)));
+        if e.rest || !all {
+            continue;
+        }
+        let _ = writeln!(s, "  {} => {{ {}Some((({}) as u32, ({}) as u32)) }},", o.opcode, binds(o), count(&e.ins), count(&e.outs));
+    }
+    let _ = writeln!(s, "  _ => None, }} }}");
+    let _ = writeln!(s, "{vis}fn {n}__stack_effect_text(__w: {w}) -> str {{ {rl}match {n}__base_op(__w) {{");
+    for (k, o) in l.ops.iter().enumerate() {
+        if !o.parts.is_empty() {
+            continue;
+        }
+        let e = v.ops[k].stack.as_ref().unwrap();
+        let _ = writeln!(s, "  {} => {},", o.opcode, str_lit(&eff_text(e)));
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
+    // The pass. `__d[i]` is the depth before word i plus one (0: not
+    // reached yet); `__work` holds each reached word once.
+    let entry = match &v.stack_entry {
+        Some(e) => format!("(({}) as i64)", text(e)),
+        None => "0".to_string(),
+    };
+    let err = |at: &str, reason: &str, op: &str, a: &str, b: &str| {
+        format!("return Err({n}__VerifyError {{ at: {at}, reason: {n}__VerifyReason.{reason}, op: {op}, operand: {a}, kind: {b}, msg: \"\" }});")
+    };
+    let thens: Vec<String> = l
+        .ops
+        .iter()
+        .filter(|o| o.parts.is_empty() && o.then.is_some())
+        .map(|o| format!("__op == {}", o.opcode))
+        .collect();
+    let _ = writeln!(s, "fn {n}__stack_pass(__code: []{w}{ctx_params}, __d: *i64, __work: *u64) -> Result<u32, {n}__VerifyError> {{");
+    let _ = writeln!(s, "  let __entry: i64 = {entry};");
+    let _ = writeln!(s, "  if __entry < 0 or __entry > 2147483647 {{ {} }}", err("0", "StackTooDeep", &format!("{n}__NUM_OPS"), "0", "0"));
+    let _ = writeln!(s, "  __d[0] = __entry + 1;\n  __work[0] = 0;\n  var __nw: u64 = 1;\n  var __hi: i64 = __entry;");
+    let _ = writeln!(s, "  while __nw > 0 {{");
+    let _ = writeln!(s, "    __nw -= 1;\n    let __i = __work[__nw];\n    let __wd = __code[__i];");
+    let _ = writeln!(s, "    let __op = {n}__base_op(__wd) as u64;\n    let __depth = __d[__i] - 1;");
+    let _ = writeln!(s, "    let (__pops, __pushes, __all) = {n}__stack_counts(__wd{ctx_args});");
+    let _ = writeln!(s, "    if __pops < 0 or __pushes < 0 or __pushes > 2147483647 {{ {} }}", err("__i", "StackCount", "__op", "0", "0"));
+    let _ = writeln!(s, "    let __p = if __all {{ __depth }} else {{ __pops }};");
+    let _ = writeln!(s, "    if __p > __depth {{ {} }}", err("__i", "StackUnderflow", "__op", "__depth as u64", "__p as u64"));
+    let _ = writeln!(s, "    let __nd = __depth - __p + __pushes;");
+    let _ = writeln!(s, "    if __nd > __hi {{ __hi = __nd; if __hi > 2147483647 {{ {} }} }}", err("__i", "StackTooDeep", "__op", "0", "0"));
+    let _ = writeln!(s, "    var __succ: [u64; 3] = [0, 0, 0];\n    var __ns: u64 = 0;");
+    let _ = writeln!(s, "    if let Some(__off) = {n}__label(__wd) {{");
+    let _ = writeln!(s, "      let __t = (__i as i64) + __off;");
+    let _ = writeln!(s, "      if __t < 0 or __t >= __code.len as i64 {{ {} }}", err("__i", "BadTarget", "__op", "0", "0"));
+    let _ = writeln!(s, "      __succ[__ns] = __t as u64; __ns += 1;\n    }}");
+    let _ = writeln!(s, "    let __next = __i + {n}__base_size(__wd);");
+    let _ = writeln!(s, "    if {n}__continues(__op) {{");
+    let _ = writeln!(s, "      if __next >= __code.len {{ {} }}", err("__i", "RunsOffEnd", "__op", "0", "0"));
+    let _ = writeln!(s, "      __succ[__ns] = __next; __ns += 1;");
+    if !thens.is_empty() {
+        // `then OP` ops that continue may also skip their follower.
+        let _ = writeln!(
+            s,
+            "      if {} {{ let __skip = __next + {n}__base_size(__code[__next]); if __skip < __code.len {{ __succ[__ns] = __skip; __ns += 1; }} }}",
+            thens.join(" or ")
+        );
+    }
+    let _ = writeln!(s, "    }}");
+    let _ = writeln!(s, "    if __ns == 0 and !__all and __depth != __p {{ {} }}", err("__i", "StackExit", "__op", "__depth as u64", "__p as u64"));
+    let _ = writeln!(s, "    var __k: u64 = 0;\n    while __k < __ns {{");
+    let _ = writeln!(s, "      let __j = __succ[__k];");
+    let _ = writeln!(s, "      if __d[__j] == 0 {{ __d[__j] = __nd + 1; __work[__nw] = __j; __nw += 1; }}");
+    let _ = writeln!(
+        s,
+        "      else if __d[__j] != __nd + 1 {{ {} }}",
+        err("__j", "StackMismatch", &format!("{n}__base_op(__code[__j]) as u64"), "(__d[__j] - 1) as u64", "__nd as u64")
+    );
+    let _ = writeln!(s, "      __k += 1;\n    }}\n  }}");
+    let _ = writeln!(s, "  Ok((__hi - __entry) as u32)\n}}");
+    Ok(s)
 }
