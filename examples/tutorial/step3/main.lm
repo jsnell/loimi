@@ -1,0 +1,54 @@
+// Step 3: the calculator again, compiled to bytecode and run on a vm.
+//
+//   loimi run examples/tutorial/step3/main.lm -- FILE.pip [--disasm]
+
+import std.io;
+import std.os;
+import std.diag;
+import std.mem;
+import std.text;
+import parser;
+import compile;
+import vm.{Calc, Limits};
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else { io.eprintln("usage: step3 <file.pip> [--disasm]"); return 2; };
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
+    let disasm = os.arg(2).is_some();
+    var sm = diag.SourceMap.new();
+    let file = sm.add(path, src);
+    var arena = mem.Arena.new();
+    defer arena.free();
+
+    var stmts = match parser.parse_program(src, file, &arena) {
+        Ok(s) => s,
+        Err(e) => { var d = e.diag(); sm.eprint(&d); return 1; }
+    };
+    let chunk = match compile.compile(&stmts) {
+        Ok(c) => c,
+        Err(msg) => { io.eprint("error: "); io.eprintln(msg); return 1; }
+    };
+
+    if disasm {
+        var out = text.StrBuf.new();
+        Calc.disasm(chunk.code, &out);
+        io.print(out.as_str());
+        out.free();
+    }
+
+    // The verifier proves every operand in range, once, so the handlers
+    // can index registers and constants without bounds checks.
+    var lim = Limits { nregs: chunk.nregs, nconsts: chunk.consts.len as u32 };
+    if let Some(bad) = Calc.verify(chunk.code, &lim) {
+        io.eprint("verify: bad instruction at ");
+        io.print_int(bad as i64);
+        io.eprintln("");
+        return 1;
+    }
+
+    let regs: *i64 = mem.alloc(chunk.nregs as u64);
+    match Calc.run(chunk.code.ptr, regs, chunk.consts.ptr) {
+        Ok(_) => 0,
+        Err(msg) => { io.eprint("error: "); io.eprintln(msg); 1 }
+    }
+}
