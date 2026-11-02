@@ -43,9 +43,6 @@ pub fn fail(line: u32, msg: str) -> never {
     os.quit(1)
 }
 
-fn is_id_start(c: u8) -> bool { lex.is_ident_start(c) or c == '$' }
-fn is_id_char(c: u8) -> bool { lex.is_ident_char(c) or c == '$' }
-
 fn ops() -> lex.OpTable<T> {
     var t: lex.OpTable<T> = lex.OpTable.new();
     t.add("(", T.LParen); t.add(")", T.RParen); t.add("{", T.LBrace); t.add("}", T.RBrace);
@@ -82,9 +79,7 @@ fn keywords() -> lex.Keywords<T> {
 
 /// Tokenize `src`. Strings and names point into `src` or into `arena`.
 pub fn tokenize(src: str, arena: *mem.Arena, out: *mem.Vec<Token>) {
-    var sy = lex.c_like();
-    sy.int_overflow_to_float = true;
-    var cur = lex.Cursor.new(src, 0, sy);
+    var cur = lex.Cursor.new(src, 0, lex.js());
     var optab = ops();
     var kw = keywords();
     var buf = text.StrBuf.new();
@@ -96,11 +91,7 @@ pub fn tokenize(src: str, arena: *mem.Arena, out: *mem.Vec<Token>) {
             break;
         }
         let ch = cur.peek();
-        if is_id_start(ch) {
-            let start = cur.pos;
-            cur.bump();
-            cur.eat_while(is_id_char);
-            let name = cur.since(start);
+        if let Some(name) = cur.ident() {
             let k = kw.get(name) ?? T.Name;
             out.push(Token { kind: k, line: line, num: 0.0, text: name });
             continue;

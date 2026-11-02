@@ -206,6 +206,28 @@ fn main() {
     io.println(line.as_str());
     kw.free();
 
+    // Extra identifier bytes: `$` anywhere (JavaScript), `?`/`!` after
+    // the first byte; the default rejects `$`.
+    var js = lex.js();
+    js.ident_inner = "?!";
+    var jc = lex.Cursor.new("$ $a a$b _$1 empty? ?x 3$", 0, js);
+    line.clear();
+    loop {
+        jc.skip_trivia();
+        let Some(name) = jc.ident() else { break };
+        line.push_str(name);
+        line.push(' ');
+    }
+    line.push_str("rest [");
+    line.push_str(jc.src[jc.pos..jc.src.len]);
+    line.push(']');
+    io.println(line.as_str());
+    var jn = lex.Cursor.new("3$", 0, js);
+    match jn.number() { Ok(_) => io.println("number"), Err(e) => show_err("3$", e) }
+    var dc = lex.Cursor.new("a$b", 0, lex.c_like());
+    io.println(dc.ident() ?? "none");
+    io.print_bool(dc.is_ident_start('$')); io.print_bool(jc.is_ident_start('$')); io.print_bool(jc.is_ident_start('?')); io.print_bool(jc.is_ident_char('?')); io.println("");
+
     // Custom character classes, peeking, marks, line tracking.
     var sc = lex.Cursor.new("set-car! x\n(y)", 0, scheme);
     io.print(sc.eat_while(is_sym));
@@ -293,6 +315,10 @@ fn main() {
 // expect: error 0-2: unfinished long string [[[]
 // expect: ShlEq Shl Le Le EqEq Dots Concat Arrow Minus Minus rest [ x]
 // expect: if=1 iffy=0 then=2 _x9=0 rest [9]
+// expect: $ $a a$b _$1 empty? rest [?x 3$]
+// expect: error 0-2: malformed number [3$]
+// expect: a
+// expect: falsetruefalsetrue
 // expect: set-car! 2 1 true
 // expect: error: unfinished string
 // expect:   --> t.lua:1:5
