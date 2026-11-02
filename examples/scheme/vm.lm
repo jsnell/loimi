@@ -294,30 +294,30 @@ pub vm Scheme {
 
     /// Everything but a call of a closure with exactly its number of
     /// (fixed) parameters: rest parameters, arity errors, builtins and
-    /// `apply`. Sets up the state and returns where to continue.
-    fn call_slow(base: u64, nargs: u64, tail: bool) -> Result<*u32, V> {
+    /// `apply`. Sets up the state and continues there.
+    fn call_slow(base: u64, nargs: u64, tail: bool) -> never {
         var n = nargs;
         var f = regs[base];
         while value.prim_of(f) == Some(builtins.P_APPLY) {
             // (apply proc arg ... list): spread the list into registers.
-            if n < 2 { return Err(rt.err_msg(ctx, "apply: wrong number of arguments")); }
+            if n < 2 { raise rt.err_msg(ctx, "apply: wrong number of arguments") }
             let lst = regs[base + n];
             for i in 0..n - 1 { regs[base + i] = regs[base + 1 + i]; }
             n -= 2;
             var cur = lst;
             while let P(p) = cur {
-                if regs + base + n + 2 >= ctx.stack_end { return Err(rt.err_msg(ctx, "stack overflow")); }
+                if regs + base + n + 2 >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
                 regs[base + 1 + n] = p.car;
                 n += 1;
                 cur = p.cdr;
             }
-            if cur != V.Imm(value.IMM_NIL) { return Err(rt.type_err(ctx, "apply", "list", lst)); }
+            if cur != V.Imm(value.IMM_NIL) { raise rt.type_err(ctx, "apply", "list", lst) }
             f = regs[base];
         }
         if let Clo(cl) = f {
             let p = cl.proto;
             let np = p.nparams as u64;
-            if n < np or (n > np and p.rest == 0) { return Err(arity_err(ctx, cl, n)); }
+            if n < np or (n > np and p.rest == 0) { raise arity_err(ctx, cl, n) }
             let args = regs + base + 1;
             var have = n;
             if p.rest != 0 {
@@ -335,10 +335,10 @@ pub vm Scheme {
                 dst = regs;
                 for i in 0..have { dst[i] = args[i]; }
             } else if fp + 1 >= ctx.frames_end {
-                return Err(rt.err_msg(ctx, "stack overflow (too many nested calls)"));
+                raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
             }
             let nr = p.nregs as u64;
-            if dst + nr >= ctx.stack_end { return Err(rt.err_msg(ctx, "stack overflow")); }
+            if dst + nr >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
             for i in have..nr { dst[i] = Imm(value.IMM_UNSPEC); }
             if !tail {
                 fp.resume = pc + 1;
@@ -349,21 +349,21 @@ pub vm Scheme {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = dst;
-            return Ok(p.code.ptr);
+            jump p.code.ptr
         }
         if let Some(id) = value.prim_of(f) {
             let v = builtins.call_native(ctx, id, regs + base + 1, n)?;
             if !tail {
                 regs[base] = v;
-                return Ok(pc + 1);
+                next
             }
             *(regs - 1) = v;
             fp = fp - 1;
             regs = fp.base;
             k = fp.k;
-            return Ok(fp.resume);
+            jump fp.resume
         }
-        Err(rt.err(ctx, "not a procedure", f))
+        raise rt.err(ctx, "not a procedure", f)
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).
@@ -393,7 +393,7 @@ pub vm Scheme {
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            jump call_slow(base as u64, nargs as u64, false)?
+            call_slow(base as u64, nargs as u64, false)
         }
     }
     /// return R[base](R[base+1] .. R[base+nargs]), reusing this frame.
@@ -419,7 +419,7 @@ pub vm Scheme {
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            jump call_slow(base as u64, nargs as u64, true)?
+            call_slow(base as u64, nargs as u64, true)
         }
     }
     op RET(src: reg) : ABC {
