@@ -585,6 +585,11 @@ pub struct Ics {
     mega: MegaCache,
 }
 
+pub fn Ics.free(ic: *Ics) {
+    ic.poly.free();
+    ic.mega.free();
+}
+
 /// Allocation-site template ("slack tracking"): objects from one site
 /// start with as many inline slots as the site's objects ended up with.
 pub struct Template { proto: u64, inline: u32, max_inline: u32 }
@@ -699,8 +704,7 @@ pub fn Model<O, S, V>.attach(m: *Model<O, S, V>, h: *gc.Heap) { m.shapes.attach(
 
 pub fn Model<O, S, V>.free(m: *Model<O, S, V>) {
     m.shapes.free();
-    m.ic.poly.free();
-    m.ic.mega.free();
+    m.ic.free();
 }
 
 /// The shape for a new object without prototype and with `inline_cap`

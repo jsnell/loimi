@@ -54,6 +54,14 @@ pub fn Lexer.new(src: str, file: u32, arena: *mem.Arena) -> Lexer {
     lx
 }
 
+/// Release the operator and keyword tables and the literal buffer. (The
+/// strings in tokens live in the arena, which the caller owns.)
+pub fn Lexer.free(lx: *Lexer) {
+    lx.ops.free();
+    lx.keywords.free();
+    lx.buf.free();
+}
+
 pub fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
     let c = &lx.cur;
     c.skip_trivia()?;

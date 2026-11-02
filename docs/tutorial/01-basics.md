@@ -149,7 +149,8 @@ are a vm feature (`raise`, chapter 4).
 ## The standard library
 
 `std.io` prints (`print`, `println`, `print_int`, `print_f64`, and the
-`eprint` forms for stderr) and reads files; `std.os` has the command
+`eprint` forms for stderr: `eprint`, `eprintln`, `eprint_int`,
+`eprint_f64`) and reads files; `std.os` has the command
 line; `std.mem` has `Vec<T>` and `Arena`; `std.text` has `StrBuf` and an
 `Interner`:
 

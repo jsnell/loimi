@@ -118,3 +118,12 @@ pub fn Interner.intern(it: *Interner, s: str) -> u32 {
 }
 
 pub fn Interner.name(it: *Interner, id: u32) -> str { it.names.at(id as u64) }
+
+/// Release the table and the interned strings' storage. Names returned
+/// by `name` (and the strings passed to `intern` that were copied) are
+/// invalid afterwards.
+pub fn Interner.free(it: *Interner) {
+    it.ids.free();
+    it.names.free();
+    it.arena.free();
+}
