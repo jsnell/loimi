@@ -1,7 +1,6 @@
 // Strings: building, comparison, parsing, interning.
 
 import std.mem;
-import std.map;
 import std.hash;
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
@@ -101,29 +100,75 @@ pub fn parse_f64(s: str) -> ?f64 {
     Some(v)
 }
 
-/// Interned strings: equal strings get equal ids.
-pub struct Interner { ids: map.HashMap<str, u32>, names: mem.Vec<str>, arena: mem.Arena }
+/// Interned strings: equal strings get equal ids (0, 1, 2, ...).
+///
+/// An open-addressing table of one word per slot, at most half full: the
+/// id + 1 in the low half and the top 32 bits of the string's hash in
+/// the high half, so a probe compares bytes only when the hashes agree.
+pub struct Interner { slots: *u64, mask: u64, names: mem.Vec<str>, arena: mem.Arena }
 
 pub fn Interner.new() -> Interner {
-    Interner { ids: map.HashMap.new(), names: mem.Vec.new(), arena: mem.Arena.new() }
+    Interner { slots: mem.alloc(64), mask: 63, names: mem.Vec.new(), arena: mem.Arena.new() }
+}
+
+/// The id of `s`, if it has one.
+pub fn Interner.find(it: *Interner, s: str) -> ?u32 {
+    let h = hash.bytes(s);
+    let tag = h >> 32;
+    var i = h & it.mask;
+    loop {
+        let w = it.slots[i];
+        if w == 0 { return None; }
+        if w >> 32 == tag {
+            let id = (w & 0xFFFFFFFF) - 1;
+            if it.names.at(id).eq(s) { return Some(id as u32); }
+        }
+        i = (i + 1) & it.mask;
+    }
 }
 
 pub fn Interner.intern(it: *Interner, s: str) -> u32 {
-    if let Some(id) = it.ids.get(s) { return id; }
+    let h = hash.bytes(s);
+    let tag = h >> 32;
+    var i = h & it.mask;
+    loop {
+        let w = it.slots[i];
+        if w == 0 { break; }
+        if w >> 32 == tag {
+            let id = (w & 0xFFFFFFFF) - 1;
+            if it.names.at(id).eq(s) { return id as u32; }
+        }
+        i = (i + 1) & it.mask;
+    }
     let owned = it.arena.str(s);
-    let id = it.names.len as u32;
+    let id = it.names.len;
     it.names.push(owned);
-    it.ids.insert(owned, id);
-    id
+    it.slots[i] = (tag << 32) | (id + 1);
+    if (id + 1) * 2 > it.mask { it.grow(); }
+    id as u32
+}
+
+fn Interner.grow(it: *Interner) {
+    let old = it.slots;
+    let n = it.mask + 1;
+    it.mask = n * 2 - 1;
+    it.slots = mem.alloc(n * 2);
+    for j in 0..n {
+        let w = old[j];
+        if w == 0 { continue; }
+        let h = hash.bytes(it.names.at((w & 0xFFFFFFFF) - 1));
+        var i = h & it.mask;
+        while it.slots[i] != 0 { i = (i + 1) & it.mask; }
+        it.slots[i] = w;
+    }
+    mem.release(old);
 }
 
 pub fn Interner.name(it: *Interner, id: u32) -> str { it.names.at(id as u64) }
 
-/// Release the table and the interned strings' storage. Names returned
-/// by `name` (and the strings passed to `intern` that were copied) are
-/// invalid afterwards.
+/// Release the table, the name list and the interned bytes.
 pub fn Interner.free(it: *Interner) {
-    it.ids.free();
+    mem.release(it.slots);
     it.names.free();
     it.arena.free();
 }

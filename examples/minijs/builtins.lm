@@ -29,6 +29,7 @@ extern "C" fn log(x: f64) -> f64;
 extern "C" fn pow(x: f64, y: f64) -> f64;
 extern "C" fn ceil(x: f64) -> f64;
 extern "C" fn trunc(x: f64) -> f64;
+extern "C" fn memchr(s: *u8, c: i32, n: u64) -> *u8;
 
 /// Call native `id`.
 pub fn call(c: *Ctx, id: u32, this: V, args: *V, n: u64) -> Result<V, V> {
@@ -73,9 +74,10 @@ fn Ctx.native(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) -> V 
 }
 
 /// Define a native method `name` on object `o`.
-fn Ctx.def(c: *Ctx, o: Gc<Obj>, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) {
+fn Ctx.def(c: *Ctx, o: Gc<Obj>, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) -> V {
     let fv = c.native(name, f);
     c.define_hidden(o, c.key(name), fv);
+    fv
 }
 
 fn Ctx.def_global(c: *Ctx, name: str, v: V) {
@@ -128,7 +130,7 @@ pub fn install(c: *Ctx) {
     let ap = c.arr_proto();
     let arr_bag = c.ctor("Array", array_ctor, ap);
     c.def(arr_bag, "isArray", array_is_array);
-    c.def(ap, "push", array_push);
+    c.f_push = c.def(ap, "push", array_push);
     c.def(ap, "pop", array_pop);
     c.def(ap, "shift", array_shift);
     c.def(ap, "unshift", array_unshift);
@@ -145,8 +147,8 @@ pub fn install(c: *Ctx) {
     let sp = c.str_proto();
     let str_bag = c.ctor("String", string_ctor, sp);
     c.def(str_bag, "fromCharCode", string_from_char_code);
-    c.def(sp, "charCodeAt", str_char_code_at);
-    c.def(sp, "charAt", str_char_at);
+    c.f_cca = c.def(sp, "charCodeAt", str_char_code_at);
+    c.f_charat = c.def(sp, "charAt", str_char_at);
     c.def(sp, "indexOf", str_index_of);
     c.def(sp, "lastIndexOf", str_last_index_of);
     c.def(sp, "slice", str_slice);
@@ -183,12 +185,12 @@ pub fn install(c: *Ctx) {
     let math = c.new_object_with(c.objproto, 32);
     c.define_hidden(math, c.key("PI"), V.Num(3.141592653589793));
     c.define_hidden(math, c.key("E"), V.Num(2.718281828459045));
-    c.def(math, "floor", math_floor);
+    c.f_floor = c.def(math, "floor", math_floor);
     c.def(math, "ceil", math_ceil);
     c.def(math, "round", math_round);
     c.def(math, "trunc", math_trunc);
     c.def(math, "abs", math_abs);
-    c.def(math, "sqrt", math_sqrt);
+    c.f_sqrt = c.def(math, "sqrt", math_sqrt);
     c.def(math, "sin", math_sin);
     c.def(math, "cos", math_cos);
     c.def(math, "tan", math_tan);
@@ -597,10 +599,18 @@ fn str_char_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
 }
 
 fn find_from(h: str, needle: str, from: u64) -> i64 {
-    if needle.len > h.len { return -1; }
+    let n = needle.len;
+    if n > h.len or from > h.len - n { return -1; }
+    if n == 0 { return from as i64; }
+    // memchr for the first byte, then compare the rest.
+    let c0 = needle[0] as i32;
+    let last = h.len - n;
     var i = from;
-    while i + needle.len <= h.len {
-        if h[i..i + needle.len].eq(needle) { return i as i64; }
+    while i <= last {
+        let p = memchr(h.ptr + i, c0, last - i + 1);
+        if (p as u64) == 0 { return -1; }
+        i = (p as u64) - (h.ptr as u64);
+        if n == 1 or mem.memcmp(h.ptr + i + 1, needle.ptr + 1, n - 1) == 0 { return i as i64; }
         i += 1;
     }
     -1

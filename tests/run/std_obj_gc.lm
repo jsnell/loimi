@@ -154,7 +154,8 @@ fn World.site_read(w: *World, o: Gc<Obj>, i: u64, k: u64) {
         w.rstates.set(k, ns);
         v = x;
     }
-    let got = match v { Some(x) => value_of(x), None => ABSENT };
+    // Absent-property hits give nil (no property holds nil here).
+    let got = match v { Some(Nil) => ABSENT, Some(x) => value_of(x), None => ABSENT };
     let fresh = match w.m.get_chain(o, k) { Some(x) => value_of(x), None => ABSENT };
     if got != fresh {
         if w.errors < 5 { io.println("stale read site"); }
@@ -162,10 +163,15 @@ fn World.site_read(w: *World, o: Gc<Obj>, i: u64, k: u64) {
     }
 }
 
-/// A write site for key `k`: own stores and cached adds.
+/// A write site for key `k`: own stores, cached adds, polymorphic and
+/// megamorphic stores.
 fn World.site_write(w: *World, o: Gc<Obj>, k: u64, v: Value) {
     let s = w.wsites.ptr_at(k);
     let st = w.wstates.at(k);
+    if (st == obj.IcState.Poly and w.m.poly_set(o, s.ent, v)) or (st == obj.IcState.Mega and w.m.mega_set(o, k, v)) {
+        w.site_hits += 1;
+        return;
+    }
     if (st == obj.IcState.OwnIn or st == obj.IcState.OwnOut) and o.shape.id == s.sid {
         w.m.store_ref(o, s.slot, v);
         w.site_hits += 1;
@@ -176,7 +182,8 @@ fn World.site_write(w: *World, o: Gc<Obj>, k: u64, v: Value) {
         w.site_hits += 1;
         return;
     }
-    w.wstates.set(k, w.m.write_miss(s, o, k, v));
+    let from = if st == obj.IcState.Add or (st != obj.IcState.Poly and st != obj.IcState.Mega and w.rand(2) == 0) { obj.IcState.Generic } else { st };
+    w.wstates.set(k, w.m.write_miss_in(s, from, o, k, v));
 }
 
 fn World.step(w: *World) {
@@ -267,6 +274,7 @@ fn main() uses gc {
     // Small budgets, so sites go through every state.
     w.m.ic.refills = 2;
     w.m.ic.resets = 2;
+    w.m.ic.absent = true;
     // Keep few dead ids, so the table forgets now and then.
     w.m.shapes.retain = 64;
     for k in 0..KEYS {

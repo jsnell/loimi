@@ -1,0 +1,138 @@
+// std.obj: absent-property hits in Poly and Mega entries (and their
+// invalidation when the key appears on the receiver's chain), store
+// sites that go polymorphic and megamorphic, and `has_mega`.
+import std.io;
+import std.gc;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, proto: ?Gc<Obj>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+struct World { heap: gc.Heap, m: obj.Model<Gc<Obj>, Gc<Slots>, Value> }
+
+fn World.obj(w: *World, proto: ?Gc<Obj>, n: u32) -> Gc<Obj> {
+    new(&w.heap, Obj { shape: w.m.root_for(proto, n), dict: None, overflow: None, proto: proto }, n as u64)
+}
+
+fn int(v: ?Value) -> i64 {
+    match v {
+        Some(Int(i)) => i as i64,
+        Some(Nil) => -1,
+        None => -2,
+        _ => -3,
+    }
+}
+
+fn show(label: str, x: i64) { io.print(label); io.print(" "); io.print_int(x); io.println(""); }
+fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); io.println(""); }
+
+const X: u64 = 1;
+const Y: u64 = 2;
+const Z: u64 = 3;
+
+fn empty_site() -> obj.Site { obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 } }
+
+fn absent(w: *World) {
+    let base = w.obj(None, 2);
+    w.m.make_proto(base);
+    w.m.set(base, Y, Value.Int(5));
+    let a = w.obj(Some(base), 2);
+    w.m.set(a, X, Value.Int(1));
+    let lone = w.obj(None, 2);
+    w.m.set(lone, X, Value.Int(2));
+    // A generic read site that finds nothing goes polymorphic with an
+    // absent hit.
+    var s = empty_site();
+    let (v, st) = w.m.read_miss(&s, obj.IcState.Generic, a, Z);
+    show("read z", int(v));
+    yes("poly", st == obj.IcState.Poly);
+    show("poly hit", int(w.m.poly_get(a, s.ent)));
+    let (v2, st2) = w.m.read_miss(&s, obj.IcState.Poly, lone, Z);
+    show("read z on a lone object", int(v2));
+    yes("still poly", st2 == obj.IcState.Poly);
+    show("lone hit", int(w.m.poly_get(lone, s.ent)));
+    // The key appears on the prototype: the absent hit misses.
+    w.m.set(base, Z, Value.Int(9));
+    show("after the prototype got z", int(w.m.poly_get(a, s.ent)));
+    let (v3, _) = w.m.read_miss(&s, obj.IcState.Poly, a, Z);
+    show("refilled", int(v3));
+    show("hit", int(w.m.poly_get(a, s.ent)));
+    // Mega: the same through the shared cache.
+    var e = obj.Hit.empty();
+    show("mega read", int(w.m.read_mega(&w.m.ic.mega, a, Y)));
+    show("mega absent", int(w.m.read_mega(&w.m.ic.mega, lone, Y)));
+    show("mega absent hit", int(w.m.mega_get(lone, Y)));
+    w.m.set(lone, Y, Value.Int(3));
+    show("own add changes the shape", int(w.m.mega_get(lone, Y)));
+    yes("has y", w.m.has_mega(a, Y));
+    yes("has w", w.m.has_mega(a, 77));
+    yes("has w again", w.m.has_mega(a, 77));
+    w.m.set(base, 77, Value.Int(0));
+    yes("has w after the prototype got it", w.m.has_mega(a, 77));
+    yes("empty hit unused", e.sid == obj.EMPTY_ID);
+}
+
+fn writes(w: *World) {
+    // Ten shapes through one store site.
+    var objs: [Gc<Obj>; 10] = [w.obj(None, 2); 10];
+    for i in 0..10 {
+        let o = w.obj(None, 2);
+        for j in 0..i { w.m.set(o, 10 + j as u64, Value.Int(0)); }
+        w.m.set(o, X, Value.Int(0));
+        objs[i] = o;
+    }
+    var s = empty_site();
+    var st = obj.IcState.Generic;
+    var polys = 0;
+    var megas = 0;
+    for round in 0..40 {
+        for i in 0..10 {
+            let o = objs[i];
+            let v = Value.Int((round * 10 + i) as i32);
+            var done = false;
+            if st == obj.IcState.OwnIn and o.shape.id == s.sid { o.inline.ptr[s.slot] = v; done = true; }
+            if st == obj.IcState.Poly and w.m.poly_set(o, s.ent, v) { done = true; }
+            if st == obj.IcState.Mega and w.m.mega_set(o, X, v) { done = true; }
+            if !done { st = w.m.write_miss_in(&s, st, o, X, v); }
+            if st == obj.IcState.Poly { polys += 1; }
+            if st == obj.IcState.Mega { megas += 1; }
+        }
+    }
+    yes("went poly", polys > 0);
+    yes("went mega", megas > 0);
+    var ok = true;
+    for i in 0..10 { if int(w.m.get(objs[i], X)) != (390 + i) as i64 { ok = false; } }
+    yes("all stores landed", ok);
+}
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), m: obj.Model.new(new_slots, Value.Nil) };
+    w.m.attach(&w.heap);
+    w.m.ic.absent = true;
+    absent(&w);
+    writes(&w);
+}
+// expect: read z -2
+// expect: poly true
+// expect: poly hit -1
+// expect: read z on a lone object -2
+// expect: still poly true
+// expect: lone hit -1
+// expect: after the prototype got z -2
+// expect: refilled 9
+// expect: hit 9
+// expect: mega read 5
+// expect: mega absent -2
+// expect: mega absent hit -1
+// expect: own add changes the shape -2
+// expect: has y true
+// expect: has w false
+// expect: has w again false
+// expect: has w after the prototype got it true
+// expect: empty hit unused true
+// expect: went poly true
+// expect: went mega true
+// expect: all stores landed true

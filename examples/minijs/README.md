@@ -59,6 +59,23 @@ only for exact quotients; `===` compares Int with Num numerically; and
 `value.number(x)` normalizes natives' results. `-0`, `NaN` and `x - 0` (not
 `x + -0`, so no `ADDI` for it) are handled where they matter.
 
+**Arithmetic** is quickened as in Mini: `ADD`, `SUB` and `MUL` are
+families whose generic member tests (Int, Int) first; a site that sees
+two floats becomes `_F`, which adds the raw words as doubles and keeps a
+result that is not a NaN (a tagged word is a NaN as a double), and a site
+that first sees an Int and a Num becomes `_IF`/`_FI`. Quickening re-runs
+`JS.optimize` on the function, so supers of quickened members
+(`MUL_F; ADD_F`) form. `DIV` divides the raw words first. Bit operations
+and `%` have forms with an Int constant (`SHLK`, `BORK`, `MODK`, ...),
+and conditions compare with small constants directly (`JLTI`, `JGEI`).
+
+**The compiler** folds top-level `const`s initialized with literals
+(SPEC.md rules out reading them before their declaration), compiles
+`switch` on Int cases in a small range to a jump table (`SWITCHI` and
+one `JMP` per value), puts loop tests at the bottom, and drops the
+`TONUM` of `x++` when the old value is unused. `MINIJS_DIS=1` prints
+every function's code after fusion (`JS.disasm`).
+
 **Strings** are byte strings (MiniJS programs are ASCII). They are not
 interned: `===` compares bytes (after pointer equality). Property names
 are *keys*: small integers from a `text.Interner` that never die, cached
@@ -128,13 +145,21 @@ states:
     full entry starts over up to 8 times before the site goes
     megamorphic;
   - `_MEGA`: std.obj's shared `MegaCache`, own and prototype hits;
+  - reads of absent properties (`o.z === undefined` across shapes) are
+    cached too, in Poly and Mega entries (std.obj's `ic.absent`): the
+    receiver's shape plus the validity cell of its prototype;
   - `_AP` / `_SP`: methods of arrays and strings (`a.push`,
     `s.charCodeAt`), MiniJS's own: the receiver's variant plus the shape
-    of `Array.prototype` / `String.prototype`.
+    of `Array.prototype` / `String.prototype`. A rope receiver is
+    replaced by its flat string in its register, so a loop over
+    `s.charCodeAt(i)` flattens once.
 - `SETPROP`: `_IN` / `_OUT` stores, and `_ADD`, a cached transition
   (old shape → new shape, inline slot) for the property adds that
   constructors do. The shape check is enough: objects that are
-  prototypes have shapes in std.obj's prototype tree.
+  prototypes have shapes in std.obj's prototype tree. A store site that
+  keeps missing becomes `_POLY` (up to eight own-slot entries), then
+  `_MEGA` (stores through the shared `MegaCache`), from std.obj's
+  `write_miss_in`. `key in o` goes through the `MegaCache` too.
 
 **Shape ids across collections.** When the last object of a shape dies,
 the shape is collected, but std.obj keeps its id for the path that built
@@ -149,10 +174,19 @@ R0 is `this`, R1.. the parameters. `CALL base n` takes the callee from
 R[base], `this` from R[base+1] and the arguments above it, so the
 callee's window starts at base+1 and nothing is copied. The fast path
 covers every bytecode function except class constructors, whatever the
-argument count: missing parameters and the rest of the window are
-cleared, extra arguments are overwritten by locals. Natives are called
-from CALL's hot path too. `new` frames are flagged so that `RET` returns
-`this` unless the constructor returns an object.
+argument count: the registers above the fixed parameters are cleared
+two at a time (the register after the window may be cleared too: it is
+free), missing arguments in a cold block, and extra arguments are
+overwritten by locals. `new` frames and the bottom frame are flagged, so
+`RET` tests one word before returning. A call's result is used where it
+lands (`return f(x)` returns from the call base).
+
+`CALL` is a family: a site whose callee is `charCodeAt`, `charAt`,
+`push`, `Math.floor` or `Math.sqrt` (with one argument) becomes a member
+that compares the callee with that native and runs it inline
+(`CALL_CCA`, `CALL_PUSH`, ...); other callees, or arguments outside the
+inline case, take the native (or generic) path. Other natives are
+called out of line.
 
 Derived constructors keep the pre-allocated object in a hidden register
 until `super(...)` returns (`SUPERDONE`); until then `this` reads are
@@ -191,7 +225,11 @@ Natives receive `this` and the arguments in place. They allocate but
 never collect, and never call back into the VM: the array methods that
 take callbacks, including a stable merge sort, are JavaScript in the
 prelude, compiled and run before the program. That keeps the VM free of
-`reenter`.
+`reenter`. It costs little: `data.map(f)` runs as fast as the same loop
+written in the program (0.136 s against 0.149 s for 6M elements), and
+as fast as V8's native `map` in `--jitless` mode (0.128 s); a VM-level
+"call a closure per element" op could only save the loop's own
+dispatches (about half of a trivial callback's cost).
 
 `Number::toString` uses `std.num.write_js` (added to std.num): the
 shortest round-trip digits from `std.num.shortest`, laid out by
@@ -238,6 +276,12 @@ them, and `this` in arrow functions created in a derived constructor
 before `super()`.
 
 ## Performance
+
+**Current numbers and the changelog of the performance pass are in
+[`bench/minijs/RESULTS.md`](../../bench/minijs/RESULTS.md)**: after it,
+MiniJS takes 0.53 of node --jitless's time and 0.40 of QuickJS's
+(geometric means over the 14 benchmarks), 0.23-0.82 per benchmark
+against V8's interpreter. The tables below are from before that pass.
 
 CPU seconds (user + system), best of 3, `--dispatch=tailcall`, on the
 shared 8-core development machine while other agents were running

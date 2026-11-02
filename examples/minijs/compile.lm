@@ -28,6 +28,9 @@ import ast;
 import ast.{T, K, VK, Node, Func, Class, Member, Var, fail, is_null, null_node, null_var, null_func, new_node, new_func, new_var};
 import parser.{Parser};
 import vm.{JS};
+import std.io;
+
+extern "C" fn getenv(name: *u8) -> ?*u8;
 
 // ── pass 1: resolve ─────────────────────────────────────────────────
 
@@ -201,6 +204,9 @@ fn Res.stmt(r: *Res, n: *Node) {
                 let d = n.list.at(i);
                 if (d.vr as u64) == 0 { d.vr = r.declare(d.text, VK.Let, d.flag); }
                 r.expr(d.a);
+                if n.op == T.Const and d.vr.kind == VK.Global and is_literal(d.a) {
+                    if is_null(d.vr.cval) { d.vr.cval = d.a; } else { d.vr.assigned = true; }
+                }
             }
         }
         ExprStmt => r.expr(n.a),
@@ -267,6 +273,20 @@ fn Res.stmt(r: *Res, n: *Node) {
         ClassDecl => r.class(n.cls),
         _ => fail(n.line, "unexpected statement"),
     }
+}
+
+fn is_literal(n: *Node) -> bool {
+    if is_null(n) { return false; }
+    match n.kind {
+        Num | Str | True | False | Null => true,
+        _ => false,
+    }
+}
+
+/// The literal a global constant always holds, if it is one.
+fn const_global(v: *Var) -> *Node {
+    if v.kind == VK.Global and !v.assigned and !v.undeclared { return v.cval; }
+    null_node()
 }
 
 fn Res.class(r: *Res, c: *Class) {
@@ -500,6 +520,8 @@ fn Gen.var_reg(g: *Gen, v: *Var) -> ?u32 {
 
 fn Gen.load_var(g: *Gen, v: *Var, dst: u32) {
     if v.kind == VK.Global {
+        let c = const_global(v);
+        if !is_null(c) { g.to(c, dst); return; }
         if v.undeclared {
             let k = g.str_const(v.name);
             g.emit(JS.THROWREF(0, k as u16));
@@ -604,6 +626,11 @@ fn has_assign(n: *Node) -> bool {
 fn Gen.any_before(g: *Gen, n: *Node, later: *Node) -> u32 {
     if n.kind == K.Name and let Some(r) = g.var_reg(n.vr) and !has_assign(later) { return r; }
     if n.kind == K.This and (n.vr as u64) != 0 and !n.vr.owner.derived and let Some(r) = g.var_reg(n.vr) { return r; }
+    // A call leaves its result in a fresh temporary: use it in place.
+    if n.kind == K.Call or n.kind == K.New or n.kind == K.SuperCall {
+        g.fs.code.set_loc(n.line);
+        return g.call(n);
+    }
     let t = g.temp();
     g.to(n, t);
     t
@@ -620,6 +647,10 @@ fn Gen.const_value(g: *Gen, n: *Node) -> ?V {
         False => Some(V.Bool(false)),
         Num => Some(value.number(n.num)),
         Str => Some(V.S(g.ctx.key_str(g.ctx.key(n.text)))),
+        Name => {
+            let c = const_global(n.vr);
+            if is_null(c) { None } else { g.const_value(c) }
+        }
         _ => None,
     }
 }
@@ -745,6 +776,31 @@ g.closure(n.fun, dst);
                 }
             }
             if n.op == T.Instanceof { fail(n.line, "instanceof is not supported"); }
+            // Bit operations and `%` with an Int constant.
+            let kop = n.op == T.Amp or n.op == T.Pipe or n.op == T.Caret or n.op == T.Shl or n.op == T.Shr or n.op == T.UShr or n.op == T.Percent;
+            if kop and n.b.kind == K.Num and let Int(_) = value.number(n.b.num) {
+                let a = g.any(n.a);
+                let k = g.konst(value.number(n.b.num));
+                if k < 256 {
+                    let (d, x, y) = (dst as u8, a as u8, k as u8);
+                    match n.op {
+                        Amp => g.emit(JS.BANDK(d, x, y)),
+                        Pipe => g.emit(JS.BORK(d, x, y)),
+                        Caret => g.emit(JS.BXORK(d, x, y)),
+                        Shl => g.emit(JS.SHLK(d, x, y)),
+                        Shr => g.emit(JS.SHRK(d, x, y)),
+                        UShr => g.emit(JS.USHRK(d, x, y)),
+                        _ => g.emit(JS.MODK(d, x, y)),
+                    };
+                    g.reset(m);
+                    return;
+                }
+                let b = g.temp();
+                g.load_const(value.number(n.b.num), b);
+                g.arith(n.op, dst, a, b);
+                g.reset(m);
+                return;
+            }
             let a = g.any_before(n.a, n.b);
             let b = g.any(n.b);
             g.arith(n.op, dst, a, b);
@@ -922,7 +978,7 @@ fn Gen.update(g: *Gen, n: *Node, dst: u32, want: bool) {
         let old = g.temp();
         let nw = g.temp();
         g.load_var(t.vr, old);
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.store_var(t.vr, nw);
         if want { g.mov(dst, if prefix { nw } else { old }); }
@@ -934,13 +990,13 @@ fn Gen.update(g: *Gen, n: *Node, dst: u32, want: bool) {
     let nw = g.temp();
     if t.kind == K.Member {
         g.get_prop(old, o, t.text);
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.set_prop(o, t.text, nw);
     } else {
         let k = g.any(t.b);
         g.emit(JS.GETINDEX(old as u8, o as u8, k as u8));
-        g.emit(JS.TONUM(old as u8, old as u8));
+        if want and !prefix { g.emit(JS.TONUM(old as u8, old as u8)); }
         g.emit(JS.ADDI(nw as u8, old as u8, delta));
         g.emit(JS.SETINDEX(o as u8, k as u8, nw as u8));
     }
@@ -1140,6 +1196,32 @@ fn Gen.cond(g: *Gen, n: *Node, jump_if: bool, l: bc.Label) {
                     return;
                 }
             }
+            let ordered = op == T.Lt or op == T.Gt or op == T.Le or op == T.Ge;
+            if ordered and (small_int(n.b).is_some() or small_int(n.a).is_some()) {
+                // Against a small integer: x < 5, 0 <= x, ...
+                let pol: u8 = if jump_if { 1 } else { 0 };
+                var o = op;
+                var x = n.a;
+                var c: i32 = 0;
+                if let Some(v) = small_int(n.b) {
+                    c = v;
+                } else {
+                    c = small_int(n.a) ?? 0;
+                    x = n.b;
+                    o = match op { Lt => T.Gt, Gt => T.Lt, Le => T.Ge, _ => T.Le };
+                }
+                let a = g.any(x);
+                let (r, k) = (a as u8, c as i8);
+                match o {
+                    Lt => g.emit(JS.JLTI(pol, r, k)),
+                    Le => g.emit(JS.JLEI(pol, r, k)),
+                    Gt => g.emit(JS.JGTI(pol, r, k)),
+                    _ => g.emit(JS.JGEI(pol, r, k)),
+                };
+                g.jump(l);
+                g.reset(m);
+                return;
+            }
             if op == T.Lt or op == T.Gt or op == T.Le or op == T.Ge or op == T.EqEqEq or op == T.NotEqEq {
                 let a = g.any_before(n.a, n.b);
                 let b = g.any(n.b);
@@ -1256,7 +1338,7 @@ fn count_this_props(n: *Node) -> u32 {
 fn ctor_hint(f: *Func) -> u32 {
     var c: u32 = 0;
     for i in 0..f.body.len { c += count_this_props(f.body.at(i)); }
-    if c < 4 and !f.derived { c = 4; }
+    if c == 0 and !f.derived { c = 4; }
     if c > 32 { c = 32; }
     c
 }
@@ -1315,6 +1397,16 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
         fail(f.line, b.as_str());
     }
     JS.optimize(proto.code);
+    if getenv("MINIJS_DIS\0".ptr).is_some() {
+        // Debugging aid: the function's code after peephole fusion.
+        var b = text.StrBuf.new();
+        b.push_str("== ");
+        b.push_str(f.name);
+        b.push_str("\n");
+        JS.disasm(proto.code, &b);
+        io.eprint(b.as_str());
+        b.free();
+    }
     fs.code.free();
     fs.consts.free();
     fs.protos.free();
@@ -1442,11 +1534,12 @@ fn Gen.stmt(g: *Gen, n: *Node) {
         While => {
             let li = g.push_loop(true);
             let l = g.loop_at(li);
+            // The test is at the bottom: one branch per iteration.
+            g.jump(l.cont);
             let top = g.fs.code.here();
-            g.bind(l.cont);
-            g.cond(n.a, false, l.brk);
             g.stmt(n.b);
-            g.jump(top);
+            g.bind(l.cont);
+            g.cond(n.a, true, top);
             g.bind(l.brk);
             g.fs.loops.truncate(li);
         }
@@ -1488,6 +1581,11 @@ fn Gen.stmt(g: *Gen, n: *Node) {
                 // local's register.
                 if is_null(n.a) { g.emit(JS.RETU()); return; }
                 if n.a.kind == K.Name and let Some(r) = g.var_reg(n.a.vr) { g.emit(JS.RET(r as u8)); return; }
+                let m = g.mark();
+                let r = g.any(n.a);
+                g.emit(JS.RET(r as u8));
+                g.reset(m);
+                return;
             }
             let lvl = g.fs.regs.enter();
             let r = g.fs.regs.nactive;
@@ -1532,8 +1630,10 @@ fn Gen.for_stmt(g: *Gen, n: *Node) {
     if !is_null(n.a) { g.stmt(n.a); }
     let li = g.push_loop(true);
     let l = g.loop_at(li);
+    // The test is at the bottom: one branch per iteration.
+    let test = g.label();
+    if !is_null(n.b) { g.jump(test); }
     let top = g.fs.code.here();
-    if !is_null(n.b) { g.cond(n.b, false, l.brk); }
     g.stmt(n.d);
     g.bind(l.cont);
     // Per-iteration bindings: closures made in this iteration keep its box.
@@ -1542,7 +1642,13 @@ fn Gen.for_stmt(g: *Gen, n: *Node) {
         if v.kind != VK.Global and boxed(v) { g.emit(JS.REBOX(v.reg as u8)); }
     }
     if !is_null(n.c) { g.fs.regs.end_stmt(); g.effect(n.c); }
-    g.jump(top);
+    if is_null(n.b) {
+        g.jump(top);
+    } else {
+        g.bind(test);
+        g.fs.regs.end_stmt();
+        g.cond(n.b, true, top);
+    }
     g.bind(l.brk);
     g.fs.loops.truncate(li);
     g.fs.regs.leave(lvl);
@@ -1559,15 +1665,13 @@ fn Gen.for_each(g: *Gen, n: *Node) {
     g.emit(JS.LOADI(idx as u8, 0));
     let li = g.push_loop(true);
     let l = g.loop_at(li);
+    // The test is at the bottom: one branch per iteration.
+    let test = g.label();
+    g.jump(test);
     let top = g.fs.code.here();
     let inner = g.fs.regs.enter();
     g.enter_vars(&n.vars);
     let m = g.mark();
-    let len = g.temp();
-    g.emit(JS.GETLEN(len as u8, arr as u8));
-    g.emit(JS.JLT(0, idx as u8, len as u8));
-    g.jump(l.brk);
-    g.reset(m);
     let v = if n.a.kind == K.VarDecl { n.a.list.at(0).vr } else { n.a.vr };
     if let Some(r) = g.var_reg(v) {
         g.emit(JS.GETINDEX(r as u8, arr as u8, idx as u8));
@@ -1587,7 +1691,13 @@ fn Gen.for_each(g: *Gen, n: *Node) {
     g.bind(l.cont);
     g.fs.regs.leave(inner);
     g.emit(JS.ADDI(idx as u8, idx as u8, 1));
+    g.bind(test);
+    let mt = g.mark();
+    let len = g.temp();
+    g.emit(JS.GETLEN(len as u8, arr as u8));
+    g.emit(JS.JLT(1, idx as u8, len as u8));
     g.jump(top);
+    g.reset(mt);
     g.bind(l.brk);
     g.fs.loops.truncate(li);
     g.fs.regs.leave(lvl);
@@ -1604,14 +1714,72 @@ fn Gen.switch_stmt(g: *Gen, n: *Node) {
     let l = g.loop_at(li);
     var labels: mem.Vec<bc.Label> = mem.Vec.new();
     var default_label: ?bc.Label = None;
+    // Integer cases in a small range: a jump table.
+    var lo: i32 = 0x7FFFFFFF;
+    var hi: i32 = -0x7FFFFFFF;
+    var ncase: u64 = 0;
+    var dense = true;
+    for i in 0..n.list.len {
+        let c = n.list.at(i);
+        if c.flag == 1 { continue; }
+        ncase += 1;
+        if let Some(Int(x)) = g.const_value(c.a) {
+            if x < lo { lo = x; }
+            if x > hi { hi = x; }
+        } else {
+            dense = false;
+        }
+    }
+    let width = (hi as i64) - (lo as i64) + 1;
+    if dense and ncase >= 3 and width <= 255 and width <= 8 * ncase as i64 + 32 {
+        for i in 0..n.list.len { labels.push(g.label()); if n.list.at(i).flag == 1 { default_label = Some(labels.at(i)); } }
+        let dflt = default_label ?? l.brk;
+        let kl = g.konst(V.Int(lo));
+        if kl < 256 {
+            g.emit(JS.SWITCHI(d as u8, kl as u8, width as u8));
+            for v in 0..width {
+                var target = dflt;
+                for i in 0..n.list.len {
+                    let c = n.list.at(i);
+                    if c.flag == 1 { continue; }
+                    if let Some(Int(x)) = g.const_value(c.a) and (x as i64) == lo as i64 + v { target = labels.at(i); break; }
+                }
+                g.jump(target);
+            }
+            g.jump(dflt);
+            for i in 0..n.list.len {
+                let c = n.list.at(i);
+                g.bind(labels.at(i));
+                g.hoist_functions(&c.list);
+                g.stmts(&c.list);
+            }
+            g.bind(l.brk);
+            labels.free();
+            g.fs.loops.truncate(li);
+            g.fs.regs.leave(lvl);
+            return;
+        }
+        labels.clear();
+        default_label = None;
+    }
     for i in 0..n.list.len {
         let c = n.list.at(i);
         let cl = g.label();
         labels.push(cl);
         if c.flag == 1 { default_label = Some(cl); continue; }
         let m = g.mark();
-        let t = g.any(c.a);
-        g.emit(JS.JEQ(1, d as u8, t as u8));
+        var done = false;
+        if let Some(kv) = g.const_value(c.a) {
+            let k = g.konst(kv);
+            if k < 256 {
+                g.emit(JS.JEQK(1, d as u8, k as u8));
+                done = true;
+            }
+        }
+        if !done {
+            let t = g.any(c.a);
+            g.emit(JS.JEQ(1, d as u8, t as u8));
+        }
         g.jump(cl);
         g.reset(m);
     }

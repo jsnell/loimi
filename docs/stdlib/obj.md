@@ -562,6 +562,21 @@ family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
   shape check: a store and a shape change, with no check that the object
   needs its validity cell invalidated, because objects with cells have
   shapes of their own (below).
+- `m.write_miss_in(site, state, o, key, v)` is `write_miss` for a site
+  in a given state, with polymorphic stores: a monomorphic store site
+  that misses `m.ic.refills` times becomes `Poly` (own-slot hits;
+  `m.poly_set(o, ent, v)` is the hit), and a Poly entry that fills up
+  `m.ic.resets` times makes it `Mega`, which stores through the shared
+  cache (`m.mega_set(o, key, v)`, only while `m.ic.readonly` is 0) and
+  fills it in its slow path but never changes state again.
+- With `m.ic.absent` set (off by default), reads that find nothing are
+  cached too, as hits with slot `obj.ABSENT` in Poly and Mega entries
+  (monomorphic members cannot express them, so such a read makes a
+  site polymorphic at once): the receiver's shape id and the validity
+  cell of its prototype (0 without one). `poly_get`, `mega_get` and
+  `hit` give `nil` for them, so turn this on only for languages where
+  reading an absent property gives nil. `m.has_mega(o, key)` is `key in
+  o` through the shared cache (`tests/run/std_obj_absent.lm`).
 - `m.get_fill(o, key, &shape_word, &slot_word)` and `m.set_fill(..)` are
   the slow paths of a vm that only wants monomorphic own-property caches
   (`tests/run/std_obj_ic.lm`).

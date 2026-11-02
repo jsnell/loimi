@@ -23,8 +23,8 @@ See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on
 the standard library's shape and inline-cache support. On its 14
 clean-room benchmarks it is faster than V8's bytecode interpreter
-(`node --jitless`, 0.33–0.97× of its time) and faster than QuickJS, on
-every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
+(`node --jitless`: 0.53× of its time by geometric mean, 0.23–0.82× per
+benchmark) and faster than QuickJS (0.40×), on every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
 [`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
 public r7rs-benchmarks suite. By geometric mean it takes 0.39× of Gauche's
 time and 0.62× of Guile 3's time with Guile's JIT off. Guile with its JIT
