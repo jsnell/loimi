@@ -232,7 +232,8 @@ impl VmLayout {
             (false, _) => format!("({})", o.parts.iter().map(|&p| self.size_src(vm, p)).collect::<Vec<_>>().join(" + ")),
         }
     }
-    /// `part_offsets` with offsets as source expressions.
+    /// Each part of op `i` (`i` itself if it is not a super) with its
+    /// word offset from the head, as a source expression.
     pub fn part_offsets_src(&self, vm: &str, i: usize) -> Vec<(String, usize)> {
         let o = &self.ops[i];
         if o.parts.is_empty() {

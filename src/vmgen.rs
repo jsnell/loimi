@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::codegen::{llty, ret_llty, FnGen};
-use crate::diag::Span;
 use crate::tir::*;
 
 #[derive(Clone, Debug)]
@@ -348,13 +347,9 @@ fn state_args(g: &mut FnGen, vd: &VmDef) -> String {
     args.join(", ")
 }
 
-/// Tail-call `callee` (a handler-like function) with the current state.
-pub fn tail_call(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
-    tail_to(g, vd, callee, insn)
-}
-
-/// Transfer control to `target` (already stored in the pc slot).
-fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
+/// Tail-call `callee` (a handler-like function) with the current state:
+/// the target is already stored in the pc slot.
+pub fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
     let hg = g.vm.clone().unwrap();
     let args = format!("{}, i{} {}", state_args(g, vd), vd.word.bits, insn);
     let rt = ret_llty(g.p(), &vd.ret);
@@ -464,17 +459,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         }
         TVm::Raise(x) => {
             let v = g.val(x);
-            let hg = g.vm.clone().unwrap();
-            let p = g.p();
-            let vd = &p.vms[hg.vm as usize];
-            g.store(&x.ty, &v, &hg.raise_slot);
-            if hg.combined {
-                g.br(&hg.raise_label);
-            } else {
-                let sym = format!("@\"{}\"", p.fns[vd.on_raise.unwrap() as usize].symbol);
-                let w = current_word(g, vd);
-                tail_to(g, vd, &sym, &w);
-            }
+            raise_value(g, &v, &x.ty);
             g.poison(&e.ty)
         }
         TVm::RaiseSlot => {
@@ -1133,15 +1118,9 @@ pub fn standalone(p: &Program, f: &FnDef) -> bool {
     }
 }
 
-pub fn test_value_variant(g: &mut FnGen, t: &Ty, idx: u32, subs: &[TPat], ptr: &str, fail: &str) {
-    crate::values::test_variant(g, t, idx, subs, ptr, fail)
-}
-
-pub fn make_value(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) -> String {
-    crate::values::make(g, t, idx, args, vals)
-}
-
-pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty, _span: Span) {
+/// `raise err` (of type `t`): store it in the raise slot and go to the
+/// vm's `on raise` handler.
+pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty) {
     let hg = g.vm.clone().unwrap();
     let p = g.p();
     let vd = &p.vms[hg.vm as usize];

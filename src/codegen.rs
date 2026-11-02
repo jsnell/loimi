@@ -1477,7 +1477,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let pp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", lt, ptr, idx + 1));
                 self.test_pat(&subs[0], &pp, fail);
             }
-            Ty::Value(_) => crate::vmgen::test_value_variant(self, t, idx, subs, ptr, fail),
+            Ty::Value(_) => crate::values::test_variant(self, t, idx, subs, ptr, fail),
             _ => unreachable!("variant pattern on {:?}", t),
         }
     }
@@ -1563,7 +1563,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let ftl = self.ty(ft);
                 self.inst(format!("insertvalue {} {}, {} {}, {}", lt, x, ftl, vals[0], pos))
             }
-            Ty::Value(_) => crate::vmgen::make_value(self, t, idx, args, &vals),
+            Ty::Value(_) => crate::values::make(self, t, idx, args, &vals),
             _ => unreachable!(),
         }
     }
@@ -1592,7 +1592,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.label(&l_bad);
                 let err = if et.is_unitlike() { "zeroinitializer".into() } else { self.inst(format!("extractvalue {} {}, 2", lt, v)) };
                 if self.vm.is_some() {
-                    crate::vmgen::raise_value(self, &err, et, e.span);
+                    crate::vmgen::raise_value(self, &err, et);
                 } else {
                     let rooted = if self.has_defers(0) { self.root_pending(&err, et) } else { false };
                     self.run_defers_to(0);

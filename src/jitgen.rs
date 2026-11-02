@@ -548,7 +548,7 @@ pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
     let ep = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", b, iz));
     let e = g.inst(format!("load ptr, ptr {}", ep));
     g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
-    crate::vmgen::tail_call(g, vd, &e, &w);
+    crate::vmgen::tail_to(g, vd, &e, &w);
     g.label(&no);
 }
 
@@ -582,7 +582,7 @@ pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
     g.label(&trig);
     g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
     let sym = format!("@\"{}.jit_hot\"", vd.symbol);
-    crate::vmgen::tail_call(g, vd, &sym, "0");
+    crate::vmgen::tail_to(g, vd, &sym, "0");
     g.label(&go);
 }
 

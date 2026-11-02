@@ -28,7 +28,6 @@ pub struct Diag {
 /// The warnings the compiler knows, for `#[allow(..)]`.
 pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "state_root"];
 
-#[allow(dead_code)]
 impl Diag {
     pub fn new(span: Span, msg: impl Into<String>) -> Diag {
         Diag { span, msg: msg.into(), notes: Vec::new(), lint: None }

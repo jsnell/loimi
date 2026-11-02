@@ -9,17 +9,14 @@ use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 use crate::vmast::*;
 
-#[allow(dead_code)]
 pub struct OperandKind {
     pub name: String,
     pub body: Expr,
-    pub verify: Option<Expr>,
     /// A `const` kind: the state register its body indexes (`k` in
     /// `k[it]`), which vm code must not write through.
     pub konst: Option<usize>,
 }
 
-#[allow(dead_code)]
 pub struct OpInfo {
     pub name: String,
     pub opcode: u32,
@@ -41,7 +38,6 @@ pub struct OpInfo {
     pub span: Span,
 }
 
-#[allow(dead_code)]
 pub struct VmInfo {
     pub module: usize,
     pub name: String,
@@ -169,7 +165,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
 
 /// Operand fields decode to 64-bit integers, whatever their width: they
 /// are mostly indices, and `regs[a + 1]` should be a plain 64-bit add.
-fn raw_ty(_bits: u32, signed: bool) -> Ty {
+fn raw_ty(signed: bool) -> Ty {
     Ty::Int(IntTy { signed, bits: 64 })
 }
 
@@ -179,7 +175,7 @@ fn decode(word: IntTy, off: u32, bits: u32, shift: u32, signed: bool, span: Span
     let w = mk(wt.clone(), TK::Vm(TVm::Word(off)), span);
     let int = |v: u64| mk(wt.clone(), TK::Int(v as i128), span);
     let wb = word.bits as u32;
-    let rt = raw_ty(bits, signed);
+    let rt = raw_ty(signed);
     if signed {
         let st = Ty::Int(IntTy { signed: true, bits: word.bits });
         let up = mk(wt.clone(), TK::Binary(BinOp::Shl, Box::new(w), Box::new(int((wb - shift - bits) as u64))), span);
@@ -444,7 +440,7 @@ fn operand_kinds(d: &VmDecl, state: &[(String, Ty)]) -> Res<Vec<OperandKind>> {
                 )
             })?),
         };
-        kinds.push(OperandKind { name: o.name.name.clone(), body: o.body.clone(), verify: o.verify.clone(), konst });
+        kinds.push(OperandKind { name: o.name.name.clone(), body: o.body.clone(), konst });
     }
     if let Some((a, b)) = kinds.iter().filter_map(|k| k.konst.map(|s| (k, s))).collect::<Vec<_>>().windows(2).find(|w| w[0].1 != w[1].1).map(|w| (w[0].0.name.clone(), w[1].0.name.clone())) {
         let o = d.operands.iter().find(|o| o.name.name == b).unwrap();
@@ -1225,7 +1221,7 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
         let mut operands = Vec::new();
         for (pi, pname) in params.iter().enumerate() {
             let (bits, shift, signed) = fields[pi];
-            let raw = cx.temp(raw_ty(bits, signed));
+            let raw = cx.temp(raw_ty(signed));
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
             // A forwarded operand is a copy of the previous part's field.
@@ -1242,7 +1238,7 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
             // part's own word (the variant's links say they are equal).
             let init = match fwd.iter().find(|l| l.0 == j && l.1 == pi && j > start) {
                 Some(&(_, _, d)) => {
-                    let (dl, rt) = (prev_raws[d], raw_ty(bits, signed));
+                    let (dl, rt) = (prev_raws[d], raw_ty(signed));
                     let dt = cx.locals[dl as usize].ty.clone();
                     let v = mk(dt.clone(), TK::Local(dl), span);
                     if dt == rt { v } else { mk(rt, TK::Cast(Box::new(v)), span) }
@@ -1734,7 +1730,7 @@ fn then_operand(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, name: &Ident, spa
     let word = info.word;
     let pc_local = h.state[info.pc_idx];
     let pc_ty = info.state[info.pc_idx].1.clone();
-    let raw = cx.temp(raw_ty(bits, signed));
+    let raw = cx.temp(raw_ty(signed));
     cx.locals[raw as usize].name = format!("then.{}.raw", name.name);
     cx.locals[raw as usize].field = true;
     let pc2 = cx.temp(pc_ty.clone());

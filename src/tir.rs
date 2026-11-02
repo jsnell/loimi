@@ -143,8 +143,7 @@ pub enum TK {
     Bool(bool),
     Str(Vec<u8>),
     Unit,
-    #[allow(dead_code)]
-    Zeroed,
+        Zeroed,
     Local(LocalId),
     /// A module-level `var` (a place).
     Global(u32),
@@ -309,12 +308,10 @@ pub struct VariantDef {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct EnumDef {
     pub name: String,
     pub tag: IntTy,
     pub variants: Vec<VariantDef>,
-    pub pattern: bool,
 }
 
 impl EnumDef {
@@ -331,7 +328,6 @@ pub enum CallConv {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct FnDef {
     pub name: String,
     pub symbol: String,
@@ -374,7 +370,7 @@ pub struct FnDef {
     /// that the body's `gc` calls root it.
     pub env_root: Option<LocalId>,
     /// `#[catch_panic(v)]` on an `export "C"` function: the LLVM constant
-    /// it returns when a panic unwinds to it (`rtgen::emit_catch_wrapper`).
+    /// it returns when a panic unwinds to it (`rtgen::emit_catch_wrappers`).
     pub catch_panic: Option<String>,
 }
 
@@ -464,7 +460,6 @@ pub struct VmOp {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct VmDef {
     pub name: String,
     pub symbol: String,

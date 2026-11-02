@@ -156,7 +156,7 @@ impl<'a> Checker<'a> {
             }
             GenDecl::Enum(_) => {
                 let id = self.prog.enums.len() as u32;
-                self.prog.enums.push(EnumDef { name, tag: IntTy::I32, variants: vec![], pattern });
+                self.prog.enums.push(EnumDef { name, tag: IntTy::I32, variants: vec![] });
                 Ty::Enum(id)
             }
         };

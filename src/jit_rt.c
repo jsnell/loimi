@@ -24,7 +24,9 @@
  *
  * Environment: LOIMI_JIT=1 turns the JIT on; LOIMI_JIT_HOT=n sets the
  * hot-counter threshold; LOIMI_JIT_STATS=1 prints statistics at exit;
- * LOIMI_JIT_RECOMPILE=n stops recompiles after n compiles (testing). */
+ * LOIMI_JIT_RECOMPILE=n stops recompiles after n compiles (testing);
+ * LOIMI_JIT_DEBUG=1 lists each compiled code object; LOIMI_JIT_MAP=file
+ * writes address ranges for profilers. */
 #define _GNU_SOURCE
 #include <stddef.h>
 #include <stdint.h>

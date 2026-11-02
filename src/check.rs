@@ -360,7 +360,6 @@ impl<'a> Checker<'a> {
                             name: format!("{}.{}", prefix, e.name.name),
                             tag: IntTy::I32,
                             variants: vec![],
-                            pattern: false,
                         });
                         self.define(m, &e.name, Def::Enum(id), e.is_pub)?;
                     }
@@ -814,13 +813,7 @@ impl<'a> Checker<'a> {
 
     pub fn ty_name(&self, t: &Ty) -> String {
         match t {
-            Ty::Int(it) => {
-                if it.bits == 64 && false {
-                    String::new()
-                } else {
-                    format!("{}{}", if it.signed { "i" } else { "u" }, it.bits)
-                }
-            }
+            Ty::Int(it) => format!("{}{}", if it.signed { "i" } else { "u" }, it.bits),
             Ty::F32 => "f32".into(),
             Ty::F64 => "f64".into(),
             Ty::Bool => "bool".into(),
@@ -3302,12 +3295,12 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn builtin_call(&mut self, cx: &mut FnCx, name: &str, args: &[Expr], _exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
+    fn builtin_call(&mut self, cx: &mut FnCx, name: &str, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
         if self.value_def(cx.module, name).is_some() {
             return Ok(None);
         }
         if name == "new" && args.len() == 2 && matches!(args[1].kind, ExprKind::Closure(..)) {
-            return self.new_closure(cx, &args[0], &args[1], _exp, span).map(Some);
+            return self.new_closure(cx, &args[0], &args[1], exp, span).map(Some);
         }
         if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
             return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
@@ -3320,7 +3313,7 @@ impl<'a> Checker<'a> {
             if !matches!(h.ty, Ty::Ptr(_)) {
                 return Err(Diag::new(args[0].span, "the first argument of `new` must be a pointer to a heap"));
             }
-            let want = match _exp {
+            let want = match exp {
                 Some(Ty::Gc(t)) => Some((**t).clone()),
                 _ => None,
             };

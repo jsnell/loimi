@@ -123,7 +123,7 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>)
                 queue.push((ipath, base.join(rel).with_extension("lm"), imp.span));
             }
         }
-        modules.push(ast::Module { path, file: fid, items });
+        modules.push(ast::Module { path, items });
     }
     Ok(modules)
 }
