@@ -1,0 +1,52 @@
+// `is_insn_boundary(..)` in a verify clause is rewritten as a whole-word
+// call, as in `verify` blocks: with whitespace before the parenthesis,
+// and not inside a longer name (`my_is_insn_boundary(` used to become
+// `my_V__boundary(..`, an unknown function).
+import std.io;
+
+fn my_is_insn_boundary(x: u64) -> bool { x != 99 }
+
+vm V {
+    state { pc: *u32 }
+
+    operand imm = it verify my_is_insn_boundary(it);
+    operand label = pc + it verify is_insn_boundary (pc + it);
+
+    encoding fixed(u32) {
+        format A { op: 8, a: 24 }
+        format J { op: 8, sj: s24 }
+    }
+
+    op NOP(x: imm) : A { next }
+    op JMP(target: label) : J { jump target }
+    op RET(x: imm) : A { exit x as i64 }
+
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+
+fn show(r: Result<Verified<V>, V.VerifyError>) {
+    match r {
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.NOP(c, at, 1);
+    at = V.emit.JMP(c, at, 1);
+    at = V.emit.RET(c, at, 7);
+    show(V.verify(c[0..at]));
+    io.print_int(V.run(&code[0])); io.println("");
+    code[1] = V.JMP(5);
+    show(V.verify(c[0..at]));
+    code[1] = V.JMP(1);
+    code[0] = V.NOP(99);
+    show(V.verify(c[0..at]));
+}
+// expect: ok
+// expect: 7
+// expect: bad at 1
+// expect: bad at 0

@@ -564,7 +564,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         }
     }
     let clause = |kind: &str| -> Option<String> {
-        Some(clause_text(sm, v, kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
+        Some(replace_call(&clause_text(sm, v, kind)?, "is_insn_boundary", &format!("{n}__boundary(__code, &__bits, ")))
     };
     let mut s = generate_verifier_types(sm, v, l);
     let stack = has_stack(v);
@@ -1326,20 +1326,24 @@ fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
 }
 
 /// `text` with each call `name(` replaced by `repl` (which ends with the
-/// opening parenthesis), where `name` is a whole word.
+/// opening parenthesis), where `name` is a whole word (not a method or a
+/// longer name's suffix) and whitespace may come before the parenthesis.
 fn replace_call(text: &str, name: &str, repl: &str) -> String {
-    let pat = format!("{name}(");
+    let word = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = String::new();
     let mut rest = text;
-    while let Some(p) = rest.find(&pat) {
+    while let Some(p) = rest.find(name) {
         let prev = rest[..p].chars().next_back().or_else(|| out.chars().next_back());
         out.push_str(&rest[..p]);
-        if prev.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') {
-            out.push_str(&pat);
-        } else {
+        let after = &rest[p + name.len()..];
+        let args = after.trim_start();
+        if !prev.is_some_and(|c| word(c) || c == '.') && args.starts_with('(') {
             out.push_str(repl);
+            rest = &args[1..];
+        } else {
+            out.push_str(name);
+            rest = after;
         }
-        rest = &rest[p + pat.len()..];
     }
     out.push_str(rest);
     out
