@@ -223,6 +223,10 @@ pub struct Func {
     free: mem.Vec<*Var>,
     /// The top level of the program.
     top: bool,
+    /// A function declaration (hoisted: created at block entry).
+    decl: bool,
+    /// The name of a named function expression, bound inside it.
+    self_var: *Var,
 }
 
 pub struct Member { name: str, fun: *Func, is_static: bool }
@@ -256,6 +260,7 @@ pub fn new_func(name: str, line: u32, pos: u32, parent: *Func) -> *Func {
     f.expr = null_node();
     f.parent = parent;
     f.this_var = null_var();
+    f.self_var = null_var();
     f.vars = mem.Vec.new();
     f.free = mem.Vec.new();
     f

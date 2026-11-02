@@ -1,0 +1,951 @@
+// The MiniJS virtual machine: a register machine. Each activation owns a
+// window of registers: R0 is `this`, R1.. the parameters, then locals and
+// temporaries. A call puts the callee in R[base], `this` in R[base+1] and
+// the arguments above it; the callee's window starts at R[base+1], so
+// `this` and the arguments arrive in place, and the result is stored back
+// into the caller's R[base].
+//
+// Property access sites carry inline caches (std.obj shapes); the
+// families quicken a site to the member for what it has seen.
+
+import std.gc;
+import std.mem;
+import std.text;
+import std.obj;
+import value;
+import value.{V, Str, Obj, Vals, Arr, Fn, Box, Proto};
+import rt;
+import rt.{Ctx, Frame, TEnt};
+import builtins;
+
+extern "C" fn pow(a: f64, b: f64) -> f64;
+
+// ── slow paths ──────────────────────────────────────────────────────
+
+/// Arithmetic outside the fast paths: op 0 add, 1 sub, 2 mul, 3 div,
+/// 4 mod, 5 pow.
+fn arith(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
+    if op == 0 {
+        let an = value.is_number(a);
+        let bn = value.is_number(b);
+        if !(an and bn) {
+            let sa = match a { S(_) | O(_) | A(_) | F(_) => true, _ => false };
+            let sb = match b { S(_) | O(_) | A(_) | F(_) => true, _ => false };
+            if sa or sb { return Ok(c.concat(a, b)); }
+        }
+    }
+    let x = value.to_number(a);
+    let y = value.to_number(b);
+    let r = match op {
+        0 => x + y,
+        1 => x - y,
+        2 => x * y,
+        3 => x / y,
+        4 => value.js_mod(x, y),
+        _ => js_pow(x, y),
+    };
+    Ok(value.number(r))
+}
+
+fn js_pow(x: f64, y: f64) -> f64 {
+    // pow(1, NaN) and pow(-1, ±Infinity) are 1 in C but NaN in JS.
+    if y != y { return 0.0 / 0.0; }
+    if (x == 1.0 or x == -1.0) and (y == 1.0 / 0.0 or y == -1.0 / 0.0) { return 0.0 / 0.0; }
+    pow(x, y)
+}
+
+fn less(c: *Ctx, a: V, b: V, or_equal: bool) -> bool {
+    if let (S(x), S(y)) = (a, b) {
+        let r = value.str_cmp(x, y);
+        return if or_equal { r <= 0 } else { r < 0 };
+    }
+    let x = value.to_number(a);
+    let y = value.to_number(b);
+    if or_equal { x <= y } else { x < y }
+}
+
+/// `==` (out of the subset beyond the obvious cases).
+fn loose_eq(a: V, b: V) -> bool {
+    if value.strict_eq(a, b) { return true; }
+    let an = a == V.Undef or a == V.Null;
+    let bn = b == V.Undef or b == V.Null;
+    if an or bn { return an and bn; }
+    let ap = match a { O(_) | A(_) | F(_) => false, _ => true };
+    let bp = match b { O(_) | A(_) | F(_) => false, _ => true };
+    if ap and bp { return value.to_number(a) == value.to_number(b); }
+    false
+}
+
+fn int32(v: V) -> i32 {
+    match v {
+        Int(i) => i,
+        _ => value.to_int32(value.to_number(v)),
+    }
+}
+
+/// Bitwise ops: 0 and, 1 or, 2 xor, 3 shl, 4 shr, 5 ushr.
+fn bitop(op: i64, a: V, b: V) -> V {
+    let x = int32(a);
+    let y = int32(b);
+    match op {
+        0 => V.Int(x & y),
+        1 => V.Int(x | y),
+        2 => V.Int(x ^ y),
+        3 => V.Int(((x as u32) << ((y & 31) as u32)) as i32),
+        4 => V.Int(x >> (y & 31)),
+        _ => value.number((((x as u32) >> ((y & 31) as u32)) as f64)),
+    }
+}
+
+fn neg(a: V) -> V {
+    match a {
+        Int(x) => if x == 0 or x == -2147483648 { V.Num(-(x as f64)) } else { V.Int(0 - x) },
+        _ => V.Num(-value.to_number(a)),
+    }
+}
+
+fn type_of(c: *Ctx, v: V) -> V { V.S(c.key_str(c.key(value.type_of(v)))) }
+
+fn key_of_const(c: *Ctx, k: V) -> u64 {
+    let S(s) = k else { return c.key_of(k); };
+    c.str_key(s)
+}
+
+/// GETPROP/GETMETHOD miss: read the property and fill the cache for
+/// what was found. Returns the value and the member to become:
+/// 0 none, 1 own inline, 2 own out of line, 3 prototype, 4 array
+/// prototype, 5 string prototype.
+fn get_fill(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32, ent_w: *u32) -> Result<(V, u32), V> {
+    let key = key_of_const(c, kv);
+    match v {
+        O(o) => {
+            if o.dict.is_none() {
+                if let Some(i) = c.m.find(o, key) {
+                    *shape_w = o.shape.id;
+                    let r = obj.slot_ref(i, o.inline.len as u32);
+                    *slot_w = r;
+                    return Ok((c.m.load(o, i), if r & obj.OUT == 0 { 1 } else { 2 }));
+                }
+                if let Some(_) = o.proto {
+                    if *ent_w == 0 {
+                        c.pent.push(obj.ProtoEntry.empty());
+                        *ent_w = c.pent.len as u32;
+                    }
+                    let e = c.pent.ptr_at((*ent_w - 1) as u64);
+                    e.sid = obj.EMPTY_ID;
+                    let r = c.m.get_proto_fill(o, key, e) ?? V.Undef;
+                    if e.sid != obj.EMPTY_ID {
+                        *shape_w = e.sid;
+                        return Ok((r, 3));
+                    }
+                    return Ok((r, 0));
+                }
+            }
+            Ok((c.m.get_chain(o, key) ?? V.Undef, 0))
+        }
+        A(_) | S(_) => {
+            if key != c.k_length {
+                let p = if let A(_) = v { c.arr_proto() } else { c.str_proto() };
+                if c.key_index(key) < 0 and p.dict.is_none() {
+                    if let Some(i) = c.m.find(p, key) {
+                        *shape_w = p.shape.id;
+                        *slot_w = i;
+                        return Ok((c.m.load(p, i), if let A(_) = v { 4 } else { 5 }));
+                    }
+                }
+            }
+            Ok((c.get(v, key)?, 0))
+        }
+        _ => Ok((c.get(v, key)?, 0)),
+    }
+}
+
+/// SETPROP miss: store, and fill the cache. Returns the member to become:
+/// 0 none, 1 own inline, 2 own out of line, 3 add (inline).
+fn set_fill(c: *Ctx, v: V, kv: V, x: V, shape_w: *u32, slot_w: *u32, ent_w: *u32) -> Result<u32, V> {
+    let key = key_of_const(c, kv);
+    let O(o) = v else { c.set(v, key, x)?; return Ok(0); };
+    if o.dict.is_some() { c.m.set(o, key, x); return Ok(0); }
+    if let Some(i) = c.m.find(o, key) {
+        c.m.store(o, i, x);
+        *shape_w = o.shape.id;
+        let r = obj.slot_ref(i, o.inline.len as u32);
+        *slot_w = r;
+        return Ok(if r & obj.OUT == 0 { 1 } else { 2 });
+    }
+    let old = o.shape.id;
+    let idx = o.shape.count;
+    let was_proto = o.flags & value.OF_PROTO != 0;
+    c.m.add(o, key, x);
+    if !was_proto and o.dict.is_none() and (idx as u64) < o.inline.len {
+        if *ent_w == 0 {
+            c.tent.push(TEnt { shape: None, idx: 0 });
+            *ent_w = c.tent.len as u32;
+        }
+        let e = c.tent.ptr_at((*ent_w - 1) as u64);
+        e.shape = Some(o.shape);
+        e.idx = idx;
+        *shape_w = old;
+        return Ok(3);
+    }
+    Ok(0)
+}
+
+/// Create a closure of child prototype `i` of the running function.
+fn make_closure(c: *Ctx, parent: Gc<Fn>, regs: *V, i: u64) -> Gc<Fn> {
+    let p = parent.proto.protos.data[i];
+    let n = p.nfree as u64;
+    var home = V.Undef;
+    var par = V.Undef;
+    if p.flags & value.PF_ARROW != 0 {
+        home = parent.home;
+        par = parent.parent;
+    }
+    let f = new(&c.heap, Fn { proto: p, props: None, home: home, parent: par, native: 0, hint: 4, ctor_proto: None, ctor_shape: None }, n);
+    for j in 0..n {
+        let d = p.desc.data[j];
+        f.free[j] = if d >= 256 { regs[(d & 255) as u64] } else { parent.free[d as u64] };
+    }
+    f
+}
+
+/// `class C extends P`: set up C.prototype (inheriting from P.prototype),
+/// static inheritance and the `super(...)` target.
+fn make_class(c: *Ctx, ctor: V, parent: V, has_parent: bool) -> Result<(), V> {
+    let F(f) = ctor else { return Ok(()); };
+    var pproto: ?Gc<Obj> = c.objproto;
+    if has_parent {
+        match parent {
+            F(pf) => {
+                let pb = c.fn_props(pf);
+                match c.m.get(pb, c.k_prototype) ?? V.Undef {
+                    O(po) => { pproto = Some(po); }
+                    Null => { pproto = None; }
+                    _ => return Err(c.type_error("Class extends value does not have valid prototype property")),
+                }
+                // Static members are inherited: C's own properties sit on
+                // top of P's.
+                rt.mark_proto(pb);
+                let bag = c.new_object_with(Some(pb), 4);
+                bag.flags = value.OF_NONENUM;
+                c.m.set(bag, c.k_prototype, V.Undef);
+                f.props = Some(bag);
+                f.parent = parent;
+            }
+            Null => { pproto = None; }
+            _ => return Err(c.type_error("Class extends value is not a constructor or null")),
+        }
+    }
+    if let Some(pp) = pproto { rt.mark_proto(pp); }
+    let po = c.new_object_with(pproto, 4);
+    po.flags = value.OF_NONENUM;
+    c.m.set(po, c.k_constructor, ctor);
+    let bag = c.fn_props(f);
+    c.m.set(bag, c.k_prototype, V.O(po));
+    f.home = V.O(po);
+    Ok(())
+}
+
+fn define_method(c: *Ctx, cls: V, kv: V, m: V, is_static: bool) {
+    let (F(f), F(mf)) = (cls, m) else { return; };
+    let key = key_of_const(c, kv);
+    if is_static {
+        let bag = c.fn_props(f);
+        mf.home = V.O(bag);
+        c.m.set(bag, key, m);
+        return;
+    }
+    let O(po) = f.home else { return; };
+    mf.home = f.home;
+    c.m.set(po, key, m);
+}
+
+/// `super.key`: look it up above the method's home object.
+fn super_get(c: *Ctx, cl: Gc<Fn>, kv: V) -> Result<V, V> {
+    let key = key_of_const(c, kv);
+    let O(h) = cl.home else { return Err(c.type_error("'super' keyword unexpected here")); };
+    let Some(p) = h.proto else { return Ok(V.Undef); };
+    Ok(c.m.get_chain(p, key) ?? V.Undef)
+}
+
+/// The object `new f` initializes: its prototype is f.prototype, and it
+/// starts with as many inline slots as f's objects ended up with.
+fn construct_this(c: *Ctx, f: Gc<Fn>) -> V {
+    let bag = c.fn_props(f);
+    var proto = c.objproto;
+    if bag.dict.is_none() and bag.shape.count >= 1 {
+        if let O(po) = bag.inline[0] { proto = Some(po); }
+    } else if let Some(O(po)) = c.m.get(bag, c.k_prototype) {
+        proto = Some(po);
+    }
+    let Some(p) = proto else { return V.O(c.new_object_with(None, f.hint)); };
+    var sh: ?Gc<obj.Shape> = None;
+    if let Some(cp) = f.ctor_proto and (cp as u64) == (p as u64) { sh = f.ctor_shape; }
+    let shape = match sh {
+        Some(s) => s,
+        None => {
+            rt.mark_proto(p);
+            let s = c.m.root_for(Some(p), f.hint);
+            f.ctor_proto = Some(p);
+            f.ctor_shape = Some(s);
+            s
+        }
+    };
+    V.O(new(&c.heap, Obj { shape: shape, dict: None, overflow: None, proto: Some(p), flags: 0 }, f.hint as u64))
+}
+
+/// After `new f` returned object `o`: learn its size for later objects.
+fn observe(f: Gc<Fn>, o: Gc<Obj>) {
+    let n = o.shape.count;
+    if o.dict.is_none() and n > f.hint {
+        f.hint = if n > 32 { 32 } else { n };
+        f.ctor_shape = None;
+    }
+}
+
+fn not_function(c: *Ctx, v: V) -> V {
+    var b = text.StrBuf.new();
+    c.write(&b, if let S(_) = v { v } else { V.S(c.key_str(c.key(value.type_of(v)))) });
+    b.push_str(" is not a function");
+    let e = c.type_error(b.as_str());
+    b.free();
+    e
+}
+
+fn ref_error(c: *Ctx, name: V) -> V {
+    var b = text.StrBuf.new();
+    c.write(&b, name);
+    b.push_str(" is not defined");
+    let e = c.new_error(c.err_proto(), b.as_str());
+    b.free();
+    e
+}
+
+fn delete_prop(c: *Ctx, v: V, key: V) -> Result<V, V> {
+    match v {
+        O(o) => { c.m.delete(o, c.key_of(key)); }
+        A(a) => {
+            let i = c.index_of(key);
+            if i >= 0 and (i as u64) < a.len { a.ptr[i as u64] = V.Undef; }
+        }
+        F(f) => { c.m.delete(c.fn_props(f), c.key_of(key)); }
+        Undef | Null => return Err(c.type_error("Cannot convert undefined or null to object")),
+        _ => {}
+    }
+    Ok(V.Bool(true))
+}
+
+/// The handler for an exception at `at` in `p`, if any: (target, register).
+fn find_handler(p: Gc<Proto>, at: *u32) -> ?(u64, u64) {
+    let off = ((at as u64) - (p.code.ptr as u64)) / 4;
+    let h = p.handlers.data;
+    var i: u64 = 0;
+    while i + 3 < h.len {
+        if (h[i] as u64) <= off and off < (h[i + 1] as u64) { return Some((h[i + 2] as u64, h[i + 3] as u64)); }
+        i += 4;
+    }
+    None
+}
+
+pub vm JS {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V, k: *V, fp: *Frame }
+
+    verify_context proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    operand imm = it;
+    operand simm = it;
+    operand gl = it;
+    operand fv = it verify (it as u32) < proto.nfree;
+    operand child = it verify (it as u64) < proto.protos.data.len;
+    operand callbase = it verify (it as u32) < proto.nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    // The collector scans frames and registers up to ctx.fp.
+    sync { ctx.fp = fp; }
+
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
+    op LOADU(dst: reg) : ABC { dst = Undef; next }
+    op LOADNULL(dst: reg) : ABC { dst = Null; next }
+    op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+
+    op GETGLOBAL(dst: reg, g: gl) : ABx { dst = ctx.gvals.ptr[g]; next }
+    op SETGLOBAL(src: reg, g: gl) : ABx { ctx.gvals.ptr[g] = src; next }
+    /// Reading an undeclared variable (k[name] is its name).
+    op THROWREF(pad: imm, name: kst) : ABx { cold { raise ref_error(ctx, name) } }
+
+    /// R[dst] = the running function (named function expressions).
+    op SELF(dst: reg) : ABC { dst = F(fp.cl); next }
+    op GETFREE(dst: reg, i: fv) : ABC { dst = fp.cl.free.ptr[i]; next }
+    /// Patch free slot `i` of the closure in R[c] (hoisted functions that
+    /// capture each other).
+    op SETFREE(c: reg, i: imm, src: reg) : ABC {
+        if let F(f) = c { f.free.ptr[i] = src; }
+        next
+    }
+    /// Put R[r] in a new box (a captured variable that is assigned).
+    op BOXNEW(r: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let v = r;
+        r = B(new(&ctx.heap, Box { v: v }));
+        next
+    }
+    /// A fresh box holding the value of the box in R[r] (per-iteration
+    /// bindings of `for (let ...)`).
+    op REBOX(r: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if let B(b) = r { r = B(new(&ctx.heap, Box { v: b.v })); }
+        next
+    }
+    op BOXGET(dst: reg, b: reg) : ABC {
+        if let B(x) = b { dst = x.v; }
+        next
+    }
+    op BOXSET(b: reg, src: reg) : ABC {
+        if let B(x) = b { x.v = src; }
+        next
+    }
+    op CLOSURE(dst: reg, i: child) : ABx {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = F(make_closure(ctx, fp.cl, regs, i as u64));
+        next
+    }
+
+    op NEWOBJ(dst: reg, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = O(ctx.new_literal(n as u32));
+        next
+    }
+    /// R[dst] = [R[base] .. R[base+n-1]].
+    op NEWARR(dst: reg, base: callbase, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let a = ctx.new_array(n as u64, n as u64);
+        for i in 0..n as u64 { a.ptr[i] = regs[base + i]; }
+        dst = A(a);
+        next
+    }
+    /// Append R[base] .. R[base+n-1] to the array in R[arr].
+    op ARRPUSH(arr: reg, base: callbase, n: imm) : ABC {
+        if let A(a) = arr {
+            for i in 0..n as u64 { ctx.arr_push(a, regs[base + i]); }
+        }
+        next
+    }
+
+    // Property reads. The cache holds the receiver's shape id, a SlotRef
+    // (own properties) or holder slot (prototypes of primitives), and the
+    // index + 1 of the site's side-table entry (prototype hits).
+    cache PropIC { shape: u32, slot: u32, ent: u32 }
+
+    inline for (fam, own_in, own_out, protom, aprotom, sprotom, dkind, pre) in [
+        ("GETPROP", "GETPROP_IN", "GETPROP_OUT", "GETPROP_P", "GETPROP_AP", "GETPROP_SP", reg, {}),
+        ("GETMETHOD", "GETMETHOD_IN", "GETMETHOD_OUT", "GETMETHOD_P", "GETMETHOD_AP", "GETMETHOD_SP", callbase, { regs[dst + 1] = obj; }),
+    ] {
+        family #fam(dst: dkind, obj: reg, key: kst) : ABC + PropIC {
+            generic {
+                pre
+                let (v, m) = get_fill(ctx, obj, key, &cache.shape, &cache.slot, &cache.ent)?;
+                regs[dst.raw] = v;
+                if m == 1 { become #own_in; }
+                if m == 2 { become #own_out; }
+                if m == 3 { become #protom; }
+                if m == 4 { become #aprotom; }
+                if m == 5 { become #sprotom; }
+                next
+            }
+            #own_in {
+                if let O(o) = obj and o.shape.id == cache.shape {
+                    pre
+                    regs[dst.raw] = o.inline.ptr[cache.slot];
+                    next
+                }
+                cold { become #fam; redo }
+            }
+            #own_out {
+                if let O(o) = obj and o.shape.id == cache.shape {
+                    pre
+                    regs[dst.raw] = ctx.m.load_out(o, cache.slot & !obj.OUT);
+                    next
+                }
+                cold { become #fam; redo }
+            }
+            #protom {
+                if let O(o) = obj and o.shape.id == cache.shape {
+                    let e = ctx.pent.ptr + (cache.ent - 1) as u64;
+                    if let Some(cl) = e.cell and cl.valid and let Some(h) = e.holder {
+                        pre
+                        regs[dst.raw] = ctx.m.load(h, e.slot);
+                        next
+                    }
+                }
+                cold { become #fam; redo }
+            }
+            #aprotom {
+                if let A(_) = obj {
+                    let p = ctx.arr_proto();
+                    if p.shape.id == cache.shape {
+                        pre
+                        regs[dst.raw] = ctx.m.load(p, cache.slot);
+                        next
+                    }
+                }
+                cold { become #fam; redo }
+            }
+            #sprotom {
+                if let S(_) = obj {
+                    let p = ctx.str_proto();
+                    if p.shape.id == cache.shape {
+                        pre
+                        regs[dst.raw] = ctx.m.load(p, cache.slot);
+                        next
+                    }
+                }
+                cold { become #fam; redo }
+            }
+        }
+    }
+
+    family SETPROP(obj: reg, key: kst, val: reg) : ABC + PropIC {
+        generic {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            let m = set_fill(ctx, obj, key, val, &cache.shape, &cache.slot, &cache.ent)?;
+            if m == 1 { become SETPROP_IN; }
+            if m == 2 { become SETPROP_OUT; }
+            if m == 3 { become SETPROP_ADD; }
+            next
+        }
+        SETPROP_IN {
+            if let O(o) = obj and o.shape.id == cache.shape {
+                o.inline.ptr[cache.slot] = val;
+                next
+            }
+            cold { become SETPROP; redo }
+        }
+        SETPROP_OUT {
+            if let O(o) = obj and o.shape.id == cache.shape {
+                let Some(s) = o.overflow else { unreachable };
+                s.data.ptr[cache.slot & !obj.OUT] = val;
+                next
+            }
+            cold { become SETPROP; redo }
+        }
+        SETPROP_ADD {
+            if let O(o) = obj and o.shape.id == cache.shape and o.flags & value.OF_PROTO == 0 {
+                let e = ctx.tent.ptr + (cache.ent - 1) as u64;
+                if let Some(sh) = e.shape and (e.idx as u64) < o.inline.len {
+                    o.inline.ptr[e.idx] = val;
+                    o.shape = sh;
+                    next
+                }
+            }
+            cold { become SETPROP; redo }
+        }
+    }
+
+    op GETINDEX(dst: reg, obj: reg, key: reg) : ABC {
+        if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
+            dst = a.ptr[i as u32 as u64];
+            next
+        }
+        cold { dst = ctx.get_index(obj, key)?; next }
+    }
+    op SETINDEX(obj: reg, key: reg, val: reg) : ABC {
+        if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
+            a.ptr[i as u32 as u64] = val;
+            next
+        }
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            ctx.set_index(obj, key, val)?;
+            next
+        }
+    }
+    op GETLEN(dst: reg, obj: reg) : ABC {
+        if let A(a) = obj { dst = Int(a.len as i32); next }
+        if let S(s) = obj { dst = Int(s.data.len as i32); next }
+        cold { dst = ctx.get(obj, ctx.k_length)?; next }
+    }
+    op DELPROP(dst: reg, obj: reg, key: reg) : ABC {
+        cold { dst = delete_prop(ctx, obj, key)?; next }
+    }
+    op IN(dst: reg, key: reg, obj: reg) : ABC {
+        cold { dst = Bool(ctx.has(obj, ctx.key_of(key))?); next }
+    }
+    /// R[dst] = the keys `for (k in R[obj])` visits.
+    op KEYS(dst: reg, obj: reg) : ABC {
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            dst = A(ctx.for_in_keys(obj));
+            next
+        }
+    }
+
+    // Arithmetic.
+    inline for (name, checked, sym, code) in [
+        ("ADD", "add_checked", +, 0),
+        ("SUB", "sub_checked", -, 1),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                _ => {}
+            }
+            cold {
+                match (a, b) {
+                    (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
+                    (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
+                    (Int(x), Int(y)) => { dst = Num(x as f64 sym y as f64); next }
+                    _ => {}
+                }
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                dst = arith(ctx, code, a, b)?;
+                next
+            }
+        }
+    }
+    op MUL(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) and (r != 0 or (x | y) >= 0) { dst = Int(r); next },
+            (Num(x), Num(y)) => { dst = Num(x * y); next }
+            _ => {}
+        }
+        cold { dst = arith(ctx, 2, a, b)?; next }
+    }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if y > 0 and x % y == 0 { dst = Int(x / y); next },
+            (Num(x), Num(y)) => { dst = Num(x / y); next }
+            _ => {}
+        }
+        cold { dst = arith(ctx, 3, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 and x >= 0 { dst = Int(x % y); next }
+        cold { dst = arith(ctx, 4, a, b)?; next }
+    }
+    op POW(dst: reg, a: reg, b: reg) : ABC {
+        cold { dst = arith(ctx, 5, a, b)?; next }
+    }
+    /// R[dst] = R[a] + sc (a small signed constant).
+    op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
+        if let Num(x) = a { dst = Num(x + sc as f64); next }
+        cold { dst = arith(ctx, 0, a, Int(sc as i32))?; next }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        if let Num(x) = a { dst = Num(-x); next }
+        dst = neg(a);
+        next
+    }
+    /// Unary + (ToNumber).
+    op TONUM(dst: reg, a: reg) : ABC {
+        match a {
+            Int(_) | Num(_) => { dst = a; next }
+            _ => {}
+        }
+        cold { dst = value.number(value.to_number(a)); next }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
+    op TYPEOF(dst: reg, a: reg) : ABC { dst = type_of(ctx, a); next }
+    op BNOT(dst: reg, a: reg) : ABC {
+        if let Int(x) = a { dst = Int(!x); next }
+        dst = Int(!int32(a));
+        next
+    }
+    inline for (name, code) in [("BAND", 0), ("BOR", 1), ("BXOR", 2), ("SHL", 3), ("SHR", 4), ("USHR", 5)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            if let (Int(x), Int(y)) = (a, b) {
+                if code == 0 { dst = Int(x & y); next }
+                if code == 1 { dst = Int(x | y); next }
+                if code == 2 { dst = Int(x ^ y); next }
+                if code == 3 { dst = Int(((x as u32) << ((y & 31) as u32)) as i32); next }
+                if code == 4 { dst = Int(x >> (y & 31)); next }
+                if x >= 0 { dst = Int(((x as u32) >> ((y & 31) as u32)) as i32); next }
+            }
+            dst = bitop(code, a, b);
+            next
+        }
+    }
+
+    // Comparisons producing booleans.
+    op EQ(dst: reg, a: reg, b: reg) : ABC {
+        if a == b {
+            if let Num(x) = a { dst = Bool(x == x); next }
+            dst = Bool(true);
+            next
+        }
+        dst = Bool(value.strict_eq(a, b));
+        next
+    }
+    op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
+    op LT(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => { dst = Bool(x < y); next }
+            (Num(x), Num(y)) => { dst = Bool(x < y); next }
+            _ => {}
+        }
+        dst = Bool(less(ctx, a, b, false));
+        next
+    }
+    op LE(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => { dst = Bool(x <= y); next }
+            (Num(x), Num(y)) => { dst = Bool(x <= y); next }
+            _ => {}
+        }
+        dst = Bool(less(ctx, a, b, true));
+        next
+    }
+
+    /// The end of a compare-and-branch: jump to the following JMP's
+    /// target, or skip the JMP.
+    fn branch(take: bool, target: *u32) -> never {
+        if take { jump target }
+        jump pc + 2
+    }
+
+    // Compare and branch: the next word is a JMP holding the offset.
+    // Jump if the comparison equals `pol`.
+    op JLT(pol: imm, a: reg, b: reg) : ABC then JMP {
+        let want = pol != 0;
+        match (a, b) {
+            (Int(x), Int(y)) => branch((x < y) == want, then.target),
+            (Num(x), Num(y)) => branch((x < y) == want, then.target),
+            _ => {}
+        }
+        branch(less(ctx, a, b, false) == want, then.target)
+    }
+    op JLE(pol: imm, a: reg, b: reg) : ABC then JMP {
+        let want = pol != 0;
+        match (a, b) {
+            (Int(x), Int(y)) => branch((x <= y) == want, then.target),
+            (Num(x), Num(y)) => branch((x <= y) == want, then.target),
+            _ => {}
+        }
+        branch(less(ctx, a, b, true) == want, then.target)
+    }
+    op JEQ(pol: imm, a: reg, b: reg) : ABC then JMP {
+        let want = pol != 0;
+        if a == b {
+            var eq = true;
+            if let Num(x) = a { eq = x == x; }
+            branch(eq == want, then.target)
+        }
+        branch(value.strict_eq(a, b) == want, then.target)
+    }
+
+    op JMP(target: label) : sJ { jump target }
+    /// Jump if falsy.
+    op TEST(a: reg, target: label) : AsBx {
+        if a == V.Bool(false) { jump target }
+        if a == V.Bool(true) { next }
+        if !value.truthy(a) { jump target }
+        next
+    }
+    /// Jump if truthy.
+    op TESTT(a: reg, target: label) : AsBx {
+        if a == V.Bool(true) { jump target }
+        if a == V.Bool(false) { next }
+        if value.truthy(a) { jump target }
+        next
+    }
+    /// Jump unless null or undefined.
+    op TESTNN(a: reg, target: label) : AsBx {
+        if a != V.Undef and a != V.Null { jump target }
+        next
+    }
+
+    /// Calls that CALL's fast path does not take: natives, argument
+    /// count mismatches, non-functions.
+    fn call_slow(base: u64, nargs: u64, flags: u32) -> never {
+        let f = regs[base];
+        let F(cl) = f else { raise not_function(ctx, f) };
+        let p = cl.proto;
+        if cl.native != 0 {
+            let v = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs)?;
+            regs[base] = v;
+            next
+        }
+        if p.flags & value.PF_CLASS != 0 and flags & rt.FR_NEW == 0 and regs[base + 1] == V.Undef {
+            raise ctx.type_error("Class constructor cannot be invoked without 'new'")
+        }
+        let callee = regs + base + 1;
+        let n = p.nregs as u64;
+        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
+        }
+        let np = p.nparams as u64 + 1;
+        var i = nargs + 1;
+        if i > np { i = np; }
+        while i < n {
+            callee[i] = Undef;
+            i += 1;
+        }
+        fp.resume = pc + 1;
+        fp = fp + 1;
+        fp.cl = cl;
+        fp.base = callee;
+        fp.flags = flags;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        regs = callee;
+        jump p.code.ptr
+    }
+
+    /// R[base] = R[base](R[base+2] .. R[base+1+nargs]) with this = R[base+1].
+    op CALL(base: callbase, nargs: imm) : ABC {
+        if let F(cl) = regs[base] {
+            let p = cl.proto;
+            if likely(p.fixed == nargs as u32) {
+                let callee = regs + base + 1;
+                let n = p.nregs as u64;
+                if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+                }
+                var i = nargs as u64 + 1;
+                while i < n {
+                    callee[i] = Undef;
+                    i += 1;
+                }
+                fp.resume = pc + 1;
+                fp = fp + 1;
+                fp.cl = cl;
+                fp.base = callee;
+                fp.flags = 0;
+                k = p.consts.data.ptr;
+                fp.k = k;
+                regs = callee;
+                jump p.code.ptr
+            }
+        }
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            call_slow(base as u64, nargs as u64, 0)
+        }
+    }
+    /// R[base] = new R[base](R[base+2] ..).
+    op NEW(base: callbase, nargs: imm) : ABC {
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            let f = regs[base];
+            let F(cl) = f else { raise not_function(ctx, f) };
+            if cl.native != 0 {
+                regs[base + 1] = Undef;
+                call_slow(base as u64, nargs as u64, rt.FR_NEW)
+            }
+            if cl.proto.flags & (value.PF_ARROW | value.PF_METHOD) != 0 {
+                raise not_function(ctx, f)
+            }
+            regs[base + 1] = construct_this(ctx, cl);
+            call_slow(base as u64, nargs as u64, rt.FR_NEW)
+        }
+    }
+    op RET(src: reg) : ABC {
+        var v = src;
+        if fp.flags != 0 {
+            cold {
+                match v {
+                    O(_) | A(_) | F(_) => {}
+                    _ => { v = regs[0]; }
+                }
+                if let O(o) = regs[0] { observe(fp.cl, o); }
+                if fp == ctx.frames { exit v }
+                *(regs - 1) = v;
+                fp = fp - 1;
+                regs = fp.base;
+                k = fp.k;
+                jump fp.resume
+            }
+        }
+        if fp == ctx.frames { exit v }
+        *(regs - 1) = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.k;
+        jump fp.resume
+    }
+    op THROW(src: reg) : ABC {
+        cold { raise src }
+    }
+
+    /// R[dst] = the constructor `super(...)` calls.
+    op GETPARENT(dst: reg) : ABC {
+        let p = fp.cl.parent;
+        if let F(_) = p { dst = p; next }
+        cold { raise ctx.type_error("'super' keyword unexpected here") }
+    }
+    /// R[dst] = super[k[key]].
+    op GETSUPER(dst: reg, key: kst) : ABC {
+        cold { dst = super_get(ctx, fp.cl, key)?; next }
+    }
+    /// Make the closure in R[ctor] a class, extending R[parent] if `has`.
+    op CLASS(ctor: reg, parent: reg, has: imm) : ABC {
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            make_class(ctx, ctor, parent, has != 0)?;
+            next
+        }
+    }
+    /// Define method R[m] as k[key] on class R[cls]'s prototype (or, for
+    /// SMETHOD, on the class itself).
+    op METHOD(cls: reg, key: kst, m: reg) : ABC {
+        cold { define_method(ctx, cls, key, m, false); next }
+    }
+    op SMETHOD(cls: reg, key: kst, m: reg) : ABC {
+        cold { define_method(ctx, cls, key, m, true); next }
+    }
+
+    // Superinstructions for common pairs.
+    super MOVE_MOVE = MOVE; MOVE;
+    super GETPROP_IN_GETPROP_IN = GETPROP_IN; GETPROP_IN;
+
+    entry run(c: *Ctx, cl: Gc<Fn>) -> V {
+        ctx = c;
+        let p = cl.proto;
+        c.stack[0] = Undef;
+        regs = c.stack + 1;
+        for i in 0..p.nregs as u64 { regs[i] = Undef; }
+        fp = c.frames;
+        fp.cl = cl;
+        fp.base = regs;
+        fp.flags = 0;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        c.fp = fp;
+        jump p.code.ptr
+    }
+
+    on raise(e: V) {
+        var f = fp;
+        var at = pc;
+        loop {
+            let p = f.cl.proto;
+            if let Some((target, r)) = find_handler(p, at) {
+                fp = f;
+                regs = f.base;
+                k = f.k;
+                regs[r] = e;
+                jump p.code.ptr + target
+            }
+            if f == ctx.frames { break; }
+            f = f - 1;
+            at = f.resume - 1;
+        }
+        ctx.error = e;
+        ctx.failed = true;
+        ctx.fp = fp;
+        exit Undef
+    }
+}
