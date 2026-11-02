@@ -232,6 +232,78 @@ pub fn write_shortest(b: *text.StrBuf, x: f64) {
     b.push_str(buf[0..n as u64]);
 }
 
+/// The shortest round-trip decimal digits of a finite, nonzero `x`
+/// (ignoring its sign): `digits[0..n]` with no trailing zeros, and the
+/// decimal exponent of the first digit, so `x = 0.d1d2... * 10^(exp+1)`.
+/// Among equally short candidates it is the one closest to `x` (C's
+/// correctly rounded `%.*e`), which is what ECMAScript's Number::toString
+/// and Python's `repr` choose.
+pub struct Shortest { digits: [u8; 17], n: u32, exp: i32 }
+
+pub fn shortest(x: f64) -> Shortest {
+    var buf: [u8; 48] = [0; 48];
+    let ax = if x < 0.0 { -x } else { x };
+    var prec = 1;
+    var n: i32 = 0;
+    while prec <= 17 {
+        n = snprintf(&buf[0], 48, "%.*e\0".ptr, prec - 1, ax);
+        if strtod(&buf[0], 0 as **u8) == ax { break; }
+        prec += 1;
+    }
+    let s = buf[0..n as u64];
+    var r = Shortest { digits: [0; 17], n: 0, exp: 0 };
+    var i: u64 = 0;
+    while i < s.len and s[i] != 'e' {
+        if s[i] >= '0' and s[i] <= '9' and r.n < 17 { r.digits[r.n] = s[i]; r.n += 1; }
+        i += 1;
+    }
+    while r.n > 1 and r.digits[r.n - 1] == '0' { r.n -= 1; }
+    if i < s.len {
+        if let Ok(v) = parse_i64(s[i + 1..s.len], 10) { r.exp = v as i32; }
+    }
+    r
+}
+
+/// Append `x` as ECMAScript's Number::toString (radix 10) writes it:
+/// shortest round-trip digits; plain notation for 1e-7 < |x| < 1e21
+/// (`123`, `0.001`, `1.5`), exponent notation otherwise (`1e+21`,
+/// `1.5e-7`); `NaN`, `Infinity`, `-Infinity`, and `0` for both zeros.
+pub fn write_js(b: *text.StrBuf, x: f64) {
+    if x != x { b.push_str("NaN"); return; }
+    if x == 0.0 { b.push('0'); return; }
+    if x < 0.0 { b.push('-'); }
+    let ax = if x < 0.0 { -x } else { x };
+    if ax == 1.0 / 0.0 { b.push_str("Infinity"); return; }
+    let s = shortest(ax);
+    let k = s.n as i64;
+    let n = s.exp as i64 + 1;
+    if k <= n and n <= 21 {
+        for i in 0..k { b.push(s.digits[i]); }
+        for _ in k..n { b.push('0'); }
+    } else if 0 < n and n <= 21 {
+        for i in 0..n { b.push(s.digits[i]); }
+        b.push('.');
+        for i in n..k { b.push(s.digits[i]); }
+    } else if -6 < n and n <= 0 {
+        b.push_str("0.");
+        for _ in 0..(0 - n) { b.push('0'); }
+        for i in 0..k { b.push(s.digits[i]); }
+    } else {
+        b.push(s.digits[0]);
+        if k > 1 {
+            b.push('.');
+            for i in 1..k { b.push(s.digits[i]); }
+        }
+        b.push('e');
+        let e = n - 1;
+        if e < 0 { b.push('-'); } else { b.push('+'); }
+        var tb = text.StrBuf.new();
+        tb.push_int(if e < 0 { 0 - e } else { e });
+        b.push_str(tb.as_str());
+        tb.free();
+    }
+}
+
 /// If the text appended since byte offset `start` looks like an integer
 /// (only a sign and digits), append `.0`, so that floats print as floats:
 /// `write_g(b, 3.0, 14); mark_float(b, start)` gives `3.0`, as Lua's
