@@ -241,7 +241,7 @@ struct FuncState {
     lines: mem.Vec<u32>,
     upvals: mem.Vec<UpDesc>,
     /// Child prototypes. (The compiler never collects, so a plain Vec is fine.)
-    protos: mem.Vec<Gc<Proto> >,
+    protos: mem.Vec<Gc<Proto>>,
     blocks: mem.Vec<Block>,
 }
 
