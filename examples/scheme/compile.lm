@@ -35,7 +35,7 @@ import vm.{Scheme};
 enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or }
 
 /// Ops for builtins compiled inline.
-enum PO { Add, Sub, Mul, Div, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset }
+enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset }
 
 struct Var {
     name: Gc<Sym>,
@@ -218,6 +218,9 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("-") { return Some((PO.Sub, 2)); }
     if name.eq("*") { return Some((PO.Mul, 2)); }
     if name.eq("/") { return Some((PO.Div, 2)); }
+    if name.eq("quotient") { return Some((PO.Quo, 2)); }
+    if name.eq("remainder") { return Some((PO.Rem, 2)); }
+    if name.eq("modulo") { return Some((PO.Mod, 2)); }
     if name.eq("=") { return Some((PO.NumEq, 2)); }
     if name.eq("<") { return Some((PO.Lt, 2)); }
     if name.eq(">") { return Some((PO.Gt, 2)); }
@@ -1089,7 +1092,7 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
             let j = g.cond(n.a);
             g.to(n.b, dst);
             let e = g.emit(Scheme.JMP(0));
-            g.patch(j, g.pc());
+            g.patch_all(j, g.pc());
             if is_null(n.c) { g.load_const(value.unspec(), dst); } else { g.to(n.c, dst); }
             g.patch(e, g.pc());
         }
@@ -1155,10 +1158,10 @@ fn Gen.effect(g: *Gen, n: *Node) {
             let j = g.cond(n.a);
             g.effect(n.b);
             if is_null(n.c) {
-                g.patch(j, g.pc());
+                g.patch_all(j, g.pc());
             } else {
                 let e = g.emit(Scheme.JMP(0));
-                g.patch(j, g.pc());
+                g.patch_all(j, g.pc());
                 g.effect(n.c);
                 g.patch(e, g.pc());
             }
@@ -1168,6 +1171,24 @@ fn Gen.effect(g: *Gen, n: *Node) {
         }
         Let => { g.bind_let(n); g.effect(n.a); }
         Letrec => { g.bind_letrec(n); g.effect(n.a); }
+        Prim => {
+            // Mutators need no result.
+            if n.po == PO.SetCar or n.po == PO.SetCdr or n.po == PO.Vset {
+                let a = g.any(n.list.at(0)) as u8;
+                let b = g.any(n.list.at(1)) as u8;
+                if n.po == PO.Vset {
+                    let c = g.any(n.list.at(2)) as u8;
+                    g.emit(Scheme.VSET(a, b, c));
+                } else if n.po == PO.SetCar {
+                    g.emit(Scheme.SETCAR(a, b));
+                } else {
+                    g.emit(Scheme.SETCDR(a, b));
+                }
+            } else {
+                let r = g.alloc();
+                g.to(n, r);
+            }
+        }
         _ => {
             let r = g.alloc();
             g.to(n, r);
@@ -1185,7 +1206,7 @@ fn Gen.tail(g: *Gen, n: *Node) {
         If => {
             let j = g.cond(n.a);
             g.tail(n.b);
-            g.patch(j, g.pc());
+            g.patch_all(j, g.pc());
             if is_null(n.c) {
                 let r = g.alloc();
                 g.load_const(value.unspec(), r);
@@ -1226,19 +1247,35 @@ fn Gen.tail(g: *Gen, n: *Node) {
     g.fs.line = saved_line;
 }
 
-/// Emit a test of `n`; returns a jump to patch, taken when `n` is false.
-fn Gen.cond(g: *Gen, n: *Node) -> u64 {
+/// Emit a test of `n`; returns the jumps to patch, taken when `n` is false.
+/// `(not x)` tests x the other way round, and `(and a b ...)` tests each
+/// operand in turn.
+fn Gen.cond(g: *Gen, n: *Node) -> mem.Vec<u64> {
+    var js: mem.Vec<u64> = mem.Vec.new();
+    g.cond_into(n, &js);
+    js
+}
+
+fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
+    let saved_line = g.set_line(n);
     let save = g.fs.freereg;
-    var j: u64 = 0;
-    if n.kind == K.Prim and n.po == PO.Not {
+    if n.kind == K.And {
+        for i in 0..n.list.len { g.cond_into(n.list.at(i), js); }
+    } else if n.kind == K.Prim and n.po == PO.Not {
         let r = g.any(n.list.at(0));
-        j = g.emit(Scheme.TESTT(r as u8, 0));
+        js.push(g.emit(Scheme.TESTT(r as u8, 0)));
     } else {
         let r = g.any(n);
-        j = g.emit(Scheme.TEST(r as u8, 0));
+        js.push(g.emit(Scheme.TEST(r as u8, 0)));
     }
     g.fs.freereg = save;
-    j
+    g.fs.line = saved_line;
+}
+
+fn Gen.patch_all(g: *Gen, js: mem.Vec<u64>, target: u64) {
+    var v = js;
+    for i in 0..v.len { g.patch(v.at(i), target); }
+    v.free();
 }
 
 /// A call. `dst` is where the result goes (non-tail), or the first free
@@ -1251,22 +1288,33 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
     if tail and f.kind == K.Ref and (f.vr.lam as u64) == (g.fs.lam as u64) and !f.vr.assigned {
         let l = g.fs.lam;
         if !l.rest and l.nparams as u64 == nargs {
+            // Arguments that are their own parameter need nothing. An
+            // argument that is a single op (and whose parameter no other
+            // argument reads) is computed straight into its parameter;
+            // the rest go to temporaries first, and are moved last.
+            var mode: mem.Vec<u32> = mem.Vec.new();   // 0 same, 1 direct, 2 temp
+            for i in 0..nargs {
+                let a = n.list.at(i);
+                let p = l.params.at(i);
+                if a.kind == K.Ref and (a.vr as u64) == (p as u64) and !boxed(p) { mode.push(0); continue; }
+                var direct = a.kind == K.Prim or a.kind == K.Const or a.kind == K.Ref or a.kind == K.GRef;
+                for j in 0..nargs {
+                    if j != i and mentions(n.list.at(j), p) { direct = false; }
+                }
+                mode.push(if direct { 1 } else { 2 });
+            }
             let base = g.fs.freereg;
             for i in 0..nargs {
-                let a = n.list.at(i);
-                // An argument that is already its parameter needs no move.
-                if a.kind == K.Ref and (a.vr as u64) == (l.params.at(i) as u64) and !boxed(a.vr) {
-                    g.alloc();
-                    continue;
-                }
                 let r = g.alloc();
-                g.to(a, r);
+                if mode.at(i) == 2 { g.to(n.list.at(i), r); }
             }
             for i in 0..nargs {
-                let a = n.list.at(i);
-                if a.kind == K.Ref and (a.vr as u64) == (l.params.at(i) as u64) and !boxed(a.vr) { continue; }
-                g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8));
+                if mode.at(i) == 1 { g.to(n.list.at(i), l.params.at(i).reg); }
             }
+            for i in 0..nargs {
+                if mode.at(i) == 2 { g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8)); }
+            }
+            mode.free();
             let j = g.emit(Scheme.JMP(0));
             g.patch(j, 0);
             return;
@@ -1285,6 +1333,24 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         g.emit(Scheme.CALL(base as u8, nargs as u8));
         if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
     }
+}
+
+/// Does `n` read or assign variable `v` (directly or through a closure)?
+fn mentions(n: *Node, v: *Var) -> bool {
+    if is_null(n) { return false; }
+    if (n.kind == K.Ref or n.kind == K.Set) and (n.vr as u64) == (v as u64) { return true; }
+    if n.kind == K.Lambda {
+        let l = n.lam;
+        for i in 0..l.free.len {
+            if (l.free.at(i) as u64) == (v as u64) { return true; }
+        }
+        return false;
+    }
+    if mentions(n.a, v) or mentions(n.b, v) or mentions(n.c, v) { return true; }
+    for i in 0..n.list.len {
+        if mentions(n.list.at(i), v) { return true; }
+    }
+    false
 }
 
 fn small_const(n: *Node) -> ?i32 {
@@ -1309,6 +1375,30 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         if po == PO.Add and let Some(k) = small_const(args.at(0)) {
             let a = g.any(args.at(1));
             g.emit(Scheme.ADDI(d, a as u8, k as i8));
+            return;
+        }
+    }
+    // Comparisons with a small constant (on either side).
+    if po == PO.NumEq or po == PO.Lt or po == PO.Gt or po == PO.Le or po == PO.Ge {
+        var x = args.at(0);
+        var k = small_const(args.at(1));
+        var p = po;
+        if k.is_none() and let Some(k0) = small_const(args.at(0)) {
+            k = Some(k0);
+            x = args.at(1);
+            p = match po { Lt => PO.Gt, Gt => PO.Lt, Le => PO.Ge, Ge => PO.Le, _ => po };
+        }
+        if let Some(kk) = k {
+            let a = g.any(x) as u8;
+            let c = kk as i8;
+            let w = match p {
+                NumEq => Scheme.NUMEQI(d, a, c),
+                Lt => Scheme.LTI(d, a, c),
+                Gt => Scheme.GTI(d, a, c),
+                Le => Scheme.LEI(d, a, c),
+                _ => Scheme.GEI(d, a, c),
+            };
+            g.emit(w);
             return;
         }
     }
@@ -1338,6 +1428,9 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         Sub => Scheme.SUB(d, a, b),
         Mul => Scheme.MUL(d, a, b),
         Div => Scheme.DIV(d, a, b),
+        Quo => Scheme.QUO(d, a, b),
+        Rem => Scheme.REM(d, a, b),
+        Mod => Scheme.MOD(d, a, b),
         NumEq => Scheme.NUMEQ(d, a, b),
         Lt => Scheme.LT(d, a, b),
         Gt => Scheme.GT(d, a, b),

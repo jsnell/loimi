@@ -189,6 +189,23 @@ pub vm Scheme {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         cold { dst = builtins.arith(ctx, 0, a, Int(sc as i32))?; next }
     }
+    /// quotient, remainder, modulo: fixnums with a positive divisor inline.
+    op QUO(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x / y); next }
+        cold { dst = builtins.intdiv(ctx, 0, a, b)?; next }
+    }
+    op REM(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x % y); next }
+        cold { dst = builtins.intdiv(ctx, 1, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            let r = x % y;
+            dst = Int(if r < 0 { r + y } else { r });
+            next
+        }
+        cold { dst = builtins.intdiv(ctx, 2, a, b)?; next }
+    }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
         if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }
         cold { dst = builtins.arith(ctx, 3, a, b)?; next }
@@ -201,8 +218,25 @@ pub vm Scheme {
         ("GE", >=, 4),
     ] {
         op #name(dst: reg, a: reg, b: reg) : ABC {
-            if let (Int(x), Int(y)) = (a, b) { dst = value.boolean(x sym y); next }
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = value.boolean(x sym y); next }
+                (Num(x), Num(y)) => { dst = value.boolean(x sym y); next }
+                _ => {}
+            }
             cold { dst = value.boolean(builtins.compare(ctx, code, a, b)?); next }
+        }
+    }
+    // Comparison with a small constant: (< n 2).
+    inline for (name, sym, code) in [
+        ("NUMEQI", ==, 0),
+        ("LTI", <, 1),
+        ("GTI", >, 2),
+        ("LEI", <=, 3),
+        ("GEI", >=, 4),
+    ] {
+        op #name(dst: reg, a: reg, sc: simm) : ABsC {
+            if let Int(x) = a { dst = value.boolean(x sym (sc as i32)); next }
+            cold { dst = value.boolean(builtins.compare(ctx, code, a, Int(sc as i32))?); next }
         }
     }
     op ZEROP(dst: reg, a: reg) : ABC {
@@ -397,6 +431,39 @@ pub vm Scheme {
         k = fp.k;
         jump fp.resume
     }
+
+    // Superinstructions, chosen from `--vm-stats` over the benchmarks.
+    // Compare-and-branch pairs produced by every `if`:
+    super LTI_TEST = LTI; TEST;
+    super LEI_TEST = LEI; TEST;
+    super GTI_TEST = GTI; TEST;
+    super GEI_TEST = GEI; TEST;
+    super NUMEQI_TEST = NUMEQI; TEST;
+    super LT_TEST = LT; TEST;
+    super LT_TESTT = LT; TESTT;
+    super LE_TEST = LE; TEST;
+    super GT_TEST = GT; TEST;
+    super GE_TEST = GE; TEST;
+    super NUMEQ_TEST = NUMEQ; TEST;
+    super NULLP_TEST = NULLP; TEST;
+    super PAIRP_TEST = PAIRP; TEST;
+    super EQ_TEST = EQ; TEST;
+    super NOT_TEST = NOT; TEST;
+    super ZEROP_TEST = ZEROP; TEST;
+    // Loops, argument set-up and list walking.
+    super MOVE_MOVE = MOVE; MOVE;
+    super MOVE_JMP = MOVE; JMP;
+    super ADDI_JMP = ADDI; JMP;
+    super CDR_JMP = CDR; JMP;
+    super CDR_CDR = CDR; CDR;
+    super GETFREE_GETFREE = GETFREE; GETFREE;
+    super ADD_RET = ADD; RET;
+    super CONS_RET = CONS; RET;
+    super TEST_RET = TEST; RET;
+    super TESTT_RET = TESTT; RET;
+    super ADDI_CALL = ADDI; CALL;
+    super MOVE_CALL = MOVE; CALL;
+    super MOVE_TAILCALL = MOVE; TAILCALL;
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V {
         ctx = c;

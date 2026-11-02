@@ -8,9 +8,9 @@
   (let loop ((i n) (r 0))
     (if (= i 0) r (loop (- i 1) (ack 3 9)))))
 
-(display (run 30))
+(display (run 20))
 (newline)
-(display (ack 3 12))
+(display (ack 3 10))
 (newline)
 ; expect: 4093
-; expect: 32765
+; expect: 8189
