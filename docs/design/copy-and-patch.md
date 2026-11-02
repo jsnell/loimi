@@ -3,12 +3,15 @@
 Status: **prototype**, behind flags (`loimi build --jit-stencils`, run
 with `LOIMI_JIT=1`), x86-64 Linux, tail-call dispatch, one vm per
 program. It runs all three example interpreters: Mini
-(`examples/mini`), MiniJS and Scheme, none of them changed for it.
+(`examples/mini`), MiniJS and Scheme, none of them changed for it
+(phase 4 marks their constant operands `const`).
 Written 2026-11-02 to answer open question 6 of the
 [roadmap](../roadmap.md); section 9 is the second phase (MiniJS and
 Scheme, no cost with the JIT off, faster stencil builds), section 10
 the third (rewrites of compiled code, hot and cold stencil parts:
-neither faster), and section 11 sketches immutable operand kinds.
+neither faster), section 11 sketches immutable operand kinds, and
+section 12 is the fourth phase, which implements them (no measurable
+gain).
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -428,7 +431,8 @@ most (by inspection, not measured):
 - Cold paths exit to the interpreter (above). Stencil copies of cold
   blocks whose `next` continues in compiled code would fix that.
 - `k[it]` is still a load. The constant pool cannot change after
-  verification, but Loimi has no way to say so (section 8).
+  verification, but Loimi has no way to say so (section 8). Phase 4 added
+  the way and patched constants in: no measurable gain (section 12).
 
 ## 8. Recommendation
 
@@ -459,6 +463,8 @@ What a full version needs:
      (`ADDK_F` with a known float needs no check on its second
      operand). This is the first step to type specialization, and the
      only `vm` syntax change this work suggests (sketch in section 11).
+     Done in phase 4, as a `const` clause (section 12). On its own it
+     measured no faster.
    - ~~*Complete members*~~: since phase 3, old compiled code follows a
      rewrite at the rewritten instruction (section 10), so members need
      not be complete.
@@ -715,7 +721,7 @@ Geometric means of time against the interpreter (default build):
 - Default builds: the IR of all three interpreters is byte-identical to
   phase 2's (std paths normalized). JIT off: within noise.
 
-## 11. Sketch: immutable operand kinds (not implemented)
+## 11. Sketch: immutable operand kinds (implemented in section 12)
 
 Section 7 left `k[it]` as a load. This sketches what the language and
 the JIT would need to patch constants in.
@@ -767,3 +773,98 @@ load and, with variants, a tag check: a few percent where they are
 hot, by analogy with section 7, not measured. It is also the first
 step towards type specialization, which is where the remaining gap to
 LuaJIT is (section 7).
+
+## 12. Phase 4: constant operands patched in
+
+Phase 4 implemented section 11 and measured it. **It works and costs
+nothing, but it gains nothing measurable**: 0.3–0.7% on Mini, 0.2% on
+MiniJS, none on Scheme (1.003), all within noise.
+
+**Language.** An operand kind takes a `const` clause, beside `verify` and
+`display` (`language.md` §3.2):
+
+```
+operand kst = k[it] const proto.consts.data.ptr verify (it as u64) < proto.consts.data.len;
+```
+
+The body must be `S[it]` for a pointer state register `S`. The clause is
+an expression of the verify context, of `S`'s type: the value `S` has
+while code verified against that context runs. That part is a promise of
+the vm author, like a `verify` clause. The checker enforces the rest
+within the vm: no handler, vm function, cold block or `on raise` may
+write through `S` (the operand itself, `k[i] = x`, `*(k + i) = x`) or
+take an address in it (`&k[i]`). A vm has at most one pool. Mini,
+MiniJS and Scheme mark their `kst` kinds `const`; nothing else in them
+changed. The tests are `tests/run/vm_const_operand.lm` and five
+`tests/fail/vm_const_*.lm`.
+
+**Interpreter.** `const` adds nothing to the handlers. A default build of
+an interpreter that opts in has the same IR as before, plus one unused
+function (`Vm__const_pool`, which type-checks the clause); LLVM drops it.
+Interpreters that do not opt in have byte-identical IR (std paths and
+panic strings normalized).
+
+**JIT.** `Vm.build_verified` passes the pool to `loimi_jit_register`.
+
+1. *Values.* In a stencil, a read of a const operand (`k[c]`, and also
+   `*((k + c.raw) as *f64)`, which Mini's float members use) of a 64-bit
+   type becomes the hole `__jit.c.OFF.SHIFT.BITS.u`, an `R_X86_64_64`
+   immediate patched with the constant's bits. The hole is read with
+   `movabs` in inline asm: as a plain symbol address, clang 19
+   sometimes stored it with a sign-extended 32-bit immediate
+   (`movq $hole, mem`) whatever its `!absolute_symbol` range, and those
+   compiles failed. `LOADK` is now `movabs` and a store; `MULK_F` is
+   `movabs`, `movq` to xmm, `mulsd` with the register operand.
+2. *Variants.* An op with one const operand of a one-word `value` type
+   gets a stencil per variant its handler's patterns name (`ADDK.v.Int`,
+   `ADDK.v.Num`), from the same handler. In a variant, the constant is
+   rebuilt as `(bits & payload mask) | tag`, so LLVM knows its tag bits
+   and folds the tag tests on it; for the unboxed float of a nanbox it is
+   `llvm.assume(bits < limit)`. The runtime picks a variant from the
+   constant (`loimi_jit_variants`: mask and value per variant). Mini gets
+   50 variants (163 stencils), MiniJS 48, Scheme none (its only const
+   operand is `LOADK`'s). `LOIMI_JIT_VARIANTS=0` at build time turns them
+   off. `ADDK.v.Int` loses the test of the constant: 14 instructions to
+   the `jmp` instead of 17. What it cannot fold are tests written as bit
+   tricks: `JGTKN`'s integer test `(a ^ bias | b ^ bias) < 1 << 48`
+   stays in `JGTKN.v.Num`, because LLVM does not carry `b < limit`
+   through the xor.
+
+Correctness: the golden JIT tests (all scripts and conformance tests,
+three GC modes, threshold 1, with and without recompiles) pass for all
+three, with the constants patched in and variants chosen.
+
+**Results.** Best of 5 (Scheme: 3), interleaved, `--align-functions=64`,
+same machine (load average about 3). Geometric means:
+
+| | JIT before / interp | JIT, constants / JIT before | JIT, constants and variants / JIT before | JIT off / interp |
+|---|---:|---:|---:|---:|
+| Mini (14) | 0.770 | 0.997 (0.993 in a second run) | 0.996 | 0.998 |
+| MiniJS (14) | 0.858 | | 0.998 | 0.997 |
+| Scheme (41) | 0.778 | 1.003 (only `LOADK` is const) | (no variants) | not measured |
+
+- Per benchmark, Mini moves by up to ±5% with variants (mandelbrot and
+  hash_strings 0.95, interp and oo_methods 1.03), about the noise of
+  one run. The JIT-off column is the opted-in build without
+  `LOIMI_JIT`.
+- **Why so little.** A constant load is an L1 hit off a register that
+  is already live (`k`), and out-of-order execution hides its latency;
+  the `movabs` that replaces it is one instruction too, and cannot be
+  folded into an arithmetic operand as the load was. A type check of a
+  constant is a well-predicted branch. Neither is on the critical path:
+  section 7's limits are the register file in memory, the checks of
+  *register* operands, and calls. Variants also make code larger (Mini's
+  stencils grow from 22 KB to 29 KB).
+- **Phase 3's 1% (task 0).** Neither suspect is measurable on Mini. With
+  the JIT on, against the shipped design: no rewrite prefixes 0.997, a
+  private anonymous mapping (transparent huge pages allowed) 1.001, both
+  0.989 (best of 5, 14 benchmarks). Left as is: the prefixes are what
+  makes rewrites cheap, and the double mapping is what makes them need
+  no system call.
+
+**Recommendation.** Keep `const` operands: they are a small, checked
+language feature with no cost, and the place type specialization would
+start from. But patching constants is not a speedup for a baseline JIT
+of an interpreter that is already tuned. The remaining gap to LuaJIT
+needs values in machine registers and types known across instructions
+(section 8, item 4), not cheaper constants.

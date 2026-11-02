@@ -189,12 +189,23 @@ quickening on/off.
      is optional (`LOIMI_JIT_SPLIT=1`). Neither is faster: the
      invalidations cost little, and the new scheme costs about 1% (Mini
      0.78, MiniJS 0.86, Scheme 0.78).
+   - *Phase 4: constant operands.* Operand kinds take a `const` clause
+     (`operand kst = k[it] const proto.consts.data.ptr verify ..`): what
+     they read cannot change after verification, which the checker
+     enforces within the vm. The interpreter is unchanged. The JIT
+     patches each constant in as a 64-bit immediate, and picks stencil
+     variants per tag of the constant, generated from the handler with
+     the tag known so LLVM folds its checks. All three interpreters opt
+     in. No measurable gain (Mini 0.996 of the JIT's time before,
+     MiniJS 0.998): constant loads and their type checks were never
+     on the critical path. Phase 3's 1% was not measurable either.
    - *Recommendation.* Pursue it post-1.0 as an opt-in tier, not as a
-     substitute for an optimizing JIT. A full version needs immutable
-     operand kinds (`const k[it]`, so constants and their types can be
-     patched in; sketched in the design note); freeing compiled code;
+     substitute for an optimizing JIT. A full version needs freeing
+     compiled code;
      several vms per program and variants; and AArch64 and PIC/Mach-O
-     relocations.
+     relocations. The next speed experiment is keeping register-file
+     values in machine registers across instructions (design note,
+     section 8), not cheaper constants.
 7. **How unsafe is `Window`?** A register window is one pointer with no
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing
