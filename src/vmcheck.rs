@@ -1322,73 +1322,68 @@ fn warn_unsynced_roots(c: &mut Checker, d: &VmDecl, i: usize, site: Span) {
 /// Whether `b` mentions the name `x` anywhere (conservatively: as a
 /// read).
 fn block_reads(b: &Block, x: &str) -> bool {
-    b.stmts.iter().any(|s| match s {
-        Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| expr_reads(e, x)) || els.as_ref().is_some_and(|b| block_reads(b, x)),
-        Stmt::Expr { expr, .. } | Stmt::Defer(expr) => expr_reads(expr, x),
-    })
-}
-
-fn expr_reads(e: &Expr, x: &str) -> bool {
-    let go = |e: &Expr| expr_reads(e, x);
-    let conds = |cs: &Vec<Cond>| cs.iter().any(|c| match c {
-        Cond::Expr(e) | Cond::Let(_, e) => expr_reads(e, x),
-    });
-    match &e.kind {
-        ExprKind::Ident(n) => n == x,
-        ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => go(l) || go(r),
-        ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
-        ExprKind::Call(f, args) => go(f) || args.iter().any(go),
-        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
-        ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
-        ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, e)| go(e)),
-        ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
-        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => block_reads(b, x),
-        ExprKind::If(cs, t, f) => conds(cs) || block_reads(t, x) || f.as_ref().is_some_and(|e| go(e)),
-        ExprKind::While(cs, b) => conds(cs) || block_reads(b, x),
-        ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || block_reads(b, x),
-        ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
-        ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
-        // Anything else (closures, vm expressions, ...): assume it does.
-        _ => true,
-    }
+    let hit = |e: &Expr| matches!(&e.kind, ExprKind::Ident(n) if n == x);
+    AstAny { hit: &hit, vm: false, other: true }.block(b)
 }
 
 /// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for
 /// finding the operands an op writes.
 pub(crate) fn block_assigns(b: &Block, x: &str) -> bool {
-    b.stmts.iter().any(|s| match s {
-        Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| expr_assigns(e, x)) || els.as_ref().is_some_and(|b| block_assigns(b, x)),
-        Stmt::Expr { expr, .. } | Stmt::Defer(expr) => expr_assigns(expr, x),
-    })
+    let hit = |e: &Expr| match &e.kind {
+        ExprKind::Assign(l, _) | ExprKind::CompoundAssign(_, l, _) => matches!(&l.kind, ExprKind::Ident(n) if n == x),
+        _ => false,
+    };
+    AstAny { hit: &hit, vm: true, other: false }.block(b)
 }
 
-fn expr_assigns(e: &Expr, x: &str) -> bool {
-    let go = |e: &Expr| expr_assigns(e, x);
-    let conds = |cs: &Vec<Cond>| cs.iter().any(|c| match c {
-        Cond::Expr(e) | Cond::Let(_, e) => expr_assigns(e, x),
-    });
-    match &e.kind {
-        ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => {
-            matches!(&l.kind, ExprKind::Ident(n) if n == x) || go(l) || go(r)
+/// A search over an AST block: is there an expression `hit` holds for?
+/// `vm`: look into vm expressions (`jump`, `exit`, `raise`, `fail`,
+/// `cold`); `other`: the answer for expressions not looked into (other
+/// vm expressions, closures, literals, ...).
+struct AstAny<'a> {
+    hit: &'a dyn Fn(&Expr) -> bool,
+    vm: bool,
+    other: bool,
+}
+
+impl AstAny<'_> {
+    fn block(&self, b: &Block) -> bool {
+        b.stmts.iter().any(|s| match s {
+            Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| self.expr(e)) || els.as_ref().is_some_and(|b| self.block(b)),
+            Stmt::Expr { expr, .. } | Stmt::Defer(expr) => self.expr(expr),
+        })
+    }
+
+    fn expr(&self, e: &Expr) -> bool {
+        if (self.hit)(e) {
+            return true;
         }
-        ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
-        ExprKind::Call(f, args) => go(f) || args.iter().any(go),
-        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
-        ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
-        ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, e)| go(e)),
-        ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
-        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => block_assigns(b, x),
-        ExprKind::If(cs, t, f) => conds(cs) || block_assigns(t, x) || f.as_ref().is_some_and(|e| go(e)),
-        ExprKind::While(cs, b) => conds(cs) || block_assigns(b, x),
-        ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || block_assigns(b, x),
-        ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
-        ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
-        ExprKind::Vm(v) => match v {
-            VmExpr::Jump(a) | VmExpr::Exit(a) | VmExpr::Raise(a) | VmExpr::Fail(a) => go(a),
-            VmExpr::Cold(b) => block_assigns(b, x),
-            _ => false,
-        },
-        _ => false,
+        let go = |e: &Expr| self.expr(e);
+        let conds = |cs: &Vec<Cond>| cs.iter().any(|c| match c {
+            Cond::Expr(e) | Cond::Let(_, e) => self.expr(e),
+        });
+        match &e.kind {
+            ExprKind::Ident(_) => false,
+            ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => go(l) || go(r),
+            ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
+            ExprKind::Call(f, args) => go(f) || args.iter().any(go),
+            ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
+            ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
+            ExprKind::StructLit(_, fs, _) => fs.iter().any(|(_, e)| go(e)),
+            ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
+            ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => self.block(b),
+            ExprKind::If(cs, t, f) => conds(cs) || self.block(t) || f.as_ref().is_some_and(|e| go(e)),
+            ExprKind::While(cs, b) => conds(cs) || self.block(b),
+            ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || self.block(b),
+            ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
+            ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
+            ExprKind::Vm(v) if self.vm => match v {
+                VmExpr::Jump(a) | VmExpr::Exit(a) | VmExpr::Raise(a) | VmExpr::Fail(a) => go(a),
+                VmExpr::Cold(b) => self.block(b),
+                _ => false,
+            },
+            _ => self.other,
+        }
     }
 }
 
