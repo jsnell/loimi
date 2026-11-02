@@ -1,0 +1,19 @@
+-- Concatenation chains compile to one multi-operand CONCAT. Output from PUC-Lua 5.4.
+local a, b, c = "x", 12, 1.5
+print(a .. b .. c .. "!" .. a)
+print((a .. b) .. (c .. a))
+local t = {}
+for i = 1, 5 do t[#t + 1] = "k" .. i .. "=" .. i * 2 .. ";" end
+print(table.concat(t))
+local s = ""
+for i = 1, 3 do s = s .. i .. "," .. s end
+print(s)
+print("a" .. 1 .. 2 .. 3, 1 .. "")
+local function f(x) return x .. "y" end
+print(f("q") .. f(f("r")) .. 7)
+-- expect: x121.5!x
+-- expect: x121.5x
+-- expect: k1=2;k2=4;k3=6;k4=8;k5=10;
+-- expect: 1,2,1,3,1,2,1,
+-- expect: a123	1
+-- expect: qyryy7

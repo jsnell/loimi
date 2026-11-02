@@ -158,17 +158,26 @@ fn less(c: *Ctx, a: V, b: V, or_equal: bool) -> Result<bool, V> {
     }
 }
 
-fn concat(c: *Ctx, a: V, b: V) -> Result<V, V> {
-    for v in 0..2 {
-        let x = if v == 0 { a } else { b };
-        match x {
-            S(_) | Int(_) | Num(_) => {}
-            _ => return Err(error(c, "attempt to concatenate a ", x)),
-        }
+fn concatenable(v: V) -> bool {
+    match v {
+        S(_) | Int(_) | Num(_) => true,
+        _ => false,
+    }
+}
+
+/// vals[0] .. vals[1] .. ... .. vals[n-1] (n >= 2) as one new string.
+/// Errors name the operand Lua would: it concatenates from the right,
+/// so the last pair is checked first (its left operand if both are bad).
+fn concat(c: *Ctx, vals: *V, n: u64) -> Result<V, V> {
+    if !concatenable(vals[n - 2]) { return Err(error(c, "attempt to concatenate a ", vals[n - 2])); }
+    if !concatenable(vals[n - 1]) { return Err(error(c, "attempt to concatenate a ", vals[n - 1])); }
+    var i = n - 2;
+    while i > 0 {
+        i -= 1;
+        if !concatenable(vals[i]) { return Err(error(c, "attempt to concatenate a ", vals[i])); }
     }
     c.out.clear();
-    value.write_value(&c.out, a);
-    value.write_value(&c.out, b);
+    for j in 0..n { value.write_value(&c.out, vals[j]); }
     Ok(V.S(value.new_str(&c.heap, c.out.as_str())))
 }
 
@@ -509,9 +518,10 @@ pub vm Mini {
         dst = length(ctx, a)?;
         next
     }
-    op CONCAT(dst: reg, a: reg, b: reg) : ABC {
+    /// R[dst] = R[base] .. ... .. R[base + n - 1], as one string.
+    op CONCAT(dst: reg, base: callbase, n: imm) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        dst = concat(ctx, a, b)?;
+        dst = concat(ctx, regs + base, n as u64)?;
         next
     }
 

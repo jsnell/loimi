@@ -860,11 +860,38 @@ fn Parser.subexpr(p: *Parser, limit: u32) -> E {
             e = p.binop(op, l, rhs);
             continue;
         }
+        if op == T.Concat {
+            e = p.concat(e, rp);
+            continue;
+        }
         let l = p.any_reg(e);
         let rhs = p.subexpr(rp);
         e = p.binop(op, l, rhs);
     }
     e
+}
+
+/// `e .. rhs`: operands go to consecutive registers, and a chain
+/// a .. b .. c becomes one CONCAT over all of them (as in Lua).
+fn Parser.concat(p: *Parser, e: E, rp: u32) -> E {
+    let l = p.to_next_reg(e);
+    let rhs = p.subexpr(rp);
+    // The right operand is itself a concatenation starting right after l:
+    // extend it to start at l.
+    if let Reloc(at) = rhs and at + 1 == p.pc() {
+        let w = p.fs.code.at(at);
+        if Mini.opcode(w) == Mini.OP_CONCAT and ((w >> 16) & 255) == l + 1 {
+            let n = (w >> 24) + 1;
+            p.fs.code.set(at, Mini.CONCAT(0, l as u8, n as u8));
+            p.free_reg(l);
+            return rhs;
+        }
+    }
+    let r = p.to_next_reg(rhs);
+    if r != l + 1 { fail(p.line, "internal error: concat operands not consecutive"); }
+    p.free_reg(r);
+    p.free_reg(l);
+    E.Reloc(p.emit(Mini.CONCAT(0, l as u8, 2)))
 }
 
 fn swappable(op: T) -> bool {
