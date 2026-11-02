@@ -14,7 +14,9 @@ pub fn is_traced(p: &Program, t: &Ty) -> bool {
     match t {
         Ty::Gc(_) => true,
         Ty::Option(inner) | Ty::Array(inner, _) => is_traced(p, inner),
+        Ty::Result(a, b) => is_traced(p, a) || is_traced(p, b),
         Ty::Tuple(ts) => ts.iter().any(|t| is_traced(p, t)),
+        Ty::Enum(i) => p.enums[*i as usize].variants.iter().any(|v| v.fields.iter().any(|t| is_traced(p, t))),
         Ty::Struct(i) => {
             let s = &p.structs[*i as usize];
             s.object.is_none() && s.fields.iter().any(|(_, t)| is_traced(p, t))
@@ -70,6 +72,61 @@ pub fn mark_expr(g: &mut FnGen, t: &Ty, v: &str, h: &str) {
                     let x = g.inst(format!("extractvalue {} {}, {}", lt, v, i));
                     mark_expr(g, ft, &x, h);
                 }
+            }
+        }
+        Ty::Result(a, b) => {
+            let lt = g.ty(t);
+            let tag = g.inst(format!("extractvalue {} {}, 0", lt, v));
+            for (pos, ft) in [(1, a), (2, b)] {
+                if !is_traced(p, ft) {
+                    continue;
+                }
+                let l_yes = g.fresh_label("mkres");
+                let l_no = g.fresh_label("mkresn");
+                // Ok (field 1) has tag false, Err (field 2) tag true.
+                if pos == 1 {
+                    g.cond_br(&tag, &l_no, &l_yes);
+                } else {
+                    g.cond_br(&tag, &l_yes, &l_no);
+                }
+                g.label(&l_yes);
+                let x = g.inst(format!("extractvalue {} {}, {}", lt, v, pos));
+                mark_expr(g, ft, &x, h);
+                g.br(&l_no);
+                g.label(&l_no);
+            }
+        }
+        Ty::Enum(eid) => {
+            let e = &p.enums[*eid as usize];
+            if !is_traced(p, t) {
+                return;
+            }
+            let slot = g.alloca(t);
+            let lt = g.ty(t);
+            g.emit(format!("store {} {}, ptr {}", lt, v, slot));
+            let tt = format!("i{}", e.tag.bits);
+            let tag = g.inst(format!("load {}, ptr {}", tt, slot));
+            let pp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", lt, slot));
+            for var in &e.variants {
+                if !var.fields.iter().any(|ft| is_traced(p, ft)) {
+                    continue;
+                }
+                let c = g.inst(format!("icmp eq {} {}, {}", tt, tag, var.discr));
+                let l_yes = g.fresh_label("mkenum");
+                let l_no = g.fresh_label("mkenumn");
+                g.cond_br(&c, &l_yes, &l_no);
+                g.label(&l_yes);
+                let st = Ty::Tuple(var.fields.clone());
+                let stl = g.ty(&st);
+                for (i, ft) in var.fields.iter().enumerate() {
+                    if is_traced(p, ft) {
+                        let fp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", stl, pp, i));
+                        let x = g.load(ft, &fp);
+                        mark_expr(g, ft, &x, h);
+                    }
+                }
+                g.br(&l_no);
+                g.label(&l_no);
             }
         }
         Ty::Array(et, n) => {

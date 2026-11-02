@@ -1,0 +1,51 @@
+// Gc references inside `Result`s and enum payloads are traced: as locals
+// across a collection (shadow-stack roots), as object fields (generated
+// trace functions), and stores of them into objects get the write barrier.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+enum E { A(Gc<Node>), B, C(i64, (u8, Gc<Node>)) }
+object Holder { e: E, r: Result<i64, Gc<Node>> }
+
+fn mk(h: *gc.Heap, v: i64) -> Result<Gc<Node>, str> { Ok(new(h, Node { value: v, next: None })) }
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..1000 { new(h, Node { value: -1, next: None }); }
+    gc.collect(h);
+    for i in 0..1000 { new(h, Node { value: -2, next: None }); }
+}
+
+fn val(e: E) -> i64 {
+    match e { E.A(x) => x.value, E.B => 0, E.C(k, (_, x)) => k + x.value }
+}
+
+fn f(h: *gc.Heap) -> Result<i64, str> uses gc {
+    let r = mk(h, 7);
+    let e = E.A(new(h, Node { value: 8, next: None }));
+    churn(h);
+    let n = r?;
+    Ok(n.value + val(e))
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    match f(h) { Ok(v) => { io.print_int(v); io.println(""); }, Err(m) => io.println(m) }
+
+    h.set_generational(true);
+    h.set_verify(true);
+    let o = new(h, Holder { e: E.B, r: Ok(0) });
+    gc.collect(h);
+    gc.collect(h);
+    // `o` is old now: these stores of young objects need the barrier.
+    o.e = E.C(100, (1, new(h, Node { value: 20, next: None })));
+    o.r = Err(new(h, Node { value: 3, next: None }));
+    churn(h);
+    churn(h);
+    let r = match o.r { Ok(_) => 0, Err(x) => x.value };
+    io.print_int(val(o.e) + r); io.println("");
+}
+
+// expect: 15
+// expect: 123
