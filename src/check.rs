@@ -267,6 +267,7 @@ impl<'a> Checker<'a> {
                             name: format!("{}.{}", prefix, v.name.name),
                             repr: ValueRepr::NanBox,
                             variants: vec![],
+                            num_limit: 0,
                         });
                         self.define(m, &v.name, Def::Value(id), v.is_pub)?;
                     }

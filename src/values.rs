@@ -1,10 +1,21 @@
 //! `value` types: dynamic values with a declared representation.
 //!
 //! nanbox:  i64. The `unboxed` f64 variant is stored as its bits (NaNs
-//!          canonicalized); other variants use tags 0xFFF9.. in the top
-//!          16 bits with a 48-bit payload.
-//! lowtag:  i64. Tag in the low 3 bits; integers shifted left by 3,
-//!          pointers (8-byte aligned) or'ed with the tag.
+//!          canonicalized to 0x7FF8_0000_0000_0000). Every other variant
+//!          owns an aligned block of the NaN space above
+//!          0xFFF8_0000_0000_0000: the word is `tag << shift | payload`,
+//!          where the payload has `shift` bits. With at most 7 tagged
+//!          variants each gets a 48-bit block 0xFFF9.. 0xFFFF in declaration
+//!          order. With more, blocks are sized to the payload (48 bits for
+//!          pointers, N for iN/uN, 1 for bool, 0 for none) and allocated
+//!          buddy-style from 0xFFF8_8000_0000_0000 (47 bits) and
+//!          0xFFF9..0xFFFF (48 bits each), widest first.
+//! lowtag:  i64. The word is `payload << shift | tag`. With at most 8
+//!          variants the tag is the variant index in the low 3 bits;
+//!          pointers (8-byte aligned) are or'ed with it and integers (up to
+//!          61 bits) shifted by 3. With more, pointers and 61-bit integers
+//!          keep 3-bit tags and narrower variants share the rest with longer
+//!          tags (`64 - payload bits` long at most), allocated buddy-style.
 //! boxed:   { i64 tag, i64 payload }, two registers.
 
 use crate::check::Checker;
@@ -15,7 +26,44 @@ use crate::vmast::ValueDecl;
 
 pub const NAN_TAG_BASE: u64 = 0xFFF9;
 pub const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
-const LOW_BITS: u64 = 3;
+/// The 47-bit block in the upper half of 0xFFF8: above the negative
+/// default NaN 0xFFF8_0000_0000_0000 that x86 arithmetic produces.
+const NAN_HALF_BLOCK: u64 = 0xFFF8_8000_0000_0000;
+const LOW_BITS: u32 = 3;
+/// Bits a nanbox keeps of a pointer payload.
+const NAN_PTR_BITS: u32 = 48;
+
+/// Bits a payload of type `t` needs (pointers: `ptr_bits`), or None if the
+/// type cannot be a payload of a one-word value.
+fn payload_width(t: Option<&Ty>, ptr_bits: u32) -> Option<u32> {
+    Some(match t {
+        None => 0,
+        Some(Ty::Bool) => 1,
+        Some(Ty::Int(it)) => it.bits as u32,
+        Some(Ty::Ptr(_) | Ty::Gc(_)) => ptr_bits,
+        Some(_) => return None,
+    })
+}
+
+/// Buddy allocation of aligned blocks. `free` holds blocks as (start,
+/// log2 size); `need` lists (variant, log2 size) in allocation order.
+/// Returns each variant's block start, or the first variant that did not
+/// fit. A request takes the smallest free block that fits (lowest start on
+/// ties) and splits it down to the requested size, keeping the low half.
+fn buddy(mut free: Vec<(u64, u32)>, need: &[(usize, u32)]) -> Result<Vec<(usize, u64)>, usize> {
+    let mut out = Vec::new();
+    for &(v, size) in need {
+        let best = free.iter().enumerate().filter(|(_, b)| b.1 >= size).min_by_key(|(_, b)| (b.1, b.0)).map(|(i, _)| i);
+        let Some(i) = best else { return Err(v) };
+        let (start, mut s) = free.remove(i);
+        while s > size {
+            s -= 1;
+            free.push((start + (1u64 << s), s));
+        }
+        out.push((v, start));
+    }
+    Ok(out)
+}
 
 pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDef> {
     let repr = match v.repr.name.as_str() {
@@ -24,76 +72,125 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         "boxed" => ValueRepr::Boxed,
         r => return Err(Diag::new(v.repr.span, format!("unknown representation `{}` (nanbox, lowtag or boxed)", r))),
     };
-    let mut variants = Vec::new();
-    let mut boxed_count = 0u64;
+    let mut variants: Vec<ValueVariantDef> = Vec::new();
     let mut have_unboxed = false;
+    // (variant index, payload bits) of the variants that need a tag.
+    let mut tagged: Vec<(usize, u32)> = Vec::new();
     for (i, vv) in v.variants.iter().enumerate() {
         let payload = match &vv.payload {
             Some(t) => Some(c.resolve_type(m, t)?),
             None => None,
         };
-        let small_ok = |t: &Ty| match t {
-            Ty::Int(it) => it.bits <= 32,
-            Ty::Bool | Ty::Ptr(_) | Ty::Gc(_) => true,
-            _ => false,
-        };
-        let tag = match repr {
-            ValueRepr::NanBox => {
-                if vv.unboxed {
-                    if payload != Some(Ty::F64) {
-                        return Err(Diag::new(vv.name.span, "the `unboxed` variant of a nanbox must hold an f64"));
-                    }
-                    if have_unboxed {
-                        return Err(Diag::new(vv.name.span, "a nanbox has at most one `unboxed` variant"));
-                    }
-                    have_unboxed = true;
-                    0
-                } else {
-                    if let Some(t) = &payload {
-                        if !small_ok(t) {
-                            return Err(Diag::new(
-                                vv.name.span,
-                                "nanbox payloads must be integers of at most 32 bits, bool or pointers (or the unboxed f64)",
-                            ));
-                        }
-                    }
-                    let t = NAN_TAG_BASE + boxed_count;
-                    boxed_count += 1;
-                    if t > 0xFFFF {
-                        return Err(Diag::new(vv.name.span, "a nanbox has room for at most 7 tagged variants"));
-                    }
-                    t
+        if variants.iter().any(|x| x.name == vv.name.name) {
+            return Err(Diag::new(vv.name.span, format!("duplicate variant `{}`", vv.name.name)));
+        }
+        if vv.unboxed && repr != ValueRepr::NanBox {
+            return Err(Diag::new(vv.name.span, "`unboxed` is only meaningful for nanbox"));
+        }
+        match repr {
+            ValueRepr::NanBox if vv.unboxed => {
+                if payload != Some(Ty::F64) {
+                    return Err(Diag::new(vv.name.span, "the `unboxed` variant of a nanbox must hold an f64"));
                 }
+                if have_unboxed {
+                    return Err(Diag::new(vv.name.span, "a nanbox has at most one `unboxed` variant"));
+                }
+                have_unboxed = true;
             }
-            ValueRepr::LowTag => {
-                if vv.unboxed {
-                    return Err(Diag::new(vv.name.span, "`unboxed` is only meaningful for nanbox"));
+            ValueRepr::NanBox => match payload_width(payload.as_ref(), NAN_PTR_BITS) {
+                Some(w) if w <= 48 => tagged.push((i, w)),
+                _ => {
+                    return Err(Diag::new(
+                        vv.name.span,
+                        "nanbox payloads must be integers of at most 48 bits (such as i48), bool or pointers (or the unboxed f64)",
+                    ))
                 }
-                if let Some(t) = &payload {
-                    if !small_ok(t) {
-                        return Err(Diag::new(vv.name.span, "lowtag payloads must be integers of at most 32 bits, bool or pointers"));
-                    }
+            },
+            ValueRepr::LowTag => match payload_width(payload.as_ref(), 64) {
+                Some(w) if w <= 64 - LOW_BITS || matches!(payload, Some(Ty::Ptr(_) | Ty::Gc(_))) => tagged.push((i, w)),
+                _ => {
+                    return Err(Diag::new(
+                        vv.name.span,
+                        "lowtag payloads must be integers of at most 61 bits (such as i61), bool or pointers",
+                    ))
                 }
-                if i as u64 >= 1 << LOW_BITS {
-                    return Err(Diag::new(vv.name.span, "lowtag has room for at most 8 variants"));
-                }
-                i as u64
-            }
+            },
             ValueRepr::Boxed => {
                 if let Some(t) = &payload {
-                    if !(small_ok(t) || matches!(t, Ty::F64 | Ty::Int(_))) {
+                    if !matches!(t, Ty::F64 | Ty::Int(_) | Ty::Bool | Ty::Ptr(_) | Ty::Gc(_)) {
                         return Err(Diag::new(vv.name.span, "boxed payloads must be numbers, bool or pointers"));
                     }
                 }
-                i as u64
             }
-        };
-        if variants.iter().any(|x: &ValueVariantDef| x.name == vv.name.name) {
-            return Err(Diag::new(vv.name.span, format!("duplicate variant `{}`", vv.name.name)));
         }
-        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag });
+        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0 });
     }
-    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants })
+    let too_many = |i: usize, what: &str| Diag::new(v.variants[i].name.span, format!("no room in the {} for variant `{}`", what, v.variants[i].name.name));
+    let mut num_limit = NAN_TAG_BASE << 48;
+    match repr {
+        ValueRepr::NanBox if tagged.len() <= 7 => {
+            for (k, &(i, _)) in tagged.iter().enumerate() {
+                variants[i].tag = NAN_TAG_BASE + k as u64;
+                variants[i].shift = 48;
+            }
+        }
+        ValueRepr::NanBox => {
+            let mut need = tagged.clone();
+            need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+            let mut free = vec![(NAN_HALF_BLOCK, 47)];
+            free.extend((NAN_TAG_BASE..=0xFFFF).map(|t| (t << 48, 48)));
+            let blocks = buddy(free, &need).map_err(|i| {
+                too_many(i, "nanbox's NaN space (seven 48-bit blocks for pointers and 48-bit integers, one 47-bit block)")
+            })?;
+            for (i, start) in blocks {
+                let w = tagged.iter().find(|t| t.0 == i).unwrap().1;
+                variants[i].tag = start >> w;
+                variants[i].shift = w;
+                num_limit = num_limit.min(start);
+            }
+        }
+        ValueRepr::LowTag if tagged.len() <= 1 << LOW_BITS => {
+            for &(i, _) in &tagged {
+                variants[i].shift = LOW_BITS;
+            }
+        }
+        ValueRepr::LowTag => {
+            // Tags are codes in the low bits: a block is (code, code length).
+            // Allocate with the buddy allocator over bit-reversed codes, so
+            // "start" orders codes and "size" is 64 - code length.
+            let mut need: Vec<(usize, u32)> = tagged
+                .iter()
+                .map(|&(i, w)| {
+                    let is_ptr = matches!(variants[i].payload, Some(Ty::Ptr(_) | Ty::Gc(_)));
+                    (i, if is_ptr { 64 - LOW_BITS } else { w })
+                })
+                .collect();
+            need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+            let free = vec![(0u64, 64)];
+            let blocks = buddy(free, &need).map_err(|i| too_many(i, "lowtag's tag space (8 three-bit tags; pointers and 61-bit integers take one each)"))?;
+            for (i, start) in blocks {
+                let w = need.iter().find(|t| t.0 == i).unwrap().1;
+                let len = 64 - w;
+                // `start` is the bit-reversed code, aligned to 2^w: its top
+                // `len` bits, reversed, are the code.
+                let code = if len == 0 { 0 } else { (start >> w).reverse_bits() >> (64 - len) };
+                variants[i].tag = code;
+                variants[i].shift = len;
+            }
+        }
+        _ => {}
+    }
+    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit })
+}
+
+/// `(1 << bits) - 1`, for bits up to 64.
+fn low_mask(bits: u32) -> u64 {
+    if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+}
+
+/// `x << s`, for s up to 64.
+fn shl(x: u64, s: u32) -> u64 {
+    if s >= 64 { 0 } else { x << s }
 }
 
 fn def<'a>(g: &FnGen<'_, 'a>, t: &Ty) -> &'a ValueDef {
@@ -185,33 +282,36 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
                 let nan = g.inst(format!("fcmp uno double {}, {}", vals[0], vals[0]));
                 return g.inst(format!("select i1 {}, i64 {}, i64 {}", nan, CANONICAL_NAN as i64, bits));
             }
-            let tag = ((var.tag << 48) as i64).to_string();
+            let tag = (shl(var.tag, var.shift) as i64).to_string();
             match &var.payload {
                 None => tag,
                 Some(pt) => {
                     let b = match pt {
                         // Signed payloads are stored as their low bits.
-                        Ty::Int(it) if it.signed => g.inst(format!("zext i{} {} to i64", it.bits, vals[0])),
+                        Ty::Int(it) if it.signed && it.bits < 64 => g.inst(format!("zext i{} {} to i64", it.bits, vals[0])),
                         _ => payload_bits(g, pt, &vals[0]),
                     };
-                    let b = if matches!(pt, Ty::Ptr(_) | Ty::Gc(_)) { g.inst(format!("and i64 {}, {}", b, 0xFFFF_FFFF_FFFFu64)) } else { b };
+                    let b = if matches!(pt, Ty::Ptr(_) | Ty::Gc(_)) { g.inst(format!("and i64 {}, {}", b, low_mask(var.shift))) } else { b };
                     g.inst(format!("or i64 {}, {}", b, tag))
                 }
             }
         }
         ValueRepr::LowTag => match &var.payload {
-            None => var.tag.to_string(),
+            None => (var.tag as i64).to_string(),
             Some(Ty::Ptr(_) | Ty::Gc(_)) => {
                 let b = g.inst(format!("ptrtoint ptr {} to i64", vals[0]));
                 g.inst(format!("or i64 {}, {}", b, var.tag))
             }
             Some(pt) => {
                 let b = match pt {
-                    Ty::Int(it) if it.signed => g.inst(format!("sext i{} {} to i64", it.bits, vals[0])),
+                    // Sign-extended, unless the shift drops the extension
+                    // bits anyway (i61): zext lets LLVM fold
+                    // `zext(trunc(x >> 3)) << 3` into `x`.
+                    Ty::Int(it) if it.signed && it.bits as u32 + var.shift < 64 => g.inst(format!("sext i{} {} to i64", it.bits, vals[0])),
                     _ => payload_bits(g, pt, &vals[0]),
                 };
-                let s = g.inst(format!("shl i64 {}, {}", b, LOW_BITS));
-                g.inst(format!("or i64 {}, {}", s, var.tag))
+                let s = g.inst(format!("shl i64 {}, {}", b, var.shift));
+                g.inst(format!("or i64 {}, {}", s, var.tag as i64))
             }
         },
         ValueRepr::Boxed => {
@@ -231,14 +331,16 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
 pub fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
     match d.repr {
-        ValueRepr::NanBox if var.unboxed => g.inst(format!("icmp ult i64 {}, {}", v, (NAN_TAG_BASE << 48) as i64)),
+        ValueRepr::NanBox if var.unboxed => g.inst(format!("icmp ult i64 {}, {}", v, d.num_limit as i64)),
+        ValueRepr::NanBox if var.shift == 0 => g.inst(format!("icmp eq i64 {}, {}", v, var.tag as i64)),
         ValueRepr::NanBox => {
-            let h = g.inst(format!("lshr i64 {}, 48", v));
-            g.inst(format!("icmp eq i64 {}, {}", h, var.tag))
+            let h = g.inst(format!("lshr i64 {}, {}", v, var.shift));
+            g.inst(format!("icmp eq i64 {}, {}", h, var.tag as i64))
         }
+        ValueRepr::LowTag if var.shift >= 64 => g.inst(format!("icmp eq i64 {}, {}", v, var.tag as i64)),
         ValueRepr::LowTag => {
-            let l = g.inst(format!("and i64 {}, {}", v, (1u64 << LOW_BITS) - 1));
-            g.inst(format!("icmp eq i64 {}, {}", l, var.tag))
+            let l = g.inst(format!("and i64 {}, {}", v, low_mask(var.shift)));
+            g.inst(format!("icmp eq i64 {}, {}", l, var.tag as i64))
         }
         ValueRepr::Boxed => {
             let t = g.inst(format!("extractvalue {{ i64, i64 }} {}, 0", v));
@@ -257,18 +359,22 @@ pub fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
                 return g.inst(format!("bitcast i64 {} to double", v));
             }
             if let Ty::Ptr(_) | Ty::Gc(_) = pt {
-                let m = g.inst(format!("and i64 {}, {}", v, 0xFFFF_FFFF_FFFFu64));
+                let m = g.inst(format!("and i64 {}, {}", v, low_mask(var.shift)));
                 return g.inst(format!("inttoptr i64 {} to ptr", m));
             }
             v.to_string()
         }
         ValueRepr::LowTag => {
             if let Ty::Ptr(_) | Ty::Gc(_) = pt {
-                let m = g.inst(format!("and i64 {}, {}", v, -(1i64 << LOW_BITS)));
+                let m = g.inst(format!("and i64 {}, {}", v, !low_mask(var.shift) as i64));
                 return g.inst(format!("inttoptr i64 {} to ptr", m));
             }
+            // `v` holds this variant, so `v ^ tag` has zero low bits and
+            // the shift is `exact`: LLVM can then fold a later `<< shift`
+            // (such as overflow-checked arithmetic) back into `v ^ tag`.
             let signed = matches!(pt, Ty::Int(it) if it.signed);
-            g.inst(format!("{} i64 {}, {}", if signed { "ashr" } else { "lshr" }, v, LOW_BITS))
+            let x = if var.tag == 0 { v.to_string() } else { g.inst(format!("xor i64 {}, {}", v, var.tag as i64)) };
+            g.inst(format!("{} exact i64 {}, {}", if signed { "ashr" } else { "lshr" }, x, var.shift))
         }
         ValueRepr::Boxed => {
             let p = g.inst(format!("extractvalue {{ i64, i64 }} {}, 1", v));
@@ -342,9 +448,9 @@ pub fn try_merged_tuple(g: &mut FnGen, pats: &[TPat], tuple_ty: &Ty, ptr: &str, 
             ValueRepr::NanBox if var.unboxed => unboxed.push(v.clone()),
             ValueRepr::NanBox | ValueRepr::LowTag => {
                 let (m, tagbits) = if d.repr == ValueRepr::NanBox {
-                    (0xFFFFu64 << 48, var.tag << 48)
+                    (!low_mask(var.shift), shl(var.tag, var.shift))
                 } else {
-                    ((1u64 << LOW_BITS) - 1, var.tag)
+                    (low_mask(var.shift), var.tag)
                 };
                 if mask.is_some_and(|x| x != m) {
                     let c = is_variant(g, d, *idx, v);
@@ -375,7 +481,9 @@ pub fn try_merged_tuple(g: &mut FnGen, pats: &[TPat], tuple_ty: &Ty, ptr: &str, 
         for u in &unboxed[1..] {
             acc = g.inst(format!("call i64 @llvm.umax.i64(i64 {}, i64 {})", acc, u));
         }
-        conds.push(g.inst(format!("icmp ult i64 {}, {}", acc, (NAN_TAG_BASE << 48) as i64)));
+        // Unboxed variants of different value types: the strictest limit.
+        let limit = loaded.iter().filter(|l| l.0.repr == ValueRepr::NanBox && l.0.variants[l.1 as usize].unboxed).map(|l| l.0.num_limit).min().unwrap();
+        conds.push(g.inst(format!("icmp ult i64 {}, {}", acc, limit as i64)));
     }
     let mut c = conds[0].clone();
     for x in &conds[1..] {

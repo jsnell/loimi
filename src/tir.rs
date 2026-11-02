@@ -328,6 +328,10 @@ pub struct ValueVariantDef {
     pub unboxed: bool,
     /// Encoding: tag value (meaning depends on repr).
     pub tag: u64,
+    /// Tag position. nanbox: the word is `tag << shift | payload` (the
+    /// payload has `shift` bits); lowtag: `payload << shift | tag` (the tag
+    /// has `shift` bits). Unused for boxed and the unboxed variant.
+    pub shift: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +339,9 @@ pub struct ValueDef {
     pub name: String,
     pub repr: ValueRepr,
     pub variants: Vec<ValueVariantDef>,
+    /// nanbox: the lowest tagged encoding; words below it are the unboxed
+    /// f64 variant.
+    pub num_limit: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

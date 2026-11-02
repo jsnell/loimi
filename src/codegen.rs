@@ -1436,16 +1436,22 @@ impl<'a, 'p> FnGen<'a, 'p> {
             return (v, ov);
         }
         let k = 64 - it.bits as u32;
-        let ext = if it.signed { "sext" } else { "zext" };
+        // The extension bits of a shifted operand are shifted out: zext lets
+        // LLVM fold `zext(trunc(v >> k)) << k` back into `v`.
         let nt = format!("i{}", it.bits);
-        let xw = self.inst(format!("{} {} {} to i64", ext, nt, x));
-        let yw = self.inst(format!("{} {} {} to i64", ext, nt, y));
+        let xw = self.inst(format!("zext {} {} to i64", nt, x));
         let xs = self.inst(format!("shl i64 {}, {}", xw, k));
-        let ys = if op == "mul" { yw } else { self.inst(format!("shl i64 {}, {}", yw, k)) };
+        let ys = if op == "mul" {
+            self.inst(format!("{} {} {} to i64", if it.signed { "sext" } else { "zext" }, nt, y))
+        } else {
+            let yw = self.inst(format!("zext {} {} to i64", nt, y));
+            self.inst(format!("shl i64 {}, {}", yw, k))
+        };
         let r = self.inst(format!("call {{ i64, i1 }} @{}(i64 {}, i64 {})", name, xs, ys));
         let v = self.inst(format!("extractvalue {{ i64, i1 }} {}, 0", r));
         let ov = self.inst(format!("extractvalue {{ i64, i1 }} {}, 1", r));
-        let sh = self.inst(format!("{} i64 {}, {}", if it.signed { "ashr" } else { "lshr" }, v, k));
+        // The low k bits of the result are zero (both operands, or one factor, had them zero).
+        let sh = self.inst(format!("{} exact i64 {}, {}", if it.signed { "ashr" } else { "lshr" }, v, k));
         let n = self.inst(format!("trunc i64 {} to {}", sh, nt));
         (n, ov)
     }
