@@ -29,6 +29,8 @@ pub struct OpInfo {
     pub parts: Vec<usize>,
     /// `then OP`: the op that follows this one.
     pub then: Option<usize>,
+    /// A `#[forward]` superinstruction.
+    pub forward: bool,
     pub size: u32,
     pub fid: FnId,
     pub body: Option<Block>,
@@ -301,6 +303,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             fields: lo.fields.iter().map(|f| (f.1, f.2, f.3)).collect(),
             parts: lo.parts.clone(),
             then: lo.then,
+            forward: k >= d.ops.len() && d.supers[k - d.ops.len()].forward,
             size: l.size(k),
             fid,
             body,
@@ -706,12 +709,16 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
     let word = info.word;
     let fid = info.ops[k].fid;
     let parts: Vec<usize> = if info.ops[k].parts.is_empty() { vec![k] } else { info.ops[k].parts.clone() };
+    let forward = info.ops[k].forward;
     let ret = info.ret.clone();
     let mut cx = FnCx::new(m, ret);
     let state = declare_state(c, vm, &mut cx);
     let mut exprs = Vec::new();
     let n = parts.len();
     let mut off = 0;
+    // Operands the previous part assigns (kind, raw field local), for
+    // forwarding into this part.
+    let mut prev_written: Vec<(usize, LocalId)> = Vec::new();
     for (j, &p) in parts.iter().enumerate() {
         let op = &c.vms[vm as usize].ops[p];
         let span = op.span;
@@ -740,15 +747,50 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             ..HandlerCx::new(vm, state.clone())
         });
         off += size;
+        let written: Vec<usize> = if forward { (0..params.len()).filter(|&pi| block_assigns(&body, &params[pi])).collect() } else { vec![] };
+        // Forwarding (`#[forward] super`): an operand read here that may
+        // name the register the previous part just wrote. The body is
+        // also checked with that operand's field replaced by the previous
+        // part's, under `if x.raw == d.raw`, so LLVM forwards the stored
+        // value instead of reloading it through memory. That takes a
+        // store-to-load round trip off a dependency chain, at the cost of
+        // a compare and a predictable branch per candidate operand.
+        let mut fwd: Vec<(usize, LocalId)> = Vec::new();
+        for pi in 0..params.len() {
+            if written.contains(&pi) || fwd.len() == 2 {
+                continue;
+            }
+            if let Some(&(_, d)) = prev_written.iter().find(|(kind, _)| *kind == kinds[pi]) {
+                fwd.push((pi, d));
+            }
+        }
+        let hcx = cx.vm.clone().unwrap();
         let r = c.block(&mut cx, &body, Some(&Ty::Never));
-        cx.scopes.pop();
-        let b = r?;
+        let mut b = r?;
         if b.ty != Ty::Never {
+            cx.scopes.pop();
             return Err(Diag::new(
                 body.span,
                 format!("handler `{}` can reach its end; every path must end in `next`, `jump`, `exit`, `raise` or `redo`", name),
             ));
         }
+        for &(pi, d) in fwd.iter().rev() {
+            let mut h2 = hcx.clone();
+            h2.operands[pi].2 = d;
+            cx.vm = Some(h2);
+            let bf = c.block(&mut cx, &body, Some(&Ty::Never))?;
+            let raw = hcx.operands[pi].2;
+            let rt = cx.locals[raw as usize].ty.clone();
+            let eq = mk(
+                Ty::Bool,
+                TK::Binary(BinOp::Eq, Box::new(mk(rt.clone(), TK::Local(raw), span)), Box::new(mk(rt, TK::Local(d), span))),
+                span,
+            );
+            b = mk(Ty::Never, TK::If(vec![TCond::Expr(eq)], Box::new(bf), Some(Box::new(b))), span);
+        }
+        cx.vm = Some(hcx.clone());
+        cx.scopes.pop();
+        prev_written = written.iter().map(|&pi| (kinds[pi], hcx.operands[pi].2)).collect();
         let e = mk(Ty::Never, TK::Block(lets, Some(Box::new(b))), span);
         exprs.push(if n > 1 { mk(Ty::Never, TK::Vm(TVm::Part(j as u32, Box::new(e))), span) } else { e });
     }
@@ -767,6 +809,45 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
     fd.body = Some(body);
     fd.vm_state = state;
     Ok(())
+}
+
+/// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for
+/// finding the operands an op writes.
+fn block_assigns(b: &Block, x: &str) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| expr_assigns(e, x)) || els.as_ref().is_some_and(|b| block_assigns(b, x)),
+        Stmt::Expr { expr, .. } | Stmt::Defer(expr) => expr_assigns(expr, x),
+    })
+}
+
+fn expr_assigns(e: &Expr, x: &str) -> bool {
+    let go = |e: &Expr| expr_assigns(e, x);
+    let conds = |cs: &Vec<Cond>| cs.iter().any(|c| match c {
+        Cond::Expr(e) | Cond::Let(_, e) => expr_assigns(e, x),
+    });
+    match &e.kind {
+        ExprKind::Assign(l, r) | ExprKind::CompoundAssign(_, l, r) => {
+            matches!(&l.kind, ExprKind::Ident(n) if n == x) || go(l) || go(r)
+        }
+        ExprKind::Field(a, _) | ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Try(a) | ExprKind::TypeArgs(a, _) => go(a),
+        ExprKind::Call(f, args) => go(f) || args.iter().any(go),
+        ExprKind::Index(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Coalesce(a, b) | ExprKind::ArrayRepeat(a, b) => go(a) || go(b),
+        ExprKind::SliceRange(a, lo, hi) => go(a) || lo.as_ref().is_some_and(|e| go(e)) || hi.as_ref().is_some_and(|e| go(e)),
+        ExprKind::StructLit(_, fs) => fs.iter().any(|(_, e)| go(e)),
+        ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => es.iter().any(go),
+        ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => block_assigns(b, x),
+        ExprKind::If(cs, t, f) => conds(cs) || block_assigns(t, x) || f.as_ref().is_some_and(|e| go(e)),
+        ExprKind::While(cs, b) => conds(cs) || block_assigns(b, x),
+        ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || block_assigns(b, x),
+        ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
+        ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
+        ExprKind::Vm(v) => match v {
+            VmExpr::Jump(a) | VmExpr::Exit(a) | VmExpr::Raise(a) | VmExpr::Fail(a) => go(a),
+            VmExpr::Cold(b) => block_assigns(b, x),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {

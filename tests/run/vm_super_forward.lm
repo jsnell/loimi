@@ -1,0 +1,98 @@
+// matrix: dispatch
+// `#[forward]` superinstructions: a later part reading the register an
+// earlier part wrote gets the value directly (checked here for results
+// only: forwarded or not, the program must compute the same values),
+// including a cold path in the forwarded part and both operands naming
+// the written register.
+import std.io;
+
+vm V {
+    context ctx: *i64;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        if a + b > 1000 { cold { *ctx += 1; dst = 1000; next } }
+        dst = a + b;
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    #[forward] super MUL_ADD = MUL; ADD;
+    #[forward] super MUL_ADD_ADD = MUL; ADD; ADD;
+
+    entry run(c: *i64, code: *u32, r: *i64) -> i64 {
+        ctx = c;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+fn go(code: []u32, n: u64) {
+    var regs: [i64; 8] = [0; 8];
+    var clamps: i64 = 0;
+    V.optimize(code[0..n]);
+    io.print(V.op_name(code[2]));
+    io.print(" ");
+    io.print_int(V.run(&clamps, &code[0], &regs[0]));
+    io.print(" ");
+    io.print_int(clamps);
+    io.println("");
+}
+
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    // r2 = r0 * r1; r3 = r2 + r0 (forwarded as `a`)
+    at = V.emit.LOADI(c, 0, 0, 3);
+    at = V.emit.LOADI(c, at, 1, 4);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 2, 0);
+    at = V.emit.RET(c, at, 3);
+    go(c, at);
+    // r3 = r0 + r2 (forwarded as `b`)
+    at = V.emit.LOADI(c, 0, 0, 3);
+    at = V.emit.LOADI(c, at, 1, 4);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 0, 2);
+    at = V.emit.RET(c, at, 3);
+    go(c, at);
+    // r2 = r2 + r2, both forwarded; then the cold path
+    at = V.emit.LOADI(c, 0, 0, 30);
+    at = V.emit.LOADI(c, at, 1, 20);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 2, 2, 2);
+    at = V.emit.RET(c, at, 2);
+    go(c, at);
+    // Not forwarded: ADD reads other registers.
+    at = V.emit.LOADI(c, 0, 0, 5);
+    at = V.emit.LOADI(c, at, 1, 6);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 1, 1);
+    at = V.emit.RET(c, at, 3);
+    go(c, at);
+    // Three parts: r2 = r0 * r1; r3 = r2 + r1; r4 = r0 + r3
+    at = V.emit.LOADI(c, 0, 0, 2);
+    at = V.emit.LOADI(c, at, 1, 7);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 2, 1);
+    at = V.emit.ADD(c, at, 4, 0, 3);
+    at = V.emit.RET(c, at, 4);
+    go(c, at);
+}
+// expect: MUL_ADD 15 0
+// expect: MUL_ADD 15 0
+// expect: MUL_ADD 1000 1
+// expect: MUL_ADD 12 0
+// expect: MUL_ADD_ADD 23 0

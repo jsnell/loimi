@@ -54,6 +54,9 @@ pub struct OpDecl {
 pub struct SuperDecl {
     pub name: Ident,
     pub parts: Vec<Ident>,
+    /// `#[forward]`: forward each part's written register to the next
+    /// part's reads (see vmcheck::check_handler).
+    pub forward: bool,
 }
 
 #[derive(Clone, Debug)]

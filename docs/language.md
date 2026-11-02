@@ -765,6 +765,17 @@ several supers match, the one with the most parts wins. The generated
 verifier treats every part's word as an instruction: jumps may land on
 it, and it must hold an op of the same family as the super's part.
 
+**Forwarding.** In `#[forward] super A_B = A; B;`, each part after the
+first is compiled twice for an operand that may name a register the
+previous part assigned (same operand kind; at most two such operands
+per part): once with that operand's field replaced by the previous
+part's, under `if b.raw == dst.raw`, and once as written. In the first
+copy LLVM forwards the stored value instead of loading it back, which
+takes a store-to-load round trip (about 5 cycles on x86) off the
+dependency chain. It costs a compare and a branch that is predictable
+per site, so it pays off on latency-bound chains (`MUL; ADD` feeding a
+divide) and not on throughput-bound code.
+
 `loimi build --vm-stats` records opcode pair frequencies.
 `loimi vm suggest-supers` turns them into ranked `super` declarations.
 

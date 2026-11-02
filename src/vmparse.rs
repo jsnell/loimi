@@ -168,7 +168,7 @@ impl Parser {
                         parts.push(self.ident()?);
                         self.expect(";")?;
                     }
-                    vm.supers.push(SuperDecl { name: n, parts });
+                    vm.supers.push(SuperDecl { name: n, parts, forward: item_attrs.has("forward") });
                 }
                 "fn" => {
                     self.in_vm = true;
