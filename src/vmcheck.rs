@@ -316,30 +316,54 @@ fn check_const_writes(c: &Checker, vi: usize) -> Res<()> {
             _ => false,
         }
     }
+    if let Some((span, addr)) = first_state_write(c, vi, si, |_| true, through) {
+        let what = if addr { "takes an address through" } else { "assignment writes through" };
+        return Err(Diag::new(
+            span,
+            format!("this {} `{}`, the constant pool of `const` operand kind `{}`: what a const operand reads cannot change after verification", what, sname, kname),
+        ));
+    }
+    Ok(())
+}
+
+/// The first write in vm `vi`'s functions that `pick` selects to a place
+/// `place(e, l)` holds for, with `l` the function's local of state
+/// variable `si`: an assignment to it, or an address taken of it (`true`)
+/// other than the state passed to a vm function (checked itself).
+fn first_state_write(
+    c: &Checker,
+    vi: usize,
+    si: usize,
+    pick: impl Fn(&FnDef) -> bool,
+    place: impl Fn(&TExpr, LocalId) -> bool,
+) -> Option<(Span, bool)> {
     for f in c.prog.fns.iter() {
-        if f.vm != Some(vi as u32) {
+        if f.vm != Some(vi as u32) || !pick(f) {
             continue;
         }
         let (Some(body), Some(&l)) = (&f.body, f.vm_state.get(si)) else { continue };
         let mut bad = None;
+        let mut passed: Vec<*const TExpr> = Vec::new();
         crate::tirwalk::for_each_expr(body, &mut |e| {
             if bad.is_some() {
                 return;
             }
             match &e.kind {
-                TK::Assign(lhs, _) if through(lhs, l) => bad = Some((e.span, "assignment writes through")),
-                TK::AddrOf(p) if through(p, l) => bad = Some((e.span, "takes an address through")),
+                TK::Call(f, args) if matches!(f.kind, TK::FnRef(g) if c.prog.fns[g as usize].vm_role == VmRole::VmFn) => {
+                    if let Some(a) = args.get(si) {
+                        passed.push(a as *const TExpr);
+                    }
+                }
+                TK::Assign(lhs, _) if place(lhs, l) => bad = Some((e.span, false)),
+                TK::AddrOf(p) if place(p, l) && !passed.contains(&(e as *const TExpr)) => bad = Some((e.span, true)),
                 _ => {}
             }
         });
-        if let Some((span, what)) = bad {
-            return Err(Diag::new(
-                span,
-                format!("this {} `{}`, the constant pool of `const` operand kind `{}`: what a const operand reads cannot change after verification", what, sname, kname),
-            ));
+        if bad.is_some() {
+            return bad;
         }
     }
-    Ok(())
+    None
 }
 
 /// Op handlers and vm functions leave `pc` to the control words: `next`,
@@ -350,43 +374,20 @@ fn check_const_writes(c: &Checker, vi: usize) -> Res<()> {
 /// target. Entries and `on raise` may set `pc`.
 fn check_pc_writes(c: &Checker, vi: usize) -> Res<()> {
     let pc_idx = c.prog.vms[vi].pc_idx;
-    for f in c.prog.fns.iter() {
-        if f.vm != Some(vi as u32) || !matches!(f.vm_role, VmRole::Handler(_) | VmRole::VmFn) {
-            continue;
-        }
-        let (Some(body), Some(&l)) = (&f.body, f.vm_state.get(pc_idx)) else { continue };
-        // The state local itself, or (in a vm function, which reaches the
-        // state through pointers) what it points to.
-        let is_pc = |e: &TExpr| match &e.kind {
-            TK::Local(x) => *x == l,
-            TK::Deref(p) => matches!(p.kind, TK::Local(x) if x == l),
-            _ => false,
-        };
-        let mut bad = None;
-        // A call of a vm function passes the state by address (it is
-        // checked itself).
-        let mut passed: Vec<*const TExpr> = Vec::new();
-        crate::tirwalk::for_each_expr(body, &mut |e| {
-            if bad.is_some() {
-                return;
-            }
-            match &e.kind {
-                TK::Call(f, args) if matches!(f.kind, TK::FnRef(g) if c.prog.fns[g as usize].vm_role == VmRole::VmFn) => {
-                    if let Some(a) = args.get(pc_idx) {
-                        passed.push(a as *const TExpr);
-                    }
-                }
-                TK::Assign(lhs, _) if is_pc(lhs) => bad = Some((e.span, "assigns")),
-                TK::AddrOf(p) if is_pc(p) && !passed.contains(&(e as *const TExpr)) => bad = Some((e.span, "takes the address of")),
-                _ => {}
-            }
-        });
-        if let Some((span, what)) = bad {
-            return Err(Diag::new(
-                span,
-                format!("this {} `pc` in an op or vm function: `next`, `redo` and supers assume it stays at the instruction; use `jump` to go elsewhere", what),
-            ));
-        }
+    // The state local itself, or (in a vm function, which reaches the
+    // state through pointers) what it points to.
+    let is_pc = |e: &TExpr, l: LocalId| match &e.kind {
+        TK::Local(x) => *x == l,
+        TK::Deref(p) => matches!(p.kind, TK::Local(x) if x == l),
+        _ => false,
+    };
+    let pick = |f: &FnDef| matches!(f.vm_role, VmRole::Handler(_) | VmRole::VmFn);
+    if let Some((span, addr)) = first_state_write(c, vi, pc_idx, pick, is_pc) {
+        let what = if addr { "takes the address of" } else { "assigns" };
+        return Err(Diag::new(
+            span,
+            format!("this {} `pc` in an op or vm function: `next`, `redo` and supers assume it stays at the instruction; use `jump` to go elsewhere", what),
+        ));
     }
     Ok(())
 }
