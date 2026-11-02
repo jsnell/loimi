@@ -1,0 +1,665 @@
+// Bytecode fuzzer for the generated verifier (`Vm.verify`).
+//
+// The claim under test: code that passes `Vm.verify` runs without
+// operand bounds checks and still cannot touch memory it should not.
+// This file declares one test vm three times, once per dispatch mode,
+// generates random programs from a seed, verifies them, and runs the
+// verified ones in every mode. Buffers (code, registers, constants,
+// globals) are heap-allocated with their exact sizes, so under
+// `--sanitize=address` any out-of-bounds access is reported.
+//
+// Besides crashes, the driver checks:
+//   - the three generated verifiers agree;
+//   - the three modes compute the same result, registers, globals,
+//     variant counters and (quickened) code;
+//   - code still verifies after running (quickening keeps it valid),
+//     and after `Vm.optimize` (superinstruction fusion keeps it valid).
+//
+// usage: fuzzvm <first-seed> <count> [-v | -d]
+//   -v prints each seed before running it (to find a crashing one);
+//   -d also prints each program and the verifier's verdict.
+// Exit status 0: no failures; 1: a check failed (the seed is printed).
+//
+// Build and run with tests/fuzz/run.sh.
+
+import std.io;
+import std.os;
+import std.mem;
+import std.num;
+import std.text;
+
+/// What the verifier checks against.
+pub struct Proto {
+    nregs: u32,
+    nconsts: u32,
+    nfuncs: u32,
+    /// Function entry points, as word offsets into `code`.
+    fentry: *u32,
+    /// The code being verified (for `func` operands).
+    code: *u32,
+}
+
+/// A second verify context: the global table's size.
+pub struct Env { nglobals: u32 }
+
+struct Frame { ret: *u32, regs: *i64 }
+
+pub struct Ctx {
+    globals: *i64,
+    fentry: *u32,
+    code: *u32,
+    /// Registers per frame (== proto.nregs).
+    nregs: u64,
+    reg_end: *i64,
+    frames: *Frame,
+    depth: u64,
+    max_depth: u64,
+    /// Backward progress (jumps, calls, redo) left before `fail`.
+    budget: i64,
+    /// `count` variant: executions per opcode (256 entries).
+    counts: *i64,
+    /// `trace` variant: a running hash of traced opcodes.
+    log: i64,
+}
+
+const BUDGET_EXHAUSTED: i64 = 1000001;
+const DIV_BY_ZERO: i64 = 1000002;
+const CALL_OVERFLOW: i64 = 1000003;
+
+inline for (V, mode) in [(FT, tailcall), (FG, goto), (FS, switch)] {
+    #[dispatch(mode)]
+    pub vm #V {
+        context ctx: *Ctx;
+        state { pc: *u32, regs: *i64, k: *i64 }
+
+        verify_context proto: *Proto;
+        verify_context env: *Env;
+
+        operand reg = regs[it] verify (it as u32) < proto.nregs;
+        operand kst = k[it] verify (it as u32) < proto.nconsts;
+        // Indexes state reached through the context, checked against
+        // the second verify context.
+        operand glob = ctx.globals[it] verify (it as u32) < env.nglobals;
+        operand imm = it;
+        operand label = pc + it verify is_insn_boundary(pc + it);
+        operand func = it verify (it as u32) < proto.nfuncs and is_insn_boundary(proto.code + proto.fentry[it] as u64);
+        // Base of a callee's register window (checked again at run time:
+        // the window must fit in the register file).
+        operand window = it verify (it as u32) < proto.nregs;
+
+        encoding fixed(u32) {
+            format ABC { op: 8, a: 8, b: 8, c: 8 }
+            format ABx { op: 8, a: 8, bx: 16 }
+            format AsBx { op: 8, a: 8, sbx: s16 }
+            format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+            format sJ { op: 8, sj: s24 }
+        }
+
+        cache Two { x: u32, y: u32 }
+        cache One { v: u32 }
+
+        /// Charge one unit of progress; true when the budget is gone.
+        fn tick() -> bool {
+            ctx.budget -= 1;
+            ctx.budget < 0
+        }
+
+        op NOP() : ABC { next }
+        op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+        op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+        op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+        op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a +% b; next }
+        op SUB(dst: reg, a: reg, b: reg) : ABC { dst = a -% b; next }
+        op MULK(dst: reg, a: reg, c: kst) : ABC { dst = a *% c; next }
+        op ADDI(dst: reg, a: reg, sc: imm) : ABsC { dst = a +% (sc as i64); next }
+        /// Raw operand fields.
+        op RAW(dst: reg, a: reg, b: imm) : ABC { dst = (a.raw as i64) * 256 + (b as i64); next }
+        /// A cold block that ends in `next` (outlined in tail-call mode).
+        op ADDC(dst: reg, a: reg, b: reg) : ABC {
+            if let Some(r) = a.add_checked(b) { dst = r; next }
+            cold { dst = 0 - 1; next }
+        }
+        op DIV(dst: reg, a: reg, b: reg) : ABC {
+            if b == 0 or (b == 0 - 1 and a == -9223372036854775807 - 1) { cold { raise DIV_BY_ZERO } }
+            dst = a / b;
+            next
+        }
+        op GETG(dst: reg, g: glob) : ABx { dst = g; next }
+        op SETG(src: reg, g: glob) : ABx { g = src; next }
+
+        op JMP(target: label) : sJ {
+            if tick() { cold { fail BUDGET_EXHAUSTED } }
+            jump target
+        }
+        op JLT(a: reg, b: reg, target: label) : ABsC {
+            if a < b {
+                if tick() { cold { fail BUDGET_EXHAUSTED } }
+                jump target
+            }
+            next
+        }
+        op JNZ(a: reg, target: label) : AsBx {
+            if a != 0 {
+                if tick() { cold { fail BUDGET_EXHAUSTED } }
+                jump target
+            }
+            next
+        }
+
+        /// Two inline cache words.
+        op COUNT(dst: reg) : ABC + Two {
+            cache.x = cache.x +% 1;
+            cache.y = cache.y +% cache.x;
+            dst = cache.y as i64;
+            next
+        }
+
+        /// Quickening with an inline cache.
+        family LOADC(dst: reg, c: kst) : ABx + One {
+            generic {
+                cache.v = (c & 65535) as u32;
+                become LOADC_Q;
+                dst = c;
+                next
+            }
+            LOADC_Q {
+                if (cache.v as i64) == (c & 65535) { dst = c; next }
+                cold {
+                    if tick() { fail BUDGET_EXHAUSTED }
+                    become LOADC;
+                    redo
+                }
+            }
+        }
+
+        /// Quickening without a cache; `become` before `next`, so in a
+        /// superinstruction's first part the fused word is rewritten.
+        family ARITH(dst: reg, a: reg, b: reg) : ABC {
+            generic {
+                if a >= 0 and b >= 0 { become ARITH_POS; }
+                dst = a ^ b;
+                next
+            }
+            ARITH_POS {
+                if a < 0 or b < 0 {
+                    if tick() { cold { fail BUDGET_EXHAUSTED } }
+                    become ARITH;
+                    redo
+                }
+                dst = a ^ b;
+                next
+            }
+        }
+
+        /// Call function `f` with its register window at R[base].
+        op CALL(f: func, base: window, n: imm) : ABC {
+            if tick() { cold { fail BUDGET_EXHAUSTED } }
+            let nr = regs + (base as u64);
+            if ctx.depth >= ctx.max_depth or nr + ctx.nregs > ctx.reg_end { cold { raise CALL_OVERFLOW } }
+            let fr = ctx.frames + ctx.depth;
+            fr.ret = pc + 1;
+            fr.regs = regs;
+            ctx.depth += 1;
+            regs = nr;
+            regs[0] = regs[0] +% (n as i64);
+            jump ctx.code + (ctx.fentry[f] as u64)
+        }
+        /// Return R[src] in the callee's R[0] (the caller's R[base]), or
+        /// leave the vm from the outermost frame.
+        op RET(src: reg) : ABC {
+            let v = src;
+            if ctx.depth == 0 { exit Ok(v) }
+            regs[0] = v;
+            ctx.depth -= 1;
+            let fr = ctx.frames + ctx.depth;
+            regs = fr.regs;
+            jump fr.ret
+        }
+        op EXIT(src: reg) : ABC { exit Ok(src) }
+
+        op VCOUNT() : ABC { use_variant count; next }
+        op VTRACE() : ABC { use_variant trace; next }
+        op VOFF() : ABC { use_variant default; next }
+
+        variant count wraps all {
+            before { ctx.counts[opcode] += 1; }
+        }
+        variant trace wraps [ADD, CALL, LOADC, LOADC_Q, ADD_JLT, RET] {
+            before { ctx.log = ctx.log *% 31 +% (opcode as i64) +% 1; }
+        }
+
+        super ADD_JLT = ADD; JLT;
+        super LOADK_ADD = LOADK; ADD;
+        super COUNT_MOVE = COUNT; MOVE;
+        super MOVE_LOADC = MOVE; LOADC;
+        super ARITH_JNZ = ARITH; JNZ;
+        super LOADI_CALL = LOADI; CALL;
+        super JNZ_RET = JNZ; RET;
+        super ADDI_ADDI_JNZ = ADDI; ADDI; JNZ;
+        super LOADC_ADD = LOADC; ADD;
+
+        entry run(c: *Ctx, code: *u32, r: *i64, kp: *i64) -> Result<i64, i64> {
+            ctx = c;
+            regs = r;
+            k = kp;
+            pc = code;
+            jump pc
+        }
+
+        on raise(e: i64) { fail e }
+    }
+}
+
+// ── random programs ─────────────────────────────────────────────────
+
+struct Rng { s: u64 }
+
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 11400714819323198485;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 13787848793156543417;
+    z = (z ^ (z >> 27)) *% 10723151780598845931;
+    z ^ (z >> 31)
+}
+
+fn Rng.below(r: *Rng, n: u64) -> u64 {
+    if n == 0 { return 0; }
+    r.next() % n
+}
+
+/// True with probability pct/100.
+fn Rng.chance(r: *Rng, pct: u64) -> bool { r.below(100) < pct }
+
+const MAX_WORDS: u64 = 96;
+
+struct Prog {
+    code: [u32; 96],
+    len: u64,
+    nregs: u32,
+    nconsts: u32,
+    nglobals: u32,
+    nfuncs: u32,
+    fentry: [u32; 4],
+    consts: [i64; 8],
+    /// Register file size, in frames of nregs.
+    frames: u64,
+    noise: u64,
+}
+
+/// Whether to pick an in-range operand.
+fn ok(r: *Rng, p: *Prog) -> bool { r.below(1000) >= p.noise }
+
+/// Plain (non-super) ops the generator picks from, weighted by repetition.
+const PICKS: [u32; 40] = [
+    FT.OP_NOP, FT.OP_LOADI, FT.OP_LOADI, FT.OP_LOADK, FT.OP_MOVE, FT.OP_ADD, FT.OP_ADD, FT.OP_SUB,
+    FT.OP_MULK, FT.OP_ADDI, FT.OP_ADDI, FT.OP_RAW, FT.OP_ADDC, FT.OP_DIV, FT.OP_GETG, FT.OP_SETG,
+    FT.OP_JMP, FT.OP_JLT, FT.OP_JLT, FT.OP_JNZ, FT.OP_JNZ, FT.OP_COUNT, FT.OP_LOADC, FT.OP_LOADC,
+    FT.OP_ARITH, FT.OP_ARITH, FT.OP_CALL, FT.OP_CALL, FT.OP_RET, FT.OP_EXIT, FT.OP_VCOUNT, FT.OP_VTRACE,
+    FT.OP_VOFF, FT.OP_LOADC_Q, FT.OP_ARITH_POS, FT.OP_ADD, FT.OP_JLT, FT.OP_MOVE, FT.OP_LOADK, FT.OP_RET,
+];
+
+/// A word with the opcode replaced.
+fn with_op(w: u32, op: u32) -> u32 { FT.with_opcode(w, op) }
+
+fn reg(r: *Rng, p: *Prog) -> u8 {
+    if ok(r, p) { r.below(p.nregs as u64) as u8 } else { r.below(256) as u8 }
+}
+
+fn kst8(r: *Rng, p: *Prog) -> u8 {
+    if ok(r, p) and p.nconsts > 0 { r.below(p.nconsts as u64) as u8 } else { r.below(256) as u8 }
+}
+
+fn kst16(r: *Rng, p: *Prog) -> u16 {
+    if ok(r, p) and p.nconsts > 0 { r.below(p.nconsts as u64) as u16 } else { r.below(65536) as u16 }
+}
+
+fn glob(r: *Rng, p: *Prog) -> u16 {
+    if ok(r, p) and p.nglobals > 0 { r.below(p.nglobals as u64) as u16 } else { r.below(65536) as u16 }
+}
+
+/// Offset from word `at` to a random instruction start (or garbage).
+fn label(r: *Rng, p: *Prog, starts: []u64, at: u64, lo: i64, hi: i64) -> i64 {
+    if ok(r, p) {
+        for _try in 0..8 {
+            let t = starts[r.below(starts.len)] as i64;
+            let off = t - (at as i64);
+            if off >= lo and off <= hi { return off; }
+        }
+    }
+    if r.chance(50) { return (r.below(9) as i64) - 4; }
+    lo + (r.below((hi - lo + 1) as u64) as i64)
+}
+
+/// A program: mostly well-formed instructions, sometimes mutated or
+/// entirely random words.
+fn generate(r: *Rng, p: *Prog) {
+    p.nregs = 1 + r.below(12) as u32;
+    p.nconsts = if r.chance(10) { 0 } else { 1 + r.below(6) as u32 };
+    p.nglobals = if r.chance(10) { 0 } else { 1 + r.below(4) as u32 };
+    p.nfuncs = if r.chance(10) { 0 } else { 1 + r.below(3) as u32 };
+    // Per mille of operands that are out of range.
+    p.noise = if r.chance(60) { 0 } else if r.chance(50) { 10 } else { 60 };
+    p.frames = 1 + r.below(4);
+    for i in 0..8 {
+        p.consts[i] = if r.chance(50) { (r.below(41) as i64) - 20 } else { r.next() as i64 };
+    }
+    let style = r.below(20);
+    if style == 0 {
+        // Random words, but with plausible opcodes half the time.
+        p.len = 1 + r.below(MAX_WORDS);
+        for i in 0..p.len {
+            var w = r.next() as u32;
+            if r.chance(50) { w = with_op(w, r.below(FT.NUM_OPS + 2) as u32); }
+            p.code[i] = w;
+        }
+        for i in 0..4 { p.fentry[i] = r.below(p.len + 1) as u32; }
+        return;
+    }
+    // Pass 1: choose ops and lay them out.
+    var ops: [u32; 96] = [0; 96];
+    var starts: [u64; 96] = [0; 96];
+    var n: u64 = 0;
+    var at: u64 = 0;
+    let want = 1 + r.below(40);
+    while n < want {
+        var op = PICKS[r.below(40)];
+        if n + 1 == want and r.chance(90) { op = if r.chance(70) { FT.OP_RET } else { FT.OP_EXIT }; }
+        let size = FT.op_size(with_op(0, op));
+        if at + size > MAX_WORDS - 4 { break; }
+        ops[n] = op;
+        starts[n] = at;
+        at += size;
+        n += 1;
+    }
+    p.len = at;
+    let st = starts[0..n];
+    // Pass 2: operands.
+    let code = p.code[..];
+    for i in 0..n {
+        let a = starts[i];
+        let op = ops[i];
+        if op == FT.OP_NOP { FT.emit.NOP(code, a); }
+        else if op == FT.OP_LOADI { FT.emit.LOADI(code, a, reg(r, p), ((r.below(41) as i64) - 20) as i16); }
+        else if op == FT.OP_LOADK { FT.emit.LOADK(code, a, reg(r, p), kst16(r, p)); }
+        else if op == FT.OP_MOVE { FT.emit.MOVE(code, a, reg(r, p), reg(r, p)); }
+        else if op == FT.OP_ADD { FT.emit.ADD(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_SUB { FT.emit.SUB(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_MULK { FT.emit.MULK(code, a, reg(r, p), reg(r, p), kst8(r, p)); }
+        else if op == FT.OP_ADDI { FT.emit.ADDI(code, a, reg(r, p), reg(r, p), ((r.below(9) as i64) - 4) as i8); }
+        else if op == FT.OP_RAW { FT.emit.RAW(code, a, reg(r, p), reg(r, p), r.below(256) as u8); }
+        else if op == FT.OP_ADDC { FT.emit.ADDC(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_DIV { FT.emit.DIV(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_GETG { FT.emit.GETG(code, a, reg(r, p), glob(r, p)); }
+        else if op == FT.OP_SETG { FT.emit.SETG(code, a, reg(r, p), glob(r, p)); }
+        else if op == FT.OP_JMP { FT.emit.JMP(code, a, label(r, p, st, a, -8388608, 8388607) as i32); }
+        else if op == FT.OP_JLT { FT.emit.JLT(code, a, reg(r, p), reg(r, p), label(r, p, st, a, -128, 127) as i8); }
+        else if op == FT.OP_JNZ { FT.emit.JNZ(code, a, reg(r, p), label(r, p, st, a, -32768, 32767) as i16); }
+        else if op == FT.OP_COUNT { FT.emit.COUNT(code, a, reg(r, p)); }
+        else if op == FT.OP_LOADC { FT.emit.LOADC(code, a, reg(r, p), kst16(r, p)); }
+        else if op == FT.OP_LOADC_Q { FT.emit.LOADC_Q(code, a, reg(r, p), kst16(r, p)); }
+        else if op == FT.OP_ARITH { FT.emit.ARITH(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_ARITH_POS { FT.emit.ARITH_POS(code, a, reg(r, p), reg(r, p), reg(r, p)); }
+        else if op == FT.OP_CALL {
+            let f = if ok(r, p) and p.nfuncs > 0 { r.below(p.nfuncs as u64) as u8 } else { r.below(256) as u8 };
+            FT.emit.CALL(code, a, f, reg(r, p), r.below(4) as u8);
+        }
+        else if op == FT.OP_RET { FT.emit.RET(code, a, reg(r, p)); }
+        else if op == FT.OP_EXIT { FT.emit.EXIT(code, a, reg(r, p)); }
+        else if op == FT.OP_VCOUNT { FT.emit.VCOUNT(code, a); }
+        else if op == FT.OP_VTRACE { FT.emit.VTRACE(code, a); }
+        else { FT.emit.VOFF(code, a); }
+        // Random cache contents now and then.
+        if r.chance(10) {
+            let sz = FT.op_size(code[a]);
+            for j in 1..sz { code[a + j] = r.next() as u32; }
+        }
+    }
+    for i in 0..4 {
+        p.fentry[i] = if ok(r, p) { st[r.below(n)] as u32 } else { r.below(p.len + 2) as u32 };
+    }
+    // Fuse now and then, as the builder would.
+    if r.chance(30) { FT.optimize(code[0..p.len]); }
+    // Mutations: rewrite opcodes (often into supers), flip bits,
+    // replace words.
+    if style <= 6 {
+        let muts = 1 + r.below(4);
+        for _m in 0..muts {
+            let i = r.below(p.len);
+            let kind = r.below(4);
+            if kind == 0 { p.code[i] = with_op(p.code[i], r.below(FT.NUM_OPS) as u32); }
+            else if kind == 1 { p.code[i] = p.code[i] ^ ((1 as u32) << (r.below(32) as u32)); }
+            else if kind == 2 { p.code[i] = r.next() as u32; }
+            else {
+                // A super opcode on an existing instruction start.
+                let s = st[r.below(n)];
+                let sup = FT.OP_ADD_JLT + r.below(FT.NUM_OPS - (FT.OP_ADD_JLT as u64)) as u32;
+                p.code[s] = with_op(p.code[s], sup);
+            }
+        }
+    }
+    if r.chance(5) and p.len > 1 { p.len = 1 + r.below(p.len); }   // truncate
+}
+
+// ── running ─────────────────────────────────────────────────────────
+
+/// FNV-style mixing for result signatures.
+fn mix(h: u64, x: u64) -> u64 { (h ^ x) *% 1099511628211 }
+
+struct Outcome {
+    verified: ?u64,
+    /// Result, registers, globals, counters and code after the run.
+    sig: u64,
+    /// The code still verifies after running / after optimize.
+    reverify: ?u64,
+    reverify_opt: ?u64,
+    ran: bool,
+    result: i64,
+}
+
+var VERBOSE: bool = false;
+
+inline for (V, runv) in [(FT, run_ft), (FG, run_fg), (FS, run_fs)] {
+    /// Verify `p` and, if it passes, run it with fresh exactly-sized buffers.
+    fn #runv(p: *Prog, optimize_first: bool) -> Outcome {
+        var out = Outcome { verified: None, sig: 0, reverify: None, reverify_opt: None, ran: false, result: 0 };
+        let len = p.len;
+        let code: *u32 = mem.alloc(len);
+        for i in 0..len { code[i] = p.code[i]; }
+        let cs = code.slice(len);
+        let fentry: *u32 = mem.alloc(4);
+        for i in 0..4 { fentry[i] = p.fentry[i]; }
+        var proto = Proto { nregs: p.nregs, nconsts: p.nconsts, nfuncs: p.nfuncs, fentry: fentry, code: code };
+        var env = Env { nglobals: p.nglobals };
+        out.verified = #V.verify(cs, &proto, &env);
+        if out.verified.is_none() {
+            if optimize_first { #V.optimize(cs); }
+            let nr = (p.nregs as u64) * p.frames;
+            let regs: *i64 = mem.alloc(nr);
+            for i in 0..nr { regs[i] = (i as i64) - 2; }
+            let k: *i64 = mem.alloc(p.nconsts as u64);
+            for i in 0..p.nconsts as u64 { k[i] = p.consts[i]; }
+            let globals: *i64 = mem.alloc(p.nglobals as u64);
+            let frames: *Frame = mem.alloc(8);
+            let counts: *i64 = mem.alloc(256);
+            var ctx = Ctx {
+                globals: globals, fentry: fentry, code: code, nregs: p.nregs as u64,
+                reg_end: regs + nr, frames: frames, depth: 0, max_depth: 8,
+                budget: 2000, counts: counts, log: 0,
+            };
+            let r = #V.run(&ctx, code, regs, k);
+            out.ran = true;
+            if DUMP {
+                io.println("code after running:");
+                dump_code(cs);
+            }
+            var h: u64 = 14695981039346656037;
+            match r {
+                Ok(v) => { h = mix(h, 1); h = mix(h, v as u64); out.result = v; }
+                Err(e) => { h = mix(h, 2); h = mix(h, e as u64); out.result = e; }
+            }
+            for i in 0..nr { h = mix(h, regs[i] as u64); }
+            for i in 0..p.nglobals as u64 { h = mix(h, globals[i] as u64); }
+            for i in 0..256 { h = mix(h, counts[i] as u64); }
+            h = mix(h, ctx.log as u64);
+            h = mix(h, ctx.depth);
+            for i in 0..len { h = mix(h, code[i] as u64); }
+            out.sig = h;
+            out.reverify = #V.verify(cs, &proto, &env);
+            #V.optimize(cs);
+            out.reverify_opt = #V.verify(cs, &proto, &env);
+            mem.release(regs);
+            mem.release(k);
+            mem.release(globals);
+            mem.release(frames);
+            mem.release(counts);
+        }
+        mem.release(code);
+        mem.release(fentry);
+        out
+    }
+}
+
+fn opt_eq(a: ?u64, b: ?u64) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn report(seed: u64, what: str) -> bool {
+    io.print("FAIL seed ");
+    io.print_int(seed as i64);
+    io.print(": ");
+    io.println(what);
+    false
+}
+
+fn show(label: str, x: i64) {
+    io.print(label);
+    io.print_int(x);
+}
+
+/// Print a program (for reproducing a failure).
+fn dump(p: *Prog, opt: bool) {
+    show("nregs ", p.nregs as i64);
+    show(" nconsts ", p.nconsts as i64);
+    show(" nglobals ", p.nglobals as i64);
+    show(" nfuncs ", p.nfuncs as i64);
+    show(" frames ", p.frames as i64);
+    show(" optimize ", opt as i64);
+    io.print(" fentry");
+    for i in 0..4 { show(" ", p.fentry[i] as i64); }
+    io.println("");
+    dump_code(p.code[0..p.len]);
+}
+
+fn dump_code(code: []u32) {
+    for i in 0..code.len {
+        let w = code[i];
+        show("  ", i as i64);
+        io.print(": ");
+        io.print(FT.op_name(w));
+        show(" a=", ((w >> 8) & 255) as i64);
+        show(" b=", ((w >> 16) & 255) as i64);
+        show(" c=", ((w >> 24) & 255) as i64);
+        show(" sbx=", ((w as i32) >> 16) as i64);
+        show(" sj=", ((w as i32) >> 8) as i64);
+        io.println("");
+    }
+}
+
+var DUMP: bool = false;
+
+/// Run one seed; false on a failed check.
+fn one(seed: u64, stats: *[u64; 4]) -> bool {
+    var r = Rng { s: seed };
+    var p = Prog {
+        code: [0; 96], len: 0, nregs: 1, nconsts: 0, nglobals: 0, nfuncs: 0,
+        fentry: [0; 4], consts: [0; 8], frames: 1, noise: 0,
+    };
+    generate(&r, &p);
+    let opt = r.chance(25);
+    if DUMP { dump(&p, opt); }
+    if DUMP { io.println("tailcall"); }
+    let a = run_ft(&p, opt);
+    if DUMP {
+        match a.verified {
+            None => show("verified; result ", a.result),
+            Some(i) => show("rejected at ", i as i64),
+        }
+        if let Some(i) = a.reverify { show("; after running, rejected at ", i as i64); }
+        if let Some(i) = a.reverify_opt { show("; after optimize, rejected at ", i as i64); }
+        io.println("");
+        io.println("goto");
+    }
+    let b = run_fg(&p, opt);
+    if DUMP { io.println("switch"); }
+    let c = run_fs(&p, opt);
+    if !opt_eq(a.verified, b.verified) or !opt_eq(a.verified, c.verified) {
+        return report(seed, "the verifiers disagree");
+    }
+    if a.verified.is_some() { return true; }
+    stats[0] += 1;
+    if a.result == BUDGET_EXHAUSTED { stats[1] += 1; }
+    if a.sig != b.sig or a.sig != c.sig {
+        return report(seed, "dispatch modes disagree");
+    }
+    if a.reverify.is_some() or b.reverify.is_some() or c.reverify.is_some() {
+        return report(seed, "code no longer verifies after running (quickening)");
+    }
+    if a.reverify_opt.is_some() or b.reverify_opt.is_some() or c.reverify_opt.is_some() {
+        return report(seed, "code no longer verifies after optimize");
+    }
+    true
+}
+
+fn parse(s: str) -> u64 {
+    match num.parse_u64(s, 10) {
+        Ok(v) => v,
+        Err(_) => {
+            io.eprintln("usage: fuzzvm <first-seed> <count> [-v]");
+            os.quit(2)
+        }
+    }
+}
+
+fn main() -> i32 {
+    let (Some(a0), Some(a1)) = (os.arg(1), os.arg(2)) else {
+        io.eprintln("usage: fuzzvm <first-seed> <count> [-v]");
+        return 2;
+    };
+    let first = parse(a0);
+    let count = parse(a1);
+    if let Some(f) = os.arg(3) {
+        VERBOSE = true;
+        DUMP = f.len == 2 and f[1] == 'd';
+    }
+    var stats: [u64; 4] = [0; 4];
+    var failed: u64 = 0;
+    var line = text.StrBuf.new();
+    for i in 0..count {
+        let seed = first + i;
+        if VERBOSE {
+            line.clear();
+            line.push_str("seed ");
+            line.push_int(seed as i64);
+            io.eprintln(line.as_str());
+        }
+        let before = stats[0];
+        if !one(seed, &stats) { failed += 1; }
+        if VERBOSE and stats[0] != before { io.eprintln("ran"); }
+    }
+    io.print("seeds ");
+    io.print_int(first as i64);
+    io.print("..");
+    io.print_int((first + count) as i64);
+    io.print(": ");
+    io.print_int(stats[0] as i64);
+    io.print(" verified and ran (");
+    io.print_int(stats[1] as i64);
+    io.print(" hit the step budget), ");
+    io.print_int(failed as i64);
+    io.println(" failed");
+    if failed > 0 { 1 } else { 0 }
+}

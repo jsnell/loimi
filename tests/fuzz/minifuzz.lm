@@ -1,0 +1,382 @@
+// Bytecode fuzzer for Mini (examples/mini): random code for Mini's own
+// vm, checked with the generated `Mini.verify` and, if it passes, run
+// with `Mini.run`. Anything ASan reports is a hole in Mini's `verify`
+// clauses or in the generated verifier.
+//
+// This file imports Mini's modules unchanged: tests/fuzz/run.sh builds it
+// in a directory holding links to examples/mini/{value,vm,lib}.lm.
+//
+// Programs are generated from Mini's op table (Mini.NUM_OPS, op_size),
+// so new ops are fuzzed without changes here; only the label ops are
+// named. Proto metadata that the verifier does not check (upvalue
+// descriptors, the main closure's upvalue count) is generated valid:
+// it comes from Mini's compiler, not from the bytecode.
+//
+// Mini has no step budget, so each program runs under a 200 ms timer
+// (`ualarm`); a program that loops forever ends the process with
+// SIGALRM, which run.sh counts as a timeout, not a failure.
+//
+// usage: minifuzz <first-seed> <count> [-v | -d]
+
+import std.io;
+import std.os;
+import std.gc;
+import std.mem;
+import std.num;
+import std.text;
+import value;
+import value.{V, Arr, Proto, Lines, Protos, UpDescs, Closure};
+import vm.{Mini, Ctx, Frame};
+import vm;
+
+extern "C" fn ualarm(usecs: u32, interval: u32) -> u32;
+
+struct Rng { s: u64 }
+
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 11400714819323198485;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 13787848793156543417;
+    z = (z ^ (z >> 27)) *% 10723151780598845931;
+    z ^ (z >> 31)
+}
+
+fn Rng.below(r: *Rng, n: u64) -> u64 {
+    if n == 0 { return 0; }
+    r.next() % n
+}
+
+fn Rng.chance(r: *Rng, pct: u64) -> bool { r.below(100) < pct }
+
+/// A field value: mostly a register, sometimes a small number, rarely anything.
+fn field(r: *Rng, nregs: u32) -> u32 {
+    let k = r.below(100);
+    if k < 70 { r.below(nregs as u64) as u32 } else if k < 92 { r.below(8) as u32 } else { r.below(256) as u32 }
+}
+
+fn is_label_op(op: u32) -> bool {
+    op == Mini.OP_JMP or op == Mini.OP_TEST or op == Mini.OP_TESTT or op == Mini.OP_FORPREP
+        or op == Mini.OP_FORLOOP or op == Mini.OP_NEXT or op == Mini.OP_INEXT
+}
+
+const LABEL_OPS: [u32; 7] = [Mini.OP_JMP, Mini.OP_TEST, Mini.OP_TESTT, Mini.OP_FORPREP, Mini.OP_FORLOOP, Mini.OP_NEXT, Mini.OP_INEXT];
+
+var DUMP: bool = false;
+
+/// A random function prototype. `parent_nregs` > 0 for a child: its
+/// upvalues then capture the parent's registers.
+fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top: bool) -> Gc<Proto> {
+    let nregs = 1 + r.below(16) as u32;
+    let nconsts = r.below(8);
+    let nup = if top { 0 } else { r.below(3) };
+    // Code layout.
+    var ops: [u32; 64] = [0; 64];
+    var starts: [u64; 64] = [0; 64];
+    var n: u64 = 0;
+    var len: u64 = 0;
+    let want = 1 + r.below(30);
+    while n < want {
+        var op: u32 = if r.chance(20) { LABEL_OPS[r.below(7)] } else { r.below(Mini.NUM_OPS) as u32 };
+        // Mostly one-word ops: supers come from Mini.optimize below.
+        for _k in 0..4 {
+            if Mini.op_size(Mini.with_opcode(0, op)) == 1 or r.chance(20) { break; }
+            op = r.below(Mini.NUM_OPS) as u32;
+        }
+        if r.chance(4) and children.len > 0 { op = Mini.OP_CLOSURE; }
+        if r.chance(4) { op = Mini.OP_CALL; }
+        if n + 1 == want and r.chance(97) { op = Mini.OP_RET0; }
+        let size = Mini.op_size(Mini.with_opcode(0, op));
+        if len + size > 120 { break; }
+        ops[n] = op;
+        starts[n] = len;
+        len += size;
+        n += 1;
+    }
+    let consts = value.new_arr(h, nconsts);
+    for i in 0..nconsts {
+        let k = r.below(6);
+        consts.data[i] = if k == 0 { V.Int((r.below(41) as i32) - 20) }
+            else if k == 1 { V.Num(((r.below(2001) as i64) - 1000) as f64 / 8.0) }
+            else if k == 2 { V.S(value.new_str(h, if r.chance(50) { "x" } else { "key" })) }
+            else if k == 3 { V.Bool(r.chance(50)) }
+            else if k == 4 { V.Int(r.next() as i32) }
+            else { V.Nil };
+    }
+    let lines = new(h, Lines {}, len);
+    let protos = new(h, Protos {}, children.len);
+    for i in 0..children.len { protos.data[i] = children[i]; }
+    let updesc = new(h, UpDescs {}, nup);
+    for i in 0..nup { updesc.data[i] = 256 | r.below(parent_nregs as u64) as u32; }
+    let p = new(h, Proto {
+        name: value.new_str(h, "f"),
+        nparams: 0,
+        nregs: nregs,
+        nupvals: nup as u32,
+        consts: consts,
+        lines: lines,
+        protos: protos,
+        updesc: updesc,
+    }, len);
+    for i in 0..len { p.code[i] = 0; lines.data[i] = i as u32; }
+    // Per mille of instructions whose operands are not checked against
+    // Mini.verify while generating.
+    let noise: u64 = if r.chance(60) { 0 } else if r.chance(50) { 20 } else { 200 };
+    for i in 0..n {
+        let at = starts[i];
+        var op = ops[i];
+        let size = Mini.op_size(Mini.with_opcode(0, op));
+        let is_last = i + 1 == n;
+        // Try random operands until Mini.verify accepts the instruction on
+        // its own (followed by a RET0), so that most programs verify.
+        // Ops that are only picked at random (not forced) may change
+        // between tries, which steers away from supers with unset parts.
+        var w: u32 = 0;
+        var tries: u64 = 0;
+        loop {
+            w = op;
+            if is_label_op(op) {
+                if op != Mini.OP_JMP { w = w | (field(r, nregs) << 8); }
+                w = w | if op == Mini.OP_JMP { (1 as u32) << 8 } else { (1 as u32) << 16 };
+            } else {
+                w = w | (field(r, nregs) << 8) | (field(r, nregs) << 16) | (field(r, nregs) << 24);
+            }
+            tries += 1;
+            if tries > 30 and size == 1 and op != Mini.OP_JMP {
+                // Nothing fits (say, FORPREP with fewer than 4 registers).
+                op = Mini.OP_JMP;
+                continue;
+            }
+            if is_last or tries > 40 or r.below(1000) < noise or at + size >= len { break; }
+            p.code[at] = w;
+            for j in 1..size { p.code[at + j] = 0; }
+            p.code[at + size] = Mini.with_opcode(0, Mini.OP_RET0);
+            if Mini.verify(p.code[at..at + size + 1], p).is_none() { break; }
+            if tries % 4 == 0 and !is_label_op(op) and op != Mini.OP_CALL and op != Mini.OP_CLOSURE {
+                for _k in 0..32 {
+                    let c = r.below(Mini.NUM_OPS) as u32;
+                    if c != op and Mini.op_size(Mini.with_opcode(0, c)) == size { op = c; break; }
+                }
+            }
+        }
+        if is_label_op(op) {
+            // Mostly a jump to an instruction start, forward-biased so
+            // that few programs loop forever.
+            var off: i64 = (r.below(9) as i64) - 4;
+            if r.below(1000) >= noise {
+                var t = starts[r.below(n)];
+                if t <= at and (t == at or r.chance(90)) and i + 1 < n { t = starts[i + 1 + r.below(n - i - 1)]; }
+                off = (t as i64) - (at as i64);
+            }
+            if op == Mini.OP_JMP {
+                w = Mini.with_opcode((((off as u32) & 16777215) << 8), op);
+            } else {
+                w = (w & 65535) | (((off as u32) & 65535) << 16);
+            }
+        }
+        p.code[at] = w;
+        for j in 1..size { p.code[at + j] = if r.chance(3) { r.next() as u32 } else { 0 }; }
+    }
+    if r.chance(40) { Mini.optimize(p.code); }
+    if r.chance(15) {
+        for _m in 0..1 + r.below(3) {
+            let i = r.below(len);
+            p.code[i] = p.code[i] ^ ((1 as u32) << (r.below(32) as u32));
+        }
+    }
+    if r.chance(3) {
+        for i in 0..len { p.code[i] = r.next() as u32; }
+    }
+    p
+}
+
+fn dump(p: Gc<Proto>) {
+    io.print("proto nregs ");
+    io.print_int(p.nregs as i64);
+    io.print(" nconsts ");
+    io.print_int(p.consts.data.len as i64);
+    io.print(" nupvals ");
+    io.print_int(p.nupvals as i64);
+    io.print(" children ");
+    io.print_int(p.protos.data.len as i64);
+    io.println("");
+    for i in 0..p.code.len {
+        let w = p.code[i];
+        io.print("  ");
+        io.print_int(i as i64);
+        io.print(": ");
+        io.print(Mini.op_name(w));
+        io.print(" a=");
+        io.print_int(((w >> 8) & 255) as i64);
+        io.print(" b=");
+        io.print_int(((w >> 16) & 255) as i64);
+        io.print(" c=");
+        io.print_int(((w >> 24) & 255) as i64);
+        io.print(" sbx=");
+        io.print_int(((w as i32) >> 16) as i64);
+        io.print(" sj=");
+        io.print_int(((w as i32) >> 8) as i64);
+        io.println("");
+    }
+}
+
+/// Generate, verify and run one program. Returns whether it verified.
+/// Nothing collects while the protos are built (allocation never
+/// collects); during the run they are reachable from the main closure.
+fn one(ctx: *Ctx, seed: u64) -> bool {
+    var r = Rng { s: seed };
+    let h = &ctx.heap;
+    var none: mem.Vec<Gc<Proto>> = mem.Vec.new();
+    var kids: mem.Vec<Gc<Proto>> = mem.Vec.new();
+    let main_nregs_hint: u32 = 16;
+    for _k in 0..r.below(3) { kids.push(gen_proto(h, &r, none.items(), main_nregs_hint, false)); }
+    let main = gen_proto(h, &r, kids.items(), 0, true);
+    // Children capture registers below the parent's nregs.
+    for i in 0..kids.len {
+        let c = kids.at(i);
+        for j in 0..c.updesc.data.len { c.updesc.data[j] = 256 | (c.updesc.data[j] & 255) % main.nregs; }
+    }
+    none.free();
+    if DUMP {
+        dump(main);
+        for i in 0..kids.len { dump(kids.at(i)); }
+    }
+    var ok = true;
+    for i in 0..kids.len + 1 {
+        let c = if i == 0 { main } else { kids.at(i - 1) };
+        if let Some(bad) = Mini.verify(c.code, c) {
+            ok = false;
+            if DUMP {
+                io.print("proto ");
+                io.print_int(i as i64);
+                io.print(" rejected at ");
+                io.print_int(bad as i64);
+                io.println("");
+            }
+        }
+    }
+    kids.free();
+    if DUMP { io.println(if ok { "verified" } else { "rejected" }); }
+    if !ok { return false; }
+    // A stack with exactly the main frame's registers, or a little more,
+    // so that ASan sees accesses past the frame.
+    let nstack = main.nregs as u64 + if r.chance(40) { 0 } else { r.below(64) };
+    let stack: *V = mem.alloc(nstack);
+    ctx.stack = stack;
+    ctx.stack_end = stack + nstack;
+    ctx.fp = ctx.frames;
+    ctx.error = V.Nil;
+    ctx.open = None;
+    ctx.open_level = 0 as *V;
+    ctx.heap.set_stress(r.chance(10));
+    let cl = value.new_closure(h, main);
+    ualarm(200000, 0);
+    Mini.run(ctx, cl);
+    ualarm(0, 0);
+    ctx.heap.set_stress(false);
+    park(ctx);
+    mem.release(stack);
+    true
+}
+
+/// Registers for the idle frame 0 (vm.scan_roots scans frames up to fp).
+var IDLE: ?*V = None;
+
+/// Point frame 0 at idle registers, so collections between programs scan
+/// no freed stack. Its closure (the last program's) stays alive until the
+/// next program replaces it.
+fn park(ctx: *Ctx) {
+    let idle: *V = match IDLE {
+        Some(p) => p,
+        None => {
+            let p: *V = mem.alloc(16);
+            for i in 0..16 { p[i] = V.Nil; }
+            IDLE = Some(p);
+            p
+        }
+    };
+    ctx.fp = ctx.frames;
+    ctx.frames.base = idle;
+    ctx.stack = idle;
+    ctx.stack_end = idle;
+    ctx.open = None;
+    ctx.open_level = 0 as *V;
+}
+
+fn parse(s: str) -> u64 {
+    match num.parse_u64(s, 10) {
+        Ok(v) => v,
+        Err(_) => {
+            io.eprintln("usage: minifuzz <first-seed> <count> [-v | -d]");
+            os.quit(2)
+        }
+    }
+}
+
+fn tidy(h: *gc.Heap) uses gc { gc.collect(h); }
+
+fn main() -> i32 uses gc {
+    let (Some(a0), Some(a1)) = (os.arg(1), os.arg(2)) else {
+        io.eprintln("usage: minifuzz <first-seed> <count> [-v | -d]");
+        return 2;
+    };
+    let first = parse(a0);
+    let count = parse(a1);
+    var verbose = false;
+    if let Some(f) = os.arg(3) {
+        verbose = true;
+        DUMP = f.len == 2 and f[1] == 'd';
+    }
+    var heap = gc.Heap.new();
+    value.init_strings(&heap);
+    let globals = value.new_table(&heap);
+    var ctx = Ctx {
+        heap: heap,
+        stack: 0 as *V,
+        stack_end: 0 as *V,
+        frames: mem.alloc(16),
+        frames_end: 0 as *Frame,
+        fp: 0 as *Frame,
+        globals: globals,
+        error: V.Nil,
+        out: text.StrBuf.new(),
+        open: None,
+        open_level: 0 as *V,
+    };
+    ctx.frames_end = ctx.frames + 16;
+    // Frame 0 starts with a one-register closure, until a program runs.
+    let idle = new(&ctx.heap, Proto {
+        name: value.new_str(&ctx.heap, "idle"),
+        nparams: 0, nregs: 1, nupvals: 0,
+        consts: value.new_arr(&ctx.heap, 0),
+        lines: new(&ctx.heap, Lines {}, 0),
+        protos: new(&ctx.heap, Protos {}, 0),
+        updesc: new(&ctx.heap, UpDescs {}, 0),
+    }, 0);
+    ctx.frames.cl = value.new_closure(&ctx.heap, idle);
+    park(&ctx);
+    ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);
+    var line = text.StrBuf.new();
+    var verified: u64 = 0;
+    for i in 0..count {
+        let seed = first + i;
+        if verbose {
+            line.clear();
+            line.push_str("seed ");
+            line.push_int(seed as i64);
+            io.eprintln(line.as_str());
+        }
+        if one(&ctx, seed) {
+            verified += 1;
+            if verbose { io.eprintln("ran"); }
+        }
+        if i % 32 == 31 { tidy(&ctx.heap); }
+    }
+    io.print("seeds ");
+    io.print_int(first as i64);
+    io.print("..");
+    io.print_int((first + count) as i64);
+    io.print(": ");
+    io.print_int(verified as i64);
+    io.println(" verified and ran, 0 failed");
+    0
+}
