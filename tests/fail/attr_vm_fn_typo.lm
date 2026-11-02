@@ -1,0 +1,12 @@
+// error: unknown attribute `cld` on a vm function; did you mean `cold`?
+vm M {
+    context c: *u8;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    #[cld]
+    fn helper() -> i64 { 1 }
+    op HALT() : X { exit helper() }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

@@ -1,0 +1,4 @@
+// error: attribute `thread_local` does not apply to a module (`#![..]`): it is for module-level `var`s
+#![thread_local]
+
+fn main() {}

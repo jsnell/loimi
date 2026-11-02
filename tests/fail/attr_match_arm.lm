@@ -1,0 +1,10 @@
+// error: unknown attribute `alow` on a match arm; did you mean `allow`?
+fn f(x: i64) -> i64 {
+    match x {
+        #[alow(match_fallout)]
+        0 => 1,
+        _ => 2,
+    }
+}
+
+fn main() { f(0); }

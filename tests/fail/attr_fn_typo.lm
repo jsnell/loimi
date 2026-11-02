@@ -1,0 +1,5 @@
+// error: unknown attribute `inlien` on a function; did you mean `inline`?
+#[inlien]
+fn f() {}
+
+fn main() { f(); }

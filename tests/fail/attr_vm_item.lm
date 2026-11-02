@@ -1,0 +1,12 @@
+// An attribute of one position is rejected at another.
+// error: attribute `forward` does not apply to an `op`: it is for `super` declarations in a vm
+vm M {
+    context c: *u8;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    #[forward]
+    op HALT() : X { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

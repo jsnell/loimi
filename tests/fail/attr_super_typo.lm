@@ -1,0 +1,13 @@
+// error: unknown attribute `forwrd` on a `super`; did you mean `forward`?
+vm M {
+    context c: *u8;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op NOP() : X { next }
+    op HALT() : X { exit 0 }
+    #[forwrd]
+    super NOP_HALT = NOP; HALT;
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

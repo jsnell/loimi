@@ -1,0 +1,5 @@
+// error: unknown attribute `threadlocal` on a module-level `var`; did you mean `thread_local`?
+#[threadlocal]
+var X: i64 = 0;
+
+fn main() {}

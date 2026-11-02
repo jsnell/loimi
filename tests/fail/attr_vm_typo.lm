@@ -1,0 +1,12 @@
+// A misspelled `#[require_verified]` must not silently drop the check.
+// error: unknown attribute `require_verifed` on a vm; did you mean `require_verified`?
+#[require_verifed]
+vm M {
+    context c: *u8;
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

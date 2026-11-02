@@ -1,0 +1,5 @@
+// error: attribute `inline` does not apply to a `struct`: it is for functions (here: `allow`)
+#[inline]
+struct S { x: i64 }
+
+fn main() {}

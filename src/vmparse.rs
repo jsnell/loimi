@@ -45,6 +45,14 @@ impl Parser {
                 Tok::Ident(s) => s.clone(),
                 _ => return self.err("expected a vm item (state, operand, encoding, op, ...)"),
             };
+            let (what, known): (String, &[&str]) = match kw.as_str() {
+                "fn" => ("a vm function".into(), crate::parser::FN_ATTRS),
+                "super" => ("a `super`".into(), &["forward"]),
+                "on" => ("`on raise`".into(), &[]),
+                "operand" | "entry" | "op" => (format!("an `{}`", kw), &[]),
+                _ => (format!("a `{}`", kw), &[]),
+            };
+            crate::parser::check_attrs(&item_attrs, &what, known)?;
             match kw.as_str() {
                 "context" => {
                     self.bump();

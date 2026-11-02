@@ -142,6 +142,15 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`
   and `super_overlap` (section 7.3).
+- **Attributes** are checked where they appear: an unknown or misplaced
+  one is an error (with a "did you mean" for near misses), never
+  ignored, since a misspelled `#[require_verified]` would silently drop
+  a check. `#[allow(..)]` goes anywhere (items, vm items, fields, enum
+  variants, match arms, `#![..]`); functions (also extern, trait and vm
+  functions) take `#[inline]`, `#[inline(always|never)]`, `#[cold]` and
+  `#[unsafe]`; a `vm` takes `#[require_verified]` and
+  `#[dispatch(mode)]`; a module-level `var` takes `#[thread_local]`; a
+  `super` takes `#[forward]`.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 

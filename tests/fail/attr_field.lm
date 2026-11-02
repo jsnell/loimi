@@ -1,0 +1,7 @@
+// error: unknown attribute `verfied` on a field (here: `allow`)
+struct S {
+    #[verfied]
+    x: i64,
+}
+
+fn main() {}

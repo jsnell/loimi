@@ -25,6 +25,88 @@ pub struct Parser {
     open_allows: Vec<(String, Span)>,
 }
 
+/// Every attribute and where it applies, for messages. `allow` is
+/// accepted everywhere.
+const ATTRS: &[(&str, &str)] = &[
+    ("allow", "any item"),
+    ("inline", "functions"),
+    ("cold", "functions"),
+    ("unsafe", "functions"),
+    ("thread_local", "module-level `var`s"),
+    ("require_verified", "`vm` declarations"),
+    ("dispatch", "`vm` declarations"),
+    ("forward", "`super` declarations in a vm"),
+];
+/// Attributes on functions (also extern, trait and vm functions).
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe"];
+/// Attributes on `vm` declarations.
+pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
+
+/// Levenshtein distance, for "did you mean" suggestions.
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur.push(sub.min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The closest of `known` to `name`, if close enough to be a typo.
+pub fn suggest<'a>(name: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = (name.chars().count() / 3).max(1);
+    known
+        .into_iter()
+        .map(|k| (edit_distance(name, k), k))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// Check the attributes of a construct (`what`, for messages: "a vm",
+/// "a match arm") against the ones it accepts besides `allow`. An unknown
+/// attribute is an error, never ignored: a misspelled
+/// `#[require_verified]` would silently drop a check.
+pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
+    for (n, args, sp) in &attrs.list {
+        if n == "uses" {
+            continue; // effects, recorded as attributes by `parse_fn`
+        }
+        if n == "allow" || known.contains(&n.as_str()) {
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward");
+            if flag && !args.is_empty() {
+                return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
+            }
+            if n == "inline" && !(args.is_empty() || (args.len() == 1 && (args[0] == "always" || args[0] == "never"))) {
+                return Err(Diag::new(*sp, "`#[inline]` takes no argument, `always` or `never`"));
+            }
+            if n == "dispatch" && args.len() != 1 {
+                return Err(Diag::new(*sp, "`#[dispatch(..)]` takes one dispatch mode: tailcall, goto or switch"));
+            }
+            continue;
+        }
+        let here: Vec<&str> = std::iter::once("allow").chain(known.iter().copied()).collect();
+        let list = here.iter().map(|a| format!("`{}`", a)).collect::<Vec<_>>().join(", ");
+        let msg = if let Some((_, place)) = ATTRS.iter().find(|(a, _)| a == n) {
+            format!("attribute `{}` does not apply to {}: it is for {} (here: {})", n, what, place, list)
+        } else if let Some(s) = suggest(n, here.iter().copied()) {
+            format!("unknown attribute `{}` on {}; did you mean `{}`?", n, what, s)
+        } else if let Some(s) = suggest(n, ATTRS.iter().map(|(a, _)| *a)) {
+            let place = ATTRS.iter().find(|(a, _)| *a == s).unwrap().1;
+            format!("unknown attribute `{}` on {}; did you mean `{}` (for {})? (here: {})", n, what, s, place, list)
+        } else {
+            format!("unknown attribute `{}` on {} (here: {})", n, what, list)
+        };
+        return Err(Diag::new(*sp, msg));
+    }
+    Ok(())
+}
+
 fn is_upper(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
@@ -348,7 +430,9 @@ impl Parser {
             if self.is("#") && self.is_at(1, "!") {
                 self.bump();
                 self.bump();
+                let first = mod_attrs.list.len();
                 self.parse_attr_body(&mut mod_attrs)?;
+                check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec() }, "a module (`#![..]`)", &[])?;
                 continue;
             }
             let mark = self.open_allows.len();
@@ -432,6 +516,19 @@ impl Parser {
     pub fn parse_item(&mut self) -> Res<Item> {
         let attrs = self.parse_attrs()?;
         let is_pub = self.eat_kw("pub");
+        let kw = match self.peek() {
+            Tok::Ident(s) => s.clone(),
+            _ => String::new(),
+        };
+        let (what, known): (String, &[&str]) = match kw.as_str() {
+            "fn" | "extern" | "export" => ("a function".into(), FN_ATTRS),
+            "var" => ("a module-level `var`".into(), &["thread_local"]),
+            "vm" => ("a vm".into(), VM_ATTRS),
+            "enum" | "impl" | "import" | "object" => (format!("an `{}`", kw), &[]),
+            "" => ("an item".into(), &[]),
+            _ => (format!("a `{}`", kw), &[]),
+        };
+        check_attrs(&attrs, &what, known)?;
         if self.is_kw("fn") {
             return Ok(Item::Fn(self.parse_fn(attrs, Linkage::Internal, is_pub)?));
         }
@@ -450,10 +547,14 @@ impl Parser {
             self.expect("{")?;
             let mut fields = Vec::new();
             while !self.is("}") {
+                let mark = self.allow_mark();
+                let fattrs = self.parse_attrs()?;
+                check_attrs(&fattrs, "a field", &[])?;
                 let f = self.ident()?;
                 self.expect(":")?;
                 let t = self.parse_type()?;
                 fields.push((f, t));
+                self.close_allows(mark);
                 if !self.eat(",") {
                     break;
                 }
@@ -471,8 +572,11 @@ impl Parser {
             self.expect("{")?;
             let mut methods = Vec::new();
             while !self.is("}") {
+                let mark = self.allow_mark();
                 let attrs = self.parse_attrs()?;
+                check_attrs(&attrs, "a function", FN_ATTRS)?;
                 let f = self.parse_fn(attrs, Linkage::Internal, false)?;
+                self.close_allows(mark);
                 if f.recv.is_some() {
                     return Err(Diag::new(
                         f.name.span,
@@ -511,9 +615,6 @@ impl Parser {
             self.expect("=")?;
             let ty = self.parse_type()?;
             self.expect(";")?;
-            if !attrs.list.is_empty() {
-                return Err(Diag::new(attrs.list[0].2, "a type alias takes no attributes"));
-            }
             return Ok(Item::TypeAlias(TypeAliasDecl { name, generics, ty, is_pub }));
         }
         if self.eat_kw("enum") {
@@ -523,6 +624,8 @@ impl Parser {
             self.expect("{")?;
             let mut variants = Vec::new();
             while !self.is("}") {
+                let fattrs = self.parse_attrs()?;
+                check_attrs(&fattrs, "an enum variant", &[])?;
                 let vname = self.ident()?;
                 let mut fields = Vec::new();
                 if self.eat("(") {
@@ -553,9 +656,6 @@ impl Parser {
             self.expect("=")?;
             let value = self.parse_expr()?;
             self.expect(";")?;
-            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "thread_local" && n != "allow") {
-                return Err(Diag::new(*sp, format!("unknown attribute `{}` on a module-level `var` (only `thread_local`)", n)));
-            }
             let thread_local = attrs.has("thread_local");
             return Ok(Item::Global(GlobalDecl { name, ty, value, is_pub, thread_local }));
         }
@@ -1349,9 +1449,7 @@ impl Parser {
                             // `#[allow(lint)] pat => body`
                             let mark = self.open_allows.len();
                             let attrs = self.parse_attrs()?;
-                            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "allow") {
-                                return Err(Diag::new(*sp, format!("unknown attribute `{}` on a match arm (only `allow`)", n)));
-                            }
+                            check_attrs(&attrs, "a match arm", &[])?;
                             let pat = self.parse_pat()?;
                             let guard = if self.eat_kw("if") { Some(self.parse_expr()?) } else { None };
                             self.expect("=>")?;
