@@ -1690,7 +1690,8 @@ super (as the `super_overlap` lint defines it) is moved to a second,
 commented-out list that names what it overlaps. So the first list can
 be pasted whole without warnings, and the second lists alternatives.
 In a library (`--lib`, `--shared`) the report prints when the host
-process exits. (**Not built:** a separate `loimi vm suggest-supers`
+process exits; several such libraries can link into one host (the stats
+runtime's symbols are weak, and named by a hash of its source). (**Not built:** a separate `loimi vm suggest-supers`
 command.)
 
 ---
@@ -1964,7 +1965,8 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
     not run, and memory they allocated and had not yet stored somewhere
     reachable leaks. The shadow-stack top and the vm nesting depths
     (`Vm.depth`) are restored, so GC roots and re-entry counts are
-    correct. Everything else stays as the panic left it: a data
+    correct, also when the panic unwinds through nested vm runs and host
+    callbacks (`tests/embed/panic.lm`, vm `R`). Everything else stays as the panic left it: a data
     structure that was being modified (a vm state, a `Vec` mid-`push`, a
     hash map mid-rehash) may break its own invariants. The safe rule is
     to treat the objects the failed call was modifying as poisoned: free
