@@ -1358,6 +1358,12 @@ impl<'a> Checker<'a> {
                 }
                 if lo == hi && !matches!(p.kind, PatKind::Range(..)) { TPK::Int(lo) } else { TPK::Range(lo, hi) }
             }
+            PatKind::Str(bytes) => {
+                if *ty != Ty::str() {
+                    return Err(Diag::new(p.span, format!("string pattern for a value of type `{}`", self.ty_name(ty))));
+                }
+                TPK::Str(bytes.clone())
+            }
             PatKind::Bool(b) => {
                 if *ty != Ty::Bool {
                     return Err(Diag::new(p.span, "boolean pattern for a non-bool value"));
@@ -3565,6 +3571,7 @@ fn pats_overlap(a: &TPat, b: &TPat) -> bool {
         (TPK::Int(x), TPK::Range(lo, hi)) | (TPK::Range(lo, hi), TPK::Int(x)) => lo <= x && x <= hi,
         (TPK::Range(a1, a2), TPK::Range(b1, b2)) => a1 <= b2 && b1 <= a2,
         (TPK::Bool(x), TPK::Bool(y)) => x == y,
+        (TPK::Str(x), TPK::Str(y)) => x == y,
         _ => true,
     }
 }

@@ -1,0 +1,5 @@
+fn f(s: str) -> i64 {
+    match s { "a" => 1, "b" => 2 }
+}
+fn main() {}
+// error: non-exhaustive match: add a `_` arm

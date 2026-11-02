@@ -1687,6 +1687,10 @@ impl Parser {
                 }
                 mk(PatKind::Int(lo), self)
             }
+            Tok::Str(s) => {
+                self.bump();
+                mk(PatKind::Str(s), self)
+            }
             Tok::Ident(s) if s == "_" => {
                 self.bump();
                 mk(PatKind::Wild, self)

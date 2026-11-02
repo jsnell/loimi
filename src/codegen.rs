@@ -938,7 +938,16 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 };
                 let slot = if e.ty.is_unitlike() { None } else { Some(self.alloca(&e.ty)) };
                 let l_end = self.fresh_label("endmatch");
-                for arm in arms {
+                // Leading string-literal arms: switch on the length first.
+                let mut first = 0;
+                if scrut.ty == Ty::str() {
+                    let k = arms.iter().take_while(|a| a.guard.is_none() && str_lits(&a.pat).is_some()).count();
+                    if k >= 2 {
+                        self.str_switch(&scrut.ty, &sp, &arms[..k], &e.ty, slot.as_deref(), &l_end);
+                        first = k;
+                    }
+                }
+                for arm in &arms[first..] {
                     let l_next = self.fresh_label("arm");
                     self.live.push(vec![]);
                     self.test_pat(&arm.pat, &sp, &l_next);
@@ -1244,6 +1253,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let c = self.inst(format!("icmp eq i1 {}, {}", x, b));
                 self.branch_ok(&c, fail);
             }
+            TPK::Str(bytes) => {
+                let lt = self.ty(t);
+                let lp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", lt, ptr));
+                let len = self.inst(format!("load i64, ptr {}", lp));
+                let c = self.inst(format!("icmp eq i64 {}, {}", len, bytes.len()));
+                self.branch_ok(&c, fail);
+                self.str_bytes_eq(t, ptr, bytes, fail);
+            }
             TPK::Range(lo, hi) => {
                 let x = self.load(t, ptr);
                 let lt = self.ty(t);
@@ -1280,6 +1297,96 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TPK::Variant(idx, subs) => self.test_variant(t, *idx, subs, ptr, fail),
         }
+    }
+
+    /// Match `arms`, whose patterns are all string literals (or `|` of
+    /// them): a `switch` on the length, then the literals of that length
+    /// in arm order. Falls through when none matches.
+    fn str_switch(&mut self, t: &Ty, sp: &str, arms: &[TArm], rty: &Ty, slot: Option<&str>, l_end: &str) {
+        let lt = self.ty(t);
+        let lp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", lt, sp));
+        let len = self.inst(format!("load i64, ptr {}", lp));
+        let l_rest = self.fresh_label("strrest");
+        let bodies: Vec<String> = arms.iter().map(|_| self.fresh_label("strarm")).collect();
+        let mut by_len: std::collections::BTreeMap<usize, Vec<(usize, &[u8])>> = Default::default();
+        for (i, a) in arms.iter().enumerate() {
+            for b in str_lits(&a.pat).unwrap() {
+                by_len.entry(b.len()).or_default().push((i, b));
+            }
+        }
+        let lens: Vec<(usize, String)> = by_len.keys().map(|n| (*n, self.fresh_label("strlen"))).collect();
+        let cases: String = lens.iter().map(|(n, l)| format!(" i64 {}, label %{}", n, l)).collect();
+        self.term(format!("switch i64 {}, label %{} [{} ]", len, l_rest, cases));
+        for (n, l) in &lens {
+            self.label(l);
+            for (i, b) in &by_len[n] {
+                let next = self.fresh_label("strnext");
+                self.str_bytes_eq(t, sp, b, &next);
+                self.br(&bodies[*i]);
+                self.label(&next);
+            }
+            self.br(&l_rest);
+        }
+        for (a, l) in arms.iter().zip(&bodies) {
+            self.label(l);
+            self.live.push(vec![]);
+            let v = self.val(&a.body);
+            self.live.pop();
+            if let Some(s) = slot {
+                if !self.terminated {
+                    self.store(rty, &v, s);
+                }
+            }
+            self.br(l_end);
+        }
+        self.label(&l_rest);
+    }
+
+    /// Branch to `fail` unless the bytes of the `str` at `ptr`, whose
+    /// length is known to be `bytes.len()`, equal `bytes`. Compares in
+    /// 8-, 4-, 2- and 1-byte loads against constants (the last load may
+    /// overlap the previous one), with one branch.
+    fn str_bytes_eq(&mut self, t: &Ty, ptr: &str, bytes: &[u8], fail: &str) {
+        let n = bytes.len();
+        if n == 0 {
+            return;
+        }
+        let lt = self.ty(t);
+        let dp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 0", lt, ptr));
+        let data = self.inst(format!("load ptr, ptr {}", dp));
+        let mut all: Option<String> = None;
+        let mut o = 0;
+        while o < n {
+            let mut w = 8;
+            while w > 1 && w > n {
+                w /= 2;
+            }
+            if o + w > n {
+                // Shrink to what is left, or overlap the previous load.
+                let rem = n - o;
+                let mut w2 = w;
+                while w2 > rem {
+                    w2 /= 2;
+                }
+                if w2 == rem { w = w2 } else { o = n - w }
+            }
+            let mut k: u64 = 0;
+            for i in (0..w).rev() {
+                k = (k << 8) | bytes[o + i] as u64;
+            }
+            let p = self.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", data, o));
+            let it = format!("i{}", w * 8);
+            let v = self.inst(format!("load {}, ptr {}, align 1", it, p));
+            // As a signed constant of the load's width.
+            let sk = (k << (64 - w * 8)) as i64 >> (64 - w * 8);
+            let c = self.inst(format!("icmp eq {} {}, {}", it, v, sk));
+            all = Some(match all {
+                None => c,
+                Some(a) => self.inst(format!("and i1 {}, {}", a, c)),
+            });
+            o += w;
+        }
+        self.branch_ok(&all.unwrap(), fail);
     }
 
     pub fn branch_ok(&mut self, c: &str, fail: &str) {
@@ -2055,5 +2162,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 "zeroinitializer".into()
             }
         }
+    }
+}
+
+/// The literals of a string pattern (`"a"` or `"a" | "b"`), if it is one.
+fn str_lits(p: &TPat) -> Option<Vec<&[u8]>> {
+    match &p.kind {
+        TPK::Str(b) => Some(vec![b.as_slice()]),
+        TPK::Or(alts) => {
+            let mut out = vec![];
+            for a in alts {
+                out.extend(str_lits(a)?);
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }

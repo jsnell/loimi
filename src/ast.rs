@@ -175,6 +175,8 @@ pub enum PatKind {
     Int(i128),
     Char(u8),
     Bool(bool),
+    /// A string literal, for `str` scrutinees.
+    Str(Vec<u8>),
     Range(i128, i128),
     /// `Variant(p, ...)`, `Enum.Variant(..)`, `.Variant(..)`. The path is
     /// empty for the `.Variant` form.
