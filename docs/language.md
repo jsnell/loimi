@@ -590,10 +590,28 @@ from the declarations. It checks:
   indices in range, upvalue indices valid, ...);
 - every `label` lands on an instruction boundary (never inside an instruction
   or an inline cache);
+- in a superinstruction, each later part's word holds an op of that part's
+  family. Those words are instructions of their own (a jump may land on
+  them, and when a part quickens the super can split up), and are checked
+  as such;
+- `then OP`: the next instruction is an `OP` (or a member of its family);
 - for stack VMs, ops declare stack effects (`op ADD() stack(a, b -- r)`) and
   the verifier computes the maximum depth per function and checks consistency
   at control-flow merges (like the JVM verifier, minus types);
-- code can't fall off the end.
+- code can't fall off the end: it is not empty, and its last instruction
+  cannot continue past itself. An op may continue if its handler uses
+  `next` or reads `pc` (to save a return address like `pc + 1`), directly,
+  in a vm function it calls, or in an op it can `become`. An op with `then`
+  that may continue (`jump pc + 2` past its JMP) needs an instruction after
+  that JMP.
+
+`verify` clauses see `it`, `pc` (the address of the operand's word) and the
+verify context, nothing else; a verify context cannot be named `it` or `pc`.
+What the verifier cannot see is up to the vm: that the run-time state
+matches the verify context (the register window really has `proto.nregs`
+registers), that every function reachable by a call was verified, that
+operands without a `verify` clause (`imm`) are safe for every value, and
+that jumps to computed addresses (`jump fp.resume`) go to boundaries.
 
 `Mini.run` only accepts `Verified` code. As a result, operand accesses compile
 **without bounds checks**, and stack VMs check for overflow once per call

@@ -7,7 +7,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 
 | Area | Status |
 |---|---|
-| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`). |
+| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`, `--sanitize=address`). |
 | Core language | `inline for` (module level and in `vm` blocks), structs (literals may be module-qualified: `diag.Span { .. }`), enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (through nested patterns and tuples), `let ... else`, `if let` chains, loops with `break` values, `defer`, consts, module-level `var`s (see below), casts (including integer to fieldless enum, checked in debug builds; `Kind.COUNT` gives the number of variants; `x as u64 < y` parses as a comparison), local inference across `if`/`match` branches (`if c { Ok(e) } else { Err(m) }` needs no annotation), checked/wrapping arithmetic, arbitrary-width integers `iN`/`uN` (1..=64), overflow and bounds checks (overflow traps in debug builds). |
 | Globals | `var NAME: T = init;` at module level (with `pub`, readable and assignable from other modules as `mod.NAME` or after `import mod.{NAME}`). Plain LLVM globals; `#[thread_local]` makes one copy per thread (`thread_local(initialexec)`). The initializer must be a constant expression: literals, consts, `[x; N]`, struct/tuple/array literals, enum variants without payload, `None`/`Some(..)`/`Ok(..)`/`Err(..)` of constants, and functions (for hooks). Globals are not GC roots: a global holding `Gc`/`Value` must be marked by a root scanner (`heap.add_scanner`). |
 | Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Methods resolve per instance. Static traits (`trait Hash { fn hash(k: Self) -> u64; .. }`, `impl Hash for Sym;`) and bounds (`HashMap<K: hash.Hash, V>`, `fn f<T: A + B>`) are checked at instantiation, with the error at the use site; no default methods, generic traits, or impls for generic instances yet. A generic function can be used as a function pointer where a function type is expected (`Pratt.new(peek, ...)` with `fn peek<E>(p: *P<E>) -> T`). Methods can have their own type parameters after the method name, on plain receivers (`fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`) and generic ones (`fn Box<T>.map<U>(b: *Box<T>, f: fn(T) -> U) -> Box<U>`); the receiver's arguments come from the receiver, the method's are inferred from the arguments and the expected type. Type arguments can also be given explicitly on calls: `mem.alloc<u8>(n)`, `id<i64>(x)`, `c.op<K>(&ops)`, `Cursor.cast<u8>(&c)` (a method's own parameters only; not on a generic type's static functions such as `Vec.new`). `f<T>(` is recognized when `<` directly follows the name and a balanced, type-shaped `<...>` is followed by `(`; otherwise `<` is a comparison. |
@@ -23,7 +23,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | `std.lex` | A scanner toolkit rather than a generator: `Cursor` (peek, bump, line tracking, marks, spans, errors), `Syntax` presets (`lua()`, `c_like()`, `none()`) for line, block, nested and Lua long-bracket comments, escape and overflow rules; `skip_trivia`, `ident`, `number` (via std.num), `quoted` (escapes into a `StrBuf`, including `\ddd`, `\xHH`, `\u{..}`, `\z`, line continuation), `long_string`, `OpTable<K>` (maximal munch), `Keywords<K>`. Errors are `lex.Error` (span and message), convertible to a `diag.Diag`. A complete lexer for Mini's token set is about 50 lines (`tests/run/lex_toy.lm`). |
 | `std.parse` | `Pratt<P, K, E, X>`: binding-power table indexed by token kind (`infix_left`, `infix_right`, `infix`, `prefix`) and a driver that calls the user's `peek`, `advance`, `atom`, `unary`, `binary` and optional `before_rhs` hooks through function pointers. |
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |
-| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, and the Mini scripts with and without GC stress. |
+| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, the Mini scripts with and without GC stress, and a few seconds of bytecode fuzzing (below). |
 
 ## Differences from the design
 
@@ -65,8 +65,13 @@ in [`language.md`](language.md). Updated 2026-11-02.
   pointers are checked, synced and rooted like direct calls. There are no
   effect variables: a generic function cannot take "a callback with any
   effects" and inherit them.
-- **Verifier**: operand checks only. Stack-effect checking for stack VMs
-  and "cannot fall off the end" are not implemented.
+- **Verifier**: opcodes, extents, operand `verify` clauses, superinstruction
+  part words, and "cannot fall off the end" (an op may continue if its
+  handler uses `next` or reads `pc`; the scan is over tokens, so it errs
+  toward "may continue"). Stack-effect checking for stack VMs is not
+  implemented, and there is no `Verified<V>` type: `Vm.run` takes a raw
+  code pointer, so nothing ties the code it runs, or the run-time state
+  (register window size, the closure's prototype), to what was verified.
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
   not through an external `set_dispatch`.
 - **Front-end stdlib** (`std.lex`, `std.parse`, `std.diag`, `std.num`) is
