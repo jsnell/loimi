@@ -7,6 +7,23 @@ statically stack-checked Forth; see `SPEC.md`). I read the README,
 or the other example interpreters; nothing forced me to (one lookup of
 `Vm.opcode` in `std/bc.lm` and `tests/run/std_bc.lm`, item 9).
 
+## Follow-up (what has been done since)
+
+This report is kept as written. Since then:
+
+| # | Status |
+|---|---|
+| 1 | Fixed: `op X() : F stack(a b -- c)` stack effects, checked by the generated verifier, with `max_stack()` on the proof (`language.md` §3.4a). Stak declares each effect once. |
+| 2 | Fixed: `verify` blocks see the base view (supers split, members generic). |
+| 3 | Fixed: `reject(at, msg)` in a `verify` block. |
+| 4 | Fixed: `--vm-stats` suggests 3- and 4-op sequences; `optimize` picks fusions by dynamic programming. |
+| 5, 9 | Fixed: stdlib docs lead with what exists; unbuilt features are marked "Not built"; §3.3 lists the generated API. |
+| 6 | Fixed: `text.Fmt`, `StrBuf.add`, `b.fmt("{} {}", a, b)`. |
+| 7 | Fixed: string patterns in `match`. |
+| 8 | Partly: `..zero` for fields where zero is valid, and `[]` as the empty slice; pointer fields must still be given. |
+| 10 | Partly: lint `state_root` warns when a traced state variable is not in `sync`; no automatic rooting. |
+| 11 | Fixed in the tutorial's fuzzing chapter. |
+
 ## Summary
 
 | | |
