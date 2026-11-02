@@ -836,7 +836,8 @@ fn Parser.subexpr(p: *Parser, limit: u32) -> E {
         }
         // A constant left operand of a commutative operator or a
         // comparison stays unmaterialized, so the K form can be used
-        // with the operands swapped.
+        // with the operands swapped (`k - x` and `k / x` have their own
+        // reversed ops).
         if swappable(op) and let Some(kl) = p.kindex(e, op == T.Eq or op == T.Ne) {
             let rhs = p.subexpr(rp);
             if p.kindex(rhs, op == T.Eq or op == T.Ne).is_none() {
@@ -847,6 +848,8 @@ fn Parser.subexpr(p: *Parser, limit: u32) -> E {
                 let w = match op {
                     Plus => Mini.ADDK(0, a, k),
                     Star => Mini.MULK(0, a, k),
+                    Minus => Mini.RSUBK(0, a, k),
+                    Slash => Mini.RDIVK(0, a, k),
                     Eq | Ne => Mini.EQK(0, a, k),
                     Lt => Mini.GTK(0, a, k),
                     Le => Mini.GEK(0, a, k),
@@ -895,7 +898,7 @@ fn Parser.concat(p: *Parser, e: E, rp: u32) -> E {
 }
 
 fn swappable(op: T) -> bool {
-    op == T.Plus or op == T.Star or op == T.Eq or op == T.Ne or op == T.Lt or op == T.Le or op == T.Gt or op == T.Ge
+    op == T.Plus or op == T.Star or op == T.Minus or op == T.Slash or op == T.Eq or op == T.Ne or op == T.Lt or op == T.Le or op == T.Gt or op == T.Ge
 }
 
 /// The constant index (at most 255) of a numeric constant expression, or

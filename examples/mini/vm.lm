@@ -519,6 +519,18 @@ pub vm Mini {
             cold { dst = arith_slow(ctx, 4, a, b)?; next }
         }
     }
+    /// R[dst] = k[b] - R[a] and k[b] / R[a] (a constant left operand).
+    op RSUBK(dst: reg, a: reg, b: kst) : ABC {
+        if let (Int(x), Int(y)) = (b, a) and let Some(r) = x.sub_checked(y) { dst = Int(r); next }
+        let r = unsafe { *((k + b.raw) as *f64) } - unsafe { *((regs + a.raw) as *f64) };
+        if likely(r == r) { dst = r.to_bits() as V; next }
+        cold { dst = arith_mixed(ctx, 1, b, a)?; next }
+    }
+    op RDIVK(dst: reg, a: reg, b: kst) : ABC {
+        let r = unsafe { *((k + b.raw) as *f64) } / unsafe { *((regs + a.raw) as *f64) };
+        if likely(r == r) { dst = r.to_bits() as V; next }
+        cold { dst = arith_slow(ctx, 3, b, a)?; next }
+    }
     op POW(dst: reg, a: reg, b: reg) : ABC {
         dst = arith_slow(ctx, 5, a, b)?;
         next
