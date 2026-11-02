@@ -139,8 +139,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The only lint so far is
-  `match_fallout`.
+  the warnings that remain into errors. The lints are `match_fallout`
+  and `super_overlap` (section 7.3).
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -197,6 +197,13 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
   `a.add_overflow(b) -> (T, bool)`. These map directly to LLVM's
   `*.with.overflow` intrinsics, which guest integer semantics need constantly.
+- **Shifts.** `a << n` and `a >> n` have the type of `a`; `>>` is
+  arithmetic for signed `a` and logical for unsigned. The amount `n` may
+  be any integer type (`x << shift` with `x: u32`, `shift: u64`), and is
+  taken modulo the width of `a`, read as an unsigned number of its own
+  type, so shifting never has undefined results. A literal `a` takes its
+  type from the context like other literals (`w & (255 << shift)` with
+  `w: u32` shifts a `u32`) and is an `i64` without one.
 - **Arbitrary-width integers.** `iN` and `uN` for any `N` from 1 to 64 are
   integer types of exactly that width (LLVM's `iN`): arithmetic wraps,
   overflows and is checked at `N` bits, `as` sign- or zero-extends from `N`
@@ -209,15 +216,40 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`i48`: 8 bytes, `u24`: 4).
 - Hints: `likely(c)`, `unlikely(c)`, `assume(c)`, `unreachable`, `#[cold]`,
   `#[inline(always)]`, `#[inline(never)]`.
-- `unsafe { }` permits raw pointer dereference and unchecked indexing.
+- `unsafe { }` marks code whose correctness the compiler cannot check.
+  As implemented, exactly one operation requires it: making a GC
+  reference from something else (`p as Gc<T>` from a pointer, an address
+  or another `Gc`; section 8), because the collector trusts every `Gc` it
+  finds. Raw pointers do not need it (section 1.3). An `unsafe` block is
+  an ordinary block otherwise, and may be used to mark other unchecked
+  code for readers.
 
 ### 1.3 Memory
 
 There is no borrow checker. Host memory is managed through explicit allocators,
 mostly arenas (`std.mem`), which suit compilers and interpreters well: ASTs,
 IR, and per-compilation data die together. Guest memory lives in the GC heap
-(section 8). Slices are bounds-checked, and raw pointers require `unsafe`. This
-is "safety-leaning", not memory-safe.
+(section 8). This is "safety-leaning", not memory-safe:
+
+- **Arrays and slices are bounds-checked** (in debug and release builds),
+  and integer overflow traps in debug builds.
+- **Raw pointers are unchecked, and need no `unsafe`.** `*p`, `p.field`,
+  `p[i]` and `p + n` on a `*T` compile to plain loads, stores and address
+  arithmetic, anywhere. The pointer type is the marker: a `*T` says
+  "no bounds, no lifetime", the way a slice says "checked". Interpreter
+  host code (allocators, hash tables, the collector, register windows)
+  is built on pointers, and the standard library and the example
+  interpreters use them throughout; requiring `unsafe` around each use
+  would mark most of that code without making any of it safer. Use a
+  slice (`p.slice(n)`) where a bounds check is wanted.
+- **GC references cannot be forged outside `unsafe`.** A `Gc<T>` comes
+  from `new`, from a field or value that holds one, or from
+  `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it
+  finds, so a bad one corrupts the heap far from the bug; that is the one
+  conversion the compiler makes you mark.
+- **Bytecode is checked once, by the verifier** (section 6), and operand
+  accesses in handlers are unchecked because it ran, not because of an
+  annotation.
 
 ### 1.4 Compile-time evaluation
 
@@ -276,6 +308,38 @@ would replace every use of that name in the body.
 
 `import std.gc.{Gc, Heap};`. `extern "C" fn` declares C functions, and
 `export "C"` exposes Loimi functions, which matters for embedding.
+
+**Namespaces.** A module's names live in two namespaces:
+
+- **types and modules**: structs, enums, `value` and `object` types,
+  type aliases, traits, vms, and imported modules (`import std.parse;`
+  binds `parse`). These are what type positions and the head of a path
+  see: `T`, `m.T`, `T.f(..)`, `T.Variant`, `T { .. }`, `m.f(..)`;
+- **values**: functions, consts and globals.
+
+A function may share its name with a type or module, so `fn parse(..)`
+can sit next to `import std.parse;`, and `struct Point` next to
+`fn Point(..)`. Two types, a type and a module, two values, or a const or
+global and a type or module with one name are an error ("defined more
+than once"): a const or global can be the head of `x.y` (`ORIGIN.x`),
+which would be ambiguous. `import m.{x}` imports whatever `m` binds as
+`x` in either namespace.
+
+How a name is resolved depends on where it is:
+
+- a local variable always wins;
+- `x(..)` and `x` in an expression name a value. If there is none, `x`
+  may be a variant of the expected type (`Arr(a)` where a `Value` is
+  expected, even with `object Arr` imported: a type is never a value),
+  and otherwise it is an error;
+- in `x.y`, `x` is looked up among types and modules first: with both
+  `fn parse` and `import std.parse`, `parse.Prec` is the module's struct
+  (a function has no fields, so nothing is lost);
+- patterns resolve variant names against the type being matched, so
+  they are not affected by items in scope.
+
+Enum and `value` variants are not module items: bare `Arr(..)` or
+`Nil` is found through the expected type (or written `Value.Arr(..)`).
 
 ---
 
@@ -466,8 +530,14 @@ type-checks the mapping. From the declarations it **generates**:
 - a disassembler (below);
 - `Mini.verify` (section 6);
 - metadata for tools: `Vm.op_size(w)`, `Vm.op_name(w)`, `Vm.NUM_OPS`,
-  branch targets through `Vm.label(w)`. Per-op operand kinds are not
-  exposed yet;
+  branch targets through `Vm.label(w)`, and per-op operand metadata, so
+  that fuzzers and assemblers can build plausible instructions:
+  `Vm.operand_count(w)` operand fields, in encoder order, and for field
+  `i` its kind `Vm.operand_kind(w, i)` (an index into the vm's `operand`
+  declarations, in order; `Vm.NUM_KINDS` for none), width
+  `Vm.operand_bits(w, i)` and `Vm.operand_signed(w, i)`;
+  `Vm.kind_name(k)` and `Vm.kind_is_label(k)` describe a kind. A super's
+  head answers for its first part;
 - `Vm.optimize(code)`, the superinstruction peephole (section 7.3), and
   `Vm.deopt(code)` (section 7.2);
 - label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
@@ -544,7 +614,9 @@ load overlaps with the handler's work.
 ### 3.5 VM functions
 
 A `fn` inside a `vm` block is a **vm function**. It can read and write state
-and is always inlined into its callers. If its return type is `never`, it
+and is always inlined into its callers. Like a handler, it may call
+effectful functions without declaring their effects; those calls are
+synced where they are made (section 5). If its return type is `never`, it
 can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
 `?` on the raise type. That makes shared tails easy to write:
 
@@ -723,6 +795,15 @@ Rules:
   store `pc` and the stack top to `ctx.sync`, and spill live `Value`/`Gc`
   locals into a per-vm temporary root area. With a moving collector it also
   reloads them afterwards. Calls without effects pay nothing.
+- **In plain vm functions** (section 3.5), effectful calls are synced in
+  place exactly as in a handler, without declaring the effect: a vm
+  function sees the calling handler's state through pointers and is
+  inlined into it, so `fn gc_point() { if ... { cold { gc.collect(..) } } }`
+  pays for the sync only on the path that collects. A handler (or vm
+  function) calling such a function roots its own traced locals at that
+  call, as for any call that may collect; it does not sync there. Declaring
+  `uses gc` on a vm function instead makes every call of it a synced call.
+  Called from an entry, nothing is synced (the run loop has not started).
 - **In ordinary functions**, `Gc`/`Value` locals that are live across a `gc`
   call are registered in a compiler-maintained shadow-stack frame. This only
   happens on paths that can collect, which are slow paths by nature.
@@ -978,10 +1059,33 @@ safe, needs no control-flow analysis, and can happen at build time (the
 
 `Vm.optimize(code)` is the generated peephole pass. It compares words by
 the op they stand for alone (a super's head counts as its first part), so
-it can run again on code that has been optimized and quickened; where
-several supers match, the one with the most parts wins. The generated
-verifier treats every part's word as an instruction: jumps may land on
-it, and it must hold an op of the same family as the super's part.
+it can run again on code that has been optimized and quickened. The
+generated verifier treats every part's word as an instruction: jumps may
+land on it, and it must hold an op of the same family as the super's part.
+
+**The matching rule.** `optimize` walks the code left to right. At each
+instruction it fuses the longest declared super that starts there, if
+any, and moves on to the next word, which is the super's second part.
+It does not look ahead: with `super GETGLOBAL_SUBK = GETGLOBAL; SUBK;`
+and `super SUBK_CALL = SUBK; CALL;`, the sequence `GETGLOBAL; SUBK; CALL`
+becomes `GETGLOBAL_SUBK` followed by the plain `CALL`, since the `SUBK`
+belongs to the first super. (The `SUBK` word does become a `SUBK_CALL`
+head, but it only runs if something jumps to it.) Declared supers where
+a proper suffix of one is a proper prefix of another get a warning,
+`super_overlap`, at the later declared one; declare the longer super if
+the whole sequence is hot, drop one of the two, or silence it with
+`#[allow(super_overlap)]` on that super or on the vm.
+
+**Supers of quickened members.** `optimize` usually runs on freshly
+emitted code, where every family is at its `generic` member, so a super
+whose parts are specialized members (`GETGLOBAL_C; SUBK`) only forms when
+`optimize` runs again after quickening, or by quickening inside a super:
+when the `GETGLOBAL` part of a `GETGLOBAL_SUBK` runs `become GETGLOBAL_C`,
+the head becomes `GETGLOBAL_C_SUBK` only if that super is declared, and
+is otherwise split back into its parts. To keep a super across
+quickening, declare both: the pair with the generic member, which
+`optimize` forms, and the pair with the quickened member, which the
+`become` turns it into.
 
 **Forwarding.** In `#[forward] super A_B = A; B;`, each part after the
 first is compiled twice for an operand that may name a register the

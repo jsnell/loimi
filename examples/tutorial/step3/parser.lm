@@ -118,6 +118,7 @@ pub fn parse_program(src: str, file: u32, arena: *mem.Arena) -> Result<mem.Vec<S
     defer pr.free();
 
     var p = Parser { lx: Lexer.new(src, file, arena), tok: lexer.eof(), arena: arena, pratt: &pr };
+    defer p.lx.free();
     p.advance()?;
     var stmts: mem.Vec<Stmt> = mem.Vec.new();
     while p.tok.kind != T.Eof {

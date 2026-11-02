@@ -1,0 +1,12 @@
+// Module for names.lm: an object type and a value variant of the same name.
+pub object Arr { items: [Value] }
+pub object Str { data: [u8] }
+
+pub value Value repr nanbox {
+    Num(f64) unboxed,
+    Nil,
+    Arr(Gc<Arr>),
+    Str(Gc<Str>),
+}
+
+pub fn parse(s: str) -> i64 { s.len as i64 }

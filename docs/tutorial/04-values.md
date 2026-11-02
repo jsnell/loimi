@@ -299,11 +299,11 @@ sets it like the state:
     }
 ```
 
-The error line is returned through `ctx` rather than in the `Err`
-because of a current limitation: in tail-call mode every handler
-returns the entry's return type, and a type that does not fit in
-registers (a `Result` of a struct with a string and a line, say) makes
-LLVM fail to compile the tail calls. Keep entry return types small.
+The error line is returned through `ctx` rather than in the `Err`,
+which keeps `str` as the error type everywhere. The entry may return
+any type, a `Result` of a struct with a message and a line included:
+in tail-call mode, a result that is not a single scalar travels from
+`exit` to the entry through a thread-local slot.
 
 ## Printing values
 

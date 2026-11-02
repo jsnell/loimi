@@ -47,8 +47,65 @@ pub fn extra_param(p: &Program, f: &FnDef) -> Option<String> {
     }
 }
 
+/// Whether a tail-call vm returns its entries' result through a
+/// thread-local slot instead of in registers. Handlers return the entry's
+/// type, and LLVM can only compile `musttail` calls whose result is
+/// returned in registers: an aggregate that does not fit is returned
+/// through a hidden pointer (sret), and the tail call then fails in the
+/// backend. So every aggregate result travels through
+/// `@"Vm.ret_slot"`: `exit v` stores it and returns void, and the entry,
+/// which made the first, ordinary call, loads it. The store happens just
+/// before the chain of tail calls returns to that entry, so nested runs
+/// (an entry called from a handler) cannot clobber it.
+pub fn indirect_ret(p: &Program, vd: &VmDef) -> bool {
+    if vd.dispatch != Dispatch::TailCall || vd.ret.is_unitlike() {
+        return false;
+    }
+    matches!(llty(p, &vd.ret).as_bytes()[0], b'{' | b'[' | b'%')
+}
+
+/// The LLVM return type of a tail-call vm's handlers.
+pub fn handler_ret_llty(p: &Program, vd: &VmDef) -> String {
+    if indirect_ret(p, vd) { "void".into() } else { ret_llty(p, &vd.ret) }
+}
+
+/// Whether function `f` is a tail-call handler that returns void because
+/// its vm's result goes through the return slot.
+pub fn returns_through_slot(p: &Program, f: &FnDef) -> bool {
+    takes_insn(p, f) && indirect_ret(p, &p.vms[f.vm.unwrap() as usize])
+}
+
+fn ret_slot(vd: &VmDef) -> String {
+    format!("@\"{}.ret_slot\"", vd.symbol)
+}
+
 pub fn table_name(vd: &VmDef) -> String {
     format!("@\"{}.table\"", vd.symbol)
+}
+
+/// Whether combined-mode entry `entry` can ever dispatch through a
+/// variant's table: it, or some op, vm function or `on raise` it may
+/// run, says `use_variant` with a variant. Other entries get no wrapper
+/// blocks: they could never be reached, and a few hundred of them in one
+/// function made LLVM's loop strength reduction take minutes.
+fn entry_switches(p: &Program, vm: u32, entry: FnId) -> bool {
+    let mut found = false;
+    for (fid, f) in p.fns.iter().enumerate() {
+        if f.vm != Some(vm) || (f.vm_role == VmRole::Entry && fid as FnId != entry) {
+            continue;
+        }
+        if let Some(b) = &f.body {
+            crate::tirwalk::for_each_expr(b, &mut |e| {
+                if matches!(e.kind, TK::Vm(TVm::TableAddr(t)) if t > 0) {
+                    found = true;
+                }
+            });
+        }
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 /// Called after parameters are stored: set up vm state for handlers/entries.
@@ -94,11 +151,14 @@ pub fn handler_prologue(g: &mut FnGen) {
         hg.raise_label = g.fresh_label("raise");
         hg.invalid_label = g.fresh_label("invalid");
         hg.op_labels = vd.ops.iter().map(|o| format!("op.{}.{}", o.name, o.opcode)).collect();
+        let switches = f.vm_role == VmRole::Entry && entry_switches(p, vm, g.fid);
         hg.wrapper_labels = vd
             .variants
             .iter()
             .enumerate()
-            .map(|(v, (_, ws))| ws.iter().map(|(k, _)| (*k, format!("var.{}.{}", v, k))).collect())
+            .map(|(v, (_, ws))| {
+                if switches { ws.iter().map(|(k, _)| (*k, format!("var.{}.{}", v, k))).collect() } else { vec![] }
+            })
             .collect();
         if let Some(rt) = &vd.raise_ty {
             hg.raise_slot = g.alloca(rt);
@@ -148,11 +208,13 @@ pub fn epilogue(g: &mut FnGen) {
     if let Some(rf) = vd.on_raise {
         emit_body(g, rf, &hg.raise_label);
     }
-    for (v, (_, ws)) in vd.variants.iter().enumerate() {
-        for (j, (_, fid)) in ws.iter().enumerate() {
-            emit_body(g, *fid, &hg.wrapper_labels[v][j].1);
+    for (v, ws) in hg.wrapper_labels.iter().enumerate() {
+        for (j, (_, l)) in ws.iter().enumerate() {
+            emit_body(g, vd.variants[v].1[j].1, l);
         }
     }
+    // Without wrappers, the variants' tables are never used.
+    let ntables = if hg.wrapper_labels.iter().all(|w| w.is_empty()) { 0 } else { vd.variants.len() };
     g.fid = entry_fid;
     g.slots = entry_slots;
     if let Some(h) = g.vm.as_mut() {
@@ -188,7 +250,7 @@ pub fn epilogue(g: &mut FnGen) {
             g.inst(format!("trunc i64 {} to i32", opc))
         };
         g.term(format!("switch i32 {}, label %{} [{} ]", case, hg.invalid_label, cases));
-        for t in 0..=vd.variants.len() {
+        for t in 0..=ntables {
             if t > 0 || vd.tbl_idx.is_some() {
                 let mut ids = Vec::new();
                 for i in 0..n {
@@ -205,7 +267,7 @@ pub fn epilogue(g: &mut FnGen) {
             }
         }
     } else {
-        for t in 0..=vd.variants.len() {
+        for t in 0..=ntables {
             let mut entries = Vec::new();
             for i in 0..n {
                 let l = match vd.ops.iter().position(|o| o.opcode as usize == i) {
@@ -280,7 +342,15 @@ fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
     let args = format!("{}, i{} {}", state_args(g, vd), vd.word.bits, insn);
     let rt = ret_llty(g.p(), &vd.ret);
     let kind = if hg.role == VmRole::Entry { "" } else { "musttail " };
-    if rt == "void" {
+    if indirect_ret(g.p(), vd) {
+        g.emit(format!("{}call preserve_nonecc void {}({})", kind, callee, args));
+        if hg.role == VmRole::Entry {
+            let v = g.inst(format!("load {}, ptr {}", rt, ret_slot(vd)));
+            g.term(format!("ret {} {}", rt, v));
+        } else {
+            g.term("ret void");
+        }
+    } else if rt == "void" {
         g.emit(format!("{}call preserve_nonecc void {}({})", kind, callee, args));
         g.term("ret void");
     } else {
@@ -364,7 +434,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         TVm::Exit(x) => {
             let v = g.val(x);
             let rt = ret_llty(g.p(), &x.ty);
-            if rt == "void" {
+            let p = g.p();
+            if returns_through_slot(p, g.f()) {
+                let vd = &p.vms[g.f().vm.unwrap() as usize];
+                g.emit(format!("store {} {}, ptr {}", rt, v, ret_slot(vd)));
+                g.term("ret void");
+            } else if rt == "void" {
                 g.term("ret void");
             } else {
                 g.term(format!("ret {} {}", rt, v));
@@ -798,10 +873,13 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
             let _ = writeln!(
                 fns,
                 "define internal preserve_nonecc {} {}({}) noreturn nounwind {{\n  call void @llvm.trap()\n  unreachable\n}}\n",
-                ret_llty(p, &vd.ret),
+                handler_ret_llty(p, vd),
                 inv,
                 params.join(", ")
             );
+            if indirect_ret(p, vd) {
+                let _ = writeln!(globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", ret_slot(vd), llty(p, &vd.ret));
+            }
             if let Some(rt) = &vd.raise_ty {
                 let _ = writeln!(globals, "@\"{}.raise_slot\" = internal thread_local(initialexec) global {} zeroinitializer", vd.symbol, llty(p, rt));
             }

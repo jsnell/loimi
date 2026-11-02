@@ -1,0 +1,38 @@
+// Raw pointers are unchecked and need no `unsafe` (language.md §1.3):
+// dereference, field access, indexing and arithmetic work anywhere.
+// `unsafe` is only required to make a Gc reference (tests/fail/gc_ptr_cast.lm);
+// a slice over the same memory is bounds-checked.
+import std.io;
+import std.mem;
+
+struct P { x: i64, y: i64 }
+
+fn sum(p: *i64, n: u64) -> i64 {
+    var s: i64 = 0;
+    for i in 0..n { s += p[i]; }
+    s
+}
+
+fn main() {
+    let p: *i64 = mem.alloc(4);
+    for i in 0..4 { p[i] = (i as i64) * 10; }
+    *(p + 1) = 11;
+    io.print_int(sum(p, 4)); io.println("");
+    io.print_int(*p + p[3]); io.println("");
+    var pt = P { x: 1, y: 2 };
+    let q = &pt;
+    q.y = 5;
+    io.print_int(pt.x + pt.y); io.println("");
+    // An unsafe block is still an ordinary block (and an expression).
+    let v = unsafe { p[2] };
+    io.print_int(v); io.println("");
+    // A slice over the pointer checks its bounds.
+    let s = p.slice(4);
+    io.print_int(s[3]); io.println("");
+    mem.release(p);
+}
+// expect: 61
+// expect: 30
+// expect: 6
+// expect: 20
+// expect: 30

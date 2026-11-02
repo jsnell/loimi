@@ -1,0 +1,50 @@
+// Shift amounts may be any integer type; the result has the left
+// operand's type, and a literal left operand takes its type from the
+// context (i64 without one). Amounts are taken modulo the width.
+import std.io;
+
+fn main() {
+    let shift: u64 = 8;
+    let w: u32 = 0xFFFFFFFF;
+    // Literal left operand typed from the context (u32 through `&`).
+    let cleared = w & ((255 << shift) ^ 0xFFFFFFFF);
+    io.print_int(cleared as i64); io.println("");
+    // No context: i64.
+    let x = 255 << shift;
+    io.print_int(x); io.println("");
+    // A narrow amount on a wide value, a wide amount on a narrow one.
+    let s8: u8 = 40;
+    let big: u64 = 1;
+    io.print_int((big << s8) as i64); io.println("");
+    let b: u8 = 0x81;
+    let n: i64 = 1;
+    io.print_int((b >> n) as i64); io.println("");
+    io.print_int((b << n) as i64); io.println("");
+    // Modulo the width, in the amount's own type: 9 mod 8, 65 mod 8.
+    let nine: u64 = 9;
+    io.print_int((b << nine) as i64); io.println("");
+    let a65: u64 = 65;
+    io.print_int((b >> a65) as i64); io.println("");
+    // Odd widths: 50 mod 48.
+    let v: i48 = 1;
+    let fifty: u8 = 50;
+    io.print_int((v << fifty) as i64); io.println("");
+    // Signed values shift arithmetically by an unsigned amount.
+    let m: i32 = -64;
+    let three: u16 = 3;
+    io.print_int((m >> three) as i64); io.println("");
+    // Compound assignment.
+    var acc: u16 = 1;
+    acc <<= shift;
+    io.print_int(acc as i64); io.println("");
+}
+// expect: 4294902015
+// expect: 65280
+// expect: 1099511627776
+// expect: 64
+// expect: 2
+// expect: 2
+// expect: 64
+// expect: 4
+// expect: -8
+// expect: 256

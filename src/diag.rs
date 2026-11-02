@@ -26,7 +26,7 @@ pub struct Diag {
 }
 
 /// The warnings the compiler knows, for `#[allow(..)]`.
-pub const LINTS: &[&str] = &["match_fallout"];
+pub const LINTS: &[&str] = &["match_fallout", "super_overlap"];
 
 #[allow(dead_code)]
 impl Diag {

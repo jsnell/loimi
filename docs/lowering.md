@@ -258,7 +258,7 @@ Notes:
 | `jump t` | same, with `pc' = t` |
 | `redo` | same, with `pc' = pc` |
 | `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). Would become `store atomic ... monotonic` under `#[threads(shared_code)]` (not yet implemented) |
-| `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function |
+| `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function. *As implemented:* a result that is a scalar (an integer, pointer, float or non-boxed value) is returned in registers, and handlers return the entry's type; any aggregate result (a `Result`, struct, tuple, option of a non-pointer) is stored to a thread-local `Vm.ret_slot` and handlers return `void`, since a `musttail` call cannot return through a hidden `sret` pointer. The entry loads the slot after its call returns |
 | `raise e` | `store e` to `ctx.pending`, `musttail call @Mini.on_raise` |
 
 **Inline cache fields** are places at `pc + 1 + offset` words. A field
@@ -344,6 +344,15 @@ The inner handler dispatches through `%tbl`, which still points at the variant
 table, so the interpreter stays instrumented until the table is switched back.
 When a vm declares no variants, `%tbl` is not a state register: handlers
 address the default table as a global constant, which frees a register.
+
+In goto and switch modes each entry is one function holding every
+handler, and a wrapper is a block that runs `before` and branches to the
+op's block. Only entries that can switch tables get the wrapper blocks:
+those that say `use_variant` with a variant, or all of them when an op,
+vm function or `on raise` does. In an entry that never switches, the
+wrappers would be unreachable, but LLVM removes them only late, and on a
+large interpreter with `wraps all` its loop strength reduction took
+minutes over the IR they left behind.
 
 Unused opcode slots point at a trap handler (`@"Mini.invalid"` as implemented). Verified code can't
 reach it, so it exists only for defense in depth.

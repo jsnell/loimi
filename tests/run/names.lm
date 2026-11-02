@@ -1,0 +1,76 @@
+// matrix: dispatch
+// Namespaces (language.md §1.5): types, values and modules.
+//
+// - An imported object type `Arr` and the value variant `Arr(..)` of the
+//   same name coexist: `Arr` in type position is the type, in a call or
+//   pattern the variant.
+// - A function can have the name of an imported module: `parse(..)` is
+//   the function, `parse.x` the module's item.
+import std.io;
+import std.gc;
+import std.parse;
+import names_mod.value;
+import names_mod.value.{Arr, Str, Value};
+
+fn parse(s: str) -> i64 { value.parse(s) * 10 }
+
+fn first(v: Value) -> f64 {
+    match v {
+        Arr(a) => if let Num(x) = a.items[0] { x } else { -1.0 },
+        Str(_) => -2.0,
+        _ => -3.0,
+    }
+}
+
+fn wrap(h: *gc.Heap, x: f64) -> Value {
+    let arr: Gc<Arr> = new(h, Arr {}, 1);
+    arr.items[0] = Num(x);
+    Arr(arr)
+}
+
+struct Ctx { heap: gc.Heap }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    // The variant, in a handler, with the object type `Arr` imported.
+    op NEWARR(dst: reg, src: reg) : ABC {
+        let arr = new(&ctx.heap, Arr {}, 1);
+        arr.items[0] = src;
+        dst = Arr(arr);
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32, r: *Value) -> Value {
+        ctx = c;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    let v = wrap(&heap, 2.5);
+    io.print_f64(first(v)); io.println("");
+    let s = new(&heap, Str {}, 0);
+    io.print_f64(first(Str(s))); io.println("");
+    io.print_int(parse("abc")); io.println("");
+    // The module is still there behind the function.
+    let p = parse.Prec { left: 7, right: 8 };
+    io.print_int(p.left as i64); io.println("");
+
+    var c = Ctx { heap: gc.Heap.new() };
+    var regs: [Value; 2] = [Num(4.5), Nil];
+    var code: [u32; 2] = [M.NEWARR(1, 0), M.RET(1)];
+    io.print_f64(first(M.run(&c, &code[0], &regs[0]))); io.println("");
+}
+// expect: 2.5
+// expect: -2
+// expect: 30
+// expect: 7
+// expect: 4.5

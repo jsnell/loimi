@@ -1,0 +1,59 @@
+// Generated operand metadata (language.md §3.3): per op, each operand
+// field's kind, width and signedness, for fuzzers and assemblers.
+import std.io;
+
+vm M {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    op LOADK(dst: reg, c: kst) : AsBx { dst = c; next }
+    op ADDI(dst: reg, a: reg, v: imm) : ABC { dst = a + v as i64; next }
+    op JLT(a: reg, t: label) : AsBx { if a < 0 { jump t } next }
+    op NOP() : ABC { next }
+    op RET(a: reg) : ABC { exit a }
+    super ADDI_RET = ADDI; RET;
+    entry run(code: *u32, r: *i64, c: *i64) -> i64 { pc = code; regs = r; k = c; jump pc }
+}
+
+fn show(w: u32) {
+    io.print(M.op_name(w));
+    for i in 0..M.operand_count(w) {
+        let kd = M.operand_kind(w, i);
+        io.print(" ");
+        io.print(M.kind_name(kd));
+        io.print(":");
+        if M.operand_signed(w, i) { io.print("s"); }
+        io.print_int(M.operand_bits(w, i) as i64);
+        if M.kind_is_label(kd) { io.print("(label)"); }
+    }
+    io.println("");
+}
+
+fn main() {
+    io.print_int(M.NUM_KINDS as i64); io.println("");
+    show(M.LOADK(1, 2));
+    show(M.ADDI(1, 2, 3));
+    show(M.JLT(0, -4));
+    show(M.NOP());
+    // A super's head answers for its first part.
+    var code: [u32; 2] = [M.ADDI(0, 0, 1), M.RET(0)];
+    M.optimize(code[..]);
+    show(code[0]);
+    // Out of range: no kind.
+    io.println(M.kind_name(M.operand_kind(code[1], 5)));
+    io.print_int(M.operand_count(0xFF) as i64); io.println("");
+}
+// expect: 4
+// expect: LOADK reg:8 kst:s16
+// expect: ADDI reg:8 reg:8 imm:8
+// expect: JLT reg:8 label:s16(label)
+// expect: NOP
+// expect: ADDI_RET reg:8 reg:8 imm:8
+// expect: <none>
+// expect: 0

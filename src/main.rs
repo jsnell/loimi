@@ -252,7 +252,19 @@ fn parse_args() -> Result<Opts, String> {
     Ok(o)
 }
 
+/// The checker and code generator recurse over expressions; large
+/// programs (MiniJS) overflow the main thread's 8 MiB stack in debug
+/// builds. Run the compiler on a thread with a larger one.
 fn main() -> ExitCode {
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(compiler_main)
+        .expect("cannot start the compiler thread")
+        .join()
+        .unwrap_or(ExitCode::from(101))
+}
+
+fn compiler_main() -> ExitCode {
     let opts = match parse_args() {
         Ok(o) => o,
         Err(e) => {

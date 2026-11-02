@@ -54,11 +54,14 @@ sampling profiler attributes time per op. `loimi build --emit-llvm -o
 pip.ll` writes the LLVM IR, where a handler looks like this:
 
 ```text
-define internal preserve_nonecc { i1, {}, { ptr, i64 } } @"vm.Pip.op.ADDK"(ptr %p0, ptr %p1, ptr %p2, ptr %p3, ptr %p4, i32 %insn)
+define internal preserve_nonecc void @"vm.Pip.op.ADDK"(ptr %p0, ptr %p1, ptr %p2, ptr %p3, ptr %p4, i32 %insn)
 ```
 
 The parameters are the context, the four state variables and the
-instruction word; the return type is the entry's. Things to look for in
+instruction word. The entry's result, a `Result<(), str>`, does not
+come back in registers: `exit` stores it to a thread-local slot that
+the entry reads, so handlers return `void` (an entry returning a
+scalar such as an `i64` returns it directly). Things to look for in
 a hot handler's assembly:
 
 - **no stack frame** (`push`, `sub $..., %rsp`): a plain call on any
@@ -248,6 +251,13 @@ original instruction, and fusion needs no control-flow analysis.
     // anything. (The verifier checks supers too.)
     for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
 ```
+
+`Pip.optimize` goes left to right and fuses, at each instruction, the
+longest super that starts there. `SUBK_CALL` and `GETGLOBAL_SUBK` share
+the `SUBK`, so in `GETGLOBAL; SUBK; CALL` the first one wins and
+`SUBK_CALL` does not run there; the compiler says so with a
+`super_overlap` warning. Here both pairs are frequent on their own, so
+the declarations stay.
 
 Quickening and supers interact: `Pip.optimize` runs on generic code, so
 it sees `GETGLOBAL; SUBK`. When the GETGLOBAL part quickens, the super's

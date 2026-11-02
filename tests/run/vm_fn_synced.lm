@@ -1,0 +1,106 @@
+// matrix: dispatch
+// Plain vm functions sync effectful calls in place, as ops do: the call
+// in `gc_point`'s cold block runs the vm's `sync` block, and only when it
+// is made. A handler local that holds a reference across a call of such
+// a vm function is rooted (`keep` in GC, `t` in `collect_twice`).
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+value V repr nanbox { Num(f64) unboxed, Int(i32), S(Gc<Str>), Nil }
+
+struct Ctx { heap: gc.Heap, base: *V, top: *V, syncs: i64, force: bool }
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.base;
+    while p < c.top {
+        gc_mark(h, *p);
+        p = p + 1;
+    }
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    sync {
+        ctx.top = regs + 8;
+        ctx.syncs += 1;
+    }
+
+    // Collect if asked to. Without `uses gc`: the call is synced here.
+    fn gc_point() {
+        if ctx.force { cold { gc.collect(&ctx.heap); } }
+    }
+    // Reaches the collector through another vm function.
+    fn collect_twice() {
+        let t = regs[1];
+        regs[1] = Nil;
+        gc_point();
+        gc_point();
+        regs[1] = t;
+    }
+
+    op STR(dst: reg, ch: imm) : ABC {
+        gc_point();
+        let s = new(&ctx.heap, Str {}, 1);
+        s.data[0] = ch as u8;
+        dst = S(s);
+        next
+    }
+    op FORCE(on: imm) : ABC { ctx.force = on != 0; next }
+    op CLEAR(dst: reg) : ABC { dst = Nil; next }
+    op GC() : ABC {
+        let keep = regs[0];
+        regs[0] = Nil;
+        collect_twice();
+        regs[0] = keep;
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32) -> V {
+        ctx = c;
+        pc = code;
+        regs = c.base;
+        gc_point();      // in an entry: no sync
+        jump pc
+    }
+}
+
+fn main() {
+    var ctx = Ctx { heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V, syncs: 0, force: false };
+    var regs: [V; 8] = [V.Nil; 8];
+    ctx.base = &regs[0];
+    ctx.top = &regs[0];
+    ctx.heap.add_scanner(&ctx as *u8, scan);
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    at = M.emit.STR(c, at, 0, 'a');
+    at = M.emit.STR(c, at, 1, 'b');
+    at = M.emit.STR(c, at, 2, 'x');
+    at = M.emit.CLEAR(c, at, 2);        // "x" becomes garbage
+    at = M.emit.FORCE(c, at, 1);
+    at = M.emit.GC(c, at);              // two collections, two syncs
+    at = M.emit.STR(c, at, 2, 'c');     // a third
+    at = M.emit.RET(c, at, 0);
+    match M.run(&ctx, &code[0]) {
+        S(s) => io.println(s.data),
+        _ => io.println("?"),
+    }
+    match regs[1] {
+        S(s) => io.println(s.data),
+        _ => io.println("?"),
+    }
+    io.print_int(ctx.heap.freed as i64); io.println("");
+    io.print_int(ctx.syncs); io.println("");
+}
+// expect: a
+// expect: b
+// expect: 1
+// expect: 3

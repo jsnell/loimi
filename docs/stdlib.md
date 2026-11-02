@@ -14,6 +14,13 @@ Design rules for the library:
   freed in one go.
 - **Fast paths inline, slow paths `cold`, effects declared.** The library
   follows the same discipline it asks of users.
+- **Everything that owns memory can give it back.** As implemented, each
+  std type that holds heap memory has a `free()` method (`Vec`, `Arena`,
+  `HashMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`,
+  `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
+  `MegaCache`, `Ics`, `Model`), and `io.read_file`'s result is released
+  with `io.free_file`. Freeing a container does not free what its
+  elements point to.
 
 ---
 
@@ -403,6 +410,11 @@ a compare and the slot load (`bench/obj`). Details and what is left out:
 These are minimal: C interop types (`CStr`, `c_int`, ...), files, stdin and
 stdout, environment variables, clocks, `mmap`, and dynamic loading. Enough to
 build a REPL and a native-module system, and no more.
+
+*As implemented:* `std.io` has `print`, `println`, `print_int`,
+`print_f64`, `print_bool`, their stderr forms `eprint`, `eprintln`,
+`eprint_int`, `eprint_f64`, and `read_file` / `free_file`; `std.os` has
+the command line and `quit`. There is no `std.ffi`.
 
 ## `std.test`: interpreter testing
 

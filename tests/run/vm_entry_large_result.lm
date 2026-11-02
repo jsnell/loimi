@@ -1,0 +1,75 @@
+// matrix: dispatch
+// An entry whose result does not fit in registers (a Result of a struct
+// with a string and a line). In tail-call mode the handlers used to
+// return it directly, which LLVM could not compile as musttail calls.
+import std.io;
+
+struct Machine { limit: i64 }
+struct Fail { msg: str, line: u32 }
+
+vm Calc {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op CHECK(a: reg) : ABC {
+        if a > ctx.limit { raise a }
+        next
+    }
+    op RET(src: reg) : ABC { exit Ok(()) }
+    op BAD(src: reg) : ABC {
+        if src > 100 { cold { fail Fail { msg: "cold", line: src as u32 } } }
+        exit Err(Fail { msg: "bad", line: src as u32 })
+    }
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> Result<(), Fail> {
+        ctx = m;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+
+    on raise(e: i64) { exit Err(Fail { msg: "raised", line: e as u32 }) }
+}
+
+fn show(r: Result<(), Fail>) {
+    match r {
+        Ok(_) => io.println("ok"),
+        Err(f) => { io.print(f.msg); io.print(" "); io.print_int(f.line as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var m = Machine { limit: 10 };
+    var code: [u32; 32] = [0; 32];
+    var regs: [i64; 8] = [0; 8];
+    var at: u64 = 0;
+    at = Calc.emit.LOADI(code[..], at, 0, 4);
+    at = Calc.emit.ADD(code[..], at, 1, 0, 0);
+    at = Calc.emit.CHECK(code[..], at, 1);
+    at = Calc.emit.RET(code[..], at, 1);
+    show(Calc.run(&m, &code[0], &regs[0]));
+    m.limit = 5;
+    show(Calc.run(&m, &code[0], &regs[0]));
+    at = 0;
+    at = Calc.emit.LOADI(code[..], at, 0, 42);
+    at = Calc.emit.BAD(code[..], at, 0);
+    show(Calc.run(&m, &code[0], &regs[0]));
+    at = 0;
+    at = Calc.emit.LOADI(code[..], at, 0, 420);
+    at = Calc.emit.BAD(code[..], at, 0);
+    show(Calc.run(&m, &code[0], &regs[0]));
+}
+// expect: ok
+// expect: raised 8
+// expect: bad 42
+// expect: cold 420

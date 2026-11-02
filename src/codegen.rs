@@ -461,8 +461,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             None => f.body.as_ref().unwrap(),
         };
         let v = self.val(body);
+        let through_slot = crate::vmgen::returns_through_slot(p, f);
         if !self.terminated {
-            if f.ret.is_unitlike() {
+            if f.ret.is_unitlike() || through_slot {
                 self.term("ret void");
             } else {
                 let rt = self.ty(&f.ret);
@@ -500,7 +501,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             "define {}{}{} @\"{}\"({}) {} {{",
             linkage,
             cc_str(f.cc),
-            ret_llty(p, &f.ret),
+            if through_slot { "void".to_string() } else { ret_llty(p, &f.ret) },
             symbol,
             params.join(", "),
             attrs.join(" ")
@@ -1439,12 +1440,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
             _ => unreachable!(),
         };
         if matches!(op, Shl | Shr) {
+            // The amount is taken modulo the width, as an unsigned number
+            // of its own type, which may differ from the shifted value's:
+            // reduce it in the wider of the two, then fit it to `lt`.
             let Ty::Int(it) = t else { unreachable!() };
+            let Ty::Int(bt) = &b.ty else { unreachable!() };
+            let w = it.bits.max(bt.bits);
+            let wt = format!("i{}", w);
+            let yw = if bt.bits < w { self.inst(format!("zext i{} {} to {}", bt.bits, y, wt)) } else { y };
             let m = if it.bits.is_power_of_two() {
-                self.inst(format!("and {} {}, {}", lt, y, it.bits - 1))
+                self.inst(format!("and {} {}, {}", wt, yw, it.bits - 1))
             } else {
-                self.inst(format!("urem {} {}, {}", lt, y, it.bits))
+                self.inst(format!("urem {} {}, {}", wt, yw, it.bits))
             };
+            let m = if it.bits < w { self.inst(format!("trunc {} {} to {}", wt, m, lt)) } else { m };
             return self.inst(format!("{} {} {}, {}", ins, lt, x, m));
         }
         if let (Div | Rem, Ty::Int(it)) = (op, t) {

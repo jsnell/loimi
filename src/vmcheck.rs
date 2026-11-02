@@ -56,6 +56,9 @@ pub struct VmInfo {
     /// `-> never` vm functions, which may end in control words.
     pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
+    /// Calls between plain vm functions (caller, callee), to propagate
+    /// `sync_effects`.
+    pub fn_calls: Vec<(FnId, FnId)>,
 }
 
 /// An inline cache layout: per field its name, type and first word
@@ -103,6 +106,9 @@ pub struct HandlerCx {
     pub by_ptr: bool,
     /// In the body of a `-> never` vm function: no operands, `become` or `cache`.
     pub in_fn: bool,
+    /// In the body of plain vm function `f`: its effectful calls are synced
+    /// like a handler's, and their effects recorded in `sync_effects`.
+    pub vm_fn: Option<FnId>,
     /// Inside a `cold` block.
     pub cold: bool,
     /// The shared copy of `-> never` vm function `i`: `next` skips the
@@ -128,6 +134,7 @@ impl HandlerCx {
             state,
             by_ptr: false,
             in_fn: false,
+            vm_fn: None,
             cold: false,
             shared: None,
             inlining: vec![],
@@ -188,14 +195,65 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm_role: role,
         vm_state: vec![],
         effects: 0,
+        sync_effects: 0,
     });
     id
+}
+
+/// Lint `super_overlap`: two supers where a proper suffix of one is a
+/// proper prefix of the other (`GETGLOBAL; SUBK` and `SUBK; CALL`).
+/// `Vm.optimize` fuses left to right, so in `GETGLOBAL; SUBK; CALL` the
+/// first super takes the shared `SUBK` and the second never runs there.
+/// One warning per super, at the later declared of each pair, naming the
+/// earlier ones it overlaps.
+fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayout) {
+    let supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
+    let span_of = |k: usize| d.supers.iter().find(|s| s.name.name == l.ops[k].name).map(|s| s.name.span);
+    let names = |ps: &[usize]| ps.iter().map(|&p| l.ops[p].name.as_str()).collect::<Vec<_>>().join("; ");
+    // The sequence in which `x` then `y` both match, if they overlap that way.
+    let overlap = |x: usize, y: usize| -> Option<Vec<usize>> {
+        let (px, py) = (&l.ops[x].parts, &l.ops[y].parts);
+        let k = (1..px.len().min(py.len())).find(|&k| px[px.len() - k..] == py[..k])?;
+        let mut seq = px.clone();
+        seq.extend_from_slice(&py[k..]);
+        Some(seq)
+    };
+    for (bi, &b) in supers.iter().enumerate() {
+        let Some(sb) = span_of(b) else { continue };
+        let mut partners = Vec::new();
+        let mut example = None;
+        for &a in &supers[..bi] {
+            let found = overlap(a, b).map(|s| (a, b, s)).or_else(|| overlap(b, a).map(|s| (b, a, s)));
+            if let Some((x, y, seq)) = found {
+                partners.push(format!("`{}`", l.ops[a].name));
+                example.get_or_insert((x, y, seq, a));
+            }
+        }
+        let Some((x, y, seq, a)) = example else { continue };
+        let mut w = Diag::warning(
+            "super_overlap",
+            sb,
+            format!(
+                "superinstruction `{}` overlaps {}: in `{}`, `optimize` fuses `{}` and `{}` cannot run there (the first super that matches, left to right, wins)",
+                l.ops[b].name,
+                partners.join(", "),
+                names(&seq),
+                l.ops[x].name,
+                l.ops[y].name
+            ),
+        );
+        if let Some(sa) = span_of(a) {
+            w = w.note(sa, format!("`{}` is declared here", l.ops[a].name));
+        }
+        c.warnings.push(w);
+    }
 }
 
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
     let mut l = crate::vmexpand::layout(&d)?;
+    warn_super_overlaps(c, &d, &l);
     let prefix = format!("{}.{}", c.module_prefix(m), d.name.name);
     let word = IntTy { signed: false, bits: l.word_bits as u8 };
 
@@ -411,10 +469,10 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         }
         let fid = new_fn(c, format!("{}.{}", prefix, e.name.name), e.name.name.clone(), pt, ret.clone(), CallConv::C, vm, VmRole::Entry, e.name.span);
         let gname = Ident { name: format!("{}__{}", d.name.name, e.name.name), span: e.name.span };
-        if c.scopes[m].contains_key(&gname.name) {
+        if c.scopes[m].contains_key(&gname.name) || c.values[m].contains_key(&gname.name) {
             return Err(Diag::new(e.name.span, format!("`{}` clashes with a generated vm item", e.name.name)));
         }
-        c.scopes[m].insert(gname.name, (Def::Fn(fid), d.is_pub));
+        c.define(m, &gname, Def::Fn(fid), d.is_pub)?;
         entries.push((fid, e.clone()));
     }
     let raise_fid = match &d.on_raise {
@@ -474,11 +532,27 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         fn_caches,
         never_fns,
         sync: d.sync.clone(),
+        fn_calls: vec![],
     });
 
     // Bodies.
     for (fid, f) in fn_decls {
         check_vm_fn(c, vm, fid, &f)?;
+    }
+    // A vm function calling one whose calls are synced has those effects
+    // too (for rooting at its own call sites).
+    loop {
+        let mut changed = false;
+        for &(caller, callee) in &c.vms[i].fn_calls {
+            let e = c.prog.fns[callee as usize].sync_effects & !c.prog.fns[caller as usize].effects;
+            if e & !c.prog.fns[caller as usize].sync_effects != 0 {
+                c.prog.fns[caller as usize].sync_effects |= e;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
     for j in 0..c.vms[i].never_fns.len() {
         check_never_fn(c, vm, j)?;
@@ -758,7 +832,14 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     for (k, (p, t)) in f.params.iter().zip(pts[st.len()..].iter()).enumerate() {
         params.push(declare_param(&mut cx, &p.name.name, t, pcaches[k], &mut cache_params));
     }
-    cx.vm = Some(HandlerCx { is_handler: false, allow_control: false, by_ptr: true, cache_params, ..HandlerCx::new(vm, state.clone()) });
+    cx.vm = Some(HandlerCx {
+        is_handler: false,
+        allow_control: false,
+        by_ptr: true,
+        vm_fn: Some(fid),
+        cache_params,
+        ..HandlerCx::new(vm, state.clone())
+    });
     let b = c.block(&mut cx, f.body.as_ref().unwrap(), Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let fd = &mut c.prog.fns[fid as usize];
@@ -1251,6 +1332,9 @@ pub fn vm_fn_call(c: &mut Checker, cx: &mut FnCx, name: &str, args: &[Expr], spa
     }
     let Some(fid) = vm_fn(c, cx, name) else { return Ok(None) };
     let h = cx.vm.clone().unwrap();
+    if let Some(caller) = h.vm_fn {
+        c.vms[h.vm as usize].fn_calls.push((caller, fid));
+    }
     let info = &c.vms[h.vm as usize];
     let mut pre = Vec::new();
     for (i, (_, t)) in info.state.iter().enumerate() {
@@ -1373,7 +1457,15 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     }
     let span = call.span;
     if let Some(h) = cx.vm.clone() {
-        if h.allow_control && h.is_handler {
+        // A plain vm function is inlined into vm code, and sees the
+        // caller's state through pointers: its effectful calls are synced
+        // in place, as in an op, so that only the path that makes the call
+        // pays. Its callers root their traced locals (`sync_effects`).
+        let in_vm_fn = h.vm_fn.is_some() && h.by_ptr;
+        if (h.allow_control && h.is_handler) || in_vm_fn {
+            if let Some(fid) = h.vm_fn {
+                c.prog.fns[fid as usize].sync_effects |= missing;
+            }
             let sync = match c.vms[h.vm as usize].sync.clone() {
                 Some(b) => c.block(cx, &b, Some(&Ty::Unit))?,
                 None => mk(Ty::Unit, TK::Unit, span),

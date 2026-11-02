@@ -419,3 +419,41 @@ fn tutorial_steps() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
+
+/// `variant .. wraps all` in goto mode: the tutorial's step 9 with every
+/// op wrapped used to take minutes in clang (entries that never switch
+/// tables carried every wrapper block, and LLVM's loop strength
+/// reduction blew up on them). It must build in well under a minute.
+#[test]
+fn variant_wraps_all_goto_build_time() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("loimi-wraps-all-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for e in std::fs::read_dir(root.join("examples/tutorial/step9")).unwrap().filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "lm") {
+            let mut text = std::fs::read_to_string(&p).unwrap();
+            if let Some(a) = text.find("variant budget wraps [") {
+                let b = a + text[a..].find("] {").expect("end of the wraps list") + 3;
+                text.replace_range(a..b, "variant budget wraps all {");
+            }
+            std::fs::write(dir.join(p.file_name().unwrap()), text).unwrap();
+        }
+    }
+    let vm = std::fs::read_to_string(dir.join("vm.lm")).unwrap();
+    assert!(vm.contains("variant budget wraps all {"), "step 9 has no `variant budget wraps [..]`");
+    let start = std::time::Instant::now();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v {} && exec timeout 300 \"$0\" \"$@\"", MEM_LIMIT_KB))
+        .arg(env!("CARGO_BIN_EXE_loimi"))
+        .args(["build", "main.lm", "--dispatch=goto", "-o", "pip"])
+        .current_dir(&dir)
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    let took = start.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "build failed after {:?}:\n{}", took, String::from_utf8_lossy(&out.stderr));
+    assert!(took.as_secs() < 60, "building step 9 with `wraps all` in goto mode took {:?}", took);
+}

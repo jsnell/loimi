@@ -1,0 +1,41 @@
+// Every std type that owns heap memory can release it: Interner, the
+// lexer's tables, files from io.read_file. Also io.eprint_int and
+// io.eprint_f64.
+// expect-stderr: -42 2.5
+import std.io;
+import std.lex;
+import std.text;
+
+enum K { Plus, Minus, If }
+
+fn main() {
+    var names = text.Interner.new();
+    let a = names.intern("alpha");
+    let b = names.intern("beta");
+    io.print_bool(names.intern("alpha") == a and a != b); io.println("");
+    io.println(names.name(b));
+    names.free();
+
+    var ops: lex.OpTable<K> = lex.OpTable.new();
+    ops.add("+", K.Plus);
+    ops.add("-", K.Minus);
+    var kws: lex.Keywords<K> = lex.Keywords.new();
+    kws.add("if", K.If);
+    var c = lex.Cursor.new("if + -", 0, lex.c_like());
+    let word = c.ident() ?? "";
+    io.print_bool(kws.get(word) == Some(K.If)); io.println("");
+    ops.free();
+    kws.free();
+
+    let me = io.read_file("tests/run/std_free.lm").unwrap();
+    io.println(me[0..7]);
+    io.free_file(me);
+
+    io.eprint_int(-42); io.eprint(" "); io.eprint_f64(2.5); io.eprintln("");
+    io.print_int(-7); io.print(" "); io.print_f64(0.1); io.println("");
+}
+// expect: true
+// expect: beta
+// expect: true
+// expect: // Ever
+// expect: -7 0.1

@@ -21,7 +21,14 @@ pub fn eprintln(s: str) {
     write(2, "\n".ptr, 1);
 }
 
-pub fn print_int(x: i64) {
+pub fn print_int(x: i64) { write_int(1, x); }
+pub fn print_f64(x: f64) { write_f64(1, x); }
+
+/// `print_int` and `print_f64` on stderr.
+pub fn eprint_int(x: i64) { write_int(2, x); }
+pub fn eprint_f64(x: f64) { write_f64(2, x); }
+
+fn write_int(fd: i32, x: i64) {
     var buf: [u8; 24];
     var i: u64 = 24;
     var u: u64 = if x < 0 { 0 -% (x as u64) } else { x as u64 };
@@ -35,13 +42,13 @@ pub fn print_int(x: i64) {
         i -= 1;
         buf[i] = '-';
     }
-    print(buf[i..24]);
+    write(fd, &buf[i], 24 - i);
 }
 
-pub fn print_f64(x: f64) {
+fn write_f64(fd: i32, x: f64) {
     var buf: [u8; 64];
     let n = snprintf(&buf[0], 64, "%.14g\0".ptr, x);
-    print(buf[0..n as u64]);
+    write(fd, &buf[0], n as u64);
 }
 
 pub fn print_bool(b: bool) {
@@ -57,7 +64,8 @@ extern "C" fn malloc(n: u64) -> *u8;
 extern "C" fn free(p: *u8);
 extern "C" fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
 
-/// Read a whole file. The returned string is heap-allocated.
+/// Read a whole file. The returned string is heap-allocated: release it
+/// with `free_file`.
 pub fn read_file(path: str) -> ?str {
     let cpath = malloc(path.len + 1);
     memcpy(cpath, path.ptr, path.len);
@@ -74,3 +82,6 @@ pub fn read_file(path: str) -> ?str {
     fclose(f);
     Some(buf.slice(got))
 }
+
+/// Release a string returned by `read_file`.
+pub fn free_file(s: str) { free(s.ptr); }
