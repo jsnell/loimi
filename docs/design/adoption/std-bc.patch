@@ -1,0 +1,712 @@
+--- a/examples/mini/compile.lm
++++ b/examples/mini/compile.lm
+@@ -9,6 +9,7 @@
+ import std.os;
+ import std.hash;
+ import std.map;
++import std.bc;
+ import value;
+ import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs};
+ import vm.{Mini};
+@@ -225,12 +226,10 @@
+ 
+ struct FuncState {
+     parent: ?*FuncState,
+-    code: mem.Vec<u32>,
+-    consts: mem.Vec<V>,
++    code: bc.Code<u32>,
++    consts: bc.Pool<V>,
+     locals: mem.Vec<Local>,
+-    nactive: u32,
+-    freereg: u32,
+-    maxreg: u32,
++    regs: bc.Regs,
+     nparams: u32,
+     name: str,
+     /// Pending `break` jumps of the enclosing loops.
+@@ -238,7 +237,6 @@
+     loop_depth: u32,
+     /// First register of the innermost loop's variables (closed by `break`).
+     loop_level: u32,
+-    lines: mem.Vec<u32>,
+     upvals: mem.Vec<UpDesc>,
+     /// Child prototypes. (The compiler never collects, so a plain Vec is fine.)
+     protos: mem.Vec<Gc<Proto>>,
+@@ -274,8 +272,6 @@
+     tok: Token,
+     heap: *gc.Heap,
+     fs: *FuncState,
+-    /// String constants interned across all functions of the chunk.
+-    strings: map.HashMap<str, V>,
+     /// Line of the last consumed token (recorded for each instruction).
+     line: u32,
+ }
+@@ -356,48 +352,32 @@
+     false
+ }
+ 
+-fn Parser.emit(p: *Parser, w: u32) -> u64 {
+-    p.fs.code.push(w);
+-    p.fs.lines.push(p.line);
+-    p.fs.code.len - 1
++/// Emit an instruction (and its inline-cache words) on line `line`.
++fn Parser.emit_line(p: *Parser, w: u32, line: u32) -> u64 {
++    p.fs.code.set_loc(line);
++    p.fs.code.op(w)
+ }
+ 
+-fn Parser.pc(p: *Parser) -> u64 { p.fs.code.len }
++fn Parser.emit(p: *Parser, w: u32) -> u64 { p.emit_line(w, p.line) }
++
++fn Parser.pc(p: *Parser) -> u64 { p.fs.code.pc() }
++
++const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
++const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
++
++/// Set the offset of jump word `w` (JMP's 24-bit field, or the 16-bit one).
++fn patch_jump(w: u32, off: i64) -> ?u32 {
++    if Mini.opcode(w) == Mini.OP_JMP { SJ.set32(w, off) } else { SBX.set32(w, off) }
++}
+ 
+ /// Point the jump at `at` to `target`.
+ fn Parser.patch(p: *Parser, at: u64, target: u64) {
+-    let w = p.fs.code.at(at);
+-    let off = target as i64 - at as i64;
+-    let op = Mini.opcode(w);
+-    if op == Mini.OP_JMP {
+-        p.fs.code.set(at, Mini.JMP(off as i32));
+-    } else {
+-        if off < -32768 or off > 32767 { fail(p.tok.line, "control structure too long"); }
+-        p.fs.code.set(at, (w & 0xFFFF) | (((off as i32) as u32 & 0xFFFF) << 16));
+-    }
++    if !p.fs.code.patch(at, target) { fail(p.tok.line, "control structure too long"); }
+ }
+ 
++/// Strings are interned, so equal constants have equal bits.
+ fn Parser.constant(p: *Parser, v: V) -> u32 {
+-    // One string object per distinct string, across the whole chunk.
+-    var v = v;
+-    if let S(s) = v {
+-        match p.strings.get(s.data) {
+-            Some(existing) => v = existing,
+-            None => { p.strings.insert(s.data, v); }
+-        }
+-    }
+-    let fs = p.fs;
+-    for i in 0..fs.consts.len {
+-        let c = fs.consts.at(i);
+-        let same = match (c, v) {
+-            (S(a), S(b)) => a.data.eq(b.data),
+-            _ => c == v,
+-        };
+-        if same { return i as u32; }
+-    }
+-    if fs.consts.len >= 65535 { fail(p.tok.line, "too many constants"); }
+-    fs.consts.push(v);
+-    (fs.consts.len - 1) as u32
++    p.fs.consts.add(v) ?? fail(p.tok.line, "too many constants")
+ }
+ 
+ fn Parser.name_const(p: *Parser, s: str) -> u32 {
+@@ -436,18 +416,11 @@
+ }
+ 
+ fn Parser.reserve(p: *Parser, n: u32) -> u32 {
+-    let r = p.fs.freereg;
+-    p.fs.freereg += n;
+-    if p.fs.freereg > p.fs.maxreg { p.fs.maxreg = p.fs.freereg; }
+-    if p.fs.freereg > 250 { fail(p.tok.line, "function or expression needs too many registers"); }
+-    r
++    p.fs.regs.try_alloc(n) ?? fail(p.tok.line, "function or expression needs too many registers")
+ }
+ 
+ fn Parser.free_reg(p: *Parser, r: u32) {
+-    if r >= p.fs.nactive {
+-        p.fs.freereg -= 1;
+-        if r != p.fs.freereg { fail(p.tok.line, "internal error: register freed out of order"); }
+-    }
++    if !p.fs.regs.free(r) { fail(p.tok.line, "internal error: register freed out of order"); }
+ }
+ 
+ fn Parser.free_exp(p: *Parser, e: E) {
+@@ -478,11 +451,9 @@
+         Upval(i) => { p.emit(Mini.GETUPVAL(d, i as u8)); }
+         Global(k) => {
+             p.emit(Mini.GETGLOBAL(d, k as u16));
+-            p.emit(0);   // inline cache word
+         }
+         Field(t, k) => {
+             p.emit(Mini.GETFIELD(d, t as u8, k as u8));
+-            p.emit(0);   // inline cache word
+         }
+         Index(t, k) => { p.emit(Mini.GETINDEX(d, t as u8, k as u8)); }
+         IndexI(t, i) => { p.emit(Mini.GETINDEXI(d, t as u8, i as u8)); }
+@@ -534,7 +505,6 @@
+         Field(t, k) => {
+             let v = p.any_reg(v);
+             p.emit(Mini.SETFIELD(t as u8, k as u8, reg_of(v) as u8));
+-            p.emit(0);   // inline cache word
+         }
+         Index(t, k) => {
+             if let Some(c) = p.kindex(v, true) {
+@@ -628,7 +598,7 @@
+         _ => fail(p.tok.line, "function arguments expected"),
+     }
+     let at = p.emit(Mini.CALL(base as u8, nargs as u8, 1));
+-    p.fs.freereg = base + 1;
++    p.fs.regs.top = base + 1;
+     E.Call(base, at)
+ }
+ 
+@@ -667,8 +637,7 @@
+                 let k = p.name_const(name.text);
+                 if k <= 255 {
+                     p.emit(Mini.SELF(base as u8, reg_of(obj) as u8, k as u8));
+-                    p.emit(0);   // inline cache word
+-                } else {
++                        } else {
+                     p.emit(Mini.MOVE((base + 1) as u8, reg_of(obj) as u8));
+                     p.emit(Mini.LOADK(base as u8, k as u16));
+                     p.emit(Mini.GETINDEX(base as u8, (base + 1) as u8, base as u8));
+@@ -705,13 +674,12 @@
+             let vr = p.any_reg(v);
+             if k <= 255 {
+                 p.emit(Mini.SETFIELD(t as u8, k as u8, reg_of(vr) as u8));
+-                p.emit(0);   // inline cache word
+-            } else {
++                } else {
+                 let kr = p.reserve(1);
+                 p.emit(Mini.LOADK(kr as u8, k as u16));
+                 p.emit(Mini.SETINDEX(t as u8, kr as u8, reg_of(vr) as u8));
+             }
+-            p.fs.freereg = t + 1 + pending;
++            p.fs.regs.top = t + 1 + pending;
+             nhash += 1;
+         } else if p.tok.kind == T.LBracket {
+             p.advance();
+@@ -722,7 +690,7 @@
+             let v = p.expr();
+             let vr = p.any_reg(v);
+             p.emit(Mini.SETINDEX(t as u8, reg_of(kr) as u8, reg_of(vr) as u8));
+-            p.fs.freereg = t + 1 + pending;
++            p.fs.regs.top = t + 1 + pending;
+             nhash += 1;
+         } else {
+             let e = p.expr();
+@@ -748,7 +716,7 @@
+ fn Parser.flush_list(p: *Parser, t: u32, n: u32, batch: u32) {
+     if batch > 255 { fail(p.tok.line, "table constructor too long"); }
+     p.emit(Mini.SETLIST(t as u8, n as u8, batch as u8));
+-    p.fs.freereg = t + 1;
++    p.fs.regs.top = t + 1;
+ }
+ 
+ fn Parser.simple(p: *Parser) -> E {
+@@ -904,7 +872,7 @@
+     let k = match e {
+         I(i) => p.constant(V.Int(i)),
+         K(k) => {
+-            let v = p.fs.consts.at(k as u64);
++            let v = p.fs.consts.get(k);
+             let num = match v { Int(_) | Num(_) => true, _ => false };
+             if !any and !num { return None; }
+             k
+@@ -983,7 +951,7 @@
+ /// the free register, adjusted to exactly `nvars` values. Only a call in
+ /// the last position can produce several values.
+ fn Parser.explist_to(p: *Parser, nvars: u32) {
+-    let start = p.fs.freereg;
++    let start = p.fs.regs.top;
+     var n: u32 = 1;
+     var e = p.expr();
+     while p.accept(T.Comma) {
+@@ -1005,7 +973,7 @@
+         p.emit(Mini.LOADNIL(r as u8));
+         n += 1;
+     }
+-    p.fs.freereg = start + nvars;
++    p.fs.regs.top = start + nvars;
+ }
+ 
+ // ── statements ──────────────────────────────────────────────────────
+@@ -1015,7 +983,7 @@
+ }
+ 
+ fn Parser.enter_block(p: *Parser) {
+-    p.fs.blocks.push(Block { first_local: p.fs.locals.len, nactive: p.fs.nactive, upval: false });
++    p.fs.blocks.push(Block { first_local: p.fs.locals.len, nactive: p.fs.regs.nactive, upval: false });
+ }
+ 
+ fn Parser.leave_block(p: *Parser) {
+@@ -1023,8 +991,7 @@
+     // The function's outermost block needs no CLOSE: returning closes.
+     if b.upval and p.fs.blocks.len > 0 { p.emit(Mini.CLOSE(b.nactive as u8)); }
+     p.fs.locals.truncate(b.first_local);
+-    p.fs.nactive = b.nactive;
+-    p.fs.freereg = b.nactive;
++    p.fs.regs.leave(b.nactive);
+ }
+ 
+ fn Parser.statlist(p: *Parser) {
+@@ -1045,8 +1012,7 @@
+ 
+ fn Parser.add_local(p: *Parser, name: str, r: u32) {
+     p.fs.locals.push(Local { name: name, reg: r });
+-    p.fs.nactive = r + 1;
+-    if p.fs.freereg < p.fs.nactive { p.fs.freereg = p.fs.nactive; }
++    p.fs.regs.activate(r + 1 - p.fs.regs.nactive);
+ }
+ 
+ // Conditions of if, while and repeat compile to jumps, as in Lua: each
+@@ -1068,10 +1034,9 @@
+     if let Reloc(at) = e and at + 1 == p.pc() and Mini.opcode(p.fs.code.at(at)) == Mini.OP_NOT {
+         src = (p.fs.code.at(at) >> 16) & 255;
+         p.fs.code.truncate(at);
+-        p.fs.lines.truncate(at);
+         when = !when;
+         // `a ~= b` is EQ into a temporary, then NOT.
+-        if at > 0 and jump_op(Mini.opcode(p.fs.code.at(at - 1))) != 0 and ((p.fs.code.at(at - 1) >> 8) & 255) == src and src >= p.fs.nactive {
++        if at > 0 and jump_op(Mini.opcode(p.fs.code.at(at - 1))) != 0 and ((p.fs.code.at(at - 1) >> 8) & 255) == src and src >= p.fs.regs.nactive {
+             e = E.Reloc(at - 1);
+         } else {
+             return Some(p.emit(Mini.TESTT(src as u8, 0)));
+@@ -1112,8 +1077,8 @@
+ }
+ 
+ fn Parser.patch_list(p: *Parser, l: *mem.Vec<u64>, target: u64) {
+-    for i in 0..l.len { p.patch(l.at(i), target); }
+-    l.clear();
++    p.fs.code.patch_list(l, target);
++    if p.fs.code.check().is_some() { fail(p.tok.line, "control structure too long"); }
+ }
+ 
+ /// `a and b and ...`: falls through when all are true; returns the jumps
+@@ -1169,7 +1134,7 @@
+ fn Parser.loop_enter(p: *Parser) -> LoopSave {
+     let s = LoopSave { depth: p.fs.loop_depth, level: p.fs.loop_level, breaks: p.fs.breaks.len };
+     p.fs.loop_depth += 1;
+-    p.fs.loop_level = p.fs.nactive;
++    p.fs.loop_level = p.fs.regs.nactive;
+     s
+ }
+ 
+@@ -1220,7 +1185,7 @@
+ 
+ fn Parser.statement(p: *Parser) {
+     p.statement_inner();
+-    p.fs.freereg = p.fs.nactive;
++    p.fs.regs.end_stmt();
+ }
+ 
+ fn Parser.statement_inner(p: *Parser) {
+@@ -1244,7 +1209,7 @@
+                 p.check(T.Name, "local name");
+                 if !p.accept(T.Comma) { break; }
+             }
+-            let base = p.fs.freereg;
++            let base = p.fs.regs.top;
+             let n = names.len as u32;
+             if p.accept(T.Assign) {
+                 p.explist_to(n);
+@@ -1422,7 +1387,7 @@
+                 targets.push(t);
+             }
+             p.check(T.Assign, "'='");
+-            let base = p.fs.freereg;
++            let base = p.fs.regs.top;
+             let n = targets.len as u32;
+             p.explist_to(n);
+             var i = n;
+@@ -1439,7 +1404,7 @@
+     p.check(T.Assign, "'='");
+     let saved = p.loop_enter();
+     p.enter_block();
+-    let base = p.fs.freereg;
++    let base = p.fs.regs.top;
+     let a = p.expr();
+     p.to_next_reg(a);
+     p.check(T.Comma, "','");
+@@ -1456,8 +1421,7 @@
+     p.add_local("(for index)", base);
+     p.add_local("(for limit)", base + 1);
+     p.add_local("(for step)", base + 2);
+-    let prep = p.emit(Mini.FORPREP(base as u8, 0));
+-    p.fs.lines.set(prep, line);
++    let prep = p.emit_line(Mini.FORPREP(base as u8, 0), line);
+     p.enter_block();
+     p.reserve(1);
+     p.add_local(name, base + 3);
+@@ -1487,7 +1451,7 @@
+     p.check(T.LParen, "'('");
+     let saved = p.loop_enter();
+     p.enter_block();
+-    let base = p.fs.freereg;
++    let base = p.fs.regs.top;
+     let e = p.expr();
+     p.to_next_reg(e);
+     p.check(T.RParen, "')'");
+@@ -1506,8 +1470,7 @@
+     p.leave_block();
+     p.check(T.End, "'end'");
+     p.patch(j, p.pc());
+-    let at = if is_pairs { p.emit(Mini.NEXT(base as u8, 0)) } else { p.emit(Mini.INEXT(base as u8, 0)) };
+-    p.fs.lines.set(at, line);
++    let at = p.emit_line(if is_pairs { Mini.NEXT(base as u8, 0) } else { Mini.INEXT(base as u8, 0) }, line);
+     p.patch(at, body);
+     p.leave_block();
+     p.loop_exit(saved);
+@@ -1516,18 +1479,15 @@
+ fn FuncState.new(name: str, parent: ?*FuncState) -> FuncState {
+     FuncState {
+         parent: parent,
+-        code: mem.Vec.new(),
+-        consts: mem.Vec.new(),
++        code: bc.Code.new(Mini.op_size, patch_jump),
++        consts: bc.Pool.new(65535),
+         locals: mem.Vec.new(),
+-        nactive: 0,
+-        freereg: 0,
+-        maxreg: 0,
++        regs: bc.Regs.new(250),
+         nparams: 0,
+         name: name,
+         breaks: mem.Vec.new(),
+         loop_depth: 0,
+         loop_level: 0,
+-        lines: mem.Vec.new(),
+         upvals: mem.Vec.new(),
+         protos: mem.Vec.new(),
+         blocks: mem.Vec.new(),
+@@ -1537,11 +1497,10 @@
+ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
+     p.emit(Mini.RET0());
+     let h = p.heap;
+-    let consts = value.new_arr(h, fs.consts.len);
+-    for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
+-    let nregs = if fs.maxreg == 0 { 1 } else { fs.maxreg };
+-    let lines = new(h, Lines {}, fs.lines.len);
+-    for i in 0..fs.lines.len { lines.data[i] = fs.lines.at(i); }
++    let consts = value.new_arr(h, fs.consts.len());
++    for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
++    let lines = new(h, Lines {}, fs.code.len());
++    fs.code.locs_into(lines.data);
+     let protos = new(h, Protos {}, fs.protos.len);
+     for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
+     let updesc = new(h, UpDescs {}, fs.upvals.len);
+@@ -1552,14 +1511,14 @@
+     let proto = new(h, Proto {
+         name: value.new_str(h, fs.name),
+         nparams: fs.nparams,
+-        nregs: nregs,
++        nregs: fs.regs.frame_size(1),
+         nupvals: fs.upvals.len as u32,
+         consts: consts,
+         lines: lines,
+         protos: protos,
+         updesc: updesc,
+-    }, fs.code.len);
+-    for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
++    }, fs.code.len());
++    fs.code.copy_into(proto.code);
+     if let Some(bad) = Mini.verify(proto.code, proto) {
+         var b = text.StrBuf.new();
+         b.push_str("internal error: generated code fails verification at instruction ");
+@@ -1571,7 +1530,6 @@
+     fs.consts.free();
+     fs.locals.free();
+     fs.breaks.free();
+-    fs.lines.free();
+     fs.upvals.free();
+     fs.protos.free();
+     fs.blocks.free();
+@@ -1619,7 +1577,6 @@
+         tok: Token { kind: T.Eof, text: "", line: 1, num: V.Nil },
+         heap: h,
+         fs: &fs,
+-        strings: map.HashMap.new(),
+         line: 1,
+     };
+     p.advance();
+--- a/examples/mini/value.lm
++++ b/examples/mini/value.lm
+@@ -522,3 +522,9 @@
+     b.push_str(prefix);
+     b.push_str(buf[0..n]);
+ }
++
++/// Constant-pool keys (std.bc): by bits, so 0.0, -0.0 and 0 stay apart
++/// and interned strings compare by identity.
++pub fn V.hash(v: V) -> u64 { hash.mix(v as u64) }
++pub fn V.eq(a: V, b: V) -> bool { a == b }
++impl hash.Hash for V;
+--- a/examples/scheme/compile.lm
++++ b/examples/scheme/compile.lm
+@@ -22,6 +22,7 @@
+ import std.gc;
+ import std.map;
+ import std.hash;
++import std.bc;
+ import value;
+ import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
+ import rt.{Ctx};
+@@ -1072,12 +1073,10 @@
+ 
+ struct FS {
+     lam: *Lam,
+-    code: mem.Vec<u32>,
+-    lines: mem.Vec<u32>,
+-    consts: mem.Vec<V>,
++    code: bc.Code<u32>,
++    consts: bc.Pool<V>,
+     protos: mem.Vec<Gc<Proto> >,
+-    freereg: u32,
+-    maxreg: u32,
++    regs: bc.Regs,
+     line: u32,
+ }
+ 
+@@ -1086,52 +1085,39 @@
+ fn FS.new(l: *Lam) -> FS {
+     FS {
+         lam: l,
+-        code: mem.Vec.new(),
+-        lines: mem.Vec.new(),
+-        consts: mem.Vec.new(),
++        code: bc.Code.new(Scheme.op_size, patch_jump),
++        consts: bc.Pool.new(65535),
+         protos: mem.Vec.new(),
+-        freereg: 0,
+-        maxreg: 0,
++        regs: bc.Regs.new(250),
+         line: 0,
+     }
+ }
+ 
+ fn Gen.emit(g: *Gen, w: u32) -> u64 {
+-    g.fs.code.push(w);
+-    g.fs.lines.push(g.fs.line);
+-    g.fs.code.len - 1
++    g.fs.code.set_loc(g.fs.line);
++    g.fs.code.op(w)
+ }
+ 
+-fn Gen.pc(g: *Gen) -> u64 { g.fs.code.len }
++fn Gen.pc(g: *Gen) -> u64 { g.fs.code.pc() }
+ 
+ fn Gen.alloc(g: *Gen) -> u32 {
+-    let r = g.fs.freereg;
+-    g.fs.freereg += 1;
+-    if g.fs.freereg > g.fs.maxreg { g.fs.maxreg = g.fs.freereg; }
+-    if g.fs.freereg > 250 { fail(g.fs.line, "procedure needs too many registers"); }
+-    r
++    g.fs.regs.try_alloc(1) ?? fail(g.fs.line, "procedure needs too many registers")
++}
++
++const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
++const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
++
++fn patch_jump(w: u32, off: i64) -> ?u32 {
++    if Scheme.opcode(w) == Scheme.OP_JMP { SJ.set32(w, off) } else { SBX.set32(w, off) }
+ }
+ 
+ /// Point the jump at `at` to `target`.
+ fn Gen.patch(g: *Gen, at: u64, target: u64) {
+-    let w = g.fs.code.at(at);
+-    let off = target as i64 - at as i64;
+-    if Scheme.opcode(w) == Scheme.OP_JMP {
+-        g.fs.code.set(at, Scheme.JMP(off as i32));
+-    } else {
+-        if off < -32768 or off > 32767 { fail(g.fs.line, "procedure too long"); }
+-        g.fs.code.set(at, (w & 0xFFFF) | (((off as i32) as u32 & 0xFFFF) << 16));
+-    }
++    if !g.fs.code.patch(at, target) { fail(g.fs.line, "procedure too long"); }
+ }
+ 
+ fn Gen.constant(g: *Gen, v: V) -> u32 {
+-    let fs = g.fs;
+-    for i in 0..fs.consts.len {
+-        if fs.consts.at(i) == v { return i as u32; }
+-    }
+-    if fs.consts.len >= 65535 { fail(fs.line, "too many constants"); }
+-    fs.consts.push(v);
+-    (fs.consts.len - 1) as u32
++    g.fs.consts.add(v) ?? fail(g.fs.line, "too many constants")
+ }
+ 
+ fn Gen.load_const(g: *Gen, v: V, dst: u32) {
+@@ -1169,7 +1155,7 @@
+ /// Emit code leaving the value of `n` in register `dst`.
+ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
+     let saved_line = g.set_line(n);
+-    let save = g.fs.freereg;
++    let save = g.fs.regs.top;
+     let d = dst as u8;
+     match n.kind {
+         Const => g.load_const(n.v, dst),
+@@ -1224,14 +1210,14 @@
+             jumps.free();
+         }
+     }
+-    g.fs.freereg = save;
++    g.fs.regs.top = save;
+     g.fs.line = saved_line;
+ }
+ 
+ /// Evaluate `n` for its effects only.
+ fn Gen.effect(g: *Gen, n: *Node) {
+     let saved_line = g.set_line(n);
+-    let save = g.fs.freereg;
++    let save = g.fs.regs.top;
+     match n.kind {
+         Const | Ref | GRef | Lambda => {}
+         Set => {
+@@ -1297,14 +1283,14 @@
+             g.to(n, r);
+         }
+     }
+-    g.fs.freereg = save;
++    g.fs.regs.top = save;
+     g.fs.line = saved_line;
+ }
+ 
+ /// Return the value of `n` from the current procedure.
+ fn Gen.tail(g: *Gen, n: *Node) {
+     let saved_line = g.set_line(n);
+-    let save = g.fs.freereg;
++    let save = g.fs.regs.top;
+     match n.kind {
+         If => {
+             let j = g.cond(n.a);
+@@ -1323,7 +1309,7 @@
+             g.tail(n.list.at(n.list.len - 1));
+         }
+         Call => {
+-            let r = g.fs.freereg;
++            let r = g.fs.regs.top;
+             g.call(n, r, true);
+         }
+         Let => { g.bind_let(n); g.tail(n.a); }
+@@ -1346,7 +1332,7 @@
+             g.emit(Scheme.RET(r as u8));
+         }
+     }
+-    g.fs.freereg = save;
++    g.fs.regs.top = save;
+     g.fs.line = saved_line;
+ }
+ 
+@@ -1361,7 +1347,7 @@
+ 
+ fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
+     let saved_line = g.set_line(n);
+-    let save = g.fs.freereg;
++    let save = g.fs.regs.top;
+     if n.kind == K.And {
+         for i in 0..n.list.len { g.cond_into(n.list.at(i), js); }
+     } else if n.kind == K.Prim and n.po == PO.Not {
+@@ -1371,7 +1357,7 @@
+         let r = g.any(n);
+         js.push(g.emit(Scheme.TEST(r as u8, 0)));
+     }
+-    g.fs.freereg = save;
++    g.fs.regs.top = save;
+     g.fs.line = saved_line;
+ }
+ 
+@@ -1406,7 +1392,7 @@
+                 }
+                 mode.push(if direct { 1 } else { 2 });
+             }
+-            let base = g.fs.freereg;
++            let base = g.fs.regs.top;
+             for i in 0..nargs {
+                 let r = g.alloc();
+                 if mode.at(i) == 2 { g.to(n.list.at(i), r); }
+@@ -1423,7 +1409,7 @@
+             return;
+         }
+     }
+-    let base = if !tail and dst + 1 == g.fs.freereg { dst } else { g.alloc() };
++    let base = if !tail and dst + 1 == g.fs.regs.top { dst } else { g.alloc() };
+     g.to(f, base);
+     for i in 0..nargs {
+         let r = g.alloc();
+@@ -1552,7 +1538,7 @@
+ 
+ /// Evaluate a let's inits into fresh registers and bind its variables.
+ fn Gen.bind_let(g: *Gen, n: *Node) {
+-    let base = g.fs.freereg;
++    let base = g.fs.regs.top;
+     for i in 0..n.list.len {
+         let r = g.alloc();
+         g.to(n.list.at(i), r);
+@@ -1576,7 +1562,7 @@
+     for j in 0..n.list.len {
+         let v = n.vars.at(j);
+         let init = n.list.at(j);
+-        let save = g.fs.freereg;
++        let save = g.fs.regs.top;
+         if boxed(v) {
+             let r = g.any(init);
+             g.emit(Scheme.BOXSET(v.reg as u8, r as u8));
+@@ -1596,7 +1582,7 @@
+                 }
+             }
+         }
+-        g.fs.freereg = save;
++        g.fs.regs.top = save;
+     }
+ }
+ 
+@@ -1625,10 +1611,10 @@
+ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
+     let h = g.heap;
+     let l = fs.lam;
+-    let consts = value.new_arr(h, fs.consts.len);
+-    for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
+-    let lines = new(h, Lines {}, fs.lines.len);
+-    for i in 0..fs.lines.len { lines.data[i] = fs.lines.at(i); }
++    let consts = value.new_arr(h, fs.consts.len());
++    for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
++    let lines = new(h, Lines {}, fs.code.len());
++    fs.code.locs_into(lines.data);
+     let protos = new(h, Protos {}, fs.protos.len);
+     for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
+     if l.free.len > 255 { fail(fs.line, "too many free variables"); }
+@@ -1645,14 +1631,14 @@
+         nparams: np,
+         rest: rest,
+         fixed: if l.rest { 0x10000 } else { np },
+-        nregs: if fs.maxreg == 0 { 1 } else { fs.maxreg },
++        nregs: fs.regs.frame_size(1),
+         nfree: l.free.len as u32,
+         consts: consts,
+         lines: lines,
+         protos: protos,
+         desc: desc,
+-    }, fs.code.len);
+-    for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
++    }, fs.code.len());
++    fs.code.copy_into(proto.code);
+     if let Some(bad) = Scheme.verify(proto.code, proto) {
+         var b = text.StrBuf.new();
+         b.push_str("internal error: generated code fails verification at instruction ");
+@@ -1661,7 +1647,6 @@
+     }
+     Scheme.optimize(proto.code);
+     fs.code.free();
+-    fs.lines.free();
+     fs.consts.free();
+     fs.protos.free();
+     proto
+--- a/examples/scheme/value.lm
++++ b/examples/scheme/value.lm
+@@ -352,3 +352,8 @@
+     t.all.push(o);
+     o
+ }
++
++/// Constant-pool keys (std.bc): by bits.
++pub fn V.hash(v: V) -> u64 { hash.mix(v as u64) }
++pub fn V.eq(a: V, b: V) -> bool { a == b }
++impl hash.Hash for V;

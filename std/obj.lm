@@ -1,0 +1,920 @@
+// Objects with hidden classes (shapes) and inline-cache support.
+//
+// Record-like objects with symbol keys (JS objects, Python instances, Lua
+// tables used as records). A *shape* describes an object's layout: which
+// keys it has, in what order, and so in which slot each value lives.
+// Objects built by adding the same keys in the same order share a shape,
+// so a property access site can cache "(shape id, slot)" and a hit is one
+// compare and one load:
+//
+//     if o.shape.id == cache.shape { dst = m.load_ref(o, cache.slot) }
+//
+// Design: docs/stdlib/obj.md (the "As implemented" notes list what is
+// left out).
+//
+// Keys are u64: symbol ids (`text.Interner`) or other integers that stay
+// meaningful while shapes use them. They are not traced.
+//
+// The object type belongs to the interpreter, because its slots hold the
+// interpreter's `value` type (generic object types are not supported). It
+// needs these fields, which the generic code here reads and writes:
+//
+//     object Obj {
+//         shape: Gc<obj.Shape>,
+//         dict: ?Gc<obj.Dict>,       // dictionary mode
+//         overflow: ?Gc<Slots>,      // out-of-line slots
+//         proto: ?Gc<Obj>,           // only for the prototype functions
+//         ..anything else..,
+//         inline: [Value],           // inline slots, count fixed at allocation
+//     }
+//     object Slots { data: [Value] }
+//
+// `Model<O, S, V>` is instantiated with O = Gc<Obj>, S = Gc<Slots> and
+// V = Value, and is given a function that allocates a Slots array.
+//
+// Slots. A property's slot is its *index*: the order in which it was added
+// (counting from 0). Index i lives in `inline[i]` if i < inline.len, else
+// in `overflow.data[i - inline.len]`. A shape fixes the inline count (each
+// root shape is for one inline count), so it also fixes where each property
+// lives; caches store a *SlotRef*: the index, or the overflow index with
+// bit 31 set (`OUT`), so a hit needs no comparison with the inline count.
+//
+// Shapes form a transition tree per (prototype, inline count). Adding a
+// property follows or creates the edge for its key. Shapes are GC objects:
+// a shape is kept alive by the objects that use it and by its children
+// (through `parent`); edges to children and the table of root shapes are
+// weak, cleared by a sweeper when the child dies. Shape ids are never
+// reused (a u32 counter), so a stale id in a cache can never match a live
+// object: caches need no clearing after a collection.
+//
+// Dictionary mode: after `dict_threshold` properties, or when a property
+// other than the last one added is deleted, an object gets the shared
+// dictionary shape (id DICT_ID, never cached) and a `Dict` mapping keys to
+// slot indices. Values stay in the object's slots.
+//
+// Prototype chains: `lookup` follows `proto` fields. A root shape is per
+// prototype, so a shape check also checks the prototype. A lookup that
+// finds its key on a prototype can be cached as (receiver shape, holder,
+// slot) plus the validity cell of the receiver's prototype (`ProtoEntry`);
+// any change to the key set of an object with a cell, or to its prototype,
+// invalidates its cell and the cells of the objects that inherit from it.
+//
+// Nothing here collects: every function is free of effects and can run in
+// a handler's fast or cold path. Allocation (shapes, tables, slot arrays)
+// happens at transitions and growth.
+
+import std.gc;
+import std.mem;
+import std.hash;
+import std.map;
+
+/// SlotRef bit: the slot is `overflow.data[ref & !OUT]`.
+pub const OUT: u32 = 0x80000000;
+/// Not a shape id: an empty cache holds 0.
+pub const EMPTY_ID: u32 = 0;
+/// The id of the dictionary-mode shape; never stored in a cache.
+pub const DICT_ID: u32 = 0xFFFFFFFF;
+/// Fast-mode chains up to this length are searched by walking `parent`
+/// links; longer ones build a `Table` on first lookup.
+const WALK: u32 = 8;
+
+pub object Shape {
+    id: u32,
+    /// Number of properties.
+    count: u32,
+    inline_cap: u32,
+    flags: u32,
+    /// The property added by the transition from `parent`.
+    key: u64,
+    /// Identity (address bits) of the prototype; 0 for none.
+    proto: u64,
+    parent: ?Gc<Shape>,
+    /// Weak transitions: the first child inline, the others in `edges`.
+    child_key: u64,
+    child: u64,
+    edges: ?Gc<Edges>,
+    /// Lazily built key -> index table for long chains.
+    table: ?Gc<Table>,
+}
+
+/// Open-addressed (key, child address) pairs; address 0 is empty, 1 a
+/// deleted entry.
+pub object Edges { used: u64, data: [u64] }
+/// Open-addressed (key, index + 1) pairs; 0 is empty.
+pub object Table { data: [u64] }
+
+/// Dictionary-mode properties: an open-addressed index over entries kept
+/// in insertion order. `data` holds `icap` index words (entry number + 1,
+/// 0 empty), then `ecap` entries of (key, slot index or DEL).
+pub object Dict {
+    icap: u64,
+    ecap: u64,
+    n: u64,
+    live: u64,
+    next_slot: u64,
+    proto: u64,
+    inline_cap: u64,
+    data: [u64],
+}
+const DEL: u64 = 0xFFFFFFFFFFFFFFFF;
+
+/// "The prototype chain from this object up is unchanged." `deps` are the
+/// cells of objects whose prototype this object is.
+pub object Cell { valid: bool, n: u64, parent: ?Gc<Cell>, deps: ?Gc<CellList> }
+pub object CellList { data: [?Gc<Cell>] }
+
+/// For turning weak (untraced) addresses back into references inside the
+/// sweeper: a reference can only be made from bits through a value.
+value Ref repr nanbox { Num(f64) unboxed, S(Gc<Shape>), C(Gc<Cell>) }
+const ADDR: u64 = 0xFFFFFFFFFFFF;
+
+const REGISTERED: u32 = 1;
+
+// ── the shape table ─────────────────────────────────────────────────────
+
+pub struct Shapes {
+    heap: *gc.Heap,
+    next_id: u32,
+    /// (proto | inline_cap << 48) -> root shape address. Weak.
+    roots: map.HashMap<u64, u64>,
+    /// Shapes with children (the sweeper clears their dead edges).
+    parents: mem.Vec<u64>,
+    /// The shared dictionary-mode shape (a root: marked by the scanner).
+    dict: ?Gc<Shape>,
+    /// Object address -> validity cell address. Weak in both.
+    cells: map.HashMap<u64, u64>,
+    stag: u64,
+    ctag: u64,
+    /// Statistics.
+    created: u64,
+    swept: u64,
+}
+
+pub fn Shapes.new() -> Shapes {
+    Shapes {
+        heap: 0 as *gc.Heap, next_id: 1, roots: map.HashMap.new(), parents: mem.Vec.new(),
+        dict: None, cells: map.HashMap.new(), stag: 0, ctag: 0, created: 0, swept: 0,
+    }
+}
+
+/// Use heap `h`, and register the root scanner and the sweeper with it.
+/// address while the heap lives.
+pub fn Shapes.attach(s: *Shapes, h: *gc.Heap) {
+    s.heap = h;
+    s.heap.add_scanner(s as *u8, scan_shapes);
+    s.heap.add_sweeper(s as *u8, sweep_shapes);
+}
+
+fn scan_shapes(h: *gc.Heap, data: *u8) {
+    let s = data as *Shapes;
+    if let Some(d) = s.dict { gc_mark(h, d); }
+}
+
+fn Shapes.shape_at(s: *Shapes, a: u64) -> Gc<Shape> {
+    let S(x) = ((a & ADDR) | s.stag) as Ref else { unreachable };
+    x
+}
+
+fn Shapes.cell_at(s: *Shapes, a: u64) -> Gc<Cell> {
+    let C(x) = ((a & ADDR) | s.ctag) as Ref else { unreachable };
+    x
+}
+
+fn marked(a: u64) -> bool { gc.is_marked(a as *u8) }
+
+/// After marking: drop edges to dead shapes, dead roots and dead cells.
+fn sweep_shapes(h: *gc.Heap, data: *u8) {
+    let s = data as *Shapes;
+    var j: u64 = 0;
+    for i in 0..s.parents.len {
+        let a = s.parents.at(i);
+        if !marked(a) { continue; }
+        let p = s.shape_at(a);
+        var children: u64 = 0;
+        if p.child != 0 {
+            if marked(p.child) { children += 1; } else { p.child = 0; s.swept += 1; }
+        }
+        if let Some(e) = p.edges {
+            let cap = e.data.len / 2;
+            for k in 0..cap {
+                let c = e.data[2 * k + 1];
+                if c > 1 {
+                    if marked(c) { children += 1; } else { e.data[2 * k + 1] = 1; s.swept += 1; }
+                }
+            }
+        }
+        if children == 0 {
+            p.flags = p.flags & !REGISTERED;
+            p.edges = None;
+            continue;
+        }
+        s.parents.set(j, a);
+        j += 1;
+    }
+    s.parents.truncate(j);
+    var it: u64 = 0;
+    while let Some(slot) = s.roots.next(&it) {
+        if !marked(slot.value) { s.roots.remove(slot.key); }
+    }
+    it = 0;
+    while let Some(slot) = s.cells.next(&it) {
+        if !marked(slot.key) or !marked(slot.value) { s.cells.remove(slot.key); }
+    }
+}
+
+fn Shapes.make(s: *Shapes, parent: ?Gc<Shape>, key: u64, proto: u64, cap: u32, count: u32) -> Gc<Shape> {
+    let id = s.next_id;
+    if id == DICT_ID { abort_msg("std.obj: out of shape ids"); }
+    s.next_id = id + 1;
+    s.created += 1;
+    let sh = new(s.heap, Shape {
+        id: id, count: count, inline_cap: cap, flags: 0, key: key, proto: proto,
+        parent: parent, child_key: 0, child: 0, edges: None, table: None,
+    });
+    if s.stag == 0 { s.stag = (Ref.S(sh) as u64) & !ADDR; }
+    sh
+}
+
+extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn abort();
+
+fn abort_msg(m: str) {
+    write(2, m.ptr, m.len);
+    write(2, "\n".ptr, 1);
+    abort();
+}
+
+/// The root shape (no properties) for objects with prototype identity
+/// `proto` (0 for none) and `inline_cap` inline slots.
+pub fn Shapes.root(s: *Shapes, proto: u64, inline_cap: u32) -> Gc<Shape> {
+    if inline_cap > 0xFFFF { abort_msg("std.obj: too many inline slots"); }
+    let k = (proto & ADDR) | ((inline_cap as u64) << 48);
+    if let Some(a) = s.roots.get(k) { return s.shape_at(a); }
+    let r = s.make(None, 0, proto & ADDR, inline_cap, 0);
+    s.roots.insert(k, r as u64);
+    r
+}
+
+/// The shared dictionary-mode shape.
+pub fn Shapes.dict_shape(s: *Shapes) -> Gc<Shape> {
+    if let Some(d) = s.dict { return d; }
+    let d = s.make(None, 0, 0, 0, 0);
+    d.id = DICT_ID;
+    s.next_id -= 1;
+    s.dict = Some(d);
+    d
+}
+
+fn edge_find(e: Gc<Edges>, key: u64) -> u64 {
+    let mask = e.data.len / 2 - 1;
+    var i = hash.mix(key) & mask;
+    loop {
+        let c = e.data[2 * i + 1];
+        if c == 0 { return 0; }
+        if c > 1 and e.data[2 * i] == key { return c; }
+        i = (i + 1) & mask;
+    }
+}
+
+fn edge_put(e: Gc<Edges>, key: u64, child: u64) {
+    let mask = e.data.len / 2 - 1;
+    var i = hash.mix(key) & mask;
+    while e.data[2 * i + 1] > 1 { i = (i + 1) & mask; }
+    if e.data[2 * i + 1] == 0 { e.used += 1; }
+    e.data[2 * i] = key;
+    e.data[2 * i + 1] = child;
+}
+
+/// The shape after adding `key` to `sh` (created on first use).
+pub fn Shapes.add(s: *Shapes, sh: Gc<Shape>, key: u64) -> Gc<Shape> {
+    if sh.child != 0 and sh.child_key == key { return s.shape_at(sh.child); }
+    if let Some(e) = sh.edges {
+        let c = edge_find(e, key);
+        if c != 0 { return s.shape_at(c); }
+    }
+    let child = s.make(Some(sh), key, sh.proto, sh.inline_cap, sh.count + 1);
+    if sh.child == 0 {
+        sh.child_key = key;
+        sh.child = child as u64;
+    } else {
+        var e = match sh.edges {
+            Some(e) => e,
+            None => {
+                let e = new(s.heap, Edges { used: 0 }, 16);
+                sh.edges = Some(e);
+                e
+            }
+        };
+        let cap = e.data.len / 2;
+        if (e.used + 1) * 4 > cap * 3 {
+            // Rehash, dropping deleted entries.
+            let ne = new(s.heap, Edges { used: 0 }, e.data.len * 2);
+            for k in 0..cap {
+                let c = e.data[2 * k + 1];
+                if c > 1 { edge_put(ne, e.data[2 * k], c); }
+            }
+            sh.edges = Some(ne);
+            e = ne;
+        }
+        edge_put(e, key, child as u64);
+    }
+    if sh.flags & REGISTERED == 0 {
+        sh.flags = sh.flags | REGISTERED;
+        s.parents.push(sh as u64);
+    }
+    child
+}
+
+/// The index of `key` in shape `sh`, if it has the key.
+pub fn Shapes.find(s: *Shapes, sh: Gc<Shape>, key: u64) -> ?u32 {
+    if sh.count <= WALK {
+        var cur = sh;
+        while cur.count > 0 {
+            if cur.key == key { return Some(cur.count - 1); }
+            let Some(p) = cur.parent else { return None; };
+            cur = p;
+        }
+        return None;
+    }
+    let t = match sh.table {
+        Some(t) => t,
+        None => s.build_table(sh),
+    };
+    let mask = t.data.len / 2 - 1;
+    var i = hash.mix(key) & mask;
+    loop {
+        let v = t.data[2 * i + 1];
+        if v == 0 { return None; }
+        if t.data[2 * i] == key { return Some((v - 1) as u32); }
+        i = (i + 1) & mask;
+    }
+}
+
+fn Shapes.build_table(s: *Shapes, sh: Gc<Shape>) -> Gc<Table> {
+    var cap: u64 = 16;
+    while cap < (sh.count as u64) * 2 { cap *= 2; }
+    let t = new(s.heap, Table {}, cap * 2);
+    let mask = cap - 1;
+    var cur = sh;
+    while cur.count > 0 {
+        var i = hash.mix(cur.key) & mask;
+        while t.data[2 * i + 1] != 0 { i = (i + 1) & mask; }
+        t.data[2 * i] = cur.key;
+        t.data[2 * i + 1] = cur.count as u64;
+        let Some(p) = cur.parent else { break; };
+        cur = p;
+    }
+    sh.table = Some(t);
+    t
+}
+
+/// The keys of `sh` in insertion order, appended to `out`.
+pub fn Shapes.keys(s: *Shapes, sh: Gc<Shape>, out: *mem.Vec<u64>) {
+    let base = out.len;
+    for i in 0..sh.count { out.push(0); }
+    var cur = sh;
+    while cur.count > 0 {
+        out.set(base + (cur.count - 1) as u64, cur.key);
+        let Some(p) = cur.parent else { break; };
+        cur = p;
+    }
+}
+
+/// The SlotRef of index `i` for an object with `cap` inline slots.
+pub fn slot_ref(i: u32, cap: u32) -> u32 { if i < cap { i } else { (i - cap) | OUT } }
+
+// ── validity cells ──────────────────────────────────────────────────────
+
+fn kill(c: Gc<Cell>) {
+    if !c.valid { return; }
+    c.valid = false;
+    if let Some(l) = c.deps {
+        for i in 0..c.n {
+            if let Some(d) = l.data[i] { kill(d); }
+        }
+    }
+    c.deps = None;
+    c.n = 0;
+}
+
+fn Shapes.add_dep(s: *Shapes, p: Gc<Cell>, c: Gc<Cell>) {
+    // Drop dead dependents first.
+    var n: u64 = 0;
+    if let Some(l) = p.deps {
+        for i in 0..p.n {
+            if let Some(d) = l.data[i] and d.valid { l.data[n] = Some(d); n += 1; }
+        }
+        for i in n..p.n { l.data[i] = None; }
+    }
+    p.n = n;
+    let cap = match p.deps { Some(l) => l.data.len, None => 0 };
+    if n == cap {
+        let nl = new(s.heap, CellList {}, if cap < 4 { 4 } else { cap * 2 });
+        if let Some(l) = p.deps { for i in 0..n { nl.data[i] = l.data[i]; } }
+        p.deps = Some(nl);
+    }
+    if let Some(l) = p.deps { l.data[n] = Some(c); }
+    p.n = n + 1;
+}
+
+/// Invalidate the cell of the object at address `a`, if it has one.
+pub fn Shapes.invalidate(s: *Shapes, a: u64) {
+    if s.cells.len == 0 { return; }
+    let Some(c) = s.cells.get(a) else { return; };
+    kill(s.cell_at(c));
+    s.cells.remove(a);
+}
+
+// ── inline-cache helpers ────────────────────────────────────────────────
+
+/// A polymorphic cache entry for up to four shapes (no GC references, so
+/// it can live anywhere: a side table, or eight cache words).
+pub struct Poly { n: u32, sids: [u32; 4], slots: [u32; 4] }
+
+pub fn Poly.new() -> Poly { Poly { n: 0, sids: [0; 4], slots: [0; 4] } }
+
+pub fn Poly.get(p: *Poly, sid: u32) -> ?u32 {
+    for i in 0..p.n { if p.sids[i] == sid { return Some(p.slots[i]); } }
+    None
+}
+
+/// Add a shape; false when full (time to go megamorphic).
+pub fn Poly.add(p: *Poly, sid: u32, slot: u32) -> bool {
+    if p.n == 4 { return false; }
+    p.sids[p.n] = sid;
+    p.slots[p.n] = slot;
+    p.n += 1;
+    true
+}
+
+struct MegaEntry { key: u64, sid: u32, slot: u32 }
+
+/// A direct-mapped (shape id, key) -> SlotRef cache shared by all
+/// megamorphic sites. Ids are never reused, so it needs no clearing.
+pub struct MegaCache { e: *MegaEntry, mask: u64 }
+
+/// `n` entries (a power of two).
+pub fn MegaCache.new(n: u64) -> MegaCache { MegaCache { e: mem.alloc(n), mask: n - 1 } }
+
+pub fn MegaCache.get(c: *MegaCache, sid: u32, key: u64) -> ?u32 {
+    let x = c.e + (hash.mix(key ^ ((sid as u64) << 32)) & c.mask);
+    if x.sid == sid and x.key == key { Some(x.slot) } else { None }
+}
+
+pub fn MegaCache.put(c: *MegaCache, sid: u32, key: u64, slot: u32) {
+    let x = c.e + (hash.mix(key ^ ((sid as u64) << 32)) & c.mask);
+    x.sid = sid;
+    x.key = key;
+    x.slot = slot;
+}
+
+pub fn MegaCache.free(c: *MegaCache) { mem.release(c.e); }
+
+/// A cached prototype-chain hit: valid while the receiver has shape `sid`
+/// and `cell` is valid; the value is `holder`'s slot `slot` (an index).
+/// Holds GC references: keep it somewhere traced, or mark it from a
+/// scanner with `mark`.
+pub struct ProtoEntry<O> { sid: u32, slot: u32, cell: ?Gc<Cell>, holder: ?O }
+
+pub fn ProtoEntry<O>.empty() -> ProtoEntry<O> { ProtoEntry { sid: EMPTY_ID, slot: 0, cell: None, holder: None } }
+
+pub fn ProtoEntry<O>.mark(e: *ProtoEntry<O>, h: *gc.Heap) {
+    if let Some(c) = e.cell { gc_mark(h, c); }
+    if let Some(o) = e.holder { gc_mark(h, o); }
+}
+
+/// Allocation-site template ("slack tracking"): objects from one site
+/// start with as many inline slots as the site's objects ended up with.
+pub struct Template { proto: u64, inline: u32, max_inline: u32 }
+
+pub fn Template.new(proto: u64, inline: u32) -> Template {
+    Template { proto: proto, inline: inline, max_inline: 32 }
+}
+
+// ── the model: generic operations on the interpreter's objects ─────────
+
+/// Result of a lookup through the prototype chain.
+pub enum Lookup<O> { Own(u32), Proto(O, u32), Missing }
+
+pub struct Model<O, S, V> {
+    shapes: Shapes,
+    new_slots: fn(*gc.Heap, u64) -> S,
+    nil: V,
+    /// Properties before an object switches to dictionary mode.
+    dict_threshold: u32,
+}
+
+/// `new_slots(h, n)` allocates an overflow array of `n` values; `nil` is
+/// written into slots whose property was deleted. Call `attach(heap)` once the
+/// model has its final address.
+pub fn Model<O, S, V>.new(new_slots: fn(*gc.Heap, u64) -> S, nil: V) -> Model<O, S, V> {
+    Model { shapes: Shapes.new(), new_slots: new_slots, nil: nil, dict_threshold: 64 }
+}
+
+pub fn Model<O, S, V>.attach(m: *Model<O, S, V>, h: *gc.Heap) { m.shapes.attach(h); }
+
+pub fn Model<O, S, V>.free(m: *Model<O, S, V>) {
+    m.shapes.roots.free();
+    m.shapes.cells.free();
+    m.shapes.parents.free();
+}
+
+/// The shape for a new object without prototype and with `inline_cap`
+/// inline slots: `new(h, Obj { shape: m.root(n), dict: None, overflow: None }, n)`.
+pub fn Model<O, S, V>.root(m: *Model<O, S, V>, inline_cap: u32) -> Gc<Shape> {
+    m.shapes.root(0, inline_cap)
+}
+
+/// The shape for a new object with prototype `proto`.
+pub fn Model<O, S, V>.root_for(m: *Model<O, S, V>, proto: ?O, inline_cap: u32) -> Gc<Shape> {
+    let bits = match proto { Some(p) => p as u64, None => 0 };
+    m.shapes.root(bits, inline_cap)
+}
+
+/// The shape for an object allocated at a site with template `t`; the
+/// object needs `t.inline` inline slots.
+pub fn Model<O, S, V>.template_root(m: *Model<O, S, V>, t: *Template) -> Gc<Shape> {
+    m.shapes.root(t.proto, t.inline)
+}
+
+/// Let the template learn from a finished object: later objects get
+/// inline room for all its properties.
+pub fn Model<O, S, V>.observe(m: *Model<O, S, V>, t: *Template, o: O) {
+    let n = m.len(o) as u32;
+    if n > t.inline { t.inline = if n > t.max_inline { t.max_inline } else { n }; }
+}
+
+pub fn Model<O, S, V>.is_dict(m: *Model<O, S, V>, o: O) -> bool { o.shape.id == DICT_ID }
+
+/// Number of own properties.
+pub fn Model<O, S, V>.len(m: *Model<O, S, V>, o: O) -> u64 {
+    match o.dict {
+        Some(d) => d.live,
+        None => o.shape.count as u64,
+    }
+}
+
+// Slots.
+
+/// The value in slot index `i` (must exist).
+pub fn Model<O, S, V>.load(m: *Model<O, S, V>, o: O, i: u32) -> V {
+    let cap = o.inline.len;
+    if (i as u64) < cap { return o.inline[i]; }
+    let Some(s) = o.overflow else { unreachable };
+    s.data[(i as u64) - cap]
+}
+
+pub fn Model<O, S, V>.store(m: *Model<O, S, V>, o: O, i: u32, v: V) {
+    let cap = o.inline.len;
+    if (i as u64) < cap { o.inline[i] = v; return; }
+    let Some(s) = o.overflow else { unreachable };
+    s.data[(i as u64) - cap] = v;
+}
+
+/// The value at a SlotRef (from a cache hit: no bounds checks, since the
+/// shape check implies the slot exists).
+pub fn Model<O, S, V>.load_ref(m: *Model<O, S, V>, o: O, r: u32) -> V {
+    if r & OUT == 0 { return o.inline.ptr[r]; }
+    let Some(s) = o.overflow else { unreachable };
+    s.data.ptr[r & !OUT]
+}
+
+pub fn Model<O, S, V>.store_ref(m: *Model<O, S, V>, o: O, r: u32, v: V) {
+    if r & OUT == 0 { o.inline.ptr[r] = v; return; }
+    let Some(s) = o.overflow else { unreachable };
+    s.data.ptr[r & !OUT] = v;
+}
+
+/// Inline slot `i` (a cache member that knows the slot is inline).
+pub fn Model<O, S, V>.load_inline(m: *Model<O, S, V>, o: O, i: u32) -> V { o.inline.ptr[i] }
+
+/// Overflow slot `i` (a cache member that knows the slot is out of line).
+pub fn Model<O, S, V>.load_out(m: *Model<O, S, V>, o: O, i: u32) -> V {
+    let Some(s) = o.overflow else { unreachable };
+    s.data.ptr[i]
+}
+
+/// Make room for slot index `i`.
+fn Model<O, S, V>.reserve(m: *Model<O, S, V>, o: O, i: u64) {
+    let cap = o.inline.len;
+    if i < cap { return; }
+    let need = i - cap + 1;
+    let have = match o.overflow { Some(s) => s.data.len, None => 0 };
+    if need <= have { return; }
+    var n = have + have / 2;
+    if n < 4 { n = 4; }
+    if n < need { n = need; }
+    let ns = m.new_slots(m.shapes.heap, n);
+    if let Some(s) = o.overflow { for k in 0..have { ns.data[k] = s.data[k]; } }
+    for k in have..n { ns.data[k] = m.nil; }
+    o.overflow = Some(ns);
+}
+
+// Lookup.
+
+/// The slot index of own property `key`.
+pub fn Model<O, S, V>.find(m: *Model<O, S, V>, o: O, key: u64) -> ?u32 {
+    if let Some(d) = o.dict {
+        let Some(e) = dict_find(d, key) else { return None; };
+        return Some(d.data[d.icap + 2 * e + 1] as u32);
+    }
+    m.shapes.find(o.shape, key)
+}
+
+/// Own property `key`.
+pub fn Model<O, S, V>.get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
+    let Some(i) = m.find(o, key) else { return None; };
+    Some(m.load(o, i))
+}
+
+pub fn Model<O, S, V>.has_own(m: *Model<O, S, V>, o: O, key: u64) -> bool { m.find(o, key).is_some() }
+
+/// `key` on `o` or its prototypes (needs a `proto: ?O` field).
+pub fn Model<O, S, V>.lookup(m: *Model<O, S, V>, o: O, key: u64) -> Lookup<O> {
+    if let Some(i) = m.find(o, key) { return .Own(i); }
+    var cur = o.proto;
+    while let Some(p) = cur {
+        if let Some(i) = m.find(p, key) { return .Proto(p, i); }
+        cur = p.proto;
+    }
+    .Missing
+}
+
+/// `key` on `o` or its prototypes.
+pub fn Model<O, S, V>.get_chain(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
+    match m.lookup(o, key) {
+        Own(i) => Some(m.load(o, i)),
+        Proto(h, i) => Some(m.load(h, i)),
+        Missing => None,
+    }
+}
+
+// Mutation.
+
+/// Set own property `key` (adding it if absent).
+pub fn Model<O, S, V>.set(m: *Model<O, S, V>, o: O, key: u64, v: V) {
+    if let Some(i) = m.find(o, key) { m.store(o, i, v); return; }
+    m.add(o, key, v);
+}
+
+/// Add property `key`, known to be absent.
+pub fn Model<O, S, V>.add(m: *Model<O, S, V>, o: O, key: u64, v: V) {
+    m.shapes.invalidate(o as u64);
+    if o.dict.is_none() and o.shape.count >= m.dict_threshold { m.to_dict(o); }
+    if let Some(d) = o.dict {
+        m.dict_add(o, d, key, v);
+        return;
+    }
+    let i = o.shape.count;
+    m.reserve(o, i as u64);
+    o.shape = m.shapes.add(o.shape, key);
+    m.store(o, i, v);
+}
+
+/// Delete own property `key`; false if absent.
+pub fn Model<O, S, V>.delete(m: *Model<O, S, V>, o: O, key: u64) -> bool {
+    let Some(i) = m.find(o, key) else { return false; };
+    m.shapes.invalidate(o as u64);
+    if o.dict.is_none() {
+        let sh = o.shape;
+        if i + 1 == sh.count and let Some(p) = sh.parent {
+            // The last property added: step back to the parent shape.
+            m.store(o, i, m.nil);
+            o.shape = p;
+            return true;
+        }
+        m.to_dict(o);
+    }
+    let Some(d) = o.dict else { unreachable };
+    let Some(e) = dict_find(d, key) else { unreachable };
+    m.store(o, i, m.nil);
+    d.data[d.icap + 2 * e + 1] = DEL;
+    d.live -= 1;
+    true
+}
+
+/// Change the prototype (needs a `proto: ?O` field). The object moves to
+/// the matching shape in the new prototype's tree.
+pub fn Model<O, S, V>.set_proto(m: *Model<O, S, V>, o: O, p: ?O) {
+    m.shapes.invalidate(o as u64);
+    o.proto = p;
+    let bits = match p { Some(x) => (x as u64) & ADDR, None => 0 };
+    if let Some(d) = o.dict {
+        d.proto = bits;
+        return;
+    }
+    var keys: mem.Vec<u64> = mem.Vec.new();
+    m.shapes.keys(o.shape, &keys);
+    var sh = m.shapes.root(bits, o.shape.inline_cap);
+    for k in 0..keys.len { sh = m.shapes.add(sh, keys.at(k)); }
+    o.shape = sh;
+    keys.free();
+}
+
+/// Own keys in insertion order, appended to `out`.
+pub fn Model<O, S, V>.keys(m: *Model<O, S, V>, o: O, out: *mem.Vec<u64>) {
+    let Some(d) = o.dict else { m.shapes.keys(o.shape, out); return; };
+    for e in 0..d.n {
+        if d.data[d.icap + 2 * e + 1] != DEL { out.push(d.data[d.icap + 2 * e]); }
+    }
+}
+
+// Dictionary mode.
+
+fn new_dict(h: *gc.Heap, ecap: u64, proto: u64, inline_cap: u64) -> Gc<Dict> {
+    let icap = ecap * 2;
+    new(h, Dict { icap: icap, ecap: ecap, n: 0, live: 0, next_slot: 0, proto: proto, inline_cap: inline_cap }, icap + 2 * ecap)
+}
+
+fn dict_find(d: Gc<Dict>, key: u64) -> ?u64 {
+    let mask = d.icap - 1;
+    var i = hash.mix(key) & mask;
+    loop {
+        let x = d.data[i];
+        if x == 0 { return None; }
+        let e = x - 1;
+        if d.data[d.icap + 2 * e] == key {
+            if d.data[d.icap + 2 * e + 1] == DEL { return None; }
+            return Some(e);
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Append an entry (there must be room); a deleted entry for the same
+/// key is superseded in the index.
+fn dict_put(d: Gc<Dict>, key: u64, slot: u64) {
+    let e = d.n;
+    d.n += 1;
+    d.live += 1;
+    d.data[d.icap + 2 * e] = key;
+    d.data[d.icap + 2 * e + 1] = slot;
+    let mask = d.icap - 1;
+    var i = hash.mix(key) & mask;
+    loop {
+        let x = d.data[i];
+        if x == 0 or d.data[d.icap + 2 * (x - 1)] == key { d.data[i] = e + 1; return; }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Switch `o` to dictionary mode.
+pub fn Model<O, S, V>.to_dict(m: *Model<O, S, V>, o: O) {
+    if o.dict.is_some() { return; }
+    m.shapes.invalidate(o as u64);
+    let sh = o.shape;
+    var ecap: u64 = 8;
+    while ecap < (sh.count as u64) * 2 { ecap *= 2; }
+    let d = new_dict(m.shapes.heap, ecap, sh.proto, sh.inline_cap as u64);
+    var keys: mem.Vec<u64> = mem.Vec.new();
+    m.shapes.keys(sh, &keys);
+    for k in 0..keys.len { dict_put(d, keys.at(k), k); }
+    keys.free();
+    d.next_slot = sh.count as u64;
+    o.dict = Some(d);
+    o.shape = m.shapes.dict_shape();
+}
+
+fn Model<O, S, V>.dict_add(m: *Model<O, S, V>, o: O, d0: Gc<Dict>, key: u64, v: V) {
+    var d = d0;
+    if d.n == d.ecap { d = m.compact(o, d, true); }
+    let slot = d.next_slot;
+    m.reserve(o, slot);
+    d.next_slot += 1;
+    m.store(o, slot as u32, v);
+    dict_put(d, key, slot);
+}
+
+/// Rebuild the dictionary without deleted entries, renumbering the slots
+/// (values move down, in order) and growing if `grow` and it is over
+/// half full.
+fn Model<O, S, V>.compact(m: *Model<O, S, V>, o: O, d: Gc<Dict>, grow: bool) -> Gc<Dict> {
+    m.shapes.invalidate(o as u64);
+    var ecap = d.ecap;
+    if grow and d.live * 2 >= ecap { ecap *= 2; }
+    let nd = new_dict(m.shapes.heap, ecap, d.proto, d.inline_cap);
+    var next: u64 = 0;
+    for e in 0..d.n {
+        let slot = d.data[d.icap + 2 * e + 1];
+        if slot == DEL { continue; }
+        if slot != next { m.store(o, next as u32, m.load(o, slot as u32)); }
+        dict_put(nd, d.data[d.icap + 2 * e], next);
+        next += 1;
+    }
+    for s in next..d.next_slot { m.store(o, s as u32, m.nil); }
+    nd.next_slot = next;
+    o.dict = Some(nd);
+    nd
+}
+
+/// Turn a dictionary-mode object back into a fast one (for objects that
+/// become prototypes, or after a burst of deletions), if it has at most
+/// `dict_threshold` properties.
+pub fn Model<O, S, V>.optimize(m: *Model<O, S, V>, o: O) {
+    let Some(d0) = o.dict else { return; };
+    if d0.live > m.dict_threshold as u64 { return; }
+    let d = m.compact(o, d0, false);
+    var sh = m.shapes.root(d.proto, d.inline_cap as u32);
+    for e in 0..d.n { sh = m.shapes.add(sh, d.data[d.icap + 2 * e]); }
+    o.shape = sh;
+    o.dict = None;
+}
+
+// Inline caches.
+//
+// A vm declares the cache words and does the fast check itself, where the
+// compiler can keep everything in registers:
+//
+//     cache PropIC { shape: u32, slot: u32 }
+//     op GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
+//         if let Obj(o) = obj and o.shape.id == cache.shape {
+//             dst = ctx.objs.load_ref(o, cache.slot); next
+//         }
+//         cold { dst = get_slow(ctx, obj, name, &cache.shape, &cache.slot)?; next }
+//     }
+//
+// and the slow path calls `get_fill`, which refills the words.
+
+/// Own-property read that fills a monomorphic cache (`shape_w`,
+/// `slot_w`) when `key` is an own property of a fast-mode object.
+pub fn Model<O, S, V>.get_fill(m: *Model<O, S, V>, o: O, key: u64, shape_w: *u32, slot_w: *u32) -> ?V {
+    let Some(i) = m.find(o, key) else { return None; };
+    if o.dict.is_none() {
+        *shape_w = o.shape.id;
+        *slot_w = slot_ref(i, o.inline.len as u32);
+    }
+    Some(m.load(o, i))
+}
+
+/// Own-property write: an existing property is stored and the cache
+/// filled (a later hit is a shape check and a store); a new one is added.
+pub fn Model<O, S, V>.set_fill(m: *Model<O, S, V>, o: O, key: u64, v: V, shape_w: *u32, slot_w: *u32) {
+    if let Some(i) = m.find(o, key) {
+        m.store(o, i, v);
+        if o.dict.is_none() {
+            *shape_w = o.shape.id;
+            *slot_w = slot_ref(i, o.inline.len as u32);
+        }
+        return;
+    }
+    m.add(o, key, v);
+}
+
+/// Own-property read through a megamorphic cache.
+pub fn Model<O, S, V>.get_mega(m: *Model<O, S, V>, c: *MegaCache, o: O, key: u64) -> ?V {
+    if o.dict.is_none() {
+        let sid = o.shape.id;
+        if let Some(r) = c.get(sid, key) { return Some(m.load_ref(o, r)); }
+        let Some(i) = m.find(o, key) else { return None; };
+        let r = slot_ref(i, o.inline.len as u32);
+        c.put(sid, key, r);
+        return Some(m.load_ref(o, r));
+    }
+    m.get(o, key)
+}
+
+/// The validity cell of prototype `p`: valid until the key set of `p` or
+/// of any object above it changes, or one of their prototypes changes
+/// (needs a `proto: ?O` field).
+pub fn Model<O, S, V>.cell(m: *Model<O, S, V>, p: O) -> Gc<Cell> {
+    let a = (p as u64) & ADDR;
+    if let Some(ca) = m.shapes.cells.get(a) {
+        let c = m.shapes.cell_at(ca);
+        if c.valid { return c; }
+    }
+    let up: ?Gc<Cell> = match p.proto { Some(pp) => Some(m.cell(pp)), None => None };
+    let c = new(m.shapes.heap, Cell { valid: true, n: 0, parent: up, deps: None });
+    if m.shapes.ctag == 0 { m.shapes.ctag = (Ref.C(c) as u64) & !ADDR; }
+    m.shapes.cells.insert(a, c as u64);
+    if let Some(u) = up { m.shapes.add_dep(u, c); }
+    c
+}
+
+/// Read `key` through the chain, filling `e` when it is found on a
+/// prototype of a fast-mode receiver. Own properties are left to the
+/// monomorphic cache.
+pub fn Model<O, S, V>.get_proto_fill(m: *Model<O, S, V>, o: O, key: u64, e: *ProtoEntry<O>) -> ?V {
+    match m.lookup(o, key) {
+        Own(i) => Some(m.load(o, i)),
+        Proto(h, i) => {
+            if o.dict.is_none() and let Some(p) = o.proto {
+                e.sid = o.shape.id;
+                e.slot = i;
+                e.cell = Some(m.cell(p));
+                e.holder = Some(h);
+            }
+            Some(m.load(h, i))
+        }
+        Missing => None,
+    }
+}
+
+/// A cached prototype hit: the receiver's shape matches and the chain is
+/// unchanged.
+pub fn Model<O, S, V>.proto_hit(m: *Model<O, S, V>, o: O, e: *ProtoEntry<O>) -> ?V {
+    if o.shape.id != e.sid { return None; }
+    let Some(c) = e.cell else { return None; };
+    if !c.valid { return None; }
+    let Some(h) = e.holder else { return None; };
+    Some(m.load(h, e.slot))
+}

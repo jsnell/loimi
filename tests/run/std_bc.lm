@@ -1,0 +1,382 @@
+// std.bc: a toy language compiled to a toy register vm with the code
+// buffer, labels, jump lists, the constant pool, the register allocator,
+// the position table and jump threading.
+//
+// Toy language:
+//   stmt := "let" name "=" expr ";" | name "=" expr ";" | "print" expr ";"
+//         | "while" expr block | "if" expr block ["else" block] | block
+//   block := "{" stmt* "}"
+//   expr := sum ["<" sum] ; sum := term (("+" | "-") term)* ;
+//   term := atom ("*" atom)* ; atom := int | name | "(" expr ")"
+import std.io;
+import std.mem;
+import std.bc;
+
+struct Machine { k: *i64 }
+struct Limits { nregs: u32, nconsts: u32 }
+
+vm Toy {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+    verify_context lim: *Limits;
+
+    operand reg = regs[it] verify (it as u32) < lim.nregs;
+    operand kst = ctx.k[it] verify (it as u32) < lim.nconsts;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+    cache Count { n: u32 }
+
+    op LOADK(dst: reg, k: kst) : ABx { dst = k; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op SUB(dst: reg, a: reg, b: reg) : ABC { dst = a - b; next }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op LT(dst: reg, a: reg, b: reg) : ABC { dst = if a < b { 1 } else { 0 }; next }
+    op JMPF(a: reg, target: label) : AsBx { if a == 0 { jump target } next }
+    op JMP(target: label) : sJ { jump target }
+    // An op with an inline cache word: `op` must reserve it.
+    op PRINT(a: reg) : ABC + Count { cache.n = cache.n + 1; io.print_int(a); io.println(""); next }
+    op RET() : ABC { exit 0 }
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> i64 { ctx = m; pc = code; regs = r; jump pc }
+}
+
+const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
+const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
+const DST: bc.Field = bc.Field { shift: 8, bits: 8, signed: false };
+
+fn patch(w: u32, off: i64) -> ?u32 {
+    if Toy.opcode(w) == Toy.OP_JMP { SJ.set32(w, off) } else { SBX.set32(w, off) }
+}
+fn target_of(w: u32) -> ?i64 {
+    let op = Toy.opcode(w);
+    if op == Toy.OP_JMP { return Some(SJ.get32(w)); }
+    if op == Toy.OP_JMPF { return Some(SBX.get32(w)); }
+    None
+}
+fn is_goto(w: u32) -> bool { Toy.opcode(w) == Toy.OP_JMP }
+
+struct Local { name: str, reg: u32 }
+
+struct C {
+    src: str,
+    pos: u64,
+    line: u32,
+    code: bc.Code<u32>,
+    consts: bc.Pool<i64>,
+    regs: bc.Regs,
+    locals: mem.Vec<Local>,
+    ok: bool,
+}
+
+fn C.err(c: *C, msg: str) {
+    if c.ok { io.print("error on line "); io.print_int(c.line as i64); io.print(": "); io.println(msg); }
+    c.ok = false;
+}
+
+fn is_alpha(ch: u8) -> bool { (ch >= 'a' and ch <= 'z') or ch == '_' }
+fn is_digit(ch: u8) -> bool { ch >= '0' and ch <= '9' }
+
+fn C.skip(c: *C) {
+    while c.pos < c.src.len {
+        let ch = c.src[c.pos];
+        if ch == '\n' { c.line += 1; c.code.set_loc(c.line); }
+        if ch != ' ' and ch != '\n' { return; }
+        c.pos += 1;
+    }
+}
+fn C.peek(c: *C) -> u8 { c.skip(); if c.pos < c.src.len { c.src[c.pos] } else { 0 } }
+fn C.eat(c: *C, ch: u8) -> bool { if c.peek() == ch { c.pos += 1; true } else { false } }
+fn C.expect(c: *C, ch: u8) { if !c.eat(ch) { c.err("unexpected character"); c.pos = c.src.len; } }
+fn C.word(c: *C) -> str {
+    c.skip();
+    let start = c.pos;
+    while c.pos < c.src.len and (is_alpha(c.src[c.pos]) or is_digit(c.src[c.pos])) { c.pos += 1; }
+    c.src[start..c.pos]
+}
+fn C.at_word(c: *C, w: str) -> bool {
+    c.skip();
+    let save = c.pos;
+    let got = c.word();
+    if got.eq(w) { return true; }
+    c.pos = save;
+    false
+}
+
+fn C.find(c: *C, name: str) -> ?u32 {
+    var i = c.locals.len;
+    while i > 0 { i -= 1; if c.locals.at(i).name.eq(name) { return Some(c.locals.at(i).reg); } }
+    None
+}
+
+/// A register holding the value of the next expression.
+fn C.atom(c: *C) -> u32 {
+    let ch = c.peek();
+    if ch == '(' { c.pos += 1; let r = c.expr(); c.expect(')'); return r; }
+    let w = c.word();
+    if w.len == 0 { c.err("expected an expression"); c.pos = c.src.len; return 0; }
+    if is_digit(w[0]) {
+        var v: i64 = 0;
+        for i in 0..w.len { v = v * 10 + (w[i] - '0') as i64; }
+        let Some(k) = c.consts.add(v) else { c.err("too many constants"); return 0; };
+        let r = c.regs.alloc(1);
+        c.code.op(Toy.LOADK(r as u8, k as u16));
+        return r;
+    }
+    let Some(r) = c.find(w) else { c.err("unknown variable"); return 0; };
+    r
+}
+
+/// Emit `op dst, a, b` into a fresh temporary after freeing the operands.
+fn C.binop(c: *C, op: u32, a: u32, b: u32) -> u32 {
+    if !c.regs.free2(a, b) { c.err("internal error: registers freed out of order"); }
+    let t = c.regs.alloc(1);
+    // All four share the ABC format: build one and swap the opcode.
+    c.code.op(Toy.with_opcode(Toy.ADD(t as u8, a as u8, b as u8), op));
+    t
+}
+
+fn C.term(c: *C) -> u32 {
+    var l = c.atom();
+    while c.eat('*') { let r = c.atom(); l = c.binop(Toy.OP_MUL, l, r); }
+    l
+}
+fn C.sum(c: *C) -> u32 {
+    var l = c.term();
+    loop {
+        if c.eat('+') { let r = c.term(); l = c.binop(Toy.OP_ADD, l, r); continue; }
+        if c.eat('-') { let r = c.term(); l = c.binop(Toy.OP_SUB, l, r); continue; }
+        return l;
+    }
+}
+fn C.expr(c: *C) -> u32 {
+    let l = c.sum();
+    if c.eat('<') { let r = c.sum(); return c.binop(Toy.OP_LT, l, r); }
+    l
+}
+
+/// Evaluate an expression into `dst`: when the last instruction computed
+/// it into the top temporary, retarget that instruction instead of moving.
+fn C.expr_to(c: *C, dst: u32) {
+    let r = c.expr();
+    if r == dst { return; }
+    if c.regs.is_temp(r) and let Some(at) = c.code.last() {
+        let w = c.code.at(at);
+        if DST.get32(w) == r as i64 and Toy.opcode(w) != Toy.OP_JMPF {
+            c.code.set(at, DST.set32(w, dst as i64) ?? w);
+            c.regs.free(r);
+            return;
+        }
+    }
+    c.code.op(Toy.MOVE(dst as u8, r as u8));
+    c.regs.free(r);
+}
+
+fn C.block(c: *C) {
+    c.expect('{');
+    let level = c.regs.enter();
+    let nlocals = c.locals.len;
+    while c.ok and c.peek() != '}' and c.peek() != 0 { c.stmt(); }
+    c.expect('}');
+    c.locals.truncate(nlocals);
+    c.regs.leave(level);
+}
+
+fn C.stmt(c: *C) {
+    c.skip();
+    if c.peek() == '{' { c.block(); return; }
+    if c.at_word("let") {
+        let name = c.word();
+        c.expect('=');
+        let r = c.regs.alloc(1);
+        c.expr_to(r);
+        c.expect(';');
+        c.regs.end_stmt();
+        c.regs.activate(1);
+        c.locals.push(Local { name: name, reg: r });
+        return;
+    }
+    if c.at_word("print") {
+        let r = c.expr();
+        c.code.op(Toy.PRINT(r as u8));
+        c.expect(';');
+        c.regs.end_stmt();
+        return;
+    }
+    if c.at_word("while") {
+        let head = c.code.here();
+        let exit = c.code.label();
+        let r = c.expr();
+        c.regs.end_stmt();
+        c.code.jump(Toy.JMPF(r as u8, 0), exit);
+        c.block();
+        c.code.jump(Toy.JMP(0), head);
+        c.code.bind(exit);
+        return;
+    }
+    if c.at_word("if") {
+        // Jump lists rather than labels, as a Lua-style compiler keeps them.
+        var false_exits: mem.Vec<u64> = mem.Vec.new();
+        let r = c.expr();
+        c.regs.end_stmt();
+        false_exits.push(c.code.op(Toy.JMPF(r as u8, 0)));
+        c.block();
+        if c.at_word("else") {
+            let end = c.code.label();
+            c.code.jump(Toy.JMP(0), end);
+            c.code.patch_here(&false_exits);
+            c.block();
+            c.code.bind(end);
+        } else {
+            c.code.patch_here(&false_exits);
+        }
+        false_exits.free();
+        return;
+    }
+    let name = c.word();
+    let Some(dst) = c.find(name) else { c.err("unknown variable"); c.pos = c.src.len; return; };
+    c.expect('=');
+    c.expr_to(dst);
+    c.expect(';');
+    c.regs.end_stmt();
+}
+
+fn compile_and_run(src: str, thread: bool) {
+    var c = C {
+        src: src, pos: 0, line: 1,
+        code: bc.Code.new(Toy.op_size, patch),
+        consts: bc.Pool.new(65536),
+        regs: bc.Regs.new(250),
+        locals: mem.Vec.new(),
+        ok: true,
+    };
+    c.code.set_loc(1);
+    while c.ok and c.peek() != 0 { c.stmt(); }
+    c.code.op(Toy.RET());
+    if let Some(e) = c.code.check() {
+        io.print("error at line "); io.print_int(e.loc as i64); io.print(": "); io.println(e.message());
+        return;
+    }
+    if !c.ok { return; }
+    if thread {
+        io.print("threaded jumps: ");
+        io.print_int(c.code.thread_jumps(target_of, is_goto) as i64);
+        io.println("");
+    }
+    let n = c.code.len();
+    let nregs = c.regs.frame_size(1);
+    var buf: [u32; 256] = [0; 256];
+    c.code.copy_into(buf[..]);
+    var lim = Limits { nregs: nregs, nconsts: c.consts.len() as u32 };
+    if let Some(bad) = Toy.verify(buf[0..n], &lim) {
+        io.print("verify failed at "); io.print_int(bad as i64); io.println("");
+        return;
+    }
+    // Positions: per word and compact tables agree.
+    var per: [u32; 256] = [0; 256];
+    c.code.locs_into(per[..]);
+    var table: mem.Vec<u8> = mem.Vec.new();
+    c.code.encode_locs(&table);
+    for pc in 0..n {
+        if bc.line_at(table.items(), pc) != per[pc] or c.code.loc_at(pc) != per[pc] { io.println("position table mismatch"); }
+    }
+    io.print("words "); io.print_int(n as i64);
+    io.print(", regs "); io.print_int(nregs as i64);
+    io.print(", consts "); io.print_int(c.consts.len() as i64);
+    io.print(", line of last word "); io.print_int(per[n - 1] as i64);
+    io.print(", table bytes "); io.print_int(table.len as i64);
+    io.println("");
+    var regs: [i64; 256] = [0; 256];
+    var m = Machine { k: c.consts.items().ptr };
+    Toy.run(&m, &buf[0], &regs[0]);
+    table.free();
+    c.code.free();
+    c.consts.free();
+    c.locals.free();
+}
+
+/// A forward jump whose offset does not fit is reported with the
+/// position of the jump.
+fn jump_range() {
+    var code: bc.Code<u32> = bc.Code.new(Toy.op_size, patch);
+    code.set_loc(7);
+    let l = code.label();
+    code.jump(Toy.JMPF(0, 0), l);
+    code.set_loc(8);
+    for i in 0..40000 { code.op(Toy.MOVE(0, 0)); }
+    code.bind(l);
+    let Some(e) = code.check() else { io.println("no error"); return; };
+    io.print(e.message()); io.print(" at pc "); io.print_int(e.pc as i64);
+    io.print(", line "); io.print_int(e.loc as i64); io.println("");
+    // A label used but never placed.
+    code.clear();
+    let m = code.label();
+    code.jump(Toy.JMP(0), m);
+    if let Some(e2) = code.check() { io.println(e2.message()); }
+    // Truncation drops pending fixups in the removed code.
+    code.clear();
+    let k = code.label();
+    code.op(Toy.MOVE(0, 0));
+    let j = code.jump(Toy.JMP(0), k);
+    code.truncate(j);
+    code.bind(k);
+    io.print_bool(code.check().is_none()); io.println("");
+    code.free();
+}
+
+/// Pool and register limits.
+fn limits() {
+    var p: bc.Pool<i64> = bc.Pool.new(2);
+    let a = p.add(10) ?? 99;
+    let b = p.add(20) ?? 99;
+    let a2 = p.add(10) ?? 99;
+    let full = p.add(30).is_none();
+    io.print_int(a as i64); io.print_int(b as i64); io.print_int(a2 as i64); io.print_bool(full); io.println("");
+    p.free();
+    var r = bc.Regs.new(3);
+    let x = r.alloc(1);
+    r.activate(1);                   // x is a local
+    let t1 = r.alloc(1);
+    let t2 = r.alloc(1);
+    io.print_bool(r.free(t1));        // not the top: refused
+    io.print_bool(r.free2(t1, t2));   // either order
+    io.print_bool(r.try_alloc(3).is_none());
+    r.alloc(3);
+    io.print_bool(r.failed());
+    io.print_int(r.frame_size(1) as i64);
+    io.print_int(x as i64);
+    io.println("");
+}
+
+fn main() {
+    jump_range();
+    limits();
+    // Sum of 1..10 and a nested loop, with if/else; constants are shared.
+    compile_and_run("let i = 1;\nlet s = 0;\nwhile i < 11 {\n  s = s + i;\n  i = i + 1;\n}\nprint s;\n", false);
+    compile_and_run("let i = 0;\nlet odd = 0;\nwhile i < 6 {\n  i = i + 1;\n  if odd < 1 { print i * 100; odd = 1; } else { odd = 0; }\n}\nprint (2 + 3) * (4 - 1);\n", true);
+    // Errors carry the position of the offending code.
+    compile_and_run("let x = 1;\n\nprint y;\n", false);
+    compile_and_run("let a = 1;\nlet b = 2;\nprint a + (b + (a + (b + (a + b))));\n", false);
+}
+// expect: jump too long at pc 0, line 7
+// expect: jump to a label that was never placed
+// expect: true
+// expect: 010true
+// expect: falsetruetruetrue40
+// expect: words 12, regs 3, consts 3, line of last word 8, table bytes 16
+// expect: 55
+// expect: threaded jumps: 1
+// expect: words 28, regs 5, consts 7, line of last word 8, table bytes 16
+// expect: 100
+// expect: 300
+// expect: 500
+// expect: 15
+// expect: error on line 3: unknown variable
+// expect: words 10, regs 3, consts 2, line of last word 4, table bytes 8
+// expect: 9

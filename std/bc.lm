@@ -1,0 +1,614 @@
+// Bytecode construction: the parts of a compiler back end that every
+// register or stack VM rebuilds by hand.
+//
+//   Code<W>   a code buffer over the vm's word type W (u8 ... u64), with a
+//             source-position table, forward labels with fixups, jump
+//             lists, range-checked patching, and jump threading;
+//   Field     a bit field of a code word (for patch functions and decoding);
+//   Pool<K>   a constant pool with deduplication (K implements hash.Hash);
+//   Regs      a register allocator for register VMs: locals below
+//             `nactive`, temporaries stacked above (Lua's freereg
+//             discipline), with the maximum tracked;
+//   lines     a compact pc -> position table (delta-encoded runs).
+//
+// Everything is generic over the vm through two functions the caller
+// passes in, so it works with any `vm`'s generated API:
+//
+//   size:  fn(W) -> u64        words taken by the instruction starting with
+//                              this word (the generated `Vm.op_size`);
+//                              `op` reserves and zeroes inline-cache words
+//   patch: fn(W, i64) -> ?W    the word with its jump offset set to the
+//                              given value (target pc - pc of the word), or
+//                              None if the offset does not fit
+//
+// A patch function is usually a few lines over `Vm.opcode` and `Field`:
+//
+//   const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
+//   const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
+//   fn patch(w: u32, off: i64) -> ?u32 {
+//       let f = if Mini.opcode(w) == Mini.OP_JMP { SJ } else { SBX };
+//       f.set32(w, off)
+//   }
+//
+// Nothing here collects (or has effects). Constants that are GC references
+// sit in host memory while a function is compiled: compile between
+// collections, as Mini and Scheme do, or root them yourself.
+
+import std.mem;
+import std.hash;
+import std.map;
+
+const NONE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+// ── fields ──────────────────────────────────────────────────────────────
+
+/// A bit field of a code word: `bits` bits starting at bit `shift`,
+/// two's complement if `signed`.
+pub struct Field { shift: u32, bits: u32, signed: bool }
+
+/// Whether `v` can be stored in the field.
+pub fn Field.fits(f: Field, v: i64) -> bool {
+    if f.bits >= 64 { return true; }
+    if f.signed {
+        let lim = (1 as i64) << ((f.bits - 1) as i64);
+        v >= 0 - lim and v < lim
+    } else {
+        v >= 0 and (v as u64) < ((1 as u64) << (f.bits as u64))
+    }
+}
+
+fn Field.mask(f: Field) -> u64 {
+    if f.bits >= 64 { 0xFFFFFFFFFFFFFFFF } else { ((1 as u64) << (f.bits as u64)) - 1 }
+}
+
+/// The field's value in word `w`.
+pub fn Field.get(f: Field, w: u64) -> i64 {
+    let raw = (w >> (f.shift as u64)) & f.mask();
+    if f.signed and f.bits < 64 {
+        let s = (64 - f.bits) as u64;
+        ((raw << s) as i64) >> (s as i64)
+    } else {
+        raw as i64
+    }
+}
+
+/// `w` with the field set to `v`, or None if `v` does not fit.
+pub fn Field.set(f: Field, w: u64, v: i64) -> ?u64 {
+    if !f.fits(v) { return None; }
+    let m = f.mask() << (f.shift as u64);
+    Some((w & !m) | (((v as u64) << (f.shift as u64)) & m))
+}
+
+/// `Field.set` for u32 code words.
+pub fn Field.set32(f: Field, w: u32, v: i64) -> ?u32 {
+    let Some(r) = f.set(w as u64, v) else { return None; };
+    Some(r as u32)
+}
+
+/// `Field.get` for u32 code words.
+pub fn Field.get32(f: Field, w: u32) -> i64 { f.get(w as u64) }
+
+// ── errors ──────────────────────────────────────────────────────────────
+
+pub enum ErrorKind {
+    /// A jump offset does not fit its field.
+    JumpRange,
+    /// More registers than the allocator's limit.
+    Registers,
+    /// More constants than the pool's limit.
+    Constants,
+    /// A label with pending jumps was never placed.
+    Unbound,
+}
+
+/// The first error a `Code` buffer ran into. `loc` is the source position
+/// recorded for the instruction at `pc`.
+pub struct Error { kind: ErrorKind, pc: u64, loc: u32 }
+
+pub fn Error.message(e: Error) -> str {
+    match e.kind {
+        JumpRange => "jump too long",
+        Registers => "too many registers",
+        Constants => "too many constants",
+        Unbound => "jump to a label that was never placed",
+    }
+}
+
+// ── the code buffer ─────────────────────────────────────────────────────
+
+/// A label: a code position that may not be known yet.
+pub struct Label { id: u32 }
+
+struct LabelInfo { pc: u64, head: u64 }
+struct Fixup { at: u64, next: u64 }
+
+pub struct Code<W> {
+    words: mem.Vec<W>,
+    size: fn(W) -> u64,
+    patch_fn: fn(W, i64) -> ?W,
+    /// Position table as runs: from `run_pc[i]` on, the position is `run_loc[i]`.
+    run_pc: mem.Vec<u64>,
+    run_loc: mem.Vec<u32>,
+    /// Source position recorded for instructions emitted from now on.
+    loc: u32,
+    /// Start of the last instruction emitted with `op` (NONE if unknown).
+    last_at: u64,
+    /// The highest pc that is (or will be) a jump target: an instruction
+    /// emitted before it must not be folded into one emitted after it.
+    barrier: u64,
+    labels: mem.Vec<LabelInfo>,
+    fixups: mem.Vec<Fixup>,
+    error: ?Error,
+}
+
+pub fn Code<W>.new(size: fn(W) -> u64, patch: fn(W, i64) -> ?W) -> Code<W> {
+    Code {
+        words: mem.Vec.new(), size: size, patch_fn: patch,
+        run_pc: mem.Vec.new(), run_loc: mem.Vec.new(), loc: 0,
+        last_at: NONE, barrier: NONE,
+        labels: mem.Vec.new(), fixups: mem.Vec.new(), error: None,
+    }
+}
+
+/// The pc of the next word.
+pub fn Code<W>.pc(c: *Code<W>) -> u64 { c.words.len }
+pub fn Code<W>.len(c: *Code<W>) -> u64 { c.words.len }
+pub fn Code<W>.words(c: *Code<W>) -> []W { c.words.items() }
+pub fn Code<W>.at(c: *Code<W>, i: u64) -> W { c.words.at(i) }
+pub fn Code<W>.set(c: *Code<W>, i: u64, w: W) { c.words.set(i, w); }
+
+/// Set the source position for the following instructions; returns the
+/// previous one (to restore after a subexpression).
+pub fn Code<W>.set_loc(c: *Code<W>, loc: u32) -> u32 {
+    let old = c.loc;
+    c.loc = loc;
+    old
+}
+
+fn Code<W>.note_loc(c: *Code<W>, pc: u64) {
+    let n = c.run_loc.len;
+    if n > 0 and c.run_loc.at(n - 1) == c.loc { return; }
+    if n > 0 and c.run_pc.at(n - 1) == pc {
+        // Nothing was emitted under the previous position.
+        c.run_loc.set(n - 1, c.loc);
+        if n > 1 and c.run_loc.at(n - 2) == c.loc {
+            c.run_pc.truncate(n - 1);
+            c.run_loc.truncate(n - 1);
+        }
+        return;
+    }
+    c.run_pc.push(pc);
+    c.run_loc.push(c.loc);
+}
+
+/// Record an error unless one is already recorded.
+pub fn Code<W>.fail(c: *Code<W>, kind: ErrorKind, pc: u64) {
+    if c.error.is_some() { return; }
+    c.error = Some(Error { kind: kind, pc: pc, loc: if pc < c.words.len { c.loc_at(pc) } else { c.loc } });
+}
+
+/// The first error, if any (including labels used but never placed).
+pub fn Code<W>.check(c: *Code<W>) -> ?Error {
+    if c.error.is_none() {
+        for i in 0..c.labels.len {
+            let l = c.labels.at(i);
+            if l.pc == NONE and l.head != NONE { c.fail(ErrorKind.Unbound, c.fixups.at(l.head).at); }
+        }
+    }
+    c.error
+}
+
+/// Emit an instruction and zero its inline-cache words; returns its pc.
+pub fn Code<W>.op(c: *Code<W>, w: W) -> u64 {
+    let at = c.words.len;
+    c.note_loc(at);
+    c.words.push(w);
+    let n = c.size(w);
+    for i in 1..n { c.words.push(0 as W); }
+    c.last_at = at;
+    at
+}
+
+/// Append one raw word (an operand or cache word written by hand).
+pub fn Code<W>.word(c: *Code<W>, w: W) -> u64 {
+    let at = c.words.len;
+    c.note_loc(at);
+    c.words.push(w);
+    at
+}
+
+/// The pc of the last instruction, if it may be rewritten or merged with
+/// the next one: it was emitted with `op` and no jump targets the
+/// current pc. Peephole rules (folding `NOT` into a branch, extending a
+/// `CONCAT`) check this first.
+pub fn Code<W>.last(c: *Code<W>) -> ?u64 {
+    if c.last_at == NONE or (c.barrier != NONE and c.barrier > c.last_at) { return None; }
+    if c.last_at + c.size(c.words.at(c.last_at)) != c.words.len { return None; }
+    Some(c.last_at)
+}
+
+/// Mark the current pc as a jump target (blocks `last`).
+pub fn Code<W>.mark_target(c: *Code<W>) { c.barrier = c.words.len; }
+
+/// Remove the code from `pc` on (to undo a peephole candidate). Pending
+/// fixups in the removed code are dropped; the previous instruction is
+/// not known afterwards (`last` returns None until the next `op`).
+pub fn Code<W>.truncate(c: *Code<W>, pc: u64) {
+    if pc >= c.words.len { return; }
+    c.words.truncate(pc);
+    while c.run_pc.len > 0 and c.run_pc.at(c.run_pc.len - 1) >= pc {
+        c.run_pc.truncate(c.run_pc.len - 1);
+        c.run_loc.truncate(c.run_loc.len - 1);
+    }
+    for i in 0..c.labels.len {
+        let l = c.labels.ptr_at(i);
+        if l.pc != NONE {
+            if l.pc > pc { l.pc = pc; }
+            continue;
+        }
+        var link: *u64 = &l.head;
+        while *link != NONE {
+            let f = c.fixups.ptr_at(*link);
+            if f.at >= pc { *link = f.next; } else { link = &f.next; }
+        }
+    }
+    c.last_at = NONE;
+    if c.barrier != NONE and c.barrier > pc { c.barrier = pc; }
+}
+
+/// Point the jump word at `at` to `target`. Records `JumpRange` and
+/// returns false if the offset does not fit.
+pub fn Code<W>.patch(c: *Code<W>, at: u64, target: u64) -> bool {
+    let off = target as i64 - at as i64;
+    if c.barrier == NONE or target > c.barrier { c.barrier = target; }
+    match c.patch_fn(c.words.at(at), off) {
+        Some(w) => { c.words.set(at, w); true }
+        None => { c.fail(ErrorKind.JumpRange, at); false }
+    }
+}
+
+/// Emit jump instruction `w` (with any offset) pointing at `target`, an
+/// already known pc; returns its pc.
+pub fn Code<W>.jump_to(c: *Code<W>, w: W, target: u64) -> u64 {
+    let at = c.op(w);
+    c.patch(at, target);
+    at
+}
+
+// Labels.
+
+/// A new label, not yet placed.
+pub fn Code<W>.label(c: *Code<W>) -> Label {
+    c.labels.push(LabelInfo { pc: NONE, head: NONE });
+    Label { id: (c.labels.len - 1) as u32 }
+}
+
+/// A new label placed at the current pc (a loop head).
+pub fn Code<W>.here(c: *Code<W>) -> Label {
+    let l = c.label();
+    c.bind(l);
+    l
+}
+
+/// Place `l` at the current pc and patch the jumps waiting for it.
+pub fn Code<W>.bind(c: *Code<W>, l: Label) {
+    let info = c.labels.ptr_at(l.id as u64);
+    let pc = c.words.len;
+    info.pc = pc;
+    c.barrier = pc;
+    var f = info.head;
+    info.head = NONE;
+    while f != NONE {
+        let fx = c.fixups.at(f);
+        c.patch(fx.at, pc);
+        f = fx.next;
+    }
+}
+
+/// The pc of a placed label.
+pub fn Code<W>.label_pc(c: *Code<W>, l: Label) -> ?u64 {
+    let pc = c.labels.at(l.id as u64).pc;
+    if pc == NONE { None } else { Some(pc) }
+}
+
+/// Make the jump word at `at` jump to `l` (now if placed, else when bound).
+pub fn Code<W>.fixup(c: *Code<W>, at: u64, l: Label) {
+    let info = c.labels.ptr_at(l.id as u64);
+    if info.pc != NONE {
+        c.patch(at, info.pc);
+        return;
+    }
+    c.fixups.push(Fixup { at: at, next: info.head });
+    info.head = c.fixups.len - 1;
+}
+
+/// Emit jump instruction `w` to label `l`; returns its pc.
+pub fn Code<W>.jump(c: *Code<W>, w: W, l: Label) -> u64 {
+    let at = c.op(w);
+    c.fixup(at, l);
+    at
+}
+
+// Jump lists: plain vectors of jump pcs, for compilers that pass pending
+// exits around (Lua's `cond` returning its false-exit list) and move
+// single jumps between lists.
+
+/// Patch every jump in `l` to `target` and clear the list.
+pub fn Code<W>.patch_list(c: *Code<W>, l: *mem.Vec<u64>, target: u64) {
+    for i in 0..l.len { c.patch(l.at(i), target); }
+    l.clear();
+}
+
+/// Patch every jump in `l` to the current pc and clear the list.
+pub fn Code<W>.patch_here(c: *Code<W>, l: *mem.Vec<u64>) {
+    let pc = c.words.len;
+    c.patch_list(l, pc);
+}
+
+// Source positions.
+
+/// The source position recorded for the word at `pc`.
+pub fn Code<W>.loc_at(c: *Code<W>, pc: u64) -> u32 {
+    // Last run starting at or before pc.
+    var lo: u64 = 0;
+    var hi = c.run_pc.len;
+    if hi == 0 { return c.loc; }
+    while hi - lo > 1 {
+        let m = (lo + hi) / 2;
+        if c.run_pc.at(m) <= pc { lo = m; } else { hi = m; }
+    }
+    c.run_loc.at(lo)
+}
+
+/// Write the position of every word to `out` (length at least `len()`),
+/// for runtimes that keep one entry per word.
+pub fn Code<W>.locs_into(c: *Code<W>, out: []u32) {
+    var r: u64 = 0;
+    for pc in 0..c.words.len {
+        while r + 1 < c.run_pc.len and c.run_pc.at(r + 1) <= pc { r += 1; }
+        out[pc] = if c.run_loc.len == 0 { c.loc } else { c.run_loc.at(r) };
+    }
+}
+
+/// Append the position table in compact form (see `line_at`): per run,
+/// the pc delta and the zigzagged position delta as LEB128 varints.
+pub fn Code<W>.encode_locs(c: *Code<W>, out: *mem.Vec<u8>) {
+    var pc: u64 = 0;
+    var loc: i64 = 0;
+    for i in 0..c.run_pc.len {
+        put_varint(out, c.run_pc.at(i) - pc);
+        let d = c.run_loc.at(i) as i64 - loc;
+        put_varint(out, ((d << 1) ^ (d >> 63)) as u64);
+        pc = c.run_pc.at(i);
+        loc = c.run_loc.at(i) as i64;
+    }
+}
+
+fn put_varint(out: *mem.Vec<u8>, x: u64) {
+    var v = x;
+    while v >= 0x80 {
+        out.push(((v & 0x7F) | 0x80) as u8);
+        v = v >> 7;
+    }
+    out.push(v as u8);
+}
+
+fn get_varint(t: []u8, at: *u64) -> u64 {
+    var v: u64 = 0;
+    var sh: u64 = 0;
+    while *at < t.len {
+        let b = t[*at];
+        *at += 1;
+        v = v | (((b & 0x7F) as u64) << sh);
+        if b < 0x80 { break; }
+        sh += 7;
+    }
+    v
+}
+
+/// The position for `pc` in a table made by `encode_locs` (0 if empty).
+/// A linear scan: meant for error paths, not for every instruction.
+pub fn line_at(table: []u8, pc: u64) -> u32 {
+    var at: u64 = 0;
+    var cur_pc: u64 = 0;
+    var loc: i64 = 0;
+    var result: i64 = 0;
+    while at < table.len {
+        let dpc = get_varint(table, &at);
+        let z = get_varint(table, &at);
+        cur_pc += dpc;
+        if cur_pc > pc { break; }
+        loc += ((z >> 1) as i64) ^ (0 - ((z & 1) as i64));
+        result = loc;
+    }
+    result as u32
+}
+
+// Jump threading.
+
+/// Retarget jumps that land on an unconditional jump to that jump's final
+/// destination (following chains, at most 8 deep). `target_of(w)` is the
+/// offset of a jump word (None for other words) and `is_goto(w)` tells
+/// unconditional jumps. Run it after the last label is bound; it keeps
+/// every instruction in place, so positions and labels stay valid.
+pub fn Code<W>.thread_jumps(c: *Code<W>, target_of: fn(W) -> ?i64, is_goto: fn(W) -> bool) -> u64 {
+    var changed: u64 = 0;
+    var pc: u64 = 0;
+    let n = c.words.len;
+    while pc < n {
+        let w = c.words.at(pc);
+        let size = c.size(w);
+        if let Some(off) = target_of(w) {
+            var t = pc as i64 + off;
+            var hops = 0;
+            while hops < 8 and t >= 0 and (t as u64) < n and (t as u64) != pc {
+                let tw = c.words.at(t as u64);
+                if !is_goto(tw) { break; }
+                let Some(o2) = target_of(tw) else { break; };
+                if o2 == 0 { break; }
+                t = t + o2;
+                hops += 1;
+            }
+            if hops > 0 and t >= 0 and (t as u64) <= n {
+                if let Some(nw) = c.patch_fn(w, t - pc as i64) {
+                    c.words.set(pc, nw);
+                    changed += 1;
+                }
+            }
+        }
+        pc += if size == 0 { 1 } else { size };
+    }
+    changed
+}
+
+/// Copy the code into `out` (length at least `len()`).
+pub fn Code<W>.copy_into(c: *Code<W>, out: []W) {
+    for i in 0..c.words.len { out[i] = c.words.at(i); }
+}
+
+/// Reset for the next function (keeps the size and patch functions).
+pub fn Code<W>.clear(c: *Code<W>) {
+    c.words.clear();
+    c.run_pc.clear();
+    c.run_loc.clear();
+    c.labels.clear();
+    c.fixups.clear();
+    c.last_at = NONE;
+    c.barrier = NONE;
+    c.error = None;
+}
+
+pub fn Code<W>.free(c: *Code<W>) {
+    c.words.free();
+    c.run_pc.free();
+    c.run_loc.free();
+    c.labels.free();
+    c.fixups.free();
+}
+
+// ── constant pool ───────────────────────────────────────────────────────
+
+/// Constants with deduplication: `add` returns the index of an equal
+/// constant if there is one. Equality and hashing come from `hash.Hash`;
+/// to keep `0.0` and `-0.0` (or `1` and `1.0`) apart, compare bits, as a
+/// nanboxed value's `==` does.
+pub struct Pool<K: hash.Hash> { items: mem.Vec<K>, index: map.HashMap<K, u32>, limit: u64 }
+
+/// A pool holding at most `limit` constants (the width of the vm's
+/// constant operand).
+pub fn Pool<K>.new(limit: u64) -> Pool<K> {
+    Pool { items: mem.Vec.new(), index: map.HashMap.new(), limit: limit }
+}
+
+/// The index of `k`, added if new; None when the pool is full.
+pub fn Pool<K>.add(p: *Pool<K>, k: K) -> ?u32 {
+    if let Some(i) = p.index.get(k) { return Some(i); }
+    if p.items.len >= p.limit { return None; }
+    let i = p.items.len as u32;
+    p.items.push(k);
+    p.index.insert(k, i);
+    Some(i)
+}
+
+/// Add without deduplication (for constants that must stay distinct).
+pub fn Pool<K>.push(p: *Pool<K>, k: K) -> ?u32 {
+    if p.items.len >= p.limit { return None; }
+    p.items.push(k);
+    Some((p.items.len - 1) as u32)
+}
+
+pub fn Pool<K>.find(p: *Pool<K>, k: K) -> ?u32 { p.index.get(k) }
+pub fn Pool<K>.get(p: *Pool<K>, i: u32) -> K { p.items.at(i as u64) }
+pub fn Pool<K>.len(p: *Pool<K>) -> u64 { p.items.len }
+pub fn Pool<K>.items(p: *Pool<K>) -> []K { p.items.items() }
+
+pub fn Pool<K>.clear(p: *Pool<K>) {
+    p.items.clear();
+    p.index.free();
+    p.index = map.HashMap.new();
+}
+
+pub fn Pool<K>.free(p: *Pool<K>) {
+    p.items.free();
+    p.index.free();
+}
+
+// ── register allocation ─────────────────────────────────────────────────
+
+/// Registers of one function in a register VM. Registers below `nactive`
+/// hold active locals; temporaries are allocated as a stack from `top`
+/// (Lua's freereg) and must be freed in reverse order. `max` is the
+/// frame size the function needs.
+pub struct Regs { nactive: u32, top: u32, max: u32, limit: u32, overflow: bool }
+
+/// An allocator for at most `limit` registers.
+pub fn Regs.new(limit: u32) -> Regs {
+    Regs { nactive: 0, top: 0, max: 0, limit: limit, overflow: false }
+}
+
+/// Reserve `n` consecutive registers; returns the first. Past the limit
+/// it sets `overflow` (see `failed`) and still returns an index, so a
+/// compiler can report the error at the end of the statement or function.
+pub fn Regs.alloc(r: *Regs, n: u32) -> u32 {
+    let first = r.top;
+    r.top += n;
+    if r.top > r.max { r.max = r.top; }
+    if r.top > r.limit { r.overflow = true; }
+    first
+}
+
+/// `alloc`, or None past the limit (nothing is reserved then).
+pub fn Regs.try_alloc(r: *Regs, n: u32) -> ?u32 {
+    if r.top + n > r.limit { return None; }
+    Some(r.alloc(n))
+}
+
+/// Whether more than `limit` registers were ever requested.
+pub fn Regs.failed(r: *Regs) -> bool { r.overflow }
+
+/// Whether `reg` is a temporary (not a local).
+pub fn Regs.is_temp(r: *Regs, reg: u32) -> bool { reg >= r.nactive }
+
+/// Free temporary `reg` (locals are ignored). Temporaries must be freed
+/// top first: returns false (and frees nothing) if `reg` is not the top.
+pub fn Regs.free(r: *Regs, reg: u32) -> bool {
+    if reg < r.nactive { return true; }
+    if reg + 1 != r.top { return false; }
+    r.top -= 1;
+    true
+}
+
+/// Free two registers in whichever order keeps the stack discipline.
+pub fn Regs.free2(r: *Regs, a: u32, b: u32) -> bool {
+    if a > b { r.free(a) and r.free(b) } else { r.free(b) and r.free(a) }
+}
+
+/// The current top, to restore with `reset` (free everything allocated
+/// since).
+pub fn Regs.mark(r: *Regs) -> u32 { r.top }
+
+pub fn Regs.reset(r: *Regs, top: u32) {
+    r.top = if top < r.nactive { r.nactive } else { top };
+}
+
+/// End of a statement: free every temporary.
+pub fn Regs.end_stmt(r: *Regs) { r.top = r.nactive; }
+
+/// Make the `n` registers from `nactive` on locals (they must be
+/// allocated already, or are allocated now).
+pub fn Regs.activate(r: *Regs, n: u32) {
+    r.nactive += n;
+    if r.top < r.nactive { r.alloc(r.nactive - r.top); }
+}
+
+/// Enter a block: returns the level to give `leave`.
+pub fn Regs.enter(r: *Regs) -> u32 { r.nactive }
+
+/// Leave a block: its locals and all temporaries are freed.
+pub fn Regs.leave(r: *Regs, level: u32) {
+    r.nactive = level;
+    r.top = level;
+}
+
+/// The number of registers the function needs (at least `min`).
+pub fn Regs.frame_size(r: *Regs, min: u32) -> u32 { if r.max < min { min } else { r.max } }

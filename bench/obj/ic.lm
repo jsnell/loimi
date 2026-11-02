@@ -1,0 +1,130 @@
+// Property-read microbenchmark for std.obj: the same loop body with the
+// read done four ways, against a MOVE baseline.
+//
+//   loimi run bench/obj/ic.lm --release
+//
+// Each loop iteration does 8 reads (or moves) plus a decrement and a
+// branch; the reported cost per read is (time - baseline) / reads.
+import std.io;
+import std.gc;
+import std.obj;
+
+extern "C" fn clock() -> i64;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+struct Ctx { heap: gc.Heap, m: obj.Model<Gc<Obj>, Gc<Slots>, Value>, mega: obj.MegaCache }
+
+fn get_slow(c: *Ctx, v: Value, key: u64, shape_w: *u32, slot_w: *u32) -> Value {
+    let O(o) = v else { return Value.Nil; };
+    c.m.get_fill(o, key, shape_w, slot_w) ?? Value.Nil
+}
+
+vm B {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    cache PropIC { shape: u32, slot: u32 }
+
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    // Monomorphic inline cache (quickened after the first execution).
+    family GETPROP(dst: reg, o: reg, key: imm) : ABC + PropIC {
+        generic {
+            dst = get_slow(ctx, o, key as u64, &cache.shape, &cache.slot);
+            if cache.shape != obj.EMPTY_ID and cache.slot & obj.OUT == 0 { become GETPROP_IN; }
+            next
+        }
+        GETPROP_IN {
+            if let O(x) = o and x.shape.id == cache.shape {
+                dst = ctx.m.load_inline(x, cache.slot);
+                next
+            }
+            cold { become GETPROP; redo }
+        }
+    }
+    // No cache: a lookup in the shape (a walk of the transition chain).
+    op GETPROP_LOOKUP(dst: reg, o: reg, key: imm) : ABC {
+        if let O(x) = o { dst = ctx.m.get(x, key as u64) ?? Value.Nil; next }
+        dst = Value.Nil;
+        next
+    }
+    // The global megamorphic cache.
+    op GETPROP_MEGA(dst: reg, o: reg, key: imm) : ABC {
+        if let O(x) = o { dst = ctx.m.get_mega(&ctx.mega, x, key as u64) ?? Value.Nil; next }
+        dst = Value.Nil;
+        next
+    }
+    op DEC(dst: reg) : ABC {
+        if let Int(x) = dst { dst = Value.Int(x - 1); }
+        next
+    }
+    op JPOS(a: reg, target: label) : AsBx {
+        if let Int(x) = a and x > 0 { jump target }
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32, r: *Value) -> Value { ctx = c; pc = code; regs = r; jump pc }
+}
+
+const ITERS: i32 = 10000000;
+const READS: u64 = 8;
+
+/// Build the loop with `kind`: 0 MOVE, 1 GETPROP, 2 GETPROP_LOOKUP, 3 GETPROP_MEGA.
+fn time(c: *Ctx, o: Gc<Obj>, kind: u32, label: str, base: f64) -> f64 {
+    var code: [u32; 64] = [0; 64];
+    let s = code[..];
+    var at: u64 = 0;
+    for i in 0..READS {
+        let key = (i % 4 + 1) as u8;
+        at = match kind {
+            0 => B.emit.MOVE(s, at, 3, 0),
+            1 => B.emit.GETPROP(s, at, 3, 0, key),
+            2 => B.emit.GETPROP_LOOKUP(s, at, 3, 0, key),
+            _ => B.emit.GETPROP_MEGA(s, at, 3, 0, key),
+        };
+    }
+    at = B.emit.DEC(s, at, 2);
+    let back = 0 - (at as i64);
+    at = B.emit.JPOS(s, at, 2, back as i16);
+    at = B.emit.RET(s, at, 3);
+    var regs: [Value; 4] = [Value.Nil; 4];
+    regs[0] = Value.O(o);
+    regs[2] = Value.Int(ITERS);
+    let t0 = clock();
+    B.run(c, &code[0], &regs[0]);
+    let t = (clock() - t0) as f64 / 1000000.0;
+    let reads = ITERS as f64 * READS as f64;
+    io.print(label);
+    io.print(": ");
+    io.print_f64(t * 1000.0);
+    io.print(" ms");
+    if base > 0.0 {
+        io.print(", ");
+        io.print_f64((t - base) * 1000000000.0 / reads);
+        io.print(" ns per read over the MOVE loop");
+    }
+    io.println("");
+    t
+}
+
+fn main() {
+    var c = Ctx { heap: gc.Heap.new(), m: obj.Model.new(new_slots, Value.Nil), mega: obj.MegaCache.new(4096) };
+    c.m.attach(&c.heap);
+    let o = new(&c.heap, Obj { shape: c.m.root(4), dict: None, overflow: None }, 4);
+    for k in 1..5 { c.m.set(o, k as u64, Value.Int(k as i32)); }
+    let base = time(&c, o, 0, "MOVE (baseline)", 0.0);
+    time(&c, o, 1, "inline cache hit", base);
+    time(&c, o, 3, "megamorphic cache", base);
+    time(&c, o, 2, "uncached lookup", base);
+}

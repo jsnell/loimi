@@ -1,0 +1,223 @@
+// std.obj under GC stress: random property writes, deletions, prototype
+// changes, dictionary switches and object replacement, with a collection
+// after every operation, checked against a host-side model. Slot values
+// include references to boxes reachable only through the slots, and
+// discarded objects leave dead shapes behind for the sweeper.
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, proto: ?Gc<Obj>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+const N: u64 = 12;
+const KEYS: u64 = 6;
+const ABSENT: i64 = -1000000;
+
+struct World {
+    heap: gc.Heap,
+    m: obj.Model<Gc<Obj>, Gc<Slots>, Value>,
+    objs: mem.Vec<Gc<Obj>>,
+    /// Expected own values: objs × KEYS; ABSENT, n (Int), or n + 1000 (boxed).
+    want: mem.Vec<i64>,
+    proto: mem.Vec<i64>,
+    entries: mem.Vec<obj.ProtoEntry<Gc<Obj>>>,
+    ekeys: mem.Vec<u64>,
+    hits: u64,
+    shadows: u64,
+    seed: u64,
+    errors: u64,
+}
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let w = data as *World;
+    for i in 0..w.objs.len { gc_mark(h, w.objs.at(i)); }
+    for i in 0..w.entries.len { w.entries.ptr_at(i).mark(h); }
+}
+
+fn World.rand(w: *World, n: u64) -> u64 {
+    w.seed = w.seed *% 6364136223846793005 +% 1442695040888963407;
+    (w.seed >> 33) % n
+}
+
+fn World.fresh(w: *World, i: u64) {
+    let n = w.rand(4);
+    let o = new(&w.heap, Obj { shape: w.m.root(n as u32), dict: None, overflow: None, proto: None }, n);
+    w.objs.set(i, o);
+    for k in 0..KEYS { w.want.set(i * KEYS + k, ABSENT); }
+    w.proto.set(i, -1);
+    // Objects that had this one as prototype keep the old object; forget
+    // the relation in the model so lookups through it are not checked.
+    for j in 0..N { if w.proto.at(j) == i as i64 { w.proto.set(j, -2); } }
+    if i > 0 and w.rand(4) != 0 {
+        let j = w.rand(i);
+        w.m.set_proto(o, Some(w.objs.at(j)));
+        w.proto.set(i, j as i64);
+    }
+}
+
+fn value_of(v: Value) -> i64 {
+    match v {
+        Int(n) => n as i64,
+        O(b) => match b.inline[0] { Int(n) => n as i64 + 1000, _ => -7 },
+        _ => -9,
+    }
+}
+
+fn World.check(w: *World, i: u64) {
+    let o = w.objs.at(i);
+    var count: u64 = 0;
+    for k in 0..KEYS {
+        let want = w.want.at(i * KEYS + k);
+        let got = match w.m.get(o, k) { Some(v) => value_of(v), None => ABSENT };
+        if got != want {
+            if w.errors < 5 {
+                io.print("mismatch obj "); io.print_int(i as i64); io.print(" key "); io.print_int(k as i64);
+                io.print(" want "); io.print_int(want); io.print(" got "); io.print_int(got); io.println("");
+            }
+            w.errors += 1;
+        }
+        if want != ABSENT { count += 1; }
+        // Through the chain: the nearest object (in the model) with the key.
+        var j = i as i64;
+        var expect = ABSENT;
+        while j >= 0 {
+            let x = w.want.at(j as u64 * KEYS + k);
+            if x != ABSENT { expect = x; break; }
+            j = w.proto.at(j as u64);
+        }
+        if j == -2 { continue; }
+        let chain = match w.m.get_chain(o, k) { Some(v) => value_of(v), None => ABSENT };
+        if chain != expect { w.errors += 1; }
+    }
+    if w.m.len(o) != count { w.errors += 1; }
+}
+
+/// Write the cached key somewhere on cached receiver i's chain:
+/// shadowing must invalidate the entry, overwriting the holder must not.
+fn World.write_chain(w: *World, i: u64) {
+    let o = w.objs.at(i);
+    let e = w.entries.ptr_at(i);
+    if w.m.proto_hit(o, e).is_none() { return; }
+    var cur = o.proto;
+    var hops = w.rand(3);
+    loop {
+        let Some(p) = cur else { break; };
+        if hops == 0 { break; }
+        hops -= 1;
+        cur = p.proto;
+    }
+    let Some(p) = cur else { return; };
+    for j in 0..N {
+        if w.objs.at(j) == p {
+            let n = w.rand(1000) as i32;
+            let key = w.ekeys.at(i);
+            w.m.set(p, key, Value.Int(n));
+            w.want.set(j * KEYS + key, n as i64);
+            w.shadows += 1;
+        }
+    }
+}
+
+fn World.step(w: *World) {
+    let i = w.rand(N);
+    let o = w.objs.at(i);
+    let k = w.rand(KEYS);
+    match w.rand(16) {
+        0 | 1 | 2 | 3 | 4 | 5 => {
+            let n = w.rand(1000) as i32;
+            w.m.set(o, k, Value.Int(n));
+            w.want.set(i * KEYS + k, n as i64);
+        }
+        6 | 7 => {
+            // A box reachable only from the slot.
+            let n = w.rand(1000) as i32;
+            let b = new(&w.heap, Obj { shape: w.m.root(1), dict: None, overflow: None, proto: None }, 1);
+            w.m.set(b, 0, Value.Int(n));
+            w.m.set(o, k, Value.O(b));
+            w.want.set(i * KEYS + k, n as i64 + 1000);
+        }
+        8 | 9 => {
+            let had = w.want.at(i * KEYS + k) != ABSENT;
+            if w.m.delete(o, k) != had { w.errors += 1; }
+            w.want.set(i * KEYS + k, ABSENT);
+        }
+        10 => {
+            // A prototype with a lower index (no cycles), or none.
+            let j = w.rand(N);
+            if j < i {
+                w.m.set_proto(o, Some(w.objs.at(j)));
+                w.proto.set(i, j as i64);
+            } else {
+                w.m.set_proto(o, None);
+                w.proto.set(i, -1);
+            }
+        }
+        11 => { if w.rand(2) == 0 { w.m.to_dict(o); } else { w.m.optimize(o); } }
+        12 => w.fresh(i),
+        _ => {
+            // A cached prototype read, then a hit check on the same receiver.
+            let e = w.entries.ptr_at(i);
+            *e = obj.ProtoEntry.empty();
+            let v = w.m.get_proto_fill(o, k, e);
+            w.ekeys.set(i, k);
+            if let Some(hv) = w.m.proto_hit(o, e) and let Some(x) = v {
+                if value_of(hv) != value_of(x) { w.errors += 1; }
+            }
+            if w.rand(2) == 0 { w.write_chain(i); }
+        }
+    }
+    // Every cached entry that still hits must agree with a fresh lookup.
+    for j in 0..N {
+        let e = w.entries.ptr_at(j);
+        let oj = w.objs.at(j);
+        if let Some(hv) = w.m.proto_hit(oj, e) {
+            w.hits += 1;
+            let fresh = match w.m.get_chain(oj, w.ekeys.at(j)) { Some(v) => value_of(v), None => ABSENT };
+            if fresh != value_of(hv) {
+                if w.errors < 5 { io.println("stale prototype cache entry"); }
+                w.errors += 1;
+            }
+        }
+    }
+    w.check(i);
+}
+
+fn main() uses gc {
+    var w = World {
+        heap: gc.Heap.new(),
+        m: obj.Model.new(new_slots, Value.Nil),
+        objs: mem.Vec.new(), want: mem.Vec.new(), proto: mem.Vec.new(), entries: mem.Vec.new(), ekeys: mem.Vec.new(), hits: 0, shadows: 0,
+        seed: 12345, errors: 0,
+    };
+    w.m.attach(&w.heap);
+    w.m.dict_threshold = 12;
+    w.heap.add_scanner(&w as *u8, scan);
+    w.heap.set_stress(true);
+    let tmp = new(&w.heap, Obj { shape: w.m.root(0), dict: None, overflow: None, proto: None }, 0);
+    for i in 0..N {
+        w.objs.push(tmp);
+        w.proto.push(-1);
+        w.entries.push(obj.ProtoEntry.empty());
+        w.ekeys.push(0);
+        for k in 0..KEYS { w.want.push(ABSENT); }
+    }
+    for i in 0..N { w.fresh(i); }
+    for step in 0..10000 {
+        w.step();
+        gc.maybe_collect(&w.heap);
+    }
+    for i in 0..N { w.check(i); }
+    io.print("errors "); io.print_int(w.errors as i64); io.println("");
+    io.print_bool(w.heap.collections >= 10000); io.println("");
+    io.print_bool(w.m.shapes.swept > 0); io.println("");
+    io.print_bool(w.hits > 200 and w.shadows > 50); io.println("");
+}
+// expect: errors 0
+// expect: true
+// expect: true
+// expect: true
