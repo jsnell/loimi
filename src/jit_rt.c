@@ -56,7 +56,7 @@ uint16_t loimi_jit_hotcount[HOT_SLOTS];
 enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER };
 enum { R_64 = 1, R_PC32 = 2, R_PLT32 = 4, R_32 = 10, R_32S = 11, R_TPOFF32 = 23 };
 enum { S_NONE, S_COMPILED, S_FAILED };
-#define MAX_COMPILES 8
+#define MAX_COMPILES 32
 
 struct rec {
     uint32_t *code;
@@ -72,10 +72,10 @@ static uint16_t threshold = 50;
 static struct rec **recs;
 static size_t nrecs, caprecs;
 static size_t nentries, capentries;
-static uint8_t *region, *region_end, *bump, *rodata, *helpers;
+static uint8_t *region, *region_end, *bump, *rodata, *helpers, *exit_code;
 static int64_t *tlsoff;
 static struct {
-    uint64_t compiles, failures, invalidations, insns, exits, bytes, patched, ns, max_ns;
+    uint64_t compiles, failures, invalidations, given_up, insns, exits, bytes, patched, ns, max_ns;
 } st;
 
 static uint64_t now_ns(void) {
@@ -90,9 +90,10 @@ static void report(void) {
         return;
     }
     fprintf(stderr,
-            "jit: %llu compiles (%llu failed, %llu invalidations), %llu instructions (%llu exit to the interpreter), "
+            "jit: %llu compiles (%llu failed, %llu invalidations, %llu given up), %llu instructions (%llu exit to the interpreter), "
             "%llu bytes, %llu entries; compile time %.3f ms total, %.1f us per function (max %.1f), %.0f ns per instruction\n",
             (unsigned long long)st.compiles, (unsigned long long)st.failures, (unsigned long long)st.invalidations,
+            (unsigned long long)st.given_up,
             (unsigned long long)st.insns, (unsigned long long)st.exits, (unsigned long long)st.bytes,
             (unsigned long long)st.patched, st.ns / 1e6, st.compiles ? st.ns / 1e3 / st.compiles : 0.0, st.max_ns / 1e3,
             st.insns ? (double)st.ns / st.insns : 0.0);
@@ -213,6 +214,25 @@ static int init_region(void) {
         mprotect(helpers, hl, PROT_READ | PROT_EXEC);
         bump += hl;
     }
+    /* One copy of the exit stencil (dispatch *pc in the interpreter), for
+     * continuations that do not land on an instruction. */
+    const struct jit_stencil *xs = &loimi_jit_stencils[loimi_jit_nops];
+    exit_code = bump;
+    mprotect(exit_code, 4096, PROT_READ | PROT_WRITE);
+    memcpy(exit_code, loimi_jit_code + xs->code, xs->len);
+    for (uint32_t k = 0; k < xs->nreloc; k++) {
+        const struct jit_reloc *rl = &loimi_jit_relocs[xs->reloc + k];
+        int64_t S = 0;
+        switch (rl->kind) {
+        case K_SYM: S = (int64_t)(intptr_t)loimi_jit_syms[rl->arg]; break;
+        case K_TLS: S = tlsoff[rl->arg]; break;
+        case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
+        case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
+        }
+        patch(exit_code + rl->off, rl, S);
+    }
+    mprotect(exit_code, 4096, PROT_READ | PROT_EXEC);
+    bump += 4096;
     return 1;
 }
 
@@ -268,7 +288,13 @@ static void unpatch(struct rec *r) {
     for (uint32_t i = 0; i < r->npatched; i++) r->code[r->ppc[i]] = r->orig[i];
     r->npatched = 0;
     r->state = r->compiles >= MAX_COMPILES ? S_FAILED : S_NONE;
+    if (r->state == S_FAILED) st.given_up++;
     st.invalidations++;
+    /* Quickening is usually done after a few rewrites: compile again
+     * after a few more calls, instead of a full threshold. */
+    uint16_t *c = &loimi_jit_hotcount[((uintptr_t)r->code >> 2) & (HOT_SLOTS - 1)];
+    uint16_t soon = threshold / 8 + 1;
+    if (*c > soon) *c = soon;
 }
 
 void loimi_jit_become(uint32_t *pc) {
@@ -312,7 +338,10 @@ static int compile(struct rec *r) {
     for (uint64_t pc = 0; pc < n;) {
         uint32_t op = code[pc] & opmask;
         const struct jit_opinfo *oi = &loimi_jit_opinfo[op];
-        if (oi->base == 0xffff || oi->size == 0 || pc + oi->size > n) goto out;
+        if (oi->base == 0xffff || oi->size == 0 || pc + oi->size > n) {
+            if (debug) fprintf(stderr, "jit: %p: no op at word %llu (%08x)\n", (void *)code, (unsigned long long)pc, code[pc]);
+            goto out;
+        }
         uint32_t s = loimi_jit_stencils[oi->base].present ? oi->base
                      : (oi->part != 0xffff && loimi_jit_stencils[oi->part].present) ? oi->part : nops;
         if (s == nops) nexit++;
@@ -355,13 +384,15 @@ static int compile(struct rec *r) {
             }
             case K_NEXT:
                 t = (int64_t)pc + rl->arg;
-                if (t < 0 || (uint64_t)t >= n || map[t] < 0) goto fail;
-                S = (int64_t)(intptr_t)(dst + map[t]);
+                /* Not an instruction: the jump is never taken (verified
+                 * code jumps to instructions only), but must go somewhere. */
+                S = (int64_t)(intptr_t)(t < 0 || (uint64_t)t >= n || map[t] < 0 ? exit_code : dst + map[t]);
                 break;
             case K_JUMP:
                 t = (int64_t)pc + (rl->arg & 255) + field(code[pc + (rl->arg & 255)], rl->arg);
-                if (t < 0 || (uint64_t)t >= n || map[t] < 0) goto fail;
-                S = (int64_t)(intptr_t)(dst + map[t]);
+                /* A signed operand that is not a label (the stencil
+                 * compares the jump's target with pc + it): the same. */
+                S = (int64_t)(intptr_t)(t < 0 || (uint64_t)t >= n || map[t] < 0 ? exit_code : dst + map[t]);
                 break;
             case K_TLS: S = tlsoff[rl->arg]; break;
             case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
