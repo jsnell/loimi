@@ -586,46 +586,49 @@ pub vm Scheme {
     }
 
     // Superinstructions, chosen from `--vm-stats` over the benchmarks.
+    // All `#[forward]`: where a part reads the register the previous part
+    // wrote, `optimize` picks a variant that keeps the value in a machine
+    // register (no run-time test; it costs opcodes and code size).
     // Compare-and-branch pairs produced by every `if`:
-    super LTI_TEST = LTI; TEST;
-    super LEI_TEST = LEI; TEST;
-    super GTI_TEST = GTI; TEST;
-    super GEI_TEST = GEI; TEST;
-    super NUMEQI_TEST = NUMEQI; TEST;
-    super LT_TEST = LT; TEST;
-    super LT_TESTT = LT; TESTT;
-    super LE_TEST = LE; TEST;
-    super GT_TEST = GT; TEST;
-    super GE_TEST = GE; TEST;
-    super NUMEQ_TEST = NUMEQ; TEST;
-    super NULLP_TEST = NULLP; TEST;
-    super PAIRP_TEST = PAIRP; TEST;
-    super EQ_TEST = EQ; TEST;
-    super NOT_TEST = NOT; TEST;
-    super ZEROP_TEST = ZEROP; TEST;
+    #[forward] super LTI_TEST = LTI; TEST;
+    #[forward] super LEI_TEST = LEI; TEST;
+    #[forward] super GTI_TEST = GTI; TEST;
+    #[forward] super GEI_TEST = GEI; TEST;
+    #[forward] super NUMEQI_TEST = NUMEQI; TEST;
+    #[forward] super LT_TEST = LT; TEST;
+    #[forward] super LT_TESTT = LT; TESTT;
+    #[forward] super LE_TEST = LE; TEST;
+    #[forward] super GT_TEST = GT; TEST;
+    #[forward] super GE_TEST = GE; TEST;
+    #[forward] super NUMEQ_TEST = NUMEQ; TEST;
+    #[forward] super NULLP_TEST = NULLP; TEST;
+    #[forward] super PAIRP_TEST = PAIRP; TEST;
+    #[forward] super EQ_TEST = EQ; TEST;
+    #[forward] super NOT_TEST = NOT; TEST;
+    #[forward] super ZEROP_TEST = ZEROP; TEST;
     // Loops, argument set-up and list walking.
-    super MOVE_MOVE = MOVE; MOVE;
+    #[forward] super MOVE_MOVE = MOVE; MOVE;
     // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.
     #[allow(super_overlap)]
-    super MOVE_JMP = MOVE; JMP;
-    super ADDI_JMP = ADDI; JMP;
-    super CDR_JMP = CDR; JMP;
+    #[forward] super MOVE_JMP = MOVE; JMP;
+    #[forward] super ADDI_JMP = ADDI; JMP;
+    #[forward] super CDR_JMP = CDR; JMP;
     // Overlaps another super, but runs outside CDR; JMP: 13-18% of takl's and ntakl's ops.
     #[allow(super_overlap)]
-    super CDR_CDR = CDR; CDR;
-    super GETFREE_GETFREE = GETFREE; GETFREE;
-    super ADD_RET = ADD; RET;
-    super CONS_RET = CONS; RET;
+    #[forward] super CDR_CDR = CDR; CDR;
+    #[forward] super GETFREE_GETFREE = GETFREE; GETFREE;
+    #[forward] super ADD_RET = ADD; RET;
+    #[forward] super CONS_RET = CONS; RET;
     // Overlaps another super, but runs outside LT; TESTT: 2-2.8% of takl's, ntakl's and nboyer's ops.
     #[allow(super_overlap)]
-    super TESTT_RET = TESTT; RET;
-    super ADDI_CALL = ADDI; CALL;
+    #[forward] super TESTT_RET = TESTT; RET;
+    #[forward] super ADDI_CALL = ADDI; CALL;
     // Overlaps another super, but runs outside MOVE; MOVE: 4.4% of conform's ops, 1-2% of several others.
     #[allow(super_overlap)]
-    super MOVE_CALL = MOVE; CALL;
+    #[forward] super MOVE_CALL = MOVE; CALL;
     // Overlaps another super, but runs outside MOVE; MOVE: 7% of fibc's ops, 4% of graphs'.
     #[allow(super_overlap)]
-    super MOVE_TAILCALL = MOVE; TAILCALL;
+    #[forward] super MOVE_TAILCALL = MOVE; TAILCALL;
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V uses gc {
         ctx = c;

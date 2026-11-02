@@ -984,50 +984,53 @@ pub vm Mini {
     }
 
     // Suggested by `loimi build --vm-stats` on recursive code.
-    super LOADI_SUB = LOADI; SUB;
-    super ADD_RET1 = ADD; RET1;
-    super MUL_F_ADD_F = MUL_F; ADD_F;
+    // All `#[forward]`: where a part reads the register the previous part
+    // wrote, `optimize` picks a variant that keeps the value in a machine
+    // register (no run-time test; it costs opcodes and code size).
+    #[forward] super LOADI_SUB = LOADI; SUB;
+    #[forward] super ADD_RET1 = ADD; RET1;
+    #[forward] super MUL_F_ADD_F = MUL_F; ADD_F;
     // Overlaps another super, but runs where no ADD_F follows: 2.8% of nbody's ops.
     #[allow(super_overlap)]
-    super MUL_F_MUL_F = MUL_F; MUL_F;
+    #[forward] super MUL_F_MUL_F = MUL_F; MUL_F;
     // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops, 2.8% of nbody's.
     #[allow(super_overlap)]
-    super ADD_F_MUL_F = ADD_F; MUL_F;
+    #[forward] super ADD_F_MUL_F = ADD_F; MUL_F;
     // Overlaps another super, but runs outside MUL_F; MUL_F: 8.3% of nbody's ops.
     #[allow(super_overlap)]
-    super MUL_F_SUB_F = MUL_F; SUB_F;
+    #[forward] super MUL_F_SUB_F = MUL_F; SUB_F;
     // Overlaps another super, but runs outside MUL_F; ADD_F: 15% of mandelbrot's ops.
     #[allow(super_overlap)]
-    super ADD_F_SUB_F = ADD_F; SUB_F;
+    #[forward] super ADD_F_SUB_F = ADD_F; SUB_F;
     // Overlaps another super, but runs outside the MUL_F pairs: 15% of mandelbrot's ops.
     #[allow(super_overlap)]
-    super MULK_F_MUL_F = MULK_F; MUL_F;
+    #[forward] super MULK_F_MUL_F = MULK_F; MUL_F;
     // Overlaps another super, but runs outside the MUL_F pairs: 11% of nbody's ops.
     #[allow(super_overlap)]
-    super GETFIELD_MUL_F = GETFIELD; MUL_F;
-    super GETFIELD_SUB_F = GETFIELD; SUB_F;
+    #[forward] super GETFIELD_MUL_F = GETFIELD; MUL_F;
+    #[forward] super GETFIELD_SUB_F = GETFIELD; SUB_F;
     // Overlaps another super, but runs outside MUL_F; ADD_F: 8.3% of nbody's ops.
     #[allow(super_overlap)]
-    super ADD_F_SETFIELD = ADD_F; SETFIELD;
-    super MOVE_CALL = MOVE; CALL;
+    #[forward] super ADD_F_SETFIELD = ADD_F; SETFIELD;
+    #[forward] super MOVE_CALL = MOVE; CALL;
     // Overlaps another super, but runs outside MOVE; CALL: 2% of closures' ops.
     #[allow(super_overlap)]
-    super MOVE_MOVE = MOVE; MOVE;
+    #[forward] super MOVE_MOVE = MOVE; MOVE;
     // Overlaps another super, but runs outside MOVE; MOVE: 6% of string_build's ops.
     #[allow(super_overlap)]
-    super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
-    super GETINDEX_GETINDEX = GETINDEX; GETINDEX;
+    #[forward] super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
+    #[forward] super GETINDEX_GETINDEX = GETINDEX; GETINDEX;
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
     #[allow(super_overlap)]
-    super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
+    #[forward] super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
     // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
     #[allow(super_overlap)]
-    super GETUPVAL_MOVE = GETUPVAL; MOVE;
+    #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
     #[forward] super ADDI_ADDI = ADDI; ADDI;
-    super GETUPVAL_JEQN = GETUPVAL; JEQN;
+    #[forward] super GETUPVAL_JEQN = GETUPVAL; JEQN;
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 2.3% of interp's ops.
     #[allow(super_overlap)]
-    super GETINDEX_ADDI = GETINDEX; ADDI;
+    #[forward] super GETINDEX_ADDI = GETINDEX; ADDI;
 
     /// A top-level run of `cl` from the bottom of the stack (the
     /// standalone interpreter).
