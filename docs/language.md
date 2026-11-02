@@ -1912,8 +1912,9 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
 
   More in the header:
 
-  - **Documentation.** The `///` comment above an export (or an exported
-    constant) becomes a C comment above its declaration.
+  - **Documentation.** The `///` comment above an export, an exported
+    constant, or a struct or enum the header declares becomes a C
+    comment above its declaration.
   - **Constants.** `export "C" const RX_SEARCH: u32 = 1;` is an ordinary
     constant in Loimi and `#define RX_SEARCH 1u` in the header (integers
     with a `u`/`LL`/`ULL` suffix by type, `bool`, floats, `str` as a

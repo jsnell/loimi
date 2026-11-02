@@ -19,9 +19,10 @@ typedef struct loimi_str { const char *ptr; size_t len; } loimi_str;
 
 /* Opaque Loimi structs, used through pointers. */
 typedef struct Counter Counter;
+/* A C name of its own: `api_point` in the header. */
 typedef struct api_point api_point;
 
-/* enum Mode */
+/* What counter_step does: add or subtract. */
 typedef uint8_t Mode;
 enum { Mode_Add = 0, Mode_Sub = 1 };
 

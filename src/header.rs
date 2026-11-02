@@ -345,6 +345,11 @@ fn c_comment(doc: &[String]) -> String {
     }
 }
 
+/// The `///` comment of struct or enum `name` as a C comment, or nothing.
+fn type_doc(p: &Program, sm: &SourceMap, name: &str) -> String {
+    p.type_spans.get(name).map(|sp| c_comment(&doc_lines(sm, *sp))).unwrap_or_default()
+}
+
 /// The header for `p`'s exports. `guard` names the include guard;
 /// `prefix` goes before the C names of structs and enums without a
 /// `#[c_name]`.
@@ -371,16 +376,18 @@ pub fn generate(p: &Program, sm: &SourceMap, source: &str, guard: &str, prefix: 
     );
     if !g.opaque.is_empty() {
         out.push_str("/* Opaque Loimi structs, used through pointers. */\n");
-        for c in g.opaque.keys() {
+        for (c, name) in &g.opaque {
+            out.push_str(&type_doc(p, sm, name));
             out.push_str(&format!("typedef struct {0} {0};\n", c));
         }
         out.push('\n');
     }
     for (c, &i) in &g.enums {
         let e = &p.enums[i as usize];
+        let doc = type_doc(p, sm, &e.name);
+        out.push_str(&if doc.is_empty() { format!("/* enum {} */\n", c) } else { doc });
         out.push_str(&format!(
-            "/* enum {} */\ntypedef {}int{}_t {};\n",
-            c,
+            "typedef {}int{}_t {};\n",
             if e.tag.signed { "" } else { "u" },
             e.tag.bits,
             c

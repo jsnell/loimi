@@ -327,6 +327,7 @@ impl<'a> Checker<'a> {
                             None
                         };
                         self.struct_files.insert(id, s.name.span.file);
+                        self.prog.type_spans.insert(format!("{}.{}", prefix, s.name.name), s.name.span);
                         if let Some(c) = &s.c_name {
                             self.prog.c_names.insert(format!("{}.{}", prefix, s.name.name), c.clone());
                         }
@@ -342,6 +343,7 @@ impl<'a> Checker<'a> {
                     }
                     Item::Enum(e) => {
                         let id = self.prog.enums.len() as u32;
+                        self.prog.type_spans.insert(format!("{}.{}", prefix, e.name.name), e.name.span);
                         if let Some(c) = &e.c_name {
                             self.prog.c_names.insert(format!("{}.{}", prefix, e.name.name), c.clone());
                         }
