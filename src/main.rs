@@ -76,7 +76,8 @@ const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address] [-W error | --deny-warnings]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
-       loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
+                  [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
+       loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]";
 
 fn std_root() -> PathBuf {
     if let Ok(p) = std::env::var("LOIMI_STD") {
@@ -610,10 +611,25 @@ fn compiler_main() -> ExitCode {
         let _ = std::fs::remove_file(&obj);
     }
     if opts.keep_ll {
-        eprintln!("IR kept at {}", ll.display());
-    } else {
-        let _ = std::fs::remove_file(&ll);
+        // The temporary directory goes away below: keep the IR next to the
+        // output (`-o dir/x` keeps `dir/x.ll`), else as `<stem>.ll` in the
+        // current directory, like `--emit-llvm`.
+        let kept = match &opts.output {
+            Some(o) => {
+                let mut s = o.clone().into_os_string();
+                s.push(".ll");
+                PathBuf::from(s)
+            }
+            None => PathBuf::from(format!("{}.ll", stem)),
+        };
+        if let Err(e) = std::fs::copy(&ll, &kept) {
+            eprintln!("error: cannot write {}: {}", kept.display(), e);
+            let _ = std::fs::remove_dir_all(&tmpdir);
+            return ExitCode::from(1);
+        }
+        eprintln!("IR kept at {}", kept.display());
     }
+    let _ = std::fs::remove_file(&ll);
     if opts.run {
         let status = Command::new(&exe).args(&opts.run_args).status();
         let _ = std::fs::remove_dir_all(&tmpdir);

@@ -608,6 +608,29 @@ fn variant_wraps_all_goto_build_time() {
     assert!(took.as_secs() < 60, "building step 9 with `wraps all` in goto mode took {:?}", took);
 }
 
+/// `--keep-ll` keeps the IR next to the output, where it survives the
+/// temporary build directory (it used to be printed as kept and then
+/// deleted with that directory), and as `<stem>.ll` without `-o`.
+#[test]
+fn keep_ll() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("loimi-keep-ll-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hello = root.join("tests/run/hello.lm");
+    let out = loimi().args(["build", "--keep-ll", "-o"]).arg(dir.join("hi")).arg(&hello).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "build failed:\n{}", stderr);
+    let ll = dir.join("hi.ll");
+    assert!(stderr.contains(&format!("IR kept at {}", ll.display())), "{}", stderr);
+    assert!(std::fs::read_to_string(&ll).unwrap().contains("define "), "{} is not IR", ll.display());
+    assert!(dir.join("hi").exists());
+    let out = loimi().args(["run", "--keep-ll"]).arg(&hello).current_dir(&dir).output().unwrap();
+    assert!(out.status.success(), "run failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert!(dir.join("hello.ll").exists(), "`run --keep-ll` kept no hello.ll");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Build `lib` as a static archive and as a shared object (with the C
 /// header from `--header`), compile `host` against each with clang, and
 /// compare the host's output with `expected`. `header_golden`: the header
