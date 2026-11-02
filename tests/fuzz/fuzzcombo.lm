@@ -1,0 +1,776 @@
+// Differential fuzzer for combinations of vm features in generated code.
+//
+// fuzzvm.lm checks the verifier; this one checks that superinstructions
+// compute what their parts compute alone, across the features that
+// change how a part is compiled: `#[forward]` forwarding variants,
+// n-ary supers, family members as parts and `become` inside a part
+// (from the hot path and from a cold block, with `redo`), cold blocks
+// that read operands (forwarded or not, outlined in tail-call mode),
+// `-> never` vm functions (inlined, and shared copies reached from cold
+// blocks or `#[inline(never)]`), cache handles and wide cache fields,
+// `then JMP` parts, `raise` from a part (the `pc` that `on raise` sees),
+// `const` operands, signed fields, calls and returns, and allocation
+// (Gc locals live across a collection) in parts and cold blocks.
+//
+// For each seed it generates a well-formed program (mostly runs of a
+// super's parts, with operands that often name the register the
+// previous instruction wrote, so that forwarding variants form), and
+// runs it twice: as emitted (no supers: the reference) and after
+// `C.optimize`. Each run executes the code twice (the second time on
+// quickened code; the optimized copy is optimized again in between, to
+// fuse supers of quickened members). The result, registers, the log of
+// `OUT` values and raises (with the raising pc) must agree, and the code
+// must still verify. `C.deopt` of the two codes must agree too.
+//
+// The vm has one dispatch mode per build (`--dispatch=`), and runs under
+// the copy-and-patch JIT when built with `--jit-stencils` and run with
+// LOIMI_JIT=1 LOIMI_JIT_HOT=1. At exit the driver prints a hash of every
+// outcome, which must be the same for every build: tests/fuzz.rs builds
+// it in each mode and compares.
+//
+// usage: fuzzcombo <first-seed> <count> [-v | -d] [stress] [jit]
+//   -v prints each seed before running it; -d also prints each program,
+//   -r only each run's result.
+//   stress: collect at every allocation.
+//   jit: the JIT is on (LOIMI_JIT=1): skip what it does not support
+//   (optimize, verify and deopt of code it has compiled).
+
+import std.io;
+import std.os;
+import std.mem;
+import std.num;
+import std.text;
+import std.gc;
+
+object Box { v: i64 }
+
+object Proto {
+    nregs: u32,
+    nconsts: u32,
+    nfuncs: u32,
+    k: *i64,
+    fentry: *u32,
+    code: verified [u32] by C,
+}
+
+struct Frame { ret: *u32, regs: *i64 }
+
+struct Ctx {
+    heap: gc.Heap,
+    nregs: u64,
+    reg_end: *i64,
+    frames: *Frame,
+    depth: u64,
+    /// Backward progress (jumps, calls, redo) left before `fail`.
+    budget: i64,
+    /// A hash of OUT values and raises.
+    log: u64,
+    nraise: u64,
+    code0: *u32,
+}
+
+const BUDGET_EXHAUSTED: i64 = 1000001;
+const CALL_OVERFLOW: i64 = 1000003;
+const TOO_MANY_RAISES: i64 = 1000004;
+
+fn mix(h: u64, x: u64) -> u64 { (h ^ x) *% 1099511628211 }
+
+fn boxed(h: *gc.Heap, v: i64) -> Gc<Box> uses gc { new(h, Box { v: v }) }
+
+/// Two allocations with the first one live across the second: under
+/// stress the second collects, so the first must be a root.
+fn twice(h: *gc.Heap, v: i64) -> i64 uses gc {
+    let a = boxed(h, v);
+    let b = boxed(h, v *% 3 +% 1);
+    a.v *% 7 +% b.v
+}
+
+#[require_verified]
+#[allow(super_overlap)]
+vm C {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64, k: *i64, p: Gc<Proto> }
+
+    verify_context owner proto: Gc<Proto>;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] const proto.k verify (it as u32) < proto.nconsts;
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    operand func = it verify (it as u32) < proto.nfuncs;
+    operand window = it verify (it as u32) < proto.nregs;
+
+    verify fentries {
+        var ok = true;
+        for i in 0..proto.nfuncs as u64 {
+            if !is_insn_boundary(code.ptr + proto.fentry[i] as u64) { ok = false; }
+        }
+        ok
+    }
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    cache One { v: u32 }
+    /// A wide field (two words in a u32 vm) after a narrow one.
+    cache IC { n: u32, w: u64 }
+
+    fn tick() -> bool {
+        ctx.budget -= 1;
+        ctx.budget < 0
+    }
+    fn out(v: i64) { ctx.log = mix(ctx.log, v as u64); }
+
+    /// `-> never` helpers: inlined at hot call sites, shared copies (in
+    /// tail-call mode) from cold blocks.
+    fn setv(d: u64, v: i64) -> never { regs[d] = v; next }
+    #[inline(never)]
+    fn setv_shared(d: u64, v: i64) -> never { regs[d] = v +% 1; next }
+    fn bumpc(c: cache IC, d: u64, v: i64) -> never {
+        c.n += 1;
+        c.w = c.w *% 3 +% (v as u64) +% 4294967296;
+        regs[d] = (c.w >> 1) as i64;
+        next
+    }
+    fn go(t: *u32) -> never {
+        if tick() { cold { fail BUDGET_EXHAUSTED } }
+        jump t
+    }
+
+    op NOP() : ABC { next }
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v; next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    /// A cold path that reads the (maybe forwarded) operands.
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        let r = a +% b;
+        if (r & 7) == 3 { cold { dst = a -% b *% 5; next } }
+        dst = r;
+        next
+    }
+    op SUB(dst: reg, a: reg, b: reg) : ABC { dst = a -% b; next }
+    op ADDK(dst: reg, a: reg, c: kst) : ABC {
+        if (c & 3) == 0 { cold { dst = a +% c +% 1000; next } }
+        dst = a +% c;
+        next
+    }
+    /// Signed field; the cold path reads `a` and `sc`.
+    op ADDI(dst: reg, a: reg, sc: imm) : ABsC {
+        if (a & 15) == 5 { cold { dst = a *% sc +% 11; next } }
+        dst = a +% sc;
+        next
+    }
+    /// Reads and writes `dst`.
+    op ACC(dst: reg, a: reg) : ABC { dst = dst *% 3 +% a; next }
+    /// Writes both operands.
+    op SWAP(a: reg, b: reg) : ABC {
+        let t = a;
+        a = b;
+        b = t;
+        next
+    }
+    /// Raises from a cold block and from the hot path; `on raise`
+    /// continues after the raising instruction (the low bits of the
+    /// error are its size).
+    op CHK(a: reg, b: reg) : ABC {
+        if a == b { cold { raise 16 + 1 } }
+        if a < -1000 { raise 32 + 1 }
+        next
+    }
+    op DIVR(dst: reg, a: reg, b: reg) : ABC {
+        if b == 0 or b == -1 { cold { raise 48 + 1 } }
+        dst = a / b;
+        next
+    }
+    op OUT(a: reg) : ABC { out(a); next }
+
+    /// `become` from the hot path (generic) and from a cold block (the
+    /// member's deopt, then `redo`). Members compute what the generic op
+    /// computes, and deopts take no step budget: a super's part runs its
+    /// own member's code whatever its word holds now (a jump to the word,
+    /// or `next` from an outlined cold block in the previous part, runs
+    /// the word alone and may quicken it without changing the head), so
+    /// results must not depend on which member runs.
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic {
+            dst = a *% b;
+            if a >= 0 and a < 100 { become MUL_S; }
+            next
+        }
+        MUL_S {
+            if a < 0 or a >= 100 {
+                cold {
+                    become MUL;
+                    redo
+                }
+            }
+            dst = a *% b;
+            next
+        }
+    }
+    /// Quickening with an inline cache.
+    family LOADC(dst: reg, c: kst) : ABx + One {
+        generic {
+            cache.v = (c & 65535) as u32;
+            become LOADC_Q;
+            dst = c;
+            next
+        }
+        LOADC_Q {
+            if (cache.v as i64) == (c & 65535) { dst = c; next }
+            cold {
+                become LOADC;
+                redo
+            }
+        }
+    }
+    /// A cache handle: the helper inlined from the hot path, shared from
+    /// the cold one.
+    op CGET(dst: reg, a: reg) : ABC + IC {
+        if (cache.n & 1) == 0 { bumpc(cache, dst.raw, a) }
+        cold { bumpc(cache, dst.raw, a +% 1) }
+    }
+    /// A wide cache field read and written in place.
+    op ADDW(dst: reg, a: reg, b: reg) : ABC + IC {
+        cache.w = cache.w +% (a as u64);
+        dst = (cache.w as i64) +% b;
+        next
+    }
+    op SETN(dst: reg, v: imm) : AsBx {
+        if (v & 3) == 1 { cold { setv(dst.raw, v *% 2) } }
+        if (v & 3) == 2 { setv_shared(dst.raw, v) }
+        setv(dst.raw, v)
+    }
+    /// Allocation on the hot path and in a cold block.
+    op ALLOC(dst: reg, a: reg) : ABC {
+        let b = boxed(&ctx.heap, a);
+        let c = boxed(&ctx.heap, b.v +% 1);
+        dst = b.v +% c.v *% 2;
+        next
+    }
+    op ALLOCC(dst: reg, a: reg) : ABC {
+        if (a & 1) == 1 { cold { dst = twice(&ctx.heap, a); next } }
+        dst = a;
+        next
+    }
+
+    op JMP(target: label) : sJ { go(target) }
+    op JLT(a: reg, b: reg, target: label) : ABsC {
+        if a < b { go(target) }
+        next
+    }
+    op JNZ(a: reg, target: label) : AsBx {
+        if a != 0 { go(target) }
+        next
+    }
+    op CLT(a: reg, b: reg) : ABC then JMP {
+        if a < b { go(then.target) }
+        jump pc + 2
+    }
+    op CNZ(a: reg) : ABC then JMP {
+        if a != 0 { jump pc + 2 }
+        next
+    }
+
+    /// Call function `f` with its register window at R[base].
+    op CALL(f: func, base: window, n: imm) : ABC {
+        if tick() { cold { fail BUDGET_EXHAUSTED } }
+        let nr = regs + (base as u64);
+        if ctx.depth >= 6 or nr + ctx.nregs > ctx.reg_end { cold { raise 64 + 1 } }
+        let fr = ctx.frames + ctx.depth;
+        fr.ret = pc + 1;
+        fr.regs = regs;
+        ctx.depth += 1;
+        regs = nr;
+        regs[0] = regs[0] +% (n as i64);
+        jump p.code.start() + p.fentry[f] as u64
+    }
+    op RET(src: reg) : ABC {
+        let v = src;
+        if ctx.depth == 0 { exit Ok(v) }
+        regs[0] = v;
+        ctx.depth -= 1;
+        let fr = ctx.frames + ctx.depth;
+        regs = fr.regs;
+        jump fr.ret
+    }
+    op EXIT(src: reg) : ABC { exit Ok(src) }
+
+    #[forward] super ADD_ADD = ADD; ADD;
+    #[forward] super ADD_SUB = ADD; SUB;
+    #[forward] super MUL_ADD = MUL; ADD;
+    #[forward] super MUL_S_ADD = MUL_S; ADD;
+    #[forward] super ADD_MUL = ADD; MUL;
+    #[forward] super ADD_MUL_S = ADD; MUL_S;
+    #[forward] super ADDI_ADDI_ADDI = ADDI; ADDI; ADDI;
+    #[forward] super ADDI_ADDI = ADDI; ADDI;
+    #[forward] super LOADK_ADDK = LOADK; ADDK;
+    #[forward] super ADDK_ADDK = ADDK; ADDK;
+    #[forward] super ADD_CHK = ADD; CHK;
+    #[forward] super ADD_JLT = ADD; JLT;
+    #[forward] super ADD_CLT_JMP = ADD; CLT; JMP;
+    #[forward] super MOVE_CGET = MOVE; CGET;
+    #[forward] super CGET_ADD = CGET; ADD;
+    #[forward] super ACC_ACC = ACC; ACC;
+    #[forward] super SWAP_ADD = SWAP; ADD;
+    #[forward] super ADD_DIVR = ADD; DIVR;
+    #[forward] super LOADC_ADD = LOADC; ADD;
+    #[forward] super LOADC_Q_ADD = LOADC_Q; ADD;
+    #[forward] super ALLOC_ADD = ALLOC; ADD;
+    #[forward] super ADD_ALLOCC = ADD; ALLOCC;
+    #[forward] super ADD_OUT = ADD; OUT;
+    #[forward] super LOADI_ADD_MUL_OUT = LOADI; ADD; MUL; OUT;
+    #[forward] super SETN_ADD = SETN; ADD;
+    #[forward] super ADDW_ADDI = ADDW; ADDI;
+    #[forward] super ADDI_RET = ADDI; RET;
+    super LOADI_CALL = LOADI; CALL;
+    super CNZ_JMP_SETN = CNZ; JMP; SETN;
+    super CHK_CHK = CHK; CHK;
+    super MUL_JNZ = MUL; JNZ;
+
+    entry run(c: *Ctx, proto: Gc<Proto>, r: *i64) -> Result<i64, i64> uses gc {
+        ctx = c;
+        p = proto;
+        regs = r;
+        k = proto.k;
+        jump proto.code
+    }
+
+    on raise(e: i64) {
+        ctx.nraise += 1;
+        ctx.log = mix(mix(ctx.log, e as u64), (pc as u64 - ctx.code0 as u64) / 4);
+        if ctx.nraise > 20 { fail TOO_MANY_RAISES }
+        jump pc + ((e & 15) as u64)
+    }
+}
+
+// ── random programs ─────────────────────────────────────────────────
+
+struct Rng { s: u64 }
+
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 11400714819323198485;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 13787848793156543417;
+    z = (z ^ (z >> 27)) *% 10723151780598845931;
+    z ^ (z >> 31)
+}
+
+fn Rng.below(r: *Rng, n: u64) -> u64 {
+    if n == 0 { return 0; }
+    r.next() % n
+}
+
+fn Rng.chance(r: *Rng, pct: u64) -> bool { r.below(100) < pct }
+
+const MAX_WORDS: u64 = 160;
+const NONE: u32 = 255;
+
+struct Prog {
+    code: [u32; 160],
+    len: u64,
+    nregs: u32,
+    nconsts: u32,
+    nfuncs: u32,
+    fentry: [u32; 4],
+    consts: [i64; 8],
+    frames: u64,
+    /// The register the previous instruction wrote, for forwarding.
+    last: u8,
+}
+
+/// Plain ops, weighted by repetition.
+const PICKS: [u32; 40] = [
+    C.OP_LOADI, C.OP_LOADI, C.OP_LOADK, C.OP_MOVE, C.OP_ADD, C.OP_ADD, C.OP_SUB, C.OP_ADDK,
+    C.OP_ADDI, C.OP_ADDI, C.OP_ACC, C.OP_SWAP, C.OP_CHK, C.OP_DIVR, C.OP_OUT, C.OP_OUT,
+    C.OP_MUL, C.OP_MUL, C.OP_MUL_S, C.OP_LOADC, C.OP_LOADC_Q, C.OP_CGET, C.OP_ADDW, C.OP_SETN,
+    C.OP_ALLOC, C.OP_ALLOCC, C.OP_JMP, C.OP_JLT, C.OP_JNZ, C.OP_CLT, C.OP_CNZ, C.OP_CALL,
+    C.OP_RET, C.OP_EXIT, C.OP_NOP, C.OP_OUT, C.OP_ADD, C.OP_SETN, C.OP_CGET, C.OP_JLT,
+];
+
+const SEQS: u64 = 31;
+
+/// Part `j` of fusable sequence `s` (NONE past the end).
+fn seq(s: u64, j: u64) -> u32 {
+    let t: [u32; 4] = match s {
+        0 => [C.OP_ADD, C.OP_ADD, NONE, NONE],
+        1 => [C.OP_ADD, C.OP_SUB, NONE, NONE],
+        2 => [C.OP_MUL, C.OP_ADD, NONE, NONE],
+        3 => [C.OP_MUL_S, C.OP_ADD, NONE, NONE],
+        4 => [C.OP_ADD, C.OP_MUL, NONE, NONE],
+        5 => [C.OP_ADD, C.OP_MUL_S, NONE, NONE],
+        6 => [C.OP_ADDI, C.OP_ADDI, C.OP_ADDI, NONE],
+        7 => [C.OP_ADDI, C.OP_ADDI, NONE, NONE],
+        8 => [C.OP_LOADK, C.OP_ADDK, NONE, NONE],
+        9 => [C.OP_ADDK, C.OP_ADDK, NONE, NONE],
+        10 => [C.OP_ADD, C.OP_CHK, NONE, NONE],
+        11 => [C.OP_ADD, C.OP_JLT, NONE, NONE],
+        12 => [C.OP_ADD, C.OP_CLT, C.OP_JMP, NONE],
+        13 => [C.OP_MOVE, C.OP_CGET, NONE, NONE],
+        14 => [C.OP_CGET, C.OP_ADD, NONE, NONE],
+        15 => [C.OP_ACC, C.OP_ACC, NONE, NONE],
+        16 => [C.OP_SWAP, C.OP_ADD, NONE, NONE],
+        17 => [C.OP_ADD, C.OP_DIVR, NONE, NONE],
+        18 => [C.OP_LOADC, C.OP_ADD, NONE, NONE],
+        19 => [C.OP_LOADC_Q, C.OP_ADD, NONE, NONE],
+        20 => [C.OP_ALLOC, C.OP_ADD, NONE, NONE],
+        21 => [C.OP_ADD, C.OP_ALLOCC, NONE, NONE],
+        22 => [C.OP_ADD, C.OP_OUT, NONE, NONE],
+        23 => [C.OP_LOADI, C.OP_ADD, C.OP_MUL, C.OP_OUT],
+        24 => [C.OP_SETN, C.OP_ADD, NONE, NONE],
+        25 => [C.OP_ADDW, C.OP_ADDI, NONE, NONE],
+        26 => [C.OP_ADDI, C.OP_RET, NONE, NONE],
+        27 => [C.OP_LOADI, C.OP_CALL, NONE, NONE],
+        28 => [C.OP_CNZ, C.OP_JMP, C.OP_SETN, NONE],
+        29 => [C.OP_CHK, C.OP_CHK, NONE, NONE],
+        _ => [C.OP_MUL, C.OP_JNZ, NONE, NONE],
+    };
+    t[j]
+}
+
+fn with_op(w: u32, op: u32) -> u32 { C.with_opcode(w, op) }
+
+/// A register operand: often the one the previous instruction wrote.
+fn rd(r: *Rng, p: *Prog) -> u8 {
+    if r.chance(45) { p.last } else { r.below(p.nregs as u64) as u8 }
+}
+/// A destination register (remembered for the next instruction).
+fn wr(r: *Rng, p: *Prog) -> u8 {
+    let d = r.below(p.nregs as u64) as u8;
+    p.last = d;
+    d
+}
+
+fn kst(r: *Rng, p: *Prog) -> u64 { r.below(p.nconsts as u64) }
+
+/// Offset from word `at` to a random instruction start.
+fn label(r: *Rng, starts: []u64, at: u64, lo: i64, hi: i64) -> i64 {
+    for _try in 0..8 {
+        let t = starts[r.below(starts.len)] as i64;
+        let off = t - (at as i64);
+        if off >= lo and off <= hi { return off; }
+    }
+    1
+}
+
+fn small(r: *Rng) -> i64 { (r.below(41) as i64) - 20 }
+
+fn generate(r: *Rng, p: *Prog) {
+    p.nregs = 2 + r.below(8) as u32;
+    p.nconsts = 1 + r.below(6) as u32;
+    p.nfuncs = 1 + r.below(4) as u32;
+    p.frames = 1 + r.below(4);
+    p.last = 0;
+    for i in 0..8 {
+        p.consts[i] = if r.chance(70) { small(r) } else { r.next() as i64 };
+    }
+    var ops: [u32; 160] = [0; 160];
+    var starts: [u64; 160] = [0; 160];
+    var n: u64 = 0;
+    var at: u64 = 0;
+    let want = 2 + r.below(40);
+    while n < want {
+        if r.chance(45) {
+            let s = r.below(SEQS);
+            var j: u64 = 0;
+            while j < 4 and seq(s, j) != NONE {
+                let o = seq(s, j);
+                let sz = C.op_size(with_op(0, o));
+                if at + sz > MAX_WORDS - 8 { break; }
+                ops[n] = o;
+                starts[n] = at;
+                at += sz;
+                n += 1;
+                j += 1;
+            }
+            continue;
+        }
+        var op = PICKS[r.below(40)];
+        if n + 1 == want and r.chance(90) { op = if r.chance(70) { C.OP_RET } else { C.OP_EXIT }; }
+        let size = C.op_size(with_op(0, op));
+        if at + size > MAX_WORDS - 8 { break; }
+        ops[n] = op;
+        starts[n] = at;
+        at += size;
+        n += 1;
+    }
+    // A `then JMP` op needs its JMP: add the missing ones.
+    var m: u64 = 0;
+    var ops2: [u32; 160] = [0; 160];
+    var at2: u64 = 0;
+    for i in 0..n {
+        let o = ops[i];
+        if at2 + 2 > MAX_WORDS - 2 { break; }
+        ops2[m] = o;
+        starts[m] = at2;
+        at2 += C.op_size(with_op(0, o));
+        m += 1;
+        if (o == C.OP_CLT or o == C.OP_CNZ) and !(i + 1 < n and ops[i + 1] == C.OP_JMP) {
+            ops2[m] = C.OP_JMP;
+            starts[m] = at2;
+            at2 += 1;
+            m += 1;
+        }
+    }
+    // Always end in a RET.
+    ops2[m] = C.OP_RET;
+    starts[m] = at2;
+    at2 += 1;
+    m += 1;
+    p.len = at2;
+    let st = starts[0..m];
+    let code = p.code[..];
+    for i in 0..m {
+        let a = starts[i];
+        let op = ops2[i];
+        if op == C.OP_NOP { C.emit.NOP(code, a); }
+        else if op == C.OP_LOADI { let v = small(r) as i16; C.emit.LOADI(code, a, wr(r, p), v); }
+        else if op == C.OP_LOADK { let c = kst(r, p) as u16; C.emit.LOADK(code, a, wr(r, p), c); }
+        else if op == C.OP_MOVE { let s = rd(r, p); C.emit.MOVE(code, a, wr(r, p), s); }
+        else if op == C.OP_ADD { let x = rd(r, p); let y = rd(r, p); C.emit.ADD(code, a, wr(r, p), x, y); }
+        else if op == C.OP_SUB { let x = rd(r, p); let y = rd(r, p); C.emit.SUB(code, a, wr(r, p), x, y); }
+        else if op == C.OP_ADDK { let x = rd(r, p); let c = kst(r, p) as u8; C.emit.ADDK(code, a, wr(r, p), x, c); }
+        else if op == C.OP_ADDI { let x = rd(r, p); let v = small(r) as i8; C.emit.ADDI(code, a, wr(r, p), x, v); }
+        else if op == C.OP_ACC { let x = rd(r, p); let d = if r.chance(50) { p.last } else { wr(r, p) }; C.emit.ACC(code, a, d, x); }
+        else if op == C.OP_SWAP { let x = rd(r, p); let y = rd(r, p); C.emit.SWAP(code, a, x, y); }
+        else if op == C.OP_CHK { let x = rd(r, p); let y = rd(r, p); C.emit.CHK(code, a, x, y); }
+        else if op == C.OP_DIVR { let x = rd(r, p); let y = rd(r, p); C.emit.DIVR(code, a, wr(r, p), x, y); }
+        else if op == C.OP_OUT { C.emit.OUT(code, a, rd(r, p)); }
+        else if op == C.OP_MUL { let x = rd(r, p); let y = rd(r, p); C.emit.MUL(code, a, wr(r, p), x, y); }
+        else if op == C.OP_MUL_S { let x = rd(r, p); let y = rd(r, p); C.emit.MUL_S(code, a, wr(r, p), x, y); }
+        else if op == C.OP_LOADC { let c = kst(r, p) as u16; C.emit.LOADC(code, a, wr(r, p), c); }
+        else if op == C.OP_LOADC_Q { let c = kst(r, p) as u16; C.emit.LOADC_Q(code, a, wr(r, p), c); }
+        else if op == C.OP_CGET { let x = rd(r, p); C.emit.CGET(code, a, wr(r, p), x); }
+        else if op == C.OP_ADDW { let x = rd(r, p); let y = rd(r, p); C.emit.ADDW(code, a, wr(r, p), x, y); }
+        else if op == C.OP_SETN { let v = small(r) as i16; C.emit.SETN(code, a, wr(r, p), v); }
+        else if op == C.OP_ALLOC { let x = rd(r, p); C.emit.ALLOC(code, a, wr(r, p), x); }
+        else if op == C.OP_ALLOCC { let x = rd(r, p); C.emit.ALLOCC(code, a, wr(r, p), x); }
+        else if op == C.OP_JMP { C.emit.JMP(code, a, label(r, st, a, -8388608, 8388607) as i32); }
+        else if op == C.OP_JLT { let x = rd(r, p); let y = rd(r, p); C.emit.JLT(code, a, x, y, label(r, st, a, -128, 127) as i8); }
+        else if op == C.OP_JNZ { let x = rd(r, p); C.emit.JNZ(code, a, x, label(r, st, a, -32768, 32767) as i16); }
+        else if op == C.OP_CLT { let x = rd(r, p); let y = rd(r, p); C.emit.CLT(code, a, x, y); }
+        else if op == C.OP_CNZ { C.emit.CNZ(code, a, rd(r, p)); }
+        else if op == C.OP_CALL {
+            let f = if p.nfuncs > 0 { r.below(p.nfuncs as u64) as u8 } else { 0 };
+            let base = r.below(p.nregs as u64) as u8;
+            C.emit.CALL(code, a, f, base, r.below(4) as u8);
+        }
+        else if op == C.OP_RET { C.emit.RET(code, a, rd(r, p)); }
+        else { C.emit.EXIT(code, a, rd(r, p)); }
+    }
+    for i in 0..4 { p.fentry[i] = st[r.below(m)] as u32; }
+}
+
+// ── running ─────────────────────────────────────────────────────────
+
+struct Outcome {
+    verified: bool,
+    /// Result, registers and log of each run.
+    sig: u64,
+    reverify: bool,
+    /// The code after `C.deopt`.
+    deopt: u64,
+    result: i64,
+}
+
+var VERBOSE: bool = false;
+var DUMP: bool = false;
+
+fn new_ctx(p: *Prog, regs: *i64, nr: u64, frames: *Frame, code0: *u32) -> Ctx {
+    Ctx {
+        heap: gc.Heap.new(), nregs: p.nregs as u64, reg_end: regs + nr, frames: frames, depth: 0,
+        budget: 1000, log: 0, nraise: 0, code0: code0,
+    }
+}
+
+/// Build `p`'s code object, optimize it or not, and run it twice.
+fn run_prog(heap: *gc.Heap, p: *Prog, optimize: bool, stress: bool) -> Outcome uses gc {
+    var out = Outcome { verified: false, sig: 0, reverify: true, deopt: 0, result: 0 };
+    let k: *i64 = mem.alloc(8);
+    for i in 0..8 { k[i] = p.consts[i]; }
+    let fentry: *u32 = mem.alloc(4);
+    for i in 0..4 { fentry[i] = p.fentry[i]; }
+    let init = Proto { nregs: p.nregs, nconsts: p.nconsts, nfuncs: p.nfuncs, k: k, fentry: fentry };
+    let pr = match C.build_verified(heap, init, p.code[0..p.len]) {
+        Ok(x) => x,
+        Err(e) => {
+            if DUMP {
+                var b = text.StrBuf.new();
+                e.write(&b);
+                io.println(b.as_str());
+                b.free();
+            }
+            mem.release(k);
+            mem.release(fentry);
+            return out;
+        }
+    };
+    out.verified = true;
+    if optimize { C.optimize(pr.code); }
+    let nr = (p.nregs as u64) * p.frames;
+    let regs: *i64 = mem.alloc(nr);
+    let frames: *Frame = mem.alloc(8);
+    var h: u64 = 14695981039346656037;
+    for round in 0..2 {
+        if round == 1 and optimize and !JIT { C.optimize(pr.code); }
+        for i in 0..nr { regs[i] = (i as i64) - 2 + (round as i64) * 7; }
+        var ctx = new_ctx(p, regs, nr, frames, pr.code.start());
+        ctx.heap.set_stress(stress);
+        if DUMP {
+            io.println(if optimize { "optimized:" } else { "as emitted:" });
+            dump_code(pr.code.words());
+        }
+        let r = C.run(&ctx, pr, regs);
+        match r {
+            Ok(v) => { h = mix(h, 1); h = mix(h, v as u64); out.result = v; }
+            Err(e) => { h = mix(h, 2); h = mix(h, e as u64); out.result = e; }
+        }
+        for i in 0..nr { h = mix(h, regs[i] as u64); }
+        h = mix(h, ctx.log);
+        h = mix(h, ctx.depth);
+        if DUMP or RESULTS {
+            show("  result ", out.result);
+            show(" log ", ctx.log as i64);
+            show(" raises ", ctx.nraise as i64);
+            io.println("");
+        }
+        ctx.heap.free();
+    }
+    out.sig = h;
+    if !JIT {
+        out.reverify = match C.verify(pr.code.words(), pr) { Ok(_) => true, Err(_) => false };
+        C.deopt(pr.code);
+        var d: u64 = 0;
+        let ws = pr.code.words();
+        for j in 0..ws.len { d = mix(d, ws[j] as u64); }
+        out.deopt = d;
+    }
+    mem.release(regs);
+    mem.release(frames);
+    // k and fentry stay allocated: the JIT may hold on to the code object.
+    out
+}
+
+fn report(seed: u64, what: str) -> bool {
+    io.print("FAIL seed ");
+    io.print_int(seed as i64);
+    io.print(": ");
+    io.println(what);
+    false
+}
+
+fn show(label: str, x: i64) {
+    io.print(label);
+    io.print_int(x);
+}
+
+fn dump_code(code: []u32) {
+    var b = text.StrBuf.new();
+    C.disasm(code, &b);
+    io.print(b.as_str());
+    b.free();
+}
+
+fn dump(p: *Prog) {
+    show("nregs ", p.nregs as i64);
+    show(" nconsts ", p.nconsts as i64);
+    show(" nfuncs ", p.nfuncs as i64);
+    show(" frames ", p.frames as i64);
+    io.print(" fentry");
+    for i in 0..4 { show(" ", p.fentry[i] as i64); }
+    io.print(" consts");
+    for i in 0..p.nconsts as u64 { show(" ", p.consts[i]); }
+    io.println("");
+}
+
+var JIT: bool = false;
+/// -r: print each run's result only.
+var RESULTS: bool = false;
+
+/// Run one seed; false on a failed check. Mixes the outcome into `all`.
+fn one(heap: *gc.Heap, seed: u64, stress: bool, all: *u64, stats: *[u64; 4]) -> bool uses gc {
+    var r = Rng { s: seed };
+    var p = Prog {
+        code: [0; 160], len: 0, nregs: 1, nconsts: 1, nfuncs: 0,
+        fentry: [0; 4], consts: [0; 8], frames: 1, last: 0,
+    };
+    generate(&r, &p);
+    if DUMP { dump(&p); }
+    let a = run_prog(heap, &p, false, stress);
+    let b = run_prog(heap, &p, true, stress);
+    *all = mix(mix(*all, a.sig), a.verified as u64);
+    if !a.verified or !b.verified { return report(seed, "a generated program does not verify"); }
+    stats[0] += 1;
+    if a.result == BUDGET_EXHAUSTED { stats[1] += 1; }
+    if a.sig != b.sig { return report(seed, "optimized code computes something else"); }
+    if !a.reverify or !b.reverify { return report(seed, "code no longer verifies after running"); }
+    if a.deopt != b.deopt { return report(seed, "deopt of optimized code differs"); }
+    true
+}
+
+fn parse(s: str) -> u64 {
+    match num.parse_u64(s, 10) {
+        Ok(v) => v,
+        Err(_) => {
+            io.eprintln("usage: fuzzcombo <first-seed> <count> [-v | -d] [stress] [jit]");
+            os.quit(2)
+        }
+    }
+}
+
+fn main() -> i32 uses gc {
+    let (Some(a0), Some(a1)) = (os.arg(1), os.arg(2)) else {
+        io.eprintln("usage: fuzzcombo <first-seed> <count> [-v | -d] [stress] [jit]");
+        return 2;
+    };
+    let first = parse(a0);
+    let count = parse(a1);
+    var stress = false;
+    var i: u64 = 3;
+    while let Some(f) = os.arg(i) {
+        if f.len == 2 and f[0] == '-' {
+            VERBOSE = true;
+            DUMP = f[1] == 'd';
+            RESULTS = f[1] == 'r';
+        } else if f.len == 6 and f[0] == 's' {
+            stress = true;
+        } else if f.len == 3 and f[0] == 'j' {
+            JIT = true;
+        }
+        i += 1;
+    }
+    var heap = gc.Heap.new();
+    var stats: [u64; 4] = [0; 4];
+    var failed: u64 = 0;
+    var all: u64 = 0;
+    var line = text.StrBuf.new();
+    for s in 0..count {
+        let seed = first + s;
+        if VERBOSE {
+            line.clear();
+            line.push_str("seed ");
+            line.push_int(seed as i64);
+            io.eprintln(line.as_str());
+        }
+        if !one(&heap, seed, stress, &all, &stats) { failed += 1; }
+    }
+    io.print("seeds ");
+    io.print_int(first as i64);
+    io.print("..");
+    io.print_int((first + count) as i64);
+    io.print(": ");
+    io.print_int(stats[0] as i64);
+    io.print(" ran (");
+    io.print_int(stats[1] as i64);
+    io.print(" hit the step budget), ");
+    io.print_int(failed as i64);
+    io.print(" failed, outcome hash ");
+    io.print_int(all as i64);
+    io.println("");
+    if failed > 0 { 1 } else { 0 }
+}

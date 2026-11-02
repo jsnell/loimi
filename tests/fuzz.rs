@@ -16,10 +16,15 @@ fn limited(prog: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 fn build(src: &Path, exe: &Path) {
+    build_with(src, exe, &[]);
+}
+
+fn build_with(src: &Path, exe: &Path, flags: &[&str]) {
     let out = limited(env!("CARGO_BIN_EXE_loimi"))
         .env("LOIMI_STD", env!("CARGO_MANIFEST_DIR"))
         .arg("build")
         .arg(src)
+        .args(flags)
         .arg("-o")
         .arg(exe)
         .output()
@@ -95,4 +100,55 @@ fn fuzz_mini() {
     run(&exe, 0, 3000);
     let _ = std::fs::remove_file(&exe);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// tests/fuzz/fuzzcombo.lm: superinstructions against their parts run
+/// alone, built in each dispatch mode and with the JIT, normally and
+/// under GC stress. Every build must report the same outcome hash.
+#[test]
+fn fuzz_vm_combinations() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("tests/fuzz/fuzzcombo.lm");
+    let jit = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+    let mut builds: Vec<(&str, Vec<&str>, Vec<(&str, &str)>)> = vec![
+        ("tailcall", vec!["--dispatch=tailcall"], vec![]),
+        ("goto", vec!["--dispatch=goto"], vec![]),
+        ("switch", vec!["--dispatch=switch"], vec![]),
+    ];
+    if jit {
+        builds.push(("jit", vec!["--jit-stencils"], vec![("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]));
+    }
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for (name, flags, env) in &builds {
+        let exe = tmp(&format!("fuzzcombo-{}", name));
+        build_with(&src, &exe, flags);
+        for (count, extra) in [("3000", None), ("1000", Some("stress"))] {
+            let mut c = limited(&exe);
+            c.arg("0").arg(count).envs(env.iter().copied());
+            if let Some(x) = extra {
+                c.arg(x);
+            }
+            if !env.is_empty() {
+                c.arg("jit");
+            }
+            let out = c.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            assert!(
+                out.status.success(),
+                "fuzzcombo ({} {:?}) failed ({:?}):\n{}\nreproduce: {} <seed> 1 -d",
+                name,
+                extra,
+                out.status,
+                stdout,
+                exe.display()
+            );
+            let h = stdout.lines().last().and_then(|l| l.split("outcome hash ").nth(1)).unwrap_or("").to_string();
+            hashes.push((format!("{} {:?}", name, extra), h));
+        }
+        let _ = std::fs::remove_file(&exe);
+    }
+    for (name, h) in &hashes {
+        let base = &hashes[if name.contains("stress") { 1 } else { 0 }];
+        assert_eq!(h, &base.1, "fuzzcombo: {} computes other results than {}", name, base.0);
+    }
 }
