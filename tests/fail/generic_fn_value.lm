@@ -1,0 +1,6 @@
+fn id<T>(x: T) -> T { x }
+
+fn main() {
+    let f = id;
+}
+// error: cannot infer the type arguments of generic function `id`

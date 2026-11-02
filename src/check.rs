@@ -1477,6 +1477,9 @@ impl<'a> Checker<'a> {
             };
         }
         if let Some((def, _)) = self.scopes[cx.module].get(name).cloned() {
+            if let Def::GenericFn(g) = def {
+                return self.generic_fn_value(g, exp, span);
+            }
             return self.def_value(def, name, span);
         }
         if let Some(t) = exp {

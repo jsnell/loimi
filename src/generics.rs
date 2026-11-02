@@ -239,6 +239,42 @@ impl<'a> Checker<'a> {
         }))
     }
 
+    /// Generic fn `g` used as a value (not called): its type arguments are
+    /// inferred from the expected function type, e.g. a `fn(*P) -> K`
+    /// parameter or field.
+    pub fn generic_fn_value(&mut self, g: u32, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let gf = &self.generics.fns[g as usize];
+        let (module, params, decl) = (gf.module, gf.params.clone(), gf.decl.clone());
+        let Some(want @ Ty::Fn(..)) = exp else {
+            return Err(Diag::new(
+                span,
+                format!("cannot infer the type arguments of generic function `{}`: use it where a function type is expected", decl.name.name),
+            ));
+        };
+        let mut ptys = Vec::new();
+        for p in &decl.params {
+            ptys.push(self.pattern_type(module, &params, &p.ty)?);
+        }
+        let ret = match &decl.ret {
+            Some(t) => self.pattern_type(module, &params, t)?,
+            None => Ty::Unit,
+        };
+        let mut b: Vec<Option<Ty>> = vec![None; params.len()];
+        if !self.unify(&Ty::Fn(ptys, Box::new(ret)), want, &mut b) {
+            return Err(Diag::new(span, format!("`{}` does not match the expected type `{}`", decl.name.name, self.ty_name(want))));
+        }
+        let mut targs = Vec::new();
+        for (i, t) in b.into_iter().enumerate() {
+            match t {
+                Some(t) => targs.push(t),
+                None => return Err(Diag::new(span, format!("cannot infer type parameter `{}`", params[i]))),
+            }
+        }
+        let fid = self.instantiate_fn(g, targs, span)?;
+        let f = &self.prog.fns[fid as usize];
+        Ok(mk(Ty::Fn(f.param_tys.clone(), Box::new(f.ret.clone())), TK::FnRef(fid), span))
+    }
+
     /// Call of generic fn `g`. `pre` are already-checked leading arguments
     /// (a method receiver); `known` fixes some type parameters up front.
     pub fn generic_call(
