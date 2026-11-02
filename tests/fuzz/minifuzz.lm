@@ -80,7 +80,10 @@ var KNOWN: bool = false;
 ///   - GETINDEXI(dst, t, i) with i = 0: `(i as u64) - 1` overflows (a
 ///     panic in debug builds; release builds wrap and take the slow path);
 ///   - SELF(a: callbase, ..) writes R[a+1], but `callbase` only checks
-///     a < nregs: one register past the frame when a = nregs - 1.
+///     a < nregs: one register past the frame when a = nregs - 1;
+///   - CONCAT(dst, base, n) reads R[base .. base+n-1] past the frame, and
+///     with n < 2 `n - 2` underflows (a panic in debug builds, a wild
+///     read in release builds).
 /// Every word is checked, not just instruction starts: cheap and safe.
 fn known_hole(p: Gc<Proto>) -> bool {
     let nregs = p.nregs as u32;
@@ -95,6 +98,7 @@ fn known_hole(p: Gc<Proto>) -> bool {
         if op == Mini.OP_RETN and a + b > nregs { return true; }
         if op == Mini.OP_GETINDEXI and c == 0 { return true; }
         if op == Mini.OP_SELF and a + 2 > nregs { return true; }
+        if op == Mini.OP_CONCAT and (c < 2 or b + c > nregs) { return true; }
     }
     false
 }

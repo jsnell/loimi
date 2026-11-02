@@ -11,7 +11,9 @@
 //            in debug builds)
 //   repro 7: SELF with a = nregs - 1 writes R[a+1], one past the frame
 //            (`callbase` checks a < nregs; SELF needs a + 1 < nregs)
-// 1-6 come from `imm` operands without `verify` clauses (nres, n, i).
+//   repro 8: CONCAT with n = 0: `n - 2` underflows in concat()
+//   repro 9: CONCAT reading n registers past the frame
+// 1-6, 8, 9 come from `imm` operands without `verify` clauses (nres, n, i).
 // The stack holds exactly the main frame, so ASan sees the overflow:
 //   mkdir d; ln -s $PWD/examples/mini/{value,vm,lib}.lm d/
 //   ln -s $PWD/tests/fuzz/mini_holes.lm d/
@@ -43,7 +45,8 @@ fn main() -> i32 {
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     let h = &heap;
-    var main_code: [u32; 3] = [0; 3];
+    var main_code: [u32; 4] = [0; 4];
+    var mlen: u64 = 3;
     var child_code: [u32; 1] = [0; 1];
     var nregs: u32 = 3;
     if which == 1 or which == 3 or which == 5 {
@@ -55,6 +58,11 @@ fn main() -> i32 {
         // SELF needs a table in R[obj] to reach the write.
         main_code[0] = Mini.NEWTABLE(0, 0, 0);
         main_code[1] = Mini.SELF(2, 0, 0);
+        main_code[3] = Mini.RET0();     // SELF has a cache word
+        mlen = 4;
+    } else if which == 8 or which == 9 {
+        main_code[0] = Mini.LOADNIL(0);
+        main_code[1] = Mini.CONCAT(0, 1, if which == 8 { 0 } else { 200 });
         main_code[2] = Mini.RET0();
     } else if which == 6 {
         main_code[0] = Mini.NEWTABLE(0, 0, 0);
@@ -74,7 +82,7 @@ fn main() -> i32 {
     var nokids: mem.Vec<Gc<Proto>> = mem.Vec.new();
     let child = proto(h, 1, child_code[..], nokids.items());
     var kids: [Gc<Proto>; 1] = [child];
-    let mainp = proto(h, nregs, main_code[..], kids[..]);
+    let mainp = proto(h, nregs, main_code[0..mlen], kids[..]);
     io.print("verify main: ");
     io.println(if Mini.verify(mainp.code, mainp).is_none() { "ok" } else { "rejected" });
     io.print("verify child: ");
