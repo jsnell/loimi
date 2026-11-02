@@ -40,6 +40,8 @@ extern const uint8_t loimi_jit_hcode[];
 extern const int64_t loimi_jit_hcode_len;
 extern const struct jit_reloc loimi_jit_hrelocs[];
 extern const int32_t loimi_jit_nhrelocs;
+extern const struct jit_reloc loimi_jit_drelocs[];
+extern const int32_t loimi_jit_ndrelocs;
 extern const int64_t loimi_jit_rodata_len;
 extern const int32_t loimi_jit_ntls;
 extern void loimi_jit_tls(int64_t *out);
@@ -179,7 +181,6 @@ static int init_region(void) {
     if (ro) {
         mprotect(region, (ro + 4095) & ~(size_t)4095, PROT_READ | PROT_WRITE);
         memcpy(region, loimi_jit_rodata, ro);
-        mprotect(region, (ro + 4095) & ~(size_t)4095, PROT_READ);
         bump = region + ((ro + 4095) & ~(size_t)4095);
     }
     rodata = region;
@@ -214,6 +215,18 @@ static int init_region(void) {
         mprotect(helpers, hl, PROT_READ | PROT_EXEC);
         bump += hl;
     }
+    /* The helpers' jump tables (in the read-only data), then protect it. */
+    for (int32_t k = 0; k < loimi_jit_ndrelocs; k++) {
+        const struct jit_reloc *rl = &loimi_jit_drelocs[k];
+        int64_t S = 0;
+        switch (rl->kind) {
+        case K_SYM: S = (int64_t)(intptr_t)loimi_jit_syms[rl->arg]; break;
+        case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
+        case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
+        }
+        patch(rodata + rl->off, rl, S);
+    }
+    if (ro) mprotect(region, (ro + 4095) & ~(size_t)4095, PROT_READ);
     /* One copy of the exit stencil (dispatch *pc in the interpreter), for
      * continuations that do not land on an instruction. */
     const struct jit_stencil *xs = &loimi_jit_stencils[loimi_jit_nops];

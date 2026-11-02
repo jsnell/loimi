@@ -157,6 +157,8 @@ struct Cx<'a> {
     /// Read-only sections copied into the JIT's data: section → offset.
     rodata: Vec<u8>,
     ro_ix: HashMap<usize, usize>,
+    /// Relocations of the copied read-only data (jump tables of helpers).
+    drelocs: Vec<Reloc>,
 }
 
 impl Cx<'_> {
@@ -217,7 +219,9 @@ impl Cx<'_> {
                         if ts.flags & SHF_ALLOC == 0 || ts.flags & SHF_WRITE != 0 {
                             return Err(format!("reference to section {}", ts.name));
                         }
-                        if elf.sections.iter().any(|r| r.ty == SHT_RELA && r.info as usize == t) {
+                        let relocated = elf.sections.iter().any(|r| r.ty == SHT_RELA && r.info as usize == t);
+                        if relocated && holes {
+                            // Per-copy data of a stencil: not supported.
                             return Err(format!("data with relocations ({})", ts.name));
                         }
                         let base = match self.ro_ix.get(&t) {
@@ -230,6 +234,12 @@ impl Cx<'_> {
                                 let b = self.rodata.len();
                                 self.rodata.extend_from_slice(&elf.data[ts.off..ts.off + ts.size]);
                                 self.ro_ix.insert(t, b);
+                                if relocated {
+                                    // A helper's jump table: patched once.
+                                    for rl in self.relocs(elf, t, false)? {
+                                        self.drelocs.push(Reloc { off: rl.off + b as u32, ..rl });
+                                    }
+                                }
                                 b
                             }
                         };
@@ -267,7 +277,7 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         let name = if let Some(r) = rest.strip_prefix('"') { r.split('"').next().unwrap_or("") } else { rest.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).next().unwrap_or("") };
         known.insert(name.to_string());
     }
-    let mut cx = Cx { known: &known, syms: Vec::new(), sym_ix: HashMap::new(), tls: Vec::new(), tls_ix: HashMap::new(), rodata: Vec::new(), ro_ix: HashMap::new() };
+    let mut cx = Cx { known: &known, syms: Vec::new(), sym_ix: HashMap::new(), tls: Vec::new(), tls_ix: HashMap::new(), rodata: Vec::new(), ro_ix: HashMap::new(), drelocs: Vec::new() };
     let mut rejected = Vec::new();
     let by_name: HashMap<&str, u32> = ops.iter().map(|(o, n)| (n.as_str(), *o)).collect();
     // The stencils: (index (opcode, or nops for the exit stencil), name,
@@ -295,15 +305,25 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let deps = |rs: &[Reloc]| -> Vec<usize> { rs.iter().filter(|r| r.kind == K_HELPER).map(|r| (r.arg >> 32) as usize).collect() };
     let mut helpers: BTreeMap<usize, Result<Vec<Reloc>, String>> = BTreeMap::new();
     let mut work: Vec<usize> = found.iter().flat_map(|f| deps(&f.3)).collect();
-    while let Some(h) = work.pop() {
-        if helpers.contains_key(&h) {
-            continue;
+    loop {
+        while let Some(h) = work.pop() {
+            if helpers.contains_key(&h) {
+                continue;
+            }
+            let r = cx.relocs(&elf, h, false);
+            if let Ok(rs) = &r {
+                work.extend(deps(rs));
+            }
+            helpers.insert(h, r);
         }
-        let r = cx.relocs(&elf, h, false);
-        if let Ok(rs) = &r {
-            work.extend(deps(rs));
+        // Jump tables read so far may name more helpers.
+        work = deps(&cx.drelocs).into_iter().filter(|h| !helpers.contains_key(h)).collect();
+        if work.is_empty() {
+            break;
         }
-        helpers.insert(h, r);
+    }
+    if let Some(d) = deps(&cx.drelocs).into_iter().find(|d| helpers[d].is_err()) {
+        return Err(format!("a jump table refers to {}, which cannot be used: {}", elf.sections[d].name, helpers[&d].as_ref().err().unwrap()));
     }
     // A helper that calls one that cannot be used cannot be used either.
     loop {
@@ -344,6 +364,7 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         }
     };
     hrelocs.iter_mut().for_each(resolve);
+    cx.drelocs.iter_mut().for_each(resolve);
     let mut code: Vec<u8> = Vec::new();
     let mut relocs: Vec<Reloc> = Vec::new();
     // Per stencil index: (code offset, length, first reloc, reloc count,
@@ -370,7 +391,7 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         code.extend_from_slice(bytes);
         relocs.extend(rs);
     }
-    let Cx { syms, tls, rodata, .. } = cx;
+    let Cx { syms, tls, rodata, drelocs, .. } = cx;
     if !stencils.contains_key(&nops) {
         let why = rejected.iter().find(|r| r.0 == "<exit>").map(|r| r.1.clone()).unwrap_or_default();
         return Err(format!("the exit stencil is missing ({})", why));
@@ -397,6 +418,12 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let _ = writeln!(ir, "@loimi_jit_hcode_len = constant i64 {}", hcode.len());
     let _ = writeln!(ir, "@loimi_jit_hrelocs = constant [{} x {{ i32, i16, i16, i64, i64 }}] [{}]", hl.len(), hl.join(", "));
     let _ = writeln!(ir, "@loimi_jit_nhrelocs = constant i32 {}", hl.len());
+    let dl: Vec<String> = drelocs
+        .iter()
+        .map(|r| format!("{{ i32, i16, i16, i64, i64 }} {{ i32 {}, i16 {}, i16 {}, i64 {}, i64 {} }}", r.off, r.ty, r.kind, r.addend, r.arg as i64))
+        .collect();
+    let _ = writeln!(ir, "@loimi_jit_drelocs = constant [{} x {{ i32, i16, i16, i64, i64 }}] [{}]", dl.len(), dl.join(", "));
+    let _ = writeln!(ir, "@loimi_jit_ndrelocs = constant i32 {}", dl.len());
     let mut st = Vec::new();
     for i in 0..=nops {
         let (o, l, r, nr, t, present) = match stencils.get(&i) {

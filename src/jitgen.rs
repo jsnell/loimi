@@ -484,25 +484,59 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
 ///   them into helper code that the JIT copies once. The interpreter
 ///   therefore never has to take a helper's address for the stencils,
 ///   which would change how LLVM inlines it there.
-/// - Other definitions (`main`, exports) become `available_externally`,
-///   so that only what the stencils reach is compiled.
+/// - Other definitions (`main`, exports) become `available_externally`.
+/// - Functions the stencils cannot reach (through function bodies) become
+///   declarations, so that clang compiles only what the stencils use.
 pub fn stencil_module(ir: &str, stencils: &str) -> String {
-    let mut out = String::with_capacity(ir.len() + stencils.len());
+    // The functions the stencils reach.
+    let mut bodies: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    let mut cur: Option<(&str, Vec<&str>)> = None;
     for line in ir.lines() {
+        if let Some((name, refs)) = cur.as_mut() {
+            if line == "}" {
+                bodies.insert(name, std::mem::take(refs));
+                cur = None;
+            } else {
+                refs.extend(symbol_refs(line));
+            }
+        } else if line.starts_with("define ") {
+            if let Some(name) = symbol_refs(line).into_iter().next() {
+                cur = Some((name, Vec::new()));
+            }
+        }
+    }
+    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut work: Vec<&str> = stencils.lines().flat_map(symbol_refs).collect();
+    while let Some(n) = work.pop() {
+        if reached.insert(n) {
+            if let Some(rs) = bodies.get(n) {
+                work.extend(rs.iter().copied());
+            }
+        }
+    }
+    let mut out = String::with_capacity(ir.len() + stencils.len());
+    let mut skipping = false;
+    for line in ir.lines() {
+        if skipping {
+            skipping = line != "}";
+            continue;
+        }
+        if line.starts_with("define ") {
+            if let Some(name) = symbol_refs(line).into_iter().next() {
+                if !reached.contains(name) {
+                    out.push_str(&declaration(line));
+                    out.push('\n');
+                    skipping = true;
+                    continue;
+                }
+            }
+        }
         if let Some(rest) = line.strip_prefix("define internal ") {
             if rest.starts_with("preserve_nonecc ") {
                 out.push_str("define available_externally dso_local ");
                 out.push_str(rest);
             } else {
-                // No jump tables: they are data with relocations.
-                out.push_str("define internal ");
-                match rest.strip_suffix('{') {
-                    Some(head) => {
-                        out.push_str(head);
-                        out.push_str("\"no-jump-tables\"=\"true\" {");
-                    }
-                    None => out.push_str(rest),
-                }
+                out.push_str(line);
             }
         } else if let Some(rest) = line.strip_prefix("define ") {
             out.push_str("define available_externally ");
@@ -520,4 +554,89 @@ pub fn stencil_module(ir: &str, stencils: &str) -> String {
     }
     out.push_str(stencils);
     out
+}
+
+/// The global symbols a line of IR names (`@name`, `@"name"`), in order.
+fn symbol_refs(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"' {
+            // A string constant (c"...") or a quoted local name: skip it.
+            if i > 0 && b[i - 1] == b'@' {
+                let end = line[i + 1..].find('"').map(|e| i + 1 + e).unwrap_or(b.len());
+                out.push(&line[i + 1..end]);
+                i = end + 1;
+                continue;
+            }
+            let end = line[i + 1..].find('"').map(|e| i + 1 + e).unwrap_or(b.len());
+            i = end + 1;
+            continue;
+        }
+        if b[i] == b'@' && i + 1 < b.len() && b[i + 1] != b'"' {
+            let s = i + 1;
+            let mut e = s;
+            while e < b.len() && (b[e].is_ascii_alphanumeric() || b[e] == b'_' || b[e] == b'.' || b[e] == b'$') {
+                e += 1;
+            }
+            if e > s {
+                out.push(&line[s..e]);
+            }
+            i = e;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A `declare` for the function a `define` line begins: its calling
+/// convention, result and parameter types.
+fn declaration(define: &str) -> String {
+    let at = define.find('@').unwrap();
+    let head: Vec<&str> = define[7..at].split_whitespace().filter(|w| !matches!(*w, "internal" | "available_externally" | "dso_local")).collect();
+    // The name, then the parameter list up to its closing parenthesis.
+    let mut i = at + 1;
+    if define[i..].starts_with('"') {
+        i += 1 + define[i + 1..].find('"').unwrap() + 1;
+    } else {
+        while i < define.len() && define.as_bytes()[i] != b'(' {
+            i += 1;
+        }
+    }
+    let name = &define[at..i];
+    let mut depth = 0;
+    let mut params = Vec::new();
+    let mut start = i + 1;
+    let mut in_str = false;
+    for (k, c) in define[i..].char_indices().map(|(k, c)| (k + i, c)) {
+        match c {
+            '"' => in_str = !in_str,
+            _ if in_str => {}
+            '(' | '{' | '[' | '<' => depth += 1,
+            ')' | '}' | ']' | '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    params.push(&define[start..k]);
+                    break;
+                }
+            }
+            ',' if depth == 1 => {
+                params.push(&define[start..k]);
+                start = k + 1;
+            }
+            _ => {}
+        }
+    }
+    let tys: Vec<String> = params
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.rfind(" %") {
+            Some(s) => p[..s].to_string(),
+            None => p.to_string(),
+        })
+        .collect();
+    format!("declare {} {}({})", head.join(" "), name, tys.join(", "))
 }
