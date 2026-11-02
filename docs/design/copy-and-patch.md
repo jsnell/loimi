@@ -968,10 +968,13 @@ Why it falls so far short of the bound:
   cache. The other three hops read a register written two or more ops
   earlier, or reach `JGTKN`, whose const variant is chosen instead
   (a variant cannot be both). The hand-written one-slot loop also
-  forwarded *within* supers. The stencils do not: at the second part,
-  every match arm of the first part has stored `dst`, and LLVM reloads
-  it instead of merging the values. Fixing that is independent of any
-  cache.
+  forwarded *within* supers. The stencils did not: the second part
+  loads `regs[a]` after the first stored `regs[dst]`, two different
+  holes, so LLVM cannot know they are the same register. (Not the
+  match arms: where the indices are known equal, GVN merges the arms'
+  stored values in a phi.) Fixed independently of any cache: forwarding
+  variants of `#[forward]` supers (language.md section 7), measured in
+  `bench/mini/RESULTS.md`.
 - Integers pay a round trip `movq` to and from xmm15 (2 + 2 cycles on
   Skylake), about what the store-to-load forwarding cost. Integer code
   (spectral_norm's `A`, sieve, queens) gains nothing and pays the extra

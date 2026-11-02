@@ -251,6 +251,26 @@ measured but not claimed.
     The kinds decode to the plain field, so the handlers' machine code
     is unchanged. 10 minutes of minifuzz under ASan afterwards: 2.0M
     programs (421k verified and ran), no failures.
+28. **Forwarding variants** (compiler). LLVM never forwarded a
+    super's first result into its second part: the store to `regs[dst]`
+    and the load of `regs[a]` use indices decoded from two words, which
+    no alias metadata can relate (when they are equal the load must see
+    the store). The test-and-branch of 26 was the only way, and it cost
+    more than it saved outside latency chains (with the float supers
+    marked: mandelbrot +2%, nbody +4%, JIT nbody +15%). A `#[forward]`
+    super now gets an opcode per set of linked operands (`MUL_F_ADD_F__f2`),
+    picked by `optimize` where the fields are equal, with no run-time
+    test; every Mini, MiniJS and Scheme super is `#[forward]` (Mini +45
+    opcodes, binary +22%). Best of 5, interleaved, `--align-functions=64`,
+    against the same compiler without the variants: Mini 0.982 by
+    geometric mean (mandelbrot 0.93, spectral_norm 0.96, fannkuch 0.97,
+    none slower than 1.005), with the JIT 0.973 (mandelbrot 0.92,
+    spectral_norm 0.93, queens 0.96). MiniJS 0.989 (nbody 0.95), JIT
+    0.984 (bitops 0.93, json 0.93). Scheme (best of 3, 41 programs) 0.967
+    (compare-and-`TEST` pairs branch on the compare's flags), JIT 1.00.
+    The forwarded operand is a copy of the earlier field, not the same
+    local: cold blocks decode fields again from the current word, which
+    gave 26's ADDI_ADDI a wrong register on its overflow path.
 
 Tried and dropped:
 
