@@ -1,0 +1,41 @@
+local s = "hello world"
+print(string.len(s), string.len(""), string.len("a\0b"), string.len(123))
+-- sub
+print(string.sub(s, 1, 5), string.sub(s, 7), string.sub(s, -5), string.sub(s, -5, -3))
+print(string.sub(s, 0), string.sub(s, 0, 3), string.sub(s, -100, 2), string.sub(s, 3, 100))
+print("[" .. string.sub(s, 5, 4) .. "]", "[" .. string.sub(s, 100) .. "]", "[" .. string.sub(s, 12) .. "]")
+print("[" .. string.sub(s, 1, 0) .. "]", "[" .. string.sub(s, -100, -50) .. "]", string.sub(s, 11, 11))
+print(string.sub(s, 2.0, 3.0), string.sub("", 1, 1) == "", string.sub(s, -1), string.sub(s, 1, -1))
+print(string.sub(12345, 2, 3))
+-- byte
+print(string.byte("A"), string.byte("abc", 2), string.byte("abc", -1), string.byte("abc", 3))
+print(string.byte("abc", 4), string.byte("abc", 0), string.byte("abc", -4), (string.byte("")))
+print(string.byte("\0"), string.byte(string.char(255)), string.byte("abc", 1.0))
+-- char
+print(string.char(72, 105, 33), "[" .. string.char() .. "]", string.char(97) .. string.char(98.0))
+print(string.len(string.char(0, 1, 2)), string.byte(string.char(255)))
+-- rep
+print(string.rep("ab", 3), "[" .. string.rep("x", 0) .. "]", "[" .. string.rep("x", -1) .. "]")
+print(string.rep("", 5) == "", string.rep("-", 10), string.len(string.rep("abc", 1000)))
+print(string.rep(7, 3), string.rep("a", 1))
+-- strings with zero bytes survive printing
+print(string.len("a\0b" .. "c"), string.byte("a\0b", 2))
+local z = string.char(120, 0, 121)
+print(string.len(z), string.byte(z, 2), string.sub(z, 3))
+-- expect: 11	0	3	3
+-- expect: hello	world	world	wor
+-- expect: hello world	hel	he	llo world
+-- expect: []	[]	[]
+-- expect: []	[]	d
+-- expect: el	true	d	hello world
+-- expect: 23
+-- expect: 65	98	99	99
+-- expect: nil	nil	nil	nil
+-- expect: 0	255	97
+-- expect: Hi!	[]	ab
+-- expect: 3	255
+-- expect: ababab	[]	[]
+-- expect: true	----------	3000
+-- expect: 777	a
+-- expect: 4	0
+-- expect: 3	0	y

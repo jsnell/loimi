@@ -1,0 +1,14 @@
+-- error(msg) stops the program; buffered output written before it is kept.
+io.write("partial ")
+print("line")
+function check(x)
+  if x > 2 then error("too big: " .. x) end
+  return x
+end
+print(check(1), check(2))
+check(3)
+print("not reached")
+-- expect: partial line
+-- expect: 1	2
+-- expect-stderr: error: line 5: too big: 3
+-- expect-exit: 1
