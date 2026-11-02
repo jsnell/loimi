@@ -1,0 +1,13 @@
+    0  LOADI dst=r1 v=1
+    1  LOADK dst=r3 c=k0
+    2  LOADI dst=r4 v=3
+    3  MUL dst=r2 a=r3 b=r4
+    4  ADD dst=r0 a=r1 b=r2
+    5  PRINT a=r0
+    6  LOADI dst=r1 v=4
+    7  LOADI dst=r2 v=3
+    8  LT dst=r0 a=r2 b=r1
+    9  PRINT a=r0
+   10  HALT
+8.5
+true

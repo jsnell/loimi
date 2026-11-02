@@ -1,0 +1,70 @@
+// Step 5: variables and control flow.
+//
+//   loimi run examples/tutorial/step5/main.lm -- FILE.pip [--disasm | --disasm-after]
+//
+// --disasm prints the bytecode before running it; --disasm-after prints it
+// after, when the inline caches are filled and ops have been quickened.
+
+import std.io;
+import std.os;
+import std.diag;
+import std.mem;
+import std.text;
+import parser;
+import compile;
+import value.{Value};
+import vm.{Pip, Limits, Machine, Globals};
+
+fn disassemble(code: []u32) {
+    var out = text.StrBuf.new();
+    Pip.disasm(code, &out);
+    io.print(out.as_str());
+    out.free();
+}
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else { io.eprintln("usage: step5 <file.pip> [--disasm | --disasm-after]"); return 2; };
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
+    let flag = os.arg(2) ?? "";
+    var sm = diag.SourceMap.new();
+    let file = sm.add(path, src);
+    var arena = mem.Arena.new();
+    defer arena.free();
+
+    var stmts = match parser.parse_program(src, file, &arena) {
+        Ok(s) => s,
+        Err(e) => { var d = e.diag(); sm.eprint(&d); return 1; }
+    };
+    var names = text.Interner.new();
+    let chunk = match compile.compile(&stmts, &names) {
+        Ok(c) => c,
+        Err(msg) => { io.eprint("error: "); io.eprintln(msg); return 1; }
+    };
+    if flag.eq("--disasm") { disassemble(chunk.code); }
+
+    var lim = Limits { nregs: chunk.nregs, nconsts: chunk.consts.len as u32, nnames: names.names.len as u32 };
+    if Pip.verify(chunk.code, &lim).is_some() {
+        io.eprintln("error: the bytecode failed verification");
+        return 1;
+    }
+
+    var m = Machine {
+        code: chunk.code.ptr, lines: chunk.lines.ptr, out: text.StrBuf.new(), error_line: 0,
+        globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+    };
+    let regs: *Value = mem.alloc(chunk.nregs as u64);
+    let status: i32 = match Pip.run(&m, regs, chunk.consts.ptr) {
+        Ok(_) => 0,
+        Err(msg) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: line ");
+            b.push_int(m.error_line as i64);
+            b.push_str(": ");
+            b.push_str(msg);
+            io.eprintln(b.as_str());
+            1
+        }
+    };
+    if flag.eq("--disasm-after") { disassemble(chunk.code); }
+    status
+}

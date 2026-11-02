@@ -1,0 +1,56 @@
+// The calculator's virtual machine: a register machine over i64.
+
+import std.io;
+
+/// What the verifier checks operands against: the size of the register
+/// file and of the constant table.
+pub struct Limits { nregs: u32, nconsts: u32 }
+
+pub vm Calc {
+    // Live across every instruction, and kept in machine registers.
+    state { pc: *u32, regs: *i64, k: *i64 }
+
+    // The generated verifier `Calc.verify(code, lim)` takes this.
+    verify_context lim: *Limits;
+
+    // What an encoded field means in a handler, and what the verifier
+    // must check about it.
+    operand reg = regs[it] verify (it as u32) < lim.nregs display "r{}";
+    operand kst = k[it] verify (it as u32) < lim.nconsts display "k{}";
+    operand imm = it;
+
+    // Every instruction is one 32-bit word.
+    encoding fixed(u32) {
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v; next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op NEG(dst: reg, a: reg) : ABC { dst = 0 - a; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op SUB(dst: reg, a: reg, b: reg) : ABC { dst = a - b; next }
+    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        if b == 0 { fail "division by zero" }
+        dst = a / b;
+        next
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if b == 0 { fail "division by zero" }
+        dst = a % b;
+        next
+    }
+    op PRINT(a: reg) : ABC { io.print_int(a); io.println(""); next }
+    op HALT() : ABC { exit Ok(()) }
+
+    // The way in: set up the state, then dispatch the first instruction.
+    entry run(code: *u32, r: *i64, consts: *i64) -> Result<(), str> {
+        pc = code;
+        regs = r;
+        k = consts;
+        jump pc
+    }
+}

@@ -1,0 +1,468 @@
+// The Pip virtual machine: registers hold dynamically typed values.
+
+import std.io;
+import std.gc;
+import std.mem;
+import std.text;
+import value;
+import value.{Value, Proto};
+
+extern "C" fn fmod(x: f64, y: f64) -> f64;
+
+/// One activation record. `ret` is where the caller continues when this
+/// frame's callee returns.
+pub struct Frame { proto: *Proto, base: *Value, ret: *u32 }
+
+/// One global variable. `key` is the name's symbol plus one; 0 marks an
+/// empty slot.
+pub struct Slot { key: u32, value: Value }
+
+/// The global variables: an open-addressing hash table. Growing it moves
+/// variables to other slots, so a cached slot index has to be checked.
+pub struct Globals { slots: *Slot, cap: u64, count: u64 }
+
+pub fn Globals.new() -> Globals { Globals { slots: mem.alloc(8), cap: 8, count: 0 } }
+
+/// The slot holding `key`, if it is defined.
+pub fn Globals.find(g: *Globals, key: u32) -> ?u64 {
+    var i = (key as u64 * 2654435761) & (g.cap - 1);
+    loop {
+        let k = g.slots[i].key;
+        if k == key { return Some(i); }
+        if k == 0 { return None; }
+        i = (i + 1) & (g.cap - 1);
+    }
+}
+
+pub fn Globals.define(g: *Globals, key: u32, v: Value) {
+    if let Some(i) = g.find(key) { g.slots[i].value = v; return; }
+    if (g.count + 1) * 2 > g.cap {
+        let old = g.slots;
+        let n = g.cap;
+        g.cap = n * 2;
+        g.slots = mem.alloc(g.cap);
+        g.count = 0;
+        for i in 0..n { if old[i].key != 0 { g.define(old[i].key, old[i].value); } }
+        mem.release(old);
+    }
+    var i = (key as u64 * 2654435761) & (g.cap - 1);
+    while g.slots[i].key != 0 { i = (i + 1) & (g.cap - 1); }
+    g.slots[i] = Slot { key: key, value: v };
+    g.count += 1;
+}
+
+/// The vm's context: everything handlers need that is not hot enough to
+/// deserve a machine register of its own.
+pub struct Machine {
+    /// The value stack: each call's registers are a window into it.
+    stack: *Value,
+    stack_end: *Value,
+    /// The frame stack: frames[0] runs the top-level code.
+    frames: *Frame,
+    frames_end: *Frame,
+    /// A scratch buffer for printing.
+    out: text.StrBuf,
+    /// The line of the last run-time error.
+    error_line: u32,
+    globals: Globals,
+    /// Variable names, for error messages.
+    names: *text.Interner,
+    /// Holds the message of the last run-time error.
+    err: text.StrBuf,
+    heap: gc.Heap,
+    /// The frame of the running function, as of the last sync: the root
+    /// scanner walks the frames up to here.
+    fp: *Frame,
+    /// Every function, for their constants.
+    protos: *mem.Vec<*Proto>,
+    /// Scratch space for building strings.
+    tmp: text.StrBuf,
+}
+
+/// The GC's roots: every active frame's registers, every function's
+/// constants, and the globals. Registered with `heap.add_scanner`; it runs
+/// during a collection, so it has no effects and cannot collect.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let m = data as *Machine;
+    var f = m.frames;
+    while f <= m.fp {
+        for i in 0..f.proto.nregs as u64 { gc_mark(h, f.base[i]); }
+        f = f + 1;
+    }
+    for i in 0..m.protos.len {
+        let p = m.protos.at(i);
+        for j in 0..p.consts.len { gc_mark(h, p.consts[j]); }
+    }
+    for i in 0..m.globals.cap {
+        if m.globals.slots[i].key != 0 { gc_mark(h, m.globals.slots[i].value); }
+    }
+}
+
+/// "undefined variable 'x'"
+fn undefined(m: *Machine, name: u64) -> str {
+    m.err.clear();
+    m.err.push_str("undefined variable '");
+    m.err.push_str(m.names.name(name as u32));
+    m.err.push_str("'");
+    m.err.as_str()
+}
+
+pub enum Arith { Add, Sub, Mul, Div, Mod }
+
+fn arith_error(v: Value) -> str {
+    match v {
+        Nil => "arithmetic on a nil value",
+        Bool(_) => "arithmetic on a boolean value",
+        Fn(_) => "arithmetic on a function value",
+        Str(_) => "arithmetic on a string value",
+        Arr(_) => "arithmetic on an array value",
+        _ => "arithmetic on a number",
+    }
+}
+
+/// Everything the handlers' fast paths leave out: integer overflow,
+/// mixed integer and float operands, division, and type errors.
+fn arith(op: Arith, a: Value, b: Value) -> Result<Value, str> {
+    if let (Int(x), Int(y)) = (a, b) {
+        let (x, y) = (x as i64, y as i64);
+        let r = match op {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            Div => { if y == 0 { return Err("division by zero"); } x / y }
+            Mod => { if y == 0 { return Err("division by zero"); } x % y }
+        };
+        // A result that does not fit an Int becomes a float.
+        if r >= -2147483648 and r <= 2147483647 { return Ok(Value.Int(r as i32)); }
+        return Ok(Value.Num(r as f64));
+    }
+    let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) else {
+        return Err(if value.to_f64(a).is_none() { arith_error(a) } else { arith_error(b) });
+    };
+    Ok(Value.Num(match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => x / y,
+        Mod => fmod(x, y),
+    }))
+}
+
+fn less(a: Value, b: Value, or_equal: bool) -> Result<bool, str> {
+    let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) else {
+        return Err("comparison of non-numbers");
+    };
+    Ok(if or_equal { x <= y } else { x < y })
+}
+
+/// Numbers compare by value (1 == 1.0); anything else by identity.
+fn equal(a: Value, b: Value) -> bool {
+    if let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) { return x == y; }
+    if let (Str(x), Str(y)) = (a, b) { return x.data.eq(y.data); }
+    a == b
+}
+
+fn is_str(v: Value) -> bool { if let Str(_) = v { true } else { false } }
+
+/// ADD, SUB and MUL outside their fast paths. `+` with a string on either
+/// side joins the two as text, which allocates, so it may collect first.
+fn arith_slow(m: *Machine, op: Arith, a: Value, b: Value) -> Result<Value, str> uses gc {
+    if op == Arith.Add and (is_str(a) or is_str(b)) {
+        // `a` and `b` hold traced values and are used after this call,
+        // so the compiler registers them as roots while it runs.
+        gc.maybe_collect(&m.heap);
+        m.tmp.clear();
+        value.write(&m.tmp, a);
+        value.write(&m.tmp, b);
+        return Ok(Value.Str(value.new_str(&m.heap, m.tmp.as_str())));
+    }
+    arith(op, a, b)
+}
+
+pub vm Pip {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
+
+    // The verifier checks one function at a time, against its prototype.
+    verify_context proto: *Proto, nnames: u32;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs display "r{}";
+    operand kst = k[it] verify it < proto.consts.len display "k{}";
+    operand imm = it;
+    operand gname = it verify (it as u32) < nnames display "g{}";
+    /// CALL's argument count: R[base+1 .. base+n] must be in the frame.
+    operand nargs = it verify Pip.ABC_a(*pc) + it < proto.nregs as u64;
+    /// NEWLIST's element count: R[base .. base+n-1] must be in the frame.
+    operand listn = it verify Pip.ABC_b(*pc) + it <= proto.nregs as u64;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    // Before a call that may collect, the compiler runs this, so that the
+    // root scanner sees the current frame.
+    sync { ctx.fp = fp; }
+
+    encoding fixed(u32) {
+        format AB   { op: 8, a: 8, b: 8 }
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ   { op: 8, sj: s24 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADNIL(dst: reg) : ABC { dst = Nil; next }
+    op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+
+    // Three ops from one template: `#name` makes an identifier, and `sym`
+    // is pasted as a token.
+    inline for (name, checked, sym, kind) in [
+        ("ADD", "add_checked", +, Arith.Add),
+        ("SUB", "sub_checked", -, Arith.Sub),
+        ("MUL", "mul_checked", *, Arith.Mul),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                _ => {}
+            }
+            cold { dst = arith_slow(ctx, kind, a, b)?; next }
+        }
+    }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) if y > 0 => { dst = Int(x / y); next }
+            (Num(x), Num(y)) => { dst = Num(x / y); next }
+            _ => {}
+        }
+        cold { dst = arith(Arith.Div, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x % y); next }
+        cold { dst = arith(Arith.Mod, a, b)?; next }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        match a {
+            Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
+            Num(x) => { dst = Num(-x); next }
+            _ => {}
+        }
+        cold { dst = arith(Arith.Sub, Value.Int(0), a)?; next }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
+
+    op EQ(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x == y); next }
+        cold { dst = Bool(equal(a, b)); next }
+    }
+    op NE(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x != y); next }
+        cold { dst = Bool(!equal(a, b)); next }
+    }
+    inline for (name, test, or_equal) in [("LT", x < y, false), ("LE", x <= y, true)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = Bool(test); next }
+                (Num(x), Num(y)) => { dst = Bool(test); next }
+                _ => {}
+            }
+            cold { dst = Bool(less(a, b, or_equal)?); next }
+        }
+    }
+
+    // Global variables. The first execution of a GETGLOBAL looks the name
+    // up and caches the slot in the word after the instruction, then
+    // rewrites its own opcode to GETGLOBAL_C, which only checks that the
+    // slot still holds the name. If the table has grown since, it turns
+    // back into GETGLOBAL and runs again.
+    cache GlobalIC { slot: u32 }
+
+    family GETGLOBAL(dst: reg, n: gname) : ABx + GlobalIC {
+        generic {
+            let Some(i) = ctx.globals.find(n as u32 + 1) else { cold { raise undefined(ctx, n) } };
+            cache.slot = i as u32;
+            dst = ctx.globals.slots[i].value;
+            become GETGLOBAL_C;
+            next
+        }
+        GETGLOBAL_C {
+            let i = cache.slot as u64;
+            if likely(i < ctx.globals.cap) {
+                let s = ctx.globals.slots + i;
+                if s.key == n as u32 + 1 { dst = s.value; next }
+            }
+            cold { become GETGLOBAL; redo }
+        }
+    }
+    family SETGLOBAL(src: reg, n: gname) : ABx + GlobalIC {
+        generic {
+            let Some(i) = ctx.globals.find(n as u32 + 1) else { cold { raise undefined(ctx, n) } };
+            cache.slot = i as u32;
+            ctx.globals.slots[i].value = src;
+            become SETGLOBAL_C;
+            next
+        }
+        SETGLOBAL_C {
+            let i = cache.slot as u64;
+            if likely(i < ctx.globals.cap) {
+                let s = ctx.globals.slots + i;
+                if s.key == n as u32 + 1 { s.value = src; next }
+            }
+            cold { become SETGLOBAL; redo }
+        }
+    }
+    op DEFGLOBAL(src: reg, n: gname) : ABx { ctx.globals.define(n as u32 + 1, src); next }
+
+    // Branches. JMP jumps; JF jumps if its operand is false or nil.
+    op JMP(target: label) : sJ { jump target }
+    op JF(a: reg, target: label) : AsBx {
+        if !value.truthy(a) { jump target }
+        next
+    }
+
+    // Compare and branch: these are always followed by a JMP (`then JMP`),
+    // which holds the offset. If the comparison holds, skip the JMP and
+    // run the code after it; otherwise take it. The jump word stays an
+    // ordinary instruction, so std.bc patches it and the verifier checks
+    // its target like any other.
+    fn branch(holds: bool, target: *u32) -> never {
+        if holds { jump pc + 2 }
+        jump target
+    }
+    inline for (name, test, slow) in [("JNLT", x < y, less(a, b, false)), ("JNLE", x <= y, less(a, b, true))] {
+        op #name(a: reg, b: reg) : AB then JMP {
+            match (a, b) {
+                (Int(x), Int(y)) => branch(test, then.target),
+                (Num(x), Num(y)) => branch(test, then.target),
+                _ => {}
+            }
+            cold { branch(slow?, then.target) }
+        }
+    }
+    op JNEQ(a: reg, b: reg) : AB then JMP {
+        if let (Int(x), Int(y)) = (a, b) { branch(x == y, then.target) }
+        cold { branch(equal(a, b), then.target) }
+    }
+    op JEQ(a: reg, b: reg) : AB then JMP {
+        if let (Int(x), Int(y)) = (a, b) { branch(x != y, then.target) }
+        cold { branch(!equal(a, b), then.target) }
+    }
+
+    // Arrays and strings.
+
+    /// R[dst] = [R[base], ..., R[base+n-1]]
+    op NEWLIST(dst: reg, base: reg, n: listn) : ABC {
+        // Collect, if enough has been allocated, before allocating. The
+        // test is inline; the collection, and the sync before it, are cold.
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let arr = new(&ctx.heap, value.Arr {}, n);
+        for i in 0..n { arr.items[i] = regs[base.raw + i]; }
+        dst = Arr(arr);
+        next
+    }
+    /// R[dst] = an array of R[n] nils.
+    op NEWARRAY(dst: reg, n: reg) : ABC {
+        if let Int(len) = n and len >= 0 {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            dst = Arr(value.new_arr(&ctx.heap, len as u64));
+            next
+        }
+        cold { raise "array size must be a non-negative integer" }
+    }
+    op GETINDEX(dst: reg, a: reg, i: reg) : ABC {
+        if let (Arr(arr), Int(j)) = (a, i) {
+            // A negative index becomes a huge u64 and fails the test too.
+            let u = j as u64;
+            if u < arr.items.len { dst = arr.items.ptr[u]; next }
+            cold { raise "index out of range" }
+        }
+        cold { raise "indexing a non-array" }
+    }
+    op SETINDEX(a: reg, i: reg, v: reg) : ABC {
+        if let (Arr(arr), Int(j)) = (a, i) {
+            let u = j as u64;
+            if u < arr.items.len { arr.items.ptr[u] = v; next }
+            cold { raise "index out of range" }
+        }
+        cold { raise "indexing a non-array" }
+    }
+    op LEN(dst: reg, a: reg) : ABC {
+        match a {
+            Str(s) => { dst = Int(s.data.len as i32); next }
+            Arr(arr) => { dst = Int(arr.items.len as i32); next }
+            _ => {}
+        }
+        cold { raise "length of a value that is not a string or an array" }
+    }
+
+    op PRINT(a: reg) : ABC {
+        ctx.out.clear();
+        value.write(&ctx.out, a);
+        io.println(ctx.out.as_str());
+        next
+    }
+    op HALT() : ABC { exit Ok(()) }
+
+    /// R[base] = R[base](R[base+1], ..., R[base+n]). The callee's
+    /// registers start at R[base+1], so the arguments are already its
+    /// first registers, and the result goes just below its window.
+    op CALL(base: reg, n: nargs) : ABC {
+        let f = base;
+        if let Fn(p) = f {
+            if n as u32 != p.nparams { cold { raise "wrong number of arguments" } }
+            let callee = regs + base.raw + 1;
+            if callee + p.nregs as u64 > ctx.stack_end or fp + 1 == ctx.frames_end {
+                cold { raise "stack overflow" }
+            }
+            // Registers past the arguments still hold whatever an earlier
+            // call left there, possibly objects the collector has freed
+            // since. The root scanner will read them, so clear them.
+            var i = n as u64;
+            while i < p.nregs as u64 {
+                callee[i] = Nil;
+                i += 1;
+            }
+            fp.ret = pc + 1;
+            fp = fp + 1;
+            fp.proto = p;
+            fp.base = callee;
+            regs = callee;
+            k = p.consts.ptr;
+            jump p.code.ptr
+        }
+        cold { raise "call of a non-function" }
+    }
+    /// Return R[src] to the caller.
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.frames { exit Ok(()) }
+        *(regs - 1) = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.proto.consts.ptr;
+        jump fp.ret
+    }
+
+    entry run(m: *Machine, main: *Proto) -> Result<(), str> {
+        ctx = m;
+        fp = m.frames;
+        fp.proto = main;
+        fp.base = m.stack;
+        regs = m.stack;
+        for i in 0..main.nregs as u64 { regs[i] = Nil; }
+        k = main.consts.ptr;
+        m.fp = fp;
+        jump main.code.ptr
+    }
+
+    // `raise msg` (and `?` on an Err) in any handler lands here, with the
+    // state as it was in that handler: `pc` still points at the
+    // instruction that failed, and `fp` at its function's frame.
+    on raise(msg: str) {
+        let p = fp.proto;
+        let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
+        ctx.error_line = p.lines[i];
+        fail msg
+    }
+}

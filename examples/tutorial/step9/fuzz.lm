@@ -1,0 +1,208 @@
+// A bytecode fuzzer for Pip. It compiles real programs, breaks a few
+// words of their bytecode at random, checks the result with the
+// generated verifier `Pip.verify`, and runs whatever passes through
+// `run_budget`, which stops programs that loop forever. Anything that
+// crashes (or that ASan reports) is a hole in a `verify` clause or in a
+// handler.
+//
+//   loimi build examples/tutorial/step9/fuzz.lm --sanitize=address -o fuzz
+//   ./fuzz FIRST-SEED COUNT FILE.pip... [--gc-stress] [-v]
+//
+// Starting from compiled code rather than random words means most
+// mutants are nearly valid, which is where verifier bugs hide. Besides
+// crashes it checks two properties: code still verifies after
+// `Pip.optimize` fuses superinstructions, and after running (when sites
+// have quickened and caches are filled).
+
+import std.io;
+import std.os;
+import std.gc;
+import std.mem;
+import std.text;
+import parser;
+import compile;
+import value.{Value, Proto};
+import vm;
+import vm.{Pip, Machine, Globals, Frame};
+
+extern "C" fn dup(fd: i32) -> i32;
+extern "C" fn dup2(fd: i32, to: i32) -> i32;
+extern "C" fn open(path: *u8, flags: i32) -> i32;
+
+struct Rng { s: u64 }
+
+/// splitmix64
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 11400714819323198485;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 13787848793156543417;
+    z = (z ^ (z >> 27)) *% 10723151780598845931;
+    z ^ (z >> 31)
+}
+
+fn Rng.below(r: *Rng, n: u64) -> u64 { if n == 0 { 0 } else { r.next() % n } }
+
+fn Rng.chance(r: *Rng, percent: u64) -> bool { r.below(100) < percent }
+
+/// Change one word of `p`'s code.
+fn mutate(r: *Rng, p: *Proto) {
+    let i = r.below(p.code.len);
+    var w = p.code[i];
+    let k = r.below(100);
+    if k < 40 {
+        // One operand byte: usually a small number, sometimes anything.
+        let shift = 8 * (1 + r.below(3));
+        let v = if r.chance(80) { r.below(p.nregs as u64 + 3) } else { r.below(256) };
+        w = (w & (((255 as u64) << shift) as u32 ^ 0xFFFFFFFF)) | ((v << shift) as u32);
+    } else if k < 65 {
+        // Another opcode, same operands.
+        w = (w & 0xFFFFFF00) | (r.below(Pip.NUM_OPS) as u32);
+    } else if k < 85 {
+        w = w ^ (((1 as u64) << r.below(32)) as u32);
+    } else if k < 95 {
+        // Another target, if the word is a jump.
+        let off = r.below(p.code.len + 4) as i64 - i as i64 - 2;
+        if let Some(j) = Pip.set_label(w, off) { w = j; }
+    } else {
+        w = r.next() as u32;
+    }
+    p.code[i] = w;
+}
+
+struct Stats { rejected: u64, finished: u64, raised: u64, budget: u64 }
+
+/// With -v, print the instruction each rejected program failed at.
+var VERBOSE: bool = false;
+
+fn verify_all(protos: *mem.Vec<*Proto>, nnames: u32, explain: bool) -> bool {
+    for i in 0..protos.len {
+        let p = protos.at(i);
+        if let Some(bad) = Pip.verify(p.code, p, nnames) {
+            if explain and VERBOSE {
+                var b = text.StrBuf.new();
+                b.push_str("rejected:");
+                Pip.disasm_insn(p.code, bad, &b);
+                io.eprint(b.as_str());
+                b.free();
+            }
+            return false;
+        }
+    }
+    true
+}
+
+fn bug(seed: u64, what: str) {
+    var b = text.StrBuf.new();
+    b.push_str("BUG: seed ");
+    b.push_int(seed as i64);
+    b.push_str(": ");
+    b.push_str(what);
+    io.eprintln(b.as_str());
+    os.quit(1);
+}
+
+/// One program: compile a corpus file, break it, verify it, run it.
+fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st: *Stats) {
+    var r = Rng { s: seed };
+    var arena = mem.Arena.new();
+    var names = text.Interner.new();
+    var m = Machine {
+        stack: stack, stack_end: stack + 4096, frames: frames, frames_end: frames + 64,
+        out: text.StrBuf.new(), error_line: 0, globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+        heap: gc.Heap.new(), fp: frames, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(), steps: 20000,
+    };
+    var stmts = match parser.parse_program(src, 0, &arena) {
+        Ok(s) => s,
+        Err(_) => { bug(seed, "corpus file does not parse"); return; }
+    };
+    var prog = match compile.compile(&stmts, &names, &m.heap) {
+        Ok(p) => p,
+        Err(_) => { bug(seed, "corpus file does not compile"); return; }
+    };
+    m.protos = &prog.protos;
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    if stress { m.heap.set_stress(true); }
+    let nnames = names.names.len as u32;
+
+    let n = 1 + r.below(3);
+    for _ in 0..n { mutate(&r, prog.protos.at(r.below(prog.protos.len))); }
+
+    if !verify_all(&prog.protos, nnames, true) {
+        st.rejected += 1;
+    } else {
+        for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
+        if !verify_all(&prog.protos, nnames, false) { bug(seed, "code does not verify after Pip.optimize"); }
+        match Pip.run_budget(&m, prog.main) {
+            Ok(_) => st.finished += 1,
+            Err(msg) => if msg.eq("step budget exhausted") { st.budget += 1; } else { st.raised += 1; },
+        }
+        if !verify_all(&prog.protos, nnames, false) { bug(seed, "code does not verify after running"); }
+    }
+
+    // Everything this run allocated goes; the next run compiles afresh.
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        mem.release(p.code.ptr);
+        mem.release(p.lines.ptr);
+        mem.release(p.consts.ptr);
+        mem.release(p);
+    }
+    prog.protos.free();
+    m.heap.free();
+    mem.release(m.globals.slots);
+    m.out.free();
+    m.err.free();
+    m.tmp.free();
+    arena.free();
+    // (text.Interner has no free of its own.)
+    names.ids.free();
+    names.names.free();
+    names.arena.free();
+}
+
+fn main() -> i32 {
+    let (Some(a), Some(b)) = (os.arg(1), os.arg(2)) else {
+        io.eprintln("usage: fuzz FIRST-SEED COUNT FILE.pip... [--gc-stress] [-v]");
+        return 2;
+    };
+    let (Some(first), Some(count)) = (text.parse_int(a), text.parse_int(b)) else {
+        io.eprintln("seeds must be numbers");
+        return 2;
+    };
+    var stress = false;
+    var corpus: mem.Vec<str> = mem.Vec.new();
+    for i in 3..os.arg_count() {
+        let f = os.arg(i) ?? "";
+        if f.eq("--gc-stress") { stress = true; continue; }
+        if f.eq("-v") { VERBOSE = true; continue; }
+        let Some(src) = io.read_file(f) else { io.eprint("cannot read "); io.eprintln(f); return 2; };
+        corpus.push(src);
+    }
+    if corpus.len == 0 { io.eprintln("no corpus files"); return 2; }
+
+    // The programs print; send that to /dev/null while they run.
+    let stdout = dup(1);
+    dup2(open("/dev/null\0".ptr, 1), 1);
+    let stack: *Value = mem.alloc(4096);
+    let frames: *Frame = mem.alloc(64);
+    var st = Stats { rejected: 0, finished: 0, raised: 0, budget: 0 };
+    for i in 0..count as u64 {
+        let seed = first as u64 + i;
+        run_one(seed, corpus.at(seed % corpus.len), stress, stack, frames, &st);
+    }
+    dup2(stdout, 1);
+
+    var out = text.StrBuf.new();
+    out.push_int(count);
+    out.push_str(" programs: ");
+    out.push_int(st.rejected as i64);
+    out.push_str(" rejected by the verifier, ");
+    out.push_int(st.finished as i64);
+    out.push_str(" finished, ");
+    out.push_int(st.raised as i64);
+    out.push_str(" raised an error, ");
+    out.push_int(st.budget as i64);
+    out.push_str(" ran out of steps");
+    io.println(out.as_str());
+    0
+}

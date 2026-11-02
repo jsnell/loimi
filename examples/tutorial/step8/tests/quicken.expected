@@ -1,0 +1,46 @@
+2.5
+2.0
+55
+fn step:
+    0  MULK_F dst=r3 a=r0 b=k0
+    1  ADD_F dst=r2 a=r3 b=r1
+    2  RET src=r2
+    3  LOADNIL dst=r2
+    4  RET src=r2
+fn fib:
+    0  JNLTK a=r0 b=k0
+    1  JMP target -> 3
+    2  RET src=r0
+    3  GETGLOBAL_C_SUBK
+    3    GETGLOBAL_C dst=r2 n=g1 [cache slot=2]
+    5    SUBK dst=r3 a=r0 b=k1
+    6  CALL base=r2 n=1
+    7  GETGLOBAL_C_SUBK
+    7    GETGLOBAL_C dst=r3 n=g1 [cache slot=2]
+    9    SUBK dst=r4 a=r0 b=k0
+   10  CALL base=r3 n=1
+   11  ADD_RET
+   11    ADD dst=r1 a=r2 b=r3
+   12    RET src=r1
+   13  LOADNIL dst=r1
+   14  RET src=r1
+fn main:
+    0  LOADK dst=r0 c=k0
+    1  DEFGLOBAL src=r0 n=g0
+    2  LOADK dst=r0 c=k1
+    3  DEFGLOBAL src=r0 n=g1
+    4  GETGLOBAL_C dst=r0 n=g0 [cache slot=1]
+    6  LOADK dst=r1 c=k2
+    7  LOADK dst=r2 c=k3
+    8  CALL base=r0 n=2
+    9  PRINT a=r0
+   10  GETGLOBAL_C dst=r0 n=g0 [cache slot=1]
+   12  LOADI dst=r1 v=2
+   13  LOADI dst=r2 v=1
+   14  CALL base=r0 n=2
+   15  PRINT a=r0
+   16  GETGLOBAL_C dst=r0 n=g1 [cache slot=2]
+   18  LOADI dst=r1 v=10
+   19  CALL base=r0 n=1
+   20  PRINT a=r0
+   21  HALT

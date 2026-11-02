@@ -1,0 +1,108 @@
+// Step 8: the same language, made faster.
+//
+//   loimi run examples/tutorial/step8/main.lm -- FILE.pip [--disasm] [--disasm-after] [--gc-stress]
+//
+// --gc-stress collects at every allocation site, which finds a missing
+// root in the first few instructions that depend on it.
+
+import std.io;
+import std.os;
+import std.diag;
+import std.gc;
+import std.mem;
+import std.text;
+import parser;
+import compile;
+import compile.{Program};
+import value.{Value, Proto};
+import vm;
+import vm.{Pip, Machine, Globals, Frame};
+
+fn error(msg: str, line: u32) {
+    var b = text.StrBuf.new();
+    b.push_str("error: line ");
+    b.push_int(line as i64);
+    b.push_str(": ");
+    b.push_str(msg);
+    io.eprintln(b.as_str());
+    b.free();
+}
+
+fn disassemble(prog: *Program) {
+    var out = text.StrBuf.new();
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        out.push_str("fn ");
+        out.push_str(p.name);
+        out.push_str(":\n");
+        Pip.disasm(p.code, &out);
+    }
+    io.print(out.as_str());
+    out.free();
+}
+
+const STACK: u64 = 1 << 20;
+const FRAMES: u64 = 1 << 16;
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else { io.eprintln("usage: step8 <file.pip> [--disasm] [--disasm-after] [--gc-stress]"); return 2; };
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
+    var disasm = false;
+    var disasm_after = false;
+    var stress = false;
+    for i in 2..os.arg_count() {
+        let a = os.arg(i) ?? "";
+        if a.eq("--disasm") { disasm = true; }
+        if a.eq("--disasm-after") { disasm_after = true; }
+        if a.eq("--gc-stress") { stress = true; }
+    }
+    var sm = diag.SourceMap.new();
+    let file = sm.add(path, src);
+    var arena = mem.Arena.new();
+    defer arena.free();
+
+    var stmts = match parser.parse_program(src, file, &arena) {
+        Ok(s) => s,
+        Err(e) => { var d = e.diag(); sm.eprint(&d); return 1; }
+    };
+    var names = text.Interner.new();
+    var m = Machine {
+        stack: mem.alloc(STACK), stack_end: 0 as *Value,
+        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame,
+        out: text.StrBuf.new(), error_line: 0,
+        globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+        heap: gc.Heap.new(), fp: 0 as *Frame, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(),
+    };
+    m.stack_end = m.stack + STACK;
+    m.frames_end = m.frames + FRAMES;
+    m.fp = m.frames;
+
+    // The compiler allocates string constants. Nothing collects until the
+    // program runs, so they need no rooting until `m.protos` is set.
+    var prog = match compile.compile(&stmts, &names, &m.heap) {
+        Ok(p) => p,
+        Err((msg, line)) => { error(msg, line); return 1; }
+    };
+    m.protos = &prog.protos;
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    if stress { m.heap.set_stress(true); }
+
+    // Fuse superinstructions, then verify every function before running
+    // anything. (The verifier checks supers too.)
+    for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
+    if disasm { disassemble(&prog); }
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        if let Some(bad) = Pip.verify(p.code, p, names.names.len as u32) {
+            error("bytecode failed verification", p.lines[bad]);
+            return 1;
+        }
+    }
+
+    let status: i32 = match Pip.run(&m, prog.main) {
+        Ok(_) => 0,
+        Err(msg) => { error(msg, m.error_line); 1 }
+    };
+    if disasm_after { disassemble(&prog); }
+    status
+}

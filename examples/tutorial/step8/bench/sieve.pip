@@ -1,0 +1,25 @@
+// Arrays: the sieve of Eratosthenes, repeated.
+fn sieve(n) {
+    let composite = array(n + 1);
+    let count = 0;
+    let i = 2;
+    while i <= n {
+        if not composite[i] {
+            count = count + 1;
+            let j = i * i;
+            while j <= n {
+                composite[j] = true;
+                j = j + i;
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+let total = 0;
+let round = 0;
+while round < 30 {
+    total = total + sieve(1000000);
+    round = round + 1;
+}
+print total;

@@ -1,0 +1,125 @@
+// Compile Pip's syntax tree to bytecode for the Pip vm.
+
+import std.bc;
+import std.mem;
+import parser.{Node, Expr, BinOp, Stmt};
+import value.{Value};
+import vm.{Pip};
+
+/// A compiled program. `lines` holds the source line of every code word.
+pub struct Chunk { code: []u32, lines: []u32, consts: []Value, nregs: u32 }
+
+struct C {
+    code: bc.Code<u32>,
+    consts: bc.Pool<Value>,
+    regs: bc.Regs,
+    error: ?str,
+}
+
+/// The instruction for `dst = a op b`. There is no GT or GE: `a > b` is
+/// `b < a`.
+fn binop(op: BinOp, dst: u8, a: u8, b: u8) -> u32 {
+    match op {
+        Add => Pip.ADD(dst, a, b),
+        Sub => Pip.SUB(dst, a, b),
+        Mul => Pip.MUL(dst, a, b),
+        Div => Pip.DIV(dst, a, b),
+        Mod => Pip.MOD(dst, a, b),
+        Eq => Pip.EQ(dst, a, b),
+        Ne => Pip.NE(dst, a, b),
+        Lt => Pip.LT(dst, a, b),
+        Le => Pip.LE(dst, a, b),
+        Gt => Pip.LT(dst, b, a),
+        Ge => Pip.LE(dst, b, a),
+    }
+}
+
+fn C.constant(c: *C, dst: u8, v: Value) {
+    let Some(k) = c.consts.add(v) else { c.error = Some("too many constants"); return; };
+    c.code.op(Pip.LOADK(dst, k as u16));
+}
+
+/// Compile `n` so that its value ends up in register `dst`.
+fn C.expr_to(c: *C, n: *Node, dst: u32) {
+    let d = dst as u8;
+    // Instructions emitted from here on belong to this line.
+    c.code.set_loc(n.line);
+    match n.expr {
+        Int(v) => {
+            if v >= -32768 and v <= 32767 {
+                c.code.op(Pip.LOADI(d, v as i16));
+            } else if v >= -2147483648 and v <= 2147483647 {
+                c.constant(d, Value.Int(v as i32));
+            } else {
+                c.constant(d, Value.Num(v as f64));
+            }
+        }
+        Float(x) => c.constant(d, Value.Num(x)),
+        Bool(b) => { c.code.op(Pip.LOADBOOL(d, if b { 1 } else { 0 })); }
+        Nil => { c.code.op(Pip.LOADNIL(d)); }
+        Neg(e) => {
+            c.expr_to(e, dst);
+            c.code.set_loc(n.line);
+            c.code.op(Pip.NEG(d, d));
+        }
+        Not(e) => {
+            c.expr_to(e, dst);
+            c.code.set_loc(n.line);
+            c.code.op(Pip.NOT(d, d));
+        }
+        Binary(op, l, r) => {
+            let mark = c.regs.mark();
+            let a = c.operand(l);
+            let b = c.operand(r);
+            c.code.set_loc(n.line);
+            c.code.op(binop(op, d, a as u8, b as u8));
+            c.regs.reset(mark);
+        }
+    }
+}
+
+/// Compile `n` into a new temporary register and return it.
+fn C.operand(c: *C, n: *Node) -> u32 {
+    let r = c.regs.alloc(1);
+    c.expr_to(n, r);
+    r
+}
+
+fn C.stmt(c: *C, s: Stmt) {
+    match s {
+        Print(e) => {
+            let r = c.operand(e);
+            c.code.set_loc(e.line);
+            c.code.op(Pip.PRINT(r as u8));
+        }
+    }
+    c.regs.end_stmt();
+}
+
+pub fn compile(stmts: *mem.Vec<Stmt>) -> Result<Chunk, str> {
+    var c = C {
+        code: bc.Code.new(Pip.op_size, Pip.set_label),
+        consts: bc.Pool.new(65536),
+        regs: bc.Regs.new(250),
+        error: None,
+    };
+    for i in 0..stmts.len { c.stmt(stmts.at(i)); }
+    c.code.op(Pip.HALT());
+    if c.regs.failed() { return Err("expression too complex: out of registers"); }
+    if let Some(e) = c.error { return Err(e); }
+
+    let n = c.code.len();
+    let code: *u32 = mem.alloc(n);
+    c.code.copy_into(code.slice(n));
+    let lines: *u32 = mem.alloc(n);
+    c.code.locs_into(lines.slice(n));
+    let nk = c.consts.len();
+    let consts: *Value = mem.alloc(nk);
+    for i in 0..nk { consts[i] = c.consts.get(i as u32); }
+    let chunk = Chunk {
+        code: code.slice(n), lines: lines.slice(n), consts: consts.slice(nk), nregs: c.regs.frame_size(1),
+    };
+    c.code.free();
+    c.consts.free();
+    Ok(chunk)
+}

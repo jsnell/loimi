@@ -1,0 +1,41 @@
+    0  LOADI dst=r1 v=1
+    1  LOADI dst=r3 v=2
+    2  LOADI dst=r4 v=3
+    3  MUL dst=r2 a=r3 b=r4
+    4  ADD dst=r0 a=r1 b=r2
+    5  PRINT a=r0
+    6  LOADI dst=r2 v=1
+    7  LOADI dst=r3 v=2
+    8  ADD dst=r1 a=r2 b=r3
+    9  LOADI dst=r2 v=3
+   10  MUL dst=r0 a=r1 b=r2
+   11  PRINT a=r0
+   12  LOADI dst=r2 v=10
+   13  LOADI dst=r3 v=4
+   14  SUB dst=r1 a=r2 b=r3
+   15  LOADI dst=r2 v=3
+   16  SUB dst=r0 a=r1 b=r2
+   17  PRINT a=r0
+   18  LOADI dst=r1 v=2
+   19  NEG dst=r1 a=r1
+   20  LOADI dst=r3 v=3
+   21  LOADI dst=r4 v=4
+   22  ADD dst=r2 a=r3 b=r4
+   23  NEG dst=r2 a=r2
+   24  MUL dst=r0 a=r1 b=r2
+   25  PRINT a=r0
+   26  LOADI dst=r1 v=17
+   27  LOADI dst=r2 v=5
+   28  DIV dst=r0 a=r1 b=r2
+   29  PRINT a=r0
+   30  LOADI dst=r1 v=17
+   31  LOADI dst=r2 v=5
+   32  MOD dst=r0 a=r1 b=r2
+   33  PRINT a=r0
+   34  HALT
+7
+9
+3
+14
+3
+2

@@ -1,0 +1,4 @@
+error: expected an expression
+  --> tests/err_syntax.pip:2:11
+    2 | print 1 + * 2;
+      |           ^

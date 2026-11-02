@@ -1,0 +1,13 @@
+// A hot loop over locals: integer and float arithmetic, compare-and-branch.
+fn run(n) {
+    let i = 0;
+    let acc = 0;
+    let x = 0.0;
+    while i < n {
+        acc = acc + i % 7;
+        x = x * 0.5 + 1.0;
+        i = i + 1;
+    }
+    return acc + x;
+}
+print run(30000000);

@@ -1,0 +1,99 @@
+// Compile the calculator's syntax tree to bytecode for the Calc vm.
+//
+// std.bc does the bookkeeping: `bc.Code` collects instruction words (the
+// generated encoders `Calc.ADD(..)` build them), `bc.Pool` deduplicates
+// constants, and `bc.Regs` hands out registers as a stack, the way Lua's
+// compiler does with its "free register".
+
+import std.bc;
+import std.mem;
+import parser.{Node, Expr, BinOp, Stmt};
+import vm.{Calc};
+
+/// A compiled program. The arrays are allocated with std.mem.
+pub struct Chunk { code: []u32, consts: []i64, nregs: u32 }
+
+struct C {
+    code: bc.Code<u32>,
+    consts: bc.Pool<i64>,
+    regs: bc.Regs,
+    /// The first error; compilation carries on and reports it at the end.
+    error: ?str,
+}
+
+fn arith(op: BinOp, dst: u8, a: u8, b: u8) -> u32 {
+    match op {
+        Add => Calc.ADD(dst, a, b),
+        Sub => Calc.SUB(dst, a, b),
+        Mul => Calc.MUL(dst, a, b),
+        Div => Calc.DIV(dst, a, b),
+        Mod => Calc.MOD(dst, a, b),
+    }
+}
+
+/// Compile `n` so that its value ends up in register `dst`.
+fn C.expr_to(c: *C, n: *Node, dst: u32) {
+    let d = dst as u8;
+    match n.expr {
+        Int(v) => {
+            if v >= -32768 and v <= 32767 {
+                c.code.op(Calc.LOADI(d, v as i16));
+            } else {
+                let Some(k) = c.consts.add(v) else { c.error = Some("too many constants"); return; };
+                c.code.op(Calc.LOADK(d, k as u16));
+            }
+        }
+        Neg(e) => {
+            c.expr_to(e, dst);
+            c.code.op(Calc.NEG(d, d));
+        }
+        Binary(op, l, r) => {
+            let mark = c.regs.mark();
+            let a = c.operand(l);
+            let b = c.operand(r);
+            c.code.op(arith(op, d, a as u8, b as u8));
+            c.regs.reset(mark);
+        }
+    }
+}
+
+/// Compile `n` into a new temporary register and return it.
+fn C.operand(c: *C, n: *Node) -> u32 {
+    let r = c.regs.alloc(1);
+    c.expr_to(n, r);
+    r
+}
+
+fn C.stmt(c: *C, s: Stmt) {
+    match s {
+        Print(e) => {
+            let r = c.operand(e);
+            c.code.op(Calc.PRINT(r as u8));
+        }
+    }
+    c.regs.end_stmt();
+}
+
+pub fn compile(stmts: *mem.Vec<Stmt>) -> Result<Chunk, str> {
+    var c = C {
+        code: bc.Code.new(Calc.op_size, Calc.set_label),
+        consts: bc.Pool.new(65536),
+        regs: bc.Regs.new(250),
+        error: None,
+    };
+    for i in 0..stmts.len { c.stmt(stmts.at(i)); }
+    c.code.op(Calc.HALT());
+    if c.regs.failed() { return Err("expression too complex: out of registers"); }
+    if let Some(e) = c.error { return Err(e); }
+
+    let n = c.code.len();
+    let code: *u32 = mem.alloc(n);
+    c.code.copy_into(code.slice(n));
+    let nk = c.consts.len();
+    let consts: *i64 = mem.alloc(nk);
+    for i in 0..nk { consts[i] = c.consts.get(i as u32); }
+    let chunk = Chunk { code: code.slice(n), consts: consts.slice(nk), nregs: c.regs.frame_size(1) };
+    c.code.free();
+    c.consts.free();
+    Ok(chunk)
+}

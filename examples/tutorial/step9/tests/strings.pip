@@ -1,0 +1,16 @@
+// Strings: literals, `+` with a string on either side, len, equality.
+let s = "hello";
+print s + ", world";
+print "n = " + 42;
+print 1.5 + "!";
+print len(s);
+print s == "hel" + "lo";
+print s != "hello";
+let t = "";
+let i = 0;
+while i < 5 {
+    t = t + i;
+    i = i + 1;
+}
+print t;
+print "tab\tand \"quotes\"";

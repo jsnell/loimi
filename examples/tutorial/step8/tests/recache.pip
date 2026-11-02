@@ -1,0 +1,13 @@
+// A function's global reads are cached. Defining more globals makes the
+// globals table grow, which moves them, and the caches recover.
+let a = 1;
+fn get() { return a; }
+print get();
+let b = 2;
+let c = 3;
+let d = 4;
+let e = 5;
+let g = 6;
+print get();
+a = 10;
+print get();

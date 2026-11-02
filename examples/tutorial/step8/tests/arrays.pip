@@ -1,0 +1,31 @@
+// Arrays: literals, array(n), indexing, len, nesting.
+let a = [1, 2.5, "three", nil, [4, 5]];
+print a;
+print len(a);
+print a[2];
+print a[4][1];
+a[0] = a[0] + 10;
+print a[0];
+
+fn range(n) {
+    let r = array(n);
+    let i = 0;
+    while i < n {
+        r[i] = i * i;
+        i = i + 1;
+    }
+    return r;
+}
+print range(6);
+
+fn sum(xs) {
+    let total = 0;
+    let i = 0;
+    while i < len(xs) {
+        total = total + xs[i];
+        i = i + 1;
+    }
+    return total;
+}
+print sum(range(100));
+print [] == [];

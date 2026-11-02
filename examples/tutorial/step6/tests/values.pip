@@ -1,0 +1,20 @@
+// Integers, floats, booleans and nil.
+print 7 / 2;
+print 7.0 / 2;
+print 1 + 0.5;
+print 2147483647 + 1;
+print -2147483647 - 1;
+print 3000000000;
+print 0.1 + 0.2;
+print 10 % 3;
+print -7 % 3;
+print 7.5 % 2;
+print 1 < 2;
+print 2 <= 1.5;
+print 3 > 2;
+print 1 == 1.0;
+print 1 != 2;
+print nil == false;
+print not nil;
+print not 0;
+print -(1.5);

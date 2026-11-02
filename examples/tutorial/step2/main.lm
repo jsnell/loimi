@@ -1,0 +1,62 @@
+// Step 2: a calculator. Parse `print <expr>;` statements into a tree and
+// evaluate the tree directly.
+//
+//   loimi run examples/tutorial/step2/main.lm -- examples/tutorial/step2/tests/arith.pip
+
+import std.io;
+import std.os;
+import std.diag;
+import std.mem;
+import std.text;
+import parser;
+import parser.{Node, Expr, BinOp, Stmt};
+
+/// Evaluate a tree. Errors are ordinary values: the message and the line.
+fn eval(n: *Node) -> Result<i64, (str, u32)> {
+    match n.expr {
+        Int(v) => Ok(v),
+        Neg(e) => Ok(0 - eval(e)?),
+        Binary(op, l, r) => {
+            let a = eval(l)?;
+            let b = eval(r)?;
+            match op {
+                Add => Ok(a + b),
+                Sub => Ok(a - b),
+                Mul => Ok(a * b),
+                Div => if b == 0 { Err(("division by zero", n.line)) } else { Ok(a / b) },
+                Mod => if b == 0 { Err(("division by zero", n.line)) } else { Ok(a % b) },
+            }
+        }
+    }
+}
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else { io.eprintln("usage: step2 <file.pip>"); return 2; };
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
+    var sm = diag.SourceMap.new();
+    let file = sm.add(path, src);
+    var arena = mem.Arena.new();
+    defer arena.free();
+
+    let stmts = match parser.parse_program(src, file, &arena) {
+        Ok(s) => s,
+        Err(e) => { var d = e.diag(); sm.eprint(&d); return 1; }
+    };
+    for i in 0..stmts.len {
+        match stmts.at(i) {
+            Print(e) => match eval(e) {
+                Ok(v) => { io.print_int(v); io.println(""); }
+                Err((msg, line)) => {
+                    var b = text.StrBuf.new();
+                    b.push_str("error: line ");
+                    b.push_int(line as i64);
+                    b.push_str(": ");
+                    b.push_str(msg);
+                    io.eprintln(b.as_str());
+                    return 1;
+                }
+            },
+        }
+    }
+    0
+}

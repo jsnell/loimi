@@ -66,6 +66,10 @@ infrastructure out of macros, compiler extensions, and convention:
 
 ## Documents
 
+- [`docs/tutorial/`](docs/tutorial/README.md): **start here**. A
+  step-by-step tutorial that builds a small language from a calculator to
+  a fast, garbage-collected, fuzzed bytecode interpreter, with working
+  code for every step in [`examples/tutorial/`](examples/tutorial).
 - [`docs/language.md`](docs/language.md): the language. The core is short;
   most of the document covers the interpreter-specific features (`value`, `vm`,
   effects, quickening, verification, GC integration, instrumentation).

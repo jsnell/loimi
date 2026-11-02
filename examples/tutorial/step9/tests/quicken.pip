@@ -1,0 +1,9 @@
+// After running: K forms, a float site quickened to ADD_F, supers.
+fn step(x, y) { return x * 0.5 + y; }
+fn fib(n) {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+print step(3.0, 1.0);
+print step(2, 1);
+print fib(10);

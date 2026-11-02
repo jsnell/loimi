@@ -1,0 +1,34 @@
+// Functions, recursion, and calls as statements.
+fn fib(n) {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+print fib(20);
+
+fn gcd(a, b) {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+print gcd(1071, 462);
+
+fn show(x) { print x; }
+show(42);
+print show(1);
+
+// Functions are values.
+let f = fib;
+print f(10);
+print fib;
+
+// Locals shadow globals; globals are visible inside functions.
+let count = 0;
+fn bump(count) { count = count + 100; return count; }
+print bump(1);
+fn tick() { count = count + 1; }
+tick();
+tick();
+print count;

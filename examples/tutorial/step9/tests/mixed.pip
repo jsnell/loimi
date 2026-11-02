@@ -1,0 +1,25 @@
+// Sites that see ints, then floats, then ints again, and the K forms
+// with every kind of constant.
+fn add(a, b) { return a + b; }
+print add(1, 2);
+print add(1.5, 2.5);
+print add(1, 2);
+print add("a", 1);
+fn k(x) { return [x + 1, x - 1, x * 2, x % 3, x + 0.5, x * 2147483647]; }
+print k(5);
+print k(2.5);
+print k(-7);
+fn cmp(x) {
+    let r = [];
+    if x < 2 { r = [r, "lt"]; }
+    if x <= 2 { r = [r, "le"]; }
+    if x > 2 { r = [r, "gt"]; }
+    if x >= 2 { r = [r, "ge"]; }
+    if x == 2 { r = [r, "eq"]; }
+    if x != 2 { r = [r, "ne"]; }
+    return r;
+}
+print cmp(1);
+print cmp(2);
+print cmp(2.0);
+print cmp(3.5);

@@ -1,0 +1,85 @@
+// The lexer for Pip, the language this tutorial builds. It already knows
+// every token of the final language, so later steps leave it alone.
+//
+// It is built from std.lex: a Cursor configured for C-style comments, the
+// cursor's numeral and string scanners, an OpTable for punctuation
+// (longest match wins, so `<=` is not `<` then `=`) and a Keywords table.
+
+import std.diag;
+import std.lex;
+import std.mem;
+import std.num;
+import std.text;
+
+pub enum T {
+    Eof, Int, Float, Str, Name,
+    // keywords
+    Let, Fn, If, Else, While, Return, Print, True, False, Nil, Not,
+    // punctuation
+    Plus, Minus, Star, Slash, Percent, EqEq, NotEq, Lt, Le, Gt, Ge, Assign,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi,
+}
+
+/// A token. `int` and `float` hold a numeral's value, `text` a name or the
+/// decoded contents of a string literal.
+pub struct Token { kind: T, span: diag.Span, line: u32, int: i64, float: f64, text: str }
+
+/// A placeholder token.
+pub fn eof() -> Token {
+    Token { kind: T.Eof, span: diag.span(0, 0, 0), line: 0, int: 0, float: 0.0, text: "" }
+}
+
+pub struct Lexer {
+    cur: lex.Cursor,
+    ops: lex.OpTable<T>,
+    keywords: lex.Keywords<T>,
+    buf: text.StrBuf,
+    /// Holds the decoded string literals, which outlive the lexer's buffer.
+    arena: *mem.Arena,
+}
+
+pub fn Lexer.new(src: str, file: u32, arena: *mem.Arena) -> Lexer {
+    var lx = Lexer {
+        cur: lex.Cursor.new(src, file, lex.c_like()),
+        ops: lex.OpTable.new(), keywords: lex.Keywords.new(), buf: text.StrBuf.new(), arena: arena,
+    };
+    let kws = ["let", "fn", "if", "else", "while", "return", "print", "true", "false", "nil", "not"];
+    let kwk = [T.Let, T.Fn, T.If, T.Else, T.While, T.Return, T.Print, T.True, T.False, T.Nil, T.Not];
+    for i in 0..kws.len { lx.keywords.add(kws[i], kwk[i]); }
+    let ops = ["+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "=",
+               "(", ")", "{", "}", "[", "]", ",", ";"];
+    let opk = [T.Plus, T.Minus, T.Star, T.Slash, T.Percent, T.EqEq, T.NotEq, T.Lt, T.Le, T.Gt, T.Ge, T.Assign,
+               T.LParen, T.RParen, T.LBrace, T.RBrace, T.LBracket, T.RBracket, T.Comma, T.Semi];
+    for i in 0..ops.len { lx.ops.add(ops[i], opk[i]); }
+    lx
+}
+
+pub fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
+    let c = &lx.cur;
+    c.skip_trivia()?;
+    let start = c.pos;
+    var t = Token { kind: T.Eof, span: c.span_from(start), line: c.line, int: 0, float: 0.0, text: "" };
+    if c.at_end() {
+        return Ok(t);
+    } else if let Some(name) = c.ident() {
+        t.kind = lx.keywords.get(name) ?? T.Name;
+        t.text = name;
+    } else if c.at_number() {
+        match c.number()? {
+            Int(i) => { t.kind = T.Int; t.int = i; }
+            Float(f) => { t.kind = T.Float; t.float = f; }
+        }
+    } else if c.peek() == '"' {
+        lx.buf.clear();
+        c.quoted(&lx.buf)?;
+        t.kind = T.Str;
+        t.text = lx.arena.str(lx.buf.as_str());
+    } else if let Some(k) = c.op(&lx.ops) {
+        t.kind = k;
+    } else {
+        c.bump();
+        return Err(c.error_at(start, "unexpected character"));
+    }
+    t.span = c.span_from(start);
+    Ok(t)
+}

@@ -341,3 +341,81 @@ fn minijs_programs() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
+
+/// The tutorial (docs/tutorial, examples/tutorial): every step builds and
+/// passes its tests in every dispatch mode, with and without GC stress
+/// (examples/tutorial/check.sh), and every ```loimi block in the chapters
+/// appears in a step's sources. A block may elide code with a line `...`
+/// or `// ...`; each part between elisions must match consecutive lines
+/// of one file, ignoring indentation.
+#[test]
+fn tutorial_steps() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/tutorial/check.sh"))
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/tutorial/check.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    fn sources(dir: &Path, out: &mut Vec<(PathBuf, Vec<String>)>) {
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                sources(&p, out);
+            } else if p.extension().is_some_and(|x| x == "lm") {
+                let lines = std::fs::read_to_string(&p).unwrap().lines().map(|l| l.trim().to_string()).collect();
+                out.push((p, lines));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(&root.join("examples/tutorial"), &mut files);
+    let mut failures = Vec::new();
+    let mut docs: Vec<PathBuf> = std::fs::read_dir(root.join("docs/tutorial"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    docs.sort();
+    let mut blocks = 0;
+    for doc in &docs {
+        let text = std::fs::read_to_string(doc).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() != "```loimi" {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < lines.len() && lines[end].trim() != "```" {
+                end += 1;
+            }
+            blocks += 1;
+            let body: Vec<String> = lines[start..end].iter().map(|l| l.trim().to_string()).collect();
+            for part in body.split(|l| l == "..." || l == "// ...") {
+                let a = part.iter().position(|l| !l.is_empty());
+                let b = part.iter().rposition(|l| !l.is_empty());
+                let (Some(a), Some(b)) = (a, b) else { continue };
+                let part = &part[a..=b];
+                let found = files.iter().any(|(_, fl)| fl.windows(part.len()).any(|w| w == part));
+                if !found {
+                    failures.push(format!("{}:{}: snippet not found in examples/tutorial:\n{}", doc.display(), start + 1, part.join("\n")));
+                }
+            }
+            i = end + 1;
+        }
+    }
+    assert!(blocks > 50, "only {} loimi blocks found", blocks);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}

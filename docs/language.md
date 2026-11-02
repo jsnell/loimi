@@ -1,7 +1,8 @@
 # The Loimi language
 
 Design draft. Syntax is provisional; the semantics and the reasons behind them
-are the point. Code samples are illustrative.
+are the point. Code samples are illustrative. For a gentle introduction
+that uses only what is implemented, see the [tutorial](tutorial/README.md).
 
 ## 0. Principles
 
