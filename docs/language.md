@@ -530,8 +530,14 @@ type-checks the mapping. From the declarations it **generates**:
 - a disassembler (below);
 - `Mini.verify` (section 6);
 - metadata for tools: `Vm.op_size(w)`, `Vm.op_name(w)`, `Vm.NUM_OPS`,
-  branch targets through `Vm.label(w)`. Per-op operand kinds are not
-  exposed yet;
+  branch targets through `Vm.label(w)`, and per-op operand metadata, so
+  that fuzzers and assemblers can build plausible instructions:
+  `Vm.operand_count(w)` operand fields, in encoder order, and for field
+  `i` its kind `Vm.operand_kind(w, i)` (an index into the vm's `operand`
+  declarations, in order; `Vm.NUM_KINDS` for none), width
+  `Vm.operand_bits(w, i)` and `Vm.operand_signed(w, i)`;
+  `Vm.kind_name(k)` and `Vm.kind_is_label(k)` describe a kind. A super's
+  head answers for its first part;
 - `Vm.optimize(code)`, the superinstruction peephole (section 7.3), and
   `Vm.deopt(code)` (section 7.2);
 - label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the

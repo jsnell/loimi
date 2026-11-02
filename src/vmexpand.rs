@@ -598,6 +598,43 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         let _ = writeln!(s, "  {} => {},", o.opcode, o.family);
     }
     let _ = writeln!(s, "  _ => {}, }} }}", u64::MAX);
+    // Operand metadata for tools (fuzzers, assemblers): per op, the kind,
+    // width and signedness of each operand field, in encoder order. A
+    // word answers for the op it stands for alone (a super's head for its
+    // first part); an invalid opcode has no operands. Kinds are numbered
+    // in declaration order; NUM_KINDS stands for "none".
+    let nk = v.operands.len();
+    let _ = writeln!(s, "{vis}const {n}__NUM_KINDS: u64 = {};", nk);
+    let _ = writeln!(s, "{vis}fn {n}__kind_name(k: u64) -> str {{ match k {{");
+    for (i, k) in v.operands.iter().enumerate() {
+        let _ = writeln!(s, "  {} => \"{}\",", i, k.name.name);
+    }
+    let _ = writeln!(s, "  _ => \"<none>\", }} }}");
+    let labels: Vec<String> =
+        v.operands.iter().enumerate().filter(|(_, k)| is_label_kind(v, &k.name.name)).map(|(i, _)| format!("k == {}", i)).collect();
+    let _ = writeln!(s, "{vis}fn {n}__kind_is_label(k: u64) -> bool {{ {} }}", if labels.is_empty() { "false".into() } else { labels.join(" or ") });
+    let kind_ix = |name: &str| v.operands.iter().position(|k| k.name.name == name).unwrap_or(nk);
+    let per_field = |s: &mut String, fname: &str, ret: &str, none: &str, f: &dyn Fn(usize, usize) -> String| {
+        let _ = writeln!(s, "{vis}fn {n}__{fname}(w: {w}, i: u64) -> {ret} {{ match {n}__base_op(w) {{");
+        for (k, o) in l.ops.iter().enumerate() {
+            if !o.parts.is_empty() || o.fields.is_empty() {
+                continue;
+            }
+            let arms: Vec<String> = (0..o.fields.len()).map(|j| format!("{} => {}", j, f(k, j))).collect();
+            let _ = writeln!(s, "  {} => match i {{ {}, _ => {} }},", o.opcode, arms.join(", "), none);
+        }
+        let _ = writeln!(s, "  _ => {}, }} }}", none);
+    };
+    let _ = writeln!(s, "{vis}fn {n}__operand_count(w: {w}) -> u64 {{ match {n}__base_op(w) {{");
+    for o in &l.ops {
+        if o.parts.is_empty() && !o.fields.is_empty() {
+            let _ = writeln!(s, "  {} => {},", o.opcode, o.fields.len());
+        }
+    }
+    let _ = writeln!(s, "  _ => 0, }} }}");
+    per_field(&mut s, "operand_kind", "u64", &nk.to_string(), &|k, j| kind_ix(&l.ops[k].kinds[j]).to_string());
+    per_field(&mut s, "operand_bits", "u64", "0", &|k, j| l.ops[k].fields[j].1.to_string());
+    per_field(&mut s, "operand_signed", "bool", "false", &|k, j| l.ops[k].fields[j].3.to_string());
     let _ = writeln!(s, "{vis}fn {n}__op_name(w: {w}) -> str {{ match {n}__opcode(w) {{");
     for o in &l.ops {
         let _ = writeln!(s, "  {} => \"{}\",", o.opcode, o.name);
