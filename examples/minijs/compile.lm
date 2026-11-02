@@ -1465,11 +1465,12 @@ fn Gen.stmt(g: *Gen, n: *Node) {
         While => {
             let li = g.push_loop(true);
             let l = g.loop_at(li);
+            // The test is at the bottom: one branch per iteration.
+            g.jump(l.cont);
             let top = g.fs.code.here();
-            g.bind(l.cont);
-            g.cond(n.a, false, l.brk);
             g.stmt(n.b);
-            g.jump(top);
+            g.bind(l.cont);
+            g.cond(n.a, true, top);
             g.bind(l.brk);
             g.fs.loops.truncate(li);
         }
@@ -1555,8 +1556,10 @@ fn Gen.for_stmt(g: *Gen, n: *Node) {
     if !is_null(n.a) { g.stmt(n.a); }
     let li = g.push_loop(true);
     let l = g.loop_at(li);
+    // The test is at the bottom: one branch per iteration.
+    let test = g.label();
+    if !is_null(n.b) { g.jump(test); }
     let top = g.fs.code.here();
-    if !is_null(n.b) { g.cond(n.b, false, l.brk); }
     g.stmt(n.d);
     g.bind(l.cont);
     // Per-iteration bindings: closures made in this iteration keep its box.
@@ -1565,7 +1568,13 @@ fn Gen.for_stmt(g: *Gen, n: *Node) {
         if v.kind != VK.Global and boxed(v) { g.emit(JS.REBOX(v.reg as u8)); }
     }
     if !is_null(n.c) { g.fs.regs.end_stmt(); g.effect(n.c); }
-    g.jump(top);
+    if is_null(n.b) {
+        g.jump(top);
+    } else {
+        g.bind(test);
+        g.fs.regs.end_stmt();
+        g.cond(n.b, true, top);
+    }
     g.bind(l.brk);
     g.fs.loops.truncate(li);
     g.fs.regs.leave(lvl);
@@ -1582,15 +1591,13 @@ fn Gen.for_each(g: *Gen, n: *Node) {
     g.emit(JS.LOADI(idx as u8, 0));
     let li = g.push_loop(true);
     let l = g.loop_at(li);
+    // The test is at the bottom: one branch per iteration.
+    let test = g.label();
+    g.jump(test);
     let top = g.fs.code.here();
     let inner = g.fs.regs.enter();
     g.enter_vars(&n.vars);
     let m = g.mark();
-    let len = g.temp();
-    g.emit(JS.GETLEN(len as u8, arr as u8));
-    g.emit(JS.JLT(0, idx as u8, len as u8));
-    g.jump(l.brk);
-    g.reset(m);
     let v = if n.a.kind == K.VarDecl { n.a.list.at(0).vr } else { n.a.vr };
     if let Some(r) = g.var_reg(v) {
         g.emit(JS.GETINDEX(r as u8, arr as u8, idx as u8));
@@ -1610,7 +1617,13 @@ fn Gen.for_each(g: *Gen, n: *Node) {
     g.bind(l.cont);
     g.fs.regs.leave(inner);
     g.emit(JS.ADDI(idx as u8, idx as u8, 1));
+    g.bind(test);
+    let mt = g.mark();
+    let len = g.temp();
+    g.emit(JS.GETLEN(len as u8, arr as u8));
+    g.emit(JS.JLT(1, idx as u8, len as u8));
     g.jump(top);
+    g.reset(mt);
     g.bind(l.brk);
     g.fs.loops.truncate(li);
     g.fs.regs.leave(lvl);
