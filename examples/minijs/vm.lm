@@ -89,14 +89,17 @@ fn eq_slow(a: V, b: V) -> bool {
     }
 }
 
+#[inline(always)]
 fn int32(v: V) -> i32 {
     match v {
         Int(i) => i,
+        Num(x) => if x >= -2147483648.0 and x <= 2147483647.0 { x as i32 } else { value.to_int32(x) },
         _ => value.to_int32(value.to_number(v)),
     }
 }
 
 /// Bitwise ops: 0 and, 1 or, 2 xor, 3 shl, 4 shr, 5 ushr.
+#[inline(always)]
 fn bitop(op: i64, a: V, b: V) -> V {
     let x = int32(a);
     let y = int32(b);
