@@ -233,6 +233,9 @@ pub fn collect(h: *Heap) uses gc {
                 hd.tid = FREE;
                 freed += 1;
             }
+            // A free slot may have been marked through a dangling
+            // reference (a missed root); never hand out a marked slot.
+            hd.mark = 0;
             hd.next = head;
             head = hd;
         }
