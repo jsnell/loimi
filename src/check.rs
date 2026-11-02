@@ -2940,8 +2940,17 @@ impl<'a> Checker<'a> {
         }
         let operand_exp = if op.is_cmp() { None } else { exp };
         let (a, b) = if matches!(op, Shl | Shr) {
+            // The result has the left operand's type (a literal takes it
+            // from the context, or is i64); the amount may be any integer.
             let a = self.expr(cx, l, operand_exp)?;
-            let b = self.expr_coerce(cx, r, &a.ty.clone())?;
+            let b = if is_literal_expr(r) && a.ty.is_int() {
+                self.expr_coerce(cx, r, &a.ty.clone())?
+            } else {
+                self.expr(cx, r, None)?
+            };
+            if a.ty.is_int() && !b.ty.is_int() && b.ty != Ty::Never {
+                return Err(Diag::new(r.span, format!("shift amount must be an integer, found `{}`", self.ty_name(&b.ty))));
+            }
             (a, b)
         } else if is_literal_expr(l) && !is_literal_expr(r) {
             let b = self.expr(cx, r, operand_exp)?;

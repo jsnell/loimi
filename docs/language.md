@@ -197,6 +197,13 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
   `a.add_overflow(b) -> (T, bool)`. These map directly to LLVM's
   `*.with.overflow` intrinsics, which guest integer semantics need constantly.
+- **Shifts.** `a << n` and `a >> n` have the type of `a`; `>>` is
+  arithmetic for signed `a` and logical for unsigned. The amount `n` may
+  be any integer type (`x << shift` with `x: u32`, `shift: u64`), and is
+  taken modulo the width of `a`, read as an unsigned number of its own
+  type, so shifting never has undefined results. A literal `a` takes its
+  type from the context like other literals (`w & (255 << shift)` with
+  `w: u32` shifts a `u32`) and is an `i64` without one.
 - **Arbitrary-width integers.** `iN` and `uN` for any `N` from 1 to 64 are
   integer types of exactly that width (LLVM's `iN`): arithmetic wraps,
   overflows and is checked at `N` bits, `as` sign- or zero-extends from `N`
