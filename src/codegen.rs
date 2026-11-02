@@ -1062,7 +1062,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 };
                 let v = match (init, hole) {
                     // A stencil's operand field: a hole patched with its value.
-                    (_, Some((off, shift, bits, signed))) => crate::jitgen::field_hole(self, off, shift, bits, signed),
+                    (_, Some((off, shift, bits, signed))) => {
+                        let st = self.stencil.as_ref().unwrap();
+                        let base = st.part_offs[st.part];
+                        crate::jitgen::field_hole(self, base + off, shift, bits, signed)
+                    }
                     (Some(e), None) => self.val(e),
                     (None, None) => "zeroinitializer".into(),
                 };

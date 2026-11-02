@@ -36,9 +36,14 @@ pub struct StencilGen {
     /// the stencil calls the same functions.
     pub cold_syms: Vec<String>,
     pub cold_next: usize,
-    /// Signed operand fields of the op (word offset, shift, bits): jump
-    /// targets `pc + off + field` that become direct jumps.
-    pub labels: Vec<(u32, u32, u32)>,
+    /// Per part (one for a plain op): its signed operand fields (word
+    /// offset from the part, shift, bits), jump targets
+    /// `pc + off + field` that become direct jumps.
+    pub labels: Vec<Vec<(u32, u32, u32)>>,
+    /// Word offset of each part from the instruction's first word.
+    pub part_offs: Vec<u32>,
+    /// The part being emitted.
+    pub part: usize,
 }
 
 /// The vm that `--jit-stencils` compiles: the program's only tail-call vm.
@@ -287,26 +292,29 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     let _ = writeln!(globals, "@loimi_jit_entries = external global ptr");
     let _ = writeln!(globals, "@loimi_jit_hotcount = external global [{} x i16]", HOT_SLOTS);
     let _ = writeln!(fns, "declare void @loimi_jit_hot(ptr)\ndeclare void @loimi_jit_become(ptr)");
-    // Per opcode: { size of the op the JIT compiles at such a word (a
-    // super's first part), that op's opcode (0xffff: none), flags }:
-    // flag 1 = reads the next word as its `then` operand, 2 = a super
-    // (the words of its other parts must keep their opcodes).
+    // Per opcode: { the size of its first word's instruction (a super's
+    // first part: the later parts' words are instructions too), the
+    // opcode whose stencil to use (0xffff: invalid), flags, the size of
+    // the whole op, the stencil to use if that one is missing (a super's
+    // first part) }. Flag 1: reads the next word as its `then` operand;
+    // 2: a super (the words of its later parts must keep their opcodes).
     let mut info = Vec::new();
+    let ty = "{ i16, i16, i16, i16, i16 }";
     for i in 0..n {
         let e = match vd.ops.iter().find(|o| o.opcode == i) {
             Some(o) => {
-                let base = match o.parts.first() {
+                let first = match o.parts.first() {
                     Some(&b) => &vd.ops[b as usize],
                     None => o,
                 };
-                let flags = (base.then as u32) | ((!o.parts.is_empty() as u32) << 1);
-                format!("{{ i16, i16, i16, i16 }} {{ i16 {}, i16 {}, i16 {}, i16 {} }}", base.size, base.opcode, flags, o.size)
+                let flags = (first.then as u32) | ((!o.parts.is_empty() as u32) << 1);
+                format!("{ty} {{ i16 {}, i16 {}, i16 {}, i16 {}, i16 {} }}", first.size, o.opcode, flags, o.size, first.opcode)
             }
-            None => "{ i16, i16, i16, i16 } { i16 0, i16 -1, i16 0, i16 0 }".to_string(),
+            None => format!("{ty} {{ i16 0, i16 -1, i16 0, i16 0, i16 -1 }}"),
         };
         info.push(e);
     }
-    let _ = writeln!(globals, "@loimi_jit_opinfo = constant [{} x {{ i16, i16, i16, i16 }}] [{}]", n, info.join(", "));
+    let _ = writeln!(globals, "@loimi_jit_opinfo = constant [{} x {ty}] [{}]", n, info.join(", "));
     let _ = writeln!(globals, "@loimi_jit_nops = constant i32 {}", n);
     // Op names, for LOIMI_JIT_DEBUG.
     let mut names = Vec::new();
@@ -348,18 +356,36 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
     let Ok(vi) = jit_vm(p) else { return };
     let vd = &p.vms[vi];
     let mut out = String::new();
+    let wb = vd.word.bits as u32;
     for o in &vd.ops {
-        if !o.parts.is_empty() {
-            continue;
-        }
         let f = &p.fns[o.fid as usize];
-        let labels = signed_fields(f.body.as_ref().unwrap(), vd.word.bits as u32);
+        let body = f.body.as_ref().unwrap();
+        // A super's body is a block of `Part`s; each has its own fields.
+        let (labels, part_offs) = if o.parts.is_empty() {
+            (vec![signed_fields(body, wb)], vec![0])
+        } else {
+            let mut ls = vec![vec![]; o.parts.len()];
+            crate::tirwalk::for_each_expr(body, &mut |e| {
+                if let TK::Vm(TVm::Part(j, b)) = &e.kind {
+                    ls[*j as usize] = signed_fields(b, wb);
+                }
+            });
+            let mut offs = Vec::new();
+            let mut off = 0;
+            for &q in &o.parts {
+                offs.push(off);
+                off += vd.ops[q as usize].size;
+            }
+            (ls, offs)
+        };
         let mut g = FnGen::new(cg, o.fid);
         g.stencil = Some(StencilGen {
             symbol: format!("__jit.op.{}", o.name),
             cold_syms: g.cg.cold_syms.get(&o.fid).cloned().unwrap_or_default(),
             cold_next: 0,
             labels,
+            part_offs,
+            part: 0,
         });
         out.push_str(&g.run());
     }

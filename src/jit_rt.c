@@ -29,7 +29,7 @@
 
 struct jit_reloc { uint32_t off; uint16_t type; uint16_t kind; int64_t addend; int64_t arg; };
 struct jit_stencil { uint32_t code, len, reloc, nreloc; int32_t trim; uint32_t present; };
-struct jit_opinfo { uint16_t size, base, flags, span; };
+struct jit_opinfo { uint16_t size, base, flags, span, part; };
 
 extern const uint8_t loimi_jit_code[];
 extern const struct jit_reloc loimi_jit_relocs[];
@@ -238,7 +238,8 @@ static int compile(struct rec *r) {
         uint32_t op = code[pc] & opmask;
         const struct jit_opinfo *oi = &loimi_jit_opinfo[op];
         if (oi->base == 0xffff || oi->size == 0 || pc + oi->size > n) goto out;
-        uint32_t s = loimi_jit_stencils[oi->base].present ? oi->base : nops;
+        uint32_t s = loimi_jit_stencils[oi->base].present ? oi->base
+                     : (oi->part != 0xffff && loimi_jit_stencils[oi->part].present) ? oi->part : nops;
         if (s == nops) nexit++;
         if ((oi->flags & 1) && pc + oi->size < n) nopatch[pc + oi->size] = 1;
         if (oi->flags & 2)

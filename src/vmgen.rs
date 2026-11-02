@@ -541,9 +541,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 return g.poison(&e.ty);
             }
             g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
-            // The next part decodes its own word.
+            // The next part decodes its own word (in a stencil, a hole).
             if let Some(slot) = &hg.insn_slot {
-                let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, np));
+                let w = match g.stencil.as_ref().map(|st| st.part_offs[*part as usize]) {
+                    Some(off) => crate::jitgen::word_hole(g, off),
+                    None => g.inst(format!("load i{}, ptr {}", vd.word.bits, np)),
+                };
                 g.emit(format!("store i{} {}, ptr {}", vd.word.bits, w, slot));
             }
             let l = part_label(g, *part);
@@ -603,6 +606,9 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         TVm::Part(j, body) => {
             let l = part_label(g, *j);
             g.label(&l);
+            if let Some(st) = g.stencil.as_mut() {
+                st.part = *j as usize;
+            }
             g.val(body)
         }
     }
@@ -700,7 +706,13 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
         dispatch(g, target);
         return;
     }
-    let pc0 = format!("%p{}", vd.pc_idx);
+    // In a super's later part, pc is the part's word: holes and
+    // continuations are numbered from the head's word.
+    let (part, word_off) = {
+        let st = g.stencil.as_ref().unwrap();
+        (st.part, st.part_offs[st.part])
+    };
+    let pc0 = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
     let cont = |g: &mut FnGen, name: String| {
         g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
         let rt = handler_ret_llty(g.p(), vd);
@@ -711,11 +723,11 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
         tail_to(g, vd, &format!("@\"{}\"", name), "poison");
     };
     match kind {
-        JumpKind::Const(d) => cont(g, format!("__jit.n.{}", d)),
+        JumpKind::Const(d) => cont(g, format!("__jit.n.{}", d + word_off as i64)),
         JumpKind::PcRel => {
-            let labels = g.stencil.as_ref().unwrap().labels.clone();
+            let labels = g.stencil.as_ref().unwrap().labels[part].clone();
             for (off, shift, bits) in labels {
-                let raw = crate::jitgen::field_hole(g, off, shift, bits, true);
+                let raw = crate::jitgen::field_hole(g, word_off + off, shift, bits, true);
                 let base = if off == 0 { pc0.clone() } else { g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc0, off)) };
                 let cand = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, base, raw));
                 let eq = g.inst(format!("icmp eq ptr {}, {}", target, cand));
@@ -723,7 +735,7 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
                 let no = g.fresh_label("notdirect");
                 g.cond_br(&eq, &yes, &no);
                 g.label(&yes);
-                cont(g, format!("__jit.j.{}.{}.{}", off, shift, bits));
+                cont(g, format!("__jit.j.{}.{}.{}", word_off + off, shift, bits));
                 g.label(&no);
             }
             dispatch(g, target);
