@@ -1,0 +1,12 @@
+circle area=3.14 round shape
+square area=4.00 shape
+3D cube area=54.00 boxy shape
+plain area=0.00 shape
+4 Shape:sq Shape:sq Shape:base viaCube
+true true true
+name,s false
+child r=5 circle 78.540
+pre>base>mid>leaf
+6
+42 41
+6

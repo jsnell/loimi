@@ -1,0 +1,38 @@
+var i = 5;
+console.log(i++, i, ++i, i, i--, i, --i, i);
+var o = { n: 1 };
+console.log(o.n++, o.n, ++o.n, o["n"]--, --o["n"], o.n);
+var a = [10, 20, 30];
+var k = 0;
+console.log(a[k++]++, String(a), k);
+console.log(String(a), ++a[1], a[2]--, String(a));
+var x = 1.5;
+x++;
+console.log(x, -x++, x);
+var s = 10;
+s += 5; console.log(s);
+s -= 3; console.log(s);
+s *= 4; console.log(s);
+s /= 8; console.log(s);
+s %= 4; console.log(s);
+s **= 3; console.log(s);
+var str = "a";
+str += "b" + 1;
+console.log(str);
+var p = { v: 2 };
+p.v *= 10; p["v"] += 1;
+console.log(p.v);
+var m = [1, 2];
+m[0] += 100; m[1] -= 100;
+console.log(m[0], m[1]);
+var y, z;
+y = z = 7;
+console.log(y, z);
+var q = (y = 3) + 1;
+console.log(q, y);
+var cnt = 0;
+var obj = { arr: [0, 0, 0] };
+function idx() { cnt++; return 1; }
+obj.arr[idx()] += 5;
+console.log(cnt, obj.arr.join(","));
+for (var j = 0, l = 3; j < l; j++, l--) { console.log("j", j, l); }

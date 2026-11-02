@@ -1,0 +1,12 @@
+arith 7 a b c
+args 6 x y z
+method 9 obj arg call
+assign 5 target key value
+array 3 e0 e1 e2
+object abc pa ck pb pc
+compare true l r
+reassign 21
+lhs-first 2,0,0
+compound 6
+new 3 F p1 p2 ctor
+cond 1 c1 then

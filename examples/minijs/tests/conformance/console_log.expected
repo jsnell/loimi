@@ -1,0 +1,18 @@
+single
+a b c
+1 2.5 -3 1e+21 1e-7
+true false null undefined
+
+
+ 
+x  y
+  leading and trailing spaces  
+mixed 1 true null undefined end
+1,2 3;4 [object Object]
+tab	inside newline
+inside
+0.30000000000000004 100 0.3333333333333333
+NaN Infinity -Infinity
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19
+quotes ' and " are printed raw
+backslash \ printed once

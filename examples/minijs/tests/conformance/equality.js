@@ -1,0 +1,14 @@
+console.log(1 === 1, 1 === 1.0, 1 === "1", 0 === -0, NaN === NaN, null === null, undefined === undefined, null === undefined);
+console.log("a" === "a", "a" === "A", "ab" === "a" + "b", "" === "", true === true, true === 1, false === 0);
+console.log(1 !== 2, "1" !== 1, null !== undefined, NaN !== NaN);
+var o = {}, p = {}, q = o;
+console.log(o === p, o === q, [] === [], o !== p);
+var f = function () {};
+var g = f;
+console.log(f === g, f === function () {});
+var s1 = "hello world", s2 = "hello " + "world";
+console.log(s1 === s2, s1.slice(0, 5) === "hello", s1[0] === "h");
+console.log(0.1 + 0.2 === 0.3, 0.5 + 0.5 === 1, 2 ** 53 === 2 ** 53 + 1);
+console.log(typeof 1 === "number", typeof "x" === "string");
+var arr = [1, 2, 3];
+console.log(arr.length === 3, arr[3] === undefined, arr.indexOf(2) === 1);

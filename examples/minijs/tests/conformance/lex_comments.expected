@@ -1,0 +1,9 @@
+one
+two
+3
+// not a comment /* nor this */
+empty block comment
+tab-indented line
+10
+crlf line
+after crlf

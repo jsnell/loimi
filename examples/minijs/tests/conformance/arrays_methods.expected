@@ -1,0 +1,19 @@
+4 6 1,2,3,4,5,6
+6 5 1,2,3,4 undefined
+1 2,3,4 undefined
+4 6 -2,-1,0,2,3,4
+10,20,30,40,50 30,40,50 20,30 40,50 30,40
+0 0 10,20 0 30,40,50
+10 99
+1,2,3,4 4 0 1
+1,2 1,2,3,4
+1,9|2
+1 -1 1 1 -1 0 -1 0
+4,3,2,1 true 0 1 5,4,3,2,1
+true false true true true false
+0,0,0,0,0 5 7,7,7 0
+null set 3
+1 true
+01234
+zab b z a
+true true true false false false

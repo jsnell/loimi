@@ -1,0 +1,19 @@
+inner 3
+middle 2
+outer 1
+shadow
+const
+var-inner var-outer
+var escapes block
+body-shadow
+2
+1,2
+10 20
+param
+changed orig
+rebound mutated
+2
+3
+in case
+undefined
+5

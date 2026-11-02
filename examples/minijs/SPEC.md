@@ -16,22 +16,33 @@ different behaviour.
 - **Comments** are `// ...` and `/* ... */`.
 - **Identifiers** contain letters, digits, `_` and `$`, and do not start
   with a digit.
-- **Reserved words:** `break case class const constructor continue default
-  do else extends false for function if in let new null of return
-  static super switch this true typeof undefined var void while`.
-  `constructor` and `static` are reserved only inside class bodies; `of`
-  only in `for` headers. `undefined` is treated as a literal. Programs
-  must not use other JavaScript reserved words as names.
+- **Reserved words:** `break case catch class const continue default
+  delete do else extends false finally for function if in instanceof let
+  new null return super switch this throw true try typeof undefined var
+  void while`, plus all other ECMAScript reserved words. Programs must
+  not use them as variable names. Reserved words *may* be used as
+  property names (`o.default`, `{class: 1}`).
+- **Contextual words.** `constructor`, `static`, `of`, `get` and `set`
+  are ordinary identifiers outside the places where they have meaning.
+  Programs must not assign to `undefined`, `NaN` or `Infinity`.
 - **Numerals:**
-  - decimal: `42`, `3.25`, `.5`, `1e9`, `2.5E-3`;
-  - hex: `0xff`.
+  - decimal: `42`, `3.25`, `.5`, `5.`, `1e9`, `1e+3`, `2.5E-3`;
+  - hex: `0xff` and `0XFF`.
 
   There are no octal, binary or BigInt literals, and no numeric
   separators.
 - **Strings:**
   - delimited by `'` or `"`;
-  - escapes `\n \t \r \\ \' \" \0` and `\xHH`;
+  - escapes `\n \t \r \\ \' \" \0`, and `\xHH` below `\x80`. There
+    are no line continuations;
   - no template literals, and no regular-expression literals.
+- **Strict mode.** Programs behave the same in strict and sloppy mode:
+  - no assignment to undeclared variables, and no reading of undeclared
+    variables, including `typeof undeclared`;
+  - no writes to string indices;
+  - no use of `this` in plain function calls.
+
+  A leading `"use strict";` directive is allowed and ignored.
 - **Semicolons are required** after every statement that JavaScript
   terminates with one. Programs must not rely on automatic semicolon
   insertion.
@@ -45,6 +56,9 @@ function. Arrays are objects.
 
 - **Doubles.** All numbers are IEEE-754 doubles, with JavaScript semantics
   (`5 / 2` is `2.5`, `1 / 0` is `Infinity`).
+- **No arithmetic on strings.** Programs must not apply arithmetic,
+  bitwise or relational operators to strings, except `+` for
+  concatenation and string-to-string comparison. Write `Number(s)`.
 - **Integer optimization.** An implementation may represent integral
   values specially, but that must not be observable.
 - **`%`** is JavaScript's remainder: it takes the sign of the dividend.
@@ -63,8 +77,10 @@ function. Arrays are objects.
 ### 2.3 Objects
 
 - **Properties.** Objects are collections of properties with string keys.
-  Property order follows JavaScript: integer-like keys ascending first,
-  then the other string keys in insertion order. It is only observable
+  Property order follows JavaScript: array-index keys (canonical
+  decimal strings of integers 0 .. 2^32−2) ascending first, then the other
+  string keys in insertion order. Programs use only keys that are either
+  small non-negative integers or not numeric-looking at all. It is only observable
   through `Object.keys` and `for ... in`.
 - **Prototypes.** Every object has a prototype (an object, or null).
   Property reads walk the prototype chain. Property writes create or
@@ -82,6 +98,9 @@ function. Arrays are objects.
 ### 2.4 Arrays
 
 - **Literals** are `[1, 2, 3]`, with no holes and no spread.
+- **`new Array(n)`** creates holes in JavaScript. Programs must write
+  every element (for example with `fill`) before reading it or
+  iterating over it.
 - **Elements** are read with `a[i]`. An index out of range gives
   undefined.
 - **Writing** `a[i] = v` with `i == a.length` appends.
@@ -172,7 +191,8 @@ function. Arrays are objects.
 
 ## 4. Statements
 
-- **Declarations:** `var`, `let` and `const` (with block scoping for
+- **Declarations:** `var`, `let` and `const`, with several declarators
+  allowed (`let a = 1, b = 2;`) (with block scoping for
   `let`/`const`), and function declarations.
   - Programs must not read a `let`/`const` before its declaration (the
     temporal dead zone).
@@ -183,7 +203,8 @@ function. Arrays are objects.
   fallthrough. Case values are compared with `===`.
 - **Loops:**
   - `while`, `do ... while`, and `for (init; cond; step)`;
-  - `for (const x of array)` (arrays only) and `for (const k in object)`
+  - `for (const x of array)`, also with `let` (arrays only; a loop body
+    may push to the array it iterates over, with JavaScript semantics) and `for (const k in object)`
     (own and inherited enumerable string keys, in JavaScript order;
     programs should iterate only over objects without inherited
     enumerable properties);
@@ -208,12 +229,20 @@ Only the following exist.
 **Global functions:**
 - `console.log(...args)`: writes the arguments converted with ToString,
   separated by single spaces, followed by a newline.
+  - Programs must not pass `-0`, which node prints as `-0`.
+  - When more than one argument is passed, the first must not contain
+    `%`, because node treats it as a format string.
   - Arguments must be numbers, strings, booleans, null or undefined.
   - Printing an object or array directly is out of the subset, because
     node prints them with its own inspection format. Use `String(a)` or
     `a.join(",")` instead.
-- `String(v)` and `Number(s)`. `Number` accepts decimal and hex numeral
-  strings, with surrounding whitespace; anything else gives `NaN`.
+- `String(v)` and `Number(s)`, with JavaScript's StringToNumber:
+  - surrounding whitespace is ignored, and `""` gives 0;
+  - an optional sign, decimal or hex numerals, and `Infinity` are
+    accepted;
+  - anything else gives `NaN`.
+
+  `String` of functions and of Error objects is out of the subset.
 - `parseInt(s, radix?)` and `parseFloat(s)`, for ASCII inputs.
 - `isNaN(x)` and `isFinite(x)`, for number arguments.
 - `Error`: `new Error(msg)` gives an object with `.message`.
@@ -245,7 +274,12 @@ log pow min max sign`, plus `Math.PI` and `Math.E`. There is no
     stable.
   - `map(f)`, `filter(f)`, `forEach(f)`, `reduce(f, init)` (init is
     required), `some(f)`, `every(f)`, `fill(v)` and `includes(v)`.
-  - Callbacks get `(element, index, array)`.
+  - Callbacks get `(element, index, array)`, except that `reduce`'s
+    callback gets `(acc, element, index, array)`.
+  - The optional arguments that JavaScript defines are allowed:
+    `indexOf(v, from)`, `fill(v, start, end)`, `slice()`, and calls with
+    no arguments.
+  - `includes` uses SameValueZero, so `[NaN].includes(NaN)` is true.
 
 **`String`** (methods on string values):
 - `charCodeAt(i)`, `charAt(i)`, `indexOf(sub, from?)` and
@@ -253,9 +287,13 @@ log pow min max sign`, plus `Math.PI` and `Math.E`. There is no
 - `slice(start?, end?)` and `substring(start, end?)`;
 - `split(sep)`, with a string separator; `""` splits into characters;
 - `toUpperCase()` and `toLowerCase()`, for ASCII;
-- `trim()`, `repeat(n)`, `startsWith(s)`, `endsWith(s)` and
+- `trim()`, `repeat(n)`, `startsWith(s, pos?)`, `endsWith(s)` and
   `includes(s)`;
 - `String.fromCharCode(c...)`, for code units below 128.
+
+**Precision.** `Math` functions other than `abs floor ceil round trunc
+sqrt min max sign` may differ in the last bit between engines. Programs
+print their results through `toFixed`.
 
 **`Number` methods:** `n.toFixed(d)` for 0 ≤ d ≤ 20 and |n| < 1e21, and
 `n.toString(radix?)` for integer n and radix 2–36.

@@ -1,0 +1,15 @@
+call-undefined:threw
+call-number:threw
+call-missing-method:threw
+prop-of-undefined:threw
+prop-of-null:threw
+index-of-undefined:threw
+set-on-undefined:threw
+nested-missing:threw
+this-before-super:threw
+missing-super:threw
+fine:ok
+user-throw:threw
+object string
+deep index caught
+wrapped
