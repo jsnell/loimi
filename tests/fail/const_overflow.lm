@@ -1,0 +1,7 @@
+// Constant folding reports overflow (a checked operation that would trap
+// at run time) instead of wrapping silently, also for odd widths.
+// error: constant expression overflows `u3`
+const A: u3 = 7;
+const B: u3 = A + 1;
+
+fn main() -> i32 { B as i32 }
