@@ -1190,6 +1190,8 @@ impl Parser {
                     "for" => {
                         self.bump();
                         let var = self.ident()?;
+                        // `for i: u8 in 0..10`: the type of the range.
+                        let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
                         self.expect_kw("in")?;
                         let saved = self.no_struct;
                         self.no_struct = true;
@@ -1198,7 +1200,7 @@ impl Parser {
                         let hi = self.parse_bin(2)?;
                         self.no_struct = saved;
                         let body = self.parse_block()?;
-                        mk(ExprKind::For(var, Box::new(lo), Box::new(hi), body), self)
+                        mk(ExprKind::For(var, ty, Box::new(lo), Box::new(hi), body), self)
                     }
                     "unsafe" if self.is_at(1, "{") => {
                         self.bump();

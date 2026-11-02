@@ -105,7 +105,8 @@ pub enum ExprKind {
     Match(P<Expr>, Vec<Arm>),
     While(Vec<Cond>, Block),
     Loop(Block),
-    For(Ident, P<Expr>, P<Expr>, Block),
+    /// `for i in lo..hi { .. }`, `for i: T in lo..hi { .. }`.
+    For(Ident, Option<TypeExpr>, P<Expr>, P<Expr>, Block),
     Return(Option<P<Expr>>),
     Break(Option<P<Expr>>),
     Continue,

@@ -1420,8 +1420,20 @@ impl<'a> Checker<'a> {
                 let ty = lc.break_ty.unwrap_or(Ty::Never);
                 Ok(mk(ty, TK::Loop { body: Box::new(b), step: None, id }, span))
             }
-            ExprKind::For(var, lo, hi, body) => {
-                let (lo_t, hi_t) = if is_literal_expr(lo) && !is_literal_expr(hi) {
+            ExprKind::For(var, ann, lo, hi, body) => {
+                // The range's type: the annotation, else the bound that is
+                // not a literal (`0..n` with `n: u64` is a u64 range), else
+                // i64.
+                let ann = match ann {
+                    Some(t) => Some(self.resolve_type(cx.module, t)?),
+                    None => None,
+                };
+                let (lo_t, hi_t) = if let Some(t) = &ann {
+                    if !t.is_int() {
+                        return Err(Diag::new(lo.span, "range bounds must be integers"));
+                    }
+                    (self.expr_coerce(cx, lo, t)?, self.expr_coerce(cx, hi, t)?)
+                } else if is_literal_expr(lo) && !is_literal_expr(hi) {
                     let h = self.expr(cx, hi, None)?;
                     let l = self.expr_coerce(cx, lo, &h.ty.clone())?;
                     (l, h)
