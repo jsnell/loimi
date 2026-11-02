@@ -26,6 +26,19 @@
 // parses its operand with its own power, so unary minus at 12 binds
 // tighter than `*` at 10 but looser than right-associative `^` at 14:
 // `-x ^ 2` is `-(x ^ 2)`, as in Lua.
+//
+// Operators that are not "lhs op rhs" get a `led` hook (Pratt's "left
+// denotation"): when the operator binds, the driver consumes it and calls
+// the hook with the left operand, and the hook parses the rest itself and
+// returns the combined expression. That covers
+//   - mixfix: `c ? a : b` (parse `a`, expect `:`, parse `b`),
+//   - postfix: `x!`, `x++` (parse nothing),
+//   - right-hand sides with their own grammar: `x = rhs` (check that the
+//     left operand is a target), `x => body` (turn the left operand into
+//     a parameter list), `a[i]`, `f(args)`, `obj.field`.
+// A hook parses an operand with `pr.parse(p, bp)`, typically at the
+// operator's right power (`pr.infix_of(k).right`), reaching the table
+// through its parser state.
 
 import std.mem;
 
@@ -55,6 +68,8 @@ pub struct Pratt<P, K, E, X> {
     /// operand to use. Single-pass compilers use this to put the left
     /// operand in a register, or to emit the jump of `and`/`or`.
     before_rhs: ?fn(*P, K, E) -> Result<E, X>,
+    /// Per-kind custom infix hooks (`led`), indexed by `kind as u64`.
+    leds: mem.Vec<?fn(*P, K, E) -> Result<E, X>>,
 }
 
 /// A parser with no operators yet. `unary` is only called for kinds given
@@ -69,6 +84,7 @@ pub fn Pratt<P, K, E, X>.new(
     Pratt {
         infix_bp: mem.Vec.new(), prefix_bp: mem.Vec.new(),
         peek: peek, advance: advance, atom: atom, unary: unary, binary: binary, before_rhs: None,
+        leds: mem.Vec.new(),
     }
 }
 
@@ -84,6 +100,20 @@ pub fn Pratt<P, K, E, X>.infix_left(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) { 
 
 /// A right-associative infix operator (bp >= 2): `a ^ b ^ c` is `a ^ (b ^ c)`.
 pub fn Pratt<P, K, E, X>.infix_right(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) { pr.infix(kind, bp, bp - 1); }
+
+/// Make `kind` a custom infix operator with left power `left`: when it
+/// binds, it is consumed and `led(p, kind, lhs)` parses the rest and
+/// returns the result (`binary` and `before_rhs` are not called). `right`
+/// is only recorded, for the hook to parse an operand with
+/// `pr.parse(p, pr.infix_of(kind).right)`: for a mixfix or right-hand
+/// side, the power that gives the associativity wanted (`left - 1` for
+/// right-associative `?:` and `=`); 0 for a postfix operator.
+pub fn Pratt<P, K, E, X>.led(pr: *Pratt<P, K, E, X>, kind: K, left: u32, right: u32, led: fn(*P, K, E) -> Result<E, X>) {
+    pr.infix(kind, left, right);
+    let i = kind as u64;
+    while pr.leds.len <= i { pr.leds.push(None); }
+    pr.leds.set(i, Some(led));
+}
 
 /// Make `kind` a prefix operator whose operand is parsed at power `bp`.
 pub fn Pratt<P, K, E, X>.prefix(pr: *Pratt<P, K, E, X>, kind: K, bp: u32) {
@@ -122,6 +152,11 @@ pub fn Pratt<P, K, E, X>.parse(pr: *Pratt<P, K, E, X>, p: *P, min_bp: u32) -> Re
         let b = pr.infix_of(op);
         if b.left <= min_bp { break; }
         pr.advance(p)?;
+        let i = op as u64;
+        if i < pr.leds.len and let Some(led) = pr.leds.at(i) {
+            lhs = led(p, op, lhs)?;
+            continue;
+        }
         if let Some(h) = pr.before_rhs { lhs = h(p, op, lhs)?; }
         let rhs = pr.parse(p, b.right)?;
         lhs = pr.binary(p, op, lhs, rhs)?;
@@ -135,4 +170,5 @@ pub fn Pratt<P, K, E, X>.expr(pr: *Pratt<P, K, E, X>, p: *P) -> Result<E, X> { p
 pub fn Pratt<P, K, E, X>.free(pr: *Pratt<P, K, E, X>) {
     pr.infix_bp.free();
     pr.prefix_bp.free();
+    pr.leds.free();
 }
