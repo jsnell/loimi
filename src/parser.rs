@@ -16,6 +16,13 @@ pub struct Parser {
     /// Variables of `inline for` statements expanded inside vm bodies,
     /// checked against the vm's state names when the vm is complete.
     pub vm_loop_vars: Vec<Ident>,
+    /// `#[allow(lint)]` attributes: (lint, attribute span, region). The
+    /// region runs from the attribute to the end of what it is attached to
+    /// (an item, a vm item, a match arm), or is the whole file for
+    /// `#![allow(..)]`. Warnings inside a region are not reported.
+    pub allows: Vec<(String, Span, Span)>,
+    /// Allows whose construct is still being parsed: (lint, attribute span).
+    open_allows: Vec<(String, Span)>,
 }
 
 fn is_upper(s: &str) -> bool {
@@ -24,7 +31,16 @@ fn is_upper(s: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Parser {
-        Parser { toks, pos: 0, no_struct: false, in_vm: false, cast_type: false, vm_loop_vars: Vec::new() }
+        Parser {
+            toks,
+            pos: 0,
+            no_struct: false,
+            in_vm: false,
+            cast_type: false,
+            vm_loop_vars: Vec::new(),
+            allows: Vec::new(),
+            open_allows: Vec::new(),
+        }
     }
 
     // ── token helpers ────────────────────────────────────────────────
@@ -319,9 +335,29 @@ impl Parser {
                 self.parse_attr_body(&mut mod_attrs)?;
                 continue;
             }
+            let mark = self.open_allows.len();
             items.push(self.parse_item()?);
+            self.close_allows(mark);
+        }
+        // `#![allow(..)]`: the whole file.
+        let file = self.toks.last().map(|t| t.span.file).unwrap_or(0);
+        for (n, sp) in self.open_allows.drain(..) {
+            self.allows.push((n, sp, Span { file, lo: 0, hi: u32::MAX }));
         }
         Ok((items, mod_attrs))
+    }
+
+    /// The point to pass to `close_allows` after parsing a construct.
+    pub fn allow_mark(&self) -> usize {
+        self.open_allows.len()
+    }
+
+    /// The attached construct of the allows opened since `mark` ends here.
+    pub fn close_allows(&mut self, mark: usize) {
+        let end = self.prev_span();
+        for (n, sp) in self.open_allows.drain(mark..) {
+            self.allows.push((n, sp, sp.to(end)));
+        }
     }
 
     fn parse_attr_body(&mut self, attrs: &mut Attrs) -> Res<()> {
@@ -351,7 +387,14 @@ impl Parser {
                 }
                 args.push(v);
             }
-            attrs.list.push((name, args, start.to(self.prev_span())));
+            let sp = start.to(self.prev_span());
+            if name == "allow" {
+                if args.is_empty() {
+                    return Err(Diag::new(sp, "`allow` needs a lint name: `#[allow(match_fallout)]`"));
+                }
+                self.open_allows.extend(args.iter().map(|a| (a.clone(), sp)));
+            }
+            attrs.list.push((name, args, sp));
             if !self.eat(",") {
                 break;
             }
@@ -490,7 +533,7 @@ impl Parser {
             self.expect("=")?;
             let value = self.parse_expr()?;
             self.expect(";")?;
-            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "thread_local") {
+            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "thread_local" && n != "allow") {
                 return Err(Diag::new(*sp, format!("unknown attribute `{}` on a module-level `var` (only `thread_local`)", n)));
             }
             let thread_local = attrs.has("thread_local");
@@ -1223,12 +1266,19 @@ impl Parser {
                         self.expect("{")?;
                         let mut arms = Vec::new();
                         while !self.is("}") {
+                            // `#[allow(lint)] pat => body`
+                            let mark = self.open_allows.len();
+                            let attrs = self.parse_attrs()?;
+                            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "allow") {
+                                return Err(Diag::new(*sp, format!("unknown attribute `{}` on a match arm (only `allow`)", n)));
+                            }
                             let pat = self.parse_pat()?;
                             let guard = if self.eat_kw("if") { Some(self.parse_expr()?) } else { None };
                             self.expect("=>")?;
                             let body = self.parse_expr_stmt_inner()?;
                             let block_like = is_block_like(&body);
                             arms.push(Arm { pat, guard, body });
+                            self.close_allows(mark);
                             if !self.eat(",") && !block_like && !self.is("}") {
                                 return self.err(format!("expected `,` after match arm, found {}", self.describe()));
                             }

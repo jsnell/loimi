@@ -1,0 +1,105 @@
+// `#[allow(match_fallout)]` silences the lone-`if` arm warning on a match
+// arm, an op, a vm function or a whole vm; elsewhere it is still
+// reported (once: DIV_WARN).
+import std.io;
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+}
+
+fn show(v: V) {
+    match v {
+        Int(x) => io.print_int(x as i64),
+        Num(x) => io.print_f64(x),
+        Nil => io.print("nil"),
+    }
+    io.println("");
+}
+
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op DIV_ARM(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            #[allow(match_fallout)]
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    #[allow(match_fallout)]
+    op DIV_OP(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    #[allow(match_fallout)]
+    fn div(d: u64, a: V, b: V) -> never {
+        match (a, b) {
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { regs[d] = Int(x / y); next },
+            (Int(x), Int(y)) => { regs[d] = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        regs[d] = Nil; next
+    }
+    op DIV_FN(dst: reg, a: reg, b: reg) : ABC { div(dst.raw, a, b) }
+    op DIV_WARN(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *V) -> V { pc = code; regs = r; jump pc }
+}
+
+#[allow(match_fallout)]
+vm Q {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *V) -> V { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var regs: [V; 4] = [Int(7), Int(2), Int(8), Nil];
+    var code: [u32; 2] = [M.DIV_ARM(3, 0, 1), M.RET(3)];
+    show(M.run(&code[0], &regs[0]));
+    code[0] = M.DIV_OP(3, 2, 1);
+    show(M.run(&code[0], &regs[0]));
+    code[0] = M.DIV_FN(3, 0, 1);
+    show(M.run(&code[0], &regs[0]));
+    code[0] = M.DIV_WARN(3, 2, 1);
+    show(M.run(&code[0], &regs[0]));
+    var qc: [u32; 2] = [Q.DIV(3, 0, 1), Q.RET(3)];
+    show(Q.run(&qc[0], &regs[0]));
+}
+// expect: nil
+// expect: 4
+// expect: nil
+// expect: 4
+// expect: nil
+// expect-stderr: vm_allow_lint.lm:56:33
+// expect-no-stderr: vm_allow_lint.lm:29:
+// expect-no-stderr: vm_allow_lint.lm:38:
+// expect-no-stderr: vm_allow_lint.lm:47:
+// expect-no-stderr: vm_allow_lint.lm:73:

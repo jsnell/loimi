@@ -6,7 +6,9 @@
 //!   // expect: <line>          expected stdout line, in order
 //!   // expect-exit: <code>     expected exit status (default 0)
 //!   // expect-stderr: <text>   substring of stderr
-//!   // args: <flags>           extra compiler flags (e.g. --release)
+//!   // expect-no-stderr: <text> text that must not appear in stderr
+//!   // args: <flags>           extra compiler flags (e.g. --release; also
+//!                              for tests/fail)
 //!   // matrix: dispatch        run once per dispatch mode
 //!   // error: <text>           (tests/fail) substring of the compile error
 
@@ -55,6 +57,7 @@ fn run_programs() {
         let expect: Vec<String> = directives(&text, "expect");
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = directives(&text, "expect-stderr");
+        let stderr_not = directives(&text, "expect-no-stderr");
         let extra: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
         let modes: Vec<Vec<String>> = if directives(&text, "matrix").iter().any(|m| m.trim() == "dispatch") {
             ["tailcall", "goto", "switch"].iter().map(|d| vec![format!("--dispatch={}", d)]).collect()
@@ -80,6 +83,11 @@ fn run_programs() {
                     failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
                 }
             }
+            for s in &stderr_not {
+                if stderr.contains(s.as_str()) {
+                    failures.push(format!("{}: stderr has `{}`:\n{}", name, s, stderr));
+                }
+            }
         }
     }
     if !failures.is_empty() {
@@ -93,7 +101,8 @@ fn compile_errors() {
     for f in files("tests/fail") {
         let text = std::fs::read_to_string(&f).unwrap();
         let want = directives(&text, "error");
-        let out = loimi().arg("build").arg(&f).arg("--emit-llvm").arg("-o").arg("-").output().unwrap();
+        let extra: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
+        let out = loimi().arg("build").arg(&f).args(&extra).arg("--emit-llvm").arg("-o").arg("-").output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         if out.status.success() {

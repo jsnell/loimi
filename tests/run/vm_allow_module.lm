@@ -1,0 +1,29 @@
+// `#![allow(match_fallout)]` silences the lint in the whole file, so this
+// builds with `-W error`.
+// args: -W error
+#![allow(match_fallout)]
+import std.io;
+
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op SEL(dst: reg, a: reg) : ABC {
+        match a {
+            0 => if dst > 0 { dst = 1; next },
+            0 => { dst = 2; next }
+            _ => {}
+        }
+        dst = 3;
+        next
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var regs: [i64; 2] = [0, 0];
+    var code: [u32; 2] = [M.SEL(1, 0), M.RET(1)];
+    io.print_int(M.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 3

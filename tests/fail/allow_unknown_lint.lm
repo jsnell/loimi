@@ -1,0 +1,6 @@
+// `#[allow(..)]` names a known lint.
+// error: unknown lint `match_falout` (known: match_fallout)
+#[allow(match_falout)]
+fn f() {}
+
+fn main() { f(); }

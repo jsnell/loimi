@@ -1930,12 +1930,13 @@ impl<'a> Checker<'a> {
             if self.warnings.iter().any(|w| w.span == span) {
                 continue;
             }
-            let w = Diag::new(
+            let w = Diag::warning(
+                "match_fallout",
                 span,
                 "this arm's body is an `if` without `else`: when the condition is false, control continues after the `match`, not with the later arms",
             )
             .note(arms[j].pat.span, "this later arm also matches some of the same values")
-            .note(arms[i].pat.span, "to try later arms when the condition is false, use a guard: `pat if cond => ..`; to continue after the `match`, write `else {}`");
+            .note(arms[i].pat.span, "to try later arms when the condition is false, use a guard: `pat if cond => ..`; to continue after the `match`, write `else {}` (or put `#[allow(match_fallout)]` on the arm)");
             self.warnings.push(w);
         }
     }

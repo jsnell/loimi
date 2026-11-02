@@ -34,11 +34,13 @@ struct Opts {
     vm_stats: bool,
     /// `--sanitize=address`: build with AddressSanitizer.
     sanitize_address: bool,
+    /// `-W error` / `--deny-warnings`: warnings fail the build.
+    deny_warnings: bool,
 }
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats]
-                  [--sanitize=address]
+                  [--sanitize=address] [-W error | --deny-warnings]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -61,7 +63,8 @@ fn std_root() -> PathBuf {
 }
 
 /// Load the root module and everything it imports.
-fn load(sm: &mut SourceMap, root: &Path) -> Result<Vec<ast::Module>, Diag> {
+/// `allows` collects the `#[allow(lint)]` regions of every file.
+fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>) -> Result<Vec<ast::Module>, Diag> {
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
     let stdr = std_root();
     let mut modules: Vec<ast::Module> = Vec::new();
@@ -76,6 +79,7 @@ fn load(sm: &mut SourceMap, root: &Path) -> Result<Vec<ast::Module>, Diag> {
         let toks = lexer::lex(fid, &text)?;
         let mut p = parser::Parser::new(toks);
         let (items, _attrs) = p.parse_module()?;
+        allows.append(&mut p.allows);
         for it in &items {
             if let ast::Item::Import(imp) = it {
                 let ipath: Vec<String> = imp.path.iter().map(|i| i.name.clone()).collect();
@@ -91,13 +95,33 @@ fn load(sm: &mut SourceMap, root: &Path) -> Result<Vec<ast::Module>, Diag> {
 
 fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
     let input = opts.input.as_ref().unwrap();
-    let mut modules = load(sm, input)?;
+    let mut allows = Vec::new();
+    let mut modules = load(sm, input, &mut allows)?;
+    for (name, span, _) in &allows {
+        if !diag::LINTS.contains(&name.as_str()) {
+            return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
+        }
+    }
     vmexpand::expand(sm, &mut modules)?;
     let mut c = check::Checker::new(&modules);
     c.dispatch_override = opts.dispatch;
     c.run()?;
-    for w in &c.warnings {
-        eprint!("{}", sm.render_as("warning", w));
+    // Warnings, minus those inside an `#[allow(lint)]` region.
+    let allowed = |w: &Diag| {
+        allows.iter().any(|(n, _, r)| {
+            w.lint == Some(n.as_str()) && r.file == w.span.file && r.lo <= w.span.lo && w.span.hi <= r.hi
+        })
+    };
+    let warnings: Vec<&Diag> = c.warnings.iter().filter(|w| !allowed(w)).collect();
+    for w in &warnings {
+        eprint!("{}", sm.render_as(if opts.deny_warnings { "error" } else { "warning" }, w));
+    }
+    if opts.deny_warnings && !warnings.is_empty() {
+        let n = warnings.len();
+        return Err(Diag::new(
+            Span { file: u32::MAX, lo: 0, hi: 0 },
+            format!("{} warning{} treated as error{} (-W error)", n, if n == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" }),
+        ));
     }
     let prog = c.prog;
     let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats });
@@ -169,6 +193,7 @@ fn parse_args() -> Result<Opts, String> {
         keep_ll: false,
         vm_stats: false,
         sanitize_address: false,
+        deny_warnings: false,
     };
     match cmd.as_str() {
         "build" => {}
@@ -183,6 +208,11 @@ fn parse_args() -> Result<Opts, String> {
             "--keep-ll" => o.keep_ll = true,
             "--vm-stats" => o.vm_stats = true,
             "--sanitize=address" => o.sanitize_address = true,
+            "--deny-warnings" | "-Werror" => o.deny_warnings = true,
+            "-W" => match args.next().as_deref() {
+                Some("error") => o.deny_warnings = true,
+                _ => return Err("-W takes `error`".into()),
+            },
             s if s.starts_with("--sanitize=") => {
                 return Err(format!("unknown sanitizer `{}` (supported: address)", &s["--sanitize=".len()..]))
             }

@@ -20,12 +20,21 @@ pub struct Diag {
     pub span: Span,
     pub msg: String,
     pub notes: Vec<(Span, String)>,
+    /// For warnings: the lint's name, for `#[allow(name)]`. Printed as
+    /// `warning[name]: ..`.
+    pub lint: Option<&'static str>,
 }
+
+/// The warnings the compiler knows, for `#[allow(..)]`.
+pub const LINTS: &[&str] = &["match_fallout"];
 
 #[allow(dead_code)]
 impl Diag {
     pub fn new(span: Span, msg: impl Into<String>) -> Diag {
-        Diag { span, msg: msg.into(), notes: Vec::new() }
+        Diag { span, msg: msg.into(), notes: Vec::new(), lint: None }
+    }
+    pub fn warning(lint: &'static str, span: Span, msg: impl Into<String>) -> Diag {
+        Diag { span, msg: msg.into(), notes: Vec::new(), lint: Some(lint) }
     }
     pub fn note(mut self, span: Span, msg: impl Into<String>) -> Diag {
         self.notes.push((span, msg.into()));
@@ -81,7 +90,14 @@ impl SourceMap {
 
     pub fn render_as(&self, severity: &str, d: &Diag) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "{}: {}", severity, d.msg);
+        match d.lint {
+            Some(l) => {
+                let _ = writeln!(out, "{}[{}]: {}", severity, l, d.msg);
+            }
+            None => {
+                let _ = writeln!(out, "{}: {}", severity, d.msg);
+            }
+        }
         if (d.span.file as usize) < self.files.len() {
             self.snippet(&mut out, d.span, "");
         }

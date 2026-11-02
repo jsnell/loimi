@@ -132,6 +132,13 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   to try the later arms, or write `else {}` to say that falling out of the
   `match` is intended. Arms followed only by `_ => {}` do not warn, since
   falling out of the `match` is then the same as trying the rest.
+- **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
+  silences one on a match arm, an item (function, `vm`, ...) or a vm item
+  (`op`, `family`, vm function, entry), covering everything inside it;
+  `#![allow(name)]` at the top of a file covers the file. An unknown
+  name is an error. `loimi build -W error` (or `--deny-warnings`) turns
+  the warnings that remain into errors. The only lint so far is
+  `match_fallout`.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 

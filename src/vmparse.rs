@@ -38,6 +38,7 @@ impl Parser {
                 loop_vars.extend(self.expand_inline_for(false)?);
                 continue;
             }
+            let mark = self.allow_mark();
             let item_attrs = self.parse_attrs()?;
             let kw = match self.peek() {
                 Tok::Ident(s) => s.clone(),
@@ -274,6 +275,7 @@ impl Parser {
                 }
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
+            self.close_allows(mark);
         }
         loop_vars.append(&mut self.vm_loop_vars);
         for v in &loop_vars {
