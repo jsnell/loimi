@@ -439,12 +439,22 @@ pub vm Mini {
                     (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; next }
                     _ => {}
                 }
-                cold { dst = arith_mixed(ctx, code, a, b)?; next }
+                cold {
+                    match (a, b) {
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #fname; next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #fname; next }
+                        _ => {}
+                    }
+                    dst = arith_slow(ctx, code, a, b)?;
+                    next
+                }
             }
             #fname {
                 match (a, b) {
                     (Num(x), Num(y)) => { dst = Num(x sym y); next }
                     (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                    (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
+                    (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
                     _ => {}
                 }
                 cold { dst = arith_mixed(ctx, code, a, b)?; next }
