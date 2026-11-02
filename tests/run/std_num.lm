@@ -1,0 +1,215 @@
+// std.num: numeral parsing, float formatting, guest arithmetic.
+
+import std.io;
+import std.num;
+import std.text;
+
+fn show_int(r: Result<i64, num.NumError>) {
+    match r {
+        Ok(v) => io.print_int(v),
+        Err(e) => io.print(num.error_message(e)),
+    }
+    io.println("");
+}
+
+fn show_f(r: Result<f64, num.NumError>) {
+    var b = text.StrBuf.new();
+    match r {
+        Ok(v) => num.write_shortest(&b, v),
+        Err(e) => b.push_str(num.error_message(e)),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn show_num(s: str) {
+    var b = text.StrBuf.new();
+    b.push_str(s);
+    b.push_str(" -> ");
+    match num.parse_number(s) {
+        Ok(Int(i)) => { b.push_str("int "); b.push_int(i); }
+        Ok(Float(f)) => { b.push_str("float "); num.write_shortest(&b, f); }
+        Err(e) => b.push_str(num.error_message(e)),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn show_opt(r: ?i64) {
+    match r { Some(v) => io.print_int(v), None => io.print("none") }
+    io.print(" ");
+}
+
+fn fmt(x: f64) {
+    var b = text.StrBuf.new();
+    num.write_g(&b, x, 14);
+    b.push_str(" ");
+    num.write_shortest(&b, x);
+    b.push_str(" ");
+    let s2 = b.len();
+    num.write_g(&b, x, 14);
+    num.mark_float(&b, s2);
+    io.println(b.as_str());
+    b.free();
+}
+
+fn main() {
+    // Integers: exact range, both bounds, radix, overflow vs invalid.
+    show_int(num.parse_int("9223372036854775807"));
+    show_int(num.parse_int("-9223372036854775808"));
+    show_int(num.parse_int("9223372036854775808"));
+    show_int(num.parse_int("-9223372036854775809"));
+    show_int(num.parse_int("99999999999999999999999x"));
+    show_int(num.parse_int("+17"));
+    show_int(num.parse_int("0x7fffFFFFffffFFFF"));
+    show_int(num.parse_int("-0x10"));
+    show_int(num.parse_int("0x"));
+    show_int(num.parse_int(""));
+    show_int(num.parse_int("-"));
+    show_int(num.parse_int("1 "));
+    show_int(num.parse_i64("-777", 8));
+    show_int(num.parse_i64("zz", 36));
+    match num.parse_u64("18446744073709551615", 10) { Ok(v) => io.print_bool(v == 0xFFFFFFFFFFFFFFFF), Err(_) => io.print("err") }
+    io.println("");
+    match num.parse_u64_wrapping("ffffffffffffffffff", 16) { Ok(v) => io.print_bool(v == 0xFFFFFFFFFFFFFFFF), Err(_) => io.print("err") }
+    io.println("");
+
+    // Floats.
+    show_f(num.parse_f64("0.1"));
+    show_f(num.parse_f64("-2.5e-3"));
+    show_f(num.parse_f64(".5"));
+    show_f(num.parse_f64("5."));
+    show_f(num.parse_f64("1e400"));
+    show_f(num.parse_f64("."));
+    show_f(num.parse_f64("1e"));
+    show_f(num.parse_f64("inf"));
+    show_f(num.parse_f64("0x10"));
+    show_f(num.parse_f64("1.000000000000000000000000000000000000000000000000000000000000000000001"));
+    io.print_int(num.decimal_len("12.5e+3xyz") as i64); io.print(" ");
+    io.print_int(num.decimal_len("1..2") as i64); io.print(" ");
+    io.print_int(num.decimal_len("3e+") as i64); io.print(" ");
+    io.print_int(num.decimal_len("x") as i64); io.println("");
+
+    // Numbers as a lexer sees them.
+    show_num("42");
+    show_num("-0x1F");
+    show_num("9223372036854775808");
+    show_num("3.0");
+    show_num("1e2");
+    show_num("0x1p4");
+    show_num("0xffffffffffffffffff");
+
+    // Formatting.
+    fmt(0.1);
+    fmt(1.0 / 3.0);
+    fmt(100.0);
+    fmt(-0.0);
+    fmt(1e15);
+    fmt(1e16);
+    fmt(0.0001);
+    fmt(0.00001);
+    fmt(5e-324);
+    fmt(1.7976931348623157e308);
+    fmt(9007199254740992.0);
+    fmt(1e100);
+    fmt(1.0 / 0.0);
+    fmt(123456789012345.6);
+    var b = text.StrBuf.new();
+    num.write_hex(&b, 0);
+    b.push(' ');
+    num.write_hex(&b, 0xDEADbeef);
+    b.push(' ');
+    num.write_hex(&b, 0xFFFFFFFFFFFFFFFF);
+    io.println(b.as_str());
+
+    // Integer arithmetic.
+    let min: i64 = -9223372036854775807 - 1;
+    show_opt(num.floor_div(7, 2)); show_opt(num.floor_div(-7, 2)); show_opt(num.floor_div(7, -2));
+    show_opt(num.floor_div(-7, -2)); show_opt(num.floor_div(1, 0)); show_opt(num.floor_div(min, -1));
+    io.println("|");
+    show_opt(num.floor_mod(7, 3)); show_opt(num.floor_mod(-7, 3)); show_opt(num.floor_mod(7, -3));
+    show_opt(num.floor_mod(-7, -3)); show_opt(num.floor_mod(6, -3)); show_opt(num.floor_mod(5, 0));
+    show_opt(num.floor_mod(min, -1));
+    io.println("|");
+    show_opt(num.trunc_div(-7, 2)); show_opt(num.trunc_rem(-7, 2)); show_opt(num.trunc_div(min, -1));
+    show_opt(num.trunc_rem(min, -1)); show_opt(num.trunc_rem(1, 0));
+    io.println("|");
+    let (s, o) = num.add_overflow(0x7FFFFFFFFFFFFFFF, 1);
+    io.print_bool(s == min and o); io.print(" ");
+    let (d, o2) = num.sub_overflow(5, 7);
+    io.print_int(d); io.print_bool(o2); io.print(" ");
+    let (m, o3) = num.mul_overflow(0x100000000, 0x100000000);
+    io.print_int(m); io.print_bool(o3); io.print(" ");
+    io.print_bool(min.mul_checked(-1).is_none()); io.println("");
+
+    // Float arithmetic.
+    var fb = text.StrBuf.new();
+    let fs: [f64; 8] = [
+        num.floor_div_f64(7.0, 2.0), num.floor_div_f64(-7.0, 2.0),
+        num.floor_mod_f64(5.5, 2.0), num.floor_mod_f64(-5.5, 2.0),
+        num.floor_mod_f64(5.5, -2.0), num.floor_mod_f64(-6.0, 3.0),
+        num.floor_mod_f64(-1.0, 1.0 / 0.0), num.floor_mod_f64(1.0, 0.0),
+    ];
+    for i in 0..8 { num.write_shortest(&fb, fs[i]); fb.push(' '); }
+    fb.push('|');
+    io.println(fb.as_str());
+    show_opt(num.to_i64_exact(3.0)); show_opt(num.to_i64_exact(3.5));
+    show_opt(num.to_i64_exact(-9223372036854775808.0)); show_opt(num.to_i64_exact(9223372036854775808.0));
+    show_opt(num.to_i64_exact(0.0 / 0.0)); show_opt(num.to_i64_exact(-0.0));
+    io.println("|");
+}
+// expect: 9223372036854775807
+// expect: -9223372036854775808
+// expect: number out of range
+// expect: number out of range
+// expect: malformed number
+// expect: 17
+// expect: 9223372036854775807
+// expect: -16
+// expect: malformed number
+// expect: malformed number
+// expect: malformed number
+// expect: malformed number
+// expect: -511
+// expect: 1295
+// expect: true
+// expect: true
+// expect: 0.1
+// expect: -0.0025
+// expect: 0.5
+// expect: 5
+// expect: inf
+// expect: malformed number
+// expect: malformed number
+// expect: malformed number
+// expect: malformed number
+// expect: 1
+// expect: 7 1 1 0
+// expect: 42 -> int 42
+// expect: -0x1F -> int -31
+// expect: 9223372036854775808 -> float 9.223372036854776e+18
+// expect: 3.0 -> float 3
+// expect: 1e2 -> float 100
+// expect: 0x1p4 -> malformed number
+// expect: 0xffffffffffffffffff -> number out of range
+// expect: 0.1 0.1 0.1
+// expect: 0.33333333333333 0.3333333333333333 0.33333333333333
+// expect: 100 100 100.0
+// expect: -0 -0 -0.0
+// expect: 1e+15 1000000000000000 1e+15
+// expect: 1e+16 1e+16 1e+16
+// expect: 0.0001 0.0001 0.0001
+// expect: 1e-05 1e-05 1e-05
+// expect: 4.9406564584125e-324 5e-324 4.9406564584125e-324
+// expect: 1.7976931348623e+308 1.7976931348623157e+308 1.7976931348623e+308
+// expect: 9.007199254741e+15 9007199254740992 9.007199254741e+15
+// expect: 1e+100 1e+100 1e+100
+// expect: inf inf inf
+// expect: 1.2345678901235e+14 123456789012345.6 1.2345678901235e+14
+// expect: 0 deadbeef ffffffffffffffff
+// expect: 3 -4 -4 3 none -9223372036854775808 |
+// expect: 1 2 -2 -1 0 none 0 |
+// expect: -3 -1 -9223372036854775808 0 none |
+// expect: true -2false 0true true
+// expect: 3 -4 1.5 0.5 -0.5 -0 inf nan |
+// expect: 3 none -9223372036854775808 none none 0 |
