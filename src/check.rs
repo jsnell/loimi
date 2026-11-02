@@ -19,6 +19,17 @@ pub enum Def {
     GenericType(u32),
     GenericFn(u32),
     Trait(u32),
+    /// `type Name = T;` (index into `Checker::aliases`).
+    Alias(u32),
+}
+
+/// A type alias. Non-generic aliases are resolved once, before type
+/// definitions (`ty`); generic ones at each use, with their arguments.
+pub struct AliasInfo {
+    pub module: usize,
+    pub decl: TypeAliasDecl,
+    pub ty: Option<Ty>,
+    pub busy: bool,
 }
 
 pub struct ConstInfo {
@@ -120,6 +131,10 @@ pub struct Checker<'a> {
     pub dispatch_override: Option<Dispatch>,
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
+    pub aliases: Vec<AliasInfo>,
+    /// Warnings, in the order found (deduplicated by span: handler
+    /// bodies can be checked more than once).
+    pub warnings: Vec<Diag>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -192,6 +207,8 @@ impl<'a> Checker<'a> {
             traits: Default::default(),
             tenv: vec![],
             object_count: 0,
+            aliases: vec![],
+            warnings: vec![],
         }
     }
 
@@ -315,6 +332,11 @@ impl<'a> Checker<'a> {
                         self.define(m, &t.name, Def::Trait(id), t.is_pub)?;
                     }
                     Item::Impl(i) => self.traits.impl_decls.push((m, i.clone())),
+                    Item::TypeAlias(a) => {
+                        let id = self.aliases.len() as u32;
+                        self.aliases.push(AliasInfo { module: m, decl: a.clone(), ty: None, busy: false });
+                        self.define(m, &a.name, Def::Alias(id), a.is_pub)?;
+                    }
                     Item::Import(_) => {}
                 }
             }
@@ -352,6 +374,14 @@ impl<'a> Checker<'a> {
         // Impls are known before any type is resolved, so that generic
         // instances created from here on can have their bounds checked.
         self.register_impls()?;
+        // Non-generic type aliases, so that code taking `&self` (type
+        // paths in expressions) can read them.
+        for a in 0..self.aliases.len() {
+            if self.aliases[a].decl.generics.is_empty() {
+                let span = self.aliases[a].decl.name.span;
+                self.alias_type(a as u32, vec![], span)?;
+            }
+        }
         // Pass 3: type definitions.
         for (m, module) in self.modules.iter().enumerate() {
             for item in &module.items {
@@ -623,6 +653,58 @@ impl<'a> Checker<'a> {
         Ok((tag, variants))
     }
 
+    /// The alias a type path names (`Name` or `module.Name`), if any.
+    fn alias_path(&self, m: usize, path: &[Ident]) -> Res<Option<(u32, String)>> {
+        let (tm, id) = match path {
+            [id] => {
+                if self.tenv.iter().any(|(n, _)| *n == id.name) {
+                    return Ok(None);
+                }
+                (m, id)
+            }
+            [module, id] => match self.scopes[m].get(&module.name) {
+                Some((Def::Module(target), _)) => (*target, id),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        match self.scopes[tm].get(&id.name) {
+            Some((Def::Alias(a), is_pub)) => {
+                if tm != m && !is_pub {
+                    return Err(Diag::new(id.span, format!("`{}` is private", id.name)));
+                }
+                Ok(Some((*a, id.name.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The type alias `a` stands for, with its parameters bound to `args`.
+    /// The aliased type is resolved in the alias's module, seeing only
+    /// the alias's own parameters.
+    pub fn alias_type(&mut self, a: u32, args: Vec<Ty>, span: Span) -> Res<Ty> {
+        let info = &self.aliases[a as usize];
+        if let Some(t) = &info.ty {
+            return Ok(t.clone());
+        }
+        if info.busy {
+            return Err(Diag::new(span, format!("type alias `{}` refers to itself", info.decl.name.name))
+                .note(info.decl.name.span, "the alias is declared here"));
+        }
+        let (m, decl) = (info.module, info.decl.clone());
+        let env: Vec<(String, Ty)> = decl.generics.iter().map(|g| g.name.clone()).zip(args).collect();
+        self.aliases[a as usize].busy = true;
+        let saved = std::mem::replace(&mut self.tenv, env);
+        let r = self.resolve_type(m, &decl.ty);
+        self.tenv = saved;
+        self.aliases[a as usize].busy = false;
+        let t = r?;
+        if decl.generics.is_empty() {
+            self.aliases[a as usize].ty = Some(t.clone());
+        }
+        Ok(t)
+    }
+
     pub fn resolve_type_name(&self, m: usize, id: &Ident) -> Res<Ty> {
         if let Some((_, t)) = self.tenv.iter().rev().find(|(n, _)| *n == id.name) {
             return Ok(t.clone());
@@ -634,6 +716,16 @@ impl<'a> Checker<'a> {
             return Err(Diag::new(id.span, format!("`{}` needs type arguments", id.name)));
         }
         match self.scopes[m].get(&id.name) {
+            Some((Def::Alias(a), _)) => {
+                let a = &self.aliases[*a as usize];
+                match &a.ty {
+                    Some(t) => Ok(t.clone()),
+                    None if !a.decl.generics.is_empty() => {
+                        Err(Diag::new(id.span, format!("`{}` needs type arguments", id.name)))
+                    }
+                    None => Err(Diag::new(id.span, format!("type alias `{}` is used before it is resolved", id.name))),
+                }
+            }
             Some((Def::Struct(i), _)) => Ok(Ty::Struct(*i)),
             Some((Def::Enum(i), _)) => Ok(Ty::Enum(*i)),
             Some((Def::Value(i), _)) => Ok(Ty::Value(*i)),
@@ -666,6 +758,20 @@ impl<'a> Checker<'a> {
                         return Err(Diag::new(args[0].span, msg));
                     }
                     return Ok(Ty::Gc(Box::new(inner)));
+                }
+                if let Some((a, name)) = self.alias_path(m, path)? {
+                    let mut targs = Vec::new();
+                    for x in args {
+                        targs.push(self.resolve_type(m, x)?);
+                    }
+                    let want = self.aliases[a as usize].decl.generics.len();
+                    if targs.len() != want {
+                        return Err(Diag::new(
+                            t.span,
+                            format!("type alias `{}` takes {} type argument(s), got {}", name, want, targs.len()),
+                        ));
+                    }
+                    return self.alias_type(a, targs, t.span);
                 }
                 if path.len() == 1 && path[0].name == "Result" {
                     if args.len() != 2 {
@@ -748,6 +854,9 @@ impl<'a> Checker<'a> {
                 Ty::Fn(out, Box::new(self.resolve_type(m, r)?), e)
             }
             TypeKind::Never => Ty::Never,
+            TypeKind::Cache(_) => {
+                return Err(Diag::new(t.span, "a `cache Name` handle can only be the type of a vm function parameter"))
+            }
             TypeKind::Trailing(_) => {
                 return Err(Diag::new(t.span, "a trailing array `[T]` is only allowed as the last field of an `object`"))
             }
@@ -1776,12 +1885,59 @@ impl<'a> Checker<'a> {
             tarms.push(a);
         }
         self.check_exhaustive(&s.ty, &tarms, span)?;
+        if cx.vm.as_ref().is_some_and(|h| h.allow_control) {
+            self.lint_lone_if_arms(&tarms, arms);
+        }
         let ty = ty.unwrap_or(Ty::Never);
         for a in tarms.iter_mut() {
             let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
             a.body = self.coerce(body, &ty)?;
         }
         Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
+    }
+
+    /// Warn about a `match` arm in vm code whose body is a lone `if` (no
+    /// `else`) ending in a control word, when a later arm that does
+    /// something could also have matched: if the condition is false,
+    /// control continues after the `match`, not with the later arm.
+    /// An explicit `else {}` (or a guard, `pat if cond => ..`) says
+    /// which is meant.
+    pub fn lint_lone_if_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
+        fn lone_if(e: &TExpr) -> bool {
+            match &e.kind {
+                TK::If(_, then, None) => then.ty == Ty::Never,
+                TK::Block(stmts, None) if stmts.len() == 1 => matches!(&stmts[0], TStmt::Expr(x) if lone_if(x)),
+                TK::Block(stmts, Some(t)) if stmts.is_empty() => lone_if(t),
+                _ => false,
+            }
+        }
+        fn empty(e: &TExpr) -> bool {
+            match &e.kind {
+                TK::Unit => true,
+                TK::Block(stmts, None) => stmts.is_empty(),
+                TK::Block(stmts, Some(t)) => stmts.is_empty() && empty(t),
+                _ => false,
+            }
+        }
+        for (i, a) in tarms.iter().enumerate() {
+            if !lone_if(&a.body) {
+                continue;
+            }
+            let Some(j) = (i + 1..tarms.len()).find(|&j| !empty(&tarms[j].body) && pats_overlap(&a.pat, &tarms[j].pat)) else {
+                continue;
+            };
+            let span = arms[i].body.span;
+            if self.warnings.iter().any(|w| w.span == span) {
+                continue;
+            }
+            let w = Diag::new(
+                span,
+                "this arm's body is an `if` without `else`: when the condition is false, control continues after the `match`, not with the later arms",
+            )
+            .note(arms[j].pat.span, "this later arm also matches some of the same values")
+            .note(arms[i].pat.span, "to try later arms when the condition is false, use a guard: `pat if cond => ..`; to continue after the `match`, write `else {}`");
+            self.warnings.push(w);
+        }
     }
 
     pub fn expr_coerce(&mut self, cx: &mut FnCx, e: &Expr, want: &Ty) -> Res<TExpr> {
@@ -1882,6 +2038,7 @@ impl<'a> Checker<'a> {
                     Some((Def::Struct(i), _)) => Some(Ty::Struct(*i)),
                     Some((Def::Enum(i), _)) => Some(Ty::Enum(*i)),
                     Some((Def::Value(i), _)) => Some(Ty::Value(*i)),
+                    Some((Def::Alias(a), _)) => self.aliases[*a as usize].ty.clone(),
                     _ => None,
                 }
             }
@@ -1891,6 +2048,7 @@ impl<'a> Checker<'a> {
                     Some((Def::Struct(i), true)) => Some(Ty::Struct(*i)),
                     Some((Def::Enum(i), true)) => Some(Ty::Enum(*i)),
                     Some((Def::Value(i), true)) => Some(Ty::Value(*i)),
+                    Some((Def::Alias(a), true)) => self.aliases[*a as usize].ty.clone(),
                     _ => None,
                 }
             }
@@ -2660,6 +2818,19 @@ impl<'a> Checker<'a> {
                     _ => None,
                 };
                 let v = self.expr(cx, inner, inner_exp.as_ref())?;
+                if let (TK::Vm(TVm::Word(_) | TVm::WordAt(..)), Some(h)) = (&v.kind, &cx.vm) {
+                    let wb = self.vms[h.vm as usize].word.bits as u64 / 8;
+                    if crate::layout::align_of(&self.prog, &v.ty) > wb {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "cannot take the address of a `{}` cache field: code words are only {}-byte aligned; read and assign the field instead",
+                                self.ty_name(&v.ty),
+                                wb
+                            ),
+                        ));
+                    }
+                }
                 let v = if is_place(&v) {
                     v
                 } else {
@@ -2809,7 +2980,7 @@ impl<'a> Checker<'a> {
                 Ty::Array(..) => self.check_assignable(cx, b, span),
                 _ => Ok(()),
             },
-            TK::Vm(TVm::Word(_)) => Ok(()),
+            TK::Vm(TVm::Word(_) | TVm::WordAt(..)) => Ok(()),
             TK::Block(_, Some(t)) if matches!(t.kind, TK::Local(_)) => Ok(()),
             _ => Err(Diag::new(span, "left side of assignment is not a place")),
         }
@@ -2922,8 +3093,27 @@ pub fn is_place(e: &TExpr) -> bool {
         TK::Local(_) | TK::Deref(_) | TK::Global(_) => true,
         TK::Field(b, _) => is_place(b) || matches!(b.ty, Ty::Slice(_)),
         TK::Index(b, _) => !matches!(b.ty, Ty::Array(..)) || is_place(b),
-        TK::Vm(TVm::Word(_)) => true,
+        TK::Vm(TVm::Word(_) | TVm::WordAt(..)) => true,
         _ => false,
+    }
+}
+
+/// Whether some value can match both patterns (conservative: true when
+/// unsure).
+fn pats_overlap(a: &TPat, b: &TPat) -> bool {
+    match (&a.kind, &b.kind) {
+        (TPK::Wild | TPK::Bind(_), _) | (_, TPK::Wild | TPK::Bind(_)) => true,
+        (TPK::Or(xs), _) => xs.iter().any(|x| pats_overlap(x, b)),
+        (_, TPK::Or(ys)) => ys.iter().any(|y| pats_overlap(a, y)),
+        (TPK::Tuple(xs), TPK::Tuple(ys)) => xs.len() != ys.len() || xs.iter().zip(ys).all(|(x, y)| pats_overlap(x, y)),
+        (TPK::Variant(i, xs), TPK::Variant(j, ys)) => {
+            i == j && (xs.len() != ys.len() || xs.iter().zip(ys).all(|(x, y)| pats_overlap(x, y)))
+        }
+        (TPK::Int(x), TPK::Int(y)) => x == y,
+        (TPK::Int(x), TPK::Range(lo, hi)) | (TPK::Range(lo, hi), TPK::Int(x)) => lo <= x && x <= hi,
+        (TPK::Range(a1, a2), TPK::Range(b1, b2)) => a1 <= b2 && b1 <= a2,
+        (TPK::Bool(x), TPK::Bool(y)) => x == y,
+        _ => true,
     }
 }
 

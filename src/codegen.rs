@@ -577,6 +577,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 }
             }
             TK::Vm(TVm::Word(off)) => crate::vmgen::word_place(self, *off),
+            TK::Vm(TVm::WordAt(h, bytes, _)) => {
+                let p = self.val(h);
+                if *bytes == 0 {
+                    p
+                } else {
+                    self.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", p, bytes))
+                }
+            }
             _ => {
                 let v = self.val(e);
                 let t = self.alloca(&e.ty);
@@ -847,7 +855,17 @@ impl<'a, 'p> FnGen<'a, 'p> {
             TK::Assign(lhs, rhs) => {
                 let v = self.val(rhs);
                 let p = self.place(lhs);
-                self.store(&lhs.ty, &v, &p);
+                if matches!(lhs.kind, TK::Vm(TVm::Word(_) | TVm::WordAt(..))) && !lhs.ty.is_unitlike() {
+                    // A code word or inline cache field: only word-aligned.
+                    let t = self.ty(&lhs.ty);
+                    let a = match &lhs.kind {
+                        TK::Vm(TVm::WordAt(_, _, a)) => *a,
+                        _ => crate::vmgen::word_align(self),
+                    };
+                    self.emit(format!("store {} {}, ptr {}, align {}", t, v, p, a));
+                } else {
+                    self.store(&lhs.ty, &v, &p);
+                }
                 "zeroinitializer".into()
             }
             TK::Coalesce(a, b) => {

@@ -1,0 +1,77 @@
+// Type aliases: transparent, generic, public across modules, usable in
+// expressions where the aliased type's name could appear.
+import std.io;
+import std.map.{HashMap};
+import type_alias_mod.defs;
+import type_alias_mod.defs.{ShapeRef, Table};
+
+type Word = u32;
+type Pair<A, B> = (A, B);
+type Opt<T> = ?T;
+type Point2 = Point;
+type IntBox = Box<i64>;
+type Words = [Word; 4];
+type Cb = fn(i64) -> i64;
+type Nested<T> = Opt<Pair<T, T>>;   // aliases of aliases
+type Col = Color;                    // declared before its target
+
+struct Point { x: i64, y: i64 }
+struct Box<T> { v: T }
+enum Color { Red, Green, Blue(u8) }
+struct Holder { w: Word, items: Words }
+
+fn Point.sum(p: *Point) -> i64 { p.x + p.y }
+fn Point2.origin() -> Point2 { Point2 { x: 0, y: 0 } }   // a method on the alias is a method on Point
+
+fn first<T>(p: Pair<T, T>) -> T { p.0 }
+fn twice(x: i64) -> i64 { x * 2 }
+
+fn main() {
+    let w: Word = 7;
+    let x: u32 = w + 1;                     // the same type as u32
+    io.print_int(x as i64); io.println("");
+    let p: Pair<i64, bool> = (3, true);
+    let q: (i64, bool) = p;
+    io.print_int(q.0); io.println("");
+    let o: Opt<i64> = Some(4);
+    io.print_int(o ?? 0); io.println("");
+    var pt = Point2 { x: 1, y: 2 };          // struct literal through an alias
+    io.print_int(pt.sum()); io.println("");
+    let z = Point.origin();
+    io.print_int(z.x); io.println("");
+    let b: IntBox = Box { v: 9 };
+    io.print_int(b.v); io.println("");
+    let h = Holder { w: 1, items: [1, 2, 3, 4] };
+    io.print_int(h.items[3] as i64); io.println("");
+    let f: Cb = twice;
+    io.print_int(f(21)); io.println("");
+    let n: Nested<i64> = Some((5, 6));
+    if let Some(pr) = n { io.print_int(first(pr)); io.println(""); }
+    let c = Col.Blue(3);                    // variant through an alias
+    match c {
+        Col.Blue(k) => { io.print_int(k as i64); io.println(""); }
+        _ => {}
+    }
+    let s = defs.Shape { id: 1, slots: 11 };
+    let r: ShapeRef = &s;
+    let r2: defs.ShapeRef = r;
+    io.print_int(defs.shape_slots(r2) as i64); io.println("");
+    var t: Table<i64> = HashMap.new();
+    t.insert("a", 12);
+    let t2: *HashMap<str, i64> = &t;
+    io.print_int(t2.get("a") ?? 0); io.println("");
+    io.print_int(size_of<Pair<u8, u64>>() as i64); io.println("");
+}
+// expect: 8
+// expect: 3
+// expect: 4
+// expect: 3
+// expect: 0
+// expect: 9
+// expect: 4
+// expect: 42
+// expect: 5
+// expect: 3
+// expect: 11
+// expect: 12
+// expect: 16

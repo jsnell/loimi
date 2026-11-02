@@ -15,8 +15,9 @@ differs from the design.
 **Results so far.** `examples/mini` implements a Lua 5.4 subset
 ([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
 from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
-0.40–0.97× of Lua's time. On 10 of them it is faster than LuaJIT's
-hand-written assembly interpreter (`luajit -joff`), or within 10% of it.
+0.36–0.76× of Lua's time. It is also faster than LuaJIT's hand-written
+assembly interpreter (`luajit -joff`) on 11 of them, and within 8% on
+the other three.
 See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
 
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on
@@ -25,7 +26,10 @@ clean-room benchmarks it is faster than V8's bytecode interpreter
 (`node --jitless`, 0.33–0.97× of its time) and faster than QuickJS, on
 every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
 [`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
-public r7rs-benchmarks suite.
+public r7rs-benchmarks suite. By geometric mean it takes 0.39× of Gauche's
+time and 0.62× of Guile 3's time with Guile's JIT off. Guile with its JIT
+is faster: we take 1.39× of its time
+([`bench/scheme/README.md`](bench/scheme/README.md)).
 
 ## Getting started
 

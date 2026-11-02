@@ -1,0 +1,10 @@
+fn get(p: *u64) -> u64 { *p }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u64 }
+    op NOP() : A + IC { let x = get(&cache.n); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cannot take the address of a `u64` cache field: code words are only 4-byte aligned

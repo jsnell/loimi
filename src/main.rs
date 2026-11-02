@@ -96,6 +96,9 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
     let mut c = check::Checker::new(&modules);
     c.dispatch_override = opts.dispatch;
     c.run()?;
+    for w in &c.warnings {
+        eprint!("{}", sm.render_as("warning", w));
+    }
     let prog = c.prog;
     let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats });
     let ir = cg.generate();

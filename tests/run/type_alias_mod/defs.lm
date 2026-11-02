@@ -1,0 +1,8 @@
+import std.map.{HashMap};
+
+pub struct Shape { id: u32, slots: u32 }
+pub type ShapeRef = *Shape;
+pub type Table<V> = HashMap<str, V>;
+type Hidden = u8;
+pub fn shape_slots(s: ShapeRef) -> u32 { s.slots }
+fn hidden() -> Hidden { 1 }

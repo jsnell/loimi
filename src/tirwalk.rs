@@ -97,7 +97,7 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
             }
         }
         TK::Vm(v) => match v {
-            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) => go(a),
+            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
             TVm::Synced(a, b) => {
                 go(a);
                 go(b);
@@ -310,7 +310,7 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
             }
         }
         TK::Vm(v) => match v {
-            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) => go(a, f),
+            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a, f),
             TVm::Synced(a, b) => {
                 go(a, f);
                 go(b, f);

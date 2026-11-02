@@ -1,0 +1,120 @@
+// vm functions that take the calling op's inline cache: `c: cache Name`
+// is a handle to the op's cache words, passed as `cache`. Inlined copies
+// address the words from `pc`; shared copies (cold call sites,
+// `#[inline(never)]`) get the address, so they update the calling
+// instruction's own cache.
+// matrix: dispatch
+import std.io;
+
+struct Entry { key: u64, value: i64 }
+struct Globals { entries: [Entry; 4], version: u64, lookups: u64 }
+
+vm V {
+    context g: *Globals;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    // 1 + 2 + 2 = 5 words after the instruction.
+    cache GlobalIC { hits: u32, version: u64, entry: ?*Entry }
+    cache Other { n: u32 }
+
+    // A plain vm function: reads and fills the cache through the handle.
+    fn lookup(c: cache GlobalIC, key: u64) -> i64 {
+        if let Some(e) = c.entry and c.version == g.version {
+            c.hits += 1;
+            return e.value;
+        }
+        g.lookups += 1;
+        var i: u64 = 0;
+        while i < 4 {
+            let e = &g.entries[i];
+            if e.key == key {
+                fill(c, e);
+                return e.value;
+            }
+            i += 1;
+        }
+        0
+    }
+    // Handles can be passed on.
+    fn fill(c: cache GlobalIC, e: *Entry) { c.entry = Some(e); c.version = g.version; }
+
+    // A `-> never` vm function using the cache: inlined from hot paths,
+    // shared (in tail-call mode) when called from a cold block.
+    fn get_or_miss(c: cache GlobalIC, dst: u64, key: u64) -> never {
+        if let Some(e) = c.entry and c.version == g.version {
+            c.hits += 1;
+            regs[dst] = e.value;
+            next
+        }
+        regs[dst] = lookup(c, key);
+        next
+    }
+    #[inline(never)]
+    fn always_shared(c: cache GlobalIC, dst: u64, key: u64) -> never { get_or_miss(c, dst, key) }
+
+    op GETG(dst: reg, key: imm) : ABC + GlobalIC { dst = lookup(cache, key); next }
+    op GETG2(dst: reg, key: imm) : ABC + GlobalIC { get_or_miss(cache, dst.raw, key) }
+    op GETG_COLD(dst: reg, key: imm) : ABC + GlobalIC {
+        if key == 99 { next }
+        cold { get_or_miss(cache, dst.raw, key) }
+    }
+    op GETG_SHARED(dst: reg, key: imm) : ABC + GlobalIC { always_shared(cache, dst.raw, key) }
+    op BUMP() : ABC + Other { cache.n += 1; next }
+    op RET(src: reg) : ABC { exit src }
+    super GETG_GETG = GETG; GETG;
+
+    entry run(code: *u32, r: *i64, gl: *Globals) -> i64 { pc = code; regs = r; g = gl; jump pc }
+}
+
+fn main() {
+    var gl = Globals {
+        entries: [Entry { key: 1, value: 10 }, Entry { key: 2, value: 20 }, Entry { key: 3, value: 30 }, Entry { key: 4, value: 40 }],
+        version: 1,
+        lookups: 0,
+    };
+    var code: [u32; 64] = [0; 64];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.GETG(c, at, 0, 1);         // 0..6
+    at = V.emit.GETG2(c, at, 1, 2);        // 6..12
+    at = V.emit.GETG_COLD(c, at, 2, 3);    // 12..18
+    at = V.emit.GETG_SHARED(c, at, 3, 4);  // 18..24
+    at = V.emit.GETG(c, at, 4, 2);         // 24..30 (fused with the next one by optimize)
+    at = V.emit.GETG(c, at, 5, 3);         // 30..36
+    at = V.emit.BUMP(c, at);               // 36..38
+    at = V.emit.RET(c, at, 6);
+    V.optimize(c[0..at]);
+    io.print(V.op_name(code[24])); io.println("");
+    var regs: [i64; 8] = [0; 8];
+    var round = 0;
+    while round < 3 {
+        V.run(&code[0], &regs[0], &gl);
+        round += 1;
+    }
+    io.print_int(regs[0] + regs[1] + regs[2] + regs[3] + regs[4] + regs[5]); io.println("");
+    // Each instruction missed once and then hit twice in its own cache.
+    io.print_int(gl.lookups as i64); io.println("");
+    var k = 0;
+    while k < 6 {
+        io.print_int(code[k * 6 + 1] as i64);
+        k += 1;
+    }
+    io.println("");
+    io.print_int(code[37] as i64); io.println("");
+    // A new version invalidates every cache.
+    gl.version = 2;
+    gl.entries[0].value = 11;
+    V.run(&code[0], &regs[0], &gl);
+    io.print_int(regs[0]); io.println("");
+    io.print_int(gl.lookups as i64); io.println("");
+}
+// expect: GETG_GETG
+// expect: 150
+// expect: 6
+// expect: 222222
+// expect: 3
+// expect: 11
+// expect: 12

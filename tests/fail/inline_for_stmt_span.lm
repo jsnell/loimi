@@ -1,0 +1,8 @@
+fn main() {
+    var s: i64 = 0;
+    inline for v in [1, true] {
+        s += v;
+    }
+}
+// error: mismatched types: expected `i64`, found `bool`
+// error: inline_for_stmt_span.lm:3:25

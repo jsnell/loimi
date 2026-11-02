@@ -35,7 +35,7 @@ impl Parser {
         let mut loop_vars: Vec<Ident> = Vec::new();
         while !self.eat("}") {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
-                loop_vars.extend(self.expand_inline_for()?);
+                loop_vars.extend(self.expand_inline_for(false)?);
                 continue;
             }
             let item_attrs = self.parse_attrs()?;
@@ -257,6 +257,7 @@ impl Parser {
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
         }
+        loop_vars.append(&mut self.vm_loop_vars);
         for v in &loop_vars {
             if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {
                 return Err(crate::diag::Diag::new(
