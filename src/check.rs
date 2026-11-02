@@ -27,6 +27,7 @@ pub struct ConstInfo {
     pub busy: bool,
 }
 
+#[derive(Clone)]
 pub struct LoopCx {
     pub id: u32,
     pub is_loop: bool,
@@ -66,6 +67,20 @@ impl FnCx {
         self.scopes.last_mut().unwrap().push((name.to_string(), id));
         id
     }
+    /// A copy for speculative checking: the original is unaffected.
+    pub fn probe(&self) -> FnCx {
+        FnCx {
+            module: self.module,
+            locals: self.locals.clone(),
+            scopes: self.scopes.clone(),
+            ret: self.ret.clone(),
+            loops: self.loops.clone(),
+            next_loop: self.next_loop,
+            vm: self.vm.clone(),
+            effects: self.effects,
+            fn_name: self.fn_name.clone(),
+        }
+    }
     /// A local not visible by name.
     pub fn temp(&mut self, ty: Ty) -> LocalId {
         let id = self.locals.len() as LocalId;
@@ -103,6 +118,33 @@ pub struct Checker<'a> {
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
     TExpr { ty, kind, span }
+}
+
+/// An unknown part of a guessed type (`Checker::guess_ty`).
+const HOLE: u32 = u32::MAX;
+
+fn has_hole(t: &Ty) -> bool {
+    match t {
+        Ty::Param(HOLE) => true,
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
+        Ty::Result(a, b) => has_hole(a) || has_hole(b),
+        Ty::Tuple(ts) => ts.iter().any(has_hole),
+        Ty::Fn(ps, r) => ps.iter().any(has_hole) || has_hole(r),
+        _ => false,
+    }
+}
+
+/// Combine two guesses of the same value's type, filling holes.
+fn merge_guess(a: Ty, b: Ty) -> Ty {
+    match (a, b) {
+        (Ty::Param(HOLE), t) | (t, Ty::Param(HOLE)) => t,
+        (Ty::Option(x), Ty::Option(y)) => Ty::Option(Box::new(merge_guess(*x, *y))),
+        (Ty::Result(a1, b1), Ty::Result(a2, b2)) => Ty::Result(Box::new(merge_guess(*a1, *a2)), Box::new(merge_guess(*b1, *b2))),
+        (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
+            Ty::Tuple(xs.into_iter().zip(ys).map(|(x, y)| merge_guess(x, y)).collect())
+        }
+        (a, _) => a,
+    }
 }
 
 fn is_literal_expr(e: &Expr) -> bool {
@@ -1207,90 +1249,9 @@ impl<'a> Checker<'a> {
                 Ok(mk(Ty::Array(Box::new(v.ty.clone()), n), TK::ArrayRepeat(Box::new(v), n), span))
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.block(cx, b, exp),
-            ExprKind::If(conds, then, els) => {
-                // `if c { 1 } else { x }`: type the literal from the other branch.
-                let mut hint: Option<Ty> = None;
-                if exp.is_none() {
-                    if let (Some(Stmt::Expr { expr: t, semi: false }), Some(e)) = (then.stmts.last(), els) {
-                        let else_tail = match &e.kind {
-                            ExprKind::Block(b) => match b.stmts.last() {
-                                Some(Stmt::Expr { expr, semi: false }) => Some(expr),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if is_literal_expr(t) && then.stmts.len() == 1 {
-                            if let Some(et) = else_tail {
-                                if !is_literal_expr(et) {
-                                    let mut probe = FnCx::new(cx.module, cx.ret.clone());
-                                    probe.scopes = cx.scopes.clone();
-                                    probe.locals = cx.locals.clone();
-                                    probe.vm = cx.vm.clone();
-                                    if let Ok(v) = self.expr(&mut probe, e, None) {
-                                        if v.ty.is_numeric() {
-                                            hint = Some(v.ty);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let exp = if hint.is_some() { hint.as_ref() } else { exp };
-                cx.scopes.push(vec![]);
-                let tconds = self.conds(cx, conds)?;
-                let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
-                let t = self.block(cx, then, then_exp);
-                cx.scopes.pop();
-                let t = t?;
-                match els {
-                    None => {
-                        let t = if t.ty == Ty::Never { t } else { self.coerce(t, &Ty::Unit)? };
-                        Ok(mk(Ty::Unit, TK::If(tconds, Box::new(t), None), span))
-                    }
-                    Some(els) => {
-                        let e_exp = exp.cloned().or_else(|| if t.ty == Ty::Never { None } else { Some(t.ty.clone()) });
-                        let ev = self.expr(cx, els, e_exp.as_ref())?;
-                        let ty = match &e_exp {
-                            Some(ty) => ty.clone(),
-                            None => ev.ty.clone(),
-                        };
-                        let t = self.coerce(t, &ty)?;
-                        let ev = self.coerce(ev, &ty)?;
-                        Ok(mk(ty, TK::If(tconds, Box::new(t), Some(Box::new(ev))), span))
-                    }
-                }
-            }
-            ExprKind::Match(scrut, arms) => {
-                let s = self.expr(cx, scrut, None)?;
-                let mut ty: Option<Ty> = exp.cloned();
-                let mut tarms = Vec::new();
-                for arm in arms {
-                    cx.scopes.push(vec![]);
-                    let r = (|| -> Res<TArm> {
-                        let p = self.pat(cx, &arm.pat, &s.ty, false)?;
-                        let g = match &arm.guard {
-                            Some(g) => Some(self.expr_coerce(cx, g, &Ty::Bool)?),
-                            None => None,
-                        };
-                        let b = self.expr(cx, &arm.body, ty.as_ref())?;
-                        Ok(TArm { pat: p, guard: g, body: b })
-                    })();
-                    cx.scopes.pop();
-                    let a = r?;
-                    if ty.is_none() && a.body.ty != Ty::Never {
-                        ty = Some(a.body.ty.clone());
-                    }
-                    tarms.push(a);
-                }
-                self.check_exhaustive(&s.ty, &tarms, span)?;
-                let ty = ty.unwrap_or(Ty::Never);
-                for a in tarms.iter_mut() {
-                    let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
-                    a.body = self.coerce(body, &ty)?;
-                }
-                Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
-            }
+            ExprKind::If(..) | ExprKind::Match(..) if exp.is_none() => self.branches_inferred(cx, e),
+            ExprKind::If(conds, then, els) => self.if_expr(cx, conds, then, els.as_deref(), exp, span),
+            ExprKind::Match(scrut, arms) => self.match_expr(cx, scrut, arms, exp, span),
             ExprKind::While(conds, body) => {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
@@ -1471,6 +1432,198 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Vm(v) => crate::vmcheck::check_vm_expr(self, cx, v, exp, span),
         }
+    }
+
+    /// `if`/`match` without an expected type. When a branch cannot be
+    /// typed on its own (`Ok(e)`, `None`), guess the type from all branches
+    /// together and check again with that as the expected type, so
+    /// `if c { Ok(e) } else { Err(m) }` works when `e` and `m` are typed.
+    fn branches_inferred(&mut self, cx: &mut FnCx, e: &Expr) -> Res<TExpr> {
+        let (nscopes, nloops) = (cx.scopes.len(), cx.loops.len());
+        let check = |c: &mut Self, cx: &mut FnCx, exp: Option<&Ty>| match &e.kind {
+            ExprKind::If(conds, then, els) => c.if_expr(cx, conds, then, els.as_deref(), exp, e.span),
+            ExprKind::Match(scrut, arms) => c.match_expr(cx, scrut, arms, exp, e.span),
+            _ => unreachable!(),
+        };
+        let err = match check(self, cx, None) {
+            Ok(v) => return Ok(v),
+            Err(d) => d,
+        };
+        if !err.msg.starts_with("cannot infer") {
+            return Err(err);
+        }
+        cx.scopes.truncate(nscopes);
+        cx.loops.truncate(nloops);
+        let guess = self.guess_ty(cx, e);
+        if has_hole(&guess) {
+            return Err(err);
+        }
+        match check(self, cx, Some(&guess)) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                cx.scopes.truncate(nscopes);
+                cx.loops.truncate(nloops);
+                Err(err)
+            }
+        }
+    }
+
+    /// The type of `e` as far as it can be told without an expected type,
+    /// with `HOLE` for unknown parts: `Ok(1)` is `Result<i64, HOLE>`,
+    /// `None` is `?HOLE`, and the branches of `if`/`match`/blocks are merged.
+    /// Checks only on probes, so `cx` is unaffected.
+    fn guess_ty(&mut self, cx: &FnCx, e: &Expr) -> Ty {
+        let hole = Ty::Param(HOLE);
+        let unshadowed = |c: &Self, n: &str| cx.lookup(n).is_none() && !c.scopes[cx.module].contains_key(n);
+        match &e.kind {
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+                let Some(Stmt::Expr { expr: tail, semi: false }) = b.stmts.last() else {
+                    return self.probe_ty(cx, e);
+                };
+                let mut p = cx.probe();
+                p.scopes.push(vec![]);
+                let prefix = Block { stmts: b.stmts[..b.stmts.len() - 1].to_vec(), span: b.span };
+                if self.block_inner(&mut p, &prefix, None).is_err() {
+                    return hole;
+                }
+                self.guess_ty(&p, tail)
+            }
+            ExprKind::If(conds, then, els) => {
+                let Some(els) = els else { return Ty::Unit };
+                let mut p = cx.probe();
+                p.scopes.push(vec![]);
+                let t = if self.conds(&mut p, conds).is_ok() {
+                    let tb = Expr { kind: ExprKind::Block(then.clone()), span: then.span };
+                    self.guess_ty(&p, &tb)
+                } else {
+                    hole.clone()
+                };
+                let f = self.guess_ty(cx, els);
+                merge_guess(t, f)
+            }
+            ExprKind::Match(scrut, arms) => {
+                let mut p = cx.probe();
+                let Ok(s) = self.expr(&mut p, scrut, None) else { return hole };
+                let mut acc = hole;
+                for a in arms {
+                    let mut q = p.probe();
+                    q.scopes.push(vec![]);
+                    if self.pat(&mut q, &a.pat, &s.ty, false).is_ok() {
+                        let t = self.guess_ty(&q, &a.body);
+                        acc = merge_guess(acc, t);
+                    }
+                }
+                acc
+            }
+            ExprKind::Call(f, args) if args.len() == 1 => match &f.kind {
+                ExprKind::Ident(n) if matches!(n.as_str(), "Ok" | "Err" | "Some") && unshadowed(self, n) => {
+                    let x = self.guess_ty(cx, &args[0]);
+                    match n.as_str() {
+                        "Ok" => Ty::Result(Box::new(x), Box::new(hole)),
+                        "Err" => Ty::Result(Box::new(hole), Box::new(x)),
+                        _ => Ty::Option(Box::new(x)),
+                    }
+                }
+                _ => self.probe_ty(cx, e),
+            },
+            ExprKind::Ident(n) if n == "None" && unshadowed(self, n) => Ty::Option(Box::new(hole)),
+            ExprKind::Tuple(es) => Ty::Tuple(es.iter().map(|x| self.guess_ty(cx, x)).collect()),
+            _ => self.probe_ty(cx, e),
+        }
+    }
+
+    fn probe_ty(&mut self, cx: &FnCx, e: &Expr) -> Ty {
+        let mut p = cx.probe();
+        match self.expr(&mut p, e, None) {
+            Ok(v) if v.ty != Ty::Never => v.ty,
+            _ => Ty::Param(HOLE),
+        }
+    }
+
+    fn if_expr(&mut self, cx: &mut FnCx, conds: &[Cond], then: &Block, els: Option<&Expr>, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        // `if c { 1 } else { x }`: type the literal from the other branch.
+        let mut hint: Option<Ty> = None;
+        if exp.is_none() {
+            if let (Some(Stmt::Expr { expr: t, semi: false }), Some(e)) = (then.stmts.last(), els) {
+                let else_tail = match &e.kind {
+                    ExprKind::Block(b) => match b.stmts.last() {
+                        Some(Stmt::Expr { expr, semi: false }) => Some(expr),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if is_literal_expr(t) && then.stmts.len() == 1 {
+                    if let Some(et) = else_tail {
+                        if !is_literal_expr(et) {
+                            let mut probe = FnCx::new(cx.module, cx.ret.clone());
+                            probe.scopes = cx.scopes.clone();
+                            probe.locals = cx.locals.clone();
+                            probe.vm = cx.vm.clone();
+                            if let Ok(v) = self.expr(&mut probe, e, None) {
+                                if v.ty.is_numeric() {
+                                    hint = Some(v.ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let exp = if hint.is_some() { hint.as_ref() } else { exp };
+        cx.scopes.push(vec![]);
+        let tconds = self.conds(cx, conds)?;
+        let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
+        let t = self.block(cx, then, then_exp);
+        cx.scopes.pop();
+        let t = t?;
+        match els {
+            None => {
+                let t = if t.ty == Ty::Never { t } else { self.coerce(t, &Ty::Unit)? };
+                Ok(mk(Ty::Unit, TK::If(tconds, Box::new(t), None), span))
+            }
+            Some(els) => {
+                let e_exp = exp.cloned().or_else(|| if t.ty == Ty::Never { None } else { Some(t.ty.clone()) });
+                let ev = self.expr(cx, els, e_exp.as_ref())?;
+                let ty = match &e_exp {
+                    Some(ty) => ty.clone(),
+                    None => ev.ty.clone(),
+                };
+                let t = self.coerce(t, &ty)?;
+                let ev = self.coerce(ev, &ty)?;
+                Ok(mk(ty, TK::If(tconds, Box::new(t), Some(Box::new(ev))), span))
+            }
+        }
+    }
+
+    fn match_expr(&mut self, cx: &mut FnCx, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        let mut ty: Option<Ty> = exp.cloned();
+        let mut tarms = Vec::new();
+        for arm in arms {
+            cx.scopes.push(vec![]);
+            let r = (|| -> Res<TArm> {
+                let p = self.pat(cx, &arm.pat, &s.ty, false)?;
+                let g = match &arm.guard {
+                    Some(g) => Some(self.expr_coerce(cx, g, &Ty::Bool)?),
+                    None => None,
+                };
+                let b = self.expr(cx, &arm.body, ty.as_ref())?;
+                Ok(TArm { pat: p, guard: g, body: b })
+            })();
+            cx.scopes.pop();
+            let a = r?;
+            if ty.is_none() && a.body.ty != Ty::Never {
+                ty = Some(a.body.ty.clone());
+            }
+            tarms.push(a);
+        }
+        self.check_exhaustive(&s.ty, &tarms, span)?;
+        let ty = ty.unwrap_or(Ty::Never);
+        for a in tarms.iter_mut() {
+            let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
+            a.body = self.coerce(body, &ty)?;
+        }
+        Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
     }
 
     pub fn expr_coerce(&mut self, cx: &mut FnCx, e: &Expr, want: &Ty) -> Res<TExpr> {

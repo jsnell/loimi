@@ -76,6 +76,11 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `for i in 0..Kind.COUNT { let k = i as Kind; }`); a variant named `COUNT`
   takes precedence. With explicit discriminants the count is not the
   largest discriminant plus one.
+- **Local inference across branches.** Without an annotation, the branches
+  of `if` and `match` are typed against each other: `let r = if c { Ok(e) }
+  else { Err(m) };` gets `Result<typeof e, typeof m>`, and an arm that cannot
+  be typed alone (`None`, `Ok(x)`) takes its type from the others. Inference
+  is local: it does not look at later uses of `r`.
 - **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
   takes type arguments. After any other type name, `<` begins type
   arguments only when a balanced `<...>` made of type tokens follows
