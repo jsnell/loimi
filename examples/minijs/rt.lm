@@ -72,6 +72,12 @@ pub struct Ctx {
     k_constructor: u64,
     k_message: u64,
     k_name: u64,
+    /// Natives that CALL runs inline (its members CALL_CCA etc.).
+    f_cca: V,
+    f_charat: V,
+    f_push: V,
+    f_floor: V,
+    f_sqrt: V,
 }
 
 pub const STACK_SLOTS: u64 = 1 << 22;
@@ -106,6 +112,7 @@ pub fn Ctx.new() -> Ctx {
         natives: mem.Vec.new(),
         native_proto: None,
         k_length: 0, k_prototype: 0, k_constructor: 0, k_message: 0, k_name: 0,
+        f_cca: V.Undef, f_charat: V.Undef, f_push: V.Undef, f_floor: V.Undef, f_sqrt: V.Undef,
     };
     c.stack_end = c.stack + STACK_SLOTS;
     c.frames_end = c.frames + FRAME_SLOTS;
@@ -164,6 +171,11 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     for i in 0..c.chars.len { if let Some(s) = c.chars.at(i) { gc_mark(h, s); } }
     if let Some(s) = c.empty { gc_mark(h, s); }
     gc_mark(h, c.error);
+    gc_mark(h, c.f_cca);
+    gc_mark(h, c.f_charat);
+    gc_mark(h, c.f_push);
+    gc_mark(h, c.f_floor);
+    gc_mark(h, c.f_sqrt);
     if let Some(p) = c.objproto { gc_mark(h, p); }
     if let Some(p) = c.arrproto { gc_mark(h, p); }
     if let Some(p) = c.strproto { gc_mark(h, p); }

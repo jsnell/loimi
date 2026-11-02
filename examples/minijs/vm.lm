@@ -886,45 +886,136 @@ pub vm JS {
         jump p.code.ptr
     }
 
+    /// A native call from CALL's members (their callee is the native
+    /// they expected, the arguments are not what their inline path takes).
+    fn call_native(base: u64, nargs: u64) -> never {
+        if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+        let F(cl) = regs[base] else { unreachable };
+        regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs)?;
+        next
+    }
+
     /// R[base] = R[base](R[base+2] .. R[base+1+nargs]) with this = R[base+1].
-    op CALL(base: callbase, nargs: imm) : ABC {
-        if let F(cl) = regs[base] {
-            let p = cl.proto;
-            if likely(p.fixed <= 255) {
-                let callee = regs + base + 1;
-                let n = p.nregs as u64;
-                if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-                    cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+    /// Sites that call certain natives (`s.charCodeAt(i)`, `a.push(x)`,
+    /// `Math.floor(x)`, ...) become members that run them inline while
+    /// the callee is that native.
+    family CALL(base: callbase, nargs: imm) : ABC {
+        generic {
+            if let F(cl) = regs[base] {
+                let p = cl.proto;
+                if likely(p.fixed <= 255) {
+                    let callee = regs + base + 1;
+                    let n = p.nregs as u64;
+                    if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                        cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+                    }
+                    // Missing arguments are undefined; extra ones are dropped
+                    // (their registers are the callee's locals).
+                    var i = nargs as u64 + 1;
+                    if nargs as u32 > p.fixed { i = p.fixed as u64 + 1; }
+                    while i < n {
+                        callee[i] = Undef;
+                        i += 1;
+                    }
+                    fp.resume = pc + 1;
+                    fp = fp + 1;
+                    fp.cl = cl;
+                    fp.base = callee;
+                    fp.flags = 0;
+                    k = p.consts.data.ptr;
+                    fp.k = k;
+                    regs = callee;
+                    jump p.code.ptr
                 }
-                // Missing arguments are undefined; extra ones are dropped
-                // (their registers are the callee's locals).
-                var i = nargs as u64 + 1;
-                if nargs as u32 > p.fixed { i = p.fixed as u64 + 1; }
-                while i < n {
-                    callee[i] = Undef;
-                    i += 1;
+                if cl.native != 0 {
+                    if nargs == 1 {
+                        let f = regs[base];
+                        if f == ctx.f_cca { become CALL_CCA; }
+                        if f == ctx.f_charat { become CALL_CHARAT; }
+                        if f == ctx.f_push { become CALL_PUSH; }
+                        if f == ctx.f_floor { become CALL_FLOOR; }
+                        if f == ctx.f_sqrt { become CALL_SQRT; }
+                    }
+                    if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+                    regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs as u64)?;
+                    next
                 }
-                fp.resume = pc + 1;
-                fp = fp + 1;
-                fp.cl = cl;
-                fp.base = callee;
-                fp.flags = 0;
-                k = p.consts.data.ptr;
-                fp.k = k;
-                regs = callee;
-                jump p.code.ptr
             }
-            if cl.native != 0 {
-                if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-                regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs as u64)?;
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                call_slow(base as u64, nargs as u64, 0)
+            }
+        }
+        /// s.charCodeAt(i)
+        CALL_CCA {
+            if regs[base] == ctx.f_cca and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
+                    and (i as u32 as u64) < s.data.len {
+                regs[base] = Int(s.data[i as u32 as u64] as i32);
                 next
             }
+            cold {
+                if regs[base] != ctx.f_cca { become CALL; redo }
+                call_native(base as u64, 1)
+            }
         }
-        cold {
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            call_slow(base as u64, nargs as u64, 0)
+        /// s.charAt(i)
+        CALL_CHARAT {
+            if regs[base] == ctx.f_charat and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
+                    and (i as u32 as u64) < s.data.len {
+                regs[base] = S(ctx.char_str(s.data[i as u32 as u64]));
+                next
+            }
+            cold {
+                if regs[base] != ctx.f_charat { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// a.push(x) with room in the store.
+        CALL_PUSH {
+            if regs[base] == ctx.f_push and let A(a) = regs[base + 1] and let Some(st) = a.store
+                    and a.len < st.data.len {
+                a.ptr[a.len] = regs[base + 2];
+                a.len += 1;
+                regs[base] = Int(a.len as i32);
+                next
+            }
+            cold {
+                if regs[base] != ctx.f_push { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// Math.floor(x)
+        CALL_FLOOR {
+            if regs[base] == ctx.f_floor {
+                let x = regs[base + 2];
+                if let Int(_) = x { regs[base] = x; next }
+                if let Num(d) = x {
+                    let f = d.floor();
+                    if f >= -2147483648.0 and f <= 2147483647.0 and (f != 0.0 or d > 0.0) {
+                        regs[base] = Int(f as i32);
+                        next
+                    }
+                }
+            }
+            cold {
+                if regs[base] != ctx.f_floor { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// Math.sqrt(x)
+        CALL_SQRT {
+            if regs[base] == ctx.f_sqrt {
+                let x = regs[base + 2];
+                if let Num(d) = x and d >= 0.0 { regs[base] = value.number(d.sqrt()); next }
+                if let Int(i) = x and i >= 0 { regs[base] = value.number((i as f64).sqrt()); next }
+            }
+            cold {
+                if regs[base] != ctx.f_sqrt { become CALL; redo }
+                call_native(base as u64, 1)
+            }
         }
     }
+
     /// Push a frame for bytecode function `cl` called at `base` and jump to it.
     fn enter(cl: Gc<Fn>, base: u64, nargs: u64, flags: u32) -> never {
         let p = cl.proto;
