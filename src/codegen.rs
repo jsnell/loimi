@@ -170,6 +170,16 @@ impl<'p> Codegen<'p> {
         }
     }
 
+    /// The thread-locals holding the location of the last call to a
+    /// `#[track_caller]` function (`FnGen::store_caller`).
+    pub fn caller_globals(&mut self) {
+        for (g, t) in [("@loimi.caller_ptr", "ptr null"), ("@loimi.caller_len", "i64 0")] {
+            if self.tls_defined.insert(g.to_string()) {
+                let _ = writeln!(self.globals, "{} = internal thread_local(initialexec) global {}", g, t);
+            }
+        }
+    }
+
     pub fn string_const(&mut self, s: &[u8]) -> String {
         // Counting copies (`--jit-stencils`) number their own, so that the
         // rest is named as in a default build.
@@ -427,6 +437,9 @@ pub struct FnGen<'a, 'p> {
     pub stencil: Option<crate::jitgen::StencilGen>,
     /// Emitting the counting copy of this function (`--jit-stencils`).
     pub jit_count: bool,
+    /// A `#[track_caller]` function: its caller's location is in
+    /// `%caller.ptr` and `%caller.len` (`store_caller`).
+    caller_saved: bool,
 }
 
 impl<'a, 'p> FnGen<'a, 'p> {
@@ -447,6 +460,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             pending: vec![],
             stencil: None,
             jit_count: false,
+            caller_saved: false,
         }
     }
 
@@ -595,6 +609,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.live[0].push(r);
         }
         crate::vmgen::handler_prologue(&mut self);
+        if f.track_caller && self.cold.is_none() {
+            self.cg.caller_globals();
+            self.emit("%caller.ptr = load ptr, ptr @loimi.caller_ptr");
+            self.emit("%caller.len = load i64, ptr @loimi.caller_len");
+            self.caller_saved = true;
+        }
         let cold = self.cold.take();
         let body = match &cold {
             Some((b, captured, sym)) => {
@@ -693,6 +713,25 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
         let _ = writeln!(out, "}}\n");
         out
+    }
+
+    /// Before a call to a `#[track_caller]` function (or `test.caller()`'s
+    /// runtime half): record where the call is, or, in a `#[track_caller]`
+    /// function, pass on where it was called from.
+    fn store_caller(&mut self, span: Span) {
+        self.cg.caller_globals();
+        let (ptr, len) = if self.caller_saved {
+            ("%caller.ptr".to_string(), "%caller.len".to_string())
+        } else if self.f().track_caller {
+            // An outlined cold block: the location stays the caller's.
+            return;
+        } else {
+            let loc = self.cg.location(span);
+            let len = loc.len();
+            (self.cg.string_const(loc.as_bytes()), len.to_string())
+        };
+        self.emit(format!("store ptr {}, ptr @loimi.caller_ptr", ptr));
+        self.emit(format!("store i64 {}, ptr @loimi.caller_len", len));
     }
 
     // ── panics ──────────────────────────────────────────────────────
@@ -2139,6 +2178,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
         } else {
             rt.clone()
         };
+        if let TK::FnRef(id) = &f.kind {
+            let fd = &p.fns[*id as usize];
+            if fd.track_caller || matches!(fd.symbol.as_str(), "loimi_caller_ptr" | "loimi_caller_len") {
+                self.store_caller(e.span);
+            }
+        }
         let pre = crate::gcgen::push_frame(self, f);
         let call = format!("call {}{} {}({})", cc_str(cc), fnty, callee, avs.join(", "));
         let r = if rt == "void" {

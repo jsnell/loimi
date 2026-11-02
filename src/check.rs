@@ -756,6 +756,11 @@ impl<'a> Checker<'a> {
             }
             self.prog.c_const_params.insert(symbol.clone(), args.iter().map(|a| (a.clone(), *sp)).collect());
         }
+        if let Some((_, _, sp)) = f.attrs.list.iter().find(|(n, _, _)| n == "test") {
+            if !f.params.is_empty() || !f.generics.is_empty() || f.recv.is_some() || ret != Ty::Unit || f.body.is_none() || f.linkage != Linkage::Internal {
+                return Err(Diag::new(*sp, "`#[test]` applies to functions `fn name()` without parameters, type parameters or a result"));
+            }
+        }
         let catch_panic = match f.attrs.get("catch_panic") {
             Some(args) => Some(self.catch_panic_value(f, &ret, args.first().map(|s| s.as_str()))?),
             None => None,
@@ -784,6 +789,7 @@ impl<'a> Checker<'a> {
             env_struct: None,
             env_root: None,
             catch_panic,
+            track_caller: f.attrs.has("track_caller"),
         };
         Ok(())
     }
@@ -3676,6 +3682,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         env_struct: None,
         env_root: None,
         catch_panic: None,
+        track_caller: false,
     }
 }
 

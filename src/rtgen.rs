@@ -86,7 +86,7 @@ const KIND_PANIC: u32 = 1;
 /// or has an export with `#[catch_panic]`. Without, `@loimi.panic` just
 /// prints and aborts.
 pub fn has_handlers(cg: &Codegen) -> bool {
-    ["loimi_protect", "loimi_throw", "loimi_catch_panic"].iter().any(|n| cg.decls.0.contains_key(*n))
+    ["loimi_protect", "loimi_throw", "loimi_catch_panic", "loimi_catch_panic_reenter"].iter().any(|n| cg.decls.0.contains_key(*n))
         || cg.p.fns.iter().any(|f| f.catch_panic.is_some() && f.body.is_some())
 }
 
@@ -218,6 +218,12 @@ pub fn emit_runtime(cg: &mut Codegen) {
             );
         }
     }
+    // `test.caller()`: the location the last `#[track_caller]` call stored.
+    if cg.decls.0.remove("loimi_caller_ptr").is_some() | cg.decls.0.remove("loimi_caller_len").is_some() {
+        cg.caller_globals();
+        let _ = writeln!(cg.fns, "define internal ptr @loimi_caller_ptr() {{\n  %v = load ptr, ptr @loimi.caller_ptr\n  ret ptr %v\n}}");
+        let _ = writeln!(cg.fns, "define internal i64 @loimi_caller_len() {{\n  %v = load i64, ptr @loimi.caller_len\n  ret i64 %v\n}}");
+    }
     // The last caught panic's message (`rt.panic_message`).
     let want_msg = cg.decls.0.remove("loimi_panic_msg_ptr").is_some() | cg.decls.0.remove("loimi_panic_msg_len").is_some();
     if !cg.panic_handlers {
@@ -239,6 +245,14 @@ pub fn emit_runtime(cg: &mut Codegen) {
         // `f` has no effects, so it cannot enter a vm: no depths to save.
         let body = handler_body(kind, &[], "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
         let _ = writeln!(cg.fns, "define internal i32 @{}(ptr %f, ptr %data) nounwind noinline {{\n{}}}\n", name, body);
+    }
+    // The same for a function that may collect or run a vm (`std.test`
+    // runs tests through it): a panic in a nested run leaves its `Vm.depth`
+    // counted up, so restore them.
+    if cg.decls.0.remove("loimi_catch_panic_reenter").is_some() {
+        let depths = depth_globals(cg);
+        let body = handler_body(KIND_PANIC, &depths, "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
+        let _ = writeln!(cg.fns, "define internal i32 @loimi_catch_panic_reenter(ptr %f, ptr %data) nounwind noinline {{\n{}}}\n", body);
     }
     if cg.decls.0.remove("loimi_throw").is_some() {
         let msg = "rt.throw outside rt.protect\n";

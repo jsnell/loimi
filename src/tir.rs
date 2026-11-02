@@ -383,6 +383,9 @@ pub struct FnDef {
     /// `#[catch_panic(v)]` on an `export "C"` function: the LLVM constant
     /// it returns when a panic unwinds to it (`rtgen::emit_catch_wrappers`).
     pub catch_panic: Option<String>,
+    /// `#[track_caller]`: callers store their location for
+    /// `test.caller()` (`codegen::store_caller`).
+    pub track_caller: bool,
 }
 
 impl FnDef {

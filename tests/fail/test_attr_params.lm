@@ -1,0 +1,4 @@
+// error: `#[test]` applies to functions `fn name()` without parameters
+#[test]
+fn t(x: i64) {}
+fn main() {}

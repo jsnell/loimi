@@ -39,9 +39,11 @@ const ATTRS: &[(&str, &str)] = &[
     ("catch_panic", "`export \"C\"` functions"),
     ("c_name", "structs and enums named in a C header"),
     ("c_const", "`export \"C\"` functions (pointer parameters `const` in C)"),
+    ("test", "functions without parameters (run by `loimi test`)"),
+    ("track_caller", "functions (`test.caller()` is the call's location)"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
-pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic", "c_const"];
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic", "c_const", "test", "track_caller"];
 /// Attributes on `vm` declarations.
 pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
 
@@ -81,7 +83,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "test" | "track_caller");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }

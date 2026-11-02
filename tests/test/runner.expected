@@ -1,0 +1,31 @@
+test passes ... ok
+test fails_eq ... FAILED
+    runner.lm:39:17: test.eq failed
+        got:  got
+        want: want
+test fails_in_helper ... FAILED
+    runner.lm:44:5: test.eq failed
+        got:  9
+        want: 10
+test fails_bounds_check ... FAILED
+    runner.lm:51:18: index out of bounds
+test catches_panic ... ok
+test capture_and_golden ... ok
+test golden_mismatch ... FAILED
+    runner.lm:70:24: test.golden: output differs from runner.golden at line 2
+        got:  line two
+        want: line 2
+test fails_while_capturing ... FAILED
+    runner.lm:76:5: failed with output captured
+    captured output:
+        swallowed
+test collects ... ok
+
+failures:
+    fails_eq
+    fails_in_helper
+    fails_bounds_check
+    golden_mismatch
+    fails_while_capturing
+
+test result: FAILED. 4 passed; 5 failed; 1 filtered out

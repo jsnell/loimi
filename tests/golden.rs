@@ -157,6 +157,32 @@ fn compile_errors() {
     }
 }
 
+/// `loimi test` (std.test): run each tests/test/NAME.lm from its
+/// directory with the `// args:` as filters; stdout must equal
+/// NAME.expected and the exit status `// expect-exit:` (default 0).
+#[test]
+fn std_test() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test");
+    let mut failures = Vec::new();
+    for f in files("tests/test") {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let args: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
+        let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let out = loimi().current_dir(&dir).arg("test").arg(&name).args(&args).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let want = std::fs::read_to_string(f.with_extension("expected")).unwrap();
+        if stdout != want {
+            failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, want, stdout, String::from_utf8_lossy(&out.stderr)));
+        } else if out.status.code() != Some(exit) {
+            failures.push(format!("{}: exit {:?}, expected {}", name, out.status.code(), exit));
+        }
+    }
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
 /// The Mini interpreter (examples/mini): run every script in
 /// examples/mini/tests normally and with GC stress (collect at every
 /// safepoint), comparing with `-- expect:` lines.

@@ -218,6 +218,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         env_struct: None,
         env_root: None,
         catch_panic: None,
+        track_caller: false,
     });
     id
 }

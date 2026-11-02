@@ -54,6 +54,11 @@ struct Opts {
     /// `--jit-stencils`: build the copy-and-patch JIT prototype in
     /// (docs/design/copy-and-patch.md); `LOIMI_JIT=1` turns it on at run time.
     jit: bool,
+    /// `loimi test`: replace `main` with a runner of the `#[test]`
+    /// functions (`test_main`), and run it.
+    test: bool,
+    /// `loimi test --update`: `test.golden` rewrites its files.
+    update: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -77,7 +82,8 @@ usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tail
                   [--sanitize=address] [-W error | --deny-warnings]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
-       loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]";
+       loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]
+       loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
 
 fn std_root() -> PathBuf {
     if let Ok(p) = std::env::var("LOIMI_STD") {
@@ -100,7 +106,8 @@ fn std_root() -> PathBuf {
 
 /// Load the root module and everything it imports.
 /// `allows` collects the `#[allow(lint)]` regions of every file.
-fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>) -> Result<Vec<ast::Module>, Diag> {
+/// `test`: the root module gets a generated `main` (`test_main`).
+fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>, test: bool) -> Result<Vec<ast::Module>, Diag> {
     let root_dir = root.parent().unwrap_or(Path::new(".")).to_path_buf();
     let stdr = std_root();
     let mut modules: Vec<ast::Module> = Vec::new();
@@ -114,8 +121,11 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>)
         let fid = sm.add(file.display().to_string(), text.clone());
         let toks = lexer::lex(fid, &text)?;
         let mut p = parser::Parser::new(toks);
-        let (items, _attrs) = p.parse_module()?;
+        let (mut items, _attrs) = p.parse_module()?;
         allows.append(&mut p.allows);
+        if test && path == ["main"] {
+            test_main(sm, &mut items)?;
+        }
         for it in &items {
             if let ast::Item::Import(imp) = it {
                 let ipath: Vec<String> = imp.path.iter().map(|i| i.name.clone()).collect();
@@ -127,6 +137,33 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>)
         modules.push(ast::Module { path, items });
     }
     Ok(modules)
+}
+
+/// `loimi test`: drop the root module's `main` and add one that runs
+/// each `#[test]` function, in source order, through a `test.Runner`
+/// (std/test.lm), importing `std.test` if the module does not.
+fn test_main(sm: &mut SourceMap, items: &mut Vec<ast::Item>) -> Result<(), Diag> {
+    let is_test = |f: &ast::FnDecl| f.attrs.has("test") && f.recv.is_none();
+    let names: Vec<String> =
+        items.iter().filter_map(|it| if let ast::Item::Fn(f) = it { is_test(f).then(|| f.name.name.clone()) } else { None }).collect();
+    items.retain(|it| !matches!(it, ast::Item::Fn(f) if f.name.name == "main" && f.recv.is_none()));
+    let imported = items.iter().any(|it| {
+        matches!(it, ast::Item::Import(i) if i.names.is_none() && i.path.iter().map(|p| p.name.as_str()).eq(["std", "test"]))
+    });
+    let mut src = String::new();
+    if !imported {
+        src.push_str("import std.test;\n");
+    }
+    src.push_str("fn main() -> i32 uses reenter {\n    var runner = test.Runner.new();\n");
+    for n in &names {
+        src.push_str(&format!("    runner.run(\"{}\", {});\n", n, n));
+    }
+    src.push_str("    runner.finish()\n}\n");
+    let fid = sm.add("<loimi test>".to_string(), src.clone());
+    let toks = lexer::lex(fid, &src)?;
+    let (generated, _) = parser::Parser::new(toks).parse_module()?;
+    items.extend(generated);
+    Ok(())
 }
 
 /// What the JIT build needs besides the program's IR: the stencil
@@ -141,7 +178,7 @@ struct JitParts {
 fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
-    let mut modules = load(sm, input, &mut allows)?;
+    let mut modules = load(sm, input, &mut allows, opts.test)?;
     for (name, span, _) in &allows {
         if !diag::LINTS.contains(&name.as_str()) {
             return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
@@ -342,10 +379,16 @@ fn parse_args() -> Result<Opts, String> {
         header_prefix: String::new(),
         tls: None,
         jit: false,
+        test: false,
+        update: false,
     };
     match cmd.as_str() {
         "build" => {}
         "run" => o.run = true,
+        "test" => {
+            o.run = true;
+            o.test = true;
+        }
         _ => return Err(USAGE.into()),
     }
     while let Some(a) = args.next() {
@@ -368,6 +411,8 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--vm-stats" => o.vm_stats = true,
             "--jit-stencils" => o.jit = true,
+            "--update" if o.test => o.update = true,
+            "--list" if o.test => o.run_args.push(a.clone()),
             "--sanitize=address" => o.sanitize_address = true,
             "--deny-warnings" | "-Werror" => o.deny_warnings = true,
             "-W" => match args.next().as_deref() {
@@ -631,7 +676,19 @@ fn compiler_main() -> ExitCode {
     }
     let _ = std::fs::remove_file(&ll);
     if opts.run {
-        let status = Command::new(&exe).args(&opts.run_args).status();
+        let mut cmd = Command::new(&exe);
+        cmd.args(&opts.run_args);
+        if opts.test {
+            // Tests run in their file's directory, so that `test.golden`
+            // paths are relative to it.
+            if let Some(dir) = input.parent().filter(|d| !d.as_os_str().is_empty()) {
+                cmd.current_dir(dir);
+            }
+            if opts.update {
+                cmd.env("LOIMI_TEST_UPDATE", "1");
+            }
+        }
+        let status = cmd.status();
         let _ = std::fs::remove_dir_all(&tmpdir);
         return match status {
             Ok(s) => match s.code() {

@@ -1,0 +1,92 @@
+// `loimi test` and std.test: run from this directory as
+// `loimi test runner.lm` (tests/golden.rs, std_test), output compared
+// with runner.expected. Some tests fail on purpose.
+// expect-exit: 1
+// args: pass fail catch capture golden collects
+import std.io;
+import std.test;
+import std.text;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+/// A helper of our own: failures point at the line in the test.
+#[track_caller]
+fn squares(x: i64, want: i64) { test.eq(x * x, want); }
+
+fn oob(_: *u8) {
+    var a: [u8; 2] = [0; 2];
+    let i = 5;
+    io.print_int(a[i] as i64);
+}
+
+fn main() { io.println("not run by loimi test"); }
+
+#[test]
+fn passes() {
+    test.eq(2 + 2, 4);
+    test.eq("abc", "abc");
+    test.eq(true, true);
+    test.eq(1.5, 1.5);
+    test.ne(1 as u8, 2 as u8);
+    test.assert(1 < 2);
+    test.eq(test.some(text.parse_int("12")), 12);
+    test.none(text.parse_int("x"));
+    squares(3, 9);
+}
+
+#[test]
+fn fails_eq() { test.eq("got", "want"); }
+
+#[test]
+fn fails_in_helper() {
+    squares(2, 4);
+    squares(3, 10);
+}
+
+#[test]
+fn fails_bounds_check() {
+    var a: [u8; 2] = [0; 2];
+    let i = 7;
+    io.print_int(a[i] as i64);
+}
+
+#[test]
+fn catches_panic() {
+    test.has(test.panics(oob, 0 as *u8), "index out of bounds");
+}
+
+#[test]
+fn capture_and_golden() {
+    test.capture_start();
+    io.println("line 1");
+    io.eprintln("line 2");
+    var b = text.StrBuf.new();
+    test.capture_end(&b);
+    test.golden(b.as_str(), "runner.golden");
+}
+
+#[test]
+fn golden_mismatch() { test.golden("line 1\nline two\n", "runner.golden"); }
+
+#[test]
+fn fails_while_capturing() {
+    test.capture_start();
+    io.println("swallowed");
+    test.fail("failed with output captured");
+}
+
+// A test may collect: it declares the effect.
+#[test]
+fn collects() uses gc {
+    var h = gc.Heap.new();
+    var l: ?Gc<Node> = None;
+    for i in 0..1000 { l = Some(new(&h, Node { value: i, next: l })); }
+    gc.collect(&h);
+    var n = 0;
+    while let Some(x) = l { n += x.value; l = x.next; }
+    test.eq(n, 499500);
+}
+
+#[test]
+fn filtered_out_by_name() { test.fail("not selected"); }

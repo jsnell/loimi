@@ -1,0 +1,4 @@
+// error: `#[track_caller]` takes no arguments
+#[track_caller(x)]
+fn t() {}
+fn main() {}

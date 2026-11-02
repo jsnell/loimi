@@ -1,0 +1,377 @@
+// Unit tests. Mark functions `#[test]` and run the file with
+// `loimi test FILE.lm [FILTER..]`:
+//
+//     import std.test;
+//     #[test] fn adds() { test.eq(1 + 2, 3); }
+//
+// `loimi test` replaces the file's `main` with one that runs every
+// `#[test]` function of the file through a `Runner`, each under a panic
+// catch: a failed assertion, bounds check or `unwrap` fails that test,
+// and the run goes on. The assertions are `#[track_caller]`, so a
+// failure names the line of the assertion (or of the call to your own
+// `#[track_caller]` helper that made it):
+//
+//     test adds ... FAILED
+//         adds.lm:3:21: test.eq failed
+//             got:  4
+//             want: 3
+//
+// A test that may collect or run a vm declares the effect
+// (`#[test] fn runs() uses gc { .. }`). A crash that is not a panic
+// (a segfault in unchecked code) still ends the run.
+
+import std.io;
+import std.os;
+import std.text;
+import std.hash;
+import std.mem;
+import std.rt;
+
+extern "C" fn loimi_caller_ptr() -> *u8;
+extern "C" fn loimi_caller_len() -> u64;
+extern "C" fn loimi_catch_panic_reenter(f: fn(*u8) uses reenter, data: *u8) -> i32 uses reenter;
+extern "C" fn getenv(name: *u8) -> *u8;
+extern "C" fn dup(fd: i32) -> i32;
+extern "C" fn dup2(fd: i32, to: i32) -> i32;
+extern "C" fn close(fd: i32) -> i32;
+extern "C" fn tmpfile() -> *u8;
+extern "C" fn fileno(f: *u8) -> i32;
+extern "C" fn fclose(f: *u8) -> i32;
+extern "C" fn lseek(fd: i32, off: i64, whence: i32) -> i64;
+extern "C" fn read(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn fopen(path: *u8, mode: *u8) -> *u8;
+extern "C" fn fwrite(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
+
+/// Inside a `#[track_caller]` function: where it was called from
+/// (`"file.lm:12:5"`). A `#[track_caller]` function calling another
+/// passes its own caller on, so a helper of your own reports the line in
+/// the test that called it. Outside one, the location of the last such
+/// call on this thread ("?" if none).
+#[track_caller]
+pub fn caller() -> str {
+    let n = loimi_caller_len();
+    if n == 0 { return "?"; }
+    loimi_caller_ptr().slice(n)
+}
+
+// ── assertions ──────────────────────────────────────────────────────
+
+/// Values `test.eq` and `test.ne` compare: the method
+/// `fn T.eq(a: T, b: T) -> bool` (the same one `hash.Hash` asks for).
+/// Implemented for `str`, `bool`, `f64` (exact) and the integer types; a
+/// type of your own joins with `fn T.eq` and `impl test.Eq for T;`.
+pub trait Eq {
+    fn eq(a: Self, b: Self) -> bool;
+}
+
+impl Eq for u64;
+impl Eq for i64;
+impl Eq for u32;
+impl Eq for i32;
+impl Eq for str;
+
+pub fn u16.eq(a: u16, b: u16) -> bool { a == b }
+pub fn u8.eq(a: u8, b: u8) -> bool { a == b }
+pub fn i16.eq(a: i16, b: i16) -> bool { a == b }
+pub fn i8.eq(a: i8, b: i8) -> bool { a == b }
+pub fn bool.eq(a: bool, b: bool) -> bool { a == b }
+pub fn f64.eq(a: f64, b: f64) -> bool { a == b }
+
+impl Eq for u16;
+impl Eq for u8;
+impl Eq for i16;
+impl Eq for i8;
+impl Eq for bool;
+impl Eq for f64;
+
+// The message of the last `fail` (the panic keeps only 512 bytes of it).
+var fail_buf: u64 = 0;
+var fail_len: u64 = 0;
+
+/// Fail the test: panic with `msg`, prefixed by the caller's location.
+#[track_caller]
+pub fn fail(msg: str) -> never {
+    var b = text.StrBuf.new();
+    b.add(caller()).add(": ").add(msg);
+    if fail_len > 0 { mem.release(fail_buf as *u8); }
+    fail_buf = b.bytes.ptr as u64;
+    fail_len = b.len();
+    rt.panic(b.as_str())
+}
+
+#[track_caller]
+pub fn assert(cond: bool) {
+    if !cond { fail("assertion failed"); }
+}
+
+/// `assert` with a message of your own.
+#[track_caller]
+pub fn assert_msg(cond: bool, msg: str) {
+    if !cond { fail(msg); }
+}
+
+#[track_caller]
+pub fn eq<T: Eq + text.Fmt>(got: T, want: T) {
+    if !got.eq(want) {
+        var b = text.StrBuf.new();
+        b.add("test.eq failed\n    got:  ").add(got).add("\n    want: ").add(want);
+        fail(b.as_str());
+    }
+}
+
+#[track_caller]
+pub fn ne<T: Eq + text.Fmt>(got: T, other: T) {
+    if got.eq(other) {
+        var b = text.StrBuf.new();
+        b.add("test.ne failed: both are ").add(got);
+        fail(b.as_str());
+    }
+}
+
+/// The value in `x`; fails the test if it is None.
+#[track_caller]
+pub fn some<T>(x: ?T) -> T {
+    match x {
+        Some(v) => v,
+        None => fail("test.some: got None"),
+    }
+}
+
+#[track_caller]
+pub fn none<T>(x: ?T) {
+    if let Some(_) = x { fail("test.none: got Some"); }
+}
+
+/// The value in `r`; fails the test if it is an `Err`.
+#[track_caller]
+pub fn ok<T, E>(r: Result<T, E>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(_) => fail("test.ok: got Err"),
+    }
+}
+
+/// The error in `r`; fails the test if it is `Ok`.
+#[track_caller]
+pub fn err<T, E>(r: Result<T, E>) -> E {
+    match r {
+        Ok(_) => fail("test.err: got Ok"),
+        Err(e) => e,
+    }
+}
+
+/// Whether `s` contains `part`.
+pub fn contains(s: str, part: str) -> bool {
+    if part.len > s.len { return false; }
+    for i in 0..s.len - part.len + 1 {
+        if mem.memcmp(s.ptr + i, part.ptr, part.len) == 0 { return true; }
+    }
+    false
+}
+
+/// Fails unless `s` contains `part`.
+#[track_caller]
+pub fn has(s: str, part: str) {
+    if !contains(s, part) {
+        var b = text.StrBuf.new();
+        b.add("test.has failed\n    text: ").add(s).add("\n    lacks: ").add(part);
+        fail(b.as_str());
+    }
+}
+
+/// Run `f(data)`, which must panic; the panic's message. Fails the test
+/// if `f` returns.
+#[track_caller]
+pub fn panics(f: fn(*u8), data: *u8) -> str {
+    if rt.catch_panic(f, data) { fail("test.panics: no panic"); }
+    // A `fail` inside `f` was expected: not this test's failure message.
+    if fail_len > 0 {
+        mem.release(fail_buf as *u8);
+        fail_len = 0;
+    }
+    rt.panic_message()
+}
+
+// ── output capture and golden files ─────────────────────────────────
+
+var cap_out: i32 = -1;
+var cap_err: i32 = -1;
+var cap_file: u64 = 0;
+
+/// Send stdout and stderr (file descriptors 1 and 2, which `std.io`
+/// writes to directly) to a temporary file until `capture_end`. For
+/// testing code that prints, such as an interpreter's `print`. A test
+/// that fails while capturing gets its output back before the failure
+/// is reported.
+pub fn capture_start() {
+    if cap_out >= 0 { rt.panic("test.capture_start: already capturing"); }
+    let f = tmpfile();
+    if (f as u64) == 0 { rt.panic("test.capture_start: tmpfile failed"); }
+    cap_file = f as u64;
+    cap_out = dup(1);
+    cap_err = dup(2);
+    dup2(fileno(f), 1);
+    dup2(fileno(f), 2);
+}
+
+/// Stop capturing; append what was written to `out`.
+pub fn capture_end(out: *text.StrBuf) {
+    if cap_out < 0 { rt.panic("test.capture_end: not capturing"); }
+    let fd = fileno(cap_file as *u8);
+    restore_output();
+    lseek(fd, 0, 0);
+    var buf: [u8; 4096] = [0; 4096];
+    loop {
+        let n = read(fd, &buf[0], 4096);
+        if n <= 0 { break; }
+        out.push_str(buf[0..n as u64]);
+    }
+    fclose(cap_file as *u8);
+}
+
+fn restore_output() {
+    if cap_out < 0 { return; }
+    dup2(cap_out, 1);
+    dup2(cap_err, 2);
+    close(cap_out);
+    close(cap_err);
+    cap_out = -1;
+    cap_err = -1;
+}
+
+/// Compare `got` with the contents of the file `path` (relative to the
+/// test file's directory under `loimi test`). With `loimi test --update`
+/// (or `LOIMI_TEST_UPDATE=1`), write `got` to the file instead.
+#[track_caller]
+pub fn golden(got: str, path: str) {
+    var cpath = text.StrBuf.new();
+    cpath.add(path).push(0);
+    if (getenv("LOIMI_TEST_UPDATE\0".ptr) as u64) != 0 {
+        let f = fopen(cpath.as_str().ptr, "wb\0".ptr);
+        if (f as u64) == 0 { fail(text.StrBuf.new().add("test.golden: cannot write ").add(path).as_str()); }
+        fwrite(got.ptr, 1, got.len, f);
+        fclose(f);
+        return;
+    }
+    let want = match io.read_file(path) {
+        Some(w) => w,
+        None => fail(text.StrBuf.new().add("test.golden: cannot read ").add(path).add(" (`loimi test --update` writes it)").as_str()),
+    };
+    if !got.eq(want) {
+        // The first line that differs, numbered from 1.
+        var i: u64 = 0;
+        var line: u64 = 1;
+        var start: u64 = 0;
+        while i < got.len and i < want.len and got[i] == want[i] {
+            if got[i] == '\n' { line += 1; start = i + 1; }
+            i += 1;
+        }
+        var b = text.StrBuf.new();
+        b.fmt2("test.golden: output differs from {} at line {}", path, line);
+        b.add("\n    got:  ").add(line_at(got, start)).add("\n    want: ").add(line_at(want, start));
+        fail(b.as_str());
+    }
+    io.free_file(want);
+}
+
+/// The line of `s` starting at `at` (without its newline), or "<end>".
+fn line_at(s: str, at: u64) -> str {
+    if at >= s.len { return "<end>"; }
+    var e = at;
+    while e < s.len and s[e] != '\n' { e += 1; }
+    s[at..e]
+}
+
+// ── the runner ──────────────────────────────────────────────────────
+
+/// Runs tests and counts the results. `loimi test` generates a `main`
+/// that calls `run` for every `#[test]` function; a hand-written `main`
+/// can do the same. The program's arguments select tests: those whose
+/// name contains one of the words (all without words); `--list` prints
+/// the names instead of running them.
+pub struct Runner {
+    passed: u64,
+    failed: u64,
+    filtered: u64,
+    list: bool,
+    failures: text.StrBuf,
+}
+
+pub fn Runner.new() -> Runner {
+    var list = false;
+    for i in 1..os.arg_count() {
+        if os.arg(i).unwrap().eq("--list") { list = true; }
+    }
+    Runner { passed: 0, failed: 0, filtered: 0, list: list, failures: text.StrBuf.new() }
+}
+
+fn Runner.selected(r: *Runner, name: str) -> bool {
+    var words = 0;
+    for i in 1..os.arg_count() {
+        let a = os.arg(i).unwrap();
+        if a.eq("--list") { continue; }
+        words += 1;
+        if contains(name, a) { return true; }
+    }
+    words == 0
+}
+
+fn call_test(data: *u8) uses reenter {
+    let f = *(data as *(fn() uses reenter));
+    f();
+}
+
+/// Run the test `f`, unless the arguments filter it out: a panic in it
+/// fails it, with the panic's message.
+pub fn Runner.run(r: *Runner, name: str, f: fn() uses reenter) uses reenter {
+    if !r.selected(name) { r.filtered += 1; return; }
+    if r.list { io.println(name); return; }
+    io.print(text.StrBuf.new().add("test ").add(name).add(" ... ").as_str());
+    var fv = f;
+    fail_len = 0;
+    let passed = loimi_catch_panic_reenter(call_test, &fv as *u8) != 0;
+    // Output still captured (the test failed, or never called
+    // `capture_end`) is shown, not lost.
+    var captured = text.StrBuf.new();
+    if cap_out >= 0 { capture_end(&captured); }
+    var b = text.StrBuf.new();
+    if passed {
+        r.passed += 1;
+        b.add("ok");
+    } else {
+        r.failed += 1;
+        b.add("FAILED\n");
+        indent(&b, "    ", if fail_len > 0 { (fail_buf as *u8).slice(fail_len) } else { rt.panic_message() });
+        r.failures.add("    ").add(name).add("\n");
+    }
+    if captured.len() > 0 {
+        b.add("\n    captured output:\n");
+        indent(&b, "        ", captured.as_str());
+    }
+    io.println(b.as_str());
+    b.free();
+    captured.free();
+}
+
+/// Append `s` with `pre` before each line, without a final newline.
+fn indent(b: *text.StrBuf, pre: str, s: str) {
+    var n = s.len;
+    if n > 0 and s[n - 1] == '\n' { n -= 1; }
+    b.add(pre);
+    for i in 0..n {
+        b.push(s[i]);
+        if s[i] == '\n' { b.add(pre); }
+    }
+}
+
+/// Print the summary; the exit status: 0 if every test that ran passed,
+/// 1 otherwise.
+pub fn Runner.finish(r: *Runner) -> i32 {
+    if r.list { return 0; }
+    var b = text.StrBuf.new();
+    if r.failed > 0 { b.add("\nfailures:\n").add(r.failures.as_str()); }
+    b.add("\ntest result: ").add(if r.failed == 0 { "ok" } else { "FAILED" });
+    b.fmt3(". {} passed; {} failed; {} filtered out", r.passed, r.failed, r.filtered);
+    io.println(b.as_str());
+    if r.failed == 0 { 0 } else { 1 }
+}
