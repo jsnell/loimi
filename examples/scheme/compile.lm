@@ -116,6 +116,11 @@ struct Comp {
     gdefs: map.HashMap<u64, u32>,
     glams: map.HashMap<u64, *Lam>,
     gsets: map.HashMap<u64, bool>,
+    /// The top-level form that defines each global, the form being
+    /// inlined into, and the first form that may run program code.
+    gform: map.HashMap<u64, u64>,
+    cur_form: u64,
+    first_impure: u64,
 }
 
 fn Comp.node(c: *Comp, kind: K) -> *Node {
@@ -1211,6 +1216,33 @@ fn Comp.known(c: *Comp, f: *Node) -> ?(*Lam, u64, *Var) {
     None
 }
 
+/// Can an inlined call of global `g` in the current top-level form run
+/// before g's definition? Not if the definition is in an earlier form, or
+/// if no form before it runs program code (they only define procedures
+/// and constants, so nothing can call anything until g is bound).
+fn Comp.needs_guard(c: *Comp, g: u64) -> bool {
+    let Some(f) = c.gform.get(g) else { return true; };
+    !(f < c.cur_form or f < c.first_impure)
+}
+
+/// May evaluating `n` run program code (call anything but a builtin)?
+/// Lambda bodies do not run when the closure is made.
+fn may_call(n: *Node) -> bool {
+    if is_null(n) { return false; }
+    if n.kind == K.Lambda { return false; }
+    if n.kind == K.Call {
+        let f = n.a;
+        if f.kind != K.Const { return true; }
+        let Some(id) = value.prim_of(f.v) else { return true; };
+        if id == builtins.P_APPLY or id == builtins.P_CALLCC { return true; }
+    }
+    if may_call(n.a) or may_call(n.b) or may_call(n.c) { return true; }
+    for i in 0..n.list.len {
+        if may_call(n.list.at(i)) { return true; }
+    }
+    false
+}
+
 /// Inline the small known procedures called in `n`; returns the new node.
 fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     if is_null(n) { return n; }
@@ -1255,7 +1287,7 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
         lt.a = body;
         out = lt;
     }
-    if n.a.kind == K.GRef {
+    if n.a.kind == K.GRef and c.needs_guard(n.a.g as u64) {
         // (begin <check that f is bound> body)
         let chk = c.node(K.GChk);
         chk.line = n.line;
@@ -2235,6 +2267,9 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         gdefs: map.HashMap.new(),
         glams: map.HashMap.new(),
         gsets: map.HashMap.new(),
+        gform: map.HashMap.new(),
+        cur_form: 0,
+        first_impure: 0,
     };
     var pre: mem.Vec<V> = mem.Vec.new();
     read_all(&c, prelude, false, &pre);
@@ -2246,7 +2281,16 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
     for i in 0..pre.len { c.top(pre.at(i), &nodes); }
     for i in 0..prog.len { c.scan_defs(prog.at(i)); }
     for i in 0..prog.len { c.top(prog.at(i), &nodes); }
-    for i in 0..nodes.len { nodes.set(i, c.inl(nodes.at(i), 0)); }
+    c.first_impure = nodes.len;
+    for i in 0..nodes.len {
+        let n = nodes.at(i);
+        if n.kind == K.GDef { c.gform.insert(n.g as u64, i); }
+        if c.first_impure == nodes.len and may_call(n) { c.first_impure = i; }
+    }
+    for i in 0..nodes.len {
+        c.cur_form = i;
+        nodes.set(i, c.inl(nodes.at(i), 0));
+    }
     for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { contify(nodes.at(i)); }
     for i in 0..nodes.len { reown(nodes.at(i), top); }
