@@ -3233,8 +3233,17 @@ pub fn fold(e: &TExpr) -> TExpr {
                         And => Some(x & y),
                         Or => Some(x | y),
                         Xor => Some(x ^ y),
-                        Shl if (0..128).contains(&y) => Some(x << y),
-                        Shr if (0..128).contains(&y) => Some(x >> y),
+                        // As at run time: the amount is read as an
+                        // unsigned number of its own type and taken
+                        // modulo the width of the shifted value.
+                        Shl | Shr => match &b.ty {
+                            Ty::Int(bt) => {
+                                let n = wrap_int(y, IntTy { signed: false, bits: bt.bits }) % it.bits as i128;
+                                let x = wrap_int(x, *it);
+                                Some(if *op == Shl { x << n } else { x >> n })
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     };
                     match v {

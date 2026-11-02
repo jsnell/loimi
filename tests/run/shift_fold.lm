@@ -1,0 +1,53 @@
+// Constant-folded shifts (const initializers) take the amount modulo the
+// width, read as an unsigned number of its own type, like run-time
+// shifts. They used to shift by the full amount (1 << 33 as a u32 was 0).
+import std.io;
+
+const A: u32 = 1 << 33;            // 33 mod 32 = 1
+const B: u8 = 0x81 >> 9;           // 9 mod 8 = 1
+const C: i32 = -64 >> 35;          // 35 mod 32 = 3, arithmetic
+const D: i48 = 1 << 50;            // 50 mod 48 = 2
+const E: i32 = 1 << -1;            // -1 as u32 mod 32 = 31
+const F: u64 = 1 << (65 as u8);    // 65 mod 64 = 1
+const G: i64 = 3 << 64;            // 64 mod 64 = 0
+
+fn show(x: i64) { io.print_int(x); io.println(""); }
+
+fn main() {
+    show(A as i64);
+    show(B as i64);
+    show(C as i64);
+    show(D as i64);
+    show(E as i64);
+    show(F as i64);
+    show(G);
+    // The same shifts at run time.
+    var one32: u32 = 1; var s33: u32 = 33;
+    show((one32 << s33) as i64);
+    var b: u8 = 0x81; var s9: u8 = 9;
+    show((b >> s9) as i64);
+    var m: i32 = -64; var s35: i32 = 35;
+    show((m >> s35) as i64);
+    var one48: i48 = 1; var s50: i48 = 50;
+    show((one48 << s50) as i64);
+    var one_i32: i32 = 1; var neg: i32 = -1;
+    show((one_i32 << neg) as i64);
+    var one64: u64 = 1; var s65: u8 = 65;
+    show((one64 << s65) as i64);
+    var three: i64 = 3; var s64: i64 = 64;
+    show(three << s64);
+}
+// expect: 2
+// expect: 64
+// expect: -8
+// expect: 4
+// expect: -2147483648
+// expect: 2
+// expect: 3
+// expect: 2
+// expect: 64
+// expect: -8
+// expect: 4
+// expect: -2147483648
+// expect: 2
+// expect: 3
