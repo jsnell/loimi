@@ -1,7 +1,9 @@
 // The Pike VM: a breadth-first simulation of the same bytecode, in time
 // O(pattern * input). It is ordinary host code: it reads the words with
-// the vm's generated decoders (Rx.opcode, Rx.A_a, Rx.label, ...), since a
-// vm's handlers can only run the backtracking semantics.
+// the vm's generated decoders (Rx.op_of, Rx.A_a, Rx.label, ...), since a
+// vm's handlers can only run the backtracking semantics. Both dispatches
+// are exhaustive matches over `Rx.Op`, so adding an op to the vm is a
+// compile error here until the Pike VM handles it.
 //
 // Threads are kept in priority order, and a thread is added to a list
 // only once per pc per step, which gives the same leftmost-first answer
@@ -79,7 +81,6 @@ fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end:
         let pc = wk.pc as u64;
         let mask = wk.mask;
         let w = code[pc];
-        let op = Rx.opcode(w);
         if mask == 0 {
             if p.seen[pc] == p.gen { continue; }
             p.seen[pc] = p.gen;
@@ -89,52 +90,62 @@ fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end:
             p.seen_masked.insert(key, p.gen);
         }
         let next = Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask };
-        if op == Rx.OP_JMP {
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
-        } else if op == Rx.OP_SPLIT {
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
-            p.work.push(next);
-        } else if op == Rx.OP_SPLITX {
-            p.work.push(next);
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
-        } else if op == Rx.OP_SAVE {
-            let s = Rx.A_a(w);
-            p.work.push(Work { pc: 0, slot: s as u32, val: p.cur[s], mask: 0 });
-            p.cur[s] = sp as i64;
-            p.work.push(next);
-        } else if op == Rx.OP_MARK {
-            let m = Rx.A_a(w);
-            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask | ((1 as u64) << m) });
-        } else if op == Rx.OP_UNMARK {
-            let m = Rx.A_a(w);
-            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask & (((1 as u64) << m) ^ 0xFFFFFFFFFFFFFFFF) });
-        } else if op == Rx.OP_NOPROG {
-            let m = Rx.AJ_a(w);
-            if (mask & ((1 as u64) << m)) != 0 {
+        match Rx.op_of(w) {
+            Rx.Op.JMP => p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask }),
+            Rx.Op.SPLIT => {
                 p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
-            } else {
                 p.work.push(next);
             }
-        } else if op == Rx.OP_LOOP {
-            let m = Rx.AJ_a(w);
-            if (mask & ((1 as u64) << m)) == 0 {
+            Rx.Op.SPLITX => {
+                p.work.push(next);
                 p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
-            } else {
+            }
+            Rx.Op.SAVE => {
+                let s = Rx.A_a(w);
+                p.work.push(Work { pc: 0, slot: s as u32, val: p.cur[s], mask: 0 });
+                p.cur[s] = sp as i64;
                 p.work.push(next);
             }
-        } else if op == Rx.OP_BOL {
-            if sp == 0 { p.work.push(next); }
-        } else if op == Rx.OP_EOL {
-            if sp == end or (sp + 1 == end and input[sp] == '\n') { p.work.push(next); }
-        } else {
-            // CHAR, ANY, CLASS, MATCH: a thread waits here.
-            if mask != 0 {
-                if p.seen[pc] == p.gen { continue; }
-                p.seen[pc] = p.gen;
+            Rx.Op.MARK => {
+                let m = Rx.A_a(w);
+                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask | ((1 as u64) << m) });
             }
-            l.pcs[l.n] = pc as u32;
-            mem.copy(l.caps + l.n * p.nsl, p.cur, p.nsl);
-            l.n += 1;
+            Rx.Op.UNMARK => {
+                let m = Rx.A_a(w);
+                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask & ~((1 as u64) << m) });
+            }
+            Rx.Op.NOPROG => {
+                let m = Rx.AJ_a(w);
+                if (mask & ((1 as u64) << m)) != 0 {
+                    p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
+                } else {
+                    p.work.push(next);
+                }
+            }
+            Rx.Op.LOOP => {
+                let m = Rx.AJ_a(w);
+                if (mask & ((1 as u64) << m)) == 0 {
+                    p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
+                } else {
+                    p.work.push(next);
+                }
+            }
+            Rx.Op.BOL => if sp == 0 { p.work.push(next); },
+            Rx.Op.EOL => if sp == end or (sp + 1 == end and input[sp] == '\n') { p.work.push(next); },
+            // The backtracker's multi-byte instructions are not in Pike
+            // programs, but the fuzzer runs the Pike VM over the
+            // backtracker's code too: there a thread waits at them and
+            // dies (see `run`).
+            Rx.Op.CHAR | Rx.Op.ANY | Rx.Op.CLASS | Rx.Op.MATCH | Rx.Op.LIT | Rx.Op.CSTAR | Rx.Op.CPLUS => {
+                // A thread waits here.
+                if mask != 0 {
+                    if p.seen[pc] == p.gen { continue; }
+                    p.seen[pc] = p.gen;
+                }
+                l.pcs[l.n] = pc as u32;
+                mem.copy(l.caps + l.n * p.nsl, p.cur, p.nsl);
+                l.n += 1;
+            }
         }
     }
 }
@@ -169,18 +180,22 @@ pub fn run(r: *Regex, p: *Pike, input: *u8, end: u64, start: u64, searching: boo
         while i < clist.n {
             let pc = clist.pcs[i] as u64;
             let w = code[pc];
-            let op = Rx.opcode(w);
-            var ok = false;
-            if op == Rx.OP_MATCH {
-                // Threads after this one have lower priority: drop them.
-                mem.copy(r.slots, clist.caps + i * p.nsl, nslots);
-                matched = true;
-                break;
-            } else if sp < end {
-                if op == Rx.OP_CHAR { ok = c as u64 == Rx.A_a(w); }
-                else if op == Rx.OP_ANY { ok = c != '\n'; }
-                else if op == Rx.OP_CLASS { ok = r.classes[Rx.A_a(w)].has(c); }
-            }
+            let more = sp < end;
+            let ok = match Rx.op_of(w) {
+                Rx.Op.MATCH => {
+                    // Threads after this one have lower priority: drop them.
+                    mem.copy(r.slots, clist.caps + i * p.nsl, nslots);
+                    matched = true;
+                    break;
+                }
+                Rx.Op.CHAR => more and c as u64 == Rx.A_a(w),
+                Rx.Op.ANY => more and c != '\n',
+                Rx.Op.CLASS => more and r.classes[Rx.A_a(w)].has(c),
+                Rx.Op.LIT | Rx.Op.CSTAR | Rx.Op.CPLUS => false,
+                // `add` puts only the ops above in the lists.
+                Rx.Op.JMP | Rx.Op.SPLIT | Rx.Op.SPLITX | Rx.Op.SAVE | Rx.Op.MARK | Rx.Op.UNMARK
+                    | Rx.Op.NOPROG | Rx.Op.LOOP | Rx.Op.BOL | Rx.Op.EOL => trap(),
+            };
             if ok {
                 mem.copy(p.cur, clist.caps + i * p.nsl, p.nsl);
                 p.add(code, nlist, pc + 1, input, sp + 1, end, nslots);
