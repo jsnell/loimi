@@ -12,9 +12,43 @@ well with Loimi because every handler is its own symbol.
 
 ## Current results
 
-Commit 87cd496. `--dispatch=tailcall` and `goto` are the same source.
-This run was on a busier machine than earlier ones (PUC-Lua itself ran
-3-5% slower than in the starting-point run).
+Commit fe6c642 (second phase). `--dispatch=tailcall` and `goto` are the
+same source; "(before)" is Mini/-joff at the end of the first phase
+(87cd496). Machine load was low for this run (load average below 2.5 at
+its end); earlier in the phase other agents' builds made runs noisy.
+
+| Benchmark | Mini tailcall | Mini goto | PUC-Lua 5.4 | LuaJIT -joff | LuaJIT | Mini/Lua | Mini/-joff | (before) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| binary_trees | 1.250 | 1.254 | 2.538 | 1.378 | 0.953 | 0.49 | 0.91 | 0.89 |
+| closures | 0.478 | 0.531 | 1.342 | 0.937 | 0.777 | 0.36 | 0.51 | 0.53 |
+| fannkuch | 1.238 | 1.185 | 1.698 | 1.428 | 0.326 | 0.73 | 0.87 | 0.95 |
+| fib | 1.048 | 1.063 | 1.604 | 1.137 | 0.212 | 0.65 | 0.92 | 0.94 |
+| hash_strings | 1.115 | 1.168 | 1.595 | 1.066 | 0.212 | 0.70 | 1.05 | 1.07 |
+| interp | 1.011 | 1.010 | 2.008 | 1.084 | 0.371 | 0.50 | 0.93 | 1.17 |
+| mandelbrot | 0.696 | 0.730 | 1.190 | 0.783 | 0.157 | 0.58 | 0.89 | 1.25 |
+| nbody | 0.451 | 0.521 | 1.155 | 0.524 | 0.090 | 0.39 | 0.86 | 1.13 |
+| oo_methods | 0.774 | 0.836 | 1.354 | 1.008 | 0.186 | 0.57 | 0.77 | 0.79 |
+| queens | 0.944 | 0.959 | 1.236 | 0.964 | 0.476 | 0.76 | 0.98 | 1.04 |
+| sieve | 0.693 | 0.717 | 1.254 | 0.795 | 0.227 | 0.55 | 0.87 | 0.94 |
+| sort | 0.809 | 0.816 | 1.080 | 0.834 | 0.311 | 0.75 | 0.97 | 1.07 |
+| spectral_norm | 1.228 | 1.328 | 1.683 | 1.133 | 0.072 | 0.73 | 1.08 | 1.45 |
+| string_build | 0.788 | 0.792 | 1.740 | 0.748 | 0.385 | 0.45 | 1.05 | 1.06 |
+
+Mini is faster than PUC-Lua on all 14 benchmarks (0.36-0.76 of its
+time) and faster than LuaJIT's assembly interpreter on 11 of them. The
+three above it are within 8%: spectral_norm (1.08; was 1.45),
+hash_strings and string_build (1.05; string hashing and interning, not
+interpreter dispatch).
+
+Float arithmetic is now 16 instructions per op in the hot path (ADD_F:
+decode 6, two FP loads, `addsd`, `ucomisd; jp`, store, dispatch 4),
+against ~10-12 for LuaJIT's ADDVV and 23 before.
+
+`goto` is slower than `tailcall` on most benchmarks in this run
+(closures, nbody, spectral_norm, oo_methods by 7-15%), faster only on
+fannkuch. `tailcall` stays the default.
+
+### Previous results (end of the first phase, commit 87cd496)
 
 | Benchmark | Mini tailcall | Mini goto | PUC-Lua 5.4 | LuaJIT -joff | LuaJIT | Mini/Lua | Mini/-joff |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -155,3 +189,135 @@ Before → after, Mini tailcall, seconds.
 18. **Field IC misses in cold blocks** (87cd496). Removes a stack frame
     from every GETFIELD hit (LLVM did not shrink-wrap the miss call).
     Within noise.
+
+### Second phase
+
+Measured with interleaved A/B runs (`ab.py`: each binary alternately,
+minimum of 5-11 runs). The machine was shared with other agents' builds
+for much of this phase, so effects under about 5% are reported as
+measured but not claimed.
+
+19. **Float fast paths test the result, not the operands** (ae91268,
+    96257bf). A tagged word is a NaN as a double, so the float-first
+    members add the raw words as doubles and keep the result if it is
+    not NaN; otherwise they fall back to the typed match. Operands load
+    straight into FP registers (`*((regs + a.raw) as *f64)`), and the
+    result is stored as bits. ADD_F's hot path went from 23 to 16
+    instructions. mandelbrot 0.91 → 0.79 (-14%), nbody -4..-8%.
+    The same trick for compare-and-branch (`x < y` or `x >= y` holding
+    means both are numbers) and for DIV was within noise.
+20. **Exact mixed int/float members** (3fe4638). A site that first sees
+    (Int, Num) or (Num, Int) becomes ADD_IF / ADD_FI (and SUB, MUL, and
+    the K forms): one tag test on the integer, `cvtsi2sd`, the operation
+    and the NaN test on the result. Anything else turns the site into the
+    complete float-first member. spectral_norm 1.59 → 1.43 (-10%).
+21. **RSUBK and RDIVK** (56578ee): `k - x` and `k / x` with a constant
+    left operand, so `1.0 / x` needs no LOADK. spectral_norm 1.43 → 1.35.
+22. **Polarity in the opcode; supers again** (e6bd5f5). JLT/JLTN etc.
+    replace the polarity operand (saving a setcc and compare per branch).
+    Twelve supers from `--vm-stats` pair counts summed over all
+    benchmarks. interp 1.19 → 1.04 (-12%), sort -6%, fannkuch -4%,
+    fib -3%. Supers alone (before the polarity split): interp -7%, sort
+    -3%, others within noise.
+23. **Counted integer for loops** (3c41239), as in Lua 5.4: FORPREP
+    replaces the limit with the iteration count, so FORLOOP has no
+    overflow check and no step-sign test. sieve -9%, queens -6%,
+    spectral_norm -4%, mandelbrot -4%.
+24. **Ints compared and indexed on their words** (2558ac8). `(a ^ B)`
+    with B the Int tag word with the payload's sign bit set is below
+    2^48 exactly for Ints and orders them as unsigned numbers, so the
+    tag test and the compare share the xors; an array index is the key's
+    word minus Int(1)'s word. These need no payload extraction, which is
+    what made them matter for i48 (below). With i32: -2..-4% on
+    fannkuch, sort, fib, queens (near noise).
+25. **Fusing after quickening** (cffb314). `Mini.optimize` ran only at
+    compile time, when arithmetic is generic, so supers of float members
+    never formed. Each quickening transition of an arithmetic site now
+    re-runs it on the function (bounded: a site changes at most twice).
+    With supers for the frequent float pairs: mandelbrot -6%, nbody -5%.
+26. **`#[forward]` supers** (compiler, 9ac1748). A later part's operand
+    that may name the register the previous part wrote is compiled a
+    second time with its field replaced by the earlier one under an
+    equality test, and LLVM forwards the stored value. Applied to every
+    super it cost interp +8% and fib +4% (an extra compare and branch
+    in throughput-bound code), so it is opt-in. On ADDI_ADDI it gives
+    spectral_norm -5..-10% (its A(i, j) is a latency chain of
+    store-to-load round trips feeding a divide).
+
+27. **Verify clauses for register counts** (fe6c642; from the
+    fuzzer). CALL's argument and result counts, SETLIST's, RETN's and
+    CONCAT's counts, GETINDEXI's index and SELF's base got operand kinds
+    whose `verify` clauses check the covered range against the frame.
+    The kinds decode to the plain field, so the handlers' machine code
+    is unchanged. 10 minutes of minifuzz under ASan afterwards: 2.0M
+    programs (421k verified and ran), no failures.
+
+Tried and dropped:
+
+- **Lazy register clearing** (CALL clears only missing parameters;
+  `scan_roots` clears stale slots between the top frame and a
+  high-water mark). Twice measured: fib -5%, closures -3%,
+  binary_trees +3%, spectral_norm +1%. Not worth the GC subtlety.
+- **Float-first compares** (again) and DIV with direct FP loads: within
+  noise.
+- **Forwarding on all supers**: see 26.
+- **Fixed four-slot register clearing in CALL** and **GETINDEX's
+  generic path in a cold block** (removes the hot path's stack frame):
+  both within noise in the noisy part of the phase; not committed.
+- **Supers only spectral_norm uses** (MUL;MULK_IF, ADD_FI;RDIVK, ...):
+  no measurable effect, removed.
+
+## Int(i48): measured, not adopted
+
+Mini keeps 32-bit integers (SPEC §2.1). Switching the payload to `i48`
+(every `as i32` on Int payloads, range checks, NEG's minimum, FORPREP's
+clamp, the lexer's integer range) passes all conformance tests; the
+only expectation changes would be the i32 overflow-to-float lines in
+basics.mini and lib_math.mini (where Lua then agrees). Cost against the
+i32 build at the same commit, interleaved runs:
+
+| | plain i48 | i48 + word tricks (24) + i64 `%` |
+|---|---:|---:|
+| closures | +8% | +9% |
+| spectral_norm | +6..7% | +4% |
+| queens | +4..5% | +3% |
+| sieve | +3..7% | +2% |
+| interp | +5..6% | +1% |
+| fib | +2..6% | ±1% |
+| others | ±3% | ±1% |
+
+Where the cost comes from (x86-64, nanbox with the Int tag above bit 48):
+
+- Overflow-checked `+ - *` shift both operands to the top of the word,
+  add, `jo`, shift back and re-tag: 6 instructions where i32 needs 4
+  (`addl; jo; movl; or`). This is inherent in a 48-bit payload; it is
+  why LuaJIT's dual-number mode uses int32.
+- int→float conversion must sign-extend the payload first (`shl; sar;
+  cvtsi2sd`): +2 on every mixed operation (spectral_norm's A(i, j) has
+  two per call).
+- `x % y` on i48 is guarded for MIN % -1 in a way LLVM cannot fold even
+  after `y > 0` is tested (the test is on the shifted payload). Doing
+  it in i64 fixes that (+4 instead of +12 instructions in MODK) but
+  costs the sign extensions.
+- Wrapping adds (FORLOOP's index) need an extra mask (`and`).
+
+Compares and array indexing cost nothing extra once done on words
+(item 24). Because the remaining costs are per arithmetic instruction,
+and two benchmarks stay above 4%, the switch was not made.
+
+## Remaining compiler and codegen issues
+
+- Supers of quickened members only form if something re-runs
+  `Vm.optimize` after `become` (Mini now does it by hand). `become`
+  could look up the super for the new neighbour pair itself.
+- `x % y` on `iN` wider than 32 bits keeps the MIN % -1 guard even when
+  `y > 0` was tested on the same value (the test is on the shifted
+  payload, the guard on the extended one).
+- Hot handlers that make a plain call on some path (GETINDEX's
+  `table_get`, SETINDEX's `table_set`, CALL's clearing loop) get a
+  stack frame (`push %rbp`) on every path; only `cold` keeps it off.
+- `cvtsi2sd` into a register with a stale upper half (no `xorps`
+  break): a false dependency in the mixed int/float members.
+- No way to say "this pointer is dereferenceable", so loads cannot be
+  hoisted or speculated; and verify clauses that relate two operands
+  have to decode the word themselves (`Mini.ABC_a(*pc)`).
