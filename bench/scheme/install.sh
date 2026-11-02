@@ -4,11 +4,11 @@
 #
 # Result, all gitignored: sources and logs in bench/scheme/src/, binaries
 # and libraries in bench/scheme/install/:
-#   bin/chibi-scheme  chibi-scheme, stock makefile (-O2 by default;
+#   bin/chibi-scheme  chibi-scheme, stock makefile (-O3 by default;
 #                     computed-goto dispatch is on by default)
-#   bin/gosh          Gauche, release tarball, stock configure (-O2) minus
+#   bin/gosh          Gauche and SLIB, release tarballs, stock configure (-O2) minus
 #                     optional extensions the benchmarks don't use
-#   bin/guile         Guile 3 with its JIT, release tarball, on bdwgc and
+#   bin/guile         Guile 3 with its JIT, release tarball (-O2 -flto), on bdwgc and
 #                     libunistring built here (GMP and libffi from the system)
 # Tarballs are verified against the sha256 in MANIFEST before extraction.
 # Builds use make -j${JOBS:-2}.
