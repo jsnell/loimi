@@ -1,6 +1,7 @@
 # Design note: closures and static traits
 
-Status: section 0 implemented; sections 1 and 2 are proposals. Written 2026-11-02.
+Status: section 0 implemented; section 2 implemented in the reduced
+scope of "Step 1 scope" below; section 1 is a proposal. Written 2026-11-02.
 
 Loimi has generics (monomorphized, with methods resolved per instance) and
 plain function pointers (`fn(A) -> R`). It has no closures and no traits.
@@ -245,7 +246,7 @@ Parser: `trait`, `impl .. for ..;`, bounds in generic parameter lists.
 Checker: a trait table, an impl table, bound checks in the instantiation
 paths, defaults. No codegen changes.
 
-## Step 1 scope (being implemented)
+## Step 1 scope (implemented)
 
 Section 0 does not change this design: trait method signatures carry
 effects like any function type, an impl's method may have fewer, and

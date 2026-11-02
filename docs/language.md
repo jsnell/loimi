@@ -89,6 +89,31 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `(x as T) < y`.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
+- **Traits** state what a generic parameter needs:
+
+  ```loimi
+  pub trait Hash {
+      fn hash(k: Self) -> u64;
+      fn eq(a: Self, b: Self) -> bool;
+  }
+  impl Hash for Sym;          // checks that fn Sym.hash and fn Sym.eq exist
+  pub struct HashMap<K: hash.Hash, V> { .. }
+  fn show_all<T: Show + Hash>(xs: []T) { .. }
+  ```
+
+  A trait lists method signatures over `Self`. `impl Trait for Type;`
+  contains no code: it asserts that the ordinary methods `fn Type.name`
+  exist with the trait's signatures (with `Self` replaced by `Type`) and
+  no more effects than the trait declares. Bounds `T: A + B` on the type
+  parameters of structs, enums, functions and methods are checked when
+  an instance with concrete types is created, and a missing impl is
+  reported there: "`Key` does not implement `Hash` (needed by
+  `HashMap<Key, i64>`)". Inside a generic body, method calls still
+  resolve per instance, so the bound documents and checks the requirement
+  but does not change the call, which stays direct. Not yet supported:
+  default methods, generic traits and trait methods, impls for instances
+  of generic types (`impl Hash for Vec<T>`), and checking a generic body
+  against its bounds.
   Type arguments are inferred from arguments and the expected type, or given
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,

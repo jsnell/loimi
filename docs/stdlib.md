@@ -51,6 +51,11 @@ Guest-semantics helpers that are easy to get subtly wrong:
   plus a hash part, with array-part migration. Keys are `Value`s through a
   user-supplied hash/eq interface, so it works with any `value` type.
 
+**As implemented**: `std.map.HashMap<K: hash.Hash, V>` (linear probing).
+`std.hash.Hash` is a trait (`hash(k: Self) -> u64`, `eq(a: Self, b: Self)
+-> bool`) implemented for `u64`, `i64`, `u32`, `i32` and `str`; a key type
+defines both methods and declares `impl hash.Hash for Key;`.
+
 ## `std.text`
 
 - `str` (UTF-8 slice), `String` (host-owned), and `Gc<Str>`: a GC string
