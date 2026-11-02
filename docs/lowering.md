@@ -524,6 +524,10 @@ The place is inside an object when it is a field reached through a `Gc`
 (`o.f`, also `o.pair.a` and `o.arr[i]` through value-type fields), an
 element of a trailing array (`o.items[i]`), or unchecked indexing of a
 trailing array's pointer (`o.items.ptr[i]`, recognized syntactically).
+A call that takes the address of such a place of a traced type as an
+argument (`o.pair.set(x)`, which auto-refs `&o.pair`, or `f(&o.pair)`)
+is followed by the barrier on the object, since the callee may store
+through it.
 Other stores through raw pointers get no barrier: the code that makes
 them calls `gc.write_barrier(h, obj)` (see
 [`stdlib/gc.md`](stdlib/gc.md#as-implemented)). Initializing a new

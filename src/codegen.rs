@@ -1771,7 +1771,19 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if let Some(env) = env {
             avs.push(format!("ptr {}", env));
         }
+        // Objects whose traced places are passed by address (`o.pair.set(x)`
+        // auto-refs `&o.pair`): the callee may store references there, so
+        // they get the write barrier after the call.
+        let mut barriers = Vec::new();
         for a in args {
+            if let TK::AddrOf(inner) = &a.kind {
+                if crate::gcgen::needs_barrier(self, inner) {
+                    let (addr, obj) = crate::gcgen::object_place(self, inner);
+                    barriers.push(obj);
+                    avs.push(format!("ptr {}", addr));
+                    continue;
+                }
+            }
             let v = self.val(a);
             if let Ty::Block(..) = a.ty {
                 let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
@@ -1798,6 +1810,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.inst(&call)
         };
         crate::gcgen::pop_frame(self, pre);
+        for obj in barriers {
+            self.emit(format!("call void @\"std.gc.barrier\"(ptr {})", obj));
+        }
         if e.ty == Ty::Never {
             self.term("unreachable");
         }

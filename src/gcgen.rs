@@ -416,7 +416,7 @@ pub fn needs_barrier(g: &mut FnGen, lhs: &TExpr) -> bool {
 
 /// The address of the place `e` (for which `in_object` holds) and of the
 /// object that contains it.
-fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
+pub fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
     match &e.kind {
         TK::Deref(x) => {
             let v = g.val(x);
