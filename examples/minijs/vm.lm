@@ -47,6 +47,22 @@ fn arith(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
     Ok(value.number(r))
 }
 
+/// ADD/SUB/MUL outside their fast paths: Int overflow, then `arith`.
+fn arith_cold(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
+    if let (Int(x), Int(y)) = (a, b) {
+        let (fx, fy) = (x as f64, y as f64);
+        return Ok(V.Num(if op == 0 { fx + fy } else if op == 1 { fx - fy } else { fx * fy }));
+    }
+    arith(c, op, a, b)
+}
+
+/// Fuse superinstructions in a function again after one of its sites was
+/// quickened (fusion compares words by the op they stand for, so supers
+/// of specialized members form too).
+fn refuse(cl: Gc<Fn>) {
+    JS.optimize(cl.proto.code);
+}
+
 fn js_pow(x: f64, y: f64) -> f64 {
     // pow(1, NaN) and pow(-1, ±Infinity) are 1 in C but NaN in JS.
     if y != y { return 0.0 / 0.0; }
@@ -644,38 +660,72 @@ pub vm JS {
         }
     }
 
-    // Arithmetic.
-    inline for (name, checked, sym, code) in [
-        ("ADD", "add_checked", +, 0),
-        ("SUB", "sub_checked", -, 1),
+    // Arithmetic: ADD, SUB and MUL are families. The generic member tests
+    // (Int, Int) first; the first time a site sees two floats it becomes
+    // the _F member, which adds the raw words as doubles (a tagged word is
+    // a NaN as a double, so a result that is not a NaN means both
+    // operands were numbers). A site that first sees an Int and a Num
+    // becomes _IF or _FI, which only handle that case inline and make
+    // the site float-first otherwise. Members handle every type, so a
+    // site never switches back.
+    inline for (name, fname, ifname, finame, checked, sym, code) in [
+        ("ADD", "ADD_F", "ADD_IF", "ADD_FI", "add_checked", +, 0),
+        ("SUB", "SUB_F", "SUB_IF", "SUB_FI", "sub_checked", -, 1),
+        ("MUL", "MUL_F", "MUL_IF", "MUL_FI", "mul_checked", *, 2),
     ] {
-        op #name(dst: reg, a: reg, b: reg) : ABC {
-            match (a, b) {
-                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
-                (Num(x), Num(y)) => { dst = Num(x sym y); next }
-                (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
-                (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
-                _ => {}
+        family #name(dst: reg, a: reg, b: reg) : ABC {
+            generic {
+                if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) {
+                    dst = Int(r);
+                    next
+                }
+                cold {
+                    match (a, b) {
+                        (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; refuse(fp.cl); next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; refuse(fp.cl); next }
+                        _ => {}
+                    }
+                    if code == 0 and ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    dst = arith_cold(ctx, code, a, b)?;
+                    next
+                }
             }
-            cold {
-                if let (Int(x), Int(y)) = (a, b) { dst = Num(x as f64 sym y as f64); next }
-                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                dst = arith(ctx, code, a, b)?;
-                next
+            #fname {
+                let r = unsafe { *((regs + a.raw) as *f64) } sym unsafe { *((regs + b.raw) as *f64) };
+                if likely(r == r) { dst = r.to_bits() as V; next }
+                cold {
+                    match (a, b) {
+                        (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
+                        (Int(x), Int(y)) => if let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) { dst = Int(r); next },
+                        _ => {}
+                    }
+                    if code == 0 and ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    dst = arith_cold(ctx, code, a, b)?;
+                    next
+                }
+            }
+            #ifname {
+                if let Int(x) = a {
+                    let r = x as f64 sym unsafe { *((regs + b.raw) as *f64) };
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; refuse(fp.cl); redo }
+            }
+            #finame {
+                if let Int(y) = b {
+                    let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; refuse(fp.cl); redo }
             }
         }
-    }
-    op MUL(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) and (r != 0 or (x | y) >= 0) { dst = Int(r); next },
-            (Num(x), Num(y)) => { dst = Num(x * y); next }
-            (Int(x), Num(y)) => { dst = Num(x as f64 * y); next }
-            (Num(x), Int(y)) => { dst = Num(x * y as f64); next }
-            _ => {}
-        }
-        cold { dst = arith(ctx, 2, a, b)?; next }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
+        let r = unsafe { *((regs + a.raw) as *f64) } / unsafe { *((regs + b.raw) as *f64) };
+        if likely(r == r) { dst = r.to_bits() as V; next }
         match (a, b) {
             (Int(x), Int(y)) => {
                 // Integral quotients stay Int (no -0: a zero quotient of
@@ -688,15 +738,29 @@ pub vm JS {
                 dst = Num(r);
                 next
             }
-            (Num(x), Num(y)) => { dst = Num(x / y); next }
             (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
             (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
             _ => {}
         }
         cold { dst = arith(ctx, 3, a, b)?; next }
     }
+    /// `%` with a positive Int divisor is exact in integers when the
+    /// dividend is integral (an Int, or a Num below 2^53).
     op MOD(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) and y > 0 and x >= 0 { dst = Int(x % y); next }
+        if let Int(y) = b and y > 0 {
+            if let Int(x) = a and x >= 0 { dst = Int(x % y); next }
+            var xi: i64 = 0;
+            var ok = false;
+            if let Int(x) = a { xi = x as i64; ok = true; }
+            if let Num(x) = a and x >= -9007199254740992.0 and x <= 9007199254740992.0 {
+                xi = x as i64;
+                ok = xi as f64 == x;
+            }
+            if ok {
+                let r = xi % (y as i64);
+                if r != 0 or xi > 0 { dst = Int(r as i32); next }
+            }
+        }
         if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
         cold { dst = arith(ctx, 4, a, b)?; next }
     }
