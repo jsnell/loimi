@@ -1,0 +1,302 @@
+// std.parse.Parser: the Pratt driver with its hooks as trait methods of the
+// parser state (`impl parse.Hooks<T, str, lex.Error> for Sx;`). The same
+// grammar as std_parse.lm: Lua's operators, plus `led` operators for a
+// ternary `c ? a : b`, assignment `x = e` and a postfix factorial `n!`,
+// dispatched by kind in one `led` method. `before_rhs` keeps its default
+// in `Ev` and counts calls in `Sx`.
+
+import std.io;
+import std.diag;
+import std.lex;
+import std.mem;
+import std.num;
+import std.parse;
+import std.text;
+
+enum T { Eof, Num, Name, Plus, Minus, Star, Slash, Caret, Concat, Eq, Lt, And, Or, Not, LParen, RParen, Question, Colon, Bang, Assign }
+
+/// Tokens: shared by both parser states.
+struct Lexer {
+    cur: lex.Cursor,
+    ops: lex.OpTable<T>,
+    kws: lex.Keywords<T>,
+    kind: T,
+    start: u64,
+    value: f64,
+}
+
+fn Lexer.new(src: str, file: u32) -> Lexer {
+    var l = Lexer { cur: lex.Cursor.new(src, file, lex.lua()), ops: lex.OpTable.new(), kws: lex.Keywords.new(), kind: T.Eof, start: 0, value: 0.0 };
+    let ops = ["+", "-", "*", "/", "^", "..", "==", "<", "(", ")", "?", ":", "!", "="];
+    let kinds = [T.Plus, T.Minus, T.Star, T.Slash, T.Caret, T.Concat, T.Eq, T.Lt, T.LParen, T.RParen, T.Question, T.Colon, T.Bang, T.Assign];
+    for i in 0..ops.len { l.ops.add(ops[i], kinds[i]); }
+    l.kws.add("and", T.And);
+    l.kws.add("or", T.Or);
+    l.kws.add("not", T.Not);
+    l
+}
+
+fn Lexer.next(l: *Lexer) -> Result<(), lex.Error> {
+    l.cur.skip_trivia()?;
+    l.start = l.cur.pos;
+    if l.cur.at_end() { l.kind = T.Eof; return Ok(()); }
+    if let Some(name) = l.cur.ident() { l.kind = l.kws.get(name) ?? T.Name; return Ok(()); }
+    if l.cur.at_number() {
+        l.kind = T.Num;
+        l.value = match l.cur.number()? { Int(i) => i as f64, Float(f) => f };
+        return Ok(());
+    }
+    if let Some(k) = l.ops.eat(&l.cur) { l.kind = k; return Ok(()); }
+    Err(l.cur.error_here("unexpected character"))
+}
+
+fn Lexer.error(l: *Lexer, msg: str) -> lex.Error {
+    var hi = l.cur.pos;
+    if hi == l.start { hi += 1; }
+    lex.Error { span: diag.span(l.cur.file, l.start, hi), msg: msg }
+}
+
+fn Lexer.text(l: *Lexer) -> str { l.cur.src[l.start..l.cur.pos] }
+
+fn operators<P: parse.Hooks<T, E, lex.Error>, E>(pr: *parse.Parser<P, T, E, lex.Error>) {
+    pr.infix_left(T.Or, 1);
+    pr.infix_left(T.And, 2);
+    pr.infix_left(T.Eq, 3);
+    pr.infix_left(T.Lt, 3);
+    pr.infix_right(T.Concat, 5);
+    pr.infix_left(T.Plus, 6);
+    pr.infix_left(T.Minus, 6);
+    pr.infix_left(T.Star, 7);
+    pr.infix_left(T.Slash, 7);
+    pr.prefix(T.Minus, 8);
+    pr.prefix(T.Not, 8);
+    pr.infix_right(T.Caret, 10);
+    pr.led(T.Assign, 1, 0);
+    pr.led(T.Question, 1, 0);
+    pr.led(T.Bang, 11, 0);
+}
+
+fn op_text(k: T) -> str {
+    match k {
+        Plus => "+", Minus => "-", Star => "*", Slash => "/", Caret => "^", Concat => "..",
+        Eq => "==", Lt => "<", And => "and", Or => "or", Not => "not", Bang => "!", Assign => "=", _ => "?",
+    }
+}
+
+// ── S-expressions ───────────────────────────────────────────────────────
+
+struct Sx {
+    lx: Lexer,
+    arena: mem.Arena,
+    hooks: i64,
+    pr: *parse.Parser<Sx, T, str, lex.Error>,
+}
+
+fn Sx.peek(p: *Sx) -> T { p.lx.kind }
+fn Sx.advance(p: *Sx) -> Result<(), lex.Error> { p.lx.next() }
+
+fn Sx.atom(p: *Sx) -> Result<str, lex.Error> {
+    if p.lx.kind == T.LParen {
+        p.advance()?;
+        let e = p.pr.expr(p)?;
+        if p.lx.kind != T.RParen { return Err(p.lx.error("expected ')'")); }
+        p.advance()?;
+        return Ok(e);
+    }
+    if p.lx.kind != T.Num and p.lx.kind != T.Name { return Err(p.lx.error("expected an expression")); }
+    let s = p.arena.str(p.lx.text());
+    p.advance()?;
+    Ok(s)
+}
+
+fn Sx.list(p: *Sx, parts: []str) -> str {
+    var b = text.StrBuf.new();
+    b.push('(');
+    for i in 0..parts.len {
+        if i > 0 { b.push(' '); }
+        b.push_str(parts[i]);
+    }
+    b.push(')');
+    let s = p.arena.str(b.as_str());
+    b.free();
+    s
+}
+
+fn Sx.unary(p: *Sx, op: T, e: str) -> Result<str, lex.Error> {
+    var parts = [op_text(op), e];
+    Ok(p.list(parts[..]))
+}
+
+fn Sx.binary(p: *Sx, op: T, l: str, r: str) -> Result<str, lex.Error> {
+    var parts = [op_text(op), l, r];
+    Ok(p.list(parts[..]))
+}
+
+fn Sx.before_rhs(p: *Sx, op: T, l: str) -> Result<str, lex.Error> {
+    p.hooks += 1;
+    Ok(l)
+}
+
+fn Sx.led(p: *Sx, op: T, l: str) -> Result<str, lex.Error> {
+    match op {
+        Question => {
+            let r = p.pr.infix_of(T.Question).right;
+            let a = p.pr.parse(p, r)?;
+            if p.lx.kind != T.Colon { return Err(p.lx.error("expected ':'")); }
+            p.advance()?;
+            let b = p.pr.parse(p, r)?;
+            var parts = ["?", l, a, b];
+            Ok(p.list(parts[..]))
+        }
+        Assign => {
+            if l.len == 0 or l[0] == '(' or lex.is_digit(l[0]) { return Err(p.lx.error("cannot assign to this")); }
+            let r = p.pr.parse(p, p.pr.infix_of(op).right)?;
+            p.binary(op, l, r)
+        }
+        _ => p.unary(op, l),
+    }
+}
+
+impl parse.Hooks<T, str, lex.Error> for Sx;
+
+fn show(sm: *diag.SourceMap, src: str) {
+    let f = sm.add("expr", src);
+    var pr: parse.Parser<Sx, T, str, lex.Error> = parse.Parser.new();
+    operators(&pr);
+    var p = Sx { lx: Lexer.new(src, f), arena: mem.Arena.new(), hooks: 0, pr: &pr };
+    let r: Result<str, lex.Error> = match p.advance() {
+        Ok(_) => match pr.expr(&p) {
+            Ok(e) => if p.lx.kind == T.Eof { Ok(e) } else { Err(p.lx.error("unexpected token after expression")) },
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(e) => { io.print(e); io.print(" hooks: "); io.print_int(p.hooks); io.println(""); }
+        Err(e) => {
+            var d = e.diag();
+            var out = text.StrBuf.new();
+            sm.render(&d, &out);
+            io.print(out.as_str());
+            out.free();
+        }
+    }
+    p.arena.free();
+    pr.free();
+}
+
+// ── evaluation: `before_rhs` keeps its default ─────────────────────────
+
+struct Ev { lx: Lexer, pr: *parse.Parser<Ev, T, f64, lex.Error> }
+
+fn Ev.peek(p: *Ev) -> T { p.lx.kind }
+fn Ev.advance(p: *Ev) -> Result<(), lex.Error> { p.lx.next() }
+
+fn Ev.atom(p: *Ev) -> Result<f64, lex.Error> {
+    if p.lx.kind == T.LParen {
+        p.advance()?;
+        let e = p.pr.expr(p)?;
+        if p.lx.kind != T.RParen { return Err(p.lx.error("expected ')'")); }
+        p.advance()?;
+        return Ok(e);
+    }
+    if p.lx.kind != T.Num { return Err(p.lx.error("expected a number")); }
+    let v = p.lx.value;
+    p.advance()?;
+    Ok(v)
+}
+
+fn Ev.unary(p: *Ev, op: T, x: f64) -> Result<f64, lex.Error> {
+    Ok(if op == T.Minus { 0.0 - x } else { if x == 0.0 { 1.0 } else { 0.0 } })
+}
+
+fn Ev.binary(p: *Ev, op: T, a: f64, b: f64) -> Result<f64, lex.Error> {
+    Ok(match op {
+        Plus => a + b,
+        Minus => a - b,
+        Star => a * b,
+        Slash => a / b,
+        Lt => if a < b { 1.0 } else { 0.0 },
+        Eq => if a == b { 1.0 } else { 0.0 },
+        _ => return Err(p.lx.error("operator not supported by the evaluator")),
+    })
+}
+
+fn Ev.led(p: *Ev, op: T, c: f64) -> Result<f64, lex.Error> {
+    match op {
+        Question => {
+            let r = p.pr.infix_of(T.Question).right;
+            let a = p.pr.parse(p, r)?;
+            if p.lx.kind != T.Colon { return Err(p.lx.error("expected ':'")); }
+            p.advance()?;
+            let b = p.pr.parse(p, r)?;
+            Ok(if c != 0.0 { a } else { b })
+        }
+        Bang => {
+            var r = 1.0;
+            var i = 2.0;
+            while i <= c { r = r * i; i += 1.0; }
+            Ok(r)
+        }
+        _ => Err(p.lx.error("cannot assign to a number")),
+    }
+}
+
+impl parse.Hooks<T, f64, lex.Error> for Ev;
+
+fn eval(src: str) {
+    var pr: parse.Parser<Ev, T, f64, lex.Error> = parse.Parser.new();
+    operators(&pr);
+    var p = Ev { lx: Lexer.new(src, 0), pr: &pr };
+    var b = text.StrBuf.new();
+    b.push_str(src);
+    b.push_str(" = ");
+    match p.advance() {
+        Ok(_) => match pr.expr(&p) {
+            Ok(v) => num.write_shortest(&b, v),
+            Err(e) => b.push_str(e.msg),
+        },
+        Err(e) => b.push_str(e.msg),
+    }
+    io.println(b.as_str());
+    b.free();
+    pr.free();
+}
+
+fn main() {
+    var sm = diag.SourceMap.new();
+    show(&sm, "1 + 2 * 3");
+    show(&sm, "1 - 2 - 3");
+    show(&sm, "-x ^ 2");
+    show(&sm, "a .. b .. c + 1");
+    show(&sm, "not a == b or c < d and e");
+    show(&sm, "1 +");
+    show(&sm, "a or b ? c + 1 : d ? e : f");
+    show(&sm, "x = y = a < b ? 1 : 2");
+    show(&sm, "-n! ^ 2 + 3!");
+    show(&sm, "a + b = c");
+    eval("1 + 2 * 3 - 4 / 8");
+    eval("-(2 + 3) * 2 < 0");
+    eval("3! + (1 < 2 ? 10 : 20) * 2");
+    eval("1 = 2");
+}
+// expect: (+ 1 (* 2 3)) hooks: 2
+// expect: (- (- 1 2) 3) hooks: 2
+// expect: (- (^ x 2)) hooks: 1
+// expect: (.. a (.. b (+ c 1))) hooks: 3
+// expect: (or (== (not a) b) (and (< c d) e)) hooks: 4
+// expect: error: expected an expression
+// expect:   --> expr:1:4
+// expect:     1 | 1 +
+// expect:       |    ^
+// expect: (? (or a b) (+ c 1) (? d e f)) hooks: 2
+// expect: (= x (= y (? (< a b) 1 2))) hooks: 1
+// expect: (+ (- (^ (! n) 2)) (! 3)) hooks: 2
+// expect: error: cannot assign to this
+// expect:   --> expr:1:9
+// expect:     1 | a + b = c
+// expect:       |         ^
+// expect: 1 + 2 * 3 - 4 / 8 = 6.5
+// expect: -(2 + 3) * 2 < 0 = 1
+// expect: 3! + (1 < 2 ? 10 : 20) * 2 = 26
+// expect: 1 = 2 = cannot assign to a number

@@ -1,6 +1,11 @@
 // Parsing helpers: a Pratt (precedence-climbing) expression parser driven
-// by a table of binding powers, calling back into the user's parser
-// through function pointers.
+// by a table of binding powers, in two forms:
+//   - `Parser<P, K, E, X>`: the hooks are methods of the user's parser
+//     state `P`, which implements the trait `Hooks<K, E, X>`. Calls are
+//     direct (and inlinable), and `before_rhs` and `led` have defaults.
+//   - `Pratt<P, K, E, X>`: the hooks are function pointers stored in the
+//     table, each taking a `*P`.
+// Both share the binding-power rules below.
 //
 // Type parameters, used throughout:
 //   P  the user's parser state (the hooks receive a `*P`)
@@ -171,4 +176,121 @@ pub fn Pratt<P, K, E, X>.free(pr: *Pratt<P, K, E, X>) {
     pr.infix_bp.free();
     pr.prefix_bp.free();
     pr.leds.free();
+}
+
+// ── Parser: the hooks as a trait ────────────────────────────────────────
+
+/// The hooks of a parser state for `Parser<Self, K, E, X>`: the same
+/// roles as `Pratt`'s function pointers, as methods of the state.
+pub trait Hooks<K, E, X> {
+    /// The kind of the current token.
+    fn peek(p: *Self) -> K;
+    /// Consume the current token.
+    fn advance(p: *Self) -> Result<(), X>;
+    /// An operand that does not start with a prefix operator.
+    fn atom(p: *Self) -> Result<E, X>;
+    /// Combine a prefix operator (already consumed) with its operand.
+    fn unary(p: *Self, op: K, operand: E) -> Result<E, X>;
+    /// Combine `lhs op rhs`.
+    fn binary(p: *Self, op: K, lhs: E, rhs: E) -> Result<E, X>;
+    /// After an infix operator is consumed, before its right operand is
+    /// parsed; returns the left operand to use. By default, unchanged.
+    fn before_rhs(p: *Self, op: K, lhs: E) -> Result<E, X> { Ok(lhs) }
+    /// A custom infix operator made with `Parser.led` (consumed): parse
+    /// the rest and return the combined expression. Only called for kinds
+    /// registered with `led`; the default traps.
+    fn led(p: *Self, op: K, lhs: E) -> Result<E, X> { trap() }
+}
+
+/// An operator table for a parser state `P` with hooks `Hooks<K, E, X>`.
+pub struct Parser<P: Hooks<K, E, X>, K, E, X> {
+    infix_bp: mem.Vec<Prec>,
+    prefix_bp: mem.Vec<u32>,
+    /// Kinds whose infix form is a `led` hook.
+    is_led: mem.Vec<bool>,
+}
+
+pub fn Parser<P, K, E, X>.new() -> Parser<P, K, E, X> {
+    Parser { infix_bp: mem.Vec.new(), prefix_bp: mem.Vec.new(), is_led: mem.Vec.new() }
+}
+
+/// Make `kind` an infix operator with the given binding powers.
+pub fn Parser<P, K, E, X>.infix(pr: *Parser<P, K, E, X>, kind: K, left: u32, right: u32) {
+    let i = kind as u64;
+    while pr.infix_bp.len <= i { pr.infix_bp.push(Prec { left: 0, right: 0 }); }
+    pr.infix_bp.set(i, Prec { left: left, right: right });
+}
+
+/// A left-associative infix operator.
+pub fn Parser<P, K, E, X>.infix_left(pr: *Parser<P, K, E, X>, kind: K, bp: u32) { pr.infix(kind, bp, bp); }
+
+/// A right-associative infix operator (bp >= 2).
+pub fn Parser<P, K, E, X>.infix_right(pr: *Parser<P, K, E, X>, kind: K, bp: u32) { pr.infix(kind, bp, bp - 1); }
+
+/// Make `kind` a custom infix operator with left power `left`: when it
+/// binds, it is consumed and `p.led(kind, lhs)` parses the rest
+/// (`binary` and `before_rhs` are not called). `right` is recorded for
+/// the hook (`pr.infix_of(kind).right`), as for `Pratt.led`.
+pub fn Parser<P, K, E, X>.led(pr: *Parser<P, K, E, X>, kind: K, left: u32, right: u32) {
+    pr.infix(kind, left, right);
+    let i = kind as u64;
+    while pr.is_led.len <= i { pr.is_led.push(false); }
+    pr.is_led.set(i, true);
+}
+
+/// Make `kind` a prefix operator whose operand is parsed at power `bp`.
+pub fn Parser<P, K, E, X>.prefix(pr: *Parser<P, K, E, X>, kind: K, bp: u32) {
+    let i = kind as u64;
+    while pr.prefix_bp.len <= i { pr.prefix_bp.push(0); }
+    pr.prefix_bp.set(i, bp);
+}
+
+/// The infix powers of `kind` (left 0 if it is not an infix operator).
+pub fn Parser<P, K, E, X>.infix_of(pr: *Parser<P, K, E, X>, kind: K) -> Prec {
+    let i = kind as u64;
+    if i < pr.infix_bp.len { pr.infix_bp.at(i) } else { Prec { left: 0, right: 0 } }
+}
+
+/// The prefix power of `kind` (0 if it is not a prefix operator).
+pub fn Parser<P, K, E, X>.prefix_of(pr: *Parser<P, K, E, X>, kind: K) -> u32 {
+    let i = kind as u64;
+    if i < pr.prefix_bp.len { pr.prefix_bp.at(i) } else { 0 }
+}
+
+/// Parse an expression whose operators all bind tighter than `min_bp`
+/// (0 for a full expression). Hooks may call this recursively.
+pub fn Parser<P, K, E, X>.parse(pr: *Parser<P, K, E, X>, p: *P, min_bp: u32) -> Result<E, X> {
+    let first = p.peek();
+    let ubp = pr.prefix_of(first);
+    var lhs: E = if ubp > 0 {
+        p.advance()?;
+        let operand = pr.parse(p, ubp)?;
+        p.unary(first, operand)?
+    } else {
+        p.atom()?
+    };
+    loop {
+        let op = p.peek();
+        let b = pr.infix_of(op);
+        if b.left <= min_bp { break; }
+        p.advance()?;
+        let i = op as u64;
+        if i < pr.is_led.len and pr.is_led.at(i) {
+            lhs = p.led(op, lhs)?;
+            continue;
+        }
+        lhs = p.before_rhs(op, lhs)?;
+        let rhs = pr.parse(p, b.right)?;
+        lhs = p.binary(op, lhs, rhs)?;
+    }
+    Ok(lhs)
+}
+
+/// Parse a full expression (`parse(p, 0)`).
+pub fn Parser<P, K, E, X>.expr(pr: *Parser<P, K, E, X>, p: *P) -> Result<E, X> { pr.parse(p, 0) }
+
+pub fn Parser<P, K, E, X>.free(pr: *Parser<P, K, E, X>) {
+    pr.infix_bp.free();
+    pr.prefix_bp.free();
+    pr.is_led.free();
 }
