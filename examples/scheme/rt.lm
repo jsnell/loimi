@@ -33,7 +33,7 @@ pub struct Ctx {
 }
 
 pub const STACK_SLOTS: u64 = 1 << 23;
-pub const FRAME_SLOTS: u64 = 1 << 20;
+pub const FRAME_SLOTS: u64 = 1 << 17;
 
 pub fn Ctx.new() -> Ctx {
     var c = Ctx {
@@ -67,23 +67,22 @@ pub fn Ctx.global(c: *Ctx, s: Gc<Sym>) -> u32 {
 }
 
 /// GC roots: symbols, globals, the pending error, and every active frame's
-/// closure and registers. The registers of all frames form one contiguous
-/// range of the stack, ending at the top frame's last register.
+/// closure and registers.
 pub fn scan_roots(h: *gc.Heap, data: *u8) {
     let c = data as *Ctx;
     for i in 0..c.syms.all.len { gc_mark(h, c.syms.all.at(i)); }
     for i in 0..c.gvals.len { gc_mark(h, c.gvals.at(i)); }
     gc_mark(h, c.error);
+    // Every frame's whole window, not just the stack up to the top frame:
+    // a callee's window can end below its caller's, and the caller's
+    // registers above it must stay valid (they are read again, by a later
+    // collection, once the callee returns).
     var f = c.frames;
     while f <= c.fp {
         gc_mark(h, f.cl);
+        let n = f.cl.proto.nregs as u64;
+        for i in 0..n { gc_mark(h, f.base[i]); }
         f = f + 1;
-    }
-    let top = c.fp.base + c.fp.cl.proto.nregs as u64;
-    var p = c.stack;
-    while p < top {
-        gc_mark(h, *p);
-        p = p + 1;
     }
 }
 

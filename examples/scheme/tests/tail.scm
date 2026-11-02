@@ -1,4 +1,5 @@
-; Proper tail calls (they must not grow the frame stack) and deep
+; Proper tail calls (they must not grow the frame stack, which holds 131072
+; frames: every loop below runs longer than that) and deep
 ; non-tail recursion.
 
 (define (count-down n) (if (= n 0) 'done (count-down (- n 1))))
@@ -24,18 +25,18 @@
 ; expect: (c a o w k l b arrow)
 ; Tail calls through apply and through a builtin in tail position.
 (define (t-apply n) (if (= n 0) 'ap (apply t-apply (list (- n 1)))))
-(display (t-apply 1000000)) (newline)
+(display (t-apply 150000)) (newline)
 ; expect: ap
 ; Tail calls with rest arguments.
 (define (t-rest n . xs) (if (= n 0) xs (t-rest (- n 1) n)))
-(display (t-rest 1000000)) (newline)
+(display (t-rest 150000)) (newline)
 ; expect: (1)
 ; A named-let loop with a closure created on each iteration.
 (define (loop-closures n)
   (let loop ((i 0) (f (lambda () 0)))
     (if (= i n) (f) (loop (+ i 1) (lambda () i)))))
-(display (loop-closures 100000)) (newline)
-; expect: 99999
+(display (loop-closures 150000)) (newline)
+; expect: 149999
 ; Deep non-tail recursion (100000 deep).
 (define (sum-to n) (if (= n 0) 0 (+ n (sum-to (- n 1)))))
 (display (sum-to 100000)) (newline)
