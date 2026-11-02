@@ -42,5 +42,6 @@ diff -u "$here/tests/demo.expected" "$out/demo.out"
 diff -u "$here/tests/verify.expected" "$out/verify.out"
 
 python3 "$here/tests/gen.py" "$out/cases" "$out/expected" --random "$nrand" --seed "$seed"
+timeout 300 "$host" fuzz 20000 "$seed"
 timeout 300 "$host" test "$out/cases" > "$out/actual"
 python3 "$here/tests/compare.py" "$out/cases" "$out/expected" "$out/actual"

@@ -5,7 +5,8 @@
  *
  *   rxhost demo                 a few matches, an error, a disassembly
  *   rxhost test CASES           run test cases (see tests/gen.py), print results
- *   rxhost bench [pcre]         benchmarks (with -DHAVE_PCRE2 also PCRE2)
+ *   rxhost bench [textsize]     benchmarks (with -DHAVE_PCRE2 also PCRE2)
+ *   rxhost fuzz N SEED          random byte patterns: the engines must agree
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,6 +142,44 @@ static int test(const char *path) {
     }
     fclose(f);
     return 0;
+}
+
+/* ---- fuzz mode: random bytes as patterns; both engines must agree ---- */
+
+static uint64_t rng_state;
+static uint32_t rnd(void) {
+    rng_state = rng_state * 6364136223846793005ull + 1442695040888963407ull;
+    return (uint32_t)(rng_state >> 33);
+}
+
+static int fuzz(long n, uint64_t seed) {
+    static const char alpha[] = "ab.()[]^-|*+?{},0123\\dws$:?\n";
+    rng_state = seed;
+    long compiled = 0, matched = 0, limit = 0, bad = 0;
+    for (long i = 0; i < n; i++) {
+        char pat[32], subj[64];
+        size_t pn = rnd() % 24, sn = rnd() % 48;
+        for (size_t j = 0; j < pn; j++)
+            pat[j] = rnd() % 8 == 0 ? (char)rnd() : alpha[rnd() % (sizeof alpha - 1)];
+        for (size_t j = 0; j < sn; j++) subj[j] = "ab\n1 "[rnd() % 5];
+        Regex *re = rx_compile(pat, pn);
+        if (rx_ok(re)) {
+            compiled++;
+            int64_t a[2 * 16], b[2 * 16];
+            int ra = rx_exec(re, subj, sn, 0, RX_SEARCH, a, 16);
+            int rb = rx_exec(re, subj, sn, 0, RX_SEARCH | RX_PIKE, b, 16);
+            uint32_t g = rx_groups(re) + 1;
+            if (g > 16) g = 16;
+            if (ra < 0) limit++;
+            else if (ra != rb || (ra == 1 && memcmp(a, b, 2 * g * sizeof a[0]) != 0)) {
+                if (bad++ < 10) printf("DISAGREE %.*s on %.*s: %d vs %d\n", (int)pn, pat, (int)sn, subj, ra, rb);
+            } else if (ra == 1) matched++;
+        }
+        rx_free(re);
+    }
+    printf("fuzz: %ld patterns, %ld compiled, %ld matched, %ld over the limit, %ld disagreements\n", n, compiled,
+           matched, limit, bad);
+    return bad != 0;
 }
 
 /* ---- benchmarks ---- */
@@ -282,6 +321,7 @@ int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "demo")) return demo();
     if (argc >= 3 && !strcmp(argv[1], "test")) return test(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "bench")) return bench(argc, argv);
-    fprintf(stderr, "usage: rxhost demo | test CASES | bench [textsize]\n");
+    if (argc >= 4 && !strcmp(argv[1], "fuzz")) return fuzz(atol(argv[2]), (uint64_t)atoll(argv[3]));
+    fprintf(stderr, "usage: rxhost demo | test CASES | bench [textsize] | fuzz N SEED\n");
     return 2;
 }
