@@ -1,0 +1,3 @@
+value L repr lowtag { Int(i62), Nil }
+fn main() {}
+// error: lowtag payloads must be integers of at most 61 bits

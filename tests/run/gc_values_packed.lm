@@ -1,0 +1,82 @@
+// GC tracing of a nanbox with more than 7 tagged variants: Gc payloads in
+// 48-bit blocks are found and unmasked; small immediates are skipped.
+import std.io;
+import std.gc;
+import std.mem;
+
+object Node { value: i64, next: V }
+object Str { data: [u8] }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i48),
+    S(Gc<Str>),
+    N(Gc<Node>),
+    Nil, F, T, Eof,
+    Char(u32),
+    Prim(u16),
+}
+
+struct Stack { slots: *V, top: u64 }
+
+fn scan_stack(h: *gc.Heap, data: *u8) {
+    let st = data as *Stack;
+    for i in 0..st.top { gc_mark(h, st.slots[i]); }
+}
+
+fn string(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str {}, s.len);
+    for i in 0..s.len { o.data[i] = s[i]; }
+    o
+}
+
+fn list(h: *gc.Heap, n: i64) -> V {
+    var l = V.Nil;
+    for i in 0..n {
+        let tail = if i % 3 == 0 { V.Char(i as u32) } else { l };
+        l = V.N(new(h, Node { value: i, next: tail }));
+        if i % 3 == 0 { l = V.N(new(h, Node { value: -1, next: l })); }
+    }
+    l
+}
+
+fn sum(v: V) -> i64 {
+    var t: i64 = 0;
+    var c = v;
+    while true {
+        match c {
+            N(n) => { t = t + n.value; c = n.next; }
+            Char(x) => { t = t + 1000 * x as i64; break; }
+            _ => break,
+        }
+    }
+    t
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var st = Stack { slots: mem.alloc(8), top: 0 };
+    heap.add_scanner(&st as *u8, scan_stack);
+    st.slots[0] = V.S(string(h, "kept"));
+    st.slots[1] = list(h, 50);
+    st.slots[2] = V.Int(-140737488355328);
+    st.slots[3] = V.Prim(9);
+    st.slots[4] = V.Eof;
+    st.top = 5;
+    let before = sum(st.slots[1]);
+    for i in 0..20 { list(h, 200); string(h, "garbage"); }
+    gc.collect(h);
+    match st.slots[0] { S(s) => io.println(s.data), _ => io.println("?") }
+    io.print_bool(sum(st.slots[1]) == before); io.println("");
+    match st.slots[2] { Int(x) => io.print_int(x as i64), _ => io.print("?") }
+    io.println("");
+    match st.slots[3] { Prim(x) => io.print_int(x as i64), _ => io.print("?") }
+    io.println("");
+    io.print_bool(st.slots[4] == V.Eof); io.println("");
+}
+// expect: kept
+// expect: true
+// expect: -140737488355328
+// expect: 9
+// expect: true

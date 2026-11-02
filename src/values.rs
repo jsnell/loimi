@@ -45,22 +45,24 @@ fn payload_width(t: Option<&Ty>, ptr_bits: u32) -> Option<u32> {
     })
 }
 
-/// Buddy allocation of aligned blocks. `free` holds blocks as (start,
-/// log2 size); `need` lists (variant, log2 size) in allocation order.
-/// Returns each variant's block start, or the first variant that did not
-/// fit. A request takes the smallest free block that fits (lowest start on
-/// ties) and splits it down to the requested size, keeping the low half.
-fn buddy(mut free: Vec<(u64, u32)>, need: &[(usize, u32)]) -> Result<Vec<(usize, u64)>, usize> {
+/// Buddy allocation. `free` holds blocks as (key, log2 size); `need` lists
+/// (variant, log2 size) in allocation order. A request takes the smallest
+/// free block that fits (lowest key on ties) and halves it down to the
+/// requested size, keeping the half `split` returns first. Returns each
+/// variant's block key, or the first variant that did not fit.
+fn buddy(mut free: Vec<(u64, u32)>, need: &[(usize, u32)], split: impl Fn(u64, u32) -> (u64, u64)) -> Result<Vec<(usize, u64)>, usize> {
     let mut out = Vec::new();
     for &(v, size) in need {
         let best = free.iter().enumerate().filter(|(_, b)| b.1 >= size).min_by_key(|(_, b)| (b.1, b.0)).map(|(i, _)| i);
         let Some(i) = best else { return Err(v) };
-        let (start, mut s) = free.remove(i);
+        let (mut key, mut s) = free.remove(i);
         while s > size {
+            let (lo, hi) = split(key, s);
             s -= 1;
-            free.push((start + (1u64 << s), s));
+            free.push((hi, s));
+            key = lo;
         }
-        out.push((v, start));
+        out.push((v, key));
     }
     Ok(out)
 }
@@ -125,7 +127,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         }
         variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0 });
     }
-    let too_many = |i: usize, what: &str| Diag::new(v.variants[i].name.span, format!("no room in the {} for variant `{}`", what, v.variants[i].name.name));
+    let too_many = |i: usize, what: &str| Diag::new(v.variants[i].name.span, format!("no room for variant `{}` in the {}", v.variants[i].name.name, what));
     let mut num_limit = NAN_TAG_BASE << 48;
     match repr {
         ValueRepr::NanBox if tagged.len() <= 7 => {
@@ -139,7 +141,8 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
             let mut free = vec![(NAN_HALF_BLOCK, 47)];
             free.extend((NAN_TAG_BASE..=0xFFFF).map(|t| (t << 48, 48)));
-            let blocks = buddy(free, &need).map_err(|i| {
+            // A block is (start, payload bits); halves are its low and high half.
+            let blocks = buddy(free, &need, |start, s| (start, start + (1u64 << (s - 1)))).map_err(|i| {
                 too_many(i, "nanbox's NaN space (seven 48-bit blocks for pointers and 48-bit integers, one 47-bit block)")
             })?;
             for (i, start) in blocks {
@@ -155,9 +158,8 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             }
         }
         ValueRepr::LowTag => {
-            // Tags are codes in the low bits: a block is (code, code length).
-            // Allocate with the buddy allocator over bit-reversed codes, so
-            // "start" orders codes and "size" is 64 - code length.
+            // A block is (code, 64 - code length): the words whose low bits
+            // are `code`. Its halves extend the code by a 0 or a 1 bit.
             let mut need: Vec<(usize, u32)> = tagged
                 .iter()
                 .map(|&(i, w)| {
@@ -166,16 +168,13 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
                 })
                 .collect();
             need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
-            let free = vec![(0u64, 64)];
-            let blocks = buddy(free, &need).map_err(|i| too_many(i, "lowtag's tag space (8 three-bit tags; pointers and 61-bit integers take one each)"))?;
-            for (i, start) in blocks {
+            let free = (0..1u64 << LOW_BITS).map(|c| (c, 64 - LOW_BITS)).collect();
+            let blocks = buddy(free, &need, |code, s| (code, code | 1u64 << (64 - s)))
+                .map_err(|i| too_many(i, "lowtag's tag space (8 three-bit tags; pointers and 61-bit integers take one each)"))?;
+            for (i, code) in blocks {
                 let w = need.iter().find(|t| t.0 == i).unwrap().1;
-                let len = 64 - w;
-                // `start` is the bit-reversed code, aligned to 2^w: its top
-                // `len` bits, reversed, are the code.
-                let code = if len == 0 { 0 } else { (start >> w).reverse_bits() >> (64 - len) };
                 variants[i].tag = code;
-                variants[i].shift = len;
+                variants[i].shift = 64 - w;
             }
         }
         _ => {}
