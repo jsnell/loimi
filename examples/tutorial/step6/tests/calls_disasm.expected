@@ -1,0 +1,16 @@
+fn add:
+    0  ADD dst=r2 a=r0 b=r1
+    1  RET src=r2
+    2  LOADNIL dst=r2
+    3  RET src=r2
+fn main:
+    0  LOADK dst=r0 c=k0
+    1  DEFGLOBAL src=r0 n=g0
+    2  GETGLOBAL dst=r1 n=g0 [cache slot=0]
+    4  LOADI dst=r2 v=1
+    5  LOADI dst=r3 v=2
+    6  CALL base=r1 n=2
+    7  MOVE dst=r0 src=r1
+    8  PRINT a=r0
+    9  HALT
+3

@@ -1,0 +1,264 @@
+// Syntax trees for Pip, and a parser that builds them.
+//
+// Expressions go through std.parse's Pratt driver: we give it a table of
+// binding powers and five small hooks (peek, advance, atom, unary,
+// binary), and it does the precedence climbing. Statements are parsed by
+// hand, which is the easy part.
+
+import std.diag;
+import std.lex;
+import std.mem;
+import std.parse;
+import lexer;
+import lexer.{T, Token, Lexer};
+
+pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge }
+
+pub enum Expr {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Nil,
+    Name(str),
+    Neg(*Node),
+    Not(*Node),
+    Binary(BinOp, *Node, *Node),
+    /// `f(args)`
+    Call(*Node, mem.Vec<*Node>),
+}
+
+/// An expression and the line it starts on (for error messages).
+pub struct Node { expr: Expr, line: u32 }
+
+pub enum Stmt {
+    Print(*Node),
+    /// `let name = value;`
+    Let(str, *Node),
+    /// `name = value;`
+    Assign(str, *Node),
+    /// `if cond { then } else { otherwise }`; `else if` is an `else`
+    /// block holding one If.
+    If(*Node, mem.Vec<Stmt>, mem.Vec<Stmt>),
+    While(*Node, mem.Vec<Stmt>),
+    /// `fn name(params) { body }`
+    Fn(*FnDecl),
+    /// `return value;` (`return;` returns nil) and its line
+    Return(?*Node, u32),
+    /// A call evaluated for its effect: `f(x);`
+    Expr(*Node),
+}
+
+pub struct FnDecl { name: str, params: mem.Vec<str>, body: mem.Vec<Stmt>, line: u32 }
+
+type Pratt = parse.Pratt<Parser, T, *Node, lex.Error>;
+
+pub struct Parser {
+    lx: Lexer,
+    tok: Token,
+    /// Every node lives here and is freed in one go.
+    arena: *mem.Arena,
+    /// The operator table, for parenthesized subexpressions.
+    pratt: *Pratt,
+}
+
+fn Parser.advance(p: *Parser) -> Result<(), lex.Error> {
+    p.tok = p.lx.next()?;
+    Ok(())
+}
+
+fn Parser.error(p: *Parser, msg: str) -> lex.Error { lex.Error { span: p.tok.span, msg: msg } }
+
+fn Parser.expect(p: *Parser, k: T, msg: str) -> Result<(), lex.Error> {
+    if p.tok.kind != k { return Err(p.error(msg)); }
+    p.advance()
+}
+
+fn Parser.node(p: *Parser, e: Expr, line: u32) -> *Node {
+    let n = p.arena.alloc_bytes(size_of<Node>(), 8) as *Node;
+    *n = Node { expr: e, line: line };
+    n
+}
+
+fn Parser.expr(p: *Parser) -> Result<*Node, lex.Error> { p.pratt.expr(p) }
+
+// ── the Pratt hooks ─────────────────────────────────────────────────
+
+fn peek(p: *Parser) -> T { p.tok.kind }
+
+fn advance(p: *Parser) -> Result<(), lex.Error> { p.advance() }
+
+/// An operand: a primary expression followed by any number of calls.
+fn atom(p: *Parser) -> Result<*Node, lex.Error> {
+    var e = primary(p)?;
+    while p.tok.kind == T.LParen {
+        let line = p.tok.line;
+        p.advance()?;
+        var args: mem.Vec<*Node> = mem.Vec.new();
+        while p.tok.kind != T.RParen {
+            args.push(p.expr()?);
+            if p.tok.kind != T.Comma { break; }
+            p.advance()?;
+        }
+        p.expect(T.RParen, "expected ')'")?;
+        e = p.node(Expr.Call(e, args), line);
+    }
+    Ok(e)
+}
+
+/// A literal, a name or a parenthesized expression.
+fn primary(p: *Parser) -> Result<*Node, lex.Error> {
+    let t = p.tok;
+    match t.kind {
+        Int => { p.advance()?; Ok(p.node(Expr.Int(t.int), t.line)) }
+        Float => { p.advance()?; Ok(p.node(Expr.Float(t.float), t.line)) }
+        True => { p.advance()?; Ok(p.node(Expr.Bool(true), t.line)) }
+        False => { p.advance()?; Ok(p.node(Expr.Bool(false), t.line)) }
+        Nil => { p.advance()?; Ok(p.node(Expr.Nil, t.line)) }
+        Name => { p.advance()?; Ok(p.node(Expr.Name(t.text), t.line)) }
+        LParen => {
+            p.advance()?;
+            let e = p.expr()?;
+            p.expect(T.RParen, "expected ')'")?;
+            Ok(e)
+        }
+        _ => Err(p.error("expected an expression")),
+    }
+}
+
+fn unary(p: *Parser, op: T, e: *Node) -> Result<*Node, lex.Error> {
+    Ok(p.node(if op == T.Not { Expr.Not(e) } else { Expr.Neg(e) }, e.line))
+}
+
+fn binary(p: *Parser, op: T, l: *Node, r: *Node) -> Result<*Node, lex.Error> {
+    let b = match op {
+        Plus => BinOp.Add,
+        Minus => BinOp.Sub,
+        Star => BinOp.Mul,
+        Slash => BinOp.Div,
+        Percent => BinOp.Mod,
+        EqEq => BinOp.Eq,
+        NotEq => BinOp.Ne,
+        Lt => BinOp.Lt,
+        Le => BinOp.Le,
+        Gt => BinOp.Gt,
+        _ => BinOp.Ge,
+    };
+    Ok(p.node(Expr.Binary(b, l, r), l.line))
+}
+
+// ── statements ──────────────────────────────────────────────────────
+
+fn Parser.name(p: *Parser) -> Result<str, lex.Error> {
+    let name = p.tok.text;
+    p.expect(T.Name, "expected a name")?;
+    Ok(name)
+}
+
+/// `{ stmt* }`
+fn Parser.block(p: *Parser) -> Result<mem.Vec<Stmt>, lex.Error> {
+    p.expect(T.LBrace, "expected '{'")?;
+    var stmts: mem.Vec<Stmt> = mem.Vec.new();
+    while p.tok.kind != T.RBrace {
+        if p.tok.kind == T.Eof { return Err(p.error("expected '}'")); }
+        stmts.push(p.stmt()?);
+    }
+    p.advance()?;
+    Ok(stmts)
+}
+
+fn Parser.stmt(p: *Parser) -> Result<Stmt, lex.Error> {
+    match p.tok.kind {
+        Print => {
+            p.advance()?;
+            let e = p.expr()?;
+            p.expect(T.Semi, "expected ';'")?;
+            Ok(Stmt.Print(e))
+        }
+        Let => {
+            p.advance()?;
+            let name = p.name()?;
+            p.expect(T.Assign, "expected '='")?;
+            let e = p.expr()?;
+            p.expect(T.Semi, "expected ';'")?;
+            Ok(Stmt.Let(name, e))
+        }
+        If => {
+            p.advance()?;
+            let cond = p.expr()?;
+            let then_block = p.block()?;
+            var otherwise: mem.Vec<Stmt> = mem.Vec.new();
+            if p.tok.kind == T.Else {
+                p.advance()?;
+                if p.tok.kind == T.If { otherwise.push(p.stmt()?); } else { otherwise = p.block()?; }
+            }
+            Ok(Stmt.If(cond, then_block, otherwise))
+        }
+        While => {
+            p.advance()?;
+            let cond = p.expr()?;
+            Ok(Stmt.While(cond, p.block()?))
+        }
+        Fn => {
+            let line = p.tok.line;
+            p.advance()?;
+            let name = p.name()?;
+            p.expect(T.LParen, "expected '('")?;
+            var params: mem.Vec<str> = mem.Vec.new();
+            while p.tok.kind != T.RParen {
+                params.push(p.name()?);
+                if p.tok.kind != T.Comma { break; }
+                p.advance()?;
+            }
+            p.expect(T.RParen, "expected ')'")?;
+            let body = p.block()?;
+            let f = p.arena.alloc_bytes(size_of<FnDecl>(), 8) as *FnDecl;
+            *f = FnDecl { name: name, params: params, body: body, line: line };
+            Ok(Stmt.Fn(f))
+        }
+        Return => {
+            let line = p.tok.line;
+            p.advance()?;
+            var value: ?*Node = None;
+            if p.tok.kind != T.Semi { value = Some(p.expr()?); }
+            p.expect(T.Semi, "expected ';'")?;
+            Ok(Stmt.Return(value, line))
+        }
+        _ => {
+            // An assignment or a call: parse an expression and see.
+            let e = p.expr()?;
+            if p.tok.kind == T.Assign {
+                let Name(name) = e.expr else { return Err(p.error("cannot assign to this")); };
+                p.advance()?;
+                let v = p.expr()?;
+                p.expect(T.Semi, "expected ';'")?;
+                return Ok(Stmt.Assign(name, v));
+            }
+            let Call(_, _) = e.expr else { return Err(p.error("expected a statement")); };
+            p.expect(T.Semi, "expected ';'")?;
+            Ok(Stmt.Expr(e))
+        }
+    }
+}
+
+/// Parse a whole program.
+pub fn parse_program(src: str, file: u32, arena: *mem.Arena) -> Result<mem.Vec<Stmt>, lex.Error> {
+    var pr: Pratt = parse.Pratt.new(peek, advance, atom, unary, binary);
+    let cmp = [T.EqEq, T.NotEq, T.Lt, T.Le, T.Gt, T.Ge];
+    for i in 0..cmp.len { pr.infix_left(cmp[i], 3); }
+    pr.infix_left(T.Plus, 6);
+    pr.infix_left(T.Minus, 6);
+    pr.infix_left(T.Star, 7);
+    pr.infix_left(T.Slash, 7);
+    pr.infix_left(T.Percent, 7);
+    pr.prefix(T.Minus, 8);
+    pr.prefix(T.Not, 8);
+    defer pr.free();
+
+    var p = Parser { lx: Lexer.new(src, file, arena), tok: lexer.eof(), arena: arena, pratt: &pr };
+    p.advance()?;
+    var stmts: mem.Vec<Stmt> = mem.Vec.new();
+    while p.tok.kind != T.Eof {
+        stmts.push(p.stmt()?);
+    }
+    Ok(stmts)
+}

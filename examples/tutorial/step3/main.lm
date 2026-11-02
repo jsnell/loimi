@@ -39,10 +39,8 @@ fn main() -> i32 {
     // The verifier proves every operand in range, once, so the handlers
     // can index registers and constants without bounds checks.
     var lim = Limits { nregs: chunk.nregs, nconsts: chunk.consts.len as u32 };
-    if let Some(bad) = Calc.verify(chunk.code, &lim) {
-        io.eprint("verify: bad instruction at ");
-        io.print_int(bad as i64);
-        io.eprintln("");
+    if Calc.verify(chunk.code, &lim).is_some() {
+        io.eprintln("error: the bytecode failed verification");
         return 1;
     }
 

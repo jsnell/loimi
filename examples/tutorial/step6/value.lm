@@ -1,0 +1,66 @@
+// Pip's run-time values.
+
+import std.hash;
+import std.num;
+import std.text;
+
+/// One 64-bit word. A double is stored as itself; the other variants live
+/// in the NaN space, where no real computation produces a value (the
+/// compiler canonicalizes NaNs when it builds a `Num`).
+pub value Value repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    Fn(*Proto),
+}
+
+/// A compiled function. Prototypes live in ordinary memory and are never
+/// freed: a program's functions live as long as the program.
+pub struct Proto {
+    name: str,
+    nparams: u32,
+    /// The size of the function's register window.
+    nregs: u32,
+    code: []u32,
+    /// The source line of each code word.
+    lines: []u32,
+    consts: []Value,
+}
+
+// The constant pool (`bc.Pool<Value>`) deduplicates constants by their
+// bits, so 0, 0.0 and -0.0 stay apart.
+pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
+pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
+impl hash.Hash for Value;
+
+pub fn truthy(v: Value) -> bool {
+    match v {
+        Nil => false,
+        Bool(b) => b,
+        _ => true,
+    }
+}
+
+/// Numeric value of an Int or Num.
+pub fn to_f64(v: Value) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+pub fn write(b: *text.StrBuf, v: Value) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => {
+            let start = b.len();
+            num.write_shortest(b, x);
+            num.mark_float(b, start);
+        }
+        Bool(t) => b.push_str(if t { "true" } else { "false" }),
+        Nil => b.push_str("nil"),
+        Fn(p) => { b.push_str("<fn "); b.push_str(p.name); b.push_str(">"); }
+    }
+}
