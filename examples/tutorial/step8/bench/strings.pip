@@ -1,0 +1,18 @@
+// Allocation: string building and short-lived arrays.
+fn build(n) {
+    let s = "";
+    let i = 0;
+    while i < n {
+        s = s + "ab";
+        i = i + 1;
+    }
+    return s;
+}
+let total = 0;
+let round = 0;
+while round < 30000 {
+    let parts = [build(100), build(50), [round]];
+    total = total + len(parts[0]) + len(parts[1]);
+    round = round + 1;
+}
+print total;

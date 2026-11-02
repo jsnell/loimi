@@ -1,0 +1,5 @@
+fn inner(x) {
+    return x + nil;
+}
+fn outer() { return inner(1); }
+print outer();
