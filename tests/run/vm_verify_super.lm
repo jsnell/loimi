@@ -1,0 +1,116 @@
+// matrix: dispatch
+// Superinstructions, `then` and the end of the code. Found by tests/fuzz.
+//
+// The words after a super's head are instructions of their own: when the
+// first part quickens, the head stops being the super and they run alone.
+// So each must hold an op of its part's family, and the last of them must
+// not be able to run off the end. An op with `then` that may continue
+// (`jump pc + 2` past its JMP) must not be followed by the last instruction.
+import std.io;
+
+struct Proto { nregs: u32 }
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    family LD(dst: reg) : ABC {
+        generic { dst = 1; become LD_Q; next }
+        LD_Q { dst = 2; next }
+    }
+    op MOV(dst: reg, src: reg) : ABC { dst = src; next }
+    op JMP(t: label) : sJ { jump t }
+    op RET(a: reg) : ABC { exit a }
+    family INC(a: reg) : ABC {
+        generic { a = a + 1; next }
+        INC_X { exit a }
+    }
+    op LT(a: reg, b: reg) : ABC then JMP {
+        if a < b { jump then.t }
+        jump pc + 2
+    }
+
+    super LD_MOV = LD; MOV;
+    super LD_RET = LD; RET;
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn names(c: []u32) {
+    for i in 0..c.len {
+        if i > 0 { io.print(" "); }
+        io.print(V.op_name(c[i]));
+    }
+    io.println("");
+}
+
+fn main() {
+    var p = Proto { nregs: 2 };
+    var code: [u32; 8] = [0; 8];
+    let c = code[..];
+
+    // LD_MOV whose second word is a far JMP: after LD quickens, the JMP
+    // would run unverified.
+    code[0] = V.with_opcode(V.LD(0), V.OP_LD_MOV);
+    code[1] = V.JMP(257);              // fields a = 1, b = 1: valid MOV operands
+    code[2] = V.RET(0);
+    show(V.verify(c[0..3], &p));
+
+    // LD_RET ending the code: its RET word is the last instruction. An
+    // INC_X there (RET's place, exits) would be fine for the super, but
+    // INC_X is not in RET's family; and an INC in its own place runs off
+    // the end.
+    code[0] = V.with_opcode(V.LD(0), V.OP_LD_RET);
+    code[1] = V.RET(0);
+    show(V.verify(c[0..2], &p));
+    code[0] = V.LD(0);
+    code[1] = V.INC(0);
+    show(V.verify(c[0..2], &p));
+    code[1] = V.with_opcode(V.INC(0), V.OP_INC_X);
+    show(V.verify(c[0..2], &p));         // INC_X exits, but can it become INC? no: ok
+
+    // LT skips its JMP with `jump pc + 2`: the JMP must not be last.
+    code[0] = V.LT(0, 1);
+    code[1] = V.JMP(-1);
+    show(V.verify(c[0..2], &p));
+    code[2] = V.RET(0);
+    show(V.verify(c[0..3], &p));
+
+    // Running fused code that quickens: LD_MOV splits into LD_Q MOV.
+    code[0] = V.LD(0);
+    code[1] = V.MOV(1, 0);
+    code[2] = V.RET(1);
+    V.optimize(c[0..3]);
+    names(c[0..3]);
+    var regs: [i64; 2] = [0; 2];
+    io.print_int(V.run(&code[0], &regs[0]));
+    io.print_int(V.run(&code[0], &regs[0]));
+    io.println("");
+    names(c[0..3]);
+    show(V.verify(c[0..3], &p));
+}
+// expect: bad at 0
+// expect: ok
+// expect: bad at 1
+// expect: ok
+// expect: bad at 0
+// expect: ok
+// expect: LD_MOV MOV RET
+// expect: 12
+// expect: LD_Q MOV RET
+// expect: ok

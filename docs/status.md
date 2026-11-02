@@ -7,7 +7,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 
 | Area | Status |
 |---|---|
-| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`). |
+| Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`, `--sanitize=address`). |
 | Core language | `inline for` (module level and in `vm` blocks), structs (literals may be module-qualified: `diag.Span { .. }`), enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (through nested patterns and tuples), `let ... else`, `if let` chains, loops with `break` values, `for i in 0..n` ranges typed by the non-literal bound or an annotation (`for i: u8 in 0..10`), `defer`, consts, module-level `var`s (see below), casts (including integer to fieldless enum, checked in debug builds; `Kind.COUNT` gives the number of variants; `x as u64 < y` parses as a comparison), local inference across `if`/`match` branches (`if c { Ok(e) } else { Err(m) }` needs no annotation), checked/wrapping arithmetic, arbitrary-width integers `iN`/`uN` (1..=64), overflow and bounds checks (overflow traps in debug builds). |
 | Globals | `var NAME: T = init;` at module level (with `pub`, readable and assignable from other modules as `mod.NAME` or after `import mod.{NAME}`). Plain LLVM globals; `#[thread_local]` makes one copy per thread (`thread_local(initialexec)`). The initializer must be a constant expression: literals, consts, `[x; N]`, struct/tuple/array literals, enum variants without payload, `None`/`Some(..)`/`Ok(..)`/`Err(..)` of constants, and functions (for hooks). Globals are not GC roots: a global holding `Gc`/`Value` must be marked by a root scanner (`heap.add_scanner`). |
 | Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Qualified variants of generic enums (`Lookup.Missing`, `Lookup.Own(i)`, also in patterns) take the instance from the expected type or the payload. Methods resolve per instance. Static traits (`trait Hash { fn hash(k: Self) -> u64; .. }`, `impl Hash for Sym;`) and bounds (`HashMap<K: hash.Hash, V>`, `fn f<T: A + B>`) are checked at instantiation, with the error at the use site; no default methods, generic traits, or impls for generic instances yet. A generic function can be used as a function pointer where a function type is expected (`Pratt.new(peek, ...)` with `fn peek<E>(p: *P<E>) -> T`), or with explicit type arguments anywhere (`scan<Gc<Box>>`); passed to another generic function, its type arguments can come from the parameter types alone (`apply(double, 21)` with `fn apply<T, U>(f: fn(T) -> U, x: T)`). Methods can have their own type parameters after the method name, on plain receivers (`fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`) and generic ones (`fn Box<T>.map<U>(b: *Box<T>, f: fn(T) -> U) -> Box<U>`); the receiver's arguments come from the receiver, the method's are inferred from the arguments and the expected type. Type arguments can also be given explicitly on calls: `mem.alloc<u8>(n)`, `id<i64>(x)`, `c.op<K>(&ops)`, `Cursor.cast<u8>(&c)` (a method's own parameters only; not on a generic type's static functions such as `Vec.new`). `f<T>(` is recognized when `<` directly follows the name and a balanced, type-shaped `<...>` is followed by `(`; otherwise `<` is a comparison. |
@@ -25,7 +25,59 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | `std.bc` | Bytecode construction over any vm's generated encoders: `Code<W>` (given `Vm.op_size` and a jump-patch function: `op` reserves inline-cache words, labels with fixups, jump lists, range-checked patching with sticky errors, a run-length position table with per-word expansion and a delta-encoded form, `last`/`truncate` for peepholes, jump threading), `Field` (encoded bit fields), `Pool<K: hash.Hash>` (deduplicating constant pool with a limit) and `Regs` (Lua-style locals/temporaries register allocator with maximum tracking). |
 | `std.obj` | Hidden-class objects over a generic `obj.Obj<V>` or the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache`, allocation templates. No attributes, elements or globals cells. |
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |
-| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, and the Mini scripts with and without GC stress. |
+| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, the Mini scripts with and without GC stress, and a few seconds of bytecode fuzzing (below). |
+
+## Bytecode fuzzing (M5)
+
+The M5 criterion is 24 hours of bytecode fuzzing under ASan with no
+crashes. `tests/fuzz/run.sh` builds the fuzzers with `--sanitize=address`
+and runs them for a time or seed budget, saving failing seeds:
+
+- `tests/fuzz/fuzzvm.lm`: a test vm using every verifier feature
+  (register, constant and context-indexed operands, labels of three
+  widths, a call operand checked with `is_insn_boundary`, two verify
+  contexts, inline caches, families with `become`/`redo`, supers with up to
+  four parts and family-member parts, `then JMP`, `-> never` vm functions,
+  cold blocks, variants), declared once per dispatch mode. Random programs
+  (mostly well-formed, some mutated, some random words) are verified and,
+  if they pass, run in all three modes with exactly-sized heap buffers and
+  a step budget. Besides crashes it checks that the modes agree and that
+  code still verifies after running (quickening) and after `Vm.optimize`.
+- `tests/fuzz/minifuzz.lm`: random code against Mini's own `verify`
+  clauses and `Mini.run`, on a stack exactly as large as the frame.
+
+ASan works in all three dispatch modes. `--sanitize=address` turns off
+use-after-return detection: its fake-stack fallback is a dynamic alloca,
+which LLVM cannot combine with stack realignment in `preserve_none`
+functions, so tail-call builds would not compile. `musttail` survives the
+instrumentation.
+
+**Run so far: 2 h 10 min** under ASan (2026-11-02), before and after the
+n-ary supers / `then` changes, 20 minutes of it on the final verifier:
+149M test-vm programs (55M verified and run in all three modes) and 11.6M
+Mini programs (3.0M run), in debug and `--release` builds. That is well
+short of the 24 hours M5 asks for. `cargo test` runs a few seconds of both
+without ASan.
+
+Bugs found and fixed (regression tests in `tests/run/vm_verify_*.lm`):
+
+- Verified code could run off its end: a last instruction using `next`
+  read past the buffer, and empty code verified. The verifier now rejects
+  both (see `language.md` §6).
+- Before the n-ary super rewrite: a super's later words were checked only
+  as the declared part's operands, so after the first part quickened they
+  ran as unverified instructions; and `Vm.optimize` produced overlapping
+  supers that failed verification.
+- Found by review while fuzzing: `verify` clauses are pasted into the
+  generated verifier, whose locals shadowed verify contexts of the same
+  name (`verify_context w: u32` compared with the instruction word).
+
+Holes in Mini's verify clauses (`examples/mini/vm.lm`, not changed here;
+reproducers in `tests/fuzz/mini_holes.lm`, skipped by the fuzzer unless
+`MINIFUZZ_KNOWN=1`): CALL's `nres` lets the callee's return write past the
+stack; SETLIST's, RETN's and CONCAT's counts read past the frame; CONCAT
+with fewer than 2 values and GETINDEXI with index 0 underflow; SELF writes
+`R[a+1]` with only `a < nregs` checked.
 
 ## Differences from the design
 
@@ -67,8 +119,13 @@ in [`language.md`](language.md). Updated 2026-11-02.
   pointers are checked, synced and rooted like direct calls. There are no
   effect variables: a generic function cannot take "a callback with any
   effects" and inherit them.
-- **Verifier**: operand checks only. Stack-effect checking for stack VMs
-  and "cannot fall off the end" are not implemented.
+- **Verifier**: opcodes, extents, operand `verify` clauses, superinstruction
+  part words, and "cannot fall off the end" (an op may continue if its
+  handler uses `next` or reads `pc`; the scan is over tokens, so it errs
+  toward "may continue"). Stack-effect checking for stack VMs is not
+  implemented, and there is no `Verified<V>` type: `Vm.run` takes a raw
+  code pointer, so nothing ties the code it runs, or the run-time state
+  (register window size, the closure's prototype), to what was verified.
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
   not through an external `set_dispatch`.
 - **Front-end stdlib** (`std.lex`, `std.parse`, `std.diag`, `std.num`) is

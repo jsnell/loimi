@@ -175,13 +175,13 @@ impl VmLayout {
     }
 }
 
-/// Source expression decoding field (bits, shift, signed) of word `w`.
+/// Source expression decoding field (bits, shift, signed) of word `__w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
     // As in handlers: operand fields are 64-bit.
     let rt = if signed { "i64" } else { "u64" };
     if signed {
         format!(
-            "(((w << {}) as i{wb}) >> {}) as {}",
+            "(((__w << {}) as i{wb}) >> {}) as {}",
             word_bits - shift - bits,
             word_bits - bits,
             rt,
@@ -189,22 +189,239 @@ fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
         )
     } else {
         let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        format!("((w >> {}) & {}) as {}", shift, m, rt)
+        format!("((__w >> {}) & {}) as {}", shift, m, rt)
     }
 }
 
-/// The verifier: checks opcodes, instruction extents, and every operand's
-/// `verify` clause. Returns the index of the first bad instruction.
-fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
+/// Ops whose handler may continue past the instruction's last word: it
+/// uses `next`, or reads `pc` (to save a return address such as `pc + 1`),
+/// directly, in a vm function it calls, or in an op it can `become`.
+/// Code whose last instruction is one of these could run off the end.
+///
+/// The scan is over tokens, so it errs on the side of "may continue",
+/// with one refinement for shared slow paths such as
+/// `fn call_slow(.., tail: bool) -> never` called as `call_slow(.., true)`:
+/// a vm function is scanned once per combination of literal `true`/`false`
+/// arguments, and `if p { .. }` / `if !p { .. }` blocks that such a
+/// parameter rules out are skipped (unless the function rebinds `p`).
+fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
+    use crate::lexer::{Tok, Token};
+    use std::collections::HashMap;
+
+    type Bind = Vec<Option<bool>>;
+    #[derive(Default)]
+    struct Facts {
+        direct: bool,
+        calls: Vec<(String, Bind)>,
+        becomes: Vec<String>,
+    }
+    fn tokens(sm: &SourceMap, b: &Block) -> Option<Vec<Token>> {
+        let text = &sm.files[b.span.file as usize].text[b.span.lo as usize..b.span.hi as usize];
+        crate::lexer::lex(b.span.file, text).ok()
+    }
+    /// Index after the block whose `{` is at `i`.
+    fn skip_block(t: &[Token], i: usize) -> usize {
+        let mut depth = 0;
+        let mut j = i;
+        while j < t.len() {
+            match t[j].tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        t.len()
+    }
+    /// Literal bool arguments of the call whose `(` is at `i`.
+    fn call_args(t: &[Token], i: usize) -> Bind {
+        let mut args = Vec::new();
+        let mut cur: Vec<&Tok> = Vec::new();
+        let mut depth = 0;
+        let mut j = i;
+        while j < t.len() {
+            let tok = &t[j].tok;
+            match tok {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 || (depth == 1 && *tok == Tok::Punct(",")) {
+                if !cur.is_empty() {
+                    args.push(match cur.as_slice() {
+                        [Tok::Ident(b)] if b == "true" => Some(true),
+                        [Tok::Ident(b)] if b == "false" => Some(false),
+                        _ => None,
+                    });
+                }
+                cur.clear();
+                if depth == 0 {
+                    break;
+                }
+            } else if j > i {
+                cur.push(tok);
+            }
+            j += 1;
+        }
+        args
+    }
+    // `params`: the names that `bind` gives values to.
+    let scan = |t: &[Token], params: &[String], bind: &Bind| -> Facts {
+        let mut known: HashMap<&str, bool> = HashMap::new();
+        for (k, p) in params.iter().enumerate() {
+            if let Some(Some(b)) = bind.get(k) {
+                known.insert(p.as_str(), *b);
+            }
+        }
+        // A parameter that is assigned or shadowed is not known.
+        for (i, tk) in t.iter().enumerate() {
+            if let Tok::Ident(name) = &tk.tok {
+                let assigned = matches!(t.get(i + 1).map(|x| &x.tok), Some(Tok::Punct("=")));
+                let shadowed = i > 0 && matches!(&t[i - 1].tok, Tok::Ident(k) if k == "let" || k == "var");
+                if assigned || shadowed {
+                    known.remove(name.as_str());
+                }
+            }
+        }
+        let mut f = Facts::default();
+        let mut i = 0;
+        while i < t.len() {
+            let Tok::Ident(name) = &t[i].tok else {
+                i += 1;
+                continue;
+            };
+            if i > 0 && t[i - 1].tok == Tok::Punct(".") {
+                i += 1;
+                continue;
+            }
+            if name == "if" {
+                // `if p {` / `if !p {` with p known: skip a block that
+                // cannot run.
+                let neg = t.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct("!"));
+                let k = if neg { i + 2 } else { i + 1 };
+                if let (Some(Tok::Ident(p)), Some(Tok::Punct("{"))) = (t.get(k).map(|x| &x.tok), t.get(k + 1).map(|x| &x.tok)) {
+                    if let Some(&b) = known.get(p.as_str()) {
+                        if b == neg {
+                            i = skip_block(t, k + 1);
+                            continue;
+                        }
+                    }
+                }
+            }
+            match (name.as_str(), t.get(i + 1).map(|x| &x.tok)) {
+                ("next" | "pc", _) => f.direct = true,
+                ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
+                (_, Some(Tok::Punct("("))) => f.calls.push((name.clone(), call_args(t, i + 1))),
+                _ => {}
+            }
+            i += 1;
+        }
+        f
+    };
+    let fn_toks: Vec<(String, Vec<String>, Option<Vec<Token>>)> = v
+        .fns
+        .iter()
+        .map(|f| {
+            let params = f.params.iter().map(|p| p.name.name.clone()).collect();
+            (f.name.name.clone(), params, f.body.as_ref().and_then(|b| tokens(sm, b)))
+        })
+        .collect();
+    // Nodes: ops (by index), then vm function instances (name, bindings).
+    let mut facts: Vec<Facts> = v
+        .ops
+        .iter()
+        .map(|o| match tokens(sm, &o.body) {
+            Some(t) => scan(&t, &[], &vec![]),
+            None => Facts { direct: true, ..Facts::default() },
+        })
+        .collect();
+    let mut inst: HashMap<(String, Bind), usize> = HashMap::new();
+    let mut k = 0;
+    while k < facts.len() {
+        let calls = facts[k].calls.clone();
+        for (name, bind) in calls {
+            let Some((_, params, toks)) = fn_toks.iter().find(|(n, _, _)| *n == name) else { continue };
+            let key = (name.clone(), bind.clone());
+            if inst.contains_key(&key) {
+                continue;
+            }
+            inst.insert(key, facts.len());
+            facts.push(match toks {
+                Some(t) => scan(t, params, &bind),
+                None => Facts { direct: true, ..Facts::default() },
+            });
+        }
+        k += 1;
+    }
+    let mut cont: Vec<bool> = facts.iter().map(|f| f.direct).collect();
+    loop {
+        let mut changed = false;
+        for i in 0..facts.len() {
+            if cont[i] {
+                continue;
+            }
+            let f = &facts[i];
+            let c = f.calls.iter().any(|c| inst.get(c).is_some_and(|&j| cont[j]))
+                || f.becomes.iter().any(|b| v.ops.iter().position(|o| o.name.name == *b).is_some_and(|t| cont[t]));
+            if c {
+                cont[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out: Vec<bool> = cont[..v.ops.len()].to_vec();
+    out.resize(l.ops.len(), false);
+    for (i, o) in l.ops.iter().enumerate() {
+        if let Some(&last) = o.parts.last() {
+            out[i] = out[last];
+        }
+    }
+    out
+}
+
+/// The verifier. It checks that
+/// - the code is not empty, and every instruction holds a valid opcode and
+///   fits (with its inline cache);
+/// - instructions are walked one component at a time: the words after a
+///   superinstruction's head are instructions too (jumps may land on them,
+///   and `redo`, `next` from a shared tail or a quickened part runs them
+///   alone), so each must hold an op of the same family as the super's part;
+/// - `then OP`: the next instruction is an OP;
+/// - every operand satisfies its kind's `verify` clause (a super's head
+///   word carries its first part's operands; the other parts are checked
+///   at their own words);
+/// - the code cannot run off its end: the last instruction is not one that
+///   may continue (see `may_continue`), and an op with `then` that may
+///   continue (say by `jump pc + 2` past its follower) is not followed by
+///   the last instruction.
+/// Returns the index of the first bad word.
+///
+/// `verify` clauses are pasted into the generated function, so they see
+/// `it`, `pc` and the verify context; the verifier's own names start with
+/// `__` so that a clause cannot pick them up by accident.
+fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let vis = if v.is_pub { "pub " } else { "" };
+    for p in &v.verify_ctx {
+        if matches!(p.name.name.as_str(), "it" | "pc") || p.name.name.starts_with("__") {
+            return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
+        }
+    }
     let clause = |kind: &str| -> Option<String> {
         let k = v.operands.iter().find(|o| o.name.name == kind)?;
         let e = k.verify.as_ref()?;
         let f = &sm.files[e.span.file as usize];
         let text = &f.text[e.span.lo as usize..e.span.hi as usize];
-        Some(text.replace("is_insn_boundary(", &format!("{n}__boundary(code, &bits, ")))
+        Some(text.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
     };
     let mut s = String::new();
     let _ = writeln!(
@@ -215,54 +432,64 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
          \x20 (bits[i >> 3] >> ((i & 7) as u8)) & 1 == 1\n}}",
         l.word_bits / 8
     );
-    let mut params = vec![format!("code: []{w}")];
+    let cont = may_continue(sm, v, l);
+    let continuing: Vec<String> =
+        l.ops.iter().filter(|o| cont[o.opcode as usize]).map(|o| format!("op == {}", o.opcode)).collect();
+    let _ = writeln!(
+        s,
+        "fn {n}__continues(op: u64) -> bool {{ {} }}",
+        if continuing.is_empty() { "false".to_string() } else { continuing.join(" or ") }
+    );
+    let mut params = vec![format!("__code: []{w}")];
     for p in &v.verify_ctx {
         let f = &sm.files[p.ty.span.file as usize];
         params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
     }
     let _ = writeln!(s, "{vis}fn {n}__verify({}) -> ?u64 {{", params.join(", "));
-    let _ = writeln!(s, "  if code.len > 524288 {{ return Some(0); }}");
-    let _ = writeln!(s, "  var bits: [u8; 65536] = [0; 65536];");
-    let _ = writeln!(s, "  var i: u64 = 0;");
-    // Instructions are walked one component at a time: the words after a
-    // superinstruction's head are instructions too (jumps may land on
-    // them, and `redo` or `next` from a shared tail runs them alone), so
-    // each must hold an op of the same family as the super's part.
-    let _ = writeln!(s, "  while i < code.len {{");
-    let _ = writeln!(s, "    if {n}__opcode(code[i]) as u64 >= {n}__NUM_OPS {{ return Some(i); }}");
-    let _ = writeln!(s, "    bits[i >> 3] = bits[i >> 3] | ((1 as u8) << ((i & 7) as u8));");
-    let _ = writeln!(s, "    if i + {n}__op_size(code[i]) > code.len {{ return Some(i); }}");
-    let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
+    let _ = writeln!(s, "  if __code.len == 0 or __code.len > 524288 {{ return Some(0); }}");
+    let _ = writeln!(s, "  var __bits: [u8; 65536] = [0; 65536];");
+    let _ = writeln!(s, "  var __i: u64 = 0;");
+    let _ = writeln!(s, "  var __last: u64 = 0;");
+    let _ = writeln!(s, "  while __i < __code.len {{");
+    let _ = writeln!(s, "    if {n}__opcode(__code[__i]) as u64 >= {n}__NUM_OPS {{ return Some(__i); }}");
+    let _ = writeln!(s, "    __bits[__i >> 3] = __bits[__i >> 3] | ((1 as u8) << ((__i & 7) as u8));");
+    let _ = writeln!(s, "    if __i + {n}__op_size(__code[__i]) > __code.len {{ return Some(__i); }}");
+    let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
         let mut conds: Vec<String> = l.part_offsets(k)[1..]
             .iter()
-            .map(|(off, p)| format!("{n}__family(code[i + {off}]) != {}", l.ops[*p].family))
+            .map(|(off, p)| format!("{n}__family(__code[__i + {off}]) != {}", l.ops[*p].family))
             .collect();
-        // `then OP`: the next instruction must be an OP.
+        // `then OP`: the next instruction must be an OP; if this op may
+        // continue, something must come after that OP too.
         let b = l.base(k);
         if let Some(t) = l.ops[b].then {
             let sz = l.size(b);
-            conds.push(format!("i + {sz} >= code.len or {n}__family(code[i + {sz}]) != {}", l.ops[t].family));
+            conds.push(format!("__i + {sz} >= __code.len or {n}__family(__code[__i + {sz}]) != {}", l.ops[t].family));
+            if cont[b] {
+                conds.push(format!("__i + {sz} + {n}__base_size(__code[__i + {sz}]) >= __code.len"));
+            }
         }
         if !conds.is_empty() {
-            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(i); }} }}", o.opcode, conds.join(" or "));
+            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(__i); }} }}", o.opcode, conds.join(" or "));
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");
-    let _ = writeln!(s, "  i = 0;\n  while i < code.len {{");
-    let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
+    let _ = writeln!(s, "    __last = __i;\n    __i += {n}__base_size(__code[__i]);\n  }}");
+    // The walk is per component, so the last word group is never a
+    // super's head.
+    let _ = writeln!(s, "  if {n}__continues({n}__opcode(__code[__last]) as u64) {{ return Some(__last); }}");
+    let _ = writeln!(s, "  __i = 0;\n  while __i < __code.len {{");
+    let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
         let mut checks = String::new();
-        // A super's head word carries its first part's operands; the
-        // other parts are checked at their own words.
         for (off, p) in l.part_offsets(k).into_iter().take(1) {
             let po = &l.ops[p];
             for (fi, (_, bits, shift, signed)) in po.fields.iter().enumerate() {
                 if let Some(c) = clause(&po.kinds[fi]) {
                     let _ = write!(
                         checks,
-                        "{{ let pc: *{w} = code.ptr + i + {off}; let w = code[i + {off}]; let it = {}; if !({}) {{ return Some(i + {off}); }} }} ",
+                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = __code[__i + {off}]; let it = {}; if !({}) {{ return Some(__i + {off}); }} }} ",
                         decode_src(l.word_bits, *bits, *shift, *signed),
                         c
                     );
@@ -274,8 +501,8 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n  None\n}}");
-    s
+    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}\n  None\n}}");
+    Ok(s)
 }
 
 pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
@@ -427,8 +654,8 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
     let _ = writeln!(s, "    _ => None,");
     let _ = writeln!(s, "  }}");
     let _ = writeln!(s, "}}");
-    let _ = writeln!(s, "{vis}fn {n}__label(w: {w}) -> ?i64 {{");
-    let _ = writeln!(s, "  match {n}__opcode(w) {{");
+    let _ = writeln!(s, "{vis}fn {n}__label(__w: {w}) -> ?i64 {{");
+    let _ = writeln!(s, "  match {n}__opcode(__w) {{");
     for (op, (bits, shift, signed)) in &labels {
         let _ = writeln!(s, "    {op} => Some({} as i64),", decode_src(l.word_bits, *bits, *shift, *signed));
     }
@@ -442,7 +669,7 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
                 let rt = if fld.signed { "i64" } else { "u64" };
                 let _ = writeln!(
                     s,
-                    "{vis}fn {n}__{}_{}(w: {w}) -> {rt} {{ {} }}",
+                    "{vis}fn {n}__{}_{}(__w: {w}) -> {rt} {{ {} }}",
                     f.name.name,
                     fld.name.name,
                     decode_src(l.word_bits, fld.bits, shift, fld.signed)
@@ -462,8 +689,11 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
                 let mut src = generate(v, &l);
-                src.push_str(&generate_verifier(sm, v, &l));
+                src.push_str(&generate_verifier(sm, v, &l)?);
                 src.push_str(&generate_labels(v, &l));
+                if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
+                    eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
+                }
                 let fid = sm.add(format!("<vm {} expansion>", v.name.name), src.clone());
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);

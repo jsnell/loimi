@@ -1,0 +1,107 @@
+// matrix: dispatch
+// The verifier rejects code that could run off its end: empty code, and
+// code whose last instruction may continue past itself (it uses `next`,
+// reads `pc`, calls a vm function that reads `pc`, or can `become` an op
+// that does). Found by tests/fuzz.
+import std.io;
+
+struct Proto { nregs: u32 }
+struct Ctx { ret: *u32, next: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    fn after() -> *u32 { pc + 1 }
+
+    op INC(a: reg) : ABC { a = a + 1; next }
+    op RET(a: reg) : ABC { exit a }
+    /// Saves a return address: may continue at pc + 1.
+    op GOSUB(t: label) : sJ { ctx.ret = pc + 1; jump t }
+    op BACK() : ABC { jump ctx.ret }
+    /// Reads pc through a vm function.
+    op SKIP() : ABC { jump after() }
+    /// A field named `next` is not the control word.
+    op FIELD() : ABC { exit ctx.next }
+    /// A shared tail that continues only when `tail` is false.
+    fn call(a: i64, tail: bool) -> never {
+        if !tail { ctx.ret = pc + 1; next }
+        exit a
+    }
+    op TCALL(a: reg) : ABC { call(a, true) }
+    op NCALL(a: reg) : ABC { call(a, false) }
+    /// Exits, but can become an op that continues.
+    family TRY(a: reg) : ABC {
+        generic { become TRY_Q; exit a }
+        TRY_Q { next }
+    }
+
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var p = Proto { nregs: 2 };
+    var code: [u32; 4] = [0; 4];
+    let c = code[..];
+    show(V.verify(c[0..0], &p));            // empty
+
+    code[0] = V.INC(0);
+    code[1] = V.INC(1);
+    show(V.verify(c[0..2], &p));            // ends in INC: runs off the end
+    code[2] = V.RET(1);
+    show(V.verify(c[0..3], &p));
+
+    code[0] = V.GOSUB(2);
+    code[1] = V.RET(0);
+    code[2] = V.BACK();
+    show(V.verify(c[0..3], &p));            // BACK may end the code
+    code[2] = V.GOSUB(-1);
+    show(V.verify(c[0..3], &p));            // GOSUB may not: it returns past itself
+    code[2] = V.SKIP();
+    show(V.verify(c[0..3], &p));            // nor may SKIP (pc in a vm fn)
+    code[2] = V.FIELD();
+    show(V.verify(c[0..3], &p));
+    code[2] = V.TRY(0);
+    show(V.verify(c[0..3], &p));            // TRY becomes TRY_Q, which continues
+    code[2] = V.TCALL(0);
+    show(V.verify(c[0..3], &p));            // call(_, true) never continues
+    code[2] = V.NCALL(0);
+    show(V.verify(c[0..3], &p));            // call(_, false) does
+
+    var ctx = Ctx { ret: &code[0], next: 7 };
+    var regs: [i64; 2] = [0; 2];
+    code[0] = V.GOSUB(2);
+    code[1] = V.RET(1);
+    code[2] = V.INC(1);
+    code[3] = V.BACK();
+    show(V.verify(c, &p));
+    io.print_int(V.run(&ctx, &code[0], &regs[0])); io.println("");
+}
+// expect: bad at 0
+// expect: bad at 1
+// expect: ok
+// expect: ok
+// expect: bad at 2
+// expect: bad at 2
+// expect: ok
+// expect: bad at 2
+// expect: ok
+// expect: bad at 2
+// expect: ok
+// expect: 1

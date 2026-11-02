@@ -32,10 +32,13 @@ struct Opts {
     dispatch: Option<tir::Dispatch>,
     keep_ll: bool,
     vm_stats: bool,
+    /// `--sanitize=address`: build with AddressSanitizer.
+    sanitize_address: bool,
 }
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats]
+                  [--sanitize=address]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -95,7 +98,58 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<String, Diag> {
     c.run()?;
     let prog = c.prog;
     let cg = codegen::Codegen::new(&prog, sm, codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats });
-    Ok(cg.generate())
+    let ir = cg.generate();
+    Ok(if opts.sanitize_address { sanitize_address(&ir) } else { ir })
+}
+
+/// The ASan runtime to link explicitly, if clang's own is missing.
+/// `Ok(None)`: clang links its runtime itself. Otherwise GCC's shared
+/// libasan (same instrumentation ABI), or `LOIMI_ASAN_RUNTIME`.
+fn asan_runtime(clang: &str) -> Result<Option<PathBuf>, String> {
+    if let Ok(p) = std::env::var("LOIMI_ASAN_RUNTIME") {
+        return Ok(Some(PathBuf::from(p)));
+    }
+    let query = |prog: &str, arg: &str| -> Option<PathBuf> {
+        let out = Command::new(prog).arg(arg).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !s.is_empty() { Some(PathBuf::from(s)) } else { None }
+    };
+    if let Some(dir) = query(clang, "-print-runtime-dir") {
+        if dir.join("libclang_rt.asan.a").exists() {
+            return Ok(None);
+        }
+    }
+    if let Some(p) = query("gcc", "-print-file-name=libasan.so") {
+        if p.is_absolute() && p.exists() {
+            return Ok(Some(p));
+        }
+    }
+    Err("--sanitize=address: no ASan runtime found (install libclang-rt-19-dev or GCC's libasan, \
+         or set LOIMI_ASAN_RUNTIME to a libasan.so)"
+        .to_string())
+}
+
+/// ASan instruments only functions that carry the `sanitize_address`
+/// attribute. Clang adds it to C functions, but IR input has none, so
+/// mark every definition. Leak checking is off by default: programs
+/// leave their heaps to the OS (ASAN_OPTIONS=detect_leaks=1 turns it on).
+fn sanitize_address(ir: &str) -> String {
+    let mut out = String::with_capacity(ir.len() + ir.len() / 16);
+    out.push_str(
+        "@loimi.asan_options = private constant [15 x i8] c\"detect_leaks=0\\00\"\n\
+         define ptr @__asan_default_options() {\n  ret ptr @loimi.asan_options\n}\n",
+    );
+    for line in ir.lines() {
+        match line.strip_suffix('{') {
+            Some(head) if line.starts_with("define ") => {
+                out.push_str(head);
+                out.push_str("sanitize_address {");
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -111,6 +165,7 @@ fn parse_args() -> Result<Opts, String> {
         dispatch: None,
         keep_ll: false,
         vm_stats: false,
+        sanitize_address: false,
     };
     match cmd.as_str() {
         "build" => {}
@@ -124,6 +179,10 @@ fn parse_args() -> Result<Opts, String> {
             "--emit-llvm" => o.emit_llvm = true,
             "--keep-ll" => o.keep_ll = true,
             "--vm-stats" => o.vm_stats = true,
+            "--sanitize=address" => o.sanitize_address = true,
+            s if s.starts_with("--sanitize=") => {
+                return Err(format!("unknown sanitizer `{}` (supported: address)", &s["--sanitize=".len()..]))
+            }
             "--" => {
                 o.run_args = args.by_ref().collect();
             }
@@ -190,19 +249,39 @@ fn main() -> ExitCode {
         if opts.run { tmpdir.join(&stem) } else { PathBuf::from(&stem) }
     });
     let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
-    let status = Command::new(&clang)
-        .arg(if opts.release { "-O3" } else { "-O1" })
+    let mut cmd = Command::new(&clang);
+    cmd.arg(if opts.release { "-O3" } else { "-O1" })
         .arg("-Wno-override-module")
         // Executables: absolute addressing lets dispatch index the table directly.
         .arg("-fno-pic")
-        .arg("-no-pie")
-        .arg("-x")
-        .arg("ir")
-        .arg(&ll)
-        .arg("-o")
-        .arg(&exe)
-        .arg("-lm")
-        .status();
+        .arg("-no-pie");
+    let asan_lib = if opts.sanitize_address {
+        match asan_runtime(&clang) {
+            Ok(lib) => lib,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+    if opts.sanitize_address {
+        // Use-after-return detection puts frames on a fake stack with a
+        // dynamic-alloca fallback, which LLVM cannot combine with stack
+        // realignment in `preserve_none` handlers (tail-call dispatch).
+        cmd.arg("-fsanitize=address")
+            .arg("-fsanitize-address-use-after-return=never")
+            .arg("-fno-omit-frame-pointer");
+        if asan_lib.is_some() {
+            cmd.arg("-fno-sanitize-link-runtime");
+        }
+    }
+    cmd.arg("-x").arg("ir").arg(&ll);
+    if let Some(lib) = &asan_lib {
+        cmd.arg("-x").arg("none").arg(lib);
+    }
+    let status = cmd.arg("-o").arg(&exe).arg("-lm").status();
     match status {
         Ok(s) if s.success() => {}
         Ok(_) => {
