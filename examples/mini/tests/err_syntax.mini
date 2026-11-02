@@ -1,0 +1,7 @@
+-- A syntax error is reported with its line, the source line and a caret.
+print("never printed")
+print("hello)
+-- expect-exit: 1
+-- expect-stderr: error: line 3: unfinished string
+-- expect-stderr:     3 | print("hello)
+-- expect-stderr:       |       ^^^^^^^

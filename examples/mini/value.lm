@@ -246,6 +246,12 @@ fn key_eq(a: V, b: V) -> bool {
     a == b
 }
 
+/// Constants (the compiler's std.bc.Pool) are equal when their bits are:
+/// strings are interned, and 1 and 1.0 stay apart.
+pub fn V.hash(v: V) -> u64 { hash.mix(v as u64) }
+pub fn V.eq(a: V, b: V) -> bool { a == b }
+impl hash.Hash for V;
+
 /// Index of the hash slot holding (normalized) key `k`, if present.
 fn hash_find(t: Gc<Table>, k: V) -> ?u64 {
     if t.hcap == 0 { return None; }

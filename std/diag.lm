@@ -110,6 +110,17 @@ pub fn SourceMap.line_text(sm: *SourceMap, id: u32, line: u32) -> str {
     f.text[lo..hi]
 }
 
+/// The span of 1-based line `line` without its terminator (an empty span
+/// at the end of the file if out of range), for errors that only know a
+/// line number.
+pub fn SourceMap.line_span(sm: *SourceMap, id: u32, line: u32) -> Span {
+    let f = sm.file(id);
+    f.index();
+    if line == 0 or line as u64 > f.line_starts.len { return span(id, f.text.len, f.text.len); }
+    let lo = f.line_starts.at(line as u64 - 1) as u64;
+    span(id, lo, lo + sm.line_text(id, line).len)
+}
+
 /// Append `name:line:col` for the start of `s`.
 pub fn SourceMap.write_location(sm: *SourceMap, out: *text.StrBuf, s: Span) {
     let lc = sm.line_col(s.file, s.lo);

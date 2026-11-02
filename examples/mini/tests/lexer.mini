@@ -1,0 +1,15 @@
+-- Lexical details handled by std.lex: escapes, long brackets, numerals.
+print("tab\tend", 'q"q', "\65\066\0671", "\x41\u{48}", "a\z
+      b")
+print([[long
+string]], #[==[a]]b]==])
+--[==[ a long
+comment ]] still ]==] print(0x10, 0xff + 1, 1e3, .5)
+print(#"\0\0", "x\
+y")
+-- expect: tab	end	q"q	ABC1	AH	ab
+-- expect: long
+-- expect: string	4
+-- expect: 16	256	1000.0	0.5
+-- expect: 2	x
+-- expect: y

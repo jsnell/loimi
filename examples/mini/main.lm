@@ -45,7 +45,7 @@ fn main() -> i32 {
     ctx.fp = ctx.frames;
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
     lib.install(&ctx.heap, ctx.globals);
-    let proto = compile.compile(&ctx.heap, src);
+    let proto = compile.compile(&ctx.heap, path, src);
     let main_closure = value.new_closure(&ctx.heap, proto);
     ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);
     Mini.run(&ctx, main_closure);

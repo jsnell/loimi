@@ -37,6 +37,14 @@ fn main() {
     io.print(sm.line_text(f, 5)); io.print("] [");
     io.print(sm.line_text(f, 9)); io.println("]");
     io.println(sm.snippet(diag.span(f, 6, 11)));
+    // Whole-line spans, for errors that only know a line number.
+    let lines: [u32; 3] = [2, 3, 9];
+    for i in 0..3 {
+        let ls = sm.line_span(f, lines[i]);
+        io.print_int(ls.lo as i64); io.print(".."); io.print_int(ls.hi as i64);
+        io.print(" ["); io.print(sm.snippet(ls)); io.print("] ");
+    }
+    io.println("|");
 
     // An error with a label, a note with a span, and a help line.
     render(&sm, diag.error(diag.span(f, 18, 25), "unfinished string")
@@ -93,6 +101,7 @@ fn main() {
 // expect: 1:1 1:12 2:1 2:7 5:1 5:1 1:1 |
 // expect: 5 1 [	if y then] [] []
 // expect: x = 1
+// expect: 12..25 [print("hello)] 26..36 [	if y then] 42..42 [] |
 // expect: error: unfinished string
 // expect:   --> script.mini:2:7
 // expect:     2 | print("hello)
