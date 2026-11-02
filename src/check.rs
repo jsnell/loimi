@@ -638,7 +638,7 @@ impl<'a> Checker<'a> {
             effects: effects_of(&f.attrs)?,
             sync_effects: 0,
             env: None,
-        env_val: vec![],
+            env_val: vec![],
         };
         Ok(())
     }

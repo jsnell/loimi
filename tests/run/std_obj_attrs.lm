@@ -88,7 +88,9 @@ fn main() uses gc {
     ks.clear();
     let n: u64 = 100;
     for i in 0..n { ks.push(1000 + (i * 37) % 100); ks.push(i % 3); }
-    obj.index_keys_first(&ks, 0 as *u8, index_of);
+    // The closure form: indices are the keys of at least `base`.
+    let base: u64 = 1000;
+    obj.index_keys_first_by(&ks, |k| if k >= base { (k - base) as i64 } else { -1 });
     var sorted = true;
     for i in 0..n { if ks.at(i) != 1000 + i { sorted = false; } }
     for i in 0..n { if ks.at(n + i) != i % 3 { sorted = false; } }
