@@ -51,6 +51,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
 - **vm functions** can read and write state but cannot use control words.
 - **Effects** must be declared; they are not inferred for private functions.
+  Function types carry no effects, so calls through function pointers are
+  not checked or rooted (see `design/closures-traits.md`, section 0).
 - **Verifier**: operand checks only. Stack-effect checking for stack VMs
   and "cannot fall off the end" are not implemented.
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
@@ -64,7 +66,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
 - **`inline for`** is token-level expansion: values are token sequences
   (so operators like `+` work), and `#var` makes an identifier from a
   string or identifier value.
-- **Not yet built**: traits/interfaces, a moving,
+- **Not yet built**: traits/interfaces and closures (see the proposal in
+  [`design/closures-traits.md`](design/closures-traits.md)), a moving,
   incremental or generational GC, weak references, ephemerons, finalizers,
   `std.bc`/`obj`/`rt`/`prof`/`test`, line tables,
   variable-length encodings, atomic `become` for shared code, and the C
