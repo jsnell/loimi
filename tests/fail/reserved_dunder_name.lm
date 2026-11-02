@@ -1,0 +1,7 @@
+// Names starting with `__` are reserved for generated items (vm
+// expansion declares the C functions it calls as `__extern_X`), so a
+// module's own items can never clash with them.
+extern "C" fn __extern_calloc(n: u64, size: u64) -> *u8;
+fn main() {
+}
+// error: `__extern_calloc`: names starting with `__` are reserved for generated items

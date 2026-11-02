@@ -978,9 +978,9 @@ fn generate_build_verified(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool, 
         if !jit {
             String::new()
         } else if konst {
-            format!("loimi_jit_register(__c.ptr as *u8, __c.len, {n}__const_pool({})); ", args[1..].join(", "))
+            format!("__extern_loimi_jit_register(__c.ptr as *u8, __c.len, {n}__const_pool({})); ", args[1..].join(", "))
         } else {
-            "loimi_jit_register(__c.ptr as *u8, __c.len, 0 as *u8); ".to_string()
+            "__extern_loimi_jit_register(__c.ptr as *u8, __c.len, 0 as *u8); ".to_string()
         }
     );
     // The escape hatch, as `assume_verified`: the object with its words,
@@ -1011,7 +1011,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     if jw {
         let _ = writeln!(
             s,
-            "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {} {{ loimi_jit_word(w) }} else {{ w }} }}",
+            "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {} {{ __extern_loimi_jit_word(w) }} else {{ w }} }}",
             enter_opcode(l)
         );
     } else {
@@ -1135,7 +1135,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     if jit {
         // The JIT's enter words go back first; afterwards it re-patches
         // the code of the instructions whose words changed.
-        let _ = writeln!(s, "  loimi_jit_invalidate(code.ptr as *u8);");
+        let _ = writeln!(s, "  __extern_loimi_jit_invalidate(code.ptr as *u8);");
     }
     let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
     // Longest first; a super's forwarding variants before it, those with
@@ -1194,7 +1194,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         );
     }
     if jit {
-        let _ = writeln!(s, "  loimi_jit_rewritten(code.ptr as *u8);");
+        let _ = writeln!(s, "  __extern_loimi_jit_rewritten(code.ptr as *u8);");
     }
     let _ = writeln!(s, "}}");
     // Deoptimization: every instruction word back to its family's
@@ -1204,7 +1204,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     // caches are zeroed, as the emitters leave them.
     let _ = writeln!(s, "{vis}fn {n}__deopt_words(__code: []{w}) {{");
     if jit {
-        let _ = writeln!(s, "  loimi_jit_invalidate(__code.ptr as *u8);");
+        let _ = writeln!(s, "  __extern_loimi_jit_invalidate(__code.ptr as *u8);");
     }
     let _ = writeln!(s, "  var __i: u64 = 0;\n  while __i < __code.len {{");
     let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
@@ -1214,7 +1214,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
     let _ = writeln!(s, "    __i += __size;\n  }}");
     if jit {
-        let _ = writeln!(s, "  loimi_jit_rewritten(__code.ptr as *u8);");
+        let _ = writeln!(s, "  __extern_loimi_jit_rewritten(__code.ptr as *u8);");
     }
     let _ = writeln!(s, "}}");
     s
@@ -1602,8 +1602,42 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
     Ok(())
 }
 
+/// Item names a module cannot declare, so that the items vm expansion
+/// adds to it never clash with the module's own: names starting with
+/// `__` (generated C declarations, `__extern_X`: see `c_externs`) and,
+/// for each vm `V` of the module, names starting with `V__` (`V.verify`
+/// is the generated `V__verify`).
+fn check_reserved_names(items: &[Item]) -> Res<()> {
+    let vms: Vec<&str> = items.iter().filter_map(|it| if let Item::Vm(v) = it { Some(v.name.name.as_str()) } else { None }).collect();
+    for it in items {
+        let name = match it {
+            Item::Fn(f) if f.recv.is_none() => &f.name,
+            Item::Struct(d) => &d.name,
+            Item::Enum(d) => &d.name,
+            Item::Const(d) => &d.name,
+            Item::Global(d) => &d.name,
+            Item::Trait(d) => &d.name,
+            Item::TypeAlias(d) => &d.name,
+            Item::Value(d) => &d.name,
+            Item::Vm(d) => &d.name,
+            _ => continue,
+        };
+        if name.name.starts_with("__") {
+            return Err(Diag::new(name.span, format!("`{}`: names starting with `__` are reserved for generated items", name.name)));
+        }
+        if let Some(vm) = vms.iter().find(|vm| name.name.strip_prefix(**vm).is_some_and(|r| r.starts_with("__"))) {
+            return Err(Diag::new(
+                name.span,
+                format!("`{}`: names starting with `{vm}__` are reserved for the items generated for vm `{vm}` in this module", name.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Generated code calls C functions through declarations named
-/// `__extern_X`, which link to `X`: a module may declare `X` itself.
+/// `__extern_X`, which link to `X`: a module may declare `X` itself, and
+/// cannot declare `__extern_X` (see `check_reserved_names`).
 fn c_externs(items: &mut [Item]) {
     for it in items {
         if let Item::Fn(f) = it {
@@ -1618,18 +1652,22 @@ fn c_externs(items: &mut [Item]) {
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
-        let mut externs = false;
+        // Each C function is declared once per module.
+        let (mut externs, mut jit_externs, mut word_extern) = (false, false, false);
+        check_reserved_names(&m.items)?;
         for it in &m.items {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
                 let mut src = generate(v, &l, jit);
-                if jit {
+                if jit && !jit_externs {
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.
-                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64, pool: *u8);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\nextern \"C\" fn loimi_jit_rewritten(code: *u8);\n");
-                    if maps_words(&l, jit) {
-                        src.push_str("extern \"C\" fn loimi_jit_word(w: u32) -> u32;\n");
-                    }
+                    src.push_str("extern \"C\" fn __extern_loimi_jit_register(code: *u8, n: u64, pool: *u8);\nextern \"C\" fn __extern_loimi_jit_invalidate(code: *u8);\nextern \"C\" fn __extern_loimi_jit_rewritten(code: *u8);\n");
+                    jit_externs = true;
+                }
+                if maps_words(&l, jit) && !word_extern {
+                    src.push_str("extern \"C\" fn __extern_loimi_jit_word(w: u32) -> u32;\n");
+                    word_extern = true;
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
                 if has_stack(v) {

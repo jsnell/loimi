@@ -1,0 +1,12 @@
+// Items vm `V` generates in its module are named `V__..`: the module
+// cannot declare such names itself.
+fn V__op_name(x: i64) -> i64 { x }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+fn main() {
+}
+// error: `V__op_name`: names starting with `V__` are reserved
