@@ -1,0 +1,465 @@
+// The Stak virtual machine: a data stack, a locals stack and a frame stack.
+//
+// State registers: `pc`, `sp` (points AT the top value; the empty stack
+// is `stack - 1`), `lp` (the current word's local slots) and `fp` (the
+// current frame). The compiler checks stack depths statically, so ops pop
+// and push without underflow checks; CALL checks for overflow once per
+// call, against the callee's maximum depth.
+
+import std.io;
+import std.gc;
+import std.mem;
+import std.text;
+import value;
+import value.{Value, Word};
+
+extern "C" fn fmod(x: f64, y: f64) -> f64;
+extern "C" fn sqrt(x: f64) -> f64;
+
+/// One activation. `ret` is where the caller continues and `lp` the
+/// caller's locals, both saved by CALL in the callee's frame.
+pub struct Frame { word: *Word, ret: *u32, lp: *Value }
+
+pub struct Machine {
+    stack: *Value,
+    stack_end: *Value,
+    lstack: *Value,
+    lstack_end: *Value,
+    frames: *Frame,
+    frames_end: *Frame,
+    /// Every compiled word, by index (CALL's operand).
+    words: *mem.Vec<*Word>,
+    consts: *Value,
+    nconsts: u32,
+    globals: *Value,
+    nglobals: u32,
+    heap: gc.Heap,
+    /// The state as of the last sync, for the root scanner.
+    sp: *Value,
+    lp: *Value,
+    fp: *Frame,
+    out: text.StrBuf,
+    tmp: text.StrBuf,
+    err: text.StrBuf,
+    /// Where the last run-time error happened.
+    error_line: u32,
+    error_word: str,
+}
+
+/// GC roots: the data stack up to `sp`, the locals of every active frame,
+/// the globals and the constants.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let m = data as *Machine;
+    var p = m.stack;
+    while p <= m.sp { gc_mark(h, *p); p = p + 1; }
+    let ltop = m.lp + m.fp.word.nlocals as u64;
+    p = m.lstack;
+    while p < ltop { gc_mark(h, *p); p = p + 1; }
+    for i in 0..m.nglobals as u64 { gc_mark(h, m.globals[i]); }
+    for i in 0..m.nconsts as u64 { gc_mark(h, m.consts[i]); }
+}
+
+pub enum Arith { Add, Sub, Mul, Div, Mod }
+
+fn type_error(what: str, v: Value, m: *Machine) -> str {
+    m.err.clear();
+    m.err.push_str(what);
+    m.err.push_str(" on ");
+    m.err.push_str(value.type_name(v));
+    m.err.as_str()
+}
+
+/// Arithmetic outside the fast paths: overflow, mixed operands, division,
+/// type errors.
+fn arith(m: *Machine, op: Arith, a: Value, b: Value) -> Result<Value, str> {
+    if let (Int(x), Int(y)) = (a, b) {
+        let (x, y) = (x as i64, y as i64);
+        let r = match op {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            Div => { if y == 0 { return Err("division by zero"); } x / y }
+            Mod => {
+                if y == 0 { return Err("division by zero"); }
+                let r = x % y;
+                if r != 0 and ((r < 0) != (y < 0)) { r + y } else { r }
+            }
+        };
+        if r >= -2147483648 and r <= 2147483647 { return Ok(Value.Int(r as i32)); }
+        return Ok(Value.Num(r as f64));
+    }
+    let Some(x) = value.to_f64(a) else { return Err(type_error("arithmetic", a, m)); };
+    let Some(y) = value.to_f64(b) else { return Err(type_error("arithmetic", b, m)); };
+    Ok(Value.Num(match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => x / y,
+        Mod => { let r = fmod(x, y); if r != 0.0 and ((r < 0.0) != (y < 0.0)) { r + y } else { r } }
+    }))
+}
+
+fn less(m: *Machine, a: Value, b: Value, or_equal: bool) -> Result<bool, str> {
+    if let (Str(x), Str(y)) = (a, b) {
+        let n = if x.data.len < y.data.len { x.data.len } else { y.data.len };
+        for i in 0..n {
+            if x.data[i] != y.data[i] { return Ok(x.data[i] < y.data[i]); }
+        }
+        return Ok(if or_equal { x.data.len <= y.data.len } else { x.data.len < y.data.len });
+    }
+    let Some(x) = value.to_f64(a) else { return Err(type_error("comparison", a, m)); };
+    let Some(y) = value.to_f64(b) else { return Err(type_error("comparison", b, m)); };
+    Ok(if or_equal { x <= y } else { x < y })
+}
+
+fn equal(a: Value, b: Value) -> bool {
+    if let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) { return x == y; }
+    if let (Str(x), Str(y)) = (a, b) { return x.data.eq(y.data); }
+    a == b
+}
+
+/// `a b concat`, or `a tostr` when `two` is false: the text of the top
+/// value(s) as a new string. The operands are still on the stack, so they
+/// are roots if this collects.
+fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Value uses gc {
+    gc.maybe_collect(&m.heap);
+    m.tmp.clear();
+    value.write(&m.tmp, a);
+    if two { value.write(&m.tmp, b); }
+    Value.Str(value.new_str(&m.heap, m.tmp.as_str()))
+}
+
+#[require_verified]
+pub vm Stak {
+    context ctx: *Machine;
+    state { pc: *u32, sp: *Value, lp: *Value, fp: *Frame }
+
+    verify_context word: *Word, nglobals: u32, nconsts: u32, nwords: u32;
+
+    operand imm = it;
+    operand kst = ctx.consts[it] verify (it as u32) < nconsts display "k{}";
+    operand loc = lp[it] verify (it as u32) < word.nlocals display "l{}";
+    /// A `do` loop's index slot; the limit is in the slot after it.
+    operand dslot = lp[it] verify (it as u32) + 1 < word.nlocals display "l{}";
+    operand glob = ctx.globals[it] verify (it as u32) < nglobals display "g{}";
+    operand wref = it verify (it as u32) < nwords display "w{}";
+    operand cnt = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    sync { ctx.sp = sp; ctx.lp = lp; ctx.fp = fp; }
+
+    encoding fixed(u32) {
+        format N  { op: 8, x: 24 }
+        format S  { op: 8, sx: s24 }
+        format LS { op: 8, a: 8, sb: s16 }
+    }
+
+    fn push(v: Value) { sp = sp + 1; *sp = v; }
+
+    // Literals.
+    op PUSHI(v: imm) : S { push(Int(v as i32)); next }
+    op PUSHK(c: kst) : N { push(c); next }
+    op PUSHNIL() : N { push(Nil); next }
+    op PUSHBOOL(b: imm) : N { push(Bool(b != 0)); next }
+
+    // Stack shuffling.
+    op DUP() : N { let v = *sp; push(v); next }
+    op DROP() : N { sp = sp - 1; next }
+    op SWAP() : N { let b = *sp; *sp = *(sp - 1); *(sp - 1) = b; next }
+    op OVER() : N { let v = *(sp - 1); push(v); next }
+    op ROT() : N {
+        // a b c -- b c a
+        let a = *(sp - 2);
+        *(sp - 2) = *(sp - 1);
+        *(sp - 1) = *sp;
+        *sp = a;
+        next
+    }
+    op NIP() : N { *(sp - 1) = *sp; sp = sp - 1; next }
+    op TUCK() : N {
+        // a b -- b a b
+        let b = *sp;
+        let a = *(sp - 1);
+        *(sp - 1) = b;
+        *sp = a;
+        push(b);
+        next
+    }
+    op DUP2() : N { let a = *(sp - 1); let b = *sp; push(a); push(b); next }
+    op DROP2() : N { sp = sp - 2; next }
+
+    // Arithmetic: ( a b -- c ).
+    inline for (name, checked, sym, kind) in [
+        ("ADD", "add_checked", +, Arith.Add),
+        ("SUB", "sub_checked", -, Arith.Sub),
+        ("MUL", "mul_checked", *, Arith.Mul),
+    ] {
+        op #name() : N {
+            let b = *sp;
+            let a = *(sp - 1);
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { sp = sp - 1; *sp = Int(r); next },
+                (Num(x), Num(y)) => { sp = sp - 1; *sp = Num(x sym y); next }
+                _ => {}
+            }
+            cold { let r = arith(ctx, kind, a, b)?; sp = sp - 1; *sp = r; next }
+        }
+    }
+    op DIV() : N {
+        let b = *sp;
+        let a = *(sp - 1);
+        match (a, b) {
+            (Int(x), Int(y)) if y > 0 => { sp = sp - 1; *sp = Int(x / y); next }
+            (Num(x), Num(y)) => { sp = sp - 1; *sp = Num(x / y); next }
+            _ => {}
+        }
+        cold { let r = arith(ctx, Arith.Div, a, b)?; sp = sp - 1; *sp = r; next }
+    }
+    op MOD() : N {
+        let b = *sp;
+        let a = *(sp - 1);
+        if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 { sp = sp - 1; *sp = Int(x % y); next }
+        cold { let r = arith(ctx, Arith.Mod, a, b)?; sp = sp - 1; *sp = r; next }
+    }
+    op NEG() : N {
+        match *sp {
+            Int(x) => if x != -2147483648 { *sp = Int(0 - x); next },
+            Num(x) => { *sp = Num(-x); next }
+            _ => {}
+        }
+        cold { *sp = arith(ctx, Arith.Sub, Value.Int(0), *sp)?; next }
+    }
+    op ABS() : N {
+        match *sp {
+            Int(x) => if x != -2147483648 { if x < 0 { *sp = Int(0 - x); } next },
+            Num(x) => { if x < 0.0 { *sp = Num(-x); } next }
+            _ => {}
+        }
+        cold {
+            let v = *sp;
+            if let Int(_) = v { *sp = Num(2147483648.0); next }
+            raise type_error("abs", v, ctx)
+        }
+    }
+
+    // Comparisons: ( a b -- bool ).
+    inline for (name, test, slow) in [
+        ("LT", x < y, less(ctx, a, b, false)),
+        ("LE", x <= y, less(ctx, a, b, true)),
+        ("GT", x > y, less(ctx, b, a, false)),
+        ("GE", x >= y, less(ctx, b, a, true)),
+    ] {
+        op #name() : N {
+            let b = *sp;
+            let a = *(sp - 1);
+            match (a, b) {
+                (Int(x), Int(y)) => { sp = sp - 1; *sp = Bool(test); next }
+                (Num(x), Num(y)) => { sp = sp - 1; *sp = Bool(test); next }
+                _ => {}
+            }
+            cold { let r = slow?; sp = sp - 1; *sp = Bool(r); next }
+        }
+    }
+    op EQ() : N {
+        let b = *sp;
+        let a = *(sp - 1);
+        sp = sp - 1;
+        if let (Int(x), Int(y)) = (a, b) { *sp = Bool(x == y); next }
+        *sp = Bool(equal(a, b));
+        next
+    }
+    op NE() : N {
+        let b = *sp;
+        let a = *(sp - 1);
+        sp = sp - 1;
+        if let (Int(x), Int(y)) = (a, b) { *sp = Bool(x != y); next }
+        *sp = Bool(!equal(a, b));
+        next
+    }
+    op NOT() : N { *sp = Bool(!value.truthy(*sp)); next }
+    op AND() : N {
+        let b = *sp;
+        sp = sp - 1;
+        *sp = Bool(value.truthy(*sp) and value.truthy(b));
+        next
+    }
+    op OR() : N {
+        let b = *sp;
+        sp = sp - 1;
+        *sp = Bool(value.truthy(*sp) or value.truthy(b));
+        next
+    }
+
+    // Locals and globals.
+    op LGET(l: loc) : N { push(l); next }
+    op LSET(l: loc) : N { l = *sp; sp = sp - 1; next }
+    op GGET(g: glob) : N { push(g); next }
+    op GSET(g: glob) : N { g = *sp; sp = sp - 1; next }
+
+    // Branches.
+    op JMP(target: label) : S { jump target }
+    op JZ(target: label) : S {
+        let v = *sp;
+        sp = sp - 1;
+        if !value.truthy(v) { jump target }
+        next
+    }
+
+    // Counted loops. DO pops `limit start` into the slot pair and skips
+    // the loop if start >= limit; LOOP increments and jumps back while
+    // the index is below the limit.
+    op DO(s: dslot, target: label) : LS {
+        let start = *sp;
+        let limit = *(sp - 1);
+        sp = sp - 2;
+        if let (Int(a), Int(b)) = (start, limit) {
+            s = start;
+            lp[s.raw + 1] = limit;
+            if a >= b { jump target }
+            next
+        }
+        cold { raise "do: the bounds must be integers" }
+    }
+    op LOOP(s: dslot, target: label) : LS {
+        if let (Int(i), Int(n)) = (s, lp[s.raw + 1]) {
+            let j = i + 1;
+            s = Int(j);
+            if j < n { jump target }
+            next
+        }
+        cold { raise "loop: corrupted index" }
+    }
+
+    // Calls. Arguments stay where they are on the data stack; the callee
+    // gets fresh local slots above the caller's.
+    op CALL(w: wref) : N {
+        let callee = ctx.words.ptr[w];
+        let nlp = lp + fp.word.nlocals as u64;
+        if sp + callee.maxdepth as u64 >= ctx.stack_end or nlp + callee.nlocals as u64 > ctx.lstack_end
+            or fp + 1 == ctx.frames_end {
+            cold { raise "stack overflow" }
+        }
+        // Slots past the caller's may hold dead objects from earlier
+        // calls; the root scanner reads them, so clear them.
+        for i in 0..callee.nlocals as u64 { nlp[i] = Nil; }
+        fp = fp + 1;
+        fp.word = callee;
+        fp.ret = pc + 1;
+        fp.lp = lp;
+        lp = nlp;
+        jump callee.code
+    }
+    op RET() : N {
+        if fp == ctx.frames { exit Ok(()) }
+        lp = fp.lp;
+        let r = fp.ret;
+        fp = fp - 1;
+        jump r
+    }
+    op HALT() : N { exit Ok(()) }
+
+    // Builtins.
+    op PRINT() : N {
+        ctx.out.clear();
+        value.write(&ctx.out, *sp);
+        sp = sp - 1;
+        io.println(ctx.out.as_str());
+        next
+    }
+    op DOT() : N {
+        ctx.out.clear();
+        value.write(&ctx.out, *sp);
+        ctx.out.push(' ');
+        sp = sp - 1;
+        io.print(ctx.out.as_str());
+        next
+    }
+    op CR() : N { io.println(""); next }
+    op CONCAT() : N {
+        let r = stringify(ctx, *(sp - 1), *sp, true);
+        sp = sp - 1;
+        *sp = r;
+        next
+    }
+    op TOSTR() : N {
+        if let Str(_) = *sp { next }
+        *sp = stringify(ctx, *sp, Nil, false);
+        next
+    }
+    op LEN() : N {
+        match *sp {
+            Str(s) => { *sp = Int(s.data.len as i32); next }
+            Arr(a) => { *sp = Int(a.items.len as i32); next }
+            _ => {}
+        }
+        cold { raise type_error("len", *sp, ctx) }
+    }
+    op ARRAY() : N {
+        if let Int(n) = *sp and n >= 0 {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            *sp = Arr(value.new_arr(&ctx.heap, n as u64));
+            next
+        }
+        cold { raise "array: the size must be a non-negative integer" }
+    }
+    /// The top `n` values become an array.
+    op MKARRAY(n: cnt) : N {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let a = new(&ctx.heap, value.Arr {}, n);
+        let base = sp + 1 - n;
+        for i in 0..n { a.items[i] = base[i]; }
+        sp = base;
+        *sp = Arr(a);
+        next
+    }
+    op AT() : N {
+        if let (Arr(a), Int(i)) = (*(sp - 1), *sp) {
+            let u = i as u64;
+            if u < a.items.len { sp = sp - 1; *sp = a.items.ptr[u]; next }
+            cold { raise "index out of range" }
+        }
+        cold { raise type_error("@", *(sp - 1), ctx) }
+    }
+    op STORE() : N {
+        if let (Arr(a), Int(i)) = (*(sp - 1), *sp) {
+            let u = i as u64;
+            if u < a.items.len { a.items.ptr[u] = *(sp - 2); sp = sp - 3; next }
+            cold { raise "index out of range" }
+        }
+        cold { raise type_error("!", *(sp - 1), ctx) }
+    }
+    op SQRT() : N {
+        if let Some(x) = value.to_f64(*sp) { *sp = Num(sqrt(x)); next }
+        cold { raise type_error("sqrt", *sp, ctx) }
+    }
+    op TOINT() : N {
+        match *sp {
+            Int(_) => next,
+            Num(x) => if x > -2147483649.0 and x < 2147483648.0 { *sp = Int(x as i32); next },
+            _ => {}
+        }
+        cold { raise "int: not a number in the int range" }
+    }
+
+    entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc {
+        ctx = m;
+        fp = m.frames;
+        fp.word = main;
+        fp.lp = m.lstack;
+        lp = m.lstack;
+        for i in 0..main.nlocals as u64 { lp[i] = Nil; }
+        sp = m.stack - 1;
+        m.sp = sp;
+        m.lp = lp;
+        m.fp = fp;
+        jump main.code
+    }
+
+    on raise(msg: str) {
+        let w = fp.word;
+        let i = ((pc as u64) - (w.code.start() as u64)) / 4;
+        ctx.error_line = w.lines[i];
+        ctx.error_word = w.name;
+        fail msg
+    }
+}

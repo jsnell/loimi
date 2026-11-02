@@ -1,0 +1,589 @@
+// Single-pass compiler from Stak source to Stak bytecode.
+//
+// Tokens are whitespace-separated words, read with a std.lex Cursor.
+// Each definition compiles into its own Word; the top-level code into
+// `main`. The compiler tracks the data-stack depth through every word, so
+// underflow and unbalanced branches are compile-time errors and each Word
+// knows its maximum depth.
+
+import std.bc;
+import std.diag;
+import std.gc;
+import std.lex;
+import std.map;
+import std.mem;
+import std.num;
+import std.text;
+import value;
+import value.{Value, Word};
+import vm.{Stak};
+
+pub struct Program { main: *Word, words: mem.Vec<*Word>, consts: []Value, nglobals: u32 }
+
+pub struct Error { msg: str, span: diag.Span }
+
+enum Kind { Name, Str, Int, Float }
+
+struct Tok { kind: Kind, text: str, int: i64, float: f64, span: diag.Span, line: u32 }
+
+/// What a name in the dictionary means.
+enum Entry { Call(u32), Global(u32) }
+
+/// An open control structure.
+enum Ctl {
+    /// `if`: the label of the else part, and the depth after the condition.
+    If(bc.Label, i32),
+    /// `else`: the end label, and the then-branch's end depth and deadness.
+    Else(bc.Label, i32, bool),
+    /// `begin`: the loop head and its depth.
+    Begin(bc.Label, i32),
+    /// `while`: the loop head, the exit label, the depth at `begin`, and
+    /// the depth after the condition (where the loop exits).
+    While(bc.Label, bc.Label, i32, i32),
+    /// `do`: the index slot, the body head, the exit label, the depth.
+    Do(u32, bc.Label, bc.Label, i32),
+    /// `[`: the depth when it opened.
+    Bracket(i32),
+}
+
+struct Local { name: str, slot: u32 }
+
+/// The state of compiling one word (or the top level).
+struct Def {
+    word: *Word,
+    code: bc.Code<u32>,
+    locals: mem.Vec<Local>,
+    nlocals: u32,
+    /// The stack depth relative to the word's entry (inputs included).
+    depth: i32,
+    maxdepth: i32,
+    /// After `exit`: the code here cannot run, so depths do not matter.
+    dead: bool,
+    ctl: mem.Vec<Ctl>,
+    toplevel: bool,
+}
+
+struct Comp {
+    cur: lex.Cursor,
+    buf: text.StrBuf,
+    arena: *mem.Arena,
+    heap: *gc.Heap,
+    dict: map.HashMap<str, Entry>,
+    words: mem.Vec<*Word>,
+    nglobals: u32,
+    consts: bc.Pool<Value>,
+    /// Strings already in the pool, so equal literals share a constant.
+    strs: map.HashMap<str, u32>,
+    /// A token pushed back by `peek`.
+    ahead: ?Tok,
+}
+
+fn Comp.err(c: *Comp, span: diag.Span, msg: str) -> Error { Error { msg: msg, span: span } }
+
+/// Joins message parts into an arena string.
+fn Comp.fmt(c: *Comp, a: str, b: str, d: str) -> str {
+    c.buf.clear();
+    c.buf.push_str(a);
+    c.buf.push_str(b);
+    c.buf.push_str(d);
+    c.arena.str(c.buf.as_str())
+}
+
+fn Comp.fmt_n(c: *Comp, a: str, n: i64, b: str, m: i64, d: str) -> str {
+    c.buf.clear();
+    c.buf.push_str(a);
+    c.buf.push_int(n);
+    c.buf.push_str(b);
+    c.buf.push_int(m);
+    c.buf.push_str(d);
+    c.arena.str(c.buf.as_str())
+}
+
+// ── tokens ──────────────────────────────────────────────────────────
+
+fn Comp.next(c: *Comp) -> Result<?Tok, Error> {
+    if let Some(t) = c.ahead { c.ahead = None; return Ok(Some(t)); }
+    let cur = &c.cur;
+    match cur.skip_trivia() {
+        Ok(_) => {}
+        Err(e) => return Err(Error { msg: e.msg, span: e.span }),
+    }
+    if cur.at_end() { return Ok(None); }
+    let start = cur.pos;
+    let line = cur.line;
+    if cur.peek() == '"' {
+        c.buf.clear();
+        match cur.quoted(&c.buf) {
+            Ok(_) => {}
+            Err(e) => return Err(Error { msg: e.msg, span: e.span }),
+        }
+        let s = c.arena.str(c.buf.as_str());
+        return Ok(Some(Tok { kind: Kind.Str, text: s, int: 0, float: 0.0, span: cur.span_from(start), line: line }));
+    }
+    while !cur.at_end() and !lex.is_space(cur.peek()) { cur.bump(); }
+    let text = cur.since(start);
+    var t = Tok { kind: Kind.Name, text: text, int: 0, float: 0.0, span: cur.span_from(start), line: line };
+    let c0 = text[0];
+    if lex.is_digit(c0) or ((c0 == '-' or c0 == '.') and text.len > 1 and (lex.is_digit(text[1]) or text[1] == '.')) {
+        if let Ok(v) = num.parse_int(text) {
+            t.kind = Kind.Int;
+            t.int = v;
+        } else if let Ok(f) = num.parse_f64(text) {
+            t.kind = Kind.Float;
+            t.float = f;
+        } else {
+            return Err(c.err(t.span, "malformed number"));
+        }
+    }
+    Ok(Some(t))
+}
+
+fn Comp.expect_name(c: *Comp, after: diag.Span, what: str) -> Result<Tok, Error> {
+    let Some(t) = c.next()? else { return Err(c.err(after, c.fmt("expected ", what, " here"))); };
+    if t.kind != Kind.Name { return Err(c.err(t.span, c.fmt("expected ", what, ""))); }
+    Ok(t)
+}
+
+/// Skips a `( ... )` comment whose `(` was just read.
+fn Comp.skip_comment(c: *Comp, open: diag.Span) -> Result<(), Error> {
+    loop {
+        let Some(t) = c.next()? else { return Err(c.err(open, "unterminated `(` comment")); };
+        if t.kind == Kind.Name and t.text.eq(")") { return Ok(()); }
+    }
+}
+
+// ── emitting, with depth tracking ───────────────────────────────────
+
+fn Def.new(name: str, nin: u32, nout: u32, toplevel: bool) -> Def {
+    let w: *Word = mem.alloc(1);
+    *w = Word {
+        name: name, nin: nin, nout: nout, nlocals: 0, maxdepth: 0,
+        words: mem.alloc<u32>(1).slice(0), code: Stak.placeholder(), lines: mem.alloc<u32>(1).slice(0),
+    };
+    Def {
+        word: w, code: bc.Code.new(Stak.op_size, Stak.set_label), locals: mem.Vec.new(), nlocals: 0,
+        depth: nin as i32, maxdepth: nin as i32, dead: false, ctl: mem.Vec.new(), toplevel: toplevel,
+    }
+}
+
+fn Def.emit(d: *Def, w: u32, line: u32) {
+    d.code.set_loc(line);
+    d.code.op(w);
+}
+
+/// Accounts for an operation that pops `nin` values and pushes `nout`.
+fn Comp.effect(c: *Comp, d: *Def, t: *Tok, nin: u32, nout: u32) -> Result<(), Error> {
+    if d.dead { return Ok(()); }
+    if d.depth < nin as i32 {
+        return Err(c.err(t.span, c.fmt_n("stack underflow: this needs ", nin as i64, " values, but the stack has ", d.depth as i64, "")));
+    }
+    d.depth = d.depth - nin as i32 + nout as i32;
+    if d.depth > d.maxdepth { d.maxdepth = d.depth; }
+    Ok(())
+}
+
+fn Comp.op(c: *Comp, d: *Def, t: *Tok, w: u32, nin: u32, nout: u32) -> Result<(), Error> {
+    c.effect(d, t, nin, nout)?;
+    d.emit(w, t.line);
+    Ok(())
+}
+
+fn Comp.konst(c: *Comp, t: *Tok, v: Value) -> Result<u32, Error> {
+    let Some(k) = c.consts.add(v) else { return Err(c.err(t.span, "too many constants")); };
+    if k >= (1 << 24) { return Err(c.err(t.span, "too many constants")); }
+    Ok(k)
+}
+
+/// Joins two control-flow paths: (depth, dead) of each.
+fn Comp.merge(c: *Comp, d: *Def, t: *Tok, a: i32, a_dead: bool, b: i32, b_dead: bool) -> Result<(), Error> {
+    if a_dead and b_dead { d.dead = true; return Ok(()); }
+    d.dead = false;
+    if a_dead { d.depth = b; return Ok(()); }
+    if b_dead { d.depth = a; return Ok(()); }
+    if a != b {
+        return Err(c.err(t.span, c.fmt_n("the branches leave different stack depths (", a as i64, " and ", b as i64, ")")));
+    }
+    d.depth = a;
+    Ok(())
+}
+
+/// Built-in words: the instruction and its stack effect.
+fn builtin(name: str) -> ?(u32, u32, u32) {
+    if name.eq("dup") { return Some((Stak.DUP(), 1, 2)); }
+    if name.eq("drop") { return Some((Stak.DROP(), 1, 0)); }
+    if name.eq("swap") { return Some((Stak.SWAP(), 2, 2)); }
+    if name.eq("over") { return Some((Stak.OVER(), 2, 3)); }
+    if name.eq("rot") { return Some((Stak.ROT(), 3, 3)); }
+    if name.eq("nip") { return Some((Stak.NIP(), 2, 1)); }
+    if name.eq("tuck") { return Some((Stak.TUCK(), 2, 3)); }
+    if name.eq("2dup") { return Some((Stak.DUP2(), 2, 4)); }
+    if name.eq("2drop") { return Some((Stak.DROP2(), 2, 0)); }
+    if name.eq("+") { return Some((Stak.ADD(), 2, 1)); }
+    if name.eq("-") { return Some((Stak.SUB(), 2, 1)); }
+    if name.eq("*") { return Some((Stak.MUL(), 2, 1)); }
+    if name.eq("/") { return Some((Stak.DIV(), 2, 1)); }
+    if name.eq("mod") { return Some((Stak.MOD(), 2, 1)); }
+    if name.eq("negate") { return Some((Stak.NEG(), 1, 1)); }
+    if name.eq("abs") { return Some((Stak.ABS(), 1, 1)); }
+    if name.eq("=") { return Some((Stak.EQ(), 2, 1)); }
+    if name.eq("<>") { return Some((Stak.NE(), 2, 1)); }
+    if name.eq("<") { return Some((Stak.LT(), 2, 1)); }
+    if name.eq("<=") { return Some((Stak.LE(), 2, 1)); }
+    if name.eq(">") { return Some((Stak.GT(), 2, 1)); }
+    if name.eq(">=") { return Some((Stak.GE(), 2, 1)); }
+    if name.eq("not") { return Some((Stak.NOT(), 1, 1)); }
+    if name.eq("and") { return Some((Stak.AND(), 2, 1)); }
+    if name.eq("or") { return Some((Stak.OR(), 2, 1)); }
+    if name.eq("print") { return Some((Stak.PRINT(), 1, 0)); }
+    if name.eq(".") { return Some((Stak.DOT(), 1, 0)); }
+    if name.eq("cr") { return Some((Stak.CR(), 0, 0)); }
+    if name.eq("concat") { return Some((Stak.CONCAT(), 2, 1)); }
+    if name.eq("tostr") { return Some((Stak.TOSTR(), 1, 1)); }
+    if name.eq("len") { return Some((Stak.LEN(), 1, 1)); }
+    if name.eq("array") { return Some((Stak.ARRAY(), 1, 1)); }
+    if name.eq("@") { return Some((Stak.AT(), 2, 1)); }
+    if name.eq("!") { return Some((Stak.STORE(), 3, 0)); }
+    if name.eq("sqrt") { return Some((Stak.SQRT(), 1, 1)); }
+    if name.eq("int") { return Some((Stak.TOINT(), 1, 1)); }
+    if name.eq("true") { return Some((Stak.PUSHBOOL(1), 0, 1)); }
+    if name.eq("false") { return Some((Stak.PUSHBOOL(0), 0, 1)); }
+    if name.eq("nil") { return Some((Stak.PUSHNIL(), 0, 1)); }
+    None
+}
+
+fn Def.local(d: *Def, name: str) -> ?u32 {
+    var i = d.locals.len;
+    while i > 0 {
+        i -= 1;
+        let l = d.locals.at(i);
+        if l.name.eq(name) { return Some(l.slot); }
+    }
+    None
+}
+
+fn Def.new_slot(d: *Def, n: u32) -> u32 {
+    let s = d.nlocals;
+    d.nlocals += n;
+    s
+}
+
+/// The index slot of the `n`th innermost `do` loop.
+fn Def.do_slot(d: *Def, n: u32) -> ?u32 {
+    var i = d.ctl.len;
+    var seen: u32 = 0;
+    while i > 0 {
+        i -= 1;
+        if let Do(s, _, _, _) = d.ctl.at(i) {
+            if seen == n { return Some(s); }
+            seen += 1;
+        }
+    }
+    None
+}
+
+// ── words ───────────────────────────────────────────────────────────
+
+/// Compiles one token into `d`. Returns false at the `;` that ends a
+/// definition.
+fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
+    var t = t;
+    let line = t.line;
+    match t.kind {
+        Int => {
+            let v = t.int;
+            if v >= -(1 << 23) and v < (1 << 23) {
+                c.op(d, &t, Stak.PUSHI(v as i32), 0, 1)?;
+                return Ok(true);
+            }
+            let val = if v >= -2147483648 and v <= 2147483647 { Value.Int(v as i32) } else { Value.Num(v as f64) };
+            let k = c.konst(&t, val)?;
+            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            return Ok(true);
+        }
+        Float => {
+            let k = c.konst(&t, Value.Num(t.float))?;
+            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            return Ok(true);
+        }
+        Str => {
+            let k = match c.strs.get(t.text) {
+                Some(k) => k,
+                None => {
+                    let k = c.konst(&t, Value.Str(value.new_str(c.heap, t.text)))?;
+                    c.strs.insert(t.text, k);
+                    k
+                }
+            };
+            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            return Ok(true);
+        }
+        Name => {}
+    }
+    let s = t.text;
+    if s.eq("(") { c.skip_comment(t.span)?; return Ok(true); }
+    if s.eq(";") {
+        if d.toplevel { return Err(c.err(t.span, "`;` outside a definition")); }
+        return Ok(false);
+    }
+    if s.eq(":") { return Err(c.err(t.span, "definitions cannot be nested")); }
+    if s.eq("var") {
+        if !d.toplevel { return Err(c.err(t.span, "`var` is only allowed at the top level")); }
+        let n = c.expect_name(t.span, "a variable name")?;
+        c.dict.insert(n.text, Entry.Global(c.nglobals));
+        c.nglobals += 1;
+        return Ok(true);
+    }
+    if s.eq("{") {
+        if d.toplevel { return Err(c.err(t.span, "locals are only allowed in definitions")); }
+        var names: mem.Vec<Tok> = mem.Vec.new();
+        defer names.free();
+        loop {
+            let n = c.expect_name(t.span, "a local name or `}`")?;
+            if n.text.eq("}") { break; }
+            names.push(n);
+        }
+        c.effect(d, &t, names.len as u32, 0)?;
+        let base = d.new_slot(names.len as u32);
+        var i = names.len;
+        while i > 0 {
+            i -= 1;
+            d.emit(Stak.LSET(base + i as u32), line);
+        }
+        for j in 0..names.len { d.locals.push(Local { name: names.at(j).text, slot: base + j as u32 }); }
+        return Ok(true);
+    }
+    if s.eq("to") {
+        var n = c.expect_name(t.span, "a variable name")?;
+        if let Some(slot) = d.local(n.text) {
+            c.op(d, &n, Stak.LSET(slot), 1, 0)?;
+            return Ok(true);
+        }
+        if let Some(Global(g)) = c.dict.get(n.text) {
+            c.op(d, &n, Stak.GSET(g), 1, 0)?;
+            return Ok(true);
+        }
+        return Err(c.err(n.span, c.fmt("`", n.text, "` is not a local or a variable")));
+    }
+    if s.eq("if") {
+        c.effect(d, &t, 1, 0)?;
+        let l = d.code.label();
+        d.code.set_loc(line);
+        d.code.jump(Stak.JZ(0), l);
+        d.ctl.push(Ctl.If(l, d.depth));
+        return Ok(true);
+    }
+    if s.eq("else") {
+        let Some(If(l, start)) = d.ctl.pop() else { return Err(c.err(t.span, "`else` without `if`")); };
+        let end = d.code.label();
+        d.code.set_loc(line);
+        d.code.jump(Stak.JMP(0), end);
+        d.code.bind(l);
+        d.ctl.push(Ctl.Else(end, d.depth, d.dead));
+        // The else branch starts from the depth after the condition.
+        d.depth = start;
+        d.dead = false;
+        return Ok(true);
+    }
+    if s.eq("then") {
+        match d.ctl.pop() {
+            Some(If(l, start)) => {
+                d.code.bind(l);
+                c.merge(d, &t, start, false, d.depth, d.dead)?;
+            }
+            Some(Else(end, a, a_dead)) => {
+                d.code.bind(end);
+                c.merge(d, &t, a, a_dead, d.depth, d.dead)?;
+            }
+            _ => return Err(c.err(t.span, "`then` without `if`")),
+        }
+        return Ok(true);
+    }
+    if s.eq("begin") {
+        d.ctl.push(Ctl.Begin(d.code.here(), d.depth));
+        return Ok(true);
+    }
+    if s.eq("until") {
+        let Some(Begin(top, depth)) = d.ctl.pop() else { return Err(c.err(t.span, "`until` without `begin`")); };
+        c.effect(d, &t, 1, 0)?;
+        if !d.dead and d.depth != depth {
+            return Err(c.err(t.span, c.fmt_n("the loop body changes the stack depth (from ", depth as i64, " to ", d.depth as i64, ")")));
+        }
+        d.code.set_loc(line);
+        d.code.jump(Stak.JZ(0), top);
+        return Ok(true);
+    }
+    if s.eq("while") {
+        let Some(Begin(top, depth)) = d.ctl.pop() else { return Err(c.err(t.span, "`while` without `begin`")); };
+        c.effect(d, &t, 1, 0)?;
+        let exit = d.code.label();
+        d.code.set_loc(line);
+        d.code.jump(Stak.JZ(0), exit);
+        d.ctl.push(Ctl.While(top, exit, depth, d.depth));
+        return Ok(true);
+    }
+    if s.eq("repeat") {
+        let Some(While(top, exit, depth, exit_depth)) = d.ctl.pop() else { return Err(c.err(t.span, "`repeat` without `while`")); };
+        if !d.dead and d.depth != depth {
+            return Err(c.err(t.span, c.fmt_n("the loop body changes the stack depth (from ", depth as i64, " to ", d.depth as i64, ")")));
+        }
+        d.code.set_loc(line);
+        d.code.jump(Stak.JMP(0), top);
+        d.code.bind(exit);
+        // The loop leaves through `while`, after its condition was popped.
+        d.depth = exit_depth;
+        d.dead = false;
+        return Ok(true);
+    }
+    if s.eq("do") {
+        c.effect(d, &t, 2, 0)?;
+        let slot = d.new_slot(2);
+        if slot + 1 >= 256 { return Err(c.err(t.span, "too many locals")); }
+        let exit = d.code.label();
+        d.code.set_loc(line);
+        d.code.jump(Stak.DO(slot as u8, 0), exit);
+        d.ctl.push(Ctl.Do(slot, d.code.here(), exit, d.depth));
+        return Ok(true);
+    }
+    if s.eq("loop") {
+        let Some(Do(slot, top, exit, depth)) = d.ctl.pop() else { return Err(c.err(t.span, "`loop` without `do`")); };
+        if !d.dead and d.depth != depth {
+            return Err(c.err(t.span, c.fmt_n("the loop body changes the stack depth (from ", depth as i64, " to ", d.depth as i64, ")")));
+        }
+        d.code.set_loc(line);
+        d.code.jump(Stak.LOOP(slot as u8, 0), top);
+        d.code.bind(exit);
+        d.depth = depth;
+        return Ok(true);
+    }
+    if s.eq("i") or s.eq("j") {
+        let Some(slot) = d.do_slot(if s.eq("i") { 0 } else { 1 }) else {
+            return Err(c.err(t.span, c.fmt("`", s, "` outside a `do` loop")));
+        };
+        c.op(d, &t, Stak.LGET(slot), 0, 1)?;
+        return Ok(true);
+    }
+    if s.eq("[") {
+        d.ctl.push(Ctl.Bracket(d.depth));
+        return Ok(true);
+    }
+    if s.eq("]") {
+        let Some(Bracket(start)) = d.ctl.pop() else { return Err(c.err(t.span, "`]` without `[`")); };
+        if d.depth < start { return Err(c.err(t.span, "the array literal pops values from outside it")); }
+        let n = (d.depth - start) as u32;
+        c.op(d, &t, Stak.MKARRAY(n), n, 1)?;
+        return Ok(true);
+    }
+    if s.eq("exit") {
+        if d.toplevel {
+            d.emit(Stak.HALT(), line);
+        } else {
+            if !d.dead and d.depth != d.word.nout as i32 {
+                return Err(c.err(t.span, c.fmt_n("`exit` with ", d.depth as i64, " values on the stack; the word returns ", d.word.nout as i64, "")));
+            }
+            d.emit(Stak.RET(), line);
+        }
+        d.dead = true;
+        return Ok(true);
+    }
+    if let Some(slot) = d.local(s) {
+        c.op(d, &t, Stak.LGET(slot), 0, 1)?;
+        return Ok(true);
+    }
+    if let Some(e) = c.dict.get(s) {
+        match e {
+            Call(i) => {
+                let w = c.words.at(i as u64);
+                c.op(d, &t, Stak.CALL(i), w.nin, w.nout)?;
+            }
+            Global(g) => c.op(d, &t, Stak.GGET(g), 0, 1)?,
+        }
+        return Ok(true);
+    }
+    if let Some((w, nin, nout)) = builtin(s) {
+        c.op(d, &t, w, nin, nout)?;
+        return Ok(true);
+    }
+    Err(c.err(t.span, c.fmt("unknown word `", s, "`")))
+}
+
+/// Copies the finished code into the Word.
+fn Comp.finish(c: *Comp, d: *Def) -> Result<*Word, Error> {
+    if let Some(e) = d.code.check() {
+        return Err(c.err(diag.span(0, 0, 0), e.message()));
+    }
+    let w = d.word;
+    let n = d.code.len();
+    let words: *u32 = mem.alloc(n);
+    let lines: *u32 = mem.alloc(n);
+    d.code.copy_into(words.slice(n));
+    d.code.locs_into(lines.slice(n));
+    w.words = words.slice(n);
+    w.lines = lines.slice(n);
+    w.nlocals = d.nlocals;
+    w.maxdepth = (d.maxdepth - w.nin as i32) as u32;
+    d.code.free();
+    d.locals.free();
+    d.ctl.free();
+    Ok(w)
+}
+
+/// `: name ( in -- out ) body ;` after the `:`.
+fn Comp.definition(c: *Comp, colon: Tok) -> Result<(), Error> {
+    let name = c.expect_name(colon.span, "the word's name")?;
+    let open = c.expect_name(name.span, "the stack effect `( in -- out )`")?;
+    if !open.text.eq("(") { return Err(c.err(open.span, "expected the stack effect `( in -- out )`")); }
+    var nin: u32 = 0;
+    var nout: u32 = 0;
+    var after = false;
+    loop {
+        let t = c.expect_name(open.span, "`)`")?;
+        if t.text.eq(")") { break; }
+        if t.text.eq("--") { after = true; } else if after { nout += 1; } else { nin += 1; }
+    }
+    if !after { return Err(c.err(open.span, "the stack effect needs `--`")); }
+    var d = Def.new(name.text, nin, nout, false);
+    let index = c.words.len as u32;
+    c.words.push(d.word);
+    c.dict.insert(name.text, Entry.Call(index));
+    loop {
+        let Some(t) = c.next()? else { return Err(c.err(colon.span, "definition without `;`")); };
+        let end = t;
+        if !c.word(&d, t)? {
+            if d.ctl.len > 0 { return Err(c.err(end.span, "unclosed control structure before `;`")); }
+            if !d.dead and d.depth != nout as i32 {
+                return Err(c.err(end.span, c.fmt_n("the word leaves ", d.depth as i64, " values on the stack, but its effect says ", nout as i64, "")));
+            }
+            d.emit(Stak.RET(), end.line);
+            break;
+        }
+    }
+    c.finish(&d)?;
+    Ok(())
+}
+
+pub fn compile(src: str, file: u32, arena: *mem.Arena, heap: *gc.Heap) -> Result<Program, Error> {
+    var sy = lex.none();
+    sy.line_comment = "\\";
+    var c = Comp {
+        cur: lex.Cursor.new(src, file, sy), buf: text.StrBuf.new(), arena: arena, heap: heap,
+        dict: map.HashMap.new(), words: mem.Vec.new(), nglobals: 0, consts: bc.Pool.new(1 << 24),
+        strs: map.HashMap.new(), ahead: None,
+    };
+    var main = Def.new("main", 0, 0, true);
+    var last_line: u32 = 1;
+    loop {
+        let Some(t) = c.next()? else { break; };
+        last_line = t.line;
+        if t.kind == Kind.Name and t.text.eq(":") {
+            if main.ctl.len > 0 { return Err(c.err(t.span, "a definition inside an open control structure")); }
+            c.definition(t)?;
+            continue;
+        }
+        c.word(&main, t)?;
+    }
+    if main.ctl.len > 0 { return Err(c.err(diag.span(file, src.len, src.len), "unclosed control structure at the end of the program")); }
+    main.emit(Stak.HALT(), last_line);
+    let mw = c.finish(&main)?;
+    let consts = c.consts.items();
+    Ok(Program { main: mw, words: c.words, consts: consts, nglobals: c.nglobals })
+}

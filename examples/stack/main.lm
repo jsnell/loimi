@@ -1,0 +1,127 @@
+// Stak: a statically stack-checked Forth. See SPEC.md.
+//
+//   loimi build examples/stack/main.lm --release -o stak
+//   ./stak FILE.stk [--disasm] [--disasm-after] [--gc-stress]
+
+import std.io;
+import std.os;
+import std.diag;
+import std.gc;
+import std.mem;
+import std.text;
+import compile;
+import compile.{Program};
+import value.{Value, Word};
+import vm;
+import vm.{Stak, Machine, Frame};
+
+fn disassemble(prog: *Program) {
+    var out = text.StrBuf.new();
+    for i in 0..prog.words.len {
+        let w = prog.words.at(i);
+        out.push_str(": ");
+        out.push_str(w.name);
+        out.push_str("\n");
+        Stak.disasm(w.words, &out);
+    }
+    out.push_str("main:\n");
+    Stak.disasm(prog.main.words, &out);
+    io.print(out.as_str());
+    out.free();
+}
+
+fn verify(w: *Word, prog: *Program) -> bool {
+    match Stak.verify(w.words, w, prog.nglobals, prog.consts.len as u32, prog.words.len as u32) {
+        Ok(v) => { w.code = Stak.optimize(v); true }
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: bytecode of `");
+            b.push_str(w.name);
+            b.push_str("` failed verification: ");
+            e.write(&b);
+            io.eprintln(b.as_str());
+            false
+        }
+    }
+}
+
+const STACK: u64 = 1 << 20;
+const LSTACK: u64 = 1 << 20;
+const FRAMES: u64 = 1 << 16;
+
+fn main() -> i32 uses gc {
+    let Some(path) = os.arg(1) else { io.eprintln("usage: stak FILE.stk [--disasm] [--disasm-after] [--gc-stress]"); return 2; };
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read the file"); return 2; };
+    var disasm = false;
+    var disasm_after = false;
+    var stress = false;
+    for i in 2..os.arg_count() {
+        let a = os.arg(i) ?? "";
+        if a.eq("--disasm") { disasm = true; }
+        if a.eq("--disasm-after") { disasm_after = true; }
+        if a.eq("--gc-stress") { stress = true; }
+    }
+    var sm = diag.SourceMap.new();
+    let file = sm.add(path, src);
+    var arena = mem.Arena.new();
+    defer arena.free();
+
+    var m = Machine {
+        stack: mem.alloc(STACK + 1), stack_end: 0 as *Value,
+        lstack: mem.alloc(LSTACK), lstack_end: 0 as *Value,
+        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame,
+        words: 0 as *mem.Vec<*Word>, consts: 0 as *Value, nconsts: 0,
+        globals: 0 as *Value, nglobals: 0, heap: gc.Heap.new(),
+        sp: 0 as *Value, lp: 0 as *Value, fp: 0 as *Frame,
+        out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
+        error_line: 0, error_word: "",
+    };
+    // One slot below the stack, so that `sp = stack - 1` (empty) points
+    // into the allocation.
+    m.stack = m.stack + 1;
+    m.stack_end = m.stack + STACK;
+    m.lstack_end = m.lstack + LSTACK;
+    m.frames_end = m.frames + FRAMES;
+
+    // String constants are allocated while compiling; nothing collects
+    // until the program runs.
+    var prog = match compile.compile(src, file, &arena, &m.heap) {
+        Ok(p) => p,
+        Err(e) => { var d = diag.error(e.span, e.msg); sm.eprint(&d); return 1; }
+    };
+    m.words = &prog.words;
+    m.consts = prog.consts.ptr;
+    m.nconsts = prog.consts.len as u32;
+    m.globals = mem.alloc(prog.nglobals as u64 + 1);
+    m.nglobals = prog.nglobals;
+    for i in 0..prog.nglobals as u64 { m.globals[i] = Value.Nil; }
+    m.fp = m.frames;
+    m.fp.word = prog.main;
+    m.lp = m.lstack;
+    m.sp = m.stack - 1;
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    if stress { m.heap.set_stress(true); }
+
+    for i in 0..prog.words.len {
+        if !verify(prog.words.at(i), &prog) { return 1; }
+    }
+    if !verify(prog.main, &prog) { return 1; }
+    if disasm { disassemble(&prog); }
+
+    let status: i32 = match Stak.run(&m, prog.main) {
+        Ok(_) => 0,
+        Err(msg) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: line ");
+            b.push_int(m.error_line as i64);
+            b.push_str(" in ");
+            b.push_str(m.error_word);
+            b.push_str(": ");
+            b.push_str(msg);
+            io.eprintln(b.as_str());
+            1
+        }
+    };
+    if disasm_after { disassemble(&prog); }
+    status
+}

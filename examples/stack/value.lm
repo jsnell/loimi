@@ -1,0 +1,106 @@
+// Stak's run-time values and the GC objects they point to.
+
+import std.gc;
+import std.hash;
+import std.mem;
+import std.num;
+import std.text;
+import vm.{Stak};
+
+/// A string: its bytes are a trailing array.
+pub object Str { data: [u8] }
+
+/// A fixed-length array.
+pub object Arr { items: [Value] }
+
+pub value Value repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    Str(Gc<Str>),
+    Arr(Gc<Arr>),
+}
+
+/// A compiled word (or the top-level code).
+pub struct Word {
+    name: str,
+    nin: u32,
+    nout: u32,
+    /// Local slots, including the hidden ones of `do` loops.
+    nlocals: u32,
+    /// The deepest the data stack gets above the word's entry depth minus
+    /// its inputs, as computed by the compiler. CALL checks room for it.
+    maxdepth: u32,
+    words: []u32,
+    code: Verified<Stak>,
+    lines: []u32,
+}
+
+pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
+pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
+impl hash.Hash for Value;
+
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str {}, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
+    let a = new(h, Arr {}, n);
+    for i in 0..n { a.items[i] = Value.Nil; }
+    a
+}
+
+pub fn truthy(v: Value) -> bool {
+    match v {
+        Nil => false,
+        Bool(b) => b,
+        _ => true,
+    }
+}
+
+pub fn to_f64(v: Value) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+pub fn type_name(v: Value) -> str {
+    match v {
+        Int(_) => "int",
+        Num(_) => "float",
+        Nil => "nil",
+        Bool(_) => "bool",
+        Str(_) => "string",
+        Arr(_) => "array",
+    }
+}
+
+pub fn write(b: *text.StrBuf, v: Value) { write_nested(b, v, 0); }
+
+fn write_nested(b: *text.StrBuf, v: Value, depth: u32) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => {
+            let start = b.len();
+            num.write_shortest(b, x);
+            num.mark_float(b, start);
+        }
+        Bool(t) => b.push_str(if t { "true" } else { "false" }),
+        Nil => b.push_str("nil"),
+        Str(s) => b.push_str(s.data),
+        Arr(a) => {
+            if depth > 4 { b.push_str("[ ... ]"); return; }
+            b.push_str("[ ");
+            for i in 0..a.items.len {
+                write_nested(b, a.items[i], depth + 1);
+                b.push(' ');
+            }
+            b.push(']');
+        }
+    }
+}

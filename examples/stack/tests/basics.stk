@@ -1,0 +1,23 @@
+\ arithmetic and printing
+1 2 + print
+7 2 / print
+7.0 2 / print
+-7 3 mod print
+2147483647 1 + print
+"hello" " world" concat print
+3 4 < print
+1 1.0 = print
+: sq ( n -- n*n ) dup * ;
+5 sq print
+: fact ( n -- n! ) dup 1 <= if drop 1 else dup 1 - fact * then ;
+10 fact print
+: fib ( n -- f ) dup 2 < if exit then dup 1 - fib swap 2 - fib + ;
+20 fib print
+var total
+0 to total
+10 0 do total i + to total loop
+total print
+: sum3 ( a b c -- s ) { a b c } a b + c + ;
+1 2 3 sum3 print
+[ 1 2.5 "three" nil true ] print
+[ 1 2 3 ] len print
