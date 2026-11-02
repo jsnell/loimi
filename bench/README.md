@@ -43,3 +43,9 @@ Notes:
   while each tail-call handler rematerializes them. Tail-call mode's
   advantage (independent register allocation per handler) is expected to
   show on larger interpreters, as it did for CPython.
+
+## Other benchmark sets
+
+- [`mini/`](mini/README.md): clean-room Lua-subset programs, Mini vs PUC-Lua and LuaJIT.
+- [`scheme/`](scheme/README.md): the public r7rs-benchmarks suite, run unmodified,
+  examples/scheme vs chibi-scheme.

@@ -11,8 +11,8 @@ the generated `Scheme.X` encoders and checks it with the generated verifier.
 cargo build --release
 ./target/release/loimi build examples/scheme/main.lm --release -o scheme
 ./scheme program.scm            # a second argument turns on GC stress
-examples/scheme/bench/run.sh    # benchmarks (see bench/README.md)
 cargo test --release --test golden scheme_programs
+bench/scheme/compare.py         # benchmarks vs chibi-scheme (see bench/scheme/README.md)
 ```
 
 ## Files
@@ -28,12 +28,15 @@ cargo test --release --test golden scheme_programs
 | `prelude.lm` | builtins written in Scheme (`map`, `for-each`, `vector-map`, ...) |
 | `main.lm` | driver |
 | `tests/*.scm` | test programs with `; expect:` lines, run by `tests/golden.rs` normally and under GC stress |
-| `bench/` | benchmarks |
+
+Benchmarks live in [`bench/scheme`](../../bench/scheme/README.md): the
+public r7rs-benchmarks suite, run unmodified against chibi-scheme.
 
 ## What is supported
 
 - **Data.** Fixnums (32-bit), flonums, booleans, characters, strings,
-  interned symbols, pairs and lists, vectors, procedures, unspecified.
+  interned symbols, pairs and lists, vectors, records, procedures,
+  unspecified.
 - **Reader.** Lists with `()` or `[]`, dotted pairs, `'` `` ` `` `,` `,@`,
   `#t`/`#f`/`#true`/`#false`, `#\a` `#\space` `#\x41` characters, strings
   with `\n \t \r \a \0 \\ \" \x41;` escapes and line continuations,
@@ -44,13 +47,16 @@ cargo test --release --test golden scheme_programs
   `let`, `begin` (splicing at top level and in bodies), `cond` (with `else`
   and `=>`), `case` (with `else` and `=>`), `and`, `or`, `when`, `unless`,
   `do`, `quote`, `quasiquote`/`unquote`/`unquote-splicing` (nested, and in
-  vectors). Keywords can be shadowed by local variables.
+  vectors), `define-record-type` (top level and in bodies). Keywords can be
+  shadowed by local variables. A top-level `(import ...)` is accepted and
+  ignored: every procedure the program can name is built in.
 - **Builtins** (126 natives plus the prelude): numbers (`+ - * / quotient
   remainder modulo = < > <= >= zero? positive? negative? even? odd? number?
-  integer? exact? inexact? abs min max gcd lcm sqrt expt floor ceiling
-  round truncate exact->inexact inexact->exact exact inexact square
-  number->string string->number`), pairs and lists (`cons car cdr` and
-  `c[ad]{2,3}r`, `set-car! set-cdr! list length append reverse list-tail
+  integer? exact? inexact? exact-integer? abs min max gcd lcm sqrt expt exp
+  log sin cos tan asin acos atan floor ceiling round truncate
+  exact->inexact inexact->exact exact inexact square number->string
+  string->number`), pairs and lists (`cons car cdr` and
+  `c[ad]{2,4}r`, `set-car! set-cdr! list length append reverse list-tail
   list-ref list-copy last-pair memq memv member assq assv assoc map
   for-each apply`), predicates (`null? pair? list? eq? eqv? equal? not
   symbol? string? procedure? vector? boolean? char?`), vectors
@@ -60,7 +66,12 @@ cargo test --release --test golden scheme_programs
   and friends, `string-copy string->list list->string make-string string
   string-set! symbol->string string->symbol char->integer integer->char
   char=? char<? char-upcase char-alphabetic?` ...), output (`display write
-  newline write-string write-char`), `error`, `exit`.
+  newline write-string write-char flush-output-port current-output-port`;
+  the port arguments are accepted and ignored), `read` (from standard
+  input), `eof-object eof-object?`, `current-second current-jiffy
+  jiffies-per-second`, `values call-with-values`,
+  `call-with-current-continuation`/`call/cc` (escaping only, see below),
+  `error`, `exit`.
 - **Proper tail calls** everywhere (`if`, `cond`, `case`, `and`, `or`,
   `when`, `let`..., `apply`, calls to builtins and to procedures with rest
   parameters). The frame stack holds 131072 frames, so non-tail recursion
@@ -86,9 +97,21 @@ cargo test --release --test golden scheme_programs
   defines or `set!`s that name somewhere (then every call goes through the
   global). The prelude always uses the inline versions.
 - Symbols are never collected. `eq?` on flonums compares bits.
-- Not supported: `call/cc`, `dynamic-wind`, `syntax-rules`/`define-syntax`
-  (they are reported as unsupported), `values`, string ports, `delay`,
-  `define-record-type`, bignums, rationals, complex numbers.
+- **Continuations are escape-only.** A continuation can be invoked while
+  the `call/cc` that made it is still active (early exit from loops,
+  searches and recursions, as in the `ctak`, `fibc` and `puzzle`
+  benchmarks). Invoking it after that `call/cc` has returned is an error
+  (`continuation invoked after its extent ended`), not a re-entry.
+- **Multiple values** are a list tagged with a private marker unless
+  there is exactly one value; only `call-with-values` takes them apart.
+- **Records** are vectors with a hidden type field: `vector?` is false for
+  them and `equal?` compares them by identity, but the inline
+  `vector-ref` op does not check the type.
+- `current-jiffy` counts microseconds of wall-clock time from its first
+  call.
+- Not supported: `dynamic-wind`, `syntax-rules`/`define-syntax` (they are
+  reported as unsupported), re-entrant continuations, file and string
+  ports, `delay`, bytevectors, bignums, rationals, complex numbers.
 
 ## Architecture
 
@@ -213,20 +236,31 @@ and 29 superinstructions picked from `--vm-stats` over the benchmarks
 (compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`, `ADDI_CALL`,
 ...).
 
-## Why no call/cc, dynamic-wind or syntax-rules
+## Escape continuations; why no full call/cc, dynamic-wind or syntax-rules
 
-All three are left out to keep the core small; none of them is blocked by
-the language.
+`call/cc` is handled in `call_slow`, like `apply`. It allocates a
+continuation, a closure of a fixed prototype (`vm.cont_proto`) whose one
+free slot is a frame depth, and pushes a frame of that prototype (or, for
+a tail call, replaces the current frame) with R0 = the procedure and R1 =
+the continuation. The prototype's code is `CALL R0 1; RET R0`: a non-tail
+call, so the frame stays where it is while the procedure runs, and a normal
+return passes the result straight through. Invoking the continuation
+(its `fixed` arity never matches, so it always reaches `call_slow`) checks
+that the frame at its depth still holds this very continuation as its
+closure, which is true exactly while that `call/cc` is active, and then
+returns the argument from that frame, dropping everything above it. Both
+the capture and the escape are O(1), and ordinary calls pay nothing.
 
-- **`call/cc`.** Frames live on an explicit frame stack and registers in an
-  explicit value stack, never on the C stack (natives do not call back into
-  the VM), so a continuation can be captured by copying both stacks into a
-  heap object: a `CALLCC` op would copy `frames..fp` and the registers they
-  use, and invoking the continuation would copy them back and `jump` to the
-  saved `resume` address. That is the simple "stack copying" strategy; a
-  segmented stack (as in Chez) would make capture O(1). Escaping-only
-  continuations (the common use) could be cheaper still: record the frame
-  depth and unwind to it.
+The rest is left out to keep the core small; none of it is blocked by the
+language.
+
+- **Re-entrant `call/cc`.** Frames live on an explicit frame stack and
+  registers in an explicit value stack, never on the C stack (natives do
+  not call back into the VM), so a full continuation can be captured by
+  copying both stacks into a heap object, and invoking it would copy them
+  back and `jump` to the saved `resume` address. That is the simple "stack
+  copying" strategy; a segmented stack (as in Chez) would make capture
+  O(1).
 - **`dynamic-wind`** needs a wind list in the context, and continuation
   invocation would run the `after`/`before` thunks between the current and
   target wind lists. Running a thunk from the middle of a continuation
@@ -239,27 +273,48 @@ the language.
 
 ## Benchmarks
 
-See [`bench/README.md`](bench/README.md) for sources. Times in seconds,
-wall clock, on the development machine (x86-64, LLVM 19), `--release`:
+The benchmarks are the public
+[r7rs-benchmarks](https://github.com/ecraven/r7rs-benchmarks) suite, used
+unmodified and downloaded at a pinned commit, and the reference is
+chibi-scheme 0.12 (a bytecode VM) built from source; see
+[`bench/scheme/README.md`](../../bench/scheme/README.md) for how they are
+run, the inputs, all results and the skipped programs. 41 of the 57
+programs the suite's `bench` script runs are included; of the other 16,
+equal, pi, chudnovsky, mbrotZ and bv2string would need a sharing-aware
+`equal?`, bignums, complex numbers or bytevectors, and 11 need file ports.
 
-| benchmark | tailcall | goto | switch |
+The classic Gabriel and Kernighan–Van Wyk programs, seconds as reported by
+each benchmark itself (excluding startup), best of 3, `--dispatch=tailcall`,
+Intel i7-6700, 2026-11-02:
+
+| benchmark | ours | chibi | ours/chibi |
 |---|---|---|---|
-| ack | 3.46 | 3.51 | 3.49 |
-| array1 | 0.83 | 0.80 | 0.85 |
-| cpstak | 0.56 | 0.55 | 0.57 |
-| deriv | 0.48 | 0.45 | 0.49 |
-| destruc | 0.22 | 0.21 | 0.23 |
-| div | 0.33 | 0.34 | 0.34 |
-| fib (fib 32) | 0.09 | 0.09 | 0.10 |
-| fibfp | 0.05 | 0.05 | 0.05 |
-| mbrot | 0.61 | 0.60 | 0.66 |
-| nqueens | 0.08 | 0.08 | 0.08 |
-| primes | 1.27 | 1.32 | 1.37 |
-| sum | 0.77 | 0.80 | 0.80 |
-| tak | 0.94 | 1.00 | 1.25 |
-| takl | 0.41 | 0.44 | 0.46 |
+| fib | 0.710 | 1.765 | 0.40 |
+| fibfp | 0.235 | 1.334 | 0.18 |
+| tak | 0.637 | 2.350 | 0.27 |
+| takl | 0.139 | 1.366 | 0.10 |
+| cpstak | 0.281 | 1.725 | 0.16 |
+| ctak | 0.025 | 1.369 | 0.02 |
+| ack | 0.757 | 1.700 | 0.45 |
+| nqueens | 0.384 | 1.786 | 0.21 |
+| deriv | 0.355 | 1.779 | 0.20 |
+| destruc | 0.178 | 1.259 | 0.14 |
+| diviter | 0.188 | 1.194 | 0.16 |
+| divrec | 0.281 | 1.155 | 0.24 |
+| primes | 0.192 | 0.649 | 0.30 |
+| sum | 0.393 | 1.487 | 0.26 |
+| sumfp | 0.110 | 1.182 | 0.09 |
+| array1 | 0.433 | 1.575 | 0.28 |
+| mbrot | 0.062 | 1.428 | 0.04 |
+| browse | 0.021 | 1.887 | 0.01 |
+| puzzle | 0.129 | 1.650 | 0.08 |
+| triangl | 0.201 | 1.200 | 0.17 |
+| string | 0.040 | 1.150 | 0.03 |
 
-Effect of the optimizations from `--vm-stats` (tailcall): `sum` went from
-2.65 s to 0.77 s (compare-with-constant ops, loop arguments computed into
-their parameters, `LTI_TEST`/`MOVE_JMP` supers), `primes` from 1.99 s to
-1.27 s (inline `modulo`).
+Over all 41 programs the geometric mean of ours/chibi is 0.12. The gap is
+narrowest on call-bound code (ack, fib, tak, ntakl), where a call or
+return comes every few ops, and widest where chibi pays for heap flonums,
+full continuations, strings or its collector.
+
+The programs this directory used before were reproduced from memory by
+the interpreter's author; they were removed in favour of the public suite.
