@@ -506,6 +506,14 @@ pub vm Lox {
     // (monomorphic, polymorphic, megamorphic) in the slow paths.
     cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
 
+    /// R[dst] = property value `v` read from `o`: a method is bound to
+    /// `o` (which allocates, so it is cold), a field is stored as it is.
+    fn found(dst: u64, o: Value, v: Value) -> never {
+        if let Method(_) = v { cold { regs[dst] = bind(ctx, o, v); next } }
+        regs[dst] = v;
+        next
+    }
+
     family GETPROP(dst: reg, o: reg, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = o else { cold { raise "Only instances have properties." } };
@@ -548,7 +556,7 @@ pub vm Lox {
             }
         }
         GETPROP_POLY {
-            if let Inst(x) = o and let Some(v) = ctx.m.poly_get(x, cache.ent) { dst = bind(ctx, o, v); next }
+            if let Inst(x) = o and let Some(v) = ctx.m.poly_get(x, cache.ent) { found(dst.raw, o, v) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
                 let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
@@ -559,7 +567,7 @@ pub vm Lox {
             }
         }
         GETPROP_MEGA {
-            if let Inst(x) = o and let Some(v) = ctx.m.mega_get(x, key(name)) { dst = bind(ctx, o, v); next }
+            if let Inst(x) = o and let Some(v) = ctx.m.mega_get(x, key(name)) { found(dst.raw, o, v) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
                 let (r, _) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
