@@ -193,6 +193,20 @@ fn field_set_slow(h: *gc.Heap, t: Gc<Table>, key: V, v: V, slot: *u32) {
     if let Some(i) = value.table_find(t, key) { *slot = i as u32; }
 }
 
+/// Arithmetic outside the (Int, Int) and (Num, Num) fast paths: mixed
+/// int/float operands first, then everything else.
+fn arith_mixed(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
+    if op <= 2 {
+        let (x, y) = match (a, b) {
+            (Int(i), Num(y)) => (i as f64, y),
+            (Num(x), Int(j)) => (x, j as f64),
+            _ => return arith_slow(c, op, a, b),
+        };
+        return Ok(V.Num(if op == 0 { x + y } else if op == 1 { x - y } else { x * y }));
+    }
+    arith_slow(c, op, a, b)
+}
+
 /// The single dispatch point for natives. Natives allocate but never collect.
 fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
     lib.call(&c.heap, id, args, n)
@@ -405,31 +419,35 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", o) }
     }
 
-    // One declaration, six ops: register and constant (K) second operands.
-    inline for (name, checked, sym, code, bkind) in [
-        ("ADD", "add_checked", +, 0, reg),
-        ("SUB", "sub_checked", -, 1, reg),
-        ("MUL", "mul_checked", *, 2, reg),
-        ("ADDK", "add_checked", +, 0, kst),
-        ("SUBK", "sub_checked", -, 1, kst),
-        ("MULK", "mul_checked", *, 2, kst),
+    // Arithmetic: one declaration, six families (register and constant
+    // second operands). The generic member tests (Int, Int) first; the
+    // first time a site sees two floats it becomes the _F member, which
+    // tests (Num, Num) first. Both members handle every type, so a site
+    // never switches back.
+    inline for (name, fname, checked, sym, code, bkind) in [
+        ("ADD", "ADD_F", "add_checked", +, 0, reg),
+        ("SUB", "SUB_F", "sub_checked", -, 1, reg),
+        ("MUL", "MUL_F", "mul_checked", *, 2, reg),
+        ("ADDK", "ADDK_F", "add_checked", +, 0, kst),
+        ("SUBK", "SUBK_F", "sub_checked", -, 1, kst),
+        ("MULK", "MULK_F", "mul_checked", *, 2, kst),
     ] {
-        op #name(dst: reg, a: reg, b: bkind) : ABC {
-            match (a, b) {
-                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
-                (Num(x), Num(y)) => { dst = Num(x sym y); next }
-                _ => {}
-            }
-            cold {
-                // Mixed int/float operands: still cheap, but kept out of
-                // the hot handler.
+        family #name(dst: reg, a: reg, b: bkind) : ABC {
+            generic {
                 match (a, b) {
-                    (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
-                    (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
+                    (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                    (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; next }
                     _ => {}
                 }
-                dst = arith_slow(ctx, code, a, b)?;
-                next
+                cold { dst = arith_mixed(ctx, code, a, b)?; next }
+            }
+            #fname {
+                match (a, b) {
+                    (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                    (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                    _ => {}
+                }
+                cold { dst = arith_mixed(ctx, code, a, b)?; next }
             }
         }
     }
