@@ -1,0 +1,3 @@
+fn get(f: block fn()) -> block fn() { f }
+fn main() {}
+// error: a `block fn` type can only be the type of a function parameter

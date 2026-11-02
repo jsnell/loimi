@@ -1,0 +1,3 @@
+struct Hooks { f: block fn(i64) }
+fn main() {}
+// error: a `block fn` type can only be the type of a function parameter

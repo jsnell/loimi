@@ -59,6 +59,11 @@ pub struct FnCx {
     pub fn_name: String,
     /// Nesting depth of `unsafe { }` blocks.
     pub unsafe_depth: u32,
+    /// The next name lookup may yield a `block fn` local: it is a callee
+    /// or an argument for a `block fn` parameter.
+    pub block_use: bool,
+    /// Inside a closure body: the closure's type (for messages).
+    pub closure_ty: Option<Ty>,
 }
 
 impl FnCx {
@@ -74,6 +79,8 @@ impl FnCx {
             effects: 0,
             fn_name: String::new(),
             unsafe_depth: 0,
+            block_use: false,
+            closure_ty: None,
         }
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
@@ -95,6 +102,8 @@ impl FnCx {
             effects: self.effects,
             fn_name: self.fn_name.clone(),
             unsafe_depth: self.unsafe_depth,
+            block_use: false,
+            closure_ty: self.closure_ty.clone(),
         }
     }
     /// A local not visible by name.
@@ -142,6 +151,11 @@ pub struct Checker<'a> {
     /// Warnings, in the order found (deduplicated by span: handler
     /// bodies can be checked more than once).
     pub warnings: Vec<Diag>,
+    /// Declaring a signature-only function (an instance over opaque type
+    /// parameters, or a trait method without a default): no body needed.
+    pub sig_only: bool,
+    /// Closures created so far (for unique symbols).
+    pub closure_count: u32,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -154,7 +168,9 @@ pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
 /// `*fn() uses gc` be read back as a plain `fn()`.
 fn fn_widens(from: &Ty, to: &Ty) -> bool {
     match (from, to) {
-        (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) => p1 == p2 && r1 == r2 && e1 & !e2 == 0,
+        (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) | (Ty::Block(p1, r1, e1), Ty::Block(p2, r2, e2)) => {
+            p1 == p2 && r1 == r2 && e1 & !e2 == 0
+        }
         (Ty::Option(a), Ty::Option(b)) => fn_widens(a, b),
         _ => false,
     }
@@ -217,6 +233,8 @@ impl<'a> Checker<'a> {
             object_count: 0,
             aliases: vec![],
             warnings: vec![],
+            sig_only: false,
+            closure_count: 0,
         }
     }
 
@@ -363,8 +381,7 @@ impl<'a> Checker<'a> {
                         self.define(m, &v.name, Def::Vm(id), v.is_pub)?;
                     }
                     Item::Trait(t) => {
-                        let id = self.traits.decls.len() as u32;
-                        self.traits.decls.push((m, t.clone()));
+                        let id = self.register_trait(m, t)?;
                         self.define(m, &t.name, Def::Trait(id), t.is_pub)?;
                     }
                     Item::Impl(i) => self.traits.impl_decls.push((m, i.clone())),
@@ -511,6 +528,7 @@ impl<'a> Checker<'a> {
             self.pending.push((id, m, f, vec![]));
         }
         while let Some((id, m, f, env)) = self.pending.pop() {
+            self.check_against_bounds(id).map_err(|d| self.instance_note(d, id))?;
             self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
         }
         Ok(())
@@ -553,7 +571,7 @@ impl<'a> Checker<'a> {
     pub fn declare_fn(&mut self, id: FnId, m: usize, f: &FnDecl, symbol: Option<String>) -> Res<()> {
         let mut param_tys = Vec::new();
         for p in &f.params {
-            param_tys.push(self.resolve_type(m, &p.ty)?);
+            param_tys.push(self.resolve_param_type(m, &p.ty)?);
         }
         let ret = match &f.ret {
             Some(t) => self.resolve_type(m, t)?,
@@ -577,7 +595,7 @@ impl<'a> Checker<'a> {
         if f.linkage == Linkage::Extern && f.body.is_some() {
             return Err(Diag::new(f.name.span, "extern functions cannot have a body"));
         }
-        if f.linkage != Linkage::Extern && f.body.is_none() {
+        if f.linkage != Linkage::Extern && f.body.is_none() && !self.sig_only {
             return Err(Diag::new(f.name.span, "function needs a body"));
         }
         if f.linkage != Linkage::Internal {
@@ -616,6 +634,7 @@ impl<'a> Checker<'a> {
             vm_state: vec![],
             effects: effects_of(&f.attrs)?,
             sync_effects: 0,
+            env: None,
         };
         Ok(())
     }
@@ -674,6 +693,13 @@ impl<'a> Checker<'a> {
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
             Ty::Param(i) => format!("?T{}", i),
             Ty::Gc(t) => format!("Gc<{}>", self.ty_name(t)),
+            Ty::Opaque(o) => self.traits.opaques[*o as usize].name.clone(),
+            Ty::Block(ps, r, e) => format!(
+                "block fn({}) -> {}{}",
+                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
+                self.ty_name(r),
+                if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
+            ),
         }
     }
 
@@ -792,7 +818,7 @@ impl<'a> Checker<'a> {
                     // and in an instance it is the concrete type.
                     let ok = match &inner {
                         Ty::Struct(i) => self.prog.structs[*i as usize].object.is_some(),
-                        Ty::Param(_) => true,
+                        Ty::Param(_) | Ty::Opaque(_) => true,
                         _ => false,
                     };
                     if !ok {
@@ -888,10 +914,16 @@ impl<'a> Checker<'a> {
                     Ty::Tuple(out)
                 }
             }
+            TypeKind::Block(..) => {
+                return Err(Diag::new(
+                    t.span,
+                    "a `block fn` type can only be the type of a function parameter: closures cannot be stored or returned",
+                ))
+            }
             TypeKind::Fn(ps, r, eff) => {
                 let mut out = Vec::new();
                 for p in ps {
-                    out.push(self.resolve_type(m, p)?);
+                    out.push(self.resolve_param_type(m, p)?);
                 }
                 let e = match eff {
                     Some(e) => effect_bits(&e.name, e.span)?,
@@ -907,6 +939,21 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(t.span, "a trailing array `[T]` is only allowed as the last field of an `object`"))
             }
         })
+    }
+
+    /// The type of a function parameter: like `resolve_type`, but a
+    /// `block fn` type is allowed at the top.
+    pub fn resolve_param_type(&mut self, m: usize, t: &TypeExpr) -> Res<Ty> {
+        let TypeKind::Block(ps, r, eff) = &t.kind else { return self.resolve_type(m, t) };
+        let mut out = Vec::new();
+        for p in ps {
+            out.push(self.resolve_param_type(m, p)?);
+        }
+        let e = match eff {
+            Some(e) => effect_bits(&e.name, e.span)?,
+            None => 0,
+        };
+        Ok(Ty::Block(out, Box::new(self.resolve_type(m, r)?), e))
     }
 
     pub fn const_int(&mut self, m: usize, e: &Expr) -> Res<i128> {
@@ -952,6 +999,13 @@ impl<'a> Checker<'a> {
             // A function value converts to a function type with more effects.
             return Ok(TExpr { ty: want.clone(), ..e });
         }
+        if let (Ty::Fn(p1, r1, e1), Ty::Block(p2, r2, e2)) = (&e.ty, want) {
+            // A plain function is a closure without an environment.
+            if p1 == p2 && r1 == r2 && e1 & !e2 == 0 {
+                let span = e.span;
+                return Ok(mk(want.clone(), TK::Cast(Box::new(e)), span));
+            }
+        }
         if let Ty::Option(inner) = want {
             if **inner == e.ty || fn_widens(&e.ty, inner) {
                 let span = e.span;
@@ -959,7 +1013,7 @@ impl<'a> Checker<'a> {
                 return Ok(mk(want.clone(), TK::Variant(1, vec![e]), span));
             }
         }
-        if let (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) = (&e.ty, want) {
+        if let (Ty::Fn(p1, r1, e1) | Ty::Block(p1, r1, e1), Ty::Fn(p2, r2, e2) | Ty::Block(p2, r2, e2)) = (&e.ty, want) {
             if p1 == p2 && r1 == r2 && e1 & !e2 != 0 {
                 return Err(Diag::new(
                     e.span,
@@ -1737,6 +1791,10 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::TypeArgs(inner, targs) => self.type_args_value(cx, inner, targs, span),
+            ExprKind::Closure(..) => Err(Diag::new(
+                span,
+                "a closure can only be an argument for a `block fn` parameter (`fn f(cb: block fn(i64) -> bool)`)",
+            )),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
                 let ty = self.resolve_type(cx.module, t)?;
@@ -2030,7 +2088,18 @@ impl<'a> Checker<'a> {
 
     pub fn ident(&mut self, cx: &mut FnCx, name: &str, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         if let Some(id) = cx.lookup(name) {
-            return Ok(mk(cx.locals[id as usize].ty.clone(), TK::Local(id), span));
+            let ty = cx.locals[id as usize].ty.clone();
+            if matches!(ty, Ty::Block(..)) && !std::mem::take(&mut cx.block_use) {
+                return Err(Diag::new(
+                    span,
+                    format!(
+                        "`{}` is a `block fn`: it can only be called, or passed on as an argument for a `block fn` parameter",
+                        name
+                    ),
+                ));
+            }
+            cx.block_use = false;
+            return Ok(mk(ty, TK::Local(id), span));
         }
         if let Some(r) = crate::vmcheck::vm_ident(self, cx, name, span)? {
             return Ok(r);
@@ -2085,6 +2154,9 @@ impl<'a> Checker<'a> {
             ExprKind::Ident(n) if cx.lookup(n).is_none() => {
                 if let Some(t) = prim_type(n) {
                     return Some(t);
+                }
+                if let Some((_, t)) = self.tenv.iter().rev().find(|(x, _)| x == n) {
+                    return Some(t.clone());
                 }
                 match self.scopes[cx.module].get(n) {
                     Some((Def::Struct(i), _)) => Some(Ty::Struct(*i)),
@@ -2327,6 +2399,19 @@ impl<'a> Checker<'a> {
                 while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
                     base_ty = *inner;
                 }
+                let found = match base_ty {
+                    Ty::Opaque(_) => self.trait_method_for(&base_ty, &name.name, false, name.span)?,
+                    _ => None,
+                };
+                if let Some((gf, known)) = found {
+                    let own = self.generics.fns[gf as usize].params.len() - known.len();
+                    if explicit.len() != own {
+                        return Err(Diag::new(name.span, format!("`{}` takes {} type argument(s), got {}", name.name, own, explicit.len())));
+                    }
+                    let mut all = known;
+                    all.extend(explicit.into_iter().map(Some));
+                    return self.generic_call(cx, gf, vec![recv], all, args, exp, span);
+                }
                 let g = match self.generics.inst_of.get(&base_ty).cloned() {
                     Some((gt, rargs)) => match self.generics.methods.get(&(gt, name.name.clone())).copied() {
                         Some(g) => {
@@ -2514,6 +2599,13 @@ impl<'a> Checker<'a> {
                             return self.generic_call(cx, gf, vec![], vec![], args, exp, span);
                         }
                         let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() else {
+                            // A trait's function through a bound (`T.zero()`) or a default.
+                            if let Some((gf, known)) = self.trait_method_for(&t, &name.name, !matches!(t, Ty::Opaque(_)), name.span)? {
+                                return self.generic_call(cx, gf, vec![], known, args, exp, span);
+                            }
+                            if let Ty::Opaque(o) = t {
+                                return Err(self.no_bound_method(o, &name.name, name.span));
+                            }
                             return Err(Diag::new(
                                 name.span,
                                 format!("no variant or function `{}` in `{}`", name.name, self.ty_name(&t)),
@@ -2529,12 +2621,16 @@ impl<'a> Checker<'a> {
             }
             _ => {}
         }
-        let f = self.expr(cx, callee, None)?;
+        // A `block fn` local may be called.
+        cx.block_use = matches!(callee.kind, ExprKind::Ident(_));
+        let f = self.expr(cx, callee, None);
+        cx.block_use = false;
+        let f = f?;
         self.finish_call(cx, f, vec![], args, span)
     }
 
     pub fn finish_call(&mut self, cx: &mut FnCx, f: TExpr, mut pre: Vec<TExpr>, args: &[Expr], span: Span) -> Res<TExpr> {
-        let Ty::Fn(params, ret, _) = f.ty.clone() else {
+        let (Ty::Fn(params, ret, _) | Ty::Block(params, ret, _)) = f.ty.clone() else {
             return Err(Diag::new(f.span, format!("cannot call a value of type `{}`", self.ty_name(&f.ty))));
         };
         let variadic = matches!(f.kind, TK::FnRef(id) if self.prog.fns[id as usize].variadic);
@@ -2547,7 +2643,11 @@ impl<'a> Checker<'a> {
             let pi = i + npre;
             if pi < params.len() {
                 let pt = params[pi].clone();
-                pre.push(self.expr_coerce(cx, a, &pt)?);
+                if matches!(pt, Ty::Block(..)) {
+                    pre.push(self.block_arg(cx, a, &pt)?);
+                } else {
+                    pre.push(self.expr_coerce(cx, a, &pt)?);
+                }
             } else {
                 let mut v = self.expr(cx, a, None)?;
                 if v.ty == Ty::F32 {
@@ -2641,6 +2741,13 @@ impl<'a> Checker<'a> {
         while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
             base_ty = *inner;
         }
+        if let Ty::Opaque(o) = base_ty {
+            // A bounded type parameter: only its bounds' methods.
+            return match self.trait_method_for(&base_ty, &name.name, false, name.span)? {
+                Some((gf, known)) => self.generic_call(cx, gf, vec![recv], known, args, exp, span),
+                None => Err(self.no_bound_method(o, &name.name, name.span)),
+            };
+        }
         if let Some((g, targs)) = self.generics.inst_of.get(&base_ty).cloned() {
             if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
                 let known = targs.into_iter().map(Some).collect();
@@ -2678,6 +2785,10 @@ impl<'a> Checker<'a> {
         }
         if let Some(r) = self.intrinsic_method(cx, recv.clone(), &name.name, args, span)? {
             return Ok(r);
+        }
+        // A trait's default method, for a type that implements the trait.
+        if let Some((gf, known)) = self.trait_method_for(&base_ty, &name.name, true, name.span)? {
+            return self.generic_call(cx, gf, vec![recv], known, args, exp, span);
         }
         // A field holding a function pointer: `(n.f)(x)` style written as `n.f(x)`.
         if let Ok(fv) = self.field_of(recv.clone(), name, name.span) {
@@ -3095,6 +3206,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        env: None,
     }
 }
 

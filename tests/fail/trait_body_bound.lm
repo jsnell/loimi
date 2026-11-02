@@ -1,0 +1,11 @@
+// A generic body calling a bounded function needs the bound itself.
+trait Show { fn show(x: Self); }
+fn i64.show(x: i64) {}
+impl Show for i64;
+fn g<T: Show>(x: T) { x.show(); }
+trait Other { fn other(x: Self); }
+fn i64.other(x: i64) {}
+impl Other for i64;
+fn f<T: Other>(x: T) { g(x); }
+fn main() { f(1); }
+// error: `T` does not implement `Show` (needed by `g<T>`)

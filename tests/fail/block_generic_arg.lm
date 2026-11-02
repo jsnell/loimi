@@ -1,0 +1,5 @@
+// A block fn cannot escape through a generic parameter.
+fn id<T>(x: T) -> T { x }
+fn keep(f: block fn()) { id(f); }
+fn main() {}
+// error: `f` is a `block fn`

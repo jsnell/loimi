@@ -1,0 +1,5 @@
+trait F { fn f<U>(x: Self, u: U) -> U; }
+fn i64.f(x: i64, u: i64) -> i64 { u }
+impl F for i64;
+fn main() {}
+// error: `i64` does not implement `F`: the trait's `f` takes 1 type parameter(s), the method none

@@ -1,0 +1,7 @@
+// Effects of a call through a bound are the trait's.
+trait Visit { fn visit(x: Self) uses gc; }
+fn i64.visit(x: i64) {}
+impl Visit for i64;
+fn f<T: Visit>(x: T) { x.visit(); }
+fn main() uses gc { f(1); }
+// error: `Visit.visit<T>` uses gc, but `f<T>` does not declare it

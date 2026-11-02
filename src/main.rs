@@ -1,6 +1,7 @@
 mod ast;
 mod traits;
 mod check;
+mod closures;
 mod codegen;
 mod diag;
 mod gcgen;

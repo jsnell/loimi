@@ -22,6 +22,7 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
     match &e.kind {
         TK::Local(l) => push(used, *l),
         TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) | TK::Global(_) => {}
+        TK::Closure(_, caps) => caps.iter().for_each(|l| push(used, *l)),
         TK::Continue(_) | TK::Unreachable => {}
         TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
         TK::Try(a) | TK::Trailing(a) => go(a),
@@ -223,7 +224,7 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
     let go = |x: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)| for_each_bind(x, f);
     match &e.kind {
         TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
-        TK::Global(_) | TK::Continue(_) | TK::Unreachable => {}
+        TK::Global(_) | TK::Continue(_) | TK::Unreachable | TK::Closure(..) => {}
         TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a, f),
         TK::Try(a) | TK::Trailing(a) => go(a, f),
         TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
@@ -332,7 +333,7 @@ pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
     let mut go = |x: &'a TExpr| for_each_expr(x, f);
     match &e.kind {
         TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
-        TK::Global(_) | TK::Continue(_) | TK::Unreachable => {}
+        TK::Global(_) | TK::Continue(_) | TK::Unreachable | TK::Closure(..) => {}
         TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
         TK::Try(a) | TK::Trailing(a) => go(a),
         TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {

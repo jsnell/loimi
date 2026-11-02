@@ -1,0 +1,6 @@
+trait A { fn name(x: Self) -> str { "a" } }
+trait B { fn name(x: Self) -> str { "b" } }
+impl A for i64;
+impl B for i64;
+fn main() { let x: i64 = 1; x.name(); }
+// error: method `name` on `i64` is ambiguous: it comes from `A` and `B`

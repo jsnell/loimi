@@ -196,6 +196,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        env: None,
     });
     id
 }
@@ -418,6 +419,11 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 pt.push(Ty::Ptr(Box::new(Ty::Int(word))));
                 pc_caches.push(Some(ci));
             } else {
+                if let TypeKind::Block(..) = &p.ty.kind {
+                    // Vm functions are inlined into handlers, which may not
+                    // create closures; a callback would only be a plain fn.
+                    return Err(Diag::new(p.ty.span, "a vm function cannot take a `block fn` parameter: use a plain `fn` type"));
+                }
                 pt.push(c.resolve_type(m, &p.ty)?);
                 pc_caches.push(None);
             }
@@ -1446,7 +1452,7 @@ pub fn check_raise_ty(c: &mut Checker, cx: &mut FnCx, e: &Ty, span: Span) -> Res
 /// through function pointers are treated alike.
 pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     let TK::Call(f, _) = &call.kind else { unreachable!() };
-    let Ty::Fn(_, _, e) = f.ty else { unreachable!() };
+    let (Ty::Fn(_, _, e) | Ty::Block(_, _, e)) = f.ty else { unreachable!() };
     let callee = match f.kind {
         TK::FnRef(id) => format!("`{}`", c.prog.fns[id as usize].name),
         _ => format!("this call through a `{}`", c.ty_name(&f.ty)),
@@ -1478,8 +1484,14 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
             return Ok(call);
         }
     }
-    let caller = if cx.fn_name.is_empty() { "this function".to_string() } else { format!("`{}`", cx.fn_name) };
     let eff = effect_name(missing);
+    if let Some(t) = &cx.closure_ty {
+        return Err(Diag::new(
+            span,
+            format!("{} uses {}, but this closure's type `{}` does not allow it", callee, eff, c.ty_name(t)),
+        ));
+    }
+    let caller = if cx.fn_name.is_empty() { "this function".to_string() } else { format!("`{}`", cx.fn_name) };
     Err(Diag::new(
         span,
         format!("{} uses {}, but {} does not declare it; add `uses {}` to its signature", callee, eff, caller, eff),

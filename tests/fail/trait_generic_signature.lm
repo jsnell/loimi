@@ -1,0 +1,5 @@
+trait Conv<T> { fn conv(x: Self) -> T; }
+fn i64.conv(x: i64) -> str { "" }
+impl Conv<i64> for i64;
+fn main() {}
+// error: `i64` does not implement `Conv<i64>`: `i64.conv` has type `fn(i64) -> []u8`, but the trait needs `fn(i64) -> i64`

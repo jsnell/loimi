@@ -1,0 +1,4 @@
+var saved: ?fn() = None;
+fn keep(f: block fn()) { saved = f; }
+fn main() {}
+// error: `f` is a `block fn`

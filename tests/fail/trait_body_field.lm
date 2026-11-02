@@ -1,0 +1,8 @@
+// Fields of a bounded type parameter are not visible in the generic body.
+trait Show { fn show(x: Self); }
+struct Sym { id: u32 }
+fn Sym.show(s: Sym) {}
+impl Show for Sym;
+fn f<T: Show>(x: T) -> u32 { x.id }
+fn main() { f(Sym { id: 1 }); }
+// error: no field `id` on type `T`

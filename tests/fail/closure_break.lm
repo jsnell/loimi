@@ -1,0 +1,5 @@
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() {
+    loop { each(3, |i| if i > 1 { break; }); }
+}
+// error: `break` outside of a loop

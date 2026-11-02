@@ -27,6 +27,8 @@ pub enum TypeKind {
     Tuple(Vec<TypeExpr>),
     /// `fn(A, B) -> R uses gc`: the effect, if any, is the strongest one.
     Fn(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
+    /// `block fn(A) -> R uses gc`: a non-escaping closure (parameters only).
+    Block(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),
@@ -119,6 +121,9 @@ pub enum ExprKind {
     /// `expr?`
     Try(P<Expr>),
     SizeOf(TypeExpr),
+    /// `|a, b: T| body` or `|a| -> R { .. }`: a closure literal (only as an
+    /// argument for a `block fn` parameter).
+    Closure(Vec<(Ident, Option<TypeExpr>)>, Option<TypeExpr>, P<Expr>),
     /// `f<T, U>`: explicit type arguments (only as a callee: `f<T>(..)`).
     TypeArgs(P<Expr>, Vec<TypeExpr>),
     /// VM control words and constructs (only valid in handlers).
@@ -236,21 +241,34 @@ pub struct FnDecl {
     pub is_pub: bool,
 }
 
-/// The traits a type parameter must implement, as (possibly qualified) paths.
-pub type Bounds = Vec<Vec<Ident>>;
+/// A trait named in a bound or an impl: `Hash`, `hash.Hash`, `Hooks<K, E>`.
+#[derive(Clone, Debug)]
+pub struct TraitRef {
+    pub path: Vec<Ident>,
+    pub args: Vec<TypeExpr>,
+    pub span: Span,
+}
 
-/// `trait Name { fn m(a: Self) -> R; .. }`: method signatures over `Self`.
+/// The traits a type parameter must implement.
+pub type Bounds = Vec<TraitRef>;
+
+/// `trait Name<A> { fn m(a: Self) -> R; fn d(a: Self) { .. } .. }`: method
+/// signatures over `Self`, with optional default bodies and their own type
+/// parameters.
 #[derive(Clone, Debug)]
 pub struct TraitDecl {
     pub name: Ident,
+    pub generics: Vec<Ident>,
     pub methods: Vec<FnDecl>,
     pub is_pub: bool,
 }
 
-/// `impl Trait for Type;`
+/// `impl Trait for Type;`, `impl<T: Hash> Hash for Vec<T>;`
 #[derive(Clone, Debug)]
 pub struct ImplDecl {
-    pub trait_path: Vec<Ident>,
+    pub generics: Vec<Ident>,
+    pub bounds: Vec<Bounds>,
+    pub trait_ref: TraitRef,
     pub ty: TypeExpr,
     pub span: Span,
 }

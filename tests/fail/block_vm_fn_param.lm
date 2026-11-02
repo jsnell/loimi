@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    fn visit(f: block fn(i64)) { f(1); }
+    op NOP() : A { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: a vm function cannot take a `block fn` parameter

@@ -1,0 +1,6 @@
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() {
+    let total = 0;
+    each(3, |i| total += i);
+}
+// error: cannot assign to `total`: declared with `let`

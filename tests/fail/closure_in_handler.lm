@@ -1,0 +1,11 @@
+// Closures are not allowed in vm code: a closure is a function of its own,
+// and capturing handler state by reference would force it into memory.
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+vm V {
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op ADD() : A { cold { each(3, |i| acc += i); } next }
+    entry run(c: *u32) -> i64 { pc = c; acc = 0; jump pc }
+}
+fn main() {}
+// error: closures are not allowed in vm code
