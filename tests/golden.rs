@@ -157,3 +157,68 @@ fn mini_scripts() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
+
+/// Tests in examples/mini/tests/conformance that need standard library
+/// functions Mini does not have yet (string.*, math.*, table.*, io.*,
+/// tostring, type, assert, error, %.14g float formatting, ...).
+/// Remove entries as the library lands.
+const MINI_CONFORMANCE_SKIP: &[&str] = &[
+    "arith_float", "concat", "err_assert", "err_format_d", "gc_alloc", "lex_strings",
+    "lib_assert_error", "lib_format", "lib_io_write", "lib_math", "lib_print",
+    "lib_string_basic", "lib_table", "lib_tonumber", "lib_tostring", "lib_type",
+    "multret", "prog_algorithms", "prog_objects", "prog_strings",
+    "stmt_ipairs", "stmt_numfor", "stmt_pairs", "stmt_while",
+];
+
+/// The clean-room conformance tests (examples/mini/tests/conformance):
+/// NAME.lua must print exactly NAME.expected (output of real Lua 5.4).
+/// err_*.lua must also exit with a nonzero status; their .expected holds
+/// the output before the error. Run normally and with GC stress.
+#[test]
+fn mini_conformance() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}", std::process::id()));
+    let out = loimi().arg("build").arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let dir = root.join("examples/mini/tests/conformance");
+    let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "lua"))
+        .collect();
+    scripts.sort();
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for f in scripts {
+        let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+        if MINI_CONFORMANCE_SKIP.contains(&stem.as_str()) {
+            continue;
+        }
+        ran += 1;
+        let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
+        let should_fail = stem.starts_with("err_");
+        for stress in [false, true] {
+            let mut cmd = Command::new(&exe);
+            cmd.arg(&f);
+            if stress {
+                cmd.arg("stress");
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let name = format!("{}{}", stem, if stress { " (gc stress)" } else { "" });
+            if stdout != expected {
+                failures.push(format!("{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}", name, expected, stdout, stderr));
+                continue;
+            }
+            if should_fail == out.status.success() {
+                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, stderr));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&exe);
+    assert!(ran > 0);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}

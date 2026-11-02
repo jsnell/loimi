@@ -420,8 +420,13 @@ pub vm Mini {
     }
 
     op EQ(dst: reg, a: reg, b: reg) : ABC {
-        if a == b { dst = Bool(true); next }
-        if let (Int(_), Int(_)) = (a, b) { dst = Bool(false); next }
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x == y); next }
+        // Same bits means equal, except for NaN.
+        if a == b {
+            if let Num(x) = a { dst = Bool(x == x); next }
+            dst = Bool(true);
+            next
+        }
         cold { dst = Bool(value.raw_equal(a, b)); next }
     }
     op LT(dst: reg, a: reg, b: reg) : ABC {
@@ -460,6 +465,17 @@ pub vm Mini {
             let (Some(i), Some(l), Some(s)) = (value.to_num(regs[a]), value.to_num(regs[a + 1]), value.to_num(regs[a + 2])) else {
                 raise error_msg(ctx, "'for' values must be numbers")
             };
+            // Integer start and step: an integer loop, with the float
+            // limit floored (or ceiled for a negative step) and clamped.
+            if let (Int(ii), Int(si)) = (regs[a], regs[a + 2]) {
+                if si == 0 { raise error_msg(ctx, "'for' step is zero") }
+                let lf = if si > 0 { l.floor() } else { -((-l).floor()) };
+                if l != l or (si > 0 and lf < ii as f64) or (si < 0 and lf > ii as f64) { jump target }
+                let li: i32 = if lf > 2147483647.0 { 2147483647 } else if lf < -2147483648.0 { -2147483647 - 1 } else { lf as i32 };
+                regs[a + 1] = Int(li);
+                regs[a + 3] = Int(ii);
+                next
+            }
             if s == 0.0 { raise error_msg(ctx, "'for' step is zero") }
             regs[a] = Num(i);
             regs[a + 1] = Num(l);

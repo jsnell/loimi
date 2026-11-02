@@ -515,10 +515,7 @@ fn reg_of(e: E) -> u32 {
 /// not freed: statements reset the free register at their end.
 fn Parser.store_var(p: *Parser, target: E, v: E) {
     match target {
-        Local(r) => {
-            p.free_exp(v);
-            p.discharge(v, r);
-        }
+        Local(r) => p.discharge(v, r),
         Upval(i) => {
             let v = p.any_reg(v);
             p.emit(Mini.SETUPVAL(reg_of(v) as u8, i as u8));
