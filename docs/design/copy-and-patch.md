@@ -6,7 +6,9 @@ program. It runs all three example interpreters: Mini
 (`examples/mini`), MiniJS and Scheme, none of them changed for it.
 Written 2026-11-02 to answer open question 6 of the
 [roadmap](../roadmap.md); section 9 is the second phase (MiniJS and
-Scheme, no cost with the JIT off, faster stencil builds).
+Scheme, no cost with the JIT off, faster stencil builds), section 10
+the third (rewrites of compiled code, hot and cold stencil parts:
+neither faster), and section 11 sketches immutable operand kinds.
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -194,7 +196,8 @@ A stencil whose fast path ends in `jmp __jit.n.D` as its *last*
 instruction has the jump dropped when the next instruction's code
 follows. In practice LLVM places the fast path first and the cold
 blocks after it, so the jump is usually in the middle. It stays a
-direct `jmp` (section 7).
+direct `jmp` (section 7; splitting stencils into hot and cold parts
+did not pay, section 10).
 
 ## 4. Interaction with the rest of the vm
 
@@ -216,20 +219,21 @@ direct `jmp` (section 7).
   read through `pc`, which compiled code keeps up to date. They work
   unchanged, and the interpreter and compiled code share them.
 - **Quickening (`become`).** The JIT compiles the opcodes it finds, so
-  it compiles quickened members once they are hot. `become` in a JIT
-  build (in the counting copy) first calls `loimi_jit_become(pc)`. If
-  the code object is compiled, that restores its original words and
-  drops the compiled code. Its call counter is set to 1/8 of the
-  threshold, so it is compiled again soon (at most 32 times; after that
-  it stays interpreted). `Vm.optimize` and
-  `Vm.deopt` (generated) do the same through `loimi_jit_invalidate`, so
-  `refuse` (re-fusing supers after quickening) never sees an enter word.
-  Old compiled code that is still running when it is dropped stays
-  correct: it implements the old members, and Mini's members are all
-  complete. A vm whose members are not complete (a member that assumes
-  a type check done elsewhere) would need the old code to exit instead.
-  That could be generated, since the compiler knows which ops can
-  `become`.
+  it compiles quickened members once they are hot. In a JIT build,
+  `become` in a stencil or counting copy calls
+  `loimi_jit_become(word, opcode)`, which makes the rewrite. If the code
+  object is compiled, the runtime also updates its compiled code: it
+  compiles the code object again at once, or points the instruction at
+  code it already has (section 10). `Vm.optimize` and `Vm.deopt`
+  (generated) bracket their rewrites with `loimi_jit_invalidate` and
+  `loimi_jit_rewritten`, so `refuse` (re-fusing supers after quickening)
+  never sees an enter word. Instructions that can be rewritten get a
+  5-byte prefix in front of their code, which the runtime turns into a
+  jump to the new code. Old code that is still running therefore reaches
+  the new member the next time it gets to that instruction; only the
+  copy that made the rewrite finishes as the old member. Members need
+  not be complete, as long as the runtime does not give up on the code
+  object (it does only when out of memory).
 - **The verifier.** Only code built by `Vm.build_verified` is registered
   with the JIT. Stencils rely on the facts the handlers rely on (operands
   in range; label targets are instruction boundaries), and the JIT
@@ -276,9 +280,11 @@ direct `jmp` (section 7).
 - **Compiling** a code object is two passes. The first walks the
   instructions (`opinfo`: per opcode, the size and stencil to use) and
   lays out one stencil copy per instruction. The second copies the
-  stencils and applies the patch records. The pages are `mmap`ped near
-  the program (pc-relative calls into it must fit in 32 bits), written
-  while `PROT_READ|PROT_WRITE`, then switched to `PROT_READ|PROT_EXEC`.
+  stencils and applies the patch records. The region is `mmap`ped near
+  the program (pc-relative calls into it must fit in 32 bits). It is a
+  `memfd` mapped twice: executable where the code runs, and writable
+  at another address, where the runtime writes it. Patching therefore
+  needs no `mprotect`, and no page is writable and executable at once.
 - **Entering compiled code.** After compiling, each instruction word that
   has a stencil is replaced with `ENTER | (index << 8)`. `ENTER` is the
   highest free opcode, and its table slot holds `Vm.jit_enter`, a
@@ -414,9 +420,8 @@ most (by inspection, not measured):
 
 - Most stencils end their fast path with `jmp __jit.n.D` *in the
   middle*, with the cold blocks after it, so every op takes one taken
-  direct jump. A block-placement option, or splitting each stencil into
-  a hot part and a cold part placed elsewhere (as CPython 3.14 does),
-  would let the fast path fall through.
+  direct jump. Splitting stencils into hot and cold parts (as CPython
+  3.14 does) was tried in phase 3 and measured no faster (section 10).
 - `pc` is kept current in its register (`add $4` per op). Keeping it
   as a hole constant and materializing it only on exits would save
   that, but cache-field accesses would then need 64-bit addresses.
@@ -453,17 +458,16 @@ What a full version needs:
      immediate instead of loading it, and fold type checks on it
      (`ADDK_F` with a known float needs no check on its second
      operand). This is the first step to type specialization, and the
-     only `vm` syntax change this work suggests.
-   - *Complete members*: the prototype relies on every family member
-     handling every input, so that stale compiled code stays correct
-     after a `become`. That should be checked or declared. Otherwise
-     the compiler must make code that can `become` exit afterwards
-     (the compiler knows which ops can).
+     only `vm` syntax change this work suggests (sketch in section 11).
+   - ~~*Complete members*~~: since phase 3, old compiled code follows a
+     rewrite at the rewritten instruction (section 10), so members need
+     not be complete.
 2. **Compiler.**
    - ~~Build the stencil module from what the handlers reach~~ (done in
      phase 2: only reachable functions are compiled).
-   - Hot and cold stencil parts, so fast paths fall through, and cold
-     continuations that return into compiled code.
+   - Cold continuations that return into compiled code. (Hot and cold
+     stencil parts, so that fast paths fall through, were tried in
+     phase 3: no faster.)
    - ~~An interpreter that does not count when the JIT is off~~ (done in
      phase 2, with counting copies of the handlers that jump).
    - Other targets: AArch64 relocations (`ADRP`/`ADD`, 26-bit `B`/`BL`,
@@ -564,11 +568,9 @@ the `--jit-stencils` build without `LOIMI_JIT`.
 
 **What remains** (in order of value):
 
-1. *Quickening invalidates whole code objects.* A `become` in compiled
-   code could instead restore only its own word and recompile the code
-   object at the next safe point. That would help MiniJS most.
-2. *Hot/cold stencil parts* (not done): the fast path's `jmp` to the
-   next instruction is still in the middle of most stencils.
+1. *Quickening invalidates whole code objects.* Done in phase 3
+   (section 10), but it was not what held MiniJS back.
+2. *Hot/cold stencil parts.* Tried in phase 3 (section 10): no faster.
 3. The limitations below, of which several vms per program, variants,
    and AArch64 are the ones a real interpreter would hit first.
 
@@ -591,6 +593,177 @@ LOIMI_JIT=1 LOIMI_JIT_STATS=1 ./mini-jit bench/mini/programs/fib.lua
 
 `LOIMI_JIT_HOT=n` sets the threshold, `LOIMI_JIT_DEBUG=1` lists each
 compiled code object, and `LOIMI_JIT_MAP=file` writes address ranges
-for profilers. At build time, `LOIMI_JIT_REPORT=1` reports the stencils
-(and any rejected ones), and `LOIMI_KEEP_STENCILS=dir` keeps the
-stencil module and object.
+for profilers. `LOIMI_JIT_RECOMPILE=n` stops recompiling a code object
+after n compiles (rewrites then retarget instructions; for testing). At
+build time, `LOIMI_JIT_REPORT=1` reports the stencils (and any rejected
+ones), `LOIMI_KEEP_STENCILS=dir` keeps the stencil module and object,
+and `LOIMI_JIT_SPLIT=1` splits stencils into hot and cold parts
+(section 10).
+
+## 10. Phase 3: rewrites of compiled code, hot and cold parts
+
+Phase 2 named two things to try next: keep compiled code across
+quickening (deltablue had 237 invalidations in 301 compiles), and let
+fast paths fall through. Both are done. Neither made the JIT faster.
+
+**Rewrites of compiled code.** A `become` used to restore every word of
+the code object and drop its compiled code; the code was compiled again
+after 1/8 of the threshold. Now `become` calls
+`loimi_jit_become(word, opcode)` and `Vm.optimize`/`Vm.deopt` bracket
+their rewrites with `loimi_jit_invalidate`/`loimi_jit_rewritten`. The
+runtime picks, per rewritten instruction:
+
+1. code it already has for the new word (the copy made at compile time,
+   or one made earlier: a site going back and forth between members);
+2. otherwise, compiling the whole code object again at once, up to 32
+   compiles;
+3. after that, an out-of-line copy of the new op's stencil for that
+   instruction.
+
+If none applies (out of memory or budget), it drops the code as before.
+The alternatives considered:
+
+- *Restore one word and recompile at the next safe point.* The hot
+  counters are not a safe point for this: compiled-to-compiled calls do
+  not count, so a function called only from compiled code would keep
+  its stale code. Recompiling at the rewrite is safe, as it turns out
+  (below), and simpler.
+- *Re-patch the instruction's code in place.* Stencil copies differ in
+  size, and a stencil's own branches may target its first bytes, so the
+  old copy cannot be overwritten. The JIT puts a 5-byte nop in front of
+  the code of each instruction whose word can change (ops that can
+  `become`, supers and their first parts, computed by
+  `jitgen::rewritable_ops`). Every way into that instruction's code goes
+  through this *home*: direct jumps, falling through from the previous
+  copy, and (via `loimi_jit_entries`) enter words. Retargeting writes a
+  `jmp` there and updates the entry. A recompile also points each such
+  home of the old code at the new code.
+- *Compile family members together* so a `become` only changes which
+  stencil runs. That is option 1 with all copies made up front. It
+  would cost code for members that never run.
+
+Why this is safe, including re-entry and invalidation while frames of
+the code are live: compiled code is never freed, and only the 5-byte
+homes of old code are written, which no return address points into.
+A stencil that calls `loimi_jit_become` (or a helper that re-enters the
+interpreter, which rewrites) returns into its unchanged body and
+finishes as the old member, then continues at a home, which leads to
+the new code. GC is not involved (compiled code holds no references).
+deltablue has a store site that alternates between `SETPROP_ADD` and
+`SETPROP` on every miss, 150,000 times in one run. With two `mprotect`
+calls per retarget, deltablue took 1.85× as long. So the JIT region is
+now one memory object mapped twice (executable, and writable at another
+address), and patching needs no system call. Writing code the processor
+is running still costs a pipeline flush, so a site retargeted more than
+16 times is left to the interpreter (its home jumps to the exit
+stencil).
+
+Correctness: the golden JIT tests (all scripts and conformance tests,
+three GC modes, threshold 1) pass as before, and pass again with
+`LOIMI_JIT_RECOMPILE=1`, which turns off recompiles so that every
+rewrite takes the retarget, out-of-line copy and interpreter paths.
+Over MiniJS's tests that is 1,256 recompiles normally, and 1,402
+retargets (1,188 new copies, 212 reuses, 2 sites left to the
+interpreter) with recompiles off; no run dropped its code.
+
+**Hot and cold stencil parts.** With `LOIMI_JIT_SPLIT=1` at build time,
+stencils get a profile entry count, and clang's
+`-fsplit-machine-functions` moves blocks it thinks never run to a
+`.text.split` section. `elf.rs` joins the two parts (a new patch kind
+for references between them), and the runtime lays out each code
+object's cold parts after all its fast paths. Only about a third of the
+stencils are split (36 of Mini's 112). The other stencils' cold blocks
+are small tail calls to cold functions, which the splitter leaves in
+place. A split stencil's fast path does end in its `jmp` to the next
+instruction, which the JIT drops. It is off by default because it
+measured no faster: 1.01× the JIT time without it for both Mini and
+MiniJS. Mini's nbody was 13% slower, apparently because some blocks
+moved out of line are not rare. A taken direct `jmp` to the next
+instruction seems to cost little.
+
+**Results.** Best of 5 (Scheme: 3), interleaved, all built with
+`--align-functions=64` (the noise between builds of the same code is
+otherwise several percent). *Before*: phase 2; *after*: this phase.
+Geometric means of time against the interpreter (default build):
+
+| | JIT off, before | JIT off, after | JIT, before | JIT, after |
+|---|---:|---:|---:|---:|
+| Mini (14) | 1.00 | 1.00 | 0.77 | 0.78 |
+| MiniJS (14) | 1.00 | 1.00 | 0.85 | 0.86 |
+| Scheme (41) | 1.00 | 1.00 | 0.77 | 0.78 |
+
+- **No gain.** deltablue never drops its code now (579 recompiles, 351
+  retargets to existing code, 88 out-of-line copies, 6 sites left to
+  the interpreter), against 237 invalidations before, and runs in the
+  same time (0.88 s against 0.87 s). The invalidations cost little: a
+  dropped function ran in the interpreter for about 7 calls before it
+  was compiled again, which is short next to the run. Recompiling costs
+  little too (deltablue: 647 compiles in 4 ms). What limits
+  MiniJS is still the work inside handlers: property lookup, allocation
+  and strings (section 9).
+- **It costs about 1%** with the JIT on, in all three (Mini 0.772 →
+  0.777, MiniJS 0.847 → 0.861, Scheme 0.765 → 0.776). That is within
+  the noise of one run, but every run was on the slow side, and Scheme
+  barely quickens, so the cost is static. Suspects, not separated: the
+  nop in front of every rewritable instruction, and the doubly mapped
+  region, which cannot use transparent huge pages (the old private
+  mapping could). Other code is unchanged.
+- **What it buys** is robustness rather than speed. Old code reaches the
+  new member at the rewritten instruction, so members need not be
+  complete (section 8). Sites that keep changing no longer cost whole
+  recompiles, and no function is given up on because of quickening.
+- Default builds: the IR of all three interpreters is byte-identical to
+  phase 2's (std paths normalized). JIT off: within noise.
+
+## 11. Sketch: immutable operand kinds (not implemented)
+
+Section 7 left `k[it]` as a load. This sketches what the language and
+the JIT would need to patch constants in.
+
+**Syntax.** An operand kind whose place cannot change once the code is
+verified:
+
+```
+operand kst = const k[it] verify (it as u64) < proto.consts.data.len;
+```
+
+**What the checker enforces.**
+
+- The place's base (`k`) is a state register that is fixed per code
+  object: it is set only from the code object's own data (MiniJS's
+  `CALL` sets `k = p.consts.data.ptr`, and a return restores `fp.k`).
+  The checker already knows which state an operand kind reads.
+- No handler, helper or exported function stores through a `const`
+  place. The pool is ordinary memory, so this is a promise of the vm
+  author, checked as far as the types allow, like `verify` clauses.
+- `const` adds nothing to the interpreter: the handlers are unchanged.
+
+**What the JIT does with it.**
+
+1. *Values as holes.* A `const` operand read becomes a 64-bit hole
+   `__jit.c.OFF.SHIFT.BITS` (an `R_X86_64_64` immediate, `movabs`),
+   patched with the constant's bits at compile time. The runtime needs
+   the pool's address per code object: `Vm.build_verified` passes it to
+   `loimi_jit_register`, evaluated from the operand kind's base in the
+   verify context. `LOADK` becomes a store of an immediate, and
+   `ADDK_F` adds an immediate with no load.
+2. *Types as stencil variants.* A hole's value is unknown when clang
+   compiles the stencil, so the type check on it stays. To fold it, the
+   generator emits one variant per tag the handler distinguishes (the
+   arms of the `match` or `if let` on that operand), each with the tag
+   assumed (`llvm.assume`), for example `ADDK_F.k=Num`. The runtime
+   picks the variant from the constant's tag. Variants are opt-in per
+   op or per operand kind, to bound the number of stencils.
+3. *Heap constants.* A pointer patched into code keeps its object
+   alive only while the pool does. That holds as long as compiled code
+   is dropped with its code object (the collector hook of section 8),
+   and the collector does not move objects. A moving collector would
+   need relocation records for the patched pointers, or the load kept
+   for pointer constants.
+
+**Expected gain.** Constant operands sit in hot loops (mandelbrot's
+`MULK`, `ADDK` and `JGTKN`; Scheme's literal operands). Each loses a
+load and, with variants, a tag check: a few percent where they are
+hot, by analogy with section 7, not measured. It is also the first
+step towards type specialization, which is where the remaining gap to
+LuaJIT is (section 7).

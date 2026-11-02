@@ -180,13 +180,21 @@ quickening on/off.
      remains (values through the register file in memory, type checks,
      call overhead) needs register allocation and type specialization
      across instructions, not templates.
+   - *Phase 3: quickening and stencil layout.* A rewrite of compiled
+     code (`become`, `Vm.optimize`, `Vm.deopt`) no longer drops the code
+     object. The runtime recompiles it at once, or points the rewritten
+     instruction at code it has, through a 5-byte prefix that old code
+     also passes. Members therefore need not be complete. Splitting
+     stencils into hot and cold parts, so that fast paths fall through,
+     is optional (`LOIMI_JIT_SPLIT=1`). Neither is faster: the
+     invalidations cost little, and the new scheme costs about 1% (Mini
+     0.78, MiniJS 0.86, Scheme 0.78).
    - *Recommendation.* Pursue it post-1.0 as an opt-in tier, not as a
      substitute for an optimizing JIT. A full version needs immutable
      operand kinds (`const k[it]`, so constants and their types can be
-     patched in); recompiling after quickening without dropping the
-     whole code object (MiniJS's polymorphic sites); hot and cold
-     stencil parts; freeing compiled code; several vms per program and
-     variants; and AArch64 and PIC/Mach-O relocations.
+     patched in; sketched in the design note); freeing compiled code;
+     several vms per program and variants; and AArch64 and PIC/Mach-O
+     relocations.
 7. **How unsafe is `Window`?** A register window is one pointer with no
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing
