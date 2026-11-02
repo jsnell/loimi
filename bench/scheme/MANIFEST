@@ -7,9 +7,11 @@
 # r7rs-benchmarks: Larceny's R7RS benchmarks (W. D. Clinger et al., drawn
 # from the Gabriel, Kernighan-Van Wyk and Gambit suites) as maintained by
 # ecraven. License: the repository has no LICENSE file (GitHub reports
-# none) and the program headers carry no license statement, so no license
-# is granted for the collection. We therefore only download it at bench
-# time and never commit or redistribute any of it.
+# none). A few programs carry W. D. Clinger's notice permitting copying
+# and redistribution with the notice kept (e.g. equal.scm); most carry no
+# license statement at all, so no license is granted for the collection as
+# a whole. We therefore only download it at bench time and never commit or
+# redistribute any of it.
 #
 # chibi-scheme: BSD-3-Clause (COPYING in its tree). Release 0.12.
 #
