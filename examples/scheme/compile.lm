@@ -6,7 +6,8 @@
 // each lambda its list of free variables.
 //
 // Pass 2 (`Gen`) allocates registers and emits code through the generated
-// `Scheme.X` encoders. Closures are flat: a closure copies the values of
+// `Scheme.X` encoders into a std.bc code buffer (with its labels, jump
+// lists, constant pool and register allocator). Closures are flat: a closure copies the values of
 // its free variables when it is created. A variable that is both captured
 // and assigned lives in a box (a one-slot vector), so all closures share it.
 // letrec bindings of lambdas are not boxed: the closures are created first
@@ -22,6 +23,7 @@ import std.text;
 import std.gc;
 import std.map;
 import std.hash;
+import std.bc;
 import value;
 import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
 import rt.{Ctx};
@@ -1072,12 +1074,12 @@ fn Comp.scan_defs(c: *Comp, x: V) {
 
 struct FS {
     lam: *Lam,
-    code: mem.Vec<u32>,
-    lines: mem.Vec<u32>,
-    consts: mem.Vec<V>,
+    code: bc.Code<u32>,
+    consts: bc.Pool<V>,
     protos: mem.Vec<Gc<Proto> >,
-    freereg: u32,
-    maxreg: u32,
+    /// Scheme has no locals in the allocator's sense: every expression
+    /// saves `regs.top` and restores it when done.
+    regs: bc.Regs,
     line: u32,
 }
 
@@ -1086,52 +1088,43 @@ struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
 fn FS.new(l: *Lam) -> FS {
     FS {
         lam: l,
-        code: mem.Vec.new(),
-        lines: mem.Vec.new(),
-        consts: mem.Vec.new(),
+        code: bc.Code.new(Scheme.op_size, Scheme.set_label),
+        consts: bc.Pool.new(65535),
         protos: mem.Vec.new(),
-        freereg: 0,
-        maxreg: 0,
+        regs: bc.Regs.new(250),
         line: 0,
     }
 }
 
 fn Gen.emit(g: *Gen, w: u32) -> u64 {
-    g.fs.code.push(w);
-    g.fs.lines.push(g.fs.line);
-    g.fs.code.len - 1
+    g.fs.code.set_loc(g.fs.line);
+    g.fs.code.op(w)
 }
 
-fn Gen.pc(g: *Gen) -> u64 { g.fs.code.len }
+/// Emit jump `w` to label `l`.
+fn Gen.jump(g: *Gen, w: u32, l: bc.Label) {
+    g.fs.code.set_loc(g.fs.line);
+    g.fs.code.jump(w, l);
+}
 
 fn Gen.alloc(g: *Gen) -> u32 {
-    let r = g.fs.freereg;
-    g.fs.freereg += 1;
-    if g.fs.freereg > g.fs.maxreg { g.fs.maxreg = g.fs.freereg; }
-    if g.fs.freereg > 250 { fail(g.fs.line, "procedure needs too many registers"); }
-    r
+    g.fs.regs.try_alloc(1) ?? fail(g.fs.line, "procedure needs too many registers")
 }
 
-/// Point the jump at `at` to `target`.
-fn Gen.patch(g: *Gen, at: u64, target: u64) {
-    let w = g.fs.code.at(at);
-    let off = target as i64 - at as i64;
-    if Scheme.opcode(w) == Scheme.OP_JMP {
-        g.fs.code.set(at, Scheme.JMP(off as i32));
-    } else {
-        if off < -32768 or off > 32767 { fail(g.fs.line, "procedure too long"); }
-        g.fs.code.set(at, (w & 0xFFFF) | (((off as i32) as u32 & 0xFFFF) << 16));
-    }
+fn Gen.top(g: *Gen) -> u32 { g.fs.regs.top }
+fn Gen.reset(g: *Gen, top: u32) { g.fs.regs.reset(top); }
+
+/// Point the pending jumps `js` here (a jump that does not fit is
+/// reported when the procedure ends).
+fn Gen.patch_here(g: *Gen, js: mem.Vec<u64>) {
+    var v = js;
+    g.fs.code.patch_here(&v);
+    v.free();
 }
 
+/// Constants are equal when their bits are (symbols are interned).
 fn Gen.constant(g: *Gen, v: V) -> u32 {
-    let fs = g.fs;
-    for i in 0..fs.consts.len {
-        if fs.consts.at(i) == v { return i as u32; }
-    }
-    if fs.consts.len >= 65535 { fail(fs.line, "too many constants"); }
-    fs.consts.push(v);
-    (fs.consts.len - 1) as u32
+    g.fs.consts.add(v) ?? fail(g.fs.line, "too many constants")
 }
 
 fn Gen.load_const(g: *Gen, v: V, dst: u32) {
@@ -1169,7 +1162,7 @@ fn Gen.set_line(g: *Gen, n: *Node) -> u32 {
 /// Emit code leaving the value of `n` in register `dst`.
 fn Gen.to(g: *Gen, n: *Node, dst: u32) {
     let saved_line = g.set_line(n);
-    let save = g.fs.freereg;
+    let save = g.top();
     let d = dst as u8;
     match n.kind {
         Const => g.load_const(n.v, dst),
@@ -1194,10 +1187,11 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
         If => {
             let j = g.cond(n.a);
             g.to(n.b, dst);
-            let e = g.emit(Scheme.JMP(0));
-            g.patch_all(j, g.pc());
+            let done = g.fs.code.label();
+            g.jump(Scheme.JMP(0), done);
+            g.patch_here(j);
             if is_null(n.c) { g.load_const(value.unspec(), dst); } else { g.to(n.c, dst); }
-            g.patch(e, g.pc());
+            g.fs.code.bind(done);
         }
         Lambda => {
             let idx = g.lambda(n.lam);
@@ -1212,26 +1206,24 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
         Let => { g.bind_let(n); g.to(n.a, dst); }
         Letrec => { g.bind_letrec(n); g.to(n.a, dst); }
         And | Or => {
-            var jumps: mem.Vec<u64> = mem.Vec.new();
+            let done = g.fs.code.label();
             for i in 0..n.list.len {
                 g.to(n.list.at(i), dst);
                 if i + 1 < n.list.len {
-                    let w = if n.kind == K.And { Scheme.TEST(d, 0) } else { Scheme.TESTT(d, 0) };
-                    jumps.push(g.emit(w));
+                    g.jump(if n.kind == K.And { Scheme.TEST(d, 0) } else { Scheme.TESTT(d, 0) }, done);
                 }
             }
-            for i in 0..jumps.len { g.patch(jumps.at(i), g.pc()); }
-            jumps.free();
+            g.fs.code.bind(done);
         }
     }
-    g.fs.freereg = save;
+    g.reset(save);
     g.fs.line = saved_line;
 }
 
 /// Evaluate `n` for its effects only.
 fn Gen.effect(g: *Gen, n: *Node) {
     let saved_line = g.set_line(n);
-    let save = g.fs.freereg;
+    let save = g.top();
     match n.kind {
         Const | Ref | GRef | Lambda => {}
         Set => {
@@ -1261,12 +1253,13 @@ fn Gen.effect(g: *Gen, n: *Node) {
             let j = g.cond(n.a);
             g.effect(n.b);
             if is_null(n.c) {
-                g.patch_all(j, g.pc());
+                g.patch_here(j);
             } else {
-                let e = g.emit(Scheme.JMP(0));
-                g.patch_all(j, g.pc());
+                let done = g.fs.code.label();
+                g.jump(Scheme.JMP(0), done);
+                g.patch_here(j);
                 g.effect(n.c);
-                g.patch(e, g.pc());
+                g.fs.code.bind(done);
             }
         }
         Seq => {
@@ -1297,19 +1290,19 @@ fn Gen.effect(g: *Gen, n: *Node) {
             g.to(n, r);
         }
     }
-    g.fs.freereg = save;
+    g.reset(save);
     g.fs.line = saved_line;
 }
 
 /// Return the value of `n` from the current procedure.
 fn Gen.tail(g: *Gen, n: *Node) {
     let saved_line = g.set_line(n);
-    let save = g.fs.freereg;
+    let save = g.top();
     match n.kind {
         If => {
             let j = g.cond(n.a);
             g.tail(n.b);
-            g.patch_all(j, g.pc());
+            g.patch_here(j);
             if is_null(n.c) {
                 let r = g.alloc();
                 g.load_const(value.unspec(), r);
@@ -1323,30 +1316,28 @@ fn Gen.tail(g: *Gen, n: *Node) {
             g.tail(n.list.at(n.list.len - 1));
         }
         Call => {
-            let r = g.fs.freereg;
+            let r = g.top();
             g.call(n, r, true);
         }
         Let => { g.bind_let(n); g.tail(n.a); }
         Letrec => { g.bind_letrec(n); g.tail(n.a); }
         And | Or => {
             let r = g.alloc();
-            var jumps: mem.Vec<u64> = mem.Vec.new();
+            let done = g.fs.code.label();
             for i in 0..n.list.len - 1 {
                 g.to(n.list.at(i), r);
-                let w = if n.kind == K.And { Scheme.TEST(r as u8, 0) } else { Scheme.TESTT(r as u8, 0) };
-                jumps.push(g.emit(w));
+                g.jump(if n.kind == K.And { Scheme.TEST(r as u8, 0) } else { Scheme.TESTT(r as u8, 0) }, done);
             }
             g.tail(n.list.at(n.list.len - 1));
-            for i in 0..jumps.len { g.patch(jumps.at(i), g.pc()); }
+            g.fs.code.bind(done);
             g.emit(Scheme.RET(r as u8));
-            jumps.free();
         }
         _ => {
             let r = g.any(n);
             g.emit(Scheme.RET(r as u8));
         }
     }
-    g.fs.freereg = save;
+    g.reset(save);
     g.fs.line = saved_line;
 }
 
@@ -1361,7 +1352,7 @@ fn Gen.cond(g: *Gen, n: *Node) -> mem.Vec<u64> {
 
 fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
     let saved_line = g.set_line(n);
-    let save = g.fs.freereg;
+    let save = g.top();
     if n.kind == K.And {
         for i in 0..n.list.len { g.cond_into(n.list.at(i), js); }
     } else if n.kind == K.Prim and n.po == PO.Not {
@@ -1371,14 +1362,8 @@ fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
         let r = g.any(n);
         js.push(g.emit(Scheme.TEST(r as u8, 0)));
     }
-    g.fs.freereg = save;
+    g.reset(save);
     g.fs.line = saved_line;
-}
-
-fn Gen.patch_all(g: *Gen, js: mem.Vec<u64>, target: u64) {
-    var v = js;
-    for i in 0..v.len { g.patch(v.at(i), target); }
-    v.free();
 }
 
 /// A call. `dst` is where the result goes (non-tail), or the first free
@@ -1406,7 +1391,7 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
                 }
                 mode.push(if direct { 1 } else { 2 });
             }
-            let base = g.fs.freereg;
+            let base = g.top();
             for i in 0..nargs {
                 let r = g.alloc();
                 if mode.at(i) == 2 { g.to(n.list.at(i), r); }
@@ -1418,12 +1403,12 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
                 if mode.at(i) == 2 { g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8)); }
             }
             mode.free();
-            let j = g.emit(Scheme.JMP(0));
-            g.patch(j, 0);
+            g.fs.code.set_loc(g.fs.line);
+            g.fs.code.jump_to(Scheme.JMP(0), 0);
             return;
         }
     }
-    let base = if !tail and dst + 1 == g.fs.freereg { dst } else { g.alloc() };
+    let base = if !tail and dst + 1 == g.top() { dst } else { g.alloc() };
     g.to(f, base);
     for i in 0..nargs {
         let r = g.alloc();
@@ -1552,7 +1537,7 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
 
 /// Evaluate a let's inits into fresh registers and bind its variables.
 fn Gen.bind_let(g: *Gen, n: *Node) {
-    let base = g.fs.freereg;
+    let base = g.top();
     for i in 0..n.list.len {
         let r = g.alloc();
         g.to(n.list.at(i), r);
@@ -1576,7 +1561,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
     for j in 0..n.list.len {
         let v = n.vars.at(j);
         let init = n.list.at(j);
-        let save = g.fs.freereg;
+        let save = g.top();
         if boxed(v) {
             let r = g.any(init);
             g.emit(Scheme.BOXSET(v.reg as u8, r as u8));
@@ -1596,7 +1581,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
                 }
             }
         }
-        g.fs.freereg = save;
+        g.reset(save);
     }
 }
 
@@ -1623,12 +1608,15 @@ fn Gen.lambda(g: *Gen, l: *Lam) -> u32 {
 }
 
 fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
+    if let Some(e) = fs.code.check() {
+        fail(e.loc, match e.kind { JumpRange => "procedure too long", _ => e.message() });
+    }
     let h = g.heap;
     let l = fs.lam;
-    let consts = value.new_arr(h, fs.consts.len);
-    for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
-    let lines = new(h, Lines {}, fs.lines.len);
-    for i in 0..fs.lines.len { lines.data[i] = fs.lines.at(i); }
+    let consts = value.new_arr(h, fs.consts.len());
+    for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
+    let lines = new(h, Lines {}, fs.code.len());
+    fs.code.locs_into(lines.data);
     let protos = new(h, Protos {}, fs.protos.len);
     for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
     if l.free.len > 255 { fail(fs.line, "too many free variables"); }
@@ -1645,14 +1633,14 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
         nparams: np,
         rest: rest,
         fixed: if l.rest { 0x10000 } else { np },
-        nregs: if fs.maxreg == 0 { 1 } else { fs.maxreg },
+        nregs: fs.regs.frame_size(1),
         nfree: l.free.len as u32,
         consts: consts,
         lines: lines,
         protos: protos,
         desc: desc,
-    }, fs.code.len);
-    for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
+    }, fs.code.len());
+    fs.code.copy_into(proto.code);
     if let Some(bad) = Scheme.verify(proto.code, proto) {
         var b = text.StrBuf.new();
         b.push_str("internal error: generated code fails verification at instruction ");
@@ -1661,7 +1649,6 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     }
     Scheme.optimize(proto.code);
     fs.code.free();
-    fs.lines.free();
     fs.consts.free();
     fs.protos.free();
     proto

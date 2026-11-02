@@ -63,6 +63,11 @@ pub value V repr nanbox {
 
 pub const NO_GLOBAL: u32 = 0xFFFFFFFF;
 
+/// Compiler constants (std.bc.Pool) are equal when their bits are.
+pub fn V.hash(v: V) -> u64 { hash.mix(v as u64) }
+pub fn V.eq(a: V, b: V) -> bool { a == b }
+impl hash.Hash for V;
+
 /// `Proto.fixed` of the prototype shared by escape continuations: no CALL
 /// argument count equals it, so calling one always takes the slow path.
 pub const CONT_FIXED: u32 = 0x20000;
