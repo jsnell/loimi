@@ -17,9 +17,23 @@ import compile;
 import builtins;
 import prelude;
 
+/// Print the bytecode of `p` and of its nested prototypes (`scheme
+/// prog.scm disasm`).
+fn dump(p: Gc<value.Proto>) {
+    var b = text.StrBuf.new();
+    b.push_str("== ");
+    b.push_str(p.name.data);
+    b.push_str(" (nregs ");
+    b.push_int(p.nregs as i64);
+    b.push_str(")\n");
+    Scheme.disasm(p.code, &b);
+    io.print(b.as_str());
+    for i in 0..p.protos.data.len { dump(p.protos.data[i]); }
+}
+
 fn main() -> i32 {
     let Some(path) = os.arg(1) else {
-        io.eprintln("usage: scheme <program.scm> [stress]");
+        io.eprintln("usage: scheme <program.scm> [stress | disasm]");
         return 2;
     };
     let Some(src) = io.read_file(path) else {
@@ -35,7 +49,9 @@ fn main() -> i32 {
     // mperm, paraffins, graphs 10-20% faster), and no slower elsewhere.
     ctx.heap.set_growth(400, 2 << 20);
     ctx.heap.set_max_budget(256 << 20);
-    if os.arg(2).is_some() { ctx.heap.set_stress(true); }
+    var disasm = false;
+    if let Some(a) = os.arg(2) { disasm = a.eq("disasm"); }
+    if os.arg(2).is_some() and !disasm { ctx.heap.set_stress(true); }
     for id in 0..builtins.NPRIMS {
         let (name, _, _) = builtins.prim_info(id);
         let s = ctx.syms.intern(&ctx.heap, name);
@@ -43,6 +59,10 @@ fn main() -> i32 {
         ctx.gvals.set(g as u64, value.prim(id));
     }
     let proto = compile.compile(&ctx, prelude.source(), src);
+    if disasm {
+        dump(proto);
+        return 0;
+    }
     let main_closure = value.new_closure(&ctx.heap, proto);
     ctx.heap.add_scanner(&ctx as *u8, rt.scan_roots);
     Scheme.run(&ctx, main_closure);
