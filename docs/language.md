@@ -1827,6 +1827,19 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   so the object can be `dlopen`'ed whatever static TLS space is left
   (`--tls=initial-exec|local-dynamic|global-dynamic` overrides). The
   costs are in `lowering.md` §4.
+- **AddressSanitizer.** `--sanitize=address` works with `--lib` and
+  `--shared`: the library is instrumented, and the host links the ASan
+  runtime by building with `-fsanitize=address`. Loimi instruments with
+  clang but links executables against GCC's `libasan` when clang's own
+  runtime (`libclang_rt.asan`, package `libclang-rt-19-dev`) is missing,
+  which is the usual case on Debian; both speak the same
+  instrumentation ABI. So `gcc -fsanitize=address host.c librx.a` works
+  everywhere, and `clang-19 -fsanitize=address` works where clang's
+  runtime is installed. A host that cannot be rebuilt can load a
+  `--shared` library under `LD_PRELOAD=$(gcc -print-file-name=libasan.so)`.
+  A library leaves ASan's options to the host (executables turn leak
+  checking off by default; libraries do not). `--emit-llvm` with `--lib`
+  gives IR you can also instrument yourself.
 - **The header** (`--header out.h`) declares every export, in source
   order, with these C types:
 

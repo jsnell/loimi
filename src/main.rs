@@ -215,7 +215,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         Tls::LocalDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local(localdynamic)"),
         Tls::GeneralDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local"),
     }
-    Ok((if opts.sanitize_address { sanitize_address(&ir) } else { ir }, header, jit))
+    Ok((if opts.sanitize_address { sanitize_address(&ir, library) } else { ir }, header, jit))
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -294,14 +294,17 @@ fn asan_runtime(clang: &str) -> Result<Option<PathBuf>, String> {
 
 /// ASan instruments only functions that carry the `sanitize_address`
 /// attribute. Clang adds it to C functions, but IR input has none, so
-/// mark every definition. Leak checking is off by default: programs
-/// leave their heaps to the OS (ASAN_OPTIONS=detect_leaks=1 turns it on).
-fn sanitize_address(ir: &str) -> String {
+/// mark every definition. In executables leak checking is off by default:
+/// programs leave their heaps to the OS (ASAN_OPTIONS=detect_leaks=1
+/// turns it on). Libraries leave ASan's options to the host.
+fn sanitize_address(ir: &str, library: bool) -> String {
     let mut out = String::with_capacity(ir.len() + ir.len() / 16);
-    out.push_str(
-        "@loimi.asan_options = private constant [15 x i8] c\"detect_leaks=0\\00\"\n\
-         define ptr @__asan_default_options() {\n  ret ptr @loimi.asan_options\n}\n",
-    );
+    if !library {
+        out.push_str(
+            "@loimi.asan_options = private constant [15 x i8] c\"detect_leaks=0\\00\"\n\
+             define ptr @__asan_default_options() {\n  ret ptr @loimi.asan_options\n}\n",
+        );
+    }
     for line in ir.lines() {
         match line.strip_suffix('{') {
             Some(head) if line.starts_with("define ") => {
@@ -409,9 +412,6 @@ fn parse_args() -> Result<Opts, String> {
     if o.kind != OutKind::Exe {
         if o.run {
             return Err("`loimi run` builds executables; --lib and --shared need `loimi build`".into());
-        }
-        if o.sanitize_address {
-            return Err("--sanitize=address builds executables only".into());
         }
     }
     Ok(o)
@@ -522,7 +522,9 @@ fn compiler_main() -> ExitCode {
         // stable before/after benchmarking.
         cmd.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
     }
-    let asan_lib = if opts.sanitize_address {
+    // Libraries carry the instrumentation only: the host links the ASan
+    // runtime (docs/language.md §10.1).
+    let asan_lib = if opts.sanitize_address && opts.kind == OutKind::Exe {
         match asan_runtime(&clang) {
             Ok(lib) => lib,
             Err(e) => {
@@ -540,7 +542,7 @@ fn compiler_main() -> ExitCode {
         cmd.arg("-fsanitize=address")
             .arg("-fsanitize-address-use-after-return=never")
             .arg("-fno-omit-frame-pointer");
-        if asan_lib.is_some() {
+        if asan_lib.is_some() || opts.kind != OutKind::Exe {
             cmd.arg("-fno-sanitize-link-runtime");
         }
     }

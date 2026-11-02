@@ -680,6 +680,64 @@ fn c_library_panics() {
     c_host_run("c-library-panics", &d.join("panic.lm"), &d.join("panic_host.c"), &d.join("panic_host.expected"), None);
 }
 
+/// `--sanitize=address` with `--lib` and `--shared`: the library carries
+/// the instrumentation, the host links ASan's runtime (gcc's libasan,
+/// as `loimi build --sanitize=address` does for executables). Caught
+/// panics unwind cleanly under ASan. Not under `ulimit -v`, which ASan
+/// cannot run with: its RSS limit bounds it instead.
+#[test]
+fn c_library_asan() {
+    // ASan reserves terabytes of shadow memory: skip under `ulimit -v`.
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+    if limits.lines().any(|l| l.starts_with("Max address space") && !l.contains("unlimited")) {
+        eprintln!("c_library_asan: skipped under an address-space limit (ulimit -v)");
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let d = root.join("tests/embed");
+    let dir = std::env::temp_dir().join(format!("loimi-asan-lib-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let want = std::fs::read_to_string(d.join("panic_host.expected")).unwrap();
+    for (variant, flag, lib) in [("static", "--lib", "libp.a"), ("shared", "--shared", "libp.so")] {
+        let libfile = dir.join(lib);
+        let out = loimi()
+            .arg("build")
+            .arg(d.join("panic.lm"))
+            .args([flag, "--sanitize=address", "-o"])
+            .arg(&libfile)
+            .arg("--header")
+            .arg(dir.join("panic.h"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}: build failed:\n{}", variant, String::from_utf8_lossy(&out.stderr));
+        let exe = dir.join(format!("host-{}", variant));
+        let mut cc = Command::new("gcc");
+        cc.args(["-fsanitize=address", "-I"]).arg(&dir).arg(d.join("panic_host.c"));
+        if flag == "--shared" {
+            cc.arg("-L").arg(&dir).arg("-lp").arg(format!("-Wl,-rpath,{}", dir.display()));
+        } else {
+            cc.arg(&libfile);
+        }
+        let out = cc.arg("-lm").arg("-o").arg(&exe).output().unwrap();
+        assert!(out.status.success(), "{}: gcc failed:\n{}", variant, String::from_utf8_lossy(&out.stderr));
+        let out = Command::new(&exe)
+            .env("ASAN_OPTIONS", "hard_rss_limit_mb=2000:allocator_may_return_null=1:detect_leaks=0")
+            .output()
+            .unwrap();
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && got == want,
+            "{}: exit {:?}\n--- got\n{}--- stderr\n{}",
+            variant,
+            out.status.code(),
+            got,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Mini embedded in a C host (examples/embed/host.c): two states alive at
 /// once, globals both ways, C natives, syntax and runtime errors,
 /// natives calling back into Mini (nested, failing, under GC stress), the

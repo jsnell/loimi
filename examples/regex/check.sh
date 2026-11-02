@@ -26,11 +26,10 @@ done
 if [ -n "$asan" ]; then
     # ASan breaks under `ulimit -v`; bound it by RSS instead.
     export ASAN_OPTIONS=hard_rss_limit_mb=2000
-    # `--sanitize=address` builds executables only, so instrument the
-    # library's LLVM IR ourselves. Loimi links gcc's libasan; so do we.
-    "$loimi" build "$here/lib.lm" --lib --emit-llvm -o "$out/rx.ll" --header "$out/rx.h"
-    clang-19 -g -O1 -fsanitize=address -fPIC -Wno-override-module -c "$out/rx.ll" -o "$out/rx_asan.o"
-    gcc -g -fsanitize=address -I"$out" "$here/host.c" "$out/rx_asan.o" -lm -o "$out/rxhost_asan"
+    # The archive is instrumented; the host links the ASan runtime
+    # (gcc's libasan here, as Loimi's own --sanitize=address does).
+    "$loimi" build "$here/lib.lm" --lib --sanitize=address -o "$out/librx_asan.a" --header "$out/rx.h"
+    gcc -g -fsanitize=address -I"$out" "$here/host.c" "$out/librx_asan.a" -lm -o "$out/rxhost_asan"
     host=$out/rxhost_asan
 else
     "$loimi" build "$here/lib.lm" --release --lib -o "$out/librx.a" --header "$out/rx.h"
