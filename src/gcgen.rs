@@ -341,10 +341,14 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
             }
         }
     }
-    if ids.is_empty() {
+    // (slot, type) of each root: traced locals, then pending values.
+    let mut roots: Vec<(String, Ty)> =
+        ids.iter().map(|l| (g.slots[*l as usize].clone(), fd.locals[*l as usize].ty.clone())).collect();
+    roots.extend(g.pending.iter().cloned());
+    if roots.is_empty() {
         return None;
     }
-    let n = ids.len();
+    let n = roots.len();
     let ft = format!("{{ ptr, i64, [{} x {{ ptr, ptr }}] }}", n);
     let fr = g.fresh();
     let _ = writeln!(g.allocas, "  {} = alloca {}, align 8", fr, ft);
@@ -352,11 +356,9 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     g.emit(format!("store ptr {}, ptr {}", prev, fr));
     let np = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", ft, fr));
     g.emit(format!("store i64 {}, ptr {}", n, np));
-    for (i, l) in ids.iter().enumerate() {
-        let t = fd.locals[*l as usize].ty.clone();
-        let mf = mark_fn(g.cg, &t);
+    for (i, (slot, t)) in roots.iter().enumerate() {
+        let mf = mark_fn(g.cg, t);
         let sp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 0", ft, fr, i));
-        let slot = g.slots[*l as usize].clone();
         g.emit(format!("store ptr {}, ptr {}", slot, sp));
         let mp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 1", ft, fr, i));
         g.emit(format!("store ptr {}, ptr {}", mf, mp));

@@ -1,0 +1,52 @@
+// A traced value computed before defers that may collect run (a block's
+// tail value, `return v`, `break v`, the error of `?`) stays rooted while
+// they run. It was a temporary held only in a register: freed and reused.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn young(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+fn churn(h: *gc.Heap) uses gc { for i in 0..300 { young(h, -1); } gc.collect(h); for i in 0..300 { young(h, -2); } }
+
+fn tail(h: *gc.Heap) -> Gc<Node> uses gc {
+    defer churn(h);
+    young(h, 1)
+}
+
+fn ret(h: *gc.Heap) -> Gc<Node> uses gc {
+    defer churn(h);
+    return young(h, 2);
+}
+
+fn brk(h: *gc.Heap) -> i64 uses gc {
+    let n = loop {
+        defer churn(h);
+        break young(h, 3);
+    };
+    n.value
+}
+
+fn fails(h: *gc.Heap) -> Result<i64, Gc<Node>> { Err(young(h, 4)) }
+
+fn tried(h: *gc.Heap) -> Result<i64, Gc<Node>> uses gc {
+    defer churn(h);
+    let v = fails(h)?;
+    Ok(v)
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let a = tail(h);
+    let b = ret(h);
+    io.print_int(a.value); io.println("");
+    io.print_int(b.value); io.println("");
+    io.print_int(brk(h)); io.println("");
+    match tried(h) { Ok(_) => io.println("ok"), Err(n) => { io.print_int(n.value); io.println(""); } }
+}
+
+// expect: 1
+// expect: 2
+// expect: 3
+// expect: 4
