@@ -1,0 +1,10 @@
+# Reference JavaScript interpreters for benchmarking.
+#
+# node --jitless (V8's Ignition bytecode interpreter) is the main reference;
+# node itself is already installed. QuickJS (a bytecode interpreter) is an
+# optional second reference, built from source by install.sh into
+# bench/js/install/ (gitignored). Only this manifest and the script are
+# committed. QuickJS is MIT-licensed.
+#
+# name     version     url                                                     sha256
+quickjs    2026-06-04  https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz   b376e839b322978313d929fd20663b11ba58b75df5a46c126dd19ea2fa70ad2a

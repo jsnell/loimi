@@ -9,3 +9,5 @@ core.*
 /bench/scheme/src
 /bench/scheme/install
 /bench/scheme/r7rs-benchmarks
+/bench/js/src
+/bench/js/install
