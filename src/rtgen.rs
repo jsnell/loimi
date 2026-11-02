@@ -28,6 +28,54 @@ use crate::ast::Linkage;
 /// glibc's `jmp_buf` is 200 bytes on x86-64 and 312 on AArch64.
 const JMP_BUF_BYTES: u32 = 512;
 
+/// On x86-64 the handlers use LLVM's builtin setjmp (`__builtin_setjmp`):
+/// it saves the frame pointer, stack pointer and resume address in five
+/// words, and the function that calls it saves the callee-saved
+/// registers itself. Elsewhere, glibc's `_setjmp`/`longjmp`, which also
+/// save the signal-free context and mangle pointers.
+const BUILTIN_SJLJ: bool = cfg!(target_arch = "x86_64");
+
+/// The jump buffer's type in `%loimi.handler`.
+fn buf_ty() -> String {
+    if BUILTIN_SJLJ { "[5 x ptr]".into() } else { format!("[{} x i8]", JMP_BUF_BYTES) }
+}
+
+/// IR lines: `%r` = 0 after saving the context in `%buf`, nonzero when
+/// a jump comes back.
+fn setjmp_ir() -> &'static str {
+    if BUILTIN_SJLJ {
+        "  %fa = call ptr @llvm.frameaddress.p0(i32 0)\n  \
+           store ptr %fa, ptr %buf\n  \
+           %sa = call ptr @llvm.stacksave.p0()\n  \
+           %sslot = getelementptr inbounds [5 x ptr], ptr %buf, i64 0, i64 2\n  \
+           store ptr %sa, ptr %sslot\n  \
+           %r = call i32 @llvm.eh.sjlj.setjmp(ptr %buf)\n"
+    } else {
+        "  %r = call i32 @_setjmp(ptr %buf) returns_twice\n"
+    }
+}
+
+/// IR line: jump to the handler whose buffer is `%buf`.
+fn longjmp_ir() -> &'static str {
+    if BUILTIN_SJLJ {
+        "  call void @llvm.eh.sjlj.longjmp(ptr %buf) noreturn\n"
+    } else {
+        "  call void @longjmp(ptr %buf, i32 1) noreturn\n"
+    }
+}
+
+fn declare_sjlj(cg: &mut Codegen) {
+    if BUILTIN_SJLJ {
+        cg.decls.insert("declare ptr @llvm.frameaddress.p0(i32 immarg)");
+        cg.decls.insert("declare ptr @llvm.stacksave.p0()");
+        cg.decls.insert("declare i32 @llvm.eh.sjlj.setjmp(ptr)");
+        cg.decls.insert("declare void @llvm.eh.sjlj.longjmp(ptr) noreturn");
+    } else {
+        cg.decls.insert("declare i32 @_setjmp(ptr) returns_twice");
+        cg.decls.insert("declare void @longjmp(ptr, i32) noreturn");
+    }
+}
+
 const KIND_THROW: u32 = 0;
 const KIND_PANIC: u32 = 1;
 
@@ -74,8 +122,8 @@ fn handler_body(kind: u32, depths: &[String], call: &str, caught: &str) -> Strin
     }
     let _ = writeln!(
         s,
-        "  %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n  \
-           %r = call i32 @_setjmp(ptr %buf) returns_twice\n  \
+        "  %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n\
+         {}  \
            %first = icmp eq i32 %r, 0\n  \
            br i1 %first, label %run, label %caught\n\
          run:\n  \
@@ -88,6 +136,7 @@ fn handler_body(kind: u32, depths: &[String], call: &str, caught: &str) -> Strin
            %shadow2 = load volatile ptr, ptr %hs\n  \
            store ptr %prev2, ptr @loimi.handler_top\n  \
            store ptr %shadow2, ptr @loimi.shadow_top",
+        setjmp_ir(),
         call.lines().map(|l| format!("  {}\n", l)).collect::<String>(),
         "  ret RESULT\n"
     );
@@ -145,7 +194,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
         }
         return;
     }
-    let _ = writeln!(cg.globals, "%loimi.handler = type {{ ptr, ptr, i64, [{} x i8] }}", JMP_BUF_BYTES);
+    let _ = writeln!(cg.globals, "%loimi.handler = type {{ ptr, ptr, i64, {} }}", buf_ty());
     let _ = writeln!(cg.globals, "@loimi.handler_top = internal thread_local(initialexec) global ptr null");
     let _ = writeln!(cg.globals, "@loimi.panic_msg = internal thread_local(initialexec) global ptr null");
     let _ = writeln!(cg.globals, "@loimi.panic_len = internal thread_local(initialexec) global i64 0");
@@ -177,17 +226,17 @@ pub fn emit_runtime(cg: &mut Codegen) {
                call void @loimi.panic(ptr @loimi.throw_msg, i64 {})\n  \
                unreachable\n\
              jump:\n  \
-               %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n  \
-               call void @longjmp(ptr %buf, i32 1) noreturn\n  \
+               %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n\
+             {}  \
                unreachable\n\
              }}\n",
             KIND_THROW,
-            msg.len()
+            msg.len(),
+            longjmp_ir()
         );
     }
     emit_catch_wrappers(cg);
-    cg.decls.insert("declare i32 @_setjmp(ptr) returns_twice");
-    cg.decls.insert("declare void @longjmp(ptr, i32) noreturn");
+    declare_sjlj(cg);
 }
 
 /// `#[catch_panic(v)]` exports: the code generator emitted the body as
@@ -240,10 +289,10 @@ pub fn panic_body(cg: &Codegen) -> String {
          jump:\n  \
            store ptr %msg, ptr @loimi.panic_msg\n  \
            store i64 %len, ptr @loimi.panic_len\n  \
-           %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n  \
-           call void @longjmp(ptr %buf, i32 1) noreturn\n  \
+           %buf = getelementptr inbounds %loimi.handler, ptr %h, i32 0, i32 3\n\
+         {}  \
            unreachable\n\
          die:\n{}",
-        KIND_PANIC, die
+        KIND_PANIC, longjmp_ir(), die
     )
 }

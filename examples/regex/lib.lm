@@ -4,6 +4,7 @@
 //   loimi build examples/regex/lib.lm --release --lib -o librx.a --header rx.h
 
 import std.mem;
+import std.rt;
 import std.text;
 import syntax;
 import syntax.{Set};
@@ -54,9 +55,12 @@ fn set_error(r: *Regex, msg: str, at: i64) {
     r.err_at = at;
 }
 
-/// Compile a pattern. Never returns NULL: on an error the result has
-/// rx_ok() false, and rx_error()/rx_error_offset() say why. Free it with
-/// rx_free either way. The pattern is copied; the caller keeps its buffer.
+/// Compile a pattern. On an error in the pattern the result has rx_ok()
+/// false, and rx_error()/rx_error_offset() say why; free it with rx_free
+/// either way. NULL only on an internal error (out of memory, or a bug
+/// in the library), which rx_internal_error() describes. The pattern is
+/// copied; the caller keeps its buffer.
+#[catch_panic]
 export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
     let r: *Regex = mem.alloc(1);
     *r = empty_regex();
@@ -157,7 +161,10 @@ export "C" fn rx_groups(r: *Regex) -> u32 { r.ngroups }
 /// (2 * nspans int64s): group 0, then each group, -1 for a group that
 /// did not take part. Returns 1 on a match, 0 if none, -1 on an error
 /// (rx_error: the pattern did not compile, or the backtracker ran out of
-/// stack).
+/// stack), -2 on an internal error (out of memory, or a bug in the
+/// library; rx_internal_error() says which). After -2 the only safe call
+/// on `r` is rx_free.
+#[catch_panic(-2)]
 export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spans: *i64, nspans: u64) -> i32 {
     if !r.ok { return -1; }
     if start > len { return 0; }
@@ -233,6 +240,11 @@ export "C" fn rx_disasm(r: *Regex, flags: u32) -> str {
     Rx.disasm(code, &r.err);
     r.err.as_str()
 }
+
+/// What the last internal error on this thread was (the message of a
+/// panic inside the library, "file:line:col: what"), "" if none. Static
+/// text.
+export "C" fn rx_internal_error() -> str { rt.panic_message() }
 
 /// Free a regex from rx_compile.
 export "C" fn rx_free(r: *Regex) {

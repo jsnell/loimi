@@ -610,12 +610,13 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
         crate::vmgen::epilogue(&mut self);
         // `#[catch_panic]`: the body is internal `sym.body`, called by the
-        // exported wrapper (`rtgen::emit_catch_wrappers`).
+        // exported wrapper (`rtgen::emit_catch_wrappers`) and inlined into
+        // it: a separate call cost a regex match about 1 ns more.
         let catch_body = f.catch_panic.is_some() && cold.is_none() && self.stencil.is_none() && !self.jit_count;
         let linkage = if (f.linkage == Linkage::Export && !catch_body) || self.stencil.is_some() { "" } else { "internal " };
         let mut attrs = vec!["nounwind"];
         if catch_body {
-            attrs.push("noinline");
+            attrs.push("alwaysinline");
         }
         if self.stencil.is_some() {
             attrs.push("\"no-jump-tables\"=\"true\"");

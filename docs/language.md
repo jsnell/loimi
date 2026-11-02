@@ -1870,12 +1870,15 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   integer, `true`/`false`, or a variant of the result enum; without one
   (`#[catch_panic]`) the result is zero: 0, false, NULL, an empty `str`,
   or nothing. `rt.catch_panic(f, data)` does the same inside Loimi.
-  - **Cost.** A catching export installs a handler (a `_setjmp` and a few
-    thread-local stores, some 10 ns) on each call, and calls its body,
-    which is not inlined. Nothing else changes: panic sites were always
-    out-of-line calls, and code without a catch is compiled as before.
-    Put the attribute on calls that do real work (compile, match), not
-    on accessors called millions of times.
+  - **Cost.** A catching export installs a handler on each call: on
+    x86-64 LLVM's builtin setjmp (three stores) plus saving the
+    callee-saved registers and a few thread-local loads and stores,
+    1-2 ns. Elsewhere it is glibc's `_setjmp`, a few ns. The regex
+    library's `rx_exec`, called once per match, got 5-8% slower on its
+    benchmarks with the most matches (one per 25 ns). Nothing else
+    changes: panic sites were always out-of-line calls, and code without
+    a catch compiles as before. Put the attribute on calls that do real
+    work (compile, match), not on accessors called millions of times.
   - **What is left after a caught panic.** The frames between the panic
     and the catch are abandoned, as with `rt.throw`: their `defer`s do
     not run, and memory they allocated and had not yet stored somewhere
