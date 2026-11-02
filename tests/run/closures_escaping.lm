@@ -1,0 +1,155 @@
+// Escaping closures: `closure fn` values created with `new(arena, |..| ..)`,
+// stored in structs, returned, kept in a Vec, passed to generic code, and
+// converted from plain functions and to `block fn`.
+import std.io;
+import std.mem;
+import std.mem.{Vec, Arena};
+
+struct Builtin { name: str, call: closure fn(i64) -> i64 }
+
+struct Config { less: closure fn(*i64, *i64) -> i32, on_done: ?closure fn(i64) }
+
+fn double(x: i64) -> i64 { x * 2 }
+
+// Returned from a function: the environment lives in the caller's arena.
+fn adder(a: *Arena, k: i64) -> closure fn(i64) -> i64 {
+    new(a, |x| x + k)
+}
+
+// A closure capturing a struct and a pointer; the state behind the pointer
+// is shared, the struct is a copy.
+struct Counter { n: i64 }
+
+fn counter(a: *Arena, c: *Counter, step: i64) -> closure fn() -> i64 {
+    new(a, || { c.n += step; c.n })
+}
+
+// Generic over the closure's signature.
+fn map<T, U>(xs: []T, f: closure fn(T) -> U) -> Vec<U> {
+    var out: Vec<U> = Vec.new();
+    for i in 0..xs.len { out.push(f(xs[i])); }
+    out
+}
+
+// Generic over any callable type.
+fn twice<F>(f: F, x: i64) -> i64 { f(f(x)) }
+
+fn compose(a: *Arena, f: closure fn(i64) -> i64, g: closure fn(i64) -> i64) -> closure fn(i64) -> i64 {
+    new(a, |x| g(f(x)))
+}
+
+// A generator: the closure captures a pointer to its state.
+struct Range { i: i64, end: i64 }
+
+fn range(a: *Arena, lo: i64, hi: i64) -> closure fn() -> ?i64 {
+    let st = a.alloc_bytes(16, 8) as *Range;
+    *st = Range { i: lo, end: hi };
+    new(a, || {
+        if st.i >= st.end { return None; }
+        st.i += 1;
+        Some(st.i - 1)
+    })
+}
+
+fn sum_block(n: i64, f: block fn(i64) -> i64) -> i64 {
+    var t: i64 = 0;
+    for i in 0..n { t += f(i); }
+    t
+}
+
+fn main() {
+    var arena = Arena.new();
+    let a = &arena;
+
+    // Stored in a struct field and called through it.
+    let scale = 10;
+    var table: Vec<Builtin> = Vec.new();
+    table.push(Builtin { name: "double", call: double });
+    table.push(Builtin { name: "scale", call: new(a, |x| x * scale) });
+    table.push(Builtin { name: "add7", call: adder(a, 7) });
+    table.push(Builtin { name: "neg", call: new(a, |x| -x) });
+    for i in 0..table.len {
+        let b = table.ptr_at(i);
+        io.print(b.name); io.print(" "); io.print_int(b.call(5)); io.println("");
+    }
+
+    // A capture is a copy: changing the variable later does not change it.
+    var base: i64 = 100;
+    let f: closure fn(i64) -> i64 = new(a, |x: i64| x + base);
+    base = 0;
+    io.print_int(f(1)); io.print(" "); io.print_int(base); io.println("");
+
+    // Shared state behind a pointer.
+    var c = Counter { n: 0 };
+    let next = counter(a, &c, 3);
+    next(); next();
+    io.print_int(next()); io.print(" "); io.print_int(c.n); io.println("");
+
+    // In a Vec, generic code, composition.
+    var fs: Vec<closure fn(i64) -> i64> = Vec.new();
+    for k in 1..4 { fs.push(adder(a, k * 100)); }
+    var t: i64 = 0;
+    for i in 0..fs.len { t += fs.at(i)(1); }
+    io.print_int(t); io.println("");
+    let xs = [1, 2, 3];
+    let ys = map(xs[..], new(a, |x: i64| -> f64 { x as f64 / 2.0 }));
+    io.print_f64(ys.at(0) + ys.at(1) + ys.at(2)); io.println("");
+    let strs = map(xs[..], new(a, |x: i64| if x > 1 { "big" } else { "small" }));
+    io.print(strs.at(0)); io.print(strs.at(2)); io.println("");
+    io.print_int(twice(adder(a, 5), 0)); io.print(" "); io.print_int(twice(double, 3)); io.println("");
+    let h = compose(a, adder(a, 1), new(a, |x| x * x));
+    io.print_int(h(4)); io.println("");
+
+    // A generator.
+    let r = range(a, 3, 7);
+    var sum: i64 = 0;
+    while let Some(i) = r() { sum += i; }
+    io.print_int(sum); io.println("");
+
+    // A stored comparator passed on as a `block fn`; an optional hook.
+    let desc = true;
+    var cfg = Config {
+        less: new(a, |x, y| if desc { (*y - *x) as i32 } else { (*x - *y) as i32 }),
+        on_done: None,
+    };
+    var v: Vec<i64> = Vec.new();
+    v.push(3); v.push(9); v.push(1); v.push(5);
+    v.sort_by(cfg.less);
+    for i in 0..v.len { io.print_int(v.at(i)); io.print(" "); }
+    io.println("");
+    let tag = 42;
+    cfg.on_done = Some(new(a, |n| { io.print("done "); io.print_int(n + tag); io.println(""); }));
+    if let Some(d) = cfg.on_done { d(v.len as i64); }
+    io.print_int(sum_block(4, f)); io.println("");
+
+    // A closure capturing nothing allocates nothing.
+    let before = arena.used;
+    let k: closure fn() -> i64 = new(a, || 5);
+    io.print_int(k()); io.print(" "); io.print_int((arena.used - before) as i64); io.println("");
+
+    // Nested: an escaping closure that creates closures.
+    let mk: closure fn(i64) -> closure fn(i64) -> i64 = new(a, |m| adder(a, m));
+    io.print_int(mk(10)(5)); io.println("");
+
+    v.free();
+    fs.free();
+    table.free();
+    arena.free();
+}
+// expect: double 10
+// expect: scale 50
+// expect: add7 12
+// expect: neg -5
+// expect: 101 0
+// expect: 9 9
+// expect: 603
+// expect: 3
+// expect: smallbig
+// expect: 10 12
+// expect: 25
+// expect: 18
+// expect: 9 5 3 1
+// expect: done 46
+// expect: 406
+// expect: 5 0
+// expect: 15

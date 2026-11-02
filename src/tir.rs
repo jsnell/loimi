@@ -52,6 +52,10 @@ pub enum Ty {
     Opaque(u32),
     /// `block fn(A) -> R uses E`: a non-escaping closure, `{ code, env }`.
     Block(Vec<Ty>, Box<Ty>, u8),
+    /// `closure fn(A) -> R uses E`: an escaping closure, `{ code, env }`,
+    /// with the environment in host memory (not traced). Under `Gc<..>`:
+    /// a closure object `{ code, captures.. }` in the GC heap.
+    Closure(Vec<Ty>, Box<Ty>, u8),
 }
 
 impl Ty {
@@ -181,6 +185,12 @@ pub enum TK {
     /// A closure literal: the closure's function and the captured locals,
     /// whose addresses make up its environment.
     Closure(FnId, Vec<LocalId>),
+    /// `new(a, |..| ..)`: an escaping closure. The environment holds
+    /// copies of the captured locals. The third part is the allocation:
+    /// for a `closure fn`, the `a.alloc_bytes(size, align)` call (or, with
+    /// no captures, `a` itself, evaluated and ignored); for a
+    /// `Gc<closure fn>`, the heap.
+    NewClosure(FnId, Vec<LocalId>, B),
 }
 
 #[derive(Clone, Debug)]
@@ -356,6 +366,13 @@ pub struct FnDef {
     /// the value itself instead of the local's address (immutable,
     /// untraced locals of at most 8 bytes), which saves a load per use.
     pub env_val: Vec<bool>,
+    /// Escaping closures: the environment is a struct (this struct id)
+    /// holding the captured values from field `.1` on (a GC closure's
+    /// object has the code pointer in field 0).
+    pub env_struct: Option<(u32, u32)>,
+    /// GC closures: a hidden local holding the environment object, so
+    /// that the body's `gc` calls root it.
+    pub env_root: Option<LocalId>,
     /// `#[catch_panic(v)]` on an `export "C"` function: the LLVM constant
     /// it returns when a panic unwinds to it (`rtgen::emit_catch_wrapper`).
     pub catch_panic: Option<String>,

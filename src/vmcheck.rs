@@ -218,6 +218,8 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         sync_effects: 0,
         env: None,
         env_val: vec![],
+        env_struct: None,
+        env_root: None,
         catch_panic: None,
     });
     id
@@ -1855,7 +1857,7 @@ pub fn check_raise_ty(c: &mut Checker, cx: &mut FnCx, e: &Ty, span: Span) -> Res
 /// through function pointers are treated alike.
 pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     let TK::Call(f, _) = &call.kind else { unreachable!() };
-    let (Ty::Fn(_, _, e) | Ty::Block(_, _, e)) = f.ty else { unreachable!() };
+    let (Ty::Fn(_, _, e) | Ty::Block(_, _, e) | Ty::Closure(_, _, e)) = crate::check::callee_sig(&f.ty) else { unreachable!() };
     let callee = match f.kind {
         TK::FnRef(id) => format!("`{}`", c.prog.fns[id as usize].name),
         _ => format!("this call through a `{}`", c.ty_name(&f.ty)),

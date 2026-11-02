@@ -29,6 +29,8 @@ pub enum TypeKind {
     Fn(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
     /// `block fn(A) -> R uses gc`: a non-escaping closure (parameters only).
     Block(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
+    /// `closure fn(A) -> R uses E`.
+    Closure(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),

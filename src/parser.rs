@@ -957,6 +957,11 @@ impl Parser {
             let t = self.parse_type()?;
             let TypeKind::Fn(ps, ret, eff) = t.kind else { unreachable!() };
             TypeKind::Block(ps, ret, eff)
+        } else if self.is_kw("closure") && self.is_kw_at(1, "fn") {
+            self.bump();
+            let t = self.parse_type()?;
+            let TypeKind::Fn(ps, ret, eff) = t.kind else { unreachable!() };
+            TypeKind::Closure(ps, ret, eff)
         } else if self.eat_kw("fn") {
             self.expect("(")?;
             let mut ps = Vec::new();

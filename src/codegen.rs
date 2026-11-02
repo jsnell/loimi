@@ -120,7 +120,7 @@ pub fn llty(p: &Program, t: &Ty) -> String {
         }
         Ty::Param(_) | Ty::Opaque(_) => unreachable!("type parameter in codegen"),
         Ty::Gc(_) => "ptr".into(),
-        Ty::Block(..) => "{ ptr, ptr }".into(),
+        Ty::Block(..) | Ty::Closure(..) => "{ ptr, ptr }".into(),
     }
 }
 
@@ -540,6 +540,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             crate::tirwalk::locals(f.body.as_ref().unwrap(), &mut used, &mut declared);
             used.extend(declared);
             used.retain(|l| !caps.contains(l));
+            used.extend(f.env_root);
             used
         });
         for (i, l) in f.locals.iter().enumerate() {
@@ -570,7 +571,15 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if let Some(x) = crate::vmgen::extra_param(p, f) {
             params.push(x);
         }
-        if let Some(caps) = &f.env {
+        if let (Some(caps), Some((sid, first))) = (&f.env, f.env_struct) {
+            // An escaping closure: the captured values are fields of the
+            // environment struct, used in place.
+            params.insert(0, "ptr %env".to_string());
+            let st = llty(p, &Ty::Struct(sid));
+            for (i, &l) in caps.iter().enumerate() {
+                self.slots[l as usize] = self.inst(format!("getelementptr inbounds {}, ptr %env, i32 0, i32 {}", st, first as usize + i));
+            }
+        } else if let Some(caps) = &f.env {
             // The environment: pointers to the captured locals' slots, or
             // (captured by value) the values themselves.
             params.insert(0, "ptr %env".to_string());
@@ -578,6 +587,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let gp = self.inst(format!("getelementptr inbounds [{} x ptr], ptr %env, i64 0, i64 {}", caps.len(), i));
                 self.slots[l as usize] = if f.env_val[i] { gp } else { self.inst(format!("load ptr, ptr {}", gp)) };
             }
+        }
+        if let Some(r) = f.env_root {
+            // A GC closure's environment object stays rooted in the body.
+            let slot = self.slots[r as usize].clone();
+            self.emit(format!("store ptr %env, ptr {}", slot));
+            self.live[0].push(r);
         }
         crate::vmgen::handler_prologue(&mut self);
         let cold = self.cold.take();
@@ -821,6 +836,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TK::FnRef(id) => format!("@\"{}\"", self.p().fns[*id as usize].symbol),
             TK::Closure(fid, caps) => self.closure(*fid, caps),
+            TK::NewClosure(fid, caps, mem) => self.new_closure(&e.ty, *fid, caps, mem),
             TK::AddrOf(inner) => self.place(inner),
             TK::SliceRange(b, lo, hi) => self.slice_range(e, b, lo.as_deref(), hi.as_deref()),
             TK::Unary(op, inner) => {
@@ -1953,7 +1969,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.cg.decls.insert(format!("declare {} @{}({})", tt, name, ft));
                 self.inst(format!("call {} @{}({} {})", tt, name, ft, v))
             }
-            (Ty::Fn(ps, r, _), Ty::Block(..)) => {
+            (Ty::Closure(..), Ty::Block(..)) => v,
+            (Ty::Fn(ps, r, _), Ty::Block(..) | Ty::Closure(..)) => {
                 let t = self.trampoline(ps, r);
                 let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr {}, 0", t));
                 self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}, 1", a, v))
@@ -1995,6 +2012,49 @@ impl<'a, 'p> FnGen<'a, 'p> {
         self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}, 1", a, env))
     }
 
+    /// `new(a, |..| ..)`: allocate the environment and copy the captured
+    /// values into it. A `closure fn` is `{ code, env }` (env null if
+    /// nothing is captured); a `Gc<closure fn>` is the object, whose first
+    /// field is the code.
+    fn new_closure(&mut self, ty: &Ty, fid: FnId, caps: &[LocalId], mem: &TExpr) -> String {
+        let p = self.p();
+        let fd = &p.fns[fid as usize];
+        let sym = fd.symbol.clone();
+        let env_struct = fd.env_struct;
+        let m = self.val(mem);
+        let gc = matches!(ty, Ty::Gc(_));
+        let env = match env_struct {
+            None => "null".to_string(),
+            Some((sid, first)) => {
+                let st = Ty::Struct(sid);
+                let lt = llty(p, &st);
+                let env = if gc {
+                    let size = layout::size_of(p, &st);
+                    let tid = p.structs[sid as usize].object.unwrap();
+                    let obj = self.inst(format!("call ptr @\"std.gc.alloc\"(ptr {}, i64 {}, i32 {}, i64 0)", m, size, tid));
+                    let cp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 0", lt, obj));
+                    self.emit(format!("store ptr @\"{}\", ptr {}", sym, cp));
+                    obj
+                } else {
+                    m
+                };
+                for (i, &l) in caps.iter().enumerate() {
+                    let t = self.f().locals[l as usize].ty.clone();
+                    let slot = self.slots[l as usize].clone();
+                    let v = self.load(&t, &slot);
+                    let fp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", lt, env, first as usize + i));
+                    self.store(&t, &v, &fp);
+                }
+                env
+            }
+        };
+        if gc {
+            return env;
+        }
+        let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr @\"{}\", 0", sym));
+        self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}, 1", a, env))
+    }
+
     /// `R (ptr env, A..)` that calls the plain function `env` with `A..`:
     /// the code half of a plain function used as a `block fn`.
     fn trampoline(&mut self, ps: &[Ty], r: &Ty) -> String {
@@ -2031,10 +2091,17 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let fd = &p.fns[*id as usize];
                 (format!("@\"{}\"", fd.symbol), fd.cc, fd.variadic, fd.param_tys.len())
             }
-            _ if matches!(f.ty, Ty::Block(..)) => {
+            _ if matches!(f.ty, Ty::Block(..) | Ty::Closure(..)) => {
                 let v = self.val(f);
                 let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
                 env = Some(self.inst(format!("extractvalue {{ ptr, ptr }} {}, 1", v)));
+                (code, CallConv::C, false, args.len())
+            }
+            _ if matches!(&f.ty, Ty::Gc(t) if matches!(**t, Ty::Closure(..))) => {
+                // A GC closure object: the code pointer is its first field.
+                let v = self.val(f);
+                let code = self.inst(format!("load ptr, ptr {}", v));
+                env = Some(v);
                 (code, CallConv::C, false, args.len())
             }
             _ => (self.val(f), CallConv::C, false, args.len()),

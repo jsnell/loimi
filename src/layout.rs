@@ -9,7 +9,7 @@ pub fn align_of(p: &Program, t: &Ty) -> u64 {
         Ty::F32 => 4,
         Ty::F64 => 8,
         Ty::Bool | Ty::Unit | Ty::Never => 1,
-        Ty::Ptr(_) | Ty::Fn(..) | Ty::Slice(_) | Ty::Value(_) | Ty::Block(..) => 8,
+        Ty::Ptr(_) | Ty::Fn(..) | Ty::Slice(_) | Ty::Value(_) | Ty::Block(..) | Ty::Closure(..) => 8,
         Ty::Array(e, _) => align_of(p, e),
         Ty::Option(inner) => {
             if inner.is_nullable_ptr() {
@@ -66,7 +66,7 @@ pub fn size_of(p: &Program, t: &Ty) -> u64 {
         Ty::Bool => 1,
         Ty::Unit | Ty::Never => 0,
         Ty::Ptr(_) | Ty::Fn(..) => 8,
-        Ty::Block(..) => 16,
+        Ty::Block(..) | Ty::Closure(..) => 16,
         Ty::Value(i) => if p.values[*i as usize].repr == ValueRepr::Boxed { 16 } else { 8 },
         Ty::Slice(_) => 16,
         Ty::Array(e, n) => size_of(p, e) * n,

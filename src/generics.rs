@@ -55,7 +55,7 @@ pub fn contains_param(t: &Ty, g: &Generics) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_param(x, g),
         Ty::Result(a, b) => contains_param(a, g) || contains_param(b, g),
         Ty::Tuple(ts) => ts.iter().any(|t| contains_param(t, g)),
-        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
+        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
         Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
             Some((_, args)) => args.iter().any(|t| contains_param(t, g)),
             None => false,
@@ -72,13 +72,19 @@ pub fn contains_infer(t: &Ty, g: &Generics) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_infer(x, g),
         Ty::Result(a, b) => contains_infer(a, g) || contains_infer(b, g),
         Ty::Tuple(ts) => ts.iter().any(|t| contains_infer(t, g)),
-        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) => ps.iter().any(|t| contains_infer(t, g)) || contains_infer(r, g),
+        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(|t| contains_infer(t, g)) || contains_infer(r, g),
         Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
             Some((_, args)) => args.iter().any(|t| contains_infer(t, g)),
             None => false,
         },
         _ => false,
     }
+}
+
+/// `new(a, |..| ..)`: an escaping closure literal.
+fn is_new_closure(a: &Expr) -> bool {
+    matches!(&a.kind, ExprKind::Call(f, args) if matches!(&f.kind, ExprKind::Ident(n) if n == "new")
+        && args.len() == 2 && matches!(args[1].kind, ExprKind::Closure(..)))
 }
 
 /// Does `t` contain a `block fn` type (which may not be a type argument)?
@@ -88,7 +94,7 @@ pub fn contains_block(t: &Ty) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_block(x),
         Ty::Result(a, b) => contains_block(a) || contains_block(b),
         Ty::Tuple(ts) => ts.iter().any(contains_block),
-        Ty::Fn(ps, r, _) => ps.iter().any(contains_block) || contains_block(r),
+        Ty::Fn(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(contains_block) || contains_block(r),
         _ => false,
     }
 }
@@ -259,7 +265,9 @@ impl<'a> Checker<'a> {
             (Ty::Tuple(xs), Ty::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y, b)),
             // Effects are not unified: the argument is coerced to the
             // instantiated parameter type afterwards, which checks them.
-            (Ty::Fn(p1, r1, _), Ty::Fn(p2, r2, _)) | (Ty::Block(p1, r1, _), Ty::Block(p2, r2, _)) => {
+            (Ty::Fn(p1, r1, _), Ty::Fn(p2, r2, _))
+            | (Ty::Block(p1, r1, _), Ty::Block(p2, r2, _))
+            | (Ty::Closure(p1, r1, _), Ty::Closure(p2, r2, _)) => {
                 p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y, b)) && self.unify(r1, r2, b)
             }
             (Ty::Struct(_), Ty::Struct(_)) | (Ty::Enum(_), Ty::Enum(_)) if pat != act => {
@@ -295,7 +303,7 @@ impl<'a> Checker<'a> {
             },
             Ty::Gc(x) => match self.subst(x, b, span)? {
                 Some(x) => {
-                    if !matches!(&x, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
+                    if !matches!(&x, Ty::Closure(..)) && !matches!(&x, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
                         return Err(Diag::new(span, format!("Gc<T> needs an `object` type, found `{}`", self.ty_name(&x))));
                     }
                     Ty::Gc(Box::new(x))
@@ -320,7 +328,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(out)
             }
-            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) => {
+            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) | Ty::Closure(ps, r, e) => {
                 let mut out = Vec::new();
                 for t in ps {
                     match self.subst(t, b, span)? {
@@ -330,6 +338,7 @@ impl<'a> Checker<'a> {
                 }
                 match self.subst(r, b, span)? {
                     Some(r) if matches!(t, Ty::Block(..)) => Ty::Block(out, Box::new(r), *e),
+                    Some(r) if matches!(t, Ty::Closure(..)) => Ty::Closure(out, Box::new(r), *e),
                     Some(r) => Ty::Fn(out, Box::new(r), *e),
                     None => return Ok(None),
                 }
@@ -369,14 +378,19 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(out)
             }
-            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) => {
+            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) | Ty::Closure(ps, r, e) => {
                 let mut out = Vec::new();
                 for t in ps {
                     out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
                 }
                 let r = Box::new(self.subst_holes(r, b, span)?.unwrap_or(Ty::Param(HOLE)));
-                if matches!(t, Ty::Block(..)) { Ty::Block(out, r, *e) } else { Ty::Fn(out, r, *e) }
+                match t {
+                    Ty::Block(..) => Ty::Block(out, r, *e),
+                    Ty::Closure(..) => Ty::Closure(out, r, *e),
+                    _ => Ty::Fn(out, r, *e),
+                }
             }
+            Ty::Gc(x) if matches!(**x, Ty::Closure(..)) => Ty::Gc(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
             t if contains_param(t, &self.generics) => {
                 // Gc<..>, Result<..> and generic instances: only when fully known.
                 let full: Vec<Option<Ty>> = b.iter().map(|x| x.clone().filter(|t| !has_hole(t))).collect();
@@ -491,7 +505,8 @@ impl<'a> Checker<'a> {
             let pt = &ptys[off + i];
             let generic_fn = matches!(pt, Ty::Fn(..) | Ty::Block(..)) && self.generic_fn_named(cx, a)?.is_some();
             // Closures too: their parameter types may come from later arguments.
-            let closure = matches!(pt, Ty::Block(..)) && matches!(a.kind, ExprKind::Closure(..));
+            let closure = matches!(pt, Ty::Block(..)) && matches!(a.kind, ExprKind::Closure(..))
+                || matches!(crate::check::callee_sig(pt), Ty::Closure(..)) && is_new_closure(a);
             if contains_param(pt, &self.generics) && (generic_fn || closure) {
                 deferred.push(i);
             } else {
@@ -511,6 +526,10 @@ impl<'a> Checker<'a> {
                     None => self.subst_partial(&pt, &b, span)?,
                 };
                 self.block_arg(cx, a, &w)?
+            } else if want.is_none() && deferred.contains(&i) && is_new_closure(a) {
+                // `new(a, |..| ..)` for a partly known `closure fn` parameter.
+                let partial = self.subst_partial(&pt, &b, span)?;
+                self.expr(cx, a, Some(&partial))?
             } else if want.is_none() && deferred.contains(&i) {
                 // Only partly known: the parameters may still determine
                 // the function's type arguments.

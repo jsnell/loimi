@@ -635,7 +635,7 @@ fn mentions_param(t: &Ty, i: u32, g: &crate::generics::Generics) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => mentions_param(x, i, g),
         Ty::Result(a, b) => mentions_param(a, i, g) || mentions_param(b, i, g),
         Ty::Tuple(ts) => ts.iter().any(|t| mentions_param(t, i, g)),
-        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) => ps.iter().any(|t| mentions_param(t, i, g)) || mentions_param(r, i, g),
+        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(|t| mentions_param(t, i, g)) || mentions_param(r, i, g),
         Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
             Some((_, args)) => args.iter().any(|t| mentions_param(t, i, g)),
             None => false,

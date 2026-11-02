@@ -24,6 +24,7 @@
 
 use crate::ast::*;
 use crate::check::{has_hole, mk, Checker, FnCx, HOLE};
+use crate::tir::LocalDef;
 use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 
@@ -34,7 +35,7 @@ impl<'a> Checker<'a> {
     /// plain function value.
     pub fn block_arg(&mut self, cx: &mut FnCx, a: &Expr, want: &Ty) -> Res<TExpr> {
         let v = match &a.kind {
-            ExprKind::Closure(ps, ret, body) => return self.closure(cx, ps, ret.as_ref(), body, want, a.span),
+            ExprKind::Closure(ps, ret, body) => return self.closure(cx, ps, ret.as_ref(), body, want, a.span, false),
             ExprKind::Ident(n) if cx.lookup(n).is_some() => {
                 cx.block_use = true;
                 let r = self.expr(cx, a, Some(want));
@@ -70,6 +71,7 @@ impl<'a> Checker<'a> {
         body: &Expr,
         want: &Ty,
         span: Span,
+        gc: bool,
     ) -> Res<TExpr> {
         if cx.vm.is_some() {
             return Err(Diag::new(
@@ -77,9 +79,10 @@ impl<'a> Checker<'a> {
                 "closures are not allowed in vm code (op handlers, vm functions, entries, `on raise`): pass a named function, or call a plain function that creates the closure",
             ));
         }
-        let Ty::Block(wps, wret, eff) = want else {
+        let (Ty::Block(wps, wret, eff) | Ty::Closure(wps, wret, eff)) = want else {
             return Err(Diag::new(span, "a closure can only be an argument for a `block fn` parameter"));
         };
+        let escaping = matches!(want, Ty::Closure(..));
         if params.len() != wps.len() {
             return Err(Diag::new(
                 span,
@@ -123,7 +126,8 @@ impl<'a> Checker<'a> {
             None if has_hole(wret) => None,
             None => Some((**wret).clone()),
         };
-        let shown = Ty::Block(ptys.clone(), Box::new(ret_t.clone().unwrap_or(Ty::Param(HOLE))), *eff);
+        let shown_ret = Box::new(ret_t.clone().unwrap_or(Ty::Param(HOLE)));
+        let shown = if escaping { Ty::Closure(ptys.clone(), shown_ret, *eff) } else { Ty::Block(ptys.clone(), shown_ret, *eff) };
         // The body is a function of its own: `return` and `?` leave the
         // closure, loops outside it are not reachable, and its calls may
         // have the effects its type allows.
@@ -155,6 +159,9 @@ impl<'a> Checker<'a> {
         let mut declared = Vec::new();
         crate::tirwalk::locals(&b, &mut used, &mut declared);
         let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < start).collect();
+        if escaping {
+            self.check_escaping_captures(cx, &b, &caps, gc)?;
+        }
         let n = self.closure_count;
         self.closure_count += 1;
         let owner = if cx.fn_name.is_empty() { "closure".to_string() } else { cx.fn_name.clone() };
@@ -182,8 +189,217 @@ impl<'a> Checker<'a> {
                     && !matches!(t, Ty::Opaque(_) | Ty::Param(_))
             })
             .collect();
+        if escaping {
+            // Captured by value into an environment struct: a GC object
+            // `{ code, caps.. }`, or plain host memory `{ caps.. }`.
+            let cty = Ty::Closure(ptys.clone(), Box::new(rty.clone()), *eff);
+            def.env_val = vec![true; caps.len()];
+            if self.traits.opaque_depth == 0 && (gc || !caps.is_empty()) {
+                let mut fields: Vec<(String, Ty)> = Vec::new();
+                if gc {
+                    fields.push(("code".to_string(), Ty::Ptr(Box::new(Ty::u8()))));
+                }
+                for l in &caps {
+                    let ld = &cx.locals[*l as usize];
+                    fields.push((ld.name.clone(), ld.ty.clone()));
+                }
+                let sid = self.prog.structs.len() as u32;
+                let object = if gc {
+                    self.object_count += 1;
+                    Some(self.object_count - 1)
+                } else {
+                    None
+                };
+                self.prog.structs.push(crate::tir::StructDef {
+                    name: format!("{} env", def.symbol),
+                    fields,
+                    pattern: false,
+                    object,
+                    trailing: None,
+                    verified: None,
+                });
+                def.env_struct = Some((sid, gc as u32));
+            }
+            if gc {
+                // The environment object, rooted while the body runs.
+                let id = cx.locals.len() as LocalId;
+                cx.locals.push(LocalDef { name: "closure env".into(), ty: Ty::Gc(Box::new(cty.clone())), mutable: false, field: false });
+                def.locals = cx.locals.clone();
+                def.env_root = Some(id);
+            }
+            def.env = Some(caps.clone());
+            self.prog.fns.push(def);
+            let ty = if gc { Ty::Gc(Box::new(cty)) } else { cty };
+            return Ok(mk(ty, TK::NewClosure(fid, caps, Box::new(mk(Ty::Unit, TK::Unit, span))), span));
+        }
         def.env = Some(caps.clone());
         self.prog.fns.push(def);
         Ok(mk(Ty::Block(ptys, Box::new(rty), *eff), TK::Closure(fid, caps), span))
+    }
+}
+
+/// The place `e` is rooted at, if it is (part of) a local's own storage:
+/// `x`, `x.f`, `x[i]` on an array, but not through a pointer or slice.
+fn place_root(e: &TExpr) -> Option<(LocalId, Span)> {
+    match &e.kind {
+        TK::Local(l) => Some((*l, e.span)),
+        TK::Field(b, _) => place_root(b).map(|(l, _)| (l, e.span)),
+        TK::Index(b, _) if matches!(b.ty, Ty::Array(..)) => place_root(b).map(|(l, _)| (l, e.span)),
+        _ => None,
+    }
+}
+
+impl<'a> Checker<'a> {
+    /// `new(a, |..| ..)`: an escaping closure, with its environment
+    /// allocated by `a` (a `closure fn`), or in the GC heap when `a` is a
+    /// `*gc.Heap` (a `Gc<closure fn>`).
+    pub fn new_closure(&mut self, cx: &mut FnCx, alloc: &Expr, lit: &Expr, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let ExprKind::Closure(ps, ret, body) = &lit.kind else { unreachable!() };
+        let a = self.expr(cx, alloc, None)?;
+        let gc = matches!(&a.ty, Ty::Ptr(t) if matches!(**t, Ty::Struct(s) if self.prog.structs[s as usize].name == "std.gc.Heap"));
+        let mut sig = exp;
+        if let Some(Ty::Option(inner)) = sig {
+            sig = Some(inner);
+        }
+        if let Some(Ty::Gc(inner)) = sig {
+            sig = Some(inner);
+        }
+        let want = match sig {
+            Some(t @ Ty::Closure(..)) => t.clone(),
+            _ => {
+                // No expected closure type: the literal's annotations.
+                let mut pts = Vec::new();
+                for (name, ann) in ps {
+                    match ann {
+                        Some(te) => pts.push(self.resolve_type(cx.module, te)?),
+                        None => {
+                            return Err(Diag::new(
+                                name.span,
+                                format!(
+                                    "cannot infer the type of closure parameter `{}`: write `{}: T`, or give the closure a type (`let f: closure fn(..) -> R = new(..)`)",
+                                    name.name, name.name
+                                ),
+                            ))
+                        }
+                    }
+                }
+                Ty::Closure(pts, Box::new(Ty::Param(HOLE)), 0)
+            }
+        };
+        let mut v = self.closure(cx, ps, ret.as_ref(), body, &want, lit.span, gc)?;
+        let TK::NewClosure(fid, caps, _) = &v.kind else { unreachable!() };
+        let (fid, caps) = (*fid, caps.clone());
+        let mem = if gc || caps.is_empty() {
+            a
+        } else {
+            match self.prog.fns[fid as usize].env_struct {
+                Some((sid, _)) => {
+                    let st = Ty::Struct(sid);
+                    let size = crate::layout::size_of(&self.prog, &st) as i128;
+                    let align = crate::layout::align_of(&self.prog, &st) as i128;
+                    let lit = |v: i128| Expr { kind: ExprKind::Int(v as u128), span: alloc.span };
+                    let name = Ident { name: "alloc_bytes".into(), span: alloc.span };
+                    let at = self.ty_name(&a.ty);
+                    self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span).map_err(|d| {
+                        d.note(alloc.span, format!(
+                            "the environment of `new(a, |..| ..)` is allocated with `a.alloc_bytes(size: u64, align: u64) -> *u8` (`a` is `{}`; `*mem.Arena` has one), or in the GC heap if `a` is a `*gc.Heap`",
+                            at
+                        ))
+                    })?
+                }
+                // Inside a generic body checked against its bounds: no code.
+                None => a,
+            }
+        };
+        if !gc && !caps.is_empty() && !matches!(mem.ty, Ty::Ptr(_)) && self.traits.opaque_depth == 0 {
+            return Err(Diag::new(alloc.span, "`alloc_bytes` must return a pointer (`*u8`)"));
+        }
+        v.kind = TK::NewClosure(fid, caps, Box::new(mem));
+        Ok(v)
+    }
+
+    /// What an escaping closure may capture: no `block fn` (it only lives
+    /// during its call), nothing traced unless the environment is in the
+    /// GC heap, and captured locals are copies: assigning one is an error.
+    fn check_escaping_captures(&mut self, cx: &FnCx, body: &TExpr, caps: &[LocalId], gc: bool) -> Res<()> {
+        for l in caps {
+            let ld = &cx.locals[*l as usize];
+            if matches!(ld.ty, Ty::Block(..)) {
+                return Err(Diag::new(
+                    body.span,
+                    format!(
+                        "this closure escapes, but it captures `{}`, a `block fn` that only lives during the call that received it",
+                        ld.name
+                    ),
+                ));
+            }
+            if !gc && self.traits.opaque_depth == 0 && crate::gcgen::is_traced(&self.prog, &ld.ty) {
+                return Err(Diag::new(
+                    body.span,
+                    format!(
+                        "this closure captures `{}` of type `{}`, which holds GC references, but its environment is not traced: create it in the GC heap with `new(heap, |..| ..)` (a `Gc<closure fn(..)>`)",
+                        ld.name,
+                        self.ty_name(&ld.ty)
+                    ),
+                ));
+            }
+        }
+        let mut err: Option<Diag> = None;
+        let prog = &self.prog;
+        let check = |e: &TExpr, err: &mut Option<Diag>| {
+            if err.is_some() {
+                return;
+            }
+            match &e.kind {
+                TK::Assign(lhs, _) => {
+                    if let Some((l, sp)) = place_root(lhs) {
+                        if caps.contains(&l) {
+                            let name = &cx.locals[l as usize].name;
+                            *err = Some(
+                                Diag::new(
+                                    sp,
+                                    format!(
+                                        "`{}` is captured by value: this closure escapes, so it has its own copy, and assigning it would not change `{}` outside",
+                                        name, name
+                                    ),
+                                )
+                                .note(body.span, "keep shared or changing state behind a pointer that the closure captures"),
+                            );
+                        }
+                    }
+                }
+                TK::AddrOf(inner) if gc => {
+                    if let Some((l, sp)) = place_root(inner) {
+                        if caps.contains(&l) && crate::gcgen::is_traced(prog, &cx.locals[l as usize].ty) {
+                            let name = &cx.locals[l as usize].name;
+                            *err = Some(Diag::new(
+                                sp,
+                                format!(
+                                    "cannot take the address of `{}`: it is a traced capture in a GC closure's environment, and a store through the pointer would miss the write barrier",
+                                    name
+                                ),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        };
+        // Nested closures write the same locals.
+        let mut bodies = vec![body.clone()];
+        while let Some(b) = bodies.pop() {
+            crate::tirwalk::for_each_expr(&b, &mut |e| {
+                check(e, &mut err);
+                if let TK::Closure(fid, _) | TK::NewClosure(fid, _, _) = &e.kind {
+                    if let Some(nb) = &prog.fns[*fid as usize].body {
+                        bodies.push(nb.clone());
+                    }
+                }
+            });
+        }
+        match err {
+            Some(d) => Err(d),
+            None => Ok(()),
+        }
     }
 }

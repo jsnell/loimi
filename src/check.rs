@@ -175,11 +175,20 @@ pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
 /// `*fn() uses gc` be read back as a plain `fn()`.
 fn fn_widens(from: &Ty, to: &Ty) -> bool {
     match (from, to) {
-        (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) | (Ty::Block(p1, r1, e1), Ty::Block(p2, r2, e2)) => {
-            p1 == p2 && r1 == r2 && e1 & !e2 == 0
-        }
+        (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2))
+        | (Ty::Block(p1, r1, e1), Ty::Block(p2, r2, e2))
+        | (Ty::Closure(p1, r1, e1), Ty::Closure(p2, r2, e2)) => p1 == p2 && r1 == r2 && e1 & !e2 == 0,
         (Ty::Option(a), Ty::Option(b)) => fn_widens(a, b),
         _ => false,
+    }
+}
+
+/// The signature a value of type `t` is called with: `t` itself, or the
+/// closure type of a `Gc<closure fn(..)>`.
+pub fn callee_sig(t: &Ty) -> Ty {
+    match t {
+        Ty::Gc(inner) if matches!(**inner, Ty::Closure(..)) => (**inner).clone(),
+        t => t.clone(),
     }
 }
 
@@ -192,7 +201,7 @@ pub fn has_hole(t: &Ty) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
         Ty::Result(a, b) => has_hole(a) || has_hole(b),
         Ty::Tuple(ts) => ts.iter().any(has_hole),
-        Ty::Fn(ps, r, _) => ps.iter().any(has_hole) || has_hole(r),
+        Ty::Fn(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(has_hole) || has_hole(r),
         _ => false,
     }
 }
@@ -715,6 +724,9 @@ impl<'a> Checker<'a> {
             if param_tys.iter().any(|t| matches!(t, Ty::Block(..))) {
                 return Err(Diag::new(f.name.span, "C functions cannot take a `block fn`: pass a plain `fn` and a context pointer"));
             }
+            if param_tys.iter().chain(std::iter::once(&ret)).any(|t| matches!(callee_sig(t), Ty::Closure(..))) {
+                return Err(Diag::new(f.name.span, "closures cannot cross into C: pass a plain `fn` and a context pointer"));
+            }
             let odd = |t: &Ty| matches!(t, Ty::Int(it) if !matches!(it.bits, 8 | 16 | 32 | 64));
             if let Some(t) = param_tys.iter().chain(std::iter::once(&ret)).find(|t| odd(t)) {
                 return Err(Diag::new(
@@ -772,6 +784,8 @@ impl<'a> Checker<'a> {
             sync_effects: 0,
             env: None,
             env_val: vec![],
+            env_struct: None,
+            env_root: None,
             catch_panic,
         };
         Ok(())
@@ -841,6 +855,12 @@ impl<'a> Checker<'a> {
             Ty::Param(i) => format!("?T{}", i),
             Ty::Gc(t) => format!("Gc<{}>", self.ty_name(t)),
             Ty::Opaque(o) => self.traits.opaques[*o as usize].name.clone(),
+            Ty::Closure(ps, r, e) => format!(
+                "closure fn({}) -> {}{}",
+                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
+                self.ty_name(r),
+                if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
+            ),
             Ty::Block(ps, r, e) => format!(
                 "block fn({}) -> {}{}",
                 ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
@@ -1036,12 +1056,12 @@ impl<'a> Checker<'a> {
                     // and in an instance it is the concrete type.
                     let ok = match &inner {
                         Ty::Struct(i) => self.prog.structs[*i as usize].object.is_some(),
-                        Ty::Param(_) | Ty::Opaque(_) => true,
+                        Ty::Param(_) | Ty::Opaque(_) | Ty::Closure(..) => true,
                         _ => false,
                     };
                     if !ok {
                         let msg = if self.tenv.is_empty() {
-                            "Gc<T> needs an `object` type".to_string()
+                            "Gc<T> needs an `object` type (or a `closure fn` type)".to_string()
                         } else {
                             format!("Gc<T> needs an `object` type, found `{}`", self.ty_name(&inner))
                         };
@@ -1141,7 +1161,7 @@ impl<'a> Checker<'a> {
                     "a `block fn` type can only be the type of a function parameter: closures cannot be stored or returned",
                 ))
             }
-            TypeKind::Fn(ps, r, eff) => {
+            TypeKind::Fn(ps, r, eff) | TypeKind::Closure(ps, r, eff) => {
                 let mut out = Vec::new();
                 for p in ps {
                     out.push(self.resolve_param_type(m, p)?);
@@ -1150,7 +1170,8 @@ impl<'a> Checker<'a> {
                     Some(e) => effect_bits(&e.name, e.span)?,
                     None => 0,
                 };
-                Ty::Fn(out, Box::new(self.resolve_type(m, r)?), e)
+                let r = Box::new(self.resolve_type(m, r)?);
+                if matches!(t.kind, TypeKind::Closure(..)) { Ty::Closure(out, r, e) } else { Ty::Fn(out, r, e) }
             }
             TypeKind::Never => Ty::Never,
             TypeKind::Cache(_) => {
@@ -1234,6 +1255,14 @@ impl<'a> Checker<'a> {
                 return Ok(mk(want.clone(), TK::Cast(Box::new(e)), span));
             }
         }
+        if let (Ty::Fn(p1, r1, e1), Ty::Closure(p2, r2, e2)) | (Ty::Closure(p1, r1, e1), Ty::Block(p2, r2, e2)) = (&e.ty, want) {
+            // A plain function is a closure without an environment (through
+            // a trampoline); a `closure fn` passes as a `block fn` as is.
+            if p1 == p2 && r1 == r2 && e1 & !e2 == 0 {
+                let span = e.span;
+                return Ok(mk(want.clone(), TK::Cast(Box::new(e)), span));
+            }
+        }
         if let Ty::Option(inner) = want {
             if **inner == e.ty || fn_widens(&e.ty, inner) {
                 let span = e.span;
@@ -1241,7 +1270,11 @@ impl<'a> Checker<'a> {
                 return Ok(mk(want.clone(), TK::Variant(1, vec![e]), span));
             }
         }
-        if let (Ty::Fn(p1, r1, e1) | Ty::Block(p1, r1, e1), Ty::Fn(p2, r2, e2) | Ty::Block(p2, r2, e2)) = (&e.ty, want) {
+        if let (
+            Ty::Fn(p1, r1, e1) | Ty::Block(p1, r1, e1) | Ty::Closure(p1, r1, e1),
+            Ty::Fn(p2, r2, e2) | Ty::Block(p2, r2, e2) | Ty::Closure(p2, r2, e2),
+        ) = (&e.ty, want)
+        {
             if p1 == p2 && r1 == r2 && e1 & !e2 != 0 {
                 return Err(Diag::new(
                     e.span,
@@ -2092,7 +2125,7 @@ impl<'a> Checker<'a> {
             ExprKind::TypeArgs(inner, targs) => self.type_args_value(cx, inner, targs, span),
             ExprKind::Closure(..) => Err(Diag::new(
                 span,
-                "a closure can only be an argument for a `block fn` parameter (`fn f(cb: block fn(i64) -> bool)`)",
+                "a closure can only be an argument for a `block fn` parameter (`fn f(cb: block fn(i64) -> bool)`), or escape when created with `new(arena, |..| ..)` or `new(heap, |..| ..)`",
             )),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
@@ -3010,7 +3043,7 @@ impl<'a> Checker<'a> {
     }
 
     pub fn finish_call(&mut self, cx: &mut FnCx, f: TExpr, mut pre: Vec<TExpr>, args: &[Expr], span: Span) -> Res<TExpr> {
-        let (Ty::Fn(params, ret, _) | Ty::Block(params, ret, _)) = f.ty.clone() else {
+        let (Ty::Fn(params, ret, _) | Ty::Block(params, ret, _) | Ty::Closure(params, ret, _)) = callee_sig(&f.ty) else {
             return Err(Diag::new(f.span, format!("cannot call a value of type `{}`", self.ty_name(&f.ty))));
         };
         let variadic = matches!(f.kind, TK::FnRef(id) if self.prog.fns[id as usize].variadic);
@@ -3116,7 +3149,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+    pub(crate) fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         let mut base_ty = recv.ty.clone();
         while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
             base_ty = *inner;
@@ -3172,7 +3205,7 @@ impl<'a> Checker<'a> {
         }
         // A field holding a function pointer: `(n.f)(x)` style written as `n.f(x)`.
         if let Ok(fv) = self.field_of(recv.clone(), name, name.span) {
-            if matches!(fv.ty, Ty::Fn(..)) {
+            if matches!(callee_sig(&fv.ty), Ty::Fn(..) | Ty::Closure(..)) {
                 return self.finish_call(cx, fv, vec![], args, span);
             }
         }
@@ -3274,6 +3307,9 @@ impl<'a> Checker<'a> {
     fn builtin_call(&mut self, cx: &mut FnCx, name: &str, args: &[Expr], _exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
         if self.value_def(cx.module, name).is_some() {
             return Ok(None);
+        }
+        if name == "new" && args.len() == 2 && matches!(args[1].kind, ExprKind::Closure(..)) {
+            return self.new_closure(cx, &args[0], &args[1], _exp, span).map(Some);
         }
         if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
             return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
@@ -3646,6 +3682,8 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         sync_effects: 0,
         env: None,
         env_val: vec![],
+        env_struct: None,
+        env_root: None,
         catch_panic: None,
     }
 }
