@@ -21,7 +21,7 @@ import std.parse;
 import std.bc;
 import std.rt;
 import value;
-import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs};
+import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs, Code};
 import vm.{Mini};
 
 // ── lexer ────────────────────────────────────────────────────────────
@@ -1457,24 +1457,33 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
         let u = fs.upvals.at(i);
         updesc.data[i] = if u.instack { 256 | u.idx } else { u.idx };
     }
+    // Verify against the counts the Proto will hold, then store the
+    // proof with them: CALL jumps only to a Proto's verified `code`.
+    let nregs = fs.regs.frame_size(1);
+    let nupvals = fs.upvals.len as u32;
+    let words = new(h, Code {}, fs.code.len());
+    fs.code.copy_into(words.data);
+    let code = match Mini.verify(words.data, nregs, nupvals, consts.data.len, protos.data.len) {
+        Ok(v) => Mini.optimize(v),
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("generated code fails verification: ");
+            e.write(&b);
+            internal_error(b.as_str())
+        }
+    };
     let proto = new(h, Proto {
         name: value.new_str(h, fs.name),
         nparams: fs.nparams,
-        nregs: fs.regs.frame_size(1),
-        nupvals: fs.upvals.len as u32,
+        nregs: nregs,
+        nupvals: nupvals,
         consts: consts,
         lines: lines,
         protos: protos,
         updesc: updesc,
-    }, fs.code.len());
-    fs.code.copy_into(proto.code);
-    if let Some(bad) = Mini.verify(proto.code, proto) {
-        var b = text.StrBuf.new();
-        b.push_str("generated code fails verification at instruction ");
-        b.push_int(bad as i64);
-        internal_error(b.as_str());
-    }
-    Mini.optimize(proto.code);
+        code: code,
+        words: words,
+    });
     fs.code.free();
     fs.consts.free();
     fs.locals.free();

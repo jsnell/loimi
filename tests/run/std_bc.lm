@@ -271,8 +271,8 @@ fn compile_and_run(src: str, thread: bool) {
     var buf: [u32; 256] = [0; 256];
     c.code.copy_into(buf[..]);
     var lim = Limits { nregs: nregs, nconsts: c.consts.len() as u32 };
-    if let Some(bad) = Toy.verify(buf[0..n], &lim) {
-        io.print("verify failed at "); io.print_int(bad as i64); io.println("");
+    if let Err(bad) = Toy.verify(buf[0..n], &lim) {
+        io.print("verify failed at "); io.print_int(bad.at as i64); io.println("");
         return;
     }
     // Positions: per word and compact tables agree.

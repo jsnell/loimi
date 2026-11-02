@@ -43,7 +43,7 @@ fn main() {
     show(M.NOP());
     // A super's head answers for its first part.
     var code: [u32; 2] = [M.ADDI(0, 0, 1), M.RET(0)];
-    M.optimize(code[..]);
+    M.optimize_words(code[..]);
     show(code[0]);
     // Out of range: no kind.
     io.println(M.kind_name(M.operand_kind(code[1], 5)));

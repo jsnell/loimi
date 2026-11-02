@@ -99,7 +99,7 @@ fn main() {
     at = V.emit.BUMP(c, at, 2);        // 26
     at = V.emit.HALT(c, at, 2);
     io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");
-    V.optimize(c);
+    V.optimize_words(c);
     io.println(V.op_name(code[1]));
     io.println(V.op_name(code[4]));
     io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");

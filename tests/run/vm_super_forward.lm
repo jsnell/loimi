@@ -41,7 +41,7 @@ vm V {
 fn go(code: []u32, n: u64) {
     var regs: [i64; 8] = [0; 8];
     var clamps: i64 = 0;
-    V.optimize(code[0..n]);
+    V.optimize_words(code[0..n]);
     io.print(V.op_name(code[2]));
     io.print(" ");
     io.print_int(V.run(&clamps, &code[0], &regs[0]));

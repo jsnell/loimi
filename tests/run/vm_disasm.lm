@@ -54,7 +54,7 @@ fn main() {
     at = D.emit.LOADI(code[..], at, 4, 5);
     at = D.emit.ADD(code[..], at, 4, 4, 4);
     at = D.emit.RET(code[..], at, 4);
-    D.optimize(code[..at]);
+    D.optimize_words(code[..at]);
     // Fill the cache: a pointer, a signed field, a two-word u64, a float.
     var sh = Shape { id: 1 };
     let p = (&sh) as u64;

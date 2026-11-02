@@ -306,40 +306,44 @@ pub fn call_value(c: *Ctx, f: V, args: *V, n: u64) -> Result<V, V> uses reenter 
     r
 }
 
+#[require_verified]
 pub vm Mini {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    // The generated verifier (Mini.verify) checks these against the prototype.
-    verify_context proto: Gc<Proto>;
-    operand reg = regs[it] verify (it as u32) < proto.nregs;
-    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    // The generated verifier (Mini.verify) checks these against the
+    // prototype's register, upvalue, constant and child counts. It runs
+    // before the Proto exists (compile.lm, `finish`), which then stores
+    // the proof next to the same counts.
+    verify_context nregs: u32, nupvals: u32, nconsts: u64, nprotos: u64;
+    operand reg = regs[it] verify (it as u32) < nregs;
+    operand kst = k[it] verify (it as u64) < nconsts;
     operand imm = it;
     operand simm = it;
-    operand callbase = it verify (it as u32) < proto.nregs;
-    operand forbase = it verify (it as u32) + 3 < proto.nregs;
-    operand upv = it verify (it as u32) < proto.nupvals;
-    operand child = it verify (it as u64) < proto.protos.data.len;
-    operand level = it verify (it as u32) <= proto.nregs;
+    operand callbase = it verify (it as u32) < nregs;
+    operand forbase = it verify (it as u32) + 3 < nregs;
+    operand upv = it verify (it as u32) < nupvals;
+    operand child = it verify (it as u64) < nprotos;
+    operand level = it verify (it as u32) <= nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
     // Counts of registers from the A (or B) operand on. They decode to
     // the plain field; the verifier checks the range they cover against
     // the frame, reading the base from the instruction word (`*pc`).
     /// CALL's argument count: R[a+1 .. a+n] are in the frame.
-    operand nargs = it verify Mini.ABC_a(*pc) + it < proto.nregs as u64;
+    operand nargs = it verify Mini.ABC_a(*pc) + it < nregs as u64;
     /// CALL's result count (at least 1): the callee's return writes
     /// R[a .. a+n-1].
-    operand nres = it verify it >= 1 and Mini.ABC_a(*pc) + it <= proto.nregs as u64;
+    operand nres = it verify it >= 1 and Mini.ABC_a(*pc) + it <= nregs as u64;
     /// SETLIST reads R[a+1 .. a+n].
-    operand listn = it verify Mini.ABC_a(*pc) + it < proto.nregs as u64;
+    operand listn = it verify Mini.ABC_a(*pc) + it < nregs as u64;
     /// RETN reads R[a .. a+n-1].
-    operand retn = it verify Mini.ABC_a(*pc) + it <= proto.nregs as u64;
+    operand retn = it verify Mini.ABC_a(*pc) + it <= nregs as u64;
     /// CONCAT joins R[b .. b+n-1], at least two.
-    operand catn = it verify it >= 2 and Mini.ABC_b(*pc) + it <= proto.nregs as u64;
+    operand catn = it verify it >= 2 and Mini.ABC_b(*pc) + it <= nregs as u64;
     /// GETINDEXI's constant index, 1..255.
     operand index1 = it verify it >= 1;
     /// SELF writes R[a] and R[a+1].
-    operand selfbase = it verify (it as u32) + 1 < proto.nregs;
+    operand selfbase = it verify (it as u32) + 1 < nregs;
 
     encoding fixed(u32) {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
@@ -912,7 +916,7 @@ pub vm Mini {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = callee;
-            jump p.code.ptr
+            jump p.code
         }
         if let Native(id) = f {
             cold {
@@ -1038,7 +1042,7 @@ pub vm Mini {
         for i in 0..p.nregs as u64 { regs[i] = V.Nil; }
         k = p.consts.data.ptr;
         c.fp = fp;
-        jump p.code.ptr
+        jump p.code
     }
 
     /// A run of `cl` in frame `at`, whose window `call_value` filled with
@@ -1054,7 +1058,7 @@ pub vm Mini {
         regs = fp.base;
         c.base = fp;
         c.fp = fp;
-        jump p.code.ptr
+        jump p.code
     }
 
     on raise(e: V) {
@@ -1066,7 +1070,7 @@ pub vm Mini {
         }
         // Prefix the message with the line of the failing instruction.
         let p = fp.cl.proto;
-        let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
+        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
         var line: u32 = 0;
         if i < p.lines.data.len { line = p.lines.data[i]; }
         ctx.out.clear();

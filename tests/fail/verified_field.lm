@@ -1,0 +1,17 @@
+// The code inside a Verified<V> cannot be replaced through its field.
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry run(code: Verified<V>) -> i64 { jump code }
+}
+fn main() {
+    var code: [u32; 1] = [0; 1];
+    var other: [u32; 1] = [7; 1];
+    if let Ok(v) = V.verify(code[..]) {
+        var w = v;
+        w.__code = other[..];
+        V.run(w);
+    }
+}
+// error: field `__code` of `V.Verified` is private to the file that declares it

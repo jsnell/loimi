@@ -68,6 +68,7 @@ const CALL_OVERFLOW: i64 = 1000003;
 
 inline for (V, mode) in [(FT, tailcall), (FG, goto), (FS, switch)] {
     #[dispatch(mode)]
+    #[require_verified]
     pub vm #V {
         context ctx: *Ctx;
         state { pc: *u32, regs: *i64, k: *i64 }
@@ -267,12 +268,11 @@ inline for (V, mode) in [(FT, tailcall), (FG, goto), (FS, switch)] {
         super CNZ_JMP_LEAVE = CNZ; JMP; LEAVE;
         super LOADI_LOADI_LOADI_RET = LOADI; LOADI; LOADI; RET;
 
-        entry run(c: *Ctx, code: *u32, r: *i64, kp: *i64) -> Result<i64, i64> {
+        entry run(c: *Ctx, code: Verified<#V>, r: *i64, kp: *i64) -> Result<i64, i64> {
             ctx = c;
             regs = r;
             k = kp;
-            pc = code;
-            jump pc
+            jump code
         }
 
         on raise(e: i64) { fail e }
@@ -493,7 +493,7 @@ fn generate(r: *Rng, p: *Prog) {
         p.fentry[i] = if ok(r, p) { st[r.below(n)] as u32 } else { r.below(p.len + 2) as u32 };
     }
     // Fuse now and then, as the builder would.
-    if r.chance(60) { FT.optimize(code[0..p.len]); }
+    if r.chance(60) { FT.optimize_words(code[0..p.len]); }
     // Mutations: rewrite opcodes (often into supers), flip bits,
     // replace words.
     if style <= 6 {
@@ -545,9 +545,10 @@ inline for (V, runv) in [(FT, run_ft), (FG, run_fg), (FS, run_fs)] {
         for i in 0..4 { fentry[i] = p.fentry[i]; }
         var proto = Proto { nregs: p.nregs, nconsts: p.nconsts, nfuncs: p.nfuncs, fentry: fentry, code: code };
         var env = Env { nglobals: p.nglobals };
-        out.verified = #V.verify(cs, &proto, &env);
-        if out.verified.is_none() {
-            if optimize_first { #V.optimize(cs); }
+        let vr = #V.verify(cs, &proto, &env);
+        out.verified = match vr { Ok(_) => None, Err(e) => Some(e.at) };
+        if let Ok(v0) = vr {
+            let v = if optimize_first { #V.optimize(v0) } else { v0 };
             let nr = (p.nregs as u64) * p.frames;
             let regs: *i64 = mem.alloc(nr);
             for i in 0..nr { regs[i] = (i as i64) - 2; }
@@ -561,7 +562,7 @@ inline for (V, runv) in [(FT, run_ft), (FG, run_fg), (FS, run_fs)] {
                 reg_end: regs + nr, frames: frames, depth: 0, max_depth: 8,
                 budget: 2000, counts: counts, log: 0,
             };
-            let r = #V.run(&ctx, code, regs, k);
+            let r = #V.run(&ctx, v, regs, k);
             out.ran = true;
             if DUMP {
                 io.println("code after running:");
@@ -579,9 +580,9 @@ inline for (V, runv) in [(FT, run_ft), (FG, run_fg), (FS, run_fs)] {
             h = mix(h, ctx.depth);
             for i in 0..len { h = mix(h, code[i] as u64); }
             out.sig = h;
-            out.reverify = #V.verify(cs, &proto, &env);
-            #V.optimize(cs);
-            out.reverify_opt = #V.verify(cs, &proto, &env);
+            out.reverify = match #V.verify(cs, &proto, &env) { Ok(_) => None, Err(e) => Some(e.at) };
+            #V.optimize(v);
+            out.reverify_opt = match #V.verify(cs, &proto, &env) { Ok(_) => None, Err(e) => Some(e.at) };
             mem.release(regs);
             mem.release(k);
             mem.release(globals);

@@ -333,7 +333,7 @@ fn delete_prop(c: *Ctx, v: V, key: V) -> Result<V, V> {
 
 /// The handler for an exception at `at` in `p`, if any: (target, register).
 fn find_handler(p: Gc<Proto>, at: *u32) -> ?(u64, u64) {
-    let off = ((at as u64) - (p.code.ptr as u64)) / 4;
+    let off = ((at as u64) - (p.code.start() as u64)) / 4;
     let h = p.handlers.data;
     var i: u64 = 0;
     while i + 3 < h.len {
@@ -343,19 +343,24 @@ fn find_handler(p: Gc<Proto>, at: *u32) -> ?(u64, u64) {
     None
 }
 
+#[require_verified]
 pub vm JS {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    verify_context proto: Gc<Proto>;
-    operand reg = regs[it] verify (it as u32) < proto.nregs;
-    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    // The generated verifier (JS.verify) checks these against the
+    // prototype's register, free variable, constant and child counts. It
+    // runs before the Proto exists (compile.lm, `finish`), which then
+    // stores the proof next to the same counts.
+    verify_context nregs: u32, nfree: u32, nconsts: u64, nprotos: u64;
+    operand reg = regs[it] verify (it as u32) < nregs;
+    operand kst = k[it] verify (it as u64) < nconsts;
     operand imm = it;
     operand simm = it;
     operand gl = it;
-    operand fv = it verify (it as u32) < proto.nfree;
-    operand child = it verify (it as u64) < proto.protos.data.len;
-    operand callbase = it verify (it as u32) < proto.nregs;
+    operand fv = it verify (it as u32) < nfree;
+    operand child = it verify (it as u64) < nprotos;
+    operand callbase = it verify (it as u32) < nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
@@ -1030,7 +1035,7 @@ pub vm JS {
         k = p.consts.data.ptr;
         fp.k = k;
         regs = callee;
-        jump p.code.ptr
+        jump p.code
     }
 
     /// A native call from CALL's members (their callee is the native
@@ -1082,7 +1087,7 @@ pub vm JS {
                     k = p.consts.data.ptr;
                     fp.k = k;
                     regs = callee;
-                    jump p.code.ptr
+                    jump p.code
                 }
                 // Natives: out of line, so that the bytecode path needs
                 // no stack frame.
@@ -1205,7 +1210,7 @@ pub vm JS {
         k = p.consts.data.ptr;
         fp.k = k;
         regs = callee;
-        jump p.code.ptr
+        jump p.code
     }
 
     /// R[base] = new R[base](R[base+2] ..).
@@ -1379,7 +1384,7 @@ pub vm JS {
         k = p.consts.data.ptr;
         fp.k = k;
         c.fp = fp;
-        jump p.code.ptr
+        jump p.code
     }
 
     on raise(e: V) {
@@ -1392,7 +1397,7 @@ pub vm JS {
                 regs = f.base;
                 k = f.k;
                 regs[r] = e;
-                jump p.code.ptr + target
+                jump p.code.start() + target
             }
             if f == ctx.frames { break; }
             f = f - 1;

@@ -12,9 +12,10 @@ import std.num;
 import std.io;
 import std.obj;
 import value;
-import value.{V, Str, Obj, Vals, Arr, Fn, Proto, Protos, Descs, Lines, Handlers};
+import value.{V, Str, Obj, Vals, Arr, Fn, Proto, Protos, Descs, Lines, Handlers, Code};
 import rt;
 import rt.{Ctx, Native};
+import vm.{JS};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 extern "C" fn sin(x: f64) -> f64;
@@ -102,11 +103,15 @@ fn Ctx.ctor(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>, proto: 
 pub fn install(c: *Ctx) {
     let h = &c.heap;
     let empty_vals = rt.new_vals(h, 0);
+    // Natives share one prototype with no code: its NO_FIXED keeps CALL
+    // off the path that jumps to `code`, so it never runs.
+    let words = new(h, Code {}, 0);
+    let Ok(code) = JS.verify(words.data, 1, 0, 0, 0) else { unreachable };
     c.native_proto = Some(new(h, Proto {
         name: c.key_str(c.key("native")), nparams: 0, fixed: value.NO_FIXED, nregs: 1, nfree: 0, flags: 0, hint: 4,
         consts: empty_vals, protos: new(h, Protos {}, 0), desc: new(h, Descs {}, 0),
-        handlers: new(h, Handlers {}, 0), lines: new(h, Lines {}, 0),
-    }, 0));
+        handlers: new(h, Handlers {}, 0), lines: new(h, Lines {}, 0), code: code, words: words,
+    }));
 
     let console = c.new_object_with(c.objproto, 4);
     c.def(console, "log", console_log);

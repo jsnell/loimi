@@ -59,10 +59,10 @@ vm V {
     }
 }
 
-fn show(r: ?u64) {
+fn show(r: Result<Verified<V>, V.VerifyError>) {
     match r {
-        None => io.println("ok"),
-        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); }
     }
 }
 
@@ -88,7 +88,7 @@ fn main() {
     at = V.emit.ADD(c, at, 2, 0, 1);
     at = V.emit.MUL(c, at, 3, 2, 2);
     at = V.emit.RET(c, at, 3);
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     names(c, at);
     show(V.verify(c[0..at]));
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
@@ -115,7 +115,7 @@ fn main() {
     at = V.emit.LOADI(c, at, 1, 6);
     at = V.emit.ADD(c, at, 2, 0, 1);
     at = V.emit.RET(c, at, 2);
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     names(c, at);
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
     names(c, at);
@@ -129,10 +129,10 @@ fn main() {
     at = V.emit.ADD(c, at, 2, 1, 0);
     at = V.emit.MUL(c, at, 3, 2, 2);
     at = V.emit.RET(c, at, 3);
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     names(c, at);
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     names(c, at);
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
     show(V.verify(c[0..at]));
@@ -142,7 +142,7 @@ fn main() {
     at = V.emit.ABS(c, at, 0);
     at = V.emit.MUL(c, at, 1, 0, 0);
     at = V.emit.RET(c, at, 1);
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     names(c, at);
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
 }

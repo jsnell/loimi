@@ -1,7 +1,10 @@
 import std.io;
+import std.text;
 
 struct Proto { nregs: u32, nconsts: u32 }
 
+// Entries start only in verified code: `run` takes a Verified<V>.
+#[require_verified]
 vm V {
     state { pc: *u32, regs: *i64 }
     verify_context proto: *Proto;
@@ -22,13 +25,18 @@ vm V {
     op CACHED(dst: reg) : ABC + C { cache.x = cache.x + 1; next }
     op RET(src: reg) : ABC { exit src }
 
-    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+    entry run(code: Verified<V>, r: *i64) -> i64 { regs = r; jump code }
 }
 
-fn show(r: ?u64) {
+fn show(r: Result<Verified<V>, V.VerifyError>) {
     match r {
-        None => io.println("ok"),
-        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+        Ok(v) => { io.print("ok, "); io.print_int(v.len() as i64); io.println(" words"); }
+        Err(e) => {
+            var b = text.StrBuf.new();
+            e.write(&b);
+            io.println(b.as_str());
+            b.free();
+        }
     }
 }
 
@@ -61,14 +69,47 @@ fn main() {
     code[5] = V.RET(0);
 
     show(V.verify(c[0..2], &p));         // CACHED cut off by the end
+    show(V.verify(c[0..4], &p));         // ends in ADD, which continues
+    show(V.verify(c[0..0], &p));         // empty
+
+    // The reason is an enum, for programs that act on it.
+    if let Err(e) = V.verify(c[0..0], &p) {
+        match e.reason {
+            Empty => io.println("reason: Empty"),
+            _ => io.println("reason: other"),
+        }
+        io.println(e.message());
+    }
 
     var regs: [i64; 4] = [0; 4];
-    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+    match V.verify(c[0..at], &p) {
+        Ok(v) => {
+            // `optimize` takes and returns the proof: fusing preserves it.
+            let v2 = V.optimize(v);
+            io.print_int(V.run(v2, &regs[0])); io.println("");
+        }
+        Err(_) => io.println("unexpected"),
+    }
+    // A placeholder for a field that needs a Verified before the real
+    // code is verified: one invalid opcode, which traps if it runs.
+    let ph = V.placeholder();
+    io.print_int(ph.len() as i64); io.println("");
+    show(V.verify(ph.words(), &p));
+    // Code the host trusts without checking.
+    let t = unsafe { V.assume_verified(c[0..at]) };
+    io.print_int(V.run(t, &regs[0])); io.println("");
 }
-// expect: ok
-// expect: bad at 4
-// expect: bad at 3
-// expect: bad at 0
-// expect: bad at 5
-// expect: bad at 1
+// expect: ok, 6 words
+// expect: word 4 (JLT): operand `target` (label) fails `is_insn_boundary(pc + it)`
+// expect: word 3 (ADD): operand `b` (reg) fails `(it as u32) < proto.nregs`
+// expect: word 0 (LOADK): operand `k` (kst) fails `(it as u32) < proto.nconsts`
+// expect: word 5: invalid opcode
+// expect: word 1 (CACHED): the instruction runs past the end of the code
+// expect: word 3 (ADD): execution can run off the end of the code after this instruction
+// expect: word 0: the code is empty
+// expect: reason: Empty
+// expect: the code is empty
+// expect: 16
+// expect: 1
+// expect: word 0: invalid opcode
 // expect: 16

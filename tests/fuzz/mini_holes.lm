@@ -27,20 +27,31 @@ import std.gc;
 import std.mem;
 import std.text;
 import value;
-import value.{V, Proto, Lines, Protos, UpDescs};
+import value.{V, Proto, Lines, Protos, UpDescs, Code};
 import vm.{Mini, Ctx, Frame};
 import vm;
 
-fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> Gc<Proto> {
+/// A prototype for `code`, and whether the code passed Mini.verify. If it
+/// did not, the Proto holds it anyway (`assume_verified`): the reproducers
+/// exist to run code that the verifier used to accept.
+fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> (Gc<Proto>, bool) {
     let protos = new(h, Protos {}, kids.len);
     for i in 0..kids.len { protos.data[i] = kids[i]; }
+    let words = new(h, Code {}, code.len);
+    let lines = new(h, Lines {}, code.len);
+    for i in 0..code.len { words.data[i] = code[i]; lines.data[i] = 0; }
+    let consts = value.new_arr(h, 1);
+    let (v, ok) = match Mini.verify(words.data, nregs, 0, consts.data.len, protos.data.len) {
+        Ok(v) => (v, true),
+        Err(_) => (unsafe { Mini.assume_verified(words.data) }, false),
+    };
     let p = new(h, Proto {
         name: value.new_str(h, "f"), nparams: 0, nregs: nregs, nupvals: 0,
-        consts: value.new_arr(h, 1), lines: new(h, Lines {}, code.len),
+        consts: consts, lines: lines,
         protos: protos, updesc: new(h, UpDescs {}, 0),
-    }, code.len);
-    for i in 0..code.len { p.code[i] = code[i]; p.lines.data[i] = 0; }
-    p
+        code: v, words: words,
+    });
+    (p, ok)
 }
 
 fn main() -> i32 {
@@ -102,15 +113,14 @@ fn verifies(which: u8, run: bool) -> bool {
         main_code[2] = Mini.RET0();
     }
     var nokids: mem.Vec<Gc<Proto>> = mem.Vec.new();
-    let child = proto(h, 1, child_code[..], nokids.items());
+    let (child, child_ok) = proto(h, 1, child_code[..], nokids.items());
     var kids: [Gc<Proto>; 1] = [child];
-    let mainp = proto(h, nregs, main_code[0..mlen], kids[..]);
-    let ok = Mini.verify(mainp.code, mainp).is_none();
+    let (mainp, ok) = proto(h, nregs, main_code[0..mlen], kids[..]);
     if !run { return ok; }
     io.print("verify main: ");
     io.println(if ok { "ok" } else { "rejected" });
     io.print("verify child: ");
-    io.println(if Mini.verify(child.code, child).is_none() { "ok" } else { "rejected" });
+    io.println(if child_ok { "ok" } else { "rejected" });
     if !ok { return false; }
     let stack: *V = mem.alloc(nregs as u64);
     var ctx = Ctx {

@@ -86,7 +86,7 @@ fn main() {
     at = V.emit.GETG(c, at, 5, 3);         // 30..36
     at = V.emit.BUMP(c, at);               // 36..38
     at = V.emit.RET(c, at, 6);
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     io.print(V.op_name(code[24])); io.println("");
     var regs: [i64; 8] = [0; 8];
     var round = 0;

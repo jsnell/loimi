@@ -1,0 +1,10 @@
+// In a #[require_verified] vm, an entry cannot start at a raw code pointer.
+#[require_verified]
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+fn main() {}
+// error: `V` is `#[require_verified]`: an entry starts only in verified code, `jump v` with `v: Verified<V>`

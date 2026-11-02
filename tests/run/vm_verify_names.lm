@@ -19,10 +19,10 @@ vm V {
     entry run(c: *u32, r: *i64) -> i64 { pc = c; regs = r; jump pc }
 }
 
-fn show(r: ?u64) {
+fn show(r: Result<Verified<V>, V.VerifyError>) {
     match r {
-        None => io.println("ok"),
-        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); }
     }
 }
 

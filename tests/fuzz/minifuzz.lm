@@ -29,7 +29,7 @@ import std.mem;
 import std.num;
 import std.text;
 import value;
-import value.{V, Arr, Proto, Lines, Protos, UpDescs, Closure};
+import value.{V, Arr, Proto, Lines, Protos, UpDescs, Closure, Code};
 import vm.{Mini, Ctx, Frame};
 import vm;
 
@@ -69,7 +69,7 @@ var DUMP: bool = false;
 
 /// A random function prototype. `parent_nregs` > 0 for a child: its
 /// upvalues then capture the parent's registers.
-fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top: bool) -> Gc<Proto> {
+fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top: bool) -> (Gc<Proto>, ?Mini.VerifyError) {
     let nregs = 1 + r.below(16) as u32;
     let nconsts = r.below(8);
     let nup = if top { 0 } else { r.below(3) };
@@ -112,17 +112,8 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
     for i in 0..children.len { protos.data[i] = children[i]; }
     let updesc = new(h, UpDescs {}, nup);
     for i in 0..nup { updesc.data[i] = 256 | r.below(parent_nregs as u64) as u32; }
-    let p = new(h, Proto {
-        name: value.new_str(h, "f"),
-        nparams: 0,
-        nregs: nregs,
-        nupvals: nup as u32,
-        consts: consts,
-        lines: lines,
-        protos: protos,
-        updesc: updesc,
-    }, len);
-    for i in 0..len { p.code[i] = 0; lines.data[i] = i as u32; }
+    let words = new(h, Code {}, len);
+    for i in 0..len { words.data[i] = 0; lines.data[i] = i as u32; }
     // Per mille of instructions whose operands are not checked against
     // Mini.verify while generating.
     let noise: u64 = if r.chance(60) { 0 } else if r.chance(50) { 20 } else { 200 };
@@ -152,10 +143,10 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
                 continue;
             }
             if is_last or tries > 40 or r.below(1000) < noise or at + size >= len { break; }
-            p.code[at] = w;
-            for j in 1..size { p.code[at + j] = 0; }
-            p.code[at + size] = Mini.with_opcode(0, Mini.OP_RET0);
-            if Mini.verify(p.code[at..at + size + 1], p).is_none() { break; }
+            words.data[at] = w;
+            for j in 1..size { words.data[at + j] = 0; }
+            words.data[at + size] = Mini.with_opcode(0, Mini.OP_RET0);
+            if let Ok(_) = Mini.verify(words.data[at..at + size + 1], nregs, nup as u32, nconsts, children.len) { break; }
             if tries % 4 == 0 and !is_label_op(op) and op != Mini.OP_CALL and op != Mini.OP_CLOSURE {
                 for _k in 0..32 {
                     let c = r.below(Mini.NUM_OPS) as u32;
@@ -179,28 +170,47 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
             }
         }
         // Call what the previous instruction just made (CLOSURE r; CALL r).
-        if op == Mini.OP_CALL and i > 0 and Mini.opcode(p.code[starts[i - 1]]) == Mini.OP_CLOSURE and r.chance(80) {
-            w = (w & !(255 << 8)) | (p.code[starts[i - 1]] & (255 << 8));
+        if op == Mini.OP_CALL and i > 0 and Mini.opcode(words.data[starts[i - 1]]) == Mini.OP_CLOSURE and r.chance(80) {
+            w = (w & !(255 << 8)) | (words.data[starts[i - 1]] & (255 << 8));
         }
         // Mostly results that fit the frame (others fail verification).
         if op == Mini.OP_CALL and r.chance(90) {
             let a = (w >> 8) & 255;
             if a <= nregs { w = (w & 16777215) | ((r.below((nregs - a + 1) as u64) as u32) << 24); }
         }
-        p.code[at] = w;
-        for j in 1..size { p.code[at + j] = if r.chance(3) { r.next() as u32 } else { 0 }; }
+        words.data[at] = w;
+        for j in 1..size { words.data[at + j] = if r.chance(3) { r.next() as u32 } else { 0 }; }
     }
-    if r.chance(40) { Mini.optimize(p.code); }
+    if r.chance(40) { Mini.optimize_words(words.data); }
     if r.chance(15) {
         for _m in 0..1 + r.below(3) {
             let i = r.below(len);
-            p.code[i] = p.code[i] ^ ((1 as u32) << (r.below(32) as u32));
+            words.data[i] = words.data[i] ^ ((1 as u32) << (r.below(32) as u32));
         }
     }
     if r.chance(3) {
-        for i in 0..len { p.code[i] = r.next() as u32; }
+        for i in 0..len { words.data[i] = r.next() as u32; }
     }
-    p
+    // A Proto needs its proof. Code that fails verification is held
+    // unchecked (`assume_verified`) so that `-d` can dump it; `one` runs
+    // a program only if every proto verified (`err` is None).
+    let (code, err) = match Mini.verify(words.data, nregs, nup as u32, nconsts, children.len) {
+        Ok(v) => (v, None),
+        Err(e) => (unsafe { Mini.assume_verified(words.data) }, Some(e)),
+    };
+    let p = new(h, Proto {
+        name: value.new_str(h, "f"),
+        nparams: 0,
+        nregs: nregs,
+        nupvals: nup as u32,
+        consts: consts,
+        lines: lines,
+        protos: protos,
+        updesc: updesc,
+        code: code,
+        words: words,
+    });
+    (p, err)
 }
 
 fn dump(p: Gc<Proto>) {
@@ -213,8 +223,8 @@ fn dump(p: Gc<Proto>) {
     io.print(" children ");
     io.print_int(p.protos.data.len as i64);
     io.println("");
-    for i in 0..p.code.len {
-        let w = p.code[i];
+    for i in 0..p.words.data.len {
+        let w = p.words.data[i];
         io.print("  ");
         io.print_int(i as i64);
         io.print(": ");
@@ -241,9 +251,15 @@ fn one(ctx: *Ctx, seed: u64) -> bool {
     let h = &ctx.heap;
     var none: mem.Vec<Gc<Proto>> = mem.Vec.new();
     var kids: mem.Vec<Gc<Proto>> = mem.Vec.new();
+    var errs: [?Mini.VerifyError; 4] = [None, None, None, None];
     let main_nregs_hint: u32 = 16;
-    for _k in 0..r.below(3) { kids.push(gen_proto(h, &r, none.items(), main_nregs_hint, false)); }
-    let main = gen_proto(h, &r, kids.items(), 0, true);
+    for _k in 0..r.below(3) {
+        let (c, e) = gen_proto(h, &r, none.items(), main_nregs_hint, false);
+        kids.push(c);
+        errs[kids.len] = e;
+    }
+    let (main, main_err) = gen_proto(h, &r, kids.items(), 0, true);
+    errs[0] = main_err;
     // Children capture registers below the parent's nregs.
     for i in 0..kids.len {
         let c = kids.at(i);
@@ -256,15 +272,16 @@ fn one(ctx: *Ctx, seed: u64) -> bool {
     }
     var ok = true;
     for i in 0..kids.len + 1 {
-        let c = if i == 0 { main } else { kids.at(i - 1) };
-        if let Some(bad) = Mini.verify(c.code, c) {
+        if let Some(e) = errs[i] {
             ok = false;
             if DUMP {
-                io.print("proto ");
-                io.print_int(i as i64);
-                io.print(" rejected at ");
-                io.print_int(bad as i64);
-                io.println("");
+                var b = text.StrBuf.new();
+                b.push_str("proto ");
+                b.push_int(i as i64);
+                b.push_str(" rejected: ");
+                e.write(&b);
+                io.println(b.as_str());
+                b.free();
             }
         }
     }
@@ -359,15 +376,20 @@ fn main() -> i32 uses gc {
         host: vm.no_host,
     };
     ctx.frames_end = ctx.frames + 16;
-    // Frame 0 starts with a one-register closure, until a program runs.
+    // Frame 0 starts with a one-register closure (never run: RET0), until
+    // a program runs.
+    let idle_words = new(&ctx.heap, Code {}, 1);
+    idle_words.data[0] = Mini.RET0();
+    let Ok(idle_code) = Mini.verify(idle_words.data, 1, 0, 0, 0) else { unreachable };
     let idle = new(&ctx.heap, Proto {
         name: value.new_str(&ctx.heap, "idle"),
         nparams: 0, nregs: 1, nupvals: 0,
         consts: value.new_arr(&ctx.heap, 0),
-        lines: new(&ctx.heap, Lines {}, 0),
+        lines: new(&ctx.heap, Lines {}, 1),
         protos: new(&ctx.heap, Protos {}, 0),
         updesc: new(&ctx.heap, UpDescs {}, 0),
-    }, 0);
+        code: idle_code, words: idle_words,
+    });
     ctx.frames.cl = value.new_closure(&ctx.heap, idle);
     park(&ctx);
     ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);

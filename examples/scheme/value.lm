@@ -13,6 +13,7 @@ import std.mem;
 import std.hash;
 import std.text;
 import std.map;
+import vm.{Scheme};
 
 pub object Pair { car: V, cdr: V }
 pub object Str { data: [u8] }
@@ -30,6 +31,12 @@ pub object Lines { data: [u32] }
 /// enclosing frame", otherwise "free slot `low byte` of the enclosing closure".
 pub object Descs { data: [u32] }
 pub object Protos { data: [Gc<Proto>] }
+/// Bytecode words: the storage behind a Proto's `code`.
+pub object Code { data: [u32] }
+/// A procedure prototype. `code` is the proof that `words` passed
+/// Scheme.verify against this prototype's nregs, nfree and its constant
+/// and child counts (compile.lm, `finish`); none of these change after.
+/// Every call jumps to a `code`, so every procedure that runs was verified.
 pub object Proto {
     name: Gc<Str>,
     /// Number of required parameters.
@@ -45,7 +52,10 @@ pub object Proto {
     lines: Gc<Lines>,
     protos: Gc<Protos>,
     desc: Gc<Descs>,
-    code: [u32],
+    code: Verified<Scheme>,
+    /// Owns `code`'s words (the proof holds a plain slice, which the
+    /// collector does not trace).
+    words: Gc<Code>,
 }
 /// A flat closure: the values of its free variables (boxes for assigned ones).
 pub object Closure { proto: Gc<Proto>, free: [V] }

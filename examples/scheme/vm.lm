@@ -7,8 +7,9 @@
 import std.gc;
 import std.io;
 import std.text;
+import std.os;
 import value;
-import value.{V, Pair, Vect, Proto, Closure, Lines, Protos, Descs};
+import value.{V, Pair, Vect, Proto, Closure, Lines, Protos, Descs, Code};
 import rt.{Ctx, Frame};
 import rt;
 import builtins;
@@ -50,7 +51,7 @@ fn eqv_slow(a: V, b: V) -> V { value.boolean(value.eqv(a, b)) }
 
 /// Source line of the instruction at `at` in `p` (0: unknown, e.g. prelude code).
 fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
-    let i = ((at as u64) - (p.code.ptr as u64)) / 4;
+    let i = ((at as u64) - (p.code.start() as u64)) / 4;
     if i < p.lines.data.len { p.lines.data[i] } else { 0 }
 }
 
@@ -62,7 +63,20 @@ fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
 /// checks that the frame at that depth still belongs to it and returns from
 /// it. Its `fixed` keeps CALL off the fast path.
 pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
-    let p = new(h, Proto {
+    let words = new(h, Code {}, 2);
+    words.data[0] = Scheme.CALL(0, 1);
+    words.data[1] = Scheme.RET(0);
+    let code = match Scheme.verify(words.data, 2, 1, 0, 0) {
+        Ok(v) => v,
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: internal error: continuation code fails verification: ");
+            e.write(&b);
+            io.eprintln(b.as_str());
+            os.quit(1)
+        }
+    };
+    new(h, Proto {
         name: value.new_str(h, "continuation"),
         nparams: 1,
         rest: 0,
@@ -73,27 +87,30 @@ pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
         lines: new(h, Lines {}, 0),
         protos: new(h, Protos {}, 0),
         desc: new(h, Descs {}, 0),
-    }, 2);
-    p.code[0] = Scheme.CALL(0, 1);
-    p.code[1] = Scheme.RET(0);
-    p
+        code: code,
+        words: words,
+    })
 }
 
+#[require_verified]
 pub vm Scheme {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    // The generated verifier (Scheme.verify) checks these against the prototype.
-    verify_context proto: Gc<Proto>;
-    operand reg = regs[it] verify (it as u32) < proto.nregs;
-    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    // The generated verifier (Scheme.verify) checks these against the
+    // prototype's register, free variable, constant and child counts. It
+    // runs before the Proto exists (compile.lm, `finish`), which then
+    // stores the proof next to the same counts.
+    verify_context nregs: u32, nfree: u32, nconsts: u64, nprotos: u64;
+    operand reg = regs[it] verify (it as u32) < nregs;
+    operand kst = k[it] verify (it as u64) < nconsts;
     operand imm = it;
     operand simm = it;
     /// A global slot (allocated by the compiler, so always in range).
     operand gl = it;
-    operand fv = it verify (it as u32) < proto.nfree;
-    operand child = it verify (it as u64) < proto.protos.data.len;
-    operand callbase = it verify (it as u32) < proto.nregs;
+    operand fv = it verify (it as u32) < nfree;
+    operand child = it verify (it as u64) < nprotos;
+    operand callbase = it verify (it as u32) < nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
@@ -403,7 +420,7 @@ pub vm Scheme {
             k = cp.consts.data.ptr;
             fp.k = k;
             regs = dst;
-            jump cp.code.ptr
+            jump cp.code
         }
         if let Clo(cl) = f {
             let p = cl.proto;
@@ -456,7 +473,7 @@ pub vm Scheme {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = dst;
-            jump p.code.ptr
+            jump p.code
         }
         if let Some(id) = value.prim_of(f) {
             let v = builtins.call_native(ctx, id, regs + base + 1, n)?;
@@ -503,7 +520,7 @@ pub vm Scheme {
         fp.base = callee;
         fp.k = k;
         regs = callee;
-        jump p.code.ptr
+        jump p.code
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).
@@ -528,7 +545,7 @@ pub vm Scheme {
                 k = p.consts.data.ptr;
                 fp.k = k;
                 regs = callee;
-                jump p.code.ptr
+                jump p.code
             }
         }
         cold {
@@ -554,7 +571,7 @@ pub vm Scheme {
                 fp.cl = cl;
                 k = p.consts.data.ptr;
                 fp.k = k;
-                jump p.code.ptr
+                jump p.code
             }
         }
         cold {
@@ -626,7 +643,7 @@ pub vm Scheme {
         k = p.consts.data.ptr;
         fp.k = k;
         c.fp = fp;
-        jump p.code.ptr
+        jump p.code
     }
 
     on raise(e: V) {

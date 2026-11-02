@@ -364,7 +364,8 @@ impl Parser {
         self.expect("[")?;
         loop {
             let start = self.span();
-            let name = self.ident()?.name;
+            // `#[unsafe]` marks a function that only `unsafe { }` may name.
+            let name = if self.is_kw("unsafe") { self.bump(); "unsafe".to_string() } else { self.ident()?.name };
             let mut args = Vec::new();
             if self.eat("(") {
                 while !self.is(")") {

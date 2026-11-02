@@ -25,7 +25,7 @@ import std.map;
 import std.hash;
 import std.bc;
 import value;
-import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
+import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs, Code};
 import rt.{Ctx};
 import read;
 import read.{fail, Reader};
@@ -2397,26 +2397,35 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     }
     let np = l.nparams;
     let rest: u32 = if l.rest { 1 } else { 0 };
+    // Verify against the counts the Proto will hold, then store the
+    // proof with them: CALL jumps only to a Proto's verified `code`.
+    let nregs = fs.regs.frame_size(1);
+    let nfree = l.free.len as u32;
+    let words = new(h, Code {}, fs.code.len());
+    fs.code.copy_into(words.data);
+    let code = match Scheme.verify(words.data, nregs, nfree, consts.data.len, protos.data.len) {
+        Ok(v) => Scheme.optimize(v),
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("internal error: generated code fails verification: ");
+            e.write(&b);
+            fail(0, b.as_str())
+        }
+    };
     let proto = new(h, Proto {
         name: value.new_str(h, l.name),
         nparams: np,
         rest: rest,
         fixed: if l.rest { 0x10000 } else { np },
-        nregs: fs.regs.frame_size(1),
-        nfree: l.free.len as u32,
+        nregs: nregs,
+        nfree: nfree,
         consts: consts,
         lines: lines,
         protos: protos,
         desc: desc,
-    }, fs.code.len());
-    fs.code.copy_into(proto.code);
-    if let Some(bad) = Scheme.verify(proto.code, proto) {
-        var b = text.StrBuf.new();
-        b.push_str("internal error: generated code fails verification at instruction ");
-        b.push_int(bad as i64);
-        fail(0, b.as_str());
-    }
-    Scheme.optimize(proto.code);
+        code: code,
+        words: words,
+    });
     fs.code.free();
     fs.consts.free();
     fs.protos.free();

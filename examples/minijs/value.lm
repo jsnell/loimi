@@ -7,6 +7,7 @@ import std.hash;
 import std.text;
 import std.num;
 import std.obj;
+import vm.{JS};
 
 extern "C" fn fmod(a: f64, b: f64) -> f64;
 
@@ -145,6 +146,12 @@ pub const PF_METHOD: u32 = 8;
 /// `fixed` for prototypes that CALL's fast path must never take (natives).
 pub const NO_FIXED: u32 = 0xFFFF;
 
+/// Bytecode words: the storage behind a Proto's `code`.
+pub object Code { data: [u32] }
+/// A function prototype. `code` is the proof that `words` passed
+/// JS.verify against this prototype's nregs, nfree and its constant and
+/// child counts (compile.lm, `finish`); none of these change after.
+/// Every call jumps to a `code`, so every function that runs was verified.
 pub object Proto {
     name: Gc<Str>,
     nparams: u32,
@@ -160,7 +167,10 @@ pub object Proto {
     desc: Gc<Descs>,
     handlers: Gc<Handlers>,
     lines: Gc<Lines>,
-    code: [u32],
+    code: Verified<JS>,
+    /// Owns `code`'s words (the proof holds a plain slice, which the
+    /// collector does not trace).
+    words: Gc<Code>,
 }
 
 pub value V repr nanbox {

@@ -428,11 +428,20 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
 ///   may continue (see `may_continue`), and an op with `then` that may
 ///   continue (say by `jump pc + 2` past its follower) is not followed by
 ///   the last instruction.
-/// Returns the index of the first bad word.
+/// Returns `Ok(Verified)`, the code wrapped in the vm's proof type, or
+/// `Err(VerifyError)` for the first bad word: its index, which check
+/// failed, and for an operand its index and kind.
 ///
 /// `verify` clauses are pasted into the generated function, so they see
 /// `it`, `pc` and the verify context; the verifier's own names start with
 /// `__` so that a clause cannot pick them up by accident.
+///
+/// Also generated here: the proof type `Vm__Verified` (one field, the
+/// code slice, which only the vm's generated functions can reach: fields
+/// starting with `__` are private to the file that declares their struct,
+/// and this file is the vm's expansion), its accessors, the escape hatch
+/// `Vm.assume_verified` (`#[unsafe]`), the error type, and `optimize` and
+/// `deopt` over verified code.
 fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
@@ -442,14 +451,101 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
             return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
         }
     }
-    let clause = |kind: &str| -> Option<String> {
+    let clause_text = |kind: &str| -> Option<String> {
         let k = v.operands.iter().find(|o| o.name.name == kind)?;
         let e = k.verify.as_ref()?;
         let f = &sm.files[e.span.file as usize];
-        let text = &f.text[e.span.lo as usize..e.span.hi as usize];
-        Some(text.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
+        Some(f.text[e.span.lo as usize..e.span.hi as usize].to_string())
+    };
+    let clause = |kind: &str| -> Option<String> {
+        Some(clause_text(kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
     };
     let mut s = String::new();
+    // The proof type and what can be done with it.
+    let _ = writeln!(
+        s,
+        "{vis}struct {n}__Verified {{ __code: []{w} }}\n\
+         {vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
+         {vis}fn {n}__Verified.len(v: {n}__Verified) -> u64 {{ v.__code.len }}\n\
+         {vis}fn {n}__Verified.words(v: {n}__Verified) -> []{w} {{ v.__code }}\n\
+         #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}) -> {n}__Verified {{ {n}__Verified {{ __code: code }} }}\n\
+         {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
+         {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
+    );
+    // A placeholder proof, for a field that must hold a Verified before
+    // the real code is verified (a prototype built before the program it
+    // belongs to is complete): one word with an opcode no op has, which
+    // traps when dispatched. Not generated if every opcode is taken.
+    let used: std::collections::HashSet<u32> = l.ops.iter().map(|o| o.opcode).collect();
+    if let Some(bad) = (0..1u64 << l.op_bits.min(16)).map(|x| x as u32).find(|x| !used.contains(x)) {
+        let word = (bad as u64) << l.op_shift;
+        let _ = writeln!(
+            s,
+            "var {n}__TRAP: [{w}; 1] = [{word}];\n\
+             {vis}fn {n}__placeholder() -> {n}__Verified {{ {n}__Verified {{ __code: {n}__TRAP[..] }} }}"
+        );
+    }
+    // Errors.
+    let _ = writeln!(
+        s,
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Then, RunsOffEnd, Operand }}\n\
+         {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64 }}\n\
+         fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
+         \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind }})\n}}\n\
+         {vis}fn {n}__VerifyError.message(e: {n}__VerifyError) -> str {{\n\
+         \x20 match e.reason {{\n\
+         \x20   Empty => \"the code is empty\",\n\
+         \x20   TooLong => \"the code is longer than 524288 words\",\n\
+         \x20   BadOpcode => \"invalid opcode\",\n\
+         \x20   Truncated => \"the instruction runs past the end of the code\",\n\
+         \x20   SuperPart => \"a superinstruction's word holds an op outside its part's family\",\n\
+         \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
+         \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
+         \x20   Operand => \"an operand fails its kind's verify clause\",\n\
+         \x20 }}\n}}"
+    );
+    let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = writeln!(s, "{vis}fn {n}__verify_clause(k: u64) -> str {{ match k {{");
+    for (i, k) in v.operands.iter().enumerate() {
+        if let Some(t) = clause_text(&k.name.name) {
+            let _ = writeln!(s, "  {} => \"{}\",", i, esc(&t));
+        }
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
+    let _ = writeln!(s, "{vis}fn {n}__operand_name(w: {w}, i: u64) -> str {{ match {n}__base_op(w) {{");
+    for o in &l.ops {
+        if !o.parts.is_empty() || o.fields.is_empty() {
+            continue;
+        }
+        let arms: Vec<String> = o.fields.iter().enumerate().map(|(j, f)| format!("{} => \"{}\"", j, f.0)).collect();
+        let _ = writeln!(s, "  {} => match i {{ {}, _ => \"\" }},", o.opcode, arms.join(", "));
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
+    // "word 4 (LOADK): operand `c` (kst) fails `it < lim.nconsts`"
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__VerifyError.write<B>(e: {n}__VerifyError, out: *B) {{\n\
+         \x20 out.push_str(\"word \");\n\
+         \x20 out.push_int(e.at as i64);\n\
+         \x20 if e.op < {n}__NUM_OPS {{\n\
+         \x20   out.push_str(\" (\");\n\
+         \x20   out.push_str({n}__op_name({n}__with_opcode(0, e.op as {w})));\n\
+         \x20   out.push_str(\")\");\n\
+         \x20 }}\n\
+         \x20 out.push_str(\": \");\n\
+         \x20 match e.reason {{\n\
+         \x20   Operand => {{\n\
+         \x20     out.push_str(\"operand `\");\n\
+         \x20     out.push_str({n}__operand_name({n}__with_opcode(0, e.op as {w}), e.operand));\n\
+         \x20     out.push_str(\"` (\");\n\
+         \x20     out.push_str({n}__kind_name(e.kind));\n\
+         \x20     out.push_str(\") fails `\");\n\
+         \x20     out.push_str({n}__verify_clause(e.kind));\n\
+         \x20     out.push_str(\"`\");\n\
+         \x20   }}\n\
+         \x20   _ => out.push_str(e.message()),\n\
+         \x20 }}\n}}"
+    );
     let _ = writeln!(
         s,
         "fn {n}__boundary(code: []{w}, bits: *[u8; 65536], p: *{w}) -> bool {{\n\
@@ -471,42 +567,61 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
         let f = &sm.files[p.ty.span.file as usize];
         params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
     }
-    let _ = writeln!(s, "{vis}fn {n}__verify({}) -> ?u64 {{", params.join(", "));
-    let _ = writeln!(s, "  if __code.len == 0 or __code.len > 524288 {{ return Some(0); }}");
+    let nk = v.operands.len();
+    let fail = |at: &str, reason: &str, op: &str| format!("return {n}__verr({at}, {n}__VerifyReason.{reason}, {op}, 0, {nk});");
+    let op_at = |at: &str| format!("{n}__opcode(__code[{at}]) as u64");
+    let _ = writeln!(s, "{vis}fn {n}__verify({}) -> Result<{n}__Verified, {n}__VerifyError> {{", params.join(", "));
+    let _ = writeln!(s, "  if __code.len == 0 {{ {} }}", fail("0", "Empty", &format!("{n}__NUM_OPS")));
+    let _ = writeln!(s, "  if __code.len > 524288 {{ {} }}", fail("0", "TooLong", &format!("{n}__NUM_OPS")));
     let _ = writeln!(s, "  var __bits: [u8; 65536] = [0; 65536];");
     let _ = writeln!(s, "  var __i: u64 = 0;");
     let _ = writeln!(s, "  var __last: u64 = 0;");
     let _ = writeln!(s, "  while __i < __code.len {{");
-    let _ = writeln!(s, "    if {n}__opcode(__code[__i]) as u64 >= {n}__NUM_OPS {{ return Some(__i); }}");
+    let _ = writeln!(s, "    if {} >= {n}__NUM_OPS {{ {} }}", op_at("__i"), fail("__i", "BadOpcode", &format!("{n}__NUM_OPS")));
     let _ = writeln!(s, "    __bits[__i >> 3] = __bits[__i >> 3] | ((1 as u8) << ((__i & 7) as u8));");
-    let _ = writeln!(s, "    if __i + {n}__op_size(__code[__i]) > __code.len {{ return Some(__i); }}");
+    let _ = writeln!(s, "    if __i + {n}__op_size(__code[__i]) > __code.len {{ {} }}", fail("__i", "Truncated", &op_at("__i")));
     let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
-        let mut conds: Vec<String> = l.part_offsets_src(n, k)[1..]
+        let mut arms: Vec<String> = l.part_offsets_src(n, k)[1..]
             .iter()
-            .map(|(off, p)| format!("{n}__family(__code[__i + {off}]) != {}", l.ops[*p].family))
+            .map(|(off, p)| {
+                format!("if {n}__family(__code[__i + {off}]) != {} {{ {} }}", l.ops[*p].family, fail("__i", "SuperPart", &op_at("__i")))
+            })
             .collect();
         // `then OP`: the next instruction must be an OP; if this op may
         // continue, something must come after that OP too.
         let b = l.base(k);
         if let Some(t) = l.ops[b].then {
             let sz = l.size_src(n, b);
-            conds.push(format!("__i + {sz} >= __code.len or {n}__family(__code[__i + {sz}]) != {}", l.ops[t].family));
+            arms.push(format!(
+                "if __i + {sz} >= __code.len or {n}__family(__code[__i + {sz}]) != {} {{ {} }}",
+                l.ops[t].family,
+                fail("__i", "Then", &op_at("__i"))
+            ));
             if cont[b] {
-                conds.push(format!("__i + {sz} + {n}__base_size(__code[__i + {sz}]) >= __code.len"));
+                arms.push(format!(
+                    "if __i + {sz} + {n}__base_size(__code[__i + {sz}]) >= __code.len {{ {} }}",
+                    fail("__i", "RunsOffEnd", &op_at("__i"))
+                ));
             }
         }
-        if !conds.is_empty() {
-            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(__i); }} }}", o.opcode, conds.join(" or "));
+        if !arms.is_empty() {
+            let _ = writeln!(s, "      {} => {{ {} }}", o.opcode, arms.join(" "));
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
     let _ = writeln!(s, "    __last = __i;\n    __i += {n}__base_size(__code[__i]);\n  }}");
     // The walk is per component, so the last word group is never a
     // super's head.
-    let _ = writeln!(s, "  if {n}__continues({n}__opcode(__code[__last]) as u64) {{ return Some(__last); }}");
+    let _ = writeln!(
+        s,
+        "  if {n}__continues({}) {{ {} }}",
+        op_at("__last"),
+        fail("__last", "RunsOffEnd", &op_at("__last"))
+    );
     let _ = writeln!(s, "  __i = 0;\n  while __i < __code.len {{");
     let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
+    let kind_ix = |name: &str| v.operands.iter().position(|k| k.name.name == name).unwrap_or(nk);
     for (k, o) in l.ops.iter().enumerate() {
         let mut checks = String::new();
         for (off, p) in l.part_offsets_src(n, k).into_iter().take(1) {
@@ -515,9 +630,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
                 if let Some(c) = clause(&po.kinds[fi]) {
                     let _ = write!(
                         checks,
-                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = __code[__i + {off}]; let it = {}; if !({}) {{ return Some(__i + {off}); }} }} ",
+                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = __code[__i + {off}]; let it = {}; if !({}) {{ return {n}__verr(__i + {off}, {n}__VerifyReason.Operand, {}, {fi}, {}); }} }} ",
                         decode_src(l.word_bits, *bits, *shift, *signed),
-                        c
+                        c,
+                        po.opcode,
+                        kind_ix(&po.kinds[fi]),
                     );
                 }
             }
@@ -527,7 +644,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}\n  None\n}}");
+    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}\n  Ok({n}__Verified {{ __code: __code }})\n}}");
     Ok(s)
 }
 
@@ -650,7 +767,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     // middle of a fused sequence still execute the original ops. Words
     // are compared by the op they stand for alone, so code can be
     // optimized again (after quickening, say); the longest match wins.
-    let _ = writeln!(s, "{vis}fn {n}__optimize(code: []{w}) {{");
+    let _ = writeln!(s, "{vis}fn {n}__optimize_words(code: []{w}) {{");
     let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
     let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
     supers.sort_by_key(|&k| std::cmp::Reverse(l.ops[k].parts.len()));
@@ -676,7 +793,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     // generic; the parts' words are instructions of their own). Members of
     // a family share format and cache, so sizes do not change. Inline
     // caches are zeroed, as the emitters leave them.
-    let _ = writeln!(s, "{vis}fn {n}__deopt(__code: []{w}) {{");
+    let _ = writeln!(s, "{vis}fn {n}__deopt_words(__code: []{w}) {{");
     let _ = writeln!(s, "  var __i: u64 = 0;\n  while __i < __code.len {{");
     let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
     let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
@@ -1015,7 +1132,8 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
     let mut seen = std::collections::HashSet::new();
     for it in items {
         let name = match it {
-            Item::Fn(f) => &f.name.name,
+            // Methods (`Vm__Verified.start`) live in their type's namespace.
+            Item::Fn(f) if f.recv.is_none() => &f.name.name,
             Item::Const(c) => &c.name.name,
             Item::Global(g) => &g.name.name,
             _ => continue,

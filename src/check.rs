@@ -156,6 +156,13 @@ pub struct Checker<'a> {
     pub sig_only: bool,
     /// Closures created so far (for unique symbols).
     pub closure_count: u32,
+    /// Functions declared `#[unsafe]` (`Vm.assume_verified`): naming one
+    /// needs an `unsafe { }` block.
+    pub unsafe_fns: std::collections::HashSet<FnId>,
+    /// The file declaring each struct: fields whose names start with `__`
+    /// are private to it (the generated `Vm__Verified` is built only by
+    /// the vm's own generated functions).
+    pub struct_files: HashMap<u32, u32>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -235,6 +242,8 @@ impl<'a> Checker<'a> {
             warnings: vec![],
             sig_only: false,
             closure_count: 0,
+            unsafe_fns: Default::default(),
+            struct_files: HashMap::new(),
         }
     }
 
@@ -317,6 +326,7 @@ impl<'a> Checker<'a> {
                         } else {
                             None
                         };
+                        self.struct_files.insert(id, s.name.span.file);
                         self.prog.structs.push(StructDef {
                             name: format!("{}.{}", prefix, s.name.name),
                             fields: vec![],
@@ -618,6 +628,9 @@ impl<'a> Checker<'a> {
         } else {
             None
         };
+        if f.attrs.has("unsafe") {
+            self.unsafe_fns.insert(id);
+        }
         self.prog.fns[id as usize] = FnDef {
             name,
             symbol,
@@ -692,7 +705,16 @@ impl<'a> Checker<'a> {
                 self.ty_name(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
-            Ty::Struct(i) => short(&self.prog.structs[*i as usize].name),
+            Ty::Struct(i) => {
+                // Generated vm types: `Mini__Verified` is `Verified<Mini>`,
+                // `Mini__VerifyError` is `Mini.VerifyError`.
+                let n = short(&self.prog.structs[*i as usize].name);
+                match n.split_once("__") {
+                    Some((vm, "Verified")) => format!("Verified<{}>", vm),
+                    Some((vm, "VerifyError")) => format!("{}.VerifyError", vm),
+                    _ => n,
+                }
+            }
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
             Ty::Param(i) => format!("?T{}", i),
@@ -809,6 +831,57 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The vm named by `path` (`Mini`, `vm.Mini`) as seen from module `m`.
+    fn vm_named(&self, m: usize, path: &[Ident]) -> Option<u32> {
+        let target = match path {
+            [_] => m,
+            [md, _] => match self.scopes[m].get(&md.name) {
+                Some((Def::Module(t), _)) => *t,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        match self.scopes[target].get(&path[path.len() - 1].name) {
+            Some((Def::Vm(i), _)) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Types generated for a vm: `Verified<Mini>` (also `Mini.Verified`),
+    /// `Mini.VerifyError`, `Mini.VerifyReason`. They live in the vm's
+    /// module as `Mini__X`.
+    fn vm_type(&mut self, m: usize, path: &[Ident], args: &[TypeExpr], span: Span) -> Res<Option<Ty>> {
+        let (vm, item) = if path.len() == 1 && path[0].name == "Verified" && !self.scopes[m].contains_key("Verified") {
+            let [a] = args else {
+                return Err(Diag::new(span, "Verified takes one argument, a vm: `Verified<Mini>`"));
+            };
+            let TypeKind::Named(vp, va) = &a.kind else {
+                return Err(Diag::new(a.span, "Verified takes a vm: `Verified<Mini>`"));
+            };
+            match self.vm_named(m, vp) {
+                Some(vm) if va.is_empty() => (vm, "Verified".to_string()),
+                _ => return Err(Diag::new(a.span, "Verified takes a vm: `Verified<Mini>`")),
+            }
+        } else if path.len() == 2 && args.is_empty() {
+            match self.vm_named(m, &path[..1]) {
+                Some(vm) => (vm, path[1].name.clone()),
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        };
+        let (vm_m, decl) = &self.vm_decls[vm as usize];
+        let full = format!("{}__{}", decl.name.name, item);
+        match self.scopes[*vm_m].get(&full) {
+            Some((Def::Struct(i), _)) => Ok(Some(Ty::Struct(*i))),
+            Some((Def::Enum(i), _)) => Ok(Some(Ty::Enum(*i))),
+            _ => Err(Diag::new(
+                path[path.len() - 1].span,
+                format!("vm `{}` has no generated type `{}`", decl.name.name, item),
+            )),
+        }
+    }
+
     pub fn resolve_type(&mut self, m: usize, t: &TypeExpr) -> Res<Ty> {
         Ok(match &t.kind {
             TypeKind::Named(path, args) => {
@@ -848,6 +921,9 @@ impl<'a> Checker<'a> {
                         ));
                     }
                     return self.alias_type(a, targs, t.span);
+                }
+                if let Some(t) = self.vm_type(m, path, args, t.span)? {
+                    return Ok(t);
                 }
                 if path.len() == 1 && path[0].name == "Result" {
                     if args.len() != 2 {
@@ -1533,6 +1609,7 @@ impl<'a> Checker<'a> {
                 let defs = self.prog.structs[sid as usize].fields.clone();
                 let mut vals: Vec<Option<TExpr>> = vec![None; defs.len()];
                 for (f, v) in fields {
+                    self.check_private_field(sid, f)?;
                     let Some(idx) = defs.iter().position(|(n, _)| *n == f.name) else {
                         return Err(Diag::new(f.span, format!("no field `{}` in struct `{}`", f.name, name.name)));
                     };
@@ -2123,6 +2200,7 @@ impl<'a> Checker<'a> {
             if let Def::GenericFn(g) = def {
                 return self.generic_fn_value(g, exp, span);
             }
+            self.check_unsafe_def(cx, &def, span)?;
             return self.def_value(def, name, span);
         }
         // Types are not values: a variant of the expected type may have the
@@ -2133,9 +2211,25 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some((def, _)) = self.scopes[cx.module].get(name).cloned() {
+            self.check_unsafe_def(cx, &def, span)?;
             return self.def_value(def, name, span);
         }
         Err(Diag::new(span, format!("unknown name `{}`", name)))
+    }
+
+    /// Naming a `#[unsafe]` function (to call it or take it as a value)
+    /// needs an `unsafe { }` block.
+    pub fn check_unsafe_def(&self, cx: &FnCx, def: &Def, span: Span) -> Res<()> {
+        if let Def::Fn(id) = def {
+            if cx.unsafe_depth == 0 && self.unsafe_fns.contains(id) {
+                let name = self.prog.fns[*id as usize].name.replace("__", ".");
+                return Err(Diag::new(
+                    span,
+                    format!("`{}` is unsafe: nothing checks what it promises; wrap the call in `unsafe {{ }}`", name),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn def_value(&mut self, def: Def, name: &str, span: Span) -> Res<TExpr> {
@@ -2220,6 +2314,7 @@ impl<'a> Checker<'a> {
             return Ok(r);
         }
         if let Some(def) = self.vm_item(cx, base, &name.name) {
+            self.check_unsafe_def(cx, &def, span)?;
             return self.def_value(def, &name.name, span);
         }
         if let Some(m) = self.module_path(cx, base) {
@@ -2229,6 +2324,7 @@ impl<'a> Checker<'a> {
             if !is_pub {
                 return Err(Diag::new(name.span, format!("`{}` is private", name.name)));
             }
+            self.check_unsafe_def(cx, &def, span)?;
             return self.def_value(def, &name.name, span);
         }
         if let Some(g) = self.generic_type_path(cx, base) {
@@ -2263,6 +2359,27 @@ impl<'a> Checker<'a> {
         self.field_of(b, name, span)
     }
 
+    /// Fields whose names start with `__` are private to the file that
+    /// declares their struct. That is how generated types stay opaque:
+    /// `Vm.Verified`'s code field is reachable only from the vm's
+    /// expansion, so only `Vm.verify` (and `Vm.assume_verified`) build one.
+    fn check_private_field(&self, sid: u32, f: &Ident) -> Res<()> {
+        if !f.name.starts_with("__") {
+            return Ok(());
+        }
+        match self.struct_files.get(&sid) {
+            Some(&file) if file != f.span.file => {
+                let sname = self.prog.structs[sid as usize].name.clone();
+                let sname = sname.rsplit('.').next().unwrap_or(&sname).replace("__", ".");
+                Err(Diag::new(
+                    f.span,
+                    format!("field `{}` of `{}` is private to the file that declares it", f.name, sname),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn field_of(&mut self, b: TExpr, name: &Ident, span: Span) -> Res<TExpr> {
         let b = self.auto_deref(b);
         match b.ty.clone() {
@@ -2276,6 +2393,7 @@ impl<'a> Checker<'a> {
                         return Ok(mk(Ty::Slice(Box::new(et)), TK::Trailing(obj), span));
                     }
                 }
+                self.check_private_field(sid, name)?;
                 let fields = &self.prog.structs[sid as usize].fields;
                 let Some(idx) = fields.iter().position(|(n, _)| *n == name.name) else {
                     return Err(Diag::new(
@@ -2590,6 +2708,7 @@ impl<'a> Checker<'a> {
                         // `Vm.disasm(code, &out)`: generic over the sink.
                         return self.generic_call(cx, g, vec![], vec![], args, exp, span);
                     }
+                    self.check_unsafe_def(cx, &def, callee.span)?;
                     let f = self.def_value(def, &name.name, callee.span)?;
                     return self.finish_call(cx, f, vec![], args, span);
                 }

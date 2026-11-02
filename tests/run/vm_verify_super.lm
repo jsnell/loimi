@@ -44,10 +44,10 @@ vm V {
     entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
 }
 
-fn show(r: ?u64) {
+fn show(r: Result<Verified<V>, V.VerifyError>) {
     match r {
-        None => io.println("ok"),
-        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); }
     }
 }
 
@@ -95,7 +95,7 @@ fn main() {
     code[0] = V.LD(0);
     code[1] = V.MOV(1, 0);
     code[2] = V.RET(1);
-    V.optimize(c[0..3]);
+    V.optimize_words(c[0..3]);
     names(c[0..3]);
     var regs: [i64; 2] = [0; 2];
     io.print_int(V.run(&code[0], &regs[0]));

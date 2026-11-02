@@ -5,6 +5,7 @@ import std.gc;
 import std.mem;
 import std.hash;
 import std.text;
+import vm.{Mini};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
@@ -37,6 +38,12 @@ pub object Lines { data: [u32] }
 /// enclosing frame", otherwise "upvalue `low byte` of the enclosing closure".
 pub object UpDescs { data: [u32] }
 pub object Protos { data: [Gc<Proto>] }
+/// Bytecode words: the storage behind a Proto's `code`.
+pub object Code { data: [u32] }
+/// A function prototype. `code` is the proof that `words` passed
+/// Mini.verify against this prototype's nregs, nupvals and its constant
+/// and child counts (compile.lm, `finish`); none of these change after.
+/// Every call jumps to a `code`, so every function that runs was verified.
 pub object Proto {
     name: Gc<Str>,
     nparams: u32,
@@ -46,7 +53,10 @@ pub object Proto {
     lines: Gc<Lines>,
     protos: Gc<Protos>,
     updesc: Gc<UpDescs>,
-    code: [u32],
+    code: Verified<Mini>,
+    /// Owns `code`'s words (the proof holds a plain slice, which the
+    /// collector does not trace).
+    words: Gc<Code>,
 }
 /// A captured variable. While open, `v` points at the variable's stack
 /// slot and `next` links the open list (sorted by level, highest first).

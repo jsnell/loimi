@@ -26,7 +26,7 @@ fn dump(p: Gc<value.Proto>) {
     b.push_str(" (nregs ");
     b.push_int(p.nregs as i64);
     b.push_str(")\n");
-    Scheme.disasm(p.code, &b);
+    Scheme.disasm(p.code.words(), &b);
     io.print(b.as_str());
     for i in 0..p.protos.data.len { dump(p.protos.data[i]); }
 }

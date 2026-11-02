@@ -1,4 +1,4 @@
-// `Vm.deopt(code)` rewrites every instruction back to its family's
+// `Vm.deopt(v)` rewrites every instruction back to its family's
 // generic op and splits superinstructions, e.g. before serializing
 // quickened code. Shown with the disassembler.
 // matrix: dispatch
@@ -32,16 +32,18 @@ fn main() {
     at = Q.emit.ADD(code[..], at, 0, 1);
     at = Q.emit.ADD(code[..], at, 0, 2);
     at = Q.emit.RET(code[..], at, 0);
-    Q.optimize(code[..at]);
+    // optimize and deopt take and return the proof: both keep code verified.
+    let Ok(v0) = Q.verify(code[..at]) else { return; };
+    let v = Q.optimize(v0);
     var regs: [i64; 1] = [0];
-    io.print_int(Q.run(&code[0], &regs[0])); io.println("");
+    io.print_int(Q.run(v.start(), &regs[0])); io.println("");
     var b = text.StrBuf.new();
-    Q.disasm(code[..at], &b);
-    Q.deopt(code[..at]);
+    Q.disasm(v.words(), &b);
+    let d = Q.deopt(v);
     b.push_str("--\n");
-    Q.disasm(code[..at], &b);
+    Q.disasm(d.words(), &b);
     io.print(b.as_str());
-    io.print_int(Q.run(&code[0], &regs[0])); io.println("");
+    io.print_int(Q.run(d.start(), &regs[0])); io.println("");
 }
 // expect: 44
 // expect:     0  LOAD_ADD_ONE

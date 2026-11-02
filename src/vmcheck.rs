@@ -61,6 +61,11 @@ pub struct VmInfo {
     /// Calls between plain vm functions (caller, callee), to propagate
     /// `sync_effects`.
     pub fn_calls: Vec<(FnId, FnId)>,
+    /// The generated proof type `Vm__Verified` (`Verified<Vm>`).
+    pub verified: u32,
+    /// `#[require_verified]`: entries start only in verified code (`jump v`
+    /// with `v: Verified<Vm>`), unless inside `unsafe { }`.
+    pub require_verified: bool,
 }
 
 /// An inline cache layout: per field its name, type and first word
@@ -121,6 +126,8 @@ pub struct HandlerCx {
     /// Parameters declared `cache Name` in scope: (name, handle local,
     /// cache layout). The handle points to the op's first cache word.
     pub cache_params: Vec<(String, LocalId, usize)>,
+    /// In an entry (or a `-> never` vm function inlined into one).
+    pub entry: bool,
 }
 
 impl HandlerCx {
@@ -141,6 +148,7 @@ impl HandlerCx {
             shared: None,
             inlining: vec![],
             cache_params: vec![],
+            entry: false,
         }
     }
 }
@@ -551,6 +559,11 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         sync: d.sync.clone(),
         reload: d.reload.clone(),
         fn_calls: vec![],
+        verified: match c.scopes[m].get(&format!("{}__Verified", d.name.name)) {
+            Some((Def::Struct(sid), _)) => *sid,
+            _ => unreachable!("vmexpand generates Vm__Verified"),
+        },
+        require_verified: d.attrs.has("require_verified"),
     });
 
     // Bodies.
@@ -788,6 +801,17 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
                 mk(Ty::i64(), TK::Local(l), span)
             }
             (None, None, None) => {
+                if h.entry && c.vms[vmi].require_verified && cx.unsafe_depth == 0 {
+                    // The shared copy is checked once, not as part of the
+                    // entry, so its jumps are not held to the entry's rule.
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "`{}` is `#[require_verified]`: an entry cannot reach the shared copy of `{}` (a call from a `cold` block); call it on the hot path",
+                            c.vms[vmi].name, name
+                        ),
+                    ));
+                }
                 c.vms[vmi].never_fns[j].no_op_calls.push(span);
                 int(0)
             }
@@ -1026,7 +1050,7 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
         params.push(cx.declare(&p.name.name, t.clone(), true));
     }
     let state = declare_state(c, vm, &mut cx);
-    cx.vm = Some(HandlerCx { is_handler: false, ..HandlerCx::new(vm, state.clone()) });
+    cx.vm = Some(HandlerCx { is_handler: false, entry: true, ..HandlerCx::new(vm, state.clone()) });
     let b = c.block(&mut cx, &e.body, Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let mut inits: Vec<TStmt> = state.iter().map(|&s| TStmt::Let(s, None)).collect();
@@ -1126,7 +1150,27 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
             never(TVm::Jump(Box::new(pc())))
         }
         VmExpr::Jump(t) => {
-            let t = c.expr_coerce(cx, t, &pc_ty)?;
+            // `jump v` with `v: Verified<Vm>` starts at the verified code.
+            let te = c.expr(cx, t, Some(&pc_ty))?;
+            let vsid = c.vms[vmi].verified;
+            if te.ty == Ty::Struct(vsid) {
+                let sp = te.span;
+                let wt = Ty::Int(c.vms[vmi].word);
+                let code = mk(Ty::Slice(Box::new(wt.clone())), TK::Field(Box::new(te), 0), sp);
+                let start = mk(Ty::Ptr(Box::new(wt)), TK::Field(Box::new(code), 0), sp);
+                return never(TVm::Jump(Box::new(c.coerce(start, &pc_ty)?)));
+            }
+            if h.entry && c.vms[vmi].require_verified && cx.unsafe_depth == 0 {
+                let vname = c.vms[vmi].name.clone();
+                return Err(Diag::new(
+                    t.span,
+                    format!(
+                        "`{vname}` is `#[require_verified]`: an entry starts only in verified code, `jump v` with `v: Verified<{vname}>` (from `{vname}.verify`); found `{}`",
+                        c.ty_name(&te.ty)
+                    ),
+                ));
+            }
+            let t = c.coerce(te, &pc_ty)?;
             never(TVm::Jump(Box::new(t)))
         }
         VmExpr::Exit(e) => {

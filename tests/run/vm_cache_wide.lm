@@ -96,10 +96,10 @@ fn main() {
     at = V.emit.HITS(c, at, 3);
     at = V.emit.RET(c, at, 0);
     io.print_int(at as i64); io.println("");
-    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print_int(i as i64); io.println(""); } }
+    match V.verify(c[0..at], 4) { Ok(_) => io.println("verified"), Err(e) => { io.print_int(e.at as i64); io.println(""); } }
     // A jump into the cache is rejected.
     code[top + 12] = V.JNZ(1, -5);
-    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); } }
+    match V.verify(c[0..at], 4) { Ok(_) => io.println("verified"), Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); } }
     code[top + 12] = V.JNZ(1, -12);
 
     var shape = Shape { id: 1, slot: 2 };
@@ -118,9 +118,9 @@ fn main() {
 
     // optimize fuses GETPROP_MONO; ADD (10 + 1 words), and the fused code
     // still verifies and runs.
-    V.optimize(c[0..at]);
+    V.optimize_words(c[0..at]);
     io.print(V.op_name(code[top])); io.println("");
-    match V.verify(c[0..at], 4) { None => io.println("verified"), Some(i) => { io.print_int(i as i64); io.println(""); } }
+    match V.verify(c[0..at], 4) { Ok(_) => io.println("verified"), Err(e) => { io.print_int(e.at as i64); io.println(""); } }
     regs = [0, 2, 0, 0];
     io.print_int(V.run(&code[0], &regs[0], &obj)); io.println("");
     io.print_int(code[top + 4] as i64); io.println("");

@@ -32,7 +32,7 @@ vm M {
 fn main() {
     var code: [u32; 8] = [M.GETG(0, 9), M.SUBK(0, 0, 2), M.CALL(0), M.ADD(2, 0, 1), M.RET(2), 0, 0, 0];
     var regs: [i64; 4] = [0; 4];
-    M.optimize(code[..5]);
+    M.optimize_words(code[..5]);
     for i in 0..5 { if i > 0 { io.print(" "); } io.print(M.op_name(code[i])); }
     io.println("");
     io.print_int(M.run(&code[0], &regs[0])); io.println("");
