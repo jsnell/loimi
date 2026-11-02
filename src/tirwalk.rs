@@ -204,3 +204,105 @@ fn append_rest(branch: &mut TExpr, rest: &[TStmt], tail: &Option<B>) {
     t.ty = Ty::Never;
     branch.ty = Ty::Never;
 }
+
+/// Call `f` on every top-level pattern in `e` (match arms, `if let` and
+/// `let` patterns), at any depth of expression nesting.
+pub fn for_each_pat(e: &TExpr, f: &mut dyn FnMut(&TPat)) {
+    let go = |x: &TExpr, f: &mut dyn FnMut(&TPat)| for_each_pat(x, f);
+    match &e.kind {
+        TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
+        TK::Global(_) | TK::Continue(_) | TK::Unreachable => {}
+        TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a, f),
+        TK::Try(a) | TK::Trailing(a) => go(a, f),
+        TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
+            go(a, f);
+            go(b, f);
+        }
+        TK::SliceRange(a, lo, hi) => {
+            go(a, f);
+            for x in [lo, hi].into_iter().flatten() {
+                go(x, f);
+            }
+        }
+        TK::Call(c, args) => {
+            go(c, f);
+            args.iter().for_each(|a| go(a, f));
+        }
+        TK::Intrinsic(_, args) | TK::Struct(args) | TK::Tuple(args) | TK::Array(args) | TK::Variant(_, args) => {
+            args.iter().for_each(|a| go(a, f))
+        }
+        TK::Block(stmts, tail) => {
+            for s in stmts {
+                match s {
+                    TStmt::Let(_, init) => {
+                        if let Some(x) = init {
+                            go(x, f);
+                        }
+                    }
+                    TStmt::LetPat(p, x, els) => {
+                        go(x, f);
+                        if let Some(e) = els {
+                            go(e, f);
+                        }
+                        f(p);
+                    }
+                    TStmt::Expr(x) | TStmt::Defer(x) => go(x, f),
+                }
+            }
+            if let Some(t) = tail {
+                go(t, f);
+            }
+        }
+        TK::If(conds, then, els) => {
+            for c in conds {
+                match c {
+                    TCond::Expr(x) => go(x, f),
+                    TCond::Let(p, x) => {
+                        go(x, f);
+                        f(p);
+                    }
+                }
+            }
+            go(then, f);
+            if let Some(x) = els {
+                go(x, f);
+            }
+        }
+        TK::Match(s, arms) => {
+            go(s, f);
+            for a in arms {
+                f(&a.pat);
+                if let Some(g) = &a.guard {
+                    go(g, f);
+                }
+                go(&a.body, f);
+            }
+        }
+        TK::Loop { body, step, .. } => {
+            go(body, f);
+            if let Some(s) = step {
+                go(s, f);
+            }
+        }
+        TK::Break(_, v) | TK::Return(v) => {
+            if let Some(x) = v {
+                go(x, f);
+            }
+        }
+        TK::New { heap, init, len } => {
+            go(heap, f);
+            go(init, f);
+            if let Some(l) = len {
+                go(l, f);
+            }
+        }
+        TK::Vm(v) => match v {
+            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) => go(a, f),
+            TVm::Synced(a, b) => {
+                go(a, f);
+                go(b, f);
+            }
+            TVm::Become(_) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+        },
+    }
+}

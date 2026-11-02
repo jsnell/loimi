@@ -28,6 +28,9 @@ pub struct Codegen<'p> {
     /// Outlined cold blocks waiting to be emitted: (handler, body, captured locals, symbol).
     pub cold_queue: Vec<(FnId, TExpr, Vec<LocalId>, String)>,
     pub cold_count: u32,
+    /// Per function: immutable f64 locals bound only from the unboxed
+    /// variant of a nanbox value (see `values::nan_safe`).
+    pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -109,6 +112,7 @@ impl<'p> Codegen<'p> {
             decls: Decls::default(),
             str_count: 0,
             mark_fns: Default::default(),
+            nan_safe: Default::default(),
             cold_queue: vec![],
             cold_count: 0,
         }

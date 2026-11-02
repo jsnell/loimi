@@ -1,0 +1,64 @@
+// NaN canonicalization in nanbox values: arithmetic on unboxed floats
+// skips it (hardware NaNs from canonical inputs are valid encodings), but
+// floats from elsewhere are still canonicalized.
+import std.io;
+
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Ref(*Obj),
+}
+
+fn kind(v: V) -> str {
+    match v {
+        Num(x) => if x != x { "nan" } else { "num" },
+        Int(_) => "int",
+        Ref(_) => "ref",
+    }
+}
+
+/// Arithmetic on unboxed operands: built without canonicalization.
+fn arith(a: V, b: V, op: i32) -> V {
+    match (a, b) {
+        (Num(x), Num(y)) => match op {
+            0 => Num(x + y),
+            1 => Num(x - y),
+            2 => Num(x * y),
+            _ => Num(-(x / y)),
+        },
+        _ => Int(0),
+    }
+}
+
+fn forged(bits: u64) -> V {
+    // Not provably NaN-safe: must be canonicalized.
+    V.Num(f64.from_bits(bits))
+}
+
+fn main() {
+    let inf = arith(V.Num(1.0), V.Num(0.0), 3);
+    io.println(kind(inf));
+    let z = V.Num(0.0);
+    let nan = arith(z, z, 3);
+    io.println(kind(nan));
+    io.println(kind(arith(nan, V.Num(1.0), 0)));
+    io.println(kind(arith(inf, inf, 1)));
+    io.println(kind(arith(inf, z, 2)));
+    io.println(kind(arith(nan, nan, 3)));
+    // A NaN whose bits look like a tagged pointer.
+    io.println(kind(forged(0xFFFB000000001234)));
+    io.println(kind(forged(0xFFF9000000000007)));
+    match arith(V.Num(1.5), V.Num(2.25), 2) { Num(x) => io.print_f64(x), _ => io.print("?") }
+    io.println("");
+}
+// expect: num
+// expect: nan
+// expect: nan
+// expect: nan
+// expect: nan
+// expect: nan
+// expect: nan
+// expect: nan
+// expect: 3.375

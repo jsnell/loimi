@@ -113,6 +113,65 @@ fn payload_bits(g: &mut FnGen, pt: &Ty, v: &str) -> String {
     }
 }
 
+/// Locals of the current function that hold an f64 unboxed from a nanbox
+/// value's `unboxed` variant, and are bound nowhere else and immutable.
+fn nan_safe_local(g: &mut FnGen, l: LocalId) -> bool {
+    let fid = g.fid;
+    if !g.cg.nan_safe.contains_key(&fid) {
+        let p = g.p();
+        let f = &p.fns[fid as usize];
+        let mut good = std::collections::HashSet::new();
+        let mut bad = std::collections::HashSet::new();
+        fn rec(p: &Program, pat: &TPat, under: bool, good: &mut std::collections::HashSet<LocalId>, bad: &mut std::collections::HashSet<LocalId>) {
+            match &pat.kind {
+                TPK::Bind(l) => {
+                    if under {
+                        good.insert(*l);
+                    } else {
+                        bad.insert(*l);
+                    }
+                }
+                TPK::Variant(idx, subs) => {
+                    let unboxed = match &pat.ty {
+                        Ty::Value(v) => {
+                            let d = &p.values[*v as usize];
+                            d.repr == ValueRepr::NanBox && d.variants[*idx as usize].unboxed
+                        }
+                        _ => false,
+                    };
+                    subs.iter().for_each(|s| rec(p, s, unboxed, good, bad));
+                }
+                TPK::Tuple(ps) | TPK::Or(ps) => ps.iter().for_each(|s| rec(p, s, false, good, bad)),
+                _ => {}
+            }
+        }
+        if let Some(b) = &f.body {
+            crate::tirwalk::for_each_pat(b, &mut |pat| rec(p, pat, false, &mut good, &mut bad));
+        }
+        let set = good.into_iter().filter(|l| !bad.contains(l) && !f.locals[*l as usize].mutable).collect();
+        g.cg.nan_safe.insert(fid, set);
+    }
+    g.cg.nan_safe[&fid].contains(&l)
+}
+
+/// Whether the f64 expression `e` can only be a NaN that hardware made
+/// from canonical inputs: such NaNs have a zero payload (0x7FF8.. or
+/// 0xFFF8..), which is already a valid `unboxed` encoding, so building
+/// the value needs no canonicalization. Leaves are literals, int-to-float
+/// casts, and locals unboxed from the value (always canonical).
+fn nan_safe(g: &mut FnGen, e: &TExpr) -> bool {
+    use crate::ast::{BinOp, UnOp};
+    match &e.kind {
+        TK::Float(x) => !x.is_nan(),
+        TK::Cast(inner) => matches!(inner.ty, Ty::Int(_)),
+        TK::Local(l) => nan_safe_local(g, *l),
+        TK::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => nan_safe(g, a) && nan_safe(g, b),
+        TK::Unary(UnOp::Neg, a) => nan_safe(g, a),
+        TK::Intrinsic(Intr::Sqrt | Intr::Floor, args) => args.iter().all(|a| nan_safe(g, a)),
+        _ => false,
+    }
+}
+
 pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) -> String {
     let d = def(g, t);
     let var = &d.variants[idx as usize];
@@ -120,6 +179,9 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
         ValueRepr::NanBox => {
             if var.unboxed {
                 let bits = g.inst(format!("bitcast double {} to i64", vals[0]));
+                if nan_safe(g, &args[0]) {
+                    return bits;
+                }
                 let nan = g.inst(format!("fcmp uno double {}, {}", vals[0], vals[0]));
                 return g.inst(format!("select i1 {}, i64 {}, i64 {}", nan, CANONICAL_NAN as i64, bits));
             }
