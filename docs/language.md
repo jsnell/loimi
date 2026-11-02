@@ -1061,12 +1061,13 @@ between threads.
 or anything else the collector traces: the collector does not scan
 bytecode, so the reference would neither keep its target alive nor be
 updated if it moved. (`weak` fields, which the GC would clear when their
-target dies, are not implemented either.) Cache something whose
+target dies, are not implemented either: the collector does not scan
+bytecode, so it could not clear them.) Cache something whose
 lifetime the interpreter controls instead: a shape id that is never
 reused, a pointer to a structure that is never freed or moved (shapes
 kept alive by a table), or a version number, and validate it on use.
 Weak caching of GC objects belongs in the library, where it can be
-written as a side table that the root scanner or a sweeper clears.
+written as a side table that a sweeper clears, or with `std.gc.Weak`.
 
 ### 7.1a The following instruction: `then`
 
@@ -1244,8 +1245,18 @@ enough to make it precise and cheap:
   through the heap policy's barrier, which is a compile-time parameter
   (`#![heap = std.gc.MarkSweep]`). Non-incremental mark-sweep has no barrier,
   so stores cost nothing. A generational policy adds a card-mark at each such
-  store, and the source does not change. (*Not yet implemented:* `std.gc`
-  mark-sweep is the only policy, and there is no `heap` attribute.)
+  store, and the source does not change. (*As implemented:* there is no
+  `heap` attribute. Every such store, including `o.items.ptr[i] = v`,
+  calls `std.gc.barrier(o)`, an object-logging barrier that tests one
+  header byte, and a heap is made generational at run time with
+  `heap.set_generational(true)`; see
+  [`stdlib/gc.md`](stdlib/gc.md#as-implemented). Stores through other
+  raw pointers into objects need `gc.write_barrier(h, obj)`, and
+  `heap.set_verify(true)` finds the missing ones.)
+- **Weak references** are library types: `heap.new_weak(x)` gives a
+  `Gc<gc.Weak<T>>` that reads None once `x` died, and
+  `gc.Ephemerons<K, V>` maps objects to values that only the key keeps
+  alive. There is no `weak` field qualifier.
 - **Roots.** These come from three places: the VM stacks (described by the
   `state` kinds and the `ctx.sync` area), compiler-managed temporary roots at
   effectful calls (section 5), and explicit `Root<T>` handles for host data

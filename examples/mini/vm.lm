@@ -397,7 +397,7 @@ pub vm Mini {
             let i = cache.slot as u64;
             if likely(i < tab.hcap) {
                 let p = tab.hptr + 2 * i;
-                if p[0] == key { p[1] = v; value.hbar(tab); next }
+                if p[0] == key { p[1] = v; value.tbar(tab); next }
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
@@ -419,7 +419,7 @@ pub vm Mini {
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.abar(tab); next }
+            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
         }
         if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
         if let T(tab) = t {
@@ -435,7 +435,7 @@ pub vm Mini {
     op SETINDEXK(t: reg, key: reg, v: kst) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.abar(tab); next }
+            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
         }
         if let T(tab) = t {
             if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }

@@ -2,8 +2,9 @@
 // generational (sticky mark bits).
 //
 // Small objects (header included, up to 512 bytes) come from size-class
-// free lists in 64 KiB chunks, aligned to their size (carved out of 1 MiB
-// segments). The first slot of a chunk is its header, which points at the
+// free lists in 64 KiB chunks, aligned to their size (carved out of 2 MiB
+// segments, aligned so that they can be huge pages). The start of a chunk
+// is its header, which points at the
 // heap's remembered set, so a write barrier finds it from an object's
 // address alone. Each chunk keeps its own free list; per size class, the
 // allocator takes chunks with free slots in address order. Larger
@@ -48,7 +49,9 @@ extern "C" fn loimi_shadow_top() -> *ShadowFrame;
 extern "C" fn loimi_type_name(tid: u32) -> str;
 extern "C" fn calloc(n: u64, size: u64) -> *u8;
 extern "C" fn free(p: *u8);
-extern "C" fn posix_memalign(out: **u8, align: u64, size: u64) -> i32;
+extern "C" fn mmap(addr: *u8, len: u64, prot: i32, flags: i32, fd: i32, off: i64) -> *u8;
+extern "C" fn munmap(addr: *u8, len: u64) -> i32;
+extern "C" fn madvise(addr: *u8, len: u64, advice: i32) -> i32;
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn abort();
 extern "C" fn getenv(name: *u8) -> *u8;
@@ -67,8 +70,12 @@ const HEADER: u64 = 16;
 /// objects of up to 16 * c bytes, for c in 1..NCLASS.
 const NCLASS: u64 = 33;
 const CHUNK: u64 = 65536;
-/// Chunks are carved out of segments of this many.
-const SEG_CHUNKS: u64 = 16;
+/// Chunks are carved out of segments of this many (2 MiB, mapped aligned
+/// to their size: a transparent huge page each. With 1 MiB segments from
+/// `posix_memalign`, which the kernel backs with 4 KiB pages, MiniJS's
+/// richards ran 7% slower than with chunks in the brk heap.)
+const SEG_CHUNKS: u64 = 32;
+const SEG: u64 = 2097152;
 /// The `tid` of a free small-object slot.
 const FREE: u16 = 0xFFFF;
 
@@ -87,7 +94,11 @@ struct Header { size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
 
 fn next_free(hd: *Header) -> *Header { hd.len as *Header }
 
-/// A chunk of slots of `size` bytes each; slot 0 holds the `ChunkHead`.
+/// A chunk of `n` slots of `size` bytes each, starting at `base`: after
+/// the `ChunkHead` at the start of the (aligned) chunk, and an offset
+/// that varies from chunk to chunk (cache coloring: with every chunk
+/// aligned alike, objects at the same place in different chunks would
+/// compete for the same cache sets).
 /// `free` lists its free slots while it is not the size class's current
 /// chunk, `nfree` counts them, and `next` links the class's chunks with
 /// free slots (chunk index + 1; 0 ends the list). `used` is set while the
@@ -168,10 +179,14 @@ pub struct Heap {
     minor: bool,
     /// The next collection must be major.
     want_major: bool,
-    /// Allocation budget between minor collections (bytes).
+    /// Cap on the allocation budget between minor collections (0: none).
     nursery: u64,
     /// Major collection once the old generation exceeds this.
     major_limit: u64,
+    /// Live bytes after the last full collection (the nursery's budget is
+    /// computed from them, not from the old generation, which also holds
+    /// promoted objects that have died since).
+    major_live: u64,
     /// Check the barrier invariant at every collection (`set_verify`).
     verify: bool,
     verifying: bool,
@@ -218,8 +233,9 @@ pub fn Heap.new() -> Heap {
         sticky: false,
         minor: false,
         want_major: false,
-        nursery: 4 << 20,
+        nursery: 0,
         major_limit: 0,
+        major_live: 0,
         verify: false,
         verifying: false,
         vparent: 0 as *u8,
@@ -233,40 +249,43 @@ pub fn Heap.new() -> Heap {
 /// Called by compiled code for `new`. The object is zeroed.
 pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
-    if c < NCLASS {
-        let hd = h.free[c];
-        if (hd as u64) != 0 {
-            h.free[c] = next_free(hd);
-            hd.tid = tid as u16;
-            hd.len = n;
-            h.count += 1;
-            h.allocated += c << 4;
-            let p = hd as *u8 + HEADER;
-            mem.memset(p, 0, size);
-            return p;
-        }
+    if c >= NCLASS { return alloc_large(h, size, tid, n); }
+    var hd = h.free[c];
+    if (hd as u64) == 0 { hd = refill(h, c); }
+    h.free[c] = next_free(hd);
+    // tid, mark and flags in one store, on the path after the refill: the
+    // flags are 0 (young), which lets LLVM drop the write barriers of
+    // stores into the new object that follow.
+    *((hd as *u8 + 4) as *u32) = tid & 0xFFFF;
+    hd.len = n;
+    h.count += 1;
+    h.allocated += c << 4;
+    let p = hd as *u8 + HEADER;
+    mem.memset(p, 0, size);
+    p
+}
+
+/// Make the next chunk of class `c` with free slots (or a new one) the
+/// current chunk; returns its first free slot.
+#[inline(never)]
+fn refill(h: *Heap, c: u64) -> *Header {
+    let a = h.avail[c];
+    if a != 0 {
+        let ch = h.chunks.ptr_at(a - 1);
+        h.avail[c] = ch.next;
+        ch.next = 0;
+        ch.used = true;
+        h.free[c] = ch.free;
+        ch.free = 0 as *Header;
+        ch.nfree = 0;
+    } else {
+        add_chunk(h, c);
     }
-    alloc_slow(h, size, tid, n)
+    h.free[c]
 }
 
 #[inline(never)]
-fn alloc_slow(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
-    let c = (HEADER + size + 15) >> 4;
-    if c < NCLASS {
-        let a = h.avail[c];
-        if a != 0 {
-            let ch = h.chunks.ptr_at(a - 1);
-            h.avail[c] = ch.next;
-            ch.next = 0;
-            ch.used = true;
-            h.free[c] = ch.free;
-            ch.free = 0 as *Header;
-            ch.nfree = 0;
-        } else {
-            add_chunk(h, c);
-        }
-        return alloc(h, size, tid, n);
-    }
+fn alloc_large(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let p = calloc(1, 16 + HEADER + size);
     if (p as u64) == 0 { oom(); }
     let head = p as *ChunkHead;
@@ -288,11 +307,25 @@ fn oom() {
     abort();
 }
 
+/// A fresh segment of SEG bytes aligned to SEG (zeroed, from mmap).
+fn new_segment() -> *u8 {
+    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS.
+    let raw = mmap(0 as *u8, 2 * SEG, 3, 0x22, -1, 0);
+    if (raw as i64) == -1 { oom(); }
+    let a = raw as u64;
+    let start = (a + SEG - 1) & !(SEG - 1);
+    if start > a { munmap(raw, start - a); }
+    let end = a + 2 * SEG;
+    if end > start + SEG { munmap((start + SEG) as *u8, end - start - SEG); }
+    let seg = start as *u8;
+    madvise(seg, SEG, 14);   // MADV_HUGEPAGE
+    seg
+}
+
 /// A new chunk for class `c`, made its current chunk.
 fn add_chunk(h: *Heap, c: u64) {
     if h.seg_left == 0 {
-        var seg = 0 as *u8;
-        if posix_memalign(&seg, CHUNK, SEG_CHUNKS * CHUNK) != 0 { oom(); }
+        let seg = new_segment();
         h.segments.push(seg);
         h.seg_next = seg;
         h.seg_left = SEG_CHUNKS;
@@ -301,15 +334,17 @@ fn add_chunk(h: *Heap, c: u64) {
     h.seg_next = base + CHUNK;
     h.seg_left -= 1;
     let size = c << 4;
-    let n = CHUNK / size;
     let head = base as *ChunkHead;
     head.rs = h.rs;
     head.pad = 0;
+    let start = 16 + ((h.chunks.len * 37 + 11) % 64) * 64;
+    let n = (CHUNK - start) / size;
+    let slots = base + start;
     var list = 0 as *Header;
     var i = n;
-    while i > 1 {
+    while i > 0 {
         i -= 1;
-        let hd = (base + i * size) as *Header;
+        let hd = (slots + i * size) as *Header;
         hd.size = size as u32;
         hd.tid = FREE;
         hd.mark = 0;
@@ -317,7 +352,7 @@ fn add_chunk(h: *Heap, c: u64) {
         hd.len = list as u64;
         list = hd;
     }
-    h.chunks.push(Chunk { base: base, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true });
+    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true });
     h.free[c] = list;
 }
 
@@ -468,7 +503,10 @@ pub fn collect(h: *Heap) uses gc {
     }
     let t1 = if h.stats { now_ns() } else { 0 };
     let keep = h.gen;
+    // Bytes of the survivors, and of those that were young (no LOG flag:
+    // in a generational heap every old object has it at this point).
     var live: u64 = 0;
+    var promoted: u64 = 0;
     var freed: u64 = 0;
     // Small objects: sweep the chunks (in a minor collection, those
     // allocated from), rebuild their free lists in address order, and
@@ -484,12 +522,13 @@ pub fn collect(h: *Heap) uses gc {
             var head = 0 as *Header;
             var nfree: u64 = 0;
             var i = ch.n;
-            while i > 1 {
+            while i > 0 {
                 i -= 1;
                 let hd = (ch.base + i * ch.size) as *Header;
                 if hd.tid != FREE {
                     if hd.mark != 0 {
                         if keep {
+                            if hd.flags == 0 { promoted += ch.size; }
                             hd.flags = LOG;
                         } else {
                             hd.mark = 0;
@@ -530,6 +569,7 @@ pub fn collect(h: *Heap) uses gc {
         let cur = h.large.at(i);
         if cur.mark != 0 {
             if keep {
+                if cur.flags == LARGE { promoted += cur.size as u64; }
                 cur.flags = LARGE | LOG;
             } else {
                 cur.mark = 0;
@@ -551,12 +591,13 @@ pub fn collect(h: *Heap) uses gc {
     h.sticky = keep;
     if minor {
         h.minors += 1;
-        h.live_bytes += live;
+        h.live_bytes += promoted;
         if h.live_bytes > h.major_limit { h.want_major = true; }
     } else {
         h.live_bytes = live;
         h.want_major = false;
         h.major_limit = live + budget(h, live);
+        h.major_live = live;
     }
     h.minor = false;
     // In stress mode a generational heap still runs a major collection
@@ -589,7 +630,7 @@ fn clear_marks(h: *Heap) {
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
         var i = ch.n;
-        while i > 1 {
+        while i > 0 {
             i -= 1;
             let hd = (ch.base + i * ch.size) as *Header;
             hd.mark = 0;
@@ -609,17 +650,17 @@ fn clear_marks(h: *Heap) {
 /// The allocation budget until the next collection.
 fn next_threshold(h: *Heap) -> u64 {
     if h.stress {
-        // A generational heap under stress collects after 0 to 4 KiB of
-        // allocation (varying), not at every safepoint: objects must stay
-        // young across a few safepoints for stores into old objects to
-        // exercise the write barrier.
-        if !h.gen { return 0; }
+        // With verify on, a generational heap under stress collects after
+        // 0 to 4 KiB of allocation (varying), not at every safepoint:
+        // objects must stay young across a few safepoints for stores into
+        // old objects to exercise the write barrier.
+        if !(h.gen and h.verify) { return 0; }
         return (eph_hash(h.collections) & 4095) as u64;
     }
     if !h.gen { return budget(h, h.live_bytes); }
-    // Never let the nursery outgrow what a full collection would allow.
-    let b = budget(h, h.live_bytes);
-    if h.nursery < b { h.nursery } else { b }
+    // The nursery is the growth budget, or less if capped (`set_nursery`).
+    let b = budget(h, h.major_live);
+    if h.nursery != 0 and h.nursery < b { h.nursery } else { b }
 }
 
 /// Bytes that may be allocated after a collection that left `live` bytes.
@@ -664,6 +705,7 @@ pub fn Heap.set_stress(h: *Heap, on: bool) {
 pub fn Heap.set_generational(h: *Heap, on: bool) {
     h.gen = on;
     if on {
+        h.major_live = h.live_bytes;
         h.major_limit = h.live_bytes + budget(h, h.live_bytes);
     } else {
         h.want_major = false;
@@ -671,8 +713,10 @@ pub fn Heap.set_generational(h: *Heap, on: bool) {
     h.threshold = next_threshold(h);
 }
 
-/// The allocation budget between minor collections, in bytes (default 4
-/// MiB; never more than a full collection's budget).
+/// Cap the allocation budget between minor collections at `bytes` (0, the
+/// default: no cap, the same budget as between full collections, from
+/// `set_growth`). A small nursery shortens minor pauses but promotes more
+/// short-lived objects, which then wait for a major collection.
 pub fn Heap.set_nursery(h: *Heap, bytes: u64) {
     h.nursery = bytes;
     h.threshold = next_threshold(h);
@@ -686,11 +730,12 @@ pub fn Heap.set_nursery(h: *Heap, bytes: u64) {
 /// meant for tests, with `set_stress`.
 pub fn Heap.set_verify(h: *Heap, on: bool) {
     h.verify = on;
+    h.threshold = next_threshold(h);
 }
 
 /// Collect if enough has been allocated since the last collection.
 pub fn maybe_collect(h: *Heap) uses gc {
-    if h.allocated > h.threshold or (h.stress and !h.gen) {
+    if h.allocated > h.threshold or (h.stress and !(h.gen and h.verify)) {
         collect(h);
     }
 }
@@ -702,7 +747,7 @@ fn verify_heap(h: *Heap) {
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
         var i = ch.n;
-        while i > 1 {
+        while i > 0 {
             i -= 1;
             let hd = (ch.base + i * ch.size) as *Header;
             if hd.tid != FREE and hd.mark != 0 and (hd.flags & LOG) != 0 {
@@ -937,7 +982,7 @@ fn eph_sweep<K, V>(h: *Heap, data: *u8) {
 pub fn Heap.free(h: *Heap) {
     for i in 0..h.large.len { free(h.large.at(i) as *u8 - 16); }
     h.large.free();
-    for i in 0..h.segments.len { free(h.segments.at(i)); }
+    for i in 0..h.segments.len { munmap(h.segments.at(i), SEG); }
     h.segments.free();
     h.chunks.free();
     for c in 0..NCLASS {

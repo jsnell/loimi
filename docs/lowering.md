@@ -454,6 +454,46 @@ call.
   Header and field initialization follow. Only the `cold` refill carries
   effects, so only the refill path syncs.
 
+As implemented, the barrier is not a policy parameter: it is always
+compiled in, and the heap decides at run time whether it does anything.
+After a store of a traced value (`Gc`, a `value` type with reference
+variants, or an option, tuple, struct or array holding one) into a place
+inside an object, the compiler emits `call @std.gc.barrier(ptr %obj)`.
+The place is inside an object when it is a field reached through a `Gc`
+(`o.f`, also `o.pair.a` and `o.arr[i]` through value-type fields), an
+element of a trailing array (`o.items[i]`), or unchecked indexing of a
+trailing array's pointer (`o.items.ptr[i]`, recognized syntactically).
+Other stores through raw pointers get no barrier: the code that makes
+them calls `gc.write_barrier(h, obj)` (see
+[`stdlib/gc.md`](stdlib/gc.md#as-implemented)). Initializing a new
+object (`new(h, T { .. })`) needs none.
+
+`barrier` is `alwaysinline` and tests one header byte:
+
+```llvm
+store i64 %v, ptr %slot
+%f = load i8, ptr %obj - 9            ; header flags
+%log = and i8 %f, 1                   ; LOG: old, not yet remembered
+br i1 %log, label %remember, label %cont   ; expected not taken
+```
+
+On x86-64 that is `testb $0x1,-0x9(%rax); jne`. The header shares a
+cache line with the object's first fields, which a store has usually just
+touched (a shape check before an inline-slot store, the length before an
+element store). Measured cost in a non-generational heap (no object ever
+has `LOG`): within noise on all three interpreters (see the roadmap,
+open question 2). The `remember` call keeps the handler from being a
+leaf: in tail-call mode MiniJS's `SETPROP_IN` gains a `push`/`pop` pair
+that aligns the stack for it on the fast path too, since the slow path
+rejoins the dispatch.
+
+**Generational GC: moving or not.** The design question (roadmap, open
+question 2) was settled for the non-moving scheme with sticky mark bits.
+It needs no reloading after `gc` calls, keeps raw pointers into objects
+valid (Mini's `aptr`, MiniJS's `Arr.ptr`, upvalue pointers, `k` pointers
+into constant arrays), and costs one byte test per barrier. A copying
+nursery would need every such pointer re-derived after each safepoint.
+
 ## 11. Bounds checks and verification
 
 Operand accesses in handlers are emitted as `getelementptr inbounds` without
