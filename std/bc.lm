@@ -21,7 +21,14 @@
 //                              given value (target pc - pc of the word), or
 //                              None if the offset does not fit
 //
-// A patch function is usually a few lines over `Vm.opcode` and `Field`:
+// The compiler generates both for every vm: `Vm.op_size`, and
+// `Vm.set_label`, which re-encodes the word's `pc + it` operand with a
+// range check (`Vm.label` reads it back, for `thread_jumps`):
+//
+//   var code: bc.Code<u32> = bc.Code.new(Mini.op_size, Mini.set_label);
+//
+// For another encoding of jump offsets, a patch function is a few lines
+// over `Vm.opcode` and `Field`:
 //
 //   const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
 //   const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
