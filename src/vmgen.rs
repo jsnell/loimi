@@ -239,7 +239,7 @@ pub fn epilogue(g: &mut FnGen) {
     let sym = g.f().symbol.clone();
     if vd.dispatch == Dispatch::Switch {
         g.label(&hg.dispatch_label);
-        let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+        let pc = load_pc(g);
         let opc = opcode_of(g, vd, &pc);
         let wt = format!("i{}", vd.word.bits);
         let mut cases = String::new();
@@ -325,13 +325,31 @@ fn opcode_and_word(g: &mut FnGen, vd: &VmDef, pc: &str) -> (String, String) {
     (opc, word)
 }
 
+/// The slot of the `pc` state variable in vm code.
+fn pc_slot(g: &FnGen) -> String {
+    let hg = g.vm.as_ref().expect("pc outside vm code");
+    hg.state_slots[g.p().vms[hg.vm as usize].pc_idx].clone()
+}
+
+/// Load `pc` (a `ptr`).
+pub fn load_pc(g: &mut FnGen) -> String {
+    let s = pc_slot(g);
+    g.inst(format!("load ptr, ptr {}", s))
+}
+
+/// Store `v` (a `ptr`) to `pc`.
+pub fn store_pc(g: &mut FnGen, v: &str) {
+    let s = pc_slot(g);
+    g.emit(format!("store ptr {}, ptr {}", v, s));
+}
+
 /// The current instruction word (from the register in tail-call handlers).
 fn current_word(g: &mut FnGen, vd: &VmDef) -> String {
     let hg = g.vm.clone().unwrap();
     match &hg.insn_slot {
         Some(s) => g.inst(format!("load i{}, ptr {}", vd.word.bits, s)),
         None => {
-            let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            let pc = load_pc(g);
             g.inst(format!("load i{}, ptr {}", vd.word.bits, pc))
         }
     }
@@ -375,7 +393,7 @@ fn dispatch(g: &mut FnGen, target: &str) {
     let hg = g.vm.clone().unwrap();
     let p = g.p();
     let vd = &p.vms[hg.vm as usize];
-    g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+    store_pc(g, target);
     if hg.combined {
         if vd.dispatch == Dispatch::Switch {
             g.br(&hg.dispatch_label);
@@ -418,7 +436,7 @@ pub fn word_place(g: &mut FnGen, off: u32) -> String {
     let hg = g.vm.clone().expect("code word access outside a handler");
     let p = g.p();
     let vd = &p.vms[hg.vm as usize];
-    let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+    let pc = load_pc(g);
     if off == 0 {
         return pc;
     }
@@ -471,7 +489,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let p = g.p();
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
-            let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            let mut pc = load_pc(g);
             if *back > 0 {
                 pc = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 -{}", wt, pc, back));
             }
@@ -511,19 +529,19 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let hg = g.vm.clone().unwrap();
             let p = g.p();
             let vd = &p.vms[hg.vm as usize];
-            let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            let pc = load_pc(g);
             let np = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, size));
             if hg.outlined {
                 // Out of the super's handler: continue in its resume
                 // function for the next part, as the handler would.
                 let VmRole::Handler(k) = g.f().vm_role else { unreachable!("outlined cold block outside an op handler") };
                 let r = vd.ops[k as usize].resume[*part as usize].expect("vmcheck creates the resume function");
-                g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
+                store_pc(g, &np);
                 let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, np));
                 tail_to(g, vd, &format!("@\"{}\"", crate::jitgen::callee_symbol(g, r)), &w);
                 return g.poison(&e.ty);
             }
-            g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
+            store_pc(g, &np);
             // The next part decodes its own word (in a stencil, a hole).
             if let Some(slot) = &hg.insn_slot {
                 let w = match g.stencil.as_ref().map(|st| st.part_offs[*part as usize]) {
@@ -612,7 +630,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 let (yes, no) = (g.fresh_label("resume"), g.fresh_label("dispatch"));
                 g.cond_br(&is_null, &no, &yes);
                 g.label(&yes);
-                g.emit(format!("store ptr {}, ptr {}", tv, g.vm.as_ref().unwrap().state_slots[vd.pc_idx]));
+                store_pc(g, &tv);
                 let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, tv));
                 tail_to(g, vd, &c, &w);
                 g.label(&no);
@@ -765,9 +783,9 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
         let st = g.stencil.as_ref().unwrap();
         (st.part, st.part_offs[st.part])
     };
-    let pc0 = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+    let pc0 = load_pc(g);
     let cont = |g: &mut FnGen, name: String| {
-        g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+        store_pc(g, target);
         let rt = handler_ret_llty(g.p(), vd);
         let mut ps: Vec<String> = vd.state_tys.iter().map(|t| llty(g.p(), t)).collect();
         ps.push(format!("i{}", vd.word.bits));

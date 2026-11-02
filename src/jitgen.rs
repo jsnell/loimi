@@ -486,7 +486,6 @@ pub fn jump_kind(t: &TExpr, pc_local: LocalId) -> JumpKind {
 /// enter word, jump straight to its compiled code, without counting.
 /// Returns with the insertion point on the other path.
 pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
-    let hg = g.vm.clone().unwrap();
     let w = g.inst(format!("load i32, ptr {}", target));
     let mask = (1u32 << vd.op_bits) - 1;
     let op = g.inst(format!("and i32 {}, {}", w, mask));
@@ -500,7 +499,7 @@ pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
     let b = g.inst("load ptr, ptr @loimi_jit_entries");
     let ep = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", b, iz));
     let e = g.inst(format!("load ptr, ptr {}", ep));
-    g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+    crate::vmgen::store_pc(g, target);
     crate::vmgen::tail_to(g, vd, &e, &w);
     g.label(&no);
 }
@@ -511,10 +510,9 @@ pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
 /// `backward_only`: count only if the target is at or before pc (loops).
 /// Returns with the insertion point on the path that dispatches normally.
 pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
-    let hg = g.vm.clone().unwrap();
     let go = g.fresh_label("hotgo");
     if backward_only {
-        let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+        let pc = crate::vmgen::load_pc(g);
         let back = g.inst(format!("icmp ule ptr {}, {}", target, pc));
         let cnt = g.fresh_label("hotcnt");
         g.cond_br(&back, &cnt, &go);
@@ -533,7 +531,7 @@ pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
     let trig = g.fresh_label("hottrig");
     g.cond_br(&z, &trig, &go);
     g.label(&trig);
-    g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+    crate::vmgen::store_pc(g, target);
     let sym = format!("@\"{}.jit_hot\"", vd.symbol);
     crate::vmgen::tail_to(g, vd, &sym, "0");
     g.label(&go);
