@@ -743,12 +743,17 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
             Ok(V.S(value.new_str(h, s.data[start..end])))
         }
         86 => {
-            c.tmp.clear();
+            // One copy: size the result first.
+            var len: u64 = 0;
+            for i in 0..n { len += str_arg(c, name, args[i])?.data.len; }
+            let r = new(h, Str {}, len);
+            var at: u64 = 0;
             for i in 0..n {
-                let s = str_arg(c, name, args[i])?;
-                c.tmp.push_str(s.data);
+                let Ok(s) = str_arg(c, name, args[i]) else { break; };
+                mem.memcpy(r.data.ptr + at, s.data.ptr, s.data.len);
+                at += s.data.len;
             }
-            Ok(V.S(value.new_str(h, c.tmp.as_str())))
+            Ok(V.S(r))
         }
         87 | 88 | 89 | 120 | 121 => {
             let x = str_arg(c, name, a)?;
