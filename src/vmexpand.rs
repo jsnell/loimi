@@ -563,161 +563,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
         }
     }
-    let clause_text = |kind: &str| -> Option<String> {
-        let k = v.operands.iter().find(|o| o.name.name == kind)?;
-        Some(sm.text(k.verify.as_ref()?.span).to_string())
-    };
     let clause = |kind: &str| -> Option<String> {
-        Some(clause_text(kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
+        Some(clause_text(sm, v, kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
     };
-    let mut s = String::new();
+    let mut s = generate_verifier_types(sm, v, l);
     let stack = has_stack(v);
-    // A stack vm's proof also records the maximum stack growth.
-    let proof = |code: &str, max: &str| {
-        if stack {
-            format!("{n}__Verified {{ __code: {code}, __max: {max} }}")
-        } else {
-            format!("{n}__Verified {{ __code: {code} }}")
-        }
-    };
-    // The proof type and what can be done with it.
-    if stack {
-        let _ = writeln!(
-            s,
-            "{vis}struct {n}__Verified {{ __code: []{w}, __max: u32 }}\n\
-             {vis}fn {n}__Verified.max_stack(v: {n}__Verified) -> u32 {{ v.__max }}\n\
-             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}, max_stack: u32) -> {n}__Verified {{ {} }}",
-            proof("code", "max_stack")
-        );
-    } else {
-        let _ = writeln!(
-            s,
-            "{vis}struct {n}__Verified {{ __code: []{w} }}\n\
-             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}) -> {n}__Verified {{ {} }}",
-            proof("code", "0")
-        );
-    }
-    let _ = writeln!(
-        s,
-        "{vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
-         {vis}fn {n}__Verified.len(v: {n}__Verified) -> u64 {{ v.__code.len }}\n\
-         {vis}fn {n}__Verified.words(v: {n}__Verified) -> []{w} {{ v.__code }}\n\
-         {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
-         {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
-    );
-    // A placeholder proof, for a field that must hold a Verified before
-    // the real code is verified (a prototype built before the program it
-    // belongs to is complete): one word with an opcode no op has, which
-    // traps when dispatched. Not generated if every opcode is taken.
-    let used: std::collections::HashSet<u32> = l.ops.iter().map(|o| o.opcode).collect();
-    if let Some(bad) = (0..1u64 << l.op_bits.min(16)).map(|x| x as u32).find(|x| !used.contains(x)) {
-        let word = (bad as u64) << l.op_shift;
-        let _ = writeln!(
-            s,
-            "var {n}__TRAP: [{w}; 1] = [{word}];\n\
-             {vis}fn {n}__placeholder() -> {n}__Verified {{ {} }}",
-            proof(&format!("{n}__TRAP[..]"), "0")
-        );
-    }
-    // Errors.
-    let _ = writeln!(
-        s,
-        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check{} }}\n\
-         {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64, msg: str }}\n\
-         fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
-         \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind, msg: \"\" }})\n}}\n\
-         {vis}fn {n}__VerifyError.message(e: {n}__VerifyError) -> str {{\n\
-         \x20 match e.reason {{\n\
-         \x20   Empty => \"the code is empty\",\n\
-         \x20   TooLong => \"the code is longer than 524288 words\",\n\
-         \x20   BadOpcode => \"invalid opcode\",\n\
-         \x20   Truncated => \"the instruction runs past the end of the code\",\n\
-         \x20   SuperPart => \"a superinstruction's word holds an op outside its part's family\",\n\
-         \x20   Forward => \"a forwarding superinstruction's linked operands name different registers\",\n\
-         \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
-         \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
-         \x20   Operand => \"an operand fails its kind's verify clause\",\n\
-         \x20   Check => \"a `verify` check of the vm fails\",{}\n\
-         \x20 }}\n}}",
-        if stack { ", StackUnderflow, StackMismatch, StackExit, StackTooDeep, StackCount, BadTarget" } else { "" },
-        if stack {
-            "\n    StackUnderflow => \"stack underflow\",\n\
-             \x20   StackMismatch => \"paths reach this instruction with different stack depths\",\n\
-             \x20   StackExit => \"the instruction ends the code with values left on the stack\",\n\
-             \x20   StackTooDeep => \"the stack can grow past 2^31 values\",\n\
-             \x20   StackCount => \"a stack effect's count is out of range\",\n\
-             \x20   BadTarget => \"a jump target lies outside the code\","
-        } else {
-            ""
-        }
-    );
-    let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
-    let _ = writeln!(s, "{vis}fn {n}__verify_clause(k: u64) -> str {{ match k {{");
-    for (i, k) in v.operands.iter().enumerate() {
-        if let Some(t) = clause_text(&k.name.name) {
-            let _ = writeln!(s, "  {} => \"{}\",", i, esc(&t));
-        }
-    }
-    let _ = writeln!(s, "  _ => \"\", }} }}");
-    let names = l.ops.iter().filter(|o| o.parts.is_empty() && !o.fields.is_empty()).map(|o| {
-        let arms: Vec<String> = o.fields.iter().enumerate().map(|(j, f)| format!("{} => \"{}\"", j, f.0)).collect();
-        (o.opcode, format!("match i {{ {}, _ => \"\" }}", arms.join(", ")))
-    });
-    match_fn(&mut s, &format!("{vis}fn {n}__operand_name(w: {w}, i: u64) -> str"), &format!("match {n}__base_op(w)"), names, "_ => \"\"");
-    let _ = writeln!(s, "{vis}fn {n}__check_name(i: u64) -> str {{ match i {{");
-    for (i, (name, _)) in v.checks.iter().enumerate() {
-        let _ = writeln!(s, "  {} => \"{}\",", i, name.name);
-    }
-    let _ = writeln!(s, "  _ => \"\", }} }}");
-    // "word 4 (LOADK): operand `c` (kst) fails `it < lim.nconsts`"
-    // "check `handlers` fails"
-    let _ = writeln!(
-        s,
-        "{vis}fn {n}__VerifyError.write<B>(e: {n}__VerifyError, out: *B) {{\n\
-         \x20 match e.reason {{\n\
-         \x20   Check => if e.msg.len == 0 {{\n\
-         \x20     out.push_str(\"check `\");\n\
-         \x20     out.push_str({n}__check_name(e.operand));\n\
-         \x20     out.push_str(\"` fails\");\n\
-         \x20     return;\n\
-         \x20   }},\n\
-         \x20   _ => {{}}\n\
-         \x20 }}\n\
-         \x20 out.push_str(\"word \");\n\
-         \x20 out.push_int(e.at as i64);\n\
-         \x20 if e.op < {n}__NUM_OPS {{\n\
-         \x20   out.push_str(\" (\");\n\
-         \x20   out.push_str({n}__op_name({n}__with_opcode(0, e.op as {w})));\n\
-         \x20   out.push_str(\")\");\n\
-         \x20 }}\n\
-         \x20 out.push_str(\": \");\n\
-         \x20 match e.reason {{\n\
-         \x20   Operand => {{\n\
-         \x20     out.push_str(\"operand `\");\n\
-         \x20     out.push_str({n}__operand_name({n}__with_opcode(0, e.op as {w}), e.operand));\n\
-         \x20     out.push_str(\"` (\");\n\
-         \x20     out.push_str({n}__kind_name(e.kind));\n\
-         \x20     out.push_str(\") fails `\");\n\
-         \x20     out.push_str({n}__verify_clause(e.kind));\n\
-         \x20     out.push_str(\"`\");\n\
-         \x20   }}\n\
-         \x20   Check => {{\n\
-         \x20     out.push_str(\"check `\");\n\
-         \x20     out.push_str({n}__check_name(e.operand));\n\
-         \x20     out.push_str(\"` fails: \");\n\
-         \x20     out.push_str(e.msg);\n\
-         \x20   }}\n\
-         {}\
-         \x20   _ => out.push_str(e.message()),\n\
-         \x20 }}\n}}",
-        if stack {
-            "\x20   StackUnderflow => {{ out.push_str(\"stack underflow: the instruction takes \"); out.push_int(e.kind as i64); out.push_str(\" value(s), the stack has \"); out.push_int(e.operand as i64); }}\n\
-             \x20   StackMismatch => {{ out.push_str(\"paths reach this instruction with different stack depths (\"); out.push_int(e.operand as i64); out.push_str(\" and \"); out.push_int(e.kind as i64); out.push_str(\")\"); }}\n\
-             \x20   StackExit => {{ out.push_str(\"the instruction ends the code and takes exactly \"); out.push_int(e.kind as i64); out.push_str(\" value(s), but the stack has \"); out.push_int(e.operand as i64); }}\n"
-        } else {
-            ""
-        }
-    );
     let _ = writeln!(
         s,
         "fn {n}__boundary(code: []{w}, bits: *[u8; 65536], p: *{w}) -> bool {{\n\
@@ -874,7 +724,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         }
         let _ = writeln!(s, "  if let Err(__e) = __r {{ return Err(__e); }}");
     }
-    let _ = writeln!(s, "  Ok({})\n}}", proof("__code", if stack { "__max" } else { "0" }));
+    let _ = writeln!(s, "  Ok({})\n}}", proof_src(v, "__code", if stack { "__max" } else { "0" }));
     if !v.checks.is_empty() {
         let _ = writeln!(
             s,
@@ -910,6 +760,186 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         }
         let _ = writeln!(s, "  Ok(())\n}}");
     }
+    s.push_str(&generate_build_verified(sm, v, l, jit, konst.is_some()));
+    Ok(s)
+}
+
+/// Source of a proof (`Vm__Verified`) of the code slice `code`; a stack
+/// vm's proof also records the maximum stack growth, `max`.
+fn proof_src(v: &VmDecl, code: &str, max: &str) -> String {
+    let n = &v.name.name;
+    if has_stack(v) {
+        format!("{n}__Verified {{ __code: {code}, __max: {max} }}")
+    } else {
+        format!("{n}__Verified {{ __code: {code} }}")
+    }
+}
+
+/// The source text of operand kind `kind`'s `verify` clause, if it has one.
+fn clause_text(sm: &SourceMap, v: &VmDecl, kind: &str) -> Option<String> {
+    let k = v.operands.iter().find(|o| o.name.name == kind)?;
+    Some(sm.text(k.verify.as_ref()?.span).to_string())
+}
+
+/// For `generate_verifier`: the proof type `Vm__Verified` and its
+/// methods, `assume_verified`, the placeholder proof, and the error types
+/// with their messages.
+fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    let stack = has_stack(v);
+    let proof = |code: &str, max: &str| proof_src(v, code, max);
+    // The proof type and what can be done with it.
+    if stack {
+        let _ = writeln!(
+            s,
+            "{vis}struct {n}__Verified {{ __code: []{w}, __max: u32 }}\n\
+             {vis}fn {n}__Verified.max_stack(v: {n}__Verified) -> u32 {{ v.__max }}\n\
+             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}, max_stack: u32) -> {n}__Verified {{ {} }}",
+            proof("code", "max_stack")
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "{vis}struct {n}__Verified {{ __code: []{w} }}\n\
+             #[unsafe]\n{vis}fn {n}__assume_verified(code: []{w}) -> {n}__Verified {{ {} }}",
+            proof("code", "0")
+        );
+    }
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__Verified.start(v: {n}__Verified) -> *{w} {{ v.__code.ptr }}\n\
+         {vis}fn {n}__Verified.len(v: {n}__Verified) -> u64 {{ v.__code.len }}\n\
+         {vis}fn {n}__Verified.words(v: {n}__Verified) -> []{w} {{ v.__code }}\n\
+         {vis}fn {n}__optimize(v: {n}__Verified) -> {n}__Verified {{ {n}__optimize_words(v.__code); v }}\n\
+         {vis}fn {n}__deopt(v: {n}__Verified) -> {n}__Verified {{ {n}__deopt_words(v.__code); v }}"
+    );
+    // A placeholder proof, for a field that must hold a Verified before
+    // the real code is verified (a prototype built before the program it
+    // belongs to is complete): one word with an opcode no op has, which
+    // traps when dispatched. Not generated if every opcode is taken.
+    let used: std::collections::HashSet<u32> = l.ops.iter().map(|o| o.opcode).collect();
+    if let Some(bad) = (0..1u64 << l.op_bits.min(16)).map(|x| x as u32).find(|x| !used.contains(x)) {
+        let word = (bad as u64) << l.op_shift;
+        let _ = writeln!(
+            s,
+            "var {n}__TRAP: [{w}; 1] = [{word}];\n\
+             {vis}fn {n}__placeholder() -> {n}__Verified {{ {} }}",
+            proof(&format!("{n}__TRAP[..]"), "0")
+        );
+    }
+    // Errors.
+    let _ = writeln!(
+        s,
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check{} }}\n\
+         {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64, msg: str }}\n\
+         fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
+         \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind, msg: \"\" }})\n}}\n\
+         {vis}fn {n}__VerifyError.message(e: {n}__VerifyError) -> str {{\n\
+         \x20 match e.reason {{\n\
+         \x20   Empty => \"the code is empty\",\n\
+         \x20   TooLong => \"the code is longer than 524288 words\",\n\
+         \x20   BadOpcode => \"invalid opcode\",\n\
+         \x20   Truncated => \"the instruction runs past the end of the code\",\n\
+         \x20   SuperPart => \"a superinstruction's word holds an op outside its part's family\",\n\
+         \x20   Forward => \"a forwarding superinstruction's linked operands name different registers\",\n\
+         \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
+         \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
+         \x20   Operand => \"an operand fails its kind's verify clause\",\n\
+         \x20   Check => \"a `verify` check of the vm fails\",{}\n\
+         \x20 }}\n}}",
+        if stack { ", StackUnderflow, StackMismatch, StackExit, StackTooDeep, StackCount, BadTarget" } else { "" },
+        if stack {
+            "\n    StackUnderflow => \"stack underflow\",\n\
+             \x20   StackMismatch => \"paths reach this instruction with different stack depths\",\n\
+             \x20   StackExit => \"the instruction ends the code with values left on the stack\",\n\
+             \x20   StackTooDeep => \"the stack can grow past 2^31 values\",\n\
+             \x20   StackCount => \"a stack effect's count is out of range\",\n\
+             \x20   BadTarget => \"a jump target lies outside the code\","
+        } else {
+            ""
+        }
+    );
+    let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = writeln!(s, "{vis}fn {n}__verify_clause(k: u64) -> str {{ match k {{");
+    for (i, k) in v.operands.iter().enumerate() {
+        if let Some(t) = clause_text(sm, v, &k.name.name) {
+            let _ = writeln!(s, "  {} => \"{}\",", i, esc(&t));
+        }
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
+    let names = l.ops.iter().filter(|o| o.parts.is_empty() && !o.fields.is_empty()).map(|o| {
+        let arms: Vec<String> = o.fields.iter().enumerate().map(|(j, f)| format!("{} => \"{}\"", j, f.0)).collect();
+        (o.opcode, format!("match i {{ {}, _ => \"\" }}", arms.join(", ")))
+    });
+    match_fn(&mut s, &format!("{vis}fn {n}__operand_name(w: {w}, i: u64) -> str"), &format!("match {n}__base_op(w)"), names, "_ => \"\"");
+    let _ = writeln!(s, "{vis}fn {n}__check_name(i: u64) -> str {{ match i {{");
+    for (i, (name, _)) in v.checks.iter().enumerate() {
+        let _ = writeln!(s, "  {} => \"{}\",", i, name.name);
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
+    // "word 4 (LOADK): operand `c` (kst) fails `it < lim.nconsts`"
+    // "check `handlers` fails"
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__VerifyError.write<B>(e: {n}__VerifyError, out: *B) {{\n\
+         \x20 match e.reason {{\n\
+         \x20   Check => if e.msg.len == 0 {{\n\
+         \x20     out.push_str(\"check `\");\n\
+         \x20     out.push_str({n}__check_name(e.operand));\n\
+         \x20     out.push_str(\"` fails\");\n\
+         \x20     return;\n\
+         \x20   }},\n\
+         \x20   _ => {{}}\n\
+         \x20 }}\n\
+         \x20 out.push_str(\"word \");\n\
+         \x20 out.push_int(e.at as i64);\n\
+         \x20 if e.op < {n}__NUM_OPS {{\n\
+         \x20   out.push_str(\" (\");\n\
+         \x20   out.push_str({n}__op_name({n}__with_opcode(0, e.op as {w})));\n\
+         \x20   out.push_str(\")\");\n\
+         \x20 }}\n\
+         \x20 out.push_str(\": \");\n\
+         \x20 match e.reason {{\n\
+         \x20   Operand => {{\n\
+         \x20     out.push_str(\"operand `\");\n\
+         \x20     out.push_str({n}__operand_name({n}__with_opcode(0, e.op as {w}), e.operand));\n\
+         \x20     out.push_str(\"` (\");\n\
+         \x20     out.push_str({n}__kind_name(e.kind));\n\
+         \x20     out.push_str(\") fails `\");\n\
+         \x20     out.push_str({n}__verify_clause(e.kind));\n\
+         \x20     out.push_str(\"`\");\n\
+         \x20   }}\n\
+         \x20   Check => {{\n\
+         \x20     out.push_str(\"check `\");\n\
+         \x20     out.push_str({n}__check_name(e.operand));\n\
+         \x20     out.push_str(\"` fails: \");\n\
+         \x20     out.push_str(e.msg);\n\
+         \x20   }}\n\
+         {}\
+         \x20   _ => out.push_str(e.message()),\n\
+         \x20 }}\n}}",
+        if stack {
+            "\x20   StackUnderflow => {{ out.push_str(\"stack underflow: the instruction takes \"); out.push_int(e.kind as i64); out.push_str(\" value(s), the stack has \"); out.push_int(e.operand as i64); }}\n\
+             \x20   StackMismatch => {{ out.push_str(\"paths reach this instruction with different stack depths (\"); out.push_int(e.operand as i64); out.push_str(\" and \"); out.push_int(e.kind as i64); out.push_str(\")\"); }}\n\
+             \x20   StackExit => {{ out.push_str(\"the instruction ends the code and takes exactly \"); out.push_int(e.kind as i64); out.push_str(\" value(s), but the stack has \"); out.push_int(e.operand as i64); }}\n"
+        } else {
+            ""
+        }
+    );
+    s
+}
+
+/// For `generate_verifier`: `Vm.build_verified` and
+/// `Vm.build_assume_verified`. `konst`: the vm has a constant pool (for
+/// the JIT).
+fn generate_build_verified(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool, konst: bool) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
     // `Vm.build_verified(heap, Obj { .. }, words, ctx..)`: create an object
     // whose last field is `code: verified [W] by Vm`, copy `words` into
     // it and verify them there. The `owner` verify context, if any, is the
@@ -944,7 +974,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         args.join(", "),
         if !jit {
             String::new()
-        } else if konst.is_some() {
+        } else if konst {
             format!("loimi_jit_register(__c.ptr as *u8, __c.len, {n}__const_pool({})); ", args[1..].join(", "))
         } else {
             "loimi_jit_register(__c.ptr as *u8, __c.len, 0 as *u8); ".to_string()
@@ -962,7 +992,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
          \x20 while __i < __words.len {{ __c[__i] = __words[__i]; __i += 1; }}\n\
          \x20 __o\n}}"
     );
-    Ok(s)
+    s
 }
 
 pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
