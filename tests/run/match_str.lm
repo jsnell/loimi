@@ -93,7 +93,7 @@ fn main() {
     io.print_int(guarded("a", true) * 100 + guarded("a", false) * 10 + guarded("c", true));
     io.println("");
 }
-// expect: 0 1 2 2 3 4 5 6 -1 -1 -1 -1 -1
+// expect: codes: 0 1 2 2 3 4 5 6 -1 -1 -1 -1 -1
 // expect: true
 // expect: 99
 // expect: 1500
