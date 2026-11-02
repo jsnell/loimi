@@ -164,8 +164,15 @@ quickening on/off.
      mandelbrot 0.59, and 0.78 by geometric mean over the 14 benchmarks.
      It is faster than LuaJIT `-joff` on all 14 (0.66 by geometric
      mean), but 2.3× slower than LuaJIT with its JIT. It compiles at
-     7–30 µs per function. A JIT build with the JIT off costs 5%.
-     Default builds are unchanged.
+     7–30 µs per function. Default builds are unchanged.
+   - *Phase 2: all three interpreters.* MiniJS and Scheme build and pass
+     all their tests with the JIT forced on, with no change to their
+     source. JIT against interpreter, by geometric mean: Mini 0.77,
+     MiniJS 0.85, Scheme 0.79 (Scheme with the JIT is 0.80 of Guile 3's
+     time with its JIT). A JIT build with the JIT off now runs the
+     default build's handlers (counting copies are swapped in only with
+     `LOIMI_JIT=1`) and is within noise of a default build (was +5%).
+     Stencil builds take a third less time.
    - *Where the time goes.* Dispatch and operand decoding were 20–40% of
      handler-bound time even after supers and quickening, and stencils
      remove most of it. Superinstructions needed stencils of their own:
@@ -176,9 +183,10 @@ quickening on/off.
    - *Recommendation.* Pursue it post-1.0 as an opt-in tier, not as a
      substitute for an optimizing JIT. A full version needs immutable
      operand kinds (`const k[it]`, so constants and their types can be
-     patched in); hot and cold stencil parts; a non-counting interpreter
-     when the JIT is off; freeing compiled code; and AArch64 and
-     PIC/Mach-O relocations.
+     patched in); recompiling after quickening without dropping the
+     whole code object (MiniJS's polymorphic sites); hot and cold
+     stencil parts; freeing compiled code; several vms per program and
+     variants; and AArch64 and PIC/Mach-O relocations.
 7. **How unsafe is `Window`?** A register window is one pointer with no
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing

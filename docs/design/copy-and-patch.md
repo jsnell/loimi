@@ -2,8 +2,11 @@
 
 Status: **prototype**, behind flags (`loimi build --jit-stencils`, run
 with `LOIMI_JIT=1`), x86-64 Linux, tail-call dispatch, one vm per
-program. It runs Mini (`examples/mini`). Written 2026-11-02 to answer
-open question 6 of the [roadmap](../roadmap.md):
+program. It runs all three example interpreters: Mini
+(`examples/mini`), MiniJS and Scheme, none of them changed for it.
+Written 2026-11-02 to answer open question 6 of the
+[roadmap](../roadmap.md); section 9 is the second phase (MiniJS and
+Scheme, no cost with the JIT off, faster stencil builds).
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -16,7 +19,8 @@ included). It passes every Mini script and conformance test with the
 JIT forced on at the first call or backward jump.
 
 Against Mini's interpreter, it takes 32% off fib, 11% off sieve and
-41% off mandelbrot, and 22% by geometric mean over the 14 benchmarks.
+41% off mandelbrot, and 22% by geometric mean over the 14 benchmarks
+(23% after phase 2; MiniJS 15%, Scheme 21%; section 9).
 It is faster than LuaJIT's interpreter on all 14. It is still 2.3×
 slower than LuaJIT with its trace JIT on (2.4–3.5× on those three). A
 baseline JIT removes dispatch and operand decoding. It does not remove
@@ -132,45 +136,59 @@ faster (0.35 s).
 
 `main.rs` (`build_stencils`) and `src/elf.rs`:
 
-1. **The stencil module** is the program's IR with every `internal`
-   definition rewritten to `available_externally dso_local`. Bodies stay
-   available for inlining (`value.truthy`, `int_index` and the like
-   inline as they do in the handlers). Anything not inlined is
-   referenced *by name*, with the calling convention as declared, so a
-   stencil calls the interpreter's own copy of a function. That copy has
-   not been given a different convention by LLVM's interprocedural
-   passes, because the program takes its address (step 4).
+1. **The stencil module** is the program's IR, rewritten:
+   - globals and handler-convention functions (cold blocks, `on raise`,
+     shared `-> never` functions, other handlers) become
+     `available_externally dso_local`. Stencils refer to them *by name*:
+     they use the interpreter's own.
+   - other functions (*helpers*: `value.truthy`, `table_set`, the
+     collector) stay `internal`. They inline into stencils as they do
+     into handlers. The ones a stencil still calls are compiled into the
+     object, and the JIT copies them once (step 3).
+   - functions no stencil reaches become declarations, and `main` and
+     exports become `available_externally`, so clang compiles only what
+     the stencils use.
+
    Thread-locals become `localexec`. The stencils, the exit stencil and
    the hole declarations are appended.
+
+   The prototype first made helpers `available_externally` too, so
+   stencils called the interpreter's copies through `loimi_jit_syms`.
+   Taking their addresses there changed how LLVM inlined them *in the
+   interpreter*: in a JIT build `value.table_set` was inlined into
+   `SETINDEXK` and `hash_set` was not, and the reverse in a default
+   build. That was most of the 5% that a JIT build cost with the JIT off.
 2. `clang -O3 -fno-pic -ffunction-sections -fdata-sections -c`: one
-   section per stencil, and one per constant.
+   section per stencil, helper, and constant.
 3. **The ELF reader** (about 300 lines of Rust, no crates) walks the
    section headers, symbol table and `.rela.text.__jit.op.*` sections.
    Each relocation becomes a patch record of one of these kinds:
    - a hole (`__jit.w`, `__jit.f`, `__jit.n`, `__jit.j`, parsed from the
      symbol name);
-   - a program symbol (cold functions, `vm.Mini.table`, helpers, libc);
+   - a program symbol (cold functions, `vm.Mini.table`, globals, libc);
+   - a helper: a function of the object (a call). Helpers' own
+     relocations are read the same way, and they make one block of
+     helper code. A helper must not use holes;
    - a thread-local (`R_X86_64_TPOFF32`);
    - read-only data of the object (float constants, `.rodata.cst*`),
-     which is copied.
+     which is copied. A helper's jump table is data with relocations: it
+     is copied too, and patched once. Stencils have no jump tables
+     (`"no-jump-tables"`).
 
    Relocation types are `R_X86_64_64`, `PC32`, `PLT32`, `32`, `32S` and
    `TPOFF32`. A stencil with any other relocation is rejected, and so is
-   one that refers to another text section or to data with relocations.
-   Its op then uses the exit stencil. With `-fdata-sections` no Mini op
-   is rejected (without it, `.rodata` with the op-name table caused
-   two rejections).
+   one that refers to another stencil, to data with relocations, or to
+   a helper that is rejected. Its op then uses the exit stencil. No op of
+   Mini, MiniJS or Scheme is rejected.
 4. **The tables** go into the program as IR constants: the code bytes,
-   the patch records, a per-opcode stencil index, `loimi_jit_syms` (the
-   addresses of the program symbols the stencils use, which also keeps
-   those functions' ABI fixed), the read-only data, and a function
+   the patch records, a per-opcode stencil index, the helper code and
+   its patch records, `loimi_jit_syms` (the addresses of the program
+   symbols the stencils use), the read-only data, and a function
    computing each thread-local's offset from the thread pointer
    (`llvm.threadlocal.address` minus `%fs:0`).
 
-The stencils add about 2.2 s to Mini's 4.3 s build: the stencil module
-is the whole program again, so most of the time is clang optimizing
-`available_externally` bodies that are thrown away. Mini's 113 stencils
-are 23 KB of code.
+Mini's 113 stencils are 21 KB of code, plus 26 helpers (17 KB).
+Build times are in section 9.
 
 A stencil whose fast path ends in `jmp __jit.n.D` as its *last*
 instruction has the jump dropped when the next instruction's code
@@ -199,10 +217,11 @@ direct `jmp` (section 7).
   unchanged, and the interpreter and compiled code share them.
 - **Quickening (`become`).** The JIT compiles the opcodes it finds, so
   it compiles quickened members once they are hot. `become` in a JIT
-  build first calls `loimi_jit_become(pc)`. If the code object is
-  compiled, that restores its original words and drops the compiled
-  code. The code object is compiled again when it is hot again (at most
-  8 times; after that it stays interpreted). `Vm.optimize` and
+  build (in the counting copy) first calls `loimi_jit_become(pc)`. If
+  the code object is compiled, that restores its original words and
+  drops the compiled code. Its call counter is set to 1/8 of the
+  threshold, so it is compiled again soon (at most 32 times; after that
+  it stays interpreted). `Vm.optimize` and
   `Vm.deopt` (generated) do the same through `loimi_jit_invalidate`, so
   `refuse` (re-fusing supers after quickening) never sees an enter word.
   Old compiled code that is still running when it is dropped stays
@@ -221,13 +240,24 @@ direct `jmp` (section 7).
 
 ## 5. The run-time JIT, exits and re-entry
 
-`src/jit_rt.c` (about 400 lines of C, compiled into the program):
+`src/jit_rt.c` (about 500 lines of C, compiled into the program):
 
 - **Registry.** `Vm.build_verified` calls `loimi_jit_register(code, n)`.
   Code objects are kept sorted by address. A new object overlapping an
   old record means the collector freed the old one, so the record is
   dropped.
-- **Hot counters.** With the JIT on (`loimi_jit_on`), the interpreter
+- **Counting copies.** Handlers and shared `-> never` functions that make
+  a jump the JIT counts or intercepts (a call, a return, a label jump) or
+  a `become` are emitted twice in a JIT build: as in a default build, and
+  as a counting copy (`NAME.jc`) with the hooks below
+  (`jitgen::counted_fns`; also those that tail-call such a function
+  directly). With `LOIMI_JIT=1` the runtime points the dispatch table
+  at the counting copies at startup. Without it, the interpreter is the
+  default build's code. The copies go last in the module and number
+  their own cold blocks and strings, so the default copies' IR is
+  byte-identical to a default build's. (The prototype tested a flag
+  before counting, in every handler; that cost 5%.)
+- **Hot counters.** With the JIT on, the interpreter
   decrements a 16-bit counter in a 4096-entry table, indexed by the hash
   of the target. It does this on every `jump` to the start of a verified
   code object (a call: `jump p.code`) and on every backward label jump
@@ -240,6 +270,9 @@ direct `jmp` (section 7).
   to whole functions. Calls and returns that reach an enter word jump
   straight to its compiled code, without counting and without the enter
   handler.
+- **Helpers and the exit.** At the first compile, the runtime copies the
+  helper code next to the stencils' read-only data and patches it, and
+  makes one copy of the exit stencil.
 - **Compiling** a code object is two passes. The first walks the
   instructions (`opinfo`: per opcode, the size and stencil to use) and
   lays out one stencil copy per instruction. The second copies the
@@ -260,7 +293,12 @@ direct `jmp` (section 7).
   head may still run in the interpreter.
 - **Exits.** Compiled code leaves through the dispatch table: dynamic
   jumps, cold paths, and instructions without a stencil (their slot holds
-  the exit stencil, `musttail tbl[opcode(*pc)]`). The interpreter then
+  the exit stencil, `musttail tbl[opcode(*pc)]`). A continuation that
+  is not an instruction goes to the shared exit copy. It is never taken:
+  for example, MiniJS's `SWITCHI` jumps to `pc + 1 + i`, which the
+  stencil compares with `pc + field` for each signed field, and a field
+  that is not a label gives a target outside the code. The prototype
+  failed the whole compile instead. The interpreter then
   runs until it dispatches to an enter word. An exit costs one or two
   indirect jumps, about what the interpreter pays per instruction anyway.
 
@@ -311,9 +349,9 @@ expected output.
   counted returns, and that difference held over repeated runs. It
   appears to be a layout effect, not understood.
 - **JIT off costs 5% by geometric mean** (up to 12% on interp, 10% on
-  fib): the interpreter's calls, returns and backward jumps carry the
-  enter-word check and the test before counting. The first version
-  updated a counter on every backward jump and cost up to 16%.
+  fib). Phase 2 brought this to 0 (section 9): the cause was mostly
+  helpers' addresses taken for the stencils, which changed LLVM's
+  inlining in the interpreter, and partly the flag test before counting.
 - **Default builds are unaffected.** Without `--jit-stencils` the IR
   for Mini is byte-identical to the IR from before the prototype.
 
@@ -422,14 +460,12 @@ What a full version needs:
      the compiler must make code that can `become` exit afterwards
      (the compiler knows which ops can).
 2. **Compiler.**
-   - Build the stencil module from the handlers and what they reach,
-     not the whole program again (build time: +2.2 s for Mini).
+   - ~~Build the stencil module from what the handlers reach~~ (done in
+     phase 2: only reachable functions are compiled).
    - Hot and cold stencil parts, so fast paths fall through, and cold
      continuations that return into compiled code.
-   - An interpreter that does not count when the JIT is off: two copies
-     of the few handlers that `jump` (as LuaJIT swaps `FORL` and
-     `IFORL`), or the instrumentation-variant machinery (`language.md`
-     §9). That brings "JIT off" from +5% to 0.
+   - ~~An interpreter that does not count when the JIT is off~~ (done in
+     phase 2, with counting copies of the handlers that jump).
    - Other targets: AArch64 relocations (`ADRP`/`ADD`, 26-bit `B`/`BL`,
      `MOVZ`/`MOVK` for 64-bit holes), Mach-O and COFF, and
      position-independent programs (a per-region GOT, as in CPython).
@@ -452,6 +488,89 @@ What a full version needs:
    register as CPython 3.14 caches the top of its stack. That would
    start on the memory-traffic layer of section 7, and is the next
    experiment if this tier is built.
+
+## 9. Phase 2: MiniJS, Scheme, and no cost when off
+
+The second phase asked whether the result holds beyond Mini, and
+removed the prototype's worst costs.
+
+**MiniJS and Scheme needed no change.** Both built with
+`--jit-stencils` as they were, and passed all their tests with the JIT
+forced on (threshold 1) in all three GC modes, before any compiler
+change. All their ops get stencils (MiniJS 134, Scheme 88), none exits
+to the interpreter for lack of one, and none is rejected. The vm
+features Mini did not use were already handled by the generic design:
+MiniJS's `-> never` helpers (`branch`, `call_slow`, `enter`) are shared
+functions that stencils tail-call, exceptions are `raise` to `on raise`
+(whose `jump` to the handler is ordinary dispatch), re-entry and
+`reload` are the handlers' own code, and Scheme's escaping `call/cc` is
+plain vm code. New golden tests `minijs_jit_stencils` and
+`scheme_jit_stencils` run every script and conformance test that way,
+as `mini_jit_stencils` does.
+
+One thing failed silently: MiniJS's `SWITCHI` (`jump pc + 1 + i`) made
+the JIT give up on functions with a `switch` (json: 2 of 22). Fixed in
+the runtime (section 5, *Exits*).
+
+**Changes** (compiler and runtime only):
+
+- *No cost with the JIT off.* Counting copies of the handlers that jump
+  (section 5) and helper code copied from the stencil object (section
+  3). The handlers' IR in a JIT build is now byte-identical to a
+  default build's, and so is their machine code, except a few bytes in
+  some cold blocks.
+- *Faster stencil builds.* Only functions that stencils reach are
+  compiled in the stencil module.
+- *Quickening.* After an invalidation a code object is compiled again
+  after 1/8 of the threshold, and given up on after 32 compiles, not 8.
+  deltablue gave up on 12 functions before (0.76 s → 0.74 s).
+
+**Results.** Best of 5 (Scheme: 3), interleaved, same machine and
+caveats as section 6. Geometric means of the time ratios; *JIT off* is
+the `--jit-stencils` build without `LOIMI_JIT`.
+
+| | benchmarks | JIT off / interp | JIT / interp | range | JIT against references |
+|---|---:|---:|---:|---:|---|
+| Mini | 14 | 1.00 (0.99–1.02) | **0.77** | 0.59–0.97 | LuaJIT `-joff` 0.65, LuaJIT 2.3× slower |
+| MiniJS | 14 | 1.00 (0.99–1.02) | **0.85** | 0.74–1.02 | node `--jitless` 0.45, QuickJS 0.35, node 3.9× slower |
+| Scheme | 41 | 1.00 (0.94–1.06) | **0.79** | 0.50–1.84 | Guile 3 (JIT) 0.80, Guile without JIT 0.37, Gauche 0.23, Chibi 0.05 |
+
+- **JIT off is within noise** of a default build for all three (it was
+  1.05 for Mini in phase 1).
+- These runs predate the last two changes (pruned stencil module,
+  helper jump tables). A best-of-3 re-run after them, without the
+  references, gave 0.77, 0.86 and 0.77 with the JIT and 1.00 with it
+  off.
+- **Mini** improved a little over phase 1 (0.78 → 0.77): sieve 0.89 →
+  0.87, closures 0.97 → 0.85. Helper calls from stencils no longer go
+  through functions the interpreter had to keep out of line.
+- **MiniJS** gains least, 15%. Its time is more in property lookup,
+  allocation and strings (json 1.02, strings 0.97, raytrace 0.95) than
+  in dispatch. Numeric and call-heavy code gains as in Mini (nbody and
+  closures 0.74, awfy_micro 0.78). deltablue has 237 invalidations in
+  301 compiles: its polymorphic sites quicken, and each `become` drops
+  the whole code object's compiled code.
+- **Scheme** gains 21%, most on calls and arithmetic loops (sum 0.50,
+  ntakl 0.54, sumfp 0.52, puzzle 0.65), least on list and string
+  programs. With the JIT it is faster than Guile 3's JIT by geometric
+  mean (without it, Scheme takes 1.02× Guile's time). One outlier is unexplained: `string`
+  (25 ms) takes 45 ms with the JIT, but only when exactly its three
+  loop functions are compiled (threshold 20–60); with thresholds 1–10 or
+  100+ it takes 24 ms. Its time is in copying large strings and the
+  collector, not in compiled code.
+
+**Build time.** Stencils now add 1.6 s to Mini's build (was 2.5 s),
+2.3 s to MiniJS's (was 3.5 s) and 1.6 s to Scheme's (was 2.0 s).
+
+**What remains** (in order of value):
+
+1. *Quickening invalidates whole code objects.* A `become` in compiled
+   code could instead restore only its own word and recompile the code
+   object at the next safe point. That would help MiniJS most.
+2. *Hot/cold stencil parts* (not done): the fast path's `jmp` to the
+   next instruction is still in the middle of most stencils.
+3. The limitations below, of which several vms per program, variants,
+   and AArch64 are the ones a real interpreter would hit first.
 
 ### Limitations of the prototype
 

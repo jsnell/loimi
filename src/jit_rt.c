@@ -4,9 +4,12 @@
  * The compiler emits, per op, a stencil: machine code with holes for the
  * operand fields, the instruction word and the continuations (tables
  * `loimi_jit_*`, from src/elf.rs). The interpreter tells this runtime
- * about every verified code object (`loimi_jit_register`), counts calls,
- * returns and backward jumps per target (`loimi_jit_hotcount`), and calls
- * `loimi_jit_hot` when a counter runs out. Compiling a code object copies
+ * about every verified code object (`loimi_jit_register`). With the JIT
+ * on, the dispatch table is pointed at the counting copies of the
+ * handlers that jump (`loimi_jit_ctable`), which count calls and
+ * backward jumps per target (`loimi_jit_hotcount`) and call
+ * `loimi_jit_hot` when a counter runs out; with it off, the interpreter
+ * is the default build's. Compiling a code object copies
  * the stencil of each instruction into executable memory, patches it, and
  * then replaces each instruction word that has compiled code with the
  * enter opcode, whose payload indexes `loimi_jit_entries`: the
