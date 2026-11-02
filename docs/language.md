@@ -183,6 +183,22 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `#[unsafe]`; a `vm` takes `#[require_verified]` and
   `#[dispatch(mode)]`; a module-level `var` takes `#[thread_local]`; a
   `super` takes `#[forward]`.
+- **Tests.** `#[test]` marks a function `fn name()` (no parameters or
+  result; it may declare effects) as a unit test. In a normal build it
+  is an ordinary function. `loimi test FILE.lm [build options]
+  [FILTER..] [--list] [--update]` builds FILE.lm with its `main`
+  replaced by one that runs FILE.lm's `#[test]` functions (not those of
+  the modules it imports) through `std.test`'s `Runner`, and runs it in
+  FILE.lm's directory: each test under a panic catch, so a failure stops
+  only that test; the exit status is 1 if any failed. Filters select the
+  tests whose name contains one of them; `--update` makes
+  `test.golden` rewrite its files (stdlib.md, `std.test`).
+- **`#[track_caller]`** on a function makes each call store the call's
+  location (`"file.lm:12:5"`) in a thread-local before calling;
+  `test.caller()` reads it. In a `#[track_caller]` function, calls to
+  others pass on its own caller's location instead, so an assertion
+  helper reports the line of the test that called it. Calls of other
+  functions pay nothing.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -1859,7 +1875,8 @@ no second copy of the interpreter to maintain. This is how debuggers, profilers,
 coverage, and `sys.settrace`-style hooks are implemented.
 
 `loimi build --vm-stats` does not need a variant: it compiles op and
-op-pair counters into the handlers and prints them at exit.
+op-pair counters into the handlers and prints them at exit. The
+program can read them too (`std.prof.op_counts`).
 
 ---
 

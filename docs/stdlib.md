@@ -27,9 +27,9 @@ says so. Some modules are design only; their sections say so at the top.
 | `std.rt` | `protect`/`throw` only (no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
 | `std.collections` (beyond `HashMap`) | **not built** | |
 | `std.ast` | **not built** | |
-| `std.prof` | **not built** (`--vm-stats` is a compiler flag) | |
+| `std.prof` | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
 | `std.ffi` | **not built** (`extern "C"` is in the language) | |
-| `std.test` | **not built** | |
+| `std.test` | built (`#[test]`, `loimi test`, assertions, capture, golden files; no matrix or differential runner) | `std/test.lm` |
 
 Design rules for the library:
 
@@ -44,7 +44,7 @@ Design rules for the library:
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
   `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
-  `MegaCache`, `Ics`, `Model`, `Ephemerons`), and `io.read_file`'s result
+  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `Bench`, `Counters`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
   its elements point to.
 
@@ -614,31 +614,117 @@ which is the core of Lua-, JS-, and Python-style closure compilation.
 
 ## `std.prof`
 
-**Not built.** What exists instead is the compiler flag `loimi build
---vm-stats` (language.md §7.3, §9), which counts ops and op pairs and
-prints suggested `super` declarations at exit.
+`std/prof.lm`, for timing and counting inside an interpreter or its
+benchmark driver. Nothing in it runs unless called, and the vm-stats
+access is compiled in only when the program uses it.
 
-Design: per-op counts, op-pair counts and `suggest-supers` as a library;
-a sampling profiler that reads the synced `pc` from a timer signal (made
-accurate by an instrumentation variant that syncs on backward jumps and
-calls) and maps it through the line table to guest source lines, with
-folded stacks for flame graphs.
+- **Clock**: `prof.now_ns() -> u64` (`CLOCK_MONOTONIC`), and a stopwatch
+  `prof.Timer.start()` with `t.ns()`, `t.ms() -> f64`, `t.restart()`.
+  `prof.fmt_ns(&buf, ns)` appends "812 ns", "3.25 us", "41.7 ms".
+- **Benchmarks**: `var b = prof.Bench.new(warmup, runs)`, then
+  `b.add(name, f, data)` per variant (`f: fn(*u8) uses reenter`, so a
+  variant may run an interpreter that collects; `run` then needs the
+  effect too), and `b.run()`: `warmup` untimed rounds, then `runs`
+  rounds that each time every variant once, starting from a different
+  one each round, so drift in the machine's speed hits all variants
+  alike. It prints name, minimum, median and minimum relative to the
+  first variant on stderr (`b.report(&buf)` writes the table);
+  `b.min_ns(i)` and `b.median_ns(i)` give the numbers. `b.free()`.
+- **Counters**: `prof.Counters.new()`, `c.add(name) -> id`, `c.inc(id)`,
+  `c.bump(id, n)` (inlined), `c.get(id)`, `c.report()` (stderr),
+  `c.free()`: for events `--vm-stats` does not see (cache misses,
+  slow-path entries).
+- **Vm stats**: in a `loimi build --vm-stats` build,
+  `prof.op_counts("Vm") -> ?prof.OpCounts` gives the vm's counters
+  (None without the flag or for an unknown vm; `prof.vm_stats_enabled()`).
+  `c.len()` ops in declaration order (supers included), `c.name(i)`,
+  `c.count(i)`, `c.count_of("ADD")`, `c.total()`, `c.reset()` (op counts,
+  pairs and sequences: measure one phase, or skip a warmup; the report
+  at exit covers what ran since) and `c.report()` (the exit report, now).
+
+### Design (not built)
+
+A sampling profiler that reads the synced `pc` from a timer signal
+(made accurate by an instrumentation variant that syncs on backward
+jumps and calls) and maps it through the line table to guest source
+lines, with folded stacks for flame graphs; `suggest-supers` as a
+library over the pair counts; confidence intervals in `Bench`.
 
 ## `std.test`
 
-**Not built.** Test runners today are shell scripts (`examples/*/check.sh`)
-and `cargo test` for the compiler; bytecode fuzzers are ordinary Loimi
-programs (tutorial chapter 9, `tests/fuzz/`).
+`std/test.lm` and the `loimi test` command (language.md §1.2).
 
-Design:
+```loimi
+import std.test;
 
-- Golden tests: run every `tests/**/*.<ext>` script and compare stdout and
-  stderr with `-- expect:` comments or `.out` files, with `--update` and
-  parallel runs.
+#[track_caller]
+fn squares(x: i64, want: i64) { test.eq(x * x, want); }
+
+#[test]
+fn arithmetic() {
+    test.eq(2 + 2, 4);
+    squares(3, 10);
+}
+
+#[test]
+fn runs_a_program() uses gc { .. }
+```
+
+```text
+$ loimi test calc_test.lm            # or: .. arith  (names containing "arith")
+test arithmetic ... FAILED
+    calc_test.lm:9:5: test.eq failed
+        got:  9
+        want: 10
+test runs_a_program ... ok
+
+failures:
+    arithmetic
+
+test result: FAILED. 1 passed; 1 failed; 0 filtered out
+```
+
+- **Running.** `loimi test FILE.lm` replaces FILE.lm's `main` and runs
+  each `#[test]` function of FILE.lm in source order, in FILE.lm's
+  directory. Arguments: filter words (a test runs if its name contains
+  one), `--list`, `--update`, and the build options (`--release`,
+  `--dispatch=`, `--sanitize=address`, `-W error`, ..). A test fails on
+  any panic: an assertion, a bounds check, `unwrap` of None; the frames
+  it abandons leak (`language.md` §10.1), and the rest of the run goes
+  on. A crash that is not a panic (a segfault in unchecked code) ends
+  the run. The generated `main` is plain Loimi over `test.Runner`
+  (`Runner.new()` reads the arguments, `r.run(name, f)`,
+  `r.finish() -> i32`), which a hand-written `main` can use as well.
+- **Assertions** fail the test with the location of their caller
+  (`#[track_caller]`; a helper of your own marked `#[track_caller]`
+  passes the test's line through): `test.assert(c)`,
+  `test.assert_msg(c, msg)`, `test.eq(got, want)` and `test.ne(a, b)`
+  (types with `fn T.eq` and `impl test.Eq for T;`: `str`, `bool`, `f64`
+  and the integers are built in, and `text.Fmt` to print them),
+  `test.some(opt) -> T`, `test.none(opt)`, `test.ok(result) -> T`,
+  `test.err(result) -> E`, `test.has(text, part)`,
+  `test.panics(f, data) -> str` (the panic's message; fails if `f`
+  returns), `test.fail(msg)`. `test.caller()` is the location inside a
+  `#[track_caller]` function.
+- **Output and golden files.** `test.capture_start()` sends stdout and
+  stderr (descriptors 1 and 2) to a temporary file until
+  `test.capture_end(&buf)` appends what was written; a test that fails
+  while capturing shows the captured output. `test.golden(text, path)`
+  compares with the file at `path` and names the first differing line;
+  `loimi test --update` (or `LOIMI_TEST_UPDATE=1`) writes the file
+  instead.
+
+Conformance tests that run a built interpreter on script files remain
+shell scripts (`examples/*/check.sh`); bytecode fuzzers are ordinary
+Loimi programs (tutorial chapter 9, `tests/fuzz/`).
+
+### Design (not built)
+
+- A golden-file runner over `tests/**/*.<ext>` scripts with `-- expect:`
+  comments, `--update` and parallel runs (`check.sh` does this per
+  example today).
 - A mode matrix: each test under every dispatch strategy, value repr and
   GC policy asked for (`--matrix dispatch=*,gc=MarkSweep,stress`).
 - Differential testing against a reference interpreter binary.
-- A bytecode fuzz harness: random code, which the verifier must either
-  reject or the VM must run without memory errors (under ASan).
-- `std.bench`: a benchmark runner with warmup, multiple runs, and
-  confidence intervals.
+- Tests collected from imported modules, and tests in parallel or in
+  separate processes (so that a crash fails one test, not the run).
