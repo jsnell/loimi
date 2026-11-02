@@ -37,10 +37,11 @@ const ATTRS: &[(&str, &str)] = &[
     ("dispatch", "`vm` declarations"),
     ("forward", "`super` declarations in a vm"),
     ("catch_panic", "`export \"C\"` functions"),
-    ("c_name", "structs passed to C"),
+    ("c_name", "structs and enums named in a C header"),
+    ("c_const", "`export \"C\"` functions (pointer parameters `const` in C)"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
-pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic"];
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic", "c_const"];
 /// Attributes on `vm` declarations.
 pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
 
@@ -89,6 +90,12 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             }
             if n == "catch_panic" && args.len() > 1 {
                 return Err(Diag::new(*sp, "`#[catch_panic]` takes at most one value: what the function returns after a panic"));
+            }
+            if n == "c_name" && args.len() != 1 {
+                return Err(Diag::new(*sp, "`#[c_name(\"name\")]` takes the C name"));
+            }
+            if n == "c_const" && args.is_empty() {
+                return Err(Diag::new(*sp, "`#[c_const(p, ..)]` takes the pointer parameters that are `const` in C"));
             }
             if n == "dispatch" && args.len() != 1 {
                 return Err(Diag::new(*sp, "`#[dispatch(..)]` takes one dispatch mode: tailcall, goto or switch"));
@@ -538,7 +545,9 @@ impl Parser {
             "fn" | "extern" | "export" => ("a function".into(), FN_ATTRS),
             "var" => ("a module-level `var`".into(), &["thread_local"]),
             "vm" => ("a vm".into(), VM_ATTRS),
-            "enum" | "impl" | "import" | "object" => (format!("an `{}`", kw), &[]),
+            "enum" => ("an `enum`".into(), &["c_name"]),
+            "struct" => ("a `struct`".into(), &["c_name"]),
+            "impl" | "import" | "object" => (format!("an `{}`", kw), &[]),
             "" => ("an item".into(), &[]),
             _ => (format!("a `{}`", kw), &[]),
         };
@@ -551,6 +560,19 @@ impl Parser {
             let abi = self.string_lit()?;
             if abi != "C" {
                 return self.err("only the \"C\" ABI is supported");
+            }
+            // `export "C" const NAME: T = v;`: a constant in the C header.
+            if linkage == Linkage::Export && self.eat_kw("const") {
+                if !attrs.list.is_empty() {
+                    return Err(Diag::new(attrs.list[0].2, "an exported constant takes no attributes"));
+                }
+                let name = self.ident()?;
+                self.expect(":")?;
+                let ty = self.parse_type()?;
+                self.expect("=")?;
+                let value = self.parse_expr()?;
+                self.expect(";")?;
+                return Ok(Item::Const(ConstDecl { name, ty, value, is_pub: true, export: true }));
             }
             return Ok(Item::Fn(self.parse_fn(attrs, linkage, is_pub)?));
         }
@@ -589,7 +611,8 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub }));
+            let c_name = attrs.get("c_name").map(|a| a[0].clone());
+            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub, c_name }));
         }
         if self.is_kw("trait") && matches!(self.peek_at(1), Tok::Ident(_)) {
             self.bump();
@@ -673,7 +696,8 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Enum(EnumDecl { name, generics, bounds, repr, variants, is_pub }));
+            let c_name = attrs.get("c_name").map(|a| a[0].clone());
+            return Ok(Item::Enum(EnumDecl { name, generics, bounds, repr, variants, is_pub, c_name }));
         }
         if self.eat_kw("var") {
             let name = self.ident()?;
@@ -695,7 +719,7 @@ impl Parser {
             self.expect("=")?;
             let value = self.parse_expr()?;
             self.expect(";")?;
-            return Ok(Item::Const(ConstDecl { name, ty, value, is_pub }));
+            return Ok(Item::Const(ConstDecl { name, ty, value, is_pub, export: false }));
         }
         if self.is_kw("import") {
             let start = self.bump().span;

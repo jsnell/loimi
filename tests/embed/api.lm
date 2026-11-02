@@ -7,6 +7,9 @@ import std.os;
 import std.rt;
 
 struct Counter { n: i64, hits: u32 }
+/// A C name of its own: `api_point` in the header.
+#[c_name("api_point")]
+struct Point { x: i64, y: i64 }
 enum Mode: u8 { Add, Sub }
 
 export "C" fn counter_new() -> *Counter {
@@ -85,4 +88,30 @@ export "C" fn protected_depth(limit: i32, nested: bool) -> i32 {
     var j = Job { depth: 0, limit: limit };
     let ok = rt.protect(if nested { outer } else { job }, &j as *u8);
     if ok { -1 } else { j.depth }
+}
+
+// Constants in the header, with their documentation.
+
+/// Flags: a `u32` constant.
+export "C" const API_FLAG_A: u32 = 1;
+export "C" const API_FLAG_B: u32 = API_FLAG_A << 1;
+export "C" const API_MIN: i32 = -5;
+export "C" const API_BIG: u64 = 0x100000000;
+export "C" const API_ON: bool = true;
+export "C" const API_NAME: str = "api \"v1\"";
+export "C" const API_SUB: Mode = Mode.Sub;
+
+export "C" fn point_new(x: i64, y: i64) -> *Point {
+    let p: *Point = mem.alloc(1);
+    p.x = x;
+    p.y = y;
+    p
+}
+
+/// Read-only parameters: `const` in C.
+#[c_const(p, bytes)]
+export "C" fn point_sum(p: *Point, bytes: *u8, n: u64) -> i64 {
+    var t = p.x + p.y;
+    for i in 0..n { t += bytes[i] as i64; }
+    t
 }

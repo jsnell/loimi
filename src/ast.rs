@@ -290,6 +290,8 @@ pub struct StructDecl {
     pub is_object: bool,
     pub fields: Vec<(Ident, TypeExpr)>,
     pub is_pub: bool,
+    /// `#[c_name("..")]`: its name in a C header.
+    pub c_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,6 +309,8 @@ pub struct EnumDecl {
     pub repr: Option<TypeExpr>,
     pub variants: Vec<Variant>,
     pub is_pub: bool,
+    /// `#[c_name("..")]`: its name in a C header.
+    pub c_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -315,6 +319,8 @@ pub struct ConstDecl {
     pub ty: TypeExpr,
     pub value: Expr,
     pub is_pub: bool,
+    /// `export "C" const`: also a constant in the C header.
+    pub export: bool,
 }
 
 /// Module-level mutable variable: `var NAME: T = const_init;`.

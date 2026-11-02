@@ -56,24 +56,29 @@ single-byte steps for the Pike VM. Both are verified before use.
 ## C API (`rx.h`, from `loimi build lib.lm --lib|--shared --header rx.h`)
 
 ```c
-Regex *rx_compile(void *pat, uint64_t len);   /* never NULL; check rx_ok */
-bool rx_ok(Regex *r);
-loimi_str rx_error(Regex *r);                 /* "" if none; valid until the next call on r */
-int64_t rx_error_offset(Regex *r);            /* byte offset in the pattern, or -1 */
-uint32_t rx_groups(Regex *r);
-int32_t rx_exec(Regex *r, void *buf, uint64_t len, uint64_t start, uint32_t flags,
+#define RX_SEARCH 1u
+#define RX_PIKE 2u
+rx_regex *rx_compile(const void *pat, uint64_t len);  /* NULL only on an internal error; check rx_ok */
+bool rx_ok(rx_regex *r);
+loimi_str rx_error(rx_regex *r);                 /* "" if none; valid until the next call on r */
+int64_t rx_error_offset(rx_regex *r);            /* byte offset in the pattern, or -1 */
+uint32_t rx_groups(rx_regex *r);
+int32_t rx_exec(rx_regex *r, const void *buf, uint64_t len, uint64_t start, uint32_t flags,
                 int64_t *spans, uint64_t nspans);
-void rx_set_step_limit(Regex *r, int64_t n);  /* 0: none */
-loimi_str rx_disasm(Regex *r, uint32_t flags);
-void rx_free(Regex *r);
+void rx_set_step_limit(rx_regex *r, int64_t n);  /* 0: none */
+loimi_str rx_disasm(rx_regex *r, uint32_t flags);
+loimi_str rx_internal_error(void);               /* the last caught panic on this thread */
+void rx_free(rx_regex *r);
 ```
 
-- `rx_exec` flags: 1 = search (`pattern.search(s, start)`), else an
-  anchored match (`pattern.match(s, start)`); 2 = use the Pike VM.
-  Returns 1 (match), 0 (none), -1 (error: the pattern did not compile,
-  the backtrack stack limit of 4M records, or the step limit; see
-  `rx_error`). On a match, writes `nspans` (start, end) pairs: group 0,
-  then each group; -1 for a group that did not participate.
+- `rx_exec` flags: `RX_SEARCH` = search (`pattern.search(s, start)`),
+  else an anchored match (`pattern.match(s, start)`); `RX_PIKE` = use
+  the Pike VM. Returns 1 (match), 0 (none), -1 (error: the pattern did
+  not compile, the backtrack stack limit of 4M records, or the step
+  limit; see `rx_error`), -2 (internal error: a panic inside the library
+  was caught, see `rx_internal_error`; only `rx_free` is safe after it).
+  On a match, writes `nspans` (start, end) pairs: group 0, then each
+  group; -1 for a group that did not participate.
 - Ownership: the pattern and the subject are borrowed for the call; the
   library keeps no pointer into them. `spans` is the caller's. Strings
   returned (`rx_error`, `rx_disasm`) belong to the regex.

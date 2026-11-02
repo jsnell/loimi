@@ -492,4 +492,11 @@ pub struct Program {
     pub values: Vec<ValueDef>,
     pub fns: Vec<FnDef>,
     pub vms: Vec<VmDef>,
+    /// `#[c_name("..")]` of structs and enums, by Loimi name.
+    pub c_names: std::collections::BTreeMap<String, String>,
+    /// `export "C" const`s, in source order: name, value, name span.
+    pub c_consts: Vec<(String, TExpr, crate::diag::Span)>,
+    /// `#[c_const(p, ..)]` on an export, by symbol: parameters that are
+    /// `const` pointers in C.
+    pub c_const_params: std::collections::BTreeMap<String, Vec<(String, crate::diag::Span)>>,
 }

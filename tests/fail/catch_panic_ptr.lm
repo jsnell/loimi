@@ -1,0 +1,5 @@
+// error: `#[catch_panic]`: after a panic the result is NULL, which `*u8` cannot be; return `?*u8`
+#[catch_panic]
+export "C" fn f(p: *u8) -> *u8 { p }
+
+fn main() {}

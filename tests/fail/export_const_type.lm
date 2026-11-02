@@ -1,0 +1,5 @@
+// error: `export "C" const X`: only integers, `bool`, floats, `str` and payload-free enum variants can be C constants
+// args: --lib
+export "C" const X: [u8; 2] = [1, 2];
+
+fn main() {}

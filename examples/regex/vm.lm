@@ -26,6 +26,8 @@ pub struct Limits { nslots: u32, nmarks: u32, nclasses: u32, nlits: u32 }
 /// Most backtrack records a match may use (16 bytes each): 4M = 64 MiB.
 pub const BT_LIMIT: u64 = 1 << 22;
 
+/// A compiled regex (`rx_regex` in C).
+#[c_name("rx_regex")]
 pub struct Regex {
     // ---- The compiled program ----
     code: Verified<Rx>,

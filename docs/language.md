@@ -1893,7 +1893,7 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   |---|---|
   | `i8`..`u64`, `f32`, `f64`, `bool` | `int8_t`..`uint64_t`, `float`, `double`, `bool` |
   | `()` result | `void` |
-  | `*u8` | `void *` (Loimi's untyped byte pointer; Loimi has no `const`) |
+  | `*u8` | `void *` (Loimi's untyped byte pointer), `const void *` with `#[c_const]` |
   | `*T` | `T *` for any mappable `T` |
   | `*S`, `S` a struct | `S *`, with `typedef struct S S;` (opaque) |
   | `?*T`, `?fn(..)` | the pointer; `NULL` is `None` |
@@ -1909,6 +1909,24 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   or on the stack, and LLVM would split one across both. The same checks
   run on every `--lib`/`--shared` build. `--header` also works on an
   executable.
+
+  More in the header:
+
+  - **Documentation.** The `///` comment above an export (or an exported
+    constant) becomes a C comment above its declaration.
+  - **Constants.** `export "C" const RX_SEARCH: u32 = 1;` is an ordinary
+    constant in Loimi and `#define RX_SEARCH 1u` in the header (integers
+    with a `u`/`LL`/`ULL` suffix by type, `bool`, floats, `str` as a
+    string literal, and payload-free enum variants as `((E)n)`).
+  - **`const` pointers.** Loimi has no `const`, so the header cannot
+    tell which pointers an export only reads. `#[c_const(pat, buf)]` on
+    the export declares those parameters `const T *` in C. It is a
+    promise the Loimi side keeps by hand: nothing checks that the
+    function does not write through them.
+  - **C names.** A struct or enum is named as in Loimi, unless it has
+    `#[c_name("rx_regex")]`, or `--header-prefix rx_` puts a prefix on
+    every name without one (`rx_Regex`). Enum constants follow:
+    `rx_Mode_Add`.
 - **Recovering instead of exiting.** A library must not exit the host on
   a guest error. `std.rt.protect(f, data)` / `std.rt.throw()` unwind out
   of code with no error path (Mini's parser); see `stdlib.md`, `std.rt`.

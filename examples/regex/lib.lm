@@ -14,8 +14,11 @@ import pike.{Pike};
 import vm.{Rx, Regex, Limits, Bt, Lit};
 
 
-/// Flags for rx_exec.
-pub enum RxFlag: u32 { Search = 1, Pike = 2 }
+/// rx_exec flag: search from `start` (Python's `pattern.search`)
+/// instead of matching at `start` (`pattern.match`).
+export "C" const RX_SEARCH: u32 = 1;
+/// rx_exec/rx_disasm flag: the Pike VM instead of the backtracker.
+export "C" const RX_PIKE: u32 = 2;
 
 fn empty_regex() -> Regex {
     Regex {
@@ -60,7 +63,11 @@ fn set_error(r: *Regex, msg: str, at: i64) {
 /// in the library), which rx_internal_error() describes. The pattern is
 /// copied; the caller keeps its buffer.
 #[catch_panic]
-export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
+#[c_const(pat)]
+export "C" fn rx_compile(pat: *u8, len: u64) -> ?*Regex { Some(compile_regex(pat, len)) }
+
+/// rx_compile for Loimi callers (fuzz.lm, stats.lm): panics abort.
+pub fn compile_regex(pat: *u8, len: u64) -> *Regex {
     let r: *Regex = mem.alloc(1);
     *r = empty_regex();
     mem.release(r.bt_end);
@@ -161,10 +168,11 @@ export "C" fn rx_groups(r: *Regex) -> u32 { r.ngroups }
 /// library; rx_internal_error() says which). After -2 the only safe call
 /// on `r` is rx_free.
 #[catch_panic(-2)]
+#[c_const(buf)]
 export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spans: *i64, nspans: u64) -> i32 {
     if !r.ok { return -1; }
     if start > len { return 0; }
-    let searching = (flags & 1) != 0;
+    let searching = (flags & RX_SEARCH) != 0;
     if let Some(b) = r.required and start == 0 {
         // As PCRE does: no match can succeed without this byte. (Only
         // from position 0, so that a loop over the matches of a buffer
@@ -174,7 +182,7 @@ export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spa
     let nslots = 2 * (r.ngroups as u64 + 1);
     for i in 0..nslots { r.slots[i] = -1; }
     var found = false;
-    if (flags & 2) != 0 {
+    if (flags & RX_PIKE) != 0 {
         let p = match r.pike {
             Some(p) => p as *Pike,
             None => {
@@ -232,7 +240,7 @@ export "C" fn rx_set_step_limit(r: *Regex, n: i64) { r.step_limit = n; }
 export "C" fn rx_disasm(r: *Regex, flags: u32) -> str {
     r.err.clear();
     if !r.ok { return r.err.as_str(); }
-    let code = if (flags & 2) != 0 { r.pike_code.words() } else { r.code.words() };
+    let code = if (flags & RX_PIKE) != 0 { r.pike_code.words() } else { r.code.words() };
     Rx.disasm(code, &r.err);
     r.err.as_str()
 }

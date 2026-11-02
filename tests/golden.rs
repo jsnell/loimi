@@ -722,7 +722,7 @@ fn vm_stats_library() {
 fn c_library_asan() {
     // ASan reserves terabytes of shadow memory: skip under `ulimit -v`.
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
-    if limits.lines().any(|l| l.starts_with("Max address space") && !l.contains("unlimited")) {
+    if limits.lines().any(|l| l.starts_with("Max address space") && l.split_whitespace().nth(3) != Some("unlimited")) {
         eprintln!("c_library_asan: skipped under an address-space limit (ulimit -v)");
         return;
     }

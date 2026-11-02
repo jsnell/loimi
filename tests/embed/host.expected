@@ -13,3 +13,5 @@ apply_twice 42
 arg_count 0
 protected 7 507
 protected again 3
+consts 1 2 -5 4294967296 1 api "v1" 1
+point_sum 33

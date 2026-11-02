@@ -20,15 +20,23 @@
 #include <pcre2.h>
 #endif
 
-/* rx_exec flags (lib.lm cannot export constants to the header). */
-#define RX_SEARCH 1u
-#define RX_PIKE 2u
+/* rx_compile returns NULL only on an internal error (a panic inside the
+ * library, caught at the API boundary); so does rx_exec with -2. */
+static rx_regex *compile(const char *pat, size_t n) {
+    rx_regex *re = rx_compile(pat, n);
+    if (!re) {
+        loimi_str e = rx_internal_error();
+        fprintf(stderr, "rx_compile: internal error: %.*s\n", (int)e.len, e.ptr);
+        exit(2);
+    }
+    return re;
+}
 
-static void print_match(Regex *re, const char *s, uint32_t flags) {
+static void print_match(rx_regex *re, const char *s, uint32_t flags) {
     int64_t spans[2 * 10];
-    int rc = rx_exec(re, (void *)s, strlen(s), 0, flags, spans, 10);
+    int rc = rx_exec(re, s, strlen(s), 0, flags, spans, 10);
     if (rc < 0) {
-        loimi_str e = rx_error(re);
+        loimi_str e = rc == -2 ? rx_internal_error() : rx_error(re);
         printf("  error: %.*s\n", (int)e.len, e.ptr);
         return;
     }
@@ -49,7 +57,7 @@ static void print_match(Regex *re, const char *s, uint32_t flags) {
 
 static int demo(void) {
     const char *pat = "(\\w+)@(\\w+)\\.com";
-    Regex *re = rx_compile((void *)pat, strlen(pat));
+    rx_regex *re = compile(pat, strlen(pat));
     printf("pattern %s: %u groups\n", pat, rx_groups(re));
     print_match(re, "mail bob@example.com now", RX_SEARCH);
     print_match(re, "mail bob@example.com now", RX_SEARCH | RX_PIKE);
@@ -66,7 +74,7 @@ static int demo(void) {
         char *big = malloc(n);
         for (size_t i = 0; i < n; i++) big[i] = "ab"[i & 1];
         const char *p = "(?:a|b)*c?";
-        re = rx_compile((void *)p, strlen(p));
+        re = compile(p, strlen(p));
         int64_t sp[2];
         int rc = rx_exec(re, big, n, 0, 0, sp, 1);
         loimi_str e = rx_error(re);
@@ -80,21 +88,21 @@ static int demo(void) {
     /* A step limit stops catastrophic backtracking. */
     {
         const char *p = "(a|aa)+$", *s = "aaaaaaaaaaaaaaaaaaaaaaaaaaaab";
-        re = rx_compile((void *)p, strlen(p));
+        re = compile(p, strlen(p));
         rx_set_step_limit(re, 100000);
         int64_t sp[2];
-        int rc = rx_exec(re, (void *)s, strlen(s), 0, RX_SEARCH, sp, 1);
+        int rc = rx_exec(re, s, strlen(s), 0, RX_SEARCH, sp, 1);
         loimi_str e = rx_error(re);
         printf("%s with a step limit: rc=%d error='%.*s'\n", p, rc, (int)e.len, e.ptr);
         rx_set_step_limit(re, 0);
-        rc = rx_exec(re, (void *)s, strlen(s), 0, RX_SEARCH, sp, 1);
+        rc = rx_exec(re, s, strlen(s), 0, RX_SEARCH, sp, 1);
         printf("%s without: rc=%d\n", p, rc);
         rx_free(re);
     }
 
     const char *bad[] = { "a(b", "*a", "[z-a]", "a{3,2}", "\\q" };
     for (int i = 0; i < 5; i++) {
-        re = rx_compile((void *)bad[i], strlen(bad[i]));
+        re = compile(bad[i], strlen(bad[i]));
         loimi_str e = rx_error(re);
         printf("compile %-8s ok=%d error='%.*s' at %lld\n", bad[i], rx_ok(re), (int)e.len, e.ptr,
                (long long)rx_error_offset(re));
@@ -116,13 +124,13 @@ static size_t unhex(const char *h, char *out) {
     return n;
 }
 
-static void put_result(Regex *re, const char *s, size_t n, uint32_t flags) {
+static void put_result(rx_regex *re, const char *s, size_t n, uint32_t flags) {
     int64_t spans[2 * 100];
     if (!rx_ok(re)) {
         printf("ERR");
         return;
     }
-    int rc = rx_exec(re, (void *)s, n, 0, flags, spans, 100);
+    int rc = rx_exec(re, s, n, 0, flags, spans, 100);
     if (rc < 0) {
         printf("LIMIT");
         return;
@@ -147,7 +155,7 @@ static int test(const char *path) {
         char mode[8];
         if (sscanf(line, "%7s %32767s %32767s", mode, hp, hs) != 3) continue;
         size_t pn = unhex(hp, pat), sn = unhex(hs, subj);
-        Regex *re = rx_compile(pat, pn);
+        rx_regex *re = compile(pat, pn);
         uint32_t fl = mode[0] == 's' ? RX_SEARCH : 0;
         put_result(re, subj, sn, fl);
         printf("\t");
@@ -177,7 +185,7 @@ static int fuzz(long n, uint64_t seed) {
         for (size_t j = 0; j < pn; j++)
             pat[j] = rnd() % 8 == 0 ? (char)rnd() : alpha[rnd() % (sizeof alpha - 1)];
         for (size_t j = 0; j < sn; j++) subj[j] = "ab\n1 "[rnd() % 5];
-        Regex *re = rx_compile(pat, pn);
+        rx_regex *re = compile(pat, pn);
         if (rx_ok(re)) {
             compiled++;
             int64_t a[2 * 16], b[2 * 16];
@@ -243,12 +251,12 @@ static const Bench benches[] = {
 };
 
 /* Count non-overlapping matches, as len(re.findall(...)) does. */
-static long count_rx(Regex *re, const char *t, size_t n, uint32_t flags) {
+static long count_rx(rx_regex *re, const char *t, size_t n, uint32_t flags) {
     long c = 0;
     size_t at = 0;
     int64_t sp[2];
     while (at <= n) {
-        int rc = rx_exec(re, (void *)t, n, at, flags | RX_SEARCH, sp, 1);
+        int rc = rx_exec(re, t, n, at, flags | RX_SEARCH, sp, 1);
         if (rc < 0) return -1;
         if (rc == 0) break;
         c++;
@@ -293,7 +301,7 @@ static int bench(int argc, char **argv) {
         const Bench *B = &benches[b];
         const char *t = B->text == 1 ? path : B->text == 2 ? path2 : text;
         size_t tn = strlen(t);
-        Regex *re = rx_compile((void *)B->pat, strlen(B->pat));
+        rx_regex *re = compile(B->pat, strlen(B->pat));
         if (getenv("RX_STEP_LIMIT")) rx_set_step_limit(re, atoll(getenv("RX_STEP_LIMIT")));
         double best[2] = { 1e9, 1e9 };
         long cnt[2] = { 0, 0 };

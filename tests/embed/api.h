@@ -19,14 +19,26 @@ typedef struct loimi_str { const char *ptr; size_t len; } loimi_str;
 
 /* Opaque Loimi structs, used through pointers. */
 typedef struct Counter Counter;
+typedef struct api_point api_point;
 
 /* enum Mode */
 typedef uint8_t Mode;
 enum { Mode_Add = 0, Mode_Sub = 1 };
 
+/* Flags: a `u32` constant. */
+#define API_FLAG_A 1u
+#define API_FLAG_B 2u
+#define API_MIN (-5)
+#define API_BIG 4294967296ULL
+#define API_ON true
+#define API_NAME "api \"v1\""
+#define API_SUB ((Mode)1)
+
 Counter *counter_new(void);
 void counter_free(Counter *c);
 int64_t counter_step(Counter *c, Mode mode, int64_t by);
+
+/* `?*T` is a nullable pointer. */
 int64_t counter_or_null(Counter *c);
 bool is_big(Counter *c, int64_t limit);
 bool negate(bool b);
@@ -34,11 +46,24 @@ int64_t widths(int8_t a, uint8_t b, int16_t c, uint16_t d, int32_t e, uint32_t f
 double floats(float x, double y);
 void fill(int32_t *out, uint64_t n);
 uint8_t first_byte(void **pp);
+
+/* `str` in and out: a pointer and a length. */
 loimi_str longer(loimi_str a, loimi_str b);
 uint64_t str_len(loimi_str s);
+
+/* A C callback. */
 int32_t apply_twice(int32_t (*f)(int32_t), int32_t x);
+
+/* Libraries have no command line. */
 uint64_t arg_count(void);
+
+/* -1 if no throw; else the depth reached (with `nested`, after an inner
+ * protect caught a throw at depth 5, 500 + limit). */
 int32_t protected_depth(int32_t limit, bool nested);
+api_point *point_new(int64_t x, int64_t y);
+
+/* Read-only parameters: `const` in C. */
+int64_t point_sum(const api_point *p, const void *bytes, uint64_t n);
 
 #ifdef __cplusplus
 }

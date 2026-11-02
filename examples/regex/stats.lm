@@ -30,7 +30,7 @@ fn gen_text(n: u64) -> *u8 {
 }
 
 fn count(pat: str, t: *u8, n: u64) -> i64 {
-    let re = lib.rx_compile(pat.ptr, pat.len);
+    let re = lib.compile_regex(pat.ptr, pat.len);
     var spans: [i64; 2] = [0; 2];
     var c: i64 = 0;
     var at: u64 = 0;

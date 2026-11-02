@@ -59,7 +59,7 @@ fn main() -> i32 {
     while i < n {
         i += 1;
         let pat = CORPUS[rng.below(12)];
-        let re = lib.rx_compile(pat.ptr, pat.len);
+        let re = lib.compile_regex(pat.ptr, pat.len);
         let nslots = 2 * (re.ngroups as u64 + 1);
         // Mutate a copy of the backtracker's code (before optimize).
         let words = re.words.items();

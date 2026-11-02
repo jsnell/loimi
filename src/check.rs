@@ -327,6 +327,9 @@ impl<'a> Checker<'a> {
                             None
                         };
                         self.struct_files.insert(id, s.name.span.file);
+                        if let Some(c) = &s.c_name {
+                            self.prog.c_names.insert(format!("{}.{}", prefix, s.name.name), c.clone());
+                        }
                         self.prog.structs.push(StructDef {
                             name: format!("{}.{}", prefix, s.name.name),
                             fields: vec![],
@@ -339,6 +342,9 @@ impl<'a> Checker<'a> {
                     }
                     Item::Enum(e) => {
                         let id = self.prog.enums.len() as u32;
+                        if let Some(c) = &e.c_name {
+                            self.prog.c_names.insert(format!("{}.{}", prefix, e.name.name), c.clone());
+                        }
                         self.prog.enums.push(EnumDef {
                             name: format!("{}.{}", prefix, e.name.name),
                             tag: IntTy::I32,
@@ -546,6 +552,15 @@ impl<'a> Checker<'a> {
             self.check_against_bounds(id).map_err(|d| self.instance_note(d, id))?;
             self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
         }
+        // `export "C" const`s, for the header.
+        for id in 0..self.consts.len() {
+            if !self.consts[id].decl.export {
+                continue;
+            }
+            let span = self.consts[id].decl.name.span;
+            let v = self.const_value(id as u32, span)?;
+            self.prog.c_consts.push((self.consts[id].decl.name.name.clone(), v, span));
+        }
         Ok(())
     }
 
@@ -623,6 +638,9 @@ impl<'a> Checker<'a> {
         let sp = f.attrs.list.iter().find(|(n, _, _)| n == "catch_panic").map(|a| a.2).unwrap_or(f.name.span);
         if f.linkage != Linkage::Export {
             return Err(Diag::new(sp, "`#[catch_panic]` applies to `export \"C\"` functions: the boundary where a panic turns into a C return value"));
+        }
+        if let Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_) = ret {
+            return Err(Diag::new(sp, format!("`#[catch_panic]`: after a panic the result is NULL, which `{}` cannot be; return `?{}`", self.ty_name(ret), self.ty_name(ret))));
         }
         let Some(v) = v else { return Ok("zeroinitializer".into()) };
         let bad = |what: &str| Err(Diag::new(sp, format!("`#[catch_panic({})]`: {}", v, what)));
@@ -715,6 +733,19 @@ impl<'a> Checker<'a> {
         };
         if f.attrs.has("unsafe") {
             self.unsafe_fns.insert(id);
+        }
+        if let Some((_, args, sp)) = f.attrs.list.iter().find(|(n, _, _)| n == "c_const") {
+            if f.linkage != Linkage::Export {
+                return Err(Diag::new(*sp, "`#[c_const(..)]` applies to `export \"C\"` functions"));
+            }
+            for a in args {
+                match f.params.iter().position(|p| p.name.name == *a) {
+                    Some(i) if matches!(param_tys[i], Ty::Ptr(_)) => {}
+                    Some(_) => return Err(Diag::new(*sp, format!("`#[c_const({})]`: `{}` is not a pointer parameter", a, a))),
+                    None => return Err(Diag::new(*sp, format!("`#[c_const({})]`: no parameter `{}`", a, a))),
+                }
+            }
+            self.prog.c_const_params.insert(symbol.clone(), args.iter().map(|a| (a.clone(), *sp)).collect());
         }
         let catch_panic = match f.attrs.get("catch_panic") {
             Some(args) => Some(self.catch_panic_value(f, &ret, args.first().map(|s| s.as_str()))?),

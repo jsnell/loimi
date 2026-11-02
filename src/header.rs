@@ -23,8 +23,8 @@
 use std::collections::BTreeMap;
 
 use crate::ast::Linkage;
-use crate::diag::Diag;
-use crate::tir::{FnDef, Program, Ty};
+use crate::diag::{Diag, SourceMap, Span};
+use crate::tir::{FnDef, Program, TExpr, Ty, TK};
 
 /// Integer argument registers on x86-64 (System V); AArch64 has eight.
 const INT_ARG_REGS: usize = 6;
@@ -38,6 +38,9 @@ const C_KEYWORDS: &[&str] = &[
 
 struct Gen<'p> {
     p: &'p Program,
+    /// `--header-prefix`: prepended to the C names of structs and enums
+    /// without a `#[c_name]`.
+    prefix: &'p str,
     /// C name -> Loimi struct name, for the opaque declarations.
     opaque: BTreeMap<String, String>,
     /// C name -> enum id, for the typedefs and constants.
@@ -78,6 +81,14 @@ fn ty_name(p: &Program, t: &Ty) -> String {
 }
 
 impl<'p> Gen<'p> {
+    /// The C name of struct or enum `name` (its Loimi name).
+    fn c_name(&self, name: &str) -> String {
+        match self.p.c_names.get(name) {
+            Some(c) => c.clone(),
+            None => format!("{}{}", self.prefix, short(name)),
+        }
+    }
+
     /// The C declaration of `inner` (a name, possibly empty, possibly with
     /// leading `*`s) with type `t`. `Err` says why `t` has no C equivalent.
     fn decl(&mut self, t: &Ty, inner: &str, is_result: bool) -> Result<String, String> {
@@ -102,10 +113,10 @@ impl<'p> Gen<'p> {
                     if p.structs[*i as usize].object.is_some() {
                         return Err(format!("`{}` is a GC object; pointers into the GC heap cannot cross into C", short(name)));
                     }
-                    let c = short(name).to_string();
-                    if c.contains('<') {
-                        return Err(format!("generic struct `{}` has no C name", c));
+                    if short(name).contains('<') {
+                        return Err(format!("generic struct `{}` has no C name", short(name)));
                     }
+                    let c = self.c_name(name);
                     if let Some(prev) = self.opaque.get(&c) {
                         if prev != name {
                             return Err(format!("two exported structs are both named `{}` in C", c));
@@ -139,10 +150,10 @@ impl<'p> Gen<'p> {
                 if e.has_payload() {
                     return Err(format!("enum `{}` has payloads; pass a pointer to a struct instead", short(&e.name)));
                 }
-                let c = short(&e.name).to_string();
-                if c.contains('<') {
-                    return Err(format!("generic enum `{}` has no C name", c));
+                if short(&e.name).contains('<') {
+                    return Err(format!("generic enum `{}` has no C name", short(&e.name)));
                 }
+                let c = self.c_name(&e.name);
                 if let Some(&prev) = self.enums.get(&c) {
                     if prev != *i {
                         return Err(format!("two exported enums are both named `{}` in C", c));
@@ -197,9 +208,24 @@ fn prototype(g: &mut Gen, f: &FnDef) -> Result<String, Diag> {
     }
     let mut params = Vec::new();
     let mut regs = 0;
+    let consts = g.p.c_const_params.get(&f.symbol);
     for (i, t) in f.param_tys.iter().enumerate() {
         let name = param_name(f, i);
-        let d = g.decl(t, &name, false).map_err(|e| err(format!("parameter `{}: {}`", name, ty_name(g.p, t)), e))?;
+        let loimi_name = &f.locals[f.params[i] as usize].name;
+        let mut d = g.decl(t, &name, false).map_err(|e| err(format!("parameter `{}: {}`", name, ty_name(g.p, t)), e))?;
+        if let Some((_, sp)) = consts.and_then(|c| c.iter().find(|(n, _)| n == loimi_name)) {
+            // `#[c_const(p)]`: `const T *p`. The pointee must be a value,
+            // not another pointer, so that the `const` reads unambiguously.
+            match t {
+                Ty::Ptr(x) if !matches!(**x, Ty::Ptr(_) | Ty::Fn(..) | Ty::Option(_)) => d = format!("const {}", d),
+                _ => {
+                    return Err(Diag::new(
+                        *sp,
+                        format!("`#[c_const({})]`: only a pointer to a value (`*u8`, `*T`) can be `const` in C", loimi_name),
+                    ))
+                }
+            }
+        }
         if matches!(t, Ty::Slice(_)) && regs + 2 > INT_ARG_REGS {
             // C passes a 16-byte struct whole, in two registers or on the
             // stack; LLVM splits `{ ptr, i64 }` and could put one half in
@@ -223,21 +249,114 @@ fn prototype(g: &mut Gen, f: &FnDef) -> Result<String, Diag> {
     g.decl(&f.ret, &head, true).map_err(|e| err(format!("result `{}`", ty_name(g.p, &f.ret)), e))
 }
 
-/// Check that every `export "C"` function has a C signature.
+/// The `#define` of an `export "C" const`, or why it has none.
+fn const_define(g: &mut Gen, name: &str, v: &TExpr, span: Span) -> Result<String, Diag> {
+    let err = |why: &str| Diag::new(span, format!("`export \"C\" const {}`: {}", name, why));
+    let value = match (&v.ty, &v.kind) {
+        (Ty::Int(it), TK::Int(n)) => {
+            let suffix = match (it.signed, it.bits) {
+                (false, 64) => "ULL",
+                (true, 64) => "LL",
+                (false, _) => "u",
+                (true, _) => "",
+            };
+            if *n < 0 {
+                format!("({}{})", n, suffix)
+            } else {
+                format!("{}{}", n, suffix)
+            }
+        }
+        (Ty::Bool, TK::Bool(b)) => b.to_string(),
+        (Ty::F64, TK::Float(x)) => format!("{:?}", x),
+        (Ty::F32, TK::Float(x)) => format!("{:?}f", x),
+        (Ty::Slice(e), TK::Str(bytes)) if **e == Ty::u8() => {
+            let mut s = String::from("\"");
+            for &b in bytes {
+                match b {
+                    b'"' | b'\\' => {
+                        s.push('\\');
+                        s.push(b as char);
+                    }
+                    0x20..=0x7e => s.push(b as char),
+                    _ => s.push_str(&format!("\\{:03o}", b)),
+                }
+            }
+            s.push('"');
+            s
+        }
+        (Ty::Enum(ei), TK::Variant(vi, fields)) if fields.is_empty() => {
+            let c = g.decl(&v.ty, "", false).map_err(|e| err(&e))?;
+            format!("(({}){})", c, g.p.enums[*ei as usize].variants[*vi as usize].discr)
+        }
+        _ => return Err(err("only integers, `bool`, floats, `str` and payload-free enum variants can be C constants")),
+    };
+    Ok(format!("#define {} {}", name, value))
+}
+
+/// Check that every `export "C"` function has a C signature, and every
+/// `export "C" const` a C value.
 pub fn check_exports(p: &Program) -> Result<(), Diag> {
-    let mut g = Gen { p, opaque: BTreeMap::new(), enums: BTreeMap::new() };
+    let mut g = Gen { p, prefix: "", opaque: BTreeMap::new(), enums: BTreeMap::new() };
     for f in exports(p) {
         prototype(&mut g, f)?;
+    }
+    for (name, v, span) in &p.c_consts {
+        const_define(&mut g, name, v, *span)?;
     }
     Ok(())
 }
 
-/// The header for `p`'s exports. `guard` names the include guard.
-pub fn generate(p: &Program, source: &str, guard: &str) -> Result<String, Diag> {
-    let mut g = Gen { p, opaque: BTreeMap::new(), enums: BTreeMap::new() };
+/// The `///` comment lines above the item whose name is at `span`
+/// (skipping attribute lines), without the slashes.
+fn doc_lines(sm: &SourceMap, span: Span) -> Vec<String> {
+    let Some(file) = sm.files.get(span.file as usize) else { return vec![] };
+    let before = &file.text[..(span.lo as usize).min(file.text.len())];
+    let start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let mut doc = Vec::new();
+    for l in before[..start].lines().rev() {
+        let t = l.trim_start();
+        if let Some(d) = t.strip_prefix("///") {
+            doc.push(d.strip_prefix(' ').unwrap_or(d).trim_end().replace("*/", "* /"));
+        } else if !t.starts_with("#[") {
+            break;
+        }
+    }
+    doc.reverse();
+    doc
+}
+
+/// `doc` as a C comment, or nothing.
+fn c_comment(doc: &[String]) -> String {
+    match doc {
+        [] => String::new(),
+        [one] => format!("/* {} */\n", one),
+        _ => {
+            let mut s = format!("/* {}\n", doc[0]);
+            for (i, l) in doc[1..].iter().enumerate() {
+                let end = if i + 2 == doc.len() { " */" } else { "" };
+                if l.is_empty() {
+                    s.push_str(&format!(" *{}\n", end));
+                } else {
+                    s.push_str(&format!(" * {}{}\n", l, end));
+                }
+            }
+            s
+        }
+    }
+}
+
+/// The header for `p`'s exports. `guard` names the include guard;
+/// `prefix` goes before the C names of structs and enums without a
+/// `#[c_name]`.
+pub fn generate(p: &Program, sm: &SourceMap, source: &str, guard: &str, prefix: &str) -> Result<String, Diag> {
+    let mut g = Gen { p, prefix, opaque: BTreeMap::new(), enums: BTreeMap::new() };
     let mut protos = Vec::new();
     for f in exports(p) {
-        protos.push(prototype(&mut g, f)?);
+        protos.push((c_comment(&doc_lines(sm, f.span)), prototype(&mut g, f)?));
+    }
+    let mut defines = Vec::new();
+    for (name, v, span) in &p.c_consts {
+        defines.push((c_comment(&doc_lines(sm, *span)), const_define(&mut g, name, v, *span)?));
     }
     let mut out = String::new();
     out.push_str(&format!("/* Generated by `loimi build --header` from {}. Do not edit. */\n", source));
@@ -278,8 +397,21 @@ pub fn generate(p: &Program, source: &str, guard: &str) -> Result<String, Diag> 
             out.push('\n');
         }
     }
-    for d in protos {
-        out.push_str(&d);
+    if !defines.is_empty() {
+        for (doc, d) in &defines {
+            out.push_str(doc);
+            out.push_str(d);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    for (i, (doc, d)) in protos.iter().enumerate() {
+        // A blank line before a documented declaration.
+        if !doc.is_empty() && i > 0 {
+            out.push('\n');
+        }
+        out.push_str(doc);
+        out.push_str(d);
         out.push_str(";\n");
     }
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");

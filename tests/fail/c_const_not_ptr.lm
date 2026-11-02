@@ -1,0 +1,5 @@
+// error: `#[c_const(n)]`: `n` is not a pointer parameter
+#[c_const(n)]
+export "C" fn f(n: u64) -> u64 { n }
+
+fn main() {}

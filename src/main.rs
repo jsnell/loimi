@@ -46,6 +46,8 @@ struct Opts {
     kind: OutKind,
     /// `--header out.h`: also write a C header for the `export "C"` functions.
     header: Option<PathBuf>,
+    /// `--header-prefix p`: C names of structs and enums start with `p`.
+    header_prefix: String,
     /// `--tls=`: the TLS model for runtime thread-locals (default:
     /// initial-exec, local-dynamic for `--shared`).
     tls: Option<Tls>,
@@ -73,7 +75,7 @@ enum Tls {
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address] [-W error | --deny-warnings]
-                  [--lib | --shared] [--header out.h] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
+                  [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -175,7 +177,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let guard: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
             let source = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            Some(header::generate(&prog, &source, &guard)?)
+            Some(header::generate(&prog, sm, &source, &guard, &opts.header_prefix)?)
         }
         None => None,
     };
@@ -336,6 +338,7 @@ fn parse_args() -> Result<Opts, String> {
         align_functions: None,
         kind: OutKind::Exe,
         header: None,
+        header_prefix: String::new(),
         tls: None,
         jit: false,
     };
@@ -353,6 +356,7 @@ fn parse_args() -> Result<Opts, String> {
             "--lib" => o.kind = OutKind::Static,
             "--shared" => o.kind = OutKind::Shared,
             "--header" => o.header = Some(PathBuf::from(args.next().ok_or("--header needs a path")?)),
+            "--header-prefix" => o.header_prefix = args.next().ok_or("--header-prefix needs a prefix")?,
             s if s.starts_with("--tls=") => {
                 o.tls = Some(match &s["--tls=".len()..] {
                     "initial-exec" => Tls::InitialExec,

@@ -27,5 +27,10 @@ int main(void) {
     printf("arg_count %llu\n", (unsigned long long)arg_count());
     printf("protected %d %d\n", protected_depth(7, false), protected_depth(7, true));
     printf("protected again %d\n", protected_depth(3, false));
+    printf("consts %u %u %d %llu %d %s %d\n", API_FLAG_A, API_FLAG_B, API_MIN, (unsigned long long)API_BIG, API_ON, API_NAME,
+           API_SUB);
+    const char *bytes = "\x01\x02";
+    const api_point *pt = point_new(10, 20);
+    printf("point_sum %lld\n", (long long)point_sum(pt, bytes, 2));
     return 0;
 }
