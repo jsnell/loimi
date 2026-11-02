@@ -643,6 +643,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 }
             }
             TK::Binary(op, a, b) => self.binary(e, *op, a, b),
+            TK::Cast(inner) if inner.ty.is_int() && matches!(e.ty, Ty::Enum(_)) => self.int_to_enum(inner, e),
             TK::Cast(inner) => self.cast(inner, &e.ty),
             TK::Call(f, args) => self.call(e, f, args),
             TK::Intrinsic(i, args) => self.intrinsic(e, *i, args),
@@ -1409,6 +1410,47 @@ impl<'a, 'p> FnGen<'a, 'p> {
         self.inst(format!("{} {} {}, {}", ins, lt, x, y))
     }
 
+    /// `x as Kind` for a fieldless enum. With checks on (debug builds), a
+    /// value that is not one of the discriminants panics.
+    fn int_to_enum(&mut self, inner: &TExpr, e: &TExpr) -> String {
+        let Ty::Int(it) = inner.ty else { unreachable!() };
+        let Ty::Enum(eid) = e.ty else { unreachable!() };
+        let ed = &self.p().enums[eid as usize];
+        if self.cg.opts.overflow_checks {
+            let v = self.val(inner);
+            let w = if it.bits < 64 {
+                let op = if it.signed { "sext" } else { "zext" };
+                self.inst(format!("{} i{} {} to i64", op, it.bits, v))
+            } else {
+                v.clone()
+            };
+            let mut ds: Vec<i128> = ed.variants.iter().map(|v| v.discr).collect();
+            ds.sort();
+            ds.dedup();
+            let (lo, hi) = (ds[0], *ds.last().unwrap());
+            let mut bad = if hi - lo + 1 == ds.len() as i128 {
+                let d = self.inst(format!("sub i64 {}, {}", w, lo as i64));
+                self.inst(format!("icmp ugt i64 {}, {}", d, (hi - lo) as i64))
+            } else {
+                let mut ok = "false".to_string();
+                for d in &ds {
+                    let c = self.inst(format!("icmp eq i64 {}, {}", w, *d as i64));
+                    ok = self.inst(format!("or i1 {}, {}", ok, c));
+                }
+                self.inst(format!("xor i1 {}, true", ok))
+            };
+            if !it.signed && it.bits == 64 && lo < 0 {
+                // Large u64 values would look negative.
+                let neg = self.inst(format!("icmp slt i64 {}, 0", w));
+                bad = self.inst(format!("or i1 {}, {}", bad, neg));
+            }
+            self.check(&bad, "integer cast to enum is not a valid discriminant", e.span);
+            let tb = ed.tag.bits as u32;
+            return if tb == 64 { w } else { self.inst(format!("trunc i64 {} to i{}", w, tb)) };
+        }
+        self.cast(inner, &e.ty)
+    }
+
     pub fn cast(&mut self, inner: &TExpr, to: &Ty) -> String {
         let v = self.val(inner);
         let from = &inner.ty;
@@ -1425,7 +1467,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let fsigned = matches!(from, Ty::Int(it) if it.signed) || matches!(from, Ty::Enum(_));
         let tsigned = matches!(to, Ty::Int(it) if it.signed);
         match (from, to) {
-            (Ty::Int(_) | Ty::Bool | Ty::Enum(_) | Ty::Value(_), Ty::Int(_) | Ty::Value(_)) => {
+            (Ty::Int(_) | Ty::Bool | Ty::Enum(_) | Ty::Value(_), Ty::Int(_) | Ty::Value(_) | Ty::Enum(_)) => {
                 let (fb, tb) = (bits(from, p), bits(to, p));
                 if fb == tb {
                     v

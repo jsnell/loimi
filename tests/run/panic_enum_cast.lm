@@ -1,0 +1,16 @@
+import std.io;
+enum Op: u8 { Load, Store }
+enum Sparse { A = 1, B = 5 }
+fn conv(x: i64) -> Op { x as Op }
+fn sparse(x: u32) -> Sparse { x as Sparse }
+fn main() {
+    let s = sparse(5);
+    io.print_bool(s == Sparse.B); io.println("");
+    conv(1);
+    io.println("ok");
+    conv(256 + 1);
+}
+// expect: true
+// expect: ok
+// expect-exit: 134
+// expect-stderr: panic_enum_cast.lm:4:25: integer cast to enum is not a valid discriminant

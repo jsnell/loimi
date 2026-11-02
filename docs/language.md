@@ -66,6 +66,16 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   its own copy, which is what an interpreter wants for "current VM" or
   per-thread caches. `pub var` is visible to other modules. Globals are not
   GC roots.
+- **Integer-to-enum casts.** `x as Kind` converts an integer to an enum
+  without payloads (decoding an opcode byte, a token kind from a table). The
+  value must equal one of the discriminants. Like overflow, this is checked
+  in debug builds (a panic naming the cast) and unchecked in release builds,
+  where an invalid value is undefined behavior for any `match` on the
+  result. A constant operand is checked at compile time. `Kind.COUNT` is the
+  number of variants, typed like an integer literal (`[u32; Kind.COUNT]`,
+  `for i in 0..Kind.COUNT { let k = i as Kind; }`); a variant named `COUNT`
+  takes precedence. With explicit discriminants the count is not the
+  largest discriminant plus one.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - `defer stmt` runs `stmt` when the enclosing scope exits.

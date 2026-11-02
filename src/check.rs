@@ -109,6 +109,8 @@ fn is_literal_expr(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) => true,
         ExprKind::Unary(UnOp::Neg, inner) => is_literal_expr(inner),
+        // `Kind.COUNT` types like a literal.
+        ExprKind::Field(_, n) => n.name == "COUNT",
         _ => false,
     }
 }
@@ -1094,10 +1096,24 @@ impl<'a> Checker<'a> {
                     return Ok(v);
                 }
                 if !self.castable(&v.ty, &to) {
+                    let why = match &to {
+                        Ty::Enum(_) if v.ty.is_int() => " (only enums without payloads can be cast from integers)",
+                        _ => "",
+                    };
                     return Err(Diag::new(
                         span,
-                        format!("cannot cast `{}` to `{}`", self.ty_name(&v.ty), self.ty_name(&to)),
+                        format!("cannot cast `{}` to `{}`{}", self.ty_name(&v.ty), self.ty_name(&to), why),
                     ));
+                }
+                if let Ty::Enum(eid) = &to {
+                    // A constant converts at compile time.
+                    if let TK::Int(x) = fold(&v).kind {
+                        let vs = &self.prog.enums[*eid as usize].variants;
+                        let Some(idx) = vs.iter().position(|var| var.discr == x) else {
+                            return Err(Diag::new(span, format!("`{}` is not a discriminant of `{}`", x, self.ty_name(&to))));
+                        };
+                        return Ok(mk(to, TK::Variant(idx as u32, vec![]), span));
+                    }
                 }
                 Ok(mk(to, TK::Cast(Box::new(v)), span))
             }
@@ -1620,6 +1636,11 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.type_path(cx, base) {
             if let Some(idx) = self.variant_index(&t, &name.name) {
                 return self.make_variant(cx, &t, idx, &[], span);
+            }
+            if let (Ty::Enum(eid), "COUNT") = (&t, name.name.as_str()) {
+                // The number of variants, typed like an integer literal.
+                let n = self.prog.enums[*eid as usize].variants.len() as i128;
+                return self.int_lit(n, exp, span);
             }
             if let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() {
                 return self.def_value(Def::Fn(f), &name.name, span);
@@ -2228,7 +2249,10 @@ impl<'a> Checker<'a> {
             (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => true,
             (Ty::Gc(_), Ty::Int(it)) => it.bits == 64,
             (Ty::Ptr(_), Ty::Int(it)) | (Ty::Int(it), Ty::Ptr(_)) => it.bits == 64,
-            (Ty::Enum(e), Ty::Int(_)) => !self.prog.enums[*e as usize].has_payload(),
+            (Ty::Enum(e), Ty::Int(_)) | (Ty::Int(_), Ty::Enum(e)) => {
+                let ed = &self.prog.enums[*e as usize];
+                !ed.has_payload() && !ed.variants.is_empty()
+            }
             (Ty::Value(v), Ty::Int(it)) | (Ty::Int(it), Ty::Value(v)) => {
                 it.bits == 64 && self.prog.values[*v as usize].repr != ValueRepr::Boxed
             }
