@@ -1,0 +1,201 @@
+// Lox's run-time values and the objects that live in the GC heap.
+
+import std.gc;
+import std.hash;
+import std.mem;
+import std.num;
+import std.obj;
+import std.text;
+import vm.{Lox};
+
+/// A string. Every string is interned (see `Strings`), so two strings are
+/// equal exactly when they are the same object.
+pub object LStr { hash: u64, data: [u8] }
+
+/// A captured variable. A local that some closure captures lives in a
+/// cell from its declaration on; the local's register holds the cell.
+pub object Cell { v: Value }
+
+pub object Closure { proto: *Proto, upvals: [Gc<Cell>] }
+
+/// A class. Its methods are the properties of `methods`, an object that
+/// is the prototype of every instance (inherited methods are copied in
+/// when the class is created). `inline` is the number of inline slots new
+/// instances get: it grows to the most fields an instance has had.
+pub object Class { name: Gc<LStr>, methods: Gc<Inst>, init: Value, inline: u32 }
+
+/// An instance (and a class's method table): a std.obj object. `proto` is
+/// the class's method table, so a property read finds fields first and
+/// then methods, and std.obj's inline caches handle both.
+pub object Inst {
+    shape: Gc<obj.Shape>,
+    dict: ?Gc<obj.Dict>,
+    overflow: ?Gc<Slots>,
+    proto: ?Gc<Inst>,
+    class: ?Gc<Class>,
+    inline: [Value],
+}
+pub object Slots { data: [Value] }
+
+pub fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+pub type Model = obj.Model<Gc<Inst>, Gc<Slots>, Value>;
+
+pub object Bound { recv: Value, method: Gc<Closure> }
+
+/// A native function.
+pub struct Native { name: str, arity: u32, f: fn(*Value) -> Value }
+
+/// One 64-bit word. `Method` marks a closure stored in a class's method
+/// table, so that a property read can tell a method (which it binds to the
+/// receiver) from a field holding a function. It never reaches Lox code.
+pub value Value repr nanbox {
+    Num(f64) unboxed,
+    Nil,
+    Bool(bool),
+    Str(Gc<LStr>),
+    Fun(Gc<Closure>),
+    Class(Gc<Class>),
+    Inst(Gc<Inst>),
+    Bound(Gc<Bound>),
+    Method(Gc<Closure>),
+    /// A captured local's register holds its cell.
+    CellV(Gc<Cell>),
+    /// A native function: an index into the machine's table.
+    Native(u32),
+}
+
+/// A compiled function. Prototypes are never freed. Their constants hold
+/// strings, so the vm's root scanner marks them.
+pub struct Proto {
+    name: str,
+    arity: u32,
+    nregs: u32,
+    words: []u32,
+    code: Verified<Lox>,
+    lines: []u32,
+    consts: []Value,
+    /// Functions defined inside this one (CLOSURE's operand).
+    children: []*Proto,
+    /// Where each upvalue of a closure of this function comes from: bit 31
+    /// set for a cell in a register of the enclosing function (the low
+    /// bits are the register), clear for an upvalue of the enclosing
+    /// closure.
+    captures: []u32,
+    is_script: bool,
+}
+
+pub const LOCAL_CAPTURE: u32 = 0x80000000;
+
+pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
+pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
+impl hash.Hash for Value;
+
+// ── interned strings ─────────────────────────────────────────────────
+
+/// The string table: every live string, by contents. Weak: a sweeper
+/// drops the strings that were not marked.
+pub struct Strings { slots: *u64, cap: u64, count: u64 }
+
+pub fn Strings.new() -> Strings { Strings { slots: mem.alloc(256), cap: 256, count: 0 } }
+
+fn str_hash(s: str) -> u64 {
+    // FNV-1a, as good as anything for short strings.
+    var h: u64 = 14695981039346656037;
+    for i in 0..s.len { h = (h ^ (s[i] as u64)) *% 1099511628211; }
+    h
+}
+
+fn as_str(a: u64) -> Gc<LStr> { unsafe { a as Gc<LStr> } }
+
+/// The interned string with contents `s`, made if there is none.
+pub fn Strings.intern(t: *Strings, h: *gc.Heap, s: str) -> Gc<LStr> {
+    let hv = str_hash(s);
+    var i = hv & (t.cap - 1);
+    loop {
+        let a = t.slots[i];
+        if a == 0 { break; }
+        if a != 1 {
+            let x = as_str(a);
+            if x.hash == hv and x.data.eq(s) { return x; }
+        }
+        i = (i + 1) & (t.cap - 1);
+    }
+    let o = new(h, LStr { hash: hv }, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    t.insert(o);
+    o
+}
+
+fn Strings.insert(t: *Strings, o: Gc<LStr>) {
+    if (t.count + 1) * 2 > t.cap { t.grow(); }
+    var i = o.hash & (t.cap - 1);
+    while t.slots[i] > 1 { i = (i + 1) & (t.cap - 1); }
+    t.slots[i] = o as u64;
+    t.count += 1;
+}
+
+fn Strings.grow(t: *Strings) {
+    let old = t.slots;
+    let n = t.cap;
+    t.cap = n * 2;
+    t.slots = mem.alloc(t.cap);
+    t.count = 0;
+    for i in 0..n { if old[i] > 1 { t.insert(as_str(old[i])); } }
+    mem.release(old);
+}
+
+/// The sweeper: forget strings that died (1 marks a deleted slot).
+pub fn sweep_strings(h: *gc.Heap, data: *u8) {
+    let t = data as *Strings;
+    for i in 0..t.cap {
+        let a = t.slots[i];
+        if a > 1 and !gc.is_marked(a as *u8) {
+            t.slots[i] = 1;
+            t.count -= 1;
+        }
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+pub fn falsey(v: Value) -> bool {
+    match v {
+        Nil => true,
+        Bool(b) => !b,
+        _ => false,
+    }
+}
+
+/// Lox equality: numbers by value, everything else by identity (strings
+/// are interned).
+pub fn equal(a: Value, b: Value) -> bool {
+    if let (Num(x), Num(y)) = (a, b) { return x == y; }
+    a == b
+}
+
+pub fn write(b: *text.StrBuf, v: Value) {
+    match v {
+        Num(x) => num.write_g(b, x, 6),
+        Nil => b.push_str("nil"),
+        Bool(t) => b.push_str(if t { "true" } else { "false" }),
+        Str(s) => b.push_str(s.data),
+        Fun(c) => write_fn(b, c.proto),
+        Method(c) => write_fn(b, c.proto),
+        Bound(m) => write_fn(b, m.method.proto),
+        Class(c) => b.push_str(c.name.data),
+        Inst(o) => {
+            if let Some(c) = o.class { b.push_str(c.name.data); }
+            b.push_str(" instance");
+        }
+        Native(_) => b.push_str("<native fn>"),
+        CellV(_) => b.push_str("<cell>"),
+    }
+}
+
+fn write_fn(b: *text.StrBuf, p: *Proto) {
+    if p.is_script { b.push_str("<script>"); return; }
+    b.push_str("<fn ");
+    b.push_str(p.name);
+    b.push_str(">");
+}

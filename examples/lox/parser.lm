@@ -1,0 +1,688 @@
+// Lox syntax trees, and a parser that builds them and resolves names.
+//
+// The parser does what a single-pass Lox compiler does besides emitting
+// code: it reports every compile error with Lox's messages and panic-mode
+// recovery, and it resolves each variable to a local slot, an upvalue
+// index or a global name. It also records which locals are captured by
+// closures, which the code generator needs before it compiles the
+// declaration (captured locals live in heap cells). Expressions go through
+// std.parse's Pratt driver.
+
+import std.io;
+import std.mem;
+import std.parse;
+import std.text;
+import lexer;
+import lexer.{T, Token, Lexer};
+
+/// A resolved variable.
+pub enum Var {
+    /// A local of the current function: an index into `Program.locals`.
+    Local(u32),
+    /// An upvalue of the current function.
+    Upval(u32),
+    Global(str),
+}
+
+pub enum Expr {
+    Num(f64),
+    /// A string literal's contents.
+    Str(str),
+    Bool(bool),
+    Nil,
+    Var(Var),
+    Assign(Var, *Node),
+    /// `-x` (Minus) and `!x` (Bang).
+    Unary(T, *Node),
+    Binary(T, *Node, *Node),
+    And(*Node, *Node),
+    Or(*Node, *Node),
+    Call(*Node, mem.Vec<*Node>),
+    /// `obj.name`
+    Get(*Node, str),
+    /// `obj.name = value`
+    Set(*Node, str, *Node),
+    /// `super.name`: the method name, `this` and `super`.
+    Super(str, Var, Var),
+    /// A parenthesized expression or `this`: not an assignment target.
+    Group(*Node),
+}
+
+/// An expression and its line (the line runtime errors report).
+pub struct Node { e: Expr, line: u32 }
+
+pub enum Stmt {
+    Expr(*Node),
+    Print(*Node),
+    /// `var x = init;` (the target is Global or Local).
+    VarDecl(Var, ?*Node, u32),
+    Block(mem.Vec<Stmt>),
+    If(*Node, *Stmt, ?*Stmt),
+    /// `while (cond) body`, and a `for` loop's increment.
+    While(*Node, *Stmt, ?*Node),
+    Fun(Var, *Fun),
+    Return(?*Node, u32),
+    Class(*ClassDecl),
+}
+
+pub enum FunKind { Script, Function, Method, Initializer }
+
+/// A function: its body and what the code generator needs to know about
+/// its variables.
+pub struct Fun {
+    name: str,
+    kind: FunKind,
+    arity: u32,
+    body: mem.Vec<Stmt>,
+    /// The parameters' local ids (slot 0 is the callee or `this`).
+    params: mem.Vec<u32>,
+    /// For each upvalue: the enclosing function's local slot (if
+    /// `is_local`) or the enclosing function's upvalue index.
+    upvals: mem.Vec<Capture>,
+    /// The local id of slot 0 (`this` in methods).
+    slot0: u32,
+    line: u32,
+}
+
+pub struct Capture { is_local: bool, index: u32 }
+
+pub struct ClassDecl {
+    name: str,
+    target: Var,
+    line: u32,
+    superclass: ?*Node,
+    /// The local id of `super`, if there is a superclass.
+    super_local: u32,
+    methods: mem.Vec<*Fun>,
+}
+
+/// What the code generator needs about a local: its register and whether
+/// a closure captures it.
+pub struct LocalInfo { slot: u32, captured: bool }
+
+pub struct Program { script: *Fun, locals: mem.Vec<LocalInfo> }
+
+// ── compile-time scopes ──────────────────────────────────────────────
+
+struct Local { name: str, depth: i32, id: u32 }
+
+struct FnState {
+    enclosing: ?*FnState,
+    fun: *Fun,
+    locals: mem.Vec<Local>,
+    scope_depth: i32,
+    /// Constants clox would make in this function's chunk, to report
+    /// "Too many constants in one chunk." where clox does.
+    nconsts: u32,
+}
+
+struct ClassState { enclosing: ?*ClassState, has_super: bool }
+
+type Pratt = parse.Pratt<Parser, T, *Node, ()>;
+
+pub struct Parser {
+    lx: Lexer,
+    cur: Token,
+    prev: Token,
+    had_error: bool,
+    panic: bool,
+    arena: *mem.Arena,
+    pratt: *Pratt,
+    fs: *FnState,
+    cls: ?*ClassState,
+    infos: mem.Vec<LocalInfo>,
+    err: text.StrBuf,
+}
+
+// ── errors ───────────────────────────────────────────────────────────
+
+fn Parser.error_at(p: *Parser, t: Token, msg: str) {
+    if p.panic { return; }
+    p.panic = true;
+    p.had_error = true;
+    let b = &p.err;
+    b.clear();
+    b.push_str("[line ");
+    b.push_int(t.line as i64);
+    b.push_str("] Error");
+    if t.kind == T.Eof {
+        b.push_str(" at end");
+    } else if t.kind != T.Error {
+        b.push_str(" at '");
+        b.push_str(t.text);
+        b.push_str("'");
+    }
+    b.push_str(": ");
+    b.push_str(msg);
+    io.eprintln(b.as_str());
+}
+
+fn Parser.error(p: *Parser, msg: str) { p.error_at(p.prev, msg); }
+fn Parser.error_cur(p: *Parser, msg: str) { p.error_at(p.cur, msg); }
+
+// ── tokens ───────────────────────────────────────────────────────────
+
+fn Parser.advance(p: *Parser) {
+    p.prev = p.cur;
+    loop {
+        p.cur = p.lx.next();
+        if p.cur.kind != T.Error { break; }
+        p.error_cur(p.cur.text);
+    }
+}
+
+fn Parser.check(p: *Parser, k: T) -> bool { p.cur.kind == k }
+
+fn Parser.match_(p: *Parser, k: T) -> bool {
+    if p.cur.kind != k { return false; }
+    p.advance();
+    true
+}
+
+/// Consume a `k`, or report `msg` at the current token and fail.
+fn Parser.consume(p: *Parser, k: T, msg: str) -> Result<(), ()> {
+    if p.cur.kind == k { p.advance(); return Ok(()); }
+    p.error_cur(msg);
+    Err(())
+}
+
+fn Parser.node(p: *Parser, e: Expr, line: u32) -> *Node {
+    let n = p.arena.alloc_bytes(size_of<Node>(), 8) as *Node;
+    *n = Node { e: e, line: line };
+    n
+}
+
+fn Parser.stmt_box(p: *Parser, s: Stmt) -> *Stmt {
+    let n = p.arena.alloc_bytes(size_of<Stmt>(), 8) as *Stmt;
+    *n = s;
+    n
+}
+
+/// Count a constant of the current chunk, as clox would make one.
+fn Parser.constant(p: *Parser) {
+    p.fs.nconsts += 1;
+    if p.fs.nconsts > 256 { p.error("Too many constants in one chunk."); }
+}
+
+// ── scopes and names ─────────────────────────────────────────────────
+
+fn Parser.new_info(p: *Parser, slot: u32) -> u32 {
+    p.infos.push(LocalInfo { slot: slot, captured: false });
+    (p.infos.len - 1) as u32
+}
+
+/// Declare a local in the current scope (uninitialized until
+/// `mark_initialized`). Returns its id.
+fn Parser.add_local(p: *Parser, name: str) -> u32 {
+    let fs = p.fs;
+    if fs.locals.len == 256 {
+        p.error("Too many local variables in function.");
+        return 0;
+    }
+    let id = p.new_info(fs.locals.len as u32);
+    fs.locals.push(Local { name: name, depth: -1, id: id });
+    id
+}
+
+fn Parser.mark_initialized(p: *Parser) {
+    let fs = p.fs;
+    if fs.scope_depth == 0 { return; }
+    fs.locals.ptr_at(fs.locals.len - 1).depth = fs.scope_depth;
+}
+
+/// Declare variable `name` (just consumed) where it is: a local in a
+/// block, a global at the top level.
+fn Parser.declare(p: *Parser, name: Token) -> Var {
+    let fs = p.fs;
+    if fs.scope_depth == 0 {
+        p.constant();
+        return Var.Global(name.text);
+    }
+    var i = fs.locals.len;
+    while i > 0 {
+        i -= 1;
+        let l = fs.locals.at(i);
+        if l.depth != -1 and l.depth < fs.scope_depth { break; }
+        if l.name.eq(name.text) { p.error("Already a variable with this name in this scope."); }
+    }
+    Var.Local(p.add_local(name.text))
+}
+
+fn resolve_local(p: *Parser, fs: *FnState, name: str) -> ?u32 {
+    var i = fs.locals.len;
+    while i > 0 {
+        i -= 1;
+        let l = fs.locals.at(i);
+        if l.name.eq(name) {
+            if l.depth == -1 { p.error("Can't read local variable in its own initializer."); }
+            return Some(i as u32);
+        }
+    }
+    None
+}
+
+fn add_upvalue(p: *Parser, fs: *FnState, is_local: bool, index: u32) -> u32 {
+    let ups = &fs.fun.upvals;
+    for i in 0..ups.len {
+        let u = ups.at(i);
+        if u.is_local == is_local and u.index == index { return i as u32; }
+    }
+    if ups.len == 256 {
+        p.error("Too many closure variables in function.");
+        return 0;
+    }
+    ups.push(Capture { is_local: is_local, index: index });
+    (ups.len - 1) as u32
+}
+
+fn resolve_upvalue(p: *Parser, fs: *FnState, name: str) -> ?u32 {
+    let Some(enc) = fs.enclosing else { return None; };
+    if let Some(slot) = resolve_local(p, enc, name) {
+        let id = enc.locals.at(slot as u64).id;
+        p.infos.ptr_at(id as u64).captured = true;
+        return Some(add_upvalue(p, fs, true, slot));
+    }
+    if let Some(up) = resolve_upvalue(p, enc, name) { return Some(add_upvalue(p, fs, false, up)); }
+    None
+}
+
+fn Parser.resolve(p: *Parser, name: str) -> Var {
+    if let Some(slot) = resolve_local(p, p.fs, name) { return Var.Local(p.fs.locals.at(slot as u64).id); }
+    if let Some(up) = resolve_upvalue(p, p.fs, name) { return Var.Upval(up); }
+    p.constant();
+    Var.Global(name)
+}
+
+fn Parser.begin_scope(p: *Parser) { p.fs.scope_depth += 1; }
+
+fn Parser.end_scope(p: *Parser) {
+    let fs = p.fs;
+    fs.scope_depth -= 1;
+    while fs.locals.len > 0 and fs.locals.at(fs.locals.len - 1).depth > fs.scope_depth {
+        fs.locals.pop();
+    }
+}
+
+// ── expressions: the Pratt hooks ─────────────────────────────────────
+
+fn peek(p: *Parser) -> T { p.cur.kind }
+
+fn advance(p: *Parser) -> Result<(), ()> { p.advance(); Ok(()) }
+
+fn Parser.expr(p: *Parser) -> Result<*Node, ()> { p.pratt.expr(p) }
+
+fn unary(p: *Parser, op: T, e: *Node) -> Result<*Node, ()> {
+    Ok(p.node(Expr.Unary(op, e), p.prev.line))
+}
+
+fn binary(p: *Parser, op: T, l: *Node, r: *Node) -> Result<*Node, ()> {
+    // The line of the operator's right operand's last token is what clox
+    // reports; the line of the last token consumed is the same thing.
+    let line = p.prev.line;
+    let e = match op {
+        And => Expr.And(l, r),
+        Or => Expr.Or(l, r),
+        _ => Expr.Binary(op, l, r),
+    };
+    Ok(p.node(e, line))
+}
+
+/// `=`: the left operand must be a variable or a property.
+fn assign(p: *Parser, op: T, l: *Node) -> Result<*Node, ()> {
+    let eq = p.prev;
+    let r = p.pratt.parse(p, 0)?;
+    match l.e {
+        Var(v) => Ok(p.node(Expr.Assign(v, r), eq.line)),
+        Get(o, name) => Ok(p.node(Expr.Set(o, name, r), p.prev.line)),
+        _ => {
+            p.error_at(eq, "Invalid assignment target.");
+            Ok(r)
+        }
+    }
+}
+
+fn Parser.arguments(p: *Parser) -> Result<mem.Vec<*Node>, ()> {
+    var args: mem.Vec<*Node> = mem.Vec.new();
+    if !p.check(T.RParen) {
+        loop {
+            args.push(p.expr()?);
+            if args.len == 256 { p.error("Can't have more than 255 arguments."); }
+            if !p.match_(T.Comma) { break; }
+        }
+    }
+    p.consume(T.RParen, "Expect ')' after arguments.")?;
+    Ok(args)
+}
+
+/// A primary expression and its calls and property accesses.
+fn atom(p: *Parser) -> Result<*Node, ()> {
+    var e = primary(p)?;
+    loop {
+        if p.match_(T.LParen) {
+            let args = p.arguments()?;
+            e = p.node(Expr.Call(e, args), p.prev.line);
+        } else if p.match_(T.Dot) {
+            p.consume(T.Ident, "Expect property name after '.'.")?;
+            p.constant();
+            e = p.node(Expr.Get(e, p.prev.text), p.prev.line);
+        } else {
+            break;
+        }
+    }
+    Ok(e)
+}
+
+fn primary(p: *Parser) -> Result<*Node, ()> {
+    p.advance();
+    let t = p.prev;
+    let line = t.line;
+    match t.kind {
+        Num => { p.constant(); Ok(p.node(Expr.Num(t.num), line)) }
+        Str => { p.constant(); Ok(p.node(Expr.Str(t.text[1..t.text.len - 1]), line)) }
+        True => Ok(p.node(Expr.Bool(true), line)),
+        False => Ok(p.node(Expr.Bool(false), line)),
+        Nil => Ok(p.node(Expr.Nil, line)),
+        LParen => {
+            let e = p.expr()?;
+            p.consume(T.RParen, "Expect ')' after expression.")?;
+            Ok(p.node(Expr.Group(e), line))
+        }
+        Ident => Ok(p.node(Expr.Var(p.resolve(t.text)), line)),
+        This => {
+            if p.cls.is_none() {
+                p.error("Can't use 'this' outside of a class.");
+                return Ok(p.node(Expr.Nil, line));
+            }
+            let v = p.node(Expr.Var(p.resolve("this")), line);
+            Ok(p.node(Expr.Group(v), line))
+        }
+        Super => {
+            match p.cls {
+                None => p.error("Can't use 'super' outside of a class."),
+                Some(c) => if !c.has_super { p.error("Can't use 'super' in a class with no superclass."); },
+            }
+            p.consume(T.Dot, "Expect '.' after 'super'.")?;
+            p.consume(T.Ident, "Expect superclass method name.")?;
+            let name = p.prev.text;
+            p.constant();
+            let this = p.resolve("this");
+            let sup = p.resolve("super");
+            Ok(p.node(Expr.Super(name, this, sup), p.prev.line))
+        }
+        _ => {
+            p.error("Expect expression.");
+            Err(())
+        }
+    }
+}
+
+// ── statements ───────────────────────────────────────────────────────
+
+fn Parser.block(p: *Parser) -> Result<mem.Vec<Stmt>, ()> {
+    var out: mem.Vec<Stmt> = mem.Vec.new();
+    while !p.check(T.RBrace) and !p.check(T.Eof) {
+        if let Some(s) = p.declaration() { out.push(s); }
+    }
+    p.consume(T.RBrace, "Expect '}' after block.")?;
+    Ok(out)
+}
+
+/// A declaration, with panic-mode recovery: after an error, skip to a
+/// likely statement boundary. None if the declaration had an error.
+fn Parser.declaration(p: *Parser) -> ?Stmt {
+    let r = if p.match_(T.Class) {
+        p.class_decl()
+    } else if p.match_(T.Fun) {
+        p.fun_decl()
+    } else if p.match_(T.Var) {
+        p.var_decl()
+    } else {
+        p.statement()
+    };
+    if p.panic { p.synchronize(); }
+    match r {
+        Ok(s) => Some(s),
+        Err(_) => None,
+    }
+}
+
+fn Parser.synchronize(p: *Parser) {
+    p.panic = false;
+    while p.cur.kind != T.Eof {
+        if p.prev.kind == T.Semi { return; }
+        match p.cur.kind {
+            Class | Fun | Var | For | If | While | Print | Return => return,
+            _ => {}
+        }
+        p.advance();
+    }
+}
+
+fn Parser.var_decl(p: *Parser) -> Result<Stmt, ()> {
+    p.consume(T.Ident, "Expect variable name.")?;
+    let name = p.prev;
+    let target = p.declare(name);
+    let init = if p.match_(T.Eq) { Some(p.expr()?) } else { None };
+    p.consume(T.Semi, "Expect ';' after variable declaration.")?;
+    p.mark_initialized();
+    Ok(Stmt.VarDecl(target, init, name.line))
+}
+
+fn Parser.fun_decl(p: *Parser) -> Result<Stmt, ()> {
+    p.consume(T.Ident, "Expect function name.")?;
+    let name = p.prev;
+    let target = p.declare(name);
+    // A function may refer to itself.
+    p.mark_initialized();
+    let f = p.function(name.text, FunKind.Function, name.line)?;
+    Ok(Stmt.Fun(target, f))
+}
+
+fn Parser.new_fun(p: *Parser, name: str, kind: FunKind, line: u32) -> *Fun {
+    let f = p.arena.alloc_bytes(size_of<Fun>(), 8) as *Fun;
+    *f = Fun {
+        name: name, kind: kind, arity: 0, body: mem.Vec.new(), params: mem.Vec.new(),
+        upvals: mem.Vec.new(), slot0: 0, line: line,
+    };
+    f
+}
+
+/// Parameters and body of a function, in a new FnState.
+fn Parser.function(p: *Parser, name: str, kind: FunKind, line: u32) -> Result<*Fun, ()> {
+    let f = p.new_fun(name, kind, line);
+    var fs = FnState { enclosing: Some(p.fs), fun: f, locals: mem.Vec.new(), scope_depth: 0, nconsts: 0 };
+    p.fs = &fs;
+    let r = p.function_body(f, kind);
+    p.fs = fs.enclosing.unwrap();
+    fs.locals.free();
+    // The function is a constant of the enclosing chunk.
+    p.constant();
+    r?;
+    Ok(f)
+}
+
+fn Parser.function_body(p: *Parser, f: *Fun, kind: FunKind) -> Result<(), ()> {
+    let slot0 = if kind == FunKind.Function { "" } else { "this" };
+    f.slot0 = p.add_local(slot0);
+    p.fs.locals.ptr_at(0).depth = 0;
+    p.begin_scope();
+    // As in clox, a missing '(', ')' or '{' is reported and parsing goes on.
+    let _ = p.consume(T.LParen, "Expect '(' after function name.");
+    if !p.check(T.RParen) {
+        loop {
+            f.arity += 1;
+            if f.arity > 255 { p.error_cur("Can't have more than 255 parameters."); }
+            p.consume(T.Ident, "Expect parameter name.")?;
+            let id = match p.declare(p.prev) { Local(id) => id, _ => 0 };
+            p.mark_initialized();
+            f.params.push(id);
+            if !p.match_(T.Comma) { break; }
+        }
+    }
+    let _ = p.consume(T.RParen, "Expect ')' after parameters.");
+    let _ = p.consume(T.LBrace, "Expect '{' before function body.");
+    f.body = p.block()?;
+    Ok(())
+}
+
+fn Parser.class_decl(p: *Parser) -> Result<Stmt, ()> {
+    p.consume(T.Ident, "Expect class name.")?;
+    let name = p.prev;
+    p.constant();
+    let target = p.declare(name);
+    p.mark_initialized();
+    let d = p.arena.alloc_bytes(size_of<ClassDecl>(), 8) as *ClassDecl;
+    *d = ClassDecl { name: name.text, target: target, line: name.line, superclass: None, super_local: 0, methods: mem.Vec.new() };
+    var cs = ClassState { enclosing: p.cls, has_super: false };
+    p.cls = Some(&cs);
+    let r = p.class_body(d, name, &cs);
+    p.cls = cs.enclosing;
+    r?;
+    Ok(Stmt.Class(d))
+}
+
+fn Parser.class_body(p: *Parser, d: *ClassDecl, name: Token, cs: *ClassState) -> Result<(), ()> {
+    if p.match_(T.Lt) {
+        p.consume(T.Ident, "Expect superclass name.")?;
+        let sup = p.prev;
+        let v = p.resolve(sup.text);
+        if name.text.eq(sup.text) { p.error("A class can't inherit from itself."); }
+        d.superclass = Some(p.node(Expr.Var(v), sup.line));
+        p.begin_scope();
+        d.super_local = p.add_local("super");
+        p.mark_initialized();
+        cs.has_super = true;
+    }
+    p.consume(T.LBrace, "Expect '{' before class body.")?;
+    while !p.check(T.RBrace) and !p.check(T.Eof) {
+        p.consume(T.Ident, "Expect method name.")?;
+        let m = p.prev;
+        p.constant();
+        let kind = if m.text.eq("init") { FunKind.Initializer } else { FunKind.Method };
+        d.methods.push(p.function(m.text, kind, m.line)?);
+    }
+    p.consume(T.RBrace, "Expect '}' after class body.")?;
+    if cs.has_super { p.end_scope(); }
+    Ok(())
+}
+
+fn Parser.statement(p: *Parser) -> Result<Stmt, ()> {
+    if p.match_(T.Print) {
+        let e = p.expr()?;
+        p.consume(T.Semi, "Expect ';' after value.")?;
+        return Ok(Stmt.Print(e));
+    }
+    if p.match_(T.If) {
+        p.consume(T.LParen, "Expect '(' after 'if'.")?;
+        let c = p.expr()?;
+        p.consume(T.RParen, "Expect ')' after condition.")?;
+        let then = p.stmt_box(p.statement()?);
+        let otherwise = if p.match_(T.Else) { Some(p.stmt_box(p.statement()?)) } else { None };
+        return Ok(Stmt.If(c, then, otherwise));
+    }
+    if p.match_(T.While) {
+        p.consume(T.LParen, "Expect '(' after 'while'.")?;
+        let c = p.expr()?;
+        p.consume(T.RParen, "Expect ')' after condition.")?;
+        let body = p.stmt_box(p.statement()?);
+        return Ok(Stmt.While(c, body, None));
+    }
+    if p.match_(T.For) { return p.for_stmt(); }
+    if p.match_(T.Return) {
+        let line = p.prev.line;
+        if p.fs.fun.kind == FunKind.Script { p.error("Can't return from top-level code."); }
+        if p.match_(T.Semi) { return Ok(Stmt.Return(None, line)); }
+        if p.fs.fun.kind == FunKind.Initializer { p.error("Can't return a value from an initializer."); }
+        let e = p.expr()?;
+        p.consume(T.Semi, "Expect ';' after return value.")?;
+        return Ok(Stmt.Return(Some(e), line));
+    }
+    if p.match_(T.LBrace) {
+        p.begin_scope();
+        let b = p.block();
+        p.end_scope();
+        return Ok(Stmt.Block(b?));
+    }
+    let e = p.expr()?;
+    p.consume(T.Semi, "Expect ';' after expression.")?;
+    Ok(Stmt.Expr(e))
+}
+
+/// `for (init; cond; incr) body` becomes a block holding `init` and a
+/// while loop with an increment.
+fn Parser.for_stmt(p: *Parser) -> Result<Stmt, ()> {
+    p.begin_scope();
+    let r = p.for_parts();
+    p.end_scope();
+    r
+}
+
+fn Parser.for_parts(p: *Parser) -> Result<Stmt, ()> {
+    p.consume(T.LParen, "Expect '(' after 'for'.")?;
+    var out: mem.Vec<Stmt> = mem.Vec.new();
+    if p.match_(T.Semi) {
+    } else if p.match_(T.Var) {
+        out.push(p.var_decl()?);
+    } else {
+        let e = p.expr()?;
+        p.consume(T.Semi, "Expect ';' after expression.")?;
+        out.push(Stmt.Expr(e));
+    }
+    var cond = p.node(Expr.Bool(true), p.prev.line);
+    if !p.match_(T.Semi) {
+        cond = p.expr()?;
+        p.consume(T.Semi, "Expect ';' after loop condition.")?;
+    }
+    var incr: ?*Node = None;
+    if !p.match_(T.RParen) {
+        incr = Some(p.expr()?);
+        p.consume(T.RParen, "Expect ')' after for clauses.")?;
+    }
+    let body = p.stmt_box(p.statement()?);
+    out.push(Stmt.While(cond, body, incr));
+    Ok(Stmt.Block(out))
+}
+
+/// Parse a whole program. None if there were compile errors (already
+/// reported on stderr).
+pub fn parse_program(src: str, arena: *mem.Arena) -> ?Program {
+    var pr: Pratt = parse.Pratt.new(peek, advance, atom, unary, binary);
+    // Lox's precedence levels, loosest first: assignment, or, and,
+    // equality, comparison, term, factor, unary.
+    pr.led(T.Eq, 1, 0, assign);
+    pr.infix_left(T.Or, 2);
+    pr.infix_left(T.And, 3);
+    pr.infix_left(T.EqEq, 4);
+    pr.infix_left(T.BangEq, 4);
+    pr.infix_left(T.Lt, 5);
+    pr.infix_left(T.Le, 5);
+    pr.infix_left(T.Gt, 5);
+    pr.infix_left(T.Ge, 5);
+    pr.infix_left(T.Plus, 6);
+    pr.infix_left(T.Minus, 6);
+    pr.infix_left(T.Star, 7);
+    pr.infix_left(T.Slash, 7);
+    pr.prefix(T.Minus, 8);
+    pr.prefix(T.Bang, 8);
+    defer pr.free();
+
+    let tok = Token { kind: T.Eof, text: "", line: 1, num: 0.0 };
+    var p = Parser {
+        lx: Lexer.new(src), cur: tok, prev: tok, had_error: false, panic: false,
+        arena: arena, pratt: &pr, fs: 0 as *FnState, cls: None, infos: mem.Vec.new(), err: text.StrBuf.new(),
+    };
+    let script = p.new_fun("script", FunKind.Script, 1);
+    var fs = FnState { enclosing: None, fun: script, locals: mem.Vec.new(), scope_depth: 0, nconsts: 0 };
+    p.fs = &fs;
+    script.slot0 = p.add_local("");
+    fs.locals.ptr_at(0).depth = 0;
+    p.advance();
+    while !p.match_(T.Eof) {
+        if let Some(s) = p.declaration() { script.body.push(s); }
+    }
+    fs.locals.free();
+    p.lx.free();
+    p.err.free();
+    if p.had_error { return None; }
+    Some(Program { script: script, locals: p.infos })
+}

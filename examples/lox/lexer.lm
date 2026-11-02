@@ -1,0 +1,105 @@
+// The Lox scanner. Lox's lexical grammar is small: `//` comments,
+// identifiers, keywords, decimal numerals with an optional fraction, and
+// strings without escapes that may span lines. std.lex's Cursor does the
+// trivia, identifiers, keywords and operators; numerals and strings are
+// scanned by hand because Lox's rules differ from the presets (`1.` is the
+// number 1 followed by a dot, and strings have no escapes).
+
+import std.lex;
+import std.text;
+
+pub enum T {
+    // Single-character tokens.
+    LParen, RParen, LBrace, RBrace, Comma, Dot, Minus, Plus, Semi, Slash, Star,
+    // One or two character tokens.
+    Bang, BangEq, Eq, EqEq, Gt, Ge, Lt, Le,
+    // Literals.
+    Ident, Str, Num,
+    // Keywords.
+    And, Class, Else, False, For, Fun, If, Nil, Or, Print, Return, Super, This, True, Var, While,
+    // A scanning error (the message is in `text`), and the end.
+    Error, Eof,
+}
+
+/// A token: its kind, its source text (for an error, the message), its
+/// line, and for a number its value.
+pub struct Token { kind: T, text: str, line: u32, num: f64 }
+
+pub struct Lexer {
+    cur: lex.Cursor,
+    ops: lex.OpTable<T>,
+    keywords: lex.Keywords<T>,
+}
+
+pub fn Lexer.new(src: str) -> Lexer {
+    var syn = lex.none();
+    syn.line_comment = "//";
+    var lx = Lexer { cur: lex.Cursor.new(src, 0, syn), ops: lex.OpTable.new(), keywords: lex.Keywords.new() };
+    let kws = ["and", "class", "else", "false", "for", "fun", "if", "nil", "or", "print", "return",
+               "super", "this", "true", "var", "while"];
+    let kwk = [T.And, T.Class, T.Else, T.False, T.For, T.Fun, T.If, T.Nil, T.Or, T.Print, T.Return,
+               T.Super, T.This, T.True, T.Var, T.While];
+    for i in 0..kws.len { lx.keywords.add(kws[i], kwk[i]); }
+    let ops = ["(", ")", "{", "}", ",", ".", "-", "+", ";", "/", "*", "!", "!=", "=", "==", ">", ">=", "<", "<="];
+    let opk = [T.LParen, T.RParen, T.LBrace, T.RBrace, T.Comma, T.Dot, T.Minus, T.Plus, T.Semi, T.Slash,
+               T.Star, T.Bang, T.BangEq, T.Eq, T.EqEq, T.Gt, T.Ge, T.Lt, T.Le];
+    for i in 0..ops.len { lx.ops.add(ops[i], opk[i]); }
+    lx
+}
+
+pub fn Lexer.free(lx: *Lexer) {
+    lx.ops.free();
+    lx.keywords.free();
+}
+
+fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
+
+pub fn Lexer.next(lx: *Lexer) -> Token {
+    let c = &lx.cur;
+    // A `//` comment or whitespace cannot fail to scan without block
+    // comments, so the error case does not arise.
+    let _ = c.skip_trivia();
+    let start = c.pos;
+    var t = Token { kind: T.Eof, text: "", line: c.line, num: 0.0 };
+    if c.at_end() { return t; }
+    if let Some(name) = c.ident() {
+        t.kind = lx.keywords.get(name) ?? T.Ident;
+        t.text = name;
+        return t;
+    }
+    let ch = c.peek();
+    if is_digit(ch) {
+        while is_digit(c.peek()) { c.bump(); }
+        if c.peek() == '.' and is_digit(c.peek_at(1)) {
+            c.bump();
+            while is_digit(c.peek()) { c.bump(); }
+        }
+        t.kind = T.Num;
+        t.text = c.since(start);
+        t.num = text.parse_f64(t.text) ?? 0.0;
+        return t;
+    }
+    if ch == '"' {
+        c.bump();
+        while !c.at_end() and c.peek() != '"' { c.bump(); }
+        if c.at_end() {
+            t.kind = T.Error;
+            t.text = "Unterminated string.";
+            t.line = c.line;
+            return t;
+        }
+        c.bump();
+        t.kind = T.Str;
+        t.text = c.since(start);
+        return t;
+    }
+    if let Some(k) = c.op(&lx.ops) {
+        t.kind = k;
+        t.text = c.since(start);
+        return t;
+    }
+    c.bump();
+    t.kind = T.Error;
+    t.text = "Unexpected character.";
+    t
+}

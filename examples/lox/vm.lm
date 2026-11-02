@@ -1,0 +1,720 @@
+// The Lox virtual machine: a register machine with NaN-boxed values.
+//
+// Calling convention: a call's callee and arguments are in consecutive
+// registers R[base], R[base+1], ...; the callee's register window starts
+// at R[base], so its slot 0 is the callee (or `this` for a method) and its
+// parameters are already in r1..rn. The result comes back in R[base].
+
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+import std.prof;
+import std.text;
+import value;
+import value.{Value, Proto, LStr, Cell, Closure, Class, Inst, Slots, Bound, Native, Model, Strings};
+
+/// One activation record. `ret` is where the caller continues when the
+/// function called from this frame returns.
+pub struct Frame { cl: Gc<Closure>, base: *Value, ret: *u32 }
+
+pub struct Slot { key: u32, value: Value }
+
+/// Global variables: an open-addressing table keyed by the name's symbol
+/// plus one (0 is an empty slot). Growing moves slots, so a cached slot
+/// index is checked against the key.
+pub struct Globals { slots: *Slot, cap: u64, count: u64 }
+
+pub fn Globals.new() -> Globals { Globals { slots: mem.alloc(64), cap: 64, count: 0 } }
+
+pub fn Globals.find(g: *Globals, key: u32) -> ?u64 {
+    var i = (key as u64 * 2654435761) & (g.cap - 1);
+    loop {
+        let k = g.slots[i].key;
+        if k == key { return Some(i); }
+        if k == 0 { return None; }
+        i = (i + 1) & (g.cap - 1);
+    }
+}
+
+pub fn Globals.define(g: *Globals, key: u32, v: Value) {
+    if let Some(i) = g.find(key) { g.slots[i].value = v; return; }
+    if (g.count + 1) * 2 > g.cap {
+        let old = g.slots;
+        let n = g.cap;
+        g.cap = n * 2;
+        g.slots = mem.alloc(g.cap);
+        g.count = 0;
+        for i in 0..n { if old[i].key != 0 { g.define(old[i].key, old[i].value); } }
+        mem.release(old);
+    }
+    var i = (key as u64 * 2654435761) & (g.cap - 1);
+    while g.slots[i].key != 0 { i = (i + 1) & (g.cap - 1); }
+    g.slots[i] = Slot { key: key, value: v };
+    g.count += 1;
+}
+
+pub struct Machine {
+    stack: *Value,
+    stack_end: *Value,
+    frames: *Frame,
+    frames_end: *Frame,
+    /// The running frame, as of the last sync: the root scanner walks the
+    /// frames up to here.
+    fp: *Frame,
+    globals: Globals,
+    /// Global names, for error messages.
+    names: *text.Interner,
+    heap: gc.Heap,
+    m: Model,
+    strings: Strings,
+    natives: *Native,
+    /// The interned "init", whose address is the key of initializers.
+    init_str: ?Gc<LStr>,
+    protos: *mem.Vec<*Proto>,
+    out: text.StrBuf,
+    /// Error messages are built here.
+    msg: text.StrBuf,
+    /// Scratch space for string concatenation.
+    tmp: text.StrBuf,
+    keys: mem.Vec<u64>,
+    stress: bool,
+}
+
+/// The GC's roots: every active frame's closure and registers, every
+/// function's constants, the globals.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let m = data as *Machine;
+    var f = m.frames;
+    while f <= m.fp {
+        gc_mark(h, f.cl);
+        let n = f.cl.proto.nregs as u64;
+        for i in 0..n { gc_mark(h, f.base[i]); }
+        f = f + 1;
+    }
+    for i in 0..m.protos.len {
+        let p = m.protos.at(i);
+        for j in 0..p.consts.len { gc_mark(h, p.consts[j]); }
+    }
+    for i in 0..m.globals.cap {
+        if m.globals.slots[i].key != 0 { gc_mark(h, m.globals.slots[i].value); }
+    }
+    if let Some(s) = m.init_str { gc_mark(h, s); }
+}
+
+// ── slow paths ───────────────────────────────────────────────────────
+
+fn undefined_var(m: *Machine, name: u64) -> str {
+    m.msg.clear();
+    m.msg.push_str("Undefined variable '");
+    m.msg.push_str(m.names.name(name as u32));
+    m.msg.push_str("'.");
+    m.msg.as_str()
+}
+
+fn undefined_prop(m: *Machine, name: Value) -> str {
+    m.msg.clear();
+    m.msg.push_str("Undefined property '");
+    if let Str(s) = name { m.msg.push_str(s.data); }
+    m.msg.push_str("'.");
+    m.msg.as_str()
+}
+
+fn arity_error(m: *Machine, want: u64, got: u64) -> str {
+    m.msg.clear();
+    m.msg.fmt2("Expected {} arguments but got {}.", want, got).as_str()
+}
+
+/// The key of a property name: the address of its interned string.
+fn key(v: Value) -> u64 {
+    if let Str(s) = v { s as u64 } else { 0 }
+}
+
+/// `+` on anything but two numbers: two strings concatenate.
+fn add_slow(m: *Machine, a: Value, b: Value) -> Result<Value, str> uses gc {
+    let (Str(x), Str(y)) = (a, b) else { return Err("Operands must be two numbers or two strings."); };
+    gc.maybe_collect(&m.heap);
+    m.tmp.clear();
+    m.tmp.push_str(x.data);
+    m.tmp.push_str(y.data);
+    Ok(Value.Str(m.strings.intern(&m.heap, m.tmp.as_str())))
+}
+
+fn new_instance(m: *Machine, c: Gc<Class>) -> Gc<Inst> {
+    let n = c.inline;
+    new(&m.heap, Inst { shape: m.m.root_for(Some(c.methods), n), dict: None, overflow: None, proto: Some(c.methods), class: Some(c) }, n as u64)
+}
+
+/// Copy the superclass's methods into the subclass (classes are closed
+/// once declared, so copying gives the same answers as looking up).
+fn inherit(m: *Machine, c: Gc<Class>, s: Gc<Class>) {
+    m.keys.clear();
+    m.m.keys(s.methods, &m.keys);
+    for i in 0..m.keys.len {
+        let k = m.keys.at(i);
+        if let Some(v) = m.m.get(s.methods, k) { m.m.set(c.methods, k, v); }
+    }
+    c.init = s.init;
+}
+
+/// After a property was added to `o`: let its class give new instances
+/// room for this many fields inline.
+fn grow_template(m: *Machine, o: Gc<Inst>) {
+    if let Some(c) = o.class {
+        let n = m.m.len(o) as u32;
+        if n > c.inline and n <= 32 { c.inline = n; }
+    }
+}
+
+fn read_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64) -> (?Value, obj.IcState) {
+    m.m.read_miss(s, st, o, k)
+}
+
+fn write_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64, v: Value) -> obj.IcState {
+    let n = m.m.len(o);
+    let r = m.m.write_miss_in(s, st, o, k, v);
+    if m.m.len(o) > n { grow_template(m, o); }
+    r
+}
+
+/// A method read from an instance becomes a bound method.
+fn bind(m: *Machine, recv: Value, v: Value) -> Value uses gc {
+    let Method(c) = v else { return v; };
+    gc.maybe_collect(&m.heap);
+    Value.Bound(new(&m.heap, Bound { recv: recv, method: c }))
+}
+
+/// Write the traceback of a run-time error to stderr.
+fn traceback(m: *Machine, msg: str, top: *Frame, pc: *u32) {
+    let b = &m.out;
+    b.clear();
+    b.push_str(msg);
+    b.push('\n');
+    var f = top;
+    var at = pc;
+    loop {
+        let p = f.cl.proto;
+        let i = ((at as u64) - (p.code.start() as u64)) / 4;
+        b.push_str("[line ");
+        b.push_int(p.lines[i] as i64);
+        b.push_str("] in ");
+        if p.is_script { b.push_str("script"); } else { b.push_str(p.name); b.push_str("()"); }
+        b.push('\n');
+        if f == m.frames { break; }
+        f = f - 1;
+        at = f.ret - 1;
+    }
+    io.eprint(b.as_str());
+}
+
+pub fn clock_native(args: *Value) -> Value {
+    Value.Num((prof.now_ns() as f64) / 1000000000.0)
+}
+
+#[require_verified]
+pub vm Lox {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
+    verify_context proto: *Proto, nnames: u32;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs display "r{}";
+    operand kst = k[it] verify it < proto.consts.len display "k{}";
+    operand imm = it;
+    operand gname = it verify (it as u32) < nnames display "g{}";
+    operand upv = it verify it < proto.captures.len display "u{}";
+    operand child = it verify it < proto.children.len display "f{}";
+    /// A call's argument count: R[base .. base+n] must be in the frame.
+    operand nargs = it verify Lox.ABC_a(*pc) + it < proto.nregs as u64;
+    /// SUPERINVOKE's: the superclass is in R[base+n+1].
+    operand nargs1 = it verify Lox.ABC_a(*pc) + it + 1 < proto.nregs as u64;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    sync { ctx.fp = fp; }
+
+    encoding fixed(u32) {
+        format AB   { op: 8, a: 8, b: 8 }
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format sJ   { op: 8, sj: s24 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    /// Collect first if the heap's budget is spent (or always, under
+    /// --gc-stress). The test is inline, the collection cold.
+    fn gc_point() {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold or ctx.stress) { cold { gc.maybe_collect(&ctx.heap); } }
+    }
+
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADNIL(dst: reg) : ABC { dst = Nil; next }
+    op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
+
+    // ── arithmetic: (Num, Num) inline, everything else cold ──────────
+    inline for (name, sym, bkind) in [
+        ("SUB", -, reg), ("MUL", *, reg), ("DIV", /, reg),
+        ("SUBK", -, kst), ("MULK", *, kst), ("DIVK", /, kst),
+    ] {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
+            if let (Num(x), Num(y)) = (a, b) { dst = Num(x sym y); next }
+            cold { raise "Operands must be numbers." }
+        }
+    }
+    inline for (name, bkind) in [("ADD", reg), ("ADDK", kst)] {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
+            if let (Num(x), Num(y)) = (a, b) { dst = Num(x + y); next }
+            cold { dst = add_slow(ctx, a, b)?; next }
+        }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        if let Num(x) = a { dst = Num(-x); next }
+        cold { raise "Operand must be a number." }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = Bool(value.falsey(a)); next }
+
+    op EQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(value.equal(a, b)); next }
+    op NE(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!value.equal(a, b)); next }
+    // `a <= b` is `!(a > b)` and `a >= b` is `!(a < b)`, as in clox (it
+    // matters for NaN).
+    inline for (name, test) in [("LT", x < y), ("GT", x > y), ("LE", !(x > y)), ("GE", !(x < y))] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            if let (Num(x), Num(y)) = (a, b) { dst = Bool(test); next }
+            cold { raise "Operands must be numbers." }
+        }
+    }
+
+    // ── branches ─────────────────────────────────────────────────────
+    op JMP(target: label) : sJ { jump target }
+    op JF(a: reg, target: label) : AsBx {
+        if value.falsey(a) { jump target }
+        next
+    }
+    op JT(a: reg, target: label) : AsBx {
+        if !value.falsey(a) { jump target }
+        next
+    }
+
+    /// Compare and branch: followed by a JMP that is taken when the
+    /// comparison is false.
+    fn branch(holds: bool, target: *u32) -> never {
+        if holds { jump pc + 2 }
+        jump target
+    }
+    inline for (name, bkind, test) in [
+        ("JNLT", reg, x < y), ("JNGT", reg, x > y), ("JNLE", reg, !(x > y)), ("JNGE", reg, !(x < y)),
+        ("JNLTK", kst, x < y), ("JNGTK", kst, x > y), ("JNLEK", kst, !(x > y)), ("JNGEK", kst, !(x < y)),
+    ] {
+        op #name(a: reg, b: bkind) : AB then JMP {
+            if let (Num(x), Num(y)) = (a, b) { branch(test, then.target) }
+            cold { raise "Operands must be numbers." }
+        }
+    }
+    inline for (eqname, nename, bkind) in [("JNEQ", "JEQ", reg), ("JNEQK", "JEQK", kst)] {
+        op #eqname(a: reg, b: bkind) : AB then JMP { branch(value.equal(a, b), then.target) }
+        op #nename(a: reg, b: bkind) : AB then JMP { branch(!value.equal(a, b), then.target) }
+    }
+
+    // ── variables ────────────────────────────────────────────────────
+    cache GlobalIC { slot: u32 }
+
+    family GETGLOBAL(dst: reg, n: gname) : ABx + GlobalIC {
+        generic {
+            let Some(i) = ctx.globals.find(n as u32 + 1) else { cold { raise undefined_var(ctx, n) } };
+            cache.slot = i as u32;
+            dst = ctx.globals.slots[i].value;
+            become GETGLOBAL_C;
+            next
+        }
+        GETGLOBAL_C {
+            let i = cache.slot as u64;
+            if likely(i < ctx.globals.cap) {
+                let s = ctx.globals.slots + i;
+                if s.key == n as u32 + 1 { dst = s.value; next }
+            }
+            cold { become GETGLOBAL; redo }
+        }
+    }
+    family SETGLOBAL(src: reg, n: gname) : ABx + GlobalIC {
+        generic {
+            let Some(i) = ctx.globals.find(n as u32 + 1) else { cold { raise undefined_var(ctx, n) } };
+            cache.slot = i as u32;
+            ctx.globals.slots[i].value = src;
+            become SETGLOBAL_C;
+            next
+        }
+        SETGLOBAL_C {
+            let i = cache.slot as u64;
+            if likely(i < ctx.globals.cap) {
+                let s = ctx.globals.slots + i;
+                if s.key == n as u32 + 1 { s.value = src; next }
+            }
+            cold { become SETGLOBAL; redo }
+        }
+    }
+    op DEFGLOBAL(src: reg, n: gname) : ABx { ctx.globals.define(n as u32 + 1, src); next }
+
+    /// Put R[r] in a new cell (a local that a closure captures).
+    op NEWCELL(r: reg) : ABC {
+        gc_point();
+        let v = r;
+        r = CellV(new(&ctx.heap, Cell { v: v }));
+        next
+    }
+    op GETCELL(dst: reg, r: reg) : ABC {
+        if let CellV(c) = r { dst = c.v; next }
+        cold { raise "internal error: not a cell" }
+    }
+    op SETCELL(r: reg, src: reg) : ABC {
+        if let CellV(c) = r { c.v = src; next }
+        cold { raise "internal error: not a cell" }
+    }
+    op GETUPV(dst: reg, u: upv) : ABC {
+        let c = fp.cl.upvals;
+        if u < c.len { dst = c.ptr[u].v; next }
+        cold { raise "internal error: bad upvalue" }
+    }
+    op SETUPV(u: upv, src: reg) : ABC {
+        let c = fp.cl.upvals;
+        if u < c.len { c.ptr[u].v = src; next }
+        cold { raise "internal error: bad upvalue" }
+    }
+    op CLOSURE(dst: reg, f: child) : ABx {
+        gc_point();
+        let p = fp.cl.proto.children[f];
+        let n = p.captures.len;
+        let cl = new(&ctx.heap, Closure { proto: p }, n);
+        // The captures come from the compiler, not the bytecode, but they
+        // are checked anyway: a bad one would read outside the frame.
+        let me = fp.cl;
+        for i in 0..n {
+            let c = p.captures[i];
+            let j = (c & 0xFFFF) as u64;
+            if c & value.LOCAL_CAPTURE != 0 {
+                if j < me.proto.nregs as u64 and let CellV(cell) = regs[j] {
+                    cl.upvals.ptr[i] = cell;
+                } else {
+                    cold { raise "internal error: bad capture" }
+                }
+            } else if j < me.upvals.len {
+                cl.upvals.ptr[i] = me.upvals.ptr[j];
+            } else {
+                cold { raise "internal error: bad capture" }
+            }
+        }
+        dst = Fun(cl);
+        next
+    }
+
+    op PRINT(a: reg) : ABC {
+        ctx.out.clear();
+        value.write(&ctx.out, a);
+        ctx.out.push('\n');
+        io.print(ctx.out.as_str());
+        next
+    }
+
+    // ── calls ────────────────────────────────────────────────────────
+
+    /// Call closure `c` with its window at R[base] and `n` arguments;
+    /// the caller continues at `ret`.
+    fn call_closure(c: Gc<Closure>, base: u64, n: u64, ret: *u32) -> never {
+        let p = c.proto;
+        if n != p.arity as u64 { cold { raise arity_error(ctx, p.arity as u64, n) } }
+        let callee = regs + base;
+        if callee + p.nregs as u64 > ctx.stack_end or fp + 1 == ctx.frames_end {
+            cold { raise "Stack overflow." }
+        }
+        // Registers past the arguments may hold stale references that the
+        // root scanner would read.
+        var i = n + 1;
+        while i < p.nregs as u64 {
+            callee[i] = Nil;
+            i += 1;
+        }
+        fp.ret = ret;
+        fp = fp + 1;
+        fp.cl = c;
+        fp.base = callee;
+        regs = callee;
+        k = p.consts.ptr;
+        jump p.code
+    }
+
+    /// Call R[base] (which is `f`) with `n` arguments.
+    fn call_value(f: Value, base: u64, n: u64, ret: *u32) -> never {
+        match f {
+            Fun(c) => call_closure(c, base, n, ret),
+            Bound(b) => {
+                regs[base] = b.recv;
+                call_closure(b.method, base, n, ret)
+            }
+            Class(c) => {
+                gc_point();
+                regs[base] = Inst(new_instance(ctx, c));
+                if let Fun(init) = c.init { call_closure(init, base, n, ret) }
+                if n != 0 { cold { raise arity_error(ctx, 0, n) } }
+                jump ret
+            }
+            Native(i) => {
+                let nf = ctx.natives + i as u64;
+                if n != nf.arity as u64 { cold { raise arity_error(ctx, nf.arity as u64, n) } }
+                regs[base] = (nf.f)(regs + base + 1);
+                jump ret
+            }
+            _ => {}
+        }
+        cold { raise "Can only call functions and classes." }
+    }
+
+    op CALL(base: reg, n: nargs) : ABC {
+        let f = base;
+        if let Fun(c) = f { call_closure(c, base.raw, n, pc + 1) }
+        call_value(f, base.raw, n, pc + 1)
+    }
+
+    /// Return R[src] to the caller, in its R[base] (our r0).
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.frames { exit Ok(()) }
+        regs[0] = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.cl.proto.consts.ptr;
+        jump fp.ret
+    }
+
+    // ── properties ───────────────────────────────────────────────────
+    // The six words of an obj.Site; std.obj runs the cache state machine
+    // (monomorphic, polymorphic, megamorphic) in the slow paths.
+    cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
+
+    family GETPROP(dst: reg, o: reg, name: kst) : ABC + PropIC {
+        generic {
+            let Inst(x) = o else { cold { raise "Only instances have properties." } };
+            let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
+            if st == obj.IcState.OwnIn { become GETPROP_IN; }
+            if st == obj.IcState.OwnOut { become GETPROP_OUT; }
+            if st == obj.IcState.Proto { become GETPROP_P; }
+            if st == obj.IcState.Poly { become GETPROP_POLY; }
+            dst = bind(ctx, o, v);
+            next
+        }
+        GETPROP_IN {
+            if let Inst(x) = o and x.shape.id == cache.sid { dst = x.inline.ptr[cache.slot]; next }
+            cold { become GETPROP_MISS; redo }
+        }
+        GETPROP_OUT {
+            if let Inst(x) = o and x.shape.id == cache.sid { dst = ctx.m.load_out(x, cache.slot & !obj.OUT); next }
+            cold { become GETPROP_MISS; redo }
+        }
+        GETPROP_P {
+            if let Inst(x) = o and x.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(x, cache.slot, cache.cell, cache.depth) {
+                dst = bind(ctx, o, v);
+                next
+            }
+            cold { become GETPROP_MISS; redo }
+        }
+        GETPROP_MISS {
+            cold {
+                let Inst(x) = o else { raise "Only instances have properties." };
+                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                if st == obj.IcState.OwnIn { become GETPROP_IN; }
+                if st == obj.IcState.OwnOut { become GETPROP_OUT; }
+                if st == obj.IcState.Proto { become GETPROP_P; }
+                if st == obj.IcState.Poly { become GETPROP_POLY; }
+                if st == obj.IcState.Generic { become GETPROP; }
+                dst = bind(ctx, o, v);
+                next
+            }
+        }
+        GETPROP_POLY {
+            if let Inst(x) = o and let Some(v) = ctx.m.poly_get(x, cache.ent) { dst = bind(ctx, o, v); next }
+            cold {
+                let Inst(x) = o else { raise "Only instances have properties." };
+                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                if st == obj.IcState.Mega { become GETPROP_MEGA; }
+                dst = bind(ctx, o, v);
+                next
+            }
+        }
+        GETPROP_MEGA {
+            if let Inst(x) = o and let Some(v) = ctx.m.mega_get(x, key(name)) { dst = bind(ctx, o, v); next }
+            cold {
+                let Inst(x) = o else { raise "Only instances have properties." };
+                let (r, _) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                dst = bind(ctx, o, v);
+                next
+            }
+        }
+    }
+
+    family SETPROP(o: reg, name: kst, v: reg) : ABC + PropIC {
+        generic {
+            let Inst(x) = o else { cold { raise "Only instances have fields." } };
+            let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name), v);
+            if st == obj.IcState.OwnIn { become SETPROP_IN; }
+            if st == obj.IcState.OwnOut { become SETPROP_OUT; }
+            if st == obj.IcState.Add { become SETPROP_ADD; }
+            next
+        }
+        SETPROP_IN {
+            if let Inst(x) = o and x.shape.id == cache.sid { x.inline.ptr[cache.slot] = v; next }
+            cold { become SETPROP_MISS; redo }
+        }
+        SETPROP_OUT {
+            if let Inst(x) = o and x.shape.id == cache.sid { ctx.m.store_ref(x, cache.slot, v); next }
+            cold { become SETPROP_MISS; redo }
+        }
+        SETPROP_ADD {
+            if let Inst(x) = o and x.shape.id == cache.sid { ctx.m.add_hit(x, cache.ent, cache.slot, v); next }
+            cold { become SETPROP; redo }
+        }
+        SETPROP_MISS {
+            cold {
+                let Inst(x) = o else { raise "Only instances have fields." };
+                let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name), v);
+                if st == obj.IcState.OwnIn { become SETPROP_IN; }
+                if st == obj.IcState.OwnOut { become SETPROP_OUT; }
+                if st == obj.IcState.Add { become SETPROP_ADD; }
+                if st == obj.IcState.Poly { become SETPROP_POLY; }
+                if st == obj.IcState.Mega { become SETPROP_MEGA; }
+                if st == obj.IcState.Generic { become SETPROP; }
+                next
+            }
+        }
+        SETPROP_POLY {
+            if let Inst(x) = o and ctx.m.poly_set(x, cache.ent, v) { next }
+            cold {
+                let Inst(x) = o else { raise "Only instances have fields." };
+                let st = write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name), v);
+                if st == obj.IcState.Mega { become SETPROP_MEGA; }
+                next
+            }
+        }
+        SETPROP_MEGA {
+            if let Inst(x) = o and ctx.m.mega_set(x, key(name), v) { next }
+            cold {
+                let Inst(x) = o else { raise "Only instances have fields." };
+                write_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name), v);
+                next
+            }
+        }
+    }
+
+    /// `R[base].name(R[base+1], ..., R[base+n])` without making a bound
+    /// method: a method found through the class is called with the
+    /// receiver as its slot 0.
+    fn invoke_found(v: Value, base: u64, n: u64) -> never {
+        if let Method(c) = v { call_closure(c, base, n, pc + 1 + Lox.CW_PropIC) }
+        regs[base] = v;
+        call_value(v, base, n, pc + 1 + Lox.CW_PropIC)
+    }
+
+    family INVOKE(base: reg, n: nargs, name: kst) : ABC + PropIC {
+        generic {
+            let Inst(x) = base else { cold { raise "Only instances have methods." } };
+            let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
+            if st == obj.IcState.Proto { become INVOKE_P; }
+            if st == obj.IcState.Poly { become INVOKE_POLY; }
+            invoke_found(v, base.raw, n)
+        }
+        INVOKE_P {
+            if let Inst(x) = base and x.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(x, cache.slot, cache.cell, cache.depth) {
+                if let Method(c) = v { call_closure(c, base.raw, n, pc + 1 + Lox.CW_PropIC) }
+            }
+            cold { become INVOKE_MISS; redo }
+        }
+        INVOKE_MISS {
+            cold {
+                let Inst(x) = base else { raise "Only instances have methods." };
+                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Proto, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                if st == obj.IcState.Proto { become INVOKE_P; }
+                if st == obj.IcState.Poly { become INVOKE_POLY; }
+                if st == obj.IcState.Generic or st == obj.IcState.OwnIn or st == obj.IcState.OwnOut { become INVOKE; }
+                invoke_found(v, base.raw, n)
+            }
+        }
+        INVOKE_POLY {
+            if let Inst(x) = base and let Some(v) = ctx.m.poly_get(x, cache.ent) { invoke_found(v, base.raw, n) }
+            cold {
+                let Inst(x) = base else { raise "Only instances have methods." };
+                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                if st == obj.IcState.Mega { become INVOKE_MEGA; }
+                invoke_found(v, base.raw, n)
+            }
+        }
+        INVOKE_MEGA {
+            if let Inst(x) = base and let Some(v) = ctx.m.mega_get(x, key(name)) { invoke_found(v, base.raw, n) }
+            cold {
+                let Inst(x) = base else { raise "Only instances have methods." };
+                let (r, _) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let Some(v) = r else { raise undefined_prop(ctx, name) };
+                invoke_found(v, base.raw, n)
+            }
+        }
+    }
+
+    // ── classes ──────────────────────────────────────────────────────
+    op CLASS(dst: reg, name: kst) : ABC {
+        gc_point();
+        let Str(s) = name else { cold { raise "internal error: class name" } };
+        let methods = new(&ctx.heap, Inst { shape: ctx.m.root(0), dict: None, overflow: None, proto: None, class: None }, 0);
+        dst = Class(new(&ctx.heap, Class { name: s, methods: methods, init: Value.Nil, inline: 4 }));
+        next
+    }
+    op INHERIT(cls: reg, sup: reg) : ABC {
+        if let (Class(c), Class(s)) = (cls, sup) { inherit(ctx, c, s); next }
+        cold { raise "Superclass must be a class." }
+    }
+    op METHOD(cls: reg, f: reg, name: kst) : ABC {
+        if let (Class(c), Fun(m)) = (cls, f) {
+            let kk = key(name);
+            ctx.m.set(c.methods, kk, Method(m));
+            if let Some(s) = ctx.init_str and kk == s as u64 { c.init = f; }
+            next
+        }
+        cold { raise "internal error: METHOD" }
+    }
+    /// `super.name`: R[dst] holds the superclass; bind its method `name`
+    /// to `this`.
+    op GETSUPER(dst: reg, this: reg, name: kst) : ABC {
+        if let Class(s) = dst and let Some(v) = ctx.m.get(s.methods, key(name)) {
+            dst = bind(ctx, this, v);
+            next
+        }
+        cold { raise undefined_prop(ctx, name) }
+    }
+    /// `super.name(args)`: R[base] is `this`, the arguments follow, and
+    /// the superclass is in R[base+n+1].
+    op SUPERINVOKE(base: reg, n: nargs1, name: kst) : ABC {
+        if let Class(s) = regs[base.raw + n + 1] and let Some(Method(c)) = ctx.m.get(s.methods, key(name)) {
+            call_closure(c, base.raw, n, pc + 1)
+        }
+        cold { raise undefined_prop(ctx, name) }
+    }
+
+    entry run(m: *Machine, main: Gc<Closure>) -> Result<(), str> uses gc {
+        ctx = m;
+        fp = m.frames;
+        fp.cl = main;
+        fp.base = m.stack;
+        regs = m.stack;
+        for i in 0..main.proto.nregs as u64 { regs[i] = Nil; }
+        regs[0] = Fun(main);
+        k = main.proto.consts.ptr;
+        m.fp = fp;
+        jump main.proto.code
+    }
+
+    on raise(msg: str) {
+        traceback(ctx, msg, fp, pc);
+        fail msg
+    }
+}

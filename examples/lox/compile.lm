@@ -1,0 +1,596 @@
+// Compile the resolved Lox syntax tree to bytecode for the Lox vm.
+//
+// Registers: a function's local slot i (as the parser numbered them) is
+// register i; slot 0 is the callee, or `this` in a method. Temporaries
+// live above the active locals. A local that a closure captures holds a
+// cell from its declaration on, and is read and written through it.
+
+import std.bc;
+import std.mem;
+import std.text;
+import parser;
+import parser.{Node, Expr, Stmt, Var, Fun, FunKind, ClassDecl, LocalInfo, Program};
+import lexer.{T};
+import value;
+import value.{Value, Proto};
+import vm.{Lox, Machine};
+
+struct Unit {
+    m: *Machine,
+    names: *text.Interner,
+    infos: *mem.Vec<LocalInfo>,
+    protos: mem.Vec<*Proto>,
+    error: ?(str, u32),
+}
+
+struct C {
+    unit: *Unit,
+    fun: *Fun,
+    code: bc.Code<u32>,
+    consts: bc.Pool<Value>,
+    regs: bc.Regs,
+    children: mem.Vec<*Proto>,
+}
+
+fn C.error(c: *C, msg: str, line: u32) {
+    if c.unit.error.is_none() { c.unit.error = Some((msg, line)); }
+}
+
+fn C.info(c: *C, id: u32) -> LocalInfo { c.unit.infos.at(id as u64) }
+
+fn C.konst(c: *C, v: Value, line: u32) -> u32 {
+    let Some(k) = c.consts.add(v) else { c.error("Too many constants in one chunk.", line); return 0; };
+    k
+}
+
+/// A constant index for an 8-bit operand.
+fn C.k8(c: *C, v: Value, line: u32) -> u8 {
+    let k = c.konst(v, line);
+    if k > 255 { c.error("Too many constants in one chunk.", line); }
+    k as u8
+}
+
+fn C.str_const(c: *C, s: str, line: u32) -> u8 {
+    let m = c.unit.m;
+    c.k8(Value.Str(m.strings.intern(&m.heap, s)), line)
+}
+
+fn C.symbol(c: *C, name: str, line: u32) -> u16 {
+    let s = c.unit.names.intern(name);
+    if s > 65535 { c.error("Too many global names.", line); }
+    s as u16
+}
+
+/// If `n` is a number literal with a constant index that fits 8 bits.
+fn C.small_num(c: *C, n: *Node) -> ?u8 {
+    let Num(x) = n.e else { return None; };
+    let k = c.consts.add(Value.Num(x))?;
+    if k < 256 { Some(k as u8) } else { None }
+}
+
+// ── variables ────────────────────────────────────────────────────────
+
+/// The register of a local that is not captured, if `n` reads one.
+fn C.local_reg(c: *C, n: *Node) -> ?u32 {
+    if let Group(g) = n.e { return c.local_reg(g); }
+    if let Var(v) = n.e and let Local(id) = v {
+        let i = c.info(id);
+        if !i.captured { return Some(i.slot); }
+    }
+    None
+}
+
+fn C.load_var(c: *C, v: Var, dst: u32, line: u32) {
+    let d = dst as u8;
+    match v {
+        Local(id) => {
+            let i = c.info(id);
+            if i.captured {
+                c.code.op(Lox.GETCELL(d, i.slot as u8));
+            } else if i.slot != dst {
+                c.code.op(Lox.MOVE(d, i.slot as u8));
+            }
+        }
+        Upval(u) => { c.code.op(Lox.GETUPV(d, u as u8)); }
+        Global(name) => { c.code.op(Lox.GETGLOBAL(d, c.symbol(name, line))); }
+    }
+}
+
+/// Store register `r` into variable `v`.
+fn C.store_var(c: *C, v: Var, r: u32, line: u32) {
+    match v {
+        Local(id) => {
+            let i = c.info(id);
+            if i.captured {
+                c.code.op(Lox.SETCELL(i.slot as u8, r as u8));
+            } else if i.slot != r {
+                c.code.op(Lox.MOVE(i.slot as u8, r as u8));
+            }
+        }
+        Upval(u) => { c.code.op(Lox.SETUPV(u as u8, r as u8)); }
+        Global(name) => { c.code.op(Lox.SETGLOBAL(r as u8, c.symbol(name, line))); }
+    }
+}
+
+// ── expressions ──────────────────────────────────────────────────────
+
+/// A register holding the value of `n`: a local's own register, or a new
+/// temporary.
+fn C.operand(c: *C, n: *Node) -> u32 {
+    if let Some(r) = c.local_reg(n) { return r; }
+    let r = c.regs.alloc(1);
+    c.expr_to(n, r);
+    r
+}
+
+fn arith(op: T, d: u8, a: u8, b: u8) -> u32 {
+    match op {
+        Plus => Lox.ADD(d, a, b),
+        Minus => Lox.SUB(d, a, b),
+        Star => Lox.MUL(d, a, b),
+        Slash => Lox.DIV(d, a, b),
+        EqEq => Lox.EQ(d, a, b),
+        BangEq => Lox.NE(d, a, b),
+        Lt => Lox.LT(d, a, b),
+        Le => Lox.LE(d, a, b),
+        Gt => Lox.GT(d, a, b),
+        _ => Lox.GE(d, a, b),
+    }
+}
+
+fn arith_k(op: T, d: u8, a: u8, k: u8) -> ?u32 {
+    match op {
+        Plus => Some(Lox.ADDK(d, a, k)),
+        Minus => Some(Lox.SUBK(d, a, k)),
+        Star => Some(Lox.MULK(d, a, k)),
+        Slash => Some(Lox.DIVK(d, a, k)),
+        _ => None,
+    }
+}
+
+/// Compile `n` so that its value ends up in register `dst`.
+fn C.expr_to(c: *C, n: *Node, dst: u32) {
+    let d = dst as u8;
+    c.code.set_loc(n.line);
+    match n.e {
+        Num(x) => { c.code.op(Lox.LOADK(d, c.konst(Value.Num(x), n.line) as u16)); }
+        Str(s) => { c.code.op(Lox.LOADK(d, c.str_const(s, n.line) as u16)); }
+        Bool(b) => { c.code.op(Lox.LOADBOOL(d, if b { 1 } else { 0 })); }
+        Nil => { c.code.op(Lox.LOADNIL(d)); }
+        Var(v) => c.load_var(v, dst, n.line),
+        Assign(v, e) => {
+            if let Local(id) = v and !c.info(id).captured {
+                let slot = c.info(id).slot;
+                c.expr_to(e, slot);
+                if slot != dst { c.code.op(Lox.MOVE(d, slot as u8)); }
+                return;
+            }
+            c.expr_to(e, dst);
+            c.code.set_loc(n.line);
+            c.store_var(v, dst, n.line);
+        }
+        Unary(op, e) => {
+            let mark = c.regs.mark();
+            let r = c.operand(e);
+            c.code.set_loc(n.line);
+            c.code.op(if op == T.Minus { Lox.NEG(d, r as u8) } else { Lox.NOT(d, r as u8) });
+            c.regs.reset(mark);
+        }
+        Binary(op, l, r) => {
+            let mark = c.regs.mark();
+            let a = c.operand(l);
+            if let Some(k) = c.small_num(r) and let Some(w) = arith_k(op, d, a as u8, k) {
+                c.code.set_loc(n.line);
+                c.code.op(w);
+                c.regs.reset(mark);
+                return;
+            }
+            let b = c.operand(r);
+            c.code.set_loc(n.line);
+            c.code.op(arith(op, d, a as u8, b as u8));
+            c.regs.reset(mark);
+        }
+        And(l, r) => {
+            let end = c.code.label();
+            c.expr_to(l, dst);
+            c.code.jump(Lox.JF(d, 0), end);
+            c.expr_to(r, dst);
+            c.code.bind(end);
+        }
+        Or(l, r) => {
+            let end = c.code.label();
+            c.expr_to(l, dst);
+            c.code.jump(Lox.JT(d, 0), end);
+            c.expr_to(r, dst);
+            c.code.bind(end);
+        }
+        Call(f, args) => c.call(n, f, &args, dst),
+        Get(o, name) => {
+            let mark = c.regs.mark();
+            let r = c.operand(o);
+            let k = c.str_const(name, n.line);
+            c.code.set_loc(n.line);
+            c.code.op(Lox.GETPROP(d, r as u8, k));
+            c.regs.reset(mark);
+        }
+        Set(o, name, v) => {
+            let mark = c.regs.mark();
+            let ro = c.operand(o);
+            let rv = c.operand(v);
+            let k = c.str_const(name, n.line);
+            c.code.set_loc(n.line);
+            c.code.op(Lox.SETPROP(ro as u8, k, rv as u8));
+            if rv != dst { c.code.op(Lox.MOVE(d, rv as u8)); }
+            c.regs.reset(mark);
+        }
+        Group(e) => c.expr_to(e, dst),
+        Super(name, this, sup) => {
+            let mark = c.regs.mark();
+            c.load_var(sup, dst, n.line);
+            let rt = c.regs.alloc(1);
+            c.load_var(this, rt, n.line);
+            let k = c.str_const(name, n.line);
+            c.code.set_loc(n.line);
+            c.code.op(Lox.GETSUPER(d, rt as u8, k));
+            c.regs.reset(mark);
+        }
+    }
+}
+
+fn C.call(c: *C, n: *Node, f: *Node, args: *mem.Vec<*Node>, dst: u32) {
+    // The callee (or receiver) and the arguments go to consecutive
+    // registers at the top of the frame; the result comes back in the
+    // first. If `dst` is the topmost temporary, it can be that register.
+    let mark = c.regs.mark();
+    let nargs = args.len as u32;
+    let in_place = c.regs.is_temp(dst) and dst + 1 == mark;
+    let base = if in_place { c.regs.alloc(nargs); dst } else { c.regs.alloc(1 + nargs) };
+    match f.e {
+        Get(o, name) => {
+            c.expr_to(o, base);
+            for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
+            let k = c.str_const(name, n.line);
+            c.code.set_loc(n.line);
+            c.code.op(Lox.INVOKE(base as u8, nargs as u8, k));
+        }
+        Super(name, this, sup) => {
+            c.load_var(this, base, n.line);
+            for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
+            let rs = c.regs.alloc(1);
+            c.load_var(sup, rs, n.line);
+            let k = c.str_const(name, n.line);
+            c.code.set_loc(n.line);
+            c.code.op(Lox.SUPERINVOKE(base as u8, nargs as u8, k));
+        }
+        _ => {
+            c.expr_to(f, base);
+            for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
+            c.code.set_loc(n.line);
+            c.code.op(Lox.CALL(base as u8, nargs as u8));
+        }
+    }
+    if base != dst { c.code.op(Lox.MOVE(dst as u8, base as u8)); }
+    c.regs.reset(mark);
+}
+
+/// Emit code that falls through if `cond` is true and jumps to `l` if it
+/// is false. A comparison becomes a compare-and-branch op and its JMP.
+fn C.jump_if_false(c: *C, cond: *Node, l: bc.Label) {
+    let mark = c.regs.mark();
+    match cond.e {
+        Binary(op, x, y) => {
+            let w: ?u32 = match op {
+                Lt | Le | Gt | Ge | EqEq | BangEq => {
+                    let a = c.operand(x) as u8;
+                    if let Some(k) = c.small_num(y) {
+                        Some(match op {
+                            Lt => Lox.JNLTK(a, k),
+                            Le => Lox.JNLEK(a, k),
+                            Gt => Lox.JNGTK(a, k),
+                            Ge => Lox.JNGEK(a, k),
+                            EqEq => Lox.JNEQK(a, k),
+                            _ => Lox.JEQK(a, k),
+                        })
+                    } else {
+                        let b = c.operand(y) as u8;
+                        Some(match op {
+                            Lt => Lox.JNLT(a, b),
+                            Le => Lox.JNLE(a, b),
+                            Gt => Lox.JNGT(a, b),
+                            Ge => Lox.JNGE(a, b),
+                            EqEq => Lox.JNEQ(a, b),
+                            _ => Lox.JEQ(a, b),
+                        })
+                    }
+                }
+                _ => None,
+            };
+            if let Some(w) = w {
+                c.code.set_loc(cond.line);
+                c.code.op(w);
+                c.code.jump(Lox.JMP(0), l);
+                c.regs.reset(mark);
+                return;
+            }
+        }
+        And(x, y) => {
+            c.jump_if_false(x, l);
+            c.jump_if_false(y, l);
+            return;
+        }
+        Or(x, y) => {
+            let yes = c.code.label();
+            let r = c.operand(x);
+            c.code.jump(Lox.JT(r as u8, 0), yes);
+            c.regs.reset(mark);
+            c.jump_if_false(y, l);
+            c.code.bind(yes);
+            return;
+        }
+        _ => {}
+    }
+    let r = c.operand(cond);
+    c.code.set_loc(cond.line);
+    c.code.jump(Lox.JF(r as u8, 0), l);
+    c.regs.reset(mark);
+}
+
+// ── statements ───────────────────────────────────────────────────────
+
+/// Make the next register the local `id`.
+fn C.new_local(c: *C, id: u32, line: u32) -> u32 {
+    let r = c.regs.alloc(1);
+    if r != c.info(id).slot { c.error("internal error: local slot mismatch", line); }
+    r
+}
+
+fn C.stmt(c: *C, s: *Stmt) {
+    match *s {
+        Expr(e) => {
+            // An assignment to a local needs no result register.
+            if let Assign(v, x) = e.e and let Local(id) = v and !c.info(id).captured {
+                c.expr_to(x, c.info(id).slot);
+            } else {
+                let r = c.regs.alloc(1);
+                c.expr_to(e, r);
+            }
+        }
+        Print(e) => {
+            let r = c.operand(e);
+            c.code.set_loc(e.line);
+            c.code.op(Lox.PRINT(r as u8));
+        }
+        VarDecl(v, init, line) => {
+            match v {
+                Local(id) => {
+                    let r = c.new_local(id, line);
+                    match init {
+                        Some(e) => c.expr_to(e, r),
+                        None => { c.code.op(Lox.LOADNIL(r as u8)); }
+                    }
+                    if c.info(id).captured { c.code.op(Lox.NEWCELL(r as u8)); }
+                    c.regs.end_stmt();
+                    c.regs.activate(1);
+                }
+                _ => {
+                    let r = c.regs.alloc(1);
+                    match init {
+                        Some(e) => c.expr_to(e, r),
+                        None => { c.code.op(Lox.LOADNIL(r as u8)); }
+                    }
+                    c.code.set_loc(line);
+                    if let Global(name) = v { c.code.op(Lox.DEFGLOBAL(r as u8, c.symbol(name, line))); }
+                }
+            }
+        }
+        Block(stmts) => c.block(&stmts),
+        If(cond, then, otherwise) => {
+            let skip = c.code.label();
+            c.jump_if_false(cond, skip);
+            c.stmt(then);
+            if let Some(o) = otherwise {
+                let end = c.code.label();
+                c.code.jump(Lox.JMP(0), end);
+                c.code.bind(skip);
+                c.stmt(o);
+                c.code.bind(end);
+            } else {
+                c.code.bind(skip);
+            }
+        }
+        While(cond, body, incr) => {
+            let top = c.code.here();
+            let exit = c.code.label();
+            c.jump_if_false(cond, exit);
+            c.stmt(body);
+            if let Some(e) = incr {
+                c.regs.end_stmt();
+                let st = Stmt.Expr(e);
+                c.stmt(&st);
+            }
+            c.code.jump(Lox.JMP(0), top);
+            c.code.bind(exit);
+        }
+        Fun(v, f) => {
+            let child = c.function(f);
+            match v {
+                Local(id) => {
+                    let r = c.new_local(id, f.line);
+                    c.code.set_loc(f.line);
+                    if c.info(id).captured {
+                        // The function may capture itself: the cell must
+                        // exist before the closure is made.
+                        c.code.op(Lox.LOADNIL(r as u8));
+                        c.code.op(Lox.NEWCELL(r as u8));
+                        let t = c.regs.alloc(1);
+                        c.code.op(Lox.CLOSURE(t as u8, child));
+                        c.code.op(Lox.SETCELL(r as u8, t as u8));
+                    } else {
+                        c.code.op(Lox.CLOSURE(r as u8, child));
+                    }
+                    c.regs.end_stmt();
+                    c.regs.activate(1);
+                }
+                _ => {
+                    let r = c.regs.alloc(1);
+                    c.code.set_loc(f.line);
+                    c.code.op(Lox.CLOSURE(r as u8, child));
+                    if let Global(name) = v { c.code.op(Lox.DEFGLOBAL(r as u8, c.symbol(name, f.line))); }
+                }
+            }
+        }
+        Return(e, line) => {
+            if c.fun.kind == FunKind.Initializer {
+                let r = c.this_reg();
+                if line != 0 { c.code.set_loc(line); }
+                c.code.op(Lox.RET(r as u8));
+            } else {
+                let r = match e {
+                    Some(x) => c.operand(x),
+                    None => { let r = c.regs.alloc(1); c.code.op(Lox.LOADNIL(r as u8)); r }
+                };
+                if line != 0 { c.code.set_loc(line); }
+                c.code.op(Lox.RET(r as u8));
+            }
+        }
+        Class(d) => c.class(d),
+    }
+    c.regs.end_stmt();
+}
+
+/// A register holding `this` (slot 0, unwrapped if it is captured).
+fn C.this_reg(c: *C) -> u32 {
+    if !c.info(c.fun.slot0).captured { return 0; }
+    let r = c.regs.alloc(1);
+    c.code.op(Lox.GETCELL(r as u8, 0));
+    r
+}
+
+fn C.block(c: *C, stmts: *mem.Vec<Stmt>) {
+    let level = c.regs.enter();
+    for i in 0..stmts.len { c.stmt(stmts.ptr_at(i)); }
+    c.regs.leave(level);
+}
+
+fn C.class(c: *C, d: *ClassDecl) {
+    let name = c.str_const(d.name, d.line);
+    c.code.set_loc(d.line);
+    // Define the class variable.
+    match d.target {
+        Local(id) => {
+            let r = c.new_local(id, d.line);
+            c.code.op(Lox.CLASS(r as u8, name));
+            if c.info(id).captured { c.code.op(Lox.NEWCELL(r as u8)); }
+            c.regs.end_stmt();
+            c.regs.activate(1);
+        }
+        Upval(_) => {}
+        Global(g) => {
+            let r = c.regs.alloc(1);
+            c.code.op(Lox.CLASS(r as u8, name));
+            c.code.op(Lox.DEFGLOBAL(r as u8, c.symbol(g, d.line)));
+            c.regs.end_stmt();
+        }
+    }
+    let level = c.regs.enter();
+    // `super` is a local around the methods.
+    var sup: u32 = 0;
+    if let Some(s) = d.superclass {
+        sup = c.new_local(d.super_local, d.line);
+        c.expr_to(s, sup);
+        c.regs.activate(1);
+    }
+    let cls = c.regs.alloc(1);
+    c.load_var(d.target, cls, d.line);
+    if d.superclass.is_some() {
+        c.code.set_loc(d.line);
+        c.code.op(Lox.INHERIT(cls as u8, sup as u8));
+        if c.info(d.super_local).captured { c.code.op(Lox.NEWCELL(sup as u8)); }
+    }
+    for i in 0..d.methods.len {
+        let f = d.methods.at(i);
+        let child = c.function(f);
+        let r = c.regs.alloc(1);
+        c.code.set_loc(f.line);
+        c.code.op(Lox.CLOSURE(r as u8, child));
+        c.code.op(Lox.METHOD(cls as u8, r as u8, c.str_const(f.name, f.line)));
+        c.regs.free(r);
+    }
+    c.regs.leave(level);
+}
+
+fn new_c(unit: *Unit, f: *Fun) -> C {
+    C {
+        unit: unit, fun: f,
+        code: bc.Code.new(Lox.op_size, Lox.set_label),
+        consts: bc.Pool.new(65536),
+        regs: bc.Regs.new(256),
+        children: mem.Vec.new(),
+    }
+}
+
+/// Compile a nested function; returns its index among this function's
+/// children.
+fn C.function(c: *C, f: *Fun) -> u16 {
+    let p = compile_fun(c.unit, f);
+    c.children.push(p);
+    (c.children.len - 1) as u16
+}
+
+fn compile_fun(unit: *Unit, f: *Fun) -> *Proto {
+    var c = new_c(unit, f);
+    c.code.set_loc(f.line);
+    // Slot 0 and the parameters are the first locals.
+    c.regs.alloc(1);
+    c.regs.activate(1);
+    if c.info(f.slot0).captured { c.code.op(Lox.NEWCELL(0)); }
+    for i in 0..f.params.len {
+        let id = f.params.at(i);
+        let r = c.new_local(id, f.line);
+        c.regs.activate(1);
+        if c.info(id).captured { c.code.op(Lox.NEWCELL(r as u8)); }
+    }
+    for i in 0..f.body.len { c.stmt(f.body.ptr_at(i)); }
+    // Falling off the end returns nil (`this` from an initializer).
+    let end = Stmt.Return(None, 0);
+    c.stmt(&end);
+    c.finish(f)
+}
+
+/// Copy the finished code, lines, constants and children into a
+/// prototype.
+fn C.finish(c: *C, f: *Fun) -> *Proto {
+    if c.regs.failed() { c.error("Too many registers in function.", f.line); }
+    if let Some(e) = c.code.check() { c.error(e.message(), e.loc); }
+    let n = c.code.len();
+    let code: *u32 = mem.alloc(n);
+    c.code.copy_into(code.slice(n));
+    let lines: *u32 = mem.alloc(n);
+    c.code.locs_into(lines.slice(n));
+    let nk = c.consts.len();
+    let consts: *Value = mem.alloc(nk);
+    for i in 0..nk { consts[i] = c.consts.get(i as u32); }
+    let nu = f.upvals.len;
+    let caps: *u32 = mem.alloc(nu);
+    for i in 0..nu {
+        let u = f.upvals.at(i);
+        caps[i] = if u.is_local { u.index | value.LOCAL_CAPTURE } else { u.index };
+    }
+    let p: *Proto = mem.alloc(1);
+    *p = Proto {
+        name: f.name, arity: f.arity, nregs: c.regs.frame_size(1),
+        words: code.slice(n), code: Lox.placeholder(), lines: lines.slice(n), consts: consts.slice(nk),
+        children: c.children.items(), captures: caps.slice(nu), is_script: f.kind == FunKind.Script,
+    };
+    c.code.free();
+    c.consts.free();
+    c.unit.protos.push(p);
+    p
+}
+
+pub fn compile(prog: *Program, m: *Machine, names: *text.Interner) -> Result<(*Proto, mem.Vec<*Proto>), (str, u32)> {
+    var unit = Unit { m: m, names: names, infos: &prog.locals, protos: mem.Vec.new(), error: None };
+    let main = compile_fun(&unit, prog.script);
+    if let Some(e) = unit.error { return Err(e); }
+    Ok((main, unit.protos))
+}
