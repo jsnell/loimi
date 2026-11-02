@@ -222,6 +222,7 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, s
     std::fs::write(&sll, jitgen::stencil_module(ir, &jit.stencils)).map_err(|e| e.to_string())?;
     let st = Command::new(clang)
         .args(["-O3", "-Wno-override-module", "-fno-pic", "-ffunction-sections", "-fdata-sections", "-fno-asynchronous-unwind-tables", "-c", "-x", "ir"])
+        .args(if jitgen::split_stencils() { &["-fsplit-machine-functions"][..] } else { &[] })
         .arg(&sll)
         .arg("-o")
         .arg(&so)

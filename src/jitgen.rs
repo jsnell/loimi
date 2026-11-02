@@ -509,6 +509,25 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
         });
         out.push_str(&g.run());
     }
+    // Hot and cold parts (an experiment, off unless LOIMI_JIT_SPLIT is
+    // set at build time; no faster, see copy-and-patch.md section 10): an
+    // entry count makes the blocks LLVM thinks are never run cold, and
+    // `-fsplit-machine-functions` moves them to a section of their own
+    // (`.text.split.__jit.op.NAME`). The fast path then ends in its jump to
+    // the next instruction, which the JIT drops (falling through), and
+    // the cold parts go after all fast paths (`elf.rs`, `jit_rt.c`).
+    let prof = cg.jit_holes.len();
+    let split = split_stencils();
+    let mut out = if split {
+        out.lines()
+            .map(|l| match l.strip_suffix(" {") {
+                Some(head) if l.starts_with("define ") && l.contains("@\"__jit.op.") => format!("{} !prof !{} {{\n", head, prof),
+                _ => format!("{}\n", l),
+            })
+            .collect::<String>()
+    } else {
+        out
+    };
     out.push_str(&exit_stencil(p, vi));
     let mut md = String::new();
     for (i, (name, hi)) in cg.jit_holes.iter().enumerate() {
@@ -520,8 +539,16 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
     for line in cg.jit_conts.values() {
         let _ = writeln!(out, "{}", line);
     }
+    if split {
+        let _ = writeln!(md, "!{} = !{{!\"function_entry_count\", i64 1000}}", prof);
+    }
     out.push_str(&md);
     cg.stencils = out;
+}
+
+/// Whether to split stencils into hot and cold parts (`LOIMI_JIT_SPLIT`).
+pub fn split_stencils() -> bool {
+    std::env::var_os("LOIMI_JIT_SPLIT").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The stencil module: the interpreter's IR, plus the stencils.

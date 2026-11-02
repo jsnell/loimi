@@ -35,6 +35,9 @@ const K_JUMP: u16 = 4;
 const K_TLS: u16 = 5;
 const K_RODATA: u16 = 6;
 const K_HELPER: u16 = 7;
+/// A stencil's own code: arg is an offset into its hot part followed by
+/// its cold part (which the JIT places apart).
+const K_SELF: u16 = 8;
 
 struct Section {
     name: String,
@@ -166,7 +169,9 @@ impl Cx<'_> {
     /// helper must not use holes). A call to another function of the
     /// object (a helper) is a `K_HELPER` record with arg (section << 32 |
     /// offset), resolved once the helper code is laid out.
-    fn relocs(&mut self, elf: &Elf, si: usize, holes: bool) -> Result<Vec<Reloc>, String> {
+    /// `own`: a stencil's hot and cold sections (references to them are
+    /// `K_SELF` records), and the hot section's size.
+    fn relocs(&mut self, elf: &Elf, si: usize, holes: bool, own: Option<(usize, Option<usize>, u64)>) -> Result<Vec<Reloc>, String> {
         let mut rs = Vec::new();
         for rsec in elf.sections.iter().filter(|r| r.ty == SHT_RELA && r.info as usize == si) {
             for k in 0..rsec.size / 24 {
@@ -203,8 +208,10 @@ impl Cx<'_> {
                 } else {
                     let t = s.shndx as usize;
                     let ts = elf.sections.get(t).ok_or("bad section index")?;
-                    if ts.flags & SHF_EXECINSTR != 0 {
-                        if ts.name.starts_with(".text.__jit.") {
+                    if let Some((hot, _, hot_len)) = own.filter(|o| o.0 == t || o.1 == Some(t)) {
+                        (K_SELF, s.value + if t == hot { 0 } else { hot_len })
+                    } else if ts.flags & SHF_EXECINSTR != 0 {
+                        if ts.name.starts_with(".text.__jit.") || ts.name.starts_with(".text.split.__jit.") {
                             return Err(format!("reference to stencil {}", ts.name));
                         }
                         if ty != R_X86_64_PLT32 && !s.name.is_empty() && s.name != ts.name && self.known.contains(&s.name) {
@@ -236,7 +243,7 @@ impl Cx<'_> {
                                 self.ro_ix.insert(t, b);
                                 if relocated {
                                     // A helper's jump table: patched once.
-                                    for rl in self.relocs(elf, t, false)? {
+                                    for rl in self.relocs(elf, t, false, None)? {
                                         self.drelocs.push(Reloc { off: rl.off + b as u32, ..rl });
                                     }
                                 }
@@ -281,8 +288,8 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let mut rejected = Vec::new();
     let by_name: HashMap<&str, u32> = ops.iter().map(|(o, n)| (n.as_str(), *o)).collect();
     // The stencils: (index (opcode, or nops for the exit stencil), name,
-    // section, relocations).
-    let mut found: Vec<(u32, String, usize, Vec<Reloc>)> = Vec::new();
+    // section, cold section (`-fsplit-machine-functions`), relocations).
+    let mut found: Vec<(u32, String, usize, Option<usize>, Vec<Reloc>)> = Vec::new();
     for (si, sec) in elf.sections.iter().enumerate() {
         let Some(fname) = sec.name.strip_prefix(".text.") else { continue };
         let idx = if fname == "__jit.exit" {
@@ -296,21 +303,32 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
             continue;
         };
         let name = if idx == nops { "<exit>".to_string() } else { fname.trim_start_matches("__jit.op.").to_string() };
-        match cx.relocs(&elf, si, true) {
-            Ok(rs) => found.push((idx, name, si, rs)),
+        let split = format!(".text.split.{}", fname);
+        let cold = elf.sections.iter().position(|c| c.name == split);
+        let own = Some((si, cold, sec.size as u64));
+        let rs = cx.relocs(&elf, si, true, own).and_then(|mut rs| {
+            if let Some(c) = cold {
+                for rl in cx.relocs(&elf, c, true, own)? {
+                    rs.push(Reloc { off: rl.off + sec.size as u32, ..rl });
+                }
+            }
+            Ok(rs)
+        });
+        match rs {
+            Ok(rs) => found.push((idx, name, si, cold, rs)),
             Err(w) => rejected.push((name, w)),
         }
     }
     // Helpers: the functions the stencils call, and those they call.
     let deps = |rs: &[Reloc]| -> Vec<usize> { rs.iter().filter(|r| r.kind == K_HELPER).map(|r| (r.arg >> 32) as usize).collect() };
     let mut helpers: BTreeMap<usize, Result<Vec<Reloc>, String>> = BTreeMap::new();
-    let mut work: Vec<usize> = found.iter().flat_map(|f| deps(&f.3)).collect();
+    let mut work: Vec<usize> = found.iter().flat_map(|f| deps(&f.4)).collect();
     loop {
         while let Some(h) = work.pop() {
             if helpers.contains_key(&h) {
                 continue;
             }
-            let r = cx.relocs(&elf, h, false);
+            let r = cx.relocs(&elf, h, false, None);
             if let Ok(rs) = &r {
                 work.extend(deps(rs));
             }
@@ -368,9 +386,9 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let mut code: Vec<u8> = Vec::new();
     let mut relocs: Vec<Reloc> = Vec::new();
     // Per stencil index: (code offset, length, first reloc, reloc count,
-    // trim distance or -1).
-    let mut stencils: BTreeMap<u32, (usize, usize, usize, usize, i64)> = BTreeMap::new();
-    for (idx, name, si, mut rs) in found {
+    // trim distance or -1, length of the hot part).
+    let mut stencils: BTreeMap<u32, (usize, usize, usize, usize, i64, usize)> = BTreeMap::new();
+    for (idx, name, si, cold, mut rs) in found {
         if let Some(d) = deps(&rs).into_iter().find(|d| helpers[d].is_err()) {
             rejected.push((name, format!("calls {}: {}", elf.sections[d].name, helpers[&d].as_ref().err().unwrap())));
             continue;
@@ -378,7 +396,7 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
         rs.iter_mut().for_each(resolve);
         let sec = &elf.sections[si];
         let bytes = &elf.data[sec.off..sec.off + sec.size];
-        // The stencil ends in `jmp __jit.n.D`: the copy can drop it when
+        // The hot part ends in `jmp __jit.n.D`: the copy can drop it when
         // the code for pc + D follows.
         let n = bytes.len();
         let trim = rs
@@ -387,8 +405,13 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
             .map(|r| r.arg as i64)
             .unwrap_or(-1);
         rs.sort_by_key(|r| r.off);
-        stencils.insert(idx, (code.len(), n, relocs.len(), rs.len(), trim));
-        code.extend_from_slice(bytes);
+        let mut bytes = bytes.to_vec();
+        if let Some(c) = cold {
+            let cs = &elf.sections[c];
+            bytes.extend_from_slice(&elf.data[cs.off..cs.off + cs.size]);
+        }
+        stencils.insert(idx, (code.len(), bytes.len(), relocs.len(), rs.len(), trim, n));
+        code.extend_from_slice(&bytes);
         relocs.extend(rs);
     }
     let Cx { syms, tls, rodata, drelocs, .. } = cx;
@@ -426,13 +449,13 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let _ = writeln!(ir, "@loimi_jit_ndrelocs = constant i32 {}", dl.len());
     let mut st = Vec::new();
     for i in 0..=nops {
-        let (o, l, r, nr, t, present) = match stencils.get(&i) {
-            Some(&(o, l, r, nr, t)) => (o, l, r, nr, t, 1),
-            None => (0, 0, 0, 0, -1, 0),
+        let (o, l, r, nr, t, h, present) = match stencils.get(&i) {
+            Some(&(o, l, r, nr, t, h)) => (o, l, r, nr, t, h, 1),
+            None => (0, 0, 0, 0, -1, 0, 0),
         };
-        st.push(format!("{{ i32, i32, i32, i32, i32, i32 }} {{ i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {} }}", o, l, r, nr, t, present));
+        st.push(format!("{{ i32, i32, i32, i32, i32, i32, i32 }} {{ i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {}, i32 {} }}", o, l, r, nr, t, present, h));
     }
-    let _ = writeln!(ir, "@loimi_jit_stencils = constant [{} x {{ i32, i32, i32, i32, i32, i32 }}] [{}]", st.len(), st.join(", "));
+    let _ = writeln!(ir, "@loimi_jit_stencils = constant [{} x {{ i32, i32, i32, i32, i32, i32, i32 }}] [{}]", st.len(), st.join(", "));
     let mut decls = String::new();
     let sl: Vec<String> = syms
         .iter()

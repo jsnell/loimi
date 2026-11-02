@@ -36,7 +36,10 @@
 #include <time.h>
 
 struct jit_reloc { uint32_t off; uint16_t type; uint16_t kind; int64_t addend; int64_t arg; };
-struct jit_stencil { uint32_t code, len, reloc, nreloc; int32_t trim; uint32_t present; };
+/* A stencil: its hot part (`hot` bytes, the fast path), then its cold
+ * part (blocks LLVM thinks are rarely run, `-fsplit-machine-functions`),
+ * which the JIT places after all the hot parts of a code object. */
+struct jit_stencil { uint32_t code, len, reloc, nreloc; int32_t trim; uint32_t present, hot; };
 struct jit_opinfo { uint16_t size, base, flags, span, part; };
 
 extern const uint8_t loimi_jit_code[];
@@ -63,7 +66,7 @@ extern void *const loimi_jit_ctable[];
 void **loimi_jit_entries;
 uint16_t loimi_jit_hotcount[HOT_SLOTS];
 
-enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER };
+enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER, K_SELF };
 enum { R_64 = 1, R_PC32 = 2, R_PLT32 = 4, R_32 = 10, R_32S = 11, R_TPOFF32 = 23 };
 enum { S_NONE, S_COMPILED, S_FAILED };
 #define MAX_COMPILES 32
@@ -381,16 +384,18 @@ static int64_t field(uint32_t w, int64_t arg) {
     return (int64_t)(u ^ (1ull << (bits - 1))) - (int64_t)(1ull << (bits - 1));
 }
 
-/* Copy stencil s (len bytes of it) for the instruction at pc to `at`, and
- * patch it. Continuations go to the instructions' homes (r->home). */
-static int emit_copy(const struct rec *r, uint64_t pc, uint32_t w0, uint32_t s, uint32_t len, uint8_t *at) {
+/* Copy stencil s for the instruction at pc, its hot part (len bytes of
+ * it: the final jump may be trimmed) to `at` and its cold part to `cold`,
+ * and patch it. Continuations go to the instructions' homes (r->home). */
+static int emit_copy(const struct rec *r, uint64_t pc, uint32_t w0, uint32_t s, uint32_t len, uint8_t *at, uint8_t *cold) {
     const struct jit_stencil *sp = &loimi_jit_stencils[s];
     uint64_t n = r->n;
     memcpy(WR(at), loimi_jit_code + sp->code, len);
+    memcpy(WR(cold), loimi_jit_code + sp->code + sp->hot, sp->len - sp->hot);
     for (uint32_t k = 0; k < sp->nreloc; k++) {
         const struct jit_reloc *rl = &loimi_jit_relocs[sp->reloc + k];
-        if (rl->off + 4 > len) continue; /* the trimmed jump */
-        uint8_t *P = at + rl->off;
+        if (rl->off < sp->hot && rl->off + 4 > len) continue; /* the trimmed jump */
+        uint8_t *P = rl->off < sp->hot ? at + rl->off : cold + (rl->off - sp->hot);
         int64_t S, t;
         switch (rl->kind) {
         case K_SYM: S = (int64_t)(intptr_t)loimi_jit_syms[rl->arg]; break;
@@ -419,6 +424,7 @@ static int emit_copy(const struct rec *r, uint64_t pc, uint32_t w0, uint32_t s, 
         case K_TLS: S = tlsoff[rl->arg]; break;
         case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
         case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
+        case K_SELF: S = (int64_t)(intptr_t)(rl->arg < sp->hot ? at + rl->arg : cold + (rl->arg - sp->hot)); break;
         default: return 0;
         }
         if (!patch(P, rl, S)) return 0;
@@ -524,9 +530,10 @@ static uint8_t *make_copy(struct rec *r, uint64_t i, uint32_t w) {
     const struct jit_opinfo *ni = &loimi_jit_opinfo[w & OPMASK], *oi = &loimi_jit_opinfo[r->cw[i] & OPMASK];
     if (ni->base == 0xffff || ni->size != oi->size || r->nalts >= 16 + r->n) return NULL;
     uint32_t s = stencil_for(w);
-    uint32_t len = loimi_jit_stencils[s].len;
+    const struct jit_stencil *sp = &loimi_jit_stencils[s];
+    uint32_t len = sp->len;
     uint64_t sz = (len + 15) & ~(uint64_t)15;
-    if (bump + sz > region_end || !emit_copy(r, i, w, s, len, bump)) return NULL;
+    if (bump + sz > region_end || !emit_copy(r, i, w, s, sp->hot, bump, bump + sp->hot)) return NULL;
     uint8_t *at = bump;
     bump += sz;
     st.bytes += sz;
@@ -713,7 +720,7 @@ static int compile(struct rec *r, const int32_t *oent) {
     uint32_t *code = r->code;
     uint32_t *sts = malloc(n * sizeof *sts);
     uint32_t *lens = malloc(n * sizeof *lens);
-    int64_t *map = malloc(n * sizeof *map);
+    int64_t *map = malloc(n * sizeof *map), *cmap = malloc(n * sizeof *cmap);
     int ok = 0;
     uint64_t ninsn = 0, nexit = 0;
     free_compiled(r);
@@ -731,8 +738,9 @@ static int compile(struct rec *r, const int32_t *oent) {
     }
     /* Layout: one stencil per instruction (a super's first part at its
      * head word; the other parts are instructions of their own), behind a
-     * 5-byte nop for instructions whose word may be rewritten. */
-    int64_t off = 0;
+     * 5-byte nop for instructions whose word may be rewritten. The cold
+     * parts follow all the hot ones. */
+    int64_t off = 0, coff = 0;
     for (uint64_t pc = 0; pc < n;) {
         uint32_t op = code[pc] & OPMASK;
         const struct jit_opinfo *oi = &loimi_jit_opinfo[op];
@@ -743,8 +751,10 @@ static int compile(struct rec *r, const int32_t *oent) {
         uint32_t s = stencil_for(code[pc]);
         if (s == nops) nexit++;
         const struct jit_stencil *sp = &loimi_jit_stencils[s];
-        uint32_t len = sp->len;
+        uint32_t len = sp->hot;
         if (sp->trim >= 0 && (uint64_t)sp->trim == oi->size && pc + oi->size < n) len -= 5;
+        cmap[pc] = coff;
+        coff += sp->len - sp->hot;
         if (oi->flags & 4) {
             r->fl[pc] |= F_PREFIX;
             off += 5;
@@ -757,6 +767,8 @@ static int compile(struct rec *r, const int32_t *oent) {
         ninsn++;
     }
     off = (off + 15) & ~(int64_t)15;
+    int64_t hot_end = off;
+    off = (off + coff + 15) & ~(int64_t)15;
     if (bump + off > region_end) goto out;
     uint8_t *dst = bump;
     for (uint64_t pc = 0; pc < n; pc++)
@@ -767,7 +779,7 @@ static int compile(struct rec *r, const int32_t *oent) {
     for (uint64_t pc = 0; pc < n; pc++) {
         if (map[pc] < 0) continue;
         if (r->fl[pc] & F_PREFIX) memcpy(WR(r->home[pc]), nop5, 5);
-        if (!emit_copy(r, pc, code[pc], sts[pc], lens[pc], r->body[pc])) goto out;
+        if (!emit_copy(r, pc, code[pc], sts[pc], lens[pc], r->body[pc], dst + hot_end + cmap[pc])) goto out;
     }
     bump += off;
     if (oent)
@@ -796,6 +808,7 @@ static int compile(struct rec *r, const int32_t *oent) {
     ok = 1;
 out:
     free(map);
+    free(cmap);
     free(sts);
     free(lens);
     if (!ok) free_compiled(r);
