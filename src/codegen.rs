@@ -44,6 +44,8 @@ pub struct Codegen<'p> {
     pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
     /// Trampolines that call a plain function as a `block fn`, by signature.
     pub tramps: std::collections::HashMap<String, String>,
+    /// Whether `std.gc.barrier` exists (stores into objects call it); computed on first use.
+    pub gc_barrier: Option<bool>,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -126,6 +128,7 @@ impl<'p> Codegen<'p> {
             decls: Decls::default(),
             str_count: 0,
             mark_fns: Default::default(),
+            gc_barrier: None,
             nan_safe: Default::default(),
             cold_queue: vec![],
             cold_count: 0,
@@ -644,7 +647,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
     }
 
     /// Index value, extended to i64.
-    fn index_val(&mut self, idx: &TExpr) -> String {
+    pub fn index_val(&mut self, idx: &TExpr) -> String {
         let v = self.val(idx);
         match &idx.ty {
             Ty::Int(it) if it.bits < 64 => {
@@ -904,6 +907,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TK::Assign(lhs, rhs) => {
                 let v = self.val(rhs);
+                if crate::gcgen::needs_barrier(self, lhs) {
+                    crate::gcgen::store_with_barrier(self, lhs, &v);
+                    return "zeroinitializer".into();
+                }
                 let p = self.place(lhs);
                 if matches!(lhs.kind, TK::Vm(TVm::Word(_) | TVm::WordAt(..))) && !lhs.ty.is_unitlike() {
                     // A code word or inline cache field: only word-aligned.

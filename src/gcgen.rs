@@ -204,6 +204,21 @@ pub fn emit_runtime(cg: &mut Codegen) {
         g.allocas, g.body
     );
     cg.fns.push_str(&text);
+    // `loimi_type_name(tid) -> str`, for the collector's diagnostics.
+    cg.decls.0.remove("loimi_type_name");
+    let mut cases = String::new();
+    let mut arms = String::new();
+    for (sid, tid) in &objects {
+        let name = cg.p.structs[*sid].name.clone();
+        let s = cg.string_const(name.as_bytes());
+        let _ = write!(cases, " i32 {}, label %n{}", tid, tid);
+        let _ = write!(arms, "n{}:\n  ret {{ ptr, i64 }} {{ ptr {}, i64 {} }}\n", tid, s, name.len());
+    }
+    let _ = write!(
+        cg.fns,
+        "define internal {{ ptr, i64 }} @loimi_type_name(i32 %tid) cold nounwind {{\nentry:\n  switch i32 %tid, label %none [{} ]\n{}none:\n  ret {{ ptr, i64 }} zeroinitializer\n}}\n\n",
+        cases, arms
+    );
 }
 
 /// `new(heap, init, len?)`
@@ -297,4 +312,87 @@ pub fn pop_frame(g: &mut FnGen, prev: Option<String>) {
     if let Some(prev) = prev {
         g.emit(format!("store ptr {}, ptr @loimi.shadow_top", prev));
     }
+}
+
+/// Whether the place `e` lies inside a GC object: a field (or element of
+/// an array field, or field of a struct field) of an object reached
+/// through a `Gc`, or an element of an object's trailing array. Stores of
+/// traced values there go through the write barrier.
+fn in_object(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Deref(x) => matches!(x.ty, Ty::Gc(_)),
+        TK::Field(b, _) => matches!(b.ty, Ty::Struct(_) | Ty::Tuple(_)) && in_object(b),
+        TK::Index(b, _) => match &b.ty {
+            Ty::Array(..) => in_object(b),
+            Ty::Slice(_) => matches!(b.kind, TK::Trailing(_)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Does the assignment to `lhs` need a write barrier?
+pub fn needs_barrier(g: &mut FnGen, lhs: &TExpr) -> bool {
+    if !in_object(lhs) || !is_traced(g.p(), &lhs.ty) {
+        return false;
+    }
+    if g.cg.gc_barrier.is_none() {
+        let p = g.p();
+        let has = p.fns.iter().any(|f| f.symbol == "std.gc.barrier" && f.body.is_some());
+        g.cg.gc_barrier = Some(has);
+    }
+    g.cg.gc_barrier == Some(true)
+}
+
+/// The address of the place `e` (for which `in_object` holds) and of the
+/// object that contains it.
+fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
+    match &e.kind {
+        TK::Deref(x) => {
+            let v = g.val(x);
+            (v.clone(), v)
+        }
+        TK::Field(b, i) => {
+            let (base, obj) = object_place(g, b);
+            let bt = g.ty(&b.ty);
+            let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", bt, base, i));
+            (p, obj)
+        }
+        TK::Index(b, idx) => match (&b.ty, &b.kind) {
+            (Ty::Array(_, n), _) => {
+                let n = *n;
+                let (base, obj) = object_place(g, b);
+                let i = g.index_val(idx);
+                let bad = g.inst(format!("icmp uge i64 {}, {}", i, n));
+                g.check(&bad, "index out of bounds", e.span);
+                let bt = g.ty(&b.ty);
+                let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 0, i64 {}", bt, base, i));
+                (p, obj)
+            }
+            (_, TK::Trailing(o)) => {
+                let p = g.p();
+                let obj = g.val(o);
+                let Ty::Gc(inner) = &o.ty else { unreachable!() };
+                let size = layout::size_of(p, inner);
+                let base = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", obj, size));
+                let lp = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 -8", obj));
+                let len = g.inst(format!("load i64, ptr {}", lp));
+                let i = g.index_val(idx);
+                let bad = g.inst(format!("icmp uge i64 {}, {}", i, len));
+                g.check(&bad, "index out of bounds", e.span);
+                let elem = g.ty(&e.ty);
+                let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 {}", elem, base, i));
+                (p, obj)
+            }
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    }
+}
+
+/// `lhs = v` into an object, followed by the write barrier on the object.
+pub fn store_with_barrier(g: &mut FnGen, lhs: &TExpr, v: &str) {
+    let (p, obj) = object_place(g, lhs);
+    g.store(&lhs.ty, v, &p);
+    g.emit(format!("call void @\"std.gc.barrier\"(ptr {})", obj));
 }

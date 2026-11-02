@@ -1,0 +1,119 @@
+// Weak references and ephemeron tables, in both heap modes, with stress
+// (and in generational mode, verify). A weak reference reads None once
+// its target died; an ephemeron entry keeps its value alive only while
+// its key is alive, even when the value references the key.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn node(h: *gc.Heap, v: i64, next: ?Gc<Node>) -> Gc<Node> { new(h, Node { value: v, next: next }) }
+
+fn scribble(h: *gc.Heap) {
+    for i in 0..400 { node(h, 1000000, None); }
+}
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..10 {
+        scribble(h);
+        gc.collect(h);
+    }
+}
+
+fn get(w: Gc<gc.Weak<Node>>) -> i64 {
+    if let Some(n) = w.get() { n.value } else { -1 }
+}
+
+fn eget(t: *gc.Ephemerons<Node, Gc<Node>>, k: Gc<Node>) -> i64 {
+    if let Some(v) = t.get(k) { v.value } else { -1 }
+}
+
+/// Weak references to a kept and a dropped target.
+fn weak_refs(h: *gc.Heap) uses gc {
+    let keep = node(h, 1, None);
+    let w1 = h.new_weak(keep);
+    let w2 = h.new_weak(node(h, 2, None));
+    io.print_int(get(w1)); io.print(" "); io.print_int(get(w2)); io.println("");
+    churn(h);
+    io.print_int(get(w1)); io.print(" "); io.print_int(get(w2)); io.println("");
+    // Retarget an old weak reference to a young object, kept and not.
+    w1.set(Some(node(h, 3, None)));
+    churn(h);
+    io.print_int(get(w1)); io.print(" "); io.print_int(keep.value); io.println("");
+    let k2 = node(h, 4, None);
+    w2.set(Some(k2));
+    churn(h);
+    io.print_int(get(w2)); io.print(" "); io.print_int(k2.value); io.println("");
+}
+
+/// An entry whose value references its key, with a key nothing else
+/// references: the value must not keep the key alive.
+fn add_dropped(h: *gc.Heap, t: *gc.Ephemerons<Node, Gc<Node>>) {
+    let k = node(h, 20, None);
+    t.set(k, node(h, 21, Some(k)));
+}
+
+/// A key reachable only through the value of `k1`'s entry; returns a
+/// weak reference to it.
+fn add_chained(h: *gc.Heap, t: *gc.Ephemerons<Node, Gc<Node>>, k1: Gc<Node>) -> Gc<gc.Weak<Node>> {
+    let k3 = node(h, 30, None);
+    t.set(k3, node(h, 31, None));
+    if let Some(v) = t.get(k1) { v.next = Some(k3); }
+    h.new_weak(k3)
+}
+
+fn ephemerons(h: *gc.Heap) uses gc {
+    let t: *gc.Ephemerons<Node, Gc<Node>> = gc.Ephemerons.new(h);
+    let k1 = node(h, 10, None);
+    t.set(k1, node(h, 11, Some(k1)));
+    add_dropped(h, t);
+    let w3 = add_chained(h, t, k1);
+    io.print_int(t.len() as i64); io.println("");
+    churn(h);
+    io.print_int(eget(t, k1)); io.print(" "); io.print_int(t.len() as i64); io.println("");
+    churn(h);
+    if let Some(k) = w3.get() { io.print_int(eget(t, k)); } else { io.print("dead"); }
+    io.println("");
+    // Without k1's entry, k3 dies, and so does its entry.
+    t.remove(k1);
+    churn(h);
+    churn(h);
+    io.print_int(t.len() as i64); io.print(" "); io.print_int(get(w3)); io.println("");
+    t.free();
+}
+
+fn run(h: *gc.Heap) uses gc {
+    weak_refs(h);
+    ephemerons(h);
+}
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    heap.set_stress(true);
+    run(&heap);
+    heap.free();
+    var gheap = gc.Heap.new();
+    gheap.set_generational(true);
+    gheap.set_stress(true);
+    gheap.set_verify(true);
+    run(&gheap);
+    gheap.free();
+    0
+}
+
+// expect: 1 2
+// expect: 1 -1
+// expect: -1 1
+// expect: 4 4
+// expect: 3
+// expect: 11 2
+// expect: 31
+// expect: 0 -1
+// expect: 1 2
+// expect: 1 -1
+// expect: -1 1
+// expect: 4 4
+// expect: 3
+// expect: 11 2
+// expect: 31
+// expect: 0 -1

@@ -1,0 +1,110 @@
+// Generational mode with stress and verify: every safepoint collects
+// (mostly minor collections), and each collection first checks that no
+// old object outside the remembered set points to a young one. Old
+// objects get young references through every kind of store the compiler
+// puts a write barrier on, and through a raw pointer with an explicit
+// `gc.write_barrier`. Freed slots are overwritten (`scribble`), so a
+// young object freed while an old one still references it shows up as a
+// wrong sum.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+object Vec4 { items: [?Gc<Node>] }
+struct Pair { a: ?Gc<Node>, b: ?Gc<Node> }
+object Holder { tag: u64, pair: Pair, arr: [?Gc<Node>; 2], v: V }
+object Raw { slots: [V] }
+
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil, N(Gc<Node>) }
+
+fn node(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+
+fn scribble(h: *gc.Heap) {
+    for i in 0..400 { node(h, 1000000); }
+}
+
+fn val(n: ?Gc<Node>) -> i64 {
+    if let Some(x) = n { x.value } else { -1 }
+}
+
+fn vval(v: V) -> i64 {
+    match v {
+        N(x) => x.value,
+        _ => -1,
+    }
+}
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..20 {
+        scribble(h);
+        gc.maybe_collect(h);
+    }
+}
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_stress(true);
+    h.set_verify(true);
+
+    // Old objects: survive a few collections.
+    let old = node(h, 1);
+    let vec: Gc<Vec4> = new(h, Vec4 {}, 4);
+    let hold = new(h, Holder { tag: 7, pair: Pair { a: None, b: None }, arr: [None; 2], v: V.Nil });
+    let raw: Gc<Raw> = new(h, Raw {}, 3);
+    for i in 0..3 { raw.slots[i] = V.Nil; }
+    churn(h);
+
+    // Young references stored into old objects.
+    old.next = Some(node(h, 2));                 // a Gc field
+    vec.items[1] = Some(node(h, 3));             // a trailing array element
+    hold.pair.b = Some(node(h, 4));              // a field of a struct field
+    hold.arr[1] = Some(node(h, 5));              // an element of an array field
+    hold.v = V.N(node(h, 6));                    // a value field
+    hold.pair = Pair { a: Some(node(h, 7)), b: hold.pair.b };   // a whole struct
+    let p = raw.slots.ptr;                       // a raw pointer into the object
+    p[2] = V.N(node(h, 8));
+    gc.write_barrier(h, raw as *u8);
+    churn(h);
+    io.print_int(val(old.next) + val(vec.items[1]) + val(hold.pair.b) + val(hold.arr[1])
+        + vval(hold.v) + val(hold.pair.a) + vval(raw.slots[2]));
+    io.println("");
+
+    // Again, after the remembered set was processed: the objects must be
+    // logged again on their next store.
+    old.next = Some(node(h, 20));
+    vec.items[1] = Some(node(h, 30));
+    p[2] = V.N(node(h, 80));
+    gc.write_barrier(h, raw as *u8);
+    churn(h);
+    io.print_int(val(old.next) + val(vec.items[1]) + vval(raw.slots[2]));
+    io.println("");
+
+    // A long list built by prepending young nodes to an old tail, and by
+    // appending young nodes to an old head.
+    var head = node(h, 0);
+    var tail = head;
+    for i in 1..2001 {
+        let n = node(h, i);
+        tail.next = Some(n);
+        tail = n;
+        if i % 100 == 0 { gc.maybe_collect(h); }
+    }
+    churn(h);
+    var sum: i64 = 0;
+    var c: ?Gc<Node> = Some(head);
+    while let Some(x) = c { sum += x.value; c = x.next; }
+    io.print_int(sum);
+    io.println("");
+
+    io.print_bool(h.minors > 0 and h.minors < h.collections);
+    io.println("");
+    heap.free();
+    0
+}
+
+// expect: 35
+// expect: 130
+// expect: 2001000
+// expect: true
