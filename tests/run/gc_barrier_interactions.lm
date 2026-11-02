@@ -1,0 +1,76 @@
+// Write barriers with other features, on a generational heap in verify
+// mode: stores in closures through captured references, into generic
+// objects, from `inline for`, into a struct inside an object, and a
+// method called on a struct field of an object (`b.pair.set(x)`
+// auto-refs `&b.pair`; the call is followed by the barrier).
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+struct Pair { a: ?Gc<Node>, n: i64 }
+object Box { pair: Pair, arr: [?Gc<Node>; 3], items: [?Gc<Node>] }
+object Gen<T> { x: T, items: [T] }
+
+value V repr nanbox { Num(f64) unboxed, Int(i32), N(Gc<Node>), Nil }
+
+fn Pair.set(p: *Pair, x: Gc<Node>) { p.a = Some(x); }
+
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn each_gc(h: *gc.Heap, n: i64, f: block fn(i64) uses gc) uses gc { for i in 0..n { f(i); gc.collect(h); } }
+
+fn young(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+
+fn age(h: *gc.Heap) uses gc { gc.collect(h); gc.collect(h); }
+
+fn keep<T>(h: *gc.Heap, x: T) -> T uses gc { gc.collect(h); for i in 0..500 { young(h, -5); } x }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    let b = new(h, Box { pair: Pair { a: None, n: 0 }, arr: [None, None, None] }, 3);
+    let g: Gc<Gen<V>> = new(h, Gen { x: V.Nil }, 2);
+    let gn: Gc<Gen<Gc<Node>>> = new(h, Gen { x: young(h, 0) }, 2);
+    age(h);
+    // closure stores
+    each(3, |i| { b.arr[i] = Some(young(h, i)); });
+    age(h);
+    each(3, |i| { b.items[i] = Some(young(h, 10 + i)); });
+    age(h);
+    // generic objects
+    g.x = V.N(young(h, 20));
+    g.items[1] = V.N(young(h, 21));
+    gn.x = young(h, 22);
+    gn.items[0] = young(h, 23);
+    gn.items[1] = young(h, 24);
+    age(h);
+    // inline for stores
+    inline for k in [0, 1, 2] { b.arr[k] = Some(young(h, 30 + k)); }
+    age(h);
+    // value struct inside object
+    b.pair.a = Some(young(h, 40));
+    age(h);
+    // closure with uses gc storing through captured ref
+    each_gc(h, 2, |i| { gn.items[i] = young(h, 50 + i); });
+    // generic fn with Gc
+    let kept = keep(h, young(h, 60));
+    let kv = keep(h, V.N(young(h, 61)));
+    age(h);
+    var t = 0;
+    for i in 0..3 { if let Some(x) = b.arr[i] { t += x.value; } }
+    for i in 0..3 { if let Some(x) = b.items[i] { t += x.value; } }
+    if let Some(x) = b.pair.a { t += x.value; }
+    match g.x { V.N(x) => t += x.value, _ => {} }
+    match g.items[1] { V.N(x) => t += x.value, _ => {} }
+    t += gn.x.value + gn.items[0].value + gn.items[1].value + kept.value;
+    match kv { V.N(x) => t += x.value, _ => {} }
+    io.print_int(t); io.println("");
+    // method through auto-ref on a value field of an object
+    b.pair.set(young(h, 70));
+    age(h);
+    io.println("method store ok");
+}
+
+// expect: 451
+// expect: method store ok

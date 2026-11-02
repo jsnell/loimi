@@ -345,6 +345,9 @@ pub struct FnGen<'a, 'p> {
     pub live: Vec<Vec<LocalId>>,
     /// Generating an outlined cold block of this handler: (body, captured locals, symbol).
     pub cold: Option<(TExpr, Vec<LocalId>, String)>,
+    /// Traced values computed before defers run (a block's tail, a return
+    /// value), spilled to these slots: roots like `live` locals.
+    pub pending: Vec<(String, Ty)>,
 }
 
 impl<'a, 'p> FnGen<'a, 'p> {
@@ -362,6 +365,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             vm: None,
             live: vec![vec![]],
             cold: None,
+            pending: vec![],
         }
     }
 
@@ -781,13 +785,17 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Some(t) => self.val(t),
                     None => self.poison(&e.ty),
                 };
-                self.live.pop();
+                // The block's locals, and its value, stay rooted while its
+                // defers run.
                 let ds = self.defers.pop().unwrap();
-                if !self.terminated {
+                if !self.terminated && !ds.is_empty() {
+                    let rooted = self.root_pending(&v, &e.ty);
                     for d in ds.iter().rev() {
                         self.val(d);
                     }
+                    self.unroot_pending(rooted);
                 }
+                self.live.pop();
                 v
             }
             TK::If(conds, then, els) => {
@@ -895,7 +903,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     self.store(t, v, &s);
                 }
                 let depth = self.loops[li].defer_depth;
+                let rooted = match &v {
+                    Some((v, t)) if self.has_defers(depth) => self.root_pending(v, t),
+                    _ => false,
+                };
                 self.run_defers_to(depth);
+                self.unroot_pending(rooted);
                 let l = self.loops[li].brk.clone();
                 self.br(&l);
                 "zeroinitializer".into()
@@ -910,7 +923,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TK::Return(v) => {
                 let rv = v.as_ref().map(|v| self.val(v));
+                let rooted = match (&rv, v) {
+                    (Some(rv), Some(v)) if self.has_defers(0) => self.root_pending(rv, &v.ty),
+                    _ => false,
+                };
                 self.run_defers_to(0);
+                self.unroot_pending(rooted);
                 let rt = self.f().ret.clone();
                 match rv {
                     Some(v) if !rt.is_unitlike() => {
@@ -967,6 +985,29 @@ impl<'a, 'p> FnGen<'a, 'p> {
             TK::Vm(v) => crate::vmgen::vm_expr(self, e, v),
             TK::New { heap, init, len } => crate::gcgen::new_object(self, e, heap, init, len.as_deref()),
             TK::Trailing(obj) => crate::gcgen::trailing(self, obj),
+        }
+    }
+
+    fn has_defers(&self, depth: usize) -> bool {
+        self.defers[depth..].iter().any(|d| !d.is_empty())
+    }
+
+    /// Spill a traced value `v` of type `t` that must survive running
+    /// defers to a slot that shadow-stack frames include. Returns whether
+    /// it did (to pass to `unroot_pending`).
+    fn root_pending(&mut self, v: &str, t: &Ty) -> bool {
+        if !crate::gcgen::is_traced(self.p(), t) {
+            return false;
+        }
+        let slot = self.alloca(t);
+        self.store(t, v, &slot);
+        self.pending.push((slot, t.clone()));
+        true
+    }
+
+    fn unroot_pending(&mut self, rooted: bool) {
+        if rooted {
+            self.pending.pop();
         }
     }
 
@@ -1308,7 +1349,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 if self.vm.is_some() {
                     crate::vmgen::raise_value(self, &err, et, e.span);
                 } else {
+                    let rooted = if self.has_defers(0) { self.root_pending(&err, et) } else { false };
                     self.run_defers_to(0);
+                    self.unroot_pending(rooted);
                     let rt = self.f().ret.clone();
                     let rtl = self.ty(&rt);
                     let x = self.inst(format!("insertvalue {} zeroinitializer, i1 true, 0", rtl));
@@ -1771,7 +1814,19 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if let Some(env) = env {
             avs.push(format!("ptr {}", env));
         }
+        // Objects whose traced places are passed by address (`o.pair.set(x)`
+        // auto-refs `&o.pair`): the callee may store references there, so
+        // they get the write barrier after the call.
+        let mut barriers = Vec::new();
         for a in args {
+            if let TK::AddrOf(inner) = &a.kind {
+                if crate::gcgen::needs_barrier(self, inner) {
+                    let (addr, obj) = crate::gcgen::object_place(self, inner);
+                    barriers.push(obj);
+                    avs.push(format!("ptr {}", addr));
+                    continue;
+                }
+            }
             let v = self.val(a);
             if let Ty::Block(..) = a.ty {
                 let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
@@ -1798,6 +1853,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.inst(&call)
         };
         crate::gcgen::pop_frame(self, pre);
+        for obj in barriers {
+            self.emit(format!("call void @\"std.gc.barrier\"(ptr {})", obj));
+        }
         if e.ty == Ty::Never {
             self.term("unreachable");
         }

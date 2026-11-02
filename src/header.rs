@@ -84,6 +84,9 @@ impl<'p> Gen<'p> {
         let p = self.p;
         let base = |b: &str| if inner.is_empty() { b.to_string() } else { format!("{} {}", b, inner) };
         Ok(match t {
+            Ty::Int(it) if !matches!(it.bits, 8 | 16 | 32 | 64) => {
+                return Err(format!("`{}` has no C equivalent: C has 8-, 16-, 32- and 64-bit integers", ty_name(p, t)))
+            }
             Ty::Int(it) => base(&format!("{}int{}_t", if it.signed { "" } else { "u" }, it.bits)),
             Ty::F32 => base("float"),
             Ty::F64 => base("double"),

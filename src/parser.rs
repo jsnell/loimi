@@ -312,6 +312,22 @@ impl Parser {
                     }
                 }
             }
+            // In an element list, `Pair<i64, i64>` is one element: type
+            // arguments, recognized as for `f<T>(..)` (`<` right after a
+            // name, balanced and type-shaped), keep their commas.
+            if depth == 0
+                && stops.contains(&",")
+                && t == Tok::Punct("<")
+                && !self.toks[self.pos].space_before
+                && matches!(out.last(), Some(Token { tok: Tok::Ident(_), .. }))
+            {
+                if let Some(end) = self.angle_args_end() {
+                    while self.pos < end {
+                        out.push(self.bump());
+                    }
+                    continue;
+                }
+            }
             match t {
                 Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
                 Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,

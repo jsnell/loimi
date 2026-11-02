@@ -1,0 +1,30 @@
+// `inline for` elements may be generic types with several type arguments:
+// the comma in `Pair<i64, i64>` used to split the element in two
+// ("expected `>`, found `)`"). Comparisons separated by commas are still
+// separate elements, and operator tokens work as values.
+import std.io;
+
+struct Pair<A, B> { a: A, b: B }
+fn Pair<A, B>.sum(p: *Pair<A, B>) -> i64 { p.a as i64 + p.b as i64 }
+
+fn main() {
+    var s: i64 = 0;
+    inline for T in [Pair<i64, i64>, Pair<u8, i32>] {
+        var p: T = Pair { a: 3, b: 4 };
+        s += p.sum();
+    }
+    io.print_int(s); io.println("");
+
+    let a: i64 = 1; let b: i64 = 2;
+    var n: i64 = 0;
+    inline for c in [a < b, b > a, a > b] { if c { n += 1; } }
+    io.print_int(n); io.println("");
+
+    var t: i64 = 1;
+    inline for (k, op) in [(2, +), (3, *), (4, -), (1, <<)] { t = t op k; }
+    io.print_int(t); io.println("");
+}
+
+// expect: 14
+// expect: 2
+// expect: 10

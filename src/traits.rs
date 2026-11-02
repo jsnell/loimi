@@ -303,9 +303,13 @@ impl<'a> Checker<'a> {
     /// The type of `ty`'s own method `name` (not a trait default), with
     /// `own` as the method's own type arguments. None if there is none.
     fn own_method(&mut self, ty: &Ty, name: &str, own: &[Ty], span: Span) -> Res<Option<Ty>> {
+        // An instance of a generic type may also have methods of its own,
+        // defined through an alias (`type IntBox = Box<i64>; fn IntBox.m`).
         let generic = match self.generics.inst_of.get(ty).cloned() {
-            Some((g, rargs)) => self.generics.methods.get(&(g, name.to_string())).map(|gf| (*gf, rargs)),
-            None => {
+            Some((g, rargs)) if self.generics.methods.contains_key(&(g, name.to_string())) => {
+                self.generics.methods.get(&(g, name.to_string())).map(|gf| (*gf, rargs))
+            }
+            _ => {
                 if let Some(fid) = self.methods.get(&(ty.clone(), name.to_string())).copied() {
                     if !own.is_empty() {
                         return Err(Diag::new(span, format!("the trait's `{}` takes {} type parameter(s), the method none", name, own.len())));

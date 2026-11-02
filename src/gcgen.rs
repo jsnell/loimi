@@ -14,7 +14,9 @@ pub fn is_traced(p: &Program, t: &Ty) -> bool {
     match t {
         Ty::Gc(_) => true,
         Ty::Option(inner) | Ty::Array(inner, _) => is_traced(p, inner),
+        Ty::Result(a, b) => is_traced(p, a) || is_traced(p, b),
         Ty::Tuple(ts) => ts.iter().any(|t| is_traced(p, t)),
+        Ty::Enum(i) => p.enums[*i as usize].variants.iter().any(|v| v.fields.iter().any(|t| is_traced(p, t))),
         Ty::Struct(i) => {
             let s = &p.structs[*i as usize];
             s.object.is_none() && s.fields.iter().any(|(_, t)| is_traced(p, t))
@@ -70,6 +72,61 @@ pub fn mark_expr(g: &mut FnGen, t: &Ty, v: &str, h: &str) {
                     let x = g.inst(format!("extractvalue {} {}, {}", lt, v, i));
                     mark_expr(g, ft, &x, h);
                 }
+            }
+        }
+        Ty::Result(a, b) => {
+            let lt = g.ty(t);
+            let tag = g.inst(format!("extractvalue {} {}, 0", lt, v));
+            for (pos, ft) in [(1, a), (2, b)] {
+                if !is_traced(p, ft) {
+                    continue;
+                }
+                let l_yes = g.fresh_label("mkres");
+                let l_no = g.fresh_label("mkresn");
+                // Ok (field 1) has tag false, Err (field 2) tag true.
+                if pos == 1 {
+                    g.cond_br(&tag, &l_no, &l_yes);
+                } else {
+                    g.cond_br(&tag, &l_yes, &l_no);
+                }
+                g.label(&l_yes);
+                let x = g.inst(format!("extractvalue {} {}, {}", lt, v, pos));
+                mark_expr(g, ft, &x, h);
+                g.br(&l_no);
+                g.label(&l_no);
+            }
+        }
+        Ty::Enum(eid) => {
+            let e = &p.enums[*eid as usize];
+            if !is_traced(p, t) {
+                return;
+            }
+            let slot = g.alloca(t);
+            let lt = g.ty(t);
+            g.emit(format!("store {} {}, ptr {}", lt, v, slot));
+            let tt = format!("i{}", e.tag.bits);
+            let tag = g.inst(format!("load {}, ptr {}", tt, slot));
+            let pp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", lt, slot));
+            for var in &e.variants {
+                if !var.fields.iter().any(|ft| is_traced(p, ft)) {
+                    continue;
+                }
+                let c = g.inst(format!("icmp eq {} {}, {}", tt, tag, var.discr));
+                let l_yes = g.fresh_label("mkenum");
+                let l_no = g.fresh_label("mkenumn");
+                g.cond_br(&c, &l_yes, &l_no);
+                g.label(&l_yes);
+                let st = Ty::Tuple(var.fields.clone());
+                let stl = g.ty(&st);
+                for (i, ft) in var.fields.iter().enumerate() {
+                    if is_traced(p, ft) {
+                        let fp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 {}", stl, pp, i));
+                        let x = g.load(ft, &fp);
+                        mark_expr(g, ft, &x, h);
+                    }
+                }
+                g.br(&l_no);
+                g.label(&l_no);
             }
         }
         Ty::Array(et, n) => {
@@ -284,10 +341,14 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
             }
         }
     }
-    if ids.is_empty() {
+    // (slot, type) of each root: traced locals, then pending values.
+    let mut roots: Vec<(String, Ty)> =
+        ids.iter().map(|l| (g.slots[*l as usize].clone(), fd.locals[*l as usize].ty.clone())).collect();
+    roots.extend(g.pending.iter().cloned());
+    if roots.is_empty() {
         return None;
     }
-    let n = ids.len();
+    let n = roots.len();
     let ft = format!("{{ ptr, i64, [{} x {{ ptr, ptr }}] }}", n);
     let fr = g.fresh();
     let _ = writeln!(g.allocas, "  {} = alloca {}, align 8", fr, ft);
@@ -295,11 +356,9 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     g.emit(format!("store ptr {}, ptr {}", prev, fr));
     let np = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", ft, fr));
     g.emit(format!("store i64 {}, ptr {}", n, np));
-    for (i, l) in ids.iter().enumerate() {
-        let t = fd.locals[*l as usize].ty.clone();
-        let mf = mark_fn(g.cg, &t);
+    for (i, (slot, t)) in roots.iter().enumerate() {
+        let mf = mark_fn(g.cg, t);
         let sp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 0", ft, fr, i));
-        let slot = g.slots[*l as usize].clone();
         g.emit(format!("store ptr {}, ptr {}", slot, sp));
         let mp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 1", ft, fr, i));
         g.emit(format!("store ptr {}, ptr {}", mf, mp));
@@ -324,12 +383,70 @@ fn in_object(e: &TExpr) -> bool {
         TK::Field(b, _) => matches!(b.ty, Ty::Struct(_) | Ty::Tuple(_)) && in_object(b),
         TK::Index(b, _) => match &b.ty {
             Ty::Array(..) => in_object(b),
-            Ty::Slice(_) => matches!(b.kind, TK::Trailing(_)),
+            Ty::Slice(_) => slice_in_object(b),
             // `o.items.ptr[i]`: unchecked indexing into a trailing array.
             Ty::Ptr(_) => trailing_ptr(b).is_some(),
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// Whether the slice `e` points into an object: a trailing array, or a
+/// sub-slice of one or of an array field (`o.items[1..][0] = v`).
+fn slice_in_object(e: &TExpr) -> bool {
+    match &e.kind {
+        TK::Trailing(_) => true,
+        TK::SliceRange(b, _, _) => match &b.ty {
+            Ty::Slice(_) => slice_in_object(b),
+            Ty::Array(..) => in_object(b),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The slice `e` (for which `slice_in_object` holds) as (pointer, length),
+/// and the object it points into. Bounds-checked like `TK::SliceRange`.
+fn slice_place(g: &mut FnGen, e: &TExpr) -> (String, String, String) {
+    match &e.kind {
+        TK::Trailing(o) => {
+            let p = g.p();
+            let obj = g.val(o);
+            let Ty::Gc(inner) = &o.ty else { unreachable!() };
+            let size = layout::size_of(p, inner);
+            let base = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", obj, size));
+            let lp = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 -8", obj));
+            let len = g.inst(format!("load i64, ptr {}", lp));
+            (base, len, obj)
+        }
+        TK::SliceRange(b, lo, hi) => {
+            let (ptr, len, obj) = match &b.ty {
+                Ty::Array(_, n) => {
+                    let (p, obj) = object_place(g, b);
+                    (p, n.to_string(), obj)
+                }
+                _ => slice_place(g, b),
+            };
+            let lo_v = match lo {
+                Some(l) => g.val(l),
+                None => "0".into(),
+            };
+            let hi_v = match hi {
+                Some(h) => g.val(h),
+                None => len.clone(),
+            };
+            let c1 = g.inst(format!("icmp ugt i64 {}, {}", hi_v, len));
+            let c2 = g.inst(format!("icmp ugt i64 {}, {}", lo_v, hi_v));
+            let c = g.inst(format!("or i1 {}, {}", c1, c2));
+            g.check(&c, "slice range out of bounds", e.span);
+            let Ty::Slice(et) = &e.ty else { unreachable!() };
+            let el = g.ty(et);
+            let np = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 {}", el, ptr, lo_v));
+            let nl = g.inst(format!("sub i64 {}, {}", hi_v, lo_v));
+            (np, nl, obj)
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -359,7 +476,7 @@ pub fn needs_barrier(g: &mut FnGen, lhs: &TExpr) -> bool {
 
 /// The address of the place `e` (for which `in_object` holds) and of the
 /// object that contains it.
-fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
+pub fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
     match &e.kind {
         TK::Deref(x) => {
             let v = g.val(x);
@@ -382,14 +499,8 @@ fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
                 let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 0, i64 {}", bt, base, i));
                 (p, obj)
             }
-            (_, TK::Trailing(o)) => {
-                let p = g.p();
-                let obj = g.val(o);
-                let Ty::Gc(inner) = &o.ty else { unreachable!() };
-                let size = layout::size_of(p, inner);
-                let base = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", obj, size));
-                let lp = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 -8", obj));
-                let len = g.inst(format!("load i64, ptr {}", lp));
+            (Ty::Slice(_), _) => {
+                let (base, len, obj) = slice_place(g, b);
                 let i = g.index_val(idx);
                 let bad = g.inst(format!("icmp uge i64 {}, {}", i, len));
                 g.check(&bad, "index out of bounds", e.span);

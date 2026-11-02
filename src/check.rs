@@ -494,7 +494,7 @@ impl<'a> Checker<'a> {
                 if nrecv != 0 {
                     return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
                 }
-                let rty = self.resolve_type_name(m, &recv)?;
+                let rty = self.method_recv_ty(m, &recv)?;
                 let key = (rty, mname.name.clone());
                 if self.methods.contains_key(&key) || self.generics.ty_methods.insert(key, g as u32).is_some() {
                     return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
@@ -520,6 +520,9 @@ impl<'a> Checker<'a> {
             let mut cx = FnCx::new(m, Ty::Unit);
             let v = self.expr(&mut cx, &g.value, Some(&ty))?;
             let init = fold_deep(&self.coerce(v, &ty)?);
+            if let Some(d) = const_overflow(&init) {
+                return Err(d);
+            }
             if let Some(bad) = self.static_init_error(&init) {
                 return Err(Diag::new(
                     bad,
@@ -590,7 +593,7 @@ impl<'a> Checker<'a> {
         let prefix = self.module_prefix(m);
         let mut name = f.name.name.clone();
         if let (Some(recv), true) = (&f.recv, f.generics.is_empty()) {
-            let rty = self.resolve_type_name(m, recv)?;
+            let rty = self.method_recv_ty(m, recv)?;
             name = format!("{}.{}", recv.name, f.name.name);
             let key = (rty, f.name.name.clone());
             if self.methods.contains_key(&key) {
@@ -801,6 +804,26 @@ impl<'a> Checker<'a> {
             self.aliases[a as usize].ty = Some(t.clone());
         }
         Ok(t)
+    }
+
+    /// The type a method `fn Recv.name` is defined on. Method calls look
+    /// through pointers and `Gc` to the type behind them, so a method on
+    /// an alias of a pointer type could never be called.
+    fn method_recv_ty(&self, m: usize, recv: &Ident) -> Res<Ty> {
+        let rty = self.resolve_type_name(m, recv)?;
+        if let Ty::Ptr(inner) | Ty::Gc(inner) = &rty {
+            return Err(Diag::new(
+                recv.span,
+                format!(
+                    "`{}` is `{}`: methods are found on the type behind a pointer; define the method on `{}` and take `{}` as the receiver",
+                    recv.name,
+                    self.ty_name(&rty),
+                    self.ty_name(inner),
+                    self.ty_name(&rty)
+                ),
+            ));
+        }
+        Ok(rty)
     }
 
     pub fn resolve_type_name(&self, m: usize, id: &Ident) -> Res<Ty> {
@@ -1039,7 +1062,11 @@ impl<'a> Checker<'a> {
     pub fn const_int(&mut self, m: usize, e: &Expr) -> Res<i128> {
         let mut cx = FnCx::new(m, Ty::Unit);
         let te = self.expr(&mut cx, e, Some(&Ty::i64()))?;
-        match fold(&te).kind {
+        let te = fold(&te);
+        if let Some(d) = const_overflow(&te) {
+            return Err(d);
+        }
+        match te.kind {
             TK::Int(v) => Ok(v),
             _ => Err(Diag::new(e.span, "expected a constant integer expression")),
         }
@@ -1058,7 +1085,10 @@ impl<'a> Checker<'a> {
         let ty = self.resolve_type(m, &decl.ty)?;
         let mut cx = FnCx::new(m, Ty::Unit);
         let v = self.expr(&mut cx, &decl.value, Some(&ty))?;
-        let v = fold(&self.coerce(v, &ty)?);
+        let v = fold_deep(&self.coerce(v, &ty)?);
+        if let Some(d) = const_overflow(&v) {
+            return Err(d);
+        }
         if !is_const(&v) {
             return Err(Diag::new(decl.value.span, "constant initializer must be a constant expression"));
         }
@@ -1283,9 +1313,23 @@ impl<'a> Checker<'a> {
             PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) if !ty.is_int() => {
                 return Err(Diag::new(p.span, format!("integer pattern for a value of type `{}`", self.ty_name(ty))));
             }
-            PatKind::Int(v) => TPK::Int(*v),
-            PatKind::Char(c) => TPK::Int(*c as i128),
-            PatKind::Range(a, b) => TPK::Range(*a, *b),
+            PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) => {
+                // Out of the type's range, a pattern would be truncated
+                // to it and match another value.
+                let Ty::Int(it) = ty else { unreachable!() };
+                let (lo, hi) = match &p.kind {
+                    PatKind::Int(v) => (*v, *v),
+                    PatKind::Char(c) => (*c as i128, *c as i128),
+                    PatKind::Range(a, b) => (*a, *b),
+                    _ => unreachable!(),
+                };
+                for v in [lo, hi] {
+                    if v < it.min() || v > it.max() {
+                        return Err(Diag::new(p.span, format!("pattern `{}` does not fit in `{}`", v, self.ty_name(ty))));
+                    }
+                }
+                if lo == hi && !matches!(p.kind, PatKind::Range(..)) { TPK::Int(lo) } else { TPK::Range(lo, hi) }
+            }
             PatKind::Bool(b) => {
                 if *ty != Ty::Bool {
                     return Err(Diag::new(p.span, "boolean pattern for a non-bool value"));
@@ -2720,6 +2764,14 @@ impl<'a> Checker<'a> {
                         if let Some(r) = self.static_intrinsic(cx, &t, &name.name, args, span)? {
                             return Ok(r);
                         }
+                        // `IntBox.make(..)` with `type IntBox = Box<i64>`: the
+                        // generic type's function, with the instance's arguments.
+                        if let Some((g, targs)) = self.generics.inst_of.get(&t).cloned() {
+                            if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
+                                let known = targs.into_iter().map(Some).collect();
+                                return self.generic_call(cx, gf, vec![], known, args, exp, span);
+                            }
+                        }
                         if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
                             return self.generic_call(cx, gf, vec![], vec![], args, exp, span);
                         }
@@ -3463,7 +3515,8 @@ pub fn fold(e: &TExpr) -> TExpr {
                     let v = match op {
                         Add | AddWrap => Some(x + y),
                         Sub | SubWrap => Some(x - y),
-                        Mul | MulWrap => Some(x.wrapping_mul(y)),
+                        Mul => x.checked_mul(y),
+                        MulWrap => Some(x.wrapping_mul(y)),
                         Div if y != 0 => Some(x / y),
                         Rem if y != 0 => Some(x % y),
                         And => Some(x & y),
@@ -3482,7 +3535,13 @@ pub fn fold(e: &TExpr) -> TExpr {
                         },
                         _ => None,
                     };
+                    // An operation that overflows (traps at run time) is
+                    // left unfolded; `const_overflow` reports it.
+                    let checked = matches!(op, Add | Sub | Mul | Div);
                     match v {
+                        Some(v) if checked && (v < it.min() || v > it.max()) => {
+                            TK::Binary(*op, Box::new(a), Box::new(b))
+                        }
                         Some(v) => TK::Int(wrap_int(v, *it)),
                         None => TK::Binary(*op, Box::new(a), Box::new(b)),
                     }
@@ -3490,9 +3549,12 @@ pub fn fold(e: &TExpr) -> TExpr {
                 _ => TK::Binary(*op, Box::new(a), Box::new(b)),
             }
         }
-        TK::Unary(UnOp::Neg, a) => match fold(a).kind {
-            TK::Int(x) => TK::Int(-x),
-            TK::Float(f) => TK::Float(-f),
+        TK::Unary(UnOp::Neg, a) => match (fold(a), &e.ty) {
+            (TExpr { kind: TK::Int(x), .. }, Ty::Int(it)) if -x < it.min() || -x > it.max() => {
+                TK::Unary(UnOp::Neg, Box::new(mk(Ty::Int(*it), TK::Int(x), a.span)))
+            }
+            (TExpr { kind: TK::Int(x), .. }, _) => TK::Int(-x),
+            (TExpr { kind: TK::Float(f), .. }, _) => TK::Float(-f),
             _ => e.kind.clone(),
         },
         TK::Unary(UnOp::Not, a) => match (fold(a).kind, &e.ty) {
@@ -3508,6 +3570,32 @@ pub fn fold(e: &TExpr) -> TExpr {
         _ => e.kind.clone(),
     };
     TExpr { ty: e.ty.clone(), kind: k, span: e.span }
+}
+
+/// After `fold`: an integer operation on constants that was left unfolded
+/// because it overflows its type or divides by zero, as an error.
+pub fn const_overflow(e: &TExpr) -> Option<Diag> {
+    let int = |x: &TExpr| matches!(x.kind, TK::Int(_));
+    let over = |e: &TExpr| match &e.ty {
+        Ty::Int(it) => format!("constant expression overflows `{}{}`", if it.signed { "i" } else { "u" }, it.bits),
+        _ => unreachable!(),
+    };
+    match &e.kind {
+        TK::Binary(op, a, b) if int(a) && int(b) && e.ty.is_int() => {
+            let what = if matches!(op, BinOp::Div | BinOp::Rem) && matches!(b.kind, TK::Int(0)) {
+                "division by zero in a constant expression".to_string()
+            } else {
+                over(e)
+            };
+            Some(Diag::new(e.span, what))
+        }
+        TK::Unary(UnOp::Neg, a) if int(a) && e.ty.is_int() => Some(Diag::new(e.span, over(e))),
+        TK::Binary(_, a, b) => const_overflow(a).or_else(|| const_overflow(b)),
+        TK::Unary(_, a) | TK::Cast(a) => const_overflow(a),
+        TK::Struct(es) | TK::Tuple(es) | TK::Array(es) | TK::Variant(_, es) => es.iter().find_map(const_overflow),
+        TK::ArrayRepeat(v, _) => const_overflow(v),
+        _ => None,
+    }
 }
 
 /// `fold` applied to every element of aggregate literals.

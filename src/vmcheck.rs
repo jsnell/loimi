@@ -1519,6 +1519,14 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     }
     let span = call.span;
     if let Some(h) = cx.vm.clone() {
+        // Vm code may collect while a run is active: callers of the vm's
+        // entries root their traced locals across the call, as for a call
+        // to a `uses gc` function.
+        if missing & EFF_GC != 0 {
+            for e in c.prog.vms[h.vm as usize].entries.clone() {
+                c.prog.fns[e as usize].sync_effects |= EFF_GC;
+            }
+        }
         // A plain vm function is inlined into vm code, and sees the
         // caller's state through pointers: its effectful calls are synced
         // in place, as in an op, so that only the path that makes the call

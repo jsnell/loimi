@@ -301,6 +301,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
   `a.add_overflow(b) -> (T, bool)`. These map directly to LLVM's
   `*.with.overflow` intrinsics, which guest integer semantics need constantly.
+  In constant expressions (`const`s, array lengths, global initializers),
+  overflow of `+ - *`, unary `-` and `/` is a compile error in all builds.
 - **Shifts.** `a << n` and `a >> n` have the type of `a`; `>>` is
   arithmetic for signed `a` and logical for unsigned. The amount `n` may
   be any integer type (`x << shift` with `x: u32`, `shift: u64`), and is

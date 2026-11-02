@@ -1,0 +1,69 @@
+// Arbitrary-width integers: casts between odd widths and signedness,
+// struct fields, range patterns, folded constants.
+import std.io;
+
+struct S { a: u3, b: i5, c: u48, d: i1 }
+
+fn cls(x: u3) -> i64 {
+    match x { 0..=3 => 1, 4..=7 => 2, _ => 3 }
+}
+fn cls2(x: i5) -> i64 {
+    match x { -16..=-1 => 1, 0 => 2, 1..=15 => 3, _ => 4 }
+}
+fn p(x: i64) { io.print_int(x); io.println(""); }
+
+const K: u3 = 5;
+const M: i5 = -16;
+// Wrapping operators wrap at compile time too.
+const W: u3 = 7 +% 3;
+const N: i5 = -16 -% 1;
+
+fn main() {
+    let x: u3 = 7;
+    let y: i5 = -16;
+    p(x as i64);
+    p(y as i64);
+    p((y as u3) as i64);
+    p((x as i5) as i64);
+    p(((y as u64) >> 60) as i64);
+    p(cls(x));
+    p(cls2(y));
+    p(cls2(15));
+    let s = S { a: 6, b: -3, c: 0xFFFF_FFFF_FFFF, d: -1 };
+    p(s.a as i64 + s.b as i64);
+    p(s.c as i64);
+    p(s.d as i64);
+    p((K as i64) * 10 + (M as i64));
+    p((x +% 1) as i64);
+    let z: u3 = (5 as u3) * (1 as u3);
+    p(z as i64);
+    p((y / (2 as i5)) as i64);
+    p((y >> 1) as i64);
+    p(((x as u8) << 5) as i64);
+    p(((-1 as i5) as u48) as i64);
+    p(((0xFFFF_FFFF_FFFF as u48) as i48) as i64);
+    p(W as i64);
+    p(N as i64);
+}
+
+// expect: 7
+// expect: -16
+// expect: 0
+// expect: 7
+// expect: 15
+// expect: 2
+// expect: 1
+// expect: 3
+// expect: 3
+// expect: 281474976710655
+// expect: -1
+// expect: 34
+// expect: 0
+// expect: 5
+// expect: -8
+// expect: -8
+// expect: 224
+// expect: 281474976710655
+// expect: -1
+// expect: 2
+// expect: 15

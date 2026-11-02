@@ -91,7 +91,8 @@ rejected (run by `cargo test`).
   the only roots the compiler has to provide are traced locals that are in
   scope at those calls, registered in shadow-stack frames. Traced
   *temporaries* are not roots: bind a value to a local before a call that
-  may collect.
+  may collect. (The exception: a value computed before defers run, such
+  as a block's tail value or `return v`, is rooted while they run.)
 - **`sync { ... }`** is a new vm item. It holds the code the compiler runs
   before an effectful call from a handler, for example publishing `fp` or
   the stack top for the GC's root scanner. The design's fixed `ctx.sync` area

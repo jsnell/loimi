@@ -1,0 +1,91 @@
+// matrix: dispatch
+// GC from vm code: stores into objects through an operand kind
+// (`ctx.clo.ups[it]`) and a context field get the write barrier (verify
+// mode checks it), and a host local held across `M.run` is rooted: a
+// handler may collect while the run is active, so the entry call roots
+// the caller's traced locals like a call to a `uses gc` function (it
+// used to be freed and its memory reused).
+import std.io;
+import std.gc;
+
+object Box { v: V }
+object Clo { last: V, ups: [V] }
+value V repr nanbox { Num(f64) unboxed, Int(i32), B(Gc<Box>), Nil }
+
+struct Ctx { heap: gc.Heap, base: *V, top: *V, clo: Gc<Clo> }
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.base;
+    while p < c.top { gc_mark(h, *p); p = p + 1; }
+    gc_mark(h, c.clo);
+}
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..200 { new(h, Box { v: Nil }); }
+    gc.collect(h);
+    for i in 0..200 { new(h, Box { v: Int(-1) }); }
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    operand up = ctx.clo.ups[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    sync { ctx.top = regs + 8; }
+
+    op NEWBOX(dst: reg, n: imm) : ABC { dst = B(new(&ctx.heap, Box { v: Int(n as i32) })); next }
+    // Store through an operand kind that names a trailing-array slot.
+    op SETUP(u: up, a: reg) : ABC { u = a; next }
+    op GETUP(dst: reg, u: up) : ABC { dst = u; next }
+    op SETLAST(a: reg) : ABC { ctx.clo.last = a; next }
+    op GETLAST(dst: reg) : ABC { dst = ctx.clo.last; next }
+    op GC() : ABC { churn(&ctx.heap); next }
+    op SUM(dst: reg, a: reg, b: reg) : ABC {
+        var s: i32 = 0;
+        if let B(x) = a { if let Int(i) = x.v { s += i; } }
+        if let B(x) = b { if let Int(i) = x.v { s += i; } }
+        dst = Int(s);
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32) -> V { ctx = c; pc = code; regs = c.base; jump pc }
+}
+
+fn main() uses gc {
+    var ctx = Ctx { heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V, clo: unsafe { 0 as Gc<Clo> } };
+    var regs: [V; 8] = [V.Nil; 8];
+    ctx.base = &regs[0];
+    ctx.top = &regs[0];
+    let h = &ctx.heap;
+    ctx.clo = new(h, Clo { last: Nil }, 4);
+    h.add_scanner(&ctx as *u8, scan);
+    h.set_generational(true);
+    h.set_verify(true);
+    gc.collect(h);
+    gc.collect(h);
+    let keep = new(h, Box { v: Int(7) });
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    at = M.emit.NEWBOX(c, at, 0, 20);
+    at = M.emit.NEWBOX(c, at, 1, 22);
+    at = M.emit.SETUP(c, at, 2, 0);
+    at = M.emit.SETLAST(c, at, 1);
+    at = M.emit.NEWBOX(c, at, 0, 0);
+    at = M.emit.NEWBOX(c, at, 1, 0);
+    at = M.emit.GC(c, at);
+    at = M.emit.GETUP(c, at, 3, 2);
+    at = M.emit.GETLAST(c, at, 4);
+    at = M.emit.SUM(c, at, 5, 3, 4);
+    at = M.emit.RET(c, at, 5);
+    match M.run(&ctx, &code[0]) { Int(i) => io.print_int(i as i64), _ => io.print("?") }
+    io.println("");
+    match keep.v { Int(i) => io.print_int(i as i64), _ => io.print("freed") }
+    io.println("");
+}
+// expect: 42
+// expect: 7
