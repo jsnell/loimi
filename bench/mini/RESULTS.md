@@ -37,7 +37,7 @@ In quieter runs spectral_norm measured 1.65-1.68 s (Mini/Lua 0.89-0.91)
 and binary_trees 1.21-1.33 s.
 
 Mini is faster than PUC-Lua on all 14 benchmarks, and faster than or
-within about 10% of LuaJIT's assembly interpreter (-joff) on 9 of them.
+within 10% of LuaJIT's assembly interpreter (-joff) on 10 of them.
 The largest remaining gaps to -joff are spectral_norm (1.45x: per-op
 cost in a call-heavy float loop), mandelbrot and nbody (1.13-1.25x:
 float handlers are ~18 instructions where LuaJIT's are ~10), and interp
