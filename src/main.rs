@@ -547,11 +547,27 @@ fn compiler_main() -> ExitCode {
         }
     }
     cmd.arg("-x").arg("ir").arg(&ll);
-    if let Some(rt) = &jit_rt {
-        cmd.arg("-x").arg("c").arg(rt);
-    }
-    if let Some(rt) = &stats_rt {
-        cmd.arg("-x").arg("c").arg(rt);
+    // C runtime sources. A static library compiles each to its own
+    // object (`-c` takes one input per `-o`), all archived together.
+    let mut extra_objs = Vec::new();
+    for rt in jit_rt.iter().chain(stats_rt.iter()) {
+        if opts.kind == OutKind::Static {
+            let o = rt.with_extension("o");
+            let ok = Command::new(&clang)
+                .args([if opts.release { "-O3" } else { "-O1" }, "-fPIC", "-c", "-x", "c"])
+                .arg(rt)
+                .arg("-o")
+                .arg(&o)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                eprintln!("error: {} failed on {}", clang, rt.display());
+                return ExitCode::from(1);
+            }
+            extra_objs.push(o);
+        } else {
+            cmd.arg("-x").arg("c").arg(rt);
+        }
     }
     if let Some(lib) = &asan_lib {
         cmd.arg("-x").arg("none").arg(lib);
@@ -576,7 +592,7 @@ fn compiler_main() -> ExitCode {
     if opts.kind == OutKind::Static {
         let ar = std::env::var("LOIMI_AR").unwrap_or_else(|_| "llvm-ar-19".into());
         let _ = std::fs::remove_file(&exe);
-        match Command::new(&ar).arg("rcs").arg(&exe).arg(&obj).status() {
+        match Command::new(&ar).arg("rcs").arg(&exe).arg(&obj).args(&extra_objs).status() {
             Ok(s) if s.success() => {}
             Ok(_) => {
                 eprintln!("error: {} failed", ar);

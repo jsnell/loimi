@@ -680,6 +680,39 @@ fn c_library_panics() {
     c_host_run("c-library-panics", &d.join("panic.lm"), &d.join("panic_host.c"), &d.join("panic_host.expected"), None);
 }
 
+/// `--vm-stats` in a static library: the stats runtime goes into the
+/// archive, and the report prints when the host exits, its suggestions
+/// overlapping neither each other nor the vm's supers.
+#[test]
+fn vm_stats_library() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rx = root.join("examples/regex");
+    let dir = std::env::temp_dir().join(format!("loimi-stats-lib-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("librx.a");
+    let out = loimi()
+        .arg("build")
+        .arg(rx.join("lib.lm"))
+        .args(["--lib", "--release", "--vm-stats", "-o"])
+        .arg(&lib)
+        .arg("--header")
+        .arg(dir.join("rx.h"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = dir.join("rxhost");
+    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
+    let out = limited(&clang).arg("-I").arg(&dir).arg(rx.join("host.c")).arg(&lib).args(["-lm", "-o"]).arg(&exe).output().unwrap();
+    assert!(out.status.success(), "host: {}", String::from_utf8_lossy(&out.stderr));
+    let out = limited(&exe).arg("demo").output().unwrap();
+    let report = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "demo failed:\n{}", report);
+    assert!(report.contains("== vm stats: Rx =="), "no report at exit:\n{}", report);
+    assert!(report.contains("suggested superinstructions"), "no suggestions:\n{}", report);
+}
+
 /// `--sanitize=address` with `--lib` and `--shared`: the library carries
 /// the instrumentation, the host links ASan's runtime (gcc's libasan,
 /// as `loimi build --sanitize=address` does for executables). Caught

@@ -91,10 +91,10 @@ loimi build examples/tutorial/step7/main.lm --release --vm-stats -o pip-stats
       29860703   11.8%  CALL
       29860703   11.8%  RET
 
-frequent adjacent pairs (at least 1% of executed ops), as superinstructions:
-    super LOADI_SUB = LOADI; SUB;    // 29860702, 11.8%
-    super LOADI_JNLT = LOADI; JNLT;    // 29860703, 11.8%
-    super MOVE_ADD = MOVE; ADD;    // 14930351, 5.9%
+suggested superinstructions (each at least 1% of executed ops; none overlaps another or an
+existing super, so they can all be added together):
+    super GETGLOBAL_C_LOADI_SUB_CALL = GETGLOBAL_C; LOADI; SUB; CALL;    // 29860700, 11.8%, saves 89582100 dispatches
+    super LOADI_JNLT = LOADI; JNLT;    // 29860703, 11.8%, saves 29860703 dispatches
     ...
 ```
 
@@ -220,14 +220,21 @@ fn step:
 
 ## Superinstructions
 
-`--vm-stats` ends with frequent adjacent pairs, already written as
-declarations. On step 8:
+`--vm-stats` ends with suggested superinstructions, already written as
+declarations, and, commented out, frequent ones that overlap them (only
+one of two overlapping supers can fuse where they meet). On step 8
+without its supers:
 
 ```text
-    super ADD_RET = ADD; RET;    // 14930351, 9.1%
-    super SUBK_CALL = SUBK; CALL;    // 29860702, 18.2%
-    super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;    // 29860700, 18.2%
+    super GETGLOBAL_C_SUBK_CALL = GETGLOBAL_C; SUBK; CALL;    // 29860700, 18.2%, saves 59721400 dispatches
+    super ADD_RET = ADD; RET;    // 14930351, 9.1%, saves 14930351 dispatches
+...
+//  super SUBK_CALL = SUBK; CALL;    // 29860702, 18.2%, saves 29860702 dispatches; overlaps GETGLOBAL_C_SUBK_CALL
+//  super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;    // 29860700, 18.2%, saves 29860700 dispatches; overlaps GETGLOBAL_C_SUBK_CALL
 ```
+
+Step 8 takes the pairs, which are simpler to read; the three-op super
+works the same way.
 
 A **superinstruction** runs several ops with one dispatch:
 

@@ -1638,14 +1638,19 @@ fields differ (`Forward`), and a `become` in a part keeps the variant
 when the new super has it. There is no run-time test; the cost is
 opcodes (up to 7 per super) and code size.
 
-`loimi build --vm-stats` records opcode pair frequencies, and at exit
-prints the most frequent pairs as ranked `super` declarations. It also
-counts sequences of 3 and 4 adjacent ops, and suggests those that run at
-least 1% of the time and are *dominant* (at least half the runs of their
+`loimi build --vm-stats` records opcode pair frequencies and sequences
+of 3 and 4 adjacent ops, and at exit prints suggested `super`
+declarations: pairs that run at least 1% of the time, and longer
+sequences that do and are *dominant* (at least half the runs of their
 shorter prefix and suffix continue into them), so that a longer super
-saves more than pairs over the same ops could; they are ranked by
-dispatches saved, skipping any that overlaps a better one. (**Not built:**
-a separate `loimi vm suggest-supers` command.)
+saves more than pairs over the same ops could. They are ranked by
+dispatches saved, and one that overlaps a better one or an existing
+super (as the `super_overlap` lint defines it) is moved to a second,
+commented-out list that names what it overlaps. So the first list can
+be pasted whole without warnings, and the second lists alternatives.
+In a library (`--lib`, `--shared`) the report prints when the host
+process exits. (**Not built:** a separate `loimi vm suggest-supers`
+command.)
 
 ---
 

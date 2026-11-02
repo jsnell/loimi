@@ -932,8 +932,20 @@ pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
         let _ = writeln!(cg.globals, "@\"{}.stats.plain\" = internal constant [{} x i1] [{}]", sym, n, plain.join(", "));
         let head = cg.string_const(format!("\n== vm stats: {} ==\n%14s  %6s  op\n\0", vd.name).as_bytes());
         let row = cg.string_const(b"%14llu  %5.1f%%  %s\n\0");
-        let pairs_head = cg.string_const(b"\nfrequent adjacent pairs (at least 1%% of executed ops), as superinstructions:\n\0");
-        let pair_row = cg.string_const(b"    super %s_%s = %s; %s;    // %llu, %.1f%%\n\0");
+        // The supers the vm has, as (number of parts, parts...): the
+        // suggestions must not overlap them.
+        let mut super_words: Vec<String> = Vec::new();
+        for o in vd.ops.iter().filter(|o| !o.parts.is_empty()) {
+            super_words.push(format!("i32 {}", o.parts.len()));
+            super_words.extend(o.parts.iter().map(|p| format!("i32 {}", p)));
+        }
+        let _ = writeln!(
+            cg.globals,
+            "@\"{}.stats.supers\" = internal constant [{} x i32] {}",
+            sym,
+            super_words.len(),
+            if super_words.is_empty() { "zeroinitializer".to_string() } else { format!("[{}]", super_words.join(", ")) }
+        );
         let count_hdr = cg.string_const(b"count\0");
         let pct_hdr = cg.string_const(b"%\0");
         let f = format!("@\"{}.stats.report\"", sym);
@@ -976,45 +988,13 @@ opnext:
   %odone = icmp eq i64 %oi1, {n}
   br i1 %odone, label %pairs, label %oploop
 pairs:
-  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {pairs_head})
-  br label %ploop
-ploop:
-  %pi = phi i64 [ 0, %pairs ], [ %pi1, %pnext ]
-  %pcp = getelementptr inbounds i64, ptr @"{sym}.stats.pairs", i64 %pi
-  %pc = load i64, ptr %pcp
-  %pc100 = mul i64 %pc, 100
-  %pbig = icmp uge i64 %pc100, %tot1
-  %pnz = icmp ne i64 %pc, 0
-  %pok0 = and i1 %pbig, %pnz
-  %pa = udiv i64 %pi, {n}
-  %pb = urem i64 %pi, {n}
-  %paplp = getelementptr inbounds [{n} x i1], ptr @"{sym}.stats.plain", i64 0, i64 %pa
-  %papl = load i1, ptr %paplp
-  %pbplp = getelementptr inbounds [{n} x i1], ptr @"{sym}.stats.plain", i64 0, i64 %pb
-  %pbpl = load i1, ptr %pbplp
-  %pok1 = and i1 %pok0, %papl
-  %pok = and i1 %pok1, %pbpl
-  br i1 %pok, label %pprint, label %pnext
-pprint:
-  %panp = getelementptr inbounds [{n} x ptr], ptr @"{sym}.stats.names", i64 0, i64 %pa
-  %pa_name = load ptr, ptr %panp
-  %pbnp = getelementptr inbounds [{n} x ptr], ptr @"{sym}.stats.names", i64 0, i64 %pb
-  %pb_name = load ptr, ptr %pbnp
-  %pcf = uitofp i64 %pc to double
-  %ppct0 = fmul double %pcf, 100.0
-  %ppct = fdiv double %ppct0, %totf
-  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {pair_row}, ptr %pa_name, ptr %pb_name, ptr %pa_name, ptr %pb_name, i64 %pc, double %ppct)
-  br label %pnext
-pnext:
-  %pi1 = add i64 %pi, 1
-  %pdone = icmp eq i64 %pi1, {nn}
-  br i1 %pdone, label %done, label %ploop
+  call void @loimi_stats_suggest(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.pairs", i64 {n}, ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1, ptr @"{sym}.stats.supers", i64 {nsw})
+  br label %done
 done:
-  call void @loimi_stats_seq_report(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1)
   ret void
 }}
 "#,
-            nn = n * n,
+            nsw = super_words.len(),
         );
         dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
     }
@@ -1023,7 +1003,7 @@ done:
         let _ = writeln!(cg.globals, "@stderr = external global ptr");
         cg.decls.insert("declare i32 @fprintf(ptr, ptr, ...)");
         cg.decls.insert("declare void @loimi_stats_seq(ptr, i64, i64)");
-        cg.decls.insert("declare void @loimi_stats_seq_report(ptr, ptr, ptr, i64)");
+        cg.decls.insert("declare void @loimi_stats_suggest(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)");
     }
 }
 

@@ -24,6 +24,6 @@ fn main() {
 }
 // expect: 1022
 // expect-stderr: == vm stats: V ==
-// expect-stderr: super INC_DBL = INC; DBL;
-// expect-stderr: super DBL_LOOP = DBL; LOOP;
-// expect-stderr: super INC_DBL_LOOP = INC; DBL; LOOP;    // 9, 32.1%, saves 18 dispatches
+// expect-stderr:     super INC_DBL_LOOP = INC; DBL; LOOP;    // 9, 32.1%, saves 18 dispatches
+// expect-stderr: //  super INC_DBL = INC; DBL;    // 9, 32.1%, saves 9 dispatches; overlaps INC_DBL_LOOP
+// expect-stderr: //  super DBL_LOOP = DBL; LOOP;    // 9, 32.1%, saves 9 dispatches; overlaps INC_DBL_LOOP
