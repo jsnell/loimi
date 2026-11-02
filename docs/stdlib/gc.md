@@ -410,3 +410,151 @@ fn Gc<T>.addr(x: Gc<T>) -> usize;          // stable, because the heap doesn't m
 fn Gc<T>.identity_hash(x: Gc<T>) -> u64;   // address-based; still stable with a moving
                                            // policy (uses the HASHED flag + side table)
 ```
+
+---
+
+## As implemented
+
+`std/gc.lm`, tested by `tests/run/gc_*.lm` (among them
+`gc_generational.lm`, `gc_verify_barrier.lm` and `gc_weak.lm`) and by
+every interpreter test run in three modes: normal, `stress`, and
+`verify` (generational heap, stress, and verification).
+
+### Heap layout
+
+- **Chunks, not segments with side bitmaps.** Small objects (header
+  included, up to 512 bytes; classes step by 16 bytes) live in 64 KiB
+  chunks aligned to 64 KiB, carved out of 2 MiB segments mapped aligned
+  to 2 MiB (`mmap`, with `MADV_HUGEPAGE`), so that each can be a
+  transparent huge page. With 1 MiB segments from `posix_memalign`, which
+  the kernel backs with 4 KiB pages, MiniJS's `richards` ran 7% slower
+  than with the old allocator's chunks in the brk heap (which got huge
+  pages); with 2 MiB segments it is back within 1%. The start of a chunk holds a 16-byte `ChunkHead`
+  pointing at the heap's remembered set, so the write barrier finds it
+  from an object's address alone. The slots then start at an offset that
+  varies from chunk to chunk, from 0 to 4 KiB (cache coloring). Without
+  it, objects at the start of fresh chunks shared their page offset with
+  the VM stack and frame arrays (also allocated page-aligned), and loads
+  from them waited on unrelated stores (4K aliasing): Mini's
+  `spectral_norm` ran 20% slower.
+- **The header is 16 bytes**, `{ size: u32, tid: u16, mark: u8, flags:
+  u8, len: u64 }`, with the mark in the header (no side bitmap). `len`
+  is the trailing array's length, or the free-list link of a free slot.
+  Flags: `LOG` (old and not in the remembered set) and `LARGE`.
+- Each chunk keeps its own free list. The allocator pops the current
+  chunk's list (the inlined fast path) and, when it is empty, takes the
+  next chunk of the class with free slots, in index order
+  (`alloc_slow`). Sweeping is eager (no lazy sweeping) and rebuilds the
+  chunk lists.
+- **Large objects** are `calloc`'d with the remembered-set pointer in 16
+  bytes before the header, and kept in a vector.
+- **Collection triggers**: `growth` (percent of the live bytes),
+  `min_heap` and `max_budget` (`set_growth`, `set_max_budget`).
+  Interpreters test `heap.allocated > heap.threshold` in their handlers
+  and call `gc.collect`.
+
+### Generational mode: sticky mark bits, non-moving
+
+`heap.set_generational(true)`, off by default (the decision and the
+measurements are in [`../roadmap.md`](../roadmap.md), open question 2).
+
+- *Young* means allocated since the last collection, *old* means it
+  survived one. Old objects keep their mark bit (sticky marks).
+- A **minor collection** marks from the roots and from the remembered set
+  and stops at marked (old) objects. It then sweeps only the chunks that
+  were allocated from since the last collection (a chunk is marked
+  `used` when it becomes a current chunk), and the young large objects.
+  Every survivor becomes old: there is no aging.
+- A **major collection** first clears every mark (a pass over all
+  headers), then runs a full mark-sweep whose survivors stay marked. It
+  runs once the old generation has grown by the growth budget since the
+  last major collection.
+- **The nursery** is the same allocation budget as between full
+  collections, computed from the live bytes after the last major
+  collection (not from the old generation, which also holds promoted
+  objects that have died since: budgets computed from it grew the heap,
+  and Scheme's `string` and Mini's `string_build` ran 10-40% slower), and
+  can be capped with `heap.set_nursery(bytes)`. Small nurseries measured
+  worse: they promote the objects in use at each minor collection, which
+  then fill the old generation and bring major collections sooner (Mini
+  `binary_trees` with a 4 MiB nursery: 358 minor and 15 major
+  collections, more GC time than without generations; with the full
+  budget: 30 and 4, half the GC time).
+- Stress mode with verify on and a generational heap collects after 0
+  to 4 KiB of allocation (varying), not at every safepoint, so that objects stay
+  young across a few safepoints and stores into old objects exercise the
+  barrier. Every eighth collection is major.
+
+### The write barrier: object logging
+
+```loimi
+#[inline]
+pub fn barrier(obj: *u8) {
+    let hd = (obj - HEADER) as *Header;
+    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+}
+```
+
+- The compiler calls `gc.barrier(obj)` after every store of a traced
+  value into an object (see [`../lowering.md`](../lowering.md) §10). In a
+  non-generational heap no object has `LOG`, so the barrier costs a byte
+  test and a not-taken branch.
+- `remember` clears `LOG` and appends the object to the remembered set.
+  It runs once per object between collections. A minor collection
+  traces the remembered objects and sets `LOG` again.
+- **Stores through raw pointers** bypass the compiler's barrier:
+  `gc.write_barrier(h, obj)` after them, naming the object that contains
+  the slot (not an interior pointer). `gc.needs_barrier(obj)` and
+  `gc.remember(obj)` let an interpreter log several objects together.
+  Mini logs a table and its `arr` and `hash` parts together, so its
+  table stores test only the table's own header (the parts are never
+  older than the table).
+- **Verify mode** (`heap.set_verify(true)`): at the start of every
+  collection, every old object outside the remembered set is traced
+  without marking, and a reference to a young object (a missing barrier)
+  or to a free slot (a dangling reference) aborts with both type names:
+
+  ```
+  gc verify: old object of type value.Arr points to a young object of type value.Str but is not in the remembered set: missing write barrier
+  ```
+
+### Weak references and ephemerons
+
+- **`Weak<T>`** is a library object, `object Weak<T> { addr: u64 }`, made
+  with `heap.new_weak(x)` (which registers it), read with `w.get() ->
+  ?Gc<T>` and changed with `w.set(..)`. The address is not traced. After
+  marking, the collector clears registered weak references whose target
+  is unmarked and drops dead ones from its registry. No `weak` field
+  qualifier exists: an object that needs one holds a `Gc<Weak<T>>`.
+- **`Ephemerons<K, V>`** is a table in host memory from keys `Gc<K>` (by
+  address) to values of any traced type V, created with
+  `gc.Ephemerons.new(h)` (which registers it with the heap) and released
+  with `t.free()`. After the roots are marked, the collector marks the
+  values of entries with marked keys, drains, and repeats until nothing
+  new is marked. It then drops the entries whose key died. The table is
+  not itself a GC object, so a guest `WeakMap` object needs a finalizer
+  (not implemented) to free it.
+- Order after marking: ephemerons to a fixpoint, ephemeron sweeping,
+  weak references, then the sweepers (`add_sweeper`). In a minor
+  collection old objects count as marked (`is_marked`), so sweepers and
+  weak references stay correct; `heap.is_minor()` tells a sweeper that
+  only young objects can have died.
+- **The sweeper-based weak tables stay.** Mini's string intern table
+  and std.obj's transition table are host-side hash tables with weak
+  entries keyed by content (string bytes; parent shape, key and
+  attributes), and std.obj keeps the ids of dead shapes. Neither is a
+  map from objects, so neither `Weak` (an extra object per entry) nor
+  `Ephemerons` (keyed by identity) fits better than the sweeper.
+
+### Not implemented
+
+Policies as a compile-time parameter (`#![heap = ..]`; generational is a
+run-time switch, and the barrier is always compiled in), incremental
+marking, lazy sweeping, side mark bitmaps, card marking (a large array
+stored into is retraced whole by each minor collection), aging before
+promotion, finalizers, `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
+and the `weak` field qualifier (also for inline caches, language.md
+§7.1).
+
+`LOIMI_GC_STATS=1` prints a line per collection to stderr: kind, live
+(old) bytes, and the mark and sweep times.

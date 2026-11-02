@@ -23,6 +23,10 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
     // Collect after allocating twice the live data (at least 1 MB): 17%
     // faster on binary_trees than the default, the rest within noise.
     heap.set_growth(200, 1 << 20);
+    // Generational: binary_trees 18% faster, string_build 6% and sieve 3%
+    // slower, the rest within noise; see std/gc.md and the roadmap
+    // (question 2).
+    heap.set_generational(true);
     let globals = value.new_table(&heap);
     lib.install(&heap, globals);
     let stack: *V = mem.alloc(STACK_SLOTS);

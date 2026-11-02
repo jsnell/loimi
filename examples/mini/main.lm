@@ -26,7 +26,15 @@ fn main() -> i32 {
         return 1;
     };
     var ctx = state.new_ctx(vm.no_host);
-    if os.arg(2).is_some() { ctx.heap.set_stress(true); }
+    // `stress`: collect at every safepoint; `verify`: the same with a
+    // generational heap, checking the write barriers at each collection.
+    if let Some(mode) = os.arg(2) {
+        ctx.heap.set_stress(true);
+        if mode.eq("verify") {
+            ctx.heap.set_generational(true);
+            ctx.heap.set_verify(true);
+        }
+    }
     let proto = compile.compile(&ctx.heap, path, src);
     let main_closure = value.new_closure(&ctx.heap, proto);
     state.attach(&ctx);

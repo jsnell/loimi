@@ -459,6 +459,7 @@ fn array_unshift(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     c.arr_reserve(a, a.len + n);
     mem.copy(a.ptr + n, a.ptr, a.len);
     for i in 0..n { a.ptr[i] = args[i]; }
+    value.abar(a);
     a.len += n;
     Ok(numv(a.len as f64))
 }
@@ -567,6 +568,7 @@ fn array_fill(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     let e = rel_index(int_arg(args, n, 2, a.len as f64), a.len);
     var i = s;
     while i < e { a.ptr[i] = v; i += 1; }
+    value.abar(a);
     Ok(this)
 }
 

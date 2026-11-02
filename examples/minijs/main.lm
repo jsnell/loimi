@@ -47,7 +47,7 @@ fn stats(c: *Ctx) {
 
 fn main() -> i32 {
     let Some(path) = os.arg(1) else {
-        io.eprintln("usage: minijs <program.js> [stress]");
+        io.eprintln("usage: minijs <program.js> [stress|verify]");
         return 2;
     };
     let Some(src) = io.read_file(path) else {
@@ -58,7 +58,15 @@ fn main() -> i32 {
     var ctx = Ctx.new();
     ctx.init();
     builtins.install(&ctx);
-    if os.arg(2).is_some() { ctx.heap.set_stress(true); }
+    // `stress`: collect at every safepoint; `verify`: the same with a
+    // generational heap, checking the write barriers at each collection.
+    if let Some(mode) = os.arg(2) {
+        ctx.heap.set_stress(true);
+        if mode.eq("verify") {
+            ctx.heap.set_generational(true);
+            ctx.heap.set_verify(true);
+        }
+    }
     if !run(&ctx, prelude.source()) { return 1; }
     // The prelude's methods are not enumerable, like the natives.
     ctx.hide_all(ctx.arr_proto());

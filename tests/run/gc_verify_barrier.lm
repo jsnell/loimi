@@ -1,0 +1,28 @@
+// Verify mode catches a store through a raw pointer that skips
+// `gc.write_barrier`: the next collection finds an old object pointing to
+// a young one that is not in the remembered set.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    let old = new(h, Node { value: 1, next: None });
+    gc.collect(h);
+    gc.collect(h);
+    let young = new(h, Node { value: 2, next: None });
+    let p = &old.next;
+    *p = Some(young);
+    io.println("stored");
+    gc.collect(h);
+    io.println("not reached");
+    0
+}
+
+// expect: stored
+// expect-exit: 134
+// expect-stderr: missing write barrier

@@ -343,6 +343,11 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
 - `Root<T>`, `GcVec<T>`, `Weak<T>`, finalizers (run outside the collector),
   and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
 - Stress mode, heap verification, poisoning, and heap snapshots.
+- *As implemented* (see [`stdlib/gc.md`](stdlib/gc.md#as-implemented)): mark-sweep
+  with an optional generational mode (sticky mark bits, object-logging
+  barrier), `Weak<T>`, `Ephemerons<K, V>`, sweepers, stress and verify
+  modes. No policy parameter, lazy sweeping, `Root<T>`, finalizers, poisoning
+  or snapshots.
 
 **As implemented**: every object has a 16-byte header (slot size, type
 id, mark bits, and the trailing-array length, which compiled code reads

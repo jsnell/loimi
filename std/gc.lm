@@ -1,9 +1,15 @@
-// Garbage-collected heap: precise, non-moving mark-sweep.
+// Garbage-collected heap: precise, non-moving mark-sweep, optionally
+// generational (sticky mark bits).
 //
 // Small objects (header included, up to 512 bytes) come from size-class
-// free lists carved out of 64 KiB chunks; sweeping walks the chunks and
-// rebuilds the free lists. Larger objects are calloc'd and kept in a
-// vector.
+// free lists in 64 KiB chunks, aligned to their size (carved out of 2 MiB
+// segments, aligned so that they can be huge pages). The start of a chunk
+// is its header, which points at the
+// heap's remembered set, so a write barrier finds it from an object's
+// address alone. Each chunk keeps its own free list; per size class, the
+// allocator takes chunks with free slots in address order. Larger
+// objects are calloc'd, with the same remembered-set pointer just before
+// their header, and kept in a vector.
 //
 // Objects are allocated with `new(heap, Obj { .. })`. Allocation never
 // collects; collection happens only in functions that `use gc`
@@ -14,23 +20,71 @@
 //   - scanners added with `Heap.add_scanner` (for example the VM stack).
 // The compiler generates the tracing of each object type (including
 // pointers inside NaN-boxed values) as `loimi_trace_object`.
+//
+// Generational mode (`Heap.set_generational`), non-moving with sticky
+// mark bits: an object is *old* once it survived a collection, and old
+// objects keep their mark bit. A minor collection marks from the roots
+// and the remembered set, treats marked (old) objects as done, and sweeps
+// only the chunks allocated from since the last collection; its
+// survivors become old. A major collection clears the marks and runs a
+// full mark-sweep. The write barrier keeps the invariant that an old
+// object not in the remembered set points to no young object: the
+// compiler calls `barrier(obj)` after every store of a traced value
+// (`Gc`, a `value` type with references, a struct or option holding
+// them) into a field or trailing-array element of an object reached
+// through a `Gc`; code that stores through a raw pointer into an object
+// calls `write_barrier(h, obj)` itself. Old objects carry the LOG flag
+// until they are logged, so the barrier is one byte test:
+//
+//     if hd.flags & LOG != 0 { remember(obj) }   // rare: once per object per cycle
+//
+// Weak references (`Weak<T>`) and ephemeron tables (`Ephemerons<K, V>`)
+// are cleared after marking; sweepers (`Heap.add_sweeper`) run after them.
 
 import std.mem;
+import std.io;
 
 extern "C" fn loimi_trace_object(h: *Heap, obj: *u8, tid: u32);
 extern "C" fn loimi_shadow_top() -> *ShadowFrame;
+extern "C" fn loimi_type_name(tid: u32) -> str;
 extern "C" fn calloc(n: u64, size: u64) -> *u8;
 extern "C" fn free(p: *u8);
+extern "C" fn mmap(addr: *u8, len: u64, prot: i32, flags: i32, fd: i32, off: i64) -> *u8;
+extern "C" fn munmap(addr: *u8, len: u64) -> i32;
+extern "C" fn madvise(addr: *u8, len: u64, advice: i32) -> i32;
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn abort();
+extern "C" fn getenv(name: *u8) -> *u8;
+extern "C" fn clock_gettime(clk: i32, ts: *Timespec) -> i32;
+
+struct Timespec { sec: i64, nsec: i64 }
+
+fn now_ns() -> u64 {
+    var ts = Timespec { sec: 0, nsec: 0 };
+    clock_gettime(1, &ts);
+    (ts.sec * 1000000000 + ts.nsec) as u64
+}
 
 const HEADER: u64 = 16;
 /// Size classes are multiples of 16 bytes, header included: class c holds
 /// objects of up to 16 * c bytes, for c in 1..NCLASS.
 const NCLASS: u64 = 33;
 const CHUNK: u64 = 65536;
+/// Chunks are carved out of segments of this many (2 MiB, mapped aligned
+/// to their size: a transparent huge page each. With 1 MiB segments from
+/// `posix_memalign`, which the kernel backs with 4 KiB pages, MiniJS's
+/// richards ran 7% slower than with chunks in the brk heap.)
+const SEG_CHUNKS: u64 = 32;
+const SEG: u64 = 2097152;
 /// The `tid` of a free small-object slot.
 const FREE: u16 = 0xFFFF;
+
+/// Header flag: the object is old and not in the remembered set, so a
+/// store into it must log it (`barrier`). Set only in generational mode.
+const LOG: u8 = 1;
+/// Header flag: a large object (calloc'd, remembered-set pointer before
+/// the header).
+const LARGE: u8 = 2;
 
 /// Lives just before every object (16 bytes, so a pair of two words takes
 /// a 32-byte slot). `size` is the slot size; `len` is the length of the
@@ -40,8 +94,27 @@ struct Header { size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
 
 fn next_free(hd: *Header) -> *Header { hd.len as *Header }
 
-/// A chunk of `n` small-object slots of `size` bytes each.
-struct Chunk { base: *u8, size: u64, n: u64 }
+/// A chunk of `n` slots of `size` bytes each, starting at `base`: after
+/// the `ChunkHead` at the start of the (aligned) chunk, and an offset
+/// that varies from chunk to chunk (cache coloring: with every chunk
+/// aligned alike, objects at the same place in different chunks would
+/// compete for the same cache sets).
+/// `free` lists its free slots while it is not the size class's current
+/// chunk, `nfree` counts them, and `next` links the class's chunks with
+/// free slots (chunk index + 1; 0 ends the list). `used` is set while the
+/// chunk is (or since the last collection was) a current chunk, i.e. it
+/// may hold objects allocated since then: a minor collection sweeps only
+/// those.
+struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool }
+
+/// At the start of each chunk (and 16 bytes before a large object's
+/// header): where the write barrier logs objects.
+struct ChunkHead { rs: *RemSet, pad: u64 }
+
+/// The remembered set: old objects stored into since the last collection.
+/// Allocated separately so its address stays fixed when the `Heap`
+/// struct is moved.
+struct RemSet { objs: mem.Vec<*u8> }
 
 /// Shadow-stack frame written by compiled code; entries follow `n`.
 pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
@@ -49,19 +122,37 @@ struct ShadowEntry { slot: *u8, mark: fn(*Heap, *u8) }
 
 struct Scanner { data: *u8, scan: fn(*Heap, *u8) }
 
+/// A registered ephemeron table: `mark` marks the values of entries whose
+/// key is marked and returns whether it marked anything new; `sweep`
+/// drops the entries whose key died.
+struct EphHook { data: *u8, mark: fn(*Heap, *u8) -> bool, sweep: fn(*Heap, *u8) }
+
 pub struct Heap {
-    /// Large objects.
+    /// Large objects; those before `large_old` are old (generational mode).
     large: mem.Vec<*Header>,
-    /// Free small slots per size class.
+    large_old: u64,
+    /// The current chunk's free slots, per size class.
     free: [*Header; 33],
+    /// First chunk with free slots per size class (index + 1; 0: none).
+    avail: [u64; 33],
     chunks: mem.Vec<Chunk>,
+    /// Raw segment allocations, and the next unused chunk of the last one.
+    segments: mem.Vec<*u8>,
+    seg_next: *u8,
+    seg_left: u64,
+    rs: *RemSet,
     /// Called after marking, before sweeping (for weak tables).
     sweepers: mem.Vec<Scanner>,
+    ephemerons: mem.Vec<EphHook>,
+    /// Live `Weak` objects (some may have died since the last collection).
+    weaks: mem.Vec<*u8>,
     count: u64,
+    /// Bytes in live objects after the last collection (in generational
+    /// mode: the old generation).
     live_bytes: u64,
     allocated: u64,
     /// Collect when `allocated` exceeds this (set after each collection
-    /// from `growth` and `min_heap`).
+    /// from `growth` and `min_heap`; in generational mode, the nursery).
     threshold: u64,
     /// The smallest allocation budget between collections, in bytes.
     min_heap: u64,
@@ -76,19 +167,55 @@ pub struct Heap {
     stack: mem.Vec<*u8>,
     scanners: mem.Vec<Scanner>,
     collections: u64,
+    /// Of `collections`, the minor ones.
+    minors: u64,
     freed: u64,
     stress: bool,
+    /// Generational mode (see the top of this file).
+    gen: bool,
+    /// Live objects may carry mark bits (after a generational collection).
+    sticky: bool,
+    /// The collection in progress is minor.
+    minor: bool,
+    /// The next collection must be major.
+    want_major: bool,
+    /// Cap on the allocation budget between minor collections (0: none).
+    nursery: u64,
+    /// Major collection once the old generation exceeds this.
+    major_limit: u64,
+    /// Live bytes after the last full collection (the nursery's budget is
+    /// computed from them, not from the old generation, which also holds
+    /// promoted objects that have died since).
+    major_live: u64,
+    /// Check the barrier invariant at every collection (`set_verify`).
+    verify: bool,
+    verifying: bool,
+    vparent: *u8,
+    /// Print a line per collection to stderr (`LOIMI_GC_STATS` set).
+    stats: bool,
+    mark_ns: u64,
+    sweep_ns: u64,
     /// Free for the embedder (for example, runtime data that allocation
     /// helpers need but that is not passed to them).
     user: *u8,
 }
 
 pub fn Heap.new() -> Heap {
+    let rs: *RemSet = mem.alloc(1);
+    rs.objs = mem.Vec.new();
     Heap {
         large: mem.Vec.new(),
+        large_old: 0,
         free: [0 as *Header; 33],
+        avail: [0; 33],
         chunks: mem.Vec.new(),
+        segments: mem.Vec.new(),
+        seg_next: 0 as *u8,
+        seg_left: 0,
+        rs: rs,
         sweepers: mem.Vec.new(),
+        ephemerons: mem.Vec.new(),
+        weaks: mem.Vec.new(),
         count: 0,
         live_bytes: 0,
         allocated: 0,
@@ -99,8 +226,22 @@ pub fn Heap.new() -> Heap {
         stack: mem.Vec.new(),
         scanners: mem.Vec.new(),
         collections: 0,
+        minors: 0,
         freed: 0,
         stress: false,
+        gen: false,
+        sticky: false,
+        minor: false,
+        want_major: false,
+        nursery: 0,
+        major_limit: 0,
+        major_live: 0,
+        verify: false,
+        verifying: false,
+        vparent: 0 as *u8,
+        stats: (getenv("LOIMI_GC_STATS\0".ptr) as u64) != 0,
+        mark_ns: 0,
+        sweep_ns: 0,
         user: 0 as *u8,
     }
 }
@@ -108,39 +249,56 @@ pub fn Heap.new() -> Heap {
 /// Called by compiled code for `new`. The object is zeroed.
 pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
-    if c < NCLASS {
-        let hd = h.free[c];
-        if (hd as u64) != 0 {
-            h.free[c] = next_free(hd);
-            hd.tid = tid as u16;
-            hd.len = n;
-            h.count += 1;
-            h.allocated += c << 4;
-            let p = hd as *u8 + HEADER;
-            mem.memset(p, 0, size);
-            return p;
-        }
+    if c >= NCLASS { return alloc_large(h, size, tid, n); }
+    var hd = h.free[c];
+    if (hd as u64) == 0 { hd = refill(h, c); }
+    h.free[c] = next_free(hd);
+    // tid, mark and flags in one store, on the path after the refill: the
+    // flags are 0 (young), which lets LLVM drop the write barriers of
+    // stores into the new object that follow.
+    *((hd as *u8 + 4) as *u32) = tid & 0xFFFF;
+    hd.len = n;
+    h.count += 1;
+    h.allocated += c << 4;
+    let p = hd as *u8 + HEADER;
+    mem.memset(p, 0, size);
+    p
+}
+
+/// Make the next chunk of class `c` with free slots (or a new one) the
+/// current chunk; returns its first free slot.
+#[inline(never)]
+fn refill(h: *Heap, c: u64) -> *Header {
+    let a = h.avail[c];
+    if a != 0 {
+        let ch = h.chunks.ptr_at(a - 1);
+        h.avail[c] = ch.next;
+        ch.next = 0;
+        ch.used = true;
+        h.free[c] = ch.free;
+        ch.free = 0 as *Header;
+        ch.nfree = 0;
+    } else {
+        add_chunk(h, c);
     }
-    alloc_slow(h, size, tid, n)
+    h.free[c]
 }
 
 #[inline(never)]
-fn alloc_slow(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
-    let c = (HEADER + size + 15) >> 4;
-    if c < NCLASS {
-        add_chunk(h, c);
-        return alloc(h, size, tid, n);
-    }
-    let p = calloc(1, HEADER + size);
+fn alloc_large(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let p = calloc(1, 16 + HEADER + size);
     if (p as u64) == 0 { oom(); }
-    let hd = p as *Header;
+    let head = p as *ChunkHead;
+    head.rs = h.rs;
+    let hd = (p + 16) as *Header;
     hd.size = (HEADER + size) as u32;
     hd.tid = tid as u16;
+    hd.flags = LARGE;
     hd.len = n;
     h.large.push(hd);
     h.count += 1;
     h.allocated += HEADER + size;
-    p + HEADER
+    p + 16 + HEADER
 }
 
 fn oom() {
@@ -149,39 +307,122 @@ fn oom() {
     abort();
 }
 
-/// Carve a new chunk into free slots of class `c`.
+/// A fresh segment of SEG bytes aligned to SEG (zeroed, from mmap).
+fn new_segment() -> *u8 {
+    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS.
+    let raw = mmap(0 as *u8, 2 * SEG, 3, 0x22, -1, 0);
+    if (raw as i64) == -1 { oom(); }
+    let a = raw as u64;
+    let start = (a + SEG - 1) & !(SEG - 1);
+    if start > a { munmap(raw, start - a); }
+    let end = a + 2 * SEG;
+    if end > start + SEG { munmap((start + SEG) as *u8, end - start - SEG); }
+    let seg = start as *u8;
+    madvise(seg, SEG, 14);   // MADV_HUGEPAGE
+    seg
+}
+
+/// A new chunk for class `c`, made its current chunk.
 fn add_chunk(h: *Heap, c: u64) {
+    if h.seg_left == 0 {
+        let seg = new_segment();
+        h.segments.push(seg);
+        h.seg_next = seg;
+        h.seg_left = SEG_CHUNKS;
+    }
+    let base = h.seg_next;
+    h.seg_next = base + CHUNK;
+    h.seg_left -= 1;
     let size = c << 4;
-    let n = CHUNK / size;
-    let base = calloc(1, n * size);
-    if (base as u64) == 0 { oom(); }
-    h.chunks.push(Chunk { base: base, size: size, n: n });
+    let head = base as *ChunkHead;
+    head.rs = h.rs;
+    head.pad = 0;
+    let start = 16 + ((h.chunks.len * 37 + 11) % 64) * 64;
+    let n = (CHUNK - start) / size;
+    let slots = base + start;
+    var list = 0 as *Header;
     var i = n;
     while i > 0 {
         i -= 1;
-        let hd = (base + i * size) as *Header;
+        let hd = (slots + i * size) as *Header;
         hd.size = size as u32;
         hd.tid = FREE;
-        hd.len = h.free[c] as u64;
-        h.free[c] = hd;
+        hd.mark = 0;
+        hd.flags = 0;
+        hd.len = list as u64;
+        list = hd;
     }
+    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true });
+    h.free[c] = list;
 }
 
 /// Whether the object at `p` survived marking. Meaningful only in a
-/// sweeper (see `add_sweeper`).
+/// sweeper (see `add_sweeper`). In a minor collection, old objects count
+/// as marked.
 pub fn is_marked(p: *u8) -> bool {
     let hd = (p - HEADER) as *Header;
     hd.mark != 0
 }
+
+/// Whether the collection in progress is a minor one (for sweepers that
+/// can skip work: only objects allocated since the last collection die).
+pub fn Heap.is_minor(h: *Heap) -> bool { h.minor }
 
 /// Mark the object at `p` (null is ignored). Called by generated tracing code.
 pub fn mark_ptr(h: *Heap, p: *u8) {
     if (p as u64) == 0 { return; }
     let hd = (p - HEADER) as *Header;
     if hd.mark != 0 { return; }
+    if h.verifying { verify_fail(h, p); }
     hd.mark = 1;
     h.stack.push(p);
 }
+
+// ── write barrier ───────────────────────────────────────────────────────
+
+/// The write barrier, called by compiled code after storing a traced
+/// value into the object at `obj`.
+#[inline]
+pub fn barrier(obj: *u8) {
+    let hd = (obj - HEADER) as *Header;
+    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+}
+
+/// The write barrier for stores that bypass the compiler's: after storing
+/// a GC reference through a raw pointer into the object at `obj` (into a
+/// field or its trailing array), call `write_barrier(h, obj)` with that
+/// object (not an interior pointer). Without it a generational heap can
+/// free the stored object while it is still referenced. Free in a
+/// non-generational heap except for one byte test.
+#[inline]
+pub fn write_barrier(h: *Heap, obj: *u8) {
+    let hd = (obj - HEADER) as *Header;
+    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+}
+
+/// Whether a store into `obj` would need logging (old and not logged).
+/// For barriers that log more than the object itself (`remember`).
+#[inline]
+pub fn needs_barrier(obj: *u8) -> bool {
+    let hd = (obj - HEADER) as *Header;
+    (hd.flags & LOG) != 0
+}
+
+/// Add `obj` to its heap's remembered set: a minor collection traces it.
+#[inline(never)]
+pub fn remember(obj: *u8) {
+    let hd = (obj - HEADER) as *Header;
+    if (hd.flags & LOG) == 0 { return; }
+    hd.flags = hd.flags & !LOG;
+    let head = if (hd.flags & LARGE) != 0 {
+        (obj - HEADER - 16) as *ChunkHead
+    } else {
+        ((obj as u64) & !(CHUNK - 1)) as *ChunkHead
+    };
+    head.rs.objs.push(obj);
+}
+
+// ── hooks ───────────────────────────────────────────────────────────────
 
 /// Register a root scanner: `scan(heap, data)` must `gc_mark` every
 /// reference it owns. Scanners (and sweepers) run during a collection, so
@@ -205,8 +446,28 @@ fn drain(h: *Heap) {
     }
 }
 
-/// Run a full collection.
+// ── collection ──────────────────────────────────────────────────────────
+
+/// Run a collection: a full one, or in generational mode a minor one
+/// unless the old generation has outgrown its budget.
 pub fn collect(h: *Heap) uses gc {
+    let t0 = if h.stats { now_ns() } else { 0 };
+    if h.verify and h.sticky { verify_heap(h); }
+    let minor = h.gen and h.sticky and !h.want_major;
+    if !minor and h.sticky { clear_marks(h); }
+    h.minor = minor;
+    if minor {
+        // Old objects stored into: trace them, and log them again on the
+        // next store.
+        let rs = h.rs;
+        for i in 0..rs.objs.len {
+            let p = rs.objs.at(i);
+            let hd = (p - HEADER) as *Header;
+            loimi_trace_object(h, p, hd.tid as u32);
+            hd.flags = hd.flags | LOG;
+        }
+    }
+    h.rs.objs.clear();
     for i in 0..h.scanners.len {
         let s = h.scanners.at(i);
         s.scan(h, s.data);
@@ -221,65 +482,185 @@ pub fn collect(h: *Heap) uses gc {
         fr = fr.prev;
     }
     drain(h);
+    // Ephemerons: mark the values of entries with marked keys until
+    // nothing new is marked.
+    loop {
+        for i in 0..h.ephemerons.len {
+            let e = h.ephemerons.at(i);
+            e.mark(h, e.data);
+        }
+        if h.stack.len == 0 { break; }
+        drain(h);
+    }
+    for i in 0..h.ephemerons.len {
+        let e = h.ephemerons.at(i);
+        e.sweep(h, e.data);
+    }
+    clear_weaks(h);
     for i in 0..h.sweepers.len {
         let s = h.sweepers.at(i);
         s.scan(h, s.data);
     }
-    // Sweep the small objects, rebuilding the free lists in address order.
+    let t1 = if h.stats { now_ns() } else { 0 };
+    let keep = h.gen;
+    // Bytes of the survivors, and of those that were young (no LOG flag:
+    // in a generational heap every old object has it at this point).
     var live: u64 = 0;
-    var kept: u64 = 0;
+    var promoted: u64 = 0;
     var freed: u64 = 0;
-    for c in 0..NCLASS { h.free[c] = 0 as *Header; }
-    var ci = h.chunks.len;
-    while ci > 0 {
-        ci -= 1;
-        let ch = h.chunks.at(ci);
-        let c = ch.size >> 4;
-        var head = h.free[c];
-        var i = ch.n;
-        while i > 0 {
-            i -= 1;
-            let hd = (ch.base + i * ch.size) as *Header;
-            if hd.tid != FREE {
-                if hd.mark != 0 {
-                    hd.mark = 0;
-                    kept += 1;
-                    live += ch.size;
-                    continue;
-                }
-                hd.tid = FREE;
-                freed += 1;
-            }
-            // A free slot may have been marked through a dangling
-            // reference (a missed root); never hand out a marked slot.
-            hd.mark = 0;
-            hd.len = head as u64;
-            head = hd;
-        }
-        h.free[c] = head;
+    // Small objects: sweep the chunks (in a minor collection, those
+    // allocated from), rebuild their free lists in address order, and
+    // relink the chunks with free slots per class in index order.
+    var tail: [u64; 33] = [0; 33];
+    for c in 0..NCLASS {
+        h.free[c] = 0 as *Header;
+        h.avail[c] = 0;
     }
-    // Large objects.
-    var out: u64 = 0;
-    for i in 0..h.large.len {
+    for ci in 0..h.chunks.len {
+        let ch = h.chunks.ptr_at(ci);
+        if ch.used or !minor {
+            var head = 0 as *Header;
+            var nfree: u64 = 0;
+            var i = ch.n;
+            while i > 0 {
+                i -= 1;
+                let hd = (ch.base + i * ch.size) as *Header;
+                if hd.tid != FREE {
+                    if hd.mark != 0 {
+                        if keep {
+                            if hd.flags == 0 { promoted += ch.size; }
+                            hd.flags = LOG;
+                        } else {
+                            hd.mark = 0;
+                        }
+                        live += ch.size;
+                        continue;
+                    }
+                    hd.tid = FREE;
+                    hd.flags = 0;
+                    freed += 1;
+                }
+                // A free slot may have been marked through a dangling
+                // reference (a missed root); never hand out a marked slot.
+                hd.mark = 0;
+                hd.len = head as u64;
+                head = hd;
+                nfree += 1;
+            }
+            ch.free = head;
+            ch.nfree = nfree;
+            ch.used = false;
+        }
+        ch.next = 0;
+        if ch.nfree != 0 {
+            let c = ch.size >> 4;
+            if tail[c] == 0 {
+                h.avail[c] = ci + 1;
+            } else {
+                h.chunks.ptr_at(tail[c] - 1).next = ci + 1;
+            }
+            tail[c] = ci + 1;
+        }
+    }
+    // Large objects (in a minor collection, the young ones).
+    let first = if minor { h.large_old } else { 0 };
+    var out = first;
+    for i in first..h.large.len {
         let cur = h.large.at(i);
         if cur.mark != 0 {
-            cur.mark = 0;
+            if keep {
+                if cur.flags == LARGE { promoted += cur.size as u64; }
+                cur.flags = LARGE | LOG;
+            } else {
+                cur.mark = 0;
+            }
             live += cur.size as u64;
-            kept += 1;
             h.large.set(out, cur);
             out += 1;
         } else {
             freed += 1;
-            free(cur as *u8);
+            free(cur as *u8 - 16);
         }
     }
     h.large.truncate(out);
+    h.large_old = if keep { out } else { 0 };
     h.freed += freed;
-    h.count = kept;
-    h.live_bytes = live;
+    h.count -= freed;
     h.allocated = 0;
-    h.threshold = if h.stress { 0 } else { budget(h, live) };
     h.collections += 1;
+    h.sticky = keep;
+    if minor {
+        h.minors += 1;
+        h.live_bytes += promoted;
+        if h.live_bytes > h.major_limit { h.want_major = true; }
+    } else {
+        h.live_bytes = live;
+        h.want_major = false;
+        h.major_limit = live + budget(h, live);
+        h.major_live = live;
+    }
+    h.minor = false;
+    // In stress mode a generational heap still runs a major collection
+    // now and then, so both kinds are exercised.
+    if h.stress and h.gen and h.collections % 8 == 7 { h.want_major = true; }
+    h.threshold = next_threshold(h);
+    if h.stats {
+        let t2 = now_ns();
+        h.mark_ns += t1 - t0;
+        h.sweep_ns += t2 - t1;
+        io.eprint(if minor { "gc minor " } else { "gc major " });
+        io.eprint_int(h.collections as i64);
+        io.eprint(" live ");
+        io.eprint_int((h.live_bytes >> 10) as i64);
+        io.eprint("K mark ");
+        io.eprint_int(((t1 - t0) / 1000) as i64);
+        io.eprint("us sweep ");
+        io.eprint_int(((t2 - t1) / 1000) as i64);
+        io.eprint("us total mark ");
+        io.eprint_int((h.mark_ns / 1000000) as i64);
+        io.eprint("ms sweep ");
+        io.eprint_int((h.sweep_ns / 1000000) as i64);
+        io.eprintln("ms");
+    }
+}
+
+/// Clear every mark bit and LOG flag, and forget the remembered set
+/// (before a full collection of a heap whose live objects are marked).
+fn clear_marks(h: *Heap) {
+    for ci in 0..h.chunks.len {
+        let ch = h.chunks.ptr_at(ci);
+        var i = ch.n;
+        while i > 0 {
+            i -= 1;
+            let hd = (ch.base + i * ch.size) as *Header;
+            hd.mark = 0;
+            hd.flags = 0;
+        }
+    }
+    for i in 0..h.large.len {
+        let cur = h.large.at(i);
+        cur.mark = 0;
+        cur.flags = LARGE;
+    }
+    h.large_old = 0;
+    h.rs.objs.clear();
+    h.sticky = false;
+}
+
+/// The allocation budget until the next collection.
+fn next_threshold(h: *Heap) -> u64 {
+    if h.stress {
+        // With verify on, a generational heap under stress collects after
+        // 0 to 4 KiB of allocation (varying), not at every safepoint:
+        // objects must stay young across a few safepoints for stores into
+        // old objects to exercise the write barrier.
+        if !(h.gen and h.verify) { return 0; }
+        return (eph_hash(h.collections) & 4095) as u64;
+    }
+    if !h.gen { return budget(h, h.live_bytes); }
+    // The nursery is the growth budget, or less if capped (`set_nursery`).
+    let b = budget(h, h.major_live);
+    if h.nursery != 0 and h.nursery < b { h.nursery } else { b }
 }
 
 /// Bytes that may be allocated after a collection that left `live` bytes.
@@ -291,11 +672,14 @@ fn budget(h: *Heap, live: u64) -> u64 {
 
 /// Set the growth policy: after a collection, allocate `percent` percent
 /// of the live bytes (at least `min_heap` bytes) before the next one.
-/// Takes effect now for the current budget too.
+/// Takes effect now for the current budget too. In generational mode it
+/// sets when a major collection runs: once the old generation has grown
+/// by that much since the last one.
 pub fn Heap.set_growth(h: *Heap, percent: u64, min_heap: u64) {
     h.growth = percent;
     h.min_heap = min_heap;
-    if !h.stress { h.threshold = budget(h, h.live_bytes); }
+    h.major_limit = h.live_bytes + budget(h, h.live_bytes);
+    h.threshold = next_threshold(h);
 }
 
 /// Limit the allocation budget between collections to `bytes` (0: no
@@ -304,31 +688,314 @@ pub fn Heap.set_growth(h: *Heap, percent: u64, min_heap: u64) {
 /// of the live data. Takes effect now for the current budget too.
 pub fn Heap.set_max_budget(h: *Heap, bytes: u64) {
     h.max_budget = bytes;
-    if !h.stress { h.threshold = budget(h, h.live_bytes); }
+    h.major_limit = h.live_bytes + budget(h, h.live_bytes);
+    h.threshold = next_threshold(h);
 }
 
 /// Stress mode: collect at every safepoint (finds missing roots quickly).
 pub fn Heap.set_stress(h: *Heap, on: bool) {
     h.stress = on;
-    h.threshold = if on { 0 } else { budget(h, h.live_bytes) };
+    h.threshold = next_threshold(h);
+}
+
+/// Generational mode: collections are minor (young objects only) until
+/// the old generation has grown by the growth budget (`set_growth`),
+/// then major. Stores of references into objects through raw pointers
+/// need `write_barrier`. Can be switched at any time.
+pub fn Heap.set_generational(h: *Heap, on: bool) {
+    h.gen = on;
+    if on {
+        h.major_live = h.live_bytes;
+        h.major_limit = h.live_bytes + budget(h, h.live_bytes);
+    } else {
+        h.want_major = false;
+    }
+    h.threshold = next_threshold(h);
+}
+
+/// Cap the allocation budget between minor collections at `bytes` (0, the
+/// default: no cap, the same budget as between full collections, from
+/// `set_growth`). A small nursery shortens minor pauses but promotes more
+/// short-lived objects, which then wait for a major collection.
+pub fn Heap.set_nursery(h: *Heap, bytes: u64) {
+    h.nursery = bytes;
+    h.threshold = next_threshold(h);
+}
+
+/// Verify mode, for generational heaps: at the start of every collection
+/// check every old object's references: each must point to an allocated
+/// object, and unless the object is in the remembered set, to an old one.
+/// A violation (a missing write barrier, or a dangling reference) prints
+/// the two objects' type ids and aborts. Costs a heap walk per collection;
+/// meant for tests, with `set_stress`.
+pub fn Heap.set_verify(h: *Heap, on: bool) {
+    h.verify = on;
+    h.threshold = next_threshold(h);
 }
 
 /// Collect if enough has been allocated since the last collection.
 pub fn maybe_collect(h: *Heap) uses gc {
-    if h.allocated > h.threshold or h.stress {
+    if h.allocated > h.threshold or (h.stress and !(h.gen and h.verify)) {
         collect(h);
+    }
+}
+
+// ── verification ────────────────────────────────────────────────────────
+
+fn verify_heap(h: *Heap) {
+    h.verifying = true;
+    for ci in 0..h.chunks.len {
+        let ch = h.chunks.ptr_at(ci);
+        var i = ch.n;
+        while i > 0 {
+            i -= 1;
+            let hd = (ch.base + i * ch.size) as *Header;
+            if hd.tid != FREE and hd.mark != 0 and (hd.flags & LOG) != 0 {
+                let p = hd as *u8 + HEADER;
+                h.vparent = p;
+                loimi_trace_object(h, p, hd.tid as u32);
+            }
+        }
+    }
+    for i in 0..h.large.len {
+        let hd = h.large.at(i);
+        if hd.mark != 0 and (hd.flags & LOG) != 0 {
+            let p = hd as *u8 + HEADER;
+            h.vparent = p;
+            loimi_trace_object(h, p, hd.tid as u32);
+        }
+    }
+    h.verifying = false;
+}
+
+#[cold]
+fn verify_fail(h: *Heap, p: *u8) {
+    let hp = (h.vparent - HEADER) as *Header;
+    let hd = (p - HEADER) as *Header;
+    io.eprint("gc verify: old object of type ");
+    io.eprint(loimi_type_name(hp.tid as u32));
+    if hd.tid == FREE {
+        io.eprintln(" points to a free slot");
+    } else {
+        io.eprint(" points to a young object of type ");
+        io.eprint(loimi_type_name(hd.tid as u32));
+        io.eprintln(" but is not in the remembered set: missing write barrier");
+    }
+    abort();
+}
+
+// ── weak references ─────────────────────────────────────────────────────
+
+/// A weak reference: does not keep its target alive, and reads as None
+/// once the target has died. Make one with `Heap.new_weak`; the heap
+/// clears it in the collection that frees the target.
+pub object Weak<T> { addr: u64 }
+
+/// A weak reference to `x`.
+pub fn Heap.new_weak<T>(h: *Heap, x: Gc<T>) -> Gc<Weak<T>> {
+    let w: Gc<Weak<T>> = new(h, Weak { addr: x as u64 });
+    h.weaks.push(w as *u8);
+    w
+}
+
+/// The target, or None if it died.
+pub fn Weak<T>.get(w: Gc<Weak<T>>) -> ?Gc<T> {
+    if w.addr == 0 { return None; }
+    Some(unsafe { w.addr as Gc<T> })
+}
+
+/// Point `w` at `x` (or at nothing).
+pub fn Weak<T>.set(w: Gc<Weak<T>>, x: ?Gc<T>) {
+    w.addr = if let Some(o) = x { o as u64 } else { 0 };
+}
+
+/// Drop dead weak references from the registry and clear the live ones
+/// whose target died.
+fn clear_weaks(h: *Heap) {
+    var out: u64 = 0;
+    for i in 0..h.weaks.len {
+        let p = h.weaks.at(i);
+        if !is_marked(p) { continue; }
+        let a = p as *u64;
+        if *a != 0 and !is_marked(*a as *u8) { *a = 0; }
+        h.weaks.set(out, p);
+        out += 1;
+    }
+    h.weaks.truncate(out);
+}
+
+// ── ephemerons ──────────────────────────────────────────────────────────
+
+/// An ephemeron table: a map from objects (by identity) to values of a
+/// traced type V, where an entry keeps its value alive only while its key
+/// is alive by other paths, and is dropped when the key dies. (A plain
+/// map from keys to values would keep every value, and so every key the
+/// values reference, alive.) The basis for JavaScript's WeakMap and Lua's
+/// tables with weak keys.
+///
+/// The table lives in host memory: create it with `Ephemerons.new(h)`,
+/// which registers it with the heap, and release it with `free`. Lookups
+/// are by address (the heap does not move objects).
+pub struct Ephemerons<K, V> {
+    heap: *Heap,
+    /// Open addressing: key addresses (0 empty, 1 deleted) and values.
+    keys: *u64,
+    vals: *V,
+    cap: u64,
+    used: u64,
+    live: u64,
+}
+
+const EPH_DEL: u64 = 1;
+
+fn eph_hash(a: u64) -> u64 {
+    var z = a;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^ (z >> 31)
+}
+
+/// A new, empty table registered with `h`.
+pub fn Ephemerons<K, V>.new(h: *Heap) -> *Ephemerons<K, V> {
+    let t: *Ephemerons<K, V> = mem.alloc(1);
+    t.heap = h;
+    t.cap = 8;
+    t.keys = mem.alloc(8);
+    t.vals = mem.alloc(8);
+    t.used = 0;
+    t.live = 0;
+    h.ephemerons.push(EphHook { data: t as *u8, mark: eph_mark<K, V>, sweep: eph_sweep<K, V> });
+    t
+}
+
+/// Unregister the table and free it.
+pub fn Ephemerons<K, V>.free(t: *Ephemerons<K, V>) {
+    let h = t.heap;
+    var out: u64 = 0;
+    for i in 0..h.ephemerons.len {
+        let e = h.ephemerons.at(i);
+        if e.data != t as *u8 {
+            h.ephemerons.set(out, e);
+            out += 1;
+        }
+    }
+    h.ephemerons.truncate(out);
+    mem.release(t.keys);
+    mem.release(t.vals);
+    mem.release(t);
+}
+
+/// Number of entries (including those whose key died since the last
+/// collection).
+pub fn Ephemerons<K, V>.len(t: *Ephemerons<K, V>) -> u64 { t.live }
+
+fn Ephemerons<K, V>.slot(t: *Ephemerons<K, V>, a: u64) -> ?u64 {
+    let mask = t.cap - 1;
+    var i = eph_hash(a) & mask;
+    loop {
+        let k = t.keys[i];
+        if k == a { return Some(i); }
+        if k == 0 { return None; }
+        i = (i + 1) & mask;
+    }
+}
+
+/// The value for key `k`.
+pub fn Ephemerons<K, V>.get(t: *Ephemerons<K, V>, k: Gc<K>) -> ?V {
+    if let Some(i) = t.slot(k as u64) { Some(t.vals[i]) } else { None }
+}
+
+/// Set the value for key `k`.
+pub fn Ephemerons<K, V>.set(t: *Ephemerons<K, V>, k: Gc<K>, v: V) {
+    let a = k as u64;
+    if let Some(i) = t.slot(a) {
+        t.vals[i] = v;
+        return;
+    }
+    if (t.used + 1) * 4 > t.cap * 3 {
+        eph_resize(t, if (t.live + 1) * 2 > t.cap { t.cap * 2 } else { t.cap });
+    }
+    let mask = t.cap - 1;
+    var i = eph_hash(a) & mask;
+    while t.keys[i] > EPH_DEL { i = (i + 1) & mask; }
+    if t.keys[i] == 0 { t.used += 1; }
+    t.keys[i] = a;
+    t.vals[i] = v;
+    t.live += 1;
+}
+
+/// Remove the entry for `k`, if any.
+pub fn Ephemerons<K, V>.remove(t: *Ephemerons<K, V>, k: Gc<K>) {
+    if let Some(i) = t.slot(k as u64) {
+        t.keys[i] = EPH_DEL;
+        t.live -= 1;
+    }
+}
+
+fn eph_resize<K, V>(t: *Ephemerons<K, V>, cap: u64) {
+    let ok = t.keys;
+    let ov = t.vals;
+    let n = t.cap;
+    t.keys = mem.alloc(cap);
+    t.vals = mem.alloc(cap);
+    t.cap = cap;
+    t.used = 0;
+    let mask = cap - 1;
+    for j in 0..n {
+        let a = ok[j];
+        if a > EPH_DEL {
+            var i = eph_hash(a) & mask;
+            while t.keys[i] != 0 { i = (i + 1) & mask; }
+            t.keys[i] = a;
+            t.vals[i] = ov[j];
+            t.used += 1;
+        }
+    }
+    mem.release(ok);
+    mem.release(ov);
+}
+
+/// Mark the values of entries whose key is marked.
+fn eph_mark<K, V>(h: *Heap, data: *u8) -> bool {
+    let t = data as *Ephemerons<K, V>;
+    let before = h.stack.len;
+    for i in 0..t.cap {
+        let a = t.keys[i];
+        if a > EPH_DEL and is_marked(a as *u8) { gc_mark(h, t.vals[i]); }
+    }
+    h.stack.len != before
+}
+
+/// Drop the entries whose key died.
+fn eph_sweep<K, V>(h: *Heap, data: *u8) {
+    let t = data as *Ephemerons<K, V>;
+    for i in 0..t.cap {
+        let a = t.keys[i];
+        if a > EPH_DEL and !is_marked(a as *u8) {
+            t.keys[i] = EPH_DEL;
+            t.live -= 1;
+        }
     }
 }
 
 /// Free every object (no finalizers run).
 pub fn Heap.free(h: *Heap) {
-    for i in 0..h.large.len { free(h.large.at(i) as *u8); }
+    for i in 0..h.large.len { free(h.large.at(i) as *u8 - 16); }
     h.large.free();
-    for i in 0..h.chunks.len { free(h.chunks.at(i).base); }
+    for i in 0..h.segments.len { munmap(h.segments.at(i), SEG); }
+    h.segments.free();
     h.chunks.free();
-    for c in 0..NCLASS { h.free[c] = 0 as *Header; }
+    for c in 0..NCLASS {
+        h.free[c] = 0 as *Header;
+        h.avail[c] = 0;
+    }
+    h.seg_left = 0;
     h.count = 0;
     h.stack.free();
     h.scanners.free();
     h.sweepers.free();
+    h.ephemerons.free();
+    h.weaks.free();
+    h.rs.objs.free();
+    mem.release(h.rs);
 }

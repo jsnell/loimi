@@ -160,6 +160,27 @@ pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
     o
 }
 
+/// The write barrier for stores into a table's array and hash parts.
+/// Those go through raw pointers (`aptr`, `hptr`), which the compiler's
+/// barrier does not see, into the table (inline array part) or its `arr`
+/// and `hash` objects. One test of the table's own header: a table is
+/// logged together with its parts (`log_table`), and the parts are never
+/// older than the table (they are allocated after it), so while the
+/// table needs no logging (young, or logged already) neither do they.
+/// Call it also before replacing a part (`t.arr = ..`), so that the
+/// compiler's barrier on that store does not log the table alone.
+#[inline]
+pub fn tbar(t: Gc<Table>) {
+    if unlikely(gc.needs_barrier(t as *u8)) { log_table(t); }
+}
+
+#[inline(never)]
+fn log_table(t: Gc<Table>) {
+    gc.remember(t as *u8);
+    if let Some(a) = t.arr { gc.remember(a as *u8); }
+    if let Some(a) = t.hash { gc.remember(a as *u8); }
+}
+
 pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
     let a = new(h, Arr {}, n);
     for i in 0..n { a.data[i] = V.Nil; }
@@ -295,7 +316,7 @@ pub fn hash_set_existing(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
     var i = hv & mask;
     loop {
         let key = slots[2 * i];
-        if key == k { slots[2 * i + 1] = v; return true; }
+        if key == k { slots[2 * i + 1] = v; tbar(t); return true; }
         if key == V.Nil { return false; }
         i = (i + 1) & mask;
     }
@@ -356,6 +377,7 @@ fn rehash(h: *gc.Heap, t: Gc<Table>) {
     // `old` stays alive: it is only dropped from `t.hash` below, and
     // nothing here collects.
     let hs = new_arr(h, cap * 2);
+    tbar(t);
     t.hcap = cap;
     t.hused = 0;
     t.hptr = hs.data.ptr;
@@ -375,6 +397,7 @@ fn hash_insert_new(t: Gc<Table>, k: V, v: V) {
     while slots[2 * i] != V.Nil { i = (i + 1) & mask; }
     slots[2 * i] = k;
     slots[2 * i + 1] = v;
+    tbar(t);
     t.hused += 1;
 }
 
@@ -383,6 +406,7 @@ fn hash_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     // so assigning to existing fields during traversal is safe.
     if let Some(i) = hash_find(t, k) {
         t.hptr[2 * i + 1] = v;
+        tbar(t);
         return;
     }
     if v == V.Nil { return; }
@@ -396,6 +420,7 @@ fn array_grow(h: *gc.Heap, t: Gc<Table>, n: u64) {
     let p = na.data.ptr;
     for i in 0..t.asize { p[i] = t.aptr[i]; }
     for i in t.asize..n { p[i] = V.Nil; }
+    tbar(t);
     t.arr = Some(na);
     t.aptr = p;
     t.acap = n;
@@ -408,6 +433,7 @@ fn array_append(h: *gc.Heap, t: Gc<Table>, v: V) {
         let cap = t.acap;
         if t.asize == cap { array_grow(h, t, if cap < 4 { 4 } else { cap * 2 }); }
         t.aptr[t.asize] = v;
+        tbar(t);
         t.asize += 1;
         if t.hused == 0 { return; }
         let next = V.Int((t.asize + 1) as i32);
@@ -423,7 +449,7 @@ pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     let k = norm_key(k);
     if let Int(_) = k {
         let u = int_index(k);
-        if u < t.asize { t.aptr[u] = v; return; }
+        if u < t.asize { t.aptr[u] = v; tbar(t); return; }
         if u == t.asize and v != V.Nil { array_append(h, t, v); return; }
     }
     hash_set(h, t, k, v);
@@ -438,6 +464,7 @@ pub fn table_setlist(h: *gc.Heap, t: Gc<Table>, vals: *V, n: u64, start: u64) {
     let end = start + n;
     if end > t.acap { array_grow(h, t, end); }
     for i in 0..n { t.aptr[start + i] = vals[i]; }
+    tbar(t);
     if end > t.asize { t.asize = end; }
 }
 

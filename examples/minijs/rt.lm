@@ -131,6 +131,9 @@ pub fn Ctx.init(c: *Ctx) {
     // collections: as fast as a 64 MiB minimum at 100%, with a quarter
     // of the memory for programs with little live data.
     c.heap.set_growth(300, 8 << 20);
+    // Generational: binary_trees 9% faster, the other benchmarks within
+    // noise (json 3% slower); see std/gc.md and the roadmap (question 2).
+    c.heap.set_generational(true);
     value.HEAP = Some(&c.heap);
     c.heap.add_scanner(c as *u8, scan_roots);
     for _ in 0..INT_KEYS { c.intkeys.push(0); }
@@ -502,6 +505,7 @@ pub fn Ctx.arr_reserve(c: *Ctx, a: Gc<Arr>, n: u64) {
 pub fn Ctx.arr_push(c: *Ctx, a: Gc<Arr>, v: V) {
     if a.len == arr_cap(a) { c.arr_reserve(a, a.len + 1); }
     a.ptr[a.len] = v;
+    value.abar(a);
     a.len += 1;
 }
 
@@ -592,10 +596,11 @@ pub fn Ctx.set(c: *Ctx, v: V, k: u64, x: V) -> Result<(), V> {
 
 /// a[i] = x (i <= len appends; beyond is out of the subset and fills with undefined).
 pub fn Ctx.arr_set(c: *Ctx, a: Gc<Arr>, i: u64, x: V) {
-    if i < a.len { a.ptr[i] = x; return; }
+    if i < a.len { a.ptr[i] = x; value.abar(a); return; }
     if i >= arr_cap(a) { c.arr_reserve(a, i + 1); }
     a.len = i + 1;
     a.ptr[i] = x;
+    value.abar(a);
 }
 
 /// obj[key] for any key value.
