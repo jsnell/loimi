@@ -26,7 +26,10 @@ clean-room benchmarks it is faster than V8's bytecode interpreter
 (`node --jitless`, 0.33–0.97× of its time) and faster than QuickJS, on
 every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
 [`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
-public r7rs-benchmarks suite.
+public r7rs-benchmarks suite. By geometric mean it takes 0.39× of Gauche's
+time and 0.62× of Guile 3's time with Guile's JIT off. Guile with its JIT
+is faster: we take 1.39× of its time
+([`bench/scheme/README.md`](bench/scheme/README.md)).
 
 ## Getting started
 
