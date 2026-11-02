@@ -461,6 +461,10 @@ pub vm Mini {
                 }
             }
             #fname {
+                // Two floats: a tagged word is a NaN as a double, so a
+                // non-NaN result means both operands were numbers.
+                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
+                if likely(r == r) { dst = r.to_bits() as V; next }
                 match (a, b) {
                     (Num(x), Num(y)) => { dst = Num(x sym y); next }
                     (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
