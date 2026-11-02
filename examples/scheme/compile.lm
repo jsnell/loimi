@@ -323,8 +323,8 @@ fn Comp.args(c: *Comp, x: V) -> mem.Vec<*Node> {
 }
 
 fn Comp.inline_call(c: *Comp, name: str, args: V, argc: i64) -> ?*Node {
-    // cXr compositions become chains of car/cdr.
-    if argc == 1 and name.len >= 4 and name.len <= 5 and name[0] == 'c' and name[name.len - 1] == 'r' {
+    // cXr compositions (up to four levels) become chains of car/cdr.
+    if argc == 1 and name.len >= 4 and name.len <= 6 and name[0] == 'c' and name[name.len - 1] == 'r' {
         var ok = true;
         for i in 1..name.len - 1 {
             if name[i] != 'a' and name[i] != 'd' { ok = false; }
@@ -430,8 +430,8 @@ fn Comp.special(c: *Comp, name: str, x: V) -> ?*Node {
     if name.eq("cond") { return Some(c.cond(rest)); }
     if name.eq("case") { return Some(c.case_form(rest)); }
     if name.eq("do") { return Some(c.do_form(rest)); }
-    if name.eq("define-syntax") or name.eq("let-syntax") or name.eq("syntax-rules") or name.eq("call/cc")
-        or name.eq("call-with-current-continuation") or name.eq("dynamic-wind") {
+    if name.eq("define-syntax") or name.eq("let-syntax") or name.eq("syntax-rules")
+        or name.eq("dynamic-wind") {
         if !c.redefined.contains(c.ctx.syms.intern(c.heap, name) as u64) {
             var b = text.StrBuf.new();
             b.push_str(name);
@@ -496,12 +496,110 @@ fn Comp.lambda(c: *Comp, ps: V, body: V, name: str) -> *Lam {
     l
 }
 
+/// Build a list from `items`.
+fn Comp.list(c: *Comp, items: []V) -> V {
+    var l = value.nil();
+    var i = items.len;
+    while i > 0 {
+        i -= 1;
+        l = value.cons(c.heap, items[i], l);
+    }
+    l
+}
+
+/// (define-record-type T (ctor field ...) pred (field acc [modifier]) ...)
+/// → (begin (define T '(T))
+///          (define (ctor a ...) (%record T <field value or #f> ...))
+///          (define (pred x) (%record? T x))
+///          (define (acc x) (%record-ref T x i))
+///          (define (modifier x v) (%record-set! T x i v)) ...)
+/// A record is a Vect whose rtd is T, so vector? is false for it.
+fn Comp.record_defs(c: *Comp, x: V) -> V {
+    let rest = cdr(c, x);
+    if list_len(rest) < 2 { fail(c.line, "bad define-record-type"); }
+    let tname = car(c, rest);
+    let Sym(_) = tname else { fail(c.line, "define-record-type: bad type name") };
+    let ctor = car(c, cdr(c, rest));
+    let pred = if list_len(rest) >= 3 { car(c, cdr(c, cdr(c, rest))) } else { value.f() };
+    let specs = if list_len(rest) >= 3 { cdr(c, cdr(c, cdr(c, rest))) } else { value.nil() };
+    let define = c.sym("define");
+    let quote = c.sym("quote");
+    var defs: mem.Vec<V> = mem.Vec.new();
+    defs.push(c.sym("begin"));
+    let tq = c.list([quote, value.cons(c.heap, tname, value.nil())][0..2]);
+    defs.push(c.list([define, tname, tq][0..3]));
+    // Field names, in order.
+    var fields: mem.Vec<V> = mem.Vec.new();
+    var cur = specs;
+    while let P(p) = cur {
+        let f = if let P(q) = p.car { q.car } else { p.car };
+        let Sym(_) = f else { fail(c.line, "define-record-type: bad field") };
+        fields.push(f);
+        cur = p.cdr;
+    }
+    if let P(cp) = ctor {
+        // Constructor parameters are fresh symbols, one per named field.
+        var params: mem.Vec<V> = mem.Vec.new();
+        var vals: mem.Vec<V> = mem.Vec.new();
+        vals.push(c.sym("%record"));
+        vals.push(tname);
+        for i in 0..fields.len { vals.push(value.f()); }
+        var a = cp.cdr;
+        while let P(q) = a {
+            let g = V.Sym(c.gensym("field"));
+            params.push(g);
+            var found = false;
+            for i in 0..fields.len {
+                if fields.at(i) == q.car { vals.items()[i + 2] = g; found = true; }
+            }
+            if !found { fail(c.line, "define-record-type: constructor argument is not a field"); }
+            a = q.cdr;
+        }
+        let head = value.cons(c.heap, cp.car, c.list(params.items()));
+        defs.push(c.list([define, head, c.list(vals.items())][0..3]));
+        params.free();
+        vals.free();
+    } else if let Sym(_) = ctor {
+        fail(c.line, "define-record-type: the constructor must list its fields");
+    }
+    let xs = V.Sym(c.gensym("record"));
+    let vs = V.Sym(c.gensym("value"));
+    if let Sym(_) = pred {
+        let body = c.list([c.sym("%record?"), tname, xs][0..3]);
+        defs.push(c.list([define, c.list([pred, xs][0..2]), body][0..3]));
+    }
+    cur = specs;
+    var i: i32 = 0;
+    while let P(p) = cur {
+        if let P(q) = p.car {
+            var r = q.cdr;
+            if let P(acc) = r {
+                let body = c.list([c.sym("%record-ref"), tname, xs, V.Int(i)][0..4]);
+                defs.push(c.list([define, c.list([acc.car, xs][0..2]), body][0..3]));
+                r = acc.cdr;
+            }
+            if let P(md) = r {
+                let body = c.list([c.sym("%record-set!"), tname, xs, V.Int(i), vs][0..5]);
+                defs.push(c.list([define, c.list([md.car, xs, vs][0..3]), body][0..3]));
+            }
+        }
+        i += 1;
+        cur = p.cdr;
+    }
+    let out = c.list(defs.items());
+    defs.free();
+    fields.free();
+    out
+}
+
 /// Flatten `begin`s in a body (they may contain definitions).
 fn Comp.flatten(c: *Comp, forms: V, out: *mem.Vec<V>) {
     var cur = forms;
     while let P(p) = cur {
         if c.is_form(p.car, "begin") {
             c.flatten(cdr(c, p.car), out);
+        } else if c.is_form(p.car, "define-record-type") {
+            c.flatten(cdr(c, c.record_defs(p.car)), out);
         } else {
             out.push(p.car);
         }
@@ -937,6 +1035,11 @@ fn Comp.top(c: *Comp, x: V, out: *mem.Vec<*Node>) {
     if c.is_form(x, "begin") {
         var cur = cdr(c, x);
         while let P(p) = cur { c.top(p.car, out); cur = p.cdr; }
+    } else if c.is_form(x, "define-record-type") {
+        c.top(c.record_defs(x), out);
+    } else if c.is_form(x, "import") {
+        // R7RS programs start with (import ...); every library name we
+        // know is built in, so there is nothing to do.
     } else if c.is_form(x, "define") {
         let (s, val, is_proc) = c.definition(x);
         let n = c.node(K.GDef);

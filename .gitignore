@@ -6,3 +6,6 @@
 /bench/lua/install
 /.claude/worktrees
 core.*
+/bench/scheme/src
+/bench/scheme/install
+/bench/scheme/r7rs-benchmarks

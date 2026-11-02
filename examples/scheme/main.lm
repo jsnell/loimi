@@ -12,6 +12,7 @@ import value.{V};
 import rt.{Ctx};
 import rt;
 import vm.{Scheme};
+import vm;
 import compile;
 import builtins;
 import prelude;
@@ -27,6 +28,7 @@ fn main() -> i32 {
         return 1;
     };
     var ctx = Ctx.new();
+    ctx.cont_proto = Some(vm.cont_proto(&ctx.heap));
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
     for id in 0..builtins.NPRIMS {
         let (name, _, _) = builtins.prim_info(id);

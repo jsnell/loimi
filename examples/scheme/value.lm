@@ -20,8 +20,9 @@ pub object Str { data: [u8] }
 /// compiler on first use as a global; NO_GLOBAL until then).
 pub object Sym { gidx: u32, name: [u8] }
 /// Vectors; also used (length 1, never visible to programs) as the boxes
-/// that hold assigned captured variables.
-pub object Vect { data: [V] }
+/// that hold assigned captured variables, and for records: `rtd` is '() for
+/// a vector, and the record type (a list of its name) for a record.
+pub object Vect { rtd: V, data: [V] }
 pub object Arr { data: [V] }
 /// Source line of each instruction.
 pub object Lines { data: [u32] }
@@ -61,6 +62,10 @@ pub value V repr nanbox {
 }
 
 pub const NO_GLOBAL: u32 = 0xFFFFFFFF;
+
+/// `Proto.fixed` of the prototype shared by escape continuations: no CALL
+/// argument count equals it, so calling one always takes the slow path.
+pub const CONT_FIXED: u32 = 0x20000;
 
 pub const IMM_NIL: i32 = 0;
 pub const IMM_FALSE: i32 = 1;
@@ -109,7 +114,7 @@ pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
 }
 
 pub fn new_vect(h: *gc.Heap, n: u64, fill: V) -> Gc<Vect> {
-    let a = new(h, Vect {}, n);
+    let a = new(h, Vect { rtd: V.Imm(IMM_NIL) }, n);
     for i in 0..n { a.data.ptr[i] = fill; }
     a
 }
@@ -160,6 +165,7 @@ pub fn equal(a: V, b: V) -> bool {
             }
             (S(x), S(y)) => return x.data.eq(y.data),
             (Vec(x), Vec(y)) => {
+                if x.rtd != V.Imm(IMM_NIL) or y.rtd != V.Imm(IMM_NIL) { return false; }
                 if x.data.len != y.data.len { return false; }
                 for i in 0..x.data.len {
                     if !equal(x.data.ptr[i], y.data.ptr[i]) { return false; }
@@ -177,7 +183,7 @@ pub fn type_name(v: V) -> str {
         P(_) => "pair",
         Sym(_) => "symbol",
         S(_) => "string",
-        Vec(_) => "vector",
+        Vec(x) => if x.rtd == V.Imm(IMM_NIL) { "vector" } else { "record" },
         Clo(_) => "procedure",
         Imm(x) => {
             if x == IMM_NIL { "empty list" }
@@ -292,6 +298,12 @@ pub fn print(b: *text.StrBuf, v: V, write: bool) {
             b.push(')');
         }
         Vec(a) => {
+            if let P(t) = a.rtd {
+                b.push_str("#<record ");
+                print(b, t.car, false);
+                b.push('>');
+                return;
+            }
             b.push_str("#(");
             for i in 0..a.data.len {
                 if i > 0 { b.push(' '); }

@@ -32,5 +32,20 @@ pub fn source() -> str {
 (define (vector-for-each f v) (for-each f (vector->list v)))
 (define (string-for-each f s) (for-each f (string->list s)))
 (define (string-map f s) (list->string (map f (string->list s))))
+
+(define call/cc call-with-current-continuation)
+
+; Multiple values: one value is itself; any other number is a list tagged
+; with a unique pair, which call-with-values spreads.
+(define %values-tag (list 'values))
+(define (values . xs)
+  (if (if (pair? xs) (null? (cdr xs)) #f)
+      (car xs)
+      (cons %values-tag xs)))
+(define (call-with-values producer consumer)
+  (let ((v (producer)))
+    (if (if (pair? v) (eq? (car v) %values-tag) #f)
+        (apply consumer (cdr v))
+        (consumer v))))
 "
 }

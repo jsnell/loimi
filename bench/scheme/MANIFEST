@@ -1,0 +1,20 @@
+# Benchmark sources and reference interpreters for the Scheme example.
+# fetch.sh clones r7rs-benchmarks into bench/scheme/r7rs-benchmarks/;
+# install.sh builds chibi-scheme into bench/scheme/install/. Both are
+# gitignored: nothing from these projects is committed, only this manifest,
+# the scripts, and our own prelude/postlude/inputs for the harness.
+#
+# r7rs-benchmarks: Larceny's R7RS benchmarks (W. D. Clinger et al., drawn
+# from the Gabriel, Kernighan-Van Wyk and Gambit suites) as maintained by
+# ecraven. License: the repository has no LICENSE file (GitHub reports
+# none). A few programs carry W. D. Clinger's notice permitting copying
+# and redistribution with the notice kept (e.g. equal.scm); most carry no
+# license statement at all, so no license is granted for the collection as
+# a whole. We therefore only download it at bench time and never commit or
+# redistribute any of it.
+#
+# chibi-scheme: BSD-3-Clause (COPYING in its tree). Release 0.12.
+#
+# name             url                                                commit
+r7rs-benchmarks    https://github.com/ecraven/r7rs-benchmarks.git     85f6acdc4cc4e2b857f307ba56bd0ba931dcccd1
+chibi-scheme       https://github.com/ashinn/chibi-scheme.git         08e23be118e7de8cf29d606bc4793371c0ace680
