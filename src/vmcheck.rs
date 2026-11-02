@@ -170,7 +170,8 @@ fn raw_ty(signed: bool) -> Ty {
 }
 
 /// Decode a field of the code word at `pc + off`.
-fn decode(word: IntTy, off: u32, bits: u32, shift: u32, signed: bool, span: Span) -> TExpr {
+fn decode(word: IntTy, d: FieldDecode, span: Span) -> TExpr {
+    let FieldDecode { off, shift, bits, signed } = d;
     let wt = Ty::Int(word);
     let w = mk(wt.clone(), TK::Vm(TVm::Word(off)), span);
     let int = |v: u64| mk(wt.clone(), TK::Int(v as i128), span);
@@ -1224,7 +1225,8 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
             // A forwarded operand is a copy of the previous part's field.
-            cx.locals[raw as usize].field = !fwd.iter().any(|l| l.0 == j && l.1 == pi && j > start);
+            let fd = FieldDecode { off: 0, shift, bits, signed };
+            cx.locals[raw as usize].field = (!fwd.iter().any(|l| l.0 == j && l.1 == pi && j > start)).then_some(fd);
             // A forwarding variant (`#[forward] super`): an operand linked
             // to the register the previous part wrote is a copy of that
             // part's field (`optimize` checked that they are equal), so
@@ -1242,7 +1244,7 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
                     let v = mk(dt.clone(), TK::Local(dl), span);
                     if dt == rt { v } else { mk(rt, TK::Cast(Box::new(v)), span) }
                 }
-                None => decode(word, 0, bits, shift, signed, span),
+                None => decode(word, fd, span),
             };
             lets.push(TStmt::Let(raw, Some(init)));
             operands.push((pname.clone(), kinds[pi], raw));
@@ -1729,7 +1731,8 @@ fn then_operand(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, name: &Ident, spa
     let pc_ty = info.state[info.pc_idx].1.clone();
     let raw = cx.temp(raw_ty(signed));
     cx.locals[raw as usize].name = format!("then.{}.raw", name.name);
-    cx.locals[raw as usize].field = true;
+    let fd = FieldDecode { off, shift, bits, signed };
+    cx.locals[raw as usize].field = Some(fd);
     let pc2 = cx.temp(pc_ty.clone());
     cx.locals[pc2 as usize].name = "then.pc".into();
     let n = mk(Ty::i64(), TK::Int(off as i128), span);
@@ -1739,7 +1742,7 @@ fn then_operand(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, name: &Ident, spa
     let r = c.expr(cx, &body, None);
     cx.scopes.pop();
     let v = r?;
-    let lets = vec![TStmt::Let(raw, Some(decode(word, off, bits, shift, signed, span))), TStmt::Let(pc2, Some(pc_init))];
+    let lets = vec![TStmt::Let(raw, Some(decode(word, fd, span))), TStmt::Let(pc2, Some(pc_init))];
     Ok(mk(v.ty.clone(), TK::Block(lets, Some(Box::new(v))), span))
 }
 

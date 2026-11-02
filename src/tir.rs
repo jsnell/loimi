@@ -95,8 +95,19 @@ pub struct LocalDef {
     pub ty: Ty,
     pub mutable: bool,
     /// An operand field the vm checker decodes from a code word (a
-    /// handler's `x.raw`, a `then` operand's): a stencil makes it a hole.
-    pub field: bool,
+    /// handler's `x.raw`, a `then` operand's), and how: a stencil makes
+    /// it a hole, and cold code decodes it again.
+    pub field: Option<FieldDecode>,
+}
+
+/// Where an operand field lies: in the code word at `pc + off` (`off`
+/// within a superinstruction's part), `bits` wide at bit `shift`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldDecode {
+    pub off: u32,
+    pub shift: u32,
+    pub bits: u32,
+    pub signed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

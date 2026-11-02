@@ -85,7 +85,7 @@ impl FnCx {
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
         let id = self.locals.len() as LocalId;
-        self.locals.push(LocalDef { name: name.to_string(), ty, mutable, field: false });
+        self.locals.push(LocalDef { name: name.to_string(), ty, mutable, field: None });
         self.scopes.last_mut().unwrap().push((name.to_string(), id));
         id
     }
@@ -109,7 +109,7 @@ impl FnCx {
     /// A local not visible by name.
     pub fn temp(&mut self, ty: Ty) -> LocalId {
         let id = self.locals.len() as LocalId;
-        self.locals.push(LocalDef { name: format!("tmp{}", id), ty, mutable: true, field: false });
+        self.locals.push(LocalDef { name: format!("tmp{}", id), ty, mutable: true, field: None });
         id
     }
     pub fn lookup(&self, name: &str) -> Option<LocalId> {

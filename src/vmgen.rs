@@ -710,7 +710,7 @@ fn outline(g: &mut FnGen, b: &TExpr) {
         used.into_iter().filter(|l| !declared.contains(l) && !f.vm_state.contains(l)).collect();
     // Operand fields are decoded again from the instruction word, which
     // the cold function receives in its register: nothing to store.
-    let decoded = decode_lets(f.body.as_ref().unwrap());
+    let decoded = decode_lets(f.body.as_ref().unwrap(), &f.locals);
     let (redo, captured): (Vec<LocalId>, Vec<LocalId>) = captured.into_iter().partition(|l| decoded.iter().any(|(d, _)| d == l));
     let mut body = b.clone();
     if !redo.is_empty() {
@@ -808,27 +808,20 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
 /// The handler's operand-field decodes: `let raw = <bits of word 0>;` at
 /// the top of its body, or of each part of a superinstruction (decoded
 /// from the part's own word, which is the current word in that part).
-fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
-    fn pure(e: &TExpr) -> bool {
-        match &e.kind {
-            TK::Int(_) | TK::Vm(TVm::Word(0)) => true,
-            TK::Binary(_, a, b) => pure(a) && pure(b),
-            TK::Cast(a) => pure(a),
-            _ => false,
-        }
-    }
+/// (Forwarded operands are copies, not decodes: see `LocalDef::field`.)
+fn decode_lets(body: &TExpr, locals: &[LocalDef]) -> Vec<(LocalId, TExpr)> {
     let TK::Block(stmts, tail) = &body.kind else { return vec![] };
     let mut out = Vec::new();
     for s in stmts {
         match s {
-            TStmt::Let(l, Some(e)) if pure(e) => out.push((*l, e.clone())),
-            TStmt::Expr(TExpr { kind: TK::Vm(TVm::Part(_, b)), .. }) => out.extend(decode_lets(b)),
+            TStmt::Let(l, Some(e)) if locals[*l as usize].field.is_some_and(|d| d.off == 0) => out.push((*l, e.clone())),
+            TStmt::Expr(TExpr { kind: TK::Vm(TVm::Part(_, b)), .. }) => out.extend(decode_lets(b, locals)),
             _ => {}
         }
     }
     if let Some(t) = tail {
         if let TK::Vm(TVm::Part(_, b)) = &t.kind {
-            out.extend(decode_lets(b));
+            out.extend(decode_lets(b, locals));
         }
     }
     out

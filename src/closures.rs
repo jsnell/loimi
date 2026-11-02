@@ -223,7 +223,7 @@ impl<'a> Checker<'a> {
             if gc {
                 // The environment object, rooted while the body runs.
                 let id = cx.locals.len() as LocalId;
-                cx.locals.push(LocalDef { name: "closure env".into(), ty: Ty::Gc(Box::new(cty.clone())), mutable: false, field: false });
+                cx.locals.push(LocalDef { name: "closure env".into(), ty: Ty::Gc(Box::new(cty.clone())), mutable: false, field: None });
                 def.locals = cx.locals.clone();
                 def.env_root = Some(id);
             }
