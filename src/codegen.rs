@@ -461,8 +461,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             None => f.body.as_ref().unwrap(),
         };
         let v = self.val(body);
+        let through_slot = crate::vmgen::returns_through_slot(p, f);
         if !self.terminated {
-            if f.ret.is_unitlike() {
+            if f.ret.is_unitlike() || through_slot {
                 self.term("ret void");
             } else {
                 let rt = self.ty(&f.ret);
@@ -500,7 +501,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             "define {}{}{} @\"{}\"({}) {} {{",
             linkage,
             cc_str(f.cc),
-            ret_llty(p, &f.ret),
+            if through_slot { "void".to_string() } else { ret_llty(p, &f.ret) },
             symbol,
             params.join(", "),
             attrs.join(" ")

@@ -54,11 +54,14 @@ sampling profiler attributes time per op. `loimi build --emit-llvm -o
 pip.ll` writes the LLVM IR, where a handler looks like this:
 
 ```text
-define internal preserve_nonecc { i1, {}, { ptr, i64 } } @"vm.Pip.op.ADDK"(ptr %p0, ptr %p1, ptr %p2, ptr %p3, ptr %p4, i32 %insn)
+define internal preserve_nonecc void @"vm.Pip.op.ADDK"(ptr %p0, ptr %p1, ptr %p2, ptr %p3, ptr %p4, i32 %insn)
 ```
 
 The parameters are the context, the four state variables and the
-instruction word; the return type is the entry's. Things to look for in
+instruction word. The entry's result, a `Result<(), str>`, does not
+come back in registers: `exit` stores it to a thread-local slot that
+the entry reads, so handlers return `void` (an entry returning a
+scalar such as an `i64` returns it directly). Things to look for in
 a hot handler's assembly:
 
 - **no stack frame** (`push`, `sub $..., %rsp`): a plain call on any

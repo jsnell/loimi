@@ -258,7 +258,7 @@ Notes:
 | `jump t` | same, with `pc' = t` |
 | `redo` | same, with `pc' = pc` |
 | `become X` | `store i8 X, ptr %pc` (opcode is in the low byte, little-endian; big-endian targets adjust the offset). Would become `store atomic ... monotonic` under `#[threads(shared_code)]` (not yet implemented) |
-| `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function |
+| `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function. *As implemented:* a result that is a scalar (an integer, pointer, float or non-boxed value) is returned in registers, and handlers return the entry's type; any aggregate result (a `Result`, struct, tuple, option of a non-pointer) is stored to a thread-local `Vm.ret_slot` and handlers return `void`, since a `musttail` call cannot return through a hidden `sret` pointer. The entry loads the slot after its call returns |
 | `raise e` | `store e` to `ctx.pending`, `musttail call @Mini.on_raise` |
 
 **Inline cache fields** are places at `pc + 1 + offset` words. A field

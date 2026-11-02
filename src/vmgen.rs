@@ -47,6 +47,38 @@ pub fn extra_param(p: &Program, f: &FnDef) -> Option<String> {
     }
 }
 
+/// Whether a tail-call vm returns its entries' result through a
+/// thread-local slot instead of in registers. Handlers return the entry's
+/// type, and LLVM can only compile `musttail` calls whose result is
+/// returned in registers: an aggregate that does not fit is returned
+/// through a hidden pointer (sret), and the tail call then fails in the
+/// backend. So every aggregate result travels through
+/// `@"Vm.ret_slot"`: `exit v` stores it and returns void, and the entry,
+/// which made the first, ordinary call, loads it. The store happens just
+/// before the chain of tail calls returns to that entry, so nested runs
+/// (an entry called from a handler) cannot clobber it.
+pub fn indirect_ret(p: &Program, vd: &VmDef) -> bool {
+    if vd.dispatch != Dispatch::TailCall || vd.ret.is_unitlike() {
+        return false;
+    }
+    matches!(llty(p, &vd.ret).as_bytes()[0], b'{' | b'[' | b'%')
+}
+
+/// The LLVM return type of a tail-call vm's handlers.
+pub fn handler_ret_llty(p: &Program, vd: &VmDef) -> String {
+    if indirect_ret(p, vd) { "void".into() } else { ret_llty(p, &vd.ret) }
+}
+
+/// Whether function `f` is a tail-call handler that returns void because
+/// its vm's result goes through the return slot.
+pub fn returns_through_slot(p: &Program, f: &FnDef) -> bool {
+    takes_insn(p, f) && indirect_ret(p, &p.vms[f.vm.unwrap() as usize])
+}
+
+fn ret_slot(vd: &VmDef) -> String {
+    format!("@\"{}.ret_slot\"", vd.symbol)
+}
+
 pub fn table_name(vd: &VmDef) -> String {
     format!("@\"{}.table\"", vd.symbol)
 }
@@ -280,7 +312,15 @@ fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
     let args = format!("{}, i{} {}", state_args(g, vd), vd.word.bits, insn);
     let rt = ret_llty(g.p(), &vd.ret);
     let kind = if hg.role == VmRole::Entry { "" } else { "musttail " };
-    if rt == "void" {
+    if indirect_ret(g.p(), vd) {
+        g.emit(format!("{}call preserve_nonecc void {}({})", kind, callee, args));
+        if hg.role == VmRole::Entry {
+            let v = g.inst(format!("load {}, ptr {}", rt, ret_slot(vd)));
+            g.term(format!("ret {} {}", rt, v));
+        } else {
+            g.term("ret void");
+        }
+    } else if rt == "void" {
         g.emit(format!("{}call preserve_nonecc void {}({})", kind, callee, args));
         g.term("ret void");
     } else {
@@ -364,7 +404,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         TVm::Exit(x) => {
             let v = g.val(x);
             let rt = ret_llty(g.p(), &x.ty);
-            if rt == "void" {
+            let p = g.p();
+            if returns_through_slot(p, g.f()) {
+                let vd = &p.vms[g.f().vm.unwrap() as usize];
+                g.emit(format!("store {} {}, ptr {}", rt, v, ret_slot(vd)));
+                g.term("ret void");
+            } else if rt == "void" {
                 g.term("ret void");
             } else {
                 g.term(format!("ret {} {}", rt, v));
@@ -798,10 +843,13 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
             let _ = writeln!(
                 fns,
                 "define internal preserve_nonecc {} {}({}) noreturn nounwind {{\n  call void @llvm.trap()\n  unreachable\n}}\n",
-                ret_llty(p, &vd.ret),
+                handler_ret_llty(p, vd),
                 inv,
                 params.join(", ")
             );
+            if indirect_ret(p, vd) {
+                let _ = writeln!(globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", ret_slot(vd), llty(p, &vd.ret));
+            }
             if let Some(rt) = &vd.raise_ty {
                 let _ = writeln!(globals, "@\"{}.raise_slot\" = internal thread_local(initialexec) global {} zeroinitializer", vd.symbol, llty(p, rt));
             }
