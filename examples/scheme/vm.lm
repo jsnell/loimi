@@ -99,7 +99,7 @@ pub vm Scheme {
     // them there, with the Proto itself as `proto`.
     verify_context owner proto: Gc<Proto>;
     operand reg = regs[it] verify (it as u32) < proto.nregs;
-    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    operand kst = k[it] const proto.consts.data.ptr verify (it as u64) < proto.consts.data.len;
     operand imm = it;
     operand simm = it;
     /// A global slot (allocated by the compiler, so always in range).
