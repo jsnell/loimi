@@ -484,7 +484,7 @@ impl<'a> Checker<'a> {
                 if nrecv != 0 {
                     return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
                 }
-                let rty = self.resolve_type_name(m, &recv)?;
+                let rty = self.method_recv_ty(m, &recv)?;
                 let key = (rty, mname.name.clone());
                 if self.methods.contains_key(&key) || self.generics.ty_methods.insert(key, g as u32).is_some() {
                     return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
@@ -583,7 +583,7 @@ impl<'a> Checker<'a> {
         let prefix = self.module_prefix(m);
         let mut name = f.name.name.clone();
         if let (Some(recv), true) = (&f.recv, f.generics.is_empty()) {
-            let rty = self.resolve_type_name(m, recv)?;
+            let rty = self.method_recv_ty(m, recv)?;
             name = format!("{}.{}", recv.name, f.name.name);
             let key = (rty, f.name.name.clone());
             if self.methods.contains_key(&key) {
@@ -782,6 +782,26 @@ impl<'a> Checker<'a> {
             self.aliases[a as usize].ty = Some(t.clone());
         }
         Ok(t)
+    }
+
+    /// The type a method `fn Recv.name` is defined on. Method calls look
+    /// through pointers and `Gc` to the type behind them, so a method on
+    /// an alias of a pointer type could never be called.
+    fn method_recv_ty(&self, m: usize, recv: &Ident) -> Res<Ty> {
+        let rty = self.resolve_type_name(m, recv)?;
+        if let Ty::Ptr(inner) | Ty::Gc(inner) = &rty {
+            return Err(Diag::new(
+                recv.span,
+                format!(
+                    "`{}` is `{}`: methods are found on the type behind a pointer; define the method on `{}` and take `{}` as the receiver",
+                    recv.name,
+                    self.ty_name(&rty),
+                    self.ty_name(inner),
+                    self.ty_name(&rty)
+                ),
+            ));
+        }
+        Ok(rty)
     }
 
     pub fn resolve_type_name(&self, m: usize, id: &Ident) -> Res<Ty> {

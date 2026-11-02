@@ -1,0 +1,8 @@
+// A method on an alias of a pointer type was accepted but could never be
+// called: method calls look through pointers (`p.get()` said "no method
+// `get` on type `*S`").
+// error: `SP` is `*S`: methods are found on the type behind a pointer
+struct S { x: i64 }
+type SP = *S;
+fn SP.get(p: SP) -> i64 { p.x }
+fn main() -> i32 { var s = S { x: 8 }; let p: SP = &s; p.get() as i32 }
