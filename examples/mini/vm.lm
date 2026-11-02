@@ -435,13 +435,13 @@ pub vm Mini {
     // first time a site sees two floats it becomes the _F member, which
     // tests (Num, Num) first. Both members handle every type, so a site
     // never switches back.
-    inline for (name, fname, checked, sym, code, bkind) in [
-        ("ADD", "ADD_F", "add_checked", +, 0, reg),
-        ("SUB", "SUB_F", "sub_checked", -, 1, reg),
-        ("MUL", "MUL_F", "mul_checked", *, 2, reg),
-        ("ADDK", "ADDK_F", "add_checked", +, 0, kst),
-        ("SUBK", "SUBK_F", "sub_checked", -, 1, kst),
-        ("MULK", "MULK_F", "mul_checked", *, 2, kst),
+    inline for (name, fname, checked, sym, code, bkind, bbase) in [
+        ("ADD", "ADD_F", "add_checked", +, 0, reg, regs),
+        ("SUB", "SUB_F", "sub_checked", -, 1, reg, regs),
+        ("MUL", "MUL_F", "mul_checked", *, 2, reg, regs),
+        ("ADDK", "ADDK_F", "add_checked", +, 0, kst, k),
+        ("SUBK", "SUBK_F", "sub_checked", -, 1, kst, k),
+        ("MULK", "MULK_F", "mul_checked", *, 2, kst, k),
     ] {
         family #name(dst: reg, a: reg, b: bkind) : ABC {
             generic {
@@ -463,7 +463,7 @@ pub vm Mini {
             #fname {
                 // Two floats: a tagged word is a NaN as a double, so a
                 // non-NaN result means both operands were numbers.
-                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
+                let r = unsafe { *((regs + a.raw) as *f64) } sym unsafe { *((bbase + b.raw) as *f64) };
                 if likely(r == r) { dst = r.to_bits() as V; next }
                 match (a, b) {
                     (Num(x), Num(y)) => { dst = Num(x sym y); next }
@@ -481,8 +481,10 @@ pub vm Mini {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
     }
-    inline for (dname, mname, bkind) in [("DIV", "MOD", reg), ("DIVK", "MODK", kst)] {
+    inline for (dname, mname, bkind, bbase) in [("DIV", "MOD", reg, regs), ("DIVK", "MODK", kst, k)] {
         op #dname(dst: reg, a: reg, b: bkind) : ABC {
+            let r = unsafe { *((regs + a.raw) as *f64) } / unsafe { *((bbase + b.raw) as *f64) };
+            if likely(r == r) { dst = r.to_bits() as V; next }
             match (a, b) {
                 (Num(x), Num(y)) => { dst = Num(x / y); next }
                 (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
