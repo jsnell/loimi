@@ -12,7 +12,6 @@ import pike;
 import pike.{Pike};
 import vm.{Rx, Regex, Limits, Bt, Lit};
 
-extern "C" fn memchr(s: *u8, c: i32, n: u64) -> ?*u8;
 
 /// Flags for rx_exec.
 pub enum RxFlag: u32 { Search = 1, Pike = 2 }
@@ -93,16 +92,13 @@ export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
     for i in 0..tree.classes.len { r.classes[i] = tree.classes.at(i); }
     mem.release(r.lits);
     r.lits = out.lits.ptr;
-    // Vec.new() allocates, so the placeholders must be freed first.
-    r.lit_bytes.free();
+    // The placeholders are empty Vecs, which own no memory.
     r.lit_bytes = out.lit_bytes;
     mem.release(r.slots);
     mem.release(r.marks);
     r.slots = mem.alloc((nslots + out.nmarks) as u64);
     r.marks = r.slots + nslots as u64;
-    r.words.free();
     r.words = out.words;
-    r.pike_words.free();
     r.pike_words = pout.words;
 
     var f = Set.empty();
@@ -166,7 +162,7 @@ export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spa
         // As PCRE does: no match can succeed without this byte. (Only
         // from position 0, so that a loop over the matches of a buffer
         // does not scan its rest each time.)
-        if memchr(buf + start, b as i32, len - start).is_none() { return 0; }
+        if mem.find_byte((buf + start).slice(len - start), b).is_none() { return 0; }
     }
     let nslots = 2 * (r.ngroups as u64 + 1);
     for i in 0..nslots { r.slots[i] = -1; }

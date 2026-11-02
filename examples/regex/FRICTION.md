@@ -10,6 +10,20 @@ captures included: about 30,000 random patterns × subjects across seeds,
 plus 80 hand-written cases. That held in all three dispatch modes, under
 ASan, with a bytecode fuzzer and with a byte-pattern fuzzer. See SPEC.md.
 
+## Language and std follow-up
+
+This report is kept as written. Since then, for the language and std
+items:
+
+| # | Status |
+|---|---|
+| 5 | Fixed: generated `Vm.Op` (one variant per op, no supers, a family as its generic op; discriminant = opcode) and `Vm.op_of(w) -> Vm.Op` (`language.md` §3.3). `pike.lm` now dispatches with two exhaustive `match`es, so a new op is a compile error there. |
+| 6 | Fixed: `~x` is bitwise not on integers (an error on `bool`, pointing at `!`); `!x` on integers still works, and both are documented. language.md §1.2 has an operator table with precedence. `++`, `--`, `**`, `?:`, `===` and unary `+` get a hint saying what to write. |
+| 7 | Fixed: in vm code `jump (expr)`, `exit (..)`, `raise (..)`, `fail (..)` take a parenthesized operand; `next (`/`redo (` are errors saying they take none; outside vm code the unknown-name error says it is a control word. |
+| 8 | Fixed: an empty `Vec` (`Vec.new()`, `with_capacity(0)`, after `free()`) allocates nothing; `mem.release`/`mem.grow` accept its sentinel pointer. stdlib.md documents the pattern for optional resources (`Vec` or `?*T`, never `alloc(1)` dummies). `lib.lm` no longer frees its placeholder vectors. |
+| 10 | Fixed: `a ?? b` with `b: ?T` is `?T` (`b` still evaluated only on None; chains). No `or`/`or_else` methods: `??` is the lazy form. |
+| 11 | `var r = Ok(..)`: still needs an annotation (inference stays local), but the error now says how to write it. `in` stays reserved (`for x in`); the error says it is a reserved word and suggests `in_`. Added `mem.find_byte`/`rfind_byte`/`find_bytes`/`compare_bytes`/`equal_bytes` (libc `memchr`/`memrchr`/`memmem`/`memcmp`) and `HashMap.clear()`; `text.find` uses `memchr`. `lib.lm` uses `mem.find_byte` instead of its own `extern memchr`. |
+
 ## Summary: top items
 
 | # | Item | Area | Fix kind |
