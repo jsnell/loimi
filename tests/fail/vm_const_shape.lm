@@ -1,0 +1,13 @@
+// A const operand kind must read `S[it]` from a pointer state register.
+// error: a `const` operand kind reads `S[it]` for a pointer state register `S`
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand kst = it const 0 as *i64;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op LOADK(dst: reg, c: kst) : AB { dst = c as i64; next }
+    op RET(src: reg) : AB { exit src }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {}

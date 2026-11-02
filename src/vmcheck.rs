@@ -14,6 +14,9 @@ pub struct OperandKind {
     pub name: String,
     pub body: Expr,
     pub verify: Option<Expr>,
+    /// A `const` kind: the state register its body indexes (`k` in
+    /// `k[it]`), which vm code must not write through.
+    pub konst: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -266,6 +269,74 @@ fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayou
     }
 }
 
+/// The state register a `const` operand kind's body `S[it]` indexes.
+fn const_base(body: &Expr, state: &[(String, Ty)]) -> Option<usize> {
+    let ExprKind::Index(b, ix) = &body.kind else { return None };
+    let (ExprKind::Ident(s), ExprKind::Ident(it)) = (&b.kind, &ix.kind) else { return None };
+    if it != "it" {
+        return None;
+    }
+    let i = state.iter().position(|(n, _)| n == s)?;
+    matches!(state[i].1, Ty::Ptr(_)).then_some(i)
+}
+
+/// What a `const` operand reads must not change once the code is
+/// verified: no vm code (handlers, vm functions, cold blocks, `on raise`)
+/// may write through the pool's state register, by assignment (`k[i] =`,
+/// `*(k + i) =`, the operand itself) or by taking an address in it
+/// (`&k[i]`). Plain functions the vm calls, and the host, are trusted not
+/// to change the pool of verified code (as with `verify` clauses).
+fn check_const_writes(c: &Checker, vi: usize) -> Res<()> {
+    let info = &c.vms[vi];
+    let Some((kname, si)) = info.kinds.iter().find_map(|k| k.konst.map(|s| (k.name.clone(), s))) else { return Ok(()) };
+    let sname = &info.state[si].0;
+    // Whether pointer expression `e` is computed from state local `l`.
+    fn from(e: &TExpr, l: LocalId) -> bool {
+        match &e.kind {
+            TK::Local(x) => *x == l,
+            TK::Deref(p) => matches!(p.kind, TK::Local(x) if x == l),
+            TK::Cast(a) | TK::Unary(_, a) => from(a, l),
+            TK::Binary(_, a, b) => from(a, l) || from(b, l),
+            TK::Intrinsic(Intr::PtrOffset, a) => from(&a[0], l),
+            TK::Block(_, Some(t)) => from(t, l),
+            _ => false,
+        }
+    }
+    // Whether place `e` is memory reached through `l`.
+    fn through(e: &TExpr, l: LocalId) -> bool {
+        match &e.kind {
+            TK::Index(b, _) => matches!(b.ty, Ty::Ptr(_)) && from(b, l) || through(b, l),
+            TK::Deref(p) => !matches!(p.kind, TK::Local(_)) && from(p, l),
+            TK::Field(b, _) => through(b, l),
+            _ => false,
+        }
+    }
+    for f in c.prog.fns.iter() {
+        if f.vm != Some(vi as u32) {
+            continue;
+        }
+        let (Some(body), Some(&l)) = (&f.body, f.vm_state.get(si)) else { continue };
+        let mut bad = None;
+        crate::tirwalk::for_each_expr(body, &mut |e| {
+            if bad.is_some() {
+                return;
+            }
+            match &e.kind {
+                TK::Assign(lhs, _) if through(lhs, l) => bad = Some((e.span, "assignment writes through")),
+                TK::AddrOf(p) if through(p, l) => bad = Some((e.span, "takes an address through")),
+                _ => {}
+            }
+        });
+        if let Some((span, what)) = bad {
+            return Err(Diag::new(
+                span,
+                format!("this {} `{}`, the constant pool of `const` operand kind `{}`: what a const operand reads cannot change after verification", what, sname, kname),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
@@ -331,11 +402,24 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         l.cache_words[ci] = off;
         caches.push(CacheInfo { name: cd.name.name.clone(), fields });
     }
-    let kinds: Vec<OperandKind> = d
-        .operands
-        .iter()
-        .map(|o| OperandKind { name: o.name.name.clone(), body: o.body.clone(), verify: o.verify.clone() })
-        .collect();
+    let mut kinds: Vec<OperandKind> = Vec::new();
+    for o in &d.operands {
+        let konst = match &o.konst {
+            None => None,
+            Some(_) => Some(const_base(&o.body, &state).ok_or_else(|| {
+                Diag::new(
+                    o.body.span,
+                    format!("a `const` operand kind reads `S[it]` for a pointer state register `S` (operand `{}`)", o.name.name),
+                )
+            })?),
+        };
+        kinds.push(OperandKind { name: o.name.name.clone(), body: o.body.clone(), verify: o.verify.clone(), konst });
+    }
+    // One constant pool per vm (the JIT is given one per code object).
+    if let Some((a, b)) = kinds.iter().filter_map(|k| k.konst.map(|s| (k, s))).collect::<Vec<_>>().windows(2).find(|w| w[0].1 != w[1].1).map(|w| (w[0].0.name.clone(), w[1].0.name.clone())) {
+        let o = d.operands.iter().find(|o| o.name.name == b).unwrap();
+        return Err(Diag::new(o.body.span, format!("`const` operand kinds `{}` and `{}` read different state registers; a vm has at most one constant pool", a, b)));
+    }
     let dispatch = match c.dispatch_override {
         Some(x) => x,
         None => match d.attrs.get("dispatch").and_then(|a| a.first()).map(|s| s.as_str()) {
@@ -547,8 +631,10 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 size: o.size,
                 parts: o.parts.iter().map(|&p| p as u32).collect(),
                 then: o.then.is_some(),
+                consts: o.kinds.iter().zip(&o.fields).filter(|(k, _)| kinds[**k].konst.is_some()).map(|(_, f)| (f.1, f.0)).collect(),
             })
             .collect(),
+        const_base: kinds.iter().find_map(|k| k.konst),
         entries: entries.iter().map(|(f, _)| *f).collect(),
         on_raise: raise_fid,
         raise_ty: raise_ty.clone(),
@@ -611,6 +697,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     if let (Some(fid), Some(r)) = (raise_fid, &d.on_raise) {
         check_raise(c, vm, fid, r)?;
     }
+    check_const_writes(c, i)?;
     // Instrumentation variants: a wrapper per wrapped op.
     for (vi, var) in d.variants.iter().enumerate() {
         if var.name.name == "default" || d.variants[..vi].iter().any(|x| x.name.name == var.name.name) {

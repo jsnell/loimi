@@ -1,0 +1,16 @@
+// The `const` clause gives the pool's address from the verify context,
+// with the type of the state register the kind indexes.
+// error: expected `*i64`, found `*i32`
+struct Proto { consts: *i32 }
+vm M {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    verify_context proto: *Proto;
+    operand reg = regs[it];
+    operand kst = k[it] const proto.consts;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op LOADK(dst: reg, c: kst) : AB { dst = c; next }
+    op RET(src: reg) : AB { exit src }
+    entry run(code: *u32, r: *i64, k0: *i64) -> i64 { pc = code; regs = r; k = k0; jump pc }
+}
+
+fn main() {}

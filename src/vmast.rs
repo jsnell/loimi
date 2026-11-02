@@ -7,6 +7,11 @@ pub struct OperandDecl {
     pub name: Ident,
     pub body: Expr,
     pub verify: Option<Expr>,
+    /// `const EXPR`: the operand reads `S[it]` for a state register `S`
+    /// whose value, while code verified against a context runs, is EXPR
+    /// of that context (a constant pool), and what it reads never changes
+    /// after verification.
+    pub konst: Option<Expr>,
     /// `display "r{}"`: how the generated disassembler prints the operand
     /// (`{}` is the decoded field, or a label's absolute target).
     pub display: Option<String>,

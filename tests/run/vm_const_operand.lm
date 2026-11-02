@@ -1,0 +1,44 @@
+// `const` operand kinds: `k[it]` reads a constant pool that cannot change
+// after verification (the copy-and-patch JIT patches the constants into
+// compiled code). The interpreter reads them as before.
+import std.io;
+
+struct Proto { nregs: u32, consts: *i64, nconsts: u64 }
+
+vm V {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] const proto.consts verify it < proto.nconsts;
+
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op LOADK(dst: reg, c: kst) : ABC { dst = c; next }
+    op ADDK(dst: reg, a: reg, c: kst) : ABC { dst = a + c; next }
+    // A raw read through the pool at a const operand's index.
+    op MULK(dst: reg, a: reg, c: kst) : ABC { dst = a * unsafe { *(k + c.raw) }; next }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(code: *u32, r: *i64, consts: *i64) -> i64 { pc = code; regs = r; k = consts; jump pc }
+}
+
+fn main() {
+    var ks: [i64; 3] = [5, 7, 3];
+    var p = Proto { nregs: 2, consts: &ks[0], nconsts: 3 };
+    var code: [u32; 4] = [V.LOADK(0, 0), V.ADDK(1, 0, 1), V.MULK(1, 1, 2), V.RET(1)];
+    match V.verify(code[..], &p) {
+        Ok(_) => io.println("ok"),
+        Err(_) => io.println("bad"),
+    }
+    var bad: [u32; 2] = [V.LOADK(0, 3), V.RET(0)];
+    match V.verify(bad[..], &p) {
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.println(""); }
+    }
+    var regs: [i64; 2] = [0; 2];
+    io.print_int(V.run(&code[0], &regs[0], &ks[0])); io.println("");
+}
+// expect: ok
+// expect: bad at 0
+// expect: 36

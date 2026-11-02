@@ -1,0 +1,15 @@
+// A const operand cannot be assigned: what it reads must not change after
+// verification.
+// error: assignment writes through `k`, the constant pool of `const` operand kind `kst`
+vm M {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    verify_context nk: u64;
+    operand reg = regs[it];
+    operand kst = k[it] const 0 as *i64 verify it < nk;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op SETK(src: reg, c: kst) : AB { c = src; next }
+    op RET(src: reg) : AB { exit src }
+    entry run(code: *u32, r: *i64, k0: *i64) -> i64 { pc = code; regs = r; k = k0; jump pc }
+}
+
+fn main() {}

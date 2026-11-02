@@ -85,9 +85,12 @@ impl Parser {
                     let body = self.parse_expr()?;
                     let mut verify = None;
                     let mut display = None;
+                    let mut konst = None;
                     loop {
                         if verify.is_none() && self.eat_kw("verify") {
                             verify = Some(self.parse_expr()?);
+                        } else if konst.is_none() && self.eat_kw("const") {
+                            konst = Some(self.parse_expr()?);
                         } else if display.is_none() && self.eat_kw("display") {
                             let t = self.bump();
                             let Tok::Str(s) = t.tok else {
@@ -103,7 +106,7 @@ impl Parser {
                         }
                     }
                     self.expect(";")?;
-                    vm.operands.push(OperandDecl { name: n, body, verify, display });
+                    vm.operands.push(OperandDecl { name: n, body, verify, konst, display });
                 }
                 "encoding" => {
                     self.bump();

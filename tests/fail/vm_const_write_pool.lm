@@ -1,0 +1,17 @@
+// No vm code may write through a constant pool's register, by index or
+// through pointer arithmetic, even outside an operand.
+// error: assignment writes through `k`, the constant pool of `const` operand kind `kst`
+vm M {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    verify_context nk: u64;
+    operand reg = regs[it];
+    operand kst = k[it] const 0 as *i64 verify it < nk;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op LOADK(dst: reg, c: kst) : AB { dst = c; next }
+    op CLOBBER(src: reg) : AB { bump(src); next }
+    fn bump(v: i64) { unsafe { *(k + 1) = v; } }
+    op RET(src: reg) : AB { exit src }
+    entry run(code: *u32, r: *i64, k0: *i64) -> i64 { pc = code; regs = r; k = k0; jump pc }
+}
+
+fn main() {}

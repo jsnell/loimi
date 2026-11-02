@@ -412,6 +412,8 @@ pub struct VmOp {
     pub parts: Vec<u32>,
     /// Declared `then OP`: the word after it is read as part of it.
     pub then: bool,
+    /// Its fields of `const` operand kinds: (shift, bits).
+    pub consts: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -435,6 +437,8 @@ pub struct VmDef {
     pub variants: Vec<(String, Vec<(u32, FnId)>)>,
     /// State index of the hidden dispatch-table register (vms with variants).
     pub tbl_idx: Option<usize>,
+    /// The state register `const` operand kinds index (the constant pool).
+    pub const_base: Option<usize>,
 }
 
 /// A module-level `var`. `init` is a constant expression.
