@@ -1335,7 +1335,7 @@ fn count_this_props(n: *Node) -> u32 {
 fn ctor_hint(f: *Func) -> u32 {
     var c: u32 = 0;
     for i in 0..f.body.len { c += count_this_props(f.body.at(i)); }
-    if c < 4 and !f.derived { c = 4; }
+    if c == 0 and !f.derived { c = 4; }
     if c > 32 { c = 32; }
     c
 }
