@@ -1,9 +1,9 @@
 // The Mini virtual machine: a register machine in the style of Lua 5.
 
 import std.gc;
-import std.io;
 import std.text;
 import value;
+import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
 
 extern "C" fn pow(a: f64, b: f64) -> f64;
@@ -180,24 +180,9 @@ fn length(c: *Ctx, v: V) -> Result<V, V> {
     }
 }
 
-/// Built-in functions (until lib.lm exists): 0 is print.
-fn native(h: *gc.Heap, id: i32, args: *V, n: u64) -> Result<V, V> {
-    var b = text.StrBuf.new();
-    for i in 0..n {
-        if i > 0 { b.push('\t'); }
-        value.write_value(&b, args[i]);
-    }
-    b.push('\n');
-    io.print(b.as_str());
-    b.free();
-    let _ = h;
-    let _ = id;
-    Ok(V.Nil)
-}
-
 /// The single dispatch point for natives. Natives allocate but never collect.
 fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
-    native(&c.heap, id, args, n)
+    lib.call(&c.heap, id, args, n)
 }
 
 pub vm Mini {
