@@ -5,11 +5,12 @@ compiler can emit wrong code, a handler can mishandle a rare type
 combination, the GC can miss a root that matters once in a million
 allocations, and a verifier can accept code that walks off the end of
 the register file. This chapter collects the testing this tutorial has
-used, and adds the piece that finds memory-safety bugs: a bytecode
-fuzzer.
+used, adds unit tests in Loimi (`std.test`), and adds the piece that
+finds memory-safety bugs: a bytecode fuzzer.
 
 Code: [`examples/tutorial/step9/`](../../examples/tutorial/step9): the
-interpreter from step 8 with a step-budget variant, and `fuzz.lm`.
+interpreter from step 8 with a step-budget variant, `fuzz.lm`, and the
+unit tests in `unit_test.lm`.
 
 ## Conformance tests and the test matrix
 
@@ -42,6 +43,76 @@ For a language with an existing implementation, the expected output
 should come from that implementation, not from yours. Mini's
 conformance tests are Lua programs whose `.expected` files are PUC-Lua's
 output; MiniJS's are node's.
+
+## Unit tests
+
+Conformance tests see the interpreter from outside. For its parts (the
+lexer, the compiler's output, a helper with an edge case) `std.test`
+runs Loimi functions marked `#[test]`. Step 9's are in `unit_test.lm`:
+
+```loimi
+#[test]
+fn lexes_two_char_operators() {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    var lx = lexer.Lexer.new("a <= b != 1.5;", 0, &arena);
+    let kinds = [T.Name, T.Le, T.Name, T.NotEq, T.Float, T.Semi, T.Eof];
+    for i in 0..kinds.len {
+        let t = test.ok(lx.next());
+        test.assert(t.kind == kinds[i]);
+        if t.kind == T.Float { test.eq(t.float, 1.5); }
+    }
+    lx.free();
+}
+```
+
+```sh
+loimi test examples/tutorial/step9/unit_test.lm          # every test
+loimi test examples/tutorial/step9/unit_test.lm arith    # names containing "arith"
+```
+
+`loimi test` replaces the file's `main` with one that runs each test in
+turn and prints `test NAME ... ok` or `FAILED` with the reason; the exit
+status is 1 if any failed. A failing assertion or any other panic (a
+bounds check, an `unwrap` of None) fails only its own test. Assertions
+(`test.eq(got, want)`, `test.assert`, `test.ok(result)`, `test.some`,
+`test.has(text, part)`) report the line of the test that called them:
+
+```text
+test arithmetic ... FAILED
+    unit_test.lm:79:9: test.eq failed
+        got:  7
+        want: 8
+```
+
+A test that runs the interpreter in-process declares `uses gc`, like
+any function that may collect. The interpreter prints with `io.print`,
+so the test captures stdout to compare it:
+
+```loimi
+    var out = text.StrBuf.new();
+    // `print` writes to stdout: capture it.
+    test.capture_start();
+    let r = Pip.run(&m, prog.main);
+    test.capture_end(&out);
+```
+
+```loimi
+#[test]
+fn arithmetic() uses gc {
+    for i in 0..2 {
+        let stress = i == 1;
+        test.eq(run("print 1 + 2 * 3;", stress), "7\n");
+        test.eq(run("print 2147483647 + 1;", stress), "2147483648.0\n");
+    }
+}
+```
+
+`test.golden(text, path)` compares with a file, and `loimi test
+--update` rewrites the file instead, which suits output that changes on
+purpose, such as the compiler's bytecode: `sum_bytecode` disassembles a
+loop and compares it with `tests/sum.disasm`. `check.sh` runs each
+step's `*_test.lm` in every dispatch mode.
 
 ## A step budget, as a `variant`
 
@@ -239,6 +310,12 @@ someone else to write programs from (Mini's is
 implementation for expected outputs and for comparison. The comparison
 scripts (`bench/mini/compare.py`) then run each benchmark under every
 implementation and dispatch mode, interleaved, best of N.
+Inside one program, `std.prof`'s `Bench` does the same for variants you
+can call as functions (two ways of running a loop, an optimization
+switched on and off): warmup rounds, then interleaved timed rounds, and
+the minimum and median of each. `prof.op_counts("Pip")` reads the
+`--vm-stats` op counts from the program, for example to `reset` them
+after a warmup or to check that a super fired.
 
 ## Where to go from here
 

@@ -1,0 +1,112 @@
+// Unit tests for step 9 (chapter 9), next to the .pip conformance tests:
+//
+//   loimi test examples/tutorial/step9/unit_test.lm [FILTER..] [--update]
+//
+// `examples/tutorial/check.sh` runs them in every dispatch mode.
+
+import std.gc;
+import std.mem;
+import std.test;
+import std.text;
+import lexer;
+import lexer.{T};
+import parser;
+import compile;
+import compile.{Program};
+import value.{Value, Proto};
+import vm;
+import vm.{Pip, Machine, Globals, Frame};
+
+#[test]
+fn lexes_two_char_operators() {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    var lx = lexer.Lexer.new("a <= b != 1.5;", 0, &arena);
+    let kinds = [T.Name, T.Le, T.Name, T.NotEq, T.Float, T.Semi, T.Eof];
+    for i in 0..kinds.len {
+        let t = test.ok(lx.next());
+        test.assert(t.kind == kinds[i]);
+        if t.kind == T.Float { test.eq(t.float, 1.5); }
+    }
+    lx.free();
+}
+
+/// Compile `src`, verify and optimize every function, as main.lm does.
+fn build(src: str, names: *text.Interner, heap: *gc.Heap, arena: *mem.Arena) -> Program {
+    var stmts = test.ok(parser.parse_program(src, 0, arena));
+    var prog = test.ok(compile.compile(&stmts, names, heap));
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        p.code = Pip.optimize(test.ok(Pip.verify(p.words, p, names.names.len as u32)));
+    }
+    prog
+}
+
+/// Run `src` in-process (with GC stress if `stress`): what it printed,
+/// then main.lm's "error: line N: .." if it failed.
+fn run(src: str, stress: bool) -> str uses gc {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    var names = text.Interner.new();
+    var m = Machine {
+        stack: mem.alloc(1 << 16), stack_end: 0 as *Value,
+        frames: mem.alloc(1 << 10), frames_end: 0 as *Frame,
+        out: text.StrBuf.new(), error_line: 0,
+        globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+        heap: gc.Heap.new(), fp: 0 as *Frame, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(), steps: 0,
+    };
+    m.stack_end = m.stack + (1 << 16);
+    m.frames_end = m.frames + (1 << 10);
+    m.fp = m.frames;
+    var prog = build(src, &names, &m.heap, &arena);
+    m.protos = &prog.protos;
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    m.heap.set_stress(stress);
+    var out = text.StrBuf.new();
+    // `print` writes to stdout: capture it.
+    test.capture_start();
+    let r = Pip.run(&m, prog.main);
+    test.capture_end(&out);
+    if let Err(msg) = r { out.fmt2("error: line {}: {}\n", m.error_line, msg); }
+    m.heap.free();
+    out.as_str()
+}
+
+#[test]
+fn arithmetic() uses gc {
+    for i in 0..2 {
+        let stress = i == 1;
+        test.eq(run("print 1 + 2 * 3;", stress), "7\n");
+        test.eq(run("print 2147483647 + 1;", stress), "2147483648.0\n");
+    }
+}
+
+#[test]
+fn errors_name_the_line() uses gc {
+    test.eq(run("let a = 1;\nprint a + nil;", false), "error: line 2: arithmetic on a nil value\n");
+}
+
+#[test]
+fn strings_survive_collections() uses gc {
+    let src = "let s = \"\"; let i = 0; while i < 50 { s = s + \"ab\"; i = i + 1; } print s;";
+    let out = run(src, true);
+    test.eq(out.len, 101);
+}
+
+// The compiler's output for a loop, against tests/sum.disasm: after a
+// change to the compiler, `loimi test unit_test.lm sum --update`
+// rewrites the file, and the diff shows what changed.
+#[test]
+fn sum_bytecode() {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    var names = text.Interner.new();
+    var heap = gc.Heap.new();
+    var prog = build("fn sum(n) { let t = 0; while n > 0 { t = t + n; n = n - 1; } return t; }", &names, &heap, &arena);
+    var out = text.StrBuf.new();
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        if p.name.eq("sum") { Pip.disasm(p.words, &out); }
+    }
+    test.golden(out.as_str(), "tests/sum.disasm");
+}

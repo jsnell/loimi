@@ -1,0 +1,9 @@
+    0  LOADI dst=r1 v=0
+    1  JNGTK a=r0 b=k0
+    2  JMP target -> 6
+    3  ADD dst=r1 a=r1 b=r0
+    4  SUBK dst=r0 a=r0 b=k1
+    5  JMP target -> 1
+    6  RET src=r1
+    7  LOADNIL dst=r2
+    8  RET src=r2

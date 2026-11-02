@@ -13,6 +13,8 @@
 # understands `--gc-stress` run every test a second time with it.
 # Programs run in their step's directory, so paths in messages are short.
 #
+# A step's NAME_test.lm files are unit tests, run with `loimi test` in
+# each dispatch mode.
 # -u rewrites the .expected files from the tailcall build's output.
 # Run by `cargo test` (tests/golden.rs, tutorial_steps).
 
@@ -50,6 +52,16 @@ for step in "${STEPS[@]}"; do
             fi
         done
         [ $built = 1 ] || continue
+        # Unit tests (std.test): NAME_test.lm, run with `loimi test`.
+        for t in "$dir"/*_test.lm; do
+            [ -f "$t" ] || continue
+            COUNT=$((COUNT + 1))
+            if ! (cd "$dir" && ulimit -v 2500000 && "$LOIMI" test -W error --dispatch="$mode" "$(basename "$t")") > "$TMP/unit.log" 2>&1; then
+                echo "FAIL $step/$(basename "$t") ($mode)"
+                cat "$TMP/unit.log"
+                FAIL=1
+            fi
+        done
         for exp in "$dir"/tests/*.expected; do
             name=$(basename "$exp" .expected)
             prog=main
