@@ -661,9 +661,6 @@ fn takes_cont(p: &Program, vd: &VmDef, fid: FnId) -> bool {
 /// path then makes no calls and needs no stack frame.
 fn can_outline(g: &FnGen, b: &TExpr) -> bool {
     let Some(hg) = &g.vm else { return false };
-    if std::env::var_os("LOIMI_NO_OUTLINE").is_some() {
-        return false;
-    }
     if hg.combined || b.ty != Ty::Never {
         return false;
     }
