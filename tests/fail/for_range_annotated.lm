@@ -1,0 +1,4 @@
+fn main() {
+    for i: u8 in 0..300 { }
+}
+// error: literal `300` does not fit in `u8`

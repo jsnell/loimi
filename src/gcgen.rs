@@ -164,7 +164,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
     cg.decls.0.remove("loimi_trace_object");
     let mut g = FnGen::new(cg, 0);
     let objects: Vec<(usize, u32)> =
-        p.structs.iter().enumerate().filter_map(|(i, s)| s.object.map(|t| (i, t))).collect();
+        p.structs.iter().enumerate().filter(|(_, s)| !s.pattern).filter_map(|(i, s)| s.object.map(|t| (i, t))).collect();
     let l_end = g.fresh_label("traced");
     let mut cases = String::new();
     let mut labels = Vec::new();

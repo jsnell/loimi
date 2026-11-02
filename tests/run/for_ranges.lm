@@ -1,0 +1,35 @@
+// The type of a `for` range: from the bound that is not a literal, from
+// an annotation on the variable, or i64.
+import std.io;
+
+enum Kind { A, B, C }
+const N: u64 = 4;
+
+fn takes_u8(x: u8) -> u8 { x }
+fn takes_u64(x: u64) -> u64 { x }
+
+fn main() {
+    let n: u64 = 3;
+    for i in 0..n { io.print_int(takes_u64(i) as i64); }
+    io.println("");
+    let m: u8 = 250;
+    for i in m..255 { io.print_int(takes_u8(i) as i64); }
+    io.println("");
+    for i in 1..N { io.print_int(takes_u64(i) as i64); }
+    io.println("");
+    // Both bounds literals: the annotation gives the type.
+    for i: u8 in 0..3 { io.print_int(takes_u8(i) as i64); }
+    io.println("");
+    for k: u64 in 0..Kind.COUNT { io.print_int(takes_u64(k) as i64); }
+    io.println("");
+    // Without one, i64.
+    var t: i64 = 0;
+    for i in 0 - 2..3 { t += i; }
+    io.print_int(t); io.println("");
+}
+// expect: 012
+// expect: 250251252253254
+// expect: 123
+// expect: 012
+// expect: 012
+// expect: 0

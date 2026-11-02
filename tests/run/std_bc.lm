@@ -51,14 +51,11 @@ const SJ: bc.Field = bc.Field { shift: 8, bits: 24, signed: true };
 const SBX: bc.Field = bc.Field { shift: 16, bits: 16, signed: true };
 const DST: bc.Field = bc.Field { shift: 8, bits: 8, signed: false };
 
+// The compiler uses the generated `Toy.set_label` and `Toy.label`; this
+// hand-written patch function over `bc.Field` does the same (and is what
+// a custom encoding would need). `jump_range` uses it.
 fn patch(w: u32, off: i64) -> ?u32 {
     if Toy.opcode(w) == Toy.OP_JMP { SJ.set32(w, off) } else { SBX.set32(w, off) }
-}
-fn target_of(w: u32) -> ?i64 {
-    let op = Toy.opcode(w);
-    if op == Toy.OP_JMP { return Some(SJ.get32(w)); }
-    if op == Toy.OP_JMPF { return Some(SBX.get32(w)); }
-    None
 }
 fn is_goto(w: u32) -> bool { Toy.opcode(w) == Toy.OP_JMP }
 
@@ -250,7 +247,7 @@ fn C.stmt(c: *C) {
 fn compile_and_run(src: str, thread: bool) {
     var c = C {
         src: src, pos: 0, line: 1,
-        code: bc.Code.new(Toy.op_size, patch),
+        code: bc.Code.new(Toy.op_size, Toy.set_label),
         consts: bc.Pool.new(65536),
         regs: bc.Regs.new(250),
         locals: mem.Vec.new(),
@@ -266,7 +263,7 @@ fn compile_and_run(src: str, thread: bool) {
     if !c.ok { return; }
     if thread {
         io.print("threaded jumps: ");
-        io.print_int(c.code.thread_jumps(target_of, is_goto) as i64);
+        io.print_int(c.code.thread_jumps(Toy.label, is_goto) as i64);
         io.println("");
     }
     let n = c.code.len();

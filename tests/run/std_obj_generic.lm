@@ -1,0 +1,90 @@
+// std.obj's ready-made generic object type `obj.Obj<V>` (with
+// `obj.Slots<V>` and `obj.new_slots<V>`), under GC stress: objects whose
+// slots hold values referring to other objects, overflow growth,
+// prototype lookups and dictionary mode, with a collection after each
+// step.
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<obj.Obj<Value>>) }
+
+struct World {
+    heap: gc.Heap,
+    m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value>,
+    roots: mem.Vec<Gc<obj.Obj<Value>>>,
+}
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let w = data as *World;
+    for i in 0..w.roots.len { gc_mark(h, w.roots.at(i)); }
+}
+
+fn World.obj(w: *World, proto: ?Gc<obj.Obj<Value>>, n: u32) -> Gc<obj.Obj<Value>> {
+    obj.new_obj(&w.heap, w.m.root_for(proto, n), proto, n as u64)
+}
+
+fn World.churn(w: *World) uses gc {
+    gc.collect(&w.heap);
+    // Reuse freed memory: a dead object or slot array would be overwritten.
+    for i in 0..50 { w.obj(None, 3); }
+}
+
+fn int(v: ?Value) -> i64 {
+    match v { Some(Int(i)) => i as i64, Some(Nil) => -1, None => -2, _ => -3 }
+}
+
+fn where(l: obj.Lookup<Gc<obj.Obj<Value>>>) -> str {
+    match l { obj.Lookup.Own(_) => "own", obj.Lookup.Proto(_, _) => "proto", obj.Lookup.Missing => "missing" }
+}
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), m: obj.Model.new(obj.new_slots<Value>, Value.Nil), roots: mem.Vec.new() };
+    w.m.attach(&w.heap);
+    w.heap.add_scanner(&w as *u8, scan);
+    w.heap.set_stress(true);
+
+    let base = w.obj(None, 2);
+    w.roots.push(base);
+    w.m.set(base, 1, Value.Int(7));
+    let child = w.obj(Some(base), 1);
+    w.roots.push(child);
+    w.churn();
+    // Values that are the only reference to an object.
+    for k in 10..30 {
+        let o = w.obj(None, 1);
+        w.m.set(o, 1, Value.Int(k as i32));
+        w.m.set(child, k as u64, O(o));
+        w.churn();
+    }
+    var t: i64 = 0;
+    for k in 10..30 {
+        match w.m.get(child, k as u64) {
+            Some(O(o)) => t += int(w.m.get(o, 1)),
+            _ => t += 1000,
+        }
+    }
+    io.print_int(t); io.println("");
+    io.println(where(w.m.lookup(child, 1)));
+    io.println(where(w.m.lookup(child, 12)));
+    io.println(where(w.m.lookup(child, 99)));
+    io.print_int(int(w.m.get_chain(child, 1))); io.println("");
+    // Dictionary mode keeps the slot values alive too.
+    w.m.delete(child, 15);
+    w.m.to_dict(child);
+    w.churn();
+    t = 0;
+    for k in 10..30 {
+        if let Some(O(o)) = w.m.get(child, k as u64) { t += int(w.m.get(o, 1)); }
+    }
+    io.print_int(t); io.println("");
+    w.m.free();
+    w.roots.free();
+}
+// expect: 390
+// expect: proto
+// expect: own
+// expect: missing
+// expect: 7
+// expect: 375

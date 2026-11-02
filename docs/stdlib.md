@@ -239,8 +239,9 @@ Generic machinery that each vm's generated `Builder` plugs into:
 rather than a generated `Builder`. Everything is generic over the vm's
 code word `W` through two functions the compiler passes in: `size:
 fn(W) -> u64` (the generated `Vm.op_size`) and `patch: fn(W, i64) -> ?W`
-(set a jump word's offset, `target - pc`, or None if it does not fit,
-usually three lines over `Vm.opcode` and `bc.Field`). The test
+(set a jump word's offset, `target - pc`, or None if it does not fit:
+the generated `Vm.set_label`, or a few lines over `Vm.opcode` and
+`bc.Field` for a custom encoding). The test
 `tests/run/std_bc.lm` compiles a small language to a toy register vm
 with all of it.
 

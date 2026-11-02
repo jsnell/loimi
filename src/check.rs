@@ -139,9 +139,9 @@ fn fn_widens(from: &Ty, to: &Ty) -> bool {
 }
 
 /// An unknown part of a guessed type (`Checker::guess_ty`).
-const HOLE: u32 = u32::MAX;
+pub const HOLE: u32 = u32::MAX;
 
-fn has_hole(t: &Ty) -> bool {
+pub fn has_hole(t: &Ty) -> bool {
     match t {
         Ty::Param(HOLE) => true,
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
@@ -358,21 +358,7 @@ impl<'a> Checker<'a> {
                 match item {
                     Item::Struct(s) if s.generics.is_empty() => {
                         let Some((Def::Struct(id), _)) = self.scopes[m].get(&s.name.name).cloned() else { unreachable!() };
-                        let mut fields = Vec::new();
-                        let mut trailing = None;
-                        for (i, (f, t)) in s.fields.iter().enumerate() {
-                            if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
-                                return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
-                            }
-                            if let TypeKind::Trailing(elem) = &t.kind {
-                                if !s.is_object || i + 1 != s.fields.len() {
-                                    return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
-                                }
-                                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
-                                continue;
-                            }
-                            fields.push((f.name.clone(), self.resolve_type(m, t)?));
-                        }
+                        let (fields, trailing) = self.struct_fields(m, s)?;
                         self.prog.structs[id as usize].fields = fields;
                         self.prog.structs[id as usize].trailing = trailing;
                     }
@@ -450,9 +436,43 @@ impl<'a> Checker<'a> {
             self.pending.push((id, m, f, vec![]));
         }
         while let Some((id, m, f, env)) = self.pending.pop() {
-            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None))?;
+            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
         }
         Ok(())
+    }
+
+    /// The fields of a struct or object declaration (with type parameters
+    /// bound in `tenv`), and its trailing array.
+    #[allow(clippy::type_complexity)]
+    pub fn struct_fields(&mut self, m: usize, s: &StructDecl) -> Res<(Vec<(String, Ty)>, Option<(String, Ty)>)> {
+        let mut fields = Vec::new();
+        let mut trailing = None;
+        for (i, (f, t)) in s.fields.iter().enumerate() {
+            if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
+                return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
+            }
+            if let TypeKind::Trailing(elem) = &t.kind {
+                if !s.is_object || i + 1 != s.fields.len() {
+                    return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
+                }
+                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
+                continue;
+            }
+            fields.push((f.name.clone(), self.resolve_type(m, t)?));
+        }
+        Ok((fields, trailing))
+    }
+
+    /// An error inside an instance of a generic function: say which
+    /// instance, and where it was first needed.
+    pub fn instance_note(&self, d: Diag, id: FnId) -> Diag {
+        match self.generics.fn_site.get(&id) {
+            Some(site) if !d.notes.iter().any(|(s, _)| s == site) => {
+                let name = self.prog.fns[id as usize].name.clone();
+                d.note(*site, format!("in `{}`, instantiated here", name))
+            }
+            _ => d,
+        }
     }
 
     pub fn declare_fn(&mut self, id: FnId, m: usize, f: &FnDecl, symbol: Option<String>) -> Res<()> {
@@ -629,8 +649,21 @@ impl<'a> Checker<'a> {
                         return Err(Diag::new(t.span, "Gc takes one type argument"));
                     }
                     let inner = self.resolve_type(m, &args[0])?;
-                    if !matches!(&inner, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
-                        return Err(Diag::new(args[0].span, "Gc<T> needs an `object` type"));
+                    // A type parameter is checked when it is bound: in a
+                    // generic signature it is an inference variable here,
+                    // and in an instance it is the concrete type.
+                    let ok = match &inner {
+                        Ty::Struct(i) => self.prog.structs[*i as usize].object.is_some(),
+                        Ty::Param(_) => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        let msg = if self.tenv.is_empty() {
+                            "Gc<T> needs an `object` type".to_string()
+                        } else {
+                            format!("Gc<T> needs an `object` type, found `{}`", self.ty_name(&inner))
+                        };
+                        return Err(Diag::new(args[0].span, msg));
                     }
                     return Ok(Ty::Gc(Box::new(inner)));
                 }
@@ -988,7 +1021,31 @@ impl<'a> Checker<'a> {
                 // Check the qualifier, if any, names the scrutinee type.
                 if path.len() >= 2 && !path[0].name.is_empty() {
                     let qual = &path[path.len() - 2];
-                    let qty = self.resolve_type_name(cx.module, qual)?;
+                    // `mod.Enum.Variant`: the enum is looked up in `mod`.
+                    let qm = match path.len() {
+                        3 => match self.scopes[cx.module].get(&path[0].name) {
+                            Some((Def::Module(t), _)) => *t,
+                            _ => return Err(Diag::new(path[0].span, format!("unknown module `{}`", path[0].name))),
+                        },
+                        _ => cx.module,
+                    };
+                    // `Lookup.Own(i)` for a value of type `Lookup<O>`: a
+                    // generic enum's name stands for any of its instances.
+                    let generic = match self.scopes[qm].get(&qual.name) {
+                        Some((Def::GenericType(g), _)) if self.tenv.iter().all(|(n, _)| *n != qual.name) => Some(*g),
+                        _ => None,
+                    };
+                    let qty = match generic {
+                        Some(g) if self.generics.inst_of.get(ty).is_some_and(|(g2, _)| *g2 == g) => ty.clone(),
+                        Some(g) => {
+                            let gname = self.generics.types[g as usize].name.clone();
+                            return Err(Diag::new(
+                                p.span,
+                                format!("pattern of type `{}` for a value of type `{}`", gname, self.ty_name(ty)),
+                            ));
+                        }
+                        None => self.resolve_type_name(qm, qual)?,
+                    };
                     if qty != *ty {
                         return Err(Diag::new(
                             p.span,
@@ -1363,8 +1420,20 @@ impl<'a> Checker<'a> {
                 let ty = lc.break_ty.unwrap_or(Ty::Never);
                 Ok(mk(ty, TK::Loop { body: Box::new(b), step: None, id }, span))
             }
-            ExprKind::For(var, lo, hi, body) => {
-                let (lo_t, hi_t) = if is_literal_expr(lo) && !is_literal_expr(hi) {
+            ExprKind::For(var, ann, lo, hi, body) => {
+                // The range's type: the annotation, else the bound that is
+                // not a literal (`0..n` with `n: u64` is a u64 range), else
+                // i64.
+                let ann = match ann {
+                    Some(t) => Some(self.resolve_type(cx.module, t)?),
+                    None => None,
+                };
+                let (lo_t, hi_t) = if let Some(t) = &ann {
+                    if !t.is_int() {
+                        return Err(Diag::new(lo.span, "range bounds must be integers"));
+                    }
+                    (self.expr_coerce(cx, lo, t)?, self.expr_coerce(cx, hi, t)?)
+                } else if is_literal_expr(lo) && !is_literal_expr(hi) {
                     let h = self.expr(cx, hi, None)?;
                     let l = self.expr_coerce(cx, lo, &h.ty.clone())?;
                     (l, h)
@@ -1512,7 +1581,7 @@ impl<'a> Checker<'a> {
                     _ => Err(Diag::new(span, "`?` needs an option or result")),
                 }
             }
-            ExprKind::TypeArgs(..) => Err(Diag::new(span, "explicit type arguments are only supported on calls: `f<T>(..)`")),
+            ExprKind::TypeArgs(inner, targs) => self.type_args_value(cx, inner, targs, span),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
                 let ty = self.resolve_type(cx.module, t)?;
@@ -1874,6 +1943,16 @@ impl<'a> Checker<'a> {
             }
             return self.def_value(def, &name.name, span);
         }
+        if let Some(g) = self.generic_type_path(cx, base) {
+            if let Some(v) = self.generic_variant(cx, g, name, &[], exp, span)? {
+                return Ok(v);
+            }
+            let gname = self.generics.types[g as usize].name.clone();
+            return Err(Diag::new(
+                name.span,
+                format!("no variant `{}` in `{}` (a generic type's functions can only be called)", name.name, gname),
+            ));
+        }
         if let Some(t) = self.type_path(cx, base) {
             if let Some(idx) = self.variant_index(&t, &name.name) {
                 return self.make_variant(cx, &t, idx, &[], span);
@@ -2060,6 +2139,53 @@ impl<'a> Checker<'a> {
         self.explicit_call(cx, name, g, explicit, recv, args, exp, span)
     }
 
+    /// The generic function (or generic method of a plain type) that `e`
+    /// names, if any: `f`, `mod.f`, `Type.f`, `mod.Type.f`.
+    pub fn generic_fn_named(&self, cx: &FnCx, e: &Expr) -> Res<Option<(u32, Ident)>> {
+        match &e.kind {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.scopes[cx.module].get(n) {
+                Some((Def::GenericFn(g), _)) => Ok(Some((*g, Ident { name: n.clone(), span: e.span }))),
+                _ => Ok(None),
+            },
+            ExprKind::Field(base, name) => {
+                if let Some(m) = self.module_path(cx, base) {
+                    return match self.scopes[m].get(&name.name) {
+                        Some((Def::GenericFn(g), true)) => Ok(Some((*g, name.clone()))),
+                        Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
+                        _ => Ok(None),
+                    };
+                }
+                if let Some(t) = self.type_path(cx, base) {
+                    return Ok(self.generics.ty_methods.get(&(t, name.name.clone())).map(|g| (*g, name.clone())));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `f<T..>` used as a value: the instance of a generic function.
+    fn type_args_value(&mut self, cx: &mut FnCx, inner: &Expr, targs: &[TypeExpr], span: Span) -> Res<TExpr> {
+        let Some((g, name)) = self.generic_fn_named(cx, inner)? else {
+            if let ExprKind::Field(base, _) = &inner.kind {
+                if self.generic_type_path(cx, base).is_some() {
+                    return Err(Diag::new(span, "explicit type arguments are not supported on a generic type's functions"));
+                }
+            }
+            return Err(Diag::new(inner.span, "explicit type arguments need a generic function name"));
+        };
+        let mut explicit = Vec::new();
+        for t in targs {
+            explicit.push(self.resolve_type(cx.module, t)?);
+        }
+        let n = self.generics.fns[g as usize].params.len();
+        if explicit.len() != n {
+            return Err(Diag::new(name.span, format!("`{}` takes {} type argument(s), got {}", name.name, n, explicit.len())));
+        }
+        let fid = self.instantiate_fn(g, explicit, span)?;
+        Ok(mk(self.prog.fns[fid as usize].fn_ty(), TK::FnRef(fid), span))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn explicit_call(
         &mut self,
@@ -2141,12 +2267,10 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(g) = self.generic_type_path(cx, base) {
-                    let inst = self.instance_from_expected(g, exp);
-                    if let Some(t) = &inst {
-                        if let Some(idx) = self.variant_index(t, &name.name) {
-                            return self.make_variant(cx, &t.clone(), idx, args, span);
-                        }
+                    if let Some(v) = self.generic_variant(cx, g, name, args, exp, span)? {
+                        return Ok(v);
                     }
+                    let inst = self.instance_from_expected(g, exp);
                     let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() else {
                         let gname = self.generics.types[g as usize].name.clone();
                         return Err(Diag::new(
@@ -2228,6 +2352,56 @@ impl<'a> Checker<'a> {
         }
         let call = mk(*ret, TK::Call(Box::new(f), pre), span);
         crate::vmcheck::wrap_effects(self, cx, call)
+    }
+
+    /// `Lookup.Missing`, `Lookup.Own(i)`: a variant of generic enum `g`.
+    /// The instance comes from the expected type, or else from the
+    /// payload arguments. None if `g` has no variant `name`.
+    fn generic_variant(&mut self, cx: &mut FnCx, g: u32, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
+        let gt = &self.generics.types[g as usize];
+        let crate::generics::GenDecl::Enum(ed) = gt.decl.clone() else { return Ok(None) };
+        let Some(vdecl) = ed.variants.iter().find(|v| v.name.name == name.name) else { return Ok(None) };
+        if let Some(t) = self.instance_from_expected(g, exp) {
+            let idx = self.variant_index(&t, &name.name).unwrap();
+            return self.make_variant(cx, &t, idx, args, span).map(Some);
+        }
+        let (module, params, gname) = (gt.module, gt.params.clone(), gt.name.clone());
+        let mut b: Vec<Option<Ty>> = vec![None; params.len()];
+        if vdecl.fields.len() == args.len() {
+            for (ft, a) in vdecl.fields.iter().zip(args) {
+                let env = params.iter().enumerate().map(|(i, p)| (p.clone(), Ty::Param(i as u32))).collect();
+                let pt = self.with_tenv(env, |c| c.resolve_type(module, ft))?;
+                if !crate::generics::contains_param(&pt, &self.generics) {
+                    continue;
+                }
+                // Check a clone to learn the type; the argument is checked again.
+                let mut probe = FnCx::new(cx.module, cx.ret.clone());
+                probe.scopes = cx.scopes.clone();
+                probe.locals = cx.locals.clone();
+                probe.vm = cx.vm.clone();
+                if let Ok(v) = self.expr(&mut probe, a, None) {
+                    self.unify(&pt, &v.ty, &mut b);
+                }
+            }
+        }
+        let mut targs = Vec::new();
+        for (i, t) in b.into_iter().enumerate() {
+            match t {
+                Some(t) => targs.push(t),
+                None => {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "cannot infer type parameter `{}` of `{}.{}`: use it where a `{}<..>` is expected",
+                            params[i], gname, name.name, gname
+                        ),
+                    ))
+                }
+            }
+        }
+        let t = self.instantiate_type(g, targs, span)?;
+        let idx = self.variant_index(&t, &name.name).unwrap();
+        self.make_variant(cx, &t, idx, args, span).map(Some)
     }
 
     /// `Vec` (a generic type named in expression position).

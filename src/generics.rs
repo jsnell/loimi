@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::check::{mk, Checker, FnCx};
+use crate::check::{has_hole, mk, Checker, FnCx, HOLE};
 use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 
@@ -41,12 +41,14 @@ pub struct Generics {
     /// (non-generic type, method name) → generic fn: methods with their
     /// own type parameters on a plain type (`fn Cursor.op<K>`).
     pub ty_methods: HashMap<(Ty, String), u32>,
+    /// Instance of a generic function → where it was first needed.
+    pub fn_site: HashMap<FnId, Span>,
 }
 
 pub fn contains_param(t: &Ty, g: &Generics) -> bool {
     match t {
         Ty::Param(_) => true,
-        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) => contains_param(x, g),
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_param(x, g),
         Ty::Result(a, b) => contains_param(a, g) || contains_param(b, g),
         Ty::Tuple(ts) => ts.iter().any(|t| contains_param(t, g)),
         Ty::Fn(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
@@ -96,9 +98,20 @@ impl<'a> Checker<'a> {
         let env: Vec<(String, Ty)> = gt.params.iter().cloned().zip(args.iter().cloned()).collect();
         let decl = gt.decl.clone();
         let ty = match &decl {
-            GenDecl::Struct(_) => {
+            GenDecl::Struct(s) => {
                 let id = self.prog.structs.len() as u32;
-                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object: None, trailing: None });
+                // Every concrete instance of a generic `object` is an
+                // object type of its own, with its own type id (and so its
+                // own tracing code). Pattern instances are never allocated.
+                let object = match (s.is_object, pattern) {
+                    (false, _) => None,
+                    (true, true) => Some(u32::MAX),
+                    (true, false) => {
+                        self.object_count += 1;
+                        Some(self.object_count - 1)
+                    }
+                };
+                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None });
                 Ty::Struct(id)
             }
             GenDecl::Enum(_) => {
@@ -109,20 +122,17 @@ impl<'a> Checker<'a> {
         };
         self.generics.type_inst.insert((g, args.clone()), ty.clone());
         self.generics.inst_of.insert(ty.clone(), (g, args));
+        let inst_name = self.ty_name(&ty);
+        let note = |d: Diag| if d.span == span { d } else { d.note(span, format!("in `{}`, instantiated here", inst_name)) };
         match decl {
             GenDecl::Struct(s) => {
-                let fields = self.with_tenv(env, |c| -> Res<Vec<(String, Ty)>> {
-                    let mut out = Vec::new();
-                    for (f, t) in &s.fields {
-                        out.push((f.name.clone(), c.resolve_type(module, t)?));
-                    }
-                    Ok(out)
-                })?;
+                let (fields, trailing) = self.with_tenv(env, |c| c.struct_fields(module, &s)).map_err(note)?;
                 let Ty::Struct(id) = ty else { unreachable!() };
                 self.prog.structs[id as usize].fields = fields;
+                self.prog.structs[id as usize].trailing = trailing;
             }
             GenDecl::Enum(e) => {
-                let (tag, variants) = self.with_tenv(env, |c| c.enum_variants(module, &e))?;
+                let (tag, variants) = self.with_tenv(env, |c| c.enum_variants(module, &e)).map_err(note)?;
                 let Ty::Enum(id) = ty else { unreachable!() };
                 self.prog.enums[id as usize].tag = tag;
                 self.prog.enums[id as usize].variants = variants;
@@ -160,8 +170,11 @@ impl<'a> Checker<'a> {
         let id = self.prog.fns.len() as FnId;
         self.prog.fns.push(crate::check::placeholder_fn(span));
         self.generics.fn_inst.insert((g, args.clone()), id);
+        self.generics.fn_site.insert(id, span);
         let symbol = format!("{}.{}", self.module_prefix(module), base);
-        self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)))?;
+        self.prog.fns[id as usize].name = base.clone();
+        self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)))
+            .map_err(|d| d.note(span, format!("in `{}`, instantiated here", base)))?;
         self.prog.fns[id as usize].name = base;
         self.pending.push((id, module, decl, env));
         Ok(id)
@@ -175,6 +188,10 @@ impl<'a> Checker<'a> {
 
     pub fn unify(&self, pat: &Ty, act: &Ty, b: &mut [Option<Ty>]) -> bool {
         match (pat, act) {
+            // A hole in the actual type (an unknown part of a partly
+            // inferred expected type) matches anything and binds nothing.
+            (_, Ty::Param(HOLE)) => true,
+            (Ty::Param(_), _) if has_hole(act) => true,
             (Ty::Param(i), _) => match &b[*i as usize] {
                 Some(t) => t == act,
                 None => {
@@ -182,7 +199,9 @@ impl<'a> Checker<'a> {
                     true
                 }
             },
-            (Ty::Ptr(x), Ty::Ptr(y)) | (Ty::Slice(x), Ty::Slice(y)) | (Ty::Option(x), Ty::Option(y)) => self.unify(x, y, b),
+            (Ty::Ptr(x), Ty::Ptr(y)) | (Ty::Slice(x), Ty::Slice(y)) | (Ty::Option(x), Ty::Option(y)) | (Ty::Gc(x), Ty::Gc(y)) => {
+                self.unify(x, y, b)
+            }
             (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.unify(x, y, b),
             (Ty::Result(a1, b1), Ty::Result(a2, b2)) => self.unify(a1, a2, b) && self.unify(b1, b2, b),
             (Ty::Tuple(xs), Ty::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y, b)),
@@ -220,6 +239,15 @@ impl<'a> Checker<'a> {
             },
             Ty::Option(x) => match self.subst(x, b, span)? {
                 Some(x) => Ty::Option(Box::new(x)),
+                None => return Ok(None),
+            },
+            Ty::Gc(x) => match self.subst(x, b, span)? {
+                Some(x) => {
+                    if !matches!(&x, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
+                        return Err(Diag::new(span, format!("Gc<T> needs an `object` type, found `{}`", self.ty_name(&x))));
+                    }
+                    Ty::Gc(Box::new(x))
+                }
                 None => return Ok(None),
             },
             Ty::Array(x, n) => match self.subst(x, b, span)? {
@@ -263,6 +291,42 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.instantiate_type(g, out, span)?
+            }
+            t => t.clone(),
+        }))
+    }
+
+    /// `t` with the bound parameters substituted and the unbound ones
+    /// left as holes: the partly known type of a generic call's argument.
+    fn subst_partial(&mut self, t: &Ty, b: &[Option<Ty>], span: Span) -> Res<Ty> {
+        Ok(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)))
+    }
+
+    fn subst_holes(&mut self, t: &Ty, b: &[Option<Ty>], span: Span) -> Res<Option<Ty>> {
+        Ok(Some(match t {
+            Ty::Param(i) => b[*i as usize].clone().unwrap_or(Ty::Param(HOLE)),
+            Ty::Ptr(x) => Ty::Ptr(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Slice(x) => Ty::Slice(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Option(x) => Ty::Option(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Array(x, k) => Ty::Array(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE))), *k),
+            Ty::Tuple(ts) => {
+                let mut out = Vec::new();
+                for t in ts {
+                    out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
+                }
+                Ty::Tuple(out)
+            }
+            Ty::Fn(ps, r, e) => {
+                let mut out = Vec::new();
+                for t in ps {
+                    out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
+                }
+                Ty::Fn(out, Box::new(self.subst_holes(r, b, span)?.unwrap_or(Ty::Param(HOLE))), *e)
+            }
+            t if contains_param(t, &self.generics) => {
+                // Gc<..>, Result<..> and generic instances: only when fully known.
+                let full: Vec<Option<Ty>> = b.iter().map(|x| x.clone().filter(|t| !has_hole(t))).collect();
+                return self.subst(t, &full, span);
             }
             t => t.clone(),
         }))
@@ -362,10 +426,35 @@ impl<'a> Checker<'a> {
             vals.push(r);
         }
         let off = vals.len();
+        // A generic function passed as an argument gets its type arguments
+        // from the parameter's type, which may depend on later arguments:
+        // check those first (`apply(double, 21)` with `fn apply<T, U>(f:
+        // fn(T) -> U, x: T)`).
+        let mut order: Vec<usize> = Vec::new();
+        let mut deferred: Vec<usize> = Vec::new();
         for (i, a) in args.iter().enumerate() {
+            let pt = &ptys[off + i];
+            if matches!(pt, Ty::Fn(..)) && contains_param(pt, &self.generics) && self.generic_fn_named(cx, a)?.is_some() {
+                deferred.push(i);
+            } else {
+                order.push(i);
+            }
+        }
+        order.extend(deferred.iter().copied());
+        let mut slots: Vec<Option<TExpr>> = vec![None; args.len()];
+        for i in order {
+            let a = &args[i];
             let pt = ptys[off + i].clone();
             let want = self.subst(&pt, &b, span)?;
-            let v = self.expr(cx, a, want.as_ref())?;
+            let v = if want.is_none() && deferred.contains(&i) {
+                // Only partly known: the parameters may still determine
+                // the function's type arguments.
+                let partial = self.subst_partial(&pt, &b, span)?;
+                let (g, _) = self.generic_fn_named(cx, a)?.unwrap();
+                self.generic_fn_value(g, Some(&partial), a.span)?
+            } else {
+                self.expr(cx, a, want.as_ref())?
+            };
             let v = match &want {
                 Some(t) => self.coerce(v, t)?,
                 None => {
@@ -375,8 +464,9 @@ impl<'a> Checker<'a> {
                     v
                 }
             };
-            vals.push(v);
+            slots[i] = Some(v);
         }
+        vals.extend(slots.into_iter().map(|v| v.unwrap()));
         let mut targs = Vec::new();
         for (i, t) in b.iter().enumerate() {
             match t {

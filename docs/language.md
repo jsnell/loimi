@@ -83,6 +83,12 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   else { Err(m) };` gets `Result<typeof e, typeof m>`, and an arm that cannot
   be typed alone (`None`, `Ok(x)`) takes its type from the others. Inference
   is local: it does not look at later uses of `r`.
+- **Range loops.** `for i in lo..hi` counts from `lo` up to `hi - 1`. The
+  range takes the type of a bound that is not a literal: `0..n` with
+  `n: u64` is a `u64` range, `m..255` with `m: u8` a `u8` range. When both
+  bounds are literals (or `Kind.COUNT`), the type comes from an annotation
+  on the variable, `for i: u8 in 0..10`, and is `i64` without one; the
+  bounds must fit it. (The loop variable's later uses are not looked at.)
 - **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
   takes type arguments. After any other type name, `<` begins type
   arguments only when a balanced `<...>` made of type tokens follows
@@ -119,6 +125,26 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
   `fn Vec<T>.map<U>(v: *Vec<T>, f: fn(T) -> U) -> Vec<U>`.
+- **Variants of generic enums** can be qualified with the enum's name
+  alone: with `enum Lookup<O> { Own(u32), Proto(O, u32), Missing }`,
+  `Lookup.Missing` and `Lookup.Own(i)` take their instance from the
+  expected type (`return Lookup.Missing;` in a function returning
+  `Lookup<O>`), or else from the payload (`Lookup.Proto(2.5, 7)` is a
+  `Lookup<f64>`); `let l = Lookup.Missing;` is an error. In patterns,
+  `Lookup.Own(x)` matches any instance. `mod.Lookup.Missing` works too.
+- **Generic functions as values.** A generic function used where a
+  function type is expected gets its type arguments from that type
+  (`Pratt.new(peek, ..)`). Explicit type arguments name an instance
+  anywhere: `heap.add_scanner(&roots as *u8, scan<Gc<Box>>)`,
+  `let f = size_of_t<u32>;` (all of the function's type arguments; not on
+  a generic type's functions). `f<T>` without a call is read as type
+  arguments when the `<` directly follows the name and the `>` is followed
+  by `)`, `,`, `;`, `}` or `]`. When a generic function is passed to
+  another generic function, the parameter's type may be only partly
+  known (`fn apply<T, U>(f: fn(T) -> U, x: T) -> U`): the other arguments
+  are checked first, and then the known parts (here `T`) are enough if
+  they determine the function's type arguments, as in `apply(double, 21)`
+  with `fn double<N>(x: N) -> N`.
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in
@@ -314,6 +340,9 @@ operand upv   = ctx.closure.upvals[it] verify it < proto.nupvals;
 
 `verify` clauses may refer to the `verify_context` declared in the vm
 (typically the function prototype being checked, `verify_context proto: Gc<Proto>;`).
+A verifier can take several context parameters, in one declaration
+(`verify_context proto: *Proto, consts: *Consts;`) or in several; they
+follow the code in `Vm.verify(code, proto, consts)` in declaration order.
 
 If the expression is a place (like `regs[it]`), the operand is assignable:
 `dst = Int(1)` writes the register. `x.raw` gives the undecoded field.
@@ -352,6 +381,14 @@ type-checks the mapping. From the declarations it **generates**:
   (`r3`, `k[7] = "foo"`, `-> 0042`);
 - `Mini.verify` (section 6);
 - metadata tables (sizes, operand kinds, branch targets) for tools.
+- label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
+  jump label of word `w` (its first operand whose kind is `pc + it`) and
+  returns None if `off` does not fit the field or the op has no label;
+  `Vm.label(w) -> ?i64` decodes it; `Vm.FMT_field(w)` reads field
+  `field` of format `FMT` (`Vm.AsBx_sbx(w)`), as a `u64` or, for a
+  signed field, an `i64`. A superinstruction's head word answers for its
+  first part. `set_label` and `label` are the patch and jump-threading
+  functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`.
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.
@@ -741,6 +778,18 @@ enough to make it precise and cheap:
 - **`object` declarations** are GC-managed structs. The compiler generates the
   header (type id, mark bits) and the trace function from field types.
   A trailing variable-length array is allowed (`slots: [Value]`).
+- **Generic objects.** `object Obj<V> { shape: Gc<Shape>, inline: [V] }` is
+  a family of object types: each instance (`Obj<Value>`, `Obj<i64>`) is an
+  object type of its own, with its own type id and generated trace
+  function, so `Obj<i64>`'s slots are not traced and `Obj<Value>`'s are.
+  The trailing array may have a type parameter as its element type.
+  `Gc<T>` may name a type parameter (`fn keep<T>(x: Gc<T>) -> Gc<T>`,
+  `struct Pair<T> { a: Gc<T>, b: Gc<T> }`). There is no `Object` bound:
+  like method calls in generic bodies, this is checked per instance, when
+  T is bound. Binding T to something that is not an `object` is an error
+  at the `Gc<T>` in the generic declaration, with a note pointing to the
+  use that created the instance: "Gc<T> needs an `object` type, found
+  `i64`".
 - **`Gc<T>`** is a traced reference. A `Value` traces whichever variants hold `Gc`.
   It converts to a raw pointer or a `u64` address with `as`. The way back
   (`p as Gc<T>` from a pointer, a `u64`, or another `Gc`) is only allowed

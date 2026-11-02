@@ -1,0 +1,51 @@
+// A verifier with several context parameters: in one `verify_context`
+// declaration or in several, passed after the code in declaration order.
+import std.io;
+
+struct Proto { nregs: u32 }
+struct Consts { n: u32 }
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto, consts: *Consts;
+    verify_context max_imm: u64;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = it verify (it as u32) < consts.n;
+    operand imm = it verify it <= max_imm;
+
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op LOADK(dst: reg, k: kst) : ABC { dst = k as i64; next }
+    op LOADI(dst: reg, v: imm) : ABC { dst = v as i64; next }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn show(r: ?u64) {
+    match r {
+        None => io.println("ok"),
+        Some(i) => { io.print("bad at "); io.print_int(i as i64); io.println(""); }
+    }
+}
+
+fn main() {
+    var p = Proto { nregs: 4 };
+    var k = Consts { n: 2 };
+    var code: [u32; 3] = [V.LOADK(0, 1), V.LOADI(1, 9), V.RET(0)];
+    show(V.verify(code[..], &p, &k, 9));
+    show(V.verify(code[..], &p, &k, 8));
+    k.n = 1;
+    show(V.verify(code[..], &p, &k, 9));
+    p.nregs = 1;
+    k.n = 2;
+    show(V.verify(code[..], &p, &k, 9));
+    var regs: [i64; 4] = [0; 4];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: ok
+// expect: bad at 1
+// expect: bad at 0
+// expect: bad at 1
+// expect: 1

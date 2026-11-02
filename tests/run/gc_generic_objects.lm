@@ -1,0 +1,122 @@
+// Generic `object` types: each instance is an object type of its own,
+// with its own type id and tracing code. `Gc<T>` with a type parameter is
+// checked when T is bound. The heap is in stress mode, so every safepoint
+// collects, and freed slots are overwritten to catch missing marks.
+import std.io;
+import std.gc;
+
+object Cell<T> { value: T, next: ?Gc<Cell<T>> }
+object Obj<V> { tag: u64, inline: [V] }
+object Leaf { n: i64 }
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj<Value>>), L(Gc<Leaf>) }
+
+/// A plain struct over a reference to any object type.
+struct Pair<T> { a: Gc<T>, b: Gc<T> }
+
+fn push<T>(h: *gc.Heap, l: ?Gc<Cell<T>>, v: T) -> Gc<Cell<T>> {
+    new(h, Cell { value: v, next: l })
+}
+
+fn make<V>(h: *gc.Heap, tag: u64, n: u64, fill: V) -> Gc<Obj<V>> {
+    let o: Gc<Obj<V>> = new(h, Obj { tag: tag }, n);
+    for i in 0..o.inline.len { o.inline[i] = fill; }
+    o
+}
+
+/// `Gc<T>` for any object type T: the reference survives a collection
+/// because the instance roots it like any traced local.
+fn survive<T>(h: *gc.Heap, x: Gc<T>) -> Gc<T> uses gc {
+    gc.collect(h);
+    scribble(h);
+    x
+}
+
+fn same<T>(p: Pair<T>) -> bool { p.a as u64 == p.b as u64 }
+
+fn leaf(h: *gc.Heap, n: i64) -> Gc<Leaf> { new(h, Leaf { n: n }) }
+
+// Reuse freed memory: a freed leaf would now read 999.
+fn scribble(h: *gc.Heap) {
+    for i in 0..300 { leaf(h, 999); }
+}
+
+fn sum_cells(l: ?Gc<Cell<i64>>) -> i64 {
+    var t: i64 = 0;
+    var c = l;
+    while let Some(x) = c { t += x.value; c = x.next; }
+    t
+}
+
+fn sum_leaves(l: ?Gc<Cell<Gc<Leaf>>>) -> i64 {
+    var t: i64 = 0;
+    var c = l;
+    while let Some(x) = c { t += x.value.n; c = x.next; }
+    t
+}
+
+fn sum_value(v: Value) -> i64 {
+    match v {
+        Int(i) => i as i64,
+        L(l) => l.n,
+        O(o) => {
+            var t = o.tag as i64;
+            for i in 0..o.inline.len { t += sum_value(o.inline[i]); }
+            t
+        }
+        _ => 0,
+    }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    heap.set_stress(true);
+
+    // Cell<i64> and Cell<Gc<Leaf>> are different object types.
+    var ints: ?Gc<Cell<i64>> = None;
+    var leaves: ?Gc<Cell<Gc<Leaf>>> = None;
+    for i in 0..10 {
+        ints = Some(push(h, ints, i as i64));
+        leaves = Some(push(h, leaves, leaf(h, i as i64 * 10)));
+        gc.maybe_collect(h);
+        scribble(h);
+    }
+    io.print_int(sum_cells(ints)); io.println("");
+    io.print_int(sum_leaves(leaves)); io.println("");
+
+    // Trailing arrays of a type parameter: of plain integers (not traced),
+    // of references, and of values holding references.
+    let nums = make(h, 1, 4, 7 as i64);
+    let refs = make(h, 2, 3, leaf(h, 5));
+    let lv: Value = L(leaf(h, 3));
+    let inner = make(h, 100, 2, lv);
+    let outer: Gc<Obj<Value>> = make(h, 1000, 3, Value.Int(1));
+    outer.inline[1] = O(inner);
+    gc.maybe_collect(h);
+    scribble(h);
+    var t: i64 = 0;
+    for i in 0..nums.inline.len { t += nums.inline[i]; }
+    for i in 0..refs.inline.len { t += refs.inline[i].n; }
+    io.print_int(t); io.println("");
+    io.print_int(sum_value(O(outer))); io.println("");
+
+    // Gc<T> in a generic function, with T bound to different objects.
+    let kept = survive(h, nums);
+    let kept2 = survive(h, leaf(h, 42));
+    io.print_int(kept.inline[0] + kept2.n); io.println("");
+    let p = Pair { a: kept2, b: kept2 };
+    io.print_bool(same(p)); io.println("");
+
+    gc.collect(h);
+    // Live: 10 int cells, 10 leaf cells + 10 leaves, nums, refs + 1 leaf,
+    // inner + 1 leaf, outer, kept2 (37).
+    io.print("objects "); io.print_int(heap.count as i64); io.println("");
+}
+// expect: 45
+// expect: 450
+// expect: 43
+// expect: 1108
+// expect: 49
+// expect: true
+// expect: objects 37

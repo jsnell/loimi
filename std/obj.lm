@@ -15,9 +15,15 @@
 // Keys are u64: symbol ids (`text.Interner`) or other integers that stay
 // meaningful while shapes use them. They are not traced.
 //
-// The object type belongs to the interpreter, because its slots hold the
-// interpreter's `value` type (generic object types are not supported). It
-// needs these fields, which the generic code here reads and writes:
+// The object type is generic over the interpreter's `value` type V. The
+// ready-made `Obj<V>` and `Slots<V>` below have exactly the fields the
+// generic code reads and writes:
+//
+//     var m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value> =
+//         obj.Model.new(obj.new_slots<Value>, Value.Nil);
+//
+// An interpreter that wants more fields in its objects declares its own
+// object type with at least these fields, and its own slot array:
 //
 //     object Obj {
 //         shape: Gc<obj.Shape>,
@@ -29,8 +35,8 @@
 //     }
 //     object Slots { data: [Value] }
 //
-// `Model<O, S, V>` is instantiated with O = Gc<Obj>, S = Gc<Slots> and
-// V = Value, and is given a function that allocates a Slots array.
+// `Model<O, S, V>` is then instantiated with O = Gc<Obj>, S = Gc<Slots>
+// and V = Value, and is given a function that allocates a Slots array.
 //
 // Slots. A property's slot is its *index*: the order in which it was added
 // (counting from 0). Index i lives in `inline[i]` if i < inline.len, else
@@ -493,6 +499,27 @@ pub fn Template.new(proto: u64, inline: u32) -> Template {
 
 // ── the model: generic operations on the interpreter's objects ─────────
 
+/// A ready-made object over value type V (see the top of the file).
+pub object Obj<V> {
+    shape: Gc<Shape>,
+    dict: ?Gc<Dict>,
+    overflow: ?Gc<Slots<V>>,
+    proto: ?Gc<Obj<V>>,
+    inline: [V],
+}
+/// The overflow slot array of `Obj<V>`.
+pub object Slots<V> { data: [V] }
+
+/// Allocates `Slots<V>`: the `new_slots` function for `Model.new`
+/// (`obj.new_slots<Value>`).
+pub fn new_slots<V>(h: *gc.Heap, n: u64) -> Gc<Slots<V>> { new(h, Slots { }, n) }
+
+/// A new `Obj<V>` with `n` inline slots and shape `shape` (from `m.root(n)`,
+/// `m.root_for(p, n)` or `m.template_root(&t)`).
+pub fn new_obj<V>(h: *gc.Heap, shape: Gc<Shape>, proto: ?Gc<Obj<V>>, n: u64) -> Gc<Obj<V>> {
+    new(h, Obj { shape: shape, dict: None, overflow: None, proto: proto }, n)
+}
+
 /// Result of a lookup through the prototype chain.
 pub enum Lookup<O> { Own(u32), Proto(O, u32), Missing }
 
@@ -631,13 +658,13 @@ pub fn Model<O, S, V>.has_own(m: *Model<O, S, V>, o: O, key: u64) -> bool { m.fi
 
 /// `key` on `o` or its prototypes (needs a `proto: ?O` field).
 pub fn Model<O, S, V>.lookup(m: *Model<O, S, V>, o: O, key: u64) -> Lookup<O> {
-    if let Some(i) = m.find(o, key) { return .Own(i); }
+    if let Some(i) = m.find(o, key) { return Lookup.Own(i); }
     var cur = o.proto;
     while let Some(p) = cur {
-        if let Some(i) = m.find(p, key) { return .Proto(p, i); }
+        if let Some(i) = m.find(p, key) { return Lookup.Proto(p, i); }
         cur = p.proto;
     }
-    .Missing
+    Lookup.Missing
 }
 
 /// `key` on `o` or its prototypes.

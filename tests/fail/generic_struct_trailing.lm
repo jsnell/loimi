@@ -1,0 +1,6 @@
+struct Buf<T> { n: u64, data: [T] }
+
+fn main() {
+    let b: *Buf<u8> = 0 as *Buf<u8>;
+}
+// error: a trailing array `[T]` must be the last field of an `object`

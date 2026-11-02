@@ -1,0 +1,2 @@
+// Used by generic_variants.lm: a generic enum in another module.
+pub enum Maybe<T> { Just(T), Nothing }

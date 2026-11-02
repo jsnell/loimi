@@ -1,0 +1,9 @@
+// The expected type `fn(T) -> U` is only partly known when `make` is
+// checked, and its parameters do not determine `make`'s type argument.
+fn make<R>(x: i64) -> R { x as R }
+fn apply<T, U>(f: fn(T) -> U, x: T) -> U { f(x) }
+
+fn main() {
+    let y = apply(make, 1 as i64);
+}
+// error: cannot infer type parameter `R`

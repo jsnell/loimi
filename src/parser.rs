@@ -999,10 +999,14 @@ impl Parser {
             } else if self.is("<")
                 && !self.toks[self.pos].space_before
                 && matches!(e.kind, ExprKind::Ident(_) | ExprKind::Field(..))
-                && self.angle_args_end().is_some_and(|i| matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("("))))
+                && self.angle_args_end().is_some_and(|i| {
+                    matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("(" | ")" | "," | ";" | "}" | "]")))
+                })
             {
                 // `f<T>(..)`, `mem.alloc<u8>(n)`, `v.map<f64>(g)`: explicit
-                // type arguments of a generic call.
+                // type arguments of a generic call. Also `f<T>` as a value,
+                // when followed by a token that cannot continue a
+                // comparison (`)`, `,`, `;`, `}`, `]`).
                 let saved = std::mem::replace(&mut self.cast_type, false);
                 self.bump();
                 let mut targs = Vec::new();
@@ -1186,6 +1190,8 @@ impl Parser {
                     "for" => {
                         self.bump();
                         let var = self.ident()?;
+                        // `for i: u8 in 0..10`: the type of the range.
+                        let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
                         self.expect_kw("in")?;
                         let saved = self.no_struct;
                         self.no_struct = true;
@@ -1194,7 +1200,7 @@ impl Parser {
                         let hi = self.parse_bin(2)?;
                         self.no_struct = saved;
                         let body = self.parse_block()?;
-                        mk(ExprKind::For(var, Box::new(lo), Box::new(hi), body), self)
+                        mk(ExprKind::For(var, ty, Box::new(lo), Box::new(hi), body), self)
                     }
                     "unsafe" if self.is_at(1, "{") => {
                         self.bump();
