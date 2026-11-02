@@ -142,6 +142,8 @@ pub fn Ctx.new() -> Ctx {
 /// Finish setting up once `c` has its final address.
 pub fn Ctx.init(c: *Ctx) {
     c.m.attach(&c.heap);
+    c.heap.min_heap = 64 << 20;
+    c.heap.threshold = c.heap.min_heap;
     value.HEAP = Some(&c.heap);
     c.heap.add_scanner(c as *u8, scan_roots);
     for _ in 0..INT_KEYS { c.intkeys.push(0); }

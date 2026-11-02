@@ -78,6 +78,17 @@ fn loose_eq(a: V, b: V) -> bool {
     false
 }
 
+/// `===` for values with different bits.
+fn eq_slow(a: V, b: V) -> bool {
+    match (a, b) {
+        (Num(x), Num(y)) => x == y,
+        (Int(x), Num(y)) => x as f64 == y,
+        (Num(x), Int(y)) => x == y as f64,
+        (S(_), _) | (R(_), _) => value.strict_eq(a, b),
+        _ => false,
+    }
+}
+
 fn int32(v: V) -> i32 {
     match v {
         Int(i) => i,
@@ -779,6 +790,7 @@ pub vm JS {
     }
     op MOD(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) and y > 0 and x >= 0 { dst = Int(x % y); next }
+        if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
         cold { dst = arith(ctx, 4, a, b)?; next }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
@@ -832,7 +844,7 @@ pub vm JS {
             dst = Bool(true);
             next
         }
-        dst = Bool(value.strict_eq(a, b));
+        dst = Bool(eq_slow(a, b));
         next
     }
     op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
@@ -889,7 +901,7 @@ pub vm JS {
             if let Num(x) = a { eq = x == x; }
             branch(eq == want, then.target)
         }
-        branch(value.strict_eq(a, b) == want, then.target)
+        branch(eq_slow(a, b) == want, then.target)
     }
 
     op JMP(target: label) : sJ { jump target }
@@ -954,13 +966,16 @@ pub vm JS {
     op CALL(base: callbase, nargs: imm) : ABC {
         if let F(cl) = regs[base] {
             let p = cl.proto;
-            if likely(p.fixed == nargs as u32) {
+            if likely(p.fixed <= 255) {
                 let callee = regs + base + 1;
                 let n = p.nregs as u64;
                 if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
                     cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
                 }
+                // Missing arguments are undefined; extra ones are dropped
+                // (their registers are the callee's locals).
                 var i = nargs as u64 + 1;
+                if nargs as u32 > p.fixed { i = p.fixed as u64 + 1; }
                 while i < n {
                     callee[i] = Undef;
                     i += 1;
@@ -981,8 +996,43 @@ pub vm JS {
             call_slow(base as u64, nargs as u64, 0)
         }
     }
+    /// Push a frame for bytecode function `cl` called at `base` and jump to it.
+    fn enter(cl: Gc<Fn>, base: u64, nargs: u64, flags: u32) -> never {
+        let p = cl.proto;
+        let callee = regs + base + 1;
+        let n = p.nregs as u64;
+        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
+        }
+        let np = p.nparams as u64;
+        var i = nargs + 1;
+        if nargs > np { i = np + 1; }
+        while i < n {
+            callee[i] = Undef;
+            i += 1;
+        }
+        fp.resume = pc + 1;
+        fp = fp + 1;
+        fp.cl = cl;
+        fp.base = callee;
+        fp.flags = flags;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        regs = callee;
+        jump p.code.ptr
+    }
+
     /// R[base] = new R[base](R[base+2] ..).
     op NEW(base: callbase, nargs: imm) : ABC {
+        // A constructor whose objects' root shape is cached for its
+        // current prototype: allocate here and enter it.
+        if let F(cl) = regs[base] and cl.native == 0 and let Some(sh) = cl.ctor_shape and let Some(cp) = cl.ctor_proto
+                and let Some(bag) = cl.props and bag.dict.is_none() and bag.shape.count >= 1 and bag.inline.ptr[0] == V.O(cp) {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            let o = new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp), flags: 0 }, cl.hint as u64);
+            regs[base + 1] = O(o);
+            enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+        }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
             let f = regs[base];

@@ -1271,7 +1271,7 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     let proto = new(h, Proto {
         name: g.ctx.key_str(g.ctx.key(f.name)),
         nparams: np,
-        fixed: np,
+        fixed: if f.ctor { value.NO_FIXED } else { np },
         nregs: fs.regs.frame_size(np + 1),
         nfree: f.free.len as u32,
         flags: flags,
