@@ -54,6 +54,8 @@ pub struct StencilGen {
     /// A variant stencil for constants of one tag: the constant's bits
     /// satisfy `bits & mask == value` (or `bits < value` if `ult`).
     pub variant: Option<(u64, u64, bool)>,
+    /// The register file's state local (`regs`), for `LOIMI_JIT_REGDELAY`.
+    pub regs: Option<LocalId>,
 }
 
 /// A stencil variant of an op for constants of one tag of a value type
@@ -413,6 +415,53 @@ pub fn const_read(g: &mut FnGen, e: &TExpr) -> Option<String> {
     Some(t)
 }
 
+/// `LOIMI_JIT_REGDELAY=n` at build time (an experiment, copy-and-patch.md
+/// section 13): every read of the register file in a stencil goes through
+/// n dependent no-op instructions (`imul $1` on integers, `addsd -0.0` on
+/// floats; 3–4 cycles each), to measure how much of the run time waits on
+/// register-file loads. Off (0) by default.
+pub fn reg_delay() -> u32 {
+    std::env::var("LOIMI_JIT_REGDELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// In a stencil with `LOIMI_JIT_REGDELAY`, a read of the register file
+/// (`regs[i]`, or `*((regs + i) as *T)`): the value, delayed.
+pub fn delayed_reg_read(g: &mut FnGen, e: &TExpr) -> Option<String> {
+    fn strip(e: &TExpr) -> &TExpr {
+        match &e.kind {
+            TK::Cast(a) => strip(a),
+            _ => e,
+        }
+    }
+    let n = g.cg.reg_delay;
+    let regs = g.stencil.as_ref()?.regs?;
+    if n == 0 {
+        return None;
+    }
+    let is_regs = |e: &TExpr| matches!(strip(e).kind, TK::Local(l) if l == regs);
+    let hit = match &e.kind {
+        TK::Index(b, _) => matches!(b.ty, Ty::Ptr(_)) && is_regs(b),
+        TK::Deref(p) => matches!(&strip(p).kind, TK::Intrinsic(Intr::PtrOffset, a) if is_regs(&a[0])),
+        _ => false,
+    };
+    if !hit || e.ty.is_unitlike() || crate::layout::size_of(g.p(), &e.ty) != 8 {
+        return None;
+    }
+    let p = g.place(e);
+    let lt = g.ty(&e.ty);
+    let mut v = g.inst(format!("load {}, ptr {}", lt, p));
+    for _ in 0..n {
+        v = if lt == "double" {
+            g.inst(format!("call double asm sideeffect \"addsd $2, $0\", \"=x,0,x\"(double {}, double -0.0)", v))
+        } else if lt == "i64" {
+            g.inst(format!("call i64 asm sideeffect \"imulq $$1, $1, $0\", \"=r,r\"(i64 {})", v))
+        } else {
+            return Some(v);
+        };
+    }
+    Some(v)
+}
+
 /// The instruction word at pc + off in a stencil, as a constant.
 pub fn word_hole(g: &mut FnGen, off: u32) -> String {
     let name = format!("__jit.w.{}", off);
@@ -696,6 +745,7 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
             pool,
             const_raws: Vec::new(),
             variant: None,
+            regs: vd.state_names.iter().position(|n| n == "regs").map(|i| f.vm_state[i]),
         });
         let st = g.stencil.clone();
         out.push_str(&g.run());

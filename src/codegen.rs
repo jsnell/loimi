@@ -58,6 +58,8 @@ pub struct Codegen<'p> {
     pub cold_syms: std::collections::HashMap<FnId, Vec<String>>,
     /// Stencil holes used (name → end of the symbol's value range).
     pub jit_holes: BTreeMap<String, u64>,
+    /// `LOIMI_JIT_REGDELAY` (`jitgen::reg_delay`), read once.
+    pub reg_delay: u32,
     /// Continuation holes used (name → declaration).
     pub jit_conts: BTreeMap<String, String>,
     /// The stencil functions (`--jit-stencils`).
@@ -158,6 +160,7 @@ impl<'p> Codegen<'p> {
             tramps: Default::default(),
             cold_syms: Default::default(),
             jit_holes: Default::default(),
+            reg_delay: crate::jitgen::reg_delay(),
             jit_conts: Default::default(),
             stencils: String::new(),
             jit_counted: Default::default(),
@@ -786,6 +789,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TK::Unit | TK::Zeroed => "zeroinitializer".into(),
             TK::Local(_) | TK::Global(_) | TK::Deref(_) | TK::Index(..) => {
+                if self.stencil.is_some() {
+                    if let Some(v) = crate::jitgen::delayed_reg_read(self, e) {
+                        return v;
+                    }
+                }
                 let p = self.place(e);
                 self.load(&e.ty, &p)
             }
