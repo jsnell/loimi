@@ -30,9 +30,12 @@ impl Parser {
             verify_ctx: vec![],
             is_pub,
         };
+        // `inline for` variables replace every matching token in the body,
+        // so one named like a state variable would silently replace it.
+        let mut loop_vars: Vec<Ident> = Vec::new();
         while !self.eat("}") {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
-                self.expand_inline_for()?;
+                loop_vars.extend(self.expand_inline_for()?);
                 continue;
             }
             let item_attrs = self.parse_attrs()?;
@@ -126,13 +129,13 @@ impl Parser {
                 }
                 "op" => {
                     self.bump();
-                    let (name, params, format, cache) = self.parse_op_head()?;
+                    let (name, params, format, cache, then) = self.parse_op_head()?;
                     let body = self.vm_block()?;
-                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None });
+                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then });
                 }
                 "family" => {
                     self.bump();
-                    let (name, params, format, cache) = self.parse_op_head()?;
+                    let (name, params, format, cache, then) = self.parse_op_head()?;
                     self.expect("{")?;
                     while !self.eat("}") {
                         let member = self.ident()?;
@@ -149,6 +152,7 @@ impl Parser {
                             cache: cache.clone(),
                             body,
                             family: Some(name.name.clone()),
+                            then: then.clone(),
                         });
                     }
                 }
@@ -242,6 +246,14 @@ impl Parser {
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
         }
+        for v in &loop_vars {
+            if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {
+                return Err(crate::diag::Diag::new(
+                    v.span,
+                    format!("`inline for` variable `{}` has the name of a vm state variable, which it would replace in the body", v.name),
+                ));
+            }
+        }
         Ok(vm)
     }
 
@@ -252,7 +264,8 @@ impl Parser {
         b
     }
 
-    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>)> {
+    #[allow(clippy::type_complexity)]
+    fn parse_op_head(&mut self) -> Res<(Ident, Vec<OpParam>, Ident, Option<Ident>, Option<Ident>)> {
         let name = self.ident()?;
         self.expect("(")?;
         let mut params = Vec::new();
@@ -269,7 +282,8 @@ impl Parser {
         self.expect(":")?;
         let format = self.ident()?;
         let cache = if self.eat("+") { Some(self.ident()?) } else { None };
-        Ok((name, params, format, cache))
+        let then = if self.eat_kw("then") { Some(self.ident()?) } else { None };
+        Ok((name, params, format, cache, then))
     }
 
     pub fn parse_value_decl(&mut self, is_pub: bool) -> Res<ValueDecl> {

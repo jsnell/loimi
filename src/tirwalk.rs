@@ -102,7 +102,12 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
                 go(a);
                 go(b);
             }
-            TVm::Become(_) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+            TVm::Shared(_, args, size) => {
+                args.iter().for_each(|a| locals(a, used, declared));
+                locals(size, used, declared);
+            }
+            TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+            TVm::SharedArg(..) => {}
         },
     }
 }
@@ -310,7 +315,13 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                 go(a, f);
                 go(b, f);
             }
-            TVm::Become(_) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+            TVm::Shared(_, args, size) => {
+                args.iter().for_each(|a| go(a, f));
+                go(size, f);
+            }
+            TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+            TVm::SharedArg(..) => {}
         },
     }
 }
+

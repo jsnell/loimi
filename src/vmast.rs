@@ -45,6 +45,9 @@ pub struct OpDecl {
     pub body: Block,
     /// Set for members of a `family`: the family's generic op name.
     pub family: Option<String>,
+    /// `then OP`: the instruction after this one is an OP (or a member of
+    /// its family), and the body can read its operands as `then.x`.
+    pub then: Option<Ident>,
 }
 
 #[derive(Clone, Debug)]

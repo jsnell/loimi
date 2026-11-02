@@ -25,11 +25,15 @@ pub struct HandlerGen {
     pub labels_global: String,
     /// Tail-call handlers receive the current instruction word in a register.
     pub insn_slot: Option<String>,
+    /// Generating an outlined cold block.
+    pub outlined: bool,
 }
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+            p.vms[vm as usize].dispatch == Dispatch::TailCall
+        }
         _ => false,
     }
 }
@@ -72,6 +76,7 @@ pub fn handler_prologue(g: &mut FnGen) {
         raise_slot: format!("@\"{}.raise_slot\"", vd.symbol),
         labels_global: format!("@\"{}.labels\"", f.symbol),
         insn_slot: None,
+        outlined: g.cold.is_some(),
     };
     if takes_insn(p, f) {
         let wt = Ty::Int(vd.word);
@@ -379,12 +384,15 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let hg = g.vm.clone().unwrap();
             g.load(&e.ty, &hg.raise_slot)
         }
-        TVm::Become(opc) => {
+        TVm::Become(opc, back) => {
             let hg = g.vm.clone().unwrap();
             let p = g.p();
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
-            let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            if *back > 0 {
+                pc = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 -{}", wt, pc, back));
+            }
             let w = g.inst(format!("load {}, ptr {}", wt, pc));
             let mask = ((1u64 << vd.op_bits) - 1) << vd.op_shift;
             let cleared = g.inst(format!("and {} {}, {}", wt, w, !mask as i64 & word_mask(vd.word.bits)));
@@ -407,6 +415,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let vd = &p.vms[hg.vm as usize];
             let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
             let np = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, size));
+            if hg.outlined {
+                // Out of the super's handler: run the next part's word on
+                // its own (it holds an op of the part's family).
+                dispatch(g, &np);
+                return g.poison(&e.ty);
+            }
             g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
             // The next part decodes its own word.
             if let Some(slot) = &hg.insn_slot {
@@ -442,6 +456,23 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             }
             g.poison(&e.ty)
         }
+        TVm::Shared(fid, args, size) => {
+            let p = g.p();
+            let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
+            for (i, a) in args.iter().chain(std::iter::once(&**size)).enumerate() {
+                let v = g.val(a);
+                let slot = shared_slot(g, *fid, i, &a.ty);
+                g.store(&a.ty, &v, &slot);
+            }
+            // Entries have no current instruction; the shared copy ignores it.
+            let w = if g.vm.as_ref().unwrap().role == VmRole::Entry { "0".to_string() } else { current_word(g, vd) };
+            tail_to(g, vd, &format!("@\"{}\"", p.fns[*fid as usize].symbol), &w);
+            g.poison(&e.ty)
+        }
+        TVm::SharedArg(fid, i) => {
+            let slot = shared_slot(g, *fid, *i as usize, &e.ty);
+            g.load(&e.ty, &slot)
+        }
         TVm::Synced(sync, call) => {
             g.val(sync);
             g.val(call)
@@ -465,9 +496,10 @@ fn can_outline(g: &FnGen, b: &TExpr) -> bool {
     if hg.combined || b.ty != Ty::Never {
         return false;
     }
-    let p = g.p();
     match g.f().vm_role {
-        VmRole::Handler(k) => p.vms[hg.vm as usize].ops[k as usize].parts.is_empty(),
+        // In a superinstruction, `next` from a part other than the last
+        // dispatches the next part's word when outlined.
+        VmRole::Handler(_) => true,
         _ => false,
     }
 }
@@ -484,6 +516,15 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     crate::tirwalk::locals(b, &mut used, &mut declared);
     let captured: Vec<LocalId> =
         used.into_iter().filter(|l| !declared.contains(l) && !f.vm_state.contains(l)).collect();
+    // Operand fields are decoded again from the instruction word, which
+    // the cold function receives in its register: nothing to store.
+    let decoded = decode_lets(f.body.as_ref().unwrap());
+    let (redo, captured): (Vec<LocalId>, Vec<LocalId>) = captured.into_iter().partition(|l| decoded.iter().any(|(d, _)| d == l));
+    let mut body = b.clone();
+    if !redo.is_empty() {
+        let lets = decoded.into_iter().filter(|(l, _)| redo.contains(l)).map(|(l, e)| TStmt::Let(l, Some(e))).collect();
+        body = TExpr { ty: b.ty.clone(), kind: TK::Block(lets, Some(Box::new(body))), span: b.span };
+    }
     for &l in &captured {
         let t = f.locals[l as usize].ty.clone();
         let gname = format!("@\"{}.c{}\"", sym, l);
@@ -494,7 +535,47 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     }
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
-    g.cg.cold_queue.push((g.fid, b.clone(), captured, sym));
+    g.cg.cold_queue.push((g.fid, body, captured, sym));
+}
+
+/// The handler's operand-field decodes: `let raw = <bits of word 0>;` at
+/// the top of its body, or of each part of a superinstruction (decoded
+/// from the part's own word, which is the current word in that part).
+fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
+    fn pure(e: &TExpr) -> bool {
+        match &e.kind {
+            TK::Int(_) | TK::Vm(TVm::Word(0)) => true,
+            TK::Binary(_, a, b) => pure(a) && pure(b),
+            TK::Cast(a) => pure(a),
+            _ => false,
+        }
+    }
+    let TK::Block(stmts, tail) = &body.kind else { return vec![] };
+    let mut out = Vec::new();
+    for s in stmts {
+        match s {
+            TStmt::Let(l, Some(e)) if pure(e) => out.push((*l, e.clone())),
+            TStmt::Expr(TExpr { kind: TK::Vm(TVm::Part(_, b)), .. }) => out.extend(decode_lets(b)),
+            _ => {}
+        }
+    }
+    if let Some(t) = tail {
+        if let TK::Vm(TVm::Part(_, b)) = &t.kind {
+            out.extend(decode_lets(b));
+        }
+    }
+    out
+}
+
+/// Thread-local slot for argument `i` of the shared copy `fid` of a
+/// `-> never` vm function.
+fn shared_slot(g: &mut FnGen, fid: FnId, i: usize, t: &Ty) -> String {
+    let p = g.p();
+    let name = format!("@\"{}.a{}\"", p.fns[fid as usize].symbol, i);
+    if g.cg.tls_defined.insert(name.clone()) {
+        let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", name, llty(p, t));
+    }
+    name
 }
 
 /// `--vm-stats`: count this op and the (previous op, this op) pair.
@@ -716,7 +797,9 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
 /// emitted inside their entries).
 pub fn standalone(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+            p.vms[vm as usize].dispatch == Dispatch::TailCall
+        }
         _ => true,
     }
 }

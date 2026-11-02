@@ -19,6 +19,11 @@ pub struct OpLayout {
     pub cache_words: u32,
     /// For superinstructions: component op indices.
     pub parts: Vec<usize>,
+    /// Index of the family's generic op (the op itself outside families;
+    /// the first part's family for superinstructions).
+    pub family: usize,
+    /// `then OP`: the op that must follow this one.
+    pub then: Option<usize>,
 }
 
 pub struct VmLayout {
@@ -103,7 +108,19 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
             None => 0,
         };
         let kinds = op.params.iter().map(|p| p.kind.name.clone()).collect();
-        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache_words, parts: vec![] });
+        let family = match &op.family {
+            Some(f) => v.ops.iter().position(|o| o.name.name == *f).unwrap_or(i),
+            None => i,
+        };
+        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache_words, parts: vec![], family, then: None });
+    }
+    for (i, op) in v.ops.iter().enumerate() {
+        if let Some(t) = &op.then {
+            let Some(j) = v.ops.iter().position(|o| o.name.name == t.name) else {
+                return Err(Diag::new(t.span, format!("unknown op `{}`", t.name)));
+            };
+            ops[i].then = Some(j);
+        }
     }
     for s in &v.supers {
         let mut parts = Vec::new();
@@ -117,8 +134,12 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         if parts.len() < 2 {
             return Err(Diag::new(s.name.span, "a superinstruction needs at least two parts"));
         }
+        if let Some(o) = ops.iter().find(|o| o.parts == parts) {
+            return Err(Diag::new(s.name.span, format!("superinstruction `{}` has the same parts as `{}`", s.name.name, o.name)));
+        }
         let opcode = ops.len() as u32;
-        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache_words: 0, parts });
+        let family = ops[parts[0]].family;
+        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache_words: 0, parts, family, then: None });
     }
     if ops.len() as u64 > (1u64 << op_bits) {
         return Err(Diag::new(v.name.span, format!("{} ops do not fit in a {}-bit opcode field", ops.len(), op_bits)));
@@ -132,11 +153,32 @@ impl VmLayout {
         let o = &self.ops[i];
         if o.parts.is_empty() { 1 + o.cache_words } else { o.parts.iter().map(|&p| self.size(p)).sum() }
     }
+    /// The op a word stands for on its own: a superinstruction's first part.
+    pub fn base(&self, i: usize) -> usize {
+        self.ops[i].parts.first().copied().unwrap_or(i)
+    }
+    /// (word offset, op) of each part of op `i` (the op itself if not a super).
+    pub fn part_offsets(&self, i: usize) -> Vec<(u32, usize)> {
+        let o = &self.ops[i];
+        if o.parts.is_empty() {
+            return vec![(0, i)];
+        }
+        let mut off = 0;
+        o.parts
+            .iter()
+            .map(|&p| {
+                let r = (off, p);
+                off += self.size(p);
+                r
+            })
+            .collect()
+    }
 }
 
 /// Source expression decoding field (bits, shift, signed) of word `w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
-    let rt = field_ty(bits, signed);
+    // As in handlers: operand fields are 64-bit.
+    let rt = if signed { "i64" } else { "u64" };
     if signed {
         format!(
             "(((w << {}) as i{wb}) >> {}) as {}",
@@ -182,30 +224,39 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
     let _ = writeln!(s, "  if code.len > 524288 {{ return Some(0); }}");
     let _ = writeln!(s, "  var bits: [u8; 65536] = [0; 65536];");
     let _ = writeln!(s, "  var i: u64 = 0;");
+    // Instructions are walked one component at a time: the words after a
+    // superinstruction's head are instructions too (jumps may land on
+    // them, and `redo` or `next` from a shared tail runs them alone), so
+    // each must hold an op of the same family as the super's part.
     let _ = writeln!(s, "  while i < code.len {{");
     let _ = writeln!(s, "    if {n}__opcode(code[i]) as u64 >= {n}__NUM_OPS {{ return Some(i); }}");
     let _ = writeln!(s, "    bits[i >> 3] = bits[i >> 3] | ((1 as u8) << ((i & 7) as u8));");
-    let _ = writeln!(s, "    let n = {n}__op_size(code[i]);");
-    let _ = writeln!(s, "    if i + n > code.len {{ return Some(i); }}");
-    let _ = writeln!(s, "    i += n;\n  }}");
+    let _ = writeln!(s, "    if i + {n}__op_size(code[i]) > code.len {{ return Some(i); }}");
+    let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
+    for (k, o) in l.ops.iter().enumerate() {
+        let mut conds: Vec<String> = l.part_offsets(k)[1..]
+            .iter()
+            .map(|(off, p)| format!("{n}__family(code[i + {off}]) != {}", l.ops[*p].family))
+            .collect();
+        // `then OP`: the next instruction must be an OP.
+        let b = l.base(k);
+        if let Some(t) = l.ops[b].then {
+            let sz = l.size(b);
+            conds.push(format!("i + {sz} >= code.len or {n}__family(code[i + {sz}]) != {}", l.ops[t].family));
+        }
+        if !conds.is_empty() {
+            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(i); }} }}", o.opcode, conds.join(" or "));
+        }
+    }
+    let _ = writeln!(s, "      _ => {{}}\n    }}");
+    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");
     let _ = writeln!(s, "  i = 0;\n  while i < code.len {{");
     let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
-    for o in &l.ops {
-        let parts: Vec<(u32, usize)> = if o.parts.is_empty() {
-            vec![(0, o.opcode as usize)]
-        } else {
-            let mut off = 0;
-            o.parts
-                .iter()
-                .map(|&p| {
-                    let r = (off, p);
-                    off += l.size(p);
-                    r
-                })
-                .collect()
-        };
+    for (k, o) in l.ops.iter().enumerate() {
         let mut checks = String::new();
-        for (off, p) in parts {
+        // A super's head word carries its first part's operands; the
+        // other parts are checked at their own words.
+        for (off, p) in l.part_offsets(k).into_iter().take(1) {
             let po = &l.ops[p];
             for (fi, (_, bits, shift, signed)) in po.fields.iter().enumerate() {
                 if let Some(c) = clause(&po.kinds[fi]) {
@@ -223,7 +274,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    i += {n}__op_size(code[i]);\n  }}\n  None\n}}");
+    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n  None\n}}");
     s
 }
 
@@ -268,6 +319,22 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         let _ = writeln!(s, "  {} => {},", o.opcode, l.size(i));
     }
     let _ = writeln!(s, "  _ => 1, }} }}");
+    // Per word on its own: a superinstruction's first part.
+    let _ = writeln!(s, "{vis}fn {n}__base_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
+    for (i, o) in l.ops.iter().enumerate() {
+        let _ = writeln!(s, "  {} => {},", o.opcode, l.size(l.base(i)));
+    }
+    let _ = writeln!(s, "  _ => 1, }} }}");
+    let _ = writeln!(s, "{vis}fn {n}__base_op(w: {w}) -> {w} {{ match {n}__opcode(w) {{");
+    for (i, o) in l.ops.iter().enumerate() {
+        let _ = writeln!(s, "  {} => {},", o.opcode, l.ops[l.base(i)].opcode);
+    }
+    let _ = writeln!(s, "  x => x, }} }}");
+    let _ = writeln!(s, "fn {n}__family(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
+    for o in &l.ops {
+        let _ = writeln!(s, "  {} => {},", o.opcode, o.family);
+    }
+    let _ = writeln!(s, "  _ => {}, }} }}", u64::MAX);
     let _ = writeln!(s, "{vis}fn {n}__op_name(w: {w}) -> str {{ match {n}__opcode(w) {{");
     for o in &l.ops {
         let _ = writeln!(s, "  {} => \"{}\",", o.opcode, o.name);
@@ -275,27 +342,30 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     let _ = writeln!(s, "  _ => \"<invalid>\", }} }}");
     // Superinstruction peephole: rewrite the first word of each matching
     // sequence. The other words keep their opcodes, so jumps into the
-    // middle of a fused sequence still execute the original ops.
+    // middle of a fused sequence still execute the original ops. Words
+    // are compared by the op they stand for alone, so code can be
+    // optimized again (after quickening, say); the longest match wins.
     let _ = writeln!(s, "{vis}fn {n}__optimize(code: []{w}) {{");
-    let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{\n    let n = {n}__op_size(code[i]);");
-    for o in l.ops.iter().filter(|o| !o.parts.is_empty()) {
-        let mut conds = Vec::new();
-        let mut off = String::from("i");
-        for (k, &p) in o.parts.iter().enumerate() {
-            if k > 0 {
-                conds.push(format!("{off} < code.len"));
-            }
-            conds.push(format!("{n}__opcode(code[{off}]) == {}", l.ops[p].opcode));
-            off = format!("{off} + {}", l.size(p));
+    let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
+    let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
+    supers.sort_by_key(|&k| std::cmp::Reverse(l.ops[k].parts.len()));
+    let mut first = true;
+    for k in supers {
+        let o = &l.ops[k];
+        let mut conds = vec![format!("i + {} <= code.len", l.size(k))];
+        for (off, p) in l.part_offsets(k) {
+            conds.push(format!("{n}__base_op(code[i + {off}]) == {}", l.ops[p].opcode));
         }
         let _ = writeln!(
             s,
-            "    if {} {{ code[i] = {n}__with_opcode(code[i], {}); }}",
+            "    {}if {} {{ code[i] = {n}__with_opcode(code[i], {}); }}",
+            if first { "" } else { "else " },
             conds.join(" and "),
             o.opcode
         );
+        first = false;
     }
-    let _ = writeln!(s, "    i += n;\n  }}\n}}");
+    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n}}");
     s
 }
 

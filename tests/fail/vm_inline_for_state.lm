@@ -1,0 +1,11 @@
+vm V {
+    state { pc: *u32, k: *i64 }
+    operand imm = it;
+    encoding fixed(u32) { format AB { op: 8, a: 8 } }
+    inline for (name, k) in [("A", imm), ("B", imm)] {
+        op #name(x: k) : AB { next }
+    }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `inline for` variable `k` has the name of a vm state variable

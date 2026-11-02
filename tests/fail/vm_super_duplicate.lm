@@ -1,0 +1,11 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op NOP() : A { next }
+    op HALT() : A { exit 0 }
+    super NOP_HALT = NOP; HALT;
+    super NOP_HALT2 = NOP; HALT;
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: superinstruction `NOP_HALT2` has the same parts as `NOP_HALT`

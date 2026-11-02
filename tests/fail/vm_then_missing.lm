@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    operand label = pc + it;
+    encoding fixed(u32) { format A { op: 8 } format sJ { op: 8, sj: s24 } }
+    op JMP(target: label) : sJ { jump target }
+    op SKIP() : A { jump then.target }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: op `SKIP` does not declare `then OP`

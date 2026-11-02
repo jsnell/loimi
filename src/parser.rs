@@ -159,23 +159,25 @@ impl Parser {
     /// in parentheses when more than one token). `#a` turns a string or
     /// identifier value into an identifier. The expansion is spliced into
     /// the token stream in place of the construct.
-    pub fn expand_inline_for(&mut self) -> Res<()> {
+    /// Expand an `inline for`; returns its loop variables.
+    pub fn expand_inline_for(&mut self) -> Res<Vec<Ident>> {
         let start = self.pos;
         let span = self.span();
         self.expect_kw("inline")?;
         self.expect_kw("for")?;
-        let mut vars = Vec::new();
+        let mut idents = Vec::new();
         if self.eat("(") {
             while !self.is(")") {
-                vars.push(self.ident()?.name);
+                idents.push(self.ident()?);
                 if !self.eat(",") {
                     break;
                 }
             }
             self.expect(")")?;
         } else {
-            vars.push(self.ident()?.name);
+            idents.push(self.ident()?);
         }
+        let vars: Vec<String> = idents.iter().map(|i| i.name.clone()).collect();
         self.expect_kw("in")?;
         self.expect("[")?;
         // Elements: balanced token groups separated by top-level commas.
@@ -248,7 +250,7 @@ impl Parser {
         let end = self.pos;
         self.toks.splice(start..end, out);
         self.pos = start;
-        Ok(())
+        Ok(idents)
     }
 
     /// Tokens up to (not including) one of `stops` at nesting depth 0.

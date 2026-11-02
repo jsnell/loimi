@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    fn tail(c: bool) -> never { if c { jump pc + 1 } }
+    op NOP() : A { tail(true) }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: vm function `tail` returns `never` but can reach its end

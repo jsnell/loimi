@@ -177,8 +177,9 @@ pub enum TVm {
     Jump(B),
     Exit(B),
     Raise(B),
-    /// Rewrite the current instruction's opcode.
-    Become(u32),
+    /// Rewrite the opcode of the word `back` words before pc (0: the
+    /// current instruction; more for the head of a superinstruction).
+    Become(u32, u32),
     Cold(B),
     /// The code word at `pc + offset` (a place).
     Word(u32),
@@ -192,6 +193,12 @@ pub enum TVm {
     TableAddr(u32),
     /// Continue with the real handler of op `i` (from an instrumentation wrapper).
     Chain(u32),
+    /// Tail-call mode: continue in the shared copy of a `-> never` vm
+    /// function (its FnId), passing the arguments and the size `next`
+    /// skips through thread-local slots.
+    Shared(FnId, Vec<TExpr>, B),
+    /// In a shared copy: argument `i` (the last one is the `next` size).
+    SharedArg(FnId, u32),
     /// A call that may collect or observe vm state: run the vm's `sync`
     /// block, keep traced locals visible to the GC, then call.
     Synced(B, B),
@@ -359,6 +366,8 @@ pub enum VmRole {
     Entry,
     Raise,
     VmFn,
+    /// Shared copy of the `-> never` vm function with this index (tail-call mode).
+    Shared(u32),
     /// Instrumentation wrapper: (variant index, op index).
     Wrapper(u32, u32),
 }

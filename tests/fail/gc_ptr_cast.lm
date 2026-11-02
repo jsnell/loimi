@@ -1,0 +1,7 @@
+import std.gc;
+
+object Node { value: i64 }
+
+fn get(p: *u8) -> Gc<Node> { p as Gc<Node> }
+fn main() {}
+// error: casting `*u8` to `Gc<Node>` is unsafe: it must point to a live `Node` in the GC heap

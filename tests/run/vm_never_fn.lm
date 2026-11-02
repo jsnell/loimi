@@ -1,0 +1,122 @@
+// matrix: dispatch
+// `-> never` vm functions: shared tails that end in control words.
+import std.io;
+
+struct M { calls: i64 }
+
+vm V {
+    context ctx: *M;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    // Branch to the target of the JMP word that follows, or skip it.
+    fn branch() -> never { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+    fn skip() -> never { jump pc + 2 }
+    fn cond_branch(take: bool) -> never {
+        if take { branch() }
+        skip()
+    }
+    // A shared slow path: uses state, its arguments and `next`.
+    fn slow_set(i: u64, v: i64) -> never {
+        ctx.calls += 1;
+        regs[i] = v;
+        next
+    }
+    // Calls another `-> never` function.
+    fn double_set(i: u64) -> never {
+        let v = regs[i] * 2;
+        slow_set(i, v)
+    }
+    fn fail_div(x: i64) -> never { raise x + 1000 }
+    #[inline(never)]
+    fn bump(i: u64) -> never {
+        regs[i] = regs[i] + 1;
+        next
+    }
+    fn start(c: *u32) -> never { jump c }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op BRLT(a: reg, b: reg) : ABC { cond_branch(a < b) }
+    op JMP(target: label) : sJ { jump target }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        if b == 0 { cold { fail_div(a) } }
+        dst = a / b;
+        next
+    }
+    op SLOW(dst: reg, a: reg) : ABC {
+        if a < 0 { dst = 0; next }
+        cold { slow_set(dst.raw as u64, a + 1) }
+    }
+    op DOUBLE(dst: reg) : ABC { cold { double_set(dst.raw as u64) } }
+    op BUMP(dst: reg) : ABC { bump(dst.raw as u64) }
+    op HALT(src: reg) : ABC { exit src }
+
+    super SLOW_ADD = SLOW; ADD;
+    super BUMP_BUMP = BUMP; BUMP;
+
+    entry run(m: *M, code: *u32, r: *i64) -> i64 {
+        ctx = m;
+        regs = r;
+        start(code)
+    }
+
+    on raise(e: i64) { exit 0 - e }
+}
+
+fn main() {
+    var m = M { calls: 0 };
+    var code: [u32; 32] = [0; 32];
+    var regs: [i64; 8] = [0; 8];
+    let c = code[..];
+    // r0 = 0; r1 = 10; r2 = 1; loop: r0 += r2; if r0 < r1 goto loop; halt r0
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 10);
+    at = V.emit.LOADI(c, at, 2, 1);
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.BRLT(c, at, 0, 1);
+    at = V.emit.JMP(c, at, -2);
+    at = V.emit.HALT(c, at, 0);
+    io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");
+
+    // Shared slow path with `next`, alone and as the first part of a super.
+    at = 0;
+    at = V.emit.LOADI(c, at, 0, 5);
+    at = V.emit.SLOW(c, at, 1, 0);     // r1 = 6
+    at = V.emit.ADD(c, at, 2, 1, 1);   // r2 = 12
+    at = V.emit.DOUBLE(c, at, 2);      // r2 = 24
+    at = V.emit.BUMP(c, at, 2);        // 25
+    at = V.emit.BUMP(c, at, 2);        // 26
+    at = V.emit.HALT(c, at, 2);
+    io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");
+    V.optimize(c);
+    io.println(V.op_name(code[1]));
+    io.println(V.op_name(code[4]));
+    io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");
+    io.print_int(m.calls); io.println("");
+
+    // Raise from a cold call.
+    at = 0;
+    at = V.emit.LOADI(c, at, 0, 7);
+    at = V.emit.LOADI(c, at, 1, 0);
+    at = V.emit.DIV(c, at, 2, 0, 1);
+    at = V.emit.HALT(c, at, 2);
+    io.print_int(V.run(&m, &code[0], &regs[0])); io.println("");
+}
+// expect: 10
+// expect: 26
+// expect: SLOW_ADD
+// expect: BUMP_BUMP
+// expect: 26
+// expect: 4
+// expect: -1007

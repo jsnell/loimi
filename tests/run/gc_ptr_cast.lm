@@ -1,0 +1,19 @@
+// `unsafe { p as Gc<T> }`: a raw pointer or address back to a traced reference.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn main() {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let n = new(h, Node { value: 42, next: None });
+    let p = n as *u8;                      // e.g. stored in a C-side table
+    let addr = n as u64;
+    let back = unsafe { p as Gc<Node> };
+    let back2 = unsafe { addr as Gc<Node> };
+    io.print_int(back.value + back2.value); io.println("");
+    io.println(if back as *u8 == p { "same" } else { "different" });
+}
+// expect: 84
+// expect: same

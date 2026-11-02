@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    fn tail() -> never { become NOP; next }
+    op NOP() : A { tail() }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `become` is not allowed in vm functions

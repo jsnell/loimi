@@ -161,6 +161,9 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
 }
 ```
 
+Inside a `vm`, a loop variable may not have the name of a state variable:
+it would replace every use of that name in the body.
+
 ### 1.5 Modules and interop
 
 `import std.gc.{Gc, Heap};`. `extern "C" fn` declares C functions, and
@@ -313,9 +316,14 @@ operand upv   = ctx.closure.upvals[it] verify it < proto.nupvals;
 (typically the function prototype being checked, `verify_context proto: Gc<Proto>;`).
 
 If the expression is a place (like `regs[it]`), the operand is assignable:
-`dst = Int(1)` writes the register. `x.raw` gives the undecoded field. The raw
-field's width and signedness come from the format, so one `label` kind serves
-8-bit and 24-bit offsets alike.
+`dst = Int(1)` writes the register. `x.raw` gives the undecoded field.
+
+The raw field `it` (and `x.raw`) is a `u64`, or an `i64` for a signed field
+(sign-extended), whatever the field's width: most fields are indices, and
+`regs[a + 1]` should be one 64-bit add, not a wrapping 8-bit add and a
+zero-extension. The width and signedness come from the format and matter
+to the encoders (`Vm.OP(a: u8, ..)`), so one `label` kind serves 8-bit and
+24-bit offsets alike.
 
 ### 3.3 Encodings and formats
 
@@ -377,13 +385,44 @@ load overlaps with the handler's work.
 
 ### 3.5 VM functions
 
-A `fn` inside a `vm` block is a **vm function**. It can read and write state,
-is always inlined into its callers, and, if its return type is `never`, can
-use control words. That makes shared tails easy to write:
+A `fn` inside a `vm` block is a **vm function**. It can read and write state
+and is always inlined into its callers. If its return type is `never`, it
+can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
+`?` on the raise type. That makes shared tails easy to write:
 
 ```loimi
 fn call_closure(c: Gc<Closure>, base: *Value, nargs: u8) -> never { ...; jump c.proto.code_start() }
+
+// The word after a conditional op is a JMP holding the branch offset.
+fn branch() -> never { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+fn cond_branch(take: bool) -> never { if take { branch() } jump pc + 2 }
+op JLT(a: reg, b: reg) : ABC { cond_branch(a < b) }
 ```
+
+Rules for `-> never` vm functions:
+
+- Every path must end in a control word.
+- `next` and `redo` mean what they mean in the calling op: `next` skips the
+  caller's instruction (in a superinstruction part, it continues with the
+  next part). A function that uses `next` can only be reached from op
+  handlers, not from entries or `on raise`.
+- The body sees the vm state and its own parameters, but not the caller's
+  operands: pass `dst.raw` or values as arguments. `become` and `cache` are
+  not allowed, since they belong to the calling op.
+- They can only be called where control words are allowed: op handlers,
+  entries, `on raise`, and other `-> never` vm functions.
+
+How a call is compiled depends on the dispatch mode and on where it is:
+
+| | Call site on the hot path | Call site in a `cold` block, or recursive |
+|---|---|---|
+| `tailcall` | body inlined | `musttail` to one shared copy with the handler signature |
+| `goto`, `switch` | body inlined | body inlined (recursion is an error) |
+
+The shared copy is reached like an outlined cold block: the arguments, and
+the size `next` skips, go through thread-local slots, and the state stays
+in registers. `#[inline]` on the function inlines every call;
+`#[inline(never)]` makes every call in tail-call mode use the shared copy.
 
 ### 3.6 Entries and the error path
 
@@ -584,6 +623,30 @@ reserves and zero-fills it, and the disassembler prints it. Inside the handler,
 don't keep their target alive. When the target dies, the GC resets the entry
 to zero, which the handler sees as a miss (`stdlib/gc.md` §8).
 
+### 7.1a The following instruction: `then`
+
+Lua-style conditional ops are followed by a JMP word that holds the branch
+offset, so the compiler's jump patching and the verifier treat it as an
+ordinary jump. `then OP` after the format (and cache) says that the next
+instruction is an `OP`, or a member of its family, and `then.x` reads its
+operand `x`: decoded from that word with `OP`'s format and evaluated by
+`OP`'s operand kind, with `pc` at that word.
+
+```loimi
+op JMP(target: label) : sJ { jump target }
+op LT(a: reg, b: reg) : ABC then JMP {
+    if a < b { jump then.target }
+    jump pc + 2                    // skip the JMP
+}
+```
+
+The JMP stays a separate instruction (`next` skips only `LT`); the
+generated verifier checks that it is there, and checks its operands at its
+own word. `then` operands are read-only, and not available in vm
+functions (pass them as arguments). This is the same idea as an inline
+cache (`cache.slot` is the word after the instruction), with the word
+typed as an instruction instead of a cache layout.
+
 ### 7.2 Families and `become`
 
 A `family` is a group of ops that share operands, format, and cache, with
@@ -622,11 +685,34 @@ atomic store, which the compiler emits when the vm is declared
 ```loimi
 super LOADK_ADD = LOADK; ADD;
 super MOVE_RETURN = MOVE; RETURN;
+super LOADI_ADD_F_RET = LOADI; ADD_F; RET1;   // any number of parts; family members too
 ```
 
 The compiler builds the handler by inlining the component bodies in order.
-Paths of the first component that end in `next` fall through into the second.
-Other control words (`jump`, `raise`, ...) keep their meaning.
+Paths of a component that end in `next` fall through into the next one.
+Other control words (`jump`, `raise`, ...) keep their meaning; `redo` in a
+later part runs that part's own word alone.
+
+A part can name any op, including a specialized family member
+(`GETGLOBAL_C`, `ADD_F`). No two supers may have the same parts.
+
+**`become` inside a super.** A part that executes `become X` rewrites its
+own word to `X`, as it would alone (so a jump into the middle sees the
+specialization). It also rewrites the super's first word: to the super
+whose parts are the same with this part replaced by `X`, if one is
+declared, and otherwise to the sequence's first op, which splits the
+super up. For example, with
+
+```loimi
+super LOADI_ADD = LOADI; ADD;
+super LOADI_ADD_F = LOADI; ADD_F;
+```
+
+the first time `LOADI_ADD`'s `ADD` part sees two floats and runs
+`become ADD_F`, the code changes to `LOADI_ADD_F, ADD_F`; when `ADD_F`
+deoptimizes with `become ADD`, it changes back. Without `LOADI_ADD_F`, it
+would become `LOADI, ADD_F`. `Vm.optimize` can be run again on quickened
+code to fuse supers of specialized members.
 
 With `fixed` encodings, the fused op **reuses the components' words**: the
 first word's opcode is rewritten to the super-op and the following words stay
@@ -634,6 +720,13 @@ as they are, so the super-op reads operands from both words. A jump into the
 second word still runs the original second instruction, so fusion is always
 safe, needs no control-flow analysis, and can happen at build time (peephole
 in `Mini.Builder`) or at run time (quickening).
+
+`Vm.optimize(code)` is the generated peephole pass. It compares words by
+the op they stand for alone (a super's head counts as its first part), so
+it can run again on code that has been optimized and quickened; where
+several supers match, the one with the most parts wins. The generated
+verifier treats every part's word as an instruction: jumps may land on
+it, and it must hold an op of the same family as the super's part.
 
 `loimi build --vm-stats` records opcode pair frequencies.
 `loimi vm suggest-supers` turns them into ranked `super` declarations.
@@ -649,6 +742,9 @@ enough to make it precise and cheap:
   header (type id, mark bits) and the trace function from field types.
   A trailing variable-length array is allowed (`slots: [Value]`).
 - **`Gc<T>`** is a traced reference. A `Value` traces whichever variants hold `Gc`.
+  It converts to a raw pointer or a `u64` address with `as`. The way back
+  (`p as Gc<T>` from a pointer, a `u64`, or another `Gc`) is only allowed
+  inside `unsafe { }`, since nothing checks that `p` points to a live `T`.
 - **Write barriers.** Stores of `Gc`/`Value` into object fields are lowered
   through the heap policy's barrier, which is a compile-time parameter
   (`#![heap = std.gc.MarkSweep]`). Non-incremental mark-sweep has no barrier,

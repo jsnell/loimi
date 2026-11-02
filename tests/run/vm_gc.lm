@@ -39,7 +39,7 @@ vm M {
 
     op STR(dst: reg, ch: imm) : ABC {
         let s = new(&ctx.heap, Str {}, 1);
-        s.data[0] = ch;
+        s.data[0] = ch as u8;
         dst = S(s);
         next
     }

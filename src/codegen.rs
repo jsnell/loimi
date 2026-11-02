@@ -28,6 +28,8 @@ pub struct Codegen<'p> {
     /// Outlined cold blocks waiting to be emitted: (handler, body, captured locals, symbol).
     pub cold_queue: Vec<(FnId, TExpr, Vec<LocalId>, String)>,
     pub cold_count: u32,
+    /// Thread-local argument slots of shared `-> never` vm functions already defined.
+    pub tls_defined: std::collections::HashSet<String>,
     /// Per function: immutable f64 locals bound only from the unboxed
     /// variant of a nanbox value (see `values::nan_safe`).
     pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
@@ -115,6 +117,7 @@ impl<'p> Codegen<'p> {
             nan_safe: Default::default(),
             cold_queue: vec![],
             cold_count: 0,
+            tls_defined: Default::default(),
         }
     }
 
@@ -1581,7 +1584,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             (Ty::F32, Ty::F64) => self.inst(format!("fpext float {} to double", v)),
             (Ty::F64, Ty::F32) => self.inst(format!("fptrunc double {} to float", v)),
-            (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => v,
+            (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_) | Ty::Gc(_)) => v,
+            (Ty::Int(_), Ty::Gc(_)) => self.inst(format!("inttoptr {} {} to ptr", ft, v)),
             (Ty::Ptr(_) | Ty::Gc(_), Ty::Int(_)) => self.inst(format!("ptrtoint ptr {} to {}", v, tt)),
             (Ty::Int(_), Ty::Ptr(_)) => self.inst(format!("inttoptr {} {} to ptr", ft, v)),
             _ => v,
