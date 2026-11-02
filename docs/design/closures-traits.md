@@ -1,7 +1,9 @@
 # Design note: closures and static traits
 
-Status: section 0 implemented; section 2 implemented in the reduced
-scope of "Step 1 scope" below; section 1 is a proposal. Written 2026-11-02.
+Status: implemented. Section 0 first, then section 2 in the reduced scope
+of "Step 1 scope", then the rest of section 2 and section 1 as described
+in "Step 2 (implemented)" at the end, which also lists where the result
+differs from the proposal. Written 2026-11-02.
 
 Loimi has generics (monomorphized, with methods resolved per instance) and
 plain function pointers (`fn(A) -> R`). It has no closures and no traits.
@@ -289,3 +291,135 @@ checking generic bodies against their bounds, `Pratt` as a trait.
 3. Non-escaping `block fn` closures for comparators and visitors, with
    captures by reference. Revisit escaping closures only together with a
    story for environments in arenas or the GC heap.
+
+## Step 2 (implemented)
+
+Done 2026-11-02: the rest of section 2, and section 1 with the vm part
+cut down. Language-level description in `language.md` §1.2 ("Traits",
+"Closures"); tests in `tests/run/traits_full.lm`, `closures.lm`,
+`gc_closures.lm`, `sort_by.lm`, `std_parse_hooks.lm` and
+`tests/fail/{trait,closure,block}_*.lm`.
+
+### Traits
+
+- **Default methods** are trait methods with a body. Every trait method
+  is registered as a generic function over `[trait params.., Self,
+  method params..]` with `Self` bounded by the trait. Its signature is
+  what a call through a bound checks against; its body, if any, is the
+  default, instantiated like any generic function with `Self` = the
+  implementing type. Method lookup on a concrete type tries the type's
+  own methods first and falls back to a default of a trait the type
+  implements (two traits providing the same default is an ambiguity
+  error).
+- **Generic traits** (`trait Hooks<K, E, X>`) and **trait arguments in
+  bounds and impls** (`P: Hooks<K, E, X>`, `impl Conv<i64> for Sym;`).
+  The impl table is keyed by (trait, arguments, type).
+- **Generic trait methods** (`fn fold<U>(..)`): the impl check
+  instantiates both the trait's signature and the type's method with
+  fresh opaque types for `U` (carrying the trait method's bounds), so the
+  method must be generic with the same number of parameters and match.
+- **Generic impls** `impl<T: Hash> Hash for Vec<T>;`: the type and trait
+  arguments are patterns over the impl's parameters; `implements(ty,
+  trait, args)` unifies them with the instance and checks the impl's
+  bounds on the bindings, recursively. The impl's methods are checked
+  once, with its parameters as opaque types that have the impl's bounds.
+- **Implied bounds**: a method of a generic type has the type's bounds
+  on its receiver parameters (`fn HashMap<K, V>.probe` can call
+  `key.hash()`), as `std.map` already assumed.
+- **Generic bodies are checked against their bounds** ("later step" in
+  section 2). The body of a generic function is still checked per
+  instance (that is where its code comes from), but before an instance
+  is checked, the body is checked once more with each *bounded*
+  parameter replaced by `Ty::Opaque(i)`, a type that only has the
+  methods of its bounds: method calls on it resolve to the trait
+  method's signature (a pattern instance of the generic function above,
+  which is never emitted), and fields, operators or coercions to a
+  concrete type fail. Unbounded parameters keep their concrete argument
+  in that pass, so they keep duck typing. The pass runs once per
+  combination of the unbounded parameters' arguments, and its output is
+  discarded (closures created in it get no body). Errors point into the
+  generic code, with an "instantiated here" note.
+
+  The alternative, checking a generic body once with every parameter
+  opaque, would have broken generic code that relies on duck typing for
+  unbounded parameters; with per-instance code generation still in
+  place, the extra pass is the smallest change that gives bounded
+  parameters real checking.
+- **Static trait functions**: `T.zero()` on a type parameter resolves
+  through the bound (type paths now see the type parameters in scope).
+- Not done: `dyn`, associated types and constants, supertraits, an
+  orphan rule or an overlap check between impls (the first matching
+  impl wins), and checking default bodies at the trait itself (they are
+  checked when an instance uses them).
+
+### Closures
+
+As proposed in section 1, with these choices and differences:
+
+- **Escape rule.** `block fn` types are rejected anywhere but at the top
+  of a parameter type (of a function, a function type or another
+  `block fn`), and as type arguments. A `block fn` local can only be a
+  callee or an argument for a `block fn` parameter (a flag on the name
+  lookup, set only in those two positions), and a closure literal only
+  such an argument. Everything else (storing, returning, `&f`, casts,
+  passing it as a `T`) is an error.
+- **Checking.** The body is checked with the enclosing `FnCx`, with the
+  return type, loops and effects of the closure: `return` and `?` leave
+  the closure, `break` cannot reach an outer loop, and calls need effects
+  the `block fn` type allows. The closure becomes its own `FnDef`, which
+  shares the enclosing function's local table (so no renumbering); the
+  captured locals are the ones it uses that were declared before it
+  (`tirwalk::locals`, which also sees nested closures' captures). In a
+  generic call, closure arguments are checked last against the partly
+  known parameter type; their result type may come from the body.
+- **Lowering.** The proposal's `{ code, env }` pair, with two changes
+  found by measuring (`bench/sort`, `bench/README.md`):
+  - It is passed as **two scalar arguments**, not one aggregate. A
+    closure literal's code pointer is a constant but its environment is
+    a stack address; LLVM's function specialization clones a callee only
+    for constant scalar arguments, so with the aggregate a sort called
+    from several sites kept an indirect comparator call (1.5x the
+    hand-written sort). Split, `mem.sort_by` with a closure runs as fast
+    as the hand-written sort without `#[inline(always)]`.
+  - **Small immutable captures are copied** into their environment entry
+    (a `let` of at most 8 bytes that holds no GC reference): one load per
+    use instead of two. A `let` cannot change while the closure lives,
+    so the copy is never stale. With both, a closure call that stays
+    indirect costs the same as a function pointer call.
+
+  Full specialization per closure (each literal its own type, callee
+  instantiated per closure) was not needed: LLVM already inlines or
+  specializes the common case, and the indirect case is as cheap as a
+  function pointer.
+- **Plain functions** convert to a `block fn` through one trampoline per
+  signature, `(env, args..) -> env(args..)`, with the function pointer as
+  the environment; when the call stays indirect, that is one extra jump.
+- **GC** as proposed: captured traced locals stay in the enclosing
+  frame's slots and are captured by reference (never copied), so the
+  shadow-stack frame of the call that received the closure roots them
+  and the closure sees their current values. A call through a `block fn`
+  roots the caller's traced locals when the type `uses gc`, like any
+  call. `tests/run/gc_closures.lm` runs under GC stress, and fails if the
+  calls through `block fn` are not rooted.
+- **vm code: closures are not allowed** in op handlers, vm functions,
+  entries or `on raise`, and vm functions cannot take `block fn`
+  parameters. The proposal's capture rules for state variables (by
+  value, read-only) and the cold-outlining interplay were not built:
+  no interpreter in the repository needed them, and handlers can call a
+  plain function that creates the closure, or pass a named function
+  (which converts to a `block fn`). So `musttail`, cold outlining and
+  state variables are unaffected. Lifting this needs the by-value
+  capture of state variables described above.
+- **C functions** cannot take `block fn` parameters.
+
+### Standard library
+
+- `std.mem`: `Vec<T>.sort_by(cmp: block fn(*T, *T) -> i32)` and
+  `mem.sort_by(p, n, cmp)`, a stable merge sort.
+- `std.parse`: `Parser<P: Hooks<K, E, X>, K, E, X>`, `Pratt` with its
+  hooks as a trait (`before_rhs` and `led` have defaults; `led` is one
+  method dispatching on the operator kind instead of a table of function
+  pointers). `Pratt` stays for its existing users.
+- Not converted: `std.obj.index_keys_first` and `Model`'s `new_slots`
+  still take function pointers (the latter is stored, so it is a trait
+  candidate rather than a closure), and `HashMap` has no `each`.

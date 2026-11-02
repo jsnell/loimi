@@ -1,0 +1,84 @@
+// Closures: in bounded generic bodies, aggregate results, recursion, a
+// `block fn` parameter of a function type, early return, `uses gc` types
+// taking plain functions, captured parameters and floats, and trait
+// methods taking closures, called through a bound.
+import std.io;
+import std.gc;
+
+trait Conv { fn conv(x: Self) -> i64; }
+fn i64.conv(x: i64) -> i64 { x * 10 }
+impl Conv for i64;
+
+fn each(n: u64, f: block fn(u64)) { for i in 0..n { f(i); } }
+
+// A closure in a bounded generic body (checked against the bound too).
+fn sum_by<T: Conv>(xs: []T) -> i64 {
+    var t: i64 = 0;
+    each(xs.len, |i| t += xs[i].conv());
+    t
+}
+
+struct Big { a: i64, b: i64, c: i64, d: i64 }
+
+fn make(f: block fn(i64) -> Big) -> i64 { let b = f(3); b.a + b.b + b.c + b.d }
+
+fn rec(n: i64, f: block fn(i64)) { if n > 0 { f(n); rec(n - 1, f); } }
+
+fn call_with(g: fn(i64, block fn(i64) -> i64) -> i64) -> i64 { g(5, |x| x * x) }
+fn apply(x: i64, f: block fn(i64) -> i64) -> i64 { f(x) }
+
+fn never_returns(f: block fn() -> i64) -> i64 { f() }
+
+fn gcwork(h: *gc.Heap, f: block fn() uses gc) uses gc { f(); }
+fn plain() {}
+
+fn param_capture(k: i64) -> i64 {
+    var acc: i64 = 0;
+    each(3, |i| acc += k * i as i64);
+    acc
+}
+
+trait Each {
+    fn each_item(c: *Self, f: block fn(i64));
+    fn total(c: *Self) -> i64 { var t: i64 = 0; c.each_item(|x| t += x); t }
+}
+struct Bag { items: [i64; 4] }
+fn Bag.each_item(b: *Bag, f: block fn(i64)) { for i in 0..4 { f(b.items[i]); } }
+impl Each for Bag;
+
+fn biggest<C: Each>(c: *C) -> i64 {
+    var m: i64 = -1;
+    c.each_item(|x| if x > m { m = x; });
+    m
+}
+
+fn main() uses gc {
+    var xs: [i64; 3] = [1, 2, 3];
+    io.print_int(sum_by(xs[..])); io.println("");
+    io.print_int(make(|x| Big { a: x, b: x * 2, c: x * 3, d: x * 4 })); io.println("");
+    var s: i64 = 0;
+    rec(4, |i| s += i);
+    io.print_int(s); io.println("");
+    io.print_int(call_with(apply)); io.println("");
+    io.print_int(never_returns(|| { return 7; })); io.println("");
+    io.print_int(never_returns(|| 9)); io.println("");
+    var heap = gc.Heap.new();
+    gcwork(&heap, plain);
+    gcwork(&heap, || gc.collect(&heap));
+    io.print_int(param_capture(5)); io.println("");
+    let fl = 2.5;
+    var tot = 0.0;
+    each(4, |i| tot += fl * i as f64);
+    io.print_f64(tot); io.println("");
+    var bag = Bag { items: [4, 9, 2, 7] };
+    io.print_int(biggest(&bag)); io.print(" "); io.print_int(bag.total()); io.println("");
+}
+// expect: 60
+// expect: 30
+// expect: 10
+// expect: 25
+// expect: 7
+// expect: 9
+// expect: 15
+// expect: 15
+// expect: 9 22

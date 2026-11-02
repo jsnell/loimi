@@ -42,6 +42,7 @@ iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
 Result<T, E>
 Gc<T>           // traced reference into the GC heap (section 8)
 fn(A, B) -> R   // function pointer; `fn(A) -> R uses gc` has effects (section 5)
+block fn(A) -> R  // non-escaping closure; only as a parameter type (section 1.2)
 ```
 
 Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
@@ -161,12 +162,59 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   parameters of structs, enums, functions and methods are checked when
   an instance with concrete types is created, and a missing impl is
   reported there: "`Key` does not implement `Hash` (needed by
-  `HashMap<Key, i64>`)". Inside a generic body, method calls still
-  resolve per instance, so the bound documents and checks the requirement
-  but does not change the call, which stays direct. Not yet supported:
-  default methods, generic traits and trait methods, impls for instances
-  of generic types (`impl Hash for Vec<T>`), and checking a generic body
-  against its bounds.
+  `HashMap<Key, i64>`)". A method of a generic type has the type's
+  bounds on the receiver's parameters without restating them
+  (`fn HashMap<K, V>.get` may call `key.hash()`).
+
+  Traits can also have:
+
+  ```loimi
+  trait Show {
+      fn show(x: Self);
+      fn show_line(x: Self) { x.show(); io.println(""); }  // a default
+  }
+  trait Conv<T> { fn conv(x: Self) -> T; }                // a type parameter
+  trait Folder {
+      fn fold<U>(f: *Self, init: U, step: fn(U, i64) -> U) -> U;  // a generic method
+      fn zero() -> Self;                                  // called as `F.zero()`
+  }
+  impl Conv<i64> for Sym;
+  impl<T: Show> Show for Vec<T>;      // every Vec<T> whose T is Show
+  fn total<T: Conv<i64>>(xs: []T) -> i64 { .. xs[i].conv() .. }
+  ```
+
+  - **Default methods** have a body. An impl takes the type's own
+    method if there is one (checked against the signature) and the
+    default otherwise; the default is instantiated for the type, so
+    `sym.show_line()` and `x.show_line()` on a bounded `x` both work.
+  - **Generic traits** take type arguments in bounds and impls
+    (`T: Conv<i64>`, `P: parse.Hooks<K, E, X>`, where the arguments may
+    name other parameters). A type may implement one trait with
+    different arguments.
+  - **Generic trait methods** have their own type parameters; the type's
+    method must have as many (`fn Range.fold<U>`), with the same
+    signature.
+  - **Generic impls** `impl<T: B> Trait for Type<T>;` cover every
+    instance whose arguments satisfy the impl's bounds, checked when an
+    instance is needed (`Vec<f64>` is not `Show` if `f64` is not). The
+    methods are the generic type's (`fn Vec<T>.show`). Each parameter of
+    the impl must appear in the type.
+  - **Static functions** of a trait (no `Self` parameter needed) are
+    called on the type: `T.zero()` for a bounded `T`.
+
+  **Generic bodies are checked against their bounds.** Inside
+  `fn f<T: Show>(x: T)`, `T` has only what its bounds give it: `x.show()`
+  and the defaults of `Show`, and calls to functions whose bounds `T`
+  meets. `x.extra()` is an error ("no method `extra` on type parameter
+  `T`: its bounds (`Show`) do not provide it") even if every type `f` is
+  used with has an `extra` method; so are its fields, operators and
+  passing it where a concrete type is expected. A call through a bound
+  has the effects the trait declares. The check runs once per
+  combination of the arguments of the *unbounded* parameters: those keep
+  the old duck typing (method calls on them resolve per instance), so
+  generic code written before traits keeps compiling. Code is still
+  generated per instance, and calls are direct (static dispatch, no
+  `dyn`).
   Type arguments are inferred from arguments and the expected type, or given
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
@@ -191,6 +239,62 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   are checked first, and then the known parts (here `T`) are enough if
   they determine the function's type arguments, as in `apply(double, 21)`
   with `fn double<N>(x: N) -> N`.
+- **Closures** (`block fn`, non-escaping):
+
+  ```loimi
+  fn count_if(xs: []i64, pred: block fn(i64) -> bool) -> i64 { .. pred(xs[i]) .. }
+  fn Vec<T>.sort_by(v: *Vec<T>, cmp: block fn(*T, *T) -> i32) { .. }
+
+  var hits = 0;
+  let n = count_if(xs, |x| x > limit);       // captures `limit`
+  each(v, |x| hits += x);                     // writes `hits`
+  ids.sort_by(|a, b| names.at(*a).cmp(names.at(*b)));
+  map(xs, |x: i64| -> str { if x > 5 { return "big"; } "small" });
+  ```
+
+  `block fn(A, B) -> R uses E` is the type of a closure parameter. A
+  closure literal `|a, b| expr` (parameter types from the parameter,
+  or written `|a: T|`; `|| expr` takes none; `|a| -> R { .. }` gives the
+  result type) can only be an argument for such a parameter, and a
+  `block fn` parameter can only be called or passed on as such an
+  argument (also to a closure that calls it). It cannot be stored in a
+  local, a field or a global, returned, cast, or be a type argument;
+  `block fn` types are only allowed at the top of a parameter type. So a
+  closure never outlives the call that receives it, which is what makes
+  capturing by reference safe without lifetime analysis:
+
+  - **Captures** are by reference: the closure sees the enclosing
+    locals' current values and its writes are visible after the call.
+    `let` locals stay read-only. (Small untraced `let`s are copied into
+    the closure's environment, which nobody can observe.)
+  - The body is a function of its own: `return` and `?` leave the
+    closure, and `break`/`continue` cannot reach loops outside it.
+  - **Effects**: the closure's body may only make calls whose effects
+    the `block fn` type allows (`block fn(i64) uses gc` may collect), and
+    calling a `block fn` has its type's effects, with the usual rules.
+  - A plain function (or `fn` value) converts to a `block fn` with the
+    same signature and no more effects: `v.sort_by(cmp_i64)` works.
+  - In a generic call, closure arguments are checked last, so their
+    parameter types can come from the other arguments, and their result
+    type from the body (`map(xs, |x| x as f64 / 2.0)` infers `U = f64`).
+  - Not in vm code: op handlers, vm functions, entries and `on raise`
+    cannot contain closures (a closure is a separate function, so it
+    could not use control words, and capturing state variables by
+    reference would force them into memory), and vm functions cannot
+    take `block fn` parameters. Call a plain function that makes the
+    closure, or pass a named function. C functions cannot take them
+    either.
+  - **GC**: a captured traced local stays in the enclosing frame; the
+    shadow-stack frame of the call that received the closure roots it.
+    The callee roots its own traced locals at each call of the closure
+    whose type `uses gc`, and the closure body roots its own.
+
+  Lowering: a `block fn` is a code pointer and an environment pointer,
+  passed as two arguments; the environment is an array, in the enclosing
+  frame, of pointers to the captured locals (or their values). A call is
+  indirect unless LLVM inlines or specializes the callee, which it does
+  for a sort called with a closure literal: then the closure costs
+  nothing (see `bench/README.md`).
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in
@@ -840,6 +944,12 @@ struct Hooks {
   them (or be a handler or `cold` block, where the `sync` block runs
   first), and a `gc` call gets a shadow-stack frame for the traced locals
   in scope.
+- Closure types follow the same rules: `block fn(i64) uses gc` is called
+  like a `uses gc` function, a closure's body may only make the calls its
+  type allows, and a plain function or `block fn` converts to a `block fn`
+  type with more effects (section 1.2).
+- Calls through a trait bound have the effects of the trait's method
+  declaration; an impl's method may have fewer.
 - Generic code carries effects through: `T` bound to `fn() uses gc` keeps
   the effect, and `fn(T) -> U uses gc` in a generic signature stays
   effectful in every instance. Inference does not look at effects; the

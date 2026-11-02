@@ -110,6 +110,77 @@ pub fn Vec<T>.free(v: *Vec<T>) {
     v.cap = 0;
 }
 
+/// Sort the elements, stably, by `cmp(a, b)`: negative if `a` goes first,
+/// positive if `b` does, 0 if they are equal. The comparator may capture
+/// locals: `ids.sort_by(|a, b| names.at(*a).cmp(names.at(*b)))`.
+pub fn Vec<T>.sort_by(v: *Vec<T>, cmp: block fn(*T, *T) -> i32) {
+    sort_by(v.ptr, v.len, cmp);
+}
+
+/// Sort `n` values at `p` stably by `cmp` (see `Vec.sort_by`): insertion
+/// sort for runs of 16, then a bottom-up merge sort through a buffer of
+/// `n` values.
+pub fn sort_by<T>(p: *T, n: u64, cmp: block fn(*T, *T) -> i32) {
+    let run: u64 = 16;
+    var lo: u64 = 0;
+    while lo < n {
+        let hi = if lo + run < n { lo + run } else { n };
+        insertion_sort(p, lo, hi, cmp);
+        lo = hi;
+    }
+    if n <= run { return; }
+    let tmp: *T = alloc(n);
+    var src = p;
+    var dst = tmp;
+    var w = run;
+    while w < n {
+        var l: u64 = 0;
+        while l < n {
+            let mid = if l + w < n { l + w } else { n };
+            let hi = if l + 2 * w < n { l + 2 * w } else { n };
+            merge_runs(src, dst, l, mid, hi, cmp);
+            l = hi;
+        }
+        let t = src;
+        src = dst;
+        dst = t;
+        w *= 2;
+    }
+    if src != p { copy(p, src, n); }
+    release(tmp);
+}
+
+fn insertion_sort<T>(p: *T, lo: u64, hi: u64, cmp: block fn(*T, *T) -> i32) {
+    var i = lo + 1;
+    while i < hi {
+        let x = p[i];
+        var j = i;
+        while j > lo and cmp(&x, p + (j - 1)) < 0 {
+            p[j] = p[j - 1];
+            j -= 1;
+        }
+        p[j] = x;
+        i += 1;
+    }
+}
+
+/// Merge the sorted runs `src[lo..mid]` and `src[mid..hi]` into `dst[lo..hi]`.
+fn merge_runs<T>(src: *T, dst: *T, lo: u64, mid: u64, hi: u64, cmp: block fn(*T, *T) -> i32) {
+    var i = lo;
+    var j = mid;
+    var k = lo;
+    while k < hi {
+        if i < mid and (j >= hi or cmp(src + i, src + j) <= 0) {
+            dst[k] = src[i];
+            i += 1;
+        } else {
+            dst[k] = src[j];
+            j += 1;
+        }
+        k += 1;
+    }
+}
+
 /// Bump allocator: allocations are freed all at once.
 pub struct Arena { chunk: *u8, used: u64, size: u64, chunks: Vec<*u8> }
 

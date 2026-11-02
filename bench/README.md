@@ -44,6 +44,43 @@ Notes:
   advantage (independent register allocation per handler) is expected to
   show on larger interpreters, as it did for CPython.
 
+## Sort comparators: closures vs function pointers
+
+`sort/run.sh` sorts 2M `u64` values by `x ^ salt` with `std.mem.sort_by`'s
+merge sort, the comparator given in several ways (see `sort/sort.lm`).
+The comparison is cheap and the accesses sequential, so call overhead
+shows. Best of 7, CPU time of the sort only (i7-6700, clang 19,
+2026-11-02, other jobs running on the machine):
+
+| Comparator | Time |
+|---|---|
+| comparison written into the sort (floor) | 169 ms |
+| `mem.sort_by` + closure capturing `salt` | 169 ms |
+| `mem.sort_by` + plain fn (trampoline) | 175 ms |
+| copy taking `fn(*u64, *u64) -> i32`, `salt` in a global | 175 ms |
+| `#[inline(never)]` copy, closure, two call sites | 233 ms |
+| `#[inline(never)]` copy, plain fn, two call sites | 251 ms |
+| `#[inline(never)]` fn-pointer copy, two call sites | 234 ms |
+
+The first four are what a program gets by default: LLVM inlines the sort
+into its caller, or clones it for the constant code pointer (function
+specialization), and then inlines the comparator. The last three keep the
+comparator call indirect; a closure call then costs what a function
+pointer call costs. A plain function passed as a `block fn` goes through a
+trampoline, one extra jump when the call stays indirect.
+
+Two lowering choices got the closure rows there. Before them, the closure
+through `mem.sort_by` took 266 ms and the indirect closure 276 ms:
+
+- A `block fn` argument is two scalars (code, env), not a `{ ptr, ptr }`
+  aggregate: the env half is a stack address, so with the aggregate LLVM
+  never saw a constant argument to specialize on.
+- Small immutable captures are copied into the environment, so a use is
+  one load instead of two.
+
+Sorting indices by a 16 MB key table instead, every mode takes about
+230 ms: the random loads hide the call.
+
 ## Other benchmark sets
 
 - [`mini/`](mini/README.md): clean-room Lua-subset programs, Mini vs PUC-Lua and LuaJIT.

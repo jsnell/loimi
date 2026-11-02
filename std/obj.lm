@@ -610,13 +610,20 @@ pub fn Template.new(proto: u64, inline: u32) -> Template {
 
 /// Reorder `keys` JavaScript-style: keys that are integer indices
 /// (`index_of(data, key) >= 0`) first, ascending, then the others in
-/// their original order. Stable, O(n log n).
+/// their original order. Stable, O(n log n). See `index_keys_first_by`
+/// for a closure instead of a function and a data pointer.
 pub fn index_keys_first(keys: *mem.Vec<u64>, data: *u8, index_of: fn(*u8, u64) -> i64) {
+    index_keys_first_by(keys, |k| index_of(data, k));
+}
+
+/// `index_keys_first` with the index test as a closure:
+/// `obj.index_keys_first_by(&ks, |k| interp.array_index(k))`.
+pub fn index_keys_first_by(keys: *mem.Vec<u64>, index_of: block fn(u64) -> i64) {
     var idx: mem.Vec<u64> = mem.Vec.new();
     var rest: mem.Vec<u64> = mem.Vec.new();
     for i in 0..keys.len {
         let k = keys.at(i);
-        let x = index_of(data, k);
+        let x = index_of(k);
         if x >= 0 { idx.push(x as u64); idx.push(k); } else { rest.push(k); }
     }
     if idx.len == 0 { idx.free(); rest.free(); return; }

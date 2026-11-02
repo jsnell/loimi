@@ -1,0 +1,9 @@
+trait Show { fn show(x: Self); fn name(x: Self) -> str { "?" } }
+struct Box<T> { x: T }
+fn Box<T>.show(b: Box<T>) { b.x.show(); }
+impl<T: Show> Show for Box<T>;
+fn i64.show(x: i64) {}
+impl Show for i64;
+fn f<T: Show>(x: T) { x.show(); }
+fn main() { f(Box { x: 1 }); f(Box { x: 1.5 }); }
+// error: `Box<f64>` does not implement `Show` (needed by `f<Box<f64>>`)

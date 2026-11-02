@@ -1,0 +1,101 @@
+// Non-escaping closures: `block fn` parameters and closure literals.
+import std.io;
+import std.mem;
+import std.mem.{Vec};
+
+fn each(n: i64, f: block fn(i64)) {
+    for i in 0..n { f(i); }
+}
+
+fn count_if(xs: []i64, pred: block fn(i64) -> bool) -> i64 {
+    var c: i64 = 0;
+    for i in 0..xs.len { if pred(xs[i]) { c += 1; } }
+    c
+}
+
+// A `block fn` parameter can be passed on, and captured by another closure.
+fn each_twice(n: i64, f: block fn(i64)) {
+    each(n, f);
+    each(n, |i| f(i + 100));
+}
+
+// Generic over the element and result types; `U` comes from the closure's body.
+fn map<T, U>(xs: []T, f: block fn(T) -> U) -> Vec<U> {
+    var out: Vec<U> = Vec.new();
+    for i in 0..xs.len { out.push(f(xs[i])); }
+    out
+}
+
+fn find(xs: []i64, pred: block fn(*i64) -> bool) -> ?u64 {
+    for i in 0..xs.len {
+        if pred(&xs[i]) { return Some(i); }
+    }
+    None
+}
+
+fn apply(f: block fn(i64) -> i64, x: i64) -> i64 { f(x) }
+
+fn double(x: i64) -> i64 { x * 2 }
+
+fn parse_all(xs: []i64, f: block fn(i64) -> ?i64) -> ?i64 {
+    var t: i64 = 0;
+    for i in 0..xs.len { t += f(xs[i])?; }
+    Some(t)
+}
+
+struct Counter { hits: i64 }
+
+fn main() {
+    // Captures by reference: writes are visible after the call.
+    var sum: i64 = 0;
+    each(5, |i| sum += i);
+    io.print_int(sum); io.println("");
+
+    var xs: [i64; 6] = [3, 8, 1, 9, 4, 6];
+    let limit = 4;
+    io.print_int(count_if(xs[..], |x| x > limit)); io.println("");
+
+    // Nested closures capture through the enclosing closure.
+    var hits: i64 = 0;
+    each(3, |i| each(i, |j| hits += j + 1));
+    io.print_int(hits); io.println("");
+
+    var seen = 0;
+    each_twice(2, |i| { seen += i; });
+    io.print_int(seen); io.println("");
+
+    let ys = map(xs[..], |x| x as f64 / 2.0);
+    io.print_f64(ys.at(1)); io.println("");
+    let names = map(xs[..], |x: i64| -> str { if x > 5 { return "big"; } "small" });
+    io.println(names.at(0)); io.println(names.at(1));
+
+    let at = find(xs[..], |p| *p == 9) ?? 99;
+    io.print_int(at as i64); io.println("");
+
+    // A plain function converts to a `block fn`.
+    io.print_int(apply(double, 21)); io.println("");
+    io.print_int(apply(|x| double(x) + 1, 21)); io.println("");
+
+    // `?` and `return` in a closure leave the closure.
+    io.print_int(parse_all(xs[..], |x| if x > 0 { Some(x) } else { None }) ?? -1); io.println("");
+    io.print_int(parse_all(xs[..], |x| if x != 9 { Some(x) } else { None }) ?? -1); io.println("");
+
+    // Captured struct fields, through a pointer.
+    var c = Counter { hits: 0 };
+    let cp = &c;
+    each(4, |i| cp.hits += i * i);
+    io.print_int(c.hits); io.println("");
+}
+// expect: 10
+// expect: 3
+// expect: 4
+// expect: 202
+// expect: 4
+// expect: small
+// expect: big
+// expect: 3
+// expect: 42
+// expect: 43
+// expect: 31
+// expect: -1
+// expect: 14

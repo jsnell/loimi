@@ -1,0 +1,137 @@
+// Traits: default methods, generic traits, generic trait methods, impls for
+// generic instances, and generic bodies checked against their bounds.
+import std.io;
+import std.mem;
+import std.mem.{Vec};
+
+// ── default methods ─────────────────────────────────────────────────────
+trait Show {
+    fn show(x: Self);
+    // A default: uses the other methods through `Self`'s bound.
+    fn show_line(x: Self) { x.show(); io.println(""); }
+    fn show_twice(x: Self) { x.show(); io.print(" "); x.show(); io.println(""); }
+}
+
+struct Sym { id: u32 }
+fn Sym.show(s: Sym) { io.print("#"); io.print_int(s.id as i64); }
+// Overrides the default.
+fn Sym.show_twice(s: Sym) { io.print("twice "); s.show(); io.println(""); }
+impl Show for Sym;
+
+fn i64.show(x: i64) { io.print_int(x); }
+impl Show for i64;
+
+fn report<T: Show>(x: T) {
+    x.show_line();
+    x.show_twice();
+}
+
+// ── impls for generic instances ─────────────────────────────────────────
+struct Pair<A, B> { a: A, b: B }
+fn Pair<A, B>.show(p: Pair<A, B>) { io.print("("); p.a.show(); io.print(", "); p.b.show(); io.print(")"); }
+impl<A: Show, B: Show> Show for Pair<A, B>;
+
+fn Vec<T>.show(v: Vec<T>) {
+    io.print("[");
+    for i in 0..v.len {
+        if i > 0 { io.print(" "); }
+        v.ptr[i].show();
+    }
+    io.print("]");
+}
+impl<T: Show> Show for Vec<T>;
+
+// ── generic traits ──────────────────────────────────────────────────────
+trait Conv<T> {
+    fn conv(x: Self) -> T;
+    fn conv_or(x: *Self, d: T) -> T { d }
+}
+fn Sym.conv(s: Sym) -> i64 { s.id as i64 * 100 }
+impl Conv<i64> for Sym;
+fn i64.conv(x: i64) -> str { if x > 0 { "positive" } else { "not positive" } }
+impl Conv<str> for i64;
+
+fn total<T: Conv<i64>>(xs: []T) -> i64 {
+    var t: i64 = 0;
+    for i in 0..xs.len { t += xs[i].conv(); }
+    t
+}
+
+fn describe<T: Conv<U>, U>(x: T) -> U { x.conv() }
+
+// ── generic trait methods and static trait functions ────────────────────
+trait Folder {
+    fn fold<U>(f: *Self, init: U, step: fn(U, i64) -> U) -> U;
+    fn zero() -> Self;
+}
+struct Range { lo: i64, hi: i64 }
+fn Range.fold<U>(r: *Range, init: U, step: fn(U, i64) -> U) -> U {
+    var acc = init;
+    for i in r.lo..r.hi { acc = step(acc, i); }
+    acc
+}
+fn Range.zero() -> Range { Range { lo: 0, hi: 0 } }
+impl Folder for Range;
+
+fn add(a: i64, b: i64) -> i64 { a + b }
+fn count(a: u8, b: i64) -> u8 { a + 1 }
+
+fn sum_all<F: Folder>(f: *F) -> (i64, u8) {
+    let z = F.zero();
+    (f.fold(0, add) + z.fold(0, add), f.fold<u8>(0, count))
+}
+
+// ── bounded and unbounded parameters together ──────────────────────────
+// `K` is checked against `Show`; `V` stays duck-typed (`v.twice()` works
+// for any V with a `twice` method).
+fn i64.twice(x: i64) -> i64 { x * 2 }
+fn show_entry<K: Show, V>(k: K, v: V) -> V {
+    k.show();
+    io.print(" -> ");
+    v.twice()
+}
+
+fn main() {
+    report(Sym { id: 7 });
+    report(42);
+    report(Pair { a: 1, b: Sym { id: 2 } });
+    var v: Vec<i64> = Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    report(v);
+    var vs: Vec<Pair<i64, i64>> = Vec.new();
+    vs.push(Pair { a: 5, b: 6 });
+    report(vs);
+
+    var syms: [Sym; 2] = [Sym { id: 1 }, Sym { id: 2 }];
+    io.print_int(total(syms[..])); io.println("");
+    io.println(describe<i64, str>(5));
+    let s = Sym { id: 3 };
+    io.print_int(describe<Sym, i64>(s)); io.println("");
+    io.print_int(s.conv_or(-1)); io.println("");
+
+    var r = Range { lo: 1, hi: 5 };
+    let (a, n) = sum_all(&r);
+    io.print_int(a); io.print(" "); io.print_int(n as i64); io.println("");
+
+    io.print_int(show_entry(Sym { id: 9 }, 21)); io.println("");
+    v.free();
+    vs.free();
+}
+// expect: #7
+// expect: twice #7
+// expect: 42
+// expect: 42 42
+// expect: (1, #2)
+// expect: (1, #2) (1, #2)
+// expect: [1 2 3]
+// expect: [1 2 3] [1 2 3]
+// expect: [(5, 6)]
+// expect: [(5, 6)] [(5, 6)]
+// expect: 300
+// expect: positive
+// expect: 300
+// expect: -1
+// expect: 10 4
+// expect: #9 -> 42

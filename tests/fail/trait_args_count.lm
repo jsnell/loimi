@@ -1,0 +1,5 @@
+trait Conv<T> { fn conv(x: Self) -> T; }
+fn i64.conv(x: i64) -> str { "" }
+impl Conv for i64;
+fn main() {}
+// error: trait `Conv` takes 1 type argument(s), got 0

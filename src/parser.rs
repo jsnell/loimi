@@ -447,35 +447,38 @@ impl Parser {
         if self.is_kw("trait") && matches!(self.peek_at(1), Tok::Ident(_)) {
             self.bump();
             let name = self.ident()?;
+            let (generics, bounds) = self.parse_generics()?;
+            if let Some(b) = bounds.iter().flatten().next() {
+                return Err(Diag::new(b.span, "a trait's type parameters take no bounds"));
+            }
             self.expect("{")?;
             let mut methods = Vec::new();
             while !self.is("}") {
-                let f = self.parse_fn(Attrs::default(), Linkage::Internal, false)?;
-                if f.body.is_some() || !f.generics.is_empty() || f.recv.is_some() {
+                let attrs = self.parse_attrs()?;
+                let f = self.parse_fn(attrs, Linkage::Internal, false)?;
+                if f.recv.is_some() {
                     return Err(Diag::new(
                         f.name.span,
-                        "a trait method is a signature `fn name(a: Self, ..) -> R;` (no body, receiver or type parameters yet)",
+                        "a trait method is written `fn name(a: Self, ..) -> R;` or with a default body, without a receiver type",
                     ));
                 }
                 methods.push(f);
             }
             self.expect("}")?;
-            return Ok(Item::Trait(TraitDecl { name, methods, is_pub }));
+            return Ok(Item::Trait(TraitDecl { name, generics, methods, is_pub }));
         }
-        if self.is_kw("impl") && matches!(self.peek_at(1), Tok::Ident(_)) {
+        if self.is_kw("impl") && (matches!(self.peek_at(1), Tok::Ident(_)) || self.is_at(1, "<")) {
             let start = self.span();
             self.bump();
-            let mut trait_path = vec![self.ident()?];
-            while self.eat(".") {
-                trait_path.push(self.ident()?);
-            }
+            let (generics, bounds) = self.parse_generics()?;
+            let trait_ref = self.parse_trait_ref()?;
             self.expect_kw("for")?;
             let ty = self.parse_type()?;
             self.expect(";")?;
             if is_pub {
                 return self.err("`impl` takes no `pub`: impls are visible everywhere");
             }
-            return Ok(Item::Impl(ImplDecl { trait_path, ty, span: start.to(self.prev_span()) }));
+            return Ok(Item::Impl(ImplDecl { generics, bounds, trait_ref, ty, span: start.to(self.prev_span()) }));
         }
         if self.is_kw("type") && matches!(self.peek_at(1), Tok::Ident(_)) {
             // `type Name = T;`, `type Map<V> = HashMap<str, V>;`
@@ -484,7 +487,7 @@ impl Parser {
             let (generics, bounds) = self.parse_generics()?;
             if let Some(b) = bounds.iter().flatten().next() {
                 return Err(Diag::new(
-                    b[0].span,
+                    b.span,
                     "a type alias's parameters take no bounds; the aliased type's own bounds are checked where it is used",
                 ));
             }
@@ -629,7 +632,7 @@ impl Parser {
         Ok(FnDecl { name, generics, bounds, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
     }
 
-    /// `<T, U: A + m.B>`: the parameters and the bounds of each.
+    /// `<T, U: A + m.B + Hooks<T>>`: the parameters and the bounds of each.
     fn parse_generics(&mut self) -> Res<(Vec<Ident>, Vec<Bounds>)> {
         let mut gs = Vec::new();
         let mut bs = Vec::new();
@@ -639,24 +642,45 @@ impl Parser {
                 let mut b = Vec::new();
                 if self.eat(":") {
                     loop {
-                        let mut path = vec![self.ident()?];
-                        while self.eat(".") {
-                            path.push(self.ident()?);
-                        }
-                        b.push(path);
+                        b.push(self.parse_trait_ref()?);
                         if !self.eat("+") {
                             break;
                         }
                     }
                 }
                 bs.push(b);
+                self.split_angle();
                 if !self.eat(",") {
                     break;
                 }
             }
+            self.split_angle();
             self.expect(">")?;
         }
         Ok((gs, bs))
+    }
+
+    /// `Hash`, `hash.Hash`, `Hooks<K, E>`.
+    fn parse_trait_ref(&mut self) -> Res<TraitRef> {
+        let start = self.span();
+        let mut path = vec![self.ident()?];
+        while self.eat(".") {
+            path.push(self.ident()?);
+        }
+        let mut args = Vec::new();
+        if self.eat("<") {
+            self.split_angle();
+            while !self.is(">") {
+                args.push(self.parse_type()?);
+                self.split_angle();
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.split_angle();
+            self.expect(">")?;
+        }
+        Ok(TraitRef { path, args, span: start.to(self.prev_span()) })
     }
 
     // ── types ────────────────────────────────────────────────────────
@@ -747,6 +771,11 @@ impl Parser {
                 return Ok(t);
             }
             TypeKind::Tuple(ts)
+        } else if self.is_kw("block") && self.is_kw_at(1, "fn") {
+            self.bump();
+            let t = self.parse_type()?;
+            let TypeKind::Fn(ps, ret, eff) = t.kind else { unreachable!() };
+            TypeKind::Block(ps, ret, eff)
         } else if self.eat_kw("fn") {
             self.expect("(")?;
             let mut ps = Vec::new();
@@ -886,6 +915,11 @@ impl Parser {
             return self.parse_primary();
         }
         let lhs = self.parse_expr()?;
+        self.parse_assign_tail(lhs)
+    }
+
+    /// After an expression: `= rhs` or `op= rhs` makes it an assignment.
+    fn parse_assign_tail(&mut self, lhs: Expr) -> Res<Expr> {
         let start = lhs.span;
         let op = match self.peek() {
             Tok::Punct("=") => None,
@@ -1218,6 +1252,35 @@ impl Parser {
                 self.expect(")")?;
                 self.no_struct = saved;
                 mk(ExprKind::Tuple(es), self)
+            }
+            Tok::Punct("|") | Tok::Punct("||") => {
+                // A closure: `|a, b: T| expr`, `|| expr`, `|a| -> R { .. }`.
+                let mut params = Vec::new();
+                if self.bump().tok == Tok::Punct("|") {
+                    while !self.is("|") {
+                        let name = self.ident()?;
+                        let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
+                        params.push((name, ty));
+                        if !self.eat(",") {
+                            break;
+                        }
+                    }
+                    self.expect("|")?;
+                }
+                let saved = self.no_struct;
+                self.no_struct = false;
+                let (ret, body) = if self.eat("->") {
+                    let t = self.parse_type()?;
+                    let b = self.parse_block()?;
+                    let span = b.span;
+                    (Some(t), Expr { kind: ExprKind::Block(b), span })
+                } else {
+                    // The body may be an assignment: `|i| sum += i`.
+                    let e = self.parse_expr()?;
+                    (None, self.parse_assign_tail(e)?)
+                };
+                self.no_struct = saved;
+                mk(ExprKind::Closure(params, ret, Box::new(body)), self)
             }
             Tok::Punct("[") => {
                 self.bump();

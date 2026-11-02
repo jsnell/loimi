@@ -1,0 +1,111 @@
+// GC stress with `uses gc` closures. Every allocation point collects
+// (`set_stress`). Traced locals captured by a closure stay in the enclosing
+// frame's slots and are rooted by its shadow-stack frame at the call that
+// receives the closure; the closure reads and writes them through its
+// environment. The callee roots its own traced locals at the call through
+// the closure, and the closure roots its own.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn each(n: i64, f: block fn(i64) uses gc) uses gc {
+    for i in 0..n { f(i); }
+}
+
+// The callee holds traced locals of its own across the calls of `f`.
+fn each_node(l: ?Gc<Node>, f: block fn(Gc<Node>) uses gc) uses gc {
+    var c = l;
+    while let Some(n) = c {
+        f(n);
+        c = n.next;
+    }
+}
+
+// Passed on through another `block fn` parameter.
+fn each_twice(n: i64, f: block fn(i64) uses gc) uses gc {
+    each(n, f);
+    each(n, |i| f(i + 1000));
+}
+
+// The callee's own object, reachable only from its local, survives a
+// collection inside the closure.
+fn with_fresh(h: *gc.Heap, f: block fn() uses gc) -> i64 uses gc {
+    let mine = new(h, Node { value: 77, next: None });
+    f();
+    var again: i64 = 0;
+    for i in 0..100 { again += new(h, Node { value: 1, next: None }).value; }
+    mine.value + again
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t: i64 = 0;
+    var c = l;
+    while let Some(n) = c {
+        t += n.value;
+        c = n.next;
+    }
+    t
+}
+
+fn garbage(h: *gc.Heap, n: i64) {
+    for i in 0..n { new(h, Node { value: i, next: None }); }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    heap.set_stress(true);
+    let h = &heap;
+
+    // A captured traced `var`, replaced inside the closure across collections.
+    var list: ?Gc<Node> = None;
+    each(200, |i| {
+        garbage(h, 3);
+        list = Some(new(h, Node { value: i, next: list }));
+        gc.maybe_collect(h);
+    });
+    io.print_int(sum(list)); io.println("");
+
+    // A closure's own traced locals across a collection.
+    var total: i64 = 0;
+    each(50, |i| {
+        let tmp = new(h, Node { value: i, next: None });
+        garbage(h, 5);
+        gc.collect(h);
+        let tmp2 = new(h, Node { value: tmp.value * 2, next: Some(tmp) });
+        gc.collect(h);
+        total += tmp2.value + tmp.value;
+    });
+    io.print_int(total); io.println("");
+
+    // The callee's traced locals stay rooted while the closure collects.
+    var visited: i64 = 0;
+    each_node(list, |n| {
+        garbage(h, 2);
+        gc.collect(h);
+        visited += n.value;
+    });
+    io.print_int(visited); io.println("");
+
+    // Nested closures and a `block fn` passed on: all still see `list`.
+    var hits: i64 = 0;
+    each_twice(3, |i| {
+        gc.collect(h);
+        each_node(list, |n| if n.value == 0 { hits += i; });
+    });
+    io.print_int(hits); io.println("");
+
+    io.print_int(with_fresh(h, || { garbage(h, 10); gc.collect(h); })); io.println("");
+
+    gc.collect(h);
+    io.print_int(sum(list)); io.println("");
+    io.print_int(heap.count as i64); io.println("");
+    heap.free();
+}
+// expect: 19900
+// expect: 3675
+// expect: 19900
+// expect: 3006
+// expect: 177
+// expect: 19900
+// expect: 200

@@ -47,6 +47,11 @@ pub enum Ty {
     Param(u32),
     /// Traced reference into the GC heap.
     Gc(Box<Ty>),
+    /// A bounded type parameter while a generic body is checked against
+    /// its bounds (index into `Traits::opaques`). Never reaches codegen.
+    Opaque(u32),
+    /// `block fn(A) -> R uses E`: a non-escaping closure, `{ code, env }`.
+    Block(Vec<Ty>, Box<Ty>, u8),
 }
 
 impl Ty {
@@ -168,6 +173,9 @@ pub enum TK {
     New { heap: B, init: B, len: Option<B> },
     /// The trailing array of an object, as a slice.
     Trailing(B),
+    /// A closure literal: the closure's function and the captured locals,
+    /// whose addresses make up its environment.
+    Closure(FnId, Vec<LocalId>),
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +324,14 @@ pub struct FnDef {
     /// synced in place, as in an op; callers root their traced locals at
     /// a call of this function as if it had these effects.
     pub sync_effects: u8,
+    /// Closure bodies: the captured locals of the enclosing function, in
+    /// environment order. The function takes the environment pointer as
+    /// a hidden first parameter, and reaches these locals through it.
+    pub env: Option<Vec<LocalId>>,
+    /// Per captured local: captured by value. The environment entry holds
+    /// the value itself instead of the local's address (immutable,
+    /// untraced locals of at most 8 bytes), which saves a load per use.
+    pub env_val: Vec<bool>,
 }
 
 impl FnDef {

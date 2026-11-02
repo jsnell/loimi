@@ -1,0 +1,10 @@
+// A method call on a bounded type parameter resolves through its bounds,
+// even if every instance happens to have the method.
+trait Show { fn show(x: Self); }
+struct Sym { id: u32 }
+fn Sym.show(s: Sym) {}
+fn Sym.extra(s: Sym) {}
+impl Show for Sym;
+fn f<T: Show>(x: T) { x.show(); x.extra(); }
+fn main() { f(Sym { id: 1 }); }
+// error: no method `extra` on type parameter `T`: its bounds (`Show`) do not provide it

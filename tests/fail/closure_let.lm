@@ -1,0 +1,2 @@
+fn main() { let f = |x: i64| x + 1; }
+// error: a closure can only be an argument for a `block fn` parameter

@@ -42,6 +42,8 @@ pub struct Codegen<'p> {
     /// Per function: immutable f64 locals bound only from the unboxed
     /// variant of a nanbox value (see `values::nan_safe`).
     pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
+    /// Trampolines that call a plain function as a `block fn`, by signature.
+    pub tramps: std::collections::HashMap<String, String>,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -91,8 +93,9 @@ pub fn llty(p: &Program, t: &Ty) -> String {
                 "i64".into()
             }
         }
-        Ty::Param(_) => unreachable!("type parameter in codegen"),
+        Ty::Param(_) | Ty::Opaque(_) => unreachable!("type parameter in codegen"),
         Ty::Gc(_) => "ptr".into(),
+        Ty::Block(..) => "{ ptr, ptr }".into(),
     }
 }
 
@@ -127,6 +130,7 @@ impl<'p> Codegen<'p> {
             cold_queue: vec![],
             cold_count: 0,
             tls_defined: Default::default(),
+            tramps: Default::default(),
         }
     }
 
@@ -440,21 +444,52 @@ impl<'a, 'p> FnGen<'a, 'p> {
     pub fn run(mut self) -> String {
         let f = self.f();
         let p = self.p();
-        for l in &f.locals {
+        // A closure shares its enclosing function's local table: give stack
+        // slots only to the locals it declares, not to captured ones.
+        let needed: Option<Vec<LocalId>> = f.env.as_ref().map(|caps| {
+            let mut used = Vec::new();
+            let mut declared = f.params.clone();
+            crate::tirwalk::locals(f.body.as_ref().unwrap(), &mut used, &mut declared);
+            used.extend(declared);
+            used.retain(|l| !caps.contains(l));
+            used
+        });
+        for (i, l) in f.locals.iter().enumerate() {
+            if needed.as_ref().is_some_and(|n| !n.contains(&(i as LocalId))) {
+                self.slots.push("%unused".into());
+                continue;
+            }
             let s = self.alloca(&l.ty);
             self.slots.push(s);
         }
         let mut params = Vec::new();
         for (i, (&lid, t)) in f.params.iter().zip(f.param_tys.iter()).enumerate() {
-            let pname = format!("%p{}", i);
-            let attr = if f.linkage == Linkage::Export && self.cold.is_none() { c_abi_attr(t) } else { "" };
-            params.push(format!("{} {}{}", llty(p, t), attr, pname));
+            let mut pname = format!("%p{}", i);
+            if let Ty::Block(..) = t {
+                // Code and environment arrive as two scalars, so that LLVM
+                // can specialize the function for a constant code pointer.
+                params.push(format!("ptr {}.code, ptr {}.env", pname, pname));
+                let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr {}.code, 0", pname));
+                pname = self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}.env, 1", a, pname));
+            } else {
+                let attr = if f.linkage == Linkage::Export && self.cold.is_none() { c_abi_attr(t) } else { "" };
+                params.push(format!("{} {}{}", llty(p, t), attr, pname));
+            }
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
             self.live[0].push(lid);
         }
         if let Some(x) = crate::vmgen::extra_param(p, f) {
             params.push(x);
+        }
+        if let Some(caps) = &f.env {
+            // The environment: pointers to the captured locals' slots, or
+            // (captured by value) the values themselves.
+            params.insert(0, "ptr %env".to_string());
+            for (i, &l) in caps.iter().enumerate() {
+                let gp = self.inst(format!("getelementptr inbounds [{} x ptr], ptr %env, i64 0, i64 {}", caps.len(), i));
+                self.slots[l as usize] = if f.env_val[i] { gp } else { self.inst(format!("load ptr, ptr {}", gp)) };
+            }
         }
         crate::vmgen::handler_prologue(&mut self);
         let cold = self.cold.take();
@@ -658,6 +693,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 }
             }
             TK::FnRef(id) => format!("@\"{}\"", self.p().fns[*id as usize].symbol),
+            TK::Closure(fid, caps) => self.closure(*fid, caps),
             TK::AddrOf(inner) => self.place(inner),
             TK::SliceRange(b, lo, hi) => self.slice_range(e, b, lo.as_deref(), hi.as_deref()),
             TK::Unary(op, inner) => {
@@ -1622,6 +1658,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.cg.decls.insert(format!("declare {} @{}({})", tt, name, ft));
                 self.inst(format!("call {} @{}({} {})", tt, name, ft, v))
             }
+            (Ty::Fn(ps, r, _), Ty::Block(..)) => {
+                let t = self.trampoline(ps, r);
+                let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr {}, 0", t));
+                self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}, 1", a, v))
+            }
             (Ty::F32, Ty::F64) => self.inst(format!("fpext float {} to double", v)),
             (Ty::F64, Ty::F32) => self.inst(format!("fptrunc double {} to float", v)),
             (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_) | Ty::Gc(_)) => v,
@@ -1632,18 +1673,89 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
     }
 
+    /// A closure value: `{ code, env }`, with the environment (pointers to
+    /// the captured locals' slots) in this frame.
+    fn closure(&mut self, fid: FnId, caps: &[LocalId]) -> String {
+        let sym = self.p().fns[fid as usize].symbol.clone();
+        let by_val = self.p().fns[fid as usize].env_val.clone();
+        let env = if caps.is_empty() {
+            "null".to_string()
+        } else {
+            let env = self.fresh();
+            let _ = writeln!(self.allocas, "  {} = alloca [{} x ptr], align 8", env, caps.len());
+            for (i, &l) in caps.iter().enumerate() {
+                let gp = self.inst(format!("getelementptr inbounds [{} x ptr], ptr {}, i64 0, i64 {}", caps.len(), env, i));
+                let slot = self.slots[l as usize].clone();
+                if by_val[i] {
+                    let t = self.f().locals[l as usize].ty.clone();
+                    let v = self.load(&t, &slot);
+                    self.store(&t, &v, &gp);
+                } else {
+                    self.emit(format!("store ptr {}, ptr {}", slot, gp));
+                }
+            }
+            env
+        };
+        let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr @\"{}\", 0", sym));
+        self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}, 1", a, env))
+    }
+
+    /// `R (ptr env, A..)` that calls the plain function `env` with `A..`:
+    /// the code half of a plain function used as a `block fn`.
+    fn trampoline(&mut self, ps: &[Ty], r: &Ty) -> String {
+        let p = self.p();
+        let lps: Vec<String> = ps.iter().map(|t| if matches!(t, Ty::Block(..)) { "ptr, ptr".to_string() } else { llty(p, t) }).collect();
+        let rt = ret_llty(p, r);
+        let key = format!("{} ({})", rt, lps.join(", "));
+        if let Some(n) = self.cg.tramps.get(&key) {
+            return n.clone();
+        }
+        let name = format!("@\"loimi.tramp.{}\"", self.cg.tramps.len());
+        self.cg.tramps.insert(key, name.clone());
+        let formals: Vec<String> = lps
+            .iter()
+            .enumerate()
+            .map(|(i, t)| if t == "ptr, ptr" { format!("ptr %a{}.code, ptr %a{}.env", i, i) } else { format!("{} %a{}", t, i) })
+            .collect();
+        let actuals = formals.join(", ");
+        let mut text = format!("define internal {} {}(ptr %env{}{}) nounwind alwaysinline {{\n", rt, name, if formals.is_empty() { "" } else { ", " }, actuals);
+        if rt == "void" {
+            text.push_str(&format!("  tail call void %env({})\n  ret void\n}}\n\n", actuals));
+        } else {
+            text.push_str(&format!("  %r = tail call {} %env({})\n  ret {} %r\n}}\n\n", rt, actuals, rt));
+        }
+        self.cg.fns.push_str(&text);
+        name
+    }
+
     fn call(&mut self, e: &TExpr, f: &TExpr, args: &[TExpr]) -> String {
         let p = self.p();
+        let mut env = None;
         let (callee, cc, variadic, fixed) = match &f.kind {
             TK::FnRef(id) => {
                 let fd = &p.fns[*id as usize];
                 (format!("@\"{}\"", fd.symbol), fd.cc, fd.variadic, fd.param_tys.len())
             }
+            _ if matches!(f.ty, Ty::Block(..)) => {
+                let v = self.val(f);
+                let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
+                env = Some(self.inst(format!("extractvalue {{ ptr, ptr }} {}, 1", v)));
+                (code, CallConv::C, false, args.len())
+            }
             _ => (self.val(f), CallConv::C, false, args.len()),
         };
         let mut avs = Vec::new();
+        if let Some(env) = env {
+            avs.push(format!("ptr {}", env));
+        }
         for a in args {
             let v = self.val(a);
+            if let Ty::Block(..) = a.ty {
+                let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
+                let env = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 1", v));
+                avs.push(format!("ptr {}, ptr {}", code, env));
+                continue;
+            }
             let t = self.ty(&a.ty);
             avs.push(format!("{} {}", t, v));
         }

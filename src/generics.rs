@@ -43,19 +43,52 @@ pub struct Generics {
     pub ty_methods: HashMap<(Ty, String), u32>,
     /// Instance of a generic function → where it was first needed.
     pub fn_site: HashMap<FnId, Span>,
+    /// Concrete instance of a generic function → (generic fn, arguments).
+    pub inst_generic: HashMap<FnId, (u32, Vec<Ty>)>,
 }
 
+/// Does `t` contain an inference variable or an opaque type parameter
+/// (making an instance of it a pattern that is never emitted)?
 pub fn contains_param(t: &Ty, g: &Generics) -> bool {
     match t {
-        Ty::Param(_) => true,
+        Ty::Param(_) | Ty::Opaque(_) => true,
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_param(x, g),
         Ty::Result(a, b) => contains_param(a, g) || contains_param(b, g),
         Ty::Tuple(ts) => ts.iter().any(|t| contains_param(t, g)),
-        Ty::Fn(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
+        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
         Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
             Some((_, args)) => args.iter().any(|t| contains_param(t, g)),
             None => false,
         },
+        _ => false,
+    }
+}
+
+/// Does `t` contain an inference variable (`Ty::Param`), as opposed to
+/// only opaque type parameters?
+pub fn contains_infer(t: &Ty, g: &Generics) -> bool {
+    match t {
+        Ty::Param(_) => true,
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_infer(x, g),
+        Ty::Result(a, b) => contains_infer(a, g) || contains_infer(b, g),
+        Ty::Tuple(ts) => ts.iter().any(|t| contains_infer(t, g)),
+        Ty::Fn(ps, r, _) | Ty::Block(ps, r, _) => ps.iter().any(|t| contains_infer(t, g)) || contains_infer(r, g),
+        Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
+            Some((_, args)) => args.iter().any(|t| contains_infer(t, g)),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Does `t` contain a `block fn` type (which may not be a type argument)?
+pub fn contains_block(t: &Ty) -> bool {
+    match t {
+        Ty::Block(..) => true,
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => contains_block(x),
+        Ty::Result(a, b) => contains_block(a) || contains_block(b),
+        Ty::Tuple(ts) => ts.iter().any(contains_block),
+        Ty::Fn(ps, r, _) => ps.iter().any(contains_block) || contains_block(r),
         _ => false,
     }
 }
@@ -78,15 +111,16 @@ impl<'a> Checker<'a> {
             return Ok(t.clone());
         }
         let module = gt.module;
-        let bounds = gt.bounds.clone();
         let gname = gt.name.clone();
-        self.check_bounds(
-            module,
-            &bounds,
-            &args,
-            || format!("{}<{}>", gname, args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ")),
-            span,
-        )?;
+        if let Some(a) = args.iter().find(|a| contains_block(a)) {
+            return Err(Diag::new(span, format!("a `block fn` cannot be a type argument (`{}` in `{}`)", self.ty_name(a), gname)));
+        }
+        let bounds = self.type_bounds(g, &args)?;
+        let needed_by = format!("{}<{}>", gname, args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", "));
+        self.check_bounds(&bounds, &args, needed_by, span)?;
+        if let Some(t) = self.generics.type_inst.get(&(g, args.clone())) {
+            return Ok(t.clone());
+        }
         let gt = &self.generics.types[g as usize];
         let pattern = args.iter().any(|a| contains_param(a, &self.generics));
         let name = format!(
@@ -141,18 +175,11 @@ impl<'a> Checker<'a> {
         Ok(ty)
     }
 
-    pub fn instantiate_fn(&mut self, g: u32, args: Vec<Ty>, span: Span) -> Res<FnId> {
-        if let Some(f) = self.generics.fn_inst.get(&(g, args.clone())) {
-            return Ok(*f);
-        }
-        let gf = &self.generics.fns[g as usize];
-        let module = gf.module;
-        let decl = gf.decl.clone();
-        let env: Vec<(String, Ty)> = gf.params.iter().cloned().zip(args.iter().cloned()).collect();
-        let targs = args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ");
-        let base = match &decl.recv {
+    /// The display name of an instance: `f<i64>`, `Vec<u8>.push`, `Box<T>.map<U>`.
+    pub fn inst_name(&self, decl: &FnDecl, args: &[Ty]) -> String {
+        let names: Vec<String> = args.iter().map(|a| self.ty_name(a)).collect();
+        match &decl.recv {
             Some(r) => {
-                let names: Vec<String> = args.iter().map(|a| self.ty_name(a)).collect();
                 let (ra, ma) = names.split_at(decl.recv_generics);
                 let mut b = r.name.clone();
                 if !ra.is_empty() {
@@ -164,26 +191,50 @@ impl<'a> Checker<'a> {
                 }
                 b
             }
-            None => format!("{}<{}>", decl.name.name, targs),
-        };
-        self.check_bounds(module, &decl.bounds, &args, || base.clone(), span)?;
+            None => format!("{}<{}>", decl.name.name, names.join(", ")),
+        }
+    }
+
+    /// The instance of generic function `g` for `args`. An instance over
+    /// opaque type parameters (while a generic body is checked against its
+    /// bounds) only has a signature: it is never checked or emitted.
+    pub fn instantiate_fn(&mut self, g: u32, args: Vec<Ty>, span: Span) -> Res<FnId> {
+        if let Some(f) = self.generics.fn_inst.get(&(g, args.clone())) {
+            return Ok(*f);
+        }
+        let gf = &self.generics.fns[g as usize];
+        let module = gf.module;
+        let decl = gf.decl.clone();
+        let env: Vec<(String, Ty)> = gf.params.iter().cloned().zip(args.iter().cloned()).collect();
+        let base = self.inst_name(&decl, &args);
+        if let Some(a) = args.iter().find(|a| contains_block(a)) {
+            return Err(Diag::new(span, format!("a `block fn` cannot be a type argument (`{}` in `{}`)", self.ty_name(a), base)));
+        }
+        let bounds = self.fn_bounds(g, &args)?;
+        self.check_bounds(&bounds, &args, base.clone(), span)?;
+        let pattern = args.iter().any(|a| contains_param(a, &self.generics));
         let id = self.prog.fns.len() as FnId;
         self.prog.fns.push(crate::check::placeholder_fn(span));
         self.generics.fn_inst.insert((g, args.clone()), id);
-        self.generics.fn_site.insert(id, span);
         let symbol = format!("{}.{}", self.module_prefix(module), base);
         self.prog.fns[id as usize].name = base.clone();
-        self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)))
-            .map_err(|d| d.note(span, format!("in `{}`, instantiated here", base)))?;
+        let saved = std::mem::replace(&mut self.sig_only, pattern);
+        let r = self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)));
+        self.sig_only = saved;
+        r.map_err(|d| d.note(span, format!("in `{}`, instantiated here", base)))?;
         self.prog.fns[id as usize].name = base;
-        self.pending.push((id, module, decl, env));
+        if !pattern {
+            self.generics.fn_site.insert(id, span);
+            self.generics.inst_generic.insert(id, (g, args));
+            self.pending.push((id, module, decl, env));
+        }
         Ok(id)
     }
 
     /// Resolve a type with the given generic parameters as inference variables.
     fn pattern_type(&mut self, module: usize, params: &[String], t: &TypeExpr) -> Res<Ty> {
         let env = params.iter().enumerate().map(|(i, p)| (p.clone(), Ty::Param(i as u32))).collect();
-        self.with_tenv(env, |c| c.resolve_type(module, t))
+        self.with_tenv(env, |c| c.resolve_param_type(module, t))
     }
 
     pub fn unify(&self, pat: &Ty, act: &Ty, b: &mut [Option<Ty>]) -> bool {
@@ -207,7 +258,7 @@ impl<'a> Checker<'a> {
             (Ty::Tuple(xs), Ty::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y, b)),
             // Effects are not unified: the argument is coerced to the
             // instantiated parameter type afterwards, which checks them.
-            (Ty::Fn(p1, r1, _), Ty::Fn(p2, r2, _)) => {
+            (Ty::Fn(p1, r1, _), Ty::Fn(p2, r2, _)) | (Ty::Block(p1, r1, _), Ty::Block(p2, r2, _)) => {
                 p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y, b)) && self.unify(r1, r2, b)
             }
             (Ty::Struct(_), Ty::Struct(_)) | (Ty::Enum(_), Ty::Enum(_)) if pat != act => {
@@ -268,7 +319,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(out)
             }
-            Ty::Fn(ps, r, e) => {
+            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) => {
                 let mut out = Vec::new();
                 for t in ps {
                     match self.subst(t, b, span)? {
@@ -277,6 +328,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 match self.subst(r, b, span)? {
+                    Some(r) if matches!(t, Ty::Block(..)) => Ty::Block(out, Box::new(r), *e),
                     Some(r) => Ty::Fn(out, Box::new(r), *e),
                     None => return Ok(None),
                 }
@@ -316,12 +368,13 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(out)
             }
-            Ty::Fn(ps, r, e) => {
+            Ty::Fn(ps, r, e) | Ty::Block(ps, r, e) => {
                 let mut out = Vec::new();
                 for t in ps {
                     out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
                 }
-                Ty::Fn(out, Box::new(self.subst_holes(r, b, span)?.unwrap_or(Ty::Param(HOLE))), *e)
+                let r = Box::new(self.subst_holes(r, b, span)?.unwrap_or(Ty::Param(HOLE)));
+                if matches!(t, Ty::Block(..)) { Ty::Block(out, r, *e) } else { Ty::Fn(out, r, *e) }
             }
             t if contains_param(t, &self.generics) => {
                 // Gc<..>, Result<..> and generic instances: only when fully known.
@@ -434,7 +487,10 @@ impl<'a> Checker<'a> {
         let mut deferred: Vec<usize> = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let pt = &ptys[off + i];
-            if matches!(pt, Ty::Fn(..)) && contains_param(pt, &self.generics) && self.generic_fn_named(cx, a)?.is_some() {
+            let generic_fn = matches!(pt, Ty::Fn(..) | Ty::Block(..)) && self.generic_fn_named(cx, a)?.is_some();
+            // Closures too: their parameter types may come from later arguments.
+            let closure = matches!(pt, Ty::Block(..)) && matches!(a.kind, ExprKind::Closure(..));
+            if contains_param(pt, &self.generics) && (generic_fn || closure) {
                 deferred.push(i);
             } else {
                 order.push(i);
@@ -446,7 +502,14 @@ impl<'a> Checker<'a> {
             let a = &args[i];
             let pt = ptys[off + i].clone();
             let want = self.subst(&pt, &b, span)?;
-            let v = if want.is_none() && deferred.contains(&i) {
+            let v = if matches!(pt, Ty::Block(..)) {
+                // A `block fn` parameter, maybe only partly known.
+                let w = match &want {
+                    Some(w) => w.clone(),
+                    None => self.subst_partial(&pt, &b, span)?,
+                };
+                self.block_arg(cx, a, &w)?
+            } else if want.is_none() && deferred.contains(&i) {
                 // Only partly known: the parameters may still determine
                 // the function's type arguments.
                 let partial = self.subst_partial(&pt, &b, span)?;

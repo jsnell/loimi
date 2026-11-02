@@ -253,7 +253,7 @@ pub fn trailing(g: &mut FnGen, obj: &TExpr) -> String {
 /// function pointer is the pointer type's effects.
 pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     let p = g.p();
-    let Ty::Fn(_, _, mut effects) = f.ty else { return None };
+    let (Ty::Fn(_, _, mut effects) | Ty::Block(_, _, mut effects)) = f.ty else { return None };
     if let TK::FnRef(id) = f.kind {
         effects |= p.fns[id as usize].sync_effects;
     }

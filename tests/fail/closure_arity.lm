@@ -1,0 +1,3 @@
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() { each(3, |i, j| {}); }
+// error: this closure takes 2 parameter(s), but `block fn(i64) -> ()` takes 1
