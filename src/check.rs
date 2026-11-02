@@ -132,6 +132,9 @@ pub struct Checker<'a> {
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
     pub aliases: Vec<AliasInfo>,
+    /// Warnings, in the order found (deduplicated by span: handler
+    /// bodies can be checked more than once).
+    pub warnings: Vec<Diag>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -205,6 +208,7 @@ impl<'a> Checker<'a> {
             tenv: vec![],
             object_count: 0,
             aliases: vec![],
+            warnings: vec![],
         }
     }
 
@@ -1881,12 +1885,59 @@ impl<'a> Checker<'a> {
             tarms.push(a);
         }
         self.check_exhaustive(&s.ty, &tarms, span)?;
+        if cx.vm.as_ref().is_some_and(|h| h.allow_control) {
+            self.lint_lone_if_arms(&tarms, arms);
+        }
         let ty = ty.unwrap_or(Ty::Never);
         for a in tarms.iter_mut() {
             let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
             a.body = self.coerce(body, &ty)?;
         }
         Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
+    }
+
+    /// Warn about a `match` arm in vm code whose body is a lone `if` (no
+    /// `else`) ending in a control word, when a later arm that does
+    /// something could also have matched: if the condition is false,
+    /// control continues after the `match`, not with the later arm.
+    /// An explicit `else {}` (or a guard, `pat if cond => ..`) says
+    /// which is meant.
+    pub fn lint_lone_if_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
+        fn lone_if(e: &TExpr) -> bool {
+            match &e.kind {
+                TK::If(_, then, None) => then.ty == Ty::Never,
+                TK::Block(stmts, None) if stmts.len() == 1 => matches!(&stmts[0], TStmt::Expr(x) if lone_if(x)),
+                TK::Block(stmts, Some(t)) if stmts.is_empty() => lone_if(t),
+                _ => false,
+            }
+        }
+        fn empty(e: &TExpr) -> bool {
+            match &e.kind {
+                TK::Unit => true,
+                TK::Block(stmts, None) => stmts.is_empty(),
+                TK::Block(stmts, Some(t)) => stmts.is_empty() && empty(t),
+                _ => false,
+            }
+        }
+        for (i, a) in tarms.iter().enumerate() {
+            if !lone_if(&a.body) {
+                continue;
+            }
+            let Some(j) = (i + 1..tarms.len()).find(|&j| !empty(&tarms[j].body) && pats_overlap(&a.pat, &tarms[j].pat)) else {
+                continue;
+            };
+            let span = arms[i].body.span;
+            if self.warnings.iter().any(|w| w.span == span) {
+                continue;
+            }
+            let w = Diag::new(
+                span,
+                "this arm's body is an `if` without `else`: when the condition is false, control continues after the `match`, not with the later arms",
+            )
+            .note(arms[j].pat.span, "this later arm also matches some of the same values")
+            .note(arms[i].pat.span, "to try later arms when the condition is false, use a guard: `pat if cond => ..`; to continue after the `match`, write `else {}`");
+            self.warnings.push(w);
+        }
     }
 
     pub fn expr_coerce(&mut self, cx: &mut FnCx, e: &Expr, want: &Ty) -> Res<TExpr> {
@@ -3044,6 +3095,25 @@ pub fn is_place(e: &TExpr) -> bool {
         TK::Index(b, _) => !matches!(b.ty, Ty::Array(..)) || is_place(b),
         TK::Vm(TVm::Word(_) | TVm::WordAt(..)) => true,
         _ => false,
+    }
+}
+
+/// Whether some value can match both patterns (conservative: true when
+/// unsure).
+fn pats_overlap(a: &TPat, b: &TPat) -> bool {
+    match (&a.kind, &b.kind) {
+        (TPK::Wild | TPK::Bind(_), _) | (_, TPK::Wild | TPK::Bind(_)) => true,
+        (TPK::Or(xs), _) => xs.iter().any(|x| pats_overlap(x, b)),
+        (_, TPK::Or(ys)) => ys.iter().any(|y| pats_overlap(a, y)),
+        (TPK::Tuple(xs), TPK::Tuple(ys)) => xs.len() != ys.len() || xs.iter().zip(ys).all(|(x, y)| pats_overlap(x, y)),
+        (TPK::Variant(i, xs), TPK::Variant(j, ys)) => {
+            i == j && (xs.len() != ys.len() || xs.iter().zip(ys).all(|(x, y)| pats_overlap(x, y)))
+        }
+        (TPK::Int(x), TPK::Int(y)) => x == y,
+        (TPK::Int(x), TPK::Range(lo, hi)) | (TPK::Range(lo, hi), TPK::Int(x)) => lo <= x && x <= hi,
+        (TPK::Range(a1, a2), TPK::Range(b1, b2)) => a1 <= b2 && b1 <= a2,
+        (TPK::Bool(x), TPK::Bool(y)) => x == y,
+        _ => true,
     }
 }
 

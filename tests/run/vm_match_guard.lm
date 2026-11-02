@@ -1,0 +1,62 @@
+// Match guards in handlers, over value tuples: `pat if cond => ..` tries
+// the later arms when the guard is false. Contrast DIV_IF, whose arm is an
+// `if` without `else`: a false condition continues after the `match`
+// (here into the cold path), and the compiler warns about it.
+// matrix: dispatch
+import std.io;
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+}
+
+fn show(v: V) {
+    match v {
+        Int(x) => io.print_int(x as i64),
+        Num(x) => io.print_f64(x),
+        Nil => io.print("nil"),
+    }
+    io.println("");
+}
+
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) if y != 0 and x % y == 0 => { dst = Int(x / y); next }
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            (Num(x), Num(y)) => { dst = Num(x / y); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    op DIV_IF(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => if y != 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
+        cold { dst = Nil; next }
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *V) -> V { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var regs: [V; 4] = [Int(7), Int(2), Int(8), Nil];
+    var code: [u32; 2] = [M.DIV(3, 0, 1), M.RET(3)];
+    show(M.run(&code[0], &regs[0]));      // 3.5: the guard fails, the next arm runs
+    code[0] = M.DIV(3, 2, 1);
+    show(M.run(&code[0], &regs[0]));      // 4
+    code[0] = M.DIV_IF(3, 0, 1);
+    show(M.run(&code[0], &regs[0]));      // nil: after the match, not the next arm
+}
+// expect: 3.5
+// expect: 4
+// expect: nil
+// expect-stderr: warning: this arm's body is an `if` without `else`
+// expect-stderr: vm_match_guard.lm:39:33

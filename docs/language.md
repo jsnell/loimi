@@ -108,6 +108,30 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **Match guards.** `pat if cond => body` matches only when `cond` (which
+  sees the pattern's bindings) is true; otherwise the later arms are
+  tried. Guarded arms do not count toward exhaustiveness. Note the
+  difference from an arm whose *body* is an `if`:
+
+  ```loimi
+  match (a, b) {
+      (Int(x), Int(y)) if y != 0 => { dst = Int(x / y); next }   // y == 0: tries the next arm
+      (Int(x), Int(y)) => if y != 0 { dst = Int(x / y); next },  // y == 0: continues after the match
+      (Int(x), _) => { .. }
+      _ => {}
+  }
+  ```
+
+  Once a pattern matches, its arm is chosen; a false `if` inside it
+  falls out of the whole `match`, as in Rust. In handlers, where the code
+  after a `match` is usually the slow path, that silently skips a later
+  arm meant for the case. The compiler warns when, in vm code (op
+  handlers, `-> never` vm functions, entries, `on raise`), an arm's body
+  is an `if` without `else` that ends in a control word and a later arm
+  with a non-empty body could match some of the same values. Use a guard
+  to try the later arms, or write `else {}` to say that falling out of the
+  `match` is intended. Arms followed only by `_ => {}` do not warn, since
+  falling out of the `match` is then the same as trying the rest.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
