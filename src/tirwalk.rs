@@ -324,3 +324,4 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
         },
     }
 }
+

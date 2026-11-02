@@ -37,6 +37,11 @@ vm V {
         }
     }
     op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    // A cold path that falls through to the next part of a super.
+    op ABS(dst: reg) : ABC {
+        if dst >= 0 { next }
+        cold { dst = 0 - dst; next }
+    }
     op JMP(target: label) : sJ { jump target }
     op RET(src: reg) : ABC { exit src }
 
@@ -44,6 +49,7 @@ vm V {
     super LOADI_ADDP_MUL = LOADI; ADD_P; MUL;
     super ADD_RET = ADD; RET;
     super ADDP_MUL = ADD_P; MUL;
+    super ABS_MUL = ABS; MUL;
 
     entry run(c: *Counts, code: *u32, r: *i64) -> i64 {
         ctx = c;
@@ -130,6 +136,15 @@ fn main() {
     names(c, at);
     io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
     show(V.verify(c[0..at]));
+
+    at = 0;
+    at = V.emit.LOADI(c, at, 0, -3);
+    at = V.emit.ABS(c, at, 0);
+    at = V.emit.MUL(c, at, 1, 0, 0);
+    at = V.emit.RET(c, at, 1);
+    V.optimize(c[0..at]);
+    names(c, at);
+    io.print_int(V.run(&cnt, &code[0], &regs[0])); io.println("");
 }
 // expect: LOADI LOADI_ADD_MUL ADD MUL RET
 // expect: ok
@@ -151,3 +166,5 @@ fn main() {
 // expect: LOADI NEG NEG ADDP_MUL MUL RET
 // expect: 16
 // expect: ok
+// expect: LOADI ABS_MUL MUL RET
+// expect: 9

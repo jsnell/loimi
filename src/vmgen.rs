@@ -25,6 +25,8 @@ pub struct HandlerGen {
     pub labels_global: String,
     /// Tail-call handlers receive the current instruction word in a register.
     pub insn_slot: Option<String>,
+    /// Generating an outlined cold block.
+    pub outlined: bool,
 }
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
@@ -74,6 +76,7 @@ pub fn handler_prologue(g: &mut FnGen) {
         raise_slot: format!("@\"{}.raise_slot\"", vd.symbol),
         labels_global: format!("@\"{}.labels\"", f.symbol),
         insn_slot: None,
+        outlined: g.cold.is_some(),
     };
     if takes_insn(p, f) {
         let wt = Ty::Int(vd.word);
@@ -412,6 +415,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let vd = &p.vms[hg.vm as usize];
             let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
             let np = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, size));
+            if hg.outlined {
+                // Out of the super's handler: run the next part's word on
+                // its own (it holds an op of the part's family).
+                dispatch(g, &np);
+                return g.poison(&e.ty);
+            }
             g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
             // The next part decodes its own word.
             if let Some(slot) = &hg.insn_slot {
@@ -487,9 +496,10 @@ fn can_outline(g: &FnGen, b: &TExpr) -> bool {
     if hg.combined || b.ty != Ty::Never {
         return false;
     }
-    let p = g.p();
     match g.f().vm_role {
-        VmRole::Handler(k) => p.vms[hg.vm as usize].ops[k as usize].parts.is_empty(),
+        // In a superinstruction, `next` from a part other than the last
+        // dispatches the next part's word when outlined.
+        VmRole::Handler(_) => true,
         _ => false,
     }
 }
@@ -529,7 +539,8 @@ fn outline(g: &mut FnGen, b: &TExpr) {
 }
 
 /// The handler's operand-field decodes: `let raw = <bits of word 0>;` at
-/// the top of its body.
+/// the top of its body, or of each part of a superinstruction (decoded
+/// from the part's own word, which is the current word in that part).
 fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
     fn pure(e: &TExpr) -> bool {
         match &e.kind {
@@ -539,14 +550,21 @@ fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
             _ => false,
         }
     }
-    let TK::Block(stmts, _) = &body.kind else { return vec![] };
-    stmts
-        .iter()
-        .filter_map(|s| match s {
-            TStmt::Let(l, Some(e)) if pure(e) => Some((*l, e.clone())),
-            _ => None,
-        })
-        .collect()
+    let TK::Block(stmts, tail) = &body.kind else { return vec![] };
+    let mut out = Vec::new();
+    for s in stmts {
+        match s {
+            TStmt::Let(l, Some(e)) if pure(e) => out.push((*l, e.clone())),
+            TStmt::Expr(TExpr { kind: TK::Vm(TVm::Part(_, b)), .. }) => out.extend(decode_lets(b)),
+            _ => {}
+        }
+    }
+    if let Some(t) = tail {
+        if let TK::Vm(TVm::Part(_, b)) = &t.kind {
+            out.extend(decode_lets(b));
+        }
+    }
+    out
 }
 
 /// Thread-local slot for argument `i` of the shared copy `fid` of a

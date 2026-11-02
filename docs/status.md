@@ -42,10 +42,14 @@ in [`language.md`](language.md). Updated 2026-11-02.
   calls.** In tail-call mode, a `cold` block in an op handler that ends in
   control words moves to its own function with the handler's signature,
   and the handler reaches it with `musttail`. The hot path makes no call,
-  so it needs no stack frame. Handler locals the cold code uses travel
-  through thread-local slots (`initialexec`), written only on the cold path.
+  so it needs no stack frame. The instruction word travels in its
+  register, and the cold function decodes the operand fields it uses
+  again; other handler locals it uses travel through thread-local slots
+  (`initialexec`), written only on the cold path.
   `if c { cold { .. } }` followed by code ending in a control word gets that
-  continuation copied into the cold block, so it can be outlined too. Other
+  continuation copied into the cold block, so it can be outlined too. This
+  includes superinstruction parts: an outlined `next` from a part other
+  than the last dispatches the next part's word on its own. Other
   cold blocks, and all cold blocks in goto/switch mode, stay inline and are
   marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
