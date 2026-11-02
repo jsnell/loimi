@@ -272,6 +272,29 @@ callee's registers, no inlining), the `MOVE`s that stage arguments, and
 the cached property loads themselves (`GETPROP_IN` is five instructions
 plus the dispatch, 25-30% of nbody and richards).
 
+After the std.obj rework (stable shape ids instead of pinning, the
+cache state machine and plain-word prototype hits from std.obj,
+per-property attributes) and the GC growth change, best of 5 wall-clock
+seconds, interleaved runs of both binaries on the same loaded machine:
+
+| Benchmark | before | after |
+|---|---:|---:|
+| awfy_micro | 0.87 | 0.85 |
+| binary_trees | 1.93 | 1.51 |
+| bitops | 0.95 | 0.94 |
+| closures | 1.32 | 1.32 |
+| deltablue | 0.92 | 0.98 |
+| fannkuch | 0.50 | 0.52 |
+| json | 1.34 | 1.40 |
+| nbody | 0.62 | 0.62 |
+| properties | 1.10 | 1.01 |
+| raytrace | 0.66 | 0.64 |
+| richards | 0.89 | 0.87 |
+| sort | 0.94 | 0.97 |
+| spectral_norm | 1.01 | 1.02 |
+| strings | 1.51 | 1.51 |
+| total | 14.55 | 14.14 |
+
 What mattered, in order: inline caches for own properties and for
 prototype methods (validity cells), ropes for `+=`, shape ids that
 survive collections so that sites stay monomorphic, polymorphic entries
