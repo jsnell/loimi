@@ -438,6 +438,12 @@ computed by `obj.slot_ref(i, cap)`.
   collection, and the weak-cache-reset machinery of gc.md §8 (not built
   in std.gc) is not needed. The cost is that 4 billion shape creations
   abort the process.
+- **Pinning**: `m.shapes.pin(sh)` keeps a shape (and so its ancestors
+  and its id) alive for good. Without it a shape dies with its last
+  object, and the next object built the same way gets a new id, which a
+  cache sees as a new shape; an interpreter pins the shapes its caches
+  record so that sites stay monomorphic across collections (MiniJS's
+  deltablue went megamorphic without it).
 - **Lookup**: chains of up to 8 properties are walked; longer ones build
   a key → index `Table` on first lookup and keep it on the shape (one
   table per shape; tables are not shared along a chain).
