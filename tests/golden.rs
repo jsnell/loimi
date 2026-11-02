@@ -139,7 +139,19 @@ fn compile_errors() {
 /// safepoint), comparing with `-- expect:` lines.
 #[test]
 fn mini_scripts() {
-    mini_scripts_with(&[], |_| true);
+    mini_scripts_with(&[], &[], |_| true);
+}
+
+/// The copy-and-patch JIT prototype (`--jit-stencils`, x86-64 Linux):
+/// every script and conformance test with the JIT on and its hot
+/// threshold at 1, so code is compiled at its first call or backward
+/// jump (and again after each invalidation).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn mini_jit_stencils() {
+    let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")];
+    mini_scripts_with(&["--jit-stencils"], &env, |_| true);
+    mini_conformance_with(&["--jit-stencils"], &env);
 }
 
 /// Re-entry (table.sort's comparator runs as a nested run of the
@@ -148,11 +160,11 @@ fn mini_scripts() {
 #[test]
 fn mini_reentry_dispatch_modes() {
     for mode in ["--dispatch=goto", "--dispatch=switch"] {
-        mini_scripts_with(&[mode], |name| name.starts_with("sort") || name.starts_with("err_sort"));
+        mini_scripts_with(&[mode], &[], |name| name.starts_with("sort") || name.starts_with("err_sort"));
     }
 }
 
-fn mini_scripts_with(flags: &[&str], select: impl Fn(&str) -> bool) {
+fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
     let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
@@ -179,6 +191,7 @@ fn mini_scripts_with(flags: &[&str], select: impl Fn(&str) -> bool) {
         for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
+            cmd.envs(env.iter().copied());
             if !mode.is_empty() {
                 cmd.arg(mode);
             }
@@ -213,9 +226,13 @@ fn mini_scripts_with(flags: &[&str], select: impl Fn(&str) -> bool) {
 /// the output before the error. Run normally and with GC stress.
 #[test]
 fn mini_conformance() {
+    mini_conformance_with(&[], &[]);
+}
+
+fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}", std::process::id()));
-    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
+    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -234,6 +251,7 @@ fn mini_conformance() {
         for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
+            cmd.envs(env.iter().copied());
             if !mode.is_empty() {
                 cmd.arg(mode);
             }
