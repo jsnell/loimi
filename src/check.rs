@@ -615,6 +615,50 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The LLVM constant an `export "C"` function with
+    /// `#[catch_panic(v)]` returns after a panic: `v` (an integer, `true`,
+    /// `false`, or a variant of the result enum), or zero (`0`, `false`,
+    /// NULL, an empty `str`) without one.
+    fn catch_panic_value(&self, f: &FnDecl, ret: &Ty, v: Option<&str>) -> Res<String> {
+        let sp = f.attrs.list.iter().find(|(n, _, _)| n == "catch_panic").map(|a| a.2).unwrap_or(f.name.span);
+        if f.linkage != Linkage::Export {
+            return Err(Diag::new(sp, "`#[catch_panic]` applies to `export \"C\"` functions: the boundary where a panic turns into a C return value"));
+        }
+        let Some(v) = v else { return Ok("zeroinitializer".into()) };
+        let bad = |what: &str| Err(Diag::new(sp, format!("`#[catch_panic({})]`: {}", v, what)));
+        match ret {
+            Ty::Unit | Ty::Never => bad("the function returns nothing; write `#[catch_panic]`"),
+            Ty::Int(it) => match v.parse::<i128>() {
+                Ok(n) => {
+                    let (lo, hi) = if it.signed {
+                        (-(1i128 << (it.bits - 1)), (1i128 << (it.bits - 1)) - 1)
+                    } else {
+                        (0, (1i128 << it.bits) - 1)
+                    };
+                    if n < lo || n > hi {
+                        return bad(&format!("out of range for `{}`", self.ty_name(ret)));
+                    }
+                    Ok(n.to_string())
+                }
+                Err(_) => bad(&format!("expected an integer for the `{}` result", self.ty_name(ret))),
+            },
+            Ty::Bool => match v {
+                "true" => Ok("true".into()),
+                "false" => Ok("false".into()),
+                _ => bad("expected `true` or `false` for the `bool` result"),
+            },
+            Ty::Enum(e) => {
+                let ed = &self.prog.enums[*e as usize];
+                match ed.variants.iter().find(|x| x.name == v) {
+                    Some(x) if !ed.has_payload() => Ok(x.discr.to_string()),
+                    Some(_) => bad("the result enum has payloads"),
+                    None => bad(&format!("`{}` has no variant `{}`", self.ty_name(ret), v)),
+                }
+            }
+            _ => bad(&format!("a `{}` result can only be zero after a panic; write `#[catch_panic]`", self.ty_name(ret))),
+        }
+    }
+
     pub fn declare_fn(&mut self, id: FnId, m: usize, f: &FnDecl, symbol: Option<String>) -> Res<()> {
         let mut param_tys = Vec::new();
         for p in &f.params {
@@ -672,6 +716,10 @@ impl<'a> Checker<'a> {
         if f.attrs.has("unsafe") {
             self.unsafe_fns.insert(id);
         }
+        let catch_panic = match f.attrs.get("catch_panic") {
+            Some(args) => Some(self.catch_panic_value(f, &ret, args.first().map(|s| s.as_str()))?),
+            None => None,
+        };
         self.prog.fns[id as usize] = FnDef {
             name,
             symbol,
@@ -693,6 +741,7 @@ impl<'a> Checker<'a> {
             sync_effects: 0,
             env: None,
             env_val: vec![],
+            catch_panic,
         };
         Ok(())
     }
@@ -3504,6 +3553,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         sync_effects: 0,
         env: None,
         env_val: vec![],
+        catch_panic: None,
     }
 }
 

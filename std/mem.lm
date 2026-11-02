@@ -16,6 +16,14 @@ pub fn alloc<T>(n: u64) -> *T {
     p as *T
 }
 
+/// Allocate `n` zeroed values of type T, or None when out of memory
+/// (or when `n` values do not fit in the address space).
+pub fn try_alloc<T>(n: u64) -> ?*T {
+    let p = calloc(if n == 0 { 1 } else { n }, size_of<T>());
+    if (p as u64) == 0 { return None; }
+    Some(p as *T)
+}
+
 /// Resize an allocation made with `alloc`.
 pub fn grow<T>(p: *T, n: u64) -> *T {
     let q = realloc(p as *u8, n * size_of<T>());
@@ -31,13 +39,13 @@ pub fn copy<T>(dst: *T, src: *T, n: u64) {
     memmove(dst as *u8, src as *u8, n * size_of<T>());
 }
 
-extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
-extern "C" fn abort();
+extern "C" fn loimi_panic(msg: *u8, len: u64);
 
+/// Out of memory is a panic: it aborts, unless a `rt.catch_panic` or a
+/// `#[catch_panic]` export catches it.
 fn panic_oom() {
     let m = "out of memory\n";
-    write(2, m.ptr, m.len);
-    abort();
+    loimi_panic(m.ptr, m.len);
 }
 
 /// A growable array.

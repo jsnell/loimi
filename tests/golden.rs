@@ -669,6 +669,17 @@ fn c_library() {
     c_host_run("c-library", &d.join("api.lm"), &d.join("host.c"), &d.join("host.expected"), Some(&d.join("api.h")));
 }
 
+/// Panics in a library become error returns: `#[catch_panic]` exports
+/// (bounds check, `unwrap`, `trap()`, division by zero, `rt.panic`, out of
+/// memory), `rt.catch_panic` under `rt.protect`, panics unwinding through
+/// host callbacks, GC roots on the shadow stack; an uncaught one aborts.
+#[test]
+fn c_library_panics() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let d = root.join("tests/embed");
+    c_host_run("c-library-panics", &d.join("panic.lm"), &d.join("panic_host.c"), &d.join("panic_host.expected"), None);
+}
+
 /// Mini embedded in a C host (examples/embed/host.c): two states alive at
 /// once, globals both ways, C natives, syntax and runtime errors,
 /// natives calling back into Mini (nested, failing, under GC stress), the

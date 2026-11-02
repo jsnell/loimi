@@ -36,9 +36,11 @@ const ATTRS: &[(&str, &str)] = &[
     ("require_verified", "`vm` declarations"),
     ("dispatch", "`vm` declarations"),
     ("forward", "`super` declarations in a vm"),
+    ("catch_panic", "`export \"C\"` functions"),
+    ("c_name", "structs passed to C"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
-pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe"];
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic"];
 /// Attributes on `vm` declarations.
 pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
 
@@ -84,6 +86,9 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             }
             if n == "inline" && !(args.is_empty() || (args.len() == 1 && (args[0] == "always" || args[0] == "never"))) {
                 return Err(Diag::new(*sp, "`#[inline]` takes no argument, `always` or `never`"));
+            }
+            if n == "catch_panic" && args.len() > 1 {
+                return Err(Diag::new(*sp, "`#[catch_panic]` takes at most one value: what the function returns after a panic"));
             }
             if n == "dispatch" && args.len() != 1 {
                 return Err(Diag::new(*sp, "`#[dispatch(..)]` takes one dispatch mode: tailcall, goto or switch"));
@@ -473,6 +478,11 @@ impl Parser {
                     match t.tok {
                         Tok::Ident(s) => args.push(s),
                         Tok::Int(i) => args.push(i.to_string()),
+                        // `#[catch_panic(-1)]`
+                        Tok::Punct("-") if matches!(self.peek(), Tok::Int(_)) => {
+                            let Tok::Int(i) = self.bump().tok else { unreachable!() };
+                            args.push(format!("-{}", i));
+                        }
                         Tok::Str(s) => args.push(String::from_utf8_lossy(&s).into_owned()),
                         Tok::Punct(",") => {}
                         _ => return Err(Diag::new(t.span, "unexpected token in attribute")),

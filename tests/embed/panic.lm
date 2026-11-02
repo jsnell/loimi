@@ -1,0 +1,154 @@
+// Panics in a library turned into error returns (`#[catch_panic]`,
+// `rt.catch_panic`), driven by tests/embed/panic_host.c. Built by the
+// `c_library_panics` test in golden.rs.
+
+import std.gc;
+import std.mem;
+import std.rt;
+
+struct Table { items: mem.Vec<i64> }
+enum Status: i32 { Ok = 0, Failed = -1 }
+
+var table_data: [i64; 4] = [10, 20, 30, 40];
+
+/// An index into a fixed table: -1 after a failed bounds check.
+#[catch_panic(-1)]
+export "C" fn lookup(i: u64) -> i64 {
+    table_data[..][i]
+}
+
+/// `unwrap` of None: `Failed`.
+#[catch_panic(Failed)]
+export "C" fn first_even(xs: *i64, n: u64) -> Status {
+    var found: ?i64 = None;
+    for i in 0..n {
+        if xs[i] % 2 == 0 and found.is_none() { found = Some(xs[i]); }
+    }
+    let v = found.unwrap();
+    if v > 0 { Status.Ok } else { Status.Ok }
+}
+
+/// `trap()`: false.
+#[catch_panic(false)]
+export "C" fn must_be_positive(x: i64) -> bool {
+    if x <= 0 { trap(); }
+    true
+}
+
+/// Division by zero.
+#[catch_panic(-7)]
+export "C" fn divide(a: i64, b: i64) -> i64 { a / b }
+
+/// `rt.panic` with a message, and no result: the panic just returns.
+#[catch_panic]
+export "C" fn check_name(s: str) {
+    if s.len == 0 { rt.panic("empty name"); }
+}
+
+/// Out of memory in `mem.alloc`: NULL.
+#[catch_panic]
+export "C" fn table_new(n: u64) -> ?*Table {
+    let t: *Table = mem.alloc(1);
+    t.items = mem.Vec.with_capacity(n);
+    Some(t)
+}
+
+export "C" fn table_free(t: *Table) {
+    t.items.free();
+    mem.release(t);
+}
+
+/// `mem.try_alloc`: no panic, NULL when out of memory.
+export "C" fn try_bytes(n: u64) -> ?*u8 { mem.try_alloc(n) }
+export "C" fn free_bytes(p: *u8) { mem.release(p); }
+
+/// The message of the last caught panic on this thread.
+export "C" fn last_panic() -> str { rt.panic_message() }
+
+/// No `#[catch_panic]`: a panic aborts the host (unless an enclosing
+/// catch on this thread, below it on the stack, catches it).
+export "C" fn lookup_unprotected(i: u64) -> i64 { table_data[..][i] }
+
+/// A C callback, under a catch: a panic in a nested call to an export
+/// without `#[catch_panic]` unwinds through the host's frames to here.
+#[catch_panic(-1)]
+export "C" fn with_callback(f: fn(i64) -> i64, x: i64) -> i64 { f(x) + 1000 }
+
+// rt.catch_panic inside Loimi, with rt.protect around it.
+struct Job { i: u64, out: i64 }
+
+fn job(data: *u8) {
+    let j = data as *Job;
+    if j.i == 99 { rt.throw(); }
+    j.out = table_data[..][j.i];
+}
+
+fn caught(data: *u8) {
+    let j = data as *Job;
+    if !rt.catch_panic(job, data) { j.out = -2; }
+}
+
+/// 0..3: the entry; 4: -2 (caught panic); 99: a throw passes through the
+/// catch to the protect around it: -3.
+export "C" fn caught_in_loimi(i: u64) -> i64 {
+    var j = Job { i: i, out: 0 };
+    if !rt.protect(caught, &j as *u8) { return -3; }
+    j.out
+}
+
+// A panic with GC roots on the shadow stack: the catch restores the
+// shadow-stack top, so the next collection sees only live frames.
+object Node { value: i64, next: ?Gc<Node> }
+struct World { heap: gc.Heap }
+
+extern "C" fn loimi_shadow_top() -> ?*u8;
+
+export "C" fn world_new() -> *World {
+    let w: *World = mem.alloc(1);
+    w.heap = gc.Heap.new();
+    w
+}
+
+fn list(h: *gc.Heap, n: i64) -> ?Gc<Node> uses gc {
+    var head: ?Gc<Node> = None;
+    for i in 0..n { head = Some(new(h, Node { value: i, next: head })); }
+    head
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t = 0;
+    var c = l;
+    while let Some(n) = c { t += n.value; c = n.next; }
+    t
+}
+
+/// Builds a list (rooted in this frame), then fails a bounds check
+/// deeper down with it still live: -1.
+#[catch_panic(-1)]
+export "C" fn world_fail(w: *World, n: i64) -> i64 uses gc {
+    let keep = list(&w.heap, n);
+    let s = sum(keep) + deeper(&w.heap, n);
+    s + sum(keep)
+}
+
+fn deeper(h: *gc.Heap, n: i64) -> i64 uses gc {
+    let more = list(h, n);
+    table_data[..][n as u64] + sum(more)
+}
+
+/// Collect, churn and sum a fresh list: n(n-1)/2, with no stale roots.
+export "C" fn world_churn(w: *World, n: i64) -> i64 uses gc {
+    gc.collect(&w.heap);
+    for i in 0..20 { list(&w.heap, 500); }
+    let l = list(&w.heap, n);
+    gc.collect(&w.heap);
+    sum(l)
+}
+
+/// No shadow-stack frames are left on this thread.
+export "C" fn shadow_stack_empty() -> bool { loimi_shadow_top().is_none() }
+
+export "C" fn world_free(w: *World) {
+    w.heap.free();
+    mem.release(w);
+}

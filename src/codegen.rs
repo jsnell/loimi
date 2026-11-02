@@ -67,6 +67,8 @@ pub struct Codegen<'p> {
     /// `--jit-stencils`: the handler-convention functions that get a
     /// counting copy (`jitgen::counted_fns`).
     pub jit_counted: std::collections::HashSet<FnId>,
+    /// The program installs panic handlers (`rtgen::has_handlers`).
+    pub panic_handlers: bool,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -164,6 +166,7 @@ impl<'p> Codegen<'p> {
             jit_conts: Default::default(),
             stencils: String::new(),
             jit_counted: Default::default(),
+            panic_handlers: false,
         }
     }
 
@@ -378,12 +381,9 @@ impl<'p> Codegen<'p> {
         let _ = writeln!(self.fns, "define internal ptr @loimi_argv() {{\n  %v = load ptr, ptr @loimi.argv\n  ret ptr %v\n}}");
         self.decls.0.remove("loimi_argc");
         self.decls.0.remove("loimi_argv");
-        // Runtime support: panic.
-        let _ = writeln!(
-            self.fns,
-            "define internal void @loimi.panic(ptr %msg, i64 %len) cold noreturn nounwind noinline {{\n  \
-             call i64 @write(i32 2, ptr %msg, i64 %len)\n  call void @abort()\n  unreachable\n}}"
-        );
+        // Runtime support: panic (`rtgen::panic_body`).
+        let body = crate::rtgen::panic_body(&self);
+        let _ = writeln!(self.fns, "define internal void @loimi.panic(ptr %msg, i64 %len) cold noreturn nounwind noinline {{\n{}}}", body);
         self.decls.insert("declare i64 @write(i32, ptr, i64)");
         self.decls.insert("declare void @abort() noreturn");
         out.push_str(&self.globals);
@@ -609,8 +609,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.term("unreachable");
         }
         crate::vmgen::epilogue(&mut self);
-        let linkage = if f.linkage == Linkage::Export || self.stencil.is_some() { "" } else { "internal " };
+        // `#[catch_panic]`: the body is internal `sym.body`, called by the
+        // exported wrapper (`rtgen::emit_catch_wrappers`).
+        let catch_body = f.catch_panic.is_some() && cold.is_none() && self.stencil.is_none() && !self.jit_count;
+        let linkage = if (f.linkage == Linkage::Export && !catch_body) || self.stencil.is_some() { "" } else { "internal " };
         let mut attrs = vec!["nounwind"];
+        if catch_body {
+            attrs.push("noinline");
+        }
         if self.stencil.is_some() {
             attrs.push("\"no-jump-tables\"=\"true\"");
         }
@@ -622,6 +628,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             (Some((_, _, s)), _) => s.clone(),
             (None, Some(st)) => st.symbol.clone(),
             (None, None) if self.jit_count => crate::jitgen::counting_symbol(&f.symbol),
+            (None, None) if catch_body => format!("{}.body", f.symbol),
             (None, None) => f.symbol.clone(),
         };
         match f.inline {
@@ -2094,6 +2101,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             Intr::Assume => {
                 decl(self.cg, "declare void @llvm.assume(i1)");
                 self.emit(format!("call void @llvm.assume(i1 {})", vals[0]));
+                "zeroinitializer".into()
+            }
+            // In a library, `trap()` is a panic, so that `#[catch_panic]`
+            // and `rt.catch_panic` can catch it.
+            Intr::Trap if self.cg.opts.library => {
+                self.panic("trap", e.span);
                 "zeroinitializer".into()
             }
             Intr::Trap => {

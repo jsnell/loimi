@@ -354,6 +354,9 @@ pub struct FnDef {
     /// the value itself instead of the local's address (immutable,
     /// untraced locals of at most 8 bytes), which saves a load per use.
     pub env_val: Vec<bool>,
+    /// `#[catch_panic(v)]` on an `export "C"` function: the LLVM constant
+    /// it returns when a panic unwinds to it (`rtgen::emit_catch_wrapper`).
+    pub catch_panic: Option<String>,
 }
 
 impl FnDef {

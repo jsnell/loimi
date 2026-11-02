@@ -1,0 +1,5 @@
+// error: `#[catch_panic]` applies to `export "C"` functions
+#[catch_panic(-1)]
+fn f() -> i64 { 1 }
+
+fn main() {}

@@ -1,0 +1,6 @@
+// error: `#[catch_panic(Nope)]`: `E` has no variant `Nope`
+enum E: i32 { A, B }
+#[catch_panic(Nope)]
+export "C" fn f() -> E { E.A }
+
+fn main() {}

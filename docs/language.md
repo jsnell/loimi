@@ -1853,6 +1853,52 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
 - **Recovering instead of exiting.** A library must not exit the host on
   a guest error. `std.rt.protect(f, data)` / `std.rt.throw()` unwind out
   of code with no error path (Mini's parser); see `stdlib.md`, `std.rt`.
+- **Panics.** A failed bounds check, `unwrap` of None, a debug overflow
+  check, division by zero, `trap()`, `rt.panic(msg)` and `mem.alloc` out
+  of memory are panics. By default a panic prints its message on stderr
+  and aborts the process, host included. An export can catch them
+  instead:
+
+  ```loimi
+  #[catch_panic(-1)]
+  export "C" fn rx_exec(r: *Regex, s: str, flags: u32) -> i32 { ... }
+  ```
+
+  A panic anywhere below the export on the same thread (in Loimi code,
+  or in a Loimi export the host calls from a callback) returns `-1` from
+  it, and `rt.panic_message()` gives the message. The value is an
+  integer, `true`/`false`, or a variant of the result enum; without one
+  (`#[catch_panic]`) the result is zero: 0, false, NULL, an empty `str`,
+  or nothing. `rt.catch_panic(f, data)` does the same inside Loimi.
+  - **Cost.** A catching export installs a handler (a `_setjmp` and a few
+    thread-local stores, some 10 ns) on each call, and calls its body,
+    which is not inlined. Nothing else changes: panic sites were always
+    out-of-line calls, and code without a catch is compiled as before.
+    Put the attribute on calls that do real work (compile, match), not
+    on accessors called millions of times.
+  - **What is left after a caught panic.** The frames between the panic
+    and the catch are abandoned, as with `rt.throw`: their `defer`s do
+    not run, and memory they allocated and had not yet stored somewhere
+    reachable leaks. The shadow-stack top and the vm nesting depths
+    (`Vm.depth`) are restored, so GC roots and re-entry counts are
+    correct. Everything else stays as the panic left it: a data
+    structure that was being modified (a vm state, a `Vec` mid-`push`, a
+    hash map mid-rehash) may break its own invariants. The safe rule is
+    to treat the objects the failed call was modifying as poisoned: free
+    them, or mark them failed and refuse further calls on them, and
+    carry on with the rest. Thread-locals, globals the call did not
+    touch, other objects and other threads are unaffected.
+  - **Not caught.** A panic inside the collector itself (it does not
+    panic, but out of memory in a GC heap aborts), stack overflow, a
+    segmentation fault from an unchecked pointer, `--sanitize=address`
+    reports, and, in executables, `trap()` (an illegal instruction there;
+    in `--lib`/`--shared` builds `trap()` is a panic).
+  - **Host frames.** A panic in a nested export without its own catch
+    unwinds through the host's frames to the catching export below, like
+    `longjmp`: host code in between must not hold resources it needs to
+    release (C++ destructors do not run).
+  - **Threads.** Handlers are per thread. A panic on a thread with no
+    catch aborts, even if another thread has one.
 
 **Re-entry.** A C function registered as a native runs inside a
 handler's `cold` block. Its type in Loimi says so: Mini stores natives

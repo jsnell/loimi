@@ -1,0 +1,5 @@
+// error: `#[catch_panic(300)]`: out of range for `u8`
+#[catch_panic(300)]
+export "C" fn f() -> u8 { 1 }
+
+fn main() {}

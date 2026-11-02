@@ -14,9 +14,20 @@
 // can be dropped (a parser's tables, for example). The protected function
 // has type `fn(*u8)` without effects, so it cannot collect, and no GC
 // roots are lost when its frames are skipped.
+//
+// Panics (a failed bounds check, `unwrap` of None, an overflow check,
+// `trap()` in a library, `rt.panic`, `mem.alloc` out of memory) normally
+// print a message and abort. `catch_panic` and the `#[catch_panic(v)]`
+// attribute on an `export "C"` function catch them instead, so that a
+// library returns an error to its host (docs/language.md §10.1 says what
+// state is left behind).
 
 extern "C" fn loimi_protect(f: fn(*u8), data: *u8) -> i32;
 extern "C" fn loimi_throw();
+extern "C" fn loimi_catch_panic(f: fn(*u8), data: *u8) -> i32;
+extern "C" fn loimi_panic(msg: *u8, len: u64);
+extern "C" fn loimi_panic_msg_ptr() -> *u8;
+extern "C" fn loimi_panic_msg_len() -> u64;
 
 /// Run `f(data)`. True if it returned, false if it (or anything it
 /// called) called `throw`.
@@ -29,4 +40,29 @@ pub fn protect(f: fn(*u8), data: *u8) -> bool {
 pub fn throw() -> never {
     loimi_throw();
     unreachable
+}
+
+/// Run `f(data)`. True if it returned, false if it panicked: the panic
+/// unwound to here instead of aborting (see `panic_message`). `throw`
+/// passes through to an enclosing `protect`.
+pub fn catch_panic(f: fn(*u8), data: *u8) -> bool {
+    loimi_catch_panic(f, data) != 0
+}
+
+/// Panic with `msg`: unwind to the innermost `catch_panic` or
+/// `#[catch_panic]` export on this thread, or print `msg` and abort.
+pub fn panic(msg: str) -> never {
+    loimi_panic(msg.ptr, msg.len);
+    unreachable
+}
+
+/// The message of the last panic caught on this thread, without the
+/// trailing newline ("lib.lm:12:5: index out of bounds"); empty if none
+/// was. Static text: valid for the life of the program.
+pub fn panic_message() -> str {
+    let p = loimi_panic_msg_ptr();
+    var n = loimi_panic_msg_len();
+    if n == 0 { return ""; }
+    if p[n - 1] == 10 { n -= 1; }
+    p.slice(n)
 }

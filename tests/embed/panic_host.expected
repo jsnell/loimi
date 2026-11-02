@@ -1,0 +1,18 @@
+lookup 30 -1
+lookup: panic.lm:17:5: index out of bounds
+first_even 0 -1
+first_even: panic.lm:27:13: unwrap of None
+must_be_positive 1 0
+must_be_positive: panic.lm:34:17: trap
+divide 3 -7
+divide: panic.lm:40:47: division by zero
+check_name: empty name
+table_new ok NULL
+table_new: out of memory
+try_bytes ok NULL
+with_callback 1002 -1 999 1020
+caught_in_loimi 40 -2 -3
+caught_in_loimi: panic.lm:83:13: index out of bounds
+world 33 -1 45 empty
+lookup again 10
+uncaught: SIGABRT
