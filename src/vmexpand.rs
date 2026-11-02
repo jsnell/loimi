@@ -629,6 +629,19 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         first = false;
     }
     let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n}}");
+    // Deoptimization: every instruction word back to its family's
+    // generic op, splitting supers (the head becomes its first part's
+    // generic; the parts' words are instructions of their own). Members of
+    // a family share format and cache, so sizes do not change. Inline
+    // caches are zeroed, as the emitters leave them.
+    let _ = writeln!(s, "{vis}fn {n}__deopt(__code: []{w}) {{");
+    let _ = writeln!(s, "  var __i: u64 = 0;\n  while __i < __code.len {{");
+    let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
+    let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
+    let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
+    let _ = writeln!(s, "    var __k: u64 = 1;");
+    let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
+    let _ = writeln!(s, "    __i += __size;\n  }}\n}}");
     s
 }
 
