@@ -16,11 +16,11 @@ LUA = os.path.join(ROOT, "bench", "lua", "install", "bin")
 OUT = os.path.join(os.environ.get("TMPDIR", "/tmp"), "loimi-mini-bench")
 
 
-def build_mini(dispatch):
+def build_mini(dispatch, align=None):
     exe = os.path.join(OUT, f"mini-{dispatch}")
     subprocess.run([os.path.join(ROOT, "target", "release", "loimi"), "build",
                     os.path.join(ROOT, "examples", "mini", "main.lm"), "--release",
-                    f"--dispatch={dispatch}", "-o", exe], check=True)
+                    f"--dispatch={dispatch}", "-o", exe] + ([f"--align-functions={align}"] if align else []), check=True)
     return exe
 
 
@@ -40,11 +40,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--dispatch", nargs="*", default=["tailcall"])
+    ap.add_argument("--align", type=int, help="build with --align-functions=N (steadier A/B comparisons)")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     subprocess.run(["cargo", "build", "--release", "-q"], cwd=ROOT, check=True)
-    impls = [(f"mini-{d}", [build_mini(d)]) for d in a.dispatch]
+    impls = [(f"mini-{d}", [build_mini(d, a.align)]) for d in a.dispatch]
     for name, args in [("lua", ["lua"]), ("luajit-joff", ["luajit", "-joff"]), ("luajit", ["luajit"])]:
         exe = os.path.join(LUA, args[0])
         if os.path.exists(exe):

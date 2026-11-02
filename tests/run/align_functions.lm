@@ -1,0 +1,21 @@
+// args: --align-functions=64
+// matrix: dispatch
+// Function alignment is a code-placement option only: behaviour is unchanged.
+import std.io;
+
+vm V {
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format A { op: 8, x: 24 } }
+    op ADD(x: imm) : A { acc = acc + (x as i64); next }
+    op HALT() : A { exit acc }
+    operand imm = it;
+    entry run(code: *u32) -> i64 { acc = 0; jump code }
+}
+
+fn main() -> i32 {
+    var code: [u32; 3] = [V.ADD(40), V.ADD(2), V.HALT()];
+    io.print_int(V.run(&code[0]));
+    io.println("");
+    0
+}
+// expect: 42

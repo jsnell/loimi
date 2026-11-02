@@ -36,10 +36,11 @@ struct Opts {
     sanitize_address: bool,
     /// `-W error` / `--deny-warnings`: warnings fail the build.
     deny_warnings: bool,
+    align_functions: Option<u32>,
 }
 
 const USAGE: &str = "\
-usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats]
+usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address] [-W error | --deny-warnings]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
@@ -194,6 +195,7 @@ fn parse_args() -> Result<Opts, String> {
         vm_stats: false,
         sanitize_address: false,
         deny_warnings: false,
+        align_functions: None,
     };
     match cmd.as_str() {
         "build" => {}
@@ -213,6 +215,13 @@ fn parse_args() -> Result<Opts, String> {
                 Some("error") => o.deny_warnings = true,
                 _ => return Err("-W takes `error`".into()),
             },
+            s if s.starts_with("--align-functions=") => {
+                let n: u32 = s["--align-functions=".len()..].parse().map_err(|_| "--align-functions takes a number")?;
+                if !n.is_power_of_two() || n > 4096 {
+                    return Err("--align-functions takes a power of two up to 4096".into());
+                }
+                o.align_functions = Some(n);
+            }
             s if s.starts_with("--sanitize=") => {
                 return Err(format!("unknown sanitizer `{}` (supported: address)", &s["--sanitize=".len()..]))
             }
@@ -288,6 +297,12 @@ fn main() -> ExitCode {
         // Executables: absolute addressing lets dispatch index the table directly.
         .arg("-fno-pic")
         .arg("-no-pie");
+    if let Some(n) = opts.align_functions {
+        // Every function (vm handlers included) starts on an n-byte boundary,
+        // so unrelated code changes do not shift handler placement. Useful for
+        // stable before/after benchmarking.
+        cmd.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
+    }
     let asan_lib = if opts.sanitize_address {
         match asan_runtime(&clang) {
             Ok(lib) => lib,
