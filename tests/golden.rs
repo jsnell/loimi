@@ -467,6 +467,31 @@ fn stack_programs() {
     );
 }
 
+/// The regex library (examples/regex/check.sh, fast): its C host's demo,
+/// the bytecode fuzzer, the verifier test, random byte patterns on both
+/// engines, and both engines against Python's `re` on the hand-written
+/// cases and 100 random ones (fixed seed).
+#[test]
+fn regex_library() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out_dir = std::env::temp_dir().join(format!("loimi-regex-{}", std::process::id()));
+    let out = Command::new("sh")
+        .arg(root.join("examples/regex/check.sh"))
+        .args(["--fast", "--random", "100", "--seed", "1"])
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .env("RX_OUT", &out_dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&out_dir);
+    assert!(
+        out.status.success(),
+        "examples/regex/check.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The tutorial (docs/tutorial, examples/tutorial): every step builds and
 /// passes its tests in every dispatch mode, with and without GC stress
 /// (examples/tutorial/check.sh), and every ```loimi block in the chapters
