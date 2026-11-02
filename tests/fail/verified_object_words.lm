@@ -1,0 +1,20 @@
+// The raw words of a verified array are reachable only from the vm's
+// generated code.
+// error: `__verified_words` is private to the vm's generated code
+import std.gc;
+
+object Proto { nregs: u32, code: verified [u32] by V }
+
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(p: Gc<Proto>) -> i64 { jump p.code }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    let w: [u32; 1] = [V.HALT()];
+    let Ok(p) = V.build_verified(&heap, Proto { nregs: 1 }, w[..]) else { return; };
+    __verified_words(p)[0] = 7;
+}

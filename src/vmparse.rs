@@ -29,6 +29,8 @@ impl Parser {
             sync: None,
             reload: None,
             verify_ctx: vec![],
+            verify_owner: None,
+            checks: vec![],
             is_pub,
         };
         // `inline for` variables replace every matching token in the body,
@@ -251,11 +253,28 @@ impl Parser {
                     // across several declarations).
                     self.bump();
                     loop {
+                        // `owner proto: Gc<Proto>`: the object that holds
+                        // the code (`code: verified [W] by Vm`).
+                        let owner = if self.is_kw("owner") && matches!(self.peek_at(1), Tok::Ident(_)) {
+                            Some(self.bump().span)
+                        } else {
+                            None
+                        };
                         let n = self.ident()?;
                         self.expect(":")?;
                         let ty = self.parse_type()?;
                         if vm.verify_ctx.iter().any(|p: &Param| p.name.name == n.name) {
                             return Err(Diag::new(n.span, format!("`{}` is declared twice in `verify_context`", n.name)));
+                        }
+                        if let Some(sp) = owner {
+                            if vm.verify_owner.is_some() {
+                                return Err(Diag::new(sp, "a vm has at most one `owner` verify context"));
+                            }
+                            let is_gc = matches!(&ty.kind, TypeKind::Named(p, a) if p.len() == 1 && p[0].name == "Gc" && a.len() == 1);
+                            if !is_gc {
+                                return Err(Diag::new(ty.span, "the `owner` verify context is the object holding the code: `owner p: Gc<Proto>`"));
+                            }
+                            vm.verify_owner = Some(vm.verify_ctx.len());
                         }
                         vm.verify_ctx.push(Param { name: n, ty });
                         if !self.eat(",") {
@@ -263,6 +282,18 @@ impl Parser {
                         }
                     }
                     self.expect(";")?;
+                }
+                "verify" => {
+                    // `verify handlers { .. }`: a `bool` block the verifier
+                    // evaluates after checking the code, with the verify
+                    // context, `code` and `is_insn_boundary(p)` in scope.
+                    self.bump();
+                    let n = self.ident()?;
+                    if vm.checks.iter().any(|(c, _)| c.name == n.name) {
+                        return Err(Diag::new(n.span, format!("`verify {}` is declared twice", n.name)));
+                    }
+                    let b = self.parse_block()?;
+                    vm.checks.push((n, b));
                 }
                 "sync" => {
                     self.bump();

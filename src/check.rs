@@ -333,6 +333,7 @@ impl<'a> Checker<'a> {
                             pattern: false,
                             object,
                             trailing: None,
+                            verified: None,
                         });
                         self.define(m, &s.name, Def::Struct(id), s.is_pub)?;
                     }
@@ -460,9 +461,10 @@ impl<'a> Checker<'a> {
                 match item {
                     Item::Struct(s) if s.generics.is_empty() => {
                         let Some((Def::Struct(id), _)) = self.scopes[m].get(&s.name.name).cloned() else { unreachable!() };
-                        let (fields, trailing) = self.struct_fields(m, s)?;
+                        let (fields, trailing, verified) = self.struct_fields(m, s)?;
                         self.prog.structs[id as usize].fields = fields;
                         self.prog.structs[id as usize].trailing = trailing;
+                        self.prog.structs[id as usize].verified = verified;
                     }
                     Item::Enum(e) if e.generics.is_empty() => {
                         let Some((Def::Enum(id), _)) = self.scopes[m].get(&e.name.name).cloned() else { unreachable!() };
@@ -548,25 +550,51 @@ impl<'a> Checker<'a> {
     }
 
     /// The fields of a struct or object declaration (with type parameters
-    /// bound in `tenv`), and its trailing array.
+    /// bound in `tenv`), its trailing array, and for a `verified` trailing
+    /// array the vm's proof type.
     #[allow(clippy::type_complexity)]
-    pub fn struct_fields(&mut self, m: usize, s: &StructDecl) -> Res<(Vec<(String, Ty)>, Option<(String, Ty)>)> {
+    pub fn struct_fields(&mut self, m: usize, s: &StructDecl) -> Res<(Vec<(String, Ty)>, Option<(String, Ty)>, Option<u32>)> {
         let mut fields = Vec::new();
         let mut trailing = None;
+        let mut verified = None;
         for (i, (f, t)) in s.fields.iter().enumerate() {
             if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
                 return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
             }
-            if let TypeKind::Trailing(elem) = &t.kind {
+            if let TypeKind::Trailing(elem) | TypeKind::VerifiedTrailing(elem, _) = &t.kind {
                 if !s.is_object || i + 1 != s.fields.len() {
                     return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
                 }
-                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
+                let et = self.resolve_type(m, elem)?;
+                if let TypeKind::VerifiedTrailing(_, path) = &t.kind {
+                    let Some(vm) = self.vm_named(m, path) else {
+                        return Err(Diag::new(path[0].span, "`verified [W] by Vm` names a vm after `by`"));
+                    };
+                    let (vm_m, vname, word) = {
+                        let (vm_m, d) = &self.vm_decls[vm as usize];
+                        (*vm_m, d.name.name.clone(), d.word.clone())
+                    };
+                    let word = match &word {
+                        Some(w) => self.resolve_type(vm_m, w)?,
+                        None => return Err(Diag::new(path[0].span, format!("vm `{}` has no encoding", vname))),
+                    };
+                    if word != et {
+                        return Err(Diag::new(
+                            elem.span,
+                            format!("vm `{}` has `{}` code words, not `{}`", vname, self.ty_name(&word), self.ty_name(&et)),
+                        ));
+                    }
+                    match self.scopes[vm_m].get(&format!("{}__Verified", vname)) {
+                        Some((Def::Struct(v), _)) => verified = Some(*v),
+                        _ => unreachable!("vmexpand generates Vm__Verified"),
+                    }
+                }
+                trailing = Some((f.name.clone(), et));
                 continue;
             }
             fields.push((f.name.clone(), self.resolve_type(m, t)?));
         }
-        Ok((fields, trailing))
+        Ok((fields, trailing, verified))
     }
 
     /// An error inside an instance of a generic function: say which
@@ -1038,7 +1066,7 @@ impl<'a> Checker<'a> {
             TypeKind::Cache(_) => {
                 return Err(Diag::new(t.span, "a `cache Name` handle can only be the type of a vm function parameter"))
             }
-            TypeKind::Trailing(_) => {
+            TypeKind::Trailing(_) | TypeKind::VerifiedTrailing(..) => {
                 return Err(Diag::new(t.span, "a trailing array `[T]` is only allowed as the last field of an `object`"))
             }
         })
@@ -2264,14 +2292,19 @@ impl<'a> Checker<'a> {
     /// Naming a `#[unsafe]` function (to call it or take it as a value)
     /// needs an `unsafe { }` block.
     pub fn check_unsafe_def(&self, cx: &FnCx, def: &Def, span: Span) -> Res<()> {
-        if let Def::Fn(id) = def {
-            if cx.unsafe_depth == 0 && self.unsafe_fns.contains(id) {
-                let name = self.prog.fns[*id as usize].name.replace("__", ".");
-                return Err(Diag::new(
-                    span,
-                    format!("`{}` is unsafe: nothing checks what it promises; wrap the call in `unsafe {{ }}`", name),
-                ));
+        let name = match def {
+            Def::Fn(id) if self.unsafe_fns.contains(id) => self.prog.fns[*id as usize].name.clone(),
+            Def::GenericFn(g) if self.generics.fns[*g as usize].decl.attrs.has("unsafe") => {
+                self.generics.fns[*g as usize].decl.name.name.clone()
             }
+            _ => return Ok(()),
+        };
+        if cx.unsafe_depth == 0 {
+            let name = name.rsplit('.').next().unwrap_or(&name).replace("__", ".");
+            return Err(Diag::new(
+                span,
+                format!("`{}` is unsafe: nothing checks what it promises; wrap the call in `unsafe {{ }}`", name),
+            ));
         }
         Ok(())
     }
@@ -2434,7 +2467,14 @@ impl<'a> Checker<'a> {
                         let TK::Deref(obj) = b.kind else {
                             return Err(Diag::new(name.span, "trailing arrays are only reachable through a Gc reference"));
                         };
-                        return Ok(mk(Ty::Slice(Box::new(et)), TK::Trailing(obj), span));
+                        let words = mk(Ty::Slice(Box::new(et)), TK::Trailing(obj), span);
+                        // `code: verified [W] by Vm` reads as the proof:
+                        // `Vm__Verified { __code: <the trailing array> }`,
+                        // a value, not a place, so it cannot be assigned.
+                        if let Some(v) = self.prog.structs[sid as usize].verified {
+                            return Ok(mk(Ty::Struct(v), TK::Struct(vec![words]), span));
+                        }
+                        return Ok(words);
                     }
                 }
                 self.check_private_field(sid, name)?;
@@ -3095,6 +3135,22 @@ impl<'a> Checker<'a> {
             if sd.object.is_none() {
                 return Err(Diag::new(args[1].span, format!("`{}` is a struct, not an `object`", self.ty_name(&init.ty))));
             }
+            // An object with verified code is created only by its vm's
+            // `build_verified`, which fills and verifies the code.
+            if let Some(v) = sd.verified {
+                if self.struct_files.get(&v) != Some(&span.file) {
+                    let vname = self.ty_name(&Ty::Struct(v));
+                    let vm = vname.trim_start_matches("Verified<").trim_end_matches('>').to_string();
+                    let (tn, _) = sd.trailing.clone().unwrap();
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "`{}` holds verified code (`{}: verified [..] by {}`): create it with `{}.build_verified(heap, {} {{ .. }}, words, ..)`",
+                            self.ty_name(&init.ty), tn, vm, vm, self.ty_name(&init.ty)
+                        ),
+                    ));
+                }
+            }
             let len = match (&sd.trailing, args.len()) {
                 (Some(_), 3) => Some(Box::new(self.expr_coerce(cx, &args[2], &Ty::Int(IntTy::U64))?)),
                 (None, 2) => None,
@@ -3103,6 +3159,32 @@ impl<'a> Checker<'a> {
             };
             let t = Ty::Gc(Box::new(init.ty.clone()));
             return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len }, span)));
+        }
+        if name == "__verified_words" {
+            // In a vm's generated code (`Vm.build_verified`): the words of
+            // an object's `verified [W] by Vm` array, as a writable slice.
+            let [a] = args else {
+                return Err(Diag::new(span, "`__verified_words` takes an object"));
+            };
+            let o = self.expr(cx, a, None)?;
+            let sid = match &o.ty {
+                Ty::Gc(t) => match **t {
+                    Ty::Struct(s) => Some(s),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let found = sid.and_then(|s| Some((self.prog.structs[s as usize].verified?, self.prog.structs[s as usize].trailing.clone()?)));
+            let Some((v, (_, et))) = found else {
+                return Err(Diag::new(
+                    a.span,
+                    format!("`{}` has no `verified [..] by Vm` trailing array", self.ty_name(&o.ty)),
+                ));
+            };
+            if self.struct_files.get(&v) != Some(&span.file) {
+                return Err(Diag::new(span, "`__verified_words` is private to the vm's generated code"));
+            }
+            return Ok(Some(mk(Ty::Slice(Box::new(et)), TK::Trailing(Box::new(o)), span)));
         }
         if name == "gc_mark" {
             if args.len() != 2 {

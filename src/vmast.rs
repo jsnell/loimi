@@ -109,6 +109,12 @@ pub struct VmDecl {
     pub reload: Option<Block>,
     /// Parameters of the generated verifier (`verify_context proto: Gc<Proto>;`).
     pub verify_ctx: Vec<Param>,
+    /// `verify_context owner proto: Gc<Proto>`: the parameter that
+    /// `Vm.build_verified` fills with the object it builds.
+    pub verify_owner: Option<usize>,
+    /// `verify NAME { .. }`: checks the verifier runs after the code (side
+    /// tables such as exception handler targets), in order.
+    pub checks: Vec<(Ident, Block)>,
     pub is_pub: bool,
 }
 

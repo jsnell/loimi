@@ -21,7 +21,7 @@ import std.parse;
 import std.bc;
 import std.rt;
 import value;
-import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs, Code};
+import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs};
 import vm.{Mini};
 
 // ── lexer ────────────────────────────────────────────────────────────
@@ -1457,14 +1457,20 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
         let u = fs.upvals.at(i);
         updesc.data[i] = if u.instack { 256 | u.idx } else { u.idx };
     }
-    // Verify against the counts the Proto will hold, then store the
-    // proof with them: CALL jumps only to a Proto's verified `code`.
-    let nregs = fs.regs.frame_size(1);
-    let nupvals = fs.upvals.len as u32;
-    let words = new(h, Code {}, fs.code.len());
-    fs.code.copy_into(words.data);
-    let code = match Mini.verify(words.data, nregs, nupvals, consts.data.len, protos.data.len) {
-        Ok(v) => Mini.optimize(v),
+    // The Proto is created with its code, verified against the counts
+    // it holds: CALL jumps only to a Proto's verified `code`.
+    let init = Proto {
+        name: value.new_str(h, fs.name),
+        nparams: fs.nparams,
+        nregs: fs.regs.frame_size(1),
+        nupvals: fs.upvals.len as u32,
+        consts: consts,
+        lines: lines,
+        protos: protos,
+        updesc: updesc,
+    };
+    let proto = match Mini.build_verified(h, init, fs.code.words()) {
+        Ok(p) => p,
         Err(e) => {
             var b = text.StrBuf.new();
             b.push_str("generated code fails verification: ");
@@ -1472,18 +1478,7 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
             internal_error(b.as_str())
         }
     };
-    let proto = new(h, Proto {
-        name: value.new_str(h, fs.name),
-        nparams: fs.nparams,
-        nregs: nregs,
-        nupvals: nupvals,
-        consts: consts,
-        lines: lines,
-        protos: protos,
-        updesc: updesc,
-        code: code,
-        words: words,
-    });
+    Mini.optimize(proto.code);
     fs.code.free();
     fs.consts.free();
     fs.locals.free();

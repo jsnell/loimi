@@ -488,7 +488,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     // Errors.
     let _ = writeln!(
         s,
-        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Then, RunsOffEnd, Operand }}\n\
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Then, RunsOffEnd, Operand, Check }}\n\
          {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64 }}\n\
          fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
          \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind }})\n}}\n\
@@ -502,6 +502,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
          \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
          \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
          \x20   Operand => \"an operand fails its kind's verify clause\",\n\
+         \x20   Check => \"a `verify` check of the vm fails\",\n\
          \x20 }}\n}}"
     );
     let esc = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").replace('\\', "\\\\").replace('"', "\\\"");
@@ -521,10 +522,25 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
         let _ = writeln!(s, "  {} => match i {{ {}, _ => \"\" }},", o.opcode, arms.join(", "));
     }
     let _ = writeln!(s, "  _ => \"\", }} }}");
+    let _ = writeln!(s, "{vis}fn {n}__check_name(i: u64) -> str {{ match i {{");
+    for (i, (name, _)) in v.checks.iter().enumerate() {
+        let _ = writeln!(s, "  {} => \"{}\",", i, name.name);
+    }
+    let _ = writeln!(s, "  _ => \"\", }} }}");
     // "word 4 (LOADK): operand `c` (kst) fails `it < lim.nconsts`"
+    // "check `handlers` fails"
     let _ = writeln!(
         s,
         "{vis}fn {n}__VerifyError.write<B>(e: {n}__VerifyError, out: *B) {{\n\
+         \x20 match e.reason {{\n\
+         \x20   Check => {{\n\
+         \x20     out.push_str(\"check `\");\n\
+         \x20     out.push_str({n}__check_name(e.operand));\n\
+         \x20     out.push_str(\"` fails\");\n\
+         \x20     return;\n\
+         \x20   }}\n\
+         \x20   _ => {{}}\n\
+         \x20 }}\n\
          \x20 out.push_str(\"word \");\n\
          \x20 out.push_int(e.at as i64);\n\
          \x20 if e.op < {n}__NUM_OPS {{\n\
@@ -644,7 +660,69 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}\n  Ok({n}__Verified {{ __code: __code }})\n}}");
+    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}");
+    // `verify NAME { .. }`: checks of side tables (exception handler
+    // targets, ...) against the code, once its boundaries are known.
+    for (i, (name, b)) in v.checks.iter().enumerate() {
+        if v.verify_ctx.iter().any(|p| p.name.name == "code") {
+            return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
+        }
+        let f = &sm.files[b.span.file as usize];
+        let text = f.text[b.span.lo as usize..b.span.hi as usize].replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, "));
+        let _ = writeln!(
+            s,
+            "  {{ let code: []{w} = __code; let __ok: bool = {text}; if !__ok {{ return {n}__verr(0, {n}__VerifyReason.Check, {n}__NUM_OPS, {i}, {}); }} }}",
+            v.operands.len()
+        );
+    }
+    let _ = writeln!(s, "  Ok({n}__Verified {{ __code: __code }})\n}}");
+    // `Vm.build_verified(heap, Obj { .. }, words, ctx..)`: create an object
+    // whose last field is `code: verified [W] by Vm`, copy `words` into
+    // it and verify them there. The `owner` verify context, if any, is the
+    // new object itself, so the checks read the counts (and tables) that
+    // the object holds.
+    let mut params = vec![];
+    let mut args = vec!["__c".to_string()];
+    for (i, p) in v.verify_ctx.iter().enumerate() {
+        if Some(i) == v.verify_owner {
+            args.push("__o".into());
+            continue;
+        }
+        let f = &sm.files[p.ty.span.file as usize];
+        params.push(format!(", {}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
+        args.push(p.name.name.clone());
+    }
+    let (generics, obj) = match v.verify_owner {
+        Some(i) => {
+            let TypeKind::Named(_, a) = &v.verify_ctx[i].ty.kind else { unreachable!("checked by the parser") };
+            let f = &sm.files[a[0].span.file as usize];
+            ("<__H>", f.text[a[0].span.lo as usize..a[0].span.hi as usize].to_string())
+        }
+        None => ("<__H, __T>", "__T".to_string()),
+    };
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__build_verified{generics}(__h: *__H, __init: {obj}, __words: []{w}{}) -> Result<Gc<{obj}>, {n}__VerifyError> {{\n\
+         \x20 let __o = new(__h, __init, __words.len);\n\
+         \x20 let __c = __verified_words(__o);\n\
+         \x20 var __i: u64 = 0;\n\
+         \x20 while __i < __words.len {{ __c[__i] = __words[__i]; __i += 1; }}\n\
+         \x20 match {n}__verify({}) {{ Ok(_) => Ok(__o), Err(__e) => Err(__e) }}\n}}",
+        params.join(""),
+        args.join(", ")
+    );
+    // The escape hatch, as `assume_verified`: the object with its words,
+    // unchecked (for code the host built itself and trusts, and for
+    // reproducers of verifier holes).
+    let _ = writeln!(
+        s,
+        "#[unsafe]\n{vis}fn {n}__build_assume_verified{generics}(__h: *__H, __init: {obj}, __words: []{w}) -> Gc<{obj}> {{\n\
+         \x20 let __o = new(__h, __init, __words.len);\n\
+         \x20 let __c = __verified_words(__o);\n\
+         \x20 var __i: u64 = 0;\n\
+         \x20 while __i < __words.len {{ __c[__i] = __words[__i]; __i += 1; }}\n\
+         \x20 __o\n}}"
+    );
     Ok(s)
 }
 

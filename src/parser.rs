@@ -552,7 +552,22 @@ impl Parser {
                 check_attrs(&fattrs, "a field", &[])?;
                 let f = self.ident()?;
                 self.expect(":")?;
-                let t = self.parse_type()?;
+                let t = if self.is_kw("verified") && self.is_at(1, "[") {
+                    // `code: verified [u32] by Mini`
+                    let start = self.bump().span;
+                    let inner = self.parse_type()?;
+                    let TypeKind::Trailing(elem) = inner.kind else {
+                        return Err(Diag::new(inner.span, "`verified` marks a trailing array: `code: verified [u32] by Vm`"));
+                    };
+                    self.expect_kw("by")?;
+                    let mut path = vec![self.ident()?];
+                    while self.eat(".") {
+                        path.push(self.ident()?);
+                    }
+                    TypeExpr { kind: TypeKind::VerifiedTrailing(elem, path), span: start.to(self.prev_span()) }
+                } else {
+                    self.parse_type()?
+                };
                 fields.push((f, t));
                 self.close_allows(mark);
                 if !self.eat(",") {

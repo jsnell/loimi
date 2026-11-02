@@ -267,6 +267,9 @@ pub struct StructDef {
     /// GC-managed `object`: its type id, and the element type of a trailing array.
     pub object: Option<u32>,
     pub trailing: Option<(String, Ty)>,
+    /// `code: verified [W] by Vm`: the trailing array holds verified code;
+    /// the struct id of `Vm`'s proof type `Vm__Verified`.
+    pub verified: Option<u32>,
 }
 
 #[derive(Clone, Debug)]

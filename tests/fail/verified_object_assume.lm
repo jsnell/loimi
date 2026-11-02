@@ -1,0 +1,17 @@
+// error: `V.build_assume_verified` is unsafe
+import std.gc;
+
+object Proto { nregs: u32, code: verified [u32] by V }
+
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(p: Gc<Proto>) -> i64 { jump p.code }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    let w: [u32; 1] = [7];
+    let p = V.build_assume_verified(&heap, Proto { nregs: 1 }, w[..]);
+}

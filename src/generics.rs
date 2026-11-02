@@ -145,7 +145,7 @@ impl<'a> Checker<'a> {
                         Some(self.object_count - 1)
                     }
                 };
-                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None });
+                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None, verified: None });
                 Ty::Struct(id)
             }
             GenDecl::Enum(_) => {
@@ -160,10 +160,11 @@ impl<'a> Checker<'a> {
         let note = |d: Diag| if d.span == span { d } else { d.note(span, format!("in `{}`, instantiated here", inst_name)) };
         match decl {
             GenDecl::Struct(s) => {
-                let (fields, trailing) = self.with_tenv(env, |c| c.struct_fields(module, &s)).map_err(note)?;
+                let (fields, trailing, verified) = self.with_tenv(env, |c| c.struct_fields(module, &s)).map_err(note)?;
                 let Ty::Struct(id) = ty else { unreachable!() };
                 self.prog.structs[id as usize].fields = fields;
                 self.prog.structs[id as usize].trailing = trailing;
+                self.prog.structs[id as usize].verified = verified;
             }
             GenDecl::Enum(e) => {
                 let (tag, variants) = self.with_tenv(env, |c| c.enum_variants(module, &e)).map_err(note)?;
@@ -433,6 +434,7 @@ impl<'a> Checker<'a> {
         exp: Option<&Ty>,
         span: Span,
     ) -> Res<TExpr> {
+        self.check_unsafe_def(cx, &crate::check::Def::GenericFn(g), span)?;
         let gf = &self.generics.fns[g as usize];
         let module = gf.module;
         let params = gf.params.clone();

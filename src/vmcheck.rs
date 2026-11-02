@@ -1189,7 +1189,12 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
             if te.ty == Ty::Struct(vsid) {
                 let sp = te.span;
                 let wt = Ty::Int(c.vms[vmi].word);
-                let code = mk(Ty::Slice(Box::new(wt.clone())), TK::Field(Box::new(te), 0), sp);
+                // `jump p.code` with `code: verified [W] by Vm`: the
+                // trailing array's address, computed from `p`.
+                let code = match te.kind {
+                    TK::Struct(mut fs) if fs.len() == 1 => fs.pop().unwrap(),
+                    kind => mk(Ty::Slice(Box::new(wt.clone())), TK::Field(Box::new(TExpr { kind, ..te }), 0), sp),
+                };
                 let start = mk(Ty::Ptr(Box::new(wt)), TK::Field(Box::new(code), 0), sp);
                 return never(TVm::Jump(Box::new(c.coerce(start, &pc_ty)?)));
             }

@@ -1,0 +1,12 @@
+// error: the `owner` verify context is the object holding the code: `owner p: Gc<Proto>`
+struct Proto { nregs: u32 }
+
+vm V {
+    state { pc: *u32 }
+    verify_context owner proto: *Proto;
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}

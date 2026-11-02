@@ -32,6 +32,10 @@ pub enum TypeKind {
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),
+    /// `verified [W] by Vm`: a trailing array holding code that `Vm`'s
+    /// verifier accepted. Only `Vm.build_verified` creates the object, and
+    /// the field reads as `Verified<Vm>`.
+    VerifiedTrailing(P<TypeExpr>, Vec<Ident>),
     /// `cache Name`: a handle to an op's inline cache (vm function parameters).
     Cache(Ident),
 }

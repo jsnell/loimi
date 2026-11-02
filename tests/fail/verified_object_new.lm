@@ -1,0 +1,18 @@
+// An object with verified code comes only from the vm's build_verified.
+// error: `Proto` holds verified code (`code: verified [..] by V`): create it with `V.build_verified(heap, Proto { .. }, words, ..)`
+import std.gc;
+
+object Proto { nregs: u32, code: verified [u32] by V }
+
+vm V {
+    state { pc: *u32 }
+    verify_context owner proto: Gc<Proto>;
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(p: Gc<Proto>) -> i64 { jump p.code }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    let p = new(&heap, Proto { nregs: 1 }, 1);
+}

@@ -27,31 +27,27 @@ import std.gc;
 import std.mem;
 import std.text;
 import value;
-import value.{V, Proto, Lines, Protos, UpDescs, Code};
+import value.{V, Proto, Lines, Protos, UpDescs};
 import vm.{Mini, Ctx, Frame};
 import vm;
 
 /// A prototype for `code`, and whether the code passed Mini.verify. If it
-/// did not, the Proto holds it anyway (`assume_verified`): the reproducers
-/// exist to run code that the verifier used to accept.
+/// did not, the Proto holds it anyway (`build_assume_verified`): the
+/// reproducers exist to run code that the verifier used to accept.
 fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> (Gc<Proto>, bool) {
     let protos = new(h, Protos {}, kids.len);
     for i in 0..kids.len { protos.data[i] = kids[i]; }
-    let words = new(h, Code {}, code.len);
     let lines = new(h, Lines {}, code.len);
-    for i in 0..code.len { words.data[i] = code[i]; lines.data[i] = 0; }
-    let consts = value.new_arr(h, 1);
-    let (v, ok) = match Mini.verify(words.data, nregs, 0, consts.data.len, protos.data.len) {
-        Ok(v) => (v, true),
-        Err(_) => (unsafe { Mini.assume_verified(words.data) }, false),
-    };
-    let p = new(h, Proto {
+    for i in 0..code.len { lines.data[i] = 0; }
+    let init = Proto {
         name: value.new_str(h, "f"), nparams: 0, nregs: nregs, nupvals: 0,
-        consts: consts, lines: lines,
+        consts: value.new_arr(h, 1), lines: lines,
         protos: protos, updesc: new(h, UpDescs {}, 0),
-        code: v, words: words,
-    });
-    (p, ok)
+    };
+    match Mini.build_verified(h, init, code) {
+        Ok(p) => (p, true),
+        Err(_) => (unsafe { Mini.build_assume_verified(h, init, code) }, false),
+    }
 }
 
 fn main() -> i32 uses gc {

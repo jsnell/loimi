@@ -1,0 +1,11 @@
+// error: vm `V` has `u32` code words, not `u16`
+object Proto { nregs: u32, code: verified [u16] by V }
+
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format X { op: 8 } }
+    op HALT() : X { exit 0 }
+    entry run(code: *u32) -> i64 { jump code }
+}
+
+fn main() {}
