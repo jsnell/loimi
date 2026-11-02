@@ -1,0 +1,87 @@
+// Reproducers for holes in Mini's verify clauses (examples/mini/vm.lm).
+// Each program passes Mini.verify, then writes or reads past the stack.
+//   repro 1: CALL with nres 255, callee RET1 (RET1's cold path clears
+//            want - 1 registers of the callee's frame)
+//   repro 2: SETLIST reading n registers past the frame
+//   repro 3: CALL with nres 255, callee RETN (writes want results)
+//   repro 4: RETN reading n registers past the frame
+//   repro 5: CALL with nres 255, callee RET0 (writes want Nils; what the
+//            fuzzer hit first)
+//   repro 6: GETINDEXI with index 0: `(i as u64) - 1` overflows (panics
+//            in debug builds)
+// All come from `imm` operands without `verify` clauses (nres, n, i).
+// The stack holds exactly the main frame, so ASan sees the overflow:
+//   mkdir d; ln -s $PWD/examples/mini/{value,vm,lib}.lm d/
+//   ln -s $PWD/tests/fuzz/mini_holes.lm d/
+//   loimi build d/mini_holes.lm --sanitize=address -o holes; ./holes 5
+import std.io;
+import std.os;
+import std.gc;
+import std.mem;
+import std.text;
+import value;
+import value.{V, Proto, Lines, Protos, UpDescs};
+import vm.{Mini, Ctx, Frame};
+import vm;
+
+fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> Gc<Proto> {
+    let protos = new(h, Protos {}, kids.len);
+    for i in 0..kids.len { protos.data[i] = kids[i]; }
+    let p = new(h, Proto {
+        name: value.new_str(h, "f"), nparams: 0, nregs: nregs, nupvals: 0,
+        consts: value.new_arr(h, 0), lines: new(h, Lines {}, code.len),
+        protos: protos, updesc: new(h, UpDescs {}, 0),
+    }, code.len);
+    for i in 0..code.len { p.code[i] = code[i]; p.lines.data[i] = 0; }
+    p
+}
+
+fn main() -> i32 {
+    let which = match os.arg(1) { Some(s) => s[0] - '0', None => 1 };
+    var heap = gc.Heap.new();
+    value.init_strings(&heap);
+    let h = &heap;
+    var main_code: [u32; 3] = [0; 3];
+    var child_code: [u32; 1] = [0; 1];
+    var nregs: u32 = 3;
+    if which == 1 or which == 3 or which == 5 {
+        child_code[0] = if which == 1 { Mini.RET1(0) } else if which == 3 { Mini.RETN(0, 1) } else { Mini.RET0() };
+        main_code[0] = Mini.CLOSURE(0, 0);
+        main_code[1] = Mini.CALL(0, 0, 255);
+        main_code[2] = Mini.RET0();
+    } else if which == 6 {
+        main_code[0] = Mini.NEWTABLE(0, 0, 0);
+        main_code[1] = Mini.GETINDEXI(1, 0, 0);
+        main_code[2] = Mini.RET0();
+    } else if which == 2 {
+        main_code[0] = Mini.NEWTABLE(0, 0, 0);
+        main_code[1] = Mini.SETLIST(0, 200, 0);
+        main_code[2] = Mini.RET0();
+    } else {
+        // RETN only reads past the frame when returning to a caller.
+        child_code[0] = Mini.RETN(0, 200);
+        main_code[0] = Mini.CLOSURE(0, 0);
+        main_code[1] = Mini.CALL(0, 0, 200);
+        main_code[2] = Mini.RET0();
+    }
+    var nokids: mem.Vec<Gc<Proto>> = mem.Vec.new();
+    let child = proto(h, 1, child_code[..], nokids.items());
+    var kids: [Gc<Proto>; 1] = [child];
+    let mainp = proto(h, nregs, main_code[..], kids[..]);
+    io.print("verify main: ");
+    io.println(if Mini.verify(mainp.code, mainp).is_none() { "ok" } else { "rejected" });
+    io.print("verify child: ");
+    io.println(if Mini.verify(child.code, child).is_none() { "ok" } else { "rejected" });
+    let stack: *V = mem.alloc(nregs as u64);
+    var ctx = Ctx {
+        heap: heap, stack: stack, stack_end: stack + nregs as u64,
+        frames: mem.alloc(16), frames_end: 0 as *Frame, fp: 0 as *Frame,
+        globals: value.new_table(h), error: V.Nil, out: text.StrBuf.new(),
+        open: None, open_level: 0 as *V,
+    };
+    ctx.frames_end = ctx.frames + 16;
+    ctx.fp = ctx.frames;
+    Mini.run(&ctx, value.new_closure(&ctx.heap, mainp));
+    io.println("ran");
+    0
+}

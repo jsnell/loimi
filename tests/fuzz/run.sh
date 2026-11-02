@@ -127,7 +127,7 @@ fuzz() {   # fuzz TARGET
             [ $st -eq 86 ] && why="ASan: $(grep -o 'AddressSanitizer: [a-z-]*' "$log.err" | head -1 | cut -d' ' -f2)"
             [ $st -eq 124 ] && why="hang"
             echo "$bad $why" >> "$OUT/$t.failures"
-            grep -v '^seed ' "$log.err" > "$OUT/$t-seed-$bad.log"
+            grep -v -e '^seed ' -e '^ran$' "$log.err" > "$OUT/$t-seed-$bad.log"
             echo "FAIL $t seed $bad: $why (log: $OUT/$t-seed-$bad.log)"
             fails=$((fails + 1))
         fi

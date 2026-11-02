@@ -29,6 +29,7 @@ cargo build --release
 ./target/release/loimi build examples/mini/main.lm --release -o mini
 ./mini examples/mini/tests/functions.mini              # the Lua-like example
 cargo test                                             # all tests
+tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
 bench/run.sh                                           # Loimi VM vs hand-written C
 bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
 ```
