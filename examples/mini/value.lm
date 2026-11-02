@@ -6,6 +6,8 @@ import std.mem;
 import std.hash;
 import std.text;
 
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+
 pub object Str { hash: u64, data: [u8] }
 pub object Arr { data: [V] }
 /// A table: an array part holding keys 1..asize (`arr`, whose length is
@@ -355,22 +357,33 @@ pub fn number(x: f64) -> V {
     V.Num(x)
 }
 
+/// Append `v` converted as by Lua's `tostring`.
 pub fn write_value(b: *text.StrBuf, v: V) {
     match v {
         Int(i) => b.push_int(i as i64),
         Num(x) => {
-            if x == x.floor() and x > -1e15 and x < 1e15 {
-                b.push_int(x as i64);
-                b.push_str(".0");
-            } else {
-                b.push_f64(x);
+            var buf: [u8; 48] = [0; 48];
+            let n = snprintf(&buf[0], 48, "%.14g\0".ptr, x) as u64;
+            b.push_str(buf[0..n]);
+            // Looks like an integer (only digits and '-')? Mark it as a float.
+            var int_like = true;
+            for i in 0..n {
+                if buf[i] != '-' and !text.is_digit(buf[i]) { int_like = false; }
             }
+            if int_like { b.push_str(".0"); }
         }
         Nil => b.push_str("nil"),
         Bool(x) => b.push_str(if x { "true" } else { "false" }),
         S(s) => b.push_str(s.data),
-        T(t) => { b.push_str("table: "); b.push_int(t as i64); }
-        F(c) => { b.push_str("function: "); b.push_str(c.proto.name.data); }
+        T(t) => push_addr(b, "table: ", t as u64),
+        F(c) => push_addr(b, "function: ", c as u64),
         Native(_) => b.push_str("function: builtin"),
     }
+}
+
+fn push_addr(b: *text.StrBuf, prefix: str, addr: u64) {
+    var buf: [u8; 48] = [0; 48];
+    let n = snprintf(&buf[0], 48, "%p\0".ptr, addr as *u8) as u64;
+    b.push_str(prefix);
+    b.push_str(buf[0..n]);
 }
