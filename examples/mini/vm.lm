@@ -330,6 +330,16 @@ pub vm Mini {
         }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
+    /// R[dst] = t[i] for an integer constant 1 <= i <= 255.
+    op GETINDEXI(dst: reg, t: reg, i: imm) : ABC {
+        if let T(tab) = t {
+            let u = (i as u64) - 1;
+            if u < tab.asize { dst = tab.aptr[u]; next }
+            dst = value.table_get(tab, Int(i as i32));
+            next
+        }
+        cold { raise error(ctx, "attempt to index a ", t) }
+    }
     /// Method lookup: R[a+1] = obj; R[a] = obj[key].
     op SELF(a: callbase, obj: reg, key: kst) : ABC {
         let o = obj;
@@ -341,13 +351,16 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", o) }
     }
 
-    // One declaration, three ops.
-    inline for (name, checked, sym, code) in [
-        ("ADD", "add_checked", +, 0),
-        ("SUB", "sub_checked", -, 1),
-        ("MUL", "mul_checked", *, 2),
+    // One declaration, six ops: register and constant (K) second operands.
+    inline for (name, checked, sym, code, bkind) in [
+        ("ADD", "add_checked", +, 0, reg),
+        ("SUB", "sub_checked", -, 1, reg),
+        ("MUL", "mul_checked", *, 2, reg),
+        ("ADDK", "add_checked", +, 0, kst),
+        ("SUBK", "sub_checked", -, 1, kst),
+        ("MULK", "mul_checked", *, 2, kst),
     ] {
-        op #name(dst: reg, a: reg, b: reg) : ABC {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
             match (a, b) {
                 (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
                 (Num(x), Num(y)) => { dst = Num(x sym y); next }
@@ -361,21 +374,23 @@ pub vm Mini {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
     }
-    op DIV(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Num(x), Num(y)) => { dst = Num(x / y); next }
-            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
-            _ => {}
+    inline for (dname, mname, bkind) in [("DIV", "MOD", reg), ("DIVK", "MODK", kst)] {
+        op #dname(dst: reg, a: reg, b: bkind) : ABC {
+            match (a, b) {
+                (Num(x), Num(y)) => { dst = Num(x / y); next }
+                (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+                _ => {}
+            }
+            cold { dst = arith_slow(ctx, 3, a, b)?; next }
         }
-        cold { dst = arith_slow(ctx, 3, a, b)?; next }
-    }
-    op MOD(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) and y > 0 {
-            let r = x % y;
-            dst = Int(if r < 0 { r + y } else { r });
-            next
+        op #mname(dst: reg, a: reg, b: bkind) : ABC {
+            if let (Int(x), Int(y)) = (a, b) and y > 0 {
+                let r = x % y;
+                dst = Int(if r < 0 { r + y } else { r });
+                next
+            }
+            cold { dst = arith_slow(ctx, 4, a, b)?; next }
         }
-        cold { dst = arith_slow(ctx, 4, a, b)?; next }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
         dst = arith_slow(ctx, 5, a, b)?;
@@ -404,23 +419,51 @@ pub vm Mini {
         next
     }
 
-    op EQ(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x == y); next }
-        // Same bits means equal, except for NaN.
-        if a == b {
-            if let Num(x) = a { dst = Bool(x == x); next }
-            dst = Bool(true);
-            next
+    // Comparisons, with a register or constant (K) second operand.
+    // GT and GE exist only with K (for `k < x`, the compiler swaps).
+    inline for (ename, lname, lename, bkind) in [("EQ", "LT", "LE", reg), ("EQK", "LTK", "LEK", kst)] {
+        op #ename(dst: reg, a: reg, b: bkind) : ABC {
+            if let (Int(x), Int(y)) = (a, b) { dst = Bool(x == y); next }
+            // Same bits means equal, except for NaN.
+            if a == b {
+                if let Num(x) = a { dst = Bool(x == x); next }
+                dst = Bool(true);
+                next
+            }
+            cold { dst = Bool(value.raw_equal(a, b)); next }
         }
-        cold { dst = Bool(value.raw_equal(a, b)); next }
+        op #lname(dst: reg, a: reg, b: bkind) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = Bool(x < y); next }
+                (Num(x), Num(y)) => { dst = Bool(x < y); next }
+                _ => {}
+            }
+            cold { dst = Bool(less(ctx, a, b, false)?); next }
+        }
+        op #lename(dst: reg, a: reg, b: bkind) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = Bool(x <= y); next }
+                (Num(x), Num(y)) => { dst = Bool(x <= y); next }
+                _ => {}
+            }
+            cold { dst = Bool(less(ctx, a, b, true)?); next }
+        }
     }
-    op LT(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x < y); next }
-        cold { dst = Bool(less(ctx, a, b, false)?); next }
+    op GTK(dst: reg, a: reg, b: kst) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => { dst = Bool(x > y); next }
+            (Num(x), Num(y)) => { dst = Bool(x > y); next }
+            _ => {}
+        }
+        cold { dst = Bool(less(ctx, b, a, false)?); next }
     }
-    op LE(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x <= y); next }
-        cold { dst = Bool(less(ctx, a, b, true)?); next }
+    op GEK(dst: reg, a: reg, b: kst) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) => { dst = Bool(x >= y); next }
+            (Num(x), Num(y)) => { dst = Bool(x >= y); next }
+            _ => {}
+        }
+        cold { dst = Bool(less(ctx, b, a, true)?); next }
     }
 
     op JMP(target: label) : sJ { jump target }
@@ -616,6 +659,13 @@ pub vm Mini {
     super LT_TEST = LT; TEST;
     super LE_TEST = LE; TEST;
     super EQ_TEST = EQ; TEST;
+    super EQ_TESTT = EQ; TESTT;
+    super LTK_TEST = LTK; TEST;
+    super LEK_TEST = LEK; TEST;
+    super GTK_TEST = GTK; TEST;
+    super GEK_TEST = GEK; TEST;
+    super EQK_TEST = EQK; TEST;
+    super EQK_TESTT = EQK; TESTT;
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
     super ADD_RET1 = ADD; RET1;

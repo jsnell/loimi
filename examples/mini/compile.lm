@@ -259,6 +259,8 @@ enum E {
     Global(u32),
     Field(u32, u32),
     Index(u32, u32),
+    /// t[i] for an integer literal 1 <= i <= 255.
+    IndexI(u32, u32),
     Reloc(u64),
     /// An open call: function and results at register .0, CALL at .1.
     /// Its result count can still be raised (see explist_to).
@@ -453,6 +455,7 @@ fn Parser.free_exp(p: *Parser, e: E) {
         Temp(r) => p.free_reg(r),
         Call(r, _) => p.free_reg(r),
         Field(t, _) => p.free_reg(t),
+        IndexI(t, _) => p.free_reg(t),
         Index(t, k) => {
             if k > t { p.free_reg(k); p.free_reg(t); } else { p.free_reg(t); p.free_reg(k); }
         }
@@ -479,6 +482,7 @@ fn Parser.discharge(p: *Parser, e: E, dst: u32) {
         }
         Field(t, k) => { p.emit(Mini.GETFIELD(d, t as u8, k as u8)); }
         Index(t, k) => { p.emit(Mini.GETINDEX(d, t as u8, k as u8)); }
+        IndexI(t, i) => { p.emit(Mini.GETINDEXI(d, t as u8, i as u8)); }
         Reloc(at) => {
             let w = p.fs.code.at(at);
             p.fs.code.set(at, (w & 0xFFFF00FF) | (dst << 8));
@@ -531,6 +535,12 @@ fn Parser.store_var(p: *Parser, target: E, v: E) {
         Index(t, k) => {
             let v = p.any_reg(v);
             p.emit(Mini.SETINDEX(t as u8, k as u8, reg_of(v) as u8));
+        }
+        IndexI(t, i) => {
+            let v = p.any_reg(v);
+            let kr = p.reserve(1);
+            p.emit(Mini.LOADI(kr as u8, i as i16));
+            p.emit(Mini.SETINDEX(t as u8, kr as u8, reg_of(v) as u8));
         }
         _ => fail(p.line, "cannot assign to this expression"),
     }
@@ -630,6 +640,11 @@ fn Parser.suffixed(p: *Parser) -> E {
                 p.advance();
                 let t = p.any_reg(e);
                 let ke = p.expr();
+                if let I(i) = ke and i >= 1 and i <= 255 {
+                    p.check(T.RBracket, "']'");
+                    e = E.IndexI(reg_of(t), i as u32);
+                    continue;
+                }
                 let k = p.any_reg(ke);
                 p.check(T.RBracket, "']'");
                 e = E.Index(reg_of(t), reg_of(k));
@@ -809,46 +824,122 @@ fn Parser.subexpr(p: *Parser, limit: u32) -> E {
             e = E.Temp(r);
             continue;
         }
+        // A constant left operand of a commutative operator or a
+        // comparison stays unmaterialized, so the K form can be used
+        // with the operands swapped.
+        if swappable(op) and let Some(kl) = p.kindex(e, op == T.Eq or op == T.Ne) {
+            let rhs = p.subexpr(rp);
+            if p.kindex(rhs, op == T.Eq or op == T.Ne).is_none() {
+                let r = p.any_reg(rhs);
+                p.free_exp(r);
+                let a = reg_of(r) as u8;
+                let k = kl as u8;
+                let w = match op {
+                    Plus => Mini.ADDK(0, a, k),
+                    Star => Mini.MULK(0, a, k),
+                    Eq | Ne => Mini.EQK(0, a, k),
+                    Lt => Mini.GTK(0, a, k),
+                    Le => Mini.GEK(0, a, k),
+                    Gt => Mini.LTK(0, a, k),
+                    _ => Mini.LEK(0, a, k),
+                };
+                e = p.finish_binop(op, w);
+                continue;
+            }
+            let l = p.any_reg(e);
+            e = p.binop(op, l, rhs);
+            continue;
+        }
         let l = p.any_reg(e);
         let rhs = p.subexpr(rp);
-        // x + c and x - c with a small constant c.
-        if op == T.Plus or op == T.Minus {
-            if let I(c) = rhs {
-                let c = if op == T.Minus { 0 - c } else { c };
-                if c >= -128 and c <= 127 {
-                    p.free_exp(l);
-                    e = E.Reloc(p.emit(Mini.ADDI(0, reg_of(l) as u8, c as i8)));
-                    continue;
-                }
-            }
-        }
-        let r = p.any_reg(rhs);
-        p.free_exp(r);
-        p.free_exp(l);
-        let (a, b) = (reg_of(l) as u8, reg_of(r) as u8);
-        let w = match op {
-            Plus => Mini.ADD(0, a, b),
-            Minus => Mini.SUB(0, a, b),
-            Star => Mini.MUL(0, a, b),
-            Slash => Mini.DIV(0, a, b),
-            Percent => Mini.MOD(0, a, b),
-            Caret => Mini.POW(0, a, b),
-            Concat => Mini.CONCAT(0, a, b),
-            Eq | Ne => Mini.EQ(0, a, b),
-            Lt => Mini.LT(0, a, b),
-            Le => Mini.LE(0, a, b),
-            Gt => Mini.LT(0, b, a),
-            Ge => Mini.LE(0, b, a),
-            _ => fail(p.tok.line, "bad operator"),
-        };
-        e = E.Reloc(p.emit(w));
-        if op == T.Ne {
-            let t = p.to_next_reg(e);
-            p.free_reg(t);
-            e = E.Reloc(p.emit(Mini.NOT(0, t as u8)));
-        }
+        e = p.binop(op, l, rhs);
     }
     e
+}
+
+fn swappable(op: T) -> bool {
+    op == T.Plus or op == T.Star or op == T.Eq or op == T.Ne or op == T.Lt or op == T.Le or op == T.Gt or op == T.Ge
+}
+
+/// The constant index (at most 255) of a numeric constant expression, or
+/// also of nil, true, false and strings if `any`.
+fn Parser.kindex(p: *Parser, e: E, any: bool) -> ?u32 {
+    let k = match e {
+        I(i) => p.constant(V.Int(i)),
+        K(k) => {
+            let v = p.fs.consts.at(k as u64);
+            let num = match v { Int(_) | Num(_) => true, _ => false };
+            if !any and !num { return None; }
+            k
+        }
+        Nil => if any { p.constant(V.Nil) } else { return None; },
+        True => if any { p.constant(V.Bool(true)) } else { return None; },
+        False => if any { p.constant(V.Bool(false)) } else { return None; },
+        _ => return None,
+    };
+    if k > 255 { None } else { Some(k) }
+}
+
+/// The binary operator `op` on `l` (in a register) and `rhs`.
+fn Parser.binop(p: *Parser, op: T, l: E, rhs: E) -> E {
+    // x + c and x - c with a small constant c.
+    if op == T.Plus or op == T.Minus {
+        if let I(c) = rhs {
+            let c = if op == T.Minus { 0 - c } else { c };
+            if c >= -128 and c <= 127 {
+                p.free_exp(l);
+                return E.Reloc(p.emit(Mini.ADDI(0, reg_of(l) as u8, c as i8)));
+            }
+        }
+    }
+    let a = reg_of(l) as u8;
+    if op != T.Caret and op != T.Concat and let Some(k) = p.kindex(rhs, op == T.Eq or op == T.Ne) {
+        p.free_exp(l);
+        let k = k as u8;
+        let w = match op {
+            Plus => Mini.ADDK(0, a, k),
+            Minus => Mini.SUBK(0, a, k),
+            Star => Mini.MULK(0, a, k),
+            Slash => Mini.DIVK(0, a, k),
+            Percent => Mini.MODK(0, a, k),
+            Eq | Ne => Mini.EQK(0, a, k),
+            Lt => Mini.LTK(0, a, k),
+            Le => Mini.LEK(0, a, k),
+            Gt => Mini.GTK(0, a, k),
+            Ge => Mini.GEK(0, a, k),
+            _ => fail(p.tok.line, "bad operator"),
+        };
+        return p.finish_binop(op, w);
+    }
+    let r = p.any_reg(rhs);
+    p.free_exp(r);
+    p.free_exp(l);
+    let b = reg_of(r) as u8;
+    let w = match op {
+        Plus => Mini.ADD(0, a, b),
+        Minus => Mini.SUB(0, a, b),
+        Star => Mini.MUL(0, a, b),
+        Slash => Mini.DIV(0, a, b),
+        Percent => Mini.MOD(0, a, b),
+        Caret => Mini.POW(0, a, b),
+        Concat => Mini.CONCAT(0, a, b),
+        Eq | Ne => Mini.EQ(0, a, b),
+        Lt => Mini.LT(0, a, b),
+        Le => Mini.LE(0, a, b),
+        Gt => Mini.LT(0, b, a),
+        Ge => Mini.LE(0, b, a),
+        _ => fail(p.tok.line, "bad operator"),
+    };
+    p.finish_binop(op, w)
+}
+
+/// Emit the instruction `w` for operator `op` (negated for `~=`).
+fn Parser.finish_binop(p: *Parser, op: T, w: u32) -> E {
+    let e = E.Reloc(p.emit(w));
+    if op != T.Ne { return e; }
+    let t = p.to_next_reg(e);
+    p.free_reg(t);
+    E.Reloc(p.emit(Mini.NOT(0, t as u8)))
 }
 
 /// Evaluate an expression list into consecutive registers starting at
@@ -923,6 +1014,13 @@ fn Parser.add_local(p: *Parser, name: str, r: u32) {
 
 fn Parser.cond(p: *Parser) -> u64 {
     let c = p.expr();
+    // `if not x`: test x for truth instead of materializing `not x`.
+    if let Reloc(at) = c and at + 1 == p.pc() and Mini.opcode(p.fs.code.at(at)) == Mini.OP_NOT {
+        let src = (p.fs.code.at(at) >> 16) & 255;
+        p.fs.code.truncate(at);
+        p.fs.lines.truncate(at);
+        return p.emit(Mini.TESTT(src as u8, 0));
+    }
     let r = p.any_reg(c);
     p.free_exp(r);
     p.emit(Mini.TEST(reg_of(r) as u8, 0))
@@ -951,6 +1049,7 @@ fn Parser.check_conflict(p: *Parser, targets: *mem.Vec<E>, e: E) {
     for i in 0..targets.len {
         match targets.at(i) {
             Field(t, _) => if t == r { conflict = true; },
+            IndexI(t, _) => if t == r { conflict = true; },
             Index(t, k) => if t == r or k == r { conflict = true; },
             _ => {}
         }
@@ -961,6 +1060,7 @@ fn Parser.check_conflict(p: *Parser, targets: *mem.Vec<E>, e: E) {
     for i in 0..targets.len {
         match targets.at(i) {
             Field(t, k) => if t == r { targets.set(i, E.Field(copy, k)); },
+            IndexI(t, k) => if t == r { targets.set(i, E.IndexI(copy, k)); },
             Index(t, k) => {
                 let t2 = if t == r { copy } else { t };
                 let k2 = if k == r { copy } else { k };
@@ -973,7 +1073,7 @@ fn Parser.check_conflict(p: *Parser, targets: *mem.Vec<E>, e: E) {
 
 fn assignable(e: E) -> bool {
     match e {
-        Local(_) | Upval(_) | Global(_) | Field(_, _) | Index(_, _) => true,
+        Local(_) | Upval(_) | Global(_) | Field(_, _) | Index(_, _) | IndexI(_, _) => true,
         _ => false,
     }
 }
