@@ -435,13 +435,13 @@ pub vm Mini {
     // first time a site sees two floats it becomes the _F member, which
     // tests (Num, Num) first. Both members handle every type, so a site
     // never switches back.
-    inline for (name, fname, checked, sym, code, bkind, bbase) in [
-        ("ADD", "ADD_F", "add_checked", +, 0, reg, regs),
-        ("SUB", "SUB_F", "sub_checked", -, 1, reg, regs),
-        ("MUL", "MUL_F", "mul_checked", *, 2, reg, regs),
-        ("ADDK", "ADDK_F", "add_checked", +, 0, kst, k),
-        ("SUBK", "SUBK_F", "sub_checked", -, 1, kst, k),
-        ("MULK", "MULK_F", "mul_checked", *, 2, kst, k),
+    inline for (name, fname, ifname, finame, checked, sym, code, bkind, bbase) in [
+        ("ADD", "ADD_F", "ADD_IF", "ADD_FI", "add_checked", +, 0, reg, regs),
+        ("SUB", "SUB_F", "SUB_IF", "SUB_FI", "sub_checked", -, 1, reg, regs),
+        ("MUL", "MUL_F", "MUL_IF", "MUL_FI", "mul_checked", *, 2, reg, regs),
+        ("ADDK", "ADDK_F", "ADDK_IF", "ADDK_FI", "add_checked", +, 0, kst, k),
+        ("SUBK", "SUBK_F", "SUBK_IF", "SUBK_FI", "sub_checked", -, 1, kst, k),
+        ("MULK", "MULK_F", "MULK_IF", "MULK_FI", "mul_checked", *, 2, kst, k),
     ] {
         family #name(dst: reg, a: reg, b: bkind) : ABC {
             generic {
@@ -452,8 +452,8 @@ pub vm Mini {
                 }
                 cold {
                     match (a, b) {
-                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #fname; next }
-                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #fname; next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; next }
                         _ => {}
                     }
                     dst = arith_slow(ctx, code, a, b)?;
@@ -473,6 +473,22 @@ pub vm Mini {
                     _ => {}
                 }
                 cold { dst = arith_mixed(ctx, code, a, b)?; next }
+            }
+            // Mixed operands, seen first: only that case is fast, and
+            // anything else makes the site float-first.
+            #ifname {
+                if let Int(x) = a {
+                    let r = x as f64 sym unsafe { *((bbase + b.raw) as *f64) };
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; redo }
+            }
+            #finame {
+                if let Int(y) = b {
+                    let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; redo }
             }
         }
     }
