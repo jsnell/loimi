@@ -77,6 +77,24 @@ Guest-semantics helpers that are easy to get subtly wrong:
 - Numeric-literal parsing shared by the lexer and runtime `tonumber`: hex,
   binary, underscores, and exponents, configurable per guest language.
 
+**As implemented** (`std/num.lm`): no `BigInt` yet. Parsing returns
+`Result<_, NumError>` with `Invalid` and `Overflow` kept apart:
+`parse_int` (sign, decimal or `0x` hex, exact i64 range), `parse_i64` /
+`parse_u64` (radix 2 to 36), `parse_u64_wrapping` (Lua hex literals),
+`parse_f64` (strict decimal syntax checked first, then correctly rounded by
+strtod), `parse_number` (`Number.Int` or `Number.Float`, decimal overflow
+becomes a float as in Lua) and `decimal_len` (the extent of a numeral, for
+lexers). Formatting appends to a `StrBuf`: `write_g(b, x, 14)` (Lua's
+`%.14g`), `write_shortest` (shortest round-trip, Python `repr` notation
+rules, by trying `%.{1..17}e` with snprintf rather than Ryu), `mark_float`
+(append `.0` to integer-looking output) and `write_hex`. Binary literals and
+digit separators are not supported. The `std.core` guest-arithmetic helpers
+live here too: `floor_div`, `floor_mod`, `trunc_div`, `trunc_rem` (None on
+a zero divisor; `MIN / -1` wraps), `floor_div_f64`, `floor_mod_f64`,
+`add_overflow`/`sub_overflow`/`mul_overflow` returning `(i64, bool)`, and
+`to_i64_exact`. The built-in `add_checked`/`sub_checked`/`mul_checked`
+methods cover the `?T` forms.
+
 ## `std.lex`: lexer generator
 
 The token specification is turned into a DFA at **compile time** (comptime),
@@ -102,6 +120,43 @@ It uses longest match, priority by declaration order, and keyword tables via
 perfect hashing. Hand-written lexers can still use `std.lex.Cursor`
 (peek, advance, spans, and UTF-8 aware character classes).
 
+**As implemented** (`std/lex.lm`): without comptime there is no generator;
+the module is the `Cursor` toolkit, and a lexer is a short function that
+tries the scanners in order:
+
+```loimi
+fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
+    let c = &lx.cur;
+    c.skip_trivia()?;
+    let start = c.pos;
+    if c.at_end() { return Ok(lx.tok(T.Eof, start)); }
+    if let Some(name) = c.ident() { return Ok(lx.tok(lx.keywords.get(name) ?? T.Name, start)); }
+    if c.at_number() { lx.num = c.number()?; return Ok(lx.tok(T.Number, start)); }
+    if c.peek() == '"' { lx.buf.clear(); c.quoted(&lx.buf)?; return Ok(lx.tok(T.String, start)); }
+    if let Some(k) = lx.ops.eat(c) { return Ok(lx.tok(k, start)); }
+    Err(c.error_at(start, "unexpected character"))
+}
+```
+
+- `Syntax` holds the per-language conventions: line comment prefix, block
+  comment delimiters (optionally nesting), Lua long-bracket comments, octal
+  or decimal `\ddd`, whether backslash-newline keeps the newline, raw
+  newlines in strings, and whether overflowing decimal/hex literals become
+  floats/wrap or are errors. Presets: `lua()`, `c_like()`, `none()`.
+- `Cursor`: `peek`, `peek_at`, `bump`, `advance`, `eat`, `eat_str`,
+  `starts_with`, `eat_while(fn(u8) -> bool)`, `since`, `span_from`,
+  `save`/`restore`, and `line` tracking. Character classes are ASCII.
+- Scanners: `skip_trivia`, `ident`, `at_number`/`number` (via std.num, with
+  `3abc` reported as malformed), `quoted` (escapes decoded into a `StrBuf`;
+  after a bad escape it still scans to the closing quote so the lexer can
+  continue), `long_bracket_level`/`long_string`.
+- `OpTable<K>`: operator strings to token kinds, maximal munch through
+  per-first-byte chains sorted longest first. Matching is
+  `ops.eat(&cursor)` because methods cannot have their own type parameters.
+- `Keywords<K>`: a `HashMap<str, K>` wrapper (no perfect hashing yet).
+- Errors are `lex.Error { span, msg }` with a static message;
+  `e.diag()` turns one into a `diag.Diag`.
+
 ## `std.parse`
 
 - `Pratt<Ast>`: precedence-climbing helper driven by a comptime operator table
@@ -111,12 +166,36 @@ perfect hashing. Hand-written lexers can still use `std.lex.Cursor`
   tokens (`recover_to(.{ .Semi, .End })`) so one syntax error doesn't hide the rest.
 - `Span`, `SourceId`, `SourceMap` (file → line/column, computed lazily).
 
+**As implemented** (`std/parse.lm`): `Pratt<P, K, E, X>` over parser state
+`P`, a payload-free token-kind enum `K` (used as a table index via
+`k as u64`), expression result `E` and error type `X`. The table is filled
+at run time (`infix_left(k, bp)`, `infix_right(k, bp)`, `infix(k, l, r)`,
+`prefix(k, bp)`), and `parse(p, min_bp)` calls the user's `peek`,
+`advance`, `atom`, `unary` and `binary` functions and an optional
+`before_rhs` hook (where a single-pass compiler puts the left operand in a
+register or emits the jump of `and`/`or`). Postfix operators belong in
+`atom`. A hook that needs to recurse (parentheses) reaches the table through
+a pointer in `P`. `TokenStream` and error recovery are not built. `Span` and
+`SourceMap` live in `std.diag`.
+
 ## `std.diag`
 
 Diagnostics with labeled spans, notes, and fix-it hints, rendered with
 source snippets and carets in plain text or ANSI color. Compiler phases push
 into a `Diagnostics` sink, and the same machinery formats guest runtime
 errors with tracebacks.
+
+**As implemented** (`std/diag.lm`): `Span { file, lo, hi }`; `SourceMap`
+(borrowed names and text; `add`, `line_col` by binary search in a line-start
+table built on first use, `line_text`, `snippet`, `write_location`); `Diag`
+with a `Severity`, a message, an optional primary span with a label, and
+notes (`with_label`, `with_note`, `with_note_at`, `with_help`), rendered in
+the same format as the Loimi compiler's own errors (tabs preserved under the
+caret line, spans clipped to their first line); and `Diagnostics`, which
+copies the messages pushed into it into an arena (so they can be built in a
+temporary `StrBuf`), counts errors and warnings, and prints a summary such as
+`1 warning and 2 errors generated.` Not built: fix-it hints, ANSI color,
+multi-line spans, tracebacks.
 
 ## `std.ast`
 
