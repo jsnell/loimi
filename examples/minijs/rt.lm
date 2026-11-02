@@ -116,8 +116,10 @@ pub fn Ctx.new() -> Ctx {
 /// Finish setting up once `c` has its final address.
 pub fn Ctx.init(c: *Ctx) {
     c.m.attach(&c.heap);
-    c.heap.min_heap = 64 << 20;
-    c.heap.threshold = c.heap.min_heap;
+    // Allocate three times the live data (at least 8 MiB) between
+    // collections: as fast as a 64 MiB minimum at 100%, with a quarter
+    // of the memory for programs with little live data.
+    c.heap.set_growth(300, 8 << 20);
     value.HEAP = Some(&c.heap);
     c.heap.add_scanner(c as *u8, scan_roots);
     for _ in 0..INT_KEYS { c.intkeys.push(0); }

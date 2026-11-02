@@ -25,7 +25,7 @@ first interpreter built mostly on the standard library: `std.lex`,
 | `value.lm` | the `V` value type, heap objects (strings, ropes, objects, arrays, functions, boxes, prototypes), conversions, `===` |
 | `rt.lm` | the context (stacks, globals, keys, builtin prototypes, cache side tables), property access for every kind of value, ToString, arrays, errors, GC roots |
 | `ast.lm` | tokens and the lexer (on `std.lex`), syntax trees, variables |
-| `parser.lm` | recursive-descent statements, binary operators through `std.parse`'s Pratt driver |
+| `parser.lm` | recursive-descent statements; expressions through `std.parse`'s Pratt driver, with `led` hooks for assignment, `?:` and `x => ...` |
 | `compile.lm` | name resolution and capture analysis, then code generation with `std.bc` |
 | `vm.lm` | the `vm JS` declaration: ops, inline caches, calls, exceptions |
 | `builtins.lm` | natives and the global environment |
@@ -88,14 +88,18 @@ lookup. Natives are `Fn`s with a native id.
 
 ### Objects: std.obj
 
-Objects are `Obj { shape, dict, overflow, proto, flags, inline: [V] }`,
-the interpreter's own object type over std.obj's generic `Model`. Shapes
-are hidden classes in a transition tree per (prototype, inline count), so
-a shape check also checks the prototype. Dictionary mode, overflow slots,
-validity cells and key order (`Object.keys`) come from std.obj; MiniJS
-adds JS's key order (array indices first) and enumerability (flags for
-"all properties non-enumerable", used by builtin and class prototypes,
-and "`constructor` is not enumerable", used by `F.prototype`).
+Objects are `Obj { shape, dict, overflow, proto, inline: [V] }`, the
+interpreter's own object type over std.obj's generic `Model`. Shapes are
+hidden classes in a transition tree per (prototype, inline count), so a
+shape check also checks the prototype. Dictionary mode, overflow slots,
+validity cells, the inline-cache state machine, per-property attributes
+and JS key order (`obj.index_keys_first`, given MiniJS's "is this key an
+array index") come from std.obj. Enumerability is attribute bit
+`value.NONENUM`, set on built-in methods, class methods, `constructor`
+and `prototype` (`Ctx.define_hidden`), so properties a program adds to
+a built-in or class prototype, or to a function, are enumerable, as in
+JavaScript. Objects become std.obj prototypes (`make_proto`) when they
+are first used as one.
 
 **Allocation size.** The compiler counts the `this.x = ...` assignments
 in a constructor; `class D extends B` adds B's count when the class is
@@ -106,35 +110,38 @@ If objects end up bigger, the function learns the larger size.
 
 ### Inline caches
 
-Property sites carry a four-word cache, `{ shape, slot, ent, miss }`, and
-are families:
+Property sites carry a six-word cache, std.obj's `Site`: `{ sid, slot,
+cell, depth, ent, miss }`. std.obj runs the state machine in the slow
+paths (`m.read_miss`, `m.write_miss`); the families' members are its
+states:
 
 - `GETPROP` / `GETMETHOD` (`o.m(...)`: method and receiver in one op):
   - `_IN` / `_OUT`: own property, inline or overflow slot;
-  - `_P`: found on a prototype, cached as std.obj's `ProtoEntry`
-    (receiver shape, holder, slot, validity cell) in a side table; a hit
-    is a shape compare, a cell check and a load, whatever the depth;
+  - `_P`: found on a prototype: the receiver's shape, the validity cell
+    of its prototype, the holder's depth and slot, all plain words; a
+    hit is a shape compare, a byte load for the cell, `depth` loads of
+    `proto` and the slot load;
+  - `_MISS`: a monomorphic member missed; std.obj refills the site
+    (sites are often monomorphic per phase) and after 8 misses makes it
+    polymorphic;
+  - `_POLY`: up to eight (shape, own slot or prototype hit) entries; a
+    full entry starts over up to 8 times before the site goes
+    megamorphic;
+  - `_MEGA`: std.obj's shared `MegaCache`, own and prototype hits;
   - `_AP` / `_SP`: methods of arrays and strings (`a.push`,
-    `s.charCodeAt`): the receiver's variant plus the shape of
-    `Array.prototype` / `String.prototype`;
-  - `_POLY`: up to eight (shape, own slot or prototype entry) pairs;
-  - `_MEGA`: std.obj's `MegaCache` for own properties, plus a
-    direct-mapped table of prototype entries.
-
-  A monomorphic site that misses is refilled a few times (sites are
-  often monomorphic per phase) before it goes polymorphic; a full
-  polymorphic entry is restarted a few times (see "shape ids" below)
-  before the site goes megamorphic.
+    `s.charCodeAt`), MiniJS's own: the receiver's variant plus the shape
+    of `Array.prototype` / `String.prototype`.
 - `SETPROP`: `_IN` / `_OUT` stores, and `_ADD`, a cached transition
   (old shape → new shape, inline slot) for the property adds that
-  constructors do.
+  constructors do. The shape check is enough: objects that are
+  prototypes have shapes in std.obj's prototype tree.
 
-**Shape ids across collections.** std.obj's transitions are weak: when
-the last object of a shape dies, the shape is collected, and the next
-object built the same way gets a new shape with a new id, which a cache
-sees as a new shape. deltablue rebuilds its constraint graph again and
-again, and its call sites went megamorphic. MiniJS now *pins* every shape
-a cache records (`Shapes.pin`, added to std.obj), so its id stays valid.
+**Shape ids across collections.** When the last object of a shape dies,
+the shape is collected, but std.obj keeps its id for the path that built
+it: the next object built the same way gets a shape with the same id, so
+caches keep hitting. deltablue rebuilds its constraint graph again and
+again; before ids were stable its call sites went megamorphic, and
+MiniJS pinned every shape a cache recorded.
 
 ### Calls
 
@@ -198,9 +205,20 @@ allocate check the threshold first (in a cold path) and collect with the
 frame pointer published by the `sync` block. Roots are the globals,
 keys, builtin prototypes, cache side tables and every frame's register
 window. GC stress (a second argument) collects at every safepoint; the
-test runner uses it for every test. The minimum heap is raised to 64 MB,
-since std.gc's policy (collect again after allocating as much as is live)
-spent a quarter of binary_trees in the collector.
+test runner uses it for every test. The growth policy is 300% with an
+8 MiB minimum (`Heap.set_growth`): std.gc's default (collect again after
+allocating as much as is live, at least 1 MiB) spent a quarter of
+binary_trees in the collector. A 64 MiB minimum at 100% is as fast, but
+uses 70 MB where 300% / 8 MiB uses 12-17 MB on programs with little live
+data (deltablue, json, strings); with 100% / 8 MiB, binary_trees is 25%
+slower (best of 3, wall-clock seconds, loaded machine):
+
+| | 100% / 64 MiB | 300% / 8 MiB | 200% / 16 MiB | 100% / 8 MiB |
+|---|---:|---:|---:|---:|
+| total of the 14 benchmarks | 13.92 | 13.82 | 13.95 | 14.23 |
+| binary_trees | 1.36 | 1.33 | 1.44 | 1.72 |
+| peak RSS, binary_trees | 103 MB | 111 MB | 110 MB | 69 MB |
+| peak RSS, json | 70 MB | 15 MB | 23 MB | 15 MB |
 
 ## Spec coverage
 
@@ -255,8 +273,8 @@ the cached property loads themselves (`GETPROP_IN` is five instructions
 plus the dispatch, 25-30% of nbody and richards).
 
 What mattered, in order: inline caches for own properties and for
-prototype methods (validity cells), ropes for `+=`, pinning shapes so
-that sites stay monomorphic across collections, polymorphic entries
+prototype methods (validity cells), ropes for `+=`, shape ids that
+survive collections so that sites stay monomorphic, polymorphic entries
 with a refill budget instead of thrashing a monomorphic site, the `NEW`
-fast path with exact allocation sizes, a larger minimum heap, mixed
+fast path with exact allocation sizes, a larger GC budget, mixed
 int/float arithmetic inline, and natives called from `CALL`'s hot path.
