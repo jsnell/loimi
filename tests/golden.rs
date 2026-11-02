@@ -30,8 +30,19 @@ fn directives(text: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// Per-process virtual memory cap (KiB) for everything the tests spawn, so a
+/// runaway test program fails instead of exhausting the machine.
+const MEM_LIMIT_KB: u64 = 2 * 1024 * 1024;
+
+/// `prog`, run under the memory cap.
+fn limited(prog: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(format!("ulimit -v {} && exec \"$0\" \"$@\"", MEM_LIMIT_KB)).arg(prog);
+    c
+}
+
 fn loimi() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_loimi"));
+    let mut c = limited(env!("CARGO_BIN_EXE_loimi"));
     c.env("LOIMI_STD", env!("CARGO_MANIFEST_DIR"));
     c
 }
@@ -128,7 +139,7 @@ fn mini_scripts() {
         let exit: i32 = lua_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = lua_directives("expect-stderr");
         for stress in [false, true] {
-            let mut cmd = Command::new(&exe);
+            let mut cmd = limited(&exe);
             cmd.arg(&f);
             if stress {
                 cmd.arg("stress");
@@ -183,7 +194,7 @@ fn mini_conformance() {
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
         for stress in [false, true] {
-            let mut cmd = Command::new(&exe);
+            let mut cmd = limited(&exe);
             cmd.arg(&f);
             if stress {
                 cmd.arg("stress");
