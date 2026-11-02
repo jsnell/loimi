@@ -217,6 +217,25 @@ inline for (V, mode) in [(FT, tailcall), (FG, goto), (FS, switch)] {
         }
         op EXIT(src: reg) : ABC { exit Ok(src) }
 
+        /// A `-> never` vm function with control words: a budgeted jump.
+        fn go(t: *u32) -> never {
+            if tick() { cold { fail BUDGET_EXHAUSTED } }
+            jump t
+        }
+        /// Conditional op reading the following JMP's target (`then`).
+        op CLT(a: reg, b: reg) : ABC then JMP {
+            if a < b { go(then.target) }
+            jump pc + 2
+        }
+        /// `then` op that falls into its JMP with `next` when a == 0.
+        op CNZ(a: reg) : ABC then JMP {
+            if a != 0 { jump pc + 2 }
+            next
+        }
+        /// Exits through a `-> never` vm function.
+        fn leave(v: i64) -> never { exit Ok(v +% 1) }
+        op LEAVE(src: reg) : ABC { leave(src) }
+
         op VCOUNT() : ABC { use_variant count; next }
         op VTRACE() : ABC { use_variant trace; next }
         op VOFF() : ABC { use_variant default; next }
@@ -237,6 +256,16 @@ inline for (V, mode) in [(FT, tailcall), (FG, goto), (FS, switch)] {
         super JNZ_RET = JNZ; RET;
         super ADDI_ADDI_JNZ = ADDI; ADDI; JNZ;
         super LOADC_ADD = LOADC; ADD;
+        // Family members as parts; `become` in a part re-targets the super.
+        super LOADC_Q_ADD = LOADC_Q; ADD;
+        super ARITH_POS_JNZ = ARITH_POS; JNZ;
+        super ADD_ARITH_POS = ADD; ARITH_POS;
+        super ADD_ARITH = ADD; ARITH;
+        // Four parts, with a `then` op and its JMP inside.
+        super MOVE_ADD_CLT_JMP = MOVE; ADD; CLT; JMP;
+        super ADD_CLT = ADD; CLT;
+        super CNZ_JMP_LEAVE = CNZ; JMP; LEAVE;
+        super LOADI_LOADI_LOADI_RET = LOADI; LOADI; LOADI; RET;
 
         entry run(c: *Ctx, code: *u32, r: *i64, kp: *i64) -> Result<i64, i64> {
             ctx = c;
@@ -290,13 +319,36 @@ struct Prog {
 fn ok(r: *Rng, p: *Prog) -> bool { r.below(1000) >= p.noise }
 
 /// Plain (non-super) ops the generator picks from, weighted by repetition.
-const PICKS: [u32; 40] = [
+const PICKS: [u32; 44] = [
     FT.OP_NOP, FT.OP_LOADI, FT.OP_LOADI, FT.OP_LOADK, FT.OP_MOVE, FT.OP_ADD, FT.OP_ADD, FT.OP_SUB,
     FT.OP_MULK, FT.OP_ADDI, FT.OP_ADDI, FT.OP_RAW, FT.OP_ADDC, FT.OP_DIV, FT.OP_GETG, FT.OP_SETG,
     FT.OP_JMP, FT.OP_JLT, FT.OP_JLT, FT.OP_JNZ, FT.OP_JNZ, FT.OP_COUNT, FT.OP_LOADC, FT.OP_LOADC,
     FT.OP_ARITH, FT.OP_ARITH, FT.OP_CALL, FT.OP_CALL, FT.OP_RET, FT.OP_EXIT, FT.OP_VCOUNT, FT.OP_VTRACE,
     FT.OP_VOFF, FT.OP_LOADC_Q, FT.OP_ARITH_POS, FT.OP_ADD, FT.OP_JLT, FT.OP_MOVE, FT.OP_LOADK, FT.OP_RET,
+    FT.OP_CLT, FT.OP_CLT, FT.OP_CNZ, FT.OP_LEAVE,
 ];
+
+const NONE: u32 = 255;
+const SEQS: u64 = 12;
+
+/// Part `j` of fusable sequence `s` (NONE past the end).
+fn seq(s: u64, j: u64) -> u32 {
+    let t: [u32; 4] = match s {
+        0 => [FT.OP_ADD, FT.OP_JLT, NONE, NONE],
+        1 => [FT.OP_LOADC_Q, FT.OP_ADD, NONE, NONE],
+        2 => [FT.OP_MOVE, FT.OP_ADD, FT.OP_CLT, FT.OP_JMP],
+        3 => [FT.OP_CNZ, FT.OP_JMP, FT.OP_LEAVE, NONE],
+        4 => [FT.OP_LOADI, FT.OP_LOADI, FT.OP_LOADI, FT.OP_RET],
+        5 => [FT.OP_ADDI, FT.OP_ADDI, FT.OP_JNZ, NONE],
+        6 => [FT.OP_ADD, FT.OP_ARITH, NONE, NONE],
+        7 => [FT.OP_ARITH_POS, FT.OP_JNZ, FT.OP_RET, NONE],
+        8 => [FT.OP_COUNT, FT.OP_MOVE, FT.OP_LOADC, FT.OP_ADD],
+        9 => [FT.OP_LOADI, FT.OP_CALL, NONE, NONE],
+        10 => [FT.OP_ADD, FT.OP_CLT, FT.OP_JMP, NONE],
+        _ => [FT.OP_ARITH, FT.OP_JNZ, FT.OP_RET, NONE],
+    };
+    t[j]
+}
 
 /// A word with the opcode replaced.
 fn with_op(w: u32, op: u32) -> u32 { FT.with_opcode(w, op) }
@@ -360,10 +412,30 @@ fn generate(r: *Rng, p: *Prog) {
     var starts: [u64; 96] = [0; 96];
     var n: u64 = 0;
     var at: u64 = 0;
-    let want = 1 + r.below(40);
+    var want = 1 + r.below(40);
     while n < want {
-        var op = PICKS[r.below(40)];
+        // Now and then a super's parts in a row, for optimize to fuse.
+        if r.chance(12) and n + 4 < want {
+            let s = r.below(SEQS);
+            var j: u64 = 0;
+            while j < 4 and seq(s, j) != NONE {
+                let o = seq(s, j);
+                let sz = FT.op_size(with_op(0, o));
+                if at + sz > MAX_WORDS - 4 { break; }
+                ops[n] = o;
+                starts[n] = at;
+                at += sz;
+                n += 1;
+                j += 1;
+            }
+            continue;
+        }
+        var op = PICKS[r.below(44)];
         if n + 1 == want and r.chance(90) { op = if r.chance(70) { FT.OP_RET } else { FT.OP_EXIT }; }
+        // `then JMP` ops are followed by a JMP, and that by something.
+        let after_then = n > 0 and (ops[n - 1] == FT.OP_CLT or ops[n - 1] == FT.OP_CNZ);
+        if after_then and r.chance(95) { op = FT.OP_JMP; }
+        if after_then and n + 1 >= want and r.chance(90) { want += 1; }
         let size = FT.op_size(with_op(0, op));
         if at + size > MAX_WORDS - 4 { break; }
         ops[n] = op;
@@ -405,6 +477,9 @@ fn generate(r: *Rng, p: *Prog) {
         }
         else if op == FT.OP_RET { FT.emit.RET(code, a, reg(r, p)); }
         else if op == FT.OP_EXIT { FT.emit.EXIT(code, a, reg(r, p)); }
+        else if op == FT.OP_CLT { FT.emit.CLT(code, a, reg(r, p), reg(r, p)); }
+        else if op == FT.OP_CNZ { FT.emit.CNZ(code, a, reg(r, p)); }
+        else if op == FT.OP_LEAVE { FT.emit.LEAVE(code, a, reg(r, p)); }
         else if op == FT.OP_VCOUNT { FT.emit.VCOUNT(code, a); }
         else if op == FT.OP_VTRACE { FT.emit.VTRACE(code, a); }
         else { FT.emit.VOFF(code, a); }
@@ -418,7 +493,7 @@ fn generate(r: *Rng, p: *Prog) {
         p.fentry[i] = if ok(r, p) { st[r.below(n)] as u32 } else { r.below(p.len + 2) as u32 };
     }
     // Fuse now and then, as the builder would.
-    if r.chance(30) { FT.optimize(code[0..p.len]); }
+    if r.chance(60) { FT.optimize(code[0..p.len]); }
     // Mutations: rewrite opcodes (often into supers), flip bits,
     // replace words.
     if style <= 6 {
