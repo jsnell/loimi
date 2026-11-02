@@ -53,8 +53,10 @@ struct Var {
     force_box: bool,
     /// Number of lambdas that capture it (to detect captures during an init).
     caps: u32,
-    /// The lambda this (letrec) variable is bound to, or null.
+    /// The lambda this (let or letrec) variable is bound to, or null.
     lam: *Lam,
+    /// References (counted after the AST passes, by `reown`).
+    refs: u32,
 }
 
 struct Lam {
@@ -322,6 +324,13 @@ fn Comp.build_inner(c: *Comp, x: V) -> *Node {
             }
             let n = c.node(K.Call);
             n.a = c.build(p.car);
+            // (map f l) and (for-each f l) with one list use the prelude's
+            // one-list versions, which can be inlined.
+            if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
+                and list_len(p.cdr) == 2 and (s.name.eq("map") or s.name.eq("for-each")) {
+                let one = c.ctx.syms.intern(c.heap, if s.name.eq("map") { "%map1" } else { "%for-each1" });
+                n.a.g = c.ctx.global(one);
+            }
             // A builtin that the program never redefines is called directly.
             if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
                 and let Some(id) = value.prim_of(c.ctx.gvals.at(n.a.g as u64))
@@ -812,6 +821,8 @@ fn Comp.let_form(c: *Comp, bindings: V, body: V) -> *Node {
     let mark = c.env.len;
     for i in 0..names.len {
         let v = c.new_var(names.at(i));
+        let init = n.list.at(i);
+        if init.kind == K.Lambda { v.lam = init.lam; }
         n.vars.push(v);
         c.env.push(v);
     }
@@ -1117,6 +1128,9 @@ fn Comp.scan_defs(c: *Comp, x: V) {
 // procedure instead; R7RS makes both an error.
 
 const INLINE_SIZE: u32 = 12;
+/// The limit when an argument is a lambda: the body is copied with the
+/// lambda in place, so calls of it become known (and are inlined in turn).
+const INLINE_SIZE_HO: u32 = 40;
 const INLINE_DEPTH: u32 = 3;
 const TOO_BIG: u32 = 1000000;
 
@@ -1125,7 +1139,10 @@ const TOO_BIG: u32 = 1000000;
 fn inline_size(n: *Node, self_g: u64, self_v: *Var) -> u32 {
     if is_null(n) { return 0; }
     match n.kind {
-        Lambda | Letrec => return TOO_BIG,
+        Lambda => {
+            let b = inline_size(n.lam.body, self_g, self_v);
+            return if b >= TOO_BIG { TOO_BIG } else { b + 1 };
+        }
         GRef => { if n.g as u64 == self_g { return TOO_BIG; } }
         Ref | Set => { if (n.vr as u64) == (self_v as u64) { return TOO_BIG; } }
         _ => {}
@@ -1178,10 +1195,34 @@ fn Comp.copy(c: *Comp, n: *Node, s: *Subst) -> *Node {
     }
     let m = clone_node(n);
     if n.kind == K.Set and let Some(t) = s.find(n.vr) { m.vr = t.vr; }
+    if n.kind == K.Lambda {
+        m.lam = c.copy_lam(n.lam, s);
+        return m;
+    }
+    if n.kind == K.Letrec {
+        for i in 0..n.vars.len {
+            let v = n.vars.at(i);
+            let w = c.fresh_var(v);
+            w.force_box = v.force_box;
+            let r = c.node(K.Ref);
+            r.vr = w;
+            s.from.push(v);
+            s.to.push(r);
+            m.vars.push(w);
+        }
+        for i in 0..n.list.len {
+            let init = c.copy(n.list.at(i), s);
+            if init.kind == K.Lambda and !is_null_lam(n.vars.at(i).lam) { m.vars.at(i).lam = init.lam; }
+            m.list.push(init);
+        }
+        m.a = c.copy(n.a, s);
+        return m;
+    }
     if n.kind == K.Let {
         for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
         for i in 0..n.vars.len {
             let w = c.fresh_var(n.vars.at(i));
+            if m.list.at(i).kind == K.Lambda { w.lam = m.list.at(i).lam; }
             let r = c.node(K.Ref);
             r.vr = w;
             s.from.push(n.vars.at(i));
@@ -1195,6 +1236,27 @@ fn Comp.copy(c: *Comp, n: *Node, s: *Subst) -> *Node {
     m.b = c.copy(n.b, s);
     m.c = c.copy(n.c, s);
     for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
+    m
+}
+
+fn Comp.copy_lam(c: *Comp, l: *Lam, s: *Subst) -> *Lam {
+    let m: *Lam = mem.alloc(1);
+    m.parent = l.parent;
+    m.name = l.name;
+    m.params = mem.Vec.new();
+    m.nparams = l.nparams;
+    m.rest = l.rest;
+    m.free = mem.Vec.new();
+    for i in 0..l.params.len {
+        let p = l.params.at(i);
+        let w = c.fresh_var(p);
+        let r = c.node(K.Ref);
+        r.vr = w;
+        s.from.push(p);
+        s.to.push(r);
+        m.params.push(w);
+    }
+    m.body = c.copy(l.body, s);
     m
 }
 
@@ -1224,6 +1286,12 @@ fn Comp.known(c: *Comp, f: *Node) -> ?(*Lam, u64, *Var) {
 fn Comp.needs_guard(c: *Comp, g: u64) -> bool {
     let Some(f) = c.gform.get(g) else { return true; };
     !(f < c.cur_form or f < c.first_impure)
+}
+
+/// Is `n` a reference to a known top-level procedure that is certainly
+/// bound here (so it can be substituted for a parameter)?
+fn Comp.bound_known(c: *Comp, n: *Node) -> bool {
+    n.kind == K.GRef and c.known(n).is_some() and !c.needs_guard(n.g as u64)
 }
 
 /// May evaluating `n` run program code (call anything but a builtin)?
@@ -1260,7 +1328,11 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     if n.a.kind == K.GRef { n.lam = l; }
     if depth >= INLINE_DEPTH { return n; }
     if l.rest or l.nparams as u64 != n.list.len { return n; }
-    if inline_size(l.body, g, self_v) > INLINE_SIZE { return n; }
+    var limit = INLINE_SIZE;
+    for i in 0..n.list.len {
+        if n.list.at(i).kind == K.Lambda or c.bound_known(n.list.at(i)) { limit = INLINE_SIZE_HO; }
+    }
+    if inline_size(l.body, g, self_v) > limit { return n; }
     // (let ((p arg) ...) body), substituting constants and unassigned
     // locals for unassigned parameters.
     var s = Subst { from: mem.Vec.new(), to: mem.Vec.new() };
@@ -1269,12 +1341,13 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     for i in 0..n.list.len {
         let p = l.params.at(i);
         let a = n.list.at(i);
-        if !p.assigned and (a.kind == K.Const or (a.kind == K.Ref and !a.vr.assigned)) {
+        if !p.assigned and (a.kind == K.Const or (a.kind == K.Ref and !a.vr.assigned) or c.bound_known(a)) {
             s.from.push(p);
             s.to.push(a);
             continue;
         }
         let w = c.fresh_var(p);
+        if a.kind == K.Lambda { w.lam = a.lam; }
         let r = c.node(K.Ref);
         r.vr = w;
         s.from.push(p);
@@ -1429,11 +1502,13 @@ fn contify(n: *Node) {
 fn bind_here(v: *Var, real: *Lam) {
     v.owner = real;
     v.captured = false;
+    v.refs = 0;
 }
 
 /// A reference to `v` from `real`: `v` is free in every lambda from
 /// `real` out to its owner.
 fn note_ref(v: *Var, real: *Lam) {
+    v.refs += 1;
     var l = real;
     while (l as u64) != (v.owner as u64) {
         v.captured = true;
@@ -2212,10 +2287,17 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
 }
 
 /// Evaluate a let's inits into fresh registers and bind its variables.
+/// A lambda bound to a variable that is never used (all its calls were
+/// inlined): no closure is made.
+fn dead_lambda(v: *Var, init: *Node) -> bool {
+    init.kind == K.Lambda and v.refs == 0 and !boxed(v)
+}
+
 fn Gen.bind_let(g: *Gen, n: *Node) {
     let base = g.top();
     for i in 0..n.list.len {
         let r = g.alloc();
+        if dead_lambda(n.vars.at(i), n.list.at(i)) { continue; }
         g.to(n.list.at(i), r);
     }
     for i in 0..n.vars.len {
@@ -2247,7 +2329,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
     for j in 0..n.list.len {
         let v = n.vars.at(j);
         let init = n.list.at(j);
-        if is_cont(init) { continue; }
+        if is_cont(init) or dead_lambda(v, init) { continue; }
         let save = g.top();
         if boxed(v) {
             let r = g.any(init);
@@ -2259,7 +2341,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
             for jj in 0..j + 1 {
                 let w = n.vars.at(jj);
                 let wi = n.list.at(jj);
-                if boxed(w) or wi.kind != K.Lambda or wi.lam.cont { continue; }
+                if boxed(w) or wi.kind != K.Lambda or wi.lam.cont or dead_lambda(w, wi) { continue; }
                 let l = wi.lam;
                 for fi in 0..l.free.len {
                     if (l.free.at(fi) as u64) == (v as u64) {
