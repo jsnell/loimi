@@ -4,13 +4,14 @@ import std.gc;
 import std.io;
 import std.text;
 import value;
-import value.{V, Str, Arr, Table, Proto};
+import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
 
-extern "C" fn fmod(a: f64, b: f64) -> f64;
+extern "C" fn pow(a: f64, b: f64) -> f64;
 
 /// One activation record. `resume` is where this frame continues after
-/// the call it is making returns.
-pub struct Frame { proto: Gc<Proto>, base: *V, resume: *u32 }
+/// the call it is making returns; `nres` is how many results this
+/// frame's caller wants (at least 1). `k` caches cl.proto.consts.
+pub struct Frame { cl: Gc<Closure>, base: *V, resume: *u32, k: *V, nres: u32 }
 
 pub struct Ctx {
     heap: gc.Heap,
@@ -22,20 +23,65 @@ pub struct Ctx {
     globals: Gc<Table>,
     error: V,
     out: text.StrBuf,
+    /// Open upvalues, sorted by stack level, highest first.
+    open: ?Gc<UpVal>,
+    /// Level of the first open upvalue (null when none), so that
+    /// "anything to close at or above here?" is one compare.
+    open_level: *V,
 }
 
-/// GC roots: globals, the pending error, and every active frame's registers.
+/// GC roots: globals, the pending error, open upvalues, and every active
+/// frame's closure and registers.
 pub fn scan_roots(h: *gc.Heap, data: *u8) {
     let c = data as *Ctx;
     gc_mark(h, c.globals);
     gc_mark(h, c.error);
+    if let Some(u) = c.open { gc_mark(h, u); }
     var f = c.frames;
     while f <= c.fp {
-        gc_mark(h, f.proto);
-        let n = f.proto.nregs as u64;
+        gc_mark(h, f.cl);
+        let n = f.cl.proto.nregs as u64;
         for i in 0..n { gc_mark(h, f.base[i]); }
         f = f + 1;
     }
+}
+
+/// The open upvalue for stack slot `level`, created if needed.
+fn find_upval(c: *Ctx, level: *V) -> Gc<UpVal> {
+    var prev: ?Gc<UpVal> = None;
+    var cur = c.open;
+    loop {
+        let Some(u) = cur else { break; };
+        if u.v < level { break; }
+        if u.v == level { return u; }
+        prev = cur;
+        cur = u.next;
+    }
+    let nu = new(&c.heap, UpVal { v: level, closed: V.Nil, next: cur });
+    match prev {
+        Some(pu) => pu.next = Some(nu),
+        None => {
+            c.open = Some(nu);
+            c.open_level = level;
+        }
+    }
+    nu
+}
+
+/// Close every open upvalue at or above `level`.
+fn close_upvals(c: *Ctx, level: *V) {
+    loop {
+        let Some(u) = c.open else { break; };
+        if u.v < level { break; }
+        u.closed = *u.v;
+        u.v = &u.closed;
+        c.open = u.next;
+        u.next = None;
+    }
+    c.open_level = match c.open {
+        Some(u) => u.v,
+        None => 0 as *V,
+    };
 }
 
 /// An error message mentioning the type of `v`: "<msg><type> value".
@@ -49,21 +95,47 @@ fn error(c: *Ctx, msg: str, v: V) -> V {
     V.S(s)
 }
 
+fn iter_error(c: *Ctx, v: V) -> V {
+    var b = text.StrBuf.new();
+    b.push_str("bad argument #1 to 'for iterator' (table expected, got ");
+    b.push_str(value.type_name(v));
+    b.push_str(")");
+    let s = value.new_str(&c.heap, b.as_str());
+    b.free();
+    V.S(s)
+}
+
 fn error_msg(c: *Ctx, msg: str) -> V {
     V.S(value.new_str(&c.heap, msg))
 }
 
+/// Arithmetic outside the fast paths: op 0 add, 1 sub, 2 mul, 3 div,
+/// 4 mod, 5 pow. Int results that overflow become floats.
 fn arith_slow(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
-    let x = value.to_num(a) ?? 0.0;
-    let y = value.to_num(b) ?? 0.0;
-    if value.to_num(a).is_none() { return Err(error(c, "attempt to perform arithmetic on a ", a)); }
-    if value.to_num(b).is_none() { return Err(error(c, "attempt to perform arithmetic on a ", b)); }
+    let Some(x) = value.to_num(a) else { return Err(error(c, "attempt to perform arithmetic on a ", a)); };
+    let Some(y) = value.to_num(b) else { return Err(error(c, "attempt to perform arithmetic on a ", b)); };
+    if let (Int(i), Int(j)) = (a, b) and op == 4 {
+        if j == 0 { return Err(error_msg(c, "attempt to perform 'n%%0'")); }
+        let (i, j) = (i as i64, j as i64);
+        var r = i % j;
+        if r != 0 and (r ^ j) < 0 { r += j; }
+        return Ok(V.Int(r as i32));
+    }
     let r = match op {
         0 => x + y,
         1 => x - y,
         2 => x * y,
         3 => x / y,
-        _ => x - (x / y).floor() * y,
+        4 => {
+            if y == 0.0 {
+                x - x / y * y
+            } else {
+                var m = x - (x / y).floor() * y;
+                if m != 0.0 and (m < 0.0) != (y < 0.0) { m += y; }
+                m
+            }
+        }
+        _ => pow(x, y),
     };
     Ok(V.Num(r))
 }
@@ -100,17 +172,32 @@ fn concat(c: *Ctx, a: V, b: V) -> Result<V, V> {
     Ok(V.S(value.new_str(&c.heap, c.out.as_str())))
 }
 
-fn native(c: *Ctx, id: i32, args: *V, n: u64) -> V {
-    // 0: print
-    c.out.clear();
-    for i in 0..n {
-        if i > 0 { c.out.push('\t'); }
-        value.write_value(&c.out, args[i]);
+fn length(c: *Ctx, v: V) -> Result<V, V> {
+    match v {
+        S(s) => Ok(V.Int(s.data.len as i32)),
+        T(t) => Ok(V.Int(value.table_len(t) as i32)),
+        _ => Err(error(c, "attempt to get length of a ", v)),
     }
-    c.out.push('\n');
-    io.print(c.out.as_str());
+}
+
+/// Built-in functions (until lib.lm exists): 0 is print.
+fn native(h: *gc.Heap, id: i32, args: *V, n: u64) -> Result<V, V> {
+    var b = text.StrBuf.new();
+    for i in 0..n {
+        if i > 0 { b.push('\t'); }
+        value.write_value(&b, args[i]);
+    }
+    b.push('\n');
+    io.print(b.as_str());
+    b.free();
+    let _ = h;
     let _ = id;
-    V.Nil
+    Ok(V.Nil)
+}
+
+/// The single dispatch point for natives. Natives allocate but never collect.
+fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+    native(&c.heap, id, args, n)
 }
 
 pub vm Mini {
@@ -122,12 +209,17 @@ pub vm Mini {
     operand reg = regs[it] verify (it as u32) < proto.nregs;
     operand kst = k[it] verify (it as u64) < proto.consts.data.len;
     operand imm = it;
+    operand simm = it;
     operand callbase = it verify (it as u32) < proto.nregs;
     operand forbase = it verify (it as u32) + 3 < proto.nregs;
+    operand upv = it verify (it as u32) < proto.nupvals;
+    operand child = it verify (it as u64) < proto.protos.data.len;
+    operand level = it verify (it as u32) <= proto.nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
         format ABx { op: 8, a: 8, bx: 16 }
         format AsBx { op: 8, a: 8, sbx: s16 }
         format sJ { op: 8, sj: s24 }
@@ -150,9 +242,9 @@ pub vm Mini {
 
     family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
         generic {
-            if let Some(i) = value.table_find(ctx.globals, name) {
+            if let Some(i) = value.table_find(ctx.globals, name) and let Some(hs) = ctx.globals.hash {
                 cache.slot = i as u32;
-                dst = ctx.globals.slots.data[2 * i + 1];
+                dst = hs.data.ptr[2 * i + 1];
                 become GETGLOBAL_C;
                 next
             }
@@ -162,8 +254,8 @@ pub vm Mini {
         GETGLOBAL_C {
             let g = ctx.globals;
             let i = cache.slot as u64;
-            if likely(i < g.cap) {
-                let slots = g.slots.data.ptr;
+            if likely(i < g.hcap) and let Some(hs) = g.hash {
+                let slots = hs.data.ptr;
                 if slots[2 * i] == name {
                     dst = slots[2 * i + 1];
                     next
@@ -177,9 +269,46 @@ pub vm Mini {
         value.table_set(&ctx.heap, ctx.globals, name, src);
         next
     }
-    op NEWTABLE(dst: reg) : ABC {
+
+    op GETUPVAL(dst: reg, i: upv) : ABC { dst = *fp.cl.upvals.ptr[i].v; next }
+    op SETUPVAL(src: reg, i: upv) : ABC { *fp.cl.upvals.ptr[i].v = src; next }
+    /// R[dst] = a new closure of child prototype `i`, capturing upvalues
+    /// as its descriptors say.
+    op CLOSURE(dst: reg, i: child) : ABx {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        dst = T(value.new_table(&ctx.heap));
+        let parent = fp.cl;
+        let p = parent.proto.protos.data.ptr[i];
+        let n = p.nupvals as u64;
+        let c = new(&ctx.heap, Closure { proto: p }, n);
+        for j in 0..n {
+            let d = p.updesc.data.ptr[j];
+            if d >= 256 {
+                c.upvals.ptr[j] = find_upval(ctx, regs + (d & 255) as u64);
+            } else {
+                c.upvals.ptr[j] = parent.upvals.ptr[d];
+            }
+        }
+        dst = F(c);
+        next
+    }
+    /// Close upvalues at or above R[a].
+    op CLOSE(a: level) : ABC {
+        if ctx.open_level >= regs + a { close_upvals(ctx, regs + a); }
+        next
+    }
+
+    /// R[dst] = a table with room for `narr` array items and `nhash` fields.
+    op NEWTABLE(dst: reg, narr: imm, nhash: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = T(value.new_table_sized(&ctx.heap, narr as u64, nhash as u64));
+        next
+    }
+    /// R[a][batch*50 + i] = R[a + i] for i in 1..n.
+    op SETLIST(a: callbase, n: imm, batch: imm) : ABC {
+        if let T(t) = regs[a] {
+            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            value.table_setlist(&ctx.heap, t, regs + a + 1, n as u64, batch as u64 * 50);
+        }
         next
     }
     op GETFIELD(dst: reg, t: reg, key: kst) : ABC {
@@ -195,17 +324,36 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
+        if let (T(tab), Int(i)) = (t, key) {
+            let u = ((i as i64) - 1) as u64;
+            if u < tab.asize { dst = tab.arr.data.ptr[u]; next }
+        }
         if let T(tab) = t { dst = value.table_get(tab, key); next }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
+        if let (T(tab), Int(i)) = (t, key) {
+            let u = ((i as i64) - 1) as u64;
+            if u < tab.asize { tab.arr.data.ptr[u] = v; next }
+        }
         if let T(tab) = t {
             if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
+            if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
             value.table_set(&ctx.heap, tab, key, v);
             next
         }
         cold { raise error(ctx, "attempt to index a ", t) }
+    }
+    /// Method lookup: R[a+1] = obj; R[a] = obj[key].
+    op SELF(a: callbase, obj: reg, key: kst) : ABC {
+        let o = obj;
+        if let T(tab) = o {
+            regs[a + 1] = o;
+            regs[a] = value.table_get(tab, key);
+            next
+        }
+        cold { raise error(ctx, "attempt to index a ", o) }
     }
 
     // One declaration, three ops.
@@ -223,8 +371,17 @@ pub vm Mini {
             cold { dst = arith_slow(ctx, code, a, b)?; next }
         }
     }
+    /// R[dst] = R[a] + sc (a small signed constant).
+    op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
+        cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
+    }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
-        if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }
+        match (a, b) {
+            (Num(x), Num(y)) => { dst = Num(x / y); next }
+            (Int(x), Int(y)) => { dst = Num(x as f64 / y as f64); next }
+            _ => {}
+        }
         cold { dst = arith_slow(ctx, 3, a, b)?; next }
     }
     op MOD(dst: reg, a: reg, b: reg) : ABC {
@@ -235,6 +392,10 @@ pub vm Mini {
         }
         cold { dst = arith_slow(ctx, 4, a, b)?; next }
     }
+    op POW(dst: reg, a: reg, b: reg) : ABC {
+        dst = arith_slow(ctx, 5, a, b)?;
+        next
+    }
     op NEG(dst: reg, a: reg) : ABC {
         match a {
             Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
@@ -244,6 +405,14 @@ pub vm Mini {
         cold { dst = arith_slow(ctx, 1, Int(0), a)?; next }
     }
     op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
+    op LEN(dst: reg, a: reg) : ABC {
+        if let T(t) = a {
+            let n = t.asize;
+            if n > 0 and t.arr.data.ptr[n - 1] != V.Nil { dst = Int(n as i32); next }
+        }
+        dst = length(ctx, a)?;
+        next
+    }
     op CONCAT(dst: reg, a: reg, b: reg) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
         dst = concat(ctx, a, b)?;
@@ -325,11 +494,40 @@ pub vm Mini {
         }
     }
 
-    /// R[base] = R[base](R[base+1] .. R[base+nargs])
-    op CALL(base: callbase, nargs: imm) : ABC {
+    /// pairs loop: R[a] table, R[a+1] traversal position, R[a+2], R[a+3]
+    /// key and value. Jumps to the body while there is a next entry.
+    op NEXT(a: forbase, target: label) : AsBx {
+        if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
+            let n = value.table_iter(t, i as u64, regs + a + 2);
+            if n != 0 {
+                regs[a + 1] = Int(n as i32);
+                jump target
+            }
+            next
+        }
+        cold { raise iter_error(ctx, regs[a]) }
+    }
+    /// ipairs loop: R[a] table, R[a+1] last index, R[a+2], R[a+3] index and value.
+    op INEXT(a: forbase, target: label) : AsBx {
+        if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
+            let u = i as u64;
+            let v = if u < t.asize { t.arr.data.ptr[u] } else { value.table_get(t, Int(i + 1)) };
+            if v == V.Nil { next }
+            regs[a + 1] = Int(i + 1);
+            regs[a + 2] = Int(i + 1);
+            regs[a + 3] = v;
+            jump target
+        }
+        cold { raise iter_error(ctx, regs[a]) }
+    }
+
+    /// R[base .. base+nres-1] = R[base](R[base+1] .. R[base+nargs]).
+    /// nres is at least 1.
+    op CALL(base: callbase, nargs: imm, nres: imm) : ABC {
         let f = regs[base];
-        if let F(p) = f {
+        if let F(cl) = f {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+            let p = cl.proto;
             let callee = regs + base + 1;
             let n = p.nregs as u64;
             if callee + n > ctx.stack_end or fp + 1 >= ctx.frames_end {
@@ -342,35 +540,74 @@ pub vm Mini {
             }
             fp.resume = pc + 1;
             fp = fp + 1;
-            fp.proto = p;
+            fp.cl = cl;
             fp.base = callee;
-            regs = callee;
+            fp.nres = nres as u32;
             k = p.consts.data.ptr;
+            fp.k = k;
+            regs = callee;
             jump p.code.ptr
         }
         if let Native(id) = f {
             cold {
-                regs[base] = native(ctx, id, regs + base + 1, nargs as u64);
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let v = call_native(ctx, id, regs + base + 1, nargs as u64)?;
+                regs[base] = v;
+                var i: u64 = 1;
+                while i < nres as u64 {
+                    regs[base as u64 + i] = Nil;
+                    i += 1;
+                }
                 next
             }
         }
         cold { raise error(ctx, "attempt to call a ", f) }
     }
-    op RET(src: reg) : ABC {
+    /// Return one value.
+    op RET1(src: reg) : ABC {
         let v = src;
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.frames { exit v }
         *(regs - 1) = v;
+        let want = fp.nres as u64;
+        if unlikely(want > 1) {
+            cold {
+                for i in 0..want - 1 { regs[i] = Nil; }
+                fp = fp - 1;
+                regs = fp.base;
+                k = fp.k;
+                jump fp.resume
+            }
+        }
         fp = fp - 1;
         regs = fp.base;
-        k = fp.proto.consts.data.ptr;
+        k = fp.k;
+        jump fp.resume
+    }
+    /// Return R[a .. a+n-1], adjusted to the number of results wanted.
+    op RETN(a: reg, n: imm) : ABC {
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
+        if fp == ctx.frames { exit a }
+        let want = fp.nres as u64;
+        let src = regs + a.raw as u64;
+        let dst = regs - 1;
+        for i in 0..want {
+            dst[i] = if i < n as u64 { src[i] } else { Nil };
+        }
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.k;
         jump fp.resume
     }
     op RET0() : ABC {
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.frames { exit Nil }
-        *(regs - 1) = Nil;
+        let want = fp.nres as u64;
+        let dst = regs - 1;
+        for i in 0..want { dst[i] = Nil; }
         fp = fp - 1;
         regs = fp.base;
-        k = fp.proto.consts.data.ptr;
+        k = fp.k;
         jump fp.resume
     }
 
@@ -380,13 +617,16 @@ pub vm Mini {
     super EQ_TEST = EQ; TEST;
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
-    super ADD_RET = ADD; RET;
+    super ADD_RET1 = ADD; RET1;
 
-    entry run(c: *Ctx, p: Gc<Proto>) -> V {
+    entry run(c: *Ctx, cl: Gc<Closure>) -> V {
         ctx = c;
+        let p = cl.proto;
         fp = c.frames;
-        fp.proto = p;
+        fp.cl = cl;
         fp.base = c.stack;
+        fp.nres = 1;
+        fp.k = p.consts.data.ptr;
         regs = c.stack;
         for i in 0..p.nregs as u64 { regs[i] = V.Nil; }
         k = p.consts.data.ptr;
@@ -396,7 +636,7 @@ pub vm Mini {
 
     on raise(e: V) {
         // Prefix the message with the line of the failing instruction.
-        let p = fp.proto;
+        let p = fp.cl.proto;
         let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
         var line: u32 = 0;
         if i < p.lines.data.len { line = p.lines.data[i]; }

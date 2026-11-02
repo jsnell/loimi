@@ -35,6 +35,8 @@ fn main() -> i32 {
         globals: globals,
         error: V.Nil,
         out: text.StrBuf.new(),
+        open: None,
+        open_level: 0 as *V,
     };
     ctx.stack_end = ctx.stack + (1 << 20);
     ctx.frames_end = ctx.frames + (1 << 16);
@@ -43,8 +45,9 @@ fn main() -> i32 {
     let print_name = V.S(value.new_str(&ctx.heap, "print"));
     value.table_set(&ctx.heap, ctx.globals, print_name, V.Native(0));
     let proto = compile.compile(&ctx.heap, src);
+    let main_closure = value.new_closure(&ctx.heap, proto);
     ctx.heap.add_scanner(&ctx as *u8, vm.scan_roots);
-    Mini.run(&ctx, proto);
+    Mini.run(&ctx, main_closure);
     if ctx.error != V.Nil {
         var b = text.StrBuf.new();
         b.push_str("error: ");
