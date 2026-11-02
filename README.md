@@ -40,6 +40,8 @@ cargo build --release
 ./target/release/loimi run tests/run/hello.lm          # compile and run
 ./target/release/loimi build examples/mini/main.lm --release -o mini
 ./mini examples/mini/tests/functions.mini              # the Lua-like example
+./target/release/loimi build examples/mini/embed.lm --lib -o libmini.a --header mini.h
+clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host   # Mini embedded in C
 cargo test                                             # all tests
 tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
 bench/run.sh                                           # Loimi VM vs hand-written C
@@ -84,7 +86,8 @@ infrastructure out of macros, compiler extensions, and convention:
   from the design.
 - [`examples/mini/`](examples/mini): a working interpreter for a small
   Lua-like language: lexer, single-pass compiler, register VM with
-  NaN-boxed values, GC-managed strings and tables, generated verifier.
+  NaN-boxed values, GC-managed strings and tables, generated verifier;
+  also built as a C library ([`examples/embed/`](examples/embed)).
 - [`examples/scheme/`](examples/scheme): an R7RS-small subset with proper
   tail calls, flat closures and a register VM.
 - [`bench/`](bench): the dispatch benchmark against hand-written C, and

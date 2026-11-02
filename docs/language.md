@@ -307,7 +307,9 @@ would replace every use of that name in the body.
 ### 1.5 Modules and interop
 
 `import std.gc.{Gc, Heap};`. `extern "C" fn` declares C functions, and
-`export "C"` exposes Loimi functions, which matters for embedding.
+`export "C"` exposes Loimi functions, which matters for embedding (§10):
+in a library build they are the public API, and `--header` declares them
+for C. `bool` crosses both kinds of boundary zero-extended, as C expects.
 
 **Namespaces.** A module's names live in two namespaces:
 
@@ -1178,12 +1180,14 @@ op-pair counters into the handlers and prints them at exit.
 
 ---
 
-## 10. Calls, reentrancy, coroutines
+## 10. Calls, reentrancy, coroutines, embedding
 
 *Design; not yet implemented:* `std.rt` (`FrameStack`, `Fiber`),
 `Mini.call`, and `suspend`. Today a vm's `entry` functions are ordinary
 internal Loimi functions (not C-ABI exports), and the example
-interpreters keep their own frame stacks in vm state.
+interpreters keep their own frame stacks in vm state. Embedding (below)
+is implemented without them: the interpreter wraps its entry in
+`export "C"` functions it writes itself.
 
 - **Guest-to-guest calls** should stay in the loop: push a frame (`std.rt.FrameStack`),
   slide the register window, and `jump`. This uses no C stack, so deep guest
@@ -1197,6 +1201,78 @@ interpreters keep their own frame stacks in vm state.
   Suspending across a host frame is an error (as with Lua's "yield across a
   C-call boundary") unless the coroutine runs on a `std.rt.Fiber`, which has
   its own stack.
+
+### 10.1 Embedding in a C host (implemented)
+
+```sh
+loimi build embed.lm --lib    -o libmini.a  --header mini.h   # static archive
+loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
+```
+
+- **The API is the `export "C"` functions** of the program. A library
+  needs no `main` and gets no `main` wrapper; `os.arg_count()` is 0.
+- **No initialization call.** Every Loimi global has a constant
+  initializer (static data), and the runtime's thread-locals (the
+  shadow-stack top, vm scratch slots, `std.rt` handlers) start zeroed in
+  every thread. A host can call any export from any thread at any time;
+  the interpreter's own state (a heap, its roots) is created by an export
+  such as `mini_new` and must be used by one thread at a time.
+- **Code model.** `--lib` and `--shared` compile with `-fPIC`, so the
+  archive links into PIE executables (the default) and shared objects.
+  Executables keep `-fno-pic`.
+- **TLS.** Runtime thread-locals are initial-exec in executables and
+  `--lib` builds. `--shared` builds default to the local-dynamic model,
+  so the object can be `dlopen`'ed whatever static TLS space is left
+  (`--tls=initial-exec|local-dynamic|global-dynamic` overrides). The
+  costs are in `lowering.md` §4.
+- **The header** (`--header out.h`) declares every export, in source
+  order, with these C types:
+
+  | Loimi | C |
+  |---|---|
+  | `i8`..`u64`, `f32`, `f64`, `bool` | `int8_t`..`uint64_t`, `float`, `double`, `bool` |
+  | `()` result | `void` |
+  | `*u8` | `void *` (Loimi's untyped byte pointer; Loimi has no `const`) |
+  | `*T` | `T *` for any mappable `T` |
+  | `*S`, `S` a struct | `S *`, with `typedef struct S S;` (opaque) |
+  | `?*T`, `?fn(..)` | the pointer; `NULL` is `None` |
+  | `fn(A) -> R` | `R (*)(A)`: a C function pointer, callable from Loimi |
+  | `str` | `loimi_str`, `struct { const char *ptr; size_t len; }`, by value |
+  | `enum E` without payloads | `typedef <tag type> E;` and constants `E_Variant` |
+
+  Everything else is rejected with the reason: structs, tuples, arrays,
+  `?T` and `Result` by value, other slices, enums with payloads, `value`
+  types, and `Gc<T>` (the host would hold a reference the collector
+  cannot see). A `str` parameter must fit in the first six integer
+  argument registers: C passes a 16-byte struct whole, in two registers
+  or on the stack, and LLVM would split one across both. The same checks
+  run on every `--lib`/`--shared` build. `--header` also works on an
+  executable.
+- **Recovering instead of exiting.** A library must not exit the host on
+  a guest error. `std.rt.protect(f, data)` / `std.rt.throw()` unwind out
+  of code with no error path (Mini's parser); see `stdlib.md`, `std.rt`.
+
+**Re-entry.** A C function registered as a native runs inside a
+handler's `cold` block, between GC safepoints: the vm state is not
+synced (`ctx.fp` may be stale) and the handler holds values in
+registers. Calling back into the interpreter from there would need the
+`reenter` effect (sync everything, reload after), and C function
+pointers carry no effects the checker could see. The first version
+therefore **forbids re-entry at run time**: `mini_dostring` called while
+any Mini code runs on the thread (that is, from a native) returns
+`MiniStatus_Reenter`. Natives may use the API calls that allocate but
+never collect: argument and result accessors and the global getters and
+setters, of their own state or another. Supporting re-entry means
+giving the native call `uses reenter` (so the handler syncs before it
+and reloads after) and running a nested loop on the same VM stack above
+the caller's frames (`Mini.call` above), rather than `entry run`'s reset
+to the bottom frame.
+
+The worked example is `examples/mini/embed.lm` (the Mini interpreter as
+a library, reusing `vm.lm`, `compile.lm` and `value.lm` through
+`state.lm`) with `examples/embed/host.c`: two states alive at once,
+globals both ways, C natives with user data, syntax and runtime errors
+with messages, and a GC-stress run through the API.
 
 ---
 

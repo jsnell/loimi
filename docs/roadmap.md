@@ -93,3 +93,18 @@ quickening on/off.
    splicing may want a proper macro design.
 9. **Embedding API.** What the generated C header should look like (opaque
    `Interp*`, value handles, error codes), and whether a C++ wrapper is generated.
+
+   *Decided (first version):* the API is whatever the interpreter writes as
+   `export "C"` functions; `loimi build --lib`/`--shared` builds the library
+   and `--header` declares them (`language.md` §10). Interpreter state is an
+   opaque struct pointer (`MiniState *`), error codes are payload-less enums
+   (a typedef plus `E_Variant` constants), strings are `loimi_str`
+   (pointer and length). There are no value handles: `Gc<T>` and `value`
+   types cannot cross into C, so hosts exchange numbers and strings through
+   accessors (`mini_get_number`, `mini_arg_string`), as Lua's stack API
+   does. No C++ wrapper: the header is `extern "C"`-guarded and usable
+   from C++. Still open: value handles that the GC knows about (a handle
+   table scanned as a root), `const` pointers (Loimi has none, so `*u8` is
+   `void *` and C passes `const` data with a cast), generated
+   `Vm.call`-style entry points, and re-entry from natives (below and
+   `language.md` §10).
