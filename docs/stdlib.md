@@ -323,7 +323,10 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
   and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
 - Stress mode, heap verification, poisoning, and heap snapshots.
 
-**As implemented**: root scanners and sweepers (`Heap.add_scanner`,
+**As implemented**: every object has a 16-byte header (slot size, type
+id, mark bits, and the trailing-array length, which compiled code reads
+at object - 8; a free slot links the next one through the length), so a
+two-word object such as a Lisp pair takes a 32-byte slot. Root scanners and sweepers (`Heap.add_scanner`,
 `add_sweeper`) are `fn(*Heap, *u8)` without effects: they run during a
 collection and must not start one, so a `uses gc` function is rejected.
 The growth policy is `Heap.set_growth(percent, min_heap)`: after a
