@@ -1,0 +1,21 @@
+body0 fin0 fin1 body2 fin2 fin3
+finally 1
+finally 2
+inner
+f3 finally
+caught boom
+00 f f 10 f f 20 f f 
+cleanup
+outer caught 1
+one
+two
+two
+default
+four
+string three
+four
+default
+four
+1
+deep
+5

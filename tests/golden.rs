@@ -276,3 +276,59 @@ fn scheme_programs() {
         panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
     }
 }
+
+/// The MiniJS interpreter (examples/minijs): every NAME.js in
+/// examples/minijs/tests and examples/minijs/tests/conformance must print
+/// exactly NAME.expected (node's output). err_*.js must also exit with a
+/// nonzero status; their .expected holds the output before the uncaught
+/// exception. Run normally and with GC stress.
+#[test]
+fn minijs_programs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let exe = std::env::temp_dir().join(format!("loimi-minijs-{}", std::process::id()));
+    let out = loimi().arg("build").arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building minijs failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let mut programs: Vec<PathBuf> = Vec::new();
+    for dir in ["examples/minijs/tests", "examples/minijs/tests/conformance"] {
+        programs.extend(
+            std::fs::read_dir(root.join(dir))
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "js")),
+        );
+    }
+    programs.sort();
+    let mut failures = Vec::new();
+    for f in &programs {
+        let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+        let expected = std::fs::read(f.with_extension("expected")).unwrap();
+        let should_fail = stem.starts_with("err_");
+        for stress in [false, true] {
+            let mut cmd = limited(&exe);
+            cmd.arg(f);
+            if stress {
+                cmd.arg("stress");
+            }
+            let out = cmd.output().unwrap();
+            let name = format!("{}{}", stem, if stress { " (gc stress)" } else { "" });
+            if out.stdout != expected {
+                failures.push(format!(
+                    "{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}",
+                    name,
+                    String::from_utf8_lossy(&expected),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+                continue;
+            }
+            if should_fail == out.status.success() {
+                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), if should_fail { "nonzero" } else { "0" }, String::from_utf8_lossy(&out.stderr)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&exe);
+    assert!(programs.len() > 50);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
