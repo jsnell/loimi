@@ -1,0 +1,229 @@
+// The regex compiler: syntax tree to Rx bytecode.
+//
+// Layouts (L: labels; `x` is the operand's code):
+//
+//   a|b      SPLIT L1; a; JMP L2; L1: b; L2:
+//   x*       L: SPLIT E; x; JMP L; E:            (x*?: SPLITX E instead)
+//   x+       JMP B; L: SPLIT E; B: x; JMP L; E:  (enters the loop body first)
+//   x?       SPLIT E; x; E:                      (x??: SPLITX E)
+//   x{m,n}   x m times, then n-m times `SPLIT E; x`, all to one E
+//   (x)      SAVE 2k; x; SAVE 2k+1
+//
+// A loop whose body can match the empty string brackets each iteration
+// with `MARK m` ... `LOOP m, L`, which goes round again only if the
+// iteration consumed input (otherwise `(a*)*` would loop forever).
+
+import std.bc;
+import std.mem;
+import syntax;
+import syntax.{Node, Tree, Set, INF};
+import vm.{Rx, Lit};
+
+pub struct Out {
+    words: mem.Vec<u32>,
+    lits: mem.Vec<Lit>,
+    lit_bytes: mem.Vec<u8>,
+    nmarks: u32,
+}
+
+struct C {
+    t: *Tree,
+    code: bc.Code<u32>,
+    out: *Out,
+    /// Fuse runs of literal bytes into LIT (the backtracker wants it,
+    /// the Pike VM steps one byte at a time).
+    use_lit: bool,
+    err: ?str,
+}
+
+/// Most code words a pattern may compile to.
+const MAX_WORDS: u64 = 1 << 18;
+
+pub fn compile(t: *Tree, use_lit: bool, out: *Out) -> ?str {
+    var c = C { t: t, code: bc.Code.new(Rx.op_size, Rx.set_label), out: out, use_lit: use_lit, err: None };
+    c.code.op(Rx.SAVE(0));
+    c.node(t.root);
+    c.code.op(Rx.SAVE(1));
+    c.code.op(Rx.MATCH());
+    if c.err.is_none() {
+        if let Some(e) = c.code.check() { c.err = Some(e.message()); }
+    }
+    if c.err.is_none() {
+        let w = c.code.words();
+        for i in 0..w.len { out.words.push(w[i]); }
+    }
+    c.code.free();
+    c.err
+}
+
+fn C.node_at(c: *C, i: u32) -> Node { c.t.nodes.at(i as u64) }
+
+/// Can node `i` match the empty string?
+pub fn nullable(t: *Tree, i: u32) -> bool {
+    match t.nodes.at(i as u64) {
+        Empty => true,
+        Byte(_) => false,
+        Any => false,
+        Class(_) => false,
+        Bol => true,
+        Eol => true,
+        Group(_, x) => nullable(t, x),
+        Cat(a, b) => nullable(t, a) and nullable(t, b),
+        Alt(a, b) => nullable(t, a) or nullable(t, b),
+        Rep(x, min, _, _) => min == 0 or nullable(t, x),
+    }
+}
+
+/// Add the bytes that can start a match of node `i` to `s`. Returns
+/// whether `i` is nullable (then what follows can start it too).
+pub fn first(t: *Tree, i: u32, s: *Set) -> bool {
+    match t.nodes.at(i as u64) {
+        Empty => true,
+        Byte(b) => { s.add(b); false }
+        Any => { var a = Set.empty(); a.add('\n'); a.invert(); s.union(&a); false }
+        Class(k) => { s.union(t.classes.ptr_at(k as u64)); false }
+        Bol => true,
+        Eol => true,
+        Group(_, x) => first(t, x, s),
+        Cat(a, b) => { if first(t, a, s) { first(t, b, s) } else { false } }
+        Alt(a, b) => { let x = first(t, a, s); let y = first(t, b, s); x or y }
+        Rep(x, min, _, _) => { let n = first(t, x, s); n or min == 0 }
+    }
+}
+
+/// Does every match of node `i` start with `^`?
+pub fn anchored(t: *Tree, i: u32) -> bool {
+    match t.nodes.at(i as u64) {
+        Bol => true,
+        Group(_, x) => anchored(t, x),
+        Cat(a, _) => anchored(t, a),
+        Alt(a, b) => anchored(t, a) and anchored(t, b),
+        _ => false,
+    }
+}
+
+fn C.too_big(c: *C) -> bool {
+    if c.code.pc() > MAX_WORDS {
+        if c.err.is_none() { c.err = Some("pattern too large"); }
+        return true;
+    }
+    c.err.is_some()
+}
+
+fn C.node(c: *C, i: u32) {
+    if c.too_big() { return; }
+    match c.node_at(i) {
+        Empty => {}
+        Byte(b) => { c.code.op(Rx.CHAR(b as u32)); }
+        Any => { c.code.op(Rx.ANY()); }
+        Class(k) => { c.code.op(Rx.CLASS(k)); }
+        Bol => { c.code.op(Rx.BOL()); }
+        Eol => { c.code.op(Rx.EOL()); }
+        Group(k, x) => {
+            c.code.op(Rx.SAVE(2 * k));
+            c.node(x);
+            c.code.op(Rx.SAVE(2 * k + 1));
+        }
+        Cat(_, _) => c.cat(i),
+        Alt(a, b) => {
+            let l1 = c.code.label();
+            let l2 = c.code.label();
+            c.code.jump(Rx.SPLIT(0), l1);
+            c.node(a);
+            c.code.jump(Rx.JMP(0), l2);
+            c.code.bind(l1);
+            c.node(b);
+            c.code.bind(l2);
+        }
+        Rep(x, min, max, greedy) => c.rep(x, min, max, greedy),
+    }
+}
+
+/// Collect the leaves of a tree of Cat nodes, left to right.
+fn C.flatten(c: *C, i: u32, out: *mem.Vec<u32>) {
+    if let Cat(a, b) = c.node_at(i) {
+        c.flatten(a, out);
+        c.flatten(b, out);
+    } else {
+        out.push(i);
+    }
+}
+
+fn C.cat(c: *C, i: u32) {
+    var parts: mem.Vec<u32> = mem.Vec.new();
+    defer parts.free();
+    c.flatten(i, &parts);
+    var k: u64 = 0;
+    while k < parts.len {
+        // A run of two or more literal bytes becomes one LIT.
+        var run: u64 = 0;
+        if c.use_lit {
+            while k + run < parts.len {
+                let Byte(_) = c.node_at(parts.at(k + run)) else { break };
+                run += 1;
+            }
+        }
+        if run >= 2 {
+            let off = c.out.lit_bytes.len as u32;
+            for j in 0..run {
+                let Byte(b) = c.node_at(parts.at(k + j)) else { unreachable };
+                c.out.lit_bytes.push(b);
+            }
+            c.out.lits.push(Lit { off: off, len: run as u32 });
+            c.code.op(Rx.LIT((c.out.lits.len - 1) as u32));
+            k += run;
+        } else {
+            c.node(parts.at(k));
+            k += 1;
+        }
+    }
+}
+
+fn C.new_mark(c: *C) -> ?u32 {
+    if c.out.nmarks >= 255 {
+        if c.err.is_none() { c.err = Some("too many loops that can match the empty string"); }
+        return None;
+    }
+    c.out.nmarks += 1;
+    Some(c.out.nmarks - 1)
+}
+
+/// x* (min_one: x+), greedy or lazy.
+fn C.star(c: *C, x: u32, min_one: bool, greedy: bool) {
+    let empty_body = nullable(c.t, x);
+    let body = c.code.label();
+    if min_one { c.code.jump(Rx.JMP(0), body); }
+    let head = c.code.here();
+    let exit = c.code.label();
+    c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
+    c.code.bind(body);
+    if empty_body {
+        let Some(m) = c.new_mark() else { return };
+        c.code.op(Rx.MARK(m));
+        c.node(x);
+        c.code.jump(Rx.LOOP(m as u8, 0), head);
+    } else {
+        c.node(x);
+        c.code.jump(Rx.JMP(0), head);
+    }
+    c.code.bind(exit);
+}
+
+fn C.rep(c: *C, x: u32, min: u32, max: u32, greedy: bool) {
+    if max == INF {
+        if min == 0 { c.star(x, false, greedy); return; }
+        for _ in 0..(min - 1) as u64 { c.node(x); if c.too_big() { return; } }
+        c.star(x, true, greedy);
+        return;
+    }
+    for _ in 0..min as u64 { c.node(x); if c.too_big() { return; } }
+    if max == min { return; }
+    // Optional copies: each one is only tried if the previous matched.
+    let exit = c.code.label();
+    for _ in 0..(max - min) as u64 {
+        c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
+        c.node(x);
+        if c.too_big() { return; }
+    }
+    c.code.bind(exit);
+}

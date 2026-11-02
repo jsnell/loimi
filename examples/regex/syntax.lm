@@ -1,0 +1,302 @@
+// Regex syntax: pattern text to a tree of nodes.
+//
+// Nodes live in one vector and refer to each other by index. Character
+// classes are 256-bit sets kept in a second vector.
+
+import std.mem;
+
+/// A set of bytes: bit c of w[c >> 6].
+pub struct Set { w: [u64; 4] }
+
+pub fn Set.empty() -> Set { Set { w: [0; 4] } }
+pub fn Set.has(s: *Set, c: u8) -> bool { ((s.w[(c >> 6) as u64] >> (c & 63)) & 1) != 0 }
+pub fn Set.add(s: *Set, c: u8) { s.w[(c >> 6) as u64] = s.w[(c >> 6) as u64] | ((1 as u64) << (c & 63)); }
+pub fn Set.add_range(s: *Set, lo: u8, hi: u8) {
+    var c = lo as u64;
+    while c <= hi as u64 { s.add(c as u8); c += 1; }
+}
+pub fn Set.union(s: *Set, o: *Set) { for i in 0..4 { s.w[i] = s.w[i] | o.w[i]; } }
+pub fn Set.invert(s: *Set) { for i in 0..4 { s.w[i] = s.w[i] ^ 0xFFFFFFFFFFFFFFFF; } }
+pub fn Set.is_full(s: *Set) -> bool {
+    s.w[0] == 0xFFFFFFFFFFFFFFFF and s.w[1] == 0xFFFFFFFFFFFFFFFF
+        and s.w[2] == 0xFFFFFFFFFFFFFFFF and s.w[3] == 0xFFFFFFFFFFFFFFFF
+}
+
+pub const INF: u32 = 0xFFFFFFFF;
+
+pub enum Node {
+    Empty,
+    Byte(u8),
+    /// `.`: any byte but newline.
+    Any,
+    /// Index into the class vector.
+    Class(u32),
+    Bol,
+    Eol,
+    /// Capture group `idx` (1-based) around a node.
+    Group(u32, u32),
+    Cat(u32, u32),
+    Alt(u32, u32),
+    /// node, min, max (INF: unbounded), greedy
+    Rep(u32, u32, u32, bool),
+}
+
+pub struct Tree {
+    nodes: mem.Vec<Node>,
+    classes: mem.Vec<Set>,
+    root: u32,
+    ngroups: u32,
+}
+
+pub fn Tree.free(t: *Tree) { t.nodes.free(); t.classes.free(); }
+
+pub struct Error { msg: str, at: u64 }
+
+struct P {
+    pat: str,
+    pos: u64,
+    t: *Tree,
+    err: ?Error,
+    depth: u32,
+}
+
+fn P.fail(p: *P, msg: str, at: u64) -> u32 {
+    if p.err.is_none() { p.err = Some(Error { msg: msg, at: at }); }
+    0
+}
+
+fn P.node(p: *P, n: Node) -> u32 {
+    p.t.nodes.push(n);
+    (p.t.nodes.len - 1) as u32
+}
+
+fn P.peek(p: *P) -> ?u8 { if p.pos < p.pat.len { Some(p.pat[p.pos]) } else { None } }
+
+/// Parse `pat`. On error, the message and the byte offset Python's `re`
+/// would report (roughly).
+pub fn parse(pat: str) -> Result<Tree, Error> {
+    var t = Tree { nodes: mem.Vec.new(), classes: mem.Vec.new(), root: 0, ngroups: 0 };
+    var p = P { pat: pat, pos: 0, t: &t, err: None, depth: 0 };
+    let root = p.alt();
+    if p.err.is_none() and p.pos < pat.len {
+        // Only an unmatched ')' stops the top-level alternation early.
+        p.fail("unbalanced parenthesis", p.pos);
+    }
+    if let Some(e) = p.err {
+        t.free();
+        return Err(e);
+    }
+    t.root = root;
+    Ok(t)
+}
+
+fn P.alt(p: *P) -> u32 {
+    p.depth += 1;
+    if p.depth > 200 { return p.fail("pattern nested too deeply", p.pos); }
+    var left = p.cat();
+    while p.err.is_none() and p.peek() == Some('|') {
+        p.pos += 1;
+        let right = p.cat();
+        left = p.node(Node.Alt(left, right));
+    }
+    p.depth -= 1;
+    left
+}
+
+fn P.cat(p: *P) -> u32 {
+    var acc: ?u32 = None;
+    while p.err.is_none() {
+        let Some(c) = p.peek() else { break };
+        if c == '|' or c == ')' { break; }
+        let r = p.repeat();
+        acc = match acc {
+            None => Some(r),
+            Some(a) => Some(p.node(Node.Cat(a, r))),
+        };
+    }
+    acc ?? p.node(Node.Empty)
+}
+
+fn is_quant_start(p: *P) -> bool {
+    let Some(c) = p.peek() else { return false };
+    if c == '*' or c == '+' or c == '?' { return true; }
+    if c == '{' { return p.brace_at(p.pos).is_some(); }
+    false
+}
+
+/// If a `{m}`, `{m,}`, `{,n}` or `{m,n}` quantifier starts at `at`:
+/// (min, max, end position). Anything else is a literal `{`, as in Python.
+fn P.brace_at(p: *P, at: u64) -> ?(u32, u32, u64) {
+    var i = at + 1;
+    var lo: u64 = 0;
+    var have_lo = false;
+    while i < p.pat.len and p.pat[i] >= '0' and p.pat[i] <= '9' {
+        lo = lo * 10 + (p.pat[i] - '0') as u64;
+        if lo > 100000 { lo = 100000; }
+        have_lo = true;
+        i += 1;
+    }
+    if i >= p.pat.len { return None; }
+    if p.pat[i] == '}' {
+        if !have_lo { return None; }
+        return Some((lo as u32, lo as u32, i + 1));
+    }
+    if p.pat[i] != ',' { return None; }
+    i += 1;
+    var hi: u64 = 0;
+    var have_hi = false;
+    while i < p.pat.len and p.pat[i] >= '0' and p.pat[i] <= '9' {
+        hi = hi * 10 + (p.pat[i] - '0') as u64;
+        if hi > 100000 { hi = 100000; }
+        have_hi = true;
+        i += 1;
+    }
+    if i >= p.pat.len or p.pat[i] != '}' { return None; }
+    Some((lo as u32, if have_hi { hi as u32 } else { INF }, i + 1))
+}
+
+fn P.repeat(p: *P) -> u32 {
+    let start = p.pos;
+    if is_quant_start(p) { return p.fail("nothing to repeat", start); }
+    let atom = p.atom();
+    if p.err.is_some() { return 0; }
+    var node = atom;
+    var quantified = false;
+    while p.err.is_none() and is_quant_start(p) {
+        if quantified { return p.fail("multiple repeat", p.pos); }
+        let qpos = p.pos;
+        let c = p.pat[p.pos];
+        var min: u32 = 0;
+        var max: u32 = INF;
+        if c == '*' { p.pos += 1; }
+        else if c == '+' { min = 1; p.pos += 1; }
+        else if c == '?' { max = 1; p.pos += 1; }
+        else {
+            let Some((lo, hi, end)) = p.brace_at(p.pos) else { unreachable };
+            if hi < lo { return p.fail("min repeat greater than max repeat", qpos + 1); }
+            min = lo; max = hi; p.pos = end;
+        }
+        if (min != INF and min > 1000) or (max != INF and max > 1000) {
+            return p.fail("repeat count too large (limit 1000)", qpos);
+        }
+        var greedy = true;
+        if p.peek() == Some('?') { greedy = false; p.pos += 1; }
+        else if p.peek() == Some('+') { return p.fail("possessive repeats are not supported", p.pos); }
+        node = p.node(Node.Rep(node, min, max, greedy));
+        quantified = true;
+        // Python accepts `a*?` but then rejects a further quantifier.
+        if is_quant_start(p) { return p.fail("multiple repeat", p.pos); }
+    }
+    node
+}
+
+fn P.atom(p: *P) -> u32 {
+    let start = p.pos;
+    let c = p.pat[p.pos];
+    p.pos += 1;
+    if c == '(' {
+        var cap: u32 = 0;
+        if p.peek() == Some('?') {
+            if p.pos + 1 < p.pat.len and p.pat[p.pos + 1] == ':' {
+                p.pos += 2;
+            } else {
+                return p.fail("unsupported group syntax `(?`", start);
+            }
+        } else {
+            p.t.ngroups += 1;
+            cap = p.t.ngroups;
+        }
+        let inner = p.alt();
+        if p.err.is_some() { return 0; }
+        if p.peek() != Some(')') { return p.fail("missing ), unterminated subpattern", start); }
+        p.pos += 1;
+        if cap == 0 { return inner; }
+        return p.node(Node.Group(cap, inner));
+    }
+    if c == '[' { return p.class(start); }
+    if c == '.' { return p.node(Node.Any); }
+    if c == '^' { return p.node(Node.Bol); }
+    if c == '$' { return p.node(Node.Eol); }
+    if c == '\\' {
+        let Some(e) = p.peek() else { return p.fail("bad escape (end of pattern)", start); };
+        p.pos += 1;
+        var s = Set.empty();
+        if class_escape(e, &s) { return p.class_node(s); }
+        let Some(b) = literal_escape(e) else { return p.fail("bad escape", start); };
+        return p.node(Node.Byte(b));
+    }
+    p.node(Node.Byte(c))
+}
+
+fn P.class_node(p: *P, s: Set) -> u32 {
+    p.t.classes.push(s);
+    p.node(Node.Class((p.t.classes.len - 1) as u32))
+}
+
+/// `\d \w \s` and their negations into `s`; false for other letters.
+fn class_escape(e: u8, s: *Set) -> bool {
+    let lower = if e >= 'A' and e <= 'Z' { e + 32 } else { e };
+    if lower == 'd' { s.add_range('0', '9'); }
+    else if lower == 'w' { s.add_range('a', 'z'); s.add_range('A', 'Z'); s.add_range('0', '9'); s.add('_'); }
+    else if lower == 's' { s.add(' '); s.add('\t'); s.add('\n'); s.add('\r'); s.add(12); s.add(11); }
+    else { return false; }
+    if e != lower { s.invert(); }
+    true
+}
+
+/// The byte an escape stands for: `\n \t \r \f \v \0`, and any
+/// punctuation escaped as itself. ASCII letters and digits are errors
+/// (Python treats them as reserved).
+fn literal_escape(e: u8) -> ?u8 {
+    if e == 'n' { return Some('\n'); }
+    if e == 't' { return Some('\t'); }
+    if e == 'r' { return Some('\r'); }
+    if e == 'f' { return Some(12); }
+    if e == 'v' { return Some(11); }
+    if e == '0' { return Some(0); }
+    if (e >= 'a' and e <= 'z') or (e >= 'A' and e <= 'Z') or (e >= '0' and e <= '9') { return None; }
+    Some(e)
+}
+
+fn P.class(p: *P, start: u64) -> u32 {
+    var s = Set.empty();
+    var negate = false;
+    if p.peek() == Some('^') { negate = true; p.pos += 1; }
+    var first = true;
+    loop {
+        let Some(c) = p.peek() else { return p.fail("unterminated character set", start); };
+        if c == ']' and !first { p.pos += 1; break; }
+        first = false;
+        let item_at = p.pos;
+        p.pos += 1;
+        var lo = c;
+        if c == '\\' {
+            let Some(e) = p.peek() else { return p.fail("unterminated character set", start); };
+            p.pos += 1;
+            var cs = Set.empty();
+            if class_escape(e, &cs) { s.union(&cs); continue; }
+            let Some(b) = literal_escape(e) else { return p.fail("bad escape", item_at); };
+            lo = b;
+        }
+        // A range `lo-hi`, unless the `-` is last.
+        if p.peek() == Some('-') and p.pos + 1 < p.pat.len and p.pat[p.pos + 1] != ']' {
+            p.pos += 1;
+            var hi = p.pat[p.pos];
+            p.pos += 1;
+            if hi == '\\' {
+                let Some(e) = p.peek() else { return p.fail("unterminated character set", start); };
+                p.pos += 1;
+                var cs = Set.empty();
+                if class_escape(e, &cs) { return p.fail("bad character range", item_at); }
+                let Some(b) = literal_escape(e) else { return p.fail("bad escape", p.pos - 2); };
+                hi = b;
+            }
+            if hi < lo { return p.fail("bad character range", item_at); }
+            s.add_range(lo, hi);
+        } else {
+            s.add(lo);
+        }
+    }
+    if negate { s.invert(); }
+    p.class_node(s)
+}

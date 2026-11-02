@@ -1,0 +1,222 @@
+// The backtracking matcher, as a Loimi vm.
+//
+// State: `pc`, the input position `sp`, the input `inp[0..end]` and the
+// top of the backtrack stack `bt`. Everything else (capture slots, the
+// class and literal tables, the stack's bounds) is in the context, the
+// compiled `Regex`.
+//
+// The backtrack stack holds two kinds of records, told apart by the low
+// bit of `tag`: a choice point (`tag` = the pc to resume at, `val` = the
+// input position) and an undo record (`tag` = address of a slot | 1,
+// `val` = the slot's old value), pushed by SAVE and MARK so that
+// backtracking restores captures.
+
+import std.mem;
+import std.text;
+import syntax.{Set};
+
+pub struct Bt { tag: u64, val: i64 }
+
+pub struct Lit { off: u32, len: u32 }
+
+/// What the verifier checks operands against.
+pub struct Limits { nslots: u32, nmarks: u32, nclasses: u32, nlits: u32 }
+
+/// Most backtrack records a match may use (16 bytes each): 4M = 64 MiB.
+pub const BT_LIMIT: u64 = 1 << 22;
+
+pub struct Regex {
+    // ---- The compiled program ----
+    code: Verified<Rx>,
+    words: mem.Vec<u32>,
+    /// The same pattern without LIT instructions, for the Pike VM.
+    pike_code: Verified<Rx>,
+    pike_words: mem.Vec<u32>,
+    lim: Limits,
+    classes: *Set,
+    lits: *Lit,
+    lit_bytes: mem.Vec<u8>,
+    ngroups: u32,
+    /// Bytes that can start a match (all of them if the pattern can
+    /// match the empty string).
+    first: Set,
+    first_all: bool,
+    /// The pattern starts with `^`: a search tries position 0 only.
+    anchored: bool,
+
+    // ---- Match state, reused between matches ----
+    /// 2 * (ngroups + 1) capture slots, then nmarks loop marks.
+    slots: *i64,
+    marks: *i64,
+    bt_base: *Bt,
+    bt_end: *Bt,
+    /// Where the current attempt started, and whether to try later
+    /// positions when it fails.
+    start: u64,
+    searching: bool,
+    /// Steps of the Pike VM, scratch.
+    pike: ?*u8,
+
+    // ---- Errors ----
+    ok: bool,
+    err: text.StrBuf,
+    err_at: i64,
+}
+
+/// Grow the backtrack stack; None past BT_LIMIT.
+fn grow(r: *Regex, top: *Bt) -> ?*Bt {
+    let used = ((top as u64) - (r.bt_base as u64)) / 16;
+    let cap = ((r.bt_end as u64) - (r.bt_base as u64)) / 16;
+    if cap >= BT_LIMIT { return None; }
+    let ncap = cap * 2;
+    r.bt_base = mem.grow(r.bt_base, ncap);
+    r.bt_end = r.bt_base + ncap;
+    Some(r.bt_base + used)
+}
+
+fn is_word(c: u8) -> bool { (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' }
+
+/// The next position at or after `s` whose byte can start a match.
+fn skip_to_first(r: *Regex, input: *u8, s: u64, end: u64) -> u64 {
+    var i = s;
+    while i < end and !r.first.has(input[i]) { i += 1; }
+    i
+}
+
+#[require_verified]
+pub vm Rx {
+    context ctx: *Regex;
+    state { pc: *u32, sp: u64, inp: *u8, end: u64, bt: *Bt }
+
+    verify_context lim: *Limits;
+
+    operand byte = it verify it < 256;
+    operand cls = ctx.classes[it] verify (it as u32) < lim.nclasses display "c{}";
+    operand lit = ctx.lits[it] verify (it as u32) < lim.nlits display "l{}";
+    operand slot = ctx.slots[it] verify (it as u32) < lim.nslots display "s{}";
+    operand mark = ctx.marks[it] verify (it as u32) < lim.nmarks display "m{}";
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format N  { op: 8 }
+        format A  { op: 8, a: 24 }
+        format J  { op: 8, sj: s24 }
+        format AJ { op: 8, a: 8, sj: s16 }
+    }
+
+    /// Resume at the most recent choice point, undoing captures on the
+    /// way. With the stack empty, a search tries the next start position.
+    #[inline(never)]
+    fn backtrack() -> never {
+        loop {
+            if bt == ctx.bt_base {
+                if ctx.searching and !ctx.anchored and ctx.start < end {
+                    var s = ctx.start + 1;
+                    if !ctx.first_all { s = skip_to_first(ctx, inp, s, end); }
+                    if s <= end and (ctx.first_all or s < end) {
+                        ctx.start = s;
+                        sp = s;
+                        jump ctx.code
+                    }
+                }
+                exit Ok(false)
+            }
+            bt = bt - 1;
+            let t = bt.tag;
+            if (t & 1) != 0 {
+                *((t - 1) as *i64) = bt.val;
+            } else {
+                sp = bt.val as u64;
+                let resume = t as *u32;
+                jump resume
+            }
+        }
+    }
+
+    fn grow_stack() -> never {
+        let Some(nb) = grow(ctx, bt) else { fail "backtrack limit exceeded" };
+        bt = nb;
+        redo
+    }
+
+    op CHAR(c: byte) : A {
+        if sp < end and inp[sp] as u64 == c { sp += 1; next }
+        backtrack()
+    }
+    op ANY() : N {
+        if sp < end and inp[sp] != '\n' { sp += 1; next }
+        backtrack()
+    }
+    op CLASS(s: cls) : A {
+        if sp < end and s.has(inp[sp]) { sp += 1; next }
+        backtrack()
+    }
+    op LIT(l: lit) : A {
+        let n = l.len as u64;
+        if end - sp >= n {
+            let p = ctx.lit_bytes.ptr + l.off as u64;
+            var i: u64 = 0;
+            while i < n and p[i] == inp[sp + i] { i += 1; }
+            if i == n { sp += n; next }
+        }
+        backtrack()
+    }
+    op BOL() : N {
+        if sp == 0 { next }
+        backtrack()
+    }
+    /// Python's `$`: the end, or before a newline that ends the input.
+    op EOL() : N {
+        if sp == end or (sp + 1 == end and inp[sp] == '\n') { next }
+        backtrack()
+    }
+    op SAVE(s: slot) : A {
+        if bt == ctx.bt_end { cold { grow_stack() } }
+        bt.tag = ((ctx.slots + s.raw) as u64) | 1;
+        bt.val = s;
+        bt = bt + 1;
+        s = sp as i64;
+        next
+    }
+    op MARK(m: mark) : A {
+        if bt == ctx.bt_end { cold { grow_stack() } }
+        bt.tag = ((ctx.marks + m.raw) as u64) | 1;
+        bt.val = m;
+        bt = bt + 1;
+        m = sp as i64;
+        next
+    }
+    /// The end of an iteration of a loop whose body can match empty: go
+    /// round again only if the iteration consumed input.
+    op LOOP(m: mark, target: label) : AJ {
+        if sp as i64 != m { jump target }
+        next
+    }
+    op JMP(target: label) : J { jump target }
+    /// Try the next instruction first, then `target`.
+    op SPLIT(target: label) : J {
+        if bt == ctx.bt_end { cold { grow_stack() } }
+        bt.tag = target as u64;
+        bt.val = sp as i64;
+        bt = bt + 1;
+        next
+    }
+    /// Try `target` first, then the next instruction.
+    op SPLITX(target: label) : J {
+        if bt == ctx.bt_end { cold { grow_stack() } }
+        bt.tag = (pc + 1) as u64;
+        bt.val = sp as i64;
+        bt = bt + 1;
+        jump target
+    }
+    op MATCH() : N { exit Ok(true) }
+
+    entry exec(r: *Regex, code: Verified<Rx>, input: *u8, n: u64, at: u64) -> Result<bool, str> {
+        ctx = r;
+        inp = input;
+        end = n;
+        sp = at;
+        bt = r.bt_base;
+        jump code
+    }
+}

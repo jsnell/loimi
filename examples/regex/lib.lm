@@ -1,0 +1,218 @@
+// The C API of the regex library (see regex.h after `--header`, and
+// SPEC.md).
+//
+//   loimi build examples/regex/lib.lm --release --lib -o librx.a --header rx.h
+
+import std.mem;
+import std.text;
+import syntax;
+import syntax.{Set};
+import compile;
+import pike;
+import pike.{Pike};
+import vm.{Rx, Regex, Limits, Bt, Lit};
+
+/// Flags for rx_exec.
+pub enum RxFlag: u32 { Search = 1, Pike = 2 }
+
+fn empty_regex() -> Regex {
+    Regex {
+        code: Rx.placeholder(),
+        words: mem.Vec.new(),
+        pike_code: Rx.placeholder(),
+        pike_words: mem.Vec.new(),
+        lim: Limits { nslots: 0, nmarks: 0, nclasses: 0, nlits: 0 },
+        classes: mem.alloc(1),
+        lits: mem.alloc(1),
+        lit_bytes: mem.Vec.new(),
+        ngroups: 0,
+        first: Set.empty(),
+        first_all: true,
+        anchored: false,
+        slots: mem.alloc(1),
+        marks: mem.alloc(1),
+        bt_base: mem.alloc(1024),
+        bt_end: mem.alloc(1),
+        start: 0,
+        searching: false,
+        pike: None,
+        ok: false,
+        err: text.StrBuf.new(),
+        err_at: -1,
+    }
+}
+
+fn set_error(r: *Regex, msg: str, at: i64) {
+    r.ok = false;
+    r.err.clear();
+    r.err.push_str(msg);
+    r.err_at = at;
+}
+
+/// Compile a pattern. Never returns NULL: on an error the result has
+/// rx_ok() false, and rx_error()/rx_error_offset() say why. Free it with
+/// rx_free either way. The pattern is copied; the caller keeps its buffer.
+export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
+    let r: *Regex = mem.alloc(1);
+    *r = empty_regex();
+    mem.release(r.bt_end);
+    r.bt_end = r.bt_base + 1024;
+    let src: str = pat.slice(len);
+    var tree = match syntax.parse(src) {
+        Ok(t) => t,
+        Err(e) => { set_error(r, e.msg, e.at as i64); return r; }
+    };
+    defer tree.free();
+
+    var out = compile.Out { words: mem.Vec.new(), lits: mem.Vec.new(), lit_bytes: mem.Vec.new(), nmarks: 0 };
+    if let Some(e) = compile.compile(&tree, true, &out) {
+        set_error(r, e, -1);
+        out.words.free(); out.lits.free(); out.lit_bytes.free();
+        return r;
+    }
+    var pout = compile.Out { words: mem.Vec.new(), lits: mem.Vec.new(), lit_bytes: mem.Vec.new(), nmarks: 0 };
+    if let Some(e) = compile.compile(&tree, false, &pout) {
+        set_error(r, e, -1);
+        out.words.free(); out.lits.free(); out.lit_bytes.free();
+        pout.words.free(); pout.lits.free(); pout.lit_bytes.free();
+        return r;
+    }
+    pout.lits.free();
+    pout.lit_bytes.free();
+
+    r.ngroups = tree.ngroups;
+    let nslots = 2 * (tree.ngroups + 1);
+    r.lim = Limits { nslots: nslots, nmarks: out.nmarks, nclasses: tree.classes.len as u32, nlits: out.lits.len as u32 };
+    mem.release(r.classes);
+    r.classes = mem.alloc(tree.classes.len + 1);
+    for i in 0..tree.classes.len { r.classes[i] = tree.classes.at(i); }
+    mem.release(r.lits);
+    r.lits = out.lits.ptr;
+    r.lit_bytes = out.lit_bytes;
+    mem.release(r.slots);
+    r.slots = mem.alloc((nslots + out.nmarks) as u64);
+    r.marks = r.slots + nslots as u64;
+    r.words = out.words;
+    r.pike_words = pout.words;
+
+    var f = Set.empty();
+    r.first_all = compile.first(&tree, tree.root, &f) or f.is_full();
+    r.first = f;
+    r.anchored = compile.anchored(&tree, tree.root);
+
+    // Both programs go through the verifier: the handlers index the
+    // slot, class and literal tables without bounds checks.
+    r.code = match Rx.verify(r.words.items(), &r.lim) {
+        Ok(v) => v,
+        Err(e) => { verify_error(r, e); return r; }
+    };
+    var plim = r.lim;
+    plim.nmarks = pout.nmarks;
+    plim.nlits = 0;
+    r.pike_code = match Rx.verify(r.pike_words.items(), &plim) {
+        Ok(v) => v,
+        Err(e) => { verify_error(r, e); return r; }
+    };
+    r.ok = true;
+    r
+}
+
+fn verify_error(r: *Regex, e: Rx.VerifyError) {
+    var b = text.StrBuf.new();
+    b.push_str("internal error: bytecode failed verification: ");
+    e.write(&b);
+    set_error(r, b.as_str(), -1);
+    b.free();
+}
+
+export "C" fn rx_ok(r: *Regex) -> bool { r.ok }
+
+/// The last error (compile or match), "" if none. Valid until the next
+/// call on `r`.
+export "C" fn rx_error(r: *Regex) -> str { r.err.as_str() }
+
+/// Byte offset in the pattern of a syntax error, or -1.
+export "C" fn rx_error_offset(r: *Regex) -> i64 { r.err_at }
+
+/// Number of capture groups (not counting group 0, the whole match).
+export "C" fn rx_groups(r: *Regex) -> u32 { r.ngroups }
+
+/// Match `buf[0..len]` starting at `start`: anchored at `start` (like
+/// Python's `pattern.match(s, start)`), or with RX_SEARCH as
+/// `pattern.search(s, start)`. With RX_PIKE, use the Pike VM instead of
+/// the backtracker.
+///
+/// On a match, writes up to `nspans` (start, end) pairs to `spans`
+/// (2 * nspans int64s): group 0, then each group, -1 for a group that
+/// did not take part. Returns 1 on a match, 0 if none, -1 on an error
+/// (rx_error: the pattern did not compile, or the backtracker ran out of
+/// stack).
+export "C" fn rx_exec(r: *Regex, buf: *u8, len: u64, start: u64, flags: u32, spans: *i64, nspans: u64) -> i32 {
+    if !r.ok { return -1; }
+    if start > len { return 0; }
+    let searching = (flags & 1) != 0;
+    let nslots = 2 * (r.ngroups as u64 + 1);
+    for i in 0..nslots { r.slots[i] = -1; }
+    var found = false;
+    if (flags & 2) != 0 {
+        let p = match r.pike {
+            Some(p) => p as *Pike,
+            None => {
+                let p = Pike.new(r.pike_words.len, nslots + r.lim.nmarks as u64);
+                r.pike = Some(p as *u8);
+                p
+            }
+        };
+        found = pike.run(r, p, buf, len, start, searching);
+    } else {
+        var at = start;
+        if searching and !r.anchored and !r.first_all {
+            at = skip(r, buf, at, len);
+            if at >= len { return 0; }
+        }
+        for i in 0..r.lim.nmarks as u64 { r.marks[i] = -1; }
+        r.start = at;
+        r.searching = searching;
+        match Rx.exec(r, r.code, buf, len, at) {
+            Ok(m) => found = m,
+            Err(msg) => { set_error(r, msg, -1); r.ok = true; return -1; }
+        }
+    }
+    if !found { return 0; }
+    for i in 0..nspans {
+        if i > r.ngroups as u64 { break; }
+        spans[2 * i] = r.slots[2 * i];
+        spans[2 * i + 1] = r.slots[2 * i + 1];
+    }
+    1
+}
+
+fn skip(r: *Regex, input: *u8, s: u64, end: u64) -> u64 {
+    var i = s;
+    while i < end and !r.first.has(input[i]) { i += 1; }
+    i
+}
+
+/// Disassembly of the backtracker's program (RX_PIKE in `flags`: the
+/// Pike VM's). Valid until the next call on `r`.
+export "C" fn rx_disasm(r: *Regex, flags: u32) -> str {
+    r.err.clear();
+    if !r.ok { return r.err.as_str(); }
+    let code = if (flags & 2) != 0 { r.pike_code.words() } else { r.code.words() };
+    Rx.disasm(code, &r.err);
+    r.err.as_str()
+}
+
+/// Free a regex from rx_compile.
+export "C" fn rx_free(r: *Regex) {
+    r.words.free();
+    r.pike_words.free();
+    mem.release(r.classes);
+    mem.release(r.lits);
+    r.lit_bytes.free();
+    mem.release(r.slots);
+    mem.release(r.bt_base);
+    if let Some(p) = r.pike { (p as *Pike).free(); }
+    r.err.free();
+    mem.release(r);
+}

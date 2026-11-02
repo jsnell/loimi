@@ -1,0 +1,186 @@
+// The Pike VM: a breadth-first simulation of the same bytecode, in time
+// O(pattern * input). It is ordinary host code: it reads the words with
+// the vm's generated decoders (Rx.opcode, Rx.A_a, Rx.label, ...), since a
+// vm's handlers can only run the backtracking semantics.
+//
+// Threads are kept in priority order, and a thread is added to a list
+// only once per pc per step, which gives the same leftmost-first answer
+// (and captures) as the backtracker.
+
+import std.mem;
+import syntax.{Set};
+import vm.{Rx, Regex};
+
+struct List { pcs: *u32, caps: *i64, n: u64 }
+
+/// An entry of the explicit stack that follows the epsilon edges:
+/// explore `pc` (slot == NONE), or restore `slots[slot] = val`.
+struct Work { pc: u32, slot: u32, val: i64 }
+
+const NONE: u32 = 0xFFFFFFFF;
+
+pub struct Pike {
+    nw: u64,
+    nsl: u64,
+    a: List,
+    b: List,
+    seen: *u64,
+    gen: u64,
+    cur: *i64,
+    work: mem.Vec<Work>,
+}
+
+fn new_list(nw: u64, nsl: u64) -> List {
+    List { pcs: mem.alloc(nw), caps: mem.alloc(nw * nsl + 1), n: 0 }
+}
+
+pub fn Pike.new(nw: u64, nsl: u64) -> *Pike {
+    let p: *Pike = mem.alloc(1);
+    *p = Pike {
+        nw: nw, nsl: nsl,
+        a: new_list(nw, nsl), b: new_list(nw, nsl),
+        seen: mem.alloc(nw), gen: 0,
+        cur: mem.alloc(nsl + 1),
+        work: mem.Vec.new(),
+    };
+    p
+}
+
+pub fn Pike.free(p: *Pike) {
+    mem.release(p.a.pcs); mem.release(p.a.caps);
+    mem.release(p.b.pcs); mem.release(p.b.caps);
+    mem.release(p.seen); mem.release(p.cur);
+    p.work.free();
+    mem.release(p);
+}
+
+/// Follow the epsilon edges from `pc0` at input position `sp`, with the
+/// slots in `p.cur`, adding every consuming instruction and MATCH reached
+/// to `l` in priority order.
+fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end: u64, nslots: u64) {
+    p.work.clear();
+    p.work.push(Work { pc: pc0 as u32, slot: NONE, val: 0 });
+    while let Some(wk) = p.work.pop() {
+        if wk.slot != NONE { p.cur[wk.slot as u64] = wk.val; continue; }
+        let pc = wk.pc as u64;
+        if p.seen[pc] == p.gen { continue; }
+        p.seen[pc] = p.gen;
+        let w = code[pc];
+        let op = Rx.opcode(w);
+        if op == Rx.OP_JMP {
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+        } else if op == Rx.OP_SPLIT {
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+        } else if op == Rx.OP_SPLITX {
+            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+        } else if op == Rx.OP_SAVE or op == Rx.OP_MARK {
+            var s = Rx.A_a(w);
+            if op == Rx.OP_MARK { s += nslots; }
+            p.work.push(Work { pc: 0, slot: s as u32, val: p.cur[s] });
+            p.cur[s] = sp as i64;
+            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+        } else if op == Rx.OP_LOOP {
+            let s = Rx.AJ_a(w) + nslots;
+            if p.cur[s] != sp as i64 {
+                p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+            } else {
+                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+            }
+        } else if op == Rx.OP_BOL {
+            if sp == 0 { p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 }); }
+        } else if op == Rx.OP_EOL {
+            if sp == end or (sp + 1 == end and input[sp] == '\n') {
+                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+            }
+        } else {
+            // CHAR, ANY, CLASS, MATCH: a thread waits here.
+            l.pcs[l.n] = pc as u32;
+            mem.copy(l.caps + l.n * p.nsl, p.cur, p.nsl);
+            l.n += 1;
+        }
+    }
+}
+
+fn target(w: u32, pc: u64) -> u32 {
+    let Some(off) = Rx.label(w) else { trap() };
+    (pc as i64 + off) as u32
+}
+
+fn reset(p: *Pike) { for i in 0..p.nsl { p.cur[i] = -1; } }
+
+/// Run the Pike VM; on a match, copy the slots to `r.slots` and return true.
+pub fn run(r: *Regex, p: *Pike, input: *u8, end: u64, start: u64, searching: bool) -> bool {
+    let code = r.pike_code.words();
+    let nslots = 2 * (r.ngroups as u64 + 1);
+    let unanchored = searching and !r.anchored;
+    var clist = &p.a;
+    var nlist = &p.b;
+    var matched = false;
+    var sp = start;
+    if unanchored and !r.first_all { sp = skip(r, input, sp, end); }
+    if sp > end or (unanchored and !r.first_all and sp == end) { return false; }
+    p.gen += 1;
+    clist.n = 0;
+    reset(p);
+    p.add(code, clist, 0, input, sp, end, nslots);
+    loop {
+        if clist.n == 0 { break; }
+        p.gen += 1;
+        nlist.n = 0;
+        let c: u8 = if sp < end { input[sp] } else { 0 };
+        var i: u64 = 0;
+        while i < clist.n {
+            let pc = clist.pcs[i] as u64;
+            let w = code[pc];
+            let op = Rx.opcode(w);
+            var ok = false;
+            if op == Rx.OP_MATCH {
+                mem.copy(r.slots, clist.caps + i * p.nsl, nslots);
+                matched = true;
+                break;
+            } else if sp < end {
+                if op == Rx.OP_CHAR { ok = c as u64 == Rx.A_a(w); }
+                else if op == Rx.OP_ANY { ok = c != '\n'; }
+                else if op == Rx.OP_CLASS { ok = r.classes[Rx.A_a(w)].has(c); }
+            }
+            if ok {
+                mem.copy(p.cur, clist.caps + i * p.nsl, p.nsl);
+                p.add(code, nlist, pc + 1, input, sp + 1, end, nslots);
+            }
+            i += 1;
+        }
+        if sp >= end { break; }
+        if !matched and unanchored {
+            var next = sp + 1;
+            if nlist.n == 0 and !r.first_all {
+                // Nothing alive: skip to a byte that can start a match.
+                next = skip(r, input, next, end);
+                if next >= end { break; }
+            }
+            if next == sp + 1 {
+                reset(p);
+                p.add(code, nlist, 0, input, sp + 1, end, nslots);
+            } else {
+                // nlist is empty: start afresh at `next`.
+                sp = next;
+                p.gen += 1;
+                nlist.n = 0;
+                reset(p);
+                p.add(code, nlist, 0, input, sp, end, nslots);
+                let t = clist; clist = nlist; nlist = t;
+                continue;
+            }
+        }
+        let t = clist; clist = nlist; nlist = t;
+        sp += 1;
+    }
+    matched
+}
+
+fn skip(r: *Regex, input: *u8, s: u64, end: u64) -> u64 {
+    var i = s;
+    while i < end and !r.first.has(input[i]) { i += 1; }
+    i
+}
