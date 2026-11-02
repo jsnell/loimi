@@ -1,0 +1,12 @@
+struct P { n: u32 }
+
+vm V {
+    state { pc: *u32 }
+    verify_context p: *P, p: u64;
+    encoding fixed(u32) { format Z { op: 8 } }
+    op RET() : Z { exit 0 }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+
+fn main() {}
+// error: `p` is declared twice in `verify_context`

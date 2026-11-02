@@ -1,7 +1,7 @@
 //! Parsing of `vm` and `value` declarations.
 
 use crate::ast::*;
-use crate::diag::Res;
+use crate::diag::{Diag, Res};
 use crate::lexer::Tok;
 use crate::parser::Parser;
 use crate::vmast::*;
@@ -208,12 +208,23 @@ impl Parser {
                     vm.on_raise = Some(RaiseDecl { param: Param { name: pn, ty }, body });
                 }
                 "verify_context" => {
+                    // `verify_context proto: *Proto, lim: *Limits;`: the
+                    // verifier's parameters after the code, in order (also
+                    // across several declarations).
                     self.bump();
-                    let n = self.ident()?;
-                    self.expect(":")?;
-                    let ty = self.parse_type()?;
+                    loop {
+                        let n = self.ident()?;
+                        self.expect(":")?;
+                        let ty = self.parse_type()?;
+                        if vm.verify_ctx.iter().any(|p: &Param| p.name.name == n.name) {
+                            return Err(Diag::new(n.span, format!("`{}` is declared twice in `verify_context`", n.name)));
+                        }
+                        vm.verify_ctx.push(Param { name: n, ty });
+                        if !self.eat(",") {
+                            break;
+                        }
+                    }
                     self.expect(";")?;
-                    vm.verify_ctx.push(Param { name: n, ty });
                 }
                 "sync" => {
                     self.bump();

@@ -340,6 +340,9 @@ operand upv   = ctx.closure.upvals[it] verify it < proto.nupvals;
 
 `verify` clauses may refer to the `verify_context` declared in the vm
 (typically the function prototype being checked, `verify_context proto: Gc<Proto>;`).
+A verifier can take several context parameters, in one declaration
+(`verify_context proto: *Proto, consts: *Consts;`) or in several; they
+follow the code in `Vm.verify(code, proto, consts)` in declaration order.
 
 If the expression is a place (like `regs[it]`), the operand is assignable:
 `dst = Int(1)` writes the register. `x.raw` gives the undecoded field.
