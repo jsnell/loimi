@@ -119,6 +119,13 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
   `fn Vec<T>.map<U>(v: *Vec<T>, f: fn(T) -> U) -> Vec<U>`.
+- **Variants of generic enums** can be qualified with the enum's name
+  alone: with `enum Lookup<O> { Own(u32), Proto(O, u32), Missing }`,
+  `Lookup.Missing` and `Lookup.Own(i)` take their instance from the
+  expected type (`return Lookup.Missing;` in a function returning
+  `Lookup<O>`), or else from the payload (`Lookup.Proto(2.5, 7)` is a
+  `Lookup<f64>`); `let l = Lookup.Missing;` is an error. In patterns,
+  `Lookup.Own(x)` matches any instance. `mod.Lookup.Missing` works too.
 - **Generic functions as values.** A generic function used where a
   function type is expected gets its type arguments from that type
   (`Pratt.new(peek, ..)`). Explicit type arguments name an instance

@@ -1,0 +1,49 @@
+// Qualified variants of generic enums: `Lookup.Missing`, `Lookup.Own(i)`
+// in expressions and patterns, inside generic code and out. The instance
+// comes from the expected type, or else from the payload.
+import std.io;
+import generic_variants_mod.opt;
+
+enum Lookup<O> { Own(u32), Proto(O, u32), Missing }
+
+fn find<O>(o: O, k: u32) -> Lookup<O> {
+    if k == 0 { return Lookup.Missing; }
+    if k == 1 { return Lookup.Own(k); }
+    let r: Lookup<O> = Lookup.Proto(o, k);
+    r
+}
+
+fn show<O>(l: Lookup<O>) -> i64 {
+    match l {
+        Lookup.Own(x) => x as i64,
+        Lookup.Proto(_, y) => 100 + y as i64,
+        Lookup.Missing => -1,
+    }
+}
+
+fn is_just<T>(m: opt.Maybe<T>) -> bool {
+    match m { opt.Maybe.Just(_) => true, opt.Maybe.Nothing => false }
+}
+
+fn main() {
+    io.print_int(show(find(5 as i64, 0))); io.println("");
+    io.print_int(show(find(true, 1))); io.println("");
+    io.print_int(show(find(5 as u8, 2))); io.println("");
+    let l: Lookup<i64> = Lookup.Missing;
+    io.print_int(show(l)); io.println("");
+    // From the payload: Lookup<f64>.
+    let p = Lookup.Proto(2.5, 7);
+    io.print_int(show(p)); io.println("");
+    if let Lookup.Proto(x, _) = p { io.print_f64(x); io.println(""); }
+    let a: opt.Maybe<i64> = opt.Maybe.Nothing;
+    io.print_bool(is_just(a)); io.println("");
+    io.print_bool(is_just(opt.Maybe.Just(3 as i64))); io.println("");
+}
+// expect: -1
+// expect: 1
+// expect: 102
+// expect: -1
+// expect: 107
+// expect: 2.5
+// expect: false
+// expect: true

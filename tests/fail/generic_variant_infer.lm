@@ -1,0 +1,6 @@
+enum Lookup<O> { Own(u32), Proto(O, u32), Missing }
+
+fn main() {
+    let l = Lookup.Missing;
+}
+// error: cannot infer type parameter `O` of `Lookup.Missing`

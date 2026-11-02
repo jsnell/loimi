@@ -1021,7 +1021,31 @@ impl<'a> Checker<'a> {
                 // Check the qualifier, if any, names the scrutinee type.
                 if path.len() >= 2 && !path[0].name.is_empty() {
                     let qual = &path[path.len() - 2];
-                    let qty = self.resolve_type_name(cx.module, qual)?;
+                    // `mod.Enum.Variant`: the enum is looked up in `mod`.
+                    let qm = match path.len() {
+                        3 => match self.scopes[cx.module].get(&path[0].name) {
+                            Some((Def::Module(t), _)) => *t,
+                            _ => return Err(Diag::new(path[0].span, format!("unknown module `{}`", path[0].name))),
+                        },
+                        _ => cx.module,
+                    };
+                    // `Lookup.Own(i)` for a value of type `Lookup<O>`: a
+                    // generic enum's name stands for any of its instances.
+                    let generic = match self.scopes[qm].get(&qual.name) {
+                        Some((Def::GenericType(g), _)) if self.tenv.iter().all(|(n, _)| *n != qual.name) => Some(*g),
+                        _ => None,
+                    };
+                    let qty = match generic {
+                        Some(g) if self.generics.inst_of.get(ty).is_some_and(|(g2, _)| *g2 == g) => ty.clone(),
+                        Some(g) => {
+                            let gname = self.generics.types[g as usize].name.clone();
+                            return Err(Diag::new(
+                                p.span,
+                                format!("pattern of type `{}` for a value of type `{}`", gname, self.ty_name(ty)),
+                            ));
+                        }
+                        None => self.resolve_type_name(qm, qual)?,
+                    };
                     if qty != *ty {
                         return Err(Diag::new(
                             p.span,
@@ -1907,6 +1931,16 @@ impl<'a> Checker<'a> {
             }
             return self.def_value(def, &name.name, span);
         }
+        if let Some(g) = self.generic_type_path(cx, base) {
+            if let Some(v) = self.generic_variant(cx, g, name, &[], exp, span)? {
+                return Ok(v);
+            }
+            let gname = self.generics.types[g as usize].name.clone();
+            return Err(Diag::new(
+                name.span,
+                format!("no variant `{}` in `{}` (a generic type's functions can only be called)", name.name, gname),
+            ));
+        }
         if let Some(t) = self.type_path(cx, base) {
             if let Some(idx) = self.variant_index(&t, &name.name) {
                 return self.make_variant(cx, &t, idx, &[], span);
@@ -2221,12 +2255,10 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(g) = self.generic_type_path(cx, base) {
-                    let inst = self.instance_from_expected(g, exp);
-                    if let Some(t) = &inst {
-                        if let Some(idx) = self.variant_index(t, &name.name) {
-                            return self.make_variant(cx, &t.clone(), idx, args, span);
-                        }
+                    if let Some(v) = self.generic_variant(cx, g, name, args, exp, span)? {
+                        return Ok(v);
                     }
+                    let inst = self.instance_from_expected(g, exp);
                     let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() else {
                         let gname = self.generics.types[g as usize].name.clone();
                         return Err(Diag::new(
@@ -2308,6 +2340,56 @@ impl<'a> Checker<'a> {
         }
         let call = mk(*ret, TK::Call(Box::new(f), pre), span);
         crate::vmcheck::wrap_effects(self, cx, call)
+    }
+
+    /// `Lookup.Missing`, `Lookup.Own(i)`: a variant of generic enum `g`.
+    /// The instance comes from the expected type, or else from the
+    /// payload arguments. None if `g` has no variant `name`.
+    fn generic_variant(&mut self, cx: &mut FnCx, g: u32, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
+        let gt = &self.generics.types[g as usize];
+        let crate::generics::GenDecl::Enum(ed) = gt.decl.clone() else { return Ok(None) };
+        let Some(vdecl) = ed.variants.iter().find(|v| v.name.name == name.name) else { return Ok(None) };
+        if let Some(t) = self.instance_from_expected(g, exp) {
+            let idx = self.variant_index(&t, &name.name).unwrap();
+            return self.make_variant(cx, &t, idx, args, span).map(Some);
+        }
+        let (module, params, gname) = (gt.module, gt.params.clone(), gt.name.clone());
+        let mut b: Vec<Option<Ty>> = vec![None; params.len()];
+        if vdecl.fields.len() == args.len() {
+            for (ft, a) in vdecl.fields.iter().zip(args) {
+                let env = params.iter().enumerate().map(|(i, p)| (p.clone(), Ty::Param(i as u32))).collect();
+                let pt = self.with_tenv(env, |c| c.resolve_type(module, ft))?;
+                if !crate::generics::contains_param(&pt, &self.generics) {
+                    continue;
+                }
+                // Check a clone to learn the type; the argument is checked again.
+                let mut probe = FnCx::new(cx.module, cx.ret.clone());
+                probe.scopes = cx.scopes.clone();
+                probe.locals = cx.locals.clone();
+                probe.vm = cx.vm.clone();
+                if let Ok(v) = self.expr(&mut probe, a, None) {
+                    self.unify(&pt, &v.ty, &mut b);
+                }
+            }
+        }
+        let mut targs = Vec::new();
+        for (i, t) in b.into_iter().enumerate() {
+            match t {
+                Some(t) => targs.push(t),
+                None => {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "cannot infer type parameter `{}` of `{}.{}`: use it where a `{}<..>` is expected",
+                            params[i], gname, name.name, gname
+                        ),
+                    ))
+                }
+            }
+        }
+        let t = self.instantiate_type(g, targs, span)?;
+        let idx = self.variant_index(&t, &name.name).unwrap();
+        self.make_variant(cx, &t, idx, args, span).map(Some)
     }
 
     /// `Vec` (a generic type named in expression position).
