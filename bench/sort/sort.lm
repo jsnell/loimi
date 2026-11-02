@@ -1,0 +1,170 @@
+// Sort comparator benchmark: 2M u64 values sorted by `x ^ salt`, with the
+// same stable merge sort (std.mem.sort_by's algorithm) called in several
+// ways. The comparison is cheap and the accesses sequential, so the cost
+// of calling the comparator shows. (Sorting indices by a big key table,
+// the random loads dominate and all modes run equally fast.)
+//
+// Run `sort MODE`; MODE is one of
+//   direct      a copy with the comparison written in (the floor)
+//   closure     mem.sort_by with a closure capturing `salt`
+//   plainfn     mem.sort_by with a plain function (through a trampoline)
+//   fnptr       a copy taking `fn(*u64, *u64) -> i32`, `salt` in a global
+//   closure-ni  a #[inline(never)] copy taking the closure
+//   plainfn-ni  the same copy taking the plain function
+//   fnptr-ni    a #[inline(never)] copy of `fnptr`
+// The -ni copies are also called from a second site with another
+// comparator, so LLVM can neither inline them nor propagate a constant
+// comparator into them: their comparator calls stay indirect. The others
+// are what a program gets by default: LLVM inlines the sort into its
+// caller and then the comparator into the sort.
+// Prints the CPU time of the sort in microseconds and a checksum.
+import std.io;
+import std.os;
+import std.mem;
+import std.hash;
+
+extern "C" fn clock() -> i64;
+
+var SALT: u64 = 0;
+
+fn cmp_global(a: *u64, b: *u64) -> i32 { cmpk(*a ^ SALT, *b ^ SALT) }
+fn cmp_desc(a: *u64, b: *u64) -> i32 { cmpk(*b, *a) }
+fn cmpk(x: u64, y: u64) -> i32 { if x < y { -1 } else if x > y { 1 } else { 0 } }
+
+fn main() {
+    let mode = os.arg(1) ?? "closure";
+    let n: u64 = 2000000;
+    let vals: *u64 = mem.alloc(n);
+    var x: u64 = 88172645463325252;
+    for i in 0..n {
+        x = x ^ (x << 13); x = x ^ (x >> 7); x = x ^ (x << 17);
+        vals[i] = x;
+    }
+    let salt: u64 = 0x5555;
+    SALT = salt;
+    // The second call sites of the -ni copies.
+    var small: [u64; 64] = [0; 64];
+    for i in 0..64 { small[i] = (i * 7919) as u64 % 64; }
+    if mode.eq("closure-ni") or mode.eq("plainfn-ni") {
+        sort_blk(&small[0], 64, |a, b| cmpk(*b, *a));
+    } else if mode.eq("fnptr-ni") {
+        sort_fnp(&small[0], 64, cmp_desc);
+    }
+    let t0 = clock();
+    if mode.eq("closure") {
+        mem.sort_by(vals, n, |a, b| cmpk(*a ^ salt, *b ^ salt));
+    } else if mode.eq("plainfn") {
+        mem.sort_by(vals, n, cmp_global);
+    } else if mode.eq("fnptr") {
+        sort_fn(vals, n, cmp_global);
+    } else if mode.eq("closure-ni") {
+        sort_blk(vals, n, |a, b| cmpk(*a ^ salt, *b ^ salt));
+    } else if mode.eq("plainfn-ni") {
+        sort_blk(vals, n, cmp_global);
+    } else if mode.eq("fnptr-ni") {
+        sort_fnp(vals, n, cmp_global);
+    } else {
+        sort_direct(vals, n, salt);
+    }
+    let t1 = clock();
+    var check: u64 = 0;
+    for i in 0..n {
+        if i > 0 and (vals[i - 1] ^ salt) > (vals[i] ^ salt) { io.println("not sorted"); }
+        check = check *% 31 +% vals[i];
+    }
+    io.print(mode); io.print(" "); io.print_int(t1 - t0); io.print(" us, check "); io.print_int(check as i64); io.println("");
+}
+
+#[inline(never)]
+fn sort_blk(p: *u64, n: u64, cmp: block fn(*u64, *u64) -> i32) { mem.sort_by(p, n, cmp); }
+
+#[inline(never)]
+fn sort_fnp(p: *u64, n: u64, cmp: fn(*u64, *u64) -> i32) { sort_fn(p, n, cmp); }
+
+// ── fn pointer copy ─────────────────────────────────────────────────────
+fn sort_fn(p: *u64, n: u64, cmp: fn(*u64, *u64) -> i32) {
+    let run: u64 = 16;
+    var lo: u64 = 0;
+    while lo < n {
+        let hi = if lo + run < n { lo + run } else { n };
+        var i = lo + 1;
+        while i < hi {
+            let x = p[i];
+            var j = i;
+            while j > lo and cmp(&x, p + (j - 1)) < 0 { p[j] = p[j - 1]; j -= 1; }
+            p[j] = x;
+            i += 1;
+        }
+        lo = hi;
+    }
+    if n <= run { return; }
+    let tmp: *u64 = mem.alloc(n);
+    var src = p;
+    var dst = tmp;
+    var w = run;
+    while w < n {
+        var l: u64 = 0;
+        while l < n {
+            let mid = if l + w < n { l + w } else { n };
+            let hi = if l + 2 * w < n { l + 2 * w } else { n };
+            var i = l;
+            var j = mid;
+            var k = l;
+            while k < hi {
+                if i < mid and (j >= hi or cmp(src + i, src + j) <= 0) { dst[k] = src[i]; i += 1; } else { dst[k] = src[j]; j += 1; }
+                k += 1;
+            }
+            l = hi;
+        }
+        let t = src;
+        src = dst;
+        dst = t;
+        w *= 2;
+    }
+    if src != p { mem.copy(p, src, n); }
+    mem.release(tmp);
+}
+
+// ── comparison written in ──────────────────────────────────────────────
+fn sort_direct(p: *u64, n: u64, salt: u64) {
+    let run: u64 = 16;
+    var lo: u64 = 0;
+    while lo < n {
+        let hi = if lo + run < n { lo + run } else { n };
+        var i = lo + 1;
+        while i < hi {
+            let x = p[i];
+            var j = i;
+            while j > lo and (x ^ salt) < (p[j - 1] ^ salt) { p[j] = p[j - 1]; j -= 1; }
+            p[j] = x;
+            i += 1;
+        }
+        lo = hi;
+    }
+    if n <= run { return; }
+    let tmp: *u64 = mem.alloc(n);
+    var src = p;
+    var dst = tmp;
+    var w = run;
+    while w < n {
+        var l: u64 = 0;
+        while l < n {
+            let mid = if l + w < n { l + w } else { n };
+            let hi = if l + 2 * w < n { l + 2 * w } else { n };
+            var i = l;
+            var j = mid;
+            var k = l;
+            while k < hi {
+                if i < mid and (j >= hi or (src[i] ^ salt) <= (src[j] ^ salt)) { dst[k] = src[i]; i += 1; } else { dst[k] = src[j]; j += 1; }
+                k += 1;
+            }
+            l = hi;
+        }
+        let t = src;
+        src = dst;
+        dst = t;
+        w *= 2;
+    }
+    if src != p { mem.copy(p, src, n); }
+    mem.release(tmp);
+}
