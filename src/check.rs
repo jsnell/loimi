@@ -1158,6 +1158,8 @@ impl<'a> Checker<'a> {
                 }
                 TPK::Bool(*b)
             }
+            // `()` matches the unit value, as in `Ok(())`.
+            PatKind::Tuple(ps) if ps.is_empty() && *ty == Ty::Unit => TPK::Wild,
             PatKind::Tuple(ps) => {
                 let Ty::Tuple(ts) = ty else {
                     return Err(Diag::new(p.span, format!("tuple pattern for a value of type `{}`", self.ty_name(ty))));

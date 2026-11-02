@@ -1,0 +1,30 @@
+// `()` is a pattern for the unit value: `Ok(())`, `Some(())`, `let () = ..`.
+// It used to be rejected as "tuple pattern for a value of type `()`".
+import std.io;
+
+fn check(x: i64) -> Result<(), str> {
+    if x >= 0 { Ok(()) } else { Err("negative") }
+}
+
+fn main() {
+    match check(1) {
+        Ok(()) => io.println("ok"),
+        Err(e) => io.println(e),
+    }
+    match check(-1) {
+        Ok(()) => io.println("ok"),
+        Err(e) => io.println(e),
+    }
+    if let Ok(()) = check(2) { io.println("if let ok"); }
+    let u: ?() = Some(());
+    if let Some(()) = u { io.println("some unit"); }
+    let () = ();
+    let pairs = ((), 3);
+    let ((), n) = pairs;
+    io.print_int(n); io.println("");
+}
+// expect: ok
+// expect: negative
+// expect: if let ok
+// expect: some unit
+// expect: 3
