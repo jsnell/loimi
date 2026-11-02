@@ -2,8 +2,8 @@
 // Host code that reads code words sees the real words while the JIT
 // holds the code: compiled instructions' words are enter words, which
 // `V.real_word` maps back, and which the generated readers (disasm,
-// op_name, op_size, label, set_label, field getters, operand metadata,
-// verify) map themselves. The output is the same with the JIT on and
+// op_name, op_size, label, set_label, field getters, operand metadata
+// and names, verify) map themselves. The output is the same with the JIT on and
 // off (whether words were enter words goes to stderr); before the fix,
 // every compiled word printed as `<invalid ..>` and verify failed.
 import std.io;
@@ -49,6 +49,8 @@ fn show(ws: []u32, p: Gc<Proto>, b: *text.StrBuf) {
         b.push_int(V.op_size(w) as i64);
         b.push_str(" operands=");
         b.push_int(V.operand_count(w) as i64);
+        b.push_str(" first=");
+        b.push_str(V.operand_name(w, 0));
         b.push_str(" a=");
         b.push_int(V.ABC_a(w) as i64);
         match V.label(w) {
@@ -112,12 +114,12 @@ fn main() {
 // expect:     3  ADD_Q dst=r0 a=r0 b=r2 [cache n=100]
 // expect:     5  JLT a=r0 b=r1 off -> 3
 // expect:     6  RET src=r0
-// expect: 0 LOADI size=1 operands=2 a=0
-// expect: 1 LOADI size=1 operands=2 a=1
-// expect: 2 LOADI size=1 operands=2 a=2
-// expect: 3 ADD_Q size=2 operands=3 a=0
-// expect: 4 <invalid> size=1 operands=0 a=0
-// expect: 5 JLT size=1 operands=3 a=0 label=-2
-// expect: 6 RET size=1 operands=1 a=0
+// expect: 0 LOADI size=1 operands=2 first=dst a=0
+// expect: 1 LOADI size=1 operands=2 first=dst a=1
+// expect: 2 LOADI size=1 operands=2 first=dst a=2
+// expect: 3 ADD_Q size=2 operands=3 first=dst a=0
+// expect: 4 <invalid> size=1 operands=0 first= a=0
+// expect: 5 JLT size=1 operands=3 first=a a=0 label=-2
+// expect: 6 RET size=1 operands=1 first=src a=0
 // expect: verify ok
 // expect: same

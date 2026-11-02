@@ -874,6 +874,9 @@ fn generate_verifier_types(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
         let arms: Vec<String> = o.fields.iter().enumerate().map(|(j, f)| format!("{} => \"{}\"", j, f.0)).collect();
         (o.opcode, format!("match i {{ {}, _ => \"\" }}", arms.join(", ")))
     });
+    // No `real_let`: `base_op` maps the JIT's enter words to the real
+    // word itself, so an enter word answers for its real op (the
+    // `operand_*` tables' `real_let` is redundant for the same reason).
     match_fn(&mut s, &format!("{vis}fn {n}__operand_name(w: {w}, i: u64) -> str"), &format!("match {n}__base_op(w)"), names, "_ => \"\"");
     let _ = writeln!(s, "{vis}fn {n}__check_name(i: u64) -> str {{ match i {{");
     for (i, (name, _)) in v.checks.iter().enumerate() {
