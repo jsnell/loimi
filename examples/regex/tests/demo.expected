@@ -16,6 +16,8 @@ pattern (\w+)@(\w+)\.com: 2 groups
     9  SAVE_MATCH
     9    SAVE s=s1
    10    MATCH
+(?:a|b)*c? on 5M bytes: rc=-1 error='backtrack limit exceeded'
+(?:a|b)*c? on 5M bytes, Pike VM: rc=1 span=0,5000000
 compile a(b      ok=0 error='missing ), unterminated subpattern' at 1
 compile *a       ok=0 error='nothing to repeat' at 0
 compile [z-a]    ok=0 error='bad character range' at 1

@@ -93,6 +93,19 @@ pub fn first(t: *Tree, i: u32, s: *Set) -> bool {
     }
 }
 
+/// A byte that every match of node `i` contains, if there is one that
+/// is easy to find (a literal byte not under an alternation or an
+/// optional repeat). A search first checks that the input has it.
+pub fn required(t: *Tree, i: u32) -> ?u8 {
+    match t.nodes.at(i as u64) {
+        Byte(b) => Some(b),
+        Group(_, x) => required(t, x),
+        Cat(a, b) => if let Some(x) = required(t, b) { Some(x) } else { required(t, a) },
+        Rep(x, min, _, _) => if min > 0 { required(t, x) } else { None },
+        _ => None,
+    }
+}
+
 /// Does every match of node `i` start with `^`?
 pub fn anchored(t: *Tree, i: u32) -> bool {
     match t.nodes.at(i as u64) {
@@ -253,9 +266,18 @@ fn C.rep(c: *C, x: u32, min: u32, max: u32, greedy: bool) {
     for _ in 0..min as u64 { c.node(x); if c.too_big() { return; } }
     if max == min { return; }
     // Optional copies: each one is only tried if the previous matched.
+    // If x can match empty, an optional copy after the first is only
+    // tried if the previous one consumed input (sre's rule, as in star).
     let exit = c.code.label();
-    for _ in 0..(max - min) as u64 {
+    var mark: ?u32 = None;
+    if nullable(c.t, x) {
+        let Some(m) = c.new_mark() else { return };
+        mark = Some(m);
+    }
+    for i in 0..(max - min) as u64 {
+        if let Some(m) = mark and i > 0 { c.code.jump(Rx.NOPROG(m as u8, 0), exit); }
         c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
+        if let Some(m) = mark { c.code.op(Rx.MARK(m)); }
         c.node(x);
         if c.too_big() { return; }
     }

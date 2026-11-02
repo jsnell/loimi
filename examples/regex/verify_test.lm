@@ -1,0 +1,43 @@
+// The generated verifier against hand-made bad programs: each must be
+// rejected, with the reason printed. (rx_compile only ever verifies the
+// compiler's own output, which is always accepted.)
+//
+//   loimi run examples/regex/verify_test.lm
+
+import std.io;
+import std.text;
+import vm.{Rx, Limits};
+
+fn check(name: str, code: []u32, lim: *Limits) {
+    var b = text.StrBuf.new();
+    b.push_str(name);
+    b.push_str(": ");
+    match Rx.verify(code, lim) {
+        Ok(_) => b.push_str("accepted"),
+        Err(e) => e.write(&b),
+    }
+    io.println(b.as_str());
+    b.free();
+}
+
+fn main() {
+    var lim = Limits { nslots: 2, nmarks: 1, nclasses: 1, nlits: 0 };
+    var good: [u32; 4] = [Rx.SAVE(0), Rx.CLASS(0), Rx.SAVE(1), Rx.MATCH()];
+    check("good", good[..], &lim);
+    var slot: [u32; 3] = [Rx.SAVE(0), Rx.SAVE(7), Rx.MATCH()];
+    check("slot out of range", slot[..], &lim);
+    var cls: [u32; 2] = [Rx.CLASS(3), Rx.MATCH()];
+    check("class out of range", cls[..], &lim);
+    var lit: [u32; 2] = [Rx.LIT(0), Rx.MATCH()];
+    check("no literals", lit[..], &lim);
+    var byte: [u32; 2] = [Rx.CHAR(300), Rx.MATCH()];
+    check("byte > 255", byte[..], &lim);
+    var jump: [u32; 3] = [Rx.SPLIT(5), Rx.CHAR(97), Rx.MATCH()];
+    check("jump out of the code", jump[..], &lim);
+    var off: [u32; 2] = [Rx.SAVE(0), Rx.CHAR(97)];
+    check("runs off the end", off[..], &lim);
+    var bad: [u32; 2] = [0xFF, Rx.MATCH()];
+    check("bad opcode", bad[..], &lim);
+    var mark: [u32; 3] = [Rx.MARK(0), Rx.LOOP(1, -1), Rx.MATCH()];
+    check("mark out of range", mark[..], &lim);
+}

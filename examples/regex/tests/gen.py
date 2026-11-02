@@ -10,11 +10,13 @@ pattern does not compile), `NOMATCH`, or the spans of group 0..n as
 
 Hand-written cases come from cases.txt (one `MODE<TAB>PATTERN<TAB>SUBJECT`
 per line, with Python escapes in SUBJECT). Random cases: patterns over a
-small alphabet built from the supported syntax, subjects over `abc\\n`,
-from a fixed seed, sizes capped.
+small alphabet built from the supported syntax, subjects over `abc1 \\n`
+(one in ten up to 3000 bytes), from a fixed seed, sizes capped. Cases
+that take Python over a second are dropped.
 """
 import random
 import re
+import signal
 import sys
 import warnings
 
@@ -60,8 +62,17 @@ def rand_pat(rng, depth=0):
 
 
 def rand_subj(rng):
-    n = rng.randint(0, 12)
+    # Mostly short; one in ten long enough to grow the backtrack stack.
+    n = rng.randint(0, 12) if rng.random() < 0.9 else rng.randint(100, 3000)
     return bytes(rng.choice(b"aaabbc\n1 ") for _ in range(n))
+
+
+class Slow(Exception):
+    pass
+
+
+def on_alarm(*_):
+    raise Slow()
 
 
 def unescape(s):
@@ -89,10 +100,20 @@ def main():
     rng = random.Random(seed)
     for _ in range(nrand):
         cases.append((rng.choice(["search", "search", "match"]), rand_pat(rng), rand_subj(rng)))
+    # Random patterns on long subjects can backtrack exponentially in
+    # Python too: drop a case that takes Python over a second.
+    signal.signal(signal.SIGALRM, on_alarm)
     with open(out_cases, "w") as c, open(out_exp, "w") as e:
         for mode, pat, subj in cases:
+            signal.alarm(1)
+            try:
+                r = expect(mode, pat, subj)
+            except Slow:
+                continue
+            finally:
+                signal.alarm(0)
             c.write("%s %s %s\n" % (mode, hx(pat), hx(subj)))
-            e.write(expect(mode, pat, subj) + "\n")
+            e.write(r + "\n")
 
 
 main()

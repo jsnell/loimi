@@ -108,6 +108,13 @@ fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end:
         } else if op == Rx.OP_UNMARK {
             let m = Rx.A_a(w);
             p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask & (((1 as u64) << m) ^ 0xFFFFFFFFFFFFFFFF) });
+        } else if op == Rx.OP_NOPROG {
+            let m = Rx.AJ_a(w);
+            if (mask & ((1 as u64) << m)) != 0 {
+                p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
+            } else {
+                p.work.push(next);
+            }
         } else if op == Rx.OP_LOOP {
             let m = Rx.AJ_a(w);
             if (mask & ((1 as u64) << m)) == 0 {

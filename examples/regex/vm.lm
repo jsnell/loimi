@@ -42,6 +42,8 @@ pub struct Regex {
     /// match the empty string).
     first: Set,
     first_all: bool,
+    /// A byte every match contains, if the compiler found one.
+    required: ?u8,
     /// The pattern starts with `^`: a search tries position 0 only.
     anchored: bool,
 
@@ -235,6 +237,12 @@ pub vm Rx {
     /// round again only if the iteration consumed input.
     op LOOP(m: mark, target: label) : AJ {
         if sp as i64 != m { jump target }
+        next
+    }
+    /// Between optional copies of a bounded repeat: stop repeating if
+    /// the last copy consumed nothing.
+    op NOPROG(m: mark, target: label) : AJ {
+        if sp as i64 == m { jump target }
         next
     }
     op JMP(target: label) : J { jump target }

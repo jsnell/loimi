@@ -34,15 +34,17 @@ BENCHES = [
     ("alt-heavy", rb"(?:fox|dog|cat|bird|lazy)\s(?:over|jumps|end)", 0),
     ("dot-star", rb"x9.*end", 0),
     ("pathological", rb"(a*)*b", 1),
+    ("patho-alt", rb"(a|aa)+$", 2),
 ]
 
 n = int(sys.argv[1]) if len(sys.argv) > 1 else 4 << 20
 k = int(sys.argv[2]) if len(sys.argv) > 2 else 22
 text = gen_text(n)
 path = b"a" * k
+path2 = b"a" * 28 + b"b"
 print("%-14s %10s %10s" % ("bench", "matches", "python-re"))
 for name, pat, which in BENCHES:
-    t = path if which else text
+    t = path if which == 1 else path2 if which == 2 else text
     r = re.compile(pat)
     best = 1e9
     for _ in range(3):

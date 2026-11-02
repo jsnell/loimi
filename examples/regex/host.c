@@ -57,6 +57,25 @@ static int demo(void) {
     printf("%.*s", (int)d.len, d.ptr);
     rx_free(re);
 
+    /* The backtracker's stack is capped (vm.lm, BT_LIMIT): each `(?:a|b)`
+     * iteration leaves a choice point, and 5M of them do not fit. The
+     * Pike VM needs no stack. */
+    {
+        size_t n = 5000000;
+        char *big = malloc(n);
+        for (size_t i = 0; i < n; i++) big[i] = "ab"[i & 1];
+        const char *p = "(?:a|b)*c?";
+        re = rx_compile((void *)p, strlen(p));
+        int64_t sp[2];
+        int rc = rx_exec(re, big, n, 0, 0, sp, 1);
+        loimi_str e = rx_error(re);
+        printf("%s on 5M bytes: rc=%d error='%.*s'\n", p, rc, (int)e.len, e.ptr);
+        rc = rx_exec(re, big, n, 0, RX_PIKE, sp, 1);
+        printf("%s on 5M bytes, Pike VM: rc=%d span=%lld,%lld\n", p, rc, (long long)sp[0], (long long)sp[1]);
+        rx_free(re);
+        free(big);
+    }
+
     const char *bad[] = { "a(b", "*a", "[z-a]", "a{3,2}", "\\q" };
     for (int i = 0; i < 5; i++) {
         re = rx_compile((void *)bad[i], strlen(bad[i]));
@@ -166,6 +185,7 @@ static const Bench benches[] = {
     { "alt-heavy", "(?:fox|dog|cat|bird|lazy)\\s(?:over|jumps|end)", 0 },
     { "dot-star", "x9.*end", 0 },
     { "pathological", "(a*)*b", 1 },
+    { "patho-alt", "(a|aa)+$", 2 },
 };
 
 /* Count non-overlapping matches, as len(re.findall(...)) does. */
@@ -209,10 +229,15 @@ static int bench(int argc, char **argv) {
     char path[32];
     memset(path, 'a', 22);
     path[22] = 0;
+    /* (a|aa)+$ against a^28 b: Fibonacci many ways to split the a's. */
+    char path2[40];
+    memset(path2, 'a', 28);
+    path2[28] = 'b';
+    path2[29] = 0;
     printf("%-14s %10s %8s %10s %10s %10s %10s\n", "bench", "matches", "", "rx-bt", "rx-pike", "pcre2", "pcre2-jit");
     for (size_t b = 0; b < sizeof benches / sizeof benches[0]; b++) {
         const Bench *B = &benches[b];
-        const char *t = B->text ? path : text;
+        const char *t = B->text == 1 ? path : B->text == 2 ? path2 : text;
         size_t tn = strlen(t);
         Regex *re = rx_compile((void *)B->pat, strlen(B->pat));
         double best[2] = { 1e9, 1e9 };
