@@ -168,9 +168,6 @@ struct Parser {
     /// The operator parser. Its hooks never fail (errors exit through
     /// `Parser.fail`), hence the error type `()`.
     exprs: parse.Pratt<Parser, T, E, ()>,
-    /// The jumps of the `and`/`or` operators whose right operand is being
-    /// compiled (innermost last).
-    andor: mem.Vec<u64>,
     sm: *diag.SourceMap,
     file: u32,
 }
@@ -662,17 +659,19 @@ fn Parser.simple(p: *Parser) -> E {
 // Operators go through std.parse's Pratt driver. Binding powers, as in
 // Lua: `or` < `and` < comparisons < `..` (right) < `+ -` < `* / %` <
 // unary < `^` (right).
+// `and`, `or` and `..` are `led` operators: their hooks need to emit
+// code both before and after the right operand.
 
 const UNARY: u32 = 8;
 
 fn operators() -> parse.Pratt<Parser, T, E, ()> {
     var x: parse.Pratt<Parser, T, E, ()> = parse.Pratt.new(hook_peek, hook_advance, hook_atom, hook_unary, hook_binary);
     x.before_rhs = Some(hook_before_rhs);
-    x.infix_left(T.Or, 1);
-    x.infix_left(T.And, 2);
+    x.led(T.Or, 1, 1, hook_andor);
+    x.led(T.And, 2, 2, hook_andor);
     x.infix_left(T.Eq, 3); x.infix_left(T.Ne, 3); x.infix_left(T.Lt, 3);
     x.infix_left(T.Le, 3); x.infix_left(T.Gt, 3); x.infix_left(T.Ge, 3);
-    x.infix_right(T.Concat, 5);
+    x.led(T.Concat, 5, 4, hook_concat);
     x.infix_left(T.Plus, 6); x.infix_left(T.Minus, 6);
     x.infix_left(T.Star, 7); x.infix_left(T.Slash, 7); x.infix_left(T.Percent, 7);
     x.infix_right(T.Caret, 10);
@@ -709,16 +708,28 @@ fn hook_unary(p: *Parser, op: T, operand: E) -> Result<E, ()> {
     Ok(E.Reloc(p.emit(w)))
 }
 
-/// After the operator, before its right operand: put the left operand
-/// where the operator needs it.
+/// `e and rhs`, `e or rhs`: test `e` in the result register and skip
+/// the right operand.
+fn hook_andor(p: *Parser, op: T, e: E) -> Result<E, ()> {
+    let r = p.to_next_reg(e);
+    let j = p.emit(if op == T.And { Mini.TEST(r as u8, 0) } else { Mini.TESTT(r as u8, 0) });
+    let rhs = p.subexpr(p.exprs.infix_of(op).right);
+    p.free_exp(rhs);
+    p.discharge(rhs, r);
+    p.patch(j, p.pc());
+    Ok(E.Temp(r))
+}
+
+/// `e .. rhs`, with `e` in the next register.
+fn hook_concat(p: *Parser, op: T, e: E) -> Result<E, ()> {
+    let l = p.to_next_reg(e);
+    let rhs = p.subexpr(p.exprs.infix_of(op).right);
+    Ok(p.concat(l, rhs))
+}
+
+/// After an arithmetic or comparison operator, before its right operand:
+/// put the left operand in a register.
 fn hook_before_rhs(p: *Parser, op: T, e: E) -> Result<E, ()> {
-    if op == T.And or op == T.Or {
-        let r = p.to_next_reg(e);
-        let w = if op == T.And { Mini.TEST(r as u8, 0) } else { Mini.TESTT(r as u8, 0) };
-        p.andor.push(p.emit(w));
-        return Ok(E.Temp(r));
-    }
-    if op == T.Concat { return Ok(E.Temp(p.to_next_reg(e))); }
     // A constant left operand of a commutative operator or a comparison
     // stays unmaterialized, so the K form can be used with the operands
     // swapped (`k - x` and `k / x` have their own reversed ops).
@@ -727,15 +738,6 @@ fn hook_before_rhs(p: *Parser, op: T, e: E) -> Result<E, ()> {
 }
 
 fn hook_binary(p: *Parser, op: T, e: E, rhs: E) -> Result<E, ()> {
-    if op == T.And or op == T.Or {
-        let Some(j) = p.andor.pop() else { unreachable };
-        let r = reg_of(e);
-        p.free_exp(rhs);
-        p.discharge(rhs, r);
-        p.patch(j, p.pc());
-        return Ok(E.Temp(r));
-    }
-    if op == T.Concat { return Ok(p.concat(reg_of(e), rhs)); }
     let eq = op == T.Eq or op == T.Ne;
     if swappable(op) and let Some(kl) = p.kindex(e, eq) {
         if p.kindex(rhs, eq).is_none() {
@@ -1519,7 +1521,6 @@ pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
         heap: h,
         fs: &fs,
         exprs: operators(),
-        andor: mem.Vec.new(),
         sm: &sm,
         file: file,
     };
@@ -1529,7 +1530,6 @@ pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
     if p.tok.kind != T.Eof { p.fail("'<eof>' expected"); }
     let proto = p.finish(&fs);
     p.exprs.free();
-    p.andor.free();
     tables.free();
     sm.free();
     proto
