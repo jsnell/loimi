@@ -199,13 +199,23 @@ quickening on/off.
      in. No measurable gain (Mini 0.996 of the JIT's time before,
      MiniJS 0.998): constant loads and their type checks were never
      on the critical path. Phase 3's 1% was not measurable either.
-   - *Recommendation.* Pursue it post-1.0 as an opt-in tier, not as a
-     substitute for an optimizing JIT. A full version needs freeing
-     compiled code;
-     several vms per program and variants; and AArch64 and PIC/Mach-O
-     relocations. The next speed experiment is keeping register-file
-     values in machine registers across instructions (design note,
-     section 8), not cheaper constants.
+   - *Guest registers in machine registers.* An upper bound by hand:
+     mandelbrot's inner loop, copied from the JIT and rewritten to keep
+     its values in host registers, takes 0.68 of the time (0.79 with
+     only the previous result in a register). A latency probe
+     (`LOIMI_JIT_REGDELAY`) projects at most 12% by geometric mean over
+     the 14 benchmarks, much of it call arguments that a cache cannot
+     hold. A one-register write-through cache with stencil variants
+     (`LOIMI_JIT_CACHE`) is correct but 1.5% slower by geometric mean
+     (mandelbrot 0.91).
+   - *Recommendation: stop the template-JIT line.* Keep the JIT as it
+     is, an opt-in tier at about 0.8 of the interpreter's time, with no
+     more speed phases. Phases 3, 4 and the register cache all gained
+     nothing; what remains needs register allocation over loops,
+     hoisted guards and a register calling convention, which is an
+     optimizing tier with deoptimization. If it is ever made a supported
+     feature, it needs freeing compiled code, several vms per program and
+     variants, and AArch64 and PIC/Mach-O relocations.
 7. **How unsafe is `Window`?** A register window is one pointer with no
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing

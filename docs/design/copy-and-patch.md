@@ -11,7 +11,9 @@ Scheme, no cost with the JIT off, faster stencil builds), section 10
 the third (rewrites of compiled code, hot and cold stencil parts:
 neither faster), section 11 sketches immutable operand kinds, and
 section 12 is the fourth phase, which implements them (no measurable
-gain).
+gain). Section 13 measures keeping guest registers in machine registers
+(worth little over the suite; recommendation: stop the template-JIT
+line).
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -497,7 +499,8 @@ What a full version needs:
    value in a fixed machine register, caching the most recently written
    register as CPython 3.14 caches the top of its stack. That would
    start on the memory-traffic layer of section 7, and is the next
-   experiment if this tier is built.
+   experiment if this tier is built. Measured in section 13: a third at
+   best on mandelbrot, 1.5% slower over the suite as built.
 
 ## 9. Phase 2: MiniJS, Scheme, and no cost when off
 
@@ -868,3 +871,124 @@ start from. But patching constants is not a speedup for a baseline JIT
 of an interpreter that is already tuned. The remaining gap to LuaJIT
 needs values in machine registers and types known across instructions
 (section 8, item 4), not cheaper constants.
+
+## 13. Experiment: guest registers in machine registers
+
+Section 8 (item 4) named this as the next experiment: keep register-file
+values in machine registers across instructions in compiled code. This
+section measures how much that can buy. **Answer: up to about a third
+on a loop that lives in registers, but little over the suite, and a
+template JIT gets almost none of it.** The one-register cache built here
+is 1.5% *slower* by geometric mean.
+
+**Upper bound, by hand.** The JIT's compiled code for mandelbrot's inner
+loop (words 31–44 of the main chunk, five super stencils, `JGTKN`,
+`FORLOOP`) was dumped from the running program and run on its own in a
+harness, against hand-written versions of the same loop. Every version
+keeps the stencils' structure (the same type checks, `pc` updates, one
+taken `jmp` per stencil, cold code between them) unless noted. Best of
+3, the same 1300×1300 picture, Skylake (i7-6700):
+
+| inner loop | seconds | of the JIT's |
+|---|---:|---:|
+| the JIT's code, copied byte for byte | 0.42 | 1.00 |
+| all 11 guest registers in host registers, spilled at exits | 0.285 | 0.68 |
+| the same, write-through (results also stored) | 0.32 | 0.76 |
+| only the previous op's result in a register, write-through | 0.33 | 0.79 |
+| registers, and no type checks, `pc` updates or jumps | 0.235 | 0.56 |
+
+The harness's first row matches the benchmark (0.41–0.45 s; mandelbrot
+spends 97% of its samples in this loop). The loop is a chain of
+dependent float operations, and every hop through the register file is
+a store-to-load forwarding (4–5 cycles on this machine). Most of the
+gain comes from the hops between consecutive operations, so a cache of
+one register, CPython 3.14-style, would get most of the bound *on this
+loop*.
+
+**Over the 14 benchmarks: a latency probe.** With
+`LOIMI_JIT_REGDELAY=n` at build time, every register-file read in a
+stencil passes through n dependent no-op instructions (`imul $1` or
+`addsd -0.0`, 3–4 cycles each). The slowdown says how much of the run
+time waits on register-file loads. Best of 5, interleaved, JIT on:
+
+| | binary_trees | closures | fannkuch | fib | hash_strings | interp | mandelbrot | nbody | oo_methods | queens | sieve | sort | spectral_norm | string_build |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| slowdown, n = 1 | 2% | 8% | 5% | 3% | 23% | 9% | 39% | 27% | 10% | 13% | 14% | 16% | 43% | 1% |
+
+Calibrated on mandelbrot (where the bound is measured: 0.78 of its
+slowdown with all registers cached, 0.52 with one), this projects at
+most 12% by geometric mean with every value in registers, and 8% with
+one cached register. Both are generous: they assume every delayed read
+could be served from a register. Much of spectral_norm's and
+hash_strings' sensitivity is arguments and results crossing calls, which
+go through the callee's frame in memory and would need a register
+calling convention, not a cache. A SIGPROF profile agrees: only
+mandelbrot (97%), spectral_norm, nbody, queens and interp (53–62%) spend
+more than a third of their time in stencils whose operands are all
+registers and constants; the rest is calls, table access, allocation
+and the runtime.
+
+**The one-register cache, built.** With `LOIMI_JIT_CACHE=1` at build
+time (Mini-shaped: it uses the operand kind named `reg` and the operand
+named `dst`):
+
+- Every stencil that falls through (`__jit.n.SIZE`) loads its `dst`
+  register and leaves it in xmm15 (inline asm, right before the `jmp`).
+  The register file still holds it (write-through), so exits, cold
+  paths, GC, re-entry and rewrites need nothing.
+- Each op gets a *cache variant* per register operand of its first part
+  (204 for Mini; 367 stencils in all, 76 KB). Its prologue stores xmm15
+  into that register's slot, which already holds that value; LLVM then
+  forwards it to the op's loads of that register wherever nothing may
+  have written in between. That keeps it correct without tracking
+  stores or calls in the generator.
+- The runtime uses a variant only where *every* continuation into the
+  instruction is a fall-through that leaves that register in xmm15 (no
+  label, `redo` or other jump lands there). Such an instruction gets no
+  enter word: the interpreter never enters compiled code there. A
+  rewritten predecessor keeps the invariant: family members share `dst`,
+  and a predecessor sent to the interpreter dispatches to a word that is
+  not an enter word.
+
+The golden test `mini_jit_stencils` passes with it on (every script
+and conformance test, three GC modes, threshold 1, with and without
+recompiles). In mandelbrot 27 instructions take a cached register. A check of the object shows that every variant reads xmm15 before
+anything writes it (the four that do not read it only write their
+operand). Results, best of 5, interleaved, against the same build
+without it:
+
+| | mandelbrot | fannkuch | fib, hash_strings | the other 10 | geometric mean |
+|---|---:|---:|---:|---:|---:|
+| cache / no cache | 0.91 | 0.97 | 1.00 | 1.01–1.08 | **1.015** |
+
+Why it falls so far short of the bound:
+
+- In mandelbrot's loop only 2 of the 5 stencil boundaries hit the
+  cache. The other three hops read a register written two or more ops
+  earlier, or reach `JGTKN`, whose const variant is chosen instead
+  (a variant cannot be both). The hand-written one-slot loop also
+  forwarded *within* supers. The stencils do not: at the second part,
+  every match arm of the first part has stored `dst`, and LLVM reloads
+  it instead of merging the values. Fixing that is independent of any
+  cache.
+- Integers pay a round trip `movq` to and from xmm15 (2 + 2 cycles on
+  Skylake), about what the store-to-load forwarding cost. Integer code
+  (spectral_norm's `A`, sieve, queens) gains nothing and pays the extra
+  instructions.
+- Every stencil pays the export (a `movq` or `movapd`) and every variant
+  the prologue store, used or not. Instructions that use the cache lose
+  their enter words, so after an exit the interpreter runs them.
+
+**Recommendation: stop the template-JIT line here.** Dispatch and
+operand decoding were the part a template JIT could remove, and phase 1
+removed them (0.77 of the interpreter's time). Phases 3, 4 and this one
+attacked what remains with template techniques and gained nothing. The
+register-file traffic is worth real time only in loops that keep their
+values in registers (mandelbrot, a third at best), and getting it needs
+register allocation over a loop or trace, guards hoisted out of it, and
+arguments passed in registers: an optimizing tier with deoptimization
+metadata, which the shared-frame design (section 5) exists to avoid.
+Keep the JIT as it is, an opt-in tier at about 0.8 of the interpreter's
+time. If the speed matters later, start an optimizing tier over traces
+or loops, not more stencil variants. `LOIMI_JIT_REGDELAY` stays as a
+probe; the cache stays behind `LOIMI_JIT_CACHE` for reproduction.
