@@ -184,7 +184,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
 }
 
 /// `(1 << bits) - 1`, for bits up to 64.
-fn low_mask(bits: u32) -> u64 {
+pub fn low_mask(bits: u32) -> u64 {
     if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
 }
 

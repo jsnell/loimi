@@ -7,6 +7,7 @@ use std::fmt::Write;
 
 use crate::ast::*;
 use crate::diag::{Diag, Res, SourceMap};
+use crate::values::low_mask;
 use crate::vmast::*;
 
 pub struct OpLayout {
@@ -325,7 +326,7 @@ fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
             wb = word_bits
         )
     } else {
-        let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let m = low_mask(bits);
         format!("((__w >> {}) & {}) as {}", shift, m, rt)
     }
 }
@@ -1020,7 +1021,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let params: Vec<String> = o.fields.iter().map(|(p, b, _, sg)| format!("{}: {}", p, field_ty(*b, *sg))).collect();
         let mut enc = format!("(({} as {w}) << {})", o.opcode, l.op_shift);
         for (p, b, sh, _) in &o.fields {
-            let m = if *b >= 64 { u64::MAX } else { (1u64 << b) - 1 };
+            let m = low_mask(*b);
             let _ = write!(enc, " | ((({} as {w}) & {}) << {})", p, m, sh);
         }
         let _ = writeln!(s, "{vis}fn {n}__{}({}) -> {w} {{ {} }}", o.name, params.join(", "), enc);
@@ -1256,7 +1257,7 @@ fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let _ = writeln!(s, "{vis}fn {n}__set_label(w: {w}, off: i64) -> ?{w} {{ {}", real_let(n, jw, "w"));
     let _ = writeln!(s, "  match {n}__opcode(w) {{");
     for (op, (bits, shift, signed)) in &labels {
-        let mask = if *bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = low_mask(*bits);
         let range = if *bits >= 64 && *signed {
             String::new()
         } else if *signed {

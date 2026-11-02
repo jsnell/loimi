@@ -184,7 +184,7 @@ fn decode(word: IntTy, off: u32, bits: u32, shift: u32, signed: bool, span: Span
         let down = mk(st.clone(), TK::Binary(BinOp::Shr, Box::new(as_s), Box::new(sint)), span);
         if rt == st { down } else { mk(rt, TK::Cast(Box::new(down)), span) }
     } else {
-        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        let mask = crate::values::low_mask(bits);
         let sh = if shift == 0 { w } else { mk(wt.clone(), TK::Binary(BinOp::Shr, Box::new(w), Box::new(int(shift as u64))), span) };
         let m = if shift + bits >= wb { sh } else { mk(wt.clone(), TK::Binary(BinOp::And, Box::new(sh), Box::new(int(mask))), span) };
         if rt == wt { m } else { mk(rt, TK::Cast(Box::new(m)), span) }
@@ -851,6 +851,16 @@ fn check_collects(c: &mut Checker, d: &VmDecl, i: usize) -> Res<()> {
     Ok(())
 }
 
+/// Store the checked body of vm function `fid`, with its parameters, its
+/// locals and the locals that hold the vm state.
+fn set_body(c: &mut Checker, fid: FnId, params: Vec<LocalId>, locals: Vec<LocalDef>, body: TExpr, state: Vec<LocalId>) {
+    let fd = &mut c.prog.fns[fid as usize];
+    fd.params = params;
+    fd.locals = locals;
+    fd.body = Some(body);
+    fd.vm_state = state;
+}
+
 fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) -> Res<()> {
     let info = &c.vms[vm as usize];
     let m = info.module;
@@ -869,11 +879,7 @@ fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) 
         ),
         span,
     );
-    let fd = &mut c.prog.fns[fid as usize];
-    fd.params = state.clone();
-    fd.locals = cx.locals;
-    fd.body = Some(body);
-    fd.vm_state = state;
+    set_body(c, fid, state.clone(), cx.locals, body, state);
     Ok(())
 }
 
@@ -927,11 +933,7 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     }
     if let Some(fid) = shared {
         let body = mk(Ty::Never, TK::Block(lets, Some(Box::new(b))), span);
-        let fd = &mut c.prog.fns[fid as usize];
-        fd.params = state.clone();
-        fd.locals = cx.locals;
-        fd.body = Some(body);
-        fd.vm_state = state;
+        set_body(c, fid, state.clone(), cx.locals, body, state);
     }
     Ok(())
 }
@@ -1112,11 +1114,7 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     });
     let b = c.block(&mut cx, f.body.as_ref().unwrap(), Some(&ret))?;
     let b = c.coerce(b, &ret)?;
-    let fd = &mut c.prog.fns[fid as usize];
-    fd.params = params;
-    fd.locals = cx.locals;
-    fd.body = Some(b);
-    fd.vm_state = state;
+    set_body(c, fid, params, cx.locals, b, state);
     Ok(())
 }
 
@@ -1280,11 +1278,7 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
     if n == 1 {
         crate::tirwalk::extend_cold(&mut body);
     }
-    let fd = &mut c.prog.fns[fid as usize];
-    fd.params = state.clone();
-    fd.locals = cx.locals;
-    fd.body = Some(body);
-    fd.vm_state = state;
+    set_body(c, fid, state.clone(), cx.locals, body, state);
     Ok(())
 }
 
@@ -1415,11 +1409,7 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
     }
     let span = b.span;
     let body = mk(ret, TK::Block(inits, Some(Box::new(b))), span);
-    let fd = &mut c.prog.fns[fid as usize];
-    fd.params = params;
-    fd.locals = cx.locals;
-    fd.body = Some(body);
-    fd.vm_state = state;
+    set_body(c, fid, params, cx.locals, body, state);
     Ok(())
 }
 
@@ -1441,11 +1431,7 @@ fn check_raise(c: &mut Checker, vm: u32, fid: FnId, r: &RaiseDecl) -> Res<()> {
         TK::Block(vec![TStmt::Let(err, Some(mk(rt, TK::Vm(TVm::RaiseSlot), span)))], Some(Box::new(b))),
         span,
     );
-    let fd = &mut c.prog.fns[fid as usize];
-    fd.params = state.clone();
-    fd.locals = cx.locals;
-    fd.body = Some(body);
-    fd.vm_state = state;
+    set_body(c, fid, state.clone(), cx.locals, body, state);
     Ok(())
 }
 

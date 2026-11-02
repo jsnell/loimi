@@ -1018,7 +1018,7 @@ pub fn stats_rt_source() -> String {
 }
 
 fn word_mask(bits: u8) -> i64 {
-    if bits >= 64 { -1 } else { ((1u64 << bits) - 1) as i64 }
+    crate::values::low_mask(bits as u32) as i64
 }
 
 fn part_label(g: &mut FnGen, j: u32) -> String {

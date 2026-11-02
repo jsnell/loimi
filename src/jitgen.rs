@@ -109,7 +109,7 @@ pub fn const_variants(p: &Program, vi: usize) -> Vec<ConstVariant> {
             _ => {}
         }
     }
-    let low = |b: u32| if b >= 64 { u64::MAX } else { (1u64 << b) - 1 };
+    let low = crate::values::low_mask;
     for (k, o) in vd.ops.iter().enumerate() {
         if !o.parts.is_empty() || o.consts.len() != 1 {
             continue;
@@ -369,12 +369,6 @@ pub fn note_const_field(g: &mut FnGen, raw: LocalId, off: u32, shift: u32, bits:
 /// the constant itself, a 64-bit hole `__jit.c.OFF.SHIFT.BITS.u` patched
 /// with its bits. Returns the address of a temporary holding it.
 pub fn const_read(g: &mut FnGen, e: &TExpr) -> Option<String> {
-    fn strip(e: &TExpr) -> &TExpr {
-        match &e.kind {
-            TK::Cast(a) => strip(a),
-            _ => e,
-        }
-    }
     let st = g.stencil.as_ref()?;
     let pool = st.pool?;
     let raw_of = |e: &TExpr| match strip(e).kind {
@@ -428,15 +422,17 @@ pub fn reg_delay() -> u32 {
     std::env::var("LOIMI_JIT_REGDELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
+/// `e` without the casts around it.
+fn strip(e: &TExpr) -> &TExpr {
+    match &e.kind {
+        TK::Cast(a) => strip(a),
+        _ => e,
+    }
+}
+
 /// In a stencil with `LOIMI_JIT_REGDELAY`, a read of the register file
 /// (`regs[i]`, or `*((regs + i) as *T)`): the value, delayed.
 pub fn delayed_reg_read(g: &mut FnGen, e: &TExpr) -> Option<String> {
-    fn strip(e: &TExpr) -> &TExpr {
-        match &e.kind {
-            TK::Cast(a) => strip(a),
-            _ => e,
-        }
-    }
     let n = g.cg.reg_delay;
     let regs = g.stencil.as_ref()?.regs?;
     if n == 0 {
