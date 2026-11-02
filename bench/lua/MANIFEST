@@ -1,0 +1,7 @@
+# Reference interpreters for benchmarking. Built from source by install.sh
+# into bench/lua/install/ (gitignored). Nothing here is committed except
+# this manifest and the script.
+#
+# name    version   url                                                          sha256 / commit
+lua       5.4.9     https://www.lua.org/ftp/lua-5.4.9.tar.gz                     2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
+luajit    2.1       https://github.com/LuaJIT/LuaJIT.git                         ea9eb7edb5eac4a9d175d74523db34fac0fa5180

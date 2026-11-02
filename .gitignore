@@ -2,3 +2,5 @@
 *.o
 *.ll.tmp
 /out
+/bench/lua/src
+/bench/lua/install
