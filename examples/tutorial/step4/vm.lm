@@ -1,0 +1,178 @@
+// The Pip virtual machine: registers hold dynamically typed values.
+
+import std.io;
+import std.text;
+import value;
+import value.{Value};
+
+extern "C" fn fmod(x: f64, y: f64) -> f64;
+
+/// What the verifier checks operands against.
+pub struct Limits { nregs: u32, nconsts: u32 }
+
+/// The vm's context: everything handlers need that is not hot enough to
+/// deserve a machine register of its own.
+pub struct Machine {
+    /// The code being run and the source line of each of its words.
+    code: *u32,
+    lines: *u32,
+    /// A scratch buffer for printing.
+    out: text.StrBuf,
+    /// The line of the last run-time error.
+    error_line: u32,
+}
+
+pub enum Arith { Add, Sub, Mul, Div, Mod }
+
+fn arith_error(v: Value) -> str {
+    match v {
+        Nil => "arithmetic on a nil value",
+        Bool(_) => "arithmetic on a boolean value",
+        _ => "arithmetic on a number",
+    }
+}
+
+/// Everything the handlers' fast paths leave out: integer overflow,
+/// mixed integer and float operands, division, and type errors.
+fn arith(op: Arith, a: Value, b: Value) -> Result<Value, str> {
+    if let (Int(x), Int(y)) = (a, b) {
+        let (x, y) = (x as i64, y as i64);
+        let r = match op {
+            Add => x + y,
+            Sub => x - y,
+            Mul => x * y,
+            Div => { if y == 0 { return Err("division by zero"); } x / y }
+            Mod => { if y == 0 { return Err("division by zero"); } x % y }
+        };
+        // A result that does not fit an Int becomes a float.
+        if r >= -2147483648 and r <= 2147483647 { return Ok(Value.Int(r as i32)); }
+        return Ok(Value.Num(r as f64));
+    }
+    let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) else {
+        return Err(if value.to_f64(a).is_none() { arith_error(a) } else { arith_error(b) });
+    };
+    Ok(Value.Num(match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => x / y,
+        Mod => fmod(x, y),
+    }))
+}
+
+fn less(a: Value, b: Value, or_equal: bool) -> Result<bool, str> {
+    let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) else {
+        return Err("comparison of non-numbers");
+    };
+    Ok(if or_equal { x <= y } else { x < y })
+}
+
+/// Numbers compare by value (1 == 1.0); anything else by identity.
+fn equal(a: Value, b: Value) -> bool {
+    if let (Some(x), Some(y)) = (value.to_f64(a), value.to_f64(b)) { return x == y; }
+    a == b
+}
+
+pub vm Pip {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *Value, k: *Value }
+    verify_context lim: *Limits;
+
+    operand reg = regs[it] verify (it as u32) < lim.nregs display "r{}";
+    operand kst = k[it] verify (it as u32) < lim.nconsts display "k{}";
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADNIL(dst: reg) : ABC { dst = Nil; next }
+    op LOADBOOL(dst: reg, b: imm) : ABC { dst = Bool(b != 0); next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+
+    // Three ops from one template: `#name` makes an identifier, and `sym`
+    // is pasted as a token.
+    inline for (name, checked, sym, kind) in [
+        ("ADD", "add_checked", +, Arith.Add),
+        ("SUB", "sub_checked", -, Arith.Sub),
+        ("MUL", "mul_checked", *, Arith.Mul),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                _ => {}
+            }
+            cold { dst = arith(kind, a, b)?; next }
+        }
+    }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Int(x), Int(y)) if y > 0 => { dst = Int(x / y); next }
+            (Num(x), Num(y)) => { dst = Num(x / y); next }
+            _ => {}
+        }
+        cold { dst = arith(Arith.Div, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x % y); next }
+        cold { dst = arith(Arith.Mod, a, b)?; next }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        match a {
+            Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
+            Num(x) => { dst = Num(-x); next }
+            _ => {}
+        }
+        cold { dst = arith(Arith.Sub, Value.Int(0), a)?; next }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = Bool(!value.truthy(a)); next }
+
+    op EQ(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x == y); next }
+        cold { dst = Bool(equal(a, b)); next }
+    }
+    op NE(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Bool(x != y); next }
+        cold { dst = Bool(!equal(a, b)); next }
+    }
+    inline for (name, test, or_equal) in [("LT", x < y, false), ("LE", x <= y, true)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = Bool(test); next }
+                (Num(x), Num(y)) => { dst = Bool(test); next }
+                _ => {}
+            }
+            cold { dst = Bool(less(a, b, or_equal)?); next }
+        }
+    }
+
+    op PRINT(a: reg) : ABC {
+        ctx.out.clear();
+        value.write(&ctx.out, a);
+        io.println(ctx.out.as_str());
+        next
+    }
+    op HALT() : ABC { exit Ok(()) }
+
+    entry run(m: *Machine, r: *Value, consts: *Value) -> Result<(), str> {
+        ctx = m;
+        pc = m.code;
+        regs = r;
+        k = consts;
+        jump pc
+    }
+
+    // `raise msg` (and `?` on an Err) in any handler lands here, with the
+    // state as it was in that handler: `pc` still points at the
+    // instruction that failed.
+    on raise(msg: str) {
+        let i = ((pc as u64) - (ctx.code as u64)) / 4;
+        ctx.error_line = ctx.lines[i];
+        fail msg
+    }
+}
