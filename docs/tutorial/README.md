@@ -21,7 +21,8 @@ built from.
    parser from `std.parse`, and a tree-walking evaluator.
 3. [A first vm](03-first-vm.md): `vm`, `state`, operands, a fixed
    encoding, ops, `next`, entries, and what the compiler generates from
-   them: encoders, the disassembler and the verifier. Compiling to
+   them: encoders, the disassembler and the verifier, whose
+   `Verified<Calc>` is the only code `run` accepts. Compiling to
    bytecode with `std.bc`.
 4. [Values, slow paths and errors](04-values.md): `value ... repr
    nanbox`, matching on `(Int, Int)`, `cold` blocks, `inline for`,
@@ -98,6 +99,6 @@ the step files.
 
 Loimi's design ([`docs/language.md`](../language.md)) describes more
 than is built ([`docs/status.md`](../status.md)). This tutorial uses only
-what is implemented. Closures in Loimi itself, `Verified<V>`, `suspend`,
+what is implemented. Closures in Loimi itself, `suspend`,
 C-ABI entry points and the generated `Builder` do not exist yet, and
 nothing here pretends otherwise.

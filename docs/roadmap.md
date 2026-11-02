@@ -5,6 +5,13 @@
 Progress (2026-11-02):
 - M0–M5 are done. The bytecode fuzzer (ASan, about 2 hours total) found
   and fixed verifier and Mini holes; `cargo test` runs a smoke version.
+  `Verified<V>` is built: `verify` returns the proof (or a diagnosis),
+  `#[require_verified]` entries accept only it, and the three
+  interpreters keep it in their prototypes, so calls reach only verified
+  code. Open: tying the proof to its verify context without a per-call
+  load (Mini's CALL pays one, up to 4% on call-heavy code; a proof
+  that is a typed view of the prototype, with the code at a fixed
+  offset, would cost nothing), and checking handler-table targets.
 - M6 is done: std.num, std.diag, std.lex, std.parse, std.bc and std.obj
   exist, and the example interpreters use them. Mini's front end is
   std.lex + std.parse (Pratt driver, `led` hooks for `and`/`or`/`..`) +

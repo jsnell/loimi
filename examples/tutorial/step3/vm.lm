@@ -6,6 +6,7 @@ import std.io;
 /// file and of the constant table.
 pub struct Limits { nregs: u32, nconsts: u32 }
 
+#[require_verified]
 pub vm Calc {
     // Live across every instruction, and kept in machine registers.
     state { pc: *u32, regs: *i64, k: *i64 }
@@ -47,10 +48,9 @@ pub vm Calc {
     op HALT() : ABC { exit Ok(()) }
 
     // The way in: set up the state, then dispatch the first instruction.
-    entry run(code: *u32, r: *i64, consts: *i64) -> Result<(), str> {
-        pc = code;
+    entry run(code: Verified<Calc>, r: *i64, consts: *i64) -> Result<(), str> {
         regs = r;
         k = consts;
-        jump pc
+        jump code
     }
 }

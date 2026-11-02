@@ -29,12 +29,25 @@ pub struct Proto {
     nparams: u32,
     /// The size of the function's register window.
     nregs: u32,
-    code: []u32,
+    /// The bytecode, as the compiler wrote it.
+    words: []u32,
+    /// The proof that `words` passed `Pip.verify`. The compiler sets a
+    /// placeholder; main stores the proof once every function is
+    /// compiled (the verifier needs the final number of globals).
+    code: Verified<Pip>,
     /// The source line of each code word.
     lines: []u32,
     consts: []Value,
 }
 ```
+
+`code` is the `Verified<Pip>` from chapter 3, and it cannot be made
+when the prototype is: the verifier checks global numbers against the
+number of names in the whole program, which is known only once
+everything is compiled. So the compiler fills `code` with
+`Pip.placeholder()`, a proof over one static word whose opcode no op
+has (it traps if it ever runs), and `main` replaces it with the real
+proof later.
 
 A function value is a pointer to its prototype. A nanbox payload can be
 any pointer:
@@ -93,7 +106,7 @@ which is the caller's `base`.
             fp.base = callee;
             regs = callee;
             k = p.consts.ptr;
-            jump p.code.ptr
+            jump p.code
         }
         cold { raise "call of a non-function" }
     }
@@ -102,7 +115,10 @@ which is the caller's `base`.
 `base` is a `reg` operand, so reading it gives the register's value;
 `base.raw` is the field itself, the register number. The handler
 assigns all four state variables and jumps: the callee runs with its
-own `regs` and `k` in the same machine registers.
+own `regs` and `k` in the same machine registers. `jump p.code` jumps
+to the start of the callee's verified code. The vm is
+`#[require_verified]` and its entry, too, jumps to `main.code`, so every
+function that runs was verified.
 
 ```loimi
     /// Return R[src] to the caller.
@@ -127,7 +143,7 @@ so an error inside a function reports the line inside the function:
 ```loimi
     on raise(msg: str) {
         let p = fp.proto;
-        let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
+        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
         ctx.error_line = p.lines[i];
         fail msg
     }
@@ -161,21 +177,30 @@ nothing at run time. Mini found nine holes like this with its fuzzer
 (counts whose range was never checked); each became an operand kind
 with a clause of this shape.
 
-What the verifier cannot check is up to the embedder: that the callee
-of a CALL was verified, that `nparams <= nregs`, that the stack has room
-for the main function's frame. `main` verifies every prototype before
-running any of them:
+`main` verifies every prototype before running any of them, and
+stores each proof in its prototype:
 
 ```loimi
     // Verify every function before running anything.
     for i in 0..prog.protos.len {
         let p = prog.protos.at(i);
-        if let Some(bad) = Pip.verify(p.code, p, names.names.len as u32) {
-            error("bytecode failed verification", p.lines[bad]);
-            return 1;
+        match Pip.verify(p.words, p, names.names.len as u32) {
+            Ok(v) => p.code = v,
+            Err(e) => {
+                var b = text.StrBuf.new();
+                b.push_str("bytecode failed verification: ");
+                e.write(&b);
+                error(b.as_str(), p.lines[e.at]);
+                return 1;
+            }
         }
     }
 ```
+
+What the verifier cannot check is still up to the embedder: that
+`nparams <= nregs`, that the stack has room for the main function's
+frame, and that a prototype's `nregs` and constants do not change after
+it was verified.
 
 ## Compiling calls
 

@@ -240,15 +240,23 @@ A **superinstruction** runs several ops with one dispatch:
 ```
 
 The compiler builds each super's handler by inlining the parts. The
-generated peephole pass `Pip.optimize(code)` fuses matching sequences
+generated peephole pass `Pip.optimize(v)` fuses matching sequences
 in place: the first word's opcode becomes the super, and the following
 words stay as they are, so a jump into the middle still runs the
 original instruction, and fusion needs no control-flow analysis.
 
+It takes the proof from `Pip.verify` and returns it: fusing keeps the
+code valid, so it stays verified. (The verifier accepts supers too, and
+chapter 9's fuzzer checks that optimized code still verifies.)
+`Pip.optimize_words(words)` does the same on a plain slice.
+
 ```loimi
-    // Fuse superinstructions, then verify every function before running
-    // anything. (The verifier checks supers too.)
-    for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
+    // Verify every function before running anything, then fuse
+    // superinstructions: `Pip.optimize` takes the proof and returns it.
+    for i in 0..prog.protos.len {
+        let p = prog.protos.at(i);
+        match Pip.verify(p.words, p, names.names.len as u32) {
+            Ok(v) => p.code = Pip.optimize(v),
 ```
 
 `Pip.optimize` goes left to right and fuses, at each instruction, the

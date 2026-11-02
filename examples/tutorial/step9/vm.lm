@@ -186,6 +186,7 @@ fn arith_slow(m: *Machine, op: Arith, a: Value, b: Value) -> Result<Value, str> 
     arith(op, a, b)
 }
 
+#[require_verified]
 pub vm Pip {
     context ctx: *Machine;
     state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
@@ -467,7 +468,7 @@ pub vm Pip {
             fp.base = callee;
             regs = callee;
             k = p.consts.ptr;
-            jump p.code.ptr
+            jump p.code
         }
         cold { raise "call of a non-function" }
     }
@@ -501,7 +502,7 @@ pub vm Pip {
         for i in 0..main.nregs as u64 { regs[i] = Nil; }
         k = main.consts.ptr;
         m.fp = fp;
-        jump main.code.ptr
+        jump main.code
     }
 
     // A second dispatch table whose handlers count down `ctx.steps`
@@ -527,7 +528,7 @@ pub vm Pip {
         for i in 0..main.nregs as u64 { regs[i] = Nil; }
         k = main.consts.ptr;
         m.fp = fp;
-        jump main.code.ptr
+        jump main.code
     }
 
     // `raise msg` (and `?` on an Err) in any handler lands here, with the
@@ -535,7 +536,7 @@ pub vm Pip {
     // instruction that failed, and `fp` at its function's frame.
     on raise(msg: str) {
         let p = fp.proto;
-        let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
+        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
         ctx.error_line = p.lines[i];
         fail msg
     }

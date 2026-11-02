@@ -342,7 +342,7 @@ fn C.finish(c: *C, name: str, nparams: u32, line: u32) -> *Proto {
     let p: *Proto = mem.alloc(1);
     *p = Proto {
         name: name, nparams: nparams, nregs: c.regs.frame_size(1),
-        code: code.slice(n), lines: lines.slice(n), consts: consts.slice(nk),
+        words: code.slice(n), code: Pip.placeholder(), lines: lines.slice(n), consts: consts.slice(nk),
     };
     c.code.free();
     c.consts.free();

@@ -644,8 +644,9 @@ type-checks the mapping. From the declarations it **generates**:
   `Vm.operand_bits(w, i)` and `Vm.operand_signed(w, i)`;
   `Vm.kind_name(k)` and `Vm.kind_is_label(k)` describe a kind. A super's
   head answers for its first part;
-- `Vm.optimize(code)`, the superinstruction peephole (section 7.3), and
-  `Vm.deopt(code)` (section 7.2);
+- `Vm.optimize(v)`, the superinstruction peephole (section 7.3), and
+  `Vm.deopt(v)` (section 7.2), over verified code (`optimize_words`,
+  `deopt_words` over a raw slice);
 - label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
   jump label of word `w` (its first operand whose kind is `pc + it`) and
   returns None if `off` does not fit the field or the op has no label;
@@ -727,7 +728,7 @@ can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
 `?` on the raise type. That makes shared tails easy to write:
 
 ```loimi
-fn call_closure(c: Gc<Closure>, base: *Value, nargs: u8) -> never { ...; jump c.proto.code_start() }
+fn call_closure(c: Gc<Closure>, base: *Value, nargs: u8) -> never { ...; jump c.proto.code }
 
 // The word after a conditional op is a JMP holding the branch offset.
 fn branch() -> never { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
@@ -807,7 +808,7 @@ entry run(c: Gc<Closure>) {
     ctx.frames.push_entry_marker();
     regs = ctx.stack.window_at_top(c.proto.nregs)?;
     k = c.proto.consts.ptr();
-    jump c.proto.code_start()
+    jump c.proto.code
 }
 
 on raise(err: Value) {
@@ -822,7 +823,9 @@ on raise(err: Value) {
 ```
 
 The compiler generates `Mini.run(ctx, c) -> Result<Value, Value>` with the C
-ABI. `on raise` is an ordinary handler: it receives the live state, so the
+ABI. `c.proto.code` is a `Verified<Mini>` (section 6): with
+`#[require_verified]` on the vm, an entry can only start in verified
+code. `on raise` is an ordinary handler: it receives the live state, so the
 `pc` it sees is exact without any syncing.
 
 An entry declared `entry call(..) -> R uses reenter` is a *nested
@@ -1021,10 +1024,9 @@ nothing extra unless the refill path actually runs.
 
 ## 6. Verification: unchecked by proof
 
-`Mini.verify(code, proto) -> ?u64` is generated from the declarations. It
-returns None if the code is valid, or the index of the first bad word.
-(The design's `Result<Verified<Mini>, VerifyError>`, a type that `run`
-would demand, is not implemented yet; see below.) It checks:
+`Mini.verify(code, ctx..) -> Result<Verified<Mini>, Mini.VerifyError>` is
+generated from the declarations. It returns the code wrapped in a proof,
+or the first bad word and why it is bad. It checks:
 
 - every word decodes to a valid opcode and format;
 - every operand satisfies its kind's `verify` clause (register and constant
@@ -1052,23 +1054,88 @@ would demand, is not implemented yet; see below.) It checks:
 
 `verify` clauses see `it`, `pc` (the address of the operand's word) and the
 verify context, nothing else; a verify context cannot be named `it` or `pc`.
-What the verifier cannot see is up to the vm: that the run-time state
-matches the verify context (the register window really has `proto.nregs`
-registers), that every function reachable by a call was verified, that
-operands without a `verify` clause (`imm`) are safe for every value, and
-that jumps to computed addresses (`jump fp.resume`) go to boundaries.
 
-In the design, `Mini.run` only accepts `Verified` code. *Not yet
-implemented:* there is no `Verified<V>` type, and `run` takes a raw code
-pointer, so calling `verify` first is up to the embedder. Operand
-accesses compile **without bounds checks**, and stack VMs check for overflow once per call
-(`max_stack` against the limit) instead of on every push. The checks don't
-disappear; they move from run time to load time. This matters for interpreters
-that load cached or untrusted bytecode files.
+**Errors.** `Mini.VerifyError` has `at` (the word index), `reason` (an
+enum `Mini.VerifyReason`: `Empty`, `TooLong`, `BadOpcode`, `Truncated`,
+`SuperPart`, `Then`, `RunsOffEnd`, `Operand`), and for `Operand` the
+operand's index and kind. `e.message()` describes the reason, and
+`e.write(&out)` writes the whole diagnosis to any buffer with
+`push_str`/`push_int`:
 
-Rewriting through quickening (`become`) and superinstructions preserves
-verification, because the compiler checks that the rewrite keeps the format
-and operand kinds unchanged.
+```
+word 4 (LOADK): operand `c` (kst) fails `(it as u64) < nconsts`
+word 7 (ADD): execution can run off the end of the code after this instruction
+```
+
+**`Verified<Mini>`** (also spelled `Mini.Verified`) is the proof: an
+opaque handle over the code slice, the same pointer and length at run
+time. Only the vm's generated functions can build one: its field is
+private to the vm's expansion (fields whose names start with `__` are
+private to the file declaring their struct), so a struct literal or a
+field write outside it is an error. It offers `v.start() -> *W`,
+`v.len()`, and `v.words() -> []W` for reading (disassembly, line
+tables; writing through it voids the proof). In vm code, `jump v` starts
+running the verified code. The escape hatches:
+
+- `unsafe { Mini.assume_verified(code) }`, for code the host built
+  itself and trusts (`assume_verified` is declared `#[unsafe]`: naming
+  it outside `unsafe { }` is an error);
+- `Mini.placeholder()`, a proof over one static word holding an opcode
+  no op has, which traps if it runs. It fills a `Verified` field until
+  the real code is verified (a prototype built while the rest of the
+  program, say the global count its verify context needs, is not known
+  yet). It is not generated if every opcode value is taken.
+
+**Requiring the proof.** `#[require_verified]` on the vm makes every
+entry start in verified code: an entry's `jump` must take a
+`Verified<Mini>` (`entry run(code: Verified<Mini>, ..) { ..; jump code }`),
+so `Mini.run` cannot be called with raw code. A raw `jump` in an entry
+(or in a `-> never` vm function inlined into one) is an error outside
+`unsafe { }`, and an entry cannot reach a shared (cold) copy of a vm
+function, which is checked once for all callers. Calls inside the vm
+are made structural by the data: a prototype whose code field is a
+`Verified<Mini>` has no raw code to jump to, so `jump p.code` in CALL
+reaches only verified functions. Mini, Scheme and MiniJS do this.
+
+**Tying the proof to its context.** The proof records nothing about the
+context it was checked against; the interpreter stores it next to that
+context and does not change the context afterwards. Two patterns:
+
+- *verify, then build*: Mini verifies against the counts its `Proto`
+  will hold (`verify_context nregs: u32, nupvals: u32, nconsts: u64,
+  nprotos: u64;`) and creates the `Proto` from the same values and the
+  proof. The words live in a separate `Code` object that the `Proto`
+  references (the proof's slice is not traced);
+- *build, then verify*: the tutorial's `Pip` builds every prototype
+  with `code: Pip.placeholder()` and verifies once the program is
+  complete (its context includes the global count), storing each proof
+  in its prototype (`p.code = v`).
+
+**Mutation.** Quickening (`become`) and `Mini.optimize` rewrite verified
+code in place, and both preserve verification: `become` only switches
+between members of a family, which share format, operand kinds and
+cache, and the verifier checks every word of a superinstruction as an
+instruction of its part's family, so quickening a part or splitting a
+super leaves valid code; `optimize` fuses only sequences that verify
+as their parts. The bytecode fuzzer checks both after every run
+(`tests/fuzz`). `Mini.optimize(v) -> Verified<Mini>` and
+`Mini.deopt(v) -> Verified<Mini>` take and return the proof; the raw
+passes are `Mini.optimize_words(code)` and `Mini.deopt_words(code)`,
+for code that is verified afterwards.
+
+What the verifier and the proof cannot see is up to the vm: that the
+run-time state matches the verify context (the register window really
+has `nregs` registers), that operands without a `verify` clause
+(`imm`) are safe for every value, and that jumps to computed addresses
+inside the vm (`jump fp.resume`, an exception handler's target
+`p.code.start() + h.target`) go to boundaries of verified code. Those
+raw jumps are allowed in ops and `on raise`, where pc is already in
+verified code; only entries are held to `Verified`.
+
+Operand accesses compile **without bounds checks**, and stack VMs check for
+overflow once per call (`max_stack` against the limit) instead of on every
+push. The checks don't disappear; they move from run time to load time. This
+matters for interpreters that load cached or untrusted bytecode files.
 
 ---
 
@@ -1167,7 +1234,7 @@ family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
 ```
 
 The `generic` member is what the compiler emits. Specialized members are only
-reached through `become`. `Vm.deopt(code)` maps every member back to
+reached through `become`. `Vm.deopt(v)` maps every member back to
 `generic`, for debuggers and for code serialization: it rewrites each
 instruction word to its family's generic op, splits superinstructions
 (the head becomes its first part's generic op) and zeroes inline caches,
@@ -1218,7 +1285,7 @@ second word still runs the original second instruction, so fusion is always
 safe, needs no control-flow analysis, and can happen at build time (the
 `Vm.optimize` peephole) or at run time (quickening).
 
-`Vm.optimize(code)` is the generated peephole pass. It compares words by
+`Vm.optimize(v)` is the generated peephole pass. It compares words by
 the op they stand for alone (a super's head counts as its first part), so
 it can run again on code that has been optimized and quickened. The
 generated verifier treats every part's word as an instruction: jumps may

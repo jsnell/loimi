@@ -35,7 +35,7 @@ fn disassemble(prog: *Program) {
         out.push_str("fn ");
         out.push_str(p.name);
         out.push_str(":\n");
-        Pip.disasm(p.code, &out);
+        Pip.disasm(p.words, &out);
     }
     io.print(out.as_str());
     out.free();
@@ -87,17 +87,22 @@ fn main() -> i32 {
     m.heap.add_scanner(&m as *u8, vm.scan_roots);
     if stress { m.heap.set_stress(true); }
 
-    // Fuse superinstructions, then verify every function before running
-    // anything. (The verifier checks supers too.)
-    for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
-    if disasm { disassemble(&prog); }
+    // Verify every function before running anything, then fuse
+    // superinstructions: `Pip.optimize` takes the proof and returns it.
     for i in 0..prog.protos.len {
         let p = prog.protos.at(i);
-        if let Some(bad) = Pip.verify(p.code, p, names.names.len as u32) {
-            error("bytecode failed verification", p.lines[bad]);
-            return 1;
+        match Pip.verify(p.words, p, names.names.len as u32) {
+            Ok(v) => p.code = Pip.optimize(v),
+            Err(e) => {
+                var b = text.StrBuf.new();
+                b.push_str("bytecode failed verification: ");
+                e.write(&b);
+                error(b.as_str(), p.lines[e.at]);
+                return 1;
+            }
         }
     }
+    if disasm { disassemble(&prog); }
 
     let status: i32 = match Pip.run(&m, prog.main) {
         Ok(_) => 0,

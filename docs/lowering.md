@@ -563,17 +563,31 @@ nursery would need every such pointer re-derived after each safepoint.
 ## 11. Bounds checks and verification
 
 Operand accesses in handlers are emitted as `getelementptr inbounds` without
-compare-and-branch, because `run` only accepts `Verified<Mini>` (the type
-system enforces this). Other indexing uses ordinary checked slices. The
-verifier itself is generated MIR: a loop over the code that decodes each word
-with the same generated decoder the handlers use, then evaluates the `verify`
-clauses.
+compare-and-branch: the verifier has proved them in range. Other indexing
+uses ordinary checked slices. The verifier is generated Loimi source
+(`src/vmexpand.rs`): a loop over the code that decodes each word with the
+same field extraction the handlers use, then evaluates the `verify`
+clauses pasted in. It returns `Result<Vm__Verified, Vm__VerifyError>`.
 
-As implemented, the accesses are unchecked as described, but
-`Verified<V>` does not exist: `run` takes a raw code pointer, and
-calling `Vm.verify` first is up to the embedder. The verifier is
-generated Loimi source (`src/vmexpand.rs`), decoding fields the same
-way the handlers do.
+`Verified<Vm>` is the generated struct `Vm__Verified { __code: []W }`:
+a slice, passed and stored as `{ ptr, i64 }`. `jump v` lowers to the
+slice's pointer (`extractvalue` after mem2reg), so an entry that takes
+a `Verified` dispatches exactly as one that takes a raw pointer; it only
+receives the length in one more register. `v.start()` is the same
+field read. The checks are all at compile time: the `__` field is
+private to the vm's expansion file, `#[unsafe]` functions need an
+`unsafe { }` block, and `#[require_verified]` is checked on each
+entry's `jump` (vmcheck).
+
+Where the proof is stored is the interpreter's choice, and that can
+cost: Mini's `Proto` used to hold its words as a trailing array, so
+CALL computed the code address as `p + offset`; the proof is now a
+field, so CALL loads it (one more dependent load per call). The CALL
+handler's machine code is otherwise unchanged. Measured on Mini
+(`--release --align-functions=64`, best of 6): `oo_methods` +4%,
+`closures` +2%, `fib` and `binary_trees` within 1%. The same field
+load with a raw `*u32` instead of the proof costs the same (+3-4% on
+`oo_methods`), so the cost is the layout, not the type.
 
 ## 12. Driver settings
 

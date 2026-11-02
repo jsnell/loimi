@@ -126,6 +126,7 @@ fn equal(a: Value, b: Value) -> bool {
     a == b
 }
 
+#[require_verified]
 pub vm Pip {
     context ctx: *Machine;
     state { pc: *u32, regs: *Value, k: *Value }
@@ -294,12 +295,11 @@ pub vm Pip {
     }
     op HALT() : ABC { exit Ok(()) }
 
-    entry run(m: *Machine, r: *Value, consts: *Value) -> Result<(), str> {
+    entry run(m: *Machine, code: Verified<Pip>, r: *Value, consts: *Value) -> Result<(), str> {
         ctx = m;
-        pc = m.code;
         regs = r;
         k = consts;
-        jump pc
+        jump code
     }
 
     // `raise msg` (and `?` on an Err) in any handler lands here, with the

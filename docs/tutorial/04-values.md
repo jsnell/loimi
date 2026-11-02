@@ -290,14 +290,16 @@ The context is one more register; its fields cost a load. The entry
 sets it like the state:
 
 ```loimi
-    entry run(m: *Machine, r: *Value, consts: *Value) -> Result<(), str> {
+    entry run(m: *Machine, code: Verified<Pip>, r: *Value, consts: *Value) -> Result<(), str> {
         ctx = m;
-        pc = m.code;
         regs = r;
         k = consts;
-        jump pc
+        jump code
     }
 ```
+
+`ctx.code` is the first word of the same code (`main` sets it to
+`code.start()`), kept for computing line numbers.
 
 The error line is returned through `ctx` rather than in the `Err`,
 which keeps `str` as the error type everywhere. The entry may return

@@ -39,13 +39,19 @@ fn main() -> i32 {
     // The verifier proves every operand in range, once, so the handlers
     // can index registers and constants without bounds checks.
     var lim = Limits { nregs: chunk.nregs, nconsts: chunk.consts.len as u32 };
-    if Calc.verify(chunk.code, &lim).is_some() {
-        io.eprintln("error: the bytecode failed verification");
-        return 1;
-    }
+    let code = match Calc.verify(chunk.code, &lim) {
+        Ok(v) => v,
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: the bytecode failed verification: ");
+            e.write(&b);
+            io.eprintln(b.as_str());
+            return 1;
+        }
+    };
 
     let regs: *i64 = mem.alloc(chunk.nregs as u64);
-    match Calc.run(chunk.code.ptr, regs, chunk.consts.ptr) {
+    match Calc.run(code, regs, chunk.consts.ptr) {
         Ok(_) => 0,
         Err(msg) => { io.eprint("error: "); io.eprintln(msg); 1 }
     }

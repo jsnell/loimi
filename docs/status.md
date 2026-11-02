@@ -15,7 +15,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | `value` types | `nanbox`, `lowtag`, `boxed` representations; NaN canonicalization; tuple patterns merged into one test (xor/or/mask, umax). Integer payloads up to 48 bits (nanbox) or 61 bits (lowtag); more than 7 (nanbox) or 8 (lowtag) tagged variants when payloads are narrow, with tags sized to the payloads. Tag pinning (`= tag 0b001`) and `lowtag(bits = N)` are not implemented: lowtag uses 3-bit primary tags. |
 | `vm` declarations | state, context, operand kinds, fixed-width formats, inline caches (fields of any integer, float, `bool` or pointer type, wider ones spanning several code words with unaligned access; no GC references), `then OP` (typed operands of the following instruction), `family` + `become`, `super` (any number of parts, including family members; `become` in a part re-targets the super), vm functions (including `-> never` ones with control words, and `c: cache Name` parameters that receive the calling op's cache), entries, `on raise`/`raise`, `cold`, `sync`, `reload` (run after each `reenter` call in vm code), nested entries (`entry call(..) uses reenter`: a run above an active one, for natives calling guest code; callers need the effect; a generated thread-local `Vm.depth` counts them), in all three dispatch modes. |
 | Dispatch | `tailcall` (`preserve_none` + `musttail`, instruction word passed in a register), `goto` (one function, replicated `indirectbr`), `switch`. |
-| Generated per vm | encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode constants, `op_size`, `op_name`, the superinstruction peephole (`Vm.optimize`), deoptimization (`Vm.deopt`: every word back to its family's generic op, supers split, caches zeroed), the verifier (`Vm.verify`, with any number of `verify_context` parameters), label helpers (`Vm.set_label(w, off) -> ?W`, range-checked; `Vm.label(w) -> ?i64`), per-format field readers (`Vm.ABC_a(w)`) and per-op operand metadata (`Vm.operand_count(w)`, `Vm.operand_kind(w, i)`, `operand_bits`, `operand_signed`, `kind_name`, `kind_is_label`, `NUM_KINDS`), the disassembler (`Vm.disasm(code, &out)`, `Vm.disasm_insn(code, i, &out) -> size`, generic over the output buffer; operand kinds can declare `display "r{}"`). The items are named `Vm__X` in the vm's module: an op named like one of them (`label`, `verify`) is an error, and operand names starting with `__` are reserved. |
+| Generated per vm | encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode constants, `op_size`, `op_name`, the superinstruction peephole (`Vm.optimize`), deoptimization (`Vm.deopt`: every word back to its family's generic op, supers split, caches zeroed), the verifier (`Vm.verify -> Result<Verified<Vm>, Vm.VerifyError>`, with any number of `verify_context` parameters; the error says which word and which check, `e.write(&out)`), the proof type `Verified<Vm>` (opaque; `jump v`, `v.start()`, `v.words()`; `#[require_verified]` vms start entries only from one; `unsafe { Vm.assume_verified(code) }`, `Vm.placeholder()`), label helpers (`Vm.set_label(w, off) -> ?W`, range-checked; `Vm.label(w) -> ?i64`), per-format field readers (`Vm.ABC_a(w)`) and per-op operand metadata (`Vm.operand_count(w)`, `Vm.operand_kind(w, i)`, `operand_bits`, `operand_signed`, `kind_name`, `kind_is_label`, `NUM_KINDS`), the disassembler (`Vm.disasm(code, &out)`, `Vm.disasm_insn(code, i, &out) -> size`, generic over the output buffer; operand kinds can declare `display "r{}"`). The items are named `Vm__X` in the vm's module: an op named like one of them (`label`, `verify`) is an error, and operand names starting with `__` are reserved. |
 | Instrumentation | `variant NAME wraps all|[OPS] { before { .. } }`, switched with `use_variant`. `loimi build --vm-stats` counts executed ops and adjacent op pairs, and prints frequent pairs at exit as `super` declarations. |
 | GC | `object` types (with trailing arrays), generic `object` types (`object Obj<V> { .., inline: [V] }`; one type id and trace function per instance), `Gc<T>` (also over a type parameter, checked per instance), `new(heap, ..)`, `gc_mark`; `std.gc` mark-sweep written in Loimi; compiler-generated tracing (including pointers inside values); shadow-stack frames for traced locals; an optional generational mode (`heap.set_generational`: non-moving, sticky mark bits, an object-logging write barrier the compiler emits after every store of a reference into an object, `gc.write_barrier` for raw-pointer stores, verify mode); weak references (`heap.new_weak`) and ephemeron tables (`gc.Ephemerons`); `unsafe { p as Gc<T> }` from a pointer or address; effects (`uses sync/gc/reenter`), also on function types (`fn(*Heap) uses gc`), so calls through function pointers are checked and rooted. |
 | Closures | Non-escaping `block fn(A) -> R uses E` parameters and `|a, b| expr` literals, capturing by reference; only as call arguments, never stored or returned (checked). Effects of the body are checked against the type. Lowered to a separate function with an environment of slot pointers in the enclosing frame (small `let`s copied in); code and environment passed as two arguments, so LLVM specializes callees for a closure literal; plain functions convert through a trampoline. Not allowed in vm code. |
@@ -148,9 +148,16 @@ rejected (run by `cargo test`).
   part words, and "cannot fall off the end" (an op may continue if its
   handler uses `next` or reads `pc`; the scan is over tokens, so it errs
   toward "may continue"). Stack-effect checking for stack VMs is not
-  implemented, and there is no `Verified<V>` type: `Vm.run` takes a raw
-  code pointer, so nothing ties the code it runs, or the run-time state
-  (register window size, the closure's prototype), to what was verified.
+  implemented. `Verified<V>` (`language.md` §6) ties the code that runs
+  to a verification: `#[require_verified]` entries start only from one,
+  and Mini, Scheme and MiniJS keep it in their prototypes, so CALL
+  reaches only verified code. Not covered: the proof records nothing
+  about its verify context (the interpreter stores it next to the
+  context and must not change that afterwards), and raw jumps inside
+  the vm (return addresses, MiniJS's exception handler targets, which
+  come from a table the verifier does not see) are trusted to land on
+  boundaries of verified code. Keeping the proof in a field costs Mini
+  one load per call (`lowering.md` §11).
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
   not through an external `set_dispatch`.
 - **Front-end stdlib** (`std.lex`, `std.parse`, `std.diag`, `std.num`) is
@@ -186,7 +193,7 @@ rejected (run by `cargo test`).
   `std.rt` (beyond `protect`/`throw`), `std.prof`/`test`, variable-length encodings, and atomic `become` for shared code.
 - **Generated tooling not built** (described in `language.md` and
   `lowering.md`, marked there): a `Builder` type (emitters plus `std.bc`
-  do its job), `Verified<V>`, stack effects, generated C-ABI entry points
+  do its job), stack effects, generated C-ABI entry points
   (entries are internal functions; embedders write `export "C"`
   wrappers), `loimi vm suggest-supers` (`--vm-stats` prints the
   suggestions itself), handler ordering from profiles, the

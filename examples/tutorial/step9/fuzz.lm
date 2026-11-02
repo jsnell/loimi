@@ -44,10 +44,10 @@ fn Rng.below(r: *Rng, n: u64) -> u64 { if n == 0 { 0 } else { r.next() % n } }
 
 fn Rng.chance(r: *Rng, percent: u64) -> bool { r.below(100) < percent }
 
-/// Change one word of `p`'s code.
+/// Change one word of `p`'s code (before it is verified).
 fn mutate(r: *Rng, p: *Proto) {
-    let i = r.below(p.code.len);
-    var w = p.code[i];
+    let i = r.below(p.words.len);
+    var w = p.words[i];
     let k = r.below(100);
     if k < 40 {
         // One operand byte: usually a small number, sometimes anything.
@@ -61,12 +61,12 @@ fn mutate(r: *Rng, p: *Proto) {
         w = w ^ (1 << r.below(32));
     } else if k < 95 {
         // Another target, if the word is a jump.
-        let off = r.below(p.code.len + 4) as i64 - i as i64 - 2;
+        let off = r.below(p.words.len + 4) as i64 - i as i64 - 2;
         if let Some(j) = Pip.set_label(w, off) { w = j; }
     } else {
         w = r.next() as u32;
     }
-    p.code[i] = w;
+    p.words[i] = w;
 }
 
 struct Stats { rejected: u64, finished: u64, raised: u64, budget: u64 }
@@ -74,18 +74,24 @@ struct Stats { rejected: u64, finished: u64, raised: u64, budget: u64 }
 /// With -v, print the instruction each rejected program failed at.
 var VERBOSE: bool = false;
 
+/// Verify every function's words and store the proofs in `code`.
 fn verify_all(protos: *mem.Vec<*Proto>, nnames: u32, explain: bool) -> bool {
     for i in 0..protos.len {
         let p = protos.at(i);
-        if let Some(bad) = Pip.verify(p.code, p, nnames) {
-            if explain and VERBOSE {
-                var b = text.StrBuf.new();
-                b.push_str("rejected:");
-                Pip.disasm_insn(p.code, bad, &b);
-                io.eprint(b.as_str());
-                b.free();
+        match Pip.verify(p.words, p, nnames) {
+            Ok(v) => p.code = v,
+            Err(e) => {
+                if explain and VERBOSE {
+                    var b = text.StrBuf.new();
+                    b.push_str("rejected: ");
+                    e.write(&b);
+                    b.push_str("\n");
+                    Pip.disasm_insn(p.words, e.at, &b);
+                    io.eprint(b.as_str());
+                    b.free();
+                }
+                return false;
             }
-            return false;
         }
     }
     true
@@ -130,7 +136,10 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st:
     if !verify_all(&prog.protos, nnames, true) {
         st.rejected += 1;
     } else {
-        for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
+        for i in 0..prog.protos.len {
+            let p = prog.protos.at(i);
+            p.code = Pip.optimize(p.code);
+        }
         if !verify_all(&prog.protos, nnames, false) { bug(seed, "code does not verify after Pip.optimize"); }
         match Pip.run_budget(&m, prog.main) {
             Ok(_) => st.finished += 1,
@@ -142,7 +151,7 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st:
     // Everything this run allocated goes; the next run compiles afresh.
     for i in 0..prog.protos.len {
         let p = prog.protos.at(i);
-        mem.release(p.code.ptr);
+        mem.release(p.words.ptr);
         mem.release(p.lines.ptr);
         mem.release(p.consts.ptr);
         mem.release(p);

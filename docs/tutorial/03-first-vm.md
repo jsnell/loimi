@@ -50,10 +50,14 @@ declarations.
 ## The `vm` block
 
 ```loimi
+#[require_verified]
 pub vm Calc {
     // Live across every instruction, and kept in machine registers.
     state { pc: *u32, regs: *i64, k: *i64 }
 ```
+
+(`#[require_verified]` comes up below, in the section on running the
+code.)
 
 `state` lists the variables that live across every instruction: the
 program counter, the base of the register file, the constant table.
@@ -130,16 +134,17 @@ the first instruction:
 
 ```loimi
     // The way in: set up the state, then dispatch the first instruction.
-    entry run(code: *u32, r: *i64, consts: *i64) -> Result<(), str> {
-        pc = code;
+    entry run(code: Verified<Calc>, r: *i64, consts: *i64) -> Result<(), str> {
         regs = r;
         k = consts;
-        jump pc
+        jump code
     }
 ```
 
 The compiler turns this into a function `Calc.run(code, regs, consts)`
-that the rest of the program calls like any other.
+that the rest of the program calls like any other. `code` is not a
+pointer but a `Verified<Calc>`, verified code (below); `jump code` sets
+`pc` to its first word.
 
 ## What it compiles to
 
@@ -279,31 +284,47 @@ Before running, `main` verifies the code:
     // The verifier proves every operand in range, once, so the handlers
     // can index registers and constants without bounds checks.
     var lim = Limits { nregs: chunk.nregs, nconsts: chunk.consts.len as u32 };
-    if Calc.verify(chunk.code, &lim).is_some() {
-        io.eprintln("error: the bytecode failed verification");
-        return 1;
-    }
+    let code = match Calc.verify(chunk.code, &lim) {
+        Ok(v) => v,
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: the bytecode failed verification: ");
+            e.write(&b);
+            io.eprintln(b.as_str());
+            return 1;
+        }
+    };
 ```
 
-`Calc.verify` returns `None` for valid code, or the index of the first
-bad word. It checks that every word has a valid opcode, that every
+`Calc.verify` returns a `Result<Verified<Calc>, Calc.VerifyError>`. The
+error has the index of the first bad word (`e.at`), the reason as an
+enum (`e.reason`), and `e.write` describes it, for example
+``word 0 (LOADK): operand `c` (kst) fails `(it as u32) < lim.nconsts` ``.
+It checks that every word has a valid opcode, that every
 operand satisfies its kind's `verify` clause, that no instruction is cut
 off by the end of the code, that jumps land on instruction boundaries
 (chapter 5), and that execution cannot run off the end. Because of
 that, `regs[it]` in a handler compiles to a plain load, as you saw in the
 assembly: the check moved from run time to load time.
 
-Two things are still up to you, and the compiler says so in
-[`status.md`](../status.md): `run` takes a raw code pointer, so nothing
-forces you to verify before running; and the verifier knows only what
-you give it, so `lim` must describe the register file you actually
-allocate. Here `main` allocates exactly `chunk.nregs` registers.
+On success you get a `Verified<Calc>`: a proof that wraps the code
+slice. Only the verifier makes one (`v.start()`, `v.len()` and
+`v.words()` read it), and `run` takes nothing else, so code that was
+not verified cannot run. `#[require_verified]` makes the compiler hold
+the vm to that: every entry must start with a `jump` to a `Verified`,
+and a `jump` to a raw pointer in an entry is an error.
+
+Two things are still up to you. The verifier knows only what you give
+it, so `lim` must describe the register file you actually allocate;
+here `main` allocates exactly `chunk.nregs` registers. And a host that
+trusts code without checking it can say so with
+`unsafe { Calc.assume_verified(words) }`.
 
 ## Running it
 
 ```loimi
     let regs: *i64 = mem.alloc(chunk.nregs as u64);
-    match Calc.run(chunk.code.ptr, regs, chunk.consts.ptr) {
+    match Calc.run(code, regs, chunk.consts.ptr) {
         Ok(_) => 0,
         Err(msg) => { io.eprint("error: "); io.eprintln(msg); 1 }
     }

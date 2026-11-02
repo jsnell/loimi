@@ -95,10 +95,10 @@ starts from real programs: it compiles a corpus file, changes one to
 three words, and verifies the result:
 
 ```loimi
-/// Change one word of `p`'s code.
+/// Change one word of `p`'s code (before it is verified).
 fn mutate(r: *Rng, p: *Proto) {
-    let i = r.below(p.code.len);
-    var w = p.code[i];
+    let i = r.below(p.words.len);
+    var w = p.words[i];
     let k = r.below(100);
     if k < 40 {
         // One operand byte: usually a small number, sometimes anything.
@@ -112,28 +112,32 @@ fn mutate(r: *Rng, p: *Proto) {
         w = w ^ (1 << r.below(32));
     } else if k < 95 {
         // Another target, if the word is a jump.
-        let off = r.below(p.code.len + 4) as i64 - i as i64 - 2;
+        let off = r.below(p.words.len + 4) as i64 - i as i64 - 2;
         if let Some(j) = Pip.set_label(w, off) { w = j; }
     } else {
         w = r.next() as u32;
     }
-    p.code[i] = w;
+    p.words[i] = w;
 }
 ```
 
 The generated tools make this short: `Pip.NUM_OPS` and `Pip.set_label`
-come from the vm, and with `-v` the fuzzer prints each rejected word
-with the generated `Pip.disasm_insn`:
+come from the vm, and with `-v` the fuzzer prints why each program was
+rejected (`e.write`) and the word, with the generated `Pip.disasm_insn`:
 
 ```text
-rejected:    6  GETGLOBAL dst=r0 n=g6 [cache slot=0]
-rejected:    2  <invalid 0xa9d828b4>
-rejected:    3  ADD_F dst=r0 a=r4 b=r0
-rejected:   64  JMP target -> 324
+rejected: word 6 (GETGLOBAL): operand `n` (gname) fails `(it as u32) < nnames`
+    6  GETGLOBAL dst=r0 n=g6 [cache slot=0]
+rejected: word 2: invalid opcode
+    2  <invalid 0xa9d828b4>
+rejected: word 3 (JMP): operand `target` (label) fails `is_insn_boundary(pc + it)`
+    3  JMP target -> 196616
 ```
 
-Programs that pass go through the generated peephole pass and run under
-the step budget. Besides crashes, the fuzzer checks two properties the
+The mutations go to a prototype's `words`; `verify_all` verifies them
+and stores each proof in the prototype's `code`, as `main` does, so
+`run_budget` can only start code that passed. Programs that pass go
+through the generated peephole pass and run under the step budget. Besides crashes, the fuzzer checks two properties the
 vm must keep: code still verifies after `Pip.optimize` has fused supers,
 and after running, when sites have quickened and caches hold whatever
 the program left in them:
@@ -142,7 +146,10 @@ the program left in them:
     if !verify_all(&prog.protos, nnames, true) {
         st.rejected += 1;
     } else {
-        for i in 0..prog.protos.len { Pip.optimize(prog.protos.at(i).code); }
+        for i in 0..prog.protos.len {
+            let p = prog.protos.at(i);
+            p.code = Pip.optimize(p.code);
+        }
         if !verify_all(&prog.protos, nnames, false) { bug(seed, "code does not verify after Pip.optimize"); }
         match Pip.run_budget(&m, prog.main) {
             Ok(_) => st.finished += 1,

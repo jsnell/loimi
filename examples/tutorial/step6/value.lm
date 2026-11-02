@@ -3,6 +3,7 @@
 import std.hash;
 import std.num;
 import std.text;
+import vm.{Pip};
 
 /// One 64-bit word. A double is stored as itself; the other variants live
 /// in the NaN space, where no real computation produces a value (the
@@ -22,7 +23,12 @@ pub struct Proto {
     nparams: u32,
     /// The size of the function's register window.
     nregs: u32,
-    code: []u32,
+    /// The bytecode, as the compiler wrote it.
+    words: []u32,
+    /// The proof that `words` passed `Pip.verify`. The compiler sets a
+    /// placeholder; main stores the proof once every function is
+    /// compiled (the verifier needs the final number of globals).
+    code: Verified<Pip>,
     /// The source line of each code word.
     lines: []u32,
     consts: []Value,
