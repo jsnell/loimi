@@ -128,8 +128,9 @@ pub struct HandlerCx {
     /// Inside a `cold` block.
     pub cold: bool,
     /// The shared copy of `-> never` vm function `i`: `next` skips the
-    /// number of words in local `size`.
-    pub shared: Option<(usize, LocalId)>,
+    /// number of words in local `size`, and continues where local `cont`
+    /// says (`TVm::SharedNext`).
+    pub shared: Option<(usize, LocalId, LocalId)>,
     /// `-> never` vm functions being inlined here (to catch recursion).
     pub inlining: Vec<usize>,
     /// Parameters declared `cache Name` in scope: (name, handle local,
@@ -684,6 +685,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 parts: o.parts.iter().map(|&p| p as u32).collect(),
                 then: o.then.is_some(),
                 consts: o.kinds.iter().zip(&o.fields).filter(|(k, _)| kinds[**k].konst.is_some()).map(|(_, f)| (f.1, f.0)).collect(),
+                resume: vec![None; o.parts.len()],
             })
             .collect(),
         const_base: kinds.iter().find_map(|k| k.konst),
@@ -692,6 +694,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         raise_ty: raise_ty.clone(),
         variants: vec![],
         tbl_idx,
+        cont_fns: vec![],
     });
     c.vms.push(VmInfo {
         module: m,
@@ -742,7 +745,15 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     }
     for k in 0..c.vms[i].ops.len() {
         check_handler(c, vm, k)?;
+        // The resume functions its parts asked for (which may ask for
+        // more: a resume function's parts call shared copies too).
+        while let Some(j) = (0..c.prog.vms[i].ops[k].resume.len())
+            .find(|&j| c.prog.vms[i].ops[k].resume[j].is_some_and(|f| c.prog.fns[f as usize].body.is_none()))
+        {
+            check_resume(c, vm, k, j)?;
+        }
     }
+    shared_conts(c, i);
     for (fid, e) in entries {
         check_entry(c, vm, fid, &e)?;
     }
@@ -860,7 +871,13 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     let arg = |k: usize, t: &Ty| mk(t.clone(), TK::Vm(TVm::SharedArg(shared.unwrap_or(u32::MAX), k as u32)), span);
     let size = cx.temp(Ty::i64());
     cx.locals[size as usize].name = "next.size".into();
-    let mut lets = vec![TStmt::Let(size, Some(arg(params.len(), &Ty::i64())))];
+    // Where `next` continues: a super's resume function, or null.
+    let cont = cx.temp(Ty::Ptr(Box::new(Ty::u8())));
+    cx.locals[cont as usize].name = "next.cont".into();
+    let mut lets = vec![
+        TStmt::Let(size, Some(arg(params.len(), &Ty::i64()))),
+        TStmt::Let(cont, Some(mk(Ty::Ptr(Box::new(Ty::u8())), TK::Vm(TVm::SharedArg(shared.unwrap_or(u32::MAX), u32::MAX)), span))),
+    ];
     cx.scopes.push(vec![]);
     let mut cache_params = Vec::new();
     for (k, (p, t)) in decl.params.iter().zip(params.iter()).enumerate() {
@@ -870,7 +887,7 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     cx.vm = Some(HandlerCx {
         in_fn: true,
         cold: true,
-        shared: Some((j, size)),
+        shared: Some((j, size, cont)),
         inlining: vec![j],
         cache_params,
         ..HandlerCx::new(vm, state.clone())
@@ -965,10 +982,20 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
     if share {
         let fid = c.vms[vmi].never_fns[j].shared.unwrap();
         let int = |v: u32| mk(Ty::i64(), TK::Int(v as i128), span);
+        // `next` in the shared copy: from a super's part before the last,
+        // it continues in the super's next part, as an inlined copy does.
+        let cont = match (h.part, h.sup, h.shared) {
+            (Some((next_part, _)), Some((sk, _, _)), _) => {
+                let r = resume_fn(c, vmi, sk, next_part as usize);
+                Some(Box::new(mk(Ty::Ptr(Box::new(Ty::u8())), TK::FnRef(r), span)))
+            }
+            (_, _, Some((_, _, cl))) => Some(Box::new(mk(Ty::Ptr(Box::new(Ty::u8())), TK::Local(cl), span))),
+            _ => None,
+        };
         let size = match (h.part, h.op, h.shared) {
             (Some((_, size)), _, _) => int(size),
             (None, Some(op), _) => int(c.vms[vmi].ops[op].size),
-            (None, None, Some((caller, l))) => {
+            (None, None, Some((caller, l, _))) => {
                 c.vms[vmi].never_fns[caller].calls.push(j);
                 mk(Ty::i64(), TK::Local(l), span)
             }
@@ -988,7 +1015,7 @@ fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Spa
                 int(0)
             }
         };
-        return Ok(mk(Ty::Never, TK::Vm(TVm::Shared(fid, vals, Box::new(size))), span));
+        return Ok(mk(Ty::Never, TK::Vm(TVm::Shared(fid, vals, Box::new(size), cont)), span));
     }
     if recursive {
         return Err(Diag::new(
@@ -1065,10 +1092,78 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
 }
 
 fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
+    let fid = c.vms[vm as usize].ops[k].fid;
+    check_parts(c, vm, k, 0, fid)
+}
+
+/// The resume function of super `k` from part `start` on (`VmRole::Resume`).
+fn check_resume(c: &mut Checker, vm: u32, k: usize, start: usize) -> Res<()> {
+    let fid = c.prog.vms[vm as usize].ops[k].resume[start].unwrap();
+    check_parts(c, vm, k, start, fid)
+}
+
+/// Super `k`'s resume function for part `part` (tail-call mode), created
+/// on first use; its body is checked after the super's handler.
+fn resume_fn(c: &mut Checker, vmi: usize, k: usize, part: usize) -> FnId {
+    if let Some(f) = c.prog.vms[vmi].ops[k].resume[part] {
+        return f;
+    }
+    let vd = &c.prog.vms[vmi];
+    let (sym, name) = (format!("{}.op.{}.resume{}", vd.symbol, vd.ops[k].name, part), format!("{} (from part {})", vd.ops[k].name, part));
+    let (st, ret, span) = (vd.state_tys.clone(), vd.ret.clone(), c.vms[vmi].ops[k].span);
+    let f = new_fn(c, sym, name, st, ret, CallConv::PreserveNone, vmi as u32, VmRole::Resume(k as u32, part as u32), span);
+    c.prog.vms[vmi].ops[k].resume[part] = Some(f);
+    f
+}
+
+/// The shared copies that take a continuation (`VmDef::cont_fns`): those
+/// a super's part before the last calls, and those called from one that
+/// takes it.
+fn shared_conts(c: &mut Checker, vi: usize) {
+    let nfs = &c.vms[vi].never_fns;
+    let idx = |fid: FnId| nfs.iter().position(|n| n.shared == Some(fid));
+    let mut cont = vec![false; nfs.len()];
+    let mut edges: Vec<(Option<usize>, usize)> = Vec::new();
+    for f in c.prog.fns.iter() {
+        if f.vm != Some(vi as u32) {
+            continue;
+        }
+        let caller = match f.vm_role {
+            VmRole::Shared(i) => Some(i as usize),
+            _ => None,
+        };
+        let Some(body) = &f.body else { continue };
+        crate::tirwalk::for_each_expr(body, &mut |e| {
+            if let TK::Vm(TVm::Shared(callee, _, _, Some(k))) = &e.kind {
+                let Some(j) = idx(*callee) else { return };
+                match k.kind {
+                    TK::FnRef(_) => cont[j] = true,
+                    _ => edges.push((caller, j)),
+                }
+            }
+        });
+    }
+    loop {
+        let mut changed = false;
+        for &(a, b) in &edges {
+            if a.is_some_and(|a| cont[a]) && !cont[b] {
+                cont[b] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    c.prog.vms[vi].cont_fns = cont;
+}
+
+/// The handler of op `k` (`start` 0), or the resume function of super
+/// `k` from part `start` on: its parts from `start`, inlined in order.
+fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> Res<()> {
     let info = &c.vms[vm as usize];
     let m = info.module;
     let word = info.word;
-    let fid = info.ops[k].fid;
     let parts: Vec<usize> = if info.ops[k].parts.is_empty() { vec![k] } else { info.ops[k].parts.clone() };
     let fwd = info.ops[k].fwd.clone();
     let ret = info.ret.clone();
@@ -1081,9 +1176,13 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
     let mut prev_raws: Vec<LocalId> = Vec::new();
     for (j, &p) in parts.iter().enumerate() {
         let op = &c.vms[vm as usize].ops[p];
+        let size = op.size;
+        if j < start {
+            off += size;
+            continue;
+        }
         let span = op.span;
         let body = op.body.clone().unwrap();
-        let size = op.size;
         let name = op.name.clone();
         let fields = op.fields.clone();
         let params = op.params.clone();
@@ -1097,7 +1196,7 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
             // A forwarded operand is a copy of the previous part's field.
-            cx.locals[raw as usize].field = !fwd.iter().any(|l| l.0 == j && l.1 == pi);
+            cx.locals[raw as usize].field = !fwd.iter().any(|l| l.0 == j && l.1 == pi && j > start);
             // A forwarding variant (`#[forward] super`): an operand linked
             // to the register the previous part wrote is a copy of that
             // part's field (`optimize` checked that they are equal), so
@@ -1106,7 +1205,9 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             // round trip off a dependency chain. A copy, not the previous
             // part's local: cold blocks decode fields again from the
             // current word, and a copy is passed to them instead.
-            let init = match fwd.iter().find(|l| l.0 == j && l.1 == pi) {
+            // A resume function decodes its first part's fields from the
+            // part's own word (the variant's links say they are equal).
+            let init = match fwd.iter().find(|l| l.0 == j && l.1 == pi && j > start) {
                 Some(&(_, _, d)) => {
                     let (dl, rt) = (prev_raws[d], raw_ty(bits, signed));
                     let dt = cx.locals[dl as usize].ty.clone();
@@ -1287,15 +1388,21 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
     let never = |k: TVm| Ok(mk(Ty::Never, TK::Vm(k), span));
     match v {
         VmExpr::Next if h.op.is_none() && h.shared.is_some() => {
-            let (j, size) = h.shared.unwrap();
+            let (j, size, cont) = h.shared.unwrap();
             c.vms[vmi].never_fns[j].uses_next = true;
             let n = mk(Ty::i64(), TK::Local(size), span);
             let target = mk(pc_ty.clone(), TK::Intrinsic(Intr::PtrOffset, vec![pc(), n]), span);
-            never(TVm::Jump(Box::new(target)))
+            never(TVm::SharedNext(Box::new(target), j as u32, cont))
         }
         VmExpr::Next => {
             let op = need_op("next")?;
             if let Some((next_part, size)) = h.part {
+                // From a cold block, which tail-call mode outlines: the
+                // outlined function continues in the super's resume
+                // function for the next part.
+                if h.cold && c.prog.vms[vmi].dispatch == Dispatch::TailCall {
+                    resume_fn(c, vmi, h.sup.unwrap().0, next_part as usize);
+                }
                 return never(TVm::Fallthrough(size, next_part));
             }
             let size = c.vms[vmi].ops[op].size;

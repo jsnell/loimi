@@ -251,6 +251,15 @@ Notes:
   ...). Changed state variables come back in the return registers when there
   are a few (as a small struct), otherwise through `ctx.sync`. The error value
   for `raise` goes in `ctx.pending`.
+- *As implemented*, an outlined cold block (one that ends in control words
+  on every path) is a tail-called function with the handler's signature.
+  In a superinstruction, its `next` from a part before the last tail-calls
+  the super's **resume function** for the next part (`Mini.op.S.resume1`:
+  the handler from that part on, with `pc` at the part's word), so that
+  the rest of the super runs as it would in the handler, and as it does
+  in goto and switch modes. The same goes for `next` in a shared copy of
+  a `-> never` vm function called from such a part, which gets the resume
+  function in a thread-local slot.
 - Each handler is a separate symbol (`Mini.op.ADD`), so `perf` and other
   profilers attribute time per opcode without any extra tooling.
 

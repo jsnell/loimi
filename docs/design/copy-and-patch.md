@@ -123,7 +123,9 @@ separate function with the handler's signature, which re-decodes its
 operands from the `insn` register. The stencil passes the patched word
 and tail-calls the interpreter's copy. The cold path then ends in the
 interpreter's own dispatch: **every cold path is an exit to the
-interpreter**. Inline `cold { }` blocks (unit-typed, such as
+interpreter**. (A cold path's `next` in a super's part before the last
+continues in the interpreter's resume function for the rest of the
+super, as in the interpreter; see language.md, section 7.3.) Inline `cold { }` blocks (unit-typed, such as
 `gc.collect` before an allocation) stay in the stencil as calls.
 
 **Superinstructions** get stencils too. A super's handler is a sequence

@@ -104,9 +104,16 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
                 go(b);
                 go(c);
             }
-            TVm::Shared(_, args, size) => {
+            TVm::Shared(_, args, size, cont) => {
                 args.iter().for_each(|a| locals(a, used, declared));
                 locals(size, used, declared);
+                if let Some(c) = cont {
+                    locals(c, used, declared);
+                }
+            }
+            TVm::SharedNext(t, _, cont) => {
+                go(t);
+                push(used, *cont);
             }
             TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
             TVm::SharedArg(..) => {}
@@ -347,10 +354,14 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                 go(b, f);
                 go(c, f);
             }
-            TVm::Shared(_, args, size) => {
+            TVm::Shared(_, args, size, cont) => {
                 args.iter().for_each(|a| go(a, f));
                 go(size, f);
+                if let Some(c) = cont {
+                    go(c, f);
+                }
             }
+            TVm::SharedNext(t, _, _) => go(t, f),
             TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
             TVm::SharedArg(..) => {}
         },
@@ -428,10 +439,14 @@ pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
                 go(b);
                 go(c);
             }
-            TVm::Shared(_, args, size) => {
+            TVm::Shared(_, args, size, cont) => {
                 args.iter().for_each(&mut go);
                 go(size);
+                if let Some(c) = cont {
+                    go(c);
+                }
             }
+            TVm::SharedNext(t, _, _) => go(t),
             TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
             TVm::SharedArg(..) => {}
         },

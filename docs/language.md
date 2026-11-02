@@ -801,7 +801,9 @@ How a call is compiled depends on the dispatch mode and on where it is:
 
 The shared copy is reached like an outlined cold block: the arguments, and
 the size `next` skips, go through thread-local slots, and the state stays
-in registers. `#[inline]` on the function inlines every call;
+in registers. Called from a superinstruction's part before the last, it
+also gets where its `next` continues (the super's next part, section
+7.3), in one more slot; shared copies never called that way have none. `#[inline]` on the function inlines every call;
 `#[inline(never)]` makes every call in tail-call mode use the shared copy.
 
 **Passing the inline cache.** A vm function (either kind) can take the
@@ -1374,6 +1376,19 @@ The compiler builds the handler by inlining the component bodies in order.
 Paths of a component that end in `next` fall through into the next one.
 Other control words (`jump`, `raise`, ...) keep their meaning; `redo` in a
 later part runs that part's own word alone.
+
+Every `next` of a part before the last falls through, whichever path
+reaches it: from the hot path, from a `cold` block, or from a `-> never`
+vm function the part calls. In tail-call mode the last two leave the
+super's handler (the cold block is outlined, the function may be a
+shared copy), and continue in the super's *resume function* for the next
+part, a copy of the handler from that part on (`Vm.op.S.resumeN`, made
+only where some path needs it). So the later parts run as parts of the
+super in every dispatch mode and with the JIT: a `become` in them
+rewrites the head as described below, no instrumentation wrapper runs
+for them, and the same program ends up with the same code words. Only
+`redo` in a later part, and a jump to a part's word, run the word alone,
+as its own op.
 
 A part can name any op, including a specialized family member
 (`GETGLOBAL_C`, `ADD_F`). No two supers may have the same parts.

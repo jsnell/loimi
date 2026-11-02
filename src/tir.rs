@@ -210,10 +210,21 @@ pub enum TVm {
     Chain(u32),
     /// Tail-call mode: continue in the shared copy of a `-> never` vm
     /// function (its FnId), passing the arguments and the size `next`
-    /// skips through thread-local slots.
-    Shared(FnId, Vec<TExpr>, B),
-    /// In a shared copy: argument `i` (the last one is the `next` size).
+    /// skips through thread-local slots. The last part is where its
+    /// `next` continues: None to dispatch the following word (an op,
+    /// or a super's last part), `FnRef` of a super's resume function
+    /// (from a part before the last), or a shared copy's own
+    /// continuation `Local`. Only shared copies in `VmDef::cont_fns`
+    /// take it (`vmcheck::shared_conts`); the others ignore it.
+    Shared(FnId, Vec<TExpr>, B, Option<B>),
+    /// In a shared copy: argument `i` (the last one is the `next` size;
+    /// `u32::MAX` is the continuation).
     SharedArg(FnId, u32),
+    /// `next` in the shared copy of `-> never` vm function `i`
+    /// (`VmRole::Shared(i)`): dispatch the target, or, if the copy takes
+    /// a continuation and the one in local `cont` is not null, continue
+    /// there (in the super it was called from) with pc at the target.
+    SharedNext(B, u32, LocalId),
     /// A call that may collect or observe vm state: run the vm's `sync`
     /// block, keep traced locals visible to the GC, then call; for a call
     /// that may re-enter the vm, run its `reload` block after the call
@@ -401,6 +412,11 @@ pub enum VmRole {
     VmFn,
     /// Shared copy of the `-> never` vm function with this index (tail-call mode).
     Shared(u32),
+    /// Tail-call mode: the rest of superinstruction `op` from part
+    /// `part` on, with pc at that part's word. `next` in an earlier part
+    /// continues here when it leaves the super's handler (from an
+    /// outlined cold block or a shared copy), as it would inside it.
+    Resume(u32, u32),
     /// Instrumentation wrapper: (variant index, op index).
     Wrapper(u32, u32),
 }
@@ -417,6 +433,9 @@ pub struct VmOp {
     pub then: bool,
     /// Its fields of `const` operand kinds: (shift, bits).
     pub consts: Vec<(u32, u32)>,
+    /// A superinstruction's resume functions (`VmRole::Resume`) per part
+    /// (tail-call mode, created where needed).
+    pub resume: Vec<Option<FnId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -442,6 +461,10 @@ pub struct VmDef {
     pub tbl_idx: Option<usize>,
     /// The state register `const` operand kinds index (the constant pool).
     pub const_base: Option<usize>,
+    /// Shared copies of `-> never` vm functions (by index) that take a
+    /// continuation for `next` (`TVm::Shared`): those reachable from a
+    /// super's part before the last.
+    pub cont_fns: Vec<bool>,
 }
 
 /// A module-level `var`. `init` is a constant expression.

@@ -195,15 +195,19 @@ pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
     let mut refs: Vec<(FnId, Vec<FnId>)> = Vec::new();
     let mut out = std::collections::HashSet::new();
     for (fid, f) in p.fns.iter().enumerate() {
-        if f.vm != Some(vi as u32) || !matches!(f.vm_role, VmRole::Handler(_) | VmRole::Shared(_)) {
+        if f.vm != Some(vi as u32) || !matches!(f.vm_role, VmRole::Handler(_) | VmRole::Shared(_) | VmRole::Resume(..)) {
             continue;
         }
         let Some(body) = &f.body else { continue };
         let pc_local = f.vm_state[vd.pc_idx];
         let mut base = false;
-        let mut callees = Vec::new();
+        // A super's outlined cold blocks continue in its resume functions.
+        let mut callees: Vec<FnId> = match f.vm_role {
+            VmRole::Handler(k) => vd.ops[k as usize].resume.iter().flatten().copied().collect(),
+            _ => vec![],
+        };
         crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
-            TK::Vm(TVm::Jump(t)) => {
+            TK::Vm(TVm::Jump(t) | TVm::SharedNext(t, ..)) => {
                 if !matches!(jump_kind(t, pc_local), JumpKind::Const(_)) {
                     base = true;
                 }

@@ -31,7 +31,7 @@ pub struct HandlerGen {
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_) | VmRole::Resume(..)) => {
             p.vms[vm as usize].dispatch == Dispatch::TailCall
         }
         _ => false,
@@ -444,14 +444,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             g.val(b)
         }
         TVm::Jump(t) => {
-            let tv = g.val(t);
-            if crate::jitgen::counting(g) && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
-                let pc_local = g.f().vm_state[g.p().vms[g.vm.as_ref().unwrap().vm as usize].pc_idx];
-                let kind = crate::jitgen::jump_kind(t, pc_local);
-                jit_dispatch(g, &tv, kind);
-            } else {
-                dispatch(g, &tv);
-            }
+            jump_to(g, t);
             g.poison(&e.ty)
         }
         TVm::Exit(x) => {
@@ -536,9 +529,13 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
             let np = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc, size));
             if hg.outlined {
-                // Out of the super's handler: run the next part's word on
-                // its own (it holds an op of the part's family).
-                dispatch(g, &np);
+                // Out of the super's handler: continue in its resume
+                // function for the next part, as the handler would.
+                let VmRole::Handler(k) = g.f().vm_role else { unreachable!("outlined cold block outside an op handler") };
+                let r = vd.ops[k as usize].resume[*part as usize].expect("vmcheck creates the resume function");
+                g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
+                let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, np));
+                tail_to(g, vd, &format!("@\"{}\"", crate::jitgen::callee_symbol(g, r)), &w);
                 return g.poison(&e.ty);
             }
             g.emit(format!("store ptr {}, ptr {}", np, hg.state_slots[vd.pc_idx]));
@@ -579,7 +576,7 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             }
             g.poison(&e.ty)
         }
-        TVm::Shared(fid, args, size) => {
+        TVm::Shared(fid, args, size, cont) => {
             let p = g.p();
             let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
             for (i, a) in args.iter().chain(std::iter::once(&**size)).enumerate() {
@@ -587,14 +584,48 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 let slot = shared_slot(g, *fid, i, &a.ty);
                 g.store(&a.ty, &v, &slot);
             }
+            if takes_cont(p, vd, *fid) {
+                let v = match cont.as_deref() {
+                    Some(TExpr { kind: TK::FnRef(r), .. }) => format!("@\"{}\"", crate::jitgen::callee_symbol(g, *r)),
+                    Some(c) => g.val(c),
+                    None => "null".into(),
+                };
+                let t = Ty::Ptr(Box::new(Ty::u8()));
+                let slot = shared_slot(g, *fid, u32::MAX as usize, &t);
+                g.store(&t, &v, &slot);
+            }
             // Entries have no current instruction; the shared copy ignores it.
             let w = if g.vm.as_ref().unwrap().role == VmRole::Entry { "0".to_string() } else { current_word(g, vd) };
             tail_to(g, vd, &format!("@\"{}\"", crate::jitgen::callee_symbol(g, *fid)), &w);
             g.poison(&e.ty)
         }
         TVm::SharedArg(fid, i) => {
+            if *i == u32::MAX && !takes_cont(g.p(), &g.p().vms[g.vm.as_ref().unwrap().vm as usize], *fid) {
+                return "null".into();
+            }
             let slot = shared_slot(g, *fid, *i as usize, &e.ty);
             g.load(&e.ty, &slot)
+        }
+        TVm::SharedNext(t, j, cont) => {
+            let p = g.p();
+            let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
+            if vd.cont_fns[*j as usize] {
+                // Called from a super's part before the last: continue in
+                // the super's resume function for the next part.
+                let tv = g.val(t);
+                let slot = g.slots[*cont as usize].clone();
+                let c = g.inst(format!("load ptr, ptr {}", slot));
+                let is_null = g.inst(format!("icmp eq ptr {}, null", c));
+                let (yes, no) = (g.fresh_label("resume"), g.fresh_label("dispatch"));
+                g.cond_br(&is_null, &no, &yes);
+                g.label(&yes);
+                g.emit(format!("store ptr {}, ptr {}", tv, g.vm.as_ref().unwrap().state_slots[vd.pc_idx]));
+                let w = g.inst(format!("load i{}, ptr {}", vd.word.bits, tv));
+                tail_to(g, vd, &c, &w);
+                g.label(&no);
+            }
+            jump_to(g, t);
+            g.poison(&e.ty)
         }
         TVm::Synced(sync, call, reload) => {
             g.val(sync);
@@ -615,6 +646,23 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     }
 }
 
+/// `jump t`.
+fn jump_to(g: &mut FnGen, t: &TExpr) {
+    let tv = g.val(t);
+    if crate::jitgen::counting(g) && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
+        let pc_local = g.f().vm_state[g.p().vms[g.vm.as_ref().unwrap().vm as usize].pc_idx];
+        let kind = crate::jitgen::jump_kind(t, pc_local);
+        jit_dispatch(g, &tv, kind);
+    } else {
+        dispatch(g, &tv);
+    }
+}
+
+/// Whether the shared copy `fid` takes a continuation for `next`.
+fn takes_cont(p: &Program, vd: &VmDef, fid: FnId) -> bool {
+    matches!(p.fns[fid as usize].vm_role, VmRole::Shared(j) if vd.cont_fns[j as usize])
+}
+
 /// A cold block in a tail-call op handler that ends in control words on
 /// every path can move to its own function, reached by `musttail`: the hot
 /// path then makes no calls and needs no stack frame.
@@ -628,7 +676,9 @@ fn can_outline(g: &FnGen, b: &TExpr) -> bool {
     }
     match g.f().vm_role {
         // In a superinstruction, `next` from a part other than the last
-        // dispatches the next part's word when outlined.
+        // continues in the super's resume function when outlined. Resume
+        // functions are only reached from slow paths: their cold blocks
+        // stay in.
         VmRole::Handler(_) => true,
         _ => false,
     }
@@ -798,7 +848,11 @@ fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
 /// `-> never` vm function.
 fn shared_slot(g: &mut FnGen, fid: FnId, i: usize, t: &Ty) -> String {
     let p = g.p();
-    let name = format!("@\"{}.a{}\"", p.fns[fid as usize].symbol, i);
+    let name = if i == u32::MAX as usize {
+        format!("@\"{}.cont\"", p.fns[fid as usize].symbol)
+    } else {
+        format!("@\"{}.a{}\"", p.fns[fid as usize].symbol, i)
+    };
     if g.cg.tls_defined.insert(name.clone()) {
         let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", name, llty(p, t));
     }
@@ -1048,7 +1102,7 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: boo
 /// emitted inside their entries).
 pub fn standalone(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_) | VmRole::Resume(..)) => {
             p.vms[vm as usize].dispatch == Dispatch::TailCall
         }
         _ => true,
