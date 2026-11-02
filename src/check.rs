@@ -927,7 +927,7 @@ impl<'a> Checker<'a> {
             }
         }
         Err(Diag::new(
-            e.span,
+            value_span(&e),
             format!("mismatched types: expected `{}`, found `{}`", self.ty_name(want), self.ty_name(&e.ty)),
         ))
     }
@@ -2999,6 +2999,15 @@ trait SpanOf {
 impl SpanOf for FnDecl {
     fn span(&self) -> Span {
         self.name.span
+    }
+}
+
+/// Where the value of `e` comes from, for errors about its type: a
+/// block's tail expression rather than its `{`.
+fn value_span(e: &TExpr) -> Span {
+    match &e.kind {
+        TK::Block(_, Some(t)) if t.ty == e.ty => value_span(t),
+        _ => e.span,
     }
 }
 

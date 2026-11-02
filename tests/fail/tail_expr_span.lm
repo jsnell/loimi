@@ -1,0 +1,9 @@
+// A type mismatch in a function's tail expression points at the
+// expression, not at the function's `{`.
+fn f(x: u32) -> bool {
+    let y = x + 1;
+    y
+}
+fn main() {}
+// error: mismatched types: expected `bool`, found `u32`
+// error: tail_expr_span.lm:5:5
