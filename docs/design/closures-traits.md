@@ -423,3 +423,184 @@ As proposed in section 1, with these choices and differences:
 - Not converted: `std.obj.index_keys_first` and `Model`'s `new_slots`
   still take function pointers (the latter is stored, so it is a trait
   candidate rather than a closure), and `HashMap` has no `each`.
+
+## Escaping closures
+
+Status: designed and built 2026-11-02 (see "As built" at the end of this
+section). Language-level description in `language.md` §1.2 ("Escaping
+closures").
+
+### What the users need
+
+`block fn` covers callbacks that run during the call that receives them.
+Interpreter and front-end code also has callbacks that are **stored**:
+
+- builtin tables whose entries close over some context (`print` bound to
+  an output buffer, a native bound to a module table);
+- hooks registered with a parser, a REPL or a host, called much later;
+- iterators and generators in front-end code (`next()` over a token
+  stream, a fresh-name supply);
+- a comparator or key function kept in a configuration struct.
+
+Today all of these are a `fn(*Ctx, ..)` pointer plus a `*Ctx` that the
+user stores next to it and casts back: the C/Zig/Odin idiom. It works,
+but every API has to carry the pair, and generic containers cannot hold
+"a callable" without knowing the context type.
+
+### How other languages do it
+
+| Language | Escaping closure | Env storage | Freed by |
+|---|---|---|---|
+| C, Zig, Odin | none: fn pointer + `void *` / `*anyopaque` / `rawptr` | the caller's choice | the caller |
+| C3 | lambdas without captures only | none | – |
+| Rust | anonymous type `impl Fn`; `Box<dyn Fn>` to store | inline or `Box` (global allocator) | drop |
+| C++ | `std::function` | small-buffer or `new` | destructor |
+| Apple blocks | stack block, `Block_copy` to escape | malloc, refcounted | `Block_release` |
+| Go, Swift, OCaml, JS | every closure | GC / refcount heap, implicit | GC / refcount |
+
+Rust is the only one in this list that is both safe and allocation-
+explicit, and it needs a borrow checker for by-reference captures and
+destructors for freeing; Loimi has neither. The systems languages without
+GC (Zig, Odin, C3) chose not to have closures at all. The GC'd languages
+allocate implicitly, which Loimi rules out ("no hidden allocation").
+
+### Design
+
+**Two types, one representation per type.**
+
+- `fn(A) -> R uses E` stays a thin code pointer. Nothing changes for it.
+- `block fn(A) -> R uses E` stays the non-escaping pair (by-reference
+  captures, parameter-only). Nothing changes for it.
+- **`closure fn(A) -> R uses E`** (new) is an ordinary value type: a fat
+  pointer `{ code: ptr, env: ptr }`, 16 bytes, copyable, storable in
+  fields, locals, globals, `Vec`s and `?` options, returnable, usable as
+  a type argument. The code takes the environment as a hidden first
+  argument, `R code(ptr env, A..)`, the same convention as `block fn`.
+  It is **not traced**: its environment is host memory.
+- **`Gc<closure fn(A) -> R uses E>`** (new) is a closure whose
+  environment is a GC object: a thin traced reference to an object
+  `{ code, captures.. }` with a generated trace function, like any
+  `object`. It is rooted, traced and write-barriered by the existing
+  `Gc<T>` machinery and freed by the collector.
+
+The fat/thin split keeps both cheap where it matters: the untraced kind
+costs no rooting or barriers when stored and called, and the GC kind is
+one word that the collector already understands. A separate `closure`
+keyword (rather than making `fn` fat) keeps plain function pointers thin
+and every existing signature, C ABI and IR unchanged.
+
+**Creation is an explicit allocation.** A closure literal that escapes is
+written as the second argument of `new`, whose first argument says where
+the environment goes:
+
+```loimi
+let add = new(&arena, |x: i64| x + k);      // closure fn(i64) -> i64, env in the arena
+let hook = new(heap, |v: Value| log(v, tag)); // Gc<closure fn(Value)>, env in the GC heap
+```
+
+- `new(a, |..| ..)` with any `a` that has a method
+  `alloc_bytes(n: u64, align: u64) -> *u8` (`*mem.Arena` has it; so can
+  a user's allocator) gives a `closure fn`. The environment is one call
+  of that method; a closure that captures nothing allocates nothing
+  (null environment).
+- `new(heap, |..| ..)` with `heap: *gc.Heap` gives a
+  `Gc<closure fn(..)>`, allocated like `new(heap, Obj { .. })`
+  (allocation does not collect, so this has no effect).
+- The closure's parameter and result types come from the expected type
+  (`let f: closure fn(i64) -> i64 = new(..)`, a field, an argument) or
+  from annotations on the literal.
+
+This is the "default plus explicit alternative" the requirements ask
+for: arena-allocated environments are the default for host code (they
+match how the rest of a Loimi front end manages memory: an AST arena, a
+compilation arena), and the GC heap is the alternative for closures that
+hold guest values. There is no hidden allocator: no `new`, no closure.
+
+**Captures are by value.** The environment holds a copy of each captured
+local, made when the closure is created. Consequences:
+
+- Nothing in the environment points into the creating frame, so the
+  closure can outlive it. There is no by-reference capture syntax; the
+  checker rejects the cases where a reference would escape or where
+  by-reference semantics would be expected:
+  - **assigning a captured local** inside the body (also `x += 1`, and
+    from a `block fn` closure nested in the body) is an error ("captured
+    by value: the closure has its own copy; keep shared state behind a
+    pointer");
+  - **capturing a `block fn`** parameter is an error (it only lives
+    during the call that received it);
+  - capturing a pointer is allowed (pointers carry no lifetime in Loimi,
+    §1.3); `&local` *inside* the body refers to the environment's copy,
+    which lives as long as the closure.
+- State that the closure updates (a counter, a generator's position)
+  lives behind a pointer the closure captures (allocated in the same arena),
+  which makes sharing explicit.
+
+**GC rules.**
+
+- A `closure fn` environment is not traced, so capturing a traced value
+  (`Gc<T>`, a `value` type with references, a struct holding one) in
+  `new(&arena, ..)` is an error that points at `new(heap, ..)`.
+- A `Gc<closure fn>` environment is an object type generated per closure
+  literal (a type id and trace function, like a generic object
+  instance), so captured references are marked through it.
+- Inside the closure body, the environment object is a traced local of
+  the closure's function (a hidden one), so it stays alive and its
+  captures stay reachable across the body's own `gc` calls even if the
+  caller dropped its reference.
+- Captures of a GC closure are read-only, and taking the address of a
+  traced capture is an error, so no store into the environment object can
+  miss the generational write barrier.
+
+**Effects.** As for `fn` and `block fn` (section 0): the body may only
+make calls its type allows, calling a closure has its type's effects
+(with `sync` wrapping in handlers and shadow-stack frames for `gc`), and
+a closure converts to a type with more effects. `closure fn` and
+`Gc<closure fn>` calls go through the same `finish_call` and
+`push_frame` paths.
+
+**Conversions.**
+
+- A plain function (or `fn` value) converts to `closure fn` without
+  allocating: code is the per-signature trampoline already used for
+  `block fn`, the environment is the function pointer. A builtin table
+  can mix plain functions and closures.
+- A `closure fn` converts to `block fn` for free (same representation),
+  so a stored comparator can be passed to `sort_by`.
+- Nothing converts to `Gc<closure fn>` except `new(heap, ..)`, and a
+  `Gc<closure fn>` does not convert to `closure fn` or `block fn` (an
+  untraced copy would not keep the object alive).
+
+**vm code.** Creating any closure stays forbidden in vm code (the reasons
+in section 1 apply: no control words in the body, no capture of state
+variables). Calling a stored `closure fn` or `Gc<closure fn>` from a
+handler or vm function is allowed: it is an indirect call like a `fn`
+field, synced and rooted per its effects. vm functions may take
+`closure fn` parameters. Hot paths are unaffected: nothing allocates
+unless the source says `new`.
+
+**C ABI.** Neither type crosses into C (`export "C"`, `extern`, the
+header generator reject them): pass a plain `fn` and a context pointer.
+That is also how a C host's callback is wrapped on the Loimi side.
+
+**Freeing.** The allocator owns the environment: an arena frees all its
+closures with `arena.free()`; GC closures are collected. A closure used
+after its arena was freed is a use-after-free, like any pointer into the
+arena (`--sanitize=address` reports it); the compiler cannot detect it.
+There is no per-closure `free` (see "Left out").
+
+**Generic code.** `closure fn(T) -> U` is an ordinary type: it unifies
+like `fn` types in inference (`fn map<T, U>(xs: []T, f: closure fn(T) ->
+U)`), can be a type argument (`Vec<closure fn(i64) -> i64>`), and a
+generic function over `F` can take closures of any signature.
+
+### Left out (for now)
+
+- Per-closure freeing of a malloc'd environment (`mem.release` of the
+  environment needs a way to tell a real environment from a converted
+  plain function's; an arena per lifetime or the GC covers the uses in
+  the repository).
+- Mutable captures (`FnMut`-style state in the environment).
+- `Gc<closure fn>` to `block fn` (needs the object rooted for the
+  duration of the call).
+- Closures as C callbacks (code + data pair in the header).
