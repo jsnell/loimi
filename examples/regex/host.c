@@ -164,7 +164,7 @@ static const Bench benches[] = {
     { "words", "\\w+", 0 },
     { "capture", "(\\w+)\\s+(\\w+)", 0 },
     { "alt-heavy", "(?:fox|dog|cat|bird|lazy)\\s(?:over|jumps|end)", 0 },
-    { "dot-star", "x9.*end$", 0 },
+    { "dot-star", "x9.*end", 0 },
     { "pathological", "(a*)*b", 1 },
 };
 
@@ -207,8 +207,8 @@ static int bench(int argc, char **argv) {
     /* The pathological case: (a*)*b against a^k, exponential in k for a
      * backtracker (Python too). */
     char path[32];
-    memset(path, 'a', 24);
-    path[24] = 0;
+    memset(path, 'a', 22);
+    path[22] = 0;
     printf("%-14s %10s %8s %10s %10s %10s %10s\n", "bench", "matches", "", "rx-bt", "rx-pike", "pcre2", "pcre2-jit");
     for (size_t b = 0; b < sizeof benches / sizeof benches[0]; b++) {
         const Bench *B = &benches[b];

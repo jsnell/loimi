@@ -1,0 +1,78 @@
+# MODE<TAB>PATTERN<TAB>SUBJECT (Python escapes in SUBJECT)
+search	abc	xxabcxx
+search	abc	ababab
+match	abc	xabc
+match	a.c	abc
+search	a.c	a\nc
+search	[a-z]+	123hello456
+search	[^a-z]+	hello123
+search	[]a]+	x]a]y
+search	[^]a]+	]]bcd
+search	[a-]+	x-a-y
+search	\d+	abc 2024 x
+search	\D+	2024abc5
+search	\w+	  foo_bar9 !
+search	\W+	foo, bar
+search	\s+	a \t\n b
+search	\S+	   xyz
+search	[\d\s]+	ab 12 3cd
+search	\.	a.b
+search	a\*b	xa*by
+search	^abc	abcabc
+search	^abc	xabc
+search	abc$	abcabc
+search	abc$	abc\n
+search	abc$	abc\n\n
+search	^$
+search	^$	\n
+search	$	ab\n
+search	a|b|c	xxcba
+search	ab|abc	abc
+search	abc|ab	abc
+search	(a|ab)(c|bcd)(d*)	abcd
+search	(a+)(b+)?	aab
+search	(a+)(b+)?	aa
+search	(a*)+	b
+search	(a*)*	b
+search	(a?)*	aab
+search	(a|b)*	abba
+search	(a|b)*?c	abbac
+search	a*?	aaa
+search	a+?	aaa
+search	a??b	ab
+search	(a+?)(a*)	aaaa
+search	(a*?)(a*?)$	aaa
+search	a{3}	aaaaa
+search	a{2,3}	aaaaa
+search	a{2,}	aaaaa
+search	a{,2}	aaaaa
+search	a{2,3}?	aaaaa
+search	(ab){2}	abababab
+search	(?:ab)+c	ababcab
+search	((a)|b)+	ab
+search	(a)|b	b
+search	(?:(a)|b)*	ab
+search	(x)?y	y
+search	a{	a{
+search	a{1	a{1
+search	a{x}	a{x}
+search	\n	a\nb
+search	(((a)))	a
+search	(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)	abcdefghijk
+search	x*	aaa
+search	(|a)+	aa
+search	(a|)+	aa
+search	(a*)+$	aab
+search	(?:a*|b)*c	abbc
+search	.*	ab\ncd
+search	.*$	ab\ncd
+search	\w+@\w+\.com	mail bob@example.com
+search	(\d+)-(\d+)	tel 555-1234 x
+search	[	x
+search	a(	x
+search	a)	x
+search	*a	x
+search	a**	x
+search	a{3,2}	x
+search	\q	x
+search	[b-a]	x

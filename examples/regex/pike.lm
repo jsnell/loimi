@@ -63,10 +63,17 @@ fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end:
     while let Some(wk) = p.work.pop() {
         if wk.slot != NONE { p.cur[wk.slot as u64] = wk.val; continue; }
         let pc = wk.pc as u64;
-        if p.seen[pc] == p.gen { continue; }
-        p.seen[pc] = p.gen;
         let w = code[pc];
         let op = Rx.opcode(w);
+        // A pc is followed once per step, so the first (highest priority)
+        // thread to reach it wins. SAVE, MARK and LOOP are exempt: a later
+        // arrival through an empty loop iteration has different marks, and
+        // the backtracker would let it take that iteration. Every cycle
+        // passes through a SPLIT or JMP, so this still terminates.
+        if op != Rx.OP_SAVE and op != Rx.OP_MARK and op != Rx.OP_LOOP {
+            if p.seen[pc] == p.gen { continue; }
+            p.seen[pc] = p.gen;
+        }
         if op == Rx.OP_JMP {
             p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
         } else if op == Rx.OP_SPLIT {
@@ -126,7 +133,6 @@ pub fn run(r: *Regex, p: *Pike, input: *u8, end: u64, start: u64, searching: boo
     reset(p);
     p.add(code, clist, 0, input, sp, end, nslots);
     loop {
-        if clist.n == 0 { break; }
         p.gen += 1;
         nlist.n = 0;
         let c: u8 = if sp < end { input[sp] } else { 0 };
@@ -137,6 +143,7 @@ pub fn run(r: *Regex, p: *Pike, input: *u8, end: u64, start: u64, searching: boo
             let op = Rx.opcode(w);
             var ok = false;
             if op == Rx.OP_MATCH {
+                // Threads after this one have lower priority: drop them.
                 mem.copy(r.slots, clist.caps + i * p.nsl, nslots);
                 matched = true;
                 break;
@@ -153,26 +160,21 @@ pub fn run(r: *Regex, p: *Pike, input: *u8, end: u64, start: u64, searching: boo
         }
         if sp >= end { break; }
         if !matched and unanchored {
-            var next = sp + 1;
             if nlist.n == 0 and !r.first_all {
                 // Nothing alive: skip to a byte that can start a match.
-                next = skip(r, input, next, end);
-                if next >= end { break; }
-            }
-            if next == sp + 1 {
-                reset(p);
-                p.add(code, nlist, 0, input, sp + 1, end, nslots);
-            } else {
-                // nlist is empty: start afresh at `next`.
-                sp = next;
-                p.gen += 1;
-                nlist.n = 0;
+                let nx = skip(r, input, sp + 1, end);
+                if nx >= end { break; }
+                sp = nx;
                 reset(p);
                 p.add(code, nlist, 0, input, sp, end, nslots);
                 let t = clist; clist = nlist; nlist = t;
                 continue;
             }
+            // The lowest-priority thread: a match starting at sp + 1.
+            reset(p);
+            p.add(code, nlist, 0, input, sp + 1, end, nslots);
         }
+        if nlist.n == 0 and (matched or !unanchored) { break; }
         let t = clist; clist = nlist; nlist = t;
         sp += 1;
     }
