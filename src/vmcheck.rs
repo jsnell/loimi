@@ -120,17 +120,10 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
     crate::values::check_value_decl(c, m, v)
 }
 
-fn raw_ty(bits: u32, signed: bool) -> Ty {
-    let b = if bits <= 8 {
-        8
-    } else if bits <= 16 {
-        16
-    } else if bits <= 32 {
-        32
-    } else {
-        64
-    };
-    Ty::Int(IntTy { signed, bits: b })
+/// Operand fields decode to 64-bit integers, whatever their width: they
+/// are mostly indices, and `regs[a + 1]` should be a plain 64-bit add.
+fn raw_ty(_bits: u32, signed: bool) -> Ty {
+    Ty::Int(IntTy { signed, bits: 64 })
 }
 
 /// Decode a field of the current code word.

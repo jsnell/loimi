@@ -167,7 +167,8 @@ impl VmLayout {
 
 /// Source expression decoding field (bits, shift, signed) of word `w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
-    let rt = field_ty(bits, signed);
+    // As in handlers: operand fields are 64-bit.
+    let rt = if signed { "i64" } else { "u64" };
     if signed {
         format!(
             "(((w << {}) as i{wb}) >> {}) as {}",

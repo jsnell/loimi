@@ -1,0 +1,41 @@
+// matrix: dispatch
+// args: --release
+// Operand fields decode to u64 / i64, so index arithmetic on an 8-bit
+// field does not wrap at 256.
+import std.io;
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand base = it;
+    operand simm = it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    // R[a + 1] = R[a] + R[a + 2]
+    op ADD3(a: base) : ABC { regs[a + 1] = regs[a] + regs[a + 2]; next }
+    op ADDI(dst: reg, v: simm) : AsBx { dst = dst + v; next }
+    op RET(a: base) : ABC { exit regs[a + 1] }
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var regs: [i64; 260] = [0; 260];
+    let c = code[..];
+    regs[255] = 40;
+    regs[257] = 2;
+    var at: u64 = 0;
+    at = V.emit.ADD3(c, at, 255);
+    at = V.emit.ADDI(c, at, 0, -5);
+    at = V.emit.RET(c, at, 255);
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+    io.print_int(regs[0]); io.println("");
+}
+// expect: 42
+// expect: -5

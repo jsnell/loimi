@@ -49,6 +49,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
   cold blocks, and all cold blocks in goto/switch mode, stay inline and are
   marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
+- **Operand fields** decode to `u64` / `i64` in handlers and verify
+  clauses, whatever their width (the design left them at the field width).
 - **`-> never` vm functions** are inlined into each call site, except
   that in tail-call mode, calls from `cold` blocks (and recursive calls)
   `musttail` to one shared copy that receives its arguments through

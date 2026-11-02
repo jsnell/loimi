@@ -277,9 +277,14 @@ operand upv   = ctx.closure.upvals[it] verify it < proto.nupvals;
 (typically the function prototype being checked, `verify_context proto: Gc<Proto>;`).
 
 If the expression is a place (like `regs[it]`), the operand is assignable:
-`dst = Int(1)` writes the register. `x.raw` gives the undecoded field. The raw
-field's width and signedness come from the format, so one `label` kind serves
-8-bit and 24-bit offsets alike.
+`dst = Int(1)` writes the register. `x.raw` gives the undecoded field.
+
+The raw field `it` (and `x.raw`) is a `u64`, or an `i64` for a signed field
+(sign-extended), whatever the field's width: most fields are indices, and
+`regs[a + 1]` should be one 64-bit add, not a wrapping 8-bit add and a
+zero-extension. The width and signedness come from the format and matter
+to the encoders (`Vm.OP(a: u8, ..)`), so one `label` kind serves 8-bit and
+24-bit offsets alike.
 
 ### 3.3 Encodings and formats
 
