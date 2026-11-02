@@ -13,6 +13,7 @@ pub enum Def {
     Value(u32),
     Fn(FnId),
     Const(u32),
+    Global(u32),
     Module(usize),
     Vm(u32),
     GenericType(u32),
@@ -89,6 +90,7 @@ pub struct Checker<'a> {
     pub scopes: Vec<HashMap<String, (Def, bool)>>,
     pub methods: HashMap<(Ty, String), FnId>,
     pub consts: Vec<ConstInfo>,
+    pub global_decls: Vec<(usize, GlobalDecl)>,
     pub pending: Vec<(FnId, usize, FnDecl, Vec<(String, Ty)>)>,
     pub generics: crate::generics::Generics,
     /// Type parameters in scope (while resolving generic instances).
@@ -119,6 +121,7 @@ impl<'a> Checker<'a> {
             scopes: vec![HashMap::new(); modules.len()],
             methods: HashMap::new(),
             consts: vec![],
+            global_decls: vec![],
             pending: vec![],
             vm_decls: vec![],
             dispatch_override: None,
@@ -230,6 +233,11 @@ impl<'a> Checker<'a> {
                         self.consts.push(ConstInfo { module: m, decl: c.clone(), value: None, busy: false });
                         self.define(m, &c.name, Def::Const(id), c.is_pub)?;
                     }
+                    Item::Global(g) => {
+                        let id = self.global_decls.len() as u32;
+                        self.global_decls.push((m, g.clone()));
+                        self.define(m, &g.name, Def::Global(id), g.is_pub)?;
+                    }
                     Item::Vm(v) => {
                         let id = self.vm_decls.len() as u32;
                         self.vm_decls.push((m, (**v).clone()));
@@ -340,6 +348,22 @@ impl<'a> Checker<'a> {
             if self.generics.methods.insert((t, mname.name.clone()), g as u32).is_some() {
                 return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
             }
+        }
+        // Module-level `var`s: types and constant initializers.
+        for i in 0..self.global_decls.len() {
+            let (m, g) = self.global_decls[i].clone();
+            let ty = self.resolve_type(m, &g.ty)?;
+            let mut cx = FnCx::new(m, Ty::Unit);
+            let v = self.expr(&mut cx, &g.value, Some(&ty))?;
+            let init = fold_deep(&self.coerce(v, &ty)?);
+            if let Some(bad) = self.static_init_error(&init) {
+                return Err(Diag::new(
+                    bad,
+                    "the initializer of a module-level `var` must be a constant expression (literals, `[x; N]`, struct, tuple, array and enum literals of constants, functions)",
+                ));
+            }
+            let symbol = format!("{}.{}", self.module_prefix(m), g.name.name);
+            self.prog.globals.push(GlobalDef { symbol, ty, init, thread_local: g.thread_local });
         }
         // Pass 5: vm declarations (generates handler functions).
         for i in 0..self.vm_decls.len() {
@@ -1516,6 +1540,7 @@ impl<'a> Checker<'a> {
                 v.span = span;
                 Ok(v)
             }
+            Def::Global(id) => Ok(mk(self.prog.globals[id as usize].ty.clone(), TK::Global(id), span)),
             _ => Err(Diag::new(span, format!("`{}` is not a value", name))),
         }
     }
@@ -2211,6 +2236,26 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The span of the first part of a global's initializer that cannot be
+    /// emitted as an LLVM constant, if any.
+    fn static_init_error(&self, e: &TExpr) -> Option<Span> {
+        let all = |es: &[TExpr]| es.iter().find_map(|x| self.static_init_error(x));
+        match &e.kind {
+            TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::FnRef(_) => {
+                if matches!(e.ty, Ty::Value(_)) { Some(e.span) } else { None }
+            }
+            TK::Struct(es) | TK::Tuple(es) | TK::Array(es) => all(es),
+            TK::ArrayRepeat(v, _) => self.static_init_error(v),
+            TK::Variant(_, es) => match &e.ty {
+                Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) if es.is_empty() => None,
+                Ty::Enum(_) => Some(e.span),
+                Ty::Option(_) | Ty::Result(..) => all(es),
+                _ => Some(e.span),
+            },
+            _ => Some(e.span),
+        }
+    }
+
     fn check_assignable(&self, cx: &FnCx, e: &TExpr, span: Span) -> Res<()> {
         match &e.kind {
             TK::Local(id) => {
@@ -2220,7 +2265,7 @@ impl<'a> Checker<'a> {
                 }
                 Ok(())
             }
-            TK::Deref(_) => Ok(()),
+            TK::Deref(_) | TK::Global(_) => Ok(()),
             TK::Field(b, _) => {
                 if matches!(b.ty, Ty::Slice(_)) {
                     return Err(Diag::new(span, "cannot assign to a slice's length or pointer"));
@@ -2309,7 +2354,7 @@ pub fn prim_type(name: &str) -> Option<Ty> {
 
 pub fn is_place(e: &TExpr) -> bool {
     match &e.kind {
-        TK::Local(_) | TK::Deref(_) => true,
+        TK::Local(_) | TK::Deref(_) | TK::Global(_) => true,
         TK::Field(b, _) => is_place(b) || matches!(b.ty, Ty::Slice(_)),
         TK::Index(b, _) => !matches!(b.ty, Ty::Array(..)) || is_place(b),
         TK::Vm(TVm::Word(_)) => true,
@@ -2381,6 +2426,21 @@ pub fn fold(e: &TExpr) -> TExpr {
         _ => e.kind.clone(),
     };
     TExpr { ty: e.ty.clone(), kind: k, span: e.span }
+}
+
+/// `fold` applied to every element of aggregate literals.
+pub fn fold_deep(e: &TExpr) -> TExpr {
+    let e = fold(e);
+    let all = |es: &[TExpr]| es.iter().map(fold_deep).collect::<Vec<_>>();
+    let kind = match &e.kind {
+        TK::Struct(es) => TK::Struct(all(es)),
+        TK::Tuple(es) => TK::Tuple(all(es)),
+        TK::Array(es) => TK::Array(all(es)),
+        TK::Variant(i, es) => TK::Variant(*i, all(es)),
+        TK::ArrayRepeat(v, n) => TK::ArrayRepeat(Box::new(fold_deep(v)), *n),
+        k => k.clone(),
+    };
+    TExpr { ty: e.ty, kind, span: e.span }
 }
 
 pub fn wrap_int(v: i128, it: IntTy) -> i128 {

@@ -397,6 +397,22 @@ impl Parser {
             self.expect("}")?;
             return Ok(Item::Enum(EnumDecl { name, generics, repr, variants, is_pub }));
         }
+        if self.eat_kw("var") {
+            let name = self.ident()?;
+            self.expect(":")?;
+            let ty = self.parse_type()?;
+            if self.is(";") {
+                return self.err("a module-level `var` needs an initializer (a constant expression)");
+            }
+            self.expect("=")?;
+            let value = self.parse_expr()?;
+            self.expect(";")?;
+            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "thread_local") {
+                return Err(Diag::new(*sp, format!("unknown attribute `{}` on a module-level `var` (only `thread_local`)", n)));
+            }
+            let thread_local = attrs.has("thread_local");
+            return Ok(Item::Global(GlobalDecl { name, ty, value, is_pub, thread_local }));
+        }
         if self.eat_kw("const") {
             let name = self.ident()?;
             self.expect(":")?;

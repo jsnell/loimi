@@ -1,0 +1,8 @@
+// Helper module for tests/run/globals.lm.
+
+pub var COUNT: i64 = 0;
+pub var NAMES: [str; 2] = ["zero", "one"];
+var hidden: u32 = 5;
+
+pub fn bump() -> i64 { COUNT += 1; hidden += 1; COUNT }
+pub fn hidden_value() -> u32 { hidden }

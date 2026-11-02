@@ -131,6 +131,8 @@ pub enum TK {
     #[allow(dead_code)]
     Zeroed,
     Local(LocalId),
+    /// A module-level `var` (a place).
+    Global(u32),
     FnRef(FnId),
     Deref(B),
     Field(B, u32),
@@ -379,8 +381,18 @@ pub struct VmDef {
     pub tbl_idx: Option<usize>,
 }
 
+/// A module-level `var`. `init` is a constant expression.
+#[derive(Clone, Debug)]
+pub struct GlobalDef {
+    pub symbol: String,
+    pub ty: Ty,
+    pub init: TExpr,
+    pub thread_local: bool,
+}
+
 #[derive(Default)]
 pub struct Program {
+    pub globals: Vec<GlobalDef>,
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub values: Vec<ValueDef>,

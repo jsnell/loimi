@@ -129,6 +129,84 @@ impl<'p> Codegen<'p> {
         name
     }
 
+    /// An LLVM constant for a global's initializer (checked by
+    /// `Checker::static_init_error`).
+    pub fn const_init(&mut self, e: &TExpr) -> String {
+        let p = self.p;
+        if e.ty.is_unitlike() {
+            return "zeroinitializer".into();
+        }
+        let typed = |cg: &mut Self, x: &TExpr| format!("{} {}", llty(p, &x.ty), cg.const_init(x));
+        match &e.kind {
+            TK::Int(v) => match &e.ty {
+                Ty::Bool => (*v != 0).to_string(),
+                Ty::F32 | Ty::F64 => float_lit(*v as f64, &e.ty),
+                _ => v.to_string(),
+            },
+            TK::Float(f) => float_lit(*f, &e.ty),
+            TK::Bool(b) => b.to_string(),
+            TK::Str(s) => {
+                let g = self.string_const(s);
+                format!("{{ ptr {}, i64 {} }}", g, s.len())
+            }
+            TK::FnRef(id) => format!("@\"{}\"", p.fns[*id as usize].symbol),
+            TK::Struct(es) | TK::Tuple(es) => {
+                if es.is_empty() {
+                    return "zeroinitializer".into();
+                }
+                let parts: Vec<String> = es.iter().map(|x| typed(self, x)).collect();
+                format!("{{ {} }}", parts.join(", "))
+            }
+            TK::Array(es) => {
+                if es.is_empty() {
+                    return "zeroinitializer".into();
+                }
+                let parts: Vec<String> = es.iter().map(|x| typed(self, x)).collect();
+                format!("[{}]", parts.join(", "))
+            }
+            TK::ArrayRepeat(v, n) => {
+                let x = self.const_init(v);
+                if x == "zeroinitializer" || x == "0" || x == "false" || x == "null" || x == "0x0000000000000000" || *n == 0 {
+                    return "zeroinitializer".into();
+                }
+                let t = llty(p, &v.ty);
+                let parts: Vec<String> = (0..*n).map(|_| format!("{} {}", t, x)).collect();
+                format!("[{}]", parts.join(", "))
+            }
+            TK::Variant(idx, args) => match &e.ty {
+                Ty::Enum(eid) => {
+                    let ed = &p.enums[*eid as usize];
+                    let d = ed.variants[*idx as usize].discr;
+                    if ed.has_payload() {
+                        format!("{{ i{} {}, [{} x i64] zeroinitializer }}", ed.tag.bits, d, layout::enum_payload_words(p, ed))
+                    } else {
+                        d.to_string()
+                    }
+                }
+                Ty::Option(inner) => {
+                    if inner.is_nullable_ptr() {
+                        if *idx == 0 { "null".into() } else { self.const_init(&args[0]) }
+                    } else if *idx == 0 {
+                        "zeroinitializer".into()
+                    } else {
+                        format!("{{ i1 true, {} }}", typed(self, &args[0]))
+                    }
+                }
+                Ty::Result(a, b) => {
+                    let (at, bt) = (llty(p, a), llty(p, b));
+                    let v = typed(self, &args[0]);
+                    if *idx == 0 {
+                        format!("{{ i1 false, {}, {} zeroinitializer }}", v, bt)
+                    } else {
+                        format!("{{ i1 true, {} zeroinitializer, {} }}", at, v)
+                    }
+                }
+                _ => unreachable!("checked by static_init_error"),
+            },
+            _ => unreachable!("checked by static_init_error"),
+        }
+    }
+
     pub fn location(&self, span: Span) -> String {
         if (span.file as usize) < self.sm.files.len() {
             let (l, c) = self.sm.line_col(span.file, span.lo);
@@ -145,6 +223,12 @@ impl<'p> Codegen<'p> {
         for s in p.structs.iter().filter(|s| !s.pattern) {
             let fs: Vec<String> = s.fields.iter().map(|(_, t)| llty(p, t)).collect();
             let _ = writeln!(out, "%\"{}\" = type {{ {} }}", s.name, fs.join(", "));
+        }
+        for g in &p.globals {
+            let init = self.const_init(&g.init);
+            let tl = if g.thread_local { "thread_local(initialexec) " } else { "" };
+            let align = layout::align_of(p, &g.ty).max(1);
+            let _ = writeln!(self.globals, "@\"{}\" = internal {}global {} {}, align {}", g.symbol, tl, llty(p, &g.ty), init, align);
         }
         for (i, f) in p.fns.iter().enumerate() {
             if f.body.is_none() {
@@ -449,6 +533,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
     pub fn place(&mut self, e: &TExpr) -> String {
         match &e.kind {
             TK::Local(id) => self.slots[*id as usize].clone(),
+            TK::Global(id) => format!("@\"{}\"", self.p().globals[*id as usize].symbol),
             TK::Deref(p) => self.val(p),
             TK::Field(b, i) => {
                 let base = self.place(b);
@@ -526,7 +611,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 format!("{{ ptr {}, i64 {} }}", g, s.len())
             }
             TK::Unit | TK::Zeroed => "zeroinitializer".into(),
-            TK::Local(_) | TK::Deref(_) | TK::Index(..) => {
+            TK::Local(_) | TK::Global(_) | TK::Deref(_) | TK::Index(..) => {
                 let p = self.place(e);
                 self.load(&e.ty, &p)
             }

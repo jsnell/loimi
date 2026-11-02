@@ -60,6 +60,12 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 ```
 
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
+- Module-level `var NAME: T = init;` declares a global. `init` must be a
+  constant expression (literals, consts, `[x; N]`, aggregate and enum
+  literals of constants, functions). `#[thread_local] var` gives each thread
+  its own copy, which is what an interpreter wants for "current VM" or
+  per-thread caches. `pub var` is visible to other modules. Globals are not
+  GC roots.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - `defer stmt` runs `stmt` when the enclosing scope exits.

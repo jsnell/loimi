@@ -261,6 +261,17 @@ pub struct ConstDecl {
     pub is_pub: bool,
 }
 
+/// Module-level mutable variable: `var NAME: T = const_init;`.
+#[derive(Clone, Debug)]
+pub struct GlobalDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    pub is_pub: bool,
+    /// `#[thread_local]`: one copy per thread (initial-exec TLS).
+    pub thread_local: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Import {
     pub path: Vec<Ident>,
@@ -275,6 +286,7 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
+    Global(GlobalDecl),
     Import(Import),
     Vm(Box<crate::vmast::VmDecl>),
     Value(crate::vmast::ValueDecl),
