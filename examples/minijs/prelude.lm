@@ -1,0 +1,102 @@
+// Builtins written in JavaScript: the array methods that call back into
+// the program. Running them as ordinary bytecode means natives never
+// re-enter the VM. Compiled and run before the program.
+
+pub fn source() -> str {
+"
+(function () {
+  const AP = Array.prototype;
+  AP.forEach = function (f) {
+    const a = this;
+    const n = a.length;
+    for (let i = 0; i < n && i < a.length; i++) f(a[i], i, a);
+  };
+  AP.map = function (f) {
+    const a = this;
+    const n = a.length;
+    const r = [];
+    for (let i = 0; i < n; i++) r.push(f(a[i], i, a));
+    return r;
+  };
+  AP.filter = function (f) {
+    const a = this;
+    const r = [];
+    const n = a.length;
+    for (let i = 0; i < n && i < a.length; i++) {
+      const x = a[i];
+      if (f(x, i, a)) r.push(x);
+    }
+    return r;
+  };
+  AP.reduce = function (f, init) {
+    const a = this;
+    let i = 0;
+    let acc = init;
+    const n = a.length;
+    for (; i < n && i < a.length; i++) acc = f(acc, a[i], i, a);
+    return acc;
+  };
+  AP.some = function (f) {
+    const a = this;
+    const n = a.length;
+    for (let i = 0; i < n && i < a.length; i++) if (f(a[i], i, a)) return true;
+    return false;
+  };
+  AP.every = function (f) {
+    const a = this;
+    const n = a.length;
+    for (let i = 0; i < n && i < a.length; i++) if (!f(a[i], i, a)) return false;
+    return true;
+  };
+  AP.find = function (f) {
+    const a = this;
+    for (let i = 0; i < a.length; i++) if (f(a[i], i, a)) return a[i];
+    return undefined;
+  };
+  AP.findIndex = function (f) {
+    const a = this;
+    for (let i = 0; i < a.length; i++) if (f(a[i], i, a)) return i;
+    return -1;
+  };
+  function defaultCompare(x, y) {
+    const a = String(x);
+    const b = String(y);
+    return a < b ? -1 : (a > b ? 1 : 0);
+  }
+  // Stable merge sort; undefined elements go last, as in JavaScript.
+  AP.sort = function (cmp) {
+    const a = this;
+    const c = cmp === undefined ? defaultCompare : cmp;
+    const items = [];
+    let undefs = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === undefined) undefs++; else items.push(a[i]);
+    }
+    const n = items.length;
+    let src = items;
+    let dst = new Array(n);
+    for (let width = 1; width < n; width *= 2) {
+      for (let lo = 0; lo < n; lo += 2 * width) {
+        const mid = Math.min(lo + width, n);
+        const hi = Math.min(lo + 2 * width, n);
+        let i = lo;
+        let j = mid;
+        let k = lo;
+        while (i < mid && j < hi) {
+          if (c(src[j], src[i]) < 0) dst[k++] = src[j++];
+          else dst[k++] = src[i++];
+        }
+        while (i < mid) dst[k++] = src[i++];
+        while (j < hi) dst[k++] = src[j++];
+      }
+      const t = src;
+      src = dst;
+      dst = t;
+    }
+    for (let i = 0; i < n; i++) a[i] = src[i];
+    for (let i = n; i < n + undefs; i++) a[i] = undefined;
+    return a;
+  };
+})();
+"
+}

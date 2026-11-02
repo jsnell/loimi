@@ -1,0 +1,898 @@
+// Builtin functions (natives) and the global environment.
+//
+// A native receives `this` and its arguments in place in the caller's
+// registers. Natives allocate but never collect and never call back into
+// the VM: the array methods that take callbacks (map, filter, sort, ...)
+// are written in JavaScript, in the prelude.
+
+import std.gc;
+import std.mem;
+import std.text;
+import std.num;
+import std.io;
+import std.obj;
+import value;
+import value.{V, Str, Obj, Vals, Arr, Fn, Proto, Protos, Descs, Lines, Handlers};
+import rt;
+import rt.{Ctx, Native};
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn tan(x: f64) -> f64;
+extern "C" fn atan(x: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn asin(x: f64) -> f64;
+extern "C" fn acos(x: f64) -> f64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+extern "C" fn pow(x: f64, y: f64) -> f64;
+extern "C" fn ceil(x: f64) -> f64;
+extern "C" fn trunc(x: f64) -> f64;
+
+/// Call native `id`.
+pub fn call(c: *Ctx, id: u32, this: V, args: *V, n: u64) -> Result<V, V> {
+    let f = c.natives.at((id - 1) as u64).f;
+    for i in 0..n { args[i] = value.flat(args[i]); }
+    f(c, value.flat(this), args, n)
+}
+
+fn arg(args: *V, n: u64, i: u64) -> V { if i < n { args[i] } else { V.Undef } }
+
+fn num_arg(args: *V, n: u64, i: u64) -> f64 { value.to_number(arg(args, n, i)) }
+
+/// ToIntegerOrInfinity.
+fn int_arg(args: *V, n: u64, i: u64, dflt: f64) -> f64 {
+    let v = arg(args, n, i);
+    if v == V.Undef { return dflt; }
+    let x = value.to_number(v);
+    if x != x { return 0.0; }
+    trunc(x)
+}
+
+/// A relative index (negative counts from `len`), clamped to 0..len.
+fn rel_index(x: f64, len: u64) -> u64 {
+    let l = len as f64;
+    var r = if x < 0.0 { l + x } else { x };
+    if r < 0.0 { r = 0.0; }
+    if r > l { r = l; }
+    r as u64
+}
+
+fn numv(x: f64) -> V { value.number(x) }
+
+fn str_v(c: *Ctx, s: str) -> V { V.S(c.str(s)) }
+
+// ── registration ────────────────────────────────────────────────────
+
+fn Ctx.native(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) -> V {
+    c.natives.push(Native { f: f, name: name });
+    let id = c.natives.len as u32;
+    let Some(p) = c.native_proto else { unreachable };
+    V.F(new(&c.heap, Fn { proto: p, props: None, home: V.Undef, parent: V.Undef, native: id, hint: 4, ctor_proto: None, ctor_shape: None }, 0))
+}
+
+/// Define a native method `name` on object `o`.
+fn Ctx.def(c: *Ctx, o: Gc<Obj>, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>) {
+    let fv = c.native(name, f);
+    c.m.set(o, c.key(name), fv);
+}
+
+fn Ctx.def_global(c: *Ctx, name: str, v: V) {
+    let key = c.key(name);
+    let slot = c.gvals.len as u32;
+    c.gvals.push(v);
+    c.gnames.push(key);
+    c.gmap.insert(key, slot);
+}
+
+/// A native constructor whose `prototype` is `proto`.
+fn Ctx.ctor(c: *Ctx, name: str, f: fn(*Ctx, V, *V, u64) -> Result<V, V>, proto: Gc<Obj>) -> Gc<Obj> {
+    let fv = c.native(name, f);
+    let F(fo) = fv else { unreachable };
+    let bag = c.fn_props(fo);
+    c.m.set(bag, c.k_prototype, V.O(proto));
+    c.m.set(proto, c.k_constructor, fv);
+    c.def_global(name, fv);
+    bag
+}
+
+pub fn install(c: *Ctx) {
+    let h = &c.heap;
+    let empty_vals = rt.new_vals(h, 0);
+    c.native_proto = Some(new(h, Proto {
+        name: c.key_str(c.key("native")), nparams: 0, fixed: value.NO_FIXED, nregs: 1, nfree: 0, flags: 0, hint: 4,
+        consts: empty_vals, protos: new(h, Protos {}, 0), desc: new(h, Descs {}, 0),
+        handlers: new(h, Handlers {}, 0), lines: new(h, Lines {}, 0),
+    }, 0));
+
+    let console = c.new_object_with(c.objproto, 4);
+    c.def(console, "log", console_log);
+    c.def_global("console", V.O(console));
+
+    c.def_global("NaN", V.Num(0.0 / 0.0));
+    c.def_global("Infinity", V.Num(1.0 / 0.0));
+    c.def_global("parseInt", c.native("parseInt", parse_int));
+    c.def_global("parseFloat", c.native("parseFloat", parse_float));
+    c.def_global("isNaN", c.native("isNaN", is_nan));
+    c.def_global("isFinite", c.native("isFinite", is_finite));
+
+    let op = c.obj_proto();
+    let obj_bag = c.ctor("Object", object_ctor, op);
+    c.def(obj_bag, "keys", object_keys);
+    c.def(obj_bag, "create", object_create);
+    c.def(obj_bag, "getPrototypeOf", object_get_proto);
+    c.def(op, "hasOwnProperty", has_own);
+    c.def(op, "toString", to_string);
+
+    let ap = c.arr_proto();
+    let arr_bag = c.ctor("Array", array_ctor, ap);
+    c.def(arr_bag, "isArray", array_is_array);
+    c.def(ap, "push", array_push);
+    c.def(ap, "pop", array_pop);
+    c.def(ap, "shift", array_shift);
+    c.def(ap, "unshift", array_unshift);
+    c.def(ap, "slice", array_slice);
+    c.def(ap, "concat", array_concat);
+    c.def(ap, "indexOf", array_index_of);
+    c.def(ap, "lastIndexOf", array_last_index_of);
+    c.def(ap, "includes", array_includes);
+    c.def(ap, "join", array_join);
+    c.def(ap, "reverse", array_reverse);
+    c.def(ap, "fill", array_fill);
+    c.def(ap, "toString", to_string);
+
+    let sp = c.str_proto();
+    let str_bag = c.ctor("String", string_ctor, sp);
+    c.def(str_bag, "fromCharCode", string_from_char_code);
+    c.def(sp, "charCodeAt", str_char_code_at);
+    c.def(sp, "charAt", str_char_at);
+    c.def(sp, "indexOf", str_index_of);
+    c.def(sp, "lastIndexOf", str_last_index_of);
+    c.def(sp, "slice", str_slice);
+    c.def(sp, "substring", str_substring);
+    c.def(sp, "split", str_split);
+    c.def(sp, "toUpperCase", str_upper);
+    c.def(sp, "toLowerCase", str_lower);
+    c.def(sp, "trim", str_trim);
+    c.def(sp, "repeat", str_repeat);
+    c.def(sp, "startsWith", str_starts_with);
+    c.def(sp, "endsWith", str_ends_with);
+    c.def(sp, "includes", str_includes);
+    c.def(sp, "toString", to_string);
+
+    let np = c.num_proto();
+    c.ctor("Number", number_ctor, np);
+    c.def(np, "toFixed", num_to_fixed);
+    c.def(np, "toString", num_to_string);
+
+    let bp = c.bool_proto();
+    c.ctor("Boolean", boolean_ctor, bp);
+    c.def(bp, "toString", to_string);
+
+    let ep = c.err_proto();
+    c.ctor("Error", error_ctor, ep);
+    c.m.set(ep, c.k_name, str_v(c, "Error"));
+    c.m.set(ep, c.k_message, V.S(c.empty_str()));
+    c.def(ep, "toString", to_string);
+    let tp = c.typeerr_proto();
+    c.ctor("TypeError", type_error_ctor, tp);
+    c.m.set(tp, c.k_name, str_v(c, "TypeError"));
+    inline_errors(c);
+
+    let math = c.new_object_with(c.objproto, 32);
+    c.m.set(math, c.key("PI"), V.Num(3.141592653589793));
+    c.m.set(math, c.key("E"), V.Num(2.718281828459045));
+    c.def(math, "floor", math_floor);
+    c.def(math, "ceil", math_ceil);
+    c.def(math, "round", math_round);
+    c.def(math, "trunc", math_trunc);
+    c.def(math, "abs", math_abs);
+    c.def(math, "sqrt", math_sqrt);
+    c.def(math, "sin", math_sin);
+    c.def(math, "cos", math_cos);
+    c.def(math, "tan", math_tan);
+    c.def(math, "atan", math_atan);
+    c.def(math, "asin", math_asin);
+    c.def(math, "acos", math_acos);
+    c.def(math, "atan2", math_atan2);
+    c.def(math, "exp", math_exp);
+    c.def(math, "log", math_log);
+    c.def(math, "pow", math_pow);
+    c.def(math, "min", math_min);
+    c.def(math, "max", math_max);
+    c.def(math, "sign", math_sign);
+    c.def_global("Math", V.O(math));
+}
+
+/// RangeError and ReferenceError: error constructors of their own.
+fn inline_errors(c: *Ctx) {
+    let rp = c.new_object_with(c.errproto, 4);
+    rp.flags = value.OF_PROTO | value.OF_NONENUM;
+    c.ctor("RangeError", range_error_ctor, rp);
+    c.m.set(rp, c.k_name, str_v(c, "RangeError"));
+    let fp = c.new_object_with(c.errproto, 4);
+    fp.flags = value.OF_PROTO | value.OF_NONENUM;
+    c.ctor("ReferenceError", reference_error_ctor, fp);
+    c.m.set(fp, c.k_name, str_v(c, "ReferenceError"));
+}
+
+// ── globals ─────────────────────────────────────────────────────────
+
+fn console_log(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    for i in 0..n {
+        if i > 0 { c.out.push(' '); }
+        c.write(&c.out, args[i]);
+    }
+    c.out.push('\n');
+    if c.out.len() > 65536 { c.flush(); }
+    Ok(V.Undef)
+}
+
+fn trim_left(s: str) -> str {
+    var i: u64 = 0;
+    while i < s.len and value.is_ws(s[i]) { i += 1; }
+    s[i..s.len]
+}
+
+fn parse_int(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let st = c.to_str(arg(args, n, 0));
+    var s = trim_left(st.data);
+    var neg = false;
+    if s.len > 0 and (s[0] == '+' or s[0] == '-') {
+        neg = s[0] == '-';
+        s = s[1..s.len];
+    }
+    var radix = value.to_int32(num_arg(args, n, 1)) as i64;
+    var strip = true;
+    if radix != 0 {
+        if radix < 2 or radix > 36 { return Ok(V.Num(0.0 / 0.0)); }
+        if radix != 16 { strip = false; }
+    } else {
+        radix = 10;
+    }
+    if strip and s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X') {
+        s = s[2..s.len];
+        radix = 16;
+    }
+    var end: u64 = 0;
+    while end < s.len and (num.digit_value(s[end]) as i64) < radix { end += 1; }
+    if end == 0 { return Ok(V.Num(0.0 / 0.0)); }
+    var x: f64 = 0.0;
+    if radix == 10 {
+        x = match num.parse_f64(s[0..end]) { Ok(v) => v, Err(_) => 0.0 / 0.0 };
+    } else {
+        for i in 0..end { x = x * radix as f64 + num.digit_value(s[i]) as f64; }
+    }
+    Ok(numv(if neg { -x } else { x }))
+}
+
+fn parse_float(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let st = c.to_str(arg(args, n, 0));
+    var s = trim_left(st.data);
+    var neg = false;
+    if s.len > 0 and (s[0] == '+' or s[0] == '-') {
+        neg = s[0] == '-';
+        s = s[1..s.len];
+    }
+    if text.starts_with(s, "Infinity") { return Ok(V.Num(if neg { -1.0 / 0.0 } else { 1.0 / 0.0 })); }
+    let l = num.decimal_len(s);
+    if l == 0 { return Ok(V.Num(0.0 / 0.0)); }
+    let x = match num.parse_f64(s[0..l]) { Ok(v) => v, Err(_) => 0.0 / 0.0 };
+    Ok(numv(if neg { -x } else { x }))
+}
+
+fn is_nan(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = num_arg(args, n, 0);
+    Ok(V.Bool(x != x))
+}
+
+fn is_finite(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = num_arg(args, n, 0);
+    Ok(V.Bool(x == x and x != 1.0 / 0.0 and x != -1.0 / 0.0))
+}
+
+fn string_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    if n == 0 { return Ok(V.S(c.empty_str())); }
+    Ok(V.S(c.to_str(args[0])))
+}
+
+fn number_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    if n == 0 { return Ok(V.Int(0)); }
+    Ok(numv(value.to_number(args[0])))
+}
+
+fn boolean_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    Ok(V.Bool(value.truthy(arg(args, n, 0))))
+}
+
+fn make_error(c: *Ctx, this: V, args: *V, n: u64, proto: Gc<Obj>) -> Result<V, V> {
+    let msg = arg(args, n, 0);
+    if let O(o) = this {
+        if msg != V.Undef { c.m.set(o, c.k_message, V.S(c.to_str(msg))); }
+        return Ok(this);
+    }
+    let o = c.new_object_with(Some(proto), 2);
+    if msg != V.Undef { c.m.set(o, c.k_message, V.S(c.to_str(msg))); }
+    Ok(V.O(o))
+}
+
+fn error_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> { make_error(c, this, args, n, c.err_proto()) }
+fn type_error_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> { make_error(c, this, args, n, c.typeerr_proto()) }
+fn range_error_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let F(f) = c.gvals.at((c.gmap.get(c.key("RangeError")) ?? 0) as u64) else { return make_error(c, this, args, n, c.err_proto()); };
+    let O(p) = c.m.get(c.fn_props(f), c.k_prototype) ?? V.Undef else { return make_error(c, this, args, n, c.err_proto()); };
+    make_error(c, this, args, n, p)
+}
+fn reference_error_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let F(f) = c.gvals.at((c.gmap.get(c.key("ReferenceError")) ?? 0) as u64) else { return make_error(c, this, args, n, c.err_proto()); };
+    let O(p) = c.m.get(c.fn_props(f), c.k_prototype) ?? V.Undef else { return make_error(c, this, args, n, c.err_proto()); };
+    make_error(c, this, args, n, p)
+}
+
+fn to_string(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> { Ok(V.S(c.to_str(this))) }
+
+// ── Object ──────────────────────────────────────────────────────────
+
+fn object_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let v = arg(args, n, 0);
+    match v {
+        O(_) | A(_) | F(_) => Ok(v),
+        _ => Ok(V.O(c.new_literal(4))),
+    }
+}
+
+fn object_keys(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let v = arg(args, n, 0);
+    let r = c.new_array(0, 8);
+    match v {
+        O(o) => {
+            var ks: mem.Vec<u64> = mem.Vec.new();
+            c.own_keys(o, &ks, true);
+            for i in 0..ks.len { c.arr_push(r, V.S(c.key_str(ks.at(i)))); }
+            ks.free();
+        }
+        A(a) => { for i in 0..a.len { c.arr_push(r, V.S(c.key_str(c.int_key(i as i64)))); } }
+        S(s) => { for i in 0..s.data.len { c.arr_push(r, V.S(c.key_str(c.int_key(i as i64)))); } }
+        Undef | Null => return Err(c.type_error("Cannot convert undefined or null to object")),
+        _ => {}
+    }
+    Ok(V.A(r))
+}
+
+fn object_create(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    match arg(args, n, 0) {
+        O(p) => {
+            rt.mark_proto(p);
+            Ok(V.O(c.new_object_with(Some(p), 4)))
+        }
+        Null => Ok(V.O(c.new_object_with(None, 4))),
+        A(_) => Ok(V.O(c.new_object_with(c.arrproto, 4))),
+        F(_) => Ok(V.O(c.new_object_with(c.fnproto, 4))),
+        _ => Err(c.type_error("Object prototype may only be an Object or null")),
+    }
+}
+
+fn object_get_proto(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    match arg(args, n, 0) {
+        O(o) => Ok(match o.proto { Some(p) => V.O(p), None => V.Null }),
+        A(_) => Ok(V.O(c.arr_proto())),
+        S(_) => Ok(V.O(c.str_proto())),
+        Int(_) | Num(_) => Ok(V.O(c.num_proto())),
+        Bool(_) => Ok(V.O(c.bool_proto())),
+        F(f) => Ok(if let F(_) = f.parent { f.parent } else { V.O(c.fn_proto()) }),
+        _ => Err(c.type_error("Cannot convert undefined or null to object")),
+    }
+}
+
+fn has_own(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let k = c.key_of(arg(args, n, 0));
+    match this {
+        O(o) => Ok(V.Bool(c.m.has_own(o, k))),
+        A(a) => {
+            if k == c.k_length { return Ok(V.Bool(true)); }
+            let i = c.key_index(k);
+            Ok(V.Bool(i >= 0 and (i as u64) < a.len))
+        }
+        S(s) => {
+            if k == c.k_length { return Ok(V.Bool(true)); }
+            let i = c.key_index(k);
+            Ok(V.Bool(i >= 0 and (i as u64) < s.data.len))
+        }
+        F(f) => Ok(V.Bool(c.m.has_own(c.fn_props(f), k))),
+        Undef | Null => Err(c.type_error("Cannot convert undefined or null to object")),
+        _ => Ok(V.Bool(false)),
+    }
+}
+
+// ── Array ───────────────────────────────────────────────────────────
+
+fn array_ctor(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    if n == 1 and value.is_number(args[0]) {
+        let x = value.to_number(args[0]);
+        if x < 0.0 or x != x.floor() or x > 4294967295.0 { return Err(c.new_error(c.err_proto(), "Invalid array length")); }
+        return Ok(V.A(c.new_array(x as u64, x as u64)));
+    }
+    let a = c.new_array(n, n);
+    for i in 0..n { a.ptr[i] = args[i]; }
+    Ok(V.A(a))
+}
+
+fn array_is_array(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    Ok(V.Bool(if let A(_) = arg(args, n, 0) { true } else { false }))
+}
+
+fn this_array(c: *Ctx, this: V) -> Result<Gc<Arr>, V> {
+    let A(a) = this else { return Err(c.type_error("not an array")); };
+    Ok(a)
+}
+
+fn array_push(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    for i in 0..n { c.arr_push(a, args[i]); }
+    Ok(numv(a.len as f64))
+}
+
+fn array_pop(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    if a.len == 0 { return Ok(V.Undef); }
+    a.len -= 1;
+    let v = a.ptr[a.len];
+    a.ptr[a.len] = V.Undef;
+    Ok(v)
+}
+
+fn array_shift(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    if a.len == 0 { return Ok(V.Undef); }
+    let v = a.ptr[0];
+    mem.copy(a.ptr, a.ptr + 1, a.len - 1);
+    a.len -= 1;
+    a.ptr[a.len] = V.Undef;
+    Ok(v)
+}
+
+fn array_unshift(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    c.arr_reserve(a, a.len + n);
+    mem.copy(a.ptr + n, a.ptr, a.len);
+    for i in 0..n { a.ptr[i] = args[i]; }
+    a.len += n;
+    Ok(numv(a.len as f64))
+}
+
+fn array_slice(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let s = rel_index(int_arg(args, n, 0, 0.0), a.len);
+    let e = rel_index(int_arg(args, n, 1, a.len as f64), a.len);
+    let cnt = if e > s { e - s } else { 0 };
+    let r = c.new_array(cnt, cnt);
+    for i in 0..cnt { r.ptr[i] = a.ptr[s + i]; }
+    Ok(V.A(r))
+}
+
+fn array_concat(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    var total = a.len;
+    for i in 0..n { total += match args[i] { A(b) => b.len, _ => 1 }; }
+    let r = c.new_array(0, total);
+    for i in 0..a.len { c.arr_push(r, a.ptr[i]); }
+    for i in 0..n {
+        match args[i] {
+            A(b) => { for j in 0..b.len { c.arr_push(r, b.ptr[j]); } }
+            _ => c.arr_push(r, args[i]),
+        }
+    }
+    Ok(V.A(r))
+}
+
+fn array_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let v = arg(args, n, 0);
+    var i = rel_index(int_arg(args, n, 1, 0.0), a.len);
+    while i < a.len {
+        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i32)); }
+        i += 1;
+    }
+    Ok(V.Int(-1))
+}
+
+fn array_last_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let v = arg(args, n, 0);
+    var i = a.len;
+    while i > 0 {
+        i -= 1;
+        if value.strict_eq(a.ptr[i], v) { return Ok(V.Int(i as i32)); }
+    }
+    Ok(V.Int(-1))
+}
+
+/// SameValueZero.
+fn same_value_zero(a: V, b: V) -> bool {
+    if let (Some(x), Some(y)) = (value.num_of(a), value.num_of(b)) {
+        return x == y or (x != x and y != y);
+    }
+    value.strict_eq(a, b)
+}
+
+fn array_includes(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let v = arg(args, n, 0);
+    var i = rel_index(int_arg(args, n, 1, 0.0), a.len);
+    while i < a.len {
+        if same_value_zero(a.ptr[i], v) { return Ok(V.Bool(true)); }
+        i += 1;
+    }
+    Ok(V.Bool(false))
+}
+
+fn array_join(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let sepv = arg(args, n, 0);
+    let sep = if sepv == V.Undef { "," } else { c.to_str(sepv).data };
+    var b = text.StrBuf.new();
+    for i in 0..a.len {
+        if i > 0 { b.push_str(sep); }
+        let e = a.ptr[i];
+        if e != V.Undef and e != V.Null { c.write(&b, e); }
+    }
+    let s = c.str(b.as_str());
+    b.free();
+    Ok(V.S(s))
+}
+
+fn array_reverse(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    if a.len > 1 {
+        var i: u64 = 0;
+        var j = a.len - 1;
+        while i < j {
+            let t = a.ptr[i];
+            a.ptr[i] = a.ptr[j];
+            a.ptr[j] = t;
+            i += 1;
+            j -= 1;
+        }
+    }
+    Ok(this)
+}
+
+fn array_fill(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let a = this_array(c, this)?;
+    let v = arg(args, n, 0);
+    let s = rel_index(int_arg(args, n, 1, 0.0), a.len);
+    let e = rel_index(int_arg(args, n, 2, a.len as f64), a.len);
+    var i = s;
+    while i < e { a.ptr[i] = v; i += 1; }
+    Ok(this)
+}
+
+// ── String ──────────────────────────────────────────────────────────
+
+fn this_str(c: *Ctx, this: V) -> Gc<Str> { c.to_str(this) }
+
+fn string_from_char_code(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    if n == 1 {
+        let code = value.to_int32(value.to_number(args[0])) & 0xFFFF;
+        return Ok(V.S(c.char_str(code as u8)));
+    }
+    let s = value.alloc_str(&c.heap, n);
+    for i in 0..n { s.data[i] = (value.to_int32(value.to_number(args[i])) & 0xFF) as u8; }
+    Ok(V.S(s))
+}
+
+fn str_char_code_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let i = int_arg(args, n, 0, 0.0);
+    if i < 0.0 or i >= s.data.len as f64 { return Ok(V.Num(0.0 / 0.0)); }
+    Ok(V.Int(s.data[i as u64] as i32))
+}
+
+fn str_char_at(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let i = int_arg(args, n, 0, 0.0);
+    if i < 0.0 or i >= s.data.len as f64 { return Ok(V.S(c.empty_str())); }
+    Ok(V.S(c.char_str(s.data[i as u64])))
+}
+
+fn find_from(h: str, needle: str, from: u64) -> i64 {
+    if needle.len > h.len { return -1; }
+    var i = from;
+    while i + needle.len <= h.len {
+        if h[i..i + needle.len].eq(needle) { return i as i64; }
+        i += 1;
+    }
+    -1
+}
+
+fn str_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let sub = c.to_str(arg(args, n, 0));
+    let from = rel_index_pos(int_arg(args, n, 1, 0.0), s.data.len);
+    Ok(V.Int(find_from(s.data, sub.data, from) as i32))
+}
+
+/// A position clamped to 0..len (no counting from the end).
+fn rel_index_pos(x: f64, len: u64) -> u64 {
+    if x < 0.0 { return 0; }
+    if x > len as f64 { return len; }
+    x as u64
+}
+
+fn str_last_index_of(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let sub = c.to_str(arg(args, n, 0));
+    let h = s.data;
+    let nd = sub.data;
+    if nd.len > h.len { return Ok(V.Int(-1)); }
+    var i = h.len - nd.len + 1;
+    while i > 0 {
+        i -= 1;
+        if h[i..i + nd.len].eq(nd) { return Ok(V.Int(i as i32)); }
+    }
+    Ok(V.Int(-1))
+}
+
+fn sub_str(c: *Ctx, s: Gc<Str>, a: u64, b: u64) -> V {
+    if b <= a { return V.S(c.empty_str()); }
+    if a == 0 and b == s.data.len { return V.S(s); }
+    if b - a == 1 { return V.S(c.char_str(s.data[a])); }
+    V.S(c.str(s.data[a..b]))
+}
+
+fn str_slice(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let a = rel_index(int_arg(args, n, 0, 0.0), s.data.len);
+    let b = rel_index(int_arg(args, n, 1, s.data.len as f64), s.data.len);
+    Ok(sub_str(c, s, a, b))
+}
+
+fn str_substring(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    var a = rel_index_pos(int_arg(args, n, 0, 0.0), s.data.len);
+    var b = rel_index_pos(int_arg(args, n, 1, s.data.len as f64), s.data.len);
+    if a > b { let t = a; a = b; b = t; }
+    Ok(sub_str(c, s, a, b))
+}
+
+fn str_split(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let r = c.new_array(0, 8);
+    let sepv = arg(args, n, 0);
+    if sepv == V.Undef {
+        c.arr_push(r, V.S(s));
+        return Ok(V.A(r));
+    }
+    let sep = c.to_str(sepv).data;
+    let h = s.data;
+    if sep.len == 0 {
+        for i in 0..h.len { c.arr_push(r, V.S(c.char_str(h[i]))); }
+        return Ok(V.A(r));
+    }
+    var start: u64 = 0;
+    loop {
+        let at = find_from(h, sep, start);
+        if at < 0 { break; }
+        c.arr_push(r, sub_str(c, s, start, at as u64));
+        start = at as u64 + sep.len;
+    }
+    c.arr_push(r, sub_str(c, s, start, h.len));
+    Ok(V.A(r))
+}
+
+fn map_case(c: *Ctx, this: V, upper: bool) -> V {
+    let s = this_str(c, this);
+    let r = value.alloc_str(&c.heap, s.data.len);
+    for i in 0..s.data.len {
+        var ch = s.data[i];
+        if upper and ch >= 'a' and ch <= 'z' { ch = ch - 32; }
+        if !upper and ch >= 'A' and ch <= 'Z' { ch = ch + 32; }
+        r.data[i] = ch;
+    }
+    V.S(r)
+}
+
+fn str_upper(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> { Ok(map_case(c, this, true)) }
+fn str_lower(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> { Ok(map_case(c, this, false)) }
+
+fn str_trim(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    var a: u64 = 0;
+    var b = s.data.len;
+    while a < b and value.is_ws(s.data[a]) { a += 1; }
+    while b > a and value.is_ws(s.data[b - 1]) { b -= 1; }
+    Ok(sub_str(c, s, a, b))
+}
+
+fn str_repeat(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let k = int_arg(args, n, 0, 0.0);
+    if k < 0.0 or k == 1.0 / 0.0 { return Err(c.new_error(c.err_proto(), "Invalid count value")); }
+    let cnt = k as u64;
+    let r = value.alloc_str(&c.heap, s.data.len * cnt);
+    for i in 0..cnt { mem.memcpy(r.data.ptr + i * s.data.len, s.data.ptr, s.data.len); }
+    Ok(V.S(r))
+}
+
+fn str_starts_with(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let p = c.to_str(arg(args, n, 0)).data;
+    let pos = rel_index_pos(int_arg(args, n, 1, 0.0), s.data.len);
+    Ok(V.Bool(pos + p.len <= s.data.len and s.data[pos..pos + p.len].eq(p)))
+}
+
+fn str_ends_with(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let p = c.to_str(arg(args, n, 0)).data;
+    let end = rel_index_pos(int_arg(args, n, 1, s.data.len as f64), s.data.len);
+    Ok(V.Bool(p.len <= end and s.data[end - p.len..end].eq(p)))
+}
+
+fn str_includes(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let s = this_str(c, this);
+    let p = c.to_str(arg(args, n, 0)).data;
+    let from = rel_index_pos(int_arg(args, n, 1, 0.0), s.data.len);
+    Ok(V.Bool(find_from(s.data, p, from) >= 0))
+}
+
+// ── Number ──────────────────────────────────────────────────────────
+
+fn this_num(c: *Ctx, this: V) -> Result<f64, V> {
+    match this {
+        Int(i) => Ok(i as f64),
+        Num(x) => Ok(x),
+        _ => Err(c.type_error("not a number")),
+    }
+}
+
+fn num_to_fixed(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = this_num(c, this)?;
+    let df = int_arg(args, n, 0, 0.0);
+    if df < 0.0 or df > 100.0 { return Err(c.new_error(c.err_proto(), "toFixed() digits argument must be between 0 and 100")); }
+    let d = df as u64;
+    if x != x or x >= 1e21 or x <= -1e21 { return Ok(V.S(c.to_str(this))); }
+    var b = text.StrBuf.new();
+    let ax = if x < 0.0 { -x } else { x + 0.0 };
+    // The exact decimal expansion, then round half up at digit d.
+    let cap: u64 = 1200;
+    let buf: *u8 = mem.alloc(cap);
+    let len = snprintf(buf, cap, "%.1100f\0".ptr, ax) as u64;
+    var dot: u64 = 0;
+    while dot < len and buf[dot] != '.' { dot += 1; }
+    let keep = dot + 1 + d;
+    let up = buf[keep] >= '5';
+    // Digits to keep, without the point.
+    var digits: mem.Vec<u8> = mem.Vec.new();
+    digits.push('0');
+    for i in 0..dot { digits.push(buf[i]); }
+    for i in dot + 1..keep { digits.push(buf[i]); }
+    mem.release(buf);
+    if up {
+        var i = digits.len;
+        loop {
+            i -= 1;
+            let ch = digits.at(i);
+            if ch == '9' { digits.set(i, '0'); continue; }
+            digits.set(i, ch + 1);
+            break;
+        }
+    }
+    let int_len = dot + 1;
+    var start: u64 = 0;
+    while start + 1 < int_len and digits.at(start) == '0' { start += 1; }
+    var zero = true;
+    for i in 0..digits.len { if digits.at(i) != '0' { zero = false; } }
+    if x < 0.0 { b.push('-'); }
+    for i in start..int_len { b.push(digits.at(i)); }
+    if d > 0 {
+        b.push('.');
+        for i in int_len..digits.len { b.push(digits.at(i)); }
+    }
+    digits.free();
+    let s = c.str(b.as_str());
+    b.free();
+    Ok(V.S(s))
+}
+
+fn num_to_string(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = this_num(c, this)?;
+    let rv = arg(args, n, 0);
+    let radix = if rv == V.Undef { 10 } else { value.to_int32(value.to_number(rv)) };
+    if radix < 2 or radix > 36 { return Err(c.new_error(c.err_proto(), "toString() radix must be between 2 and 36")); }
+    if radix == 10 or x != x or x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Ok(V.S(c.to_str(numv(x)))); }
+    var digits: mem.Vec<u8> = mem.Vec.new();
+    var ip = trunc(if x < 0.0 { -x } else { x });
+    var frac = (if x < 0.0 { -x } else { x }) - ip;
+    if ip == 0.0 { digits.push('0'); }
+    while ip >= 1.0 {
+        let q = (ip / radix as f64).floor();
+        let d = (ip - q * radix as f64) as u64;
+        digits.push("0123456789abcdefghijklmnopqrstuvwxyz"[d]);
+        ip = q;
+    }
+    var b = text.StrBuf.new();
+    if x < 0.0 { b.push('-'); }
+    var i = digits.len;
+    while i > 0 { i -= 1; b.push(digits.at(i)); }
+    if frac > 0.0 {
+        b.push('.');
+        var k = 0;
+        while frac > 0.0 and k < 52 {
+            frac = frac * radix as f64;
+            let d = frac as u64;
+            b.push("0123456789abcdefghijklmnopqrstuvwxyz"[d]);
+            frac = frac - d as f64;
+            k += 1;
+        }
+    }
+    digits.free();
+    let s = c.str(b.as_str());
+    b.free();
+    Ok(V.S(s))
+}
+
+// ── Math ────────────────────────────────────────────────────────────
+
+inline for (name, expr) in [
+    ("math_floor", x.floor()), ("math_ceil", ceil(x)), ("math_trunc", trunc(x)), ("math_sqrt", x.sqrt()),
+    ("math_sin", sin(x)), ("math_cos", cos(x)), ("math_tan", tan(x)), ("math_atan", atan(x)),
+    ("math_asin", asin(x)), ("math_acos", acos(x)), ("math_exp", exp(x)), ("math_log", log(x)),
+    ("math_abs", if x < 0.0 { -x } else { 0.0 + x }),
+] {
+    fn #name(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+        if let Int(i) = arg(args, n, 0) and i != -2147483648 {
+            let x = i as f64;
+            return Ok(numv(expr));
+        }
+        let x = num_arg(args, n, 0);
+        Ok(numv(expr))
+    }
+}
+
+fn math_round(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = num_arg(args, n, 0);
+    if x != x or x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Ok(V.Num(x)); }
+    var r = x.floor();
+    if x - r >= 0.5 { r += 1.0; }
+    if r == 0.0 and (x < 0.0 or 1.0 / x < 0.0) { return Ok(V.Num(-0.0)); }
+    Ok(numv(r))
+}
+
+fn math_atan2(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    Ok(numv(atan2(num_arg(args, n, 0), num_arg(args, n, 1))))
+}
+
+fn math_pow(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = num_arg(args, n, 0);
+    let y = num_arg(args, n, 1);
+    if y != y { return Ok(V.Num(0.0 / 0.0)); }
+    if (x == 1.0 or x == -1.0) and (y == 1.0 / 0.0 or y == -1.0 / 0.0) { return Ok(V.Num(0.0 / 0.0)); }
+    Ok(numv(pow(x, y)))
+}
+
+fn math_min(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    var r = 1.0 / 0.0;
+    for i in 0..n {
+        let x = value.to_number(args[i]);
+        if x != x { return Ok(V.Num(x)); }
+        if x < r or (x == 0.0 and r == 0.0 and 1.0 / x < 0.0) { r = x; }
+    }
+    Ok(numv(r))
+}
+
+fn math_max(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    var r = -1.0 / 0.0;
+    for i in 0..n {
+        let x = value.to_number(args[i]);
+        if x != x { return Ok(V.Num(x)); }
+        if x > r or (x == 0.0 and r == 0.0 and 1.0 / x > 0.0) { r = x; }
+    }
+    Ok(numv(r))
+}
+
+fn math_sign(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
+    let x = num_arg(args, n, 0);
+    if x != x or x == 0.0 { return Ok(numv(x)); }
+    Ok(V.Int(if x > 0.0 { 1 } else { -1 }))
+}

@@ -1,0 +1,67 @@
+// MiniJS: a JavaScript subset, implemented in Loimi.
+//
+//   loimi build examples/minijs/main.lm --release -o minijs
+//   ./minijs program.js          (a second argument turns on GC stress)
+
+import std.io;
+import std.os;
+import std.gc;
+import std.text;
+import value;
+import value.{V, Fn};
+import rt.{Ctx};
+import rt;
+import vm.{JS};
+import compile;
+import builtins;
+import prelude;
+
+fn run(ctx: *Ctx, src: str) -> bool {
+    let proto = compile.compile(ctx, src);
+    let f = new(&ctx.heap, Fn { proto: proto, props: None, home: V.Undef, parent: V.Undef, native: 0, hint: proto.hint, ctor_proto: None, ctor_shape: None }, 0);
+    JS.run(ctx, f);
+    !ctx.failed
+}
+
+extern "C" fn getenv(name: *u8) -> ?*u8;
+
+fn stats(c: *Ctx) {
+    if getenv("MINIJS_STATS\0".ptr).is_none() { return; }
+    var b = text.StrBuf.new();
+    b.push_str("shapes created ");
+    b.push_int(c.m.shapes.created as i64);
+    b.push_str(", poly sites ");
+    b.push_int(c.poly.len as i64);
+    b.push_str(", proto entries ");
+    b.push_int(c.pent.len as i64);
+    b.push_str(", collections ");
+    b.push_int(c.heap.collections as i64);
+    io.eprintln(b.as_str());
+}
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else {
+        io.eprintln("usage: minijs <program.js> [stress]");
+        return 2;
+    };
+    let Some(src) = io.read_file(path) else {
+        io.eprint("cannot read ");
+        io.eprintln(path);
+        return 1;
+    };
+    var ctx = Ctx.new();
+    ctx.init();
+    builtins.install(&ctx);
+    if os.arg(2).is_some() { ctx.heap.set_stress(true); }
+    if run(&ctx, prelude.source()) and run(&ctx, src) {
+        ctx.flush();
+        stats(&ctx);
+        return 0;
+    }
+    ctx.flush();
+    var b = text.StrBuf.new();
+    b.push_str("Uncaught ");
+    ctx.write(&b, ctx.error);
+    io.eprintln(b.as_str());
+    1
+}

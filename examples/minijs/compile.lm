@@ -1,0 +1,1759 @@
+// The MiniJS compiler: syntax trees → register bytecode.
+//
+// Pass 1 (`Res`) resolves every name to a `Var` (or a global slot),
+// records which variables are assigned and which are captured by nested
+// functions, and gives each function its list of free variables.
+//
+// Pass 2 (`Gen`) allocates registers (std.bc Regs) and emits code into a
+// std.bc Code buffer through the generated `JS.X` encoders, with
+// constants in a std.bc Pool. Closures are flat: a closure copies the
+// values of its free variables when it is created. A variable lives in a
+// box when a closure captures it and either it is assigned later or the
+// closure may be created before the variable has its value. Hoisted
+// function declarations that capture each other are patched (SETFREE)
+// after all of them exist.
+//
+// The compiler allocates in the GC heap but never collects.
+
+import std.mem;
+import std.map;
+import std.text;
+import std.bc;
+import std.gc;
+import value;
+import value.{V, Str, Proto, Vals, Protos, Descs, Lines, Handlers};
+import rt;
+import rt.{Ctx};
+import ast;
+import ast.{T, K, VK, Node, Func, Class, Member, Var, fail, is_null, null_node, null_var, null_func, new_node, new_func, new_var};
+import parser.{Parser};
+import vm.{JS};
+
+// ── pass 1: resolve ─────────────────────────────────────────────────
+
+struct Scope { vars: *mem.Vec<*Var>, parent: *Scope, fun: *Func }
+
+struct Res {
+    ctx: *Ctx,
+    scope: *Scope,
+    fun: *Func,
+    /// Globals by name (declared, builtin or undeclared).
+    globals: map.HashMap<str, *Var>,
+}
+
+fn Res.global(r: *Res, name: str, undeclared: bool) -> *Var {
+    if let Some(v) = r.globals.get(name) { return v; }
+    let v = new_var(name, VK.Global, null_func());
+    let key = r.ctx.key(name);
+    var known = true;
+    v.slot = match r.ctx.gmap.get(key) {
+        Some(s) => s,
+        None => {
+            known = false;
+            let s = r.ctx.gvals.len as u32;
+            r.ctx.gvals.push(V.Undef);
+            r.ctx.gnames.push(key);
+            r.ctx.gmap.insert(key, s);
+            s
+        }
+    };
+    v.undeclared = undeclared and !known;
+    r.globals.insert(name, v);
+    v
+}
+
+fn Res.lookup(r: *Res, name: str) -> ?*Var {
+    var s = r.scope;
+    while (s as u64) != 0 {
+        let vs = s.vars;
+        var i = vs.len;
+        while i > 0 {
+            i -= 1;
+            let v = vs.at(i);
+            if v.name.eq(name) { return Some(v); }
+        }
+        s = s.parent;
+    }
+    None
+}
+
+/// Declare `name` in the current scope (top-level declarations are globals).
+fn Res.declare(r: *Res, name: str, kind: VK, pos: u32) -> *Var {
+    let vs = r.scope.vars;
+    for i in 0..vs.len {
+        let v = vs.at(i);
+        if v.name.eq(name) {
+            v.assigned = true;
+            return v;
+        }
+    }
+    if r.fun.top and (r.scope.parent as u64) == 0 {
+        let g = r.global(name, false);
+        g.undeclared = false;
+        vs.push(g);
+        return g;
+    }
+    let v = new_var(name, kind, r.fun);
+    v.decl_pos = pos;
+    vs.push(v);
+    v
+}
+
+/// Record a use of `v` from the current function.
+fn Res.capture(r: *Res, v: *Var) {
+    if v.kind == VK.Global { return; }
+    var f = r.fun;
+    var inner = f;
+    while (f as u64) != (v.owner as u64) {
+        var have = false;
+        for i in 0..f.free.len { if (f.free.at(i) as u64) == (v as u64) { have = true; } }
+        if !have { f.free.push(v); }
+        inner = f;
+        f = f.parent;
+    }
+    if (inner as u64) != (v.owner as u64) {
+        v.captured = true;
+        // A hoisted declaration's closure exists from the start of its block.
+        let at = if inner.decl { 0 } else { inner.pos };
+        if at < v.cap_pos { v.cap_pos = at; }
+    }
+}
+
+fn Res.ref_name(r: *Res, n: *Node) {
+    if (n.vr as u64) != 0 { r.capture(n.vr); return; }
+    let v = match r.lookup(n.text) {
+        Some(v) => v,
+        None => r.global(n.text, true),
+    };
+    n.vr = v;
+    r.capture(v);
+}
+
+/// `var` declarations anywhere in `stmts` (not inside functions).
+fn Res.hoist(r: *Res, n: *Node) {
+    if is_null(n) { return; }
+    match n.kind {
+        VarDecl => {
+            if n.op == T.Var {
+                for i in 0..n.list.len {
+                    let d = n.list.at(i);
+                    d.vr = r.declare(d.text, VK.Var, d.flag);
+                }
+            }
+        }
+        Block | Case => { for i in 0..n.list.len { r.hoist(n.list.at(i)); } }
+        Switch => { for i in 0..n.list.len { r.hoist(n.list.at(i)); } }
+        If => { r.hoist(n.b); r.hoist(n.c); }
+        While | DoWhile => r.hoist(n.b),
+        For => { r.hoist(n.a); r.hoist(n.d); }
+        ForIn | ForOf => { r.hoist(n.a); r.hoist(n.d); }
+        Try => { r.hoist(n.a); r.hoist(n.b); r.hoist(n.c); }
+        Labeled => r.hoist(n.a),
+        _ => {}
+    }
+}
+
+/// The block-scoped declarations of a statement list.
+fn Res.declare_block(r: *Res, stmts: *mem.Vec<*Node>) {
+    for i in 0..stmts.len {
+        let n = stmts.at(i);
+        match n.kind {
+            VarDecl => {
+                if n.op != T.Var {
+                    for j in 0..n.list.len {
+                        let d = n.list.at(j);
+                        d.vr = r.declare(d.text, if n.op == T.Const { VK.Const } else { VK.Let }, d.flag);
+                    }
+                }
+            }
+            FuncDecl => { n.vr = r.declare(n.text, VK.FnDecl, 0); }
+            ClassDecl => { n.vr = r.declare(n.text, VK.ClassDecl, 0xFFFFFFFF); }
+            _ => {}
+        }
+    }
+}
+
+fn Res.push(r: *Res, vars: *mem.Vec<*Var>) -> *Scope {
+    let s: *Scope = mem.alloc(1);
+    s.vars = vars;
+    s.parent = r.scope;
+    s.fun = r.fun;
+    r.scope = s;
+    s
+}
+
+fn Res.pop(r: *Res) { r.scope = r.scope.parent; }
+
+fn Res.stmts(r: *Res, l: *mem.Vec<*Node>) { for i in 0..l.len { r.stmt(l.at(i)); } }
+
+fn Res.block(r: *Res, n: *Node) {
+    r.push(&n.vars);
+    r.declare_block(&n.list);
+    r.stmts(&n.list);
+    r.pop();
+}
+
+fn Res.stmt(r: *Res, n: *Node) {
+    if is_null(n) { return; }
+    match n.kind {
+        VarDecl => {
+            for i in 0..n.list.len {
+                let d = n.list.at(i);
+                if (d.vr as u64) == 0 { d.vr = r.declare(d.text, VK.Let, d.flag); }
+                r.expr(d.a);
+            }
+        }
+        ExprStmt => r.expr(n.a),
+        Block => r.block(n),
+        Empty | Break | Continue => {}
+        If => { r.expr(n.a); r.stmt(n.b); r.stmt(n.c); }
+        While | DoWhile => { r.expr(n.a); r.stmt(n.b); }
+        For => {
+            r.push(&n.vars);
+            if !is_null(n.a) and n.a.kind == K.VarDecl {
+                var one: mem.Vec<*Node> = mem.Vec.new();
+                one.push(n.a);
+                r.declare_block(&one);
+                one.free();
+            }
+            r.stmt(n.a);
+            r.expr(n.b);
+            r.expr(n.c);
+            r.stmt(n.d);
+            r.pop();
+        }
+        ForIn | ForOf => {
+            r.expr(n.b);
+            r.push(&n.vars);
+            if n.a.kind == K.VarDecl {
+                let d = n.a.list.at(0);
+                if n.a.op == T.Var {
+                    d.vr = r.lookup(d.text) ?? r.declare(d.text, VK.Var, n.pos);
+                    d.vr.assigned = true;
+                } else {
+                    d.vr = r.declare(d.text, VK.Let, n.pos);
+                }
+            } else {
+                r.ref_name(n.a);
+                n.a.vr.assigned = true;
+            }
+            r.stmt(n.d);
+            r.pop();
+        }
+        Return | Throw => r.expr(n.a),
+        Try => {
+            r.block(n.a);
+            if !is_null(n.b) {
+                r.push(&n.vars);
+                if n.text.len > 0 { n.vr = r.declare(n.text, VK.Catch, n.b.pos); }
+                r.block(n.b);
+                r.pop();
+            }
+            if !is_null(n.c) { r.block(n.c); }
+        }
+        Switch => {
+            r.expr(n.a);
+            r.push(&n.vars);
+            for i in 0..n.list.len { r.declare_block(&n.list.at(i).list); }
+            for i in 0..n.list.len {
+                let c = n.list.at(i);
+                r.expr(c.a);
+                r.stmts(&c.list);
+            }
+            r.pop();
+        }
+        Labeled => r.stmt(n.a),
+        FuncDecl => r.func(n.fun),
+        ClassDecl => r.class(n.cls),
+        _ => fail(n.line, "unexpected statement"),
+    }
+}
+
+fn Res.class(r: *Res, c: *Class) {
+    r.expr(c.parent);
+    if (c.ctor as u64) == 0 { c.ctor = default_ctor(c, r.fun); }
+    c.ctor.name = c.name;
+    r.func(c.ctor);
+    for i in 0..c.members.len { r.expr(c.members.at(i).key); r.func(c.members.at(i).fun); }
+}
+
+/// `constructor(...args) { super(...args); }` for derived classes (with
+/// 16 parameters, since there are no rest parameters), `constructor() {}`
+/// for others.
+fn default_ctor(c: *Class, parent: *Func) -> *Func {
+    let f = new_func(c.name, c.line, 0xFFFFFFF0, parent);
+    f.ctor = true;
+    f.derived = !is_null(c.parent);
+    if f.derived {
+        let call = new_node(K.SuperCall, c.line, 0);
+        for i in 0..16 {
+            let v = new_var("", VK.Param, f);
+            f.params.push(v);
+            let a = new_node(K.Name, c.line, 0);
+            a.vr = v;
+            call.list.push(a);
+        }
+        let s = new_node(K.ExprStmt, c.line, 0);
+        s.a = call;
+        f.body.push(s);
+    }
+    f
+}
+
+fn Res.func(r: *Res, f: *Func) {
+    let saved_fun = r.fun;
+    let saved_scope = r.scope;
+    r.fun = f;
+    r.push(&f.vars);
+    if !f.arrow and !f.top {
+        f.this_var = new_var("this", VK.This, f);
+    }
+    for i in 0..f.params.len {
+        let v = f.params.at(i);
+        if v.name.len > 0 {
+            for j in 0..i { if f.params.at(j).name.eq(v.name) { v.assigned = true; } }
+        }
+        f.vars.push(v);
+    }
+    for i in 0..f.body.len { r.hoist(f.body.at(i)); }
+    r.declare_block(&f.body);
+    r.stmts(&f.body);
+    r.expr(f.expr);
+    r.pop();
+    r.fun = saved_fun;
+    r.scope = saved_scope;
+}
+
+/// The innermost non-arrow function's `this`, captured if needed.
+fn Res.this_var(r: *Res) -> *Var {
+    var f = r.fun;
+    while (f as u64) != 0 and f.arrow { f = f.parent; }
+    if (f as u64) == 0 or f.top { return null_var(); }
+    r.capture(f.this_var);
+    f.this_var
+}
+
+fn Res.expr(r: *Res, n: *Node) {
+    if is_null(n) { return; }
+    match n.kind {
+        Num | Str | Undef | Null | True | False => {}
+        Name => r.ref_name(n),
+        This => { n.vr = r.this_var(); }
+        Array | Seq => { for i in 0..n.list.len { r.expr(n.list.at(i)); } }
+        Object => {
+            for i in 0..n.list.len {
+                let p = n.list.at(i);
+                r.expr(p.a);
+                r.expr(p.b);
+            }
+        }
+        Func => {
+            let f = n.fun;
+            if f.name.len > 0 and !f.method and !f.arrow {
+                // A named function expression sees its own name.
+                let vs: *mem.Vec<*Var> = mem.alloc(1);
+                *vs = mem.Vec.new();
+                r.push(vs);
+                let self_var = new_var(f.name, VK.Const, f);
+                vs.push(self_var);
+                f.self_var = self_var;
+                r.func(f);
+                r.pop();
+                return;
+            }
+            r.func(f);
+        }
+        Unary => {
+            if n.op == T.Typeof and n.a.kind == K.Name {
+                r.ref_name(n.a);
+                return;
+            }
+            r.expr(n.a);
+        }
+        Update => {
+            r.expr(n.a);
+            if n.a.kind == K.Name { n.a.vr.assigned = true; }
+        }
+        Bin | Logical => { r.expr(n.a); r.expr(n.b); }
+        Cond => { r.expr(n.a); r.expr(n.b); r.expr(n.c); }
+        Assign => {
+            r.expr(n.a);
+            r.expr(n.b);
+            if n.a.kind == K.Name { n.a.vr.assigned = true; }
+        }
+        Member => r.expr(n.a),
+        Index => { r.expr(n.a); r.expr(n.b); }
+        Call | New => { r.expr(n.a); for i in 0..n.list.len { r.expr(n.list.at(i)); } }
+        SuperCall => { n.vr = r.this_var(); for i in 0..n.list.len { r.expr(n.list.at(i)); } }
+        SuperMember => { n.vr = r.this_var(); }
+        _ => fail(n.line, "unexpected expression"),
+    }
+}
+
+// ── pass 2: code generation ─────────────────────────────────────────
+
+fn boxed(v: *Var) -> bool {
+    v.kind != VK.Global and v.captured and (v.assigned or v.cap_pos < v.decl_pos)
+}
+
+struct Loop {
+    label: str,
+    brk: bc.Label,
+    cont: bc.Label,
+    /// Accepts `continue` (loops) as well as `break`.
+    is_loop: bool,
+    /// Plain `break` targets it (loops and switch, not labeled blocks).
+    plain: bool,
+    ntries: u64,
+}
+
+struct Try {
+    /// The finally block (null for try/catch).
+    fin: *Node,
+    seg_start: u64,
+    segs: mem.Vec<u64>,
+}
+
+struct FS {
+    fun: *Func,
+    parent: *FS,
+    code: bc.Code<u32>,
+    consts: bc.Pool<V>,
+    protos: mem.Vec<Gc<Proto>>,
+    regs: bc.Regs,
+    handlers: mem.Vec<u32>,
+    loops: mem.Vec<Loop>,
+    tries: mem.Vec<*Try>,
+    /// A label that the next loop takes.
+    pending_label: str,
+    /// Derived constructors: the register holding the object that
+    /// `super(...)` initializes (0: none).
+    hidden_this: u32,
+}
+
+struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
+
+fn FS.new(f: *Func, parent: *FS) -> FS {
+    FS {
+        fun: f,
+        parent: parent,
+        code: bc.Code.new(JS.op_size, JS.set_label),
+        consts: bc.Pool.new(65536),
+        protos: mem.Vec.new(),
+        regs: bc.Regs.new(250),
+        handlers: mem.Vec.new(),
+        loops: mem.Vec.new(),
+        tries: mem.Vec.new(),
+        pending_label: "",
+        hidden_this: 0,
+    }
+}
+
+fn Gen.emit(g: *Gen, w: u32) -> u64 { g.fs.code.op(w) }
+fn Gen.pc(g: *Gen) -> u64 { g.fs.code.pc() }
+fn Gen.label(g: *Gen) -> bc.Label { g.fs.code.label() }
+fn Gen.bind(g: *Gen, l: bc.Label) { g.fs.code.bind(l); }
+fn Gen.jump(g: *Gen, l: bc.Label) { g.fs.code.jump(JS.JMP(0), l); }
+fn Gen.temp(g: *Gen) -> u32 { g.fs.regs.alloc(1) }
+fn Gen.mark(g: *Gen) -> u32 { g.fs.regs.mark() }
+fn Gen.reset(g: *Gen, m: u32) { g.fs.regs.reset(m); }
+fn Gen.is_temp(g: *Gen, r: u32) -> bool { g.fs.regs.is_temp(r) }
+
+fn Gen.konst(g: *Gen, v: V) -> u32 {
+    match g.fs.consts.add(v) {
+        Some(i) => i,
+        None => fail(0, "too many constants in one function"),
+    }
+}
+
+fn Gen.str_const(g: *Gen, s: str) -> u32 {
+    let st = g.ctx.key_str(g.ctx.key(s));
+    g.konst(V.S(st))
+}
+
+fn Gen.load_const(g: *Gen, v: V, dst: u32) {
+    if let Int(i) = v and i >= -32768 and i <= 32767 {
+        g.emit(JS.LOADI(dst as u8, i as i16));
+        return;
+    }
+    let k = g.konst(v);
+    g.emit(JS.LOADK(dst as u8, k as u16));
+}
+
+fn Gen.mov(g: *Gen, dst: u32, src: u32) {
+    if dst != src { g.emit(JS.MOVE(dst as u8, src as u8)); }
+}
+
+// Variables.
+
+fn free_index(f: *Func, v: *Var) -> u32 {
+    for i in 0..f.free.len { if (f.free.at(i) as u64) == (v as u64) { return i as u32; } }
+    fail(0, "internal error: variable not captured")
+}
+
+fn Gen.is_local(g: *Gen, v: *Var) -> bool { v.kind != VK.Global and (v.owner as u64) == (g.fs.fun as u64) }
+
+/// The register holding `v`'s value directly, if there is one.
+fn Gen.var_reg(g: *Gen, v: *Var) -> ?u32 {
+    if g.is_local(v) and !boxed(v) { Some(v.reg) } else { None }
+}
+
+fn Gen.load_var(g: *Gen, v: *Var, dst: u32) {
+    if v.kind == VK.Global {
+        if v.undeclared {
+            let k = g.str_const(v.name);
+            g.emit(JS.THROWREF(0, k as u16));
+            return;
+        }
+        g.emit(JS.GETGLOBAL(dst as u8, v.slot as u16));
+        return;
+    }
+    if g.is_local(v) {
+        if boxed(v) { g.emit(JS.BOXGET(dst as u8, v.reg as u8)); } else { g.mov(dst, v.reg); }
+    } else {
+        let i = free_index(g.fs.fun, v);
+        g.emit(JS.GETFREE(dst as u8, i as u8));
+        if boxed(v) { g.emit(JS.BOXGET(dst as u8, dst as u8)); }
+    }
+    if v.kind == VK.This and v.owner.derived { g.emit(JS.CHECKTHIS(dst as u8)); }
+}
+
+fn Gen.store_var(g: *Gen, v: *Var, src: u32) {
+    if v.kind == VK.Global {
+        if v.undeclared {
+            let k = g.str_const(v.name);
+            g.emit(JS.THROWREF(0, k as u16));
+            return;
+        }
+        g.emit(JS.SETGLOBAL(src as u8, v.slot as u16));
+        return;
+    }
+    if g.is_local(v) {
+        if boxed(v) { g.emit(JS.BOXSET(v.reg as u8, src as u8)); } else { g.mov(v.reg, src); }
+        return;
+    }
+    let i = free_index(g.fs.fun, v);
+    let m = g.mark();
+    let t = g.temp();
+    g.emit(JS.GETFREE(t as u8, i as u8));
+    g.emit(JS.BOXSET(t as u8, src as u8));
+    g.reset(m);
+}
+
+/// Give registers to the local variables in `vars` and create boxes.
+fn Gen.enter_vars(g: *Gen, vars: *mem.Vec<*Var>) {
+    var n: u32 = 0;
+    let base = g.fs.regs.nactive;
+    for i in 0..vars.len {
+        let v = vars.at(i);
+        if v.kind == VK.Global { continue; }
+        v.reg = base + n;
+        n += 1;
+    }
+    g.fs.regs.activate(n);
+    for i in 0..vars.len {
+        let v = vars.at(i);
+        if v.kind != VK.Global and boxed(v) {
+            g.emit(JS.LOADU(v.reg as u8));
+            g.emit(JS.BOXNEW(v.reg as u8));
+        }
+    }
+}
+
+/// Create the closures of the hoisted function declarations in `stmts`,
+/// then patch those that capture each other.
+fn Gen.hoist_functions(g: *Gen, stmts: *mem.Vec<*Node>) {
+    for i in 0..stmts.len {
+        let n = stmts.at(i);
+        if n.kind != K.FuncDecl { continue; }
+        let v = n.vr;
+        let m = g.mark();
+        let r = if let Some(x) = g.var_reg(v) { x } else { g.temp() };
+        g.closure(n.fun, r);
+        if g.var_reg(v).is_none() { g.store_var(v, r); }
+        g.reset(m);
+    }
+    for i in 0..stmts.len {
+        let n = stmts.at(i);
+        if n.kind != K.FuncDecl { continue; }
+        let Some(fr) = g.var_reg(n.vr) else { continue; };
+        let f = n.fun;
+        for j in 0..f.free.len {
+            let w = f.free.at(j);
+            if w.kind == VK.FnDecl and g.is_local(w) and !boxed(w) {
+                g.emit(JS.SETFREE(fr as u8, j as u8, w.reg as u8));
+            }
+        }
+    }
+}
+
+// Expressions.
+
+fn has_assign(n: *Node) -> bool {
+    if is_null(n) { return false; }
+    if n.kind == K.Assign or n.kind == K.Update { return true; }
+    if n.kind == K.Func { return false; }
+    if has_assign(n.a) or has_assign(n.b) or has_assign(n.c) { return true; }
+    for i in 0..n.list.len { if has_assign(n.list.at(i)) { return true; } }
+    false
+}
+
+/// A register holding the value of `n`: a local's own register, or a new
+/// temporary. `later` is evaluated after it: if it may assign, a local
+/// is copied.
+fn Gen.any_before(g: *Gen, n: *Node, later: *Node) -> u32 {
+    if n.kind == K.Name and let Some(r) = g.var_reg(n.vr) and !has_assign(later) { return r; }
+    if n.kind == K.This and (n.vr as u64) != 0 and !n.vr.owner.derived and let Some(r) = g.var_reg(n.vr) { return r; }
+    let t = g.temp();
+    g.to(n, t);
+    t
+}
+
+fn Gen.any(g: *Gen, n: *Node) -> u32 { g.any_before(n, null_node()) }
+
+/// The value of a literal operand (for compare-with-constant ops).
+fn Gen.const_value(g: *Gen, n: *Node) -> ?V {
+    match n.kind {
+        Null => Some(V.Null),
+        Undef => Some(V.Undef),
+        True => Some(V.Bool(true)),
+        False => Some(V.Bool(false)),
+        Num => Some(value.number(n.num)),
+        Str => Some(V.S(g.ctx.key_str(g.ctx.key(n.text)))),
+        _ => None,
+    }
+}
+
+fn small_int(n: *Node) -> ?i32 {
+    if n.kind == K.Num and n.num == n.num.floor() and n.num >= -128.0 and n.num <= 127.0 and !(n.num == 0.0 and 1.0 / n.num < 0.0) {
+        return Some(n.num as i32);
+    }
+    None
+}
+
+fn Gen.key_index(g: *Gen, name: str) -> u32 { g.str_const(name) }
+
+/// R[dst] = obj.name
+fn Gen.get_prop(g: *Gen, dst: u32, obj: u32, name: str) {
+    if name.eq("length") {
+        g.emit(JS.GETLEN(dst as u8, obj as u8));
+        return;
+    }
+    let k = g.key_index(name);
+    if k < 256 {
+        g.emit(JS.GETPROP(dst as u8, obj as u8, k as u8));
+        return;
+    }
+    let m = g.mark();
+    let t = g.temp();
+    g.emit(JS.LOADK(t as u8, k as u16));
+    g.emit(JS.GETINDEX(dst as u8, obj as u8, t as u8));
+    g.reset(m);
+}
+
+fn Gen.set_prop(g: *Gen, obj: u32, name: str, val: u32) {
+    let k = g.key_index(name);
+    if k < 256 {
+        g.emit(JS.SETPROP(obj as u8, k as u8, val as u8));
+        return;
+    }
+    let m = g.mark();
+    let t = g.temp();
+    g.emit(JS.LOADK(t as u8, k as u16));
+    g.emit(JS.SETINDEX(obj as u8, t as u8, val as u8));
+    g.reset(m);
+}
+
+/// The binary op for an operator token (assignment operators included).
+fn Gen.arith(g: *Gen, op: T, dst: u32, a: u32, b: u32) {
+    let (d, x, y) = (dst as u8, a as u8, b as u8);
+    match op {
+        Plus | PlusAssign => g.emit(JS.ADD(d, x, y)),
+        Minus | MinusAssign => g.emit(JS.SUB(d, x, y)),
+        Star | StarAssign => g.emit(JS.MUL(d, x, y)),
+        Slash | SlashAssign => g.emit(JS.DIV(d, x, y)),
+        Percent | PercentAssign => g.emit(JS.MOD(d, x, y)),
+        StarStar | StarStarAssign => g.emit(JS.POW(d, x, y)),
+        Amp | AmpAssign => g.emit(JS.BAND(d, x, y)),
+        Pipe | PipeAssign => g.emit(JS.BOR(d, x, y)),
+        Caret | CaretAssign => g.emit(JS.BXOR(d, x, y)),
+        Shl | ShlAssign => g.emit(JS.SHL(d, x, y)),
+        Shr | ShrAssign => g.emit(JS.SHR(d, x, y)),
+        UShr | UShrAssign => g.emit(JS.USHR(d, x, y)),
+        Lt => g.emit(JS.LT(d, x, y)),
+        Gt => g.emit(JS.LT(d, y, x)),
+        Le => g.emit(JS.LE(d, x, y)),
+        Ge => g.emit(JS.LE(d, y, x)),
+        EqEqEq => g.emit(JS.EQ(d, x, y)),
+        NotEqEq => g.emit(JS.NE(d, x, y)),
+        EqEq => g.emit(JS.LOOSEEQ(d, x, y)),
+        NotEq => { g.emit(JS.LOOSEEQ(d, x, y)); g.emit(JS.NOT(d, d)) }
+        In => g.emit(JS.IN(d, x, y)),
+        _ => fail(0, "unsupported operator"),
+    };
+}
+
+/// Needs its own temporary for the result (writes it before reading all
+/// operands).
+fn writes_early(n: *Node) -> bool {
+    match n.kind {
+        Object | Array | Logical => true,
+        _ => false,
+    }
+}
+
+/// Compile `n` into register `dst`.
+fn Gen.to(g: *Gen, n: *Node, dst: u32) {
+    if writes_early(n) and !g.is_temp(dst) {
+        let m = g.mark();
+        let t = g.temp();
+        g.to(n, t);
+        g.mov(dst, t);
+        g.reset(m);
+        return;
+    }
+    let m = g.mark();
+    g.fs.code.set_loc(n.line);
+    match n.kind {
+        Num => g.load_const(value.number(n.num), dst),
+        Str => { let k = g.str_const(n.text); g.emit(JS.LOADK(dst as u8, k as u16)); }
+        Undef => { g.emit(JS.LOADU(dst as u8)); }
+        Null => { g.emit(JS.LOADNULL(dst as u8)); }
+        True => { g.emit(JS.LOADBOOL(dst as u8, 1)); }
+        False => { g.emit(JS.LOADBOOL(dst as u8, 0)); }
+        Name => g.load_var(n.vr, dst),
+        This => {
+            if (n.vr as u64) == 0 { g.emit(JS.LOADU(dst as u8)); } else { g.load_var(n.vr, dst); }
+        }
+        Array => g.array(n, dst),
+        Object => g.object(n, dst),
+        Func => {
+g.closure(n.fun, dst);
+        }
+        Unary => g.unary(n, dst),
+        Update => g.update(n, dst, true),
+        Bin => {
+            if n.op == T.Plus or n.op == T.Minus {
+                if let Some(c) = small_int(n.b) and (c != 0 or n.op == T.Plus) {
+                    let a = g.any(n.a);
+                    let sc = if n.op == T.Plus { c } else { 0 - c };
+                    if sc >= -128 and sc <= 127 {
+                        g.emit(JS.ADDI(dst as u8, a as u8, sc as i8));
+                        g.reset(m);
+                        return;
+                    }
+                }
+            }
+            if n.op == T.Instanceof { fail(n.line, "instanceof is not supported"); }
+            let a = g.any_before(n.a, n.b);
+            let b = g.any(n.b);
+            g.arith(n.op, dst, a, b);
+        }
+        Logical => {
+            g.to(n.a, dst);
+            let end = g.label();
+            if n.op == T.AmpAmp {
+                g.fs.code.jump(JS.TEST(dst as u8, 0), end);
+            } else if n.op == T.PipePipe {
+                g.fs.code.jump(JS.TESTT(dst as u8, 0), end);
+            } else {
+                g.fs.code.jump(JS.TESTNN(dst as u8, 0), end);
+            }
+            g.to(n.b, dst);
+            g.bind(end);
+        }
+        Cond => {
+            let els = g.label();
+            let end = g.label();
+            g.cond(n.a, false, els);
+            g.to(n.b, dst);
+            g.jump(end);
+            g.bind(els);
+            g.to(n.c, dst);
+            g.bind(end);
+        }
+        Assign => g.assign(n, dst, true),
+        Member => {
+            let o = g.any(n.a);
+            g.get_prop(dst, o, n.text);
+        }
+        Index => {
+            if n.b.kind == K.Str {
+                let o = g.any(n.a);
+                g.get_prop(dst, o, n.b.text);
+            } else {
+                let o = g.any_before(n.a, n.b);
+                let k = g.any(n.b);
+                g.emit(JS.GETINDEX(dst as u8, o as u8, k as u8));
+            }
+        }
+        Call | New | SuperCall => {
+            let base = g.call(n);
+            g.mov(dst, base);
+        }
+        SuperMember => {
+            let k = g.key_index(n.text);
+            g.emit(JS.GETSUPER(dst as u8, k as u8));
+        }
+        Seq => {
+            for i in 0..n.list.len {
+                let mm = g.mark();
+                if i + 1 == n.list.len { g.to(n.list.at(i), dst); } else { g.effect(n.list.at(i)); }
+                g.reset(mm);
+            }
+        }
+        _ => fail(n.line, "unexpected expression"),
+    }
+    g.reset(m);
+}
+
+/// Evaluate `n` for its effects only.
+fn Gen.effect(g: *Gen, n: *Node) {
+    let m = g.mark();
+    match n.kind {
+        Assign => g.assign(n, 0, false),
+        Update => g.update(n, 0, false),
+        Num | Str | Undef | Null | True | False | Name | This | Func => {
+            if n.kind == K.Name and n.vr.undeclared { let t = g.temp(); g.to(n, t); }
+        }
+        Call | New | SuperCall => { g.call(n); }
+        _ => { let t = g.temp(); g.to(n, t); }
+    }
+    g.reset(m);
+}
+
+fn Gen.array(g: *Gen, n: *Node, dst: u32) {
+    let total = n.list.len;
+    var done: u64 = 0;
+    var first = true;
+    while first or done < total {
+        let chunk = if total - done > 200 { 200 } else { total - done };
+        let m = g.mark();
+        let base = if chunk == 0 { dst } else { g.fs.regs.alloc(chunk as u32) };
+        for i in 0..chunk { g.to(n.list.at(done + i), base + i as u32); }
+        if first {
+            g.emit(JS.NEWARR(dst as u8, base as u8, chunk as u8));
+        } else {
+            g.emit(JS.ARRPUSH(dst as u8, base as u8, chunk as u8));
+        }
+        g.reset(m);
+        done += chunk;
+        first = false;
+    }
+}
+
+fn Gen.object(g: *Gen, n: *Node, dst: u32) {
+    var cap = n.list.len;
+    if cap > 32 { cap = 32; }
+    g.emit(JS.NEWOBJ(dst as u8, cap as u8));
+    for i in 0..n.list.len {
+        let p = n.list.at(i);
+        let m = g.mark();
+        if p.flag & 1 != 0 {
+            let k = g.any(p.a);
+            let v = g.any(p.b);
+            g.emit(JS.SETINDEX(dst as u8, k as u8, v as u8));
+        } else {
+            let v = g.any(p.b);
+            g.set_prop(dst, p.text, v);
+        }
+        g.reset(m);
+    }
+}
+
+fn Gen.unary(g: *Gen, n: *Node, dst: u32) {
+    let d = dst as u8;
+    match n.op {
+        Minus => {
+            if n.a.kind == K.Num { g.load_const(value.number(-n.a.num), dst); return; }
+            let a = g.any(n.a);
+            g.emit(JS.NEG(d, a as u8));
+        }
+        Plus => { let a = g.any(n.a); g.emit(JS.TONUM(d, a as u8)); }
+        Bang => { let a = g.any(n.a); g.emit(JS.NOT(d, a as u8)); }
+        Tilde => { let a = g.any(n.a); g.emit(JS.BNOT(d, a as u8)); }
+        Typeof => {
+            if n.a.kind == K.Name and n.a.vr.undeclared {
+                let k = g.str_const("undefined");
+                g.emit(JS.LOADK(d, k as u16));
+                return;
+            }
+            let a = g.any(n.a);
+            g.emit(JS.TYPEOF(d, a as u8));
+        }
+        Void => { g.effect(n.a); g.emit(JS.LOADU(d)); }
+        Delete => {
+            if n.a.kind == K.Member {
+                let o = g.any(n.a.a);
+                let t = g.temp();
+                let k = g.str_const(n.a.text);
+                g.emit(JS.LOADK(t as u8, k as u16));
+                g.emit(JS.DELPROP(d, o as u8, t as u8));
+            } else if n.a.kind == K.Index {
+                let o = g.any_before(n.a.a, n.a.b);
+                let k = g.any(n.a.b);
+                g.emit(JS.DELPROP(d, o as u8, k as u8));
+            } else {
+                g.effect(n.a);
+                g.emit(JS.LOADBOOL(d, 1));
+            }
+        }
+        _ => fail(n.line, "unsupported unary operator"),
+    }
+}
+
+/// `++`/`--`, prefix or postfix; the value goes to `dst` if `want`.
+fn Gen.update(g: *Gen, n: *Node, dst: u32, want: bool) {
+    let delta: i8 = if n.op == T.PlusPlus { 1 } else { -1 };
+    let prefix = n.flag == 1;
+    let t = n.a;
+    let m = g.mark();
+    if t.kind == K.Name {
+        if let Some(r) = g.var_reg(t.vr) {
+            if want and !prefix {
+                g.emit(JS.TONUM(dst as u8, r as u8));
+                g.emit(JS.ADDI(r as u8, dst as u8, delta));
+            } else {
+                g.emit(JS.ADDI(r as u8, r as u8, delta));
+                if want { g.mov(dst, r); }
+            }
+            return;
+        }
+        let old = g.temp();
+        let nw = g.temp();
+        g.load_var(t.vr, old);
+        g.emit(JS.TONUM(old as u8, old as u8));
+        g.emit(JS.ADDI(nw as u8, old as u8, delta));
+        g.store_var(t.vr, nw);
+        if want { g.mov(dst, if prefix { nw } else { old }); }
+        g.reset(m);
+        return;
+    }
+    let o = g.any_before(t.a, t.b);
+    let old = g.temp();
+    let nw = g.temp();
+    if t.kind == K.Member {
+        g.get_prop(old, o, t.text);
+        g.emit(JS.TONUM(old as u8, old as u8));
+        g.emit(JS.ADDI(nw as u8, old as u8, delta));
+        g.set_prop(o, t.text, nw);
+    } else {
+        let k = g.any(t.b);
+        g.emit(JS.GETINDEX(old as u8, o as u8, k as u8));
+        g.emit(JS.TONUM(old as u8, old as u8));
+        g.emit(JS.ADDI(nw as u8, old as u8, delta));
+        g.emit(JS.SETINDEX(o as u8, k as u8, nw as u8));
+    }
+    if want { g.mov(dst, if prefix { nw } else { old }); }
+    g.reset(m);
+}
+
+fn is_logical_assign(op: T) -> bool { op == T.AmpAmpAssign or op == T.PipePipeAssign or op == T.QQAssign }
+
+/// Jump to `l` unless the logical assignment `op` should assign, given the
+/// current value in `r`.
+fn Gen.logical_skip(g: *Gen, op: T, r: u32, l: bc.Label) {
+    if op == T.AmpAmpAssign { g.fs.code.jump(JS.TEST(r as u8, 0), l); }
+    else if op == T.PipePipeAssign { g.fs.code.jump(JS.TESTT(r as u8, 0), l); }
+    else { g.fs.code.jump(JS.TESTNN(r as u8, 0), l); }
+}
+
+fn Gen.assign(g: *Gen, n: *Node, dst: u32, want: bool) {
+    let t = n.a;
+    let op = n.op;
+    let m = g.mark();
+    if t.kind == K.Name {
+        let v = t.vr;
+        if op == T.Assign {
+            if let Some(r) = g.var_reg(v) {
+                g.to(n.b, r);
+                if want { g.mov(dst, r); }
+            } else {
+                let x = g.any(n.b);
+                g.store_var(v, x);
+                if want { g.mov(dst, x); }
+            }
+            g.reset(m);
+            return;
+        }
+        let cur = match g.var_reg(v) {
+            Some(r) => r,
+            None => { let x = g.temp(); g.load_var(v, x); x }
+        };
+        if is_logical_assign(op) {
+            let end = g.label();
+            g.logical_skip(op, cur, end);
+            g.to(n.b, cur);
+            if g.var_reg(v).is_none() { g.store_var(v, cur); }
+            g.bind(end);
+            if want { g.mov(dst, cur); }
+            g.reset(m);
+            return;
+        }
+        if (op == T.PlusAssign or op == T.MinusAssign) and let Some(c) = small_int(n.b) and (c != 0 or op == T.PlusAssign) {
+            g.emit(JS.ADDI(cur as u8, cur as u8, (if op == T.PlusAssign { c } else { 0 - c }) as i8));
+        } else {
+            let b = g.any(n.b);
+            g.arith(op, cur, cur, b);
+        }
+        if g.var_reg(v).is_none() { g.store_var(v, cur); }
+        if want { g.mov(dst, cur); }
+        g.reset(m);
+        return;
+    }
+    // Property targets: evaluate the object (and key) first.
+    let is_member = t.kind == K.Member or (t.kind == K.Index and t.b.kind == K.Str);
+    let name = if t.kind == K.Member { t.text } else if is_member { t.b.text } else { "" };
+    let o = if is_member { g.any_before(t.a, n.b) } else { g.any_before(t.a, t.b) };
+    let k = if is_member { 0 } else { g.any_before(t.b, n.b) };
+    var val: u32 = 0;
+    if op == T.Assign {
+        val = g.any(n.b);
+    } else {
+        val = g.temp();
+        if is_member { g.get_prop(val, o, name); } else { g.emit(JS.GETINDEX(val as u8, o as u8, k as u8)); }
+        if is_logical_assign(op) {
+            let end = g.label();
+            g.logical_skip(op, val, end);
+            g.to(n.b, val);
+            if is_member { g.set_prop(o, name, val); } else { g.emit(JS.SETINDEX(o as u8, k as u8, val as u8)); }
+            g.bind(end);
+            if want { g.mov(dst, val); }
+            g.reset(m);
+            return;
+        }
+        let b = g.any(n.b);
+        g.arith(op, val, val, b);
+    }
+    if is_member { g.set_prop(o, name, val); } else { g.emit(JS.SETINDEX(o as u8, k as u8, val as u8)); }
+    if want { g.mov(dst, val); }
+    g.reset(m);
+}
+
+/// Compile a call (or `new`, or `super(...)`); the result is left in the
+/// returned register (a temporary that stays allocated).
+fn Gen.call(g: *Gen, n: *Node) -> u32 {
+    let nargs = n.list.len;
+    if nargs > 200 { fail(n.line, "too many arguments"); }
+    let base = g.fs.regs.alloc(2 + nargs as u32);
+    let callee = n.a;
+    var is_new = false;
+    if n.kind == K.New {
+        g.to(callee, base);
+        is_new = true;
+    } else if n.kind == K.SuperCall {
+        g.emit(JS.GETPARENT(base as u8));
+        if (n.vr as u64) == 0 { fail(n.line, "'super' keyword unexpected here"); }
+        if g.fs.hidden_this != 0 { g.mov(base + 1, g.fs.hidden_this); } else { g.load_var(n.vr, base + 1); }
+    } else if callee.kind == K.Member or (callee.kind == K.Index and callee.b.kind == K.Str) {
+        let name = if callee.kind == K.Member { callee.text } else { callee.b.text };
+        let m = g.mark();
+        let o = g.any(callee.a);
+        let k = g.key_index(name);
+        if k < 256 {
+            g.emit(JS.GETMETHOD(base as u8, o as u8, k as u8));
+        } else {
+            g.mov(base + 1, o);
+            g.get_prop(base, o, name);
+        }
+        g.reset(m);
+    } else if callee.kind == K.Index {
+        g.to(callee.a, base + 1);
+        let m = g.mark();
+        let k = g.any(callee.b);
+        g.emit(JS.GETINDEX(base as u8, (base + 1) as u8, k as u8));
+        g.reset(m);
+    } else if callee.kind == K.SuperMember {
+        let k = g.key_index(callee.text);
+        g.emit(JS.GETSUPER(base as u8, k as u8));
+        let tv = callee.vr;
+        if (tv as u64) == 0 { g.emit(JS.LOADU((base + 1) as u8)); } else { g.load_var(tv, base + 1); }
+    } else {
+        g.to(callee, base);
+        g.emit(JS.LOADU((base + 1) as u8));
+    }
+    for i in 0..nargs { g.to(n.list.at(i), base + 2 + i as u32); }
+    if is_new { g.emit(JS.NEW(base as u8, nargs as u8)); } else { g.emit(JS.CALL(base as u8, nargs as u8)); }
+    if n.kind == K.SuperCall and g.fs.hidden_this != 0 {
+        g.emit(JS.SUPERDONE(g.fs.hidden_this as u8));
+        g.mov(base, 0);
+    }
+    g.fs.regs.reset(base + 1);
+    base
+}
+
+/// `this` for `super.m(...)`: the enclosing method's.
+fn Gen.this_of_super(g: *Gen, n: *Node) -> *Var {
+    var f = g.fs.fun;
+    while (f as u64) != 0 and f.arrow { f = f.parent; }
+    if (f as u64) == 0 or f.top { return null_var(); }
+    f.this_var
+}
+
+/// Jump to `l` if the truthiness of `n` is `jump_if`.
+fn Gen.cond(g: *Gen, n: *Node, jump_if: bool, l: bc.Label) {
+    let m = g.mark();
+    match n.kind {
+        Unary => {
+            if n.op == T.Bang { g.cond(n.a, !jump_if, l); return; }
+        }
+        True | False => {
+            if (n.kind == K.True) == jump_if { g.jump(l); }
+            return;
+        }
+        Logical => {
+            if n.op == T.AmpAmp {
+                if jump_if {
+                    let skip = g.label();
+                    g.cond(n.a, false, skip);
+                    g.cond(n.b, true, l);
+                    g.bind(skip);
+                } else {
+                    g.cond(n.a, false, l);
+                    g.cond(n.b, false, l);
+                }
+                return;
+            }
+            if n.op == T.PipePipe {
+                if jump_if {
+                    g.cond(n.a, true, l);
+                    g.cond(n.b, true, l);
+                } else {
+                    let skip = g.label();
+                    g.cond(n.a, true, skip);
+                    g.cond(n.b, false, l);
+                    g.bind(skip);
+                }
+                return;
+            }
+        }
+        Bin => {
+            let op = n.op;
+            if (op == T.EqEqEq or op == T.NotEqEq) and let Some(kv) = g.const_value(n.b) {
+                let a = g.any(n.a);
+                let k = g.konst(kv);
+                if k < 256 {
+                    let pol: u8 = if (op == T.NotEqEq) != jump_if { 1 } else { 0 };
+                    g.emit(JS.JEQK(pol, a as u8, k as u8));
+                    g.jump(l);
+                    g.reset(m);
+                    return;
+                }
+            }
+            if op == T.Lt or op == T.Gt or op == T.Le or op == T.Ge or op == T.EqEqEq or op == T.NotEqEq {
+                let a = g.any_before(n.a, n.b);
+                let b = g.any(n.b);
+                let pol: u8 = if (op == T.NotEqEq) != jump_if { 1 } else { 0 };
+                let (x, y) = (a as u8, b as u8);
+                match op {
+                    Lt => g.emit(JS.JLT(pol, x, y)),
+                    Gt => g.emit(JS.JLT(pol, y, x)),
+                    Le => g.emit(JS.JLE(pol, x, y)),
+                    Ge => g.emit(JS.JLE(pol, y, x)),
+                    _ => g.emit(JS.JEQ(pol, x, y)),
+                };
+                g.jump(l);
+                g.reset(m);
+                return;
+            }
+        }
+        _ => {}
+    }
+    let r = g.any(n);
+    if jump_if { g.fs.code.jump(JS.TESTT(r as u8, 0), l); } else { g.fs.code.jump(JS.TEST(r as u8, 0), l); }
+    g.reset(m);
+}
+
+// Functions.
+
+/// R[dst] = a closure of `f`.
+fn Gen.closure(g: *Gen, f: *Func, dst: u32) {
+    let p = g.function(f);
+    g.fs.protos.push(p);
+    let i = g.fs.protos.len - 1;
+    if i > 65535 { fail(f.line, "too many functions"); }
+    g.emit(JS.CLOSURE(dst as u8, i as u16));
+}
+
+fn Gen.function(g: *Gen, f: *Func) -> Gc<Proto> {
+    let parent = g.fs;
+    var fs = FS.new(f, parent);
+    g.fs = &fs;
+    fs.code.set_loc(f.line);
+    // R0 = this, R1.. = parameters, then the function-scope variables.
+    if (f.this_var as u64) != 0 { f.this_var.reg = 0; }
+    fs.regs.activate(1);
+    var params: mem.Vec<*Var> = mem.Vec.new();
+    var rest: mem.Vec<*Var> = mem.Vec.new();
+    for i in 0..f.vars.len {
+        let v = f.vars.at(i);
+        var is_param = false;
+        for j in 0..f.params.len { if (f.params.at(j) as u64) == (v as u64) { is_param = true; } }
+        if is_param { params.push(v); } else { rest.push(v); }
+    }
+    for i in 0..f.params.len {
+        let v = f.params.at(i);
+        v.reg = 1 + i as u32;
+    }
+    fs.regs.activate(f.params.len as u32);
+    for i in 0..f.params.len {
+        let v = f.params.at(i);
+        if boxed(v) and (v.reg as u64) == i + 1 { g.emit(JS.BOXNEW(v.reg as u8)); }
+    }
+    if (f.this_var as u64) != 0 and boxed(f.this_var) { g.emit(JS.BOXNEW(0)); }
+    if f.derived {
+        let hr = fs.regs.nactive;
+        fs.regs.activate(1);
+        fs.hidden_this = hr;
+        g.emit(JS.MOVE(hr as u8, 0));
+        g.emit(JS.LOADU(0));
+    }
+    if (f.self_var as u64) != 0 { rest.push(f.self_var); }
+    g.enter_vars(&rest);
+    if (f.self_var as u64) != 0 { g.emit(JS.SELF(f.self_var.reg as u8)); }
+    params.free();
+    rest.free();
+    g.hoist_functions(&f.body);
+    if !is_null(f.expr) {
+        let r = g.any(f.expr);
+        g.emit(JS.RET(r as u8));
+    } else {
+        g.stmts(&f.body);
+        g.emit(JS.RETU());
+    }
+    let p = g.finish(&fs);
+    g.fs = parent;
+    p
+}
+
+/// The program (or the prelude): a function without parameters whose
+/// top-level declarations are globals.
+fn Gen.top(g: *Gen, f: *Func) -> Gc<Proto> {
+    var fs = FS.new(f, 0 as *FS);
+    g.fs = &fs;
+    fs.regs.activate(1);
+    g.enter_vars(&f.vars);
+    g.hoist_functions(&f.body);
+    g.stmts(&f.body);
+    let r = g.temp();
+    g.emit(JS.LOADU(r as u8));
+    g.emit(JS.RET(r as u8));
+    g.finish(&fs)
+}
+
+/// `this.x = ...` assignments in `n` (not in nested functions).
+fn count_this_props(n: *Node) -> u32 {
+    if is_null(n) or n.kind == K.Func { return 0; }
+    var c: u32 = 0;
+    if n.kind == K.Assign and n.a.kind == K.Member and n.a.a.kind == K.This { c += 1; }
+    c += count_this_props(n.a) + count_this_props(n.b) + count_this_props(n.c) + count_this_props(n.d);
+    for i in 0..n.list.len { c += count_this_props(n.list.at(i)); }
+    c
+}
+
+/// Inline slots for the objects a constructor makes: its own
+/// `this.x = ...` count, plus room for a parent constructor's.
+fn ctor_hint(f: *Func) -> u32 {
+    var c: u32 = 0;
+    for i in 0..f.body.len { c += count_this_props(f.body.at(i)); }
+    if c < 4 and !f.derived { c = 4; }
+    if c > 32 { c = 32; }
+    c
+}
+
+fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
+    let h = g.heap;
+    let f = fs.fun;
+    if let Some(e) = fs.code.check() { fail(e.loc, e.message()); }
+    if fs.regs.failed() { fail(f.line, "function needs too many registers"); }
+    let consts = rt.new_vals(h, fs.consts.len());
+    for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
+    let protos = new(h, Protos {}, fs.protos.len);
+    for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
+    if f.free.len > 255 { fail(f.line, "too many captured variables"); }
+    let desc = new(h, Descs {}, f.free.len);
+    for i in 0..f.free.len {
+        let v = f.free.at(i);
+        let p = f.parent;
+        desc.data[i] = if (v.owner as u64) == (p as u64) { 256 | v.reg } else { free_index(p, v) };
+    }
+    let handlers = new(h, Handlers {}, fs.handlers.len);
+    for i in 0..fs.handlers.len { handlers.data[i] = fs.handlers.at(i); }
+    let n = fs.code.len();
+    let lines = new(h, Lines {}, n);
+    fs.code.locs_into(lines.data);
+    var flags: u32 = 0;
+    if f.arrow { flags = flags | value.PF_ARROW; }
+    if f.method { flags = flags | value.PF_METHOD; }
+    if f.ctor { flags = flags | value.PF_CLASS; }
+    if f.derived { flags = flags | value.PF_DERIVED; }
+    let np = f.params.len as u32;
+    let proto = new(h, Proto {
+        name: g.ctx.key_str(g.ctx.key(f.name)),
+        nparams: np,
+        fixed: if f.ctor { value.NO_FIXED } else { np },
+        nregs: fs.regs.frame_size(np + 1),
+        nfree: f.free.len as u32,
+        flags: flags,
+        hint: ctor_hint(f),
+        consts: consts,
+        protos: protos,
+        desc: desc,
+        handlers: handlers,
+        lines: lines,
+    }, n);
+    fs.code.copy_into(proto.code);
+    if let Some(bad) = JS.verify(proto.code, proto) {
+        var b = text.StrBuf.new();
+        b.push_str("internal error: generated code fails verification at word ");
+        b.push_int(bad as i64);
+        b.push_str(" (");
+        b.push_str(JS.op_name(proto.code[bad]));
+        b.push_str(", nregs ");
+        b.push_int(proto.nregs as i64);
+        b.push_str(")");
+        fail(f.line, b.as_str());
+    }
+    JS.optimize(proto.code);
+    fs.code.free();
+    fs.consts.free();
+    fs.protos.free();
+    fs.handlers.free();
+    fs.loops.free();
+    fs.tries.free();
+    proto
+}
+
+// Statements.
+
+fn Gen.stmts(g: *Gen, l: *mem.Vec<*Node>) { for i in 0..l.len { g.stmt(l.at(i)); } }
+
+/// A block with its own scope.
+fn Gen.scoped(g: *Gen, vars: *mem.Vec<*Var>, stmts: *mem.Vec<*Node>) {
+    let lvl = g.fs.regs.enter();
+    g.enter_vars(vars);
+    g.hoist_functions(stmts);
+    g.stmts(stmts);
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.decls(g: *Gen, n: *Node) {
+    for i in 0..n.list.len {
+        let d = n.list.at(i);
+        let v = d.vr;
+        let m = g.mark();
+        if is_null(d.a) {
+            if n.op != T.Var {
+                // `let x;` gives x the value undefined.
+                if let Some(r) = g.var_reg(v) { g.emit(JS.LOADU(r as u8)); }
+                else { let t = g.temp(); g.emit(JS.LOADU(t as u8)); g.store_var(v, t); }
+            }
+        } else if let Some(r) = g.var_reg(v) {
+            g.to(d.a, r);
+        } else {
+            let x = g.any(d.a);
+            g.store_var(v, x);
+        }
+        g.reset(m);
+    }
+}
+
+fn Gen.push_loop(g: *Gen, is_loop: bool) -> u64 {
+    let label = g.fs.pending_label;
+    g.fs.pending_label = "";
+    g.fs.loops.push(Loop { label: label, brk: g.label(), cont: g.label(), is_loop: is_loop, plain: true, ntries: g.fs.tries.len });
+    g.fs.loops.len - 1
+}
+
+fn Gen.loop_at(g: *Gen, i: u64) -> Loop { g.fs.loops.at(i) }
+
+/// Before a jump out of the try statements above depth `depth`: end
+/// their protected ranges here and run their finally blocks.
+fn Gen.exit_begin(g: *Gen, depth: u64) {
+    let fs = g.fs;
+    var i = fs.tries.len;
+    while i > depth {
+        i -= 1;
+        let t = fs.tries.at(i);
+        let pc = g.pc();
+        if pc > t.seg_start { t.segs.push(t.seg_start); t.segs.push(pc); }
+        t.seg_start = pc;
+    }
+    i = fs.tries.len;
+    while i > depth {
+        i -= 1;
+        let t = fs.tries.at(i);
+        if is_null(t.fin) { continue; }
+        // Compile the finally block as if outside this try (and outside
+        // loops inside it).
+        var saved: mem.Vec<*Try> = mem.Vec.new();
+        for j in i..fs.tries.len { saved.push(fs.tries.at(j)); }
+        fs.tries.truncate(i);
+        var saved_loops: mem.Vec<Loop> = mem.Vec.new();
+        while fs.loops.len > 0 and fs.loops.at(fs.loops.len - 1).ntries > i {
+            saved_loops.push(fs.loops.at(fs.loops.len - 1));
+            fs.loops.truncate(fs.loops.len - 1);
+        }
+        g.block(t.fin);
+        var j = saved_loops.len;
+        while j > 0 { j -= 1; fs.loops.push(saved_loops.at(j)); }
+        for j in 0..saved.len { fs.tries.push(saved.at(j)); }
+        saved.free();
+        saved_loops.free();
+        let pc = g.pc();
+        for j in i..fs.tries.len {
+            let u = fs.tries.at(j);
+            if pc > u.seg_start { u.segs.push(u.seg_start); u.segs.push(pc); }
+            u.seg_start = pc;
+        }
+    }
+}
+
+/// After that jump: the protected ranges continue.
+fn Gen.exit_end(g: *Gen, depth: u64) {
+    let pc = g.pc();
+    for i in depth..g.fs.tries.len { g.fs.tries.at(i).seg_start = pc; }
+}
+
+fn Gen.block(g: *Gen, n: *Node) { g.scoped(&n.vars, &n.list); }
+
+fn Gen.stmt(g: *Gen, n: *Node) {
+    g.fs.code.set_loc(n.line);
+    g.fs.regs.end_stmt();
+    match n.kind {
+        VarDecl => g.decls(n),
+        ExprStmt => { if n.a.kind != K.Str { g.effect(n.a); } }
+        Block => g.block(n),
+        Empty | FuncDecl => {}
+        If => {
+            let els = g.label();
+            g.cond(n.a, false, els);
+            g.stmt(n.b);
+            if is_null(n.c) {
+                g.bind(els);
+            } else {
+                let end = g.label();
+                g.jump(end);
+                g.bind(els);
+                g.stmt(n.c);
+                g.bind(end);
+            }
+        }
+        While => {
+            let li = g.push_loop(true);
+            let l = g.loop_at(li);
+            let top = g.fs.code.here();
+            g.bind(l.cont);
+            g.cond(n.a, false, l.brk);
+            g.stmt(n.b);
+            g.jump(top);
+            g.bind(l.brk);
+            g.fs.loops.truncate(li);
+        }
+        DoWhile => {
+            let li = g.push_loop(true);
+            let l = g.loop_at(li);
+            let top = g.fs.code.here();
+            g.stmt(n.b);
+            g.bind(l.cont);
+            g.cond(n.a, true, top);
+            g.bind(l.brk);
+            g.fs.loops.truncate(li);
+        }
+        For => g.for_stmt(n),
+        ForIn | ForOf => g.for_each(n),
+        Break | Continue => {
+            let is_break = n.kind == K.Break;
+            var i = g.fs.loops.len;
+            var found = false;
+            while i > 0 {
+                i -= 1;
+                let l = g.fs.loops.at(i);
+                if n.text.len > 0 {
+                    if l.label.eq(n.text) and (is_break or l.is_loop) { found = true; break; }
+                } else if (is_break and l.plain) or (!is_break and l.is_loop) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found { fail(n.line, "break or continue outside of a loop"); }
+            let l = g.fs.loops.at(i);
+            g.exit_begin(l.ntries);
+            g.jump(if is_break { l.brk } else { l.cont });
+            g.exit_end(l.ntries);
+        }
+        Return => {
+            if g.fs.tries.len == 0 {
+                // Nothing to run on the way out: return straight from a
+                // local's register.
+                if is_null(n.a) { g.emit(JS.RETU()); return; }
+                if n.a.kind == K.Name and let Some(r) = g.var_reg(n.a.vr) { g.emit(JS.RET(r as u8)); return; }
+            }
+            let lvl = g.fs.regs.enter();
+            let r = g.fs.regs.nactive;
+            g.fs.regs.activate(1);
+            if is_null(n.a) { g.emit(JS.LOADU(r as u8)); } else { g.to(n.a, r); }
+            g.exit_begin(0);
+            g.emit(JS.RET(r as u8));
+            g.exit_end(0);
+            g.fs.regs.leave(lvl);
+        }
+        Throw => {
+            let r = g.any(n.a);
+            g.emit(JS.THROW(r as u8));
+        }
+        Try => g.try_stmt(n),
+        Switch => g.switch_stmt(n),
+        Labeled => {
+            let body = n.a;
+            match body.kind {
+                While | DoWhile | For | ForIn | ForOf => {
+                    g.fs.pending_label = n.text;
+                    g.stmt(body);
+                }
+                _ => {
+                    g.fs.pending_label = n.text;
+                    let li = g.push_loop(false);
+                    g.fs.loops.ptr_at(li).plain = false;
+                    g.stmt(body);
+                    g.bind(g.loop_at(li).brk);
+                    g.fs.loops.truncate(li);
+                }
+            }
+        }
+        ClassDecl => g.class(n),
+        _ => fail(n.line, "unexpected statement"),
+    }
+}
+
+fn Gen.for_stmt(g: *Gen, n: *Node) {
+    let lvl = g.fs.regs.enter();
+    g.enter_vars(&n.vars);
+    if !is_null(n.a) { g.stmt(n.a); }
+    let li = g.push_loop(true);
+    let l = g.loop_at(li);
+    let top = g.fs.code.here();
+    if !is_null(n.b) { g.cond(n.b, false, l.brk); }
+    g.stmt(n.d);
+    g.bind(l.cont);
+    // Per-iteration bindings: closures made in this iteration keep its box.
+    for i in 0..n.vars.len {
+        let v = n.vars.at(i);
+        if v.kind != VK.Global and boxed(v) { g.emit(JS.REBOX(v.reg as u8)); }
+    }
+    if !is_null(n.c) { g.fs.regs.end_stmt(); g.effect(n.c); }
+    g.jump(top);
+    g.bind(l.brk);
+    g.fs.loops.truncate(li);
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.for_each(g: *Gen, n: *Node) {
+    let lvl = g.fs.regs.enter();
+    // Hidden locals: the array (or key array) and the index.
+    let arr = g.fs.regs.nactive;
+    g.fs.regs.activate(2);
+    let idx = arr + 1;
+    g.to(n.b, arr);
+    if n.kind == K.ForIn { g.emit(JS.KEYS(arr as u8, arr as u8)); }
+    g.emit(JS.LOADI(idx as u8, 0));
+    let li = g.push_loop(true);
+    let l = g.loop_at(li);
+    let top = g.fs.code.here();
+    let inner = g.fs.regs.enter();
+    g.enter_vars(&n.vars);
+    let m = g.mark();
+    let len = g.temp();
+    g.emit(JS.GETLEN(len as u8, arr as u8));
+    g.emit(JS.JLT(0, idx as u8, len as u8));
+    g.jump(l.brk);
+    g.reset(m);
+    let v = if n.a.kind == K.VarDecl { n.a.list.at(0).vr } else { n.a.vr };
+    if let Some(r) = g.var_reg(v) {
+        g.emit(JS.GETINDEX(r as u8, arr as u8, idx as u8));
+    } else {
+        let t = g.temp();
+        g.emit(JS.GETINDEX(t as u8, arr as u8, idx as u8));
+        if g.is_local(v) and boxed(v) and n.a.kind == K.VarDecl and n.a.op != T.Var {
+            // A fresh binding per iteration.
+            g.mov(v.reg, t);
+            g.emit(JS.BOXNEW(v.reg as u8));
+        } else {
+            g.store_var(v, t);
+        }
+        g.reset(m);
+    }
+    g.stmt(n.d);
+    g.bind(l.cont);
+    g.fs.regs.leave(inner);
+    g.emit(JS.ADDI(idx as u8, idx as u8, 1));
+    g.jump(top);
+    g.bind(l.brk);
+    g.fs.loops.truncate(li);
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.switch_stmt(g: *Gen, n: *Node) {
+    let lvl = g.fs.regs.enter();
+    let d = g.fs.regs.nactive;
+    g.fs.regs.activate(1);
+    g.to(n.a, d);
+    g.enter_vars(&n.vars);
+    let li = g.push_loop(false);
+    g.fs.loops.ptr_at(li).plain = true;
+    let l = g.loop_at(li);
+    var labels: mem.Vec<bc.Label> = mem.Vec.new();
+    var default_label: ?bc.Label = None;
+    for i in 0..n.list.len {
+        let c = n.list.at(i);
+        let cl = g.label();
+        labels.push(cl);
+        if c.flag == 1 { default_label = Some(cl); continue; }
+        let m = g.mark();
+        let t = g.any(c.a);
+        g.emit(JS.JEQ(1, d as u8, t as u8));
+        g.jump(cl);
+        g.reset(m);
+    }
+    match default_label {
+        Some(dl) => g.jump(dl),
+        None => g.jump(l.brk),
+    }
+    for i in 0..n.list.len {
+        let c = n.list.at(i);
+        g.bind(labels.at(i));
+        g.hoist_functions(&c.list);
+        g.stmts(&c.list);
+    }
+    g.bind(l.brk);
+    labels.free();
+    g.fs.loops.truncate(li);
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.add_handlers(g: *Gen, t: *Try, target: u64, reg: u32) {
+    for i in 0..t.segs.len / 2 {
+        g.fs.handlers.push(t.segs.at(2 * i) as u32);
+        g.fs.handlers.push(t.segs.at(2 * i + 1) as u32);
+        g.fs.handlers.push(target as u32);
+        g.fs.handlers.push(reg);
+    }
+}
+
+fn Gen.close_seg(g: *Gen, t: *Try) {
+    let pc = g.pc();
+    if pc > t.seg_start { t.segs.push(t.seg_start); t.segs.push(pc); }
+    t.seg_start = pc;
+}
+
+/// try { a } catch (e) { b }
+fn Gen.try_catch(g: *Gen, n: *Node) {
+    let lvl = g.fs.regs.enter();
+    let er = g.fs.regs.nactive;
+    g.fs.regs.activate(1);
+    let t: *Try = mem.alloc(1);
+    t.fin = null_node();
+    t.seg_start = g.pc();
+    t.segs = mem.Vec.new();
+    g.fs.tries.push(t);
+    g.block(n.a);
+    g.fs.tries.truncate(g.fs.tries.len - 1);
+    g.close_seg(t);
+    let end = g.label();
+    g.jump(end);
+    let target = g.pc();
+    g.fs.code.mark_target();
+    let inner = g.fs.regs.enter();
+    if (n.vr as u64) != 0 {
+        let v = n.vr;
+        v.reg = er;
+        if boxed(v) { g.emit(JS.BOXNEW(er as u8)); }
+    }
+    g.block(n.b);
+    g.fs.regs.leave(inner);
+    g.bind(end);
+    g.add_handlers(t, target, er);
+    t.segs.free();
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.try_stmt(g: *Gen, n: *Node) {
+    if is_null(n.c) { g.try_catch(n); return; }
+    let lvl = g.fs.regs.enter();
+    let er = g.fs.regs.nactive;
+    g.fs.regs.activate(1);
+    let t: *Try = mem.alloc(1);
+    t.fin = n.c;
+    t.seg_start = g.pc();
+    t.segs = mem.Vec.new();
+    g.fs.tries.push(t);
+    if is_null(n.b) { g.block(n.a); } else { g.try_catch(n); }
+    g.fs.tries.truncate(g.fs.tries.len - 1);
+    g.close_seg(t);
+    g.block(n.c);
+    let end = g.label();
+    g.jump(end);
+    let target = g.pc();
+    g.fs.code.mark_target();
+    g.block(n.c);
+    g.emit(JS.THROW(er as u8));
+    g.bind(end);
+    g.add_handlers(t, target, er);
+    t.segs.free();
+    g.fs.regs.leave(lvl);
+}
+
+fn Gen.class(g: *Gen, n: *Node) {
+    let c = n.cls;
+    let v = n.vr;
+    let m = g.mark();
+    let r = g.temp();
+    let pr = g.temp();
+    g.closure(c.ctor, r);
+    var has: u8 = 0;
+    if !is_null(c.parent) {
+        g.to(c.parent, pr);
+        has = 1;
+    }
+    g.emit(JS.CLASS(r as u8, pr as u8, has));
+    for i in 0..c.members.len {
+        let mem_ = c.members.at(i);
+        let mm = g.mark();
+        let fr = g.temp();
+        g.closure(mem_.fun, fr);
+        if !is_null(mem_.key) {
+            let kr = g.any(mem_.key);
+            if mem_.is_static { g.emit(JS.SMETHODC(r as u8, kr as u8, fr as u8)); } else { g.emit(JS.METHODC(r as u8, kr as u8, fr as u8)); }
+        } else {
+            let k = g.key_index(mem_.name);
+            if k > 255 { fail(c.line, "too many property names"); }
+            if mem_.is_static { g.emit(JS.SMETHOD(r as u8, k as u8, fr as u8)); }
+            else { g.emit(JS.METHOD(r as u8, k as u8, fr as u8)); }
+        }
+        g.reset(mm);
+    }
+    g.store_var(v, r);
+    g.reset(m);
+}
+
+// ── driver ──────────────────────────────────────────────────────────
+
+/// Compile a program (or the prelude) into its top-level prototype.
+/// Allocates in the heap but never collects.
+pub fn compile(ctx: *Ctx, src: str) -> Gc<Proto> {
+    var arena = mem.Arena.new();
+    var toks: mem.Vec<ast.Token> = mem.Vec.new();
+    ast.tokenize(src, &arena, &toks);
+    var p = Parser.new(toks);
+    let top = new_func("main", 1, 0, null_func());
+    top.top = true;
+    p.program(top);
+    var r = Res { ctx: ctx, scope: 0 as *Scope, fun: top, globals: map.HashMap.new() };
+    r.push(&top.vars);
+    for i in 0..top.body.len { r.hoist(top.body.at(i)); }
+    r.declare_block(&top.body);
+    r.stmts(&top.body);
+    r.pop();
+    var g = Gen { ctx: ctx, heap: &ctx.heap, fs: 0 as *FS };
+    g.top(top)
+}

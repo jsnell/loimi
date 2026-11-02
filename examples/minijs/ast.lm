@@ -1,0 +1,276 @@
+// MiniJS syntax trees, and the lexer that produces their tokens.
+//
+// The lexer is built on std.lex: a Cursor configured for C-like comments,
+// its numeral and quoted-string scanners, an OpTable for punctuation
+// (maximal munch) and a Keywords table. The whole source is tokenized up
+// front, so the parser can look ahead freely (arrow functions need to see
+// past a parenthesized parameter list).
+
+import std.mem;
+import std.text;
+import std.lex;
+import std.num;
+import std.io;
+import std.os;
+
+pub enum T {
+    Eof, Name, Num, Str,
+    // reserved words
+    Break, Case, Catch, Class, Const, Continue, Default, Delete, Do, Else, Extends, False, Finally,
+    For, Function, If, In, Instanceof, Let, New, Null, Return, Super, Switch, This, Throw, True, Try,
+    Typeof, Undefined, Var, Void, While,
+    // punctuation
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Semi, Comma, Dot, Colon, Question, Arrow,
+    Plus, Minus, Star, Slash, Percent, StarStar, PlusPlus, MinusMinus,
+    Lt, Gt, Le, Ge, EqEqEq, NotEqEq, EqEq, NotEq,
+    Amp, Pipe, Caret, Tilde, Bang, AmpAmp, PipePipe, QQ, Shl, Shr, UShr,
+    Assign, PlusAssign, MinusAssign, StarAssign, SlashAssign, PercentAssign, StarStarAssign,
+    AmpAssign, PipeAssign, CaretAssign, ShlAssign, ShrAssign, UShrAssign,
+    AmpAmpAssign, PipePipeAssign, QQAssign,
+}
+
+/// A token. `text` is the identifier (also for reserved words) or the
+/// decoded string literal; `num` the numeral's value.
+pub struct Token { kind: T, line: u32, num: f64, text: str }
+
+pub fn fail(line: u32, msg: str) -> never {
+    var b = text.StrBuf.new();
+    b.push_str("SyntaxError: line ");
+    b.push_int(line as i64);
+    b.push_str(": ");
+    b.push_str(msg);
+    io.eprintln(b.as_str());
+    os.quit(1)
+}
+
+fn is_id_start(c: u8) -> bool { lex.is_ident_start(c) or c == '$' }
+fn is_id_char(c: u8) -> bool { lex.is_ident_char(c) or c == '$' }
+
+fn ops() -> lex.OpTable<T> {
+    var t: lex.OpTable<T> = lex.OpTable.new();
+    t.add("(", T.LParen); t.add(")", T.RParen); t.add("{", T.LBrace); t.add("}", T.RBrace);
+    t.add("[", T.LBracket); t.add("]", T.RBracket); t.add(";", T.Semi); t.add(",", T.Comma);
+    t.add(".", T.Dot); t.add(":", T.Colon); t.add("?", T.Question); t.add("=>", T.Arrow);
+    t.add("+", T.Plus); t.add("-", T.Minus); t.add("*", T.Star); t.add("/", T.Slash);
+    t.add("%", T.Percent); t.add("**", T.StarStar); t.add("++", T.PlusPlus); t.add("--", T.MinusMinus);
+    t.add("<", T.Lt); t.add(">", T.Gt); t.add("<=", T.Le); t.add(">=", T.Ge);
+    t.add("===", T.EqEqEq); t.add("!==", T.NotEqEq); t.add("==", T.EqEq); t.add("!=", T.NotEq);
+    t.add("&", T.Amp); t.add("|", T.Pipe); t.add("^", T.Caret); t.add("~", T.Tilde); t.add("!", T.Bang);
+    t.add("&&", T.AmpAmp); t.add("||", T.PipePipe); t.add("??", T.QQ);
+    t.add("<<", T.Shl); t.add(">>", T.Shr); t.add(">>>", T.UShr);
+    t.add("=", T.Assign); t.add("+=", T.PlusAssign); t.add("-=", T.MinusAssign); t.add("*=", T.StarAssign);
+    t.add("/=", T.SlashAssign); t.add("%=", T.PercentAssign); t.add("**=", T.StarStarAssign);
+    t.add("&=", T.AmpAssign); t.add("|=", T.PipeAssign); t.add("^=", T.CaretAssign);
+    t.add("<<=", T.ShlAssign); t.add(">>=", T.ShrAssign); t.add(">>>=", T.UShrAssign);
+    t.add("&&=", T.AmpAmpAssign); t.add("||=", T.PipePipeAssign); t.add("??=", T.QQAssign);
+    t
+}
+
+fn keywords() -> lex.Keywords<T> {
+    var k: lex.Keywords<T> = lex.Keywords.new();
+    k.add("break", T.Break); k.add("case", T.Case); k.add("catch", T.Catch); k.add("class", T.Class);
+    k.add("const", T.Const); k.add("continue", T.Continue); k.add("default", T.Default);
+    k.add("delete", T.Delete); k.add("do", T.Do); k.add("else", T.Else); k.add("extends", T.Extends);
+    k.add("false", T.False); k.add("finally", T.Finally); k.add("for", T.For); k.add("function", T.Function);
+    k.add("if", T.If); k.add("in", T.In); k.add("instanceof", T.Instanceof); k.add("let", T.Let);
+    k.add("new", T.New); k.add("null", T.Null); k.add("return", T.Return); k.add("super", T.Super);
+    k.add("switch", T.Switch); k.add("this", T.This); k.add("throw", T.Throw); k.add("true", T.True);
+    k.add("try", T.Try); k.add("typeof", T.Typeof); k.add("undefined", T.Undefined); k.add("var", T.Var);
+    k.add("void", T.Void); k.add("while", T.While);
+    k
+}
+
+/// Tokenize `src`. Strings and names point into `src` or into `arena`.
+pub fn tokenize(src: str, arena: *mem.Arena, out: *mem.Vec<Token>) {
+    var sy = lex.c_like();
+    sy.int_overflow_to_float = true;
+    var cur = lex.Cursor.new(src, 0, sy);
+    var optab = ops();
+    var kw = keywords();
+    var buf = text.StrBuf.new();
+    loop {
+        if let Err(e) = cur.skip_trivia() { fail(cur.line, e.msg); }
+        let line = cur.line;
+        if cur.at_end() {
+            out.push(Token { kind: T.Eof, line: line, num: 0.0, text: "" });
+            break;
+        }
+        let ch = cur.peek();
+        if is_id_start(ch) {
+            let start = cur.pos;
+            cur.bump();
+            cur.eat_while(is_id_char);
+            let name = cur.since(start);
+            let k = kw.get(name) ?? T.Name;
+            out.push(Token { kind: k, line: line, num: 0.0, text: name });
+            continue;
+        }
+        if cur.at_number() {
+            let x = match cur.number() {
+                Ok(Int(i)) => i as f64,
+                Ok(Float(f)) => f,
+                Err(e) => fail(line, e.msg),
+            };
+            out.push(Token { kind: T.Num, line: line, num: x, text: "" });
+            continue;
+        }
+        if ch == '"' or ch == '\'' {
+            buf.clear();
+            if let Err(e) = cur.quoted(&buf) { fail(line, e.msg); }
+            out.push(Token { kind: T.Str, line: line, num: 0.0, text: arena.str(buf.as_str()) });
+            continue;
+        }
+        if let Some(k) = cur.op(&optab) {
+            out.push(Token { kind: k, line: line, num: 0.0, text: "" });
+            continue;
+        }
+        if ch == '`' { fail(line, "template literals are not supported"); }
+        fail(line, "unexpected character");
+    }
+    buf.free();
+    optab.free();
+    kw.free();
+}
+
+// ── syntax trees ────────────────────────────────────────────────────
+
+pub enum K {
+    // expressions
+    Num, Str, Name, This, Undef, Null, True, False,
+    Array, Object, Prop, Func,
+    Unary, Update, Bin, Logical, Cond, Assign, Member, Index, Call, New, Seq,
+    SuperCall, SuperMember,
+    // statements
+    VarDecl, Decl, ExprStmt, Block, Empty, If, While, DoWhile, For, ForIn, ForOf,
+    Break, Continue, Return, Throw, Try, Switch, Case, Labeled, FuncDecl, ClassDecl,
+}
+
+/// The kinds of variables.
+pub enum VK { Let, Const, Var, Param, FnDecl, ClassDecl, This, Catch, Global }
+
+/// A variable. Locals live in a register (`reg`), in a box in that register
+/// (`boxed`: captured and assigned after a closure may have copied it), or
+/// in a closure's free slots. Top-level declarations are globals.
+pub struct Var {
+    name: str,
+    kind: VK,
+    owner: *Func,
+    captured: bool,
+    assigned: bool,
+    boxed: bool,
+    /// Token index where the variable gets its value, and the smallest
+    /// token index of a closure that captures it.
+    decl_pos: u32,
+    cap_pos: u32,
+    /// Global slot (kind Global), or register.
+    slot: u32,
+    reg: u32,
+    /// Declared nowhere: reading it throws a ReferenceError.
+    undeclared: bool,
+}
+
+/// One node. Which fields matter depends on `kind`:
+///   Num num | Str text | Name text vr | Array list | Object list(Prop)
+///   Prop text|a(computed key) b(value) flag(1: computed, 2: method)
+///   Func fun | Unary op a | Update op a flag(1: prefix) | Bin op a b
+///   Logical op a b | Cond a b c | Assign op a b | Member a text | Index a b
+///   Call a list | New a list | Seq list | SuperCall list | SuperMember text
+///   VarDecl op(Let/Const/Var) list(Decl) | Decl text vr a(init)
+///   ExprStmt a | Block list | If a b c | While a b | DoWhile a b
+///   For a(init) b(test) c(update) d(body) | ForIn/ForOf a(decl or target) b(obj) d(body)
+///   Break/Continue text(label) | Return a | Throw a
+///   Try a(block) text(catch name) vr b(catch block) c(finally block)
+///   Switch a list(Case) | Case a(test or null) list | Labeled text a
+///   FuncDecl text vr fun | ClassDecl text vr cls
+pub struct Node {
+    kind: K,
+    line: u32,
+    pos: u32,
+    op: T,
+    num: f64,
+    text: str,
+    flag: u32,
+    a: *Node,
+    b: *Node,
+    c: *Node,
+    d: *Node,
+    list: mem.Vec<*Node>,
+    fun: *Func,
+    cls: *Class,
+    vr: *Var,
+    /// Block scopes: the variables declared directly in it.
+    vars: mem.Vec<*Var>,
+}
+
+pub struct Func {
+    name: str,
+    line: u32,
+    pos: u32,
+    params: mem.Vec<*Var>,
+    body: mem.Vec<*Node>,
+    /// Arrow functions with an expression body.
+    expr: *Node,
+    arrow: bool,
+    method: bool,
+    ctor: bool,
+    derived: bool,
+    parent: *Func,
+    /// `this` (non-arrow functions).
+    this_var: *Var,
+    /// Variables of the function scope: `var`s and the body's top-level declarations.
+    vars: mem.Vec<*Var>,
+    /// Captured variables of enclosing functions, in free-slot order.
+    free: mem.Vec<*Var>,
+    /// The top level of the program.
+    top: bool,
+    /// A function declaration (hoisted: created at block entry).
+    decl: bool,
+    /// The name of a named function expression, bound inside it.
+    self_var: *Var,
+}
+
+pub struct Member { name: str, key: *Node, fun: *Func, is_static: bool }
+
+pub struct Class { name: str, parent: *Node, ctor: *Func, members: mem.Vec<Member>, line: u32 }
+
+pub fn null_node() -> *Node { 0 as *Node }
+pub fn is_null(n: *Node) -> bool { (n as u64) == 0 }
+pub fn null_var() -> *Var { 0 as *Var }
+pub fn null_func() -> *Func { 0 as *Func }
+
+pub fn new_node(kind: K, line: u32, pos: u32) -> *Node {
+    let n: *Node = mem.alloc(1);
+    n.kind = kind;
+    n.line = line;
+    n.pos = pos;
+    n.op = T.Eof;
+    n.text = "";
+    n.list = mem.Vec.new();
+    n.vars = mem.Vec.new();
+    n
+}
+
+pub fn new_func(name: str, line: u32, pos: u32, parent: *Func) -> *Func {
+    let f: *Func = mem.alloc(1);
+    f.name = name;
+    f.line = line;
+    f.pos = pos;
+    f.params = mem.Vec.new();
+    f.body = mem.Vec.new();
+    f.expr = null_node();
+    f.parent = parent;
+    f.this_var = null_var();
+    f.self_var = null_var();
+    f.vars = mem.Vec.new();
+    f.free = mem.Vec.new();
+    f
+}
+
+pub fn new_var(name: str, kind: VK, owner: *Func) -> *Var {
+    let v: *Var = mem.alloc(1);
+    v.name = name;
+    v.kind = kind;
+    v.owner = owner;
+    v.cap_pos = 0xFFFFFFFF;
+    v
+}

@@ -1,0 +1,23 @@
+// Number formatting and the integer fast path, strings.
+console.log(1 / 3, 2 / 3, 100 / 3, 1e21, 1e-7, 123e-20, 2 ** 53, 2 ** 53 + 2);
+console.log(0.1 * 3, 1.5e300 * 1.5e300, -1e-7, 5e-324, (0.000001234).toString());
+console.log(2147483647 + 1, -2147483648 - 1, 65536 * 65536, -7 % 3, 7 % -3, -0 === 0);
+console.log(5 / 2 | 0, -5 / 2 | 0, 3.7 >>> 0, -1 >>> 0, 1 << 31, 1 << 32, ~5, ~-1);
+console.log((255).toString(16), (255).toString(2), (-255).toString(36), (3.14159).toFixed(2));
+console.log(Number("  42  "), Number("0x1F"), Number(""), Number("1e3"), Number("abc"), Number("-Infinity"));
+console.log(parseInt("42px"), parseInt("0x10"), parseInt("101", 2), parseFloat("3.5abc"), parseFloat(".5"));
+let x = 0;
+for (let i = 0; i < 100; i++) x += 0.1;
+console.log(x, Math.floor(x), Math.round(2.5), Math.round(-2.5), Math.max(), Math.min(1, NaN));
+const s = "Hello, World";
+console.log(s.length, s[0], s.charAt(4), s.charCodeAt(1), s.indexOf("o"), s.lastIndexOf("o"));
+console.log(s.slice(-5), s.substring(7, 3), s.toUpperCase(), s.toLowerCase(), "  pad ".trim() + "|");
+console.log("a,b,,c".split(",").length, "abc".split("").join("-"), "ab".repeat(3), s.startsWith("Hell"), s.endsWith("ld"));
+console.log("abc" < "abd", "Z" < "a", "abc" < "ab", String.fromCharCode(72, 105), "x" + null + undefined + true);
+let built = "";
+for (let i = 0; i < 10; i++) built += i;
+console.log(built, built.length, typeof built, typeof 1, typeof null, typeof undefined, typeof {}, typeof (() => 1));
+console.log([1, [2, 3], null, undefined, "s"].join(";"), String([1, 2]), String({}));
+let m = 1;
+for (let i = 0; i < 40; i++) m = m * 3 + 1;
+console.log(m, m % 1000, (m | 0), Math.trunc(-4.7), Math.sign(-3), Math.abs(-2147483648));

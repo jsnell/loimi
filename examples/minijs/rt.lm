@@ -1,0 +1,722 @@
+// The interpreter context and the runtime operations shared by the VM
+// and the builtins: property keys, generic property access for every
+// kind of value, ToString, arrays, errors, and the GC root scanner.
+//
+// Nothing here collects. Allocation never collects (std.gc); the VM
+// collects only at its safepoints.
+
+import std.gc;
+import std.mem;
+import std.map;
+import std.hash;
+import std.text;
+import std.num;
+import std.obj;
+import std.io;
+import value;
+import value.{V, Str, Obj, Vals, Arr, Fn, Box, Proto, Protos, Descs, Lines, Handlers};
+
+/// One activation record. `resume` is where this frame continues after the
+/// call it is making returns; `k` caches cl.proto.consts.
+pub struct Frame { cl: Gc<Fn>, base: *V, resume: *u32, k: *V, flags: u32 }
+
+/// The frame was entered by `new`: a non-object result is replaced by `this`.
+pub const FR_NEW: u32 = 1;
+
+/// A builtin function: `f(ctx, this, args, nargs)`. Natives may allocate
+/// but never collect, and never call back into the VM.
+pub struct Native { f: fn(*Ctx, V, *V, u64) -> Result<V, V>, name: str }
+
+/// A cached property add (SETPROP_ADD): the shape after the add, and the
+/// inline slot that receives the value.
+pub struct TEnt { shape: ?Gc<obj.Shape>, idx: u32 }
+
+/// A polymorphic site: up to eight receiver shapes, each with an own
+/// SlotRef (kind 0) or a prototype entry index into `pent` (kind 1).
+pub struct PolyEnt { n: u32, resets: u32, sids: [u32; 8], kinds: [u32; 8], slots: [u32; 8] }
+
+pub struct Ctx {
+    heap: gc.Heap,
+    m: obj.Model<Gc<Obj>, Gc<Vals>, V>,
+    stack: *V,
+    stack_end: *V,
+    frames: *Frame,
+    frames_end: *Frame,
+    /// The innermost frame (published by the vm's `sync` block).
+    fp: *Frame,
+    /// Global variables, by slot; their key ids, and key id -> slot.
+    gvals: mem.Vec<V>,
+    gnames: mem.Vec<u64>,
+    gmap: map.HashMap<u64, u32>,
+    /// Property keys: key id k is interner id k - 1.
+    keys: text.Interner,
+    /// Per key: its string (made on demand) and its array-index value (-1: none).
+    kstrs: mem.Vec<?Gc<Str>>,
+    kidx: mem.Vec<i64>,
+    /// Key ids of the integers 0..intkeys.len (0: not made yet).
+    intkeys: mem.Vec<u64>,
+    out: text.StrBuf,
+    tmp: text.StrBuf,
+    /// An uncaught exception ends the program; this is its value.
+    error: V,
+    failed: bool,
+    objproto: ?Gc<Obj>,
+    arrproto: ?Gc<Obj>,
+    strproto: ?Gc<Obj>,
+    numproto: ?Gc<Obj>,
+    boolproto: ?Gc<Obj>,
+    fnproto: ?Gc<Obj>,
+    errproto: ?Gc<Obj>,
+    typeerrproto: ?Gc<Obj>,
+    /// One-character strings for the bytes 0..127.
+    chars: mem.Vec<?Gc<Str>>,
+    empty: ?Gc<Str>,
+    /// Inline-cache side tables: prototype hits and property adds.
+    pent: mem.Vec<obj.ProtoEntry<Gc<Obj>>>,
+    tent: mem.Vec<TEnt>,
+    poly: mem.Vec<PolyEnt>,
+    mega: obj.MegaCache,
+    /// Megamorphic prototype hits: a direct-mapped table of entries and their keys.
+    pmega: mem.Vec<obj.ProtoEntry<Gc<Obj>>>,
+    pkeys: mem.Vec<u64>,
+    /// Root shapes of object literals (prototype Object.prototype) by inline count.
+    lit_shapes: mem.Vec<?Gc<obj.Shape>>,
+    natives: mem.Vec<Native>,
+    native_proto: ?Gc<Proto>,
+    k_length: u64,
+    k_prototype: u64,
+    k_constructor: u64,
+    k_message: u64,
+    k_name: u64,
+}
+
+pub const STACK_SLOTS: u64 = 1 << 22;
+pub const FRAME_SLOTS: u64 = 1 << 16;
+const INT_KEYS: u64 = 1024;
+const PMEGA: u64 = 1024;
+
+pub fn pmega_index(sid: u32, key: u64) -> u64 { std_hash_mix(key ^ ((sid as u64) << 32)) & (PMEGA - 1) }
+fn std_hash_mix(x: u64) -> u64 { hash.mix(x) }
+
+pub fn Ctx.new() -> Ctx {
+    var c = Ctx {
+        heap: gc.Heap.new(),
+        m: obj.Model.new(new_vals, V.Undef),
+        stack: mem.alloc(STACK_SLOTS),
+        stack_end: 0 as *V,
+        frames: mem.alloc(FRAME_SLOTS),
+        frames_end: 0 as *Frame,
+        fp: 0 as *Frame,
+        gvals: mem.Vec.new(),
+        gnames: mem.Vec.new(),
+        gmap: map.HashMap.new(),
+        keys: text.Interner.new(),
+        kstrs: mem.Vec.new(),
+        kidx: mem.Vec.new(),
+        intkeys: mem.Vec.new(),
+        out: text.StrBuf.new(),
+        tmp: text.StrBuf.new(),
+        error: V.Undef,
+        failed: false,
+        objproto: None, arrproto: None, strproto: None, numproto: None,
+        boolproto: None, fnproto: None, errproto: None, typeerrproto: None,
+        chars: mem.Vec.new(),
+        empty: None,
+        pent: mem.Vec.new(),
+        tent: mem.Vec.new(),
+        poly: mem.Vec.new(),
+        mega: obj.MegaCache.new(4096),
+        pmega: mem.Vec.new(),
+        pkeys: mem.Vec.new(),
+        lit_shapes: mem.Vec.new(),
+        natives: mem.Vec.new(),
+        native_proto: None,
+        k_length: 0, k_prototype: 0, k_constructor: 0, k_message: 0, k_name: 0,
+    };
+    c.stack_end = c.stack + STACK_SLOTS;
+    c.frames_end = c.frames + FRAME_SLOTS;
+    c.fp = c.frames;
+    c
+}
+
+/// Finish setting up once `c` has its final address.
+pub fn Ctx.init(c: *Ctx) {
+    c.m.attach(&c.heap);
+    c.heap.min_heap = 64 << 20;
+    c.heap.threshold = c.heap.min_heap;
+    value.HEAP = Some(&c.heap);
+    c.heap.add_scanner(c as *u8, scan_roots);
+    for _ in 0..INT_KEYS { c.intkeys.push(0); }
+    for _ in 0..PMEGA { c.pmega.push(obj.ProtoEntry.empty()); c.pkeys.push(0); }
+    c.k_length = c.key("length");
+    c.k_prototype = c.key("prototype");
+    c.k_constructor = c.key("constructor");
+    c.k_message = c.key("message");
+    c.k_name = c.key("name");
+    c.empty = Some(value.new_str(&c.heap, ""));
+    for i in 0..128 {
+        let s = value.alloc_str(&c.heap, 1);
+        s.data[0] = i as u8;
+        c.chars.push(Some(s));
+    }
+    let op = c.new_object_with(None, 8);
+    op.flags = value.OF_PROTO | value.OF_NONENUM;
+    c.objproto = Some(op);
+    c.arrproto = Some(c.builtin_proto(op));
+    c.strproto = Some(c.builtin_proto(op));
+    c.numproto = Some(c.builtin_proto(op));
+    c.boolproto = Some(c.builtin_proto(op));
+    c.fnproto = Some(c.builtin_proto(op));
+    let ep = c.builtin_proto(op);
+    c.errproto = Some(ep);
+    c.typeerrproto = Some(c.builtin_proto(ep));
+}
+
+fn Ctx.builtin_proto(c: *Ctx, parent: Gc<Obj>) -> Gc<Obj> {
+    let p = c.new_object_with(Some(parent), 8);
+    p.flags = value.OF_PROTO | value.OF_NONENUM;
+    p
+}
+
+pub fn new_vals(h: *gc.Heap, n: u64) -> Gc<Vals> { new(h, Vals {}, n) }
+
+/// GC roots: globals, keys, builtin objects, cache side tables, the pending
+/// error, and every active frame's closure and registers.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    for i in 0..c.gvals.len { gc_mark(h, c.gvals.at(i)); }
+    for i in 0..c.kstrs.len { if let Some(s) = c.kstrs.at(i) { gc_mark(h, s); } }
+    for i in 0..c.chars.len { if let Some(s) = c.chars.at(i) { gc_mark(h, s); } }
+    if let Some(s) = c.empty { gc_mark(h, s); }
+    gc_mark(h, c.error);
+    if let Some(p) = c.objproto { gc_mark(h, p); }
+    if let Some(p) = c.arrproto { gc_mark(h, p); }
+    if let Some(p) = c.strproto { gc_mark(h, p); }
+    if let Some(p) = c.numproto { gc_mark(h, p); }
+    if let Some(p) = c.boolproto { gc_mark(h, p); }
+    if let Some(p) = c.fnproto { gc_mark(h, p); }
+    if let Some(p) = c.errproto { gc_mark(h, p); }
+    if let Some(p) = c.typeerrproto { gc_mark(h, p); }
+    if let Some(p) = c.native_proto { gc_mark(h, p); }
+    for i in 0..c.pent.len { c.pent.ptr_at(i).mark(h); }
+    for i in 0..c.pmega.len { c.pmega.ptr_at(i).mark(h); }
+    for i in 0..c.tent.len { if let Some(s) = c.tent.at(i).shape { gc_mark(h, s); } }
+    for i in 0..c.lit_shapes.len { if let Some(s) = c.lit_shapes.at(i) { gc_mark(h, s); } }
+    var f = c.frames;
+    while f <= c.fp {
+        gc_mark(h, f.cl);
+        let n = f.cl.proto.nregs as u64;
+        for i in 0..n { gc_mark(h, f.base[i]); }
+        f = f + 1;
+    }
+}
+
+pub fn Ctx.flush(c: *Ctx) {
+    io.print(c.out.as_str());
+    c.out.clear();
+}
+
+inline for (field, name) in [(objproto, "obj_proto"), (arrproto, "arr_proto"), (strproto, "str_proto"), (numproto, "num_proto"),
+                             (boolproto, "bool_proto"), (fnproto, "fn_proto"), (errproto, "err_proto"), (typeerrproto, "typeerr_proto")] {
+    pub fn Ctx.#name(c: *Ctx) -> Gc<Obj> {
+        let Some(p) = c.field else { unreachable };
+        p
+    }
+}
+
+pub fn Ctx.empty_str(c: *Ctx) -> Gc<Str> {
+    let Some(s) = c.empty else { unreachable };
+    s
+}
+
+// ── keys ────────────────────────────────────────────────────────────
+
+/// The canonical array index that `s` spells, or -1.
+fn index_of_str(s: str) -> i64 {
+    if s.len == 0 or s.len > 10 { return -1; }
+    if s[0] == '0' { return if s.len == 1 { 0 } else { -1 }; }
+    var v: i64 = 0;
+    for i in 0..s.len {
+        if s[i] < '0' or s[i] > '9' { return -1; }
+        v = v * 10 + (s[i] - '0') as i64;
+    }
+    if v >= 4294967295 { -1 } else { v }
+}
+
+/// The key id of string `s`.
+pub fn Ctx.key(c: *Ctx, s: str) -> u64 {
+    let id = c.keys.intern(s) as u64 + 1;
+    while c.kidx.len < id {
+        let n = c.keys.name(c.kidx.len as u32);
+        c.kidx.push(index_of_str(n));
+        c.kstrs.push(None);
+    }
+    id
+}
+
+pub fn Ctx.key_name(c: *Ctx, k: u64) -> str { c.keys.name((k - 1) as u32) }
+
+/// The key as a string value.
+pub fn Ctx.key_str(c: *Ctx, k: u64) -> Gc<Str> {
+    if let Some(s) = c.kstrs.at(k - 1) { return s; }
+    let s = value.new_str(&c.heap, c.key_name(k));
+    s.key = k as u32;
+    c.kstrs.set(k - 1, Some(s));
+    s
+}
+
+/// The array index a key spells, or -1.
+pub fn Ctx.key_index(c: *Ctx, k: u64) -> i64 { c.kidx.at(k - 1) }
+
+pub fn Ctx.str_key(c: *Ctx, s: Gc<Str>) -> u64 {
+    if s.key != 0 { return s.key as u64; }
+    let k = c.key(s.data);
+    s.key = k as u32;
+    k
+}
+
+pub fn Ctx.int_key(c: *Ctx, i: i64) -> u64 {
+    if i >= 0 and (i as u64) < c.intkeys.len {
+        let k = c.intkeys.at(i as u64);
+        if k != 0 { return k; }
+    }
+    c.tmp.clear();
+    c.tmp.push_int(i);
+    let k = c.key(c.tmp.as_str());
+    if i >= 0 and (i as u64) < c.intkeys.len { c.intkeys.set(i as u64, k); }
+    k
+}
+
+/// ToPropertyKey.
+pub fn Ctx.key_of(c: *Ctx, v: V) -> u64 {
+    match v {
+        S(s) => c.str_key(s),
+        R(r) => c.str_key(value.flatten(r)),
+        Int(i) => c.int_key(i as i64),
+        _ => {
+            c.tmp.clear();
+            c.write(&c.tmp, v);
+            c.key(c.tmp.as_str())
+        }
+    }
+}
+
+// ── strings ─────────────────────────────────────────────────────────
+
+pub fn Ctx.str(c: *Ctx, s: str) -> Gc<Str> { value.new_str(&c.heap, s) }
+
+pub fn Ctx.char_str(c: *Ctx, b: u8) -> Gc<Str> {
+    if b < 128 { if let Some(s) = c.chars.at(b as u64) { return s; } }
+    let s = value.alloc_str(&c.heap, 1);
+    s.data[0] = b;
+    s
+}
+
+/// Append ToString(v).
+pub fn Ctx.write(c: *Ctx, b: *text.StrBuf, v: V) {
+    match v {
+        S(s) => b.push_str(s.data),
+        R(r) => b.push_str(value.flatten(r).data),
+        Int(i) => b.push_int(i as i64),
+        Num(x) => num.write_js(b, x),
+        Bool(x) => b.push_str(if x { "true" } else { "false" }),
+        Undef => b.push_str("undefined"),
+        Null => b.push_str("null"),
+        A(a) => {
+            for i in 0..a.len {
+                if i > 0 { b.push(','); }
+                let e = a.ptr[i];
+                if e != V.Undef and e != V.Null { c.write(b, e); }
+            }
+        }
+        O(o) => {
+            if c.is_error(o) {
+                let name = c.m.get_chain(o, c.k_name) ?? V.S(c.str("Error"));
+                let msg = c.m.get_chain(o, c.k_message) ?? V.S(c.empty_str());
+                c.write(b, name);
+                if let S(ms) = msg and ms.data.len == 0 { return; }
+                b.push_str(": ");
+                c.write(b, msg);
+                return;
+            }
+            b.push_str("[object Object]");
+        }
+        F(f) => {
+            b.push_str("function ");
+            b.push_str(f.proto.name.data);
+            b.push_str("() { [native code] }");
+        }
+        B(_) => b.push_str("[box]"),
+    }
+}
+
+/// ToString(v) as a string value.
+pub fn Ctx.to_str(c: *Ctx, v: V) -> Gc<Str> {
+    if let S(s) = v { return s; }
+    if let R(r) = v { return value.flatten(r); }
+    var b = text.StrBuf.new();
+    c.write(&b, v);
+    let s = c.str(b.as_str());
+    b.free();
+    s
+}
+
+/// a + b where at least one is a string (or neither is a number).
+pub fn Ctx.concat(c: *Ctx, a0: V, b0: V) -> V {
+    var a = a0;
+    var b = b0;
+    let sa = match a { S(_) | R(_) => true, _ => false };
+    let sb = match b { S(_) | R(_) => true, _ => false };
+    if !sa { a = V.S(c.to_str(a)); }
+    if !sb { b = V.S(c.to_str(b)); }
+    let la = value.str_len(a);
+    let lb = value.str_len(b);
+    if la == 0 { return b; }
+    if lb == 0 { return a; }
+    if la + lb >= value.ROPE_MIN {
+        return V.R(new(&c.heap, value.Rope { len: la + lb, flat: None, left: a, right: b }));
+    }
+    a = value.flat(a);
+    b = value.flat(b);
+    if let (S(x), S(y)) = (a, b) {
+        if x.data.len == 0 { return b; }
+        if y.data.len == 0 { return a; }
+        let s = value.alloc_str(&c.heap, x.data.len + y.data.len);
+        mem.memcpy(s.data.ptr, x.data.ptr, x.data.len);
+        mem.memcpy(s.data.ptr + x.data.len, y.data.ptr, y.data.len);
+        return V.S(s);
+    }
+    var buf = text.StrBuf.new();
+    c.write(&buf, a);
+    c.write(&buf, b);
+    let s = c.str(buf.as_str());
+    buf.free();
+    V.S(s)
+}
+
+// ── objects ─────────────────────────────────────────────────────────
+
+pub fn Ctx.new_object_with(c: *Ctx, proto: ?Gc<Obj>, n: u32) -> Gc<Obj> {
+    let sh = c.m.root_for(proto, n);
+    new(&c.heap, Obj { shape: sh, dict: None, overflow: None, proto: proto, flags: 0 }, n as u64)
+}
+
+/// An object literal's object: prototype Object.prototype, `n` inline slots.
+pub fn Ctx.new_literal(c: *Ctx, n: u32) -> Gc<Obj> {
+    let i = n as u64;
+    while c.lit_shapes.len <= i { c.lit_shapes.push(None); }
+    let sh = match c.lit_shapes.at(i) {
+        Some(s) => s,
+        None => {
+            let s = c.m.root_for(c.objproto, n);
+            c.lit_shapes.set(i, Some(s));
+            s
+        }
+    };
+    new(&c.heap, Obj { shape: sh, dict: None, overflow: None, proto: c.objproto, flags: 0 }, i)
+}
+
+/// Mark `p` as a prototype (see value.OF_PROTO).
+pub fn mark_proto(p: Gc<Obj>) { p.flags = p.flags | value.OF_PROTO; }
+
+pub fn Ctx.is_error(c: *Ctx, o: Gc<Obj>) -> bool {
+    let ep = c.err_proto() as u64;
+    var cur = o.proto;
+    while let Some(p) = cur {
+        if (p as u64) == ep { return true; }
+        cur = p.proto;
+    }
+    false
+}
+
+pub fn Ctx.new_error(c: *Ctx, proto: Gc<Obj>, msg: str) -> V {
+    let o = c.new_object_with(Some(proto), 2);
+    c.m.set(o, c.k_message, V.S(c.str(msg)));
+    V.O(o)
+}
+
+pub fn Ctx.type_error(c: *Ctx, msg: str) -> V { c.new_error(c.typeerr_proto(), msg) }
+
+/// "<what> <key>" as a TypeError, e.g. "Cannot read properties of undefined (reading 'x')".
+pub fn Ctx.type_error_key(c: *Ctx, msg: str, k: u64) -> V {
+    var b = text.StrBuf.new();
+    b.push_str(msg);
+    b.push_str(" '");
+    b.push_str(c.key_name(k));
+    b.push_str("'");
+    let e = c.type_error(b.as_str());
+    b.free();
+    e
+}
+
+// ── functions ───────────────────────────────────────────────────────
+
+/// The own-property bag of a function, created on first use with its
+/// `prototype` in slot 0: a fresh object for constructors, undefined for
+/// arrows, methods and natives.
+pub fn Ctx.fn_props(c: *Ctx, f: Gc<Fn>) -> Gc<Obj> {
+    if let Some(p) = f.props { return p; }
+    let bag = c.new_object_with(None, 4);
+    bag.flags = value.OF_NONENUM;
+    var pv = V.Undef;
+    if f.native == 0 and f.proto.flags & (value.PF_ARROW | value.PF_METHOD) == 0 {
+        let po = c.new_object_with(c.objproto, 4);
+        po.flags = value.OF_CTOR;
+        c.m.set(po, c.k_constructor, V.F(f));
+        pv = V.O(po);
+    }
+    c.m.set(bag, c.k_prototype, pv);
+    f.props = Some(bag);
+    bag
+}
+
+// ── arrays ──────────────────────────────────────────────────────────
+
+pub fn Ctx.new_array(c: *Ctx, n: u64, cap: u64) -> Gc<Arr> {
+    let k = if cap < n { n } else { cap };
+    let store = new_vals(&c.heap, if k < 4 { 4 } else { k });
+    for i in 0..store.data.len { store.data[i] = V.Undef; }
+    new(&c.heap, Arr { len: n, ptr: store.data.ptr, store: Some(store) })
+}
+
+pub fn arr_cap(a: Gc<Arr>) -> u64 {
+    match a.store {
+        Some(s) => s.data.len,
+        None => 0,
+    }
+}
+
+/// Make room for `n` elements.
+pub fn Ctx.arr_reserve(c: *Ctx, a: Gc<Arr>, n: u64) {
+    let cap = arr_cap(a);
+    if n <= cap { return; }
+    var nc = cap * 2;
+    if nc < n { nc = n; }
+    if nc < 4 { nc = 4; }
+    let s = new_vals(&c.heap, nc);
+    for i in 0..a.len { s.data[i] = a.ptr[i]; }
+    for i in a.len..nc { s.data[i] = V.Undef; }
+    a.store = Some(s);
+    a.ptr = s.data.ptr;
+}
+
+pub fn Ctx.arr_push(c: *Ctx, a: Gc<Arr>, v: V) {
+    if a.len == arr_cap(a) { c.arr_reserve(a, a.len + 1); }
+    a.ptr[a.len] = v;
+    a.len += 1;
+}
+
+pub fn Ctx.arr_set_len(c: *Ctx, a: Gc<Arr>, n: u64) {
+    if n < a.len {
+        for i in n..a.len { a.ptr[i] = V.Undef; }
+        a.len = n;
+        return;
+    }
+    c.arr_reserve(a, n);
+    a.len = n;
+}
+
+/// The array index `v` denotes, or -1.
+pub fn Ctx.index_of(c: *Ctx, v: V) -> i64 {
+    match v {
+        Int(i) => if i >= 0 { i as i64 } else { -1 },
+        Num(x) => {
+            if x >= 0.0 and x < 4294967295.0 and x == x.floor() { x as i64 } else { -1 }
+        }
+        S(s) => c.key_index(c.str_key(s)),
+        R(r) => c.key_index(c.str_key(value.flatten(r))),
+        _ => -1,
+    }
+}
+
+// ── generic property access ─────────────────────────────────────────
+
+/// A lookup on a prototype object and its chain.
+fn Ctx.proto_get(c: *Ctx, p: Gc<Obj>, k: u64) -> V { c.m.get_chain(p, k) ?? V.Undef }
+
+/// v[k] for any value.
+pub fn Ctx.get(c: *Ctx, v0: V, k: u64) -> Result<V, V> {
+    let v = value.flat(v0);
+    match v {
+        O(o) => Ok(c.m.get_chain(o, k) ?? V.Undef),
+        A(a) => {
+            if k == c.k_length { return Ok(V.Int(a.len as i32)); }
+            let i = c.key_index(k);
+            if i >= 0 { return Ok(if (i as u64) < a.len { a.ptr[i as u64] } else { V.Undef }); }
+            Ok(c.proto_get(c.arr_proto(), k))
+        }
+        S(s) => {
+            if k == c.k_length { return Ok(V.Int(s.data.len as i32)); }
+            let i = c.key_index(k);
+            if i >= 0 { return Ok(if (i as u64) < s.data.len { V.S(c.char_str(s.data[i as u64])) } else { V.Undef }); }
+            Ok(c.proto_get(c.str_proto(), k))
+        }
+        F(f) => {
+            let bag = c.fn_props(f);
+            if let Some(x) = c.m.get_chain(bag, k) { return Ok(x); }
+            Ok(c.proto_get(c.fn_proto(), k))
+        }
+        Int(_) | Num(_) => Ok(c.proto_get(c.num_proto(), k)),
+        Bool(_) => Ok(c.proto_get(c.bool_proto(), k)),
+        Undef => Err(c.type_error_key("Cannot read properties of undefined (reading", k)),
+        Null => Err(c.type_error_key("Cannot read properties of null (reading", k)),
+        B(_) | R(_) => Ok(V.Undef),
+    }
+}
+
+/// v[k] = x for any value.
+pub fn Ctx.set(c: *Ctx, v: V, k: u64, x: V) -> Result<(), V> {
+    match v {
+        O(o) => { c.m.set(o, k, x); Ok(()) }
+        A(a) => {
+            if k == c.k_length {
+                let n = c.index_of(x);
+                if n < 0 { return Err(c.new_error(c.err_proto(), "Invalid array length")); }
+                c.arr_set_len(a, n as u64);
+                return Ok(());
+            }
+            let i = c.key_index(k);
+            if i >= 0 { c.arr_set(a, i as u64, x); }
+            Ok(())
+        }
+        F(f) => {
+            let bag = c.fn_props(f);
+            if k == c.k_prototype { if let O(p) = x { mark_proto(p); } }
+            c.m.set(bag, k, x);
+            Ok(())
+        }
+        Undef => Err(c.type_error_key("Cannot set properties of undefined (setting", k)),
+        Null => Err(c.type_error_key("Cannot set properties of null (setting", k)),
+        _ => Ok(()),
+    }
+}
+
+/// a[i] = x (i <= len appends; beyond is out of the subset and fills with undefined).
+pub fn Ctx.arr_set(c: *Ctx, a: Gc<Arr>, i: u64, x: V) {
+    if i < a.len { a.ptr[i] = x; return; }
+    if i >= arr_cap(a) { c.arr_reserve(a, i + 1); }
+    a.len = i + 1;
+    a.ptr[i] = x;
+}
+
+/// obj[key] for any key value.
+pub fn Ctx.get_index(c: *Ctx, v0: V, key: V) -> Result<V, V> {
+    let v = value.flat(v0);
+    if let A(a) = v {
+        let i = c.index_of(key);
+        if i >= 0 { return Ok(if (i as u64) < a.len { a.ptr[i as u64] } else { V.Undef }); }
+    }
+    if let S(s) = v {
+        let i = c.index_of(key);
+        if i >= 0 { return Ok(if (i as u64) < s.data.len { V.S(c.char_str(s.data[i as u64])) } else { V.Undef }); }
+    }
+    if v == V.Undef or v == V.Null {
+        return Err(c.type_error(if v == V.Undef { "Cannot read properties of undefined" } else { "Cannot read properties of null" }));
+    }
+    c.get(v, c.key_of(key))
+}
+
+pub fn Ctx.set_index(c: *Ctx, v: V, key: V, x: V) -> Result<(), V> {
+    if let A(a) = v {
+        let i = c.index_of(key);
+        if i >= 0 { c.arr_set(a, i as u64, x); return Ok(()); }
+    }
+    if v == V.Undef or v == V.Null {
+        return Err(c.type_error(if v == V.Undef { "Cannot set properties of undefined" } else { "Cannot set properties of null" }));
+    }
+    c.set(v, c.key_of(key), x)
+}
+
+/// `k in v`.
+pub fn Ctx.has(c: *Ctx, v: V, k: u64) -> Result<bool, V> {
+    match v {
+        O(o) => Ok(found(c.m.lookup(o, k))),
+        A(a) => {
+            if k == c.k_length { return Ok(true); }
+            let i = c.key_index(k);
+            if i >= 0 { return Ok((i as u64) < a.len); }
+            Ok(found(c.m.lookup(c.arr_proto(), k)))
+        }
+        F(f) => {
+            let bag = c.fn_props(f);
+            Ok(found(c.m.lookup(bag, k)) or found(c.m.lookup(c.fn_proto(), k)))
+        }
+        _ => Err(c.type_error("Cannot use 'in' operator to search for a key in a primitive")),
+    }
+}
+
+fn found(l: obj.Lookup<Gc<Obj>>) -> bool {
+    match l {
+        Missing => false,
+        _ => true,
+    }
+}
+
+/// Is own property `k` of `o` enumerable?
+fn Ctx.enumerable(c: *Ctx, o: Gc<Obj>, k: u64) -> bool {
+    if o.flags & value.OF_NONENUM != 0 { return false; }
+    if o.flags & value.OF_CTOR != 0 and k == c.k_constructor { return false; }
+    true
+}
+
+/// Own keys of `o` in JS order: array indices ascending, then the others
+/// in insertion order. Only enumerable keys if `enum_only`.
+pub fn Ctx.own_keys(c: *Ctx, o: Gc<Obj>, out: *mem.Vec<u64>, enum_only: bool) {
+    var all: mem.Vec<u64> = mem.Vec.new();
+    c.m.keys(o, &all);
+    var idx: mem.Vec<u64> = mem.Vec.new();
+    for i in 0..all.len {
+        let k = all.at(i);
+        if enum_only and !c.enumerable(o, k) { continue; }
+        if c.key_index(k) >= 0 { idx.push(k); }
+    }
+    // Insertion sort of the index keys by value (usually few).
+    for i in 1..idx.len {
+        let k = idx.at(i);
+        let v = c.key_index(k);
+        var j = i;
+        while j > 0 and c.key_index(idx.at(j - 1)) > v {
+            idx.set(j, idx.at(j - 1));
+            j -= 1;
+        }
+        idx.set(j, k);
+    }
+    for i in 0..idx.len { out.push(idx.at(i)); }
+    for i in 0..all.len {
+        let k = all.at(i);
+        if enum_only and !c.enumerable(o, k) { continue; }
+        if c.key_index(k) < 0 { out.push(k); }
+    }
+    all.free();
+    idx.free();
+}
+
+/// The keys `for (k in v)` visits, as an array of strings.
+pub fn Ctx.for_in_keys(c: *Ctx, v0: V) -> Gc<Arr> {
+    let v = value.flat(v0);
+    let r = c.new_array(0, 8);
+    match v {
+        A(a) => { for i in 0..a.len { c.arr_push(r, V.S(c.key_str(c.int_key(i as i64)))); } }
+        S(s) => { for i in 0..s.data.len { c.arr_push(r, V.S(c.key_str(c.int_key(i as i64)))); } }
+        O(o) => {
+            var seen: map.HashMap<u64, bool> = map.HashMap.new();
+            var ks: mem.Vec<u64> = mem.Vec.new();
+            var cur: ?Gc<Obj> = Some(o);
+            while let Some(x) = cur {
+                ks.clear();
+                c.own_keys(x, &ks, false);
+                for i in 0..ks.len {
+                    let k = ks.at(i);
+                    if seen.contains(k) { continue; }
+                    seen.insert(k, true);
+                    if c.enumerable(x, k) { c.arr_push(r, V.S(c.key_str(k))); }
+                }
+                cur = x.proto;
+            }
+            ks.free();
+            seen.free();
+        }
+        _ => {}
+    }
+    r
+}

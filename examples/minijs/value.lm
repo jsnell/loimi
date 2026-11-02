@@ -1,0 +1,358 @@
+// Runtime values of MiniJS: the NaN-boxed `V`, the GC objects behind
+// it, and the conversions that need no interpreter context.
+
+import std.gc;
+import std.mem;
+import std.hash;
+import std.text;
+import std.num;
+import std.obj;
+
+extern "C" fn fmod(a: f64, b: f64) -> f64;
+
+/// A string: immutable bytes. `key` caches the property-key id of the
+/// string (0: not looked up yet); `hash` is 0 until computed.
+pub object Str { hash: u64, key: u32, data: [u8] }
+
+/// A string made by concatenation, flattened on first use other than
+/// further concatenation, `length`, `typeof` and truthiness (so building
+/// a string with `+=` is linear). `left` and `right` are S or R values;
+/// `flat` caches the flattened string.
+pub object Rope { len: u64, flat: ?Gc<Str>, left: V, right: V }
+
+/// Concatenations at least this long make ropes.
+pub const ROPE_MIN: u64 = 64;
+
+/// The heap ropes are flattened into (set at startup).
+pub var HEAP: ?*gc.Heap = None;
+
+/// Length of a string value (S or R).
+pub fn str_len(v: V) -> u64 {
+    match v {
+        S(s) => s.data.len,
+        R(r) => r.len,
+        _ => 0,
+    }
+}
+
+/// The flat string of a rope. Allocates (never collects).
+pub fn flatten(r: Gc<Rope>) -> Gc<Str> {
+    if let Some(f) = r.flat { return f; }
+    let Some(h) = HEAP else { unreachable };
+    let out = alloc_str(h, r.len);
+    // Leaves left to right, with an explicit stack (ropes from `+=` are
+    // as deep as they are long).
+    var stack: mem.Vec<V> = mem.Vec.new();
+    stack.push(V.R(r));
+    var pos: u64 = 0;
+    while let Some(v) = stack.pop() {
+        match v {
+            S(s) => {
+                mem.memcpy(out.data.ptr + pos, s.data.ptr, s.data.len);
+                pos += s.data.len;
+            }
+            R(x) => {
+                if let Some(f) = x.flat {
+                    mem.memcpy(out.data.ptr + pos, f.data.ptr, f.data.len);
+                    pos += f.data.len;
+                } else {
+                    stack.push(x.right);
+                    stack.push(x.left);
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.free();
+    r.flat = Some(out);
+    r.left = V.Undef;
+    r.right = V.Undef;
+    out
+}
+
+/// A rope value as a flat string value; other values unchanged.
+pub fn flat(v: V) -> V {
+    if let R(r) = v { return V.S(flatten(r)); }
+    v
+}
+
+/// A plain array of values: overflow slots of objects, array storage,
+/// constant pools.
+pub object Vals { data: [V] }
+
+/// An object with a hidden class (std.obj). `flags` holds the OF_* bits.
+pub object Obj {
+    shape: Gc<obj.Shape>,
+    dict: ?Gc<obj.Dict>,
+    overflow: ?Gc<Vals>,
+    proto: ?Gc<Obj>,
+    flags: u32,
+    inline: [V],
+}
+
+/// The object is (or was) the prototype of another object: it may have a
+/// validity cell, so adding a property must go through std.obj.
+pub const OF_PROTO: u32 = 1;
+/// Every property is non-enumerable (built-in and class prototypes).
+pub const OF_NONENUM: u32 = 2;
+/// Its `constructor` property is non-enumerable (F.prototype objects).
+pub const OF_CTOR: u32 = 4;
+
+/// An array: `len` elements in `ptr[0..len]`, which points into `store`
+/// (capacity `store.data.len`).
+pub object Arr { len: u64, ptr: *V, store: ?Gc<Vals> }
+
+/// A captured variable that is assigned after capture.
+pub object Box { v: V }
+
+/// A function value. `props` holds its own properties (created on first
+/// use; slot 0 is always `prototype`). `home` is the object whose
+/// prototype `super.x` searches (methods), `parent` the constructor that
+/// `super(...)` calls (derived class constructors). Arrow functions copy
+/// both from their creator. `native` is a builtin's id (0: bytecode).
+/// `hint` is the number of inline slots for objects made by `new`, learnt
+/// from the objects it has made; `ctor_shape` caches their root shape for
+/// prototype `ctor_proto`.
+pub object Fn {
+    proto: Gc<Proto>,
+    props: ?Gc<Obj>,
+    home: V,
+    parent: V,
+    native: u32,
+    hint: u32,
+    ctor_proto: ?Gc<Obj>,
+    ctor_shape: ?Gc<obj.Shape>,
+    free: [V],
+}
+
+pub object Lines { data: [u32] }
+pub object Protos { data: [Gc<Proto>] }
+/// Capture descriptors: bit 8 set means "register `low byte` of the
+/// creating frame", otherwise "free slot `low byte` of the creating closure".
+pub object Descs { data: [u32] }
+/// Exception handlers: (start, end, target, register) word offsets.
+pub object Handlers { data: [u32] }
+
+pub const PF_ARROW: u32 = 1;
+pub const PF_CLASS: u32 = 2;
+pub const PF_DERIVED: u32 = 4;
+pub const PF_METHOD: u32 = 8;
+
+/// `fixed` for prototypes that CALL's fast path must never take (natives).
+pub const NO_FIXED: u32 = 0xFFFF;
+
+pub object Proto {
+    name: Gc<Str>,
+    nparams: u32,
+    /// `nparams` when CALL may take the fast path with that many arguments.
+    fixed: u32,
+    nregs: u32,
+    nfree: u32,
+    flags: u32,
+    /// Inline slots for objects made by `new` (a static estimate).
+    hint: u32,
+    consts: Gc<Vals>,
+    protos: Gc<Protos>,
+    desc: Gc<Descs>,
+    handlers: Gc<Handlers>,
+    lines: Gc<Lines>,
+    code: [u32],
+}
+
+pub value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    S(Gc<Str>),
+    O(Gc<Obj>),
+    A(Gc<Arr>),
+    F(Gc<Fn>),
+    B(Gc<Box>),
+    R(Gc<Rope>),
+    Undef,
+    Null,
+    Bool(bool),
+}
+
+// ── strings ─────────────────────────────────────────────────────────
+
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str { hash: 0, key: 0 }, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+/// A string of `n` bytes to be filled in by the caller.
+pub fn alloc_str(h: *gc.Heap, n: u64) -> Gc<Str> {
+    new(h, Str { hash: 0, key: 0 }, n)
+}
+
+pub fn str_eq(a: Gc<Str>, b: Gc<Str>) -> bool {
+    if (a as u64) == (b as u64) { return true; }
+    a.data.len == b.data.len and mem.memcmp(a.data.ptr, b.data.ptr, a.data.len) == 0
+}
+
+/// Compare code units: negative, zero or positive.
+pub fn str_cmp(a: Gc<Str>, b: Gc<Str>) -> i32 {
+    let n = if a.data.len < b.data.len { a.data.len } else { b.data.len };
+    let c = mem.memcmp(a.data.ptr, b.data.ptr, n);
+    if c != 0 { return c; }
+    if a.data.len < b.data.len { -1 } else if a.data.len > b.data.len { 1 } else { 0 }
+}
+
+pub fn str_hash(s: Gc<Str>) -> u64 {
+    if s.hash == 0 {
+        var hv = hash.bytes(s.data);
+        if hv == 0 { hv = 1; }
+        s.hash = hv;
+    }
+    s.hash
+}
+
+// Values as constant-pool keys: strings by content, everything else by bits
+// (so 0 and -0, or Int 1 and Num 1, stay apart).
+pub fn V.hash(v: V) -> u64 {
+    match v {
+        S(s) => str_hash(s),
+        _ => hash.mix(v as u64),
+    }
+}
+pub fn V.eq(a: V, b: V) -> bool {
+    match (a, b) {
+        (S(x), S(y)) => str_eq(x, y),
+        _ => a == b,
+    }
+}
+impl hash.Hash for V;
+
+// ── numbers ─────────────────────────────────────────────────────────
+
+/// A number value: Int when `x` is integral, fits in an i32 and is not -0.
+pub fn number(x: f64) -> V {
+    if x >= -2147483648.0 and x <= 2147483647.0 {
+        let i = x as i32;
+        if i as f64 == x and (i != 0 or 1.0 / x > 0.0) { return V.Int(i); }
+    }
+    V.Num(x)
+}
+
+pub fn num_of(v: V) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+pub fn is_number(v: V) -> bool {
+    match v {
+        Int(_) | Num(_) => true,
+        _ => false,
+    }
+}
+
+/// ECMAScript ToInt32.
+pub fn to_int32(x: f64) -> i32 {
+    if x != x or x == 1.0 / 0.0 or x == -1.0 / 0.0 { return 0; }
+    if x >= -2147483648.0 and x <= 2147483647.0 { return x as i32; }
+    let t = if x < 0.0 { -((-x).floor()) } else { x.floor() };
+    var m = fmod(t, 4294967296.0);
+    if m < 0.0 { m += 4294967296.0; }
+    (m as u64) as u32 as i32
+}
+
+/// JS `%` on doubles: the sign of the dividend.
+pub fn js_mod(x: f64, y: f64) -> f64 { fmod(x, y) }
+
+/// Whitespace for Number(), parseInt, parseFloat and trim (ASCII).
+pub fn is_ws(c: u8) -> bool { c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12 }
+
+/// Number(s): decimal or hex numerals with surrounding whitespace; the
+/// empty string is 0; anything else NaN.
+pub fn str_to_number(s: str) -> f64 {
+    var a: u64 = 0;
+    var b = s.len;
+    while a < b and is_ws(s[a]) { a += 1; }
+    while b > a and is_ws(s[b - 1]) { b -= 1; }
+    let t = s[a..b];
+    if t.len == 0 { return 0.0; }
+    if t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X') {
+        var v: f64 = 0.0;
+        for i in 2..t.len {
+            let d = num.digit_value(t[i]);
+            if d >= 16 { return 0.0 / 0.0; }
+            v = v * 16.0 + d as f64;
+        }
+        return v;
+    }
+    var u = t;
+    var neg = false;
+    if u[0] == '+' or u[0] == '-' {
+        neg = u[0] == '-';
+        u = u[1..u.len];
+    }
+    if u.eq("Infinity") { return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }; }
+    if u.len == 0 or num.decimal_len(u) != u.len { return 0.0 / 0.0; }
+    let Ok(x) = num.parse_f64(u) else { return 0.0 / 0.0; };
+    if neg { -x } else { x }
+}
+
+// ── conversions ─────────────────────────────────────────────────────
+
+pub fn truthy(v: V) -> bool {
+    match v {
+        Bool(b) => b,
+        Int(i) => i != 0,
+        Num(x) => x == x and x != 0.0,
+        S(s) => s.data.len > 0,
+        R(_) => true,
+        Undef | Null => false,
+        _ => true,
+    }
+}
+
+pub fn type_of(v: V) -> str {
+    match v {
+        Num(_) | Int(_) => "number",
+        S(_) | R(_) => "string",
+        Bool(_) => "boolean",
+        Undef => "undefined",
+        F(_) => "function",
+        _ => "object",
+    }
+}
+
+/// ToNumber for primitives (objects give NaN: out of the subset).
+pub fn to_number(v: V) -> f64 {
+    match v {
+        Int(i) => i as f64,
+        Num(x) => x,
+        Bool(b) => if b { 1.0 } else { 0.0 },
+        Null => 0.0,
+        S(s) => str_to_number(s.data),
+        R(r) => str_to_number(flatten(r).data),
+        _ => 0.0 / 0.0,
+    }
+}
+
+/// Strict equality (`===`).
+pub fn strict_eq(a0: V, b0: V) -> bool {
+    let a = flat(a0);
+    let b = flat(b0);
+    match (a, b) {
+        (Int(x), Int(y)) => x == y,
+        (Num(x), Num(y)) => x == y,
+        (Int(x), Num(y)) => x as f64 == y,
+        (Num(x), Int(y)) => x == y as f64,
+        (S(x), S(y)) => str_eq(x, y),
+        _ => a == b,
+    }
+}
+
+/// Append a number as Number::toString writes it.
+pub fn write_num(b: *text.StrBuf, v: V) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => num.write_js(b, x),
+        _ => {}
+    }
+}

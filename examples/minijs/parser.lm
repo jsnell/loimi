@@ -1,0 +1,706 @@
+// The MiniJS parser: tokens → syntax trees (ast.lm).
+//
+// Statements are parsed by recursive descent. Binary operators go through
+// std.parse's Pratt driver, with the parser's hooks for operands
+// (`atom`: primaries with their member/call/postfix suffixes) and for
+// building nodes. Assignment, `?:` and arrow functions sit above it.
+
+import std.mem;
+import std.parse;
+import ast;
+import ast.{T, Token, K, Node, Func, Class, Member, VK, fail, new_node, new_func, null_node, is_null, null_func};
+
+pub struct Parser {
+    toks: mem.Vec<Token>,
+    i: u64,
+    pratt: parse.Pratt<Parser, T, *Node, str>,
+    fun: *Func,
+}
+
+fn Parser.tok(p: *Parser) -> Token { p.toks.at(p.i) }
+fn Parser.kind(p: *Parser) -> T { p.toks.at(p.i).kind }
+fn Parser.kind_at(p: *Parser, n: u64) -> T {
+    let j = p.i + n;
+    if j < p.toks.len { p.toks.at(j).kind } else { T.Eof }
+}
+fn Parser.line(p: *Parser) -> u32 { p.toks.at(p.i).line }
+fn Parser.pos(p: *Parser) -> u32 { p.i as u32 }
+fn Parser.next(p: *Parser) -> Token {
+    let t = p.toks.at(p.i);
+    if t.kind != T.Eof { p.i += 1; }
+    t
+}
+fn Parser.accept(p: *Parser, k: T) -> bool {
+    if p.kind() == k { p.i += 1; return true; }
+    false
+}
+fn Parser.expect(p: *Parser, k: T, what: str) {
+    if p.kind() != k {
+        var m = text_join("expected ", what);
+        fail(p.line(), m);
+    }
+    p.i += 1;
+}
+
+fn text_join(a: str, b: str) -> str {
+    let s: *u8 = mem.alloc(a.len + b.len);
+    mem.memcpy(s, a.ptr, a.len);
+    mem.memcpy(s + a.len, b.ptr, b.len);
+    s.slice(a.len + b.len)
+}
+
+fn Parser.node(p: *Parser, k: K) -> *Node { new_node(k, p.line(), p.pos()) }
+
+fn is_word(k: T) -> bool {
+    let i = k as u64;
+    k == T.Name or (i >= T.Break as u64 and i <= T.While as u64)
+}
+
+/// An identifier (not a reserved word).
+fn Parser.ident(p: *Parser) -> str {
+    if p.kind() != T.Name { fail(p.line(), "expected an identifier"); }
+    p.next().text
+}
+
+/// A property name after `.`, in a literal or a class: any word.
+fn Parser.prop_name(p: *Parser) -> str {
+    if !is_word(p.kind()) { fail(p.line(), "expected a property name"); }
+    p.next().text
+}
+
+// ── Pratt hooks ─────────────────────────────────────────────────────
+
+fn hook_peek(p: *Parser) -> T { p.kind() }
+fn hook_advance(p: *Parser) -> Result<(), str> { p.next(); Ok(()) }
+fn hook_atom(p: *Parser) -> Result<*Node, str> { Ok(p.postfix()) }
+fn hook_unary(p: *Parser, k: T, e: *Node) -> Result<*Node, str> {
+    if k == T.PlusPlus or k == T.MinusMinus {
+        check_target(e);
+        let n = new_node(K.Update, e.line, e.pos);
+        n.op = k;
+        n.a = e;
+        n.flag = 1;
+        return Ok(n);
+    }
+    let n = new_node(K.Unary, e.line, e.pos);
+    n.op = k;
+    n.a = e;
+    Ok(n)
+}
+fn hook_binary(p: *Parser, k: T, a: *Node, b: *Node) -> Result<*Node, str> {
+    let n = new_node(if k == T.AmpAmp or k == T.PipePipe or k == T.QQ { K.Logical } else { K.Bin }, a.line, a.pos);
+    n.op = k;
+    n.a = a;
+    n.b = b;
+    Ok(n)
+}
+
+fn check_target(e: *Node) {
+    if e.kind != K.Name and e.kind != K.Member and e.kind != K.Index {
+        fail(e.line, "invalid assignment target");
+    }
+}
+
+pub fn Parser.new(toks: mem.Vec<Token>) -> Parser {
+    var pr: parse.Pratt<Parser, T, *Node, str> = parse.Pratt.new(hook_peek, hook_advance, hook_atom, hook_unary, hook_binary);
+    pr.infix_left(T.QQ, 2);
+    pr.infix_left(T.PipePipe, 2);
+    pr.infix_left(T.AmpAmp, 3);
+    pr.infix_left(T.Pipe, 4);
+    pr.infix_left(T.Caret, 5);
+    pr.infix_left(T.Amp, 6);
+    pr.infix_left(T.EqEqEq, 7); pr.infix_left(T.NotEqEq, 7); pr.infix_left(T.EqEq, 7); pr.infix_left(T.NotEq, 7);
+    pr.infix_left(T.Lt, 8); pr.infix_left(T.Gt, 8); pr.infix_left(T.Le, 8); pr.infix_left(T.Ge, 8);
+    pr.infix_left(T.In, 8); pr.infix_left(T.Instanceof, 8);
+    pr.infix_left(T.Shl, 9); pr.infix_left(T.Shr, 9); pr.infix_left(T.UShr, 9);
+    pr.infix_left(T.Plus, 10); pr.infix_left(T.Minus, 10);
+    pr.infix_left(T.Star, 11); pr.infix_left(T.Slash, 11); pr.infix_left(T.Percent, 11);
+    pr.infix_right(T.StarStar, 14);
+    pr.prefix(T.Bang, 12); pr.prefix(T.Minus, 12); pr.prefix(T.Plus, 12); pr.prefix(T.Tilde, 12);
+    pr.prefix(T.Typeof, 12); pr.prefix(T.Void, 12); pr.prefix(T.Delete, 12);
+    pr.prefix(T.PlusPlus, 12); pr.prefix(T.MinusMinus, 12);
+    Parser { toks: toks, i: 0, pratt: pr, fun: null_func() }
+}
+
+// ── expressions ─────────────────────────────────────────────────────
+
+fn is_assign_op(k: T) -> bool {
+    let i = k as u64;
+    i >= T.Assign as u64 and i <= T.QQAssign as u64
+}
+
+/// Index of the token after the `)` matching the `(` at `p.i`.
+fn Parser.after_parens(p: *Parser) -> u64 {
+    var depth: u64 = 0;
+    var j = p.i;
+    while j < p.toks.len {
+        let k = p.toks.at(j).kind;
+        if k == T.LParen or k == T.LBracket or k == T.LBrace { depth += 1; }
+        if k == T.RParen or k == T.RBracket or k == T.RBrace {
+            depth -= 1;
+            if depth == 0 { return j + 1; }
+        }
+        if k == T.Eof { return j; }
+        j += 1;
+    }
+    j
+}
+
+pub fn Parser.assign(p: *Parser) -> *Node {
+    // Arrow functions.
+    if p.kind() == T.Name and p.kind_at(1) == T.Arrow { return p.arrow(); }
+    if p.kind() == T.LParen {
+        let j = p.after_parens();
+        if j < p.toks.len and p.toks.at(j).kind == T.Arrow { return p.arrow(); }
+    }
+    let lhs = p.cond();
+    let k = p.kind();
+    if is_assign_op(k) {
+        check_target(lhs);
+        p.next();
+        let rhs = p.assign();
+        let n = new_node(K.Assign, lhs.line, lhs.pos);
+        n.op = k;
+        n.a = lhs;
+        n.b = rhs;
+        return n;
+    }
+    lhs
+}
+
+fn Parser.cond(p: *Parser) -> *Node {
+    let c = match p.pratt.parse(p, 0) {
+        Ok(n) => n,
+        Err(m) => fail(p.line(), m),
+    };
+    if !p.accept(T.Question) { return c; }
+    let t = p.assign();
+    p.expect(T.Colon, "':'");
+    let f = p.assign();
+    let n = new_node(K.Cond, c.line, c.pos);
+    n.a = c;
+    n.b = t;
+    n.c = f;
+    n
+}
+
+pub fn Parser.expr(p: *Parser) -> *Node { p.assign() }
+
+/// Comma-separated expressions (only in `for` headers).
+fn Parser.expr_seq(p: *Parser) -> *Node {
+    let e = p.assign();
+    if p.kind() != T.Comma { return e; }
+    let n = new_node(K.Seq, e.line, e.pos);
+    n.list.push(e);
+    while p.accept(T.Comma) { n.list.push(p.assign()); }
+    n
+}
+
+fn Parser.arrow(p: *Parser) -> *Node {
+    let n = p.node(K.Func);
+    let f = new_func("", p.line(), p.pos(), p.fun);
+    f.arrow = true;
+    if p.kind() == T.Name {
+        f.params.push(ast.new_var(p.next().text, VK.Param, f));
+    } else {
+        p.expect(T.LParen, "'('");
+        p.params(f);
+    }
+    p.expect(T.Arrow, "'=>'");
+    let saved = p.fun;
+    p.fun = f;
+    if p.kind() == T.LBrace {
+        p.body(f);
+    } else {
+        f.expr = p.assign();
+    }
+    p.fun = saved;
+    n.fun = f;
+    n
+}
+
+/// Parameter names up to and including `)`.
+fn Parser.params(p: *Parser, f: *Func) {
+    if p.accept(T.RParen) { return; }
+    loop {
+        let name = p.ident();
+        f.params.push(ast.new_var(name, VK.Param, f));
+        if p.accept(T.RParen) { break; }
+        p.expect(T.Comma, "',' or ')'");
+    }
+}
+
+/// A function body `{ ... }`.
+fn Parser.body(p: *Parser, f: *Func) {
+    p.expect(T.LBrace, "'{'");
+    while p.kind() != T.RBrace {
+        if p.kind() == T.Eof { fail(p.line(), "unexpected end of input"); }
+        f.body.push(p.stmt());
+    }
+    p.next();
+}
+
+/// `function name? (params) { body }` after the `function` keyword.
+fn Parser.function_rest(p: *Parser, name: str, line: u32, pos: u32) -> *Func {
+    let f = new_func(name, line, pos, p.fun);
+    p.expect(T.LParen, "'('");
+    p.params(f);
+    let saved = p.fun;
+    p.fun = f;
+    p.body(f);
+    p.fun = saved;
+    f
+}
+
+fn Parser.method(p: *Parser, name: str) -> *Func {
+    let line = p.line();
+    let pos = p.pos();
+    let f = p.function_rest(name, line, pos);
+    f.method = true;
+    f
+}
+
+fn Parser.args(p: *Parser, n: *Node) {
+    p.expect(T.LParen, "'('");
+    if p.accept(T.RParen) { return; }
+    loop {
+        n.list.push(p.assign());
+        if p.accept(T.RParen) { break; }
+        p.expect(T.Comma, "',' or ')'");
+    }
+}
+
+fn Parser.primary(p: *Parser) -> *Node {
+    let t = p.tok();
+    let line = t.line;
+    let pos = p.pos();
+    match t.kind {
+        Num => { p.next(); let n = new_node(K.Num, line, pos); n.num = t.num; n }
+        Str => { p.next(); let n = new_node(K.Str, line, pos); n.text = t.text; n }
+        Name => { p.next(); let n = new_node(K.Name, line, pos); n.text = t.text; n }
+        This => { p.next(); new_node(K.This, line, pos) }
+        Undefined => { p.next(); new_node(K.Undef, line, pos) }
+        Null => { p.next(); new_node(K.Null, line, pos) }
+        True => { p.next(); new_node(K.True, line, pos) }
+        False => { p.next(); new_node(K.False, line, pos) }
+        LParen => {
+            p.next();
+            let e = p.expr();
+            p.expect(T.RParen, "')'");
+            e
+        }
+        LBracket => {
+            p.next();
+            let n = new_node(K.Array, line, pos);
+            if !p.accept(T.RBracket) {
+                loop {
+                    n.list.push(p.assign());
+                    if p.accept(T.RBracket) { break; }
+                    p.expect(T.Comma, "',' or ']'");
+                    if p.accept(T.RBracket) { break; }
+                }
+            }
+            n
+        }
+        LBrace => p.object(),
+        Function => {
+            p.next();
+            var name = "";
+            if p.kind() == T.Name { name = p.next().text; }
+            let n = new_node(K.Func, line, pos);
+            n.fun = p.function_rest(name, line, pos);
+            n
+        }
+        New => {
+            p.next();
+            if p.kind() == T.Dot { fail(line, "new.target is not supported"); }
+            let n = new_node(K.New, line, pos);
+            n.a = p.member_only();
+            if p.kind() == T.LParen { p.args(n); }
+            n
+        }
+        Super => {
+            p.next();
+            if p.kind() == T.LParen {
+                let n = new_node(K.SuperCall, line, pos);
+                p.args(n);
+                return n;
+            }
+            if p.accept(T.Dot) {
+                let n = new_node(K.SuperMember, line, pos);
+                n.text = p.prop_name();
+                return n;
+            }
+            fail(line, "unexpected 'super'")
+        }
+        Class => fail(line, "class expressions are not supported"),
+        _ => fail(line, "unexpected token"),
+    }
+}
+
+/// A member expression without calls (the callee of `new`).
+fn Parser.member_only(p: *Parser) -> *Node {
+    var e = if p.kind() == T.New {
+        let line = p.line();
+        let pos = p.pos();
+        p.next();
+        let n = new_node(K.New, line, pos);
+        n.a = p.member_only();
+        if p.kind() == T.LParen { p.args(n); }
+        n
+    } else { p.primary() };
+    loop {
+        if p.accept(T.Dot) {
+            let n = new_node(K.Member, e.line, e.pos);
+            n.a = e;
+            n.text = p.prop_name();
+            e = n;
+        } else if p.kind() == T.LBracket {
+            p.next();
+            let n = new_node(K.Index, e.line, e.pos);
+            n.a = e;
+            n.b = p.expr();
+            p.expect(T.RBracket, "']'");
+            e = n;
+        } else {
+            return e;
+        }
+    }
+}
+
+/// A primary with member, call and postfix-update suffixes.
+fn Parser.postfix(p: *Parser) -> *Node {
+    var e = p.primary();
+    loop {
+        let k = p.kind();
+        if k == T.Dot {
+            p.next();
+            let n = new_node(K.Member, e.line, e.pos);
+            n.a = e;
+            n.text = p.prop_name();
+            e = n;
+        } else if k == T.LBracket {
+            p.next();
+            let n = new_node(K.Index, e.line, e.pos);
+            n.a = e;
+            n.b = p.expr();
+            p.expect(T.RBracket, "']'");
+            e = n;
+        } else if k == T.LParen {
+            let n = new_node(K.Call, e.line, e.pos);
+            n.a = e;
+            p.args(n);
+            e = n;
+        } else if k == T.PlusPlus or k == T.MinusMinus {
+            check_target(e);
+            p.next();
+            let n = new_node(K.Update, e.line, e.pos);
+            n.op = k;
+            n.a = e;
+            n.flag = 0;
+            return n;
+        } else {
+            return e;
+        }
+    }
+}
+
+fn Parser.object(p: *Parser) -> *Node {
+    let n = p.node(K.Object);
+    p.expect(T.LBrace, "'{'");
+    while !p.accept(T.RBrace) {
+        let pr = p.node(K.Prop);
+        if p.accept(T.LBracket) {
+            pr.a = p.assign();
+            pr.flag = 1;
+            p.expect(T.RBracket, "']'");
+        } else if p.kind() == T.Str {
+            pr.text = p.next().text;
+        } else if p.kind() == T.Num {
+            let t = p.next();
+            let kn = new_node(K.Num, t.line, pr.pos);
+            kn.num = t.num;
+            pr.a = kn;
+            pr.flag = 1;
+        } else {
+            let is_name = p.kind() == T.Name;
+            pr.text = p.prop_name();
+            if is_name and (p.kind() == T.Comma or p.kind() == T.RBrace) {
+                // Shorthand {x}.
+                let v = new_node(K.Name, pr.line, pr.pos);
+                v.text = pr.text;
+                pr.b = v;
+                n.list.push(pr);
+                if !p.accept(T.Comma) { p.expect(T.RBrace, "'}'"); break; }
+                continue;
+            }
+        }
+        if p.kind() == T.LParen {
+            let f = p.method(pr.text);
+            let fnode = new_node(K.Func, pr.line, pr.pos);
+            fnode.fun = f;
+            pr.b = fnode;
+            pr.flag = pr.flag | 2;
+        } else {
+            p.expect(T.Colon, "':'");
+            pr.b = p.assign();
+        }
+        n.list.push(pr);
+        if !p.accept(T.Comma) { p.expect(T.RBrace, "'}'"); break; }
+    }
+    n
+}
+
+// ── statements ──────────────────────────────────────────────────────
+
+fn Parser.semi(p: *Parser) { p.expect(T.Semi, "';'"); }
+
+fn Parser.block(p: *Parser) -> *Node {
+    let n = p.node(K.Block);
+    p.expect(T.LBrace, "'{'");
+    while p.kind() != T.RBrace {
+        if p.kind() == T.Eof { fail(p.line(), "unexpected end of input"); }
+        n.list.push(p.stmt());
+    }
+    p.next();
+    n
+}
+
+/// `let/const/var` declarators (the keyword is the current token).
+fn Parser.var_decl(p: *Parser, for_head: bool) -> *Node {
+    let n = p.node(K.VarDecl);
+    n.op = p.next().kind;
+    loop {
+        let d = p.node(K.Decl);
+        d.text = p.ident();
+        if p.accept(T.Assign) { d.a = p.assign(); }
+        d.flag = p.pos();
+        n.list.push(d);
+        if !p.accept(T.Comma) { break; }
+    }
+    if !for_head { p.semi(); }
+    n
+}
+
+pub fn Parser.stmt(p: *Parser) -> *Node {
+    let line = p.line();
+    let pos = p.pos();
+    match p.kind() {
+        LBrace => p.block(),
+        Semi => { p.next(); new_node(K.Empty, line, pos) }
+        Var | Let | Const => p.var_decl(false),
+        Function => {
+            p.next();
+            let name = p.ident();
+            let n = new_node(K.FuncDecl, line, pos);
+            n.text = name;
+            n.fun = p.function_rest(name, line, pos);
+            n.fun.decl = true;
+            n
+        }
+        Class => p.class_decl(),
+        If => {
+            p.next();
+            let n = new_node(K.If, line, pos);
+            p.expect(T.LParen, "'('");
+            n.a = p.expr();
+            p.expect(T.RParen, "')'");
+            n.b = p.stmt();
+            if p.accept(T.Else) { n.c = p.stmt(); }
+            n
+        }
+        While => {
+            p.next();
+            let n = new_node(K.While, line, pos);
+            p.expect(T.LParen, "'('");
+            n.a = p.expr();
+            p.expect(T.RParen, "')'");
+            n.b = p.stmt();
+            n
+        }
+        Do => {
+            p.next();
+            let n = new_node(K.DoWhile, line, pos);
+            n.b = p.stmt();
+            p.expect(T.While, "'while'");
+            p.expect(T.LParen, "'('");
+            n.a = p.expr();
+            p.expect(T.RParen, "')'");
+            p.semi();
+            n
+        }
+        For => p.for_stmt(),
+        Break | Continue => {
+            let k = p.next().kind;
+            let n = new_node(if k == T.Break { K.Break } else { K.Continue }, line, pos);
+            if p.kind() == T.Name { n.text = p.next().text; }
+            p.semi();
+            n
+        }
+        Return => {
+            p.next();
+            let n = new_node(K.Return, line, pos);
+            if p.kind() != T.Semi { n.a = p.expr(); }
+            p.semi();
+            n
+        }
+        Throw => {
+            p.next();
+            let n = new_node(K.Throw, line, pos);
+            n.a = p.expr();
+            p.semi();
+            n
+        }
+        Try => {
+            p.next();
+            let n = new_node(K.Try, line, pos);
+            n.a = p.block();
+            if p.accept(T.Catch) {
+                if p.accept(T.LParen) {
+                    n.text = p.ident();
+                    p.expect(T.RParen, "')'");
+                }
+                n.b = p.block();
+                n.flag = 1;
+            }
+            if p.accept(T.Finally) { n.c = p.block(); }
+            if is_null(n.b) and is_null(n.c) { fail(line, "missing catch or finally"); }
+            n
+        }
+        Switch => {
+            p.next();
+            let n = new_node(K.Switch, line, pos);
+            p.expect(T.LParen, "'('");
+            n.a = p.expr();
+            p.expect(T.RParen, "')'");
+            p.expect(T.LBrace, "'{'");
+            while !p.accept(T.RBrace) {
+                let c = p.node(K.Case);
+                if p.accept(T.Default) {
+                    c.flag = 1;
+                } else {
+                    p.expect(T.Case, "'case'");
+                    c.a = p.expr();
+                }
+                p.expect(T.Colon, "':'");
+                while p.kind() != T.Case and p.kind() != T.Default and p.kind() != T.RBrace {
+                    if p.kind() == T.Eof { fail(p.line(), "unexpected end of input"); }
+                    c.list.push(p.stmt());
+                }
+                n.list.push(c);
+            }
+            n
+        }
+        Name => {
+            if p.kind_at(1) == T.Colon {
+                let n = new_node(K.Labeled, line, pos);
+                n.text = p.next().text;
+                p.next();
+                n.a = p.stmt();
+                return n;
+            }
+            p.expr_stmt()
+        }
+        _ => p.expr_stmt(),
+    }
+}
+
+fn Parser.expr_stmt(p: *Parser) -> *Node {
+    let n = p.node(K.ExprStmt);
+    n.a = p.expr();
+    p.semi();
+    n
+}
+
+fn Parser.for_stmt(p: *Parser) -> *Node {
+    let line = p.line();
+    let pos = p.pos();
+    p.next();
+    p.expect(T.LParen, "'('");
+    var init = null_node();
+    let k = p.kind();
+    if (k == T.Var or k == T.Let or k == T.Const) and p.kind_at(1) == T.Name
+            and (p.kind_at(2) == T.In or (p.kind_at(2) == T.Name and p.toks.at(p.i + 2).text.eq("of"))) {
+        init = p.var_decl(true);
+    } else if k == T.Name and (p.kind_at(1) == T.In or (p.kind_at(1) == T.Name and p.toks.at(p.i + 1).text.eq("of"))) {
+        init = p.primary();
+    }
+    if !is_null(init) {
+        let is_of = p.kind() == T.Name;
+        p.next();
+        let n = new_node(if is_of { K.ForOf } else { K.ForIn }, line, pos);
+        n.a = init;
+        n.b = p.expr();
+        p.expect(T.RParen, "')'");
+        n.d = p.stmt();
+        return n;
+    }
+    let n = new_node(K.For, line, pos);
+    if k == T.Var or k == T.Let or k == T.Const {
+        n.a = p.var_decl(true);
+    } else if k != T.Semi {
+        let e = new_node(K.ExprStmt, line, pos);
+        e.a = p.expr_seq();
+        n.a = e;
+    }
+    p.semi();
+    if p.kind() != T.Semi { n.b = p.expr(); }
+    p.semi();
+    if p.kind() != T.RParen { n.c = p.expr_seq(); }
+    p.expect(T.RParen, "')'");
+    n.d = p.stmt();
+    n
+}
+
+fn Parser.class_decl(p: *Parser) -> *Node {
+    let line = p.line();
+    let pos = p.pos();
+    p.next();
+    let n = new_node(K.ClassDecl, line, pos);
+    let c: *Class = mem.alloc(1);
+    c.name = p.ident();
+    c.line = line;
+    c.parent = null_node();
+    c.ctor = null_func();
+    c.members = mem.Vec.new();
+    n.text = c.name;
+    if p.accept(T.Extends) { c.parent = p.postfix(); }
+    p.expect(T.LBrace, "'{'");
+    while !p.accept(T.RBrace) {
+        if p.accept(T.Semi) { continue; }
+        var is_static = false;
+        if p.kind() == T.Name and p.tok().text.eq("static") and p.kind_at(1) != T.LParen {
+            p.next();
+            is_static = true;
+        }
+        let mline = p.line();
+        var key = null_node();
+        var name = "";
+        if p.accept(T.LBracket) {
+            key = p.assign();
+            p.expect(T.RBracket, "']'");
+        } else if p.kind() == T.Str {
+            name = p.next().text;
+        } else {
+            name = p.prop_name();
+        }
+        if p.kind() != T.LParen { fail(mline, "class fields are not supported"); }
+        let f = p.method(name);
+        if !is_static and is_null(key) and name.eq("constructor") {
+            f.method = false;
+            f.ctor = true;
+            f.derived = !is_null(c.parent);
+            c.ctor = f;
+        } else {
+            c.members.push(Member { name: name, key: key, fun: f, is_static: is_static });
+        }
+    }
+    n.cls = c;
+    n
+}
+
+/// Parse a whole program into the body of `top`.
+pub fn Parser.program(p: *Parser, top: *Func) {
+    p.fun = top;
+    while p.kind() != T.Eof { top.body.push(p.stmt()); }
+}
