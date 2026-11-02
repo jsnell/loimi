@@ -11,6 +11,8 @@ pub struct Parser {
     no_struct: bool,
     /// Inside a vm handler: control words are recognized.
     pub in_vm: bool,
+    /// Parsing the type after `as`: `<` may be a comparison.
+    cast_type: bool,
 }
 
 fn is_upper(s: &str) -> bool {
@@ -19,7 +21,7 @@ fn is_upper(s: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Parser {
-        Parser { toks, pos: 0, no_struct: false, in_vm: false }
+        Parser { toks, pos: 0, no_struct: false, in_vm: false, cast_type: false }
     }
 
     // ── token helpers ────────────────────────────────────────────────
@@ -517,6 +519,49 @@ impl Parser {
 
     // ── types ────────────────────────────────────────────────────────
 
+    /// At a `<`: if a balanced, type-shaped `<...>` follows, the index of
+    /// the token after its closing `>`. Does not consume anything.
+    fn angle_args_end(&self) -> Option<usize> {
+        if !self.is("<") {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        loop {
+            let t = &self.toks.get(i)?.tok;
+            match t {
+                Tok::Punct("<") => depth += 1,
+                Tok::Punct(">") => depth -= 1,
+                Tok::Punct(">>") => depth -= 2,
+                Tok::Punct(",") | Tok::Punct(".") | Tok::Punct("*") | Tok::Punct("?") | Tok::Punct("[")
+                | Tok::Punct("]") | Tok::Punct(";") | Tok::Punct("(") | Tok::Punct(")") | Tok::Punct("->") => {}
+                Tok::Int(_) => {}
+                Tok::Ident(s) if !is_reserved(s) || matches!(s.as_str(), "fn" | "never") => {}
+                _ => return None,
+            }
+            i += 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+    }
+
+    /// The type after `as`. A primitive type never takes type arguments,
+    /// so `x as u64 < y` is a comparison. After another type name, `<`
+    /// starts type arguments only if a balanced `<...>` of type tokens
+    /// follows (`p as *Vec<T>`); otherwise it is a comparison. Write
+    /// `(x as T) < y` to be explicit.
+    fn parse_cast_type(&mut self) -> Res<TypeExpr> {
+        let saved = self.cast_type;
+        self.cast_type = true;
+        let r = self.parse_type();
+        self.cast_type = saved;
+        r
+    }
+
     pub fn parse_type(&mut self) -> Res<TypeExpr> {
         let start = self.span();
         let kind = if self.eat("*") {
@@ -572,7 +617,11 @@ impl Parser {
                 path.push(self.ident()?);
             }
             let mut args = Vec::new();
-            if self.eat("<") {
+            let comparison = self.cast_type
+                && self.is("<")
+                && ((path.len() == 1 && crate::check::prim_type(&path[0].name).is_some()) || self.angle_args_end().is_none());
+            let cast_type = std::mem::replace(&mut self.cast_type, false);
+            if !comparison && self.eat("<") {
                 self.split_angle();
                 while !self.is(">") {
                     args.push(self.parse_type()?);
@@ -583,6 +632,7 @@ impl Parser {
                 }
                 self.expect(">")?;
             }
+            self.cast_type = cast_type;
             TypeKind::Named(path, args)
         };
         Ok(TypeExpr { kind, span: start.to(self.prev_span()) })
@@ -814,7 +864,7 @@ impl Parser {
     fn parse_cast(&mut self) -> Res<Expr> {
         let mut e = self.parse_unary()?;
         while self.eat_kw("as") {
-            let t = self.parse_type()?;
+            let t = self.parse_cast_type()?;
             let span = e.span.to(t.span);
             e = Expr { kind: ExprKind::Cast(Box::new(e), t), span };
         }

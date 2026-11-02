@@ -1,0 +1,31 @@
+// `<` after `as T`: a comparison unless type arguments follow.
+import std.io;
+
+struct Wrap<T> { v: T }
+
+extern "C" fn malloc(n: u64) -> *u8;
+
+fn main() {
+    let x: u32 = 3;
+    let y: u64 = 10;
+    io.print_bool(x as u64 < y); io.println("");
+    io.print_bool(x as u64 <= y and y as i64 < 11); io.println("");
+    io.print_bool(y as f64 < 2.5); io.println("");
+    if x as u64 < y { io.println("less"); }
+    let p = malloc(16);
+    let q = p as *u8 < p + 1;
+    io.print_bool(q); io.println("");
+    // Generic types after `as` still take type arguments.
+    let w = malloc(16) as *Wrap<i64>;
+    w.v = 7;
+    let w2 = w as *Wrap<Wrap<i64>>;
+    io.print_int(w2.v.v); io.println("");
+    io.print_bool(x as u64 << 2 == 12); io.println("");
+}
+// expect: true
+// expect: true
+// expect: false
+// expect: less
+// expect: true
+// expect: 7
+// expect: true

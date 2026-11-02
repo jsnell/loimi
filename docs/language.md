@@ -76,6 +76,11 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `for i in 0..Kind.COUNT { let k = i as Kind; }`); a variant named `COUNT`
   takes precedence. With explicit discriminants the count is not the
   largest discriminant plus one.
+- **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
+  takes type arguments. After any other type name, `<` begins type
+  arguments only when a balanced `<...>` made of type tokens follows
+  (`p as *Vec<T>`); otherwise it is a comparison. When in doubt, write
+  `(x as T) < y`.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - `defer stmt` runs `stmt` when the enclosing scope exits.
