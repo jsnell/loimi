@@ -1,0 +1,7 @@
+// A global may have fields, so `parse.x` would be ambiguous between it
+// and the module: a global or const cannot share a name with a module.
+import std.parse;
+struct P { x: i64 }
+var parse: P = P { x: 1 };
+fn main() {}
+// error: `parse` is defined more than once

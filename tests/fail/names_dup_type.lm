@@ -1,0 +1,5 @@
+// Types and modules share one namespace: both start paths (`m.T`, `T.f`).
+import std.parse;
+struct parse { x: i64 }
+fn main() {}
+// error: `parse` is defined more than once

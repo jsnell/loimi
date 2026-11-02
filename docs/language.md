@@ -277,6 +277,38 @@ would replace every use of that name in the body.
 `import std.gc.{Gc, Heap};`. `extern "C" fn` declares C functions, and
 `export "C"` exposes Loimi functions, which matters for embedding.
 
+**Namespaces.** A module's names live in two namespaces:
+
+- **types and modules**: structs, enums, `value` and `object` types,
+  type aliases, traits, vms, and imported modules (`import std.parse;`
+  binds `parse`). These are what type positions and the head of a path
+  see: `T`, `m.T`, `T.f(..)`, `T.Variant`, `T { .. }`, `m.f(..)`;
+- **values**: functions, consts and globals.
+
+A function may share its name with a type or module, so `fn parse(..)`
+can sit next to `import std.parse;`, and `struct Point` next to
+`fn Point(..)`. Two types, a type and a module, two values, or a const or
+global and a type or module with one name are an error ("defined more
+than once"): a const or global can be the head of `x.y` (`ORIGIN.x`),
+which would be ambiguous. `import m.{x}` imports whatever `m` binds as
+`x` in either namespace.
+
+How a name is resolved depends on where it is:
+
+- a local variable always wins;
+- `x(..)` and `x` in an expression name a value. If there is none, `x`
+  may be a variant of the expected type (`Arr(a)` where a `Value` is
+  expected, even with `object Arr` imported: a type is never a value),
+  and otherwise it is an error;
+- in `x.y`, `x` is looked up among types and modules first: with both
+  `fn parse` and `import std.parse`, `parse.Prec` is the module's struct
+  (a function has no fields, so nothing is lost);
+- patterns resolve variant names against the type being matched, so
+  they are not affected by items in scope.
+
+Enum and `value` variants are not module items: bare `Arr(..)` or
+`Nil` is found through the expected type (or written `Value.Arr(..)`).
+
 ---
 
 ## 2. `value` types: declared representations

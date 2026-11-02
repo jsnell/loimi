@@ -419,10 +419,10 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         }
         let fid = new_fn(c, format!("{}.{}", prefix, e.name.name), e.name.name.clone(), pt, ret.clone(), CallConv::C, vm, VmRole::Entry, e.name.span);
         let gname = Ident { name: format!("{}__{}", d.name.name, e.name.name), span: e.name.span };
-        if c.scopes[m].contains_key(&gname.name) {
+        if c.scopes[m].contains_key(&gname.name) || c.values[m].contains_key(&gname.name) {
             return Err(Diag::new(e.name.span, format!("`{}` clashes with a generated vm item", e.name.name)));
         }
-        c.scopes[m].insert(gname.name, (Def::Fn(fid), d.is_pub));
+        c.define(m, &gname, Def::Fn(fid), d.is_pub)?;
         entries.push((fid, e.clone()));
     }
     let raise_fid = match &d.on_raise {

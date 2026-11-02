@@ -118,7 +118,14 @@ impl FnCx {
 pub struct Checker<'a> {
     pub prog: Program,
     pub modules: &'a [Module],
+    /// Per module, the items by name: types, modules, vms, traits, and
+    /// values (functions, consts, globals) whose name is not also one of
+    /// those. This is what paths (`m.T`, `T.f`) and type positions see.
     pub scopes: Vec<HashMap<String, (Def, bool)>>,
+    /// Per module, the values by name: functions, consts and globals. A
+    /// value may share its name with a type or module (`fn parse` next to
+    /// `import std.parse`); expressions that name a value look here.
+    pub values: Vec<HashMap<String, (Def, bool)>>,
     pub methods: HashMap<(Ty, String), FnId>,
     pub consts: Vec<ConstInfo>,
     pub global_decls: Vec<(usize, GlobalDecl)>,
@@ -196,6 +203,7 @@ impl<'a> Checker<'a> {
             prog: Program::default(),
             modules,
             scopes: vec![HashMap::new(); modules.len()],
+            values: vec![HashMap::new(); modules.len()],
             methods: HashMap::new(),
             consts: vec![],
             global_decls: vec![],
@@ -218,12 +226,40 @@ impl<'a> Checker<'a> {
 
     // ── declaration collection ──────────────────────────────────────
 
-    fn define(&mut self, m: usize, name: &Ident, def: Def, is_pub: bool) -> Res<()> {
-        if self.scopes[m].contains_key(&name.name) {
-            return Err(Diag::new(name.span, format!("`{}` is defined more than once", name.name)));
+    /// Bind `name` in module `m`. Values (functions, consts, globals) and
+    /// the rest (types, modules, vms, traits) are separate namespaces: a
+    /// name may be bound once in each (language.md §1.5).
+    pub fn define(&mut self, m: usize, name: &Ident, def: Def, is_pub: bool) -> Res<()> {
+        let dup = || Err(Diag::new(name.span, format!("`{}` is defined more than once", name.name)));
+        // A const or global may have fields (`ORIGIN.x`), which would be
+        // ambiguous with a path through a type or module of its name.
+        let has_fields = |d: &Def| matches!(d, Def::Const(_) | Def::Global(_));
+        if is_value_def(&def) {
+            if self.values[m].contains_key(&name.name) {
+                return dup();
+            }
+            if has_fields(&def) && self.scopes[m].contains_key(&name.name) {
+                return dup();
+            }
+            self.values[m].insert(name.name.clone(), (def.clone(), is_pub));
+            if !self.scopes[m].contains_key(&name.name) {
+                self.scopes[m].insert(name.name.clone(), (def, is_pub));
+            }
+        } else {
+            if self.scopes[m].get(&name.name).is_some_and(|(d, _)| !is_value_def(d)) {
+                return dup();
+            }
+            if self.values[m].get(&name.name).is_some_and(|(d, _)| has_fields(d)) {
+                return dup();
+            }
+            self.scopes[m].insert(name.name.clone(), (def, is_pub));
         }
-        self.scopes[m].insert(name.name.clone(), (def, is_pub));
         Ok(())
+    }
+
+    /// The value (function, const, global) named `name` in module `m`.
+    pub fn value_def(&self, m: usize, name: &str) -> Option<(Def, bool)> {
+        self.values[m].get(name).cloned()
     }
 
     pub fn run(&mut self) -> Res<()> {
@@ -358,13 +394,22 @@ impl<'a> Checker<'a> {
                         }
                         Some(names) => {
                             for n in names {
-                                let (def, is_pub) = self.scopes[target].get(&n.name).cloned().ok_or_else(|| {
-                                    Diag::new(n.span, format!("`{}` not found in module `{}`", n.name, path.join(".")))
-                                })?;
-                                if !is_pub {
+                                // Both the value and the type or module of
+                                // that name, if the module has both.
+                                let value = self.values[target].get(&n.name).cloned();
+                                let other = self.scopes[target].get(&n.name).cloned().filter(|(d, _)| !is_value_def(d));
+                                if value.is_none() && other.is_none() {
+                                    return Err(Diag::new(n.span, format!("`{}` not found in module `{}`", n.name, path.join("."))));
+                                }
+                                let found: Vec<(Def, bool)> = value.into_iter().chain(other).collect();
+                                if found.iter().all(|(_, p)| !p) {
                                     return Err(Diag::new(n.span, format!("`{}` is private", n.name)));
                                 }
-                                self.define(m, n, def, false)?;
+                                for (def, is_pub) in found {
+                                    if is_pub {
+                                        self.define(m, n, def, false)?;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1742,7 +1787,7 @@ impl<'a> Checker<'a> {
     /// Checks only on probes, so `cx` is unaffected.
     fn guess_ty(&mut self, cx: &FnCx, e: &Expr) -> Ty {
         let hole = Ty::Param(HOLE);
-        let unshadowed = |c: &Self, n: &str| cx.lookup(n).is_none() && !c.scopes[cx.module].contains_key(n);
+        let unshadowed = |c: &Self, n: &str| cx.lookup(n).is_none() && !c.values[cx.module].contains_key(n);
         match &e.kind {
             ExprKind::Block(b) | ExprKind::Unsafe(b) => {
                 let Some(Stmt::Expr { expr: tail, semi: false }) = b.stmts.last() else {
@@ -1999,16 +2044,21 @@ impl<'a> Checker<'a> {
                 _ => Err(Diag::new(span, "cannot infer the type of `None`")),
             };
         }
-        if let Some((def, _)) = self.scopes[cx.module].get(name).cloned() {
+        if let Some((def, _)) = self.value_def(cx.module, name) {
             if let Def::GenericFn(g) = def {
                 return self.generic_fn_value(g, exp, span);
             }
             return self.def_value(def, name, span);
         }
+        // Types are not values: a variant of the expected type may have the
+        // name of a type in scope (`Arr(..)` with `object Arr` imported).
         if let Some(t) = exp {
             if let Some(idx) = self.variant_index(t, name) {
                 return self.make_variant(cx, t, idx, &[], span);
             }
+        }
+        if let Some((def, _)) = self.scopes[cx.module].get(name).cloned() {
+            return self.def_value(def, name, span);
         }
         Err(Diag::new(span, format!("unknown name `{}`", name)))
     }
@@ -2095,7 +2145,7 @@ impl<'a> Checker<'a> {
             return self.def_value(def, &name.name, span);
         }
         if let Some(m) = self.module_path(cx, base) {
-            let Some((def, is_pub)) = self.scopes[m].get(&name.name).cloned() else {
+            let Some((def, is_pub)) = self.value_def(m, &name.name).or_else(|| self.scopes[m].get(&name.name).cloned()) else {
                 return Err(Diag::new(name.span, format!("`{}` not found in module", name.name)));
             };
             if !is_pub {
@@ -2247,14 +2297,14 @@ impl<'a> Checker<'a> {
         let (name, g, recv): (&Ident, u32, Option<TExpr>) = match &inner.kind {
             ExprKind::Ident(n) if cx.lookup(n).is_none() => {
                 let id = Ident { name: n.clone(), span: inner.span };
-                match self.scopes[cx.module].get(n).cloned() {
+                match self.value_def(cx.module, n) {
                     Some((Def::GenericFn(g), _)) => return self.explicit_call(cx, &id, g, explicit, None, args, exp, span),
                     _ => return Err(Diag::new(inner.span, format!("`{}` is not a generic function", n))),
                 }
             }
             ExprKind::Field(base, name) => {
                 if let Some(m) = self.module_path(cx, base) {
-                    return match self.scopes[m].get(&name.name).cloned() {
+                    return match self.value_def(m, &name.name) {
                         Some((Def::GenericFn(g), true)) => self.explicit_call(cx, name, g, explicit, None, args, exp, span),
                         Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
                         _ => Err(Diag::new(name.span, format!("`{}` is not a generic function", name.name))),
@@ -2303,13 +2353,13 @@ impl<'a> Checker<'a> {
     /// names, if any: `f`, `mod.f`, `Type.f`, `mod.Type.f`.
     pub fn generic_fn_named(&self, cx: &FnCx, e: &Expr) -> Res<Option<(u32, Ident)>> {
         match &e.kind {
-            ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.scopes[cx.module].get(n) {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.values[cx.module].get(n) {
                 Some((Def::GenericFn(g), _)) => Ok(Some((*g, Ident { name: n.clone(), span: e.span }))),
                 _ => Ok(None),
             },
             ExprKind::Field(base, name) => {
                 if let Some(m) = self.module_path(cx, base) {
-                    return match self.scopes[m].get(&name.name) {
+                    return match self.values[m].get(&name.name) {
                         Some((Def::GenericFn(g), true)) => Ok(Some((*g, name.clone()))),
                         Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
                         _ => Ok(None),
@@ -2377,7 +2427,7 @@ impl<'a> Checker<'a> {
         match &callee.kind {
             ExprKind::TypeArgs(inner, targs) => return self.call_type_args(cx, inner, targs, args, exp, span),
             ExprKind::Ident(name) if cx.lookup(name).is_none() => {
-                if let Some((Def::GenericFn(g), _)) = self.scopes[cx.module].get(name).cloned() {
+                if let Some((Def::GenericFn(g), _)) = self.value_def(cx.module, name) {
                     return self.generic_call(cx, g, vec![], vec![], args, exp, span);
                 }
                 if let Some(r) = self.builtin_call(cx, name, args, exp, span)? {
@@ -2405,7 +2455,7 @@ impl<'a> Checker<'a> {
                     let idx = if name == "Ok" { 0 } else { 1 };
                     return self.make_variant(cx, &t.clone(), idx, args, span);
                 }
-                if self.scopes[cx.module].get(name).is_none() && !crate::vmcheck::is_vm_fn(self, cx, name) {
+                if self.value_def(cx.module, name).is_none() && !crate::vmcheck::is_vm_fn(self, cx, name) {
                     if let Some(t) = exp {
                         if let Some(idx) = self.variant_index(t, name) {
                             return self.make_variant(cx, &t.clone(), idx, args, span);
@@ -2419,7 +2469,7 @@ impl<'a> Checker<'a> {
             ExprKind::DotVariant(name) => return self.variant_ctor_expected(cx, name, args, exp, span),
             ExprKind::Field(base, name) => {
                 if let Some(m) = self.module_path(cx, base) {
-                    if let Some((Def::GenericFn(g), is_pub)) = self.scopes[m].get(&name.name).cloned() {
+                    if let Some((Def::GenericFn(g), is_pub)) = self.value_def(m, &name.name) {
                         if !is_pub {
                             return Err(Diag::new(name.span, format!("`{}` is private", name.name)));
                         }
@@ -2731,7 +2781,7 @@ impl<'a> Checker<'a> {
     }
 
     fn builtin_call(&mut self, cx: &mut FnCx, name: &str, args: &[Expr], _exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
-        if self.scopes[cx.module].contains_key(name) {
+        if self.value_def(cx.module, name).is_some() {
             return Ok(None);
         }
         if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
@@ -3009,6 +3059,11 @@ fn value_span(e: &TExpr) -> Span {
         TK::Block(_, Some(t)) if t.ty == e.ty => value_span(t),
         _ => e.span,
     }
+}
+
+/// Functions, consts and globals live in the value namespace.
+pub fn is_value_def(d: &Def) -> bool {
+    matches!(d, Def::Fn(_) | Def::GenericFn(_) | Def::Const(_) | Def::Global(_))
 }
 
 pub fn placeholder_fn(span: Span) -> FnDef {

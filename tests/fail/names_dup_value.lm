@@ -1,0 +1,5 @@
+// Values (functions, consts, globals) share one namespace.
+const parse: i64 = 1;
+fn parse() {}
+fn main() {}
+// error: `parse` is defined more than once
