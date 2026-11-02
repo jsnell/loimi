@@ -131,6 +131,90 @@ fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Value uses gc {
     Value.Str(value.new_str(&m.heap, m.tmp.as_str()))
 }
 
+/// The stack effect of instruction `w`: (pops, pushes), or None for an
+/// opcode the compiler never emits before verification (superinstructions).
+fn stack_effect(w: u32, words: *mem.Vec<*Word>) -> ?(i32, i32) {
+    let op = Stak.opcode(w);
+    if op == Stak.OP_PUSHI or op == Stak.OP_PUSHK or op == Stak.OP_PUSHNIL or op == Stak.OP_PUSHBOOL
+        or op == Stak.OP_LGET or op == Stak.OP_GGET { return Some((0, 1)); }
+    if op == Stak.OP_DUP { return Some((1, 2)); }
+    if op == Stak.OP_DROP or op == Stak.OP_LSET or op == Stak.OP_GSET or op == Stak.OP_JZ
+        or op == Stak.OP_PRINT or op == Stak.OP_DOT { return Some((1, 0)); }
+    if op == Stak.OP_SWAP { return Some((2, 2)); }
+    if op == Stak.OP_OVER or op == Stak.OP_TUCK { return Some((2, 3)); }
+    if op == Stak.OP_ROT { return Some((3, 3)); }
+    if op == Stak.OP_DUP2 { return Some((2, 4)); }
+    if op == Stak.OP_DROP2 or op == Stak.OP_DO { return Some((2, 0)); }
+    if op == Stak.OP_NIP or op == Stak.OP_ADD or op == Stak.OP_SUB or op == Stak.OP_MUL or op == Stak.OP_DIV
+        or op == Stak.OP_MOD or op == Stak.OP_LT or op == Stak.OP_LE or op == Stak.OP_GT or op == Stak.OP_GE
+        or op == Stak.OP_EQ or op == Stak.OP_NE or op == Stak.OP_AND or op == Stak.OP_OR
+        or op == Stak.OP_CONCAT or op == Stak.OP_AT { return Some((2, 1)); }
+    if op == Stak.OP_NEG or op == Stak.OP_ABS or op == Stak.OP_NOT or op == Stak.OP_TOSTR or op == Stak.OP_LEN
+        or op == Stak.OP_ARRAY or op == Stak.OP_SQRT or op == Stak.OP_TOINT { return Some((1, 1)); }
+    if op == Stak.OP_STORE { return Some((3, 0)); }
+    if op == Stak.OP_JMP or op == Stak.OP_LOOP or op == Stak.OP_RET or op == Stak.OP_HALT or op == Stak.OP_CR {
+        return Some((0, 0));
+    }
+    if op == Stak.OP_MKARRAY { return Some((Stak.N_x(w) as i32, 1)); }
+    if op == Stak.OP_CALL {
+        let callee = words.at(Stak.N_x(w));
+        return Some((callee.nin as i32, callee.nout as i32));
+    }
+    None
+}
+
+/// The verifier's stack check: every path through `code` keeps the data
+/// stack between 0 and the word's declared maximum, paths that meet agree
+/// on the depth, and RET leaves exactly the word's outputs. This is what
+/// lets the handlers pop and push without checks. (Loimi's verifier does
+/// not compute stack effects itself yet; this is the hand-written stand-in.)
+pub fn check_stack(code: []u32, word: *Word, words: *mem.Vec<*Word>) -> bool {
+    let n = code.len;
+    let depth: *i32 = mem.alloc(n);
+    defer mem.release(depth);
+    for i in 0..n { depth[i] = -1; }
+    var work: mem.Vec<u64> = mem.Vec.new();
+    defer work.free();
+    let max = (word.nin + word.maxdepth) as i32;
+    depth[0] = word.nin as i32;
+    work.push(0);
+    while let Some(i) = work.pop() {
+        let w = code[i];
+        let op = Stak.opcode(w);
+        let Some((pops, pushes)) = stack_effect(w, words) else { return false; };
+        let d = depth[i];
+        if d < pops { return false; }
+        let nd = d - pops + pushes;
+        if nd > max { return false; }
+        if op == Stak.OP_HALT { continue; }
+        if op == Stak.OP_RET {
+            if d != word.nout as i32 { return false; }
+            continue;
+        }
+        var succ: [u64; 2] = [0, 0];
+        var ns = 0;
+        if let Some(off) = Stak.label(w) {
+            succ[0] = (i as i64 + off) as u64;
+            ns = 1;
+        }
+        if op != Stak.OP_JMP {
+            succ[ns] = i + Stak.op_size(w);
+            ns += 1;
+        }
+        for k in 0..ns {
+            let j = succ[k];
+            if j >= n { return false; }
+            if depth[j] < 0 {
+                depth[j] = nd;
+                work.push(j);
+            } else if depth[j] != nd {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[require_verified]
 pub vm Stak {
     context ctx: *Machine;
@@ -139,7 +223,10 @@ pub vm Stak {
     // defined.
     state { pc: *u32, sp: *Value, tos: Value, lp: *Value, fp: *Frame }
 
-    verify_context word: *Word, nglobals: u32, nconsts: u32, nwords: u32;
+    verify_context word: *Word, nglobals: u32, nconsts: u32, words: *mem.Vec<*Word>;
+
+    /// Stack depths (see `check_stack`).
+    verify stack { check_stack(code, word, words) }
 
     operand imm = it;
     operand kst = ctx.consts[it] verify (it as u32) < nconsts display "k{}";
@@ -147,7 +234,7 @@ pub vm Stak {
     /// A `do` loop's index slot; the limit is in the slot after it.
     operand dslot = lp[it] verify (it as u32) + 1 < word.nlocals display "l{}";
     operand glob = ctx.globals[it] verify (it as u32) < nglobals display "g{}";
-    operand wref = it verify (it as u32) < nwords display "w{}";
+    operand wref = it verify it < words.len display "w{}";
     operand cnt = it;
     operand label = pc + it verify is_insn_boundary(pc + it);
 

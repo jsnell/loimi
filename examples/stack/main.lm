@@ -31,7 +31,7 @@ fn disassemble(prog: *Program) {
 }
 
 fn verify(w: *Word, prog: *Program) -> bool {
-    match Stak.verify(w.words, w, prog.nglobals, prog.consts.len as u32, prog.words.len as u32) {
+    match Stak.verify(w.words, w, prog.nglobals, prog.consts.len as u32, &prog.words) {
         Ok(v) => { w.code = Stak.optimize(v); true }
         Err(e) => {
             var b = text.StrBuf.new();
