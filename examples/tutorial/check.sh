@@ -1,0 +1,80 @@
+#!/bin/bash
+# Build and test every step of the tutorial.
+#
+#   examples/tutorial/check.sh [-u] [stepN ...]
+#
+# For each step, main.lm is built (once per dispatch mode if the step
+# declares a vm) and run on every tests/NAME.expected: with tests/NAME.pip
+# as its argument if that file exists, plus the words in tests/NAME.args.
+# stdout and stderr together must equal NAME.expected; tests named err_*
+# must exit with a nonzero status, the others with 0. Steps whose main.lm
+# understands `--gc-stress` run every test a second time with it.
+# Programs run in their step's directory, so paths in messages are short.
+#
+# -u rewrites the .expected files from the tailcall build's output.
+# Run by `cargo test` (tests/golden.rs, tutorial_steps).
+
+set -u
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+LOIMI=${LOIMI:-$ROOT/target/release/loimi}
+export LOIMI_STD=${LOIMI_STD:-$ROOT}
+UPDATE=0
+if [ "${1:-}" = "-u" ]; then UPDATE=1; shift; fi
+STEPS=("$@")
+if [ ${#STEPS[@]} -eq 0 ]; then
+    for d in "$ROOT"/examples/tutorial/step*/; do STEPS+=("$(basename "$d")"); done
+fi
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+FAIL=0
+COUNT=0
+
+for step in "${STEPS[@]}"; do
+    dir=$ROOT/examples/tutorial/$step
+    modes=(tailcall)
+    if grep -qE '^(pub )?vm ' "$dir"/*.lm; then modes=(tailcall goto switch); fi
+    stress=0
+    if grep -q -- '--gc-stress' "$dir/main.lm"; then stress=1; fi
+    for mode in "${modes[@]}"; do
+        exe=$TMP/$step-$mode
+        if ! (ulimit -v 2500000; "$LOIMI" build "$dir/main.lm" --dispatch="$mode" -o "$exe") > "$TMP/build.log" 2>&1; then
+            echo "FAIL $step ($mode): build failed"
+            cat "$TMP/build.log"
+            FAIL=1
+            continue
+        fi
+        for exp in "$dir"/tests/*.expected; do
+            name=$(basename "$exp" .expected)
+            args=()
+            [ -f "$dir/tests/$name.pip" ] && args+=("tests/$name.pip")
+            [ -f "$dir/tests/$name.args" ] && read -r -a extra < "$dir/tests/$name.args" && args+=("${extra[@]}")
+            runs=(normal)
+            [ $stress = 1 ] && runs+=(stress)
+            for run in "${runs[@]}"; do
+                a=("${args[@]}")
+                [ "$run" = stress ] && a+=(--gc-stress)
+                out=$(cd "$dir" && ulimit -v 2500000 && "$exe" "${a[@]}" 2>&1)
+                status=$?
+                COUNT=$((COUNT + 1))
+                label="$step/$name ($mode${run/normal/})"
+                if [ $UPDATE = 1 ] && [ "$mode" = tailcall ] && [ "$run" = normal ]; then
+                    printf '%s\n' "$out" > "$exp"
+                fi
+                if [ "$out" != "$(cat "$exp")" ]; then
+                    echo "FAIL $label: output differs"
+                    diff <(printf '%s\n' "$out") "$exp" | head -20
+                    FAIL=1
+                elif [[ $name == err_* ]] && [ $status = 0 ]; then
+                    echo "FAIL $label: exit status 0, expected an error"
+                    FAIL=1
+                elif [[ $name != err_* ]] && [ $status != 0 ]; then
+                    echo "FAIL $label: exit status $status"
+                    FAIL=1
+                fi
+            done
+        done
+    done
+done
+
+if [ $FAIL = 0 ]; then echo "ok: $COUNT runs"; fi
+exit $FAIL

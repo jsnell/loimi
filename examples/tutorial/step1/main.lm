@@ -1,0 +1,88 @@
+// Step 1: the core language in one file (plus a module).
+//
+//   loimi run examples/tutorial/step1/main.lm
+
+import std.io;
+import std.mem;
+import std.text;
+import shapes;
+import shapes.{Point, Shape};
+
+// Functions. The last expression of a block is its value.
+fn fib(n: i64) -> i64 {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+// `?T` is an option. Slices (`[]T`) carry their length and are
+// bounds-checked.
+fn find(xs: []i64, want: i64) -> ?u64 {
+    for i in 0..xs.len {
+        if xs[i] == want { return Some(i); }
+    }
+    None
+}
+
+// Errors are values: `Result<T, E>`, and `?` returns the error early.
+fn digit(c: u8) -> Result<i64, str> {
+    if c >= '0' and c <= '9' { Ok((c - '0') as i64) } else { Err("not a digit") }
+}
+
+fn parse_number(s: str) -> Result<i64, str> {
+    var n: i64 = 0;
+    for i in 0..s.len {
+        n = n * 10 + digit(s[i])?;
+    }
+    Ok(n)
+}
+
+fn show_parse(s: str) {
+    match parse_number(s) {
+        Ok(n) => { io.print("parsed "); io.print_int(n); io.println(""); }
+        Err(msg) => { io.print("error: "); io.println(msg); }
+    }
+}
+
+fn main() {
+    io.println("hello from step 1");
+
+    // `let` is immutable, `var` is mutable; types are inferred locally.
+    let n = 20;
+    var total = 0;
+    var i = 0;
+    while i < 10 { total += i; i += 1; }
+    io.print_int(fib(n)); io.print(" "); io.print_int(total); io.println("");
+
+    // Structs, methods and enums from the `shapes` module.
+    var p = Point { x: 3.0, y: 4.0 };
+    io.print_f64(p.norm2()); io.println("");
+    io.print_f64(shapes.area(Shape.Rect(2.0, 3.5))); io.println("");
+    io.print_f64(shapes.area(.Circle(1.0))); io.println("");
+
+    // Options and `if let`.
+    let xs = [5, 7, 9, 11];
+    if let Some(at) = find(xs[..], 9) { io.print("9 is at "); io.print_int(at as i64); io.println(""); }
+    if find(xs[..], 4).is_none() { io.println("4 is missing"); }
+
+    show_parse("1234");
+    show_parse("12x4");
+
+    // Integer arithmetic traps on overflow in debug builds; the checked
+    // forms return an option instead.
+    let big: i32 = 2147483647;
+    match big.add_checked(1) {
+        Some(v) => io.print_int(v as i64),
+        None => io.print("overflow"),
+    }
+    io.println("");
+
+    // Growable vectors and string buffers from the standard library.
+    // There is no destructor: free what you allocate (or use an arena).
+    var v: mem.Vec<i64> = mem.Vec.new();
+    for k in 0..5 { v.push(k * k); }
+    var b = text.StrBuf.new();
+    b.push_str("squares:");
+    for k in 0..v.len { b.push(' '); b.push_int(v.at(k)); }
+    io.println(b.as_str());
+    b.free();
+    v.free();
+}

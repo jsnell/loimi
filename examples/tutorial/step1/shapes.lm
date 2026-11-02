@@ -1,0 +1,24 @@
+// A module: every `pub` item is visible to files that `import shapes;`.
+
+/// A plain struct. Fields are laid out like a C struct.
+pub struct Point { x: f64, y: f64 }
+
+/// A method is a function whose name is qualified by the type. The first
+/// parameter is the receiver; `p.norm2()` passes `&p` automatically.
+pub fn Point.norm2(p: *Point) -> f64 { p.x * p.x + p.y * p.y }
+
+/// An enum is a tagged union: each variant can carry a payload.
+pub enum Shape {
+    Circle(f64),
+    Rect(f64, f64),
+    Empty,
+}
+
+/// `match` is exhaustive: leave out a variant and the compiler says so.
+pub fn area(s: Shape) -> f64 {
+    match s {
+        Circle(r) => 3.0 * r * r,
+        Rect(w, h) => w * h,
+        Empty => 0.0,
+    }
+}
