@@ -61,9 +61,10 @@ fn guarded(s: str, ok: bool) -> i64 {
 
 fn main() {
     let names = ["dup", "drop", "swap", "exch", "over", "rot", "a-rather-long-name-of-27b", "", "du", "dupe", "Dup", "rpt", "swapx"];
+    io.print("codes:");
     for i in 0..names.len {
-        io.print_int(code(names[i]));
         io.print(" ");
+        io.print_int(code(names[i]));
     }
     io.println("");
     let full = "abcdefghijklmnopq";
