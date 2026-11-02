@@ -453,8 +453,16 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
         let mut params = Vec::new();
         for (i, (&lid, t)) in f.params.iter().zip(f.param_tys.iter()).enumerate() {
-            let pname = format!("%p{}", i);
-            params.push(format!("{} {}", llty(p, t), pname));
+            let mut pname = format!("%p{}", i);
+            if let Ty::Block(..) = t {
+                // Code and environment arrive as two scalars, so that LLVM
+                // can specialize the function for a constant code pointer.
+                params.push(format!("ptr {}.code, ptr {}.env", pname, pname));
+                let a = self.inst(format!("insertvalue {{ ptr, ptr }} poison, ptr {}.code, 0", pname));
+                pname = self.inst(format!("insertvalue {{ ptr, ptr }} {}, ptr {}.env, 1", a, pname));
+            } else {
+                params.push(format!("{} {}", llty(p, t), pname));
+            }
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
             self.live[0].push(lid);
@@ -463,12 +471,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             params.push(x);
         }
         if let Some(caps) = &f.env {
-            // The environment: pointers to the captured locals' slots.
+            // The environment: pointers to the captured locals' slots, or
+            // (captured by value) the values themselves.
             params.insert(0, "ptr %env".to_string());
             for (i, &l) in caps.iter().enumerate() {
                 let gp = self.inst(format!("getelementptr inbounds [{} x ptr], ptr %env, i64 0, i64 {}", caps.len(), i));
-                let ptr = self.inst(format!("load ptr, ptr {}", gp));
-                self.slots[l as usize] = ptr;
+                self.slots[l as usize] = if f.env_val[i] { gp } else { self.inst(format!("load ptr, ptr {}", gp)) };
             }
         }
         crate::vmgen::handler_prologue(&mut self);
@@ -1656,6 +1664,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
     /// the captured locals' slots) in this frame.
     fn closure(&mut self, fid: FnId, caps: &[LocalId]) -> String {
         let sym = self.p().fns[fid as usize].symbol.clone();
+        let by_val = self.p().fns[fid as usize].env_val.clone();
         let env = if caps.is_empty() {
             "null".to_string()
         } else {
@@ -1664,7 +1673,13 @@ impl<'a, 'p> FnGen<'a, 'p> {
             for (i, &l) in caps.iter().enumerate() {
                 let gp = self.inst(format!("getelementptr inbounds [{} x ptr], ptr {}, i64 0, i64 {}", caps.len(), env, i));
                 let slot = self.slots[l as usize].clone();
-                self.emit(format!("store ptr {}, ptr {}", slot, gp));
+                if by_val[i] {
+                    let t = self.f().locals[l as usize].ty.clone();
+                    let v = self.load(&t, &slot);
+                    self.store(&t, &v, &gp);
+                } else {
+                    self.emit(format!("store ptr {}, ptr {}", slot, gp));
+                }
             }
             env
         };
@@ -1676,7 +1691,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
     /// the code half of a plain function used as a `block fn`.
     fn trampoline(&mut self, ps: &[Ty], r: &Ty) -> String {
         let p = self.p();
-        let lps: Vec<String> = ps.iter().map(|t| llty(p, t)).collect();
+        let lps: Vec<String> = ps.iter().map(|t| if matches!(t, Ty::Block(..)) { "ptr, ptr".to_string() } else { llty(p, t) }).collect();
         let rt = ret_llty(p, r);
         let key = format!("{} ({})", rt, lps.join(", "));
         if let Some(n) = self.cg.tramps.get(&key) {
@@ -1684,7 +1699,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
         let name = format!("@\"loimi.tramp.{}\"", self.cg.tramps.len());
         self.cg.tramps.insert(key, name.clone());
-        let formals: Vec<String> = lps.iter().enumerate().map(|(i, t)| format!("{} %a{}", t, i)).collect();
+        let formals: Vec<String> = lps
+            .iter()
+            .enumerate()
+            .map(|(i, t)| if t == "ptr, ptr" { format!("ptr %a{}.code, ptr %a{}.env", i, i) } else { format!("{} %a{}", t, i) })
+            .collect();
         let actuals = formals.join(", ");
         let mut text = format!("define internal {} {}(ptr %env{}{}) nounwind alwaysinline {{\n", rt, name, if formals.is_empty() { "" } else { ", " }, actuals);
         if rt == "void" {
@@ -1718,6 +1737,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
         }
         for a in args {
             let v = self.val(a);
+            if let Ty::Block(..) = a.ty {
+                let code = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 0", v));
+                let env = self.inst(format!("extractvalue {{ ptr, ptr }} {}, 1", v));
+                avs.push(format!("ptr {}, ptr {}", code, env));
+                continue;
+            }
             let t = self.ty(&a.ty);
             avs.push(format!("{} {}", t, v));
         }

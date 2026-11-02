@@ -169,6 +169,19 @@ impl<'a> Checker<'a> {
         // Inside a generic body checked against its bounds, nothing is kept.
         def.body = if self.traits.opaque_depth > 0 { None } else { Some(b) };
         def.effects = *eff;
+        // A `let` cannot change while the closure lives, so a small one is
+        // copied into the environment. Traced values stay by reference, in
+        // the slot the enclosing frame roots.
+        def.env_val = caps
+            .iter()
+            .map(|l| {
+                let t = &cx.locals[*l as usize].ty;
+                !cx.locals[*l as usize].mutable
+                    && crate::layout::size_of(&self.prog, t) <= 8
+                    && !crate::gcgen::is_traced(&self.prog, t)
+                    && !matches!(t, Ty::Opaque(_) | Ty::Param(_))
+            })
+            .collect();
         def.env = Some(caps.clone());
         self.prog.fns.push(def);
         Ok(mk(Ty::Block(ptys, Box::new(rty), *eff), TK::Closure(fid, caps), span))

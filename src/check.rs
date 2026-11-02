@@ -599,6 +599,9 @@ impl<'a> Checker<'a> {
             return Err(Diag::new(f.name.span, "function needs a body"));
         }
         if f.linkage != Linkage::Internal {
+            if param_tys.iter().any(|t| matches!(t, Ty::Block(..))) {
+                return Err(Diag::new(f.name.span, "C functions cannot take a `block fn`: pass a plain `fn` and a context pointer"));
+            }
             let odd = |t: &Ty| matches!(t, Ty::Int(it) if !matches!(it.bits, 8 | 16 | 32 | 64));
             if let Some(t) = param_tys.iter().chain(std::iter::once(&ret)).find(|t| odd(t)) {
                 return Err(Diag::new(
@@ -635,6 +638,7 @@ impl<'a> Checker<'a> {
             effects: effects_of(&f.attrs)?,
             sync_effects: 0,
             env: None,
+        env_val: vec![],
         };
         Ok(())
     }
@@ -3207,6 +3211,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         effects: 0,
         sync_effects: 0,
         env: None,
+        env_val: vec![],
     }
 }
 

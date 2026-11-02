@@ -328,6 +328,10 @@ pub struct FnDef {
     /// environment order. The function takes the environment pointer as
     /// a hidden first parameter, and reaches these locals through it.
     pub env: Option<Vec<LocalId>>,
+    /// Per captured local: captured by value. The environment entry holds
+    /// the value itself instead of the local's address (immutable,
+    /// untraced locals of at most 8 bytes), which saves a load per use.
+    pub env_val: Vec<bool>,
 }
 
 impl FnDef {
