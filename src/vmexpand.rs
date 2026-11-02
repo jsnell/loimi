@@ -197,56 +197,178 @@ fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
 /// uses `next`, or reads `pc` (to save a return address such as `pc + 1`),
 /// directly, in a vm function it calls, or in an op it can `become`.
 /// Code whose last instruction is one of these could run off the end.
-/// The scan is over tokens, so it errs on the side of "may continue".
+///
+/// The scan is over tokens, so it errs on the side of "may continue",
+/// with one refinement for shared slow paths such as
+/// `fn call_slow(.., tail: bool) -> never` called as `call_slow(.., true)`:
+/// a vm function is scanned once per combination of literal `true`/`false`
+/// arguments, and `if p { .. }` / `if !p { .. }` blocks that such a
+/// parameter rules out are skipped (unless the function rebinds `p`).
 fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
-    use crate::lexer::Tok;
+    use crate::lexer::{Tok, Token};
+    use std::collections::HashMap;
+
+    type Bind = Vec<Option<bool>>;
+    #[derive(Default)]
     struct Facts {
         direct: bool,
-        calls: Vec<String>,
+        calls: Vec<(String, Bind)>,
         becomes: Vec<String>,
     }
-    let scan = |b: &Block| -> Facts {
+    fn tokens(sm: &SourceMap, b: &Block) -> Option<Vec<Token>> {
         let text = &sm.files[b.span.file as usize].text[b.span.lo as usize..b.span.hi as usize];
-        let Ok(toks) = crate::lexer::lex(b.span.file, text) else {
-            return Facts { direct: true, calls: vec![], becomes: vec![] };
-        };
-        let mut f = Facts { direct: false, calls: vec![], becomes: vec![] };
-        for (i, t) in toks.iter().enumerate() {
-            let Tok::Ident(name) = &t.tok else { continue };
-            if i > 0 && toks[i - 1].tok == Tok::Punct(".") {
-                continue;
-            }
-            match (name.as_str(), toks.get(i + 1).map(|t| &t.tok)) {
-                ("next" | "pc", _) => f.direct = true,
-                ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
-                (_, Some(Tok::Punct("("))) => f.calls.push(name.clone()),
+        crate::lexer::lex(b.span.file, text).ok()
+    }
+    /// Index after the block whose `{` is at `i`.
+    fn skip_block(t: &[Token], i: usize) -> usize {
+        let mut depth = 0;
+        let mut j = i;
+        while j < t.len() {
+            match t[j].tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
                 _ => {}
             }
+            j += 1;
+        }
+        t.len()
+    }
+    /// Literal bool arguments of the call whose `(` is at `i`.
+    fn call_args(t: &[Token], i: usize) -> Bind {
+        let mut args = Vec::new();
+        let mut cur: Vec<&Tok> = Vec::new();
+        let mut depth = 0;
+        let mut j = i;
+        while j < t.len() {
+            let tok = &t[j].tok;
+            match tok {
+                Tok::Punct("(") | Tok::Punct("[") | Tok::Punct("{") => depth += 1,
+                Tok::Punct(")") | Tok::Punct("]") | Tok::Punct("}") => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 || (depth == 1 && *tok == Tok::Punct(",")) {
+                if !cur.is_empty() {
+                    args.push(match cur.as_slice() {
+                        [Tok::Ident(b)] if b == "true" => Some(true),
+                        [Tok::Ident(b)] if b == "false" => Some(false),
+                        _ => None,
+                    });
+                }
+                cur.clear();
+                if depth == 0 {
+                    break;
+                }
+            } else if j > i {
+                cur.push(tok);
+            }
+            j += 1;
+        }
+        args
+    }
+    // `params`: the names that `bind` gives values to.
+    let scan = |t: &[Token], params: &[String], bind: &Bind| -> Facts {
+        let mut known: HashMap<&str, bool> = HashMap::new();
+        for (k, p) in params.iter().enumerate() {
+            if let Some(Some(b)) = bind.get(k) {
+                known.insert(p.as_str(), *b);
+            }
+        }
+        // A parameter that is assigned or shadowed is not known.
+        for (i, tk) in t.iter().enumerate() {
+            if let Tok::Ident(name) = &tk.tok {
+                let assigned = matches!(t.get(i + 1).map(|x| &x.tok), Some(Tok::Punct("=")));
+                let shadowed = i > 0 && matches!(&t[i - 1].tok, Tok::Ident(k) if k == "let" || k == "var");
+                if assigned || shadowed {
+                    known.remove(name.as_str());
+                }
+            }
+        }
+        let mut f = Facts::default();
+        let mut i = 0;
+        while i < t.len() {
+            let Tok::Ident(name) = &t[i].tok else {
+                i += 1;
+                continue;
+            };
+            if i > 0 && t[i - 1].tok == Tok::Punct(".") {
+                i += 1;
+                continue;
+            }
+            if name == "if" {
+                // `if p {` / `if !p {` with p known: skip a block that
+                // cannot run.
+                let neg = t.get(i + 1).map(|x| &x.tok) == Some(&Tok::Punct("!"));
+                let k = if neg { i + 2 } else { i + 1 };
+                if let (Some(Tok::Ident(p)), Some(Tok::Punct("{"))) = (t.get(k).map(|x| &x.tok), t.get(k + 1).map(|x| &x.tok)) {
+                    if let Some(&b) = known.get(p.as_str()) {
+                        if b == neg {
+                            i = skip_block(t, k + 1);
+                            continue;
+                        }
+                    }
+                }
+            }
+            match (name.as_str(), t.get(i + 1).map(|x| &x.tok)) {
+                ("next" | "pc", _) => f.direct = true,
+                ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
+                (_, Some(Tok::Punct("("))) => f.calls.push((name.clone(), call_args(t, i + 1))),
+                _ => {}
+            }
+            i += 1;
         }
         f
     };
-    let fns: Vec<(String, Facts)> =
-        v.fns.iter().filter_map(|f| Some((f.name.name.clone(), scan(f.body.as_ref()?)))).collect();
-    let ops: Vec<Facts> = v.ops.iter().map(|o| scan(&o.body)).collect();
-    let calls_cont = |calls: &[String], fn_cont: &[bool]| {
-        calls.iter().any(|c| fns.iter().position(|(n, _)| n == c).is_some_and(|k| fn_cont[k]))
-    };
-    let mut fn_cont: Vec<bool> = fns.iter().map(|(_, f)| f.direct).collect();
-    let mut cont = vec![false; l.ops.len()];
+    let fn_toks: Vec<(String, Vec<String>, Option<Vec<Token>>)> = v
+        .fns
+        .iter()
+        .map(|f| {
+            let params = f.params.iter().map(|p| p.name.name.clone()).collect();
+            (f.name.name.clone(), params, f.body.as_ref().and_then(|b| tokens(sm, b)))
+        })
+        .collect();
+    // Nodes: ops (by index), then vm function instances (name, bindings).
+    let mut facts: Vec<Facts> = v
+        .ops
+        .iter()
+        .map(|o| match tokens(sm, &o.body) {
+            Some(t) => scan(&t, &[], &vec![]),
+            None => Facts { direct: true, ..Facts::default() },
+        })
+        .collect();
+    let mut inst: HashMap<(String, Bind), usize> = HashMap::new();
+    let mut k = 0;
+    while k < facts.len() {
+        let calls = facts[k].calls.clone();
+        for (name, bind) in calls {
+            let Some((_, params, toks)) = fn_toks.iter().find(|(n, _, _)| *n == name) else { continue };
+            let key = (name.clone(), bind.clone());
+            if inst.contains_key(&key) {
+                continue;
+            }
+            inst.insert(key, facts.len());
+            facts.push(match toks {
+                Some(t) => scan(t, params, &bind),
+                None => Facts { direct: true, ..Facts::default() },
+            });
+        }
+        k += 1;
+    }
+    let mut cont: Vec<bool> = facts.iter().map(|f| f.direct).collect();
     loop {
         let mut changed = false;
-        for k in 0..fns.len() {
-            if !fn_cont[k] && calls_cont(&fns[k].1.calls, &fn_cont) {
-                fn_cont[k] = true;
-                changed = true;
+        for i in 0..facts.len() {
+            if cont[i] {
+                continue;
             }
-        }
-        for (i, f) in ops.iter().enumerate() {
-            let becomes_cont = f
-                .becomes
-                .iter()
-                .any(|b| l.ops.iter().position(|o| o.name == *b && o.parts.is_empty()).is_some_and(|t| cont[t]));
-            if !cont[i] && (f.direct || calls_cont(&f.calls, &fn_cont) || becomes_cont) {
+            let f = &facts[i];
+            let c = f.calls.iter().any(|c| inst.get(c).is_some_and(|&j| cont[j]))
+                || f.becomes.iter().any(|b| v.ops.iter().position(|o| o.name.name == *b).is_some_and(|t| cont[t]));
+            if c {
                 cont[i] = true;
                 changed = true;
             }
@@ -255,12 +377,14 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
             break;
         }
     }
+    let mut out: Vec<bool> = cont[..v.ops.len()].to_vec();
+    out.resize(l.ops.len(), false);
     for (i, o) in l.ops.iter().enumerate() {
         if let Some(&last) = o.parts.last() {
-            cont[i] = cont[last];
+            out[i] = out[last];
         }
     }
-    cont
+    out
 }
 
 /// The verifier. It checks that

@@ -601,7 +601,10 @@ from the declarations. It checks:
 - code can't fall off the end: it is not empty, and its last instruction
   cannot continue past itself. An op may continue if its handler uses
   `next` or reads `pc` (to save a return address like `pc + 1`), directly,
-  in a vm function it calls, or in an op it can `become`. An op with `then`
+  in a vm function it calls, or in an op it can `become`. A vm function
+  called with literal `true`/`false` arguments is looked at per call:
+  `call_slow(base, n, true)` does not continue if `next` and `pc + 1` are
+  only under `if !tail { .. }`. An op with `then`
   that may continue (`jump pc + 2` past its JMP) needs an instruction after
   that JMP.
 

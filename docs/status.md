@@ -25,6 +25,57 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |
 | Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, the Mini scripts with and without GC stress, and a few seconds of bytecode fuzzing (below). |
 
+## Bytecode fuzzing (M5)
+
+The M5 criterion is 24 hours of bytecode fuzzing under ASan with no
+crashes. `tests/fuzz/run.sh` builds the fuzzers with `--sanitize=address`
+and runs them for a time or seed budget, saving failing seeds:
+
+- `tests/fuzz/fuzzvm.lm`: a test vm using every verifier feature
+  (register, constant and context-indexed operands, labels of three
+  widths, a call operand checked with `is_insn_boundary`, two verify
+  contexts, inline caches, families with `become`/`redo`, supers with up to
+  four parts and family-member parts, `then JMP`, `-> never` vm functions,
+  cold blocks, variants), declared once per dispatch mode. Random programs
+  (mostly well-formed, some mutated, some random words) are verified and,
+  if they pass, run in all three modes with exactly-sized heap buffers and
+  a step budget. Besides crashes it checks that the modes agree and that
+  code still verifies after running (quickening) and after `Vm.optimize`.
+- `tests/fuzz/minifuzz.lm`: random code against Mini's own `verify`
+  clauses and `Mini.run`, on a stack exactly as large as the frame.
+
+ASan works in all three dispatch modes. `--sanitize=address` turns off
+use-after-return detection: its fake-stack fallback is a dynamic alloca,
+which LLVM cannot combine with stack realignment in `preserve_none`
+functions, so tail-call builds would not compile. `musttail` survives the
+instrumentation.
+
+**Run so far: 1 h 50 min** under ASan (2026-11-02), in two sessions before
+and after the n-ary supers / `then` changes: 139M test-vm programs (51M
+verified and run in all three modes) and 9.7M Mini programs (2.6M run),
+debug and `--release` builds. `cargo test` runs a few seconds of both
+without ASan.
+
+Bugs found and fixed (regression tests in `tests/run/vm_verify_*.lm`):
+
+- Verified code could run off its end: a last instruction using `next`
+  read past the buffer, and empty code verified. The verifier now rejects
+  both (see `language.md` §6).
+- Before the n-ary super rewrite: a super's later words were checked only
+  as the declared part's operands, so after the first part quickened they
+  ran as unverified instructions; and `Vm.optimize` produced overlapping
+  supers that failed verification.
+- Found by review while fuzzing: `verify` clauses are pasted into the
+  generated verifier, whose locals shadowed verify contexts of the same
+  name (`verify_context w: u32` compared with the instruction word).
+
+Holes in Mini's verify clauses (`examples/mini/vm.lm`, not changed here;
+reproducers in `tests/fuzz/mini_holes.lm`, skipped by the fuzzer unless
+`MINIFUZZ_KNOWN=1`): CALL's `nres` lets the callee's return write past the
+stack; SETLIST's, RETN's and CONCAT's counts read past the frame; CONCAT
+with fewer than 2 values and GETINDEXI with index 0 underflow; SELF writes
+`R[a+1]` with only `a < nregs` checked.
+
 ## Differences from the design
 
 - **Collection happens only at safepoints.** Allocation never collects;

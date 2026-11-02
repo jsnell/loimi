@@ -32,6 +32,13 @@ vm V {
     op SKIP() : ABC { jump after() }
     /// A field named `next` is not the control word.
     op FIELD() : ABC { exit ctx.next }
+    /// A shared tail that continues only when `tail` is false.
+    fn call(a: i64, tail: bool) -> never {
+        if !tail { ctx.ret = pc + 1; next }
+        exit a
+    }
+    op TCALL(a: reg) : ABC { call(a, true) }
+    op NCALL(a: reg) : ABC { call(a, false) }
     /// Exits, but can become an op that continues.
     family TRY(a: reg) : ABC {
         generic { become TRY_Q; exit a }
@@ -72,6 +79,10 @@ fn main() {
     show(V.verify(c[0..3], &p));
     code[2] = V.TRY(0);
     show(V.verify(c[0..3], &p));            // TRY becomes TRY_Q, which continues
+    code[2] = V.TCALL(0);
+    show(V.verify(c[0..3], &p));            // call(_, true) never continues
+    code[2] = V.NCALL(0);
+    show(V.verify(c[0..3], &p));            // call(_, false) does
 
     var ctx = Ctx { ret: &code[0], next: 7 };
     var regs: [i64; 2] = [0; 2];
@@ -87,6 +98,8 @@ fn main() {
 // expect: ok
 // expect: ok
 // expect: bad at 2
+// expect: bad at 2
+// expect: ok
 // expect: bad at 2
 // expect: ok
 // expect: bad at 2
