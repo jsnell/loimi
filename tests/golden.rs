@@ -127,7 +127,7 @@ fn compile_errors() {
 fn mini_scripts() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-mini-{}", std::process::id()));
-    let out = loimi().arg("build").arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let mut failures = Vec::new();
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
@@ -186,7 +186,7 @@ fn mini_scripts() {
 fn mini_conformance() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}", std::process::id()));
-    let out = loimi().arg("build").arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let dir = root.join("examples/mini/tests/conformance");
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -235,7 +235,7 @@ fn mini_conformance() {
 fn scheme_programs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-scheme-{}", std::process::id()));
-    let out = loimi().arg("build").arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building scheme failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let mut failures = Vec::new();
     let mut programs: Vec<PathBuf> = std::fs::read_dir(root.join("examples/scheme/tests"))
@@ -295,7 +295,7 @@ fn scheme_programs() {
 fn minijs_programs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-minijs-{}", std::process::id()));
-    let out = loimi().arg("build").arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building minijs failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let mut programs: Vec<PathBuf> = Vec::new();
     for dir in ["examples/minijs/tests", "examples/minijs/tests/conformance"] {

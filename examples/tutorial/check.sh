@@ -3,8 +3,8 @@
 #
 #   examples/tutorial/check.sh [-u] [stepN ...]
 #
-# For each step, main.lm is built (once per dispatch mode if the step
-# declares a vm) and run on every tests/NAME.expected: with tests/NAME.pip
+# For each step, main.lm is built with `-W error` (once per dispatch mode
+# if the step declares a vm) and run on every tests/NAME.expected: with tests/NAME.pip
 # as its argument if that file exists, plus the words in tests/NAME.args.
 # If tests/NAME.main holds a name, NAME runs that program (NAME.lm in the
 # step) instead of main.lm.
@@ -42,7 +42,7 @@ for step in "${STEPS[@]}"; do
     for mode in "${modes[@]}"; do
         built=1
         for prog in "${progs[@]}"; do
-            if ! (ulimit -v 2500000; "$LOIMI" build "$dir/$prog.lm" --dispatch="$mode" -o "$TMP/$step-$mode-$prog") > "$TMP/build.log" 2>&1; then
+            if ! (ulimit -v 2500000; "$LOIMI" build -W error "$dir/$prog.lm" --dispatch="$mode" -o "$TMP/$step-$mode-$prog") > "$TMP/build.log" 2>&1; then
                 echo "FAIL $step ($mode): building $prog.lm failed"
                 cat "$TMP/build.log"
                 FAIL=1
