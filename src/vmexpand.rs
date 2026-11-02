@@ -276,10 +276,12 @@ fn maps_words(l: &VmLayout, jit: bool) -> bool {
     jit && l.word_bits == 32 && l.op_shift == 0
 }
 
-/// The opcode of the JIT's enter words: as `jitgen::enter_opcode`, the
-/// highest opcode no op uses.
-fn enter_opcode(l: &VmLayout) -> u32 {
-    (0..1u32 << l.op_bits).rev().find(|x| !l.ops.iter().any(|o| o.opcode == *x)).unwrap_or(u32::MAX)
+/// The opcode the JIT writes over instructions that have compiled code
+/// (its enter words): the highest of `op_bits` bits that no op uses
+/// (`opcodes`). None if every opcode is taken: `jitgen::jit_vm` rejects
+/// such a vm, and another vm of the program has no enter words.
+pub fn enter_opcode(op_bits: u32, opcodes: impl Iterator<Item = u32> + Clone) -> Option<u32> {
+    (0..1u32 << op_bits).rev().find(|x| !opcodes.clone().any(|o| o == *x))
 }
 
 /// Source of the real word of code word expression `e` (`e` itself
@@ -1008,12 +1010,9 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let rl = real_let(n, jw, "w");
     // `Vm.real_word(w)`: the real word of code word w (with the JIT, a
     // compiled instruction's word is an enter word; see maps_words).
-    if jw {
-        let _ = writeln!(
-            s,
-            "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {} {{ __extern_loimi_jit_word(w) }} else {{ w }} }}",
-            enter_opcode(l)
-        );
+    let enter = if jw { enter_opcode(l.op_bits, l.ops.iter().map(|o| o.opcode)) } else { None };
+    if let Some(e) = enter {
+        let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ if (w & {mask}) == {e} {{ __extern_loimi_jit_word(w) }} else {{ w }} }}");
     } else {
         let _ = writeln!(s, "{vis}fn {n}__real_word(w: {w}) -> {w} {{ w }}");
     }

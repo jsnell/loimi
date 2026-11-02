@@ -156,6 +156,9 @@ pub fn jit_vm(p: &Program) -> Result<usize, String> {
             if vd.tbl_idx.is_some() {
                 return Err(format!("--jit-stencils: vm {} has variants (not supported by the prototype)", vd.name));
             }
+            if crate::vmexpand::enter_opcode(vd.op_bits, vd.ops.iter().map(|o| o.opcode)).is_none() {
+                return Err(format!("--jit-stencils: vm {} uses every opcode; the JIT needs a free one for its enter words", vd.name));
+            }
             Ok(*v)
         }
         [] => Err("--jit-stencils: the program has no vm with tail-call dispatch".into()),
@@ -286,11 +289,10 @@ pub fn rewritable_ops(p: &Program, vd: &VmDef) -> Vec<bool> {
     vd.ops.iter().enumerate().map(|(k, o)| becomes.contains(&o.fid) || !o.parts.is_empty() || heads.contains(&(k as u32))).collect()
 }
 
-/// The opcode the JIT writes over instructions that have compiled code:
-/// the highest one no op uses.
+/// The opcode the JIT writes over instructions that have compiled code
+/// (`vmexpand::enter_opcode`; `jit_vm` checks there is one).
 pub fn enter_opcode(vd: &VmDef) -> u32 {
-    let n = 1u32 << vd.op_bits;
-    (0..n).rev().find(|x| !vd.ops.iter().any(|o| o.opcode == *x)).expect("--jit-stencils needs a free opcode")
+    crate::vmexpand::enter_opcode(vd.op_bits, vd.ops.iter().map(|o| o.opcode)).expect("jit_vm checks for a free opcode")
 }
 
 /// Matches the operand decode `vmcheck::decode` builds: (word offset,

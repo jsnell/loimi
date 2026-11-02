@@ -1,0 +1,14 @@
+// args: --jit-stencils
+// The JIT marks compiled instructions with an opcode no op uses: a vm
+// that uses all of them cannot be compiled (this used to panic).
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 2, a: 30 } }
+    op A0() : A { next }
+    op A1() : A { next }
+    op A2() : A { next }
+    op RET() : A { exit 0 }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+fn main() {}
+// error: --jit-stencils: vm V uses every opcode; the JIT needs a free one for its enter words
