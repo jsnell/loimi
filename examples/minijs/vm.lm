@@ -884,6 +884,22 @@ pub vm JS {
         branch(eq_slow(a, b) == want, then.target)
     }
 
+    /// Compare against a small integer constant and branch: R[a] < sc,
+    /// <= sc, > sc, >= sc.
+    inline for (name, icmp, fcmp, swap, oreq) in [
+        ("JLTI", xi < c, xf < c as f64, false, false), ("JLEI", xi <= c, xf <= c as f64, false, true),
+        ("JGTI", xi > c, xf > c as f64, true, false), ("JGEI", xi >= c, xf >= c as f64, true, true),
+    ] {
+        op #name(pol: imm, a: reg, sc: simm) : ABsC then JMP {
+            let want = pol != 0;
+            let c = sc as i32;
+            if let Int(xi) = a { branch(icmp == want, then.target) }
+            if let Num(xf) = a { branch(fcmp == want, then.target) }
+            let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
+            branch(r == want, then.target)
+        }
+    }
+
     /// JEQ against a constant.
     op JEQK(pol: imm, a: reg, b: kst) : ABC then JMP {
         let want = pol != 0;
@@ -1266,6 +1282,16 @@ pub vm JS {
     // Superinstructions for common pairs.
     super MOVE_MOVE = MOVE; MOVE;
     super GETPROP_IN_GETPROP_IN = GETPROP_IN; GETPROP_IN;
+    super GETLEN_JLT = GETLEN; JLT;
+    super ADDI_JLT = ADDI; JLT;
+    super MOVE_CALL = MOVE; CALL;
+    super GETMETHOD_P_CALL = GETMETHOD_P; CALL;
+    super GETGLOBAL_LOADU = GETGLOBAL; LOADU;
+    super LOADU_MOVE = LOADU; MOVE;
+    super GETINDEX_SETINDEX = GETINDEX; SETINDEX;
+    super GETPROP_IN_GETMETHOD_P = GETPROP_IN; GETMETHOD_P;
+    super MUL_F_ADD_F = MUL_F; ADD_F;
+    super MUL_F_MUL_F = MUL_F; MUL_F;
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V {
         ctx = c;

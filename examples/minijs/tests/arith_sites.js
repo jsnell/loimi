@@ -31,3 +31,15 @@ console.log(mixed2(3, 0.5), mixed2(0.5, 3), show(mixed2(-3, 0)), show(mixed2(3, 
 let seed = 42;
 for (let i = 0; i < 5; i++) { seed = (seed * 16807) % 2147483647; console.log(seed); }
 console.log(-7 % 3, show(-6 % 3), 7.5 % 2, -7.5 % 2, 2 ** 53 % 7, -(2 ** 52) % 10, 5 % -3, show(-0 % 5));
+// Branches on comparisons with small integer constants, for every kind.
+const cmpOut = [];
+for (const x of [-129, -128, -1, 0, 0.5, 1, 2.5, 3, 127, 128, NaN, "3", "x", null, undefined, true]) {
+  let bits = "";
+  if (x < 3) bits += "a"; if (x <= 3) bits += "b"; if (x > 3) bits += "c"; if (x >= 3) bits += "d";
+  if (3 < x) bits += "e"; if (-1 >= x) bits += "f"; if (!(x < -128)) bits += "g"; if (x > 127) bits += "h";
+  cmpOut.push(bits);
+}
+console.log(cmpOut.join(" "));
+let w = 0;
+while (w < 10) w += 3;
+console.log(w);
