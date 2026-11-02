@@ -222,10 +222,17 @@ fn P.atom(p: *P) -> u32 {
         p.pos += 1;
         var s = Set.empty();
         if class_escape(e, &s) { return p.class_node(s); }
+        if e == '0' and p.octal_follows() { return p.fail("octal escapes are not supported", start); }
         let Some(b) = literal_escape(e) else { return p.fail("bad escape", start); };
         return p.node(Node.Byte(b));
     }
     p.node(Node.Byte(c))
+}
+
+/// `\0` followed by an octal digit is an octal escape in Python.
+fn P.octal_follows(p: *P) -> bool {
+    let Some(c) = p.peek() else { return false };
+    c >= '0' and c <= '7'
 }
 
 fn P.class_node(p: *P, s: Set) -> u32 {
@@ -275,6 +282,7 @@ fn P.class(p: *P, start: u64) -> u32 {
             p.pos += 1;
             var cs = Set.empty();
             if class_escape(e, &cs) { s.union(&cs); continue; }
+            if e == '0' and p.octal_follows() { return p.fail("octal escapes are not supported", item_at); }
             let Some(b) = literal_escape(e) else { return p.fail("bad escape", item_at); };
             lo = b;
         }

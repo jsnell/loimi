@@ -76,3 +76,5 @@ search	a**	x
 search	a{3,2}	x
 search	\q	x
 search	[b-a]	x
+search	a\0b	xa\x00b
+search	[\0]+	\x00\x00a
