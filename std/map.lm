@@ -99,6 +99,14 @@ pub fn HashMap<K, V>.next(m: *HashMap<K, V>, at: *u64) -> ?*Slot<K, V> {
     None
 }
 
+/// Remove every entry, keeping the table's memory.
+pub fn HashMap<K, V>.clear(m: *HashMap<K, V>) {
+    if m.used == 0 { return; }
+    for i in 0..m.cap { (m.slots + i).state = EMPTY; }
+    m.len = 0;
+    m.used = 0;
+}
+
 pub fn HashMap<K, V>.free(m: *HashMap<K, V>) {
     mem.release(m.slots);
     m.len = 0;

@@ -185,12 +185,8 @@ pub fn starts_with(s: str, prefix: str) -> bool {
     s.len >= prefix.len and s[0..prefix.len].eq(prefix)
 }
 
-pub fn find(s: str, c: u8) -> ?u64 {
-    for i in 0..s.len {
-        if s[i] == c { return Some(i); }
-    }
-    None
-}
+/// Index of the first byte `c` in `s` (`mem.find_byte`).
+pub fn find(s: str, c: u8) -> ?u64 { mem.find_byte(s, c) }
 
 pub fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
 pub fn is_alpha(c: u8) -> bool { (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' }

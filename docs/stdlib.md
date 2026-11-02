@@ -102,10 +102,28 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
 - `mem.alloc<T>(n) -> *T` (zeroed; aborts when out of memory),
   `mem.grow<T>(p, n) -> *T`, `mem.release(p)`, `mem.copy(dst, src, n)`
   (overlapping allowed).
+- Byte strings (any `[]u8`, so `str` too; libc underneath):
+  `mem.find_byte(s, c) -> ?u64` (`memchr`), `rfind_byte` (`memrchr`),
+  `find_bytes(s, needle) -> ?u64` (`memmem`), `compare_bytes(a, b) -> i32`
+  (-1, 0, 1; a prefix sorts first), `equal_bytes(a, b)`. For a raw
+  pointer, `p.slice(n)` first.
 - `Vec<T> { ptr, len, cap }`: `Vec.new()`, `with_capacity(n)`,
   `reserve(extra)`, `push`, `pop -> ?T`, `get(i) -> ?T`, `at(i)`,
   `ptr_at(i)`, `set(i, x)`, `last -> ?T`, `items -> []T`,
   `truncate(n)`, `clear`, `free`, `sort_by(cmp)`.
+  **An empty `Vec` allocates nothing**: `Vec.new()` (and
+  `with_capacity(0)`) has capacity 0 and a static sentinel pointer, and
+  the first push allocates. `free()` leaves the `Vec` empty and usable
+  (freeing twice is fine). `mem.release` and `mem.grow` accept the
+  sentinel, so code that takes over `v.items().ptr` works for empty
+  vectors too; do not pass it to C's `free`.
+- **Objects with optional resources.** A `*T` field cannot be null and
+  most structs need a value for every field, so an object built before
+  its parts exist (a compiled regex that may carry an error instead)
+  needs placeholders. Make each optional part a `Vec<T>` (an empty one
+  is free to create, overwrite and drop) or a `?*T` (None until
+  allocated, released with `if let Some(p) = x.p { mem.release(p); }`),
+  never a `mem.alloc(1)` dummy, which leaks when overwritten.
 - `mem.sort_by(p, n, cmp)`: a stable merge sort; `cmp` is a
   `block fn(*T, *T) -> i32`, a closure capturing locals or a plain
   function.
@@ -131,7 +149,7 @@ allocator); `Id<T>` / `IndexVec<Id<T>, T>` typed indices; `SmallVec<T, N>`.
 - `map.HashMap<K: hash.Hash, V>` (linear probing, at most 3/4 full):
   `HashMap.new()`, `insert(k, v) -> bool` (true if the key was new),
   `get(k) -> ?V`, `get_ptr(k) -> ?*V`, `contains`, `remove -> bool`,
-  `len` (a field), iteration with
+  `len` (a field), `clear()` (keeps the table's memory), iteration with
   `var i: u64 = 0; while let Some(s) = m.next(&i) { .. s.key, s.value .. }`,
   and `free`.
 
@@ -175,7 +193,7 @@ Everything here except `HashMap` is design only:
 - `Interner`: `Interner.new()`, `intern(s) -> u32` (ids 0, 1, 2, ...;
   the string is copied into the interner's arena), `find(s) -> ?u32`,
   `name(id) -> str`, `free()`.
-- Helpers: `starts_with(s, prefix)`, `find(s, byte) -> ?u64`,
+- Helpers: `starts_with(s, prefix)`, `find(s, byte) -> ?u64` (`memchr`),
   `is_digit`, `is_alpha` (includes `_`), `is_space`, `parse_int(s) -> ?i64`
   (decimal), `parse_f64(s) -> ?f64` (C syntax, via strtod). `std.num` has
   the exact parsers with error kinds.
