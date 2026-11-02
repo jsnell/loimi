@@ -1046,7 +1046,24 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             let raw = cx.temp(raw_ty(bits, signed));
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
-            lets.push(TStmt::Let(raw, Some(decode(word, 0, bits, shift, signed, span))));
+            // A forwarding variant (`#[forward] super`): an operand linked
+            // to the register the previous part wrote is a copy of that
+            // part's field (`optimize` checked that they are equal), so
+            // LLVM sees one address and forwards the stored value instead
+            // of reloading it through memory, which takes a store-to-load
+            // round trip off a dependency chain. A copy, not the previous
+            // part's local: cold blocks decode fields again from the
+            // current word, and a copy is passed to them instead.
+            let init = match fwd.iter().find(|l| l.0 == j && l.1 == pi) {
+                Some(&(_, _, d)) => {
+                    let (dl, rt) = (prev_raws[d], raw_ty(bits, signed));
+                    let dt = cx.locals[dl as usize].ty.clone();
+                    let v = mk(dt.clone(), TK::Local(dl), span);
+                    if dt == rt { v } else { mk(rt, TK::Cast(Box::new(v)), span) }
+                }
+                None => decode(word, 0, bits, shift, signed, span),
+            };
+            lets.push(TStmt::Let(raw, Some(init)));
             operands.push((pname.clone(), kinds[pi], raw));
         }
         cx.vm = Some(HandlerCx {
@@ -1058,14 +1075,6 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
         });
         off += size;
         let raws: Vec<LocalId> = cx.vm.as_ref().unwrap().operands.iter().map(|o| o.2).collect();
-        // A forwarding variant (`#[forward] super`): the operands linked
-        // to the register the previous part wrote use that part's field
-        // (`optimize` checked that they are equal), so LLVM forwards the
-        // stored value instead of reloading it through memory. That
-        // takes a store-to-load round trip off a dependency chain.
-        for &(_, pi, d) in fwd.iter().filter(|l| l.0 == j) {
-            cx.vm.as_mut().unwrap().operands[pi].2 = prev_raws[d];
-        }
         let r = c.block(&mut cx, &body, Some(&Ty::Never));
         let b = r?;
         if b.ty != Ty::Never {

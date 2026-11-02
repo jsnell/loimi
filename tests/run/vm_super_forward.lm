@@ -26,7 +26,7 @@ vm V {
         MUL_2 { dst = a * b; next }
     }
     op ADD(dst: reg, a: reg, b: reg) : ABC {
-        if a + b > 1000 { cold { *ctx += 1; dst = 1000; next } }
+        if a + b > 1000 { cold { *ctx += 1; dst = b; next } }
         dst = a + b;
         next
     }
@@ -81,6 +81,14 @@ fn main() {
     at = V.emit.ADD(c, at, 2, 2, 2);
     at = V.emit.RET(c, at, 2);
     go(c, at);
+    // The cold path reads `b`, forwarded from a field at another position
+    // of the word: r3 = r1 + r2 > 1000, so r3 = r2.
+    at = V.emit.LOADI(c, 0, 0, 40);
+    at = V.emit.LOADI(c, at, 1, 30);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 1, 2);
+    at = V.emit.RET(c, at, 3);
+    go(c, at);
     // Not forwarded: ADD reads other registers.
     at = V.emit.LOADI(c, 0, 0, 5);
     at = V.emit.LOADI(c, at, 1, 6);
@@ -126,7 +134,8 @@ fn show(r: Result<Verified<V>, V.VerifyError>) {
 }
 // expect: MUL_ADD__f1 15 0
 // expect: MUL_ADD__f2 15 0
-// expect: MUL_ADD__f3 1000 1
+// expect: MUL_ADD__f3 600 1
+// expect: MUL_ADD__f2 1200 1
 // expect: MUL_ADD 12 0
 // expect: MUL_ADD_ADD__f1 23 0
 // expect: ok
