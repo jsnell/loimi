@@ -78,7 +78,9 @@ var KNOWN: bool = false;
 ///   - SETLIST(a, n, batch) reads R[a+1 .. a+n] past the frame;
 ///   - RETN(a, n) reads R[a .. a+n-1] past the frame;
 ///   - GETINDEXI(dst, t, i) with i = 0: `(i as u64) - 1` overflows (a
-///     panic in debug builds; release builds wrap and take the slow path).
+///     panic in debug builds; release builds wrap and take the slow path);
+///   - SELF(a: callbase, ..) writes R[a+1], but `callbase` only checks
+///     a < nregs: one register past the frame when a = nregs - 1.
 /// Every word is checked, not just instruction starts: cheap and safe.
 fn known_hole(p: Gc<Proto>) -> bool {
     let nregs = p.nregs as u32;
@@ -92,6 +94,7 @@ fn known_hole(p: Gc<Proto>) -> bool {
         if op == Mini.OP_SETLIST and a + 1 + b > nregs { return true; }
         if op == Mini.OP_RETN and a + b > nregs { return true; }
         if op == Mini.OP_GETINDEXI and c == 0 { return true; }
+        if op == Mini.OP_SELF and a + 2 > nregs { return true; }
     }
     false
 }

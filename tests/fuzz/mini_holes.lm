@@ -9,7 +9,9 @@
 //            fuzzer hit first)
 //   repro 6: GETINDEXI with index 0: `(i as u64) - 1` overflows (panics
 //            in debug builds)
-// All come from `imm` operands without `verify` clauses (nres, n, i).
+//   repro 7: SELF with a = nregs - 1 writes R[a+1], one past the frame
+//            (`callbase` checks a < nregs; SELF needs a + 1 < nregs)
+// 1-6 come from `imm` operands without `verify` clauses (nres, n, i).
 // The stack holds exactly the main frame, so ASan sees the overflow:
 //   mkdir d; ln -s $PWD/examples/mini/{value,vm,lib}.lm d/
 //   ln -s $PWD/tests/fuzz/mini_holes.lm d/
@@ -29,7 +31,7 @@ fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> Gc<Proto> {
     for i in 0..kids.len { protos.data[i] = kids[i]; }
     let p = new(h, Proto {
         name: value.new_str(h, "f"), nparams: 0, nregs: nregs, nupvals: 0,
-        consts: value.new_arr(h, 0), lines: new(h, Lines {}, code.len),
+        consts: value.new_arr(h, 1), lines: new(h, Lines {}, code.len),
         protos: protos, updesc: new(h, UpDescs {}, 0),
     }, code.len);
     for i in 0..code.len { p.code[i] = code[i]; p.lines.data[i] = 0; }
@@ -48,6 +50,11 @@ fn main() -> i32 {
         child_code[0] = if which == 1 { Mini.RET1(0) } else if which == 3 { Mini.RETN(0, 1) } else { Mini.RET0() };
         main_code[0] = Mini.CLOSURE(0, 0);
         main_code[1] = Mini.CALL(0, 0, 255);
+        main_code[2] = Mini.RET0();
+    } else if which == 7 {
+        // SELF needs a table in R[obj] to reach the write.
+        main_code[0] = Mini.NEWTABLE(0, 0, 0);
+        main_code[1] = Mini.SELF(2, 0, 0);
         main_code[2] = Mini.RET0();
     } else if which == 6 {
         main_code[0] = Mini.NEWTABLE(0, 0, 0);
