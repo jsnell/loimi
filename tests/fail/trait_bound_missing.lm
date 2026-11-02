@@ -1,0 +1,9 @@
+// The bound on HashMap's key is checked where the instance is named.
+import std.map;
+struct Key { id: u32 }
+fn Key.hash(k: Key) -> u64 { k.id as u64 }
+fn Key.eq(a: Key, b: Key) -> bool { a.id == b.id }
+fn main() {
+    var m: map.HashMap<Key, i64> = map.HashMap.new();
+}
+// error: `Key` does not implement `Hash` (needed by `HashMap<Key, i64>`)

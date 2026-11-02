@@ -25,7 +25,8 @@ pub enum TypeKind {
     Array(P<TypeExpr>, P<Expr>),
     Option(P<TypeExpr>),
     Tuple(Vec<TypeExpr>),
-    Fn(Vec<TypeExpr>, P<TypeExpr>),
+    /// `fn(A, B) -> R uses gc`: the effect, if any, is the strongest one.
+    Fn(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),
@@ -216,6 +217,8 @@ pub struct FnDecl {
     /// Type parameters: `fn f<T>(..)`, of the receiver: `fn Vec<T>.push(..)`,
     /// and of a method: `fn Cursor.op<K>(..)`.
     pub generics: Vec<Ident>,
+    /// Trait bounds per entry of `generics` (`T: hash.Hash + Show`).
+    pub bounds: Vec<Bounds>,
     /// How many of `generics` belong to the receiver type (`fn Vec<T>.map<U>`
     /// has generics `[T, U]` and `recv_generics == 1`).
     pub recv_generics: usize,
@@ -230,10 +233,30 @@ pub struct FnDecl {
     pub is_pub: bool,
 }
 
+/// The traits a type parameter must implement, as (possibly qualified) paths.
+pub type Bounds = Vec<Vec<Ident>>;
+
+/// `trait Name { fn m(a: Self) -> R; .. }`: method signatures over `Self`.
+#[derive(Clone, Debug)]
+pub struct TraitDecl {
+    pub name: Ident,
+    pub methods: Vec<FnDecl>,
+    pub is_pub: bool,
+}
+
+/// `impl Trait for Type;`
+#[derive(Clone, Debug)]
+pub struct ImplDecl {
+    pub trait_path: Vec<Ident>,
+    pub ty: TypeExpr,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct StructDecl {
     pub name: Ident,
     pub generics: Vec<Ident>,
+    pub bounds: Vec<Bounds>,
     pub is_object: bool,
     pub fields: Vec<(Ident, TypeExpr)>,
     pub is_pub: bool,
@@ -250,6 +273,7 @@ pub struct Variant {
 pub struct EnumDecl {
     pub name: Ident,
     pub generics: Vec<Ident>,
+    pub bounds: Vec<Bounds>,
     pub repr: Option<TypeExpr>,
     pub variants: Vec<Variant>,
     pub is_pub: bool,
@@ -290,6 +314,8 @@ pub enum Item {
     Const(ConstDecl),
     Global(GlobalDecl),
     Import(Import),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
     Vm(Box<crate::vmast::VmDecl>),
     Value(crate::vmast::ValueDecl),
 }

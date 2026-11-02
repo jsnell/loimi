@@ -38,6 +38,7 @@ i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 ?T              // option; ?*T is pointer-sized
 Result<T, E>
 Gc<T>           // traced reference into the GC heap (section 8)
+fn(A, B) -> R   // function pointer; `fn(A) -> R uses gc` has effects (section 5)
 ```
 
 Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
@@ -88,6 +89,31 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `(x as T) < y`.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
+- **Traits** state what a generic parameter needs:
+
+  ```loimi
+  pub trait Hash {
+      fn hash(k: Self) -> u64;
+      fn eq(a: Self, b: Self) -> bool;
+  }
+  impl Hash for Sym;          // checks that fn Sym.hash and fn Sym.eq exist
+  pub struct HashMap<K: hash.Hash, V> { .. }
+  fn show_all<T: Show + Hash>(xs: []T) { .. }
+  ```
+
+  A trait lists method signatures over `Self`. `impl Trait for Type;`
+  contains no code: it asserts that the ordinary methods `fn Type.name`
+  exist with the trait's signatures (with `Self` replaced by `Type`) and
+  no more effects than the trait declares. Bounds `T: A + B` on the type
+  parameters of structs, enums, functions and methods are checked when
+  an instance with concrete types is created, and a missing impl is
+  reported there: "`Key` does not implement `Hash` (needed by
+  `HashMap<Key, i64>`)". Inside a generic body, method calls still
+  resolve per instance, so the bound documents and checks the requirement
+  but does not change the call, which stays direct. Not yet supported:
+  default methods, generic traits and trait methods, impls for instances
+  of generic types (`impl Hash for Vec<T>`), and checking a generic body
+  against its bounds.
   Type arguments are inferred from arguments and the expected type, or given
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
@@ -430,6 +456,48 @@ Rules:
 - Syncs only happen where they are needed, so code with no effects never
   writes `pc` to memory. Saving `pc` on every instruction would add a store per
   dispatch.
+
+### Effects on function types
+
+A function type carries effects with the same syntax as a declaration:
+
+```loimi
+struct Hooks {
+    scan:  fn(*Heap, *u8),                      // no effects
+    alloc: fn(*Heap, u64) -> *u8 uses gc,       // may collect
+    call:  fn(*Interp, Value) -> Value uses reenter,
+}
+```
+
+- A function type names one effect, the strongest (`uses gc` already
+  includes `sync`). The effect of a declaration and of its value's type are
+  the same: `fn f(h: *Heap) uses gc` has type `fn(*Heap) -> () uses gc`.
+- A function value converts to a function type whose effects include its
+  own: a plain `fn(*Heap)` can be stored in a `fn(*Heap) uses gc` field,
+  but not the other way around. The conversion applies to function values
+  and `?fn` options, not behind pointers: `*fn() uses gc` and `*fn()` are
+  unrelated types, since a store through one would be read through the
+  other. Function types are otherwise compared exactly: `if c { f } else
+  { g }` with different effects may need an annotation.
+- A call through a function pointer has the effects of the pointer's type,
+  with the same rules and code as a direct call: the caller must declare
+  them (or be a handler or `cold` block, where the `sync` block runs
+  first), and a `gc` call gets a shadow-stack frame for the traced locals
+  in scope.
+- Generic code carries effects through: `T` bound to `fn() uses gc` keeps
+  the effect, and `fn(T) -> U uses gc` in a generic signature stays
+  effectful in every instance. Inference does not look at effects; the
+  argument is checked against the instantiated type afterwards. There are
+  no effect variables: a generic function takes either plain or effectful
+  callbacks, not both.
+- `uses` binds to the innermost function type: in
+  `fn get() -> fn() uses gc { .. }` the effect is part of the result type,
+  not of `get`. Parenthesize to make that explicit (`-> (fn() uses gc)`).
+  `(T)` is the same type as `T`; a one-element tuple is `(T,)`.
+- Callbacks that run while the runtime is in a fragile state have no
+  effects in their type, which makes the restriction checked: the GC's
+  root scanners run during a collection, so `Heap.add_scanner` takes a
+  `fn(*Heap, *u8)` and rejects a `uses gc` function.
 
 Because allocation fast paths are inlined (`std.gc` bump allocation) and only
 their refill path carries `uses gc`, allocating a value in a handler costs

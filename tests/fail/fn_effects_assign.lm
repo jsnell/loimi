@@ -1,0 +1,6 @@
+import std.gc;
+fn collector(h: *gc.Heap) uses gc { gc.collect(h); }
+fn main() {
+    let f: fn(*gc.Heap) = collector;
+}
+// error: this function uses gc, but the expected type `fn(*Heap) -> ()` does not allow it

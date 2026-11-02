@@ -167,7 +167,9 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
 }
 
 /// Register a root scanner: `scan(heap, data)` must `gc_mark` every
-/// reference it owns.
+/// reference it owns. Scanners (and sweepers) run during a collection, so
+/// they must not collect: their type has no effects, and a `uses gc`
+/// function cannot be registered.
 pub fn Heap.add_scanner(h: *Heap, data: *u8, scan: fn(*Heap, *u8)) {
     h.scanners.push(Scanner { data: data, scan: scan });
 }

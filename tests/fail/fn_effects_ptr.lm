@@ -1,0 +1,8 @@
+// Effects widen only for function values, not behind a pointer: a store
+// through `*fn() uses gc` could otherwise be called as a plain `fn()`.
+fn plain() {}
+fn main() {
+    var f: fn() = plain;
+    let p: *fn() uses gc = &f;
+}
+// error: mismatched types: expected `*fn() -> () uses gc`, found `*fn() -> ()`

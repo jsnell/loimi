@@ -1,0 +1,110 @@
+// matrix: dispatch
+// A handler calling through a `uses gc` function pointer runs the vm's
+// `sync` block first and roots its traced locals, as for a direct call.
+// A call through a pointer without effects does neither.
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+value V repr nanbox { Num(f64) unboxed, Int(i32), S(Gc<Str>), Nil }
+
+struct Ctx {
+    heap: gc.Heap, base: *V, top: *V, syncs: i64,
+    hook: fn(*Ctx) uses gc,
+    plain: fn(*Ctx) -> i64,
+}
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.base;
+    while p < c.top {
+        gc_mark(h, *p);
+        p = p + 1;
+    }
+}
+
+fn collect_hook(c: *Ctx) uses gc { gc.collect(&c.heap); }
+fn plain_hook(c: *Ctx) -> i64 { c.heap.count as i64 }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    sync {
+        ctx.top = regs + 8;
+        ctx.syncs += 1;
+    }
+
+    op STR(dst: reg, ch: imm) : ABC {
+        let s = new(&ctx.heap, Str {}, 1);
+        s.data[0] = ch;
+        dst = S(s);
+        next
+    }
+    op HOOK() : ABC {
+        // Only the handler local `keep` refers to r0's value during the
+        // collection.
+        let keep = regs[0];
+        regs[0] = Nil;
+        ctx.hook(ctx);
+        regs[0] = keep;
+        next
+    }
+    op COLDHOOK() : ABC {
+        if ctx.syncs >= 0 { cold { (ctx.hook)(ctx); next } }
+        next
+    }
+    op PLAIN(dst: reg) : ABC {
+        dst = Int(ctx.plain(ctx) as i32);
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32) -> V {
+        ctx = c;
+        pc = code;
+        regs = c.base;
+        jump pc
+    }
+}
+
+fn main() {
+    var ctx = Ctx {
+        heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V, syncs: 0,
+        hook: collect_hook, plain: plain_hook,
+    };
+    var regs: [V; 8] = [V.Nil; 8];
+    ctx.base = &regs[0];
+    ctx.top = &regs[0];
+    ctx.heap.add_scanner(&ctx as *u8, scan);
+    var code: [u32; 16] = [0; 16];
+    let c = code[..];
+    var at: u64 = 0;
+    at = M.emit.STR(c, at, 0, 'a');
+    at = M.emit.STR(c, at, 1, 'x');
+    at = M.emit.STR(c, at, 1, 'y');     // "x" becomes garbage
+    at = M.emit.HOOK(c, at);
+    at = M.emit.PLAIN(c, at, 2);        // r2 = live objects: "a", "y"
+    at = M.emit.STR(c, at, 1, 'z');     // "y" becomes garbage
+    at = M.emit.COLDHOOK(c, at);
+    at = M.emit.PLAIN(c, at, 3);        // r3 = live objects: "a", "z"
+    at = M.emit.RET(c, at, 0);
+    match M.run(&ctx, &code[0]) {
+        S(s) => io.println(s.data),
+        _ => io.println("?"),
+    }
+    match regs[2] { Int(n) => io.print_int(n as i64), _ => io.print("?") }
+    io.println("");
+    match regs[3] { Int(n) => io.print_int(n as i64), _ => io.print("?") }
+    io.println("");
+    io.print_int(ctx.heap.freed as i64); io.println("");
+    io.print_int(ctx.syncs); io.println("");
+}
+// expect: a
+// expect: 2
+// expect: 2
+// expect: 2
+// expect: 2

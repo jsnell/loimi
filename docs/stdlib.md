@@ -51,6 +51,11 @@ Guest-semantics helpers that are easy to get subtly wrong:
   plus a hash part, with array-part migration. Keys are `Value`s through a
   user-supplied hash/eq interface, so it works with any `value` type.
 
+**As implemented**: `std.map.HashMap<K: hash.Hash, V>` (linear probing).
+`std.hash.Hash` is a trait (`hash(k: Self) -> u64`, `eq(a: Self, b: Self)
+-> bool`) implemented for `u64`, `i64`, `u32`, `i32` and `str`; a key type
+defines both methods and declares `impl hash.Hash for Key;`.
+
 ## `std.text`
 
 - `str` (UTF-8 slice), `String` (host-owned), and `Gc<Str>`: a GC string
@@ -175,7 +180,9 @@ at run time (`infix_left(k, bp)`, `infix_right(k, bp)`, `infix(k, l, r)`,
 `before_rhs` hook (where a single-pass compiler puts the left operand in a
 register or emits the jump of `and`/`or`). Postfix operators belong in
 `atom`. A hook that needs to recurse (parentheses) reaches the table through
-a pointer in `P`. `TokenStream` and error recovery are not built. `Span` and
+a pointer in `P`. The hooks' types have no effects, so `parse` has none
+and runs from any function: hooks may allocate but not collect (collect
+between parses). `TokenStream` and error recovery are not built. `Span` and
 `SourceMap` live in `std.diag`.
 
 ## `std.diag`
@@ -246,6 +253,10 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
 - `Root<T>`, `GcVec<T>`, `Weak<T>`, finalizers (run outside the collector),
   and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
 - Stress mode, heap verification, poisoning, and heap snapshots.
+
+**As implemented**: root scanners and sweepers (`Heap.add_scanner`,
+`add_sweeper`) are `fn(*Heap, *u8)` without effects: they run during a
+collection and must not start one, so a `uses gc` function is rejected.
 
 ## `std.obj`: objects and shapes
 

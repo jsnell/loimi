@@ -1,5 +1,5 @@
-// Hash map with open addressing and linear probing. Keys need
-// `k.hash() -> u64` and `k.eq(other) -> bool` methods (see std.hash).
+// Hash map with open addressing and linear probing. Keys implement
+// `hash.Hash` (`k.hash() -> u64` and `k.eq(other) -> bool`).
 
 import std.mem;
 import std.hash;
@@ -10,7 +10,7 @@ const DELETED: u8 = 2;
 
 pub struct Slot<K, V> { key: K, value: V, state: u8 }
 
-pub struct HashMap<K, V> { slots: *Slot<K, V>, cap: u64, len: u64, used: u64 }
+pub struct HashMap<K: hash.Hash, V> { slots: *Slot<K, V>, cap: u64, len: u64, used: u64 }
 
 pub fn HashMap<K, V>.new() -> HashMap<K, V> {
     HashMap { slots: mem.alloc(8), cap: 8, len: 0, used: 0 }

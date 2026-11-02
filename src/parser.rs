@@ -357,7 +357,7 @@ impl Parser {
         if self.is_kw("struct") || self.is_kw("object") {
             let is_object = self.bump().tok == Tok::Ident("object".into());
             let name = self.ident()?;
-            let generics = self.parse_generics()?;
+            let (generics, bounds) = self.parse_generics()?;
             self.expect("{")?;
             let mut fields = Vec::new();
             while !self.is("}") {
@@ -370,11 +370,44 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Struct(StructDecl { name, generics, is_object, fields, is_pub }));
+            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub }));
+        }
+        if self.is_kw("trait") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.bump();
+            let name = self.ident()?;
+            self.expect("{")?;
+            let mut methods = Vec::new();
+            while !self.is("}") {
+                let f = self.parse_fn(Attrs::default(), Linkage::Internal, false)?;
+                if f.body.is_some() || !f.generics.is_empty() || f.recv.is_some() {
+                    return Err(Diag::new(
+                        f.name.span,
+                        "a trait method is a signature `fn name(a: Self, ..) -> R;` (no body, receiver or type parameters yet)",
+                    ));
+                }
+                methods.push(f);
+            }
+            self.expect("}")?;
+            return Ok(Item::Trait(TraitDecl { name, methods, is_pub }));
+        }
+        if self.is_kw("impl") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            let start = self.span();
+            self.bump();
+            let mut trait_path = vec![self.ident()?];
+            while self.eat(".") {
+                trait_path.push(self.ident()?);
+            }
+            self.expect_kw("for")?;
+            let ty = self.parse_type()?;
+            self.expect(";")?;
+            if is_pub {
+                return self.err("`impl` takes no `pub`: impls are visible everywhere");
+            }
+            return Ok(Item::Impl(ImplDecl { trait_path, ty, span: start.to(self.prev_span()) }));
         }
         if self.eat_kw("enum") {
             let name = self.ident()?;
-            let generics = self.parse_generics()?;
+            let (generics, bounds) = self.parse_generics()?;
             let repr = if self.eat(":") { Some(self.parse_type()?) } else { None };
             self.expect("{")?;
             let mut variants = Vec::new();
@@ -397,7 +430,7 @@ impl Parser {
                 }
             }
             self.expect("}")?;
-            return Ok(Item::Enum(EnumDecl { name, generics, repr, variants, is_pub }));
+            return Ok(Item::Enum(EnumDecl { name, generics, bounds, repr, variants, is_pub }));
         }
         if self.eat_kw("var") {
             let name = self.ident()?;
@@ -458,14 +491,16 @@ impl Parser {
     pub fn parse_fn(&mut self, attrs: Attrs, linkage: Linkage, is_pub: bool) -> Res<FnDecl> {
         self.expect_kw("fn")?;
         let first = self.ident()?;
-        let mut generics = self.parse_generics()?;
+        let (mut generics, mut bounds) = self.parse_generics()?;
         // `fn Type.name<U>` / `fn Vec<T>.name<U>`: the method's own type
         // parameters follow the receiver's.
         let mut recv_generics = 0;
         let (recv, name) = if self.eat(".") {
             recv_generics = generics.len();
             let name = self.ident()?;
-            generics.extend(self.parse_generics()?);
+            let (g, b) = self.parse_generics()?;
+            generics.extend(g);
+            bounds.extend(b);
             (Some(first), name)
         } else {
             (None, first)
@@ -500,21 +535,37 @@ impl Parser {
             }
         }
         let body = if self.eat(";") { None } else { Some(self.parse_block()?) };
-        Ok(FnDecl { name, generics, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+        Ok(FnDecl { name, generics, bounds, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
     }
 
-    fn parse_generics(&mut self) -> Res<Vec<Ident>> {
+    /// `<T, U: A + m.B>`: the parameters and the bounds of each.
+    fn parse_generics(&mut self) -> Res<(Vec<Ident>, Vec<Bounds>)> {
         let mut gs = Vec::new();
+        let mut bs = Vec::new();
         if self.eat("<") {
             while !self.is(">") {
                 gs.push(self.ident()?);
+                let mut b = Vec::new();
+                if self.eat(":") {
+                    loop {
+                        let mut path = vec![self.ident()?];
+                        while self.eat(".") {
+                            path.push(self.ident()?);
+                        }
+                        b.push(path);
+                        if !self.eat("+") {
+                            break;
+                        }
+                    }
+                }
+                bs.push(b);
                 if !self.eat(",") {
                     break;
                 }
             }
             self.expect(">")?;
         }
-        Ok(gs)
+        Ok((gs, bs))
     }
 
     // ── types ────────────────────────────────────────────────────────
@@ -584,13 +635,21 @@ impl Parser {
             }
         } else if self.eat("(") {
             let mut ts = Vec::new();
+            let mut comma = false;
             while !self.is(")") {
                 ts.push(self.parse_type()?);
-                if !self.eat(",") {
+                comma = self.eat(",");
+                if !comma {
                     break;
                 }
             }
             self.expect(")")?;
+            // `(T)` is `T` (for example `-> (fn() uses gc)`); `(T,)` is a 1-tuple.
+            if ts.len() == 1 && !comma {
+                let mut t = ts.pop().unwrap();
+                t.span = start.to(self.prev_span());
+                return Ok(t);
+            }
             TypeKind::Tuple(ts)
         } else if self.eat_kw("fn") {
             self.expect("(")?;
@@ -607,7 +666,11 @@ impl Parser {
             } else {
                 TypeExpr { kind: TypeKind::Tuple(vec![]), span: self.prev_span() }
             };
-            TypeKind::Fn(ps, Box::new(ret))
+            // `uses E` binds to the innermost function type: in
+            // `fn f() -> fn() uses gc`, the effect belongs to the result
+            // type. A function type takes one effect, since they are ordered.
+            let eff = if self.eat_kw("uses") { Some(self.ident()?) } else { None };
+            TypeKind::Fn(ps, Box::new(ret), eff)
         } else if self.eat_kw("never") {
             TypeKind::Never
         } else {

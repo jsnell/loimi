@@ -1,0 +1,7 @@
+// A generic function used as a value keeps its effects.
+import std.gc;
+fn id_gc<T>(h: *gc.Heap, x: T) -> T uses gc { gc.maybe_collect(h); x }
+fn main() {
+    let f: fn(*gc.Heap, i64) -> i64 = id_gc;
+}
+// error: this function uses gc, but the expected type `fn(*Heap, i64) -> i64` does not allow it

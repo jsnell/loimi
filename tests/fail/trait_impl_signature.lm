@@ -1,0 +1,5 @@
+trait Show { fn show(x: Self) -> i64; }
+fn i64.show(x: *i64) -> i64 { *x }
+impl Show for i64;
+fn main() {}
+// error: `i64` does not implement `Show`: `i64.show` has type `fn(*i64) -> i64`, but the trait needs `fn(i64) -> i64`

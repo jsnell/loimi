@@ -1,0 +1,9 @@
+// A scanner runs during a collection, so it must not collect: its type
+// has no effects.
+import std.gc;
+fn bad_scan(h: *gc.Heap, data: *u8) uses gc { gc.collect(h); }
+fn main() {
+    var heap = gc.Heap.new();
+    heap.add_scanner(0 as *u8, bad_scan);
+}
+// error: this function uses gc, but the expected type `fn(*Heap, *u8) -> ()` does not allow it

@@ -1,0 +1,6 @@
+// An impl's method may not have more effects than the trait declares.
+trait Visit { fn visit(x: Self) uses sync; }
+fn i64.visit(x: i64) uses gc {}
+impl Visit for i64;
+fn main() {}
+// error: `i64` does not implement `Visit`: `i64.visit` uses gc, which the trait does not allow

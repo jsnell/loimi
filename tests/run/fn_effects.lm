@@ -1,0 +1,95 @@
+// Effects on function types: calls through a `uses gc` function pointer
+// are rooted like direct calls. The heap is in stress mode, so every
+// `maybe_collect` collects; without a shadow-stack frame at the indirect
+// call, the Gc locals below would be freed (`live` prints the object
+// count, which right after a collection is the number that survived it), and `scribble` could reuse
+// their slots.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t = 0;
+    var c = l;
+    while let Some(n) = c {
+        t += n.value;
+        c = n.next;
+    }
+    t
+}
+
+fn collect_now(h: *gc.Heap) uses gc { gc.maybe_collect(h); }
+fn no_effects(h: *gc.Heap) {}
+
+fn live(h: *gc.Heap) { io.print("objects "); io.print_int(h.count as i64); io.println(""); }
+
+// Overwrite free slots: a freed Node would now read 999.
+fn scribble(h: *gc.Heap) {
+    for i in 0..200 { new(h, Node { value: 999, next: None }); }
+}
+
+fn through_param(h: *gc.Heap, f: fn(*gc.Heap) uses gc) -> i64 uses gc {
+    let a = new(h, Node { value: 1, next: None });
+    let b = new(h, Node { value: 2, next: Some(a) });
+    f(h);
+    live(h);
+    scribble(h);
+    sum(Some(b))
+}
+
+struct Hooks { before: fn(*gc.Heap) uses gc, after: ?fn(*gc.Heap) uses gc }
+
+fn through_field(h: *gc.Heap, hooks: *Hooks) -> i64 uses gc {
+    let a = new(h, Node { value: 10, next: None });
+    hooks.before(h);
+    live(h);
+    scribble(h);
+    if let Some(f) = hooks.after { f(h); }
+    live(h);
+    scribble(h);
+    a.value
+}
+
+// Generic instantiation keeps the effect of `fn(..) uses gc`.
+struct Cb<T> { f: fn(*gc.Heap, T) -> T uses gc }
+
+fn twice<T>(h: *gc.Heap, f: fn(*gc.Heap, T) -> T uses gc, x: T) -> T uses gc { f(h, f(h, x)) }
+
+fn bump(h: *gc.Heap, n: Gc<Node>) -> Gc<Node> uses gc {
+    gc.maybe_collect(h);
+    new(h, Node { value: n.value + 1, next: Some(n) })
+}
+
+fn generic(h: *gc.Heap) -> i64 uses gc {
+    let cb = Cb { f: bump };
+    let keep = new(h, Node { value: 100, next: None });
+    let n = twice(h, cb.f, new(h, Node { value: 0, next: None }));
+    scribble(h);
+    let m = (cb.f)(h, n);
+    live(h);
+    scribble(h);
+    keep.value + sum(Some(m))
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    heap.set_stress(true);
+    io.print_int(through_param(h, collect_now)); io.println("");
+    // A function without effects converts to a `uses gc` type.
+    io.print_int(through_param(h, no_effects)); io.println("");
+    var hooks = Hooks { before: collect_now, after: Some(collect_now) };
+    io.print_int(through_field(h, &hooks)); io.println("");
+    let g: fn(*gc.Heap) -> i64 uses gc = generic;
+    io.print_int(g(h)); io.println("");
+}
+// expect: objects 2
+// expect: 3
+// expect: objects 204
+// expect: 3
+// expect: objects 1
+// expect: objects 1
+// expect: 10
+// expect: objects 5
+// expect: 106

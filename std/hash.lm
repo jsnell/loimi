@@ -2,6 +2,20 @@
 
 import std.mem;
 
+/// Map keys: `HashMap<K: Hash, V>`. A type implements it by defining the
+/// methods `fn T.hash(k: T) -> u64` and `fn T.eq(a: T, b: T) -> bool` and
+/// declaring `impl hash.Hash for T;`.
+pub trait Hash {
+    fn hash(k: Self) -> u64;
+    fn eq(a: Self, b: Self) -> bool;
+}
+
+impl Hash for u64;
+impl Hash for i64;
+impl Hash for u32;
+impl Hash for i32;
+impl Hash for str;
+
 /// Mix a 64-bit value (from splitmix64).
 pub fn mix(x: u64) -> u64 {
     var z = x +% 0x9E3779B97F4A7C15;

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::check::{mk, Checker, Def, FnCx};
+use crate::check::{effect_name, mk, Checker, Def, FnCx};
 use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 use crate::vmast::*;
@@ -818,20 +818,17 @@ pub fn check_raise_ty(c: &mut Checker, cx: &mut FnCx, e: &Ty, span: Span) -> Res
     }
 }
 
-fn effect_name(e: u8) -> &'static str {
-    if e & EFF_REENTER != 0 {
-        "reenter"
-    } else if e & EFF_GC != 0 {
-        "gc"
-    } else {
-        "sync"
-    }
-}
-
 /// Check a call against the caller's effects. In handlers, effectful calls
 /// are wrapped so that codegen syncs vm state and roots traced locals.
-pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, f: FnId, call: TExpr) -> Res<TExpr> {
-    let e = c.prog.fns[f as usize].effects;
+/// The effects come from the callee's type, so direct calls and calls
+/// through function pointers are treated alike.
+pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
+    let TK::Call(f, _) = &call.kind else { unreachable!() };
+    let Ty::Fn(_, _, e) = f.ty else { unreachable!() };
+    let callee = match f.kind {
+        TK::FnRef(id) => format!("`{}`", c.prog.fns[id as usize].name),
+        _ => format!("this call through a `{}`", c.ty_name(&f.ty)),
+    };
     let missing = e & !cx.effects;
     if missing == 0 {
         return Ok(call);
@@ -851,11 +848,10 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, f: FnId, call: TExpr) -> Res
             return Ok(call);
         }
     }
-    let callee = c.prog.fns[f as usize].name.clone();
     let caller = if cx.fn_name.is_empty() { "this function".to_string() } else { format!("`{}`", cx.fn_name) };
     let eff = effect_name(missing);
     Err(Diag::new(
         span,
-        format!("`{}` uses {}, but {} does not declare it; add `uses {}` to its signature", callee, eff, caller, eff),
+        format!("{} uses {}, but {} does not declare it; add `uses {}` to its signature", callee, eff, caller, eff),
     ))
 }
