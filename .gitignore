@@ -11,3 +11,4 @@ core.*
 /bench/scheme/r7rs-benchmarks
 /bench/js/src
 /bench/js/install
+__pycache__/

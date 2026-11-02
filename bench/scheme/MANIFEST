@@ -1,8 +1,9 @@
 # Benchmark sources and reference interpreters for the Scheme example.
 # fetch.sh clones r7rs-benchmarks into bench/scheme/r7rs-benchmarks/;
-# install.sh builds chibi-scheme into bench/scheme/install/. Both are
-# gitignored: nothing from these projects is committed, only this manifest,
-# the scripts, and our own prelude/postlude/inputs for the harness.
+# install.sh builds the reference interpreters into bench/scheme/install/
+# (sources in bench/scheme/src/). All three are gitignored: nothing from
+# these projects is committed, only this manifest, the scripts, and our own
+# prelude/postlude/inputs for the harness.
 #
 # r7rs-benchmarks: Larceny's R7RS benchmarks (W. D. Clinger et al., drawn
 # from the Gabriel, Kernighan-Van Wyk and Gambit suites) as maintained by
@@ -14,7 +15,22 @@
 # redistribute any of it.
 #
 # chibi-scheme: BSD-3-Clause (COPYING in its tree). Release 0.12.
+# Gauche: BSD-3-Clause (COPYING). Release 0.9.15, the latest release.
+# SLIB: per-file public domain or permissive terms (COPYING). Release 3c3,
+# the latest; the suite's Gauche-postlude.scm imports it.
+# Guile: LGPL-3.0-or-later (LICENSE). Release 3.0.11, the latest release.
+# Guile's dependencies built here too: bdwgc 8.2.12 (MIT-style, LICENSE),
+# libunistring 1.4.2 (LGPL-3.0-or-later or GPL-2.0-or-later). GMP and
+# libffi come from the system.
 #
-# name             url                                                commit
+# The third column is the git commit for git repositories and the sha256
+# of the tarball for release tarballs.
+#
+# name             url                                                commit / sha256
 r7rs-benchmarks    https://github.com/ecraven/r7rs-benchmarks.git     85f6acdc4cc4e2b857f307ba56bd0ba931dcccd1
 chibi-scheme       https://github.com/ashinn/chibi-scheme.git         08e23be118e7de8cf29d606bc4793371c0ace680
+gauche             https://github.com/shirok/Gauche/releases/download/release0_9_15/Gauche-0.9.15.tgz   3643e27bc7c8822cfd6fb2892db185f658e8e364938bc2ccfcedb239e35af783
+slib               https://groups.csail.mit.edu/mac/ftpdir/scm/slib-3c3.tar.gz                         2803e42eba3277d40647f1074b57dd94d06274f2b6c2f622cbf127872542b76f
+bdwgc              https://github.com/bdwgc/bdwgc/releases/download/v8.2.12/gc-8.2.12.tar.gz           42e5194ad06ab6ffb806c83eb99c03462b495d979cda782f3c72c08af833cd4e
+libunistring       https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz                      5b46e74377ed7409c5b75e7a96f95377b095623b689d8522620927964a41499c
+guile              https://ftp.gnu.org/gnu/guile/guile-3.0.11.tar.xz                                   818c79d236657a7fa96fb364137cc7b41b3bdee0d65c6174ca03769559579460

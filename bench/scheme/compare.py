@@ -1,33 +1,53 @@
 #!/usr/bin/env python3
-"""Run r7rs-benchmarks programs under our Scheme (examples/scheme) and chibi.
+"""Run r7rs-benchmarks programs under our Scheme (examples/scheme) and the
+reference interpreters that bench/scheme/install.sh built.
 
-Usage: bench/scheme/compare.py [-n RUNS] [--dispatch MODE ...] [--check] [NAME ...]
+Usage: bench/scheme/compare.py [-n RUNS] [--dispatch MODE ...] [--refs REF,...]
+                               [--check] [NAME ...]
+
+The references, each used when installed: chibi, gauche, guile (Guile 3
+with its JIT) and guile-nojit (the same with GUILE_JIT_THRESHOLD=-1, i.e.
+its bytecode VM only).
 
 Each runnable program is built the way the suite's own `bench` script
 builds it: the concatenation of
 
     <impl>-prelude.scm  src/NAME.scm  src/common.scm  <impl>-postlude.scm  src/common-postlude.scm
 
-where src/ is the unmodified suite (bench/scheme/fetch.sh). Chibi uses the
-suite's own Chibi-prelude/postlude; our Scheme uses Loimi-prelude.scm and
-Loimi-postlude.scm from this directory. The program reads its parameters
-(iteration count, inputs, expected result) from stdin, from the suite's
-inputs/NAME.input with the leading values replaced as listed in INPUTS
-below, so that each run takes about 1-3 s under chibi.
+where src/ is the unmodified suite (bench/scheme/fetch.sh) and a missing
+prelude or postlude is skipped. The references use the suite's own files
+(Chibi-prelude/postlude; Gauche-postlude only; Guile-prelude only) and
+are run with the same commands as in the suite's `bench` script; Guile's
+program is compiled first with `guild compile -O3` (not timed), as there.
+Our Scheme uses Loimi-prelude.scm and Loimi-postlude.scm from this
+directory. The program reads its parameters (iteration count, inputs,
+expected result) from stdin, from the suite's inputs/NAME.input with the
+leading values replaced as listed in INPUTS below, so that each run takes
+about 1-3 s under chibi.
 
 A run passes if the benchmark's own result check passed (no "ERROR:" line)
-and its output, minus the timing lines, equals chibi's. Times are the
-minimum over RUNS runs, in seconds, of the whole process's wall-clock time
-(startup and compilation included; chibi's startup is about 0.3 s), or with
---inner of the "Elapsed time" the benchmark itself reports.
+and its output, minus the timing lines, equals that of the first reference
+(chibi when installed; our Scheme's when there is no reference). Times are
+the minimum over RUNS runs, in seconds, of the whole process's wall-clock
+time (startup and compilation included; chibi's startup is about 0.3 s),
+or with --inner of the "Elapsed time" the benchmark itself reports. The
+ratio columns are the first of our columns over each reference.
 """
-import argparse, os, re, subprocess, sys, time
+import argparse, math, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 SUITE = os.path.join(HERE, "r7rs-benchmarks")
-CHIBI = os.path.join(HERE, "install")
+INSTALL = os.path.join(HERE, "install")
 OUT = os.path.join(os.environ.get("TMPDIR", "/tmp"), "loimi-scheme-bench")
+
+# The suite's prelude and postlude for each reference (None: the suite has
+# none, so its `bench` script uses /dev/null).
+SUITE_FILES = {
+    "chibi": ("Chibi-prelude.scm", "Chibi-postlude.scm"),
+    "gauche": (None, "Gauche-postlude.scm"),
+    "guile": ("Guile-prelude.scm", None),
+}
 
 def desc(n):
     """The list (n n-1 ... 1), as takl's inputs spell it."""
@@ -144,20 +164,23 @@ def input_for(name, count=None):
     return text
 
 
-def program(name, impl):
+def program(name, kind):
+    """Write the runnable program for `kind` ("loimi" or a key of
+    SUITE_FILES) and return its path. The file is rewritten only when its
+    text changes, so that Guile's compiled code for it stays fresh."""
     src = os.path.join(SUITE, "src")
-    if impl == "chibi":
-        pre = os.path.join(src, "Chibi-prelude.scm")
-        post = os.path.join(src, "Chibi-postlude.scm")
+    if kind in SUITE_FILES:
+        pre, post = (os.path.join(src, f) if f else os.devnull for f in SUITE_FILES[kind])
     else:
         pre = os.path.join(HERE, "Loimi-prelude.scm")
         post = os.path.join(HERE, "Loimi-postlude.scm")
     parts = [pre, os.path.join(src, name + ".scm"), os.path.join(src, "common.scm"),
              post, os.path.join(src, "common-postlude.scm")]
     text = "".join(open(p).read() for p in parts)
-    path = os.path.join(OUT, f"{name}-{impl}.scm")
-    with open(path, "w") as f:
-        f.write(text)
+    path = os.path.join(OUT, f"{name}-{kind}.scm")
+    if not os.path.exists(path) or open(path).read() != text:
+        with open(path, "w") as f:
+            f.write(text)
     return path
 
 
@@ -167,6 +190,47 @@ def build_ours(dispatch):
                     os.path.join(ROOT, "examples", "scheme", "main.lm"), "--release",
                     f"--dispatch={dispatch}", "-o", exe], check=True)
     return exe
+
+
+class Impl:
+    """One column: `cmd(prog)` is the command line that runs a program;
+    `prepare(prog)`, if any, compiles it first (untimed) and returns an
+    error text or None."""
+    def __init__(self, name, kind, cmd, env=None, prepare=None):
+        self.name, self.kind, self.cmd, self.env, self.prepare = name, kind, cmd, env, prepare
+
+
+def binary(name):
+    return os.path.join(INSTALL, "bin", name)
+
+
+def references(wanted):
+    """The installed references among `wanted`, each run as the suite's
+    `bench` script runs it."""
+    env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(INSTALL, "lib"))
+    refs = []
+    for r in wanted:
+        if r == "chibi" and os.path.exists(binary("chibi-scheme")):
+            refs.append(Impl(r, r, lambda p: [binary("chibi-scheme"), "-m", "scheme.load",
+                                              "-e", f'(load "{p}")'], env))
+        elif r == "gauche" and os.path.exists(binary("gosh")):
+            refs.append(Impl(r, r, lambda p: [binary("gosh"), "-r7", "-b", p], env))
+        elif r in ("guile", "guile-nojit") and os.path.exists(binary("guile")):
+            # `guild compile` writes the .go into Guile's cache (under
+            # XDG_CACHE_HOME), where `guile prog` then finds it, as in the
+            # suite's script.
+            genv = dict(env, XDG_CACHE_HOME=os.path.join(OUT, "guile-cache"),
+                        GC_INITIAL_HEAP_SIZE="100000000")
+            if r == "guile-nojit":
+                genv["GUILE_JIT_THRESHOLD"] = "-1"
+            def compile_(p, genv=genv):
+                c = subprocess.run([binary("guild"), "compile", "-O3", p], env=genv,
+                                   capture_output=True)
+                return None if c.returncode == 0 else c.stderr.decode(errors="replace")
+            refs.append(Impl(r, "guile", lambda p: [binary("guile"), p], genv, compile_))
+        else:
+            print(f"note: {r} not installed; run bench/scheme/install.sh", file=sys.stderr)
+    return refs
 
 
 def normalize(out):
@@ -203,67 +267,77 @@ def run(cmd, stdin, runs, env=None, timeout=None, inner=False):
     return best, out, ""
 
 
+ALL_REFS = ["chibi", "gauche", "guile", "guile-nojit"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-n", type=int, default=3)
     ap.add_argument("--dispatch", nargs="*", default=["tailcall"])
+    ap.add_argument("--refs", default=",".join(ALL_REFS),
+                    help="comma-separated reference interpreters to run, of "
+                    f"{','.join(ALL_REFS)} (default: all installed; '': only ours)")
     ap.add_argument("--check", action="store_true", help="one run each, report failures in full")
     ap.add_argument("--count", type=int, help="override the iteration count (for quick checks)")
     ap.add_argument("--inner", action="store_true",
                     help="report the benchmarks' own elapsed time instead of process wall time")
     ap.add_argument("--timeout", type=float, default=300, help="seconds per run")
-    ap.add_argument("--no-chibi", action="store_true", help="run only our Scheme")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     if a.check:
         a.n = 1
+    a.refs = [r for r in a.refs.split(",") if r]
+    if set(a.refs) - set(ALL_REFS):
+        ap.error(f"--refs: unknown {', '.join(set(a.refs) - set(ALL_REFS))}")
     if not os.path.isdir(os.path.join(SUITE, "src")):
         sys.exit("bench/scheme/r7rs-benchmarks missing; run bench/scheme/fetch.sh")
     os.makedirs(OUT, exist_ok=True)
     subprocess.run(["cargo", "build", "--release", "-q"], cwd=ROOT, check=True)
-    impls = [(f"loimi-{d}", "loimi", [build_ours(d)], None) for d in a.dispatch]
-    chibi = os.path.join(CHIBI, "bin", "chibi-scheme")
-    if a.no_chibi:
-        pass
-    elif os.path.exists(chibi):
-        env = dict(os.environ, LD_LIBRARY_PATH=os.path.join(CHIBI, "lib"))
-        impls.append(("chibi", "chibi", [chibi, "-m", "scheme.load", "-e"], env))
-    else:
-        print(f"note: {chibi} missing; run bench/scheme/install.sh", file=sys.stderr)
+    ours = [Impl(f"loimi-{d}", "loimi", lambda p, exe=build_ours(d): [exe, p])
+            for d in a.dispatch]
+    refs = references(a.refs)
+    impls = ours + refs
     names = a.names or list(INPUTS)
-    print(f"{'benchmark':<12}" + "".join(f"{n:>16}" for n, _, _, _ in impls) + f"{'ours/chibi':>12}")
+    print(f"{'benchmark':<12}" + "".join(f"{i.name:>14}" for i in impls)
+          + "".join(f"{'/' + r.name:>13}" for r in refs))
     status = 0
+    ratios = {r.name: [] for r in refs}
     for b in names:
         stdin = input_for(b, a.count)
         times, outs, errs = [], [], []
-        for _, kind, cmd, env in impls:
-            prog = program(b, kind)
-            if kind == "chibi":
-                cmd = cmd + [f'(load "{prog}")']
-            else:
-                cmd = cmd + [prog]
-            t, o, e = run(cmd, stdin, a.n, env, a.timeout, a.inner)
+        for i in impls:
+            prog = program(b, i.kind)
+            err = i.prepare(prog) if i.prepare else None
+            t, o, e = (None, "", err) if err else run(i.cmd(prog), stdin, a.n, i.env,
+                                                      a.timeout, a.inner)
             times.append(t); outs.append(o); errs.append(e)
-        cells = []
-        for t, o in zip(times, outs):
-            if t is None:
-                cells.append(f"{'FAIL':>16}")
-            elif o != outs[-1]:
-                cells.append(f"{'DIFFERS':>16}")
+        # The expected output is that of the first reference that passed.
+        passed = [o for k, (t, o) in enumerate(zip(times, outs))
+                  if t is not None and k >= len(ours)]
+        expect = passed[0] if passed else outs[0]
+        ok = [t is not None and o == expect for t, o in zip(times, outs)]
+        cells = [f"{t:>13.3f}s" if good else f"{'FAIL' if t is None else 'DIFFERS':>14}"
+                 for t, good in zip(times, ok)]
+        for k, r in enumerate(refs, len(ours)):
+            if ok[0] and ok[k]:
+                ratios[r.name].append(times[0] / times[k])
+                cells.append(f"{times[0] / times[k]:>13.2f}")
             else:
-                cells.append(f"{t:>15.3f}s")
-        ratio = ""
-        if times[0] is not None and times[-1] is not None and outs[0] == outs[-1] and len(impls) > 1:
-            ratio = f"{times[0] / times[-1]:>12.2f}"
-        print(f"{b:<12}" + "".join(cells) + ratio, flush=True)
-        for (n, _, _, _), t, o, e in zip(impls, times, outs, errs):
-            if t is None or o != outs[-1]:
+                cells.append(f"{'-':>13}")
+        print(f"{b:<12}" + "".join(cells), flush=True)
+        for i, t, good, o, e in zip(impls, times, ok, outs, errs):
+            if not good:
                 status = 1
                 if a.check:
                     detail = e if t is None else o
-                    print(f"  {n}: " + "\n  ".join(detail.splitlines()[-6:]))
+                    print(f"  {i.name}: " + "\n  ".join(detail.splitlines()[-6:]))
+    if refs:
+        geo = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else float("nan")
+        print(f"{'geomean':<12}" + " " * 14 * len(impls)
+              + "".join(f"{geo(ratios[r.name]):>13.2f}" for r in refs))
     sys.exit(status)
 
 
 if __name__ == "__main__":
     main()
+
