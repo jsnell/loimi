@@ -593,18 +593,8 @@ pub fn hot_count(g: &mut FnGen, vd: &VmDef, target: &str, backward_only: bool) {
 pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut String) {
     let vd = &p.vms[vi];
     let rt = crate::vmgen::handler_ret_llty(p, vd);
-    let mut params: Vec<String> = vd.state_tys.iter().enumerate().map(|(i, t)| format!("{} %p{}", llty(p, t), i)).collect();
-    params.push("i32 %insn".into());
-    let args = params.join(", ");
-    let call = |callee: &str, insn: &str| -> String {
-        let mut a: Vec<String> = vd.state_tys.iter().enumerate().map(|(i, t)| format!("{} %p{}", llty(p, t), i)).collect();
-        a.push(format!("i32 {}", insn));
-        if rt == "void" {
-            format!("  musttail call preserve_nonecc void {}({})\n  ret void\n", callee, a.join(", "))
-        } else {
-            format!("  %r = musttail call preserve_nonecc {} {}({})\n  ret {} %r\n", rt, callee, a.join(", "), rt)
-        }
-    };
+    let args = format!("{}, i32 %insn", state_params(p, vd));
+    let call = |callee: &str, insn: &str| handler_tail(p, vd, callee, insn);
     let table = crate::vmgen::table_name(vd);
     let n = 1u32 << vd.op_bits;
     let mask = n - 1;
@@ -693,21 +683,32 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
 pub fn exit_stencil(p: &Program, vi: usize) -> String {
     let vd = &p.vms[vi];
     let rt = crate::vmgen::handler_ret_llty(p, vd);
-    let params: Vec<String> = vd.state_tys.iter().enumerate().map(|(i, t)| format!("{} %p{}", llty(p, t), i)).collect();
-    let mut a = params.clone();
-    a.push("i32 %w".into());
     let mask = (1u32 << vd.op_bits) - 1;
-    let tail = if rt == "void" {
-        format!("  musttail call preserve_nonecc void %h({})\n  ret void\n", a.join(", "))
-    } else {
-        format!("  %r = musttail call preserve_nonecc {} %h({})\n  ret {} %r\n", rt, a.join(", "), rt)
-    };
+    let tail = handler_tail(p, vd, "%h", "%w");
     format!(
         "define preserve_nonecc {rt} @\"__jit.exit\"({}, i32 %insn) nounwind {{\n  %w = load i32, ptr %p{pc}\n  %o = and i32 %w, {mask}\n  %oz = zext i32 %o to i64\n  %hp = getelementptr inbounds ptr, ptr {table}, i64 %oz\n  %h = load ptr, ptr %hp\n{tail}}}\n",
-        params.join(", "),
+        state_params(p, vd),
         pc = vd.pc_idx,
         table = crate::vmgen::table_name(vd),
     )
+}
+
+/// The parameters of a function with the handler signature of vm `vd`
+/// for its state: `%p0, %p1, ..` (the instruction word not included).
+fn state_params(p: &Program, vd: &VmDef) -> String {
+    vd.state_tys.iter().enumerate().map(|(i, t)| format!("{} %p{}", llty(p, t), i)).collect::<Vec<_>>().join(", ")
+}
+
+/// IR lines ending such a function: tail-call handler `callee` with the
+/// state parameters and instruction word `insn`, and return its result.
+fn handler_tail(p: &Program, vd: &VmDef, callee: &str, insn: &str) -> String {
+    let rt = crate::vmgen::handler_ret_llty(p, vd);
+    let a = format!("{}, i32 {}", state_params(p, vd), insn);
+    if rt == "void" {
+        format!("  musttail call preserve_nonecc void {}({})\n  ret void\n", callee, a)
+    } else {
+        format!("  %r = musttail call preserve_nonecc {} {}({})\n  ret {} %r\n", rt, callee, a, rt)
+    }
 }
 
 /// Emit every op's stencil (not supers: the JIT compiles their parts).
