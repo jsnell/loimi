@@ -270,6 +270,7 @@ fn construct_this(c: *Ctx, f: Gc<Fn>) -> V {
 }
 
 /// After `new f` returned object `o`: learn its size for later objects.
+#[inline(always)]
 fn observe(f: Gc<Fn>, o: Gc<Obj>) {
     let n = o.shape.count;
     if o.dict.is_none() and n > f.hint {
@@ -1033,15 +1034,23 @@ pub vm JS {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-            raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
+        if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         }
+        // As in CALL.
         let np = p.nparams as u64;
-        var i = nargs + 1;
-        if nargs > np { i = np + 1; }
-        while i < n {
-            callee[i] = Undef;
-            i += 1;
+        if nargs < np {
+            cold {
+                var i = nargs + 1;
+                while i <= np { callee[i] = Undef; i += 1; }
+            }
+        }
+        var q = callee + np + 1;
+        let e = callee + n;
+        while q < e {
+            q[0] = Undef;
+            q[1] = Undef;
+            q = q + 2;
         }
         fp.resume = pc + 1;
         fp = fp + 1;
@@ -1109,6 +1118,16 @@ pub vm JS {
         jump fp.resume
     }
     op RETU() : ABC {
+        // A constructor returning normally (`new` frames are common).
+        if fp.flags == rt.FR_NEW {
+            let O(o) = regs[0] else { cold { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") } };
+            observe(fp.cl, o);
+            *(regs - 1) = regs[0];
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+            jump fp.resume
+        }
         if fp.flags != 0 {
             cold {
                 var v = V.Undef;
