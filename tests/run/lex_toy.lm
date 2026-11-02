@@ -1,0 +1,133 @@
+// A complete lexer for a small Lua-like language (Mini's token set, plus
+// long strings and escapes) built from std.lex, with errors collected in a
+// std.diag sink so that lexing continues after an error.
+
+import std.io;
+import std.diag;
+import std.lex;
+import std.num;
+import std.text;
+
+// ── the lexer ───────────────────────────────────────────────────────
+
+enum T {
+    Eof, Name, Number, String,
+    And, Break, Do, Else, Elseif, End, False, For, Function, If, Local, Nil, Not, Or, Return, Then, True, While,
+    Plus, Minus, Star, Slash, Percent, Concat, Eq, Ne, Lt, Le, Gt, Ge, Assign,
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Dot, Semi,
+}
+
+struct Token { kind: T, span: diag.Span, line: u32, num: num.Number, str: str }
+
+struct Lexer { cur: lex.Cursor, ops: lex.OpTable<T>, keywords: lex.Keywords<T>, buf: text.StrBuf }
+
+fn Lexer.new(src: str, file: u32) -> Lexer {
+    var lx = Lexer { cur: lex.Cursor.new(src, file, lex.lua()), ops: lex.OpTable.new(),
+                     keywords: lex.Keywords.new(), buf: text.StrBuf.new() };
+    let kws = ["and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if",
+               "local", "nil", "not", "or", "return", "then", "true", "while"];
+    let kinds = [T.And, T.Break, T.Do, T.Else, T.Elseif, T.End, T.False, T.For, T.Function, T.If,
+                 T.Local, T.Nil, T.Not, T.Or, T.Return, T.Then, T.True, T.While];
+    for i in 0..kws.len { lx.keywords.add(kws[i], kinds[i]); }
+    let ops = ["+", "-", "*", "/", "%", "..", "==", "~=", "<", "<=", ">", ">=", "=",
+               "(", ")", "{", "}", "[", "]", ",", ".", ";"];
+    let opk = [T.Plus, T.Minus, T.Star, T.Slash, T.Percent, T.Concat, T.Eq, T.Ne, T.Lt, T.Le, T.Gt, T.Ge, T.Assign,
+               T.LParen, T.RParen, T.LBrace, T.RBrace, T.LBracket, T.RBracket, T.Comma, T.Dot, T.Semi];
+    for i in 0..ops.len { lx.ops.add(ops[i], opk[i]); }
+    lx
+}
+
+fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
+    let c = &lx.cur;
+    c.skip_trivia()?;
+    var t = Token { kind: T.Eof, span: c.span_from(c.pos), line: c.line, num: num.Number.Int(0), str: "" };
+    let start = c.pos;
+    if c.at_end() {
+    } else if let Some(name) = c.ident() {
+        t.kind = lx.keywords.get(name) ?? T.Name;
+    } else if c.at_number() {
+        t.kind = T.Number;
+        t.num = c.number()?;
+    } else if c.peek() == '"' or c.peek() == '\'' or c.long_bracket_level().is_some() {
+        t.kind = T.String;
+        lx.buf.clear();
+        if c.peek() == '[' { lx.buf.push_str(c.long_string()?); } else { c.quoted(&lx.buf)?; }
+        t.str = lx.buf.as_str();
+    } else if let Some(k) = lx.ops.eat(c) {
+        t.kind = k;
+    } else {
+        c.bump();
+        return Err(c.error_at(start, "unexpected character"));
+    }
+    t.span = c.span_from(start);
+    Ok(t)
+}
+
+// ── driver: print the tokens of a test program ──────────────────────
+
+fn kind_name(k: T) -> str {
+    match k {
+        Eof => "<eof>", Name => "name", Number => "number", String => "string",
+        Plus => "+", Minus => "-", Star => "*", Slash => "/", Percent => "%", Concat => "..",
+        Eq => "==", Ne => "~=", Lt => "<", Le => "<=", Gt => ">", Ge => ">=", Assign => "=",
+        LParen => "(", RParen => ")", LBrace => "{", RBrace => "}", LBracket => "[", RBracket => "]",
+        Comma => ",", Dot => ".", Semi => ";",
+        _ => "keyword",
+    }
+}
+
+fn main() {
+    let src = "-- a toy program\nlocal x = 0x10 + 2.5e1 .. 'it\\'s' --[[ long\n comment ]]\nif x ~= nil then print([[raw\nstring]]) end\nlocal y = 3abc @ \"bad\\q\" z\nreturn x<=y";
+    var sm = diag.SourceMap.new();
+    let f = sm.add("toy.lua", src);
+    var ds = diag.Diagnostics.new();
+    var lx = Lexer.new(src, f);
+    var line = text.StrBuf.new();
+    var cur_line: u32 = 0;
+    loop {
+        match lx.next() {
+            Ok(t) => {
+                if t.line != cur_line {
+                    if line.len() > 0 { io.println(line.as_str()); }
+                    line.clear();
+                    cur_line = t.line;
+                }
+                if line.len() > 0 { line.push(' '); }
+                match t.kind {
+                    Name => line.push_str(sm.snippet(t.span)),
+                    Number => match t.num {
+                        Int(i) => { line.push_str("int:"); line.push_int(i); }
+                        Float(x) => { line.push_str("float:"); num.write_shortest(&line, x); }
+                    },
+                    String => { line.push('<'); line.push_str(t.str); line.push('>'); }
+                    k => line.push_str(if kind_name(k).eq("keyword") { sm.snippet(t.span) } else { kind_name(k) }),
+                }
+                if t.kind == T.Eof { break; }
+            }
+            Err(e) => ds.push(e.diag()),
+        }
+    }
+    io.println(line.as_str());
+    var out = text.StrBuf.new();
+    ds.render(&sm, &out);
+    io.print(out.as_str());
+}
+// expect: local x = int:16 + float:25 .. <it's>
+// expect: if x ~= nil then print ( <raw
+// expect: string>
+// expect: ) end
+// expect: local y = z
+// expect: return x <= y <eof>
+// expect: error: malformed number
+// expect:   --> toy.lua:6:11
+// expect:     6 | local y = 3abc @ "bad\q" z
+// expect:       |           ^^^^
+// expect: error: unexpected character
+// expect:   --> toy.lua:6:16
+// expect:     6 | local y = 3abc @ "bad\q" z
+// expect:       |                ^
+// expect: error: invalid escape sequence
+// expect:   --> toy.lua:6:22
+// expect:     6 | local y = 3abc @ "bad\q" z
+// expect:       |                      ^^
+// expect: 3 errors generated.

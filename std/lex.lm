@@ -399,13 +399,20 @@ fn Cursor.newline(c: *Cursor) {
 ///     \u{XXX}  a code point, encoded as UTF-8
 ///     \z       skip the following whitespace, including newlines
 ///     \ + newline   line continuation (see syntax.escaped_newline_kept)
+///
+/// After a bad escape the scan continues to the closing quote, so that a
+/// lexer can report the error and carry on after the string.
 pub fn Cursor.quoted(c: *Cursor, out: *text.StrBuf) -> Result<(), Error> {
     let start = c.pos;
     let quote = c.bump();
+    var bad: ?Error = None;
     loop {
         if c.at_end() { return Err(c.error_at(start, "unfinished string")); }
         let ch = c.peek();
-        if ch == quote { c.bump(); return Ok(()); }
+        if ch == quote {
+            c.bump();
+            return match bad { Some(e) => Err(e), None => Ok(()) };
+        }
         if (ch == '\n' or ch == '\r') and !c.syntax.multiline_strings {
             return Err(c.error_at(start, "unfinished string"));
         }
@@ -413,7 +420,9 @@ pub fn Cursor.quoted(c: *Cursor, out: *text.StrBuf) -> Result<(), Error> {
             out.push(c.bump());
             continue;
         }
-        c.escape(out)?;
+        if let Err(e) = c.escape(out) {
+            if bad.is_none() { bad = Some(e); }
+        }
     }
 }
 
