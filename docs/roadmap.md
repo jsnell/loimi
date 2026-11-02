@@ -2,9 +2,17 @@
 
 ## Implementation plan
 
-Progress (2026-11-01): M0–M5 are done (M5: verifier, families, inline
-caches, supers, variants, `--vm-stats`). The first proof
-interpreter, `examples/mini`, runs. See [`status.md`](status.md).
+Progress (2026-11-02):
+- M0–M5 are done. M5's fuzzing criterion is in progress.
+- M6 is partly done: std.num, std.diag, std.lex and std.parse exist; std.bc and std.obj do not.
+- M7 has two proof interpreters, `examples/mini` (a Lua 5.4 subset) and
+  `examples/scheme` (an R7RS-small subset).
+- **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
+  clean-room benchmarks, by 0.40–0.97× of Lua's time. It is within 10% of
+  LuaJIT's interpreter (`-joff`) or faster on 10 of them. See
+  [`bench/mini/RESULTS.md`](../bench/mini/RESULTS.md).
+
+See [`status.md`](status.md) for details.
 
 The compiler starts in **Rust**, emitting LLVM IR through the LLVM C API
 (`inkwell` or `llvm-sys`), pinned to one LLVM major version (≥ 19). Self-hosting

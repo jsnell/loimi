@@ -12,6 +12,13 @@ instrumentation work, and a Lua-like interpreter written in Loimi runs on
 them. See [`docs/status.md`](docs/status.md) for what is built and how it
 differs from the design.
 
+**Results so far.** `examples/mini` implements a Lua 5.4 subset
+([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
+from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
+0.40–0.97× of Lua's time. On 10 of them it is faster than LuaJIT's
+hand-written assembly interpreter (`luajit -joff`), or within 10% of it.
+See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
+
 ## Getting started
 
 Requirements: Rust (stable) and clang/LLVM 19.
@@ -23,6 +30,7 @@ cargo build --release
 ./mini examples/mini/tests/functions.mini              # the Lua-like example
 cargo test                                             # all tests
 bench/run.sh                                           # Loimi VM vs hand-written C
+bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
 ```
 
 ## Why a new language?
@@ -60,7 +68,10 @@ infrastructure out of macros, compiler extensions, and convention:
 - [`examples/mini/`](examples/mini): a working interpreter for a small
   Lua-like language: lexer, single-pass compiler, register VM with
   NaN-boxed values, GC-managed strings and tables, generated verifier.
-- [`bench/`](bench): the dispatch benchmark against hand-written C.
+- [`examples/scheme/`](examples/scheme): an R7RS-small subset with proper
+  tail calls, flat closures and a register VM.
+- [`bench/`](bench): the dispatch benchmark against hand-written C, and
+  [`bench/mini`](bench/mini): Mini vs PUC-Lua and LuaJIT.
 
 ## A taste
 
