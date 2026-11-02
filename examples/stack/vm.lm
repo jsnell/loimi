@@ -45,7 +45,12 @@ pub struct Machine {
     /// Where the last run-time error happened.
     error_line: u32,
     error_word: str,
+    /// Jumps left before `run_budget` stops the program.
+    steps: i64,
 }
+
+/// The longest array `array` makes (a fuzzer-proof bound on allocation).
+pub const MAX_LEN: i32 = 1 << 24;
 
 /// GC roots: the data stack up to `sp`, the locals of every active frame,
 /// the globals and the constants.
@@ -132,7 +137,8 @@ fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Value uses gc {
 }
 
 /// The stack effect of instruction `w`: (pops, pushes), or None for an
-/// opcode the compiler never emits before verification (superinstructions).
+/// opcode with no entry here (superinstruction heads: `check_stack` splits
+/// them first).
 fn stack_effect(w: u32, words: *mem.Vec<*Word>) -> ?(i32, i32) {
     let op = Stak.opcode(w);
     if op == Stak.OP_PUSHI or op == Stak.OP_PUSHK or op == Stak.OP_PUSHNIL or op == Stak.OP_PUSHBOOL
@@ -168,8 +174,15 @@ fn stack_effect(w: u32, words: *mem.Vec<*Word>) -> ?(i32, i32) {
 /// on the depth, and RET leaves exactly the word's outputs. This is what
 /// lets the handlers pop and push without checks. (Loimi's verifier does
 /// not compute stack effects itself yet; this is the hand-written stand-in.)
-pub fn check_stack(code: []u32, word: *Word, words: *mem.Vec<*Word>) -> bool {
-    let n = code.len;
+pub fn check_stack(words_in: []u32, word: *Word, words: *mem.Vec<*Word>) -> bool {
+    let n = words_in.len;
+    // Code that went through `Stak.optimize` has superinstruction heads;
+    // check a copy with them split back into their parts.
+    let copy: *u32 = mem.alloc(n);
+    defer mem.release(copy);
+    mem.copy(copy, words_in.ptr, n);
+    let code = copy.slice(n);
+    Stak.deopt_words(code);
     let depth: *i32 = mem.alloc(n);
     defer mem.release(depth);
     for i in 0..n { depth[i] = -1; }
@@ -478,12 +491,12 @@ pub vm Stak {
         cold { raise type_error("len", tos, ctx) }
     }
     op ARRAY() : N {
-        if let Int(n) = tos and n >= 0 {
+        if let Int(n) = tos and n >= 0 and n <= MAX_LEN {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
             tos = Arr(value.new_arr(&ctx.heap, n as u64));
             next
         }
-        cold { raise "array: the size must be a non-negative integer" }
+        cold { raise "array: the size must be an integer from 0 to 2^24" }
     }
     /// The top `n` values become an array.
     op MKARRAY(n: cnt) : N {
@@ -562,7 +575,7 @@ pub vm Stak {
     #[allow(super_overlap)]
     super LGET_LGET_STORE = LGET; LGET; STORE;
 
-    entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc {
+    fn start(m: *Machine, main: *Word) -> never {
         ctx = m;
         fp = m.frames;
         fp.word = main;
@@ -576,6 +589,22 @@ pub vm Stak {
         m.lp = lp;
         m.fp = fp;
         jump main.code
+    }
+
+    entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc { start(m, main) }
+
+    // For the fuzzer: a second dispatch table whose jumping ops count down
+    // `ctx.steps` first, so that random programs cannot loop forever.
+    variant budget wraps [JMP, JZ, LOOP, CALL, PUSHI_LT_JZ, LT_JZ, LE_JZ, GT_JZ, DUP_PUSHI_LT_JZ] {
+        before {
+            ctx.steps -= 1;
+            if ctx.steps < 0 { cold { raise "step budget exhausted" } }
+        }
+    }
+
+    entry run_budget(m: *Machine, main: *Word) -> Result<(), str> uses gc {
+        use_variant budget;
+        start(m, main)
     }
 
     on raise(msg: str) {

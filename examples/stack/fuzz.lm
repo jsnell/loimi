@@ -1,0 +1,197 @@
+// A bytecode fuzzer for Stak, after the tutorial's chapter 9. It compiles
+// real programs, breaks one to three words of their bytecode, verifies
+// the result (operand clauses plus the `stack` check in vm.lm), and runs
+// whatever passes under a step budget. A crash (or an ASan report) is a
+// hole in the verifier.
+//
+//   loimi build examples/stack/fuzz.lm --sanitize=address -o fuzz
+//   ./fuzz FIRST-SEED COUNT FILE.stk... [--gc-stress] [-v]
+
+import std.io;
+import std.os;
+import std.gc;
+import std.mem;
+import std.text;
+import compile;
+import compile.{Program};
+import value.{Value, Word};
+import vm;
+import vm.{Stak, Machine, Frame};
+
+extern "C" fn dup(fd: i32) -> i32;
+extern "C" fn dup2(fd: i32, to: i32) -> i32;
+extern "C" fn open(path: *u8, flags: i32) -> i32;
+
+struct Rng { s: u64 }
+
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s +% 11400714819323198485;
+    var z = r.s;
+    z = (z ^ (z >> 30)) *% 13787848793156543417;
+    z = (z ^ (z >> 27)) *% 10723151780598845931;
+    z ^ (z >> 31)
+}
+
+fn Rng.below(r: *Rng, n: u64) -> u64 { if n == 0 { 0 } else { r.next() % n } }
+
+fn mutate(r: *Rng, w: *Word) {
+    let i = r.below(w.words.len);
+    var x = w.words[i];
+    let k = r.below(100);
+    if k < 35 {
+        // A small operand.
+        let v = r.below(8);
+        x = (x & 0xFF) | ((v << 8) as u32);
+    } else if k < 65 {
+        // Another opcode, same operand bits.
+        x = (x & 0xFFFFFF00) | (r.below(Stak.NUM_OPS) as u32);
+    } else if k < 85 {
+        x = x ^ (1 << r.below(32));
+    } else if k < 95 {
+        let off = r.below(w.words.len + 4) as i64 - i as i64 - 2;
+        if let Some(j) = Stak.set_label(x, off) { x = j; }
+    } else {
+        x = r.next() as u32;
+    }
+    w.words[i] = x;
+}
+
+var VERBOSE: bool = false;
+
+fn verify_one(w: *Word, prog: *Program, explain: bool) -> bool {
+    match Stak.verify(w.words, w, prog.nglobals, prog.consts.len as u32, &prog.words) {
+        Ok(v) => { w.code = v; true }
+        Err(e) => {
+            if explain and VERBOSE {
+                var b = text.StrBuf.new();
+                b.push_str("rejected: ");
+                e.write(&b);
+                b.push_str("\n");
+                Stak.disasm_insn(w.words, e.at, &b);
+                io.eprint(b.as_str());
+                b.free();
+            }
+            false
+        }
+    }
+}
+
+fn verify_all(prog: *Program, explain: bool) -> bool {
+    for i in 0..prog.words.len {
+        if !verify_one(prog.words.at(i), prog, explain) { return false; }
+    }
+    verify_one(prog.main, prog, explain)
+}
+
+fn bug(seed: u64, what: str) {
+    var b = text.StrBuf.new();
+    b.push_str("BUG: seed ");
+    b.push_int(seed as i64);
+    b.push_str(": ");
+    b.push_str(what);
+    io.eprintln(b.as_str());
+    os.quit(1);
+}
+
+struct Stats { rejected: u64, finished: u64, raised: u64, budget: u64 }
+
+const NSTACK: u64 = 4096;
+
+fn run_one(seed: u64, src: str, stress: bool, stack: *Value, lstack: *Value, frames: *Frame, st: *Stats) uses gc {
+    var r = Rng { s: seed };
+    var arena = mem.Arena.new();
+    var m = Machine {
+        stack: stack + 1, stack_end: stack + 1 + NSTACK, lstack: lstack, lstack_end: lstack + NSTACK,
+        frames: frames, frames_end: frames + 64,
+        words: 0 as *mem.Vec<*Word>, consts: 0 as *Value, nconsts: 0,
+        globals: 0 as *Value, nglobals: 0, heap: gc.Heap.new(),
+        sp: stack, tos: Value.Nil, lp: lstack, fp: frames,
+        out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
+        error_line: 0, error_word: "", steps: 20000,
+    };
+    var prog = match compile.compile(src, 0, &arena, &m.heap) {
+        Ok(p) => p,
+        Err(_) => { bug(seed, "corpus file does not compile"); return; }
+    };
+    m.words = &prog.words;
+    m.consts = prog.consts.ptr;
+    m.nconsts = prog.consts.len as u32;
+    m.globals = mem.alloc(prog.nglobals as u64 + 1);
+    m.nglobals = prog.nglobals;
+    for i in 0..prog.nglobals as u64 { m.globals[i] = Value.Nil; }
+    m.fp.word = prog.main;
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    if stress { m.heap.set_stress(true); }
+
+    let n = 1 + r.below(3);
+    for _ in 0..n {
+        let k = r.below(prog.words.len + 1);
+        mutate(&r, if k == prog.words.len { prog.main } else { prog.words.at(k) });
+    }
+    if !verify_all(&prog, true) {
+        st.rejected += 1;
+    } else {
+        for i in 0..prog.words.len {
+            let w = prog.words.at(i);
+            w.code = Stak.optimize(w.code);
+        }
+        prog.main.code = Stak.optimize(prog.main.code);
+        if !verify_all(&prog, false) { bug(seed, "code does not verify after Stak.optimize"); }
+        match Stak.run_budget(&m, prog.main) {
+            Ok(_) => st.finished += 1,
+            Err(msg) => if msg.eq("step budget exhausted") { st.budget += 1; } else { st.raised += 1; },
+        }
+    }
+    prog.free();
+    m.heap.free();
+    mem.release(m.globals);
+    m.out.free();
+    m.tmp.free();
+    m.err.free();
+    arena.free();
+}
+
+fn main() -> i32 uses gc {
+    let (Some(a), Some(b)) = (os.arg(1), os.arg(2)) else {
+        io.eprintln("usage: fuzz FIRST-SEED COUNT FILE.stk... [--gc-stress] [-v]");
+        return 2;
+    };
+    let (Some(first), Some(count)) = (text.parse_int(a), text.parse_int(b)) else {
+        io.eprintln("seeds must be numbers");
+        return 2;
+    };
+    var stress = false;
+    var corpus: mem.Vec<str> = mem.Vec.new();
+    for i in 3..os.arg_count() {
+        let f = os.arg(i) ?? "";
+        if f.eq("--gc-stress") { stress = true; continue; }
+        if f.eq("-v") { VERBOSE = true; continue; }
+        let Some(src) = io.read_file(f) else { io.eprint("cannot read "); io.eprintln(f); return 2; };
+        corpus.push(src);
+    }
+    if corpus.len == 0 { io.eprintln("no corpus files"); return 2; }
+    let stdout = dup(1);
+    dup2(open("/dev/null\0".ptr, 1), 1);
+    let stack: *Value = mem.alloc(NSTACK + 1);
+    let lstack: *Value = mem.alloc(NSTACK);
+    let frames: *Frame = mem.alloc(64);
+    var st = Stats { rejected: 0, finished: 0, raised: 0, budget: 0 };
+    for i in 0..count as u64 {
+        let seed = first as u64 + i;
+        run_one(seed, corpus.at(seed % corpus.len), stress, stack, lstack, frames, &st);
+    }
+    dup2(stdout, 1);
+    var out = text.StrBuf.new();
+    out.push_int(count);
+    out.push_str(" programs: ");
+    out.push_int(st.rejected as i64);
+    out.push_str(" rejected by the verifier, ");
+    out.push_int(st.finished as i64);
+    out.push_str(" finished, ");
+    out.push_int(st.raised as i64);
+    out.push_str(" raised an error, ");
+    out.push_int(st.budget as i64);
+    out.push_str(" ran out of steps");
+    io.println(out.as_str());
+    0
+}

@@ -74,7 +74,7 @@ fn main() -> i32 uses gc {
         globals: 0 as *Value, nglobals: 0, heap: gc.Heap.new(),
         sp: 0 as *Value, tos: Value.Nil, lp: 0 as *Value, fp: 0 as *Frame,
         out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
-        error_line: 0, error_word: "",
+        error_line: 0, error_word: "", steps: 0,
     };
     // One slot below the stack, so that `sp = stack - 1` (empty) points
     // into the allocation.

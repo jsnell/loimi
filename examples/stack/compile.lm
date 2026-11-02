@@ -558,6 +558,20 @@ fn Comp.definition(c: *Comp, colon: Tok) -> Result<(), Error> {
     Ok(())
 }
 
+/// Releases what `compile` allocated (not the GC objects).
+pub fn Program.free(p: *Program) {
+    for i in 0..p.words.len { free_word(p.words.at(i)); }
+    free_word(p.main);
+    p.words.free();
+    mem.release(p.consts.ptr);
+}
+
+fn free_word(w: *Word) {
+    mem.release(w.words.ptr);
+    mem.release(w.lines.ptr);
+    mem.release(w);
+}
+
 pub fn compile(src: str, file: u32, arena: *mem.Arena, heap: *gc.Heap) -> Result<Program, Error> {
     var sy = lex.none();
     sy.line_comment = "\\";
@@ -582,5 +596,10 @@ pub fn compile(src: str, file: u32, arena: *mem.Arena, heap: *gc.Heap) -> Result
     main.emit(Stak.HALT(), last_line);
     let mw = c.finish(&main)?;
     let consts = c.consts.items();
+    // The constants' Vec lives on in `consts`; the rest goes.
+    c.consts.index.free();
+    c.dict.free();
+    c.strs.free();
+    c.buf.free();
     Ok(Program { main: mw, words: c.words, consts: consts, nglobals: c.nglobals })
 }
