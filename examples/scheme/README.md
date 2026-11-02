@@ -11,6 +11,7 @@ the generated `Scheme.X` encoders and checks it with the generated verifier.
 cargo build --release
 ./target/release/loimi build examples/scheme/main.lm --release -o scheme
 ./scheme program.scm            # a second argument turns on GC stress
+./scheme program.scm disasm     # print the compiled bytecode instead
 cargo test --release --test golden scheme_programs
 bench/scheme/compare.py         # benchmarks vs chibi-scheme (see bench/scheme/README.md)
 ```
@@ -21,7 +22,7 @@ bench/scheme/compare.py         # benchmarks vs chibi-scheme (see bench/scheme/R
 |---|---|
 | `value.lm` | the `V` value type, heap objects (pairs, strings, symbols, vectors, closures, prototypes), printing, `eqv?`/`equal?`, the symbol table |
 | `read.lm` | the reader, on `std.lex` (cursor, comments) and `std.num` (numerals) |
-| `compile.lm` | s-expressions → AST (derived forms expanded, variables resolved) → bytecode |
+| `compile.lm` | s-expressions → AST (derived forms expanded, variables resolved) → inlining, contification → bytecode |
 | `vm.lm` | the `vm Scheme` declaration: ops, calls and tail calls, error handler |
 | `rt.lm` | the interpreter context (stacks, globals) and the GC root scanner |
 | `builtins.lm` | the builtin procedures (natives) and numeric helpers |
@@ -93,9 +94,17 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
   UTF-8 when put into a string.
 - **Inline builtins.** Calls to `+ - * / quotient remainder modulo = < > <=
   >= zero? eq? eqv? not null? pair? car cdr cons set-car! set-cdr!
-  vector-ref vector-set!` and `cXr` are compiled to ops, unless the program
-  defines or `set!`s that name somewhere (then every call goes through the
-  global). The prelude always uses the inline versions.
+  vector-ref vector-set! symbol? number? exact-integer? string? vector?`
+  and `cXr` are compiled to ops, and calls to the other builtins (except
+  `apply` and `call/cc`) call the native directly (`PRIMCALL`), unless the
+  program defines or `set!`s that name somewhere (then every call goes
+  through the global). The prelude always uses the inline versions.
+- **Inlined procedures.** A top-level procedure that is defined once and
+  never `set!` (and not named like a builtin) is a known procedure, and so
+  is an unassigned `let`/`letrec` lambda: small ones are inlined at their
+  calls (see "Compiler"). A call of an inlined top-level procedure that
+  could run before its definition is guarded, so it still fails with
+  `unbound variable`.
 - Symbols are never collected. `eq?` on flonums compares bits.
 - **Continuations are escape-only.** A continuation can be invoked while
   the `call/cc` that made it is still active (early exit from loops,
@@ -150,19 +159,42 @@ part of the point of the exercise.
 
 ### Compiler
 
-`compile.lm` works in two passes:
+`compile.lm` works in passes:
 
 1. **Build** (s-expressions → AST): expands derived forms (`let*`, named
    `let`, `do`, `cond`, `case`, `when`, `unless`, quasiquote, internal
    defines) into a small core (`Const Ref GRef Set GSet GDef If Lambda Seq
    Call Prim Let Letrec And Or`). It resolves every variable to a `Var`,
-   records which ones are assigned and which are captured, and gives each
-   lambda its list of free variables (propagated through the enclosing
-   lambdas, as in Lua's upvalue resolution).
-2. **Generate** (AST → bytecode): allocates registers and emits code with
-   the generated encoders (`Scheme.ADD(dst, a, b)`), in three contexts:
-   value-into-register, effect only, and tail (`gen.tail` emits `RET` or
-   `TAILCALL`). Each finished prototype is checked with the generated
+   records which ones are assigned, and notes the top-level definitions
+   and `set!`s of each global.
+2. **Inline** (`Comp.inl`): a call of a known procedure (see above) is
+   replaced by a copy of its body, with the parameters bound by a `let` or
+   replaced by the argument when that is a constant, an unassigned local or
+   a known procedure. Bodies of up to 12 nodes are inlined, or up to 40
+   when an argument is a lambda or a known procedure: then calls of that
+   parameter in the copy are known too and are inlined in turn, so
+   `(map (lambda (x) ...) l)` becomes a loop with the lambda's body in it
+   (`map` and `for-each` with one list use the prelude's one-list versions).
+   Recursive bodies are not inlined, and nesting stops at depth 3.
+3. **Contify** (`contify`): a `letrec` lambda whose every use is a tail call
+   from the letrec body or from another contified lambda of the same letrec
+   (every named-let loop, mutually tail-recursive local procedures) is
+   compiled inline in the enclosing procedure: its parameters become
+   registers, its calls become moves and jumps, and its "returns" go to the
+   letrec's continuation. No closure is made and its free variables are
+   the enclosing procedure's registers.
+4. **Resolve** (`reown`): gives every variable its real owner (the
+   procedure whose frame holds it) and recomputes which variables are
+   captured and each lambda's free variables, as in Lua's upvalue
+   resolution. A variable that is assigned and used only by contified code
+   is no longer boxed.
+5. **Generate** (AST → bytecode): allocates registers and emits code with
+   the generated encoders (`Scheme.ADD(dst, a, b)`), in value-into-register
+   and effect-only contexts and in tail position with a continuation
+   (return, or a register or nothing followed by a jump to a join point,
+   for contified bodies). Conditions compile to branches through `not`,
+   `and` and `or`; in tail position `and`/`or` of predicates jump to a
+   `#t`/`#f` exit. Each finished prototype is checked with the generated
    `Scheme.verify` and peephole-fused with `Scheme.optimize`.
 
 ### Closures
@@ -193,10 +225,12 @@ and returns where to continue.
 
 `TAILCALL` moves the arguments down to R0.. and replaces the current
 frame's closure, so tail calls never grow either stack. A tail call of a
-procedure to itself through its own `letrec` variable (every named `let`
-loop) compiles to moves into the parameter registers and a `JMP` to the
-start, with arguments that are single ops computed straight into their
-parameter when no other argument reads it.
+procedure to itself, through its own `letrec` variable or the global of a
+known top-level procedure, compiles to moves into the parameter registers
+and a `JMP` to the start, with arguments that are single ops computed
+straight into their parameter when no other argument reads it. A non-tail
+call of a procedure to itself with its number of parameters is
+`CALLSELF`, which calls the running closure with no checks.
 
 `apply` is handled in `call_slow` by spreading the list into registers and
 dispatching again, so it is properly tail-recursive too. Builtins that take
@@ -215,7 +249,10 @@ instruction into `GETGLOBAL_B`, which skips the check.
 
 ### GC
 
-Mark-sweep from `std.gc`. Roots come from `rt.scan_roots`: symbols,
+Mark-sweep from `std.gc` (16-byte object headers, so a pair takes 32
+bytes). A collection runs after allocating 4 times the live data (at
+least 2 MiB, at most 256 MiB; `Heap.set_growth`, `set_max_budget`).
+Roots come from `rt.scan_roots`: symbols,
 globals, the pending error, and every active frame's closure and whole
 register window. Every op that allocates (`CONS`, `CLOSURE`, `MKBOX`, and
 the call path, which covers builtins and rest lists) runs the collector,
@@ -226,12 +263,13 @@ so the scanner never sees stale values.
 
 ### Ops
 
-`LOADK LOADI MOVE`, `GETGLOBAL`(+`_B`) `SETGLOBAL DEFGLOBAL`, `GETFREE
-SETFREE MKBOX BOXGET BOXSET CLOSURE`, `JMP TEST TESTT`, `ADD SUB MUL ADDI
-DIV QUO REM MOD` (fixnum fast paths with overflow checks, flonum fast
-paths, everything else cold), `NUMEQ LT GT LE GE` and their
-compare-with-constant forms `NUMEQI LTI GTI LEI GEI`, `ZEROP EQ EQV NOT
-NULLP PAIRP CAR CDR CONS SETCAR SETCDR VREF VSET`, `CALL TAILCALL RET`,
+`LOADK LOADI MOVE`, `GETGLOBAL`(+`_B`) `CHKGLOBAL`(+`_B`) `SETGLOBAL
+DEFGLOBAL`, `GETFREE SETFREE MKBOX BOXGET BOXSET CLOSURE`, `JMP TEST
+TESTT`, `ADD SUB MUL ADDI DIV QUO REM MOD` (fixnum fast paths with
+overflow checks, flonum fast paths, everything else cold), `NUMEQ LT GT
+LE GE` and their compare-with-constant forms `NUMEQI LTI GTI LEI GEI`,
+`ZEROP EQ EQV NOT NULLP PAIRP SYMBOLP NUMBERP FIXNUMP STRINGP VECTORP CAR
+CDR CONS SETCAR SETCDR VREF VSET`, `CALL CALLSELF PRIMCALL TAILCALL RET`,
 and 29 superinstructions picked from `--vm-stats` over the benchmarks
 (compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`, `ADDI_CALL`,
 ...).
@@ -283,38 +321,12 @@ programs the suite's `bench` script runs are included; of the other 16,
 equal, pi, chudnovsky, mbrotZ and bv2string would need a sharing-aware
 `equal?`, bignums, complex numbers or bytevectors, and 11 need file ports.
 
-The classic Gabriel and Kernighan–Van Wyk programs, seconds as reported by
-each benchmark itself (excluding startup), best of 3, `--dispatch=tailcall`,
-Intel i7-6700, 2026-11-02:
-
-| benchmark | ours | chibi | ours/chibi |
-|---|---|---|---|
-| fib | 0.710 | 1.765 | 0.40 |
-| fibfp | 0.235 | 1.334 | 0.18 |
-| tak | 0.637 | 2.350 | 0.27 |
-| takl | 0.139 | 1.366 | 0.10 |
-| cpstak | 0.281 | 1.725 | 0.16 |
-| ctak | 0.025 | 1.369 | 0.02 |
-| ack | 0.757 | 1.700 | 0.45 |
-| nqueens | 0.384 | 1.786 | 0.21 |
-| deriv | 0.355 | 1.779 | 0.20 |
-| destruc | 0.178 | 1.259 | 0.14 |
-| diviter | 0.188 | 1.194 | 0.16 |
-| divrec | 0.281 | 1.155 | 0.24 |
-| primes | 0.192 | 0.649 | 0.30 |
-| sum | 0.393 | 1.487 | 0.26 |
-| sumfp | 0.110 | 1.182 | 0.09 |
-| array1 | 0.433 | 1.575 | 0.28 |
-| mbrot | 0.062 | 1.428 | 0.04 |
-| browse | 0.021 | 1.887 | 0.01 |
-| puzzle | 0.129 | 1.650 | 0.08 |
-| triangl | 0.201 | 1.200 | 0.17 |
-| string | 0.040 | 1.150 | 0.03 |
-
-Over all 41 programs the geometric mean of ours/chibi is 0.12. The gap is
-narrowest on call-bound code (ack, fib, tak, ntakl), where a call or
-return comes every few ops, and widest where chibi pays for heap flonums,
-full continuations, strings or its collector.
+Geometric mean of ours / reference over the 41 programs (wall time,
+whole process; Intel i7-6700, 2026-11-02): Gauche 0.29, Guile 3 without
+its JIT 0.47, Guile 3 with its JIT 1.02 (chibi: 0.10 before the compiler
+passes). Ours is faster than Gauche and than Guile's bytecode VM on every
+program; the per-program tables, the timed-loop times and the changelog
+of the optimizations are in the benchmark README.
 
 The programs this directory used before were reproduced from memory by
 the interpreter's author; they were removed in favour of the public suite.
