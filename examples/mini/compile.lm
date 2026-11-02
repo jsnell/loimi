@@ -537,6 +537,10 @@ fn Parser.store_var(p: *Parser, target: E, v: E) {
             p.emit(0);   // inline cache word
         }
         Index(t, k) => {
+            if let Some(c) = p.kindex(v, true) {
+                p.emit(Mini.SETINDEXK(t as u8, k as u8, c as u8));
+                return;
+            }
             let v = p.any_reg(v);
             p.emit(Mini.SETINDEX(t as u8, k as u8, reg_of(v) as u8));
         }
