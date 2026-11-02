@@ -330,8 +330,16 @@ The growth policy is `Heap.set_growth(percent, min_heap)`: after a
 collection, `percent`% of the live bytes (at least `min_heap`) may be
 allocated before the next one. The default, 100% and 1 MiB, collects
 again after allocating as much as survived (the heap peaks at about twice
-the live data). MiniJS uses 300% with an 8 MiB minimum; see
-`examples/minijs/README.md` for the measurements behind the defaults.
+the live data). MiniJS uses 300% with an 8 MiB minimum (as fast as
+100% / 64 MiB, a quarter of the memory on small heaps; see
+`examples/minijs/README.md`). The default stays because no setting was
+better for every interpreter (best of 3-7, wall clock, loaded machine):
+Mini at 200% runs binary_trees 17% faster (1.21 to 1.01 s) and the rest
+within noise; Scheme at 200% runs nboyer, graphs and mperm 4-10% faster
+but string 27% slower (41 to 52 ms) and primes and array1 3-4% slower;
+an 8 MiB minimum makes Scheme's small allocation-heavy programs (deriv,
+divrec, cpstak) 6-10% slower, as the heap leaves the CPU caches. Mini
+and Scheme can opt in with `set_growth`.
 
 ## `std.obj`: objects and shapes
 
