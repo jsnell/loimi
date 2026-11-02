@@ -1,0 +1,46 @@
+// Explicit type arguments on calls of generic functions and methods.
+import std.io;
+import std.mem;
+
+fn id<T>(x: T) -> T { x }
+fn zero<T>() -> T { 0 }
+fn size<T>() -> u64 { size_of<T>() }
+fn pair<A, B>(a: A, b: B) -> (A, B) { (a, b) }
+
+struct Cursor { pos: u64 }
+fn Cursor.cast<T>(c: *Cursor) -> T { c.pos as T }
+
+struct Box<T> { v: T }
+fn Box<T>.conv<U>(b: *Box<T>) -> U { b.v as U }
+
+fn main() {
+    let p = mem.alloc<u8>(4);
+    p[0] = 200;
+    io.print_int(p[0] as i64); io.println("");
+    mem.release(p);
+    let x = id<u8>(255);
+    io.print_int(x as i64); io.println("");
+    io.print_int(zero<i32>() as i64); io.println("");
+    io.print_int(size<u16>() as i64); io.println("");
+    let (a, b) = pair<u8, f64>(1, 2);
+    io.print_int(a as i64); io.print(" "); io.print_f64(b); io.println("");
+    var c = Cursor { pos: 300 };
+    io.print_int(c.cast<u8>() as i64); io.println("");
+    io.print_int(Cursor.cast<i64>(&c)); io.println("");
+    var bx = Box { v: 2.75 };
+    io.print_int(bx.conv<i32>() as i64); io.println("");
+    // Still comparisons:
+    let (l, m) = (1, 2);
+    io.print_bool(l < m); io.println("");
+    io.print_bool(x<x); io.println("");
+}
+// expect: 200
+// expect: 255
+// expect: 0
+// expect: 2
+// expect: 1 2
+// expect: 44
+// expect: 300
+// expect: 2
+// expect: true
+// expect: false

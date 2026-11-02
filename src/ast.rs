@@ -115,6 +115,8 @@ pub enum ExprKind {
     /// `expr?`
     Try(P<Expr>),
     SizeOf(TypeExpr),
+    /// `f<T, U>`: explicit type arguments (only as a callee: `f<T>(..)`).
+    TypeArgs(P<Expr>, Vec<TypeExpr>),
     /// VM control words and constructs (only valid in handlers).
     Vm(VmExpr),
 }

@@ -88,6 +88,10 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `(x as T) < y`.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
+  Type arguments are inferred from arguments and the expected type, or given
+  explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
+  `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
+  `fn Vec<T>.map<U>(v: *Vec<T>, f: fn(T) -> U) -> Vec<U>`.
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in

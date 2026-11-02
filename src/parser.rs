@@ -931,6 +931,28 @@ impl Parser {
                 self.expect("]")?;
                 let span = e.span.to(self.prev_span());
                 e = Expr { kind: ExprKind::Index(Box::new(e), Box::new(idx)), span };
+            } else if self.is("<")
+                && !self.toks[self.pos].space_before
+                && matches!(e.kind, ExprKind::Ident(_) | ExprKind::Field(..))
+                && self.angle_args_end().is_some_and(|i| matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("("))))
+            {
+                // `f<T>(..)`, `mem.alloc<u8>(n)`, `v.map<f64>(g)`: explicit
+                // type arguments of a generic call.
+                let saved = std::mem::replace(&mut self.cast_type, false);
+                self.bump();
+                let mut targs = Vec::new();
+                self.split_angle();
+                while !self.is(">") {
+                    targs.push(self.parse_type()?);
+                    self.split_angle();
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(">")?;
+                self.cast_type = saved;
+                let span = e.span.to(self.prev_span());
+                e = Expr { kind: ExprKind::TypeArgs(Box::new(e), targs), span };
             } else if self.is("?") && !self.toks[self.pos].space_before {
                 self.bump();
                 let span = e.span.to(self.prev_span());

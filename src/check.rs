@@ -1424,6 +1424,7 @@ impl<'a> Checker<'a> {
                     _ => Err(Diag::new(span, "`?` needs an option or result")),
                 }
             }
+            ExprKind::TypeArgs(..) => Err(Diag::new(span, "explicit type arguments are only supported on calls: `f<T>(..)`")),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
                 let ty = self.resolve_type(cx.module, t)?;
@@ -1910,8 +1911,98 @@ impl<'a> Checker<'a> {
         self.make_variant(cx, &t, idx, args, span)
     }
 
+    /// `f<T..>(args)`: a call of a generic function or method with explicit
+    /// type arguments (for a method, its own parameters only).
+    fn call_type_args(&mut self, cx: &mut FnCx, inner: &Expr, targs: &[TypeExpr], args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let mut explicit = Vec::new();
+        for t in targs {
+            explicit.push(self.resolve_type(cx.module, t)?);
+        }
+        let (name, g, recv): (&Ident, u32, Option<TExpr>) = match &inner.kind {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => {
+                let id = Ident { name: n.clone(), span: inner.span };
+                match self.scopes[cx.module].get(n).cloned() {
+                    Some((Def::GenericFn(g), _)) => return self.explicit_call(cx, &id, g, explicit, None, args, exp, span),
+                    _ => return Err(Diag::new(inner.span, format!("`{}` is not a generic function", n))),
+                }
+            }
+            ExprKind::Field(base, name) => {
+                if let Some(m) = self.module_path(cx, base) {
+                    return match self.scopes[m].get(&name.name).cloned() {
+                        Some((Def::GenericFn(g), true)) => self.explicit_call(cx, name, g, explicit, None, args, exp, span),
+                        Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
+                        _ => Err(Diag::new(name.span, format!("`{}` is not a generic function", name.name))),
+                    };
+                }
+                if self.generic_type_path(cx, base).is_some() {
+                    return Err(Diag::new(
+                        span,
+                        "explicit type arguments are not supported on a generic type's static functions; annotate the result instead",
+                    ));
+                }
+                if let Some(t) = self.type_path(cx, base) {
+                    let Some(g) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() else {
+                        return Err(Diag::new(name.span, format!("`{}` is not a generic method of `{}`", name.name, self.ty_name(&t))));
+                    };
+                    return self.explicit_call(cx, name, g, explicit, None, args, exp, span);
+                }
+                let recv = self.expr(cx, base, None)?;
+                let mut base_ty = recv.ty.clone();
+                while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
+                    base_ty = *inner;
+                }
+                let g = match self.generics.inst_of.get(&base_ty).cloned() {
+                    Some((gt, rargs)) => match self.generics.methods.get(&(gt, name.name.clone())).copied() {
+                        Some(g) => {
+                            let mut all = rargs;
+                            all.extend(explicit.drain(..));
+                            explicit = all;
+                            Some(g)
+                        }
+                        None => None,
+                    },
+                    None => self.generics.ty_methods.get(&(base_ty.clone(), name.name.clone())).copied(),
+                };
+                let Some(g) = g else {
+                    return Err(Diag::new(name.span, format!("no generic method `{}` on type `{}`", name.name, self.ty_name(&recv.ty))));
+                };
+                (name, g, Some(recv))
+            }
+            _ => return Err(Diag::new(inner.span, "explicit type arguments need a generic function or method name")),
+        };
+        self.explicit_call(cx, name, g, explicit, recv, args, exp, span)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn explicit_call(
+        &mut self,
+        cx: &mut FnCx,
+        name: &Ident,
+        g: u32,
+        targs: Vec<Ty>,
+        recv: Option<TExpr>,
+        args: &[Expr],
+        exp: Option<&Ty>,
+        span: Span,
+    ) -> Res<TExpr> {
+        let gf = &self.generics.fns[g as usize];
+        let (nall, nrecv) = (gf.params.len(), gf.decl.recv_generics);
+        // The receiver's arguments come from the receiver (methods) or are
+        // not given (static calls); count only the function's own.
+        let given_own = if recv.is_some() { targs.len() - nrecv } else { targs.len() };
+        if given_own != nall - nrecv {
+            return Err(Diag::new(name.span, format!("`{}` takes {} type argument(s), got {}", name.name, nall - nrecv, given_own)));
+        }
+        if recv.is_none() && nrecv > 0 {
+            return Err(Diag::new(name.span, format!("`{}` is a method of a generic type: call it on a value", name.name)));
+        }
+        let known = targs.into_iter().map(Some).collect();
+        self.generic_call(cx, g, recv.into_iter().collect(), known, args, exp, span)
+    }
+
     fn call(&mut self, cx: &mut FnCx, callee: &Expr, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         match &callee.kind {
+            ExprKind::TypeArgs(inner, targs) => return self.call_type_args(cx, inner, targs, args, exp, span),
             ExprKind::Ident(name) if cx.lookup(name).is_none() => {
                 if let Some((Def::GenericFn(g), _)) = self.scopes[cx.module].get(name).cloned() {
                     return self.generic_call(cx, g, vec![], vec![], args, exp, span);
