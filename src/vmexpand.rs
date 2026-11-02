@@ -175,13 +175,13 @@ impl VmLayout {
     }
 }
 
-/// Source expression decoding field (bits, shift, signed) of word `w`.
+/// Source expression decoding field (bits, shift, signed) of word `__w`.
 fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
     // As in handlers: operand fields are 64-bit.
     let rt = if signed { "i64" } else { "u64" };
     if signed {
         format!(
-            "(((w << {}) as i{wb}) >> {}) as {}",
+            "(((__w << {}) as i{wb}) >> {}) as {}",
             word_bits - shift - bits,
             word_bits - bits,
             rt,
@@ -189,22 +189,115 @@ fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
         )
     } else {
         let m = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
-        format!("((w >> {}) & {}) as {}", shift, m, rt)
+        format!("((__w >> {}) & {}) as {}", shift, m, rt)
     }
 }
 
-/// The verifier: checks opcodes, instruction extents, and every operand's
-/// `verify` clause. Returns the index of the first bad instruction.
-fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
+/// Ops whose handler may continue past the instruction's last word: it
+/// uses `next`, or reads `pc` (to save a return address such as `pc + 1`),
+/// directly, in a vm function it calls, or in an op it can `become`.
+/// Code whose last instruction is one of these could run off the end.
+/// The scan is over tokens, so it errs on the side of "may continue".
+fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
+    use crate::lexer::Tok;
+    struct Facts {
+        direct: bool,
+        calls: Vec<String>,
+        becomes: Vec<String>,
+    }
+    let scan = |b: &Block| -> Facts {
+        let text = &sm.files[b.span.file as usize].text[b.span.lo as usize..b.span.hi as usize];
+        let Ok(toks) = crate::lexer::lex(b.span.file, text) else {
+            return Facts { direct: true, calls: vec![], becomes: vec![] };
+        };
+        let mut f = Facts { direct: false, calls: vec![], becomes: vec![] };
+        for (i, t) in toks.iter().enumerate() {
+            let Tok::Ident(name) = &t.tok else { continue };
+            if i > 0 && toks[i - 1].tok == Tok::Punct(".") {
+                continue;
+            }
+            match (name.as_str(), toks.get(i + 1).map(|t| &t.tok)) {
+                ("next" | "pc", _) => f.direct = true,
+                ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
+                (_, Some(Tok::Punct("("))) => f.calls.push(name.clone()),
+                _ => {}
+            }
+        }
+        f
+    };
+    let fns: Vec<(String, Facts)> =
+        v.fns.iter().filter_map(|f| Some((f.name.name.clone(), scan(f.body.as_ref()?)))).collect();
+    let ops: Vec<Facts> = v.ops.iter().map(|o| scan(&o.body)).collect();
+    let calls_cont = |calls: &[String], fn_cont: &[bool]| {
+        calls.iter().any(|c| fns.iter().position(|(n, _)| n == c).is_some_and(|k| fn_cont[k]))
+    };
+    let mut fn_cont: Vec<bool> = fns.iter().map(|(_, f)| f.direct).collect();
+    let mut cont = vec![false; l.ops.len()];
+    loop {
+        let mut changed = false;
+        for k in 0..fns.len() {
+            if !fn_cont[k] && calls_cont(&fns[k].1.calls, &fn_cont) {
+                fn_cont[k] = true;
+                changed = true;
+            }
+        }
+        for (i, f) in ops.iter().enumerate() {
+            let becomes_cont = f
+                .becomes
+                .iter()
+                .any(|b| l.ops.iter().position(|o| o.name == *b && o.parts.is_empty()).is_some_and(|t| cont[t]));
+            if !cont[i] && (f.direct || calls_cont(&f.calls, &fn_cont) || becomes_cont) {
+                cont[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (i, o) in l.ops.iter().enumerate() {
+        if let Some(&last) = o.parts.last() {
+            cont[i] = cont[last];
+        }
+    }
+    cont
+}
+
+/// The verifier. It checks that
+/// - the code is not empty, and every instruction holds a valid opcode and
+///   fits (with its inline cache);
+/// - instructions are walked one component at a time: the words after a
+///   superinstruction's head are instructions too (jumps may land on them,
+///   and `redo`, `next` from a shared tail or a quickened part runs them
+///   alone), so each must hold an op of the same family as the super's part;
+/// - `then OP`: the next instruction is an OP;
+/// - every operand satisfies its kind's `verify` clause (a super's head
+///   word carries its first part's operands; the other parts are checked
+///   at their own words);
+/// - the code cannot run off its end: the last instruction is not one that
+///   may continue (see `may_continue`), and an op with `then` that may
+///   continue (say by `jump pc + 2` past its follower) is not followed by
+///   the last instruction.
+/// Returns the index of the first bad word.
+///
+/// `verify` clauses are pasted into the generated function, so they see
+/// `it`, `pc` and the verify context; the verifier's own names start with
+/// `__` so that a clause cannot pick them up by accident.
+fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let vis = if v.is_pub { "pub " } else { "" };
+    for p in &v.verify_ctx {
+        if matches!(p.name.name.as_str(), "it" | "pc") || p.name.name.starts_with("__") {
+            return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
+        }
+    }
     let clause = |kind: &str| -> Option<String> {
         let k = v.operands.iter().find(|o| o.name.name == kind)?;
         let e = k.verify.as_ref()?;
         let f = &sm.files[e.span.file as usize];
         let text = &f.text[e.span.lo as usize..e.span.hi as usize];
-        Some(text.replace("is_insn_boundary(", &format!("{n}__boundary(code, &bits, ")))
+        Some(text.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
     };
     let mut s = String::new();
     let _ = writeln!(
@@ -215,54 +308,64 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
          \x20 (bits[i >> 3] >> ((i & 7) as u8)) & 1 == 1\n}}",
         l.word_bits / 8
     );
-    let mut params = vec![format!("code: []{w}")];
+    let cont = may_continue(sm, v, l);
+    let continuing: Vec<String> =
+        l.ops.iter().filter(|o| cont[o.opcode as usize]).map(|o| format!("op == {}", o.opcode)).collect();
+    let _ = writeln!(
+        s,
+        "fn {n}__continues(op: u64) -> bool {{ {} }}",
+        if continuing.is_empty() { "false".to_string() } else { continuing.join(" or ") }
+    );
+    let mut params = vec![format!("__code: []{w}")];
     for p in &v.verify_ctx {
         let f = &sm.files[p.ty.span.file as usize];
         params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
     }
     let _ = writeln!(s, "{vis}fn {n}__verify({}) -> ?u64 {{", params.join(", "));
-    let _ = writeln!(s, "  if code.len > 524288 {{ return Some(0); }}");
-    let _ = writeln!(s, "  var bits: [u8; 65536] = [0; 65536];");
-    let _ = writeln!(s, "  var i: u64 = 0;");
-    // Instructions are walked one component at a time: the words after a
-    // superinstruction's head are instructions too (jumps may land on
-    // them, and `redo` or `next` from a shared tail runs them alone), so
-    // each must hold an op of the same family as the super's part.
-    let _ = writeln!(s, "  while i < code.len {{");
-    let _ = writeln!(s, "    if {n}__opcode(code[i]) as u64 >= {n}__NUM_OPS {{ return Some(i); }}");
-    let _ = writeln!(s, "    bits[i >> 3] = bits[i >> 3] | ((1 as u8) << ((i & 7) as u8));");
-    let _ = writeln!(s, "    if i + {n}__op_size(code[i]) > code.len {{ return Some(i); }}");
-    let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
+    let _ = writeln!(s, "  if __code.len == 0 or __code.len > 524288 {{ return Some(0); }}");
+    let _ = writeln!(s, "  var __bits: [u8; 65536] = [0; 65536];");
+    let _ = writeln!(s, "  var __i: u64 = 0;");
+    let _ = writeln!(s, "  var __last: u64 = 0;");
+    let _ = writeln!(s, "  while __i < __code.len {{");
+    let _ = writeln!(s, "    if {n}__opcode(__code[__i]) as u64 >= {n}__NUM_OPS {{ return Some(__i); }}");
+    let _ = writeln!(s, "    __bits[__i >> 3] = __bits[__i >> 3] | ((1 as u8) << ((__i & 7) as u8));");
+    let _ = writeln!(s, "    if __i + {n}__op_size(__code[__i]) > __code.len {{ return Some(__i); }}");
+    let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
         let mut conds: Vec<String> = l.part_offsets(k)[1..]
             .iter()
-            .map(|(off, p)| format!("{n}__family(code[i + {off}]) != {}", l.ops[*p].family))
+            .map(|(off, p)| format!("{n}__family(__code[__i + {off}]) != {}", l.ops[*p].family))
             .collect();
-        // `then OP`: the next instruction must be an OP.
+        // `then OP`: the next instruction must be an OP; if this op may
+        // continue, something must come after that OP too.
         let b = l.base(k);
         if let Some(t) = l.ops[b].then {
             let sz = l.size(b);
-            conds.push(format!("i + {sz} >= code.len or {n}__family(code[i + {sz}]) != {}", l.ops[t].family));
+            conds.push(format!("__i + {sz} >= __code.len or {n}__family(__code[__i + {sz}]) != {}", l.ops[t].family));
+            if cont[b] {
+                conds.push(format!("__i + {sz} + {n}__base_size(__code[__i + {sz}]) >= __code.len"));
+            }
         }
         if !conds.is_empty() {
-            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(i); }} }}", o.opcode, conds.join(" or "));
+            let _ = writeln!(s, "      {} => {{ if {} {{ return Some(__i); }} }}", o.opcode, conds.join(" or "));
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}");
-    let _ = writeln!(s, "  i = 0;\n  while i < code.len {{");
-    let _ = writeln!(s, "    match {n}__opcode(code[i]) {{");
+    let _ = writeln!(s, "    __last = __i;\n    __i += {n}__base_size(__code[__i]);\n  }}");
+    // The walk is per component, so the last word group is never a
+    // super's head.
+    let _ = writeln!(s, "  if {n}__continues({n}__opcode(__code[__last]) as u64) {{ return Some(__last); }}");
+    let _ = writeln!(s, "  __i = 0;\n  while __i < __code.len {{");
+    let _ = writeln!(s, "    match {n}__opcode(__code[__i]) {{");
     for (k, o) in l.ops.iter().enumerate() {
         let mut checks = String::new();
-        // A super's head word carries its first part's operands; the
-        // other parts are checked at their own words.
         for (off, p) in l.part_offsets(k).into_iter().take(1) {
             let po = &l.ops[p];
             for (fi, (_, bits, shift, signed)) in po.fields.iter().enumerate() {
                 if let Some(c) = clause(&po.kinds[fi]) {
                     let _ = write!(
                         checks,
-                        "{{ let pc: *{w} = code.ptr + i + {off}; let w = code[i + {off}]; let it = {}; if !({}) {{ return Some(i + {off}); }} }} ",
+                        "{{ let pc: *{w} = __code.ptr + __i + {off}; let __w = __code[__i + {off}]; let it = {}; if !({}) {{ return Some(__i + {off}); }} }} ",
                         decode_src(l.word_bits, *bits, *shift, *signed),
                         c
                     );
@@ -274,8 +377,8 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> String {
         }
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
-    let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n  None\n}}");
-    s
+    let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}\n  None\n}}");
+    Ok(s)
 }
 
 pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
@@ -377,7 +480,10 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
                 let mut src = generate(v, &l);
-                src.push_str(&generate_verifier(sm, v, &l));
+                src.push_str(&generate_verifier(sm, v, &l)?);
+                if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
+                    eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
+                }
                 let fid = sm.add(format!("<vm {} expansion>", v.name.name), src.clone());
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);

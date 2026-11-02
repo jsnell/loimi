@@ -277,9 +277,9 @@ fn main() -> ExitCode {
             cmd.arg("-fno-sanitize-link-runtime");
         }
     }
-    cmd.arg("-x").arg("ir").arg(&ll).arg("-x").arg("none");
+    cmd.arg("-x").arg("ir").arg(&ll);
     if let Some(lib) = &asan_lib {
-        cmd.arg(lib);
+        cmd.arg("-x").arg("none").arg(lib);
     }
     let status = cmd.arg("-o").arg(&exe).arg("-lm").status();
     match status {
