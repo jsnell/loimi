@@ -311,6 +311,11 @@ pub struct FnDef {
     pub vm_state: Vec<LocalId>,
     /// Effects: EFF_SYNC | EFF_GC | EFF_REENTER.
     pub effects: u8,
+    /// Plain vm functions: effects of the calls they make, directly or
+    /// through other vm functions, beyond `effects`. Those calls are
+    /// synced in place, as in an op; callers root their traced locals at
+    /// a call of this function as if it had these effects.
+    pub sync_effects: u8,
 }
 
 impl FnDef {

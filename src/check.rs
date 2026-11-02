@@ -570,6 +570,7 @@ impl<'a> Checker<'a> {
             vm_role: VmRole::None,
             vm_state: vec![],
             effects: effects_of(&f.attrs)?,
+            sync_effects: 0,
         };
         Ok(())
     }
@@ -3020,6 +3021,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         vm_role: VmRole::None,
         vm_state: vec![],
         effects: 0,
+        sync_effects: 0,
     }
 }
 

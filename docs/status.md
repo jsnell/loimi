@@ -118,6 +118,9 @@ rejected (run by `cargo test`).
   the op's inline cache can be passed as a `c: cache Name` parameter (also
   to plain vm functions), which a shared copy receives as an address.
 - **Effects** must be declared; they are not inferred for private functions.
+  Handlers and plain vm functions are the exception: their effectful calls
+  are synced in place (in a vm function, through the state pointers it
+  sees), and callers of such a vm function root their traced locals there.
   Function types carry them (`fn(*Heap) uses gc`), so calls through function
   pointers are checked, synced and rooted like direct calls. There are no
   effect variables: a generic function cannot take "a callback with any

@@ -544,7 +544,9 @@ load overlaps with the handler's work.
 ### 3.5 VM functions
 
 A `fn` inside a `vm` block is a **vm function**. It can read and write state
-and is always inlined into its callers. If its return type is `never`, it
+and is always inlined into its callers. Like a handler, it may call
+effectful functions without declaring their effects; those calls are
+synced where they are made (section 5). If its return type is `never`, it
 can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
 `?` on the raise type. That makes shared tails easy to write:
 
@@ -723,6 +725,15 @@ Rules:
   store `pc` and the stack top to `ctx.sync`, and spill live `Value`/`Gc`
   locals into a per-vm temporary root area. With a moving collector it also
   reloads them afterwards. Calls without effects pay nothing.
+- **In plain vm functions** (section 3.5), effectful calls are synced in
+  place exactly as in a handler, without declaring the effect: a vm
+  function sees the calling handler's state through pointers and is
+  inlined into it, so `fn gc_point() { if ... { cold { gc.collect(..) } } }`
+  pays for the sync only on the path that collects. A handler (or vm
+  function) calling such a function roots its own traced locals at that
+  call, as for any call that may collect; it does not sync there. Declaring
+  `uses gc` on a vm function instead makes every call of it a synced call.
+  Called from an entry, nothing is synced (the run loop has not started).
 - **In ordinary functions**, `Gc`/`Value` locals that are live across a `gc`
   call are registered in a compiler-maintained shadow-stack frame. This only
   happens on paths that can collect, which are slow paths by nature.

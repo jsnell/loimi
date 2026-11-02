@@ -56,6 +56,9 @@ pub struct VmInfo {
     /// `-> never` vm functions, which may end in control words.
     pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
+    /// Calls between plain vm functions (caller, callee), to propagate
+    /// `sync_effects`.
+    pub fn_calls: Vec<(FnId, FnId)>,
 }
 
 /// An inline cache layout: per field its name, type and first word
@@ -103,6 +106,9 @@ pub struct HandlerCx {
     pub by_ptr: bool,
     /// In the body of a `-> never` vm function: no operands, `become` or `cache`.
     pub in_fn: bool,
+    /// In the body of plain vm function `f`: its effectful calls are synced
+    /// like a handler's, and their effects recorded in `sync_effects`.
+    pub vm_fn: Option<FnId>,
     /// Inside a `cold` block.
     pub cold: bool,
     /// The shared copy of `-> never` vm function `i`: `next` skips the
@@ -128,6 +134,7 @@ impl HandlerCx {
             state,
             by_ptr: false,
             in_fn: false,
+            vm_fn: None,
             cold: false,
             shared: None,
             inlining: vec![],
@@ -188,6 +195,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm_role: role,
         vm_state: vec![],
         effects: 0,
+        sync_effects: 0,
     });
     id
 }
@@ -474,11 +482,27 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         fn_caches,
         never_fns,
         sync: d.sync.clone(),
+        fn_calls: vec![],
     });
 
     // Bodies.
     for (fid, f) in fn_decls {
         check_vm_fn(c, vm, fid, &f)?;
+    }
+    // A vm function calling one whose calls are synced has those effects
+    // too (for rooting at its own call sites).
+    loop {
+        let mut changed = false;
+        for &(caller, callee) in &c.vms[i].fn_calls {
+            let e = c.prog.fns[callee as usize].sync_effects & !c.prog.fns[caller as usize].effects;
+            if e & !c.prog.fns[caller as usize].sync_effects != 0 {
+                c.prog.fns[caller as usize].sync_effects |= e;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
     for j in 0..c.vms[i].never_fns.len() {
         check_never_fn(c, vm, j)?;
@@ -758,7 +782,14 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     for (k, (p, t)) in f.params.iter().zip(pts[st.len()..].iter()).enumerate() {
         params.push(declare_param(&mut cx, &p.name.name, t, pcaches[k], &mut cache_params));
     }
-    cx.vm = Some(HandlerCx { is_handler: false, allow_control: false, by_ptr: true, cache_params, ..HandlerCx::new(vm, state.clone()) });
+    cx.vm = Some(HandlerCx {
+        is_handler: false,
+        allow_control: false,
+        by_ptr: true,
+        vm_fn: Some(fid),
+        cache_params,
+        ..HandlerCx::new(vm, state.clone())
+    });
     let b = c.block(&mut cx, f.body.as_ref().unwrap(), Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let fd = &mut c.prog.fns[fid as usize];
@@ -1251,6 +1282,9 @@ pub fn vm_fn_call(c: &mut Checker, cx: &mut FnCx, name: &str, args: &[Expr], spa
     }
     let Some(fid) = vm_fn(c, cx, name) else { return Ok(None) };
     let h = cx.vm.clone().unwrap();
+    if let Some(caller) = h.vm_fn {
+        c.vms[h.vm as usize].fn_calls.push((caller, fid));
+    }
     let info = &c.vms[h.vm as usize];
     let mut pre = Vec::new();
     for (i, (_, t)) in info.state.iter().enumerate() {
@@ -1373,7 +1407,15 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
     }
     let span = call.span;
     if let Some(h) = cx.vm.clone() {
-        if h.allow_control && h.is_handler {
+        // A plain vm function is inlined into vm code, and sees the
+        // caller's state through pointers: its effectful calls are synced
+        // in place, as in an op, so that only the path that makes the call
+        // pays. Its callers root their traced locals (`sync_effects`).
+        let in_vm_fn = h.vm_fn.is_some() && h.by_ptr;
+        if (h.allow_control && h.is_handler) || in_vm_fn {
+            if let Some(fid) = h.vm_fn {
+                c.prog.fns[fid as usize].sync_effects |= missing;
+            }
             let sync = match c.vms[h.vm as usize].sync.clone() {
                 Some(b) => c.block(cx, &b, Some(&Ty::Unit))?,
                 None => mk(Ty::Unit, TK::Unit, span),
