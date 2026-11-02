@@ -1,0 +1,157 @@
+// nanbox with more than 7 tagged variants: blocks of the NaN space sized
+// to each payload (48 bits for pointers and i48, 47 for i47, 32 for u32,
+// 0 for no payload), allocated widest first. The encodings are part of
+// the documented layout (docs/lowering.md), so they are checked here.
+import std.io;
+
+struct Obj { id: i64 }
+
+value S repr nanbox {
+    Num(f64) unboxed,
+    Int(i48),
+    P(*Obj),
+    Sym(*Obj),
+    Str(*Obj),
+    Vec(*Obj),
+    Clo(*Obj),
+    Nil,
+    F,
+    T,
+    Unspec,
+    Eof,
+    Char(u32),
+    Prim(u16),
+    Small(i47),
+    Flag(bool),
+}
+
+fn hex(x: u64) {
+    let digits = "0123456789abcdef";
+    var i: u64 = 0;
+    while i < 16 {
+        io.print(digits[((x >> (60 - 4 * i)) & 15)..((x >> (60 - 4 * i)) & 15) + 1]);
+        i = i + 1;
+    }
+    io.println("");
+}
+
+fn p(x: i64) { io.print_int(x); io.println(""); }
+
+fn describe(v: S) -> str {
+    match v {
+        Num(_) => "num",
+        Int(_) => "int",
+        P(_) => "pair",
+        Sym(_) => "sym",
+        Str(_) => "str",
+        Vec(_) => "vec",
+        Clo(_) => "clo",
+        Nil => "nil",
+        F => "#f",
+        T => "#t",
+        Unspec => "unspec",
+        Eof => "eof",
+        Char(_) => "char",
+        Prim(_) => "prim",
+        Small(_) => "small",
+        Flag(_) => "flag",
+    }
+}
+
+fn add(a: S, b: S) -> S {
+    match (a, b) {
+        (Int(x), Int(y)) => {
+            if let Some(r) = x.add_checked(y) { return Int(r); }
+            Num(x as f64 + y as f64)
+        }
+        (Num(x), Num(y)) => Num(x + y),
+        (Small(x), Small(y)) => match x.add_checked(y) { Some(r) => Small(r), None => Eof },
+        (Int(x), Char(c)) => Int(x + c as i48),
+        (Nil, Nil) => T,
+        _ => F,
+    }
+}
+
+fn show_int(v: S) {
+    match v { Int(x) => p(x as i64), Num(x) => { io.print("num "); io.print_int(x as i64); io.print(".0"); io.println(""); }, _ => io.println(describe(v)) }
+}
+
+fn main() {
+    var o1 = Obj { id: 1 };
+    var o2 = Obj { id: 2 };
+    // Encodings.
+    hex(S.Int(-1) as u64);
+    hex(S.Clo(&o1) as u64 & 0xFFFF000000000000);
+    hex(S.Small(-1) as u64);
+    hex(S.Char(0x41) as u64);
+    hex(S.Prim(7) as u64);
+    hex(S.Nil as u64);
+    hex(S.F as u64);
+    hex(S.T as u64);
+    hex(S.Unspec as u64);
+    hex(S.Eof as u64);
+    hex(S.Flag(true) as u64);
+    // Every variant round-trips and is told apart from the others.
+    let all = [S.Num(2.5), S.Int(-3), S.P(&o1), S.Sym(&o1), S.Str(&o2), S.Vec(&o2), S.Clo(&o1),
+               S.Nil, S.F, S.T, S.Unspec, S.Eof, S.Char(0x10FFFF), S.Prim(65535), S.Small(-70368744177664),
+               S.Flag(false)];
+    for i in 0..16 { io.print(describe(all[i])); io.print(","); }
+    io.println("");
+    match all[2] { P(o) => p(o.id), _ => io.println("?") }
+    match all[4] { Str(o) => p(o.id), _ => io.println("?") }
+    match all[12] { Char(c) => p(c as i64), _ => io.println("?") }
+    match all[13] { Prim(x) => p(x as i64), _ => io.println("?") }
+    match all[14] { Small(x) => p(x as i64), _ => io.println("?") }
+    match all[15] { Flag(b) => io.print_bool(b), _ => io.print("?") }
+    io.println("");
+    // 48-bit integer arithmetic with overflow to flonums.
+    show_int(add(S.Int(140737488355326), S.Int(1)));
+    show_int(add(S.Int(140737488355327), S.Int(1)));
+    show_int(add(S.Int(-140737488355328), S.Int(-1)));
+    show_int(add(S.Int(-5), S.Int(3)));
+    show_int(add(S.Int(10), S.Char(5)));
+    show_int(add(S.Num(0.5), S.Num(2.5)));
+    show_int(add(S.Small(70368744177663), S.Small(1)));
+    show_int(add(S.Small(-1), S.Small(-2)));
+    match add(S.Small(-3), S.Small(-4)) { Small(x) => p(x as i64), _ => io.println("?") }
+    show_int(add(S.Nil, S.Nil));
+    show_int(add(S.Nil, S.F));
+    // Equality is bitwise.
+    io.print_bool(S.Int(5) == S.Int(5)); io.print_bool(S.Char(5) == S.Prim(5)); io.print_bool(S.T == S.T);
+    io.println("");
+    // NaN canonicalization: NaNs whose bits fall in tag blocks stay Num.
+    let forged: [u64; 5] = [0xFFF8800000000001, 0xFFFF000100010000, 0xFFF9000000000005, 0xFFFFFFFFFFFFFFFF, 0xFFF8000000000000];
+    for i in 0..5 { io.print(describe(S.Num(f64.from_bits(forged[i])))); io.print(","); }
+    io.println("");
+}
+// expect: fff9ffffffffffff
+// expect: fffe000000000000
+// expect: fff8ffffffffffff
+// expect: ffff000000000041
+// expect: ffff000100000007
+// expect: ffff000100010002
+// expect: ffff000100010003
+// expect: ffff000100010004
+// expect: ffff000100010005
+// expect: ffff000100010006
+// expect: ffff000100010001
+// expect: num,int,pair,sym,str,vec,clo,nil,#f,#t,unspec,eof,char,prim,small,flag,
+// expect: 1
+// expect: 2
+// expect: 1114111
+// expect: 65535
+// expect: -70368744177664
+// expect: false
+// expect: 140737488355327
+// expect: num 140737488355328.0
+// expect: num -140737488355329.0
+// expect: -2
+// expect: 15
+// expect: num 3.0
+// expect: eof
+// expect: small
+// expect: -7
+// expect: #t
+// expect: #f
+// expect: truefalsetrue
+// expect: num,num,num,num,num,

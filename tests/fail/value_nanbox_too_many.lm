@@ -1,0 +1,6 @@
+struct O { x: i64 }
+value V repr nanbox {
+    Num(f64) unboxed, Int(i48), A(*O), B(*O), C(*O), D(*O), E(*O), F(*O), G(*O), Nil,
+}
+fn main() {}
+// error: no room for variant `G` in the nanbox's NaN space

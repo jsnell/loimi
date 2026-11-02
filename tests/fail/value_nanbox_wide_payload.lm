@@ -1,0 +1,4 @@
+struct O { x: i64 }
+value V repr nanbox { Num(f64) unboxed, Int(i49), Nil }
+fn main() {}
+// error: nanbox payloads must be integers of at most 48 bits

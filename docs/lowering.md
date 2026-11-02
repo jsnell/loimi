@@ -28,36 +28,129 @@ Everything after vm expansion is a normal compiler. The output can be
 bitcode, so a Loimi interpreter can be LTO-linked into a C/C++ host with
 `clang -flto`.
 
-## 2. Values (`repr nanbox`)
+## 2. Values (`nanbox`, `lowtag`, `boxed`)
 
-`Value` is an `i64`. Tag assignment for the example:
+### `nanbox`
+
+`Value` is an `i64`. The `unboxed` variant is the double's bits, with NaNs
+canonicalized to `0x7FF8_0000_0000_0000`. Doubles therefore never exceed
+`0xFFF8_0000_0000_0000` (the negative default NaN that x86 arithmetic
+produces from canonical inputs), and every word above it is free for the
+other variants. Each tagged variant owns an aligned block of that space:
+its words are `tag << w | payload`, where `w` is the block's width in bits
+and the payload is stored zero-extended in the low `w` bits.
+
+**Classic layout (at most 7 tagged variants).** Each variant gets a 48-bit
+block, `0xFFF9` to `0xFFFF` in the top 16 bits, in declaration order.
+For the example in language.md:
 
 | Variant | Encoding |
 |---|---|
-| `Num(f64)` | the double's bits, with NaNs canonicalized to `0x7FF8_0000_0000_0000`; always `< 0xFFF9 << 48` |
-| `Int(i32)` | `0xFFF9_0000_xxxx_xxxx` |
-| `Nil`, `Bool` | `0xFFFA_...` with payload 0 / 1 / 2 |
-| `Str`, `Obj`, `Fn`, `Native` | `0xFFFB`–`0xFFFE` in the top 16 bits, 48-bit pointer in the rest |
+| `Num(f64)` | the double's bits; always `< 0xFFF9 << 48` |
+| `Int(i48)` | `0xFFF9_xxxx_xxxx_xxxx` (the integer's low 48 bits) |
+| `Nil`, `Bool(bool)` | `0xFFFA_0000_0000_0000`, `0xFFFB_0000_0000_000b` |
+| `Str`, `Obj`, `Fn`, `Native` | `0xFFFC`–`0xFFFF` in the top 16 bits, 48-bit pointer in the rest |
 
-Pattern tests the compiler emits (`T_INT = 0xFFF9 << 48`, decimal
-`-1970324836974592` as a signed i64):
+Declarations written before wide tags existed keep exactly this encoding.
+
+**Packed layout (more than 7 tagged variants).** Each variant needs a block
+of 2^w words, where `w` is its payload width: 48 for pointers, `N` for
+`iN`/`uN`, 1 for `bool`, 0 for no payload. The free space is the seven
+48-bit blocks `0xFFF9..0xFFFF` and the 47-bit block
+`0xFFF8_8000_0000_0000..0xFFF8_FFFF_FFFF_FFFF` (the upper half of `0xFFF8`,
+which no canonical double reaches). Variants are placed widest first by a
+buddy allocator: each takes the smallest free block that fits (lowest
+address on ties) and splits it in halves down to its size. For example,
+`tests/run/values_nanbox_packed.lm`:
+
+| Variant | Width | Block | Encoding |
+|---|---|---|---|
+| `Num(f64) unboxed` | | | `< 0xFFF8_8000_0000_0000` |
+| `Int(i48)`, `P`, `Sym`, `Str`, `Vec`, `Clo` (pointers) | 48 | `0xFFF9`..`0xFFFE` | `0xFFF9_xxxx_xxxx_xxxx`, ... |
+| `Small(i47)` | 47 | the `0xFFF8` upper half | `0xFFF8_8000_0000_0000 \| x` |
+| `Char(u32)` | 32 | low end of `0xFFFF` | `0xFFFF_0000_xxxx_xxxx` |
+| `Prim(u16)` | 16 | | `0xFFFF_0001_0000_xxxx` |
+| `Flag(bool)` | 1 | | `0xFFFF_0001_0001_000b` |
+| `Nil`, `F`, `T`, `Unspec`, `Eof` | 0 | | `0xFFFF_0001_0001_0002` .. `0006` |
+
+The unboxed limit `NUM` is the lowest tagged word: `0xFFF9 << 48` in the
+classic layout, `0xFFF8_8000_0000_0000` if the 47-bit block is used.
+
+Pattern tests (`T` is the variant's tag, `w` its block width):
+
+| Pattern | Test | x86-64 |
+|---|---|---|
+| `v is Num` | `v <u NUM` | `cmp; jae` |
+| `v is Int` | `(v >> w) == T` | `shr; cmp` |
+| `v is Nil` (no payload, packed) | `v == T` | `cmp` |
+| `(a, b) is (Int, Int)` | `((a ^ T<<w) \| (b ^ T<<w)) >> w == 0` | `xor; xor; or; shr; jne` |
+| `(a, b) is (Num, Num)` | `umax(a, b) <u NUM` | `cmp; cmova; cmp` |
+| payload of a pointer variant | `v & (2^w - 1)` | `and` |
+| payload of an `iN` variant | `trunc v to iN` | free |
+
+Tuple elements with tags in the same position (same `w`) merge into one
+test; elements with different widths are tested separately and the results
+and-ed. A tuple pattern of `k` values usually costs one test, not `k`.
+
+### `lowtag`
+
+The word is `payload << s | tag`, where `tag` has `s` bits. With at most 8
+variants, `s = 3` and the tag is the variant's index; pointers (8-byte
+aligned) are or-ed with it, integers of up to 61 bits are shifted by 3.
+With more, pointers and 61-bit integers take 3-bit tags, and a variant with
+an `N`-bit payload gets a tag of `64 - N` bits allocated from what is left
+(the same buddy allocator, where splitting a tag appends a 0 or a 1 bit).
 
 | Pattern | Test |
 |---|---|
-| `v is Num` | `v <u T_INT` |
-| `v is Int` | `(v >> 48) == 0xFFF9` |
-| `(a, b) is (Int, Int)` | `((a ^ T_INT) \| (b ^ T_INT)) >> 48 == 0` |
-| `(a, b) is (Num, Num)` | `umax(a, b) <u T_INT` |
-| `v is Obj` | `(v >> 48) == 0xFFFC` |
-| payload of a pointer variant | `v & 0x0000_FFFF_FFFF_FFFF` |
+| `v is Int` | `(v & (2^s - 1)) == T` |
+| `(a, b) is (Int, Int)` | `((a ^ T) \| (b ^ T)) & (2^s - 1) == 0`; for `T = 0`: `(a \| b) & 7 == 0` |
+| payload of a pointer variant | `v & -8` |
+| payload of an integer variant | `ashr exact (v ^ T), s` |
 
-The match compiler works over the declared encodings. It tries tag-merging
-rules (xor/or for equal tags, umax/umin for range-encoded variants) before
-falling back to a decision tree. A tuple pattern of `k` values usually costs
-one test, not `k`.
+The `exact` flag (the shifted-out bits are known to be zero) lets LLVM
+cancel the shift against the `<< s` of overflow-checked arithmetic and of
+re-tagging, so an `Int(i61)` add with tag 0 is `or; test; jne; add; jo;
+store`, with no untagging at all.
 
-For `repr lowtag(bits = 1)` with tag bit 1 meaning integer:
-`(Int, Int)` becomes `(a & b & 1) == 1`, and `Int(x)` becomes `(x << 1) | 1`.
+### Overflow-checked arithmetic on odd widths
+
+`add_checked`/`sub_checked`/`mul_checked` (and the checked `+ - *` of debug
+builds) on `iN` with `N` not 8/16/32/64 shift the operands to the top of an
+i64 and use LLVM's 64-bit overflow intrinsics, whose flag is then exactly
+the overflow at `N` bits (for `mul` only one operand is shifted):
+
+```llvm
+%xs = shl i64 %x64, 16          ; i48 payloads
+%ys = shl i64 %y64, 16
+%r  = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 %xs, i64 %ys)
+%v  = ashr exact i64 %r0, 16    ; exact: the low 16 bits are zero
+```
+
+For an `Int(i48)` nanbox add the hot path is
+
+```asm
+shlq   $16, %rdx        ; x << 16  (the tag shifts out)
+shlq   $16, %rsi        ; y << 16
+addq   %rsi, %rdi
+jo     .Lslow
+shrq   $16, %rdi        ; back to 48 bits, zero-extended
+orq    %rcx, %rdi       ; | 0xFFF9 << 48
+```
+
+against `addl; jo; movl; orq` for `Int(i32)`. LLVM's own legalization of
+`sadd.with.overflow.i48` sign-extends both operands (`shl; sar` each) and
+compares the result with its re-extension, about twice as long.
+Relational compares of odd widths likewise compare the operands shifted to
+the top (`shl; shl; cmp`, not `shl; sar` per operand), and `/` and `%`
+wider than 32 bits use a 32-bit divide when both operands are non-negative
+and below 2^31 (64-bit `idiv` is two to three times slower on many x86
+cores).
+
+### `boxed`
+
+`{ i64 tag, i64 payload }`, passed and returned in two registers; the tag
+is the variant's index and integer payloads are sign- or zero-extended.
 
 ## 3. Handlers in `tailcall` mode
 

@@ -1,0 +1,6 @@
+struct O { x: i64 }
+value L repr lowtag {
+    Int(i61), A(*O), B(*O), C(*O), D(*O), E(*O), F(*O), G(*O), Nil,
+}
+fn main() {}
+// error: no room for variant `Nil` in the lowtag's tag space

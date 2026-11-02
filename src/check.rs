@@ -267,6 +267,7 @@ impl<'a> Checker<'a> {
                             name: format!("{}.{}", prefix, v.name.name),
                             repr: ValueRepr::NanBox,
                             variants: vec![],
+                            num_limit: 0,
                         });
                         self.define(m, &v.name, Def::Value(id), v.is_pub)?;
                     }
@@ -479,6 +480,15 @@ impl<'a> Checker<'a> {
         }
         if f.linkage != Linkage::Extern && f.body.is_none() {
             return Err(Diag::new(f.name.span, "function needs a body"));
+        }
+        if f.linkage != Linkage::Internal {
+            let odd = |t: &Ty| matches!(t, Ty::Int(it) if !matches!(it.bits, 8 | 16 | 32 | 64));
+            if let Some(t) = param_tys.iter().chain(std::iter::once(&ret)).find(|t| odd(t)) {
+                return Err(Diag::new(
+                    f.name.span,
+                    format!("`{}` has no C ABI: C functions take and return 8-, 16-, 32- or 64-bit integers", self.ty_name(t)),
+                ));
+            }
         }
         let inline = if f.attrs.has("inline") {
             match f.attrs.get("inline").unwrap().first().map(|s| s.as_str()) {
@@ -2176,6 +2186,14 @@ impl<'a> Checker<'a> {
                 if v.ty == Ty::F32 {
                     v = mk(Ty::F64, TK::Cast(Box::new(v)), a.span);
                 }
+                // C has no odd-width integers: pass an i48 as a (sign- or
+                // zero-extended) 64-bit integer, like C's own promotions.
+                if let Ty::Int(it) = v.ty {
+                    if !matches!(it.bits, 8 | 16 | 32 | 64) {
+                        let wide = IntTy { signed: it.signed, bits: 64 };
+                        v = mk(Ty::Int(wide), TK::Cast(Box::new(v)), a.span);
+                    }
+                }
                 pre.push(v);
             }
         }
@@ -2676,8 +2694,24 @@ pub fn prim_type(name: &str) -> Option<Ty> {
         "f64" => Ty::F64,
         "bool" => Ty::Bool,
         "str" => Ty::str(),
-        _ => return None,
+        _ => return arbitrary_int(name).map(Ty::Int),
     })
+}
+
+/// `iN` / `uN` for any width 1..=64 (`i48`, `u61`, ...): LLVM integer
+/// types of that width, used mainly as `value` payloads.
+fn arbitrary_int(name: &str) -> Option<IntTy> {
+    let signed = match name.as_bytes().first()? {
+        b'i' => true,
+        b'u' => false,
+        _ => return None,
+    };
+    let digits = &name[1..];
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 2 {
+        return None;
+    }
+    let bits: u8 = digits.parse().ok()?;
+    (1..=64).contains(&bits).then_some(IntTy { signed, bits })
 }
 
 pub fn is_place(e: &TExpr) -> bool {

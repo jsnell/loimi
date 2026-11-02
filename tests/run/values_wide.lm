@@ -1,0 +1,253 @@
+// Wide integer payloads: Int(i48) in a nanbox (the 48-bit block layout
+// used with at most 7 tagged variants), Int(i61) in a lowtag (3-bit tags),
+// and a lowtag with more than 8 variants (longer tags for narrow ones).
+import std.io;
+
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    Ref(*Obj),
+    U(u48),
+    B(bool),
+}
+
+value L repr lowtag {
+    Int(i61),
+    Nil,
+    Ref(*Obj),
+    B(bool),
+}
+
+value M repr lowtag {
+    P0(*Obj), P1(*Obj), P2(*Obj), P3(*Obj), P4(*Obj), P5(*Obj), P6(*Obj),
+    Int(i60),
+    Char(u32),
+    B(bool),
+    Nil,
+}
+
+value X repr boxed {
+    Int(i48),
+    Nil,
+}
+
+fn hex(x: u64) {
+    let digits = "0123456789abcdef";
+    var i: u64 = 0;
+    while i < 16 {
+        let d = (x >> (60 - 4 * i)) & 15;
+        io.print(digits[d..d + 1]);
+        i = i + 1;
+    }
+    io.println("");
+}
+
+fn p(x: i64) { io.print_int(x); io.println(""); }
+
+fn vadd(a: V, b: V) -> V {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.add_checked(y) { Some(r) => Int(r), None => Num(x as f64 + y as f64) },
+        (Num(x), Num(y)) => Num(x + y),
+        (Int(x), Num(y)) => Num(x as f64 + y),
+        _ => Nil,
+    }
+}
+
+fn vmul(a: V, b: V) -> V {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.mul_checked(y) { Some(r) => Int(r), None => Nil },
+        _ => Nil,
+    }
+}
+
+fn vshow(v: V) {
+    match v {
+        Num(x) => { io.print("num "); io.print_int(x as i64); io.println(""); }
+        Int(x) => { io.print("int "); p(x as i64); }
+        Nil => io.println("nil"),
+        Ref(o) => { io.print("ref "); p(o.id); }
+        U(x) => { io.print("u "); p(x as i64); }
+        B(b) => { io.print("b "); io.print_bool(b); io.println(""); }
+    }
+}
+
+fn ladd(a: L, b: L) -> L {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.add_checked(y) { Some(r) => Int(r), None => Nil },
+        _ => B(false),
+    }
+}
+
+fn lsub(a: L, b: L) -> L {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.sub_checked(y) { Some(r) => Int(r), None => Nil },
+        _ => B(false),
+    }
+}
+
+fn lmul(a: L, b: L) -> L {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.mul_checked(y) { Some(r) => Int(r), None => Nil },
+        _ => B(false),
+    }
+}
+
+fn lshow(v: L) {
+    match v {
+        Int(x) => { io.print("int "); p(x as i64); }
+        Nil => io.println("nil"),
+        Ref(o) => { io.print("ref "); p(o.id); }
+        B(b) => { io.print("b "); io.print_bool(b); io.println(""); }
+    }
+}
+
+fn mshow(v: M) {
+    match v {
+        P0(o) => { io.print("p0 "); p(o.id); }
+        P1(o) => { io.print("p1 "); p(o.id); }
+        P2(o) => { io.print("p2 "); p(o.id); }
+        P3(o) => { io.print("p3 "); p(o.id); }
+        P4(o) => { io.print("p4 "); p(o.id); }
+        P5(o) => { io.print("p5 "); p(o.id); }
+        P6(o) => { io.print("p6 "); p(o.id); }
+        Int(x) => { io.print("int "); p(x as i64); }
+        Char(c) => { io.print("char "); p(c as i64); }
+        B(b) => { io.print("b "); io.print_bool(b); io.println(""); }
+        Nil => io.println("nil"),
+    }
+}
+
+fn madd(a: M, b: M) -> M {
+    match (a, b) {
+        (Int(x), Int(y)) => match x.add_checked(y) { Some(r) => Int(r), None => Nil },
+        (Char(x), Char(y)) => Char(x + y),
+        _ => B(true),
+    }
+}
+
+fn main() {
+    var o = Obj { id: 77 };
+    io.println("-- nanbox i48");
+    hex(V.Int(-1) as u64);
+    hex(V.Int(0) as u64);
+    hex(V.U(281474976710655) as u64);
+    vshow(V.Int(-140737488355328));
+    vshow(V.Int(140737488355327));
+    vshow(V.U(281474976710655));
+    vshow(vadd(V.Int(140737488355326), V.Int(1)));
+    vshow(vadd(V.Int(140737488355327), V.Int(1)));
+    vshow(vadd(V.Int(-140737488355328), V.Int(-1)));
+    vshow(vadd(V.Int(-7), V.Int(-8)));
+    vshow(vadd(V.Int(2), V.Num(0.5)));
+    vshow(vadd(V.Num(1.5), V.Num(2.5)));
+    vshow(vadd(V.Nil, V.Int(1)));
+    vshow(vmul(V.Int(16777216), V.Int(8388607)));
+    vshow(vmul(V.Int(16777216), V.Int(8388608)));
+    vshow(vmul(V.Int(-16777216), V.Int(8388608)));
+    vshow(V.Ref(&o));
+    vshow(V.B(true));
+    io.print_bool(V.Int(-1) == V.Int(-1)); io.print_bool(V.Int(-1) == V.U(281474976710655)); io.println("");
+    match V.Num(f64.from_bits(0xFFF9000000000001)) { Num(_) => io.println("nan is num"), _ => io.println("forged!") }
+
+    io.println("-- lowtag i61");
+    hex(L.Int(-1) as u64);
+    hex(L.Nil as u64);
+    hex(L.B(true) as u64);
+    lshow(L.Int(1152921504606846975));
+    lshow(L.Int(-1152921504606846976));
+    lshow(ladd(L.Int(1152921504606846974), L.Int(1)));
+    lshow(ladd(L.Int(1152921504606846975), L.Int(1)));
+    lshow(ladd(L.Int(-1152921504606846976), L.Int(-1)));
+    lshow(ladd(L.Int(-5), L.Int(3)));
+    lshow(lsub(L.Int(-1152921504606846975), L.Int(1)));
+    lshow(lsub(L.Int(-1152921504606846976), L.Int(1)));
+    lshow(lmul(L.Int(1073741824), L.Int(1073741823)));
+    lshow(lmul(L.Int(1073741824), L.Int(1073741824)));
+    lshow(lmul(L.Int(-1073741824), L.Int(1073741824)));
+    lshow(ladd(L.Nil, L.Int(1)));
+    lshow(L.Ref(&o));
+    lshow(L.B(true));
+
+    io.println("-- lowtag packed");
+    hex(M.P6(&o) as u64 & 7);
+    hex(M.Int(-1) as u64);
+    hex(M.Char(0x41) as u64);
+    hex(M.B(true) as u64);
+    hex(M.Nil as u64);
+    var objs = [Obj { id: 0 }, Obj { id: 1 }, Obj { id: 2 }, Obj { id: 3 }, Obj { id: 4 }, Obj { id: 5 }, Obj { id: 6 }];
+    let ms = [M.P0(&objs[0]), M.P1(&objs[1]), M.P2(&objs[2]), M.P3(&objs[3]), M.P4(&objs[4]), M.P5(&objs[5]), M.P6(&objs[6]),
+              M.Int(-576460752303423488), M.Char(0xFFFFFFFF), M.B(false), M.Nil];
+    for i in 0..11 { mshow(ms[i]); }
+    mshow(madd(M.Int(576460752303423487), M.Int(-1)));
+    mshow(madd(M.Int(576460752303423487), M.Int(1)));
+    mshow(madd(M.Char(1), M.Char(2)));
+    mshow(madd(M.Char(1), M.Int(2)));
+
+    io.println("-- boxed i48");
+    match X.Int(-140737488355328) { Int(x) => match x.sub_checked(1) { Some(_) => io.println("?"), None => io.println("overflow") }, Nil => io.println("?") }
+}
+// expect: -- nanbox i48
+// expect: fff9ffffffffffff
+// expect: fff9000000000000
+// expect: fffcffffffffffff
+// expect: int -140737488355328
+// expect: int 140737488355327
+// expect: u 281474976710655
+// expect: int 140737488355327
+// expect: num 140737488355328
+// expect: num -140737488355329
+// expect: int -15
+// expect: num 2
+// expect: num 4
+// expect: nil
+// expect: int 140737471578112
+// expect: nil
+// expect: int -140737488355328
+// expect: ref 77
+// expect: b true
+// expect: truefalse
+// expect: nan is num
+// expect: -- lowtag i61
+// expect: fffffffffffffff8
+// expect: 0000000000000001
+// expect: 000000000000000b
+// expect: int 1152921504606846975
+// expect: int -1152921504606846976
+// expect: int 1152921504606846975
+// expect: nil
+// expect: nil
+// expect: int -2
+// expect: int -1152921504606846976
+// expect: nil
+// expect: int 1152921503533105152
+// expect: nil
+// expect: int -1152921504606846976
+// expect: b false
+// expect: ref 77
+// expect: b true
+// expect: -- lowtag packed
+// expect: 0000000000000006
+// expect: fffffffffffffff7
+// expect: 000000410000000f
+// expect: 800000008000000f
+// expect: 400000008000000f
+// expect: p0 0
+// expect: p1 1
+// expect: p2 2
+// expect: p3 3
+// expect: p4 4
+// expect: p5 5
+// expect: p6 6
+// expect: int -576460752303423488
+// expect: char 4294967295
+// expect: b false
+// expect: nil
+// expect: int 576460752303423486
+// expect: nil
+// expect: char 3
+// expect: b true
+// expect: -- boxed i48
+// expect: overflow

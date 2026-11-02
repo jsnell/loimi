@@ -32,6 +32,7 @@ roughly C's level of abstraction. It has deliberately few novel features.
 
 ```loimi
 i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
+iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
 [T; N]          // fixed array
 []T             // slice (ptr + len), bounds-checked
 *T, *mut T      // raw non-null pointers; null is ?*T
@@ -124,6 +125,16 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   release builds. Explicit forms: `a +% b` (wrapping), `a.add_checked(b) -> ?T`,
   `a.add_overflow(b) -> (T, bool)`. These map directly to LLVM's
   `*.with.overflow` intrinsics, which guest integer semantics need constantly.
+- **Arbitrary-width integers.** `iN` and `uN` for any `N` from 1 to 64 are
+  integer types of exactly that width (LLVM's `iN`): arithmetic wraps,
+  overflows and is checked at `N` bits, `as` sign- or zero-extends from `N`
+  bits, and shift amounts are taken modulo `N`. Their main use is `value`
+  payloads (`Int(i48)` in a nanbox, `Int(i61)` in a lowtag), where they
+  record exactly how many bits the encoding keeps. Overflow-checked
+  `+ - *` on an odd width are done in 64 bits with the operands shifted to
+  the top, so `x.add_checked(y)` on `i48` costs two shifts more than on
+  `i64` and no compares. In memory they take the next power-of-two size
+  (`i48`: 8 bytes, `u24`: 4).
 - Hints: `likely(c)`, `unlikely(c)`, `assume(c)`, `unreachable`, `#[cold]`,
   `#[inline(always)]`, `#[inline(never)]`.
 - `unsafe { }` permits raw pointer dereference and unchecked indexing.
@@ -166,7 +177,7 @@ declaration:
 ```loimi
 value Value repr nanbox {
     Num(f64) unboxed,          // any bit pattern that isn't a boxed tag
-    Int(i32),
+    Int(i48),                  // 48-bit integers: overflow at 2^47
     Nil,
     Bool(bool),
     Str(Gc<Str>),
@@ -180,8 +191,8 @@ Available representations:
 
 | `repr` | Layout | Typical user |
 |---|---|---|
-| `nanbox` | 64-bit word. Doubles stored directly; other variants in the quiet-NaN space with a 48-bit payload | JS engines, LuaJIT |
-| `lowtag(bits = N)` | 64-bit word. Aligned pointers with tag bits in the low bits; small integers shifted | Ruby, OCaml, many Schemes |
+| `nanbox` | 64-bit word. Doubles stored directly; other variants in the NaN space with payloads of up to 48 bits | JS engines, LuaJIT |
+| `lowtag` | 64-bit word. Aligned pointers with tag bits in the low bits; integers of up to 61 bits shifted | Ruby, OCaml, many Schemes |
 | `boxed` | Two words `{tag, payload}`, passed and returned in two registers | PUC Lua (`TValue`) |
 | `pointer` | Everything is a `Gc<_>` with a header type tag | CPython |
 
@@ -204,6 +215,31 @@ The compiler chooses tag assignments, or you can pin them
 - **Portability.** `nanbox` requires 48-bit pointers. On targets where that
   doesn't hold, or in wasm32, the compiler can fall back to `boxed` with a
   warning, and the source does not change.
+
+**Payload widths and the number of variants.** A variant's payload is an
+integer (`iN`/`uN`, section 1.1), `bool`, a pointer (`*T`, `Gc<T>`), or
+nothing; in a nanbox, one `unboxed` variant holds the `f64`. Integer
+payloads are as wide as their type says, so `Int(i48)` keeps 48 bits and
+`x.add_checked(y)` on its payload detects overflow of 48 bits.
+
+| `repr` | Payloads | Tagged variants |
+|---|---|---|
+| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads. Beyond 7, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word). |
+| `lowtag` | integers up to 61 bits (`i61`), `bool`, pointers (8-byte aligned) | Up to 8 with any payloads. Beyond 8, pointers and 61-bit integers take one 3-bit tag each, and a variant with an N-bit payload can have a tag of up to 64 - N bits, so narrow variants share what is left. |
+| `boxed` | any number, `bool`, pointers | any number |
+
+For example, a Scheme value with `Num(f64) unboxed`, `Int(i48)`, five
+pointer types, `Char(u32)`, a `Prim(u16)` builtin index and nullary `Nil`,
+`False`, `True`, `Eof` fits a nanbox: the integer and pointers take six
+48-bit blocks and the rest share the remaining space. A declaration that
+does not fit is a compile error naming the variant with no room.
+
+The fast paths do not depend on the layout: a variant test is one shift and
+compare (`(v >> w) == tag` in a nanbox, `(v & mask) == tag` in a lowtag,
+`v == word` for a variant without payload), the unboxed `f64` test is one
+unsigned compare, and tuple patterns whose elements have tags in the same
+position merge into one test. Extracting a pointer is one `and`. See
+[lowering.md](lowering.md) section 2 for the encodings.
 
 Switching `repr` is a one-word change, which makes the representation
 something you can benchmark rather than something you commit to on day one.

@@ -1365,6 +1365,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 (Ge, false) => "uge",
                 _ => unreachable!(),
             };
+            if let Ty::Int(it) = t {
+                if !matches!(it.bits, 8 | 16 | 32 | 64) {
+                    // Odd widths (i48 payloads): compare in i64 with both
+                    // operands shifted to the top, one `shl` each, instead
+                    // of LLVM's sign-extension (`shl` + `sar`) of each.
+                    let k = 64 - it.bits as u32;
+                    let mut w = Vec::new();
+                    for v in [&x, &y] {
+                        let z = self.inst(format!("zext {} {} to i64", lt, v));
+                        w.push(self.inst(format!("shl i64 {}, {}", z, k)));
+                    }
+                    return self.inst(format!("icmp {} i64 {}, {}", c, w[0], w[1]));
+                }
+            }
             return self.inst(format!("icmp {} {} {}, {}", c, lt, x, y));
         }
         if matches!(op, Add | Sub | Mul) && self.cg.opts.overflow_checks && t.is_int() {
@@ -1373,13 +1387,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 Sub => "sub",
                 _ => "mul",
             };
-            let pre = if signed { "s" } else { "u" };
-            let intr = format!("llvm.{}{}.with.overflow.{}", pre, name, lt);
-            self.cg.decls.insert(format!("declare {{ {}, i1 }} @{}({}, {})", lt, intr, lt, lt));
-            let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, intr, lt, x, lt, y));
-            let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+            let Ty::Int(it) = t else { unreachable!() };
+            let (r, ov) = self.overflow_op(*it, name, &x, &y);
             self.check(&ov, "integer overflow", e.span);
-            return self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
+            return r;
         }
         if matches!(op, Div | Rem) && t.is_int() {
             let z = self.inst(format!("icmp eq {} {}, 0", lt, y));
@@ -1408,10 +1419,86 @@ impl<'a, 'p> FnGen<'a, 'p> {
         };
         if matches!(op, Shl | Shr) {
             let Ty::Int(it) = t else { unreachable!() };
-            let m = self.inst(format!("and {} {}, {}", lt, y, it.bits - 1));
+            let m = if it.bits.is_power_of_two() {
+                self.inst(format!("and {} {}, {}", lt, y, it.bits - 1))
+            } else {
+                self.inst(format!("urem {} {}, {}", lt, y, it.bits))
+            };
             return self.inst(format!("{} {} {}, {}", ins, lt, x, m));
         }
+        if let (Div | Rem, Ty::Int(it)) = (op, t) {
+            if it.bits > 32 && it.bits < 64 && y.parse::<i64>().is_err() {
+                return self.narrow_div(*it, if op == Div { "udiv" } else { "urem" }, ins, &x, &y);
+            }
+        }
         self.inst(format!("{} {} {}, {}", ins, lt, x, y))
+    }
+
+    /// Division of odd-width integers wider than 32 bits (i48 payloads),
+    /// which LLVM does with a 64-bit divide: when both operands are
+    /// non-negative and below 2^31, which interpreters' integers mostly
+    /// are, use a 32-bit unsigned divide instead, two to three times
+    /// faster on many x86 cores (LLVM's "bypass slow division", which it
+    /// applies to i64 only on some CPU tunings).
+    fn narrow_div(&mut self, it: IntTy, ins32: &str, ins: &str, x: &str, y: &str) -> String {
+        let nt = format!("i{}", it.bits);
+        let o = self.inst(format!("or {} {}, {}", nt, x, y));
+        let hi = self.inst(format!("lshr {} {}, 31", nt, o));
+        let small = self.inst(format!("icmp eq {} {}, 0", nt, hi));
+        let (l_fast, l_slow, l_join) = (self.fresh_label("divfast"), self.fresh_label("divslow"), self.fresh_label("divjoin"));
+        self.cond_br(&small, &l_fast, &l_slow);
+        self.label(&l_fast);
+        let xs = self.inst(format!("trunc {} {} to i32", nt, x));
+        let ys = self.inst(format!("trunc {} {} to i32", nt, y));
+        let rs = self.inst(format!("{} i32 {}, {}", ins32, xs, ys));
+        let rf = self.inst(format!("zext i32 {} to {}", rs, nt));
+        self.br(&l_join);
+        self.label(&l_slow);
+        let rw = self.inst(format!("{} {} {}, {}", ins, nt, x, y));
+        self.br(&l_join);
+        self.label(&l_join);
+        self.inst(format!("phi {} [ {}, %{} ], [ {}, %{} ]", nt, rf, l_fast, rw, l_slow))
+    }
+
+    /// `x op y` (add, sub or mul) on integer type `it` with overflow
+    /// detection: (result, overflowed). Widths other than 8/16/32/64 (such
+    /// as `i48` value payloads) are computed in i64 with the operands
+    /// shifted into the high bits, so the overflow flag of the 64-bit
+    /// operation is the overflow of the narrow one; for `mul` only one
+    /// operand is shifted. (LLVM's own legalization of odd-width overflow
+    /// intrinsics sign-extends both operands and compares the result with
+    /// its re-extension, which is longer.)
+    pub fn overflow_op(&mut self, it: IntTy, op: &str, x: &str, y: &str) -> (String, String) {
+        let pre = if it.signed { "s" } else { "u" };
+        let native = matches!(it.bits, 8 | 16 | 32 | 64);
+        let lt = if native { format!("i{}", it.bits) } else { "i64".to_string() };
+        let name = format!("llvm.{}{}.with.overflow.{}", pre, op, lt);
+        self.cg.decls.insert(format!("declare {{ {}, i1 }} @{}({}, {})", lt, name, lt, lt));
+        if native {
+            let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, name, lt, x, lt, y));
+            let v = self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
+            let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+            return (v, ov);
+        }
+        let k = 64 - it.bits as u32;
+        // The extension bits of a shifted operand are shifted out: zext lets
+        // LLVM fold `zext(trunc(v >> k)) << k` back into `v`.
+        let nt = format!("i{}", it.bits);
+        let xw = self.inst(format!("zext {} {} to i64", nt, x));
+        let xs = self.inst(format!("shl i64 {}, {}", xw, k));
+        let ys = if op == "mul" {
+            self.inst(format!("{} {} {} to i64", if it.signed { "sext" } else { "zext" }, nt, y))
+        } else {
+            let yw = self.inst(format!("zext {} {} to i64", nt, y));
+            self.inst(format!("shl i64 {}, {}", yw, k))
+        };
+        let r = self.inst(format!("call {{ i64, i1 }} @{}(i64 {}, i64 {})", name, xs, ys));
+        let v = self.inst(format!("extractvalue {{ i64, i1 }} {}, 0", r));
+        let ov = self.inst(format!("extractvalue {{ i64, i1 }} {}, 1", r));
+        // The low k bits of the result are zero (both operands, or one factor, had them zero).
+        let sh = self.inst(format!("{} exact i64 {}, {}", if it.signed { "ashr" } else { "lshr" }, v, k));
+        let n = self.inst(format!("trunc i64 {} to {}", sh, nt));
+        (n, ov)
     }
 
     /// `x as Kind` for a fieldless enum. With checks on (debug builds), a
@@ -1567,11 +1654,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Intr::SubChecked => "sub",
                     _ => "mul",
                 };
-                let name = format!("llvm.{}{}.with.overflow.{}", if it.signed { "s" } else { "u" }, op, lt);
-                decl(self.cg, &format!("declare {{ {}, i1 }} @{}({}, {})", lt, name, lt, lt));
-                let r = self.inst(format!("call {{ {}, i1 }} @{}({} {}, {} {})", lt, name, lt, vals[0], lt, vals[1]));
-                let v = self.inst(format!("extractvalue {{ {}, i1 }} {}, 0", lt, r));
-                let ov = self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r));
+                let (v, ov) = self.overflow_op(it, op, &vals[0], &vals[1]);
                 let ok = self.inst(format!("xor i1 {}, true", ov));
                 let ot = self.ty(&e.ty);
                 let a = self.inst(format!("insertvalue {} poison, i1 {}, 0", ot, ok));
