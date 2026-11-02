@@ -10,6 +10,7 @@
 //!   // args: <flags>           extra compiler flags (e.g. --release; also
 //!                              for tests/fail)
 //!   // matrix: dispatch        run once per dispatch mode
+//!   // env: K=V ...            environment of the program (e.g. LOIMI_JIT=1)
 //!   // error: <text>           (tests/fail) substring of the compile error
 
 use std::path::{Path, PathBuf};
@@ -73,13 +74,17 @@ fn run_programs() {
         let stderr_want = directives(&text, "expect-stderr");
         let stderr_not = directives(&text, "expect-no-stderr");
         let extra: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
+        let env: Vec<(String, String)> = directives(&text, "env")
+            .iter()
+            .flat_map(|s| s.split_whitespace().filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect::<Vec<_>>())
+            .collect();
         let modes: Vec<Vec<String>> = if directives(&text, "matrix").iter().any(|m| m.trim() == "dispatch") {
             ["tailcall", "goto", "switch"].iter().map(|d| vec![format!("--dispatch={}", d)]).collect()
         } else {
             vec![vec![]]
         };
         for mode in modes {
-            let out = loimi().arg("run").arg(&f).args(&extra).args(&mode).output().unwrap();
+            let out = loimi().arg("run").arg(&f).args(&extra).args(&mode).envs(env.iter().map(|(k, v)| (k, v))).output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
             let got: Vec<&str> = stdout.lines().collect();

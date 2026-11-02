@@ -1,0 +1,76 @@
+// args: --jit-stencils
+// env: LOIMI_JIT=1 LOIMI_JIT_HOT=1
+// The JIT and a superinstruction that splits itself while it runs in the
+// interpreter. The loop's backward jump compiles the code; on the second
+// iteration ADD_MUL's ADD part takes its cold path, whose `next`
+// dispatches the next word alone: the head of MUL_OUT, which the
+// interpreter runs (a super's later word has no enter word). Its MUL
+// part quickens (`become MUL_S`), which splits the head (there is no
+// MUL_S_OUT) and makes the JIT compile the code again. OUT's word is no
+// longer a later part of anything, so the JIT made it an enter word; the
+// running MUL_OUT handler then decoded its OUT part from the enter word
+// and printed the wrong register.
+import std.io;
+import std.gc;
+import std.mem;
+
+object Proto { code: verified [u32] by V }
+
+#[require_verified]
+#[allow(super_overlap)]
+vm V {
+    context heap: *gc.Heap;
+    state { pc: *u32, regs: *i64 }
+    verify_context owner proto: Gc<Proto>;
+
+    operand reg = regs[it] verify it < 8;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        if a == 100 { cold { dst = 7; next } }
+        dst = a + b;
+        next
+    }
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a * b; if a == 7 { become MUL_S; } next }
+        MUL_S { dst = a * b; next }
+    }
+    op OUT(a: reg) : ABC { io.print_int(a); io.println(""); next }
+    /// A backward jump (which compiles the code) setting r0 = 100.
+    op LOOP(a: reg, target: label) : AsBx {
+        if a > 0 { a = a - 1; regs[0] = 100; jump target }
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_MUL = ADD; MUL;
+    super MUL_OUT = MUL; OUT;
+
+    entry run(h: *gc.Heap, p: Gc<Proto>, r: *i64) -> i64 {
+        heap = h;
+        regs = r;
+        jump p.code
+    }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var code: [u32; 5] = [V.ADD(2, 0, 1), V.MUL(5, 2, 2), V.OUT(5), V.LOOP(4, -3), V.RET(5)];
+    let Ok(p) = V.build_verified(h, Proto {}, code[..]) else { return; };
+    V.optimize(p.code);
+    let regs: *i64 = mem.alloc(8);
+    for i in 0..8 { regs[i] = 0; }
+    regs[0] = 1;
+    regs[1] = 2;
+    regs[4] = 1;
+    io.print_int(V.run(h, p, regs));
+    io.println("");
+}
+// expect: 9
+// expect: 49
+// expect: 49

@@ -108,6 +108,11 @@ struct rec {
     uint8_t *fl, *nre; /* flags; retargets so far */
     struct alt *alts;
     uint32_t nalts, capalts;
+    /* Per word, kept across compiles: another instruction read it while
+     * compiled (F_NOPATCH once). It never becomes an enter word again: a
+     * super that splits itself (`become` in a part, in the interpreter)
+     * still decodes its later parts from their words after the split. */
+    uint8_t *read;
 };
 
 static int enabled, stats, debug, inited, max_recompile = MAX_COMPILES;
@@ -341,6 +346,7 @@ static void free_compiled(struct rec *r) {
 
 static void free_rec(struct rec *r) {
     free_compiled(r);
+    free(r->read);
     free(r);
 }
 
@@ -489,17 +495,21 @@ static uint32_t new_entry(void *native) {
  * words: the interpreter enters compiled code wherever it dispatches to
  * an instruction that has a stencil, except at words other instructions
  * read (a `then` operand word, a super's later parts, whose head may
- * still run in the interpreter). Called after every change of words. */
+ * still run in the interpreter, or was one: see rec.read). Called after
+ * every change of words. */
 static void sync_entries(struct rec *r) {
     uint64_t n = r->n;
+    if (!r->read) r->read = calloc(n, 1);
     for (uint64_t pc = 0; pc < n; pc++) r->fl[pc] &= ~F_NOPATCH;
     for (uint64_t pc = 0; pc < n; pc++) {
         if (!r->home[pc]) continue;
         const struct jit_opinfo *oi = &loimi_jit_opinfo[word_at(r, pc) & OPMASK];
-        if ((oi->flags & 1) && pc + oi->size < n) r->fl[pc + oi->size] |= F_NOPATCH;
+        if ((oi->flags & 1) && pc + oi->size < n) r->read[pc + oi->size] = 1;
         if (oi->flags & 2)
-            for (uint64_t k = oi->size; k < oi->span && pc + k < n; k++) r->fl[pc + k] |= F_NOPATCH;
+            for (uint64_t k = oi->size; k < oi->span && pc + k < n; k++) r->read[pc + k] = 1;
     }
+    for (uint64_t pc = 0; pc < n; pc++)
+        if (r->read && r->read[pc]) r->fl[pc] |= F_NOPATCH;
     for (uint64_t pc = 0; pc < n; pc++) {
         if (!r->home[pc]) continue;
         uint32_t w = word_at(r, pc);
