@@ -6,6 +6,8 @@
 # For each step, main.lm is built (once per dispatch mode if the step
 # declares a vm) and run on every tests/NAME.expected: with tests/NAME.pip
 # as its argument if that file exists, plus the words in tests/NAME.args.
+# If tests/NAME.main holds a name, NAME runs that program (NAME.lm in the
+# step) instead of main.lm.
 # stdout and stderr together must equal NAME.expected; tests named err_*
 # must exit with a nonzero status, the others with 0. Steps whose main.lm
 # understands `--gc-stress` run every test a second time with it.
@@ -35,16 +37,24 @@ for step in "${STEPS[@]}"; do
     if grep -qE '^(pub )?vm ' "$dir"/*.lm; then modes=(tailcall goto switch); fi
     stress=0
     if grep -q -- '--gc-stress' "$dir/main.lm"; then stress=1; fi
+    progs=(main)
+    for f in "$dir"/tests/*.main; do [ -f "$f" ] && progs+=("$(cat "$f")"); done
     for mode in "${modes[@]}"; do
-        exe=$TMP/$step-$mode
-        if ! (ulimit -v 2500000; "$LOIMI" build "$dir/main.lm" --dispatch="$mode" -o "$exe") > "$TMP/build.log" 2>&1; then
-            echo "FAIL $step ($mode): build failed"
-            cat "$TMP/build.log"
-            FAIL=1
-            continue
-        fi
+        built=1
+        for prog in "${progs[@]}"; do
+            if ! (ulimit -v 2500000; "$LOIMI" build "$dir/$prog.lm" --dispatch="$mode" -o "$TMP/$step-$mode-$prog") > "$TMP/build.log" 2>&1; then
+                echo "FAIL $step ($mode): building $prog.lm failed"
+                cat "$TMP/build.log"
+                FAIL=1
+                built=0
+            fi
+        done
+        [ $built = 1 ] || continue
         for exp in "$dir"/tests/*.expected; do
             name=$(basename "$exp" .expected)
+            prog=main
+            [ -f "$dir/tests/$name.main" ] && prog=$(cat "$dir/tests/$name.main")
+            exe=$TMP/$step-$mode-$prog
             args=()
             [ -f "$dir/tests/$name.pip" ] && args+=("tests/$name.pip")
             [ -f "$dir/tests/$name.args" ] && read -r -a extra < "$dir/tests/$name.args" && args+=("${extra[@]}")
