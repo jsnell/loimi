@@ -133,7 +133,7 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
     if let Some(name) = c.ident() { return Ok(lx.tok(lx.keywords.get(name) ?? T.Name, start)); }
     if c.at_number() { lx.num = c.number()?; return Ok(lx.tok(T.Number, start)); }
     if c.peek() == '"' { lx.buf.clear(); c.quoted(&lx.buf)?; return Ok(lx.tok(T.String, start)); }
-    if let Some(k) = lx.ops.eat(c) { return Ok(lx.tok(k, start)); }
+    if let Some(k) = c.op(&lx.ops) { return Ok(lx.tok(k, start)); }
     Err(c.error_at(start, "unexpected character"))
 }
 ```
@@ -143,7 +143,7 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
   or decimal `\ddd`, whether backslash-newline keeps the newline, raw
   newlines in strings, and whether overflowing decimal/hex literals become
   floats/wrap or are errors. Presets: `lua()`, `c_like()`, `none()`.
-- `Cursor`: `peek`, `peek_at`, `bump`, `advance`, `eat`, `eat_str`,
+- `Cursor`: `peek`, `peek_at`, `bump`, `advance`, `eat`, `eat_str`, `op`,
   `starts_with`, `eat_while(fn(u8) -> bool)`, `since`, `span_from`,
   `save`/`restore`, and `line` tracking. Character classes are ASCII.
 - Scanners: `skip_trivia`, `ident`, `at_number`/`number` (via std.num, with
@@ -152,7 +152,7 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
   continue), `long_bracket_level`/`long_string`.
 - `OpTable<K>`: operator strings to token kinds, maximal munch through
   per-first-byte chains sorted longest first. Matching is
-  `ops.eat(&cursor)` because methods cannot have their own type parameters.
+  `cursor.op(&ops)` (or the older `ops.eat(&cursor)`).
 - `Keywords<K>`: a `HashMap<str, K>` wrapper (no perfect hashing yet).
 - Errors are `lex.Error { span, msg }` with a static message;
   `e.diag()` turns one into a `diag.Diag`.

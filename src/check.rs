@@ -13,6 +13,7 @@ pub enum Def {
     Value(u32),
     Fn(FnId),
     Const(u32),
+    Global(u32),
     Module(usize),
     Vm(u32),
     GenericType(u32),
@@ -26,6 +27,7 @@ pub struct ConstInfo {
     pub busy: bool,
 }
 
+#[derive(Clone)]
 pub struct LoopCx {
     pub id: u32,
     pub is_loop: bool,
@@ -65,6 +67,20 @@ impl FnCx {
         self.scopes.last_mut().unwrap().push((name.to_string(), id));
         id
     }
+    /// A copy for speculative checking: the original is unaffected.
+    pub fn probe(&self) -> FnCx {
+        FnCx {
+            module: self.module,
+            locals: self.locals.clone(),
+            scopes: self.scopes.clone(),
+            ret: self.ret.clone(),
+            loops: self.loops.clone(),
+            next_loop: self.next_loop,
+            vm: self.vm.clone(),
+            effects: self.effects,
+            fn_name: self.fn_name.clone(),
+        }
+    }
     /// A local not visible by name.
     pub fn temp(&mut self, ty: Ty) -> LocalId {
         let id = self.locals.len() as LocalId;
@@ -89,6 +105,7 @@ pub struct Checker<'a> {
     pub scopes: Vec<HashMap<String, (Def, bool)>>,
     pub methods: HashMap<(Ty, String), FnId>,
     pub consts: Vec<ConstInfo>,
+    pub global_decls: Vec<(usize, GlobalDecl)>,
     pub pending: Vec<(FnId, usize, FnDecl, Vec<(String, Ty)>)>,
     pub generics: crate::generics::Generics,
     /// Type parameters in scope (while resolving generic instances).
@@ -103,10 +120,39 @@ pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
     TExpr { ty, kind, span }
 }
 
+/// An unknown part of a guessed type (`Checker::guess_ty`).
+const HOLE: u32 = u32::MAX;
+
+fn has_hole(t: &Ty) -> bool {
+    match t {
+        Ty::Param(HOLE) => true,
+        Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
+        Ty::Result(a, b) => has_hole(a) || has_hole(b),
+        Ty::Tuple(ts) => ts.iter().any(has_hole),
+        Ty::Fn(ps, r) => ps.iter().any(has_hole) || has_hole(r),
+        _ => false,
+    }
+}
+
+/// Combine two guesses of the same value's type, filling holes.
+fn merge_guess(a: Ty, b: Ty) -> Ty {
+    match (a, b) {
+        (Ty::Param(HOLE), t) | (t, Ty::Param(HOLE)) => t,
+        (Ty::Option(x), Ty::Option(y)) => Ty::Option(Box::new(merge_guess(*x, *y))),
+        (Ty::Result(a1, b1), Ty::Result(a2, b2)) => Ty::Result(Box::new(merge_guess(*a1, *a2)), Box::new(merge_guess(*b1, *b2))),
+        (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
+            Ty::Tuple(xs.into_iter().zip(ys).map(|(x, y)| merge_guess(x, y)).collect())
+        }
+        (a, _) => a,
+    }
+}
+
 fn is_literal_expr(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) => true,
         ExprKind::Unary(UnOp::Neg, inner) => is_literal_expr(inner),
+        // `Kind.COUNT` types like a literal.
+        ExprKind::Field(_, n) => n.name == "COUNT",
         _ => false,
     }
 }
@@ -119,6 +165,7 @@ impl<'a> Checker<'a> {
             scopes: vec![HashMap::new(); modules.len()],
             methods: HashMap::new(),
             consts: vec![],
+            global_decls: vec![],
             pending: vec![],
             vm_decls: vec![],
             dispatch_override: None,
@@ -230,6 +277,11 @@ impl<'a> Checker<'a> {
                         self.consts.push(ConstInfo { module: m, decl: c.clone(), value: None, busy: false });
                         self.define(m, &c.name, Def::Const(id), c.is_pub)?;
                     }
+                    Item::Global(g) => {
+                        let id = self.global_decls.len() as u32;
+                        self.global_decls.push((m, g.clone()));
+                        self.define(m, &g.name, Def::Global(id), g.is_pub)?;
+                    }
                     Item::Vm(v) => {
                         let id = self.vm_decls.len() as u32;
                         self.vm_decls.push((m, (**v).clone()));
@@ -317,15 +369,45 @@ impl<'a> Checker<'a> {
             let gf = &self.generics.fns[g];
             let Some(recv) = gf.decl.recv.clone() else { continue };
             let (m, mname) = (gf.module, gf.decl.name.clone());
+            let nrecv = gf.decl.recv_generics;
             let Some((Def::GenericType(t), _)) = self.scopes[m].get(&recv.name).cloned() else {
-                return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
+                // A plain receiver type with method type parameters: `fn Cursor.op<K>`.
+                if nrecv != 0 {
+                    return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
+                }
+                let rty = self.resolve_type_name(m, &recv)?;
+                let key = (rty, mname.name.clone());
+                if self.methods.contains_key(&key) || self.generics.ty_methods.insert(key, g as u32).is_some() {
+                    return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
+                }
+                continue;
             };
-            if self.generics.types[t as usize].params.len() != self.generics.fns[g].params.len() {
-                return Err(Diag::new(recv.span, "a method of a generic type takes exactly the type's parameters"));
+            let tparams = self.generics.types[t as usize].params.len();
+            if tparams != nrecv {
+                return Err(Diag::new(
+                    recv.span,
+                    format!("`{}` takes {} type parameter(s); write them after the type name (`fn {}<..>.{}`)", recv.name, tparams, recv.name, mname.name),
+                ));
             }
             if self.generics.methods.insert((t, mname.name.clone()), g as u32).is_some() {
                 return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
             }
+        }
+        // Module-level `var`s: types and constant initializers.
+        for i in 0..self.global_decls.len() {
+            let (m, g) = self.global_decls[i].clone();
+            let ty = self.resolve_type(m, &g.ty)?;
+            let mut cx = FnCx::new(m, Ty::Unit);
+            let v = self.expr(&mut cx, &g.value, Some(&ty))?;
+            let init = fold_deep(&self.coerce(v, &ty)?);
+            if let Some(bad) = self.static_init_error(&init) {
+                return Err(Diag::new(
+                    bad,
+                    "the initializer of a module-level `var` must be a constant expression (literals, `[x; N]`, struct, tuple, array and enum literals of constants, functions)",
+                ));
+            }
+            let symbol = format!("{}.{}", self.module_prefix(m), g.name.name);
+            self.prog.globals.push(GlobalDef { symbol, ty, init, thread_local: g.thread_local });
         }
         // Pass 5: vm declarations (generates handler functions).
         for i in 0..self.vm_decls.len() {
@@ -1056,10 +1138,24 @@ impl<'a> Checker<'a> {
                     return Ok(v);
                 }
                 if !self.castable(&v.ty, &to) {
+                    let why = match &to {
+                        Ty::Enum(_) if v.ty.is_int() => " (only enums without payloads can be cast from integers)",
+                        _ => "",
+                    };
                     return Err(Diag::new(
                         span,
-                        format!("cannot cast `{}` to `{}`", self.ty_name(&v.ty), self.ty_name(&to)),
+                        format!("cannot cast `{}` to `{}`{}", self.ty_name(&v.ty), self.ty_name(&to), why),
                     ));
+                }
+                if let Ty::Enum(eid) = &to {
+                    // A constant converts at compile time.
+                    if let TK::Int(x) = fold(&v).kind {
+                        let vs = &self.prog.enums[*eid as usize].variants;
+                        let Some(idx) = vs.iter().position(|var| var.discr == x) else {
+                            return Err(Diag::new(span, format!("`{}` is not a discriminant of `{}`", x, self.ty_name(&to))));
+                        };
+                        return Ok(mk(to, TK::Variant(idx as u32, vec![]), span));
+                    }
                 }
                 Ok(mk(to, TK::Cast(Box::new(v)), span))
             }
@@ -1153,90 +1249,9 @@ impl<'a> Checker<'a> {
                 Ok(mk(Ty::Array(Box::new(v.ty.clone()), n), TK::ArrayRepeat(Box::new(v), n), span))
             }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => self.block(cx, b, exp),
-            ExprKind::If(conds, then, els) => {
-                // `if c { 1 } else { x }`: type the literal from the other branch.
-                let mut hint: Option<Ty> = None;
-                if exp.is_none() {
-                    if let (Some(Stmt::Expr { expr: t, semi: false }), Some(e)) = (then.stmts.last(), els) {
-                        let else_tail = match &e.kind {
-                            ExprKind::Block(b) => match b.stmts.last() {
-                                Some(Stmt::Expr { expr, semi: false }) => Some(expr),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if is_literal_expr(t) && then.stmts.len() == 1 {
-                            if let Some(et) = else_tail {
-                                if !is_literal_expr(et) {
-                                    let mut probe = FnCx::new(cx.module, cx.ret.clone());
-                                    probe.scopes = cx.scopes.clone();
-                                    probe.locals = cx.locals.clone();
-                                    probe.vm = cx.vm.clone();
-                                    if let Ok(v) = self.expr(&mut probe, e, None) {
-                                        if v.ty.is_numeric() {
-                                            hint = Some(v.ty);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let exp = if hint.is_some() { hint.as_ref() } else { exp };
-                cx.scopes.push(vec![]);
-                let tconds = self.conds(cx, conds)?;
-                let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
-                let t = self.block(cx, then, then_exp);
-                cx.scopes.pop();
-                let t = t?;
-                match els {
-                    None => {
-                        let t = if t.ty == Ty::Never { t } else { self.coerce(t, &Ty::Unit)? };
-                        Ok(mk(Ty::Unit, TK::If(tconds, Box::new(t), None), span))
-                    }
-                    Some(els) => {
-                        let e_exp = exp.cloned().or_else(|| if t.ty == Ty::Never { None } else { Some(t.ty.clone()) });
-                        let ev = self.expr(cx, els, e_exp.as_ref())?;
-                        let ty = match &e_exp {
-                            Some(ty) => ty.clone(),
-                            None => ev.ty.clone(),
-                        };
-                        let t = self.coerce(t, &ty)?;
-                        let ev = self.coerce(ev, &ty)?;
-                        Ok(mk(ty, TK::If(tconds, Box::new(t), Some(Box::new(ev))), span))
-                    }
-                }
-            }
-            ExprKind::Match(scrut, arms) => {
-                let s = self.expr(cx, scrut, None)?;
-                let mut ty: Option<Ty> = exp.cloned();
-                let mut tarms = Vec::new();
-                for arm in arms {
-                    cx.scopes.push(vec![]);
-                    let r = (|| -> Res<TArm> {
-                        let p = self.pat(cx, &arm.pat, &s.ty, false)?;
-                        let g = match &arm.guard {
-                            Some(g) => Some(self.expr_coerce(cx, g, &Ty::Bool)?),
-                            None => None,
-                        };
-                        let b = self.expr(cx, &arm.body, ty.as_ref())?;
-                        Ok(TArm { pat: p, guard: g, body: b })
-                    })();
-                    cx.scopes.pop();
-                    let a = r?;
-                    if ty.is_none() && a.body.ty != Ty::Never {
-                        ty = Some(a.body.ty.clone());
-                    }
-                    tarms.push(a);
-                }
-                self.check_exhaustive(&s.ty, &tarms, span)?;
-                let ty = ty.unwrap_or(Ty::Never);
-                for a in tarms.iter_mut() {
-                    let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
-                    a.body = self.coerce(body, &ty)?;
-                }
-                Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
-            }
+            ExprKind::If(..) | ExprKind::Match(..) if exp.is_none() => self.branches_inferred(cx, e),
+            ExprKind::If(conds, then, els) => self.if_expr(cx, conds, then, els.as_deref(), exp, span),
+            ExprKind::Match(scrut, arms) => self.match_expr(cx, scrut, arms, exp, span),
             ExprKind::While(conds, body) => {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
@@ -1409,6 +1424,7 @@ impl<'a> Checker<'a> {
                     _ => Err(Diag::new(span, "`?` needs an option or result")),
                 }
             }
+            ExprKind::TypeArgs(..) => Err(Diag::new(span, "explicit type arguments are only supported on calls: `f<T>(..)`")),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
                 let ty = self.resolve_type(cx.module, t)?;
@@ -1417,6 +1433,198 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Vm(v) => crate::vmcheck::check_vm_expr(self, cx, v, exp, span),
         }
+    }
+
+    /// `if`/`match` without an expected type. When a branch cannot be
+    /// typed on its own (`Ok(e)`, `None`), guess the type from all branches
+    /// together and check again with that as the expected type, so
+    /// `if c { Ok(e) } else { Err(m) }` works when `e` and `m` are typed.
+    fn branches_inferred(&mut self, cx: &mut FnCx, e: &Expr) -> Res<TExpr> {
+        let (nscopes, nloops) = (cx.scopes.len(), cx.loops.len());
+        let check = |c: &mut Self, cx: &mut FnCx, exp: Option<&Ty>| match &e.kind {
+            ExprKind::If(conds, then, els) => c.if_expr(cx, conds, then, els.as_deref(), exp, e.span),
+            ExprKind::Match(scrut, arms) => c.match_expr(cx, scrut, arms, exp, e.span),
+            _ => unreachable!(),
+        };
+        let err = match check(self, cx, None) {
+            Ok(v) => return Ok(v),
+            Err(d) => d,
+        };
+        if !err.msg.starts_with("cannot infer") {
+            return Err(err);
+        }
+        cx.scopes.truncate(nscopes);
+        cx.loops.truncate(nloops);
+        let guess = self.guess_ty(cx, e);
+        if has_hole(&guess) {
+            return Err(err);
+        }
+        match check(self, cx, Some(&guess)) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                cx.scopes.truncate(nscopes);
+                cx.loops.truncate(nloops);
+                Err(err)
+            }
+        }
+    }
+
+    /// The type of `e` as far as it can be told without an expected type,
+    /// with `HOLE` for unknown parts: `Ok(1)` is `Result<i64, HOLE>`,
+    /// `None` is `?HOLE`, and the branches of `if`/`match`/blocks are merged.
+    /// Checks only on probes, so `cx` is unaffected.
+    fn guess_ty(&mut self, cx: &FnCx, e: &Expr) -> Ty {
+        let hole = Ty::Param(HOLE);
+        let unshadowed = |c: &Self, n: &str| cx.lookup(n).is_none() && !c.scopes[cx.module].contains_key(n);
+        match &e.kind {
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => {
+                let Some(Stmt::Expr { expr: tail, semi: false }) = b.stmts.last() else {
+                    return self.probe_ty(cx, e);
+                };
+                let mut p = cx.probe();
+                p.scopes.push(vec![]);
+                let prefix = Block { stmts: b.stmts[..b.stmts.len() - 1].to_vec(), span: b.span };
+                if self.block_inner(&mut p, &prefix, None).is_err() {
+                    return hole;
+                }
+                self.guess_ty(&p, tail)
+            }
+            ExprKind::If(conds, then, els) => {
+                let Some(els) = els else { return Ty::Unit };
+                let mut p = cx.probe();
+                p.scopes.push(vec![]);
+                let t = if self.conds(&mut p, conds).is_ok() {
+                    let tb = Expr { kind: ExprKind::Block(then.clone()), span: then.span };
+                    self.guess_ty(&p, &tb)
+                } else {
+                    hole.clone()
+                };
+                let f = self.guess_ty(cx, els);
+                merge_guess(t, f)
+            }
+            ExprKind::Match(scrut, arms) => {
+                let mut p = cx.probe();
+                let Ok(s) = self.expr(&mut p, scrut, None) else { return hole };
+                let mut acc = hole;
+                for a in arms {
+                    let mut q = p.probe();
+                    q.scopes.push(vec![]);
+                    if self.pat(&mut q, &a.pat, &s.ty, false).is_ok() {
+                        let t = self.guess_ty(&q, &a.body);
+                        acc = merge_guess(acc, t);
+                    }
+                }
+                acc
+            }
+            ExprKind::Call(f, args) if args.len() == 1 => match &f.kind {
+                ExprKind::Ident(n) if matches!(n.as_str(), "Ok" | "Err" | "Some") && unshadowed(self, n) => {
+                    let x = self.guess_ty(cx, &args[0]);
+                    match n.as_str() {
+                        "Ok" => Ty::Result(Box::new(x), Box::new(hole)),
+                        "Err" => Ty::Result(Box::new(hole), Box::new(x)),
+                        _ => Ty::Option(Box::new(x)),
+                    }
+                }
+                _ => self.probe_ty(cx, e),
+            },
+            ExprKind::Ident(n) if n == "None" && unshadowed(self, n) => Ty::Option(Box::new(hole)),
+            ExprKind::Tuple(es) => Ty::Tuple(es.iter().map(|x| self.guess_ty(cx, x)).collect()),
+            _ => self.probe_ty(cx, e),
+        }
+    }
+
+    fn probe_ty(&mut self, cx: &FnCx, e: &Expr) -> Ty {
+        let mut p = cx.probe();
+        match self.expr(&mut p, e, None) {
+            Ok(v) if v.ty != Ty::Never => v.ty,
+            _ => Ty::Param(HOLE),
+        }
+    }
+
+    fn if_expr(&mut self, cx: &mut FnCx, conds: &[Cond], then: &Block, els: Option<&Expr>, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        // `if c { 1 } else { x }`: type the literal from the other branch.
+        let mut hint: Option<Ty> = None;
+        if exp.is_none() {
+            if let (Some(Stmt::Expr { expr: t, semi: false }), Some(e)) = (then.stmts.last(), els) {
+                let else_tail = match &e.kind {
+                    ExprKind::Block(b) => match b.stmts.last() {
+                        Some(Stmt::Expr { expr, semi: false }) => Some(expr),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if is_literal_expr(t) && then.stmts.len() == 1 {
+                    if let Some(et) = else_tail {
+                        if !is_literal_expr(et) {
+                            let mut probe = FnCx::new(cx.module, cx.ret.clone());
+                            probe.scopes = cx.scopes.clone();
+                            probe.locals = cx.locals.clone();
+                            probe.vm = cx.vm.clone();
+                            if let Ok(v) = self.expr(&mut probe, e, None) {
+                                if v.ty.is_numeric() {
+                                    hint = Some(v.ty);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let exp = if hint.is_some() { hint.as_ref() } else { exp };
+        cx.scopes.push(vec![]);
+        let tconds = self.conds(cx, conds)?;
+        let then_exp = if els.is_none() { Some(&Ty::Unit) } else { exp };
+        let t = self.block(cx, then, then_exp);
+        cx.scopes.pop();
+        let t = t?;
+        match els {
+            None => {
+                let t = if t.ty == Ty::Never { t } else { self.coerce(t, &Ty::Unit)? };
+                Ok(mk(Ty::Unit, TK::If(tconds, Box::new(t), None), span))
+            }
+            Some(els) => {
+                let e_exp = exp.cloned().or_else(|| if t.ty == Ty::Never { None } else { Some(t.ty.clone()) });
+                let ev = self.expr(cx, els, e_exp.as_ref())?;
+                let ty = match &e_exp {
+                    Some(ty) => ty.clone(),
+                    None => ev.ty.clone(),
+                };
+                let t = self.coerce(t, &ty)?;
+                let ev = self.coerce(ev, &ty)?;
+                Ok(mk(ty, TK::If(tconds, Box::new(t), Some(Box::new(ev))), span))
+            }
+        }
+    }
+
+    fn match_expr(&mut self, cx: &mut FnCx, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let s = self.expr(cx, scrut, None)?;
+        let mut ty: Option<Ty> = exp.cloned();
+        let mut tarms = Vec::new();
+        for arm in arms {
+            cx.scopes.push(vec![]);
+            let r = (|| -> Res<TArm> {
+                let p = self.pat(cx, &arm.pat, &s.ty, false)?;
+                let g = match &arm.guard {
+                    Some(g) => Some(self.expr_coerce(cx, g, &Ty::Bool)?),
+                    None => None,
+                };
+                let b = self.expr(cx, &arm.body, ty.as_ref())?;
+                Ok(TArm { pat: p, guard: g, body: b })
+            })();
+            cx.scopes.pop();
+            let a = r?;
+            if ty.is_none() && a.body.ty != Ty::Never {
+                ty = Some(a.body.ty.clone());
+            }
+            tarms.push(a);
+        }
+        self.check_exhaustive(&s.ty, &tarms, span)?;
+        let ty = ty.unwrap_or(Ty::Never);
+        for a in tarms.iter_mut() {
+            let body = std::mem::replace(&mut a.body, mk(Ty::Unit, TK::Unit, span));
+            a.body = self.coerce(body, &ty)?;
+        }
+        Ok(mk(ty, TK::Match(Box::new(s), tarms), span))
     }
 
     pub fn expr_coerce(&mut self, cx: &mut FnCx, e: &Expr, want: &Ty) -> Res<TExpr> {
@@ -1502,6 +1710,7 @@ impl<'a> Checker<'a> {
                 v.span = span;
                 Ok(v)
             }
+            Def::Global(id) => Ok(mk(self.prog.globals[id as usize].ty.clone(), TK::Global(id), span)),
             _ => Err(Diag::new(span, format!("`{}` is not a value", name))),
         }
     }
@@ -1582,8 +1791,16 @@ impl<'a> Checker<'a> {
             if let Some(idx) = self.variant_index(&t, &name.name) {
                 return self.make_variant(cx, &t, idx, &[], span);
             }
+            if let (Ty::Enum(eid), "COUNT") = (&t, name.name.as_str()) {
+                // The number of variants, typed like an integer literal.
+                let n = self.prog.enums[*eid as usize].variants.len() as i128;
+                return self.int_lit(n, exp, span);
+            }
             if let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() {
                 return self.def_value(Def::Fn(f), &name.name, span);
+            }
+            if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
+                return self.generic_fn_value(gf, exp, span);
             }
             return Err(Diag::new(name.span, format!("no variant or function `{}` in `{}`", name.name, self.ty_name(&t))));
         }
@@ -1694,8 +1911,98 @@ impl<'a> Checker<'a> {
         self.make_variant(cx, &t, idx, args, span)
     }
 
+    /// `f<T..>(args)`: a call of a generic function or method with explicit
+    /// type arguments (for a method, its own parameters only).
+    fn call_type_args(&mut self, cx: &mut FnCx, inner: &Expr, targs: &[TypeExpr], args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
+        let mut explicit = Vec::new();
+        for t in targs {
+            explicit.push(self.resolve_type(cx.module, t)?);
+        }
+        let (name, g, recv): (&Ident, u32, Option<TExpr>) = match &inner.kind {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => {
+                let id = Ident { name: n.clone(), span: inner.span };
+                match self.scopes[cx.module].get(n).cloned() {
+                    Some((Def::GenericFn(g), _)) => return self.explicit_call(cx, &id, g, explicit, None, args, exp, span),
+                    _ => return Err(Diag::new(inner.span, format!("`{}` is not a generic function", n))),
+                }
+            }
+            ExprKind::Field(base, name) => {
+                if let Some(m) = self.module_path(cx, base) {
+                    return match self.scopes[m].get(&name.name).cloned() {
+                        Some((Def::GenericFn(g), true)) => self.explicit_call(cx, name, g, explicit, None, args, exp, span),
+                        Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
+                        _ => Err(Diag::new(name.span, format!("`{}` is not a generic function", name.name))),
+                    };
+                }
+                if self.generic_type_path(cx, base).is_some() {
+                    return Err(Diag::new(
+                        span,
+                        "explicit type arguments are not supported on a generic type's static functions; annotate the result instead",
+                    ));
+                }
+                if let Some(t) = self.type_path(cx, base) {
+                    let Some(g) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() else {
+                        return Err(Diag::new(name.span, format!("`{}` is not a generic method of `{}`", name.name, self.ty_name(&t))));
+                    };
+                    return self.explicit_call(cx, name, g, explicit, None, args, exp, span);
+                }
+                let recv = self.expr(cx, base, None)?;
+                let mut base_ty = recv.ty.clone();
+                while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
+                    base_ty = *inner;
+                }
+                let g = match self.generics.inst_of.get(&base_ty).cloned() {
+                    Some((gt, rargs)) => match self.generics.methods.get(&(gt, name.name.clone())).copied() {
+                        Some(g) => {
+                            let mut all = rargs;
+                            all.extend(explicit.drain(..));
+                            explicit = all;
+                            Some(g)
+                        }
+                        None => None,
+                    },
+                    None => self.generics.ty_methods.get(&(base_ty.clone(), name.name.clone())).copied(),
+                };
+                let Some(g) = g else {
+                    return Err(Diag::new(name.span, format!("no generic method `{}` on type `{}`", name.name, self.ty_name(&recv.ty))));
+                };
+                (name, g, Some(recv))
+            }
+            _ => return Err(Diag::new(inner.span, "explicit type arguments need a generic function or method name")),
+        };
+        self.explicit_call(cx, name, g, explicit, recv, args, exp, span)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn explicit_call(
+        &mut self,
+        cx: &mut FnCx,
+        name: &Ident,
+        g: u32,
+        targs: Vec<Ty>,
+        recv: Option<TExpr>,
+        args: &[Expr],
+        exp: Option<&Ty>,
+        span: Span,
+    ) -> Res<TExpr> {
+        let gf = &self.generics.fns[g as usize];
+        let (nall, nrecv) = (gf.params.len(), gf.decl.recv_generics);
+        // The receiver's arguments come from the receiver (methods) or are
+        // not given (static calls); count only the function's own.
+        let given_own = if recv.is_some() { targs.len() - nrecv } else { targs.len() };
+        if given_own != nall - nrecv {
+            return Err(Diag::new(name.span, format!("`{}` takes {} type argument(s), got {}", name.name, nall - nrecv, given_own)));
+        }
+        if recv.is_none() && nrecv > 0 {
+            return Err(Diag::new(name.span, format!("`{}` is a method of a generic type: call it on a value", name.name)));
+        }
+        let known = targs.into_iter().map(Some).collect();
+        self.generic_call(cx, g, recv.into_iter().collect(), known, args, exp, span)
+    }
+
     fn call(&mut self, cx: &mut FnCx, callee: &Expr, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         match &callee.kind {
+            ExprKind::TypeArgs(inner, targs) => return self.call_type_args(cx, inner, targs, args, exp, span),
             ExprKind::Ident(name) if cx.lookup(name).is_none() => {
                 if let Some((Def::GenericFn(g), _)) = self.scopes[cx.module].get(name).cloned() {
                     return self.generic_call(cx, g, vec![], vec![], args, exp, span);
@@ -1778,6 +2085,9 @@ impl<'a> Checker<'a> {
                         if let Some(r) = self.static_intrinsic(cx, &t, &name.name, args, span)? {
                             return Ok(r);
                         }
+                        if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
+                            return self.generic_call(cx, gf, vec![], vec![], args, exp, span);
+                        }
                         let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() else {
                             return Err(Diag::new(
                                 name.span,
@@ -1789,7 +2099,7 @@ impl<'a> Checker<'a> {
                     }
                     // Method call.
                     let recv = self.expr(cx, base, None)?;
-                    return self.method_call(cx, recv, name, args, span);
+                    return self.method_call(cx, recv, name, args, exp, span);
                 }
             }
             _ => {}
@@ -1847,7 +2157,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], span: Span) -> Res<TExpr> {
+    fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         let mut base_ty = recv.ty.clone();
         while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
             base_ty = *inner;
@@ -1855,8 +2165,11 @@ impl<'a> Checker<'a> {
         if let Some((g, targs)) = self.generics.inst_of.get(&base_ty).cloned() {
             if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
                 let known = targs.into_iter().map(Some).collect();
-                return self.generic_call(cx, gf, vec![recv], known, args, None, span);
+                return self.generic_call(cx, gf, vec![recv], known, args, exp, span);
             }
+        }
+        if let Some(gf) = self.generics.ty_methods.get(&(base_ty.clone(), name.name.clone())).copied() {
+            return self.generic_call(cx, gf, vec![recv], vec![], args, exp, span);
         }
         if let Some(fid) = self.methods.get(&(base_ty.clone(), name.name.clone())).copied() {
             let fdef = &self.prog.fns[fid as usize];
@@ -2180,11 +2493,34 @@ impl<'a> Checker<'a> {
             (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => true,
             (Ty::Gc(_), Ty::Int(it)) => it.bits == 64,
             (Ty::Ptr(_), Ty::Int(it)) | (Ty::Int(it), Ty::Ptr(_)) => it.bits == 64,
-            (Ty::Enum(e), Ty::Int(_)) => !self.prog.enums[*e as usize].has_payload(),
+            (Ty::Enum(e), Ty::Int(_)) | (Ty::Int(_), Ty::Enum(e)) => {
+                let ed = &self.prog.enums[*e as usize];
+                !ed.has_payload() && !ed.variants.is_empty()
+            }
             (Ty::Value(v), Ty::Int(it)) | (Ty::Int(it), Ty::Value(v)) => {
                 it.bits == 64 && self.prog.values[*v as usize].repr != ValueRepr::Boxed
             }
             _ => false,
+        }
+    }
+
+    /// The span of the first part of a global's initializer that cannot be
+    /// emitted as an LLVM constant, if any.
+    fn static_init_error(&self, e: &TExpr) -> Option<Span> {
+        let all = |es: &[TExpr]| es.iter().find_map(|x| self.static_init_error(x));
+        match &e.kind {
+            TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::FnRef(_) => {
+                if matches!(e.ty, Ty::Value(_)) { Some(e.span) } else { None }
+            }
+            TK::Struct(es) | TK::Tuple(es) | TK::Array(es) => all(es),
+            TK::ArrayRepeat(v, _) => self.static_init_error(v),
+            TK::Variant(_, es) => match &e.ty {
+                Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) if es.is_empty() => None,
+                Ty::Enum(_) => Some(e.span),
+                Ty::Option(_) | Ty::Result(..) => all(es),
+                _ => Some(e.span),
+            },
+            _ => Some(e.span),
         }
     }
 
@@ -2197,7 +2533,7 @@ impl<'a> Checker<'a> {
                 }
                 Ok(())
             }
-            TK::Deref(_) => Ok(()),
+            TK::Deref(_) | TK::Global(_) => Ok(()),
             TK::Field(b, _) => {
                 if matches!(b.ty, Ty::Slice(_)) {
                     return Err(Diag::new(span, "cannot assign to a slice's length or pointer"));
@@ -2286,7 +2622,7 @@ pub fn prim_type(name: &str) -> Option<Ty> {
 
 pub fn is_place(e: &TExpr) -> bool {
     match &e.kind {
-        TK::Local(_) | TK::Deref(_) => true,
+        TK::Local(_) | TK::Deref(_) | TK::Global(_) => true,
         TK::Field(b, _) => is_place(b) || matches!(b.ty, Ty::Slice(_)),
         TK::Index(b, _) => !matches!(b.ty, Ty::Array(..)) || is_place(b),
         TK::Vm(TVm::Word(_)) => true,
@@ -2358,6 +2694,21 @@ pub fn fold(e: &TExpr) -> TExpr {
         _ => e.kind.clone(),
     };
     TExpr { ty: e.ty.clone(), kind: k, span: e.span }
+}
+
+/// `fold` applied to every element of aggregate literals.
+pub fn fold_deep(e: &TExpr) -> TExpr {
+    let e = fold(e);
+    let all = |es: &[TExpr]| es.iter().map(fold_deep).collect::<Vec<_>>();
+    let kind = match &e.kind {
+        TK::Struct(es) => TK::Struct(all(es)),
+        TK::Tuple(es) => TK::Tuple(all(es)),
+        TK::Array(es) => TK::Array(all(es)),
+        TK::Variant(i, es) => TK::Variant(*i, all(es)),
+        TK::ArrayRepeat(v, n) => TK::ArrayRepeat(Box::new(fold_deep(v)), *n),
+        k => k.clone(),
+    };
+    TExpr { ty: e.ty, kind, span: e.span }
 }
 
 pub fn wrap_int(v: i128, it: IntTy) -> i128 {

@@ -11,6 +11,8 @@ pub struct Parser {
     no_struct: bool,
     /// Inside a vm handler: control words are recognized.
     pub in_vm: bool,
+    /// Parsing the type after `as`: `<` may be a comparison.
+    cast_type: bool,
 }
 
 fn is_upper(s: &str) -> bool {
@@ -19,7 +21,7 @@ fn is_upper(s: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Parser {
-        Parser { toks, pos: 0, no_struct: false, in_vm: false }
+        Parser { toks, pos: 0, no_struct: false, in_vm: false, cast_type: false }
     }
 
     // ── token helpers ────────────────────────────────────────────────
@@ -397,6 +399,22 @@ impl Parser {
             self.expect("}")?;
             return Ok(Item::Enum(EnumDecl { name, generics, repr, variants, is_pub }));
         }
+        if self.eat_kw("var") {
+            let name = self.ident()?;
+            self.expect(":")?;
+            let ty = self.parse_type()?;
+            if self.is(";") {
+                return self.err("a module-level `var` needs an initializer (a constant expression)");
+            }
+            self.expect("=")?;
+            let value = self.parse_expr()?;
+            self.expect(";")?;
+            if let Some((n, _, sp)) = attrs.list.iter().find(|(n, _, _)| n != "thread_local") {
+                return Err(Diag::new(*sp, format!("unknown attribute `{}` on a module-level `var` (only `thread_local`)", n)));
+            }
+            let thread_local = attrs.has("thread_local");
+            return Ok(Item::Global(GlobalDecl { name, ty, value, is_pub, thread_local }));
+        }
         if self.eat_kw("const") {
             let name = self.ident()?;
             self.expect(":")?;
@@ -440,8 +458,18 @@ impl Parser {
     pub fn parse_fn(&mut self, attrs: Attrs, linkage: Linkage, is_pub: bool) -> Res<FnDecl> {
         self.expect_kw("fn")?;
         let first = self.ident()?;
-        let generics = self.parse_generics()?;
-        let (recv, name) = if self.eat(".") { (Some(first), self.ident()?) } else { (None, first) };
+        let mut generics = self.parse_generics()?;
+        // `fn Type.name<U>` / `fn Vec<T>.name<U>`: the method's own type
+        // parameters follow the receiver's.
+        let mut recv_generics = 0;
+        let (recv, name) = if self.eat(".") {
+            recv_generics = generics.len();
+            let name = self.ident()?;
+            generics.extend(self.parse_generics()?);
+            (Some(first), name)
+        } else {
+            (None, first)
+        };
         self.expect("(")?;
         let mut params = Vec::new();
         let mut variadic = false;
@@ -472,7 +500,7 @@ impl Parser {
             }
         }
         let body = if self.eat(";") { None } else { Some(self.parse_block()?) };
-        Ok(FnDecl { name, generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+        Ok(FnDecl { name, generics, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
     }
 
     fn parse_generics(&mut self) -> Res<Vec<Ident>> {
@@ -490,6 +518,49 @@ impl Parser {
     }
 
     // ── types ────────────────────────────────────────────────────────
+
+    /// At a `<`: if a balanced, type-shaped `<...>` follows, the index of
+    /// the token after its closing `>`. Does not consume anything.
+    fn angle_args_end(&self) -> Option<usize> {
+        if !self.is("<") {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        loop {
+            let t = &self.toks.get(i)?.tok;
+            match t {
+                Tok::Punct("<") => depth += 1,
+                Tok::Punct(">") => depth -= 1,
+                Tok::Punct(">>") => depth -= 2,
+                Tok::Punct(",") | Tok::Punct(".") | Tok::Punct("*") | Tok::Punct("?") | Tok::Punct("[")
+                | Tok::Punct("]") | Tok::Punct(";") | Tok::Punct("(") | Tok::Punct(")") | Tok::Punct("->") => {}
+                Tok::Int(_) => {}
+                Tok::Ident(s) if !is_reserved(s) || matches!(s.as_str(), "fn" | "never") => {}
+                _ => return None,
+            }
+            i += 1;
+            if depth == 0 {
+                return Some(i);
+            }
+            if depth < 0 {
+                return None;
+            }
+        }
+    }
+
+    /// The type after `as`. A primitive type never takes type arguments,
+    /// so `x as u64 < y` is a comparison. After another type name, `<`
+    /// starts type arguments only if a balanced `<...>` of type tokens
+    /// follows (`p as *Vec<T>`); otherwise it is a comparison. Write
+    /// `(x as T) < y` to be explicit.
+    fn parse_cast_type(&mut self) -> Res<TypeExpr> {
+        let saved = self.cast_type;
+        self.cast_type = true;
+        let r = self.parse_type();
+        self.cast_type = saved;
+        r
+    }
 
     pub fn parse_type(&mut self) -> Res<TypeExpr> {
         let start = self.span();
@@ -546,7 +617,11 @@ impl Parser {
                 path.push(self.ident()?);
             }
             let mut args = Vec::new();
-            if self.eat("<") {
+            let comparison = self.cast_type
+                && self.is("<")
+                && ((path.len() == 1 && crate::check::prim_type(&path[0].name).is_some()) || self.angle_args_end().is_none());
+            let cast_type = std::mem::replace(&mut self.cast_type, false);
+            if !comparison && self.eat("<") {
                 self.split_angle();
                 while !self.is(">") {
                     args.push(self.parse_type()?);
@@ -557,6 +632,7 @@ impl Parser {
                 }
                 self.expect(">")?;
             }
+            self.cast_type = cast_type;
             TypeKind::Named(path, args)
         };
         Ok(TypeExpr { kind, span: start.to(self.prev_span()) })
@@ -788,7 +864,7 @@ impl Parser {
     fn parse_cast(&mut self) -> Res<Expr> {
         let mut e = self.parse_unary()?;
         while self.eat_kw("as") {
-            let t = self.parse_type()?;
+            let t = self.parse_cast_type()?;
             let span = e.span.to(t.span);
             e = Expr { kind: ExprKind::Cast(Box::new(e), t), span };
         }
@@ -855,6 +931,28 @@ impl Parser {
                 self.expect("]")?;
                 let span = e.span.to(self.prev_span());
                 e = Expr { kind: ExprKind::Index(Box::new(e), Box::new(idx)), span };
+            } else if self.is("<")
+                && !self.toks[self.pos].space_before
+                && matches!(e.kind, ExprKind::Ident(_) | ExprKind::Field(..))
+                && self.angle_args_end().is_some_and(|i| matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("("))))
+            {
+                // `f<T>(..)`, `mem.alloc<u8>(n)`, `v.map<f64>(g)`: explicit
+                // type arguments of a generic call.
+                let saved = std::mem::replace(&mut self.cast_type, false);
+                self.bump();
+                let mut targs = Vec::new();
+                self.split_angle();
+                while !self.is(">") {
+                    targs.push(self.parse_type()?);
+                    self.split_angle();
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(">")?;
+                self.cast_type = saved;
+                let span = e.span.to(self.prev_span());
+                e = Expr { kind: ExprKind::TypeArgs(Box::new(e), targs), span };
             } else if self.is("?") && !self.toks[self.pos].space_before {
                 self.bump();
                 let span = e.span.to(self.prev_span());

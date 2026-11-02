@@ -1,0 +1,50 @@
+// matrix: dispatch
+// Globals (plain and thread-local) used from vm handlers and cold blocks,
+// and opcodes decoded with an integer-to-enum cast.
+import std.io;
+
+enum Kind: u8 { Tick, Tock }
+
+var ticks: i64 = 0;
+#[thread_local]
+var tocks: i64 = 100;
+var trace: [u8; 8] = [0; 8];
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format AB { op: 8, a: 8, b: 8 }
+    }
+
+    op STEP(a: reg, k: imm) : AB {
+        match k as Kind {
+            Tick => { ticks += 1; }
+            Tock => { tocks += a; }
+        }
+        trace[ticks as u64 % 8] = k as u8;
+        if ticks > 1000 { cold { io.println("too many ticks"); exit ticks } }
+        next
+    }
+    op RET(a: reg) : AB { exit a + ticks + tocks }
+
+    entry run(code: *u32, r: *i64) -> i64 {
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+fn main() {
+    var regs: [i64; 4] = [5, 0, 0, 0];
+    let code: [u32; 5] = [V.STEP(0, 0), V.STEP(0, 1), V.STEP(0, 0), V.STEP(0, 1), V.RET(1)];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+    io.print_int(ticks); io.print(" "); io.print_int(tocks); io.println("");
+    io.print_int(trace[2] as i64); io.println("");
+}
+// expect: 112
+// expect: 2 110
+// expect: 1

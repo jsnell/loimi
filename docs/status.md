@@ -8,8 +8,9 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | Area | Status |
 |---|---|
 | Compiler | Rust, no dependencies. Emits textual LLVM IR and drives `clang-19` (`loimi build`, `loimi run`, `--emit-llvm`, `--release`, `--dispatch=`). |
-| Core language | `inline for` (module level and in `vm` blocks), structs (literals may be module-qualified: `diag.Span { .. }`), enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (through nested patterns and tuples), `let ... else`, `if let` chains, loops with `break` values, `defer`, consts, casts, checked/wrapping arithmetic, overflow and bounds checks (overflow traps in debug builds). |
-| Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Methods resolve per instance, so `HashMap<K, V>` works with any key type that has `hash`/`eq` methods (no traits needed yet). A generic function can be used as a function pointer where a function type is expected (`Pratt.new(peek, ...)` with `fn peek<E>(p: *P<E>) -> T`). Methods cannot have type parameters of their own beyond the receiver's. |
+| Core language | `inline for` (module level and in `vm` blocks), structs (literals may be module-qualified: `diag.Span { .. }`), enums with payloads, `?T`, `Result` with `?`, tuples, arrays, slices, pointers and pointer arithmetic, methods (`fn Type.name`), modules and imports, `match` with exhaustiveness checking (through nested patterns and tuples), `let ... else`, `if let` chains, loops with `break` values, `defer`, consts, module-level `var`s (see below), casts (including integer to fieldless enum, checked in debug builds; `Kind.COUNT` gives the number of variants; `x as u64 < y` parses as a comparison), local inference across `if`/`match` branches (`if c { Ok(e) } else { Err(m) }` needs no annotation), checked/wrapping arithmetic, overflow and bounds checks (overflow traps in debug builds). |
+| Globals | `var NAME: T = init;` at module level (with `pub`, readable and assignable from other modules as `mod.NAME` or after `import mod.{NAME}`). Plain LLVM globals; `#[thread_local]` makes one copy per thread (`thread_local(initialexec)`). The initializer must be a constant expression: literals, consts, `[x; N]`, struct/tuple/array literals, enum variants without payload, `None`/`Some(..)`/`Ok(..)`/`Err(..)` of constants, and functions (for hooks). Globals are not GC roots: a global holding `Gc`/`Value` must be marked by a root scanner (`heap.add_scanner`). |
+| Generics | Monomorphized generic structs, enums, functions and methods; type arguments inferred from arguments and the expected type. Methods resolve per instance, so `HashMap<K, V>` works with any key type that has `hash`/`eq` methods (no traits needed yet). A generic function can be used as a function pointer where a function type is expected (`Pratt.new(peek, ...)` with `fn peek<E>(p: *P<E>) -> T`). Methods can have their own type parameters after the method name, on plain receivers (`fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`) and generic ones (`fn Box<T>.map<U>(b: *Box<T>, f: fn(T) -> U) -> Box<U>`); the receiver's arguments come from the receiver, the method's are inferred from the arguments and the expected type. Type arguments can also be given explicitly on calls: `mem.alloc<u8>(n)`, `id<i64>(x)`, `c.op<K>(&ops)`, `Cursor.cast<u8>(&c)` (a method's own parameters only; not on a generic type's static functions such as `Vec.new`). `f<T>(` is recognized when `<` directly follows the name and a balanced, type-shaped `<...>` is followed by `(`; otherwise `<` is a comparison. |
 | `value` types | `nanbox`, `lowtag`, `boxed` representations; NaN canonicalization; tuple patterns merged into one test (xor/or/mask, umax). |
 | `vm` declarations | state, context, operand kinds, fixed-width formats, inline caches, `family` + `become`, `super`, vm functions, entries, `on raise`/`raise`, `cold`, `sync`. |
 | Dispatch | `tailcall` (`preserve_none` + `musttail`, instruction word passed in a register), `goto` (one function, replicated `indirectbr`), `switch`. |
@@ -50,6 +51,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
 - **vm functions** can read and write state but cannot use control words.
 - **Effects** must be declared; they are not inferred for private functions.
+  Function types carry no effects, so calls through function pointers are
+  not checked or rooted (see `design/closures-traits.md`, section 0).
 - **Verifier**: operand checks only. Stack-effect checking for stack VMs
   and "cannot fall off the end" are not implemented.
 - **Instrumentation**: switching tables happens from vm code (`use_variant`),
@@ -63,7 +66,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
 - **`inline for`** is token-level expansion: values are token sequences
   (so operators like `+` work), and `#var` makes an identifier from a
   string or identifier value.
-- **Not yet built**: traits/interfaces, a moving,
+- **Not yet built**: traits/interfaces and closures (see the proposal in
+  [`design/closures-traits.md`](design/closures-traits.md)), a moving,
   incremental or generational GC, weak references, ephemerons, finalizers,
   `std.bc`/`obj`/`rt`/`prof`/`test`, line tables,
   variable-length encodings, atomic `become` for shared code, and the C

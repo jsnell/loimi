@@ -1,0 +1,47 @@
+// Integer-to-enum casts and `Kind.COUNT`.
+import std.io;
+
+enum Op: u8 { Load, Store, Add, Jump }
+enum Sparse { A = 1, B = 5, C = -3 }
+enum Wide: i64 { Lo = -2, Mid, Hi }
+
+const THIRD: Op = 2 as Op;
+
+fn name(o: Op) -> str {
+    match o { Load => "load", Store => "store", Add => "add", Jump => "jump" }
+}
+
+fn main() {
+    // Round trip through every discriminant.
+    for i in 0..Op.COUNT {
+        let o = i as Op;
+        io.print(name(o)); io.print(";");
+    }
+    io.println("");
+    let byte: u8 = 3;
+    io.println(name(byte as Op));
+    io.println(name(THIRD));
+    let counts: [u32; Op.COUNT] = [0; Op.COUNT];
+    io.print_int(counts.len as i64); io.println("");
+    let n: u32 = Op.COUNT;
+    io.print_int(n as i64); io.println("");
+    if Op.COUNT > byte { io.println("in range"); }
+
+    let s: i32 = -3;
+    match s as Sparse { C => io.println("C"), _ => io.println("?") }
+    let five: u64 = 5;
+    io.print_bool(five as Sparse == Sparse.B); io.println("");
+    io.print_int(Sparse.COUNT); io.println("");
+    let w: i8 = -1;
+    io.print_int((w as Wide) as i64); io.println("");
+}
+// expect: load;store;add;jump;
+// expect: jump
+// expect: add
+// expect: 4
+// expect: 4
+// expect: in range
+// expect: C
+// expect: true
+// expect: 3
+// expect: -1

@@ -1,0 +1,95 @@
+// Module-level mutable globals: plain and thread-local, with constant
+// initializers, read and written from this and other modules.
+import std.io;
+import globals_mod.counter;
+import globals_mod.counter.{COUNT};
+
+struct Point { x: i32, y: i32 }
+enum Mode { Off, Slow, Fast }
+enum Shape { Dot, Circle(f64) }
+
+const BASE: i64 = 40;
+
+var total: i64 = BASE + 2;
+var origin: Point = Point { x: -1, y: 2 };
+var table: [u8; 256] = [0; 256];
+var ones: [i16; 3] = [1; 3];
+var pair: (bool, f64) = (true, 0.5);
+var mode: Mode = Mode.Slow;
+var shape: Shape = Dot;
+var maybe: ?i64 = None;
+var some: ?u8 = Some(7);
+var res: Result<i32, str> = Err("bad");
+var hook: ?fn(i64) -> i64 = None;
+var greeting: str = "hello";
+#[thread_local]
+var depth: u32 = 3;
+#[thread_local]
+pub var tls_point: Point = Point { x: 10, y: 20 };
+
+fn twice(x: i64) -> i64 { x * 2 }
+
+fn bump_depth() { depth += 1; }
+
+fn main() {
+    io.print_int(total); io.println("");
+    total = total * 2;
+    io.print_int(total); io.println("");
+    origin.x += 5;
+    io.print_int(origin.x as i64); io.print(" "); io.print_int(origin.y as i64); io.println("");
+    table['a'] = 1;
+    var n = 0;
+    for i in 0..256 { n += table[i] as i64; }
+    io.print_int(n); io.println("");
+    io.print_int(ones[2] as i64); io.println("");
+    io.print_bool(pair.0); io.println("");
+    match mode { Slow => io.println("slow"), _ => io.println("other") }
+    mode = Fast;
+    io.print_int(mode as i64); io.println("");
+    match shape { Dot => io.println("dot"), Circle(_) => io.println("circle") }
+    shape = Circle(1.5);
+    if let Circle(r) = shape { io.print_bool(r == 1.5); io.println(""); }
+    io.print_bool(maybe.is_none()); io.println("");
+    io.print_int(some.unwrap() as i64); io.println("");
+    if let Err(e) = res { io.println(e); }
+    hook = Some(twice);
+    if let Some(h) = hook { io.print_int(h(21)); io.println(""); }
+    io.println(greeting);
+    bump_depth();
+    io.print_int(depth as i64); io.println("");
+    tls_point.y = 21;
+    io.print_int(tls_point.y as i64); io.println("");
+    let p = &table;
+    io.print_int(p[97] as i64); io.println("");
+
+    // Another module's globals, through the module and imported by name.
+    counter.bump();
+    counter.bump();
+    io.print_int(counter.COUNT); io.println("");
+    COUNT = 10;
+    io.print_int(counter.bump()); io.println("");
+    io.println(counter.NAMES[1]);
+    io.print_int(counter.hidden_value() as i64); io.println("");
+}
+// expect: 42
+// expect: 84
+// expect: 4 2
+// expect: 1
+// expect: 1
+// expect: true
+// expect: slow
+// expect: 2
+// expect: dot
+// expect: true
+// expect: true
+// expect: 7
+// expect: bad
+// expect: 42
+// expect: hello
+// expect: 4
+// expect: 21
+// expect: 1
+// expect: 2
+// expect: 11
+// expect: one
+// expect: 8

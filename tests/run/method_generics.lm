@@ -1,0 +1,64 @@
+// Methods with their own type parameters, on plain and generic receivers.
+import std.io;
+
+struct Cursor { pos: u64 }
+
+struct Table<K> { keys: [K; 4], n: u64 }
+
+fn Table<K>.new(k: K) -> Table<K> { Table { keys: [k; 4], n: 0 } }
+
+fn Table<K>.add(t: *Table<K>, k: K) { t.keys[t.n] = k; t.n += 1; }
+
+// Plain receiver, method type parameter.
+fn Cursor.take<K>(c: *Cursor, t: *Table<K>) -> ?K {
+    if c.pos >= t.n { return None; }
+    let k = t.keys[c.pos];
+    c.pos += 1;
+    Some(k)
+}
+
+// Called statically.
+fn Cursor.pair<A, B>(a: A, b: B) -> (B, A) { (b, a) }
+
+// Generic receiver plus a method type parameter.
+struct Box<T> { v: T }
+
+fn Box<T>.map<U>(b: *Box<T>, f: fn(T) -> U) -> Box<U> { Box { v: f(b.v) } }
+
+fn Box<T>.with<U>(b: Box<T>, u: U) -> (T, U) { (b.v, u) }
+
+fn double(x: i64) -> i64 { x * 2 }
+fn is_big(x: i64) -> bool { x > 10 }
+
+fn main() {
+    var t: Table<u8> = Table.new(0);
+    t.add(7);
+    t.add(9);
+    var c = Cursor { pos: 0 };
+    while let Some(k) = c.take(&t) {
+        io.print_int(k as i64); io.println("");
+    }
+    var words: Table<str> = Table.new("");
+    words.add("hi");
+    c.pos = 0;
+    io.println(c.take(&words).unwrap());
+
+    let (s, n) = Cursor.pair(5, "five");
+    io.println(s); io.print_int(n); io.println("");
+
+    var b = Box { v: 6 };
+    let d = b.map(double);
+    io.print_int(d.v); io.println("");
+    let big: Box<bool> = d.map(is_big);
+    io.print_bool(big.v); io.println("");
+    let (x, y) = b.with(25);
+    io.print_int(x); io.print(" "); io.print_int(y); io.println("");
+}
+// expect: 7
+// expect: 9
+// expect: hi
+// expect: five
+// expect: 5
+// expect: 12
+// expect: true
+// expect: 6 25

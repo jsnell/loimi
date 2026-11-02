@@ -1,0 +1,9 @@
+import std.io;
+enum Sparse { A = 1, B = 5 }
+fn sparse(x: u32) -> Sparse { x as Sparse }
+fn main() {
+    sparse(3);
+    io.println("unchecked");
+}
+// args: --release
+// expect: unchecked

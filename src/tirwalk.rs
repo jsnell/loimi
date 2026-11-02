@@ -21,7 +21,7 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
     let mut go = |x: &TExpr| locals(x, used, declared);
     match &e.kind {
         TK::Local(l) => push(used, *l),
-        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
+        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) | TK::Global(_) => {}
         TK::Continue(_) | TK::Unreachable => {}
         TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
         TK::Try(a) | TK::Trailing(a) => go(a),

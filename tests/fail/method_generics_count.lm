@@ -1,0 +1,4 @@
+struct Box<T> { v: T }
+fn Box.get<T>(b: *Box<T>) -> T { b.v }
+fn main() {}
+// error: `Box` takes 1 type parameter(s); write them after the type name (`fn Box<..>.get`)

@@ -115,6 +115,8 @@ pub enum ExprKind {
     /// `expr?`
     Try(P<Expr>),
     SizeOf(TypeExpr),
+    /// `f<T, U>`: explicit type arguments (only as a callee: `f<T>(..)`).
+    TypeArgs(P<Expr>, Vec<TypeExpr>),
     /// VM control words and constructs (only valid in handlers).
     Vm(VmExpr),
 }
@@ -211,8 +213,12 @@ pub struct Param {
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     pub name: Ident,
-    /// Type parameters: `fn f<T>(..)`, or of the receiver: `fn Vec<T>.push(..)`.
+    /// Type parameters: `fn f<T>(..)`, of the receiver: `fn Vec<T>.push(..)`,
+    /// and of a method: `fn Cursor.op<K>(..)`.
     pub generics: Vec<Ident>,
+    /// How many of `generics` belong to the receiver type (`fn Vec<T>.map<U>`
+    /// has generics `[T, U]` and `recv_generics == 1`).
+    pub recv_generics: usize,
     /// `fn Type.method(...)`
     pub recv: Option<Ident>,
     pub params: Vec<Param>,
@@ -257,6 +263,17 @@ pub struct ConstDecl {
     pub is_pub: bool,
 }
 
+/// Module-level mutable variable: `var NAME: T = const_init;`.
+#[derive(Clone, Debug)]
+pub struct GlobalDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    pub is_pub: bool,
+    /// `#[thread_local]`: one copy per thread (initial-exec TLS).
+    pub thread_local: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Import {
     pub path: Vec<Ident>,
@@ -271,6 +288,7 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Const(ConstDecl),
+    Global(GlobalDecl),
     Import(Import),
     Vm(Box<crate::vmast::VmDecl>),
     Value(crate::vmast::ValueDecl),

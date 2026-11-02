@@ -1,0 +1,3 @@
+var x: i64;
+fn main() {}
+// error: a module-level `var` needs an initializer

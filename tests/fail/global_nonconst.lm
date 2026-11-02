@@ -1,0 +1,4 @@
+fn f() -> i64 { 1 }
+var x: i64 = f();
+fn main() {}
+// error: the initializer of a module-level `var` must be a constant expression

@@ -37,6 +37,9 @@ pub struct Generics {
     pub fn_inst: HashMap<(u32, Vec<Ty>), FnId>,
     /// (generic type, method name) → generic fn.
     pub methods: HashMap<(u32, String), u32>,
+    /// (non-generic type, method name) → generic fn: methods with their
+    /// own type parameters on a plain type (`fn Cursor.op<K>`).
+    pub ty_methods: HashMap<(Ty, String), u32>,
 }
 
 pub fn contains_param(t: &Ty, g: &Generics) -> bool {
@@ -130,7 +133,19 @@ impl<'a> Checker<'a> {
         self.generics.fn_inst.insert((g, args.clone()), id);
         let targs = args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ");
         let base = match &decl.recv {
-            Some(r) => format!("{}<{}>.{}", r.name, targs, decl.name.name),
+            Some(r) => {
+                let names: Vec<String> = args.iter().map(|a| self.ty_name(a)).collect();
+                let (ra, ma) = names.split_at(decl.recv_generics);
+                let mut b = r.name.clone();
+                if !ra.is_empty() {
+                    b = format!("{}<{}>", b, ra.join(", "));
+                }
+                b = format!("{}.{}", b, decl.name.name);
+                if !ma.is_empty() {
+                    b = format!("{}<{}>", b, ma.join(", "));
+                }
+                b
+            }
             None => format!("{}<{}>", decl.name.name, targs),
         };
         let symbol = format!("{}.{}", self.module_prefix(module), base);

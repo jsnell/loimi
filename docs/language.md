@@ -60,8 +60,38 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 ```
 
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
+- Module-level `var NAME: T = init;` declares a global. `init` must be a
+  constant expression (literals, consts, `[x; N]`, aggregate and enum
+  literals of constants, functions). `#[thread_local] var` gives each thread
+  its own copy, which is what an interpreter wants for "current VM" or
+  per-thread caches. `pub var` is visible to other modules. Globals are not
+  GC roots.
+- **Integer-to-enum casts.** `x as Kind` converts an integer to an enum
+  without payloads (decoding an opcode byte, a token kind from a table). The
+  value must equal one of the discriminants. Like overflow, this is checked
+  in debug builds (a panic naming the cast) and unchecked in release builds,
+  where an invalid value is undefined behavior for any `match` on the
+  result. A constant operand is checked at compile time. `Kind.COUNT` is the
+  number of variants, typed like an integer literal (`[u32; Kind.COUNT]`,
+  `for i in 0..Kind.COUNT { let k = i as Kind; }`); a variant named `COUNT`
+  takes precedence. With explicit discriminants the count is not the
+  largest discriminant plus one.
+- **Local inference across branches.** Without an annotation, the branches
+  of `if` and `match` are typed against each other: `let r = if c { Ok(e) }
+  else { Err(m) };` gets `Result<typeof e, typeof m>`, and an arm that cannot
+  be typed alone (`None`, `Ok(x)`) takes its type from the others. Inference
+  is local: it does not look at later uses of `r`.
+- **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
+  takes type arguments. After any other type name, `<` begins type
+  arguments only when a balanced `<...>` made of type tokens follows
+  (`p as *Vec<T>`); otherwise it is a comparison. When in doubt, write
+  `(x as T) < y`.
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
+  Type arguments are inferred from arguments and the expected type, or given
+  explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
+  `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
+  `fn Vec<T>.map<U>(v: *Vec<T>, f: fn(T) -> U) -> Vec<U>`.
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in

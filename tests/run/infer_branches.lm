@@ -1,0 +1,53 @@
+// Branches of if/match are typed against each other when one of them
+// cannot be typed alone (`Ok(e)`, `Err(m)`, `None`).
+import std.io;
+
+fn get(x: i64) -> Result<i64, str> { if x > 0 { Ok(x) } else { Err("neg") } }
+
+fn show(r: Result<i64, str>) {
+    match r { Ok(v) => io.print_int(v), Err(m) => io.print(m) }
+    io.println("");
+}
+
+fn main() {
+    let c = false;
+    // The reported case: no branch has a complete type on its own.
+    let r = match get(3) {
+        Ok(e) => if c { Ok(e) } else { Err("filtered") },
+        Err(m) => Err(m),
+    };
+    show(r);
+    // One branch is concrete.
+    let r2 = match get(-1) {
+        Ok(e) => if c { Ok(e) } else { Err("x") },
+        Err(_) => get(5),
+    };
+    show(r2);
+    // Constructor pieces from different branches.
+    let r3 = if c { Ok(1) } else { Err("both") };
+    show(r3);
+    let s = if c { None } else { Some(3) };
+    io.print_int(s.unwrap()); io.println("");
+    let t = match 2 { 1 => None, _ => Some("two") };
+    io.println(t.unwrap());
+    // Through blocks with statements, and nested matches.
+    let u = if c {
+        let k = 4;
+        Ok(k)
+    } else {
+        match get(7) {
+            Ok(v) => { let w = v * 2; Ok(w) }
+            Err(m) => Err(m),
+        }
+    };
+    show(u);
+    let pair = if c { (None, 1) } else { (Some(2.5), 2) };
+    io.print_bool(pair.0.is_some()); io.println("");
+}
+// expect: filtered
+// expect: 5
+// expect: both
+// expect: 3
+// expect: two
+// expect: 14
+// expect: true
