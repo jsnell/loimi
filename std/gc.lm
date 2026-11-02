@@ -2,7 +2,8 @@
 //
 // Small objects (header included, up to 512 bytes) come from size-class
 // free lists carved out of 64 KiB chunks; sweeping walks the chunks and
-// rebuilds the free lists. Larger objects are calloc'd and kept on a list.
+// rebuilds the free lists. Larger objects are calloc'd and kept in a
+// vector.
 //
 // Objects are allocated with `new(heap, Obj { .. })`. Allocation never
 // collects; collection happens only in functions that `use gc`
@@ -23,7 +24,7 @@ extern "C" fn free(p: *u8);
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn abort();
 
-const HEADER: u64 = 24;
+const HEADER: u64 = 16;
 /// Size classes are multiples of 16 bytes, header included: class c holds
 /// objects of up to 16 * c bytes, for c in 1..NCLASS.
 const NCLASS: u64 = 33;
@@ -31,9 +32,13 @@ const CHUNK: u64 = 65536;
 /// The `tid` of a free small-object slot.
 const FREE: u16 = 0xFFFF;
 
-/// Lives just before every object. `next` links large objects (and free
-/// small slots); `size` is the slot size.
-struct Header { next: *Header, size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
+/// Lives just before every object (16 bytes, so a pair of two words takes
+/// a 32-byte slot). `size` is the slot size; `len` is the length of the
+/// trailing array (compiled code reads it at object - 8), and on a free
+/// small slot it links the next free slot instead.
+struct Header { size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
+
+fn next_free(hd: *Header) -> *Header { hd.len as *Header }
 
 /// A chunk of `n` small-object slots of `size` bytes each.
 struct Chunk { base: *u8, size: u64, n: u64 }
@@ -46,7 +51,7 @@ struct Scanner { data: *u8, scan: fn(*Heap, *u8) }
 
 pub struct Heap {
     /// Large objects.
-    objects: *Header,
+    large: mem.Vec<*Header>,
     /// Free small slots per size class.
     free: [*Header; 33],
     chunks: mem.Vec<Chunk>,
@@ -65,6 +70,9 @@ pub struct Heap {
     /// as survived, so the heap peaks at about twice the live data; 200
     /// lets it reach three times, and halves the number of collections.
     growth: u64,
+    /// The largest allocation budget between collections (0: no limit),
+    /// so a large growth factor does not multiply a large heap.
+    max_budget: u64,
     stack: mem.Vec<*u8>,
     scanners: mem.Vec<Scanner>,
     collections: u64,
@@ -77,7 +85,7 @@ pub struct Heap {
 
 pub fn Heap.new() -> Heap {
     Heap {
-        objects: 0 as *Header,
+        large: mem.Vec.new(),
         free: [0 as *Header; 33],
         chunks: mem.Vec.new(),
         sweepers: mem.Vec.new(),
@@ -87,6 +95,7 @@ pub fn Heap.new() -> Heap {
         threshold: 1 << 20,
         min_heap: 1 << 20,
         growth: 100,
+        max_budget: 0,
         stack: mem.Vec.new(),
         scanners: mem.Vec.new(),
         collections: 0,
@@ -102,7 +111,7 @@ pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     if c < NCLASS {
         let hd = h.free[c];
         if (hd as u64) != 0 {
-            h.free[c] = hd.next;
+            h.free[c] = next_free(hd);
             hd.tid = tid as u16;
             hd.len = n;
             h.count += 1;
@@ -125,11 +134,10 @@ fn alloc_slow(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let p = calloc(1, HEADER + size);
     if (p as u64) == 0 { oom(); }
     let hd = p as *Header;
-    hd.next = h.objects;
     hd.size = (HEADER + size) as u32;
     hd.tid = tid as u16;
     hd.len = n;
-    h.objects = hd;
+    h.large.push(hd);
     h.count += 1;
     h.allocated += HEADER + size;
     p + HEADER
@@ -154,7 +162,7 @@ fn add_chunk(h: *Heap, c: u64) {
         let hd = (base + i * size) as *Header;
         hd.size = size as u32;
         hd.tid = FREE;
-        hd.next = h.free[c];
+        hd.len = h.free[c] as u64;
         h.free[c] = hd;
     }
 }
@@ -245,28 +253,27 @@ pub fn collect(h: *Heap) uses gc {
             // A free slot may have been marked through a dangling
             // reference (a missed root); never hand out a marked slot.
             hd.mark = 0;
-            hd.next = head;
+            hd.len = head as u64;
             head = hd;
         }
         h.free[c] = head;
     }
     // Large objects.
-    var link: **Header = &h.objects;
-    var cur = h.objects;
-    while (cur as u64) != 0 {
-        let next = cur.next;
+    var out: u64 = 0;
+    for i in 0..h.large.len {
+        let cur = h.large.at(i);
         if cur.mark != 0 {
             cur.mark = 0;
             live += cur.size as u64;
             kept += 1;
-            link = &cur.next;
+            h.large.set(out, cur);
+            out += 1;
         } else {
-            *link = next;
             freed += 1;
             free(cur as *u8);
         }
-        cur = next;
     }
+    h.large.truncate(out);
     h.freed += freed;
     h.count = kept;
     h.live_bytes = live;
@@ -277,7 +284,8 @@ pub fn collect(h: *Heap) uses gc {
 
 /// Bytes that may be allocated after a collection that left `live` bytes.
 fn budget(h: *Heap, live: u64) -> u64 {
-    let b = live / 100 * h.growth + live % 100 * h.growth / 100;
+    var b = live / 100 * h.growth + live % 100 * h.growth / 100;
+    if h.max_budget != 0 and b > h.max_budget { b = h.max_budget; }
     if b > h.min_heap { b } else { h.min_heap }
 }
 
@@ -287,6 +295,15 @@ fn budget(h: *Heap, live: u64) -> u64 {
 pub fn Heap.set_growth(h: *Heap, percent: u64, min_heap: u64) {
     h.growth = percent;
     h.min_heap = min_heap;
+    if !h.stress { h.threshold = budget(h, h.live_bytes); }
+}
+
+/// Limit the allocation budget between collections to `bytes` (0: no
+/// limit; `min_heap` still applies). With a large growth factor this
+/// bounds the heap at the live data plus `bytes`, rather than a multiple
+/// of the live data. Takes effect now for the current budget too.
+pub fn Heap.set_max_budget(h: *Heap, bytes: u64) {
+    h.max_budget = bytes;
     if !h.stress { h.threshold = budget(h, h.live_bytes); }
 }
 
@@ -305,13 +322,8 @@ pub fn maybe_collect(h: *Heap) uses gc {
 
 /// Free every object (no finalizers run).
 pub fn Heap.free(h: *Heap) {
-    var cur = h.objects;
-    while (cur as u64) != 0 {
-        let next = cur.next;
-        free(cur as *u8);
-        cur = next;
-    }
-    h.objects = 0 as *Header;
+    for i in 0..h.large.len { free(h.large.at(i) as *u8); }
+    h.large.free();
     for i in 0..h.chunks.len { free(h.chunks.at(i).base); }
     h.chunks.free();
     for c in 0..NCLASS { h.free[c] = 0 as *Header; }

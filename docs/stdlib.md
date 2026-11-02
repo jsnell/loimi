@@ -323,7 +323,10 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
   and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
 - Stress mode, heap verification, poisoning, and heap snapshots.
 
-**As implemented**: root scanners and sweepers (`Heap.add_scanner`,
+**As implemented**: every object has a 16-byte header (slot size, type
+id, mark bits, and the trailing-array length, which compiled code reads
+at object - 8; a free slot links the next one through the length), so a
+two-word object such as a Lisp pair takes a 32-byte slot. Root scanners and sweepers (`Heap.add_scanner`,
 `add_sweeper`) are `fn(*Heap, *u8)` without effects: they run during a
 collection and must not start one, so a `uses gc` function is rejected.
 The growth policy is `Heap.set_growth(percent, min_heap)`: after a
@@ -339,7 +342,11 @@ within noise; Scheme at 200% runs nboyer, graphs and mperm 4-10% faster
 but string 27% slower (41 to 52 ms) and primes and array1 3-4% slower;
 an 8 MiB minimum makes Scheme's small allocation-heavy programs (deriv,
 divrec, cpstak) 6-10% slower, as the heap leaves the CPU caches. Mini
-and Scheme can opt in with `set_growth`.
+and Scheme can opt in with `set_growth`. `Heap.set_max_budget(bytes)`
+caps the budget (0, the default, is no cap), so that a large growth
+factor bounds the heap at the live data plus `bytes` rather than at a
+multiple of it once the live data is large. Scheme uses 400%, a 2 MiB
+minimum and a 256 MiB cap (see `bench/scheme/README.md`).
 
 ## `std.obj`: objects and shapes
 

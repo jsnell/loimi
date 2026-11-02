@@ -129,6 +129,16 @@ pub vm Scheme {
             next
         }
     }
+    /// Check that a global is bound (the inlined body of a top-level
+    /// procedure runs only once its definition has).
+    family CHKGLOBAL(unused: imm, g: gl) : ABx {
+        generic {
+            if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+            become CHKGLOBAL_B;
+            next
+        }
+        CHKGLOBAL_B { next }
+    }
     /// set! of a global: it must already be bound.
     op SETGLOBAL(src: reg, g: gl) : ABx {
         if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
@@ -277,6 +287,34 @@ pub vm Scheme {
     op NULLP(dst: reg, a: reg) : ABC { dst = value.boolean(a == V.Imm(value.IMM_NIL)); next }
     op PAIRP(dst: reg, a: reg) : ABC {
         if let P(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+
+    // Type predicates.
+    op SYMBOLP(dst: reg, a: reg) : ABC {
+        if let Sym(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op NUMBERP(dst: reg, a: reg) : ABC {
+        match a {
+            Int(_) | Num(_) => { dst = Imm(value.IMM_TRUE); next }
+            _ => { dst = Imm(value.IMM_FALSE); next }
+        }
+    }
+    op FIXNUMP(dst: reg, a: reg) : ABC {
+        if let Int(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op STRINGP(dst: reg, a: reg) : ABC {
+        if let S(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op VECTORP(dst: reg, a: reg) : ABC {
+        if let Vec(x) = a and x.rtd == V.Imm(value.IMM_NIL) { dst = Imm(value.IMM_TRUE); next }
         dst = Imm(value.IMM_FALSE);
         next
     }
@@ -433,6 +471,39 @@ pub vm Scheme {
             jump fp.resume
         }
         raise rt.err(ctx, "not a procedure", f)
+    }
+
+    /// R[base] = builtin `id` (R[base+1] .. R[base+nargs]): a call of a
+    /// builtin the program never redefines (not apply or call/cc).
+    op PRIMCALL(base: callbase, nargs: imm, id: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        regs[base] = builtins.call_native(ctx, id as i32, regs + base + 1, nargs as u64)?;
+        next
+    }
+
+    /// R[base] = this procedure (R[base+1] .. R[base+nargs]): a recursive
+    /// call, which the compiler emits only with the right number of
+    /// arguments, so the callee needs no checks. R[base] is not read.
+    op CALLSELF(base: callbase, nargs: imm) : ABC {
+        let cl = fp.cl;
+        let p = cl.proto;
+        let callee = regs + base + 1;
+        let n = p.nregs as u64;
+        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            cold { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
+        }
+        var i = nargs as u64;
+        while i < n {
+            callee[i] = Imm(value.IMM_UNSPEC);
+            i += 1;
+        }
+        fp.resume = pc + 1;
+        fp = fp + 1;
+        fp.cl = cl;
+        fp.base = callee;
+        fp.k = k;
+        regs = callee;
+        jump p.code.ptr
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).

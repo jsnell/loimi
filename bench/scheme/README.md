@@ -66,7 +66,18 @@ bench/scheme/compare.py --inner fib tak            # the benchmarks' own "Elapse
 bench/scheme/compare.py --refs gauche,guile-nojit  # a subset of the references ('' = none)
 bench/scheme/compare.py --check --count 1          # quick correctness pass, failures in full
 bench/scheme/compare.py --dispatch tailcall goto switch
+bench/scheme/compare.py --align 128                # build ours with --align-functions=128
+bench/scheme/compare.py --refs '' --dispatch --exe old new -n 5   # A/B of two builds
 ```
+
+Runs are interleaved: each repetition runs every implementation once, so
+drifts in machine load affect all columns alike. With `--exe`, the last
+lines give the geometric mean of each extra binary's times over the
+first's. For A/B comparisons build both binaries with the same
+`--align-functions` (128 here): code placement alone moves single
+benchmarks by up to ±9% on this machine (tak), and so does the placement
+of the bytecode in the heap (fib, with identical bytecode, after a
+prelude change).
 
 A run passes when the benchmark's own result check passes (no `ERROR:`
 line) and its output, minus the timing lines, is identical to that of the
@@ -113,194 +124,185 @@ interesting size, takes 4.5 s).
 
 ## Results
 
-`compare.py -n 3` and `compare.py -n 3 --inner`, minimum of 3 runs,
-seconds; ours is `--dispatch=tailcall`. Intel i7-6700, gcc 14 / clang 19,
-2026-11-02, run one benchmark at a time on an otherwise lightly loaded
-machine. Every program passes on every implementation with identical
-output.
+`compare.py -n 3 --align 128` and the same with `--inner`, minimum of 3
+interleaved runs, seconds; ours is `--dispatch=tailcall` at commit
+84da73f. Intel i7-6700, gcc 14 / clang 19, 2026-11-02, one benchmark at a
+time on a machine shared with other agents' work (load average about
+3-5 of 8 cores). Every program passes on every implementation with
+identical output. chibi was not rebuilt for this run; its column is from
+the previous one.
 
 | geometric mean of ours / reference | gauche | guile-nojit | guile (JIT) | chibi |
 |---|---|---|---|---|
-| wall (whole process) | **0.39** | **0.62** | **1.39** | 0.10 |
-| inner (timed loop only) | **0.49** | **0.67** | **1.57** | 0.12 |
+| wall (whole process) | **0.29** | **0.47** | **1.02** | |
+| inner (timed loop only) | **0.36** | **0.50** | **1.18** | |
+| wall, before this phase | 0.39 | 0.62 | 1.39 | 0.10 |
+| inner, before this phase | 0.49 | 0.67 | 1.57 | 0.12 |
 
-That is, ours is about 2–2.5× faster than Gauche, 1.5–1.6× faster than
-Guile's bytecode VM, and 1.4–1.6× slower than Guile with its JIT.
-Startup (an almost empty program, best of 5): ours 1 ms, Guile 7 ms,
-Gauche 42 ms (60 ms with the postlude's SLIB), chibi 313 ms; "inner"
-removes it. The inputs were sized for chibi, so some times are short
-(under 30 ms for Guile on browse, string, earley, paraffins, maze,
-gcbench), and those ratios are coarse.
+That is, ours is about 3× faster than Gauche, 2× faster than Guile's
+bytecode VM, and level with Guile with its JIT in wall time (1.2× slower
+in the timed loops). Startup (an almost empty program, best of 5): ours
+1 ms, Guile 7 ms, Gauche 42 ms (60 ms with the postlude's SLIB), chibi
+313 ms; "inner" removes it. The inputs were sized for chibi, so some
+times are short (under 30 ms for Guile on browse, string, earley,
+paraffins, maze, gcbench), and those ratios are coarse.
 
 ### Wall time (whole process)
 
-| benchmark | ours | gauche | guile-nojit | guile | chibi | /gauche | /guile-nojit | /guile | /chibi |
-|---|---|---|---|---|---|---|---|---|---|
-| browse | 0.022 | 0.082 | 0.027 | 0.019 | 2.127 | 0.27 | 0.81 | 1.17 | 0.01 |
-| deriv | 0.336 | 0.716 | 0.379 | 0.186 | 1.996 | 0.47 | 0.89 | 1.80 | 0.17 |
-| destruc | 0.170 | 0.470 | 0.230 | 0.092 | 1.566 | 0.36 | 0.74 | 1.84 | 0.11 |
-| diviter | 0.189 | 0.539 | 0.350 | 0.170 | 1.498 | 0.35 | 0.54 | 1.11 | 0.13 |
-| divrec | 0.275 | 0.635 | 0.446 | 0.217 | 1.460 | 0.43 | 0.62 | 1.27 | 0.19 |
-| puzzle | 0.130 | 0.285 | 0.237 | 0.085 | 1.991 | 0.46 | 0.55 | 1.53 | 0.07 |
-| triangl | 0.193 | 0.414 | 0.448 | 0.132 | 1.516 | 0.47 | 0.43 | 1.46 | 0.13 |
-| tak | 0.625 | 1.326 | 1.003 | 0.243 | 2.752 | 0.47 | 0.62 | 2.57 | 0.23 |
-| takl | 0.139 | 0.336 | 0.174 | 0.046 | 1.856 | 0.41 | 0.80 | 3.04 | 0.07 |
-| ntakl | 0.280 | 0.527 | 0.321 | 0.078 | 1.039 | 0.53 | 0.87 | 3.57 | 0.27 |
-| cpstak | 0.261 | 1.349 | 0.431 | 0.206 | 2.019 | 0.19 | 0.61 | 1.27 | 0.13 |
-| ctak | 0.026 | 0.251 | 0.475 | 0.475 | 1.686 | 0.11 | 0.06 | 0.06 | 0.02 |
-| fib | 0.629 | 1.446 | 1.101 | 0.289 | 2.101 | 0.44 | 0.57 | 2.18 | 0.30 |
-| fibc | 0.062 | 0.348 | 0.596 | 0.547 | 1.758 | 0.18 | 0.10 | 0.11 | 0.04 |
-| fibfp | 0.212 | 0.519 | 0.838 | 0.671 | 1.656 | 0.41 | 0.25 | 0.32 | 0.13 |
-| sum | 0.363 | 0.824 | 0.647 | 0.171 | 1.836 | 0.44 | 0.56 | 2.12 | 0.20 |
-| sumfp | 0.110 | 0.279 | 0.556 | 0.527 | 1.486 | 0.39 | 0.20 | 0.21 | 0.07 |
-| fft | 0.077 | 0.306 | 0.178 | 0.150 | 1.651 | 0.25 | 0.44 | 0.52 | 0.05 |
-| mbrot | 0.063 | 0.202 | 0.294 | 0.253 | 1.740 | 0.31 | 0.22 | 0.25 | 0.04 |
-| nucleic | 0.129 | 0.396 | 0.190 | 0.143 | 1.453 | 0.33 | 0.68 | 0.91 | 0.09 |
-| pnpoly | 0.105 | 0.216 | 0.360 | 0.225 | 1.951 | 0.49 | 0.29 | 0.47 | 0.05 |
-| simplex | 0.222 | 0.602 | 0.258 | 0.119 | 2.273 | 0.37 | 0.86 | 1.87 | 0.10 |
-| ack | 0.719 | 3.874 | 0.992 | 0.232 | 2.095 | 0.19 | 0.72 | 3.09 | 0.34 |
-| array1 | 0.436 | 0.977 | 1.225 | 0.329 | 2.053 | 0.45 | 0.36 | 1.33 | 0.21 |
-| string | 0.044 | 0.131 | 0.026 | 0.026 | 1.482 | 0.34 | 1.67 | 1.68 | 0.03 |
-| conform | 0.205 | 0.464 | 0.183 | 0.076 | 1.404 | 0.44 | 1.12 | 2.71 | 0.15 |
-| earley | 0.118 | 0.140 | 0.065 | 0.033 | 1.452 | 0.84 | 1.81 | 3.62 | 0.08 |
-| graphs | 0.226 | 0.628 | 0.210 | 0.070 | 4.003 | 0.36 | 1.08 | 3.23 | 0.06 |
-| lattice | 0.085 | 0.227 | 0.101 | 0.042 | 1.469 | 0.37 | 0.84 | 2.03 | 0.06 |
-| matrix | 0.115 | 0.296 | 0.117 | 0.052 | 1.579 | 0.39 | 0.98 | 2.22 | 0.07 |
-| maze | 0.089 | 0.207 | 0.076 | 0.039 | 0.843 | 0.43 | 1.17 | 2.28 | 0.11 |
-| mazefun | 0.212 | 0.449 | 0.294 | 0.095 | 1.527 | 0.47 | 0.72 | 2.23 | 0.14 |
-| nqueens | 0.373 | 0.720 | 0.523 | 0.180 | 2.160 | 0.52 | 0.71 | 2.07 | 0.17 |
-| paraffins | 0.056 | 0.167 | 0.053 | 0.031 | 1.370 | 0.34 | 1.06 | 1.81 | 0.04 |
-| peval | 0.249 | 0.404 | 0.205 | 0.077 | 1.631 | 0.62 | 1.22 | 3.24 | 0.15 |
-| primes | 0.183 | 0.616 | 0.323 | 0.215 | 0.974 | 0.30 | 0.57 | 0.85 | 0.19 |
-| quicksort | 0.127 | 0.300 | 0.196 | 0.077 | 1.884 | 0.42 | 0.65 | 1.65 | 0.07 |
-| nboyer | 1.126 | 1.253 | 0.930 | 0.334 | 4.213 | 0.90 | 1.21 | 3.37 | 0.27 |
-| sboyer | 0.938 | 1.314 | 1.033 | 0.317 | 3.904 | 0.71 | 0.91 | 2.96 | 0.24 |
-| gcbench | 0.036 | 0.175 | 0.051 | 0.019 | 1.167 | 0.20 | 0.70 | 1.87 | 0.03 |
-| mperm | 0.286 | 0.407 | 0.199 | 0.059 | 2.187 | 0.70 | 1.44 | 4.81 | 0.13 |
+| benchmark | ours | gauche | guile-nojit | guile | /gauche | /guile-nojit | /guile |
+|---|---|---|---|---|---|---|---|
+| browse | 0.019 | 0.083 | 0.028 | 0.019 | 0.23 | 0.67 | 1.01 |
+| deriv | 0.258 | 0.714 | 0.377 | 0.189 | 0.36 | 0.68 | 1.36 |
+| destruc | 0.147 | 0.484 | 0.232 | 0.092 | 0.30 | 0.63 | 1.60 |
+| diviter | 0.180 | 0.515 | 0.355 | 0.167 | 0.35 | 0.50 | 1.07 |
+| divrec | 0.237 | 0.665 | 0.450 | 0.218 | 0.36 | 0.53 | 1.09 |
+| puzzle | 0.102 | 0.292 | 0.239 | 0.086 | 0.35 | 0.43 | 1.19 |
+| triangl | 0.173 | 0.418 | 0.424 | 0.132 | 0.41 | 0.41 | 1.31 |
+| tak | 0.488 | 1.263 | 0.973 | 0.237 | 0.39 | 0.50 | 2.06 |
+| takl | 0.086 | 0.302 | 0.161 | 0.043 | 0.29 | 0.54 | 1.99 |
+| ntakl | 0.193 | 0.530 | 0.319 | 0.077 | 0.36 | 0.61 | 2.50 |
+| cpstak | 0.268 | 1.531 | 0.438 | 0.203 | 0.18 | 0.61 | 1.32 |
+| ctak | 0.028 | 0.321 | 0.575 | 0.561 | 0.09 | 0.05 | 0.05 |
+| fib | 0.597 | 1.454 | 1.100 | 0.290 | 0.41 | 0.54 | 2.06 |
+| fibc | 0.038 | 0.381 | 0.619 | 0.569 | 0.10 | 0.06 | 0.07 |
+| fibfp | 0.214 | 0.520 | 0.848 | 0.675 | 0.41 | 0.25 | 0.32 |
+| sum | 0.364 | 0.832 | 0.645 | 0.171 | 0.44 | 0.56 | 2.12 |
+| sumfp | 0.109 | 0.281 | 0.561 | 0.529 | 0.39 | 0.19 | 0.21 |
+| fft | 0.056 | 0.308 | 0.177 | 0.147 | 0.18 | 0.31 | 0.38 |
+| mbrot | 0.053 | 0.205 | 0.295 | 0.253 | 0.26 | 0.18 | 0.21 |
+| nucleic | 0.071 | 0.391 | 0.192 | 0.143 | 0.18 | 0.37 | 0.50 |
+| pnpoly | 0.082 | 0.214 | 0.352 | 0.223 | 0.38 | 0.23 | 0.37 |
+| simplex | 0.121 | 0.525 | 0.240 | 0.113 | 0.23 | 0.50 | 1.07 |
+| ack | 0.492 | 2.756 | 0.915 | 0.212 | 0.18 | 0.54 | 2.32 |
+| array1 | 0.353 | 0.851 | 0.994 | 0.272 | 0.41 | 0.35 | 1.30 |
+| string | 0.018 | 0.121 | 0.027 | 0.026 | 0.15 | 0.69 | 0.72 |
+| conform | 0.121 | 0.446 | 0.176 | 0.074 | 0.27 | 0.69 | 1.62 |
+| earley | 0.041 | 0.132 | 0.063 | 0.031 | 0.31 | 0.66 | 1.32 |
+| graphs | 0.146 | 0.577 | 0.203 | 0.069 | 0.25 | 0.72 | 2.10 |
+| lattice | 0.057 | 0.210 | 0.099 | 0.041 | 0.27 | 0.58 | 1.38 |
+| matrix | 0.075 | 0.269 | 0.115 | 0.051 | 0.28 | 0.65 | 1.46 |
+| maze | 0.039 | 0.192 | 0.073 | 0.038 | 0.20 | 0.53 | 1.02 |
+| mazefun | 0.147 | 0.449 | 0.289 | 0.093 | 0.33 | 0.51 | 1.59 |
+| nqueens | 0.344 | 0.722 | 0.493 | 0.172 | 0.48 | 0.70 | 2.00 |
+| paraffins | 0.047 | 0.148 | 0.053 | 0.032 | 0.32 | 0.89 | 1.48 |
+| peval | 0.106 | 0.410 | 0.203 | 0.077 | 0.26 | 0.52 | 1.37 |
+| primes | 0.165 | 0.611 | 0.318 | 0.211 | 0.27 | 0.52 | 0.78 |
+| quicksort | 0.115 | 0.296 | 0.196 | 0.077 | 0.39 | 0.59 | 1.50 |
+| nboyer | 0.729 | 1.235 | 0.885 | 0.318 | 0.59 | 0.82 | 2.30 |
+| sboyer | 0.717 | 1.220 | 0.944 | 0.299 | 0.59 | 0.76 | 2.40 |
+| gcbench | 0.022 | 0.134 | 0.027 | 0.017 | 0.16 | 0.79 | 1.28 |
+| mperm | 0.183 | 0.388 | 0.189 | 0.059 | 0.47 | 0.97 | 3.09 |
 
 ### Inner time (the benchmark's own "Elapsed time")
 
-| benchmark | ours | gauche | guile-nojit | guile | chibi | /gauche | /guile-nojit | /guile | /chibi |
-|---|---|---|---|---|---|---|---|---|---|
-| browse | 0.020 | 0.023 | 0.016 | 0.011 | 1.849 | 0.88 | 1.26 | 1.88 | 0.01 |
-| deriv | 0.371 | 0.662 | 0.369 | 0.179 | 1.702 | 0.56 | 1.01 | 2.08 | 0.22 |
-| destruc | 0.168 | 0.411 | 0.219 | 0.081 | 1.230 | 0.41 | 0.77 | 2.08 | 0.14 |
-| diviter | 0.187 | 0.429 | 0.339 | 0.155 | 1.179 | 0.44 | 0.55 | 1.21 | 0.16 |
-| divrec | 0.274 | 0.586 | 0.435 | 0.205 | 1.141 | 0.47 | 0.63 | 1.33 | 0.24 |
-| puzzle | 0.128 | 0.225 | 0.226 | 0.074 | 1.629 | 0.57 | 0.57 | 1.74 | 0.08 |
-| triangl | 0.192 | 0.355 | 0.413 | 0.122 | 1.179 | 0.54 | 0.46 | 1.58 | 0.16 |
-| tak | 0.602 | 1.281 | 0.963 | 0.228 | 2.377 | 0.47 | 0.62 | 2.64 | 0.25 |
-| takl | 0.133 | 0.250 | 0.154 | 0.033 | 1.369 | 0.53 | 0.87 | 3.99 | 0.10 |
-| ntakl | 0.269 | 0.465 | 0.308 | 0.067 | 0.663 | 0.58 | 0.87 | 4.03 | 0.41 |
-| cpstak | 0.260 | 1.138 | 0.414 | 0.189 | 1.716 | 0.23 | 0.63 | 1.38 | 0.15 |
-| ctak | 0.025 | 0.186 | 0.467 | 0.461 | 1.346 | 0.13 | 0.05 | 0.05 | 0.02 |
-| fib | 0.626 | 1.380 | 1.086 | 0.278 | 1.762 | 0.45 | 0.58 | 2.25 | 0.36 |
-| fibc | 0.060 | 0.338 | 0.642 | 0.572 | 1.490 | 0.18 | 0.09 | 0.11 | 0.04 |
-| fibfp | 0.211 | 0.492 | 0.846 | 0.680 | 1.409 | 0.43 | 0.25 | 0.31 | 0.15 |
-| sum | 0.364 | 0.791 | 0.665 | 0.162 | 1.512 | 0.46 | 0.55 | 2.25 | 0.24 |
-| sumfp | 0.108 | 0.223 | 0.552 | 0.547 | 1.169 | 0.49 | 0.20 | 0.20 | 0.09 |
-| fft | 0.077 | 0.248 | 0.170 | 0.145 | 1.339 | 0.31 | 0.45 | 0.53 | 0.06 |
-| mbrot | 0.061 | 0.143 | 0.285 | 0.246 | 1.476 | 0.43 | 0.21 | 0.25 | 0.04 |
-| nucleic | 0.125 | 0.328 | 0.197 | 0.141 | 1.171 | 0.38 | 0.64 | 0.89 | 0.11 |
-| pnpoly | 0.107 | 0.159 | 0.345 | 0.214 | 1.755 | 0.67 | 0.31 | 0.50 | 0.06 |
-| simplex | 0.218 | 0.476 | 0.236 | 0.103 | 2.030 | 0.46 | 0.92 | 2.12 | 0.11 |
-| ack | 0.672 | 2.804 | 0.920 | 0.204 | 1.701 | 0.24 | 0.73 | 3.29 | 0.39 |
-| array1 | 0.419 | 0.804 | 0.993 | 0.263 | 1.578 | 0.52 | 0.42 | 1.59 | 0.27 |
-| string | 0.040 | 0.061 | 0.016 | 0.015 | 1.143 | 0.66 | 2.56 | 2.61 | 0.03 |
-| conform | 0.201 | 0.381 | 0.167 | 0.064 | 1.053 | 0.53 | 1.20 | 3.17 | 0.19 |
-| earley | 0.097 | 0.082 | 0.055 | 0.022 | 1.111 | 1.18 | 1.76 | 4.39 | 0.09 |
-| graphs | 0.238 | 0.542 | 0.196 | 0.061 | 3.574 | 0.44 | 1.21 | 3.88 | 0.07 |
-| lattice | 0.085 | 0.209 | 0.142 | 0.055 | 1.229 | 0.40 | 0.60 | 1.55 | 0.07 |
-| matrix | 0.122 | 0.212 | 0.104 | 0.041 | 1.275 | 0.57 | 1.17 | 2.99 | 0.10 |
-| maze | 0.084 | 0.125 | 0.061 | 0.026 | 0.466 | 0.68 | 1.38 | 3.22 | 0.18 |
-| mazefun | 0.200 | 0.365 | 0.272 | 0.082 | 1.164 | 0.55 | 0.74 | 2.44 | 0.17 |
-| nqueens | 0.360 | 0.612 | 0.481 | 0.161 | 1.765 | 0.59 | 0.75 | 2.24 | 0.20 |
-| paraffins | 0.051 | 0.081 | 0.042 | 0.021 | 0.962 | 0.62 | 1.21 | 2.45 | 0.05 |
-| peval | 0.243 | 0.319 | 0.193 | 0.065 | 1.236 | 0.76 | 1.26 | 3.75 | 0.20 |
-| primes | 0.181 | 0.512 | 0.301 | 0.195 | 0.607 | 0.35 | 0.60 | 0.93 | 0.30 |
-| quicksort | 0.118 | 0.229 | 0.179 | 0.061 | 1.499 | 0.52 | 0.66 | 1.93 | 0.08 |
-| nboyer | 1.076 | 1.120 | 0.879 | 0.309 | 3.635 | 0.96 | 1.22 | 3.49 | 0.30 |
-| sboyer | 0.906 | 1.179 | 0.938 | 0.288 | 3.351 | 0.77 | 0.97 | 3.14 | 0.27 |
-| gcbench | 0.031 | 0.080 | 0.018 | 0.007 | 0.755 | 0.38 | 1.72 | 4.23 | 0.04 |
-| mperm | 0.157 | 0.199 | 0.120 | 0.033 | 1.030 | 0.79 | 1.31 | 4.75 | 0.15 |
+| benchmark | ours | gauche | guile-nojit | guile | /gauche | /guile-nojit | /guile |
+|---|---|---|---|---|---|---|---|
+| browse | 0.016 | 0.022 | 0.016 | 0.007 | 0.75 | 1.03 | 2.41 |
+| deriv | 0.258 | 0.632 | 0.370 | 0.177 | 0.41 | 0.70 | 1.46 |
+| destruc | 0.142 | 0.433 | 0.224 | 0.082 | 0.33 | 0.63 | 1.72 |
+| diviter | 0.193 | 0.465 | 0.342 | 0.160 | 0.41 | 0.56 | 1.20 |
+| divrec | 0.247 | 0.630 | 0.471 | 0.223 | 0.39 | 0.52 | 1.11 |
+| puzzle | 0.111 | 0.234 | 0.241 | 0.087 | 0.47 | 0.46 | 1.27 |
+| triangl | 0.173 | 0.385 | 0.425 | 0.123 | 0.45 | 0.41 | 1.41 |
+| tak | 0.529 | 1.337 | 1.019 | 0.249 | 0.40 | 0.52 | 2.12 |
+| takl | 0.085 | 0.256 | 0.155 | 0.034 | 0.33 | 0.55 | 2.54 |
+| ntakl | 0.197 | 0.472 | 0.311 | 0.068 | 0.42 | 0.63 | 2.91 |
+| cpstak | 0.273 | 1.533 | 0.428 | 0.202 | 0.18 | 0.64 | 1.35 |
+| ctak | 0.026 | 0.212 | 0.498 | 0.499 | 0.12 | 0.05 | 0.05 |
+| fib | 0.578 | 1.400 | 1.101 | 0.280 | 0.41 | 0.53 | 2.07 |
+| fibc | 0.036 | 0.316 | 0.596 | 0.549 | 0.12 | 0.06 | 0.07 |
+| fibfp | 0.213 | 0.464 | 0.831 | 0.663 | 0.46 | 0.26 | 0.32 |
+| sum | 0.355 | 0.757 | 0.628 | 0.159 | 0.47 | 0.57 | 2.23 |
+| sumfp | 0.107 | 0.217 | 0.543 | 0.516 | 0.49 | 0.20 | 0.21 |
+| fft | 0.054 | 0.243 | 0.165 | 0.136 | 0.22 | 0.33 | 0.40 |
+| mbrot | 0.052 | 0.143 | 0.285 | 0.246 | 0.37 | 0.18 | 0.21 |
+| nucleic | 0.065 | 0.333 | 0.183 | 0.133 | 0.19 | 0.35 | 0.49 |
+| pnpoly | 0.083 | 0.163 | 0.352 | 0.215 | 0.51 | 0.23 | 0.38 |
+| simplex | 0.121 | 0.481 | 0.234 | 0.104 | 0.25 | 0.52 | 1.16 |
+| ack | 0.504 | 3.117 | 0.934 | 0.207 | 0.16 | 0.54 | 2.44 |
+| array1 | 0.354 | 0.798 | 1.009 | 0.266 | 0.44 | 0.35 | 1.33 |
+| string | 0.018 | 0.062 | 0.016 | 0.016 | 0.29 | 1.13 | 1.10 |
+| conform | 0.121 | 0.383 | 0.169 | 0.064 | 0.32 | 0.72 | 1.89 |
+| earley | 0.039 | 0.070 | 0.053 | 0.021 | 0.56 | 0.74 | 1.82 |
+| graphs | 0.146 | 0.542 | 0.195 | 0.060 | 0.27 | 0.75 | 2.44 |
+| lattice | 0.057 | 0.154 | 0.087 | 0.032 | 0.37 | 0.65 | 1.76 |
+| matrix | 0.074 | 0.208 | 0.105 | 0.040 | 0.35 | 0.70 | 1.82 |
+| maze | 0.036 | 0.125 | 0.062 | 0.026 | 0.29 | 0.58 | 1.36 |
+| mazefun | 0.148 | 0.368 | 0.275 | 0.082 | 0.40 | 0.54 | 1.80 |
+| nqueens | 0.338 | 0.615 | 0.482 | 0.162 | 0.55 | 0.70 | 2.08 |
+| paraffins | 0.044 | 0.089 | 0.042 | 0.021 | 0.50 | 1.04 | 2.12 |
+| peval | 0.101 | 0.320 | 0.195 | 0.065 | 0.32 | 0.52 | 1.55 |
+| primes | 0.162 | 0.537 | 0.305 | 0.197 | 0.30 | 0.53 | 0.82 |
+| quicksort | 0.112 | 0.232 | 0.180 | 0.062 | 0.48 | 0.62 | 1.81 |
+| nboyer | 0.731 | 1.141 | 0.860 | 0.308 | 0.64 | 0.85 | 2.37 |
+| sboyer | 0.710 | 1.158 | 0.948 | 0.288 | 0.61 | 0.75 | 2.46 |
+| gcbench | 0.020 | 0.075 | 0.017 | 0.007 | 0.26 | 1.12 | 2.65 |
+| mperm | 0.115 | 0.196 | 0.118 | 0.032 | 0.59 | 0.98 | 3.58 |
 
 ### Reading the results
 
 The explanations of the other implementations' behaviour are educated
-guesses backed by the experiments noted, not profiles (there is no
-`perf` in this container).
+guesses backed by the experiments noted, not profiles of them.
 
-**Gauche.** Ours is faster on every program in wall time and on all but
-earley in inner time (1.18). The widest gaps are ack (0.24 inner; Gauche
-takes 2.8 s, probably spilling its VM stack to the heap on the deep,
-non-tail recursion of `(ack 3 9)`), cpstak, ctak and fibc (closures and
-continuations; ours are escape-only, see below), and flonum code. The
-narrowest are the allocation- and list-heavy programs: earley 1.18,
-nboyer 0.96, browse 0.88, mperm 0.79, sboyer 0.77, peval 0.76, where
-Gauche's compiler (which inlines and closes over locals) and its Boehm GC
-hold up best.
+**Gauche.** Ours is faster on every program, in wall time (0.09-0.59)
+and in inner time (0.12-0.75). The closest are nboyer and sboyer (0.6:
+list traversal limited by memory latency, where Gauche's 16-byte pairs
+help it) and browse and earley in inner time.
 
 **Guile without the JIT** is the closest like-for-like reference: a
-register-style bytecode VM in C, like ours. Ours is faster on 32 of 41
-programs in wall time (28 inner), and on all the call- and arithmetic-bound ones (tak,
-fib, ack, sum, diviter, divrec, triangl: 0.46–0.73). Ours is slower on
-string (2.56 inner), earley (1.76), gcbench (1.72), maze (1.38), mperm
-(1.31), peval, browse (1.26), nboyer, graphs, paraffins (1.21), conform
-(1.20), matrix (1.17) and, barely, deriv (1.01). Guile's advantage there is mostly its
-**compiler**, not its VM: recompiling the programs for Guile at lower
-optimization levels (`guild compile -O1`, which keeps only basic
-optimizations, versus the suite's `-O3`), still without the JIT, gives
-these inner times:
+bytecode VM in C, like ours, but behind an optimizing compiler
+(`guild compile -O3`). Before this phase ours was slower on 13 programs;
+the compiler passes now in `examples/scheme/compile.lm` (see the
+changelog) closed most of that, and ours is faster on all 41 in wall time
+and on 37 in inner time. The four left are within 16 ms of Guile and all
+allocation-bound: string (1.13 inner), gcbench (1.12), paraffins (1.04)
+and browse (1.03); mperm is 0.98. There Guile runs with the suite's
+100 MB initial heap (`GC_INITIAL_HEAP_SIZE`) and barely collects, and
+its substrings share storage (string). Ours collects every 4× the live
+data, starting from 2 MiB.
 
-| benchmark | ours | guile-nojit -O0 | -O1 | -O2 | -O3 |
-|---|---|---|---|---|---|
-| earley | 0.097 | 0.251 | 0.092 | 0.053 | 0.052 |
-| peval | 0.243 | 0.719 | 0.270 | 0.193 | 0.189 |
-| mperm | 0.157 | 0.735 | 0.216 | 0.116 | 0.119 |
-| nboyer | 1.076 | 4.822 | 1.093 | 0.882 | 0.865 |
-| conform | 0.201 | 0.688 | 0.442 | 0.216 | 0.167 |
-| graphs | 0.238 | 0.829 | 0.309 | 0.246 | 0.194 |
-| maze | 0.084 | 0.306 | 0.157 | 0.064 | 0.062 |
-| gcbench | 0.031 | 0.088 | 0.025 | 0.018 | 0.018 |
-| string | 0.040 | 0.016 | 0.015 | 0.015 | 0.015 |
-| tak | 0.602 | 4.464 | 1.257 | 0.949 | 0.943 |
-| fib | 0.626 | 4.864 | 1.588 | 1.094 | 1.091 |
+For reference, the inner times before this phase, and Guile's at each
+optimization level (still without the JIT):
 
-At `-O1` ours is within 5% of Guile's VM or faster on all of these except gcbench
-and string; Guile's `-O2` passes (inlining of small procedures,
-contification of loops and local functions into jumps, type inference
-that removes checks, CSE, unboxing, closure conversion that avoids
-allocating closures) are what put it ahead, by 1.2–2× on the list- and
-closure-heavy programs. Our compiler does none of these. The other two
-losses are runtime and memory costs rather than code quality:
+| benchmark | ours before | ours now | guile-nojit -O0 | -O1 | -O2 | -O3 |
+|---|---|---|---|---|---|---|
+| earley | 0.097 | 0.039 | 0.251 | 0.092 | 0.053 | 0.052 |
+| peval | 0.243 | 0.101 | 0.719 | 0.270 | 0.193 | 0.189 |
+| mperm | 0.157 | 0.115 | 0.735 | 0.216 | 0.116 | 0.119 |
+| nboyer | 1.076 | 0.731 | 4.822 | 1.093 | 0.882 | 0.865 |
+| conform | 0.201 | 0.121 | 0.688 | 0.442 | 0.216 | 0.167 |
+| graphs | 0.238 | 0.146 | 0.829 | 0.309 | 0.246 | 0.194 |
+| maze | 0.084 | 0.036 | 0.306 | 0.157 | 0.064 | 0.062 |
+| gcbench | 0.031 | 0.020 | 0.088 | 0.025 | 0.018 | 0.018 |
+| string | 0.040 | 0.018 | 0.016 | 0.015 | 0.015 | 0.015 |
+| tak | 0.602 | 0.529 | 4.464 | 1.257 | 0.949 | 0.943 |
+| fib | 0.626 | 0.578 | 4.864 | 1.588 | 1.094 | 1.091 |
 
-- **string** (2.56) is `string-append` and `substring` on strings of up
-  to 0.5 MB. Ours builds a `string-append` result in a scratch buffer and
-  then copies it into a new heap string (two copies), and every grown
-  string is a fresh large allocation for our collector; Guile does one
-  copy and runs with the 100 MB initial heap the suite gives it
-  (`GC_INITIAL_HEAP_SIZE`), so it barely collects.
-- **gcbench** (1.72) and the allocation in mperm, earley and nboyer point
-  at allocation and collection cost. The same 100 MB initial heap
-  favours Guile here. mperm also spends 0.13 s of its 0.29 s wall time
-  outside the timed loop under ours (Guile: 0.03 s), which is worth a
-  look.
+**Guile with the JIT.** Even in wall time (1.02 overall) ours is faster
+on 10 programs and within 10% on 5 more. Ours wins where Guile's value
+representation or continuations cost more than its JIT saves: flonums
+(fibfp 0.32, sumfp 0.21, mbrot 0.21, fft 0.38, pnpoly 0.37, nucleic 0.50:
+Guile heap-allocates flonums it cannot unbox; ours are NaN-boxed),
+continuations (ctak 0.05, fibc 0.07: Guile copies the stack for `call/cc`;
+ours are escape-only, not a like-for-like comparison), primes and string.
+Guile's JIT is 2-3.6× faster on the call-bound programs (tak, fib, ack,
+takl, ntakl, sum) and on the list-heavy nboyer, sboyer, graphs, nqueens
+and mperm: its template JIT removes dispatch and operand decoding, which
+a bytecode interpreter cannot. Ours is at about 30-40 x86 instructions
+per call plus a few per op (see `examples/scheme/README.md`).
 
-**Guile with the JIT** is faster than ours on 32 of 41 programs, by 2–4×
-on the call-bound and list-heavy ones (takl/ntakl 4.0, mperm 4.75,
-earley 4.39, gcbench 4.23, graphs 3.88, peval 3.75): template JIT code
-removes dispatch and operand decoding, on top of the compiler above.
-Ours still wins where Guile's value representation or continuations
-cost it more than its JIT saves:
+**Remaining losses and why** (vs Guile without the JIT, inner time):
 
-- **flonums** (fibfp 0.31, sumfp 0.20, mbrot 0.25, fft 0.53, pnpoly 0.50,
-  nucleic 0.89): Guile heap-allocates every flonum that its unboxing pass
-  cannot keep in a register across calls and loops; ours are NaN-boxed
-  immediates.
-- **continuations** (ctak 0.05, fibc 0.11): Guile captures the whole
-  stack for `call/cc`; ours are escape-only, so this is not a
-  like-for-like comparison (see `examples/scheme/README.md`).
-- primes (0.85 wall, 0.93 inner).
+- string (1.13): `string-append`/`substring` of strings of up to 0.5 MB,
+  where 80% of our time is in libc copying and zeroing new strings;
+  Guile's substrings share the buffer (copy on write).
+- gcbench (1.12), paraffins (1.04), browse (1.03): 16-20 ms programs
+  dominated by allocation and collection, where Guile's 100 MB initial
+  heap means it hardly collects at all.
+- nboyer, sboyer, mperm (0.75-0.98, the narrowest wins): memory-bound
+  list walking (`CAR` alone is 12-15% of nboyer's time) and collection of
+  a growing heap (mperm keeps 65 MB live). Our pairs are 32 bytes
+  (16-byte header), Guile's 16.
 
 **Caveats** that favour ours: 32-bit fixnums that overflow to flonums
 instead of bignums (none of these programs overflows, but the fast paths
@@ -314,6 +316,114 @@ that struggles with large live heaps: gcbench at depth 12 takes 0.1 s,
 at 14 4.9 s, at 15 8.5 s, at 16 over 120 s; ours: 0.18 s at 15, 2.3 s at
 18), which makes it a weak reference; it is kept because it is the first
 reference compare.py checks outputs against.
+
+**Full-size inputs.** earley at the suite's own size (15, 2674440 parses)
+runs in 10.6 s and 1.7 GB under `ulimit -v 2500000` since the 16-byte
+headers (it ran out of memory before: 1.9 GB of live data with 48-byte
+pairs).
+
+## Changelog
+
+Second phase (compiler passes and runtime). Each step was measured with
+interleaved A/B runs of aligned builds (`--exe old new -n 5`, wall time,
+seconds); changes under about 5% are not claimed. The first steps were
+measured while Guile was being built on the same machine, so their
+absolute times are higher than in the tables above.
+
+1. **Contification** (5c3e30e). A `letrec` lambda whose every use is a
+   tail call from the letrec body or from another contified lambda of the
+   same letrec (every named-let and `do` loop, mutually tail-recursive
+   local procedures) is compiled inline in the enclosing procedure:
+   parameters become registers, calls become moves and jumps, and its
+   returns go to the letrec's continuation (return, a register and a join
+   jump, or nothing). No closure is allocated per loop entry, and the
+   loop's free variables are the procedure's registers instead of
+   `GETFREE`s; an assigned variable used only by contified code is no
+   longer boxed. earley 0.191 → 0.099, matrix 0.159 → 0.120,
+   graphs 0.320 → 0.234, mperm 0.345 → 0.262, conform 0.316 → 0.247,
+   array1 0.569 → 0.463, deriv 0.536 → 0.438.
+2. **Direct builtin calls and type-predicate ops** (f141bd8). A call of a
+   builtin the program never redefines is `PRIMCALL` (straight to the
+   native) instead of `GETGLOBAL; CALL` → cold path → `call_slow`;
+   `symbol? number? exact-integer? string? vector?` are ops (peval calls
+   `symbol?` 3 million times). maze 0.102 → 0.062, peval 0.299 → 0.184,
+   deriv 0.438 → 0.354, matrix 0.124 → 0.106, conform 0.283 → 0.244.
+3. **Inlining** (f1c9031). Calls of small (≤ 12 AST nodes),
+   non-recursive known procedures are replaced by their bodies:
+   top-level procedures defined once and never `set!`, and unassigned
+   `letrec` lambdas. Parameters are bound by a `let`, or replaced by a
+   constant or unassigned-local argument. nucleic 0.187 → 0.092,
+   simplex 0.209 → 0.153, conform 0.224 → 0.164, maze 0.055 → 0.045,
+   sboyer 1.137 → 1.006, peval 0.202 → 0.176. To keep "unbound variable"
+   errors for calls that run before the definition, an inlined top-level
+   call is guarded by `CHKGLOBAL` (quickened to a no-op once bound);
+   b685486 drops the guard where the definition must already have run
+   (an earlier top-level form, or before the first form that can run
+   program code): it was 20% of the executed ops in nucleic and fibc.
+4. **`string-append` copies once** (ca7cf6c): sized first, then each part
+   copied into the result, instead of building it in a scratch buffer and
+   copying that. string 0.045 → 0.040.
+5. **GC growth policy** (a6213d8). `set_growth(400, 2 MiB)` and a new
+   `std.gc` `Heap.set_max_budget(256 MiB)`: collect after allocating 4×
+   the live data, capped so that big heaps grow by at most 256 MiB.
+   string 0.037 → 0.020, earley 0.054 → 0.043, nboyer 0.980 → 0.823,
+   paraffins 0.065 → 0.055, graphs 0.159 → 0.143, mperm 0.210 → 0.193;
+   nothing slower. (Sweep, best of 5: 200%/1 MiB, 300%/1-4 MiB and
+   400%/4 MiB were each worse on one of these.)
+6. **16-byte object headers in `std.gc`** (dc435d4). The header lost its
+   `next` link (free slots link through the length word, large objects
+   are kept in a vector), so a pair takes 32 bytes instead of 48.
+   nboyer 0.818 → 0.724, sboyer 0.808 → 0.737, primes 0.191 → 0.174,
+   mperm 0.193 → 0.179. earley at the suite's full size (live data about
+   1.3 GB) now runs under the 2.5 GB `ulimit -v` (1.7 GB RSS, 10.6 s);
+   before, its 1.9 GB of live data could not fit.
+7. **Branches for `and`/`or`/`not`** (3471623). Conditions branch through
+   `not`, `and` and `or` in either sense; in tail position, `and`
+   operands and boolean-valued `or` operands jump to a `#f`/`#t` exit
+   instead of materializing booleans. takl 0.135 → 0.126,
+   puzzle 0.108 → 0.100, nqueens 0.351 → 0.334, peval 0.126 → 0.120.
+8. **Tail self-calls of top-level procedures are loops** (fa31ba0), as
+   letrec self-calls already were: a known top-level procedure's closure
+   is the one running. takl 0.126 → 0.091, ntakl 0.273 → 0.200,
+   mazefun 0.192 → 0.154, ack 0.700 → 0.575, diviter 0.202 → 0.183,
+   tak 0.605 → 0.556.
+9. **`CALLSELF`** (ff5969c): a non-tail recursive call with the right
+   arity calls the running closure, with no global load, closure-type or
+   arity check. fib 0.626 → 0.526, tak 0.542 → 0.473, ack 0.565 → 0.490,
+   triangl 0.186 → 0.168, divrec 0.242 → 0.222, paraffins 0.052 → 0.048,
+   fibfp 0.209 → 0.194.
+10. **Higher-order inlining** (84da73f). The inliner copies lambdas and
+    letrecs; a call with a lambda (or a known, certainly bound top-level
+    procedure) as an argument may inline a body of up to 40 nodes, so the
+    argument's calls in the body become known and are inlined in turn,
+    and the body's loops are contified. `(map f l)` and `(for-each f l)`
+    with one list go through inlinable one-list prelude versions;
+    `let`-bound lambdas are known procedures, and a lambda binding left
+    unreferenced makes no closure. lattice 0.071 → 0.058,
+    deriv 0.315 → 0.264, peval 0.127 → 0.107, conform 0.134 → 0.125.
+
+Tried and dropped (within noise):
+
+- `CALLG`/`TAILCALLG` and `CALLF`/`TAILCALLF`: calls of known top-level
+  procedures and of known letrec procedures in free slots that fetch the
+  closure themselves and skip the arity check (one dispatch fewer per
+  call): 2% on nboyer/sboyer, 1% overall.
+- `let`-bound lambdas as known procedures on their own (gcbench is
+  dominated by allocation); kept as part of step 10, where it matters.
+- Inlining limits of 8 and 20 nodes instead of 12.
+
+Not done, with reasons:
+
+- **Constant folding and propagation**: these programs have almost no
+  constant subexpressions in hot code (inlining substitutes constant
+  arguments already).
+- **Type-check elimination** (an unchecked `car` after `(pair? x)`): the
+  tag check is one well-predicted compare and branch inside a handler
+  that also decodes operands and dispatches; the estimated gain is a few
+  percent at best on the list programs.
+- **Lambda lifting**: after contification and inlining, `CLOSURE` is
+  under 2% of the executed ops except in cpstak and ctak, where the
+  closures are continuations that escape.
 
 ## Skipped benchmarks
 

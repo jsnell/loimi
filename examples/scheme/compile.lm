@@ -34,10 +34,11 @@ import vm.{Scheme};
 
 // ── AST ─────────────────────────────────────────────────────────────
 
-enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or }
+enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or, GChk }
 
 /// Ops for builtins compiled inline.
-enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset }
+enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
+    SymP, NumP, FixP, StrP, VecP }
 
 struct Var {
     name: Gc<Sym>,
@@ -52,8 +53,10 @@ struct Var {
     force_box: bool,
     /// Number of lambdas that capture it (to detect captures during an init).
     caps: u32,
-    /// The lambda this (letrec) variable is bound to, or null.
+    /// The lambda this (let or letrec) variable is bound to, or null.
     lam: *Lam,
+    /// References (counted after the AST passes, by `reown`).
+    refs: u32,
 }
 
 struct Lam {
@@ -64,12 +67,19 @@ struct Lam {
     rest: bool,
     free: mem.Vec<*Var>,
     body: *Node,
+    /// Contified: every reference is a tail call from the same frame, so the
+    /// body is compiled inline in the enclosing procedure (see `contify`).
+    cont: bool,
+    /// The start of a contified body.
+    label: bc.Label,
 }
 
 /// One AST node; which fields matter depends on `kind`:
 ///   Const v | Ref var | GRef g | Set var a | GSet g a | GDef g a
 ///   If a b c | Lambda lam | Seq list | Call a list | Prim po list
 ///   Let vars list(inits) a(body) | Letrec vars list a | And list | Or list
+///   GChk g (fails if global g is unbound; effect only)
+/// A Call's `lam` is its callee when that is a known top-level procedure.
 struct Node {
     kind: K,
     line: u32,
@@ -104,6 +114,16 @@ struct Comp {
     redefined: map.HashMap<u64, bool>,
     line: u32,
     gensyms: u32,
+    /// Top-level definitions per global slot: how many, and the lambda of
+    /// a procedure definition; and the globals that are set!.
+    gdefs: map.HashMap<u64, u32>,
+    glams: map.HashMap<u64, *Lam>,
+    gsets: map.HashMap<u64, bool>,
+    /// The top-level form that defines each global, the form being
+    /// inlined into, and the first form that may run program code.
+    gform: map.HashMap<u64, u64>,
+    cur_form: u64,
+    first_impure: u64,
 }
 
 fn Comp.node(c: *Comp, kind: K) -> *Node {
@@ -241,6 +261,11 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("set-car!") { return Some((PO.SetCar, 2)); }
     if name.eq("set-cdr!") { return Some((PO.SetCdr, 2)); }
     if name.eq("vector-set!") { return Some((PO.Vset, 3)); }
+    if name.eq("symbol?") { return Some((PO.SymP, 1)); }
+    if name.eq("number?") { return Some((PO.NumP, 1)); }
+    if name.eq("exact-integer?") { return Some((PO.FixP, 1)); }
+    if name.eq("string?") { return Some((PO.StrP, 1)); }
+    if name.eq("vector?") { return Some((PO.VecP, 1)); }
     None
 }
 
@@ -299,6 +324,19 @@ fn Comp.build_inner(c: *Comp, x: V) -> *Node {
             }
             let n = c.node(K.Call);
             n.a = c.build(p.car);
+            // (map f l) and (for-each f l) with one list use the prelude's
+            // one-list versions, which can be inlined.
+            if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
+                and list_len(p.cdr) == 2 and (s.name.eq("map") or s.name.eq("for-each")) {
+                let one = c.ctx.syms.intern(c.heap, if s.name.eq("map") { "%map1" } else { "%for-each1" });
+                n.a.g = c.ctx.global(one);
+            }
+            // A builtin that the program never redefines is called directly.
+            if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
+                and let Some(id) = value.prim_of(c.ctx.gvals.at(n.a.g as u64))
+                and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+                n.a = c.konst(value.prim(id));
+            }
             var cur = p.cdr;
             while let P(q) = cur {
                 n.list.push(c.build(q.car));
@@ -389,6 +427,7 @@ fn Comp.special(c: *Comp, name: str, x: V) -> ?*Node {
         let n = c.node(K.GSet);
         n.g = c.ctx.global(s);
         n.a = val;
+        c.gsets.insert(n.g as u64, true);
         return Some(n);
     }
     if name.eq("if") {
@@ -782,6 +821,8 @@ fn Comp.let_form(c: *Comp, bindings: V, body: V) -> *Node {
     let mark = c.env.len;
     for i in 0..names.len {
         let v = c.new_var(names.at(i));
+        let init = n.list.at(i);
+        if init.kind == K.Lambda { v.lam = init.lam; }
         n.vars.push(v);
         c.env.push(v);
     }
@@ -1047,6 +1088,9 @@ fn Comp.top(c: *Comp, x: V, out: *mem.Vec<*Node>) {
         let n = c.node(K.GDef);
         n.g = c.ctx.global(s);
         n.a = c.def_value(s, x, val, is_proc);
+        let k = n.g as u64;
+        c.gdefs.insert(k, (c.gdefs.get(k) ?? 0) + 1);
+        if n.a.kind == K.Lambda { c.glams.insert(k, n.a.lam); }
         out.push(n);
     } else {
         out.push(c.build(x));
@@ -1070,6 +1114,449 @@ fn Comp.scan_defs(c: *Comp, x: V) {
     }
 }
 
+
+// ── inlining ────────────────────────────────────────────────────────
+//
+// A call of a small known procedure is replaced by its body, with the
+// parameters bound by a `let` (or replaced by the argument, when that is a
+// constant or an unassigned local). Known procedures are top-level
+// `(define (f ...) ...)`s that are the only definition of `f` and are
+// never set!, and unassigned letrec-bound lambdas. Bodies with lambdas
+// (or letrecs) in them and recursive bodies are not inlined. A call that
+// runs before the top-level definition would have failed with "unbound
+// variable" (or would have called a builtin of the same name) runs the
+// procedure instead; R7RS makes both an error.
+
+const INLINE_SIZE: u32 = 12;
+/// The limit when an argument is a lambda: the body is copied with the
+/// lambda in place, so calls of it become known (and are inlined in turn).
+const INLINE_SIZE_HO: u32 = 40;
+const INLINE_DEPTH: u32 = 3;
+const TOO_BIG: u32 = 1000000;
+
+/// The size of `n` in nodes, or TOO_BIG if it cannot be inlined (it has
+/// lambdas or refers to `self_g` / `self_v`).
+fn inline_size(n: *Node, self_g: u64, self_v: *Var) -> u32 {
+    if is_null(n) { return 0; }
+    match n.kind {
+        Lambda => {
+            let b = inline_size(n.lam.body, self_g, self_v);
+            return if b >= TOO_BIG { TOO_BIG } else { b + 1 };
+        }
+        GRef => { if n.g as u64 == self_g { return TOO_BIG; } }
+        Ref | Set => { if (n.vr as u64) == (self_v as u64) { return TOO_BIG; } }
+        _ => {}
+    }
+    var size: u32 = 1;
+    size += inline_size(n.a, self_g, self_v);
+    size += inline_size(n.b, self_g, self_v);
+    size += inline_size(n.c, self_g, self_v);
+    for i in 0..n.list.len {
+        size += inline_size(n.list.at(i), self_g, self_v);
+        if size >= TOO_BIG { return TOO_BIG; }
+    }
+    if size >= TOO_BIG { TOO_BIG } else { size }
+}
+
+/// Variable substitution while copying: `from` → a node to clone.
+struct Subst { from: mem.Vec<*Var>, to: mem.Vec<*Node> }
+
+fn Subst.find(s: *Subst, v: *Var) -> ?*Node {
+    for i in 0..s.from.len {
+        if (s.from.at(i) as u64) == (v as u64) { return Some(s.to.at(i)); }
+    }
+    None
+}
+
+fn clone_node(n: *Node) -> *Node {
+    let m: *Node = mem.alloc(1);
+    *m = *n;
+    m.list = mem.Vec.new();
+    m.vars = mem.Vec.new();
+    m
+}
+
+fn Comp.fresh_var(c: *Comp, v: *Var) -> *Var {
+    let w = c.new_var(v.name);
+    w.assigned = v.assigned;
+    w
+}
+
+/// A copy of `n` with fresh variables for its binders.
+fn Comp.copy(c: *Comp, n: *Node, s: *Subst) -> *Node {
+    if is_null(n) { return n; }
+    if n.kind == K.Ref {
+        if let Some(t) = s.find(n.vr) {
+            let m = clone_node(t);
+            m.line = n.line;
+            return m;
+        }
+        return clone_node(n);
+    }
+    let m = clone_node(n);
+    if n.kind == K.Set and let Some(t) = s.find(n.vr) { m.vr = t.vr; }
+    if n.kind == K.Lambda {
+        m.lam = c.copy_lam(n.lam, s);
+        return m;
+    }
+    if n.kind == K.Letrec {
+        for i in 0..n.vars.len {
+            let v = n.vars.at(i);
+            let w = c.fresh_var(v);
+            w.force_box = v.force_box;
+            let r = c.node(K.Ref);
+            r.vr = w;
+            s.from.push(v);
+            s.to.push(r);
+            m.vars.push(w);
+        }
+        for i in 0..n.list.len {
+            let init = c.copy(n.list.at(i), s);
+            if init.kind == K.Lambda and !is_null_lam(n.vars.at(i).lam) { m.vars.at(i).lam = init.lam; }
+            m.list.push(init);
+        }
+        m.a = c.copy(n.a, s);
+        return m;
+    }
+    if n.kind == K.Let {
+        for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
+        for i in 0..n.vars.len {
+            let w = c.fresh_var(n.vars.at(i));
+            if m.list.at(i).kind == K.Lambda { w.lam = m.list.at(i).lam; }
+            let r = c.node(K.Ref);
+            r.vr = w;
+            s.from.push(n.vars.at(i));
+            s.to.push(r);
+            m.vars.push(w);
+        }
+        m.a = c.copy(n.a, s);
+        return m;
+    }
+    m.a = c.copy(n.a, s);
+    m.b = c.copy(n.b, s);
+    m.c = c.copy(n.c, s);
+    for i in 0..n.list.len { m.list.push(c.copy(n.list.at(i), s)); }
+    m
+}
+
+fn Comp.copy_lam(c: *Comp, l: *Lam, s: *Subst) -> *Lam {
+    let m: *Lam = mem.alloc(1);
+    m.parent = l.parent;
+    m.name = l.name;
+    m.params = mem.Vec.new();
+    m.nparams = l.nparams;
+    m.rest = l.rest;
+    m.free = mem.Vec.new();
+    for i in 0..l.params.len {
+        let p = l.params.at(i);
+        let w = c.fresh_var(p);
+        let r = c.node(K.Ref);
+        r.vr = w;
+        s.from.push(p);
+        s.to.push(r);
+        m.params.push(w);
+    }
+    m.body = c.copy(l.body, s);
+    m
+}
+
+/// The known procedure called by `f`, if any, with what it may not refer
+/// to (itself).
+fn Comp.known(c: *Comp, f: *Node) -> ?(*Lam, u64, *Var) {
+    if f.kind == K.GRef {
+        let g = f.g as u64;
+        if (c.gdefs.get(g) ?? 0) != 1 or c.gsets.contains(g) { return None; }
+        // Before its definition runs, a global named like a builtin is the builtin.
+        if value.prim_of(c.ctx.gvals.at(g)).is_some() { return None; }
+        let Some(l) = c.glams.get(g) else { return None; };
+        return Some((l, g, 0 as *Var));
+    }
+    if f.kind == K.Ref {
+        let v = f.vr;
+        if is_null_lam(v.lam) or v.assigned or v.force_box { return None; }
+        return Some((v.lam, 0xFFFFFFFFFFFFFFFF, v));
+    }
+    None
+}
+
+/// Can an inlined call of global `g` in the current top-level form run
+/// before g's definition? Not if the definition is in an earlier form, or
+/// if no form before it runs program code (they only define procedures
+/// and constants, so nothing can call anything until g is bound).
+fn Comp.needs_guard(c: *Comp, g: u64) -> bool {
+    let Some(f) = c.gform.get(g) else { return true; };
+    !(f < c.cur_form or f < c.first_impure)
+}
+
+/// Is `n` a reference to a known top-level procedure that is certainly
+/// bound here (so it can be substituted for a parameter)?
+fn Comp.bound_known(c: *Comp, n: *Node) -> bool {
+    n.kind == K.GRef and c.known(n).is_some() and !c.needs_guard(n.g as u64)
+}
+
+/// May evaluating `n` run program code (call anything but a builtin)?
+/// Lambda bodies do not run when the closure is made.
+fn may_call(n: *Node) -> bool {
+    if is_null(n) { return false; }
+    if n.kind == K.Lambda { return false; }
+    if n.kind == K.Call {
+        let f = n.a;
+        if f.kind != K.Const { return true; }
+        let Some(id) = value.prim_of(f.v) else { return true; };
+        if id == builtins.P_APPLY or id == builtins.P_CALLCC { return true; }
+    }
+    if may_call(n.a) or may_call(n.b) or may_call(n.c) { return true; }
+    for i in 0..n.list.len {
+        if may_call(n.list.at(i)) { return true; }
+    }
+    false
+}
+
+/// Inline the small known procedures called in `n`; returns the new node.
+fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
+    if is_null(n) { return n; }
+    if n.kind == K.Lambda {
+        n.lam.body = c.inl(n.lam.body, depth);
+        return n;
+    }
+    n.a = c.inl(n.a, depth);
+    n.b = c.inl(n.b, depth);
+    n.c = c.inl(n.c, depth);
+    for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
+    if n.kind != K.Call { return n; }
+    let Some((l, g, self_v)) = c.known(n.a) else { return n; };
+    if n.a.kind == K.GRef { n.lam = l; }
+    if depth >= INLINE_DEPTH { return n; }
+    if l.rest or l.nparams as u64 != n.list.len { return n; }
+    var limit = INLINE_SIZE;
+    for i in 0..n.list.len {
+        if n.list.at(i).kind == K.Lambda or c.bound_known(n.list.at(i)) { limit = INLINE_SIZE_HO; }
+    }
+    if inline_size(l.body, g, self_v) > limit { return n; }
+    // (let ((p arg) ...) body), substituting constants and unassigned
+    // locals for unassigned parameters.
+    var s = Subst { from: mem.Vec.new(), to: mem.Vec.new() };
+    let lt = c.node(K.Let);
+    lt.line = n.line;
+    for i in 0..n.list.len {
+        let p = l.params.at(i);
+        let a = n.list.at(i);
+        if !p.assigned and (a.kind == K.Const or (a.kind == K.Ref and !a.vr.assigned) or c.bound_known(a)) {
+            s.from.push(p);
+            s.to.push(a);
+            continue;
+        }
+        let w = c.fresh_var(p);
+        if a.kind == K.Lambda { w.lam = a.lam; }
+        let r = c.node(K.Ref);
+        r.vr = w;
+        s.from.push(p);
+        s.to.push(r);
+        lt.vars.push(w);
+        lt.list.push(a);
+    }
+    let body = c.copy(l.body, &s);
+    s.from.free();
+    s.to.free();
+    var out = body;
+    if lt.vars.len > 0 {
+        lt.a = body;
+        out = lt;
+    }
+    if n.a.kind == K.GRef and c.needs_guard(n.a.g as u64) {
+        // (begin <check that f is bound> body)
+        let chk = c.node(K.GChk);
+        chk.line = n.line;
+        chk.g = n.a.g;
+        let sq = c.node(K.Seq);
+        sq.line = n.line;
+        sq.list.push(chk);
+        sq.list.push(out);
+        out = sq;
+    }
+    c.inl(out, depth + 1)
+}
+
+// ── contification ───────────────────────────────────────────────────
+//
+// A letrec-bound lambda whose every reference is a call in tail position
+// of the letrec body or of another contified lambda of the same letrec
+// (a named-let loop, mutually tail-recursive local procedures) never
+// needs a closure: its body is compiled inline in the enclosing
+// procedure, its parameters become registers there, and the calls become
+// moves and jumps. Its "return" is the continuation of the letrec. Inner
+// letrecs are decided first, so a contified inner body counts as part of
+// the frame (and of the tail positions) of the procedure around it.
+
+fn in_free(l: *Lam, v: *Var) -> bool {
+    for i in 0..l.free.len {
+        if (l.free.at(i) as u64) == (v as u64) { return true; }
+    }
+    false
+}
+
+/// Is every reference to `v` in `n` a call with `nargs` arguments in tail
+/// position (when `tail`) and in the same frame?
+fn tail_refs_only(n: *Node, v: *Var, tail: bool, nargs: u64) -> bool {
+    if is_null(n) { return true; }
+    match n.kind {
+        Const | GRef | GChk => true,
+        Ref => (n.vr as u64) != (v as u64),
+        Set => (n.vr as u64) != (v as u64) and tail_refs_only(n.a, v, false, nargs),
+        GSet | GDef => tail_refs_only(n.a, v, false, nargs),
+        If => tail_refs_only(n.a, v, false, nargs) and tail_refs_only(n.b, v, tail, nargs)
+            and tail_refs_only(n.c, v, tail, nargs),
+        Lambda => !in_free(n.lam, v),
+        Seq | And | Or => {
+            for i in 0..n.list.len {
+                if !tail_refs_only(n.list.at(i), v, tail and i + 1 == n.list.len, nargs) { return false; }
+            }
+            true
+        }
+        Prim => {
+            for i in 0..n.list.len {
+                if !tail_refs_only(n.list.at(i), v, false, nargs) { return false; }
+            }
+            true
+        }
+        Call => {
+            let f = n.a;
+            if f.kind == K.Ref and (f.vr as u64) == (v as u64) {
+                if !tail or n.list.len != nargs { return false; }
+            } else if !tail_refs_only(f, v, false, nargs) {
+                return false;
+            }
+            for i in 0..n.list.len {
+                if !tail_refs_only(n.list.at(i), v, false, nargs) { return false; }
+            }
+            true
+        }
+        Let => {
+            for i in 0..n.list.len {
+                if !tail_refs_only(n.list.at(i), v, false, nargs) { return false; }
+            }
+            tail_refs_only(n.a, v, tail, nargs)
+        }
+        Letrec => {
+            for i in 0..n.list.len {
+                let init = n.list.at(i);
+                if init.kind == K.Lambda and init.lam.cont {
+                    if !tail_refs_only(init.lam.body, v, tail, nargs) { return false; }
+                } else if !tail_refs_only(init, v, false, nargs) {
+                    return false;
+                }
+            }
+            tail_refs_only(n.a, v, tail, nargs)
+        }
+    }
+}
+
+fn contify(n: *Node) {
+    if is_null(n) { return; }
+    if n.kind == K.Lambda { contify(n.lam.body); return; }
+    contify(n.a);
+    contify(n.b);
+    contify(n.c);
+    for i in 0..n.list.len { contify(n.list.at(i)); }
+    if n.kind != K.Letrec { return; }
+    // Candidates: unassigned, unboxed lambdas with fixed parameters.
+    var cand: mem.Vec<bool> = mem.Vec.new();
+    for i in 0..n.vars.len {
+        let v = n.vars.at(i);
+        let init = n.list.at(i);
+        cand.push(init.kind == K.Lambda and !v.assigned and !boxed(v) and !init.lam.rest);
+    }
+    var changed = true;
+    while changed {
+        changed = false;
+        for i in 0..n.vars.len {
+            if !cand.at(i) { continue; }
+            let v = n.vars.at(i);
+            let np = n.list.at(i).lam.nparams as u64;
+            var ok = tail_refs_only(n.a, v, true, np);
+            for j in 0..n.list.len {
+                if !ok { break; }
+                let init = n.list.at(j);
+                if cand.at(j) {
+                    ok = tail_refs_only(init.lam.body, v, true, np);
+                } else {
+                    ok = tail_refs_only(init, v, false, np);
+                }
+            }
+            if !ok {
+                cand.set(i, false);
+                changed = true;
+            }
+        }
+    }
+    for i in 0..n.vars.len {
+        if cand.at(i) { n.list.at(i).lam.cont = true; }
+    }
+    cand.free();
+}
+
+/// After contification: give every variable its real owner (the procedure
+/// whose frame holds it), re-parent the lambdas, and recompute `captured`
+/// (a variable used only by contified code is no longer captured, so an
+/// assigned one needs no box).
+fn bind_here(v: *Var, real: *Lam) {
+    v.owner = real;
+    v.captured = false;
+    v.refs = 0;
+}
+
+/// A reference to `v` from `real`: `v` is free in every lambda from
+/// `real` out to its owner.
+fn note_ref(v: *Var, real: *Lam) {
+    v.refs += 1;
+    var l = real;
+    while (l as u64) != (v.owner as u64) {
+        v.captured = true;
+        if !in_free(l, v) { l.free.push(v); }
+        l = l.parent;
+    }
+}
+
+fn reown(n: *Node, real: *Lam) {
+    if is_null(n) { return; }
+    match n.kind {
+        Ref => note_ref(n.vr, real),
+        Set => {
+            note_ref(n.vr, real);
+            reown(n.a, real);
+        }
+        Lambda => reown_lambda(n.lam, real),
+        Let => {
+            for i in 0..n.list.len { reown(n.list.at(i), real); }
+            for i in 0..n.vars.len { bind_here(n.vars.at(i), real); }
+            reown(n.a, real);
+        }
+        Letrec => {
+            for i in 0..n.vars.len { bind_here(n.vars.at(i), real); }
+            for i in 0..n.list.len { reown(n.list.at(i), real); }
+            reown(n.a, real);
+        }
+        _ => {
+            reown(n.a, real);
+            reown(n.b, real);
+            reown(n.c, real);
+            for i in 0..n.list.len { reown(n.list.at(i), real); }
+        }
+    }
+}
+
+fn reown_lambda(l: *Lam, real: *Lam) {
+    if l.cont {
+        for i in 0..l.params.len { bind_here(l.params.at(i), real); }
+        reown(l.body, real);
+        return;
+    }
+    l.parent = real;
+    l.free.truncate(0);
+    for i in 0..l.params.len { bind_here(l.params.at(i), l); }
+    reown(l.body, l);
+}
+
 // ── pass 2: code generation ─────────────────────────────────────────
 
 struct FS {
@@ -1081,6 +1568,9 @@ struct FS {
     /// saves `regs.top` and restores it when done.
     regs: bc.Regs,
     line: u32,
+    /// The pc of the last jump to a continuation's join, and its label.
+    join_at: u64,
+    join_id: u32,
 }
 
 struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
@@ -1093,6 +1583,8 @@ fn FS.new(l: *Lam) -> FS {
         protos: mem.Vec.new(),
         regs: bc.Regs.new(250),
         line: 0,
+        join_at: 0xFFFFFFFFFFFFFFFF,
+        join_id: 0,
     }
 }
 
@@ -1168,6 +1660,7 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
         Const => g.load_const(n.v, dst),
         Ref => {
             let v = n.vr;
+            if !is_null_lam(v.lam) and v.lam.cont { fail(g.fs.line, "internal error: contified procedure used as a value"); }
             if is_local(g, v) {
                 if boxed(v) {
                     g.emit(Scheme.BOXGET(d, v.reg as u8));
@@ -1180,7 +1673,7 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
             }
         }
         GRef => { g.emit(Scheme.GETGLOBAL(d, n.g as u16)); }
-        Set | GSet | GDef => {
+        Set | GSet | GDef | GChk => {
             g.effect(n);
             g.load_const(value.unspec(), dst);
         }
@@ -1204,7 +1697,16 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
         Call => g.call(n, dst, false),
         Prim => g.prim(n, dst),
         Let => { g.bind_let(n); g.to(n.a, dst); }
-        Letrec => { g.bind_letrec(n); g.to(n.a, dst); }
+        Letrec => {
+            if has_cont(n) {
+                let k = Cont { mode: REG, dst: dst, join: g.fs.code.label() };
+                g.letrec_k(n, k);
+                g.bind_join(k);
+            } else {
+                g.bind_letrec(n);
+                g.to(n.a, dst);
+            }
+        }
         And | Or => {
             let done = g.fs.code.label();
             for i in 0..n.list.len {
@@ -1226,6 +1728,7 @@ fn Gen.effect(g: *Gen, n: *Node) {
     let save = g.top();
     match n.kind {
         Const | Ref | GRef | Lambda => {}
+        GChk => { g.emit(Scheme.CHKGLOBAL(0, n.g as u16)); }
         Set => {
             let v = n.vr;
             let r = g.any(n.a);
@@ -1266,7 +1769,16 @@ fn Gen.effect(g: *Gen, n: *Node) {
             for i in 0..n.list.len { g.effect(n.list.at(i)); }
         }
         Let => { g.bind_let(n); g.effect(n.a); }
-        Letrec => { g.bind_letrec(n); g.effect(n.a); }
+        Letrec => {
+            if has_cont(n) {
+                let k = Cont { mode: EFFECT, dst: 0, join: g.fs.code.label() };
+                g.letrec_k(n, k);
+                g.bind_join(k);
+            } else {
+                g.bind_letrec(n);
+                g.effect(n.a);
+            }
+        }
         Prim => {
             // Mutators need no result.
             if n.po == PO.SetCar or n.po == PO.SetCdr or n.po == PO.Vset {
@@ -1294,51 +1806,243 @@ fn Gen.effect(g: *Gen, n: *Node) {
     g.fs.line = saved_line;
 }
 
+/// Where the value of an expression in tail position goes: returned from
+/// the procedure (RET), or, for the body of a letrec whose contified
+/// lambdas return to the letrec's own continuation, into register `dst`
+/// (REG) or nowhere (EFFECT), followed by a jump to `join`.
+const RET: u32 = 0;
+const REG: u32 = 1;
+const EFFECT: u32 = 2;
+struct Cont { mode: u32, dst: u32, join: bc.Label }
+
+fn ret_cont() -> Cont { Cont { mode: RET, dst: 0, join: bc.Label { id: 0 } } }
+
 /// Return the value of `n` from the current procedure.
-fn Gen.tail(g: *Gen, n: *Node) {
+fn Gen.tail(g: *Gen, n: *Node) { g.tailk(n, ret_cont()); }
+
+/// Jump to the continuation's join point.
+fn Gen.to_join(g: *Gen, k: Cont) {
+    g.fs.join_at = g.fs.code.pc();
+    g.fs.join_id = k.join.id;
+    g.jump(Scheme.JMP(0), k.join);
+}
+
+/// Bind `k.join` here, dropping a jump to it just before.
+fn Gen.bind_join(g: *Gen, k: Cont) {
+    if let Some(at) = g.fs.code.last() and at == g.fs.join_at and k.join.id == g.fs.join_id {
+        g.fs.code.truncate(at);
+    }
+    g.fs.code.bind(k.join);
+}
+
+/// Deliver the value of `n` to continuation `k`.
+fn Gen.tailk(g: *Gen, n: *Node, k: Cont) {
     let saved_line = g.set_line(n);
     let save = g.top();
     match n.kind {
         If => {
             let j = g.cond(n.a);
-            g.tail(n.b);
+            g.tailk(n.b, k);
             g.patch_here(j);
             if is_null(n.c) {
-                let r = g.alloc();
-                g.load_const(value.unspec(), r);
-                g.emit(Scheme.RET(r as u8));
+                g.value_k(n.c, k);
             } else {
-                g.tail(n.c);
+                g.tailk(n.c, k);
             }
         }
         Seq => {
             for i in 0..n.list.len - 1 { g.effect(n.list.at(i)); }
-            g.tail(n.list.at(n.list.len - 1));
+            g.tailk(n.list.at(n.list.len - 1), k);
         }
-        Call => {
-            let r = g.top();
-            g.call(n, r, true);
-        }
-        Let => { g.bind_let(n); g.tail(n.a); }
-        Letrec => { g.bind_letrec(n); g.tail(n.a); }
+        Call => g.call_k(n, k),
+        Let => { g.bind_let(n); g.tailk(n.a, k); }
+        Letrec => g.letrec_k(n, k),
         And | Or => {
-            let r = g.alloc();
-            let done = g.fs.code.label();
-            for i in 0..n.list.len - 1 {
-                g.to(n.list.at(i), r);
-                g.jump(if n.kind == K.And { Scheme.TEST(r as u8, 0) } else { Scheme.TESTT(r as u8, 0) }, done);
+            // Operands that are tested with jumps: every and operand (a
+            // false one makes the value #f), and boolean-valued or
+            // operands (a true one makes it #t).
+            var exits: mem.Vec<u64> = mem.Vec.new();
+            var start: u64 = 0;
+            let sense = n.kind == K.Or;
+            while start + 1 < n.list.len and (n.kind == K.And or is_boolean(n.list.at(start))) {
+                g.branch(n.list.at(start), sense, &exits);
+                start += 1;
             }
-            g.tail(n.list.at(n.list.len - 1));
-            g.fs.code.bind(done);
-            g.emit(Scheme.RET(r as u8));
+            if start + 1 == n.list.len {
+                g.tailk(n.list.at(start), k);
+                if exits.len > 0 {
+                    g.patch_here(exits);
+                    let c = g.konst_node(value.boolean(sense));
+                    g.value_k(c, k);
+                } else {
+                    exits.free();
+                }
+            } else {
+                // A non-boolean or operand: its value is the result.
+                var rest = n.list;
+                let r = if k.mode == REG { k.dst } else { g.alloc() };
+                let done = if k.mode == RET { g.fs.code.label() } else { k.join };
+                if exits.len > 0 {
+                    // Each earlier operand jumped to a #t exit.
+                    var skip: mem.Vec<u64> = mem.Vec.new();
+                    skip.push(g.emit(Scheme.JMP(0)));
+                    g.patch_here(exits);
+                    g.load_const(value.t(), r);
+                    g.jump(Scheme.JMP(0), done);
+                    g.patch_here(skip);
+                } else {
+                    exits.free();
+                }
+                for i in start..rest.len - 1 {
+                    g.to(rest.at(i), r);
+                    g.jump(Scheme.TESTT(r as u8, 0), done);
+                }
+                g.tailk(rest.at(rest.len - 1), k);
+                if k.mode == RET {
+                    g.fs.code.bind(done);
+                    g.emit(Scheme.RET(r as u8));
+                }
+            }
         }
-        _ => {
-            let r = g.any(n);
-            g.emit(Scheme.RET(r as u8));
-        }
+        _ => g.value_k(n, k),
     }
     g.reset(save);
     g.fs.line = saved_line;
+}
+
+fn Gen.konst_node(g: *Gen, v: V) -> *Node {
+    let _ = g;
+    let n: *Node = mem.alloc(1);
+    n.kind = K.Const;
+    n.v = v;
+    n.list = mem.Vec.new();
+    n.vars = mem.Vec.new();
+    n
+}
+
+/// Deliver the value of `n` (a non-tail form; null: unspecified) to `k`.
+fn Gen.value_k(g: *Gen, n: *Node, k: Cont) {
+    let save = g.top();
+    if k.mode == RET {
+        var r: u32 = 0;
+        if is_null(n) {
+            r = g.alloc();
+            g.load_const(value.unspec(), r);
+        } else {
+            r = g.any(n);
+        }
+        g.emit(Scheme.RET(r as u8));
+    } else {
+        if k.mode == REG {
+            if is_null(n) { g.load_const(value.unspec(), k.dst); } else { g.to(n, k.dst); }
+        } else if !is_null(n) {
+            g.effect(n);
+        }
+        g.to_join(k);
+    }
+    g.reset(save);
+}
+
+/// A call in tail position.
+fn Gen.call_k(g: *Gen, n: *Node, k: Cont) {
+    let f = n.a;
+    if f.kind == K.Ref and !is_null_lam(f.vr.lam) and f.vr.lam.cont {
+        let l = f.vr.lam;
+        g.move_args(n, l);
+        g.jump(Scheme.JMP(0), l.label);
+        return;
+    }
+    if k.mode == RET {
+        let r = g.top();
+        g.call(n, r, true);
+        return;
+    }
+    if k.mode == REG {
+        g.call(n, k.dst, false);
+    } else {
+        let r = g.alloc();
+        g.call(n, r, false);
+    }
+    g.to_join(k);
+}
+
+fn is_null_lam(l: *Lam) -> bool { (l as u64) == 0 }
+
+/// A letrec in tail position: closures for the lambdas that are not
+/// contified, registers for the parameters of those that are, then the
+/// body, then the contified bodies, all delivering to `k`.
+fn Gen.letrec_k(g: *Gen, n: *Node, k: Cont) {
+    g.bind_letrec(n);
+    var first = null_lam();
+    for i in 0..n.list.len {
+        let init = n.list.at(i);
+        if init.kind != K.Lambda or !init.lam.cont { continue; }
+        let l = init.lam;
+        for j in 0..l.params.len { l.params.at(j).reg = g.alloc(); }
+        l.label = g.fs.code.label();
+    }
+    // A body that just enters a contified lambda (a named let) falls
+    // through into it.
+    let b = n.a;
+    if b.kind == K.Call and b.a.kind == K.Ref and !is_null_lam(b.a.vr.lam) and b.a.vr.lam.cont {
+        first = b.a.vr.lam;
+        let saved_line = g.set_line(b);
+        g.move_args(b, first);
+        g.fs.line = saved_line;
+        g.cont_body(first, k);
+    } else {
+        g.tailk(b, k);
+    }
+    for i in 0..n.list.len {
+        let init = n.list.at(i);
+        if init.kind != K.Lambda or !init.lam.cont or (init.lam as u64) == (first as u64) { continue; }
+        g.cont_body(init.lam, k);
+    }
+}
+
+fn null_lam() -> *Lam { 0 as *Lam }
+
+fn Gen.cont_body(g: *Gen, l: *Lam, k: Cont) {
+    g.fs.code.bind(l.label);
+    for i in 0..l.params.len {
+        let v = l.params.at(i);
+        if boxed(v) { g.emit(Scheme.MKBOX(v.reg as u8)); }
+    }
+    g.tailk(l.body, k);
+}
+
+/// Store the arguments of call `n` into the parameters of `l` (a jump to
+/// its start follows). Arguments that are their own parameter need
+/// nothing. An argument that is a single op (and whose parameter no other
+/// argument reads) is computed straight into its parameter; the rest go
+/// to temporaries first, and are moved last.
+fn Gen.move_args(g: *Gen, n: *Node, l: *Lam) {
+    let nargs = n.list.len;
+    let save = g.top();
+    var mode: mem.Vec<u32> = mem.Vec.new();   // 0 same, 1 direct, 2 temp
+    for i in 0..nargs {
+        let a = n.list.at(i);
+        let p = l.params.at(i);
+        if a.kind == K.Ref and (a.vr as u64) == (p as u64) and !boxed(p) { mode.push(0); continue; }
+        var direct = a.kind == K.Prim or a.kind == K.Const or a.kind == K.Ref or a.kind == K.GRef;
+        for j in 0..nargs {
+            if j != i and mentions(n.list.at(j), p) { direct = false; }
+        }
+        mode.push(if direct { 1 } else { 2 });
+    }
+    let base = g.top();
+    for i in 0..nargs {
+        let r = g.alloc();
+        if mode.at(i) == 2 { g.to(n.list.at(i), r); }
+    }
+    for i in 0..nargs {
+        if mode.at(i) == 1 { g.to(n.list.at(i), l.params.at(i).reg); }
+    }
+    for i in 0..nargs {
+        if mode.at(i) == 2 { g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8)); }
+    }
+    mode.free();
+    g.reset(save);
 }
 
 /// Emit a test of `n`; returns the jumps to patch, taken when `n` is false.
@@ -1350,20 +2054,58 @@ fn Gen.cond(g: *Gen, n: *Node) -> mem.Vec<u64> {
     js
 }
 
-fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
+fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) { g.branch(n, false, js); }
+
+/// Emit code that jumps (adding the jumps to `js`) when the truth of `n`
+/// is `sense`, and falls through otherwise. `not` flips the sense;
+/// `and`/`or` branch on each operand in turn.
+fn Gen.branch(g: *Gen, n: *Node, sense: bool, js: *mem.Vec<u64>) {
     let saved_line = g.set_line(n);
     let save = g.top();
-    if n.kind == K.And {
-        for i in 0..n.list.len { g.cond_into(n.list.at(i), js); }
-    } else if n.kind == K.Prim and n.po == PO.Not {
-        let r = g.any(n.list.at(0));
-        js.push(g.emit(Scheme.TESTT(r as u8, 0)));
+    if n.kind == K.Prim and n.po == PO.Not {
+        g.branch(n.list.at(0), !sense, js);
+    } else if n.kind == K.And or n.kind == K.Or {
+        // (and ...) is false when some operand is; (or ...) is true when
+        // some operand is. The other way round, all but the last operand
+        // must be tested the opposite way to skip the jump.
+        let any_jumps = (n.kind == K.And) != sense;
+        if any_jumps {
+            for i in 0..n.list.len { g.branch(n.list.at(i), sense, js); }
+        } else {
+            var skip: mem.Vec<u64> = mem.Vec.new();
+            for i in 0..n.list.len - 1 { g.branch(n.list.at(i), !sense, &skip); }
+            g.branch(n.list.at(n.list.len - 1), sense, js);
+            g.patch_here(skip);
+        }
+    } else if n.kind == K.Const {
+        if value.truthy(n.v) == sense {
+            g.fs.code.set_loc(g.fs.line);
+            js.push(g.fs.code.op(Scheme.JMP(0)));
+        }
     } else {
         let r = g.any(n);
-        js.push(g.emit(Scheme.TEST(r as u8, 0)));
+        js.push(g.emit(if sense { Scheme.TESTT(r as u8, 0) } else { Scheme.TEST(r as u8, 0) }));
     }
     g.reset(save);
     g.fs.line = saved_line;
+}
+
+/// Is the value of `n` always #t or #f?
+fn is_boolean(n: *Node) -> bool {
+    match n.kind {
+        Const => n.v == value.t() or n.v == value.f(),
+        Prim => match n.po {
+            NumEq | Lt | Gt | Le | Ge | Eq | Eqv | ZeroP | Not | NullP | PairP | SymP | NumP | FixP | StrP | VecP => true,
+            _ => false,
+        },
+        And | Or => {
+            for i in 0..n.list.len {
+                if !is_boolean(n.list.at(i)) { return false; }
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A call. `dst` is where the result goes (non-tail), or the first free
@@ -1373,42 +2115,46 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
     if nargs > 200 { fail(g.fs.line, "too many arguments"); }
     // A tail call of the procedure's own letrec variable: a loop.
     let f = n.a;
-    if tail and f.kind == K.Ref and (f.vr.lam as u64) == (g.fs.lam as u64) and !f.vr.assigned {
+    // ... or of the known top-level procedure being compiled (its closure
+    // is running, so the global is bound to it).
+    let self_global = f.kind == K.GRef and (n.lam as u64) == (g.fs.lam as u64);
+    if tail and (self_global or (f.kind == K.Ref and (f.vr.lam as u64) == (g.fs.lam as u64) and !f.vr.assigned)) {
         let l = g.fs.lam;
         if !l.rest and l.nparams as u64 == nargs {
-            // Arguments that are their own parameter need nothing. An
-            // argument that is a single op (and whose parameter no other
-            // argument reads) is computed straight into its parameter;
-            // the rest go to temporaries first, and are moved last.
-            var mode: mem.Vec<u32> = mem.Vec.new();   // 0 same, 1 direct, 2 temp
-            for i in 0..nargs {
-                let a = n.list.at(i);
-                let p = l.params.at(i);
-                if a.kind == K.Ref and (a.vr as u64) == (p as u64) and !boxed(p) { mode.push(0); continue; }
-                var direct = a.kind == K.Prim or a.kind == K.Const or a.kind == K.Ref or a.kind == K.GRef;
-                for j in 0..nargs {
-                    if j != i and mentions(n.list.at(j), p) { direct = false; }
-                }
-                mode.push(if direct { 1 } else { 2 });
-            }
-            let base = g.top();
-            for i in 0..nargs {
-                let r = g.alloc();
-                if mode.at(i) == 2 { g.to(n.list.at(i), r); }
-            }
-            for i in 0..nargs {
-                if mode.at(i) == 1 { g.to(n.list.at(i), l.params.at(i).reg); }
-            }
-            for i in 0..nargs {
-                if mode.at(i) == 2 { g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8)); }
-            }
-            mode.free();
+            g.move_args(n, l);
             g.fs.code.set_loc(g.fs.line);
             g.fs.code.jump_to(Scheme.JMP(0), 0);
             return;
         }
     }
     let base = if !tail and dst + 1 == g.top() { dst } else { g.alloc() };
+    // A recursive call of the procedure being compiled (through its known
+    // global or its own letrec variable) with the right arity.
+    let l = g.fs.lam;
+    if !tail and !l.rest and l.nparams as u64 == nargs
+        and (self_global or (f.kind == K.Ref and (f.vr.lam as u64) == (l as u64) and !f.vr.assigned)) {
+        for i in 0..nargs {
+            let r = g.alloc();
+            g.to(n.list.at(i), r);
+        }
+        g.emit(Scheme.CALLSELF(base as u8, nargs as u8));
+        if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
+        return;
+    }
+    if f.kind == K.Const and let Some(id) = value.prim_of(f.v)
+        and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+        for i in 0..nargs {
+            let r = g.alloc();
+            g.to(n.list.at(i), r);
+        }
+        g.emit(Scheme.PRIMCALL(base as u8, nargs as u8, id as u8));
+        if tail {
+            g.emit(Scheme.RET(base as u8));
+        } else if base != dst {
+            g.emit(Scheme.MOVE(dst as u8, base as u8));
+        }
+        return;
+    }
     g.to(f, base);
     for i in 0..nargs {
         let r = g.alloc();
@@ -1497,6 +2243,11 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
             Not => Scheme.NOT(d, a),
             NullP => Scheme.NULLP(d, a),
             PairP => Scheme.PAIRP(d, a),
+            SymP => Scheme.SYMBOLP(d, a),
+            NumP => Scheme.NUMBERP(d, a),
+            FixP => Scheme.FIXNUMP(d, a),
+            StrP => Scheme.STRINGP(d, a),
+            VecP => Scheme.VECTORP(d, a),
             Car => Scheme.CAR(d, a),
             _ => Scheme.CDR(d, a),
         };
@@ -1536,10 +2287,17 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
 }
 
 /// Evaluate a let's inits into fresh registers and bind its variables.
+/// A lambda bound to a variable that is never used (all its calls were
+/// inlined): no closure is made.
+fn dead_lambda(v: *Var, init: *Node) -> bool {
+    init.kind == K.Lambda and v.refs == 0 and !boxed(v)
+}
+
 fn Gen.bind_let(g: *Gen, n: *Node) {
     let base = g.top();
     for i in 0..n.list.len {
         let r = g.alloc();
+        if dead_lambda(n.vars.at(i), n.list.at(i)) { continue; }
         g.to(n.list.at(i), r);
     }
     for i in 0..n.vars.len {
@@ -1549,9 +2307,19 @@ fn Gen.bind_let(g: *Gen, n: *Node) {
     }
 }
 
+fn is_cont(n: *Node) -> bool { n.kind == K.Lambda and n.lam.cont }
+
+fn has_cont(n: *Node) -> bool {
+    for i in 0..n.list.len {
+        if is_cont(n.list.at(i)) { return true; }
+    }
+    false
+}
+
 fn Gen.bind_letrec(g: *Gen, n: *Node) {
     for i in 0..n.vars.len {
         let v = n.vars.at(i);
+        if is_cont(n.list.at(i)) { continue; }
         v.reg = g.alloc();
         if boxed(v) {
             g.load_const(value.unspec(), v.reg);
@@ -1561,6 +2329,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
     for j in 0..n.list.len {
         let v = n.vars.at(j);
         let init = n.list.at(j);
+        if is_cont(init) or dead_lambda(v, init) { continue; }
         let save = g.top();
         if boxed(v) {
             let r = g.any(init);
@@ -1572,7 +2341,7 @@ fn Gen.bind_letrec(g: *Gen, n: *Node) {
             for jj in 0..j + 1 {
                 let w = n.vars.at(jj);
                 let wi = n.list.at(jj);
-                if boxed(w) or wi.kind != K.Lambda { continue; }
+                if boxed(w) or wi.kind != K.Lambda or wi.lam.cont or dead_lambda(w, wi) { continue; }
                 let l = wi.lam;
                 for fi in 0..l.free.len {
                     if (l.free.at(fi) as u64) == (v as u64) {
@@ -1678,6 +2447,12 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         redefined: map.HashMap.new(),
         line: 0,
         gensyms: 0,
+        gdefs: map.HashMap.new(),
+        glams: map.HashMap.new(),
+        gsets: map.HashMap.new(),
+        gform: map.HashMap.new(),
+        cur_form: 0,
+        first_impure: 0,
     };
     var pre: mem.Vec<V> = mem.Vec.new();
     read_all(&c, prelude, false, &pre);
@@ -1689,6 +2464,19 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
     for i in 0..pre.len { c.top(pre.at(i), &nodes); }
     for i in 0..prog.len { c.scan_defs(prog.at(i)); }
     for i in 0..prog.len { c.top(prog.at(i), &nodes); }
+    c.first_impure = nodes.len;
+    for i in 0..nodes.len {
+        let n = nodes.at(i);
+        if n.kind == K.GDef { c.gform.insert(n.g as u64, i); }
+        if c.first_impure == nodes.len and may_call(n) { c.first_impure = i; }
+    }
+    for i in 0..nodes.len {
+        c.cur_form = i;
+        nodes.set(i, c.inl(nodes.at(i), 0));
+    }
+    for i in 0..nodes.len { reown(nodes.at(i), top); }
+    for i in 0..nodes.len { contify(nodes.at(i)); }
+    for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { g.effect(nodes.at(i)); }
     let r = g.alloc();
     g.load_const(value.unspec(), r);

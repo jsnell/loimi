@@ -9,6 +9,10 @@ pub fn source() -> str {
         (loop (cdr l) (cons (f (car l)) acc))
         (reverse acc))))
 
+(define (%for-each1 f l)
+  (let loop ((l l))
+    (if (pair? l) (begin (f (car l)) (loop (cdr l))))))
+
 (define (%all-pairs? ls)
   (if (null? ls) #t (if (pair? (car ls)) (%all-pairs? (cdr ls)) #f)))
 
@@ -22,8 +26,7 @@ pub fn source() -> str {
 
 (define (for-each f l . ls)
   (if (null? ls)
-      (let loop ((l l))
-        (if (pair? l) (begin (f (car l)) (loop (cdr l)))))
+      (%for-each1 f l)
       (let loop ((ls (cons l ls)))
         (if (%all-pairs? ls)
             (begin (apply f (%map1 car ls)) (loop (%map1 cdr ls)))))))
