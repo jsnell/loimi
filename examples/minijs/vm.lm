@@ -887,6 +887,8 @@ pub vm JS {
             if let Num(x) = a { eq = x == x; }
             branch(eq == want, then.target)
         }
+        // Different words: two Ints (the usual case) are not equal.
+        if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
         branch(eq_slow(a, b) == want, then.target)
     }
 
@@ -914,9 +916,21 @@ pub vm JS {
             if let Num(x) = a { eq = x == x; }
             branch(eq == want, then.target)
         }
+        // Different words: two Ints (the usual case) are not equal.
+        if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
         branch(eq_slow(a, b) == want, then.target)
     }
 
+    /// `switch` on Int cases lo .. lo+n-1: followed by n JMPs (one per
+    /// value) and the JMP for every other value.
+    op SWITCHI(r: reg, lo: kst, n: imm) : ABC {
+        var i = n as u64;
+        if let (Int(x), Int(l)) = (r, lo) and ((x as i64 - l as i64) as u64) < n as u64 { i = (x as i64 - l as i64) as u64; }
+        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and x == x.floor() {
+            i = (x as i64 - l as i64) as u64;
+        }
+        jump pc + 1 + i
+    }
     op JMP(target: label) : sJ { jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {

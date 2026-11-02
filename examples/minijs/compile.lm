@@ -1701,6 +1701,54 @@ fn Gen.switch_stmt(g: *Gen, n: *Node) {
     let l = g.loop_at(li);
     var labels: mem.Vec<bc.Label> = mem.Vec.new();
     var default_label: ?bc.Label = None;
+    // Integer cases in a small range: a jump table.
+    var lo: i32 = 0x7FFFFFFF;
+    var hi: i32 = -0x7FFFFFFF;
+    var ncase: u64 = 0;
+    var dense = true;
+    for i in 0..n.list.len {
+        let c = n.list.at(i);
+        if c.flag == 1 { continue; }
+        ncase += 1;
+        if let Some(Int(x)) = g.const_value(c.a) {
+            if x < lo { lo = x; }
+            if x > hi { hi = x; }
+        } else {
+            dense = false;
+        }
+    }
+    let width = (hi as i64) - (lo as i64) + 1;
+    if dense and ncase >= 3 and width <= 255 and width <= 8 * ncase as i64 + 32 {
+        for i in 0..n.list.len { labels.push(g.label()); if n.list.at(i).flag == 1 { default_label = Some(labels.at(i)); } }
+        let dflt = default_label ?? l.brk;
+        let kl = g.konst(V.Int(lo));
+        if kl < 256 {
+            g.emit(JS.SWITCHI(d as u8, kl as u8, width as u8));
+            for v in 0..width {
+                var target = dflt;
+                for i in 0..n.list.len {
+                    let c = n.list.at(i);
+                    if c.flag == 1 { continue; }
+                    if let Some(Int(x)) = g.const_value(c.a) and (x as i64) == lo as i64 + v { target = labels.at(i); break; }
+                }
+                g.jump(target);
+            }
+            g.jump(dflt);
+            for i in 0..n.list.len {
+                let c = n.list.at(i);
+                g.bind(labels.at(i));
+                g.hoist_functions(&c.list);
+                g.stmts(&c.list);
+            }
+            g.bind(l.brk);
+            labels.free();
+            g.fs.loops.truncate(li);
+            g.fs.regs.leave(lvl);
+            return;
+        }
+        labels.clear();
+        default_label = None;
+    }
     for i in 0..n.list.len {
         let c = n.list.at(i);
         let cl = g.label();
