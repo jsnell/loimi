@@ -24,6 +24,18 @@ items:
 | 10 | Fixed: `a ?? b` with `b: ?T` is `?T` (`b` still evaluated only on None; chains). No `or`/`or_else` methods: `??` is the lazy form. |
 | 11 | `var r = Ok(..)`: still needs an annotation (inference stays local), but the error now says how to write it. `in` stays reserved (`for x in`); the error says it is a reserved word and suggests `in_`. Added `mem.find_byte`/`rfind_byte`/`find_bytes`/`compare_bytes`/`equal_bytes` (libc `memchr`/`memrchr`/`memmem`/`memcmp`) and `HashMap.clear()`; `text.find` uses `memchr`. `lib.lm` uses `mem.find_byte` instead of its own `extern memchr`. |
 
+## Embedding and tooling follow-up
+
+For the library and tooling items:
+
+| # | Status |
+|---|---|
+| 1 | Fixed: `#[catch_panic(v)]` on an `export "C"` function turns a panic below it on the thread (bounds check, `unwrap`, overflow and division checks, `trap()` in libraries, `rt.panic`, `mem.alloc` out of memory, a generated `op_of` on a bad word) into the return value `v`; `rt.panic_message()` gives the message. `rt.catch_panic(f, data)` does the same inside Loimi; `mem.try_alloc` returns `?*T`. Without a catch a panic still aborts. What is safe afterwards (frames abandoned, shadow stack and vm depths restored, objects being modified are poisoned) is in `language.md` §10.1. `lib.lm` uses it: `rx_compile` returns NULL and `rx_exec` -2 on an internal error, with `rx_internal_error()`. Cost 1-2 ns per call; 5-8% on the benchmarks with a match every 25 ns. |
+| 2 | Fixed: `--sanitize=address` works with `--lib` and `--shared`; the host links the ASan runtime (`gcc -fsanitize=address host.c librx.a`), documented in §10.1. `check.sh --asan` uses it. |
+| 3 | Fixed: `--lib --vm-stats` archives the stats runtime; the report prints when the host exits. |
+| 4 | Fixed: `export "C" const RX_SEARCH: u32 = 1;` → `#define RX_SEARCH 1u`; `///` comments are copied; `#[c_const(pat, buf)]` makes parameters `const void *`; `#[c_name("rx_regex")]` (or `--header-prefix`) names opaque types. `host.c` has no `#define`s or casts left. |
+| 9 | Fixed: the suggestions are one list with no two overlapping each other or an existing super; overlapping candidates follow, commented out, naming what they overlap. |
+
 ## Summary: top items
 
 | # | Item | Area | Fix kind |
