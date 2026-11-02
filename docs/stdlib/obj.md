@@ -355,3 +355,188 @@ fn Model.ic.on_miss(c: *PropIC) -> IcState;
 `SetError` covers read-only properties, non-extensible objects, and so on.
 It is only produced when `.attributes = true`; otherwise it is `never` and the
 `Result` disappears at compile time.
+
+---
+
+## As implemented
+
+`std/obj.lm`, tested by `tests/run/std_obj.lm` (semantics),
+`tests/run/std_obj_gc.lm` (random operations checked against a host-side
+model, collecting after every operation in stress mode) and
+`tests/run/std_obj_ic.lm` (a `GETPROP` family in a vm, all dispatch
+modes); `bench/obj` measures a cache hit.
+
+### No `Model` configuration; the object type is the interpreter's
+
+There is no comptime, and `object` types cannot be generic, so the
+library cannot declare an object whose slots hold the interpreter's
+`Value`. The interpreter declares the types and the library is generic
+over them:
+
+```loimi
+object Obj {
+    shape: Gc<obj.Shape>,
+    dict: ?Gc<obj.Dict>,
+    overflow: ?Gc<Slots>,
+    proto: ?Gc<Obj>,              // only if the prototype functions are used
+    // ... any other fields ...
+    inline: [Value],
+}
+object Slots { data: [Value] }
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+var m: obj.Model<Gc<Obj>, Gc<Slots>, Value> = obj.Model.new(new_slots, Value.Nil);
+m.attach(&heap);                  // scanner + sweeper; `m` must not move afterwards
+let o = new(&heap, Obj { shape: m.root(4), dict: None, overflow: None, proto: None }, 4);
+m.set(o, sym_x, Value.Int(1));
+```
+
+Generic bodies resolve field accesses per instance, so a function that
+reads `o.proto` only needs the field when it is used. Choices the design
+puts in the `Model` are fixed or dropped:
+
+| Design option | As implemented |
+|---|---|
+| `.key` | `u64`: symbol ids (`text.Interner`) or other integers that stay meaningful while shapes use them. Keys are not traced. |
+| `.attributes` | not supported (no attribute bits, no `SetError`) |
+| `.prototypes` | `.in_shape`: one root shape per (prototype, inline count). Objects without prototypes use `root(n)`. |
+| `.ordered` | always: `keys` returns insertion order in both modes |
+| `.inline_slots` | per allocation: the object's `inline.len`, which must match the root shape's count (`root(n)`, `root_for(proto, n)`, `template_root(&t)`) |
+| `.dict_threshold` | `m.dict_threshold` (default 64) |
+| `.elements` | not built |
+
+### Shapes
+
+`Shape { id, count, inline_cap, key, proto, parent, ... }`. Property *i*
+(in insertion order) lives in slot index *i*: `inline[i]` below the
+inline count, `overflow.data[i - inline_cap]` above. A cache stores a
+SlotRef: the index, or the overflow index with bit 31 (`obj.OUT`) set,
+computed by `obj.slot_ref(i, cap)`.
+
+- **Transitions** are weak. A shape's first child is stored inline
+  (`child_key`, `child` as an address), further ones in an open-addressed
+  `Edges` object. Children keep their parent alive through `parent`. A
+  sweeper (`Heap.add_sweeper`) clears edges to shapes that were not
+  marked, and drops dead entries from the table of root shapes; the
+  references are turned back into `Gc<Shape>` through a private `value`
+  type, the only way to make a reference from bits.
+- **Ids are never reused**: a u32 counter (0 is an empty cache,
+  `DICT_ID` = `0xFFFFFFFF` the dictionary shape). A stale id in a cache
+  can never match a live object, so caches need no reset after a
+  collection, and the weak-cache-reset machinery of gc.md §8 (not built
+  in std.gc) is not needed. The cost is that 4 billion shape creations
+  abort the process.
+- **Lookup**: chains of up to 8 properties are walked; longer ones build
+  a key → index `Table` on first lookup and keep it on the shape (one
+  table per shape; tables are not shared along a chain).
+
+### Objects and dictionary mode
+
+`m.get`, `m.set`, `m.add`, `m.delete`, `m.has_own`, `m.find` (slot
+index), `m.len`, `m.keys(o, &vec)`, `m.load`/`m.store` (by index),
+`m.load_ref`/`m.store_ref` (by SlotRef, no bounds checks),
+`m.load_inline`/`m.load_out` (for cache members that know where the slot
+is). Overflow arrays grow by 1.5× through the `new_slots` function.
+
+Deleting the last property added steps back to the parent shape.
+Deleting any other property, or adding one past `dict_threshold`,
+switches to dictionary mode: the object gets the shared dictionary shape
+(id `DICT_ID`, never cached) and a `Dict` (an open-addressed index over
+entries kept in insertion order). Values stay in the object's slots; the
+dictionary maps keys to slot indices. When the entry array is full it is
+rebuilt without deleted entries, moving values down to keep slots dense.
+`m.optimize(o)` turns a dictionary-mode object with at most
+`dict_threshold` properties back into a fast one; `m.to_dict(o)` forces
+dictionary mode.
+
+### Inline caches
+
+The vm declares the cache words and does the check itself, so the hit
+path stays in the handler:
+
+```loimi
+cache PropIC { shape: u32, slot: u32 }
+family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
+    generic {
+        dst = get_slow(ctx, o, key, &cache.shape, &cache.slot);   // calls m.get_fill
+        if cache.shape != obj.EMPTY_ID {
+            if cache.slot & obj.OUT == 0 { become GETPROP_IN; } else { become GETPROP_OUT; }
+        }
+        next
+    }
+    GETPROP_IN {
+        if let O(x) = o and x.shape.id == cache.shape { dst = ctx.m.load_inline(x, cache.slot); next }
+        cold { become GETPROP; redo }
+    }
+    GETPROP_OUT { .. ctx.m.load_out(x, cache.slot & !obj.OUT) .. }
+}
+```
+
+- `m.get_fill(o, key, &shape_word, &slot_word)` and `m.set_fill(..)`: the
+  slow paths, which fill the two words for an own property of a
+  fast-mode object.
+- `obj.Poly`: up to four (shape id, SlotRef) pairs with no GC references,
+  for a side table or eight cache words.
+- `obj.MegaCache`: direct-mapped (shape id, key) → SlotRef, shared by
+  megamorphic sites (`m.get_mega(&mc, o, key)`). Not cleared on GC, since
+  ids are not reused.
+- The miss counting and the EMPTY → MONO → POLY → MEGA policy are left to
+  the vm (a family member per state, as above); there is no
+  `Model.ic.on_miss`.
+
+A hit costs two dependent loads (`o.shape`, `shape.id`), a compare
+against the cache word and the slot load: 0.8 ns over a register move on
+an i7-6700 (`bench/obj/README.md`, which shows the machine code).
+
+### Prototype chains and validity cells
+
+`m.lookup(o, key)` returns `Lookup.Own(i)`, `Lookup.Proto(holder, i)` or
+`Lookup.Missing`, following `proto` fields; `m.get_chain` returns the
+value; `m.set_proto(o, p)` moves a fast object to the matching shape in
+`p`'s tree.
+
+A prototype hit is cached in a `ProtoEntry<O> { sid, slot, cell, holder }`
+by `m.get_proto_fill(o, key, &entry)` and checked by `m.proto_hit(o,
+&entry)`: receiver shape id equal, cell valid, then the holder's slot.
+The cell is that of the receiver's prototype, from `m.cell(p)`:
+
+- Cells live in a weak side table keyed by the object's address, so
+  objects need no cell field and only objects some cache depends on have
+  one.
+- A new cell for `p` registers with the cell of `p.proto` (created if
+  needed), so the cells of a chain form a tree; each cell keeps its
+  parent cell alive.
+- Adding or deleting a property of an object with a cell, switching it to
+  or compacting its dictionary, or changing its prototype invalidates its
+  cell and, recursively, the cells registered under it. Storing a new
+  value into an existing property does not.
+
+The entry holds GC references (the cell and the holder), so it must live
+somewhere traced; `ProtoEntry.mark(h)` marks it from a scanner.
+
+### Allocation templates
+
+`obj.Template.new(proto_bits, inline)`; `m.template_root(&t)` is the root
+shape for the next object from the site (with `t.inline` inline slots),
+and `m.observe(&t, o)` raises `t.inline` to the number of properties a
+finished object has (capped at `max_inline`, 32).
+
+### Not built
+
+- Attributes (writable/enumerable/configurable) and `SetError`.
+- Elements (integer-indexed storage) and arrays.
+- `Globals` with property cells: a cell object would have to hold the
+  interpreter's `Value`, so it is the interpreter's type; Mini's
+  `GETGLOBAL` slot cache plays this role today.
+- Iteration with mutation semantics (`on_iter_mutation`): `keys` copies
+  the keys out.
+- Sharing lookup tables along a transition chain, and transition caching
+  for property *adds* (a cache that goes from the old shape to the new
+  one in one step).
+- `Model.ic.on_miss` and per-site miss counters.
+
+### Effects
+
+Nothing in `std.obj` collects. Every function is free of effects, so
+handlers can call them from fast paths and cold blocks without syncing,
+and the generic code needs no shadow-stack frames.

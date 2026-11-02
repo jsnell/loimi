@@ -235,6 +235,63 @@ Generic machinery that each vm's generated `Builder` plugs into:
 - **Serialization** of protos (bytecode cache files). Loading always goes
   through the verifier.
 
+**As implemented** (`std/bc.lm`): a library over the generated encoders
+rather than a generated `Builder`. Everything is generic over the vm's
+code word `W` through two functions the compiler passes in: `size:
+fn(W) -> u64` (the generated `Vm.op_size`) and `patch: fn(W, i64) -> ?W`
+(set a jump word's offset, `target - pc`, or None if it does not fit,
+usually three lines over `Vm.opcode` and `bc.Field`). The test
+`tests/run/std_bc.lm` compiles a small language to a toy register vm
+with all of it.
+
+- `Code<W>`: `Code.new(Vm.op_size, patch)`; `op(w)` emits an instruction
+  and zeroes its inline-cache words, `word(w)` a raw word; `pc`, `at`,
+  `set`, `words`, `copy_into`, `clear`, `free`. Source positions:
+  `set_loc(loc)` (returns the previous one) tags the following
+  instructions; positions are kept as runs, read with `loc_at(pc)`,
+  expanded per word with `locs_into(out)` (what Mini and Scheme store
+  today), or encoded with `encode_locs(&bytes)` (delta-encoded LEB128
+  runs, about 2 bytes per line change) and read back with
+  `bc.line_at(bytes, pc)` on error paths.
+- Labels: `label()`, `bind(l)`, `here()` (a placed loop head),
+  `jump(w, l)`, `fixup(at, l)` (for a jump word that is not the first
+  word emitted), `label_pc`. Jump lists for Lua-style compilers that pass
+  pending exits around: plain `mem.Vec<u64>` of jump pcs with
+  `patch_list(&l, target)` and `patch_here(&l)`; `patch(at, target)` and
+  `jump_to(w, target)` for single jumps.
+- Errors are sticky: an offset that does not fit records `JumpRange` with
+  the pc and its source position, `check()` returns the first error (also
+  `Unbound` for a label with pending jumps that was never placed), and
+  `Error.message()` describes it. Compilers that stop at the first error
+  can still check `patch`'s bool result.
+- Peephole support: `last()` is the pc of the previous instruction if it
+  may be rewritten or merged with the next one (no jump targets the
+  current pc: binding a label or patching to here blocks it, as Lua's
+  `lasttarget` does); `truncate(pc)` removes code (dropping pending
+  fixups in it); `mark_target()`.
+- `thread_jumps(target_of, is_goto)`: retargets jumps that land on an
+  unconditional jump, following chains up to 8 deep; nothing moves.
+- `bc.Field { shift, bits, signed }` with `fits`, `get`/`set` (and
+  `get32`/`set32`): range-checked access to an encoded field.
+- `Pool<K: hash.Hash>`: `Pool.new(limit)`, `add(k) -> ?u32` (deduplicated
+  through a `HashMap`; None when full), `push` (no dedup), `find`, `get`,
+  `items`. For a nanboxed `Value`, `fn V.hash` over the bits and
+  `fn V.eq(a, b) { a == b }` keep `0.0`, `-0.0` and `0` apart.
+- `Regs`: `Regs.new(limit)`; `alloc(n)` (past the limit it sets `failed()`
+  and still returns, so the error can be reported later) or
+  `try_alloc(n) -> ?u32`; `free(r)` (top only, locals ignored, false if
+  out of order), `free2(a, b)`, `is_temp`, `mark`/`reset` (Scheme's
+  save-and-restore of the free register), `end_stmt`, `activate(n)`
+  (registers become locals), `enter`/`leave` (blocks), `frame_size(min)`.
+
+Not built: emitters generated as `b.ADD(..)` methods (the generated
+`Vm.ADD(..)` encoders plus `op` cover it), branch relaxation (a too-long
+jump is an error), the exception table, `Proto` assembly with the
+verifier call (each interpreter's `Proto` and verify context differ; the
+compiler calls `Vm.verify` and `Vm.optimize` itself), and serialization.
+Nothing in `std.bc` collects, so GC references in a `Pool` are not
+roots: compile between collections, as Mini and Scheme do.
+
 ## `std.gc`
 
 Full design: [`stdlib/gc.md`](stdlib/gc.md).
@@ -271,6 +328,18 @@ Full design: [`stdlib/obj.md`](stdlib/obj.md).
 - Inline cache layouts and state machine (mono, poly, megamorphic with a
   global `MegaCache`), validity cells for prototype-chain hits, and property
   cells for globals.
+
+**As implemented** (`std/obj.lm`): shapes with weak transitions, inline
+and overflow slots, dictionary mode, prototype chains with validity cells,
+monomorphic/polymorphic/megamorphic cache helpers and allocation
+templates. There is no comptime `Model` configuration and object types
+cannot be generic, so the interpreter declares its object type (fields
+`shape`, `dict`, `overflow`, optionally `proto`, and trailing `inline:
+[Value]`) and a slot-array type, and instantiates the generic
+`obj.Model<Gc<Obj>, Gc<Slots>, Value>` with a function that allocates
+slot arrays. Keys are u64 symbol ids. An inline-cache hit is two loads,
+a compare and the slot load (`bench/obj`). Details and what is left out:
+[`stdlib/obj.md`](stdlib/obj.md#as-implemented).
 
 ## `std.rt`: runtime support
 
