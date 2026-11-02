@@ -26,14 +26,16 @@
 // the copy-and-patch JIT when built with `--jit-stencils` and run with
 // LOIMI_JIT=1 LOIMI_JIT_HOT=1. At exit the driver prints a hash of every
 // outcome, which must be the same for every build: tests/fuzz.rs builds
-// it in each mode and compares.
+// it in each mode and compares. The outcome includes the code words after
+// both runs, so quickening (which `become`s ran, and so which supers were
+// rewritten or split) must not depend on the dispatch mode or the JIT.
 //
 // usage: fuzzcombo <first-seed> <count> [-v | -d] [stress] [jit]
 //   -v prints each seed before running it; -d also prints each program,
 //   -r only each run's result.
 //   stress: collect at every allocation.
 //   jit: the JIT is on (LOIMI_JIT=1): skip what it does not support
-//   (optimize, verify and deopt of code it has compiled).
+//   (verify and deopt of code it has compiled).
 
 import std.io;
 import std.os;
@@ -193,9 +195,10 @@ vm C {
     /// member's deopt, then `redo`). Members compute what the generic op
     /// computes, and deopts take no step budget: a super's part runs its
     /// own member's code whatever its word holds now (a jump to the word,
-    /// or `next` from an outlined cold block in the previous part, runs
-    /// the word alone and may quicken it without changing the head), so
-    /// results must not depend on which member runs.
+    /// or `redo` in the part, runs the word alone and may quicken it
+    /// without changing the head), so results must not depend on which
+    /// member runs. `next` from a part's cold block, or from a shared
+    /// copy a part calls, stays in the super in every mode.
     family MUL(dst: reg, a: reg, b: reg) : ABC {
         generic {
             dst = a *% b;
@@ -573,6 +576,9 @@ struct Outcome {
     /// Result, registers and log of each run.
     sig: u64,
     reverify: bool,
+    /// The code words after both runs (quickened, maybe fused): the same
+    /// in every dispatch mode and under the JIT.
+    words: u64,
     /// The code after `C.deopt`.
     deopt: u64,
     result: i64,
@@ -590,7 +596,7 @@ fn new_ctx(p: *Prog, regs: *i64, nr: u64, frames: *Frame, code0: *u32) -> Ctx {
 
 /// Build `p`'s code object, optimize it or not, and run it twice.
 fn run_prog(heap: *gc.Heap, p: *Prog, optimize: bool, stress: bool) -> Outcome uses gc {
-    var out = Outcome { verified: false, sig: 0, reverify: true, deopt: 0, result: 0 };
+    var out = Outcome { verified: false, sig: 0, reverify: true, words: 0, deopt: 0, result: 0 };
     let k: *i64 = mem.alloc(8);
     for i in 0..8 { k[i] = p.consts[i]; }
     let fentry: *u32 = mem.alloc(4);
@@ -617,7 +623,7 @@ fn run_prog(heap: *gc.Heap, p: *Prog, optimize: bool, stress: bool) -> Outcome u
     let frames: *Frame = mem.alloc(8);
     var h: u64 = 14695981039346656037;
     for round in 0..2 {
-        if round == 1 and optimize and !JIT { C.optimize(pr.code); }
+        if round == 1 and optimize { C.optimize(pr.code); }
         for i in 0..nr { regs[i] = (i as i64) - 2 + (round as i64) * 7; }
         var ctx = new_ctx(p, regs, nr, frames, pr.code.start());
         ctx.heap.set_stress(stress);
@@ -642,6 +648,24 @@ fn run_prog(heap: *gc.Heap, p: *Prog, optimize: bool, stress: bool) -> Outcome u
         ctx.heap.free();
     }
     out.sig = h;
+    if DUMP {
+        io.println("final code:");
+        dump_code(pr.code.words());
+    }
+    var cw: u64 = 14695981039346656037;
+    let ws0 = pr.code.words();
+    // Instruction words through `real_word` (the JIT's enter words stand
+    // for them); inline cache words as they are.
+    var j: u64 = 0;
+    while j < ws0.len {
+        let w = C.real_word(ws0[j]);
+        cw = mix(cw, w as u64);
+        let n = C.base_size(w);
+        var q: u64 = 1;
+        while q < n and j + q < ws0.len { cw = mix(cw, ws0[j + q] as u64); q += 1; }
+        j += n;
+    }
+    out.words = cw;
     if !JIT {
         out.reverify = match C.verify(pr.code.words(), pr) { Ok(_) => true, Err(_) => false };
         C.deopt(pr.code);
@@ -704,6 +728,12 @@ fn one(heap: *gc.Heap, seed: u64, stress: bool, all: *u64, stats: *[u64; 4]) -> 
     let a = run_prog(heap, &p, false, stress);
     let b = run_prog(heap, &p, true, stress);
     *all = mix(mix(*all, a.sig), a.verified as u64);
+    *all = mix(mix(*all, a.words), b.words);
+    if DUMP or RESULTS {
+        show("  final code words ", a.words as i64);
+        show(" optimized ", b.words as i64);
+        io.println("");
+    }
     if !a.verified or !b.verified { return report(seed, "a generated program does not verify"); }
     stats[0] += 1;
     if a.result == BUDGET_EXHAUSTED { stats[1] += 1; }
