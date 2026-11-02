@@ -1,0 +1,296 @@
+// std.obj: shapes, transitions, overflow slots, dictionary mode,
+// prototype chains with validity cells, cache helpers, and weak
+// transitions after a collection.
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, proto: ?Gc<Obj>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+struct World { heap: gc.Heap, m: obj.Model<Gc<Obj>, Gc<Slots>, Value> }
+
+fn World.obj(w: *World, proto: ?Gc<Obj>, n: u32) -> Gc<Obj> {
+    new(&w.heap, Obj { shape: w.m.root_for(proto, n), dict: None, overflow: None, proto: proto }, n as u64)
+}
+
+fn int(v: ?Value) -> i64 {
+    match v {
+        Some(Int(i)) => i as i64,
+        Some(Nil) => -1,
+        None => -2,
+        _ => -3,
+    }
+}
+
+fn show(label: str, x: i64) { io.print(label); io.print(" "); io.print_int(x); io.println(""); }
+fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); io.println(""); }
+
+const X: u64 = 1;
+const Y: u64 = 2;
+const Z: u64 = 3;
+const METHOD: u64 = 100;
+
+fn shapes(w: *World) {
+    let a = w.obj(None, 2);
+    let b = w.obj(None, 2);
+    let c = w.obj(None, 2);
+    w.m.set(a, X, Value.Int(1));
+    w.m.set(a, Y, Value.Int(2));
+    w.m.set(b, X, Value.Int(10));
+    w.m.set(b, Y, Value.Int(20));
+    w.m.set(c, Y, Value.Int(200));
+    w.m.set(c, X, Value.Int(100));
+    yes("same order shares a shape", a.shape.id == b.shape.id);
+    yes("other order differs", a.shape.id != c.shape.id);
+    show("a.y", int(w.m.get(a, Y)));
+    show("c.x", int(w.m.get(c, X)));
+    show("missing", int(w.m.get(a, Z)));
+    // Overflow: two inline slots, then out of line.
+    for k in 10..20 { w.m.set(a, k as u64, Value.Int(k as i32)); }
+    show("a.15", int(w.m.get(a, 15)));
+    show("len", w.m.len(a) as i64);
+    yes("slot 1 inline", obj.slot_ref(1, 2) == 1);
+    yes("slot 2 out of line", obj.slot_ref(2, 2) == (0 | obj.OUT));
+    // Overwrite keeps the shape.
+    let sid = a.shape.id;
+    w.m.set(a, 15, Value.Int(-15));
+    yes("overwrite keeps shape", a.shape.id == sid);
+    show("a.15", int(w.m.get(a, 15)));
+    // Deleting the last property steps back to the parent shape.
+    let before = b.shape.id;
+    w.m.set(b, Z, Value.Int(30));
+    yes("delete last", w.m.delete(b, Z));
+    yes("back to parent", b.shape.id == before);
+    yes("delete absent", !w.m.delete(b, Z));
+    // Deleting another property switches to dictionary mode.
+    yes("delete x", w.m.delete(a, X));
+    yes("dict", w.m.is_dict(a));
+    show("a.x", int(w.m.get(a, X)));
+    show("a.y", int(w.m.get(a, Y)));
+    show("a.19", int(w.m.get(a, 19)));
+    for k in 20..60 { w.m.set(a, k as u64, Value.Int(k as i32)); }
+    for k in 20..50 { w.m.delete(a, k as u64); }
+    w.m.set(a, X, Value.Int(7));
+    show("len", w.m.len(a) as i64);
+    var keys: mem.Vec<u64> = mem.Vec.new();
+    w.m.keys(a, &keys);
+    io.print("keys");
+    for i in 0..keys.len { io.print(" "); io.print_int(keys.at(i) as i64); }
+    io.println("");
+    // Back to a fast object: keys and values survive, in order.
+    w.m.optimize(a);
+    yes("fast again", !w.m.is_dict(a));
+    var sum: i64 = 0;
+    for i in 0..keys.len { sum += int(w.m.get(a, keys.at(i))); }
+    show("sum", sum);
+    var keys2: mem.Vec<u64> = mem.Vec.new();
+    w.m.keys(a, &keys2);
+    var same = keys.len == keys2.len;
+    for i in 0..keys.len { if keys.at(i) != keys2.at(i) { same = false; } }
+    yes("same keys", same);
+    keys.free();
+    keys2.free();
+    // The threshold: many properties go to dictionary mode.
+    let big = w.obj(None, 4);
+    for k in 0..100 { w.m.set(big, k as u64, Value.Int(k as i32 * 2)); }
+    yes("big is dict", w.m.is_dict(big));
+    show("big.99", int(w.m.get(big, 99)));
+    // Long fast chains use a lookup table.
+    let long = w.obj(None, 4);
+    for k in 0..40 { w.m.set(long, (1000 + k) as u64, Value.Int(k as i32)); }
+    yes("long is fast", !w.m.is_dict(long));
+    show("long.1033", int(w.m.get(long, 1033)));
+    show("long.999", int(w.m.get(long, 999)));
+}
+
+fn caches(w: *World) {
+    let a = w.obj(None, 1);
+    w.m.set(a, X, Value.Int(1));
+    w.m.set(a, Y, Value.Int(2));
+    let b = w.obj(None, 1);
+    w.m.set(b, X, Value.Int(3));
+    w.m.set(b, Y, Value.Int(4));
+    // Monomorphic: fill from a, hit on b.
+    var cs: u32 = obj.EMPTY_ID;
+    var cr: u32 = 0;
+    show("fill", int(w.m.get_fill(a, Y, &cs, &cr)));
+    yes("out of line", cr & obj.OUT != 0);
+    yes("hit", b.shape.id == cs);
+    show("hit value", int(Some(w.m.load_ref(b, cr))));
+    w.m.set_fill(b, Y, Value.Int(44), &cs, &cr);
+    w.m.store_ref(b, cr, Value.Int(45));
+    show("stored", int(w.m.get(b, Y)));
+    // A dictionary-mode object never fills the cache.
+    w.m.to_dict(b);
+    var ds: u32 = obj.EMPTY_ID;
+    var dr: u32 = 0;
+    show("dict get", int(w.m.get_fill(b, X, &ds, &dr)));
+    yes("not filled", ds == obj.EMPTY_ID and b.shape.id != cs);
+    // Polymorphic and megamorphic.
+    var p = obj.Poly.new();
+    yes("poly add", p.add(a.shape.id, cr));
+    yes("poly get", p.get(a.shape.id).is_some() and p.get(12345).is_none());
+    var mc = obj.MegaCache.new(256);
+    show("mega miss", int(w.m.get_mega(&mc, a, X)));
+    yes("mega filled", mc.get(a.shape.id, X).is_some());
+    show("mega hit", int(w.m.get_mega(&mc, a, X)));
+    mc.free();
+}
+
+fn protos(w: *World) {
+    let base = w.obj(None, 2);
+    w.m.set(base, METHOD, Value.Int(1));
+    let mid = w.obj(Some(base), 2);
+    w.m.set(mid, X, Value.Int(5));
+    let o1 = w.obj(Some(mid), 2);
+    let o2 = w.obj(Some(mid), 2);
+    w.m.set(o1, Y, Value.Int(1));
+    w.m.set(o2, Y, Value.Int(2));
+    let o3 = w.obj(Some(base), 2);
+    w.m.set(o3, Y, Value.Int(3));
+    yes("proto in shape", o1.shape.id == o2.shape.id and o1.shape.id != o3.shape.id);
+    show("chain", int(w.m.get_chain(o1, METHOD)));
+    match w.m.lookup(o1, X) {
+        Proto(h, _) => yes("found on mid", h == mid),
+        _ => io.println("wrong"),
+    }
+    var e: obj.ProtoEntry<Gc<Obj>> = obj.ProtoEntry.empty();
+    show("fill", int(w.m.get_proto_fill(o1, METHOD, &e)));
+    show("hit on o2", int(w.m.proto_hit(o2, &e)));
+    show("miss on o3", int(w.m.proto_hit(o3, &e)));
+    // Overwriting the value on the holder keeps the entry valid.
+    w.m.set(base, METHOD, Value.Int(2));
+    show("value change", int(w.m.proto_hit(o2, &e)));
+    // Shadowing on mid invalidates it.
+    w.m.set(mid, METHOD, Value.Int(3));
+    show("after shadowing", int(w.m.proto_hit(o2, &e)));
+    show("refill", int(w.m.get_proto_fill(o1, METHOD, &e)));
+    show("hit", int(w.m.proto_hit(o2, &e)));
+    // A change above the holder (a new key on base) invalidates too.
+    w.m.get_proto_fill(o1, X, &e);
+    show("hit x", int(w.m.proto_hit(o2, &e)));
+    w.m.set(base, Z, Value.Int(0));
+    show("after base change", int(w.m.proto_hit(o2, &e)));
+    // Changing a prototype moves the object to the new prototype's tree.
+    w.m.set_proto(o3, Some(mid));
+    yes("o3 now like o1", o3.shape.id == o1.shape.id);
+    show("o3.x", int(w.m.get_chain(o3, X)));
+    show("o3.y", int(w.m.get(o3, Y)));
+    // Templates learn the final size.
+    var t = obj.Template.new(0, 0);
+    let first = new(&w.heap, Obj { shape: w.m.template_root(&t), dict: None, overflow: None, proto: None }, t.inline as u64);
+    for k in 0..5 { w.m.set(first, k as u64, Value.Int(k as i32)); }
+    w.m.observe(&t, first);
+    show("template inline", t.inline as i64);
+}
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let keep = data as *mem.Vec<Gc<Obj>>;
+    for i in 0..keep.len { gc_mark(h, keep.at(i)); }
+}
+
+/// Shapes nobody uses are collected; their edges are cleared, and the
+/// tree is rebuilt on demand.
+fn weak(w: *World) uses gc {
+    var keep: mem.Vec<Gc<Obj>> = mem.Vec.new();
+    w.heap.add_scanner(&keep as *u8, scan);
+    let a = w.obj(None, 3);
+    keep.push(a);
+    w.m.set(a, X, Value.Int(1));
+    for i in 0..200 {
+        let t = w.obj(None, 3);
+        w.m.set(t, X, Value.Int(1));
+        w.m.set(t, (5000 + i) as u64, Value.Int(2));
+    }
+    let created = w.m.shapes.created;
+    gc.collect(&w.heap);
+    show("swept edges", w.m.shapes.swept as i64);
+    let b = w.obj(None, 3);
+    keep.push(b);
+    w.m.set(b, X, Value.Int(1));
+    yes("x shape kept", a.shape.id == b.shape.id);
+    w.m.set(b, 5000, Value.Int(2));
+    yes("new shape made", w.m.shapes.created == created + 1);
+    show("b", int(w.m.get(b, 5000)));
+    gc.collect(&w.heap);
+    show("a.x", int(w.m.get(a, X)));
+    keep.free();
+}
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), m: obj.Model.new(new_slots, Value.Nil) };
+
+    w.m.attach(&w.heap);
+    w.m.dict_threshold = 64;
+    shapes(&w);
+    caches(&w);
+    protos(&w);
+    weak(&w);
+}
+// expect: same order shares a shape true
+// expect: other order differs true
+// expect: a.y 2
+// expect: c.x 100
+// expect: missing -2
+// expect: a.15 15
+// expect: len 12
+// expect: slot 1 inline true
+// expect: slot 2 out of line true
+// expect: overwrite keeps shape true
+// expect: a.15 -15
+// expect: delete last true
+// expect: back to parent true
+// expect: delete absent true
+// expect: delete x true
+// expect: dict true
+// expect: a.x -2
+// expect: a.y 2
+// expect: a.19 19
+// expect: len 22
+// expect: keys 2 10 11 12 13 14 15 16 17 18 19 50 51 52 53 54 55 56 57 58 59 1
+// expect: fast again true
+// expect: sum 669
+// expect: same keys true
+// expect: big is dict true
+// expect: big.99 198
+// expect: long is fast true
+// expect: long.1033 33
+// expect: long.999 -2
+// expect: fill 2
+// expect: out of line true
+// expect: hit true
+// expect: hit value 4
+// expect: stored 45
+// expect: dict get 3
+// expect: not filled true
+// expect: poly add true
+// expect: poly get true
+// expect: mega miss 1
+// expect: mega filled true
+// expect: mega hit 1
+// expect: proto in shape true
+// expect: chain 1
+// expect: found on mid true
+// expect: fill 1
+// expect: hit on o2 1
+// expect: miss on o3 -2
+// expect: value change 2
+// expect: after shadowing -2
+// expect: refill 3
+// expect: hit 3
+// expect: hit x 5
+// expect: after base change -2
+// expect: o3 now like o1 true
+// expect: o3.x 5
+// expect: o3.y 3
+// expect: template inline 5
+// expect: swept edges 200
+// expect: x shape kept true
+// expect: new shape made true
+// expect: b 2
+// expect: a.x 1
