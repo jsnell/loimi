@@ -1,0 +1,8 @@
+trait Show { fn show(x: Self); }
+fn i64.show(x: i64) {}
+impl Show for i64;
+fn show<T: Show>(x: T) { x.show(); }
+fn main() {
+    show(1.5);
+}
+// error: `f64` does not implement `Show` (needed by `show<f64>`)

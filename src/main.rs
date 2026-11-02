@@ -1,4 +1,5 @@
 mod ast;
+mod traits;
 mod check;
 mod codegen;
 mod diag;

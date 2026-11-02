@@ -1,0 +1,5 @@
+trait Show { fn show(x: Self); fn name(x: Self) -> str; }
+fn i64.show(x: i64) {}
+impl Show for i64;
+fn main() {}
+// error: `i64` does not implement `Show`: no method `i64.name`

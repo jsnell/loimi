@@ -18,6 +18,7 @@ pub enum Def {
     Vm(u32),
     GenericType(u32),
     GenericFn(u32),
+    Trait(u32),
 }
 
 pub struct ConstInfo {
@@ -114,6 +115,7 @@ pub struct Checker<'a> {
     pub vm_decls: Vec<(usize, crate::vmast::VmDecl)>,
     pub dispatch_override: Option<Dispatch>,
     pub vms: Vec<crate::vmcheck::VmInfo>,
+    pub traits: crate::traits::Traits,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -183,6 +185,7 @@ impl<'a> Checker<'a> {
             dispatch_override: None,
             vms: vec![],
             generics: Default::default(),
+            traits: Default::default(),
             tenv: vec![],
             object_count: 0,
         }
@@ -215,6 +218,7 @@ impl<'a> Checker<'a> {
                             module: m,
                             name: s.name.name.clone(),
                             params: s.generics.iter().map(|g| g.name.clone()).collect(),
+                            bounds: s.bounds.clone(),
                             decl: crate::generics::GenDecl::Struct(s.clone()),
                         });
                         self.define(m, &s.name, Def::GenericType(id), s.is_pub)?;
@@ -225,6 +229,7 @@ impl<'a> Checker<'a> {
                             module: m,
                             name: e.name.name.clone(),
                             params: e.generics.iter().map(|g| g.name.clone()).collect(),
+                            bounds: e.bounds.clone(),
                             decl: crate::generics::GenDecl::Enum(e.clone()),
                         });
                         self.define(m, &e.name, Def::GenericType(id), e.is_pub)?;
@@ -299,6 +304,12 @@ impl<'a> Checker<'a> {
                         self.vm_decls.push((m, (**v).clone()));
                         self.define(m, &v.name, Def::Vm(id), v.is_pub)?;
                     }
+                    Item::Trait(t) => {
+                        let id = self.traits.decls.len() as u32;
+                        self.traits.decls.push((m, t.clone()));
+                        self.define(m, &t.name, Def::Trait(id), t.is_pub)?;
+                    }
+                    Item::Impl(i) => self.traits.impl_decls.push((m, i.clone())),
                     Item::Import(_) => {}
                 }
             }
@@ -333,6 +344,9 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // Impls are known before any type is resolved, so that generic
+        // instances created from here on can have their bounds checked.
+        self.register_impls()?;
         // Pass 3: type definitions.
         for (m, module) in self.modules.iter().enumerate() {
             for item in &module.items {
@@ -405,6 +419,7 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
             }
         }
+        self.check_impls()?;
         // Module-level `var`s: types and constant initializers.
         for i in 0..self.global_decls.len() {
             let (m, g) = self.global_decls[i].clone();

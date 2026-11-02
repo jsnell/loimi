@@ -1,0 +1,58 @@
+// Static traits: `impl` asserts that methods exist; bounds are checked
+// when a generic item is instantiated with concrete types.
+import std.io;
+import std.map;
+import std.hash;
+import std.hash.{Hash};
+
+struct Sym { id: u32 }
+fn Sym.hash(s: Sym) -> u64 { hash.mix(s.id as u64) }
+fn Sym.eq(a: Sym, b: Sym) -> bool { a.id == b.id }
+impl hash.Hash for Sym;
+
+trait Show {
+    fn show(x: Self);
+}
+fn i64.show(x: i64) { io.print_int(x); }
+fn Sym.show(s: Sym) { io.print("#"); io.print_int(s.id as i64); }
+impl Show for i64;
+impl Show for Sym;
+
+// A method with fewer effects than the trait allows.
+trait Visit {
+    fn visit(x: Self) -> i64 uses gc;
+}
+fn i64.visit(x: i64) -> i64 { x * 2 }
+impl Visit for i64;
+
+fn show_all<T: Show>(xs: []T) {
+    for i in 0..xs.len {
+        if i > 0 { io.print(" "); }
+        xs[i].show();
+    }
+    io.println("");
+}
+
+struct Pair<A: Show, B: Show + Hash> { a: A, b: B }
+fn Pair<A: Show, B: Show + Hash>.show(p: *Pair<A, B>) { p.a.show(); io.print(", "); p.b.show(); io.println(""); }
+
+fn twice<T: Visit>(x: T) -> i64 uses gc { x.visit() + x.visit() }
+
+fn main() uses gc {
+    var m: map.HashMap<Sym, i64> = map.HashMap.new();
+    m.insert(Sym { id: 7 }, 70);
+    m.insert(Sym { id: 9 }, 90);
+    io.print_int(m.get(Sym { id: 9 }) ?? -1); io.println("");
+    var xs: [i64; 3] = [1, 2, 3];
+    show_all(xs[..]);
+    var ss: [Sym; 2] = [Sym { id: 1 }, Sym { id: 2 }];
+    show_all<Sym>(ss[..]);
+    var p = Pair { a: 5, b: Sym { id: 3 } };
+    p.show();
+    io.print_int(twice(21)); io.println("");
+}
+// expect: 90
+// expect: 1 2 3
+// expect: #1 #2
+// expect: 5, #3
+// expect: 84

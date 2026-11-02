@@ -18,6 +18,7 @@ pub struct GenericType {
     pub module: usize,
     pub name: String,
     pub params: Vec<String>,
+    pub bounds: Vec<Bounds>,
     pub decl: GenDecl,
 }
 
@@ -75,6 +76,16 @@ impl<'a> Checker<'a> {
             return Ok(t.clone());
         }
         let module = gt.module;
+        let bounds = gt.bounds.clone();
+        let gname = gt.name.clone();
+        self.check_bounds(
+            module,
+            &bounds,
+            &args,
+            || format!("{}<{}>", gname, args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ")),
+            span,
+        )?;
+        let gt = &self.generics.types[g as usize];
         let pattern = args.iter().any(|a| contains_param(a, &self.generics));
         let name = format!(
             "{}.{}<{}>",
@@ -128,9 +139,6 @@ impl<'a> Checker<'a> {
         let module = gf.module;
         let decl = gf.decl.clone();
         let env: Vec<(String, Ty)> = gf.params.iter().cloned().zip(args.iter().cloned()).collect();
-        let id = self.prog.fns.len() as FnId;
-        self.prog.fns.push(crate::check::placeholder_fn(span));
-        self.generics.fn_inst.insert((g, args.clone()), id);
         let targs = args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ");
         let base = match &decl.recv {
             Some(r) => {
@@ -148,6 +156,10 @@ impl<'a> Checker<'a> {
             }
             None => format!("{}<{}>", decl.name.name, targs),
         };
+        self.check_bounds(module, &decl.bounds, &args, || base.clone(), span)?;
+        let id = self.prog.fns.len() as FnId;
+        self.prog.fns.push(crate::check::placeholder_fn(span));
+        self.generics.fn_inst.insert((g, args.clone()), id);
         let symbol = format!("{}.{}", self.module_prefix(module), base);
         self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)))?;
         self.prog.fns[id as usize].name = base;
