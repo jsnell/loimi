@@ -227,9 +227,9 @@ pub vm Mini {
 
     family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
         generic {
-            if let Some(i) = value.table_find(ctx.globals, name) and let Some(hs) = ctx.globals.hash {
+            if let Some(i) = value.table_find(ctx.globals, name) {
                 cache.slot = i as u32;
-                dst = hs.data.ptr[2 * i + 1];
+                dst = ctx.globals.hptr[2 * i + 1];
                 become GETGLOBAL_C;
                 next
             }
@@ -239,8 +239,8 @@ pub vm Mini {
         GETGLOBAL_C {
             let g = ctx.globals;
             let i = cache.slot as u64;
-            if likely(i < g.hcap) and let Some(hs) = g.hash {
-                let slots = hs.data.ptr;
+            if likely(i < g.hcap) {
+                let slots = g.hptr;
                 if slots[2 * i] == name {
                     dst = slots[2 * i + 1];
                     next
@@ -311,7 +311,7 @@ pub vm Mini {
     op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
         if let (T(tab), Int(i)) = (t, key) {
             let u = ((i as i64) - 1) as u64;
-            if u < tab.asize { dst = tab.arr.data.ptr[u]; next }
+            if u < tab.asize { dst = tab.aptr[u]; next }
         }
         if let T(tab) = t { dst = value.table_get(tab, key); next }
         cold { raise error(ctx, "attempt to index a ", t) }
@@ -319,7 +319,7 @@ pub vm Mini {
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
         if let (T(tab), Int(i)) = (t, key) {
             let u = ((i as i64) - 1) as u64;
-            if u < tab.asize { tab.arr.data.ptr[u] = v; next }
+            if u < tab.asize { tab.aptr[u] = v; next }
         }
         if let T(tab) = t {
             if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
@@ -393,7 +393,7 @@ pub vm Mini {
     op LEN(dst: reg, a: reg) : ABC {
         if let T(t) = a {
             let n = t.asize;
-            if n > 0 and t.arr.data.ptr[n - 1] != V.Nil { dst = Int(n as i32); next }
+            if n > 0 and t.aptr[n - 1] != V.Nil { dst = Int(n as i32); next }
         }
         dst = length(ctx, a)?;
         next
@@ -512,7 +512,7 @@ pub vm Mini {
     op INEXT(a: forbase, target: label) : AsBx {
         if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
             let u = i as u64;
-            let v = if u < t.asize { t.arr.data.ptr[u] } else { value.table_get(t, Int(i + 1)) };
+            let v = if u < t.asize { t.aptr[u] } else { value.table_get(t, Int(i + 1)) };
             if v == V.Nil { next }
             regs[a + 1] = Int(i + 1);
             regs[a + 2] = Int(i + 1);

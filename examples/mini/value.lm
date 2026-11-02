@@ -10,12 +10,27 @@ extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
 pub object Str { hash: u64, data: [u8] }
 pub object Arr { data: [V] }
-/// A table: an array part holding keys 1..asize (`arr`, whose length is
-/// the capacity), and an open-addressing hash part allocated on demand.
-/// Hash slots hold key/value pairs; a Nil key is an empty slot, and a key
-/// with a Nil value is a tombstone (dropped on rehash).
-/// Invariant: the hash part holds no non-nil value for keys 1..asize+1.
-pub object Table { asize: u64, arr: Gc<Arr>, hcap: u64, hused: u64, hash: ?Gc<Arr>, border: u64 }
+/// A table: an array part holding keys 1..asize, and an open-addressing
+/// hash part allocated on demand. The array part starts in the table's own
+/// trailing storage (`inl`, sized by the constructor) and moves to a
+/// separate `arr` when it grows; `aptr` points at whichever is in use and
+/// `acap` is its capacity. Likewise `hptr` points into `hash` (or is null
+/// when `hcap` is 0). Hash slots hold key/value pairs; a Nil key is an
+/// empty slot, and a key with a Nil value is a tombstone (dropped on
+/// rehash). Invariant: the hash part holds no non-nil value for keys
+/// 1..asize+1.
+pub object Table {
+    asize: u64,
+    acap: u64,
+    aptr: *V,
+    hcap: u64,
+    hptr: *V,
+    hused: u64,
+    border: u64,
+    arr: ?Gc<Arr>,
+    hash: ?Gc<Arr>,
+    inl: [V],
+}
 /// Source line of each instruction.
 pub object Lines { data: [u32] }
 /// Upvalue descriptors: bit 8 set means "register `low byte` of the
@@ -73,12 +88,16 @@ pub fn new_table(h: *gc.Heap) -> Gc<Table> {
 
 /// A table with room for `narr` array items and `nhash` hash entries.
 pub fn new_table_sized(h: *gc.Heap, narr: u64, nhash: u64) -> Gc<Table> {
-    let t = new(h, Table { asize: 0, arr: new_arr(h, narr), hcap: 0, hused: 0, hash: None, border: 0 });
+    let t = new(h, Table { asize: 0, acap: narr, aptr: 0 as *V, hcap: 0, hptr: 0 as *V, hused: 0, border: 0, arr: None, hash: None }, narr);
+    t.aptr = t.inl.ptr;
+    for i in 0..narr { t.aptr[i] = V.Nil; }
     if nhash > 0 {
         var cap: u64 = 4;
         while nhash * 4 > cap * 3 { cap *= 2; }
+        let hs = new_arr(h, cap * 2);
         t.hcap = cap;
-        t.hash = Some(new_arr(h, cap * 2));
+        t.hash = Some(hs);
+        t.hptr = hs.data.ptr;
     }
     t
 }
@@ -143,8 +162,8 @@ fn key_eq(a: V, b: V) -> bool {
 
 /// Index of the hash slot holding (normalized) key `k`, if present.
 fn hash_find(t: Gc<Table>, k: V) -> ?u64 {
-    let Some(hs) = t.hash else { return None; };
-    let slots = hs.data.ptr;
+    if t.hcap == 0 { return None; }
+    let slots = t.hptr;
     let mask = t.hcap - 1;
     var i = key_hash(k) & mask;
     loop {
@@ -155,29 +174,33 @@ fn hash_find(t: Gc<Table>, k: V) -> ?u64 {
     }
 }
 
+/// Lookup in the hash part only (`k` normalized).
+pub fn hash_get(t: Gc<Table>, k: V) -> V {
+    let Some(i) = hash_find(t, k) else { return V.Nil; };
+    t.hptr[2 * i + 1]
+}
+
 pub fn table_get(t: Gc<Table>, k: V) -> V {
     var k = k;
     match k {
         Int(i) => {
             let u = ((i as i64) - 1) as u64;
-            if u < t.asize { return t.arr.data.ptr[u]; }
+            if u < t.asize { return t.aptr[u]; }
         }
         Num(x) => {
             if int_float(x) {
                 k = V.Int(x as i32);
                 let u = ((x as i64) - 1) as u64;
-                if u < t.asize { return t.arr.data.ptr[u]; }
+                if u < t.asize { return t.aptr[u]; }
             }
         }
         _ => {}
     }
-    let Some(i) = hash_find(t, k) else { return V.Nil; };
-    let Some(hs) = t.hash else { return V.Nil; };
-    hs.data.ptr[2 * i + 1]
+    hash_get(t, k)
 }
 
 /// Index of the hash slot holding key `k`, if present (for inline caches;
-/// the slot's key and value are `t.hash.data[2 * i]` and `[2 * i + 1]`).
+/// the slot's key and value are `t.hptr[2 * i]` and `[2 * i + 1]`).
 pub fn table_find(t: Gc<Table>, k: V) -> ?u64 {
     hash_find(t, norm_key(k))
 }
@@ -186,31 +209,30 @@ pub fn table_find(t: Gc<Table>, k: V) -> ?u64 {
 /// dropping tombstones.
 fn rehash(h: *gc.Heap, t: Gc<Table>) {
     var live: u64 = 0;
-    let old = t.hash;
+    let old = t.hptr;
     let n = t.hcap;
-    if let Some(hs) = old {
-        for i in 0..n {
-            if hs.data.ptr[2 * i] != V.Nil and hs.data.ptr[2 * i + 1] != V.Nil { live += 1; }
-        }
+    for i in 0..n {
+        if old[2 * i] != V.Nil and old[2 * i + 1] != V.Nil { live += 1; }
     }
     var cap: u64 = 4;
     while (live + 1) * 4 > cap * 3 { cap *= 2; }
+    // `old` stays alive: it is only dropped from `t.hash` below, and
+    // nothing here collects.
+    let hs = new_arr(h, cap * 2);
     t.hcap = cap;
     t.hused = 0;
-    t.hash = Some(new_arr(h, cap * 2));
-    if let Some(hs) = old {
-        for i in 0..n {
-            let key = hs.data.ptr[2 * i];
-            let v = hs.data.ptr[2 * i + 1];
-            if key != V.Nil and v != V.Nil { hash_insert_new(t, key, v); }
-        }
+    t.hptr = hs.data.ptr;
+    t.hash = Some(hs);
+    for i in 0..n {
+        let key = old[2 * i];
+        let v = old[2 * i + 1];
+        if key != V.Nil and v != V.Nil { hash_insert_new(t, key, v); }
     }
 }
 
 /// Insert a key known to be absent; there must be a free slot.
 fn hash_insert_new(t: Gc<Table>, k: V, v: V) {
-    let Some(hs) = t.hash else { return; };
-    let slots = hs.data.ptr;
+    let slots = t.hptr;
     let mask = t.hcap - 1;
     var i = key_hash(k) & mask;
     while slots[2 * i] != V.Nil { i = (i + 1) & mask; }
@@ -223,7 +245,7 @@ fn hash_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     // An existing key (or tombstone) is overwritten in place: no rehash,
     // so assigning to existing fields during traversal is safe.
     if let Some(i) = hash_find(t, k) {
-        if let Some(hs) = t.hash { hs.data.ptr[2 * i + 1] = v; }
+        t.hptr[2 * i + 1] = v;
         return;
     }
     if v == V.Nil { return; }
@@ -231,27 +253,31 @@ fn hash_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     hash_insert_new(t, k, v);
 }
 
+/// Make room for `n` array items, moving the array part to a new `arr`.
+fn array_grow(h: *gc.Heap, t: Gc<Table>, n: u64) {
+    let na = new(h, Arr {}, n);
+    let p = na.data.ptr;
+    for i in 0..t.asize { p[i] = t.aptr[i]; }
+    for i in t.asize..n { p[i] = V.Nil; }
+    t.arr = Some(na);
+    t.aptr = p;
+    t.acap = n;
+}
+
 /// Append at asize+1, then move the following integer keys over from the hash.
 fn array_append(h: *gc.Heap, t: Gc<Table>, v: V) {
     var v = v;
     loop {
-        let cap = t.arr.data.len;
-        if t.asize == cap {
-            let ncap = if cap < 4 { 4 } else { cap * 2 };
-            let na = new(h, Arr {}, ncap);
-            for i in 0..t.asize { na.data.ptr[i] = t.arr.data.ptr[i]; }
-            for i in t.asize..ncap { na.data.ptr[i] = V.Nil; }
-            t.arr = na;
-        }
-        t.arr.data.ptr[t.asize] = v;
+        let cap = t.acap;
+        if t.asize == cap { array_grow(h, t, if cap < 4 { 4 } else { cap * 2 }); }
+        t.aptr[t.asize] = v;
         t.asize += 1;
         if t.hused == 0 { return; }
         let next = V.Int((t.asize + 1) as i32);
         let Some(i) = hash_find(t, next) else { return; };
-        let Some(hs) = t.hash else { return; };
-        v = hs.data.ptr[2 * i + 1];
+        v = t.hptr[2 * i + 1];
         if v == V.Nil { return; }
-        hs.data.ptr[2 * i + 1] = V.Nil;
+        t.hptr[2 * i + 1] = V.Nil;
     }
 }
 
@@ -260,7 +286,7 @@ pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     let k = norm_key(k);
     if let Int(i) = k {
         let u = ((i as i64) - 1) as u64;
-        if u < t.asize { t.arr.data.ptr[u] = v; return; }
+        if u < t.asize { t.aptr[u] = v; return; }
         if u == t.asize and v != V.Nil { array_append(h, t, v); return; }
     }
     hash_set(h, t, k, v);
@@ -268,18 +294,13 @@ pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
 
 /// Store `n` positional constructor items `vals[0..n]` at keys start+1...
 pub fn table_setlist(h: *gc.Heap, t: Gc<Table>, vals: *V, n: u64, start: u64) {
-    if t.hash.is_some() or t.asize < start {
+    if t.hcap > 0 or t.asize < start {
         for i in 0..n { table_set(h, t, V.Int((start + i + 1) as i32), vals[i]); }
         return;
     }
     let end = start + n;
-    if end > t.arr.data.len {
-        let na = new(h, Arr {}, end);
-        for i in 0..t.asize { na.data.ptr[i] = t.arr.data.ptr[i]; }
-        for i in t.asize..end { na.data.ptr[i] = V.Nil; }
-        t.arr = na;
-    }
-    for i in 0..n { t.arr.data.ptr[start + i] = vals[i]; }
+    if end > t.acap { array_grow(h, t, end); }
+    for i in 0..n { t.aptr[start + i] = vals[i]; }
     if end > t.asize { t.asize = end; }
 }
 
@@ -287,7 +308,7 @@ pub fn table_setlist(h: *gc.Heap, t: Gc<Table>, vals: *V, n: u64, start: u64) {
 pub fn table_len(t: Gc<Table>) -> i64 {
     let n = t.asize;
     if n == 0 { return 0; }
-    let a = t.arr.data.ptr;
+    let a = t.aptr;
     // The hash never holds asize+1, so a full array part is a border.
     if a[n - 1] != V.Nil { return n as i64; }
     // Try the cached border and its neighbours (push/pop patterns).
@@ -318,7 +339,7 @@ pub fn table_len(t: Gc<Table>) -> i64 {
 /// returns the position after it, or 0 at the end.
 pub fn table_iter(t: Gc<Table>, i: u64, out: *V) -> u64 {
     var i = i;
-    let a = t.arr.data.ptr;
+    let a = t.aptr;
     while i < t.asize {
         let v = a[i];
         i += 1;
@@ -328,8 +349,7 @@ pub fn table_iter(t: Gc<Table>, i: u64, out: *V) -> u64 {
             return i;
         }
     }
-    let Some(hs) = t.hash else { return 0; };
-    let slots = hs.data.ptr;
+    let slots = t.hptr;
     var j = i - t.asize;
     while j < t.hcap {
         let key = slots[2 * j];
