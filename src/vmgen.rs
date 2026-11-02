@@ -148,10 +148,12 @@ pub fn handler_prologue(g: &mut FnGen) {
     if takes_insn(p, f) {
         let wt = Ty::Int(vd.word);
         let slot = g.alloca(&wt);
-        g.store(&wt, "%insn", &slot);
+        // A stencil's instruction word is a hole, patched with the word.
+        let insn = if g.stencil.is_some() { crate::jitgen::word_hole(g, 0) } else { "%insn".to_string() };
+        g.store(&wt, &insn, &slot);
         hg.insn_slot = Some(slot);
     }
-    if let (VmRole::Handler(k), None) = (f.vm_role, &g.cold) {
+    if let (VmRole::Handler(k), None, None) = (f.vm_role, &g.cold, &g.stencil) {
         if !combined {
             count_op(g, k);
         }
@@ -346,6 +348,11 @@ fn state_args(g: &mut FnGen, vd: &VmDef) -> String {
     args.join(", ")
 }
 
+/// Tail-call `callee` (a handler-like function) with the current state.
+pub fn tail_call(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
+    tail_to(g, vd, callee, insn)
+}
+
 /// Transfer control to `target` (already stored in the pc slot).
 fn tail_to(g: &mut FnGen, vd: &VmDef, callee: &str, insn: &str) {
     let hg = g.vm.clone().unwrap();
@@ -438,7 +445,13 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
         }
         TVm::Jump(t) => {
             let tv = g.val(t);
-            dispatch(g, &tv);
+            if g.cg.opts.jit && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
+                let pc_local = g.f().vm_state[g.p().vms[g.vm.as_ref().unwrap().vm as usize].pc_idx];
+                let kind = crate::jitgen::jump_kind(t, pc_local);
+                jit_dispatch(g, &tv, kind);
+            } else {
+                dispatch(g, &tv);
+            }
             g.poison(&e.ty)
         }
         TVm::Exit(x) => {
@@ -481,6 +494,11 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let vd = &p.vms[hg.vm as usize];
             let wt = format!("i{}", vd.word.bits);
             let mut pc = g.inst(format!("load ptr, ptr {}", hg.state_slots[vd.pc_idx]));
+            if g.cg.opts.jit && !hg.combined {
+                // The JIT may have replaced words of this code: it restores
+                // them (and drops the compiled code) before the rewrite.
+                g.emit(format!("call void @loimi_jit_become(ptr {})", pc));
+            }
             if *back > 0 {
                 pc = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 -{}", wt, pc, back));
             }
@@ -613,9 +631,23 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     let p = g.p();
     let f = g.f();
     let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
-    let n = g.cg.cold_count;
-    g.cg.cold_count += 1;
-    let sym = format!("{}.cold{}", f.symbol, n);
+    // A stencil calls the interpreter handler's own cold functions.
+    let stencil_sym = g.stencil.as_mut().map(|st| {
+        st.cold_next += 1;
+        st.cold_syms.get(st.cold_next - 1).cloned().expect("stencil: cold blocks differ from the handler's")
+    });
+    let sym = match &stencil_sym {
+        Some(s) => s.clone(),
+        None => {
+            let n = g.cg.cold_count;
+            g.cg.cold_count += 1;
+            let sym = format!("{}.cold{}", f.symbol, n);
+            if g.cg.opts.jit {
+                g.cg.cold_syms.entry(g.fid).or_default().push(sym.clone());
+            }
+            sym
+        }
+    };
     let mut used = Vec::new();
     let mut declared = Vec::new();
     crate::tirwalk::locals(b, &mut used, &mut declared);
@@ -633,14 +665,71 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     for &l in &captured {
         let t = f.locals[l as usize].ty.clone();
         let gname = format!("@\"{}.c{}\"", sym, l);
-        let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", gname, llty(p, &t));
+        if stencil_sym.is_none() {
+            let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", gname, llty(p, &t));
+        }
         let slot = g.slots[l as usize].clone();
         let v = g.load(&t, &slot);
         g.store(&t, &v, &gname);
     }
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
-    g.cg.cold_queue.push((g.fid, body, captured, sym));
+    if stencil_sym.is_none() {
+        g.cg.cold_queue.push((g.fid, body, captured, sym));
+    }
+}
+
+/// `jump` in a JIT build. In the interpreter: hot counting (on backward
+/// label jumps, and on every call and return), then dispatch. In a
+/// stencil: a direct jump to the compiled code of a target known from pc
+/// and the operands, else hot counting and the interpreter's dispatch.
+fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
+    use crate::jitgen::JumpKind;
+    let hg = g.vm.clone().unwrap();
+    let p = g.p();
+    let vd = &p.vms[hg.vm as usize];
+    if g.stencil.is_none() || hg.outlined {
+        match kind {
+            JumpKind::Const(_) => {}
+            JumpKind::PcRel => crate::jitgen::hot_count(g, vd, target, true),
+            JumpKind::Dynamic => crate::jitgen::hot_count(g, vd, target, false),
+        }
+        dispatch(g, target);
+        return;
+    }
+    let pc0 = format!("%p{}", vd.pc_idx);
+    let cont = |g: &mut FnGen, name: String| {
+        g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+        let rt = handler_ret_llty(g.p(), vd);
+        let mut ps: Vec<String> = vd.state_tys.iter().map(|t| llty(g.p(), t)).collect();
+        ps.push(format!("i{}", vd.word.bits));
+        g.cg.jit_conts.insert(name.clone(), format!("declare preserve_nonecc {} @\"{}\"({})", rt, name, ps.join(", ")));
+        // Stencils ignore the word register.
+        tail_to(g, vd, &format!("@\"{}\"", name), "poison");
+    };
+    match kind {
+        JumpKind::Const(d) => cont(g, format!("__jit.n.{}", d)),
+        JumpKind::PcRel => {
+            let labels = g.stencil.as_ref().unwrap().labels.clone();
+            for (off, shift, bits) in labels {
+                let raw = crate::jitgen::field_hole(g, off, shift, bits, true);
+                let base = if off == 0 { pc0.clone() } else { g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, pc0, off)) };
+                let cand = g.inst(format!("getelementptr inbounds i{}, ptr {}, i64 {}", vd.word.bits, base, raw));
+                let eq = g.inst(format!("icmp eq ptr {}, {}", target, cand));
+                let yes = g.fresh_label("direct");
+                let no = g.fresh_label("notdirect");
+                g.cond_br(&eq, &yes, &no);
+                g.label(&yes);
+                cont(g, format!("__jit.j.{}.{}.{}", off, shift, bits));
+                g.label(&no);
+            }
+            dispatch(g, target);
+        }
+        JumpKind::Dynamic => {
+            crate::jitgen::hot_count(g, vd, target, false);
+            dispatch(g, target);
+        }
+    }
 }
 
 /// The handler's operand-field decodes: `let raw = <bits of word 0>;` at
@@ -850,21 +939,24 @@ fn part_label(g: &mut FnGen, j: u32) -> String {
 
 /// Module-level definitions for tail-call vms: dispatch table, invalid-op
 /// handler, raise slot.
-pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
+pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String, jit: bool) {
+    let jit_vm = if jit { crate::jitgen::jit_vm(p).ok() } else { None };
     // Calls to this mark a block as cold. The empty asm keeps the call from
     // being deleted; preserve_all keeps it from clobbering any register.
     let _ = writeln!(
         fns,
         "define internal preserve_allcc void @loimi.cold() cold noinline nounwind {{\n  call void asm sideeffect \"\", \"\"()\n  ret void\n}}\n"
     );
-    for vd in &p.vms {
+    for (vi, vd) in p.vms.iter().enumerate() {
         if vd.dispatch == Dispatch::TailCall {
             let n = 1usize << vd.op_bits;
             let inv = format!("@\"{}.invalid\"", vd.symbol);
+            let enter = if jit_vm == Some(vi) { Some(crate::jitgen::enter_opcode(vd) as usize) } else { None };
             let mut entries = Vec::new();
             for i in 0..n {
                 match vd.ops.iter().find(|o| o.opcode as usize == i) {
                     Some(o) => entries.push(format!("ptr @\"{}\"", p.fns[o.fid as usize].symbol)),
+                    None if enter == Some(i) => entries.push(format!("ptr @\"{}.jit_enter\"", vd.symbol)),
                     None => entries.push(format!("ptr {}", inv)),
                 }
             }

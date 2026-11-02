@@ -410,6 +410,8 @@ pub struct VmOp {
     /// Words occupied (instruction + inline cache; sum of parts for supers).
     pub size: u32,
     pub parts: Vec<u32>,
+    /// Declared `then OP`: the word after it is read as part of it.
+    pub then: bool,
 }
 
 #[derive(Clone, Debug)]

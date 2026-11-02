@@ -4,9 +4,11 @@ mod check;
 mod closures;
 mod codegen;
 mod diag;
+mod elf;
 mod gcgen;
 mod generics;
 mod header;
+mod jitgen;
 mod layout;
 mod lexer;
 mod parser;
@@ -47,6 +49,9 @@ struct Opts {
     /// `--tls=`: the TLS model for runtime thread-locals (default:
     /// initial-exec, local-dynamic for `--shared`).
     tls: Option<Tls>,
+    /// `--jit-stencils`: build the copy-and-patch JIT prototype in
+    /// (docs/design/copy-and-patch.md); `LOIMI_JIT=1` turns it on at run time.
+    jit: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,7 +73,7 @@ enum Tls {
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address] [-W error | --deny-warnings]
-                  [--lib | --shared] [--header out.h] [--tls=initial-exec|local-dynamic|global-dynamic]
+                  [--lib | --shared] [--header out.h] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
        loimi run <file.lm> [--release] [--dispatch=...] [-- args...]";
 
 fn std_root() -> PathBuf {
@@ -121,8 +126,16 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>)
     Ok(modules)
 }
 
+/// What the JIT build needs besides the program's IR: the stencil
+/// functions, and the ops (opcode, name) and opcode count of the vm.
+struct JitParts {
+    stencils: String,
+    ops: Vec<(u32, String)>,
+    nops: u32,
+}
+
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>), Diag> {
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     let mut modules = load(sm, input, &mut allows)?;
@@ -131,7 +144,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>), 
             return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
         }
     }
-    vmexpand::expand(sm, &mut modules)?;
+    vmexpand::expand(sm, &mut modules, opts.jit)?;
     let mut c = check::Checker::new(&modules);
     c.dispatch_override = opts.dispatch;
     c.run()?;
@@ -172,12 +185,20 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>), 
             "no `main` function (build a library with --lib or --shared)",
         ));
     }
+    let jit = if opts.jit {
+        let vi = jitgen::jit_vm(&prog).map_err(|e| Diag::new(Span { file: u32::MAX, lo: 0, hi: 0 }, e))?;
+        let vd = &prog.vms[vi];
+        Some((vd.ops.iter().map(|o| (o.opcode, o.name.clone())).collect::<Vec<_>>(), 1u32 << vd.op_bits))
+    } else {
+        None
+    };
     let cg = codegen::Codegen::new(
         &prog,
         sm,
-        codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats, library },
+        codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats, library, jit: opts.jit },
     );
-    let mut ir = cg.generate();
+    let (mut ir, stencils) = cg.generate_with_stencils();
+    let jit = jit.map(|(ops, nops)| JitParts { stencils, ops, nops });
     // Runtime thread-locals are emitted initial-exec: one offset from the
     // thread pointer, fixed at load time. A shared object that may be
     // dlopen'ed cannot rely on static TLS space, so it uses a dynamic
@@ -188,7 +209,51 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>), 
         Tls::LocalDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local(localdynamic)"),
         Tls::GeneralDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local"),
     }
-    Ok((if opts.sanitize_address { sanitize_address(&ir) } else { ir }, header))
+    Ok((if opts.sanitize_address { sanitize_address(&ir) } else { ir }, header, jit))
+}
+
+/// `--jit-stencils`: compile the stencils to an object file, read them
+/// back, and append them to the program's IR as data. Returns the C
+/// runtime's path.
+fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, stem: &str) -> Result<PathBuf, String> {
+    let t0 = std::time::Instant::now();
+    let sll = tmpdir.join(format!("{}.stencils.ll", stem));
+    let so = tmpdir.join(format!("{}.stencils.o", stem));
+    std::fs::write(&sll, jitgen::stencil_module(ir, &jit.stencils)).map_err(|e| e.to_string())?;
+    let st = Command::new(clang)
+        .args(["-O3", "-Wno-override-module", "-fno-pic", "-ffunction-sections", "-fdata-sections", "-fno-asynchronous-unwind-tables", "-c", "-x", "ir"])
+        .arg(&sll)
+        .arg("-o")
+        .arg(&so)
+        .status()
+        .map_err(|e| format!("cannot run {}: {}", clang, e))?;
+    if !st.success() {
+        return Err(format!("{} failed on the stencil module (kept at {})", clang, sll.display()));
+    }
+    let obj = std::fs::read(&so).map_err(|e| e.to_string())?;
+    let t = elf::stencil_tables(obj, &jit.ops, jit.nops, ir)?;
+    ir.push_str(&t.ir);
+    if std::env::var_os("LOIMI_JIT_REPORT").is_some() {
+        eprintln!(
+            "jit-stencils: {} stencils, {} bytes of code, built in {:.2} s",
+            t.count,
+            t.bytes,
+            t0.elapsed().as_secs_f64()
+        );
+        for (op, why) in &t.rejected {
+            eprintln!("  no stencil for {}: {}", op, why);
+        }
+    }
+    // LOIMI_KEEP_STENCILS=dir: keep the stencil module and object there.
+    if let Some(d) = std::env::var_os("LOIMI_KEEP_STENCILS") {
+        let _ = std::fs::copy(&sll, Path::new(&d).join(format!("{}.stencils.ll", stem)));
+        let _ = std::fs::copy(&so, Path::new(&d).join(format!("{}.stencils.o", stem)));
+    }
+    let _ = std::fs::remove_file(&sll);
+    let _ = std::fs::remove_file(&so);
+    let rt = tmpdir.join("loimi_jit_rt.c");
+    std::fs::write(&rt, include_str!("jit_rt.c")).map_err(|e| e.to_string())?;
+    Ok(rt)
 }
 
 /// The ASan runtime to link explicitly, if clang's own is missing.
@@ -260,6 +325,7 @@ fn parse_args() -> Result<Opts, String> {
         kind: OutKind::Exe,
         header: None,
         tls: None,
+        jit: false,
     };
     match cmd.as_str() {
         "build" => {}
@@ -284,6 +350,7 @@ fn parse_args() -> Result<Opts, String> {
                 })
             }
             "--vm-stats" => o.vm_stats = true,
+            "--jit-stencils" => o.jit = true,
             "--sanitize=address" => o.sanitize_address = true,
             "--deny-warnings" | "-Werror" => o.deny_warnings = true,
             "-W" => match args.next().as_deref() {
@@ -324,6 +391,12 @@ fn parse_args() -> Result<Opts, String> {
     if o.input.is_none() {
         return Err(USAGE.into());
     }
+    if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
+        return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
+    }
+    if o.jit && !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
+        return Err("--jit-stencils supports x86-64 Linux only".into());
+    }
     if o.kind != OutKind::Exe {
         if o.run {
             return Err("`loimi run` builds executables; --lib and --shared need `loimi build`".into());
@@ -356,7 +429,7 @@ fn compiler_main() -> ExitCode {
         }
     };
     let mut sm = SourceMap::default();
-    let (ir, header) = match compile(&mut sm, &opts) {
+    let (mut ir, header, jit) = match compile(&mut sm, &opts) {
         Ok(r) => r,
         Err(d) => {
             eprint!("{}", sm.render(&d));
@@ -383,6 +456,17 @@ fn compiler_main() -> ExitCode {
     }
     let tmpdir = std::env::temp_dir().join(format!("loimi-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmpdir);
+    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
+    let jit_rt = match &jit {
+        Some(j) => match build_stencils(&mut ir, j, &clang, &tmpdir, &stem) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("error: --jit-stencils: {}", e);
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
     let ll = tmpdir.join(format!("{}.ll", stem));
     if let Err(e) = std::fs::write(&ll, &ir) {
         eprintln!("error: cannot write {}: {}", ll.display(), e);
@@ -394,7 +478,6 @@ fn compiler_main() -> ExitCode {
         OutKind::Static => PathBuf::from(format!("lib{}.a", stem)),
         OutKind::Shared => PathBuf::from(format!("lib{}.so", stem)),
     });
-    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
     let mut cmd = Command::new(&clang);
     cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module");
     // The object goes into the archive.
@@ -442,6 +525,9 @@ fn compiler_main() -> ExitCode {
         }
     }
     cmd.arg("-x").arg("ir").arg(&ll);
+    if let Some(rt) = &jit_rt {
+        cmd.arg("-x").arg("c").arg(rt);
+    }
     if let Some(lib) = &asan_lib {
         cmd.arg("-x").arg("none").arg(lib);
     }

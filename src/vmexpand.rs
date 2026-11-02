@@ -442,7 +442,7 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
 /// and this file is the vm's expansion), its accessors, the escape hatch
 /// `Vm.assume_verified` (`#[unsafe]`), the error type, and `optimize` and
 /// `deopt` over verified code.
-fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
+fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<String> {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let vis = if v.is_pub { "pub " } else { "" };
@@ -707,9 +707,10 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
          \x20 let __c = __verified_words(__o);\n\
          \x20 var __i: u64 = 0;\n\
          \x20 while __i < __words.len {{ __c[__i] = __words[__i]; __i += 1; }}\n\
-         \x20 match {n}__verify({}) {{ Ok(_) => Ok(__o), Err(__e) => Err(__e) }}\n}}",
+         \x20 match {n}__verify({}) {{ Ok(_) => {{ {}Ok(__o) }}, Err(__e) => Err(__e) }}\n}}",
         params.join(""),
-        args.join(", ")
+        args.join(", "),
+        if jit { "loimi_jit_register(__c.ptr as *u8, __c.len); " } else { "" }
     );
     // The escape hatch, as `assume_verified`: the object with its words,
     // unchecked (for code the host built itself and trusts, and for
@@ -726,7 +727,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Res<String> {
     Ok(s)
 }
 
-pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
+pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let mask = (1u64 << l.op_bits) - 1;
@@ -846,6 +847,10 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     // are compared by the op they stand for alone, so code can be
     // optimized again (after quickening, say); the longest match wins.
     let _ = writeln!(s, "{vis}fn {n}__optimize_words(code: []{w}) {{");
+    if jit {
+        // The JIT's replaced words go back first (its code is dropped).
+        let _ = writeln!(s, "  loimi_jit_invalidate(code.ptr as *u8);");
+    }
     let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
     let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
     supers.sort_by_key(|&k| std::cmp::Reverse(l.ops[k].parts.len()));
@@ -872,6 +877,9 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     // a family share format and cache, so sizes do not change. Inline
     // caches are zeroed, as the emitters leave them.
     let _ = writeln!(s, "{vis}fn {n}__deopt_words(__code: []{w}) {{");
+    if jit {
+        let _ = writeln!(s, "  loimi_jit_invalidate(__code.ptr as *u8);");
+    }
     let _ = writeln!(s, "  var __i: u64 = 0;\n  while __i < __code.len {{");
     let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
     let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
@@ -1233,14 +1241,19 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
 }
 
 /// Expand every vm in every module: append generated items.
-pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
+pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
         for it in &m.items {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
-                let mut src = generate(v, &l);
-                src.push_str(&generate_verifier(sm, v, &l)?);
+                let mut src = generate(v, &l, jit);
+                if jit {
+                    // `--jit-stencils`: the run-time JIT learns of every
+                    // verified code object, and of rewrites of its words.
+                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\n");
+                }
+                src.push_str(&generate_verifier(sm, v, &l, jit)?);
                 src.push_str(&generate_labels(v, &l));
                 src.push_str(&generate_disasm(v, &l));
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {

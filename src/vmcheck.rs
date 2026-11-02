@@ -546,6 +546,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 fid: o.fid,
                 size: o.size,
                 parts: o.parts.iter().map(|&p| p as u32).collect(),
+                then: o.then.is_some(),
             })
             .collect(),
         entries: entries.iter().map(|(f, _)| *f).collect(),
