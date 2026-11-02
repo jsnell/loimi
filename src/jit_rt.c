@@ -61,6 +61,7 @@ struct rec {
 };
 
 static int enabled, stats, debug, inited;
+static FILE *mapf;
 static uint16_t threshold = 50;
 static struct rec **recs;
 static size_t nrecs, caprecs;
@@ -103,6 +104,10 @@ __attribute__((constructor)) static void jit_init(void) {
     if (stats) atexit(report);
     const char *d = getenv("LOIMI_JIT_DEBUG");
     debug = enabled && d && *d && strcmp(d, "0") != 0;
+    /* LOIMI_JIT_MAP=file: "start end op" per compiled instruction, for
+     * attributing profiler samples to stencils. */
+    const char *m = getenv("LOIMI_JIT_MAP");
+    if (enabled && m && *m) mapf = fopen(m, "w");
     inited = 1;
 }
 
@@ -324,6 +329,13 @@ static int compile(struct rec *r) {
         r->orig[r->npatched++] = code[pc];
         code[pc] = loimi_jit_enter_op | e << loimi_jit_op_bits;
     }
+    if (mapf) {
+        for (uint64_t pc = 0; pc < n; pc++)
+            if (map[pc] >= 0)
+                fprintf(mapf, "%lx %lx %s\n", (unsigned long)(uintptr_t)(dst + map[pc]),
+                        (unsigned long)(uintptr_t)(dst + map[pc] + lens[pc]), sts[pc] == nops ? "exit" : loimi_jit_opnames[sts[pc]]);
+        fflush(mapf);
+    }
     if (debug) {
         fprintf(stderr, "jit: compiled %p (%llu words) at %p\n", (void *)code, (unsigned long long)n, (void *)dst);
         for (uint64_t pc = 0, k = 0; pc < n; pc++) {
@@ -363,7 +375,11 @@ void loimi_jit_hot(uint32_t *pc) {
     loimi_jit_hotcount[((uintptr_t)pc >> 2) & (HOT_SLOTS - 1)] = threshold;
     if (!enabled || !init_region()) return;
     struct rec *r = lookup(pc);
-    if (!r || r->state != S_NONE) return;
+    if (!r || r->state != S_NONE) {
+        /* Not ours, or given up on: count longer before asking again. */
+        loimi_jit_hotcount[((uintptr_t)pc >> 2) & (HOT_SLOTS - 1)] = 65535;
+        return;
+    }
     r->compiles++;
     r->state = compile(r) ? S_COMPILED : S_FAILED;
 }

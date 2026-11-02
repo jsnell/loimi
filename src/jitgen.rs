@@ -189,6 +189,29 @@ pub fn jump_kind(t: &TExpr, pc_local: LocalId) -> JumpKind {
     }
 }
 
+/// A dynamic jump (call, return) in a JIT build: if the target holds an
+/// enter word, jump straight to its compiled code, without counting.
+/// Returns with the insertion point on the other path.
+pub fn enter_if_compiled(g: &mut FnGen, vd: &VmDef, target: &str) {
+    let hg = g.vm.clone().unwrap();
+    let w = g.inst(format!("load i32, ptr {}", target));
+    let mask = (1u32 << vd.op_bits) - 1;
+    let op = g.inst(format!("and i32 {}, {}", w, mask));
+    let is = g.inst(format!("icmp eq i32 {}, {}", op, enter_opcode(vd)));
+    let yes = g.fresh_label("enter");
+    let no = g.fresh_label("notcompiled");
+    g.cond_br(&is, &yes, &no);
+    g.label(&yes);
+    let i = g.inst(format!("lshr i32 {}, {}", w, vd.op_bits));
+    let iz = g.inst(format!("zext i32 {} to i64", i));
+    let b = g.inst("load ptr, ptr @loimi_jit_entries");
+    let ep = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", b, iz));
+    let e = g.inst(format!("load ptr, ptr {}", ep));
+    g.emit(format!("store ptr {}, ptr {}", target, hg.state_slots[vd.pc_idx]));
+    crate::vmgen::tail_call(g, vd, &e, &w);
+    g.label(&no);
+}
+
 /// Hot counting before a dispatch to `target` (JIT builds, interpreter
 /// and stencils): decrement the counter of the target's hash slot; at
 /// zero, continue in `Vm.jit_hot`, which may compile the code there.
@@ -256,7 +279,7 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     // (to the compiled code if the JIT replaced the word at pc).
     let _ = writeln!(
         fns,
-        "define internal preserve_nonecc {rt} @\"{sym}.jit_hot\"({args}) nounwind {{\n  call void @loimi_jit_hot(ptr %p{pc})\n  %w = load i32, ptr %p{pc}\n  %o = and i32 %w, {mask}\n  %oz = zext i32 %o to i64\n  %hp = getelementptr inbounds ptr, ptr {table}, i64 %oz\n  %h = load ptr, ptr %hp\n{}}}\n",
+        "define internal preserve_nonecc {rt} @\"{sym}.jit_hot\"({args}) nounwind noinline cold {{\n  call void @loimi_jit_hot(ptr %p{pc})\n  %w = load i32, ptr %p{pc}\n  %o = and i32 %w, {mask}\n  %oz = zext i32 %o to i64\n  %hp = getelementptr inbounds ptr, ptr {table}, i64 %oz\n  %h = load ptr, ptr %hp\n{}}}\n",
         call("%h", "%w"),
         sym = vd.symbol,
         pc = vd.pc_idx,
