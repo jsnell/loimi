@@ -50,10 +50,11 @@ which LLVM cannot combine with stack realignment in `preserve_none`
 functions, so tail-call builds would not compile. `musttail` survives the
 instrumentation.
 
-**Run so far: 1 h 50 min** under ASan (2026-11-02), in two sessions before
-and after the n-ary supers / `then` changes: 139M test-vm programs (51M
-verified and run in all three modes) and 9.7M Mini programs (2.6M run),
-debug and `--release` builds. `cargo test` runs a few seconds of both
+**Run so far: 2 h 10 min** under ASan (2026-11-02), before and after the
+n-ary supers / `then` changes, 20 minutes of it on the final verifier:
+149M test-vm programs (55M verified and run in all three modes) and 11.6M
+Mini programs (3.0M run), in debug and `--release` builds. That is well
+short of the 24 hours M5 asks for. `cargo test` runs a few seconds of both
 without ASan.
 
 Bugs found and fixed (regression tests in `tests/run/vm_verify_*.lm`):
