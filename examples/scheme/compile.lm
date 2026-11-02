@@ -1780,22 +1780,66 @@ fn Gen.tailk(g: *Gen, n: *Node, k: Cont) {
         Let => { g.bind_let(n); g.tailk(n.a, k); }
         Letrec => g.letrec_k(n, k),
         And | Or => {
-            let r = if k.mode == REG { k.dst } else { g.alloc() };
-            let done = if k.mode == RET { g.fs.code.label() } else { k.join };
-            for i in 0..n.list.len - 1 {
-                g.to(n.list.at(i), r);
-                g.jump(if n.kind == K.And { Scheme.TEST(r as u8, 0) } else { Scheme.TESTT(r as u8, 0) }, done);
+            // Operands that are tested with jumps: every and operand (a
+            // false one makes the value #f), and boolean-valued or
+            // operands (a true one makes it #t).
+            var exits: mem.Vec<u64> = mem.Vec.new();
+            var start: u64 = 0;
+            let sense = n.kind == K.Or;
+            while start + 1 < n.list.len and (n.kind == K.And or is_boolean(n.list.at(start))) {
+                g.branch(n.list.at(start), sense, &exits);
+                start += 1;
             }
-            g.tailk(n.list.at(n.list.len - 1), k);
-            if k.mode == RET {
-                g.fs.code.bind(done);
-                g.emit(Scheme.RET(r as u8));
+            if start + 1 == n.list.len {
+                g.tailk(n.list.at(start), k);
+                if exits.len > 0 {
+                    g.patch_here(exits);
+                    let c = g.konst_node(value.boolean(sense));
+                    g.value_k(c, k);
+                } else {
+                    exits.free();
+                }
+            } else {
+                // A non-boolean or operand: its value is the result.
+                var rest = n.list;
+                let r = if k.mode == REG { k.dst } else { g.alloc() };
+                let done = if k.mode == RET { g.fs.code.label() } else { k.join };
+                if exits.len > 0 {
+                    // Each earlier operand jumped to a #t exit.
+                    var skip: mem.Vec<u64> = mem.Vec.new();
+                    skip.push(g.emit(Scheme.JMP(0)));
+                    g.patch_here(exits);
+                    g.load_const(value.t(), r);
+                    g.jump(Scheme.JMP(0), done);
+                    g.patch_here(skip);
+                } else {
+                    exits.free();
+                }
+                for i in start..rest.len - 1 {
+                    g.to(rest.at(i), r);
+                    g.jump(Scheme.TESTT(r as u8, 0), done);
+                }
+                g.tailk(rest.at(rest.len - 1), k);
+                if k.mode == RET {
+                    g.fs.code.bind(done);
+                    g.emit(Scheme.RET(r as u8));
+                }
             }
         }
         _ => g.value_k(n, k),
     }
     g.reset(save);
     g.fs.line = saved_line;
+}
+
+fn Gen.konst_node(g: *Gen, v: V) -> *Node {
+    let _ = g;
+    let n: *Node = mem.alloc(1);
+    n.kind = K.Const;
+    n.v = v;
+    n.list = mem.Vec.new();
+    n.vars = mem.Vec.new();
+    n
 }
 
 /// Deliver the value of `n` (a non-tail form; null: unspecified) to `k`.
@@ -1932,20 +1976,58 @@ fn Gen.cond(g: *Gen, n: *Node) -> mem.Vec<u64> {
     js
 }
 
-fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) {
+fn Gen.cond_into(g: *Gen, n: *Node, js: *mem.Vec<u64>) { g.branch(n, false, js); }
+
+/// Emit code that jumps (adding the jumps to `js`) when the truth of `n`
+/// is `sense`, and falls through otherwise. `not` flips the sense;
+/// `and`/`or` branch on each operand in turn.
+fn Gen.branch(g: *Gen, n: *Node, sense: bool, js: *mem.Vec<u64>) {
     let saved_line = g.set_line(n);
     let save = g.top();
-    if n.kind == K.And {
-        for i in 0..n.list.len { g.cond_into(n.list.at(i), js); }
-    } else if n.kind == K.Prim and n.po == PO.Not {
-        let r = g.any(n.list.at(0));
-        js.push(g.emit(Scheme.TESTT(r as u8, 0)));
+    if n.kind == K.Prim and n.po == PO.Not {
+        g.branch(n.list.at(0), !sense, js);
+    } else if n.kind == K.And or n.kind == K.Or {
+        // (and ...) is false when some operand is; (or ...) is true when
+        // some operand is. The other way round, all but the last operand
+        // must be tested the opposite way to skip the jump.
+        let any_jumps = (n.kind == K.And) != sense;
+        if any_jumps {
+            for i in 0..n.list.len { g.branch(n.list.at(i), sense, js); }
+        } else {
+            var skip: mem.Vec<u64> = mem.Vec.new();
+            for i in 0..n.list.len - 1 { g.branch(n.list.at(i), !sense, &skip); }
+            g.branch(n.list.at(n.list.len - 1), sense, js);
+            g.patch_here(skip);
+        }
+    } else if n.kind == K.Const {
+        if value.truthy(n.v) == sense {
+            g.fs.code.set_loc(g.fs.line);
+            js.push(g.fs.code.op(Scheme.JMP(0)));
+        }
     } else {
         let r = g.any(n);
-        js.push(g.emit(Scheme.TEST(r as u8, 0)));
+        js.push(g.emit(if sense { Scheme.TESTT(r as u8, 0) } else { Scheme.TEST(r as u8, 0) }));
     }
     g.reset(save);
     g.fs.line = saved_line;
+}
+
+/// Is the value of `n` always #t or #f?
+fn is_boolean(n: *Node) -> bool {
+    match n.kind {
+        Const => n.v == value.t() or n.v == value.f(),
+        Prim => match n.po {
+            NumEq | Lt | Gt | Le | Ge | Eq | Eqv | ZeroP | Not | NullP | PairP | SymP | NumP | FixP | StrP | VecP => true,
+            _ => false,
+        },
+        And | Or => {
+            for i in 0..n.list.len {
+                if !is_boolean(n.list.at(i)) { return false; }
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A call. `dst` is where the result goes (non-tail), or the first free
