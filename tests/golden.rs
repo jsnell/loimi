@@ -697,7 +697,8 @@ fn c_library() {
 /// Panics in a library become error returns: `#[catch_panic]` exports
 /// (bounds check, `unwrap`, `trap()`, division by zero, `rt.panic`, out of
 /// memory), `rt.catch_panic` under `rt.protect`, panics unwinding through
-/// host callbacks, GC roots on the shadow stack; an uncaught one aborts.
+/// host callbacks, GC roots on the shadow stack, panics in nested
+/// (re-entrant) vm runs restoring `Vm.depth`; an uncaught one aborts.
 #[test]
 fn c_library_panics() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

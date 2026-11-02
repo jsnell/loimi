@@ -14,5 +14,11 @@ with_callback 1002 -1 999 1020
 caught_in_loimi 40 -2 -3
 caught_in_loimi: panic.lm:83:13: index out of bounds
 world 33 -1 45 empty
+rvm normal 6 depth 0
+rvm panic in nested run -999 depth 0 empty
+rvm: panic.lm:218:46: index out of bounds
+rvm panic 4 runs deep -999 depth 0 (max 3) empty
+rvm caught in between 17 depth 0 empty, depths after the catch: 3
+rvm normal again 6 30 depth 0 churn 45 empty
 lookup again 10
 uncaught: SIGABRT
