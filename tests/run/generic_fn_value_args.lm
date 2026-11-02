@@ -1,0 +1,53 @@
+// Generic functions as values: explicit type arguments (`scan<Gc<Box>>`),
+// and type arguments inferred from a partly known expected type.
+import std.io;
+import std.gc;
+
+object Box { n: i64 }
+
+struct Roots<T> { items: [T; 2] }
+
+/// A root scanner for any traced type: T appears only in the body, so it
+/// must be given explicitly where the scanner is registered.
+fn scan<T>(h: *gc.Heap, data: *u8) {
+    let r = data as *Roots<T>;
+    for i in 0..2 { gc_mark(h, r.items[i]); }
+}
+
+fn size_of_t<T>() -> u64 { size_of<T>() }
+
+fn double<N>(x: N) -> N { x + x }
+fn show<N>(x: N) -> str { if x as i64 > 10 { "big" } else { "small" } }
+
+/// T is known only from `x`; U only from `f`'s instance.
+fn apply<T, U>(f: fn(T) -> U, x: T) -> U { f(x) }
+
+struct Hooks { sizer: fn() -> u64, scanner: fn(*gc.Heap, *u8) }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var roots = Roots { items: [new(h, Box { n: 1 }), new(h, Box { n: 2 })] };
+    heap.add_scanner(&roots as *u8, scan<Gc<Box>>);
+    for i in 0..100 { new(h, Box { n: 99 }); }
+    gc.collect(h);
+    for i in 0..100 { new(h, Box { n: 99 }); }
+    io.print_int(roots.items[0].n + roots.items[1].n); io.println("");
+
+    let hooks = Hooks { sizer: size_of_t<u32>, scanner: scan<Gc<Box>> };
+    io.print_int((hooks.sizer)() as i64); io.println("");
+    let f = size_of_t<[u16; 3]>;
+    io.print_int(f() as i64); io.println("");
+
+    io.print_int(apply(double, 21 as i64)); io.println("");
+    io.print_int(apply(double, 2 as u8) as i64); io.println("");
+    io.println(apply(show, 30 as i64));
+    io.println(apply(show<i32>, 3));
+}
+// expect: 3
+// expect: 4
+// expect: 6
+// expect: 42
+// expect: 4
+// expect: big
+// expect: small

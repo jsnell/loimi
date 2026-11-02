@@ -999,10 +999,14 @@ impl Parser {
             } else if self.is("<")
                 && !self.toks[self.pos].space_before
                 && matches!(e.kind, ExprKind::Ident(_) | ExprKind::Field(..))
-                && self.angle_args_end().is_some_and(|i| matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("("))))
+                && self.angle_args_end().is_some_and(|i| {
+                    matches!(self.toks.get(i).map(|t| &t.tok), Some(Tok::Punct("(" | ")" | "," | ";" | "}" | "]")))
+                })
             {
                 // `f<T>(..)`, `mem.alloc<u8>(n)`, `v.map<f64>(g)`: explicit
-                // type arguments of a generic call.
+                // type arguments of a generic call. Also `f<T>` as a value,
+                // when followed by a token that cannot continue a
+                // comparison (`)`, `,`, `;`, `}`, `]`).
                 let saved = std::mem::replace(&mut self.cast_type, false);
                 self.bump();
                 let mut targs = Vec::new();

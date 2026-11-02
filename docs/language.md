@@ -119,6 +119,19 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   explicitly: `mem.alloc<u8>(n)`. Methods can have their own type parameters:
   `fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K`,
   `fn Vec<T>.map<U>(v: *Vec<T>, f: fn(T) -> U) -> Vec<U>`.
+- **Generic functions as values.** A generic function used where a
+  function type is expected gets its type arguments from that type
+  (`Pratt.new(peek, ..)`). Explicit type arguments name an instance
+  anywhere: `heap.add_scanner(&roots as *u8, scan<Gc<Box>>)`,
+  `let f = size_of_t<u32>;` (all of the function's type arguments; not on
+  a generic type's functions). `f<T>` without a call is read as type
+  arguments when the `<` directly follows the name and the `>` is followed
+  by `)`, `,`, `;`, `}` or `]`. When a generic function is passed to
+  another generic function, the parameter's type may be only partly
+  known (`fn apply<T, U>(f: fn(T) -> U, x: T) -> U`): the other arguments
+  are checked first, and then the known parts (here `T`) are enough if
+  they determine the function's type arguments, as in `apply(double, 21)`
+  with `fn double<N>(x: N) -> N`.
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in

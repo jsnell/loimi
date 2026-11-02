@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
-use crate::check::{mk, Checker, FnCx};
+use crate::check::{has_hole, mk, Checker, FnCx, HOLE};
 use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
 
@@ -188,6 +188,10 @@ impl<'a> Checker<'a> {
 
     pub fn unify(&self, pat: &Ty, act: &Ty, b: &mut [Option<Ty>]) -> bool {
         match (pat, act) {
+            // A hole in the actual type (an unknown part of a partly
+            // inferred expected type) matches anything and binds nothing.
+            (_, Ty::Param(HOLE)) => true,
+            (Ty::Param(_), _) if has_hole(act) => true,
             (Ty::Param(i), _) => match &b[*i as usize] {
                 Some(t) => t == act,
                 None => {
@@ -292,6 +296,42 @@ impl<'a> Checker<'a> {
         }))
     }
 
+    /// `t` with the bound parameters substituted and the unbound ones
+    /// left as holes: the partly known type of a generic call's argument.
+    fn subst_partial(&mut self, t: &Ty, b: &[Option<Ty>], span: Span) -> Res<Ty> {
+        Ok(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)))
+    }
+
+    fn subst_holes(&mut self, t: &Ty, b: &[Option<Ty>], span: Span) -> Res<Option<Ty>> {
+        Ok(Some(match t {
+            Ty::Param(i) => b[*i as usize].clone().unwrap_or(Ty::Param(HOLE)),
+            Ty::Ptr(x) => Ty::Ptr(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Slice(x) => Ty::Slice(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Option(x) => Ty::Option(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE)))),
+            Ty::Array(x, k) => Ty::Array(Box::new(self.subst_holes(x, b, span)?.unwrap_or(Ty::Param(HOLE))), *k),
+            Ty::Tuple(ts) => {
+                let mut out = Vec::new();
+                for t in ts {
+                    out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
+                }
+                Ty::Tuple(out)
+            }
+            Ty::Fn(ps, r, e) => {
+                let mut out = Vec::new();
+                for t in ps {
+                    out.push(self.subst_holes(t, b, span)?.unwrap_or(Ty::Param(HOLE)));
+                }
+                Ty::Fn(out, Box::new(self.subst_holes(r, b, span)?.unwrap_or(Ty::Param(HOLE))), *e)
+            }
+            t if contains_param(t, &self.generics) => {
+                // Gc<..>, Result<..> and generic instances: only when fully known.
+                let full: Vec<Option<Ty>> = b.iter().map(|x| x.clone().filter(|t| !has_hole(t))).collect();
+                return self.subst(t, &full, span);
+            }
+            t => t.clone(),
+        }))
+    }
+
     /// Generic fn `g` used as a value (not called): its type arguments are
     /// inferred from the expected function type, e.g. a `fn(*P) -> K`
     /// parameter or field.
@@ -386,10 +426,35 @@ impl<'a> Checker<'a> {
             vals.push(r);
         }
         let off = vals.len();
+        // A generic function passed as an argument gets its type arguments
+        // from the parameter's type, which may depend on later arguments:
+        // check those first (`apply(double, 21)` with `fn apply<T, U>(f:
+        // fn(T) -> U, x: T)`).
+        let mut order: Vec<usize> = Vec::new();
+        let mut deferred: Vec<usize> = Vec::new();
         for (i, a) in args.iter().enumerate() {
+            let pt = &ptys[off + i];
+            if matches!(pt, Ty::Fn(..)) && contains_param(pt, &self.generics) && self.generic_fn_named(cx, a)?.is_some() {
+                deferred.push(i);
+            } else {
+                order.push(i);
+            }
+        }
+        order.extend(deferred.iter().copied());
+        let mut slots: Vec<Option<TExpr>> = vec![None; args.len()];
+        for i in order {
+            let a = &args[i];
             let pt = ptys[off + i].clone();
             let want = self.subst(&pt, &b, span)?;
-            let v = self.expr(cx, a, want.as_ref())?;
+            let v = if want.is_none() && deferred.contains(&i) {
+                // Only partly known: the parameters may still determine
+                // the function's type arguments.
+                let partial = self.subst_partial(&pt, &b, span)?;
+                let (g, _) = self.generic_fn_named(cx, a)?.unwrap();
+                self.generic_fn_value(g, Some(&partial), a.span)?
+            } else {
+                self.expr(cx, a, want.as_ref())?
+            };
             let v = match &want {
                 Some(t) => self.coerce(v, t)?,
                 None => {
@@ -399,8 +464,9 @@ impl<'a> Checker<'a> {
                     v
                 }
             };
-            vals.push(v);
+            slots[i] = Some(v);
         }
+        vals.extend(slots.into_iter().map(|v| v.unwrap()));
         let mut targs = Vec::new();
         for (i, t) in b.iter().enumerate() {
             match t {

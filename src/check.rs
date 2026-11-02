@@ -139,9 +139,9 @@ fn fn_widens(from: &Ty, to: &Ty) -> bool {
 }
 
 /// An unknown part of a guessed type (`Checker::guess_ty`).
-const HOLE: u32 = u32::MAX;
+pub const HOLE: u32 = u32::MAX;
 
-fn has_hole(t: &Ty) -> bool {
+pub fn has_hole(t: &Ty) -> bool {
     match t {
         Ty::Param(HOLE) => true,
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
@@ -1545,7 +1545,7 @@ impl<'a> Checker<'a> {
                     _ => Err(Diag::new(span, "`?` needs an option or result")),
                 }
             }
-            ExprKind::TypeArgs(..) => Err(Diag::new(span, "explicit type arguments are only supported on calls: `f<T>(..)`")),
+            ExprKind::TypeArgs(inner, targs) => self.type_args_value(cx, inner, targs, span),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
                 let ty = self.resolve_type(cx.module, t)?;
@@ -2091,6 +2091,53 @@ impl<'a> Checker<'a> {
             _ => return Err(Diag::new(inner.span, "explicit type arguments need a generic function or method name")),
         };
         self.explicit_call(cx, name, g, explicit, recv, args, exp, span)
+    }
+
+    /// The generic function (or generic method of a plain type) that `e`
+    /// names, if any: `f`, `mod.f`, `Type.f`, `mod.Type.f`.
+    pub fn generic_fn_named(&self, cx: &FnCx, e: &Expr) -> Res<Option<(u32, Ident)>> {
+        match &e.kind {
+            ExprKind::Ident(n) if cx.lookup(n).is_none() => match self.scopes[cx.module].get(n) {
+                Some((Def::GenericFn(g), _)) => Ok(Some((*g, Ident { name: n.clone(), span: e.span }))),
+                _ => Ok(None),
+            },
+            ExprKind::Field(base, name) => {
+                if let Some(m) = self.module_path(cx, base) {
+                    return match self.scopes[m].get(&name.name) {
+                        Some((Def::GenericFn(g), true)) => Ok(Some((*g, name.clone()))),
+                        Some((Def::GenericFn(_), false)) => Err(Diag::new(name.span, format!("`{}` is private", name.name))),
+                        _ => Ok(None),
+                    };
+                }
+                if let Some(t) = self.type_path(cx, base) {
+                    return Ok(self.generics.ty_methods.get(&(t, name.name.clone())).map(|g| (*g, name.clone())));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `f<T..>` used as a value: the instance of a generic function.
+    fn type_args_value(&mut self, cx: &mut FnCx, inner: &Expr, targs: &[TypeExpr], span: Span) -> Res<TExpr> {
+        let Some((g, name)) = self.generic_fn_named(cx, inner)? else {
+            if let ExprKind::Field(base, _) = &inner.kind {
+                if self.generic_type_path(cx, base).is_some() {
+                    return Err(Diag::new(span, "explicit type arguments are not supported on a generic type's functions"));
+                }
+            }
+            return Err(Diag::new(inner.span, "explicit type arguments need a generic function name"));
+        };
+        let mut explicit = Vec::new();
+        for t in targs {
+            explicit.push(self.resolve_type(cx.module, t)?);
+        }
+        let n = self.generics.fns[g as usize].params.len();
+        if explicit.len() != n {
+            return Err(Diag::new(name.span, format!("`{}` takes {} type argument(s), got {}", name.name, n, explicit.len())));
+        }
+        let fid = self.instantiate_fn(g, explicit, span)?;
+        Ok(mk(self.prog.fns[fid as usize].fn_ty(), TK::FnRef(fid), span))
     }
 
     #[allow(clippy::too_many_arguments)]
