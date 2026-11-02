@@ -362,6 +362,17 @@ pub vm JS {
     operand child = it verify (it as u64) < proto.protos.data.len;
     operand callbase = it verify (it as u32) < proto.nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
+    /// SWITCHI's case count n: it jumps to `pc + 1 + i` for some i <= n,
+    /// so the n + 1 words after it must be JMP instructions.
+    operand ncases = it verify {
+        var ok = true;
+        var j: u64 = 0;
+        while ok and j <= it {
+            ok = is_insn_boundary(pc + 1 + j) and JS.opcode(*(pc + 1 + j)) == JS.OP_JMP;
+            j += 1;
+        }
+        ok
+    };
 
     /// The exception handler table (compile.lm, `add_handlers`): entries
     /// of four words, [start, end) of the protected code, the handler's
@@ -988,7 +999,7 @@ pub vm JS {
 
     /// `switch` on Int cases lo .. lo+n-1: followed by n JMPs (one per
     /// value) and the JMP for every other value.
-    op SWITCHI(r: reg, lo: kst, n: imm) : ABC {
+    op SWITCHI(r: reg, lo: kst, n: ncases) : ABC {
         var i = n as u64;
         if let (Int(x), Int(l)) = (r, lo) and ((x as i64 - l as i64) as u64) < n as u64 { i = (x as i64 - l as i64) as u64; }
         if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and x == x.floor() {
