@@ -1,0 +1,58 @@
+// matrix: dispatch
+// A cold block in a loop whose rest of the loop body is `break`: the rest
+// was copied into the cold block (so that it could be outlined), and the
+// outlined block had no loop to break out of (the compiler panicked in
+// tail-call mode).
+import std.io;
+
+vm V {
+    context ctx: *i64;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    // dst = number of loop iterations until i reaches a; logs odd i's
+    op CNT(dst: reg, a: reg) : ABC {
+        var i: i64 = 0;
+        loop {
+            i += 1;
+            if i % 2 == 1 { cold { *ctx += i; } }
+            if i >= a { break; }
+        }
+        dst = i;
+        next
+    }
+    op CNT2(dst: reg, a: reg) : ABC {
+        var i: i64 = 0;
+        loop {
+            i += 1;
+            if i % 3 == 0 { cold { *ctx += 1000; } }
+            break;
+        }
+        dst = i + a;
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *i64, code: *u32, r: *i64) -> i64 { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 8] = [0; 8];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 7);
+    at = V.emit.CNT(c, at, 1, 0);
+    at = V.emit.CNT2(c, at, 2, 1);
+    at = V.emit.RET(c, at, 2);
+    var n: i64 = 0;
+    io.print_int(V.run(&n, &code[0], &regs[0])); io.print(" "); io.print_int(n); io.print(" "); io.print_int(regs[1]); io.println("");
+}
+// expect: 8 16 7

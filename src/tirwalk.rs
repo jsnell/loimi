@@ -143,11 +143,12 @@ fn diverges(stmts: &[TStmt], tail: &Option<B>) -> bool {
 /// `if c { cold { .. } } rest`: when the cold block falls through but the
 /// rest of its enclosing block ends in a control word, copy the rest into
 /// the cold block. The cold block then never rejoins the hot path and can
-/// be outlined.
+/// be outlined. Not if the rest leaves a loop (`break`, `continue`): an
+/// outlined block has no loop to leave.
 pub fn extend_cold(e: &mut TExpr) {
     if let TK::Block(stmts, tail) = &mut e.kind {
         for i in 0..stmts.len() {
-            let rest_never = diverges(&stmts[i + 1..], tail);
+            let rest_never = diverges(&stmts[i + 1..], tail) && !leaves_loop(&stmts[i + 1..], tail);
             if rest_never {
                 let rest_stmts: Vec<TStmt> = stmts[i + 1..].to_vec();
                 let rest_tail = tail.clone();
@@ -191,6 +192,34 @@ pub fn extend_cold(e: &mut TExpr) {
         TK::Vm(TVm::Cold(b)) | TK::Vm(TVm::Part(_, b)) => extend_cold(b),
         _ => {}
     }
+}
+
+/// Whether statements `stmts` and `tail` contain a `break` or `continue`.
+fn leaves_loop(stmts: &[TStmt], tail: &Option<B>) -> bool {
+    let mut found = false;
+    let mut look = |x: &TExpr| {
+        for_each_expr(x, &mut |e| {
+            if matches!(e.kind, TK::Break(..) | TK::Continue(_)) {
+                found = true;
+            }
+        })
+    };
+    for s in stmts {
+        match s {
+            TStmt::Let(_, Some(x)) | TStmt::Expr(x) | TStmt::Defer(x) => look(x),
+            TStmt::LetPat(_, x, els) => {
+                look(x);
+                if let Some(e) = els {
+                    look(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(t) = tail {
+        look(t);
+    }
+    found
 }
 
 /// `branch` is `{ cold { b } }` with `b` falling through: make it `{ cold { b; rest } }`.
