@@ -364,13 +364,25 @@ It is only produced when `.attributes = true`; otherwise it is `never` and the
 `tests/run/std_obj_gc.lm` (random operations checked against a host-side
 model, collecting after every operation in stress mode) and
 `tests/run/std_obj_ic.lm` (a `GETPROP` family in a vm, all dispatch
-modes); `bench/obj` measures a cache hit.
+modes) and `tests/run/std_obj_generic.lm` (the ready-made `obj.Obj<V>`
+under GC stress); `bench/obj` measures a cache hit.
 
-### No `Model` configuration; the object type is the interpreter's
+### No `Model` configuration; the object type is generic or the interpreter's
 
-There is no comptime, and `object` types cannot be generic, so the
-library cannot declare an object whose slots hold the interpreter's
-`Value`. The interpreter declares the types and the library is generic
+There is no comptime. The library declares a generic object type over
+the interpreter's `Value`, with exactly the fields it needs:
+
+```loimi
+value Value repr nanbox { .., O(Gc<obj.Obj<Value>>) }
+
+var m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value> =
+    obj.Model.new(obj.new_slots<Value>, Value.Nil);
+m.attach(&heap);
+let o = obj.new_obj(&heap, m.root(4), None, 4);   // shape, prototype, inline slots
+```
+
+An interpreter that wants other fields in its objects (a class pointer,
+a hash, flags) declares the types itself, and the library is generic
 over them:
 
 ```loimi

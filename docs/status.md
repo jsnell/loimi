@@ -23,7 +23,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | `std.lex` | A scanner toolkit rather than a generator: `Cursor` (peek, bump, line tracking, marks, spans, errors), `Syntax` presets (`lua()`, `c_like()`, `none()`) for line, block, nested and Lua long-bracket comments, escape and overflow rules; `skip_trivia`, `ident`, `number` (via std.num), `quoted` (escapes into a `StrBuf`, including `\ddd`, `\xHH`, `\u{..}`, `\z`, line continuation), `long_string`, `OpTable<K>` (maximal munch), `Keywords<K>`. Errors are `lex.Error` (span and message), convertible to a `diag.Diag`. A complete lexer for Mini's token set is about 50 lines (`tests/run/lex_toy.lm`). |
 | `std.parse` | `Pratt<P, K, E, X>`: binding-power table indexed by token kind (`infix_left`, `infix_right`, `infix`, `prefix`) and a driver that calls the user's `peek`, `advance`, `atom`, `unary`, `binary` and optional `before_rhs` hooks through function pointers. |
 | `std.bc` | Bytecode construction over any vm's generated encoders: `Code<W>` (given `Vm.op_size` and a jump-patch function: `op` reserves inline-cache words, labels with fixups, jump lists, range-checked patching with sticky errors, a run-length position table with per-word expansion and a delta-encoded form, `last`/`truncate` for peepholes, jump threading), `Field` (encoded bit fields), `Pool<K: hash.Hash>` (deduplicating constant pool with a limit) and `Regs` (Lua-style locals/temporaries register allocator with maximum tracking). |
-| `std.obj` | Hidden-class objects over the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache`, allocation templates. No attributes, elements or globals cells. |
+| `std.obj` | Hidden-class objects over a generic `obj.Obj<V>` or the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache`, allocation templates. No attributes, elements or globals cells. |
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |
 | Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, and the Mini scripts with and without GC stress. |
 
@@ -81,8 +81,8 @@ in [`language.md`](language.md). Updated 2026-11-02.
   takes the generated `Vm.op_size` and a jump-patch function rather than
   a generated `Builder`; it has no branch relaxation, exception table,
   proto assembly or serialization. `std.obj` has no comptime `Model`:
-  the interpreter declares its object and slot-array types and
-  instantiates a generic `Model`; keys are u64 symbol ids; attributes,
+  it offers a generic `Obj<V>` (or the interpreter declares its own
+  object and slot-array types) and a generic `Model` over them; keys are u64 symbol ids; attributes,
   elements and global property cells are not built. Shape ids are never
   reused, so inline caches need no reset after a collection. See the
   "As implemented" notes in [`stdlib.md`](stdlib.md) and
