@@ -247,7 +247,7 @@ fn scheme_programs() {
         let exit: i32 = scm_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = scm_directives("expect-stderr");
         for stress in [false, true] {
-            let mut cmd = Command::new(&exe);
+            let mut cmd = limited(&exe);
             cmd.arg(&f);
             if stress {
                 cmd.arg("stress");
