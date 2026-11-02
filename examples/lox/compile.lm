@@ -650,9 +650,11 @@ fn C.finish(c: *C, f: *Fun) -> *Proto {
     p
 }
 
-pub fn compile(prog: *Program, m: *Machine, names: *text.Interner) -> Result<(*Proto, mem.Vec<*Proto>), (str, u32)> {
+/// Compile a parsed program. The result holds every function, the script
+/// (the top-level code) last.
+pub fn compile(prog: *Program, m: *Machine, names: *text.Interner) -> Result<mem.Vec<*Proto>, (str, u32)> {
     var unit = Unit { m: m, names: names, infos: &prog.locals, protos: mem.Vec.new(), error: None };
-    let main = compile_fun(&unit, prog.script);
+    compile_fun(&unit, prog.script);
     if let Some(e) = unit.error { return Err(e); }
-    Ok((main, unit.protos))
+    Ok(unit.protos)
 }

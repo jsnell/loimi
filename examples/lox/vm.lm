@@ -82,6 +82,20 @@ pub struct Machine {
     stress: bool,
 }
 
+/// Release everything the machine owns, the heap included.
+pub fn Machine.free(m: *Machine) {
+    mem.release(m.stack);
+    mem.release(m.frames);
+    mem.release(m.globals.slots);
+    mem.release(m.strings.slots);
+    m.out.free();
+    m.msg.free();
+    m.tmp.free();
+    m.keys.free();
+    m.m.free();
+    m.heap.free();
+}
+
 /// The GC's roots: every active frame's closure and registers, every
 /// function's constants, the globals.
 pub fn scan_roots(h: *gc.Heap, data: *u8) {
@@ -717,6 +731,15 @@ pub vm Lox {
         m.fp = fp;
         jump main.proto.code
     }
+
+    // Superinstructions, from `--vm-stats` on the benchmarks. A super
+    // whose first part quickens becomes the super of the quickened part.
+    super GETGLOBAL_SUBK = GETGLOBAL; SUBK;
+    super GETGLOBAL_C_SUBK = GETGLOBAL_C; SUBK;
+    super ADD_RET = ADD; RET;
+    super GETPROP_RET = GETPROP; RET;
+    super GETPROP_IN_RET = GETPROP_IN; RET;
+    super GETPROP_OUT_RET = GETPROP_OUT; RET;
 
     on raise(msg: str) {
         traceback(ctx, msg, fp, pc);

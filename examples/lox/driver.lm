@@ -1,0 +1,115 @@
+// Compile and run one Lox program: parse, compile, verify, run.
+
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+import std.text;
+import parser;
+import compile;
+import value;
+import value.{Value, Proto, Closure, Native};
+import vm;
+import vm.{Lox, Machine, Globals, Frame};
+
+const STACK: u64 = 1 << 20;
+const FRAMES: u64 = 1 << 16;
+
+pub struct Options { disasm: bool, disasm_after: bool, stress: bool }
+
+fn disassemble(protos: *mem.Vec<*Proto>) {
+    var out = text.StrBuf.new();
+    for i in 0..protos.len {
+        let p = protos.at(i);
+        out.push_str("fn ");
+        out.push_str(p.name);
+        out.push_str(":\n");
+        Lox.disasm(p.words, &out);
+    }
+    io.print(out.as_str());
+    out.free();
+}
+
+fn free_proto(p: *Proto) {
+    mem.release(p.words.ptr);
+    mem.release(p.lines.ptr);
+    mem.release(p.consts.ptr);
+    mem.release(p.children.ptr);
+    mem.release(p.captures.ptr);
+    mem.release(p);
+}
+
+/// Run `src`. The result is the exit status clox would give: 0, 65 for a
+/// compile error, 70 for a run-time error (errors go to stderr).
+pub fn run_source(src: str, o: Options) -> i32 uses gc {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    let Some(prog) = parser.parse_program(src, &arena) else { return 65; };
+
+    var names = text.Interner.new();
+    defer names.free();
+    var natives: [Native; 1] = [Native { name: "clock", arity: 0, f: vm.clock_native }];
+    var m = Machine {
+        stack: mem.alloc(STACK), stack_end: 0 as *Value,
+        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame, fp: 0 as *Frame,
+        globals: Globals.new(), names: &names, heap: gc.Heap.new(),
+        m: obj.Model.new(value.new_slots, Value.Nil), strings: value.Strings.new(),
+        natives: &natives[0], init_str: None, protos: 0 as *mem.Vec<*Proto>,
+        out: text.StrBuf.new(), msg: text.StrBuf.new(), tmp: text.StrBuf.new(), keys: mem.Vec.new(),
+        stress: o.stress,
+    };
+    defer m.free();
+    m.stack_end = m.stack + STACK;
+    m.frames_end = m.frames + FRAMES;
+    m.fp = m.frames;
+    m.init_str = Some(m.strings.intern(&m.heap, "init"));
+    m.globals.define(names.intern("clock") + 1, Value.Native(0));
+
+    // Nothing collects until the program runs, so the constants the
+    // compiler allocates need no rooting until `m.protos` is set.
+    var all = match compile.compile(&prog, &m, &names) {
+        Ok(r) => r,
+        Err((msg, line)) => {
+            var b = text.StrBuf.new();
+            b.fmt2("[line {}] Error: {}", line, msg);
+            io.eprintln(b.as_str());
+            b.free();
+            return 65;
+        }
+    };
+    defer {
+        for i in 0..all.len { free_proto(all.at(i)); }
+        all.free();
+    }
+    m.protos = &all;
+    m.m.attach(&m.heap);
+    m.heap.add_scanner(&m as *u8, vm.scan_roots);
+    m.heap.add_sweeper(&m.strings as *u8, value.sweep_strings);
+    if o.stress { m.heap.set_stress(true); }
+
+    // Verify every function before running any, then fuse supers.
+    for i in 0..all.len {
+        let p = all.at(i);
+        match Lox.verify(p.words, p, names.names.len as u32) {
+            Ok(v) => p.code = Lox.optimize(v),
+            Err(e) => {
+                var b = text.StrBuf.new();
+                b.push_str("bytecode failed verification: ");
+                e.write(&b);
+                io.eprintln(b.as_str());
+                b.free();
+                return 70;
+            }
+        }
+    }
+    if o.disasm { disassemble(&all); }
+
+    // The script is the last prototype compiled.
+    let cl = new(&m.heap, Closure { proto: all.at(all.len - 1) }, 0);
+    let status: i32 = match Lox.run(&m, cl) {
+        Ok(_) => 0,
+        Err(_) => 70,
+    };
+    if o.disasm_after { disassemble(&all); }
+    status
+}

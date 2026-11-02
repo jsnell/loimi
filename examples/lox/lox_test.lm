@@ -1,0 +1,120 @@
+// Unit tests: `loimi test examples/lox/lox_test.lm`.
+//
+// The conformance tests are the book's suite (bench/lox/runtests.py);
+// these check the parts from inside, and run small programs in-process,
+// normally and with a collection at every safepoint.
+
+import std.mem;
+import std.test;
+import std.text;
+import lexer;
+import lexer.{T, Lexer};
+import parser;
+import parser.{Stmt, Var};
+import driver;
+
+#[test]
+fn lexes_numbers_strings_and_operators() {
+    var lx = Lexer.new("a <= 1.5 != 12. \"two\nlines\" // comment\n!x");
+    let kinds = [T.Ident, T.Le, T.Num, T.BangEq, T.Num, T.Dot, T.Str, T.Bang, T.Ident, T.Eof];
+    for i in 0..kinds.len {
+        let t = lx.next();
+        test.assert(t.kind == kinds[i]);
+        if i == 2 { test.eq(t.num, 1.5); }
+        if i == 4 { test.eq(t.num, 12.0); }
+        if i == 6 { test.eq(t.text, "\"two\nlines\""); }
+        if i == 8 { test.eq(t.line, 3 as u32); }
+    }
+    lx.free();
+}
+
+#[test]
+fn lexer_errors_are_tokens() {
+    var lx = Lexer.new("@ \"open");
+    let a = lx.next();
+    test.assert(a.kind == T.Error);
+    test.eq(a.text, "Unexpected character.");
+    let b = lx.next();
+    test.assert(b.kind == T.Error);
+    test.eq(b.text, "Unterminated string.");
+    lx.free();
+}
+
+#[test]
+fn resolves_captured_locals() {
+    var arena = mem.Arena.new();
+    defer arena.free();
+    let prog = test.some(parser.parse_program("{ var a = 1; var b = 2; fun f() { return a; } }", &arena));
+    let Block(stmts) = prog.script.body.at(0) else { test.fail("expected a block"); return; };
+    // a is captured by f, b is not.
+    let VarDecl(Local(a), _, _) = stmts.at(0) else { test.fail("expected var a"); return; };
+    let VarDecl(Local(b), _, _) = stmts.at(1) else { test.fail("expected var b"); return; };
+    test.assert(prog.locals.at(a as u64).captured);
+    test.assert(!prog.locals.at(b as u64).captured);
+    test.eq(prog.locals.at(a as u64).slot, 1 as u32);
+    test.eq(prog.locals.at(b as u64).slot, 2 as u32);
+}
+
+/// Run `src` and return what it printed (stdout and stderr) and its
+/// status, with and without GC stress; both runs must agree.
+#[track_caller]
+fn check(src: str, want: str, status: i32) uses gc {
+    for i in 0..2 {
+        var out = text.StrBuf.new();
+        test.capture_start();
+        let st = driver.run_source(src, driver.Options { disasm: false, disasm_after: false, stress: i == 1 });
+        test.capture_end(&out);
+        test.eq(out.as_str(), want);
+        test.eq(st, status);
+        out.free();
+    }
+}
+
+#[test]
+fn arithmetic_and_printing() uses gc {
+    check("print 1 + 2 * 3; print 1 / 3; print -0; print 10 / 0; print \"a\" + \"b\";",
+          "7\n0.333333\n-0\ninf\nab\n", 0);
+    check("print 10000000000 / 3; print 123456789;", "3.33333e+09\n1.23457e+08\n", 0);
+}
+
+#[test]
+fn closures_share_variables() uses gc {
+    check("fun counter() { var n = 0; fun inc() { n = n + 1; return n; } return inc; }
+           var c = counter(); c(); c(); print c();
+           var d = counter(); print d();", "3\n1\n", 0);
+    // Each iteration of a block gets a fresh variable.
+    check("var fs = nil; for (var i = 0; i < 3; i = i + 1) { var j = i; fun f() { print j; } if (i == 1) fs = f; } fs();",
+          "1\n", 0);
+}
+
+#[test]
+fn classes_inherit_and_bind() uses gc {
+    check("class A { init(x) { this.x = x; } get() { return this.x; } }
+           class B < A { get() { return super.get() * 10; } }
+           var b = B(4); print b.get(); var m = b.get; print m(); print b; print B;",
+          "40\n40\nB instance\nB\n", 0);
+    // A field shadows a method.
+    check("class C { f() { return 1; } } var c = C(); c.f = 2; print c.f;", "2\n", 0);
+}
+
+#[test]
+fn runtime_errors_have_tracebacks() uses gc {
+    check("fun f() { return 1 + nil; }\nf();",
+          "Operands must be two numbers or two strings.\n[line 1] in f()\n[line 2] in script\n", 70);
+    check("print x;", "Undefined variable 'x'.\n[line 1] in script\n", 70);
+}
+
+#[test]
+fn compile_errors() uses gc {
+    check("var a = 1;\na + 1 = 2;", "[line 2] Error at '=': Invalid assignment target.\n", 65);
+    check("return 1;", "[line 1] Error at 'return': Can't return from top-level code.\n", 65);
+}
+
+#[test]
+fn garbage_is_collected() uses gc {
+    // Enough garbage to collect several times without stress.
+    check("class P { init(n) { this.n = n; } }
+           var keep = P(0); var s = \"\";
+           for (var i = 0; i < 100000; i = i + 1) { var p = P(i); s = \"x\" + \"y\"; }
+           print keep.n; print s;", "0\nxy\n", 0);
+}
