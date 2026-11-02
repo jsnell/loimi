@@ -2015,8 +2015,16 @@ a library, reusing `vm.lm`, `compile.lm` and `value.lm` through
 globals both ways, C natives with user data, syntax and runtime errors
 with messages, natives calling back into Mini (nested 50 levels through
 Mini and C, past the limit, with errors passing through, under GC
-stress, and into another state), the host calling Mini functions, and a
-GC-stress run through the API.
+stress, and into another state), the host calling Mini functions, a
+GC-stress run through the API, and an internal error in a nested run.
+`mini_new`, `mini_dostring` and `mini_call` are `#[catch_panic]`: a
+panic in the interpreter returns NULL or `MiniStatus_Internal`, and
+poisons the state, following the rule above: the state counts its API
+calls in progress and its natives running, which agree in C code
+unless a panic abandoned a call. A poisoned state refuses to run code,
+`mini_error` gives the panic's message, and a native returning to a
+run of it re-panics so that the outer run stops too. Its handlers
+compile to the same IR as without the catches.
 
 ---
 

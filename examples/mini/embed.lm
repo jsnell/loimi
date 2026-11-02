@@ -23,9 +23,22 @@
 // by position. Values a native pushes are popped when it returns. More
 // than `vm.MAX_NESTING` nested runs on a thread fail with "C stack
 // overflow". A native must not free its own state.
+//
+// Internal errors: a panic inside the interpreter (a bug, out of memory
+// in a buffer, `mini_debug_panic`) is caught by `mini_dostring` and
+// `mini_call`, which return `MiniStatus_Internal` instead of aborting the
+// host (`#[catch_panic]`, docs/language.md §10.1). The state is then
+// poisoned: `mini_error` says what happened, `mini_dostring` and
+// `mini_call` return `MiniStatus_Internal` again, and the host should
+// only `mini_free` it. Other states are unaffected. A state knows it is
+// poisoned by counting: `busy` counts its API calls in progress and
+// `in_native` its natives running; in C code they are equal unless a panic
+// abandoned an API call. A native whose nested call came back poisoned
+// re-panics when it returns, so the run it was called from stops too.
 
 import std.gc;
 import std.mem;
+import std.rt;
 import std.text;
 import value;
 import value.{V};
@@ -37,7 +50,8 @@ import state;
 extern "C" fn strlen(s: *u8) -> u64;
 
 /// What mini_dostring or mini_call did (MiniStatus_Ok, ... in C).
-enum MiniStatus: i32 { Ok, Syntax, Runtime }
+/// MiniStatus_Internal: an internal error; the state is poisoned.
+enum MiniStatus: i32 { Ok, Syntax, Runtime, Internal }
 
 /// The type of a value (mini_get_type, mini_arg_type).
 enum MiniType: i32 { Nil, Boolean, Number, String, Table, Function }
@@ -60,6 +74,23 @@ pub struct MiniState {
     /// The value stack: Mini values the host refers to by position (a GC
     /// root, like `ret`).
     vals: mem.Vec<V>,
+    /// API calls in progress on this state, and natives running (see the
+    /// top of the file); `poisoned` once they disagree.
+    busy: u32,
+    in_native: u32,
+    poisoned: bool,
+}
+
+/// Whether `s` is poisoned: an internal error abandoned one of its API
+/// calls. Call only from functions C calls directly, outside `busy`.
+fn poisoned(s: *MiniState) -> bool {
+    if s.poisoned { return true; }
+    if s.busy == s.in_native { return false; }
+    s.poisoned = true;
+    s.err.clear();
+    s.err.push_str("internal error: ");
+    s.err.push_str(rt.panic_message());
+    true
 }
 
 /// GC roots of the API: the value stack and the pending result.
@@ -87,7 +118,12 @@ fn host_call(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> uses reenter {
     s.args = args;
     s.nargs = n;
     s.ret = V.Nil;
+    s.in_native += 1;
     let status = nf.f(s, nf.ud);
+    // A nested call that the native made on this state failed with an
+    // internal error: stop this run as well.
+    if poisoned(s) { rt.panic(s.err.as_str()); }
+    s.in_native -= 1;
     let r = s.ret;
     s.args = sa;
     s.nargs = sn;
@@ -116,8 +152,10 @@ fn as_str(v: V) -> str {
 
 // ── states ──────────────────────────────────────────────────────────
 
-/// A new interpreter with the standard library loaded.
-export "C" fn mini_new() -> *MiniState {
+/// A new interpreter with the standard library loaded; NULL if out of
+/// memory.
+#[catch_panic]
+export "C" fn mini_new() -> ?*MiniState {
     let s: *MiniState = mem.alloc(1);
     s.ctx = state.new_ctx(host_call);
     state.attach(&s.ctx);
@@ -128,7 +166,10 @@ export "C" fn mini_new() -> *MiniState {
     s.nargs = 0;
     s.ret = V.Nil;
     s.vals = mem.Vec.new();
-    s
+    s.busy = 0;
+    s.in_native = 0;
+    s.poisoned = false;
+    Some(s)
 }
 
 /// Free the interpreter and everything in its heap.
@@ -143,6 +184,15 @@ export "C" fn mini_free(s: *MiniState) {
 /// Collect at every safepoint (to test GC rooting), or stop doing so.
 export "C" fn mini_set_gc_stress(s: *MiniState, on: bool) { s.ctx.heap.set_stress(on); }
 
+/// Fail with an internal error with message `msg`, as a bug in the
+/// interpreter would: for testing a host's error handling. The innermost
+/// `mini_dostring` or `mini_call` on the thread returns
+/// `MiniStatus_Internal`, and `s` is poisoned.
+export "C" fn mini_debug_panic(s: *MiniState, msg: str) {
+    s.busy += 1;
+    rt.panic(msg);
+}
+
 /// Collections so far.
 export "C" fn mini_gc_count(s: *MiniState) -> u64 { s.ctx.heap.collections }
 
@@ -150,7 +200,16 @@ export "C" fn mini_gc_count(s: *MiniState) -> u64 { s.ctx.heap.collections }
 
 /// Compile and run `len` bytes of Mini source. On an error, the message
 /// is in `mini_error`. From a native, the chunk runs nested above it.
+#[catch_panic(Internal)]
 export "C" fn mini_dostring(s: *MiniState, src: *u8, len: u64) -> MiniStatus uses reenter {
+    if poisoned(s) { return MiniStatus.Internal; }
+    s.busy += 1;
+    let r = dostring(s, src, len);
+    s.busy -= 1;
+    r
+}
+
+fn dostring(s: *MiniState, src: *u8, len: u64) -> MiniStatus uses reenter {
     s.err.clear();
     let c = &s.ctx;
     let Some(proto) = compile.try_compile(&c.heap, "chunk", src.slice(len), &s.err) else { return MiniStatus.Syntax; };
@@ -168,7 +227,10 @@ export "C" fn mini_dostring(s: *MiniState, src: *u8, len: u64) -> MiniStatus use
 /// The message of the last failed `mini_dostring` or `mini_call` (empty
 /// after a successful one). Valid until the next call that runs Mini code
 /// on this state.
-export "C" fn mini_error(s: *MiniState) -> str { s.err.as_str() }
+export "C" fn mini_error(s: *MiniState) -> str {
+    poisoned(s);
+    s.err.as_str()
+}
 
 // ── the value stack and calls ───────────────────────────────────────
 //
@@ -176,7 +238,11 @@ export "C" fn mini_error(s: *MiniState) -> str { s.err.as_str() }
 // is the top). Inside a native, the stack starts out as the caller left
 // it, and what the native pushes is popped when it returns.
 
-fn push(s: *MiniState, v: V) { s.vals.push(v); }
+fn push(s: *MiniState, v: V) {
+    s.busy += 1;
+    s.vals.push(v);
+    s.busy -= 1;
+}
 
 /// The value at position `i`, if there is one.
 fn slot(s: *MiniState, i: i64) -> ?V {
@@ -242,7 +308,16 @@ export "C" fn mini_to_string(s: *MiniState, i: i64) -> str {
 /// (MiniStatus_Runtime; its message is also in `mini_error`). From a
 /// native, the call runs nested above the native's caller; from the host
 /// between runs, it is a run of its own.
+#[catch_panic(Internal)]
 export "C" fn mini_call(s: *MiniState, nargs: u64) -> MiniStatus uses reenter {
+    if poisoned(s) { return MiniStatus.Internal; }
+    s.busy += 1;
+    let r = call(s, nargs);
+    s.busy -= 1;
+    r
+}
+
+fn call(s: *MiniState, nargs: u64) -> MiniStatus uses reenter {
     s.err.clear();
     let len = s.vals.len;
     if nargs >= len {
@@ -321,8 +396,10 @@ export "C" fn mini_get_string(s: *MiniState, name: *u8) -> str { as_str(get(s, n
 
 /// Make global `name` a function that calls `f(state, ud)`.
 export "C" fn mini_register(s: *MiniState, name: *u8, f: fn(*MiniState, *u8) -> i32 uses reenter, ud: *u8) {
+    s.busy += 1;
     let id = vm.HOST_NATIVE + s.natives.len as i32;
     s.natives.push(Native { f: f, ud: ud });
+    s.busy -= 1;
     set(s, name, V.Native(id));
 }
 
