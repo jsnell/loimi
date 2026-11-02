@@ -615,37 +615,40 @@ pub vm Mini {
 
     // Compare and branch, for conditions: the next word is a JMP holding
     // the branch offset (so the verifier and the compiler's jump
-    // patching treat it as a jump). Jump if the comparison equals `k`;
-    // otherwise skip the JMP.
-    inline for (name, bkind, isub, fsub, slow) in [
-        ("JLT", reg, x < y, x < y, less(ctx, a, b, false)),
-        ("JLE", reg, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JLTK", kst, x < y, x < y, less(ctx, a, b, false)),
-        ("JLEK", kst, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JGTK", kst, x > y, x > y, less(ctx, b, a, false)),
-        ("JGEK", kst, x >= y, x >= y, less(ctx, b, a, true)),
+    // patching treat it as a jump). Jump if the comparison holds (or,
+    // for the N forms, if it does not); otherwise skip the JMP. The A
+    // field is unused.
+    inline for (name, nname, bkind, isub, fsub, slow) in [
+        ("JLT", "JLTN", reg, x < y, x < y, less(ctx, a, b, false)),
+        ("JLE", "JLEN", reg, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JLTK", "JLTKN", kst, x < y, x < y, less(ctx, a, b, false)),
+        ("JLEK", "JLEKN", kst, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JGTK", "JGTKN", kst, x > y, x > y, less(ctx, b, a, false)),
+        ("JGEK", "JGEKN", kst, x >= y, x >= y, less(ctx, b, a, true)),
     ] {
-        op #name(pol: imm, a: reg, b: bkind) : ABC then JMP {
-            let want = pol != 0;
-            match (a, b) {
-                (Int(x), Int(y)) => branch((isub) == want, then.target),
-                (Num(x), Num(y)) => branch((fsub) == want, then.target),
-                _ => {}
+        inline for (opname, want) in [(name, true), (nname, false)] {
+            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+                match (a, b) {
+                    (Int(x), Int(y)) => branch((isub) == want, then.target),
+                    (Num(x), Num(y)) => branch((fsub) == want, then.target),
+                    _ => {}
+                }
+                cold { branch(slow? == want, then.target) }
             }
-            cold { branch(slow? == want, then.target) }
         }
     }
-    inline for (name, bkind) in [("JEQ", reg), ("JEQK", kst)] {
-        op #name(pol: imm, a: reg, b: bkind) : ABC then JMP {
-            let want = pol != 0;
-            if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
-            // Same bits means equal, except for NaN; strings are interned.
-            if a == b {
-                var eq = true;
-                if let Num(x) = a { eq = x == x; }
-                branch(eq == want, then.target)
+    inline for (name, nname, bkind) in [("JEQ", "JEQN", reg), ("JEQK", "JEQKN", kst)] {
+        inline for (opname, want) in [(name, true), (nname, false)] {
+            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+                if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
+                // Same bits means equal, except for NaN; strings are interned.
+                if a == b {
+                    var eq = true;
+                    if let Num(x) = a { eq = x == x; }
+                    branch(eq == want, then.target)
+                }
+                cold { branch(value.raw_equal(a, b) == want, then.target) }
             }
-            cold { branch(value.raw_equal(a, b) == want, then.target) }
         }
     }
 
@@ -841,6 +844,18 @@ pub vm Mini {
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
     super ADD_RET1 = ADD; RET1;
+    super MUL_F_ADD_F = MUL_F; ADD_F;
+    super MUL_F_MUL_F = MUL_F; MUL_F;
+    super ADD_F_MUL_F = ADD_F; MUL_F;
+    super MOVE_CALL = MOVE; CALL;
+    super MOVE_MOVE = MOVE; MOVE;
+    super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
+    super GETINDEX_GETINDEX = GETINDEX; GETINDEX;
+    super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
+    super GETUPVAL_MOVE = GETUPVAL; MOVE;
+    super ADDI_ADDI = ADDI; ADDI;
+    super GETUPVAL_JEQN = GETUPVAL; JEQN;
+    super GETINDEX_ADDI = GETINDEX; ADDI;
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V {
         ctx = c;
