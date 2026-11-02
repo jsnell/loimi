@@ -146,12 +146,12 @@ pub const PF_METHOD: u32 = 8;
 /// `fixed` for prototypes that CALL's fast path must never take (natives).
 pub const NO_FIXED: u32 = 0xFFFF;
 
-/// Bytecode words: the storage behind a Proto's `code`.
-pub object Code { data: [u32] }
-/// A function prototype. `code` is the proof that `words` passed
-/// JS.verify against this prototype's nregs, nfree and its constant and
-/// child counts (compile.lm, `finish`); none of these change after.
-/// Every call jumps to a `code`, so every function that runs was verified.
+/// A function prototype. `code` holds the bytecode, which only
+/// JS.build_verified writes: it verifies the words in place against this
+/// prototype's nregs, nfree, its constant and child counts and its
+/// exception handler table (compile.lm, `finish`), none of which change
+/// after. Every call jumps to a `code`, and every handler target is an
+/// instruction of it, so every function that runs was verified.
 pub object Proto {
     name: Gc<Str>,
     nparams: u32,
@@ -167,10 +167,8 @@ pub object Proto {
     desc: Gc<Descs>,
     handlers: Gc<Handlers>,
     lines: Gc<Lines>,
-    code: Verified<JS>,
-    /// Owns `code`'s words (the proof holds a plain slice, which the
-    /// collector does not trace).
-    words: Gc<Code>,
+    /// Reads as a `Verified<JS>`; `jump p.code` is the array's address.
+    code: verified [u32] by JS,
 }
 
 pub value V repr nanbox {

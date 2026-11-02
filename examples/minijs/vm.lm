@@ -348,20 +348,36 @@ pub vm JS {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    // The generated verifier (JS.verify) checks these against the
-    // prototype's register, free variable, constant and child counts. It
-    // runs before the Proto exists (compile.lm, `finish`), which then
-    // stores the proof next to the same counts.
-    verify_context nregs: u32, nfree: u32, nconsts: u64, nprotos: u64;
-    operand reg = regs[it] verify (it as u32) < nregs;
-    operand kst = k[it] verify (it as u64) < nconsts;
+    // The generated verifier checks these against the prototype that
+    // holds the code: JS.build_verified (compile.lm, `finish`) creates
+    // the Proto, copies the words into its `code` and verifies them
+    // there, with the Proto itself as `proto`.
+    verify_context owner proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
     operand imm = it;
     operand simm = it;
     operand gl = it;
-    operand fv = it verify (it as u32) < nfree;
-    operand child = it verify (it as u64) < nprotos;
-    operand callbase = it verify (it as u32) < nregs;
+    operand fv = it verify (it as u32) < proto.nfree;
+    operand child = it verify (it as u64) < proto.protos.data.len;
+    operand callbase = it verify (it as u32) < proto.nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
+
+    /// The exception handler table (compile.lm, `add_handlers`): entries
+    /// of four words, [start, end) of the protected code, the handler's
+    /// target and the register that receives the exception. `on raise`
+    /// jumps to `code.start() + target` and writes `regs[reg]`: the
+    /// target must start an instruction and the register be in the frame.
+    verify handlers {
+        let t = proto.handlers.data;
+        var ok = t.len % 4 == 0;
+        var i: u64 = 0;
+        while ok and i < t.len {
+            ok = is_insn_boundary(code.ptr + t[i + 2]) and t[i + 3] < proto.nregs;
+            i += 4;
+        }
+        ok
+    }
 
     encoding fixed(u32) {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
@@ -1393,6 +1409,8 @@ pub vm JS {
         loop {
             let p = f.cl.proto;
             if let Some((target, r)) = find_handler(p, at) {
+                // `verify handlers` checked that `target` starts an
+                // instruction of `p.code` and that `r` is in the frame.
                 fp = f;
                 regs = f.base;
                 k = f.k;
