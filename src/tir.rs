@@ -215,7 +215,8 @@ pub enum TVm {
     /// or a super's last part), `FnRef` of a super's resume function
     /// (from a part before the last), or a shared copy's own
     /// continuation `Local`. Only shared copies in `VmDef::cont_fns`
-    /// take it (`vmcheck::shared_conts`); the others ignore it.
+    /// take it (`vmcheck::shared_conts`); the others ignore it. The slot
+    /// is cleared when read, so None stores nothing.
     Shared(FnId, Vec<TExpr>, B, Option<B>),
     /// In a shared copy: argument `i` (the last one is the `next` size;
     /// `u32::MAX` is the continuation).

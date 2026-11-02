@@ -584,11 +584,12 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 let slot = shared_slot(g, *fid, i, &a.ty);
                 g.store(&a.ty, &v, &slot);
             }
-            if takes_cont(p, vd, *fid) {
-                let v = match cont.as_deref() {
-                    Some(TExpr { kind: TK::FnRef(r), .. }) => format!("@\"{}\"", crate::jitgen::callee_symbol(g, *r)),
-                    Some(c) => g.val(c),
-                    None => "null".into(),
+            // The slot is null unless set here: the shared copy clears it
+            // when it reads it, so other call sites store nothing.
+            if let (true, Some(c)) = (takes_cont(p, vd, *fid), cont.as_deref()) {
+                let v = match c {
+                    TExpr { kind: TK::FnRef(r), .. } => format!("@\"{}\"", crate::jitgen::callee_symbol(g, *r)),
+                    c => g.val(c),
                 };
                 let t = Ty::Ptr(Box::new(Ty::u8()));
                 let slot = shared_slot(g, *fid, u32::MAX as usize, &t);
@@ -600,8 +601,15 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             g.poison(&e.ty)
         }
         TVm::SharedArg(fid, i) => {
-            if *i == u32::MAX && !takes_cont(g.p(), &g.p().vms[g.vm.as_ref().unwrap().vm as usize], *fid) {
-                return "null".into();
+            if *i == u32::MAX {
+                if !takes_cont(g.p(), &g.p().vms[g.vm.as_ref().unwrap().vm as usize], *fid) {
+                    return "null".into();
+                }
+                // Read once, at the top of the shared copy, and cleared.
+                let slot = shared_slot(g, *fid, u32::MAX as usize, &e.ty);
+                let v = g.load(&e.ty, &slot);
+                g.emit(format!("store ptr null, ptr {}", slot));
+                return v;
             }
             let slot = shared_slot(g, *fid, *i as usize, &e.ty);
             g.load(&e.ty, &slot)
