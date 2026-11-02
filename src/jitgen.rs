@@ -213,24 +213,42 @@ pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
                 }
             }
             TK::Vm(TVm::Become(..)) => base = true,
-            TK::Vm(TVm::Shared(c, ..)) => callees.push(*c),
-            TK::Vm(TVm::Chain(k)) => callees.push(vd.ops[*k as usize].fid),
             _ => {}
         });
+        callees.extend(continues_in(vd, body));
         if base {
             out.insert(fid as FnId);
         }
         refs.push((fid as FnId, callees));
     }
+    close_over(&mut out, &refs);
+    out
+}
+
+/// The functions `body` (of a function of vm `vd`) continues in: the
+/// shared copies it tail-calls and the ops it chains to.
+fn continues_in(vd: &VmDef, body: &TExpr) -> Vec<FnId> {
+    let mut out = Vec::new();
+    crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
+        TK::Vm(TVm::Shared(c, ..)) => out.push(*c),
+        TK::Vm(TVm::Chain(k)) => out.push(vd.ops[*k as usize].fid),
+        _ => {}
+    });
+    out
+}
+
+/// Add to `set` every function that continues in one of its members
+/// (`edges`: each function with those it continues in), transitively.
+fn close_over(set: &mut std::collections::HashSet<FnId>, edges: &[(FnId, Vec<FnId>)]) {
     loop {
-        let n = out.len();
-        for (f, cs) in &refs {
-            if cs.iter().any(|c| out.contains(c)) {
-                out.insert(*f);
+        let n = set.len();
+        for (f, cs) in edges {
+            if cs.iter().any(|c| set.contains(c)) {
+                set.insert(*f);
             }
         }
-        if out.len() == n {
-            return out;
+        if set.len() == n {
+            return;
         }
     }
 }
@@ -243,42 +261,29 @@ pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
 /// (`Vm.optimize` fuses it). The JIT gives such instructions' compiled
 /// code a 5-byte prefix that it can turn into a jump to new code.
 pub fn rewritable_ops(p: &Program, vd: &VmDef) -> Vec<bool> {
-    let mut becomes: std::collections::HashMap<FnId, (bool, Vec<FnId>)> = std::collections::HashMap::new();
+    // The handlers and every function they continue in.
+    let mut becomes = std::collections::HashSet::new();
+    let mut edges: Vec<(FnId, Vec<FnId>)> = Vec::new();
     let mut work: Vec<FnId> = vd.ops.iter().map(|o| o.fid).collect();
     while let Some(fid) = work.pop() {
-        if becomes.contains_key(&fid) {
+        if edges.iter().any(|(f, _)| *f == fid) {
             continue;
         }
-        let mut b = false;
         let mut callees = Vec::new();
         if let Some(body) = &p.fns[fid as usize].body {
-            crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
-                TK::Vm(TVm::Become(..)) => b = true,
-                TK::Vm(TVm::Shared(c, ..)) => callees.push(*c),
-                TK::Vm(TVm::Chain(k)) => callees.push(vd.ops[*k as usize].fid),
-                _ => {}
-            });
+            let mut b = false;
+            crate::tirwalk::for_each_expr(body, &mut |e| b |= matches!(e.kind, TK::Vm(TVm::Become(..))));
+            if b {
+                becomes.insert(fid);
+            }
+            callees = continues_in(vd, body);
         }
         work.extend(callees.iter().copied());
-        becomes.insert(fid, (b, callees));
+        edges.push((fid, callees));
     }
-    // Close over the functions each one continues in.
-    loop {
-        let mut changed = false;
-        let snapshot: Vec<(FnId, bool)> = becomes.iter().map(|(f, (b, _))| (*f, *b)).collect();
-        let get = |f: &FnId| snapshot.iter().any(|(g, b)| g == f && *b);
-        for (_, (b, cs)) in becomes.iter_mut() {
-            if !*b && cs.iter().any(get) {
-                *b = true;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    close_over(&mut becomes, &edges);
     let heads: Vec<u32> = vd.ops.iter().filter_map(|o| o.parts.first().copied()).collect();
-    vd.ops.iter().enumerate().map(|(k, o)| becomes[&o.fid].0 || !o.parts.is_empty() || heads.contains(&(k as u32))).collect()
+    vd.ops.iter().enumerate().map(|(k, o)| becomes.contains(&o.fid) || !o.parts.is_empty() || heads.contains(&(k as u32))).collect()
 }
 
 /// The opcode the JIT writes over instructions that have compiled code:
