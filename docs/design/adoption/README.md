@@ -1,5 +1,11 @@
 # Adopting std.bc and std.obj in the examples
 
+**Applied (2026-11-02), on the current code rather than with this patch:**
+Mini's compiler uses std.bc (with `Mini.set_label`, labels for `break`
+and `if` exits), std.lex, std.parse and std.diag; Scheme's code generator
+uses std.bc. The emitted bytecode is byte-identical to the hand-written
+versions. The patch below is kept as the historical plan.
+
 `std-bc.patch` moves the code generators of `examples/mini` and
 `examples/scheme` onto `std.bc` (apply with `git apply`). It was checked
 on a copy of both interpreters: every Mini script and conformance test

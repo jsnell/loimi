@@ -4,7 +4,15 @@
 
 Progress (2026-11-02):
 - M0–M5 are done. M5's fuzzing criterion is in progress.
-- M6 is partly done: std.num, std.diag, std.lex and std.parse exist; std.bc and std.obj do not.
+- M6 is done: std.num, std.diag, std.lex, std.parse, std.bc and std.obj
+  exist, and the example interpreters use them. Mini's front end is
+  std.lex + std.parse (Pratt driver, `led` hooks for `and`/`or`/`..`) +
+  std.diag, its code buffer, labels, constant pool and registers std.bc;
+  Scheme's reader is std.lex + std.num and its code generator std.bc;
+  MiniJS uses all six. Mini and Scheme emit byte-identical bytecode to
+  their hand-written versions. std.obj is used by MiniJS only: Lua tables
+  and Scheme records have no shape-based objects to replace (see
+  [`design/adoption/README.md`](design/adoption/README.md#stdobj)).
 - M7 has two proof interpreters, `examples/mini` (a Lua 5.4 subset) and
   `examples/scheme` (an R7RS-small subset).
 - **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
