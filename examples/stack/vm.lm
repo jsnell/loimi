@@ -544,6 +544,23 @@ pub vm Stak {
     super LE_JZ = LE; JZ;
     super GT_JZ = GT; JZ;
     super LGET_LGET = LGET; LGET;
+    // Longer sequences that start with a shared op. `optimize` fuses the
+    // longest match left to right, so these take precedence over the
+    // pairs above where they apply.
+    #[allow(super_overlap)]
+    super DUP_PUSHI_LT_JZ = DUP; PUSHI; LT; JZ;
+    #[allow(super_overlap)]
+    super DUP_PUSHI_SUB = DUP; PUSHI; SUB;
+    #[allow(super_overlap)]
+    super SWAP_PUSHI_SUB = SWAP; PUSHI; SUB;
+    #[allow(super_overlap)]
+    super LGET_PUSHI_ADD = LGET; PUSHI; ADD;
+    #[allow(super_overlap)]
+    super LGET_LGET_AT = LGET; LGET; AT;
+    #[allow(super_overlap)]
+    super LGET_LGET_ADD_LSET = LGET; LGET; ADD; LSET;
+    #[allow(super_overlap)]
+    super LGET_LGET_STORE = LGET; LGET; STORE;
 
     entry run(m: *Machine, main: *Word) -> Result<(), str> uses gc {
         ctx = m;
