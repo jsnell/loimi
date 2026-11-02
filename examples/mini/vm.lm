@@ -732,6 +732,12 @@ pub vm Mini {
     super GEK_TEST = GEK; TEST;
     super EQK_TEST = EQK; TEST;
     super EQK_TESTT = EQK; TESTT;
+    super LT_TESTT = LT; TESTT;
+    super LE_TESTT = LE; TESTT;
+    super LTK_TESTT = LTK; TESTT;
+    super LEK_TESTT = LEK; TESTT;
+    super GTK_TESTT = GTK; TESTT;
+    super GEK_TESTT = GEK; TESTT;
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
     super ADD_RET1 = ADD; RET1;

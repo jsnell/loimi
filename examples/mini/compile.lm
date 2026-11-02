@@ -1022,18 +1022,81 @@ fn Parser.add_local(p: *Parser, name: str, r: u32) {
     if p.fs.freereg < p.fs.nactive { p.fs.freereg = p.fs.nactive; }
 }
 
-fn Parser.cond(p: *Parser) -> u64 {
-    let c = p.expr();
-    // `if not x`: test x for truth instead of materializing `not x`.
-    if let Reloc(at) = c and at + 1 == p.pc() and Mini.opcode(p.fs.code.at(at)) == Mini.OP_NOT {
-        let src = (p.fs.code.at(at) >> 16) & 255;
+// Conditions of if, while and repeat compile to jumps, as in Lua: each
+// operand of an and/or chain jumps straight to the false (or true) exit,
+// `not` flips a test instead of materializing a boolean, and constants
+// fold away.
+
+/// Emit a test of `e` that jumps when its truthiness is `when` (to be
+/// patched), or nothing if it can never jump. Falls through otherwise.
+fn Parser.jump_if(p: *Parser, e: E, when: bool) -> ?u64 {
+    match e {
+        True => return if when { Some(p.emit(Mini.JMP(0))) } else { None },
+        Nil | False => return if when { None } else { Some(p.emit(Mini.JMP(0))) },
+        _ => {}
+    }
+    var when = when;
+    var src: u32 = 0;
+    if let Reloc(at) = e and at + 1 == p.pc() and Mini.opcode(p.fs.code.at(at)) == Mini.OP_NOT {
+        src = (p.fs.code.at(at) >> 16) & 255;
         p.fs.code.truncate(at);
         p.fs.lines.truncate(at);
-        return p.emit(Mini.TESTT(src as u8, 0));
+        when = !when;
+    } else {
+        let r = p.any_reg(e);
+        p.free_exp(r);
+        src = reg_of(r);
     }
-    let r = p.any_reg(c);
-    p.free_exp(r);
-    p.emit(Mini.TEST(reg_of(r) as u8, 0))
+    Some(p.emit(if when { Mini.TESTT(src as u8, 0) } else { Mini.TEST(src as u8, 0) }))
+}
+
+fn Parser.patch_list(p: *Parser, l: *mem.Vec<u64>, target: u64) {
+    for i in 0..l.len { p.patch(l.at(i), target); }
+    l.clear();
+}
+
+/// `a and b and ...`: falls through when all are true; returns the jumps
+/// taken when one is false.
+fn Parser.cond_and(p: *Parser) -> mem.Vec<u64> {
+    var f: mem.Vec<u64> = mem.Vec.new();
+    loop {
+        // Operands bind tighter than `and` and `or`.
+        let e = p.subexpr(2);
+        if let Some(j) = p.jump_if(e, false) { f.push(j); }
+        if !p.accept(T.And) { break; }
+    }
+    f
+}
+
+/// A condition: falls through when true; returns the jumps taken when
+/// false (to be patched to the false exit, then freed).
+fn Parser.cond(p: *Parser) -> mem.Vec<u64> {
+    var t: mem.Vec<u64> = mem.Vec.new();
+    var f = p.cond_and();
+    while p.accept(T.Or) {
+        // This operand being true makes the whole condition true.
+        var flipped = false;
+        if f.len > 0 {
+            let last = f.at(f.len - 1);
+            let w = p.fs.code.at(last);
+            let op = Mini.opcode(w);
+            if last + 1 == p.pc() and (op == Mini.OP_TEST or op == Mini.OP_TESTT) {
+                // Invert the final test: jump to the true exit instead.
+                let r = ((w >> 8) & 255) as u8;
+                p.fs.code.set(last, if op == Mini.OP_TEST { Mini.TESTT(r, 0) } else { Mini.TEST(r, 0) });
+                f.pop();
+                t.push(last);
+                flipped = true;
+            }
+        }
+        if !flipped { t.push(p.emit(Mini.JMP(0))); }
+        p.patch_list(&f, p.pc());
+        f.free();
+        f = p.cond_and();
+    }
+    p.patch_list(&t, p.pc());
+    t.free();
+    f
 }
 
 fn Parser.loop_enter(p: *Parser) -> LoopSave {
@@ -1149,29 +1212,30 @@ fn Parser.statement_inner(p: *Parser) {
         If => {
             p.advance();
             var jumps_to_end: mem.Vec<u64> = mem.Vec.new();
-            var j: ?u64 = Some(p.cond());
+            var f = p.cond();
             p.check(T.Then, "'then'");
             p.block();
             loop {
                 if p.tok.kind == T.Elseif {
                     jumps_to_end.push(p.emit(Mini.JMP(0)));
-                    if let Some(x) = j { p.patch(x, p.pc()); }
+                    p.patch_list(&f, p.pc());
+                    f.free();
                     p.advance();
-                    j = Some(p.cond());
+                    f = p.cond();
                     p.check(T.Then, "'then'");
                     p.block();
                 } else if p.tok.kind == T.Else {
                     jumps_to_end.push(p.emit(Mini.JMP(0)));
-                    if let Some(x) = j { p.patch(x, p.pc()); }
+                    p.patch_list(&f, p.pc());
                     p.advance();
                     p.block();
-                    j = None;
                     break;
                 } else {
                     break;
                 }
             }
-            if let Some(x) = j { p.patch(x, p.pc()); }
+            p.patch_list(&f, p.pc());
+            f.free();
             p.check(T.End, "'end'");
             for i in 0..jumps_to_end.len { p.patch(jumps_to_end.at(i), p.pc()); }
             jumps_to_end.free();
@@ -1184,14 +1248,15 @@ fn Parser.statement_inner(p: *Parser) {
         While => {
             p.advance();
             let start = p.pc();
-            let j = p.cond();
+            var f = p.cond();
             p.check(T.Do, "'do'");
             let saved = p.loop_enter();
             p.block();
             p.check(T.End, "'end'");
             let back = p.emit(Mini.JMP(0));
             p.patch(back, start);
-            p.patch(j, p.pc());
+            p.patch_list(&f, p.pc());
+            f.free();
             p.loop_exit(saved);
         }
         Repeat => {
@@ -1201,20 +1266,20 @@ fn Parser.statement_inner(p: *Parser) {
             p.enter_block();
             p.statlist();
             p.check(T.Until, "'until'");
-            let c = p.expr();
-            let r = reg_of(p.any_reg(c));
+            var f = p.cond();
             let b = p.fs.blocks.at(p.fs.blocks.len - 1);
             if b.upval {
                 // Captured body locals are closed on both paths.
-                let j = p.emit(Mini.TESTT(r as u8, 0));
+                let exit = p.emit(Mini.JMP(0));
+                p.patch_list(&f, p.pc());
                 p.emit(Mini.CLOSE(b.nactive as u8));
                 let back = p.emit(Mini.JMP(0));
                 p.patch(back, start);
-                p.patch(j, p.pc());
+                p.patch(exit, p.pc());
             } else {
-                let j = p.emit(Mini.TEST(r as u8, 0));
-                p.patch(j, start);
+                p.patch_list(&f, start);
             }
+            f.free();
             p.leave_block();
             p.loop_exit(saved);
         }
