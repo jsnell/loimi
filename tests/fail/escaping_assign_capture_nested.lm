@@ -1,0 +1,10 @@
+// Also from a `block fn` closure nested in the escaping closure's body.
+import std.mem;
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() {
+    var arena = mem.Arena.new();
+    var total: i64 = 0;
+    let f: closure fn() = new(&arena, || each(3, |i| total += i));
+    f();
+}
+// error: `total` is captured by value

@@ -1,0 +1,6 @@
+// A closure converts only to a type with at least its effects.
+import std.gc;
+fn take(f: closure fn()) {}
+fn run(f: closure fn() uses gc) { take(f); }
+fn main() {}
+// error: this function uses gc, but the expected type `closure fn() -> ()` does not allow it

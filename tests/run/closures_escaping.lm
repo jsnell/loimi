@@ -4,6 +4,7 @@
 import std.io;
 import std.mem;
 import std.mem.{Vec, Arena};
+import std.hash;
 
 struct Builtin { name: str, call: closure fn(i64) -> i64 }
 
@@ -50,6 +51,12 @@ fn range(a: *Arena, lo: i64, hi: i64) -> closure fn() -> ?i64 {
         Some(st.i - 1)
     })
 }
+
+// Captures of a type parameter, unbounded and bounded (the bounded body is
+// also checked once with `T` opaque).
+fn konst<T>(a: *Arena, x: T) -> closure fn() -> T { new(a, || x) }
+
+fn hasher<T: hash.Hash>(a: *Arena, x: T) -> closure fn() -> u64 { new(a, || x.hash()) }
 
 fn sum_block(n: i64, f: block fn(i64) -> i64) -> i64 {
     var t: i64 = 0;
@@ -131,6 +138,12 @@ fn main() {
     let mk: closure fn(i64) -> closure fn(i64) -> i64 = new(a, |m| adder(a, m));
     io.print_int(mk(10)(5)); io.println("");
 
+    // Generic captures; a `str` and a larger struct by value.
+    let s = konst(a, "text");
+    let big = konst(a, Range { i: 4, end: 9 });
+    io.print(s()); io.print(" "); io.print_int(big().end - big().i); io.print(" ");
+    io.print_bool(hasher(a, 17 as i64)() == (17 as i64).hash()); io.println("");
+
     v.free();
     fs.free();
     table.free();
@@ -153,3 +166,4 @@ fn main() {
 // expect: 406
 // expect: 5 0
 // expect: 15
+// expect: text 5 true

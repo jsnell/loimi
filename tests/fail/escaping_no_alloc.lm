@@ -1,0 +1,9 @@
+// The allocator must have `alloc_bytes(n, align) -> *u8`.
+struct Pool { n: i64 }
+fn main() {
+    var p = Pool { n: 0 };
+    let k = 3;
+    let f: closure fn() -> i64 = new(&p, || k);
+}
+// error: no method `alloc_bytes`
+// error: the environment of `new(a, |..| ..)` is allocated with `a.alloc_bytes(size: u64, align: u64) -> *u8`

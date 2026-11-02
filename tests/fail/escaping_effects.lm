@@ -1,0 +1,10 @@
+// The body of a `closure fn` may only make calls its type allows.
+import std.mem;
+import std.gc;
+fn main() {
+    var heap = gc.Heap.new();
+    var arena = mem.Arena.new();
+    let h = &heap;
+    let f: closure fn() = new(&arena, || gc.collect(h));
+}
+// error: `collect` uses gc, but this closure's type `closure fn() -> ()` does not allow it

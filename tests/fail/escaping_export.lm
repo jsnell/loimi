@@ -1,0 +1,4 @@
+// Closures cannot cross into C.
+export "C" fn hook(f: closure fn(i64) -> i64) -> i64 { f(1) }
+fn main() {}
+// error: closures cannot cross into C

@@ -1,0 +1,10 @@
+// Captures of an escaping closure are copies: assigning one would not
+// change the variable outside, so it is an error.
+import std.mem;
+fn main() {
+    var arena = mem.Arena.new();
+    var count: i64 = 0;
+    let f: closure fn() = new(&arena, || count += 1);
+    f();
+}
+// error: `count` is captured by value: this closure escapes, so it has its own copy

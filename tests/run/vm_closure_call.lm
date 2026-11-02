@@ -1,0 +1,63 @@
+// matrix: dispatch
+// vm code cannot create closures, but it can call stored ones: a builtin
+// table of `closure fn`s and a GC closure in the context, called from
+// handlers like any function pointer (synced and rooted per their
+// effects), and a vm function taking a `closure fn` parameter.
+import std.io;
+import std.mem;
+import std.mem.{Vec, Arena};
+import std.gc;
+
+object Box { v: i64 }
+
+struct Ctx {
+    natives: Vec<closure fn(i64) -> i64>,
+    hook: ?Gc<closure fn(i64) -> i64 uses gc>,
+    heap: gc.Heap,
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    op NATIVE(n: imm) : N { acc = ctx.natives.at(n as u64)(acc); next }
+    op HOOK() : N { if let Some(f) = ctx.hook { acc = f(acc); } next }
+    op TWICE(n: imm) : N { acc = twice(ctx.natives.at(n as u64), acc); next }
+    op HALT() : N { exit acc }
+
+    operand imm = it;
+
+    fn twice(f: closure fn(i64) -> i64, x: i64) -> i64 { f(f(x)) }
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; acc = 1; jump code }
+}
+
+fn scan_ctx(h: *gc.Heap, p: *u8) {
+    let c = p as *Ctx;
+    gc_mark(h, c.hook);
+}
+
+fn make_hook(h: *gc.Heap, k: i64) -> Gc<closure fn(i64) -> i64 uses gc> {
+    let b = new(h, Box { v: k });
+    new(h, |x| { gc.collect(h); x + b.v })
+}
+
+fn main() uses gc {
+    var arena = Arena.new();
+    let a = &arena;
+    var c = Ctx { natives: Vec.new(), hook: None, heap: gc.Heap.new() };
+    c.heap.set_stress(true);
+    c.heap.add_scanner(&c as *u8, scan_ctx);
+    let ten = 10;
+    c.natives.push(new(a, |x| x * ten));
+    c.natives.push(new(a, |x| x + 3));
+    c.hook = Some(make_hook(&c.heap, 1000));
+    var code: [u32; 5] = [M.NATIVE(0), M.NATIVE(1), M.HOOK(), M.TWICE(1), M.HALT()];
+    io.print_int(M.run(&c, &code[0]));
+    io.println("");
+    c.natives.free();
+    c.heap.free();
+    arena.free();
+}
+// expect: 1019

@@ -1,0 +1,12 @@
+// An arena environment is not traced: capturing a GC reference in it
+// would let the collector free the object while the closure holds it.
+import std.mem;
+import std.gc;
+object Node { v: i64 }
+fn main() {
+    var heap = gc.Heap.new();
+    var arena = mem.Arena.new();
+    let n = new(&heap, Node { v: 1 });
+    let f: closure fn() -> i64 = new(&arena, || n.v);
+}
+// error: this closure captures `n` of type `Gc<Node>`, which holds GC references, but its environment is not traced: create it in the GC heap with `new(heap, |..| ..)`

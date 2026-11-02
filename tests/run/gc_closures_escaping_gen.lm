@@ -1,0 +1,115 @@
+// The same as gc_closures_escaping.lm on a generational heap in verify
+// mode: closures stored into old objects need the write barrier.
+import std.io;
+import std.mem;
+import std.mem.{Vec};
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+// Objects can hold GC closures; stores into them get the write barrier.
+object Hooks { on_value: ?Gc<closure fn(i64) -> i64 uses gc> }
+
+fn garbage(h: *gc.Heap, n: i64) {
+    for i in 0..n { new(h, Node { value: i, next: None }); }
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t: i64 = 0;
+    var c = l;
+    while let Some(n) = c {
+        t += n.value;
+        c = n.next;
+    }
+    t
+}
+
+fn list(h: *gc.Heap, n: i64) -> ?Gc<Node> {
+    var l: ?Gc<Node> = None;
+    for i in 0..n { l = Some(new(h, Node { value: i, next: l })); }
+    l
+}
+
+// Returned: the captured list is reachable only through the closure.
+fn summer(h: *gc.Heap, n: i64) -> Gc<closure fn(i64) -> i64 uses gc> uses gc {
+    let l = list(h, n);
+    gc.maybe_collect(h);
+    new(h, |k| { gc.collect(h); garbage(h, 5); sum(l) * k })
+}
+
+// Called through a parameter, with the callee's own traced locals live.
+fn call_with_fresh(h: *gc.Heap, f: Gc<closure fn(i64) -> i64 uses gc>) -> i64 uses gc {
+    let mine = new(h, Node { value: 1000, next: None });
+    let r = f(2);
+    gc.collect(h);
+    r + mine.value
+}
+
+// A root scanner for a Vec of closures (globals and host structures are
+// not roots by themselves).
+fn scan_vec(h: *gc.Heap, p: *u8) {
+    let v = p as *Vec<Gc<closure fn() -> i64 uses gc>>;
+    for i in 0..v.len { gc_mark(h, v.at(i)); }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    heap.set_stress(true); heap.set_generational(true); heap.set_verify(true);
+    let h = &heap;
+
+    let f = summer(h, 10);
+    garbage(h, 20);
+    gc.collect(h);
+    io.print_int(f(3)); io.println("");
+    io.print_int(call_with_fresh(h, summer(h, 5))); io.println("");
+
+    // The only reference to the closure is the one its body runs from:
+    // the body's own collections must not free its environment.
+    io.print_int(summer(h, 4)(1)); io.println("");
+
+    // Stored in an object, replaced, called after collections.
+    let hooks = new(h, Hooks { on_value: None });
+    for round in 0..3 {
+        let l = list(h, round + 3);
+        hooks.on_value = Some(new(h, |x| { garbage(h, 3); gc.maybe_collect(h); sum(l) + x }));
+        garbage(h, 10);
+        gc.collect(h);
+    }
+    if let Some(cb) = hooks.on_value { io.print_int(cb(100)); io.println(""); }
+
+    // Many closures in a Vec scanned by a root scanner.
+    var fs: Vec<Gc<closure fn() -> i64 uses gc>> = Vec.new();
+    h.add_scanner(&fs as *u8, scan_vec);
+    for i in 0..20 {
+        let l = list(h, i);
+        fs.push(new(h, || { gc.maybe_collect(h); sum(l) }));
+    }
+    gc.collect(h);
+    var t: i64 = 0;
+    for i in 0..fs.len { t += fs.at(i)(); }
+    io.print_int(t); io.println("");
+
+    // A capture of a plain value next to a traced one, and a nested
+    // `block fn` over the captures.
+    let n = new(h, Node { value: 7, next: None });
+    let scale = 3;
+    let g: Gc<closure fn(i64) -> i64 uses gc> = new(h, |x| {
+        var acc: i64 = 0;
+        each(x, |i| { garbage(h, 2); gc.collect(h); acc += n.value * scale + i; });
+        acc
+    });
+    io.print_int(g(4)); io.println("");
+
+    fs.free();
+    heap.free();
+}
+
+fn each(n: i64, f: block fn(i64) uses gc) uses gc {
+    for i in 0..n { f(i); }
+}
+// expect: 135
+// expect: 1020
+// expect: 6
+// expect: 110
+// expect: 1140
+// expect: 90

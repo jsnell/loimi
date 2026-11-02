@@ -1,0 +1,9 @@
+// A GC closure does not convert to an untraced closure type.
+import std.gc;
+fn take(f: closure fn() -> i64) -> i64 { f() }
+fn main() {
+    var heap = gc.Heap.new();
+    let g: Gc<closure fn() -> i64> = new(&heap, || 1);
+    take(g);
+}
+// error: mismatched types: expected `closure fn() -> i64`, found `Gc<closure fn() -> i64>`

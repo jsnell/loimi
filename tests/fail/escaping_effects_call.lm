@@ -1,0 +1,5 @@
+// Calling a `closure fn ... uses gc` needs the effect.
+struct Hook { f: closure fn() uses gc }
+fn fire(h: *Hook) { h.f(); }
+fn main() {}
+// error: uses gc

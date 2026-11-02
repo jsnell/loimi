@@ -1,0 +1,8 @@
+// A `block fn` lives only during the call that received it: an escaping
+// closure cannot capture it (that would be a reference escaping its frame).
+import std.mem;
+fn keep(a: *mem.Arena, f: block fn(i64) -> i64) -> closure fn(i64) -> i64 {
+    new(a, |x| f(x))
+}
+fn main() {}
+// error: this closure escapes, but it captures `f`, a `block fn` that only lives during the call that received it

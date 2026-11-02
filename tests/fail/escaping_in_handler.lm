@@ -1,0 +1,10 @@
+// Creating escaping closures is not allowed in vm code either.
+import std.mem;
+vm V {
+    state { pc: *u32, acc: i64, a: *mem.Arena }
+    encoding fixed(u32) { format A { op: 8 } }
+    op ADD() : A { let f: closure fn() -> i64 = new(a, || 1); next }
+    entry run(c: *u32, m: *mem.Arena) -> i64 { pc = c; acc = 0; a = m; jump pc }
+}
+fn main() {}
+// error: closures are not allowed in vm code
