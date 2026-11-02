@@ -1,9 +1,11 @@
 // matrix: dispatch
 // `#[forward]` superinstructions: a later part reading the register an
-// earlier part wrote gets the value directly (checked here for results
-// only: forwarded or not, the program must compute the same values),
-// including a cold path in the forwarded part and both operands naming
-// the written register.
+// earlier part wrote gets the value directly. `optimize` picks the
+// forwarding variant (`S__fN`) whose links hold; checked here for
+// results (forwarded or not, the program must compute the same values),
+// including a cold path in the forwarded part, both operands naming the
+// written register, the verifier rejecting a variant whose fields
+// differ, and quickening inside a variant.
 import std.io;
 
 vm V {
@@ -19,7 +21,10 @@ vm V {
     }
 
     op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
-    op MUL(dst: reg, a: reg, b: reg) : ABC { dst = a * b; next }
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a * b; if a == 2 { become MUL_2; } next }
+        MUL_2 { dst = a * b; next }
+    }
     op ADD(dst: reg, a: reg, b: reg) : ABC {
         if a + b > 1000 { cold { *ctx += 1; dst = 1000; next } }
         dst = a + b;
@@ -29,6 +34,7 @@ vm V {
 
     #[forward] super MUL_ADD = MUL; ADD;
     #[forward] super MUL_ADD_ADD = MUL; ADD; ADD;
+    #[forward] super MUL2_ADD = MUL_2; ADD;
 
     entry run(c: *i64, code: *u32, r: *i64) -> i64 {
         ctx = c;
@@ -90,9 +96,41 @@ fn main() {
     at = V.emit.ADD(c, at, 4, 0, 3);
     at = V.emit.RET(c, at, 4);
     go(c, at);
+    // A variant whose linked fields differ does not verify.
+    at = V.emit.LOADI(c, 0, 0, 3);
+    at = V.emit.LOADI(c, at, 1, 4);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 2, 0);
+    at = V.emit.RET(c, at, 3);
+    V.optimize_words(c[0..at]);
+    show(V.verify(c[0..at]));
+    code[3] = V.ADD(3, 1, 0);
+    show(V.verify(c[0..at]));
+    // Quickening the head part of a variant keeps the variant (r0 = 2
+    // makes MUL become MUL_2): MUL_ADD__f1 becomes MUL2_ADD__f1.
+    at = V.emit.LOADI(c, 0, 0, 2);
+    at = V.emit.LOADI(c, at, 1, 5);
+    at = V.emit.MUL(c, at, 2, 0, 1);
+    at = V.emit.ADD(c, at, 3, 2, 1);
+    at = V.emit.RET(c, at, 3);
+    go(c, at);
+    io.println(V.op_name(code[2]));
+    go(c, at);
 }
-// expect: MUL_ADD 15 0
-// expect: MUL_ADD 15 0
-// expect: MUL_ADD 1000 1
+
+fn show(r: Result<Verified<V>, V.VerifyError>) {
+    match r {
+        Ok(_) => io.println("ok"),
+        Err(e) => io.println(e.message()),
+    }
+}
+// expect: MUL_ADD__f1 15 0
+// expect: MUL_ADD__f2 15 0
+// expect: MUL_ADD__f3 1000 1
 // expect: MUL_ADD 12 0
-// expect: MUL_ADD_ADD 23 0
+// expect: MUL_ADD_ADD__f1 23 0
+// expect: ok
+// expect: a forwarding superinstruction's linked operands name different registers
+// expect: MUL_ADD__f1 15 0
+// expect: MUL2_ADD__f1
+// expect: MUL2_ADD__f1 15 0

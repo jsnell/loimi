@@ -1110,7 +1110,7 @@ verify context, nothing else; a verify context cannot be named `it` or `pc`.
 
 **Errors.** `Mini.VerifyError` has `at` (the word index), `reason` (an
 enum `Mini.VerifyReason`: `Empty`, `TooLong`, `BadOpcode`, `Truncated`,
-`SuperPart`, `Then`, `RunsOffEnd`, `Operand`, `Check` for a failing
+`SuperPart`, `Forward`, `Then`, `RunsOffEnd`, `Operand`, `Check` for a failing
 `verify` block, below), and for `Operand` the
 operand's index and kind. `e.message()` describes the reason, and
 `e.write(&out)` writes the whole diagnosis to any buffer with
@@ -1428,16 +1428,22 @@ quickening, declare both: the pair with the generic member, which
 `optimize` forms, and the pair with the quickened member, which the
 `become` turns it into.
 
-**Forwarding.** In `#[forward] super A_B = A; B;`, each part after the
-first is compiled twice for an operand that may name a register the
-previous part assigned (same operand kind; at most two such operands
-per part): once with that operand's field replaced by the previous
-part's, under `if b.raw == dst.raw`, and once as written. In the first
-copy LLVM forwards the stored value instead of loading it back, which
-takes a store-to-load round trip (about 5 cycles on x86) off the
-dependency chain. It costs a compare and a branch that is predictable
-per site, so it pays off on latency-bound chains (`MUL; ADD` feeding a
-divide) and not on throughput-bound code.
+**Forwarding.** A super's parts exchange values through the register
+file: `MUL; ADD` stores the product to `R[dst]` and loads `R[a]` back,
+and since both indices are operands, LLVM cannot tell that they are the
+same register. The load waits for the store (a store-to-load round
+trip, about 5 cycles on x86). In `#[forward] super A_B = A; B;`, an
+operand of a later part that may name the register the previous part
+writes (same operand kind, not written by the part itself; at most two
+per part and three per super) is a *link*. The vm gets one more opcode
+per nonempty set of links, a *forwarding variant* `A_B__fN` (N a bit
+mask over the links), whose handler uses the previous part's field for
+the linked operands, so LLVM forwards the stored value in a machine
+register. `optimize` picks the variant whose linked fields are equal
+(the plain super otherwise), the verifier rejects a variant whose
+fields differ (`Forward`), and a `become` in a part keeps the variant
+when the new super has it. There is no run-time test; the cost is
+opcodes (up to 7 per super) and code size.
 
 `loimi build --vm-stats` records opcode pair frequencies, and at exit
 prints the most frequent pairs as ranked `super` declarations. (The

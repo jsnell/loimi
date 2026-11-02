@@ -25,6 +25,13 @@ pub struct OpLayout {
     pub family: usize,
     /// `then OP`: the op that must follow this one.
     pub then: Option<usize>,
+    /// A forwarding variant of a `#[forward]` super (named `S__fN`):
+    /// the links it assumes, each (part j, operand index in part j,
+    /// operand index in part j - 1) for a part's operand that names the
+    /// register the previous part writes. `optimize` picks the variant
+    /// whose fields are equal, and its handler reads the stored value
+    /// instead of the register. Empty for every other op.
+    pub fwd: Vec<(usize, usize, usize)>,
 }
 
 pub struct VmLayout {
@@ -122,7 +129,7 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
             Some(f) => v.ops.iter().position(|o| o.name.name == *f).unwrap_or(i),
             None => i,
         };
-        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache, parts: vec![], family, then: None });
+        ops.push(OpLayout { name: op.name.name.clone(), kinds, opcode: i as u32, fields, cache, parts: vec![], family, then: None, fwd: vec![] });
     }
     for (i, op) in v.ops.iter().enumerate() {
         if let Some(t) = &op.then {
@@ -149,7 +156,23 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         }
         let opcode = ops.len() as u32;
         let family = ops[parts[0]].family;
-        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache: None, parts, family, then: None });
+        ops.push(OpLayout { name: s.name.name.clone(), kinds: vec![], opcode, fields: vec![], cache: None, parts, family, then: None, fwd: vec![] });
+    }
+    // Forwarding variants, after every declared op and super (so that a
+    // lookup by parts finds the plain super first).
+    for (si, s) in v.supers.iter().enumerate() {
+        if !s.forward {
+            continue;
+        }
+        let k = v.ops.len() + si;
+        let links = forward_links(v, &ops, &ops[k].parts);
+        for mask in 1..1u32 << links.len() {
+            let fwd: Vec<(usize, usize, usize)> = (0..links.len()).filter(|i| mask & (1 << i) != 0).map(|i| links[i]).collect();
+            let o = &ops[k];
+            let (name, parts, family) = (format!("{}__f{}", o.name, mask), o.parts.clone(), o.family);
+            let opcode = ops.len() as u32;
+            ops.push(OpLayout { name, kinds: vec![], opcode, fields: vec![], cache: None, parts, family, then: None, fwd });
+        }
     }
     if ops.len() as u64 > (1u64 << op_bits) {
         return Err(Diag::new(v.name.span, format!("{} ops do not fit in a {}-bit opcode field", ops.len(), op_bits)));
@@ -157,6 +180,36 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
     let cache_words = v.caches.iter().map(|c| c.fields.len() as u32).collect();
     let cache_names = v.caches.iter().map(|c| c.name.name.clone()).collect();
     Ok(VmLayout { word_bits, op_shift, op_bits, ops, cache_words, cache_names })
+}
+
+/// The forwarding candidates of a `#[forward]` super with `parts`: per
+/// later part, up to two operands it does not write itself whose kind is
+/// that of an operand the previous part writes (the first such), as
+/// (part, operand, previous part's operand); at most three in all, and
+/// only between fields of the same signedness.
+fn forward_links(v: &VmDecl, ops: &[OpLayout], parts: &[usize]) -> Vec<(usize, usize, usize)> {
+    let written = |p: usize| -> Vec<usize> {
+        let od = &v.ops[p];
+        (0..od.params.len()).filter(|&pi| crate::vmcheck::block_assigns(&od.body, &od.params[pi].name.name)).collect()
+    };
+    let mut links = Vec::new();
+    for j in 1..parts.len() {
+        let (prev, cur) = (parts[j - 1], parts[j]);
+        let (pw, cw) = (written(prev), written(cur));
+        let mut n = 0;
+        for pi in 0..ops[cur].kinds.len() {
+            if cw.contains(&pi) || n == 2 {
+                continue;
+            }
+            if let Some(&d) = pw.iter().find(|&&d| ops[prev].kinds[d] == ops[cur].kinds[pi]) {
+                n += 1;
+                if ops[prev].fields[d].3 == ops[cur].fields[pi].3 && links.len() < 3 {
+                    links.push((j, pi, d));
+                }
+            }
+        }
+    }
+    links
 }
 
 impl VmLayout {
@@ -194,6 +247,18 @@ impl VmLayout {
                 r
             })
             .collect()
+    }
+    /// For a forwarding variant: per link, a source condition that the
+    /// two fields are equal. `word` is the source of a code word with
+    /// `{}` for its offset from the head.
+    pub fn fwd_conds(&self, vm: &str, k: usize, word: &str) -> Vec<String> {
+        let offs = self.part_offsets_src(vm, k);
+        let field = |j: usize, fi: usize| {
+            let (_, bits, shift, signed) = self.ops[offs[j].1].fields[fi];
+            let w = word.replace("{}", &offs[j].0);
+            format!("{{ let __w = {w}; {} }}", decode_src(self.word_bits, bits, shift, signed))
+        };
+        self.ops[k].fwd.iter().map(|&(j, pi, d)| format!("{} == {}", field(j, pi), field(j - 1, d))).collect()
     }
     /// The op a word stands for on its own: a superinstruction's first part.
     pub fn base(&self, i: usize) -> usize {
@@ -488,7 +553,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     // Errors.
     let _ = writeln!(
         s,
-        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Then, RunsOffEnd, Operand, Check }}\n\
+        "{vis}enum {n}__VerifyReason {{ Empty, TooLong, BadOpcode, Truncated, SuperPart, Forward, Then, RunsOffEnd, Operand, Check }}\n\
          {vis}struct {n}__VerifyError {{ at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64 }}\n\
          fn {n}__verr(at: u64, reason: {n}__VerifyReason, op: u64, operand: u64, kind: u64) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
          \x20 Err({n}__VerifyError {{ at: at, reason: reason, op: op, operand: operand, kind: kind }})\n}}\n\
@@ -499,6 +564,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
          \x20   BadOpcode => \"invalid opcode\",\n\
          \x20   Truncated => \"the instruction runs past the end of the code\",\n\
          \x20   SuperPart => \"a superinstruction's word holds an op outside its part's family\",\n\
+         \x20   Forward => \"a forwarding superinstruction's linked operands name different registers\",\n\
          \x20   Then => \"the instruction is not followed by the op its `then` requires\",\n\
          \x20   RunsOffEnd => \"execution can run off the end of the code after this instruction\",\n\
          \x20   Operand => \"an operand fails its kind's verify clause\",\n\
@@ -619,6 +685,9 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 format!("if {n}__family(__code[__i + {off}]) != {} {{ {} }}", l.ops[*p].family, fail("__i", "SuperPart", &op_at("__i")))
             })
             .collect();
+        for c in l.fwd_conds(n, k, "__code[__i + {}]") {
+            arms.push(format!("if !({c}) {{ {} }}", fail("__i", "Forward", &op_at("__i"))));
+        }
         // `then OP`: the next instruction must be an OP; if this op may
         // continue, something must come after that OP too.
         let b = l.base(k);
@@ -875,7 +944,9 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     }
     let _ = writeln!(s, "  var i: u64 = 0;\n  while i < code.len {{");
     let mut supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
-    supers.sort_by_key(|&k| std::cmp::Reverse(l.ops[k].parts.len()));
+    // Longest first; a super's forwarding variants before it, those with
+    // more links first.
+    supers.sort_by_key(|&k| (std::cmp::Reverse(l.ops[k].parts.len()), std::cmp::Reverse(l.ops[k].fwd.len())));
     let mut first = true;
     for k in supers {
         let o = &l.ops[k];
@@ -883,6 +954,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         for (off, p) in l.part_offsets_src(n, k) {
             conds.push(format!("{n}__base_op(code[i + {off}]) == {}", l.ops[p].opcode));
         }
+        conds.extend(l.fwd_conds(n, k, "code[i + {}]"));
         let _ = writeln!(
             s,
             "    {}if {} {{ code[i] = {n}__with_opcode(code[i], {}); }}",

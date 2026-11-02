@@ -32,8 +32,9 @@ pub struct OpInfo {
     pub parts: Vec<usize>,
     /// `then OP`: the op that follows this one.
     pub then: Option<usize>,
-    /// A `#[forward]` superinstruction.
-    pub forward: bool,
+    /// A forwarding variant of a `#[forward]` super: its links
+    /// (`vmexpand::OpLayout::fwd`).
+    pub fwd: Vec<(usize, usize, usize)>,
     pub size: u32,
     pub fid: FnId,
     pub body: Option<Block>,
@@ -227,7 +228,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
 /// One warning per super, at the later declared of each pair, naming the
 /// earlier ones it overlaps.
 fn warn_super_overlaps(c: &mut Checker, d: &VmDecl, l: &crate::vmexpand::VmLayout) {
-    let supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty()).collect();
+    let supers: Vec<usize> = (0..l.ops.len()).filter(|&k| !l.ops[k].parts.is_empty() && l.ops[k].fwd.is_empty()).collect();
     let span_of = |k: usize| d.supers.iter().find(|s| s.name.name == l.ops[k].name).map(|s| s.name.span);
     let names = |ps: &[usize]| ps.iter().map(|&p| l.ops[p].name.as_str()).collect::<Vec<_>>().join("; ");
     // The sequence in which `x` then `y` both match, if they overlap that way.
@@ -471,7 +472,9 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 od.name.span,
             )
         } else {
-            let sd = &d.supers[k - d.ops.len()];
+            // A forwarding variant has its super's parts.
+            let base = l.ops.iter().position(|o| o.parts == lo.parts).unwrap();
+            let sd = &d.supers[base - d.ops.len()];
             (String::new(), None, vec![], vec![], None, sd.name.span)
         };
         let fid = new_fn(
@@ -495,7 +498,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             fields: lo.fields.iter().map(|f| (f.1, f.2, f.3)).collect(),
             parts: lo.parts.clone(),
             then: lo.then,
-            forward: k >= d.ops.len() && d.supers[k - d.ops.len()].forward,
+            fwd: lo.fwd.clone(),
             size: l.size(k),
             fid,
             body,
@@ -1017,16 +1020,15 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
     let word = info.word;
     let fid = info.ops[k].fid;
     let parts: Vec<usize> = if info.ops[k].parts.is_empty() { vec![k] } else { info.ops[k].parts.clone() };
-    let forward = info.ops[k].forward;
+    let fwd = info.ops[k].fwd.clone();
     let ret = info.ret.clone();
     let mut cx = FnCx::new(m, ret);
     let state = declare_state(c, vm, &mut cx);
     let mut exprs = Vec::new();
     let n = parts.len();
     let mut off = 0;
-    // Operands the previous part assigns (kind, raw field local), for
-    // forwarding into this part.
-    let mut prev_written: Vec<(usize, LocalId)> = Vec::new();
+    // The previous part's raw field locals, for forwarding into this part.
+    let mut prev_raws: Vec<LocalId> = Vec::new();
     for (j, &p) in parts.iter().enumerate() {
         let op = &c.vms[vm as usize].ops[p];
         let span = op.span;
@@ -1055,26 +1057,17 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             ..HandlerCx::new(vm, state.clone())
         });
         off += size;
-        let written: Vec<usize> = if forward { (0..params.len()).filter(|&pi| block_assigns(&body, &params[pi])).collect() } else { vec![] };
-        // Forwarding (`#[forward] super`): an operand read here that may
-        // name the register the previous part just wrote. The body is
-        // also checked with that operand's field replaced by the previous
-        // part's, under `if x.raw == d.raw`, so LLVM forwards the stored
-        // value instead of reloading it through memory. That takes a
-        // store-to-load round trip off a dependency chain, at the cost of
-        // a compare and a predictable branch per candidate operand.
-        let mut fwd: Vec<(usize, LocalId)> = Vec::new();
-        for pi in 0..params.len() {
-            if written.contains(&pi) || fwd.len() == 2 {
-                continue;
-            }
-            if let Some(&(_, d)) = prev_written.iter().find(|(kind, _)| *kind == kinds[pi]) {
-                fwd.push((pi, d));
-            }
+        let raws: Vec<LocalId> = cx.vm.as_ref().unwrap().operands.iter().map(|o| o.2).collect();
+        // A forwarding variant (`#[forward] super`): the operands linked
+        // to the register the previous part wrote use that part's field
+        // (`optimize` checked that they are equal), so LLVM forwards the
+        // stored value instead of reloading it through memory. That
+        // takes a store-to-load round trip off a dependency chain.
+        for &(_, pi, d) in fwd.iter().filter(|l| l.0 == j) {
+            cx.vm.as_mut().unwrap().operands[pi].2 = prev_raws[d];
         }
-        let hcx = cx.vm.clone().unwrap();
         let r = c.block(&mut cx, &body, Some(&Ty::Never));
-        let mut b = r?;
+        let b = r?;
         if b.ty != Ty::Never {
             cx.scopes.pop();
             return Err(Diag::new(
@@ -1082,23 +1075,8 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
                 format!("handler `{}` can reach its end; every path must end in `next`, `jump`, `exit`, `raise` or `redo`", name),
             ));
         }
-        for &(pi, d) in fwd.iter().rev() {
-            let mut h2 = hcx.clone();
-            h2.operands[pi].2 = d;
-            cx.vm = Some(h2);
-            let bf = c.block(&mut cx, &body, Some(&Ty::Never))?;
-            let raw = hcx.operands[pi].2;
-            let rt = cx.locals[raw as usize].ty.clone();
-            let eq = mk(
-                Ty::Bool,
-                TK::Binary(BinOp::Eq, Box::new(mk(rt.clone(), TK::Local(raw), span)), Box::new(mk(rt, TK::Local(d), span))),
-                span,
-            );
-            b = mk(Ty::Never, TK::If(vec![TCond::Expr(eq)], Box::new(bf), Some(Box::new(b))), span);
-        }
-        cx.vm = Some(hcx.clone());
         cx.scopes.pop();
-        prev_written = written.iter().map(|&pi| (kinds[pi], hcx.operands[pi].2)).collect();
+        prev_raws = raws;
         let e = mk(Ty::Never, TK::Block(lets, Some(Box::new(b))), span);
         exprs.push(if n > 1 { mk(Ty::Never, TK::Vm(TVm::Part(j as u32, Box::new(e))), span) } else { e });
     }
@@ -1121,7 +1099,7 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
 
 /// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for
 /// finding the operands an op writes.
-fn block_assigns(b: &Block, x: &str) -> bool {
+pub(crate) fn block_assigns(b: &Block, x: &str) -> bool {
     b.stmts.iter().any(|s| match s {
         Stmt::Let { init, els, .. } => init.as_ref().is_some_and(|e| expr_assigns(e, x)) || els.as_ref().is_some_and(|b| block_assigns(b, x)),
         Stmt::Expr { expr, .. } | Stmt::Defer(expr) => expr_assigns(expr, x),
@@ -1342,10 +1320,13 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
             // In a superinstruction: the part's own word becomes the new
             // op (for jumps into the middle), and the head word becomes the
             // super with this part replaced, if one is declared, or else
-            // the sequence's first op: the super is split up.
+            // the sequence's first op: the super is split up. A forwarding
+            // variant becomes the same variant of that super, if it has
+            // one (`become` keeps the fields, so the links still hold).
             let mut parts = info.ops[sk].parts.clone();
             parts[j] = t;
-            let head = match info.ops.iter().find(|o| o.parts == parts) {
+            let fwd = &info.ops[sk].fwd;
+            let head = match info.ops.iter().find(|o| o.parts == parts && o.fwd == *fwd).or_else(|| info.ops.iter().find(|o| o.parts == parts)) {
                 Some(o) => o.opcode,
                 None => info.ops[parts[0]].opcode,
             };

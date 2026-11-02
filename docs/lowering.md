@@ -474,6 +474,17 @@ reach it, so it exists only for defense in depth.
   `LOADK`'s `next` replaced by a branch, and advances `pc` by two words on its
   final `next`. LLVM then optimizes across the boundary (for example,
   forwarding the stored constant into `ADD`'s load).
+  It cannot forward a register: `ADD` loads `regs[a]` after `LOADK` stored
+  `regs[dst]`, two indices decoded from different words, so the load must
+  stay (no alias metadata can help: when they are equal, the load must see
+  the store).
+- A forwarding variant of a `#[forward] super` (`MUL_ADD__f1`) is the
+  same handler with `ADD`'s `a` decoded from `MUL`'s `dst` field. The two
+  addresses are then the same SSA value, so GVN replaces the load with
+  the stored value (a phi when several paths of `MUL` store), and the
+  value stays in a register. The variant is only correct where the
+  fields are equal: `optimize` checks them before choosing it, and the
+  verifier rejects it otherwise.
 - Family members are ordinary ops that share a format. `become` stores the
   opcode byte (section 3). In a super's part, it stores the part's own word
   and the super's first word (the opcode of the super with that part
