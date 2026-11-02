@@ -35,8 +35,9 @@ emits textual LLVM IR, which `clang-19` compiles and links. The vm tools
 verifier, label helpers, the disassembler) are generated as Loimi source
 (`src/vmexpand.rs`) and type-checked like user code; handlers and
 dispatch tables are generated as IR (`src/vmgen.rs`). Entries are
-internal functions: there are no generated C-ABI entry points and no
-`Mini.call`. A C host embeds an interpreter through `export "C"`
+internal functions: there are no generated C-ABI entry points.
+`Mini.call` is an entry the interpreter writes, declared `uses reenter`
+(§4). A C host embeds an interpreter through `export "C"`
 functions written in Loimi, built with `--lib` (static archive) or
 `--shared`, with a header from `--header` (`src/header.rs`; see §4 and
 `language.md` §10.1).
@@ -298,7 +299,60 @@ define { i64, i64 } @Mini.run(ptr %ctx, i64 %closure) {      ; C ABI (design; en
 
 `Mini.call` (reentrant) is the same function with a nested-entry marker pushed
 on the frame stack. It counts C-stack depth and fails with a guest
-stack-overflow error past the limit. (*Not yet implemented.*)
+stack-overflow error past the limit.
+
+**As implemented: nested entries.** An entry declared `uses reenter` is
+lowered like any entry: in tail-call mode a function that sets up the
+state and makes one ordinary `preserve_none` call into the first handler
+(so it saves the callee-saved registers the handlers clobber), and
+returns what the `exit`ing handler returned or left in `ret_slot`; in
+goto and switch modes the entry's own loop function with every handler
+inlined, called recursively when runs nest. The nested loop therefore runs on the C stack of the
+native that called it, above the outer loop's frames, and its `exit`
+returns to that native. Two additions:
+
+```llvm
+define internal { i1, i64, i64 } @"vm.Mini.call"(ptr %p0, ptr %p1, ptr %p2) {
+start:
+  %depth.saved = load i32, ptr @"vm.Mini__depth"     ; thread_local
+  %depth.inc = add i32 %depth.saved, 1
+  store i32 %depth.inc, ptr @"vm.Mini__depth"
+  ...
+  store i32 %depth.saved, ptr @"vm.Mini__depth"      ; before every `ret`
+  ret { i1, i64, i64 } %r
+}
+```
+
+- `Vm.depth` is a thread-local `u32` generated with the vm's other items
+  (`#[thread_local] var Mini__depth`); the entry saves it, increments it,
+  and stores the saved value back before each `ret`, so early returns
+  and every exit path restore it.
+- Calls to the entry have the `reenter` effect (§9).
+
+The frame sentinel (which frame's return leaves the run), the frame
+placement and the depth limit are the interpreter's code (`language.md`
+§10). What must not break is the compiler's own per-thread state: cold
+captures, `-> never` arguments and `on raise`'s argument are loaded from
+their thread-local slots at the top of the function that receives them,
+before it can call anything, and `exit` stores `ret_slot` just before
+the chain returns to its entry, so a nested run in between never
+overwrites a slot that an outer handler still has to read.
+
+Measured on Mini (`bench/reenter/run.sh`: `table.sort` on 200,000
+integers, 3.8M comparisons, best of 7 on a loaded machine): the native
+sort comparing with `<` takes 13 ns per comparison; with a Lua
+comparator, which costs a nested run each (closure call, `call_value`'s
+checks and argument copy, the entry and its register saves, the
+comparator's few instructions, `exit` through `ret_slot`), 33 ns; the
+same algorithm written in Lua, where the comparison is an ordinary
+`CALL` inside the one loop, 27 ns. A nested run costs a few tens of
+cycles beyond the work it does, so a native higher-order builtin does
+not beat a prelude version unless the native part saves more than that
+per callback: Scheme's and MiniJS's preludes remain the faster choice
+for `map`, `for-each` or `sort` with cheap callbacks. Re-entry is for
+what cannot stay in the loop: C natives and embedders calling back,
+metamethods invoked from runtime functions, and builtins whose own work
+dominates.
 
 **As implemented: libraries.** The interpreter writes its C API as
 `export "C"` functions (external linkage, C calling convention, `bool`
@@ -435,8 +489,15 @@ store ptr %top, ptr %ctx.sync.top          ; top = regs + proto.nregs, or sp
 store i64 %live_value_1, ptr %ctx.tmproots[0]
 call @heap_collect_slow(...)
 ; with a moving heap: reload %live_value_1 from ctx.tmproots[0]
-; with `reenter`: reload pc/regs/k from ctx.sync as well
+; with `reenter`: run the vm's `reload` block (stores to the state slots)
 ```
+
+As implemented, the stores before the call are the vm's `sync` block and
+the code after a `reenter` call is its `reload` block, both lowered
+inline at the call site like the handler's own code: in tail-call mode
+the state lives in `alloca`s that mem2reg turns into SSA values, so
+`reload`'s assignments simply become the values later code uses. A
+`reenter` call in a vm without `reload` is a compile error.
 
 Calls without effects get none of this. In ordinary (non-handler) functions,
 live `Gc` locals at `gc` call sites are stored in an `alloca`'d shadow-stack

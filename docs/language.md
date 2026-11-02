@@ -825,6 +825,10 @@ The compiler generates `Mini.run(ctx, c) -> Result<Value, Value>` with the C
 ABI. `on raise` is an ordinary handler: it receives the live state, so the
 `pc` it sees is exact without any syncing.
 
+An entry declared `entry call(..) -> R uses reenter` is a *nested
+entry*: it starts a run above the frames of a run that is already
+active, for host code (a native) that calls guest code. See section 10.
+
 ### 3.7 Dispatch strategies
 
 Selected per build (`--dispatch=` or `#[dispatch(...)]` on the vm):
@@ -883,7 +887,7 @@ Loimi has three ordered **effects** on functions:
 |---|---|---|
 | `sync` | callee reads VM state (`pc` for tracebacks, `top`) | state written to `ctx.sync` |
 | `gc` | callee may run a garbage collection | `sync`, plus every live `Gc`/`Value` local made visible as a root |
-| `reenter` | callee may run guest code (call into the VM) | `gc`, plus state reloaded afterwards |
+| `reenter` | callee may run guest code (call into the VM) | `gc`, plus state reloaded afterwards (the vm's `reload` block) |
 
 ```loimi
 fn new_string(h: *Heap, s: str) -> Gc<Str> uses gc;
@@ -916,6 +920,50 @@ Rules:
 - Syncs only happen where they are needed, so code with no effects never
   writes `pc` to memory. Saving `pc` on every instruction would add a store per
   dispatch.
+
+### `reenter` and the cached state
+
+A call with `reenter` may run guest code on the same VM stack, nested
+above the calling frame (section 10). Rooting traced locals, as for `gc`,
+is not enough: while the guest code ran, the stack may have been
+reallocated and frames pushed and popped, so every state register that
+caches something derived from them (`regs`, `k`, `fp`, a stack top)
+may be stale. (The dispatch table register is not among them: a nested
+run starts with the default table, and `use_variant` there switches
+only that run's.) A vm
+whose handlers or vm functions make such calls declares how to get its
+state back, next to `sync`:
+
+```loimi
+sync   { ctx.fp = fp; }                            // before: publish
+reload { fp = ctx.fp; regs = ctx.stack + fp.base; k = fp.k; }   // after: recompute
+```
+
+- At each `reenter` call in an op, `on raise`, `cold` block or vm
+  function, the compiler runs `sync`, roots traced locals, makes the
+  call, then runs `reload` (through the state pointers in a vm
+  function). The call's result is used after the reload, so
+  `dst = native(ctx, a)?` stores into the reloaded `regs`. A `reenter`
+  call in vm code without a `reload` block is an error.
+- `reload` should recompute state from what the nested run cannot have
+  invalidated: offsets or the frame record the native's caller left, not
+  pointers saved before the call. `pc` usually needs no reload (code does
+  not move), and the current instruction word, decoded operand fields
+  and `next`'s size are fixed.
+- What `reload` cannot fix is the handler's own derived data. A raw
+  pointer into the stack computed before the call (`let p = regs + a`)
+  is stale after it: compute it again from the reloaded state. The same
+  goes for anything read from the heap or the code before the call: the
+  guest code may have changed tables, upvalues (and through them the
+  caller's registers), inline cache words, or quickened and fused the
+  very instruction that is running (its operands stay the same, so
+  `next` is still right). The compiler does not check these; keep the
+  code after a `reenter` call short, as in a `cold` block that stores
+  the result and continues.
+- Thread-local slots the compiler uses to move values between handlers
+  (cold-block captures, `-> never` arguments, the raise and result
+  slots) are read before any call can re-enter, so nested runs do not
+  clobber them.
 
 ### Effects on function types
 
@@ -1292,19 +1340,62 @@ op-pair counters into the handlers and prints them at exit.
 
 ## 10. Calls, reentrancy, coroutines, embedding
 
-*Design; not yet implemented:* `std.rt` (`FrameStack`, `Fiber`),
-`Mini.call`, and `suspend`. Today a vm's `entry` functions are ordinary
-internal Loimi functions (not C-ABI exports), and the example
-interpreters keep their own frame stacks in vm state. Embedding (below)
-is implemented without them: the interpreter wraps its entry in
-`export "C"` functions it writes itself.
+*Design; not yet implemented:* `std.rt` (`FrameStack`, `Fiber`) and
+`suspend`. A vm's `entry` functions are ordinary internal Loimi
+functions (not C-ABI exports), and the example interpreters keep their
+own frame stacks in vm state. Embedding (below) wraps entries in
+`export "C"` functions the interpreter writes itself. Host-to-guest
+calls are implemented as nested entries (below).
 
 - **Guest-to-guest calls** should stay in the loop: push a frame (`std.rt.FrameStack`),
   slide the register window, and `jump`. This uses no C stack, so deep guest
   recursion is bounded by the VM stack, not the C stack.
-- **Host-to-guest calls** (metamethods, callbacks, `sort` comparators) use
-  `Mini.call(ctx, f, args) uses reenter`, which runs a nested loop on top of
-  the same VM stack. The C stack depth is limited and checked.
+- **Host-to-guest calls** (metamethods, callbacks, `sort` comparators)
+  run a nested loop on top of the same VM stack, through an entry
+  declared `uses reenter` (a *nested entry*):
+
+  ```loimi
+  entry call(c: *Ctx, at: *Frame, cl: Gc<Closure>) -> Result<V, V> uses reenter {
+      ctx = c;
+      fp = at;                       // a frame above the caller's, args in place
+      fp.cl = cl; fp.nres = 1; k = cl.proto.consts.data.ptr; fp.k = k;
+      regs = fp.base;
+      c.base = fp;                   // the sentinel: RET from here exits
+      c.fp = fp;
+      jump cl.proto.code.ptr
+  }
+  ```
+
+  - **It is an entry**: in tail-call mode, a fresh call that makes the
+    first `preserve_none` call into the handlers and returns when one of
+    them says `exit` or `fail`; in goto and switch modes, a call of the
+    entry's own loop function (every entry has one, with all the
+    handlers; recursive when runs nest). The nested loop runs on the C
+    stack of the native that called it, and leaves the outer loop's
+    state where the outer handler's `sync` put it.
+  - **Its callers need `uses reenter`**: an ordinary function calling it
+    declares the effect, and a handler calling it (or calling a native
+    that may) gets `sync` before and `reload` after (section 5). An
+    entry may declare no other effect.
+  - **`Vm.depth`**: the compiler keeps a thread-local count of the nested
+    runs active on the thread, one more while a nested entry runs (also
+    when it returns early). Code that calls nested entries checks it to
+    bound the C stack: Mini fails with "C stack overflow" past 200, as
+    Lua does. It is per thread, not per vm state, because natives of one
+    state may call into another on the same C stack.
+  - **What the vm does itself**: where the new frame goes (above
+    `ctx.fp`, which the caller's `sync` published), which frame is the
+    sentinel (Mini's `RET` exits when `fp == ctx.base`, the bottom frame
+    of the innermost run, instead of `ctx.frames`), restoring the
+    caller's frame registers after the call, and turning an error into a
+    result. The compiler does not know the frame layout, so these are
+    the vm's code, typically one host function around the entry
+    (Mini's `vm.call_value`).
+  - **Errors**: `raise` in the nested run reaches that run's `on raise`,
+    whose `exit`/`fail` returns from the nested entry; the native gets
+    the `Result` and decides. If it re-raises, the outer `on raise` sees
+    the error again: Mini marks errors that already carry their position
+    (`ctx.rethrow`) so it does not prefix a second line number.
 - **Coroutines and generators** fall out of the explicit state: a coroutine is
   a separate `ValueStack` plus `FrameStack`, `suspend v` leaves the loop with
   state saved, and resuming re-enters through an entry that restores it.
@@ -1363,26 +1454,39 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   of code with no error path (Mini's parser); see `stdlib.md`, `std.rt`.
 
 **Re-entry.** A C function registered as a native runs inside a
-handler's `cold` block, between GC safepoints: the vm state is not
-synced (`ctx.fp` may be stale) and the handler holds values in
-registers. Calling back into the interpreter from there would need the
-`reenter` effect (sync everything, reload after), and C function
-pointers carry no effects the checker could see. The first version
-therefore **forbids re-entry at run time**: `mini_dostring` called while
-any Mini code runs on the thread (that is, from a native) returns
-`MiniStatus_Reenter`. Natives may use the API calls that allocate but
-never collect: argument and result accessors and the global getters and
-setters, of their own state or another. Supporting re-entry means
-giving the native call `uses reenter` (so the handler syncs before it
-and reloads after) and running a nested loop on the same VM stack above
-the caller's frames (`Mini.call` above), rather than `entry run`'s reset
-to the bottom frame.
+handler's `cold` block. Its type in Loimi says so: Mini stores natives
+as `fn(*MiniState, *u8) -> i32 uses reenter`, so the call through the
+pointer has the effect, and the handler syncs before it and reloads
+after (section 5). The header's C type is the plain function pointer:
+C cannot see effects, and needs none, because the Loimi side assumes
+the worst. A native may then:
+
+- call a Mini function: `mini_call(S, nargs)` calls the function below
+  `nargs` arguments on the state's value stack (pushed with
+  `mini_push_global`, `mini_push_arg`, `mini_push_number`, ...), as a
+  nested run above the native's caller (`vm.call_value`, the nested
+  entry `Mini.call`), and pushes the result, or the error value with
+  `MiniStatus_Runtime`. `mini_raise_top` re-raises that error unchanged;
+- run a chunk: `mini_dostring` from a native is a nested run too;
+- call into another state: a run of that state, counted in the same
+  thread-local `Mini.depth`.
+
+C never holds a Mini value: values stay on the value stack, a GC root
+that `mini_call` and natives use by position (-1 is the top), and what a
+native pushes is popped when it returns. Strings from `mini_to_string`
+stay valid while their value is on the stack. More than 200 nested runs
+on a thread fail with "C stack overflow". The one thing a native must
+not do is free its own state. The host can also call Mini functions
+between runs, with the same `mini_call`.
 
 The worked example is `examples/mini/embed.lm` (the Mini interpreter as
 a library, reusing `vm.lm`, `compile.lm` and `value.lm` through
 `state.lm`) with `examples/embed/host.c`: two states alive at once,
 globals both ways, C natives with user data, syntax and runtime errors
-with messages, and a GC-stress run through the API.
+with messages, natives calling back into Mini (nested 50 levels through
+Mini and C, past the limit, with errors passing through, under GC
+stress, and into another state), the host calling Mini functions, and a
+GC-stress run through the API.
 
 ---
 
