@@ -1,0 +1,7 @@
+# Reference Lox implementation (clox) plus the official test suite and
+# benchmarks, from Crafting Interpreters (MIT license). Fetched and built by
+# install.sh into bench/lox/src and bench/lox/install (gitignored). Nothing
+# here is committed except this manifest, the script and the runners.
+#
+# name                 url                                                                                                       sha256
+craftinginterpreters   https://github.com/munificent/craftinginterpreters/archive/4a840f70f69c6ddd17cfef4f6964f8e1bcd8c3d4.tar.gz   bf8173f246369a6f6ba5faf71db044ee15aad39a159c9ef5080040c0af3402f3

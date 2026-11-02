@@ -12,3 +12,5 @@ core.*
 /bench/js/src
 /bench/js/install
 __pycache__/
+/bench/lox/src
+/bench/lox/install
