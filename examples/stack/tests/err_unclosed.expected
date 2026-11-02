@@ -1,0 +1,4 @@
+error: unclosed control structure before `;`
+  --> tests/err_unclosed.stk:1:25
+    1 | : f ( -- ) 1 if 2 print ;
+      |                         ^

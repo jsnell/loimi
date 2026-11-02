@@ -1,0 +1,4 @@
+: down ( n -- n ) dup 0 = if exit then 1 - down ;
+10000 down print
+: forever ( n -- n ) 1 + forever ;
+0 forever print

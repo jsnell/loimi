@@ -1,0 +1,4 @@
+error: the branches leave different stack depths (1 and 2)
+  --> tests/err_branches.stk:1:29
+    1 | : f ( n -- m ) dup 0 > if 1 then ;
+      |                             ^^^^

@@ -1,0 +1,32 @@
+\ strings, arrays and the GC
+"a" "b" concat 1 concat 2.5 concat true concat print
+42 tostr len print
+"tab\there" print
+"quote \" inside" print
+"" len print
+
+( build a long string )
+: repeat-str ( s n -- r )
+  { s n } "" n 0 do s concat loop ;
+"ab" 5 repeat-str print
+"xyz" 1000 repeat-str len print
+
+( arrays: fill, sum, nested )
+: iota ( n -- arr ) { n } n array n 0 do dup i swap i ! loop ;
+: sum ( arr -- s ) { a } 0 a len 0 do a i @ + loop ;
+10 iota dup print sum print
+[ [ 1 2 ] [ 3 [ 4 5 ] ] "s" ] print
+
+( lots of garbage: arrays of strings, kept and dropped )
+var keep
+4 array to keep
+: churn ( n -- )
+  { n } n 0 do
+    i tostr "-" concat i 7 * tostr concat
+    i 4 mod 0 = if keep i 4 / 4 mod ! else drop then
+    [ i i i ] drop
+  loop ;
+2000 churn
+keep print
+[ 1 2 3 ] [ 1 2 3 ] = print
+"abc" "ab" "c" concat = print

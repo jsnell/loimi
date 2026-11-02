@@ -123,17 +123,14 @@ fn Comp.next(c: *Comp) -> Result<?Tok, Error> {
     while !cur.at_end() and !lex.is_space(cur.peek()) { cur.bump(); }
     let text = cur.since(start);
     var t = Tok { kind: Kind.Name, text: text, int: 0, float: 0.0, span: cur.span_from(start), line: line };
-    let c0 = text[0];
-    if lex.is_digit(c0) or ((c0 == '-' or c0 == '.') and text.len > 1 and (lex.is_digit(text[1]) or text[1] == '.')) {
-        if let Ok(v) = num.parse_int(text) {
-            t.kind = Kind.Int;
-            t.int = v;
-        } else if let Ok(f) = num.parse_f64(text) {
-            t.kind = Kind.Float;
-            t.float = f;
-        } else {
-            return Err(c.err(t.span, "malformed number"));
-        }
+    // A word that parses as a number is a literal (as in Forth, `1+` or
+    // `...` are names).
+    if let Ok(v) = num.parse_int(text) {
+        t.kind = Kind.Int;
+        t.int = v;
+    } else if let Ok(f) = num.parse_f64(text) {
+        t.kind = Kind.Float;
+        t.float = f;
     }
     Ok(Some(t))
 }

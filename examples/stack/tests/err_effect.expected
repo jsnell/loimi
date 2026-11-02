@@ -1,0 +1,4 @@
+error: the word leaves 2 values on the stack, but its effect says 1
+  --> tests/err_effect.stk:3:18
+    3 | : g ( -- x ) 1 2 ;
+      |                  ^

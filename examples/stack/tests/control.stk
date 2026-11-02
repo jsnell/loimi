@@ -1,0 +1,49 @@
+\ if / else / then, loops, exit, nested do loops
+: sign ( n -- s )
+  dup 0 < if drop "negative" else
+    0 = if "zero" else "positive" then
+  then ;
+-5 sign print  0 sign print  7 sign print
+
+( begin ... until: count down )
+: countdown ( n -- )
+  begin dup . 1 - dup 0 = until drop cr ;
+5 countdown
+
+( begin ... while ... repeat: gcd )
+: gcd ( a b -- g ) begin dup 0 <> while tuck mod repeat drop ;
+48 18 gcd print
+17 5 gcd print
+
+( nested do loops with i and j )
+: table ( n -- )
+  { n } n 1 do n 1 do i j * . loop cr loop ;
+4 table
+
+( an empty do loop runs zero times )
+5 5 do "never" print loop
+10 3 do loop "done" print
+
+( early exit from inside a loop )
+: first-over ( arr limit -- index )
+  { a lim }
+  a len 0 do a i @ lim > if i exit then loop -1 ;
+[ 1 5 9 13 ] 6 first-over print
+[ 1 5 9 13 ] 99 first-over print
+
+( stack shuffles )
+1 2 3 rot . . . cr
+1 2 over . . . cr
+1 2 nip . cr
+1 2 tuck . . . cr
+1 2 2dup . . . . cr
+1 2 3 2drop . cr
+
+( logic )
+true false and print
+true false or print
+nil not print
+0 not print
+"a" "b" < print
+"abc" "abc" = print
+1.5 2 <= print

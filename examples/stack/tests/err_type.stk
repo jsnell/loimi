@@ -1,0 +1,4 @@
+: inner ( a b -- c ) + ;
+: outer ( -- x ) 1 "two" inner ;
+"start" print
+outer print

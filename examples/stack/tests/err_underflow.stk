@@ -1,0 +1,2 @@
+\ underflow is a compile-time error
+: bad ( a -- b ) + ;

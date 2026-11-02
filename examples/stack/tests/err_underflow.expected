@@ -1,0 +1,4 @@
+error: stack underflow: this needs 2 values, but the stack has 1
+  --> tests/err_underflow.stk:2:18
+    2 | : bad ( a -- b ) + ;
+      |                  ^

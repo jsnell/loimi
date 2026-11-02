@@ -1,0 +1,4 @@
+error: unknown word `frob`
+  --> tests/err_unknown.stk:1:5
+    1 | 1 2 frob
+      |     ^^^^
