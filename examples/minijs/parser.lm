@@ -674,16 +674,25 @@ fn Parser.class_decl(p: *Parser) -> *Node {
             is_static = true;
         }
         let mline = p.line();
-        let name = p.prop_name();
+        var key = null_node();
+        var name = "";
+        if p.accept(T.LBracket) {
+            key = p.assign();
+            p.expect(T.RBracket, "']'");
+        } else if p.kind() == T.Str {
+            name = p.next().text;
+        } else {
+            name = p.prop_name();
+        }
         if p.kind() != T.LParen { fail(mline, "class fields are not supported"); }
         let f = p.method(name);
-        if !is_static and name.eq("constructor") {
+        if !is_static and is_null(key) and name.eq("constructor") {
             f.method = false;
             f.ctor = true;
             f.derived = !is_null(c.parent);
             c.ctor = f;
         } else {
-            c.members.push(Member { name: name, fun: f, is_static: is_static });
+            c.members.push(Member { name: name, key: key, fun: f, is_static: is_static });
         }
     }
     n.cls = c;

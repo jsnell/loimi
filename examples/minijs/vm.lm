@@ -860,6 +860,7 @@ pub vm JS {
                     O(_) | A(_) | F(_) => {}
                     _ => { v = regs[0]; }
                 }
+                if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
                 if let O(o) = regs[0] { observe(fp.cl, o); }
                 if fp == ctx.frames { exit v }
                 *(regs - 1) = v;
@@ -905,6 +906,24 @@ pub vm JS {
     }
     op SMETHOD(cls: reg, key: kst, m: reg) : ABC {
         cold { define_method(ctx, cls, key, m, true); next }
+    }
+    /// Methods with a computed name R[key].
+    op METHODC(cls: reg, key: reg, m: reg) : ABC {
+        cold { define_method(ctx, cls, key, m, false); next }
+    }
+    op SMETHODC(cls: reg, key: reg, m: reg) : ABC {
+        cold { define_method(ctx, cls, key, m, true); next }
+    }
+    /// Reading `this` in a derived constructor before super().
+    op CHECKTHIS(r: reg) : ABC {
+        if r != V.Undef { next }
+        cold { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
+    }
+    /// After super(...) returned: `this` becomes R[h].
+    op SUPERDONE(h: reg) : ABC {
+        if regs[0] != V.Undef { cold { raise ctx.new_error(ctx.err_proto(), "Super constructor may only be called once") } }
+        regs[0] = h;
+        next
     }
 
     // Superinstructions for common pairs.

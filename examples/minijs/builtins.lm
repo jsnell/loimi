@@ -366,6 +366,8 @@ fn object_create(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
             Ok(V.O(c.new_object_with(Some(p), 4)))
         }
         Null => Ok(V.O(c.new_object_with(None, 4))),
+        A(_) => Ok(V.O(c.new_object_with(c.arrproto, 4))),
+        F(_) => Ok(V.O(c.new_object_with(c.fnproto, 4))),
         _ => Err(c.type_error("Object prototype may only be an Object or null")),
     }
 }
@@ -750,7 +752,7 @@ fn num_to_fixed(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     let d = df as u64;
     if x != x or x >= 1e21 or x <= -1e21 { return Ok(V.S(c.to_str(this))); }
     var b = text.StrBuf.new();
-    let ax = if x < 0.0 { -x } else { x };
+    let ax = if x < 0.0 { -x } else { x + 0.0 };
     // The exact decimal expansion, then round half up at digit d.
     let cap: u64 = 1200;
     let buf: *u8 = mem.alloc(cap);
@@ -780,7 +782,7 @@ fn num_to_fixed(c: *Ctx, this: V, args: *V, n: u64) -> Result<V, V> {
     while start + 1 < int_len and digits.at(start) == '0' { start += 1; }
     var zero = true;
     for i in 0..digits.len { if digits.at(i) != '0' { zero = false; } }
-    if x < 0.0 and !zero { b.push('-'); }
+    if x < 0.0 { b.push('-'); }
     for i in start..int_len { b.push(digits.at(i)); }
     if d > 0 {
         b.push('.');

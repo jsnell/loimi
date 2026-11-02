@@ -229,7 +229,7 @@ pub struct Func {
     self_var: *Var,
 }
 
-pub struct Member { name: str, fun: *Func, is_static: bool }
+pub struct Member { name: str, key: *Node, fun: *Func, is_static: bool }
 
 pub struct Class { name: str, parent: *Node, ctor: *Func, members: mem.Vec<Member>, line: u32 }
 

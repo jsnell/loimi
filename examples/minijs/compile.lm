@@ -274,7 +274,7 @@ fn Res.class(r: *Res, c: *Class) {
     if (c.ctor as u64) == 0 { c.ctor = default_ctor(c, r.fun); }
     c.ctor.name = c.name;
     r.func(c.ctor);
-    for i in 0..c.members.len { r.func(c.members.at(i).fun); }
+    for i in 0..c.members.len { r.expr(c.members.at(i).key); r.func(c.members.at(i).fun); }
 }
 
 /// `constructor(...args) { super(...args); }` for derived classes (with
@@ -385,7 +385,7 @@ fn Res.expr(r: *Res, n: *Node) {
         Index => { r.expr(n.a); r.expr(n.b); }
         Call | New => { r.expr(n.a); for i in 0..n.list.len { r.expr(n.list.at(i)); } }
         SuperCall => { n.vr = r.this_var(); for i in 0..n.list.len { r.expr(n.list.at(i)); } }
-        SuperMember => {}
+        SuperMember => { n.vr = r.this_var(); }
         _ => fail(n.line, "unexpected expression"),
     }
 }
@@ -426,6 +426,9 @@ struct FS {
     tries: mem.Vec<*Try>,
     /// A label that the next loop takes.
     pending_label: str,
+    /// Derived constructors: the register holding the object that
+    /// `super(...)` initializes (0: none).
+    hidden_this: u32,
 }
 
 struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
@@ -442,6 +445,7 @@ fn FS.new(f: *Func, parent: *FS) -> FS {
         loops: mem.Vec.new(),
         tries: mem.Vec.new(),
         pending_label: "",
+        hidden_this: 0,
     }
 }
 
@@ -506,11 +510,12 @@ fn Gen.load_var(g: *Gen, v: *Var, dst: u32) {
     }
     if g.is_local(v) {
         if boxed(v) { g.emit(JS.BOXGET(dst as u8, v.reg as u8)); } else { g.mov(dst, v.reg); }
-        return;
+    } else {
+        let i = free_index(g.fs.fun, v);
+        g.emit(JS.GETFREE(dst as u8, i as u8));
+        if boxed(v) { g.emit(JS.BOXGET(dst as u8, dst as u8)); }
     }
-    let i = free_index(g.fs.fun, v);
-    g.emit(JS.GETFREE(dst as u8, i as u8));
-    if boxed(v) { g.emit(JS.BOXGET(dst as u8, dst as u8)); }
+    if v.kind == VK.This and v.owner.derived { g.emit(JS.CHECKTHIS(dst as u8)); }
 }
 
 fn Gen.store_var(g: *Gen, v: *Var, src: u32) {
@@ -598,7 +603,7 @@ fn has_assign(n: *Node) -> bool {
 /// is copied.
 fn Gen.any_before(g: *Gen, n: *Node, later: *Node) -> u32 {
     if n.kind == K.Name and let Some(r) = g.var_reg(n.vr) and !has_assign(later) { return r; }
-    if n.kind == K.This and (n.vr as u64) != 0 and let Some(r) = g.var_reg(n.vr) { return r; }
+    if n.kind == K.This and (n.vr as u64) != 0 and !n.vr.owner.derived and let Some(r) = g.var_reg(n.vr) { return r; }
     let t = g.temp();
     g.to(n, t);
     t
@@ -716,7 +721,7 @@ g.closure(n.fun, dst);
         Update => g.update(n, dst, true),
         Bin => {
             if n.op == T.Plus or n.op == T.Minus {
-                if let Some(c) = small_int(n.b) {
+                if let Some(c) = small_int(n.b) and (c != 0 or n.op == T.Plus) {
                     let a = g.any(n.a);
                     let sc = if n.op == T.Plus { c } else { 0 - c };
                     if sc >= -128 and sc <= 127 {
@@ -811,7 +816,7 @@ fn Gen.array(g: *Gen, n: *Node, dst: u32) {
     while first or done < total {
         let chunk = if total - done > 200 { 200 } else { total - done };
         let m = g.mark();
-        let base = g.fs.regs.alloc(chunk as u32);
+        let base = if chunk == 0 { dst } else { g.fs.regs.alloc(chunk as u32) };
         for i in 0..chunk { g.to(n.list.at(done + i), base + i as u32); }
         if first {
             g.emit(JS.NEWARR(dst as u8, base as u8, chunk as u8));
@@ -972,7 +977,7 @@ fn Gen.assign(g: *Gen, n: *Node, dst: u32, want: bool) {
             g.reset(m);
             return;
         }
-        if (op == T.PlusAssign or op == T.MinusAssign) and let Some(c) = small_int(n.b) {
+        if (op == T.PlusAssign or op == T.MinusAssign) and let Some(c) = small_int(n.b) and (c != 0 or op == T.PlusAssign) {
             g.emit(JS.ADDI(cur as u8, cur as u8, (if op == T.PlusAssign { c } else { 0 - c }) as i8));
         } else {
             let b = g.any(n.b);
@@ -1026,7 +1031,7 @@ fn Gen.call(g: *Gen, n: *Node) -> u32 {
     } else if n.kind == K.SuperCall {
         g.emit(JS.GETPARENT(base as u8));
         if (n.vr as u64) == 0 { fail(n.line, "'super' keyword unexpected here"); }
-        g.load_var(n.vr, base + 1);
+        if g.fs.hidden_this != 0 { g.mov(base + 1, g.fs.hidden_this); } else { g.load_var(n.vr, base + 1); }
     } else if callee.kind == K.Member or (callee.kind == K.Index and callee.b.kind == K.Str) {
         let name = if callee.kind == K.Member { callee.text } else { callee.b.text };
         let m = g.mark();
@@ -1048,7 +1053,7 @@ fn Gen.call(g: *Gen, n: *Node) -> u32 {
     } else if callee.kind == K.SuperMember {
         let k = g.key_index(callee.text);
         g.emit(JS.GETSUPER(base as u8, k as u8));
-        let tv = g.this_of_super(n);
+        let tv = callee.vr;
         if (tv as u64) == 0 { g.emit(JS.LOADU((base + 1) as u8)); } else { g.load_var(tv, base + 1); }
     } else {
         g.to(callee, base);
@@ -1056,6 +1061,10 @@ fn Gen.call(g: *Gen, n: *Node) -> u32 {
     }
     for i in 0..nargs { g.to(n.list.at(i), base + 2 + i as u32); }
     if is_new { g.emit(JS.NEW(base as u8, nargs as u8)); } else { g.emit(JS.CALL(base as u8, nargs as u8)); }
+    if n.kind == K.SuperCall and g.fs.hidden_this != 0 {
+        g.emit(JS.SUPERDONE(g.fs.hidden_this as u8));
+        g.mov(base, 0);
+    }
     g.fs.regs.reset(base + 1);
     base
 }
@@ -1168,6 +1177,13 @@ fn Gen.function(g: *Gen, f: *Func) -> Gc<Proto> {
         if boxed(v) and (v.reg as u64) == i + 1 { g.emit(JS.BOXNEW(v.reg as u8)); }
     }
     if (f.this_var as u64) != 0 and boxed(f.this_var) { g.emit(JS.BOXNEW(0)); }
+    if f.derived {
+        let hr = fs.regs.nactive;
+        fs.regs.activate(1);
+        fs.hidden_this = hr;
+        g.emit(JS.MOVE(hr as u8, 0));
+        g.emit(JS.LOADU(0));
+    }
     if (f.self_var as u64) != 0 { rest.push(f.self_var); }
     g.enter_vars(&rest);
     if (f.self_var as u64) != 0 { g.emit(JS.SELF(f.self_var.reg as u8)); }
@@ -1250,6 +1266,11 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
         var b = text.StrBuf.new();
         b.push_str("internal error: generated code fails verification at word ");
         b.push_int(bad as i64);
+        b.push_str(" (");
+        b.push_str(JS.op_name(proto.code[bad]));
+        b.push_str(", nregs ");
+        b.push_int(proto.nregs as i64);
+        b.push_str(")");
         fail(f.line, b.as_str());
     }
     JS.optimize(proto.code);
@@ -1421,11 +1442,14 @@ fn Gen.stmt(g: *Gen, n: *Node) {
             g.exit_end(l.ntries);
         }
         Return => {
-            let r = g.temp();
+            let lvl = g.fs.regs.enter();
+            let r = g.fs.regs.nactive;
+            g.fs.regs.activate(1);
             if is_null(n.a) { g.emit(JS.LOADU(r as u8)); } else { g.to(n.a, r); }
             g.exit_begin(0);
             g.emit(JS.RET(r as u8));
             g.exit_end(0);
+            g.fs.regs.leave(lvl);
         }
         Throw => {
             let r = g.any(n.a);
@@ -1650,10 +1674,15 @@ fn Gen.class(g: *Gen, n: *Node) {
         let mm = g.mark();
         let fr = g.temp();
         g.closure(mem_.fun, fr);
-        let k = g.key_index(mem_.name);
-        if k > 255 { fail(c.line, "too many property names"); }
-        if mem_.is_static { g.emit(JS.SMETHOD(r as u8, k as u8, fr as u8)); }
-        else { g.emit(JS.METHOD(r as u8, k as u8, fr as u8)); }
+        if !is_null(mem_.key) {
+            let kr = g.any(mem_.key);
+            if mem_.is_static { g.emit(JS.SMETHODC(r as u8, kr as u8, fr as u8)); } else { g.emit(JS.METHODC(r as u8, kr as u8, fr as u8)); }
+        } else {
+            let k = g.key_index(mem_.name);
+            if k > 255 { fail(c.line, "too many property names"); }
+            if mem_.is_static { g.emit(JS.SMETHOD(r as u8, k as u8, fr as u8)); }
+            else { g.emit(JS.METHOD(r as u8, k as u8, fr as u8)); }
+        }
         g.reset(mm);
     }
     g.store_var(v, r);
