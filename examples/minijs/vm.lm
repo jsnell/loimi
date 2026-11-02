@@ -29,8 +29,8 @@ fn arith(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
         let an = value.is_number(a);
         let bn = value.is_number(b);
         if !(an and bn) {
-            let sa = match a { S(_) | O(_) | A(_) | F(_) => true, _ => false };
-            let sb = match b { S(_) | O(_) | A(_) | F(_) => true, _ => false };
+            let sa = match a { S(_) | R(_) | O(_) | A(_) | F(_) => true, _ => false };
+            let sb = match b { S(_) | R(_) | O(_) | A(_) | F(_) => true, _ => false };
             if sa or sb { return Ok(c.concat(a, b)); }
         }
     }
@@ -54,7 +54,9 @@ fn js_pow(x: f64, y: f64) -> f64 {
     pow(x, y)
 }
 
-fn less(c: *Ctx, a: V, b: V, or_equal: bool) -> bool {
+fn less(c: *Ctx, a0: V, b0: V, or_equal: bool) -> bool {
+    let a = value.flat(a0);
+    let b = value.flat(b0);
     if let (S(x), S(y)) = (a, b) {
         let r = value.str_cmp(x, y);
         return if or_equal { r <= 0 } else { r < 0 };
@@ -121,21 +123,24 @@ fn get_fill(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32, ent_w: *u32) -> R
         O(o) => {
             if o.dict.is_none() {
                 if let Some(i) = c.m.find(o, key) {
+                    c.m.shapes.pin(o.shape);
                     *shape_w = o.shape.id;
                     let r = obj.slot_ref(i, o.inline.len as u32);
                     *slot_w = r;
                     return Ok((c.m.load(o, i), if r & obj.OUT == 0 { 1 } else { 2 }));
                 }
                 if let Some(_) = o.proto {
-                    if *ent_w == 0 {
-                        c.pent.push(obj.ProtoEntry.empty());
-                        *ent_w = c.pent.len as u32;
-                    }
-                    let e = c.pent.ptr_at((*ent_w - 1) as u64);
-                    e.sid = obj.EMPTY_ID;
-                    let r = c.m.get_proto_fill(o, key, e) ?? V.Undef;
-                    if e.sid != obj.EMPTY_ID {
-                        *shape_w = e.sid;
+                    var tmp: obj.ProtoEntry<Gc<Obj>> = obj.ProtoEntry.empty();
+                    let r = c.m.get_proto_fill(o, key, &tmp) ?? V.Undef;
+                    if tmp.sid != obj.EMPTY_ID {
+                        c.m.shapes.pin(o.shape);
+                        if *ent_w == 0 {
+                            c.pent.push(tmp);
+                            *ent_w = c.pent.len as u32;
+                        } else {
+                            c.pent.set((*ent_w - 1) as u64, tmp);
+                        }
+                        *shape_w = tmp.sid;
                         return Ok((r, 3));
                     }
                     return Ok((r, 0));
@@ -160,6 +165,71 @@ fn get_fill(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32, ent_w: *u32) -> R
     }
 }
 
+/// A monomorphic site missed. The first few times it is refilled (the
+/// generic member); after that it goes polymorphic, with an empty entry.
+fn to_poly(v: V, shape_w: *u32, ent_w: *u32, miss_w: *u32) -> bool {
+    *miss_w += 1;
+    let O(_) = v else { return false; };
+    if *miss_w < 8 { return false; }
+    *shape_w = obj.EMPTY_ID;
+    *ent_w = 0;
+    true
+}
+
+/// Polymorphic miss: read the property and add what was found to the
+/// site's entry. Returns the value, and true when the entry is full and
+/// the site should go megamorphic.
+fn poly_get(c: *Ctx, v: V, kv: V, ent_w: *u32) -> Result<(V, bool), V> {
+    var sw: u32 = 0;
+    var slw: u32 = 0;
+    var ew: u32 = 0;
+    let (val, m) = get_fill(c, v, kv, &sw, &slw, &ew)?;
+    if m == 0 or m > 3 { return Ok((val, false)); }
+    if *ent_w == 0 {
+        c.poly.push(rt.PolyEnt { n: 0, resets: 0, sids: [0; 8], kinds: [0; 8], slots: [0; 8] });
+        *ent_w = c.poly.len as u32;
+    }
+    let pe = c.poly.ptr_at((*ent_w - 1) as u64);
+    if pe.n == 8 {
+        // Shapes die when their objects do, and new ones get new ids:
+        // start over a few times before giving up on the site.
+        if pe.resets >= 8 { return Ok((val, true)); }
+        pe.resets += 1;
+        pe.n = 0;
+    }
+    pe.sids[pe.n] = sw;
+    if m == 3 {
+        pe.kinds[pe.n] = 1;
+        pe.slots[pe.n] = ew - 1;
+    } else {
+        pe.kinds[pe.n] = 0;
+        pe.slots[pe.n] = slw;
+    }
+    pe.n += 1;
+    Ok((val, false))
+}
+
+/// Megamorphic miss: own properties fill the MegaCache.
+fn mega_get(c: *Ctx, v: V, kv: V) -> Result<V, V> {
+    let key = key_of_const(c, kv);
+    if let O(o) = v {
+        if o.dict.is_none() and let Some(i) = c.m.find(o, key) {
+            let r = obj.slot_ref(i, o.inline.len as u32);
+            c.mega.put(o.shape.id, key, r);
+            return Ok(c.m.load_ref(o, r));
+        }
+        if o.dict.is_none() and let Some(_) = o.proto {
+            let i = rt.pmega_index(o.shape.id, key);
+            let e = c.pmega.ptr_at(i);
+            e.sid = obj.EMPTY_ID;
+            let r = c.m.get_proto_fill(o, key, e) ?? V.Undef;
+            c.pkeys.set(i, key);
+            return Ok(r);
+        }
+    }
+    c.get(v, key)
+}
+
 /// SETPROP miss: store, and fill the cache. Returns the member to become:
 /// 0 none, 1 own inline, 2 own out of line, 3 add (inline).
 fn set_fill(c: *Ctx, v: V, kv: V, x: V, shape_w: *u32, slot_w: *u32, ent_w: *u32) -> Result<u32, V> {
@@ -168,11 +238,13 @@ fn set_fill(c: *Ctx, v: V, kv: V, x: V, shape_w: *u32, slot_w: *u32, ent_w: *u32
     if o.dict.is_some() { c.m.set(o, key, x); return Ok(0); }
     if let Some(i) = c.m.find(o, key) {
         c.m.store(o, i, x);
+        c.m.shapes.pin(o.shape);
         *shape_w = o.shape.id;
         let r = obj.slot_ref(i, o.inline.len as u32);
         *slot_w = r;
         return Ok(if r & obj.OUT == 0 { 1 } else { 2 });
     }
+    let old_shape = o.shape;
     let old = o.shape.id;
     let idx = o.shape.count;
     let was_proto = o.flags & value.OF_PROTO != 0;
@@ -185,6 +257,8 @@ fn set_fill(c: *Ctx, v: V, kv: V, x: V, shape_w: *u32, slot_w: *u32, ent_w: *u32
         let e = c.tent.ptr_at((*ent_w - 1) as u64);
         e.shape = Some(o.shape);
         e.idx = idx;
+        c.m.shapes.pin(old_shape);
+        c.m.shapes.pin(o.shape);
         *shape_w = old;
         return Ok(3);
     }
@@ -201,7 +275,7 @@ fn make_closure(c: *Ctx, parent: Gc<Fn>, regs: *V, i: u64) -> Gc<Fn> {
         home = parent.home;
         par = parent.parent;
     }
-    let f = new(&c.heap, Fn { proto: p, props: None, home: home, parent: par, native: 0, hint: 4, ctor_proto: None, ctor_shape: None }, n);
+    let f = new(&c.heap, Fn { proto: p, props: None, home: home, parent: par, native: 0, hint: p.hint, ctor_proto: None, ctor_shape: None }, n);
     for j in 0..n {
         let d = p.desc.data[j];
         f.free[j] = if d >= 256 { regs[(d & 255) as u64] } else { parent.free[d as u64] };
@@ -231,6 +305,10 @@ fn make_class(c: *Ctx, ctor: V, parent: V, has_parent: bool) -> Result<(), V> {
                 c.m.set(bag, c.k_prototype, V.Undef);
                 f.props = Some(bag);
                 f.parent = parent;
+                // Room for the parent constructor's properties too.
+                f.hint = f.hint + pf.hint;
+                if f.hint < 4 { f.hint = 4; }
+                if f.hint > 32 { f.hint = 32; }
             }
             Null => { pproto = None; }
             _ => return Err(c.type_error("Class extends value is not a constructor or null")),
@@ -446,14 +524,15 @@ pub vm JS {
     // Property reads. The cache holds the receiver's shape id, a SlotRef
     // (own properties) or holder slot (prototypes of primitives), and the
     // index + 1 of the site's side-table entry (prototype hits).
-    cache PropIC { shape: u32, slot: u32, ent: u32 }
+    cache PropIC { shape: u32, slot: u32, ent: u32, miss: u32 }
 
-    inline for (fam, own_in, own_out, protom, aprotom, sprotom, dkind, pre) in [
-        ("GETPROP", "GETPROP_IN", "GETPROP_OUT", "GETPROP_P", "GETPROP_AP", "GETPROP_SP", reg, {}),
-        ("GETMETHOD", "GETMETHOD_IN", "GETMETHOD_OUT", "GETMETHOD_P", "GETMETHOD_AP", "GETMETHOD_SP", callbase, { regs[dst + 1] = obj; }),
+    inline for (fam, own_in, own_out, protom, aprotom, sprotom, polym, megam, dkind, pre) in [
+        ("GETPROP", "GETPROP_IN", "GETPROP_OUT", "GETPROP_P", "GETPROP_AP", "GETPROP_SP", "GETPROP_POLY", "GETPROP_MEGA", reg, {}),
+        ("GETMETHOD", "GETMETHOD_IN", "GETMETHOD_OUT", "GETMETHOD_P", "GETMETHOD_AP", "GETMETHOD_SP", "GETMETHOD_POLY", "GETMETHOD_MEGA", callbase, { regs[dst + 1] = obj; }),
     ] {
         family #fam(dst: dkind, obj: reg, key: kst) : ABC + PropIC {
             generic {
+                if let R(r) = obj { obj = S(value.flatten(r)); }
                 pre
                 let (v, m) = get_fill(ctx, obj, key, &cache.shape, &cache.slot, &cache.ent)?;
                 regs[dst.raw] = v;
@@ -470,7 +549,7 @@ pub vm JS {
                     regs[dst.raw] = o.inline.ptr[cache.slot];
                     next
                 }
-                cold { become #fam; redo }
+                cold { if to_poly(obj, &cache.shape, &cache.ent, &cache.miss) { become #polym; } else { become #fam; } redo }
             }
             #own_out {
                 if let O(o) = obj and o.shape.id == cache.shape {
@@ -478,7 +557,7 @@ pub vm JS {
                     regs[dst.raw] = ctx.m.load_out(o, cache.slot & !obj.OUT);
                     next
                 }
-                cold { become #fam; redo }
+                cold { if to_poly(obj, &cache.shape, &cache.ent, &cache.miss) { become #polym; } else { become #fam; } redo }
             }
             #protom {
                 if let O(o) = obj and o.shape.id == cache.shape {
@@ -489,7 +568,7 @@ pub vm JS {
                         next
                     }
                 }
-                cold { become #fam; redo }
+                cold { if to_poly(obj, &cache.shape, &cache.ent, &cache.miss) { become #polym; } else { become #fam; } redo }
             }
             #aprotom {
                 if let A(_) = obj {
@@ -512,6 +591,64 @@ pub vm JS {
                     }
                 }
                 cold { become #fam; redo }
+            }
+            // Up to four (shape, own slot or prototype entry) pairs.
+            #polym {
+                if let O(o) = obj and cache.ent != 0 {
+                    let pe = ctx.poly.ptr + (cache.ent - 1) as u64;
+                    let sid = o.shape.id;
+                    var i: u64 = 0;
+                    while i < pe.n as u64 {
+                        if pe.sids[i] == sid {
+                            let r = pe.slots[i];
+                            if pe.kinds[i] == 0 {
+                                pre
+                                regs[dst.raw] = ctx.m.load_ref(o, r);
+                                next
+                            }
+                            let e = ctx.pent.ptr + r as u64;
+                            if let Some(cl) = e.cell and cl.valid and let Some(h) = e.holder {
+                                pre
+                                regs[dst.raw] = ctx.m.load(h, e.slot);
+                                next
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                cold {
+                    if let R(r) = obj { obj = S(value.flatten(r)); }
+                    pre
+                    let (v, mega) = poly_get(ctx, obj, key, &cache.ent)?;
+                    regs[dst.raw] = v;
+                    if mega { become #megam; }
+                    next
+                }
+            }
+            // Megamorphic: own properties through the shared MegaCache.
+            #megam {
+                if let (O(o), S(ks)) = (obj, key) and o.dict.is_none() {
+                    let sid = o.shape.id;
+                    let kk = ks.key as u64;
+                    if let Some(r) = ctx.mega.get(sid, kk) {
+                        pre
+                        regs[dst.raw] = ctx.m.load_ref(o, r);
+                        next
+                    }
+                    let i = rt.pmega_index(sid, kk);
+                    let e = ctx.pmega.ptr + i;
+                    if e.sid == sid and ctx.pkeys.ptr[i] == kk and let Some(cl) = e.cell and cl.valid and let Some(h) = e.holder {
+                        pre
+                        regs[dst.raw] = ctx.m.load(h, e.slot);
+                        next
+                    }
+                }
+                cold {
+                    if let R(r) = obj { obj = S(value.flatten(r)); }
+                    pre
+                    regs[dst.raw] = mega_get(ctx, obj, key)?;
+                    next
+                }
             }
         }
     }
@@ -558,7 +695,15 @@ pub vm JS {
             dst = a.ptr[i as u32 as u64];
             next
         }
-        cold { dst = ctx.get_index(obj, key)?; next }
+        if let (S(s), Int(i)) = (obj, key) and (i as u32 as u64) < s.data.len {
+            dst = S(ctx.char_str(s.data[i as u32 as u64]));
+            next
+        }
+        cold {
+            if let R(r) = obj { obj = S(value.flatten(r)); redo }
+            dst = ctx.get_index(obj, key)?;
+            next
+        }
     }
     op SETINDEX(obj: reg, key: reg, val: reg) : ABC {
         if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
@@ -574,6 +719,7 @@ pub vm JS {
     op GETLEN(dst: reg, obj: reg) : ABC {
         if let A(a) = obj { dst = Int(a.len as i32); next }
         if let S(s) = obj { dst = Int(s.data.len as i32); next }
+        if let R(r) = obj { dst = Int(r.len as i32); next }
         cold { dst = ctx.get(obj, ctx.k_length)?; next }
     }
     op DELPROP(dst: reg, obj: reg, key: reg) : ABC {

@@ -18,9 +18,25 @@ import prelude;
 
 fn run(ctx: *Ctx, src: str) -> bool {
     let proto = compile.compile(ctx, src);
-    let f = new(&ctx.heap, Fn { proto: proto, props: None, home: V.Undef, parent: V.Undef, native: 0, hint: 4, ctor_proto: None, ctor_shape: None }, 0);
+    let f = new(&ctx.heap, Fn { proto: proto, props: None, home: V.Undef, parent: V.Undef, native: 0, hint: proto.hint, ctor_proto: None, ctor_shape: None }, 0);
     JS.run(ctx, f);
     !ctx.failed
+}
+
+extern "C" fn getenv(name: *u8) -> ?*u8;
+
+fn stats(c: *Ctx) {
+    if getenv("MINIJS_STATS\0".ptr).is_none() { return; }
+    var b = text.StrBuf.new();
+    b.push_str("shapes created ");
+    b.push_int(c.m.shapes.created as i64);
+    b.push_str(", poly sites ");
+    b.push_int(c.poly.len as i64);
+    b.push_str(", proto entries ");
+    b.push_int(c.pent.len as i64);
+    b.push_str(", collections ");
+    b.push_int(c.heap.collections as i64);
+    io.eprintln(b.as_str());
 }
 
 fn main() -> i32 {
@@ -39,6 +55,7 @@ fn main() -> i32 {
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
     if run(&ctx, prelude.source()) and run(&ctx, src) {
         ctx.flush();
+        stats(&ctx);
         return 0;
     }
     ctx.flush();

@@ -135,6 +135,7 @@ value Ref repr nanbox { Num(f64) unboxed, S(Gc<Shape>), C(Gc<Cell>) }
 const ADDR: u64 = 0xFFFFFFFFFFFF;
 
 const REGISTERED: u32 = 1;
+const PINNED: u32 = 2;
 
 // ── the shape table ─────────────────────────────────────────────────────
 
@@ -149,6 +150,8 @@ pub struct Shapes {
     dict: ?Gc<Shape>,
     /// Object address -> validity cell address. Weak in both.
     cells: map.HashMap<u64, u64>,
+    /// Shapes kept alive by `pin` (marked by the scanner).
+    pinned: mem.Vec<Gc<Shape>>,
     stag: u64,
     ctag: u64,
     /// Statistics.
@@ -159,7 +162,7 @@ pub struct Shapes {
 pub fn Shapes.new() -> Shapes {
     Shapes {
         heap: 0 as *gc.Heap, next_id: 1, roots: map.HashMap.new(), parents: mem.Vec.new(),
-        dict: None, cells: map.HashMap.new(), stag: 0, ctag: 0, created: 0, swept: 0,
+        dict: None, cells: map.HashMap.new(), pinned: mem.Vec.new(), stag: 0, ctag: 0, created: 0, swept: 0,
     }
 }
 
@@ -174,6 +177,19 @@ pub fn Shapes.attach(s: *Shapes, h: *gc.Heap) {
 fn scan_shapes(h: *gc.Heap, data: *u8) {
     let s = data as *Shapes;
     if let Some(d) = s.dict { gc_mark(h, d); }
+    for i in 0..s.pinned.len { gc_mark(h, s.pinned.at(i)); }
+}
+
+/// Keep `sh` (and so its ancestors and its id) alive for good. Shapes
+/// die with their last object, and the next object built the same way
+/// gets a new shape with a new id, which an inline cache sees as a new
+/// shape; an interpreter pins the shapes its caches have recorded, so
+/// that sites stay monomorphic across collections. Pinning is
+/// idempotent and costs one word per shape.
+pub fn Shapes.pin(s: *Shapes, sh: Gc<Shape>) {
+    if sh.flags & PINNED != 0 or sh.id == DICT_ID { return; }
+    sh.flags = sh.flags | PINNED;
+    s.pinned.push(sh);
 }
 
 fn Shapes.shape_at(s: *Shapes, a: u64) -> Gc<Shape> {
@@ -544,6 +560,7 @@ pub fn Model<O, S, V>.free(m: *Model<O, S, V>) {
     m.shapes.roots.free();
     m.shapes.cells.free();
     m.shapes.parents.free();
+    m.shapes.pinned.free();
 }
 
 /// The shape for a new object without prototype and with `inline_cap`

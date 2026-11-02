@@ -1221,6 +1221,26 @@ fn Gen.top(g: *Gen, f: *Func) -> Gc<Proto> {
     g.finish(&fs)
 }
 
+/// `this.x = ...` assignments in `n` (not in nested functions).
+fn count_this_props(n: *Node) -> u32 {
+    if is_null(n) or n.kind == K.Func { return 0; }
+    var c: u32 = 0;
+    if n.kind == K.Assign and n.a.kind == K.Member and n.a.a.kind == K.This { c += 1; }
+    c += count_this_props(n.a) + count_this_props(n.b) + count_this_props(n.c) + count_this_props(n.d);
+    for i in 0..n.list.len { c += count_this_props(n.list.at(i)); }
+    c
+}
+
+/// Inline slots for the objects a constructor makes: its own
+/// `this.x = ...` count, plus room for a parent constructor's.
+fn ctor_hint(f: *Func) -> u32 {
+    var c: u32 = 0;
+    for i in 0..f.body.len { c += count_this_props(f.body.at(i)); }
+    if c < 4 and !f.derived { c = 4; }
+    if c > 32 { c = 32; }
+    c
+}
+
 fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     let h = g.heap;
     let f = fs.fun;
@@ -1255,6 +1275,7 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
         nregs: fs.regs.frame_size(np + 1),
         nfree: f.free.len as u32,
         flags: flags,
+        hint: ctor_hint(f),
         consts: consts,
         protos: protos,
         desc: desc,

@@ -33,7 +33,8 @@ extern "C" fn trunc(x: f64) -> f64;
 /// Call native `id`.
 pub fn call(c: *Ctx, id: u32, this: V, args: *V, n: u64) -> Result<V, V> {
     let f = c.natives.at((id - 1) as u64).f;
-    f(c, this, args, n)
+    for i in 0..n { args[i] = value.flat(args[i]); }
+    f(c, value.flat(this), args, n)
 }
 
 fn arg(args: *V, n: u64, i: u64) -> V { if i < n { args[i] } else { V.Undef } }
@@ -100,7 +101,7 @@ pub fn install(c: *Ctx) {
     let h = &c.heap;
     let empty_vals = rt.new_vals(h, 0);
     c.native_proto = Some(new(h, Proto {
-        name: c.key_str(c.key("native")), nparams: 0, fixed: value.NO_FIXED, nregs: 1, nfree: 0, flags: 0,
+        name: c.key_str(c.key("native")), nparams: 0, fixed: value.NO_FIXED, nregs: 1, nfree: 0, flags: 0, hint: 4,
         consts: empty_vals, protos: new(h, Protos {}, 0), desc: new(h, Descs {}, 0),
         handlers: new(h, Handlers {}, 0), lines: new(h, Lines {}, 0),
     }, 0));

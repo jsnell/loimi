@@ -14,6 +14,68 @@ extern "C" fn fmod(a: f64, b: f64) -> f64;
 /// string (0: not looked up yet); `hash` is 0 until computed.
 pub object Str { hash: u64, key: u32, data: [u8] }
 
+/// A string made by concatenation, flattened on first use other than
+/// further concatenation, `length`, `typeof` and truthiness (so building
+/// a string with `+=` is linear). `left` and `right` are S or R values;
+/// `flat` caches the flattened string.
+pub object Rope { len: u64, flat: ?Gc<Str>, left: V, right: V }
+
+/// Concatenations at least this long make ropes.
+pub const ROPE_MIN: u64 = 64;
+
+/// The heap ropes are flattened into (set at startup).
+pub var HEAP: ?*gc.Heap = None;
+
+/// Length of a string value (S or R).
+pub fn str_len(v: V) -> u64 {
+    match v {
+        S(s) => s.data.len,
+        R(r) => r.len,
+        _ => 0,
+    }
+}
+
+/// The flat string of a rope. Allocates (never collects).
+pub fn flatten(r: Gc<Rope>) -> Gc<Str> {
+    if let Some(f) = r.flat { return f; }
+    let Some(h) = HEAP else { unreachable };
+    let out = alloc_str(h, r.len);
+    // Leaves left to right, with an explicit stack (ropes from `+=` are
+    // as deep as they are long).
+    var stack: mem.Vec<V> = mem.Vec.new();
+    stack.push(V.R(r));
+    var pos: u64 = 0;
+    while let Some(v) = stack.pop() {
+        match v {
+            S(s) => {
+                mem.memcpy(out.data.ptr + pos, s.data.ptr, s.data.len);
+                pos += s.data.len;
+            }
+            R(x) => {
+                if let Some(f) = x.flat {
+                    mem.memcpy(out.data.ptr + pos, f.data.ptr, f.data.len);
+                    pos += f.data.len;
+                } else {
+                    stack.push(x.right);
+                    stack.push(x.left);
+                }
+            }
+            _ => {}
+        }
+    }
+    stack.free();
+    r.flat = Some(out);
+    r.left = V.Undef;
+    r.right = V.Undef;
+    out
+}
+
+/// A rope value as a flat string value; other values unchanged.
+pub fn flat(v: V) -> V {
+    if let R(r) = v { return V.S(flatten(r)); }
+    v
+}
+
 /// A plain array of values: overflow slots of objects, array storage,
 /// constant pools.
 pub object Vals { data: [V] }
@@ -87,6 +149,8 @@ pub object Proto {
     nregs: u32,
     nfree: u32,
     flags: u32,
+    /// Inline slots for objects made by `new` (a static estimate).
+    hint: u32,
     consts: Gc<Vals>,
     protos: Gc<Protos>,
     desc: Gc<Descs>,
@@ -103,6 +167,7 @@ pub value V repr nanbox {
     A(Gc<Arr>),
     F(Gc<Fn>),
     B(Gc<Box>),
+    R(Gc<Rope>),
     Undef,
     Null,
     Bool(bool),
@@ -239,6 +304,7 @@ pub fn truthy(v: V) -> bool {
         Int(i) => i != 0,
         Num(x) => x == x and x != 0.0,
         S(s) => s.data.len > 0,
+        R(_) => true,
         Undef | Null => false,
         _ => true,
     }
@@ -247,7 +313,7 @@ pub fn truthy(v: V) -> bool {
 pub fn type_of(v: V) -> str {
     match v {
         Num(_) | Int(_) => "number",
-        S(_) => "string",
+        S(_) | R(_) => "string",
         Bool(_) => "boolean",
         Undef => "undefined",
         F(_) => "function",
@@ -263,12 +329,15 @@ pub fn to_number(v: V) -> f64 {
         Bool(b) => if b { 1.0 } else { 0.0 },
         Null => 0.0,
         S(s) => str_to_number(s.data),
+        R(r) => str_to_number(flatten(r).data),
         _ => 0.0 / 0.0,
     }
 }
 
 /// Strict equality (`===`).
-pub fn strict_eq(a: V, b: V) -> bool {
+pub fn strict_eq(a0: V, b0: V) -> bool {
+    let a = flat(a0);
+    let b = flat(b0);
     match (a, b) {
         (Int(x), Int(y)) => x == y,
         (Num(x), Num(y)) => x == y,
