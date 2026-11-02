@@ -664,12 +664,25 @@ pub vm Mini {
         next
     }
 
-    /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the loop variable.
+    /// The iterations after the first of an integer loop from `i` to `l`
+    /// by `s` (one that runs, with s != 0). It can exceed the integer
+    /// range, so it is stored as an Int whose payload bits are unsigned.
+    fn for_count(i: i64, l: i64, s: i64) -> V {
+        let n = if s == 1 { (l - i) as u64 }
+            else if s > 0 { ((l - i) as u64) / (s as u64) }
+            else { ((i - l) as u64) / ((0 - s) as u64) };
+        V.Int(n as i32)
+    }
+
+    /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the
+    /// loop variable. For an integer loop, FORPREP replaces the limit
+    /// with the iteration count.
     op FORPREP(a: forbase, target: label) : AsBx {
         match (regs[a], regs[a + 1], regs[a + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
                 if (s > 0 and i > l) or (s < 0 and i < l) { jump target }
+                regs[a + 1] = for_count(i as i64, l as i64, s as i64);
                 regs[a + 3] = Int(i);
                 next
             }
@@ -686,7 +699,7 @@ pub vm Mini {
                 let lf = if si > 0 { l.floor() } else { -((-l).floor()) };
                 if l != l or (si > 0 and lf < ii as f64) or (si < 0 and lf > ii as f64) { jump target }
                 let li: i32 = if lf > 2147483647.0 { 2147483647 } else if lf < -2147483648.0 { -2147483647 - 1 } else { lf as i32 };
-                regs[a + 1] = Int(li);
+                regs[a + 1] = for_count(ii as i64, li as i64, si as i64);
                 regs[a + 3] = Int(ii);
                 next
             }
@@ -699,18 +712,22 @@ pub vm Mini {
             next
         }
     }
+    /// An integer loop counts down the iterations left in R[a+1] (as in
+    /// Lua 5.4), so stepping needs no overflow or direction checks.
     op FORLOOP(a: forbase, target: label) : AsBx {
-        match (regs[a], regs[a + 1], regs[a + 2]) {
-            (Int(i), Int(l), Int(s)) => {
-                if let Some(n) = i.add_checked(s) {
-                    if (s > 0 and n <= l) or (s < 0 and n >= l) {
-                        regs[a] = Int(n);
-                        regs[a + 3] = Int(n);
-                        jump target
-                    }
-                }
-                next
+        if let Int(c) = regs[a + 1] {
+            if c != 0 {
+                regs[a + 1] = Int(c -% 1);
+                let Int(i) = regs[a] else { unreachable };
+                let Int(s) = regs[a + 2] else { unreachable };
+                let n = V.Int(i +% s);
+                regs[a] = n;
+                regs[a + 3] = n;
+                jump target
             }
+            next
+        }
+        match (regs[a], regs[a + 1], regs[a + 2]) {
             (Num(i), Num(l), Num(s)) => {
                 let n = i + s;
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
