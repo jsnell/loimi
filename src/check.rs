@@ -2443,6 +2443,10 @@ impl<'a> Checker<'a> {
                     return self.generic_call(cx, gf, vec![], known, args, exp, span);
                 }
                 if let Some(def) = self.vm_item(cx, base, &name.name) {
+                    if let Def::GenericFn(g) = def {
+                        // `Vm.disasm(code, &out)`: generic over the sink.
+                        return self.generic_call(cx, g, vec![], vec![], args, exp, span);
+                    }
                     let f = self.def_value(def, &name.name, callee.span)?;
                     return self.finish_call(cx, f, vec![], args, span);
                 }

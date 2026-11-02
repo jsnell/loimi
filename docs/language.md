@@ -450,8 +450,7 @@ type-checks the mapping. From the declarations it **generates**:
 - the opcode enum and the per-op decoders, inlined into the handlers;
 - `Mini.Builder`: typed emit functions (`b.ADD(dst, a, b)`), labels with
   backpatching, and branch range checks (`std.bc`, see stdlib);
-- `Mini.disasm`: a disassembler that prints operands through their kinds
-  (`r3`, `k[7] = "foo"`, `-> 0042`);
+- a disassembler (below);
 - `Mini.verify` (section 6);
 - metadata tables (sizes, operand kinds, branch targets) for tools.
 - label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
@@ -465,6 +464,38 @@ type-checks the mapping. From the declarations it **generates**:
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.
+
+**Disassembler.** `Vm.disasm(code, &out)` prints every instruction of
+`code`, and `Vm.disasm_insn(code, i, &out) -> u64` prints the one at word
+`i` and returns its size in words (0 if `i` is past the end). `out` points
+to any type with `push_str(str)` and `push_int(i64)` methods (and
+`push_f64(f64)` if a cache has a float field), such as `text.StrBuf`: the
+two functions are generic over it, and cost nothing unless called. Each
+line is the word offset, the op name, and the operands by name with their
+decoded values, signed fields as signed:
+
+```
+    0  LOADK dst=r0 c=k3
+    1  LOADI_ADD
+    1    LOADI dst=r1 v=-7
+    2    ADD dst=r2 a=r0 b=r1
+    3  GETPROP dst=r3 obj=r2 [cache shape=null slot=0]
+    7  JMP target -> 1
+```
+
+- A label operand (kind `pc + it`) prints its absolute target: `target -> 1`.
+- An operand kind can say how its values print with `display`, a string
+  with one `{}` for the value (for a label, the target):
+  `operand reg = regs[it] verify it < proto.nregs display "r{}";`. Without
+  one, the number prints alone.
+- Inline cache words print as `[cache field=value ...]`: integers in
+  decimal, `bool`s, `f64`s, pointers in hex (`null` for 0).
+- A superinstruction prints its name, then each part on its own line at
+  its own offset (the head word with the first part's operands). The parts'
+  words are read as they are, so quickened parts show their current op.
+  `then` followers are ordinary instructions and print as such.
+- An invalid opcode prints as `<invalid 0x..>` (size 1); an instruction
+  that runs past the end of `code` prints its name and `<truncated>`.
 
 ### 3.4 Ops and control words
 
