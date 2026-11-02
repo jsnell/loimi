@@ -62,6 +62,9 @@ pub struct Heap {
     collections: u64,
     freed: u64,
     stress: bool,
+    /// Free for the embedder (for example, runtime data that allocation
+    /// helpers need but that is not passed to them).
+    user: *u8,
 }
 
 pub fn Heap.new() -> Heap {
@@ -80,6 +83,7 @@ pub fn Heap.new() -> Heap {
         collections: 0,
         freed: 0,
         stress: false,
+        user: 0 as *u8,
     }
 }
 

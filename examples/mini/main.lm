@@ -25,6 +25,7 @@ fn main() -> i32 {
         return 1;
     };
     var heap = gc.Heap.new();
+    value.init_strings(&heap);
     let globals = value.new_table(&heap);
     var ctx = Ctx {
         heap: heap,

@@ -65,9 +65,98 @@ pub value V repr nanbox {
     Native(i32),
 }
 
+/// The string intern table: every live Str, so equal strings are the
+/// same object and string equality is identity. Open addressing over one
+/// word per slot: the Str's address in the low 48 bits and the top 16
+/// bits of its hash above them, so probes rarely touch the strings. 0 is
+/// an empty slot and 1 a tombstone. Weak: a sweeper turns strings the
+/// collector did not mark into tombstones. Reached through the heap's
+/// `user` pointer.
+pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, stag: u64 }
+
+const TOMB: u64 = 1;
+const ADDR: u64 = 0xFFFFFFFFFFFF;
+const HTAG: u64 = 0xFFFF000000000000;
+
+/// The Str in slot word `w`. (`stag` holds the tag bits of a `V.S`: a Gc
+/// pointer can only be made from an integer through a value.)
+fn str_at(st: *Strings, w: u64) -> Gc<Str> {
+    let S(o) = ((w & ADDR) | st.stag) as V else { unreachable };
+    o
+}
+
+/// Create the intern table and attach it to `h`.
+pub fn init_strings(h: *gc.Heap) {
+    let st: *Strings = mem.alloc(1);
+    st.cap = 0;
+    st.stag = 0;
+    strings_resize(st, 1024);
+    h.user = st as *u8;
+    h.add_sweeper(st as *u8, sweep_strings);
+}
+
+/// Rehash into `cap` slots, dropping tombstones.
+fn strings_resize(st: *Strings, cap: u64) {
+    let old = st.slots;
+    let n = st.cap;
+    st.cap = cap;
+    st.live = 0;
+    st.used = 0;
+    st.slots = mem.alloc(cap);
+    mem.memset(st.slots as *u8, 0, cap * 8);
+    let mask = cap - 1;
+    for j in 0..n {
+        let w = old[j];
+        if w > TOMB {
+            var i = str_at(st, w).hash & mask;
+            while st.slots[i] != 0 { i = (i + 1) & mask; }
+            st.slots[i] = w;
+            st.live += 1;
+            st.used += 1;
+        }
+    }
+    if n > 0 { mem.release(old); }
+}
+
+fn sweep_strings(h: *gc.Heap, data: *u8) {
+    let st = data as *Strings;
+    let slots = st.slots;
+    for i in 0..st.cap {
+        let w = slots[i];
+        if w > TOMB and !gc.is_marked((w & ADDR) as *u8) {
+            slots[i] = TOMB;
+            st.live -= 1;
+        }
+    }
+    if st.cap > 1024 and st.live * 8 < st.cap { strings_resize(st, st.cap / 2); }
+}
+
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
-    let o = new(h, Str { hash: hash.bytes(s) }, s.len);
+    let hv = hash.bytes(s);
+    let st = h.user as *Strings;
+    let slots = st.slots;
+    let mask = st.cap - 1;
+    let tag = hv & HTAG;
+    var i = hv & mask;
+    loop {
+        let w = slots[i];
+        if w == 0 { break; }
+        if (w & HTAG) == tag and w != TOMB {
+            let o = str_at(st, w);
+            if o.data.len == s.len and mem.memcmp(o.data.ptr, s.ptr, s.len) == 0 { return o; }
+        }
+        i = (i + 1) & mask;
+    }
+    let o = new(h, Str { hash: hv }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
+    st.stag = (V.S(o) as u64) & HTAG;
+    slots[i] = (o as u64) | tag;
+    st.live += 1;
+    st.used += 1;
+    if st.used * 2 > st.cap {
+        // Grow only if mostly live; otherwise just drop the tombstones.
+        strings_resize(st, if st.live * 3 > st.cap { st.cap * 2 } else { st.cap });
+    }
     o
 }
 
@@ -128,7 +217,6 @@ pub fn raw_equal(a: V, b: V) -> bool {
         (Num(x), Num(y)) => x == y,
         (Int(x), Num(y)) => x as f64 == y,
         (Num(x), Int(y)) => x == y as f64,
-        (S(x), S(y)) => x.hash == y.hash and x.data.eq(y.data),
         _ => a == b,
     }
 }
@@ -153,11 +241,9 @@ fn key_hash(k: V) -> u64 {
     }
 }
 
-/// Equality of normalized keys: identical bits, or equal strings.
+/// Equality of normalized keys: identical bits (strings are interned).
 fn key_eq(a: V, b: V) -> bool {
-    if a == b { return true; }
-    if let (S(x), S(y)) = (a, b) { return x.hash == y.hash and x.data.eq(y.data); }
-    false
+    a == b
 }
 
 /// Index of the hash slot holding (normalized) key `k`, if present.

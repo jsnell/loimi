@@ -515,11 +515,9 @@ fn str_rep(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
     if (k as u64) >= (1 << 31) / l {
         return Err(V.S(value.new_str(h, "resulting string too large")));
     }
-    let total = l * k as u64;
-    let o = new(h, Str { hash: 0 }, total);
-    for r in 0..k as u64 { mem.memcpy(o.data.ptr + r * l, s.data.ptr, l); }
-    o.hash = hash.bytes(o.data);
-    Ok(V.S(o))
+    var b = text.StrBuf.new();
+    for r in 0..k as u64 { b.push_str(s.data); }
+    Ok(take_str(h, &b))
 }
 
 // string.format
