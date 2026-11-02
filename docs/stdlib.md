@@ -578,8 +578,9 @@ Panics have the same machinery: `rt.catch_panic(f, data) -> bool` runs
 `f(data)` and returns false if it panicked, and `rt.panic_message() -> str`
 is the message of the last panic caught on the thread
 (`"lib.lm:12:5: index out of bounds"`). `rt.panic(msg)` panics with your
-own message (it must be static text, or outlive the read). A `throw`
-passes through a `catch_panic` to the enclosing `protect`, and a panic
+own message (a catch keeps a copy of its first 512 bytes, so it may live
+in a buffer the unwinding abandons). A `throw` passes through a
+`catch_panic` to the enclosing `protect`, and a panic
 passes through a `protect`. On an `export "C"` function the attribute
 `#[catch_panic(v)]` does the same at the C boundary; the guarantees are
 in `language.md` §10.1.

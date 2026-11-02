@@ -316,3 +316,12 @@ export "C" fn rvm_depth() -> u32 { R.depth }
 
 /// Collect the vm heap (from the callback, with the root in `host` live).
 export "C" fn rvm_collect(c: *RCtx) uses gc { gc.collect(&c.w.heap); }
+
+/// `rt.panic` with a message in a stack buffer, which the unwinding
+/// abandons: the catch keeps a copy (at most 512 bytes).
+#[catch_panic]
+export "C" fn panic_on_stack(n: u64) {
+    var b: [u8; 600] = [0; 600];
+    for i in 0..n { b[i] = (97 + i % 26) as u8; }
+    rt.panic(b[0..n]);
+}

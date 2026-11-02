@@ -1944,7 +1944,9 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
 
   A panic anywhere below the export on the same thread (in Loimi code,
   or in a Loimi export the host calls from a callback) returns `-1` from
-  it, and `rt.panic_message()` gives the message. The value is an
+  it, and `rt.panic_message()` gives the message (`rt.panic(msg)`'s is
+  copied, its first 512 bytes, so it may be built in a buffer the
+  unwinding abandons). The value is an
   integer, `true`/`false`, or a variant of the result enum; without one
   (`#[catch_panic]`) the result is zero: 0, false, NULL, an empty `str`,
   or nothing. `rt.catch_panic(f, data)` does the same inside Loimi.

@@ -15,6 +15,12 @@ static void say(const char *what) {
     printf("%s: %.*s\n", what, (int)(end - p), p);
 }
 
+/* Overwrites the stack below the caller's frame. */
+static __attribute__((noinline)) void clobber_stack(void) {
+    volatile char z[8192];
+    for (size_t i = 0; i < sizeof z; i++) z[i] = 'Z';
+}
+
 static int64_t plus_one(int64_t x) { return x + 1; }
 static int64_t oob_inside(int64_t x) { return lookup_unprotected((uint64_t)x); }
 static int64_t caught_inside(int64_t x) { return lookup((uint64_t)x); }
@@ -44,6 +50,13 @@ static int64_t cb(RCtx *c, int64_t a) {
     return 0;
 }
 
+/* Run vm function `f` on `x`; print the result, R.depth and the shadow stack. */
+static void rvm_show(const char *what, RCtx *c, uint64_t f, int64_t x) {
+    int64_t r = rvm_run(c, f, x);
+    unsigned d = rvm_depth();
+    printf("%s %lld depth %u %s\n", what, (long long)r, d, shadow_stack_empty() ? "empty" : "left over");
+}
+
 int main(void) {
     printf("lookup %lld %lld\n", (long long)lookup(2), (long long)lookup(9));
     say("lookup");
@@ -57,6 +70,12 @@ int main(void) {
     check_name(LOIMI_STR("ok"));
     check_name(LOIMI_STR(""));
     say("check_name");
+    panic_on_stack(30);
+    clobber_stack();
+    say("panic_on_stack");
+    panic_on_stack(600);
+    clobber_stack();
+    printf("panic_on_stack 600: %zu bytes kept\n", last_panic().len);
     Table *t = table_new(10);
     printf("table_new %s %s\n", t ? "ok" : "NULL", table_new((uint64_t)1 << 62) ? "ok" : "NULL");
     say("table_new");
@@ -77,23 +96,23 @@ int main(void) {
     /* Panics in nested vm runs (see rvm_* in panic.lm). */
     w = world_new();
     RCtx *c = rvm_new(w, cb);
-    printf("rvm normal %lld depth %u\n", (long long)rvm_run(c, 0, 1), rvm_depth());
+    rvm_show("rvm normal", c, 0, 1);
     cb_mode = CB_PANIC;
-    printf("rvm panic in nested run %lld depth %u", (long long)rvm_run(c, 0, 9), rvm_depth());
-    printf(" %s\n", shadow_stack_empty() ? "empty" : "left over");
+    rvm_show("rvm panic in nested run", c, 0, 9);
     say("rvm");
     cb_mode = CB_DEEP;
-    printf("rvm panic 4 runs deep %lld depth %u (max %u)", (long long)rvm_run(c, 0, 3), rvm_depth(), max_depth);
-    printf(" %s\n", shadow_stack_empty() ? "empty" : "left over");
+    rvm_show("rvm panic 4 runs deep", c, 0, 3);
+    printf("max depth in the callback %u\n", max_depth);
     cb_mode = CB_CAUGHT;
-    printf("rvm caught in between %lld depth %u", (long long)rvm_run(c, 0, 3), rvm_depth());
-    printf(" %s, depths after the catch:", shadow_stack_empty() ? "empty" : "left over");
+    rvm_show("rvm caught in between", c, 0, 3);
+    printf("depths after the catch:");
     for (int i = 0; i < n_after; i++) printf(" %u", after[i]);
     printf("\n");
     cb_mode = CB_NORMAL;
-    printf("rvm normal again %lld %lld depth %u churn %lld", (long long)rvm_run(c, 0, 1), (long long)rvm_run(c, 1, 2),
-           rvm_depth(), (long long)world_churn(w, 10));
-    printf(" %s\n", shadow_stack_empty() ? "empty" : "left over");
+    rvm_show("rvm normal again", c, 0, 1);
+    rvm_show("rvm normal again", c, 1, 2);
+    int64_t churn = world_churn(w, 10);
+    printf("churn %lld %s\n", (long long)churn, shadow_stack_empty() ? "empty" : "left over");
     rvm_free(c);
     world_free(w);
     /* Still working after all that. */
