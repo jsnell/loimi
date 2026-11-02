@@ -1,0 +1,117 @@
+// Interpreter context: the VM stacks, globals, symbols and output buffer,
+// and the GC root scanner.
+
+import std.gc;
+import std.io;
+import std.mem;
+import std.text;
+import value;
+import value.{V, Sym, Closure, Symtab};
+
+/// One activation record. `resume` is where this frame continues after the
+/// call it is making returns. `k` caches cl.proto.consts.
+pub struct Frame { cl: Gc<Closure>, base: *V, resume: *u32, k: *V }
+
+pub struct Ctx {
+    heap: gc.Heap,
+    stack: *V,
+    stack_end: *V,
+    frames: *Frame,
+    frames_end: *Frame,
+    /// The innermost frame (published by the vm's `sync` block).
+    fp: *Frame,
+    /// Global variable values, indexed by Sym.gidx; Undef when unbound.
+    gvals: mem.Vec<V>,
+    /// The symbol of each global slot (for error messages).
+    gsyms: mem.Vec<Gc<Sym> >,
+    syms: Symtab,
+    /// The pending error message (a string) after a run that failed.
+    error: V,
+    /// Buffered standard output.
+    out: text.StrBuf,
+    tmp: text.StrBuf,
+}
+
+pub const STACK_SLOTS: u64 = 1 << 23;
+pub const FRAME_SLOTS: u64 = 1 << 20;
+
+pub fn Ctx.new() -> Ctx {
+    var c = Ctx {
+        heap: gc.Heap.new(),
+        stack: mem.alloc(STACK_SLOTS),
+        stack_end: 0 as *V,
+        frames: mem.alloc(FRAME_SLOTS),
+        frames_end: 0 as *Frame,
+        fp: 0 as *Frame,
+        gvals: mem.Vec.new(),
+        gsyms: mem.Vec.new(),
+        syms: Symtab.new(),
+        error: value.unspec(),
+        out: text.StrBuf.new(),
+        tmp: text.StrBuf.new(),
+    };
+    c.stack_end = c.stack + STACK_SLOTS;
+    c.frames_end = c.frames + FRAME_SLOTS;
+    c.fp = c.frames;
+    c
+}
+
+/// The global slot of `s`, created on first use.
+pub fn Ctx.global(c: *Ctx, s: Gc<Sym>) -> u32 {
+    if s.gidx == value.NO_GLOBAL {
+        s.gidx = c.gvals.len as u32;
+        c.gvals.push(value.undef());
+        c.gsyms.push(s);
+    }
+    s.gidx
+}
+
+/// GC roots: symbols, globals, the pending error, and every active frame's
+/// closure and registers. The registers of all frames form one contiguous
+/// range of the stack, ending at the top frame's last register.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    for i in 0..c.syms.all.len { gc_mark(h, c.syms.all.at(i)); }
+    for i in 0..c.gvals.len { gc_mark(h, c.gvals.at(i)); }
+    gc_mark(h, c.error);
+    var f = c.frames;
+    while f <= c.fp {
+        gc_mark(h, f.cl);
+        f = f + 1;
+    }
+    let top = c.fp.base + c.fp.cl.proto.nregs as u64;
+    var p = c.stack;
+    while p < top {
+        gc_mark(h, *p);
+        p = p + 1;
+    }
+}
+
+pub fn Ctx.flush(c: *Ctx) {
+    io.print(c.out.as_str());
+    c.out.clear();
+}
+
+/// An error value: "<msg>" or "<msg>: <v written>".
+pub fn err(c: *Ctx, msg: str, v: V) -> V {
+    c.tmp.clear();
+    c.tmp.push_str(msg);
+    c.tmp.push_str(": ");
+    value.print(&c.tmp, v, true);
+    V.S(value.new_str(&c.heap, c.tmp.as_str()))
+}
+
+pub fn err_msg(c: *Ctx, msg: str) -> V {
+    V.S(value.new_str(&c.heap, msg))
+}
+
+/// "<who>: expected <what>, got <v>"
+pub fn type_err(c: *Ctx, who: str, what: str, v: V) -> V {
+    c.tmp.clear();
+    c.tmp.push_str(who);
+    c.tmp.push_str(": expected ");
+    c.tmp.push_str(what);
+    c.tmp.push_str(", got ");
+    value.print(&c.tmp, v, true);
+    V.S(value.new_str(&c.heap, c.tmp.as_str()))
+}

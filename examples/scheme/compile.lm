@@ -1,0 +1,1517 @@
+// The Scheme compiler: data (as read) → AST → register bytecode.
+//
+// Pass 1 (`Comp`, "build") expands derived forms into a small core AST
+// and resolves every variable to a `Var`. It records which variables are
+// assigned (set!) and which are captured by nested lambdas, and gives
+// each lambda its list of free variables.
+//
+// Pass 2 (`Gen`) allocates registers and emits code through the generated
+// `Scheme.X` encoders. Closures are flat: a closure copies the values of
+// its free variables when it is created. A variable that is both captured
+// and assigned lives in a box (a one-slot vector), so all closures share it.
+// letrec bindings of lambdas are not boxed: the closures are created first
+// and their free slots for later siblings are patched (SETFREE) once those
+// are initialized.
+//
+// The compiler allocates in the heap but never collects, so the data being
+// compiled (and the line table keyed by pair addresses) stays valid.
+
+import std.io;
+import std.mem;
+import std.text;
+import std.gc;
+import std.map;
+import std.hash;
+import value;
+import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
+import rt.{Ctx};
+import read;
+import read.{fail, Reader};
+import builtins;
+import vm.{Scheme};
+
+// ── AST ─────────────────────────────────────────────────────────────
+
+enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or }
+
+/// Ops for builtins compiled inline.
+enum PO { Add, Sub, Mul, Div, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset }
+
+struct Var {
+    name: Gc<Sym>,
+    owner: *Lam,
+    reg: u32,
+    /// Target of a set!.
+    assigned: bool,
+    /// Referenced from a lambda other than its owner.
+    captured: bool,
+    /// Boxed regardless of assignment (a letrec variable that a closure
+    /// captures before the variable is initialized).
+    force_box: bool,
+    /// Number of lambdas that capture it (to detect captures during an init).
+    caps: u32,
+    /// The lambda this (letrec) variable is bound to, or null.
+    lam: *Lam,
+}
+
+struct Lam {
+    parent: *Lam,
+    name: str,
+    params: mem.Vec<*Var>,
+    nparams: u32,
+    rest: bool,
+    free: mem.Vec<*Var>,
+    body: *Node,
+}
+
+/// One AST node; which fields matter depends on `kind`:
+///   Const v | Ref var | GRef g | Set var a | GSet g a | GDef g a
+///   If a b c | Lambda lam | Seq list | Call a list | Prim po list
+///   Let vars list(inits) a(body) | Letrec vars list a | And list | Or list
+struct Node {
+    kind: K,
+    line: u32,
+    v: V,
+    vr: *Var,
+    g: u32,
+    po: PO,
+    a: *Node,
+    b: *Node,
+    c: *Node,
+    lam: *Lam,
+    list: mem.Vec<*Node>,
+    vars: mem.Vec<*Var>,
+}
+
+fn null_node() -> *Node { 0 as *Node }
+fn is_null(n: *Node) -> bool { (n as u64) == 0 }
+
+fn boxed(v: *Var) -> bool { v.force_box or (v.assigned and v.captured) }
+
+// ── pass 1: build ───────────────────────────────────────────────────
+
+struct Comp {
+    ctx: *Ctx,
+    heap: *gc.Heap,
+    lines: map.HashMap<u64, u32>,
+    /// Variables in scope, innermost last.
+    env: mem.Vec<*Var>,
+    lam: *Lam,
+    /// Globals that the program defines or assigns (by symbol address):
+    /// builtins among them are not compiled inline.
+    redefined: map.HashMap<u64, bool>,
+    line: u32,
+    gensyms: u32,
+}
+
+fn Comp.node(c: *Comp, kind: K) -> *Node {
+    let n: *Node = mem.alloc(1);
+    n.kind = kind;
+    n.line = c.line;
+    n.v = value.unspec();
+    n.list = mem.Vec.new();
+    n.vars = mem.Vec.new();
+    n
+}
+
+fn Comp.konst(c: *Comp, v: V) -> *Node {
+    let n = c.node(K.Const);
+    n.v = v;
+    n
+}
+
+fn Comp.new_var(c: *Comp, name: Gc<Sym>) -> *Var {
+    let v: *Var = mem.alloc(1);
+    v.name = name;
+    v.owner = c.lam;
+    v.lam = 0 as *Lam;
+    v
+}
+
+/// An uninterned symbol (invisible to programs).
+fn Comp.gensym(c: *Comp, s: str) -> Gc<Sym> {
+    c.gensyms += 1;
+    let o = new(c.heap, Sym { gidx: value.NO_GLOBAL }, s.len);
+    mem.memcpy(o.name.ptr, s.ptr, s.len);
+    o
+}
+
+fn Comp.sym(c: *Comp, s: str) -> V { V.Sym(c.ctx.syms.intern(c.heap, s)) }
+
+fn Comp.lookup(c: *Comp, s: Gc<Sym>) -> ?*Var {
+    var i = c.env.len;
+    while i > 0 {
+        i -= 1;
+        let v = c.env.at(i);
+        if (v.name as u64) == (s as u64) { return Some(v); }
+    }
+    None
+}
+
+/// Record a reference to `v` from the current lambda.
+fn Comp.capture(c: *Comp, v: *Var) {
+    var l = c.lam;
+    while (l as u64) != (v.owner as u64) {
+        var have = false;
+        for i in 0..l.free.len {
+            if (l.free.at(i) as u64) == (v as u64) { have = true; }
+        }
+        if !have {
+            l.free.push(v);
+            v.caps += 1;
+        }
+        v.captured = true;
+        l = l.parent;
+    }
+}
+
+fn Comp.ref_var(c: *Comp, v: *Var) -> *Node {
+    c.capture(v);
+    let n = c.node(K.Ref);
+    n.vr = v;
+    n
+}
+
+fn car(c: *Comp, x: V) -> V {
+    let P(p) = x else { fail(c.line, "bad syntax") };
+    p.car
+}
+
+fn cdr(c: *Comp, x: V) -> V {
+    let P(p) = x else { fail(c.line, "bad syntax") };
+    p.cdr
+}
+
+/// Length of a proper list, or -1.
+fn list_len(x: V) -> i64 {
+    var n: i64 = 0;
+    var cur = x;
+    while let P(p) = cur { n += 1; cur = p.cdr; }
+    if cur != value.nil() { return -1; }
+    n
+}
+
+fn sym_name(x: V) -> ?str {
+    if let Sym(s) = x { return Some(s.name); }
+    None
+}
+
+fn is_sym(x: V, name: str) -> bool {
+    if let Sym(s) = x { return s.name.eq(name); }
+    false
+}
+
+fn Comp.line_of(c: *Comp, x: V) -> u32 {
+    if let P(p) = x and let Some(l) = c.lines.get(p as u64) { return l; }
+    c.line
+}
+
+/// Is `x` a form whose head is the special-form keyword `name` (not shadowed)?
+fn Comp.is_form(c: *Comp, x: V, name: str) -> bool {
+    if let P(p) = x and let Sym(s) = p.car and s.name.eq(name) { return c.lookup(s).is_none(); }
+    false
+}
+
+/// Builtins compiled inline: (op, number of arguments).
+fn inline_prim(name: str) -> ?(PO, i64) {
+    if name.eq("+") { return Some((PO.Add, 2)); }
+    if name.eq("-") { return Some((PO.Sub, 2)); }
+    if name.eq("*") { return Some((PO.Mul, 2)); }
+    if name.eq("/") { return Some((PO.Div, 2)); }
+    if name.eq("=") { return Some((PO.NumEq, 2)); }
+    if name.eq("<") { return Some((PO.Lt, 2)); }
+    if name.eq(">") { return Some((PO.Gt, 2)); }
+    if name.eq("<=") { return Some((PO.Le, 2)); }
+    if name.eq(">=") { return Some((PO.Ge, 2)); }
+    if name.eq("eq?") { return Some((PO.Eq, 2)); }
+    if name.eq("eqv?") { return Some((PO.Eqv, 2)); }
+    if name.eq("cons") { return Some((PO.Cons, 2)); }
+    if name.eq("vector-ref") { return Some((PO.Vref, 2)); }
+    if name.eq("zero?") { return Some((PO.ZeroP, 1)); }
+    if name.eq("not") { return Some((PO.Not, 1)); }
+    if name.eq("null?") { return Some((PO.NullP, 1)); }
+    if name.eq("pair?") { return Some((PO.PairP, 1)); }
+    if name.eq("car") { return Some((PO.Car, 1)); }
+    if name.eq("cdr") { return Some((PO.Cdr, 1)); }
+    if name.eq("set-car!") { return Some((PO.SetCar, 2)); }
+    if name.eq("set-cdr!") { return Some((PO.SetCdr, 2)); }
+    if name.eq("vector-set!") { return Some((PO.Vset, 3)); }
+    None
+}
+
+fn Comp.prim(c: *Comp, po: PO, args: mem.Vec<*Node>) -> *Node {
+    let n = c.node(K.Prim);
+    n.po = po;
+    n.list = args;
+    n
+}
+
+fn Comp.prim1(c: *Comp, po: PO, a: *Node) -> *Node {
+    var l: mem.Vec<*Node> = mem.Vec.new();
+    l.push(a);
+    c.prim(po, l)
+}
+
+fn Comp.prim2(c: *Comp, po: PO, a: *Node, b: *Node) -> *Node {
+    var l: mem.Vec<*Node> = mem.Vec.new();
+    l.push(a);
+    l.push(b);
+    c.prim(po, l)
+}
+
+fn Comp.if_node(c: *Comp, a: *Node, b: *Node, e: *Node) -> *Node {
+    let n = c.node(K.If);
+    n.a = a;
+    n.b = b;
+    n.c = e;
+    n
+}
+
+fn Comp.build(c: *Comp, x: V) -> *Node {
+    let saved = c.line;
+    c.line = c.line_of(x);
+    let n = c.build_inner(x);
+    c.line = saved;
+    n
+}
+
+fn Comp.build_inner(c: *Comp, x: V) -> *Node {
+    match x {
+        Sym(s) => {
+            if let Some(v) = c.lookup(s) { return c.ref_var(v); }
+            let n = c.node(K.GRef);
+            n.g = c.ctx.global(s);
+            n
+        }
+        P(p) => {
+            if let Sym(s) = p.car and c.lookup(s).is_none() {
+                if let Some(n) = c.special(s.name, x) { return n; }
+                // A builtin compiled inline?
+                if !c.redefined.contains(s as u64) {
+                    let argc = list_len(p.cdr);
+                    if let Some(n) = c.inline_call(s.name, p.cdr, argc) { return n; }
+                }
+            }
+            let n = c.node(K.Call);
+            n.a = c.build(p.car);
+            var cur = p.cdr;
+            while let P(q) = cur {
+                n.list.push(c.build(q.car));
+                cur = q.cdr;
+            }
+            if cur != value.nil() { fail(c.line, "improper argument list"); }
+            n
+        }
+        _ => {
+            if x == value.nil() { fail(c.line, "empty combination ()"); }
+            c.konst(x)
+        }
+    }
+}
+
+fn Comp.args(c: *Comp, x: V) -> mem.Vec<*Node> {
+    var l: mem.Vec<*Node> = mem.Vec.new();
+    var cur = x;
+    while let P(q) = cur {
+        l.push(c.build(q.car));
+        cur = q.cdr;
+    }
+    l
+}
+
+fn Comp.inline_call(c: *Comp, name: str, args: V, argc: i64) -> ?*Node {
+    // cXr compositions become chains of car/cdr.
+    if argc == 1 and name.len >= 4 and name.len <= 5 and name[0] == 'c' and name[name.len - 1] == 'r' {
+        var ok = true;
+        for i in 1..name.len - 1 {
+            if name[i] != 'a' and name[i] != 'd' { ok = false; }
+        }
+        if ok {
+            var n = c.build(car(c, args));
+            var i = name.len - 1;
+            while i > 1 {
+                i -= 1;
+                n = c.prim1(if name[i] == 'a' { PO.Car } else { PO.Cdr }, n);
+            }
+            return Some(n);
+        }
+    }
+    let Some((po, want)) = inline_prim(name) else { return None; };
+    if argc == want { return Some(c.prim(po, c.args(args))); }
+    // Left-fold + and * over more operands; (- x) is (- 0 x).
+    if (po == PO.Add or po == PO.Mul or po == PO.Sub) and argc > 2 {
+        let l = c.args(args);
+        var n = c.prim2(po, l.at(0), l.at(1));
+        for i in 2..l.len { n = c.prim2(po, n, l.at(i)); }
+        return Some(n);
+    }
+    if po == PO.Sub and argc == 1 {
+        return Some(c.prim2(PO.Sub, c.konst(V.Int(0)), c.build(car(c, args))));
+    }
+    None
+}
+
+/// Special forms. None when `name` is not a keyword.
+fn Comp.special(c: *Comp, name: str, x: V) -> ?*Node {
+    let rest = cdr(c, x);
+    if name.eq("quote") {
+        if list_len(rest) != 1 { fail(c.line, "bad quote"); }
+        return Some(c.konst(car(c, rest)));
+    }
+    if name.eq("quasiquote") {
+        if list_len(rest) != 1 { fail(c.line, "bad quasiquote"); }
+        return Some(c.qq(car(c, rest), 1));
+    }
+    if name.eq("lambda") {
+        if list_len(rest) < 2 { fail(c.line, "bad lambda"); }
+        let n = c.node(K.Lambda);
+        n.lam = c.lambda(car(c, rest), cdr(c, rest), "lambda");
+        return Some(n);
+    }
+    if name.eq("define") { fail(c.line, "define is only allowed at the start of a body or at top level"); }
+    if name.eq("set!") {
+        if list_len(rest) != 2 { fail(c.line, "bad set!"); }
+        let Sym(s) = car(c, rest) else { fail(c.line, "set!: not a variable") };
+        let val = c.build(car(c, cdr(c, rest)));
+        if let Some(v) = c.lookup(s) {
+            c.capture(v);
+            v.assigned = true;
+            let n = c.node(K.Set);
+            n.vr = v;
+            n.a = val;
+            return Some(n);
+        }
+        let n = c.node(K.GSet);
+        n.g = c.ctx.global(s);
+        n.a = val;
+        return Some(n);
+    }
+    if name.eq("if") {
+        let len = list_len(rest);
+        if len != 2 and len != 3 { fail(c.line, "bad if"); }
+        let t = c.build(car(c, rest));
+        let a = c.build(car(c, cdr(c, rest)));
+        let e = if len == 3 { c.build(car(c, cdr(c, cdr(c, rest)))) } else { null_node() };
+        return Some(c.if_node(t, a, e));
+    }
+    if name.eq("begin") {
+        if rest == value.nil() { return Some(c.konst(value.unspec())); }
+        return Some(c.seq(rest));
+    }
+    if name.eq("let") {
+        if list_len(rest) < 2 { fail(c.line, "bad let"); }
+        if let Sym(s) = car(c, rest) { return Some(c.named_let(s, cdr(c, rest))); }
+        return Some(c.let_form(car(c, rest), cdr(c, rest)));
+    }
+    if name.eq("let*") {
+        if list_len(rest) < 2 { fail(c.line, "bad let*"); }
+        return Some(c.let_star(car(c, rest), cdr(c, rest)));
+    }
+    if name.eq("letrec") or name.eq("letrec*") {
+        if list_len(rest) < 2 { fail(c.line, "bad letrec"); }
+        return Some(c.letrec(car(c, rest), cdr(c, rest)));
+    }
+    if name.eq("and") or name.eq("or") {
+        if rest == value.nil() { return Some(c.konst(value.boolean(name.eq("and")))); }
+        if list_len(rest) == 1 { return Some(c.build(car(c, rest))); }
+        let n = c.node(if name.eq("and") { K.And } else { K.Or });
+        n.list = c.args(rest);
+        return Some(n);
+    }
+    if name.eq("when") or name.eq("unless") {
+        if list_len(rest) < 2 { fail(c.line, "bad when/unless"); }
+        var t = c.build(car(c, rest));
+        if name.eq("unless") { t = c.prim1(PO.Not, t); }
+        return Some(c.if_node(t, c.seq(cdr(c, rest)), null_node()));
+    }
+    if name.eq("cond") { return Some(c.cond(rest)); }
+    if name.eq("case") { return Some(c.case_form(rest)); }
+    if name.eq("do") { return Some(c.do_form(rest)); }
+    if name.eq("define-syntax") or name.eq("let-syntax") or name.eq("syntax-rules") or name.eq("call/cc")
+        or name.eq("call-with-current-continuation") or name.eq("dynamic-wind") {
+        if !c.redefined.contains(c.ctx.syms.intern(c.heap, name) as u64) {
+            var b = text.StrBuf.new();
+            b.push_str(name);
+            b.push_str(" is not supported (see examples/scheme/README.md)");
+            fail(c.line, b.as_str());
+        }
+    }
+    None
+}
+
+/// A sequence of expressions (no definitions).
+fn Comp.seq(c: *Comp, body: V) -> *Node {
+    if list_len(body) == 1 { return c.build(car(c, body)); }
+    let n = c.node(K.Seq);
+    n.list = c.args(body);
+    if n.list.len == 0 { return c.konst(value.unspec()); }
+    n
+}
+
+/// Parse a parameter list into variables of the current lambda.
+fn Comp.params(c: *Comp, l: *Lam, ps: V) {
+    var cur = ps;
+    loop {
+        match cur {
+            P(p) => {
+                let Sym(s) = p.car else { fail(c.line, "bad parameter list") };
+                let v = c.new_var(s);
+                l.params.push(v);
+                l.nparams += 1;
+                c.env.push(v);
+                cur = p.cdr;
+            }
+            Sym(s) => {
+                let v = c.new_var(s);
+                l.params.push(v);
+                l.rest = true;
+                c.env.push(v);
+                break;
+            }
+            _ => {
+                if cur != value.nil() { fail(c.line, "bad parameter list"); }
+                break;
+            }
+        }
+    }
+}
+
+fn Comp.lambda(c: *Comp, ps: V, body: V, name: str) -> *Lam {
+    let l: *Lam = mem.alloc(1);
+    l.parent = c.lam;
+    l.name = name;
+    l.params = mem.Vec.new();
+    l.free = mem.Vec.new();
+    let mark = c.env.len;
+    let saved = c.lam;
+    c.lam = l;
+    c.params(l, ps);
+    if l.nparams > 200 { fail(c.line, "too many parameters"); }
+    l.body = c.body(body);
+    c.env.truncate(mark);
+    c.lam = saved;
+    l
+}
+
+/// Flatten `begin`s in a body (they may contain definitions).
+fn Comp.flatten(c: *Comp, forms: V, out: *mem.Vec<V>) {
+    var cur = forms;
+    while let P(p) = cur {
+        if c.is_form(p.car, "begin") {
+            c.flatten(cdr(c, p.car), out);
+        } else {
+            out.push(p.car);
+        }
+        cur = p.cdr;
+    }
+}
+
+/// (define name expr) / (define (name . params) body...) → (name, value form or lambda).
+fn Comp.definition(c: *Comp, x: V) -> (Gc<Sym>, V, bool) {
+    let rest = cdr(c, x);
+    if list_len(rest) < 1 { fail(c.line, "bad define"); }
+    let target = car(c, rest);
+    if let Sym(s) = target {
+        let e = cdr(c, rest);
+        if e == value.nil() { return (s, value.unspec(), false); }
+        if list_len(e) != 1 { fail(c.line, "bad define"); }
+        return (s, car(c, e), false);
+    }
+    let P(p) = target else { fail(c.line, "bad define") };
+    let Sym(s) = p.car else { fail(c.line, "bad define (curried defines are not supported)") };
+    if list_len(cdr(c, rest)) < 1 { fail(c.line, "bad define: empty body"); }
+    (s, target, true)
+}
+
+/// Build the value of a definition: a lambda for the procedure shorthand.
+fn Comp.def_value(c: *Comp, s: Gc<Sym>, form: V, val: V, is_proc: bool) -> *Node {
+    if is_proc {
+        let n = c.node(K.Lambda);
+        n.lam = c.lambda(cdr(c, val), cdr(c, cdr(c, form)), s.name);
+        return n;
+    }
+    // (define f (lambda ...)) names the lambda too.
+    if c.is_form(val, "lambda") {
+        let saved = c.line;
+        c.line = c.line_of(val);
+        let rest = cdr(c, val);
+        if list_len(rest) < 2 { fail(c.line, "bad lambda"); }
+        let n = c.node(K.Lambda);
+        n.lam = c.lambda(car(c, rest), cdr(c, rest), s.name);
+        c.line = saved;
+        return n;
+    }
+    c.build(val)
+}
+
+/// A body: internal definitions (letrec* semantics) followed by expressions.
+fn Comp.body(c: *Comp, forms: V) -> *Node {
+    var items: mem.Vec<V> = mem.Vec.new();
+    c.flatten(forms, &items);
+    var ndefs: u64 = 0;
+    for i in 0..items.len {
+        if c.is_form(items.at(i), "define") { ndefs += 1; }
+    }
+    if ndefs == 0 {
+        let n = c.node(K.Seq);
+        for i in 0..items.len { n.list.push(c.build(items.at(i))); }
+        items.free();
+        if n.list.len == 0 { fail(c.line, "empty body"); }
+        if n.list.len == 1 { return n.list.at(0); }
+        return n;
+    }
+    // Bind all names first, then build the inits in order. Expressions
+    // between definitions run before the next definition's init.
+    let mark = c.env.len;
+    let n = c.node(K.Letrec);
+    for i in 0..items.len {
+        let x = items.at(i);
+        if c.is_form(x, "define") {
+            let saved = c.line;
+            c.line = c.line_of(x);
+            let (s, _, _) = c.definition(x);
+            let v = c.new_var(s);
+            n.vars.push(v);
+            c.env.push(v);
+            c.line = saved;
+        }
+    }
+    var pending: mem.Vec<*Node> = mem.Vec.new();
+    var j: u64 = 0;
+    for i in 0..items.len {
+        let x = items.at(i);
+        if !c.is_form(x, "define") {
+            pending.push(c.build(x));
+            continue;
+        }
+        let saved = c.line;
+        c.line = c.line_of(x);
+        let (s, val, is_proc) = c.definition(x);
+        var caps: mem.Vec<u32> = mem.Vec.new();
+        for t in 0..n.vars.len { caps.push(n.vars.at(t).caps); }
+        var init = c.def_value(s, x, val, is_proc);
+        c.check_early_capture(n, j, init, &caps);
+        caps.free();
+        if pending.len > 0 {
+            let sq = c.node(K.Seq);
+            sq.list = pending;
+            sq.list.push(init);
+            init = sq;
+            pending = mem.Vec.new();
+        }
+        n.list.push(init);
+        c.line = saved;
+        j += 1;
+    }
+    let body = c.node(K.Seq);
+    body.list = pending;
+    if body.list.len == 0 { body.list.push(c.konst(value.unspec())); }
+    n.a = body;
+    c.env.truncate(mark);
+    items.free();
+    n
+}
+
+/// letrec analysis after building init `j` of `n`: a variable (j or later)
+/// captured by a closure made while evaluating a non-lambda init must be
+/// boxed, since its value is not known yet when the closure copies it.
+fn Comp.check_early_capture(c: *Comp, n: *Node, j: u64, init: *Node, caps: *mem.Vec<u32>) {
+    let _ = c;
+    let v = n.vars.at(j);
+    if init.kind == K.Lambda {
+        v.lam = init.lam;
+        return;
+    }
+    for i in j..n.vars.len {
+        if n.vars.at(i).caps != caps.at(i) { n.vars.at(i).force_box = true; }
+    }
+}
+
+fn Comp.letrec(c: *Comp, bindings: V, body: V) -> *Node {
+    let mark = c.env.len;
+    let n = c.node(K.Letrec);
+    var cur = bindings;
+    while let P(p) = cur {
+        let Sym(s) = car(c, p.car) else { fail(c.line, "bad letrec binding") };
+        let v = c.new_var(s);
+        n.vars.push(v);
+        c.env.push(v);
+        cur = p.cdr;
+    }
+    cur = bindings;
+    var j: u64 = 0;
+    while let P(p) = cur {
+        if list_len(p.car) != 2 { fail(c.line, "bad letrec binding"); }
+        var caps: mem.Vec<u32> = mem.Vec.new();
+        for t in 0..n.vars.len { caps.push(n.vars.at(t).caps); }
+        let init = c.def_value(n.vars.at(j).name, p.car, car(c, cdr(c, p.car)), false);
+        c.check_early_capture(n, j, init, &caps);
+        caps.free();
+        n.list.push(init);
+        j += 1;
+        cur = p.cdr;
+    }
+    n.a = c.body(body);
+    c.env.truncate(mark);
+    n
+}
+
+fn Comp.let_form(c: *Comp, bindings: V, body: V) -> *Node {
+    let n = c.node(K.Let);
+    var names: mem.Vec<Gc<Sym> > = mem.Vec.new();
+    var cur = bindings;
+    while let P(p) = cur {
+        let b = p.car;
+        if let Sym(s) = b {
+            // (let (x) ...): unspecified initial value (an extension).
+            names.push(s);
+            n.list.push(c.konst(value.unspec()));
+        } else {
+            let len = list_len(b);
+            if len != 2 and len != 1 { fail(c.line, "bad let binding"); }
+            let Sym(s) = car(c, b) else { fail(c.line, "bad let binding") };
+            names.push(s);
+            n.list.push(if len == 2 { c.build(car(c, cdr(c, b))) } else { c.konst(value.unspec()) });
+        }
+        cur = p.cdr;
+    }
+    if cur != value.nil() { fail(c.line, "bad let bindings"); }
+    let mark = c.env.len;
+    for i in 0..names.len {
+        let v = c.new_var(names.at(i));
+        n.vars.push(v);
+        c.env.push(v);
+    }
+    names.free();
+    n.a = c.body(body);
+    c.env.truncate(mark);
+    n
+}
+
+fn Comp.let_star(c: *Comp, bindings: V, body: V) -> *Node {
+    let P(p) = bindings else { return c.let_form(value.nil(), body); };
+    if p.cdr == value.nil() { return c.let_form(bindings, body); }
+    let h = c.heap;
+    // (let (b0) (let* rest body...))
+    let inner = value.cons(h, c.sym("let*"), value.cons(h, p.cdr, body));
+    c.let_form(value.cons(h, p.car, value.nil()), value.cons(h, inner, value.nil()))
+}
+
+/// (let name ((v init) ...) body) → ((letrec ((name (lambda (v ...) body))) name) init ...)
+fn Comp.named_let(c: *Comp, name: Gc<Sym>, rest: V) -> *Node {
+    let bindings = car(c, rest);
+    let body = cdr(c, rest);
+    let h = c.heap;
+    var params = value.nil();
+    var inits: mem.Vec<*Node> = mem.Vec.new();
+    var names: mem.Vec<V> = mem.Vec.new();
+    var cur = bindings;
+    while let P(p) = cur {
+        if list_len(p.car) != 2 { fail(c.line, "bad named let binding"); }
+        names.push(car(c, p.car));
+        inits.push(c.build(car(c, cdr(c, p.car))));
+        cur = p.cdr;
+    }
+    var i = names.len;
+    while i > 0 { i -= 1; params = value.cons(h, names.at(i), params); }
+    names.free();
+    let mark = c.env.len;
+    let n = c.node(K.Letrec);
+    let v = c.new_var(name);
+    n.vars.push(v);
+    c.env.push(v);
+    let lam = c.node(K.Lambda);
+    lam.lam = c.lambda(params, body, name.name);
+    v.lam = lam.lam;
+    n.list.push(lam);
+    let call = c.node(K.Call);
+    call.a = c.ref_var(v);
+    call.list = inits;
+    n.a = call;
+    c.env.truncate(mark);
+    n
+}
+
+fn Comp.temp_var(c: *Comp, name: str) -> *Var {
+    c.new_var(c.gensym(name))
+}
+
+fn Comp.cond(c: *Comp, clauses: V) -> *Node {
+    let P(p) = clauses else { return c.konst(value.unspec()); };
+    let cl = p.car;
+    let saved = c.line;
+    c.line = c.line_of(cl);
+    if list_len(cl) < 1 { fail(c.line, "bad cond clause"); }
+    let test = car(c, cl);
+    let body = cdr(c, cl);
+    var n = null_node();
+    if is_sym(test, "else") and c.lookup(c.ctx.syms.intern(c.heap, "else")).is_none() {
+        n = c.seq(body);
+    } else if body == value.nil() {
+        // (cond (test) rest...) → (or test (cond rest...))
+        let o = c.node(K.Or);
+        o.list.push(c.build(test));
+        o.list.push(c.cond(p.cdr));
+        n = o;
+    } else if is_sym(car(c, body), "=>") {
+        // (let ((t test)) (if t (f t) (cond rest...)))
+        let t = c.temp_var("cond-tmp");
+        let l = c.node(K.Let);
+        l.list.push(c.build(test));
+        l.vars.push(t);
+        let call = c.node(K.Call);
+        call.a = c.build(car(c, cdr(c, body)));
+        let r1 = c.node(K.Ref);
+        r1.vr = t;
+        call.list.push(r1);
+        let r2 = c.node(K.Ref);
+        r2.vr = t;
+        l.a = c.if_node(r2, call, c.cond(p.cdr));
+        n = l;
+    } else {
+        let t = c.build(test);
+        let a = c.seq(body);
+        let e = if p.cdr == value.nil() { null_node() } else { c.cond(p.cdr) };
+        n = c.if_node(t, a, e);
+    }
+    c.line = saved;
+    n
+}
+
+fn Comp.case_form(c: *Comp, rest: V) -> *Node {
+    if list_len(rest) < 1 { fail(c.line, "bad case"); }
+    let t = c.temp_var("case-key");
+    let l = c.node(K.Let);
+    l.list.push(c.build(car(c, rest)));
+    l.vars.push(t);
+    l.a = c.case_clauses(t, cdr(c, rest));
+    l
+}
+
+fn Comp.case_clauses(c: *Comp, t: *Var, clauses: V) -> *Node {
+    let P(p) = clauses else { return c.konst(value.unspec()); };
+    let cl = p.car;
+    if list_len(cl) < 2 { fail(c.line, "bad case clause"); }
+    let data = car(c, cl);
+    let body = cdr(c, cl);
+    var result = null_node();
+    if is_sym(car(c, body), "=>") {
+        let call = c.node(K.Call);
+        call.a = c.build(car(c, cdr(c, body)));
+        let r = c.node(K.Ref);
+        r.vr = t;
+        call.list.push(r);
+        result = call;
+    } else {
+        result = c.seq(body);
+    }
+    if is_sym(data, "else") { return result; }
+    let test = c.node(K.Or);
+    var cur = data;
+    while let P(d) = cur {
+        let r = c.node(K.Ref);
+        r.vr = t;
+        test.list.push(c.prim2(PO.Eqv, r, c.konst(d.car)));
+        cur = d.cdr;
+    }
+    if test.list.len == 0 { test.list.push(c.konst(value.f())); }
+    let e = if p.cdr == value.nil() { null_node() } else { c.case_clauses(t, p.cdr) };
+    c.if_node(test, result, e)
+}
+
+/// (do ((var init step) ...) (test expr ...) body ...) →
+/// (let loop ((var init) ...) (if test (begin expr ...) (begin body ... (loop step ...))))
+fn Comp.do_form(c: *Comp, rest: V) -> *Node {
+    if list_len(rest) < 2 { fail(c.line, "bad do"); }
+    let h = c.heap;
+    let specs = car(c, rest);
+    let exit = car(c, cdr(c, rest));
+    let body = cdr(c, cdr(c, rest));
+    if list_len(exit) < 1 { fail(c.line, "bad do exit clause"); }
+    let loop_name = c.gensym("do-loop");
+    var bindings = value.nil();
+    var steps = value.nil();
+    var specs_rev = value.nil();
+    var cur = specs;
+    while let P(p) = cur { specs_rev = value.cons(h, p.car, specs_rev); cur = p.cdr; }
+    cur = specs_rev;
+    while let P(p) = cur {
+        let s = p.car;
+        let len = list_len(s);
+        if len != 2 and len != 3 { fail(c.line, "bad do variable"); }
+        let var_ = car(c, s);
+        bindings = value.cons(h, value.cons(h, var_, value.cons(h, car(c, cdr(c, s)), value.nil())), bindings);
+        let step = if len == 3 { car(c, cdr(c, cdr(c, s))) } else { var_ };
+        steps = value.cons(h, step, steps);
+        cur = p.cdr;
+    }
+    let again = value.cons(h, V.Sym(loop_name), steps);
+    // (begin body ... again)
+    var seq = value.cons(h, again, value.nil());
+    var items: mem.Vec<V> = mem.Vec.new();
+    cur = body;
+    while let P(p) = cur { items.push(p.car); cur = p.cdr; }
+    var i = items.len;
+    while i > 0 { i -= 1; seq = value.cons(h, items.at(i), seq); }
+    items.free();
+    let loop_body = value.cons(h, c.sym("begin"), seq);
+    let result = if cdr(c, exit) == value.nil() {
+        value.cons(h, c.sym("begin"), value.cons(h, value.unspec(), value.nil()))
+    } else {
+        value.cons(h, c.sym("begin"), cdr(c, exit))
+    };
+    let iff = value.cons(h, c.sym("if"), value.cons(h, car(c, exit), value.cons(h, result, value.cons(h, loop_body, value.nil()))));
+    c.named_let(loop_name, value.cons(h, bindings, value.cons(h, iff, value.nil())))
+}
+
+fn Comp.qq_list2(c: *Comp, name: str, x: *Node) -> *Node {
+    // (list 'name x) built from cons.
+    c.prim2(PO.Cons, c.konst(c.sym(name)), c.prim2(PO.Cons, x, c.konst(value.nil())))
+}
+
+fn has_unquote(x: V) -> bool {
+    match x {
+        P(p) => {
+            if is_sym(p.car, "unquote") or is_sym(p.car, "unquote-splicing") { return true; }
+            has_unquote(p.car) or has_unquote(p.cdr)
+        }
+        Vec(v) => {
+            for i in 0..v.data.len {
+                if has_unquote(v.data.ptr[i]) { return true; }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Call builtin `id` directly (immune to redefinition).
+fn Comp.native(c: *Comp, id: i32, args: mem.Vec<*Node>) -> *Node {
+    let n = c.node(K.Call);
+    n.a = c.konst(value.prim(id));
+    n.list = args;
+    n
+}
+
+fn Comp.qq(c: *Comp, x: V, depth: i32) -> *Node {
+    if !has_unquote(x) { return c.konst(x); }
+    match x {
+        P(p) => {
+            if is_sym(p.car, "unquote") {
+                if list_len(x) != 2 { fail(c.line, "bad unquote"); }
+                if depth == 1 { return c.build(car(c, p.cdr)); }
+                return c.qq_list2("unquote", c.qq(car(c, p.cdr), depth - 1));
+            }
+            if is_sym(p.car, "quasiquote") {
+                if list_len(x) != 2 { fail(c.line, "bad quasiquote"); }
+                return c.qq_list2("quasiquote", c.qq(car(c, p.cdr), depth + 1));
+            }
+            if let P(item) = p.car and is_sym(item.car, "unquote-splicing") and depth == 1 {
+                if list_len(p.car) != 2 { fail(c.line, "bad unquote-splicing"); }
+                var args: mem.Vec<*Node> = mem.Vec.new();
+                args.push(c.build(car(c, item.cdr)));
+                args.push(c.qq(p.cdr, depth));
+                return c.native(45, args);   // append
+            }
+            c.prim2(PO.Cons, c.qq(p.car, depth), c.qq(p.cdr, depth))
+        }
+        Vec(v) => {
+            var l = value.nil();
+            var i = v.data.len;
+            while i > 0 { i -= 1; l = value.cons(c.heap, v.data.ptr[i], l); }
+            var args: mem.Vec<*Node> = mem.Vec.new();
+            args.push(c.qq(l, depth));
+            c.native(81, args)   // list->vector
+        }
+        _ => c.konst(x),
+    }
+}
+
+/// A top-level form: definitions are globals; `begin` splices.
+fn Comp.top(c: *Comp, x: V, out: *mem.Vec<*Node>) {
+    let saved = c.line;
+    c.line = c.line_of(x);
+    if c.is_form(x, "begin") {
+        var cur = cdr(c, x);
+        while let P(p) = cur { c.top(p.car, out); cur = p.cdr; }
+    } else if c.is_form(x, "define") {
+        let (s, val, is_proc) = c.definition(x);
+        let n = c.node(K.GDef);
+        n.g = c.ctx.global(s);
+        n.a = c.def_value(s, x, val, is_proc);
+        out.push(n);
+    } else {
+        out.push(c.build(x));
+    }
+    c.line = saved;
+}
+
+/// Note every global the program defines or assigns.
+fn Comp.scan_defs(c: *Comp, x: V) {
+    var cur = x;
+    while let P(p) = cur {
+        if is_sym(p.car, "define") or is_sym(p.car, "set!") {
+            if let P(q) = p.cdr {
+                var t = q.car;
+                if let P(tp) = t { t = tp.car; }
+                if let Sym(s) = t { c.redefined.insert(s as u64, true); }
+            }
+        }
+        c.scan_defs(p.car);
+        cur = p.cdr;
+    }
+}
+
+// ── pass 2: code generation ─────────────────────────────────────────
+
+struct FS {
+    lam: *Lam,
+    code: mem.Vec<u32>,
+    lines: mem.Vec<u32>,
+    consts: mem.Vec<V>,
+    protos: mem.Vec<Gc<Proto> >,
+    freereg: u32,
+    maxreg: u32,
+    line: u32,
+}
+
+struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
+
+fn FS.new(l: *Lam) -> FS {
+    FS {
+        lam: l,
+        code: mem.Vec.new(),
+        lines: mem.Vec.new(),
+        consts: mem.Vec.new(),
+        protos: mem.Vec.new(),
+        freereg: 0,
+        maxreg: 0,
+        line: 0,
+    }
+}
+
+fn Gen.emit(g: *Gen, w: u32) -> u64 {
+    g.fs.code.push(w);
+    g.fs.lines.push(g.fs.line);
+    g.fs.code.len - 1
+}
+
+fn Gen.pc(g: *Gen) -> u64 { g.fs.code.len }
+
+fn Gen.alloc(g: *Gen) -> u32 {
+    let r = g.fs.freereg;
+    g.fs.freereg += 1;
+    if g.fs.freereg > g.fs.maxreg { g.fs.maxreg = g.fs.freereg; }
+    if g.fs.freereg > 250 { fail(g.fs.line, "procedure needs too many registers"); }
+    r
+}
+
+/// Point the jump at `at` to `target`.
+fn Gen.patch(g: *Gen, at: u64, target: u64) {
+    let w = g.fs.code.at(at);
+    let off = target as i64 - at as i64;
+    if Scheme.opcode(w) == Scheme.OP_JMP {
+        g.fs.code.set(at, Scheme.JMP(off as i32));
+    } else {
+        if off < -32768 or off > 32767 { fail(g.fs.line, "procedure too long"); }
+        g.fs.code.set(at, (w & 0xFFFF) | (((off as i32) as u32 & 0xFFFF) << 16));
+    }
+}
+
+fn Gen.constant(g: *Gen, v: V) -> u32 {
+    let fs = g.fs;
+    for i in 0..fs.consts.len {
+        if fs.consts.at(i) == v { return i as u32; }
+    }
+    if fs.consts.len >= 65535 { fail(fs.line, "too many constants"); }
+    fs.consts.push(v);
+    (fs.consts.len - 1) as u32
+}
+
+fn Gen.load_const(g: *Gen, v: V, dst: u32) {
+    if let Int(i) = v and i >= -32768 and i <= 32767 {
+        g.emit(Scheme.LOADI(dst as u8, i as i16));
+        return;
+    }
+    let k = g.constant(v);
+    g.emit(Scheme.LOADK(dst as u8, k as u16));
+}
+
+fn free_index(l: *Lam, v: *Var) -> u32 {
+    for i in 0..l.free.len {
+        if (l.free.at(i) as u64) == (v as u64) { return i as u32; }
+    }
+    fail(0, "internal error: free variable not found")
+}
+
+fn is_local(g: *Gen, v: *Var) -> bool { (v.owner as u64) == (g.fs.lam as u64) }
+
+/// A register holding the value of `n` (a local's own register if possible).
+fn Gen.any(g: *Gen, n: *Node) -> u32 {
+    if n.kind == K.Ref and is_local(g, n.vr) and !boxed(n.vr) { return n.vr.reg; }
+    let r = g.alloc();
+    g.to(n, r);
+    r
+}
+
+fn Gen.set_line(g: *Gen, n: *Node) -> u32 {
+    let saved = g.fs.line;
+    if n.line != 0 { g.fs.line = n.line; }
+    saved
+}
+
+/// Emit code leaving the value of `n` in register `dst`.
+fn Gen.to(g: *Gen, n: *Node, dst: u32) {
+    let saved_line = g.set_line(n);
+    let save = g.fs.freereg;
+    let d = dst as u8;
+    match n.kind {
+        Const => g.load_const(n.v, dst),
+        Ref => {
+            let v = n.vr;
+            if is_local(g, v) {
+                if boxed(v) {
+                    g.emit(Scheme.BOXGET(d, v.reg as u8));
+                } else if v.reg != dst {
+                    g.emit(Scheme.MOVE(d, v.reg as u8));
+                }
+            } else {
+                g.emit(Scheme.GETFREE(d, free_index(g.fs.lam, v) as u8));
+                if boxed(v) { g.emit(Scheme.BOXGET(d, d)); }
+            }
+        }
+        GRef => { g.emit(Scheme.GETGLOBAL(d, n.g as u16)); }
+        Set | GSet | GDef => {
+            g.effect(n);
+            g.load_const(value.unspec(), dst);
+        }
+        If => {
+            let j = g.cond(n.a);
+            g.to(n.b, dst);
+            let e = g.emit(Scheme.JMP(0));
+            g.patch(j, g.pc());
+            if is_null(n.c) { g.load_const(value.unspec(), dst); } else { g.to(n.c, dst); }
+            g.patch(e, g.pc());
+        }
+        Lambda => {
+            let idx = g.lambda(n.lam);
+            g.emit(Scheme.CLOSURE(d, idx as u16));
+        }
+        Seq => {
+            for i in 0..n.list.len - 1 { g.effect(n.list.at(i)); }
+            g.to(n.list.at(n.list.len - 1), dst);
+        }
+        Call => g.call(n, dst, false),
+        Prim => g.prim(n, dst),
+        Let => { g.bind_let(n); g.to(n.a, dst); }
+        Letrec => { g.bind_letrec(n); g.to(n.a, dst); }
+        And | Or => {
+            var jumps: mem.Vec<u64> = mem.Vec.new();
+            for i in 0..n.list.len {
+                g.to(n.list.at(i), dst);
+                if i + 1 < n.list.len {
+                    let w = if n.kind == K.And { Scheme.TEST(d, 0) } else { Scheme.TESTT(d, 0) };
+                    jumps.push(g.emit(w));
+                }
+            }
+            for i in 0..jumps.len { g.patch(jumps.at(i), g.pc()); }
+            jumps.free();
+        }
+    }
+    g.fs.freereg = save;
+    g.fs.line = saved_line;
+}
+
+/// Evaluate `n` for its effects only.
+fn Gen.effect(g: *Gen, n: *Node) {
+    let saved_line = g.set_line(n);
+    let save = g.fs.freereg;
+    match n.kind {
+        Const | Ref | GRef | Lambda => {}
+        Set => {
+            let v = n.vr;
+            let r = g.any(n.a);
+            if is_local(g, v) {
+                if boxed(v) {
+                    g.emit(Scheme.BOXSET(v.reg as u8, r as u8));
+                } else if r != v.reg {
+                    g.emit(Scheme.MOVE(v.reg as u8, r as u8));
+                }
+            } else {
+                let t = g.alloc();
+                g.emit(Scheme.GETFREE(t as u8, free_index(g.fs.lam, v) as u8));
+                g.emit(Scheme.BOXSET(t as u8, r as u8));
+            }
+        }
+        GSet => {
+            let r = g.any(n.a);
+            g.emit(Scheme.SETGLOBAL(r as u8, n.g as u16));
+        }
+        GDef => {
+            let r = g.any(n.a);
+            g.emit(Scheme.DEFGLOBAL(r as u8, n.g as u16));
+        }
+        If => {
+            let j = g.cond(n.a);
+            g.effect(n.b);
+            if is_null(n.c) {
+                g.patch(j, g.pc());
+            } else {
+                let e = g.emit(Scheme.JMP(0));
+                g.patch(j, g.pc());
+                g.effect(n.c);
+                g.patch(e, g.pc());
+            }
+        }
+        Seq => {
+            for i in 0..n.list.len { g.effect(n.list.at(i)); }
+        }
+        Let => { g.bind_let(n); g.effect(n.a); }
+        Letrec => { g.bind_letrec(n); g.effect(n.a); }
+        _ => {
+            let r = g.alloc();
+            g.to(n, r);
+        }
+    }
+    g.fs.freereg = save;
+    g.fs.line = saved_line;
+}
+
+/// Return the value of `n` from the current procedure.
+fn Gen.tail(g: *Gen, n: *Node) {
+    let saved_line = g.set_line(n);
+    let save = g.fs.freereg;
+    match n.kind {
+        If => {
+            let j = g.cond(n.a);
+            g.tail(n.b);
+            g.patch(j, g.pc());
+            if is_null(n.c) {
+                let r = g.alloc();
+                g.load_const(value.unspec(), r);
+                g.emit(Scheme.RET(r as u8));
+            } else {
+                g.tail(n.c);
+            }
+        }
+        Seq => {
+            for i in 0..n.list.len - 1 { g.effect(n.list.at(i)); }
+            g.tail(n.list.at(n.list.len - 1));
+        }
+        Call => {
+            let r = g.fs.freereg;
+            g.call(n, r, true);
+        }
+        Let => { g.bind_let(n); g.tail(n.a); }
+        Letrec => { g.bind_letrec(n); g.tail(n.a); }
+        And | Or => {
+            let r = g.alloc();
+            var jumps: mem.Vec<u64> = mem.Vec.new();
+            for i in 0..n.list.len - 1 {
+                g.to(n.list.at(i), r);
+                let w = if n.kind == K.And { Scheme.TEST(r as u8, 0) } else { Scheme.TESTT(r as u8, 0) };
+                jumps.push(g.emit(w));
+            }
+            g.tail(n.list.at(n.list.len - 1));
+            for i in 0..jumps.len { g.patch(jumps.at(i), g.pc()); }
+            g.emit(Scheme.RET(r as u8));
+            jumps.free();
+        }
+        _ => {
+            let r = g.any(n);
+            g.emit(Scheme.RET(r as u8));
+        }
+    }
+    g.fs.freereg = save;
+    g.fs.line = saved_line;
+}
+
+/// Emit a test of `n`; returns a jump to patch, taken when `n` is false.
+fn Gen.cond(g: *Gen, n: *Node) -> u64 {
+    let save = g.fs.freereg;
+    var j: u64 = 0;
+    if n.kind == K.Prim and n.po == PO.Not {
+        let r = g.any(n.list.at(0));
+        j = g.emit(Scheme.TESTT(r as u8, 0));
+    } else {
+        let r = g.any(n);
+        j = g.emit(Scheme.TEST(r as u8, 0));
+    }
+    g.fs.freereg = save;
+    j
+}
+
+/// A call. `dst` is where the result goes (non-tail), or the first free
+/// register (tail).
+fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
+    let nargs = n.list.len;
+    if nargs > 200 { fail(g.fs.line, "too many arguments"); }
+    // A tail call of the procedure's own letrec variable: a loop.
+    let f = n.a;
+    if tail and f.kind == K.Ref and (f.vr.lam as u64) == (g.fs.lam as u64) and !f.vr.assigned {
+        let l = g.fs.lam;
+        if !l.rest and l.nparams as u64 == nargs {
+            let base = g.fs.freereg;
+            for i in 0..nargs {
+                let a = n.list.at(i);
+                // An argument that is already its parameter needs no move.
+                if a.kind == K.Ref and (a.vr as u64) == (l.params.at(i) as u64) and !boxed(a.vr) {
+                    g.alloc();
+                    continue;
+                }
+                let r = g.alloc();
+                g.to(a, r);
+            }
+            for i in 0..nargs {
+                let a = n.list.at(i);
+                if a.kind == K.Ref and (a.vr as u64) == (l.params.at(i) as u64) and !boxed(a.vr) { continue; }
+                g.emit(Scheme.MOVE(l.params.at(i).reg as u8, (base + i as u32) as u8));
+            }
+            let j = g.emit(Scheme.JMP(0));
+            g.patch(j, 0);
+            return;
+        }
+    }
+    let base = if !tail and dst + 1 == g.fs.freereg { dst } else { g.alloc() };
+    g.to(f, base);
+    for i in 0..nargs {
+        let r = g.alloc();
+        if r != base + 1 + i as u32 { fail(g.fs.line, "internal error: misplaced argument"); }
+        g.to(n.list.at(i), r);
+    }
+    if tail {
+        g.emit(Scheme.TAILCALL(base as u8, nargs as u8));
+    } else {
+        g.emit(Scheme.CALL(base as u8, nargs as u8));
+        if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
+    }
+}
+
+fn small_const(n: *Node) -> ?i32 {
+    if n.kind == K.Const and let Int(i) = n.v and i >= -128 and i <= 127 { return Some(i); }
+    None
+}
+
+fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
+    let d = dst as u8;
+    let po = n.po;
+    var args = n.list;
+    // x + c, c + x, x - c with a small constant c.
+    if po == PO.Add or po == PO.Sub {
+        if let Some(k) = small_const(args.at(1)) {
+            let a = g.any(args.at(0));
+            let kk = if po == PO.Sub { 0 - k } else { k };
+            if kk >= -128 and kk <= 127 {
+                g.emit(Scheme.ADDI(d, a as u8, kk as i8));
+                return;
+            }
+        }
+        if po == PO.Add and let Some(k) = small_const(args.at(0)) {
+            let a = g.any(args.at(1));
+            g.emit(Scheme.ADDI(d, a as u8, k as i8));
+            return;
+        }
+    }
+    if args.len == 1 {
+        let a = g.any(args.at(0)) as u8;
+        let w = match po {
+            ZeroP => Scheme.ZEROP(d, a),
+            Not => Scheme.NOT(d, a),
+            NullP => Scheme.NULLP(d, a),
+            PairP => Scheme.PAIRP(d, a),
+            Car => Scheme.CAR(d, a),
+            _ => Scheme.CDR(d, a),
+        };
+        g.emit(w);
+        return;
+    }
+    let a = g.any(args.at(0)) as u8;
+    let b = g.any(args.at(1)) as u8;
+    if args.len == 3 {
+        let c = g.any(args.at(2)) as u8;
+        g.emit(Scheme.VSET(a, b, c));
+        g.load_const(value.unspec(), dst);
+        return;
+    }
+    let w = match po {
+        Add => Scheme.ADD(d, a, b),
+        Sub => Scheme.SUB(d, a, b),
+        Mul => Scheme.MUL(d, a, b),
+        Div => Scheme.DIV(d, a, b),
+        NumEq => Scheme.NUMEQ(d, a, b),
+        Lt => Scheme.LT(d, a, b),
+        Gt => Scheme.GT(d, a, b),
+        Le => Scheme.LE(d, a, b),
+        Ge => Scheme.GE(d, a, b),
+        Eq => Scheme.EQ(d, a, b),
+        Eqv => Scheme.EQV(d, a, b),
+        Cons => Scheme.CONS(d, a, b),
+        Vref => Scheme.VREF(d, a, b),
+        SetCar => Scheme.SETCAR(a, b),
+        _ => Scheme.SETCDR(a, b),
+    };
+    g.emit(w);
+    if po == PO.SetCar or po == PO.SetCdr { g.load_const(value.unspec(), dst); }
+}
+
+/// Evaluate a let's inits into fresh registers and bind its variables.
+fn Gen.bind_let(g: *Gen, n: *Node) {
+    let base = g.fs.freereg;
+    for i in 0..n.list.len {
+        let r = g.alloc();
+        g.to(n.list.at(i), r);
+    }
+    for i in 0..n.vars.len {
+        let v = n.vars.at(i);
+        v.reg = base + i as u32;
+        if boxed(v) { g.emit(Scheme.MKBOX(v.reg as u8)); }
+    }
+}
+
+fn Gen.bind_letrec(g: *Gen, n: *Node) {
+    for i in 0..n.vars.len {
+        let v = n.vars.at(i);
+        v.reg = g.alloc();
+        if boxed(v) {
+            g.load_const(value.unspec(), v.reg);
+            g.emit(Scheme.MKBOX(v.reg as u8));
+        }
+    }
+    for j in 0..n.list.len {
+        let v = n.vars.at(j);
+        let init = n.list.at(j);
+        let save = g.fs.freereg;
+        if boxed(v) {
+            let r = g.any(init);
+            g.emit(Scheme.BOXSET(v.reg as u8, r as u8));
+        } else {
+            g.to(init, v.reg);
+            // Patch the closures made so far (including this one) that
+            // captured v before it had its value.
+            for jj in 0..j + 1 {
+                let w = n.vars.at(jj);
+                let wi = n.list.at(jj);
+                if boxed(w) or wi.kind != K.Lambda { continue; }
+                let l = wi.lam;
+                for fi in 0..l.free.len {
+                    if (l.free.at(fi) as u64) == (v as u64) {
+                        g.emit(Scheme.SETFREE(w.reg as u8, fi as u8, v.reg as u8));
+                    }
+                }
+            }
+        }
+        g.fs.freereg = save;
+    }
+}
+
+/// Compile a lambda into a child prototype of the current function.
+fn Gen.lambda(g: *Gen, l: *Lam) -> u32 {
+    let parent = g.fs;
+    var fs = FS.new(l);
+    fs.line = parent.line;
+    g.fs = &fs;
+    for i in 0..l.params.len {
+        let v = l.params.at(i);
+        v.reg = g.alloc();
+    }
+    for i in 0..l.params.len {
+        let v = l.params.at(i);
+        if boxed(v) { g.emit(Scheme.MKBOX(v.reg as u8)); }
+    }
+    g.tail(l.body);
+    let proto = g.finish(&fs);
+    g.fs = parent;
+    parent.protos.push(proto);
+    if parent.protos.len > 65535 { fail(parent.line, "too many procedures"); }
+    (parent.protos.len - 1) as u32
+}
+
+fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
+    let h = g.heap;
+    let l = fs.lam;
+    let consts = value.new_arr(h, fs.consts.len);
+    for i in 0..fs.consts.len { consts.data[i] = fs.consts.at(i); }
+    let lines = new(h, Lines {}, fs.lines.len);
+    for i in 0..fs.lines.len { lines.data[i] = fs.lines.at(i); }
+    let protos = new(h, Protos {}, fs.protos.len);
+    for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
+    if l.free.len > 255 { fail(fs.line, "too many free variables"); }
+    let desc = new(h, Descs {}, l.free.len);
+    for i in 0..l.free.len {
+        let v = l.free.at(i);
+        let p = l.parent;
+        desc.data[i] = if (v.owner as u64) == (p as u64) { 256 | v.reg } else { free_index(p, v) };
+    }
+    let np = l.nparams;
+    let rest: u32 = if l.rest { 1 } else { 0 };
+    let proto = new(h, Proto {
+        name: value.new_str(h, l.name),
+        nparams: np,
+        rest: rest,
+        fixed: if l.rest { 0x10000 } else { np },
+        nregs: if fs.maxreg == 0 { 1 } else { fs.maxreg },
+        nfree: l.free.len as u32,
+        consts: consts,
+        lines: lines,
+        protos: protos,
+        desc: desc,
+    }, fs.code.len);
+    for i in 0..fs.code.len { proto.code[i] = fs.code.at(i); }
+    if let Some(bad) = Scheme.verify(proto.code, proto) {
+        var b = text.StrBuf.new();
+        b.push_str("internal error: generated code fails verification at instruction ");
+        b.push_int(bad as i64);
+        fail(0, b.as_str());
+    }
+    Scheme.optimize(proto.code);
+    fs.code.free();
+    fs.lines.free();
+    fs.consts.free();
+    fs.protos.free();
+    proto
+}
+
+// ── driver ──────────────────────────────────────────────────────────
+
+fn read_all(c: *Comp, src: str, track: bool, out: *mem.Vec<V>) {
+    var r = Reader { src: src, pos: 0, line: 1, heap: c.heap, syms: &c.ctx.syms, lines: &c.lines, track: track };
+    while let Some(x) = r.read() { out.push(x); }
+}
+
+/// Compile the prelude and the program into one top-level procedure.
+/// Allocates in the heap but never collects.
+pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
+    let top: *Lam = mem.alloc(1);
+    top.parent = 0 as *Lam;
+    top.name = "toplevel";
+    top.params = mem.Vec.new();
+    top.free = mem.Vec.new();
+    var c = Comp {
+        ctx: ctx,
+        heap: &ctx.heap,
+        lines: map.HashMap.new(),
+        env: mem.Vec.new(),
+        lam: top,
+        redefined: map.HashMap.new(),
+        line: 0,
+        gensyms: 0,
+    };
+    var pre: mem.Vec<V> = mem.Vec.new();
+    read_all(&c, prelude, false, &pre);
+    var prog: mem.Vec<V> = mem.Vec.new();
+    read_all(&c, src, true, &prog);
+    var fs = FS.new(top);
+    var g = Gen { ctx: ctx, heap: &ctx.heap, fs: &fs };
+    var nodes: mem.Vec<*Node> = mem.Vec.new();
+    for i in 0..pre.len { c.top(pre.at(i), &nodes); }
+    for i in 0..prog.len { c.scan_defs(prog.at(i)); }
+    for i in 0..prog.len { c.top(prog.at(i), &nodes); }
+    for i in 0..nodes.len { g.effect(nodes.at(i)); }
+    let r = g.alloc();
+    g.load_const(value.unspec(), r);
+    g.emit(Scheme.RET(r as u8));
+    pre.free();
+    prog.free();
+    nodes.free();
+    g.finish(&fs)
+}

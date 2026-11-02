@@ -1,0 +1,436 @@
+// The Scheme virtual machine: a register machine. Each procedure
+// activation owns a window of registers; a call puts the procedure in
+// R[base] and the arguments in R[base+1..], and the callee's window
+// starts at R[base+1], so arguments arrive in place. The result is stored
+// back into the caller's R[base]. Tail calls reuse the current frame.
+
+import std.gc;
+import std.io;
+import std.text;
+import value;
+import value.{V, Pair, Vect, Proto, Closure};
+import rt.{Ctx, Frame};
+import rt;
+import builtins;
+
+fn arity_err(c: *Ctx, cl: Gc<Closure>, n: u64) -> V {
+    c.tmp.clear();
+    c.tmp.push_str(cl.proto.name.data);
+    c.tmp.push_str(": wrong number of arguments (expected ");
+    c.tmp.push_int(cl.proto.nparams as i64);
+    if cl.proto.rest != 0 { c.tmp.push_str(" or more"); }
+    c.tmp.push_str(", got ");
+    c.tmp.push_int(n as i64);
+    c.tmp.push_str(")");
+    V.S(value.new_str(&c.heap, c.tmp.as_str()))
+}
+
+fn unbound_err(c: *Ctx, g: u64) -> V {
+    c.tmp.clear();
+    c.tmp.push_str("unbound variable: ");
+    c.tmp.push_str(c.gsyms.at(g).name);
+    V.S(value.new_str(&c.heap, c.tmp.as_str()))
+}
+
+/// vector-ref / vector-set! failure: the vector or the index is bad.
+fn index_err(c: *Ctx, who: str, v: V, i: V) -> V {
+    let Vec(_) = v else { return rt.type_err(c, who, "vector", v); };
+    let Int(_) = i else { return rt.type_err(c, who, "index", i); };
+    rt.err(c, "index out of range", i)
+}
+
+fn zero_slow(c: *Ctx, a: V) -> Result<V, V> {
+    match a {
+        Num(x) => Ok(value.boolean(x == 0.0)),
+        _ => Err(rt.type_err(c, "zero?", "number", a)),
+    }
+}
+
+fn eqv_slow(a: V, b: V) -> V { value.boolean(value.eqv(a, b)) }
+
+/// Source line of the instruction at `at` in `p` (0: unknown, e.g. prelude code).
+fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
+    let i = ((at as u64) - (p.code.ptr as u64)) / 4;
+    if i < p.lines.data.len { p.lines.data[i] } else { 0 }
+}
+
+pub vm Scheme {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V, k: *V, fp: *Frame }
+
+    // The generated verifier (Scheme.verify) checks these against the prototype.
+    verify_context proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
+    operand imm = it;
+    operand simm = it;
+    /// A global slot (allocated by the compiler, so always in range).
+    operand gl = it;
+    operand fv = it verify (it as u32) < proto.nfree;
+    operand child = it verify (it as u64) < proto.protos.data.len;
+    operand callbase = it verify (it as u32) < proto.nregs;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+        format ABx { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    // The collector scans frames and registers up to ctx.fp.
+    sync { ctx.fp = fp; }
+
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+
+    // Globals live in a slot vector indexed by the symbol's slot number,
+    // which the compiler resolves, so a read is a load and an "unbound"
+    // check. Once a global is bound it stays bound (there is no undefine),
+    // so the first successful read quickens the instruction into
+    // GETGLOBAL_B, which skips the check.
+    family GETGLOBAL(dst: reg, g: gl) : ABx {
+        generic {
+            let v = ctx.gvals.ptr[g];
+            if v == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+            dst = v;
+            become GETGLOBAL_B;
+            next
+        }
+        GETGLOBAL_B {
+            dst = ctx.gvals.ptr[g];
+            next
+        }
+    }
+    /// set! of a global: it must already be bound.
+    op SETGLOBAL(src: reg, g: gl) : ABx {
+        if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+        ctx.gvals.ptr[g] = src;
+        next
+    }
+    op DEFGLOBAL(src: reg, g: gl) : ABx {
+        ctx.gvals.ptr[g] = src;
+        next
+    }
+
+    op GETFREE(dst: reg, i: fv) : ABC { dst = fp.cl.free.ptr[i]; next }
+    /// Patch free slot `i` of the closure in R[c] (letrec of lambdas).
+    op SETFREE(c: reg, i: imm, src: reg) : ABC {
+        if let Clo(cl) = c { cl.free.ptr[i] = src; }
+        next
+    }
+    /// Box R[r] (an assigned variable that is captured by a closure).
+    op MKBOX(r: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let v = r;
+        r = Vec(value.new_vect(&ctx.heap, 1, v));
+        next
+    }
+    op BOXGET(dst: reg, b: reg) : ABC {
+        if let Vec(x) = b { dst = x.data.ptr[0]; }
+        next
+    }
+    op BOXSET(b: reg, src: reg) : ABC {
+        if let Vec(x) = b { x.data.ptr[0] = src; }
+        next
+    }
+    /// R[dst] = a new closure of child prototype `i`, capturing values as
+    /// its descriptors say.
+    op CLOSURE(dst: reg, i: child) : ABx {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let parent = fp.cl;
+        let p = parent.proto.protos.data.ptr[i];
+        let n = p.nfree as u64;
+        let c = new(&ctx.heap, Closure { proto: p }, n);
+        for j in 0..n {
+            let d = p.desc.data.ptr[j];
+            if d >= 256 {
+                c.free.ptr[j] = regs[(d & 255) as u64];
+            } else {
+                c.free.ptr[j] = parent.free.ptr[d as u64];
+            }
+        }
+        dst = Clo(c);
+        next
+    }
+
+    op JMP(target: label) : sJ { jump target }
+    /// Jump if R[a] is #f.
+    op TEST(a: reg, target: label) : AsBx {
+        if a == V.Imm(value.IMM_FALSE) { jump target }
+        next
+    }
+    /// Jump unless R[a] is #f.
+    op TESTT(a: reg, target: label) : AsBx {
+        if a != V.Imm(value.IMM_FALSE) { jump target }
+        next
+    }
+
+    // Arithmetic: fixnum and flonum fast paths; mixed operands and
+    // fixnum overflow (which produces a flonum) go to the cold path.
+    inline for (name, checked, sym, code) in [
+        ("ADD", "add_checked", +, 0),
+        ("SUB", "sub_checked", -, 1),
+        ("MUL", "mul_checked", *, 2),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                _ => {}
+            }
+            cold { dst = builtins.arith(ctx, code, a, b)?; next }
+        }
+    }
+    /// R[dst] = R[a] + sc (a small signed constant).
+    op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
+        if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
+        cold { dst = builtins.arith(ctx, 0, a, Int(sc as i32))?; next }
+    }
+    op DIV(dst: reg, a: reg, b: reg) : ABC {
+        if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }
+        cold { dst = builtins.arith(ctx, 3, a, b)?; next }
+    }
+    inline for (name, sym, code) in [
+        ("NUMEQ", ==, 0),
+        ("LT", <, 1),
+        ("GT", >, 2),
+        ("LE", <=, 3),
+        ("GE", >=, 4),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            if let (Int(x), Int(y)) = (a, b) { dst = value.boolean(x sym y); next }
+            cold { dst = value.boolean(builtins.compare(ctx, code, a, b)?); next }
+        }
+    }
+    op ZEROP(dst: reg, a: reg) : ABC {
+        if let Int(x) = a { dst = value.boolean(x == 0); next }
+        cold { dst = zero_slow(ctx, a)?; next }
+    }
+    op EQ(dst: reg, a: reg, b: reg) : ABC { dst = value.boolean(a == b); next }
+    op EQV(dst: reg, a: reg, b: reg) : ABC {
+        if a == b { dst = Imm(value.IMM_TRUE); next }
+        cold { dst = eqv_slow(a, b); next }
+    }
+    op NOT(dst: reg, a: reg) : ABC { dst = value.boolean(a == V.Imm(value.IMM_FALSE)); next }
+    op NULLP(dst: reg, a: reg) : ABC { dst = value.boolean(a == V.Imm(value.IMM_NIL)); next }
+    op PAIRP(dst: reg, a: reg) : ABC {
+        if let P(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+
+    op CAR(dst: reg, a: reg) : ABC {
+        if let P(p) = a { dst = p.car; next }
+        cold { raise rt.type_err(ctx, "car", "pair", a) }
+    }
+    op CDR(dst: reg, a: reg) : ABC {
+        if let P(p) = a { dst = p.cdr; next }
+        cold { raise rt.type_err(ctx, "cdr", "pair", a) }
+    }
+    op CONS(dst: reg, a: reg, b: reg) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        dst = P(new(&ctx.heap, Pair { car: a, cdr: b }));
+        next
+    }
+    op SETCAR(a: reg, b: reg) : ABC {
+        if let P(p) = a { p.car = b; next }
+        cold { raise rt.type_err(ctx, "set-car!", "pair", a) }
+    }
+    op SETCDR(a: reg, b: reg) : ABC {
+        if let P(p) = a { p.cdr = b; next }
+        cold { raise rt.type_err(ctx, "set-cdr!", "pair", a) }
+    }
+    op VREF(dst: reg, v: reg, i: reg) : ABC {
+        if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
+            dst = x.data.ptr[j as u32 as u64];
+            next
+        }
+        cold { raise index_err(ctx, "vector-ref", v, i) }
+    }
+    op VSET(v: reg, i: reg, src: reg) : ABC {
+        if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
+            x.data.ptr[j as u32 as u64] = src;
+            next
+        }
+        cold { raise index_err(ctx, "vector-set!", v, i) }
+    }
+
+    /// Everything but a call of a closure with exactly its number of
+    /// (fixed) parameters: rest parameters, arity errors, builtins and
+    /// `apply`. Sets up the state and returns where to continue.
+    fn call_slow(base: u64, nargs: u64, tail: bool) -> Result<*u32, V> {
+        var n = nargs;
+        var f = regs[base];
+        while value.prim_of(f) == Some(builtins.P_APPLY) {
+            // (apply proc arg ... list): spread the list into registers.
+            if n < 2 { return Err(rt.err_msg(ctx, "apply: wrong number of arguments")); }
+            let lst = regs[base + n];
+            for i in 0..n - 1 { regs[base + i] = regs[base + 1 + i]; }
+            n -= 2;
+            var cur = lst;
+            while let P(p) = cur {
+                if regs + base + n + 2 >= ctx.stack_end { return Err(rt.err_msg(ctx, "stack overflow")); }
+                regs[base + 1 + n] = p.car;
+                n += 1;
+                cur = p.cdr;
+            }
+            if cur != V.Imm(value.IMM_NIL) { return Err(rt.type_err(ctx, "apply", "list", lst)); }
+            f = regs[base];
+        }
+        if let Clo(cl) = f {
+            let p = cl.proto;
+            let np = p.nparams as u64;
+            if n < np or (n > np and p.rest == 0) { return Err(arity_err(ctx, cl, n)); }
+            let args = regs + base + 1;
+            var have = n;
+            if p.rest != 0 {
+                var lst = V.Imm(value.IMM_NIL);
+                var i = n;
+                while i > np {
+                    i -= 1;
+                    lst = value.cons(&ctx.heap, args[i], lst);
+                }
+                args[np] = lst;
+                have = np + 1;
+            }
+            var dst = args;
+            if tail {
+                dst = regs;
+                for i in 0..have { dst[i] = args[i]; }
+            } else if fp + 1 >= ctx.frames_end {
+                return Err(rt.err_msg(ctx, "stack overflow (too many nested calls)"));
+            }
+            let nr = p.nregs as u64;
+            if dst + nr >= ctx.stack_end { return Err(rt.err_msg(ctx, "stack overflow")); }
+            for i in have..nr { dst[i] = Imm(value.IMM_UNSPEC); }
+            if !tail {
+                fp.resume = pc + 1;
+                fp = fp + 1;
+            }
+            fp.cl = cl;
+            fp.base = dst;
+            k = p.consts.data.ptr;
+            fp.k = k;
+            regs = dst;
+            return Ok(p.code.ptr);
+        }
+        if let Some(id) = value.prim_of(f) {
+            let v = builtins.call_native(ctx, id, regs + base + 1, n)?;
+            if !tail {
+                regs[base] = v;
+                return Ok(pc + 1);
+            }
+            *(regs - 1) = v;
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+            return Ok(fp.resume);
+        }
+        Err(rt.err(ctx, "not a procedure", f))
+    }
+
+    /// R[base] = R[base](R[base+1] .. R[base+nargs]).
+    op CALL(base: callbase, nargs: imm) : ABC {
+        if let Clo(cl) = regs[base] {
+            let p = cl.proto;
+            if likely(p.fixed == nargs as u32) {
+                let callee = regs + base + 1;
+                let n = p.nregs as u64;
+                if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    cold { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
+                }
+                var i = nargs as u64;
+                while i < n {
+                    callee[i] = Imm(value.IMM_UNSPEC);
+                    i += 1;
+                }
+                fp.resume = pc + 1;
+                fp = fp + 1;
+                fp.cl = cl;
+                fp.base = callee;
+                k = p.consts.data.ptr;
+                fp.k = k;
+                regs = callee;
+                jump p.code.ptr
+            }
+        }
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            jump call_slow(base as u64, nargs as u64, false)?
+        }
+    }
+    /// return R[base](R[base+1] .. R[base+nargs]), reusing this frame.
+    op TAILCALL(base: callbase, nargs: imm) : ABC {
+        if let Clo(cl) = regs[base] {
+            let p = cl.proto;
+            if likely(p.fixed == nargs as u32) {
+                let n = p.nregs as u64;
+                if regs + n >= ctx.stack_end { cold { raise rt.err_msg(ctx, "stack overflow") } }
+                let args = regs + base + 1;
+                let na = nargs as u64;
+                for i in 0..na { regs[i] = args[i]; }
+                var i = na;
+                while i < n {
+                    regs[i] = Imm(value.IMM_UNSPEC);
+                    i += 1;
+                }
+                fp.cl = cl;
+                k = p.consts.data.ptr;
+                fp.k = k;
+                jump p.code.ptr
+            }
+        }
+        cold {
+            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+            jump call_slow(base as u64, nargs as u64, true)?
+        }
+    }
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.frames { exit v }
+        *(regs - 1) = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.k;
+        jump fp.resume
+    }
+
+    entry run(c: *Ctx, cl: Gc<Closure>) -> V {
+        ctx = c;
+        let p = cl.proto;
+        c.stack[0] = Imm(value.IMM_UNSPEC);
+        regs = c.stack + 1;
+        for i in 0..p.nregs as u64 { regs[i] = Imm(value.IMM_UNSPEC); }
+        fp = c.frames;
+        fp.cl = cl;
+        fp.base = regs;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        c.fp = fp;
+        jump p.code.ptr
+    }
+
+    on raise(e: V) {
+        // Prefix the message with the line of the failing instruction, or
+        // of the nearest caller with a known line (prelude code has none).
+        var line = line_at(fp.cl.proto, pc);
+        var f = fp;
+        while line == 0 and f > ctx.frames {
+            f = f - 1;
+            line = line_at(f.cl.proto, f.resume - 1);
+        }
+        ctx.tmp.clear();
+        if line > 0 {
+            ctx.tmp.push_str("line ");
+            ctx.tmp.push_int(line as i64);
+            ctx.tmp.push_str(": ");
+        }
+        value.print(&ctx.tmp, e, false);
+        ctx.error = S(value.new_str(&ctx.heap, ctx.tmp.as_str()));
+        ctx.fp = fp;
+        exit Imm(value.IMM_UNSPEC)
+    }
+}

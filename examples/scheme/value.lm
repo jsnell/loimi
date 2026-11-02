@@ -1,0 +1,342 @@
+// Runtime values of the Scheme interpreter: NaN-boxed values, GC-managed
+// pairs, strings, symbols, vectors, closures and procedure prototypes.
+//
+// A nanbox has room for seven tagged variants besides the unboxed flonum,
+// so the immediates that need no payload of their own share one variant,
+// `Imm(i32)`, distinguished by its payload:
+//
+//   0 '()   1 #f   2 #t   3 unspecified   4 undefined (unbound / uninit)
+//   5 eof   PRIM_BASE + i: builtin procedure i   CHAR_BASE + c: char c
+
+import std.gc;
+import std.mem;
+import std.hash;
+import std.text;
+import std.map;
+
+pub object Pair { car: V, cdr: V }
+pub object Str { data: [u8] }
+/// An interned symbol. `gidx` is its global-variable slot (assigned by the
+/// compiler on first use as a global; NO_GLOBAL until then).
+pub object Sym { gidx: u32, name: [u8] }
+/// Vectors; also used (length 1, never visible to programs) as the boxes
+/// that hold assigned captured variables.
+pub object Vect { data: [V] }
+pub object Arr { data: [V] }
+/// Source line of each instruction.
+pub object Lines { data: [u32] }
+/// Capture descriptors: bit 8 set means "register `low byte` of the
+/// enclosing frame", otherwise "free slot `low byte` of the enclosing closure".
+pub object Descs { data: [u32] }
+pub object Protos { data: [Gc<Proto>] }
+pub object Proto {
+    name: Gc<Str>,
+    /// Number of required parameters.
+    nparams: u32,
+    /// 1 when extra arguments are collected into a list in R[nparams].
+    rest: u32,
+    /// nparams when there is no rest parameter, else 0x10000: a CALL whose
+    /// argument count equals this needs no further arity handling.
+    fixed: u32,
+    nregs: u32,
+    nfree: u32,
+    consts: Gc<Arr>,
+    lines: Gc<Lines>,
+    protos: Gc<Protos>,
+    desc: Gc<Descs>,
+    code: [u32],
+}
+/// A flat closure: the values of its free variables (boxes for assigned ones).
+pub object Closure { proto: Gc<Proto>, free: [V] }
+
+pub value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Imm(i32),
+    P(Gc<Pair>),
+    Sym(Gc<Sym>),
+    S(Gc<Str>),
+    Vec(Gc<Vect>),
+    Clo(Gc<Closure>),
+}
+
+pub const NO_GLOBAL: u32 = 0xFFFFFFFF;
+
+pub const IMM_NIL: i32 = 0;
+pub const IMM_FALSE: i32 = 1;
+pub const IMM_TRUE: i32 = 2;
+pub const IMM_UNSPEC: i32 = 3;
+pub const IMM_UNDEF: i32 = 4;
+pub const IMM_EOF: i32 = 5;
+pub const PRIM_BASE: i32 = 0x1000;
+pub const CHAR_BASE: i32 = 0x1000000;
+
+pub fn nil() -> V { V.Imm(IMM_NIL) }
+pub fn f() -> V { V.Imm(IMM_FALSE) }
+pub fn t() -> V { V.Imm(IMM_TRUE) }
+pub fn unspec() -> V { V.Imm(IMM_UNSPEC) }
+pub fn undef() -> V { V.Imm(IMM_UNDEF) }
+pub fn boolean(b: bool) -> V { if b { V.Imm(IMM_TRUE) } else { V.Imm(IMM_FALSE) } }
+pub fn chr(c: i32) -> V { V.Imm(CHAR_BASE + c) }
+pub fn prim(i: i32) -> V { V.Imm(PRIM_BASE + i) }
+
+pub fn truthy(v: V) -> bool { v != V.Imm(IMM_FALSE) }
+
+pub fn char_of(v: V) -> ?i32 {
+    if let Imm(x) = v and x >= CHAR_BASE { return Some(x - CHAR_BASE); }
+    None
+}
+
+pub fn prim_of(v: V) -> ?i32 {
+    if let Imm(x) = v and x >= PRIM_BASE and x < CHAR_BASE { return Some(x - PRIM_BASE); }
+    None
+}
+
+pub fn cons(h: *gc.Heap, a: V, d: V) -> V {
+    V.P(new(h, Pair { car: a, cdr: d }))
+}
+
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str {}, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
+    let a = new(h, Arr {}, n);
+    for i in 0..n { a.data[i] = V.Imm(IMM_UNSPEC); }
+    a
+}
+
+pub fn new_vect(h: *gc.Heap, n: u64, fill: V) -> Gc<Vect> {
+    let a = new(h, Vect {}, n);
+    for i in 0..n { a.data.ptr[i] = fill; }
+    a
+}
+
+pub fn new_closure(h: *gc.Heap, p: Gc<Proto>) -> Gc<Closure> {
+    new(h, Closure { proto: p }, 0)
+}
+
+pub fn is_number(v: V) -> bool {
+    match v {
+        Int(_) | Num(_) => true,
+        _ => false,
+    }
+}
+
+pub fn is_procedure(v: V) -> bool {
+    match v {
+        Clo(_) => true,
+        _ => prim_of(v).is_some(),
+    }
+}
+
+pub fn to_num(v: V) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+/// eqv?: identity, plus numbers of the same exactness by value.
+pub fn eqv(a: V, b: V) -> bool {
+    if a == b { return true; }
+    if let (Num(x), Num(y)) = (a, b) { return x == y; }
+    false
+}
+
+pub fn equal(a: V, b: V) -> bool {
+    var a = a;
+    var b = b;
+    loop {
+        if eqv(a, b) { return true; }
+        match (a, b) {
+            (P(x), P(y)) => {
+                if !equal(x.car, y.car) { return false; }
+                a = x.cdr;
+                b = y.cdr;
+            }
+            (S(x), S(y)) => return x.data.eq(y.data),
+            (Vec(x), Vec(y)) => {
+                if x.data.len != y.data.len { return false; }
+                for i in 0..x.data.len {
+                    if !equal(x.data.ptr[i], y.data.ptr[i]) { return false; }
+                }
+                return true;
+            }
+            _ => return false,
+        }
+    }
+}
+
+pub fn type_name(v: V) -> str {
+    match v {
+        Num(_) | Int(_) => "number",
+        P(_) => "pair",
+        Sym(_) => "symbol",
+        S(_) => "string",
+        Vec(_) => "vector",
+        Clo(_) => "procedure",
+        Imm(x) => {
+            if x == IMM_NIL { "empty list" }
+            else if x == IMM_FALSE or x == IMM_TRUE { "boolean" }
+            else if x >= CHAR_BASE { "char" }
+            else if x >= PRIM_BASE { "procedure" }
+            else { "unspecified" }
+        }
+    }
+}
+
+fn push_char_name(b: *text.StrBuf, c: i32) {
+    if c == 32 { b.push_str("space"); return; }
+    if c == 10 { b.push_str("newline"); return; }
+    if c == 9 { b.push_str("tab"); return; }
+    if c == 13 { b.push_str("return"); return; }
+    if c == 0 { b.push_str("null"); return; }
+    push_utf8(b, c);
+}
+
+pub fn push_utf8(b: *text.StrBuf, c: i32) {
+    let u = c as u32;
+    if u < 0x80 {
+        b.push(u as u8);
+    } else if u < 0x800 {
+        b.push((0xC0 | (u >> 6)) as u8);
+        b.push((0x80 | (u & 0x3F)) as u8);
+    } else if u < 0x10000 {
+        b.push((0xE0 | (u >> 12)) as u8);
+        b.push((0x80 | ((u >> 6) & 0x3F)) as u8);
+        b.push((0x80 | (u & 0x3F)) as u8);
+    } else {
+        b.push((0xF0 | (u >> 18)) as u8);
+        b.push((0x80 | ((u >> 12) & 0x3F)) as u8);
+        b.push((0x80 | ((u >> 6) & 0x3F)) as u8);
+        b.push((0x80 | (u & 0x3F)) as u8);
+    }
+}
+
+pub fn push_flonum(b: *text.StrBuf, x: f64) {
+    if x != x { b.push_str("+nan.0"); return; }
+    if x > 1.7976931348623157e308 { b.push_str("+inf.0"); return; }
+    if x < -1.7976931348623157e308 { b.push_str("-inf.0"); return; }
+    if x == x.floor() and x > -1e15 and x < 1e15 {
+        if x == 0.0 and (x.to_bits() >> 63) != 0 { b.push_str("-0.0"); return; }
+        b.push_int(x as i64);
+        b.push_str(".0");
+        return;
+    }
+    b.push_f64(x);
+}
+
+/// Print `v` as `display` (write = false) or `write` (write = true) does.
+pub fn print(b: *text.StrBuf, v: V, write: bool) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => push_flonum(b, x),
+        Sym(s) => b.push_str(s.name),
+        S(s) => {
+            if !write { b.push_str(s.data); return; }
+            b.push('"');
+            for i in 0..s.data.len {
+                let c = s.data[i];
+                if c == '"' { b.push_str("\\\""); }
+                else if c == '\\' { b.push_str("\\\\"); }
+                else if c == '\n' { b.push_str("\\n"); }
+                else if c == '\t' { b.push_str("\\t"); }
+                else if c == '\r' { b.push_str("\\r"); }
+                else { b.push(c); }
+            }
+            b.push('"');
+        }
+        P(p) => {
+            // Quote forms print in their short form.
+            if let Sym(s) = p.car and let P(rest) = p.cdr and rest.cdr == V.Imm(IMM_NIL) {
+                var pre = "";
+                if s.name.eq("quote") { pre = "'"; }
+                else if s.name.eq("quasiquote") { pre = "`"; }
+                else if s.name.eq("unquote") { pre = ","; }
+                else if s.name.eq("unquote-splicing") { pre = ",@"; }
+                if pre.len > 0 {
+                    b.push_str(pre);
+                    print(b, rest.car, write);
+                    return;
+                }
+            }
+            b.push('(');
+            var cur = v;
+            var first = true;
+            loop {
+                match cur {
+                    P(q) => {
+                        if !first { b.push(' '); }
+                        first = false;
+                        print(b, q.car, write);
+                        cur = q.cdr;
+                    }
+                    Imm(x) => {
+                        if x != IMM_NIL {
+                            b.push_str(" . ");
+                            print(b, cur, write);
+                        }
+                        break;
+                    }
+                    _ => {
+                        b.push_str(" . ");
+                        print(b, cur, write);
+                        break;
+                    }
+                }
+            }
+            b.push(')');
+        }
+        Vec(a) => {
+            b.push_str("#(");
+            for i in 0..a.data.len {
+                if i > 0 { b.push(' '); }
+                print(b, a.data.ptr[i], write);
+            }
+            b.push(')');
+        }
+        Clo(c) => {
+            b.push_str("#<procedure ");
+            b.push_str(c.proto.name.data);
+            b.push('>');
+        }
+        Imm(x) => {
+            if x == IMM_NIL { b.push_str("()"); }
+            else if x == IMM_FALSE { b.push_str("#f"); }
+            else if x == IMM_TRUE { b.push_str("#t"); }
+            else if x == IMM_UNSPEC { }
+            else if x == IMM_UNDEF { b.push_str("#<undefined>"); }
+            else if x == IMM_EOF { b.push_str("#<eof>"); }
+            else if x >= CHAR_BASE {
+                if write {
+                    b.push_str("#\\");
+                    push_char_name(b, x - CHAR_BASE);
+                } else {
+                    push_utf8(b, x - CHAR_BASE);
+                }
+            } else {
+                b.push_str("#<procedure>");
+            }
+        }
+    }
+}
+
+/// Interned symbols. Symbols are never collected: `all` is a GC root.
+pub struct Symtab { map: map.HashMap<str, Gc<Sym> >, all: mem.Vec<Gc<Sym> > }
+
+pub fn Symtab.new() -> Symtab {
+    Symtab { map: map.HashMap.new(), all: mem.Vec.new() }
+}
+
+pub fn Symtab.intern(t: *Symtab, h: *gc.Heap, s: str) -> Gc<Sym> {
+    if let Some(sym) = t.map.get(s) { return sym; }
+    let o = new(h, Sym { gidx: NO_GLOBAL }, s.len);
+    mem.memcpy(o.name.ptr, s.ptr, s.len);
+    t.map.insert(o.name, o);
+    t.all.push(o);
+    o
+}

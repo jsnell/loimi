@@ -1,0 +1,776 @@
+// Builtin procedures. Each is a native function identified by a small
+// integer (a procedure value is `Imm(PRIM_BASE + id)`). Natives allocate
+// but never collect: the CALL that invokes them runs the collector first
+// if needed. Hot builtins (car, +, <, ...) are also compiled inline as
+// ops when the program does not redefine them (see compile.lm); the
+// natives here serve every other call, e.g. `(map car l)`.
+//
+// `apply` is handled by the VM's call path, since it calls a procedure.
+
+import std.gc;
+import std.io;
+import std.os;
+import std.mem;
+import std.text;
+import value;
+import value.{V, Pair, Str, Sym, Vect};
+import rt.{Ctx};
+import rt;
+import read;
+
+extern "C" fn pow(a: f64, b: f64) -> f64;
+extern "C" fn ceil(a: f64) -> f64;
+extern "C" fn trunc(a: f64) -> f64;
+extern "C" fn rint(a: f64) -> f64;
+extern "C" fn fmod(a: f64, b: f64) -> f64;
+
+pub const NPRIMS: i32 = 126;
+pub const P_APPLY: i32 = 55;
+
+/// (name, minimum arguments, maximum arguments or -1).
+pub fn prim_info(id: i32) -> (str, i32, i32) {
+    match id {
+        0 => ("+", 0, -1),
+        1 => ("-", 1, -1),
+        2 => ("*", 0, -1),
+        3 => ("/", 1, -1),
+        4 => ("=", 1, -1),
+        5 => ("<", 1, -1),
+        6 => (">", 1, -1),
+        7 => ("<=", 1, -1),
+        8 => (">=", 1, -1),
+        9 => ("quotient", 2, 2),
+        10 => ("remainder", 2, 2),
+        11 => ("modulo", 2, 2),
+        12 => ("zero?", 1, 1),
+        13 => ("number?", 1, 1),
+        14 => ("integer?", 1, 1),
+        15 => ("abs", 1, 1),
+        16 => ("min", 1, -1),
+        17 => ("max", 1, -1),
+        18 => ("sqrt", 1, 1),
+        19 => ("exact->inexact", 1, 1),
+        20 => ("inexact->exact", 1, 1),
+        21 => ("exact", 1, 1),
+        22 => ("inexact", 1, 1),
+        23 => ("floor", 1, 1),
+        24 => ("ceiling", 1, 1),
+        25 => ("round", 1, 1),
+        26 => ("truncate", 1, 1),
+        27 => ("expt", 2, 2),
+        28 => ("even?", 1, 1),
+        29 => ("odd?", 1, 1),
+        30 => ("positive?", 1, 1),
+        31 => ("negative?", 1, 1),
+        32 => ("number->string", 1, 2),
+        33 => ("string->number", 1, 2),
+        34 => ("gcd", 0, -1),
+        35 => ("lcm", 0, -1),
+        36 => ("exact?", 1, 1),
+        37 => ("inexact?", 1, 1),
+        38 => ("cons", 2, 2),
+        39 => ("car", 1, 1),
+        40 => ("cdr", 1, 1),
+        41 => ("set-car!", 2, 2),
+        42 => ("set-cdr!", 2, 2),
+        43 => ("list", 0, -1),
+        44 => ("length", 1, 1),
+        45 => ("append", 0, -1),
+        46 => ("reverse", 1, 1),
+        47 => ("list-tail", 2, 2),
+        48 => ("list-ref", 2, 2),
+        49 => ("memq", 2, 2),
+        50 => ("memv", 2, 2),
+        51 => ("member", 2, 2),
+        52 => ("assq", 2, 2),
+        53 => ("assv", 2, 2),
+        54 => ("assoc", 2, 2),
+        55 => ("apply", 1, -1),
+        56 => ("caar", 1, 1),
+        57 => ("cadr", 1, 1),
+        58 => ("cdar", 1, 1),
+        59 => ("cddr", 1, 1),
+        60 => ("caddr", 1, 1),
+        61 => ("cdddr", 1, 1),
+        62 => ("null?", 1, 1),
+        63 => ("pair?", 1, 1),
+        64 => ("list?", 1, 1),
+        65 => ("eq?", 2, 2),
+        66 => ("eqv?", 2, 2),
+        67 => ("equal?", 2, 2),
+        68 => ("not", 1, 1),
+        69 => ("symbol?", 1, 1),
+        70 => ("string?", 1, 1),
+        71 => ("procedure?", 1, 1),
+        72 => ("vector?", 1, 1),
+        73 => ("boolean?", 1, 1),
+        74 => ("char?", 1, 1),
+        75 => ("make-vector", 1, 2),
+        76 => ("vector", 0, -1),
+        77 => ("vector-ref", 2, 2),
+        78 => ("vector-set!", 3, 3),
+        79 => ("vector-length", 1, 1),
+        80 => ("vector->list", 1, 1),
+        81 => ("list->vector", 1, 1),
+        82 => ("vector-fill!", 2, 2),
+        83 => ("string-length", 1, 1),
+        84 => ("string-ref", 2, 2),
+        85 => ("substring", 2, 3),
+        86 => ("string-append", 0, -1),
+        87 => ("string=?", 2, 2),
+        88 => ("string<?", 2, 2),
+        89 => ("string>?", 2, 2),
+        90 => ("string-copy", 1, 1),
+        91 => ("string->list", 1, 1),
+        92 => ("list->string", 1, 1),
+        93 => ("make-string", 1, 2),
+        94 => ("string", 0, -1),
+        95 => ("symbol->string", 1, 1),
+        96 => ("string->symbol", 1, 1),
+        97 => ("char->integer", 1, 1),
+        98 => ("integer->char", 1, 1),
+        99 => ("char=?", 2, 2),
+        100 => ("char<?", 2, 2),
+        101 => ("char>?", 2, 2),
+        102 => ("char-upcase", 1, 1),
+        103 => ("char-downcase", 1, 1),
+        104 => ("char-alphabetic?", 1, 1),
+        105 => ("char-numeric?", 1, 1),
+        106 => ("char-whitespace?", 1, 1),
+        107 => ("string-set!", 3, 3),
+        108 => ("display", 1, 2),
+        109 => ("write", 1, 2),
+        110 => ("newline", 0, 1),
+        111 => ("error", 0, -1),
+        112 => ("exit", 0, 1),
+        113 => ("last-pair", 1, 1),
+        114 => ("list-copy", 1, 1),
+        115 => ("cadddr", 1, 1),
+        116 => ("eof-object", 0, 0),
+        117 => ("symbol=?", 2, 2),
+        118 => ("char<=?", 2, 2),
+        119 => ("char>=?", 2, 2),
+        120 => ("string<=?", 2, 2),
+        121 => ("string>=?", 2, 2),
+        122 => ("boolean=?", 2, 2),
+        123 => ("write-string", 1, 2),
+        124 => ("write-char", 1, 2),
+        _ => ("square", 1, 1),
+    }
+}
+
+// ── numbers ─────────────────────────────────────────────────────────
+
+/// Binary arithmetic: op 0 +, 1 -, 2 *, 3 /. Fixnum results that overflow
+/// become flonums; `/` of fixnums is exact when the division is.
+pub fn arith(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
+    if let (Int(x), Int(y)) = (a, b) {
+        match op {
+            0 => { if let Some(r) = x.add_checked(y) { return Ok(V.Int(r)); } }
+            1 => { if let Some(r) = x.sub_checked(y) { return Ok(V.Int(r)); } }
+            2 => { if let Some(r) = x.mul_checked(y) { return Ok(V.Int(r)); } }
+            _ => {
+                if y == 0 { return Err(rt.err_msg(c, "/: division by zero")); }
+                let (i, j) = (x as i64, y as i64);
+                if i % j == 0 {
+                    let q = i / j;
+                    if q >= -2147483648 and q <= 2147483647 { return Ok(V.Int(q as i32)); }
+                }
+            }
+        }
+    }
+    let name = match op { 0 => "+", 1 => "-", 2 => "*", _ => "/" };
+    let Some(x) = value.to_num(a) else { return Err(rt.type_err(c, name, "number", a)); };
+    let Some(y) = value.to_num(b) else { return Err(rt.type_err(c, name, "number", b)); };
+    Ok(V.Num(match op { 0 => x + y, 1 => x - y, 2 => x * y, _ => x / y }))
+}
+
+/// Comparison: op 0 =, 1 <, 2 >, 3 <=, 4 >=.
+pub fn compare(c: *Ctx, op: i32, a: V, b: V) -> Result<bool, V> {
+    if let (Int(x), Int(y)) = (a, b) {
+        return Ok(match op { 0 => x == y, 1 => x < y, 2 => x > y, 3 => x <= y, _ => x >= y });
+    }
+    let name = match op { 0 => "=", 1 => "<", 2 => ">", 3 => "<=", _ => ">=" };
+    let Some(x) = value.to_num(a) else { return Err(rt.type_err(c, name, "number", a)); };
+    let Some(y) = value.to_num(b) else { return Err(rt.type_err(c, name, "number", b)); };
+    Ok(match op { 0 => x == y, 1 => x < y, 2 => x > y, 3 => x <= y, _ => x >= y })
+}
+
+fn num_arg(c: *Ctx, who: str, v: V) -> Result<f64, V> {
+    match value.to_num(v) {
+        Some(x) => Ok(x),
+        None => Err(rt.type_err(c, who, "number", v)),
+    }
+}
+
+/// An integer argument (a fixnum, or a flonum with an integral value).
+fn int_arg(c: *Ctx, who: str, v: V) -> Result<i64, V> {
+    match v {
+        Int(i) => Ok(i as i64),
+        Num(x) => {
+            if x == x.floor() and x > -9e15 and x < 9e15 { return Ok(x as i64); }
+            Err(rt.type_err(c, who, "integer", v))
+        }
+        _ => Err(rt.type_err(c, who, "integer", v)),
+    }
+}
+
+/// An exact integer result: a fixnum if it fits, otherwise a flonum.
+fn integer(x: i64) -> V {
+    if x >= -2147483648 and x <= 2147483647 { V.Int(x as i32) } else { V.Num(x as f64) }
+}
+
+/// Integer division: op 0 quotient, 1 remainder, 2 modulo.
+pub fn intdiv(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
+    let who = match op { 0 => "quotient", 1 => "remainder", _ => "modulo" };
+    let x = int_arg(c, who, a)?;
+    let y = int_arg(c, who, b)?;
+    if y == 0 { return Err(rt.err_msg(c, "integer division by zero")); }
+    var r = match op {
+        0 => x / y,
+        1 => x % y,
+        _ => {
+            var m = x % y;
+            if m != 0 and (m < 0) != (y < 0) { m += y; }
+            m
+        }
+    };
+    if let (Int(_), Int(_)) = (a, b) { return Ok(integer(r)); }
+    Ok(V.Num(r as f64))
+}
+
+fn round_like(c: *Ctx, op: i32, v: V) -> Result<V, V> {
+    if let Int(_) = v { return Ok(v); }
+    let x = num_arg(c, "round", v)?;
+    Ok(V.Num(match op { 0 => x.floor(), 1 => ceil(x), 2 => rint(x), _ => trunc(x) }))
+}
+
+fn gcd2(a: i64, b: i64) -> i64 {
+    var x = if a < 0 { 0 - a } else { a };
+    var y = if b < 0 { 0 - b } else { b };
+    while y != 0 { let t = x % y; x = y; y = t; }
+    x
+}
+
+fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
+    if let (Int(x), Int(y)) = (a, b) and y >= 0 {
+        var r: i64 = 1;
+        var ok = true;
+        for _ in 0..y as u64 {
+            r = r * x as i64;
+            if r > 2147483647 or r < -2147483648 { ok = false; break; }
+        }
+        if ok { return Ok(V.Int(r as i32)); }
+    }
+    let x = num_arg(c, "expt", a)?;
+    let y = num_arg(c, "expt", b)?;
+    Ok(V.Num(pow(x, y)))
+}
+
+fn sqrt(c: *Ctx, a: V) -> Result<V, V> {
+    if let Int(x) = a and x >= 0 {
+        let r = (x as f64).sqrt() as i64;
+        if r * r == x as i64 { return Ok(V.Int(r as i32)); }
+    }
+    let x = num_arg(c, "sqrt", a)?;
+    Ok(V.Num(x.sqrt()))
+}
+
+// ── argument helpers ────────────────────────────────────────────────
+
+fn pair_arg(c: *Ctx, who: str, v: V) -> Result<Gc<Pair>, V> {
+    match v {
+        P(p) => Ok(p),
+        _ => Err(rt.type_err(c, who, "pair", v)),
+    }
+}
+
+fn str_arg(c: *Ctx, who: str, v: V) -> Result<Gc<Str>, V> {
+    match v {
+        S(s) => Ok(s),
+        _ => Err(rt.type_err(c, who, "string", v)),
+    }
+}
+
+fn vec_arg(c: *Ctx, who: str, v: V) -> Result<Gc<Vect>, V> {
+    match v {
+        Vec(x) => Ok(x),
+        _ => Err(rt.type_err(c, who, "vector", v)),
+    }
+}
+
+fn char_arg(c: *Ctx, who: str, v: V) -> Result<i32, V> {
+    match value.char_of(v) {
+        Some(x) => Ok(x),
+        None => Err(rt.type_err(c, who, "char", v)),
+    }
+}
+
+fn index_arg(c: *Ctx, who: str, v: V, len: u64) -> Result<u64, V> {
+    if let Int(i) = v and i >= 0 and (i as u64) < len { return Ok(i as u64); }
+    if let Int(_) = v { return Err(rt.err(c, "index out of range", v)); }
+    Err(rt.type_err(c, who, "index", v))
+}
+
+/// cXr: `path` is read right to left ('a' car, 'd' cdr).
+fn cxr(c: *Ctx, who: str, path: str, v: V) -> Result<V, V> {
+    var x = v;
+    var i = path.len;
+    while i > 0 {
+        i -= 1;
+        let p = pair_arg(c, who, x)?;
+        x = if path[i] == 'a' { p.car } else { p.cdr };
+    }
+    Ok(x)
+}
+
+fn list_len(l: V) -> ?u64 {
+    var n: u64 = 0;
+    var cur = l;
+    loop {
+        match cur {
+            P(p) => { n += 1; cur = p.cdr; }
+            _ => break,
+        }
+    }
+    if cur != value.nil() { return None; }
+    Some(n)
+}
+
+/// A string as a list of chars.
+fn str_to_list(h: *gc.Heap, s: Gc<Str>) -> V {
+    var l = value.nil();
+    var i = s.data.len;
+    while i > 0 {
+        i -= 1;
+        l = value.cons(h, value.chr(s.data[i] as i32), l);
+    }
+    l
+}
+
+fn str_cmp(a: Gc<Str>, b: Gc<Str>) -> i32 {
+    let n = if a.data.len < b.data.len { a.data.len } else { b.data.len };
+    for i in 0..n {
+        if a.data[i] != b.data[i] { return if a.data[i] < b.data[i] { -1 } else { 1 }; }
+    }
+    if a.data.len < b.data.len { -1 } else if a.data.len > b.data.len { 1 } else { 0 }
+}
+
+fn chars_to_str(c: *Ctx, l: V) -> Result<V, V> {
+    c.tmp.clear();
+    var cur = l;
+    while let P(p) = cur {
+        let ch = char_arg(c, "list->string", p.car)?;
+        value.push_utf8(&c.tmp, ch);
+        cur = p.cdr;
+    }
+    Ok(V.S(value.new_str(&c.heap, c.tmp.as_str())))
+}
+
+fn mem_search(c: *Ctx, kind: i32, x: V, l: V) -> V {
+    let _ = c;
+    var cur = l;
+    while let P(p) = cur {
+        let hit = match kind { 0 => p.car == x, 1 => value.eqv(p.car, x), _ => value.equal(p.car, x) };
+        if hit { return cur; }
+        cur = p.cdr;
+    }
+    value.f()
+}
+
+fn ass_search(c: *Ctx, kind: i32, x: V, l: V) -> Result<V, V> {
+    var cur = l;
+    while let P(p) = cur {
+        let e = pair_arg(c, "assoc", p.car)?;
+        let hit = match kind { 0 => e.car == x, 1 => value.eqv(e.car, x), _ => value.equal(e.car, x) };
+        if hit { return Ok(p.car); }
+        cur = p.cdr;
+    }
+    Ok(value.f())
+}
+
+pub fn emit(c: *Ctx, v: V, write: bool) {
+    value.print(&c.out, v, write);
+    if c.out.bytes.len > 65536 { c.flush(); }
+}
+
+/// (error msg irritant ...) → "msg irritant ..."
+fn error_value(c: *Ctx, args: *V, n: u64) -> V {
+    var b = text.StrBuf.new();
+    for i in 0..n {
+        if i > 0 { b.push(' '); }
+        value.print(&b, args[i], i > 0);
+    }
+    let s = value.new_str(&c.heap, b.as_str());
+    b.free();
+    V.S(s)
+}
+
+// ── dispatch ────────────────────────────────────────────────────────
+
+/// Call builtin `id` with arguments args[0..n].
+pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+    let (name, lo, hi) = prim_info(id);
+    if (n as i32) < lo or (hi >= 0 and (n as i32) > hi) {
+        c.tmp.clear();
+        c.tmp.push_str(name);
+        c.tmp.push_str(": wrong number of arguments (");
+        c.tmp.push_int(n as i64);
+        c.tmp.push_str(")");
+        return Err(V.S(value.new_str(&c.heap, c.tmp.as_str())));
+    }
+    let h = &c.heap;
+    let a = if n > 0 { args[0] } else { value.unspec() };
+    let b = if n > 1 { args[1] } else { value.unspec() };
+    match id {
+        0 | 2 => {
+            var acc = V.Int(if id == 0 { 0 } else { 1 });
+            for i in 0..n { acc = arith(c, id, acc, args[i])?; }
+            Ok(acc)
+        }
+        1 | 3 => {
+            if n == 1 { return arith(c, id, V.Int(if id == 1 { 0 } else { 1 }), a); }
+            var acc = a;
+            for i in 1..n { acc = arith(c, id, acc, args[i])?; }
+            Ok(acc)
+        }
+        4 | 5 | 6 | 7 | 8 => {
+            var ok = true;
+            if n == 1 { num_arg(c, name, a)?; }
+            for i in 1..n {
+                if !compare(c, id - 4, args[i - 1], args[i])? { ok = false; }
+            }
+            Ok(value.boolean(ok))
+        }
+        9 | 10 | 11 => intdiv(c, id - 9, a, b),
+        12 => Ok(value.boolean(num_arg(c, name, a)? == 0.0)),
+        13 => Ok(value.boolean(value.is_number(a))),
+        14 => {
+            match a {
+                Int(_) => Ok(value.t()),
+                Num(x) => Ok(value.boolean(x == x.floor())),
+                _ => Ok(value.f()),
+            }
+        }
+        15 => {
+            match a {
+                Int(x) => Ok(if x < 0 { integer(0 - (x as i64)) } else { a }),
+                _ => { let x = num_arg(c, name, a)?; Ok(V.Num(if x < 0.0 { 0.0 - x } else { x })) }
+            }
+        }
+        16 | 17 => {
+            var acc = a;
+            num_arg(c, name, a)?;
+            var inexact = false;
+            for i in 0..n {
+                if let Num(_) = args[i] { inexact = true; }
+                if i == 0 { continue; }
+                let less = compare(c, 1, args[i], acc)?;
+                if (id == 16 and less) or (id == 17 and !less and !compare(c, 0, args[i], acc)?) { acc = args[i]; }
+            }
+            if inexact and let Int(x) = acc { acc = V.Num(x as f64); }
+            Ok(acc)
+        }
+        18 => sqrt(c, a),
+        19 | 22 => Ok(V.Num(num_arg(c, name, a)?)),
+        20 | 21 => {
+            match a {
+                Int(_) => Ok(a),
+                Num(x) => {
+                    if x == x.floor() and x >= -2147483648.0 and x <= 2147483647.0 { return Ok(V.Int(x as i32)); }
+                    Err(rt.err(c, "inexact->exact: no exact representation for", a))
+                }
+                _ => Err(rt.type_err(c, name, "number", a)),
+            }
+        }
+        23 | 24 | 25 | 26 => round_like(c, id - 23, a),
+        27 => expt(c, a, b),
+        28 | 29 => {
+            let x = int_arg(c, name, a)?;
+            Ok(value.boolean((x % 2 == 0) == (id == 28)))
+        }
+        30 => Ok(value.boolean(num_arg(c, name, a)? > 0.0)),
+        31 => Ok(value.boolean(num_arg(c, name, a)? < 0.0)),
+        32 => {
+            num_arg(c, name, a)?;
+            c.tmp.clear();
+            value.print(&c.tmp, a, false);
+            Ok(V.S(value.new_str(h, c.tmp.as_str())))
+        }
+        33 => {
+            let s = str_arg(c, name, a)?;
+            match read.parse_number(s.data) {
+                Some(v) => Ok(v),
+                None => Ok(value.f()),
+            }
+        }
+        34 | 35 => {
+            var acc: i64 = if id == 34 { 0 } else { 1 };
+            for i in 0..n {
+                let x = int_arg(c, name, args[i])?;
+                if id == 34 {
+                    acc = gcd2(acc, x);
+                } else {
+                    let g = gcd2(acc, x);
+                    acc = if g == 0 { 0 } else { acc / g * x };
+                    if acc < 0 { acc = 0 - acc; }
+                }
+            }
+            Ok(integer(acc))
+        }
+        36 => { num_arg(c, name, a)?; Ok(value.boolean(match a { Int(_) => true, _ => false })) }
+        37 => { num_arg(c, name, a)?; Ok(value.boolean(match a { Num(_) => true, _ => false })) }
+        38 => Ok(value.cons(h, a, b)),
+        39 => Ok(pair_arg(c, name, a)?.car),
+        40 => Ok(pair_arg(c, name, a)?.cdr),
+        41 => { pair_arg(c, name, a)?.car = b; Ok(value.unspec()) }
+        42 => { pair_arg(c, name, a)?.cdr = b; Ok(value.unspec()) }
+        43 => {
+            var l = value.nil();
+            var i = n;
+            while i > 0 { i -= 1; l = value.cons(h, args[i], l); }
+            Ok(l)
+        }
+        44 => {
+            match list_len(a) {
+                Some(k) => Ok(V.Int(k as i32)),
+                None => Err(rt.type_err(c, name, "list", a)),
+            }
+        }
+        45 => {
+            if n == 0 { return Ok(value.nil()); }
+            var result = args[n - 1];
+            var i = n - 1;
+            while i > 0 {
+                i -= 1;
+                // Copy args[i] in front of result.
+                let l = args[i];
+                if list_len(l).is_none() { return Err(rt.type_err(c, name, "list", l)); }
+                var head = value.nil();
+                var tail: ?Gc<Pair> = None;
+                var cur = l;
+                while let P(p) = cur {
+                    let cell = new(h, Pair { car: p.car, cdr: value.nil() });
+                    match tail {
+                        Some(t) => t.cdr = V.P(cell),
+                        None => head = V.P(cell),
+                    }
+                    tail = Some(cell);
+                    cur = p.cdr;
+                }
+                if let Some(t) = tail { t.cdr = result; result = head; }
+            }
+            Ok(result)
+        }
+        46 => {
+            var r = value.nil();
+            var cur = a;
+            while let P(p) = cur { r = value.cons(h, p.car, r); cur = p.cdr; }
+            if cur != value.nil() { return Err(rt.type_err(c, name, "list", a)); }
+            Ok(r)
+        }
+        47 | 48 => {
+            let Int(k) = b else { return Err(rt.type_err(c, name, "index", b)); };
+            var cur = a;
+            for _ in 0..k as u64 {
+                cur = pair_arg(c, name, cur)?.cdr;
+            }
+            if id == 47 { Ok(cur) } else { Ok(pair_arg(c, name, cur)?.car) }
+        }
+        49 | 50 | 51 => Ok(mem_search(c, id - 49, a, b)),
+        52 | 53 | 54 => ass_search(c, id - 52, a, b),
+        56 => cxr(c, name, "aa", a),
+        57 => cxr(c, name, "ad", a),
+        58 => cxr(c, name, "da", a),
+        59 => cxr(c, name, "dd", a),
+        60 => cxr(c, name, "add", a),
+        61 => cxr(c, name, "ddd", a),
+        115 => cxr(c, name, "addd", a),
+        62 => Ok(value.boolean(a == value.nil())),
+        63 => Ok(value.boolean(match a { P(_) => true, _ => false })),
+        64 => Ok(value.boolean(list_len(a).is_some())),
+        65 => Ok(value.boolean(a == b)),
+        66 => Ok(value.boolean(value.eqv(a, b))),
+        67 => Ok(value.boolean(value.equal(a, b))),
+        68 => Ok(value.boolean(a == value.f())),
+        69 => Ok(value.boolean(match a { Sym(_) => true, _ => false })),
+        70 => Ok(value.boolean(match a { S(_) => true, _ => false })),
+        71 => Ok(value.boolean(value.is_procedure(a))),
+        72 => Ok(value.boolean(match a { Vec(_) => true, _ => false })),
+        73 => Ok(value.boolean(a == value.t() or a == value.f())),
+        74 => Ok(value.boolean(value.char_of(a).is_some())),
+        75 => {
+            let Int(k) = a else { return Err(rt.type_err(c, name, "length", a)); };
+            if k < 0 { return Err(rt.type_err(c, name, "length", a)); }
+            let fill = if n > 1 { b } else { value.unspec() };
+            Ok(V.Vec(value.new_vect(h, k as u64, fill)))
+        }
+        76 => {
+            let v = value.new_vect(h, n, value.unspec());
+            for i in 0..n { v.data.ptr[i] = args[i]; }
+            Ok(V.Vec(v))
+        }
+        77 => {
+            let v = vec_arg(c, name, a)?;
+            let i = index_arg(c, name, b, v.data.len)?;
+            Ok(v.data.ptr[i])
+        }
+        78 => {
+            let v = vec_arg(c, name, a)?;
+            let i = index_arg(c, name, b, v.data.len)?;
+            v.data.ptr[i] = args[2];
+            Ok(value.unspec())
+        }
+        79 => Ok(V.Int(vec_arg(c, name, a)?.data.len as i32)),
+        80 => {
+            let v = vec_arg(c, name, a)?;
+            var l = value.nil();
+            var i = v.data.len;
+            while i > 0 { i -= 1; l = value.cons(h, v.data.ptr[i], l); }
+            Ok(l)
+        }
+        81 => {
+            if list_len(a).is_none() { return Err(rt.type_err(c, name, "list", a)); }
+            Ok(V.Vec(read.list_to_vect(h, a)))
+        }
+        82 => {
+            let v = vec_arg(c, name, a)?;
+            for i in 0..v.data.len { v.data.ptr[i] = b; }
+            Ok(value.unspec())
+        }
+        83 => Ok(V.Int(str_arg(c, name, a)?.data.len as i32)),
+        84 => {
+            let s = str_arg(c, name, a)?;
+            let i = index_arg(c, name, b, s.data.len)?;
+            Ok(value.chr(s.data[i] as i32))
+        }
+        85 => {
+            let s = str_arg(c, name, a)?;
+            let len = s.data.len;
+            let start = index_arg(c, name, b, len + 1)?;
+            let end = if n > 2 { index_arg(c, name, args[2], len + 1)? } else { len };
+            if end < start { return Err(rt.err(c, "substring: end before start", args[2])); }
+            Ok(V.S(value.new_str(h, s.data[start..end])))
+        }
+        86 => {
+            c.tmp.clear();
+            for i in 0..n {
+                let s = str_arg(c, name, args[i])?;
+                c.tmp.push_str(s.data);
+            }
+            Ok(V.S(value.new_str(h, c.tmp.as_str())))
+        }
+        87 | 88 | 89 | 120 | 121 => {
+            let x = str_arg(c, name, a)?;
+            let y = str_arg(c, name, b)?;
+            let r = str_cmp(x, y);
+            Ok(value.boolean(match id { 87 => r == 0, 88 => r < 0, 89 => r > 0, 120 => r <= 0, _ => r >= 0 }))
+        }
+        90 => Ok(V.S(value.new_str(h, str_arg(c, name, a)?.data))),
+        91 => Ok(str_to_list(h, str_arg(c, name, a)?)),
+        92 => chars_to_str(c, a),
+        93 => {
+            let Int(k) = a else { return Err(rt.type_err(c, name, "length", a)); };
+            if k < 0 { return Err(rt.type_err(c, name, "length", a)); }
+            let ch = if n > 1 { char_arg(c, name, b)? } else { 32 };
+            let s = new(h, Str {}, k as u64);
+            for i in 0..k as u64 { s.data[i] = ch as u8; }
+            Ok(V.S(s))
+        }
+        94 => {
+            c.tmp.clear();
+            for i in 0..n {
+                let ch = char_arg(c, name, args[i])?;
+                value.push_utf8(&c.tmp, ch);
+            }
+            Ok(V.S(value.new_str(h, c.tmp.as_str())))
+        }
+        95 => {
+            let Sym(s) = a else { return Err(rt.type_err(c, name, "symbol", a)); };
+            Ok(V.S(value.new_str(h, s.name)))
+        }
+        96 => {
+            let s = str_arg(c, name, a)?;
+            Ok(V.Sym(c.syms.intern(h, s.data)))
+        }
+        97 => Ok(V.Int(char_arg(c, name, a)?)),
+        98 => {
+            let Int(k) = a else { return Err(rt.type_err(c, name, "integer", a)); };
+            if k < 0 or k > 0x10FFFF { return Err(rt.err(c, "integer->char: out of range", a)); }
+            Ok(value.chr(k))
+        }
+        99 | 100 | 101 | 118 | 119 => {
+            let x = char_arg(c, name, a)?;
+            let y = char_arg(c, name, b)?;
+            Ok(value.boolean(match id { 99 => x == y, 100 => x < y, 101 => x > y, 118 => x <= y, _ => x >= y }))
+        }
+        102 => {
+            let x = char_arg(c, name, a)?;
+            Ok(value.chr(if x >= 'a' as i32 and x <= 'z' as i32 { x - 32 } else { x }))
+        }
+        103 => {
+            let x = char_arg(c, name, a)?;
+            Ok(value.chr(if x >= 'A' as i32 and x <= 'Z' as i32 { x + 32 } else { x }))
+        }
+        104 => {
+            let x = char_arg(c, name, a)?;
+            Ok(value.boolean((x >= 'a' as i32 and x <= 'z' as i32) or (x >= 'A' as i32 and x <= 'Z' as i32)))
+        }
+        105 => {
+            let x = char_arg(c, name, a)?;
+            Ok(value.boolean(x >= '0' as i32 and x <= '9' as i32))
+        }
+        106 => {
+            let x = char_arg(c, name, a)?;
+            Ok(value.boolean(x == 32 or x == 9 or x == 10 or x == 13 or x == 12))
+        }
+        107 => {
+            let s = str_arg(c, name, a)?;
+            let i = index_arg(c, name, b, s.data.len)?;
+            let ch = char_arg(c, name, args[2])?;
+            s.data[i] = ch as u8;
+            Ok(value.unspec())
+        }
+        108 | 123 | 124 => { emit(c, a, false); Ok(value.unspec()) }
+        109 => { emit(c, a, true); Ok(value.unspec()) }
+        110 => {
+            c.out.push('\n');
+            if c.out.bytes.len > 65536 { c.flush(); }
+            Ok(value.unspec())
+        }
+        111 => Err(error_value(c, args, n)),
+        112 => {
+            c.flush();
+            var code: i32 = 0;
+            if let Int(k) = a { code = k; }
+            if a == value.f() { code = 1; }
+            os.quit(code)
+        }
+        113 => {
+            var p = pair_arg(c, name, a)?;
+            while let P(q) = p.cdr { p = q; }
+            Ok(V.P(p))
+        }
+        114 => {
+            var head = value.nil();
+            var tail: ?Gc<Pair> = None;
+            var cur = a;
+            while let P(p) = cur {
+                let cell = new(h, Pair { car: p.car, cdr: value.nil() });
+                match tail {
+                    Some(t) => t.cdr = V.P(cell),
+                    None => head = V.P(cell),
+                }
+                tail = Some(cell);
+                cur = p.cdr;
+            }
+            if let Some(t) = tail { t.cdr = cur; }
+            Ok(head)
+        }
+        116 => Ok(V.Imm(value.IMM_EOF)),
+        117 => Ok(value.boolean(a == b)),
+        122 => Ok(value.boolean(a == b)),
+        125 => arith(c, 2, a, a),
+        _ => Err(rt.err_msg(c, "apply: internal error")),
+    }
+}

@@ -1,0 +1,50 @@
+// A small Scheme (an R7RS-small subset), implemented in Loimi.
+//
+//   loimi build examples/scheme/main.lm --release -o scheme
+//   ./scheme program.scm          (a second argument turns on GC stress)
+
+import std.io;
+import std.os;
+import std.gc;
+import std.text;
+import value;
+import value.{V};
+import rt.{Ctx};
+import rt;
+import vm.{Scheme};
+import compile;
+import builtins;
+import prelude;
+
+fn main() -> i32 {
+    let Some(path) = os.arg(1) else {
+        io.eprintln("usage: scheme <program.scm> [stress]");
+        return 2;
+    };
+    let Some(src) = io.read_file(path) else {
+        io.eprint("cannot read ");
+        io.eprintln(path);
+        return 1;
+    };
+    var ctx = Ctx.new();
+    if os.arg(2).is_some() { ctx.heap.set_stress(true); }
+    for id in 0..builtins.NPRIMS {
+        let (name, _, _) = builtins.prim_info(id);
+        let s = ctx.syms.intern(&ctx.heap, name);
+        let g = ctx.global(s);
+        ctx.gvals.set(g as u64, value.prim(id));
+    }
+    let proto = compile.compile(&ctx, prelude.source(), src);
+    let main_closure = value.new_closure(&ctx.heap, proto);
+    ctx.heap.add_scanner(&ctx as *u8, rt.scan_roots);
+    Scheme.run(&ctx, main_closure);
+    ctx.flush();
+    if ctx.error != value.unspec() {
+        var b = text.StrBuf.new();
+        b.push_str("error: ");
+        value.print(&b, ctx.error, false);
+        io.eprintln(b.as_str());
+        return 1;
+    }
+    0
+}

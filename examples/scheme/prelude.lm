@@ -1,0 +1,36 @@
+// Builtins written in Scheme: the ones that call procedures (map,
+// for-each, ...). Compiled before the program, with no source lines.
+
+pub fn source() -> str {
+"
+(define (%map1 f l)
+  (let loop ((l l) (acc '()))
+    (if (pair? l)
+        (loop (cdr l) (cons (f (car l)) acc))
+        (reverse acc))))
+
+(define (%all-pairs? ls)
+  (if (null? ls) #t (if (pair? (car ls)) (%all-pairs? (cdr ls)) #f)))
+
+(define (map f l . ls)
+  (if (null? ls)
+      (%map1 f l)
+      (let loop ((ls (cons l ls)) (acc '()))
+        (if (%all-pairs? ls)
+            (loop (%map1 cdr ls) (cons (apply f (%map1 car ls)) acc))
+            (reverse acc)))))
+
+(define (for-each f l . ls)
+  (if (null? ls)
+      (let loop ((l l))
+        (if (pair? l) (begin (f (car l)) (loop (cdr l)))))
+      (let loop ((ls (cons l ls)))
+        (if (%all-pairs? ls)
+            (begin (apply f (%map1 car ls)) (loop (%map1 cdr ls)))))))
+
+(define (vector-map f v) (list->vector (map f (vector->list v))))
+(define (vector-for-each f v) (for-each f (vector->list v)))
+(define (string-for-each f s) (for-each f (string->list s)))
+(define (string-map f s) (list->string (map f (string->list s))))
+"
+}

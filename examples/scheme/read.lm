@@ -1,0 +1,304 @@
+// The reader: source text → Scheme data (pairs, symbols, ...), allocated in
+// the GC heap. Reading allocates but never collects.
+//
+// The source line of every list is recorded in a side table keyed by the
+// address of its first pair, so the compiler can attach lines to code
+// (the heap does not move objects, and nothing is collected until the
+// whole program has been compiled).
+
+import std.gc;
+import std.io;
+import std.os;
+import std.mem;
+import std.map;
+import std.text;
+import value;
+import value.{V, Symtab, Pair, Vect};
+
+pub struct Reader {
+    src: str,
+    pos: u64,
+    line: u32,
+    heap: *gc.Heap,
+    syms: *Symtab,
+    lines: *map.HashMap<u64, u32>,
+    /// Record lines (false for the built-in prelude).
+    track: bool,
+}
+
+pub fn fail(line: u32, msg: str) -> never {
+    var b = text.StrBuf.new();
+    b.push_str("error: line ");
+    b.push_int(line as i64);
+    b.push_str(": ");
+    b.push_str(msg);
+    io.eprintln(b.as_str());
+    os.quit(1)
+}
+
+fn Reader.peek(r: *Reader, off: u64) -> u8 {
+    if r.pos + off < r.src.len { r.src[r.pos + off] } else { 0 }
+}
+
+fn delimiter(c: u8) -> bool {
+    c == 0 or text.is_space(c) or c == '(' or c == ')' or c == '[' or c == ']' or c == '"' or c == ';' or c == '\''
+}
+
+/// Skip whitespace and comments (`;`, nested `#| |#`, and `#;` datum comments).
+fn Reader.skip(r: *Reader) {
+    loop {
+        let c = r.peek(0);
+        if r.pos >= r.src.len { return; }
+        if c == '\n' { r.line += 1; r.pos += 1; continue; }
+        if text.is_space(c) { r.pos += 1; continue; }
+        if c == ';' {
+            while r.pos < r.src.len and r.peek(0) != '\n' { r.pos += 1; }
+            continue;
+        }
+        if c == '#' and r.peek(1) == '|' {
+            let start = r.line;
+            var depth = 1;
+            r.pos += 2;
+            while depth > 0 {
+                if r.pos >= r.src.len { fail(start, "unterminated block comment"); }
+                let d = r.peek(0);
+                if d == '\n' { r.line += 1; }
+                if d == '|' and r.peek(1) == '#' { depth -= 1; r.pos += 2; continue; }
+                if d == '#' and r.peek(1) == '|' { depth += 1; r.pos += 2; continue; }
+                r.pos += 1;
+            }
+            continue;
+        }
+        if c == '#' and r.peek(1) == ';' {
+            r.pos += 2;
+            let line = r.line;
+            if r.read().is_none() { fail(line, "datum comment at end of input"); }
+            continue;
+        }
+        return;
+    }
+}
+
+fn Reader.sym(r: *Reader, s: str) -> V {
+    V.Sym(r.syms.intern(r.heap, s))
+}
+
+/// (name datum)
+fn Reader.wrap(r: *Reader, name: str, line: u32) -> V {
+    let Some(d) = r.read() else { fail(line, "unexpected end of input after quote") };
+    let h = r.heap;
+    let x = value.cons(h, d, value.nil());
+    let l = value.cons(h, r.sym(name), x);
+    r.note(l, line);
+    l
+}
+
+fn Reader.note(r: *Reader, v: V, line: u32) {
+    if !r.track { return; }
+    if let P(p) = v { r.lines.insert(p as u64, line); }
+}
+
+/// The next datum, or None at end of input.
+pub fn Reader.read(r: *Reader) -> ?V {
+    r.skip();
+    if r.pos >= r.src.len { return None; }
+    let line = r.line;
+    let c = r.peek(0);
+    if c == '(' or c == '[' {
+        r.pos += 1;
+        return Some(r.list(if c == '(' { ')' } else { ']' }, line));
+    }
+    if c == ')' or c == ']' { fail(line, "unexpected ')'"); }
+    if c == '\'' { r.pos += 1; return Some(r.wrap("quote", line)); }
+    if c == '`' { r.pos += 1; return Some(r.wrap("quasiquote", line)); }
+    if c == ',' {
+        r.pos += 1;
+        if r.peek(0) == '@' { r.pos += 1; return Some(r.wrap("unquote-splicing", line)); }
+        return Some(r.wrap("unquote", line));
+    }
+    if c == '"' { return Some(r.string(line)); }
+    if c == '#' {
+        let d = r.peek(1);
+        if d == '(' {
+            r.pos += 2;
+            let l = r.list(')', line);
+            return Some(V.Vec(list_to_vect(r.heap, l)));
+        }
+        if d == '\\' {
+            r.pos += 2;
+            return Some(r.character(line));
+        }
+    }
+    // An atom: number, boolean or symbol.
+    let start = r.pos;
+    while r.pos < r.src.len and !delimiter(r.peek(0)) { r.pos += 1; }
+    let s = r.src[start..r.pos];
+    if s.len == 0 { fail(line, "unexpected character"); }
+    if s[0] == '#' {
+        if s.eq("#t") or s.eq("#true") { return Some(value.t()); }
+        if s.eq("#f") or s.eq("#false") { return Some(value.f()); }
+        fail(line, "bad # syntax");
+    }
+    if let Some(n) = parse_number(s) { return Some(n); }
+    if s.eq(".") { fail(line, "unexpected '.'"); }
+    Some(r.sym(s))
+}
+
+pub fn list_to_vect(h: *gc.Heap, l: V) -> Gc<Vect> {
+    var n: u64 = 0;
+    var cur = l;
+    while let P(p) = cur { n += 1; cur = p.cdr; }
+    let v = value.new_vect(h, n, value.unspec());
+    cur = l;
+    var i: u64 = 0;
+    while let P(p) = cur { v.data.ptr[i] = p.car; i += 1; cur = p.cdr; }
+    v
+}
+
+/// A number literal: an exact integer (a flonum if it does not fit in a
+/// fixnum) or a decimal flonum.
+pub fn parse_number(s: str) -> ?V {
+    var i: u64 = 0;
+    if s.len > 0 and (s[0] == '+' or s[0] == '-') { i = 1; }
+    if i >= s.len { return None; }
+    if !text.is_digit(s[i]) and !(s[i] == '.' and i + 1 < s.len and text.is_digit(s[i + 1])) { return None; }
+    var is_int = true;
+    for j in i..s.len {
+        if !text.is_digit(s[j]) { is_int = false; }
+    }
+    if is_int {
+        let body = if s[0] == '+' { s[1..s.len] } else { s };
+        if let Some(x) = text.parse_int(body) and x >= -2147483648 and x <= 2147483647 {
+            return Some(V.Int(x as i32));
+        }
+    }
+    let Some(f) = text.parse_f64(s) else { return None; };
+    Some(V.Num(f))
+}
+
+fn Reader.list(r: *Reader, close: u8, line: u32) -> V {
+    let h = r.heap;
+    var head = value.nil();
+    var tail: ?Gc<Pair> = None;
+    loop {
+        r.skip();
+        if r.pos >= r.src.len { fail(line, "unterminated list"); }
+        let c = r.peek(0);
+        if c == ')' or c == ']' {
+            if c != close { fail(r.line, "mismatched brackets"); }
+            r.pos += 1;
+            break;
+        }
+        if c == '.' and delimiter(r.peek(1)) {
+            r.pos += 1;
+            let Some(t) = tail else { fail(r.line, "unexpected '.'") };
+            let Some(d) = r.read() else { fail(line, "unterminated list") };
+            t.cdr = d;
+            r.skip();
+            if r.peek(0) != close { fail(r.line, "expected ')' after dotted tail"); }
+            r.pos += 1;
+            break;
+        }
+        let item_line = r.line;
+        let Some(d) = r.read() else { fail(line, "unterminated list") };
+        let cell = new(h, Pair { car: d, cdr: value.nil() });
+        match tail {
+            Some(t) => t.cdr = V.P(cell),
+            None => {
+                head = V.P(cell);
+            }
+        }
+        tail = Some(cell);
+        let _ = item_line;
+    }
+    r.note(head, line);
+    head
+}
+
+fn hex(c: u8) -> ?u32 {
+    if text.is_digit(c) { return Some((c - '0') as u32); }
+    if c >= 'a' and c <= 'f' { return Some((c - 'a') as u32 + 10); }
+    if c >= 'A' and c <= 'F' { return Some((c - 'A') as u32 + 10); }
+    None
+}
+
+fn Reader.string(r: *Reader, line: u32) -> V {
+    r.pos += 1;
+    var b = text.StrBuf.new();
+    loop {
+        if r.pos >= r.src.len { fail(line, "unterminated string"); }
+        let c = r.peek(0);
+        r.pos += 1;
+        if c == '"' { break; }
+        if c == '\n' { r.line += 1; }
+        if c != '\\' { b.push(c); continue; }
+        let e = r.peek(0);
+        r.pos += 1;
+        if e == 'n' { b.push('\n'); }
+        else if e == 't' { b.push('\t'); }
+        else if e == 'r' { b.push('\r'); }
+        else if e == 'a' { b.push(7); }
+        else if e == '0' { b.push(0); }
+        else if e == '\\' { b.push('\\'); }
+        else if e == '"' { b.push('"'); }
+        else if e == 'x' {
+            var v: u32 = 0;
+            while let Some(d) = hex(r.peek(0)) { v = v * 16 + d; r.pos += 1; }
+            if r.peek(0) == ';' { r.pos += 1; }
+            value.push_utf8(&b, v as i32);
+        } else if e == '\n' or text.is_space(e) {
+            // Line continuation: skip the newline and leading whitespace.
+            var nl = e == '\n';
+            if nl { r.line += 1; }
+            while text.is_space(r.peek(0)) {
+                if r.peek(0) == '\n' {
+                    if nl { break; }
+                    nl = true;
+                    r.line += 1;
+                }
+                r.pos += 1;
+            }
+        } else {
+            fail(r.line, "unknown string escape");
+        }
+    }
+    let s = value.new_str(r.heap, b.as_str());
+    b.free();
+    V.S(s)
+}
+
+/// After `#\`.
+fn Reader.character(r: *Reader, line: u32) -> V {
+    let start = r.pos;
+    // The first character is always part of the char, even a delimiter.
+    r.pos += 1;
+    while r.pos < r.src.len and !delimiter(r.peek(0)) { r.pos += 1; }
+    let s = r.src[start..r.pos];
+    if s.len == 1 { return value.chr(s[0] as i32); }
+    if s.eq("space") { return value.chr(32); }
+    if s.eq("newline") or s.eq("linefeed") { return value.chr(10); }
+    if s.eq("tab") { return value.chr(9); }
+    if s.eq("return") { return value.chr(13); }
+    if s.eq("null") or s.eq("nul") { return value.chr(0); }
+    if s.eq("alarm") { return value.chr(7); }
+    if s.eq("backspace") { return value.chr(8); }
+    if s.eq("delete") { return value.chr(127); }
+    if s.eq("escape") { return value.chr(27); }
+    if s[0] == 'x' and s.len > 1 {
+        var v: u32 = 0;
+        for i in 1..s.len {
+            let Some(d) = hex(s[i]) else { fail(line, "bad character literal") };
+            v = v * 16 + d;
+        }
+        return value.chr(v as i32);
+    }
+    // A multi-byte UTF-8 character.
+    if s[0] >= 0x80 {
+        var v: u32 = 0;
+        let b0 = s[0] as u32;
+        if b0 >= 0xF0 { v = b0 & 7; } else if b0 >= 0xE0 { v = b0 & 15; } else { v = b0 & 31; }
+        for i in 1..s.len { v = (v << 6) | (s[i] as u32 & 63); }
+        return value.chr(v as i32);
+    }
+    fail(line, "unknown character name")
+}
