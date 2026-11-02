@@ -325,3 +325,82 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
     }
 }
 
+
+/// Call `f` on every expression in `e`, outermost first.
+pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
+    f(e);
+    let mut go = |x: &'a TExpr| for_each_expr(x, f);
+    match &e.kind {
+        TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
+        TK::Global(_) | TK::Continue(_) | TK::Unreachable => {}
+        TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
+        TK::Try(a) | TK::Trailing(a) => go(a),
+        TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
+            go(a);
+            go(b);
+        }
+        TK::SliceRange(a, lo, hi) => {
+            go(a);
+            for x in [lo, hi].into_iter().flatten() {
+                go(x);
+            }
+        }
+        TK::Call(c, args) => {
+            go(c);
+            args.iter().for_each(go);
+        }
+        TK::Intrinsic(_, args) | TK::Struct(args) | TK::Tuple(args) | TK::Array(args) | TK::Variant(_, args) => args.iter().for_each(go),
+        TK::Block(stmts, tail) => {
+            for s in stmts {
+                match s {
+                    TStmt::Let(_, init) => init.iter().for_each(&mut go),
+                    TStmt::LetPat(_, x, els) => {
+                        go(x);
+                        els.iter().for_each(&mut go);
+                    }
+                    TStmt::Expr(x) | TStmt::Defer(x) => go(x),
+                }
+            }
+            tail.iter().for_each(|t| go(t));
+        }
+        TK::If(conds, then, els) => {
+            for c in conds {
+                match c {
+                    TCond::Expr(x) | TCond::Let(_, x) => go(x),
+                }
+            }
+            go(then);
+            els.iter().for_each(|x| go(x));
+        }
+        TK::Match(s, arms) => {
+            go(s);
+            for a in arms {
+                a.guard.iter().for_each(&mut go);
+                go(&a.body);
+            }
+        }
+        TK::Loop { body, step, .. } => {
+            go(body);
+            step.iter().for_each(|x| go(x));
+        }
+        TK::Break(_, v) | TK::Return(v) => v.iter().for_each(|x| go(x)),
+        TK::New { heap, init, len } => {
+            go(heap);
+            go(init);
+            len.iter().for_each(|x| go(x));
+        }
+        TK::Vm(v) => match v {
+            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
+            TVm::Synced(a, b) => {
+                go(a);
+                go(b);
+            }
+            TVm::Shared(_, args, size) => {
+                args.iter().for_each(&mut go);
+                go(size);
+            }
+            TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
+            TVm::SharedArg(..) => {}
+        },
+    }
+}

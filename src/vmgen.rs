@@ -83,6 +83,31 @@ pub fn table_name(vd: &VmDef) -> String {
     format!("@\"{}.table\"", vd.symbol)
 }
 
+/// Whether combined-mode entry `entry` can ever dispatch through a
+/// variant's table: it, or some op, vm function or `on raise` it may
+/// run, says `use_variant` with a variant. Other entries get no wrapper
+/// blocks: they could never be reached, and a few hundred of them in one
+/// function made LLVM's loop strength reduction take minutes.
+fn entry_switches(p: &Program, vm: u32, entry: FnId) -> bool {
+    let mut found = false;
+    for (fid, f) in p.fns.iter().enumerate() {
+        if f.vm != Some(vm) || (f.vm_role == VmRole::Entry && fid as FnId != entry) {
+            continue;
+        }
+        if let Some(b) = &f.body {
+            crate::tirwalk::for_each_expr(b, &mut |e| {
+                if matches!(e.kind, TK::Vm(TVm::TableAddr(t)) if t > 0) {
+                    found = true;
+                }
+            });
+        }
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Called after parameters are stored: set up vm state for handlers/entries.
 pub fn handler_prologue(g: &mut FnGen) {
     let f = g.f();
@@ -126,11 +151,14 @@ pub fn handler_prologue(g: &mut FnGen) {
         hg.raise_label = g.fresh_label("raise");
         hg.invalid_label = g.fresh_label("invalid");
         hg.op_labels = vd.ops.iter().map(|o| format!("op.{}.{}", o.name, o.opcode)).collect();
+        let switches = f.vm_role == VmRole::Entry && entry_switches(p, vm, g.fid);
         hg.wrapper_labels = vd
             .variants
             .iter()
             .enumerate()
-            .map(|(v, (_, ws))| ws.iter().map(|(k, _)| (*k, format!("var.{}.{}", v, k))).collect())
+            .map(|(v, (_, ws))| {
+                if switches { ws.iter().map(|(k, _)| (*k, format!("var.{}.{}", v, k))).collect() } else { vec![] }
+            })
             .collect();
         if let Some(rt) = &vd.raise_ty {
             hg.raise_slot = g.alloca(rt);
@@ -180,11 +208,13 @@ pub fn epilogue(g: &mut FnGen) {
     if let Some(rf) = vd.on_raise {
         emit_body(g, rf, &hg.raise_label);
     }
-    for (v, (_, ws)) in vd.variants.iter().enumerate() {
-        for (j, (_, fid)) in ws.iter().enumerate() {
-            emit_body(g, *fid, &hg.wrapper_labels[v][j].1);
+    for (v, ws) in hg.wrapper_labels.iter().enumerate() {
+        for (j, (_, l)) in ws.iter().enumerate() {
+            emit_body(g, vd.variants[v].1[j].1, l);
         }
     }
+    // Without wrappers, the variants' tables are never used.
+    let ntables = if hg.wrapper_labels.iter().all(|w| w.is_empty()) { 0 } else { vd.variants.len() };
     g.fid = entry_fid;
     g.slots = entry_slots;
     if let Some(h) = g.vm.as_mut() {
@@ -220,7 +250,7 @@ pub fn epilogue(g: &mut FnGen) {
             g.inst(format!("trunc i64 {} to i32", opc))
         };
         g.term(format!("switch i32 {}, label %{} [{} ]", case, hg.invalid_label, cases));
-        for t in 0..=vd.variants.len() {
+        for t in 0..=ntables {
             if t > 0 || vd.tbl_idx.is_some() {
                 let mut ids = Vec::new();
                 for i in 0..n {
@@ -237,7 +267,7 @@ pub fn epilogue(g: &mut FnGen) {
             }
         }
     } else {
-        for t in 0..=vd.variants.len() {
+        for t in 0..=ntables {
             let mut entries = Vec::new();
             for i in 0..n {
                 let l = match vd.ops.iter().position(|o| o.opcode as usize == i) {

@@ -345,6 +345,15 @@ table, so the interpreter stays instrumented until the table is switched back.
 When a vm declares no variants, `%tbl` is not a state register: handlers
 address the default table as a global constant, which frees a register.
 
+In goto and switch modes each entry is one function holding every
+handler, and a wrapper is a block that runs `before` and branches to the
+op's block. Only entries that can switch tables get the wrapper blocks:
+those that say `use_variant` with a variant, or all of them when an op,
+vm function or `on raise` does. In an entry that never switches, the
+wrappers would be unreachable, but LLVM removes them only late, and on a
+large interpreter with `wraps all` its loop strength reduction took
+minutes over the IR they left behind.
+
 Unused opcode slots point at a trap handler (`@"Mini.invalid"` as implemented). Verified code can't
 reach it, so it exists only for defense in depth.
 

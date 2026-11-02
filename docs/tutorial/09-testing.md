@@ -76,9 +76,10 @@ know the variant exists. On the benchmarks, step 9 runs as fast as
 step 8. The same mechanism gives you a tracer, a debugger's breakpoint
 check or a coverage counter without a second copy of the interpreter.
 
-One caution: `wraps all` (every one of Pip's ops) made the `--dispatch=goto`
-build take minutes in clang (every wrapper is replicated into the one
-big function). Wrapping the 16 ops that matter builds in seconds.
+`wraps all` would work too, and builds as fast in every dispatch mode
+(the compiler adds wrapper blocks only to the entries that switch to the
+variant, here `run_budget`), but wrapping only the 16 ops that can jump
+keeps the step-counting overhead off straight-line code.
 
 ## The fuzzer
 
