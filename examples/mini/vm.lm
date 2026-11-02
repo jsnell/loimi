@@ -367,8 +367,8 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { dst = tab.aptr[u]; next }
         }
         if let (T(tab), S(s)) = (t, key) { dst = value.hash_get_str(tab, key, s.hash); next }
@@ -376,8 +376,8 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; next }
         }
         if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
@@ -392,8 +392,8 @@ pub vm Mini {
     }
     /// t[key] = k[c] (a constant value).
     op SETINDEXK(t: reg, key: reg, v: kst) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; next }
         }
         if let T(tab) = t {
@@ -628,11 +628,9 @@ pub vm Mini {
     ] {
         inline for (opname, want) in [(name, true), (nname, false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
-                match (a, b) {
-                    (Int(x), Int(y)) => branch((isub) == want, then.target),
-                    (Num(x), Num(y)) => branch((fsub) == want, then.target),
-                    _ => {}
-                }
+                let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
+                if (x | y) < (1 << 48) { branch((isub) == want, then.target) }
+                if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }
         }
@@ -717,7 +715,9 @@ pub vm Mini {
     op FORLOOP(a: forbase, target: label) : AsBx {
         if let Int(c) = regs[a + 1] {
             if c != 0 {
-                regs[a + 1] = Int(c -% 1);
+                // The payload is not zero, so decrementing the word
+                // decrements it.
+                regs[a + 1] = ((regs[a + 1] as u64) - 1) as V;
                 let Int(i) = regs[a] else { unreachable };
                 let Int(s) = regs[a + 2] else { unreachable };
                 let n = V.Int(i +% s);

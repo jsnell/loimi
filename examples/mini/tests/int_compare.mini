@@ -1,0 +1,20 @@
+-- Integer compares on words (value.int_bias) and Int array indices (value.int_index).
+local xs = {-2147483648, -5, -1, 0, 1, 7, 2147483647, -0.5, 0.5, 1.0}
+local out = {}
+for i = 1, #xs do
+  for j = 1, #xs do
+    local a, b = xs[i], xs[j]
+    local s = ""
+    if a < b then s = s .. "<" end
+    if a <= b then s = s .. "l" end
+    if a > 3 then s = s .. "g" end
+    if a >= -1 then s = s .. "G" end
+    if not (a < b) then s = s .. "n" end
+    out[#out + 1] = s
+  end
+end
+print(table.concat(out, ","))
+local t = {10, 20, 30}
+print(t[0], t[-1], t[1], t[3], t[4], t[-2147483648])
+-- expect: ln,<l,<l,<l,<l,<l,<l,<l,<l,<l,n,ln,<l,<l,<l,<l,<l,<l,<l,<l,Gn,Gn,lGn,<lG,<lG,<lG,<lG,<lG,<lG,<lG,Gn,Gn,Gn,lGn,<lG,<lG,<lG,Gn,<lG,<lG,Gn,Gn,Gn,Gn,lGn,<lG,<lG,Gn,Gn,lGn,gGn,gGn,gGn,gGn,gGn,lgGn,<lgG,gGn,gGn,gGn,gGn,gGn,gGn,gGn,gGn,gGn,lgGn,gGn,gGn,gGn,Gn,Gn,Gn,<lG,<lG,<lG,<lG,lGn,<lG,<lG,Gn,Gn,Gn,Gn,<lG,<lG,<lG,Gn,lGn,<lG,Gn,Gn,Gn,Gn,lGn,<lG,<lG,Gn,Gn,lGn
+-- expect: nil	nil	10	30	nil	nil
