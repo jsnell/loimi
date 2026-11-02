@@ -128,12 +128,15 @@ fn equal(a: Value, b: Value) -> bool {
 /// `a b concat`, or `a tostr` when `two` is false: the text of the top
 /// value(s) as a new string. The operands are still on the stack, so they
 /// are roots if this collects.
-fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Value uses gc {
+fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Result<Value, str> uses gc {
     gc.maybe_collect(&m.heap);
     m.tmp.clear();
     value.write(&m.tmp, a);
     if two { value.write(&m.tmp, b); }
-    Value.Str(value.new_str(&m.heap, m.tmp.as_str()))
+    // The fuzzer found this one: `dup concat` in a loop doubles a string
+    // per iteration, which no step budget stops in time.
+    if m.tmp.len() > MAX_LEN as u64 { return Err("string too long"); }
+    Ok(Value.Str(value.new_str(&m.heap, m.tmp.as_str())))
 }
 
 /// The stack effect of instruction `w`: (pops, pushes), or None for an
@@ -473,13 +476,13 @@ pub vm Stak {
     }
     op CR() : N { io.println(""); next }
     op CONCAT() : N {
-        let r = stringify(ctx, *sp, tos, true);
+        let r = stringify(ctx, *sp, tos, true)?;
         put2(r);
         next
     }
     op TOSTR() : N {
         if let Str(_) = tos { next }
-        tos = stringify(ctx, tos, Nil, false);
+        tos = stringify(ctx, tos, Nil, false)?;
         next
     }
     op LEN() : N {
