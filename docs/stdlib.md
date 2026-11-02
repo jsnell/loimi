@@ -48,6 +48,11 @@ Guest-semantics helpers that are easy to get subtly wrong:
   reference AST and IR nodes without pointers.
 - `Vec<T>`, `SmallVec<T, N>`.
 
+**As implemented** (`std/mem.lm`, partly): `alloc`/`grow`/`release`/`copy`,
+`Vec<T>` and `Arena`. `Vec<T>.sort_by(cmp)` and `mem.sort_by(p, n, cmp)`
+sort stably with a `block fn(*T, *T) -> i32` comparator, which may be a
+closure capturing locals or a plain function.
+
 ## `std.collections`
 
 - `HashMap<K, V>` / `HashSet<T>`: SwissTable-style open addressing.
@@ -200,7 +205,16 @@ arrows this way. Postfix chains such as calls and indexing can stay in
 `atom`. A hook that needs to recurse (parentheses) reaches the table through
 a pointer in `P`. The hooks' types have no effects, so `parse` has none
 and runs from any function: hooks may allocate but not collect (collect
-between parses). `TokenStream` and error recovery are not built. `Span` and
+between parses).
+
+`Parser<P: Hooks<K, E, X>, K, E, X>` is the same table and driver with the
+hooks as methods of the parser state: `P` declares
+`impl parse.Hooks<K, E, X> for P;` and defines `fn P.peek`, `advance`,
+`atom`, `unary` and `binary`, and optionally `before_rhs` (default:
+unchanged) and `led` (one method for all kinds registered with
+`pr.led(k, left, right)`, dispatching on the kind; the default traps).
+The calls are direct, so they inline, and the hooks need no function
+pointer table or casts. `TokenStream` and error recovery are not built. `Span` and
 `SourceMap` live in `std.diag`.
 
 ## `std.diag`
