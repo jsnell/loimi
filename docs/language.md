@@ -94,7 +94,44 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   arguments only when a balanced `<...>` made of type tokens follows
   (`p as *Vec<T>`); otherwise it is a comparison. When in doubt, write
   `(x as T) < y`.
+- **Type aliases.** `type Name = T;` and `pub type Name = T;` give a type a
+  second name; `type Map<V> = HashMap<str, V>;` takes type parameters. An
+  alias is transparent: `Name` *is* `T`, so values convert freely, methods
+  of `T` apply, and `fn Name.m(..)` defines a method of `T`. The aliased
+  type is resolved in the alias's module and sees only the alias's own
+  parameters; aliases may refer to other aliases, in any order, but not
+  to themselves. A non-generic alias can also stand for its type in
+  expressions: `Name { .. }` (struct literals), `Name.f(..)` (static
+  calls), `Name.Variant` (also in patterns). Generic aliases are for type
+  positions only (`Map.new()` is not available; write `HashMap.new()`),
+  and their parameters take no bounds: the bounds of the aliased type
+  are checked where it is instantiated. Aliases are imported like other
+  items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **Match guards.** `pat if cond => body` matches only when `cond` (which
+  sees the pattern's bindings) is true; otherwise the later arms are
+  tried. Guarded arms do not count toward exhaustiveness. Note the
+  difference from an arm whose *body* is an `if`:
+
+  ```loimi
+  match (a, b) {
+      (Int(x), Int(y)) if y != 0 => { dst = Int(x / y); next }   // y == 0: tries the next arm
+      (Int(x), Int(y)) => if y != 0 { dst = Int(x / y); next },  // y == 0: continues after the match
+      (Int(x), _) => { .. }
+      _ => {}
+  }
+  ```
+
+  Once a pattern matches, its arm is chosen; a false `if` inside it
+  falls out of the whole `match`, as in Rust. In handlers, where the code
+  after a `match` is usually the slow path, that silently skips a later
+  arm meant for the case. The compiler warns when, in vm code (op
+  handlers, `-> never` vm functions, entries, `on raise`), an arm's body
+  is an `if` without `else` that ends in a control word and a later arm
+  with a non-empty body could match some of the same values. Use a guard
+  to try the later arms, or write `else {}` to say that falling out of the
+  `match` is intended. Arms followed only by `_ => {}` do not warn, since
+  falling out of the `match` is then the same as trying the rest.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -187,8 +224,44 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
 }
 ```
 
-Inside a `vm`, a loop variable may not have the name of a state variable:
-it would replace every use of that name in the body.
+`inline for` is token-level expansion. The body is copied once per
+element, and every identifier token equal to a loop variable is replaced
+by that element's tokens (in parentheses when there is more than one
+token, so `v * 10` with `v = 2 + 3` is `(2 + 3) * 10`). That includes
+field names (`r.f`) and binders (`let v`), so pick loop variable names
+that do not collide with names in the body. `#v` turns a string or
+identifier value into an identifier.
+
+It can appear at module level, among the items of a `vm`, and as a
+statement in any block: function bodies, op handlers, vm functions,
+entries.
+
+```loimi
+fn sum_fields(r: *Regs) -> i64 {
+    var total: i64 = 0;
+    inline for f in [a, b, c] { total += r.f }
+    total
+}
+```
+
+**Scoping.** In statement position, the copies become statements of the
+enclosing block, each ending with `;`; there is no new scope. So
+`let #name = ..;` declares a local of the enclosing block that later
+statements (and later copies) see, a plain `let tmp` in the body is
+shadowed by the next copy's `let tmp`, and `next`, `break` or `return` in
+a copy act on the enclosing handler or loop. Write `{ .. }` inside the body
+for a scope per copy. A spliced `#name` is an ordinary identifier at the
+place it lands: it resolves, and binds, exactly as if it had been written
+there. The same holds at module level and in a `vm`, where `#name`
+usually names an item (`fn #name`, `op #name`).
+
+Errors point into the original source: a token copied from the body keeps
+its position in the body, and a substituted token its position in the
+element list. Nested `inline for`s expand outside-in; an inner loop may
+use the outer variables in its element list, but may not reuse their
+names as its own variables. Inside a `vm` (also in handler and vm function
+bodies), a loop variable may not have the name of a state variable: it
+would replace every use of that name in the body.
 
 ### 1.5 Modules and interop
 
@@ -444,8 +517,9 @@ Rules for `-> never` vm functions:
   next part). A function that uses `next` can only be reached from op
   handlers, not from entries or `on raise`.
 - The body sees the vm state and its own parameters, but not the caller's
-  operands: pass `dst.raw` or values as arguments. `become` and `cache` are
-  not allowed, since they belong to the calling op.
+  operands: pass `dst.raw` or values as arguments. `become` is not
+  allowed, since it belongs to the calling op, and neither is `cache`;
+  pass the cache instead (`c: cache GlobalIC`, see below).
 - They can only be called where control words are allowed: op handlers,
   entries, `on raise`, and other `-> never` vm functions.
 
@@ -460,6 +534,45 @@ The shared copy is reached like an outlined cold block: the arguments, and
 the size `next` skips, go through thread-local slots, and the state stays
 in registers. `#[inline]` on the function inlines every call;
 `#[inline(never)]` makes every call in tail-call mode use the shared copy.
+
+**Passing the inline cache.** A vm function (either kind) can take the
+calling op's inline cache as a parameter of type `cache Name`, and the
+op passes `cache`:
+
+```loimi
+cache GlobalIC { version: u64, entry: ?*Entry }
+
+fn get_global(c: cache GlobalIC, dst: u64, key: Sym) -> never {
+    if let Some(e) = c.entry and c.version == ctx.globals.version {
+        regs[dst] = e.value; next
+    }
+    cold { regs[dst] = lookup_and_fill(c, key)?; next }
+}
+fn lookup_and_fill(c: cache GlobalIC, key: Sym) -> Result<Value, Value> { .. c.entry = Some(e); .. }
+
+op GETGLOBAL(dst: reg, key: kst) : ABx + GlobalIC { get_global(cache, dst.raw, key.as_sym()) }
+```
+
+`c` is a handle to the op's cache words: `c.field` reads and assigns
+them exactly as `cache.field` does in the op, with the same types and
+unaligned access for wide fields. The argument must be `cache` in an op
+whose cache has that layout, or another handle of the same layout (a vm
+function passing its `c` on); the handle is not a value otherwise
+(`c` alone, `let`, return types are errors). At run time it is the
+address of the instruction's first cache word, `pc + 1`:
+
+- in an inlined copy (hot call sites of `-> never` functions, and every
+  call of a plain vm function, which is always inlined), `c.field` folds
+  to the same `pc`-relative access as `cache.field`, so it costs nothing;
+- in a shared copy of a `-> never` function (calls from `cold` blocks,
+  recursive calls, `#[inline(never)]`), the address travels through a
+  thread-local slot like the other arguments. The shared copy therefore
+  reads and fills the cache of the instruction that called it, whichever
+  that is; every caller passes its own.
+
+A superinstruction part passes the part's own cache. `become` stays
+with the op: a helper that decides to re-specialize can return a value
+the op acts on.
 
 ### 3.6 Entries and the error path
 
@@ -670,16 +783,44 @@ and operand kinds unchanged.
 ### 7.1 Inline caches
 
 ```loimi
-cache PropIC { shape: weak ShapeId, slot: u32 }
+cache PropIC { shape: ?*Shape, slot: u32 }
 ```
 
 A cache is stored **inline in the code stream**, after the instruction (as in
 CPython 3.11+), and is attached with `+`: `op GETPROP(...) : ABC + PropIC`.
 `next` skips it automatically, the verifier forbids jumps into it, the builder
 reserves and zero-fills it, and the disassembler prints it. Inside the handler,
-`cache.shape` reads and writes the words directly. Fields marked `weak`
-don't keep their target alive. When the target dies, the GC resets the entry
-to zero, which the handler sees as a miss (`stdlib/gc.md` §8).
+`cache.shape` reads and writes the words directly.
+
+**Field types and sizes.** A field is an integer, a float, `bool`, a
+pointer, a function pointer, or an option of a pointer (`?*Shape`, None
+is null, which is what a zero-filled cache holds). Each field starts a
+new code word and takes as many words as its type needs: in a `u32`
+vm, `u32` and smaller take one word, and `u64`, `f64` and pointers take
+two, so `PropIC` above is three words and `op_size` of `GETPROP` is 4.
+In a `u64` vm every field is one word. The generated encoders
+(`Vm.emit.X` reserves and zeroes all of them), `op_size`, the verifier's
+walk (no jump may land in any of them) and `optimize` count the words.
+
+The code array is an array of words, so a two-word field is only
+word-aligned: handlers read and write it with unaligned loads and stores
+(`align 4`), which cost nothing extra on x86-64 and AArch64. Taking its
+address (`&cache.shape`) is an error, since the pointer would claim an
+alignment the field does not have; read the field, or assign it. Fields
+no wider than a word may still be passed by address. Wide fields are
+written with ordinary stores, which are not atomic if the code is shared
+between threads.
+
+**No GC references.** A cache field cannot hold `Gc<T>`, a `value` type
+or anything else the collector traces: the collector does not scan
+bytecode, so the reference would neither keep its target alive nor be
+updated if it moved. (`weak` fields, which the GC would clear when their
+target dies, are not implemented either.) Cache something whose
+lifetime the interpreter controls instead: a shape id that is never
+reused, a pointer to a structure that is never freed or moved (shapes
+kept alive by a table), or a version number, and validate it on use.
+Weak caching of GC objects belongs in the library, where it can be
+written as a side table that the root scanner or a sweeper clears.
 
 ### 7.1a The following instruction: `then`
 

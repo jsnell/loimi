@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format A { op: 8, a: 8 } }
+    op NOP(a: reg) : A { inline for pc in [1] { a = pc; } next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `inline for` variable `pc` has the name of a vm state variable

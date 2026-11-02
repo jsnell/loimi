@@ -1,0 +1,3 @@
+import type_alias_mod_priv.m;
+fn main() { let x: m.Hidden = 1; }
+// error: `Hidden` is private

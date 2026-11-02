@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u32 }
+    fn bump(c: cache IC) { c.n += 1; }
+    op NOP() : A + IC { bump(pc as *u32); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `c: cache IC` takes `cache` (in an op with cache `IC`) or a cache handle; found an expression

@@ -13,6 +13,9 @@ pub struct Parser {
     pub in_vm: bool,
     /// Parsing the type after `as`: `<` may be a comparison.
     cast_type: bool,
+    /// Variables of `inline for` statements expanded inside vm bodies,
+    /// checked against the vm's state names when the vm is complete.
+    pub vm_loop_vars: Vec<Ident>,
 }
 
 fn is_upper(s: &str) -> bool {
@@ -21,7 +24,7 @@ fn is_upper(s: &str) -> bool {
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Parser {
-        Parser { toks, pos: 0, no_struct: false, in_vm: false, cast_type: false }
+        Parser { toks, pos: 0, no_struct: false, in_vm: false, cast_type: false, vm_loop_vars: Vec::new() }
     }
 
     // ── token helpers ────────────────────────────────────────────────
@@ -158,9 +161,11 @@ impl Parser {
     /// body once per element, substituting each variable's tokens (wrapped
     /// in parentheses when more than one token). `#a` turns a string or
     /// identifier value into an identifier. The expansion is spliced into
-    /// the token stream in place of the construct.
-    /// Expand an `inline for`; returns its loop variables.
-    pub fn expand_inline_for(&mut self) -> Res<Vec<Ident>> {
+    /// the token stream in place of the construct; with `stmts` (in a
+    /// block), each copy is followed by `;`. Tokens keep their source
+    /// spans, so errors in the expansion point into the original source.
+    /// Returns the loop variables.
+    pub fn expand_inline_for(&mut self, stmts: bool) -> Res<Vec<Ident>> {
         let start = self.pos;
         let span = self.span();
         self.expect_kw("inline")?;
@@ -207,6 +212,22 @@ impl Parser {
         if body.is_empty() {
             body = vec![];
         }
+        // A nested `inline for` naming one of these variables would have its
+        // own variable replaced by our values.
+        for (i, t) in body.iter().enumerate() {
+            if t.tok == Tok::Ident("inline".into()) && body.get(i + 1).is_some_and(|n| n.tok == Tok::Ident("for".into())) {
+                for b in body[i + 2..].iter().take_while(|b| b.tok != Tok::Ident("in".into())) {
+                    if let Tok::Ident(v) = &b.tok {
+                        if vars.contains(v) {
+                            return Err(Diag::new(
+                                b.span,
+                                format!("nested `inline for` reuses the variable `{}` of an enclosing `inline for`", v),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let mut out = Vec::new();
         for values in &elements {
             let mut i = 0;
@@ -246,6 +267,12 @@ impl Parser {
                 out.push(t.clone());
                 i += 1;
             }
+            if stmts {
+                // Each copy ends a statement: `inline for r in [a, b] { f(r) }`
+                // is `f(a); f(b);`.
+                let sp = out.last().map(|t: &Token| t.span).unwrap_or(span);
+                out.push(Token { tok: Tok::Punct(";"), span: sp, space_before: false });
+            }
         }
         let end = self.pos;
         self.toks.splice(start..end, out);
@@ -283,7 +310,7 @@ impl Parser {
         let mut mod_attrs = Attrs::default();
         while *self.peek() != Tok::Eof {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
-                self.expand_inline_for()?;
+                self.expand_inline_for(false)?;
                 continue;
             }
             if self.is("#") && self.is_at(1, "!") {
@@ -406,6 +433,25 @@ impl Parser {
                 return self.err("`impl` takes no `pub`: impls are visible everywhere");
             }
             return Ok(Item::Impl(ImplDecl { trait_path, ty, span: start.to(self.prev_span()) }));
+        }
+        if self.is_kw("type") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            // `type Name = T;`, `type Map<V> = HashMap<str, V>;`
+            self.bump();
+            let name = self.ident()?;
+            let (generics, bounds) = self.parse_generics()?;
+            if let Some(b) = bounds.iter().flatten().next() {
+                return Err(Diag::new(
+                    b[0].span,
+                    "a type alias's parameters take no bounds; the aliased type's own bounds are checked where it is used",
+                ));
+            }
+            self.expect("=")?;
+            let ty = self.parse_type()?;
+            self.expect(";")?;
+            if !attrs.list.is_empty() {
+                return Err(Diag::new(attrs.list[0].2, "a type alias takes no attributes"));
+            }
+            return Ok(Item::TypeAlias(TypeAliasDecl { name, generics, ty, is_pub }));
         }
         if self.eat_kw("enum") {
             let name = self.ident()?;
@@ -616,6 +662,11 @@ impl Parser {
     }
 
     pub fn parse_type(&mut self) -> Res<TypeExpr> {
+        if self.in_vm && self.is_kw("cache") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            let start = self.bump().span;
+            let name = self.ident()?;
+            return Ok(TypeExpr { kind: TypeKind::Cache(name), span: start.to(self.prev_span()) });
+        }
         let start = self.span();
         let kind = if self.eat("*") {
             let _ = self.eat_kw("mut") || self.eat_kw("const");
@@ -715,6 +766,15 @@ impl Parser {
                 return self.err("unexpected end of file in block");
             }
             if self.eat(";") {
+                continue;
+            }
+            if self.is_kw("inline") && self.is_kw_at(1, "for") {
+                // Statements: the expansion becomes statements of this
+                // block (no scope of its own).
+                let vars = self.expand_inline_for(true)?;
+                if self.in_vm {
+                    self.vm_loop_vars.extend(vars);
+                }
                 continue;
             }
             stmts.push(self.parse_stmt()?);

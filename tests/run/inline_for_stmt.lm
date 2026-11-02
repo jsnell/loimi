@@ -1,0 +1,99 @@
+// `inline for` as a statement in function bodies, vm handlers and vm
+// functions. The copies are statements of the enclosing block (no scope
+// of their own), so `let #name` declares a local that later code sees.
+// matrix: dispatch
+import std.io;
+
+struct Regs { a: i64, b: i64, c: i64 }
+
+fn sum_fields(r: *Regs) -> i64 {
+    var total: i64 = 0;
+    inline for f in [a, b, c] {
+        total += r.f                  // field names are tokens too; `;` is optional
+    }
+    total
+}
+
+fn splices() -> i64 {
+    inline for (name, v) in [(x, 1), ("y", 2 + 3)] {
+        let #name = v * 10;           // `(2 + 3) * 10`: multi-token values are parenthesized
+    }
+    x + y                             // the spliced locals are visible after the loop
+}
+
+fn nested() -> i64 {
+    var acc: i64 = 0;
+    inline for i in [1, 2] {
+        inline for j in [10, 20] {
+            acc += i * j;
+        }
+    }
+    acc
+}
+
+fn in_blocks(k: i64) -> i64 {
+    let r = match k {
+        0 => {
+            var s: i64 = 0;
+            inline for v in [1, 2, 3] { if k == 0 { s += v; } }
+            s
+        }
+        _ => {
+            var p: i64 = 1;
+            inline for v in [2, 4] { p *= v; }
+            p
+        }
+    };
+    // `let` without a splice: each copy shadows the previous one.
+    inline for v in [4, 5] { let last = v; }
+    r * 100 + last
+}
+
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+
+    fn clear3(base: u64) {
+        inline for k in [0, 1, 2] { r[base + k] = 0; }
+    }
+
+    // Sum of three registers, one statement per register.
+    op SUM3(d: reg, a: reg, b: reg) : A {
+        var s: i64 = 0;
+        inline for x in [a, b] { s += x; }
+        d = s;
+        next
+    }
+    // Branchy handler built from a table: the first match exits.
+    op CLASSIFY(d: reg, a: reg) : A {
+        inline for (lim, code) in [(0, 100), (10, 200), (1000, 300)] {
+            if a < lim { d = code; next }
+        }
+        d = 400;
+        next
+    }
+    op CLEAR(base: reg) : A { clear3(base.raw); next }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *u32, regs: *i64) -> i64 { pc = c; r = regs; jump pc }
+}
+
+fn main() {
+    var regs = Regs { a: 1, b: 20, c: 300 };
+    io.print_int(sum_fields(&regs)); io.println("");
+    io.print_int(splices()); io.println("");
+    io.print_int(nested()); io.println("");
+    io.print_int(in_blocks(0)); io.println("");
+    io.print_int(in_blocks(1)); io.println("");
+    var code: [u32; 6] = [V.SUM3(2, 0, 1), V.CLASSIFY(3, 2), V.CLASSIFY(4, 0), V.SUM3(5, 3, 4), V.CLEAR(0), V.RET(5)];
+    var r: [i64; 6] = [3, 4, 0, 0, 0, 0];
+    io.print_int(V.run(&code[0], &r[0])); io.println("");
+    io.print_int(r[0] + r[1] + r[2]); io.println("");
+}
+// expect: 321
+// expect: 60
+// expect: 90
+// expect: 605
+// expect: 805
+// expect: 400
+// expect: 0

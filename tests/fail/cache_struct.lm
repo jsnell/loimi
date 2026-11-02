@@ -1,0 +1,10 @@
+struct P { a: u32, b: u32 }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { p: P }
+    op NOP() : A + IC { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: cache fields must be integers, floats, `bool`, pointers or function pointers

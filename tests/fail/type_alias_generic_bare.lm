@@ -1,0 +1,4 @@
+type Opt<T> = ?T;
+fn f(x: Opt) {}
+fn main() {}
+// error: type alias `Opt` takes 1 type argument(s), got 0

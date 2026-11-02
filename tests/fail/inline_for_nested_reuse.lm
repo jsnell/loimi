@@ -1,0 +1,6 @@
+fn main() {
+    inline for i in [1, 2] {
+        inline for i in [3] { let x = i; }
+    }
+}
+// error: nested `inline for` reuses the variable `i`

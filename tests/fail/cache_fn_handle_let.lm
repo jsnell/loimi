@@ -1,0 +1,9 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u32 }
+    op NOP() : A + IC { let p: cache IC = cache; next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: a `cache Name` handle can only be the type of a vm function parameter

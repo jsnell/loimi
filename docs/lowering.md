@@ -251,6 +251,14 @@ Notes:
 | `exit v` | `store v` to `ctx.exit`, `ret void`. The `musttail` chain unwinds straight back to the entry function |
 | `raise e` | `store e` to `ctx.pending`, `musttail call @Mini.on_raise` |
 
+**Inline cache fields** are places at `pc + 1 + offset` words. A field
+wider than a code word (a pointer in a `u32` vm) is loaded and stored
+with the word's alignment, `load ptr, ptr %p, align 4`, which x86-64 and
+AArch64 execute as one unaligned access. The size of each cache is a
+constant of the generated source (`Vm__CW_PropIC`, from `size_of` of the
+field types), so encoders, `op_size`, the verifier and `optimize` agree
+with the handlers.
+
 **Decode-ahead** only applies when every path through the handler ends in
 `next` without writing code. Handlers that `jump`, or that may `become`,
 dispatch after their body.

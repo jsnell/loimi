@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    cache IC { n: u32 }
+    fn bump() { cache.n += 1; }
+    op NOP() : A + IC { bump(); next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: declare a parameter `c: cache Name`

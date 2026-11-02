@@ -76,8 +76,12 @@ impl SourceMap {
     }
 
     pub fn render(&self, d: &Diag) -> String {
+        self.render_as("error", d)
+    }
+
+    pub fn render_as(&self, severity: &str, d: &Diag) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "error: {}", d.msg);
+        let _ = writeln!(out, "{}: {}", severity, d.msg);
         if (d.span.file as usize) < self.files.len() {
             self.snippet(&mut out, d.span, "");
         }
