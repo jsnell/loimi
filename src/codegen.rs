@@ -14,6 +14,15 @@ pub struct Options {
     pub overflow_checks: bool,
     /// Count executed ops and op pairs; print a report at exit.
     pub vm_stats: bool,
+    /// Building a library (`--lib`, `--shared`): no `main` wrapper.
+    pub library: bool,
+}
+
+/// Parameter or result attribute at a C-ABI boundary (`extern "C"`,
+/// `export "C"`): C passes `bool` as a byte holding 0 or 1, so the side
+/// that produces it must zero-extend the `i1`.
+pub fn c_abi_attr(t: &Ty) -> &'static str {
+    if *t == Ty::Bool { "zeroext " } else { "" }
 }
 
 pub struct Codegen<'p> {
@@ -240,11 +249,11 @@ impl<'p> Codegen<'p> {
         for (i, f) in p.fns.iter().enumerate() {
             if f.body.is_none() {
                 if f.linkage == Linkage::Extern {
-                    let mut ps: Vec<String> = f.param_tys.iter().map(|t| llty(p, t)).collect();
+                    let mut ps: Vec<String> = f.param_tys.iter().map(|t| format!("{} {}", llty(p, t), c_abi_attr(t)).trim_end().to_string()).collect();
                     if f.variadic {
                         ps.push("...".into());
                     }
-                    self.decls.insert(format!("declare {} @\"{}\"({})", ret_llty(p, &f.ret), f.symbol, ps.join(", ")));
+                    self.decls.insert(format!("declare {}{} @\"{}\"({})", c_abi_attr(&f.ret), ret_llty(p, &f.ret), f.symbol, ps.join(", ")));
                 }
                 continue;
             }
@@ -260,8 +269,9 @@ impl<'p> Codegen<'p> {
                 self.fns.push_str(&text);
             }
         }
-        // Program entry wrapper.
-        if let Some(m) = p.fns.iter().find(|f| f.symbol == "main.main" && f.body.is_some()) {
+        // Program entry wrapper. Libraries have none: the host calls the
+        // `export "C"` functions, and `os.arg_count()` is 0.
+        if let Some(m) = p.fns.iter().find(|f| f.symbol == "main.main" && f.body.is_some() && !self.opts.library) {
             let ret = &m.ret;
             let _ = writeln!(self.fns, "define i32 @main(i32 %argc, ptr %argv) {{");
             let _ = writeln!(self.fns, "  store i32 %argc, ptr @loimi.argc");
@@ -278,10 +288,11 @@ impl<'p> Codegen<'p> {
         }
         crate::vmgen::emit_tables(p, &mut self.globals, &mut self.fns);
         crate::gcgen::emit_runtime(&mut self);
+        crate::rtgen::emit_runtime(&mut self);
         crate::vmgen::emit_stats(&mut self);
         self.decls.insert("declare void @llvm.trap() noreturn");
-        let _ = writeln!(self.globals, "@loimi.argc = global i32 0");
-        let _ = writeln!(self.globals, "@loimi.argv = global ptr null");
+        let _ = writeln!(self.globals, "@loimi.argc = internal global i32 0");
+        let _ = writeln!(self.globals, "@loimi.argv = internal global ptr null");
         let _ = writeln!(self.fns, "define internal i32 @loimi_argc() {{\n  %v = load i32, ptr @loimi.argc\n  ret i32 %v\n}}");
         let _ = writeln!(self.fns, "define internal ptr @loimi_argv() {{\n  %v = load ptr, ptr @loimi.argv\n  ret ptr %v\n}}");
         self.decls.0.remove("loimi_argc");
@@ -436,7 +447,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let mut params = Vec::new();
         for (i, (&lid, t)) in f.params.iter().zip(f.param_tys.iter()).enumerate() {
             let pname = format!("%p{}", i);
-            params.push(format!("{} {}", llty(p, t), pname));
+            let attr = if f.linkage == Linkage::Export && self.cold.is_none() { c_abi_attr(t) } else { "" };
+            params.push(format!("{} {}{}", llty(p, t), attr, pname));
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
             self.live[0].push(lid);
@@ -498,9 +510,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "define {}{}{} @\"{}\"({}) {} {{",
+            "define {}{}{}{} @\"{}\"({}) {} {{",
             linkage,
             cc_str(f.cc),
+            if f.linkage == Linkage::Export && cold.is_none() && !through_slot { c_abi_attr(&f.ret) } else { "" },
             if through_slot { "void".to_string() } else { ret_llty(p, &f.ret) },
             symbol,
             params.join(", "),

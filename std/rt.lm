@@ -1,0 +1,32 @@
+// Runtime control for libraries: recovering from errors without exiting.
+//
+// A standalone interpreter can report a syntax error and exit; one that
+// is embedded in a host program must return to the host instead, even
+// from deep inside a recursive-descent parser that has no error path.
+// `protect` and `throw` are that escape hatch (setjmp/longjmp underneath):
+//
+//     fn parse_job(data: *u8) { ... throw() ... }
+//     if !rt.protect(parse_job, &job as *u8) { /* it threw */ }
+//
+// `throw` returns straight to the innermost `protect` on this thread.
+// The frames in between are abandoned: their `defer`s do not run and what
+// they allocated with `mem.alloc` leaks, so throw from code whose state
+// can be dropped (a parser's tables, for example). The protected function
+// has type `fn(*u8)` without effects, so it cannot collect, and no GC
+// roots are lost when its frames are skipped.
+
+extern "C" fn loimi_protect(f: fn(*u8), data: *u8) -> i32;
+extern "C" fn loimi_throw();
+
+/// Run `f(data)`. True if it returned, false if it (or anything it
+/// called) called `throw`.
+pub fn protect(f: fn(*u8), data: *u8) -> bool {
+    loimi_protect(f, data) != 0
+}
+
+/// Unwind to the innermost `protect` on this thread. Panics if there is
+/// none.
+pub fn throw() -> never {
+    loimi_throw();
+    unreachable
+}
