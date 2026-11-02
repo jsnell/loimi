@@ -3,7 +3,8 @@
 // Statements are parsed by recursive descent. Binary operators go through
 // std.parse's Pratt driver, with the parser's hooks for operands
 // (`atom`: primaries with their member/call/postfix suffixes) and for
-// building nodes. Assignment, `?:` and arrow functions sit above it.
+// building nodes. Assignment, `?:` and `x => ...` are `led` hooks of the
+// driver; `(a, b) => ...` is recognized in `primary` by looking ahead.
 
 import std.mem;
 import std.parse;
@@ -103,31 +104,33 @@ fn check_target(e: *Node) {
 
 pub fn Parser.new(toks: mem.Vec<Token>) -> Parser {
     var pr: parse.Pratt<Parser, T, *Node, str> = parse.Pratt.new(hook_peek, hook_advance, hook_atom, hook_unary, hook_binary);
-    pr.infix_left(T.QQ, 2);
-    pr.infix_left(T.PipePipe, 2);
-    pr.infix_left(T.AmpAmp, 3);
-    pr.infix_left(T.Pipe, 4);
-    pr.infix_left(T.Caret, 5);
-    pr.infix_left(T.Amp, 6);
-    pr.infix_left(T.EqEqEq, 7); pr.infix_left(T.NotEqEq, 7); pr.infix_left(T.EqEq, 7); pr.infix_left(T.NotEq, 7);
-    pr.infix_left(T.Lt, 8); pr.infix_left(T.Gt, 8); pr.infix_left(T.Le, 8); pr.infix_left(T.Ge, 8);
-    pr.infix_left(T.In, 8); pr.infix_left(T.Instanceof, 8);
-    pr.infix_left(T.Shl, 9); pr.infix_left(T.Shr, 9); pr.infix_left(T.UShr, 9);
-    pr.infix_left(T.Plus, 10); pr.infix_left(T.Minus, 10);
-    pr.infix_left(T.Star, 11); pr.infix_left(T.Slash, 11); pr.infix_left(T.Percent, 11);
-    pr.infix_right(T.StarStar, 14);
-    pr.prefix(T.Bang, 12); pr.prefix(T.Minus, 12); pr.prefix(T.Plus, 12); pr.prefix(T.Tilde, 12);
-    pr.prefix(T.Typeof, 12); pr.prefix(T.Void, 12); pr.prefix(T.Delete, 12);
-    pr.prefix(T.PlusPlus, 12); pr.prefix(T.MinusMinus, 12);
+    // Assignment and `?:` bind loosest and parse a full expression on
+    // their right (right-associative); `=>` binds tightest, to the name
+    // just before it.
+    var k = T.Assign as u64;
+    while k <= T.QQAssign as u64 { pr.led(k as T, 1, 0, led_assign); k += 1; }
+    pr.led(T.Question, 2, 0, led_cond);
+    pr.led(T.Arrow, 20, 0, led_arrow);
+    pr.infix_left(T.QQ, 3);
+    pr.infix_left(T.PipePipe, 3);
+    pr.infix_left(T.AmpAmp, 4);
+    pr.infix_left(T.Pipe, 5);
+    pr.infix_left(T.Caret, 6);
+    pr.infix_left(T.Amp, 7);
+    pr.infix_left(T.EqEqEq, 8); pr.infix_left(T.NotEqEq, 8); pr.infix_left(T.EqEq, 8); pr.infix_left(T.NotEq, 8);
+    pr.infix_left(T.Lt, 9); pr.infix_left(T.Gt, 9); pr.infix_left(T.Le, 9); pr.infix_left(T.Ge, 9);
+    pr.infix_left(T.In, 9); pr.infix_left(T.Instanceof, 9);
+    pr.infix_left(T.Shl, 10); pr.infix_left(T.Shr, 10); pr.infix_left(T.UShr, 10);
+    pr.infix_left(T.Plus, 11); pr.infix_left(T.Minus, 11);
+    pr.infix_left(T.Star, 12); pr.infix_left(T.Slash, 12); pr.infix_left(T.Percent, 12);
+    pr.infix_right(T.StarStar, 15);
+    pr.prefix(T.Bang, 13); pr.prefix(T.Minus, 13); pr.prefix(T.Plus, 13); pr.prefix(T.Tilde, 13);
+    pr.prefix(T.Typeof, 13); pr.prefix(T.Void, 13); pr.prefix(T.Delete, 13);
+    pr.prefix(T.PlusPlus, 13); pr.prefix(T.MinusMinus, 13);
     Parser { toks: toks, i: 0, pratt: pr, fun: null_func() }
 }
 
 // ── expressions ─────────────────────────────────────────────────────
-
-fn is_assign_op(k: T) -> bool {
-    let i = k as u64;
-    i >= T.Assign as u64 and i <= T.QQAssign as u64
-}
 
 /// Index of the token after the `)` matching the `(` at `p.i`.
 fn Parser.after_parens(p: *Parser) -> u64 {
@@ -146,34 +149,28 @@ fn Parser.after_parens(p: *Parser) -> u64 {
     j
 }
 
+/// An AssignmentExpression: assignment, `?:`, arrows and everything
+/// below them, through the Pratt driver.
 pub fn Parser.assign(p: *Parser) -> *Node {
-    // Arrow functions.
-    if p.kind() == T.Name and p.kind_at(1) == T.Arrow { return p.arrow(); }
-    if p.kind() == T.LParen {
-        let j = p.after_parens();
-        if j < p.toks.len and p.toks.at(j).kind == T.Arrow { return p.arrow(); }
-    }
-    let lhs = p.cond();
-    let k = p.kind();
-    if is_assign_op(k) {
-        check_target(lhs);
-        p.next();
-        let rhs = p.assign();
-        let n = new_node(K.Assign, lhs.line, lhs.pos);
-        n.op = k;
-        n.a = lhs;
-        n.b = rhs;
-        return n;
-    }
-    lhs
-}
-
-fn Parser.cond(p: *Parser) -> *Node {
-    let c = match p.pratt.parse(p, 0) {
+    match p.pratt.parse(p, 0) {
         Ok(n) => n,
         Err(m) => fail(p.line(), m),
-    };
-    if !p.accept(T.Question) { return c; }
+    }
+}
+
+/// `lhs op= rhs` (the operator is consumed).
+fn led_assign(p: *Parser, k: T, lhs: *Node) -> Result<*Node, str> {
+    check_target(lhs);
+    let rhs = p.assign();
+    let n = new_node(K.Assign, lhs.line, lhs.pos);
+    n.op = k;
+    n.a = lhs;
+    n.b = rhs;
+    Ok(n)
+}
+
+/// `c ? t : f` (the `?` is consumed).
+fn led_cond(p: *Parser, k: T, c: *Node) -> Result<*Node, str> {
     let t = p.assign();
     p.expect(T.Colon, "':'");
     let f = p.assign();
@@ -181,7 +178,18 @@ fn Parser.cond(p: *Parser) -> *Node {
     n.a = c;
     n.b = t;
     n.c = f;
-    n
+    Ok(n)
+}
+
+/// `x => body` (the `=>` is consumed).
+fn led_arrow(p: *Parser, k: T, param: *Node) -> Result<*Node, str> {
+    if param.kind != K.Name { fail(param.line, "unexpected '=>'"); }
+    let n = new_node(K.Func, param.line, param.pos);
+    let f = new_func("", param.line, param.pos, p.fun);
+    f.arrow = true;
+    f.params.push(ast.new_var(param.text, VK.Param, f));
+    p.arrow_body(n, f);
+    Ok(n)
 }
 
 pub fn Parser.expr(p: *Parser) -> *Node { p.assign() }
@@ -196,17 +204,19 @@ fn Parser.expr_seq(p: *Parser) -> *Node {
     n
 }
 
+/// `(params) => body`, at the `(`.
 fn Parser.arrow(p: *Parser) -> *Node {
     let n = p.node(K.Func);
     let f = new_func("", p.line(), p.pos(), p.fun);
     f.arrow = true;
-    if p.kind() == T.Name {
-        f.params.push(ast.new_var(p.next().text, VK.Param, f));
-    } else {
-        p.expect(T.LParen, "'('");
-        p.params(f);
-    }
+    p.expect(T.LParen, "'('");
+    p.params(f);
     p.expect(T.Arrow, "'=>'");
+    p.arrow_body(n, f);
+    n
+}
+
+fn Parser.arrow_body(p: *Parser, n: *Node, f: *Func) {
     let saved = p.fun;
     p.fun = f;
     if p.kind() == T.LBrace {
@@ -216,7 +226,6 @@ fn Parser.arrow(p: *Parser) -> *Node {
     }
     p.fun = saved;
     n.fun = f;
-    n
 }
 
 /// Parameter names up to and including `)`.
@@ -284,6 +293,8 @@ fn Parser.primary(p: *Parser) -> *Node {
         True => { p.next(); new_node(K.True, line, pos) }
         False => { p.next(); new_node(K.False, line, pos) }
         LParen => {
+            let j = p.after_parens();
+            if j < p.toks.len and p.toks.at(j).kind == T.Arrow { return p.arrow(); }
             p.next();
             let e = p.expr();
             p.expect(T.RParen, "')'");

@@ -364,8 +364,11 @@ It is only produced when `.attributes = true`; otherwise it is `never` and the
 `tests/run/std_obj_gc.lm` (random operations checked against a host-side
 model, collecting after every operation in stress mode) and
 `tests/run/std_obj_ic.lm` (a `GETPROP` family in a vm, all dispatch
-modes) and `tests/run/std_obj_generic.lm` (the ready-made `obj.Obj<V>`
-under GC stress); `bench/obj` measures a cache hit.
+modes), `tests/run/std_obj_sites.lm` (the cache state machine in a vm),
+`tests/run/std_obj_stable.lm` (stable ids, dead prototypes),
+`tests/run/std_obj_attrs.lm` (attributes, key order) and
+`tests/run/std_obj_generic.lm` (the ready-made `obj.Obj<V>` under GC
+stress); `bench/obj` measures a cache hit.
 
 ### No `Model` configuration; the object type is generic or the interpreter's
 
@@ -410,7 +413,7 @@ puts in the `Model` are fixed or dropped:
 | Design option | As implemented |
 |---|---|
 | `.key` | `u64`: symbol ids (`text.Interner`) or other integers that stay meaningful while shapes use them. Keys are not traced. |
-| `.attributes` | not supported (no attribute bits, no `SetError`) |
+| `.attributes` | a u32 of bits per property, meaning chosen by the interpreter; no `SetError` |
 | `.prototypes` | `.in_shape`: one root shape per (prototype, inline count). Objects without prototypes use `root(n)`. |
 | `.ordered` | always: `keys` returns insertion order in both modes |
 | `.inline_slots` | per allocation: the object's `inline.len`, which must match the root shape's count (`root(n)`, `root_for(proto, n)`, `template_root(&t)`) |
@@ -419,34 +422,75 @@ puts in the `Model` are fixed or dropped:
 
 ### Shapes
 
-`Shape { id, count, inline_cap, key, proto, parent, ... }`. Property *i*
-(in insertion order) lives in slot index *i*: `inline[i]` below the
-inline count, `overflow.data[i - inline_cap]` above. A cache stores a
-SlotRef: the index, or the overflow index with bit 31 (`obj.OUT`) set,
-computed by `obj.slot_ref(i, cap)`.
+`Shape { id, count, inline_cap, flags, key, attrs, proto, parent, table }`.
+Property *i* (in insertion order) lives in slot index *i*: `inline[i]`
+below the inline count, `overflow.data[i - inline_cap]` above. A cache
+stores a SlotRef: the index, or the overflow index with bit 31
+(`obj.OUT`) set, computed by `obj.slot_ref(i, cap)`.
 
-- **Transitions** are weak. A shape's first child is stored inline
-  (`child_key`, `child` as an address), further ones in an open-addressed
-  `Edges` object. Children keep their parent alive through `parent`. A
-  sweeper (`Heap.add_sweeper`) clears edges to shapes that were not
-  marked, and drops dead entries from the table of root shapes; the
-  references are turned back into `Gc<Shape>` through a private `value`
-  type, the only way to make a reference from bits.
-- **Ids are never reused**: a u32 counter (0 is an empty cache,
-  `DICT_ID` = `0xFFFFFFFF` the dictionary shape). A stale id in a cache
-  can never match a live object, so caches need no reset after a
-  collection, and the weak-cache-reset machinery of gc.md §8 (not built
-  in std.gc) is not needed. The cost is that 4 billion shape creations
-  abort the process.
-- **Pinning**: `m.shapes.pin(sh)` keeps a shape (and so its ancestors
-  and its id) alive for good. Without it a shape dies with its last
-  object, and the next object built the same way gets a new id, which a
-  cache sees as a new shape; an interpreter pins the shapes its caches
-  record so that sites stay monomorphic across collections (MiniJS's
-  deltablue went megamorphic without it).
+- **Transitions** are one global open-addressed table from (parent id,
+  key, attributes) to (child id, child address); root shapes are entries
+  with parent 0 and the key (prototype address, inline count, PROTO
+  flag). The child address is weak: children keep their parent alive
+  through `parent`, nothing keeps a child alive but its objects (and the
+  targets of cached adds). A sweeper (`Heap.add_sweeper`) clears the
+  address of every entry whose shape was not marked; references are
+  turned back into `Gc<Shape>` through a private `value` type, the only
+  way to make a reference from bits.
+- **Stable ids.** The sweeper keeps the *id* of a dead shape's entry, and
+  a shape rebuilt along the same path (the next object built the same
+  way after a collection) gets the same id back (`shapes.reborn` counts
+  these). An id therefore names a transition path, which fixes the
+  layout, so a cache entry holding it can be stale but never wrong; no
+  id is ever given to a different path, and caches need no reset after a
+  collection (the weak-cache machinery of gc.md §8 is not needed). Ids
+  come from a u32 counter (0 is an empty cache, `DICT_ID` =
+  `0xFFFFFFFF` the dictionary shape); 4 billion distinct paths abort the
+  process.
+- **The trade-off: memory for cache stability.** Each remembered dead
+  path costs a 32-byte entry (the table is at most half full), but no
+  shape object: dead shapes are freed. `shapes.retain` (default 65536)
+  bounds the dead entries; past it the sweeper forgets all of them
+  (`shapes.forgotten`), and those paths get new ids, which caches see as
+  new shapes. `retain = 0` is the old behaviour (ids die with their
+  shapes; MiniJS's deltablue went megamorphic that way, as its
+  constraint graph is rebuilt again and again); the default costs at
+  most about 4 MB for programs that build many distinct shapes, and
+  nothing for the others. The alternatives considered: keeping shapes
+  alive while their parent lives (strong edges) costs whole shape objects
+  (80 bytes plus lookup tables) and still loses the tree when its root
+  dies; pinning (what MiniJS did) keeps every cached shape forever;
+  an epoch scheme needs to know which caches still hold an id, which the
+  hit path cannot afford to record.
+- **The prototype's identity** is part of the root key, as an address. A
+  prototype that dies and a new one at the same address share root ids
+  and so all shape ids. That is harmless for own properties (same path,
+  same layout) and for prototype hits, whose validity cell dies with the
+  old prototype (below). `tests/run/std_obj_stable.lm` builds exactly
+  this case.
 - **Lookup**: chains of up to 8 properties are walked; longer ones build
-  a key → index `Table` on first lookup and keep it on the shape (one
-  table per shape; tables are not shared along a chain).
+  a key → (index, attributes) `Table` on first lookup and keep it on the
+  shape (one table per shape; tables are not shared along a chain).
+
+### Attributes and key order
+
+Every property has a u32 of attribute bits whose meaning is the
+interpreter's (MiniJS: bit 0 = not enumerable). They are part of the
+transition key, so they are part of the shape: `m.define(o, key, v,
+attrs)` adds or redefines, `m.set_attrs(o, key, attrs)` moves a fast
+object to the shape with the new attributes (its slots stay put; in
+dictionary mode the entry changes), `m.attrs(o, key)` reads them and
+`m.keys_where(o, &out, skip)` lists the keys with none of the `skip`
+bits. Write caches are not filled for properties with the bits in
+`m.ic.readonly`, so read-only properties and accessors can be checked in
+the interpreter's slow path.
+
+Key order is insertion order in both modes. JavaScript's order (integer
+indices first, ascending, then the rest in insertion order) is
+`obj.index_keys_first(&keys, data, index_of)`, given the interpreter's
+"is this key an array index" function (stable merge sort). Which keys
+are indices is the interpreter's knowledge (MiniJS's keys are interned
+strings); std.obj has no elements store.
 
 ### Objects and dictionary mode
 
@@ -460,47 +504,67 @@ Deleting the last property added steps back to the parent shape.
 Deleting any other property, or adding one past `dict_threshold`,
 switches to dictionary mode: the object gets the shared dictionary shape
 (id `DICT_ID`, never cached) and a `Dict` (an open-addressed index over
-entries kept in insertion order). Values stay in the object's slots; the
-dictionary maps keys to slot indices. When the entry array is full it is
-rebuilt without deleted entries, moving values down to keep slots dense.
-`m.optimize(o)` turns a dictionary-mode object with at most
-`dict_threshold` properties back into a fast one; `m.to_dict(o)` forces
-dictionary mode.
+entries kept in insertion order, each a key and slot | attributes << 32).
+Values stay in the object's slots; the dictionary maps keys to slot
+indices. When the entry array is full it is rebuilt without deleted
+entries, moving values down to keep slots dense. `m.optimize(o)` turns a
+dictionary-mode object with at most `dict_threshold` properties back
+into a fast one; `m.to_dict(o)` forces dictionary mode.
 
 ### Inline caches
 
 The vm declares the cache words and does the check itself, so the hit
-path stays in the handler:
+path stays in the handler. std.obj runs the state machine of section 5
+in its slow paths, over six cache words laid out as an `obj.Site`:
 
 ```loimi
-cache PropIC { shape: u32, slot: u32 }
+cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
 family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
     generic {
-        dst = get_slow(ctx, o, key, &cache.shape, &cache.slot);   // calls m.get_fill
-        if cache.shape != obj.EMPTY_ID {
-            if cache.slot & obj.OUT == 0 { become GETPROP_IN; } else { become GETPROP_OUT; }
-        }
-        next
+        let (v, st) = ctx.m.read_miss(&cache.sid as *obj.Site, obj.IcState.Generic, x, k);
+        ..   // become the member for `st`
     }
     GETPROP_IN {
-        if let O(x) = o and x.shape.id == cache.shape { dst = ctx.m.load_inline(x, cache.slot); next }
-        cold { become GETPROP; redo }
+        if let O(x) = o and x.shape.id == cache.sid { dst = x.inline.ptr[cache.slot]; next }
+        cold { become GETPROP_MISS; redo }   // read_miss(.., IcState.OwnIn, ..)
     }
-    GETPROP_OUT { .. ctx.m.load_out(x, cache.slot & !obj.OUT) .. }
+    GETPROP_OUT  { .. ctx.m.load_out(x, cache.slot & !obj.OUT) .. }
+    GETPROP_P    { .. x.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(x, cache.slot, cache.cell, cache.depth) .. }
+    GETPROP_POLY { .. ctx.m.poly_get(x, cache.ent) .. }
+    GETPROP_MEGA { .. ctx.m.mega_get(x, key) .. }
 }
 ```
 
-- `m.get_fill(o, key, &shape_word, &slot_word)` and `m.set_fill(..)`: the
-  slow paths, which fill the two words for an own property of a
-  fast-mode object.
-- `obj.Poly`: up to four (shape id, SlotRef) pairs with no GC references,
-  for a side table or eight cache words.
-- `obj.MegaCache`: direct-mapped (shape id, key) → SlotRef, shared by
-  megamorphic sites (`m.get_mega(&mc, o, key)`). Not cleared on GC, since
-  ids are not reused.
-- The miss counting and the EMPTY → MONO → POLY → MEGA policy are left to
-  the vm (a family member per state, as above); there is no
-  `Model.ic.on_miss`.
+- `IcState` names the members: `Generic`, `OwnIn`, `OwnOut`, `Proto`,
+  `Poly`, `Mega`, and `Add` for write sites.
+- `m.read_miss(site, state, o, key)` reads through the chain and returns
+  the value and the next state. A monomorphic site that misses is
+  refilled `m.ic.refills` times (default 8: many sites are monomorphic
+  per program phase), then becomes polymorphic, keeping its old hit. A
+  `Poly` entry (eight hits, in `m.ic.poly`, indexed by `site.ent`) that
+  fills up starts over `m.ic.resets` times (default 8), then the site
+  goes megamorphic.
+- A hit is an `obj.Hit { sid, slot, cell, depth }` of plain words: for
+  own properties `cell` is 0; for prototype hits it is the validity cell
+  of the receiver's prototype and `depth` the number of `proto` links to
+  the holder. `m.read(o, key, &hit)` fills one, `m.hit(o, &hit)` checks
+  one.
+- The megamorphic cache `m.ic.mega` (an `obj.MegaCache`, 4096 entries)
+  is direct-mapped on (shape id, key) and holds own and prototype hits.
+  It is never cleared: ids name layouts, and prototype hits carry their
+  cell. `m.get_mega(&c, o, key)` is the own-property-only variant for
+  object types without a `proto` field.
+- `m.write_miss(site, o, key, v)` stores and returns `OwnIn`/`OwnOut`
+  for an existing property of a fast-mode object, or `Add` when the
+  property was added into an inline slot: the cache holds the old shape
+  id, the slot, and (in `site.ent`) the new shape, kept alive in a table
+  the model marks. `m.add_hit(o, ent, slot, v)` is the hit after the
+  shape check: a store and a shape change, with no check that the object
+  needs its validity cell invalidated, because objects with cells have
+  shapes of their own (below).
+- `m.get_fill(o, key, &shape_word, &slot_word)` and `m.set_fill(..)` are
+  the slow paths of a vm that only wants monomorphic own-property caches
+  (`tests/run/std_obj_ic.lm`).
 
 A hit costs two dependent loads (`o.shape`, `shape.id`), a compare
 against the cache word and the slot load: 0.8 ns over a register move on
@@ -513,24 +577,35 @@ an i7-6700 (`bench/obj/README.md`, which shows the machine code).
 value; `m.set_proto(o, p)` moves a fast object to the matching shape in
 `p`'s tree.
 
-A prototype hit is cached in a `ProtoEntry<O> { sid, slot, cell, holder }`
-by `m.get_proto_fill(o, key, &entry)` and checked by `m.proto_hit(o,
-&entry)`: receiver shape id equal, cell valid, then the holder's slot.
-The cell is that of the receiver's prototype, from `m.cell(p)`:
+A prototype hit is checked by `m.proto_load(o, slot, cell, depth)` after
+the receiver's shape compare: the cell's byte, then `depth` loads of
+`proto` and the slot load. The cell is that of the receiver's prototype,
+from `m.cell(p)`:
 
-- Cells live in a weak side table keyed by the object's address, so
-  objects need no cell field and only objects some cache depends on have
-  one.
-- A new cell for `p` registers with the cell of `p.proto` (created if
-  needed), so the cells of a chain form a tree; each cell keeps its
-  parent cell alive.
-- Adding or deleting a property of an object with a cell, switching it to
-  or compacting its dictionary, or changing its prototype invalidates its
-  cell and, recursively, the cells registered under it. Storing a new
-  value into an existing property does not.
-
-The entry holds GC references (the cell and the holder), so it must live
-somewhere traced; `ProtoEntry.mark(h)` marks it from a scanner.
+- A cell is an id: a byte in `shapes.cvalid` (1 while valid) and links
+  to its parent cell and its children. Ids are not reused (the table
+  grows by 17 bytes per cell made; cells are only made for prototypes
+  that a cache reads through, again after each invalidation). Cell 0 is
+  never valid.
+- Cells live in a side table keyed by the object's address, weak in the
+  object: when the object dies the sweeper invalidates its cell, so a
+  new object at the same address (which gets the same shape ids) cannot
+  revive old hits.
+- A new cell for `p` registers under the cell of `p.proto` (created if
+  needed). Adding, deleting or changing the attributes of a property of
+  an object with a cell, switching it to or compacting its dictionary,
+  or changing its prototype invalidates its cell and, recursively, the
+  cells under it. Storing a new value into an existing property does
+  not.
+- An object that gets a cell (and every object above it) moves to the
+  **prototype tree**: the same keys and slots under a root flagged
+  `obj.PROTO` (`m.make_proto(o)`, which interpreters may also call when
+  an object becomes a prototype). Its shape ids therefore never equal
+  those of ordinary objects, which is what makes `add_hit` safe, and
+  `m.add` only looks up a cell for flagged objects. `m.is_proto(o)`
+  tells.
+- The holder is found by walking from the receiver, not stored: the
+  cell's validity guarantees the chain is the one the hit was made on.
 
 ### Allocation templates
 
@@ -541,17 +616,16 @@ finished object has (capped at `max_inline`, 32).
 
 ### Not built
 
-- Attributes (writable/enumerable/configurable) and `SetError`.
+- `SetError`: attributes are bits the interpreter interprets.
 - Elements (integer-indexed storage) and arrays.
 - `Globals` with property cells: a cell object would have to hold the
   interpreter's `Value`, so it is the interpreter's type; Mini's
   `GETGLOBAL` slot cache plays this role today.
 - Iteration with mutation semantics (`on_iter_mutation`): `keys` copies
   the keys out.
-- Sharing lookup tables along a transition chain, and transition caching
-  for property *adds* (a cache that goes from the old shape to the new
-  one in one step).
-- `Model.ic.on_miss` and per-site miss counters.
+- Sharing lookup tables along a transition chain.
+- The state machine reads a `proto` field, so object types without one
+  can use the monomorphic helpers and `get_mega` only.
 
 ### Effects
 

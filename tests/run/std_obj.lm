@@ -133,8 +133,9 @@ fn caches(w: *World) {
     yes("not filled", ds == obj.EMPTY_ID and b.shape.id != cs);
     // Polymorphic and megamorphic.
     var p = obj.Poly.new();
-    yes("poly add", p.add(a.shape.id, cr));
-    yes("poly get", p.get(a.shape.id).is_some() and p.get(12345).is_none());
+    var ha = obj.Hit { sid: a.shape.id, slot: cr, cell: 0, depth: 0 };
+    yes("poly add", p.add(&ha));
+    yes("poly find", p.find(a.shape.id).is_some() and p.find(12345).is_none());
     var mc = obj.MegaCache.new(256);
     show("mega miss", int(w.m.get_mega(&mc, a, X)));
     yes("mega filled", mc.get(a.shape.id, X).is_some());
@@ -159,23 +160,33 @@ fn protos(w: *World) {
         Proto(h, _) => yes("found on mid", h == mid),
         _ => io.println("wrong"),
     }
-    var e: obj.ProtoEntry<Gc<Obj>> = obj.ProtoEntry.empty();
-    show("fill", int(w.m.get_proto_fill(o1, METHOD, &e)));
-    show("hit on o2", int(w.m.proto_hit(o2, &e)));
-    show("miss on o3", int(w.m.proto_hit(o3, &e)));
+    let mid_sid = mid.shape.id;
+    var e = obj.Hit.empty();
+    show("fill", int(w.m.read(o1, METHOD, &e)));
+    yes("cached on o1's shape", e.sid == o1.shape.id and e.cell != 0 and e.depth == 2);
+    // Prototypes with cells moved to the prototype tree; o1 did not.
+    yes("protos flagged", w.m.is_proto(mid) and w.m.is_proto(base) and !w.m.is_proto(o1));
+    yes("mid's shape changed", mid.shape.id != mid_sid and mid.shape.count == 1);
+    show("mid.x", int(w.m.get(mid, X)));
+    show("hit on o2", int(w.m.hit(o2, &e)));
+    show("miss on o3", int(w.m.hit(o3, &e)));
     // Overwriting the value on the holder keeps the entry valid.
     w.m.set(base, METHOD, Value.Int(2));
-    show("value change", int(w.m.proto_hit(o2, &e)));
+    show("value change", int(w.m.hit(o2, &e)));
     // Shadowing on mid invalidates it.
     w.m.set(mid, METHOD, Value.Int(3));
-    show("after shadowing", int(w.m.proto_hit(o2, &e)));
-    show("refill", int(w.m.get_proto_fill(o1, METHOD, &e)));
-    show("hit", int(w.m.proto_hit(o2, &e)));
+    show("after shadowing", int(w.m.hit(o2, &e)));
+    show("refill", int(w.m.read(o1, METHOD, &e)));
+    yes("depth 1", e.depth == 1);
+    show("hit", int(w.m.hit(o2, &e)));
     // A change above the holder (a new key on base) invalidates too.
-    w.m.get_proto_fill(o1, X, &e);
-    show("hit x", int(w.m.proto_hit(o2, &e)));
+    w.m.read(o1, X, &e);
+    show("hit x", int(w.m.hit(o2, &e)));
     w.m.set(base, Z, Value.Int(0));
-    show("after base change", int(w.m.proto_hit(o2, &e)));
+    show("after base change", int(w.m.hit(o2, &e)));
+    // Own properties: cell 0.
+    w.m.read(o1, Y, &e);
+    yes("own hit", e.cell == 0 and int(w.m.hit(o2, &e)) == 2);
     // Changing a prototype moves the object to the new prototype's tree.
     w.m.set_proto(o3, Some(mid));
     yes("o3 now like o1", o3.shape.id == o1.shape.id);
@@ -202,20 +213,24 @@ fn weak(w: *World) uses gc {
     let a = w.obj(None, 3);
     keep.push(a);
     w.m.set(a, X, Value.Int(1));
+    var id5000: u32 = 0;
     for i in 0..200 {
         let t = w.obj(None, 3);
         w.m.set(t, X, Value.Int(1));
         w.m.set(t, (5000 + i) as u64, Value.Int(2));
+        if i == 0 { id5000 = t.shape.id; }
     }
     let created = w.m.shapes.created;
+    let swept = w.m.shapes.swept;
     gc.collect(&w.heap);
-    show("swept edges", w.m.shapes.swept as i64);
+    yes("swept shapes", w.m.shapes.swept - swept >= 200);
     let b = w.obj(None, 3);
     keep.push(b);
     w.m.set(b, X, Value.Int(1));
     yes("x shape kept", a.shape.id == b.shape.id);
     w.m.set(b, 5000, Value.Int(2));
     yes("new shape made", w.m.shapes.created == created + 1);
+    yes("with the old id", b.shape.id == id5000);
     show("b", int(w.m.get(b, 5000)));
     gc.collect(&w.heap);
     show("a.x", int(w.m.get(a, X)));
@@ -269,7 +284,7 @@ fn main() uses gc {
 // expect: dict get 3
 // expect: not filled true
 // expect: poly add true
-// expect: poly get true
+// expect: poly find true
 // expect: mega miss 1
 // expect: mega filled true
 // expect: mega hit 1
@@ -277,20 +292,27 @@ fn main() uses gc {
 // expect: chain 1
 // expect: found on mid true
 // expect: fill 1
+// expect: cached on o1's shape true
+// expect: protos flagged true
+// expect: mid's shape changed true
+// expect: mid.x 5
 // expect: hit on o2 1
 // expect: miss on o3 -2
 // expect: value change 2
 // expect: after shadowing -2
 // expect: refill 3
+// expect: depth 1 true
 // expect: hit 3
 // expect: hit x 5
 // expect: after base change -2
+// expect: own hit true
 // expect: o3 now like o1 true
 // expect: o3.x 5
 // expect: o3.y 3
 // expect: template inline 5
-// expect: swept edges 200
+// expect: swept shapes true
 // expect: x shape kept true
 // expect: new shape made true
+// expect: with the old id true
 // expect: b 2
 // expect: a.x 1

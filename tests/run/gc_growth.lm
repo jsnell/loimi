@@ -1,0 +1,81 @@
+// std.gc's growth policy: after a collection the budget is `growth`
+// percent of the live bytes, but at least `min_heap`. A larger growth
+// factor means fewer collections for the same work.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+struct World { heap: gc.Heap, keep: ?Gc<Node> }
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let w = data as *World;
+    if let Some(n) = w.keep { gc_mark(h, n); }
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t = 0;
+    var c = l;
+    while let Some(n) = c { t += n.value; c = n.next; }
+    t
+}
+
+/// Keep a list of `live` nodes, then allocate `garbage` more nodes,
+/// collecting whenever the budget is exhausted. Returns the number of
+/// collections.
+fn run(w: *World, live: i64, garbage: i64) -> u64 uses gc {
+    w.keep = None;
+    for i in 0..live { w.keep = Some(new(&w.heap, Node { value: i, next: w.keep })); }
+    gc.collect(&w.heap);
+    let c0 = w.heap.collections;
+    for i in 0..garbage {
+        new(&w.heap, Node { value: i, next: None });
+        gc.maybe_collect(&w.heap);
+    }
+    io.print_int(sum(w.keep)); io.println("");
+    w.heap.collections - c0
+}
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), keep: None };
+    w.heap.add_scanner(&w as *u8, scan);
+    io.print_int(w.heap.growth as i64); io.println("");
+
+    // Default: 100%, min 1 MiB. 100000 live nodes of 48 bytes are about
+    // 4.8 MB, so each collection allows about 4.8 MB of new allocation.
+    w.heap.set_growth(100, 1 << 20);
+    let a = run(&w, 100000, 1000000);
+    // Threshold after a collection is the live size.
+    io.print_bool(w.heap.threshold == w.heap.live_bytes); io.println("");
+
+    // 300%: about a third as many collections.
+    w.heap.set_growth(300, 1 << 20);
+    io.print_bool(w.heap.threshold == w.heap.live_bytes * 3); io.println("");
+    let b = run(&w, 100000, 1000000);
+    io.print_bool(b * 2 < a); io.println("");
+    io.print_bool(b > 0); io.println("");
+
+    // A large minimum dominates for a small live set.
+    w.heap.set_growth(100, 64 << 20);
+    io.print_bool(w.heap.threshold == 64 << 20); io.println("");
+    let c = run(&w, 10, 1000000);
+    io.print_int(c as i64); io.println("");
+
+    // Stress mode ignores the policy; leaving it restores the budget.
+    w.heap.set_stress(true);
+    io.print_int(w.heap.threshold as i64); io.println("");
+    w.heap.set_stress(false);
+    io.print_bool(w.heap.threshold == 64 << 20); io.println("");
+}
+// expect: 100
+// expect: 4999950000
+// expect: true
+// expect: true
+// expect: 4999950000
+// expect: true
+// expect: true
+// expect: true
+// expect: 45
+// expect: 0
+// expect: 0
+// expect: true

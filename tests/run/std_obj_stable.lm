@@ -1,0 +1,121 @@
+// std.obj: shape ids are stable across collections. A shape dies with its
+// last object, but its transition-table entry keeps the id, and an object
+// built the same way afterwards gets a shape with the same id, so caches
+// keep hitting. `retain` bounds the dead ids kept (0: none). A cached
+// prototype hit is not fooled when its prototype dies and a new one takes
+// its address (and so the same shape ids): the dead prototype's validity
+// cell died with it.
+import std.io;
+import std.gc;
+import std.mem;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<obj.Obj<Value>>) }
+
+struct World {
+    heap: gc.Heap,
+    m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value>,
+    keep: mem.Vec<Gc<obj.Obj<Value>>>,
+}
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let w = data as *World;
+    for i in 0..w.keep.len { gc_mark(h, w.keep.at(i)); }
+}
+
+/// The shape id of a fresh object with properties 1, 2, 3 (then dropped).
+fn World.build(w: *World) -> u32 {
+    let none: ?Gc<obj.Obj<Value>> = None;
+    let o = obj.new_obj(&w.heap, w.m.root(4), none, 4);
+    w.m.set(o, 1, Value.Int(1));
+    w.m.set(o, 2, Value.Int(2));
+    w.m.set(o, 3, Value.Int(3));
+    o.shape.id
+}
+
+fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); io.println(""); }
+
+/// A prototype with a method (key 10) and a receiver with key 1; reads
+/// the method through a cache. Both are dropped.
+fn World.proto_hit(w: *World, h: *obj.Hit) -> u64 {
+    let none: ?Gc<obj.Obj<Value>> = None;
+    // 6 inline slots: a size class nothing else here uses, so the next
+    // such object after a collection takes this one's address.
+    let p = obj.new_obj(&w.heap, w.m.root(6), none, 6);
+    w.m.set(p, 10, Value.Int(7));
+    let r = obj.new_obj(&w.heap, w.m.root_for(Some(p), 2), Some(p), 2);
+    w.m.set(r, 1, Value.Int(1));
+    w.m.read(r, 10, h);
+    p as u64
+}
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), m: obj.Model.new(obj.new_slots<Value>, Value.Nil), keep: mem.Vec.new() };
+    w.m.attach(&w.heap);
+    w.heap.add_scanner(&w as *u8, scan);
+
+    // Same path, same id, after the shapes died.
+    let a = w.build();
+    let created = w.m.shapes.created;
+    gc.collect(&w.heap);
+    let b = w.build();
+    yes("same id", a == b);
+    yes("shapes were rebuilt", w.m.shapes.created == created + 4 and w.m.shapes.reborn == 4);
+
+    // Without retention the dead ids are forgotten: a new id.
+    w.m.shapes.retain = 0;
+    gc.collect(&w.heap);
+    yes("forgotten", w.m.shapes.forgotten >= 4);
+    let c = w.build();
+    yes("new id", c != a);
+    w.m.shapes.retain = 1 << 16;
+
+    // A live object keeps its shape; a dead one's id comes back.
+    let none: ?Gc<obj.Obj<Value>> = None;
+    let o = obj.new_obj(&w.heap, w.m.root(4), none, 4);
+    w.keep.push(o);
+    w.m.set(o, 1, Value.Int(1));
+    let d = w.build();
+    gc.collect(&w.heap);
+    gc.collect(&w.heap);
+    yes("kept", w.build() == d);
+
+    // A cached prototype hit whose prototype died never hits again, even
+    // on a new receiver of the same layout under a new prototype at the
+    // old address.
+    var e = obj.Hit.empty();
+    let pa = w.proto_hit(&e);
+    yes("filled", e.sid != 0 and e.cell != 0 and w.m.shapes.valid(e.cell));
+    let cells = w.m.shapes.cells.len;
+    gc.collect(&w.heap);
+    yes("cell died with its object", !w.m.shapes.valid(e.cell) and w.m.shapes.cells.len < cells);
+    var hits: u64 = 0;
+    var reused: u64 = 0;
+    var same: u64 = 0;
+    for i in 0..50 {
+        let p2 = obj.new_obj(&w.heap, w.m.root(6), none, 6);
+        w.m.set(p2, 10, Value.Int(99));
+        let r2 = obj.new_obj(&w.heap, w.m.root_for(Some(p2), 2), Some(p2), 2);
+        w.m.set(r2, 1, Value.Int(1));
+        if (p2 as u64) == pa {
+            reused += 1;
+            if r2.shape.id == e.sid {
+                same += 1;
+                if w.m.hit(r2, &e).is_some() { hits += 1; }
+            }
+        }
+        gc.collect(&w.heap);
+    }
+    yes("address reused, same shape id", reused > 0 and same == reused);
+    yes("no stale hit", hits == 0);
+    w.keep.free();
+}
+// expect: same id true
+// expect: shapes were rebuilt true
+// expect: forgotten true
+// expect: new id true
+// expect: kept true
+// expect: filled true
+// expect: cell died with its object true
+// expect: address reused, same shape id true
+// expect: no stale hit true

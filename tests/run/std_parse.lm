@@ -1,6 +1,8 @@
 // std.parse: a Pratt parser for a Lua-like expression grammar, used twice
 // (building S-expressions and evaluating), with tokens from std.lex and
-// errors rendered by std.diag.
+// errors rendered by std.diag. `led` hooks add a ternary `c ? a : b`,
+// right-associative assignment `x = e` (to names only) and a postfix
+// factorial `n!`.
 
 import std.io;
 import std.diag;
@@ -10,7 +12,7 @@ import std.num;
 import std.parse;
 import std.text;
 
-enum T { Eof, Num, Name, Plus, Minus, Star, Slash, Caret, Concat, Eq, Lt, And, Or, Not, LParen, RParen }
+enum T { Eof, Num, Name, Plus, Minus, Star, Slash, Caret, Concat, Eq, Lt, And, Or, Not, LParen, RParen, Question, Colon, Bang, Assign }
 
 /// Parser state: the cursor, the current token, and the operator table
 /// (which `atom` needs for parenthesized expressions).
@@ -54,8 +56,8 @@ fn new_parser<E>(src: str, file: u32) -> P<E> {
         cur: lex.Cursor.new(src, file, lex.lua()), ops: lex.OpTable.new(), kws: lex.Keywords.new(),
         kind: T.Eof, start: 0, value: 0.0, hooks: 0, arena: mem.Arena.new(), pratt: 0 as *parse.Pratt<P<E>, T, E, lex.Error>,
     };
-    let ops = ["+", "-", "*", "/", "^", "..", "==", "<", "(", ")"];
-    let kinds = [T.Plus, T.Minus, T.Star, T.Slash, T.Caret, T.Concat, T.Eq, T.Lt, T.LParen, T.RParen];
+    let ops = ["+", "-", "*", "/", "^", "..", "==", "<", "(", ")", "?", ":", "!", "="];
+    let kinds = [T.Plus, T.Minus, T.Star, T.Slash, T.Caret, T.Concat, T.Eq, T.Lt, T.LParen, T.RParen, T.Question, T.Colon, T.Bang, T.Assign];
     for i in 0..ops.len { p.ops.add(ops[i], kinds[i]); }
     p.kws.add("and", T.And);
     p.kws.add("or", T.Or);
@@ -79,6 +81,26 @@ fn lua_operators<E>(pr: *parse.Pratt<P<E>, T, E, lex.Error>) {
     pr.infix_right(T.Caret, 10);
 }
 
+/// The custom operators: `=` and `?:` bind loosest (as tight as `or`, so
+/// `a or b ? c : d` is `(a or b) ? c : d`) and take a full expression on
+/// their right, which makes them right-associative; `!` binds tightest.
+fn led_operators<E>(pr: *parse.Pratt<P<E>, T, E, lex.Error>, cond: fn(*P<E>, T, E) -> Result<E, lex.Error>,
+                    assign: fn(*P<E>, T, E) -> Result<E, lex.Error>, fact: fn(*P<E>, T, E) -> Result<E, lex.Error>) {
+    pr.led(T.Assign, 1, 0, assign);
+    pr.led(T.Question, 1, 0, cond);
+    pr.led(T.Bang, 11, 0, fact);
+}
+
+/// The two branches of `c ? a : b` (the `?` is consumed).
+fn branches<E>(p: *P<E>) -> Result<(E, E), lex.Error> {
+    let r = p.pratt.infix_of(T.Question).right;
+    let a = p.pratt.parse(p, r)?;
+    if p.kind != T.Colon { return Err(p.error("expected ':'")); }
+    p.advance()?;
+    let b = p.pratt.parse(p, r)?;
+    Ok((a, b))
+}
+
 fn peek<E>(p: *P<E>) -> T { p.kind }
 
 fn advance<E>(p: *P<E>) -> Result<(), lex.Error> { p.advance() }
@@ -97,7 +119,7 @@ fn paren<E>(p: *P<E>) -> Result<E, lex.Error> {
 fn op_text(k: T) -> str {
     match k {
         Plus => "+", Minus => "-", Star => "*", Slash => "/", Caret => "^", Concat => "..",
-        Eq => "==", Lt => "<", And => "and", Or => "or", Not => "not", _ => "?",
+        Eq => "==", Lt => "<", And => "and", Or => "or", Not => "not", Bang => "!", Assign => "=", _ => "?",
     }
 }
 
@@ -135,6 +157,24 @@ fn sx_binary(p: *P<str>, op: T, l: str, r: str) -> Result<str, lex.Error> {
     Ok(s)
 }
 
+fn sx_cond(p: *P<str>, op: T, c: str) -> Result<str, lex.Error> {
+    let (a, b) = branches(p)?;
+    var t = text.StrBuf.new();
+    t.push_str("(? "); t.push_str(c); t.push(' '); t.push_str(a); t.push(' '); t.push_str(b); t.push(')');
+    let s = p.arena.str(t.as_str());
+    t.free();
+    Ok(s)
+}
+
+/// `name = expr`: the left operand must be a name (an S-expression atom).
+fn sx_assign(p: *P<str>, op: T, l: str) -> Result<str, lex.Error> {
+    if l.len == 0 or l[0] == '(' or lex.is_digit(l[0]) { return Err(p.error("cannot assign to this")); }
+    let r = p.pratt.parse(p, p.pratt.infix_of(op).right)?;
+    sx_binary(p, T.Assign, l, r)
+}
+
+fn sx_fact(p: *P<str>, op: T, l: str) -> Result<str, lex.Error> { sx_unary(p, op, l) }
+
 /// Counts its calls, to show the hook runs once per infix operator.
 fn sx_before(p: *P<str>, op: T, l: str) -> Result<str, lex.Error> {
     p.hooks += 1;
@@ -151,6 +191,7 @@ fn show_with(sm: *diag.SourceMap, src: str, hook: bool) {
     var pr: parse.Pratt<P<str>, T, str, lex.Error> = parse.Pratt.new(peek, advance, sx_atom, sx_unary, sx_binary);
     if hook { pr.before_rhs = Some(sx_before); }
     lua_operators(&pr);
+    led_operators(&pr, sx_cond, sx_assign, sx_fact);
     p.pratt = &pr;
     let r: Result<str, lex.Error> = match p.advance() {
         Ok(_) => match pr.expr(&p) {
@@ -209,10 +250,25 @@ fn ev_binary(p: *P<f64>, op: T, a: f64, b: f64) -> Result<f64, lex.Error> {
     })
 }
 
+fn ev_cond(p: *P<f64>, op: T, c: f64) -> Result<f64, lex.Error> {
+    let (a, b) = branches(p)?;
+    Ok(if c != 0.0 { a } else { b })
+}
+
+fn ev_assign(p: *P<f64>, op: T, l: f64) -> Result<f64, lex.Error> { Err(p.error("cannot assign to a number")) }
+
+fn ev_fact(p: *P<f64>, op: T, n: f64) -> Result<f64, lex.Error> {
+    var r = 1.0;
+    var i = 2.0;
+    while i <= n { r = r * i; i += 1.0; }
+    Ok(r)
+}
+
 fn eval(src: str) {
     var p: P<f64> = new_parser(src, 0);
     var pr: parse.Pratt<P<f64>, T, f64, lex.Error> = parse.Pratt.new(peek, advance, ev_atom, ev_unary, ev_binary);
     lua_operators(&pr);
+    led_operators(&pr, ev_cond, ev_assign, ev_fact);
     p.pratt = &pr;
     var b = text.StrBuf.new();
     b.push_str(src);
@@ -246,6 +302,16 @@ fn main() {
     eval("2 ^ 3 ^ 2");
     eval("-(2 + 3) * 2 < 0");
     eval("1 .. 2");
+    // led hooks.
+    show_with(&sm, "a or b ? c + 1 : d ? e : f", true);
+    show(&sm, "x = y = a < b ? 1 : 2");
+    show(&sm, "c ? x = 1 : y = 2");
+    show(&sm, "-n! ^ 2 + 3!");
+    show(&sm, "a + b = c");
+    show(&sm, "a ? b");
+    eval("3! + (1 < 2 ? 10 : 20) * 2");
+    eval("0 ? 1 : 0 ? 2 : 3");
+    eval("1 = 2");
 }
 // expect: (+ 1 (* 2 3))
 // expect: (- (- 1 2) 3)
@@ -275,3 +341,18 @@ fn main() {
 // expect: 2 ^ 3 ^ 2 = 512
 // expect: -(2 + 3) * 2 < 0 = 1
 // expect: 1 .. 2 = operator not supported by the evaluator
+// expect: (? (or a b) (+ c 1) (? d e f)) hooks: 2
+// expect: (= x (= y (? (< a b) 1 2)))
+// expect: (? c (= x 1) (= y 2))
+// expect: (+ (- (^ (! n) 2)) (! 3))
+// expect: error: cannot assign to this
+// expect:   --> expr:1:9
+// expect:     1 | a + b = c
+// expect:       |         ^
+// expect: error: expected ':'
+// expect:   --> expr:1:6
+// expect:     1 | a ? b
+// expect:       |      ^
+// expect: 3! + (1 < 2 ? 10 : 20) * 2 = 26
+// expect: 0 ? 1 : 0 ? 2 : 3 = 3
+// expect: 1 = 2 = cannot assign to a number

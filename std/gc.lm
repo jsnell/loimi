@@ -55,8 +55,16 @@ pub struct Heap {
     count: u64,
     live_bytes: u64,
     allocated: u64,
+    /// Collect when `allocated` exceeds this (set after each collection
+    /// from `growth` and `min_heap`).
     threshold: u64,
+    /// The smallest allocation budget between collections, in bytes.
     min_heap: u64,
+    /// The allocation budget after a collection, in percent of the live
+    /// bytes: 100 (the default) collects again after allocating as much
+    /// as survived, so the heap peaks at about twice the live data; 200
+    /// lets it reach three times, and halves the number of collections.
+    growth: u64,
     stack: mem.Vec<*u8>,
     scanners: mem.Vec<Scanner>,
     collections: u64,
@@ -78,6 +86,7 @@ pub fn Heap.new() -> Heap {
         allocated: 0,
         threshold: 1 << 20,
         min_heap: 1 << 20,
+        growth: 100,
         stack: mem.Vec.new(),
         scanners: mem.Vec.new(),
         collections: 0,
@@ -262,14 +271,29 @@ pub fn collect(h: *Heap) uses gc {
     h.count = kept;
     h.live_bytes = live;
     h.allocated = 0;
-    h.threshold = if h.stress { 0 } else if live > h.min_heap { live } else { h.min_heap };
+    h.threshold = if h.stress { 0 } else { budget(h, live) };
     h.collections += 1;
+}
+
+/// Bytes that may be allocated after a collection that left `live` bytes.
+fn budget(h: *Heap, live: u64) -> u64 {
+    let b = live / 100 * h.growth + live % 100 * h.growth / 100;
+    if b > h.min_heap { b } else { h.min_heap }
+}
+
+/// Set the growth policy: after a collection, allocate `percent` percent
+/// of the live bytes (at least `min_heap` bytes) before the next one.
+/// Takes effect now for the current budget too.
+pub fn Heap.set_growth(h: *Heap, percent: u64, min_heap: u64) {
+    h.growth = percent;
+    h.min_heap = min_heap;
+    if !h.stress { h.threshold = budget(h, h.live_bytes); }
 }
 
 /// Stress mode: collect at every safepoint (finds missing roots quickly).
 pub fn Heap.set_stress(h: *Heap, on: bool) {
     h.stress = on;
-    h.threshold = if on { 0 } else { h.min_heap };
+    h.threshold = if on { 0 } else { budget(h, h.live_bytes) };
 }
 
 /// Collect if enough has been allocated since the last collection.

@@ -53,6 +53,12 @@ pub struct Syntax {
     /// Hexadecimal integer literals wrap modulo 2^64 (Lua) instead of being
     /// an error when too large for i64.
     hex_wraps: bool,
+    /// Bytes allowed anywhere in an identifier besides `[A-Za-z0-9_]`
+    /// (digits still not first): "$" for JavaScript.
+    ident_extra: str,
+    /// Bytes allowed in an identifier after its first byte only: "?!" for
+    /// Ruby-style `empty?`, "-" for CSS-style names, "'" for Haskell.
+    ident_inner: str,
 }
 
 /// No comments; C-style escapes; overflowing literals are errors.
@@ -61,6 +67,7 @@ pub fn none() -> Syntax {
         line_comment: "", block_open: "", block_close: "", nested_comments: false,
         long_comments: false, octal_escapes: true, escaped_newline_kept: false,
         multiline_strings: false, int_overflow_to_float: false, hex_wraps: false,
+        ident_extra: "", ident_inner: "",
     }
 }
 
@@ -78,12 +85,21 @@ pub fn lua() -> Syntax {
     s
 }
 
-/// C, Java, JavaScript: `//` and non-nesting `/* */` comments, octal `\ddd`.
+/// C, Java: `//` and non-nesting `/* */` comments, octal `\ddd`.
 pub fn c_like() -> Syntax {
     var s = none();
     s.line_comment = "//";
     s.block_open = "/*";
     s.block_close = "*/";
+    s
+}
+
+/// JavaScript: `c_like()` with `$` in identifiers; decimal literals too
+/// large for i64 become floats (all JS numbers are doubles).
+pub fn js() -> Syntax {
+    var s = c_like();
+    s.ident_extra = "$";
+    s.int_overflow_to_float = true;
     s
 }
 
@@ -115,6 +131,10 @@ pub struct Cursor {
     line: u32,
     file: u32,
     syntax: Syntax,
+    /// Byte sets (256 bits) of identifier start and continuation bytes,
+    /// from `syntax`.
+    id_start: [u64; 4],
+    id_char: [u64; 4],
 }
 
 /// A saved position, for backtracking.
@@ -123,8 +143,31 @@ pub struct Mark { pos: u64, line: u32 }
 /// A cursor at the start of `src`, which is file `file` of a diag.SourceMap
 /// (use 0 if there is no map). The text is borrowed.
 pub fn Cursor.new(src: str, file: u32, syntax: Syntax) -> Cursor {
-    Cursor { src: src, pos: 0, line: 1, file: file, syntax: syntax }
+    var c = Cursor { src: src, pos: 0, line: 1, file: file, syntax: syntax, id_start: [0; 4], id_char: [0; 4] };
+    for i in 0..256 {
+        let b = i as u8;
+        if is_ident_start(b) { set_bit(&c.id_start, b); }
+        if is_ident_char(b) { set_bit(&c.id_char, b); }
+    }
+    let x = syntax.ident_extra;
+    for i in 0..x.len { set_bit(&c.id_start, x[i]); set_bit(&c.id_char, x[i]); }
+    let y = syntax.ident_inner;
+    for i in 0..y.len { set_bit(&c.id_char, y[i]); }
+    c
 }
+
+fn set_bit(s: *[u64; 4], b: u8) {
+    let i = (b >> 6) as u64;
+    s[i] = s[i] | (1 << ((b & 63) as u64));
+}
+
+fn has_bit(s: *[u64; 4], b: u8) -> bool { (s[(b >> 6) as u64] >> ((b & 63) as u64)) & 1 != 0 }
+
+/// Can `ch` start an identifier under this cursor's syntax?
+pub fn Cursor.is_ident_start(c: *Cursor, ch: u8) -> bool { has_bit(&c.id_start, ch) }
+
+/// Can `ch` continue an identifier under this cursor's syntax?
+pub fn Cursor.is_ident_char(c: *Cursor, ch: u8) -> bool { has_bit(&c.id_char, ch) }
 
 pub fn Cursor.at_end(c: *Cursor) -> bool { c.pos >= c.src.len }
 
@@ -300,12 +343,14 @@ pub fn Cursor.long_string(c: *Cursor) -> Result<str, Error> {
 
 // ── identifiers ─────────────────────────────────────────────────────
 
-/// Scan an identifier (`[A-Za-z_][A-Za-z0-9_]*`) if one starts here.
+/// Scan an identifier (`[A-Za-z_][A-Za-z0-9_]*`, plus the bytes in
+/// `syntax.ident_extra` and, after the first byte, `syntax.ident_inner`)
+/// if one starts here.
 pub fn Cursor.ident(c: *Cursor) -> ?str {
-    if !is_ident_start(c.peek()) { return None; }
+    if c.pos >= c.src.len or !c.is_ident_start(c.src[c.pos]) { return None; }
     let start = c.pos;
     c.pos += 1;
-    while c.pos < c.src.len and is_ident_char(c.src[c.pos]) { c.pos += 1; }
+    while c.pos < c.src.len and c.is_ident_char(c.src[c.pos]) { c.pos += 1; }
     Some(c.src[start..c.pos])
 }
 
@@ -319,8 +364,8 @@ pub fn Cursor.at_number(c: *Cursor) -> bool {
 /// Scan a numeral: hexadecimal integer (`0x1F`), decimal integer (`42`) or
 /// decimal float (`4.2`, `.5`, `5.`, `1e-3`), converted exactly with
 /// std.num. Out-of-range literals follow `syntax.int_overflow_to_float`
-/// and `syntax.hex_wraps`. Letters, digits or `_` directly after a numeral
-/// make it malformed (`3abc`, `0x`, `1e`).
+/// and `syntax.hex_wraps`. Identifier bytes directly after a numeral make
+/// it malformed (`3abc`, `0x`, `1e`).
 pub fn Cursor.number(c: *Cursor) -> Result<num.Number, Error> {
     let start = c.pos;
     let hex = c.peek() == '0' and (c.peek_at(1) == 'x' or c.peek_at(1) == 'X');
@@ -330,8 +375,8 @@ pub fn Cursor.number(c: *Cursor) -> Result<num.Number, Error> {
     } else {
         c.pos += num.decimal_len(c.src[c.pos..c.src.len]);
     }
-    if c.pos == start or is_ident_char(c.peek()) {
-        while is_ident_char(c.peek()) or c.peek() == '.' { c.pos += 1; }
+    if c.pos == start or (c.pos < c.src.len and c.is_ident_char(c.src[c.pos])) {
+        while c.pos < c.src.len and (c.is_ident_char(c.src[c.pos]) or c.src[c.pos] == '.') { c.pos += 1; }
         return Err(c.error_at(start, "malformed number"));
     }
     let s = c.since(start);

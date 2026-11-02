@@ -146,8 +146,12 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
 - `Syntax` holds the per-language conventions: line comment prefix, block
   comment delimiters (optionally nesting), Lua long-bracket comments, octal
   or decimal `\ddd`, whether backslash-newline keeps the newline, raw
-  newlines in strings, and whether overflowing decimal/hex literals become
-  floats/wrap or are errors. Presets: `lua()`, `c_like()`, `none()`.
+  newlines in strings, whether overflowing decimal/hex literals become
+  floats/wrap or are errors, and extra identifier bytes: `ident_extra`
+  (anywhere, `"$"` for JavaScript) and `ident_inner` (after the first
+  byte: `"?!"`, `"-"`). Presets: `lua()`, `c_like()`, `js()`, `none()`.
+  The cursor turns the identifier classes into 256-bit sets
+  (`cursor.is_ident_start(b)`, `cursor.is_ident_char(b)`).
 - `Cursor`: `peek`, `peek_at`, `bump`, `advance`, `eat`, `eat_str`, `op`,
   `starts_with`, `eat_while(fn(u8) -> bool)`, `since`, `span_from`,
   `save`/`restore`, and `line` tracking. Character classes are ASCII.
@@ -178,7 +182,14 @@ at run time (`infix_left(k, bp)`, `infix_right(k, bp)`, `infix(k, l, r)`,
 `prefix(k, bp)`), and `parse(p, min_bp)` calls the user's `peek`,
 `advance`, `atom`, `unary` and `binary` functions and an optional
 `before_rhs` hook (where a single-pass compiler puts the left operand in a
-register or emits the jump of `and`/`or`). Postfix operators belong in
+register or emits the jump of `and`/`or`). Operators that are not
+`lhs op rhs` get a per-kind `led` hook (`led(k, left, right, hook)`):
+when the operator binds, the driver consumes it and the hook parses the
+rest and returns the result. That covers mixfix (`c ? a : b`), postfix
+(`n!`) and right-hand sides with their own grammar (assignment with a
+target check, `x => body`); the hook parses operands with
+`pr.parse(p, pr.infix_of(k).right)`. MiniJS parses assignment, `?:` and
+arrows this way. Postfix chains such as calls and indexing can stay in
 `atom`. A hook that needs to recurse (parentheses) reaches the table through
 a pointer in `P`. The hooks' types have no effects, so `parse` has none
 and runs from any function: hooks may allocate but not collect (collect
@@ -315,6 +326,20 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
 **As implemented**: root scanners and sweepers (`Heap.add_scanner`,
 `add_sweeper`) are `fn(*Heap, *u8)` without effects: they run during a
 collection and must not start one, so a `uses gc` function is rejected.
+The growth policy is `Heap.set_growth(percent, min_heap)`: after a
+collection, `percent`% of the live bytes (at least `min_heap`) may be
+allocated before the next one. The default, 100% and 1 MiB, collects
+again after allocating as much as survived (the heap peaks at about twice
+the live data). MiniJS uses 300% with an 8 MiB minimum (as fast as
+100% / 64 MiB, a quarter of the memory on small heaps; see
+`examples/minijs/README.md`). The default stays because no setting was
+better for every interpreter (best of 3-7, wall clock, loaded machine):
+Mini at 200% runs binary_trees 17% faster (1.21 to 1.01 s) and the rest
+within noise; Scheme at 200% runs nboyer, graphs and mperm 4-10% faster
+but string 27% slower (41 to 52 ms) and primes and array1 3-4% slower;
+an 8 MiB minimum makes Scheme's small allocation-heavy programs (deriv,
+divrec, cpstak) 6-10% slower, as the heap leaves the CPU caches. Mini
+and Scheme can opt in with `set_growth`.
 
 ## `std.obj`: objects and shapes
 
@@ -330,10 +355,13 @@ Full design: [`stdlib/obj.md`](stdlib/obj.md).
   global `MegaCache`), validity cells for prototype-chain hits, and property
   cells for globals.
 
-**As implemented** (`std/obj.lm`): shapes with weak transitions, inline
-and overflow slots, dictionary mode, prototype chains with validity cells,
-monomorphic/polymorphic/megamorphic cache helpers and allocation
-templates. There is no comptime `Model` configuration and object types
+**As implemented** (`std/obj.lm`): shapes with weak transitions and ids
+that stay stable across collections (an id names a transition path),
+inline and overflow slots, dictionary mode, per-property attribute bits,
+prototype chains with validity cells (plain ids, so a prototype hit is a
+few plain words), the inline-cache state machine (`obj.Site`,
+`read_miss`/`write_miss`: refill, polymorphic, megamorphic, cached
+property adds) and allocation templates. There is no comptime `Model` configuration and object types
 cannot be generic, so the interpreter declares its object type (fields
 `shape`, `dict`, `overflow`, optionally `proto`, and trailing `inline:
 [Value]`) and a slot-array type, and instantiates the generic

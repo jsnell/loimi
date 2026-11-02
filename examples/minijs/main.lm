@@ -30,10 +30,14 @@ fn stats(c: *Ctx) {
     var b = text.StrBuf.new();
     b.push_str("shapes created ");
     b.push_int(c.m.shapes.created as i64);
-    b.push_str(", poly sites ");
-    b.push_int(c.poly.len as i64);
-    b.push_str(", proto entries ");
-    b.push_int(c.pent.len as i64);
+    b.push_str(" (");
+    b.push_int(c.m.shapes.reborn as i64);
+    b.push_str(" under a kept id), poly sites ");
+    b.push_int(c.m.ic.poly.len as i64);
+    b.push_str(", add sites ");
+    b.push_int(c.m.shapes.adds.len as i64);
+    b.push_str(", validity cells ");
+    b.push_int((c.m.shapes.cvalid.len - 1) as i64);
     b.push_str(", collections ");
     b.push_int(c.heap.collections as i64);
     io.eprintln(b.as_str());
@@ -53,7 +57,10 @@ fn main() -> i32 {
     ctx.init();
     builtins.install(&ctx);
     if os.arg(2).is_some() { ctx.heap.set_stress(true); }
-    if run(&ctx, prelude.source()) and run(&ctx, src) {
+    if !run(&ctx, prelude.source()) { return 1; }
+    // The prelude's methods are not enumerable, like the natives.
+    ctx.hide_all(ctx.arr_proto());
+    if run(&ctx, src) {
         ctx.flush();
         stats(&ctx);
         return 0;
