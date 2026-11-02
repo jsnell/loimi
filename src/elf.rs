@@ -38,6 +38,9 @@ const K_HELPER: u16 = 7;
 /// A stencil's own code: arg is an offset into its hot part followed by
 /// its cold part (which the JIT places apart).
 const K_SELF: u16 = 8;
+/// A constant of a `const` operand (a 64-bit hole): arg as for K_FIELD,
+/// patched with the pool entry the field indexes.
+const K_CONST: u16 = 9;
 
 struct Section {
     name: String,
@@ -193,6 +196,8 @@ impl Cx<'_> {
                         (K_WORD, r.parse::<u64>().map_err(|_| format!("bad hole {}", s.name))?)
                     } else if let Some(r) = s.name.strip_prefix("__jit.f.") {
                         (K_FIELD, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
+                    } else if let Some(r) = s.name.strip_prefix("__jit.c.") {
+                        (K_CONST, parse_field(r).ok_or(format!("bad hole {}", s.name))?)
                     } else if let Some(r) = s.name.strip_prefix("__jit.n.") {
                         (K_NEXT, r.parse::<i64>().map_err(|_| format!("bad hole {}", s.name))? as u64)
                     } else if let Some(r) = s.name.strip_prefix("__jit.j.") {
@@ -448,7 +453,8 @@ pub fn stencil_tables(obj: Vec<u8>, ops: &[(u32, String)], nops: u32, ir: &str) 
     let _ = writeln!(ir, "@loimi_jit_drelocs = constant [{} x {{ i32, i16, i16, i64, i64 }}] [{}]", dl.len(), dl.join(", "));
     let _ = writeln!(ir, "@loimi_jit_ndrelocs = constant i32 {}", dl.len());
     let mut st = Vec::new();
-    for i in 0..=nops {
+    let last = ops.iter().map(|o| o.0).max().unwrap_or(0).max(nops);
+    for i in 0..=last {
         let (o, l, r, nr, t, h, present) = match stencils.get(&i) {
             Some(&(o, l, r, nr, t, h)) => (o, l, r, nr, t, h, 1),
             None => (0, 0, 0, 0, -1, 0, 0),

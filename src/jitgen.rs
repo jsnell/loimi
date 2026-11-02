@@ -44,6 +44,102 @@ pub struct StencilGen {
     pub part_offs: Vec<u32>,
     /// The part being emitted.
     pub part: usize,
+    /// Per part: its fields of `const` operand kinds (shift, bits).
+    pub consts: Vec<Vec<(u32, u32)>>,
+    /// The constant pool's state local (`k`), if the vm has const kinds.
+    pub pool: Option<LocalId>,
+    /// Raw locals of const operands decoded so far: their hole (word
+    /// offset from the head, shift, bits).
+    pub const_raws: Vec<(LocalId, (u32, u32, u32))>,
+    /// A variant stencil for constants of one tag: the constant's bits
+    /// satisfy `bits & mask == value` (or `bits < value` if `ult`).
+    pub variant: Option<(u64, u64, bool)>,
+}
+
+/// A stencil variant of an op for constants of one tag of a value type
+/// (`copy-and-patch.md` section 12): the op's handler with its const
+/// operand's tag known, so that LLVM folds the checks on it. The runtime
+/// picks it when the constant matches (`loimi_jit_variants`).
+#[derive(Clone, Debug)]
+pub struct ConstVariant {
+    /// The op's index in the vm.
+    pub op: usize,
+    /// Stencil name suffix: `OP.v.Tag`.
+    pub name: String,
+    /// The const field (shift, bits).
+    pub field: (u32, u32),
+    pub mask: u64,
+    pub value: u64,
+    pub ult: bool,
+}
+
+/// Whether to emit stencil variants per constant tag (on unless
+/// `LOIMI_JIT_VARIANTS=0` at build time).
+pub fn variants_enabled() -> bool {
+    std::env::var_os("LOIMI_JIT_VARIANTS").is_none_or(|v| v != "0")
+}
+
+/// The stencil variants of vm `vi`: for each op (not a super) with one
+/// const operand of a one-word value type, one per variant of that type
+/// its handler tests for (the variants named in its patterns).
+pub fn const_variants(p: &Program, vi: usize) -> Vec<ConstVariant> {
+    let vd = &p.vms[vi];
+    let mut out = Vec::new();
+    if !variants_enabled() {
+        return out;
+    }
+    let Some(b) = vd.const_base else { return out };
+    let Ty::Ptr(elem) = &vd.state_tys[b] else { return out };
+    let Ty::Value(vix) = **elem else { return out };
+    let d = &p.values[vix as usize];
+    if d.repr == ValueRepr::Boxed {
+        return out;
+    }
+    fn tags(pat: &TPat, vix: u32, out: &mut Vec<u32>) {
+        match &pat.kind {
+            TPK::Variant(i, subs) => {
+                if pat.ty == Ty::Value(vix) && !out.contains(i) {
+                    out.push(*i);
+                }
+                subs.iter().for_each(|s| tags(s, vix, out));
+            }
+            TPK::Tuple(xs) | TPK::Or(xs) => xs.iter().for_each(|s| tags(s, vix, out)),
+            _ => {}
+        }
+    }
+    let low = |b: u32| if b >= 64 { u64::MAX } else { (1u64 << b) - 1 };
+    for (k, o) in vd.ops.iter().enumerate() {
+        if !o.parts.is_empty() || o.consts.len() != 1 {
+            continue;
+        }
+        let mut ts = Vec::new();
+        crate::tirwalk::for_each_bind(p.fns[o.fid as usize].body.as_ref().unwrap(), &mut |s| {
+            if let crate::tirwalk::BindSite::Pat(pat) = s {
+                tags(pat, vix, &mut ts);
+            }
+        });
+        ts.sort();
+        for t in ts {
+            let v = &d.variants[t as usize];
+            let (mask, value, ult) = match d.repr {
+                ValueRepr::NanBox if v.unboxed => (0, d.num_limit, true),
+                ValueRepr::NanBox => {
+                    // The payload's bits: narrower integers are stored
+                    // zero-extended.
+                    let pm = match &v.payload {
+                        None => 0,
+                        Some(Ty::Bool) => 1,
+                        Some(Ty::Int(it)) if (it.bits as u32) < v.shift => low(it.bits as u32),
+                        Some(_) => low(v.shift),
+                    };
+                    (!pm, if v.shift >= 64 { 0 } else { v.tag << v.shift }, false)
+                }
+                _ => (low(v.shift), v.tag, false),
+            };
+            out.push(ConstVariant { op: k, name: format!("{}.v.{}", o.name, v.name), field: o.consts[0], mask, value, ult });
+        }
+    }
+    out
 }
 
 /// The vm that `--jit-stencils` compiles: the program's only tail-call vm.
@@ -251,6 +347,72 @@ pub fn field_hole(g: &mut FnGen, off: u32, shift: u32, bits: u32, signed: bool) 
     }
 }
 
+/// A stencil decoded field `raw` (at word offset `off` of the current
+/// part): if it is of a `const` operand kind, remember its hole, so that
+/// reads of the constant become the constant (`const_read`).
+pub fn note_const_field(g: &mut FnGen, raw: LocalId, off: u32, shift: u32, bits: u32) {
+    let Some(st) = g.stencil.as_mut() else { return };
+    if off == 0 && st.pool.is_some() && st.consts[st.part].contains(&(shift, bits)) {
+        let at = st.part_offs[st.part];
+        st.const_raws.push((raw, (at, shift, bits)));
+    }
+}
+
+/// In a stencil, a read of a constant through the pool (`k[c]`, or
+/// `*((k + c.raw) as *T)` with `c` a const operand) of a 64-bit type:
+/// the constant itself, a 64-bit hole `__jit.c.OFF.SHIFT.BITS.u` patched
+/// with its bits. Returns the address of a temporary holding it.
+pub fn const_read(g: &mut FnGen, e: &TExpr) -> Option<String> {
+    fn strip(e: &TExpr) -> &TExpr {
+        match &e.kind {
+            TK::Cast(a) => strip(a),
+            _ => e,
+        }
+    }
+    let st = g.stencil.as_ref()?;
+    let pool = st.pool?;
+    let raw_of = |e: &TExpr| match strip(e).kind {
+        TK::Local(l) => st.const_raws.iter().find(|(r, _)| *r == l).map(|x| x.1),
+        _ => None,
+    };
+    let is_pool = |e: &TExpr| matches!(strip(e).kind, TK::Local(l) if l == pool);
+    let hole = match &e.kind {
+        TK::Index(b, i) if matches!(b.ty, Ty::Ptr(_)) && is_pool(b) => raw_of(i)?,
+        TK::Deref(p) => match &strip(p).kind {
+            TK::Intrinsic(Intr::PtrOffset, a) if is_pool(&a[0]) => raw_of(&a[1])?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if e.ty.is_unitlike() || crate::layout::size_of(g.p(), &e.ty) != 8 {
+        return None;
+    }
+    let name = format!("__jit.c.{}.{}.{}.u", hole.0, hole.1, hole.2);
+    g.cg.jit_holes.insert(name.clone(), u64::MAX);
+    // `movabs` in inline asm: as a plain symbol address, LLVM (19)
+    // sometimes stores it as a sign-extended 32-bit immediate, whatever
+    // its `!absolute_symbol` range says.
+    let v = g.inst(format!("call i64 asm \"movabsq $$${{1:c}}, $0\", \"=r,i\"(ptr @\"{}\")", name));
+    let v = match g.stencil.as_ref().and_then(|st| st.variant) {
+        // The tag is known: rebuild the word from its payload bits and the
+        // tag, so that LLVM knows the tag bits (and folds tests of them).
+        Some((mask, value, false)) => {
+            let pl = g.inst(format!("and i64 {}, {}", v, !mask as i64));
+            g.inst(format!("or i64 {}, {}", pl, value as i64))
+        }
+        Some((_, limit, true)) => {
+            let c = g.inst(format!("icmp ult i64 {}, {}", v, limit as i64));
+            g.emit(format!("call void @llvm.assume(i1 {})", c));
+            g.cg.decls.insert("declare void @llvm.assume(i1)");
+            v
+        }
+        None => v,
+    };
+    let t = g.alloca(&e.ty);
+    g.emit(format!("store i64 {}, ptr {}", v, t));
+    Some(t)
+}
+
 /// The instruction word at pc + off in a stencil, as a constant.
 pub fn word_hole(g: &mut FnGen, off: u32) -> String {
     let name = format!("__jit.w.{}", off);
@@ -445,6 +607,27 @@ pub fn emit_runtime(p: &Program, vi: usize, globals: &mut String, fns: &mut Stri
     }
     let _ = writeln!(globals, "@loimi_jit_opnames = constant [{} x ptr] [{}]", n, names.join(", "));
     let _ = writeln!(globals, "@loimi_jit_enter_op = constant i32 {}", enter_opcode(vd));
+    // Stencil variants per constant tag: { opcode, stencil index, field
+    // (shift << 8 | bits << 16), mask, value, ult }.
+    let vs = const_variants(p, vi);
+    let vty = "{ i32, i32, i64, i64, i64, i32 }";
+    let items: Vec<String> = vs
+        .iter()
+        .enumerate()
+        .map(|(j, cv)| {
+            format!(
+                "{vty} {{ i32 {}, i32 {}, i64 {}, i64 {}, i64 {}, i32 {} }}",
+                vd.ops[cv.op].opcode,
+                n + 1 + j as u32,
+                (cv.field.0 << 8 | cv.field.1 << 16) as i64,
+                cv.mask as i64,
+                cv.value as i64,
+                cv.ult as i32
+            )
+        })
+        .collect();
+    let _ = writeln!(globals, "@loimi_jit_variants = constant [{} x {vty}] [{}]", items.len(), items.join(", "));
+    let _ = writeln!(globals, "@loimi_jit_nvariants = constant i32 {}", items.len());
     let _ = writeln!(globals, "@loimi_jit_op_bits = constant i32 {}", vd.op_bits);
 }
 
@@ -477,6 +660,7 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
     let vd = &p.vms[vi];
     let mut out = String::new();
     let wb = vd.word.bits as u32;
+    let variants = const_variants(p, vi);
     for o in &vd.ops {
         let f = &p.fns[o.fid as usize];
         let body = f.body.as_ref().unwrap();
@@ -498,6 +682,8 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
             }
             (ls, offs)
         };
+        let consts = if o.parts.is_empty() { vec![o.consts.clone()] } else { o.parts.iter().map(|&q| vd.ops[q as usize].consts.clone()).collect() };
+        let pool = vd.const_base.map(|b| f.vm_state[b]);
         let mut g = FnGen::new(cg, o.fid);
         g.stencil = Some(StencilGen {
             symbol: format!("__jit.op.{}", o.name),
@@ -506,8 +692,21 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
             labels,
             part_offs,
             part: 0,
+            consts,
+            pool,
+            const_raws: Vec::new(),
+            variant: None,
         });
+        let st = g.stencil.clone();
         out.push_str(&g.run());
+        for cv in variants.iter().filter(|cv| vd.ops[cv.op].fid == o.fid) {
+            let mut g = FnGen::new(cg, o.fid);
+            let mut s = st.clone().unwrap();
+            s.symbol = format!("__jit.op.{}", cv.name);
+            s.variant = Some((cv.mask, cv.value, cv.ult));
+            g.stencil = Some(s);
+            out.push_str(&g.run());
+        }
     }
     // Hot and cold parts (an experiment, off unless LOIMI_JIT_SPLIT is
     // set at build time; no faster, see copy-and-patch.md section 10): an
@@ -534,7 +733,12 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
         // extern_weak: LLVM must not assume the address (the value) is
         // not null, as it does for other globals.
         let _ = writeln!(out, "@\"{}\" = extern_weak dso_local global i8, !absolute_symbol !{}", name, i);
-        let _ = writeln!(md, "!{} = !{{i64 0, i64 {}}}", i, hi);
+        if *hi == u64::MAX {
+            // A 64-bit hole (a constant, read by inline asm).
+            let _ = writeln!(md, "!{} = !{{i64 -1, i64 -1}}", i);
+        } else {
+            let _ = writeln!(md, "!{} = !{{i64 0, i64 {}}}", i, hi);
+        }
     }
     for line in cg.jit_conts.values() {
         let _ = writeln!(out, "{}", line);

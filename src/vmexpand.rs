@@ -583,6 +583,21 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         let f = &sm.files[p.ty.span.file as usize];
         params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
     }
+    // `const` operand kinds: the constant pool of verified code, from the
+    // verify context, as the type of the state register the kinds index
+    // (the JIT patches constants from it into compiled code).
+    let konst = v.operands.iter().find_map(|o| {
+        let e = o.konst.as_ref()?;
+        let crate::ast::ExprKind::Index(b, _) = &o.body.kind else { return None };
+        let crate::ast::ExprKind::Ident(sn) = &b.kind else { return None };
+        let st = v.state.iter().find(|p| p.name.name == *sn)?;
+        let f = &sm.files[e.span.file as usize];
+        let tf = &sm.files[st.ty.span.file as usize];
+        Some((f.text[e.span.lo as usize..e.span.hi as usize].to_string(), tf.text[st.ty.span.lo as usize..st.ty.span.hi as usize].to_string()))
+    });
+    if let Some((e, t)) = &konst {
+        let _ = writeln!(s, "fn {n}__const_pool({}) -> *u8 {{ let __p: {t} = {e}; __p as *u8 }}", params[1..].join(", "));
+    }
     let nk = v.operands.len();
     let fail = |at: &str, reason: &str, op: &str| format!("return {n}__verr({at}, {n}__VerifyReason.{reason}, {op}, 0, {nk});");
     let op_at = |at: &str| format!("{n}__opcode(__code[{at}]) as u64");
@@ -710,7 +725,13 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
          \x20 match {n}__verify({}) {{ Ok(_) => {{ {}Ok(__o) }}, Err(__e) => Err(__e) }}\n}}",
         params.join(""),
         args.join(", "),
-        if jit { "loimi_jit_register(__c.ptr as *u8, __c.len); " } else { "" }
+        if !jit {
+            String::new()
+        } else if konst.is_some() {
+            format!("loimi_jit_register(__c.ptr as *u8, __c.len, {n}__const_pool({})); ", args[1..].join(", "))
+        } else {
+            "loimi_jit_register(__c.ptr as *u8, __c.len, 0 as *u8); ".to_string()
+        }
     );
     // The escape hatch, as `assume_verified`: the object with its words,
     // unchecked (for code the host built itself and trusts, and for
@@ -1260,7 +1281,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 if jit {
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.
-                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\nextern \"C\" fn loimi_jit_rewritten(code: *u8);\n");
+                    src.push_str("extern \"C\" fn loimi_jit_register(code: *u8, n: u64, pool: *u8);\nextern \"C\" fn loimi_jit_invalidate(code: *u8);\nextern \"C\" fn loimi_jit_rewritten(code: *u8);\n");
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
                 src.push_str(&generate_labels(v, &l));

@@ -692,6 +692,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
     // ── places ──────────────────────────────────────────────────────
 
     pub fn place(&mut self, e: &TExpr) -> String {
+        if self.stencil.is_some() {
+            if let Some(t) = crate::jitgen::const_read(self, e) {
+                return t;
+            }
+        }
         match &e.kind {
             TK::Local(id) => self.slots[*id as usize].clone(),
             TK::Global(id) => format!("@\"{}\"", self.p().globals[*id as usize].symbol),
@@ -1119,6 +1124,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     (_, Some((off, shift, bits, signed))) => {
                         let st = self.stencil.as_ref().unwrap();
                         let base = st.part_offs[st.part];
+                        if !signed {
+                            crate::jitgen::note_const_field(self, *id, off, shift, bits);
+                        }
                         crate::jitgen::field_hole(self, base + off, shift, bits, signed)
                     }
                     (Some(e), None) => self.val(e),

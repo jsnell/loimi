@@ -617,6 +617,32 @@ zero-extension. The width and signedness come from the format and matter
 to the encoders (`Vm.OP(a: u8, ..)`), so one `label` kind serves 8-bit and
 24-bit offsets alike.
 
+**Constant operands.** A `const` clause says that what an operand reads
+cannot change once the code is verified:
+
+```loimi
+operand kst = k[it] const proto.consts.data.ptr verify (it as u64) < proto.consts.data.len;
+```
+
+The body must be `S[it]` for a pointer state register `S` (the constant
+pool). The clause is an expression of the verify context with `S`'s type:
+the value `S` has while code verified against that context runs. It is a
+promise, like a `verify` clause: the vm sets `S` to it whenever it starts
+running that code (on calls and returns). The checker enforces the rest
+within the vm: no handler, vm function, cold block or `on raise` may
+write through `S` (`c = x` on the operand, `k[i] = x`, `*(k + i) = x`) or
+take an address in it (`&k[i]`). Plain functions and the host must not
+change the pool of verified code either. A vm has at most one pool.
+
+`const` changes nothing in the interpreter: the operand reads `S[it]` as
+before (the default build's handlers are the same). With
+`--jit-stencils`, `Vm.build_verified` passes the pool to the JIT, which
+patches each constant into compiled code as a 64-bit immediate, and uses
+stencil variants per tag of a constant of a `value` type, with the
+checks on that tag folded (`docs/design/copy-and-patch.md`, section 12).
+Reads of the pool at a const operand's index through pointer arithmetic
+(`*((k + c.raw) as *f64)`) are patched too.
+
 ### 3.3 Encodings and formats
 
 ```loimi

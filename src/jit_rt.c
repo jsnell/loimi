@@ -61,12 +61,18 @@ extern const uint32_t loimi_jit_nops, loimi_jit_enter_op, loimi_jit_op_bits;
 extern const char *const loimi_jit_opnames[];
 extern void **const loimi_jit_table;
 extern void *const loimi_jit_ctable[];
+/* Stencil variants of ops with a const operand, per tag of the constant:
+ * used when the constant's bits satisfy (bits & mask) == value (or
+ * bits < value if ult). */
+struct jit_variant { uint32_t op, stencil; int64_t field; uint64_t mask, value; uint32_t ult; };
+extern const struct jit_variant loimi_jit_variants[];
+extern const int32_t loimi_jit_nvariants;
 
 #define HOT_SLOTS 4096
 void **loimi_jit_entries;
 uint16_t loimi_jit_hotcount[HOT_SLOTS];
 
-enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER, K_SELF };
+enum { K_SYM, K_WORD, K_FIELD, K_NEXT, K_JUMP, K_TLS, K_RODATA, K_HELPER, K_SELF, K_CONST };
 enum { R_64 = 1, R_PC32 = 2, R_PLT32 = 4, R_32 = 10, R_32S = 11, R_TPOFF32 = 23 };
 enum { S_NONE, S_COMPILED, S_FAILED };
 #define MAX_COMPILES 32
@@ -91,6 +97,9 @@ struct alt {
 struct rec {
     uint32_t *code;
     uint64_t n;
+    /* The constant pool of `const` operands (patched into the code), or
+     * NULL. Verified code's pool does not change. */
+    const uint64_t *pool;
     int state, compiles, rewriting;
     /* While compiled, per word: */
     uint8_t **home, **body; /* the instruction's home, and the code it runs now */
@@ -337,7 +346,7 @@ static void free_rec(struct rec *r) {
 
 /* A new verified code object. Records overlapping it are of objects the
  * collector freed (their memory is being reused), so they go. */
-void loimi_jit_register(uint32_t *code, uint64_t n) {
+void loimi_jit_register(uint32_t *code, uint64_t n, const void *pool) {
     if (!enabled || n == 0) return;
     size_t lo = 0, hi = nrecs;
     while (lo < hi) {
@@ -359,6 +368,7 @@ void loimi_jit_register(uint32_t *code, uint64_t n) {
     struct rec *r = calloc(1, sizeof *r);
     r->code = code;
     r->n = n;
+    r->pool = pool;
     recs[a] = r;
     nrecs++;
 }
@@ -372,6 +382,21 @@ static uint32_t stencil_for(uint32_t w) {
     if (oi->base != 0xffff && loimi_jit_stencils[oi->base].present) return oi->base;
     if (oi->part != 0xffff && loimi_jit_stencils[oi->part].present) return oi->part;
     return loimi_jit_nops;
+}
+
+/* The stencil for word w of code object r: a variant of stencil_for(w)
+ * for the tag of its constant, if there is one. */
+static int64_t field(uint32_t w, int64_t arg);
+static uint32_t stencil_in(const struct rec *r, uint32_t w) {
+    uint32_t s = stencil_for(w);
+    if (!r->pool || s != (w & OPMASK)) return s;
+    for (int32_t j = 0; j < loimi_jit_nvariants; j++) {
+        const struct jit_variant *v = &loimi_jit_variants[j];
+        if (v->op != s || !loimi_jit_stencils[v->stencil].present) continue;
+        uint64_t c = r->pool[field(w, v->field)];
+        if (v->ult ? c < v->value : (c & v->mask) == v->value) return v->stencil;
+    }
+    return s;
 }
 
 /* The real word at index j: enter words stand for the word they replaced. */
@@ -421,6 +446,12 @@ static int emit_copy(const struct rec *r, uint64_t pc, uint32_t w0, uint32_t s, 
             S = (int64_t)(intptr_t)(t < 0 || (uint64_t)t >= n || !r->home[t] ? exit_code : r->home[t]);
             break;
         }
+        case K_CONST: {
+            unsigned o = rl->arg & 255;
+            if (!r->pool) return 0;
+            S = (int64_t)r->pool[field(o == 0 ? w0 : word_at(r, pc + o), rl->arg)];
+            break;
+        }
         case K_TLS: S = tlsoff[rl->arg]; break;
         case K_RODATA: S = (int64_t)(intptr_t)(rodata + rl->arg); break;
         case K_HELPER: S = (int64_t)(intptr_t)(helpers + rl->arg); break;
@@ -432,9 +463,17 @@ static int emit_copy(const struct rec *r, uint64_t pc, uint32_t w0, uint32_t s, 
     return 1;
 }
 
+/* A stencil's name: its op's (variants: with a `*`). */
+static const char *stencil_name(uint32_t s, int *variant) {
+    *variant = s > loimi_jit_nops;
+    if (s == loimi_jit_nops) return "exit";
+    return loimi_jit_opnames[s < loimi_jit_nops ? s : loimi_jit_variants[s - loimi_jit_nops - 1].op];
+}
+
 static void map_line(uint8_t *a, uint32_t len, uint32_t s) {
-    fprintf(mapf, "%lx %lx %s\n", (unsigned long)(uintptr_t)a, (unsigned long)(uintptr_t)(a + len),
-            s == loimi_jit_nops ? "exit" : loimi_jit_opnames[s]);
+    int v;
+    const char *nm = stencil_name(s, &v);
+    fprintf(mapf, "%lx %lx %s%s\n", (unsigned long)(uintptr_t)a, (unsigned long)(uintptr_t)(a + len), nm, v ? "*" : "");
 }
 
 static uint32_t new_entry(void *native) {
@@ -529,7 +568,7 @@ static uint8_t *code_for(const struct rec *r, uint64_t i, uint32_t w) {
 static uint8_t *make_copy(struct rec *r, uint64_t i, uint32_t w) {
     const struct jit_opinfo *ni = &loimi_jit_opinfo[w & OPMASK], *oi = &loimi_jit_opinfo[r->cw[i] & OPMASK];
     if (ni->base == 0xffff || ni->size != oi->size || r->nalts >= 16 + r->n) return NULL;
-    uint32_t s = stencil_for(w);
+    uint32_t s = stencil_in(r, w);
     const struct jit_stencil *sp = &loimi_jit_stencils[s];
     uint32_t len = sp->len;
     uint64_t sz = (len + 15) & ~(uint64_t)15;
@@ -748,7 +787,7 @@ static int compile(struct rec *r, const int32_t *oent) {
             if (debug) fprintf(stderr, "jit: %p: no op at word %llu (%08x)\n", (void *)code, (unsigned long long)pc, code[pc]);
             goto out;
         }
-        uint32_t s = stencil_for(code[pc]);
+        uint32_t s = stencil_in(r, code[pc]);
         if (s == nops) nexit++;
         const struct jit_stencil *sp = &loimi_jit_stencils[s];
         uint32_t len = sp->hot;
@@ -796,8 +835,10 @@ static int compile(struct rec *r, const int32_t *oent) {
         for (uint64_t pc = 0; pc < n; pc++) {
             if (map[pc] < 0) continue;
             uint32_t w = r->w[pc];
-            fprintf(stderr, "  %4llu %08x %-12s %s +%lld%s%s\n", (unsigned long long)pc, w, loimi_jit_opnames[w & OPMASK],
-                    sts[pc] == nops ? "exit" : loimi_jit_opnames[sts[pc]], (long long)map[pc],
+            int v;
+            const char *nm = stencil_name(sts[pc], &v);
+            fprintf(stderr, "  %4llu %08x %-12s %s%s +%lld%s%s\n", (unsigned long long)pc, w, loimi_jit_opnames[w & OPMASK],
+                    nm, v ? "*" : "", (long long)map[pc],
                     (r->fl[pc] & F_ENTRY) ? " entry" : "", (r->fl[pc] & F_PREFIX) ? " prefix" : "");
         }
     }

@@ -188,7 +188,13 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     let jit = if opts.jit {
         let vi = jitgen::jit_vm(&prog).map_err(|e| Diag::new(Span { file: u32::MAX, lo: 0, hi: 0 }, e))?;
         let vd = &prog.vms[vi];
-        Some((vd.ops.iter().map(|o| (o.opcode, o.name.clone())).collect::<Vec<_>>(), 1u32 << vd.op_bits))
+        let nops = 1u32 << vd.op_bits;
+        let mut ops: Vec<(u32, String)> = vd.ops.iter().map(|o| (o.opcode, o.name.clone())).collect();
+        // Stencil variants per constant tag follow the exit stencil.
+        for (j, cv) in jitgen::const_variants(&prog, vi).into_iter().enumerate() {
+            ops.push((nops + 1 + j as u32, cv.name));
+        }
+        Some((ops, nops))
     } else {
         None
     };
