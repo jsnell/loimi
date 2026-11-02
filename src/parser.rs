@@ -584,13 +584,21 @@ impl Parser {
             }
         } else if self.eat("(") {
             let mut ts = Vec::new();
+            let mut comma = false;
             while !self.is(")") {
                 ts.push(self.parse_type()?);
-                if !self.eat(",") {
+                comma = self.eat(",");
+                if !comma {
                     break;
                 }
             }
             self.expect(")")?;
+            // `(T)` is `T` (for example `-> (fn() uses gc)`); `(T,)` is a 1-tuple.
+            if ts.len() == 1 && !comma {
+                let mut t = ts.pop().unwrap();
+                t.span = start.to(self.prev_span());
+                return Ok(t);
+            }
             TypeKind::Tuple(ts)
         } else if self.eat_kw("fn") {
             self.expect("(")?;
@@ -607,7 +615,11 @@ impl Parser {
             } else {
                 TypeExpr { kind: TypeKind::Tuple(vec![]), span: self.prev_span() }
             };
-            TypeKind::Fn(ps, Box::new(ret))
+            // `uses E` binds to the innermost function type: in
+            // `fn f() -> fn() uses gc`, the effect belongs to the result
+            // type. A function type takes one effect, since they are ordered.
+            let eff = if self.eat_kw("uses") { Some(self.ident()?) } else { None };
+            TypeKind::Fn(ps, Box::new(ret), eff)
         } else if self.eat_kw("never") {
             TypeKind::Never
         } else {

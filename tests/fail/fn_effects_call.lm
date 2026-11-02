@@ -1,0 +1,4 @@
+import std.gc;
+fn run_hook(h: *gc.Heap, f: fn(*gc.Heap) uses gc) { f(h); }
+fn main() {}
+// error: this call through a `fn(*Heap) -> () uses gc` uses gc, but `run_hook` does not declare it; add `uses gc` to its signature

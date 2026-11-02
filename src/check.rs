@@ -120,6 +120,18 @@ pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
     TExpr { ty, kind, span }
 }
 
+/// A value of function type `from` may be used as `to`: same signature,
+/// and `from`'s effects are a subset of `to`'s. Only at the top level (and
+/// under `?`), never behind a pointer, where it would let a store through
+/// `*fn() uses gc` be read back as a plain `fn()`.
+fn fn_widens(from: &Ty, to: &Ty) -> bool {
+    match (from, to) {
+        (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) => p1 == p2 && r1 == r2 && e1 & !e2 == 0,
+        (Ty::Option(a), Ty::Option(b)) => fn_widens(a, b),
+        _ => false,
+    }
+}
+
 /// An unknown part of a guessed type (`Checker::guess_ty`).
 const HOLE: u32 = u32::MAX;
 
@@ -129,7 +141,7 @@ fn has_hole(t: &Ty) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) | Ty::Gc(x) => has_hole(x),
         Ty::Result(a, b) => has_hole(a) || has_hole(b),
         Ty::Tuple(ts) => ts.iter().any(has_hole),
-        Ty::Fn(ps, r) => ps.iter().any(has_hole) || has_hole(r),
+        Ty::Fn(ps, r, _) => ps.iter().any(has_hole) || has_hole(r),
         _ => false,
     }
 }
@@ -526,10 +538,11 @@ impl<'a> Checker<'a> {
             Ty::Option(t) => format!("?{}", self.ty_name(t)),
             Ty::Result(a, b) => format!("Result<{}, {}>", self.ty_name(a), self.ty_name(b)),
             Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", ")),
-            Ty::Fn(ps, r) => format!(
-                "fn({}) -> {}",
+            Ty::Fn(ps, r, e) => format!(
+                "fn({}) -> {}{}",
                 ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r)
+                self.ty_name(r),
+                if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
             Ty::Struct(i) => short(&self.prog.structs[*i as usize].name),
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
@@ -661,12 +674,16 @@ impl<'a> Checker<'a> {
                     Ty::Tuple(out)
                 }
             }
-            TypeKind::Fn(ps, r) => {
+            TypeKind::Fn(ps, r, eff) => {
                 let mut out = Vec::new();
                 for p in ps {
                     out.push(self.resolve_type(m, p)?);
                 }
-                Ty::Fn(out, Box::new(self.resolve_type(m, r)?))
+                let e = match eff {
+                    Some(e) => effect_bits(&e.name, e.span)?,
+                    None => 0,
+                };
+                Ty::Fn(out, Box::new(self.resolve_type(m, r)?), e)
             }
             TypeKind::Never => Ty::Never,
             TypeKind::Trailing(_) => {
@@ -714,10 +731,27 @@ impl<'a> Checker<'a> {
             let span = e.span;
             return Ok(mk(want.clone(), TK::Block(vec![TStmt::Expr(e)], None), span));
         }
+        if fn_widens(&e.ty, want) {
+            // A function value converts to a function type with more effects.
+            return Ok(TExpr { ty: want.clone(), ..e });
+        }
         if let Ty::Option(inner) = want {
-            if **inner == e.ty {
+            if **inner == e.ty || fn_widens(&e.ty, inner) {
                 let span = e.span;
+                let e = TExpr { ty: (**inner).clone(), ..e };
                 return Ok(mk(want.clone(), TK::Variant(1, vec![e]), span));
+            }
+        }
+        if let (Ty::Fn(p1, r1, e1), Ty::Fn(p2, r2, e2)) = (&e.ty, want) {
+            if p1 == p2 && r1 == r2 && e1 & !e2 != 0 {
+                return Err(Diag::new(
+                    e.span,
+                    format!(
+                        "this function uses {}, but the expected type `{}` does not allow it",
+                        effect_name(e1 & !e2),
+                        self.ty_name(want)
+                    ),
+                ));
             }
         }
         Err(Diag::new(
@@ -1702,8 +1736,7 @@ impl<'a> Checker<'a> {
         match def {
             Def::Fn(id) => {
                 let f = &self.prog.fns[id as usize];
-                let ty = Ty::Fn(f.param_tys.clone(), Box::new(f.ret.clone()));
-                Ok(mk(ty, TK::FnRef(id), span))
+                Ok(mk(f.fn_ty(), TK::FnRef(id), span))
             }
             Def::Const(id) => {
                 let mut v = self.const_value(id, span)?;
@@ -2109,7 +2142,7 @@ impl<'a> Checker<'a> {
     }
 
     pub fn finish_call(&mut self, cx: &mut FnCx, f: TExpr, mut pre: Vec<TExpr>, args: &[Expr], span: Span) -> Res<TExpr> {
-        let Ty::Fn(params, ret) = f.ty.clone() else {
+        let Ty::Fn(params, ret, _) = f.ty.clone() else {
             return Err(Diag::new(f.span, format!("cannot call a value of type `{}`", self.ty_name(&f.ty))));
         };
         let variadic = matches!(f.kind, TK::FnRef(id) if self.prog.fns[id as usize].variadic);
@@ -2131,12 +2164,8 @@ impl<'a> Checker<'a> {
                 pre.push(v);
             }
         }
-        let callee = if let TK::FnRef(id) = f.kind { Some(id) } else { None };
         let call = mk(*ret, TK::Call(Box::new(f), pre), span);
-        match callee {
-            Some(id) => crate::vmcheck::wrap_effects(self, cx, id, call),
-            None => Ok(call),
-        }
+        crate::vmcheck::wrap_effects(self, cx, call)
     }
 
     /// `Vec` (a generic type named in expression position).
@@ -2176,7 +2205,7 @@ impl<'a> Checker<'a> {
             let Some(p0) = fdef.param_tys.first().cloned() else {
                 return Err(Diag::new(name.span, format!("`{}` takes no receiver", name.name)));
             };
-            let fty = Ty::Fn(fdef.param_tys.clone(), Box::new(fdef.ret.clone()));
+            let fty = fdef.fn_ty();
             let mut r = recv;
             loop {
                 if r.ty == p0 {
@@ -2592,14 +2621,30 @@ pub fn effects_of(attrs: &Attrs) -> Res<u8> {
         if n != "uses" {
             continue;
         }
-        e |= match args[0].as_str() {
-            "sync" => EFF_SYNC,
-            "gc" => EFF_SYNC | EFF_GC,
-            "reenter" => EFF_SYNC | EFF_GC | EFF_REENTER,
-            x => return Err(Diag::new(*span, format!("unknown effect `{}` (sync, gc or reenter)", x))),
-        };
+        e |= effect_bits(&args[0], *span)?;
     }
     Ok(e)
+}
+
+/// An effect name as a mask, including the effects it implies.
+pub fn effect_bits(name: &str, span: Span) -> Res<u8> {
+    Ok(match name {
+        "sync" => EFF_SYNC,
+        "gc" => EFF_SYNC | EFF_GC,
+        "reenter" => EFF_SYNC | EFF_GC | EFF_REENTER,
+        x => return Err(Diag::new(span, format!("unknown effect `{}` (sync, gc or reenter)", x))),
+    })
+}
+
+/// The strongest effect in a mask.
+pub fn effect_name(e: u8) -> &'static str {
+    if e & EFF_REENTER != 0 {
+        "reenter"
+    } else if e & EFF_GC != 0 {
+        "gc"
+    } else {
+        "sync"
+    }
 }
 
 pub fn prim_type(name: &str) -> Option<Ty> {

@@ -38,7 +38,8 @@ pub enum Ty {
     Option(Box<Ty>),
     Result(Box<Ty>, Box<Ty>),
     Tuple(Vec<Ty>),
-    Fn(Vec<Ty>, Box<Ty>),
+    /// Parameters, result, effects (EFF_* mask, closed downward).
+    Fn(Vec<Ty>, Box<Ty>, u8),
     Struct(u32),
     Enum(u32),
     Value(u32),
@@ -299,6 +300,13 @@ pub struct FnDef {
     pub vm_state: Vec<LocalId>,
     /// Effects: EFF_SYNC | EFF_GC | EFF_REENTER.
     pub effects: u8,
+}
+
+impl FnDef {
+    /// The type of this function as a value.
+    pub fn fn_ty(&self) -> Ty {
+        Ty::Fn(self.param_tys.clone(), Box::new(self.ret.clone()), self.effects)
+    }
 }
 
 pub const EFF_SYNC: u8 = 1;

@@ -48,7 +48,7 @@ pub fn contains_param(t: &Ty, g: &Generics) -> bool {
         Ty::Ptr(x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Option(x) => contains_param(x, g),
         Ty::Result(a, b) => contains_param(a, g) || contains_param(b, g),
         Ty::Tuple(ts) => ts.iter().any(|t| contains_param(t, g)),
-        Ty::Fn(ps, r) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
+        Ty::Fn(ps, r, _) => ps.iter().any(|t| contains_param(t, g)) || contains_param(r, g),
         Ty::Struct(_) | Ty::Enum(_) => match g.inst_of.get(t) {
             Some((_, args)) => args.iter().any(|t| contains_param(t, g)),
             None => false,
@@ -174,7 +174,9 @@ impl<'a> Checker<'a> {
             (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.unify(x, y, b),
             (Ty::Result(a1, b1), Ty::Result(a2, b2)) => self.unify(a1, a2, b) && self.unify(b1, b2, b),
             (Ty::Tuple(xs), Ty::Tuple(ys)) => xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| self.unify(x, y, b)),
-            (Ty::Fn(p1, r1), Ty::Fn(p2, r2)) => {
+            // Effects are not unified: the argument is coerced to the
+            // instantiated parameter type afterwards, which checks them.
+            (Ty::Fn(p1, r1, _), Ty::Fn(p2, r2, _)) => {
                 p1.len() == p2.len() && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y, b)) && self.unify(r1, r2, b)
             }
             (Ty::Struct(_), Ty::Struct(_)) | (Ty::Enum(_), Ty::Enum(_)) if pat != act => {
@@ -226,7 +228,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(out)
             }
-            Ty::Fn(ps, r) => {
+            Ty::Fn(ps, r, e) => {
                 let mut out = Vec::new();
                 for t in ps {
                     match self.subst(t, b, span)? {
@@ -235,7 +237,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 match self.subst(r, b, span)? {
-                    Some(r) => Ty::Fn(out, Box::new(r)),
+                    Some(r) => Ty::Fn(out, Box::new(r), *e),
                     None => return Ok(None),
                 }
             }
@@ -275,7 +277,7 @@ impl<'a> Checker<'a> {
             None => Ty::Unit,
         };
         let mut b: Vec<Option<Ty>> = vec![None; params.len()];
-        if !self.unify(&Ty::Fn(ptys, Box::new(ret)), want, &mut b) {
+        if !self.unify(&Ty::Fn(ptys, Box::new(ret), 0), want, &mut b) {
             return Err(Diag::new(span, format!("`{}` does not match the expected type `{}`", decl.name.name, self.ty_name(want))));
         }
         let mut targs = Vec::new();
@@ -287,7 +289,7 @@ impl<'a> Checker<'a> {
         }
         let fid = self.instantiate_fn(g, targs, span)?;
         let f = &self.prog.fns[fid as usize];
-        Ok(mk(Ty::Fn(f.param_tys.clone(), Box::new(f.ret.clone())), TK::FnRef(fid), span))
+        Ok(mk(f.fn_ty(), TK::FnRef(fid), span))
     }
 
     /// Call of generic fn `g`. `pre` are already-checked leading arguments
@@ -372,7 +374,7 @@ impl<'a> Checker<'a> {
         }
         let fid = self.instantiate_fn(g, targs, span)?;
         let f = &self.prog.fns[fid as usize];
-        let fty = Ty::Fn(f.param_tys.clone(), Box::new(f.ret.clone()));
+        let fty = f.fn_ty();
         let ret = f.ret.clone();
         let pts = f.param_tys.clone();
         let mut out = Vec::new();
@@ -380,7 +382,7 @@ impl<'a> Checker<'a> {
             out.push(self.coerce(v, t)?);
         }
         let call = mk(ret, TK::Call(Box::new(mk(fty, TK::FnRef(fid), span)), out), span);
-        crate::vmcheck::wrap_effects(self, cx, fid, call)
+        crate::vmcheck::wrap_effects(self, cx, call)
     }
 
     /// Infer the instance of generic type `g` from the expected type.

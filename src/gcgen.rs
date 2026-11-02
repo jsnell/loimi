@@ -248,11 +248,13 @@ pub fn trailing(g: &mut FnGen, obj: &TExpr) -> String {
 }
 
 /// Before a call that may collect: link a shadow-stack frame listing the
-/// traced locals in scope. Returns the saved previous top.
+/// traced locals in scope. Returns the saved previous top. Whether the call
+/// may collect comes from the callee's type, which for a call through a
+/// function pointer is the pointer type's effects.
 pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     let p = g.p();
-    let TK::FnRef(id) = f.kind else { return None };
-    if p.fns[id as usize].effects & EFF_GC == 0 {
+    let Ty::Fn(_, _, effects) = f.ty else { return None };
+    if effects & EFF_GC == 0 {
         return None;
     }
     let fd = g.f();

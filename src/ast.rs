@@ -25,7 +25,8 @@ pub enum TypeKind {
     Array(P<TypeExpr>, P<Expr>),
     Option(P<TypeExpr>),
     Tuple(Vec<TypeExpr>),
-    Fn(Vec<TypeExpr>, P<TypeExpr>),
+    /// `fn(A, B) -> R uses gc`: the effect, if any, is the strongest one.
+    Fn(Vec<TypeExpr>, P<TypeExpr>, Option<Ident>),
     Never,
     /// `[T]`: trailing variable-length array (last field of an `object`).
     Trailing(P<TypeExpr>),

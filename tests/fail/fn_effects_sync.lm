@@ -1,0 +1,6 @@
+// `uses sync` is weaker than `uses gc`: a gc function does not fit.
+fn needs_gc() uses gc {}
+fn main() {
+    let f: fn() uses sync = needs_gc;
+}
+// error: this function uses gc, but the expected type `fn() -> () uses sync` does not allow it
