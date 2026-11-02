@@ -3,8 +3,9 @@
 // Tokens are whitespace-separated words, read with a std.lex Cursor.
 // Each definition compiles into its own Word; the top-level code into
 // `main`. The compiler tracks the data-stack depth through every word, so
-// underflow and unbalanced branches are compile-time errors and each Word
-// knows its maximum depth.
+// underflow and unbalanced branches are compile-time errors with a
+// position in the source. (The verifier checks the same from the ops'
+// declared stack effects, and finds each word's maximum depth.)
 
 import std.bc;
 import std.diag;
@@ -56,7 +57,6 @@ struct Def {
     nlocals: u32,
     /// The stack depth relative to the word's entry (inputs included).
     depth: i32,
-    maxdepth: i32,
     /// After `exit`: the code here cannot run, so depths do not matter.
     dead: bool,
     ctl: mem.Vec<Ctl>,
@@ -154,12 +154,12 @@ fn Comp.skip_comment(c: *Comp, open: diag.Span) -> Result<(), Error> {
 fn Def.new(name: str, nin: u32, nout: u32, toplevel: bool) -> Def {
     let w: *Word = mem.alloc(1);
     *w = Word {
-        name: name, nin: nin, nout: nout, nlocals: 0, maxdepth: 0,
+        name: name, nin: nin, nout: nout, nlocals: 0,
         words: mem.alloc<u32>(1).slice(0), code: Stak.placeholder(), lines: mem.alloc<u32>(1).slice(0),
     };
     Def {
         word: w, code: bc.Code.new(Stak.op_size, Stak.set_label), locals: mem.Vec.new(), nlocals: 0,
-        depth: nin as i32, maxdepth: nin as i32, dead: false, ctl: mem.Vec.new(), toplevel: toplevel,
+        depth: nin as i32, dead: false, ctl: mem.Vec.new(), toplevel: toplevel,
     }
 }
 
@@ -175,11 +175,12 @@ fn Comp.effect(c: *Comp, d: *Def, t: *Tok, nin: u32, nout: u32) -> Result<(), Er
         return Err(c.err(t.span, c.fmt_n("stack underflow: this needs ", nin as i64, " values, but the stack has ", d.depth as i64, "")));
     }
     d.depth = d.depth - nin as i32 + nout as i32;
-    if d.depth > d.maxdepth { d.maxdepth = d.depth; }
     Ok(())
 }
 
-fn Comp.op(c: *Comp, d: *Def, t: *Tok, w: u32, nin: u32, nout: u32) -> Result<(), Error> {
+/// Emits instruction `w`, with the stack effect its op declares.
+fn Comp.op(c: *Comp, d: *Def, t: *Tok, w: u32) -> Result<(), Error> {
+    let (nin, nout) = Stak.stack_effect(w) ?? (0, 0);
     c.effect(d, t, nin, nout)?;
     d.emit(w, t.line);
     Ok(())
@@ -204,47 +205,47 @@ fn Comp.merge(c: *Comp, d: *Def, t: *Tok, a: i32, a_dead: bool, b: i32, b_dead: 
     Ok(())
 }
 
-/// Built-in words: the instruction and its stack effect.
-fn builtin(name: str) -> ?(u32, u32, u32) {
-    if name.eq("dup") { return Some((Stak.DUP(), 1, 2)); }
-    if name.eq("drop") { return Some((Stak.DROP(), 1, 0)); }
-    if name.eq("swap") { return Some((Stak.SWAP(), 2, 2)); }
-    if name.eq("over") { return Some((Stak.OVER(), 2, 3)); }
-    if name.eq("rot") { return Some((Stak.ROT(), 3, 3)); }
-    if name.eq("nip") { return Some((Stak.NIP(), 2, 1)); }
-    if name.eq("tuck") { return Some((Stak.TUCK(), 2, 3)); }
-    if name.eq("2dup") { return Some((Stak.DUP2(), 2, 4)); }
-    if name.eq("2drop") { return Some((Stak.DROP2(), 2, 0)); }
-    if name.eq("+") { return Some((Stak.ADD(), 2, 1)); }
-    if name.eq("-") { return Some((Stak.SUB(), 2, 1)); }
-    if name.eq("*") { return Some((Stak.MUL(), 2, 1)); }
-    if name.eq("/") { return Some((Stak.DIV(), 2, 1)); }
-    if name.eq("mod") { return Some((Stak.MOD(), 2, 1)); }
-    if name.eq("negate") { return Some((Stak.NEG(), 1, 1)); }
-    if name.eq("abs") { return Some((Stak.ABS(), 1, 1)); }
-    if name.eq("=") { return Some((Stak.EQ(), 2, 1)); }
-    if name.eq("<>") { return Some((Stak.NE(), 2, 1)); }
-    if name.eq("<") { return Some((Stak.LT(), 2, 1)); }
-    if name.eq("<=") { return Some((Stak.LE(), 2, 1)); }
-    if name.eq(">") { return Some((Stak.GT(), 2, 1)); }
-    if name.eq(">=") { return Some((Stak.GE(), 2, 1)); }
-    if name.eq("not") { return Some((Stak.NOT(), 1, 1)); }
-    if name.eq("and") { return Some((Stak.AND(), 2, 1)); }
-    if name.eq("or") { return Some((Stak.OR(), 2, 1)); }
-    if name.eq("print") { return Some((Stak.PRINT(), 1, 0)); }
-    if name.eq(".") { return Some((Stak.DOT(), 1, 0)); }
-    if name.eq("cr") { return Some((Stak.CR(), 0, 0)); }
-    if name.eq("concat") { return Some((Stak.CONCAT(), 2, 1)); }
-    if name.eq("tostr") { return Some((Stak.TOSTR(), 1, 1)); }
-    if name.eq("len") { return Some((Stak.LEN(), 1, 1)); }
-    if name.eq("array") { return Some((Stak.ARRAY(), 1, 1)); }
-    if name.eq("@") { return Some((Stak.AT(), 2, 1)); }
-    if name.eq("!") { return Some((Stak.STORE(), 3, 0)); }
-    if name.eq("sqrt") { return Some((Stak.SQRT(), 1, 1)); }
-    if name.eq("int") { return Some((Stak.TOINT(), 1, 1)); }
-    if name.eq("true") { return Some((Stak.PUSHBOOL(1), 0, 1)); }
-    if name.eq("false") { return Some((Stak.PUSHBOOL(0), 0, 1)); }
-    if name.eq("nil") { return Some((Stak.PUSHNIL(), 0, 1)); }
+/// Built-in words: the instruction (its stack effect is the op's).
+fn builtin(name: str) -> ?u32 {
+    if name.eq("dup") { return Some(Stak.DUP()); }
+    if name.eq("drop") { return Some(Stak.DROP()); }
+    if name.eq("swap") { return Some(Stak.SWAP()); }
+    if name.eq("over") { return Some(Stak.OVER()); }
+    if name.eq("rot") { return Some(Stak.ROT()); }
+    if name.eq("nip") { return Some(Stak.NIP()); }
+    if name.eq("tuck") { return Some(Stak.TUCK()); }
+    if name.eq("2dup") { return Some(Stak.DUP2()); }
+    if name.eq("2drop") { return Some(Stak.DROP2()); }
+    if name.eq("+") { return Some(Stak.ADD()); }
+    if name.eq("-") { return Some(Stak.SUB()); }
+    if name.eq("*") { return Some(Stak.MUL()); }
+    if name.eq("/") { return Some(Stak.DIV()); }
+    if name.eq("mod") { return Some(Stak.MOD()); }
+    if name.eq("negate") { return Some(Stak.NEG()); }
+    if name.eq("abs") { return Some(Stak.ABS()); }
+    if name.eq("=") { return Some(Stak.EQ()); }
+    if name.eq("<>") { return Some(Stak.NE()); }
+    if name.eq("<") { return Some(Stak.LT()); }
+    if name.eq("<=") { return Some(Stak.LE()); }
+    if name.eq(">") { return Some(Stak.GT()); }
+    if name.eq(">=") { return Some(Stak.GE()); }
+    if name.eq("not") { return Some(Stak.NOT()); }
+    if name.eq("and") { return Some(Stak.AND()); }
+    if name.eq("or") { return Some(Stak.OR()); }
+    if name.eq("print") { return Some(Stak.PRINT()); }
+    if name.eq(".") { return Some(Stak.DOT()); }
+    if name.eq("cr") { return Some(Stak.CR()); }
+    if name.eq("concat") { return Some(Stak.CONCAT()); }
+    if name.eq("tostr") { return Some(Stak.TOSTR()); }
+    if name.eq("len") { return Some(Stak.LEN()); }
+    if name.eq("array") { return Some(Stak.ARRAY()); }
+    if name.eq("@") { return Some(Stak.AT()); }
+    if name.eq("!") { return Some(Stak.STORE()); }
+    if name.eq("sqrt") { return Some(Stak.SQRT()); }
+    if name.eq("int") { return Some(Stak.TOINT()); }
+    if name.eq("true") { return Some(Stak.PUSHBOOL(1)); }
+    if name.eq("false") { return Some(Stak.PUSHBOOL(0)); }
+    if name.eq("nil") { return Some(Stak.PUSHNIL()); }
     None
 }
 
@@ -289,17 +290,17 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
         Int => {
             let v = t.int;
             if v >= -(1 << 23) and v < (1 << 23) {
-                c.op(d, &t, Stak.PUSHI(v as i32), 0, 1)?;
+                c.op(d, &t, Stak.PUSHI(v as i32))?;
                 return Ok(true);
             }
             let val = if v >= -2147483648 and v <= 2147483647 { Value.Int(v as i32) } else { Value.Num(v as f64) };
             let k = c.konst(&t, val)?;
-            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            c.op(d, &t, Stak.PUSHK(k))?;
             return Ok(true);
         }
         Float => {
             let k = c.konst(&t, Value.Num(t.float))?;
-            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            c.op(d, &t, Stak.PUSHK(k))?;
             return Ok(true);
         }
         Str => {
@@ -311,7 +312,7 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
                     k
                 }
             };
-            c.op(d, &t, Stak.PUSHK(k), 0, 1)?;
+            c.op(d, &t, Stak.PUSHK(k))?;
             return Ok(true);
         }
         Name => {}
@@ -352,11 +353,11 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
     if s.eq("to") {
         var n = c.expect_name(t.span, "a variable name")?;
         if let Some(slot) = d.local(n.text) {
-            c.op(d, &n, Stak.LSET(slot), 1, 0)?;
+            c.op(d, &n, Stak.LSET(slot))?;
             return Ok(true);
         }
         if let Some(Global(g)) = c.dict.get(n.text) {
-            c.op(d, &n, Stak.GSET(g), 1, 0)?;
+            c.op(d, &n, Stak.GSET(g))?;
             return Ok(true);
         }
         return Err(c.err(n.span, c.fmt("`", n.text, "` is not a local or a variable")));
@@ -456,7 +457,7 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
         let Some(slot) = d.do_slot(if s.eq("i") { 0 } else { 1 }) else {
             return Err(c.err(t.span, c.fmt("`", s, "` outside a `do` loop")));
         };
-        c.op(d, &t, Stak.LGET(slot), 0, 1)?;
+        c.op(d, &t, Stak.LGET(slot))?;
         return Ok(true);
     }
     if s.eq("[") {
@@ -467,7 +468,7 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
         let Some(Bracket(start)) = d.ctl.pop() else { return Err(c.err(t.span, "`]` without `[`")); };
         if d.depth < start { return Err(c.err(t.span, "the array literal pops values from outside it")); }
         let n = (d.depth - start) as u32;
-        c.op(d, &t, Stak.MKARRAY(n), n, 1)?;
+        c.op(d, &t, Stak.MKARRAY(n))?;
         return Ok(true);
     }
     if s.eq("exit") {
@@ -483,21 +484,22 @@ fn Comp.word(c: *Comp, d: *Def, t: Tok) -> Result<bool, Error> {
         return Ok(true);
     }
     if let Some(slot) = d.local(s) {
-        c.op(d, &t, Stak.LGET(slot), 0, 1)?;
+        c.op(d, &t, Stak.LGET(slot))?;
         return Ok(true);
     }
     if let Some(e) = c.dict.get(s) {
         match e {
             Call(i) => {
                 let w = c.words.at(i as u64);
-                c.op(d, &t, Stak.CALL(i), w.nin, w.nout)?;
+                c.effect(d, &t, w.nin, w.nout)?;
+                d.emit(Stak.CALL(i), t.line);
             }
-            Global(g) => c.op(d, &t, Stak.GGET(g), 0, 1)?,
+            Global(g) => c.op(d, &t, Stak.GGET(g))?,
         }
         return Ok(true);
     }
-    if let Some((w, nin, nout)) = builtin(s) {
-        c.op(d, &t, w, nin, nout)?;
+    if let Some(w) = builtin(s) {
+        c.op(d, &t, w)?;
         return Ok(true);
     }
     Err(c.err(t.span, c.fmt("unknown word `", s, "`")))
@@ -517,7 +519,6 @@ fn Comp.finish(c: *Comp, d: *Def) -> Result<*Word, Error> {
     w.words = words.slice(n);
     w.lines = lines.slice(n);
     w.nlocals = d.nlocals;
-    w.maxdepth = (d.maxdepth - w.nin as i32) as u32;
     d.code.free();
     d.locals.free();
     d.ctl.free();

@@ -1,6 +1,6 @@
 // A bytecode fuzzer for Stak, after the tutorial's chapter 9. It compiles
 // real programs, breaks one to three words of their bytecode, verifies
-// the result (operand clauses plus the `stack` check in vm.lm), and runs
+// the result (operand clauses and the declared stack effects), and runs
 // whatever passes under a step budget. A crash (or an ASan report) is a
 // hole in the verifier.
 //

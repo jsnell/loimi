@@ -2,9 +2,9 @@
 //
 // State registers: `pc`, `sp` and `tos` (the top value is cached in a
 // register, `sp` points at the one below it), `lp` (the current word's local slots) and `fp` (the
-// current frame). The compiler checks stack depths statically, so ops pop
-// and push without underflow checks; CALL checks for overflow once per
-// call, against the callee's maximum depth.
+// current frame). Ops declare their stack effects, which the verifier
+// checks, so they pop and push without underflow checks; CALL checks for
+// overflow once per call, against the callee's verified maximum depth.
 
 import std.io;
 import std.gc;
@@ -139,98 +139,6 @@ fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Result<Value, str> u
     Ok(Value.Str(value.new_str(&m.heap, m.tmp.as_str())))
 }
 
-/// The stack effect of instruction `w`: (pops, pushes), or None for an
-/// opcode with no entry here (superinstruction heads: `check_stack` splits
-/// them first).
-fn stack_effect(w: u32, words: *mem.Vec<*Word>) -> ?(i32, i32) {
-    let op = Stak.opcode(w);
-    if op == Stak.OP_PUSHI or op == Stak.OP_PUSHK or op == Stak.OP_PUSHNIL or op == Stak.OP_PUSHBOOL
-        or op == Stak.OP_LGET or op == Stak.OP_GGET { return Some((0, 1)); }
-    if op == Stak.OP_DUP { return Some((1, 2)); }
-    if op == Stak.OP_DROP or op == Stak.OP_LSET or op == Stak.OP_GSET or op == Stak.OP_JZ
-        or op == Stak.OP_PRINT or op == Stak.OP_DOT { return Some((1, 0)); }
-    if op == Stak.OP_SWAP { return Some((2, 2)); }
-    if op == Stak.OP_OVER or op == Stak.OP_TUCK { return Some((2, 3)); }
-    if op == Stak.OP_ROT { return Some((3, 3)); }
-    if op == Stak.OP_DUP2 { return Some((2, 4)); }
-    if op == Stak.OP_DROP2 or op == Stak.OP_DO { return Some((2, 0)); }
-    if op == Stak.OP_NIP or op == Stak.OP_ADD or op == Stak.OP_SUB or op == Stak.OP_MUL or op == Stak.OP_DIV
-        or op == Stak.OP_MOD or op == Stak.OP_LT or op == Stak.OP_LE or op == Stak.OP_GT or op == Stak.OP_GE
-        or op == Stak.OP_EQ or op == Stak.OP_NE or op == Stak.OP_AND or op == Stak.OP_OR
-        or op == Stak.OP_CONCAT or op == Stak.OP_AT { return Some((2, 1)); }
-    if op == Stak.OP_NEG or op == Stak.OP_ABS or op == Stak.OP_NOT or op == Stak.OP_TOSTR or op == Stak.OP_LEN
-        or op == Stak.OP_ARRAY or op == Stak.OP_SQRT or op == Stak.OP_TOINT { return Some((1, 1)); }
-    if op == Stak.OP_STORE { return Some((3, 0)); }
-    if op == Stak.OP_JMP or op == Stak.OP_LOOP or op == Stak.OP_RET or op == Stak.OP_HALT or op == Stak.OP_CR {
-        return Some((0, 0));
-    }
-    if op == Stak.OP_MKARRAY { return Some((Stak.N_x(w) as i32, 1)); }
-    if op == Stak.OP_CALL {
-        let callee = words.at(Stak.N_x(w));
-        return Some((callee.nin as i32, callee.nout as i32));
-    }
-    None
-}
-
-/// The verifier's stack check: every path through `code` keeps the data
-/// stack between 0 and the word's declared maximum, paths that meet agree
-/// on the depth, and RET leaves exactly the word's outputs. This is what
-/// lets the handlers pop and push without checks. (Loimi's verifier does
-/// not compute stack effects itself yet; this is the hand-written stand-in.)
-pub fn check_stack(words_in: []u32, word: *Word, words: *mem.Vec<*Word>) -> bool {
-    let n = words_in.len;
-    // Code that went through `Stak.optimize` has superinstruction heads;
-    // check a copy with them split back into their parts.
-    let copy: *u32 = mem.alloc(n);
-    defer mem.release(copy);
-    mem.copy(copy, words_in.ptr, n);
-    let code = copy.slice(n);
-    Stak.deopt_words(code);
-    let depth: *i32 = mem.alloc(n);
-    defer mem.release(depth);
-    for i in 0..n { depth[i] = -1; }
-    var work: mem.Vec<u64> = mem.Vec.new();
-    defer work.free();
-    let max = (word.nin + word.maxdepth) as i32;
-    depth[0] = word.nin as i32;
-    work.push(0);
-    while let Some(i) = work.pop() {
-        let w = code[i];
-        let op = Stak.opcode(w);
-        let Some((pops, pushes)) = stack_effect(w, words) else { return false; };
-        let d = depth[i];
-        if d < pops { return false; }
-        let nd = d - pops + pushes;
-        if nd > max { return false; }
-        if op == Stak.OP_HALT { continue; }
-        if op == Stak.OP_RET {
-            if d != word.nout as i32 { return false; }
-            continue;
-        }
-        var succ: [u64; 2] = [0, 0];
-        var ns = 0;
-        if let Some(off) = Stak.label(w) {
-            succ[0] = (i as i64 + off) as u64;
-            ns = 1;
-        }
-        if op != Stak.OP_JMP {
-            succ[ns] = i + Stak.op_size(w);
-            ns += 1;
-        }
-        for k in 0..ns {
-            let j = succ[k];
-            if j >= n { return false; }
-            if depth[j] < 0 {
-                depth[j] = nd;
-                work.push(j);
-            } else if depth[j] != nd {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 #[require_verified]
 pub vm Stak {
     context ctx: *Machine;
@@ -240,9 +148,11 @@ pub vm Stak {
     state { pc: *u32, sp: *Value, tos: Value, lp: *Value, fp: *Frame }
 
     verify_context word: *Word, nglobals: u32, nconsts: u32, words: *mem.Vec<*Word>;
-
-    /// Stack depths (see `check_stack`).
-    verify stack { check_stack(code, word, words) }
+    // Each op declares its stack effect; the verifier checks the depths
+    // (no underflow, paths agree where they meet, RET leaves exactly the
+    // word's results) and records the deepest the stack gets, which CALL
+    // checks room for once.
+    stack_entry word.nin;
 
     operand imm = it;
     operand kst = ctx.consts[it] verify (it as u32) < nconsts display "k{}";
@@ -268,17 +178,17 @@ pub vm Stak {
     fn put2(v: Value) { sp = sp - 1; tos = v; }
 
     // Literals.
-    op PUSHI(v: imm) : S { push(Int(v as i32)); next }
-    op PUSHK(c: kst) : N { push(c); next }
-    op PUSHNIL() : N { push(Nil); next }
-    op PUSHBOOL(b: imm) : N { push(Bool(b != 0)); next }
+    op PUSHI(v: imm) : S stack(-- n) { push(Int(v as i32)); next }
+    op PUSHK(c: kst) : N stack(-- k) { push(c); next }
+    op PUSHNIL() : N stack(-- nil) { push(Nil); next }
+    op PUSHBOOL(b: imm) : N stack(-- b) { push(Bool(b != 0)); next }
 
     // Stack shuffling.
-    op DUP() : N { push(tos); next }
-    op DROP() : N { drop1(); next }
-    op SWAP() : N { let b = tos; tos = *sp; *sp = b; next }
-    op OVER() : N { let a = *sp; push(a); next }
-    op ROT() : N {
+    op DUP() : N stack(a -- a a) { push(tos); next }
+    op DROP() : N stack(a --) { drop1(); next }
+    op SWAP() : N stack(a b -- b a) { let b = tos; tos = *sp; *sp = b; next }
+    op OVER() : N stack(a b -- a b a) { let a = *sp; push(a); next }
+    op ROT() : N stack(a b c -- b c a) {
         // a b c -- b c a
         let a = *(sp - 1);
         *(sp - 1) = *sp;
@@ -286,8 +196,8 @@ pub vm Stak {
         tos = a;
         next
     }
-    op NIP() : N { sp = sp - 1; next }
-    op TUCK() : N {
+    op NIP() : N stack(a b -- b) { sp = sp - 1; next }
+    op TUCK() : N stack(a b -- b a b) {
         // a b -- b a b
         let a = *sp;
         *sp = tos;
@@ -296,8 +206,8 @@ pub vm Stak {
         *sp = a;
         next
     }
-    op DUP2() : N { let a = *sp; let b = tos; push(a); push(b); next }
-    op DROP2() : N { tos = *(sp - 1); sp = sp - 2; next }
+    op DUP2() : N stack(a b -- a b a b) { let a = *sp; let b = tos; push(a); push(b); next }
+    op DROP2() : N stack(a b --) { tos = *(sp - 1); sp = sp - 2; next }
 
     // Arithmetic: ( a b -- c ).
     inline for (name, checked, sym, kind) in [
@@ -305,7 +215,7 @@ pub vm Stak {
         ("SUB", "sub_checked", -, Arith.Sub),
         ("MUL", "mul_checked", *, Arith.Mul),
     ] {
-        op #name() : N {
+        op #name() : N stack(a b -- c) {
             let b = tos;
             let a = *sp;
             match (a, b) {
@@ -316,7 +226,7 @@ pub vm Stak {
             cold { let r = arith(ctx, kind, a, b)?; put2(r); next }
         }
     }
-    op DIV() : N {
+    op DIV() : N stack(a b -- c) {
         let b = tos;
         let a = *sp;
         match (a, b) {
@@ -326,13 +236,13 @@ pub vm Stak {
         }
         cold { let r = arith(ctx, Arith.Div, a, b)?; put2(r); next }
     }
-    op MOD() : N {
+    op MOD() : N stack(a b -- c) {
         let b = tos;
         let a = *sp;
         if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 { put2(Int(x % y)); next }
         cold { let r = arith(ctx, Arith.Mod, a, b)?; put2(r); next }
     }
-    op NEG() : N {
+    op NEG() : N stack(a -- b) {
         match tos {
             Int(x) => if x != -2147483648 { tos = Int(0 - x); next },
             Num(x) => { tos = Num(-x); next }
@@ -340,7 +250,7 @@ pub vm Stak {
         }
         cold { tos = arith(ctx, Arith.Sub, Value.Int(0), tos)?; next }
     }
-    op ABS() : N {
+    op ABS() : N stack(a -- b) {
         match tos {
             Int(x) => if x != -2147483648 { if x < 0 { tos = Int(0 - x); } next },
             Num(x) => { if x < 0.0 { tos = Num(-x); } next }
@@ -360,7 +270,7 @@ pub vm Stak {
         ("GT", x > y, less(ctx, b, a, false)),
         ("GE", x >= y, less(ctx, b, a, true)),
     ] {
-        op #name() : N {
+        op #name() : N stack(a b -- f) {
             let b = tos;
             let a = *sp;
             match (a, b) {
@@ -371,33 +281,33 @@ pub vm Stak {
             cold { let r = slow?; put2(Bool(r)); next }
         }
     }
-    op EQ() : N {
+    op EQ() : N stack(a b -- f) {
         let b = tos;
         let a = *sp;
         if let (Int(x), Int(y)) = (a, b) { put2(Bool(x == y)); next }
         put2(Bool(equal(a, b)));
         next
     }
-    op NE() : N {
+    op NE() : N stack(a b -- f) {
         let b = tos;
         let a = *sp;
         if let (Int(x), Int(y)) = (a, b) { put2(Bool(x != y)); next }
         put2(Bool(!equal(a, b)));
         next
     }
-    op NOT() : N { tos = Bool(!value.truthy(tos)); next }
-    op AND() : N { put2(Bool(value.truthy(*sp) and value.truthy(tos))); next }
-    op OR() : N { put2(Bool(value.truthy(*sp) or value.truthy(tos))); next }
+    op NOT() : N stack(a -- f) { tos = Bool(!value.truthy(tos)); next }
+    op AND() : N stack(a b -- f) { put2(Bool(value.truthy(*sp) and value.truthy(tos))); next }
+    op OR() : N stack(a b -- f) { put2(Bool(value.truthy(*sp) or value.truthy(tos))); next }
 
     // Locals and globals.
-    op LGET(l: loc) : N { push(l); next }
-    op LSET(l: loc) : N { l = tos; drop1(); next }
-    op GGET(g: glob) : N { push(g); next }
-    op GSET(g: glob) : N { g = tos; drop1(); next }
+    op LGET(l: loc) : N stack(-- v) { push(l); next }
+    op LSET(l: loc) : N stack(v --) { l = tos; drop1(); next }
+    op GGET(g: glob) : N stack(-- v) { push(g); next }
+    op GSET(g: glob) : N stack(v --) { g = tos; drop1(); next }
 
     // Branches.
-    op JMP(target: label) : S { jump target }
-    op JZ(target: label) : S {
+    op JMP(target: label) : S stack(--) { jump target }
+    op JZ(target: label) : S stack(f --) {
         let v = tos;
         drop1();
         if !value.truthy(v) { jump target }
@@ -407,7 +317,7 @@ pub vm Stak {
     // Counted loops. DO pops `limit start` into the slot pair and skips
     // the loop if start >= limit; LOOP increments and jumps back while
     // the index is below the limit.
-    op DO(s: dslot, target: label) : LS {
+    op DO(s: dslot, target: label) : LS stack(limit start --) {
         let start = tos;
         let limit = *sp;
         tos = *(sp - 1);
@@ -420,7 +330,7 @@ pub vm Stak {
         }
         cold { raise "do: the bounds must be integers" }
     }
-    op LOOP(s: dslot, target: label) : LS {
+    op LOOP(s: dslot, target: label) : LS stack(--) {
         if let (Int(i), Int(n)) = (s, lp[s.raw + 1]) {
             let j = i + 1;
             s = Int(j);
@@ -432,10 +342,10 @@ pub vm Stak {
 
     // Calls. Arguments stay where they are on the data stack; the callee
     // gets fresh local slots above the caller's.
-    op CALL(w: wref) : N {
+    op CALL(w: wref) : N stack(args[words.at(w).nin] -- results[words.at(w).nout]) {
         let callee = ctx.words.ptr[w];
         let nlp = lp + fp.word.nlocals as u64;
-        if sp + callee.maxdepth as u64 >= ctx.stack_end or nlp + callee.nlocals as u64 > ctx.lstack_end
+        if sp + callee.code.max_stack() as u64 >= ctx.stack_end or nlp + callee.nlocals as u64 > ctx.lstack_end
             or fp + 1 == ctx.frames_end {
             cold { raise "stack overflow" }
         }
@@ -449,24 +359,24 @@ pub vm Stak {
         lp = nlp;
         jump callee.code
     }
-    op RET() : N {
+    op RET() : N stack(results[word.nout] --) {
         if fp == ctx.frames { exit Ok(()) }
         lp = fp.lp;
         let r = fp.ret;
         fp = fp - 1;
         jump r
     }
-    op HALT() : N { exit Ok(()) }
+    op HALT() : N stack(.. --) { exit Ok(()) }
 
     // Builtins.
-    op PRINT() : N {
+    op PRINT() : N stack(v --) {
         ctx.out.clear();
         value.write(&ctx.out, tos);
         drop1();
         io.println(ctx.out.as_str());
         next
     }
-    op DOT() : N {
+    op DOT() : N stack(v --) {
         ctx.out.clear();
         value.write(&ctx.out, tos);
         ctx.out.push(' ');
@@ -474,18 +384,18 @@ pub vm Stak {
         io.print(ctx.out.as_str());
         next
     }
-    op CR() : N { io.println(""); next }
-    op CONCAT() : N {
+    op CR() : N stack(--) { io.println(""); next }
+    op CONCAT() : N stack(a b -- s) {
         let r = stringify(ctx, *sp, tos, true)?;
         put2(r);
         next
     }
-    op TOSTR() : N {
+    op TOSTR() : N stack(v -- s) {
         if let Str(_) = tos { next }
         tos = stringify(ctx, tos, Nil, false)?;
         next
     }
-    op LEN() : N {
+    op LEN() : N stack(v -- n) {
         match tos {
             Str(s) => { tos = Int(s.data.len as i32); next }
             Arr(a) => { tos = Int(a.items.len as i32); next }
@@ -493,7 +403,7 @@ pub vm Stak {
         }
         cold { raise type_error("len", tos, ctx) }
     }
-    op ARRAY() : N {
+    op ARRAY() : N stack(n -- arr) {
         if let Int(n) = tos and n >= 0 and n <= MAX_LEN {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
             tos = Arr(value.new_arr(&ctx.heap, n as u64));
@@ -502,7 +412,7 @@ pub vm Stak {
         cold { raise "array: the size must be an integer from 0 to 2^24" }
     }
     /// The top `n` values become an array.
-    op MKARRAY(n: cnt) : N {
+    op MKARRAY(n: cnt) : N stack(xs[n] -- arr) {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
         let a = new(&ctx.heap, value.Arr {}, n);
         if n == 0 { push(Arr(a)); next }
@@ -514,7 +424,7 @@ pub vm Stak {
         tos = Arr(a);
         next
     }
-    op AT() : N {
+    op AT() : N stack(arr i -- v) {
         if let (Arr(a), Int(i)) = (*sp, tos) {
             let u = i as u64;
             if u < a.items.len { put2(a.items.ptr[u]); next }
@@ -522,7 +432,7 @@ pub vm Stak {
         }
         cold { raise type_error("@", *sp, ctx) }
     }
-    op STORE() : N {
+    op STORE() : N stack(v arr i --) {
         if let (Arr(a), Int(i)) = (*sp, tos) {
             let u = i as u64;
             if u < a.items.len {
@@ -535,11 +445,11 @@ pub vm Stak {
         }
         cold { raise type_error("!", *sp, ctx) }
     }
-    op SQRT() : N {
+    op SQRT() : N stack(x -- y) {
         if let Some(x) = value.to_f64(tos) { tos = Num(sqrt(x)); next }
         cold { raise type_error("sqrt", tos, ctx) }
     }
-    op TOINT() : N {
+    op TOINT() : N stack(x -- n) {
         match tos {
             Int(_) => next,
             Num(x) => if x > -2147483649.0 and x < 2147483648.0 { tos = Int(x as i32); next },

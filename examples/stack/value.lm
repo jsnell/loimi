@@ -29,10 +29,9 @@ pub struct Word {
     nout: u32,
     /// Local slots, including the hidden ones of `do` loops.
     nlocals: u32,
-    /// The deepest the data stack gets above the word's entry depth minus
-    /// its inputs, as computed by the compiler. CALL checks room for it.
-    maxdepth: u32,
     words: []u32,
+    /// The verified code; `code.max_stack()` is how far the data stack
+    /// grows above the word's inputs, which CALL checks room for.
     code: Verified<Stak>,
     lines: []u32,
 }

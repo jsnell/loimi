@@ -447,6 +447,26 @@ fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     }
 }
 
+/// Stak, the stack VM (examples/stack): every tests/NAME.stk prints
+/// tests/NAME.expected (stdout and stderr) in every dispatch mode, with and
+/// without GC stress, built with `-W error` (examples/stack/check.sh).
+#[test]
+fn stack_programs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/stack/check.sh"))
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/stack/check.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The tutorial (docs/tutorial, examples/tutorial): every step builds and
 /// passes its tests in every dispatch mode, with and without GC stress
 /// (examples/tutorial/check.sh), and every ```loimi block in the chapters
