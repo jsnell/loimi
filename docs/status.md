@@ -17,11 +17,13 @@ in [`language.md`](language.md). Updated 2026-11-02.
 | Generated per vm | encoders (`Vm.OP(..)`), emitters (`Vm.emit.OP(..)`), opcode constants, `op_size`, `op_name`, the superinstruction peephole (`Vm.optimize`), and the verifier (`Vm.verify`). |
 | Instrumentation | `variant NAME wraps all|[OPS] { before { .. } }`, switched with `use_variant`. `loimi build --vm-stats` counts executed ops and adjacent op pairs, and prints frequent pairs at exit as `super` declarations. |
 | GC | `object` types (with trailing arrays), `Gc<T>`, `new(heap, ..)`, `gc_mark`; `std.gc` mark-sweep written in Loimi; compiler-generated tracing (including pointers inside values); shadow-stack frames for traced locals; effects (`uses sync/gc/reenter`), also on function types (`fn(*Heap) uses gc`), so calls through function pointers are checked and rooted. |
-| Standard library | `std.io`, `std.os`, `std.mem` (`Vec`, `Arena`, allocation), `std.hash`, `std.map` (`HashMap`), `std.text` (`StrBuf`, `Interner`, number parsing/printing), `std.gc`, and the front-end modules below. |
+| Standard library | `std.io`, `std.os`, `std.mem` (`Vec`, `Arena`, allocation), `std.hash`, `std.map` (`HashMap`), `std.text` (`StrBuf`, `Interner`, number parsing/printing), `std.gc`, and the front-end and back-end modules below. |
 | `std.num` | Exact numeral parsing with overflow reporting (`parse_int`, `parse_i64`/`parse_u64` in radix 2 to 36, `parse_u64_wrapping`, `parse_f64` via strtod with strict syntax, `parse_number` for literals, `decimal_len`), float formatting (`write_g` for `%.14g`, `write_shortest` for shortest round-trip, `mark_float` for Lua's `3.0`, `write_hex`), `add/sub/mul_overflow`, `floor_div`/`floor_mod`/`trunc_div`/`trunc_rem` with the `MIN / -1` case defined, float `floor_div_f64`/`floor_mod_f64`, `to_i64_exact`. |
 | `std.diag` | `Span`, `SourceMap` (borrowed files, lazily built line-start table, binary-searched `line_col`, `line_text`, `write_location`), `Diag` (severity, message, primary span with label, notes and help lines, built with `with_label`/`with_note`/`with_note_at`/`with_help`), rendering with a snippet and carets in the compiler's format, and a `Diagnostics` sink that copies messages into an arena, counts errors and warnings, and prints a summary. |
 | `std.lex` | A scanner toolkit rather than a generator: `Cursor` (peek, bump, line tracking, marks, spans, errors), `Syntax` presets (`lua()`, `c_like()`, `none()`) for line, block, nested and Lua long-bracket comments, escape and overflow rules; `skip_trivia`, `ident`, `number` (via std.num), `quoted` (escapes into a `StrBuf`, including `\ddd`, `\xHH`, `\u{..}`, `\z`, line continuation), `long_string`, `OpTable<K>` (maximal munch), `Keywords<K>`. Errors are `lex.Error` (span and message), convertible to a `diag.Diag`. A complete lexer for Mini's token set is about 50 lines (`tests/run/lex_toy.lm`). |
 | `std.parse` | `Pratt<P, K, E, X>`: binding-power table indexed by token kind (`infix_left`, `infix_right`, `infix`, `prefix`) and a driver that calls the user's `peek`, `advance`, `atom`, `unary`, `binary` and optional `before_rhs` hooks through function pointers. |
+| `std.bc` | Bytecode construction over any vm's generated encoders: `Code<W>` (given `Vm.op_size` and a jump-patch function: `op` reserves inline-cache words, labels with fixups, jump lists, range-checked patching with sticky errors, a run-length position table with per-word expansion and a delta-encoded form, `last`/`truncate` for peepholes, jump threading), `Field` (encoded bit fields), `Pool<K: hash.Hash>` (deduplicating constant pool with a limit) and `Regs` (Lua-style locals/temporaries register allocator with maximum tracking). |
+| `std.obj` | Hidden-class objects over the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache`, allocation templates. No attributes, elements or globals cells. |
 | Example | `examples/mini/`: a Lua-like interpreter (lexer, compiler, VM, GC'd strings and tables), tested with GC stress. |
 | Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, and the Mini scripts with and without GC stress. |
 
@@ -65,6 +67,16 @@ in [`language.md`](language.md). Updated 2026-11-02.
   time; there are no `TokenStream` or error-recovery helpers, fix-it hints,
   ANSI color, `BigInt`, or Ryu/Eisel-Lemire (formatting and parsing use
   snprintf and strtod). See the notes in [`stdlib.md`](stdlib.md).
+- **Back-end stdlib** (`std.bc`, `std.obj`): `std.bc` is a library that
+  takes the generated `Vm.op_size` and a jump-patch function rather than
+  a generated `Builder`; it has no branch relaxation, exception table,
+  proto assembly or serialization. `std.obj` has no comptime `Model`:
+  the interpreter declares its object and slot-array types and
+  instantiates a generic `Model`; keys are u64 symbol ids; attributes,
+  elements and global property cells are not built. Shape ids are never
+  reused, so inline caches need no reset after a collection. See the
+  "As implemented" notes in [`stdlib.md`](stdlib.md) and
+  [`stdlib/obj.md`](stdlib/obj.md#as-implemented).
 - **`inline for`** is token-level expansion: values are token sequences
   (so operators like `+` work), and `#var` makes an identifier from a
   string or identifier value.
@@ -72,6 +84,7 @@ in [`language.md`](language.md). Updated 2026-11-02.
   generic traits; see the proposal in
   [`design/closures-traits.md`](design/closures-traits.md)), a moving,
   incremental or generational GC, weak references, ephemerons, finalizers,
-  `std.bc`/`obj`/`rt`/`prof`/`test`, line tables,
+  `std.rt`/`prof`/`test`, generic `object` types (`object Obj<T>`; std.obj
+  is generic over the interpreter's own object type instead),
   variable-length encodings, atomic `become` for shared code, and the C
   embedding header.
