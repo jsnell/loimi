@@ -395,6 +395,64 @@ fn check_pc_writes(c: &Checker, vi: usize) -> Res<()> {
     Ok(())
 }
 
+/// The vm's inline cache layouts. Each cache field starts a code word
+/// and takes as many as its type needs (recorded in `l.cache_words`). GC
+/// references are not allowed: the collector does not scan bytecode (see
+/// language.md §7.1).
+fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::VmLayout) -> Res<Vec<CacheInfo>> {
+    let mut caches = Vec::new();
+    let wb = l.word_bits as u64 / 8;
+    for (ci, cd) in d.caches.iter().enumerate() {
+        let mut fields = Vec::new();
+        let mut off = 0u32;
+        for (f, t, weak) in &cd.fields {
+            if *weak {
+                return Err(Diag::new(
+                    t.span,
+                    "`weak` cache fields are not supported: inline caches cannot hold GC references (see language.md §7.1)",
+                ));
+            }
+            if fields.iter().any(|(n, _, _): &(String, Ty, u32)| *n == f.name) {
+                return Err(Diag::new(f.span, format!("duplicate field `{}` in cache `{}`", f.name, cd.name.name)));
+            }
+            let ft = c.resolve_type(m, t)?;
+            if let Some(why) = bad_cache_type(&ft) {
+                return Err(Diag::new(t.span, format!("cache field `{}` has type `{}`: {}", f.name, c.ty_name(&ft), why)));
+            }
+            let words = crate::layout::size_of(&c.prog, &ft).max(1).div_ceil(wb) as u32;
+            fields.push((f.name.clone(), ft, off));
+            off += words;
+        }
+        l.cache_words[ci] = off;
+        caches.push(CacheInfo { name: cd.name.name.clone(), fields });
+    }
+    Ok(caches)
+}
+
+/// The vm's operand kinds; `const` kinds must all index the same state
+/// register (one constant pool per vm: the JIT is given one per code
+/// object).
+fn operand_kinds(d: &VmDecl, state: &[(String, Ty)]) -> Res<Vec<OperandKind>> {
+    let mut kinds: Vec<OperandKind> = Vec::new();
+    for o in &d.operands {
+        let konst = match &o.konst {
+            None => None,
+            Some(_) => Some(const_base(&o.body, state).ok_or_else(|| {
+                Diag::new(
+                    o.body.span,
+                    format!("a `const` operand kind reads `S[it]` for a pointer state register `S` (operand `{}`)", o.name.name),
+                )
+            })?),
+        };
+        kinds.push(OperandKind { name: o.name.name.clone(), body: o.body.clone(), verify: o.verify.clone(), konst });
+    }
+    if let Some((a, b)) = kinds.iter().filter_map(|k| k.konst.map(|s| (k, s))).collect::<Vec<_>>().windows(2).find(|w| w[0].1 != w[1].1).map(|w| (w[0].0.name.clone(), w[1].0.name.clone())) {
+        let o = d.operands.iter().find(|o| o.name.name == b).unwrap();
+        return Err(Diag::new(o.body.span, format!("`const` operand kinds `{}` and `{}` read different state registers; a vm has at most one constant pool", a, b)));
+    }
+    Ok(kinds)
+}
+
 pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     let (m, d) = c.vm_decls[i].clone();
     let vm = i as u32;
@@ -431,53 +489,8 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     if state[pc_idx].1 != Ty::Ptr(Box::new(Ty::Int(word))) {
         return Err(Diag::new(d.name.span, format!("`pc` must have type `*u{}` (pointer to the code word)", word.bits)));
     }
-    // Each cache field starts a code word and takes as many as its type
-    // needs. GC references are not allowed: the collector does not scan
-    // bytecode (see language.md §7.1).
-    let mut caches = Vec::new();
-    let wb = l.word_bits as u64 / 8;
-    for (ci, cd) in d.caches.iter().enumerate() {
-        let mut fields = Vec::new();
-        let mut off = 0u32;
-        for (f, t, weak) in &cd.fields {
-            if *weak {
-                return Err(Diag::new(
-                    t.span,
-                    "`weak` cache fields are not supported: inline caches cannot hold GC references (see language.md §7.1)",
-                ));
-            }
-            if fields.iter().any(|(n, _, _): &(String, Ty, u32)| *n == f.name) {
-                return Err(Diag::new(f.span, format!("duplicate field `{}` in cache `{}`", f.name, cd.name.name)));
-            }
-            let ft = c.resolve_type(m, t)?;
-            if let Some(why) = bad_cache_type(&ft) {
-                return Err(Diag::new(t.span, format!("cache field `{}` has type `{}`: {}", f.name, c.ty_name(&ft), why)));
-            }
-            let words = crate::layout::size_of(&c.prog, &ft).max(1).div_ceil(wb) as u32;
-            fields.push((f.name.clone(), ft, off));
-            off += words;
-        }
-        l.cache_words[ci] = off;
-        caches.push(CacheInfo { name: cd.name.name.clone(), fields });
-    }
-    let mut kinds: Vec<OperandKind> = Vec::new();
-    for o in &d.operands {
-        let konst = match &o.konst {
-            None => None,
-            Some(_) => Some(const_base(&o.body, &state).ok_or_else(|| {
-                Diag::new(
-                    o.body.span,
-                    format!("a `const` operand kind reads `S[it]` for a pointer state register `S` (operand `{}`)", o.name.name),
-                )
-            })?),
-        };
-        kinds.push(OperandKind { name: o.name.name.clone(), body: o.body.clone(), verify: o.verify.clone(), konst });
-    }
-    // One constant pool per vm (the JIT is given one per code object).
-    if let Some((a, b)) = kinds.iter().filter_map(|k| k.konst.map(|s| (k, s))).collect::<Vec<_>>().windows(2).find(|w| w[0].1 != w[1].1).map(|w| (w[0].0.name.clone(), w[1].0.name.clone())) {
-        let o = d.operands.iter().find(|o| o.name.name == b).unwrap();
-        return Err(Diag::new(o.body.span, format!("`const` operand kinds `{}` and `{}` read different state registers; a vm has at most one constant pool", a, b)));
-    }
+    let caches = cache_infos(c, m, &d, &mut l)?;
+    let kinds = operand_kinds(&d, &state)?;
     let dispatch = match c.dispatch_override {
         Some(x) => x,
         None => match d.attrs.get("dispatch").and_then(|a| a.first()).map(|s| s.as_str()) {
@@ -769,7 +782,15 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     }
     check_const_writes(c, i)?;
     check_pc_writes(c, i)?;
-    // Instrumentation variants: a wrapper per wrapped op.
+    check_variants(c, &d, i, &prefix, cc)?;
+    check_collects(c, &d, i)?;
+    check_shared_next(c, i)
+}
+
+/// Instrumentation variants: a wrapper per wrapped op.
+fn check_variants(c: &mut Checker, d: &VmDecl, i: usize, prefix: &str, cc: CallConv) -> Res<()> {
+    let vm = i as u32;
+    let (state_tys, ret) = (c.prog.vms[i].state_tys.clone(), c.prog.vms[i].ret.clone());
     for (vi, var) in d.variants.iter().enumerate() {
         if var.name.name == "default" || d.variants[..vi].iter().any(|x| x.name.name == var.name.name) {
             return Err(Diag::new(var.name.span, format!("bad or duplicate variant name `{}`", var.name.name)));
@@ -808,9 +829,13 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         }
         c.prog.vms[i].variants.push((var.name.name.clone(), wrappers));
     }
-    // Vm code that may collect runs inside every entry's call: the entry
-    // declares it, so its callers (also through function pointers) root
-    // their traced locals.
+    Ok(())
+}
+
+/// Vm code that may collect runs inside every entry's call: the entry
+/// must declare it, so its callers (also through function pointers) root
+/// their traced locals.
+fn check_collects(c: &mut Checker, d: &VmDecl, i: usize) -> Res<()> {
     if let Some((site, callee)) = c.vms[i].collects.clone() {
         for (e, fid) in d.entries.iter().zip(c.prog.vms[i].entries.clone()) {
             if c.prog.fns[fid as usize].effects & EFF_GC == 0 {
@@ -825,9 +850,9 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 .note(site, format!("{} may collect here", callee)));
             }
         }
-        warn_unsynced_roots(c, &d, i, site);
+        warn_unsynced_roots(c, d, i, site);
     }
-    check_shared_next(c, i)
+    Ok(())
 }
 
 fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) -> Res<()> {
