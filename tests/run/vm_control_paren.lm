@@ -1,0 +1,69 @@
+// Control words followed by `(`: `jump (expr)`, `exit (expr)`,
+// `raise (..)` and `fail (..)` take a parenthesized operand in vm code.
+import std.io;
+
+vm P {
+    state { pc: *u32, acc: i64, saved: u64 }
+
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format A { op: 8, a: 24 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op ADD(v: imm) : A { acc = acc + (v as i64); next }
+    // Remember where the next instruction is, as an address.
+    op MARK() : A { saved = (pc + 1) as u64; next }
+    // Jump back to the remembered address, once.
+    op BACK() : A {
+        if saved != 0 {
+            let t = saved;
+            saved = 0;
+            jump (t as *u32)
+        }
+        next
+    }
+    op SKIP(target: label) : sJ { jump (target) }
+    op CHECK(v: imm) : A {
+        if acc > (v as i64) { raise (acc) }
+        next
+    }
+    op FAIL() : A { fail (acc * 2) }
+    op HALT() : A { exit (Ok(acc)) }
+
+    entry run(code: *u32) -> Result<i64, i64> {
+        pc = code;
+        acc = 0;
+        saved = 0;
+        jump pc
+    }
+
+    on raise(e: i64) { exit (Ok(0 - e)) }
+}
+
+fn show(r: Result<i64, i64>) {
+    match r {
+        Ok(v) => { io.print("ok "); io.print_int(v); io.println(""); }
+        Err(e) => { io.print("err "); io.print_int(e); io.println(""); }
+    }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    code[0] = P.MARK();
+    code[1] = P.ADD(5);
+    code[2] = P.BACK();
+    code[3] = P.SKIP(2);
+    code[4] = P.ADD(100);
+    code[5] = P.HALT();
+    show(P.run(&code[0]));
+    // expect: ok 10
+    code[5] = P.FAIL();
+    show(P.run(&code[0]));
+    // expect: err 20
+    code[5] = P.CHECK(3);
+    show(P.run(&code[0]));
+    // expect: ok -10
+}

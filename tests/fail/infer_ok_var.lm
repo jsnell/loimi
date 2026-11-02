@@ -1,0 +1,4 @@
+fn main() {
+    var r = Ok(false);
+}
+// error: annotate it: `var r: Result<T, E> = Ok(..);`

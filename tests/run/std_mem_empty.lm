@@ -1,0 +1,93 @@
+// An empty Vec allocates nothing; every method handles it. Byte search
+// and comparison helpers; HashMap.clear.
+import std.io;
+import std.mem;
+import std.map;
+import std.text;
+
+fn show(x: i64) { io.print_int(x); io.println(""); }
+fn showo(o: ?u64) { show(if let Some(i) = o { i as i64 } else { -1 }); }
+
+struct Holder { names: mem.Vec<str>, marks: mem.Vec<u32> }
+
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    show(v.cap as i64);
+    // expect: 0
+    show(v.items().len as i64);
+    // expect: 0
+    show(if v.pop().is_none() and v.get(0).is_none() and v.last().is_none() { 1 } else { 0 });
+    // expect: 1
+    v.truncate(3);
+    v.clear();
+    v.sort_by(|a, b| (*a as i32) - (*b as i32));
+    v.free();
+    v.free();
+    for i: u64 in 0..100 { v.push(i * i); }
+    show(v.at(99) as i64);
+    // expect: 9801
+    v.free();
+    v.push(7);
+    show(v.at(0) as i64);
+    // expect: 7
+    v.free();
+    var w: mem.Vec<u8> = mem.Vec.with_capacity(0);
+    w.reserve(10);
+    show((w.cap >= 10) as i64);
+    // expect: 1
+    w.free();
+    // Taking ownership of an empty Vec's memory and releasing it is fine.
+    let e: mem.Vec<u32> = mem.Vec.new();
+    mem.release(e.ptr);
+    let q = mem.grow(e.ptr, 4);
+    q[3] = 5;
+    show(q[3] as i64);
+    // expect: 5
+    mem.release(q);
+    // Placeholders cost nothing: overwrite them freely.
+    var h = Holder { names: mem.Vec.new(), marks: mem.Vec.new() };
+    var m2: mem.Vec<u32> = mem.Vec.new();
+    m2.push(1);
+    h.marks = m2;
+    show(h.marks.len as i64 + h.names.len as i64);
+    // expect: 1
+    h.marks.free();
+
+    let s = "hello, world";
+    showo(mem.find_byte(s, 'o'));
+    // expect: 4
+    showo(mem.rfind_byte(s, 'o'));
+    // expect: 8
+    showo(mem.find_byte(s, 'z'));
+    // expect: -1
+    showo(mem.find_byte("", 'a'));
+    // expect: -1
+    showo(mem.find_bytes(s, "world"));
+    // expect: 7
+    showo(mem.find_bytes(s, "worlds"));
+    // expect: -1
+    showo(mem.find_bytes(s, ""));
+    // expect: 0
+    showo(text.find(s, ','));
+    // expect: 5
+    show(mem.compare_bytes("abc", "abd") as i64);
+    // expect: -1
+    show(mem.compare_bytes("abc", "ab") as i64);
+    // expect: 1
+    show(mem.compare_bytes("", "") as i64);
+    // expect: 0
+    show(mem.equal_bytes("ab", "ab") as i64);
+    // expect: 1
+
+    var m: map.HashMap<u64, u64> = map.HashMap.new();
+    for i: u64 in 0..50 { m.insert(i, i * 2); }
+    m.clear();
+    show(m.len as i64);
+    // expect: 0
+    show(m.get(3).is_none() as i64);
+    // expect: 1
+    m.insert(3, 4);
+    show(m.get(3).unwrap() as i64);
+    // expect: 4
+    m.free();
+}

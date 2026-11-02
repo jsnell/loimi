@@ -1,0 +1,8 @@
+vm P {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    op NOP() : A { next() }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+fn main() {}
+// error: `next` is a control word and takes no operand

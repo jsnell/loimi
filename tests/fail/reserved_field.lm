@@ -1,0 +1,3 @@
+struct S { a: u8, in: *u8 }
+fn main() {}
+// error: found `in`, which is a reserved word (rename it, e.g. `in_`)

@@ -1,0 +1,6 @@
+fn f(t: *u32) -> i64 {
+    jump (t);
+    0
+}
+fn main() {}
+// error: `jump` is a control word: it is only available in op handlers

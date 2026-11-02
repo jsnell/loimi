@@ -119,6 +119,8 @@ pub enum Intr {
     Floor,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
+    /// `__panic("msg")` (generated code only): panic with a message.
+    Panic,
 }
 
 #[derive(Clone, Debug)]

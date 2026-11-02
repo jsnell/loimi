@@ -75,6 +75,8 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x`: bitwise not, integers only (lowered to `Not`).
+    BitNot,
     Deref,
     AddrOf,
 }

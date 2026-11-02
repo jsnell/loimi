@@ -8,6 +8,17 @@ extern "C" fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
 extern "C" fn memmove(dst: *u8, src: *u8, n: u64) -> *u8;
 extern "C" fn memset(dst: *u8, c: i32, n: u64) -> *u8;
 extern "C" fn memcmp(a: *u8, b: *u8, n: u64) -> i32;
+extern "C" fn memchr(p: *u8, c: i32, n: u64) -> ?*u8;
+extern "C" fn memrchr(p: *u8, c: i32, n: u64) -> ?*u8;
+extern "C" fn memmem(h: *u8, hn: u64, n: *u8, nn: u64) -> ?*u8;
+
+/// What the pointer of an empty `Vec` (capacity 0) points to: never read,
+/// written or freed. `release` and `grow` know it, so code that takes
+/// ownership of `v.ptr` (`mem.release(v.items().ptr)`) works for an
+/// empty `Vec` too.
+var EMPTY: [u64; 2] = [0; 2];
+
+fn empty_ptr<T>() -> *T { (&EMPTY[0]) as *T }
 
 /// Allocate `n` zeroed values of type T.
 pub fn alloc<T>(n: u64) -> *T {
@@ -24,15 +35,19 @@ pub fn try_alloc<T>(n: u64) -> ?*T {
     Some(p as *T)
 }
 
-/// Resize an allocation made with `alloc`.
+/// Resize an allocation made with `alloc` (or the pointer of an empty
+/// `Vec`).
 pub fn grow<T>(p: *T, n: u64) -> *T {
+    if p == empty_ptr<T>() { return alloc(n); }
     let q = realloc(p as *u8, n * size_of<T>());
     if (q as u64) == 0 { panic_oom(); }
     q as *T
 }
 
+/// Free an allocation made with `alloc` or `grow`. The pointer of an
+/// empty `Vec` is ignored.
 pub fn release<T>(p: *T) {
-    free(p as *u8);
+    if p != empty_ptr<T>() { free(p as *u8); }
 }
 
 pub fn copy<T>(dst: *T, src: *T, n: u64) {
@@ -48,14 +63,17 @@ fn panic_oom() {
     loimi_panic(m.ptr, m.len);
 }
 
-/// A growable array.
+/// A growable array. An empty one (`Vec.new()`, or after `free()`)
+/// allocates nothing: its capacity is 0 and its pointer a static
+/// sentinel, so creating, overwriting and dropping one costs nothing.
 pub struct Vec<T> { ptr: *T, len: u64, cap: u64 }
 
-pub fn Vec<T>.new() -> Vec<T> { Vec { ptr: alloc(1), len: 0, cap: 1 } }
+/// An empty `Vec`; it allocates on the first push.
+pub fn Vec<T>.new() -> Vec<T> { Vec { ptr: empty_ptr(), len: 0, cap: 0 } }
 
 pub fn Vec<T>.with_capacity(n: u64) -> Vec<T> {
-    let c = if n == 0 { 1 } else { n };
-    Vec { ptr: alloc(c), len: 0, cap: c }
+    if n == 0 { return Vec.new(); }
+    Vec { ptr: alloc(n), len: 0, cap: n }
 }
 
 pub fn Vec<T>.reserve(v: *Vec<T>, extra: u64) {
@@ -67,12 +85,16 @@ pub fn Vec<T>.reserve(v: *Vec<T>, extra: u64) {
 }
 
 pub fn Vec<T>.push(v: *Vec<T>, x: T) {
-    if v.len == v.cap {
-        v.cap = v.cap * 2;
-        v.ptr = grow(v.ptr, v.cap);
-    }
+    if v.len == v.cap { v.grow_one(); }
     v.ptr[v.len] = x;
     v.len += 1;
+}
+
+#[cold]
+#[inline(never)]
+fn Vec<T>.grow_one(v: *Vec<T>) {
+    v.cap = if v.cap == 0 { 4 } else { v.cap * 2 };
+    v.ptr = grow(v.ptr, v.cap);
 }
 
 pub fn Vec<T>.pop(v: *Vec<T>) -> ?T {
@@ -112,8 +134,11 @@ pub fn Vec<T>.truncate(v: *Vec<T>, n: u64) {
 
 pub fn Vec<T>.clear(v: *Vec<T>) { v.len = 0; }
 
+/// Free the elements' memory. The `Vec` is then empty, and can be used
+/// (or freed) again.
 pub fn Vec<T>.free(v: *Vec<T>) {
-    free(v.ptr as *u8);
+    if v.cap != 0 { free(v.ptr as *u8); }
+    v.ptr = empty_ptr();
     v.len = 0;
     v.cap = 0;
 }
@@ -187,6 +212,50 @@ fn merge_runs<T>(src: *T, dst: *T, lo: u64, mid: u64, hi: u64, cmp: block fn(*T,
         }
         k += 1;
     }
+}
+
+/// Index of the first byte `c` in `s` (`memchr`).
+pub fn find_byte(s: []u8, c: u8) -> ?u64 {
+    if s.len == 0 { return None; }
+    match memchr(s.ptr, c as i32, s.len) {
+        Some(p) => Some((p as u64) - (s.ptr as u64)),
+        None => None,
+    }
+}
+
+/// Index of the last byte `c` in `s` (`memrchr`).
+pub fn rfind_byte(s: []u8, c: u8) -> ?u64 {
+    if s.len == 0 { return None; }
+    match memrchr(s.ptr, c as i32, s.len) {
+        Some(p) => Some((p as u64) - (s.ptr as u64)),
+        None => None,
+    }
+}
+
+/// Index of the first occurrence of `needle` in `s` (`memmem`); an
+/// empty needle is found at 0.
+pub fn find_bytes(s: []u8, needle: []u8) -> ?u64 {
+    if needle.len == 0 { return Some(0); }
+    if s.len < needle.len { return None; }
+    match memmem(s.ptr, s.len, needle.ptr, needle.len) {
+        Some(p) => Some((p as u64) - (s.ptr as u64)),
+        None => None,
+    }
+}
+
+/// Compare byte strings lexicographically (`memcmp`, then the shorter
+/// first): -1, 0 or 1.
+pub fn compare_bytes(a: []u8, b: []u8) -> i32 {
+    let n = if a.len < b.len { a.len } else { b.len };
+    let r = if n == 0 { 0 } else { memcmp(a.ptr, b.ptr, n) };
+    if r < 0 { return -1; }
+    if r > 0 { return 1; }
+    if a.len < b.len { -1 } else if a.len > b.len { 1 } else { 0 }
+}
+
+/// Whether `a` and `b` hold the same bytes (`a.eq(b)` with `std.hash`).
+pub fn equal_bytes(a: []u8, b: []u8) -> bool {
+    a.len == b.len and (a.len == 0 or memcmp(a.ptr, b.ptr, a.len) == 0)
 }
 
 /// Bump allocator: allocations are freed all at once.

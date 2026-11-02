@@ -1,0 +1,88 @@
+// `Vm.Op` and `Vm.op_of(w)`: host code matches exhaustively over the ops.
+// Supers give their first part, family members their family.
+import std.io;
+
+vm Calc {
+    state { pc: *u32, acc: i64 }
+
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format A { op: 8, a: 24 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADI(v: imm) : A { acc = v as i64; next }
+    op ADD(v: imm) : A { acc = acc + (v as i64); next }
+    family INC() : A {
+        generic { become INC_FAST; redo }
+        INC_FAST { acc = acc + 1; next }
+    }
+    op JMP(target: label) : sJ { jump target }
+    op RET() : A { exit acc }
+
+    super LOADI_ADD = LOADI; ADD;
+
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+
+/// A second interpreter over the same code, in host code.
+fn interp(code: []u32) -> i64 {
+    var acc: i64 = 0;
+    var i: u64 = 0;
+    loop {
+        let w = code[i];
+        match Calc.op_of(w) {
+            Calc.Op.LOADI => acc = Calc.A_a(w) as i64,
+            Calc.Op.ADD => acc += Calc.A_a(w) as i64,
+            Calc.Op.INC => acc += 1,
+            Calc.Op.JMP => { i = ((i as i64) + Calc.sJ_sj(w)) as u64; continue; }
+            Calc.Op.RET => return acc,
+        }
+        i += Calc.base_size(w);
+    }
+}
+
+fn name(op: Calc.Op) -> str {
+    match op {
+        Calc.Op.LOADI => "LOADI",
+        Calc.Op.ADD => "ADD",
+        Calc.Op.INC => "INC",
+        Calc.Op.JMP => "JMP",
+        Calc.Op.RET => "RET",
+    }
+}
+
+fn main() {
+    var code: [u32; 6] = [0; 6];
+    code[0] = Calc.LOADI(5);
+    code[1] = Calc.ADD(10);
+    code[2] = Calc.INC();
+    code[3] = Calc.JMP(2);
+    code[4] = Calc.ADD(1000);
+    code[5] = Calc.RET();
+    io.print_int(interp(code[..]));
+    io.println("");
+    // expect: 16
+    io.print_int(Calc.run(&code[0]));
+    io.println("");
+    // expect: 16
+    // After quickening and fusion, the words still map to the same ops.
+    code[2] = Calc.with_opcode(code[2], Calc.OP_INC_FAST);
+    code[0] = Calc.with_opcode(code[0], Calc.OP_LOADI_ADD);
+    io.print_int(interp(code[..]));
+    io.println("");
+    // expect: 16
+    io.println(name(Calc.op_of(code[0])));
+    // expect: LOADI
+    io.println(name(Calc.op_of(code[2])));
+    // expect: INC
+    // The discriminant is the opcode.
+    io.print_int((Calc.Op.JMP as u32 == Calc.OP_JMP) as i64);
+    io.println("");
+    // expect: 1
+    io.print_int(Calc.Op.COUNT as i64);
+    io.println("");
+    // expect: 5
+}
