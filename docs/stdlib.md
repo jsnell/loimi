@@ -71,6 +71,9 @@ import.
   division and the rest, see `std.num`.
 - **Options**: `o.is_some()`, `o.is_none()`, `o.unwrap()` (traps on
   None), `o.unwrap_or(d)`, `o ?? d`, and `?` (also on `Result`).
+  `o ?? p` with `p: ?T` is `?T`: `o` if it is `Some`, else `p`, which is
+  evaluated only then (Rust's `o.or_else(|| p)`; chains:
+  `a ?? b ?? c`).
   `Result` has no methods: use `match`, `if let` or `?`.
 - **Pointers**: `p.offset(n)` (`i64` elements), `p.slice(n) -> []T`,
   `p + n`, `p[i]`, `*p`.

@@ -1,0 +1,17 @@
+// A host tool that matches over `Vm.Op` breaks when an op is added.
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    op NOP() : A { next }
+    op NEW() : A { next }
+    op HALT() : A { exit 0 }
+    entry run(code: *u32) -> i64 { pc = code; jump pc }
+}
+fn f(w: u32) -> i64 {
+    match V.op_of(w) {
+        V.Op.NOP => 0,
+        V.Op.HALT => 1,
+    }
+}
+fn main() {}
+// error: non-exhaustive

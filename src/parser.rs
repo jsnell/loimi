@@ -226,6 +226,10 @@ impl Parser {
                 let span = self.bump().span;
                 Ok(Ident { name, span })
             }
+            Tok::Ident(name) => self.err(format!(
+                "expected identifier, found `{}`, which is a reserved word (rename it, e.g. `{}_`)",
+                name, name
+            )),
             _ => self.err(format!("expected identifier, found {}", self.describe())),
         }
     }
@@ -867,6 +871,17 @@ impl Parser {
             return Ok(TypeExpr { kind: TypeKind::Cache(name), span: start.to(self.prev_span()) });
         }
         let start = self.span();
+        if self.is("??") {
+            // `??T` is `?(?T)`: split the token.
+            let t = &mut self.toks[self.pos];
+            let mut second = t.clone();
+            t.tok = Tok::Punct("?");
+            t.span.hi = t.span.lo + 1;
+            second.tok = Tok::Punct("?");
+            second.span.lo += 1;
+            second.space_before = false;
+            self.toks.insert(self.pos + 1, second);
+        }
         let kind = if self.eat("*") {
             let _ = self.eat_kw("mut") || self.eat_kw("const");
             TypeKind::Ptr(Box::new(self.parse_type()?))
@@ -1032,7 +1047,7 @@ impl Parser {
         if is_block_like(&expr) {
             return Ok(Stmt::Expr { expr, semi: true });
         }
-        self.err(format!("expected `;` or `}}`, found {}", self.describe()))
+        self.err(format!("expected `;` or `}}`, found {}{}", self.describe(), self.operator_hint()))
     }
 
     fn starts_block_like(&self) -> bool {
@@ -1169,6 +1184,8 @@ impl Parser {
             Some(UnOp::Neg)
         } else if self.is("!") {
             Some(UnOp::Not)
+        } else if self.is("~") {
+            Some(UnOp::BitNot)
         } else if self.is("*") {
             Some(UnOp::Deref)
         } else if self.is("&") {
@@ -1549,16 +1566,44 @@ impl Parser {
                     }
                 }
             }
-            _ => self.err(format!("expected expression, found {}", self.describe())),
+            _ => self.err(format!("expected expression, found {}{}", self.describe(), self.operator_hint())),
+        }
+    }
+
+    /// A hint for operators Loimi does not have, at an "expected
+    /// expression" error.
+    fn operator_hint(&self) -> &'static str {
+        let tok = |back: usize| -> Option<&Token> { self.pos.checked_sub(back).map(|i| &self.toks[i]) };
+        let punct = |t: Option<&Token>, p: &str| matches!(t, Some(Token { tok: Tok::Punct(q), .. }) if *q == p);
+        let glued = |back: usize| tok(back).is_some_and(|t| !t.space_before);
+        let cur = Some(&self.toks[self.pos]);
+        if punct(cur, "+") && punct(tok(1), "+") && glued(0) {
+            "; Loimi has no `++`: write `x += 1`"
+        } else if punct(tok(1), "-") && punct(tok(2), "-") && glued(1) {
+            "; Loimi has no `--`: write `x -= 1`"
+        } else if punct(cur, "*") && punct(tok(1), "*") && glued(0) {
+            "; Loimi has no `**` operator: multiply, or use a loop"
+        } else if punct(cur, "=") && (punct(tok(1), "==") || punct(tok(1), "!=")) && glued(0) {
+            "; use `==` or `!=` (there is no `===`)"
+        } else if punct(cur, "+") {
+            "; there is no unary `+`"
+        } else if punct(cur, "?") {
+            "; there is no `?:` operator: write `if c { a } else { b }`"
+        } else {
+            ""
         }
     }
 
     fn vm_word(&self, s: &str) -> bool {
-        let next_is_call_or_field = self.is_at(1, "(") || self.is_at(1, ".") || self.is_at(1, "=");
+        // `jump (t as *u32)` is the control word with a parenthesized
+        // operand, not a call: in vm code these words are not function
+        // names (call such a function through its module, `m.fail(..)`).
+        // `next (` and `redo (` are reported by parse_vm_word.
+        let next_is_field = self.is_at(1, ".") || self.is_at(1, "=");
         match s {
-            "next" | "redo" => !next_is_call_or_field,
+            "next" | "redo" => !next_is_field,
             "jump" | "exit" | "raise" | "fail" | "become" | "use_variant" => {
-                !next_is_call_or_field && !matches!(self.peek_at(1), Tok::Punct(";") | Tok::Punct("}"))
+                !next_is_field && !matches!(self.peek_at(1), Tok::Punct(";") | Tok::Punct("}"))
             }
             _ => false,
         }
@@ -1569,6 +1614,16 @@ impl Parser {
             Tok::Ident(s) => s,
             _ => unreachable!(),
         };
+        if matches!(w.as_str(), "next" | "redo") && self.is("(") {
+            return self.err(format!(
+                "`{}` is a control word and takes no operand (to call a function named `{}` from vm code, qualify it with its module)",
+                w, w
+            ));
+        }
+        if matches!(w.as_str(), "become" | "use_variant") && !matches!(self.peek(), Tok::Ident(_)) {
+            let what = if w == "become" { "an op name" } else { "a variant name" };
+            return self.err(format!("`{}` takes {}, found {}", w, what, self.describe()));
+        }
         let kind = match w.as_str() {
             "next" => VmExpr::Next,
             "redo" => VmExpr::Redo,

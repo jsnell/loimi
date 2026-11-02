@@ -1,0 +1,32 @@
+// `~x` is bitwise not on integers; `!x` is too (and logical not on bool).
+import std.io;
+
+const MASK: u8 = ~0x0f;
+
+fn show(x: i64) { io.print_int(x); io.println(""); }
+
+fn main() {
+    let x: u64 = 5;
+    show(~x as i64);
+    // expect: -6
+    show((~x == !x) as i64);
+    // expect: 1
+    let b: u8 = 0b1010_0000;
+    show(~b as i64);
+    // expect: 95
+    show(MASK as i64);
+    // expect: 240
+    let i: i32 = -1;
+    show(~i as i64);
+    // expect: 0
+    show(~0);
+    // expect: -1
+    show(-~3);
+    // expect: 4
+    let w: u64 = 0xff;
+    show((w & ~0xf) as i64);
+    // expect: 240
+    let c = !true;
+    show(c as i64);
+    // expect: 0
+}

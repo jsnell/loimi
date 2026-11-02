@@ -91,7 +91,14 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   of `if` and `match` are typed against each other: `let r = if c { Ok(e) }
   else { Err(m) };` gets `Result<typeof e, typeof m>`, and an arm that cannot
   be typed alone (`None`, `Ok(x)`) takes its type from the others. Inference
-  is local: it does not look at later uses of `r`.
+  is local: it does not look at later uses of `r`, so `var r = Ok(false);`
+  needs an annotation (`var r: Result<bool, str> = Ok(false);`), and the
+  error says so.
+- **Reserved words**: `fn let var if else while loop for in return break
+  continue struct enum const import extern export match as true false and
+  or pub defer unsafe never`. They cannot be names (`in` included: write
+  `in_` or `input`). The control words (`next`, `jump`, ..., section 3.4)
+  and words like `vm`, `op`, `state` are not reserved.
 - **Range loops.** `for i in lo..hi` counts from `lo` up to `hi - 1`. The
   range takes the type of a bound that is not a literal: `0..n` with
   `n: u64` is a `u64` range, `m..255` with `m: u8` a `u8` range. When both
@@ -329,6 +336,32 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   nothing (see `bench/README.md`).
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
+- **Operators**, from the tightest binding to the loosest:
+
+  | Operators | Meaning |
+  |---|---|
+  | `f(x)` `a[i]` `a[i..j]` `x.f` `x?` | call, index, slice, field or method, try |
+  | `-x` `!x` `~x` `*p` `&x` | negate; logical not (`bool`) or bitwise not (integers); bitwise not (integers only); dereference; address |
+  | `x as T` | cast (`-x as u64` is `(-x) as u64`) |
+  | `*` `/` `%` `*%` | multiply, divide, remainder, wrapping multiply |
+  | `+` `-` `+%` `-%` | add, subtract, wrapping forms |
+  | `<<` `>>` | shifts |
+  | `&` | bitwise and |
+  | `^` | bitwise xor |
+  | `\|` | bitwise or |
+  | `==` `!=` `<` `<=` `>` `>=` | comparisons |
+  | `and` (or `&&`) | logical and, short-circuit |
+  | `or` (or `\|\|`) | logical or, short-circuit |
+  | `a ?? b` | option default, right-associative: `a`'s value if `Some`, else `b` (evaluated only then); with `b: ?T` the result is `?T` |
+  | `=` `+=` `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` `+%=` `-%=` `*%=` | assignment (a statement) |
+
+  Binary operators are left-associative. Unlike C, `&`, `^` and `|` bind
+  tighter than the comparisons: `x & 1 == 0` is `(x & 1) == 0`. Both
+  operands of a binary operator have the same type (shifts excepted, see
+  below); there are no implicit conversions. `!x` and `~x` are the same
+  on an integer; `~` exists so that bitwise code reads as it does in C,
+  and rejects a `bool`. There is no `++`/`--`, `**`, `?:`, `===` or
+  unary `+`; the parser says what to write instead.
 - **Integer arithmetic:** `+ - *` trap on overflow in debug builds and wrap in
   release builds. Explicit forms: `a +% b`, `a -% b`, `a *% b` (wrapping),
   `a.add_checked(b) -> ?T` (and `sub_checked`, `mul_checked`). These map
@@ -727,6 +760,7 @@ type.
 | `Vm.op_size(w) -> u64` | words the instruction at `w` takes, caches included (a super: all its parts) |
 | `Vm.base_size(w) -> u64` | size of the op `w` stands for alone |
 | `Vm.op_name(w) -> str` | name of the op (`"<invalid>"` for an unused opcode) |
+| `Vm.Op`, `Vm.op_of(w) -> Vm.Op` | an enum with one variant per op as host code sees it (`Vm.Op.ADD`; no supers, a family as its generic op), whose discriminant is the opcode (`Vm.Op.ADD as W == Vm.OP_ADD`), and the op word `w` stands for alone: a super's head gives its first part, a quickened member its family. An invalid opcode panics (verified code has none). For host tools (a second interpreter, a compiler pass, a disassembler) that `match` over the ops: the match is exhaustive, so adding an op is a compile error there |
 | `Vm.FMT_field(w) -> u64` / `i64` | field `field` of format `FMT` (`Vm.AsBx_sbx(w)`): `i64` for a signed field |
 | `Vm.set_label(w, off) -> ?W` / `Vm.label(w) -> ?i64` | re-encode / decode the jump offset of an op whose operand kind is `pc + it` (below) |
 | `Vm.operand_count(w)`, `operand_kind(w, i)`, `operand_bits(w, i)`, `operand_signed(w, i)`, `operand_name(w, i)` | per-op operand metadata (below) |
@@ -834,6 +868,13 @@ A handler body has type `never`: **every path must end in a control word**.
 | `raise e` | transfer to the `on raise` handler with the current `pc` |
 | `fail e` | leave the run loop, returning `Err(e)` |
 | `suspend v` | **Not built:** leave the run loop with state saved for resumption (generators, coroutines, async) |
+
+An operand may be in parentheses: `jump (t as *u32)`, `exit (x)`. In vm
+code the control words are not function names, so `fail (..)` never
+calls a function `fail` (call such a function through its module,
+`m.fail(..)`); `next (` and `redo (` are errors, since they take no
+operand. Outside vm code, a control word is an unknown name, and the
+error says so.
 
 Handlers and vm functions do not assign `pc` (or take its address):
 `next`, `redo` and a superinstruction's next part are relative to the

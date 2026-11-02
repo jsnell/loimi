@@ -1092,6 +1092,19 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let _ = writeln!(s, "  {} => \"{}\",", o.opcode, o.name);
     }
     let _ = writeln!(s, "  _ => \"<invalid>\", }} }}");
+    // `Vm.Op`: one variant per op as host tools see it (no supers, a
+    // family as its generic op), its discriminant the opcode; and
+    // `Vm.op_of(w)`, the op word `w` stands for alone, as an `Op`, so
+    // that a second interpreter or a compiler can `match` exhaustively.
+    let base: Vec<usize> = (0..l.ops.len()).filter(|&i| l.ops[i].parts.is_empty() && l.ops[i].family == i).collect();
+    let variants: Vec<String> = base.iter().map(|&i| format!("{} = {}", l.ops[i].name, l.ops[i].opcode)).collect();
+    let _ = writeln!(s, "{vis}enum {n}__Op {{ {} }}", variants.join(", "));
+    let _ = writeln!(s, "{vis}fn {n}__op_of(w: {w}) -> {n}__Op {{ {rl}match {n}__opcode(w) {{");
+    for o in &l.ops {
+        let f = &l.ops[o.family];
+        let _ = writeln!(s, "  {} => {n}__Op.{},", o.opcode, f.name);
+    }
+    let _ = writeln!(s, "  _ => __panic(\"{n}.op_of: invalid opcode\"), }} }}");
     // Superinstruction peephole: rewrite the first word of each matching
     // sequence. The other words keep their opcodes, so jumps into the
     // middle of a fused sequence still execute the original ops. Words

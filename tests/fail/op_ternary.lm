@@ -1,0 +1,5 @@
+fn f(c: bool) -> i64 {
+    c ? 1 : 2
+}
+fn main() {}
+// error: no `?:` operator

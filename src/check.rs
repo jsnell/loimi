@@ -1400,8 +1400,25 @@ impl<'a> Checker<'a> {
                 // Check the qualifier, if any, names the scrutinee type.
                 if path.len() >= 2 && !path[0].name.is_empty() {
                     let qual = &path[path.len() - 2];
+                    // `Vm.Op.ADD`: a generated enum of a vm.
+                    let vm_ty = match self.scopes[cx.module].get(&path[0].name) {
+                        Some((Def::Vm(v), _)) if path.len() == 3 => {
+                            let (vm_m, decl) = &self.vm_decls[*v as usize];
+                            match self.scopes[*vm_m].get(&format!("{}__{}", decl.name.name, qual.name)) {
+                                Some((Def::Enum(i), _)) => Some(Ty::Enum(*i)),
+                                _ => {
+                                    return Err(Diag::new(
+                                        qual.span,
+                                        format!("vm `{}` has no generated enum `{}`", decl.name.name, qual.name),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
                     // `mod.Enum.Variant`: the enum is looked up in `mod`.
                     let qm = match path.len() {
+                        _ if vm_ty.is_some() => cx.module,
                         3 => match self.scopes[cx.module].get(&path[0].name) {
                             Some((Def::Module(t), _)) => *t,
                             _ => return Err(Diag::new(path[0].span, format!("unknown module `{}`", path[0].name))),
@@ -1415,6 +1432,7 @@ impl<'a> Checker<'a> {
                         _ => None,
                     };
                     let qty = match generic {
+                        _ if vm_ty.is_some() => vm_ty.clone().unwrap(),
                         Some(g) if self.generics.inst_of.get(ty).is_some_and(|(g2, _)| *g2 == g) => ty.clone(),
                         Some(g) => {
                             let gname = self.generics.types[g as usize].name.clone();
@@ -1951,8 +1969,18 @@ impl<'a> Checker<'a> {
                 let Ty::Option(inner) = av.ty.clone() else {
                     return Err(Diag::new(a.span, "left side of `??` must be an option"));
                 };
-                let bv = self.expr_coerce(cx, b, &inner)?;
-                Ok(mk(*inner, TK::Coalesce(Box::new(av), Box::new(bv)), span))
+                // `a ?? b` with `b: ?T` is `?T`: `a` if it is `Some`, else
+                // `b`. A plain `b` (the usual case) is preferred.
+                let opt_rhs = matches!(&b.kind, ExprKind::Ident(n) if n == "None")
+                    || matches!(&b.kind, ExprKind::Call(f, _) if matches!(&f.kind, ExprKind::Ident(n) if n == "Some"));
+                let bv = if opt_rhs {
+                    self.expr_coerce(cx, b, &av.ty)?
+                } else {
+                    let bv = self.expr(cx, b, Some(&inner))?;
+                    if bv.ty == av.ty && bv.ty != *inner { bv } else { self.coerce(bv, &inner)? }
+                };
+                let ty = if bv.ty == av.ty && bv.ty != *inner { av.ty.clone() } else { *inner };
+                Ok(mk(ty, TK::Coalesce(Box::new(av), Box::new(bv)), span))
             }
             ExprKind::Try(inner) => {
                 let v = self.expr(cx, inner, None)?;
@@ -2301,7 +2329,7 @@ impl<'a> Checker<'a> {
         if name == "None" {
             return match exp {
                 Some(t @ Ty::Option(_)) => Ok(mk(t.clone(), TK::Variant(0, vec![]), span)),
-                _ => Err(Diag::new(span, "cannot infer the type of `None`")),
+                _ => Err(Diag::new(span, "cannot infer the type of `None` (annotate it: `var x: ?T = None;`)")),
             };
         }
         if let Some((def, _)) = self.value_def(cx.module, name) {
@@ -2322,7 +2350,14 @@ impl<'a> Checker<'a> {
             self.check_unsafe_def(cx, &def, span)?;
             return self.def_value(def, name, span);
         }
-        Err(Diag::new(span, format!("unknown name `{}`", name)))
+        let hint = match name {
+            "next" | "jump" | "redo" | "exit" | "raise" | "fail" | "become" | "use_variant" => format!(
+                " (`{}` is a control word: it is only available in op handlers, vm functions, entries and `on raise`)",
+                name
+            ),
+            _ => String::new(),
+        };
+        Err(Diag::new(span, format!("unknown name `{}`{}", name, hint)))
     }
 
     /// Naming a `#[unsafe]` function (to call it or take it as a value)
@@ -2380,6 +2415,12 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Field(base, name) => {
+                // `Vm.Op`: a generated type (`Vm.Op.ADD`, `Vm.Op.COUNT`).
+                match self.vm_item(cx, base, &name.name) {
+                    Some(Def::Struct(i)) => return Some(Ty::Struct(i)),
+                    Some(Def::Enum(i)) => return Some(Ty::Enum(i)),
+                    _ => {}
+                }
                 let m = self.module_path(cx, base)?;
                 match self.scopes[m].get(&name.name) {
                     Some((Def::Struct(i), true)) => Some(Ty::Struct(*i)),
@@ -2779,7 +2820,13 @@ impl<'a> Checker<'a> {
                 }
                 if name == "Ok" || name == "Err" {
                     let Some(t @ Ty::Result(..)) = exp else {
-                        return Err(Diag::new(span, format!("cannot infer the type of `{}`", name)));
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "cannot infer the type of `{}`: a `Result` needs both its types, and inference is local (annotate it: `var r: Result<T, E> = {}(..);`)",
+                                name, name
+                            ),
+                        ));
                     };
                     let idx = if name == "Ok" { 0 } else { 1 };
                     return self.make_variant(cx, &t.clone(), idx, args, span);
@@ -3222,6 +3269,13 @@ impl<'a> Checker<'a> {
             }
             return Ok(Some(mk(Ty::Slice(Box::new(et)), TK::Trailing(Box::new(o)), span)));
         }
+        if name == "__panic" {
+            let [Expr { kind: ExprKind::Str(_), .. }] = args else {
+                return Err(Diag::new(span, "`__panic` takes a string literal"));
+            };
+            let m = self.expr(cx, &args[0], None)?;
+            return Ok(Some(mk(Ty::Never, TK::Intrinsic(Intr::Panic, vec![m]), span)));
+        }
         if name == "gc_mark" {
             if args.len() != 2 {
                 return Err(Diag::new(span, "`gc_mark` takes a heap and a value"));
@@ -3266,6 +3320,14 @@ impl<'a> Checker<'a> {
                     return Err(Diag::new(span, format!("cannot apply `!` to `{}`", self.ty_name(&v.ty))));
                 }
                 Ok(mk(v.ty.clone(), TK::Unary(op, Box::new(v)), span))
+            }
+            UnOp::BitNot => {
+                let v = self.expr(cx, inner, exp)?;
+                if !v.ty.is_int() {
+                    let hint = if v.ty == Ty::Bool { " (use `!` for logical not)" } else { "" };
+                    return Err(Diag::new(span, format!("cannot apply `~` to `{}`{}", self.ty_name(&v.ty), hint)));
+                }
+                Ok(mk(v.ty.clone(), TK::Unary(UnOp::Not, Box::new(v)), span))
             }
             UnOp::Deref => {
                 let v = self.expr(cx, inner, exp.map(|t| Ty::Ptr(Box::new(t.clone()))).as_ref())?;

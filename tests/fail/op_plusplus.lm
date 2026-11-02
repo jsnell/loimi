@@ -1,0 +1,5 @@
+fn main() {
+    var i = 0;
+    i++;
+}
+// error: Loimi has no `++`: write `x += 1`

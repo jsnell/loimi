@@ -1073,7 +1073,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let l_end = self.fresh_label("coal");
                 self.cond_br(&is_some, &l_some, &l_none);
                 self.label(&l_some);
-                self.store(&e.ty, &payload, &slot);
+                // `a ?? b` with `b: ?T` keeps the option.
+                let keep = if e.ty == a.ty { ov.clone() } else { payload };
+                self.store(&e.ty, &keep, &slot);
                 self.br(&l_end);
                 self.label(&l_none);
                 let d = self.val(b);
@@ -2087,6 +2089,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             cg.decls.insert(s.to_string());
         };
         match i {
+            Intr::Panic => {
+                let TK::Str(m) = &args[0].kind else { unreachable!() };
+                let m = String::from_utf8_lossy(m).into_owned();
+                self.panic(&m, e.span);
+                self.poison(&e.ty)
+            }
             Intr::Likely | Intr::Unlikely => {
                 decl(self.cg, "declare i1 @llvm.expect.i1(i1, i1)");
                 self.inst(format!("call i1 @llvm.expect.i1(i1 {}, i1 {})", vals[0], i == Intr::Likely))

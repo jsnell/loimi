@@ -1,0 +1,47 @@
+// `a ?? b`: with `b: T` the result is `T`; with `b: ?T` it is `?T`
+// (`a` if it is Some, else `b`), and `b` is evaluated only when needed.
+import std.io;
+
+var calls: i64 = 0;
+
+fn find(xs: []u8, c: u8) -> ?u8 {
+    calls += 1;
+    for i in 0..xs.len { if xs[i] == c { return Some(i as u8); } }
+    None
+}
+
+fn show(o: ?u8) {
+    match o {
+        Some(v) => { io.print("Some "); io.print_int(v as i64); io.println(""); }
+        None => io.println("None"),
+    }
+}
+
+fn main() {
+    let s = "hello";
+    show(find(s, 'l') ?? find(s, 'o'));
+    // expect: Some 2
+    io.print_int(calls); io.println("");
+    // expect: 1
+    show(find(s, 'z') ?? find(s, 'o'));
+    // expect: Some 4
+    show(find(s, 'z') ?? find(s, 'y'));
+    // expect: None
+    show(find(s, 'z') ?? None);
+    // expect: None
+    show(find(s, 'z') ?? Some(9));
+    // expect: Some 9
+    let r: ?u8 = find(s, 'q') ?? find(s, 'w') ?? find(s, 'h');
+    show(r);
+    // expect: Some 0
+    io.print_int((find(s, 'z') ?? 7) as i64); io.println("");
+    // expect: 7
+    // Nested options: a plain right side unwraps one level.
+    let n: ??u8 = Some(None);
+    let m: ?u8 = Some(3);
+    show(n ?? m);
+    // expect: None
+    let k: ??u8 = None;
+    show(k ?? m);
+    // expect: Some 3
+}

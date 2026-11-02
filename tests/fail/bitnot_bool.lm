@@ -1,0 +1,4 @@
+fn main() {
+    let c = ~true;
+}
+// error: cannot apply `~` to `bool` (use `!` for logical not)
