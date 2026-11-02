@@ -611,6 +611,19 @@ fn Gen.any_before(g: *Gen, n: *Node, later: *Node) -> u32 {
 
 fn Gen.any(g: *Gen, n: *Node) -> u32 { g.any_before(n, null_node()) }
 
+/// The value of a literal operand (for compare-with-constant ops).
+fn Gen.const_value(g: *Gen, n: *Node) -> ?V {
+    match n.kind {
+        Null => Some(V.Null),
+        Undef => Some(V.Undef),
+        True => Some(V.Bool(true)),
+        False => Some(V.Bool(false)),
+        Num => Some(value.number(n.num)),
+        Str => Some(V.S(g.ctx.key_str(g.ctx.key(n.text)))),
+        _ => None,
+    }
+}
+
 fn small_int(n: *Node) -> ?i32 {
     if n.kind == K.Num and n.num == n.num.floor() and n.num >= -128.0 and n.num <= 127.0 and !(n.num == 0.0 and 1.0 / n.num < 0.0) {
         return Some(n.num as i32);
@@ -672,7 +685,7 @@ fn Gen.arith(g: *Gen, op: T, dst: u32, a: u32, b: u32) {
         Le => g.emit(JS.LE(d, x, y)),
         Ge => g.emit(JS.LE(d, y, x)),
         EqEqEq => g.emit(JS.EQ(d, x, y)),
-        NotEqEq => { g.emit(JS.EQ(d, x, y)); g.emit(JS.NOT(d, d)) }
+        NotEqEq => g.emit(JS.NE(d, x, y)),
         EqEq => g.emit(JS.LOOSEEQ(d, x, y)),
         NotEq => { g.emit(JS.LOOSEEQ(d, x, y)); g.emit(JS.NOT(d, d)) }
         In => g.emit(JS.IN(d, x, y)),
@@ -1116,6 +1129,17 @@ fn Gen.cond(g: *Gen, n: *Node, jump_if: bool, l: bc.Label) {
         }
         Bin => {
             let op = n.op;
+            if (op == T.EqEqEq or op == T.NotEqEq) and let Some(kv) = g.const_value(n.b) {
+                let a = g.any(n.a);
+                let k = g.konst(kv);
+                if k < 256 {
+                    let pol: u8 = if (op == T.NotEqEq) != jump_if { 1 } else { 0 };
+                    g.emit(JS.JEQK(pol, a as u8, k as u8));
+                    g.jump(l);
+                    g.reset(m);
+                    return;
+                }
+            }
             if op == T.Lt or op == T.Gt or op == T.Le or op == T.Ge or op == T.EqEqEq or op == T.NotEqEq {
                 let a = g.any_before(n.a, n.b);
                 let b = g.any(n.b);
@@ -1195,11 +1219,7 @@ fn Gen.function(g: *Gen, f: *Func) -> Gc<Proto> {
         g.emit(JS.RET(r as u8));
     } else {
         g.stmts(&f.body);
-        let m = g.mark();
-        let r = g.temp();
-        g.emit(JS.LOADU(r as u8));
-        g.emit(JS.RET(r as u8));
-        g.reset(m);
+        g.emit(JS.RETU());
     }
     let p = g.finish(&fs);
     g.fs = parent;
@@ -1463,6 +1483,12 @@ fn Gen.stmt(g: *Gen, n: *Node) {
             g.exit_end(l.ntries);
         }
         Return => {
+            if g.fs.tries.len == 0 {
+                // Nothing to run on the way out: return straight from a
+                // local's register.
+                if is_null(n.a) { g.emit(JS.RETU()); return; }
+                if n.a.kind == K.Name and let Some(r) = g.var_reg(n.a.vr) { g.emit(JS.RET(r as u8)); return; }
+            }
             let lvl = g.fs.regs.enter();
             let r = g.fs.regs.nactive;
             g.fs.regs.activate(1);

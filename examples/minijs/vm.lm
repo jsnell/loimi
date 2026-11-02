@@ -757,15 +757,12 @@ pub vm JS {
             match (a, b) {
                 (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
                 (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
+                (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
                 _ => {}
             }
             cold {
-                match (a, b) {
-                    (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
-                    (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
-                    (Int(x), Int(y)) => { dst = Num(x as f64 sym y as f64); next }
-                    _ => {}
-                }
+                if let (Int(x), Int(y)) = (a, b) { dst = Num(x as f64 sym y as f64); next }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 dst = arith(ctx, code, a, b)?;
                 next
@@ -776,14 +773,28 @@ pub vm JS {
         match (a, b) {
             (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) and (r != 0 or (x | y) >= 0) { dst = Int(r); next },
             (Num(x), Num(y)) => { dst = Num(x * y); next }
+            (Int(x), Num(y)) => { dst = Num(x as f64 * y); next }
+            (Num(x), Int(y)) => { dst = Num(x * y as f64); next }
             _ => {}
         }
         cold { dst = arith(ctx, 2, a, b)?; next }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
         match (a, b) {
-            (Int(x), Int(y)) => if y > 0 and x % y == 0 { dst = Int(x / y); next },
+            (Int(x), Int(y)) => {
+                // Integral quotients stay Int (no -0: a zero quotient of
+                // a nonzero divisor with x == 0 needs y > 0).
+                let r = x as f64 / y as f64;
+                if r >= -2147483648.0 and r <= 2147483647.0 {
+                    let q = r as i32;
+                    if q as f64 == r and (q != 0 or y > 0) { dst = Int(q); next }
+                }
+                dst = Num(r);
+                next
+            }
             (Num(x), Num(y)) => { dst = Num(x / y); next }
+            (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
+            (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
             _ => {}
         }
         cold { dst = arith(ctx, 3, a, b)?; next }
@@ -847,6 +858,15 @@ pub vm JS {
         dst = Bool(eq_slow(a, b));
         next
     }
+    op NE(dst: reg, a: reg, b: reg) : ABC {
+        if a == b {
+            if let Num(x) = a { dst = Bool(x != x); next }
+            dst = Bool(false);
+            next
+        }
+        dst = Bool(!eq_slow(a, b));
+        next
+    }
     op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
     op LT(dst: reg, a: reg, b: reg) : ABC {
         match (a, b) {
@@ -895,6 +915,17 @@ pub vm JS {
         branch(less(ctx, a, b, true) == want, then.target)
     }
     op JEQ(pol: imm, a: reg, b: reg) : ABC then JMP {
+        let want = pol != 0;
+        if a == b {
+            var eq = true;
+            if let Num(x) = a { eq = x == x; }
+            branch(eq == want, then.target)
+        }
+        branch(eq_slow(a, b) == want, then.target)
+    }
+
+    /// JEQ against a constant.
+    op JEQK(pol: imm, a: reg, b: kst) : ABC then JMP {
         let want = pol != 0;
         if a == b {
             var eq = true;
@@ -990,6 +1021,11 @@ pub vm JS {
                 regs = callee;
                 jump p.code.ptr
             }
+            if cl.native != 0 {
+                if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+                regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs as u64)?;
+                next
+            }
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
@@ -1068,6 +1104,29 @@ pub vm JS {
         }
         if fp == ctx.frames { exit v }
         *(regs - 1) = v;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.k;
+        jump fp.resume
+    }
+    op RETU() : ABC {
+        if fp.flags != 0 or fp == ctx.frames {
+            cold {
+                var v = V.Undef;
+                if fp.flags != 0 {
+                    v = regs[0];
+                    if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
+                    if let O(o) = v { observe(fp.cl, o); }
+                }
+                if fp == ctx.frames { exit v }
+                *(regs - 1) = v;
+                fp = fp - 1;
+                regs = fp.base;
+                k = fp.k;
+                jump fp.resume
+            }
+        }
+        *(regs - 1) = Undef;
         fp = fp - 1;
         regs = fp.base;
         k = fp.k;
