@@ -1123,8 +1123,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
             TStmt::Let(id, init) => {
                 let t = self.f().locals[*id as usize].ty.clone();
                 let wb = self.vm.as_ref().map(|h| self.cg.p.vms[h.vm as usize].word.bits as u32);
+                // Only the checker's operand decodes: a `let` of a cache
+                // field (`cache.n`, a word too) reads the code at run time.
                 let hole = match (init, wb, &self.stencil) {
-                    (Some(e), Some(wb), Some(_)) => crate::jitgen::match_decode(e, wb),
+                    (Some(e), Some(wb), Some(_)) if self.f().locals[*id as usize].field => crate::jitgen::match_decode(e, wb),
                     _ => None,
                 };
                 let v = match (init, hole) {

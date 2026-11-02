@@ -1046,6 +1046,8 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             let raw = cx.temp(raw_ty(bits, signed));
             cx.locals[raw as usize].name = format!("{}.raw", pname);
             cx.locals[raw as usize].mutable = false;
+            // A forwarded operand is a copy of the previous part's field.
+            cx.locals[raw as usize].field = !fwd.iter().any(|l| l.0 == j && l.1 == pi);
             // A forwarding variant (`#[forward] super`): an operand linked
             // to the register the previous part wrote is a copy of that
             // part's field (`optimize` checked that they are equal), so
@@ -1479,6 +1481,7 @@ fn then_operand(c: &mut Checker, cx: &mut FnCx, h: &HandlerCx, name: &Ident, spa
     let pc_ty = info.state[info.pc_idx].1.clone();
     let raw = cx.temp(raw_ty(bits, signed));
     cx.locals[raw as usize].name = format!("then.{}.raw", name.name);
+    cx.locals[raw as usize].field = true;
     let pc2 = cx.temp(pc_ty.clone());
     cx.locals[pc2 as usize].name = "then.pc".into();
     let n = mk(Ty::i64(), TK::Int(off as i128), span);

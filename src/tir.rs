@@ -90,6 +90,9 @@ pub struct LocalDef {
     pub name: String,
     pub ty: Ty,
     pub mutable: bool,
+    /// An operand field the vm checker decodes from a code word (a
+    /// handler's `x.raw`, a `then` operand's): a stencil makes it a hole.
+    pub field: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

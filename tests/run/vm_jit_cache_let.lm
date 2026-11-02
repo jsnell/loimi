@@ -1,0 +1,74 @@
+// args: --jit-stencils
+// env: LOIMI_JIT=1 LOIMI_JIT_HOT=1
+// A `let` that reads an inline cache field is not an operand field. The
+// JIT patched it into compiled code as a hole holding the cache word at
+// compile time (COUNT returned 1 both times), and `let v = cache.n;`
+// without a cast did not build (the hole is an i64).
+import std.io;
+import std.gc;
+
+object Proto { code: verified [u32] by V }
+
+#[require_verified]
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context owner proto: Gc<Proto>;
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format ABsC { op: 8, a: 8, b: 8, sc: s8 }
+    }
+    cache Cnt { n: u32 }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v; next }
+    // dst = number of times this instruction ran before
+    op COUNT(dst: reg) : ABC + Cnt {
+        let v = cache.n as u64;
+        cache.n = (v + 1) as u32;
+        dst = v as i64;
+        next
+    }
+    op COUNT2(dst: reg) : ABC + Cnt {
+        let v = cache.n;
+        cache.n = v + 2;
+        dst = v as i64;
+        next
+    }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JLT(a: reg, b: reg, off: label) : ABsC { if a < b { jump off } next }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(p: Gc<Proto>, r: *i64) -> i64 { regs = r; jump p.code }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 8] = [0; 8];
+    let c = code[..];
+    var at: u64 = 0;
+    // r0 = 0; r1 = 100; r2 = 1; loop: COUNT r3; COUNT2 r4; r0 += r2; if r0 < r1 goto loop; ret r3
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 100);
+    at = V.emit.LOADI(c, at, 2, 1);
+    at = V.emit.COUNT(c, at, 3);
+    at = V.emit.COUNT2(c, at, 4);
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.JLT(c, at, 0, 1, -5);
+    at = V.emit.RET(c, at, 3);
+    let Ok(p) = V.build_verified(h, Proto {}, c[0..at]) else { io.println("bad"); return; };
+    for _i in 0..2 {
+        regs[0] = 0;
+        io.print_int(V.run(p, &regs[0]));
+        io.print(" ");
+        io.print_int(regs[4]);
+        io.println("");
+    }
+}
+// expect: 99 198
+// expect: 199 398

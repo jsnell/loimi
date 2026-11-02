@@ -470,12 +470,15 @@ pub fn word_hole(g: &mut FnGen, off: u32) -> String {
 }
 
 /// The signed decoded fields anywhere in a handler body.
-pub fn signed_fields(body: &TExpr, wb: u32) -> Vec<(u32, u32, u32)> {
+pub fn signed_fields(body: &TExpr, locals: &[crate::tir::LocalDef], wb: u32) -> Vec<(u32, u32, u32)> {
     let mut out = Vec::new();
     crate::tirwalk::for_each_expr(body, &mut |e| {
         if let TK::Block(stmts, _) = &e.kind {
             for s in stmts {
-                if let TStmt::Let(_, Some(init)) = s {
+                if let TStmt::Let(l, Some(init)) = s {
+                    if !locals[*l as usize].field {
+                        continue;
+                    }
                     if let Some((off, shift, bits, true)) = match_decode(init, wb) {
                         if !out.contains(&(off, shift, bits)) {
                             out.push((off, shift, bits));
@@ -715,12 +718,12 @@ pub fn emit_stencils(cg: &mut crate::codegen::Codegen) {
         let body = f.body.as_ref().unwrap();
         // A super's body is a block of `Part`s; each has its own fields.
         let (labels, part_offs) = if o.parts.is_empty() {
-            (vec![signed_fields(body, wb)], vec![0])
+            (vec![signed_fields(body, &f.locals, wb)], vec![0])
         } else {
             let mut ls = vec![vec![]; o.parts.len()];
             crate::tirwalk::for_each_expr(body, &mut |e| {
                 if let TK::Vm(TVm::Part(j, b)) = &e.kind {
-                    ls[*j as usize] = signed_fields(b, wb);
+                    ls[*j as usize] = signed_fields(b, &f.locals, wb);
                 }
             });
             let mut offs = Vec::new();
