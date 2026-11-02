@@ -1,0 +1,101 @@
+// String literals as `match` patterns.
+import std.io;
+
+enum Word { Dup, Drop, Swap, Over, Rot, Long, Empty }
+
+fn word(name: str) -> ?Word {
+    match name {
+        "dup" => Some(Word.Dup),
+        "drop" => Some(Word.Drop),
+        "swap" | "exch" => Some(Word.Swap),
+        "over" => Some(Word.Over),
+        "rot" => Some(Word.Rot),
+        "a-rather-long-name-of-27b" => Some(Word.Long),
+        "" => Some(Word.Empty),
+        _ => None,
+    }
+}
+
+fn code(name: str) -> i64 {
+    match word(name) {
+        Some(w) => w as i64,
+        None => -1,
+    }
+}
+
+// Every length from 1 to 17, to cover the chunked compare.
+fn len_case(s: str) -> i64 {
+    match s {
+        "a" => 1, "ab" => 2, "abc" => 3, "abcd" => 4, "abcde" => 5,
+        "abcdef" => 6, "abcdefg" => 7, "abcdefgh" => 8, "abcdefghi" => 9,
+        "abcdefghij" => 10, "abcdefghijk" => 11, "abcdefghijkl" => 12,
+        "abcdefghijklm" => 13, "abcdefghijklmn" => 14,
+        "abcdefghijklmno" => 15, "abcdefghijklmnop" => 16,
+        "abcdefghijklmnopq" => 17, "\xff\x80" => 99,
+        _ => 0,
+    }
+}
+
+// String arms inside tuples, with guards and bindings.
+fn mixed(s: str, n: i64) -> i64 {
+    match (s, n) {
+        ("x", 0) => 1,
+        ("x", _) => 2,
+        (t, m) if t.len > 3 => m * 10,
+        _ => 0,
+    }
+}
+
+fn single(s: str) -> bool {
+    if let "yes" = s { true } else { false }
+}
+
+fn guarded(s: str, ok: bool) -> i64 {
+    match s {
+        "a" if ok => 1,
+        "a" => 2,
+        "b" => 3,
+        _ => 4,
+    }
+}
+
+fn main() {
+    let names = ["dup", "drop", "swap", "exch", "over", "rot", "a-rather-long-name-of-27b", "", "du", "dupe", "Dup", "rpt", "swapx"];
+    io.print("codes:");
+    for i in 0..names.len {
+        io.print(" ");
+        io.print_int(code(names[i]));
+    }
+    io.println("");
+    let full = "abcdefghijklmnopq";
+    var ok = true;
+    for n: u64 in 1..18 {
+        if len_case(full[0..n]) != n as i64 { ok = false; }
+    }
+    // Same lengths, one byte off at each position.
+    var buf: [u8; 17] = [0; 17];
+    for n: u64 in 1..18 {
+        for k in 0..n {
+            for j in 0..n { buf[j] = full[j]; }
+            buf[k] = 'Z';
+            if len_case(buf[0..n]) != 0 { ok = false; }
+        }
+    }
+    io.print_bool(ok);
+    io.println("");
+    io.print_int(len_case("\xff\x80"));
+    io.println("");
+    io.print_int(mixed("x", 0) * 1000 + mixed("x", 5) * 100 + mixed("long", 3) * 10 + mixed("y", 1));
+    io.println("");
+    io.print_bool(single("yes"));
+    io.print_bool(single("no"));
+    io.println("");
+    io.print_int(guarded("a", true) * 100 + guarded("a", false) * 10 + guarded("c", true));
+    io.println("");
+}
+// expect: codes: 0 1 2 2 3 4 5 6 -1 -1 -1 -1 -1
+// expect: true
+// expect: 99
+// expect: 1500
+// expect: truefalse
+// expect: 124

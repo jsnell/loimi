@@ -267,6 +267,8 @@ pub enum TPK {
     Bind(LocalId),
     Int(i128),
     Bool(bool),
+    /// Equal bytes (the scrutinee is a `str`).
+    Str(Vec<u8>),
     Range(i128, i128),
     Variant(u32, Vec<TPat>),
     Tuple(Vec<TPat>),

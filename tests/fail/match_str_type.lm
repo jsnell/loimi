@@ -1,0 +1,5 @@
+fn f(n: i64) -> i64 {
+    match n { "a" => 1, _ => 2 }
+}
+fn main() {}
+// error: string pattern for a value of type `i64`

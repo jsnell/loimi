@@ -1,0 +1,5 @@
+import std.gc;
+object Box { x: i64 }
+struct M { n: i64, b: Gc<Box> }
+fn main() { let m = M { ..zero }; }
+// error: `..zero` cannot set field `b`

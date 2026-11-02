@@ -28,20 +28,10 @@ extern "C" fn getenv(name: *u8) -> ?*u8;
 fn stats(c: *Ctx) {
     if getenv("MINIJS_STATS\0".ptr).is_none() { return; }
     var b = text.StrBuf.new();
-    b.push_str("shapes created ");
-    b.push_int(c.m.shapes.created as i64);
-    b.push_str(" (");
-    b.push_int(c.m.shapes.reborn as i64);
-    b.push_str(" under a kept id), poly sites ");
-    b.push_int(c.m.ic.poly.len as i64);
-    b.push_str(", add sites ");
-    b.push_int(c.m.shapes.adds.len as i64);
-    b.push_str(", validity cells ");
-    b.push_int((c.m.shapes.cvalid.len - 1) as i64);
-    b.push_str(", keys ");
-    b.push_int(c.keys.names.len as i64);
-    b.push_str(", collections ");
-    b.push_int(c.heap.collections as i64);
+    b.fmt4("shapes created {} ({} under a kept id), poly sites {}, add sites {}",
+        c.m.shapes.created, c.m.shapes.reborn, c.m.ic.poly.len, c.m.shapes.adds.len);
+    b.fmt3(", validity cells {}, keys {}, collections {}",
+        c.m.shapes.cvalid.len - 1, c.keys.names.len, c.heap.collections);
     io.eprintln(b.as_str());
 }
 

@@ -1,0 +1,51 @@
+// std.text formatting: the Fmt trait, StrBuf.add chains and fmt..fmt4.
+import std.io;
+import std.text;
+import std.text.{StrBuf};
+
+struct Pt { x: i32, y: i32 }
+fn Pt.fmt(p: Pt, b: *StrBuf) { b.fmt2("({}, {})", p.x, p.y); }
+impl text.Fmt for Pt;
+
+fn show(b: *StrBuf) {
+    io.println(b.as_str());
+    b.clear();
+}
+
+fn main() {
+    var b = StrBuf.new();
+    b.add("line ").add(12).add(": ").add(true).add(" ").add(2.5);
+    show(&b);
+    b.fmt2("expected {} values, got {}", 3 as u32, -1 as i8);
+    show(&b);
+    b.fmt("unknown word `{}`", "dup2");
+    show(&b);
+    let big: u64 = 0xFFFFFFFFFFFFFFFF;
+    b.fmt3("{}{}{}", "a", big, 'c');
+    show(&b);
+    b.fmt4("{{{}}} {} {} {}", Pt { x: 1, y: -2 }, 0.1, false, -9223372036854775807 - 1);
+    show(&b);
+    // Too few arguments: the placeholder stays. Too many: appended.
+    b.fmt("{} and {}", 1);
+    show(&b);
+    b.fmt2("only {}", 1, 2);
+    show(&b);
+    b.fmt("no placeholder", 7);
+    show(&b);
+    b.fmt("trailing {", 7);
+    show(&b);
+    // Chained after fmt, and the str it gives.
+    let s = b.fmt("{}", "x").add("y").as_str();
+    io.println(s);
+    b.free();
+}
+// expect: line 12: true 2.5
+// expect: expected 3 values, got -1
+// expect: unknown word `dup2`
+// expect: a1844674407370955161599
+// expect: {(1, -2)} 0.1 false -9223372036854775808
+// expect: 1 and {}
+// expect: only 12
+// expect: no placeholder7
+// expect: trailing {7
+// expect: xy

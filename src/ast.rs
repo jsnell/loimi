@@ -102,7 +102,8 @@ pub enum ExprKind {
     Unary(UnOp, P<Expr>),
     Binary(BinOp, P<Expr>, P<Expr>),
     Cast(P<Expr>, TypeExpr),
-    StructLit(Vec<Ident>, Vec<(Ident, Expr)>),
+    /// `Type { f: e, .. }`; the span of a trailing `..zero`, if any.
+    StructLit(Vec<Ident>, Vec<(Ident, Expr)>, Option<Span>),
     Tuple(Vec<Expr>),
     Unit,
     ArrayLit(Vec<Expr>),
@@ -175,6 +176,8 @@ pub enum PatKind {
     Int(i128),
     Char(u8),
     Bool(bool),
+    /// A string literal, for `str` scrutinees.
+    Str(Vec<u8>),
     Range(i128, i128),
     /// `Variant(p, ...)`, `Enum.Variant(..)`, `.Variant(..)`. The path is
     /// empty for the `.Variant` form.

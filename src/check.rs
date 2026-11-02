@@ -1368,6 +1368,12 @@ impl<'a> Checker<'a> {
                 }
                 if lo == hi && !matches!(p.kind, PatKind::Range(..)) { TPK::Int(lo) } else { TPK::Range(lo, hi) }
             }
+            PatKind::Str(bytes) => {
+                if *ty != Ty::str() {
+                    return Err(Diag::new(p.span, format!("string pattern for a value of type `{}`", self.ty_name(ty))));
+                }
+                TPK::Str(bytes.clone())
+            }
             PatKind::Bool(b) => {
                 if *ty != Ty::Bool {
                     return Err(Diag::new(p.span, "boolean pattern for a non-bool value"));
@@ -1671,7 +1677,7 @@ impl<'a> Checker<'a> {
                 }
                 Ok(mk(to, TK::Cast(Box::new(v)), span))
             }
-            ExprKind::StructLit(path, fields) => {
+            ExprKind::StructLit(path, fields, rest) => {
                 // `Type { .. }` or `module.Type { .. }`.
                 let (m, name) = match path.as_slice() {
                     [name] => (cx.module, name),
@@ -1702,9 +1708,23 @@ impl<'a> Checker<'a> {
                 }
                 let mut out = Vec::new();
                 for (i, v) in vals.into_iter().enumerate() {
-                    match v {
-                        Some(v) => out.push(v),
-                        None => return Err(Diag::new(span, format!("missing field `{}`", defs[i].0))),
+                    match (v, rest) {
+                        (Some(v), _) => out.push(v),
+                        (None, Some(rs)) => {
+                            let (fname, fty) = &defs[i];
+                            if fname.starts_with("__") || !zero_ok(fty) {
+                                return Err(Diag::new(
+                                    *rs,
+                                    format!(
+                                        "`..zero` cannot set field `{}` of type `{}`: give it a value",
+                                        fname,
+                                        self.ty_name(fty)
+                                    ),
+                                ));
+                            }
+                            out.push(mk(fty.clone(), TK::Zeroed, *rs));
+                        }
+                        (None, None) => return Err(Diag::new(span, format!("missing field `{}`", defs[i].0))),
                     }
                 }
                 Ok(mk(ty, TK::Struct(out), span))
@@ -1743,8 +1763,14 @@ impl<'a> Checker<'a> {
                     };
                     out.push(v);
                 }
+                if es.is_empty() {
+                    if let Some(t @ Ty::Slice(_)) = exp {
+                        // `[]` where a slice is expected: the empty slice.
+                        return Ok(mk(t.clone(), TK::Zeroed, span));
+                    }
+                }
                 let Some(elem) = elem else {
-                    return Err(Diag::new(span, "cannot infer the type of an empty array"));
+                    return Err(Diag::new(span, "cannot infer the type of an empty array (an empty slice needs its type: `let s: []T = [];`)"));
                 };
                 Ok(mk(Ty::Array(Box::new(elem), out.len() as u64), TK::Array(out), span))
             }
@@ -3393,6 +3419,7 @@ impl<'a> Checker<'a> {
             TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::FnRef(_) => {
                 if matches!(e.ty, Ty::Value(_)) { Some(e.span) } else { None }
             }
+            TK::Zeroed => None,
             TK::Struct(es) | TK::Tuple(es) | TK::Array(es) => all(es),
             TK::ArrayRepeat(v, _) => self.static_init_error(v),
             TK::Variant(_, es) => match &e.ty {
@@ -3575,6 +3602,7 @@ fn pats_overlap(a: &TPat, b: &TPat) -> bool {
         (TPK::Int(x), TPK::Range(lo, hi)) | (TPK::Range(lo, hi), TPK::Int(x)) => lo <= x && x <= hi,
         (TPK::Range(a1, a2), TPK::Range(b1, b2)) => a1 <= b2 && b1 <= a2,
         (TPK::Bool(x), TPK::Bool(y)) => x == y,
+        (TPK::Str(x), TPK::Str(y)) => x == y,
         _ => true,
     }
 }
@@ -3587,9 +3615,23 @@ fn irrefutable(p: &TPat) -> bool {
     }
 }
 
+/// Whether all-zero bytes are a valid value of `t` that needs no
+/// constructor, for `..zero`: numbers, `bool`, `?T` (None), slices
+/// (empty), and arrays and tuples of those. Not `*T` and `Gc<T>` (never
+/// null), structs (their constructor may set invariants), enums, `value`
+/// types or functions.
+pub fn zero_ok(t: &Ty) -> bool {
+    match t {
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) => true,
+        Ty::Array(e, _) => zero_ok(e),
+        Ty::Tuple(ts) => ts.iter().all(zero_ok),
+        _ => false,
+    }
+}
+
 fn is_const(e: &TExpr) -> bool {
     match &e.kind {
-        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit => true,
+        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed => true,
         TK::Struct(es) | TK::Tuple(es) | TK::Array(es) | TK::Variant(_, es) => es.iter().all(is_const),
         _ => false,
     }

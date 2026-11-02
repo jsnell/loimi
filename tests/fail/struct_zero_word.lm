@@ -1,0 +1,3 @@
+struct M { n: i64 }
+fn main() { let m = M { ..default }; }
+// error: expected `zero` after `..`

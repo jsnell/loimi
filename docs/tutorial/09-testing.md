@@ -161,14 +161,22 @@ the program left in them:
 
 Build it with AddressSanitizer, which works in all three dispatch
 modes, and run it in batches (each run's memory is freed, but the
-lexer's tables are not, so a long batch grows):
+lexer's tables are not, so a long batch grows). Bound its memory too: a
+mutant that allocates without bound can take the whole machine before
+anyone notices. `ulimit -v` does not work with ASan (it reserves
+terabytes of address space for its shadow memory at startup and fails),
+so set ASan's own limit, which aborts the process with a report when its
+resident memory passes it:
 
 ```sh
 loimi build examples/tutorial/step9/fuzz.lm --sanitize=address -o fuzz
 cd examples/tutorial/step9
+export ASAN_OPTIONS=hard_rss_limit_mb=2000
 ./fuzz 1 2000 tests/*.pip
 ./fuzz 1 2000 tests/*.pip --gc-stress
 ```
+
+For a build without ASan, `ulimit -v` works as usual.
 
 ```text
 3000 programs: 1861 rejected by the verifier, 572 finished, 293 raised an error, 274 ran out of steps
@@ -181,7 +189,12 @@ mutations are not testing the verifier.
 `cargo test` runs 3000 programs (without ASan). While writing this
 chapter, 200,000 programs under ASan, and 100,000 more with GC stress,
 found one real problem: `array(2147483647)` asked the allocator for 16
-GiB, which the step budget cannot prevent. Step 9 caps arrays and
+GiB, which the step budget cannot prevent. A step budget bounds time, not
+memory: anything a single op can grow needs its own budget. Strings are
+the other case. A loop that concatenates a string with itself doubles it
+on every iteration, so it reaches gigabytes in about 30 iterations, well
+inside any step budget (another interpreter's fuzzer found exactly this,
+in a stack VM, as `dup concat` in a loop). Step 9 caps arrays and
 strings at 2^24 elements:
 
 ```loimi
