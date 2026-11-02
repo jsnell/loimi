@@ -674,6 +674,7 @@ pub vm JS {
     op SETINDEX(obj: reg, key: reg, val: reg) : ABC {
         if let (A(a), Int(i)) = (obj, key) and (i as u32 as u64) < a.len {
             a.ptr[i as u32 as u64] = val;
+            value.abar(a);
             next
         }
         cold {
@@ -1131,6 +1132,7 @@ pub vm JS {
             if regs[base] == ctx.f_push and let A(a) = regs[base + 1] and let Some(st) = a.store
                     and a.len < st.data.len {
                 a.ptr[a.len] = regs[base + 2];
+                gc.barrier(st as *u8);
                 a.len += 1;
                 regs[base] = Int(a.len as i32);
                 next

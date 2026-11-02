@@ -608,7 +608,14 @@ fn clear_marks(h: *Heap) {
 
 /// The allocation budget until the next collection.
 fn next_threshold(h: *Heap) -> u64 {
-    if h.stress { return 0; }
+    if h.stress {
+        // A generational heap under stress collects after 0 to 4 KiB of
+        // allocation (varying), not at every safepoint: objects must stay
+        // young across a few safepoints for stores into old objects to
+        // exercise the write barrier.
+        if !h.gen { return 0; }
+        return (eph_hash(h.collections) & 4095) as u64;
+    }
     if !h.gen { return budget(h, h.live_bytes); }
     // Never let the nursery outgrow what a full collection would allow.
     let b = budget(h, h.live_bytes);
@@ -683,7 +690,7 @@ pub fn Heap.set_verify(h: *Heap, on: bool) {
 
 /// Collect if enough has been allocated since the last collection.
 pub fn maybe_collect(h: *Heap) uses gc {
-    if h.allocated > h.threshold or h.stress {
+    if h.allocated > h.threshold or (h.stress and !h.gen) {
         collect(h);
     }
 }

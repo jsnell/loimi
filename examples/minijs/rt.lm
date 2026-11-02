@@ -502,6 +502,7 @@ pub fn Ctx.arr_reserve(c: *Ctx, a: Gc<Arr>, n: u64) {
 pub fn Ctx.arr_push(c: *Ctx, a: Gc<Arr>, v: V) {
     if a.len == arr_cap(a) { c.arr_reserve(a, a.len + 1); }
     a.ptr[a.len] = v;
+    value.abar(a);
     a.len += 1;
 }
 
@@ -592,10 +593,11 @@ pub fn Ctx.set(c: *Ctx, v: V, k: u64, x: V) -> Result<(), V> {
 
 /// a[i] = x (i <= len appends; beyond is out of the subset and fills with undefined).
 pub fn Ctx.arr_set(c: *Ctx, a: Gc<Arr>, i: u64, x: V) {
-    if i < a.len { a.ptr[i] = x; return; }
+    if i < a.len { a.ptr[i] = x; value.abar(a); return; }
     if i >= arr_cap(a) { c.arr_reserve(a, i + 1); }
     a.len = i + 1;
     a.ptr[i] = x;
+    value.abar(a);
 }
 
 /// obj[key] for any key value.

@@ -325,9 +325,22 @@ fn in_object(e: &TExpr) -> bool {
         TK::Index(b, _) => match &b.ty {
             Ty::Array(..) => in_object(b),
             Ty::Slice(_) => matches!(b.kind, TK::Trailing(_)),
+            // `o.items.ptr[i]`: unchecked indexing into a trailing array.
+            Ty::Ptr(_) => trailing_ptr(b).is_some(),
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// The object of `o.items.ptr` (the pointer of a trailing array).
+fn trailing_ptr(e: &TExpr) -> Option<&TExpr> {
+    match &e.kind {
+        TK::Field(s, 0) => match &s.kind {
+            TK::Trailing(o) => Some(o),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -380,6 +393,18 @@ fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
                 let i = g.index_val(idx);
                 let bad = g.inst(format!("icmp uge i64 {}, {}", i, len));
                 g.check(&bad, "index out of bounds", e.span);
+                let elem = g.ty(&e.ty);
+                let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 {}", elem, base, i));
+                (p, obj)
+            }
+            (Ty::Ptr(_), _) => {
+                let o = trailing_ptr(b).unwrap();
+                let p = g.p();
+                let obj = g.val(o);
+                let Ty::Gc(inner) = &o.ty else { unreachable!() };
+                let size = layout::size_of(p, inner);
+                let base = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", obj, size));
+                let i = g.index_val(idx);
                 let elem = g.ty(&e.ty);
                 let p = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 {}", elem, base, i));
                 (p, obj)

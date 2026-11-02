@@ -97,6 +97,15 @@ pub const NONENUM: u32 = 1;
 /// (capacity `store.data.len`).
 pub object Arr { len: u64, ptr: *V, store: ?Gc<Vals> }
 
+/// The write barrier for a store of a value through `a.ptr` (into the
+/// `store` object), which the compiler's barrier does not see. Needed
+/// for a generational heap; a byte test otherwise. Stores of
+/// non-references (undefined) and moves within the same array need none.
+#[inline]
+pub fn abar(a: Gc<Arr>) {
+    if let Some(s) = a.store { gc.barrier(s as *u8); }
+}
+
 /// A captured variable that is assigned after capture.
 pub object Box { v: V }
 

@@ -43,6 +43,20 @@ fn limited(prog: impl AsRef<std::ffi::OsStr>) -> Command {
     c
 }
 
+/// How the interpreters' test programs are run: normally, with GC stress
+/// (collect at every safepoint), and with a generational heap under
+/// stress that verifies the write barriers at every collection (the
+/// interpreters' second argument).
+const GC_MODES: [&str; 3] = ["", "stress", "verify"];
+
+fn gc_mode_name(mode: &str) -> &'static str {
+    match mode {
+        "stress" => " (gc stress)",
+        "verify" => " (gc verify)",
+        _ => "",
+    }
+}
+
 fn loimi() -> Command {
     let mut c = limited(env!("CARGO_BIN_EXE_loimi"));
     c.env("LOIMI_STD", env!("CARGO_MANIFEST_DIR"));
@@ -147,16 +161,16 @@ fn mini_scripts() {
         let expect = lua_directives("expect");
         let exit: i32 = lua_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = lua_directives("expect-stderr");
-        for stress in [false, true] {
+        for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
-            if stress {
-                cmd.arg("stress");
+            if !mode.is_empty() {
+                cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), if stress { " (gc stress)" } else { "" });
+            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode));
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -202,16 +216,16 @@ fn mini_conformance() {
         ran += 1;
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
-        for stress in [false, true] {
+        for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
-            if stress {
-                cmd.arg("stress");
+            if !mode.is_empty() {
+                cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", stem, if stress { " (gc stress)" } else { "" });
+            let name = format!("{}{}", stem, gc_mode_name(mode));
             if stdout != expected {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}", name, expected, stdout, stderr));
                 continue;
@@ -255,16 +269,16 @@ fn scheme_programs() {
         let expect = scm_directives("expect");
         let exit: i32 = scm_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = scm_directives("expect-stderr");
-        for stress in [false, true] {
+        for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
-            if stress {
-                cmd.arg("stress");
+            if !mode.is_empty() {
+                cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), if stress { " (gc stress)" } else { "" });
+            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode));
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -312,14 +326,14 @@ fn minijs_programs() {
         let stem = f.file_stem().unwrap().to_string_lossy().to_string();
         let expected = std::fs::read(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
-        for stress in [false, true] {
+        for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(f);
-            if stress {
-                cmd.arg("stress");
+            if !mode.is_empty() {
+                cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
-            let name = format!("{}{}", stem, if stress { " (gc stress)" } else { "" });
+            let name = format!("{}{}", stem, gc_mode_name(mode));
             if out.stdout != expected {
                 failures.push(format!(
                     "{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}",
