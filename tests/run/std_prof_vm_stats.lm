@@ -1,0 +1,69 @@
+// std.prof: the --vm-stats counters read from inside the program, reset
+// after a first run; and the clock and counters.
+// args: --vm-stats
+import std.io;
+import std.prof;
+import std.text;
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand label = pc + it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } format J { op: 8, a: 8, sbx: s16 } }
+    op INC(x: reg) : A { x = x + 1; next }
+    op DBL(x: reg) : A { x = x * 2; next }
+    op LOOP(x: reg, t: label) : J { if x < 1000 { jump t } next }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *u32, regs: *i64) -> i64 { pc = c; r = regs; jump pc }
+}
+
+fn show(c: prof.OpCounts) {
+    var b = text.StrBuf.new();
+    for i in 0..c.len() {
+        if c.count(i) > 0 { b.fmt2("{}={} ", c.name(i), c.count(i)); }
+    }
+    b.fmt("total={}", c.total());
+    io.println(b.as_str());
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    at = V.emit.INC(code[..], at, 0);
+    at = V.emit.DBL(code[..], at, 0);
+    at = V.emit.LOOP(code[..], at, 0, -2);
+    at = V.emit.RET(code[..], at, 0);
+    var regs: [i64; 2] = [0; 2];
+    let t = prof.Timer.start();
+    V.run(&code[0], &regs[0]);
+    let c = prof.op_counts("V").unwrap();
+    show(c);
+    io.print_bool(prof.op_counts("W").is_none()); io.println("");
+    c.reset();
+    regs[0] = 500;
+    V.run(&code[0], &regs[0]);
+    show(c);
+    io.print_int(c.count_of("LOOP") as i64); io.println("");
+    io.print_bool(t.ns() > 0); io.println("");
+
+    var k = prof.Counters.new();
+    let a = k.add("a");
+    let bb = k.add("bb");
+    k.inc(a); k.inc(a); k.bump(bb, 5);
+    io.print_int((k.get(a) * 10 + k.get(bb)) as i64); io.println("");
+    k.report();
+    var s = text.StrBuf.new();
+    prof.fmt_ns(&s, 812); s.add(" ");
+    prof.fmt_ns(&s, 3250); s.add(" ");
+    prof.fmt_ns(&s, 41720000); s.add(" ");
+    prof.fmt_ns(&s, 2040000000);
+    io.println(s.as_str());
+}
+// expect: INC=9 DBL=9 LOOP=9 RET=1 total=28
+// expect: true
+// expect: INC=1 DBL=1 LOOP=1 RET=1 total=4
+// expect: 1
+// expect: true
+// expect: 25
+// expect: 812 ns 3.25 us 41.7 ms 2.04 s
+// expect-stderr: bb  5
+// expect-stderr: == vm stats: V ==

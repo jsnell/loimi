@@ -899,6 +899,7 @@ fn count_op(g: &mut FnGen, k: u32) {
 /// `--vm-stats`: counters, and a report printed at exit (op counts, and
 /// frequent pairs as `super` declarations).
 pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
+    emit_stats_access(cg);
     if !cg.opts.vm_stats {
         return;
     }
@@ -990,15 +991,70 @@ done:
             nsw = super_words.len(),
             suggest = stats_rt_sym("suggest"),
         );
+        // `prof.OpCounts.reset`: zero the counts, pairs and sequences.
+        let _ = writeln!(
+            cg.fns,
+            r#"define internal void @"{sym}.stats.reset"() {{
+  call void @llvm.memset.p0.i64(ptr @"{sym}.stats.counts", i8 0, i64 {cb}, i1 false)
+  call void @llvm.memset.p0.i64(ptr @"{sym}.stats.pairs", i8 0, i64 {pb}, i1 false)
+  store i64 {n}, ptr @"{sym}.stats.last"
+  store ptr null, ptr @"{sym}.stats.next"
+  %tabp = getelementptr inbounds i64, ptr @"{sym}.stats.seq", i64 4
+  %tab = load ptr, ptr %tabp
+  call void @free(ptr %tab)
+  call void @llvm.memset.p0.i64(ptr @"{sym}.stats.seq", i8 0, i64 48, i1 false)
+  ret void
+}}
+"#,
+            cb = n * 8,
+            pb = (n + 1) * n * 8,
+        );
         dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
     }
     if !dtors.is_empty() {
         let _ = writeln!(cg.globals, "@llvm.global_dtors = appending global [{} x {{ i32, ptr, ptr }}] [{}]", dtors.len(), dtors.join(", "));
         let _ = writeln!(cg.globals, "@stderr = external global ptr");
         cg.decls.insert("declare i32 @fprintf(ptr, ptr, ...)");
+        cg.decls.insert("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)");
+        cg.decls.insert("declare void @free(ptr)");
         cg.decls.insert(format!("declare void @{}(ptr, i64, i64)", stats_rt_sym("seq")));
         cg.decls.insert(format!("declare void @{}(ptr, ptr, i64, ptr, ptr, i64, ptr, i64)", stats_rt_sym("suggest")));
     }
+}
+
+/// `std.prof`'s access to the counters, defined when the program
+/// declares it: `loimi_vm_stats_count()` is the number of vms counted (0
+/// without `--vm-stats`), and `loimi_vm_stats_entry(i)` points to vm
+/// `i`'s `{ name, name length, ops, counts, op names, report, reset }`
+/// (`prof.RawStats`).
+fn emit_stats_access(cg: &mut crate::codegen::Codegen) {
+    let want = cg.decls.0.remove("loimi_vm_stats_count").is_some() | cg.decls.0.remove("loimi_vm_stats_entry").is_some();
+    if !want {
+        return;
+    }
+    let n = if cg.opts.vm_stats { cg.p.vms.len() } else { 0 };
+    let ty = "{ ptr, i64, i64, ptr, ptr, ptr, ptr }";
+    let mut entries = Vec::new();
+    for vd in cg.p.vms.iter().take(n) {
+        let name = cg.string_const(vd.name.as_bytes());
+        let s = &vd.symbol;
+        entries.push(format!(
+            "{ty} {{ ptr {name}, i64 {}, i64 {}, ptr @\"{s}.stats.counts\", ptr @\"{s}.stats.names\", ptr @\"{s}.stats.report\", ptr @\"{s}.stats.reset\" }}",
+            vd.name.len(),
+            vd.ops.len()
+        ));
+    }
+    let _ = writeln!(cg.fns, "define internal i64 @loimi_vm_stats_count() {{\n  ret i64 {}\n}}", n);
+    if n == 0 {
+        let _ = writeln!(cg.fns, "define internal ptr @loimi_vm_stats_entry(i64 %i) {{\n  ret ptr null\n}}");
+        return;
+    }
+    let _ = writeln!(cg.globals, "@loimi.vm_stats = internal constant [{} x {}] [{}]", n, ty, entries.join(", "));
+    let _ = writeln!(
+        cg.fns,
+        "define internal ptr @loimi_vm_stats_entry(i64 %i) {{\n  %p = getelementptr inbounds [{} x {}], ptr @loimi.vm_stats, i64 0, i64 %i\n  ret ptr %p\n}}",
+        n, ty
+    );
 }
 
 /// The C source of the `--vm-stats` runtime.

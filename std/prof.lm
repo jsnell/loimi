@@ -1,0 +1,305 @@
+// Profiling helpers for interpreter authors: a monotonic clock, a
+// benchmark harness that interleaves variants, named counters, and the
+// `--vm-stats` op counts from inside the program.
+//
+//     var b = prof.Bench.new(2, 10);           // 2 warmup rounds, 10 timed
+//     b.add("tailcall", run_a, &a as *u8);
+//     b.add("switch", run_b, &b2 as *u8);
+//     b.run();                                  // prints min / median per variant
+//
+// Nothing here costs anything unless it is called; the vm stats need a
+// `loimi build --vm-stats` build (`op_counts` returns None otherwise).
+
+import std.io;
+import std.mem;
+import std.text;
+import std.hash;
+
+struct Timespec { sec: i64, nsec: i64 }
+
+extern "C" fn clock_gettime(clock: i32, ts: *Timespec) -> i32;
+
+/// Nanoseconds on the monotonic clock (`CLOCK_MONOTONIC`), from an
+/// arbitrary start: subtract two readings.
+pub fn now_ns() -> u64 {
+    var ts = Timespec { sec: 0, nsec: 0 };
+    clock_gettime(1, &ts);
+    (ts.sec as u64) * 1000000000 + ts.nsec as u64
+}
+
+/// A stopwatch: `let t = prof.Timer.start(); ..; t.ns()`.
+pub struct Timer { t0: u64 }
+
+pub fn Timer.start() -> Timer { Timer { t0: now_ns() } }
+
+/// Nanoseconds since `start` (or the last `restart`).
+pub fn Timer.ns(t: *Timer) -> u64 { now_ns() - t.t0 }
+
+/// Milliseconds since `start`, as a float.
+pub fn Timer.ms(t: *Timer) -> f64 { t.ns() as f64 / 1000000.0 }
+
+pub fn Timer.restart(t: *Timer) { t.t0 = now_ns(); }
+
+/// Append `ns` in a readable unit ("812 ns", "3.25 us", "41.7 ms",
+/// "2.04 s"), three significant digits.
+pub fn fmt_ns(b: *text.StrBuf, ns: u64) {
+    if ns < 1000 { b.add(ns).add(" ns"); return; }
+    var x = ns as f64;
+    var unit = " us";
+    x /= 1000.0;
+    if x >= 1000.0 { x /= 1000.0; unit = " ms"; }
+    if x >= 1000.0 { x /= 1000.0; unit = " s"; }
+    // Three significant digits.
+    fixed(b, x, if x >= 100.0 { 0 } else if x >= 10.0 { 1 } else { 2 });
+    b.add(unit);
+}
+
+/// Append `x` (not negative) with `decimals` (0 to 3) digits after the point.
+fn fixed(b: *text.StrBuf, x: f64, decimals: u64) {
+    var scale: u64 = 1;
+    for _ in 0..decimals { scale *= 10; }
+    let v = (x * scale as f64 + 0.5) as u64;
+    b.add(v / scale);
+    if decimals == 0 { return; }
+    b.add(".");
+    var frac = v % scale;
+    var d = scale / 10;
+    while d > 0 { b.push('0' + (frac / d) as u8); frac %= d; d /= 10; }
+}
+
+// ── benchmarks ──────────────────────────────────────────────────────
+
+struct Case {
+    name: str,
+    f: fn(*u8) uses reenter,
+    data: *u8,
+    times: mem.Vec<u64>,
+}
+
+/// Variants of a benchmark, timed in interleaved rounds: each round runs
+/// every variant once (starting from a different one each round), so a
+/// machine that slows down or speeds up during the run affects all of
+/// them alike. Report the minimum (the least disturbed run) and the
+/// median.
+pub struct Bench {
+    cases: mem.Vec<Case>,
+    warmup: u64,
+    runs: u64,
+}
+
+/// `warmup` untimed rounds, then `runs` timed ones.
+pub fn Bench.new(warmup: u64, runs: u64) -> Bench {
+    Bench { cases: mem.Vec.new(), warmup: warmup, runs: if runs == 0 { 1 } else { runs } }
+}
+
+/// A variant: one run is `f(data)`.
+pub fn Bench.add(b: *Bench, name: str, f: fn(*u8) uses reenter, data: *u8) {
+    b.cases.push(Case { name: name, f: f, data: data, times: mem.Vec.new() });
+}
+
+/// Run the rounds and print the table (`report`) on stderr.
+pub fn Bench.run(b: *Bench) uses reenter {
+    let n = b.cases.len;
+    for r in 0..b.warmup + b.runs {
+        for k in 0..n {
+            let c = b.cases.ptr_at((r + k) % n);
+            let f = c.f;
+            let t0 = now_ns();
+            f(c.data);
+            let t = now_ns() - t0;
+            if r >= b.warmup { c.times.push(t); }
+        }
+    }
+    var out = text.StrBuf.new();
+    b.report(&out);
+    io.eprint(out.as_str());
+    out.free();
+}
+
+/// Times of variant `i`, sorted (after `run`).
+fn Bench.sorted(b: *Bench, i: u64) -> []u64 {
+    let ts = b.cases.ptr_at(i).times.items();
+    // Insertion sort: a handful of runs.
+    for j in 1..ts.len {
+        let x = ts[j];
+        var k = j;
+        while k > 0 and ts[k - 1] > x { ts[k] = ts[k - 1]; k -= 1; }
+        ts[k] = x;
+    }
+    ts
+}
+
+/// The fastest run of variant `i` (in the order `add` was called), ns.
+pub fn Bench.min_ns(b: *Bench, i: u64) -> u64 { b.sorted(i)[0] }
+
+/// The median run of variant `i`, ns.
+pub fn Bench.median_ns(b: *Bench, i: u64) -> u64 {
+    let ts = b.sorted(i);
+    ts[ts.len / 2]
+}
+
+/// One line per variant: name, min, median, and min relative to the
+/// first variant's.
+pub fn Bench.report(b: *Bench, out: *text.StrBuf) {
+    var w: u64 = 4;
+    for i in 0..b.cases.len { if b.cases.ptr_at(i).name.len > w { w = b.cases.ptr_at(i).name.len; } }
+    pad(out, "name", w);
+    out.add("         min      median   vs first\n");
+    let base = b.min_ns(0) as f64;
+    for i in 0..b.cases.len {
+        pad(out, b.cases.ptr_at(i).name, w);
+        var t = text.StrBuf.new();
+        fmt_ns(&t, b.min_ns(i));
+        lpad(out, t.as_str(), 12);
+        t.clear();
+        fmt_ns(&t, b.median_ns(i));
+        lpad(out, t.as_str(), 12);
+        t.clear();
+        fixed(&t, b.min_ns(i) as f64 / base, 2);
+        t.add("x");
+        lpad(out, t.as_str(), 11);
+        t.free();
+        out.add("\n");
+    }
+    out.fmt2("({} runs each, {} warmup)\n", b.runs, b.warmup);
+}
+
+pub fn Bench.free(b: *Bench) {
+    for i in 0..b.cases.len { b.cases.ptr_at(i).times.free(); }
+    b.cases.free();
+}
+
+fn pad(out: *text.StrBuf, s: str, w: u64) {
+    out.add(s);
+    for _ in s.len..w { out.push(' '); }
+}
+
+fn lpad(out: *text.StrBuf, s: str, w: u64) {
+    for _ in s.len..w { out.push(' '); }
+    out.add(s);
+}
+
+// ── counters ────────────────────────────────────────────────────────
+
+/// Named event counters, for what `--vm-stats` does not see (cache
+/// misses, allocations by kind, slow-path entries):
+///
+///     var c = prof.Counters.new();
+///     let miss = c.add("ic miss");
+///     ..  c.inc(miss);  ..
+///     c.report();
+pub struct Counters {
+    names: mem.Vec<str>,
+    counts: mem.Vec<u64>,
+}
+
+pub fn Counters.new() -> Counters { Counters { names: mem.Vec.new(), counts: mem.Vec.new() } }
+
+/// A new counter (at 0); its id.
+pub fn Counters.add(c: *Counters, name: str) -> u64 {
+    c.names.push(name);
+    c.counts.push(0);
+    c.names.len - 1
+}
+
+#[inline]
+pub fn Counters.inc(c: *Counters, id: u64) { c.counts.items()[id] += 1; }
+
+#[inline]
+pub fn Counters.bump(c: *Counters, id: u64, n: u64) { c.counts.items()[id] += n; }
+
+pub fn Counters.get(c: *Counters, id: u64) -> u64 { c.counts.items()[id] }
+
+/// Print every counter on stderr, one per line.
+pub fn Counters.report(c: *Counters) {
+    var w: u64 = 0;
+    for i in 0..c.names.len { if c.names.at(i).len > w { w = c.names.at(i).len; } }
+    var out = text.StrBuf.new();
+    for i in 0..c.names.len {
+        pad(&out, c.names.at(i), w);
+        out.add("  ").add(c.counts.items()[i]).add("\n");
+    }
+    io.eprint(out.as_str());
+    out.free();
+}
+
+pub fn Counters.free(c: *Counters) {
+    c.names.free();
+    c.counts.free();
+}
+
+// ── vm stats ────────────────────────────────────────────────────────
+
+/// What the compiler records per vm in a `--vm-stats` build.
+struct RawStats {
+    name: *u8,
+    name_len: u64,
+    nops: u64,
+    counts: *u64,
+    names: **u8,
+    report: fn(),
+    reset: fn(),
+}
+
+extern "C" fn loimi_vm_stats_count() -> u64;
+extern "C" fn loimi_vm_stats_entry(i: u64) -> *RawStats;
+extern "C" fn strlen(s: *u8) -> u64;
+
+/// Whether this is a `--vm-stats` build of a program with a vm.
+pub fn vm_stats_enabled() -> bool { loimi_vm_stats_count() > 0 }
+
+/// The op counters of one vm in a `--vm-stats` build: how many times
+/// each op ran since the start (or `reset`). Ops are numbered in
+/// declaration order, supers included; `name(i)` is the op's name.
+pub struct OpCounts { raw: *RawStats }
+
+/// The counters of the vm named `vm`; None without `--vm-stats` or if
+/// there is no such vm.
+pub fn op_counts(vm: str) -> ?OpCounts {
+    for i in 0..loimi_vm_stats_count() {
+        let r = loimi_vm_stats_entry(i);
+        if r.name.slice(r.name_len).eq(vm) { return Some(OpCounts { raw: r }); }
+    }
+    None
+}
+
+/// Number of ops.
+pub fn OpCounts.len(c: OpCounts) -> u64 { c.raw.nops }
+
+pub fn OpCounts.name(c: OpCounts, i: u64) -> str {
+    let p = c.raw.names[i];
+    p.slice(strlen(p))
+}
+
+/// Times op `i` ran.
+pub fn OpCounts.count(c: OpCounts, i: u64) -> u64 { c.raw.counts[i] }
+
+/// Times the op named `name` ran (0 if there is none).
+pub fn OpCounts.count_of(c: OpCounts, name: str) -> u64 {
+    for i in 0..c.raw.nops {
+        if c.name(i).eq(name) { return c.raw.counts[i]; }
+    }
+    0
+}
+
+/// Ops run in all.
+pub fn OpCounts.total(c: OpCounts) -> u64 {
+    var t: u64 = 0;
+    for i in 0..c.raw.nops { t += c.raw.counts[i]; }
+    t
+}
+
+/// Zero the counters (op counts, pairs and longer sequences), for
+/// example after a warmup or to measure one phase. The report at exit
+/// covers what ran since.
+pub fn OpCounts.reset(c: OpCounts) {
+    let f = c.raw.reset;
+    f();
+}
+
+/// Print the report `--vm-stats` prints at exit (op counts and
+/// suggested supers) now, on stderr.
+pub fn OpCounts.report(c: OpCounts) {
+    let f = c.raw.report;
+    f();
+}

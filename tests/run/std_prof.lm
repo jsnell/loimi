@@ -1,0 +1,48 @@
+// std.prof without --vm-stats: no op counts; the benchmark harness runs
+// each variant warmup + runs times, interleaved.
+import std.io;
+import std.prof;
+import std.text;
+
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    op RET() : A { exit 0 }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+
+struct Work { calls: u64, n: u64 }
+
+fn spin(d: *u8) {
+    let w = d as *Work;
+    w.calls += 1;
+    var x: u64 = 0;
+    for i in 0..w.n { x = x *% 31 +% i; }
+    if x == 1 { io.println("unlikely"); }
+}
+
+fn main() uses reenter {
+    io.print_bool(prof.vm_stats_enabled()); io.println("");
+    io.print_bool(prof.op_counts("V").is_none()); io.println("");
+    var a = Work { calls: 0, n: 1000 };
+    var b = Work { calls: 0, n: 100000 };
+    var bench = prof.Bench.new(2, 5);
+    bench.add("small", spin, &a as *u8);
+    bench.add("large", spin, &b as *u8);
+    bench.run();
+    io.print_int((a.calls * 100 + b.calls) as i64); io.println("");
+    io.print_bool(bench.min_ns(0) <= bench.median_ns(0) and bench.min_ns(1) <= bench.median_ns(1)); io.println("");
+    io.print_bool(bench.min_ns(0) < bench.min_ns(1)); io.println("");
+    var out = text.StrBuf.new();
+    bench.report(&out);
+    io.print_bool(text.starts_with(out.as_str(), "name ")); io.println("");
+    bench.free();
+}
+// expect: false
+// expect: true
+// expect: 707
+// expect: true
+// expect: true
+// expect: true
+// expect-stderr: (5 runs each, 2 warmup)
+// expect-stderr: vs first
