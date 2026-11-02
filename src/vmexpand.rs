@@ -354,7 +354,7 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
         becomes: Vec<String>,
     }
     fn tokens(sm: &SourceMap, b: &Block) -> Option<Vec<Token>> {
-        let text = &sm.files[b.span.file as usize].text[b.span.lo as usize..b.span.hi as usize];
+        let text = sm.text(b.span);
         crate::lexer::lex(b.span.file, text).ok()
     }
     /// Index after the block whose `{` is at `i`.
@@ -565,9 +565,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     }
     let clause_text = |kind: &str| -> Option<String> {
         let k = v.operands.iter().find(|o| o.name.name == kind)?;
-        let e = k.verify.as_ref()?;
-        let f = &sm.files[e.span.file as usize];
-        Some(f.text[e.span.lo as usize..e.span.hi as usize].to_string())
+        Some(sm.text(k.verify.as_ref()?.span).to_string())
     };
     let clause = |kind: &str| -> Option<String> {
         Some(clause_text(kind)?.replace("is_insn_boundary(", &format!("{n}__boundary(__code, &__bits, ")))
@@ -738,8 +736,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     );
     let mut params = vec![format!("__code: []{w}")];
     for p in &v.verify_ctx {
-        let f = &sm.files[p.ty.span.file as usize];
-        params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
+        params.push(format!("{}: {}", p.name.name, sm.text(p.ty.span)));
     }
     // `const` operand kinds: the constant pool of verified code, from the
     // verify context, as the type of the state register the kinds index
@@ -749,9 +746,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         let crate::ast::ExprKind::Index(b, _) = &o.body.kind else { return None };
         let crate::ast::ExprKind::Ident(sn) = &b.kind else { return None };
         let st = v.state.iter().find(|p| p.name.name == *sn)?;
-        let f = &sm.files[e.span.file as usize];
-        let tf = &sm.files[st.ty.span.file as usize];
-        Some((f.text[e.span.lo as usize..e.span.hi as usize].to_string(), tf.text[st.ty.span.lo as usize..st.ty.span.hi as usize].to_string()))
+        Some((sm.text(e.span).to_string(), sm.text(st.ty.span).to_string()))
     });
     if let Some((e, t)) = &konst {
         let _ = writeln!(s, "fn {n}__const_pool({}) -> *u8 {{ let __p: {t} = {e}; __p as *u8 }}", params[1..].join(", "));
@@ -906,9 +901,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             if v.verify_ctx.iter().any(|p| p.name.name == "code") {
                 return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
             }
-            let f = &sm.files[b.span.file as usize];
-            let text = f.text[b.span.lo as usize..b.span.hi as usize].to_string();
-            let text = replace_call(&text, "is_insn_boundary", &format!("{n}__boundary(code, __bits, "));
+            let text = replace_call(sm.text(b.span), "is_insn_boundary", &format!("{n}__boundary(code, __bits, "));
             let text = replace_call(&text, "reject", &format!("return {n}__reject(code, {i}, "));
             let _ = writeln!(
                 s,
@@ -929,15 +922,13 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             args.push("__o".into());
             continue;
         }
-        let f = &sm.files[p.ty.span.file as usize];
-        params.push(format!(", {}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
+        params.push(format!(", {}: {}", p.name.name, sm.text(p.ty.span)));
         args.push(p.name.name.clone());
     }
     let (generics, obj) = match v.verify_owner {
         Some(i) => {
             let TypeKind::Named(_, a) = &v.verify_ctx[i].ty.kind else { unreachable!("checked by the parser") };
-            let f = &sm.files[a[0].span.file as usize];
-            ("<__H>", f.text[a[0].span.lo as usize..a[0].span.hi as usize].to_string())
+            ("<__H>", sm.text(a[0].span).to_string())
         }
         None => ("<__H, __T>", "__T".to_string()),
     };
@@ -1658,10 +1649,7 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let w = format!("u{}", l.word_bits);
     let vis = if v.is_pub { "pub " } else { "" };
     let jw = maps_words(l, jit);
-    let text = |e: &Expr| -> String {
-        let f = &sm.files[e.span.file as usize];
-        f.text[e.span.lo as usize..e.span.hi as usize].to_string()
-    };
+    let text = |e: &Expr| -> String { sm.text(e.span).to_string() };
     for o in &v.ops {
         if o.stack.is_none() {
             return Err(Diag::new(
@@ -1727,8 +1715,7 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let mut params = vec![];
     let mut args = vec![];
     for p in &v.verify_ctx {
-        let f = &sm.files[p.ty.span.file as usize];
-        params.push(format!("{}: {}", p.name.name, &f.text[p.ty.span.lo as usize..p.ty.span.hi as usize]));
+        params.push(format!("{}: {}", p.name.name, sm.text(p.ty.span)));
         args.push(p.name.name.clone());
     }
     let ctx_params: String = params.iter().map(|p| format!(", {p}")).collect();

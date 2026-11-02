@@ -59,6 +59,11 @@ impl SourceMap {
         (self.files.len() - 1) as u32
     }
 
+    /// The source text `span` covers.
+    pub fn text(&self, span: Span) -> &str {
+        &self.files[span.file as usize].text[span.lo as usize..span.hi as usize]
+    }
+
     pub fn line_col(&self, file: u32, pos: u32) -> (usize, usize) {
         let text = &self.files[file as usize].text;
         let pos = (pos as usize).min(text.len());
