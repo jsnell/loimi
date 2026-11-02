@@ -1,0 +1,68 @@
+// matrix: dispatch
+// `next` from a part's cold block, and from a shared copy of a `-> never`
+// vm function a part calls, continues in the super in every dispatch
+// mode (tail-call mode outlines the cold block and shares the function,
+// and continues in the super's resume function): a `become` in the next
+// part then rewrites the super's head too, so the quickened code is the
+// same in every mode.
+import std.io;
+import std.text;
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it] display "r{}";
+    operand imm = it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+    }
+
+    #[inline(never)]
+    fn put(d: u64, v: i64) -> never { regs[d] = v; next }
+
+    /// Takes its cold path for odd results.
+    op ADDC(dst: reg, a: reg, b: reg) : ABC {
+        let r = a + b;
+        if (r & 1) == 1 { cold { dst = r; next } }
+        dst = r;
+        next
+    }
+    /// Calls the shared copy (always, through `#[inline(never)]`).
+    op SET(dst: reg, v: imm) : ABC { put(dst.raw, v as i64) }
+    family MUL(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a * b; become MUL_Q; next }
+        MUL_Q { dst = a * b; next }
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADDC_MUL = ADDC; MUL;
+    super ADDC_MUL_Q = ADDC; MUL_Q;
+    super SET_MUL = SET; MUL;
+
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var regs: [i64; 4] = [3, 4, 0, 0];
+    let c = code[..];
+    var at: u64 = 0;
+    at = V.emit.ADDC(c, at, 2, 0, 1);    // 7: odd, the cold path
+    at = V.emit.MUL(c, at, 3, 2, 2);
+    at = V.emit.SET(c, at, 1, 5);
+    at = V.emit.MUL(c, at, 3, 3, 1);
+    at = V.emit.RET(c, at, 3);
+    V.optimize_words(c[0..at]);
+    io.print_int(V.run(&code[0], &regs[0]));
+    io.println("");
+    var b = text.StrBuf.new();
+    V.disasm(c[0..at], &b);
+    io.print(b.as_str());
+}
+// expect: 245
+// expect:     0  ADDC_MUL_Q
+// expect:     0    ADDC dst=r2 a=r0 b=r1
+// expect:     1    MUL_Q dst=r3 a=r2 b=r2
+// expect:     2  SET dst=r1 v=5
+// expect:     3  MUL_Q dst=r3 a=r3 b=r1
+// expect:     4  RET src=r3

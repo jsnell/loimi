@@ -1,12 +1,11 @@
-// args: --jit-stencils
-// env: LOIMI_JIT=1 LOIMI_JIT_HOT=1
+// matrix: jit
 // Host code that reads code words sees the real words while the JIT
 // holds the code: compiled instructions' words are enter words, which
 // `V.real_word` maps back, and which the generated readers (disasm,
 // op_name, op_size, label, set_label, field getters, operand metadata,
-// verify) map themselves. Without the JIT (no --jit-stencils), the
-// output is the same but for the last line ("not compiled"); before the
-// fix, every compiled word printed as `<invalid ..>` and verify failed.
+// verify) map themselves. The output is the same with the JIT on and
+// off (whether words were enter words goes to stderr); before the fix,
+// every compiled word printed as `<invalid ..>` and verify failed.
 import std.io;
 import std.text;
 import std.gc;
@@ -104,7 +103,7 @@ fn main() {
     // With the JIT, some words are enter words.
     var raw: u64 = 0;
     for i in 0..ws.len { if ws[i] != copy[i] { raw += 1; } }
-    if raw > 0 { io.println("compiled"); } else { io.println("not compiled"); }
+    if raw > 0 { io.eprintln("compiled"); } else { io.eprintln("not compiled"); }
 }
 // expect: 100
 // expect:     0  LOADI dst=r0 v=0
@@ -122,4 +121,3 @@ fn main() {
 // expect: 6 RET size=1 operands=1 a=0
 // expect: verify ok
 // expect: same
-// expect: compiled
