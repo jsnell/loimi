@@ -280,10 +280,22 @@ fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)]) {
 /// `; expect:` lines (and `; expect-exit:` / `; expect-stderr:`).
 #[test]
 fn scheme_programs() {
+    scheme_programs_with(&[], &[]);
+}
+
+/// The Scheme interpreter with the copy-and-patch JIT forced on (as
+/// `mini_jit_stencils`).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn scheme_jit_stencils() {
+    scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
+}
+
+fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-scheme-{}", std::process::id()));
-    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building scheme failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = std::env::temp_dir().join(format!("loimi-scheme-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
+    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/scheme/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building scheme {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
     let mut failures = Vec::new();
     let mut programs: Vec<PathBuf> = std::fs::read_dir(root.join("examples/scheme/tests"))
         .unwrap()
@@ -305,13 +317,14 @@ fn scheme_programs() {
         for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(&f);
+            cmd.envs(env.iter().copied());
             if !mode.is_empty() {
                 cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode));
+            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), gc_mode_name(mode), flags.join(" "));
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -340,10 +353,22 @@ fn scheme_programs() {
 /// exception. Run normally and with GC stress.
 #[test]
 fn minijs_programs() {
+    minijs_programs_with(&[], &[]);
+}
+
+/// The MiniJS interpreter with the copy-and-patch JIT forced on (as
+/// `mini_jit_stencils`).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn minijs_jit_stencils() {
+    minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
+}
+
+fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-minijs-{}", std::process::id()));
-    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building minijs failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = std::env::temp_dir().join(format!("loimi-minijs-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
+    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/minijs/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building minijs {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
     let mut programs: Vec<PathBuf> = Vec::new();
     for dir in ["examples/minijs/tests", "examples/minijs/tests/conformance"] {
         programs.extend(
@@ -362,11 +387,12 @@ fn minijs_programs() {
         for mode in GC_MODES {
             let mut cmd = limited(&exe);
             cmd.arg(f);
+            cmd.envs(env.iter().copied());
             if !mode.is_empty() {
                 cmd.arg(mode);
             }
             let out = cmd.output().unwrap();
-            let name = format!("{}{}", stem, gc_mode_name(mode));
+            let name = format!("{}{} {}", stem, gc_mode_name(mode), flags.join(" "));
             if out.stdout != expected {
                 failures.push(format!(
                     "{}: stdout mismatch\n--- expected\n{}--- got\n{}--- stderr\n{}",
