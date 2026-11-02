@@ -3606,13 +3606,13 @@ fn irrefutable(p: &TPat) -> bool {
 }
 
 /// Whether all-zero bytes are a valid value of `t` that needs no
-/// constructor, for `..zero` and `[]`: numbers, `bool`, raw pointers
-/// (null), `?T` (None), slices (empty), and arrays and tuples of those.
-/// Not structs (their constructor may set invariants), enums, `Gc`,
-/// `value` types or functions.
+/// constructor, for `..zero`: numbers, `bool`, `?T` (None), slices
+/// (empty), and arrays and tuples of those. Not `*T` and `Gc<T>` (never
+/// null), structs (their constructor may set invariants), enums, `value`
+/// types or functions.
 pub fn zero_ok(t: &Ty) -> bool {
     match t {
-        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Ptr(_) | Ty::Option(_) | Ty::Slice(_) => true,
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) => true,
         Ty::Array(e, _) => zero_ok(e),
         Ty::Tuple(ts) => ts.iter().all(zero_ok),
         _ => false,

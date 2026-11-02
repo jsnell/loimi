@@ -6,7 +6,7 @@ import std.diag;
 struct Machine {
     name: str,
     out: text.StrBuf,
-    sp: *i64,
+    sp: ?*i64,
     depth: u32,
     ratio: f64,
     ok: bool,
@@ -31,7 +31,7 @@ fn main() {
     var m = Machine { out: text.StrBuf.new(), depth: 3, ..zero };
     io.print_int(m.depth as i64);
     io.print_int(m.name.len as i64);
-    io.print_int(m.sp as i64);
+    io.print_int(if m.sp.is_none() { 0 } else { 1 });
     io.print_int(m.ratio as i64);
     io.print_bool(m.ok);
     io.print_bool(m.last.is_none());
