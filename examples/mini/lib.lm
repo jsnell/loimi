@@ -211,13 +211,7 @@ fn take_str(h: *gc.Heap, b: *text.StrBuf) -> V {
 /// "bad argument #<i+1> to '<fname>' (<msg>)"
 fn bad_arg(h: *gc.Heap, i: u64, fname: str, msg: str) -> V {
     var b = text.StrBuf.new();
-    b.push_str("bad argument #");
-    b.push_int((i + 1) as i64);
-    b.push_str(" to '");
-    b.push_str(fname);
-    b.push_str("' (");
-    b.push_str(msg);
-    b.push_str(")");
+    b.fmt3("bad argument #{} to '{}' ({})", i + 1, fname, msg);
     take_str(h, &b)
 }
 
@@ -708,11 +702,7 @@ fn tab_concat(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
             _ => {
                 b.free();
                 var m = text.StrBuf.new();
-                m.push_str("invalid value (");
-                m.push_str(value.type_name(v));
-                m.push_str(") at index ");
-                m.push_int(k);
-                m.push_str(" in table for 'concat'");
+                m.fmt2("invalid value ({}) at index {} in table for 'concat'", value.type_name(v), k);
                 return Err(take_str(h, &m));
             }
         }

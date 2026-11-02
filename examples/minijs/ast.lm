@@ -35,10 +35,7 @@ pub struct Token { kind: T, line: u32, num: f64, text: str }
 
 pub fn fail(line: u32, msg: str) -> never {
     var b = text.StrBuf.new();
-    b.push_str("SyntaxError: line ");
-    b.push_int(line as i64);
-    b.push_str(": ");
-    b.push_str(msg);
+    b.fmt2("SyntaxError: line {}: {}", line, msg);
     io.eprintln(b.as_str());
     os.quit(1)
 }

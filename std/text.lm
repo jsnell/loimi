@@ -57,6 +57,130 @@ pub fn StrBuf.clear(b: *StrBuf) { b.bytes.clear(); }
 
 pub fn StrBuf.free(b: *StrBuf) { b.bytes.free(); }
 
+pub fn StrBuf.push_u64(b: *StrBuf, x: u64) {
+    var buf: [u8; 20] = [0; 20];
+    var i: u64 = 20;
+    var u = x;
+    loop {
+        i -= 1;
+        buf[i] = '0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 { break; }
+    }
+    b.push_str(buf[i..20]);
+}
+
+// ── formatting ──────────────────────────────────────────────────────
+
+/// Values that `StrBuf.add` and `StrBuf.fmt` can append. Implemented
+/// for `str`, the integer types (`u8` as a number: use `push` for a
+/// byte), `f64` (as `push_f64`) and `bool`. Other types implement it by
+/// defining `fn T.fmt(x: T, b: *StrBuf)` and declaring
+/// `impl text.Fmt for T;`.
+pub trait Fmt {
+    fn fmt(x: Self, b: *StrBuf);
+}
+
+pub fn str.fmt(x: str, b: *StrBuf) { b.push_str(x); }
+pub fn i64.fmt(x: i64, b: *StrBuf) { b.push_int(x); }
+pub fn i32.fmt(x: i32, b: *StrBuf) { b.push_int(x as i64); }
+pub fn i16.fmt(x: i16, b: *StrBuf) { b.push_int(x as i64); }
+pub fn i8.fmt(x: i8, b: *StrBuf) { b.push_int(x as i64); }
+pub fn u64.fmt(x: u64, b: *StrBuf) { b.push_u64(x); }
+pub fn u32.fmt(x: u32, b: *StrBuf) { b.push_int(x as i64); }
+pub fn u16.fmt(x: u16, b: *StrBuf) { b.push_int(x as i64); }
+pub fn u8.fmt(x: u8, b: *StrBuf) { b.push_int(x as i64); }
+pub fn f64.fmt(x: f64, b: *StrBuf) { b.push_f64(x); }
+pub fn bool.fmt(x: bool, b: *StrBuf) { b.push_str(if x { "true" } else { "false" }); }
+
+impl Fmt for str;
+impl Fmt for i64;
+impl Fmt for i32;
+impl Fmt for i16;
+impl Fmt for i8;
+impl Fmt for u64;
+impl Fmt for u32;
+impl Fmt for u16;
+impl Fmt for u8;
+impl Fmt for f64;
+impl Fmt for bool;
+
+/// Append `x` and return the buffer, for chaining:
+/// `b.add("line ").add(n).add(": ").add(msg)`.
+pub fn StrBuf.add<T: Fmt>(b: *StrBuf, x: T) -> *StrBuf {
+    x.fmt(b);
+    b
+}
+
+/// Append `f` from `from` up to its next `{}` placeholder (`{{` and `}}`
+/// stand for `{` and `}`), and return the position after the
+/// placeholder, or None at the end of `f`.
+fn StrBuf.fmt_until(b: *StrBuf, f: str, from: u64) -> ?u64 {
+    var i = from;
+    while i < f.len {
+        let c = f[i];
+        if c == '{' and i + 1 < f.len {
+            if f[i + 1] == '}' { return Some(i + 2); }
+            if f[i + 1] == '{' { b.push('{'); i += 2; continue; }
+        }
+        if c == '}' and i + 1 < f.len and f[i + 1] == '}' { b.push('}'); i += 2; continue; }
+        b.push(c);
+        i += 1;
+    }
+    None
+}
+
+/// Append `f` up to the placeholder after `at`, then `x`; None once `f`
+/// is used up (later arguments go at the end).
+fn StrBuf.fmt_arg<T: Fmt>(b: *StrBuf, f: str, at: ?u64, x: T) -> ?u64 {
+    var next: ?u64 = None;
+    if let Some(i) = at { next = b.fmt_until(f, i); }
+    x.fmt(b);
+    next
+}
+
+fn StrBuf.fmt_end(b: *StrBuf, f: str, at: ?u64) -> *StrBuf {
+    // Placeholders without an argument stay as they are.
+    var next = at;
+    loop {
+        let Some(i) = next else { break; };
+        next = b.fmt_until(f, i);
+        if next.is_some() { b.push_str("{}"); }
+    }
+    b
+}
+
+/// Append `f` with each `{}` replaced by the next argument:
+/// `b.fmt2("expected {} values, got {}", n, m)`. `{{` and `}}` are
+/// literal braces. A placeholder without an argument stays `{}`; an
+/// argument without a placeholder is appended at the end. Returns the
+/// buffer. `fmt` takes one argument, `fmt2` to `fmt4` two to four.
+pub fn StrBuf.fmt<A: Fmt>(b: *StrBuf, f: str, a: A) -> *StrBuf {
+    let at = b.fmt_arg(f, Some(0), a);
+    b.fmt_end(f, at)
+}
+
+pub fn StrBuf.fmt2<A: Fmt, B: Fmt>(b: *StrBuf, f: str, a: A, x: B) -> *StrBuf {
+    var at = b.fmt_arg(f, Some(0), a);
+    at = b.fmt_arg(f, at, x);
+    b.fmt_end(f, at)
+}
+
+pub fn StrBuf.fmt3<A: Fmt, B: Fmt, C: Fmt>(b: *StrBuf, f: str, a: A, x: B, y: C) -> *StrBuf {
+    var at = b.fmt_arg(f, Some(0), a);
+    at = b.fmt_arg(f, at, x);
+    at = b.fmt_arg(f, at, y);
+    b.fmt_end(f, at)
+}
+
+pub fn StrBuf.fmt4<A: Fmt, B: Fmt, C: Fmt, D: Fmt>(b: *StrBuf, f: str, a: A, x: B, y: C, z: D) -> *StrBuf {
+    var at = b.fmt_arg(f, Some(0), a);
+    at = b.fmt_arg(f, at, x);
+    at = b.fmt_arg(f, at, y);
+    at = b.fmt_arg(f, at, z);
+    b.fmt_end(f, at)
+}
+
 pub fn starts_with(s: str, prefix: str) -> bool {
     s.len >= prefix.len and s[0..prefix.len].eq(prefix)
 }
