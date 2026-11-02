@@ -38,6 +38,7 @@ i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 ?T              // option; ?*T is pointer-sized
 Result<T, E>
 Gc<T>           // traced reference into the GC heap (section 8)
+fn(A, B) -> R   // function pointer; `fn(A) -> R uses gc` has effects (section 5)
 ```
 
 Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
@@ -430,6 +431,48 @@ Rules:
 - Syncs only happen where they are needed, so code with no effects never
   writes `pc` to memory. Saving `pc` on every instruction would add a store per
   dispatch.
+
+### Effects on function types
+
+A function type carries effects with the same syntax as a declaration:
+
+```loimi
+struct Hooks {
+    scan:  fn(*Heap, *u8),                      // no effects
+    alloc: fn(*Heap, u64) -> *u8 uses gc,       // may collect
+    call:  fn(*Interp, Value) -> Value uses reenter,
+}
+```
+
+- A function type names one effect, the strongest (`uses gc` already
+  includes `sync`). The effect of a declaration and of its value's type are
+  the same: `fn f(h: *Heap) uses gc` has type `fn(*Heap) -> () uses gc`.
+- A function value converts to a function type whose effects include its
+  own: a plain `fn(*Heap)` can be stored in a `fn(*Heap) uses gc` field,
+  but not the other way around. The conversion applies to function values
+  and `?fn` options, not behind pointers: `*fn() uses gc` and `*fn()` are
+  unrelated types, since a store through one would be read through the
+  other. Function types are otherwise compared exactly: `if c { f } else
+  { g }` with different effects may need an annotation.
+- A call through a function pointer has the effects of the pointer's type,
+  with the same rules and code as a direct call: the caller must declare
+  them (or be a handler or `cold` block, where the `sync` block runs
+  first), and a `gc` call gets a shadow-stack frame for the traced locals
+  in scope.
+- Generic code carries effects through: `T` bound to `fn() uses gc` keeps
+  the effect, and `fn(T) -> U uses gc` in a generic signature stays
+  effectful in every instance. Inference does not look at effects; the
+  argument is checked against the instantiated type afterwards. There are
+  no effect variables: a generic function takes either plain or effectful
+  callbacks, not both.
+- `uses` binds to the innermost function type: in
+  `fn get() -> fn() uses gc { .. }` the effect is part of the result type,
+  not of `get`. Parenthesize to make that explicit (`-> (fn() uses gc)`).
+  `(T)` is the same type as `T`; a one-element tuple is `(T,)`.
+- Callbacks that run while the runtime is in a fragile state have no
+  effects in their type, which makes the restriction checked: the GC's
+  root scanners run during a collection, so `Heap.add_scanner` takes a
+  `fn(*Heap, *u8)` and rejects a `uses gc` function.
 
 Because allocation fast paths are inlined (`std.gc` bump allocation) and only
 their refill path carries `uses gc`, allocating a value in a handler costs

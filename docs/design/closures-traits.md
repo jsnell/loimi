@@ -1,6 +1,6 @@
 # Design note: closures and static traits
 
-Status: proposal, not implemented. Written 2026-11-02.
+Status: section 0 implemented; sections 1 and 2 are proposals. Written 2026-11-02.
 
 Loimi has generics (monomorphized, with methods resolved per instance) and
 plain function pointers (`fn(A) -> R`). It has no closures and no traits.
@@ -23,7 +23,19 @@ how existing code compiles.
 
 ## 0. Prerequisite: effects on function types
 
-Function types carry no effects today. `finish_call` checks effects (and
+**Done** (2026-11-02): see "Effects on function types" in
+`language.md`, section 5. As built: `Ty::Fn` has an effect mask, `coerce`
+allows a function value (or `?fn`) to widen to a type with more effects
+(never behind a pointer), `finish_call` runs the effect check and handler
+`sync` wrapping for every call from the callee's type, and
+`gcgen::push_frame` reads the effects from the callee's type. Generic
+inference ignores effects and checks them when the argument is coerced to
+the instance. There are no effect variables (`fn each<E>(f: fn(T) uses E)
+uses E`); with only three ordered effects, the plan is to add them only
+when a real callback API needs both plain and effectful callbacks. The
+original text follows.
+
+Function types carried no effects. `finish_call` checks effects (and
 `gcgen::push_frame` builds shadow-stack frames) only for direct calls
 (`TK::FnRef`). A `uses gc` function stored in a `fn(..)` value and called
 through it is neither checked against the caller's effects nor rooted. Any

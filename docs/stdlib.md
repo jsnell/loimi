@@ -175,7 +175,9 @@ at run time (`infix_left(k, bp)`, `infix_right(k, bp)`, `infix(k, l, r)`,
 `before_rhs` hook (where a single-pass compiler puts the left operand in a
 register or emits the jump of `and`/`or`). Postfix operators belong in
 `atom`. A hook that needs to recurse (parentheses) reaches the table through
-a pointer in `P`. `TokenStream` and error recovery are not built. `Span` and
+a pointer in `P`. The hooks' types have no effects, so `parse` has none
+and runs from any function: hooks may allocate but not collect (collect
+between parses). `TokenStream` and error recovery are not built. `Span` and
 `SourceMap` live in `std.diag`.
 
 ## `std.diag`
@@ -246,6 +248,10 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md).
 - `Root<T>`, `GcVec<T>`, `Weak<T>`, finalizers (run outside the collector),
   and `EphemeronTable` (for JS `WeakMap` and Lua weak tables).
 - Stress mode, heap verification, poisoning, and heap snapshots.
+
+**As implemented**: root scanners and sweepers (`Heap.add_scanner`,
+`add_sweeper`) are `fn(*Heap, *u8)` without effects: they run during a
+collection and must not start one, so a `uses gc` function is rejected.
 
 ## `std.obj`: objects and shapes
 

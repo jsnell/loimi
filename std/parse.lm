@@ -10,6 +10,13 @@
 //      a single-pass compiler, or a value for an evaluator
 //   X  the error type
 //
+// Hooks have no effects (`fn(*P) -> K`, not `fn(*P) -> K uses gc`), so
+// `parse` has none either and can be called from any function. A hook may
+// allocate (allocation never collects) but cannot collect or call guest
+// code; collect between parses, from the caller. Effectful hooks would
+// force `uses gc` on `parse` and every caller, and a shadow-stack frame at
+// every hook call when `E` is traced.
+//
 // Binding powers: an infix operator has a left power and a right power.
 // The operator binds if its left power is greater than the current
 // minimum, and its right operand is parsed with the right power as the
