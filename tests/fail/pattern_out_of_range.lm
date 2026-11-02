@@ -1,0 +1,7 @@
+// An integer pattern outside the scrutinee's type is an error: it used to
+// be truncated to the type, so `9` matched a `u3` holding 1.
+// error: pattern `9` does not fit in `u3`
+fn main() -> i32 {
+    let x: u3 = 1;
+    match x { 9 => 1, _ => 2 }
+}

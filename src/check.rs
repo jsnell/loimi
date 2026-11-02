@@ -1207,9 +1207,23 @@ impl<'a> Checker<'a> {
             PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) if !ty.is_int() => {
                 return Err(Diag::new(p.span, format!("integer pattern for a value of type `{}`", self.ty_name(ty))));
             }
-            PatKind::Int(v) => TPK::Int(*v),
-            PatKind::Char(c) => TPK::Int(*c as i128),
-            PatKind::Range(a, b) => TPK::Range(*a, *b),
+            PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) => {
+                // Out of the type's range, a pattern would be truncated
+                // to it and match another value.
+                let Ty::Int(it) = ty else { unreachable!() };
+                let (lo, hi) = match &p.kind {
+                    PatKind::Int(v) => (*v, *v),
+                    PatKind::Char(c) => (*c as i128, *c as i128),
+                    PatKind::Range(a, b) => (*a, *b),
+                    _ => unreachable!(),
+                };
+                for v in [lo, hi] {
+                    if v < it.min() || v > it.max() {
+                        return Err(Diag::new(p.span, format!("pattern `{}` does not fit in `{}`", v, self.ty_name(ty))));
+                    }
+                }
+                if lo == hi && !matches!(p.kind, PatKind::Range(..)) { TPK::Int(lo) } else { TPK::Range(lo, hi) }
+            }
             PatKind::Bool(b) => {
                 if *ty != Ty::Bool {
                     return Err(Diag::new(p.span, "boolean pattern for a non-bool value"));
