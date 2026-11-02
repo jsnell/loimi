@@ -46,6 +46,8 @@ pub struct FnCx {
     pub vm: Option<crate::vmcheck::HandlerCx>,
     pub effects: u8,
     pub fn_name: String,
+    /// Nesting depth of `unsafe { }` blocks.
+    pub unsafe_depth: u32,
 }
 
 impl FnCx {
@@ -60,6 +62,7 @@ impl FnCx {
             vm: None,
             effects: 0,
             fn_name: String::new(),
+            unsafe_depth: 0,
         }
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
@@ -80,6 +83,7 @@ impl FnCx {
             vm: self.vm.clone(),
             effects: self.effects,
             fn_name: self.fn_name.clone(),
+            unsafe_depth: self.unsafe_depth,
         }
     }
     /// A local not visible by name.
@@ -1186,6 +1190,25 @@ impl<'a> Checker<'a> {
                 if v.ty == to {
                     return Ok(v);
                 }
+                // A pointer (or address, or another object type) becomes a
+                // traced reference: only the programmer knows that it
+                // points to a live heap object of that type.
+                let to_gc = matches!(to, Ty::Gc(_))
+                    && matches!(&v.ty, Ty::Ptr(_) | Ty::Gc(_) | Ty::Int(IntTy { bits: 64, .. }));
+                if to_gc {
+                    if cx.unsafe_depth == 0 {
+                        return Err(Diag::new(
+                            span,
+                            format!(
+                                "casting `{}` to `{}` is unsafe: it must point to a live `{}` in the GC heap; wrap the cast in `unsafe {{ }}`",
+                                self.ty_name(&v.ty),
+                                self.ty_name(&to),
+                                self.ty_name(&to).trim_start_matches("Gc<").trim_end_matches('>')
+                            ),
+                        ));
+                    }
+                    return Ok(mk(to, TK::Cast(Box::new(v)), span));
+                }
                 if !self.castable(&v.ty, &to) {
                     let why = match &to {
                         Ty::Enum(_) if v.ty.is_int() => " (only enums without payloads can be cast from integers)",
@@ -1297,7 +1320,13 @@ impl<'a> Checker<'a> {
                 let n = self.const_int(cx.module, n)? as u64;
                 Ok(mk(Ty::Array(Box::new(v.ty.clone()), n), TK::ArrayRepeat(Box::new(v), n), span))
             }
-            ExprKind::Block(b) | ExprKind::Unsafe(b) => self.block(cx, b, exp),
+            ExprKind::Block(b) => self.block(cx, b, exp),
+            ExprKind::Unsafe(b) => {
+                cx.unsafe_depth += 1;
+                let r = self.block(cx, b, exp);
+                cx.unsafe_depth -= 1;
+                r
+            }
             ExprKind::If(..) | ExprKind::Match(..) if exp.is_none() => self.branches_inferred(cx, e),
             ExprKind::If(conds, then, els) => self.if_expr(cx, conds, then, els.as_deref(), exp, span),
             ExprKind::Match(scrut, arms) => self.match_expr(cx, scrut, arms, exp, span),

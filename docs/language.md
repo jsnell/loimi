@@ -682,6 +682,9 @@ enough to make it precise and cheap:
   header (type id, mark bits) and the trace function from field types.
   A trailing variable-length array is allowed (`slots: [Value]`).
 - **`Gc<T>`** is a traced reference. A `Value` traces whichever variants hold `Gc`.
+  It converts to a raw pointer or a `u64` address with `as`. The way back
+  (`p as Gc<T>` from a pointer, a `u64`, or another `Gc`) is only allowed
+  inside `unsafe { }`, since nothing checks that `p` points to a live `T`.
 - **Write barriers.** Stores of `Gc`/`Value` into object fields are lowered
   through the heap policy's barrier, which is a compile-time parameter
   (`#![heap = std.gc.MarkSweep]`). Non-incremental mark-sweep has no barrier,
