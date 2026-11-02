@@ -1,0 +1,374 @@
+// Compile Pip's syntax tree to bytecode for the Pip vm.
+//
+// Every function, and the top-level code, compiles to its own prototype
+// with its own code, constants and register count. A `let` at the top
+// level defines a global; a `let` in a block, and a parameter, is a local
+// in a register.
+
+import std.bc;
+import std.gc;
+import std.mem;
+import std.text;
+import parser.{Node, Expr, BinOp, Stmt, FnDecl};
+import value;
+import value.{Value, Proto};
+import vm.{Pip};
+
+/// The compiled program: the top-level code and every function.
+pub struct Program { main: *Proto, protos: mem.Vec<*Proto> }
+
+struct Local { name: str, reg: u32 }
+
+/// Shared by all functions.
+struct Unit {
+    /// String constants are allocated here.
+    heap: *gc.Heap,
+    names: *text.Interner,
+    protos: mem.Vec<*Proto>,
+    error: ?(str, u32),
+}
+
+/// The state of compiling one function.
+struct C {
+    unit: *Unit,
+    code: bc.Code<u32>,
+    consts: bc.Pool<Value>,
+    regs: bc.Regs,
+    /// Locals in scope, innermost last.
+    locals: mem.Vec<Local>,
+    /// How deep in blocks we are: 0 is the top level of the function.
+    depth: u32,
+    /// False for the top-level code.
+    in_function: bool,
+}
+
+fn C.error(c: *C, msg: str, line: u32) {
+    if c.unit.error.is_none() { c.unit.error = Some((msg, line)); }
+}
+
+/// The instruction for `dst = a op b`. There is no GT or GE: `a > b` is
+/// `b < a`.
+fn binop(op: BinOp, dst: u8, a: u8, b: u8) -> u32 {
+    match op {
+        Add => Pip.ADD(dst, a, b),
+        Sub => Pip.SUB(dst, a, b),
+        Mul => Pip.MUL(dst, a, b),
+        Div => Pip.DIV(dst, a, b),
+        Mod => Pip.MOD(dst, a, b),
+        Eq => Pip.EQ(dst, a, b),
+        Ne => Pip.NE(dst, a, b),
+        Lt => Pip.LT(dst, a, b),
+        Le => Pip.LE(dst, a, b),
+        Gt => Pip.LT(dst, b, a),
+        Ge => Pip.LE(dst, b, a),
+    }
+}
+
+fn C.constant(c: *C, dst: u8, v: Value, line: u32) {
+    let Some(k) = c.consts.add(v) else { c.error("too many constants", line); return; };
+    c.code.op(Pip.LOADK(dst, k as u16));
+}
+
+/// The register of local `name`, if one is in scope.
+fn C.local(c: *C, name: str) -> ?u32 {
+    var i = c.locals.len;
+    while i > 0 {
+        i -= 1;
+        let l = c.locals.at(i);
+        if l.name.eq(name) { return Some(l.reg); }
+    }
+    None
+}
+
+/// The symbol of a global's name, as an operand.
+fn C.symbol(c: *C, name: str) -> u16 {
+    let s = c.unit.names.intern(name);
+    if s > 65535 { c.error("too many names", 0); }
+    s as u16
+}
+
+/// Compile `n` so that its value ends up in register `dst`.
+fn C.expr_to(c: *C, n: *Node, dst: u32) {
+    let d = dst as u8;
+    // Instructions emitted from here on belong to this line.
+    c.code.set_loc(n.line);
+    match n.expr {
+        Int(v) => {
+            if v >= -32768 and v <= 32767 {
+                c.code.op(Pip.LOADI(d, v as i16));
+            } else if v >= -2147483648 and v <= 2147483647 {
+                c.constant(d, Value.Int(v as i32), n.line);
+            } else {
+                c.constant(d, Value.Num(v as f64), n.line);
+            }
+        }
+        Float(x) => c.constant(d, Value.Num(x), n.line),
+        Bool(b) => { c.code.op(Pip.LOADBOOL(d, if b { 1 } else { 0 })); }
+        Nil => { c.code.op(Pip.LOADNIL(d)); }
+        Name(name) => {
+            if let Some(r) = c.local(name) {
+                if r != dst { c.code.op(Pip.MOVE(d, r as u8)); }
+            } else {
+                c.code.op(Pip.GETGLOBAL(d, c.symbol(name)));
+            }
+        }
+        Neg(e) => {
+            c.expr_to(e, dst);
+            c.code.set_loc(n.line);
+            c.code.op(Pip.NEG(d, d));
+        }
+        Not(e) => {
+            c.expr_to(e, dst);
+            c.code.set_loc(n.line);
+            c.code.op(Pip.NOT(d, d));
+        }
+        Binary(op, l, r) => {
+            let mark = c.regs.mark();
+            let a = c.operand(l);
+            let b = c.operand(r);
+            c.code.set_loc(n.line);
+            c.code.op(binop(op, d, a as u8, b as u8));
+            c.regs.reset(mark);
+        }
+        Str(s) => c.constant(d, Value.Str(value.new_str(c.unit.heap, s)), n.line),
+        List(items) => {
+            let mark = c.regs.mark();
+            let base = c.regs.alloc(items.len as u32);
+            for i in 0..items.len { c.expr_to(items.at(i), base + i as u32); }
+            c.code.set_loc(n.line);
+            c.code.op(Pip.NEWLIST(d, base as u8, items.len as u8));
+            c.regs.reset(mark);
+        }
+        Index(a, i) => {
+            let mark = c.regs.mark();
+            let ra = c.operand(a);
+            let ri = c.operand(i);
+            c.code.set_loc(n.line);
+            c.code.op(Pip.GETINDEX(d, ra as u8, ri as u8));
+            c.regs.reset(mark);
+        }
+        Call(f, args) => {
+            // `len(x)` and `array(n)` are built in.
+            if let Name(name) = f.expr and args.len == 1 and c.local(name).is_none() {
+                if name.eq("len") or name.eq("array") {
+                    let mark = c.regs.mark();
+                    let r = c.operand(args.at(0));
+                    c.code.set_loc(n.line);
+                    c.code.op(if name.eq("len") { Pip.LEN(d, r as u8) } else { Pip.NEWARRAY(d, r as u8) });
+                    c.regs.reset(mark);
+                    return;
+                }
+            }
+            // The function and its arguments go to consecutive registers
+            // at the top of the frame; the result comes back in the first.
+            let mark = c.regs.mark();
+            let base = c.regs.alloc(1 + args.len as u32);
+            c.expr_to(f, base);
+            for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
+            c.code.set_loc(n.line);
+            c.code.op(Pip.CALL(base as u8, args.len as u8));
+            if base != dst { c.code.op(Pip.MOVE(d, base as u8)); }
+            c.regs.reset(mark);
+        }
+    }
+}
+
+/// A register holding the value of `n`: a local's own register, or a new
+/// temporary.
+fn C.operand(c: *C, n: *Node) -> u32 {
+    if let Name(name) = n.expr and let Some(r) = c.local(name) { return r; }
+    let r = c.regs.alloc(1);
+    c.expr_to(n, r);
+    r
+}
+
+/// Emit code that falls through if `cond` is true and jumps to `l` if
+/// it is false. A comparison becomes one compare-and-branch op and its
+/// JMP; anything else is evaluated and tested.
+fn C.jump_if_false(c: *C, cond: *Node, l: bc.Label) {
+    let mark = c.regs.mark();
+    if let Binary(op, x, y) = cond.expr {
+        let w: ?u32 = match op {
+            Lt => Some(Pip.JNLT(c.operand(x) as u8, c.operand(y) as u8)),
+            Le => Some(Pip.JNLE(c.operand(x) as u8, c.operand(y) as u8)),
+            Gt => { let a = c.operand(x); Some(Pip.JNLT(c.operand(y) as u8, a as u8)) }
+            Ge => { let a = c.operand(x); Some(Pip.JNLE(c.operand(y) as u8, a as u8)) }
+            Eq => Some(Pip.JNEQ(c.operand(x) as u8, c.operand(y) as u8)),
+            Ne => Some(Pip.JEQ(c.operand(x) as u8, c.operand(y) as u8)),
+            _ => None,
+        };
+        if let Some(w) = w {
+            c.code.set_loc(cond.line);
+            c.code.op(w);
+            c.code.jump(Pip.JMP(0), l);
+            c.regs.reset(mark);
+            return;
+        }
+    }
+    let r = c.operand(cond);
+    c.code.set_loc(cond.line);
+    c.code.jump(Pip.JF(r as u8, 0), l);
+    c.regs.reset(mark);
+}
+
+fn C.block(c: *C, stmts: *mem.Vec<Stmt>) {
+    let level = c.regs.enter();
+    let nlocals = c.locals.len;
+    c.depth += 1;
+    for i in 0..stmts.len { c.stmt(stmts.at(i)); }
+    c.depth -= 1;
+    c.locals.truncate(nlocals);
+    c.regs.leave(level);
+}
+
+/// Make the next register a local called `name`.
+fn C.add_local(c: *C, name: str) -> u32 {
+    let r = c.regs.alloc(1);
+    c.regs.activate(1);
+    c.locals.push(Local { name: name, reg: r });
+    r
+}
+
+fn C.stmt(c: *C, s: Stmt) {
+    match s {
+        Print(e) => {
+            let r = c.operand(e);
+            c.code.set_loc(e.line);
+            c.code.op(Pip.PRINT(r as u8));
+        }
+        Let(name, e) => {
+            if c.depth == 0 and !c.in_function {
+                let r = c.operand(e);
+                c.code.op(Pip.DEFGLOBAL(r as u8, c.symbol(name)));
+            } else {
+                // The value goes straight into the local's register, which
+                // becomes part of the block's frame.
+                let r = c.regs.alloc(1);
+                c.expr_to(e, r);
+                c.regs.end_stmt();
+                c.regs.activate(1);
+                c.locals.push(Local { name: name, reg: r });
+            }
+        }
+        Assign(name, e) => {
+            if let Some(r) = c.local(name) {
+                c.expr_to(e, r);
+            } else {
+                let r = c.operand(e);
+                c.code.op(Pip.SETGLOBAL(r as u8, c.symbol(name)));
+            }
+        }
+        SetIndex(a, i, v) => {
+            let ra = c.operand(a);
+            let ri = c.operand(i);
+            let rv = c.operand(v);
+            c.code.set_loc(a.line);
+            c.code.op(Pip.SETINDEX(ra as u8, ri as u8, rv as u8));
+        }
+        If(cond, then_block, else_block) => {
+            let otherwise = c.code.label();
+            c.jump_if_false(cond, otherwise);
+            c.block(&then_block);
+            if else_block.len > 0 {
+                let end = c.code.label();
+                c.code.jump(Pip.JMP(0), end);
+                c.code.bind(otherwise);
+                c.block(&else_block);
+                c.code.bind(end);
+            } else {
+                c.code.bind(otherwise);
+            }
+        }
+        While(cond, body) => {
+            let top = c.code.here();
+            let exit = c.code.label();
+            c.jump_if_false(cond, exit);
+            c.block(&body);
+            c.code.jump(Pip.JMP(0), top);
+            c.code.bind(exit);
+        }
+        Fn(decl) => {
+            if c.depth > 0 or c.in_function {
+                c.error("functions can only be defined at the top level", decl.line);
+                return;
+            }
+            let p = function(c.unit, decl);
+            let r = c.regs.alloc(1);
+            c.code.set_loc(decl.line);
+            c.constant(r as u8, Value.Fn(p), decl.line);
+            c.code.op(Pip.DEFGLOBAL(r as u8, c.symbol(decl.name)));
+        }
+        Return(value, line) => {
+            if !c.in_function { c.error("return outside a function", line); return; }
+            let r = match value {
+                Some(e) => c.operand(e),
+                None => { let r = c.regs.alloc(1); c.code.op(Pip.LOADNIL(r as u8)); r }
+            };
+            c.code.set_loc(line);
+            c.code.op(Pip.RET(r as u8));
+        }
+        Expr(e) => {
+            let r = c.regs.alloc(1);
+            c.expr_to(e, r);
+        }
+    }
+    c.regs.end_stmt();
+}
+
+fn new_c(unit: *Unit, in_function: bool) -> C {
+    C {
+        unit: unit,
+        code: bc.Code.new(Pip.op_size, Pip.set_label),
+        consts: bc.Pool.new(65536),
+        regs: bc.Regs.new(250),
+        locals: mem.Vec.new(),
+        depth: 0,
+        in_function: in_function,
+    }
+}
+
+/// Copy the finished code, positions and constants into a prototype.
+fn C.finish(c: *C, name: str, nparams: u32, line: u32) -> *Proto {
+    if c.regs.failed() { c.error("function too complex: out of registers", line); }
+    if let Some(e) = c.code.check() { c.error(e.message(), e.loc); }
+    let n = c.code.len();
+    let code: *u32 = mem.alloc(n);
+    c.code.copy_into(code.slice(n));
+    let lines: *u32 = mem.alloc(n);
+    c.code.locs_into(lines.slice(n));
+    let nk = c.consts.len();
+    let consts: *Value = mem.alloc(nk);
+    for i in 0..nk { consts[i] = c.consts.get(i as u32); }
+    let p: *Proto = mem.alloc(1);
+    *p = Proto {
+        name: name, nparams: nparams, nregs: c.regs.frame_size(1),
+        code: code.slice(n), lines: lines.slice(n), consts: consts.slice(nk),
+    };
+    c.code.free();
+    c.consts.free();
+    c.locals.free();
+    c.unit.protos.push(p);
+    p
+}
+
+fn function(unit: *Unit, f: *FnDecl) -> *Proto {
+    var c = new_c(unit, true);
+    c.code.set_loc(f.line);
+    for i in 0..f.params.len { c.add_local(f.params.at(i)); }
+    for i in 0..f.body.len { c.stmt(f.body.at(i)); }
+    // Falling off the end returns nil.
+    let r = c.regs.alloc(1);
+    c.code.op(Pip.LOADNIL(r as u8));
+    c.code.op(Pip.RET(r as u8));
+    c.finish(f.name, f.params.len as u32, f.line)
+}
+
+pub fn compile(stmts: *mem.Vec<Stmt>, names: *text.Interner, heap: *gc.Heap) -> Result<Program, (str, u32)> {
+    var unit = Unit { heap: heap, names: names, protos: mem.Vec.new(), error: None };
+    var c = new_c(&unit, false);
+    for i in 0..stmts.len { c.stmt(stmts.at(i)); }
+    c.code.op(Pip.HALT());
+    let main = c.finish("main", 0, 1);
+    if let Some(e) = unit.error { return Err(e); }
+    Ok(Program { main: main, protos: unit.protos })
+}

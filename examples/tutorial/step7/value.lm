@@ -1,0 +1,105 @@
+// Pip's run-time values, and the objects that live in the GC heap.
+
+import std.gc;
+import std.hash;
+import std.mem;
+import std.num;
+import std.text;
+
+/// A string: its bytes are a trailing array, allocated with the object.
+pub object Str { data: [u8] }
+
+/// An array of a fixed length.
+pub object Arr { items: [Value] }
+
+/// One 64-bit word. A double is stored as itself; the other variants live
+/// in the NaN space, where no real computation produces a value (the
+/// compiler canonicalizes NaNs when it builds a `Num`). The collector
+/// knows which variants hold a `Gc` and traces them.
+pub value Value repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    Fn(*Proto),
+    Str(Gc<Str>),
+    Arr(Gc<Arr>),
+}
+
+/// A compiled function. Prototypes live in ordinary memory and are never
+/// freed: a program's functions live as long as the program. Their
+/// constants can hold strings, so the vm's root scanner marks them.
+pub struct Proto {
+    name: str,
+    nparams: u32,
+    /// The size of the function's register window.
+    nregs: u32,
+    code: []u32,
+    /// The source line of each code word.
+    lines: []u32,
+    consts: []Value,
+}
+
+// The constant pool (`bc.Pool<Value>`) deduplicates constants by their
+// bits, so 0, 0.0 and -0.0 stay apart.
+pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
+pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
+impl hash.Hash for Value;
+
+/// A new string holding a copy of `s`. Allocation never collects, so
+/// this function has no effects.
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str {}, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+/// A new array of `n` nils.
+pub fn new_arr(h: *gc.Heap, n: u64) -> Gc<Arr> {
+    let a = new(h, Arr {}, n);
+    for i in 0..n { a.items[i] = Value.Nil; }
+    a
+}
+
+pub fn truthy(v: Value) -> bool {
+    match v {
+        Nil => false,
+        Bool(b) => b,
+        _ => true,
+    }
+}
+
+/// Numeric value of an Int or Num.
+pub fn to_f64(v: Value) -> ?f64 {
+    match v {
+        Int(i) => Some(i as f64),
+        Num(x) => Some(x),
+        _ => None,
+    }
+}
+
+pub fn write(b: *text.StrBuf, v: Value) { write_nested(b, v, 0); }
+
+fn write_nested(b: *text.StrBuf, v: Value, depth: u32) {
+    match v {
+        Int(i) => b.push_int(i as i64),
+        Num(x) => {
+            let start = b.len();
+            num.write_shortest(b, x);
+            num.mark_float(b, start);
+        }
+        Bool(t) => b.push_str(if t { "true" } else { "false" }),
+        Nil => b.push_str("nil"),
+        Fn(p) => { b.push_str("<fn "); b.push_str(p.name); b.push_str(">"); }
+        Str(s) => b.push_str(s.data),
+        Arr(a) => {
+            if depth > 4 { b.push_str("[...]"); return; }
+            b.push('[');
+            for i in 0..a.items.len {
+                if i > 0 { b.push_str(", "); }
+                write_nested(b, a.items[i], depth + 1);
+            }
+            b.push(']');
+        }
+    }
+}

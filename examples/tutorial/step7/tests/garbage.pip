@@ -1,0 +1,40 @@
+// Lots of garbage: strings and arrays that die young, and a long-lived
+// array that keeps growing through replacement. With --gc-stress this
+// collects at every allocation.
+fn build(n) {
+    let s = "";
+    let i = 0;
+    while i < n {
+        s = s + "x";
+        i = i + 1;
+    }
+    return s;
+}
+let keep = [];
+let round = 0;
+while round < 200 {
+    let tmp = [build(round % 7), [round, round + 1], "r" + round];
+    if round % 50 == 0 { keep = [keep, tmp[2]]; }
+    round = round + 1;
+}
+print keep;
+print len(build(1000));
+
+fn sieve(n) {
+    let composite = array(n + 1);
+    let count = 0;
+    let i = 2;
+    while i <= n {
+        if not composite[i] {
+            count = count + 1;
+            let j = i * i;
+            while j <= n {
+                composite[j] = true;
+                j = j + i;
+            }
+        }
+        i = i + 1;
+    }
+    return count;
+}
+print sieve(10000);
