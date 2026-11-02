@@ -69,7 +69,10 @@ fn ty_name(p: &Program, t: &Ty) -> String {
         Ty::Struct(i) => short(&p.structs[*i as usize].name).into(),
         Ty::Enum(i) => short(&p.enums[*i as usize].name).into(),
         Ty::Value(i) => short(&p.values[*i as usize].name).into(),
-        Ty::Param(i) => format!("?T{}", i),
+        Ty::Param(i) | Ty::Opaque(i) => format!("?T{}", i),
+        Ty::Block(ps, r, _) => {
+            format!("block fn({}) -> {}", ps.iter().map(|t| ty_name(p, t)).collect::<Vec<_>>().join(", "), ty_name(p, r))
+        }
         Ty::Gc(t) => format!("Gc<{}>", ty_name(p, t)),
     }
 }
@@ -157,7 +160,8 @@ impl<'p> Gen<'p> {
             Ty::Result(..) => return Err("`Result` has no C equivalent; return a status code".into()),
             Ty::Tuple(_) => return Err("tuples have no C equivalent".into()),
             Ty::Array(..) => return Err("arrays by value have no C equivalent; pass a pointer".into()),
-            Ty::Param(_) => return Err("generic functions cannot be exported".into()),
+            Ty::Param(_) | Ty::Opaque(_) => return Err("generic functions cannot be exported".into()),
+            Ty::Block(..) => return Err("`block fn` closures cannot cross into C; pass a function pointer and a data pointer".into()),
         })
     }
 }
