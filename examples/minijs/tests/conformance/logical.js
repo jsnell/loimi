@@ -1,0 +1,31 @@
+var log = [];
+function t(name, v) { log.push(name); return v; }
+console.log(t("a", 1) && t("b", 2), log.join(""));
+log = [];
+console.log(t("a", 0) && t("b", 2), log.join(""));
+log = [];
+console.log(t("a", 0) || t("b", ""), log.join(""));
+log = [];
+console.log(t("a", "x") || t("b", 2), log.join(""));
+log = [];
+console.log(t("a", null) ?? t("b", "dflt"), log.join(""));
+log = [];
+console.log(t("a", 0) ?? t("b", "dflt"), log.join(""));
+log = [];
+console.log(t("a", undefined) ?? t("b", ""), "|", log.join(""));
+log = [];
+console.log(t("a", false) ?? t("b", 1), log.join(""));
+console.log(1 && 2 && 3, 1 && 0 && 3, 0 || null || "z", null || undefined, "" || 0);
+console.log(true || false && false, (true || false) && false, false && true || true);
+console.log(null ?? undefined ?? 7, (null || 0) ?? 5);
+var o = { x: 0 };
+o.y = o.x || 10;
+o.z = o.x ?? 10;
+console.log(o.y, o.z);
+var c = 0;
+var r = c > 0 ? "pos" : c < 0 ? "neg" : "zero";
+console.log(r, c === 0 ? 1 : 2, true ? false ? 1 : 2 : 3);
+var calls = 0;
+function bump() { calls++; return calls; }
+var v = false ? bump() : 5;
+console.log(v, calls);

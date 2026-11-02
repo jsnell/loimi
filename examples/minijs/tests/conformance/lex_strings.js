@@ -1,0 +1,11 @@
+console.log("double", 'single');
+console.log("it's", 'say "hi"');
+console.log("esc: \\ \' \"");
+console.log("tab[\t] nl[\n] cr-len", "\r".length);
+console.log("nul length", "a\0b".length, "a\0b".charCodeAt(1));
+console.log("\x41\x42\x43", "\x7a", "\x20|");
+console.log("\x41".charCodeAt(0), "\t".charCodeAt(0), "\n".charCodeAt(0), "\r".charCodeAt(0));
+console.log("".length, "''".length, '""'.length);
+console.log('mixed \'quote\' and "dq"');
+console.log("slash / and star * and hash # and percent", "100%");
+console.log("concat " + 'ok');

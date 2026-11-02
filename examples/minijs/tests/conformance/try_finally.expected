@@ -1,0 +1,22 @@
+from-try try,finally
+finally-wins
+caught boom f3-finally
+body0,fin0,fin1,fin2
+inner-finally,outer-catch:inner
+c1,fin,top2
+1
+outer a inner b
+42 obj
+null thrown true
+undefined thrown true
+zero thrown 0
+message text object 12
+true 5 x
+bottom 1,2,3,4
+t1 c1 f1 t2 f2
+no catch, only finally
+finally ran
+f9 done f9fin
+t
+inside
+outside

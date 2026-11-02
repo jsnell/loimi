@@ -1,0 +1,14 @@
+var nan = 0 / 0;
+console.log(String(nan), nan === nan, nan !== nan, isNaN(nan), isNaN(1), isNaN(Infinity));
+console.log(NaN === NaN, isNaN(NaN), isFinite(NaN), isFinite(Infinity), isFinite(-Infinity), isFinite(0), isFinite(1e308));
+console.log(Infinity, -Infinity, Infinity + 1, Infinity - Infinity, Infinity * 0, Infinity / Infinity);
+console.log(Infinity > 1e308, -Infinity < -1e308, Infinity === Infinity, 1 / Infinity);
+var nz = -0;
+console.log(String(nz), nz === 0, 1 / nz, 1 / (0 * -1), 1 / (-0 + 0), 1 / (-0 - 0));
+console.log(String(-0), "" + -0, (-0).toString(), [-0].join(","));
+console.log(1 / Math.round(-0.4), 1 / Math.ceil(-0.5), 1 / Math.trunc(-0.9), 1 / (-1 % 1), 1 / Math.sign(-0));
+console.log(1 / Math.abs(-0), 1 / Math.min(0, -0), 1 / Math.max(-0, 0));
+console.log(NaN < 1, NaN > 1, NaN <= NaN, NaN >= 1, NaN + 1 === NaN);
+console.log(NaN ? "t" : "f", -0 ? "t" : "f", 0 ? "t" : "f", Infinity ? "t" : "f");
+console.log(typeof NaN, typeof Infinity, String(-nan));
+console.log(1e308 + 1e308, -(1e308 + 1e308), 5e-324 * 0.5, 1 / (5e-324 * -0.5));

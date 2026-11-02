@@ -1,0 +1,26 @@
+neg zero small big
+no braces
+else no braces
+dangling else binds inner
+1 one+two
+2 two
+1 string one
+3 three-or-four+default+five
+4 three-or-four+default+five
+5 five
+6 six-block
+7 default+five
+2 default+five
+null default+five
+A B none
+1 2 d1
+3,1,2,3,hit
+no-match no-match
+zero
+same obj other
+after switch 1
+i default 2
+after switch 2
+after switch 4
+block1 block2 -
+visible

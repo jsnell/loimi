@@ -1,0 +1,19 @@
+for 45 10
+while 10 5
+do-once 1
+do 10
+cont/break 1,3,5,7
+for(;;) 4
+for(;c;) 3
+comma header 8 6
+while(true) 3
+do-continue 5
+nested 0 0
+nested 0 1
+nested 1 0
+nested 1 1
+let-two 30
+decrement-cond 10 -1
+float-step 4
+braceless 3
+braceless-nested 9

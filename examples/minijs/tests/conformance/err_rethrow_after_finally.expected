@@ -1,0 +1,4 @@
+in try
+in finally
+caught once: escapes
+outer finally

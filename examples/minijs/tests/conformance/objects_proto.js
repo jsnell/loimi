@@ -1,0 +1,26 @@
+var base = { greet() { return "hi " + this.name; }, kind: "base" };
+var derived = Object.create(base);
+derived.name = "d";
+console.log(derived.greet(), derived.kind, Object.getPrototypeOf(derived) === base);
+console.log(Object.getPrototypeOf(base) === Object.getPrototypeOf({}), Object.getPrototypeOf(Object.getPrototypeOf(base)) === null);
+var third = Object.create(derived);
+console.log(third.greet(), third.name, Object.keys(third).length);
+third.name = "t";
+console.log(third.greet(), derived.greet());
+base.added = "late";
+console.log(third.added);
+var bare = Object.create(null);
+bare.x = 1;
+console.log(Object.getPrototypeOf(bare) === null, bare.x, "x" in bare, "toString" in bare, Object.keys(bare).join(","));
+var arr = [];
+console.log(Object.getPrototypeOf(arr) === Object.getPrototypeOf([1]), Array.isArray(arr), Array.isArray({}), Array.isArray("s"), Array.isArray(Object.create(arr)));
+function F() {}
+var f = new F();
+console.log(Object.getPrototypeOf(f) === F.prototype, Object.getPrototypeOf(F.prototype) === Object.getPrototypeOf({}));
+var chain = Object.create(Object.create(Object.create({ deep: "yes" })));
+console.log(chain.deep, chain.hasOwnProperty("deep"));
+var o = { hasOwnProperty: 1 };
+console.log(Object.keys(o).join(","));
+var x = Object.create({ v: 1 });
+x.v++;
+console.log(x.v, Object.getPrototypeOf(x).v);

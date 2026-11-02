@@ -1,0 +1,11 @@
+console.log(0, 42, 3.25, .5, 1e9, 2.5E-3);
+console.log(1e3, 1E3, 1e-3, 5e-7, 1.5e300);
+console.log(0xff, 0xFF, 0x0, 0x10, 0xdeadbeef, 0x7fffffff);
+console.log(0.0, 0.000, 1.50e2);
+console.log(1.0, 10.50, 0.125, 123456789012);
+console.log(.25 + .25, .5e1, 0.5e-1);
+console.log(9007199254740993, 9007199254740992);
+console.log(1e21, 1e20, 123e-20);
+console.log(0.1, 0.2, 0.30000000000000004);
+console.log(1.7976931348623157e308, 5e-324);
+console.log(2e308);

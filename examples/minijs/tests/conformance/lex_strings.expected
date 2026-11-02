@@ -1,0 +1,12 @@
+double single
+it's say "hi"
+esc: \ ' "
+tab[	] nl[
+] cr-len 1
+nul length 3 0
+ABC z  |
+65 9 10 13
+0 2 2
+mixed 'quote' and "dq"
+slash / and star * and hash # and percent 100%
+concat ok

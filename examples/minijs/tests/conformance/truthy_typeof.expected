@@ -1,0 +1,25 @@
+false falsy true false boolean
+true truthy false true boolean
+0 falsy true false number
+-0 falsy true false number
+1 truthy false true number
+-1 truthy false true number
+0.5 truthy false true number
+NaN falsy true false number
+Infinity truthy false true number
+'' falsy true false string
+'0' truthy false true string
+'false' truthy false true string
+' ' truthy false true string
+null falsy true false object
+undefined falsy true false undefined
+{} truthy false true object
+[] truthy false true object
+[0] truthy false true object
+fn truthy false true function
+function object object function function function function
+string number number string
+object undefined undefined undefined undefined
+empty string falsy
+1
+true false true false true true true false

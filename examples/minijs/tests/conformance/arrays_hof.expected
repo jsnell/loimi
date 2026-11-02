@@ -1,0 +1,16 @@
+1,4,9,16,25 0,2,6,12,20 5,5,5,5,5
+1,3,5 0 1,2
+15 120 01234 init
+5 10,20,30,40,50
+0:1/5 1:2/5 2:3/5 3:4/5 4:5/5 undefined
+true false false true false true
+short-circuit visits 4
+1|2|3|4|5 6 1,2,3,4,5
+APPLE KIWI BANANA
+a,k,b,f 5 4
+2,4
+2,1,3 1,2,3,4,5,6
+6 5
+1,2,3 4
+true false
+30

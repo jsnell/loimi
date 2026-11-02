@@ -1,0 +1,9 @@
+1 -1.5 true false null undefined s
+1,2,3  1,2,3 ,,1 a,b
+[object Object] [object Object] [object Object] [object Object],[object Object]
+a1 1a a12 3a a3 true null undefined
+x1,2 1,2x o[object Object] n nested1,2,3,4
+0.30000000000000004 1e+21 -1e-7 v=NaN,Infinity
+s5truenull7,8
+string 1
+1-a-true-

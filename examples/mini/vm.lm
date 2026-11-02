@@ -615,37 +615,40 @@ pub vm Mini {
 
     // Compare and branch, for conditions: the next word is a JMP holding
     // the branch offset (so the verifier and the compiler's jump
-    // patching treat it as a jump). Jump if the comparison equals `k`;
-    // otherwise skip the JMP.
-    inline for (name, bkind, isub, fsub, slow) in [
-        ("JLT", reg, x < y, x < y, less(ctx, a, b, false)),
-        ("JLE", reg, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JLTK", kst, x < y, x < y, less(ctx, a, b, false)),
-        ("JLEK", kst, x <= y, x <= y, less(ctx, a, b, true)),
-        ("JGTK", kst, x > y, x > y, less(ctx, b, a, false)),
-        ("JGEK", kst, x >= y, x >= y, less(ctx, b, a, true)),
+    // patching treat it as a jump). Jump if the comparison holds (or,
+    // for the N forms, if it does not); otherwise skip the JMP. The A
+    // field is unused.
+    inline for (name, nname, bkind, isub, fsub, slow) in [
+        ("JLT", "JLTN", reg, x < y, x < y, less(ctx, a, b, false)),
+        ("JLE", "JLEN", reg, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JLTK", "JLTKN", kst, x < y, x < y, less(ctx, a, b, false)),
+        ("JLEK", "JLEKN", kst, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JGTK", "JGTKN", kst, x > y, x > y, less(ctx, b, a, false)),
+        ("JGEK", "JGEKN", kst, x >= y, x >= y, less(ctx, b, a, true)),
     ] {
-        op #name(pol: imm, a: reg, b: bkind) : ABC then JMP {
-            let want = pol != 0;
-            match (a, b) {
-                (Int(x), Int(y)) => branch((isub) == want, then.target),
-                (Num(x), Num(y)) => branch((fsub) == want, then.target),
-                _ => {}
+        inline for (opname, want) in [(name, true), (nname, false)] {
+            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+                match (a, b) {
+                    (Int(x), Int(y)) => branch((isub) == want, then.target),
+                    (Num(x), Num(y)) => branch((fsub) == want, then.target),
+                    _ => {}
+                }
+                cold { branch(slow? == want, then.target) }
             }
-            cold { branch(slow? == want, then.target) }
         }
     }
-    inline for (name, bkind) in [("JEQ", reg), ("JEQK", kst)] {
-        op #name(pol: imm, a: reg, b: bkind) : ABC then JMP {
-            let want = pol != 0;
-            if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
-            // Same bits means equal, except for NaN; strings are interned.
-            if a == b {
-                var eq = true;
-                if let Num(x) = a { eq = x == x; }
-                branch(eq == want, then.target)
+    inline for (name, nname, bkind) in [("JEQ", "JEQN", reg), ("JEQK", "JEQKN", kst)] {
+        inline for (opname, want) in [(name, true), (nname, false)] {
+            op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
+                if let (Int(x), Int(y)) = (a, b) { branch((x == y) == want, then.target) }
+                // Same bits means equal, except for NaN; strings are interned.
+                if a == b {
+                    var eq = true;
+                    if let Num(x) = a { eq = x == x; }
+                    branch(eq == want, then.target)
+                }
+                cold { branch(value.raw_equal(a, b) == want, then.target) }
             }
-            cold { branch(value.raw_equal(a, b) == want, then.target) }
         }
     }
 
@@ -661,12 +664,25 @@ pub vm Mini {
         next
     }
 
-    /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the loop variable.
+    /// The iterations after the first of an integer loop from `i` to `l`
+    /// by `s` (one that runs, with s != 0). It can exceed the integer
+    /// range, so it is stored as an Int whose payload bits are unsigned.
+    fn for_count(i: i64, l: i64, s: i64) -> V {
+        let n = if s == 1 { (l - i) as u64 }
+            else if s > 0 { ((l - i) as u64) / (s as u64) }
+            else { ((i - l) as u64) / ((0 - s) as u64) };
+        V.Int(n as i32)
+    }
+
+    /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the
+    /// loop variable. For an integer loop, FORPREP replaces the limit
+    /// with the iteration count.
     op FORPREP(a: forbase, target: label) : AsBx {
         match (regs[a], regs[a + 1], regs[a + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
                 if (s > 0 and i > l) or (s < 0 and i < l) { jump target }
+                regs[a + 1] = for_count(i as i64, l as i64, s as i64);
                 regs[a + 3] = Int(i);
                 next
             }
@@ -683,7 +699,7 @@ pub vm Mini {
                 let lf = if si > 0 { l.floor() } else { -((-l).floor()) };
                 if l != l or (si > 0 and lf < ii as f64) or (si < 0 and lf > ii as f64) { jump target }
                 let li: i32 = if lf > 2147483647.0 { 2147483647 } else if lf < -2147483648.0 { -2147483647 - 1 } else { lf as i32 };
-                regs[a + 1] = Int(li);
+                regs[a + 1] = for_count(ii as i64, li as i64, si as i64);
                 regs[a + 3] = Int(ii);
                 next
             }
@@ -696,18 +712,22 @@ pub vm Mini {
             next
         }
     }
+    /// An integer loop counts down the iterations left in R[a+1] (as in
+    /// Lua 5.4), so stepping needs no overflow or direction checks.
     op FORLOOP(a: forbase, target: label) : AsBx {
-        match (regs[a], regs[a + 1], regs[a + 2]) {
-            (Int(i), Int(l), Int(s)) => {
-                if let Some(n) = i.add_checked(s) {
-                    if (s > 0 and n <= l) or (s < 0 and n >= l) {
-                        regs[a] = Int(n);
-                        regs[a + 3] = Int(n);
-                        jump target
-                    }
-                }
-                next
+        if let Int(c) = regs[a + 1] {
+            if c != 0 {
+                regs[a + 1] = Int(c -% 1);
+                let Int(i) = regs[a] else { unreachable };
+                let Int(s) = regs[a + 2] else { unreachable };
+                let n = V.Int(i +% s);
+                regs[a] = n;
+                regs[a + 3] = n;
+                jump target
             }
+            next
+        }
+        match (regs[a], regs[a + 1], regs[a + 2]) {
             (Num(i), Num(l), Num(s)) => {
                 let n = i + s;
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
@@ -841,6 +861,18 @@ pub vm Mini {
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
     super ADD_RET1 = ADD; RET1;
+    super MUL_F_ADD_F = MUL_F; ADD_F;
+    super MUL_F_MUL_F = MUL_F; MUL_F;
+    super ADD_F_MUL_F = ADD_F; MUL_F;
+    super MOVE_CALL = MOVE; CALL;
+    super MOVE_MOVE = MOVE; MOVE;
+    super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
+    super GETINDEX_GETINDEX = GETINDEX; GETINDEX;
+    super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
+    super GETUPVAL_MOVE = GETUPVAL; MOVE;
+    super ADDI_ADDI = ADDI; ADDI;
+    super GETUPVAL_JEQN = GETUPVAL; JEQN;
+    super GETINDEX_ADDI = GETINDEX; ADDI;
 
     entry run(c: *Ctx, cl: Gc<Closure>) -> V {
         ctx = c;

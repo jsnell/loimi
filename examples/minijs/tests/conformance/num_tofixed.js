@@ -1,0 +1,10 @@
+console.log((1.5).toFixed(0), (2.5).toFixed(0), (-1.5).toFixed(0), (0.5).toFixed(0), (1.45).toFixed(1));
+console.log((1.005).toFixed(2), (1.255).toFixed(2), (3.14159).toFixed(3), (0).toFixed(2), (-0).toFixed(2));
+console.log((123.456).toFixed(0), (123.456).toFixed(1), (123.456).toFixed(5), (123.456).toFixed(10));
+console.log((1e20).toFixed(2), (1e-10).toFixed(5), (1e-10).toFixed(20), (0.1).toFixed(20));
+console.log((-0.0001).toFixed(2), (-0.5).toFixed(0), (-2.345).toFixed(2), (999.995).toFixed(2));
+console.log((12345678.9).toFixed(3), (0.000001).toFixed(7), (5).toFixed(0), (5).toFixed(3));
+console.log((2 / 3).toFixed(15), (1 / 3).toFixed(16), (Math.PI).toFixed(20), (100).toFixed(20));
+var x = 7.0625;
+console.log(x.toFixed(1), x.toFixed(2), x.toFixed(3), x.toFixed(4));
+console.log((0.045).toFixed(2), (8.345).toFixed(2), (1.0049999999999999).toFixed(3), (4.35).toFixed(1));

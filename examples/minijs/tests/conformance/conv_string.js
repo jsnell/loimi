@@ -1,0 +1,11 @@
+console.log(String(1), String(-1.5), String(true), String(false), String(null), String(undefined), String("s"));
+console.log(String([1, 2, 3]), String([]), String([[1, 2], [3]]), String([null, undefined, 1]), String(["a", "b"]));
+console.log(String({}), String({ a: 1 }), String([{}]), String([{}, {}]));
+console.log("a" + 1, 1 + "a", "a" + 1 + 2, 1 + 2 + "a", "a" + (1 + 2), "" + true, "" + null, "" + undefined);
+console.log("x" + [1, 2], [1, 2] + "x", "o" + {}, "n" + [], "nested" + [1, [2, [3, 4]]]);
+console.log("" + 0.1 * 3, "" + 1e21, "" + -1e-7, "v=" + NaN + "," + Infinity);
+var s = "s";
+s += 5; s += true; s += null; s += [7, 8];
+console.log(s);
+console.log(typeof String(1), String(1).length);
+console.log([1, "a", true, null].join("-"));
