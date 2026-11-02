@@ -109,6 +109,9 @@ rejected (run by `cargo test`).
   cold blocks, and all cold blocks in goto/switch mode, stay inline and are
   marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
+- **`unsafe`** is required only for `p as Gc<T>`. Raw pointer
+  dereference, indexing and arithmetic are allowed anywhere (the design
+  draft required `unsafe` for them); see `language.md` §1.3 for why.
 - **Operand fields** decode to `u64` / `i64` in handlers and verify
   clauses, whatever their width (the design left them at the field width).
 - **`-> never` vm functions** are inlined into each call site, except

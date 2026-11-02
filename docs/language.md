@@ -216,15 +216,40 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`i48`: 8 bytes, `u24`: 4).
 - Hints: `likely(c)`, `unlikely(c)`, `assume(c)`, `unreachable`, `#[cold]`,
   `#[inline(always)]`, `#[inline(never)]`.
-- `unsafe { }` permits raw pointer dereference and unchecked indexing.
+- `unsafe { }` marks code whose correctness the compiler cannot check.
+  As implemented, exactly one operation requires it: making a GC
+  reference from something else (`p as Gc<T>` from a pointer, an address
+  or another `Gc`; section 8), because the collector trusts every `Gc` it
+  finds. Raw pointers do not need it (section 1.3). An `unsafe` block is
+  an ordinary block otherwise, and may be used to mark other unchecked
+  code for readers.
 
 ### 1.3 Memory
 
 There is no borrow checker. Host memory is managed through explicit allocators,
 mostly arenas (`std.mem`), which suit compilers and interpreters well: ASTs,
 IR, and per-compilation data die together. Guest memory lives in the GC heap
-(section 8). Slices are bounds-checked, and raw pointers require `unsafe`. This
-is "safety-leaning", not memory-safe.
+(section 8). This is "safety-leaning", not memory-safe:
+
+- **Arrays and slices are bounds-checked** (in debug and release builds),
+  and integer overflow traps in debug builds.
+- **Raw pointers are unchecked, and need no `unsafe`.** `*p`, `p.field`,
+  `p[i]` and `p + n` on a `*T` compile to plain loads, stores and address
+  arithmetic, anywhere. The pointer type is the marker: a `*T` says
+  "no bounds, no lifetime", the way a slice says "checked". Interpreter
+  host code (allocators, hash tables, the collector, register windows)
+  is built on pointers, and the standard library and the example
+  interpreters use them throughout; requiring `unsafe` around each use
+  would mark most of that code without making any of it safer. Use a
+  slice (`p.slice(n)`) where a bounds check is wanted.
+- **GC references cannot be forged outside `unsafe`.** A `Gc<T>` comes
+  from `new`, from a field or value that holds one, or from
+  `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it
+  finds, so a bad one corrupts the heap far from the bug; that is the one
+  conversion the compiler makes you mark.
+- **Bytecode is checked once, by the verifier** (section 6), and operand
+  accesses in handlers are unchecked because it ran, not because of an
+  annotation.
 
 ### 1.4 Compile-time evaluation
 
