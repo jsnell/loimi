@@ -13,7 +13,8 @@
  * errors, and runs an allocation-heavy script with GC stress on. Natives
  * call back into Mini (mini_call, mini_dostring), nested several levels
  * deep, with errors passing through them, also under GC stress; and the
- * host calls Mini functions directly.
+ * host calls Mini functions directly. Last, an internal error in a nested
+ * run comes back as MiniStatus_Internal instead of aborting the host.
  */
 #include <stdio.h>
 #include <string.h>
@@ -92,6 +93,19 @@ static int32_t native_ask_a(MiniState *S, void *ud) {
     mini_return_number(S, r);
     return 0;
 }
+
+/* boom(s): an internal error ("boom: <s>"), as if the interpreter had a bug. */
+static int32_t native_boom(MiniState *S, void *ud) {
+    (void)ud;
+    loimi_str s = mini_arg_string(S, 0);
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "boom: %.*s", (int)s.len, s.ptr);
+    mini_debug_panic(S, (loimi_str){ buf, (size_t)n });
+    return 0;
+}
+
+/* The deepest down(n) that fits under the nesting limit. */
+#define DEEPEST "199"
 
 /* Call global `f`(x) from the host, between runs, and print the result. */
 static void call_global(MiniState *S, const char *f, double x) {
@@ -216,6 +230,23 @@ int main(void) {
     mini_free(A);
     /* B outlives A. */
     run(B, "B", "print('B still here', x, y)");
+
+    /* Internal errors. A native calls back into Mini, and in that nested
+     * run another native fails as a bug in the interpreter would
+     * (mini_debug_panic). The inner mini_call returns
+     * MiniStatus_Internal; apply passes it on, and the outer
+     * mini_dostring returns it too. The state is poisoned: free it.
+     * Other states carry on, nesting as deep as before. */
+    MiniState *C = mini_new();
+    mini_register(C, "apply", native_apply, NULL);
+    mini_register(C, "boom", native_boom, NULL);
+    run(C, "C", "print(apply(apply, boom, 'nested'))  print('never printed')");
+    run(C, "C", "print('never printed either')");
+    mini_free(C);
+    mini_register(B, "apply", native_apply, NULL);
+    run(B, "B",
+        "function down(n) if n == 0 then return 0 end return apply(down, n - 1) + 1 end\n"
+        "print('B down', down(" DEEPEST "))");
     mini_free(B);
     return 0;
 }

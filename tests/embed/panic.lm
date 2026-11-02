@@ -152,3 +152,176 @@ export "C" fn world_free(w: *World) {
     w.heap.free();
     mem.release(w);
 }
+
+// A panic in a nested (re-entrant) vm run. The host's callback, called
+// from an op, re-enters the vm (`rvm_call`, a nested entry), and the
+// inner run panics. The catch is at an outer export (`rvm_run`), or at a
+// catching export in between (`rvm_call_caught`): either way `R.depth`
+// and the shadow stack are back to what they were at the catch, and the
+// vm keeps working. `host` keeps a GC root live across the callback,
+// and the callback may collect.
+struct RFrame { base: u64, ret: *u32, dst: u64 }
+
+struct RCtx {
+    stack: *i64,
+    frames: *RFrame,
+    fp: *RFrame,
+    /// The bottom frame of the innermost run: RET from it leaves the run.
+    entry_fp: *RFrame,
+    funcs: [*u32; 3],
+    code: [u32; 32],
+    w: *World,
+    cb: fn(*RCtx, i64) -> i64 uses reenter,
+}
+
+const RWINDOW: u64 = 8;
+
+/// The op HOST: the host's callback on `a`, plus 3 (the sum of a list
+/// that stays live across the call). The vm's own frame registers are
+/// restored afterwards: a caught panic in a nested run leaves them as
+/// that run had them.
+fn host(c: *RCtx, a: i64) -> i64 uses reenter {
+    let keep = list(&c.w.heap, 3);
+    let (fp, entry) = (c.fp, c.entry_fp);
+    let r = c.cb(c, a);
+    c.fp = fp;
+    c.entry_fp = entry;
+    r + sum(keep)
+}
+
+vm R {
+    context ctx: *RCtx;
+    state { pc: *u32, regs: *i64, fp: *RFrame }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    sync { ctx.fp = fp; }
+    reload {
+        fp = ctx.fp;
+        regs = ctx.stack + fp.base;
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    /// R[dst] = host(R[a]), in a cold block.
+    op HOST(dst: reg, a: reg) : ABC {
+        cold {
+            dst = host(ctx, a);
+            next
+        }
+    }
+    /// R[dst] = table_data[R[a]]: panics past 3.
+    op TABLE(dst: reg, a: reg) : ABC { dst = table_data[..][a as u64]; next }
+    op RET(src: reg) : ABC {
+        let v = src;
+        if fp == ctx.entry_fp { exit Ok(v) }
+        fp = fp - 1;
+        regs = ctx.stack + fp.base;
+        regs[fp.dst] = v;
+        jump fp.ret
+    }
+
+    entry run(c: *RCtx, f: u64, arg: i64) -> Result<i64, i64> uses gc {
+        ctx = c;
+        fp = c.frames;
+        fp.base = 0;
+        c.entry_fp = fp;
+        c.fp = fp;
+        regs = c.stack;
+        regs[0] = arg;
+        jump c.funcs[f]
+    }
+
+    /// A nested run, above the frame that made the call.
+    entry call(c: *RCtx, f: u64, arg: i64) -> Result<i64, i64> uses reenter {
+        ctx = c;
+        let base = c.fp.base + RWINDOW;
+        fp = c.fp + 1;
+        fp.base = base;
+        c.entry_fp = fp;
+        c.fp = fp;
+        regs = c.stack + base;
+        regs[0] = arg;
+        jump c.funcs[f]
+    }
+
+    on raise(e: i64) { exit Err(e) }
+}
+
+/// A vm whose function 0 is x + host(x), 1 is table_data[x] and 2 is
+/// x + 1. `cb` is the host's callback for HOST.
+export "C" fn rvm_new(w: *World, cb: fn(*RCtx, i64) -> i64 uses reenter) -> *RCtx {
+    let c: *RCtx = mem.alloc(1);
+    c.stack = mem.alloc(RWINDOW * 64);
+    c.frames = mem.alloc(64);
+    c.fp = c.frames;
+    c.entry_fp = c.frames;
+    c.w = w;
+    c.cb = cb;
+    let k = c.code[..];
+    var at: u64 = 0;
+    c.funcs[0] = &c.code[at];
+    at = R.emit.HOST(k, at, 1, 0);
+    at = R.emit.ADD(k, at, 2, 1, 0);
+    at = R.emit.RET(k, at, 2);
+    c.funcs[1] = &c.code[at];
+    at = R.emit.TABLE(k, at, 1, 0);
+    at = R.emit.RET(k, at, 1);
+    c.funcs[2] = &c.code[at];
+    at = R.emit.LOADI(k, at, 1, 1);
+    at = R.emit.ADD(k, at, 2, 0, 1);
+    at = R.emit.RET(k, at, 2);
+    c
+}
+
+export "C" fn rvm_free(c: *RCtx) {
+    mem.release(c.stack);
+    mem.release(c.frames);
+    mem.release(c);
+}
+
+/// Run function `f` on `arg`: -999 after a panic.
+#[catch_panic(-999)]
+export "C" fn rvm_run(c: *RCtx, f: u64, arg: i64) -> i64 uses gc {
+    match R.run(c, f, arg) {
+        Ok(v) => v,
+        Err(e) => e,
+    }
+}
+
+/// From the callback: a nested run of `f`. A panic in it unwinds to the
+/// catch below.
+export "C" fn rvm_call(c: *RCtx, f: u64, arg: i64) -> i64 uses reenter {
+    match R.call(c, f, arg) {
+        Ok(v) => v,
+        Err(e) => e,
+    }
+}
+
+/// The same, catching: -1 after a panic.
+#[catch_panic(-1)]
+export "C" fn rvm_call_caught(c: *RCtx, f: u64, arg: i64) -> i64 uses reenter {
+    match R.call(c, f, arg) {
+        Ok(v) => v,
+        Err(e) => e,
+    }
+}
+
+/// Nested runs active on this thread.
+export "C" fn rvm_depth() -> u32 { R.depth }
+
+/// Collect the vm heap (from the callback, with the root in `host` live).
+export "C" fn rvm_collect(c: *RCtx) uses gc { gc.collect(&c.w.heap); }
+
+/// `rt.panic` with a message in a stack buffer, which the unwinding
+/// abandons: the catch keeps a copy (at most 512 bytes).
+#[catch_panic]
+export "C" fn panic_on_stack(n: u64) {
+    var b: [u8; 600] = [0; 600];
+    for i in 0..n { b[i] = (97 + i % 26) as u8; }
+    rt.panic(b[0..n]);
+}

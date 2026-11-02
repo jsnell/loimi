@@ -1767,7 +1767,8 @@ super (as the `super_overlap` lint defines it) is moved to a second,
 commented-out list that names what it overlaps. So the first list can
 be pasted whole without warnings, and the second lists alternatives.
 In a library (`--lib`, `--shared`) the report prints when the host
-process exits. (**Not built:** a separate `loimi vm suggest-supers`
+process exits; several such libraries can link into one host (the stats
+runtime's symbols are weak, and named by a hash of its source). (**Not built:** a separate `loimi vm suggest-supers`
 command.)
 
 ---
@@ -1989,8 +1990,9 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
 
   More in the header:
 
-  - **Documentation.** The `///` comment above an export (or an exported
-    constant) becomes a C comment above its declaration.
+  - **Documentation.** The `///` comment above an export, an exported
+    constant, or a struct or enum the header declares becomes a C
+    comment above its declaration.
   - **Constants.** `export "C" const RX_SEARCH: u32 = 1;` is an ordinary
     constant in Loimi and `#define RX_SEARCH 1u` in the header (integers
     with a `u`/`LL`/`ULL` suffix by type, `bool`, floats, `str` as a
@@ -2020,7 +2022,9 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
 
   A panic anywhere below the export on the same thread (in Loimi code,
   or in a Loimi export the host calls from a callback) returns `-1` from
-  it, and `rt.panic_message()` gives the message. The value is an
+  it, and `rt.panic_message()` gives the message (`rt.panic(msg)`'s is
+  copied, its first 512 bytes, so it may be built in a buffer the
+  unwinding abandons). The value is an
   integer, `true`/`false`, or a variant of the result enum; without one
   (`#[catch_panic]`) the result is zero: 0, false, NULL, an empty `str`,
   or nothing. `rt.catch_panic(f, data)` does the same inside Loimi.
@@ -2038,7 +2042,8 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
     not run, and memory they allocated and had not yet stored somewhere
     reachable leaks. The shadow-stack top and the vm nesting depths
     (`Vm.depth`) are restored, so GC roots and re-entry counts are
-    correct. Everything else stays as the panic left it: a data
+    correct, also when the panic unwinds through nested vm runs and host
+    callbacks (`tests/embed/panic.lm`, vm `R`). Everything else stays as the panic left it: a data
     structure that was being modified (a vm state, a `Vec` mid-`push`, a
     hash map mid-rehash) may break its own invariants. The safe rule is
     to treat the objects the failed call was modifying as poisoned: free
@@ -2089,8 +2094,16 @@ a library, reusing `vm.lm`, `compile.lm` and `value.lm` through
 globals both ways, C natives with user data, syntax and runtime errors
 with messages, natives calling back into Mini (nested 50 levels through
 Mini and C, past the limit, with errors passing through, under GC
-stress, and into another state), the host calling Mini functions, and a
-GC-stress run through the API.
+stress, and into another state), the host calling Mini functions, a
+GC-stress run through the API, and an internal error in a nested run.
+`mini_new`, `mini_dostring` and `mini_call` are `#[catch_panic]`: a
+panic in the interpreter returns NULL or `MiniStatus_Internal`, and
+poisons the state, following the rule above: the state counts its API
+calls in progress and its natives running, which agree in C code
+unless a panic abandoned a call. A poisoned state refuses to run code,
+`mini_error` gives the panic's message, and a native returning to a
+run of it re-panics so that the outer run stops too. Its handlers
+compile to the same IR as without the catches.
 
 ---
 

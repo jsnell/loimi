@@ -10,6 +10,7 @@ struct Counter { n: i64, hits: u32 }
 /// A C name of its own: `api_point` in the header.
 #[c_name("api_point")]
 struct Point { x: i64, y: i64 }
+/// What counter_step does: add or subtract.
 enum Mode: u8 { Add, Sub }
 
 export "C" fn counter_new() -> *Counter {

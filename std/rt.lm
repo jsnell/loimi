@@ -51,6 +51,8 @@ pub fn catch_panic(f: fn(*u8), data: *u8) -> bool {
 
 /// Panic with `msg`: unwind to the innermost `catch_panic` or
 /// `#[catch_panic]` export on this thread, or print `msg` and abort.
+/// The catch keeps a copy of `msg` (its first 512 bytes), so it may be
+/// built in a buffer that the unwinding abandons.
 pub fn panic(msg: str) -> never {
     loimi_panic(msg.ptr, msg.len);
     unreachable
@@ -58,7 +60,8 @@ pub fn panic(msg: str) -> never {
 
 /// The message of the last panic caught on this thread, without the
 /// trailing newline ("lib.lm:12:5: index out of bounds"); empty if none
-/// was. Static text: valid for the life of the program.
+/// was. Valid until the next `rt.panic` caught on this thread (the
+/// panics the compiler generates have static messages).
 pub fn panic_message() -> str {
     let p = loimi_panic_msg_ptr();
     var n = loimi_panic_msg_len();

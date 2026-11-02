@@ -76,6 +76,9 @@ fn declare_sjlj(cg: &mut Codegen) {
     }
 }
 
+/// The most bytes of an `rt.panic` message a catch keeps.
+const PANIC_BUF: u32 = 512;
+
 const KIND_THROW: u32 = 0;
 const KIND_PANIC: u32 = 1;
 
@@ -176,17 +179,47 @@ fn emit_find(cg: &mut Codegen) {
 
 /// The runtime, emitted before `@loimi.panic` (`panic_body` is its body).
 pub fn emit_runtime(cg: &mut Codegen) {
+    cg.panic_handlers = has_handlers(cg);
     // `loimi_panic(msg, len)`: `rt.panic` and `mem`'s out-of-memory path.
+    // Its message may be built at run time, in memory the unwinding frees
+    // or overwrites (a stack buffer, a `StrBuf` freed by a `defer` that
+    // never runs): when a handler will catch it, it is copied into a
+    // thread-local buffer first, truncated to `PANIC_BUF` bytes. Panics
+    // the compiler generates have static messages and skip this.
     if cg.decls.0.remove("loimi_panic").is_some() {
-        let _ = writeln!(
-            cg.fns,
-            "define internal void @loimi_panic(ptr %m, i64 %n) cold noreturn nounwind noinline {{\n  \
-               call void @loimi.panic(ptr %m, i64 %n)\n  unreachable\n}}\n"
-        );
+        if cg.panic_handlers {
+            let _ = writeln!(cg.globals, "@loimi.panic_buf = internal thread_local(initialexec) global [{} x i8] zeroinitializer", PANIC_BUF);
+            cg.decls.insert("declare void @llvm.memmove.p0.p0.i64(ptr, ptr, i64, i1 immarg)");
+            let _ = writeln!(
+                cg.fns,
+                "define internal void @loimi_panic(ptr %m, i64 %n) cold noreturn nounwind noinline {{\n\
+                 entry:\n  \
+                   %h = call ptr @loimi.find_handler(i64 {kind})\n  \
+                   %none = icmp eq ptr %h, null\n  \
+                   br i1 %none, label %die, label %copy\n\
+                 copy:\n  \
+                   %big = icmp ugt i64 %n, {cap}\n  \
+                   %k = select i1 %big, i64 {cap}, i64 %n\n  \
+                   call void @llvm.memmove.p0.p0.i64(ptr @loimi.panic_buf, ptr %m, i64 %k, i1 false)\n  \
+                   call void @loimi.panic(ptr @loimi.panic_buf, i64 %k)\n  \
+                   unreachable\n\
+                 die:\n  \
+                   call void @loimi.panic(ptr %m, i64 %n)\n  \
+                   unreachable\n\
+                 }}\n",
+                kind = KIND_PANIC,
+                cap = PANIC_BUF
+            );
+        } else {
+            let _ = writeln!(
+                cg.fns,
+                "define internal void @loimi_panic(ptr %m, i64 %n) cold noreturn nounwind noinline {{\n  \
+                   call void @loimi.panic(ptr %m, i64 %n)\n  unreachable\n}}\n"
+            );
+        }
     }
     // The last caught panic's message (`rt.panic_message`).
     let want_msg = cg.decls.0.remove("loimi_panic_msg_ptr").is_some() | cg.decls.0.remove("loimi_panic_msg_len").is_some();
-    cg.panic_handlers = has_handlers(cg);
     if !cg.panic_handlers {
         if want_msg {
             let _ = writeln!(cg.fns, "define internal ptr @loimi_panic_msg_ptr() {{\n  ret ptr null\n}}");
