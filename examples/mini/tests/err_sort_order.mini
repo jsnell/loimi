@@ -1,0 +1,7 @@
+-- A comparator that is not a strict order (always true) makes the
+-- partition run past its bounds, which table.sort reports.
+local t = {}
+for i = 1, 20 do t[i] = i end
+table.sort(t, function(a, b) return true end)
+-- expect-stderr: invalid order function for sorting
+-- expect-exit: 1

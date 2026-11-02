@@ -1,0 +1,18 @@
+-- An error raised in a comparator propagates out of table.sort unchanged:
+-- the message keeps the line where it was raised (inside the nested run),
+-- and is not prefixed again at the table.sort call.
+local t = {3, 1, 2}
+local calls = 0
+local function check(x)
+  if x == 1 then error("comparator saw " .. x) end
+  return x
+end
+print("before")
+table.sort(t, function(a, b)
+  calls = calls + 1
+  return check(a) < check(b)
+end)
+print("not reached")
+-- expect: before
+-- expect-stderr: error: line 7: comparator saw 1
+-- expect-exit: 1

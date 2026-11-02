@@ -3,7 +3,9 @@
 //
 // Every library function is a `V.Native(id)`; the VM calls `call` with the
 // id and the arguments. Natives allocate but never collect, so they need
-// no rooting.
+// no rooting. The exception is `table.sort`, whose comparator runs Mini
+// code: the VM handles T_SORT itself (vm.lm), calling `sort` below with
+// the comparison as a closure that re-enters the interpreter.
 //
 // Output from print and io.write goes through C stdio's stdout buffer
 // (a static buffer, flushed when full); `flush` writes out what is left.
@@ -54,6 +56,7 @@ const S_FORMAT: i32 = 25;
 const T_INSERT: i32 = 30;
 const T_REMOVE: i32 = 31;
 const T_CONCAT: i32 = 32;
+pub const T_SORT: i32 = 33;
 const IO_WRITE: i32 = 40;
 
 // ---------------------------------------------------------------------------
@@ -103,6 +106,7 @@ pub fn install(h: *gc.Heap, globals: Gc<Table>) {
     set(h, t, "insert", V.Native(T_INSERT));
     set(h, t, "remove", V.Native(T_REMOVE));
     set(h, t, "concat", V.Native(T_CONCAT));
+    set(h, t, "sort", V.Native(T_SORT));
     set(h, globals, "table", V.T(t));
 
     let io = value.new_table(h);
@@ -731,4 +735,123 @@ fn io_write(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
         }
     }
     Ok(V.Nil)
+}
+
+// ---------------------------------------------------------------------------
+// table.sort
+//
+// Lua 5.4's algorithm (ltablib.c: auxsort, partition), so that a
+// comparator sees the same calls in the same order as in Lua. The
+// comparison may run Mini code, which may collect and may change the
+// table, so elements are read and written through table_get/table_set
+// on every access, never through cached pointers, and the values held
+// across a comparison are locals (rooted while it runs).
+
+fn geti(t: Gc<Table>, i: i64) -> V { value.table_get(t, key(i)) }
+
+fn seti(h: *gc.Heap, t: Gc<Table>, i: i64, v: V) { value.table_set(h, t, key(i), v); }
+
+fn order_error(h: *gc.Heap) -> V { V.S(value.new_str(h, "invalid order function for sorting")) }
+
+/// `table.sort(t [, comp])`: checks the arguments, then sorts t[1..#t]
+/// with `less(a, b)` (comp, or `<` without one).
+pub fn sort(h: *gc.Heap, args: *V, n: u64, less: block fn(V, V) -> Result<bool, V> uses reenter) -> Result<V, V> uses reenter {
+    let t = check_table(h, args, n, 0, "sort")?;
+    let len = value.table_len(t);
+    if len > 1 {
+        match arg(args, n, 1) {
+            Nil | F(_) | Native(_) => {}
+            _ => return Err(type_error(h, args, n, 1, "sort", "function")),
+        }
+        auxsort(h, t, 1, len, 0, less)?;
+    }
+    Ok(V.Nil)
+}
+
+/// Sort t[lo..up]: the larger part in this loop, the smaller recursively.
+fn auxsort(h: *gc.Heap, t: Gc<Table>, lo0: i64, up0: i64, rnd0: u64, less: block fn(V, V) -> Result<bool, V> uses reenter) -> Result<(), V> uses reenter {
+    var lo = lo0;
+    var up = up0;
+    var rnd = rnd0;
+    while lo < up {
+        // Sort a[lo], a[p], a[up].
+        let a = geti(t, lo);
+        let b = geti(t, up);
+        if less(b, a)? {
+            seti(h, t, lo, b);
+            seti(h, t, up, a);
+        }
+        if up - lo == 1 { break; }
+        var p = (lo + up) / 2;
+        if up - lo >= 100 and rnd != 0 {
+            // Lua picks a random pivot in the middle half once a
+            // partition was badly unbalanced; here the "random" number
+            // is derived from the interval, so runs are repeatable.
+            let r4 = ((up - lo) / 4) as u64;
+            p = (rnd % (r4 * 2)) as i64 + lo + r4 as i64;
+        }
+        let ap = geti(t, p);
+        let al = geti(t, lo);
+        if less(ap, al)? {
+            seti(h, t, p, al);
+            seti(h, t, lo, ap);
+        } else {
+            let au = geti(t, up);
+            if less(au, ap)? {
+                seti(h, t, p, au);
+                seti(h, t, up, ap);
+            }
+        }
+        if up - lo == 2 { break; }
+        // The median becomes the pivot, kept at a[up - 1].
+        let pivot = geti(t, p);
+        let a1 = geti(t, up - 1);
+        seti(h, t, p, a1);
+        seti(h, t, up - 1, pivot);
+        p = partition(h, t, lo, up, pivot, less)?;
+        var small: i64 = 0;
+        if p - lo < up - p {
+            auxsort(h, t, lo, p - 1, rnd, less)?;
+            small = p - lo;
+            lo = p + 1;
+        } else {
+            auxsort(h, t, p + 1, up, rnd, less)?;
+            small = up - p;
+            up = p - 1;
+        }
+        if (up - lo) / 128 > small {
+            rnd = ((up - lo) as u64) *% 2654435761 + 1;
+        }
+    }
+    Ok(())
+}
+
+/// Partition a[lo..up] around `pivot` (at a[up - 1]): afterwards
+/// a[lo..i-1] <= pivot == a[i] <= a[i+1..up]. Returns i.
+fn partition(h: *gc.Heap, t: Gc<Table>, lo: i64, up: i64, pivot: V, less: block fn(V, V) -> Result<bool, V> uses reenter) -> Result<i64, V> uses reenter {
+    var i = lo;
+    var j = up - 1;
+    loop {
+        i += 1;
+        var ai = geti(t, i);
+        while less(ai, pivot)? {
+            if i == up - 1 { return Err(order_error(h)); }
+            i += 1;
+            ai = geti(t, i);
+        }
+        j -= 1;
+        var aj = geti(t, j);
+        while less(pivot, aj)? {
+            if j < i { return Err(order_error(h)); }
+            j -= 1;
+            aj = geti(t, j);
+        }
+        if j < i {
+            seti(h, t, up - 1, ai);
+            seti(h, t, i, pivot);
+            return Ok(i);
+        }
+        seti(h, t, i, aj);
+        seti(h, t, j, ai);
+    }
 }

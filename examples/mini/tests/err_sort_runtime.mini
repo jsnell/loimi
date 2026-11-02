@@ -1,0 +1,12 @@
+-- A runtime error (not `error`) two nested runs deep: a comparator
+-- sorting with a comparator that indexes nil.
+local outer = {2, 1}
+table.sort(outer, function(a, b)
+  local inner = {{k = 1}, {}}
+  table.sort(inner, function(x, y)
+    return x.k.z < y.k.z
+  end)
+  return a < b
+end)
+-- expect-stderr: error: line 7: attempt to index a
+-- expect-exit: 1

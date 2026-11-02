@@ -10,7 +10,10 @@
  *
  * It runs two interpreters side by side, exchanges globals with them,
  * registers C functions as Mini natives, reports syntax and runtime
- * errors, and runs an allocation-heavy script with GC stress on.
+ * errors, and runs an allocation-heavy script with GC stress on. Natives
+ * call back into Mini (mini_call, mini_dostring), nested several levels
+ * deep, with errors passing through them, also under GC stress; and the
+ * host calls Mini functions directly.
  */
 #include <stdio.h>
 #include <string.h>
@@ -49,17 +52,63 @@ static int32_t native_greet(MiniState *S, void *ud) {
     return 0;
 }
 
-/* reenter(): tries to run Mini code from inside a native. Refused. */
+/* reenter(): runs Mini code from inside a native, in the native's own
+ * state (nested above the caller), then sets a global of it. */
 static int32_t native_reenter(MiniState *S, void *ud) {
     MiniState *other = ud;
-    const char *src = "print('nested')";
+    const char *src = "print('nested', who)  nested_runs = (nested_runs or 0) + 1";
     MiniStatus st = mini_dostring(other, (void *)src, strlen(src));
-    loimi_str e = mini_error(other);
-    printf("nested mini_dostring: status %d: %.*s\n", st, (int)e.len, e.ptr);
-    /* The getters and setters do not collect, so they are allowed. */
+    printf("nested mini_dostring: status %d\n", st);
     mini_set_integer(other, "touched", 1);
-    mini_return_bool(S, st == MiniStatus_Reenter);
+    mini_return_bool(S, st == MiniStatus_Ok);
     return 0;
+}
+
+/* apply(f, ...): f(...), called back from C. An error in f passes through
+ * unchanged (mini_raise_top re-raises the error value mini_call pushed). */
+static int32_t native_apply(MiniState *S, void *ud) {
+    (void)ud;
+    uint64_t n = mini_argc(S);
+    for (uint64_t i = 0; i < n; i++) mini_push_arg(S, i);
+    if (mini_call(S, n == 0 ? 0 : n - 1) != MiniStatus_Ok) return mini_raise_top(S);
+    mini_return_top(S);
+    return 0;
+}
+
+/* ask_a(x): calls A's global `square` from a native of B: a run of A of
+ * its own, while B is running. */
+static int32_t native_ask_a(MiniState *S, void *ud) {
+    MiniState *a = ud;
+    mini_push_global(a, "square");
+    mini_push_number(a, mini_arg_number(S, 0));
+    MiniStatus st = mini_call(a, 1);
+    double r = 0;
+    if (st != MiniStatus_Ok || !mini_to_number(a, -1, &r)) {
+        loimi_str e = mini_error(a);
+        mini_pop(a, 1);
+        return mini_raise(S, e);
+    }
+    mini_pop(a, 1);
+    mini_return_number(S, r);
+    return 0;
+}
+
+/* Call global `f`(x) from the host, between runs, and print the result. */
+static void call_global(MiniState *S, const char *f, double x) {
+    mini_push_global(S, (void *)f);
+    mini_push_number(S, x);
+    MiniStatus st = mini_call(S, 1);
+    double r;
+    if (st == MiniStatus_Ok && mini_to_number(S, -1, &r)) {
+        printf("%s(%g) = %g\n", f, x, r);
+    } else if (st == MiniStatus_Ok) {
+        loimi_str v = mini_to_string(S, -1);
+        printf("%s(%g) = '%.*s'\n", f, x, (int)v.len, v.ptr);
+    } else {
+        loimi_str e = mini_error(S);
+        printf("%s(%g) failed: %.*s\n", f, x, (int)e.len, e.ptr);
+    }
+    mini_pop(S, 1);
 }
 
 /* stash(s): copies a string into the other state's global `stashed`. */
@@ -90,12 +139,36 @@ int main(void) {
     mini_register(A, "add", native_add, &adds);
     mini_register(A, "greet", native_greet, NULL);
     mini_register(A, "reenter", native_reenter, A);
+    mini_register(A, "apply", native_apply, NULL);
     mini_register(B, "stash", native_stash, A);
+    mini_register(B, "ask_a", native_ask_a, A);
     run(A, "A", "print(add(1, 2, 3.5), greet('world'))  msg = greet('mini') .. '!'");
     loimi_str msg = mini_get_string(A, "msg");
     printf("A.msg = %.*s (%zu bytes)\n", (int)msg.len, msg.ptr, msg.len);
-    run(A, "A", "print(reenter())");
+    run(A, "A", "print(reenter())  print('runs', nested_runs)");
     printf("A.touched = %d\n", mini_get_type(A, "touched") == MiniType_Number);
+
+    /* Calling back: Mini -> C -> Mini, nested, with errors passing through. */
+    run(A, "A",
+        "function square(x) return x * x end\n"
+        "print(apply(square, 12), apply(apply, square, 3))\n"
+        "function down(n) if n == 0 then return 0 end return apply(down, n - 1) + 1 end\n"
+        "print('down', down(50))");
+    run(A, "A", "print(down(1000))");
+    run(A, "A", "local function bad(x) error('bad ' .. x) end\nprint(apply(bad, 'arg'))");
+    run(A, "A", "print(apply(down, -1 + 'x'))");
+    run(A, "A",
+        "local t = {5, 1, 4, 2, 3}\n"
+        "table.sort(t, function(a, b) return apply(function() return a > b end) end)\n"
+        "print(table.concat(t, ' '))\n"
+        "table.sort(t, function(a, b) if a == 1 then error('cmp ' .. b) end return a < b end)");
+    printf("A.top after errors = %llu\n", (unsigned long long)mini_top(A));
+    /* The host calls Mini functions directly. */
+    call_global(A, "square", 9);
+    call_global(A, "down", 20);
+    call_global(A, "greet", 1);
+    call_global(A, "nothing", 1);
+    run(B, "B", "print('B asks A', ask_a(5), ask_a(x))");
     run(B, "B", "stash('from B ' .. who)");
     msg = mini_get_string(A, "stashed");
     printf("A.stashed = %.*s\n", (int)msg.len, msg.ptr);
@@ -125,6 +198,20 @@ int main(void) {
     printf("collections under stress: %s\n", mini_gc_count(A) - before > 2000 ? "many" : "few");
     if (mini_get_number(A, "result", &y)) printf("A.result = %g\n", y);
     run(B, "B", "local s = '' for i = 1, 300 do s = s .. who end print(#s)");
+
+    /* GC stress during re-entry: every callback allocates, the comparator
+     * builds strings, and collections run inside nested runs. */
+    mini_set_gc_stress(A, true);
+    before = mini_gc_count(A);
+    run(A, "A",
+        "local t = {}\n"
+        "for i = 1, 200 do t[i] = apply(function(s, n) return s .. n end, 'k', (i * 7919) % 200) end\n"
+        "table.sort(t, function(a, b) return apply(function() return (a .. '') < (b .. '') end) end)\n"
+        "local ok = 0\n"
+        "for i = 2, 200 do if t[i - 1] <= t[i] then ok = ok + 1 end end\n"
+        "print('sorted under stress', ok, t[1], t[200], down(30))");
+    mini_set_gc_stress(A, false);
+    printf("collections in nested runs: %s\n", mini_gc_count(A) - before > 1000 ? "many" : "few");
 
     mini_free(A);
     /* B outlives A. */

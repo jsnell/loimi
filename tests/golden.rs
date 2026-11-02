@@ -125,17 +125,32 @@ fn compile_errors() {
 /// safepoint), comparing with `-- expect:` lines.
 #[test]
 fn mini_scripts() {
+    mini_scripts_with(&[], |_| true);
+}
+
+/// Re-entry (table.sort's comparator runs as a nested run of the
+/// interpreter) in the goto and switch dispatch modes: the sort scripts
+/// with a Mini built in each.
+#[test]
+fn mini_reentry_dispatch_modes() {
+    for mode in ["--dispatch=goto", "--dispatch=switch"] {
+        mini_scripts_with(&[mode], |name| name.starts_with("sort") || name.starts_with("err_sort"));
+    }
+}
+
+fn mini_scripts_with(flags: &[&str], select: impl Fn(&str) -> bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-mini-{}", std::process::id()));
-    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
-    assert!(out.status.success(), "building mini failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
+    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building mini {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
     let mut failures = Vec::new();
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "mini"))
+        .filter(|p| p.extension().is_some_and(|x| x == "mini") && select(&p.file_name().unwrap().to_string_lossy()))
         .collect();
     scripts.sort();
+    assert!(!scripts.is_empty());
     for f in scripts {
         let text = std::fs::read_to_string(&f).unwrap();
         let lua_directives = |key: &str| -> Vec<String> {
@@ -156,7 +171,7 @@ fn mini_scripts() {
             let out = cmd.output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            let name = format!("{}{}", f.file_name().unwrap().to_string_lossy(), if stress { " (gc stress)" } else { "" });
+            let name = format!("{}{} {}", f.file_name().unwrap().to_string_lossy(), if stress { " (gc stress)" } else { "" }, flags.join(" "));
             let got: Vec<&str> = stdout.lines().collect();
             if got != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
                 failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
@@ -545,8 +560,9 @@ fn c_library() {
 }
 
 /// Mini embedded in a C host (examples/embed/host.c): two states alive at
-/// once, globals both ways, C natives, syntax and runtime errors, refused
-/// re-entry, and an allocation-heavy script under GC stress.
+/// once, globals both ways, C natives, syntax and runtime errors,
+/// natives calling back into Mini (nested, failing, under GC stress), the
+/// host calling Mini functions, and an allocation-heavy script under GC stress.
 #[test]
 fn mini_embedded() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

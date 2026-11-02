@@ -1,0 +1,80 @@
+-- table.sort, with and without a comparator. The comparator is Mini code
+-- that the native calls back (a nested run of the interpreter).
+local t = {5, 2, 8, 1, 9, 3, 7}
+table.sort(t)
+print(table.concat(t, " "))
+table.sort(t, function(a, b) return a > b end)
+print(table.concat(t, " "))
+
+local words = {"pear", "fig", "apple", "kiwi", "banana"}
+table.sort(words)
+print(table.concat(words, ","))
+-- by length, then alphabetically
+table.sort(words, function(a, b)
+  if #a ~= #b then return #a < #b end
+  return a < b
+end)
+print(table.concat(words, ","))
+
+-- records, with upvalues and allocation in the comparator
+local people = {}
+local names = {"ann", "bob", "cy", "dee", "ed", "flo"}
+for i = 1, #names do people[i] = {name = names[i], age = (i * 37) % 11} end
+local seen = 0
+table.sort(people, function(p, q)
+  seen = seen + 1
+  local kp = string.format("%03d%s", p.age, p.name)
+  local kq = string.format("%03d%s", q.age, q.name)
+  return kp < kq
+end)
+local out = {}
+for i = 1, #people do out[i] = people[i].name .. people[i].age end
+print(table.concat(out, " "), seen > 0)
+
+-- empty, one element, floats and mixed numbers
+local e = {}
+table.sort(e)
+local one = {42}
+table.sort(one, function(a, b) error("not called") end)
+local mixed = {3, 1.5, -2, 2.25, 0, 10}
+table.sort(mixed)
+print(#e, one[1], table.concat(mixed, " "))
+
+-- a comparator that calls table.sort: nested runs inside nested runs
+local depth = 0
+local maxdepth = 0
+local function cmp(a, b)
+  depth = depth + 1
+  if depth > maxdepth then maxdepth = depth end
+  local inner = {3, 1, 2}
+  table.sort(inner, function(x, y) return x < y end)
+  depth = depth - 1
+  return a + inner[1] < b + inner[1]
+end
+local big = {}
+for i = 1, 60 do big[i] = (i * 7919) % 61 end
+table.sort(big, cmp)
+local ok = true
+for i = 2, #big do if big[i - 1] > big[i] then ok = false end end
+print(ok, big[1], big[60], maxdepth)
+
+-- a recursive function called from a comparator: guest calls inside a
+-- nested run, and a return value from deep in it
+local function fib(n) if n < 2 then return n end return fib(n - 1) + fib(n - 2) end
+local fs = {10, 3, 15, 7}
+table.sort(fs, function(a, b) return fib(a) > fib(b) end)
+print(table.concat(fs, " "))
+
+-- a comparator that is a native
+local ns = {4, 9, 1}
+table.sort(ns, math.max)
+print(#ns)
+-- expect: 1 2 3 5 7 8 9
+-- expect: 9 8 7 5 3 2 1
+-- expect: apple,banana,fig,kiwi,pear
+-- expect: fig,kiwi,pear,apple,banana
+-- expect: cy1 flo2 ann4 dee5 bob8 ed9	true
+-- expect: 0	42	-2 0 1.5 2.25 3 10
+-- expect: true	1	60	1
+-- expect: 15 10 7 3
+-- expect: 3

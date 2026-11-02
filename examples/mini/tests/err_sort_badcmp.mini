@@ -1,0 +1,3 @@
+table.sort({2, 1}, "less")
+-- expect-stderr: line 1: bad argument #2 to 'sort' (function expected, got string)
+-- expect-exit: 1

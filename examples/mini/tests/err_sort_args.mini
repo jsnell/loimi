@@ -1,0 +1,12 @@
+-- table.sort checks its comparator (only when there is something to
+-- sort, as Lua 5.4 does) and, without one, compares with `<`.
+table.sort({1}, 5)
+print("one element: not checked")
+local ok = {3, 1}
+table.sort(ok, nil)
+print(ok[1], ok[2])
+table.sort({1, "x"})
+-- expect: one element: not checked
+-- expect: 1	3
+-- expect-stderr: line 8: attempt to compare
+-- expect-exit: 1

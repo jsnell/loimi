@@ -5,9 +5,24 @@ B.y = 42
 types: 2 3 5 0
 6.5	hello, world
 A.msg = hello, mini! (12 bytes)
-nested mini_dostring: status 3: mini_dostring called while Mini code is running (from a native): re-entry is not supported
+nested	A
+nested mini_dostring: status 0
 true
+runs	1
 A.touched = 1
+144	9
+down	50
+[A] status 2: line 3: C stack overflow
+[A] status 2: line 1: bad arg
+[A] status 2: line 1: attempt to perform arithmetic on a string value
+5 4 3 2 1
+[A] status 2: line 4: cmp 5
+A.top after errors = 0
+square(9) = 81
+down(20) = 20
+greet(1) = 'hello, '
+nothing(1) failed: attempt to call a nil value
+B asks A	25.0	1600.0
 A.stashed = from B B
 [A] status 1: line 3: unexpected symbol
 [A] status 2: line 1: attempt to index a nil value
@@ -19,4 +34,6 @@ stress ok	2000	hello, n1:2.0	hello, n2000:4000.0
 collections under stress: many
 A.result = 2000
 300
+sorted under stress	199	k0	k99	30
+collections in nested runs: many
 B still here	40	42

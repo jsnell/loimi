@@ -17,7 +17,7 @@ const FRAMES: u64 = 1 << 16;
 /// standard library installed, and empty VM stacks. Natives with ids from
 /// `vm.HOST_NATIVE` up go to `host`. Once the state is at its final
 /// address, register it with `attach`.
-pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V>) -> Ctx {
+pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx {
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     // Collect after allocating twice the live data (at least 1 MB): 17%
@@ -34,8 +34,9 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V>) -> Ctx {
         frames: frames,
         frames_end: frames + FRAMES,
         fp: frames,
+        base: 0 as *Frame,
         globals: globals,
-        error: V.Nil,
+        rethrow: V.Nil,
         out: text.StrBuf.new(),
         open: None,
         open_level: 0 as *V,

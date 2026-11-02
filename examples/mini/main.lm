@@ -30,12 +30,12 @@ fn main() -> i32 {
     let proto = compile.compile(&ctx.heap, path, src);
     let main_closure = value.new_closure(&ctx.heap, proto);
     state.attach(&ctx);
-    Mini.run(&ctx, main_closure);
+    let r = Mini.run(&ctx, main_closure);
     lib.flush();
-    if ctx.error != V.Nil {
+    if let Err(e) = r {
         var b = text.StrBuf.new();
         b.push_str("error: ");
-        value.write_value(&b, ctx.error);
+        value.write_value(&b, e);
         io.eprintln(b.as_str());
         return 1;
     }

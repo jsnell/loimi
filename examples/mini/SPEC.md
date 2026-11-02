@@ -256,6 +256,16 @@ strings, such as `s:sub(1, 2)`, is not part of Mini.
 - `table.remove(t)`: removes and returns `t[#t]`. The 2-argument form is
   not in Mini.
 - `table.concat(t [, sep])`: elements 1..#t, each a string or number.
+- `table.sort(t [, comp])`: sorts elements 1..#t in place, with
+  `comp(a, b)` (true when `a` must come before `b`) or `<`. As in Lua
+  5.4, the sort is not stable, `comp` must define a strict order (an
+  inconsistent one may raise "invalid order function for sorting"), and
+  errors raised by `comp` propagate unchanged. `comp` must be nil or a
+  function (checked when `#t > 1`). Mini uses Lua 5.4's algorithm, so
+  `comp` is called with the same arguments in the same order as in Lua
+  for arrays of up to 100 elements (Lua randomizes some pivots in larger
+  ones). Calling Mini functions from `comp` nests the interpreter: more
+  than 200 nested calls through natives fail with "C stack overflow".
 
 **`io`:**
 - `io.write(...)`: writes strings and numbers, with nothing added

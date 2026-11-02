@@ -278,7 +278,7 @@ fn one(ctx: *Ctx, seed: u64) -> bool {
     ctx.stack = stack;
     ctx.stack_end = stack + nstack;
     ctx.fp = ctx.frames;
-    ctx.error = V.Nil;
+    ctx.rethrow = V.Nil;
     ctx.open = None;
     ctx.open_level = 0 as *V;
     ctx.heap.set_stress(r.chance(10));
@@ -350,8 +350,9 @@ fn main() -> i32 uses gc {
         frames: mem.alloc(16),
         frames_end: 0 as *Frame,
         fp: 0 as *Frame,
+        base: 0 as *Frame,
         globals: globals,
-        error: V.Nil,
+        rethrow: V.Nil,
         out: text.StrBuf.new(),
         open: None,
         open_level: 0 as *V,

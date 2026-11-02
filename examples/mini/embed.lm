@@ -9,16 +9,22 @@
 //
 // A `MiniState` is one interpreter: its own heap, globals and VM stack.
 // Any number may be alive at once; each must be used by one thread at a
-// time. Strings returned to C (`loimi_str`) point into the GC heap and
-// stay valid until the next `mini_dostring` on that state.
+// time. Strings returned to C (`loimi_str`) point into the GC heap: those
+// from `mini_to_string` stay valid while their value is on the value
+// stack, the others until Mini code next runs on that state.
 //
 // Natives (C functions registered with `mini_register`) run in the middle
-// of a VM instruction, between two GC safepoints. While one runs, the
-// host may use the argument and result functions and the global
-// getters and setters of any state (they allocate but never collect), but
-// not `mini_dostring`: re-entering the interpreter from a native is not
-// supported and returns MiniStatus_Reenter (see docs/language.md §10).
+// of a VM instruction. They may call back into Mini: `mini_call` calls a
+// Mini function from the state's value stack (a global, an argument, ...)
+// and `mini_dostring` runs a chunk, both as a nested run above the
+// native's caller (`vm.call_value`; docs/language.md §10.1). Mini code
+// may collect garbage there, which is why C never holds Mini values
+// itself: they live on the value stack, a GC root, and C refers to them
+// by position. Values a native pushes are popped when it returns. More
+// than `vm.MAX_NESTING` nested runs on a thread fail with "C stack
+// overflow". A native must not free its own state.
 
+import std.gc;
 import std.mem;
 import std.text;
 import value;
@@ -30,43 +36,54 @@ import state;
 
 extern "C" fn strlen(s: *u8) -> u64;
 
-/// What mini_dostring did (MiniStatus_Ok, ... in C).
-enum MiniStatus: i32 { Ok, Syntax, Runtime, Reenter }
+/// What mini_dostring or mini_call did (MiniStatus_Ok, ... in C).
+enum MiniStatus: i32 { Ok, Syntax, Runtime }
 
 /// The type of a value (mini_get_type, mini_arg_type).
 enum MiniType: i32 { Nil, Boolean, Number, String, Table, Function }
 
 /// A C function callable from Mini: returns 0 with its result set by a
-/// `mini_return_*` call (nil if none), or nonzero after `mini_raise`.
-struct Native { f: fn(*MiniState, *u8) -> i32, ud: *u8 }
+/// `mini_return_*` call (nil if none), or nonzero after `mini_raise`. It
+/// may call back into Mini (`mini_call`, `mini_dostring`).
+struct Native { f: fn(*MiniState, *u8) -> i32 uses reenter, ud: *u8 }
 
 pub struct MiniState {
     /// First, so the VM's `*Ctx` is also the `*MiniState`.
     ctx: Ctx,
     natives: mem.Vec<Native>,
-    /// The message of the last failed mini_dostring.
+    /// The message of the last failed mini_dostring or mini_call.
     err: text.StrBuf,
     /// The native running now: its arguments and result.
     args: *V,
     nargs: u64,
     ret: V,
+    /// The value stack: Mini values the host refers to by position (a GC
+    /// root, like `ret`).
+    vals: mem.Vec<V>,
 }
 
-/// Interpreter runs active on this thread. Nonzero while a native runs.
-#[thread_local]
-var running: u32 = 0;
+/// GC roots of the API: the value stack and the pending result.
+fn scan_api(h: *gc.Heap, data: *u8) {
+    let s = data as *MiniState;
+    gc_mark(h, s.ret);
+    for i in 0..s.vals.len { gc_mark(h, s.vals.at(i)); }
+}
 
 fn cstr(p: *u8) -> str { p.slice(strlen(p)) }
 
 fn key(s: *MiniState, name: *u8) -> V { V.S(value.new_str(&s.ctx.heap, cstr(name))) }
 
-/// `vm.Ctx.host`: call registered native `id`.
-fn host_call(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+/// `vm.Ctx.host`: call registered native `id`. A native may call back
+/// into Mini, which may run another native: the outer one's arguments,
+/// result and value stack are saved here (the saved result is a local,
+/// rooted while the native runs).
+fn host_call(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> uses reenter {
     let s = c as *MiniState;
     let i = (id - vm.HOST_NATIVE) as u64;
     if i >= s.natives.len { return Err(V.S(value.new_str(&c.heap, "unknown native"))); }
     let nf = s.natives.at(i);
     let (sa, sn, sr) = (s.args, s.nargs, s.ret);
+    let top = s.vals.len;
     s.args = args;
     s.nargs = n;
     s.ret = V.Nil;
@@ -75,6 +92,7 @@ fn host_call(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
     s.args = sa;
     s.nargs = sn;
     s.ret = sr;
+    s.vals.truncate(top);
     if status != 0 { Err(r) } else { Ok(r) }
 }
 
@@ -103,11 +121,13 @@ export "C" fn mini_new() -> *MiniState {
     let s: *MiniState = mem.alloc(1);
     s.ctx = state.new_ctx(host_call);
     state.attach(&s.ctx);
+    s.ctx.heap.add_scanner(s as *u8, scan_api);
     s.natives = mem.Vec.new();
     s.err = text.StrBuf.new();
     s.args = 0 as *V;
     s.nargs = 0;
     s.ret = V.Nil;
+    s.vals = mem.Vec.new();
     s
 }
 
@@ -115,6 +135,7 @@ export "C" fn mini_new() -> *MiniState {
 export "C" fn mini_free(s: *MiniState) {
     state.free_ctx(&s.ctx);
     s.natives.free();
+    s.vals.free();
     s.err.free();
     mem.release(s);
 }
@@ -128,31 +149,140 @@ export "C" fn mini_gc_count(s: *MiniState) -> u64 { s.ctx.heap.collections }
 // ── running code ────────────────────────────────────────────────────
 
 /// Compile and run `len` bytes of Mini source. On an error, the message
-/// is in `mini_error`.
-export "C" fn mini_dostring(s: *MiniState, src: *u8, len: u64) -> MiniStatus {
+/// is in `mini_error`. From a native, the chunk runs nested above it.
+export "C" fn mini_dostring(s: *MiniState, src: *u8, len: u64) -> MiniStatus uses reenter {
     s.err.clear();
-    if running > 0 {
-        s.err.push_str("mini_dostring called while Mini code is running (from a native): re-entry is not supported");
-        return MiniStatus.Reenter;
-    }
     let c = &s.ctx;
     let Some(proto) = compile.try_compile(&c.heap, "chunk", src.slice(len), &s.err) else { return MiniStatus.Syntax; };
     let cl = value.new_closure(&c.heap, proto);
-    c.error = V.Nil;
-    running += 1;
-    Mini.run(c, cl);
-    running -= 1;
-    if c.error == V.Nil { return MiniStatus.Ok; }
-    value.write_value(&s.err, c.error);
-    c.error = V.Nil;
-    // The run stopped mid-call: close what the dead frames left open.
-    vm.close_upvals(c, c.stack);
-    MiniStatus.Runtime
+    match vm.call_value(c, V.F(cl), 0 as *V, 0) {
+        Ok(_) => MiniStatus.Ok,
+        Err(e) => {
+            s.err.clear();
+            value.write_value(&s.err, e);
+            MiniStatus.Runtime
+        }
+    }
 }
 
-/// The message of the last failed `mini_dostring` (empty after success).
-/// Valid until the next `mini_dostring` on this state.
+/// The message of the last failed `mini_dostring` or `mini_call` (empty
+/// after a successful one). Valid until the next call that runs Mini code
+/// on this state.
 export "C" fn mini_error(s: *MiniState) -> str { s.err.as_str() }
+
+// ── the value stack and calls ───────────────────────────────────────
+//
+// Positions count from 0 at the bottom; negative ones from the top (-1
+// is the top). Inside a native, the stack starts out as the caller left
+// it, and what the native pushes is popped when it returns.
+
+fn push(s: *MiniState, v: V) { s.vals.push(v); }
+
+/// The value at position `i`, if there is one.
+fn slot(s: *MiniState, i: i64) -> ?V {
+    let n = s.vals.len as i64;
+    let j = if i < 0 { n + i } else { i };
+    if j < 0 or j >= n { return None; }
+    Some(s.vals.at(j as u64))
+}
+
+/// Values on the stack.
+export "C" fn mini_top(s: *MiniState) -> u64 { s.vals.len }
+
+/// Pop `n` values (all, if there are fewer).
+export "C" fn mini_pop(s: *MiniState, n: u64) {
+    let len = s.vals.len;
+    s.vals.truncate(if n > len { 0 } else { len - n });
+}
+
+/// Push global `name` (nil if unset).
+export "C" fn mini_push_global(s: *MiniState, name: *u8) { push(s, get(s, name)); }
+
+/// In a native: push argument `i` (from 0; nil past the end).
+export "C" fn mini_push_arg(s: *MiniState, i: u64) { push(s, arg(s, i)); }
+
+export "C" fn mini_push_nil(s: *MiniState) { push(s, V.Nil); }
+
+export "C" fn mini_push_number(s: *MiniState, x: f64) { push(s, V.Num(x)); }
+
+export "C" fn mini_push_integer(s: *MiniState, x: i32) { push(s, V.Int(x)); }
+
+export "C" fn mini_push_string(s: *MiniState, v: str) {
+    let o = value.new_str(&s.ctx.heap, v);
+    push(s, V.S(o));
+}
+
+/// The type of the value at `i` (MiniType_Nil if there is none).
+export "C" fn mini_type(s: *MiniState, i: i64) -> MiniType {
+    match slot(s, i) {
+        Some(v) => type_of(v),
+        None => MiniType.Nil,
+    }
+}
+
+/// The value at `i` as a double, if it is a number.
+export "C" fn mini_to_number(s: *MiniState, i: i64, out: *f64) -> bool {
+    let Some(v) = slot(s, i) else { return false; };
+    let Some(x) = value.to_num(v) else { return false; };
+    *out = x;
+    true
+}
+
+/// The value at `i` if it is a string, else { NULL, 0 }. Valid while the
+/// value is on the stack.
+export "C" fn mini_to_string(s: *MiniState, i: i64) -> str {
+    match slot(s, i) {
+        Some(v) => as_str(v),
+        None => "",
+    }
+}
+
+/// Call a function with `nargs` arguments: pops them and the function
+/// below them, then pushes the result (MiniStatus_Ok) or the error value
+/// (MiniStatus_Runtime; its message is also in `mini_error`). From a
+/// native, the call runs nested above the native's caller; from the host
+/// between runs, it is a run of its own.
+export "C" fn mini_call(s: *MiniState, nargs: u64) -> MiniStatus uses reenter {
+    s.err.clear();
+    let len = s.vals.len;
+    if nargs >= len {
+        s.err.push_str("mini_call: no function below the arguments");
+        push(s, V.S(value.new_str(&s.ctx.heap, s.err.as_str())));
+        return MiniStatus.Runtime;
+    }
+    let at = len - nargs - 1;
+    let f = s.vals.at(at);
+    // The function and arguments stay on the stack (rooted) until
+    // call_value has copied the arguments into the new frame.
+    let r = vm.call_value(&s.ctx, f, s.vals.ptr + at + 1, nargs);
+    s.vals.truncate(at);
+    match r {
+        Ok(v) => {
+            push(s, v);
+            MiniStatus.Ok
+        }
+        Err(e) => {
+            // Nested calls that failed on the way wrote theirs.
+            s.err.clear();
+            value.write_value(&s.err, e);
+            push(s, e);
+            MiniStatus.Runtime
+        }
+    }
+}
+
+/// In a native: pop the top value and make it the result.
+export "C" fn mini_return_top(s: *MiniState) {
+    if let Some(v) = s.vals.pop() { s.ret = v; }
+}
+
+/// In a native: pop the top value and fail with it. Returns 1, so
+/// `return mini_raise_top(S);`. An error value from `mini_call` passes
+/// through unchanged (its message already has its line).
+export "C" fn mini_raise_top(s: *MiniState) -> i32 {
+    if let Some(v) = s.vals.pop() { s.ret = v; }
+    1
+}
 
 // ── globals ─────────────────────────────────────────────────────────
 
@@ -190,7 +320,7 @@ export "C" fn mini_get_string(s: *MiniState, name: *u8) -> str { as_str(get(s, n
 // ── natives ─────────────────────────────────────────────────────────
 
 /// Make global `name` a function that calls `f(state, ud)`.
-export "C" fn mini_register(s: *MiniState, name: *u8, f: fn(*MiniState, *u8) -> i32, ud: *u8) {
+export "C" fn mini_register(s: *MiniState, name: *u8, f: fn(*MiniState, *u8) -> i32 uses reenter, ud: *u8) {
     let id = vm.HOST_NATIVE + s.natives.len as i32;
     s.natives.push(Native { f: f, ud: ud });
     set(s, name, V.Native(id));

@@ -1,0 +1,15 @@
+-- Unbounded re-entry: each comparator call sorts again, so every level
+-- is a nested run inside the previous one. At 200 nested runs the next
+-- fails with "C stack overflow" (Lua's LUAI_MAXCCALLS), instead of
+-- running out of C stack.
+local levels = 0
+local function deeper(a, b)
+  levels = levels + 1
+  table.sort({2, 1}, deeper)
+  return a < b
+end
+print("start")
+table.sort({2, 1}, deeper)
+-- expect: start
+-- expect-stderr: C stack overflow
+-- expect-exit: 1

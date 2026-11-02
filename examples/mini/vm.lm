@@ -20,8 +20,13 @@ pub struct Ctx {
     frames: *Frame,
     frames_end: *Frame,
     fp: *Frame,
+    /// The bottom frame of the innermost run: returning from it leaves
+    /// the run (`exit`). Null while no Mini code runs.
+    base: *Frame,
     globals: Gc<Table>,
-    error: V,
+    /// An error that came back from a nested run (`call_value`), which
+    /// already says where it happened: `on raise` passes it on unchanged.
+    rethrow: V,
     out: text.StrBuf,
     /// Open upvalues, sorted by stack level, highest first.
     open: ?Gc<UpVal>,
@@ -29,8 +34,9 @@ pub struct Ctx {
     /// "anything to close at or above here?" is one compare.
     open_level: *V,
     /// Natives with ids from HOST_NATIVE up, which an embedder registers
-    /// (embed.lm); `no_host` in the standalone interpreter.
-    host: fn(*Ctx, i32, *V, u64) -> Result<V, V>,
+    /// (embed.lm); `no_host` in the standalone interpreter. They may call
+    /// back into Mini (`call_value`).
+    host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter,
 }
 
 pub const HOST_NATIVE: i32 = 1000;
@@ -39,12 +45,13 @@ pub fn no_host(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
     Err(error_msg(c, "unknown builtin"))
 }
 
-/// GC roots: globals, the pending error, open upvalues, and every active
-/// frame's closure and registers.
+/// GC roots: globals, the error being passed on, open upvalues, and every
+/// active frame's closure and registers (those of nested runs included:
+/// they are frames above the native that started them).
 pub fn scan_roots(h: *gc.Heap, data: *u8) {
     let c = data as *Ctx;
     gc_mark(h, c.globals);
-    gc_mark(h, c.error);
+    gc_mark(h, c.rethrow);
     if let Some(u) = c.open { gc_mark(h, u); }
     var f = c.frames;
     while f <= c.fp {
@@ -232,10 +239,71 @@ fn refuse(cl: Gc<Closure>) {
     Mini.optimize(cl.proto.code);
 }
 
-/// The single dispatch point for natives. Natives allocate but never collect.
-fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
+/// The single dispatch point for natives. Most allocate but never
+/// collect; `table.sort` and host natives may call back into Mini.
+fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> uses reenter {
     if id >= HOST_NATIVE { return c.host(c, id, args, n); }
+    if id == lib.T_SORT { return table_sort(c, args, n); }
     lib.call(&c.heap, id, args, n)
+}
+
+/// `table.sort(t [, comp])`: Lua's algorithm (lib.lm), comparing with
+/// `comp` through a nested run, or with `<`.
+fn table_sort(c: *Ctx, args: *V, n: u64) -> Result<V, V> uses reenter {
+    let comp = if n > 1 { args[1] } else { V.Nil };
+    lib.sort(&c.heap, args, n, |a, b| sort_less(c, comp, a, b))
+}
+
+fn sort_less(c: *Ctx, comp: V, a: V, b: V) -> Result<bool, V> uses reenter {
+    if comp == V.Nil { return less(c, a, b, false); }
+    var ab: [V; 2] = [a, b];
+    let r = call_value(c, comp, &ab[0], 2)?;
+    Ok(value.truthy(r))
+}
+
+/// Nested runs allowed at once on a thread (`Mini.depth`), as Lua's
+/// LUAI_MAXCCALLS: each one is a few C frames.
+pub const MAX_NESTING: u32 = 200;
+
+/// Call `f` with `args[0..n]` from host code: a native (table.sort's
+/// comparator) or the embedding API (`mini_call`). While Mini code runs,
+/// this is a nested run on the same stack, above the frame that called
+/// the native (`ctx.fp`, published by the handler's sync); otherwise a
+/// run from the bottom of the stack. The callee's return ends the run.
+/// An error comes back as Err, its message already prefixed with its
+/// line; `on raise` passes it on as is when a native returns it.
+pub fn call_value(c: *Ctx, f: V, args: *V, n: u64) -> Result<V, V> uses reenter {
+    let cl = match f {
+        F(cl) => cl,
+        Native(id) => return call_native(c, id, args, n),
+        _ => return Err(error(c, "attempt to call a ", f)),
+    };
+    if Mini.depth >= MAX_NESTING { return Err(error_msg(c, "C stack overflow")); }
+    let saved_fp = c.fp;
+    let saved_base = c.base;
+    var at = c.frames;
+    var base = c.stack;
+    if saved_base != 0 as *Frame {
+        at = c.fp + 1;
+        base = c.fp.base + c.fp.cl.proto.nregs as u64;
+    }
+    let nregs = cl.proto.nregs as u64;
+    if base + nregs > c.stack_end or at + 1 >= c.frames_end {
+        return Err(error_msg(c, "stack overflow"));
+    }
+    // No collection until the run starts and `at` is a frame the
+    // collector sees: the arguments are only in the new window.
+    for i in 0..nregs { base[i] = if i < n { args[i] } else { V.Nil }; }
+    at.base = base;
+    let r = Mini.call(c, at, cl);
+    c.fp = saved_fp;
+    c.base = saved_base;
+    if let Err(e) = r {
+        // The run stopped mid-call: close what its frames left open.
+        close_upvals(c, base);
+        c.rethrow = e;
+    }
+    r
 }
 
 pub vm Mini {
@@ -281,8 +349,18 @@ pub vm Mini {
         format sJ { op: 8, sj: s24 }
     }
 
-    // The collector walks frames up to ctx.fp.
+    // The collector walks frames up to ctx.fp, and a nested run starts
+    // above it.
     sync { ctx.fp = fp; }
+    // After a native that may have run Mini code (`uses reenter`). The
+    // stack never moves and the nested run leaves `ctx.fp` as it was, so
+    // this reloads the same values; it is what keeps that an invariant of
+    // call_value rather than an assumption of every handler.
+    reload {
+        fp = ctx.fp;
+        regs = fp.base;
+        k = fp.k;
+    }
 
     op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
     op LOADI(dst: reg, v: imm) : AsBx { dst = Int(v as i32); next }
@@ -849,7 +927,7 @@ pub vm Mini {
     op RET1(src: reg) : ABC {
         let v = src;
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.frames { exit v }
+        if fp == ctx.base { exit Ok(v) }
         *(regs - 1) = v;
         let want = fp.nres as u64;
         if unlikely(want > 1) {
@@ -869,7 +947,7 @@ pub vm Mini {
     /// Return R[a .. a+n-1], adjusted to the number of results wanted.
     op RETN(a: reg, n: retn) : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.frames { exit a }
+        if fp == ctx.base { exit Ok(a) }
         let want = fp.nres as u64;
         let src = regs + a.raw as u64;
         let dst = regs - 1;
@@ -883,7 +961,7 @@ pub vm Mini {
     }
     op RET0() : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.frames { exit Nil }
+        if fp == ctx.base { exit Ok(Nil) }
         let want = fp.nres as u64;
         let dst = regs - 1;
         for i in 0..want { dst[i] = Nil; }
@@ -939,10 +1017,13 @@ pub vm Mini {
     #[allow(super_overlap)]
     super GETINDEX_ADDI = GETINDEX; ADDI;
 
-    entry run(c: *Ctx, cl: Gc<Closure>) -> V {
+    /// A top-level run of `cl` from the bottom of the stack (the
+    /// standalone interpreter).
+    entry run(c: *Ctx, cl: Gc<Closure>) -> Result<V, V> {
         ctx = c;
         let p = cl.proto;
         fp = c.frames;
+        c.base = fp;
         fp.cl = cl;
         fp.base = c.stack;
         fp.nres = 1;
@@ -954,7 +1035,29 @@ pub vm Mini {
         jump p.code.ptr
     }
 
+    /// A run of `cl` in frame `at`, whose window `call_value` filled with
+    /// the arguments: `at` becomes the run's bottom frame.
+    entry call(c: *Ctx, at: *Frame, cl: Gc<Closure>) -> Result<V, V> uses reenter {
+        ctx = c;
+        let p = cl.proto;
+        fp = at;
+        fp.cl = cl;
+        fp.nres = 1;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        regs = fp.base;
+        c.base = fp;
+        c.fp = fp;
+        jump p.code.ptr
+    }
+
     on raise(e: V) {
+        ctx.fp = fp;
+        // An error from a nested run already has its line.
+        if e != V.Nil and e == ctx.rethrow {
+            ctx.rethrow = Nil;
+            exit Err(e)
+        }
         // Prefix the message with the line of the failing instruction.
         let p = fp.cl.proto;
         let i = ((pc as u64) - (p.code.ptr as u64)) / 4;
@@ -965,8 +1068,6 @@ pub vm Mini {
         ctx.out.push_int(line as i64);
         ctx.out.push_str(": ");
         value.write_value(&ctx.out, e);
-        ctx.error = S(value.new_str(&ctx.heap, ctx.out.as_str()));
-        ctx.fp = fp;
-        exit Nil
+        exit Err(S(value.new_str(&ctx.heap, ctx.out.as_str())))
     }
 }
