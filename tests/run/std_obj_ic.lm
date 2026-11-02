@@ -1,0 +1,151 @@
+// matrix: dispatch
+// std.obj inline caches in a vm: a GETPROP family whose cache words hold
+// the shape id and the SlotRef. The generic member fills the cache and
+// quickens to an inline or out-of-line member; those check the shape and
+// load the slot, and fall back to the generic member on a miss.
+import std.io;
+import std.gc;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+struct Ctx { heap: gc.Heap, m: obj.Model<Gc<Obj>, Gc<Slots>, Value>, misses: i64 }
+
+/// The slow path: look the key up, fill the cache words, report a miss.
+fn get_slow(c: *Ctx, v: Value, key: u64, shape_w: *u32, slot_w: *u32) -> Value {
+    c.misses += 1;
+    let O(o) = v else { return Value.Nil; };
+    c.m.get_fill(o, key, shape_w, slot_w) ?? Value.Nil
+}
+
+vm P {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    // Word 1: the shape id (0 = empty); word 2: the SlotRef.
+    cache PropIC { shape: u32, slot: u32 }
+
+    family GETPROP(dst: reg, o: reg, key: imm) : ABC + PropIC {
+        generic {
+            dst = get_slow(ctx, o, key as u64, &cache.shape, &cache.slot);
+            if cache.shape != obj.EMPTY_ID {
+                if cache.slot & obj.OUT == 0 { become GETPROP_IN; } else { become GETPROP_OUT; }
+            }
+            next
+        }
+        GETPROP_IN {
+            if let O(x) = o and x.shape.id == cache.shape {
+                dst = ctx.m.load_inline(x, cache.slot);
+                next
+            }
+            cold { become GETPROP; redo }
+        }
+        GETPROP_OUT {
+            if let O(x) = o and x.shape.id == cache.shape {
+                dst = ctx.m.load_out(x, cache.slot & !obj.OUT);
+                next
+            }
+            cold { become GETPROP; redo }
+        }
+    }
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) { dst = Value.Int(x +% y); next }
+        dst = Value.Nil;
+        next
+    }
+    op DEC(dst: reg) : ABC {
+        if let Int(x) = dst { dst = Value.Int(x - 1); }
+        next
+    }
+    op JPOS(a: reg, target: label) : AsBx {
+        if let Int(x) = a and x > 0 { jump target }
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32, r: *Value) -> Value { ctx = c; pc = code; regs = r; jump pc }
+}
+
+const KX: u64 = 1;
+const KY: u64 = 2;
+const KZ: u64 = 3;
+
+fn main() {
+    var c = Ctx { heap: gc.Heap.new(), m: obj.Model.new(new_slots, Value.Nil), misses: 0 };
+    c.m.attach(&c.heap);
+    // a and b share a shape {x, y, z} with one inline slot; d has {y, x}.
+    let a = new(&c.heap, Obj { shape: c.m.root(1), dict: None, overflow: None }, 1);
+    let b = new(&c.heap, Obj { shape: c.m.root(1), dict: None, overflow: None }, 1);
+    let d = new(&c.heap, Obj { shape: c.m.root(1), dict: None, overflow: None }, 1);
+    c.m.set(a, KX, Value.Int(1)); c.m.set(a, KY, Value.Int(10)); c.m.set(a, KZ, Value.Int(100));
+    c.m.set(b, KX, Value.Int(2)); c.m.set(b, KY, Value.Int(20)); c.m.set(b, KZ, Value.Int(200));
+    c.m.set(d, KY, Value.Int(30)); c.m.set(d, KX, Value.Int(3));
+
+    // r0 = object, r1 = acc, r2 = counter, r3 = tmp
+    var code: [u32; 32] = [0; 32];
+    let s = code[..];
+    var at: u64 = 0;
+    at = P.emit.GETPROP(s, at, 3, 0, KX as u8);    // 0: r3 = r0.x  (inline)
+    at = P.emit.ADD(s, at, 1, 1, 3);               // 3
+    at = P.emit.GETPROP(s, at, 3, 0, KY as u8);    // 4: r3 = r0.y  (out of line)
+    at = P.emit.ADD(s, at, 1, 1, 3);               // 7
+    at = P.emit.DEC(s, at, 2);                     // 8
+    at = P.emit.JPOS(s, at, 2, -9);                // 9: loop to 0
+    at = P.emit.RET(s, at, 1);
+    var regs: [Value; 4] = [Value.Nil; 4];
+
+    regs[0] = Value.O(a); regs[1] = Value.Int(0); regs[2] = Value.Int(1000);
+    io.print_int(match P.run(&c, &code[0], &regs[0]) { Int(n) => n as i64, _ => -1 }); io.println("");
+    io.print_int(c.misses); io.println("");
+    io.println(P.op_name(code[0]));
+    io.println(P.op_name(code[4]));
+    io.print_int(code[1] as i64 - a.shape.id as i64); io.println("");   // the cached shape (relative)
+    io.print_bool(code[6] & obj.OUT != 0); io.println("");
+
+    // Same shape: all hits.
+    c.misses = 0;
+    regs[0] = Value.O(b); regs[1] = Value.Int(0); regs[2] = Value.Int(1000);
+    io.print_int(match P.run(&c, &code[0], &regs[0]) { Int(n) => n as i64, _ => -1 }); io.println("");
+    io.print_int(c.misses); io.println("");
+
+    // Another shape: a miss per site, a refill, then hits again. In d, y
+    // is inline and x is out of line, so both sites switch members.
+    c.misses = 0;
+    regs[0] = Value.O(d); regs[1] = Value.Int(0); regs[2] = Value.Int(1000);
+    io.print_int(match P.run(&c, &code[0], &regs[0]) { Int(n) => n as i64, _ => -1 }); io.println("");
+    io.print_int(c.misses); io.println("");
+    io.println(P.op_name(code[0]));
+    io.println(P.op_name(code[4]));
+
+    // A dictionary-mode object never fills: every execution is a miss.
+    c.m.delete(b, KX);
+    c.m.set(b, KX, Value.Int(5));
+    c.misses = 0;
+    regs[0] = Value.O(b); regs[1] = Value.Int(0); regs[2] = Value.Int(10);
+    io.print_int(match P.run(&c, &code[0], &regs[0]) { Int(n) => n as i64, _ => -1 }); io.println("");
+    io.print_int(c.misses); io.println("");
+}
+// expect: 11000
+// expect: 2
+// expect: GETPROP_IN
+// expect: GETPROP_OUT
+// expect: 0
+// expect: true
+// expect: 22000
+// expect: 0
+// expect: 33000
+// expect: 2
+// expect: GETPROP_OUT
+// expect: GETPROP_IN
+// expect: 250
+// expect: 20
