@@ -440,8 +440,18 @@ impl Parser {
     pub fn parse_fn(&mut self, attrs: Attrs, linkage: Linkage, is_pub: bool) -> Res<FnDecl> {
         self.expect_kw("fn")?;
         let first = self.ident()?;
-        let generics = self.parse_generics()?;
-        let (recv, name) = if self.eat(".") { (Some(first), self.ident()?) } else { (None, first) };
+        let mut generics = self.parse_generics()?;
+        // `fn Type.name<U>` / `fn Vec<T>.name<U>`: the method's own type
+        // parameters follow the receiver's.
+        let mut recv_generics = 0;
+        let (recv, name) = if self.eat(".") {
+            recv_generics = generics.len();
+            let name = self.ident()?;
+            generics.extend(self.parse_generics()?);
+            (Some(first), name)
+        } else {
+            (None, first)
+        };
         self.expect("(")?;
         let mut params = Vec::new();
         let mut variadic = false;
@@ -472,7 +482,7 @@ impl Parser {
             }
         }
         let body = if self.eat(";") { None } else { Some(self.parse_block()?) };
-        Ok(FnDecl { name, generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
+        Ok(FnDecl { name, generics, recv_generics, recv, params, variadic, ret, body, linkage, attrs, is_pub })
     }
 
     fn parse_generics(&mut self) -> Res<Vec<Ident>> {

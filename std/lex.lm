@@ -10,7 +10,7 @@
 //         if let Some(name) = lx.cur.ident() { return Ok(lx.tok(lx.keywords.get(name) ?? T.Name, start)); }
 //         if lx.cur.at_number() { lx.num = lx.cur.number()?; return Ok(lx.tok(T.Number, start)); }
 //         if lx.cur.peek() == '"' { lx.buf.clear(); lx.cur.quoted(&lx.buf)?; return Ok(lx.tok(T.String, start)); }
-//         if let Some(k) = lx.ops.eat(&lx.cur) { return Ok(lx.tok(k, start)); }
+//         if let Some(k) = lx.cur.op(&lx.ops) { return Ok(lx.tok(k, start)); }
 //         Err(lx.cur.error_at(start, "unexpected character"))
 //     }
 //
@@ -547,14 +547,15 @@ pub fn OpTable<K>.match_at(t: *OpTable<K>, s: str, pos: u64) -> ?(K, u64) {
 
 pub fn OpTable<K>.free(t: *OpTable<K>) { t.entries.free(); }
 
-/// Consume the longest operator from `t` at cursor `c` and return its
-/// kind. (A method of the table rather than of Cursor because methods
-/// cannot yet have their own type parameters.)
-pub fn OpTable<K>.eat(t: *OpTable<K>, c: *Cursor) -> ?K {
-    let (kind, n) = t.match_at(c.src, c.pos)?;
+/// Consume the longest operator of `ops` at the cursor and return its kind.
+pub fn Cursor.op<K>(c: *Cursor, ops: *OpTable<K>) -> ?K {
+    let (kind, n) = ops.match_at(c.src, c.pos)?;
     c.advance(n);
     Some(kind)
 }
+
+/// The same as `c.op(t)`, kept for existing callers.
+pub fn OpTable<K>.eat(t: *OpTable<K>, c: *Cursor) -> ?K { c.op(t) }
 
 // ── keywords ────────────────────────────────────────────────────────
 

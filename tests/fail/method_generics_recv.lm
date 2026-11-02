@@ -1,0 +1,4 @@
+struct Cursor { pos: u64 }
+fn Cursor<T>.get(c: *Cursor) -> u64 { c.pos }
+fn main() {}
+// error: `Cursor` is not a generic type

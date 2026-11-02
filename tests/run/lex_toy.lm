@@ -53,7 +53,7 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
         lx.buf.clear();
         if c.peek() == '[' { lx.buf.push_str(c.long_string()?); } else { c.quoted(&lx.buf)?; }
         t.str = lx.buf.as_str();
-    } else if let Some(k) = lx.ops.eat(c) {
+    } else if let Some(k) = c.op(&lx.ops) {
         t.kind = k;
     } else {
         c.bump();

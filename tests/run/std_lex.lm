@@ -179,7 +179,7 @@ fn main() {
     ops.add("-", Op.Minus);
     var oc = lex.Cursor.new("<<=<<<=<===.....->-- x", 0, lex.none());
     var line = text.StrBuf.new();
-    while let Some(k) = ops.eat(&oc) { line.push_str(op_name(k)); line.push(' '); }
+    while let Some(k) = oc.op(&ops) { line.push_str(op_name(k)); line.push(' '); }
     line.push_str("rest [");
     line.push_str(oc.src[oc.pos..oc.src.len]);
     line.push(']');

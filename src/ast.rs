@@ -211,8 +211,12 @@ pub struct Param {
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     pub name: Ident,
-    /// Type parameters: `fn f<T>(..)`, or of the receiver: `fn Vec<T>.push(..)`.
+    /// Type parameters: `fn f<T>(..)`, of the receiver: `fn Vec<T>.push(..)`,
+    /// and of a method: `fn Cursor.op<K>(..)`.
     pub generics: Vec<Ident>,
+    /// How many of `generics` belong to the receiver type (`fn Vec<T>.map<U>`
+    /// has generics `[T, U]` and `recv_generics == 1`).
+    pub recv_generics: usize,
     /// `fn Type.method(...)`
     pub recv: Option<Ident>,
     pub params: Vec<Param>,

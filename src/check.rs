@@ -317,11 +317,25 @@ impl<'a> Checker<'a> {
             let gf = &self.generics.fns[g];
             let Some(recv) = gf.decl.recv.clone() else { continue };
             let (m, mname) = (gf.module, gf.decl.name.clone());
+            let nrecv = gf.decl.recv_generics;
             let Some((Def::GenericType(t), _)) = self.scopes[m].get(&recv.name).cloned() else {
-                return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
+                // A plain receiver type with method type parameters: `fn Cursor.op<K>`.
+                if nrecv != 0 {
+                    return Err(Diag::new(recv.span, format!("`{}` is not a generic type", recv.name)));
+                }
+                let rty = self.resolve_type_name(m, &recv)?;
+                let key = (rty, mname.name.clone());
+                if self.methods.contains_key(&key) || self.generics.ty_methods.insert(key, g as u32).is_some() {
+                    return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
+                }
+                continue;
             };
-            if self.generics.types[t as usize].params.len() != self.generics.fns[g].params.len() {
-                return Err(Diag::new(recv.span, "a method of a generic type takes exactly the type's parameters"));
+            let tparams = self.generics.types[t as usize].params.len();
+            if tparams != nrecv {
+                return Err(Diag::new(
+                    recv.span,
+                    format!("`{}` takes {} type parameter(s); write them after the type name (`fn {}<..>.{}`)", recv.name, tparams, recv.name, mname.name),
+                ));
             }
             if self.generics.methods.insert((t, mname.name.clone()), g as u32).is_some() {
                 return Err(Diag::new(mname.span, format!("method `{}` is defined more than once", mname.name)));
@@ -1585,6 +1599,9 @@ impl<'a> Checker<'a> {
             if let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() {
                 return self.def_value(Def::Fn(f), &name.name, span);
             }
+            if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
+                return self.generic_fn_value(gf, exp, span);
+            }
             return Err(Diag::new(name.span, format!("no variant or function `{}` in `{}`", name.name, self.ty_name(&t))));
         }
         let _ = exp;
@@ -1778,6 +1795,9 @@ impl<'a> Checker<'a> {
                         if let Some(r) = self.static_intrinsic(cx, &t, &name.name, args, span)? {
                             return Ok(r);
                         }
+                        if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
+                            return self.generic_call(cx, gf, vec![], vec![], args, exp, span);
+                        }
                         let Some(f) = self.methods.get(&(t.clone(), name.name.clone())).copied() else {
                             return Err(Diag::new(
                                 name.span,
@@ -1789,7 +1809,7 @@ impl<'a> Checker<'a> {
                     }
                     // Method call.
                     let recv = self.expr(cx, base, None)?;
-                    return self.method_call(cx, recv, name, args, span);
+                    return self.method_call(cx, recv, name, args, exp, span);
                 }
             }
             _ => {}
@@ -1847,7 +1867,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], span: Span) -> Res<TExpr> {
+    fn method_call(&mut self, cx: &mut FnCx, recv: TExpr, name: &Ident, args: &[Expr], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         let mut base_ty = recv.ty.clone();
         while let Ty::Ptr(inner) | Ty::Gc(inner) = base_ty {
             base_ty = *inner;
@@ -1855,8 +1875,11 @@ impl<'a> Checker<'a> {
         if let Some((g, targs)) = self.generics.inst_of.get(&base_ty).cloned() {
             if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
                 let known = targs.into_iter().map(Some).collect();
-                return self.generic_call(cx, gf, vec![recv], known, args, None, span);
+                return self.generic_call(cx, gf, vec![recv], known, args, exp, span);
             }
+        }
+        if let Some(gf) = self.generics.ty_methods.get(&(base_ty.clone(), name.name.clone())).copied() {
+            return self.generic_call(cx, gf, vec![recv], vec![], args, exp, span);
         }
         if let Some(fid) = self.methods.get(&(base_ty.clone(), name.name.clone())).copied() {
             let fdef = &self.prog.fns[fid as usize];
