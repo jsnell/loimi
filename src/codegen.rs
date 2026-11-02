@@ -28,6 +28,8 @@ pub struct Codegen<'p> {
     /// Outlined cold blocks waiting to be emitted: (handler, body, captured locals, symbol).
     pub cold_queue: Vec<(FnId, TExpr, Vec<LocalId>, String)>,
     pub cold_count: u32,
+    /// Thread-local argument slots of shared `-> never` vm functions already defined.
+    pub tls_defined: std::collections::HashSet<String>,
     /// Per function: immutable f64 locals bound only from the unboxed
     /// variant of a nanbox value (see `values::nan_safe`).
     pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
@@ -115,6 +117,7 @@ impl<'p> Codegen<'p> {
             nan_safe: Default::default(),
             cold_queue: vec![],
             cold_count: 0,
+            tls_defined: Default::default(),
         }
     }
 

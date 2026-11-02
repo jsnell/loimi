@@ -1,0 +1,13 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    #[inline]
+    fn tail(n: i64) -> never {
+        if n > 0 { tail(n - 1) }
+        next
+    }
+    op NOP() : A { tail(3) }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: recursive call of `tail` cannot be inlined

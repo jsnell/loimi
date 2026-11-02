@@ -29,7 +29,9 @@ pub struct HandlerGen {
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+            p.vms[vm as usize].dispatch == Dispatch::TailCall
+        }
         _ => false,
     }
 }
@@ -442,6 +444,23 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             }
             g.poison(&e.ty)
         }
+        TVm::Shared(fid, args, size) => {
+            let p = g.p();
+            let vd = &p.vms[g.vm.as_ref().unwrap().vm as usize];
+            for (i, a) in args.iter().chain(std::iter::once(&**size)).enumerate() {
+                let v = g.val(a);
+                let slot = shared_slot(g, *fid, i, &a.ty);
+                g.store(&a.ty, &v, &slot);
+            }
+            // Entries have no current instruction; the shared copy ignores it.
+            let w = if g.vm.as_ref().unwrap().role == VmRole::Entry { "0".to_string() } else { current_word(g, vd) };
+            tail_to(g, vd, &format!("@\"{}\"", p.fns[*fid as usize].symbol), &w);
+            g.poison(&e.ty)
+        }
+        TVm::SharedArg(fid, i) => {
+            let slot = shared_slot(g, *fid, *i as usize, &e.ty);
+            g.load(&e.ty, &slot)
+        }
         TVm::Synced(sync, call) => {
             g.val(sync);
             g.val(call)
@@ -495,6 +514,17 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
     g.cg.cold_queue.push((g.fid, b.clone(), captured, sym));
+}
+
+/// Thread-local slot for argument `i` of the shared copy `fid` of a
+/// `-> never` vm function.
+fn shared_slot(g: &mut FnGen, fid: FnId, i: usize, t: &Ty) -> String {
+    let p = g.p();
+    let name = format!("@\"{}.a{}\"", p.fns[fid as usize].symbol, i);
+    if g.cg.tls_defined.insert(name.clone()) {
+        let _ = writeln!(g.cg.globals, "{} = internal thread_local(initialexec) global {} zeroinitializer", name, llty(p, t));
+    }
+    name
 }
 
 /// `--vm-stats`: count this op and the (previous op, this op) pair.
@@ -716,7 +746,9 @@ pub fn emit_tables(p: &Program, globals: &mut String, fns: &mut String) {
 /// emitted inside their entries).
 pub fn standalone(p: &Program, f: &FnDef) -> bool {
     match (f.vm, f.vm_role) {
-        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..)) => p.vms[vm as usize].dispatch == Dispatch::TailCall,
+        (Some(vm), VmRole::Handler(_) | VmRole::Raise | VmRole::Wrapper(..) | VmRole::Shared(_)) => {
+            p.vms[vm as usize].dispatch == Dispatch::TailCall
+        }
         _ => true,
     }
 }

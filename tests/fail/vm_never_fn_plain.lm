@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    fn tail() -> never { jump pc + 1 }
+    fn helper() -> i64 { tail() }
+    op NOP() : A { next }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+}
+fn main() {}
+// error: `tail` ends in a control word; call it from op handlers

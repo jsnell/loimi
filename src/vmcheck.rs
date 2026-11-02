@@ -46,7 +46,27 @@ pub struct VmInfo {
     pub ret: Ty,
     pub raise_ty: Option<Ty>,
     pub fns: HashMap<String, FnId>,
+    /// `-> never` vm functions, which may end in control words.
+    pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
+}
+
+/// A vm function returning `never`. Its body is checked again at each
+/// call site that inlines it; in tail-call mode, cold call sites instead
+/// `musttail` to one shared copy (`shared`), a function with the handler
+/// signature that receives its arguments through thread-local slots.
+pub struct NeverFn {
+    pub decl: FnDecl,
+    pub params: Vec<Ty>,
+    pub shared: Option<FnId>,
+    /// `#[inline]`: always inlined; `#[inline(never)]`: always shared.
+    pub inline: Option<bool>,
+    /// The shared copy uses `next` (directly or through shared callees).
+    pub uses_next: bool,
+    /// Shared callees of the shared copy.
+    pub calls: Vec<usize>,
+    /// Shared calls from entries and `on raise`, which have no `next`.
+    pub no_op_calls: Vec<Span>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +83,34 @@ pub struct HandlerCx {
     pub state: Vec<LocalId>,
     /// vm functions see the state through pointers.
     pub by_ptr: bool,
+    /// In the body of a `-> never` vm function: no operands, `become` or `cache`.
+    pub in_fn: bool,
+    /// Inside a `cold` block.
+    pub cold: bool,
+    /// The shared copy of `-> never` vm function `i`: `next` skips the
+    /// number of words in local `size`.
+    pub shared: Option<(usize, LocalId)>,
+    /// `-> never` vm functions being inlined here (to catch recursion).
+    pub inlining: Vec<usize>,
+}
+
+impl HandlerCx {
+    fn new(vm: u32, state: Vec<LocalId>) -> HandlerCx {
+        HandlerCx {
+            vm,
+            is_handler: true,
+            allow_control: true,
+            op: None,
+            part: None,
+            operands: vec![],
+            state,
+            by_ptr: false,
+            in_fn: false,
+            cold: false,
+            shared: None,
+            inlining: vec![],
+        }
+    }
 }
 
 pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDef> {
@@ -263,6 +311,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     // vm functions.
     let mut fns = HashMap::new();
     let mut fn_decls = Vec::new();
+    let mut never_fns: Vec<NeverFn> = Vec::new();
     for f in &d.fns {
         let mut pt: Vec<Ty> = state_tys.iter().map(|t| Ty::Ptr(Box::new(t.clone()))).collect();
         for p in &f.params {
@@ -272,11 +321,35 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             Some(t) => c.resolve_type(m, t)?,
             None => Ty::Unit,
         };
-        let fid = new_fn(c, format!("{}.fn.{}", prefix, f.name.name), f.name.name.clone(), pt, r, CallConv::C, vm, VmRole::VmFn, f.name.span);
-        c.prog.fns[fid as usize].effects = crate::check::effects_of(&f.attrs)?;
-        if fns.insert(f.name.name.clone(), fid).is_some() {
+        if fns.contains_key(&f.name.name) || never_fns.iter().any(|n| n.decl.name.name == f.name.name) {
             return Err(Diag::new(f.name.span, format!("vm function `{}` defined twice", f.name.name)));
         }
+        if r == Ty::Never {
+            let inline = match f.attrs.get("inline") {
+                Some(a) => Some(a.first().map(|s| s.as_str()) != Some("never")),
+                None => None,
+            };
+            let shared = if dispatch == Dispatch::TailCall && inline != Some(true) {
+                let idx = never_fns.len() as u32;
+                let sym = format!("{}.fn.{}", prefix, f.name.name);
+                Some(new_fn(c, sym, f.name.name.clone(), state_tys.clone(), ret.clone(), cc, vm, VmRole::Shared(idx), f.name.span))
+            } else {
+                None
+            };
+            never_fns.push(NeverFn {
+                decl: f.clone(),
+                params: pt[state_tys.len()..].to_vec(),
+                shared,
+                inline,
+                uses_next: false,
+                calls: vec![],
+                no_op_calls: vec![],
+            });
+            continue;
+        }
+        let fid = new_fn(c, format!("{}.fn.{}", prefix, f.name.name), f.name.name.clone(), pt, r, CallConv::C, vm, VmRole::VmFn, f.name.span);
+        c.prog.fns[fid as usize].effects = crate::check::effects_of(&f.attrs)?;
+        fns.insert(f.name.name.clone(), fid);
         fn_decls.push((fid, f.clone()));
     }
     // Entries.
@@ -348,12 +421,16 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         ret: ret.clone(),
         raise_ty,
         fns,
+        never_fns,
         sync: d.sync.clone(),
     });
 
     // Bodies.
     for (fid, f) in fn_decls {
         check_vm_fn(c, vm, fid, &f)?;
+    }
+    for j in 0..c.vms[i].never_fns.len() {
+        check_never_fn(c, vm, j)?;
     }
     for k in 0..c.vms[i].ops.len() {
         check_handler(c, vm, k)?;
@@ -403,7 +480,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         }
         c.prog.vms[i].variants.push((var.name.name.clone(), wrappers));
     }
-    Ok(())
+    check_shared_next(c, i)
 }
 
 fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) -> Res<()> {
@@ -413,16 +490,7 @@ fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) 
     let mut cx = FnCx::new(m, info.ret.clone());
     let state = declare_state(c, vm, &mut cx);
     let opc = cx.declare("opcode", Ty::Int(IntTy::U32), false);
-    cx.vm = Some(HandlerCx {
-        vm,
-        is_handler: true,
-        allow_control: true,
-        op: Some(k),
-        part: None,
-        operands: vec![],
-        state: state.clone(),
-        by_ptr: false,
-    });
+    cx.vm = Some(HandlerCx { op: Some(k), ..HandlerCx::new(vm, state.clone()) });
     let b = c.block(&mut cx, before, Some(&Ty::Unit))?;
     let span = before.span;
     let body = mk(
@@ -446,6 +514,162 @@ fn declare_state(c: &Checker, vm: u32, cx: &mut FnCx) -> Vec<LocalId> {
     st.iter().map(|(n, t)| cx.declare(n, t.clone(), true)).collect()
 }
 
+/// The standalone body of `-> never` vm function `j`: its shared copy in
+/// tail-call mode, and in every mode the check that reports errors in
+/// functions nobody calls. Arguments arrive through thread-local slots.
+fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
+    let info = &c.vms[vm as usize];
+    let m = info.module;
+    let nf = &info.never_fns[j];
+    let decl = nf.decl.clone();
+    let params = nf.params.clone();
+    let shared = nf.shared;
+    let mut cx = FnCx::new(m, info.ret.clone());
+    cx.fn_name = decl.name.name.clone();
+    let state = declare_state(c, vm, &mut cx);
+    let span = decl.name.span;
+    let arg = |k: usize, t: &Ty| mk(t.clone(), TK::Vm(TVm::SharedArg(shared.unwrap_or(u32::MAX), k as u32)), span);
+    let size = cx.temp(Ty::i64());
+    cx.locals[size as usize].name = "next.size".into();
+    let mut lets = vec![TStmt::Let(size, Some(arg(params.len(), &Ty::i64())))];
+    cx.scopes.push(vec![]);
+    for (k, (p, t)) in decl.params.iter().zip(params.iter()).enumerate() {
+        let l = cx.declare(&p.name.name, t.clone(), true);
+        lets.push(TStmt::Let(l, Some(arg(k, t))));
+    }
+    cx.vm = Some(HandlerCx { in_fn: true, cold: true, shared: Some((j, size)), inlining: vec![j], ..HandlerCx::new(vm, state.clone()) });
+    let b = c.block(&mut cx, decl.body.as_ref().unwrap(), Some(&Ty::Never))?;
+    if b.ty != Ty::Never {
+        return Err(never_falloff(&decl));
+    }
+    if let Some(fid) = shared {
+        let body = mk(Ty::Never, TK::Block(lets, Some(Box::new(b))), span);
+        let fd = &mut c.prog.fns[fid as usize];
+        fd.params = state.clone();
+        fd.locals = cx.locals;
+        fd.body = Some(body);
+        fd.vm_state = state;
+    }
+    Ok(())
+}
+
+fn never_falloff(f: &FnDecl) -> Diag {
+    let span = f.body.as_ref().map(|b| b.span).unwrap_or(f.name.span);
+    Diag::new(
+        span,
+        format!("vm function `{}` returns `never` but can reach its end; every path must end in a control word", f.name.name),
+    )
+}
+
+/// Shared copies run `next` with the size their caller passes. Entries
+/// and `on raise` have no instruction to skip, so they may not reach a
+/// shared copy that uses `next`.
+fn check_shared_next(c: &Checker, vm: usize) -> Res<()> {
+    let nfs = &c.vms[vm].never_fns;
+    let mut uses: Vec<bool> = nfs.iter().map(|n| n.uses_next).collect();
+    loop {
+        let mut changed = false;
+        for (j, n) in nfs.iter().enumerate() {
+            if !uses[j] && n.calls.iter().any(|&q| uses[q]) {
+                uses[j] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for (j, n) in nfs.iter().enumerate() {
+        if let Some(&sp) = n.no_op_calls.first() {
+            if uses[j] {
+                return Err(Diag::new(
+                    sp,
+                    format!("`{}` uses `next`, which is only allowed in op handlers, but is called here outside one", n.decl.name.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn never_fn_index(c: &Checker, vm: u32, name: &str) -> Option<usize> {
+    c.vms[vm as usize].never_fns.iter().position(|n| n.decl.name.name == name)
+}
+
+/// A call of `-> never` vm function `j`: inline its body here, or (tail-call
+/// mode, cold or recursive call sites, `#[inline(never)]`) pass the
+/// arguments through thread-local slots and `musttail` to its shared copy.
+fn never_call(c: &mut Checker, cx: &mut FnCx, j: usize, args: &[Expr], span: Span) -> Res<TExpr> {
+    let h = cx.vm.clone().unwrap();
+    let vmi = h.vm as usize;
+    let nf = &c.vms[vmi].never_fns[j];
+    let name = nf.decl.name.name.clone();
+    if !h.allow_control {
+        return Err(Diag::new(
+            span,
+            format!("`{}` ends in a control word; call it from op handlers, entries, `on raise` or other `-> never` vm functions", name),
+        ));
+    }
+    let params = nf.params.clone();
+    let decl = nf.decl.clone();
+    if args.len() != params.len() {
+        return Err(Diag::new(span, format!("`{}` takes {} argument(s), got {}", name, params.len(), args.len())));
+    }
+    let recursive = h.inlining.contains(&j);
+    let share = nf.shared.is_some() && (nf.inline == Some(false) || h.cold || recursive);
+    let mut vals = Vec::new();
+    for (a, t) in args.iter().zip(params.iter()) {
+        vals.push(c.expr_coerce(cx, a, t)?);
+    }
+    if share {
+        let fid = c.vms[vmi].never_fns[j].shared.unwrap();
+        let int = |v: u32| mk(Ty::i64(), TK::Int(v as i128), span);
+        let size = match (h.part, h.op, h.shared) {
+            (Some((_, size)), _, _) => int(size),
+            (None, Some(op), _) => int(c.vms[vmi].ops[op].size),
+            (None, None, Some((caller, l))) => {
+                c.vms[vmi].never_fns[caller].calls.push(j);
+                mk(Ty::i64(), TK::Local(l), span)
+            }
+            (None, None, None) => {
+                c.vms[vmi].never_fns[j].no_op_calls.push(span);
+                int(0)
+            }
+        };
+        return Ok(mk(Ty::Never, TK::Vm(TVm::Shared(fid, vals, Box::new(size))), span));
+    }
+    if recursive {
+        return Err(Diag::new(
+            span,
+            format!("recursive call of `{}` cannot be inlined (`#[inline]` functions, and all of them under goto and switch dispatch, are inlined)", name),
+        ));
+    }
+    // The body sees the vm state and its parameters, nothing of the caller.
+    let info = &c.vms[vmi];
+    let state_scope: Vec<(String, LocalId)> = info.state.iter().map(|(n, _)| n.clone()).zip(h.state.iter().copied()).collect();
+    let saved_scopes = std::mem::replace(&mut cx.scopes, vec![state_scope, vec![]]);
+    let saved_loops = std::mem::take(&mut cx.loops);
+    let mut lets = Vec::new();
+    for ((p, t), v) in decl.params.iter().zip(params.iter()).zip(vals) {
+        let l = cx.declare(&p.name.name, t.clone(), true);
+        lets.push(TStmt::Let(l, Some(v)));
+    }
+    let mut h2 = h.clone();
+    h2.in_fn = true;
+    h2.operands.clear();
+    h2.inlining.push(j);
+    cx.vm = Some(h2);
+    let r = c.block(cx, decl.body.as_ref().unwrap(), Some(&Ty::Never));
+    cx.scopes = saved_scopes;
+    cx.loops = saved_loops;
+    cx.vm = Some(h);
+    let b = r?;
+    if b.ty != Ty::Never {
+        return Err(never_falloff(&decl));
+    }
+    Ok(mk(Ty::Never, TK::Block(lets, Some(Box::new(b))), span))
+}
+
 fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     let info = &c.vms[vm as usize];
     let m = info.module;
@@ -466,16 +690,7 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     for (p, t) in f.params.iter().zip(pts[st.len()..].iter()) {
         params.push(cx.declare(&p.name.name, t.clone(), true));
     }
-    cx.vm = Some(HandlerCx {
-        vm,
-        is_handler: false,
-        allow_control: false,
-        op: None,
-        part: None,
-        operands: vec![],
-        state: state.clone(),
-        by_ptr: true,
-    });
+    cx.vm = Some(HandlerCx { is_handler: false, allow_control: false, by_ptr: true, ..HandlerCx::new(vm, state.clone()) });
     let b = c.block(&mut cx, f.body.as_ref().unwrap(), Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let fd = &mut c.prog.fns[fid as usize];
@@ -518,14 +733,10 @@ fn check_handler(c: &mut Checker, vm: u32, k: usize) -> Res<()> {
             operands.push((pname.clone(), kinds[pi], raw));
         }
         cx.vm = Some(HandlerCx {
-            vm,
-            is_handler: true,
-            allow_control: true,
             op: Some(p),
             part: if j + 1 < n { Some((j as u32 + 1, size)) } else { None },
             operands,
-            state: state.clone(),
-            by_ptr: false,
+            ..HandlerCx::new(vm, state.clone())
         });
         let r = c.block(&mut cx, &body, Some(&Ty::Never));
         cx.scopes.pop();
@@ -567,16 +778,7 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
         params.push(cx.declare(&p.name.name, t.clone(), true));
     }
     let state = declare_state(c, vm, &mut cx);
-    cx.vm = Some(HandlerCx {
-        vm,
-        is_handler: false,
-        allow_control: true,
-        op: None,
-        part: None,
-        operands: vec![],
-        state: state.clone(),
-        by_ptr: false,
-    });
+    cx.vm = Some(HandlerCx { is_handler: false, ..HandlerCx::new(vm, state.clone()) });
     let b = c.block(&mut cx, &e.body, Some(&ret))?;
     let b = c.coerce(b, &ret)?;
     let mut inits: Vec<TStmt> = state.iter().map(|&s| TStmt::Let(s, None)).collect();
@@ -606,16 +808,7 @@ fn check_raise(c: &mut Checker, vm: u32, fid: FnId, r: &RaiseDecl) -> Res<()> {
     let mut cx = FnCx::new(m, info.ret.clone());
     let state = declare_state(c, vm, &mut cx);
     let err = cx.declare(&r.param.name.name, rt.clone(), true);
-    cx.vm = Some(HandlerCx {
-        vm,
-        is_handler: true,
-        allow_control: true,
-        op: None,
-        part: None,
-        operands: vec![],
-        state: state.clone(),
-        by_ptr: false,
-    });
+    cx.vm = Some(HandlerCx::new(vm, state.clone()));
     let b = c.block(&mut cx, &r.body, Some(&Ty::Never))?;
     if b.ty != Ty::Never {
         return Err(Diag::new(r.body.span, "`on raise` can reach its end; every path must end in a control word"));
@@ -636,7 +829,13 @@ fn check_raise(c: &mut Checker, vm: u32, fid: FnId, r: &RaiseDecl) -> Res<()> {
 
 pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
     if let VmExpr::Cold(b) = v {
-        let e = c.block(cx, b, exp)?;
+        let saved = cx.vm.clone();
+        if let Some(h) = cx.vm.as_mut() {
+            h.cold = true;
+        }
+        let e = c.block(cx, b, exp);
+        cx.vm = saved;
+        let e = e?;
         let t = e.ty.clone();
         return Ok(mk(t, TK::Vm(TVm::Cold(Box::new(e))), span));
     }
@@ -648,12 +847,20 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
     }
     let vmi = h.vm as usize;
     let pc_ty = c.vms[vmi].state[c.vms[vmi].pc_idx].1.clone();
-    let pc = || mk(pc_ty.clone(), TK::Local(h.state[c.vms[vmi].pc_idx]), span);
+    let pc_local = h.state[c.vms[vmi].pc_idx];
+    let pc = || mk(pc_ty.clone(), TK::Local(pc_local), span);
     let need_op = |what: &str| -> Res<usize> {
         h.op.ok_or_else(|| Diag::new(span, format!("`{}` is only allowed in op handlers", what)))
     };
     let never = |k: TVm| Ok(mk(Ty::Never, TK::Vm(k), span));
     match v {
+        VmExpr::Next if h.op.is_none() && h.shared.is_some() => {
+            let (j, size) = h.shared.unwrap();
+            c.vms[vmi].never_fns[j].uses_next = true;
+            let n = mk(Ty::i64(), TK::Local(size), span);
+            let target = mk(pc_ty.clone(), TK::Intrinsic(Intr::PtrOffset, vec![pc(), n]), span);
+            never(TVm::Jump(Box::new(target)))
+        }
         VmExpr::Next => {
             let op = need_op("next")?;
             if let Some((next_part, size)) = h.part {
@@ -665,7 +872,9 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
             never(TVm::Jump(Box::new(target)))
         }
         VmExpr::Redo => {
-            need_op("redo")?;
+            if h.shared.is_none() {
+                need_op("redo")?;
+            }
             never(TVm::Jump(Box::new(pc())))
         }
         VmExpr::Jump(t) => {
@@ -694,6 +903,9 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
             never(TVm::Raise(Box::new(e)))
         }
         VmExpr::Become(name) => {
+            if h.in_fn {
+                return Err(Diag::new(span, "`become` is not allowed in vm functions; it rewrites the calling instruction"));
+            }
             let op = need_op("become")?;
             let info = &c.vms[vmi];
             let Some(t) = info.ops.iter().position(|o| o.name == name.name && o.parts.is_empty()) else {
@@ -765,6 +977,9 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
         }
     }
     if bn == "cache" {
+        if h.in_fn {
+            return Err(Diag::new(base.span, "`cache` is not available in vm functions; pass the values as arguments"));
+        }
         let info = &c.vms[h.vm as usize];
         let Some(op) = h.op else {
             return Err(Diag::new(base.span, "`cache` is only available in op handlers"));
@@ -780,12 +995,22 @@ pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span:
     Ok(None)
 }
 
-pub fn vm_fn(c: &Checker, cx: &FnCx, name: &str) -> Option<FnId> {
+fn vm_fn(c: &Checker, cx: &FnCx, name: &str) -> Option<FnId> {
     let h = cx.vm.as_ref()?;
     c.vms[h.vm as usize].fns.get(name).copied()
 }
 
+/// Whether `name` is a vm function visible here.
+pub fn is_vm_fn(c: &Checker, cx: &FnCx, name: &str) -> bool {
+    vm_fn(c, cx, name).is_some() || cx.vm.as_ref().is_some_and(|h| never_fn_index(c, h.vm, name).is_some())
+}
+
 pub fn vm_fn_call(c: &mut Checker, cx: &mut FnCx, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
+    if let Some(h) = &cx.vm {
+        if let Some(j) = never_fn_index(c, h.vm, name) {
+            return never_call(c, cx, j, args, span).map(Some);
+        }
+    }
     let Some(fid) = vm_fn(c, cx, name) else { return Ok(None) };
     let h = cx.vm.clone().unwrap();
     let info = &c.vms[h.vm as usize];

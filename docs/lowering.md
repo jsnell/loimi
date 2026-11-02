@@ -162,6 +162,15 @@ Notes:
 `next` without writing code. Handlers that `jump`, or that may `become`,
 dispatch after their body.
 
+### `-> never` vm functions
+
+A call on a hot path inlines the function's body; its control words then
+lower like the caller's own. In tail-call mode, a call from a `cold` block
+stores the arguments and the caller's instruction size (for `next`) in
+thread-local slots (`@"Vm.fn.NAME.a0"`, ...) and makes a `musttail` call to
+`@"Vm.fn.NAME"`, which has the handler signature, so all cold callers share
+one copy and the state never leaves its registers.
+
 ## 4. Entry points
 
 ```llvm

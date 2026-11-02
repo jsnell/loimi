@@ -1370,8 +1370,8 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Return(v) => {
                 let ret = cx.ret.clone();
-                if cx.vm.as_ref().is_some_and(|h| h.is_handler) {
-                    return Err(Diag::new(span, "`return` is not allowed in a handler; use `next`, `jump` or `exit`"));
+                if cx.vm.as_ref().is_some_and(|h| h.is_handler || h.in_fn) {
+                    return Err(Diag::new(span, "`return` is not allowed in a handler or `-> never` vm function; use `next`, `jump` or `exit`"));
                 }
                 let v = match v {
                     Some(v) => Some(Box::new(self.expr_coerce(cx, v, &ret)?)),
@@ -2080,7 +2080,7 @@ impl<'a> Checker<'a> {
                     let idx = if name == "Ok" { 0 } else { 1 };
                     return self.make_variant(cx, &t.clone(), idx, args, span);
                 }
-                if self.scopes[cx.module].get(name).is_none() && crate::vmcheck::vm_fn(self, cx, name).is_none() {
+                if self.scopes[cx.module].get(name).is_none() && !crate::vmcheck::is_vm_fn(self, cx, name) {
                     if let Some(t) = exp {
                         if let Some(idx) = self.variant_index(t, name) {
                             return self.make_variant(cx, &t.clone(), idx, args, span);

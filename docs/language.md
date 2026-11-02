@@ -341,13 +341,44 @@ load overlaps with the handler's work.
 
 ### 3.5 VM functions
 
-A `fn` inside a `vm` block is a **vm function**. It can read and write state,
-is always inlined into its callers, and, if its return type is `never`, can
-use control words. That makes shared tails easy to write:
+A `fn` inside a `vm` block is a **vm function**. It can read and write state
+and is always inlined into its callers. If its return type is `never`, it
+can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
+`?` on the raise type. That makes shared tails easy to write:
 
 ```loimi
 fn call_closure(c: Gc<Closure>, base: *Value, nargs: u8) -> never { ...; jump c.proto.code_start() }
+
+// The word after a conditional op is a JMP holding the branch offset.
+fn branch() -> never { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+fn cond_branch(take: bool) -> never { if take { branch() } jump pc + 2 }
+op JLT(a: reg, b: reg) : ABC { cond_branch(a < b) }
 ```
+
+Rules for `-> never` vm functions:
+
+- Every path must end in a control word.
+- `next` and `redo` mean what they mean in the calling op: `next` skips the
+  caller's instruction (in a superinstruction part, it continues with the
+  next part). A function that uses `next` can only be reached from op
+  handlers, not from entries or `on raise`.
+- The body sees the vm state and its own parameters, but not the caller's
+  operands: pass `dst.raw` or values as arguments. `become` and `cache` are
+  not allowed, since they belong to the calling op.
+- They can only be called where control words are allowed: op handlers,
+  entries, `on raise`, and other `-> never` vm functions.
+
+How a call is compiled depends on the dispatch mode and on where it is:
+
+| | Call site on the hot path | Call site in a `cold` block, or recursive |
+|---|---|---|
+| `tailcall` | body inlined | `musttail` to one shared copy with the handler signature |
+| `goto`, `switch` | body inlined | body inlined (recursion is an error) |
+
+The shared copy is reached like an outlined cold block: the arguments, and
+the size `next` skips, go through thread-local slots, and the state stays
+in registers. `#[inline]` on the function inlines every call;
+`#[inline(never)]` makes every call in tail-call mode use the shared copy.
 
 ### 3.6 Entries and the error path
 

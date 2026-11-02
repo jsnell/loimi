@@ -1,0 +1,10 @@
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    #[inline(never)]
+    fn tail() -> never { next }
+    op NOP() : A { tail() }
+    entry run(c: *u32) -> i64 { pc = c; tail() }
+}
+fn main() {}
+// error: `tail` uses `next`, which is only allowed in op handlers

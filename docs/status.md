@@ -49,7 +49,11 @@ in [`language.md`](language.md). Updated 2026-11-02.
   cold blocks, and all cold blocks in goto/switch mode, stay inline and are
   marked unlikely.
 - **State kinds** (`Cursor`, `Window`, `StackTop`) are plain pointers.
-- **vm functions** can read and write state but cannot use control words.
+- **`-> never` vm functions** are inlined into each call site, except
+  that in tail-call mode, calls from `cold` blocks (and recursive calls)
+  `musttail` to one shared copy that receives its arguments through
+  thread-local slots. They cannot use `become`, `cache` or the caller's
+  operands.
 - **Effects** must be declared; they are not inferred for private functions.
   Function types carry them (`fn(*Heap) uses gc`), so calls through function
   pointers are checked, synced and rooted like direct calls. There are no
