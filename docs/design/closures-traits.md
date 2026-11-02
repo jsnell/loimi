@@ -604,3 +604,56 @@ generic function over `F` can take closures of any signature.
 - `Gc<closure fn>` to `block fn` (needs the object rooted for the
   duration of the call).
 - Closures as C callbacks (code + data pair in the header).
+
+### As built
+
+As designed above; the details:
+
+- **Checker** (`src/closures.rs`): `new(a, |..| ..)` is recognized before
+  the GC-only `new`, so it works without `import std.gc`. The literal is
+  checked by the same code as a `block fn` literal (own return type,
+  loops and effects; captures are the locals it uses that were declared
+  before it), then: `check_escaping_captures` rejects a captured
+  `block fn`, a traced capture in an untraced environment, an assignment
+  whose place is rooted in a captured local (`x`, `x.f`, `x[i]` on an
+  array; not through a pointer), also inside nested closures, and, in a
+  GC closure, `&` of a traced capture. The environment is a `StructDef`
+  generated per literal (`<symbol> env`): `{ caps.. }`, or for a GC
+  closure an `object` `{ code: *u8, caps.. }` with its own type id, so
+  `loimi_trace_object` traces it like any object. For an arena closure
+  the checker then type-checks the call `a.alloc_bytes(size, align)` as
+  an ordinary method call (so any allocator type works, and its effects
+  count). `TK::NewClosure(fn, caps, alloc)` carries it.
+- **Types**: `Ty::Closure(params, ret, effects)`; `Gc<closure fn>` is
+  `Ty::Gc(Ty::Closure)`, accepted wherever `Gc<T>` checks for an object.
+  `callee_sig` gives the signature a value is called with, used by
+  `finish_call`, field calls (`t.hook(x)`), `gcgen::push_frame` and
+  `vmcheck::wrap_effects`, so calls are checked, synced and rooted from
+  one place. Generic inference unifies `closure fn` types like `fn`
+  types, and a `new(a, |..| ..)` argument for a partly known
+  `closure fn` parameter is checked last against the partly known type.
+- **Codegen**: a `closure fn` is the LLVM `{ ptr, ptr }` (passed as one
+  aggregate, unlike `block fn`'s two scalars: it is stored far more
+  often than called through a specializable call site). Creation calls
+  the allocator (or `std.gc.alloc` with the closure object's type id),
+  stores the code pointer (GC only) and copies the captures. The closure
+  function gets `ptr %env` first and uses the environment struct's
+  fields as the captured locals' slots; a GC closure also stores
+  `%env` in a hidden traced local that is live for the whole body. Plain
+  `fn` to `closure fn` reuses the `block fn` trampolines.
+- **No change to existing code**: `fn` and `block fn` take the same
+  paths as before; the IR of `examples/mini`, `minijs` and `scheme` is
+  byte-identical before and after (default build, std paths normalized).
+- **Tests**: `tests/run/closures_escaping.lm` (fields, returns, `Vec`,
+  generic over the signature and over `F`, generics with bounded and
+  unbounded captures, composition, a generator, `closure fn` as
+  `block fn`, optional hooks, zero-capture closures not allocating),
+  `gc_closures_escaping.lm` (GC stress: captured lists reachable only
+  through the closure, a closure whose only reference is the call
+  running it, closures stored in objects and in a scanned `Vec`, nested
+  `block fn` over traced captures) and `_gen.lm` (the same on a
+  generational heap in verify mode), `vm_closure_call.lm` (handlers and
+  a vm function calling arena and GC closures, all dispatch modes);
+  `tests/fail/escaping_*.lm` for each error. Removing the body's root
+  of its environment, or the tracing of environment objects, makes the
+  GC test fail.

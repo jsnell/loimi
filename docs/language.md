@@ -47,6 +47,8 @@ Result<T, E>
 Gc<T>           // traced reference into the GC heap (section 8)
 fn(A, B) -> R   // function pointer; `fn(A) -> R uses gc` has effects (section 5)
 block fn(A) -> R  // non-escaping closure; only as a parameter type (section 1.2)
+closure fn(A) -> R      // escaping closure { code, env }, env from an allocator (section 1.2)
+Gc<closure fn(A) -> R>  // escaping closure in the GC heap
 ```
 
 Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
@@ -334,6 +336,80 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   indirect unless LLVM inlines or specializes the callee, which it does
   for a sort called with a closure literal: then the closure costs
   nothing (see `bench/README.md`).
+- **Escaping closures** (`closure fn`, `Gc<closure fn>`; built): closures
+  that can be stored, returned and kept in collections.
+
+  ```loimi
+  struct Builtin { name: str, call: closure fn(i64) -> i64 }
+
+  fn adder(a: *mem.Arena, k: i64) -> closure fn(i64) -> i64 {
+      new(a, |x| x + k)                       // environment in the arena
+  }
+  table.push(Builtin { name: "add7", call: adder(&arena, 7) });
+  table.push(Builtin { name: "double", call: double });   // a plain fn
+  v.sort_by(cfg.less);                        // closure fn -> block fn
+
+  object Hooks { on_value: ?Gc<closure fn(Value) uses gc> }
+  hooks.on_value = Some(new(heap, |v| log(out, v, tag)));  // in the GC heap
+  ```
+
+  - **Types.** `closure fn(A) -> R uses E` is a value of 16 bytes,
+    `{ code, env }`, that can go anywhere a value can (fields, locals,
+    globals, `Vec<..>`, `?..`, results, type arguments). Its environment
+    is host memory and is **not traced**. `Gc<closure fn(A) -> R uses E>`
+    is one traced word, a reference to a closure object `{ code,
+    captures.. }` in the GC heap, rooted, traced, write-barriered and
+    freed like any `Gc`. Plain `fn` types stay thin code pointers and
+    `block fn` stays as it was: neither changes representation.
+  - **Creation is an explicit allocation**: `new(a, |..| body)`. With
+    `a: *gc.Heap` the result is a `Gc<closure fn>`; with any other `a`,
+    the environment is one call of `a.alloc_bytes(size: u64, align: u64)
+    -> *u8` (`*mem.Arena` has it; so can your own allocator), and the
+    result is a `closure fn`. A closure that captures nothing allocates
+    nothing. Parameter and result types come from the expected type
+    (a `let` annotation, a field, a parameter, `Vec<closure fn(..)>.push`,
+    including generic ones: `map(xs, new(a, |x: i64| x * 2))` infers
+    `U`), or from annotations on the literal.
+  - **Captures are copies**, made when the closure is created, so the
+    closure may outlive the frame. Assigning a captured variable inside
+    the body (also from a nested `block fn` closure) is an error: the
+    closure has its own copy, and the write would not be seen outside.
+    State the closure updates lives behind a pointer it captures (a
+    generator's position, a counter). Capturing a `block fn` parameter
+    is an error (it only lives during its call).
+  - **GC.** Capturing a traced value (`Gc<T>`, a `value` type with
+    references, a struct holding one) is only allowed in
+    `new(heap, ..)`: the arena environment is invisible to the collector,
+    and the error says so. A GC closure's environment is an object type
+    generated per closure literal, so its captures are marked through it;
+    while its body runs, the closure roots its own environment. Its
+    traced captures cannot have their address taken (a store through the
+    pointer would miss the write barrier).
+  - **Effects** work as for `fn` and `block fn`: the body may only make
+    calls the type allows, calling has the type's effects (rooting and
+    handler `sync` included), and a closure converts to a type with more
+    effects.
+  - **Conversions**: a plain function converts to `closure fn` without
+    allocating (a per-signature trampoline, the function as environment),
+    so tables can mix both; `closure fn` converts to `block fn` for free.
+    `Gc<closure fn>` converts to neither (an untraced copy would not keep
+    it alive).
+  - **Freeing** belongs to the allocator: `arena.free()` frees every
+    environment in it; the GC frees GC closures. Calling a closure whose
+    arena was freed is a use-after-free that the compiler does not
+    detect (`--sanitize=address` does).
+  - **vm code** cannot create closures (as for `block fn`), but handlers
+    and vm functions can call stored ones, which are synced and rooted
+    per their effects like `fn` fields; vm functions may take
+    `closure fn` parameters. **C**: neither type crosses into C; pass a
+    plain `fn` and a data pointer, and wrap them on the Loimi side
+    (`new(&arena, |st| f(st, ud))`).
+
+  Lowering: the closure body is a function `R (ptr env, A..)`, like a
+  `block fn` literal's, reading its captures from the environment
+  struct; a call loads the code (from the pair, or the object's first
+  word) and passes the environment first. See
+  `design/closures-traits.md`, "Escaping closures".
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Operators**, from the tightest binding to the loosest:
@@ -1235,10 +1311,11 @@ struct Hooks {
   them (or be a handler or `cold` block, where the `sync` block runs
   first), and a `gc` call gets a shadow-stack frame for the traced locals
   in scope.
-- Closure types follow the same rules: `block fn(i64) uses gc` is called
+- Closure types follow the same rules: `block fn(i64) uses gc`,
+  `closure fn(i64) uses gc` and `Gc<closure fn(i64) uses gc>` are called
   like a `uses gc` function, a closure's body may only make the calls its
-  type allows, and a plain function or `block fn` converts to a `block fn`
-  type with more effects (section 1.2).
+  type allows, and a closure converts to the same kind of closure type
+  with more effects (section 1.2).
 - **Entries** carry the effects of the vm code they run. If any op,
   `on raise`, vm function, cold block or variant may collect (it makes
   a `uses gc` or `uses reenter` call), every entry of the vm declares
