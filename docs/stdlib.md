@@ -7,7 +7,7 @@ roughly in the order a request flows through an interpreter.
 
 Design rules for the library:
 
-- **Generated per VM where it helps.** Builders, disassemblers, and verifiers
+- **Generated per VM where it helps.** Encoders, disassemblers, and verifiers
   come from `vm` declarations. The library supplies the generic machinery they
   plug into.
 - **Arena-first.** Front-end data (tokens, AST, IR) lives in arenas and is

@@ -38,6 +38,7 @@ impl Parser {
                 loop_vars.extend(self.expand_inline_for(false)?);
                 continue;
             }
+            let mark = self.allow_mark();
             let item_attrs = self.parse_attrs()?;
             let kw = match self.peek() {
                 Tok::Ident(s) => s.clone(),
@@ -71,9 +72,27 @@ impl Parser {
                     let n = self.ident()?;
                     self.expect("=")?;
                     let body = self.parse_expr()?;
-                    let verify = if self.eat_kw("verify") { Some(self.parse_expr()?) } else { None };
+                    let mut verify = None;
+                    let mut display = None;
+                    loop {
+                        if verify.is_none() && self.eat_kw("verify") {
+                            verify = Some(self.parse_expr()?);
+                        } else if display.is_none() && self.eat_kw("display") {
+                            let t = self.bump();
+                            let Tok::Str(s) = t.tok else {
+                                return Err(Diag::new(t.span, "expected a string after `display`, like \"r{}\""));
+                            };
+                            let s = String::from_utf8_lossy(&s).into_owned();
+                            if s.matches("{}").count() != 1 {
+                                return Err(Diag::new(t.span, "a `display` string needs exactly one `{}`"));
+                            }
+                            display = Some(s);
+                        } else {
+                            break;
+                        }
+                    }
                     self.expect(";")?;
-                    vm.operands.push(OperandDecl { name: n, body, verify });
+                    vm.operands.push(OperandDecl { name: n, body, verify, display });
                 }
                 "encoding" => {
                     self.bump();
@@ -256,6 +275,7 @@ impl Parser {
                 }
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
+            self.close_allows(mark);
         }
         loop_vars.append(&mut self.vm_loop_vars);
         for v in &loop_vars {

@@ -12,8 +12,9 @@ are the point. Code samples are illustrative.
    goto, and `switch` are build options, not rewrites.
 3. **Declare, don't encode.** Instruction formats, value representations,
    object layouts, and inline caches are declarations. The compiler generates
-   the bit manipulation and also the tools that must agree with it: builder,
-   disassembler, verifier, tracer.
+   the bit manipulation and also the tools that must agree with it:
+   encoders, disassembler, verifier, peephole and deoptimization passes.
+   (A tracer is an instrumentation `variant`, section 9.)
 4. **Make the slow path explicit, cheap, and correct.** Slow paths are
    outlined so they don't hurt register allocation. Effects ensure the runtime
    always sees consistent VM state when it needs to.
@@ -132,6 +133,13 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   to try the later arms, or write `else {}` to say that falling out of the
   `match` is intended. Arms followed only by `_ => {}` do not warn, since
   falling out of the `match` is then the same as trying the rest.
+- **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
+  silences one on a match arm, an item (function, `vm`, ...) or a vm item
+  (`op`, `family`, vm function, entry), covering everything inside it;
+  `#![allow(name)]` at the top of a file covers the file. An unknown
+  name is an error. `loimi build -W error` (or `--deny-warnings`) turns
+  the warnings that remain into errors. The only lint so far is
+  `match_fallout`.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -437,7 +445,7 @@ encoding fixed(u32) {                 // every instruction is one u32 word
     format sJ   { op: 8, sj: s24 }
 }
 
-encoding bytes {                       // variable length, byte stream
+encoding bytes {                       // variable length (not yet implemented)
     format Z    { op: u8 }
     format U8   { op: u8, x: u8 }
     format U16  { op: u8, x: u16le }
@@ -447,13 +455,20 @@ encoding bytes {                       // variable length, byte stream
 An op lists its operands in field order and names its format. The compiler
 type-checks the mapping. From the declarations it **generates**:
 
-- the opcode enum and the per-op decoders, inlined into the handlers;
-- `Mini.Builder`: typed emit functions (`b.ADD(dst, a, b)`), labels with
-  backpatching, and branch range checks (`std.bc`, see stdlib);
-- `Mini.disasm`: a disassembler that prints operands through their kinds
-  (`r3`, `k[7] = "foo"`, `-> 0042`);
+- opcode constants (`Vm.OP_ADD`) and the per-op decoders, inlined into the
+  handlers;
+- encoders (`Vm.ADD(dst, a, b)` returns the word) and emitters
+  (`Vm.emit.ADD(code, at, dst, a, b)` stores it, zeroes the inline cache
+  and returns the next offset). Labels with backpatching and branch
+  range checks are in `std.bc`, a library over the generated `op_size`
+  and `set_label` (see stdlib); there is no generated `Builder` type;
+- a disassembler (below);
 - `Mini.verify` (section 6);
-- metadata tables (sizes, operand kinds, branch targets) for tools.
+- metadata for tools: `Vm.op_size(w)`, `Vm.op_name(w)`, `Vm.NUM_OPS`,
+  branch targets through `Vm.label(w)`. Per-op operand kinds are not
+  exposed yet;
+- `Vm.optimize(code)`, the superinstruction peephole (section 7.3), and
+  `Vm.deopt(code)` (section 7.2);
 - label and field helpers: `Vm.set_label(w, off) -> ?W` re-encodes the
   jump label of word `w` (its first operand whose kind is `pc + it`) and
   returns None if `off` does not fit the field or the op has no label;
@@ -465,6 +480,38 @@ type-checks the mapping. From the declarations it **generates**:
 
 The format declaration is the single source of truth for all of these, so they
 cannot drift apart.
+
+**Disassembler.** `Vm.disasm(code, &out)` prints every instruction of
+`code`, and `Vm.disasm_insn(code, i, &out) -> u64` prints the one at word
+`i` and returns its size in words (0 if `i` is past the end). `out` points
+to any type with `push_str(str)` and `push_int(i64)` methods (and
+`push_f64(f64)` if a cache has a float field), such as `text.StrBuf`: the
+two functions are generic over it, and cost nothing unless called. Each
+line is the word offset, the op name, and the operands by name with their
+decoded values, signed fields as signed:
+
+```
+    0  LOADK dst=r0 c=k3
+    1  LOADI_ADD
+    1    LOADI dst=r1 v=-7
+    2    ADD dst=r2 a=r0 b=r1
+    3  GETPROP dst=r3 obj=r2 [cache shape=null slot=0]
+    7  JMP target -> 1
+```
+
+- A label operand (kind `pc + it`) prints its absolute target: `target -> 1`.
+- An operand kind can say how its values print with `display`, a string
+  with one `{}` for the value (for a label, the target):
+  `operand reg = regs[it] verify it < proto.nregs display "r{}";`. Without
+  one, the number prints alone.
+- Inline cache words print as `[cache field=value ...]`: integers in
+  decimal, `bool`s, `f64`s, pointers in hex (`null` for 0).
+- A superinstruction prints its name, then each part on its own line at
+  its own offset (the head word with the first part's operands). The parts'
+  words are read as they are, so quickened parts show their current op.
+  `then` followers are ordinary instructions and print as such.
+- An invalid opcode prints as `<invalid 0x..>` (size 1); an instruction
+  that runs past the end of `code` prints its name and `<truncated>`.
 
 ### 3.4 Ops and control words
 
@@ -732,8 +779,10 @@ nothing extra unless the refill path actually runs.
 
 ## 6. Verification: unchecked by proof
 
-`Mini.verify(code, proto) -> Result<Verified<Mini>, VerifyError>` is generated
-from the declarations. It checks:
+`Mini.verify(code, proto) -> ?u64` is generated from the declarations. It
+returns None if the code is valid, or the index of the first bad word.
+(The design's `Result<Verified<Mini>, VerifyError>`, a type that `run`
+would demand, is not implemented yet; see below.) It checks:
 
 - every word decodes to a valid opcode and format;
 - every operand satisfies its kind's `verify` clause (register and constant
@@ -747,7 +796,8 @@ from the declarations. It checks:
 - `then OP`: the next instruction is an `OP` (or a member of its family);
 - for stack VMs, ops declare stack effects (`op ADD() stack(a, b -- r)`) and
   the verifier computes the maximum depth per function and checks consistency
-  at control-flow merges (like the JVM verifier, minus types);
+  at control-flow merges, like the JVM verifier minus types (*not yet
+  implemented*);
 - code can't fall off the end: it is not empty, and its last instruction
   cannot continue past itself. An op may continue if its handler uses
   `next` or reads `pc` (to save a return address like `pc + 1`), directly,
@@ -766,8 +816,10 @@ registers), that every function reachable by a call was verified, that
 operands without a `verify` clause (`imm`) are safe for every value, and
 that jumps to computed addresses (`jump fp.resume`) go to boundaries.
 
-`Mini.run` only accepts `Verified` code. As a result, operand accesses compile
-**without bounds checks**, and stack VMs check for overflow once per call
+In the design, `Mini.run` only accepts `Verified` code. *Not yet
+implemented:* there is no `Verified<V>` type, and `run` takes a raw code
+pointer, so calling `verify` first is up to the embedder. Operand
+accesses compile **without bounds checks**, and stack VMs check for overflow once per call
 (`max_stack` against the limit) instead of on every push. The checks don't
 disappear; they move from run time to load time. This matters for interpreters
 that load cached or untrusted bytecode files.
@@ -871,13 +923,16 @@ family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
 }
 ```
 
-The `generic` member is what the builder emits. Specialized members are only
-reached through `become`. The compiler can also generate a deopt helper that
-maps every member back to `generic`, for debuggers and for code serialization.
+The `generic` member is what the compiler emits. Specialized members are only
+reached through `become`. `Vm.deopt(code)` maps every member back to
+`generic`, for debuggers and for code serialization: it rewrites each
+instruction word to its family's generic op, splits superinstructions
+(the head becomes its first part's generic op) and zeroes inline caches,
+which gives the code the emitters produced.
 
 Rewrites are single-word stores. With multiple guest threads they need an
-atomic store, which the compiler emits when the vm is declared
-`#[threads(shared_code)]`.
+atomic store, which the compiler would emit when the vm is declared
+`#[threads(shared_code)]` (*not yet implemented*).
 
 ### 7.3 Superinstructions
 
@@ -917,8 +972,8 @@ With `fixed` encodings, the fused op **reuses the components' words**: the
 first word's opcode is rewritten to the super-op and the following words stay
 as they are, so the super-op reads operands from both words. A jump into the
 second word still runs the original second instruction, so fusion is always
-safe, needs no control-flow analysis, and can happen at build time (peephole
-in `Mini.Builder`) or at run time (quickening).
+safe, needs no control-flow analysis, and can happen at build time (the
+`Vm.optimize` peephole) or at run time (quickening).
 
 `Vm.optimize(code)` is the generated peephole pass. It compares words by
 the op they stand for alone (a super's head counts as its first part), so
@@ -938,8 +993,9 @@ dependency chain. It costs a compare and a branch that is predictable
 per site, so it pays off on latency-bound chains (`MUL; ADD` feeding a
 divide) and not on throughput-bound code.
 
-`loimi build --vm-stats` records opcode pair frequencies.
-`loimi vm suggest-supers` turns them into ranked `super` declarations.
+`loimi build --vm-stats` records opcode pair frequencies, and at exit
+prints the most frequent pairs as ranked `super` declarations. (The
+design's separate `loimi vm suggest-supers` command does not exist.)
 
 ---
 
@@ -971,11 +1027,13 @@ enough to make it precise and cheap:
   through the heap policy's barrier, which is a compile-time parameter
   (`#![heap = std.gc.MarkSweep]`). Non-incremental mark-sweep has no barrier,
   so stores cost nothing. A generational policy adds a card-mark at each such
-  store, and the source does not change.
+  store, and the source does not change. (*Not yet implemented:* `std.gc`
+  mark-sweep is the only policy, and there is no `heap` attribute.)
 - **Roots.** These come from three places: the VM stacks (described by the
   `state` kinds and the `ctx.sync` area), compiler-managed temporary roots at
   effectful calls (section 5), and explicit `Root<T>` handles for host data
-  structures.
+  structures. (As implemented: traced locals in shadow-stack frames, and
+  root scanners registered with `heap.add_scanner`; there is no `Root<T>`.)
 - **Moving is opt-in.** The default `MarkSweep` is non-moving and
   size-segregated, which keeps interior pointers into the stack and objects
   stable across handlers. A moving policy makes the compiler reload spilled
@@ -991,10 +1049,10 @@ system confines rooting to the slow paths that can actually collect.
 
 ```loimi
 variant count wraps all {
-    before { ctx.stats.ops[op.id] += 1; }
+    before { ctx.stats.ops[opcode] += 1; }
 }
 variant trace wraps all {
-    before { ctx.tracer.on_op(op.id, pc, regs) }      // uses sync
+    before { ctx.tracer.on_op(opcode, pc, regs) }     // uses sync
 }
 variant debug wraps all {
     before { if ctx.breakpoints.has(pc) { cold { ctx.debugger.stop()? } } }
@@ -1004,16 +1062,23 @@ variant line_hook wraps [JMP, JLT, JLE, JEQ, CALL, RETURN] { ... }
 
 Each variant generates a separate dispatch table of wrapper handlers, each
 wrapping the original handler. Switching is a single register update
-(`set_dispatch(Mini.tables.debug)`), and the new table takes effect at the next
-dispatch. **Normal execution pays nothing**: no flag check in any handler, and
+(`use_variant debug` in vm code, `use_variant default` to switch back), and
+the new table takes effect at the next dispatch. (The design's
+`set_dispatch(Mini.tables.debug)` from outside the vm is not implemented.) **Normal execution pays nothing**: no flag check in any handler, and
 no second copy of the interpreter to maintain. This is how debuggers, profilers,
 coverage, and `sys.settrace`-style hooks are implemented.
 
-The `count` variant also feeds `--vm-stats`, together with a pair counter.
+`loimi build --vm-stats` does not need a variant: it compiles op and
+op-pair counters into the handlers and prints them at exit.
 
 ---
 
 ## 10. Calls, reentrancy, coroutines
+
+*Design; not yet implemented:* `std.rt` (`FrameStack`, `Fiber`),
+`Mini.call`, and `suspend`. Today a vm's `entry` functions are ordinary
+internal Loimi functions (not C-ABI exports), and the example
+interpreters keep their own frame stacks in vm state.
 
 - **Guest-to-guest calls** should stay in the loop: push a frame (`std.rt.FrameStack`),
   slide the register window, and `jump`. This uses no C stack, so deep guest

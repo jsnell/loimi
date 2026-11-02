@@ -1,0 +1,21 @@
+// `-W error` makes warnings fail the build.
+// args: -W error
+// error: error[match_fallout]: this arm's body is an `if` without `else`
+// error: 1 warning treated as error (-W error)
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op SEL(dst: reg, a: reg) : ABC {
+        match a {
+            0 => if dst > 0 { dst = 1; next },
+            0 => { dst = 2; next }
+            _ => {}
+        }
+        next
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {}

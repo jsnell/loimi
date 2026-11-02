@@ -1,0 +1,14 @@
+// An op named like a generated vm item (`Vm.label`) is reported at the op.
+// error: `M.label` is generated twice: an op cannot be named like a generated vm item
+// error: vm_op_generated_name.lm:10:8
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand label = pc + it;
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op JMP(a: reg, t: label) : AB { jump t }
+    op label(a: reg) : AB { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {}

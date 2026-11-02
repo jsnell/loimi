@@ -100,6 +100,9 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         let Some((_, ffields)) = formats.iter().find(|(n, _)| *n == op.format.name) else {
             return Err(Diag::new(op.format.span, format!("unknown format `{}`", op.format.name)));
         };
+        if let Some(p) = op.params.iter().find(|p| p.name.name.starts_with("__")) {
+            return Err(Diag::new(p.name.span, "names starting with `__` are reserved for generated code"));
+        }
         let non_op: Vec<&(String, u32, u32, bool)> = ffields.iter().filter(|f| f.0 != "op").collect();
         if op.params.len() > non_op.len() {
             return Err(Diag::new(op.name.span, format!("format `{}` has only {} operand field(s)", op.format.name, non_op.len())));
@@ -563,13 +566,15 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         let _ = writeln!(s, "{vis}fn {n}__{}({}) -> {w} {{ {} }}", o.name, params.join(", "), enc);
         let args: Vec<String> = o.fields.iter().map(|f| f.0.clone()).collect();
         let size = l.size_src(n, i);
-        let mut body = format!("code[at] = {n}__{}({});", o.name, args.join(", "));
+        // The emitter's own parameters start with `__`, so that they
+        // cannot clash with operand names (`op SET(at: reg, code: imm)`).
+        let mut body = format!("__code[__at] = {n}__{}({});", o.name, args.join(", "));
         if o.cache.is_some() {
-            let _ = write!(body, " var __k: u64 = 1; while __k < {size} {{ code[at + __k] = 0; __k += 1; }}");
+            let _ = write!(body, " var __k: u64 = 1; while __k < {size} {{ __code[__at + __k] = 0; __k += 1; }}");
         }
-        let mut ps = vec![format!("code: []{w}"), "at: u64".to_string()];
+        let mut ps = vec![format!("__code: []{w}"), "__at: u64".to_string()];
         ps.extend(params);
-        let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} at + {} }}", o.name, ps.join(", "), body, size);
+        let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} __at + {} }}", o.name, ps.join(", "), body, size);
     }
     // Sizes and names.
     let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
@@ -624,6 +629,19 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         first = false;
     }
     let _ = writeln!(s, "    i += {n}__base_size(code[i]);\n  }}\n}}");
+    // Deoptimization: every instruction word back to its family's
+    // generic op, splitting supers (the head becomes its first part's
+    // generic; the parts' words are instructions of their own). Members of
+    // a family share format and cache, so sizes do not change. Inline
+    // caches are zeroed, as the emitters leave them.
+    let _ = writeln!(s, "{vis}fn {n}__deopt(__code: []{w}) {{");
+    let _ = writeln!(s, "  var __i: u64 = 0;\n  while __i < __code.len {{");
+    let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
+    let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
+    let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
+    let _ = writeln!(s, "    var __k: u64 = 1;");
+    let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
+    let _ = writeln!(s, "    __i += __size;\n  }}\n}}");
     s
 }
 
@@ -733,6 +751,248 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
     s
 }
 
+/// A string as a Loimi string literal.
+fn str_lit(s: &str) -> String {
+    let mut bytes = Vec::new();
+    for b in s.bytes() {
+        match b {
+            b'"' => bytes.extend_from_slice(b"\\\""),
+            b'\\' => bytes.extend_from_slice(b"\\\\"),
+            0x20..=0x7e | 0x80..=0xff => bytes.push(b),
+            _ => bytes.extend_from_slice(format!("\\x{:02x}", b).as_bytes()),
+        }
+    }
+    format!("\"{}\"", String::from_utf8_lossy(&bytes))
+}
+
+/// The disassembler:
+///
+/// - `Vm.disasm_insn(code, i, out) -> u64` prints the instruction at word
+///   `i` as one line (a superinstruction as a line with its name and one
+///   indented line per part) and returns its size in words, or 0 if `i`
+///   is past the end;
+/// - `Vm.disasm(code, out)` prints all instructions.
+///
+/// `out` is a pointer to any type with `push_str(str)` and `push_int(i64)`
+/// methods (and `push_f64(f64)` if a cache has a float field), such as
+/// `text.StrBuf`; the functions are generic over it, so a vm module need
+/// not import std.text.
+///
+/// A line is the word offset, the op name and the operands as
+/// `name=value`, decoded as handlers see them (signed fields signed).
+/// Label operands (`pc + it`) print the absolute target, `name -> 42`. An
+/// operand kind's `display "r{}"` formats the value (or target). Inline
+/// cache words print as `[cache field=value ...]`: integers in decimal,
+/// `bool`s, floats, and pointers in hex (`null` for 0). Invalid opcodes
+/// print as `<invalid 0x..>` (size 1), and an instruction that does not
+/// fit in the code as its name and `<truncated>`.
+fn generate_disasm(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let wb = l.word_bits / 8;
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    // Helpers: unsigned decimal, hex, padding, multi-word reads.
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__disasm_u64<B>(__out: *B, __x: u64) {{\n\
+         \x20 if __x > 9223372036854775807 {{ __out.push_int((__x / 10) as i64); __out.push_int((__x % 10) as i64); }}\n\
+         \x20 else {{ __out.push_int(__x as i64); }}\n}}"
+    );
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__disasm_hex<B>(__out: *B, __x: u64) {{\n\
+         \x20 let __digits = \"0123456789abcdef\";\n\
+         \x20 __out.push_str(\"0x\");\n\
+         \x20 var __sh: u64 = 64;\n\
+         \x20 var __started = false;\n\
+         \x20 while __sh > 0 {{\n\
+         \x20   __sh -= 4;\n\
+         \x20   let __d = (__x >> __sh) & 15;\n\
+         \x20   if __d != 0 or __started or __sh == 0 {{ __started = true; __out.push_str(__digits[__d..__d + 1]); }}\n\
+         \x20 }}\n}}"
+    );
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__disasm_offset<B>(__out: *B, __x: u64) {{\n\
+         \x20 var __width: u64 = 1;\n\
+         \x20 var __y = __x;\n\
+         \x20 while __y >= 10 {{ __y = __y / 10; __width += 1; }}\n\
+         \x20 while __width < 5 {{ __out.push_str(\" \"); __width += 1; }}\n\
+         \x20 {n}__disasm_u64(__out, __x);\n}}"
+    );
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__disasm_word(__code: []{w}, __j: u64, __n: u64) -> u64 {{\n\
+         \x20 var __r: u64 = 0;\n\
+         \x20 var __k: u64 = 0;\n\
+         \x20 while __k < __n and __k * {} < 64 {{ __r = __r | ((__code[__j + __k] as u64) << (__k * {})); __k += 1; }}\n\
+         \x20 __r\n}}",
+        l.word_bits,
+        l.word_bits
+    );
+    // One component op, at word `__at`: name, operands, cache.
+    let _ = writeln!(s, "{vis}fn {n}__disasm_op<B>(__code: []{w}, __at: u64, __out: *B) {{");
+    let _ = writeln!(s, "  let __w = __code[__at];");
+    let _ = writeln!(
+        s,
+        "  if {n}__opcode(__w) as u64 >= {n}__NUM_OPS {{ __out.push_str(\"<invalid \"); {n}__disasm_hex(__out, __w as u64); __out.push_str(\">\"); return; }}"
+    );
+    let _ = writeln!(s, "  __out.push_str({n}__op_name({n}__base_op(__w)));");
+    let _ = writeln!(
+        s,
+        "  if __at + {n}__base_size(__w) > __code.len {{ __out.push_str(\" <truncated>\"); return; }}"
+    );
+    let _ = writeln!(s, "  match {n}__base_op(__w) {{");
+    for o in &l.ops {
+        if !o.parts.is_empty() {
+            continue;
+        }
+        let mut body = String::new();
+        for (fi, (pname, bits, shift, signed)) in o.fields.iter().enumerate() {
+            let kind = &o.kinds[fi];
+            let decl = v.operands.iter().find(|k| k.name.name == *kind);
+            let (pre, post) = match decl.and_then(|k| k.display.as_ref()) {
+                Some(d) => {
+                    let (a, b) = d.split_once("{}").unwrap();
+                    (a.to_string(), b.to_string())
+                }
+                None => (String::new(), String::new()),
+            };
+            let label = is_label_kind(v, kind);
+            let _ = write!(body, "__out.push_str({}); ", str_lit(&format!(" {}{}{}", pname, if label { " -> " } else { "=" }, pre)));
+            let dec = decode_src(l.word_bits, *bits, *shift, *signed);
+            if label {
+                let _ = write!(body, "__out.push_int((__at as i64) + ({dec}) as i64); ");
+            } else if *signed {
+                let _ = write!(body, "__out.push_int({dec}); ");
+            } else {
+                let _ = write!(body, "{n}__disasm_u64(__out, {dec}); ");
+            }
+            if !post.is_empty() {
+                let _ = write!(body, "__out.push_str({}); ", str_lit(&post));
+            }
+        }
+        if let Some(c) = o.cache {
+            let _ = write!(body, "__out.push_str(\" [cache\"); var __j = __at + 1; ");
+            for (fname, t, _) in &v.caches[c].fields {
+                let ts = type_src(t);
+                let _ = write!(
+                    body,
+                    "{{ let __n = (size_of<{ts}>() + {})/{wb}; let __r = {n}__disasm_word(__code, __j, __n); __out.push_str({}); ",
+                    wb - 1,
+                    str_lit(&format!(" {}=", fname.name))
+                );
+                let _ = write!(body, "{} __j += __n; }} ", cache_value_src(n, t));
+            }
+            let _ = write!(body, "__out.push_str(\"]\"); ");
+        }
+        if !body.is_empty() {
+            let _ = writeln!(s, "    {} => {{ let __w = __code[__at]; {}}}", o.opcode, body);
+        }
+    }
+    let _ = writeln!(s, "    _ => {{}}\n  }}\n}}");
+    // One instruction, with its offset; superinstructions with their parts.
+    let _ = writeln!(s, "{vis}fn {n}__disasm_insn<B>(__code: []{w}, __i: u64, __out: *B) -> u64 {{");
+    let _ = writeln!(s, "  if __i >= __code.len {{ return 0; }}");
+    let _ = writeln!(s, "  let __w = __code[__i];");
+    let _ = writeln!(s, "  {n}__disasm_offset(__out, __i); __out.push_str(\"  \");");
+    let _ = writeln!(
+        s,
+        "  if {n}__opcode(__w) as u64 >= {n}__NUM_OPS {{ {n}__disasm_op(__code, __i, __out); __out.push_str(\"\\n\"); return 1; }}"
+    );
+    let _ = writeln!(s, "  let __size = {n}__op_size(__w);");
+    let _ = writeln!(
+        s,
+        "  if __i + __size > __code.len {{ __out.push_str({n}__op_name(__w)); __out.push_str(\" <truncated>\\n\"); return __code.len - __i; }}"
+    );
+    let _ = writeln!(s, "  match {n}__opcode(__w) {{");
+    for (k, o) in l.ops.iter().enumerate() {
+        if o.parts.is_empty() {
+            continue;
+        }
+        let mut body = format!("__out.push_str({}); ", str_lit(&o.name));
+        for (off, _) in l.part_offsets_src(n, k) {
+            let _ = write!(
+                body,
+                "__out.push_str(\"\\n\"); {n}__disasm_offset(__out, __i + {off}); __out.push_str(\"    \"); {n}__disasm_op(__code, __i + {off}, __out); "
+            );
+        }
+        let _ = writeln!(s, "    {} => {{ {}}}", o.opcode, body);
+    }
+    let _ = writeln!(s, "    _ => {n}__disasm_op(__code, __i, __out),\n  }}");
+    let _ = writeln!(s, "  __out.push_str(\"\\n\");\n  __size\n}}");
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__disasm<B>(__code: []{w}, __out: *B) {{\n\
+         \x20 var __i: u64 = 0;\n\
+         \x20 while __i < __code.len {{ __i += {n}__disasm_insn(__code, __i, __out); }}\n}}"
+    );
+    s
+}
+
+/// Source printing cache field value `__r` (the field's words, low word
+/// first) of type `t` to `__out`.
+fn cache_value_src(n: &str, t: &TypeExpr) -> String {
+    let int_bits = |name: &str| -> Option<(bool, u32)> {
+        let (signed, rest) = match name.as_bytes().first()? {
+            b'i' => (true, &name[1..]),
+            b'u' => (false, &name[1..]),
+            _ => return None,
+        };
+        let bits: u32 = rest.parse().ok()?;
+        (1..=64).contains(&bits).then_some((signed, bits))
+    };
+    match &t.kind {
+        TypeKind::Named(path, args) if path.len() == 1 && args.is_empty() => {
+            let name = path[0].name.as_str();
+            match (name, int_bits(name)) {
+                ("bool", _) => "if __r != 0 { __out.push_str(\"true\"); } else { __out.push_str(\"false\"); }".to_string(),
+                ("f64", _) => "__out.push_f64(f64.from_bits(__r));".to_string(),
+                (_, Some((true, bits))) => format!("__out.push_int(((__r << {}) as i64) >> {});", 64 - bits, 64 - bits),
+                (_, Some((false, 64))) => format!("{n}__disasm_u64(__out, __r);"),
+                (_, Some((false, bits))) => format!("{n}__disasm_u64(__out, __r & {});", (1u64 << bits) - 1),
+                ("f32", _) => format!("{n}__disasm_hex(__out, __r & 4294967295);"),
+                // Aliases and other named types: the raw words.
+                _ => format!("{n}__disasm_u64(__out, __r);"),
+            }
+        }
+        TypeKind::Ptr(_) | TypeKind::Option(_) | TypeKind::Fn(..) => {
+            format!("if __r == 0 {{ __out.push_str(\"null\"); }} else {{ {n}__disasm_hex(__out, __r); }}")
+        }
+        _ => format!("{n}__disasm_u64(__out, __r);"),
+    }
+}
+
+/// Generated items are named `Vm__X`: an op's encoder is `Vm__OP`, so an
+/// op named like another generated item (`label`, `verify`, `OP_ADD`,
+/// `emit_X`, a field reader `ABC_a`) would define it twice. Report that at
+/// the op rather than in the generated source.
+fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
+    let n = &v.name.name;
+    let mut seen = std::collections::HashSet::new();
+    for it in items {
+        let name = match it {
+            Item::Fn(f) => &f.name.name,
+            Item::Const(c) => &c.name.name,
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            let short = name.strip_prefix(&format!("{n}__")).unwrap_or(name);
+            let same: Vec<&OpDecl> = v.ops.iter().filter(|o| o.name.name == short).collect();
+            if same.len() > 1 {
+                return Err(Diag::new(same[1].name.span, format!("op `{short}` is declared twice")));
+            }
+            let span = same.first().map(|o| o.name.span).unwrap_or(v.name.span);
+            return Err(Diag::new(
+                span,
+                format!("`{n}.{short}` is generated twice: an op cannot be named like a generated vm item; rename the op"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
     for m in modules.iter_mut() {
@@ -743,6 +1003,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
                 let mut src = generate(v, &l);
                 src.push_str(&generate_verifier(sm, v, &l)?);
                 src.push_str(&generate_labels(v, &l));
+                src.push_str(&generate_disasm(v, &l));
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
                     eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
                 }
@@ -750,6 +1011,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);
                 let (items, _) = p.parse_module()?;
+                check_generated_names(v, &items)?;
                 extra.extend(items);
             }
         }

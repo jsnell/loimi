@@ -1,0 +1,29 @@
+// Operands may be named like the generated emitters' own parameters
+// (`code`, `at`): those are `__code` and `__at`.
+// matrix: dispatch
+import std.io;
+
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    cache C { hits: u32 }
+    encoding fixed(u32) { format AB { op: 8, at: 8, code: 16 } }
+    op SET(at: reg, code: imm) : AB { at = code as i64; next }
+    op BUMP(at: reg, code: imm) : AB + C { cache.hits = cache.hits + 1; at = at + code as i64 + cache.hits as i64; next }
+    op RET(at: reg, code: imm) : AB { exit at }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    at = M.emit.SET(code[..], at, 0, 40);
+    at = M.emit.BUMP(code[..], at, 0, 1);
+    at = M.emit.RET(code[..], at, 0, 0);
+    io.print_int(at as i64); io.println("");
+    var regs: [i64; 2] = [0; 2];
+    io.print_int(M.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 4
+// expect: 42

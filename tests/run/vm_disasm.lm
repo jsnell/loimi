@@ -1,0 +1,133 @@
+// The generated disassembler: `Vm.disasm(code, out)` and
+// `Vm.disasm_insn(code, i, out) -> size`. Operands print by name with
+// their decoded values (signed fields signed), labels as absolute
+// targets, `display` strings format operand kinds, inline caches print
+// their fields, superinstructions their parts, and invalid or truncated
+// code is marked.
+import std.io;
+import std.text;
+
+struct Shape { id: u32 }
+
+vm D {
+    state { pc: *u32, regs: *i64, k: *i64 }
+
+    operand reg = regs[it] display "r{}";
+    operand kst = k[it] display "k{}";
+    operand imm = it;
+    operand label = pc + it display "@{}";
+    operand rel = pc + it;
+
+    cache IC { shape: ?*Shape, slot: u32, delta: i16, hits: u64, ok: bool, w: f64 }
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op LOADK(dst: reg, c: kst) : AsBx { dst = c; next }
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op GET(dst: reg, a: reg) : ABC + IC { cache.hits = cache.hits + 1; dst = a; next }
+    op JMP(target: label) : sJ { jump target }
+    op JNZ(a: reg, target: rel) : AsBx { if a != 0 { jump target } next }
+    op LT(a: reg, b: reg) : ABC then JMP { if a < b { jump then.target } jump pc + 2 }
+    op RET(a: reg) : ABC { exit a }
+
+    super LOADI_ADD = LOADI; ADD;
+
+    entry run(code: *u32, r: *i64, ks: *i64) -> i64 { pc = code; regs = r; k = ks; jump pc }
+}
+
+fn main() {
+    var code: [u32; 32] = [0; 32];
+    var at: u64 = 0;
+    at = D.emit.LOADK(code[..], at, 0, 3);
+    at = D.emit.LOADI(code[..], at, 1, -7);
+    at = D.emit.ADD(code[..], at, 2, 0, 1);
+    let get = at;
+    at = D.emit.GET(code[..], at, 3, 2);
+    at = D.emit.LT(code[..], at, 0, 1);
+    at = D.emit.JMP(code[..], at, -9);
+    at = D.emit.JNZ(code[..], at, 3, 2);
+    at = D.emit.LOADI(code[..], at, 4, 5);
+    at = D.emit.ADD(code[..], at, 4, 4, 4);
+    at = D.emit.RET(code[..], at, 4);
+    D.optimize(code[..at]);
+    // Fill the cache: a pointer, a signed field, a two-word u64, a float.
+    var sh = Shape { id: 1 };
+    let p = (&sh) as u64;
+    code[get + 1] = p as u32;
+    code[get + 2] = (p >> 32) as u32;
+    code[get + 3] = 17;
+    code[get + 4] = 0xfffe;
+    code[get + 5] = 0;
+    code[get + 6] = 1;
+    code[get + 7] = 1;
+    let f = (2.5).to_bits();
+    code[get + 8] = f as u32;
+    code[get + 9] = (f >> 32) as u32;
+    var out = text.StrBuf.new();
+    D.disasm(code[..at], &out);
+    // The pointer differs per run: print the cache line's tail only.
+    let s = out.as_str();
+    var i: u64 = 0;
+    var line: u64 = 0;
+    var start: u64 = 0;
+    while i < s.len {
+        if s[i] == '\n' {
+            let l = s[start..i];
+            if text.starts_with(l[7..], "GET") {
+                // `    3  GET dst=r3 a=r2 [cache shape=0x... slot=17 ...]`
+                var j: u64 = 0;
+                while l[j] != 'x' { j += 1; }
+                io.print(l[..j]); io.print("..");
+                while l[j] != ' ' { j += 1; }
+                io.println(l[j..]);
+            } else {
+                io.println(l);
+            }
+            line += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    io.print_bool(p != 0); io.println("");
+    // One instruction at a time; sizes.
+    var b = text.StrBuf.new();
+    io.print_int(D.disasm_insn(code[..at], get, &b) as i64); io.println("");
+    io.print_int(D.disasm_insn(code[..at], 1, &b) as i64); io.println("");
+    io.print_int(D.disasm_insn(code[..at], at, &b) as i64); io.println("");
+    // Invalid opcode, truncated instruction, a nulled pointer.
+    b.clear();
+    code[0] = 0xff;
+    code[get + 1] = 0;
+    code[get + 2] = 0;
+    D.disasm(code[..get + 10], &b);
+    io.print_int(D.disasm_insn(code[..get + 3], get, &b) as i64); io.println("");
+    io.print(b.as_str());
+}
+// expect:     0  LOADK dst=r0 c=k3
+// expect:     1  LOADI_ADD
+// expect:     1    LOADI dst=r1 v=-7
+// expect:     2    ADD dst=r2 a=r0 b=r1
+// expect:     3  GET dst=r3 a=r2 [cache shape=0.. slot=17 delta=-2 hits=4294967296 ok=true w=2.5]
+// expect:    13  LT a=r0 b=r1
+// expect:    14  JMP target -> @5
+// expect:    15  JNZ a=r3 target -> 17
+// expect:    16  LOADI_ADD
+// expect:    16    LOADI dst=r4 v=5
+// expect:    17    ADD dst=r4 a=r4 b=r4
+// expect:    18  RET a=r4
+// expect: true
+// expect: 10
+// expect: 2
+// expect: 0
+// expect: 3
+// expect:     0  <invalid 0xff>
+// expect:     1  LOADI_ADD
+// expect:     1    LOADI dst=r1 v=-7
+// expect:     2    ADD dst=r2 a=r0 b=r1
+// expect:     3  GET dst=r3 a=r2 [cache shape=null slot=17 delta=-2 hits=4294967296 ok=true w=2.5]
+// expect:     3  GET <truncated>

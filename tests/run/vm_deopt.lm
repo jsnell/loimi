@@ -1,0 +1,57 @@
+// `Vm.deopt(code)` rewrites every instruction back to its family's
+// generic op and splits superinstructions, e.g. before serializing
+// quickened code. Shown with the disassembler.
+// matrix: dispatch
+import std.io;
+import std.text;
+
+vm Q {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it] display "r{}";
+    operand imm = it;
+    cache Hits { n: u32 }
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+
+    family ADD(dst: reg, v: imm) : AB + Hits {
+        generic { cache.n = cache.n + 1; dst = dst + v as i64; if v == 1 { become ADD_ONE } next }
+        ADD_ONE { cache.n = cache.n + 1; dst = dst + 1; next }
+    }
+    op LOAD(dst: reg, v: imm) : AB { dst = v as i64; next }
+    op RET(a: reg) : AB { exit a }
+
+    super LOAD_ADD = LOAD; ADD;
+    super LOAD_ADD_ONE = LOAD; ADD_ONE;
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    at = Q.emit.LOAD(code[..], at, 0, 41);
+    at = Q.emit.ADD(code[..], at, 0, 1);
+    at = Q.emit.ADD(code[..], at, 0, 2);
+    at = Q.emit.RET(code[..], at, 0);
+    Q.optimize(code[..at]);
+    var regs: [i64; 1] = [0];
+    io.print_int(Q.run(&code[0], &regs[0])); io.println("");
+    var b = text.StrBuf.new();
+    Q.disasm(code[..at], &b);
+    Q.deopt(code[..at]);
+    b.push_str("--\n");
+    Q.disasm(code[..at], &b);
+    io.print(b.as_str());
+    io.print_int(Q.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 44
+// expect:     0  LOAD_ADD_ONE
+// expect:     0    LOAD dst=r0 v=41
+// expect:     1    ADD_ONE dst=r0 v=1 [cache n=1]
+// expect:     3  ADD dst=r0 v=2 [cache n=1]
+// expect:     5  RET a=r0
+// expect: --
+// expect:     0  LOAD dst=r0 v=41
+// expect:     1  ADD dst=r0 v=1 [cache n=0]
+// expect:     3  ADD dst=r0 v=2 [cache n=0]
+// expect:     5  RET a=r0
+// expect: 44

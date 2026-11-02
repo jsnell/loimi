@@ -58,5 +58,5 @@ fn main() {
 // expect: 3.5
 // expect: 4
 // expect: nil
-// expect-stderr: warning: this arm's body is an `if` without `else`
+// expect-stderr: warning[match_fallout]: this arm's body is an `if` without `else`
 // expect-stderr: vm_match_guard.lm:39:33
