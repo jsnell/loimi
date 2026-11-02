@@ -75,6 +75,16 @@ pub fn returns_through_slot(p: &Program, f: &FnDef) -> bool {
     takes_insn(p, f) && indirect_ret(p, &p.vms[f.vm.unwrap() as usize])
 }
 
+/// For a nested entry (`entry e(..) uses reenter`): the thread-local
+/// `Vm.depth` it maintains, the number of nested runs active.
+pub fn depth_global(p: &Program, f: &FnDef) -> Option<String> {
+    if f.vm_role != VmRole::Entry || f.effects & EFF_REENTER == 0 {
+        return None;
+    }
+    let vd = &p.vms[f.vm? as usize];
+    Some(format!("@\"{}__depth\"", vd.symbol))
+}
+
 fn ret_slot(vd: &VmDef) -> String {
     format!("@\"{}.ret_slot\"", vd.symbol)
 }
@@ -564,9 +574,13 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
             let slot = shared_slot(g, *fid, *i as usize, &e.ty);
             g.load(&e.ty, &slot)
         }
-        TVm::Synced(sync, call) => {
+        TVm::Synced(sync, call, reload) => {
             g.val(sync);
-            g.val(call)
+            let r = g.val(call);
+            // After a call that may have run guest code: the stack may have
+            // moved and frames changed, so the state registers are reloaded.
+            g.val(reload);
+            r
         }
         TVm::Part(j, body) => {
             let l = part_label(g, *j);

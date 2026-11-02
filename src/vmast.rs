@@ -68,6 +68,9 @@ pub struct EntryDecl {
     pub params: Vec<Param>,
     pub ret: TypeExpr,
     pub body: Block,
+    /// `uses reenter`: a nested entry, which runs guest code above the
+    /// frames of a run that is already active (`language.md` §10).
+    pub effects: Attrs,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +104,9 @@ pub struct VmDecl {
     pub on_raise: Option<RaiseDecl>,
     pub variants: Vec<VariantDecl>,
     pub sync: Option<Block>,
+    /// `reload { .. }`: run after a call that may re-enter the vm, to
+    /// reload the state registers from wherever the vm keeps them.
+    pub reload: Option<Block>,
     /// Parameters of the generated verifier (`verify_context proto: Gc<Proto>;`).
     pub verify_ctx: Vec<Param>,
     pub is_pub: bool,

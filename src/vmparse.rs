@@ -27,6 +27,7 @@ impl Parser {
             on_raise: None,
             variants: vec![],
             sync: None,
+            reload: None,
             verify_ctx: vec![],
             is_pub,
         };
@@ -212,8 +213,18 @@ impl Parser {
                     self.expect(")")?;
                     self.expect("->")?;
                     let ret = self.parse_type()?;
+                    let mut effects = Attrs::default();
+                    if self.eat_kw("uses") {
+                        loop {
+                            let e = self.ident()?;
+                            effects.list.push(("uses".into(), vec![e.name], e.span));
+                            if !self.eat(",") {
+                                break;
+                            }
+                        }
+                    }
                     let body = self.vm_block()?;
-                    vm.entries.push(EntryDecl { name: n, params, ret, body });
+                    vm.entries.push(EntryDecl { name: n, params, ret, body, effects });
                 }
                 "on" => {
                     self.bump();
@@ -248,6 +259,13 @@ impl Parser {
                 "sync" => {
                     self.bump();
                     vm.sync = Some(self.vm_block()?);
+                }
+                "reload" => {
+                    self.bump();
+                    if vm.reload.is_some() {
+                        return self.err("a vm has at most one `reload` block");
+                    }
+                    vm.reload = Some(self.vm_block()?);
                 }
                 "variant" => {
                     self.bump();

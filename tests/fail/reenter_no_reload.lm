@@ -1,0 +1,18 @@
+// A handler call that may re-enter the vm needs a `reload` block: after
+// guest code ran, the cached state registers may be stale.
+struct Ctx { fp: u64 }
+
+fn callback(c: *Ctx) -> i64 uses reenter { 0 }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op CB(dst: reg) : ABC { cold { dst = callback(ctx); next } }
+    op RET(a: reg) : ABC { exit a }
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn main() {}
+// error: `callback` uses reenter: guest code may run during the call and move the stack or change frames, so vm `M` needs a `reload { .. }` block

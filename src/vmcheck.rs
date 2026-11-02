@@ -56,6 +56,8 @@ pub struct VmInfo {
     /// `-> never` vm functions, which may end in control words.
     pub never_fns: Vec<NeverFn>,
     pub sync: Option<Block>,
+    /// Run after a call that may re-enter the vm (`uses reenter`).
+    pub reload: Option<Block>,
     /// Calls between plain vm functions (caller, callee), to propagate
     /// `sync_effects`.
     pub fn_calls: Vec<(FnId, FnId)>,
@@ -475,6 +477,14 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             pt.push(c.resolve_type(m, &p.ty)?);
         }
         let fid = new_fn(c, format!("{}.{}", prefix, e.name.name), e.name.name.clone(), pt, ret.clone(), CallConv::C, vm, VmRole::Entry, e.name.span);
+        // `uses reenter`: a nested entry. Calling it runs guest code, so its
+        // callers need the effect (in vm code: sync before, reload after).
+        let eff = crate::check::effects_of(&e.effects)?;
+        if eff != 0 && eff != EFF_SYNC | EFF_GC | EFF_REENTER {
+            let span = e.effects.list[0].2;
+            return Err(Diag::new(span, "an entry can only declare `uses reenter` (it runs guest code)"));
+        }
+        c.prog.fns[fid as usize].effects = eff;
         let gname = Ident { name: format!("{}__{}", d.name.name, e.name.name), span: e.name.span };
         if c.scopes[m].contains_key(&gname.name) || c.values[m].contains_key(&gname.name) {
             return Err(Diag::new(e.name.span, format!("`{}` clashes with a generated vm item", e.name.name)));
@@ -539,6 +549,7 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         fn_caches,
         never_fns,
         sync: d.sync.clone(),
+        reload: d.reload.clone(),
         fn_calls: vec![],
     });
 
@@ -1477,8 +1488,24 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
                 Some(b) => c.block(cx, &b, Some(&Ty::Unit))?,
                 None => mk(Ty::Unit, TK::Unit, span),
             };
+            // Guest code may run in the call: the stack may move and frames
+            // change, so the state registers must be reloaded after it.
+            let reload = if missing & EFF_REENTER != 0 {
+                let Some(b) = c.vms[h.vm as usize].reload.clone() else {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "{} uses reenter: guest code may run during the call and move the stack or change frames, so vm `{}` needs a `reload {{ .. }}` block that reloads its state after the call",
+                            callee, c.vms[h.vm as usize].name
+                        ),
+                    ));
+                };
+                c.block(cx, &b, Some(&Ty::Unit))?
+            } else {
+                mk(Ty::Unit, TK::Unit, span)
+            };
             let t = call.ty.clone();
-            return Ok(mk(t, TK::Vm(TVm::Synced(Box::new(sync), Box::new(call))), span));
+            return Ok(mk(t, TK::Vm(TVm::Synced(Box::new(sync), Box::new(call), Box::new(reload))), span));
         }
         if h.allow_control {
             // Entries run before dispatch starts: nothing to sync yet.

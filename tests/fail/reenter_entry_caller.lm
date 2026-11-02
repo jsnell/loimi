@@ -1,0 +1,17 @@
+// A nested entry runs guest code: its callers need `uses reenter`.
+struct Ctx { x: i64 }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    reload { }
+    op RET(a: reg) : ABC { exit a }
+    entry call(c: *Ctx, code: *u32, r: *i64) -> i64 uses reenter { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn native(c: *Ctx, code: *u32, r: *i64) -> i64 { M.call(c, code, r) }
+
+fn main() {}
+// error: `call` uses reenter, but `native` does not declare it; add `uses reenter` to its signature

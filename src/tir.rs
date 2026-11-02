@@ -212,8 +212,10 @@ pub enum TVm {
     /// In a shared copy: argument `i` (the last one is the `next` size).
     SharedArg(FnId, u32),
     /// A call that may collect or observe vm state: run the vm's `sync`
-    /// block, keep traced locals visible to the GC, then call.
-    Synced(B, B),
+    /// block, keep traced locals visible to the GC, then call; for a call
+    /// that may re-enter the vm, run its `reload` block after the call
+    /// (the third part; `()` otherwise).
+    Synced(B, B, B),
 }
 
 #[derive(Clone, Debug)]

@@ -558,7 +558,23 @@ impl<'a, 'p> FnGen<'a, 'p> {
         out.push_str(&self.allocas);
         let _ = writeln!(out, "  br label %start");
         let _ = writeln!(out, "start:");
-        out.push_str(&self.body);
+        match crate::vmgen::depth_global(p, f) {
+            // A nested entry counts the runs active on this thread in
+            // `Vm.depth`: one more until it returns, by any path.
+            Some(d) if cold.is_none() => {
+                let _ = writeln!(out, "  %depth.saved = load i32, ptr {}", d);
+                let _ = writeln!(out, "  %depth.inc = add i32 %depth.saved, 1");
+                let _ = writeln!(out, "  store i32 %depth.inc, ptr {}", d);
+                for line in self.body.lines() {
+                    if line.starts_with("  ret ") {
+                        let _ = writeln!(out, "  store i32 %depth.saved, ptr {}", d);
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            _ => out.push_str(&self.body),
+        }
         let _ = writeln!(out, "}}\n");
         out
     }

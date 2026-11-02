@@ -1,0 +1,13 @@
+struct Ctx { x: i64 }
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op RET(a: reg) : ABC { exit a }
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 uses gc { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn main() {}
+// error: an entry can only declare `uses reenter`

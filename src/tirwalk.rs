@@ -99,9 +99,10 @@ pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
         }
         TK::Vm(v) => match v {
             TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
-            TVm::Synced(a, b) => {
+            TVm::Synced(a, b, c) => {
                 go(a);
                 go(b);
+                go(c);
             }
             TVm::Shared(_, args, size) => {
                 args.iter().for_each(|a| locals(a, used, declared));
@@ -312,9 +313,10 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
         }
         TK::Vm(v) => match v {
             TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a, f),
-            TVm::Synced(a, b) => {
+            TVm::Synced(a, b, c) => {
                 go(a, f);
                 go(b, f);
+                go(c, f);
             }
             TVm::Shared(_, args, size) => {
                 args.iter().for_each(|a| go(a, f));
@@ -392,9 +394,10 @@ pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
         }
         TK::Vm(v) => match v {
             TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
-            TVm::Synced(a, b) => {
+            TVm::Synced(a, b, c) => {
                 go(a);
                 go(b);
+                go(c);
             }
             TVm::Shared(_, args, size) => {
                 args.iter().for_each(&mut go);

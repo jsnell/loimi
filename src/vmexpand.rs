@@ -537,6 +537,11 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
     let mask = (1u64 << l.op_bits) - 1;
     let mut s = String::new();
     let vis = if v.is_pub { "pub " } else { "" };
+    if v.entries.iter().any(|e| e.effects.get("uses").is_some()) {
+        // Nested runs (entries declared `uses reenter`) active on this
+        // thread; each such entry adds one while it runs.
+        let _ = writeln!(s, "#[thread_local]\n{vis}var {n}__depth: u32 = 0;");
+    }
     let _ = writeln!(s, "{vis}fn {n}__opcode(w: {w}) -> {w} {{ (w >> {}) & {} }}", l.op_shift, mask);
     let _ = writeln!(
         s,
@@ -1012,6 +1017,7 @@ fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
         let name = match it {
             Item::Fn(f) => &f.name.name,
             Item::Const(c) => &c.name.name,
+            Item::Global(g) => &g.name.name,
             _ => continue,
         };
         if !seen.insert(name.clone()) {
