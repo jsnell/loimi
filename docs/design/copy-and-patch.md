@@ -928,7 +928,8 @@ more than a third of their time in stencils whose operands are all
 registers and constants; the rest is calls, table access, allocation
 and the runtime.
 
-**The one-register cache, built.** With `LOIMI_JIT_CACHE=1` at build
+**The one-register cache, built** (on branch `jit-regcache-experiment`,
+not merged into master). With `LOIMI_JIT_CACHE=1` at build
 time (Mini-shaped: it uses the operand kind named `reg` and the operand
 named `dst`):
 
@@ -991,4 +992,5 @@ metadata, which the shared-frame design (section 5) exists to avoid.
 Keep the JIT as it is, an opt-in tier at about 0.8 of the interpreter's
 time. If the speed matters later, start an optimizing tier over traces
 or loops, not more stencil variants. `LOIMI_JIT_REGDELAY` stays as a
-probe; the cache stays behind `LOIMI_JIT_CACHE` for reproduction.
+probe; the cache is kept on branch `jit-regcache-experiment` for
+reproduction.

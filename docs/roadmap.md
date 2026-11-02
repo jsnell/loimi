@@ -206,7 +206,7 @@ quickening on/off.
      (`LOIMI_JIT_REGDELAY`) projects at most 12% by geometric mean over
      the 14 benchmarks, much of it call arguments that a cache cannot
      hold. A one-register write-through cache with stencil variants
-     (`LOIMI_JIT_CACHE`) is correct but 1.5% slower by geometric mean
+     (kept on branch `jit-regcache-experiment`, not merged) is correct but 1.5% slower by geometric mean
      (mandelbrot 0.91).
    - *Recommendation: stop the template-JIT line.* Keep the JIT as it
      is, an opt-in tier at about 0.8 of the interpreter's time, with no
