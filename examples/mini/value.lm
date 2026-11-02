@@ -295,11 +295,27 @@ pub fn hash_set_existing(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
     }
 }
 
+/// The array index of an Int key `k`: its word minus the word of
+/// Int(1). Payloads are stored zero-extended below the tag, so this is
+/// i - 1 for i >= 1, and for i <= 0 it is beyond any array part (at
+/// least 2^31 - 1). Saves sign-extending the payload.
+pub fn int_index(k: V) -> u64 {
+    (k as u64) -% (V.Int(1) as u64)
+}
+
+/// Int words xor this are below 2^48 exactly for Ints (the tag cancels
+/// out), and as unsigned numbers they are ordered like the integers
+/// (the payload's sign bit is flipped). So two Ints are tested and
+/// compared without extracting their payloads.
+pub fn int_bias() -> u64 {
+    V.Int(-2147483648) as u64
+}
+
 pub fn table_get(t: Gc<Table>, k: V) -> V {
     var k = k;
     match k {
-        Int(i) => {
-            let u = ((i as i64) - 1) as u64;
+        Int(_) => {
+            let u = int_index(k);
             if u < t.asize { return t.aptr[u]; }
         }
         Num(x) => {
@@ -399,8 +415,8 @@ fn array_append(h: *gc.Heap, t: Gc<Table>, v: V) {
 /// Set a key (assigning nil removes it). `k` must not be nil or NaN.
 pub fn table_set(h: *gc.Heap, t: Gc<Table>, k: V, v: V) {
     let k = norm_key(k);
-    if let Int(i) = k {
-        let u = ((i as i64) - 1) as u64;
+    if let Int(_) = k {
+        let u = int_index(k);
         if u < t.asize { t.aptr[u] = v; return; }
         if u == t.asize and v != V.Nil { array_append(h, t, v); return; }
     }

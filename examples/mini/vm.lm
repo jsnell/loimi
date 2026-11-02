@@ -216,6 +216,13 @@ fn arith_mixed(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
     arith_slow(c, op, a, b)
 }
 
+/// Fuse superinstructions in a function again after one of its sites
+/// was quickened: fusion compares words by the op they stand for, so
+/// specialized members (MUL_F; ADD_F) fuse too.
+fn refuse(cl: Gc<Closure>) {
+    Mini.optimize(cl.proto.code);
+}
+
 /// The single dispatch point for natives. Natives allocate but never collect.
 fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
     lib.call(&c.heap, id, args, n)
@@ -367,8 +374,8 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { dst = tab.aptr[u]; next }
         }
         if let (T(tab), S(s)) = (t, key) { dst = value.hash_get_str(tab, key, s.hash); next }
@@ -376,8 +383,8 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; next }
         }
         if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
@@ -392,8 +399,8 @@ pub vm Mini {
     }
     /// t[key] = k[c] (a constant value).
     op SETINDEXK(t: reg, key: reg, v: kst) : ABC {
-        if let (T(tab), Int(i)) = (t, key) {
-            let u = ((i as i64) - 1) as u64;
+        if let (T(tab), Int(_)) = (t, key) {
+            let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; next }
         }
         if let T(tab) = t {
@@ -447,13 +454,13 @@ pub vm Mini {
             generic {
                 match (a, b) {
                     (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
-                    (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; next }
+                    (Num(x), Num(y)) => cold { dst = Num(x sym y); become #fname; refuse(fp.cl); next },
                     _ => {}
                 }
                 cold {
                     match (a, b) {
-                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; next }
-                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; refuse(fp.cl); next }
                         _ => {}
                     }
                     dst = arith_slow(ctx, code, a, b)?;
@@ -481,14 +488,14 @@ pub vm Mini {
                     let r = x as f64 sym unsafe { *((bbase + b.raw) as *f64) };
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; redo }
+                cold { become #fname; refuse(fp.cl); redo }
             }
             #finame {
                 if let Int(y) = b {
                     let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; redo }
+                cold { become #fname; refuse(fp.cl); redo }
             }
         }
     }
@@ -628,11 +635,9 @@ pub vm Mini {
     ] {
         inline for (opname, want) in [(name, true), (nname, false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
-                match (a, b) {
-                    (Int(x), Int(y)) => branch((isub) == want, then.target),
-                    (Num(x), Num(y)) => branch((fsub) == want, then.target),
-                    _ => {}
-                }
+                let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
+                if (x | y) < (1 << 48) { branch((isub) == want, then.target) }
+                if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }
         }
@@ -717,7 +722,9 @@ pub vm Mini {
     op FORLOOP(a: forbase, target: label) : AsBx {
         if let Int(c) = regs[a + 1] {
             if c != 0 {
-                regs[a + 1] = Int(c -% 1);
+                // The payload is not zero, so decrementing the word
+                // decrements it.
+                regs[a + 1] = ((regs[a + 1] as u64) - 1) as V;
                 let Int(i) = regs[a] else { unreachable };
                 let Int(s) = regs[a + 2] else { unreachable };
                 let n = V.Int(i +% s);
@@ -864,6 +871,20 @@ pub vm Mini {
     super MUL_F_ADD_F = MUL_F; ADD_F;
     super MUL_F_MUL_F = MUL_F; MUL_F;
     super ADD_F_MUL_F = ADD_F; MUL_F;
+    super MUL_F_SUB_F = MUL_F; SUB_F;
+    super SUB_F_MUL_F = SUB_F; MUL_F;
+    super ADD_F_SUB_F = ADD_F; SUB_F;
+    super SUB_F_ADD_F = SUB_F; ADD_F;
+    super MULK_F_MUL_F = MULK_F; MUL_F;
+    super ADD_F_JGTKN = ADD_F; JGTKN;
+    super MUL_MULK_IF = MUL; MULK_IF;
+    super MULK_IF_ADD_FI = MULK_IF; ADD_FI;
+    super ADD_FI_RDIVK = ADD_FI; RDIVK;
+    super RDIVK_RET1 = RDIVK; RET1;
+    super ADD_F_FORLOOP = ADD_F; FORLOOP;
+    super GETFIELD_MUL_F = GETFIELD; MUL_F;
+    super GETFIELD_SUB_F = GETFIELD; SUB_F;
+    super ADD_F_SETFIELD = ADD_F; SETFIELD;
     super MOVE_CALL = MOVE; CALL;
     super MOVE_MOVE = MOVE; MOVE;
     super MOVE_MOVE_CALL = MOVE; MOVE; CALL;
