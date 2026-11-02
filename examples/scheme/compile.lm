@@ -37,7 +37,8 @@ import vm.{Scheme};
 enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Letrec, And, Or }
 
 /// Ops for builtins compiled inline.
-enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset }
+enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
+    SymP, NumP, FixP, StrP, VecP }
 
 struct Var {
     name: Gc<Sym>,
@@ -246,6 +247,11 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("set-car!") { return Some((PO.SetCar, 2)); }
     if name.eq("set-cdr!") { return Some((PO.SetCdr, 2)); }
     if name.eq("vector-set!") { return Some((PO.Vset, 3)); }
+    if name.eq("symbol?") { return Some((PO.SymP, 1)); }
+    if name.eq("number?") { return Some((PO.NumP, 1)); }
+    if name.eq("exact-integer?") { return Some((PO.FixP, 1)); }
+    if name.eq("string?") { return Some((PO.StrP, 1)); }
+    if name.eq("vector?") { return Some((PO.VecP, 1)); }
     None
 }
 
@@ -304,6 +310,12 @@ fn Comp.build_inner(c: *Comp, x: V) -> *Node {
             }
             let n = c.node(K.Call);
             n.a = c.build(p.car);
+            // A builtin that the program never redefines is called directly.
+            if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
+                and let Some(id) = value.prim_of(c.ctx.gvals.at(n.a.g as u64))
+                and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+                n.a = c.konst(value.prim(id));
+            }
             var cur = p.cdr;
             while let P(q) = cur {
                 n.list.push(c.build(q.car));
@@ -1726,6 +1738,20 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         }
     }
     let base = if !tail and dst + 1 == g.top() { dst } else { g.alloc() };
+    if f.kind == K.Const and let Some(id) = value.prim_of(f.v)
+        and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+        for i in 0..nargs {
+            let r = g.alloc();
+            g.to(n.list.at(i), r);
+        }
+        g.emit(Scheme.PRIMCALL(base as u8, nargs as u8, id as u8));
+        if tail {
+            g.emit(Scheme.RET(base as u8));
+        } else if base != dst {
+            g.emit(Scheme.MOVE(dst as u8, base as u8));
+        }
+        return;
+    }
     g.to(f, base);
     for i in 0..nargs {
         let r = g.alloc();
@@ -1814,6 +1840,11 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
             Not => Scheme.NOT(d, a),
             NullP => Scheme.NULLP(d, a),
             PairP => Scheme.PAIRP(d, a),
+            SymP => Scheme.SYMBOLP(d, a),
+            NumP => Scheme.NUMBERP(d, a),
+            FixP => Scheme.FIXNUMP(d, a),
+            StrP => Scheme.STRINGP(d, a),
+            VecP => Scheme.VECTORP(d, a),
             Car => Scheme.CAR(d, a),
             _ => Scheme.CDR(d, a),
         };

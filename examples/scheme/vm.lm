@@ -281,6 +281,34 @@ pub vm Scheme {
         next
     }
 
+    // Type predicates.
+    op SYMBOLP(dst: reg, a: reg) : ABC {
+        if let Sym(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op NUMBERP(dst: reg, a: reg) : ABC {
+        match a {
+            Int(_) | Num(_) => { dst = Imm(value.IMM_TRUE); next }
+            _ => { dst = Imm(value.IMM_FALSE); next }
+        }
+    }
+    op FIXNUMP(dst: reg, a: reg) : ABC {
+        if let Int(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op STRINGP(dst: reg, a: reg) : ABC {
+        if let S(_) = a { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    op VECTORP(dst: reg, a: reg) : ABC {
+        if let Vec(x) = a and x.rtd == V.Imm(value.IMM_NIL) { dst = Imm(value.IMM_TRUE); next }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+
     op CAR(dst: reg, a: reg) : ABC {
         if let P(p) = a { dst = p.car; next }
         cold { raise rt.type_err(ctx, "car", "pair", a) }
@@ -433,6 +461,14 @@ pub vm Scheme {
             jump fp.resume
         }
         raise rt.err(ctx, "not a procedure", f)
+    }
+
+    /// R[base] = builtin `id` (R[base+1] .. R[base+nargs]): a call of a
+    /// builtin the program never redefines (not apply or call/cc).
+    op PRIMCALL(base: callbase, nargs: imm, id: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        regs[base] = builtins.call_native(ctx, id as i32, regs + base + 1, nargs as u64)?;
+        next
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).
