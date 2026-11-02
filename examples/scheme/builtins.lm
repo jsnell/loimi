@@ -24,7 +24,7 @@ extern "C" fn ceil(a: f64) -> f64;
 extern "C" fn trunc(a: f64) -> f64;
 extern "C" fn rint(a: f64) -> f64;
 extern "C" fn fmod(a: f64, b: f64) -> f64;
-extern "C" fn clock() -> i64;
+extern "C" fn gettimeofday(tv: *i64, tz: *u8) -> i32;
 extern "C" fn exp(x: f64) -> f64;
 extern "C" fn log(x: f64) -> f64;
 extern "C" fn sin(x: f64) -> f64;
@@ -34,7 +34,17 @@ extern "C" fn asin(x: f64) -> f64;
 extern "C" fn acos(x: f64) -> f64;
 extern "C" fn atan(x: f64) -> f64;
 extern "C" fn atan2(y: f64, x: f64) -> f64;
-extern "C" fn time(t: *u8) -> i64;
+
+/// Wall-clock time in microseconds.
+fn now_us() -> i64 {
+    var tv: [i64; 2];
+    gettimeofday(&tv[0], 0 as *u8);
+    tv[0] * 1000000 + tv[1]
+}
+
+/// The time of the first current-jiffy call (jiffies count from there, so
+/// they stay fixnums for half an hour).
+var JIFFY0: i64 = -1;
 extern "C" fn fdopen(fd: i32, mode: *u8) -> *u8;
 extern "C" fn fread(buf: *u8, size: u64, n: u64, f: *u8) -> u64;
 extern "C" fn malloc(n: u64) -> *u8;
@@ -854,9 +864,14 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         126 => Ok(read_stdin(c)),
         127 => Ok(value.unspec()),
         128 => { c.flush(); Ok(value.unspec()) }
-        129 => Ok(V.Num(time(0 as *u8) as f64)),
-        130 => Ok(V.Int((clock() / 1000) as i32)),
-        131 => Ok(V.Int(1000)),
+        129 => Ok(V.Num((now_us() as f64) / 1000000.0)),
+        130 => {
+            let t = now_us();
+            if JIFFY0 < 0 { JIFFY0 = t; }
+            let d = t - JIFFY0;
+            Ok(if d <= 2147483647 { V.Int(d as i32) } else { V.Num(d as f64) })
+        }
+        131 => Ok(V.Int(1000000)),
         133 => Ok(value.boolean(a == V.Imm(value.IMM_EOF))),
         134 => { if a == V.Int(0) { return Ok(V.Int(1)); } Ok(V.Num(exp(num_arg(c, name, a)?))) }
         135 => {
