@@ -1,0 +1,5 @@
+local t = {}
+t.ok = false
+assert(t.ok, "custom message")
+-- expect-stderr: error: line 3: custom message
+-- expect-exit: 1

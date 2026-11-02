@@ -1,0 +1,15 @@
+io.write("a", "b", 1, 2.5, "\n")
+io.write()
+io.write("no newline")
+io.write(" then ", 10, "\n")
+for i = 1, 5 do io.write(i, " ") end
+io.write("\n")
+io.write(1e15, " ", -0.0, " ", 1 / 0, "\n")
+print("after")
+io.write(string.format("%5.1f|\n", 3.14159))
+-- expect: ab12.5
+-- expect: no newline then 10
+-- expect: 1 2 3 4 5 
+-- expect: 1e+15 -0 inf
+-- expect: after
+-- expect:   3.1|

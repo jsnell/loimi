@@ -1,0 +1,6 @@
+-- %d needs an integral number
+print(string.format("%d", 2.0))
+print(string.format("%d", 2.5))
+-- expect: 2
+-- expect-stderr: error: line 3: bad argument #2 to 'format' (number has no integer representation)
+-- expect-exit: 1

@@ -1,0 +1,9 @@
+-- a library function given the wrong type of argument
+local t = {}
+table.insert(t, "a")
+table.insert(t, t)
+print(string.sub("abc", 2))
+print(table.concat(t))
+-- expect: bc
+-- expect-stderr: error: line 6: invalid value (table) at index 2 in table for 'concat'
+-- expect-exit: 1

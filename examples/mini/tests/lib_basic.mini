@@ -1,0 +1,33 @@
+-- type
+print(type(nil), type(true), type(1), type(1.5), type("s"), type({}), type(print), type(type))
+function f() end
+print(type(f), type(math), type(string.sub), type(type(1)))
+-- tonumber
+print(tonumber(10), tonumber(1.5), tonumber(-3))
+print(tonumber("10"), tonumber("  10  "), tonumber("-7"), tonumber("+7"))
+print(tonumber("0x10"), tonumber("0XfF"), tonumber("  0x1A\n"), tonumber("-0x10"))
+print(tonumber("1.5"), tonumber(" -2.5e3 "), tonumber(".5"), tonumber("5."), tonumber("1e2"))
+print(tonumber("3.0"), tonumber("\t1E-2\n"), tonumber("0x1p4"), tonumber("0x.8"))
+print(tonumber(""), tonumber("  "), tonumber("abc"), tonumber("10a"), tonumber("1 2"))
+print(tonumber("inf"), tonumber("nan"), tonumber("0x"), tonumber("1e"), tonumber("--1"))
+print(tonumber(nil), tonumber(true), tonumber({}), tonumber("- 1"), tonumber("0x-1"))
+print(tonumber("2147483647"), tonumber("-2147483648"))
+print(tonumber("10") + 1, tonumber("1.5") * 2)
+-- assert returns its argument
+print(assert(1), assert("ok", "msg"), assert(0), assert(true))
+local t = {}
+print(assert(t) == t)
+-- expect: nil	boolean	number	number	string	table	function	function
+-- expect: function	table	function	string
+-- expect: 10	1.5	-3
+-- expect: 10	10	-7	7
+-- expect: 16	255	26	-16
+-- expect: 1.5	-2500.0	0.5	5.0	100.0
+-- expect: 3.0	0.01	16.0	0.5
+-- expect: nil	nil	nil	nil	nil
+-- expect: nil	nil	nil	nil	nil
+-- expect: nil	nil	nil	nil	nil
+-- expect: 2147483647	-2147483648
+-- expect: 11	3.0
+-- expect: 1	ok	0	true
+-- expect: true

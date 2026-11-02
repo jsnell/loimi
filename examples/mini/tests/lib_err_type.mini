@@ -1,0 +1,6 @@
+local n = nil
+print(math.floor(2.5))
+print(string.len(n))
+-- expect: 2
+-- expect-stderr: error: line 3: bad argument #1 to 'len' (string expected, got nil)
+-- expect-exit: 1

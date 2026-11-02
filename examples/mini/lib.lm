@@ -1,0 +1,736 @@
+// The Mini standard library (SPEC §5): basic functions and the math,
+// string, table and io tables.
+//
+// Every library function is a `V.Native(id)`; the VM calls `call` with the
+// id and the arguments. Natives allocate but never collect, so they need
+// no rooting.
+//
+// Output from print and io.write goes through C stdio's stdout buffer
+// (a static buffer, flushed when full); `flush` writes out what is left.
+
+import std.gc;
+import std.mem;
+import std.hash;
+import std.text;
+import value;
+import value.{V, Str, Table};
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+extern "C" fn printf(fmt: *u8, ...) -> i32;
+extern "C" fn putchar(c: i32) -> i32;
+extern "C" fn fflush(f: *u8) -> i32;
+extern "C" fn memchr(p: *u8, c: i32, n: u64) -> *u8;
+extern "C" fn strtod(s: *u8, end: **u8) -> f64;
+extern "C" fn ceil(x: f64) -> f64;
+extern "C" fn fabs(x: f64) -> f64;
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+
+// Native ids. `call` dispatches on the same numbers.
+const PRINT: i32 = 0;
+const TOSTRING: i32 = 1;
+const TONUMBER: i32 = 2;
+const TYPE: i32 = 3;
+const ASSERT: i32 = 4;
+const ERROR: i32 = 5;
+const M_FLOOR: i32 = 10;
+const M_CEIL: i32 = 11;
+const M_ABS: i32 = 12;
+const M_SQRT: i32 = 13;
+const M_SIN: i32 = 14;
+const M_COS: i32 = 15;
+const M_EXP: i32 = 16;
+const M_LOG: i32 = 17;
+const M_MAX: i32 = 18;
+const M_MIN: i32 = 19;
+const S_LEN: i32 = 20;
+const S_SUB: i32 = 21;
+const S_BYTE: i32 = 22;
+const S_CHAR: i32 = 23;
+const S_REP: i32 = 24;
+const S_FORMAT: i32 = 25;
+const T_INSERT: i32 = 30;
+const T_REMOVE: i32 = 31;
+const T_CONCAT: i32 = 32;
+const IO_WRITE: i32 = 40;
+
+// ---------------------------------------------------------------------------
+// Installation
+
+fn set(h: *gc.Heap, t: Gc<Table>, name: str, v: V) {
+    let k = V.S(value.new_str(h, name));
+    value.table_set(h, t, k, v);
+}
+
+/// Create every library global in `globals`.
+pub fn install(h: *gc.Heap, globals: Gc<Table>) {
+    set(h, globals, "print", V.Native(PRINT));
+    set(h, globals, "tostring", V.Native(TOSTRING));
+    set(h, globals, "tonumber", V.Native(TONUMBER));
+    set(h, globals, "type", V.Native(TYPE));
+    set(h, globals, "assert", V.Native(ASSERT));
+    set(h, globals, "error", V.Native(ERROR));
+
+    let m = value.new_table(h);
+    set(h, m, "floor", V.Native(M_FLOOR));
+    set(h, m, "ceil", V.Native(M_CEIL));
+    set(h, m, "abs", V.Native(M_ABS));
+    set(h, m, "sqrt", V.Native(M_SQRT));
+    set(h, m, "sin", V.Native(M_SIN));
+    set(h, m, "cos", V.Native(M_COS));
+    set(h, m, "exp", V.Native(M_EXP));
+    set(h, m, "log", V.Native(M_LOG));
+    set(h, m, "max", V.Native(M_MAX));
+    set(h, m, "min", V.Native(M_MIN));
+    let one = 1.0;
+    let zero = 0.0;
+    set(h, m, "huge", V.Num(one / zero));
+    set(h, m, "pi", V.Num(3.141592653589793));
+    set(h, globals, "math", V.T(m));
+
+    let s = value.new_table(h);
+    set(h, s, "len", V.Native(S_LEN));
+    set(h, s, "sub", V.Native(S_SUB));
+    set(h, s, "byte", V.Native(S_BYTE));
+    set(h, s, "char", V.Native(S_CHAR));
+    set(h, s, "rep", V.Native(S_REP));
+    set(h, s, "format", V.Native(S_FORMAT));
+    set(h, globals, "string", V.T(s));
+
+    let t = value.new_table(h);
+    set(h, t, "insert", V.Native(T_INSERT));
+    set(h, t, "remove", V.Native(T_REMOVE));
+    set(h, t, "concat", V.Native(T_CONCAT));
+    set(h, globals, "table", V.T(t));
+
+    let io = value.new_table(h);
+    set(h, io, "write", V.Native(IO_WRITE));
+    set(h, globals, "io", V.T(io));
+}
+
+/// Run native `id` on `args[0..n]`. Ok is the single result; Err is the
+/// error value.
+pub fn call(h: *gc.Heap, id: i32, args: *V, n: u64) -> Result<V, V> {
+    match id {
+        0 => lib_print(h, args, n),
+        1 => lib_tostring(h, args, n),
+        2 => lib_tonumber(h, args, n),
+        3 => lib_type(h, args, n),
+        4 => lib_assert(h, args, n),
+        5 => Err(arg(args, n, 0)),
+        10 => math_round(h, args, n, "floor", false),
+        11 => math_round(h, args, n, "ceil", true),
+        12 => math_abs(h, args, n),
+        13 => math_f(h, args, n, "sqrt", 0),
+        14 => math_f(h, args, n, "sin", 1),
+        15 => math_f(h, args, n, "cos", 2),
+        16 => math_f(h, args, n, "exp", 3),
+        17 => math_f(h, args, n, "log", 4),
+        18 => math_minmax(h, args, n, "max", true),
+        19 => math_minmax(h, args, n, "min", false),
+        20 => str_len(h, args, n),
+        21 => str_sub(h, args, n),
+        22 => str_byte(h, args, n),
+        23 => str_char(h, args, n),
+        24 => str_rep(h, args, n),
+        25 => str_format(h, args, n),
+        30 => tab_insert(h, args, n),
+        31 => tab_remove(h, args, n),
+        32 => tab_concat(h, args, n),
+        40 => io_write(h, args, n),
+        _ => Err(V.S(value.new_str(h, "unknown builtin"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output
+
+/// Write bytes to the buffered stdout.
+fn out(s: str) {
+    var p = s.ptr;
+    var left = s.len;
+    while left > 0 {
+        // printf's %.*s stops at a NUL byte, so write those separately.
+        let z = memchr(p, 0, left);
+        let run = if (z as u64) == 0 { left } else { (z as u64) - (p as u64) };
+        var done: u64 = 0;
+        while done < run {
+            let max: u64 = 1 << 30;
+            let chunk = if run - done > max { max } else { run - done };
+            printf("%.*s\0".ptr, chunk as i32, p + done);
+            done += chunk;
+        }
+        p = p + run;
+        left -= run;
+        if left > 0 {
+            putchar(0);
+            p = p + 1;
+            left -= 1;
+        }
+    }
+}
+
+/// Write `v` converted as by tostring.
+fn out_value(v: V) {
+    match v {
+        S(s) => out(s.data),
+        Int(i) => { printf("%d\0".ptr, i); }
+        _ => {
+            var b = text.StrBuf.new();
+            value.write_value(&b, v);
+            out(b.as_str());
+            b.free();
+        }
+    }
+}
+
+/// Flush buffered output. Call at exit and before writing to stderr.
+pub fn flush() {
+    fflush(0 as *u8);
+}
+
+// ---------------------------------------------------------------------------
+// Argument checking and errors
+
+fn arg(args: *V, n: u64, i: u64) -> V {
+    if i < n { args[i] } else { V.Nil }
+}
+
+fn take_str(h: *gc.Heap, b: *text.StrBuf) -> V {
+    let v = V.S(value.new_str(h, b.as_str()));
+    b.free();
+    v
+}
+
+/// "bad argument #<i+1> to '<fname>' (<msg>)"
+fn bad_arg(h: *gc.Heap, i: u64, fname: str, msg: str) -> V {
+    var b = text.StrBuf.new();
+    b.push_str("bad argument #");
+    b.push_int((i + 1) as i64);
+    b.push_str(" to '");
+    b.push_str(fname);
+    b.push_str("' (");
+    b.push_str(msg);
+    b.push_str(")");
+    take_str(h, &b)
+}
+
+/// "bad argument #<i+1> to '<fname>' (<expected> expected, got <type>)"
+fn type_error(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str, expected: str) -> V {
+    var m = text.StrBuf.new();
+    m.push_str(expected);
+    m.push_str(" expected, got ");
+    m.push_str(if i < n { value.type_name(args[i]) } else { "no value" });
+    let v = bad_arg(h, i, fname, m.as_str());
+    m.free();
+    v
+}
+
+fn check_any(h: *gc.Heap, n: u64, i: u64, fname: str) -> Result<(), V> {
+    if i >= n { return Err(bad_arg(h, i, fname, "value expected")); }
+    Ok(())
+}
+
+fn check_num(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str) -> Result<f64, V> {
+    match arg(args, n, i) {
+        Int(x) => Ok(x as f64),
+        Num(x) => Ok(x),
+        _ => Err(type_error(h, args, n, i, fname, "number")),
+    }
+}
+
+/// A float with an exact i64 value.
+fn float_to_i64(x: f64) -> ?i64 {
+    if x == x.floor() and x >= -9223372036854775808.0 and x < 9223372036854775808.0 {
+        Some(x as i64)
+    } else {
+        None
+    }
+}
+
+fn check_int(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str) -> Result<i64, V> {
+    match arg(args, n, i) {
+        Int(x) => Ok(x as i64),
+        Num(x) => {
+            let Some(r) = float_to_i64(x) else {
+                return Err(bad_arg(h, i, fname, "number has no integer representation"));
+            };
+            Ok(r)
+        }
+        _ => Err(type_error(h, args, n, i, fname, "number")),
+    }
+}
+
+fn opt_int(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str, def: i64) -> Result<i64, V> {
+    if arg(args, n, i) == V.Nil { return Ok(def); }
+    check_int(h, args, n, i, fname)
+}
+
+/// A string argument; numbers are converted as by tostring.
+fn check_str(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str) -> Result<Gc<Str>, V> {
+    let v = arg(args, n, i);
+    match v {
+        S(s) => Ok(s),
+        Int(_) | Num(_) => Ok(to_str(h, v)),
+        _ => Err(type_error(h, args, n, i, fname, "string")),
+    }
+}
+
+fn check_table(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str) -> Result<Gc<Table>, V> {
+    if let T(t) = arg(args, n, i) { return Ok(t); }
+    Err(type_error(h, args, n, i, fname, "table"))
+}
+
+/// `v` converted as by tostring.
+fn to_str(h: *gc.Heap, v: V) -> Gc<Str> {
+    if let S(s) = v { return s; }
+    var b = text.StrBuf.new();
+    value.write_value(&b, v);
+    let s = value.new_str(h, b.as_str());
+    b.free();
+    s
+}
+
+/// An Int if `x` fits Mini's integer range, else a float.
+fn int_or_float(x: i64) -> V {
+    if x >= -2147483648 and x <= 2147483647 { V.Int(x as i32) } else { V.Num(x as f64) }
+}
+
+fn key(i: i64) -> V { int_or_float(i) }
+
+// ---------------------------------------------------------------------------
+// Basic functions
+
+fn lib_print(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let _ = h;
+    for i in 0..n {
+        if i > 0 { putchar('\t' as i32); }
+        out_value(args[i]);
+    }
+    putchar('\n' as i32);
+    Ok(V.Nil)
+}
+
+fn lib_tostring(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    check_any(h, n, 0, "tostring")?;
+    Ok(V.S(to_str(h, args[0])))
+}
+
+fn is_lua_space(c: u8) -> bool {
+    c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+}
+
+fn hex_digit(c: u8) -> ?u64 {
+    if c >= '0' and c <= '9' { return Some((c - '0') as u64); }
+    if c >= 'a' and c <= 'f' { return Some((c - 'a') as u64 + 10); }
+    if c >= 'A' and c <= 'F' { return Some((c - 'A') as u64 + 10); }
+    None
+}
+
+/// A Lua integer numeral: optional sign, then decimal digits or 0x and hex
+/// digits. Hex wraps around; a decimal overflow gives None (a float).
+fn parse_int_numeral(s: str) -> ?i64 {
+    var i: u64 = 0;
+    let neg = s[0] == '-';
+    if neg or s[0] == '+' { i = 1; }
+    var a: u64 = 0;
+    var digits: u64 = 0;
+    if i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X') {
+        i += 2;
+        while i < s.len {
+            let Some(d) = hex_digit(s[i]) else { return None; };
+            a = (a *% 16) +% d;
+            digits += 1;
+            i += 1;
+        }
+    } else {
+        while i < s.len {
+            let c = s[i];
+            if !text.is_digit(c) { return None; }
+            let d = (c - '0') as u64;
+            // Past i64's range: Lua reads the numeral as a float instead.
+            if a >= 922337203685477580 and (a > 922337203685477580 or d > 7 + (if neg { 1 } else { 0 })) {
+                return None;
+            }
+            a = a * 10 + d;
+            digits += 1;
+            i += 1;
+        }
+    }
+    if digits == 0 { return None; }
+    Some((if neg { 0 -% a } else { a }) as i64)
+}
+
+/// Convert a string to a number as tonumber does.
+fn str_to_number(s: str) -> ?V {
+    var a: u64 = 0;
+    var b = s.len;
+    while a < b and is_lua_space(s[a]) { a += 1; }
+    while b > a and is_lua_space(s[b - 1]) { b -= 1; }
+    if a == b { return None; }
+    let t = s[a..b];
+    if let Some(i) = parse_int_numeral(t) { return Some(int_or_float(i)); }
+    // strtod would also accept "inf" and "nan"; Lua rejects them.
+    for i in 0..t.len {
+        if t[i] == 'n' or t[i] == 'N' or t[i] == 0 { return None; }
+    }
+    let buf: *u8 = mem.alloc(t.len + 1);
+    mem.memcpy(buf, t.ptr, t.len);
+    var end: *u8 = buf;
+    let x = strtod(buf, &end);
+    let used = (end as u64) - (buf as u64);
+    mem.release(buf);
+    if used != t.len { return None; }
+    Some(V.Num(x))
+}
+
+fn lib_tonumber(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    check_any(h, n, 0, "tonumber")?;
+    let v = args[0];
+    match v {
+        Int(_) | Num(_) => Ok(v),
+        S(s) => Ok(str_to_number(s.data) ?? V.Nil),
+        _ => Ok(V.Nil),
+    }
+}
+
+fn lib_type(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    check_any(h, n, 0, "type")?;
+    Ok(V.S(value.new_str(h, value.type_name(args[0]))))
+}
+
+fn lib_assert(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    check_any(h, n, 0, "assert")?;
+    if value.truthy(args[0]) { return Ok(args[0]); }
+    if n >= 2 { return Err(args[1]); }
+    Err(V.S(value.new_str(h, "assertion failed!")))
+}
+
+// ---------------------------------------------------------------------------
+// math
+
+/// floor or ceil: an Int when the result fits, else a float.
+fn math_round(h: *gc.Heap, args: *V, n: u64, fname: str, up: bool) -> Result<V, V> {
+    if let Int(_) = arg(args, n, 0) { return Ok(args[0]); }
+    let x = check_num(h, args, n, 0, fname)?;
+    let r = if up { ceil(x) } else { x.floor() };
+    if r >= -2147483648.0 and r <= 2147483647.0 { return Ok(V.Int(r as i32)); }
+    Ok(V.Num(r))
+}
+
+fn math_abs(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    if let Int(i) = arg(args, n, 0) {
+        return Ok(if i < 0 { int_or_float(0 - i as i64) } else { args[0] });
+    }
+    Ok(V.Num(fabs(check_num(h, args, n, 0, "abs")?)))
+}
+
+fn math_f(h: *gc.Heap, args: *V, n: u64, fname: str, which: i32) -> Result<V, V> {
+    let x = check_num(h, args, n, 0, fname)?;
+    let r = match which {
+        0 => x.sqrt(),
+        1 => sin(x),
+        2 => cos(x),
+        3 => exp(x),
+        _ => log(x),
+    };
+    Ok(V.Num(r))
+}
+
+/// The largest (or smallest) argument, keeping its subtype.
+fn math_minmax(h: *gc.Heap, args: *V, n: u64, fname: str, max: bool) -> Result<V, V> {
+    check_any(h, n, 0, fname)?;
+    var best = check_num(h, args, n, 0, fname)?;
+    var bi: u64 = 0;
+    var i: u64 = 1;
+    while i < n {
+        let x = check_num(h, args, n, i, fname)?;
+        if (max and best < x) or (!max and x < best) {
+            best = x;
+            bi = i;
+        }
+        i += 1;
+    }
+    Ok(args[bi])
+}
+
+// ---------------------------------------------------------------------------
+// string
+
+fn str_len(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let s = check_str(h, args, n, 0, "len")?;
+    Ok(int_or_float(s.data.len as i64))
+}
+
+/// A start position: negative counts from the end, clipped to 1.
+fn pos_start(p: i64, len: i64) -> i64 {
+    if p > 0 { p } else if p == 0 { 1 } else if p < 0 - len { 1 } else { len + p + 1 }
+}
+
+/// An end position: negative counts from the end, clipped to [0, len].
+fn pos_end(p: i64, len: i64) -> i64 {
+    if p > len { len } else if p >= 0 { p } else if p < 0 - len { 0 } else { len + p + 1 }
+}
+
+fn str_sub(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let s = check_str(h, args, n, 0, "sub")?;
+    let len = s.data.len as i64;
+    let i = pos_start(check_int(h, args, n, 1, "sub")?, len);
+    let j = pos_end(opt_int(h, args, n, 2, "sub", -1)?, len);
+    if i > j { return Ok(V.S(value.new_str(h, ""))); }
+    if i == 1 and j == len { return Ok(V.S(s)); }
+    Ok(V.S(value.new_str(h, s.data[(i - 1) as u64..j as u64])))
+}
+
+fn str_byte(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let s = check_str(h, args, n, 0, "byte")?;
+    let len = s.data.len as i64;
+    let p = opt_int(h, args, n, 1, "byte", 1)?;
+    let i = pos_start(p, len);
+    let j = pos_end(p, len);
+    if i > j { return Ok(V.Nil); }
+    Ok(V.Int(s.data[(i - 1) as u64] as i32))
+}
+
+fn str_char(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    var b = text.StrBuf.new();
+    for i in 0..n {
+        let c = check_int(h, args, n, i, "char")?;
+        if c < 0 or c > 255 {
+            b.free();
+            return Err(bad_arg(h, i, "char", "value out of range"));
+        }
+        b.push(c as u8);
+    }
+    Ok(take_str(h, &b))
+}
+
+fn str_rep(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let s = check_str(h, args, n, 0, "rep")?;
+    let k = check_int(h, args, n, 1, "rep")?;
+    let l = s.data.len;
+    if k <= 0 or l == 0 { return Ok(V.S(value.new_str(h, ""))); }
+    if (k as u64) >= (1 << 31) / l {
+        return Err(V.S(value.new_str(h, "resulting string too large")));
+    }
+    let total = l * k as u64;
+    let o = new(h, Str { hash: 0 }, total);
+    for r in 0..k as u64 { mem.memcpy(o.data.ptr + r * l, s.data.ptr, l); }
+    o.hash = hash.bytes(o.data);
+    Ok(V.S(o))
+}
+
+// string.format
+
+fn has(set: str, c: u8) -> bool { text.find(set, c).is_some() }
+
+/// Lua's checkformat: the flags in `flags`, a width of at most 2 digits,
+/// and (if `prec`) a precision of at most 2 digits.
+fn spec_ok(spec: str, flags: str, prec: bool) -> bool {
+    // spec is "%<flags/width/precision><conversion>"
+    var i: u64 = 1;
+    while i < spec.len and has(flags, spec[i]) { i += 1; }
+    if spec[i] != '0' {
+        var d = 0;
+        while d < 2 and text.is_digit(spec[i]) { i += 1; d += 1; }
+        if spec[i] == '.' and prec {
+            i += 1;
+            d = 0;
+            while d < 2 and text.is_digit(spec[i]) { i += 1; d += 1; }
+        }
+    }
+    i == spec.len - 1
+}
+
+/// An unknown conversion (`known` false), or bad flags, width or precision.
+fn bad_spec(h: *gc.Heap, spec: str, b: *text.StrBuf, known: bool) -> V {
+    b.free();
+    var m = text.StrBuf.new();
+    m.push_str(if known { "invalid conversion specification: '" } else { "invalid conversion '" });
+    m.push_str(spec);
+    m.push_str(if known { "'" } else { "' to 'format'" });
+    take_str(h, &m)
+}
+
+fn str_format(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let fs = check_str(h, args, n, 0, "format")?;
+    let f = fs.data;
+    var b = text.StrBuf.new();
+    var buf: [u8; 512] = [0; 512];
+    var form: [u8; 32] = [0; 32];
+    var argi: u64 = 0;
+    var i: u64 = 0;
+    while i < f.len {
+        let c = f[i];
+        i += 1;
+        if c != '%' {
+            b.push(c);
+        } else if i < f.len and f[i] == '%' {
+            b.push('%');
+            i += 1;
+        } else {
+            argi += 1;
+            if argi >= n {
+                b.free();
+                return Err(bad_arg(h, argi, "format", "no value"));
+            }
+            // The spec spans flags, width and precision, plus the conversion.
+            let start = i - 1;
+            while i < f.len and has("-+#0 123456789.", f[i]) { i += 1; }
+            if i - start >= 22 {
+                b.free();
+                return Err(V.S(value.new_str(h, "invalid format (too long)")));
+            }
+            let conv: u8 = if i < f.len { f[i] } else { 0 };
+            if i < f.len { i += 1; }
+            let spec = f[start..i];
+            // The C format: the spec, with "ll" before integer conversions.
+            mem.memcpy(&form[0], spec.ptr, spec.len - 1);
+            var fl = spec.len - 1;
+            let v = args[argi];
+            if conv == 'd' or conv == 'i' or conv == 'x' or conv == 'X' or conv == 'o' or conv == 'u' or conv == 'c' {
+                let x = match check_int(h, args, n, argi, "format") {
+                    Ok(x) => x,
+                    Err(e) => { b.free(); return Err(e); }
+                };
+                let flags = if conv == 'd' or conv == 'i' { "-+0 " } else if conv == 'u' { "-0" } else if conv == 'c' { "-" } else { "-#0" };
+                if !spec_ok(spec, flags, conv != 'c') { return Err(bad_spec(h, spec, &b, true)); }
+                if conv != 'c' { form[fl] = 'l'; form[fl + 1] = 'l'; fl += 2; }
+                form[fl] = conv;
+                form[fl + 1] = 0;
+                let k = if conv == 'c' {
+                    snprintf(&buf[0], 512, &form[0], x as i32)
+                } else {
+                    snprintf(&buf[0], 512, &form[0], x)
+                };
+                b.push_str(buf[0..k as u64]);
+            } else if conv == 'f' or conv == 'g' or conv == 'G' or conv == 'e' or conv == 'E' {
+                let x = match check_num(h, args, n, argi, "format") {
+                    Ok(x) => x,
+                    Err(e) => { b.free(); return Err(e); }
+                };
+                if !spec_ok(spec, "-+#0 ", true) { return Err(bad_spec(h, spec, &b, true)); }
+                form[fl] = conv;
+                form[fl + 1] = 0;
+                let k = snprintf(&buf[0], 512, &form[0], x);
+                b.push_str(buf[0..k as u64]);
+            } else if conv == 's' {
+                let s = to_str(h, v).data;
+                if spec.len == 2 {
+                    b.push_str(s);
+                } else {
+                    if memchr(s.ptr, 0, s.len) as u64 != 0 {
+                        b.free();
+                        return Err(bad_arg(h, argi, "format", "string contains zeros"));
+                    }
+                    if !spec_ok(spec, "-", true) { return Err(bad_spec(h, spec, &b, true)); }
+                    // Done by hand: equivalent to snprintf("%-W.Ps").
+                    let left = spec[1] == '-';
+                    var j: u64 = if left { 2 } else { 1 };
+                    var width: u64 = 0;
+                    while text.is_digit(spec[j]) { width = width * 10 + (spec[j] - '0') as u64; j += 1; }
+                    var len = s.len;
+                    if spec[j] == '.' {
+                        j += 1;
+                        var p: u64 = 0;
+                        while text.is_digit(spec[j]) { p = p * 10 + (spec[j] - '0') as u64; j += 1; }
+                        if p < len { len = p; }
+                    }
+                    let pad = if width > len { width - len } else { 0 };
+                    if !left { for q in 0..pad { b.push(' '); } }
+                    b.push_str(s[0..len]);
+                    if left { for q in 0..pad { b.push(' '); } }
+                }
+            } else {
+                return Err(bad_spec(h, spec, &b, false));
+            }
+        }
+    }
+    Ok(take_str(h, &b))
+}
+
+// ---------------------------------------------------------------------------
+// table
+
+fn tab_insert(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let t = check_table(h, args, n, 0, "insert")?;
+    let e = value.table_len(t) + 1;
+    if n == 2 {
+        value.table_set(h, t, key(e), args[1]);
+        return Ok(V.Nil);
+    }
+    if n != 3 { return Err(V.S(value.new_str(h, "wrong number of arguments to 'insert'"))); }
+    let pos = check_int(h, args, n, 1, "insert")?;
+    if pos < 1 or pos > e { return Err(bad_arg(h, 1, "insert", "position out of bounds")); }
+    var i = e;
+    while i > pos {
+        value.table_set(h, t, key(i), value.table_get(t, key(i - 1)));
+        i -= 1;
+    }
+    value.table_set(h, t, key(pos), args[2]);
+    Ok(V.Nil)
+}
+
+fn tab_remove(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let t = check_table(h, args, n, 0, "remove")?;
+    let size = value.table_len(t);
+    var pos = opt_int(h, args, n, 1, "remove", size)?;
+    if pos != size and (pos < 1 or pos > size + 1) {
+        return Err(bad_arg(h, 1, "remove", "position out of bounds"));
+    }
+    let v = value.table_get(t, key(pos));
+    while pos < size {
+        value.table_set(h, t, key(pos), value.table_get(t, key(pos + 1)));
+        pos += 1;
+    }
+    // Store nil only over an existing value, so no key is added.
+    if value.table_get(t, key(pos)) != V.Nil { value.table_set(h, t, key(pos), V.Nil); }
+    Ok(v)
+}
+
+fn tab_concat(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    let t = check_table(h, args, n, 0, "concat")?;
+    var sep = "";
+    if arg(args, n, 1) != V.Nil { sep = check_str(h, args, n, 1, "concat")?.data; }
+    let i = opt_int(h, args, n, 2, "concat", 1)?;
+    let j = opt_int(h, args, n, 3, "concat", value.table_len(t))?;
+    var b = text.StrBuf.new();
+    var k = i;
+    while k <= j {
+        let v = value.table_get(t, key(k));
+        match v {
+            S(s) => b.push_str(s.data),
+            Int(_) | Num(_) => value.write_value(&b, v),
+            _ => {
+                b.free();
+                var m = text.StrBuf.new();
+                m.push_str("invalid value (");
+                m.push_str(value.type_name(v));
+                m.push_str(") at index ");
+                m.push_int(k);
+                m.push_str(" in table for 'concat'");
+                return Err(take_str(h, &m));
+            }
+        }
+        if k < j { b.push_str(sep); }
+        k += 1;
+    }
+    Ok(take_str(h, &b))
+}
+
+// ---------------------------------------------------------------------------
+// io
+
+fn io_write(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
+    for i in 0..n {
+        match args[i] {
+            // Lua's io.write prints floats with plain "%.14g" (no ".0" suffix).
+            Num(x) => { printf("%.14g\0".ptr, x); }
+            S(_) | Int(_) => out_value(args[i]),
+            _ => return Err(type_error(h, args, n, i, "write", "string")),
+        }
+    }
+    Ok(V.Nil)
+}

@@ -1,0 +1,6 @@
+print((assert(1 < 2, "fine")))
+assert(nil)
+print("not reached")
+-- expect: true
+-- expect-stderr: error: line 2: assertion failed!
+-- expect-exit: 1

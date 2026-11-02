@@ -1,0 +1,22 @@
+-- Library functions allocate strings and grow tables; the results must
+-- survive collections (run with GC stress by the test harness).
+local keep = {}
+for i = 1, 300 do
+  local s = string.format("%03d:%s", i, string.rep("ab", i % 4))
+  local junk = tostring(i * 0.5) .. string.sub(s, 2, 3)
+  if i % 30 == 0 then table.insert(keep, s) end
+end
+print(table.concat(keep, " "))
+local parts = {}
+for i = 1, 200 do table.insert(parts, string.char(97 + i % 26)) end
+local joined = table.concat(parts)
+print(string.len(joined), string.sub(joined, 1, 30))
+while table.remove(parts) do end
+print(table.concat(parts, ","), parts[1])
+local nums = {}
+for i = 1, 100 do nums[i] = tostring(i / 4) end
+print(nums[1], nums[50], nums[100], tonumber(nums[3]) + 1)
+-- expect: 030:abab 060: 090:abab 120: 150:abab 180: 210:abab 240: 270:abab 300:
+-- expect: 200	bcdefghijklmnopqrstuvwxyzabcde
+-- expect: 	nil
+-- expect: 0.25	12.5	25.0	1.75
