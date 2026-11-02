@@ -100,6 +100,9 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
         let Some((_, ffields)) = formats.iter().find(|(n, _)| *n == op.format.name) else {
             return Err(Diag::new(op.format.span, format!("unknown format `{}`", op.format.name)));
         };
+        if let Some(p) = op.params.iter().find(|p| p.name.name.starts_with("__")) {
+            return Err(Diag::new(p.name.span, "names starting with `__` are reserved for generated code"));
+        }
         let non_op: Vec<&(String, u32, u32, bool)> = ffields.iter().filter(|f| f.0 != "op").collect();
         if op.params.len() > non_op.len() {
             return Err(Diag::new(op.name.span, format!("format `{}` has only {} operand field(s)", op.format.name, non_op.len())));
@@ -563,13 +566,15 @@ pub fn generate(v: &VmDecl, l: &VmLayout) -> String {
         let _ = writeln!(s, "{vis}fn {n}__{}({}) -> {w} {{ {} }}", o.name, params.join(", "), enc);
         let args: Vec<String> = o.fields.iter().map(|f| f.0.clone()).collect();
         let size = l.size_src(n, i);
-        let mut body = format!("code[at] = {n}__{}({});", o.name, args.join(", "));
+        // The emitter's own parameters start with `__`, so that they
+        // cannot clash with operand names (`op SET(at: reg, code: imm)`).
+        let mut body = format!("__code[__at] = {n}__{}({});", o.name, args.join(", "));
         if o.cache.is_some() {
-            let _ = write!(body, " var __k: u64 = 1; while __k < {size} {{ code[at + __k] = 0; __k += 1; }}");
+            let _ = write!(body, " var __k: u64 = 1; while __k < {size} {{ __code[__at + __k] = 0; __k += 1; }}");
         }
-        let mut ps = vec![format!("code: []{w}"), "at: u64".to_string()];
+        let mut ps = vec![format!("__code: []{w}"), "__at: u64".to_string()];
         ps.extend(params);
-        let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} at + {} }}", o.name, ps.join(", "), body, size);
+        let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} __at + {} }}", o.name, ps.join(", "), body, size);
     }
     // Sizes and names.
     let _ = writeln!(s, "{vis}fn {n}__op_size(w: {w}) -> u64 {{ match {n}__opcode(w) {{");
@@ -733,6 +738,35 @@ fn generate_labels(v: &VmDecl, l: &VmLayout) -> String {
     s
 }
 
+/// Generated items are named `Vm__X`: an op's encoder is `Vm__OP`, so an
+/// op named like another generated item (`label`, `verify`, `OP_ADD`,
+/// `emit_X`, a field reader `ABC_a`) would define it twice. Report that at
+/// the op rather than in the generated source.
+fn check_generated_names(v: &VmDecl, items: &[Item]) -> Res<()> {
+    let n = &v.name.name;
+    let mut seen = std::collections::HashSet::new();
+    for it in items {
+        let name = match it {
+            Item::Fn(f) => &f.name.name,
+            Item::Const(c) => &c.name.name,
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            let short = name.strip_prefix(&format!("{n}__")).unwrap_or(name);
+            let same: Vec<&OpDecl> = v.ops.iter().filter(|o| o.name.name == short).collect();
+            if same.len() > 1 {
+                return Err(Diag::new(same[1].name.span, format!("op `{short}` is declared twice")));
+            }
+            let span = same.first().map(|o| o.name.span).unwrap_or(v.name.span);
+            return Err(Diag::new(
+                span,
+                format!("`{n}.{short}` is generated twice: an op cannot be named like a generated vm item; rename the op"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
     for m in modules.iter_mut() {
@@ -750,6 +784,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module]) -> Res<()> {
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);
                 let (items, _) = p.parse_module()?;
+                check_generated_names(v, &items)?;
                 extra.extend(items);
             }
         }
