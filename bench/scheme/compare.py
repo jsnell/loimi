@@ -184,11 +184,12 @@ def program(name, kind):
     return path
 
 
-def build_ours(dispatch):
+def build_ours(dispatch, align=None):
     exe = os.path.join(OUT, f"scheme-{dispatch}")
     subprocess.run([os.path.join(ROOT, "target", "release", "loimi"), "build",
                     os.path.join(ROOT, "examples", "scheme", "main.lm"), "--release",
-                    f"--dispatch={dispatch}", "-o", exe], check=True)
+                    f"--dispatch={dispatch}", "-o", exe]
+                   + ([f"--align-functions={align}"] if align else []), check=True)
     return exe
 
 
@@ -281,6 +282,10 @@ def main():
     ap.add_argument("--count", type=int, help="override the iteration count (for quick checks)")
     ap.add_argument("--inner", action="store_true",
                     help="report the benchmarks' own elapsed time instead of process wall time")
+    ap.add_argument("--align", type=int,
+                    help="build ours with --align-functions=N (steadier A/B comparisons)")
+    ap.add_argument("--exe", nargs="*", default=[],
+                    help="extra prebuilt binaries of ours to run as columns (A/B runs)")
     ap.add_argument("--timeout", type=float, default=300, help="seconds per run")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
@@ -293,8 +298,10 @@ def main():
         sys.exit("bench/scheme/r7rs-benchmarks missing; run bench/scheme/fetch.sh")
     os.makedirs(OUT, exist_ok=True)
     subprocess.run(["cargo", "build", "--release", "-q"], cwd=ROOT, check=True)
-    ours = [Impl(f"loimi-{d}", "loimi", lambda p, exe=build_ours(d): [exe, p])
+    ours = [Impl(f"loimi-{d}", "loimi", lambda p, exe=build_ours(d, a.align): [exe, p])
             for d in a.dispatch]
+    ours += [Impl(os.path.basename(e), "loimi", lambda p, exe=os.path.abspath(e): [exe, p])
+             for e in a.exe]
     refs = references(a.refs)
     impls = ours + refs
     names = a.names or list(INPUTS)
@@ -302,15 +309,29 @@ def main():
           + "".join(f"{'/' + r.name:>13}" for r in refs))
     status = 0
     ratios = {r.name: [] for r in refs}
+    ab = {k: [] for k in range(1, len(ours))}
     for b in names:
         stdin = input_for(b, a.count)
-        times, outs, errs = [], [], []
-        for i in impls:
+        # Runs are interleaved (one run of each implementation in turn), so
+        # slow drifts in machine load affect all columns alike.
+        times, outs, errs = [None] * len(impls), [""] * len(impls), [""] * len(impls)
+        progs, failed = [], [False] * len(impls)
+        for k, i in enumerate(impls):
             prog = program(b, i.kind)
+            progs.append(prog)
             err = i.prepare(prog) if i.prepare else None
-            t, o, e = (None, "", err) if err else run(i.cmd(prog), stdin, a.n, i.env,
-                                                      a.timeout, a.inner)
-            times.append(t); outs.append(o); errs.append(e)
+            if err:
+                failed[k], errs[k] = True, err
+        for _ in range(a.n):
+            for k, i in enumerate(impls):
+                if failed[k]:
+                    continue
+                t, o, e = run(i.cmd(progs[k]), stdin, 1, i.env, a.timeout, a.inner)
+                outs[k], errs[k] = o, e
+                if t is None:
+                    failed[k], times[k] = True, None
+                else:
+                    times[k] = t if times[k] is None else min(times[k], t)
         # The expected output is that of the first reference that passed.
         passed = [o for k, (t, o) in enumerate(zip(times, outs))
                   if t is not None and k >= len(ours)]
@@ -318,6 +339,9 @@ def main():
         ok = [t is not None and o == expect for t, o in zip(times, outs)]
         cells = [f"{t:>13.3f}s" if good else f"{'FAIL' if t is None else 'DIFFERS':>14}"
                  for t, good in zip(times, ok)]
+        for k in range(1, len(ours)):
+            if ok[0] and ok[k]:
+                ab[k].append(times[k] / times[0])
         for k, r in enumerate(refs, len(ours)):
             if ok[0] and ok[k]:
                 ratios[r.name].append(times[0] / times[k])
@@ -331,8 +355,10 @@ def main():
                 if a.check:
                     detail = e if t is None else o
                     print(f"  {i.name}: " + "\n  ".join(detail.splitlines()[-6:]))
+    geo = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else float("nan")
+    for k in range(1, len(ours)):
+        print(f"geomean {ours[k].name} / {ours[0].name}: {geo(ab[k]):.3f}")
     if refs:
-        geo = lambda xs: math.exp(sum(map(math.log, xs)) / len(xs)) if xs else float("nan")
         print(f"{'geomean':<12}" + " " * 14 * len(impls)
               + "".join(f"{geo(ratios[r.name]):>13.2f}" for r in refs))
     sys.exit(status)
