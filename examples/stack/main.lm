@@ -67,14 +67,10 @@ fn main() -> i32 uses gc {
     defer arena.free();
 
     var m = Machine {
-        stack: mem.alloc(STACK + 1), stack_end: 0 as *Value,
-        lstack: mem.alloc(LSTACK), lstack_end: 0 as *Value,
-        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame,
-        words: 0 as *mem.Vec<*Word>, consts: 0 as *Value, nconsts: 0,
-        globals: 0 as *Value, nglobals: 0, heap: gc.Heap.new(),
-        sp: 0 as *Value, tos: Value.Nil, lp: 0 as *Value, fp: 0 as *Frame,
+        stack: mem.alloc(STACK + 1), lstack: mem.alloc(LSTACK), frames: mem.alloc(FRAMES),
+        heap: gc.Heap.new(), tos: Value.Nil,
         out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
-        error_line: 0, error_word: "", steps: 0,
+        ..zero
     };
     // One slot below the stack, so that `sp = stack - 1` (empty) points
     // into the allocation.

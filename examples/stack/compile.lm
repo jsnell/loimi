@@ -155,7 +155,7 @@ fn Def.new(name: str, nin: u32, nout: u32, toplevel: bool) -> Def {
     let w: *Word = mem.alloc(1);
     *w = Word {
         name: name, nin: nin, nout: nout, nlocals: 0, maxdepth: 0,
-        words: mem.alloc<u32>(1).slice(0), code: Stak.placeholder(), lines: mem.alloc<u32>(1).slice(0),
+        words: [], code: Stak.placeholder(), lines: [],
     };
     Def {
         word: w, code: bc.Code.new(Stak.op_size, Stak.set_label), locals: mem.Vec.new(), nlocals: 0,
@@ -206,46 +206,48 @@ fn Comp.merge(c: *Comp, d: *Def, t: *Tok, a: i32, a_dead: bool, b: i32, b_dead: 
 
 /// Built-in words: the instruction and its stack effect.
 fn builtin(name: str) -> ?(u32, u32, u32) {
-    if name.eq("dup") { return Some((Stak.DUP(), 1, 2)); }
-    if name.eq("drop") { return Some((Stak.DROP(), 1, 0)); }
-    if name.eq("swap") { return Some((Stak.SWAP(), 2, 2)); }
-    if name.eq("over") { return Some((Stak.OVER(), 2, 3)); }
-    if name.eq("rot") { return Some((Stak.ROT(), 3, 3)); }
-    if name.eq("nip") { return Some((Stak.NIP(), 2, 1)); }
-    if name.eq("tuck") { return Some((Stak.TUCK(), 2, 3)); }
-    if name.eq("2dup") { return Some((Stak.DUP2(), 2, 4)); }
-    if name.eq("2drop") { return Some((Stak.DROP2(), 2, 0)); }
-    if name.eq("+") { return Some((Stak.ADD(), 2, 1)); }
-    if name.eq("-") { return Some((Stak.SUB(), 2, 1)); }
-    if name.eq("*") { return Some((Stak.MUL(), 2, 1)); }
-    if name.eq("/") { return Some((Stak.DIV(), 2, 1)); }
-    if name.eq("mod") { return Some((Stak.MOD(), 2, 1)); }
-    if name.eq("negate") { return Some((Stak.NEG(), 1, 1)); }
-    if name.eq("abs") { return Some((Stak.ABS(), 1, 1)); }
-    if name.eq("=") { return Some((Stak.EQ(), 2, 1)); }
-    if name.eq("<>") { return Some((Stak.NE(), 2, 1)); }
-    if name.eq("<") { return Some((Stak.LT(), 2, 1)); }
-    if name.eq("<=") { return Some((Stak.LE(), 2, 1)); }
-    if name.eq(">") { return Some((Stak.GT(), 2, 1)); }
-    if name.eq(">=") { return Some((Stak.GE(), 2, 1)); }
-    if name.eq("not") { return Some((Stak.NOT(), 1, 1)); }
-    if name.eq("and") { return Some((Stak.AND(), 2, 1)); }
-    if name.eq("or") { return Some((Stak.OR(), 2, 1)); }
-    if name.eq("print") { return Some((Stak.PRINT(), 1, 0)); }
-    if name.eq(".") { return Some((Stak.DOT(), 1, 0)); }
-    if name.eq("cr") { return Some((Stak.CR(), 0, 0)); }
-    if name.eq("concat") { return Some((Stak.CONCAT(), 2, 1)); }
-    if name.eq("tostr") { return Some((Stak.TOSTR(), 1, 1)); }
-    if name.eq("len") { return Some((Stak.LEN(), 1, 1)); }
-    if name.eq("array") { return Some((Stak.ARRAY(), 1, 1)); }
-    if name.eq("@") { return Some((Stak.AT(), 2, 1)); }
-    if name.eq("!") { return Some((Stak.STORE(), 3, 0)); }
-    if name.eq("sqrt") { return Some((Stak.SQRT(), 1, 1)); }
-    if name.eq("int") { return Some((Stak.TOINT(), 1, 1)); }
-    if name.eq("true") { return Some((Stak.PUSHBOOL(1), 0, 1)); }
-    if name.eq("false") { return Some((Stak.PUSHBOOL(0), 0, 1)); }
-    if name.eq("nil") { return Some((Stak.PUSHNIL(), 0, 1)); }
-    None
+    match name {
+        "dup" => Some((Stak.DUP(), 1, 2)),
+        "drop" => Some((Stak.DROP(), 1, 0)),
+        "swap" => Some((Stak.SWAP(), 2, 2)),
+        "over" => Some((Stak.OVER(), 2, 3)),
+        "rot" => Some((Stak.ROT(), 3, 3)),
+        "nip" => Some((Stak.NIP(), 2, 1)),
+        "tuck" => Some((Stak.TUCK(), 2, 3)),
+        "2dup" => Some((Stak.DUP2(), 2, 4)),
+        "2drop" => Some((Stak.DROP2(), 2, 0)),
+        "+" => Some((Stak.ADD(), 2, 1)),
+        "-" => Some((Stak.SUB(), 2, 1)),
+        "*" => Some((Stak.MUL(), 2, 1)),
+        "/" => Some((Stak.DIV(), 2, 1)),
+        "mod" => Some((Stak.MOD(), 2, 1)),
+        "negate" => Some((Stak.NEG(), 1, 1)),
+        "abs" => Some((Stak.ABS(), 1, 1)),
+        "=" => Some((Stak.EQ(), 2, 1)),
+        "<>" => Some((Stak.NE(), 2, 1)),
+        "<" => Some((Stak.LT(), 2, 1)),
+        "<=" => Some((Stak.LE(), 2, 1)),
+        ">" => Some((Stak.GT(), 2, 1)),
+        ">=" => Some((Stak.GE(), 2, 1)),
+        "not" => Some((Stak.NOT(), 1, 1)),
+        "and" => Some((Stak.AND(), 2, 1)),
+        "or" => Some((Stak.OR(), 2, 1)),
+        "print" => Some((Stak.PRINT(), 1, 0)),
+        "." => Some((Stak.DOT(), 1, 0)),
+        "cr" => Some((Stak.CR(), 0, 0)),
+        "concat" => Some((Stak.CONCAT(), 2, 1)),
+        "tostr" => Some((Stak.TOSTR(), 1, 1)),
+        "len" => Some((Stak.LEN(), 1, 1)),
+        "array" => Some((Stak.ARRAY(), 1, 1)),
+        "@" => Some((Stak.AT(), 2, 1)),
+        "!" => Some((Stak.STORE(), 3, 0)),
+        "sqrt" => Some((Stak.SQRT(), 1, 1)),
+        "int" => Some((Stak.TOINT(), 1, 1)),
+        "true" => Some((Stak.PUSHBOOL(1), 0, 1)),
+        "false" => Some((Stak.PUSHBOOL(0), 0, 1)),
+        "nil" => Some((Stak.PUSHNIL(), 0, 1)),
+        _ => None,
+    }
 }
 
 fn Def.local(d: *Def, name: str) -> ?u32 {
