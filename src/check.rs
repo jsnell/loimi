@@ -880,37 +880,96 @@ impl<'a> Checker<'a> {
         Ok(TPat { ty: ty.clone(), kind })
     }
 
+    /// Is the pattern matrix `rows` (one row per arm, one column per type
+    /// in `tys`; `None` is a wildcard) exhaustive? A simplified version of
+    /// the usual usefulness algorithm: constructors are enum/option/result/
+    /// value variants, booleans and tuples; integers only count as covered
+    /// by wildcards.
+    fn rows_exhaustive(&self, tys: &[Ty], rows: Vec<Vec<Option<&TPat>>>) -> bool {
+        if tys.is_empty() {
+            return !rows.is_empty();
+        }
+        // Expand or-patterns and bindings in the first column.
+        let mut flat: Vec<Vec<Option<&TPat>>> = Vec::new();
+        let mut stack: Vec<Vec<Option<&TPat>>> = rows.into_iter().rev().collect();
+        while let Some(row) = stack.pop() {
+            match row[0].map(|p| &p.kind) {
+                Some(TPK::Or(alts)) => {
+                    for a in alts.iter().rev() {
+                        let mut r = row.clone();
+                        r[0] = Some(a);
+                        stack.push(r);
+                    }
+                }
+                Some(TPK::Wild) | Some(TPK::Bind(_)) => {
+                    let mut r = row;
+                    r[0] = None;
+                    flat.push(r);
+                }
+                _ => flat.push(row),
+            }
+        }
+        let rest = &tys[1..];
+        if let Ty::Tuple(elems) = &tys[0] {
+            let mut sub_tys = elems.clone();
+            sub_tys.extend_from_slice(rest);
+            let rows = flat
+                .iter()
+                .map(|r| {
+                    let mut out: Vec<Option<&TPat>> = match r[0].map(|p| &p.kind) {
+                        Some(TPK::Tuple(ps)) => ps.iter().map(Some).collect(),
+                        _ => vec![None; elems.len()],
+                    };
+                    out.extend_from_slice(&r[1..]);
+                    out
+                })
+                .collect();
+            return self.rows_exhaustive(&sub_tys, rows);
+        }
+        let n = self.variant_count(&tys[0]);
+        if n == 0 {
+            let rows = flat.iter().filter(|r| r[0].is_none()).map(|r| r[1..].to_vec()).collect();
+            return self.rows_exhaustive(rest, rows);
+        }
+        (0..n as u32).all(|i| self.variant_exhaustive(&tys[0], i, rest, &flat))
+    }
+
+    /// Are the rows that match variant `i` of `ty` exhaustive for its
+    /// payload and the remaining columns?
+    fn variant_exhaustive(&self, ty: &Ty, i: u32, rest: &[Ty], rows: &[Vec<Option<&TPat>>]) -> bool {
+        let fields = if matches!(ty, Ty::Bool) { vec![] } else { self.variant_fields(ty, i) };
+        let mut sub_tys = fields.clone();
+        sub_tys.extend_from_slice(rest);
+        let mut sub = Vec::new();
+        for r in rows {
+            let mut out: Vec<Option<&TPat>> = match r[0].map(|p| &p.kind) {
+                None => vec![None; fields.len()],
+                Some(TPK::Variant(j, ps)) if *j == i => ps.iter().map(Some).collect(),
+                Some(TPK::Bool(b)) if *b as u32 == i => vec![],
+                _ => continue,
+            };
+            out.extend_from_slice(&r[1..]);
+            sub.push(out);
+        }
+        self.rows_exhaustive(&sub_tys, sub)
+    }
+
     fn check_exhaustive(&self, ty: &Ty, arms: &[TArm], span: Span) -> Res<()> {
-        fn catch_all(p: &TPat) -> bool {
-            match &p.kind {
-                TPK::Wild | TPK::Bind(_) => true,
-                TPK::Tuple(ps) => ps.iter().all(catch_all),
-                TPK::Or(ps) => ps.iter().any(catch_all),
-                _ => false,
-            }
-        }
-        fn covered(p: &TPat, out: &mut Vec<u32>) {
-            match &p.kind {
-                TPK::Variant(i, ps) if ps.iter().all(catch_all) => out.push(*i),
-                TPK::Bool(b) => out.push(*b as u32),
-                TPK::Or(ps) => ps.iter().for_each(|p| covered(p, out)),
-                _ => {}
-            }
-        }
-        let unguarded: Vec<&TArm> = arms.iter().filter(|a| a.guard.is_none()).collect();
-        if unguarded.iter().any(|a| catch_all(&a.pat)) {
+        let rows: Vec<Vec<Option<&TPat>>> = arms.iter().filter(|a| a.guard.is_none()).map(|a| vec![Some(&a.pat)]).collect();
+        if self.rows_exhaustive(std::slice::from_ref(ty), rows.clone()) {
             return Ok(());
         }
         let n = self.variant_count(ty);
         if n > 0 {
-            let mut cov = Vec::new();
-            for a in &unguarded {
-                covered(&a.pat, &mut cov);
-            }
-            let missing: Vec<u32> = (0..n as u32).filter(|i| !cov.contains(i)).collect();
-            if missing.is_empty() {
-                return Ok(());
-            }
+            let flat: Vec<Vec<Option<&TPat>>> = arms
+                .iter()
+                .filter(|a| a.guard.is_none())
+                .flat_map(|a| match &a.pat.kind {
+                    TPK::Or(alts) => alts.iter().map(|p| vec![Some(p)]).collect::<Vec<_>>(),
+                    _ => vec![vec![Some(&a.pat)]],
+                })
+                .collect();
+            let missing: Vec<u32> = (0..n as u32).filter(|i| !self.variant_exhaustive(ty, *i, &[], &flat)).collect();
             let names: Vec<String> = missing
                 .iter()
                 .map(|i| match ty {
@@ -922,7 +981,9 @@ impl<'a> Checker<'a> {
                     _ => "?".into(),
                 })
                 .collect();
-            return Err(Diag::new(span, format!("non-exhaustive match: missing {}", names.join(", "))));
+            if !names.is_empty() {
+                return Err(Diag::new(span, format!("non-exhaustive match: missing {}", names.join(", "))));
+            }
         }
         Err(Diag::new(span, "non-exhaustive match: add a `_` arm"))
     }
