@@ -94,6 +94,19 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   arguments only when a balanced `<...>` made of type tokens follows
   (`p as *Vec<T>`); otherwise it is a comparison. When in doubt, write
   `(x as T) < y`.
+- **Type aliases.** `type Name = T;` and `pub type Name = T;` give a type a
+  second name; `type Map<V> = HashMap<str, V>;` takes type parameters. An
+  alias is transparent: `Name` *is* `T`, so values convert freely, methods
+  of `T` apply, and `fn Name.m(..)` defines a method of `T`. The aliased
+  type is resolved in the alias's module and sees only the alias's own
+  parameters; aliases may refer to other aliases, in any order, but not
+  to themselves. A non-generic alias can also stand for its type in
+  expressions: `Name { .. }` (struct literals), `Name.f(..)` (static
+  calls), `Name.Variant` (also in patterns). Generic aliases are for type
+  positions only (`Map.new()` is not available; write `HashMap.new()`),
+  and their parameters take no bounds: the bounds of the aliased type
+  are checked where it is instantiated. Aliases are imported like other
+  items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:

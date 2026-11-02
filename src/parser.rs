@@ -407,6 +407,25 @@ impl Parser {
             }
             return Ok(Item::Impl(ImplDecl { trait_path, ty, span: start.to(self.prev_span()) }));
         }
+        if self.is_kw("type") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            // `type Name = T;`, `type Map<V> = HashMap<str, V>;`
+            self.bump();
+            let name = self.ident()?;
+            let (generics, bounds) = self.parse_generics()?;
+            if let Some(b) = bounds.iter().flatten().next() {
+                return Err(Diag::new(
+                    b[0].span,
+                    "a type alias's parameters take no bounds; the aliased type's own bounds are checked where it is used",
+                ));
+            }
+            self.expect("=")?;
+            let ty = self.parse_type()?;
+            self.expect(";")?;
+            if !attrs.list.is_empty() {
+                return Err(Diag::new(attrs.list[0].2, "a type alias takes no attributes"));
+            }
+            return Ok(Item::TypeAlias(TypeAliasDecl { name, generics, ty, is_pub }));
+        }
         if self.eat_kw("enum") {
             let name = self.ident()?;
             let (generics, bounds) = self.parse_generics()?;

@@ -299,6 +299,15 @@ pub struct GlobalDecl {
     pub thread_local: bool,
 }
 
+/// `type Name<A, B> = T;`: a transparent alias.
+#[derive(Clone, Debug)]
+pub struct TypeAliasDecl {
+    pub name: Ident,
+    pub generics: Vec<Ident>,
+    pub ty: TypeExpr,
+    pub is_pub: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Import {
     pub path: Vec<Ident>,
@@ -317,6 +326,7 @@ pub enum Item {
     Import(Import),
     Trait(TraitDecl),
     Impl(ImplDecl),
+    TypeAlias(TypeAliasDecl),
     Vm(Box<crate::vmast::VmDecl>),
     Value(crate::vmast::ValueDecl),
 }

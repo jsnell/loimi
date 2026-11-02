@@ -19,6 +19,17 @@ pub enum Def {
     GenericType(u32),
     GenericFn(u32),
     Trait(u32),
+    /// `type Name = T;` (index into `Checker::aliases`).
+    Alias(u32),
+}
+
+/// A type alias. Non-generic aliases are resolved once, before type
+/// definitions (`ty`); generic ones at each use, with their arguments.
+pub struct AliasInfo {
+    pub module: usize,
+    pub decl: TypeAliasDecl,
+    pub ty: Option<Ty>,
+    pub busy: bool,
 }
 
 pub struct ConstInfo {
@@ -120,6 +131,7 @@ pub struct Checker<'a> {
     pub dispatch_override: Option<Dispatch>,
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
+    pub aliases: Vec<AliasInfo>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -192,6 +204,7 @@ impl<'a> Checker<'a> {
             traits: Default::default(),
             tenv: vec![],
             object_count: 0,
+            aliases: vec![],
         }
     }
 
@@ -315,6 +328,11 @@ impl<'a> Checker<'a> {
                         self.define(m, &t.name, Def::Trait(id), t.is_pub)?;
                     }
                     Item::Impl(i) => self.traits.impl_decls.push((m, i.clone())),
+                    Item::TypeAlias(a) => {
+                        let id = self.aliases.len() as u32;
+                        self.aliases.push(AliasInfo { module: m, decl: a.clone(), ty: None, busy: false });
+                        self.define(m, &a.name, Def::Alias(id), a.is_pub)?;
+                    }
                     Item::Import(_) => {}
                 }
             }
@@ -352,6 +370,14 @@ impl<'a> Checker<'a> {
         // Impls are known before any type is resolved, so that generic
         // instances created from here on can have their bounds checked.
         self.register_impls()?;
+        // Non-generic type aliases, so that code taking `&self` (type
+        // paths in expressions) can read them.
+        for a in 0..self.aliases.len() {
+            if self.aliases[a].decl.generics.is_empty() {
+                let span = self.aliases[a].decl.name.span;
+                self.alias_type(a as u32, vec![], span)?;
+            }
+        }
         // Pass 3: type definitions.
         for (m, module) in self.modules.iter().enumerate() {
             for item in &module.items {
@@ -623,6 +649,58 @@ impl<'a> Checker<'a> {
         Ok((tag, variants))
     }
 
+    /// The alias a type path names (`Name` or `module.Name`), if any.
+    fn alias_path(&self, m: usize, path: &[Ident]) -> Res<Option<(u32, String)>> {
+        let (tm, id) = match path {
+            [id] => {
+                if self.tenv.iter().any(|(n, _)| *n == id.name) {
+                    return Ok(None);
+                }
+                (m, id)
+            }
+            [module, id] => match self.scopes[m].get(&module.name) {
+                Some((Def::Module(target), _)) => (*target, id),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        match self.scopes[tm].get(&id.name) {
+            Some((Def::Alias(a), is_pub)) => {
+                if tm != m && !is_pub {
+                    return Err(Diag::new(id.span, format!("`{}` is private", id.name)));
+                }
+                Ok(Some((*a, id.name.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The type alias `a` stands for, with its parameters bound to `args`.
+    /// The aliased type is resolved in the alias's module, seeing only
+    /// the alias's own parameters.
+    pub fn alias_type(&mut self, a: u32, args: Vec<Ty>, span: Span) -> Res<Ty> {
+        let info = &self.aliases[a as usize];
+        if let Some(t) = &info.ty {
+            return Ok(t.clone());
+        }
+        if info.busy {
+            return Err(Diag::new(span, format!("type alias `{}` refers to itself", info.decl.name.name))
+                .note(info.decl.name.span, "the alias is declared here"));
+        }
+        let (m, decl) = (info.module, info.decl.clone());
+        let env: Vec<(String, Ty)> = decl.generics.iter().map(|g| g.name.clone()).zip(args).collect();
+        self.aliases[a as usize].busy = true;
+        let saved = std::mem::replace(&mut self.tenv, env);
+        let r = self.resolve_type(m, &decl.ty);
+        self.tenv = saved;
+        self.aliases[a as usize].busy = false;
+        let t = r?;
+        if decl.generics.is_empty() {
+            self.aliases[a as usize].ty = Some(t.clone());
+        }
+        Ok(t)
+    }
+
     pub fn resolve_type_name(&self, m: usize, id: &Ident) -> Res<Ty> {
         if let Some((_, t)) = self.tenv.iter().rev().find(|(n, _)| *n == id.name) {
             return Ok(t.clone());
@@ -634,6 +712,16 @@ impl<'a> Checker<'a> {
             return Err(Diag::new(id.span, format!("`{}` needs type arguments", id.name)));
         }
         match self.scopes[m].get(&id.name) {
+            Some((Def::Alias(a), _)) => {
+                let a = &self.aliases[*a as usize];
+                match &a.ty {
+                    Some(t) => Ok(t.clone()),
+                    None if !a.decl.generics.is_empty() => {
+                        Err(Diag::new(id.span, format!("`{}` needs type arguments", id.name)))
+                    }
+                    None => Err(Diag::new(id.span, format!("type alias `{}` is used before it is resolved", id.name))),
+                }
+            }
             Some((Def::Struct(i), _)) => Ok(Ty::Struct(*i)),
             Some((Def::Enum(i), _)) => Ok(Ty::Enum(*i)),
             Some((Def::Value(i), _)) => Ok(Ty::Value(*i)),
@@ -666,6 +754,20 @@ impl<'a> Checker<'a> {
                         return Err(Diag::new(args[0].span, msg));
                     }
                     return Ok(Ty::Gc(Box::new(inner)));
+                }
+                if let Some((a, name)) = self.alias_path(m, path)? {
+                    let mut targs = Vec::new();
+                    for x in args {
+                        targs.push(self.resolve_type(m, x)?);
+                    }
+                    let want = self.aliases[a as usize].decl.generics.len();
+                    if targs.len() != want {
+                        return Err(Diag::new(
+                            t.span,
+                            format!("type alias `{}` takes {} type argument(s), got {}", name, want, targs.len()),
+                        ));
+                    }
+                    return self.alias_type(a, targs, t.span);
                 }
                 if path.len() == 1 && path[0].name == "Result" {
                     if args.len() != 2 {
@@ -1882,6 +1984,7 @@ impl<'a> Checker<'a> {
                     Some((Def::Struct(i), _)) => Some(Ty::Struct(*i)),
                     Some((Def::Enum(i), _)) => Some(Ty::Enum(*i)),
                     Some((Def::Value(i), _)) => Some(Ty::Value(*i)),
+                    Some((Def::Alias(a), _)) => self.aliases[*a as usize].ty.clone(),
                     _ => None,
                 }
             }
@@ -1891,6 +1994,7 @@ impl<'a> Checker<'a> {
                     Some((Def::Struct(i), true)) => Some(Ty::Struct(*i)),
                     Some((Def::Enum(i), true)) => Some(Ty::Enum(*i)),
                     Some((Def::Value(i), true)) => Some(Ty::Value(*i)),
+                    Some((Def::Alias(a), true)) => self.aliases[*a as usize].ty.clone(),
                     _ => None,
                 }
             }
