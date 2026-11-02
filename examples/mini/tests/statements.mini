@@ -1,0 +1,38 @@
+-- repeat: the condition sees the body's locals
+local i = 0
+repeat local j = i * 2; i = i + 1 until j >= 6
+print(i)
+-- do blocks scope locals
+local a = 1
+do local a = 2; print(a) end
+print(a)
+-- methods and function names with fields
+local Account = {}
+Account.__index = Account
+function Account.new(balance) return {balance = balance, deposit = Account.deposit, get = Account.get} end
+function Account:deposit(v) self.balance = self.balance + v; return self end
+function Account.get(self) return self.balance end
+local acc = Account.new(10)
+acc:deposit(5):deposit(7)
+print(acc:get())
+local ns = {inner = {}}
+function ns.inner.f(x) return x + 1 end
+function ns.inner:m(x) return self == ns.inner, x end
+print(ns.inner.f(1))
+local ok, v = ns.inner:m(3)
+print(ok, v)
+-- call sugar
+local function id(x) return x end
+print(id"str", id{7}[1], #id{1, 2})
+local o = {name = "o"}
+function o:greet(t) return self.name .. (type(t) == "table" and #t or t) end
+print(o:greet{1, 2, 3}, o:greet"!")
+;;;
+-- expect: 4
+-- expect: 2
+-- expect: 1
+-- expect: 22
+-- expect: 2
+-- expect: true	3
+-- expect: str	7	2
+-- expect: o3	o!

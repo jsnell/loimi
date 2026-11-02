@@ -1,0 +1,4 @@
+local t = nil
+for k, v in pairs(t) do print(k) end
+-- expect-stderr: line 2: bad argument #1 to 'for iterator' (table expected, got nil)
+-- expect-exit: 1

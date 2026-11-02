@@ -1,0 +1,6 @@
+print("a")
+local n = 5
+print(#n)
+-- expect: a
+-- expect-stderr: line 3: attempt to get length of a number value
+-- expect-exit: 1

@@ -1,0 +1,54 @@
+local function three() return 1, 2, 3 end
+local function none() end
+local a, b, c, d = three()
+print(a, b, c, d)
+local e, f = three()
+print(e, f)
+local g, h, i = 0, three()
+print(g, h, i)
+local j, k = three(), 10
+print(j, k)
+local l, m = none()
+print(l, m)
+-- multiple assignment, swaps and evaluation before assignment
+local x, y = 1, 2
+x, y = y, x
+print(x, y)
+local t = {}
+local n = 3
+n, t[n] = n + 1, 20
+print(n, t[3], t[4])
+t[n], n = 30, 5
+print(n, t[4])
+local p, q, r = 1
+print(p, q, r)
+p, q = 1, 2, 3
+print(p, q)
+local o = {}
+o.u, o.v = three()
+print(o.u, o.v)
+g1, g2 = three()
+print(g1, g2)
+-- calls are truncated to one value elsewhere
+print((three()))
+local tt = {three(), three(), 0}
+print(#tt)
+-- returning several values through levels
+local function wrap() local s, z = 17, 5 return s % z, s - s % z end
+local w1, w2 = wrap()
+print(w1, w2)
+-- expect: 1	2	3	nil
+-- expect: 1	2
+-- expect: 0	1	2
+-- expect: 1	10
+-- expect: nil	nil
+-- expect: 2	1
+-- expect: 4	20	nil
+-- expect: 5	30
+-- expect: 1	nil	nil
+-- expect: 1	2
+-- expect: 1	2
+-- expect: 1	2
+-- expect: 1
+-- expect: 3
+-- expect: 2	15
