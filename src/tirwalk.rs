@@ -16,132 +16,20 @@ fn push(v: &mut Vec<LocalId>, l: LocalId) {
     }
 }
 
-/// Locals read or written in `e` (`used`), and locals declared inside it.
+/// Locals read or written in `e` (`used`, without repeats, in order of
+/// first use), and locals declared inside it.
 pub fn locals(e: &TExpr, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
-    let mut go = |x: &TExpr| locals(x, used, declared);
-    match &e.kind {
-        TK::Local(l) => push(used, *l),
-        TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) | TK::Global(_) => {}
-        TK::Closure(_, caps) => caps.iter().for_each(|l| push(used, *l)),
-        TK::NewClosure(_, caps, a) => {
-            locals(a, used, declared);
-            caps.iter().for_each(|l| push(used, *l));
-        }
-        TK::Continue(_) | TK::Unreachable => {}
-        TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
-        TK::Try(a) | TK::Trailing(a) => go(a),
-        TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
-            go(a);
-            go(b);
-        }
-        TK::SliceRange(a, lo, hi) => {
-            go(a);
-            if let Some(x) = lo {
-                go(x);
-            }
-            if let Some(x) = hi {
-                go(x);
-            }
-        }
-        TK::Call(f, args) => {
-            go(f);
-            args.iter().for_each(|a| locals(a, used, declared));
-        }
-        TK::Intrinsic(_, args) | TK::Struct(args) | TK::Tuple(args) | TK::Array(args) | TK::Variant(_, args) => {
-            args.iter().for_each(|a| locals(a, used, declared))
-        }
-        TK::Block(stmts, tail) => {
-            for s in stmts {
-                stmt_locals(s, used, declared);
-            }
-            if let Some(t) = tail {
-                locals(t, used, declared);
-            }
-        }
-        TK::If(conds, then, els) => {
-            for c in conds {
-                match c {
-                    TCond::Expr(x) => locals(x, used, declared),
-                    TCond::Let(p, x) => {
-                        locals(x, used, declared);
-                        pat_binds(p, declared);
-                    }
-                }
-            }
-            locals(then, used, declared);
-            if let Some(x) = els {
-                locals(x, used, declared);
-            }
-        }
-        TK::Match(s, arms) => {
-            locals(s, used, declared);
-            for a in arms {
-                pat_binds(&a.pat, declared);
-                if let Some(g) = &a.guard {
-                    locals(g, used, declared);
-                }
-                locals(&a.body, used, declared);
-            }
-        }
-        TK::Loop { body, step, .. } => {
-            locals(body, used, declared);
-            if let Some(s) = step {
-                locals(s, used, declared);
-            }
-        }
-        TK::Break(_, v) | TK::Return(v) => {
-            if let Some(x) = v {
-                locals(x, used, declared);
-            }
-        }
-        TK::New { heap, init, len } => {
-            locals(heap, used, declared);
-            locals(init, used, declared);
-            if let Some(l) = len {
-                locals(l, used, declared);
-            }
-        }
-        TK::Vm(v) => match v {
-            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
-            TVm::Synced(a, b, c) => {
-                go(a);
-                go(b);
-                go(c);
-            }
-            TVm::Shared(_, args, size, cont) => {
-                args.iter().for_each(|a| locals(a, used, declared));
-                locals(size, used, declared);
-                if let Some(c) = cont {
-                    locals(c, used, declared);
-                }
-            }
-            TVm::SharedNext(t, _, cont) => {
-                go(t);
-                push(used, *cont);
-            }
-            TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
-            TVm::SharedArg(..) => {}
+    walk(e, &mut |ev| match ev {
+        Event::Leave(x) => match &x.kind {
+            TK::Local(l) => push(used, *l),
+            TK::Closure(_, caps) | TK::NewClosure(_, caps, _) => caps.iter().for_each(|l| push(used, *l)),
+            TK::Vm(TVm::SharedNext(_, _, cont)) => push(used, *cont),
+            _ => {}
         },
-    }
-}
-
-fn stmt_locals(s: &TStmt, used: &mut Vec<LocalId>, declared: &mut Vec<LocalId>) {
-    match s {
-        TStmt::Let(l, init) => {
-            if let Some(x) = init {
-                locals(x, used, declared);
-            }
-            declared.push(*l);
-        }
-        TStmt::LetPat(p, x, els) => {
-            locals(x, used, declared);
-            if let Some(e) = els {
-                locals(e, used, declared);
-            }
-            pat_binds(p, declared);
-        }
-        TStmt::Expr(x) | TStmt::Defer(x) => locals(x, used, declared),
-    }
+        Event::Let(l, _) => declared.push(l),
+        Event::Pat(p) => pat_binds(p, declared),
+        Event::Enter(_) => {}
+    });
 }
 
 fn diverges(stmts: &[TStmt], tail: &Option<B>) -> bool {
@@ -262,12 +150,45 @@ pub enum BindSite<'a> {
 
 /// Call `f` on every binding site in `e`, at any depth of nesting.
 pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
-    let go = |x: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)| for_each_bind(x, f);
+    walk(e, &mut |ev| match ev {
+        Event::Let(l, Some(x)) => f(BindSite::Let(l, x)),
+        Event::Pat(p) => f(BindSite::Pat(p)),
+        _ => {}
+    });
+}
+
+/// Call `f` on every expression in `e`, outermost first.
+pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
+    walk(e, &mut |ev| {
+        if let Event::Enter(x) = ev {
+            f(x)
+        }
+    });
+}
+
+/// What `walk` reports, in evaluation order.
+enum Event<'a> {
+    /// An expression, before its subexpressions.
+    Enter(&'a TExpr),
+    /// An expression, after its subexpressions.
+    Leave(&'a TExpr),
+    /// `let l = init;` (or `let l;`), after `init`.
+    Let(LocalId, Option<&'a TExpr>),
+    /// A pattern's bindings: of a destructuring `let` after its value and
+    /// `else`, of an `if let` after its value, of a match arm before its
+    /// guard.
+    Pat(&'a TPat),
+}
+
+/// The one traversal of the typed IR the others are built on.
+fn walk<'a>(e: &'a TExpr, f: &mut dyn FnMut(Event<'a>)) {
+    f(Event::Enter(e));
+    let go = |x: &'a TExpr, f: &mut dyn FnMut(Event<'a>)| walk(x, f);
     match &e.kind {
         TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
         TK::Global(_) | TK::Continue(_) | TK::Unreachable | TK::Closure(..) => {}
         TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a, f),
-        TK::Try(a) | TK::Trailing(a) => go(a, f),
+        TK::Try(a) | TK::Trailing(a) | TK::NewClosure(_, _, a) => go(a, f),
         TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
             go(a, f);
             go(b, f);
@@ -291,15 +212,15 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                     TStmt::Let(l, init) => {
                         if let Some(x) = init {
                             go(x, f);
-                            f(BindSite::Let(*l, x));
                         }
+                        f(Event::Let(*l, init.as_ref()));
                     }
                     TStmt::LetPat(p, x, els) => {
                         go(x, f);
                         if let Some(e) = els {
                             go(e, f);
                         }
-                        f(BindSite::Pat(p));
+                        f(Event::Pat(p));
                     }
                     TStmt::Expr(x) | TStmt::Defer(x) => go(x, f),
                 }
@@ -314,7 +235,7 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                     TCond::Expr(x) => go(x, f),
                     TCond::Let(p, x) => {
                         go(x, f);
-                        f(BindSite::Pat(p));
+                        f(Event::Pat(p));
                     }
                 }
             }
@@ -326,7 +247,7 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
         TK::Match(s, arms) => {
             go(s, f);
             for a in arms {
-                f(BindSite::Pat(&a.pat));
+                f(Event::Pat(&a.pat));
                 if let Some(g) = &a.guard {
                     go(g, f);
                 }
@@ -344,7 +265,6 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                 go(x, f);
             }
         }
-        TK::NewClosure(_, _, a) => go(a, f),
         TK::New { heap, init, len } => {
             go(heap, f);
             go(init, f);
@@ -354,6 +274,7 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
         }
         TK::Vm(v) => match v {
             TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a, f),
+            TVm::SharedNext(t, _, _) => go(t, f),
             TVm::Synced(a, b, c) => {
                 go(a, f);
                 go(b, f);
@@ -366,95 +287,9 @@ pub fn for_each_bind<'a>(e: &'a TExpr, f: &mut dyn FnMut(BindSite<'a>)) {
                     go(c, f);
                 }
             }
-            TVm::SharedNext(t, _, _) => go(t, f),
             TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
             TVm::SharedArg(..) => {}
         },
     }
-}
-
-
-/// Call `f` on every expression in `e`, outermost first.
-pub fn for_each_expr<'a>(e: &'a TExpr, f: &mut dyn FnMut(&'a TExpr)) {
-    f(e);
-    let mut go = |x: &'a TExpr| for_each_expr(x, f);
-    match &e.kind {
-        TK::Local(_) | TK::Int(_) | TK::Float(_) | TK::Bool(_) | TK::Str(_) | TK::Unit | TK::Zeroed | TK::FnRef(_) => {}
-        TK::Global(_) | TK::Continue(_) | TK::Unreachable | TK::Closure(..) => {}
-        TK::Deref(a) | TK::Field(a, _) | TK::AddrOf(a) | TK::Unary(_, a) | TK::Cast(a) | TK::ArrayRepeat(a, _) => go(a),
-        TK::Try(a) | TK::Trailing(a) => go(a),
-        TK::Index(a, b) | TK::Binary(_, a, b) | TK::Assign(a, b) | TK::Coalesce(a, b) => {
-            go(a);
-            go(b);
-        }
-        TK::SliceRange(a, lo, hi) => {
-            go(a);
-            for x in [lo, hi].into_iter().flatten() {
-                go(x);
-            }
-        }
-        TK::Call(c, args) => {
-            go(c);
-            args.iter().for_each(go);
-        }
-        TK::Intrinsic(_, args) | TK::Struct(args) | TK::Tuple(args) | TK::Array(args) | TK::Variant(_, args) => args.iter().for_each(go),
-        TK::Block(stmts, tail) => {
-            for s in stmts {
-                match s {
-                    TStmt::Let(_, init) => init.iter().for_each(&mut go),
-                    TStmt::LetPat(_, x, els) => {
-                        go(x);
-                        els.iter().for_each(&mut go);
-                    }
-                    TStmt::Expr(x) | TStmt::Defer(x) => go(x),
-                }
-            }
-            tail.iter().for_each(|t| go(t));
-        }
-        TK::If(conds, then, els) => {
-            for c in conds {
-                match c {
-                    TCond::Expr(x) | TCond::Let(_, x) => go(x),
-                }
-            }
-            go(then);
-            els.iter().for_each(|x| go(x));
-        }
-        TK::Match(s, arms) => {
-            go(s);
-            for a in arms {
-                a.guard.iter().for_each(&mut go);
-                go(&a.body);
-            }
-        }
-        TK::Loop { body, step, .. } => {
-            go(body);
-            step.iter().for_each(|x| go(x));
-        }
-        TK::Break(_, v) | TK::Return(v) => v.iter().for_each(|x| go(x)),
-        TK::NewClosure(_, _, a) => go(a),
-        TK::New { heap, init, len } => {
-            go(heap);
-            go(init);
-            len.iter().for_each(|x| go(x));
-        }
-        TK::Vm(v) => match v {
-            TVm::Jump(a) | TVm::Exit(a) | TVm::Raise(a) | TVm::Cold(a) | TVm::Part(_, a) | TVm::WordAt(a, _, _) => go(a),
-            TVm::Synced(a, b, c) => {
-                go(a);
-                go(b);
-                go(c);
-            }
-            TVm::Shared(_, args, size, cont) => {
-                args.iter().for_each(&mut go);
-                go(size);
-                if let Some(c) = cont {
-                    go(c);
-                }
-            }
-            TVm::SharedNext(t, _, _) => go(t),
-            TVm::Become(..) | TVm::Word(_) | TVm::Fallthrough(..) | TVm::RaiseSlot | TVm::TableAddr(_) | TVm::Chain(_) => {}
-            TVm::SharedArg(..) => {}
-        },
-    }
+    f(Event::Leave(e));
 }
