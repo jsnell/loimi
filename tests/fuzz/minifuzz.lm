@@ -84,6 +84,7 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
         }
         if r.chance(4) and children.len > 0 { op = Mini.OP_CLOSURE; }
         if r.chance(4) { op = Mini.OP_CALL; }
+        if n > 0 and ops[n - 1] == Mini.OP_CLOSURE and r.chance(60) { op = Mini.OP_CALL; }
         if n + 1 == want and r.chance(97) { op = Mini.OP_RET0; }
         let size = Mini.op_size(Mini.with_opcode(0, op));
         if len + size > 120 { break; }
@@ -172,6 +173,10 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
             } else {
                 w = (w & 65535) | (((off as u32) & 65535) << 16);
             }
+        }
+        // Call what the previous instruction just made (CLOSURE r; CALL r).
+        if op == Mini.OP_CALL and i > 0 and Mini.opcode(p.code[starts[i - 1]]) == Mini.OP_CLOSURE and r.chance(80) {
+            w = (w & !(255 << 8)) | (p.code[starts[i - 1]] & (255 << 8));
         }
         p.code[at] = w;
         for j in 1..size { p.code[at + j] = if r.chance(3) { r.next() as u32 } else { 0 }; }

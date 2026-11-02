@@ -90,11 +90,11 @@ fuzz() {   # fuzz TARGET
         else
             [ $((SECONDS - start)) -ge "$TIME" ] && break
         fi
-        # (The subshell exits normally, so bash does not report the signal.)
+        # (Quiet: bash would report a child killed by a signal.)
         if [ -n "$SAN" ]; then
-            (timeout 600 "$BIN" "$seed" "$batch" -v > "$log.out" 2> "$log.err"; exit $?)
+            (timeout 600 "$BIN" "$seed" "$batch" -v > "$log.out" 2> "$log.err"; exit $?) 2> /dev/null
         else
-            (ulimit -v 2500000; timeout 600 "$BIN" "$seed" "$batch" -v > "$log.out" 2> "$log.err"; exit $?)
+            (ulimit -v 2500000; timeout 600 "$BIN" "$seed" "$batch" -v > "$log.out" 2> "$log.err"; exit $?) 2> /dev/null
         fi
         local st=$?
         ran=$((ran + $(grep -c '^ran$' "$log.err")))
