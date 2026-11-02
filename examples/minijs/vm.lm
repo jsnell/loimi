@@ -47,6 +47,22 @@ fn arith(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
     Ok(value.number(r))
 }
 
+/// ADD/SUB/MUL outside their fast paths: Int overflow, then `arith`.
+fn arith_cold(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
+    if let (Int(x), Int(y)) = (a, b) {
+        let (fx, fy) = (x as f64, y as f64);
+        return Ok(V.Num(if op == 0 { fx + fy } else if op == 1 { fx - fy } else { fx * fy }));
+    }
+    arith(c, op, a, b)
+}
+
+/// Fuse superinstructions in a function again after one of its sites was
+/// quickened (fusion compares words by the op they stand for, so supers
+/// of specialized members form too).
+fn refuse(cl: Gc<Fn>) {
+    JS.optimize(cl.proto.code);
+}
+
 fn js_pow(x: f64, y: f64) -> f64 {
     // pow(1, NaN) and pow(-1, ±Infinity) are 1 in C but NaN in JS.
     if y != y { return 0.0 / 0.0; }
@@ -156,11 +172,15 @@ fn prim_get(c: *Ctx, v: V, kv: V, shape_w: *u32, slot_w: *u32) -> Result<(V, boo
     Ok((c.get(v, key)?, false))
 }
 
-/// SETPROP miss: store, and update the site (an obj.Site).
-fn write_miss(c: *Ctx, v: V, kv: V, x: V, site: *obj.Site) -> Result<obj.IcState, V> {
+/// SETPROP miss in state `st`: store, and update the site (an obj.Site).
+/// Other receivers than objects keep Poly and Mega sites as they are.
+fn write_miss(c: *Ctx, v: V, kv: V, x: V, site: *obj.Site, st: obj.IcState) -> Result<obj.IcState, V> {
     let key = key_of_const(c, kv);
-    let O(o) = v else { c.set(v, key, x)?; return Ok(obj.IcState.Generic); };
-    Ok(c.m.write_miss(site, o, key, x))
+    let O(o) = v else {
+        c.set(v, key, x)?;
+        return Ok(if st == obj.IcState.Poly or st == obj.IcState.Mega { st } else { obj.IcState.Generic });
+    };
+    Ok(c.m.write_miss_in(site, st, o, key, x))
 }
 
 /// Create a closure of child prototype `i` of the running function.
@@ -270,6 +290,7 @@ fn construct_this(c: *Ctx, f: Gc<Fn>) -> V {
 }
 
 /// After `new f` returned object `o`: learn its size for later objects.
+#[inline(always)]
 fn observe(f: Gc<Fn>, o: Gc<Obj>) {
     let n = o.shape.count;
     if o.dict.is_none() and n > f.hint {
@@ -441,6 +462,7 @@ pub vm JS {
                     if st == obj.IcState.OwnIn { become #own_in; }
                     if st == obj.IcState.OwnOut { become #own_out; }
                     if st == obj.IcState.Proto { become #protom; }
+                    if st == obj.IcState.Poly { become #polym; }
                     next
                 }
                 let (v, p) = prim_get(ctx, obj, key, &cache.sid, &cache.slot)?;
@@ -504,6 +526,9 @@ pub vm JS {
                 }
                 cold { become #fam; redo }
             }
+            // A rope receiver is replaced by its flat string in its
+            // register (so a loop calling `s.charCodeAt(i)` on a rope
+            // flattens once) and the site stays.
             #sprotom {
                 if let S(_) = obj {
                     let p = ctx.str_proto();
@@ -513,6 +538,7 @@ pub vm JS {
                         next
                     }
                 }
+                if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
                 cold { become #fam; redo }
             }
             // Up to eight (shape, own slot or prototype hit) pairs.
@@ -557,13 +583,18 @@ pub vm JS {
         }
     }
 
+    // Store sites: std.obj's write state machine (write_miss_in). A
+    // monomorphic member that keeps missing becomes _POLY (up to eight
+    // own-slot entries), and a Poly entry that keeps filling up makes the
+    // site _MEGA (the slow path, without refilling).
     family SETPROP(obj: reg, key: kst, val: reg) : ABC + PropIC {
         generic {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site)?;
+            let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Generic)?;
             if st == obj.IcState.OwnIn { become SETPROP_IN; }
             if st == obj.IcState.OwnOut { become SETPROP_OUT; }
             if st == obj.IcState.Add { become SETPROP_ADD; }
+            if st == obj.IcState.Poly { become SETPROP_POLY; }
             next
         }
         SETPROP_IN {
@@ -571,7 +602,15 @@ pub vm JS {
                 o.inline.ptr[cache.slot] = val;
                 next
             }
-            cold { become SETPROP; redo }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnIn)?;
+                if st == obj.IcState.OwnOut { become SETPROP_OUT; }
+                if st == obj.IcState.Add { become SETPROP_ADD; }
+                if st == obj.IcState.Poly { become SETPROP_POLY; }
+                if st == obj.IcState.Generic { become SETPROP; }
+                next
+            }
         }
         SETPROP_OUT {
             if let O(o) = obj and o.shape.id == cache.sid {
@@ -579,7 +618,15 @@ pub vm JS {
                 s.data.ptr[cache.slot & !obj.OUT] = val;
                 next
             }
-            cold { become SETPROP; redo }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.OwnOut)?;
+                if st == obj.IcState.OwnIn { become SETPROP_IN; }
+                if st == obj.IcState.Add { become SETPROP_ADD; }
+                if st == obj.IcState.Poly { become SETPROP_POLY; }
+                if st == obj.IcState.Generic { become SETPROP; }
+                next
+            }
         }
         // A cached add: the shape check proves the object is not a
         // prototype (std.obj gives those other shapes).
@@ -589,6 +636,23 @@ pub vm JS {
                 next
             }
             cold { become SETPROP; redo }
+        }
+        SETPROP_POLY {
+            if let O(o) = obj and ctx.m.poly_set(o, cache.ent, val) { next }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let st = write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Poly)?;
+                if st == obj.IcState.Mega { become SETPROP_MEGA; }
+                next
+            }
+        }
+        SETPROP_MEGA {
+            if let (O(o), S(ks)) = (obj, key) and ctx.m.mega_set(o, ks.key as u64, val) { next }
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                write_miss(ctx, obj, key, val, &cache.sid as *obj.Site, obj.IcState.Mega)?;
+                next
+            }
         }
     }
 
@@ -639,38 +703,72 @@ pub vm JS {
         }
     }
 
-    // Arithmetic.
-    inline for (name, checked, sym, code) in [
-        ("ADD", "add_checked", +, 0),
-        ("SUB", "sub_checked", -, 1),
+    // Arithmetic: ADD, SUB and MUL are families. The generic member tests
+    // (Int, Int) first; the first time a site sees two floats it becomes
+    // the _F member, which adds the raw words as doubles (a tagged word is
+    // a NaN as a double, so a result that is not a NaN means both
+    // operands were numbers). A site that first sees an Int and a Num
+    // becomes _IF or _FI, which only handle that case inline and make
+    // the site float-first otherwise. Members handle every type, so a
+    // site never switches back.
+    inline for (name, fname, ifname, finame, checked, sym, code) in [
+        ("ADD", "ADD_F", "ADD_IF", "ADD_FI", "add_checked", +, 0),
+        ("SUB", "SUB_F", "SUB_IF", "SUB_FI", "sub_checked", -, 1),
+        ("MUL", "MUL_F", "MUL_IF", "MUL_FI", "mul_checked", *, 2),
     ] {
-        op #name(dst: reg, a: reg, b: reg) : ABC {
-            match (a, b) {
-                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
-                (Num(x), Num(y)) => { dst = Num(x sym y); next }
-                (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
-                (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
-                _ => {}
+        family #name(dst: reg, a: reg, b: reg) : ABC {
+            generic {
+                if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) {
+                    dst = Int(r);
+                    next
+                }
+                cold {
+                    match (a, b) {
+                        (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; refuse(fp.cl); next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); become #finame; refuse(fp.cl); next }
+                        _ => {}
+                    }
+                    if code == 0 and ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    dst = arith_cold(ctx, code, a, b)?;
+                    next
+                }
             }
-            cold {
-                if let (Int(x), Int(y)) = (a, b) { dst = Num(x as f64 sym y as f64); next }
-                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                dst = arith(ctx, code, a, b)?;
-                next
+            #fname {
+                let r = unsafe { *((regs + a.raw) as *f64) } sym unsafe { *((regs + b.raw) as *f64) };
+                if likely(r == r) { dst = r.to_bits() as V; next }
+                cold {
+                    match (a, b) {
+                        (Num(x), Num(y)) => { dst = Num(x sym y); next }
+                        (Int(x), Num(y)) => { dst = Num(x as f64 sym y); next }
+                        (Num(x), Int(y)) => { dst = Num(x sym y as f64); next }
+                        (Int(x), Int(y)) => if let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) { dst = Int(r); next },
+                        _ => {}
+                    }
+                    if code == 0 and ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                    dst = arith_cold(ctx, code, a, b)?;
+                    next
+                }
+            }
+            #ifname {
+                if let Int(x) = a {
+                    let r = x as f64 sym unsafe { *((regs + b.raw) as *f64) };
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; refuse(fp.cl); redo }
+            }
+            #finame {
+                if let Int(y) = b {
+                    let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
+                    if likely(r == r) { dst = r.to_bits() as V; next }
+                }
+                cold { become #fname; refuse(fp.cl); redo }
             }
         }
-    }
-    op MUL(dst: reg, a: reg, b: reg) : ABC {
-        match (a, b) {
-            (Int(x), Int(y)) => if let Some(r) = x.mul_checked(y) and (r != 0 or (x | y) >= 0) { dst = Int(r); next },
-            (Num(x), Num(y)) => { dst = Num(x * y); next }
-            (Int(x), Num(y)) => { dst = Num(x as f64 * y); next }
-            (Num(x), Int(y)) => { dst = Num(x * y as f64); next }
-            _ => {}
-        }
-        cold { dst = arith(ctx, 2, a, b)?; next }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
+        let r = unsafe { *((regs + a.raw) as *f64) } / unsafe { *((regs + b.raw) as *f64) };
+        if likely(r == r) { dst = r.to_bits() as V; next }
         match (a, b) {
             (Int(x), Int(y)) => {
                 // Integral quotients stay Int (no -0: a zero quotient of
@@ -683,17 +781,33 @@ pub vm JS {
                 dst = Num(r);
                 next
             }
-            (Num(x), Num(y)) => { dst = Num(x / y); next }
             (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
             (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
             _ => {}
         }
         cold { dst = arith(ctx, 3, a, b)?; next }
     }
-    op MOD(dst: reg, a: reg, b: reg) : ABC {
-        if let (Int(x), Int(y)) = (a, b) and y > 0 and x >= 0 { dst = Int(x % y); next }
+    /// `%` with a positive Int divisor is exact in integers when the
+    /// dividend is integral (an Int, or a Num below 2^53).
+    inline for (name, bkind) in [("MOD", reg), ("MODK", kst)] {
+    op #name(dst: reg, a: reg, b: bkind) : ABC {
+        if let Int(y) = b and y > 0 {
+            if let Int(x) = a and x >= 0 { dst = Int(x % y); next }
+            var xi: i64 = 0;
+            var ok = false;
+            if let Int(x) = a { xi = x as i64; ok = true; }
+            if let Num(x) = a and x >= -9007199254740992.0 and x <= 9007199254740992.0 {
+                xi = x as i64;
+                ok = xi as f64 == x;
+            }
+            if ok {
+                let r = xi % (y as i64);
+                if r != 0 or xi > 0 { dst = Int(r as i32); next }
+            }
+        }
         if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
         cold { dst = arith(ctx, 4, a, b)?; next }
+    }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
         cold { dst = arith(ctx, 5, a, b)?; next }
@@ -724,8 +838,12 @@ pub vm JS {
         dst = Int(!int32(a));
         next
     }
-    inline for (name, code) in [("BAND", 0), ("BOR", 1), ("BXOR", 2), ("SHL", 3), ("SHR", 4), ("USHR", 5)] {
-        op #name(dst: reg, a: reg, b: reg) : ABC {
+    // The K forms take an Int constant (`h << 5`, `x | 0`, `i & 255`).
+    inline for (name, code, bkind) in [
+        ("BAND", 0, reg), ("BOR", 1, reg), ("BXOR", 2, reg), ("SHL", 3, reg), ("SHR", 4, reg), ("USHR", 5, reg),
+        ("BANDK", 0, kst), ("BORK", 1, kst), ("BXORK", 2, kst), ("SHLK", 3, kst), ("SHRK", 4, kst), ("USHRK", 5, kst),
+    ] {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
             if let (Int(x), Int(y)) = (a, b) {
                 if code == 0 { dst = Int(x & y); next }
                 if code == 1 { dst = Int(x | y); next }
@@ -812,7 +930,25 @@ pub vm JS {
             if let Num(x) = a { eq = x == x; }
             branch(eq == want, then.target)
         }
+        // Different words: two Ints (the usual case) are not equal.
+        if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
         branch(eq_slow(a, b) == want, then.target)
+    }
+
+    /// Compare against a small integer constant and branch: R[a] < sc,
+    /// <= sc, > sc, >= sc.
+    inline for (name, icmp, fcmp, swap, oreq) in [
+        ("JLTI", xi < c, xf < c as f64, false, false), ("JLEI", xi <= c, xf <= c as f64, false, true),
+        ("JGTI", xi > c, xf > c as f64, true, false), ("JGEI", xi >= c, xf >= c as f64, true, true),
+    ] {
+        op #name(pol: imm, a: reg, sc: simm) : ABsC then JMP {
+            let want = pol != 0;
+            let c = sc as i32;
+            if let Int(xi) = a { branch(icmp == want, then.target) }
+            if let Num(xf) = a { branch(fcmp == want, then.target) }
+            let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
+            branch(r == want, then.target)
+        }
     }
 
     /// JEQ against a constant.
@@ -823,9 +959,21 @@ pub vm JS {
             if let Num(x) = a { eq = x == x; }
             branch(eq == want, then.target)
         }
+        // Different words: two Ints (the usual case) are not equal.
+        if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
         branch(eq_slow(a, b) == want, then.target)
     }
 
+    /// `switch` on Int cases lo .. lo+n-1: followed by n JMPs (one per
+    /// value) and the JMP for every other value.
+    op SWITCHI(r: reg, lo: kst, n: imm) : ABC {
+        var i = n as u64;
+        if let (Int(x), Int(l)) = (r, lo) and ((x as i64 - l as i64) as u64) < n as u64 { i = (x as i64 - l as i64) as u64; }
+        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and x == x.floor() {
+            i = (x as i64 - l as i64) as u64;
+        }
+        jump pc + 1 + i
+    }
     op JMP(target: label) : sJ { jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {
@@ -884,59 +1032,168 @@ pub vm JS {
         jump p.code.ptr
     }
 
+    /// A native call from CALL's members (their callee is the native
+    /// they expected, the arguments are not what their inline path takes).
+    fn call_native(base: u64, nargs: u64) -> never {
+        if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+        let F(cl) = regs[base] else { unreachable };
+        regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs)?;
+        next
+    }
+
     /// R[base] = R[base](R[base+2] .. R[base+1+nargs]) with this = R[base+1].
-    op CALL(base: callbase, nargs: imm) : ABC {
-        if let F(cl) = regs[base] {
-            let p = cl.proto;
-            if likely(p.fixed <= 255) {
-                let callee = regs + base + 1;
-                let n = p.nregs as u64;
-                if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-                    cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+    /// Sites that call certain natives (`s.charCodeAt(i)`, `a.push(x)`,
+    /// `Math.floor(x)`, ...) become members that run them inline while
+    /// the callee is that native.
+    family CALL(base: callbase, nargs: imm) : ABC {
+        generic {
+            if let F(cl) = regs[base] {
+                let p = cl.proto;
+                if likely(p.fixed <= 255) {
+                    let callee = regs + base + 1;
+                    let n = p.nregs as u64;
+                    if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                        cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+                    }
+                    // Missing arguments are undefined; extra ones are dropped
+                    // (their registers are the callee's locals, cleared with
+                    // the rest). Two registers per store pair: the register
+                    // after the window may be cleared too (it is free).
+                    let fx = p.fixed as u64;
+                    if (nargs as u64) < fx {
+                        cold {
+                            var i = nargs as u64 + 1;
+                            while i <= fx { callee[i] = Undef; i += 1; }
+                        }
+                    }
+                    var q = callee + fx + 1;
+                    let e = callee + n;
+                    while q < e {
+                        q[0] = Undef;
+                        q[1] = Undef;
+                        q = q + 2;
+                    }
+                    fp.resume = pc + 1;
+                    fp = fp + 1;
+                    fp.cl = cl;
+                    fp.base = callee;
+                    fp.flags = 0;
+                    k = p.consts.data.ptr;
+                    fp.k = k;
+                    regs = callee;
+                    jump p.code.ptr
                 }
-                // Missing arguments are undefined; extra ones are dropped
-                // (their registers are the callee's locals).
-                var i = nargs as u64 + 1;
-                if nargs as u32 > p.fixed { i = p.fixed as u64 + 1; }
-                while i < n {
-                    callee[i] = Undef;
-                    i += 1;
+                // Natives: out of line, so that the bytecode path needs
+                // no stack frame.
+                if cl.native != 0 {
+                    if nargs == 1 {
+                        let f = regs[base];
+                        if f == ctx.f_cca { become CALL_CCA; }
+                        if f == ctx.f_charat { become CALL_CHARAT; }
+                        if f == ctx.f_push { become CALL_PUSH; }
+                        if f == ctx.f_floor { become CALL_FLOOR; }
+                        if f == ctx.f_sqrt { become CALL_SQRT; }
+                    }
+                    cold { call_native(base as u64, nargs as u64) }
                 }
-                fp.resume = pc + 1;
-                fp = fp + 1;
-                fp.cl = cl;
-                fp.base = callee;
-                fp.flags = 0;
-                k = p.consts.data.ptr;
-                fp.k = k;
-                regs = callee;
-                jump p.code.ptr
             }
-            if cl.native != 0 {
-                if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-                regs[base] = builtins.call(ctx, cl.native, regs[base + 1], regs + base + 2, nargs as u64)?;
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                call_slow(base as u64, nargs as u64, 0)
+            }
+        }
+        /// s.charCodeAt(i)
+        CALL_CCA {
+            if regs[base] == ctx.f_cca and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
+                    and (i as u32 as u64) < s.data.len {
+                regs[base] = Int(s.data[i as u32 as u64] as i32);
                 next
             }
+            cold {
+                if regs[base] != ctx.f_cca { become CALL; redo }
+                call_native(base as u64, 1)
+            }
         }
-        cold {
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            call_slow(base as u64, nargs as u64, 0)
+        /// s.charAt(i)
+        CALL_CHARAT {
+            if regs[base] == ctx.f_charat and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
+                    and (i as u32 as u64) < s.data.len {
+                regs[base] = S(ctx.char_str(s.data[i as u32 as u64]));
+                next
+            }
+            cold {
+                if regs[base] != ctx.f_charat { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// a.push(x) with room in the store.
+        CALL_PUSH {
+            if regs[base] == ctx.f_push and let A(a) = regs[base + 1] and let Some(st) = a.store
+                    and a.len < st.data.len {
+                a.ptr[a.len] = regs[base + 2];
+                a.len += 1;
+                regs[base] = Int(a.len as i32);
+                next
+            }
+            cold {
+                if regs[base] != ctx.f_push { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// Math.floor(x)
+        CALL_FLOOR {
+            if regs[base] == ctx.f_floor {
+                let x = regs[base + 2];
+                if let Int(_) = x { regs[base] = x; next }
+                if let Num(d) = x {
+                    let f = d.floor();
+                    if f >= -2147483648.0 and f <= 2147483647.0 and (f != 0.0 or d > 0.0) {
+                        regs[base] = Int(f as i32);
+                        next
+                    }
+                }
+            }
+            cold {
+                if regs[base] != ctx.f_floor { become CALL; redo }
+                call_native(base as u64, 1)
+            }
+        }
+        /// Math.sqrt(x)
+        CALL_SQRT {
+            if regs[base] == ctx.f_sqrt {
+                let x = regs[base + 2];
+                if let Num(d) = x and d >= 0.0 { regs[base] = value.number(d.sqrt()); next }
+                if let Int(i) = x and i >= 0 { regs[base] = value.number((i as f64).sqrt()); next }
+            }
+            cold {
+                if regs[base] != ctx.f_sqrt { become CALL; redo }
+                call_native(base as u64, 1)
+            }
         }
     }
+
     /// Push a frame for bytecode function `cl` called at `base` and jump to it.
     fn enter(cl: Gc<Fn>, base: u64, nargs: u64, flags: u32) -> never {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-            raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
+        if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+            cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         }
+        // As in CALL.
         let np = p.nparams as u64;
-        var i = nargs + 1;
-        if nargs > np { i = np + 1; }
-        while i < n {
-            callee[i] = Undef;
-            i += 1;
+        if nargs < np {
+            cold {
+                var i = nargs + 1;
+                while i <= np { callee[i] = Undef; i += 1; }
+            }
+        }
+        var q = callee + np + 1;
+        let e = callee + n;
+        while q < e {
+            q[0] = Undef;
+            q[1] = Undef;
+            q = q + 2;
         }
         fp.resume = pc + 1;
         fp = fp + 1;
@@ -975,16 +1232,20 @@ pub vm JS {
             call_slow(base as u64, nargs as u64, rt.FR_NEW)
         }
     }
+    // The bottom frame is flagged FR_BOTTOM, so one test of the flags
+    // finds both `new` frames and the end of the run.
     op RET(src: reg) : ABC {
         var v = src;
         if fp.flags != 0 {
             cold {
-                match v {
-                    O(_) | A(_) | F(_) => {}
-                    _ => { v = regs[0]; }
+                if fp.flags & rt.FR_NEW != 0 {
+                    match v {
+                        O(_) | A(_) | F(_) => {}
+                        _ => { v = regs[0]; }
+                    }
+                    if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
+                    if let O(o) = regs[0] { observe(fp.cl, o); }
                 }
-                if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
-                if let O(o) = regs[0] { observe(fp.cl, o); }
                 if fp == ctx.frames { exit v }
                 *(regs - 1) = v;
                 fp = fp - 1;
@@ -993,7 +1254,6 @@ pub vm JS {
                 jump fp.resume
             }
         }
-        if fp == ctx.frames { exit v }
         *(regs - 1) = v;
         fp = fp - 1;
         regs = fp.base;
@@ -1001,10 +1261,20 @@ pub vm JS {
         jump fp.resume
     }
     op RETU() : ABC {
-        if fp.flags != 0 or fp == ctx.frames {
+        // A constructor returning normally (`new` frames are common).
+        if fp.flags == rt.FR_NEW {
+            let O(o) = regs[0] else { cold { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") } };
+            observe(fp.cl, o);
+            *(regs - 1) = regs[0];
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+            jump fp.resume
+        }
+        if fp.flags != 0 {
             cold {
                 var v = V.Undef;
-                if fp.flags != 0 {
+                if fp.flags & rt.FR_NEW != 0 {
                     v = regs[0];
                     if v == V.Undef { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
                     if let O(o) = v { observe(fp.cl, o); }
@@ -1075,6 +1345,16 @@ pub vm JS {
     // Superinstructions for common pairs.
     super MOVE_MOVE = MOVE; MOVE;
     super GETPROP_IN_GETPROP_IN = GETPROP_IN; GETPROP_IN;
+    super GETLEN_JLT = GETLEN; JLT;
+    super ADDI_JLT = ADDI; JLT;
+    super MOVE_CALL = MOVE; CALL;
+    super GETMETHOD_P_CALL = GETMETHOD_P; CALL;
+    super GETGLOBAL_LOADU = GETGLOBAL; LOADU;
+    super LOADU_MOVE = LOADU; MOVE;
+    super GETINDEX_SETINDEX = GETINDEX; SETINDEX;
+    super GETPROP_IN_GETMETHOD_P = GETPROP_IN; GETMETHOD_P;
+    super MUL_F_ADD_F = MUL_F; ADD_F;
+    super MUL_F_MUL_F = MUL_F; MUL_F;
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V {
         ctx = c;
@@ -1085,7 +1365,7 @@ pub vm JS {
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;
-        fp.flags = 0;
+        fp.flags = rt.FR_BOTTOM;
         k = p.consts.data.ptr;
         fp.k = k;
         c.fp = fp;

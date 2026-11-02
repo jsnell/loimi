@@ -38,6 +38,8 @@ fn stats(c: *Ctx) {
     b.push_int(c.m.shapes.adds.len as i64);
     b.push_str(", validity cells ");
     b.push_int((c.m.shapes.cvalid.len - 1) as i64);
+    b.push_str(", keys ");
+    b.push_int(c.keys.names.len as i64);
     b.push_str(", collections ");
     b.push_int(c.heap.collections as i64);
     io.eprintln(b.as_str());
