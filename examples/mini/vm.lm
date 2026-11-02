@@ -180,6 +180,19 @@ fn length(c: *Ctx, v: V) -> Result<V, V> {
     }
 }
 
+/// GETFIELD/SELF cache miss: look `key` up and remember its slot.
+fn field_get_slow(t: Gc<Table>, key: V, slot: *u32) -> V {
+    let Some(i) = value.table_find(t, key) else { return V.Nil; };
+    *slot = i as u32;
+    t.hptr[2 * i + 1]
+}
+
+/// SETFIELD cache miss: store, then remember the key's slot.
+fn field_set_slow(h: *gc.Heap, t: Gc<Table>, key: V, v: V, slot: *u32) {
+    value.table_set(h, t, key, v);
+    if let Some(i) = value.table_find(t, key) { *slot = i as u32; }
+}
+
 /// The single dispatch point for natives. Natives allocate but never collect.
 fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
     lib.call(&c.heap, id, args, n)
@@ -296,14 +309,35 @@ pub vm Mini {
         }
         next
     }
-    op GETFIELD(dst: reg, t: reg, key: kst) : ABC {
-        if let T(tab) = t { dst = value.table_get(tab, key); next }
+    // Field access with a constant string key caches the hash slot where
+    // the key was last found. A hit only needs the slot to be in range
+    // and to hold the same key (strings are interned, so that is one
+    // compare). Shapes would let this skip the key check; tables built
+    // the same way put a key in the same slot, which is what makes
+    // record-style access hit.
+    cache FieldIC { slot: u32 }
+
+    op GETFIELD(dst: reg, t: reg, key: kst) : ABC + FieldIC {
+        if let T(tab) = t {
+            let i = cache.slot as u64;
+            if likely(i < tab.hcap) {
+                let p = tab.hptr + 2 * i;
+                if p[0] == key { dst = p[1]; next }
+            }
+            dst = field_get_slow(tab, key, &cache.slot);
+            next
+        }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
-    op SETFIELD(t: reg, key: kst, v: reg) : ABC {
+    op SETFIELD(t: reg, key: kst, v: reg) : ABC + FieldIC {
         if let T(tab) = t {
+            let i = cache.slot as u64;
+            if likely(i < tab.hcap) {
+                let p = tab.hptr + 2 * i;
+                if p[0] == key { p[1] = v; next }
+            }
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            value.table_set(&ctx.heap, tab, key, v);
+            field_set_slow(&ctx.heap, tab, key, v, &cache.slot);
             next
         }
         cold { raise error(ctx, "attempt to index a ", t) }
@@ -341,11 +375,16 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// Method lookup: R[a+1] = obj; R[a] = obj[key].
-    op SELF(a: callbase, obj: reg, key: kst) : ABC {
+    op SELF(a: callbase, obj: reg, key: kst) : ABC + FieldIC {
         let o = obj;
         if let T(tab) = o {
             regs[a + 1] = o;
-            regs[a] = value.table_get(tab, key);
+            let i = cache.slot as u64;
+            if likely(i < tab.hcap) {
+                let p = tab.hptr + 2 * i;
+                if p[0] == key { regs[a] = p[1]; next }
+            }
+            regs[a] = field_get_slow(tab, key, &cache.slot);
             next
         }
         cold { raise error(ctx, "attempt to index a ", o) }

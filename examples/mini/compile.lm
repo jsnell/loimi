@@ -480,7 +480,10 @@ fn Parser.discharge(p: *Parser, e: E, dst: u32) {
             p.emit(Mini.GETGLOBAL(d, k as u16));
             p.emit(0);   // inline cache word
         }
-        Field(t, k) => { p.emit(Mini.GETFIELD(d, t as u8, k as u8)); }
+        Field(t, k) => {
+            p.emit(Mini.GETFIELD(d, t as u8, k as u8));
+            p.emit(0);   // inline cache word
+        }
         Index(t, k) => { p.emit(Mini.GETINDEX(d, t as u8, k as u8)); }
         IndexI(t, i) => { p.emit(Mini.GETINDEXI(d, t as u8, i as u8)); }
         Reloc(at) => {
@@ -531,6 +534,7 @@ fn Parser.store_var(p: *Parser, target: E, v: E) {
         Field(t, k) => {
             let v = p.any_reg(v);
             p.emit(Mini.SETFIELD(t as u8, k as u8, reg_of(v) as u8));
+            p.emit(0);   // inline cache word
         }
         Index(t, k) => {
             let v = p.any_reg(v);
@@ -659,6 +663,7 @@ fn Parser.suffixed(p: *Parser) -> E {
                 let k = p.name_const(name.text);
                 if k <= 255 {
                     p.emit(Mini.SELF(base as u8, reg_of(obj) as u8, k as u8));
+                    p.emit(0);   // inline cache word
                 } else {
                     p.emit(Mini.MOVE((base + 1) as u8, reg_of(obj) as u8));
                     p.emit(Mini.LOADK(base as u8, k as u16));
@@ -696,6 +701,7 @@ fn Parser.constructor(p: *Parser) -> E {
             let vr = p.any_reg(v);
             if k <= 255 {
                 p.emit(Mini.SETFIELD(t as u8, k as u8, reg_of(vr) as u8));
+                p.emit(0);   // inline cache word
             } else {
                 let kr = p.reserve(1);
                 p.emit(Mini.LOADK(kr as u8, k as u16));
