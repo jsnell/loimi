@@ -358,21 +358,7 @@ impl<'a> Checker<'a> {
                 match item {
                     Item::Struct(s) if s.generics.is_empty() => {
                         let Some((Def::Struct(id), _)) = self.scopes[m].get(&s.name.name).cloned() else { unreachable!() };
-                        let mut fields = Vec::new();
-                        let mut trailing = None;
-                        for (i, (f, t)) in s.fields.iter().enumerate() {
-                            if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
-                                return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
-                            }
-                            if let TypeKind::Trailing(elem) = &t.kind {
-                                if !s.is_object || i + 1 != s.fields.len() {
-                                    return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
-                                }
-                                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
-                                continue;
-                            }
-                            fields.push((f.name.clone(), self.resolve_type(m, t)?));
-                        }
+                        let (fields, trailing) = self.struct_fields(m, s)?;
                         self.prog.structs[id as usize].fields = fields;
                         self.prog.structs[id as usize].trailing = trailing;
                     }
@@ -450,9 +436,43 @@ impl<'a> Checker<'a> {
             self.pending.push((id, m, f, vec![]));
         }
         while let Some((id, m, f, env)) = self.pending.pop() {
-            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None))?;
+            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
         }
         Ok(())
+    }
+
+    /// The fields of a struct or object declaration (with type parameters
+    /// bound in `tenv`), and its trailing array.
+    #[allow(clippy::type_complexity)]
+    pub fn struct_fields(&mut self, m: usize, s: &StructDecl) -> Res<(Vec<(String, Ty)>, Option<(String, Ty)>)> {
+        let mut fields = Vec::new();
+        let mut trailing = None;
+        for (i, (f, t)) in s.fields.iter().enumerate() {
+            if fields.iter().any(|(n, _): &(String, Ty)| *n == f.name) {
+                return Err(Diag::new(f.span, format!("duplicate field `{}`", f.name)));
+            }
+            if let TypeKind::Trailing(elem) = &t.kind {
+                if !s.is_object || i + 1 != s.fields.len() {
+                    return Err(Diag::new(t.span, "a trailing array `[T]` must be the last field of an `object`"));
+                }
+                trailing = Some((f.name.clone(), self.resolve_type(m, elem)?));
+                continue;
+            }
+            fields.push((f.name.clone(), self.resolve_type(m, t)?));
+        }
+        Ok((fields, trailing))
+    }
+
+    /// An error inside an instance of a generic function: say which
+    /// instance, and where it was first needed.
+    pub fn instance_note(&self, d: Diag, id: FnId) -> Diag {
+        match self.generics.fn_site.get(&id) {
+            Some(site) if !d.notes.iter().any(|(s, _)| s == site) => {
+                let name = self.prog.fns[id as usize].name.clone();
+                d.note(*site, format!("in `{}`, instantiated here", name))
+            }
+            _ => d,
+        }
     }
 
     pub fn declare_fn(&mut self, id: FnId, m: usize, f: &FnDecl, symbol: Option<String>) -> Res<()> {
@@ -629,8 +649,21 @@ impl<'a> Checker<'a> {
                         return Err(Diag::new(t.span, "Gc takes one type argument"));
                     }
                     let inner = self.resolve_type(m, &args[0])?;
-                    if !matches!(&inner, Ty::Struct(i) if self.prog.structs[*i as usize].object.is_some()) {
-                        return Err(Diag::new(args[0].span, "Gc<T> needs an `object` type"));
+                    // A type parameter is checked when it is bound: in a
+                    // generic signature it is an inference variable here,
+                    // and in an instance it is the concrete type.
+                    let ok = match &inner {
+                        Ty::Struct(i) => self.prog.structs[*i as usize].object.is_some(),
+                        Ty::Param(_) => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        let msg = if self.tenv.is_empty() {
+                            "Gc<T> needs an `object` type".to_string()
+                        } else {
+                            format!("Gc<T> needs an `object` type, found `{}`", self.ty_name(&inner))
+                        };
+                        return Err(Diag::new(args[0].span, msg));
                     }
                     return Ok(Ty::Gc(Box::new(inner)));
                 }

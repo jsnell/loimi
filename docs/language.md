@@ -741,6 +741,18 @@ enough to make it precise and cheap:
 - **`object` declarations** are GC-managed structs. The compiler generates the
   header (type id, mark bits) and the trace function from field types.
   A trailing variable-length array is allowed (`slots: [Value]`).
+- **Generic objects.** `object Obj<V> { shape: Gc<Shape>, inline: [V] }` is
+  a family of object types: each instance (`Obj<Value>`, `Obj<i64>`) is an
+  object type of its own, with its own type id and generated trace
+  function, so `Obj<i64>`'s slots are not traced and `Obj<Value>`'s are.
+  The trailing array may have a type parameter as its element type.
+  `Gc<T>` may name a type parameter (`fn keep<T>(x: Gc<T>) -> Gc<T>`,
+  `struct Pair<T> { a: Gc<T>, b: Gc<T> }`). There is no `Object` bound:
+  like method calls in generic bodies, this is checked per instance, when
+  T is bound. Binding T to something that is not an `object` is an error
+  at the `Gc<T>` in the generic declaration, with a note pointing to the
+  use that created the instance: "Gc<T> needs an `object` type, found
+  `i64`".
 - **`Gc<T>`** is a traced reference. A `Value` traces whichever variants hold `Gc`.
   It converts to a raw pointer or a `u64` address with `as`. The way back
   (`p as Gc<T>` from a pointer, a `u64`, or another `Gc`) is only allowed

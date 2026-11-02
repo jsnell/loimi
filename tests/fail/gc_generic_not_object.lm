@@ -1,0 +1,10 @@
+// `Gc<T>` with a type parameter is checked when T is bound.
+import std.gc;
+
+fn nothing<T>(h: *gc.Heap) -> ?Gc<T> { None }
+
+fn main() {
+    var heap = gc.Heap.new();
+    let n = nothing<i64>(&heap);
+}
+// error: Gc<T> needs an `object` type, found `i64`
