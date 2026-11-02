@@ -1,7 +1,7 @@
 // The Stak virtual machine: a data stack, a locals stack and a frame stack.
 //
-// State registers: `pc`, `sp` (points AT the top value; the empty stack
-// is `stack - 1`), `lp` (the current word's local slots) and `fp` (the
+// State registers: `pc`, `sp` and `tos` (the top value is cached in a
+// register, `sp` points at the one below it), `lp` (the current word's local slots) and `fp` (the
 // current frame). The compiler checks stack depths statically, so ops pop
 // and push without underflow checks; CALL checks for overflow once per
 // call, against the callee's maximum depth.
@@ -36,6 +36,7 @@ pub struct Machine {
     heap: gc.Heap,
     /// The state as of the last sync, for the root scanner.
     sp: *Value,
+    tos: Value,
     lp: *Value,
     fp: *Frame,
     out: text.StrBuf,
@@ -52,6 +53,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     let m = data as *Machine;
     var p = m.stack;
     while p <= m.sp { gc_mark(h, *p); p = p + 1; }
+    gc_mark(h, m.tos);
     let ltop = m.lp + m.fp.word.nlocals as u64;
     p = m.lstack;
     while p < ltop { gc_mark(h, *p); p = p + 1; }
@@ -132,7 +134,10 @@ fn stringify(m: *Machine, a: Value, b: Value, two: bool) -> Value uses gc {
 #[require_verified]
 pub vm Stak {
     context ctx: *Machine;
-    state { pc: *u32, sp: *Value, lp: *Value, fp: *Frame }
+    // The top of the stack lives in `tos`; `sp` points at the value below
+    // it. The stack's bottom slot holds a dummy value, so `tos` is always
+    // defined.
+    state { pc: *u32, sp: *Value, tos: Value, lp: *Value, fp: *Frame }
 
     verify_context word: *Word, nglobals: u32, nconsts: u32, nwords: u32;
 
@@ -146,7 +151,7 @@ pub vm Stak {
     operand cnt = it;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
-    sync { ctx.sp = sp; ctx.lp = lp; ctx.fp = fp; }
+    sync { ctx.sp = sp; ctx.tos = tos; ctx.lp = lp; ctx.fp = fp; }
 
     encoding fixed(u32) {
         format N  { op: 8, x: 24 }
@@ -154,7 +159,10 @@ pub vm Stak {
         format LS { op: 8, a: 8, sb: s16 }
     }
 
-    fn push(v: Value) { sp = sp + 1; *sp = v; }
+    fn push(v: Value) { sp = sp + 1; *sp = tos; tos = v; }
+    fn drop1() { tos = *sp; sp = sp - 1; }
+    /// Replaces the top two values with `v`.
+    fn put2(v: Value) { sp = sp - 1; tos = v; }
 
     // Literals.
     op PUSHI(v: imm) : S { push(Int(v as i32)); next }
@@ -163,30 +171,30 @@ pub vm Stak {
     op PUSHBOOL(b: imm) : N { push(Bool(b != 0)); next }
 
     // Stack shuffling.
-    op DUP() : N { let v = *sp; push(v); next }
-    op DROP() : N { sp = sp - 1; next }
-    op SWAP() : N { let b = *sp; *sp = *(sp - 1); *(sp - 1) = b; next }
-    op OVER() : N { let v = *(sp - 1); push(v); next }
+    op DUP() : N { push(tos); next }
+    op DROP() : N { drop1(); next }
+    op SWAP() : N { let b = tos; tos = *sp; *sp = b; next }
+    op OVER() : N { let a = *sp; push(a); next }
     op ROT() : N {
         // a b c -- b c a
-        let a = *(sp - 2);
-        *(sp - 2) = *(sp - 1);
+        let a = *(sp - 1);
         *(sp - 1) = *sp;
-        *sp = a;
+        *sp = tos;
+        tos = a;
         next
     }
-    op NIP() : N { *(sp - 1) = *sp; sp = sp - 1; next }
+    op NIP() : N { sp = sp - 1; next }
     op TUCK() : N {
         // a b -- b a b
-        let b = *sp;
-        let a = *(sp - 1);
-        *(sp - 1) = b;
+        let a = *sp;
+        *sp = tos;
+        push(a);
+        tos = *sp;
         *sp = a;
-        push(b);
         next
     }
-    op DUP2() : N { let a = *(sp - 1); let b = *sp; push(a); push(b); next }
-    op DROP2() : N { sp = sp - 2; next }
+    op DUP2() : N { let a = *sp; let b = tos; push(a); push(b); next }
+    op DROP2() : N { tos = *(sp - 1); sp = sp - 2; next }
 
     // Arithmetic: ( a b -- c ).
     inline for (name, checked, sym, kind) in [
@@ -195,49 +203,49 @@ pub vm Stak {
         ("MUL", "mul_checked", *, Arith.Mul),
     ] {
         op #name() : N {
-            let b = *sp;
-            let a = *(sp - 1);
+            let b = tos;
+            let a = *sp;
             match (a, b) {
-                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { sp = sp - 1; *sp = Int(r); next },
-                (Num(x), Num(y)) => { sp = sp - 1; *sp = Num(x sym y); next }
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { put2(Int(r)); next },
+                (Num(x), Num(y)) => { put2(Num(x sym y)); next }
                 _ => {}
             }
-            cold { let r = arith(ctx, kind, a, b)?; sp = sp - 1; *sp = r; next }
+            cold { let r = arith(ctx, kind, a, b)?; put2(r); next }
         }
     }
     op DIV() : N {
-        let b = *sp;
-        let a = *(sp - 1);
+        let b = tos;
+        let a = *sp;
         match (a, b) {
-            (Int(x), Int(y)) if y > 0 => { sp = sp - 1; *sp = Int(x / y); next }
-            (Num(x), Num(y)) => { sp = sp - 1; *sp = Num(x / y); next }
+            (Int(x), Int(y)) if y > 0 => { put2(Int(x / y)); next }
+            (Num(x), Num(y)) => { put2(Num(x / y)); next }
             _ => {}
         }
-        cold { let r = arith(ctx, Arith.Div, a, b)?; sp = sp - 1; *sp = r; next }
+        cold { let r = arith(ctx, Arith.Div, a, b)?; put2(r); next }
     }
     op MOD() : N {
-        let b = *sp;
-        let a = *(sp - 1);
-        if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 { sp = sp - 1; *sp = Int(x % y); next }
-        cold { let r = arith(ctx, Arith.Mod, a, b)?; sp = sp - 1; *sp = r; next }
+        let b = tos;
+        let a = *sp;
+        if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 { put2(Int(x % y)); next }
+        cold { let r = arith(ctx, Arith.Mod, a, b)?; put2(r); next }
     }
     op NEG() : N {
-        match *sp {
-            Int(x) => if x != -2147483648 { *sp = Int(0 - x); next },
-            Num(x) => { *sp = Num(-x); next }
+        match tos {
+            Int(x) => if x != -2147483648 { tos = Int(0 - x); next },
+            Num(x) => { tos = Num(-x); next }
             _ => {}
         }
-        cold { *sp = arith(ctx, Arith.Sub, Value.Int(0), *sp)?; next }
+        cold { tos = arith(ctx, Arith.Sub, Value.Int(0), tos)?; next }
     }
     op ABS() : N {
-        match *sp {
-            Int(x) => if x != -2147483648 { if x < 0 { *sp = Int(0 - x); } next },
-            Num(x) => { if x < 0.0 { *sp = Num(-x); } next }
+        match tos {
+            Int(x) => if x != -2147483648 { if x < 0 { tos = Int(0 - x); } next },
+            Num(x) => { if x < 0.0 { tos = Num(-x); } next }
             _ => {}
         }
         cold {
-            let v = *sp;
-            if let Int(_) = v { *sp = Num(2147483648.0); next }
+            let v = tos;
+            if let Int(_) = v { tos = Num(2147483648.0); next }
             raise type_error("abs", v, ctx)
         }
     }
@@ -250,57 +258,45 @@ pub vm Stak {
         ("GE", x >= y, less(ctx, b, a, true)),
     ] {
         op #name() : N {
-            let b = *sp;
-            let a = *(sp - 1);
+            let b = tos;
+            let a = *sp;
             match (a, b) {
-                (Int(x), Int(y)) => { sp = sp - 1; *sp = Bool(test); next }
-                (Num(x), Num(y)) => { sp = sp - 1; *sp = Bool(test); next }
+                (Int(x), Int(y)) => { put2(Bool(test)); next }
+                (Num(x), Num(y)) => { put2(Bool(test)); next }
                 _ => {}
             }
-            cold { let r = slow?; sp = sp - 1; *sp = Bool(r); next }
+            cold { let r = slow?; put2(Bool(r)); next }
         }
     }
     op EQ() : N {
-        let b = *sp;
-        let a = *(sp - 1);
-        sp = sp - 1;
-        if let (Int(x), Int(y)) = (a, b) { *sp = Bool(x == y); next }
-        *sp = Bool(equal(a, b));
+        let b = tos;
+        let a = *sp;
+        if let (Int(x), Int(y)) = (a, b) { put2(Bool(x == y)); next }
+        put2(Bool(equal(a, b)));
         next
     }
     op NE() : N {
-        let b = *sp;
-        let a = *(sp - 1);
-        sp = sp - 1;
-        if let (Int(x), Int(y)) = (a, b) { *sp = Bool(x != y); next }
-        *sp = Bool(!equal(a, b));
+        let b = tos;
+        let a = *sp;
+        if let (Int(x), Int(y)) = (a, b) { put2(Bool(x != y)); next }
+        put2(Bool(!equal(a, b)));
         next
     }
-    op NOT() : N { *sp = Bool(!value.truthy(*sp)); next }
-    op AND() : N {
-        let b = *sp;
-        sp = sp - 1;
-        *sp = Bool(value.truthy(*sp) and value.truthy(b));
-        next
-    }
-    op OR() : N {
-        let b = *sp;
-        sp = sp - 1;
-        *sp = Bool(value.truthy(*sp) or value.truthy(b));
-        next
-    }
+    op NOT() : N { tos = Bool(!value.truthy(tos)); next }
+    op AND() : N { put2(Bool(value.truthy(*sp) and value.truthy(tos))); next }
+    op OR() : N { put2(Bool(value.truthy(*sp) or value.truthy(tos))); next }
 
     // Locals and globals.
     op LGET(l: loc) : N { push(l); next }
-    op LSET(l: loc) : N { l = *sp; sp = sp - 1; next }
+    op LSET(l: loc) : N { l = tos; drop1(); next }
     op GGET(g: glob) : N { push(g); next }
-    op GSET(g: glob) : N { g = *sp; sp = sp - 1; next }
+    op GSET(g: glob) : N { g = tos; drop1(); next }
 
     // Branches.
     op JMP(target: label) : S { jump target }
     op JZ(target: label) : S {
-        let v = *sp;
-        sp = sp - 1;
+        let v = tos;
+        drop1();
         if !value.truthy(v) { jump target }
         next
     }
@@ -309,8 +305,9 @@ pub vm Stak {
     // the loop if start >= limit; LOOP increments and jumps back while
     // the index is below the limit.
     op DO(s: dslot, target: label) : LS {
-        let start = *sp;
-        let limit = *(sp - 1);
+        let start = tos;
+        let limit = *sp;
+        tos = *(sp - 1);
         sp = sp - 2;
         if let (Int(a), Int(b)) = (start, limit) {
             s = start;
@@ -361,43 +358,42 @@ pub vm Stak {
     // Builtins.
     op PRINT() : N {
         ctx.out.clear();
-        value.write(&ctx.out, *sp);
-        sp = sp - 1;
+        value.write(&ctx.out, tos);
+        drop1();
         io.println(ctx.out.as_str());
         next
     }
     op DOT() : N {
         ctx.out.clear();
-        value.write(&ctx.out, *sp);
+        value.write(&ctx.out, tos);
         ctx.out.push(' ');
-        sp = sp - 1;
+        drop1();
         io.print(ctx.out.as_str());
         next
     }
     op CR() : N { io.println(""); next }
     op CONCAT() : N {
-        let r = stringify(ctx, *(sp - 1), *sp, true);
-        sp = sp - 1;
-        *sp = r;
+        let r = stringify(ctx, *sp, tos, true);
+        put2(r);
         next
     }
     op TOSTR() : N {
-        if let Str(_) = *sp { next }
-        *sp = stringify(ctx, *sp, Nil, false);
+        if let Str(_) = tos { next }
+        tos = stringify(ctx, tos, Nil, false);
         next
     }
     op LEN() : N {
-        match *sp {
-            Str(s) => { *sp = Int(s.data.len as i32); next }
-            Arr(a) => { *sp = Int(a.items.len as i32); next }
+        match tos {
+            Str(s) => { tos = Int(s.data.len as i32); next }
+            Arr(a) => { tos = Int(a.items.len as i32); next }
             _ => {}
         }
-        cold { raise type_error("len", *sp, ctx) }
+        cold { raise type_error("len", tos, ctx) }
     }
     op ARRAY() : N {
-        if let Int(n) = *sp and n >= 0 {
+        if let Int(n) = tos and n >= 0 {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            *sp = Arr(value.new_arr(&ctx.heap, n as u64));
+            tos = Arr(value.new_arr(&ctx.heap, n as u64));
             next
         }
         cold { raise "array: the size must be a non-negative integer" }
@@ -406,36 +402,44 @@ pub vm Stak {
     op MKARRAY(n: cnt) : N {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
         let a = new(&ctx.heap, value.Arr {}, n);
-        let base = sp + 1 - n;
-        for i in 0..n { a.items[i] = base[i]; }
-        sp = base;
-        *sp = Arr(a);
+        if n == 0 { push(Arr(a)); next }
+        // The first n-1 values are in memory, the last in `tos`.
+        let base = sp + 2 - n;
+        for i in 0..n - 1 { a.items[i] = base[i]; }
+        a.items[n - 1] = tos;
+        sp = base - 1;
+        tos = Arr(a);
         next
     }
     op AT() : N {
-        if let (Arr(a), Int(i)) = (*(sp - 1), *sp) {
+        if let (Arr(a), Int(i)) = (*sp, tos) {
             let u = i as u64;
-            if u < a.items.len { sp = sp - 1; *sp = a.items.ptr[u]; next }
+            if u < a.items.len { put2(a.items.ptr[u]); next }
             cold { raise "index out of range" }
         }
-        cold { raise type_error("@", *(sp - 1), ctx) }
+        cold { raise type_error("@", *sp, ctx) }
     }
     op STORE() : N {
-        if let (Arr(a), Int(i)) = (*(sp - 1), *sp) {
+        if let (Arr(a), Int(i)) = (*sp, tos) {
             let u = i as u64;
-            if u < a.items.len { a.items.ptr[u] = *(sp - 2); sp = sp - 3; next }
+            if u < a.items.len {
+                a.items.ptr[u] = *(sp - 1);
+                tos = *(sp - 2);
+                sp = sp - 3;
+                next
+            }
             cold { raise "index out of range" }
         }
-        cold { raise type_error("!", *(sp - 1), ctx) }
+        cold { raise type_error("!", *sp, ctx) }
     }
     op SQRT() : N {
-        if let Some(x) = value.to_f64(*sp) { *sp = Num(sqrt(x)); next }
-        cold { raise type_error("sqrt", *sp, ctx) }
+        if let Some(x) = value.to_f64(tos) { tos = Num(sqrt(x)); next }
+        cold { raise type_error("sqrt", tos, ctx) }
     }
     op TOINT() : N {
-        match *sp {
+        match tos {
             Int(_) => next,
-            Num(x) => if x > -2147483649.0 and x < 2147483648.0 { *sp = Int(x as i32); next },
+            Num(x) => if x > -2147483649.0 and x < 2147483648.0 { tos = Int(x as i32); next },
             _ => {}
         }
         cold { raise "int: not a number in the int range" }
@@ -462,7 +466,9 @@ pub vm Stak {
         lp = m.lstack;
         for i in 0..main.nlocals as u64 { lp[i] = Nil; }
         sp = m.stack - 1;
+        tos = Nil;
         m.sp = sp;
+        m.tos = tos;
         m.lp = lp;
         m.fp = fp;
         jump main.code
