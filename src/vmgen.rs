@@ -506,6 +506,15 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     crate::tirwalk::locals(b, &mut used, &mut declared);
     let captured: Vec<LocalId> =
         used.into_iter().filter(|l| !declared.contains(l) && !f.vm_state.contains(l)).collect();
+    // Operand fields are decoded again from the instruction word, which
+    // the cold function receives in its register: nothing to store.
+    let decoded = decode_lets(f.body.as_ref().unwrap());
+    let (redo, captured): (Vec<LocalId>, Vec<LocalId>) = captured.into_iter().partition(|l| decoded.iter().any(|(d, _)| d == l));
+    let mut body = b.clone();
+    if !redo.is_empty() {
+        let lets = decoded.into_iter().filter(|(l, _)| redo.contains(l)).map(|(l, e)| TStmt::Let(l, Some(e))).collect();
+        body = TExpr { ty: b.ty.clone(), kind: TK::Block(lets, Some(Box::new(body))), span: b.span };
+    }
     for &l in &captured {
         let t = f.locals[l as usize].ty.clone();
         let gname = format!("@\"{}.c{}\"", sym, l);
@@ -516,7 +525,28 @@ fn outline(g: &mut FnGen, b: &TExpr) {
     }
     let w = current_word(g, vd);
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
-    g.cg.cold_queue.push((g.fid, b.clone(), captured, sym));
+    g.cg.cold_queue.push((g.fid, body, captured, sym));
+}
+
+/// The handler's operand-field decodes: `let raw = <bits of word 0>;` at
+/// the top of its body.
+fn decode_lets(body: &TExpr) -> Vec<(LocalId, TExpr)> {
+    fn pure(e: &TExpr) -> bool {
+        match &e.kind {
+            TK::Int(_) | TK::Vm(TVm::Word(0)) => true,
+            TK::Binary(_, a, b) => pure(a) && pure(b),
+            TK::Cast(a) => pure(a),
+            _ => false,
+        }
+    }
+    let TK::Block(stmts, _) = &body.kind else { return vec![] };
+    stmts
+        .iter()
+        .filter_map(|s| match s {
+            TStmt::Let(l, Some(e)) if pure(e) => Some((*l, e.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Thread-local slot for argument `i` of the shared copy `fid` of a
