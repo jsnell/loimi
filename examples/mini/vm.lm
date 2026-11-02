@@ -562,6 +562,58 @@ pub vm Mini {
         cold { dst = Bool(less(ctx, b, a, true)?); next }
     }
 
+    // Compare and branch, for conditions: the next word is a JMP holding
+    // the branch offset (so the verifier and the compiler's jump
+    // patching treat it as a jump). Jump if the comparison equals `k`;
+    // otherwise skip the JMP.
+    inline for (name, bkind, isub, fsub, slow) in [
+        ("JLT", reg, x < y, x < y, less(ctx, a, b, false)),
+        ("JLE", reg, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JLTK", kst, x < y, x < y, less(ctx, a, b, false)),
+        ("JLEK", kst, x <= y, x <= y, less(ctx, a, b, true)),
+        ("JGTK", kst, x > y, x > y, less(ctx, b, a, false)),
+        ("JGEK", kst, x >= y, x >= y, less(ctx, b, a, true)),
+    ] {
+        op #name(pol: imm, a: reg, b: bkind) : ABC {
+            let want = pol != 0;
+            match (a, b) {
+                (Int(x), Int(y)) => {
+                    if (isub) == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                    jump pc + 2
+                }
+                (Num(x), Num(y)) => {
+                    if (fsub) == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                    jump pc + 2
+                }
+                _ => {}
+            }
+            cold {
+                if slow? == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                jump pc + 2
+            }
+        }
+    }
+    inline for (name, bkind) in [("JEQ", reg), ("JEQK", kst)] {
+        op #name(pol: imm, a: reg, b: bkind) : ABC {
+            let want = pol != 0;
+            if let (Int(x), Int(y)) = (a, b) {
+                if (x == y) == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                jump pc + 2
+            }
+            // Same bits means equal, except for NaN; strings are interned.
+            if a == b {
+                var eq = true;
+                if let Num(x) = a { eq = x == x; }
+                if eq == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                jump pc + 2
+            }
+            cold {
+                if value.raw_equal(a, b) == want { jump pc + 1 + ((pc[1] as i32) >> 8) as i64 }
+                jump pc + 2
+            }
+        }
+    }
+
     op JMP(target: label) : sJ { jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {
@@ -751,23 +803,6 @@ pub vm Mini {
         jump fp.resume
     }
 
-    // Compare-and-branch pairs produced by every `if` and `while`.
-    super LT_TEST = LT; TEST;
-    super LE_TEST = LE; TEST;
-    super EQ_TEST = EQ; TEST;
-    super EQ_TESTT = EQ; TESTT;
-    super LTK_TEST = LTK; TEST;
-    super LEK_TEST = LEK; TEST;
-    super GTK_TEST = GTK; TEST;
-    super GEK_TEST = GEK; TEST;
-    super EQK_TEST = EQK; TEST;
-    super EQK_TESTT = EQK; TESTT;
-    super LT_TESTT = LT; TESTT;
-    super LE_TESTT = LE; TESTT;
-    super LTK_TESTT = LTK; TESTT;
-    super LEK_TESTT = LEK; TESTT;
-    super GTK_TESTT = GTK; TESTT;
-    super GEK_TESTT = GEK; TESTT;
     // Suggested by `loimi build --vm-stats` on recursive code.
     super LOADI_SUB = LOADI; SUB;
     super ADD_RET1 = ADD; RET1;

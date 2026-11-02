@@ -1037,17 +1037,51 @@ fn Parser.jump_if(p: *Parser, e: E, when: bool) -> ?u64 {
     }
     var when = when;
     var src: u32 = 0;
+    var e = e;
     if let Reloc(at) = e and at + 1 == p.pc() and Mini.opcode(p.fs.code.at(at)) == Mini.OP_NOT {
         src = (p.fs.code.at(at) >> 16) & 255;
         p.fs.code.truncate(at);
         p.fs.lines.truncate(at);
         when = !when;
-    } else {
-        let r = p.any_reg(e);
-        p.free_exp(r);
-        src = reg_of(r);
+        // `a ~= b` is EQ into a temporary, then NOT.
+        if at > 0 and jump_op(Mini.opcode(p.fs.code.at(at - 1))) != 0 and ((p.fs.code.at(at - 1) >> 8) & 255) == src and src >= p.fs.nactive {
+            e = E.Reloc(at - 1);
+        } else {
+            return Some(p.emit(Mini.TESTT(src as u8, 0)));
+        }
     }
+    // A comparison just emitted: compare and branch.
+    if let Reloc(at) = e and at + 1 == p.pc() {
+        let w = p.fs.code.at(at);
+        let jop = jump_op(Mini.opcode(w));
+        if jop != 0 {
+            let pol: u32 = if when { 1 } else { 0 };
+            p.fs.code.set(at, (w & 0xFFFF0000) | (pol << 8) | jop);
+            return Some(p.emit(Mini.JMP(0)));
+        }
+    }
+    let r = p.any_reg(e);
+    p.free_exp(r);
+    src = reg_of(r);
     Some(p.emit(if when { Mini.TESTT(src as u8, 0) } else { Mini.TEST(src as u8, 0) }))
+}
+
+/// The compare-and-branch op for comparison op `op`, or 0.
+fn jump_op(op: u32) -> u32 {
+    if op == Mini.OP_EQ { return Mini.OP_JEQ; }
+    if op == Mini.OP_EQK { return Mini.OP_JEQK; }
+    if op == Mini.OP_LT { return Mini.OP_JLT; }
+    if op == Mini.OP_LE { return Mini.OP_JLE; }
+    if op == Mini.OP_LTK { return Mini.OP_JLTK; }
+    if op == Mini.OP_LEK { return Mini.OP_JLEK; }
+    if op == Mini.OP_GTK { return Mini.OP_JGTK; }
+    if op == Mini.OP_GEK { return Mini.OP_JGEK; }
+    0
+}
+
+/// Whether `op` is a compare-and-branch op (followed by its JMP word).
+fn is_jump_op(op: u32) -> bool {
+    op == Mini.OP_JEQ or op == Mini.OP_JEQK or op == Mini.OP_JLT or op == Mini.OP_JLE or op == Mini.OP_JLTK or op == Mini.OP_JLEK or op == Mini.OP_JGTK or op == Mini.OP_JGEK
 }
 
 fn Parser.patch_list(p: *Parser, l: *mem.Vec<u64>, target: u64) {
@@ -1084,6 +1118,12 @@ fn Parser.cond(p: *Parser) -> mem.Vec<u64> {
                 // Invert the final test: jump to the true exit instead.
                 let r = ((w >> 8) & 255) as u8;
                 p.fs.code.set(last, if op == Mini.OP_TEST { Mini.TESTT(r, 0) } else { Mini.TEST(r, 0) });
+                f.pop();
+                t.push(last);
+                flipped = true;
+            } else if last + 1 == p.pc() and op == Mini.OP_JMP and last > 0 and is_jump_op(Mini.opcode(p.fs.code.at(last - 1))) {
+                // Same for a compare and branch: flip its polarity.
+                p.fs.code.set(last - 1, p.fs.code.at(last - 1) ^ (1 << 8));
                 f.pop();
                 t.push(last);
                 flipped = true;

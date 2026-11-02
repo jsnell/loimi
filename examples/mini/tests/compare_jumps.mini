@@ -1,0 +1,45 @@
+-- Compare-and-branch in conditions: ints, floats, mixed, NaN, strings,
+-- constants on either side, ~=, not, and/or. Results from PUC-Lua 5.4.
+local nan = 0/0
+local vals = {1, 2, 2.0, -1.5, nan, "a", "b", "a"}
+local n = 8
+local acc = 0
+for i = 1, n do for j = 1, n do
+  local a, b = vals[i], vals[j]
+  local r = 0
+  local sa, sb = type(a) == "string", type(b) == "string"
+  if a == b then r = r + 1 end
+  if a ~= b then r = r + 2 end
+  if not (a == b) then r = r + 4 end
+  if sa == sb then
+    if a < b then r = r + 8 end
+    if a <= b then r = r + 16 end
+    if a > b then r = r + 32 end
+    if a >= b then r = r + 64 end
+    if not (a < b) and a ~= b then r = r + 128 end
+    if a < b or a == b then r = r + 256 end
+  end
+  if not sa then
+    if a < 2 then r = r + 512 end
+    if 2 < a then r = r + 1024 end
+    if a <= 1.5 or a >= 2 then r = r + 2048 end
+    if a > -1 and a ~= 2 then r = r + 4096 end
+    if 1 == a then r = r + 8192 end
+  end
+  if a == "a" or b ~= "b" then r = r + 16384 end
+  if a == nil then r = r + 32768 end
+  if b ~= true then r = r + 65536 end
+  acc = (acc * 31 + r) % 65521
+end end
+print(acc)
+local i, s = 0, 0
+while i < 10 and s ~= 20 do i = i + 1; s = s + 2 end
+repeat i = i - 1 until i <= 3 or i == 7
+print(i, s)
+local ok = pcall and 1 or 0
+local e1 = 0
+for k = 1, 3 do if k >= 2 then e1 = e1 + k end end
+print(e1)
+-- expect: 59622
+-- expect: 7	20
+-- expect: 5
