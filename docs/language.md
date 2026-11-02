@@ -1084,7 +1084,8 @@ verify context, nothing else; a verify context cannot be named `it` or `pc`.
 
 **Errors.** `Mini.VerifyError` has `at` (the word index), `reason` (an
 enum `Mini.VerifyReason`: `Empty`, `TooLong`, `BadOpcode`, `Truncated`,
-`SuperPart`, `Then`, `RunsOffEnd`, `Operand`), and for `Operand` the
+`SuperPart`, `Then`, `RunsOffEnd`, `Operand`, `Check` for a failing
+`verify` block, below), and for `Operand` the
 operand's index and kind. `e.message()` describes the reason, and
 `e.write(&out)` writes the whole diagnosis to any buffer with
 `push_str`/`push_int`:
@@ -1120,23 +1121,80 @@ so `Mini.run` cannot be called with raw code. A raw `jump` in an entry
 (or in a `-> never` vm function inlined into one) is an error outside
 `unsafe { }`, and an entry cannot reach a shared (cold) copy of a vm
 function, which is checked once for all callers. Calls inside the vm
-are made structural by the data: a prototype whose code field is a
-`Verified<Mini>` has no raw code to jump to, so `jump p.code` in CALL
-reaches only verified functions. Mini, Scheme and MiniJS do this.
+are made structural by the data: a prototype whose code is verified
+(a `Verified<Mini>` field, or a verified array, below) has no raw code
+to jump to, so `jump p.code` in CALL reaches only verified functions.
+Mini, Scheme and MiniJS do this.
 
-**Tying the proof to its context.** The proof records nothing about the
-context it was checked against; the interpreter stores it next to that
-context and does not change the context afterwards. Two patterns:
+**Verified code in an object.** An `object` can hold its code as its
+trailing array, marked as verified by a vm:
 
-- *verify, then build*: Mini verifies against the counts its `Proto`
-  will hold (`verify_context nregs: u32, nupvals: u32, nconsts: u64,
-  nprotos: u64;`) and creates the `Proto` from the same values and the
-  proof. The words live in a separate `Code` object that the `Proto`
-  references (the proof's slice is not traced);
-- *build, then verify*: the tutorial's `Pip` builds every prototype
-  with `code: Pip.placeholder()` and verifies once the program is
-  complete (its context includes the global count), storing each proof
-  in its prototype (`p.code = v`).
+```loimi
+object Proto { nregs: u32, consts: Gc<Arr>, .., code: verified [u32] by Mini }
+
+vm Mini {
+    verify_context owner proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    ..
+}
+
+let proto = match Mini.build_verified(heap, Proto { nregs: n, .. }, words) {
+    Ok(p) => p,
+    Err(e) => ..,
+};
+```
+
+- The generated `Mini.build_verified(heap, init, words, ctx..) ->
+  Result<Gc<Obj>, Mini.VerifyError>` allocates the object with room for
+  the words, copies them in and verifies them there. It is the only way
+  to create such an object: `new` on it is an error elsewhere.
+  (`unsafe { Mini.build_assume_verified(heap, init, words) }` skips the
+  verifier, like `assume_verified`.)
+- `p.code` reads as a `Verified<Mini>` over the array (`start()`,
+  `len()`, `words()`, `Mini.optimize(p.code)`); it is not a place, so
+  it cannot be assigned. `jump p.code` is the array's address, `p` plus
+  a constant: no load, unlike a `Verified` field, which costs one
+  dependent load per call (`lowering.md` §11).
+- A verify context declared `owner` is the object being built:
+  `build_verified` passes the new object, and its other context
+  parameters are the caller's. The verify clauses then read the counts
+  (and tables) the object holds, so the proof is tied to the object
+  and to the context fields stored in it. (`Mini.verify(code, proto)`
+  still takes it explicitly, for checking code against an existing
+  prototype.) The object's other fields remain ordinary fields: the
+  interpreter must not change those the verifier read (`nregs`,
+  `consts`) afterwards.
+
+Without an owner context, the proof records nothing about the context
+it was checked against, and the interpreter stores it next to that
+context. The tutorial's `Pip` *builds, then verifies*: it creates every
+prototype with `code: Pip.placeholder()` and verifies once the program
+is complete (its context includes the global count), storing each proof
+in its prototype (`p.code = v`).
+
+**Side tables.** `verify NAME { .. }` in a vm is a `bool` block that
+the verifier runs after checking every instruction, with the verify
+context, the code as `code` (a `[]W`) and `is_insn_boundary(p)` in
+scope. It checks tables the code refers to but the operand clauses do
+not see. MiniJS checks its exception handler table, so that `on raise`
+jumps only to instructions:
+
+```loimi
+verify handlers {
+    let t = proto.handlers.data;   // [start, end, target, reg] per entry
+    var ok = t.len % 4 == 0;
+    var i: u64 = 0;
+    while ok and i < t.len {
+        ok = is_insn_boundary(code.ptr + t[i + 2]) and t[i + 3] < proto.nregs;
+        i += 4;
+    }
+    ok
+}
+```
+
+A failing check is `VerifyReason.Check`, written as ``check `handlers`
+fails``. With an owner context the table is the object's own, verified
+with its code.
 
 **Mutation.** Quickening (`become`) and `Mini.optimize` rewrite verified
 code in place, and both preserve verification: `become` only switches
@@ -1153,11 +1211,13 @@ for code that is verified afterwards.
 What the verifier and the proof cannot see is up to the vm: that the
 run-time state matches the verify context (the register window really
 has `nregs` registers), that operands without a `verify` clause
-(`imm`) are safe for every value, and that jumps to computed addresses
-inside the vm (`jump fp.resume`, an exception handler's target
-`p.code.start() + h.target`) go to boundaries of verified code. Those
-raw jumps are allowed in ops and `on raise`, where pc is already in
-verified code; only entries are held to `Verified`.
+(`imm`) are safe for every value, that the context is not changed
+after verification, and that jumps to computed addresses inside the vm
+go to boundaries of verified code: return addresses (`jump fp.resume`,
+saved by a verified CALL) and table targets, unless a `verify` block
+checks the table (MiniJS's handler targets `p.code.start() + target`).
+Those raw jumps are allowed in ops and `on raise`, where pc is already
+in verified code; only entries are held to `Verified`.
 
 Operand accesses compile **without bounds checks**, and stack VMs check for
 overflow once per call (`max_stack` against the limit) instead of on every

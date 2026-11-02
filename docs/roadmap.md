@@ -8,10 +8,11 @@ Progress (2026-11-02):
   `Verified<V>` is built: `verify` returns the proof (or a diagnosis),
   `#[require_verified]` entries accept only it, and the three
   interpreters keep it in their prototypes, so calls reach only verified
-  code. Open: tying the proof to its verify context without a per-call
-  load (Mini's CALL pays one, up to 4% on call-heavy code; a proof
-  that is a typed view of the prototype, with the code at a fixed
-  offset, would cost nothing), and checking handler-table targets.
+  code. The code is a verified trailing array of the prototype
+  (`code: verified [u32] by Mini`), built by `Vm.build_verified` with
+  the prototype as its verify context, so the proof costs no load per
+  call and is tied to the counts it was checked against; `verify`
+  blocks check side tables (MiniJS's handler targets).
 - M6 is done: std.num, std.diag, std.lex, std.parse, std.bc and std.obj
   exist, and the example interpreters use them. Mini's front end is
   std.lex + std.parse (Pratt driver, `led` hooks for `and`/`or`/`..`) +

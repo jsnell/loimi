@@ -584,14 +584,29 @@ private to the vm's expansion file, `#[unsafe]` functions need an
 entry's `jump` (vmcheck).
 
 Where the proof is stored is the interpreter's choice, and that can
-cost: Mini's `Proto` used to hold its words as a trailing array, so
-CALL computed the code address as `p + offset`; the proof is now a
-field, so CALL loads it (one more dependent load per call). The CALL
-handler's machine code is otherwise unchanged. Measured on Mini
-(`--release --align-functions=64`, best of 6): `oo_methods` +4%,
-`closures` +2%, `fib` and `binary_trees` within 1%. The same field
-load with a raw `*u32` instead of the proof costs the same (+3-4% on
-`oo_methods`), so the cost is the layout, not the type.
+cost. A `Verified` field in the prototype is a `{ ptr, len }` that
+CALL loads (one more dependent load per call than a trailing array,
+whose address is `p + offset`): measured on Mini (`--release
+--align-functions=64`, best of 6), `oo_methods` +4%, `closures` +2%,
+`fib` and `binary_trees` within 1%. The same field load with a raw
+`*u32` costs the same, so the cost is the layout, not the type.
+
+`code: verified [W] by Vm` keeps the proof without the load. Reading
+`p.code` builds `Vm__Verified { __code: <trailing slice> }` (a struct
+value, not a place), and `jump p.code` takes the slice's pointer
+directly in the checker, so it lowers to the trailing array's
+`getelementptr inbounds i8, ptr %p, i64 <size>`: a `lea`. The length
+(the object header's word before `p`) is loaded only where `p.code.len()`
+or `words()` is used. `Vm.build_verified` is generated Loimi: `new` with
+the word count, a copy loop into the array (through `__verified_words`,
+a builtin that only the vm's expansion file may call, as `new` on such
+an object), then `Vm.verify` over the array with the object as the
+`owner` context; a `verify NAME { .. }` block is pasted after the
+instruction loop, with `is_insn_boundary` reading the boundary bitmap
+the first pass built. Mini went back to the trailing array: against
+the `Verified`-field build, `oo_methods` -6.2% (0.826 s to 0.775 s),
+`closures` -2.6% (0.496 s to 0.483 s), `fib` unchanged (best of 5,
+interleaved, `--align-functions=64`).
 
 ## 12. Driver settings
 
