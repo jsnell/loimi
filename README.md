@@ -19,6 +19,14 @@ from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
 hand-written assembly interpreter (`luajit -joff`), or within 10% of it.
 See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
 
+[`examples/minijs`](examples/minijs) implements a JavaScript subset on
+the standard library's shape and inline-cache support. On its 14
+clean-room benchmarks it is faster than V8's bytecode interpreter
+(`node --jitless`, 0.33–0.97× of its time) and faster than QuickJS, on
+every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
+[`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
+public r7rs-benchmarks suite.
+
 ## Getting started
 
 Requirements: Rust (stable) and clang/LLVM 19.
