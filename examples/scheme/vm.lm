@@ -342,16 +342,16 @@ pub vm Scheme {
         if value.prim_of(f) == Some(builtins.P_CALLCC) {
             // (call/cc proc): run proc with an escape continuation in a
             // frame of the continuation prototype (see cont_proto).
-            if n != 1 { return Err(rt.err_msg(ctx, "call-with-current-continuation: wrong number of arguments")); }
-            let Some(cp) = ctx.cont_proto else { return Err(rt.err_msg(ctx, "call/cc: not initialized")); };
+            if n != 1 { raise rt.err_msg(ctx, "call-with-current-continuation: wrong number of arguments") }
+            let Some(cp) = ctx.cont_proto else { raise rt.err_msg(ctx, "call/cc: not initialized") };
             var dst = regs + base + 1;
             var nf = fp;
             if !tail {
-                if fp + 1 >= ctx.frames_end { return Err(rt.err_msg(ctx, "stack overflow (too many nested calls)")); }
+                if fp + 1 >= ctx.frames_end { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
                 nf = fp + 1;
             }
             if tail { dst = regs; }
-            if dst + 3 >= ctx.stack_end { return Err(rt.err_msg(ctx, "stack overflow")); }
+            if dst + 3 >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
             let kc = new(&ctx.heap, Closure { proto: cp }, 1);
             kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
             dst[0] = regs[base + 1];
@@ -365,25 +365,25 @@ pub vm Scheme {
             k = cp.consts.data.ptr;
             fp.k = k;
             regs = dst;
-            return Ok(cp.code.ptr);
+            jump cp.code.ptr
         }
         if let Clo(cl) = f {
             let p = cl.proto;
             if p.fixed == value.CONT_FIXED {
                 // An escape continuation: return the argument from the
                 // continuation frame, if that activation is still live.
-                if n > 1 { return Err(rt.err_msg(ctx, "continuation: multiple values are not supported")); }
+                if n > 1 { raise rt.err_msg(ctx, "continuation: multiple values are not supported") }
                 let v = if n == 1 { regs[base + 1] } else { V.Imm(value.IMM_UNSPEC) };
-                let Int(d) = cl.free.ptr[0] else { return Err(rt.err_msg(ctx, "continuation: internal error")); };
+                let Int(d) = cl.free.ptr[0] else { raise rt.err_msg(ctx, "continuation: internal error") };
                 let target = ctx.frames + d as u64;
                 if d < 1 or target > fp or (target.cl as u64) != (cl as u64) {
-                    return Err(rt.err_msg(ctx, "continuation invoked after its extent ended (only escaping continuations are supported)"));
+                    raise rt.err_msg(ctx, "continuation invoked after its extent ended (only escaping continuations are supported)")
                 }
                 *(target.base - 1) = v;
                 fp = target - 1;
                 regs = fp.base;
                 k = fp.k;
-                return Ok(fp.resume);
+                jump fp.resume
             }
             let np = p.nparams as u64;
             if n < np or (n > np and p.rest == 0) { raise arity_err(ctx, cl, n) }
