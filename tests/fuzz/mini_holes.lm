@@ -13,8 +13,11 @@
 //            (`callbase` checks a < nregs; SELF needs a + 1 < nregs)
 //   repro 8: CONCAT with n = 0: `n - 2` underflows in concat()
 //   repro 9: CONCAT reading n registers past the frame
-// 1-6, 8, 9 come from `imm` operands without `verify` clauses (nres, n, i).
-// The stack holds exactly the main frame, so ASan sees the overflow:
+// 1-6, 8, 9 came from `imm` operands without `verify` clauses (nres, n,
+// i). They are fixed: Mini.verify now rejects every case. Without
+// arguments this checks all nine (exit 1 if one verifies; run by
+// tests/fuzz.rs); `holes N` builds case N and runs it if it verifies.
+// The stack holds exactly the main frame, so ASan would see an overflow:
 //   mkdir d; ln -s $PWD/examples/mini/{value,vm,lib}.lm d/
 //   ln -s $PWD/tests/fuzz/mini_holes.lm d/
 //   loimi build d/mini_holes.lm --sanitize=address -o holes; ./holes 5
@@ -41,7 +44,26 @@ fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> Gc<Proto> {
 }
 
 fn main() -> i32 {
-    let which = match os.arg(1) { Some(s) => s[0] - '0', None => 1 };
+    let Some(arg) = os.arg(1) else {
+        var bad = 0;
+        for i in 1..10 {
+            if verifies(i as u8, false) {
+                io.print("case ");
+                io.print_int(i as i64);
+                io.println(" verifies");
+                bad += 1;
+            }
+        }
+        if bad == 0 { io.println("all rejected"); }
+        return if bad == 0 { 0 } else { 1 };
+    };
+    verifies(arg[0] - '0', true);
+    0
+}
+
+/// Build case `which`; whether its main function passes Mini.verify. If
+/// `run` and it does, print the verdicts and run it.
+fn verifies(which: u8, run: bool) -> bool {
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     let h = &heap;
@@ -83,10 +105,13 @@ fn main() -> i32 {
     let child = proto(h, 1, child_code[..], nokids.items());
     var kids: [Gc<Proto>; 1] = [child];
     let mainp = proto(h, nregs, main_code[0..mlen], kids[..]);
+    let ok = Mini.verify(mainp.code, mainp).is_none();
+    if !run { return ok; }
     io.print("verify main: ");
-    io.println(if Mini.verify(mainp.code, mainp).is_none() { "ok" } else { "rejected" });
+    io.println(if ok { "ok" } else { "rejected" });
     io.print("verify child: ");
     io.println(if Mini.verify(child.code, child).is_none() { "ok" } else { "rejected" });
+    if !ok { return false; }
     let stack: *V = mem.alloc(nregs as u64);
     var ctx = Ctx {
         heap: heap, stack: stack, stack_end: stack + nregs as u64,
@@ -98,5 +123,5 @@ fn main() -> i32 {
     ctx.fp = ctx.frames;
     Mini.run(&ctx, value.new_closure(&ctx.heap, mainp));
     io.println("ran");
-    0
+    true
 }

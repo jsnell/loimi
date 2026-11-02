@@ -16,10 +16,9 @@
 // (`ualarm`); a program that loops forever ends the process with
 // SIGALRM, which run.sh counts as a timeout, not a failure.
 //
-// Known holes in Mini's verify clauses (examples/mini/vm.lm), reported
-// rather than fixed here: programs that hit them are skipped, unless
-// MINIFUZZ_KNOWN=1 is set, so that fuzzing can find new ones. See
-// `known_hole`.
+// The holes this found in Mini's verify clauses (operand counts read
+// past the frame, CONCAT with n < 2, GETINDEXI 0, SELF's R[a+1]) are
+// fixed; tests/fuzz/mini_holes.lm keeps their reproducers.
 //
 // usage: minifuzz <first-seed> <count> [-v | -d]
 
@@ -35,7 +34,6 @@ import vm.{Mini, Ctx, Frame};
 import vm;
 
 extern "C" fn ualarm(usecs: u32, interval: u32) -> u32;
-extern "C" fn getenv(name: *u8) -> ?*u8;
 
 struct Rng { s: u64 }
 
@@ -68,40 +66,6 @@ fn is_label_op(op: u32) -> bool {
 const LABEL_OPS: [u32; 7] = [Mini.OP_JMP, Mini.OP_TEST, Mini.OP_TESTT, Mini.OP_FORPREP, Mini.OP_FORLOOP, Mini.OP_NEXT, Mini.OP_INEXT];
 
 var DUMP: bool = false;
-var KNOWN: bool = false;
-
-/// Whether `p` contains a word that would hit a known hole in Mini's
-/// verify clauses. Each comes from an `imm` operand with no `verify`:
-///   - CALL(base, nargs, nres): the callee's return writes nres results
-///     from R[base] on, past the caller's frame and the stack when
-///     base + nres > nregs (RET0, RET1's cold path, RETN);
-///   - SETLIST(a, n, batch) reads R[a+1 .. a+n] past the frame;
-///   - RETN(a, n) reads R[a .. a+n-1] past the frame;
-///   - GETINDEXI(dst, t, i) with i = 0: `(i as u64) - 1` overflows (a
-///     panic in debug builds; release builds wrap and take the slow path);
-///   - SELF(a: callbase, ..) writes R[a+1], but `callbase` only checks
-///     a < nregs: one register past the frame when a = nregs - 1;
-///   - CONCAT(dst, base, n) reads R[base .. base+n-1] past the frame, and
-///     with n < 2 `n - 2` underflows (a panic in debug builds, a wild
-///     read in release builds).
-/// Every word is checked, not just instruction starts: cheap and safe.
-fn known_hole(p: Gc<Proto>) -> bool {
-    let nregs = p.nregs as u32;
-    for i in 0..p.code.len {
-        let w = p.code[i];
-        let op = Mini.opcode(w);
-        let a = (w >> 8) & 255;
-        let b = (w >> 16) & 255;
-        let c = (w >> 24) & 255;
-        if op == Mini.OP_CALL and a + c > nregs { return true; }
-        if op == Mini.OP_SETLIST and a + 1 + b > nregs { return true; }
-        if op == Mini.OP_RETN and a + b > nregs { return true; }
-        if op == Mini.OP_GETINDEXI and c == 0 { return true; }
-        if op == Mini.OP_SELF and a + 2 > nregs { return true; }
-        if op == Mini.OP_CONCAT and (c < 2 or b + c > nregs) { return true; }
-    }
-    false
-}
 
 /// A random function prototype. `parent_nregs` > 0 for a child: its
 /// upvalues then capture the parent's registers.
@@ -218,7 +182,7 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
         if op == Mini.OP_CALL and i > 0 and Mini.opcode(p.code[starts[i - 1]]) == Mini.OP_CLOSURE and r.chance(80) {
             w = (w & !(255 << 8)) | (p.code[starts[i - 1]] & (255 << 8));
         }
-        // Mostly results that fit the frame (see known_hole).
+        // Mostly results that fit the frame (others fail verification).
         if op == Mini.OP_CALL and r.chance(90) {
             let a = (w >> 8) & 255;
             if a <= nregs { w = (w & 16777215) | ((r.below((nregs - a + 1) as u64) as u32) << 24); }
@@ -293,10 +257,6 @@ fn one(ctx: *Ctx, seed: u64) -> bool {
     var ok = true;
     for i in 0..kids.len + 1 {
         let c = if i == 0 { main } else { kids.at(i - 1) };
-        if !KNOWN and known_hole(c) {
-            ok = false;
-            if DUMP { io.println("skipped: a known hole in Mini's verify clauses"); }
-        }
         if let Some(bad) = Mini.verify(c.code, c) {
             ok = false;
             if DUMP {
@@ -380,7 +340,6 @@ fn main() -> i32 uses gc {
         verbose = true;
         DUMP = f.len == 2 and f[1] == 'd';
     }
-    KNOWN = getenv("MINIFUZZ_KNOWN\0".ptr).is_some();
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     let globals = value.new_table(&heap);

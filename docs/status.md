@@ -72,12 +72,16 @@ Bugs found and fixed (regression tests in `tests/run/vm_verify_*.lm`):
   generated verifier, whose locals shadowed verify contexts of the same
   name (`verify_context w: u32` compared with the instruction word).
 
-Holes in Mini's verify clauses (`examples/mini/vm.lm`, not changed here;
-reproducers in `tests/fuzz/mini_holes.lm`, skipped by the fuzzer unless
-`MINIFUZZ_KNOWN=1`): CALL's `nres` lets the callee's return write past the
-stack; SETLIST's, RETN's and CONCAT's counts read past the frame; CONCAT
-with fewer than 2 values and GETINDEXI with index 0 underflow; SELF writes
-`R[a+1]` with only `a < nregs` checked.
+Holes in Mini's verify clauses (`examples/mini/vm.lm`), now fixed:
+CALL's `nres` let the callee's return write past the stack; SETLIST's,
+RETN's and CONCAT's counts (and CALL's argument count) read past the
+frame; CONCAT with fewer than 2 values and GETINDEXI with index 0
+underflowed; SELF wrote `R[a+1]` with only `a < nregs` checked. Each
+count now has its own operand kind whose `verify` clause reads the base
+register from the instruction word (`Mini.ABC_a(*pc) + it <= nregs`);
+the kinds decode to the plain field, so handlers are unchanged.
+`tests/fuzz/mini_holes.lm` checks that all nine reproducers are
+rejected (run by `cargo test`).
 
 ## Differences from the design
 

@@ -244,6 +244,24 @@ pub vm Mini {
     operand child = it verify (it as u64) < proto.protos.data.len;
     operand level = it verify (it as u32) <= proto.nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
+    // Counts of registers from the A (or B) operand on. They decode to
+    // the plain field; the verifier checks the range they cover against
+    // the frame, reading the base from the instruction word (`*pc`).
+    /// CALL's argument count: R[a+1 .. a+n] are in the frame.
+    operand nargs = it verify Mini.ABC_a(*pc) + it < proto.nregs as u64;
+    /// CALL's result count (at least 1): the callee's return writes
+    /// R[a .. a+n-1].
+    operand nres = it verify it >= 1 and Mini.ABC_a(*pc) + it <= proto.nregs as u64;
+    /// SETLIST reads R[a+1 .. a+n].
+    operand listn = it verify Mini.ABC_a(*pc) + it < proto.nregs as u64;
+    /// RETN reads R[a .. a+n-1].
+    operand retn = it verify Mini.ABC_a(*pc) + it <= proto.nregs as u64;
+    /// CONCAT joins R[b .. b+n-1], at least two.
+    operand catn = it verify it >= 2 and Mini.ABC_b(*pc) + it <= proto.nregs as u64;
+    /// GETINDEXI's constant index, 1..255.
+    operand index1 = it verify it >= 1;
+    /// SELF writes R[a] and R[a+1].
+    operand selfbase = it verify (it as u32) + 1 < proto.nregs;
 
     encoding fixed(u32) {
         format ABC { op: 8, a: 8, b: 8, c: 8 }
@@ -332,7 +350,7 @@ pub vm Mini {
         next
     }
     /// R[a][batch*50 + i] = R[a + i] for i in 1..n.
-    op SETLIST(a: callbase, n: imm, batch: imm) : ABC {
+    op SETLIST(a: callbase, n: listn, batch: imm) : ABC {
         if let T(t) = regs[a] {
             if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
             value.table_setlist(&ctx.heap, t, regs + a + 1, n as u64, batch as u64 * 50);
@@ -413,7 +431,7 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// R[dst] = t[i] for an integer constant 1 <= i <= 255.
-    op GETINDEXI(dst: reg, t: reg, i: imm) : ABC {
+    op GETINDEXI(dst: reg, t: reg, i: index1) : ABC {
         if let T(tab) = t {
             let u = (i as u64) - 1;
             if u < tab.asize { dst = tab.aptr[u]; next }
@@ -423,7 +441,7 @@ pub vm Mini {
         cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// Method lookup: R[a+1] = obj; R[a] = obj[key].
-    op SELF(a: callbase, obj: reg, key: kst) : ABC + FieldIC {
+    op SELF(a: selfbase, obj: reg, key: kst) : ABC + FieldIC {
         let o = obj;
         if let T(tab) = o {
             regs[a + 1] = o;
@@ -560,7 +578,7 @@ pub vm Mini {
         next
     }
     /// R[dst] = R[base] .. ... .. R[base + n - 1], as one string.
-    op CONCAT(dst: reg, base: callbase, n: imm) : ABC {
+    op CONCAT(dst: reg, base: callbase, n: catn) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
         dst = concat(ctx, regs + base, n as u64)?;
         next
@@ -777,7 +795,7 @@ pub vm Mini {
 
     /// R[base .. base+nres-1] = R[base](R[base+1] .. R[base+nargs]).
     /// nres is at least 1.
-    op CALL(base: callbase, nargs: imm, nres: imm) : ABC {
+    op CALL(base: callbase, nargs: nargs, nres: nres) : ABC {
         let f = regs[base];
         if let F(cl) = f {
             // No GC check: entering a function allocates nothing.
@@ -839,7 +857,7 @@ pub vm Mini {
         jump fp.resume
     }
     /// Return R[a .. a+n-1], adjusted to the number of results wanted.
-    op RETN(a: reg, n: imm) : ABC {
+    op RETN(a: reg, n: retn) : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.frames { exit a }
         let want = fp.nres as u64;

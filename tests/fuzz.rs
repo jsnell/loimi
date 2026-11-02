@@ -83,6 +83,13 @@ fn fuzz_mini() {
         std::os::unix::fs::symlink(root.join(format!("examples/mini/{m}.lm")), dir.join(format!("{m}.lm"))).unwrap();
     }
     std::os::unix::fs::symlink(root.join("tests/fuzz/minifuzz.lm"), dir.join("minifuzz.lm")).unwrap();
+    std::os::unix::fs::symlink(root.join("tests/fuzz/mini_holes.lm"), dir.join("mini_holes.lm")).unwrap();
+    // The verify holes the fuzzer found stay rejected.
+    let holes = tmp("mini-holes");
+    build(&dir.join("mini_holes.lm"), &holes);
+    let out = limited(&holes).output().unwrap();
+    assert!(out.status.success(), "mini_holes: {}", String::from_utf8_lossy(&out.stdout));
+    let _ = std::fs::remove_file(&holes);
     let exe = tmp("minifuzz");
     build(&dir.join("minifuzz.lm"), &exe);
     run(&exe, 0, 3000);
