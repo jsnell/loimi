@@ -1,0 +1,300 @@
+// std.lex: cursor scanners, one feature at a time.
+
+import std.io;
+import std.lex;
+import std.diag;
+import std.num;
+import std.text;
+
+fn show_err(src: str, e: lex.Error) {
+    var b = text.StrBuf.new();
+    b.push_str("error ");
+    b.push_int(e.span.lo as i64);
+    b.push('-');
+    b.push_int(e.span.hi as i64);
+    b.push_str(": ");
+    b.push_str(e.msg);
+    b.push_str(" [");
+    b.push_str(src[e.span.lo as u64..e.span.hi as u64]);
+    b.push(']');
+    io.println(b.as_str());
+    b.free();
+}
+
+/// Skip trivia, then print what is left and the line.
+fn trivia(src: str, sy: lex.Syntax) {
+    var c = lex.Cursor.new(src, 0, sy);
+    match c.skip_trivia() {
+        Ok(_) => {
+            io.print("rest [");
+            io.print(src[c.pos..src.len]);
+            io.print("] line ");
+            io.print_int(c.line as i64);
+            io.println("");
+        }
+        Err(e) => show_err(src, e),
+    }
+}
+
+fn number(src: str, sy: lex.Syntax) {
+    var c = lex.Cursor.new(src, 0, sy);
+    match c.number() {
+        Ok(n) => {
+            var b = text.StrBuf.new();
+            match n {
+                Int(i) => { b.push_str("int "); b.push_int(i); }
+                Float(f) => { b.push_str("float "); num.write_shortest(&b, f); }
+            }
+            b.push_str(" rest [");
+            b.push_str(src[c.pos..src.len]);
+            b.push(']');
+            io.println(b.as_str());
+            b.free();
+        }
+        Err(e) => show_err(src, e),
+    }
+}
+
+fn string(src: str, sy: lex.Syntax) {
+    var c = lex.Cursor.new(src, 0, sy);
+    var b = text.StrBuf.new();
+    match c.quoted(&b) {
+        Ok(_) => {
+            // Show control bytes as <n>.
+            var o = text.StrBuf.new();
+            let s = b.as_str();
+            for i in 0..s.len {
+                if s[i] < 32 or s[i] >= 127 { o.push('<'); o.push_int(s[i] as i64); o.push('>'); } else { o.push(s[i]); }
+            }
+            o.push_str(" line ");
+            o.push_int(c.line as i64);
+            io.println(o.as_str());
+            o.free();
+        }
+        Err(e) => show_err(src, e),
+    }
+    b.free();
+}
+
+enum Op { Lt, Le, Shl, ShlEq, Eq, EqEq, Dot, Concat, Dots, Arrow, Minus }
+
+fn op_name(k: Op) -> str {
+    match k {
+        Lt => "Lt", Le => "Le", Shl => "Shl", ShlEq => "ShlEq", Eq => "Eq", EqEq => "EqEq",
+        Dot => "Dot", Concat => "Concat", Dots => "Dots", Arrow => "Arrow", Minus => "Minus",
+    }
+}
+
+fn is_sym(c: u8) -> bool { lex.is_ident_char(c) or c == '-' or c == '!' or c == '?' }
+
+fn main() {
+    // Whitespace and comments.
+    let lua = lex.lua();
+    trivia("  \t\n\r\n x", lua);
+    trivia("-- comment\n-- more\nx", lua);
+    trivia("--[[ long\ncomment ]] x", lua);
+    trivia("--[==[ ]] ]=] \n ]==]x", lua);
+    trivia("--[ not long\nx", lua);
+    trivia("--[[ unfinished", lua);
+    trivia("-- at end", lua);
+    let c = lex.c_like();
+    trivia("/* a /* b */ x */", c);
+    trivia("// line\n/* \n */ y", c);
+    trivia("/* open", c);
+    var scheme = lex.none();
+    scheme.line_comment = ";";
+    scheme.block_open = "#|";
+    scheme.block_close = "|#";
+    scheme.nested_comments = true;
+    trivia("; hi\n#| a #| b |# c |# z", scheme);
+    trivia("#| a #| b |# c", scheme);
+
+    // Numerals.
+    number("42+", lua);
+    number("3.25)", lua);
+    number(".5", lua);
+    number("5.", lua);
+    number("1..2", lua);
+    number("1e10", lua);
+    number("2E-3x", lua);
+    number("0x1F", lua);
+    number("0Xff", lua);
+    number("9223372036854775807", lua);
+    number("9223372036854775808", lua);
+    number("0xffffffffffffffff", lua);
+    number("0x", lua);
+    number("3abc", lua);
+    number("1e+", lua);
+    number("0x1p4", lua);
+    number("12_000", lua);
+    number("9223372036854775808", c);
+    number("0xffffffffffffffff", c);
+    number("0x7fffffffffffffff", c);
+
+    // Strings.
+    string("\"plain\" rest", lua);
+    string("'it''s'", lua);
+    string("\"a\\tb\\nc\\\\d\\\"e\\'f\"", lua);
+    string("\"\\65\\066\\0z\\255\"", lua);
+    string("\"\\101\\0\"", c);
+    string("\"\\x41\\x7a\\xff\"", lua);
+    string("\"\\u{48}\\u{e9}\\u{20AC}\\u{1F600}\"", lua);
+    string("\"a\\z  \n   b\"", lua);
+    string("\"line\\\ncont\"", lua);
+    string("\"line\\\ncont\"", c);
+    string("\"\\a\\b\\f\\v\\r\"", lua);
+    string("\"unfinished", lua);
+    string("\"new\nline\"", lua);
+    string("\"bad \\q escape\"", lua);
+    string("\"\\256\"", lua);
+    string("\"\\xZZ\"", lua);
+    string("\"\\x4\"", lua);
+    string("\"\\u{110000}\"", lua);
+    string("\"\\u{41\"", lua);
+    var ml = lex.lua();
+    ml.multiline_strings = true;
+    string("\"two\nlines\"", ml);
+
+    // Long strings.
+    var ls = lex.Cursor.new("[==[\nraw ]] \\n text]==] after", 0, lua);
+    match ls.long_string() {
+        Ok(s) => { io.print("["); io.print(s); io.print("] rest ["); io.print(ls.src[ls.pos..ls.src.len]); io.println("]"); }
+        Err(e) => show_err(ls.src, e),
+    }
+    var ls2 = lex.Cursor.new("[[ never closed ]=]", 0, lua);
+    match ls2.long_string() { Ok(_) => io.println("?"), Err(e) => show_err(ls2.src, e) }
+
+    // Operators: maximal munch, independent of insertion order.
+    var ops: lex.OpTable<Op> = lex.OpTable.new();
+    ops.add("<", Op.Lt);
+    ops.add("<<=", Op.ShlEq);
+    ops.add("=", Op.Eq);
+    ops.add("<=", Op.Le);
+    ops.add("..", Op.Concat);
+    ops.add("<<", Op.Shl);
+    ops.add("==", Op.EqEq);
+    ops.add(".", Op.Dot);
+    ops.add("...", Op.Dots);
+    ops.add("->", Op.Arrow);
+    ops.add("-", Op.Minus);
+    var oc = lex.Cursor.new("<<=<<<=<===.....->-- x", 0, lex.none());
+    var line = text.StrBuf.new();
+    while let Some(k) = ops.eat(&oc) { line.push_str(op_name(k)); line.push(' '); }
+    line.push_str("rest [");
+    line.push_str(oc.src[oc.pos..oc.src.len]);
+    line.push(']');
+    io.println(line.as_str());
+    ops.free();
+
+    // Keywords and identifiers.
+    var kw: lex.Keywords<i64> = lex.Keywords.new();
+    kw.add("if", 1);
+    kw.add("then", 2);
+    var ic = lex.Cursor.new("if iffy then _x9 9", 0, lua);
+    line.clear();
+    loop {
+        ic.skip_trivia();
+        let Some(name) = ic.ident() else { break };
+        line.push_str(name);
+        line.push('=');
+        line.push_int(kw.get(name) ?? 0);
+        line.push(' ');
+    }
+    line.push_str("rest [");
+    line.push_str(ic.src[ic.pos..ic.src.len]);
+    line.push(']');
+    io.println(line.as_str());
+    kw.free();
+
+    // Custom character classes, peeking, marks, line tracking.
+    var sc = lex.Cursor.new("set-car! x\n(y)", 0, scheme);
+    io.print(sc.eat_while(is_sym));
+    io.print(" ");
+    let m = sc.save();
+    sc.advance(4);
+    io.print_int(sc.line as i64);
+    io.print(" ");
+    sc.restore(m);
+    io.print_int(sc.line as i64);
+    io.print(" ");
+    io.print_bool(sc.eat(' ') and sc.eat_str("x\n(") and sc.peek() == 'y' and sc.peek_at(1) == ')' and sc.peek_at(2) == 0);
+    io.println("");
+
+    // Errors become diagnostics.
+    var sm = diag.SourceMap.new();
+    let src = "x = \"abc\ny = 1";
+    let f = sm.add("t.lua", src);
+    var ec = lex.Cursor.new(src, f, lua);
+    ec.advance(4);
+    var junk = text.StrBuf.new();
+    match ec.quoted(&junk) {
+        Ok(_) => {},
+        Err(e) => {
+            var d = e.diag().with_label("string starts here");
+            var out = text.StrBuf.new();
+            sm.render(&d, &out);
+            io.print(out.as_str());
+        }
+    }
+}
+// expect: rest [x] line 3
+// expect: rest [x] line 3
+// expect: rest [x] line 2
+// expect: rest [x] line 2
+// expect: rest [x] line 2
+// expect: error 0-4: unfinished long comment [--[[]
+// expect: rest [] line 1
+// expect: rest [x */] line 1
+// expect: rest [y] line 3
+// expect: error 0-2: unfinished comment [/*]
+// expect: rest [z] line 2
+// expect: error 0-2: unfinished comment [#|]
+// expect: int 42 rest [+]
+// expect: float 3.25 rest [)]
+// expect: float 0.5 rest []
+// expect: float 5 rest []
+// expect: int 1 rest [..2]
+// expect: float 10000000000 rest []
+// expect: error 0-5: malformed number [2E-3x]
+// expect: int 31 rest []
+// expect: int 255 rest []
+// expect: int 9223372036854775807 rest []
+// expect: float 9.223372036854776e+18 rest []
+// expect: int -1 rest []
+// expect: error 0-2: malformed number [0x]
+// expect: error 0-4: malformed number [3abc]
+// expect: error 0-2: malformed number [1e]
+// expect: error 0-5: malformed number [0x1p4]
+// expect: error 0-6: malformed number [12_000]
+// expect: error 0-19: integer literal is too large [9223372036854775808]
+// expect: error 0-18: integer literal is too large [0xffffffffffffffff]
+// expect: int 9223372036854775807 rest []
+// expect: plain line 1
+// expect: it line 1
+// expect: a<9>b<10>c\d"e'f line 1
+// expect: AB<0>z<255> line 1
+// expect: A<0> line 1
+// expect: Az<255> line 1
+// expect: H<195><169><226><130><172><240><159><152><128> line 1
+// expect: ab line 2
+// expect: line<10>cont line 2
+// expect: linecont line 2
+// expect: <7><8><12><11><13> line 1
+// expect: error 0-11: unfinished string ["unfinished]
+// expect: error 0-4: unfinished string ["new]
+// expect: error 5-7: invalid escape sequence [\q]
+// expect: error 1-5: escape sequence too large [\256]
+// expect: error 1-3: hexadecimal digit expected [\x]
+// expect: error 1-4: hexadecimal digit expected [\x4]
+// expect: error 1-10: UTF-8 value too large [\u{110000]
+// expect: error 1-6: missing '}' in \u{xxxx} [\u{41]
+// expect: two<10>lines line 2
+// expect: [raw ]] \n text] rest [ after]
+// expect: error 0-2: unfinished long string [[[]
+// expect: ShlEq Shl Le Le EqEq Dots Concat Arrow Minus Minus rest [ x]
+// expect: if=1 iffy=0 then=2 _x9=0 rest [9]
+// expect: set-car! 2 1 true
+// expect: error: unfinished string
+// expect:   --> t.lua:1:5
+// expect:     1 | x = "abc
+// expect:       |     ^^^^ string starts here

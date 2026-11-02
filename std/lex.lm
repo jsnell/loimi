@@ -1,0 +1,563 @@
+// Lexing toolkit: a Cursor over source text with the scanners every
+// interpreter front end rewrites (whitespace and comments, identifiers,
+// numerals, quoted strings with escapes, maximal-munch operators, keyword
+// tables). A lexer is a short function that tries them in order:
+//
+//     fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
+//         lx.cur.skip_trivia()?;
+//         let start = lx.cur.pos;
+//         if lx.cur.at_end() { return Ok(lx.tok(T.Eof, start)); }
+//         if let Some(name) = lx.cur.ident() { return Ok(lx.tok(lx.keywords.get(name) ?? T.Name, start)); }
+//         if lx.cur.at_number() { lx.num = lx.cur.number()?; return Ok(lx.tok(T.Number, start)); }
+//         if lx.cur.peek() == '"' { lx.buf.clear(); lx.cur.quoted(&lx.buf)?; return Ok(lx.tok(T.String, start)); }
+//         if let Some(k) = lx.ops.eat(&lx.cur) { return Ok(lx.tok(k, start)); }
+//         Err(lx.cur.error_at(start, "unexpected character"))
+//     }
+//
+// The lexical conventions that differ between languages (comment syntax,
+// escape rules, numeral overflow) are fields of `Syntax`. Text is treated
+// as bytes; identifiers are ASCII.
+
+import std.diag;
+import std.hash;
+import std.map;
+import std.mem;
+import std.num;
+import std.text;
+
+// ── configuration ───────────────────────────────────────────────────
+
+/// Lexical conventions. Start from `lua()`, `c_like()` or `none()` and
+/// change fields as needed.
+pub struct Syntax {
+    /// Line comment prefix ("--", "//", ";", "#"), or "" for none.
+    line_comment: str,
+    /// Block comment delimiters ("/*" and "*/", "#|" and "|#"), or "" for none.
+    block_open: str,
+    block_close: str,
+    /// Block comments nest (Scheme, Haskell, Rust).
+    nested_comments: bool,
+    /// A line comment followed by a long bracket (`--[[ ... ]]`,
+    /// `--[==[ ... ]==]`) is a block comment (Lua).
+    long_comments: bool,
+    /// `\ddd` is up to three octal digits (C) instead of decimal (Lua).
+    octal_escapes: bool,
+    /// A backslash-newline in a string produces a newline (Lua) instead of
+    /// nothing (C, Python line continuation).
+    escaped_newline_kept: bool,
+    /// Strings may contain raw newlines.
+    multiline_strings: bool,
+    /// Decimal integer literals too large for i64 become floats (Lua)
+    /// instead of being an error.
+    int_overflow_to_float: bool,
+    /// Hexadecimal integer literals wrap modulo 2^64 (Lua) instead of being
+    /// an error when too large for i64.
+    hex_wraps: bool,
+}
+
+/// No comments; C-style escapes; overflowing literals are errors.
+pub fn none() -> Syntax {
+    Syntax {
+        line_comment: "", block_open: "", block_close: "", nested_comments: false,
+        long_comments: false, octal_escapes: true, escaped_newline_kept: false,
+        multiline_strings: false, int_overflow_to_float: false, hex_wraps: false,
+    }
+}
+
+/// Lua 5.4: `--` and `--[[ ]]` comments, decimal `\ddd`, `\` + newline
+/// keeps the newline, overflowing decimal literals become floats and hex
+/// literals wrap.
+pub fn lua() -> Syntax {
+    var s = none();
+    s.line_comment = "--";
+    s.long_comments = true;
+    s.octal_escapes = false;
+    s.escaped_newline_kept = true;
+    s.int_overflow_to_float = true;
+    s.hex_wraps = true;
+    s
+}
+
+/// C, Java, JavaScript: `//` and non-nesting `/* */` comments, octal `\ddd`.
+pub fn c_like() -> Syntax {
+    var s = none();
+    s.line_comment = "//";
+    s.block_open = "/*";
+    s.block_close = "*/";
+    s
+}
+
+// ── errors ──────────────────────────────────────────────────────────
+
+/// A lexical error: a static message and the offending span.
+pub struct Error { span: diag.Span, msg: str }
+
+/// The error as a diagnostic, for a diag.Diagnostics sink or rendering.
+pub fn Error.diag(e: Error) -> diag.Diag { diag.error(e.span, e.msg) }
+
+// ── character classes ───────────────────────────────────────────────
+
+pub fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
+pub fn is_alpha(c: u8) -> bool { (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') }
+pub fn is_ident_start(c: u8) -> bool { is_alpha(c) or c == '_' }
+pub fn is_ident_char(c: u8) -> bool { is_alpha(c) or is_digit(c) or c == '_' }
+pub fn is_hex_digit(c: u8) -> bool { num.is_hex_digit(c) }
+/// Space, tab, newline, carriage return, form feed, vertical tab.
+pub fn is_space(c: u8) -> bool { c == ' ' or (c >= 9 and c <= 13) }
+
+// ── the cursor ──────────────────────────────────────────────────────
+
+/// A position in source text. `pos` is a byte offset; `line` (1-based) is
+/// kept up to date as newlines are consumed.
+pub struct Cursor {
+    src: str,
+    pos: u64,
+    line: u32,
+    file: u32,
+    syntax: Syntax,
+}
+
+/// A saved position, for backtracking.
+pub struct Mark { pos: u64, line: u32 }
+
+/// A cursor at the start of `src`, which is file `file` of a diag.SourceMap
+/// (use 0 if there is no map). The text is borrowed.
+pub fn Cursor.new(src: str, file: u32, syntax: Syntax) -> Cursor {
+    Cursor { src: src, pos: 0, line: 1, file: file, syntax: syntax }
+}
+
+pub fn Cursor.at_end(c: *Cursor) -> bool { c.pos >= c.src.len }
+
+/// The current byte, or 0 at the end.
+pub fn Cursor.peek(c: *Cursor) -> u8 { if c.pos < c.src.len { c.src[c.pos] } else { 0 } }
+
+/// The byte `n` positions ahead, or 0 past the end.
+pub fn Cursor.peek_at(c: *Cursor, n: u64) -> u8 {
+    if c.pos + n < c.src.len { c.src[c.pos + n] } else { 0 }
+}
+
+/// Consume and return one byte (0 at the end, without moving).
+pub fn Cursor.bump(c: *Cursor) -> u8 {
+    if c.pos >= c.src.len { return 0; }
+    let ch = c.src[c.pos];
+    c.pos += 1;
+    if ch == '\n' { c.line += 1; }
+    ch
+}
+
+/// Consume `n` bytes (fewer at the end).
+pub fn Cursor.advance(c: *Cursor, n: u64) {
+    for _ in 0..n { c.bump(); }
+}
+
+/// Consume `ch` if it is next.
+pub fn Cursor.eat(c: *Cursor, ch: u8) -> bool {
+    if c.pos < c.src.len and c.src[c.pos] == ch { c.bump(); return true; }
+    false
+}
+
+/// Does the remaining text start with `s`?
+pub fn Cursor.starts_with(c: *Cursor, s: str) -> bool {
+    c.pos + s.len <= c.src.len and c.src[c.pos..c.pos + s.len].eq(s)
+}
+
+/// Consume `s` if the remaining text starts with it.
+pub fn Cursor.eat_str(c: *Cursor, s: str) -> bool {
+    if c.starts_with(s) { c.advance(s.len); return true; }
+    false
+}
+
+/// Consume bytes while `pred` holds; return them.
+pub fn Cursor.eat_while(c: *Cursor, pred: fn(u8) -> bool) -> str {
+    let start = c.pos;
+    while c.pos < c.src.len and pred(c.src[c.pos]) { c.bump(); }
+    c.src[start..c.pos]
+}
+
+/// Text from byte offset `start` to the current position.
+pub fn Cursor.since(c: *Cursor, start: u64) -> str { c.src[start..c.pos] }
+
+/// Span from byte offset `start` to the current position.
+pub fn Cursor.span_from(c: *Cursor, start: u64) -> diag.Span { diag.span(c.file, start, c.pos) }
+
+/// An error spanning `start` to the current position (at least one byte).
+pub fn Cursor.error_at(c: *Cursor, start: u64, msg: str) -> Error {
+    var hi = c.pos;
+    if hi == start and hi < c.src.len { hi += 1; }
+    Error { span: diag.span(c.file, start, hi), msg: msg }
+}
+
+/// An error at the current byte.
+pub fn Cursor.error_here(c: *Cursor, msg: str) -> Error { c.error_at(c.pos, msg) }
+
+pub fn Cursor.save(c: *Cursor) -> Mark { Mark { pos: c.pos, line: c.line } }
+
+pub fn Cursor.restore(c: *Cursor, m: Mark) {
+    c.pos = m.pos;
+    c.line = m.line;
+}
+
+// ── whitespace and comments ─────────────────────────────────────────
+
+/// Skip whitespace and comments as configured by `syntax`. Fails on an
+/// unterminated block comment.
+pub fn Cursor.skip_trivia(c: *Cursor) -> Result<(), Error> {
+    let sy = &c.syntax;
+    loop {
+        while c.pos < c.src.len and is_space(c.src[c.pos]) { c.bump(); }
+        if sy.line_comment.len > 0 and c.starts_with(sy.line_comment) {
+            let start = c.pos;
+            c.advance(sy.line_comment.len);
+            if sy.long_comments {
+                if let Some(level) = c.long_bracket_level() {
+                    if c.long_bracket_body(level).is_none() {
+                        let open = c.syntax.line_comment.len + level as u64 + 2;
+                        return Err(Error { span: diag.span(c.file, start, start + open), msg: "unfinished long comment" });
+                    }
+                    continue;
+                }
+            }
+            while c.pos < c.src.len and c.src[c.pos] != '\n' { c.pos += 1; }
+            continue;
+        }
+        if sy.block_open.len > 0 and c.starts_with(sy.block_open) {
+            c.block_comment()?;
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+/// Skip a block comment at the cursor (which must be at `block_open`).
+fn Cursor.block_comment(c: *Cursor) -> Result<(), Error> {
+    let start = c.pos;
+    let open = c.syntax.block_open;
+    let close = c.syntax.block_close;
+    c.advance(open.len);
+    var depth: u32 = 1;
+    loop {
+        if c.at_end() {
+            let e = Error { span: diag.span(c.file, start, start + open.len), msg: "unfinished comment" };
+            return Err(e);
+        }
+        if c.starts_with(close) {
+            c.advance(close.len);
+            depth -= 1;
+            if depth == 0 { return Ok(()); }
+        } else if c.syntax.nested_comments and c.starts_with(open) {
+            c.advance(open.len);
+            depth += 1;
+        } else {
+            c.bump();
+        }
+    }
+}
+
+// ── long brackets (Lua) ─────────────────────────────────────────────
+
+/// If the cursor is at a long-bracket opener `[[`, `[=[`, `[==[`, ...,
+/// return its level (the number of `=`) without consuming anything.
+pub fn Cursor.long_bracket_level(c: *Cursor) -> ?u32 {
+    if c.peek() != '[' { return None; }
+    var n: u64 = 1;
+    while c.peek_at(n) == '=' { n += 1; }
+    if c.peek_at(n) == '[' { Some((n - 1) as u32) } else { None }
+}
+
+/// Consume a long bracket of the given level and return its contents
+/// (None if unterminated; the cursor is then at the end). As in Lua, a
+/// newline directly after the opener is not part of the contents.
+fn Cursor.long_bracket_body(c: *Cursor, level: u32) -> ?str {
+    c.advance(level as u64 + 2);
+    if c.peek() == '\r' { c.bump(); if c.peek() == '\n' { c.bump(); } }
+    else if c.peek() == '\n' { c.bump(); if c.peek() == '\r' { c.bump(); } }
+    let start = c.pos;
+    while !c.at_end() {
+        if c.peek() == ']' {
+            var n: u64 = 1;
+            while c.peek_at(n) == '=' { n += 1; }
+            if n - 1 == level as u64 and c.peek_at(n) == ']' {
+                let body = c.src[start..c.pos];
+                c.advance(n + 1);
+                return Some(body);
+            }
+        }
+        c.bump();
+    }
+    None
+}
+
+/// Scan a Lua long string `[[...]]` / `[==[...]==]` at the cursor and
+/// return its contents (raw: no escapes are processed).
+pub fn Cursor.long_string(c: *Cursor) -> Result<str, Error> {
+    let start = c.pos;
+    let Some(level) = c.long_bracket_level() else { return Err(c.error_here("expected a long bracket")); };
+    match c.long_bracket_body(level) {
+        Some(s) => Ok(s),
+        None => Err(Error { span: diag.span(c.file, start, start + level as u64 + 2), msg: "unfinished long string" }),
+    }
+}
+
+// ── identifiers ─────────────────────────────────────────────────────
+
+/// Scan an identifier (`[A-Za-z_][A-Za-z0-9_]*`) if one starts here.
+pub fn Cursor.ident(c: *Cursor) -> ?str {
+    if !is_ident_start(c.peek()) { return None; }
+    let start = c.pos;
+    c.pos += 1;
+    while c.pos < c.src.len and is_ident_char(c.src[c.pos]) { c.pos += 1; }
+    Some(c.src[start..c.pos])
+}
+
+// ── numerals ────────────────────────────────────────────────────────
+
+/// Does a numeral start here (a digit, or `.` followed by a digit)?
+pub fn Cursor.at_number(c: *Cursor) -> bool {
+    is_digit(c.peek()) or (c.peek() == '.' and is_digit(c.peek_at(1)))
+}
+
+/// Scan a numeral: hexadecimal integer (`0x1F`), decimal integer (`42`) or
+/// decimal float (`4.2`, `.5`, `5.`, `1e-3`), converted exactly with
+/// std.num. Out-of-range literals follow `syntax.int_overflow_to_float`
+/// and `syntax.hex_wraps`. Letters, digits or `_` directly after a numeral
+/// make it malformed (`3abc`, `0x`, `1e`).
+pub fn Cursor.number(c: *Cursor) -> Result<num.Number, Error> {
+    let start = c.pos;
+    let hex = c.peek() == '0' and (c.peek_at(1) == 'x' or c.peek_at(1) == 'X');
+    if hex {
+        c.pos += 2;
+        while c.pos < c.src.len and is_hex_digit(c.src[c.pos]) { c.pos += 1; }
+    } else {
+        c.pos += num.decimal_len(c.src[c.pos..c.src.len]);
+    }
+    if c.pos == start or is_ident_char(c.peek()) {
+        while is_ident_char(c.peek()) or c.peek() == '.' { c.pos += 1; }
+        return Err(c.error_at(start, "malformed number"));
+    }
+    let s = c.since(start);
+    if hex {
+        let digits = s[2..s.len];
+        if digits.len == 0 { return Err(c.error_at(start, "malformed number")); }
+        if c.syntax.hex_wraps {
+            if let Ok(v) = num.parse_u64_wrapping(digits, 16) { return Ok(num.Number.Int(v as i64)); }
+        } else {
+            if let Ok(v) = num.parse_int(s) { return Ok(num.Number.Int(v)); }
+        }
+        return Err(c.error_at(start, "integer literal is too large"));
+    }
+    var is_int = true;
+    for i in 0..s.len { if !is_digit(s[i]) { is_int = false; } }
+    if is_int {
+        match num.parse_int(s) {
+            Ok(v) => return Ok(num.Number.Int(v)),
+            Err(_) => if !c.syntax.int_overflow_to_float {
+                return Err(c.error_at(start, "integer literal is too large"));
+            },
+        }
+    }
+    match num.parse_f64(s) {
+        Ok(f) => Ok(num.Number.Float(f)),
+        Err(_) => Err(c.error_at(start, "malformed number")),
+    }
+}
+
+// ── strings ─────────────────────────────────────────────────────────
+
+/// Append `cp` to `out` as UTF-8 (cp <= 0x10FFFF).
+pub fn push_utf8(out: *text.StrBuf, cp: u32) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push((0xC0 | (cp >> 6)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else if cp < 0x10000 {
+        out.push((0xE0 | (cp >> 12)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    } else {
+        out.push((0xF0 | (cp >> 18)) as u8);
+        out.push((0x80 | ((cp >> 12) & 0x3F)) as u8);
+        out.push((0x80 | ((cp >> 6) & 0x3F)) as u8);
+        out.push((0x80 | (cp & 0x3F)) as u8);
+    }
+}
+
+/// Consume one line break (`\n`, `\r`, `\r\n` or `\n\r`).
+fn Cursor.newline(c: *Cursor) {
+    let first = c.bump();
+    let next = c.peek();
+    if (next == '\n' or next == '\r') and next != first { c.bump(); }
+}
+
+/// Scan a quoted string whose opening quote is the current byte; the same
+/// byte closes it. The decoded contents are appended to `out` (which is
+/// not cleared first). Escapes:
+///
+///     \n \t \r \a \b \f \v \\ \" \'   the usual characters
+///     \ddd     up to 3 decimal digits, <= 255 (octal if syntax.octal_escapes)
+///     \xHH     exactly two hex digits
+///     \u{XXX}  a code point, encoded as UTF-8
+///     \z       skip the following whitespace, including newlines
+///     \ + newline   line continuation (see syntax.escaped_newline_kept)
+pub fn Cursor.quoted(c: *Cursor, out: *text.StrBuf) -> Result<(), Error> {
+    let start = c.pos;
+    let quote = c.bump();
+    loop {
+        if c.at_end() { return Err(c.error_at(start, "unfinished string")); }
+        let ch = c.peek();
+        if ch == quote { c.bump(); return Ok(()); }
+        if (ch == '\n' or ch == '\r') and !c.syntax.multiline_strings {
+            return Err(c.error_at(start, "unfinished string"));
+        }
+        if ch != '\\' {
+            out.push(c.bump());
+            continue;
+        }
+        c.escape(out)?;
+    }
+}
+
+/// Decode the escape sequence at the cursor (which is at the backslash).
+fn Cursor.escape(c: *Cursor, out: *text.StrBuf) -> Result<(), Error> {
+    let esc = c.pos;
+    c.bump();
+    let e = c.peek();
+    if e == '\n' or e == '\r' {
+        c.newline();
+        if c.syntax.escaped_newline_kept { out.push('\n'); }
+        return Ok(());
+    }
+    let simple: u8 = match e {
+        'n' => '\n', 't' => '\t', 'r' => '\r', 'a' => 7, 'b' => 8, 'f' => 12, 'v' => 11,
+        '\\' => '\\', '"' => '"', '\'' => '\'',
+        _ => 0,
+    };
+    if simple != 0 {
+        c.bump();
+        out.push(simple);
+        return Ok(());
+    }
+    if e == 'x' {
+        c.bump();
+        let hi = num.digit_value(c.peek());
+        let lo = num.digit_value(c.peek_at(1));
+        if hi >= 16 or lo >= 16 {
+            c.advance(if hi < 16 { 1 } else { 0 });
+            return Err(c.error_at(esc, "hexadecimal digit expected"));
+        }
+        c.advance(2);
+        out.push((hi * 16 + lo) as u8);
+        return Ok(());
+    }
+    if e == 'z' {
+        c.bump();
+        while is_space(c.peek()) { c.bump(); }
+        return Ok(());
+    }
+    if e == 'u' {
+        c.bump();
+        if !c.eat('{') { return Err(c.error_at(esc, "missing '{' in \\u{xxxx}")); }
+        var cp: u32 = 0;
+        var n = 0;
+        while is_hex_digit(c.peek()) {
+            cp = cp * 16 + num.digit_value(c.bump());
+            n += 1;
+            if cp > 0x10FFFF { return Err(c.error_at(esc, "UTF-8 value too large")); }
+        }
+        if n == 0 { return Err(c.error_at(esc, "hexadecimal digit expected")); }
+        if !c.eat('}') { return Err(c.error_at(esc, "missing '}' in \\u{xxxx}")); }
+        push_utf8(out, cp);
+        return Ok(());
+    }
+    let base: u32 = if c.syntax.octal_escapes { 8 } else { 10 };
+    if num.digit_value(e) < base {
+        var v: u32 = 0;
+        var n = 0;
+        while n < 3 and num.digit_value(c.peek()) < base {
+            v = v * base + num.digit_value(c.bump());
+            n += 1;
+        }
+        if v > 255 { return Err(c.error_at(esc, "escape sequence too large")); }
+        out.push(v as u8);
+        return Ok(());
+    }
+    if !c.at_end() { c.bump(); }
+    Err(c.error_at(esc, "invalid escape sequence"))
+}
+
+// ── operators ───────────────────────────────────────────────────────
+
+pub struct OpEntry<K> { text: str, kind: K, next: u32 }
+
+const NO_ENTRY: u32 = 0xFFFFFFFF;
+
+/// Operator and punctuation strings mapped to token kinds, matched by
+/// maximal munch: `<=` wins over `<`. Entries are chained per first byte,
+/// longest first, so a lookup only compares candidates that can match.
+pub struct OpTable<K> { head: [u32; 256], entries: mem.Vec<OpEntry<K>> }
+
+pub fn OpTable<K>.new() -> OpTable<K> {
+    OpTable { head: [NO_ENTRY; 256], entries: mem.Vec.new() }
+}
+
+/// Add operator `op` (non-empty; borrowed) with token kind `kind`.
+pub fn OpTable<K>.add(t: *OpTable<K>, op: str, kind: K) {
+    let id = t.entries.len as u32;
+    t.entries.push(OpEntry { text: op, kind: kind, next: NO_ENTRY });
+    // Insert into the chain for op[0], keeping it sorted longest first.
+    let first = op[0] as u64;
+    let head = t.head[first];
+    if head == NO_ENTRY or t.entries.at(head as u64).text.len <= op.len {
+        t.entries.ptr_at(id as u64).next = head;
+        t.head[first] = id;
+        return;
+    }
+    var prev = head;
+    loop {
+        let nx = t.entries.at(prev as u64).next;
+        if nx == NO_ENTRY or t.entries.at(nx as u64).text.len <= op.len { break; }
+        prev = nx;
+    }
+    t.entries.ptr_at(id as u64).next = t.entries.at(prev as u64).next;
+    t.entries.ptr_at(prev as u64).next = id;
+}
+
+/// The longest operator that `s[pos..]` starts with: its kind and length.
+pub fn OpTable<K>.match_at(t: *OpTable<K>, s: str, pos: u64) -> ?(K, u64) {
+    if pos >= s.len { return None; }
+    var i = t.head[s[pos] as u64];
+    while i != NO_ENTRY {
+        let e = t.entries.ptr_at(i as u64);
+        if pos + e.text.len <= s.len and s[pos..pos + e.text.len].eq(e.text) {
+            return Some((e.kind, e.text.len));
+        }
+        i = e.next;
+    }
+    None
+}
+
+pub fn OpTable<K>.free(t: *OpTable<K>) { t.entries.free(); }
+
+/// Consume the longest operator from `t` at cursor `c` and return its
+/// kind. (A method of the table rather than of Cursor because methods
+/// cannot yet have their own type parameters.)
+pub fn OpTable<K>.eat(t: *OpTable<K>, c: *Cursor) -> ?K {
+    let (kind, n) = t.match_at(c.src, c.pos)?;
+    c.advance(n);
+    Some(kind)
+}
+
+// ── keywords ────────────────────────────────────────────────────────
+
+/// Reserved words mapped to token kinds:
+/// `keywords.get(name) ?? T.Name`.
+pub struct Keywords<K> { words: map.HashMap<str, K> }
+
+pub fn Keywords<K>.new() -> Keywords<K> { Keywords { words: map.HashMap.new() } }
+
+/// Add a keyword (the string is borrowed).
+pub fn Keywords<K>.add(kw: *Keywords<K>, word: str, kind: K) { kw.words.insert(word, kind); }
+
+pub fn Keywords<K>.get(kw: *Keywords<K>, word: str) -> ?K { kw.words.get(word) }
+
+pub fn Keywords<K>.free(kw: *Keywords<K>) { kw.words.free(); }
