@@ -266,6 +266,35 @@ pub fn hash_get(t: Gc<Table>, k: V) -> V {
     t.hptr[2 * i + 1]
 }
 
+/// t[k] for a string key `k` with hash `hv`.
+pub fn hash_get_str(t: Gc<Table>, k: V, hv: u64) -> V {
+    if t.hcap == 0 { return V.Nil; }
+    let slots = t.hptr;
+    let mask = t.hcap - 1;
+    var i = hv & mask;
+    loop {
+        let key = slots[2 * i];
+        if key == k { return slots[2 * i + 1]; }
+        if key == V.Nil { return V.Nil; }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Overwrite the value of string key `k` (hash `hv`) if it is present
+/// (possibly as a tombstone); false if absent.
+pub fn hash_set_existing(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
+    if t.hcap == 0 { return false; }
+    let slots = t.hptr;
+    let mask = t.hcap - 1;
+    var i = hv & mask;
+    loop {
+        let key = slots[2 * i];
+        if key == k { slots[2 * i + 1] = v; return true; }
+        if key == V.Nil { return false; }
+        i = (i + 1) & mask;
+    }
+}
+
 pub fn table_get(t: Gc<Table>, k: V) -> V {
     var k = k;
     match k {

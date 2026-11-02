@@ -361,6 +361,7 @@ pub vm Mini {
             let u = ((i as i64) - 1) as u64;
             if u < tab.asize { dst = tab.aptr[u]; next }
         }
+        if let (T(tab), S(s)) = (t, key) { dst = value.hash_get_str(tab, key, s.hash); next }
         if let T(tab) = t { dst = value.table_get(tab, key); next }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
@@ -369,6 +370,7 @@ pub vm Mini {
             let u = ((i as i64) - 1) as u64;
             if u < tab.asize { tab.aptr[u] = v; next }
         }
+        if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
         if let T(tab) = t {
             if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
             if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
