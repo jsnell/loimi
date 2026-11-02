@@ -12,6 +12,7 @@ use crate::codegen::FnGen;
 use crate::diag::{Diag, Res};
 use crate::tir::*;
 use crate::vmast::ValueDecl;
+use std::collections::HashSet;
 
 pub const NAN_TAG_BASE: u64 = 0xFFF9;
 pub const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
@@ -113,16 +114,18 @@ fn payload_bits(g: &mut FnGen, pt: &Ty, v: &str) -> String {
     }
 }
 
-/// Locals of the current function that hold an f64 unboxed from a nanbox
-/// value's `unboxed` variant, and are bound nowhere else and immutable.
+/// Per function: the locals whose f64 value is NaN-safe (see `nan_safe`):
+/// immutable locals bound only from the `unboxed` variant of a nanbox
+/// value, or by `let` from a NaN-safe expression.
 fn nan_safe_local(g: &mut FnGen, l: LocalId) -> bool {
     let fid = g.fid;
     if !g.cg.nan_safe.contains_key(&fid) {
         let p = g.p();
         let f = &p.fns[fid as usize];
-        let mut good = std::collections::HashSet::new();
-        let mut bad = std::collections::HashSet::new();
-        fn rec(p: &Program, pat: &TPat, under: bool, good: &mut std::collections::HashSet<LocalId>, bad: &mut std::collections::HashSet<LocalId>) {
+        let mut good = HashSet::new();
+        let mut bad = HashSet::new();
+        let mut lets: Vec<(LocalId, &TExpr)> = Vec::new();
+        fn rec(p: &Program, pat: &TPat, under: bool, good: &mut HashSet<LocalId>, bad: &mut HashSet<LocalId>) {
             match &pat.kind {
                 TPK::Bind(l) => {
                     if under {
@@ -146,9 +149,19 @@ fn nan_safe_local(g: &mut FnGen, l: LocalId) -> bool {
             }
         }
         if let Some(b) = &f.body {
-            crate::tirwalk::for_each_pat(b, &mut |pat| rec(p, pat, false, &mut good, &mut bad));
+            crate::tirwalk::for_each_bind(b, &mut |site| match site {
+                crate::tirwalk::BindSite::Pat(pat) => rec(p, pat, false, &mut good, &mut bad),
+                crate::tirwalk::BindSite::Let(l, init) => lets.push((l, init)),
+            });
         }
-        let set = good.into_iter().filter(|l| !bad.contains(l) && !f.locals[*l as usize].mutable).collect();
+        let immutable = |l: &LocalId| !f.locals[*l as usize].mutable;
+        let mut set: HashSet<LocalId> = good.into_iter().filter(|l| !bad.contains(l) && immutable(l)).collect();
+        // `let` locals, in order: an init can only use earlier locals.
+        for (l, init) in lets {
+            if immutable(&l) && !bad.contains(&l) && init.ty == Ty::F64 && nan_safe_in(&set, init) {
+                set.insert(l);
+            }
+        }
         g.cg.nan_safe.insert(fid, set);
     }
     g.cg.nan_safe[&fid].contains(&l)
@@ -158,16 +171,25 @@ fn nan_safe_local(g: &mut FnGen, l: LocalId) -> bool {
 /// from canonical inputs: such NaNs have a zero payload (0x7FF8.. or
 /// 0xFFF8..), which is already a valid `unboxed` encoding, so building
 /// the value needs no canonicalization. Leaves are literals, int-to-float
-/// casts, and locals unboxed from the value (always canonical).
+/// casts, and NaN-safe locals.
 fn nan_safe(g: &mut FnGen, e: &TExpr) -> bool {
+    if let TK::Local(l) = &e.kind {
+        return nan_safe_local(g, *l);
+    }
+    nan_safe_local(g, u32::MAX);
+    let set = &g.cg.nan_safe[&g.fid];
+    nan_safe_in(set, e)
+}
+
+fn nan_safe_in(safe: &HashSet<LocalId>, e: &TExpr) -> bool {
     use crate::ast::{BinOp, UnOp};
     match &e.kind {
         TK::Float(x) => !x.is_nan(),
         TK::Cast(inner) => matches!(inner.ty, Ty::Int(_)),
-        TK::Local(l) => nan_safe_local(g, *l),
-        TK::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => nan_safe(g, a) && nan_safe(g, b),
-        TK::Unary(UnOp::Neg, a) => nan_safe(g, a),
-        TK::Intrinsic(Intr::Sqrt | Intr::Floor, args) => args.iter().all(|a| nan_safe(g, a)),
+        TK::Local(l) => safe.contains(l),
+        TK::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => nan_safe_in(safe, a) && nan_safe_in(safe, b),
+        TK::Unary(UnOp::Neg, a) => nan_safe_in(safe, a),
+        TK::Intrinsic(Intr::Sqrt | Intr::Floor, args) => args.iter().all(|a| nan_safe_in(safe, a)),
         _ => false,
     }
 }

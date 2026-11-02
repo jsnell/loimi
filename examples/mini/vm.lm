@@ -409,7 +409,7 @@ pub vm Mini {
     op SELF(a: callbase, obj: reg, key: kst) : ABC + FieldIC {
         let o = obj;
         if let T(tab) = o {
-            regs[a + 1] = o;
+            regs[a as u64 + 1] = o;
             let i = cache.slot as u64;
             if likely(i < tab.hcap) {
                 let p = tab.hptr + 2 * i;
@@ -576,46 +576,46 @@ pub vm Mini {
 
     /// Numeric for: R[a] index, R[a+1] limit, R[a+2] step, R[a+3] the loop variable.
     op FORPREP(a: forbase, target: label) : AsBx {
-        match (regs[a], regs[a + 1], regs[a + 2]) {
+        match (regs[a], regs[a as u64 + 1], regs[a as u64 + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
                 if (s > 0 and i > l) or (s < 0 and i < l) { jump target }
-                regs[a + 3] = Int(i);
+                regs[a as u64 + 3] = Int(i);
                 next
             }
             _ => {}
         }
         cold {
-            let (Some(i), Some(l), Some(s)) = (value.to_num(regs[a]), value.to_num(regs[a + 1]), value.to_num(regs[a + 2])) else {
+            let (Some(i), Some(l), Some(s)) = (value.to_num(regs[a]), value.to_num(regs[a as u64 + 1]), value.to_num(regs[a as u64 + 2])) else {
                 raise error_msg(ctx, "'for' values must be numbers")
             };
             // Integer start and step: an integer loop, with the float
             // limit floored (or ceiled for a negative step) and clamped.
-            if let (Int(ii), Int(si)) = (regs[a], regs[a + 2]) {
+            if let (Int(ii), Int(si)) = (regs[a], regs[a as u64 + 2]) {
                 if si == 0 { raise error_msg(ctx, "'for' step is zero") }
                 let lf = if si > 0 { l.floor() } else { -((-l).floor()) };
                 if l != l or (si > 0 and lf < ii as f64) or (si < 0 and lf > ii as f64) { jump target }
                 let li: i32 = if lf > 2147483647.0 { 2147483647 } else if lf < -2147483648.0 { -2147483647 - 1 } else { lf as i32 };
-                regs[a + 1] = Int(li);
-                regs[a + 3] = Int(ii);
+                regs[a as u64 + 1] = Int(li);
+                regs[a as u64 + 3] = Int(ii);
                 next
             }
             if s == 0.0 { raise error_msg(ctx, "'for' step is zero") }
             regs[a] = Num(i);
-            regs[a + 1] = Num(l);
-            regs[a + 2] = Num(s);
+            regs[a as u64 + 1] = Num(l);
+            regs[a as u64 + 2] = Num(s);
             if (s > 0.0 and i > l) or (s < 0.0 and i < l) { jump target }
-            regs[a + 3] = Num(i);
+            regs[a as u64 + 3] = Num(i);
             next
         }
     }
     op FORLOOP(a: forbase, target: label) : AsBx {
-        match (regs[a], regs[a + 1], regs[a + 2]) {
+        match (regs[a], regs[a as u64 + 1], regs[a as u64 + 2]) {
             (Int(i), Int(l), Int(s)) => {
                 if let Some(n) = i.add_checked(s) {
                     if (s > 0 and n <= l) or (s < 0 and n >= l) {
                         regs[a] = Int(n);
-                        regs[a + 3] = Int(n);
+                        regs[a as u64 + 3] = Int(n);
                         jump target
                     }
                 }
@@ -625,7 +625,7 @@ pub vm Mini {
                 let n = i + s;
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
                     regs[a] = Num(n);
-                    regs[a + 3] = Num(n);
+                    regs[a as u64 + 3] = Num(n);
                     jump target
                 }
                 next
@@ -637,10 +637,10 @@ pub vm Mini {
     /// pairs loop: R[a] table, R[a+1] traversal position, R[a+2], R[a+3]
     /// key and value. Jumps to the body while there is a next entry.
     op NEXT(a: forbase, target: label) : AsBx {
-        if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
+        if let (T(t), Int(i)) = (regs[a], regs[a as u64 + 1]) {
             let n = value.table_iter(t, i as u64, regs + a + 2);
             if n != 0 {
-                regs[a + 1] = Int(n as i32);
+                regs[a as u64 + 1] = Int(n as i32);
                 jump target
             }
             next
@@ -649,13 +649,13 @@ pub vm Mini {
     }
     /// ipairs loop: R[a] table, R[a+1] last index, R[a+2], R[a+3] index and value.
     op INEXT(a: forbase, target: label) : AsBx {
-        if let (T(t), Int(i)) = (regs[a], regs[a + 1]) {
+        if let (T(t), Int(i)) = (regs[a], regs[a as u64 + 1]) {
             let u = i as u64;
             let v = if u < t.asize { t.aptr[u] } else { value.table_get(t, Int(i + 1)) };
             if v == V.Nil { next }
-            regs[a + 1] = Int(i + 1);
-            regs[a + 2] = Int(i + 1);
-            regs[a + 3] = v;
+            regs[a as u64 + 1] = Int(i + 1);
+            regs[a as u64 + 2] = Int(i + 1);
+            regs[a as u64 + 3] = v;
             jump target
         }
         cold { raise iter_error(ctx, regs[a]) }

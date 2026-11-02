@@ -32,6 +32,25 @@ fn arith(a: V, b: V, op: i32) -> V {
     }
 }
 
+/// Through `let`: still NaN-safe. Through `var`: canonicalized.
+fn via_let(a: V, b: V) -> V {
+    match (a, b) {
+        (Num(x), Num(y)) => { let n = x / y; Num(n) }
+        _ => Int(0),
+    }
+}
+
+fn via_var(a: V, bits: u64) -> V {
+    match a {
+        Num(x) => {
+            var m = x;
+            m = f64.from_bits(bits);
+            Num(m)
+        }
+        _ => Int(0),
+    }
+}
+
 fn forged(bits: u64) -> V {
     // Not provably NaN-safe: must be canonicalized.
     V.Num(f64.from_bits(bits))
@@ -50,10 +69,14 @@ fn main() {
     // A NaN whose bits look like a tagged pointer.
     io.println(kind(forged(0xFFFB000000001234)));
     io.println(kind(forged(0xFFF9000000000007)));
+    io.println(kind(via_let(z, z)));
+    io.println(kind(via_var(z, 0xFFFB000000001234)));
     match arith(V.Num(1.5), V.Num(2.25), 2) { Num(x) => io.print_f64(x), _ => io.print("?") }
     io.println("");
 }
 // expect: num
+// expect: nan
+// expect: nan
 // expect: nan
 // expect: nan
 // expect: nan
