@@ -1,9 +1,0 @@
-good: accepted
-slot out of range: word 1 (SAVE): operand `s` (slot) fails `(it as u32) < lim.nslots`
-class out of range: word 0 (CLASS): operand `s` (cls) fails `(it as u32) < lim.nclasses`
-no literals: word 0 (LIT): operand `l` (lit) fails `(it as u32) < lim.nlits`
-byte > 255: word 0 (CHAR): operand `c` (byte) fails `it < 256`
-jump out of the code: word 0 (SPLIT): operand `target` (label) fails `is_insn_boundary(pc + it)`
-runs off the end: word 1 (CHAR): execution can run off the end of the code after this instruction
-bad opcode: word 0: invalid opcode
-mark out of range: word 1 (LOOP): operand `m` (mark) fails `(it as u32) < lim.nmarks`

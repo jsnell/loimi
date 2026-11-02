@@ -99,7 +99,7 @@ void rx_free(rx_regex *r);
 | `check.sh` | build, demo, bytecode fuzzer, verifier test, byte-pattern fuzz, differential tests vs Python (`--random N --seed S`, `--asan`) |
 | `dispatch.sh` | tests and benchmarks in all three dispatch modes |
 | `fuzz.lm` | mutates compiled code, runs what the verifier accepts on both engines |
-| `verify_test.lm` | the verifier on hand-made bad programs |
+| `verify_test.lm` | unit tests (`loimi test`): the verifier on hand-made bad programs, the API in-process |
 | `stats.lm` | benchmark driver for `--vm-stats` |
 | `bench.py` | the benchmarks with Python's `re` |
 | `tests/gen.py`, `tests/cases.txt`, `tests/compare.py` | differential tests |

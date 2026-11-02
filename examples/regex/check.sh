@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the regex library and its C host, then: the demo, the bytecode
-# fuzzer, the verifier test, random byte patterns (both engines must
+# fuzzer, the unit tests, random byte patterns (both engines must
 # agree), and both engines against Python's `re` on the hand-written
 # cases and on random cases.
 #
@@ -54,8 +54,8 @@ else
     "$loimi" build "$here/fuzz.lm" --release -o "$out/rxfuzz"
     timeout 300 "$out/rxfuzz" "$nfuzz" "$seed"
 fi
-"$loimi" run "$here/verify_test.lm" > "$out/verify.out"
-diff -u "$here/tests/verify.expected" "$out/verify.out"
+# Unit tests (std.test): the verifier on bad programs, the API in-process.
+"$loimi" test ${asan:+--sanitize=address} "$here/verify_test.lm" > "$out/unit.out" || { cat "$out/unit.out"; exit 1; }
 
 python3 "$here/tests/gen.py" "$out/cases" "$out/expected" --random "$nrand" --seed "$seed"
 timeout 300 "$host" fuzz "$nfuzz" "$seed"

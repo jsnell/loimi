@@ -1,43 +1,129 @@
-// The generated verifier against hand-made bad programs: each must be
-// rejected, with the reason printed. (rx_compile only ever verifies the
-// compiler's own output, which is always accepted.)
+// Unit tests: the generated verifier against hand-made bad programs
+// (each must be rejected, for the right reason; rx_compile only ever
+// verifies the compiler's own output), and the library API in-process,
+// both engines.
 //
-//   loimi run examples/regex/verify_test.lm
+//   loimi test examples/regex/verify_test.lm [FILTER..]
 
-import std.io;
+import std.test;
 import std.text;
 import vm.{Rx, Limits};
+import lib;
 
-fn check(name: str, code: []u32, lim: *Limits) {
+/// Verify `code`; the rejection message, "accepted" if it verifies.
+fn verdict(code: []u32) -> str {
+    var lim = Limits { nslots: 2, nmarks: 1, nclasses: 1, nlits: 0 };
     var b = text.StrBuf.new();
-    b.push_str(name);
-    b.push_str(": ");
-    match Rx.verify(code, lim) {
+    match Rx.verify(code, &lim) {
         Ok(_) => b.push_str("accepted"),
         Err(e) => e.write(&b),
     }
-    io.println(b.as_str());
-    b.free();
+    b.as_str()
 }
 
-fn main() {
-    var lim = Limits { nslots: 2, nmarks: 1, nclasses: 1, nlits: 0 };
-    var good: [u32; 4] = [Rx.SAVE(0), Rx.CLASS(0), Rx.SAVE(1), Rx.MATCH()];
-    check("good", good[..], &lim);
-    var slot: [u32; 3] = [Rx.SAVE(0), Rx.SAVE(7), Rx.MATCH()];
-    check("slot out of range", slot[..], &lim);
-    var cls: [u32; 2] = [Rx.CLASS(3), Rx.MATCH()];
-    check("class out of range", cls[..], &lim);
-    var lit: [u32; 2] = [Rx.LIT(0), Rx.MATCH()];
-    check("no literals", lit[..], &lim);
-    var byte: [u32; 2] = [Rx.CHAR(300), Rx.MATCH()];
-    check("byte > 255", byte[..], &lim);
-    var jump: [u32; 3] = [Rx.SPLIT(5), Rx.CHAR(97), Rx.MATCH()];
-    check("jump out of the code", jump[..], &lim);
-    var off: [u32; 2] = [Rx.SAVE(0), Rx.CHAR(97)];
-    check("runs off the end", off[..], &lim);
-    var bad: [u32; 2] = [0xFF, Rx.MATCH()];
-    check("bad opcode", bad[..], &lim);
-    var mark: [u32; 3] = [Rx.MARK(0), Rx.LOOP(1, -1), Rx.MATCH()];
-    check("mark out of range", mark[..], &lim);
+#[test]
+fn good() {
+    var c: [u32; 4] = [Rx.SAVE(0), Rx.CLASS(0), Rx.SAVE(1), Rx.MATCH()];
+    test.eq(verdict(c[..]), "accepted");
+}
+
+#[test]
+fn slot_out_of_range() {
+    var c: [u32; 3] = [Rx.SAVE(0), Rx.SAVE(7), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 1 (SAVE): operand `s` (slot) fails `(it as u32) < lim.nslots`");
+}
+
+#[test]
+fn class_out_of_range() {
+    var c: [u32; 2] = [Rx.CLASS(3), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 0 (CLASS): operand `s` (cls) fails `(it as u32) < lim.nclasses`");
+}
+
+#[test]
+fn no_literals() {
+    var c: [u32; 2] = [Rx.LIT(0), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 0 (LIT): operand `l` (lit) fails `(it as u32) < lim.nlits`");
+}
+
+#[test]
+fn byte_over_255() {
+    var c: [u32; 2] = [Rx.CHAR(300), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 0 (CHAR): operand `c` (byte) fails `it < 256`");
+}
+
+#[test]
+fn jump_out_of_the_code() {
+    var c: [u32; 3] = [Rx.SPLIT(5), Rx.CHAR(97), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 0 (SPLIT): operand `target` (label) fails `is_insn_boundary(pc + it)`");
+}
+
+#[test]
+fn runs_off_the_end() {
+    var c: [u32; 2] = [Rx.SAVE(0), Rx.CHAR(97)];
+    test.eq(verdict(c[..]), "word 1 (CHAR): execution can run off the end of the code after this instruction");
+}
+
+#[test]
+fn bad_opcode() {
+    var c: [u32; 2] = [0xFF, Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 0: invalid opcode");
+}
+
+#[test]
+fn mark_out_of_range() {
+    var c: [u32; 3] = [Rx.MARK(0), Rx.LOOP(1, -1), Rx.MATCH()];
+    test.eq(verdict(c[..]), "word 1 (LOOP): operand `m` (mark) fails `(it as u32) < lim.nmarks`");
+}
+
+// ── the library API ─────────────────────────────────────────────────
+
+/// Search `s` for `pat` with both engines, which must agree; the span of
+/// group `g` as "start..end", or "no match".
+#[track_caller]
+fn search(pat: str, s: str, g: u64) -> str {
+    let r = lib.rx_compile(pat.ptr, pat.len).unwrap();
+    test.assert_msg(lib.rx_ok(r), lib.rx_error(r));
+    var spans: [i64; 8] = [0; 8];
+    var pike: [i64; 8] = [0; 8];
+    let m = lib.rx_exec(r, s.ptr, s.len, 0, lib.RX_SEARCH, &spans[0], 4);
+    let mp = lib.rx_exec(r, s.ptr, s.len, 0, lib.RX_SEARCH | lib.RX_PIKE, &pike[0], 4);
+    test.eq(mp, m);
+    var b = text.StrBuf.new();
+    if m == 1 {
+        test.eq(pike[2 * g], spans[2 * g]);
+        test.eq(pike[2 * g + 1], spans[2 * g + 1]);
+        b.fmt2("{}..{}", spans[2 * g], spans[2 * g + 1]);
+    } else {
+        b.add("no match");
+    }
+    lib.rx_free(r);
+    b.as_str()
+}
+
+#[test]
+fn literal() { test.eq(search("abc", "xxabcxx", 0), "2..5"); }
+
+#[test]
+fn groups() {
+    test.eq(search("(a+)(b*)c", "zaaac", 1), "1..4");
+    test.eq(search("(a+)(b*)c", "zaaac", 2), "4..4");
+}
+
+#[test]
+fn alternation_prefers_left() { test.eq(search("a|ab", "ab", 0), "0..1"); }
+
+#[test]
+fn counted_repeat() {
+    test.eq(search("x{2,3}", "xxxxx", 0), "0..3");
+    test.eq(search("^x{2}$", "xxx", 0), "no match");
+}
+
+#[test]
+fn syntax_error_has_offset() {
+    let pat = "a(b";
+    let r = lib.rx_compile(pat.ptr, pat.len).unwrap();
+    test.assert(!lib.rx_ok(r));
+    test.has(lib.rx_error(r), "missing )");
+    test.eq(lib.rx_error_offset(r), 1);
+    lib.rx_free(r);
 }
