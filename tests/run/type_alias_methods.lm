@@ -7,6 +7,8 @@ import std.io;
 struct Box<T> { v: T }
 type IntBox = Box<i64>;
 fn IntBox.get(b: *IntBox) -> i64 { b.v }
+// The generic type's static function through the instance's alias.
+fn Box<T>.make(v: T) -> Box<T> { Box { v: v } }
 
 trait Show { fn show(x: Self); }
 fn IntBox.show(b: IntBox) { io.print("box "); io.print_int(b.v); io.println(""); }
@@ -25,9 +27,12 @@ fn main() {
     sh(Box { v: 3 });
     let w: u32 = 21;
     sh(w);
+    let m = IntBox.make(5);
+    io.print_int(m.v); io.println("");
 }
 
 // expect: 4
 // expect: box 4
 // expect: box 3
 // expect: word 21
+// expect: 5

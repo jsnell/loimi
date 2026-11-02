@@ -2645,6 +2645,14 @@ impl<'a> Checker<'a> {
                         if let Some(r) = self.static_intrinsic(cx, &t, &name.name, args, span)? {
                             return Ok(r);
                         }
+                        // `IntBox.make(..)` with `type IntBox = Box<i64>`: the
+                        // generic type's function, with the instance's arguments.
+                        if let Some((g, targs)) = self.generics.inst_of.get(&t).cloned() {
+                            if let Some(gf) = self.generics.methods.get(&(g, name.name.clone())).copied() {
+                                let known = targs.into_iter().map(Some).collect();
+                                return self.generic_call(cx, gf, vec![], known, args, exp, span);
+                            }
+                        }
                         if let Some(gf) = self.generics.ty_methods.get(&(t.clone(), name.name.clone())).copied() {
                             return self.generic_call(cx, gf, vec![], vec![], args, exp, span);
                         }
