@@ -31,12 +31,11 @@ pub object Lines { data: [u32] }
 /// enclosing frame", otherwise "free slot `low byte` of the enclosing closure".
 pub object Descs { data: [u32] }
 pub object Protos { data: [Gc<Proto>] }
-/// Bytecode words: the storage behind a Proto's `code`.
-pub object Code { data: [u32] }
-/// A procedure prototype. `code` is the proof that `words` passed
-/// Scheme.verify against this prototype's nregs, nfree and its constant
-/// and child counts (compile.lm, `finish`); none of these change after.
-/// Every call jumps to a `code`, so every procedure that runs was verified.
+/// A procedure prototype. `code` holds the bytecode, which only
+/// Scheme.build_verified writes: it verifies the words in place against
+/// this prototype's nregs, nfree and its constant and child counts
+/// (compile.lm, `finish`), none of which change after. Every call jumps
+/// to a `code`, so every procedure that runs was verified.
 pub object Proto {
     name: Gc<Str>,
     /// Number of required parameters.
@@ -52,10 +51,8 @@ pub object Proto {
     lines: Gc<Lines>,
     protos: Gc<Protos>,
     desc: Gc<Descs>,
-    code: Verified<Scheme>,
-    /// Owns `code`'s words (the proof holds a plain slice, which the
-    /// collector does not trace).
-    words: Gc<Code>,
+    /// Reads as a `Verified<Scheme>`; `jump p.code` is the array's address.
+    code: verified [u32] by Scheme,
 }
 /// A flat closure: the values of its free variables (boxes for assigned ones).
 pub object Closure { proto: Gc<Proto>, free: [V] }

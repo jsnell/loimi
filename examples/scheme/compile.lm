@@ -25,7 +25,7 @@ import std.map;
 import std.hash;
 import std.bc;
 import value;
-import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs, Code};
+import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
 import rt.{Ctx};
 import read;
 import read.{fail, Reader};
@@ -2397,14 +2397,22 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     }
     let np = l.nparams;
     let rest: u32 = if l.rest { 1 } else { 0 };
-    // Verify against the counts the Proto will hold, then store the
-    // proof with them: CALL jumps only to a Proto's verified `code`.
-    let nregs = fs.regs.frame_size(1);
-    let nfree = l.free.len as u32;
-    let words = new(h, Code {}, fs.code.len());
-    fs.code.copy_into(words.data);
-    let code = match Scheme.verify(words.data, nregs, nfree, consts.data.len, protos.data.len) {
-        Ok(v) => Scheme.optimize(v),
+    // The Proto is created with its code, verified against the counts
+    // it holds: CALL jumps only to a Proto's verified `code`.
+    let init = Proto {
+        name: value.new_str(h, l.name),
+        nparams: np,
+        rest: rest,
+        fixed: if l.rest { 0x10000 } else { np },
+        nregs: fs.regs.frame_size(1),
+        nfree: l.free.len as u32,
+        consts: consts,
+        lines: lines,
+        protos: protos,
+        desc: desc,
+    };
+    let proto = match Scheme.build_verified(h, init, fs.code.words()) {
+        Ok(p) => p,
         Err(e) => {
             var b = text.StrBuf.new();
             b.push_str("internal error: generated code fails verification: ");
@@ -2412,20 +2420,7 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
             fail(0, b.as_str())
         }
     };
-    let proto = new(h, Proto {
-        name: value.new_str(h, l.name),
-        nparams: np,
-        rest: rest,
-        fixed: if l.rest { 0x10000 } else { np },
-        nregs: nregs,
-        nfree: nfree,
-        consts: consts,
-        lines: lines,
-        protos: protos,
-        desc: desc,
-        code: code,
-        words: words,
-    });
+    Scheme.optimize(proto.code);
     fs.code.free();
     fs.consts.free();
     fs.protos.free();

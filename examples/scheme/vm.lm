@@ -9,7 +9,7 @@ import std.io;
 import std.text;
 import std.os;
 import value;
-import value.{V, Pair, Vect, Proto, Closure, Lines, Protos, Descs, Code};
+import value.{V, Pair, Vect, Proto, Closure, Lines, Protos, Descs};
 import rt.{Ctx, Frame};
 import rt;
 import builtins;
@@ -63,20 +63,8 @@ fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
 /// checks that the frame at that depth still belongs to it and returns from
 /// it. Its `fixed` keeps CALL off the fast path.
 pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
-    let words = new(h, Code {}, 2);
-    words.data[0] = Scheme.CALL(0, 1);
-    words.data[1] = Scheme.RET(0);
-    let code = match Scheme.verify(words.data, 2, 1, 0, 0) {
-        Ok(v) => v,
-        Err(e) => {
-            var b = text.StrBuf.new();
-            b.push_str("error: internal error: continuation code fails verification: ");
-            e.write(&b);
-            io.eprintln(b.as_str());
-            os.quit(1)
-        }
-    };
-    new(h, Proto {
+    let words: [u32; 2] = [Scheme.CALL(0, 1), Scheme.RET(0)];
+    let init = Proto {
         name: value.new_str(h, "continuation"),
         nparams: 1,
         rest: 0,
@@ -87,9 +75,17 @@ pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
         lines: new(h, Lines {}, 0),
         protos: new(h, Protos {}, 0),
         desc: new(h, Descs {}, 0),
-        code: code,
-        words: words,
-    })
+    };
+    match Scheme.build_verified(h, init, words[..]) {
+        Ok(p) => p,
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("error: internal error: continuation code fails verification: ");
+            e.write(&b);
+            io.eprintln(b.as_str());
+            os.quit(1)
+        }
+    }
 }
 
 #[require_verified]
@@ -97,20 +93,20 @@ pub vm Scheme {
     context ctx: *Ctx;
     state { pc: *u32, regs: *V, k: *V, fp: *Frame }
 
-    // The generated verifier (Scheme.verify) checks these against the
-    // prototype's register, free variable, constant and child counts. It
-    // runs before the Proto exists (compile.lm, `finish`), which then
-    // stores the proof next to the same counts.
-    verify_context nregs: u32, nfree: u32, nconsts: u64, nprotos: u64;
-    operand reg = regs[it] verify (it as u32) < nregs;
-    operand kst = k[it] verify (it as u64) < nconsts;
+    // The generated verifier checks these against the prototype that
+    // holds the code: Scheme.build_verified (compile.lm, `finish`)
+    // creates the Proto, copies the words into its `code` and verifies
+    // them there, with the Proto itself as `proto`.
+    verify_context owner proto: Gc<Proto>;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    operand kst = k[it] verify (it as u64) < proto.consts.data.len;
     operand imm = it;
     operand simm = it;
     /// A global slot (allocated by the compiler, so always in range).
     operand gl = it;
-    operand fv = it verify (it as u32) < nfree;
-    operand child = it verify (it as u64) < nprotos;
-    operand callbase = it verify (it as u32) < nregs;
+    operand fv = it verify (it as u32) < proto.nfree;
+    operand child = it verify (it as u64) < proto.protos.data.len;
+    operand callbase = it verify (it as u32) < proto.nregs;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
