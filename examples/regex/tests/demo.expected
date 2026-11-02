@@ -1,0 +1,23 @@
+pattern (\w+)@(\w+)\.com: 2 groups
+  mail bob@example.com now [0]='bob@example.com' [1]='bob' [2]='example'
+  mail bob@example.com now [0]='bob@example.com' [1]='bob' [2]='example'
+  nobody here    no match
+    0  SAVE s=s0
+    1  SAVE_CPLUS
+    1    SAVE s=s2
+    2    CPLUS s=c0
+    3  SAVE s=s3
+    4  CHAR c=64
+    5  SAVE_CPLUS
+    5    SAVE s=s4
+    6    CPLUS s=c1
+    7  SAVE s=s5
+    8  LIT l=l0
+    9  SAVE_MATCH
+    9    SAVE s=s1
+   10    MATCH
+compile a(b      ok=0 error='missing ), unterminated subpattern' at 1
+compile *a       ok=0 error='nothing to repeat' at 0
+compile [z-a]    ok=0 error='bad character range' at 1
+compile a{3,2}   ok=0 error='min repeat greater than max repeat' at 2
+compile \q       ok=0 error='bad escape' at 0

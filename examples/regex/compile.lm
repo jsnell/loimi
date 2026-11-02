@@ -11,7 +11,8 @@
 //
 // A loop whose body can match the empty string brackets each iteration
 // with `MARK m` ... `LOOP m, L`, which goes round again only if the
-// iteration consumed input (otherwise `(a*)*` would loop forever).
+// iteration consumed input (otherwise `(a*)*` would loop forever). x+
+// enters its first iteration after `UNMARK m`, so that one is not checked.
 
 import std.bc;
 import std.mem;
@@ -30,8 +31,9 @@ struct C {
     t: *Tree,
     code: bc.Code<u32>,
     out: *Out,
-    /// Fuse runs of literal bytes into LIT (the backtracker wants it,
-    /// the Pike VM steps one byte at a time).
+    /// Use the backtracker's multi-byte instructions: LIT for runs of
+    /// literal bytes, CSTAR/CPLUS for greedy loops over one byte. (The
+    /// Pike VM steps one byte at a time and has neither.)
     use_lit: bool,
     err: ?str,
 }
@@ -180,32 +182,64 @@ fn C.cat(c: *C, i: u32) {
 }
 
 fn C.new_mark(c: *C) -> ?u32 {
-    if c.out.nmarks >= 255 {
-        if c.err.is_none() { c.err = Some("too many loops that can match the empty string"); }
+    // The Pike VM keeps the marks set at the current position in a bit
+    // mask next to a 24-bit pc.
+    if c.out.nmarks >= 40 {
+        if c.err.is_none() { c.err = Some("too many loops that can match the empty string (limit 40)"); }
         return None;
     }
     c.out.nmarks += 1;
     Some(c.out.nmarks - 1)
 }
 
+/// The class of a node that matches exactly one byte, if it is one.
+fn C.single_byte_class(c: *C, x: u32) -> ?u32 {
+    var s = Set.empty();
+    match c.node_at(x) {
+        Byte(b) => s.add(b),
+        Any => { s.add('\n'); s.invert(); }
+        Class(k) => return Some(k),
+        _ => return None,
+    }
+    c.t.classes.push(s);
+    Some((c.t.classes.len - 1) as u32)
+}
+
 /// x* (min_one: x+), greedy or lazy.
 fn C.star(c: *C, x: u32, min_one: bool, greedy: bool) {
+    if c.use_lit and greedy {
+        if let Some(k) = c.single_byte_class(x) {
+            c.code.op(if min_one { Rx.CPLUS(k) } else { Rx.CSTAR(k) });
+            return;
+        }
+    }
     let empty_body = nullable(c.t, x);
     let body = c.code.label();
-    if min_one { c.code.jump(Rx.JMP(0), body); }
-    let head = c.code.here();
     let exit = c.code.label();
-    c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
-    c.code.bind(body);
-    if empty_body {
-        let Some(m) = c.new_mark() else { return };
-        c.code.op(Rx.MARK(m));
-        c.node(x);
-        c.code.jump(Rx.LOOP(m as u8, 0), head);
-    } else {
+    if !empty_body {
+        if min_one { c.code.jump(Rx.JMP(0), body); }
+        let head = c.code.here();
+        c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
+        c.code.bind(body);
         c.node(x);
         c.code.jump(Rx.JMP(0), head);
+        c.code.bind(exit);
+        return;
     }
+    // As Python's sre does: an iteration may start only if the previous
+    // optional one consumed input. The mandatory first iteration of x+ is
+    // not checked, so it enters with the mark cleared.
+    let Some(m) = c.new_mark() else { return };
+    if min_one {
+        c.code.op(Rx.UNMARK(m));
+        c.code.jump(Rx.JMP(0), body);
+    }
+    let head = c.code.here();
+    c.code.jump(if greedy { Rx.SPLIT(0) } else { Rx.SPLITX(0) }, exit);
+    c.code.op(Rx.MARK(m));
+    c.code.bind(body);
+    c.node(x);
+    c.code.jump(Rx.LOOP(m as u8, 0), head);
     c.code.bind(exit);
 }
 

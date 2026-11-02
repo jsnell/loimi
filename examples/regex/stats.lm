@@ -1,0 +1,58 @@
+// A Loimi driver for the benchmark patterns, for `--vm-stats` (which a
+// `--lib` build cannot use: the stats runtime is only linked into
+// executables).
+//
+//   loimi build examples/regex/stats.lm --release --vm-stats -o rxstats && ./rxstats
+
+import std.io;
+import std.mem;
+import lib;
+
+const WORDS: [str; 20] = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "regex", "loimi",
+                          "bytecode", "machine", "Sherlock", "Holmes", "Watson", "1887", "42", "x9", "foo_bar", "end"];
+
+fn gen_text(n: u64) -> *u8 {
+    let t: *u8 = mem.alloc(n + 32);
+    var i: u64 = 0;
+    var s: u64 = 12345;
+    while i < n {
+        s = s *% 6364136223846793005 +% 1442695040888963407;
+        let r = s >> 33;
+        let w = WORDS[r % 20];
+        if i + w.len + 1 > n { break; }
+        for j in 0..w.len { t[i + j] = w[j]; }
+        i += w.len;
+        t[i] = if (r >> 8) % 13 == 0 { '\n' } else { ' ' };
+        i += 1;
+    }
+    while i < n { t[i] = ' '; i += 1; }
+    t
+}
+
+fn count(pat: str, t: *u8, n: u64) -> i64 {
+    let re = lib.rx_compile(pat.ptr, pat.len);
+    var spans: [i64; 2] = [0; 2];
+    var c: i64 = 0;
+    var at: u64 = 0;
+    while at <= n {
+        let rc = lib.rx_exec(re, t, n, at, 1, &spans[0], 1);
+        if rc != 1 { break; }
+        c += 1;
+        at = if spans[1] > spans[0] { spans[1] as u64 } else { spans[1] as u64 + 1 };
+    }
+    lib.rx_free(re);
+    c
+}
+
+fn main() {
+    let n: u64 = 1 << 20;
+    let t = gen_text(n);
+    let pats: [str; 7] = ["Sherlock Holmes", "Sherlock|Watson|Holmes|1887", "[a-z]+ing|\\d{3,}", "\\w+",
+                          "(\\w+)\\s+(\\w+)", "(?:fox|dog|cat|bird|lazy)\\s(?:over|jumps|end)", "x9.*end"];
+    for i in 0..7 {
+        io.print(pats[i]);
+        io.print(": ");
+        io.print_int(count(pats[i], t, n));
+        io.println("");
+    }
+}

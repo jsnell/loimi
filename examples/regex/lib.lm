@@ -30,7 +30,7 @@ fn empty_regex() -> Regex {
         first_all: true,
         anchored: false,
         slots: mem.alloc(1),
-        marks: mem.alloc(1),
+        marks: mem.alloc(1),  // a placeholder: `*T` cannot be null
         bt_base: mem.alloc(1024),
         bt_end: mem.alloc(1),
         start: 0,
@@ -88,11 +88,16 @@ export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
     for i in 0..tree.classes.len { r.classes[i] = tree.classes.at(i); }
     mem.release(r.lits);
     r.lits = out.lits.ptr;
+    // Vec.new() allocates, so the placeholders must be freed first.
+    r.lit_bytes.free();
     r.lit_bytes = out.lit_bytes;
     mem.release(r.slots);
+    mem.release(r.marks);
     r.slots = mem.alloc((nslots + out.nmarks) as u64);
     r.marks = r.slots + nslots as u64;
+    r.words.free();
     r.words = out.words;
+    r.pike_words.free();
     r.pike_words = pout.words;
 
     var f = Set.empty();
@@ -103,7 +108,7 @@ export "C" fn rx_compile(pat: *u8, len: u64) -> *Regex {
     // Both programs go through the verifier: the handlers index the
     // slot, class and literal tables without bounds checks.
     r.code = match Rx.verify(r.words.items(), &r.lim) {
-        Ok(v) => v,
+        Ok(v) => Rx.optimize(v),
         Err(e) => { verify_error(r, e); return r; }
     };
     var plim = r.lim;
@@ -211,6 +216,7 @@ export "C" fn rx_free(r: *Regex) {
     mem.release(r.lits);
     r.lit_bytes.free();
     mem.release(r.slots);
+    if !r.ok and r.marks != r.slots + 2 * (r.ngroups as u64 + 1) { mem.release(r.marks); }
     mem.release(r.bt_base);
     if let Some(p) = r.pike { (p as *Pike).free(); }
     r.err.free();

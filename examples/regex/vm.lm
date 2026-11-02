@@ -9,7 +9,8 @@
 // bit of `tag`: a choice point (`tag` = the pc to resume at, `val` = the
 // input position) and an undo record (`tag` = address of a slot | 1,
 // `val` = the slot's old value), pushed by SAVE and MARK so that
-// backtracking restores captures.
+// backtracking restores captures. CSTAR and CPLUS push a pair: the lower
+// bound (`tag` 0), then the resume pc | 2 with the current end of the run.
 
 import std.mem;
 import std.text;
@@ -125,6 +126,19 @@ pub vm Rx {
             let t = bt.tag;
             if (t & 1) != 0 {
                 *((t - 1) as *i64) = bt.val;
+            } else if (t & 2) != 0 {
+                // A greedy CSTAR/CPLUS: give back one more byte, down to
+                // the lower bound kept in the record below.
+                let below = bt - 1;
+                let p = bt.val - 1;
+                if p >= below.val {
+                    bt.val = p;
+                    bt = bt + 1;
+                    sp = p as u64;
+                    let resume = (t - 2) as *u32;
+                    jump resume
+                }
+                bt = below;
             } else {
                 sp = bt.val as u64;
                 let resume = t as *u32;
@@ -151,6 +165,28 @@ pub vm Rx {
         if sp < end and s.has(inp[sp]) { sp += 1; next }
         backtrack()
     }
+    /// Greedy `[class]*`: take every byte in the class, then give them
+    /// back one at a time on backtracking, from one pair of records.
+    op CSTAR(s: cls) : A { class_star(&s, 0) }
+    /// Greedy `[class]+`.
+    op CPLUS(s: cls) : A { class_star(&s, 1) }
+
+    fn class_star(s: *Set, min: u64) -> never {
+        if bt + 1 >= ctx.bt_end { cold { grow_stack() } }
+        let lo = sp + min;
+        while sp < end and s.has(inp[sp]) { sp += 1; }
+        if sp < lo { backtrack() }
+        if sp > lo {
+            bt.tag = 0;
+            bt.val = lo as i64;
+            let top = bt + 1;
+            top.tag = ((pc + 1) as u64) | 2;
+            top.val = sp as i64;
+            bt = bt + 2;
+        }
+        next
+    }
+
     op LIT(l: lit) : A {
         let n = l.len as u64;
         if end - sp >= n {
@@ -186,6 +222,15 @@ pub vm Rx {
         m = sp as i64;
         next
     }
+    /// Clear a loop mark (with undo), so that the next LOOP goes round.
+    op UNMARK(m: mark) : A {
+        if bt == ctx.bt_end { cold { grow_stack() } }
+        bt.tag = ((ctx.marks + m.raw) as u64) | 1;
+        bt.val = m;
+        bt = bt + 1;
+        m = -1;
+        next
+    }
     /// The end of an iteration of a loop whose body can match empty: go
     /// round again only if the iteration consumed input.
     op LOOP(m: mark, target: label) : AJ {
@@ -210,6 +255,13 @@ pub vm Rx {
         jump target
     }
     op MATCH() : N { exit Ok(true) }
+
+    // Superinstructions, from `--vm-stats` on the benchmark patterns
+    // (stats.lm). `Rx.optimize` fuses them after verification.
+    super SAVE_SPLIT_CPLUS_LIT = SAVE; SPLIT; CPLUS; LIT;
+    super SAVE_CPLUS = SAVE; CPLUS;
+    super SAVE_MATCH = SAVE; MATCH;
+    super SPLIT_LIT = SPLIT; LIT;
 
     entry exec(r: *Regex, code: Verified<Rx>, input: *u8, n: u64, at: u64) -> Result<bool, str> {
         ctx = r;

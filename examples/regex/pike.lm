@@ -8,14 +8,16 @@
 // (and captures) as the backtracker.
 
 import std.mem;
+import std.map;
 import syntax.{Set};
 import vm.{Rx, Regex};
 
 struct List { pcs: *u32, caps: *i64, n: u64 }
 
 /// An entry of the explicit stack that follows the epsilon edges:
-/// explore `pc` (slot == NONE), or restore `slots[slot] = val`.
-struct Work { pc: u32, slot: u32, val: i64 }
+/// explore `pc` with loop marks `mask` set at this position (slot ==
+/// NONE), or restore `slots[slot] = val`.
+struct Work { pc: u32, slot: u32, val: i64, mask: u64 }
 
 const NONE: u32 = 0xFFFFFFFF;
 
@@ -25,6 +27,8 @@ pub struct Pike {
     a: List,
     b: List,
     seen: *u64,
+    /// (mask << 24 | pc) -> gen, for states with a nonzero mask.
+    seen_masked: map.HashMap<u64, u64>,
     gen: u64,
     cur: *i64,
     work: mem.Vec<Work>,
@@ -39,7 +43,7 @@ pub fn Pike.new(nw: u64, nsl: u64) -> *Pike {
     *p = Pike {
         nw: nw, nsl: nsl,
         a: new_list(nw, nsl), b: new_list(nw, nsl),
-        seen: mem.alloc(nw), gen: 0,
+        seen: mem.alloc(nw), seen_masked: map.HashMap.new(), gen: 0,
         cur: mem.alloc(nsl + 1),
         work: mem.Vec.new(),
     };
@@ -50,6 +54,7 @@ pub fn Pike.free(p: *Pike) {
     mem.release(p.a.pcs); mem.release(p.a.caps);
     mem.release(p.b.pcs); mem.release(p.b.caps);
     mem.release(p.seen); mem.release(p.cur);
+    p.seen_masked.free();
     p.work.free();
     mem.release(p);
 }
@@ -57,52 +62,69 @@ pub fn Pike.free(p: *Pike) {
 /// Follow the epsilon edges from `pc0` at input position `sp`, with the
 /// slots in `p.cur`, adding every consuming instruction and MATCH reached
 /// to `l` in priority order.
+///
+/// What happens after an epsilon instruction depends on its pc and on
+/// which loop marks equal `sp`, i.e. were set by a MARK in this closure:
+/// LOOP goes round again only if its mark is older. Each work item
+/// carries those marks as a bit mask, and an epsilon pc is followed once
+/// per (pc, mask), so the first (highest priority) path to reach a state
+/// wins, which is the answer the backtracker gives. A thread waiting at a
+/// consuming instruction or MATCH does not depend on the mask (every mark
+/// is older than the next position), so it is added once per pc.
 fn Pike.add(p: *Pike, code: []u32, l: *List, pc0: u64, input: *u8, sp: u64, end: u64, nslots: u64) {
     p.work.clear();
-    p.work.push(Work { pc: pc0 as u32, slot: NONE, val: 0 });
+    p.work.push(Work { pc: pc0 as u32, slot: NONE, val: 0, mask: 0 });
     while let Some(wk) = p.work.pop() {
         if wk.slot != NONE { p.cur[wk.slot as u64] = wk.val; continue; }
         let pc = wk.pc as u64;
+        let mask = wk.mask;
         let w = code[pc];
         let op = Rx.opcode(w);
-        // A pc is followed once per step, so the first (highest priority)
-        // thread to reach it wins. SAVE, MARK and LOOP are exempt: a later
-        // arrival through an empty loop iteration has different marks, and
-        // the backtracker would let it take that iteration. Every cycle
-        // passes through a SPLIT or JMP, so this still terminates.
-        if op != Rx.OP_SAVE and op != Rx.OP_MARK and op != Rx.OP_LOOP {
+        if mask == 0 {
             if p.seen[pc] == p.gen { continue; }
             p.seen[pc] = p.gen;
+        } else {
+            let key = (mask << 24) | pc;
+            if p.seen_masked.get(key) == Some(p.gen) { continue; }
+            p.seen_masked.insert(key, p.gen);
         }
+        let next = Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask };
         if op == Rx.OP_JMP {
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
         } else if op == Rx.OP_SPLIT {
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
-            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
+            p.work.push(next);
         } else if op == Rx.OP_SPLITX {
-            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
-            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
-        } else if op == Rx.OP_SAVE or op == Rx.OP_MARK {
-            var s = Rx.A_a(w);
-            if op == Rx.OP_MARK { s += nslots; }
-            p.work.push(Work { pc: 0, slot: s as u32, val: p.cur[s] });
+            p.work.push(next);
+            p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
+        } else if op == Rx.OP_SAVE {
+            let s = Rx.A_a(w);
+            p.work.push(Work { pc: 0, slot: s as u32, val: p.cur[s], mask: 0 });
             p.cur[s] = sp as i64;
-            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+            p.work.push(next);
+        } else if op == Rx.OP_MARK {
+            let m = Rx.A_a(w);
+            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask | ((1 as u64) << m) });
+        } else if op == Rx.OP_UNMARK {
+            let m = Rx.A_a(w);
+            p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0, mask: mask & (((1 as u64) << m) ^ 0xFFFFFFFFFFFFFFFF) });
         } else if op == Rx.OP_LOOP {
-            let s = Rx.AJ_a(w) + nslots;
-            if p.cur[s] != sp as i64 {
-                p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0 });
+            let m = Rx.AJ_a(w);
+            if (mask & ((1 as u64) << m)) == 0 {
+                p.work.push(Work { pc: target(w, pc), slot: NONE, val: 0, mask: mask });
             } else {
-                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
+                p.work.push(next);
             }
         } else if op == Rx.OP_BOL {
-            if sp == 0 { p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 }); }
+            if sp == 0 { p.work.push(next); }
         } else if op == Rx.OP_EOL {
-            if sp == end or (sp + 1 == end and input[sp] == '\n') {
-                p.work.push(Work { pc: (pc + 1) as u32, slot: NONE, val: 0 });
-            }
+            if sp == end or (sp + 1 == end and input[sp] == '\n') { p.work.push(next); }
         } else {
             // CHAR, ANY, CLASS, MATCH: a thread waits here.
+            if mask != 0 {
+                if p.seen[pc] == p.gen { continue; }
+                p.seen[pc] = p.gen;
+            }
             l.pcs[l.n] = pc as u32;
             mem.copy(l.caps + l.n * p.nsl, p.cur, p.nsl);
             l.n += 1;
