@@ -416,6 +416,19 @@ shared object with initial-exec TLS) costs nothing measurable: dispatch
 loads the table address with one `lea` instead of an absolute
 address.
 
+Thread-locals rather than plain globals cost nothing either. An
+initial-exec access is `mov %fs:OFF, reg`, the same one instruction as
+an absolute address. Measured (2026-11-03) by building the same IR with
+`thread_local(initialexec)` deleted, so that every runtime thread-local
+(the shadow-stack top included, touched at every call that may collect)
+is a plain global; `--align-functions=64`, best of 3 interleaved runs,
+geometric mean of plain-global time over TLS time: Mini 1.009 (14
+benchmarks, all within 0.99–1.05), MiniJS 0.998 (14, 0.96–1.02), Scheme
+1.000 (41 r7rs programs, 0.94–1.06). So executables keep their
+thread-locals unconditionally, with no single-threaded build mode, and
+independent states on several threads (language.md §10.1, Threads) cost
+nothing when there is one.
+
 ## 5. `goto` mode
 
 A single function with one basic block per handler. State variables are phis
