@@ -1,0 +1,109 @@
+// std.bigint against CPython (bench/bigint/bench.py does the same work):
+// factorial(5000) by a running product, fib(100000) by fast doubling,
+// formatting and parsing a 100,000-digit decimal number, and a product
+// and a division of 100,000-digit numbers. Prints each part's time (ms,
+// best of 5) and a checksum of the results.
+import std.io;
+import std.mem;
+import std.text;
+import std.prof;
+import std.bigint;
+import std.bigint.{Num, BigInt};
+
+fn replace(x: *BigInt, y: BigInt) {
+    x.free();
+    *x = y;
+}
+
+fn factorial(n: i64) -> BigInt {
+    var f = bigint.of_i64(1);
+    var buf: [u64; 1] = [0; 1];
+    for i in 2..n + 1 {
+        replace(&f, bigint.mul(f.num(), bigint.from_i64(buf[0..1], i)));
+    }
+    f
+}
+
+/// (fib(n), fib(n + 1)) by fast doubling.
+fn fib(n: u64) -> (BigInt, BigInt) {
+    if n == 0 { return (bigint.of_i64(0), bigint.of_i64(1)); }
+    let (a0, b0) = fib(n / 2);
+    var a = a0;
+    var b = b0;
+    // c = a * (2b - a), d = a^2 + b^2
+    var t = bigint.shl(b.num(), 1);
+    replace(&t, bigint.sub(t.num(), a.num()));
+    var c = bigint.mul(a.num(), t.num());
+    var a2 = bigint.mul(a.num(), a.num());
+    var b2 = bigint.mul(b.num(), b.num());
+    var d = bigint.add(a2.num(), b2.num());
+    t.free(); a2.free(); b2.free(); a.free(); b.free();
+    if n % 2 == 0 { return (c, d); }
+    var e = bigint.add(c.num(), d.num());
+    c.free();
+    (d, e)
+}
+
+fn checksum(x: Num) -> i64 { bigint.hash_py(x) }
+
+fn main() {
+    var best: [u64; 6] = [0xffffffffffffffff; 6];
+    var sums: [i64; 6] = [0; 6];
+    for _rep in 0..5 {
+        var t0 = prof.now_ns();
+        var f = factorial(5000);
+        var t1 = prof.now_ns();
+        if t1 - t0 < best[0] { best[0] = t1 - t0; }
+        sums[0] = checksum(f.num());
+        f.free();
+
+        t0 = prof.now_ns();
+        let (fa, fb) = fib(100000);
+        t1 = prof.now_ns();
+        if t1 - t0 < best[1] { best[1] = t1 - t0; }
+        var x = fa;
+        var y = fb;
+        sums[1] = checksum(x.num());
+        y.free();
+
+        // A 100,000-digit number: 7^118000 has 99,720 digits.
+        var seven = bigint.of_i64(7);
+        var big = bigint.pow(seven.num(), 118000);
+        var b = text.StrBuf.new();
+        t0 = prof.now_ns();
+        bigint.write(&b, big.num(), 10);
+        t1 = prof.now_ns();
+        if t1 - t0 < best[2] { best[2] = t1 - t0; }
+        sums[2] = b.len() as i64;
+
+        t0 = prof.now_ns();
+        var back = bigint.parse(b.as_str(), 10).unwrap();
+        t1 = prof.now_ns();
+        if t1 - t0 < best[3] { best[3] = t1 - t0; }
+        sums[3] = checksum(back.num());
+
+        t0 = prof.now_ns();
+        var p = bigint.mul(big.num(), x.num());
+        t1 = prof.now_ns();
+        if t1 - t0 < best[4] { best[4] = t1 - t0; }
+        sums[4] = checksum(p.num());
+
+        t0 = prof.now_ns();
+        let (q, r) = bigint.divmod(p.num(), x.num(), true).unwrap();
+        t1 = prof.now_ns();
+        var qq = q;
+        var rr = r;
+        if t1 - t0 < best[5] { best[5] = t1 - t0; }
+        sums[5] = checksum(qq.num()) +% checksum(rr.num());
+        qq.free(); rr.free(); p.free(); back.free(); b.free(); big.free(); seven.free(); x.free();
+    }
+    let names: [str; 6] = ["factorial(5000)", "fib(100000)", "str(7**118000)", "int(100k digits)", "mul 100k x 21k digits", "divmod 121k / 21k digits"];
+    for i in 0..6 {
+        io.print(names[i]);
+        io.print(" ");
+        io.print_int((best[i] / 1000) as i64);
+        io.print(" us  check ");
+        io.print_int(sums[i]);
+        io.println("");
+    }
+}

@@ -1,0 +1,171 @@
+// std.dict: an insertion-ordered dict in the GC heap, with traced keys
+// and values. Run against a plain heap, a stress heap (collect at every
+// safepoint) and a generational stress heap with verify (a missing write
+// barrier aborts), and built with `--gc-check-roots` (the matrix).
+// `find_with` runs an equality that collects and changes the dict.
+// (Allocating never collects; the explicit collects are the safepoints.)
+// matrix: check-roots
+import std.io;
+import std.gc;
+import std.hash;
+import std.dict.{Dict};
+
+object Box { n: i64 }
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, B(Gc<Box>) }
+
+fn Value.hash(v: Value) -> u64 {
+    match v {
+        B(b) => hash.mix(b.n as u64),
+        Int(i) => hash.mix(i as u64),
+        _ => 7,
+    }
+}
+fn Value.eq(a: Value, b: Value) -> bool {
+    match (a, b) {
+        (B(x), B(y)) => x.n == y.n,
+        (Int(x), Int(y)) => x == y,
+        _ => false,
+    }
+}
+impl hash.Hash for Value;
+
+fn boxed(h: *gc.Heap, n: i64) -> Value uses gc { Value.B(new(h, Box { n: n })) }
+
+fn num(v: Value) -> i64 {
+    match v { B(b) => b.n, Int(i) => i as i64, _ => -1 }
+}
+
+/// Keys and values are fresh boxes, reachable only through the dict.
+fn fill(h: *gc.Heap, n: i64) -> Gc<Dict<Value, Value>> uses gc {
+    let d: Gc<Dict<Value, Value>> = Dict.new(h, 0);
+    for i in 0..n {
+        let k = boxed(h, i);
+        let v = boxed(h, i * 10);
+        d.insert(h, k, v);
+    }
+    d
+}
+
+fn sum_values(d: Gc<Dict<Value, Value>>) -> i64 {
+    var s: i64 = 0;
+    var i: u64 = 0;
+    while let Some(e) = d.next(&i) { s += num(d.value(e)); }
+    s
+}
+
+fn basic(h: *gc.Heap) uses gc {
+    let d = fill(h, 500);
+    gc.collect(h);
+    // Remove the odd keys; replace some values.
+    for i in 0..500 {
+        if i % 2 == 1 {
+            let k = boxed(h, i);
+            d.remove(k);
+        }
+    }
+    for i in 0..50 {
+        let k = boxed(h, i * 2);
+        let v = boxed(h, 1);
+        d.insert(h, k, v);
+    }
+    gc.collect(h);
+    // Grow again past the dead entries (compaction).
+    for i in 500..700 {
+        let k = boxed(h, i);
+        let v = boxed(h, i * 10);
+        d.insert(h, k, v);
+    }
+    gc.collect(h);
+    io.print_int(d.len as i64); io.print(" "); io.print_int(sum_values(d)); io.println("");
+    // Order: the first keys are 0, 2, 4.
+    var i: u64 = 0;
+    var shown = 0;
+    while let Some(e) = d.next(&i) {
+        if shown < 3 { if shown > 0 { io.print(" "); } io.print_int(num(d.key(e))); }
+        shown += 1;
+    }
+    io.println("");
+    let c = d.copy(h);
+    gc.collect(h);
+    let (lk, lv) = c.pop_last().unwrap();
+    io.print_int(num(lk)); io.print(" "); io.print_int(num(lv)); io.print(" ");
+    io.print_int(c.len as i64); io.print(" "); io.print_int(d.len as i64); io.println("");
+    c.clear();
+    let k5 = boxed(h, 5);
+    let v5 = boxed(h, 55);
+    c.insert(h, k5, v5);
+    gc.collect(h);
+    io.print_int(num(c.get(Value.Int(0)) ?? Value.Nil)); io.print(" ");
+    let k5b = boxed(h, 5);
+    io.print_int(num(c.get(k5b) ?? Value.Nil)); io.println("");
+}
+
+/// An equality that allocates (so it may collect) and, the first time,
+/// inserts into the dict being searched: the lookup starts over.
+fn effectful(h: *gc.Heap) uses reenter {
+    let d = fill(h, 40);
+    var calls = 0;
+    var mutated = false;
+    let key = boxed(h, 17);
+    let r: Result<?u64, str> = d.find_with(key.hash(), |k| -> Result<bool, str> {
+        calls += 1;
+        let junk = boxed(h, 12345);
+        gc.collect(h);
+        if !mutated {
+            mutated = true;
+            for j in 100..200 {
+                let v = boxed(h, j);
+                d.insert(h, v, junk);
+            }
+        }
+        Ok(k.eq(key))
+    });
+    if let Ok(Some(e)) = r {
+        io.print_int(num(d.key(e))); io.print(" "); io.print_int(num(d.value(e)));
+    }
+    io.print(" "); io.print_int(calls); io.print(" "); io.print_int(d.len as i64); io.println("");
+    let bad: Result<?u64, str> = d.find_with(key.hash(), |k| -> Result<bool, str> { Err("eq failed") });
+    if let Err(m) = bad { io.println(m); }
+}
+
+fn run(h: *gc.Heap) uses reenter {
+    basic(h);
+    effectful(h);
+}
+
+fn main() -> i32 uses reenter {
+    var heap = gc.Heap.new();
+    run(&heap);
+    heap.free();
+    var sheap = gc.Heap.new();
+    sheap.set_stress(true);
+    run(&sheap);
+    sheap.free();
+    var gheap = gc.Heap.new();
+    gheap.set_generational(true);
+    gheap.set_stress(true);
+    gheap.set_verify(true);
+    run(&gheap);
+    gheap.free();
+    0
+}
+
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed

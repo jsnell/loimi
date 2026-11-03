@@ -1,0 +1,1210 @@
+// Arbitrary-precision integers (docs/stdlib.md, "std.bigint").
+//
+// Three layers over one representation: a magnitude of 64-bit limbs,
+// least significant first, normalized (no zero limb at the top; zero has
+// no limbs), plus a sign.
+//
+// - `Num` is a view: a sign and a slice of limbs that someone else owns.
+//   Every operation reads `Num`s and writes its result into a buffer the
+//   caller provides (`add_into(out, a, b)`), sized by the matching
+//   `*_size` function, and returns the result as a `Num` over the start of
+//   that buffer. Nothing here allocates except scratch space for the
+//   algorithms, which is freed before returning. An interpreter keeps
+//   limbs wherever it likes (a GC object's trailing array, an arena).
+// - `BigInt` owns its limbs (a `mem.Vec<u64>` on the C heap):
+//   `bigint.add(a, b) -> BigInt`, freed with `x.free()`.
+// - `Big` is a GC object holding limbs, and `gc_add(h, a, b) -> Gc<Big>`
+//   computes straight into a new one. Operands are `Arg`s (a small `i64`
+//   or a `Gc<Big>`). Allocating does not collect (collections run at the
+//   interpreter's safepoints), so none of these has an effect.
+//
+// Small integers are the interpreter's business: keep them unboxed in the
+// value type and come here on overflow (`num.add_overflow`), making a
+// `Num` of an `i64` with `from_i64(buf, x)` (one limb of buffer).
+//
+// Algorithms: schoolbook and Karatsuba multiplication (above KARATSUBA
+// limbs), Knuth's algorithm D for division, binary powering, and
+// divide-and-conquer radix conversion for formatting above DC_LIMBS
+// limbs (with schoolbook division, so still quadratic, but with a much
+// smaller constant than dividing by one limb at a time). Not built:
+// subquadratic division (Burnikel-Ziegler, Newton), FFT multiplication,
+// a separate squaring routine, divide-and-conquer parsing.
+
+import std.mem;
+import std.text;
+import std.gc;
+
+extern "C" fn loimi_panic(msg: *u8, len: u64);
+
+/// Multiplications of at least this many limbs (both operands) use
+/// Karatsuba's algorithm.
+pub const KARATSUBA: u64 = 32;
+/// Formatting numbers of more limbs than this splits them in halves
+/// (divide and conquer).
+pub const DC_LIMBS: u64 = 30;
+
+/// A signed integer: `neg` and the magnitude `d` (limbs, least
+/// significant first). Normalized: `d` has no zero limb at the top, and
+/// zero (no limbs) is not negative. Functions here return normalized
+/// views, and expect them.
+pub struct Num { neg: bool, d: []u64 }
+
+fn fail(m: str) {
+    loimi_panic(m.ptr, m.len);
+}
+
+fn need(out: []u64, n: u64) {
+    if out.len < n { fail("std.bigint: output buffer too small\n"); }
+}
+
+fn max(a: u64, b: u64) -> u64 { if a > b { a } else { b } }
+fn min(a: u64, b: u64) -> u64 { if a < b { a } else { b } }
+
+/// Length of `p[0..n]` without its zero limbs at the top.
+fn norm(p: *u64, n: u64) -> u64 {
+    var k = n;
+    while k > 0 and p[k - 1] == 0 { k -= 1; }
+    k
+}
+
+/// The normalized view of `p[0..n]` with sign `neg` (dropped for zero).
+fn view(p: *u64, n: u64, neg: bool) -> Num {
+    let k = norm(p, n);
+    Num { neg: neg and k != 0, d: p.slice(k) }
+}
+
+/// Zero.
+pub fn zero() -> Num { Num { neg: false, d: [] } }
+
+/// A view of `p[0..n]` (normalized here: top zero limbs are dropped).
+pub fn of_limbs(p: *u64, n: u64, neg: bool) -> Num { view(p, n, neg) }
+
+// ── magnitudes: raw limb arithmetic ────────────────────────────────
+
+fn mag_cmp(a: *u64, na: u64, b: *u64, nb: u64) -> i32 {
+    if na != nb { return if na < nb { -1 } else { 1 }; }
+    var i = na;
+    while i > 0 {
+        i -= 1;
+        let x = a[i];
+        let y = b[i];
+        if x != y { return if x < y { -1 } else { 1 }; }
+    }
+    0
+}
+
+/// r[0..na] = a + b (na >= nb); returns the carry. `r` may be `a`.
+fn add_to(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) -> u64 {
+    var c: u64 = 0;
+    var i: u64 = 0;
+    while i < nb {
+        let x = a[i];
+        let s = x +% b[i];
+        let t = s +% c;
+        c = if s < x or t < s { 1 } else { 0 };
+        r[i] = t;
+        i += 1;
+    }
+    while i < na {
+        let x = a[i];
+        let t = x +% c;
+        c = if t < x { 1 } else { 0 };
+        r[i] = t;
+        i += 1;
+    }
+    c
+}
+
+/// r[0..rn] += b[0..nb] (rn >= nb), stopping once the carry is
+/// absorbed; returns the carry out of r[rn - 1].
+fn add_in(r: *u64, rn: u64, b: *u64, nb: u64) -> u64 {
+    var c: u64 = 0;
+    var i: u64 = 0;
+    while i < nb {
+        let x = r[i];
+        let s = x +% b[i];
+        let t = s +% c;
+        c = if s < x or t < s { 1 } else { 0 };
+        r[i] = t;
+        i += 1;
+    }
+    while c != 0 and i < rn {
+        let t = r[i] +% 1;
+        r[i] = t;
+        c = if t == 0 { 1 } else { 0 };
+        i += 1;
+    }
+    c
+}
+
+/// r[0..na] = a - b (na >= nb); returns the borrow. `r` may be `a`.
+fn sub_to(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) -> u64 {
+    var br: u64 = 0;
+    var i: u64 = 0;
+    while i < nb {
+        let x = a[i];
+        let y = b[i];
+        let d = x -% y;
+        r[i] = d -% br;
+        br = if x < y or d < br { 1 } else { 0 };
+        i += 1;
+    }
+    while i < na {
+        let x = a[i];
+        r[i] = x -% br;
+        br = if x < br { 1 } else { 0 };
+        i += 1;
+    }
+    br
+}
+
+/// r[0..rn] -= b[0..nb] (rn >= nb), stopping once the borrow is
+/// absorbed; returns the borrow.
+fn sub_in(r: *u64, rn: u64, b: *u64, nb: u64) -> u64 {
+    var br: u64 = 0;
+    var i: u64 = 0;
+    while i < nb {
+        let x = r[i];
+        let y = b[i];
+        let d = x -% y;
+        r[i] = d -% br;
+        br = if x < y or d < br { 1 } else { 0 };
+        i += 1;
+    }
+    while br != 0 and i < rn {
+        let x = r[i];
+        r[i] = x -% 1;
+        br = if x == 0 { 1 } else { 0 };
+        i += 1;
+    }
+    br
+}
+
+/// r[0..n] = a * m; returns the carry limb. `r` may be `a`.
+fn mul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
+    var c: u64 = 0;
+    for i in 0..n {
+        let (lo, hi) = a[i].mul_wide(m);
+        let t = lo +% c;
+        c = hi + (if t < lo { 1 } else { 0 });
+        r[i] = t;
+    }
+    c
+}
+
+/// r[0..n] += a * m; returns the carry limb.
+fn addmul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
+    var c: u64 = 0;
+    for i in 0..n {
+        let (lo, hi) = a[i].mul_wide(m);
+        let t = lo +% c;
+        var h = hi + (if t < lo { 1 } else { 0 });
+        let u = r[i] +% t;
+        h += if u < t { 1 } else { 0 };
+        r[i] = u;
+        c = h;
+    }
+    c
+}
+
+/// r[0..n] -= a * m; returns the borrow limb.
+fn submul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
+    var c: u64 = 0;
+    for i in 0..n {
+        let (lo, hi) = a[i].mul_wide(m);
+        let t = lo +% c;
+        var h = hi + (if t < lo { 1 } else { 0 });
+        let x = r[i];
+        r[i] = x -% t;
+        h += if x < t { 1 } else { 0 };
+        c = h;
+    }
+    c
+}
+
+/// r[0..na + nb] = a * b (na, nb >= 1); r must not overlap a or b.
+fn mul_basecase(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
+    r[na] = mul_1(r, a, na, b[0]);
+    for j in 1..nb {
+        r[na + j] = addmul_1(r + j, a, na, b[j]);
+    }
+}
+
+/// r[0..2n] = a * b, both n limbs, by Karatsuba's algorithm.
+fn kmul(r: *u64, a: *u64, b: *u64, n: u64) {
+    if n < KARATSUBA {
+        mul_basecase(r, a, n, b, n);
+        return;
+    }
+    let h = n / 2;
+    let hh = n - h;
+    kmul(r, a, b, h);
+    kmul(r + 2 * h, a + h, b + h, hh);
+    let m = hh + 1;
+    let t: *u64 = mem.alloc(4 * m);
+    let sa = t;
+    let sb = t + m;
+    let z = t + 2 * m;
+    sa[hh] = add_to(sa, a + h, hh, a, h);
+    sb[hh] = add_to(sb, b + h, hh, b, h);
+    kmul(z, sa, sb, m);
+    sub_in(z, 2 * m, r, 2 * h);
+    sub_in(z, 2 * m, r + 2 * h, 2 * hh);
+    add_in(r + h, 2 * n - h, z, norm(z, 2 * m));
+    mem.release(t);
+}
+
+/// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
+fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
+    if nb < KARATSUBA {
+        mul_basecase(r, a, na, b, nb);
+        return;
+    }
+    if na == nb {
+        kmul(r, a, b, na);
+        return;
+    }
+    // Unbalanced: multiply b by na / nb pieces of a.
+    mem.memset(r as *u8, 0, (na + nb) * 8);
+    let t: *u64 = mem.alloc(2 * nb);
+    var off: u64 = 0;
+    while off < na {
+        let len = min(nb, na - off);
+        if len == nb { kmul(t, a + off, b, nb); } else { mul_mag(t, b, nb, a + off, len); }
+        add_in(r + off, na + nb - off, t, len + nb);
+        off += len;
+    }
+    mem.release(t);
+}
+
+/// q[0..n] = a / d, returns a % d (d != 0). `q` may be `a`.
+fn divrem_1(q: *u64, a: *u64, n: u64, d: u64) -> u64 {
+    var r: u64 = 0;
+    var i = n;
+    while i > 0 {
+        i -= 1;
+        let (qq, rr) = r.div_wide(a[i], d);
+        q[i] = qq;
+        r = rr;
+    }
+    r
+}
+
+/// r[0..n] = a << s for 1 <= s < 64; returns the bits shifted out.
+/// `r` may be `a`.
+fn lshift(r: *u64, a: *u64, n: u64, s: u64) -> u64 {
+    if n == 0 { return 0; }
+    let out = a[n - 1] >> (64 - s);
+    var i = n - 1;
+    while i > 0 {
+        r[i] = (a[i] << s) | (a[i - 1] >> (64 - s));
+        i -= 1;
+    }
+    r[0] = a[0] << s;
+    out
+}
+
+/// r[0..n] = a >> s for 1 <= s < 64. `r` may be `a`.
+fn rshift(r: *u64, a: *u64, n: u64, s: u64) {
+    if n == 0 { return; }
+    for i in 0..n - 1 {
+        r[i] = (a[i] >> s) | (a[i + 1] << (64 - s));
+    }
+    r[n - 1] = a[n - 1] >> s;
+}
+
+/// Knuth's algorithm D: q[0..na - nb + 1] = a / b and r[0..nb] = a % b,
+/// for na >= nb >= 2 and b normalized. q and r must not overlap a or b.
+fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
+    let s = b[nb - 1].clz() as u64;
+    let bn: *u64 = mem.alloc(nb);
+    let an: *u64 = mem.alloc(na + 1);
+    if s > 0 {
+        lshift(bn, b, nb, s);
+        an[na] = lshift(an, a, na, s);
+    } else {
+        mem.copy(bn, b, nb);
+        mem.copy(an, a, na);
+        an[na] = 0;
+    }
+    let btop = bn[nb - 1];
+    let bsec = bn[nb - 2];
+    var j = na - nb + 1;
+    while j > 0 {
+        j -= 1;
+        let hi = an[j + nb];
+        let lo = an[j + nb - 1];
+        var qhat: u64 = 0;
+        var rhat: u64 = 0;
+        var rover = false;
+        if hi >= btop {
+            qhat = 0xffffffffffffffff;
+            rhat = lo +% btop;
+            rover = rhat < lo;
+        } else {
+            let (qq, rr) = hi.div_wide(lo, btop);
+            qhat = qq;
+            rhat = rr;
+        }
+        let t = an[j + nb - 2];
+        while !rover {
+            let (pl, ph) = qhat.mul_wide(bsec);
+            if ph > rhat or (ph == rhat and pl > t) {
+                qhat -= 1;
+                let nr = rhat +% btop;
+                rover = nr < rhat;
+                rhat = nr;
+            } else {
+                break;
+            }
+        }
+        let br = submul_1(an + j, bn, nb, qhat);
+        let top = an[j + nb];
+        an[j + nb] = top -% br;
+        if top < br {
+            qhat -= 1;
+            let c = add_in(an + j, nb, bn, nb);
+            an[j + nb] = an[j + nb] +% c;
+        }
+        q[j] = qhat;
+    }
+    if s > 0 { rshift(r, an, nb, s); } else { mem.copy(r, an, nb); }
+    mem.release(an);
+    mem.release(bn);
+}
+
+/// Magnitude division into fresh buffers: (q, nq, r, nr), normalized.
+/// b must be nonzero. The caller releases q and r.
+fn divmod_alloc(a: []u64, b: []u64) -> (*u64, u64, *u64, u64) {
+    let na = a.len;
+    let nb = b.len;
+    if na < nb {
+        let r: *u64 = mem.alloc(nb);
+        mem.copy(r, a.ptr, na);
+        return (mem.alloc(1), 0, r, na);
+    }
+    let q: *u64 = mem.alloc(na - nb + 1);
+    let r: *u64 = mem.alloc(nb);
+    if nb == 1 {
+        r[0] = divrem_1(q, a.ptr, na, b[0]);
+        return (q, norm(q, na), r, norm(r, 1));
+    }
+    divrem(q, r, a.ptr, na, b.ptr, nb);
+    (q, norm(q, na - nb + 1), r, norm(r, nb))
+}
+
+// ── views: predicates, comparison, conversions ──────────────────────
+
+pub fn is_zero(a: Num) -> bool { a.d.len == 0 }
+
+/// -1, 0 or 1.
+pub fn sign(a: Num) -> i32 {
+    if a.d.len == 0 { 0 } else if a.neg { -1 } else { 1 }
+}
+
+pub fn is_odd(a: Num) -> bool { a.d.len > 0 and (a.d[0] & 1) != 0 }
+
+/// Number of bits of |a| (0 for zero), Python's `int.bit_length`.
+pub fn bit_length(a: Num) -> u64 {
+    let n = a.d.len;
+    if n == 0 { return 0; }
+    64 * n - (a.d[n - 1].clz() as u64)
+}
+
+/// -1, 0 or 1 as a < b, a == b, a > b.
+pub fn cmp(a: Num, b: Num) -> i32 {
+    if a.neg != b.neg { return if a.neg { -1 } else { 1 }; }
+    let c = mag_cmp(a.d.ptr, a.d.len, b.d.ptr, b.d.len);
+    if a.neg { 0 - c } else { c }
+}
+
+/// Compare magnitudes: |a| against |b|.
+pub fn cmp_abs(a: Num, b: Num) -> i32 { mag_cmp(a.d.ptr, a.d.len, b.d.ptr, b.d.len) }
+
+pub fn eq(a: Num, b: Num) -> bool { a.neg == b.neg and cmp_abs(a, b) == 0 }
+
+/// -a, as a view of the same limbs.
+pub fn neg(a: Num) -> Num { Num { neg: !a.neg and a.d.len != 0, d: a.d } }
+
+/// |a|, as a view of the same limbs.
+pub fn abs(a: Num) -> Num { Num { neg: false, d: a.d } }
+
+/// `x` as a view of `out` (one limb).
+pub fn from_i64(out: []u64, x: i64) -> Num {
+    need(out, 1);
+    let m = if x < 0 { (0 -% x) as u64 } else { x as u64 };
+    out[0] = m;
+    view(out.ptr, 1, x < 0)
+}
+
+/// `x` as a view of `out` (one limb).
+pub fn from_u64(out: []u64, x: u64) -> Num {
+    need(out, 1);
+    out[0] = x;
+    view(out.ptr, 1, false)
+}
+
+/// a as an i64, if it fits.
+pub fn to_i64(a: Num) -> ?i64 {
+    if a.d.len == 0 { return Some(0); }
+    if a.d.len > 1 { return None; }
+    let m = a.d[0];
+    if a.neg {
+        if m > 0x8000000000000000 { return None; }
+        return Some(0 -% (m as i64));
+    }
+    if m > 0x7fffffffffffffff { return None; }
+    Some(m as i64)
+}
+
+/// a as a u64, if it fits (and is not negative).
+pub fn to_u64(a: Num) -> ?u64 {
+    if a.d.len == 0 { return Some(0); }
+    if a.neg or a.d.len > 1 { return None; }
+    Some(a.d[0])
+}
+
+/// The low 64 bits of a in two's complement (C-style wrapping
+/// conversion: `(u64) a`).
+pub fn to_u64_wrapping(a: Num) -> u64 {
+    if a.d.len == 0 { return 0; }
+    if a.neg { 0 -% a.d[0] } else { a.d[0] }
+}
+
+/// The nearest f64 (ties to even), as Python's `float(n)`; ±inf when
+/// |a| rounds to 2^1024 or more (Python raises OverflowError there).
+pub fn to_f64(a: Num) -> f64 {
+    let n = a.d.len;
+    if n == 0 { return 0.0; }
+    let bits = bit_length(a);
+    var f: f64 = 0.0;
+    if bits <= 64 {
+        f = a.d[0] as f64;
+    } else if bits > 1024 {
+        f = 1.0 / 0.0;
+    } else {
+        // The top 64 bits, with a sticky bit for anything nonzero below:
+        // rounding them to 53 bits rounds the whole number correctly.
+        let shift = bits - 64;
+        let li = shift / 64;
+        let bi = shift % 64;
+        var top = a.d[li] >> bi;
+        if bi != 0 { top = top | (a.d[li + 1] << (64 - bi)); }
+        var sticky = bi != 0 and (a.d[li] << (64 - bi)) != 0;
+        var i: u64 = 0;
+        while !sticky and i < li {
+            if a.d[i] != 0 { sticky = true; }
+            i += 1;
+        }
+        if sticky { top = top | 1; }
+        f = (top as f64) * f64.from_bits((1023 + shift) << 52);
+    }
+    if a.neg { 0.0 - f } else { f }
+}
+
+/// Limbs `from_f64_into` needs for `x` (any f64).
+pub fn f64_size(x: f64) -> u64 {
+    let e = ((x.to_bits() >> 52) & 0x7ff) as u64;
+    if e < 1075 { 1 } else { (e - 1075 + 53) / 64 + 2 }
+}
+
+/// The integer part of `x` (truncated toward zero), or None for inf
+/// and nan.
+pub fn from_f64_into(out: []u64, x: f64) -> ?Num {
+    let bits = x.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as u64;
+    if e == 0x7ff { return None; }
+    let neg = (bits >> 63) != 0;
+    need(out, f64_size(x));
+    if e < 1023 { return Some(zero()); }
+    let m = (bits & 0xfffffffffffff) | 0x10000000000000;
+    if e <= 1075 {
+        out[0] = m >> (1075 - e);
+        return Some(view(out.ptr, 1, neg));
+    }
+    let sh = e - 1075;
+    let li = sh / 64;
+    let bi = sh % 64;
+    let n = li + 2;
+    for i in 0..n { out[i] = 0; }
+    out[li] = m << bi;
+    if bi != 0 { out[li + 1] = m >> (64 - bi); }
+    Some(view(out.ptr, n, neg))
+}
+
+const P61: u64 = 0x1fffffffffffffff;
+
+fn mod61(x: u64) -> u64 {
+    let y = (x & P61) + (x >> 61);
+    if y >= P61 { y - P61 } else { y }
+}
+
+/// Python's `hash(n)` for an int: n modulo 2^61 - 1 with n's sign, and
+/// -2 for -1. Equal to `hash_i64` for numbers that fit an i64.
+pub fn hash_py(a: Num) -> i64 {
+    var h: u64 = 0;
+    var i = a.d.len;
+    while i > 0 {
+        i -= 1;
+        h = mod61(mod61(h << 3) + mod61(a.d[i]));
+    }
+    var r = h as i64;
+    if a.neg { r = 0 - r; }
+    if r == -1 { -2 } else { r }
+}
+
+/// Python's `hash(n)` for an int that fits an i64.
+pub fn hash_i64(x: i64) -> i64 {
+    var buf: [u64; 1] = [0; 1];
+    hash_py(from_i64(buf[0..1], x))
+}
+
+// ── arithmetic into caller buffers ──────────────────────────────────
+//
+// Each `op_into(out, ..)` writes the result to the start of `out`, which
+// must have at least `op_size(..)` limbs (else a panic), and returns it
+// as a view of `out`. `out` must not overlap the operands.
+
+/// Limbs for `add_into` and `sub_into`.
+pub fn add_size(a: Num, b: Num) -> u64 { max(a.d.len, b.d.len) + 1 }
+
+fn add_signed(out: []u64, an: bool, a: []u64, bn: bool, b: []u64) -> Num {
+    need(out, max(a.len, b.len) + 1);
+    let r = out.ptr;
+    if an == bn {
+        if a.len >= b.len {
+            r[a.len] = add_to(r, a.ptr, a.len, b.ptr, b.len);
+            return view(r, a.len + 1, an);
+        }
+        r[b.len] = add_to(r, b.ptr, b.len, a.ptr, a.len);
+        return view(r, b.len + 1, an);
+    }
+    let c = mag_cmp(a.ptr, a.len, b.ptr, b.len);
+    if c == 0 { return zero(); }
+    if c > 0 {
+        sub_to(r, a.ptr, a.len, b.ptr, b.len);
+        return view(r, a.len, an);
+    }
+    sub_to(r, b.ptr, b.len, a.ptr, a.len);
+    view(r, b.len, bn)
+}
+
+/// a + b.
+pub fn add_into(out: []u64, a: Num, b: Num) -> Num { add_signed(out, a.neg, a.d, b.neg, b.d) }
+
+/// a - b.
+pub fn sub_into(out: []u64, a: Num, b: Num) -> Num { add_signed(out, a.neg, a.d, !b.neg, b.d) }
+
+/// Limbs for `mul_into`.
+pub fn mul_size(a: Num, b: Num) -> u64 { a.d.len + b.d.len }
+
+/// a * b.
+pub fn mul_into(out: []u64, a: Num, b: Num) -> Num {
+    let na = a.d.len;
+    let nb = b.d.len;
+    if na == 0 or nb == 0 { return zero(); }
+    need(out, na + nb);
+    if na >= nb { mul_mag(out.ptr, a.d.ptr, na, b.d.ptr, nb); } else { mul_mag(out.ptr, b.d.ptr, nb, a.d.ptr, na); }
+    view(out.ptr, na + nb, a.neg != b.neg)
+}
+
+/// Limbs for the quotient of `divmod_into`.
+pub fn quot_size(a: Num, b: Num) -> u64 {
+    if a.d.len >= b.d.len { a.d.len - b.d.len + 2 } else { 1 }
+}
+
+/// Limbs for the remainder of `divmod_into`.
+pub fn rem_size(a: Num, b: Num) -> u64 { max(b.d.len, 1) }
+
+/// Quotient and remainder of a / b, or None if b is zero. `floor`:
+/// the quotient rounds toward negative infinity and the remainder takes
+/// b's sign (Python's `//` and `%`, Scheme's `floor/`); otherwise it
+/// truncates toward zero and the remainder takes a's sign (C, Scheme's
+/// `truncate/`). `q` needs `quot_size(a, b)` limbs and `r`
+/// `rem_size(a, b)`.
+pub fn divmod_into(q: []u64, r: []u64, a: Num, b: Num, floor: bool) -> ?(Num, Num) {
+    let na = a.d.len;
+    let nb = b.d.len;
+    if nb == 0 { return None; }
+    need(q, quot_size(a, b));
+    need(r, rem_size(a, b));
+    var nq: u64 = 0;
+    var nr: u64 = 0;
+    if na < nb {
+        mem.copy(r.ptr, a.d.ptr, na);
+        nr = na;
+    } else if nb == 1 {
+        r[0] = divrem_1(q.ptr, a.d.ptr, na, b.d[0]);
+        nq = norm(q.ptr, na);
+        nr = norm(r.ptr, 1);
+    } else {
+        divrem(q.ptr, r.ptr, a.d.ptr, na, b.d.ptr, nb);
+        nq = norm(q.ptr, na - nb + 1);
+        nr = norm(r.ptr, nb);
+    }
+    let qneg = a.neg != b.neg;
+    if floor and qneg and nr != 0 {
+        // q - 1 (that is, |q| + 1) and r + b (that is, |b| - |r|).
+        q[nq] = 0;
+        var one: [u64; 1] = [1; 1];
+        add_in(q.ptr, nq + 1, &one[0], 1);
+        nq = norm(q.ptr, nq + 1);
+        sub_to(r.ptr, b.d.ptr, nb, r.ptr, nr);
+        nr = norm(r.ptr, nb);
+        return Some((view(q.ptr, nq, true), view(r.ptr, nr, b.neg)));
+    }
+    Some((view(q.ptr, nq, qneg), view(r.ptr, nr, a.neg)))
+}
+
+/// Limbs for `shl_into(.., a, n)`.
+pub fn shl_size(a: Num, n: u64) -> u64 { a.d.len + n / 64 + 1 }
+
+/// a * 2^n.
+pub fn shl_into(out: []u64, a: Num, n: u64) -> Num {
+    let na = a.d.len;
+    if na == 0 { return zero(); }
+    need(out, shl_size(a, n));
+    let li = n / 64;
+    let bi = n % 64;
+    for i in 0..li { out[i] = 0; }
+    if bi == 0 {
+        mem.copy(out.ptr + li, a.d.ptr, na);
+        out[li + na] = 0;
+    } else {
+        out[li + na] = lshift(out.ptr + li, a.d.ptr, na, bi);
+    }
+    view(out.ptr, li + na + 1, a.neg)
+}
+
+/// Limbs for `shr_into(.., a, n)`.
+pub fn shr_size(a: Num, n: u64) -> u64 {
+    let li = n / 64;
+    if li >= a.d.len { 1 } else { a.d.len - li + 1 }
+}
+
+/// floor(a / 2^n): an arithmetic shift, so -1 >> n is -1 (Python's `>>`).
+pub fn shr_into(out: []u64, a: Num, n: u64) -> Num {
+    let na = a.d.len;
+    if na == 0 { return zero(); }
+    need(out, shr_size(a, n));
+    let li = n / 64;
+    let bi = n % 64;
+    var lost = false;
+    var m: u64 = 0;
+    if li >= na {
+        lost = true;
+    } else {
+        m = na - li;
+        if bi == 0 { mem.copy(out.ptr, a.d.ptr + li, m); } else { rshift(out.ptr, a.d.ptr + li, m, bi); }
+        if bi != 0 and (a.d[li] << (64 - bi)) != 0 { lost = true; }
+        var i: u64 = 0;
+        while !lost and i < li {
+            if a.d[i] != 0 { lost = true; }
+            i += 1;
+        }
+    }
+    out[m] = 0;
+    if a.neg and lost {
+        var one: [u64; 1] = [1; 1];
+        add_in(out.ptr, m + 1, &one[0], 1);
+        return view(out.ptr, m + 1, true);
+    }
+    view(out.ptr, m + 1, a.neg)
+}
+
+/// Limbs for `and_into`, `or_into` and `xor_into`.
+pub fn bitop_size(a: Num, b: Num) -> u64 { max(a.d.len, b.d.len) + 1 }
+
+const AND: u32 = 0;
+const OR: u32 = 1;
+const XOR: u32 = 2;
+
+/// Limb i of a's infinite two's complement, given the running carry of
+/// the negation (~|a| + 1).
+fn twos_limb(a: Num, i: u64, carry: *u64) -> u64 {
+    let x = if i < a.d.len { a.d[i] } else { 0 };
+    if !a.neg { return x; }
+    let t = (~x) +% *carry;
+    if *carry != 0 and t != 0 { *carry = 0; }
+    t
+}
+
+fn bitop(out: []u64, a: Num, b: Num, op: u32) -> Num {
+    let n = max(a.d.len, b.d.len) + 1;
+    need(out, n);
+    var ca: u64 = 1;
+    var cb: u64 = 1;
+    for i in 0..n {
+        let x = twos_limb(a, i, &ca);
+        let y = twos_limb(b, i, &cb);
+        out[i] = if op == AND { x & y } else if op == OR { x | y } else { x ^ y };
+    }
+    let rneg = (out[n - 1] >> 63) != 0;
+    if rneg {
+        // The magnitude is the two's complement of the limbs.
+        var c: u64 = 1;
+        for i in 0..n {
+            let t = (~out[i]) +% c;
+            if c != 0 and t != 0 { c = 0; }
+            out[i] = t;
+        }
+    }
+    view(out.ptr, n, rneg)
+}
+
+/// a & b, with Python's semantics for negative numbers (infinite two's
+/// complement).
+pub fn and_into(out: []u64, a: Num, b: Num) -> Num { bitop(out, a, b, AND) }
+
+/// a | b (infinite two's complement).
+pub fn or_into(out: []u64, a: Num, b: Num) -> Num { bitop(out, a, b, OR) }
+
+/// a ^ b (infinite two's complement).
+pub fn xor_into(out: []u64, a: Num, b: Num) -> Num { bitop(out, a, b, XOR) }
+
+/// Limbs for `not_into`.
+pub fn not_size(a: Num) -> u64 { max(a.d.len, 1) + 1 }
+
+/// ~a, that is -a - 1.
+pub fn not_into(out: []u64, a: Num) -> Num {
+    var buf: [u64; 1] = [1; 1];
+    let one = Num { neg: false, d: buf[0..1] };
+    // -a - 1 = -(a + 1)
+    let r = add_into(out, a, one);
+    neg(r)
+}
+
+/// Limbs for `pow_into(.., a, e)`, or None if that does not fit a u64.
+pub fn pow_size(a: Num, e: u64) -> ?u64 {
+    let bits = bit_length(a);
+    if bits <= 1 or e == 0 { return Some(1); }
+    let Some(t) = bits.mul_checked(e) else { return None; };
+    Some(t / 64 + 2)
+}
+
+/// a ** e. `out` needs `pow_size(a, e)` limbs.
+pub fn pow_into(out: []u64, a: Num, e: u64) -> Num {
+    let Some(n) = pow_size(a, e) else { fail("std.bigint: pow result too large\n"); return zero(); };
+    need(out, n);
+    let rneg = a.neg and (e & 1) != 0;
+    if e == 0 or (a.d.len == 1 and a.d[0] == 1) {
+        out[0] = 1;
+        return view(out.ptr, 1, rneg);
+    }
+    if a.d.len == 0 { return zero(); }
+    // Left to right binary powering between two scratch buffers.
+    var x: *u64 = mem.alloc(n);
+    var y: *u64 = mem.alloc(n);
+    mem.copy(x, a.d.ptr, a.d.len);
+    var nx = a.d.len;
+    var bit = 63 - (e.clz() as u64);
+    while bit > 0 {
+        bit -= 1;
+        mul_mag(y, x, nx, x, nx);
+        nx = norm(y, 2 * nx);
+        var t = x; x = y; y = t;
+        if ((e >> bit) & 1) != 0 {
+            if nx >= a.d.len { mul_mag(y, x, nx, a.d.ptr, a.d.len); } else { mul_mag(y, a.d.ptr, a.d.len, x, nx); }
+            nx = norm(y, nx + a.d.len);
+            t = x; x = y; y = t;
+        }
+    }
+    mem.copy(out.ptr, x, nx);
+    mem.release(x);
+    mem.release(y);
+    view(out.ptr, nx, rneg)
+}
+
+// ── text ────────────────────────────────────────────────────────────
+
+const DIGITS: str = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// The largest power of `radix` that fits a u64, and its exponent.
+fn chunk_base(radix: u32) -> (u64, u64) {
+    let r = radix as u64;
+    var b = r;
+    var k: u64 = 1;
+    loop {
+        let Some(nb) = b.mul_checked(r) else { break; };
+        b = nb;
+        k += 1;
+    }
+    (b, k)
+}
+
+fn is_pow2(radix: u32) -> bool { (radix & (radix - 1)) == 0 }
+
+/// Write |x| (x[0..n], normalized, nonzero or n == 0) in a radix that is
+/// not a power of two, at least `pad` digits (zeros in front).
+fn write_base(b: *text.StrBuf, x: *u64, n: u64, radix: u32, base: u64, k: u64, pad: u64) {
+    let t: *u64 = mem.alloc(n + 1);
+    mem.copy(t, x, n);
+    var m = n;
+    var chunks: mem.Vec<u64> = mem.Vec.new();
+    while m > 0 {
+        chunks.push(divrem_1(t, t, m, base));
+        m = norm(t, m);
+    }
+    mem.release(t);
+    var digits: mem.Vec<u8> = mem.Vec.new();
+    var i: u64 = 0;
+    while i < chunks.len {
+        var c = chunks.at(i);
+        let last = i + 1 == chunks.len;
+        var j: u64 = 0;
+        while j < k and (!last or c != 0) {
+            digits.push(DIGITS[c % (radix as u64)]);
+            c = c / (radix as u64);
+            j += 1;
+        }
+        i += 1;
+    }
+    var z = digits.len;
+    while z < pad { b.push('0'); z += 1; }
+    var d = digits.len;
+    while d > 0 { d -= 1; b.push(digits.at(d)); }
+    digits.free();
+    chunks.free();
+}
+
+/// Divide and conquer: x < pows[level + 1]; pows[i] = base^(2^i).
+fn write_dc(b: *text.StrBuf, x: *u64, n: u64, pows: *mem.Vec<BigInt>, level: u64, pad: u64, radix: u32, base: u64, k: u64) {
+    if n <= DC_LIMBS or level == 0 {
+        write_base(b, x, n, radix, base, k, pad);
+        return;
+    }
+    let p = pows.ptr_at(level).num();
+    if n < p.d.len {
+        write_dc(b, x, n, pows, level - 1, pad, radix, base, k);
+        return;
+    }
+    let (q, nq, r, nr) = divmod_alloc(x.slice(n), p.d);
+    let low = k << level;
+    if pad > 0 or nq > 0 {
+        write_dc(b, q, nq, pows, level - 1, if pad > low { pad - low } else { 0 }, radix, base, k);
+        write_dc(b, r, nr, pows, level - 1, low, radix, base, k);
+    } else {
+        write_dc(b, r, nr, pows, level - 1, 0, radix, base, k);
+    }
+    mem.release(q);
+    mem.release(r);
+}
+
+/// Append a in `radix` (2 to 36; lowercase letters, a leading `-` when
+/// negative, no prefix).
+pub fn write(b: *text.StrBuf, a: Num, radix: u32) {
+    if radix < 2 or radix > 36 { fail("std.bigint.write: radix must be 2 to 36\n"); }
+    let n = a.d.len;
+    if n == 0 { b.push('0'); return; }
+    if a.neg { b.push('-'); }
+    if is_pow2(radix) {
+        let s = radix.ctz() as u64;
+        let bits = bit_length(a);
+        var i = (bits + s - 1) / s;
+        while i > 0 {
+            i -= 1;
+            let at = i * s;
+            let li = at / 64;
+            let bi = at % 64;
+            var v = a.d[li] >> bi;
+            if bi + s > 64 and li + 1 < n { v = v | (a.d[li + 1] << (64 - bi)); }
+            b.push(DIGITS[v & ((1 << s) - 1)]);
+        }
+        return;
+    }
+    let (base, k) = chunk_base(radix);
+    if n <= DC_LIMBS {
+        write_base(b, a.d.ptr, n, radix, base, k, 0);
+        return;
+    }
+    // pows[i] = base^(2^i), up to the first whose square exceeds a.
+    var pows: mem.Vec<BigInt> = mem.Vec.new();
+    var b0: [u64; 1] = [base; 1];
+    pows.push(copy(Num { neg: false, d: b0[0..1] }));
+    while 2 * pows.ptr_at(pows.len - 1).d.len - 1 <= n {
+        let top = pows.ptr_at(pows.len - 1).num();
+        pows.push(mul(top, top));
+    }
+    write_dc(b, a.d.ptr, n, &pows, pows.len - 1, 0, radix, base, k);
+    for i in 0..pows.len { pows.ptr_at(i).free(); }
+    pows.free();
+}
+
+/// Append a in decimal.
+pub fn write_dec(b: *text.StrBuf, a: Num) { write(b, a, 10); }
+
+fn digit(c: u8) -> u32 {
+    if c >= '0' and c <= '9' { return (c - '0') as u32; }
+    if c >= 'a' and c <= 'z' { return (c - 'a') as u32 + 10; }
+    if c >= 'A' and c <= 'Z' { return (c - 'A') as u32 + 10; }
+    99
+}
+
+/// Limbs for `parse_into` of `ndigits` digits in `radix`.
+pub fn parse_size(ndigits: u64, radix: u32) -> u64 {
+    var bits: u64 = 1;
+    while ((1 as u64) << bits) < (radix as u64) { bits += 1; }
+    ndigits * bits / 64 + 2
+}
+
+/// The number written with the digits `s` in `radix` (2 to 36; letters
+/// in either case), or None if `s` is empty or has another character.
+/// No sign, prefix, spaces or underscores: the caller handles its
+/// language's syntax. `out` needs `parse_size(s.len, radix)` limbs.
+pub fn parse_into(out: []u64, s: str, radix: u32) -> ?Num {
+    if radix < 2 or radix > 36 { fail("std.bigint.parse: radix must be 2 to 36\n"); }
+    if s.len == 0 { return None; }
+    for i in 0..s.len {
+        if digit(s[i]) >= radix { return None; }
+    }
+    let size = parse_size(s.len, radix);
+    need(out, size);
+    let r = out.ptr;
+    for i in 0..size { r[i] = 0; }
+    if is_pow2(radix) {
+        let w = radix.ctz() as u64;
+        var at: u64 = 0;
+        var i = s.len;
+        while i > 0 {
+            i -= 1;
+            let v = digit(s[i]) as u64;
+            let li = at / 64;
+            let bi = at % 64;
+            r[li] = r[li] | (v << bi);
+            if bi + w > 64 { r[li + 1] = r[li + 1] | (v >> (64 - bi)); }
+            at += w;
+        }
+        return Some(view(r, size, false));
+    }
+    let (base, k) = chunk_base(radix);
+    var n: u64 = 0;
+    var i: u64 = 0;
+    let first = s.len % k;
+    var len = if first == 0 { k } else { first };
+    while i < s.len {
+        var v: u64 = 0;
+        var m: u64 = 1;
+        for j in 0..len {
+            v = v * (radix as u64) + (digit(s[i + j]) as u64);
+            m *= radix as u64;
+        }
+        let mult = if len == k { base } else { m };
+        let c = mul_1(r, r, n, mult);
+        r[n] = c;
+        n += 1;
+        var cell: [u64; 1] = [v; 1];
+        add_in(r, n, &cell[0], 1);
+        n = norm(r, n);
+        i += len;
+        len = k;
+    }
+    Some(view(r, n, false))
+}
+
+// ── owned integers ──────────────────────────────────────────────────
+
+/// An integer that owns its limbs (C heap). Copying the struct shares
+/// them; `free` releases them.
+pub struct BigInt { neg: bool, d: mem.Vec<u64> }
+
+/// The view of x (valid until x changes or is freed).
+pub fn BigInt.num(x: *BigInt) -> Num { Num { neg: x.neg, d: x.d.items() } }
+
+pub fn BigInt.free(x: *BigInt) {
+    x.d.free();
+    x.neg = false;
+}
+
+/// Room for n limbs.
+fn room(n: u64) -> mem.Vec<u64> { mem.Vec.with_capacity(if n == 0 { 1 } else { n }) }
+
+fn space(v: *mem.Vec<u64>) -> []u64 { v.ptr.slice(v.cap) }
+
+fn own(v: mem.Vec<u64>, r: Num) -> BigInt {
+    var w = v;
+    w.len = r.d.len;
+    BigInt { neg: r.neg, d: w }
+}
+
+/// A copy of a.
+pub fn copy(a: Num) -> BigInt {
+    var v = room(a.d.len);
+    mem.copy(v.ptr, a.d.ptr, a.d.len);
+    v.len = a.d.len;
+    BigInt { neg: a.neg, d: v }
+}
+
+pub fn of_i64(x: i64) -> BigInt {
+    var v = room(1);
+    own(v, from_i64(space(&v), x))
+}
+
+pub fn of_u64(x: u64) -> BigInt {
+    var v = room(1);
+    own(v, from_u64(space(&v), x))
+}
+
+/// The integer part of x, or None for inf and nan.
+pub fn of_f64(x: f64) -> ?BigInt {
+    var v = room(f64_size(x));
+    let Some(r) = from_f64_into(space(&v), x) else { v.free(); return None; };
+    Some(own(v, r))
+}
+
+/// Parse digits (see `parse_into`).
+pub fn parse(s: str, radix: u32) -> ?BigInt {
+    var v = room(parse_size(s.len, radix));
+    let Some(r) = parse_into(space(&v), s, radix) else { v.free(); return None; };
+    Some(own(v, r))
+}
+
+pub fn add(a: Num, b: Num) -> BigInt { var v = room(add_size(a, b)); own(v, add_into(space(&v), a, b)) }
+pub fn sub(a: Num, b: Num) -> BigInt { var v = room(add_size(a, b)); own(v, sub_into(space(&v), a, b)) }
+pub fn mul(a: Num, b: Num) -> BigInt { var v = room(mul_size(a, b)); own(v, mul_into(space(&v), a, b)) }
+pub fn shl(a: Num, n: u64) -> BigInt { var v = room(shl_size(a, n)); own(v, shl_into(space(&v), a, n)) }
+pub fn shr(a: Num, n: u64) -> BigInt { var v = room(shr_size(a, n)); own(v, shr_into(space(&v), a, n)) }
+pub fn bit_and(a: Num, b: Num) -> BigInt { var v = room(bitop_size(a, b)); own(v, and_into(space(&v), a, b)) }
+pub fn bit_or(a: Num, b: Num) -> BigInt { var v = room(bitop_size(a, b)); own(v, or_into(space(&v), a, b)) }
+pub fn bit_xor(a: Num, b: Num) -> BigInt { var v = room(bitop_size(a, b)); own(v, xor_into(space(&v), a, b)) }
+pub fn bit_not(a: Num) -> BigInt { var v = room(not_size(a)); own(v, not_into(space(&v), a)) }
+
+/// a ** e (panics if the size does not fit a u64).
+pub fn pow(a: Num, e: u64) -> BigInt {
+    let Some(n) = pow_size(a, e) else { fail("std.bigint: pow result too large\n"); return copy(zero()); };
+    var v = room(n);
+    own(v, pow_into(space(&v), a, e))
+}
+
+/// (quotient, remainder), or None if b is zero; see `divmod_into`.
+pub fn divmod(a: Num, b: Num, floor: bool) -> ?(BigInt, BigInt) {
+    if b.d.len == 0 { return None; }
+    var q = room(quot_size(a, b));
+    var r = room(rem_size(a, b));
+    let (x, y) = divmod_into(space(&q), space(&r), a, b, floor).unwrap();
+    Some((own(q, x), own(r, y)))
+}
+
+/// a in `radix`, appended to `b` (see `write`).
+pub fn BigInt.write(x: *BigInt, b: *text.StrBuf, radix: u32) { write(b, x.num(), radix); }
+
+// ── integers in the GC heap ─────────────────────────────────────────
+
+/// An integer in the GC heap: `len` limbs of `d` (which may be longer:
+/// results are allocated at their size bound) and a sign.
+pub object Big { neg: bool, len: u64, d: [u64] }
+
+/// The view of b. It points into the object: keep b reachable while
+/// using it.
+pub fn Big.num(b: Gc<Big>) -> Num { Num { neg: b.neg, d: b.d[0..b.len] } }
+
+/// An operand of the GC functions: a small integer (the interpreter's
+/// unboxed case) or a `Gc<Big>`, so that callers need no temporary
+/// object for a small operand.
+pub enum Arg { Small(i64), Ref(Gc<Big>) }
+
+/// The view of a; `buf` holds the limb of a small one.
+pub fn Arg.num(a: Arg, buf: *u64) -> Num {
+    match a {
+        Small(x) => from_i64(buf.slice(1), x),
+        Ref(b) => b.num(),
+    }
+}
+
+/// A new `Big` with room for n limbs, zero.
+pub fn new_big(h: *gc.Heap, n: u64) -> Gc<Big> {
+    new(h, Big { neg: false, len: 0 }, n)
+}
+
+/// A copy of a in the GC heap.
+pub fn gc_copy(h: *gc.Heap, a: Num) -> Gc<Big> {
+    let o = new_big(h, a.d.len);
+    mem.copy(o.d.ptr, a.d.ptr, a.d.len);
+    o.len = a.d.len;
+    o.neg = a.neg;
+    o
+}
+
+fn set(o: Gc<Big>, r: Num) -> Gc<Big> {
+    o.neg = r.neg;
+    o.len = r.d.len;
+    o
+}
+
+fn gc_bin(h: *gc.Heap, a: Arg, b: Arg, size: fn(Num, Num) -> u64, op: fn([]u64, Num, Num) -> Num) -> Gc<Big> {
+    var x: u64 = 0;
+    var y: u64 = 0;
+    let o = new_big(h, size(a.num(&x), b.num(&y)));
+    set(o, op(o.d, a.num(&x), b.num(&y)))
+}
+
+pub fn gc_add(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, add_size, add_into) }
+pub fn gc_sub(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, add_size, sub_into) }
+pub fn gc_mul(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, mul_size, mul_into) }
+pub fn gc_and(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, and_into) }
+pub fn gc_or(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, or_into) }
+pub fn gc_xor(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, xor_into) }
+
+pub fn gc_not(h: *gc.Heap, a: Arg) -> Gc<Big> {
+    var x: u64 = 0;
+    let o = new_big(h, not_size(a.num(&x)));
+    set(o, not_into(o.d, a.num(&x)))
+}
+
+pub fn gc_neg(h: *gc.Heap, a: Arg) -> Gc<Big> {
+    var x: u64 = 0;
+    let n = a.num(&x).d.len;
+    let o = new_big(h, n);
+    let v = a.num(&x);
+    mem.copy(o.d.ptr, v.d.ptr, n);
+    set(o, neg(Num { neg: v.neg, d: o.d[0..n] }))
+}
+
+pub fn gc_shl(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> {
+    var x: u64 = 0;
+    let o = new_big(h, shl_size(a.num(&x), n));
+    set(o, shl_into(o.d, a.num(&x), n))
+}
+
+pub fn gc_shr(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> {
+    var x: u64 = 0;
+    let o = new_big(h, shr_size(a.num(&x), n));
+    set(o, shr_into(o.d, a.num(&x), n))
+}
+
+/// a ** e (panics if the size does not fit a u64).
+pub fn gc_pow(h: *gc.Heap, a: Arg, e: u64) -> Gc<Big> {
+    var x: u64 = 0;
+    let Some(n) = pow_size(a.num(&x), e) else { fail("std.bigint: pow result too large\n"); return new_big(h, 0); };
+    let o = new_big(h, n);
+    set(o, pow_into(o.d, a.num(&x), e))
+}
+
+/// (quotient, remainder) or None if b is zero; see `divmod_into`.
+pub fn gc_divmod(h: *gc.Heap, a: Arg, b: Arg, floor: bool) -> ?(Gc<Big>, Gc<Big>) {
+    var x: u64 = 0;
+    var y: u64 = 0;
+    if b.num(&y).d.len == 0 { return None; }
+    let q = new_big(h, quot_size(a.num(&x), b.num(&y)));
+    let r = new_big(h, rem_size(a.num(&x), b.num(&y)));
+    let (qv, rv) = divmod_into(q.d, r.d, a.num(&x), b.num(&y), floor).unwrap();
+    Some((set(q, qv), set(r, rv)))
+}
+
+/// The integer part of x, or None for inf and nan.
+pub fn gc_from_f64(h: *gc.Heap, x: f64) -> ?Gc<Big> {
+    let o = new_big(h, f64_size(x));
+    let Some(r) = from_f64_into(o.d, x) else { return None; };
+    Some(set(o, r))
+}
+
+/// Parse digits (see `parse_into`).
+pub fn gc_parse(h: *gc.Heap, s: str, radix: u32) -> ?Gc<Big> {
+    let o = new_big(h, parse_size(s.len, radix));
+    let Some(r) = parse_into(o.d, s, radix) else { return None; };
+    Some(set(o, r))
+}
+
+pub fn gc_of_i64(h: *gc.Heap, x: i64) -> Gc<Big> {
+    let o = new_big(h, 1);
+    set(o, from_i64(o.d, x))
+}

@@ -14,9 +14,10 @@ says so. Some modules are design only; their sections say so at the top.
 |---|---|---|
 | `std.core` (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
 | `std.mem` | built | `std/mem.lm` |
-| `std.hash`, `std.map` | built (`HashMap` only) | `std/hash.lm`, `std/map.lm` |
+| `std.hash`, `std.map`, `std.dict` | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
 | `std.text` | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
-| `std.num` | built (no `BigInt`) | `std/num.lm` |
+| `std.num` | built | `std/num.lm` |
+| `std.bigint` | built (no subquadratic division) | `std/bigint.lm` |
 | `std.io`, `std.os` | built (minimal) | `std/io.lm`, `std/os.lm` |
 | `std.lex` | built (a cursor toolkit, no generator) | `std/lex.lm` |
 | `std.parse` | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
@@ -26,7 +27,7 @@ says so. Some modules are design only; their sections say so at the top.
 | `std.gil` | built (a global interpreter lock per heap) | `std/gil.lm` |
 | `std.obj` | built (no comptime `Model`) | `std/obj.lm` |
 | `std.rt` | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
-| `std.collections` (beyond `HashMap`) | **not built** | |
+| `std.collections` (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
 | `std.ast` | **not built** | |
 | `std.prof` | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
 | `std.ffi` | **not built** (`extern "C"` is in the language) | |
@@ -43,7 +44,7 @@ Design rules for the library:
   follows the same discipline it asks of users.
 - **Everything that owns memory can give it back.** Each std type that
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
-  `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
+  `OrderedMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
   `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Bench`,
   `Counters`), and `io.read_file`'s result
@@ -68,6 +69,13 @@ import.
   b)` etc., `i64` only).
 - **Bit operations**: `x.clz()`, `x.ctz()`, `x.popcount()` on any
   integer type; shifts `<< >>` (language.md §1.2).
+- **Wide arithmetic** on `u64` (for multi-word integers, `std.bigint`):
+  `a.mul_wide(b) -> (u64, u64)` is the full 128-bit product as (low,
+  high); `hi.div_wide(lo, d) -> (u64, u64)` divides the 128-bit number
+  `hi * 2^64 + lo` by `d` and gives (quotient, remainder). The caller
+  guarantees `hi < d` (so the quotient fits; `d` is then nonzero), as for
+  the x86-64 `div` instruction. They lower to LLVM `i128` operations: a
+  `mul` instruction, and a call of the runtime's `__udivti3`.
 - **Floats** (`f32` and `f64` alike; each lowers to one LLVM
   intrinsic): `x.to_bits()` (`u32`/`u64`) and `f32.from_bits(u32)`,
   `f64.from_bits(u64)`; `x.sqrt()`, `x.abs()`; rounding to an integral
@@ -198,14 +206,118 @@ allocator); `Id<T>` / `IndexVec<Id<T>, T>` typed indices; `SmallVec<T, N>`.
   `len` (a field), `clear()` (keeps the table's memory), iteration with
   `var i: u64 = 0; while let Some(s) = m.next(&i) { .. s.key, s.value .. }`,
   and `free`.
+- `map.OrderedMap<K: hash.Hash, V>`: a hash map that iterates in
+  insertion order, in host memory. `std.dict.Dict` (below) is the same
+  table in the GC heap, for guest dicts.
+
+### Ordered maps: `map.OrderedMap` and `dict.Dict`
+
+Both use CPython's compact dict layout: an index table of `u32` slots (a
+power of two; empty, deleted, or an entry number) over a dense array of
+`map.Entry<K, V> { hash, key, value }` in insertion order, at most 2/3 of
+the index size. Removing a key marks its entry dead (its hash becomes
+`map.DEAD`, its key and value bytes are zeroed, so a traced table no
+longer keeps them alive) and its index slot deleted; the next resize
+compacts the entries. Entries keep their hashes (with the top bit
+cleared), so resizing and copying never call `hash` or `eq`: an
+interpreter whose hashing runs guest code (`__hash__`) calls it once per
+key. Probing is CPython's (`i = 5i + 1 + perturb`, `perturb >>= 5`).
+
+- **The usual API**, through `hash.Hash` on K: `OrderedMap.new()`,
+  `with_capacity(n)`, `insert(k, v) -> bool` (true if new; a replaced
+  key keeps its place), `get -> ?V`, `get_ptr -> ?*V`, `contains`,
+  `remove(k) -> ?V`, `pop_last() -> ?(K, V)` (reclaims trailing dead
+  entries, so a stack-like use stays compact), `clear()` (keeps the
+  memory), `len` (a field), iteration in insertion order with
+  `var i: u64 = 0; while let Some(e) = m.next(&i) { .. e.key, e.value .. }`,
+  and `free`.
+- **Hash-supplied forms**, for interpreters (a string's cached hash, an
+  identity test before the general equality): `find_by(hash, eq: block
+  fn(K) -> bool) -> ?u64` gives an *entry index*; `put_by(hash, k, v,
+  eq) -> (u64, bool)` inserts or replaces in one probe; `insert_new(hash,
+  k, v)` appends a key the caller knows is absent; `entry(e) -> *Entry`,
+  `set_value(e, v)`, `is_live(e)`, `remove_at(e)`. `eq` gets a copy of
+  each candidate key whose hash matches.
+- **Entry indices and `version`.** An entry index stays valid until the
+  table is compacted. `version` changes on every insertion of a new key,
+  removal, compaction and `clear`, not on value updates, so an inline
+  cache can hold an entry index and check the key at it (Python's
+  attribute caches), or hold the version (a cached global).
+- **Lookups that can fail and run guest code**:
+  `find_with<E>(hash, eq: block fn(K) -> Result<bool, E> uses reenter)
+  -> Result<?u64, E> uses reenter`. An `Err` from `eq` stops the lookup.
+  The rule for changes during the lookup is CPython's: after each `eq`
+  call, if `version` changed (`eq` inserted, removed or resized), the
+  probe starts over on the current table, so the answer is about the map
+  as it is when `find_with` returns. An `eq` that changes the map on
+  every call makes the lookup loop forever, as in CPython. Insertion with
+  such an equality is `find_with` and then `set_value` or `insert_new`
+  (nothing runs between them).
+
+<!-- snippet: run "1 3 2 | 20 negative key" -->
+```loimi
+import std.io;
+import std.hash;
+import std.map.{OrderedMap};
+
+/// Keys are equal when equal mod 10; the equality can fail.
+fn h10(k: i64) -> u64 { hash.mix((k % 10) as u64) }
+fn eq10(a: i64, b: i64) -> Result<bool, str> {
+    if a < 0 { return Err("negative key"); }
+    Ok(a % 10 == b % 10)
+}
+
+fn main() uses reenter {
+    var m: OrderedMap<i64, i64> = OrderedMap.new();
+    m.insert_new(h10(1), 1, 10);
+    m.insert_new(h10(3), 3, 30);
+    m.insert_new(h10(2), 2, 20);
+    var i: u64 = 0;
+    while let Some(e) = m.next(&i) { io.print_int(e.key); io.print(" "); }
+    io.print("| ");
+    let hit: Result<?u64, str> = m.find_with(h10(12), |k| eq10(k, 12));
+    if let Ok(Some(e)) = hit { io.print_int(m.entry(e).value); }
+    let bad: Result<?u64, str> = m.find_with(h10(2), |k| eq10(-k, 2));
+    if let Err(msg) = bad { io.print(" "); io.print(msg); }
+    io.println("");
+    m.free();
+}
+```
+
+`std/dict.lm`: `dict.Dict<K: hash.Hash, V>` is an `object` whose index
+(`DictIndex`) and entries (`DictEntries<K, V>`) are GC objects, so keys
+and values may be `Value`s or `Gc<T>`s; a guest dict can be a
+`Gc<Dict<Value, Value>>` (examples/python's is). It has the same API
+with the dict as a `Gc` receiver and the heap on calls that may allocate
+(`Dict.new(h, n)`, `insert(h, k, v)`, `put_by(h, ..)`, `insert_new(h,
+..)`, `copy(h)`); like any `new`, they never collect, so they can run in
+a handler's fast path. Iteration is by entry index (`next(&i) -> ?u64`,
+then `key(e)`, `value(e)`, `hash_at(e)`), which stays usable across
+allocation and guest code (compare `version` to detect "changed during
+iteration"). `has_room()` and `try_add_by(hash, k, v, eq) -> ?u64`
+insert without resizing or allocating (None if the key is present or the
+dict is full): Python's attribute-store cache appends a new attribute
+with it. `find_with` re-reads the dict's tables after each `eq` call.
+Tested by `tests/test/ordered_map.lm` (randomized operations against a
+`Vec` model, both maps; `find_with` restarting and failing) and
+`tests/run/dict_gc.lm` (traced keys and values in a stress heap and a
+generational verify heap, an `eq` that collects and inserts during
+`find_with`, `--gc-check-roots`).
+
+Measured in examples/python (which uses `Dict<Value, Value>` for every
+dict, instance attributes, globals and class namespaces): the 11
+benchmarks are unchanged (0.97x the time of its own dict, interleaved
+best of 5). Entries of 24 bytes instead of 16 (the stored hash) make
+`P(i, 2)` in a loop about 20% slower (more allocation per instance
+dict); dict-heavy code with int and string keys is a few percent faster.
+CPython avoids the hash in instance dicts with a str-keys-only entry
+layout; Loimi's does not have one.
 
 ### Design (not built): `std.collections`
 
-Everything here except `HashMap` is design only:
+Everything here except `HashMap`, `OrderedMap` and `Dict` is design only:
 
 - `HashSet<T>`, SwissTable-style probing.
-- `IndexMap`: insertion-ordered, for guest dicts with ordering guarantees
-  (Python and JS objects).
 - `BitSet`, `Deque`, `BinaryHeap`.
 - `std.collections.Table`: a **Lua-style hybrid table**. A dense array part
   plus a hash part, with array-part migration. Keys are `Value`s through a
@@ -277,10 +389,163 @@ and validation, and case mapping.
 
 ### Design (not built)
 
-`BigInt` with a small-int fast path (Python- and Ruby-style integers);
 Ryu formatting and Eisel-Lemire parsing (snprintf and strtod are used
 instead); binary literals, digit separators and per-language literal
 configuration.
+
+## `std.bigint`
+
+`std/bigint.lm`: arbitrary-precision integers with Python's semantics
+(floor and truncating division, infinite two's complement for bitwise
+operations on negative numbers, correctly rounded conversion to `f64`,
+Python's `hash`). Tested by `tests/test/bigint.lm` and by a differential
+test against CPython (`tests/bigint/diff.py`, run by `cargo test`
+as `bigint_vs_python`: 3000 random cases, and 1000 more collecting
+between the steps of the GC operations; longer runs by hand).
+
+**Representation.** A magnitude of 64-bit limbs, least significant
+first, normalized (no zero limb at the top; zero has no limbs), and a
+sign. Limbs are `u64` because `a.mul_wide(b)` and `hi.div_wide(lo, d)`
+(`std.core`) give the 128-bit products and quotients that 64-bit limbs
+need; that makes multiplication about four times the work per
+instruction of 32-bit limbs (CPython's are 30 bits).
+
+The small case is the interpreter's: an unboxed integer in its value
+type, with overflow checks (`num.add_overflow`, `x.mul_checked(y)`)
+sending it here. std.bigint handles only the big case, through three
+layers over one representation:
+
+- **`Num`, a view**: `struct Num { neg: bool, d: []u64 }`, limbs that
+  someone else owns. Every operation reads `Num`s and writes its result
+  into a buffer the caller provides, sized by a matching function, and
+  returns the result as a `Num` over the start of that buffer:
+  `add_into(out, a, b)` with `add_size(a, b)` limbs, `sub_into`,
+  `mul_into` (`mul_size`), `divmod_into(q, r, a, b, floor)` (`quot_size`,
+  `rem_size`; None for a zero divisor; `floor` rounds the quotient down
+  and gives the remainder the divisor's sign, Python's `//` and `%` and
+  Scheme's `floor/`, else it truncates, C's and Scheme's `truncate/`),
+  `shl_into` / `shr_into` (arithmetic: `-1 >> n` is -1), `and_into`,
+  `or_into`, `xor_into` (`bitop_size`), `not_into`, `pow_into`
+  (`pow_size -> ?u64`, None when the size overflows), `from_i64`,
+  `from_u64` (one limb), `from_f64_into` (`f64_size`, truncates; None
+  for inf and nan), `parse_into(out, digits, radix)` (`parse_size`).
+  Views need no buffer: `neg`, `abs`, `cmp`, `cmp_abs`, `eq`, `sign`,
+  `is_zero`, `is_odd`, `bit_length`, `to_i64` / `to_u64 -> ?..`,
+  `to_u64_wrapping`, `to_f64` (nearest, ties to even; ±inf beyond the
+  range), `hash_py` and `hash_i64` (CPython's `hash` of an int: modulo
+  2^61 - 1 with the sign, -1 becomes -2), `of_limbs(p, n, neg)` (a view
+  of limbs from elsewhere, normalized). Nothing allocates except scratch
+  space inside the algorithms, freed before returning, so a view of a GC
+  object's trailing array is a valid operand, and its limbs can be the
+  output.
+- **`BigInt`, owned**: `struct BigInt { neg: bool, d: mem.Vec<u64> }` on
+  the C heap. `bigint.add(a, b) -> BigInt` (and `sub`, `mul`, `divmod(a,
+  b, floor) -> ?(BigInt, BigInt)`, `pow`, `shl`, `shr`, `bit_and`,
+  `bit_or`, `bit_xor`, `bit_not`, `copy`, `of_i64`, `of_u64`, `of_f64`,
+  `parse(s, radix) -> ?BigInt`) take views, so owned and GC numbers mix;
+  `x.num()` is an owned number's view, `x.free()` releases it.
+- **`Big`, in the GC heap**: `object Big { neg: bool, len: u64, d: [u64] }`
+  (`len` limbs of `d` are the number: results are allocated at their
+  size bound). `gc_add(h, a, b) -> Gc<Big>` (and `gc_sub`, `gc_mul`,
+  `gc_divmod`, `gc_pow`, `gc_shl`, `gc_shr`, `gc_and`, `gc_or`,
+  `gc_xor`, `gc_not`, `gc_neg`, `gc_copy`, `gc_of_i64`, `gc_from_f64`,
+  `gc_parse`) take `Arg`s, `enum Arg { Small(i64), Ref(Gc<Big>) }`, so
+  a small operand needs no object. `b.num()` is a `Big`'s view. Allocating
+  does not collect (collections run at the interpreter's safepoints), so
+  these have no effect. An interpreter can store `Gc<Big>` in its own
+  objects (Python's `Box.big`) or as a `value` variant's payload.
+
+Formatting: `bigint.write(b, x, radix)` appends to a `text.StrBuf`
+(radix 2 to 36, lowercase, `-` for negatives, no prefix);
+`parse_into` takes digits only (no sign, prefix, spaces or underscores:
+the language's syntax is the caller's).
+
+Algorithms: schoolbook multiplication, Karatsuba from `KARATSUBA` (32)
+limbs (an unbalanced product is cut into balanced pieces), Knuth's
+algorithm D for division (one `div_wide` per quotient limb), left to
+right binary powering, power-of-two radixes by bit extraction, other
+radixes by dividing out the largest power of the radix that fits a limb
+up to `DC_LIMBS` (30) limbs and above that divide and conquer (split by
+radix^(k·2^i), the halves formatted recursively, the low ones padded with
+zeros), parsing by multiplying in a limb's worth of digits at a time.
+
+<!-- snippet: run "93326215443944152681699238856266700490715968264381621468592963895217599993229915608941463976156518286253697920827223758251185210916864000000000000000000000000" "-ff" -->
+```loimi
+import std.io;
+import std.text;
+import std.bigint;
+import std.bigint.{BigInt};
+
+fn main() {
+    var f = bigint.of_i64(1);
+    var one: [u64; 1] = [0; 1];
+    for i in 2..101 {
+        // A small factor as a view of one limb on the stack.
+        let g = bigint.mul(f.num(), bigint.from_i64(one[0..1], i));
+        f.free();
+        f = g;
+    }
+    var b = text.StrBuf.new();
+    bigint.write(&b, f.num(), 10);          // 100!
+    b.push(' ');
+    var m = bigint.of_i64(-255);
+    bigint.write(&b, m.num(), 16);
+    io.println(b.as_str());
+    f.free(); m.free(); b.free();
+}
+```
+
+In an interpreter, the overflow of a small-int fast path goes to the GC
+layer with the operands as `Arg`s, and a result that fits the small case
+again goes back to it (examples/python/big.lm is this, with an i64
+"medium" box in between):
+
+<!-- snippet: check
+import std.gc;
+import std.bigint;
+import std.bigint.{Arg, Big};
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Big(Gc<Big>), Nil }
+{snippet}
+fn main() {}
+-->
+```loimi
+fn arg(v: Value) -> Arg {
+    match v { Int(i) => Arg.Small(i as i64), Big(b) => Arg.Ref(b), _ => Arg.Small(0) }
+}
+
+fn add(h: *gc.Heap, a: Value, b: Value) -> Value {
+    if let (Int(x), Int(y)) = (a, b) {
+        if let Some(r) = x.add_checked(y) { return Value.Int(r); }
+    }
+    let r = bigint.gc_add(h, arg(a), arg(b));
+    if let Some(x) = bigint.to_i64(r.num()) {
+        if x >= -2147483648 and x <= 2147483647 { return Value.Int(x as i32); }
+    }
+    Value.Big(r)
+}
+```
+
+Performance (`bench/bigint/bench.lm` against the same work in
+`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine):
+
+| | std.bigint | CPython 3.13 |
+|---|---|---|
+| factorial(5000), a running product | 1.8 ms | 4.9 ms |
+| fib(100000) by fast doubling | 0.58 ms | 1.7 ms |
+| `str` of a 99,722-digit number | 20 ms | 33 ms |
+| `int` of it | 9.7 ms | 17 ms |
+| product, 99,722 by 20,899 digits | 2.0 ms | 7.5 ms |
+| `divmod`, 120,621 by 20,899 digits | 6.4 ms | 15 ms |
+
+### Design (not built)
+
+Subquadratic division (Burnikel-Ziegler or Newton) and with it
+subquadratic radix conversion (formatting is divide and conquer over
+schoolbook division, so still quadratic; CPython 3.12+ converts huge
+numbers with `_pylong`, which is asymptotically faster), divide-and-conquer
+parsing, a squaring routine, FFT multiplication, `gcd`, integer square
+root, correctly rounded `a / b` to `f64`, and in-place operations on an
+owned `BigInt` (each operation returns a new one).
 
 ## `std.io` and `std.os`
 

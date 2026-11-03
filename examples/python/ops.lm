@@ -323,7 +323,7 @@ pub fn get_global(c: *Ctx, func: Value, s: Gc<Str>, idx: *u32, ver: *u32, builti
     let bd = c.builtins.unwrap();
     if let Some(e) = value.dict_find_str(bd, s) {
         *idx = e as u32;
-        *ver = d.keyver as u32;
+        *ver = d.version as u32;
         *builtin = 1;
         return Ok(value.dict_val(bd, e));
     }
@@ -486,7 +486,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
             }
             let d = o.dict;
             if let Some(e) = value.dict_find_str(d, name) {
-                d.ent.items[2 * e + 1] = v;
+                d.set_value(e, v);
                 *ic = e as u32;
                 return Ok(());
             }
@@ -1429,24 +1429,14 @@ pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
     Ok(hv)
 }
 
-/// Entry of an instance key whose class defines __eq__: probe calling it.
+/// Entry of an instance key whose class defines __eq__: probe calling it
+/// (std.dict starts the probe over if `__eq__` changes the dict).
 fn dict_find_user(c: *Ctx, d: Gc<Dict>, k: Value, hv: u64) -> Result<?u64, Value> uses reenter {
-    var i = hv & d.mask;
-    var perturb = hv;
-    loop {
-        let ix = d.idx.s[i];
-        if ix == -1 { return Ok(None); }
-        if ix >= 0 {
-            let e = ix as u64;
-            let key = value.dict_key(d, e);
-            if key == k { return Ok(Some(e)); }
-            if let Inst(_) = key {
-                if equal(c, key, k)? { return Ok(Some(e)); }
-            }
-        }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
+    d.find_with(hv, |key| -> Result<bool, Value> {
+        if key == k { return Ok(true); }
+        if let Inst(_) = key { return equal(c, key, k); }
+        Ok(false)
+    })
 }
 
 fn has_user_eq(c: *Ctx, k: Value) -> bool {
@@ -1457,7 +1447,7 @@ fn has_user_eq(c: *Ctx, k: Value) -> bool {
 pub fn dict_put(c: *Ctx, d: Gc<Dict>, k: Value, v: Value) -> Result<(), Value> uses reenter {
     let hv = hash_key(c, k)?;
     if has_user_eq(c, k) {
-        if let Some(e) = dict_find_user(c, d, k, hv)? { d.ent.items[2 * e + 1] = v; return Ok(()); }
+        if let Some(e) = dict_find_user(c, d, k, hv)? { d.set_value(e, v); return Ok(()); }
     }
     value.dict_set(&c.heap, d, k, hv, v);
     Ok(())

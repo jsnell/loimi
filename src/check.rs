@@ -3621,6 +3621,19 @@ impl<'a> Checker<'a> {
                 };
                 mk(Ty::Option(Box::new(t.clone())), TK::Intrinsic(intr, vec![recv, y]), span)
             }
+            (Ty::Int(it), "mul_wide" | "div_wide") if *it == IntTy::U64 => {
+                // `a.mul_wide(b)`: the 128-bit product as (low, high);
+                // `hi.div_wide(lo, d)`: (hi * 2^64 + lo) / d as (quotient,
+                // remainder), for hi < d.
+                let n = if name == "mul_wide" { 1 } else { 2 };
+                argc(n)?;
+                let mut vals = vec![recv];
+                for a in &args[..n] {
+                    vals.push(self.expr_coerce(cx, a, &t)?);
+                }
+                let intr = if name == "mul_wide" { Intr::MulWide } else { Intr::DivWide };
+                mk(Ty::Tuple(vec![t.clone(), t.clone()]), TK::Intrinsic(intr, vals), span)
+            }
             (Ty::Int(_), "clz" | "ctz" | "popcount") => {
                 argc(0)?;
                 let intr = match name {

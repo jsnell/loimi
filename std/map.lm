@@ -111,3 +111,354 @@ pub fn HashMap<K, V>.free(m: *HashMap<K, V>) {
     mem.release(m.slots);
     m.len = 0;
 }
+
+// ── OrderedMap: insertion-ordered (CPython's compact dict layout) ────
+//
+// An index table of u32 slots (a power of two; 0 empty, 1 deleted, e + 2
+// for entry e) over a dense array of entries in insertion order. The
+// entries array holds 2/3 as many entries as the index has slots; a
+// removed entry stays in place, dead, until the next resize compacts
+// the array. Each entry keeps its hash (top bit cleared), so resizing
+// never calls `hash` or `eq`: an interpreter whose hashing runs guest
+// code calls it once per key. `std.dict.Dict` is the same table in the
+// GC heap; the `probe_*` functions are the shared core. (Everything here
+// is generic, so a program that does not use it gets no code for it.)
+
+/// One entry: the key's hash (top bit clear; DEAD once removed), key, value.
+pub struct Entry<K, V> { hash: u64, key: K, value: V }
+
+/// The hash of a removed entry.
+pub const DEAD: u64 = 0x8000000000000000;
+/// Index slot values: empty, deleted; entry e is e + SLOT_BASE.
+pub const SLOT_EMPTY: u32 = 0;
+pub const SLOT_DELETED: u32 = 1;
+pub const SLOT_BASE: u32 = 2;
+const NO_ENTRY: u64 = 0xffffffffffffffff;
+const RESTART: u64 = 0xfffffffffffffffe;
+
+/// The stored form of a caller's hash (the top bit marks dead entries).
+#[inline(always)]
+pub fn stored_hash<K>(h: u64) -> u64 { h & 0x7fffffffffffffff }
+
+/// The index size for `n` entries (a power of two, at least 8, with n at
+/// most 2/3 of it).
+pub fn index_size_for<K>(n: u64) -> u64 {
+    var sz: u64 = 8;
+    while sz * 2 < n * 3 { sz *= 2; }
+    sz
+}
+
+/// How many entries an index of `size` slots allows.
+#[inline(always)]
+pub fn usable_for<K>(size: u64) -> u64 { (size * 2) / 3 }
+
+/// The entry of `hash` whose key `eq` accepts, by CPython's perturbed
+/// probing over the index `idx` (mask + 1 slots) and the entries `ents`;
+/// `hash` is a stored hash. `eq` sees only keys whose stored hash matches.
+#[inline]
+pub fn probe_find<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, hash: u64, eq: block fn(K) -> bool) -> ?u64 {
+    var i = hash & mask;
+    var perturb = hash;
+    loop {
+        let s = idx[i];
+        if s == SLOT_EMPTY { return None; }
+        if s >= SLOT_BASE {
+            let e = (s - SLOT_BASE) as u64;
+            let p = ents + e;
+            if p.hash == hash and eq(p.key) { return Some(e); }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// The index slot that holds entry `e` (whose stored hash is `hash`).
+pub fn probe_slot_of<K>(idx: *u32, mask: u64, hash: u64, e: u64) -> u64 {
+    let want = (e as u32) + SLOT_BASE;
+    var i = hash & mask;
+    var perturb = hash;
+    loop {
+        if idx[i] == want { return i; }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// One probe for find-or-insert: `(e, true)` if `eq` accepts the key of
+/// entry `e`, else `(slot, false)` with the first empty or deleted index
+/// slot on the path, where the key goes.
+#[inline]
+pub fn probe_lookup<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, hash: u64, eq: block fn(K) -> bool) -> (u64, bool) {
+    var i = hash & mask;
+    var perturb = hash;
+    var free = NO_ENTRY;
+    loop {
+        let s = idx[i];
+        if s == SLOT_EMPTY { return (if free == NO_ENTRY { i } else { free }, false); }
+        if s >= SLOT_BASE {
+            let e = (s - SLOT_BASE) as u64;
+            let p = ents + e;
+            if p.hash == hash and eq(p.key) { return (e, true); }
+        } else if free == NO_ENTRY {
+            free = i;
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// Point the first empty or deleted slot on `hash`'s probe path at entry `e`.
+#[inline]
+pub fn probe_put<K>(idx: *u32, mask: u64, hash: u64, e: u64) {
+    var i = hash & mask;
+    var perturb = hash;
+    loop {
+        if idx[i] < SLOT_BASE { idx[i] = (e as u32) + SLOT_BASE; return; }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// Copy the live entries of `src[0..n]` to `dst` (in order) and index
+/// them in `idx` (all slots empty, mask + 1 of them). Returns how many.
+pub fn probe_rebuild<K, V>(idx: *u32, mask: u64, dst: *Entry<K, V>, src: *Entry<K, V>, n: u64) -> u64 {
+    var j: u64 = 0;
+    for i in 0..n {
+        let p = src + i;
+        if p.hash != DEAD {
+            dst[j] = *p;
+            probe_put<K>(idx, mask, p.hash, j);
+            j += 1;
+        }
+    }
+    j
+}
+
+/// Mark entry `e` dead: its slot deleted, its hash DEAD, its key and
+/// value bytes zeroed (so that a traced table no longer keeps them alive).
+pub fn probe_kill<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, e: u64) {
+    let p = ents + e;
+    let slot = probe_slot_of<K>(idx, mask, p.hash, e);
+    idx[slot] = SLOT_DELETED;
+    p.hash = DEAD;
+    mem.memset((&p.key) as *u8, 0, size_of<K>());
+    mem.memset((&p.value) as *u8, 0, size_of<V>());
+}
+
+/// The effectful probe shared by `OrderedMap.find_with` and
+/// `dict.Dict.find_with`: `view()` gives the current (index, mask,
+/// entries, version), read again after each `eq` call.
+pub fn probe_find_with<K, V, E>(hash: u64, view: block fn() -> (*u32, u64, *Entry<K, V>, u64),
+                                eq: block fn(K) -> Result<bool, E> uses reenter) -> Result<?u64, E> uses reenter {
+    loop {
+        let (idx0, mask0, _e0, ver) = view();
+        var i = hash & mask0;
+        var perturb = hash;
+        var r = RESTART;
+        loop {
+            let (idx, mask, ents, _v) = view();
+            let s = idx[i];
+            if s == SLOT_EMPTY { r = NO_ENTRY; break; }
+            if s >= SLOT_BASE {
+                let e = (s - SLOT_BASE) as u64;
+                if (ents + e).hash == hash {
+                    let k = (ents + e).key;
+                    let same = eq(k)?;
+                    let (_i2, _m2, _e2, ver2) = view();
+                    if ver2 != ver { break; }
+                    if same { r = e; break; }
+                }
+            }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & mask;
+        }
+        if r == NO_ENTRY { return Ok(None); }
+        if r != RESTART { return Ok(Some(r)); }
+    }
+}
+
+/// A hash map that remembers insertion order. Keys implement `hash.Hash`
+/// for the convenience methods (`get`, `insert`, ...); interpreters whose
+/// hashing or equality can fail or run guest code use the hash-supplied
+/// forms (`find_by`, `find_with`, `insert_new`, `entry`, `remove_at`).
+/// Entry indices are stable until the table is compacted (a resize),
+/// which bumps `version`, as does every insertion of a new key, removal
+/// and `clear` (not value updates): an inline cache can hold an entry
+/// index and the version.
+pub struct OrderedMap<K: hash.Hash, V> {
+    idx: *u32,
+    mask: u64,
+    ents: *Entry<K, V>,
+    /// Entries in use, dead ones included.
+    used: u64,
+    /// Capacity of `ents`.
+    cap: u64,
+    /// Live entries.
+    len: u64,
+    version: u64,
+}
+
+pub fn OrderedMap<K, V>.new() -> OrderedMap<K, V> { OrderedMap.with_capacity(0) }
+
+/// A map with room for `n` entries before it resizes.
+pub fn OrderedMap<K, V>.with_capacity(n: u64) -> OrderedMap<K, V> {
+    let sz = index_size_for<K>(n);
+    let cap = usable_for<K>(sz);
+    OrderedMap { idx: mem.alloc(sz), mask: sz - 1, ents: mem.alloc(cap), used: 0, cap: cap, len: 0, version: 0 }
+}
+
+/// Resize (and compact) for `n` live entries.
+#[cold]
+#[inline(never)]
+fn OrderedMap<K, V>.resize(m: *OrderedMap<K, V>, n: u64) {
+    let sz = index_size_for<K>(n);
+    let cap = usable_for<K>(sz);
+    let idx: *u32 = mem.alloc(sz);
+    let ents: *Entry<K, V> = mem.alloc(cap);
+    m.used = probe_rebuild(idx, sz - 1, ents, m.ents, m.used);
+    mem.release(m.idx);
+    mem.release(m.ents);
+    m.idx = idx;
+    m.ents = ents;
+    m.mask = sz - 1;
+    m.cap = cap;
+    m.version += 1;
+}
+
+/// The entry index of the key with hash `h` that `eq` accepts. `eq` gets a
+/// copy of each candidate key whose hash matches, and must not change the map.
+#[inline]
+pub fn OrderedMap<K, V>.find_by(m: *OrderedMap<K, V>, h: u64, eq: block fn(K) -> bool) -> ?u64 {
+    probe_find(m.idx, m.mask, m.ents, stored_hash<K>(h), eq)
+}
+
+/// `find_by` for an `eq` that can fail and run guest code, which may
+/// change this map. `eq` gets a copy of the candidate key (pointers into
+/// the table do not survive a change). After each call of `eq`, if
+/// `version` changed, the lookup starts over (CPython's rule), so the
+/// answer is about the map as it is when `find_with` returns. An `eq`
+/// that changes the map on every call makes the lookup loop forever, as
+/// in CPython.
+pub fn OrderedMap<K, V>.find_with<E>(m: *OrderedMap<K, V>, h: u64, eq: block fn(K) -> Result<bool, E> uses reenter) -> Result<?u64, E> uses reenter {
+    probe_find_with<K, V, E>(stored_hash<K>(h), || (m.idx, m.mask, m.ents, m.version), eq)
+}
+
+/// Append a new entry for a key the caller knows is absent; returns its index.
+pub fn OrderedMap<K, V>.insert_new(m: *OrderedMap<K, V>, h: u64, key: K, value: V) -> u64 {
+    if m.used == m.cap { m.resize(m.len * 2 + 1); }
+    let hs = stored_hash<K>(h);
+    let e = m.used;
+    m.ents[e] = Entry { hash: hs, key: key, value: value };
+    probe_put<K>(m.idx, m.mask, hs, e);
+    m.used += 1;
+    m.len += 1;
+    m.version += 1;
+    e
+}
+
+/// Entry `e` (a live entry index from `find_by`, `next`, ...). The pointer
+/// is valid until the map changes.
+pub fn OrderedMap<K, V>.entry(m: *OrderedMap<K, V>, e: u64) -> *Entry<K, V> { m.ents + e }
+
+/// Whether entry index `e` is a live entry.
+pub fn OrderedMap<K, V>.is_live(m: *OrderedMap<K, V>, e: u64) -> bool {
+    e < m.used and (m.ents + e).hash != DEAD
+}
+
+pub fn OrderedMap<K, V>.set_value(m: *OrderedMap<K, V>, e: u64, value: V) { (m.ents + e).value = value; }
+
+/// Remove the live entry `e`.
+pub fn OrderedMap<K, V>.remove_at(m: *OrderedMap<K, V>, e: u64) {
+    probe_kill(m.idx, m.mask, m.ents, e);
+    m.len -= 1;
+    m.version += 1;
+}
+
+pub fn OrderedMap<K, V>.get(m: *OrderedMap<K, V>, key: K) -> ?V {
+    let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
+    Some((m.ents + e).value)
+}
+
+pub fn OrderedMap<K, V>.get_ptr(m: *OrderedMap<K, V>, key: K) -> ?*V {
+    let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
+    Some(&(m.ents + e).value)
+}
+
+pub fn OrderedMap<K, V>.contains(m: *OrderedMap<K, V>, key: K) -> bool {
+    m.find_by(key.hash(), |k| k.eq(key)).is_some()
+}
+
+/// Insert or replace (a replaced key keeps its place in the order).
+/// Returns true if the key was new.
+pub fn OrderedMap<K, V>.insert(m: *OrderedMap<K, V>, key: K, value: V) -> bool {
+    m.put_by(key.hash(), key, value, |k| k.eq(key)).1
+}
+
+/// Insert or replace in one probe, with the caller's hash and equality
+/// (as `find_by`). Returns the entry index and whether the key was new.
+pub fn OrderedMap<K, V>.put_by(m: *OrderedMap<K, V>, h: u64, key: K, value: V, eq: block fn(K) -> bool) -> (u64, bool) {
+    let hs = stored_hash<K>(h);
+    let (r, found) = probe_lookup(m.idx, m.mask, m.ents, hs, eq);
+    if found {
+        (m.ents + r).value = value;
+        return (r, false);
+    }
+    if m.used == m.cap { return (m.insert_new(h, key, value), true); }
+    let e = m.used;
+    m.ents[e] = Entry { hash: hs, key: key, value: value };
+    m.idx[r] = (e as u32) + SLOT_BASE;
+    m.used = e + 1;
+    m.len += 1;
+    m.version += 1;
+    (e, true)
+}
+
+/// Remove `key`; its value if it was present.
+pub fn OrderedMap<K, V>.remove(m: *OrderedMap<K, V>, key: K) -> ?V {
+    let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
+    let v = (m.ents + e).value;
+    m.remove_at(e);
+    Some(v)
+}
+
+/// Remove and return the last entry in insertion order.
+pub fn OrderedMap<K, V>.pop_last(m: *OrderedMap<K, V>) -> ?(K, V) {
+    while m.used > 0 and (m.ents + (m.used - 1)).hash == DEAD { m.used -= 1; }
+    if m.used == 0 { return None; }
+    let e = m.used - 1;
+    let p = m.ents + e;
+    let r = (p.key, p.value);
+    m.remove_at(e);
+    m.used = e;
+    Some(r)
+}
+
+/// Iteration in insertion order:
+/// `var i: u64 = 0; while let Some(e) = m.next(&i) { .. e.key, e.value .. }`.
+/// The entry index of `e` is `i - 1`.
+pub fn OrderedMap<K, V>.next(m: *OrderedMap<K, V>, at: *u64) -> ?*Entry<K, V> {
+    while *at < m.used {
+        let p = m.ents + *at;
+        *at += 1;
+        if p.hash != DEAD { return Some(p); }
+    }
+    None
+}
+
+/// Remove every entry, keeping the memory.
+pub fn OrderedMap<K, V>.clear(m: *OrderedMap<K, V>) {
+    mem.memset(m.idx as *u8, 0, (m.mask + 1) * 4);
+    m.used = 0;
+    m.len = 0;
+    m.version += 1;
+}
+
+/// Free the map's memory. The map must not be used afterwards (make a
+/// new one).
+pub fn OrderedMap<K, V>.free(m: *OrderedMap<K, V>) {
+    mem.release(m.idx);
+    mem.release(m.ents);
+    m.used = 0;
+    m.len = 0;
+    m.cap = 0;
+}

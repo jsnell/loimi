@@ -451,17 +451,17 @@ pub vm Py {
             let d = f.globals;
             let i = cache.idx as u64;
             if likely(i < d.used) {
-                let e = d.ent.items.ptr + 2 * i;
-                if *e == name { dst = *(e + 1); next }
+                let e = d.ents.e.ptr + i;
+                if e.key == name { dst = e.value; next }
             }
             cold { become GETGLOBAL; redo }
         }
         GETGLOBAL_B {
             let Func(f) = fp.func else { trap() };
             let d = f.globals;
-            if (d.keyver as u32) == cache.ver {
+            if (d.version as u32) == cache.ver {
                 let bd = ctx.builtins.unwrap();
-                dst = *(bd.ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                dst = (bd.ents.e.ptr + (cache.idx as u64)).value;
                 next
             }
             cold { become GETGLOBAL; redo }
@@ -539,21 +539,21 @@ pub vm Py {
             let d = o.dict;
             let i = cache.idx as u64;
             if likely(i < d.used) {
-                let e = d.ent.items.ptr + 2 * i;
-                if *e == name { dst = *(e + 1); next }
+                let e = d.ents.e.ptr + i;
+                if e.key == name { dst = e.value; next }
             }
             let j = cache.idx2 as u64;
             if j < d.used {
-                let e = d.ent.items.ptr + 2 * j;
-                if *e == name { dst = *(e + 1); next }
+                let e = d.ents.e.ptr + j;
+                if e.key == name { dst = e.value; next }
             }
         } else if let Obj(b) = obj and (b.kind == K_CLASS or b.kind == K_MODULE) and let Some(d) = b.dict {
             // A plain attribute of the class (or module) itself; ops.getattr
             // fills the cache only for values that need no binding.
             let i = cache.idx as u64;
             if i < d.used {
-                let e = d.ent.items.ptr + 2 * i;
-                if *e == name { dst = *(e + 1); next }
+                let e = d.ents.e.ptr + i;
+                if e.key == name { dst = e.value; next }
             }
         }
         cold {
@@ -569,10 +569,10 @@ pub vm Py {
             let d = o.dict;
             let i = cache.idx as u64;
             if likely(i < d.used) {
-                let e = d.ent.items.ptr + 2 * i;
-                if *e == name {
-                    *(e + 1) = src;
-                    gc.write_barrier(&ctx.heap, d.ent as *u8);
+                let e = d.ents.e.ptr + i;
+                if e.key == name {
+                    e.value = src;
+                    gc.write_barrier(&ctx.heap, d.ents as *u8);
                     next
                 }
             } else if i == d.used and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
@@ -605,7 +605,7 @@ pub vm Py {
                     var d = cache.depth;
                     while d > 0 { owner = owner.base ?? owner; d -= 1; }
                     if let Some(od) = owner.dict {
-                        regs[base.raw] = *(od.ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                        regs[base.raw] = (od.ents.e.ptr + (cache.idx as u64)).value;
                         regs[base.raw + 1] = o;
                         next
                     }
@@ -615,7 +615,7 @@ pub vm Py {
                     var d = cache.depth2;
                     while d > 0 { owner = owner.base ?? owner; d -= 1; }
                     if let Some(od) = owner.dict {
-                        regs[base.raw] = *(od.ent.items.ptr + 2 * (cache.idx2 as u64) + 1);
+                        regs[base.raw] = (od.ents.e.ptr + (cache.idx2 as u64)).value;
                         regs[base.raw + 1] = o;
                         next
                     }
@@ -625,9 +625,9 @@ pub vm Py {
             // A function in a module's or class's own dict, called without self.
             let i = cache.idx as u64;
             if i < d.used and (b.kind == K_MODULE or b.kind == K_CLASS) {
-                let e = d.ent.items.ptr + 2 * i;
-                if *e == name {
-                    let v = *(e + 1);
+                let e = d.ents.e.ptr + i;
+                if e.key == name {
+                    let v = e.value;
                     if let Obj(sm) = v and sm.kind == K_STATICM { regs[base.raw] = sm.a; regs[base.raw + 1] = Undef; next }
                     if let Obj(cm) = v and cm.kind == K_CLASSM { regs[base.raw] = cm.a; regs[base.raw + 1] = o; next }
                     regs[base.raw] = v;
