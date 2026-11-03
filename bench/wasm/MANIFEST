@@ -1,0 +1,15 @@
+# External pieces for the WebAssembly benchmarks and spec tests. Downloaded
+# into bench/wasm/src/ and checked with sha256sum by install.sh; built into
+# bench/wasm/install/ (both gitignored). Nothing here is committed except
+# this manifest and the scripts.
+#
+# name          version    url                                                                                                       sha256
+cmake           3.30.5     https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz                f747d9b23e1a252a8beafb4ed2bc2ddf78cff7f04a8e4de19f4ff88e9b51dc9d
+wabt            1.0.36     https://github.com/WebAssembly/wabt/releases/download/1.0.36/wabt-1.0.36.tar.xz                           aaf2515431912e191561b9d82df98850394af80e48076960161e09704a5ef7c6
+libuv           1.37.0     https://github.com/libuv/libuv/archive/refs/tags/v1.37.0.tar.gz                                           7afa3c8a326b3eed02a9addb584ae7e995ae4d30516cad5e1e4af911931162a6
+wasm3           0.5.0      https://github.com/wasm3/wasm3/archive/refs/tags/v0.5.0.tar.gz                                            b778dd72ee2251f4fe9e2666ee3fe1c26f06f517c3ffce572416db067546536c
+wasi-libc       wasi-sdk-25  https://github.com/WebAssembly/wasi-libc/archive/refs/tags/wasi-sdk-25.tar.gz                    42e6eb03fd097f8a0f76c0db3c6364b71c97bc11aedc3cd73266fad587a1ea11
+wasi-builtins   25.0       https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/libclang_rt.builtins-wasm32-wasi-25.0.tar.gz  13aca55665321200b9659b292615adf5110ace9e891ab94511badd970553ca18
+testsuite       f3f048661dc1686d556a27d522df901cb747ab4a  https://codeload.github.com/WebAssembly/testsuite/tar.gz/f3f048661dc1686d556a27d522df901cb747ab4a  052dbb79eeaedbaa7af068b7b85e1125d187719b597e2242fb2cfabf51226e73
+coremark        1f483d5b8316753a742cbf5590caf5bd0a4e4777  https://codeload.github.com/eembc/coremark/tar.gz/1f483d5b8316753a742cbf5590caf5bd0a4e4777  4067e7f260218df13f2875d8f821a8ff32a84153c6e0759d7c89f96c0a8bf987
+benchmarksgame  40296663ed350d5fe4a6ab5e367bab61cb77c219  https://salsa.debian.org/benchmarksgame-team/benchmarksgame/-/archive/40296663ed350d5fe4a6ab5e367bab61cb77c219/benchmarksgame-40296663ed350d5fe4a6ab5e367bab61cb77c219.tar.gz  43403d6883fb97480081a59c31552a5710cddb2a29c5c24037907e49d2dcbaa9
