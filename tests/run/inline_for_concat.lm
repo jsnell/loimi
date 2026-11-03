@@ -1,0 +1,40 @@
+// `#(a ++ "_x")`: one identifier from several parts (loop variables with
+// string, identifier or integer values, string and integer literals),
+// also across nested loops (the outer loop fills its parts first).
+import std.io;
+
+inline for (name, v) in [("load", 1), (store, 2)] {
+    fn #name() -> i64 { v }
+    fn #(name ++ "_x")() -> i64 { v * 10 }
+    fn #("get_" ++ name ++ 2)() -> i64 { v * 100 }
+}
+
+inline for (a, k) in [("i32", 1), ("f64", 2)] {
+    inline for (b, m) in [("add", 3), ("mul", 4)] {
+        fn #(a ++ "_" ++ b)() -> i64 { k * m }
+    }
+}
+
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand imm8 = it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+    inline for (n, sym) in [(ADD, +), (SUB, -)] {
+        op #n(d: reg, a: reg, b: reg) : A { d = a sym b; next }
+        op #(n ++ "_K")(d: reg, a: reg, k: imm8) : A { d = a sym (k as i64); next }
+    }
+    op RET(x: reg) : A { exit x }
+    entry run(c: *u32, regs: *i64) -> i64 { pc = c; r = regs; jump pc }
+}
+
+fn main() {
+    io.print_int(load() + load_x() + store() + store_x() + get_load2() + get_store2()); io.println("");
+    io.print_int(i32_add() * 1000 + i32_mul() * 100 + f64_add() * 10 + f64_mul()); io.println("");
+    var code: [u32; 4] = [V.ADD(2, 0, 1), V.SUB_K(2, 2, 3), V.ADD_K(2, 2, 100), V.RET(2)];
+    var regs: [i64; 3] = [6, 7, 0];
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: 333
+// expect: 3468
+// expect: 110

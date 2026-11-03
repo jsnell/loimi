@@ -1,0 +1,49 @@
+// `v.lane_at(i)` and `v.with_lane_at(i, x)`: a lane index chosen at run
+// time, of any integer type, masked to the lane count (`i & (N - 1)`).
+import std.io;
+
+// Opaque to the optimizer, so that the index is not a constant.
+#[inline(never)]
+fn id<T>(x: T) -> T { x }
+
+fn main() {
+    let b = u8x16.new(10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 255);
+    let w = i16x8.new(-1, -2, -3, -4, -5, -6, -7, -8);
+    let d = f64x2.new(1.5, -2.5);
+    let l = i64x2.new(-9, 9);
+    var i: u32 = 0;
+    while i < 16 {
+        io.print_int(b.lane_at(id(i)) as i64); io.print(" ");
+        i += 1;
+    }
+    io.println("");
+    // Masked: 16 is lane 0, 17 lane 1, -1 lane 15 (of 16) or 7 (of 8).
+    io.print_int(b.lane_at(id(16 as u8)) as i64); io.print(" ");
+    io.print_int(b.lane_at(id(17 as u64)) as i64); io.print(" ");
+    io.print_int(b.lane_at(id(-1 as i32)) as i64); io.print(" ");
+    io.print_int(w.lane_at(id(-1 as i64)) as i64); io.print(" ");
+    io.print_int(w.lane_at(id(10 as u16)) as i64); io.print(" ");
+    io.print_f64(d.lane_at(id(3 as u8))); io.print(" ");
+    io.print_int(l.lane_at(id(0 as i8))); io.println("");
+    // Replace each lane in turn.
+    var j: i32 = 0;
+    var v = i32x4.splat(0);
+    while j < 4 {
+        v = v.with_lane_at(id(j), (j + 1) * 100);
+        j += 1;
+    }
+    io.print_int(v.lane(0) as i64); io.print(" "); io.print_int(v.lane(1) as i64); io.print(" ");
+    io.print_int(v.lane(2) as i64); io.print(" "); io.print_int(v.lane(3) as i64); io.println("");
+    let e = d.with_lane_at(id(5 as u32), 7.25);     // 5 & 1 = lane 1
+    io.print_f64(e.lane(0)); io.print(" "); io.print_f64(e.lane(1)); io.print(" ");
+    let c = b.with_lane_at(id(31 as u64), 1);       // lane 15
+    io.print_int(c.lane(15) as i64); io.print(" "); io.print_int(c.lane(14) as i64); io.print(" ");
+    // A constant index is the same as `lane`/`with_lane`.
+    io.print_int(w.lane_at(9) as i64); io.print(" ");
+    io.print_int(l.with_lane_at(1, 5).lane(1)); io.println("");
+}
+
+// expect: 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 255
+// expect: 10 11 255 -8 -3 -2.5 -9
+// expect: 100 200 300 400
+// expect: 1.5 7.25 1 24 -2 5

@@ -2911,6 +2911,24 @@ impl<'a, 'p> FnGen<'a, 'p> {
             Intr::VBitcast if rt == at => vals[0].clone(),
             Intr::VBitcast => self.inst(format!("bitcast {} {} to {}", at, vals[0], rt)),
             Intr::VLane => self.inst(format!("extractelement {} {}, i64 {}", at, vals[0], vals[1])),
+            Intr::VWithLane if vals[1].parse::<i64>().is_err() => {
+                // `with_lane_at` (the index already masked below the lane
+                // count): a select of the lane equal to the index from a
+                // splat of `x`. LLVM inserts at a variable index through a
+                // stack slot (a vector store, a lane store, a vector load:
+                // a store-forwarding stall on x86-64).
+                let Ty::Vector(l, n) = &args[0].ty else { unreachable!() };
+                let n = *n;
+                let et = self.ty(l);
+                let w = 128 / n;
+                let it = format!("i{}", w);
+                let ix = if w < 64 { self.inst(format!("trunc i64 {} to {}", vals[1], it)) } else { vals[1].clone() };
+                let ixs = self.vsplat(&it, n, &ix);
+                let lanes: Vec<String> = (0..n).map(|k| format!("{} {}", it, k)).collect();
+                let c = self.inst(format!("icmp eq <{} x {}> {}, <{}>", n, it, ixs, lanes.join(", ")));
+                let xs = self.vsplat(&et, n, &vals[2]);
+                self.inst(format!("select <{} x i1> {}, {} {}, {} {}", n, c, at, xs, at, vals[0]))
+            }
             Intr::VWithLane => {
                 let et = self.ty(&args[2].ty);
                 self.inst(format!("insertelement {} {}, {} {}, i64 {}", at, vals[0], et, vals[2], vals[1]))

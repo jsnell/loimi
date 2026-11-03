@@ -1,0 +1,5 @@
+inline for n in ["a", "b"] {
+    fn #(n ++ "-x")() {}
+}
+fn main() {}
+// error: `#(..)` makes `a-x`, which is not an identifier

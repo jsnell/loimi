@@ -3844,16 +3844,15 @@ impl<'a> Checker<'a> {
     /// A lane index or shuffle index: a constant expression below `n`.
     fn lane_index(&mut self, cx: &mut FnCx, e: &Expr, n: u32, what: &str) -> Res<TExpr> {
         let te = fold(&self.expr_coerce(cx, e, &Ty::i64())?);
+        let hint = if what == "the lane index" {
+            "; for a lane chosen at run time, use `lane_at`/`with_lane_at`"
+        } else {
+            "; `swizzle` takes its indices from a vector (8-bit lanes)"
+        };
         match te.kind {
             TK::Int(v) if (0..n as i128).contains(&v) => Ok(mk(Ty::i64(), TK::Int(v), e.span)),
             TK::Int(v) => Err(Diag::new(e.span, format!("{} {} is out of range: it must be below {}", what, v, n))),
-            _ => Err(Diag::new(
-                e.span,
-                format!(
-                    "{} must be a constant expression (an integer literal or a `const`); for a lane chosen at run time, store the vector and index the memory",
-                    what
-                ),
-            )),
+            _ => Err(Diag::new(e.span, format!("{} must be a constant expression (an integer literal or a `const`){}", what, hint))),
         }
     }
 
@@ -3885,6 +3884,27 @@ impl<'a> Checker<'a> {
                 let i = self.lane_index(cx, &args[0], n, "the lane index")?;
                 let x = self.expr_coerce(cx, &args[1], &lane)?;
                 mk(t.clone(), TK::Intrinsic(Intr::VWithLane, vec![recv, i, x]), span)
+            }
+            "lane_at" | "with_lane_at" => {
+                // A lane chosen at run time: the index (any integer type)
+                // is masked to the lane count, `i & (N - 1)`, as shift
+                // amounts are taken modulo the lane width.
+                argc(if name == "lane_at" { 1 } else { 2 })?;
+                let i = self.expr(cx, &args[0], None)?;
+                if !i.ty.is_int() {
+                    return Err(Diag::new(args[0].span, format!("the lane index of `{}` must be an integer, not `{}`", name, self.ty_name(&i.ty))));
+                }
+                let it = i.ty.clone();
+                let isp = i.span;
+                let m = mk(it.clone(), TK::Binary(BinOp::And, Box::new(i), Box::new(mk(it.clone(), TK::Int(n as i128 - 1), isp))), isp);
+                let m = if it == Ty::i64() { m } else { mk(Ty::i64(), TK::Cast(Box::new(m)), isp) };
+                let m = fold(&m);
+                if name == "lane_at" {
+                    mk((*lane).clone(), TK::Intrinsic(Intr::VLane, vec![recv, m]), span)
+                } else {
+                    let x = self.expr_coerce(cx, &args[1], &lane)?;
+                    mk(t.clone(), TK::Intrinsic(Intr::VWithLane, vec![recv, m, x]), span)
+                }
             }
             "abs" => {
                 argc(0)?;

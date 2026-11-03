@@ -1,0 +1,5 @@
+inline for n in [1 + 2] {
+    fn #("f" ++ n)() {}
+}
+fn main() {}
+// error: `#(..)` needs a string, identifier or integer value for `n`

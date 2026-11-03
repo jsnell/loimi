@@ -398,6 +398,10 @@ impl Parser {
             let mut i = 0;
             while i < body.len() {
                 let t = &body[i];
+                if t.tok == Tok::Punct("#") && body.get(i + 1).is_some_and(|n| n.tok == Tok::Punct("(")) {
+                    i = splice_concat(&body, i, &vars, values, &mut out)?;
+                    continue;
+                }
                 if t.tok == Tok::Punct("#") {
                     if let Some(Token { tok: Tok::Ident(v), span, .. }) = body.get(i + 1) {
                         if let Some(k) = vars.iter().position(|x| x == v) {
@@ -1916,6 +1920,79 @@ impl Parser {
             _ => self.err(format!("expected pattern, found {}", self.describe())),
         }
     }
+}
+
+/// `#(a ++ "_X" ++ b)` at `body[i]` in an `inline for` body: one
+/// identifier made of the parts, each a loop variable (with a string,
+/// identifier or integer value), a string literal or an integer literal.
+/// A part naming no variable of this loop is left for an inner `inline
+/// for` (outside-in expansion): this loop's variables are replaced by
+/// string literals and the construct stays. Returns the index after `)`.
+fn splice_concat(body: &[Token], i: usize, vars: &[String], values: &[Vec<Token>], out: &mut Vec<Token>) -> Res<usize> {
+    let span = body[i].span;
+    let close = (i + 2..body.len()).find(|&k| body[k].tok == Tok::Punct(")"));
+    let Some(close) = close else {
+        return Err(Diag::new(span, "`#(` without `)`"));
+    };
+    let inner = &body[i + 2..close];
+    // part (`++` part)*, with `++` as two `+` tokens.
+    let mut parts: Vec<&Token> = Vec::new();
+    let mut k = 0;
+    loop {
+        let Some(p) = inner.get(k) else {
+            return Err(Diag::new(span, "`#(..)` needs one or more parts joined by `++`"));
+        };
+        parts.push(p);
+        k += 1;
+        if k == inner.len() {
+            break;
+        }
+        if !(inner[k].tok == Tok::Punct("+") && inner.get(k + 1).is_some_and(|t| t.tok == Tok::Punct("+") && !t.space_before)) {
+            return Err(Diag::new(inner[k].span, "expected `++` or `)` in `#(..)`"));
+        }
+        k += 2;
+    }
+    // Each part as text, or None when it is left for an inner loop.
+    let mut texts: Vec<Option<String>> = Vec::new();
+    for p in &parts {
+        texts.push(match &p.tok {
+            Tok::Str(s) => Some(String::from_utf8_lossy(s).into_owned()),
+            Tok::Int(n) => Some(n.to_string()),
+            Tok::Ident(v) => match vars.iter().position(|x| x == v) {
+                Some(j) => Some(match values[j].as_slice() {
+                    [Token { tok: Tok::Str(s), .. }] => String::from_utf8_lossy(s).into_owned(),
+                    [Token { tok: Tok::Ident(s), .. }] => s.clone(),
+                    [Token { tok: Tok::Int(n), .. }] => n.to_string(),
+                    _ => return Err(Diag::new(p.span, format!("`#(..)` needs a string, identifier or integer value for `{}`", v))),
+                }),
+                None => None,
+            },
+            _ => return Err(Diag::new(p.span, "a part of `#(..)` is a loop variable, a string literal or an integer literal")),
+        });
+    }
+    if texts.iter().all(|t| t.is_some()) {
+        let name: String = texts.into_iter().map(|t| t.unwrap()).collect();
+        let ok = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ok {
+            return Err(Diag::new(span, format!("`#(..)` makes `{}`, which is not an identifier", name)));
+        }
+        out.push(Token { tok: Tok::Ident(name), span, space_before: true });
+    } else {
+        out.extend(body[i..i + 2].iter().cloned());
+        let mut k = 0;
+        for (p, t) in parts.iter().zip(texts) {
+            if k > 0 {
+                out.extend(inner[k - 2..k].iter().cloned());
+            }
+            out.push(match t {
+                Some(t) if matches!(p.tok, Tok::Ident(_)) => Token { tok: Tok::Str(t.into_bytes()), span: p.span, space_before: p.space_before },
+                _ => (*p).clone(),
+            });
+            k += 3;
+        }
+        out.push(body[close].clone());
+    }
+    Ok(close + 1)
 }
 
 fn split_top_level(toks: &[Token]) -> Vec<Vec<Token>> {
