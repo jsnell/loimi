@@ -52,7 +52,7 @@ pub object Coro {
     fp: *Frame,
     open: ?Gc<UpVal>,
     open_level: *V,
-    ypc: ?Mini.Resume,
+    ypc: Mini.Resume,
     ydst: u32,
     ynres: u32,
     /// The error that killed it, until coroutine.close reports it.
@@ -171,7 +171,7 @@ pub fn install(h: *gc.Heap, globals: Gc<Table>) {
 /// The main thread's coroutine object (what coroutine.running returns
 /// outside any coroutine): running, without stacks of its own.
 pub fn new_main(h: *gc.Heap) -> Gc<Coro> {
-    new(h, Coro { status: RUNNING, started: true, body: V.Nil, err: V.Nil, ..zero })
+    new(h, Coro { status: RUNNING, started: true, body: V.Nil, err: V.Nil, ypc: Mini.Resume.placeholder(), ..zero })
 }
 
 fn msg(c: *Ctx, s: str) -> V { V.S(value.new_str(&c.heap, s)) }
@@ -223,9 +223,9 @@ pub fn call(c: *Ctx, id: i32, args: *V, n: u64, from_vm: bool) -> Result<V, V> u
             Co(w) if is_wrap(w) => {}
             _ => return Err(bad_arg(c, 0, if id == CREATE { "create" } else { "wrap" }, "function")),
         }
-        let co = new(&c.heap, Coro { status: SUSPENDED, started: false, body: f, err: V.Nil, ..zero });
+        let co = new(&c.heap, Coro { status: SUSPENDED, started: false, body: f, err: V.Nil, ypc: Mini.Resume.placeholder(), ..zero });
         if id == CREATE { return Ok(V.Co(co)); }
-        return Ok(V.Co(new(&c.heap, Coro { status: DEAD, started: true, body: V.Nil, err: V.Nil, wrap: Some(co), ..zero })));
+        return Ok(V.Co(new(&c.heap, Coro { status: DEAD, started: true, body: V.Nil, err: V.Nil, ypc: Mini.Resume.placeholder(), wrap: Some(co), ..zero })));
     }
     if id == RESUME {
         let co = check_co(c, args, n, "resume")?;

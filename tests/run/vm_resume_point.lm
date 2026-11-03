@@ -3,10 +3,10 @@
 // after itself, and leaves the run; a `#[require_verified]` entry later
 // continues there with `jump r`, no `unsafe`. Also: `next_resume` past an
 // op with a cache word and from the shared copy of a vm function (a
-// call from a cold block), `r.pc()`, `Verified.resume_at` (only at
-// instruction boundaries), and the verifier rejecting code whose last
-// instruction saves `next_pc` or `next_resume` (it would resume past the
-// end).
+// call from a cold block), `r.pc()`, `V.Resume.placeholder()`,
+// `Verified.resume_at` (only at instruction boundaries), and the
+// verifier rejecting code whose last instruction saves `next_pc` or
+// `next_resume` (it would resume past the end).
 import std.io;
 
 struct Proto { nregs: u32 }
@@ -106,6 +106,8 @@ fn main() {
     let r2 = V.resume(&cx, &regs[0]);
     io.print_int(r2 + regs[0]);
     io.println("");
+    // The placeholder resume point is the placeholder proof's trap word.
+    io.println(if V.Resume.placeholder().pc() == V.placeholder().start() { "placeholder" } else { "no" });
     // Code that ends with an op saving `next_resume` or `next_pc`: the
     // resume would run past the end.
     var end: [u32; 4] = [0; 4];
@@ -127,6 +129,7 @@ fn main() {
 // expect: raw 9
 // expect: yyyynyyyyyn
 // expect: 101
+// expect: placeholder
 // expect: bad at 1: execution can run off the end of the code after this instruction
 // expect: bad at 1: execution can run off the end of the code after this instruction
 // expect: ok

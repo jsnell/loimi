@@ -1808,14 +1808,17 @@ entry under `#[require_verified]`. There are two ways to get one:
   there. It walks the code from its start, so it costs a pass over the
   words before `i` (for host code such as a debugger, not a hot path).
 
-`r.pc()` reads the address. `unsafe { Mini.assume_resume(p) }` makes
-one from a raw pointer, like `assume_verified`.
+`r.pc()` reads the address. `Mini.Resume.placeholder()` is a resume
+point at the trap word of `Mini.placeholder()`, for a slot that needs a
+value before there is anything to resume: jumping to it traps.
+`unsafe { Mini.assume_resume(p) }` makes one from a raw pointer, like
+`assume_verified`.
 
 <!-- snippet: excerpt examples/mini/vm.lm -->
 ```loimi
 fn yield_exit(base: u64, nres: u64) -> never {
     ctx.nret = NRET_ONE;
-    ctx.ypc = Some(next_resume);
+    ctx.ypc = next_resume;
     ctx.ydst = base as u32;
     ctx.ynres = nres as u32;
     ctx.fp = fp;
@@ -1827,20 +1830,32 @@ and the entry that continues the coroutine:
 
 <!-- snippet: excerpt examples/mini/vm.lm -->
 ```loimi
-let Some(at) = c.ypc else { fail V.Nil };
-jump at
+entry resume(c: *Ctx, vals: *V, n: u64) -> Result<V, V> uses reenter {
+    ctx = c;
+    fp = c.fp;
+    regs = fp.base;
+    k = fp.k;
+    let dst = regs + c.ydst as u64;
+    for i in 0..c.ynres as u64 { dst[i] = if i < n { vals[i] } else { V.Nil }; }
+    // The instruction after the yield's CALL: a resume point, which
+    // only vm code makes (`next_resume`), so `#[require_verified]`
+    // lets the entry jump to it.
+    jump c.ypc
+}
 ```
 
 What is checked, and when:
 
-- *At compile time:* only `next_resume`, `resume_at` and the `#[unsafe]`
-  `assume_resume` build a `Mini.Resume`. Its field is private to the
-  vm's generated code, so a struct literal cannot forge one, and `..zero`
-  cannot make a null one; use `?Mini.Resume` for a slot that starts
-  empty. The type is per vm: another vm's entry cannot jump to it.
+- *At compile time:* only `next_resume`, `resume_at`, `placeholder` and
+  the `#[unsafe]` `assume_resume` build a `Mini.Resume`. Its field is
+  private to the vm's generated code, so a struct literal cannot forge
+  one, and `..zero` cannot make a null one: a slot that starts empty
+  holds `Mini.Resume.placeholder()` (or is a `?Mini.Resume`). The type
+  is per vm: another vm's entry cannot jump to it.
 - *At verification time:* that code cannot end with an instruction that
   saves its successor (so `next_resume` always names an instruction).
-- *At run time:* `resume_at` checks the boundary; nothing else is.
+- *At run time:* `resume_at` checks the boundary, and the placeholder
+  traps; nothing else is.
 
 What is not checked is the same as for return addresses (`jump
 fp.resume`) and for a `Verified<Mini>` kept outside its object: that

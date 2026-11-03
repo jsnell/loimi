@@ -319,8 +319,9 @@ interpreter.
    `v.resume_at(i)` on a `Verified<Mini>` (checked at run time), and
    an entry may `jump` to one under `#[require_verified]`. The yield
    path (`yield_exit`, called from CALL's native and wrap paths) saves
-   `ctx.ypc = Some(next_resume)`, and `Mini.resume` does `jump at`, with
-   no `unsafe`. Its field is private to the vm's generated code, so it
+   `ctx.ypc = next_resume`, and `Mini.resume` does `jump c.ypc`, with
+   no `unsafe`. Before the first yield, `ypc` holds
+   `Mini.Resume.placeholder()`, which traps if jumped to. Its field is private to the vm's generated code, so it
    cannot be built from a raw pointer outside `unsafe`, and the verifier
    rejects code ending in an instruction that saves its successor (an
    existing hole for `next_pc` found on the way: ops that save `next_pc`
@@ -329,8 +330,17 @@ interpreter.
    coroutine's frames do. The yield code moved out of `native_results`
    into `yield_exit`, so that the native-call path compiles as before
    (with the yield inside, LLVM stopped inlining the shared copy of
-   `native_results`); CALL's hot path is unchanged but for one field
-   offset (`ypc` is now a 16-byte `?Mini.Resume`).
+   `native_results`). The handlers' code is unchanged (with items 2 and
+   3 together, the only hot-path difference is the shift count in the
+   compare-and-branch ops), and so are the timings, against the commit
+   before, interleaved, `--align-functions=64`: best of 10, fib 1.001,
+   chameneos 1.007 to 1.009, coroutine_ring 0.948 to 0.996, sieve 1.018;
+   best of 5 over 8 clean-room benchmarks and the 3 coroutine ones,
+   geomean 1.009, all within the ±5% that this shared machine showed
+   between repeated runs.
+   A first version kept `ypc` as a `?Mini.Resume`, 8 bytes longer, which
+   moved the `Ctx` fields after it: fib ran 3% slower with otherwise
+   identical code.
 
    As it was:
    - **Error:** `Mini.resume` needs `jump c.ypc` to continue after the

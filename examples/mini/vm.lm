@@ -58,10 +58,11 @@ pub struct Ctx {
     rcap: u64,
     /// Set when a CALL of coroutine.yield left the run, with where to
     /// continue (`ypc`, the instruction after the CALL: a resume point
-    /// that `Mini.resume` may jump to) and where the CALL's `ynres`
+    /// that `Mini.resume` may jump to; `Mini.Resume.placeholder()`, which
+    /// traps, before the first yield) and where the CALL's `ynres`
     /// results go (`ydst`).
     yielded: bool,
-    ypc: ?Mini.Resume,
+    ypc: Mini.Resume,
     ydst: u32,
     ynres: u32,
     /// The values that coroutine.yield passed, or that the return that
@@ -1113,7 +1114,7 @@ pub vm Mini {
     /// `Mini.resume` may jump to.
     fn yield_exit(base: u64, nres: u64) -> never {
         ctx.nret = NRET_ONE;
-        ctx.ypc = Some(next_resume);
+        ctx.ypc = next_resume;
         ctx.ydst = base as u32;
         ctx.ynres = nres as u32;
         ctx.fp = fp;
@@ -1272,8 +1273,7 @@ pub vm Mini {
         // The instruction after the yield's CALL: a resume point, which
         // only vm code makes (`next_resume`), so `#[require_verified]`
         // lets the entry jump to it.
-        let Some(at) = c.ypc else { fail V.Nil };
-        jump at
+        jump c.ypc
     }
 
     on raise(e: V) {

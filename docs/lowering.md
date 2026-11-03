@@ -884,10 +884,14 @@ entry's `jump` (vmcheck).
 `next_resume` is `next_pc` wrapped in it (`pc` plus the op's size, or
 plus the size argument in a vm function's shared copy), and `jump r`
 lowers to the field, as a raw `jump`. So Mini's resume entry
-(`jump at` with `at: Mini.Resume`) is the same code as the
-`unsafe { jump c.ypc }` it replaced, after a test of the `?Mini.Resume`
-it is kept in. `v.resume_at(i)` is a generated loop that steps through
-the code by `Vm.base_size` (superinstruction parts are instructions)
+(`jump c.ypc` with `ypc: Mini.Resume`) is the same code as the
+`unsafe { jump c.ypc }` it replaced, and the struct has the layout of
+the `*u32` field it replaced. (Keeping it in a `?Mini.Resume` instead
+made `Ctx` 8 bytes longer, which moved the fields after it and cost
+3% on `fib`, whose code was otherwise identical: placement noise
+that `Mini.Resume.placeholder()` avoids.) `v.resume_at(i)` is a
+generated loop that steps through the code by `Vm.base_size`
+(superinstruction parts are instructions)
 until it reaches or passes `i`. The verifier's "may continue" scan (the
 code cannot end with such an instruction) counts `next_pc` and
 `next_resume` as reads of `pc`. Before resume points it missed

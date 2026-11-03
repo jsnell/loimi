@@ -872,6 +872,12 @@ fn generate_resume(v: &VmDecl, l: &VmLayout) -> String {
          \x20 None\n}}\n\
          #[unsafe]\n{vis}fn {n}__assume_resume(pc: *{w}) -> {n}__Resume {{ {n}__Resume {{ __pc: pc }} }}"
     );
+    // A resume point at the placeholder's trap word, for a slot that needs
+    // a value before there is code to resume (when `placeholder` exists).
+    let used: std::collections::HashSet<u32> = l.ops.iter().map(|o| o.opcode).collect();
+    if (0..1u64 << l.op_bits.min(16)).any(|x| !used.contains(&(x as u32))) {
+        let _ = writeln!(s, "{vis}fn {n}__Resume.placeholder() -> {n}__Resume {{ {n}__Resume {{ __pc: {n}__TRAP[..].ptr }} }}");
+    }
     s
 }
 

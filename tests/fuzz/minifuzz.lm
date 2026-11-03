@@ -389,6 +389,7 @@ fn main() -> i32 uses gc {
         nret: vm.NRET_ONE,
         rbuf: mem.alloc(16),
         rcap: 16,
+        ypc: Mini.Resume.placeholder(),
         ..zero
     };
     ctx.frames_end = ctx.frames + 16;
