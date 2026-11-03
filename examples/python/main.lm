@@ -35,6 +35,7 @@ fn main() -> i32 uses reenter {
         if a.eq("--gc-stress") { stress = true; }
         else if a.eq("--gc-verify") { verify = true; }
         else if a.eq("--disasm") { disasm = true; }
+        else if a.eq("--no-supers") { compile.NO_SUPERS = true; }
         else if path.is_none() { path = Some(a); }
         else { return usage(); }
     }

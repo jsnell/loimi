@@ -526,10 +526,10 @@ fn C.stmt(c: *C, st: *Stmt) {
         Class(cd) => c.class_def(cd),
         Return(v) => {
             if c.s.kind != SC_FUNC { c.fail("'return' outside function"); return; }
-            let r = c.alloc(1);
+            var r: u32 = 0;
             match v {
-                Some(x) => c.expr_to(x, r),
-                None => c.emit(Py.LOADNIL(r as u8)),
+                Some(x) => r = c.operand(x),
+                None => { r = c.alloc(1); c.emit(Py.LOADNIL(r as u8)); }
             }
             if c.fins.len > 0 {
                 let h0 = c.hs.len;
@@ -1401,6 +1401,14 @@ fn C.jump_if_false(c: *C, cond: *Expr, l: bc.Label) {
     match cond.e {
         Cmp(a, opsv, rest) => if opsv.len == 1 {
             let op = opsv.at(0);
+            if (op == CmpOp.Is or op == CmpOp.IsNot) and let NoneE = rest.at(0).e {
+                // x is None / x is not None: test and branch in one op.
+                let ra = c.operand(a);
+                c.emit(if op == CmpOp.Is { Py.JNNONE(ra as u8) } else { Py.JNSOME(ra as u8) });
+                c.code.jump(Py.JMP(0), l);
+                c.regs.reset(mark);
+                return;
+            }
             if let Some(k) = c.small_const(rest.at(0)) and let Some(w) = branch_ops(op, true) {
                 let ra = c.operand(a);
                 c.emit(Py.encode.ABC(w, ra as u8, k, 0));
@@ -1682,13 +1690,15 @@ pub fn compile_source(c: *Ctx, src: str, arena: *mem.Arena) -> Result<u32, Compi
     Ok(idx)
 }
 
+pub var NO_SUPERS: bool = false;
+
 /// Verify every prototype not verified yet (from index `from`).
 pub fn verify_from(c: *Ctx, from: u64) -> Result<(), str> {
     vm.NPROTOS = c.protos.len;
     for i in from..c.protos.len {
         let p = c.protos.at(i);
         match Py.verify(p.words, p) {
-            Ok(v) => p.code = v,
+            Ok(v) => p.code = if NO_SUPERS { v } else { Py.optimize(v) },
             Err(e) => {
                 var b = text.StrBuf.new();
                 b.push_str("bytecode failed verification in ");

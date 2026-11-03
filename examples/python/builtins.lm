@@ -953,6 +953,10 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
         }
         T_SET | T_FROZENSET => {
             let s = ops.new_set(c, t == T_FROZENSET);
+            if np > 0 and let List(l) = args[0] {
+                for i in 0..l.len { ops.set_add(c, s, l.arr.items[i])?; }
+                return Ok(s);
+            }
             if np > 0 {
                 let it = ops.getiter(c, args[0])?;
                 while let Some(v) = ops.next(c, it)? { ops.set_add(c, s, v)?; }

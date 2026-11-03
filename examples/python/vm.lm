@@ -646,6 +646,10 @@ pub vm Py {
                 Tuple(t) => { regs[base.raw] = Int(t.items.len as i32); next }
                 Str(s) => { regs[base.raw] = Int(s.data.len as i32); next }
                 Dict(d) => { regs[base.raw] = Int(d.len as i32); next }
+                Obj(o) => if (o.kind == value.K_SET or o.kind == value.K_FROZENSET) and let Some(d) = o.dict {
+                    regs[base.raw] = Int(d.len as i32);
+                    next
+                },
                 _ => {}
             }
         }
@@ -898,6 +902,17 @@ pub vm Py {
             }
         }
     }
+
+    /// `if x is None` / `if x is not None`: skip the JMP when the test holds.
+    op JNNONE(a: reg) : ABC then JMP { branch(a == Nil, then.target) }
+    op JNSOME(a: reg) : ABC then JMP { branch(a != Nil, then.target) }
+
+    // ── superinstructions (from --vm-stats on the benchmarks) ───────
+    super LOADMETHOD_CALLMETHOD = LOADMETHOD; CALLMETHOD;
+    super GETATTR_GETATTR = GETATTR; GETATTR;
+    #[allow(super_overlap)]
+    super GETATTR_GETATTR_MUL = GETATTR; GETATTR; MUL;
+    super MOVE_MOVE_MOVE = MOVE; MOVE; MOVE;
 
     // ── containers ──────────────────────────────────────────────────
 
