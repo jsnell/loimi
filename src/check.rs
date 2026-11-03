@@ -230,6 +230,9 @@ fn is_literal_expr(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) => true,
         ExprKind::Unary(UnOp::Neg, inner) => is_literal_expr(inner),
+        // `16 + 8` in `16 + 8 + n`: arithmetic on literals takes its type
+        // from the other operand too.
+        ExprKind::Binary(op, a, b) if !op.is_cmp() && !matches!(op, BinOp::LAnd | BinOp::LOr) => is_literal_expr(a) && is_literal_expr(b),
         // `Kind.COUNT` types like a literal.
         ExprKind::Field(_, n) => n.name == "COUNT",
         _ => false,
@@ -1422,9 +1425,15 @@ impl<'a> Checker<'a> {
                     stmts.push(TStmt::Defer(e));
                 }
                 Stmt::Let { pat, mutable, ty, init, els, span } => {
-                    let decl_ty = match ty {
-                        Some(t) => Some(self.resolve_type(cx.module, t)?),
-                        None => None,
+                    let decl_ty = match (ty, init) {
+                        // `let a: [T; _] = [x, y, z];`: the length from the literal.
+                        (Some(TypeExpr { kind: TypeKind::Array(inner, n), .. }), Some(Expr { kind: ExprKind::ArrayLit(xs), .. }))
+                            if matches!(&n.kind, ExprKind::Ident(x) if x == "_") =>
+                        {
+                            Some(Ty::Array(Box::new(self.resolve_type(cx.module, inner)?), xs.len() as u64))
+                        }
+                        (Some(t), _) => Some(self.resolve_type(cx.module, t)?),
+                        (None, _) => None,
                     };
                     let init = match init {
                         // `let f = |x: T| ..;`: a local `block fn`, with the
