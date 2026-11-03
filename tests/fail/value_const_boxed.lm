@@ -1,0 +1,4 @@
+// Boxed values have no encoding constants.
+// error: `V` is boxed (a tag word and a payload word): its variants have no encoding constants
+value V repr boxed { Int(i32), Nil }
+fn main() { let w = V.Int.mask; }

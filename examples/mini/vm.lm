@@ -897,7 +897,7 @@ pub vm Mini {
         inline for (opname, want) in [(name, true), (nname, false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
-                if (x | y) < (1 << 32) { branch((isub) == want, then.target) }
+                if ((x | y) & V.Int.mask) == 0 { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }

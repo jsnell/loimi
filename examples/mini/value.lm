@@ -66,10 +66,14 @@ pub object Proto {
 pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal>, co: ?Gc<Coro> }
 pub object Closure { proto: Gc<Proto>, upvals: [Gc<UpVal>] }
 
+/// Eight tagged variants: seven 48-bit blocks and the one word of `Nil`
+/// (`loimi build --explain-values`). The pins keep it so: `Int` shares its
+/// block width with the pointers, so tuple tests such as `(T(t), Int(_))`
+/// merge into one test, and a ninth variant would leave it alone.
 pub value V repr nanbox {
     Num(f64) unboxed,
-    Int(i32),
-    Nil,
+    Int(i32) block 48,
+    Nil block 0,
     Bool(bool),
     S(Gc<Str>),
     T(Gc<Table>),
@@ -88,16 +92,16 @@ pub value V repr nanbox {
 /// an empty slot and 1 a tombstone. Weak: a sweeper turns strings the
 /// collector did not mark into tombstones. Reached through the heap's
 /// `user` pointer.
-pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, stag: u64 }
+pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64 }
 
 const TOMB: u64 = 1;
 const ADDR: u64 = 0xFFFFFFFFFFFF;
 const HTAG: u64 = 0xFFFF000000000000;
 
-/// The Str in slot word `w`. (`stag` holds the tag bits of a `V.S`: a Gc
-/// pointer can only be made from an integer through a value.)
-fn str_at(st: *Strings, w: u64) -> Gc<Str> {
-    let S(o) = ((w & ADDR) | st.stag) as V else { unreachable };
+/// The Str in slot word `w`: its address with the tag bits of a `V.S`
+/// (a Gc pointer can only be made from an integer through a value).
+fn str_at(w: u64) -> Gc<Str> {
+    let S(o) = ((w & ADDR) | V.S.tag) as V else { unreachable };
     o
 }
 
@@ -105,7 +109,6 @@ fn str_at(st: *Strings, w: u64) -> Gc<Str> {
 pub fn init_strings(h: *gc.Heap) {
     let st: *Strings = mem.alloc(1);
     st.cap = 0;
-    st.stag = 0;
     strings_resize(st, 1024);
     h.user = st as *u8;
     h.add_sweeper(st as *u8, sweep_strings);
@@ -124,7 +127,7 @@ fn strings_resize(st: *Strings, cap: u64) {
     for j in 0..n {
         let w = old[j];
         if w > TOMB {
-            var i = str_at(st, w).hash & mask;
+            var i = str_at(w).hash & mask;
             while st.slots[i] != 0 { i = (i + 1) & mask; }
             st.slots[i] = w;
             st.live += 1;
@@ -158,14 +161,13 @@ pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
         let w = slots[i];
         if w == 0 { break; }
         if (w & HTAG) == tag and w != TOMB {
-            let o = str_at(st, w);
+            let o = str_at(w);
             if o.data.len == s.len and mem.memcmp(o.data.ptr, s.ptr, s.len) == 0 { return o; }
         }
         i = (i + 1) & mask;
     }
     let o = new(h, Str { hash: hv }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
-    st.stag = (V.S(o) as u64) & HTAG;
     slots[i] = (o as u64) | tag;
     st.live += 1;
     st.used += 1;
@@ -347,10 +349,11 @@ pub fn int_index(k: V) -> u64 {
     (k as u64) -% (V.Int(1) as u64)
 }
 
-/// Int words xor this are below 2^32 exactly for Ints (the tag cancels
-/// out), and as unsigned numbers they are ordered like the integers
-/// (the payload's sign bit is flipped). So two Ints are tested and
-/// compared without extracting their payloads.
+/// Int words xor this have no bits under `V.Int.mask` exactly for Ints
+/// (the tag cancels out), and as unsigned numbers they are ordered like
+/// the integers (the payload's sign bit is flipped). So two Ints are
+/// tested and compared without extracting their payloads, whatever the
+/// layout gives `Int` (`V.Int.mask` is the layout's).
 pub fn int_bias() -> u64 {
     V.Int(-2147483648) as u64
 }

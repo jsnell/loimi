@@ -26,7 +26,7 @@ pub struct Diag {
 }
 
 /// The warnings the compiler knows, for `#[allow(..)]`.
-pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc", "unreachable_arm"];
+pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc", "unreachable_arm", "value_layout"];
 
 /// Lints that no longer exist, still accepted by `#[allow(..)]` (which
 /// then has no effect) so that code naming them keeps building:

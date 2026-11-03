@@ -126,12 +126,41 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
                 }
             }
         }
-        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0 });
+        // `block N`: the block width, pinned. nanbox: the payload bits
+        // below the tag; lowtag: the bits above the tag (64 - its length).
+        let mut pinned = false;
+        if let Some((n, sp)) = vv.block {
+            if repr == ValueRepr::Boxed || vv.unboxed {
+                return Err(Diag::new(
+                    sp,
+                    "`block` pins a variant's block in a nanbox or lowtag word; boxed values and the `unboxed` variant have none",
+                ));
+            }
+            let max = if repr == ValueRepr::NanBox { 48 } else { 64 - LOW_BITS };
+            let is_ptr = matches!(payload, Some(Ty::Ptr(_) | Ty::Gc(_)));
+            let min = if is_ptr { max } else { tagged.last().unwrap().1 };
+            if n < min || n > max {
+                let what = if is_ptr {
+                    format!("a pointer takes a whole {}-bit block", max)
+                } else {
+                    format!("it can be from its payload's {} bits to {}", min, max)
+                };
+                return Err(Diag::new(sp, format!("`block {}` is out of range for `{}`: {}", n, vv.name.name, what)));
+            }
+            tagged.last_mut().unwrap().1 = n;
+            pinned = true;
+        }
+        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0, pinned });
     }
     let too_many = |i: usize, what: &str| Diag::new(v.variants[i].name.span, format!("no room for variant `{}` in the {}", v.variants[i].name.name, what));
     let mut num_limit = NAN_TAG_BASE << 48;
+    let classic = if repr == ValueRepr::NanBox { 48 } else { 64 - LOW_BITS };
+    // Pinned blocks narrower than the classic ones.
+    let narrow_pins: Vec<usize> = tagged.iter().filter(|&&(i, w)| variants[i].pinned && w < classic).map(|t| t.0).collect();
+    let layout;
     match repr {
-        ValueRepr::NanBox if tagged.len() <= 7 => {
+        ValueRepr::NanBox if tagged.len() <= 7 && narrow_pins.is_empty() => {
+            layout = "classic";
             for (k, &(i, _)) in tagged.iter().enumerate() {
                 variants[i].tag = NAN_TAG_BASE + k as u64;
                 variants[i].shift = 48;
@@ -139,12 +168,17 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         }
         // Eight: the classic layout for seven of them, in declaration
         // order, and the start of the 47-bit block for the narrowest (the
-        // last of that width). So adding an eighth variant keeps every
-        // other variant's 48-bit block: tuple tests that mix pointers with
-        // an i32 still merge into one test (the packed layout would give
-        // an i32 a 32-bit block).
-        ValueRepr::NanBox if tagged.len() == 8 && tagged.iter().any(|t| t.1 <= 47) => {
-            let half = tagged.iter().rev().min_by_key(|t| t.1).unwrap().0;
+        // last of that width), or for the one variant pinned narrower than
+        // 48 bits. So adding an eighth variant keeps every other variant's
+        // 48-bit block: tuple tests that mix pointers with an i32 still
+        // merge into one test (the packed layout would give an i32 a
+        // 32-bit block).
+        ValueRepr::NanBox if tagged.len() == 8 && narrow_pins.len() <= 1 && tagged.iter().any(|t| t.1 <= 47) => {
+            layout = "eight";
+            let half = match narrow_pins.first() {
+                Some(&i) => i,
+                None => tagged.iter().rev().filter(|t| !variants[t.0].pinned).min_by_key(|t| t.1).unwrap().0,
+            };
             let mut k = 0;
             for &(i, w) in &tagged {
                 if i == half {
@@ -159,6 +193,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             num_limit = NAN_HALF_BLOCK;
         }
         ValueRepr::NanBox => {
+            layout = "packed";
             let mut need = tagged.clone();
             need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
             let mut free = vec![(NAN_HALF_BLOCK, 47)];
@@ -174,12 +209,14 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
                 num_limit = num_limit.min(start);
             }
         }
-        ValueRepr::LowTag if tagged.len() <= 1 << LOW_BITS => {
+        ValueRepr::LowTag if tagged.len() <= 1 << LOW_BITS && narrow_pins.is_empty() => {
+            layout = "classic";
             for &(i, _) in &tagged {
                 variants[i].shift = LOW_BITS;
             }
         }
         ValueRepr::LowTag => {
+            layout = "packed";
             // A block is (code, 64 - code length): the words whose low bits
             // are `code`. Its halves extend the code by a 0 or a 1 bit.
             let mut need: Vec<(usize, u32)> = tagged
@@ -199,9 +236,61 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
                 variants[i].shift = 64 - w;
             }
         }
-        _ => {}
+        _ => layout = "boxed",
     }
-    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit })
+    // A layout other than the classic one narrows blocks. Say so, unless
+    // every narrowed block is pinned (`block N`): adding a variant must not
+    // silently change how the others are encoded (examples/mini/
+    // COROUTINES.md, friction 2).
+    if layout == "eight" || layout == "packed" {
+        let narrowed: Vec<usize> =
+            tagged.iter().map(|t| t.0).filter(|&i| !variants[i].pinned && block_bits(repr, &variants[i]) < classic).collect();
+        if let Some(&first) = narrowed.first() {
+            let list: Vec<String> =
+                narrowed.iter().map(|&i| { let b = block_bits(repr, &variants[i]); format!("`{}` {} bit{}", variants[i].name, b, if b == 1 { "" } else { "s" }) }).collect();
+            let vn = &variants[first];
+            let decl = match &vn.payload {
+                Some(t) => format!("{}({})", vn.name, c.ty_name(t)),
+                None => vn.name.clone(),
+            };
+            let w = Diag::warning(
+                "value_layout",
+                v.name.span,
+                format!(
+                    "`{}` has {} tagged variants, more than the classic {} layout holds ({}), so these get blocks narrower than {} bits: {}",
+                    v.name.name,
+                    tagged.len(),
+                    v.repr.name,
+                    if repr == ValueRepr::NanBox { "7, or 8 if one is at most 47 bits wide" } else { "8" },
+                    classic,
+                    list.join(", ")
+                ),
+            )
+            .note(
+                v.variants[first].name.span,
+                format!(
+                    "a tuple pattern mixing a narrow variant with wider ones tests each separately, and code that tests raw words must use the new widths (`{}.{}.mask`); pin each width to make it part of the declaration, `{} block {}` (or `block {}` to keep the classic block), or allow this with `#[allow(value_layout)]`; `loimi build --explain-values` prints the layout",
+                    v.name.name,
+                    vn.name,
+                    decl,
+                    block_bits(repr, vn),
+                    classic
+                ),
+            );
+            c.warnings.push(w);
+        }
+    }
+    Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit, layout })
+}
+
+/// A tagged variant's block width in bits: nanbox, the payload bits below
+/// the tag; lowtag, the bits above it.
+pub fn block_bits(repr: ValueRepr, v: &ValueVariantDef) -> u32 {
+    match repr {
+        ValueRepr::NanBox => v.shift,
+        ValueRepr::LowTag => 64 - v.shift,
+        ValueRepr::Boxed => 64,
+    }
 }
 
 /// `(1 << bits) - 1`, for bits up to 64.
@@ -543,4 +632,137 @@ pub fn try_merged_tuple(g: &mut FnGen, pats: &[TPat], tuple_ty: &Ty, ptr: &str, 
 
 pub fn is_boxed(p: &Program, t: &Ty) -> bool {
     matches!(t, Ty::Value(i) if p.values[*i as usize].repr == ValueRepr::Boxed)
+}
+
+/// `V.X.name`: an encoding constant of variant `idx` (language.md section
+/// 2), with whether it is a u64 (else typed like an integer literal).
+/// `mask`: the bits that identify the variant; `tag`: their value, so a
+/// word `w` holds the variant iff `w & mask == tag`; `block`: the block
+/// width in bits; `limit`: words below it are the `unboxed` variant.
+pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool), String> {
+    let var = &d.variants[idx as usize];
+    let short = d.name.rsplit('.').next().unwrap_or(&d.name);
+    if d.repr == ValueRepr::Boxed {
+        return Err(format!("`{}` is boxed (a tag word and a payload word): its variants have no encoding constants", short));
+    }
+    if var.unboxed {
+        return match name {
+            "limit" => Ok((d.num_limit as i128, true)),
+            _ => Err(format!(
+                "no constant `{}` for the unboxed variant `{}.{}`: it has `limit` (its words are those below it)",
+                name, short, var.name
+            )),
+        };
+    }
+    let (mask, tag) = mask_tag(d, var);
+    match name {
+        "mask" => Ok((mask as i128, true)),
+        "tag" => Ok((tag as i128, true)),
+        "block" => Ok((block_bits(d.repr, var) as i128, false)),
+        _ => Err(format!("no constant `{}` for variant `{}.{}`: it has `mask`, `tag` and `block`", name, short, var.name)),
+    }
+}
+
+/// A tagged variant's (mask, tag): a word `w` holds it iff `w & mask == tag`.
+fn mask_tag(d: &ValueDef, v: &ValueVariantDef) -> (u64, u64) {
+    match d.repr {
+        ValueRepr::NanBox => (!low_mask(v.shift), shl(v.tag, v.shift)),
+        _ => (low_mask(v.shift), v.tag),
+    }
+}
+
+/// `0xFFF8_8000_0000_0000`.
+fn hex(x: u64) -> String {
+    let h = format!("{:016X}", x);
+    format!("0x{}_{}_{}_{}", &h[0..4], &h[4..8], &h[8..12], &h[12..16])
+}
+
+/// `loimi build --explain-values`: each value type's encoding, and which
+/// variants' tests merge in tuple patterns.
+pub fn explain(c: &Checker) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for d in &c.prog.values {
+        let repr = match d.repr {
+            ValueRepr::NanBox => "nanbox",
+            ValueRepr::LowTag => "lowtag",
+            ValueRepr::Boxed => "boxed",
+        };
+        let ntag = d.variants.iter().filter(|v| !v.unboxed).count();
+        let why = match (d.repr, d.layout) {
+            (ValueRepr::NanBox, "classic") => "every tagged variant has a 48-bit block, 0xFFF9.. in declaration order",
+            (ValueRepr::NanBox, "eight") => {
+                "seven tagged variants have 48-bit blocks, 0xFFF9.. in declaration order, and one the start of the 47-bit block 0xFFF8_8000_0000_0000"
+            }
+            (ValueRepr::NanBox, _) => {
+                "more than 8 tagged variants (or 8 with none narrower than 48 bits, or narrow blocks pinned): blocks sized to the payloads (or to `block N`), allocated widest first"
+            }
+            (ValueRepr::LowTag, "classic") => "every variant has a 3-bit tag (the variant's index) below a 61-bit block",
+            (ValueRepr::LowTag, _) => {
+                "more than 8 variants (or narrow blocks pinned): pointers and 61-bit integers have 3-bit tags, narrower variants longer ones"
+            }
+            _ => "a tag word and a payload word",
+        };
+        let _ = writeln!(s, "value {} repr {}: {} layout, {} tagged variant{}", d.name, repr, d.layout, ntag, if ntag == 1 { "" } else { "s" });
+        let _ = writeln!(s, "  {}", why);
+        let decl = |v: &ValueVariantDef| match &v.payload {
+            Some(t) => format!("{}({})", v.name, c.ty_name(t)),
+            None => v.name.clone(),
+        };
+        let width = d.variants.iter().map(|v| decl(v).len()).max().unwrap_or(0);
+        for (i, v) in d.variants.iter().enumerate() {
+            let name = format!("{:w$}", decl(v), w = width);
+            if d.repr == ValueRepr::Boxed {
+                let _ = writeln!(s, "  {}  tag {}", name, i);
+                continue;
+            }
+            if v.unboxed {
+                let _ = writeln!(s, "  {}  unboxed: the words below {} (`limit`)", name, hex(d.num_limit));
+                continue;
+            }
+            let (mask, tag) = mask_tag(d, v);
+            let words = if mask == u64::MAX {
+                format!("the word {}", hex(tag))
+            } else if d.repr == ValueRepr::NanBox {
+                format!("words {} ..= {}", hex(tag), hex(tag | !mask))
+            } else {
+                format!("words whose low {} bits are {:#b}", v.shift, v.tag)
+            };
+            let _ = writeln!(
+                s,
+                "  {}  block {:2}{}  mask {}  tag {}  {}",
+                name,
+                block_bits(d.repr, v),
+                if v.pinned { " (pinned)" } else { "         " },
+                hex(mask),
+                hex(tag),
+                words
+            );
+        }
+        if d.repr == ValueRepr::Boxed {
+            let _ = writeln!(s, "  tuple patterns test each element's tag word separately");
+            continue;
+        }
+        // Tuple patterns: tag tests merge when the masks are equal.
+        let mut groups: Vec<(u32, Vec<&str>)> = Vec::new();
+        for v in d.variants.iter().filter(|v| !v.unboxed) {
+            let b = block_bits(d.repr, v);
+            match groups.iter_mut().find(|g| g.0 == b) {
+                Some(g) => g.1.push(&v.name),
+                None => groups.push((b, vec![&v.name])),
+            }
+        }
+        groups.sort_by_key(|g| std::cmp::Reverse(g.0));
+        let _ = writeln!(s, "  tuple patterns: elements whose variants have the same block width merge into one test, ((a ^ tag) | (b ^ tag') | ..) & mask == 0:");
+        for (b, names) in &groups {
+            let _ = writeln!(s, "    block {:2}: {}", b, names.join(", "));
+        }
+        if let Some(u) = d.variants.iter().find(|v| v.unboxed) {
+            let _ = writeln!(s, "    unboxed:  {}  (umax(a, b, ..) < limit)", u.name);
+        }
+        if groups.len() + d.variants.iter().filter(|v| v.unboxed).count() > 1 {
+            let _ = writeln!(s, "  elements from different lines do not merge (their tags sit at different bits): one test per line, and-ed");
+        }
+    }
+    s
 }

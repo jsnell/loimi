@@ -1,0 +1,4 @@
+// The unboxed variant has only `limit`.
+// error: no constant `mask` for the unboxed variant `V.Num`: it has `limit`
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+fn main() { let w = V.Num.mask; }

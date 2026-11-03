@@ -48,11 +48,13 @@ pub object Bound { recv: Value, method: Gc<Closure> }
 /// A native function.
 pub struct Native { name: str, arity: u32, f: fn(*Value) -> Value }
 
-/// One 64-bit word.
+/// One 64-bit word. Nine tagged variants: the packed layout, where the
+/// narrow variants get narrow blocks, pinned with `block N` so that a new
+/// variant cannot change them silently (`loimi build --explain-values`).
 pub value Value repr nanbox {
     Num(f64) unboxed,
-    Nil,
-    Bool(bool),
+    Nil block 0,
+    Bool(bool) block 1,
     Str(Gc<LStr>),
     Fun(Gc<Closure>),
     Class(Gc<Class>),
@@ -61,7 +63,7 @@ pub value Value repr nanbox {
     /// A captured local's register holds its cell.
     CellV(Gc<Cell>),
     /// A native function: an index into the machine's table.
-    Native(u32),
+    Native(u32) block 32,
 }
 
 /// A compiled function. Prototypes are never freed. Their constants hold

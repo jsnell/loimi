@@ -6,6 +6,7 @@ import std.io;
 
 struct Obj { id: i64 }
 
+#[allow(value_layout)]
 value V repr nanbox {
     Num(f64) unboxed,
     Int(i32),

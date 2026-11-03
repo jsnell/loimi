@@ -1,0 +1,4 @@
+// Boxed values have no blocks to pin.
+// error: `block` pins a variant's block in a nanbox or lowtag word
+value V repr boxed { Int(i32) block 32, Nil }
+fn main() {}

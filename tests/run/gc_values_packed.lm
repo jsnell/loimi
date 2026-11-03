@@ -7,6 +7,7 @@ import std.mem;
 object Node { value: i64, next: V }
 object Str { data: [u8] }
 
+#[allow(value_layout)]
 value V repr nanbox {
     Num(f64) unboxed,
     Int(i48),

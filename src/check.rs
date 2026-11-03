@@ -375,6 +375,7 @@ impl<'a> Checker<'a> {
                             repr: ValueRepr::NanBox,
                             variants: vec![],
                             num_limit: 0,
+                            layout: "",
                         });
                         self.define(m, &v.name, Def::Value(id), v.is_pub)?;
                     }
@@ -2856,7 +2857,17 @@ impl<'a> Checker<'a> {
             }
             return Err(Diag::new(name.span, format!("no variant or function `{}` in `{}`", name.name, self.ty_name(&t))));
         }
-        let _ = exp;
+        // `V.Int.mask`, `V.Int.tag`, `V.Int.block`, `V.Num.limit`: the
+        // encoding of a value variant, as constants.
+        if let ExprKind::Field(tb, vn) = &base.kind {
+            if let Some(t @ Ty::Value(vi)) = self.type_path(cx, tb) {
+                if let Some(idx) = self.variant_index(&t, &vn.name) {
+                    let (v, is_u64) = crate::values::variant_const(&self.prog.values[vi as usize], idx, &name.name)
+                        .map_err(|m| Diag::new(name.span, m))?;
+                    return if is_u64 { Ok(mk(Ty::Int(IntTy { signed: false, bits: 64 }), TK::Int(v), span)) } else { self.int_lit(v, exp, span) };
+                }
+            }
+        }
         let b = self.expr(cx, base, None)?;
         self.field_of(b, name, span)
     }

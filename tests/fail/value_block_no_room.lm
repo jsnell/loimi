@@ -1,0 +1,9 @@
+// Pins must fit: eight 48-bit blocks do not.
+// error: no room for variant
+struct Obj { id: i64 }
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32) block 48, Ch(u32) block 48,
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj), F(*Obj),
+}
+fn main() {}

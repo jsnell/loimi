@@ -757,8 +757,9 @@ Available representations:
 | `boxed` | Two words `{tag, payload}`, passed and returned in two registers | PUC Lua (`TValue`) |
 | `pointer` | **Not built:** everything is a `Gc<_>` with a header type tag | CPython |
 
-The compiler chooses tag assignments, or you can pin them
-(`Int(i32) = tag 0b001`; **Not built:** pinning). In return you get:
+The compiler chooses tag assignments. You can pin a variant's block
+width (`Int(i32) block 48`, below; **Not built:** pinning the tag
+itself, `Int(i32) = tag 0b001`). In return you get:
 
 - **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`, and
   `if v is Nil` (**Not built:** `is`; write `if let Nil = v`). No macros.
@@ -786,7 +787,7 @@ payloads are as wide as their type says, so `Int(i48)` keeps 48 bits and
 
 | `repr` | Payloads | Tagged variants |
 |---|---|---|
-| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word). |
+| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word; `block N` sets the size). |
 | `lowtag` | integers up to 61 bits (`i61`), `bool`, pointers (8-byte aligned) | Up to 8 with any payloads. Beyond 8, pointers and 61-bit integers take one 3-bit tag each, and a variant with an N-bit payload can have a tag of up to 64 - N bits, so narrow variants share what is left. |
 | `boxed` | any number, `bool`, pointers | any number |
 
@@ -802,6 +803,65 @@ compare (`(v >> w) == tag` in a nanbox, `(v & mask) == tag` in a lowtag,
 unsigned compare, and tuple patterns whose elements have tags in the same
 position merge into one test. Extracting a pointer is one `and`. See
 [lowering.md](lowering.md) section 2 for the encodings.
+
+**Seeing and pinning the layout.** Whether two variants' tests merge,
+and what a raw word looks like, depends on the layout, and the layout
+depends on how many variants there are. So adding a variant can change
+the encoding of the others: Mini's ninth variant moved `Int(i32)` from a
+48-bit block to a 32-bit one, which split its tuple tests in two and
+broke a fast path that tested raw words
+(examples/mini/COROUTINES.md, friction 2). Four things keep that from
+happening silently:
+
+- **`loimi build --explain-values`** prints every value type's layout
+  and stops: each variant's block width, mask, tag and words, and which
+  variants' tests merge in a tuple pattern (those with the same block
+  width) and which do not.
+- **`block N`** after a variant pins its block width: the payload bits
+  below the tag in a nanbox (from the payload's width to 48; pointers
+  take 48), the bits above the tag in a lowtag (to 61; pointers take
+  61). The layout honours it or the declaration is an error ("no room
+  for variant"). Pinning `Int(i32) block 48` keeps Int's tests merging
+  with the pointers' however many variants follow; pinning a variant
+  narrower than the classic width selects the packed layout.
+- **The `value_layout` warning.** When a declaration has too many
+  variants for the classic layout, every variant whose block is
+  narrower than the classic 48 bits (61 in a lowtag) must be pinned at
+  its width, or the compiler warns, naming them. So a new variant that
+  narrows others is a warning, and an error under `-W error`; pin the
+  widths to accept them (`Nil block 0`), or `#[allow(value_layout)]`.
+- **Encoding constants**, for code that tests raw words:
+  `V.Int.mask` (the bits that identify the variant), `V.Int.tag` (their
+  value: a word `w` holds `Int` exactly when `w & V.Int.mask ==
+  V.Int.tag`), `V.Int.block` (the block width), and `V.Num.limit` for
+  the `unboxed` variant (its words are those below it). They are
+  constants, so tests built from them cost what hand-written ones do,
+  and they follow the layout.
+
+<!-- snippet: run "both ints" -->
+```loimi
+import std.io;
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32) block 48,      // the classic block, whatever comes later
+    Nil block 0,            // one word, in the 47-bit block
+    Bool(bool),
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj),
+}
+
+// Two Ints, tested and ordered without extracting the payloads: the
+// biased words have no bits under the mask exactly for Ints.
+fn both_ints(a: V, b: V) -> bool {
+    let bias = V.Int(-2147483648) as u64;
+    (((a as u64 ^ bias) | (b as u64 ^ bias)) & V.Int.mask) == 0
+}
+
+fn main() {
+    if both_ints(V.Int(1), V.Int(-2)) and !both_ints(V.Int(1), V.Nil) { io.println("both ints"); }
+}
+```
 
 Switching `repr` is a one-word change, which makes the representation
 something you can benchmark rather than something you commit to on day one.

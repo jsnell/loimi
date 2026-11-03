@@ -482,7 +482,17 @@ impl Parser {
                 None
             };
             let unboxed = self.eat_kw("unboxed");
-            variants.push(ValueVariant { name: vn, payload, unboxed });
+            let block = if self.is_kw("block") {
+                let sp = self.bump().span;
+                let t = self.bump();
+                let Tok::Int(n) = t.tok else {
+                    return Err(Diag::new(t.span, "`block` takes the block width in bits: `Int(i32) block 48`"));
+                };
+                Some((n.min(1 << 16) as u32, sp.to(t.span)))
+            } else {
+                None
+            };
+            variants.push(ValueVariant { name: vn, payload, unboxed, block });
             if !self.eat(",") {
                 break;
             }
