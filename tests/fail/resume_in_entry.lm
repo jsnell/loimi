@@ -1,0 +1,10 @@
+// `next_resume` exists only where `next` does: an entry has no next
+// instruction.
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry run(code: Verified<V>, out: *?V.Resume) -> i64 { *out = Some(next_resume); jump code }
+}
+fn main() {}
+// error: `next_resume` (where `next` continues, as a resume point) is only available where `next` is

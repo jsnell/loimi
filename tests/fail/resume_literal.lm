@@ -1,0 +1,16 @@
+// A V.Resume comes only from vm code (`next_resume`) or a proof
+// (`resume_at`): its field is private to the vm's generated code, so a
+// struct literal cannot forge one from a raw pointer.
+#[require_verified]
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry resume(r: V.Resume) -> i64 { jump r }
+}
+fn main() {
+    var code: [u32; 2] = [0; 2];
+    let r = V__Resume { __pc: &code[1] };
+    V.resume(r);
+}
+// error: field `__pc` of `V.Resume` is private to the file that declares it

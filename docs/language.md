@@ -1348,7 +1348,9 @@ Rules for `-> never` vm functions:
   nothing would catch it. `next_pc` is available where `next` is (op
   handlers, and `-> never` vm functions reached from them; a shared copy
   gets the size from its caller, like `next`). It is an ordinary name:
-  a local or state variable called `next_pc` hides it.
+  a local or state variable called `next_pc` hides it. `next_resume`
+  is the same address as a `Vm.Resume`, a resume point that an entry
+  may jump to (section 6).
 - The body sees the vm state and its own parameters, but not the caller's
   operands: pass `dst.raw` or values as arguments. `become` is not
   allowed, since it belongs to the calling op, and neither is `cache`;
@@ -1788,6 +1790,74 @@ are made structural by the data: a prototype whose code is verified
 (a `Verified<Mini>` field, or a verified array, below) has no raw code
 to jump to, so `jump p.code` in CALL reaches only verified functions.
 Mini, Scheme and MiniJS do this.
+
+**Resume points.** An entry may also continue in the middle of verified
+code, where an earlier run left it: after a coroutine's yield, say.
+`Mini.Resume` is the proof for that: an instruction boundary of
+verified code, and `jump r` with `r: Mini.Resume` is allowed in an
+entry under `#[require_verified]`. There are two ways to get one:
+
+- **`next_resume`**, in vm code: `next_pc` (the address `next` continues
+  at, section 3.5) as a `Mini.Resume`, available where `next` is (op
+  handlers and the `-> never` vm functions they call, also as shared
+  copies). The running code is verified and the next instruction
+  exists: the verifier rejects code whose last instruction mentions
+  `next_pc` or `next_resume`, as it rejects one that uses `next`.
+- **`v.resume_at(i) -> ?Mini.Resume`**, on a `Verified<Mini>`: the
+  instruction starting at word `i`, or None if no instruction starts
+  there. It walks the code from its start, so it costs a pass over the
+  words before `i` (for host code such as a debugger, not a hot path).
+
+`r.pc()` reads the address. `unsafe { Mini.assume_resume(p) }` makes
+one from a raw pointer, like `assume_verified`.
+
+<!-- snippet: excerpt examples/mini/vm.lm -->
+```loimi
+fn yield_exit(base: u64, nres: u64) -> never {
+    ctx.nret = NRET_ONE;
+    ctx.ypc = Some(next_resume);
+    ctx.ydst = base as u32;
+    ctx.ynres = nres as u32;
+    ctx.fp = fp;
+    exit Ok(Nil)
+}
+```
+
+and the entry that continues the coroutine:
+
+<!-- snippet: excerpt examples/mini/vm.lm -->
+```loimi
+let Some(at) = c.ypc else { fail V.Nil };
+jump at
+```
+
+What is checked, and when:
+
+- *At compile time:* only `next_resume`, `resume_at` and the `#[unsafe]`
+  `assume_resume` build a `Mini.Resume`. Its field is private to the
+  vm's generated code, so a struct literal cannot forge one, and `..zero`
+  cannot make a null one; use `?Mini.Resume` for a slot that starts
+  empty. The type is per vm: another vm's entry cannot jump to it.
+- *At verification time:* that code cannot end with an instruction that
+  saves its successor (so `next_resume` always names an instruction).
+- *At run time:* `resume_at` checks the boundary; nothing else is.
+
+What is not checked is the same as for return addresses (`jump
+fp.resume`) and for a `Verified<Mini>` kept outside its object: that
+the code is still there when the point is used, and that the state the
+entry installs (registers, constants, frame) belongs to that code. A
+resume point is an address, not a reference: it does not keep a code
+object alive, so the vm keeps the code reachable while it holds one
+(Mini's suspended coroutine keeps its frames, whose closures hold the
+prototypes). Rewriting verified code in place (`become`, `optimize`,
+`deopt`) keeps every boundary a boundary, so a resume point survives
+quickening. As with `Verified`, the proof is about the type: raw
+pointer casts, which Loimi allows without `unsafe`, can still forge
+anything.
+
+The types and functions are generated only for programs that mention
+them (`next_resume`, `Resume`, `resume_at` or `assume_resume`), so other
+programs compile exactly as before.
 
 **Verified code in an object.** An `object` can hold its code as its
 trailing array, marked as verified by a vm:
@@ -2530,7 +2600,11 @@ calls are implemented as nested entries (below).
   state saved, and resuming re-enters through an entry that restores it.
   Suspending across a host frame is an error (as with Lua's "yield across a
   C-call boundary") unless the coroutine runs on a `std.rt.Fiber`, which has
-  its own stack.
+  its own stack. *Built today:* Mini's coroutines (examples/mini/COROUTINES.md)
+  do this by hand with nested entries. The yield saves `next_resume` and
+  leaves the run with `exit`; the resume is an entry that reinstalls the
+  coroutine's frame and jumps to that resume point (section 6), which
+  `#[require_verified]` accepts.
 
 ### 10.1 Embedding in a C host (implemented)
 

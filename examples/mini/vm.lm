@@ -57,9 +57,11 @@ pub struct Ctx {
     rbuf: *V,
     rcap: u64,
     /// Set when a CALL of coroutine.yield left the run, with where to
-    /// continue (`ypc`) and where the CALL's `ynres` results go (`ydst`).
+    /// continue (`ypc`, the instruction after the CALL: a resume point
+    /// that `Mini.resume` may jump to) and where the CALL's `ynres`
+    /// results go (`ydst`).
     yielded: bool,
-    ypc: *u32,
+    ypc: ?Mini.Resume,
     ydst: u32,
     ynres: u32,
     /// The values that coroutine.yield passed, or that the return that
@@ -1072,6 +1074,7 @@ pub vm Mini {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
+                if ctx.yielded { yield_exit(base as u64, nres as u64) }
                 native_results(base as u64, nres as u64, v)
             }
         }
@@ -1079,14 +1082,14 @@ pub vm Mini {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
+                if ctx.yielded { yield_exit(base as u64, nres as u64) }
                 native_results(base as u64, nres as u64, v)
             }
         }
         cold { raise error(ctx, "attempt to call a ", f) }
     }
     /// After a native returned `v` to CALL: store its results in
-    /// R[base .. base+nres-1], or, after coroutine.yield, leave the run
-    /// (`coro.resume` picks up the state).
+    /// R[base .. base+nres-1].
     fn native_results(base: u64, nres: u64, v: V) -> never {
         let m = ctx.nret;
         if m == NRET_ONE {
@@ -1099,17 +1102,22 @@ pub vm Mini {
             next
         }
         ctx.nret = NRET_ONE;
-        if ctx.yielded {
-            ctx.ypc = pc + 1;
-            ctx.ydst = base as u32;
-            ctx.ynres = nres as u32;
-            ctx.fp = fp;
-            exit Ok(Nil)
-        }
         for i in 0..nres {
             regs[base + i] = if i < m { ctx.rbuf[i] } else { Nil };
         }
         next
+    }
+    /// After a CALL of coroutine.yield: leave the run (`coro.resume` picks
+    /// up the state), saving where the CALL's `nres` results go and where
+    /// to continue: the next instruction, as a resume point, which
+    /// `Mini.resume` may jump to.
+    fn yield_exit(base: u64, nres: u64) -> never {
+        ctx.nret = NRET_ONE;
+        ctx.ypc = Some(next_resume);
+        ctx.ydst = base as u32;
+        ctx.ynres = nres as u32;
+        ctx.fp = fp;
+        exit Ok(Nil)
     }
     /// Return one value.
     op RET1(src: reg) : ABC {
@@ -1261,9 +1269,11 @@ pub vm Mini {
         k = fp.k;
         let dst = regs + c.ydst as u64;
         for i in 0..c.ynres as u64 { dst[i] = if i < n { vals[i] } else { V.Nil }; }
-        // A return address a verified CALL saved (as `fp.resume`), which
-        // the entry cannot prove: see COROUTINES.md.
-        unsafe { jump c.ypc }
+        // The instruction after the yield's CALL: a resume point, which
+        // only vm code makes (`next_resume`), so `#[require_verified]`
+        // lets the entry jump to it.
+        let Some(at) = c.ypc else { fail V.Nil };
+        jump at
     }
 
     on raise(e: V) {

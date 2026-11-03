@@ -52,7 +52,7 @@ pub object Coro {
     fp: *Frame,
     open: ?Gc<UpVal>,
     open_level: *V,
-    ypc: *u32,
+    ypc: ?Mini.Resume,
     ydst: u32,
     ynres: u32,
     /// The error that killed it, until coroutine.close reports it.

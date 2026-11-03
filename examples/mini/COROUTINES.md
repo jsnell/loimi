@@ -37,9 +37,10 @@ and `open_level` describe.
   error outside a coroutine. It is also an error unless it was called
   directly by a CALL instruction of the coroutine's own run, which is
   `ctx.base == ctx.frames`, with no nested run in between. Otherwise it
-  records the values and sets `ctx.yielded`. CALL's native path, the vm
-  function `native_results`, then sees the flag. It saves `pc + 1`, the
-  CALL's base register and its result count, and leaves the run with
+  records the values and sets `ctx.yielded`. CALL's native path then
+  sees the flag and calls the vm function `yield_exit`. That saves the
+  next instruction as a resume point (`next_resume`, a `Mini.Resume`),
+  the CALL's base register and its result count, and leaves the run with
   `exit`. The resumer's `Mini.call`/`Mini.resume` returns, and `resume`
   stores the coroutine's `fp`, open upvalues and continuation in the
   `Coro`.
@@ -258,7 +259,29 @@ interpreter.
      at the first scan if the slot happens to hold a stack address;
      verify mode does not check roots.
 2. **Adding a value variant silently changed the encoding of the others,
-   and broke a fast path.**
+   and broke a fast path.** *Resolved* (2026-11-03; language.md §2,
+   "Seeing and pinning the layout"):
+   - `loimi build --explain-values` prints each value type's layout:
+     every variant's block width, mask, tag and words, and which
+     variants' tuple tests merge (same block width) and which do not.
+   - `block N` pins a variant's block width. `V` now declares `Int(i32)
+     block 48` and `Nil block 0`, the layout it already had: Int keeps
+     its 48-bit block (and its merged tests with the pointers) however
+     many variants are added.
+   - The `value_layout` warning names every unpinned variant that a
+     non-classic layout narrows, so adding a variant that changes the
+     others' encoding is a warning, and an error under `-W error`, which
+     the test suite builds Mini with. Lox and MiniJS, which already had
+     packed layouts, pin their narrow variants at their current widths.
+   - `V.Int.mask`, `V.Int.tag`, `V.Int.block` and `V.Num.limit` are the
+     encoding as constants. The compare-and-branch fast path now tests
+     `((x | y) & V.Int.mask) == 0` instead of a hand-written `< 2^32`
+     (same instructions, the shift count follows the layout: `shr $48`
+     instead of `shr $32`), and the string table makes a `V.S` from
+     `V.S.tag` instead of a tag word it computed at run time (`stag`).
+     No other example tests raw value words.
+
+   As it was:
    - **What happened:** Mini's `V` had exactly 7 tagged variants. Adding
      `Co` and `Wrap` made 9, which switched the nanbox from the classic
      layout to the packed one. There, `Int(i32)` gets a 32-bit block
@@ -289,7 +312,27 @@ interpreter.
        hard-code 48.
      - A note when a declaration crosses from the classic to the packed
        layout.
-3. **Entries cannot resume at a saved pc.**
+3. **Entries cannot resume at a saved pc.** *Resolved* (2026-11-03;
+   language.md §6, "Resume points"): `Mini.Resume` is a proof that an
+   address is an instruction boundary of verified code. Vm code makes
+   one with `next_resume` (the address `next` continues at), a host with
+   `v.resume_at(i)` on a `Verified<Mini>` (checked at run time), and
+   an entry may `jump` to one under `#[require_verified]`. The yield
+   path (`yield_exit`, called from CALL's native and wrap paths) saves
+   `ctx.ypc = Some(next_resume)`, and `Mini.resume` does `jump at`, with
+   no `unsafe`. Its field is private to the vm's generated code, so it
+   cannot be built from a raw pointer outside `unsafe`, and the verifier
+   rejects code ending in an instruction that saves its successor (an
+   existing hole for `next_pc` found on the way: ops that save `next_pc`
+   without naming `pc` were not counted as continuing). Like a return
+   address, a resume point does not keep its code alive: the suspended
+   coroutine's frames do. The yield code moved out of `native_results`
+   into `yield_exit`, so that the native-call path compiles as before
+   (with the yield inside, LLVM stopped inlining the shared copy of
+   `native_results`); CALL's hot path is unchanged but for one field
+   offset (`ypc` is now a 16-byte `?Mini.Resume`).
+
+   As it was:
    - **Error:** `Mini.resume` needs `jump c.ypc` to continue after the
      yield's CALL, which fails with: "`Mini` is `#[require_verified]`:
      an entry starts only in verified code, `jump v` with `v:
@@ -413,8 +456,8 @@ running in a loop needed small wrapper scripts.
   raise` exiting a run with `Err`) is exactly the substrate that
   "coroutines without stack switching" need. `Mini.call` was reused
   unchanged as the start of a coroutine.
-- **Control words in a `-> never` vm function.** `exit` and `next` inside
-  `native_results`, called from a `cold` block, made the
+- **Control words in a `-> never` vm function.** `exit` and `next_resume`
+  inside `yield_exit`, called from a `cold` block, made the
   yield-leaves-the-run path a few lines. `redo` after growing the stacks
   re-executes CALL with the new `regs`.
 - **`sync` and `reload` keep handlers correct across thread switches with

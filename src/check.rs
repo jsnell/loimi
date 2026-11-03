@@ -893,6 +893,7 @@ impl<'a> Checker<'a> {
                 match n.split_once("__") {
                     Some((vm, "Verified")) => format!("Verified<{}>", vm),
                     Some((vm, "VerifyError")) => format!("{}.VerifyError", vm),
+                    Some((vm, "Resume")) => format!("{}.Resume", vm),
                     _ => n,
                 }
             }

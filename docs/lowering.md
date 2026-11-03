@@ -880,6 +880,22 @@ private to the vm's expansion file, `#[unsafe]` functions need an
 `unsafe { }` block, and `#[require_verified]` is checked on each
 entry's `jump` (vmcheck).
 
+`Vm.Resume` (resume points) is `Vm__Resume { __pc: *W }`, one pointer.
+`next_resume` is `next_pc` wrapped in it (`pc` plus the op's size, or
+plus the size argument in a vm function's shared copy), and `jump r`
+lowers to the field, as a raw `jump`. So Mini's resume entry
+(`jump at` with `at: Mini.Resume`) is the same code as the
+`unsafe { jump c.ypc }` it replaced, after a test of the `?Mini.Resume`
+it is kept in. `v.resume_at(i)` is a generated loop that steps through
+the code by `Vm.base_size` (superinstruction parts are instructions)
+until it reaches or passes `i`. The verifier's "may continue" scan (the
+code cannot end with such an instruction) counts `next_pc` and
+`next_resume` as reads of `pc`. Before resume points it missed
+`next_pc`, so code that ended with a call op saving `next_pc` (Lox's
+calls) passed verification. The `Vm__Resume` items are generated only
+when some source file names them, so other programs' IR does not
+change.
+
 Where the proof is stored is the interpreter's choice, and that can
 cost. A `Verified` field in the prototype is a `{ ptr, len }` that
 CALL loads (one more dependent load per call than a trailing array,
