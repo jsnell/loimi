@@ -365,12 +365,14 @@ fn C.count(c: *C, t0: Term, chunk: u32) {
 }
 
 fn occurs(t0: Term, v: Term) -> bool {
-    let t = deref(t0);
-    if t == v { return true; }
-    match t {
-        Str(s) => { for i in 0..s.args.len { if occurs(s.args[i], v) { return true; } } false }
-        Lst(l) => occurs(l.head, v) or occurs(l.tail, v),
-        _ => false,
+    var t = deref(t0);
+    loop {
+        if t == v { return true; }
+        match t {
+            Str(s) => { for i in 0..s.args.len { if occurs(s.args[i], v) { return true; } } return false; }
+            Lst(l) => { if occurs(l.head, v) { return true; } t = deref(l.tail); }
+            _ => return false,
+        }
     }
 }
 
@@ -440,57 +442,62 @@ fn C.get_arg(c: *C, t0: Term, a: u8) {
 }
 
 /// The unify instructions for the arguments of compound `t`; nested
-/// compounds go to temporaries and are matched after it.
-fn C.unify_args(c: *C, t: Term) {
-    let n = match t { Str(s) => s.args.len, _ => 2 };
-    var pending: mem.Vec<(u32, Term)> = mem.Vec.new();
-    var voids: u64 = 0;
-    for i in 0..n {
-        let a = deref(term.arg_of(t, i));
-        if let Ref(_) = a {
-            let vi = c.info(a);
-            if vi.occ == 1 and !vi.level { voids += 1; continue; }
-        }
-        if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); voids = 0; }
-        match a {
-            Ref(_) => {
+/// compounds go to temporaries and are matched after it, breadth first
+/// (a worklist, so a long list in a head does not recurse).
+fn C.unify_args(c: *C, t0: Term) {
+    var work: mem.Vec<(u32, Term)> = mem.Vec.new();
+    var wi: u64 = 0;
+    var t = t0;
+    loop {
+        let n = match t { Str(s) => s.args.len, _ => 2 };
+        var voids: u64 = 0;
+        for i in 0..n {
+            let a = deref(term.arg_of(t, i));
+            if let Ref(_) = a {
                 let vi = c.info(a);
-                if !vi.seen {
-                    vi.seen = true;
-                    if vi.perm { c.emit(Wam.UNIFY_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.UNIFY_VAR_X(vi.reg as u8)); }
-                } else if vi.perm {
-                    c.emit(Wam.UNIFY_VAL_Y(vi.reg as u8));
-                } else {
-                    c.emit(Wam.UNIFY_VAL_X(vi.reg as u8));
+                if vi.occ == 1 and !vi.level { voids += 1; continue; }
+            }
+            if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); voids = 0; }
+            match a {
+                Ref(_) => {
+                    let vi = c.info(a);
+                    if !vi.seen {
+                        vi.seen = true;
+                        if vi.perm { c.emit(Wam.UNIFY_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.UNIFY_VAR_X(vi.reg as u8)); }
+                    } else if vi.perm {
+                        c.emit(Wam.UNIFY_VAL_Y(vi.reg as u8));
+                    } else {
+                        c.emit(Wam.UNIFY_VAL_X(vi.reg as u8));
+                    }
+                }
+                Atom(x) => c.emit(Wam.UNIFY_ATOM(x)),
+                Int(v) => {
+                    if small24(v as i64) { c.emit(Wam.UNIFY_INT(v as i32)); }
+                    else { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+                }
+                Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+                _ => {
+                    let r = c.temp();
+                    c.emit(Wam.UNIFY_VAR_X(r as u8));
+                    work.push((r, a));
                 }
             }
-            Atom(x) => c.emit(Wam.UNIFY_ATOM(x)),
-            Int(v) => {
-                if small24(v as i64) { c.emit(Wam.UNIFY_INT(v as i32)); }
-                else { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
-            }
-            Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
-            _ => {
-                let r = c.temp();
-                c.emit(Wam.UNIFY_VAR_X(r as u8));
-                pending.push((r, a));
-            }
         }
-    }
-    if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); }
-    for i in 0..pending.len {
-        let (r, a) = pending.ptr[i];
+        if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); }
+        if wi == work.len { break; }
+        let (r, a) = work.ptr[wi];
+        wi += 1;
         c.release(r);
         match a {
             Str(s) => {
-                if s.f >= 65536 { c.error = Some("too many functors"); return; }
+                if s.f >= 65536 { c.error = Some("too many functors"); break; }
                 c.emit(Wam.GET_STRUCT(r as u8, s.f as u16));
             }
             _ => c.emit(Wam.GET_LIST(r as u8)),
         }
-        c.unify_args(a);
+        t = a;
     }
-    pending.free();
+    work.free();
 }
 
 // Body ------------------------------------------------------------------
@@ -523,24 +530,73 @@ fn C.put_arg(c: *C, t0: Term, a: u8) {
     }
 }
 
-/// Build compound `t` into register `target`, inner compounds first.
+fn is_compound(t: Term) -> bool { match t { Str(_) => true, Lst(_) => true, _ => false } }
+
+/// One argument of a structure being built: a variable or a constant
+/// (compound arguments are built into a register first).
+fn C.set_simple(c: *C, a: Term) {
+    match a {
+        Ref(_) => {
+            let vi = c.info(a);
+            if vi.occ == 1 and !vi.level { c.emit(Wam.SET_VOID(1)); return; }
+            if !vi.seen {
+                vi.seen = true;
+                if vi.perm { c.emit(Wam.SET_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.SET_VAR_X(vi.reg as u8)); }
+            } else if vi.perm {
+                c.emit(Wam.SET_VAL_Y(vi.reg as u8));
+            } else {
+                c.emit(Wam.SET_VAL_X(vi.reg as u8));
+            }
+        }
+        Atom(x) => c.emit(Wam.SET_ATOM(x)),
+        Int(v) => {
+            if small24(v as i64) { c.emit(Wam.SET_INT(v as i32)); }
+            else { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
+        }
+        Flt(_) => { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
+        _ => {}
+    }
+}
+
+/// Build compound `t` into register `target`, inner compounds first. A
+/// list is built from its last cell back, so its length costs neither
+/// registers nor recursion.
 fn C.build(c: *C, t: Term, target: u8) {
+    if let Lst(_) = t {
+        var heads: mem.Vec<Term> = mem.Vec.new();
+        var cur = t;
+        while let Lst(x) = cur { heads.push(deref(x.head)); cur = deref(x.tail); }
+        var treg: u32 = 0;
+        var tail_in_reg = false;
+        if is_compound(cur) { treg = c.temp(); c.build(cur, treg as u8); tail_in_reg = true; }
+        var k = heads.len;
+        while k > 0 {
+            k -= 1;
+            let h = heads.ptr[k];
+            var hreg: u32 = 0;
+            if is_compound(h) { hreg = c.temp(); c.build(h, hreg as u8); }
+            let tgt: u32 = if k == 0 { target as u32 } else { c.temp() };
+            c.emit(Wam.PUT_LIST(tgt as u8));
+            if is_compound(h) { c.emit(Wam.SET_VAL_X(hreg as u8)); c.release(hreg); } else { c.set_simple(h); }
+            if tail_in_reg { c.emit(Wam.SET_VAL_X(treg as u8)); c.release(treg); } else { c.set_simple(cur); }
+            treg = tgt;
+            tail_in_reg = true;
+        }
+        heads.free();
+        return;
+    }
     let n = match t { Str(s) => s.args.len, _ => 2 };
     var tmps: mem.Vec<u32> = mem.Vec.new();
     for i in 0..n {
         let a = deref(term.arg_of(t, i));
-        match a {
-            Str(_) => { let r = c.temp(); c.build(a, r as u8); tmps.push(r); }
-            Lst(_) => { let r = c.temp(); c.build(a, r as u8); tmps.push(r); }
-            _ => tmps.push(0),
-        }
+        if is_compound(a) { let r = c.temp(); c.build(a, r as u8); tmps.push(r); } else { tmps.push(0); }
     }
     match t {
         Str(s) => {
             if s.f >= 65536 { c.error = Some("too many functors"); return; }
             c.emit(Wam.PUT_STRUCT(target, s.f as u16));
         }
-        _ => c.emit(Wam.PUT_LIST(target)),
+        _ => {}
     }
     var voids: u64 = 0;
     for i in 0..n {
@@ -550,29 +606,12 @@ fn C.build(c: *C, t: Term, target: u8) {
             if vi.occ == 1 and !vi.level { voids += 1; continue; }
         }
         if voids > 0 { c.emit(Wam.SET_VOID(voids as u32)); voids = 0; }
-        match a {
-            Ref(_) => {
-                let vi = c.info(a);
-                if !vi.seen {
-                    vi.seen = true;
-                    if vi.perm { c.emit(Wam.SET_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.SET_VAR_X(vi.reg as u8)); }
-                } else if vi.perm {
-                    c.emit(Wam.SET_VAL_Y(vi.reg as u8));
-                } else {
-                    c.emit(Wam.SET_VAL_X(vi.reg as u8));
-                }
-            }
-            Atom(x) => c.emit(Wam.SET_ATOM(x)),
-            Int(v) => {
-                if small24(v as i64) { c.emit(Wam.SET_INT(v as i32)); }
-                else { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
-            }
-            Flt(_) => { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
-            _ => {
-                let r = tmps.ptr[i];
-                c.emit(Wam.SET_VAL_X(r as u8));
-                c.release(r);
-            }
+        if is_compound(a) {
+            let r = tmps.ptr[i];
+            c.emit(Wam.SET_VAL_X(r as u8));
+            c.release(r);
+        } else {
+            c.set_simple(a);
         }
     }
     if voids > 0 { c.emit(Wam.SET_VOID(voids as u32)); }
@@ -940,6 +979,25 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     Some(cl)
 }
 
+/// `g` with each compound argument of its basic goals replaced by a fresh
+/// variable (recorded with the argument in `fresh`).
+fn abstract_goal(m: *Machine, t0: Term, fresh: *mem.Vec<(Term, Term)>) -> Term {
+    let t = deref(t0);
+    if let Str(s) = t {
+        let n = s.args.len;
+        let r = m.mk_struct(s.f, n);
+        let ctl = is_control(m, t);
+        for i in 0..n {
+            let a = deref(s.args[i]);
+            if ctl { r.args[i] = abstract_goal(m, a, fresh); }
+            else if is_compound(a) and fresh.len < 200 { let v = m.new_var(); fresh.push((v, a)); r.args[i] = v; }
+            else { r.args[i] = a; }
+        }
+        return Term.Str(r);
+    }
+    t
+}
+
 /// call/N: build the goal from A1 and the N-1 extra arguments, load its
 /// arguments and return the code to run. Control constructs compile to a
 /// temporary clause (cut inside is local to the call).
@@ -960,10 +1018,15 @@ pub fn prepare_call(m: *Machine, n: u64) -> Result<*u32, Term> {
         g = Term.Str(s);
     }
     if is_control(m, g) {
+        // Compound arguments of the goals inside become head arguments,
+        // so the clause does not rebuild (or contain) the data.
+        var fresh: mem.Vec<(Term, Term)> = mem.Vec.new();
+        let body = abstract_goal(m, g, &fresh);
         var vars: mem.Vec<Term> = mem.Vec.new();
         var seen: HashMap<u64, bool> = HashMap.new();
-        machine.term_vars(g, &vars, &seen);
+        machine.term_vars(body, &vars, &seen);
         seen.free();
+        if vars.len >= machine.NREGS - 8 { fresh.free(); vars.free(); return Err(builtins.resource_error(m, "goal_variables")); }
         let name = m.db.atom("$call");
         let f = m.db.functor(name, vars.len as u32);
         let head = if vars.len == 0 { Term.Atom(name) } else {
@@ -971,8 +1034,13 @@ pub fn prepare_call(m: *Machine, n: u64) -> Result<*u32, Term> {
             for i in 0..vars.len { s.args[i] = vars.ptr[i]; }
             Term.Str(s)
         };
-        let Some(cl) = compile_clause(m, head, g, None) else { vars.free(); return Err(builtins.type_error(m, "callable", g)); };
-        for i in 0..vars.len { m.x[i] = vars.ptr[i]; }
+        let Some(cl) = compile_clause(m, head, body, None) else { fresh.free(); vars.free(); return Err(builtins.type_error(m, "callable", g)); };
+        for i in 0..vars.len {
+            var v = vars.ptr[i];
+            for j in 0..fresh.len { let (fv, val) = fresh.ptr[j]; if fv == v { v = val; } }
+            m.x[i] = v;
+        }
+        fresh.free();
         vars.free();
         return Ok(cl.code);
     }

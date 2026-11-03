@@ -51,9 +51,13 @@ run_suite() {    # exe label runs...
     shift 2
     for t in "${TESTS[@]}"; do
         for run in "$@"; do
+            # Tests marked NAME.nostress allocate too much to collect at
+            # every call: they run with a small heap instead.
+            if [ -f "$DIR/tests/$t.nostress" ] && [ "$run" != normal ]; then run=tiny; fi
             local flag=""
             [ "$run" = stress ] && flag=--gc-stress
             [ "$run" = verify ] && flag=--gc-verify
+            [ "$run" = tiny ] && flag=--gc-tiny
             COUNT=$((COUNT + 1))
             (cd "$DIR/tests" && ulimit -v 2500000 && timeout 300 "$exe" "$t.pl" $flag > "$TMP/out" 2> "$TMP/err")
             if ! cmp -s "$TMP/out" "$DIR/tests/$t.expected"; then
