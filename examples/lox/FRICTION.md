@@ -25,7 +25,7 @@ This report is kept as written. Since then:
 | 1 | Fixed: `poly_get_at`, `mega_get_at` and `read_miss_at` return the hit's depth (0 own, n inherited, `obj.ABSENT`); it was already in the cache entry, so a hit costs a register (MiniJS unchanged). Lox binds when the depth is nonzero; the `Method` variant is gone (`stdlib/obj.md`, "Where a value came from"). |
 | 2 | Fixed: `gc.WeakInterner.key(s)` pins an interned string and returns its address, a key for good; `stdlib/obj.md` has a "Keys for guest strings" section (pinned strings, or `text.Interner` ids as MiniJS does). Lox pins every property-name constant. |
 | 3 | Fixed: the hit helpers (`poly_get`, `mega_get`, their `_at` forms, `proto_load`, `load_ref`) are `#[inline]` (the attribute existed; the report missed it). `trees` 0.58x -> 0.55x of clox; MiniJS within noise. |
-| 4 | Open: still seven pointer variants. With `Method` gone Lox needs six, so it no longer hits the limit. |
+| 4 | Fixed: a nanbox holds up to 56 `Gc` variants; when the seven 48-bit blocks run out, the last-declared `Gc` variants share one, told apart by the pointer's low 3 bits (the shared layout, lowering.md section 2; `block 45` pins it). Lox is unchanged: with `Method` gone it needs six pointer variants, and `Native(u32)` (an index) costs nothing a `Gc` variant would save. |
 | 5 | Fixed: `gc.WeakInterner<X>` over the interpreter's string object (or the ready-made `gc.Str`): `intern`, `find`, `key`, a sweeper drops dead strings. Lox's 60 hand-written lines are gone. |
 | 6 | Fixed (opt-in): lint `hot_gc`, `-W hot_gc`, warns about `uses gc` calls on an op's fast path outside `cold` (calls inside plain vm functions are not seen). |
 | 7 | Unchanged (by design; tutorial chapter 9). |

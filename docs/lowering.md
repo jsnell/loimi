@@ -113,6 +113,65 @@ address on ties) and splits it in halves down to its size. For example,
 | `Flag(bool)` | 1 | | `0xFFFF_0001_0001_000b` |
 | `Nil`, `F`, `T`, `Unspec`, `Eof` | 0 | | `0xFFFF_0001_0001_0002` .. `0006` |
 
+**Shared layout (more 48-bit needs than blocks).** The packed layout
+fits at most seven variants that need a whole 48-bit block (pointers and
+48-bit integers). Beyond that, `Gc` variants share 48-bit blocks, up to
+8 in a block: GC objects are at least 8-byte aligned (std.gc's are
+16-byte aligned: 16-byte headers and size classes, 16-byte-aligned
+chunks and calloc'd large objects), so the low 3 bits of a `Gc` pointer
+are free, and a variant in a shared block is told apart by a 3-bit *low
+tag* `L` there. Its word is `T << 48 | ptr | L`; its mask covers both
+tags, `0xFFFF_0000_0000_0007`, and `V.X.block` is 45 (the pointer bits
+between them). Which variants share: those pinned `block 45`, then as
+few unpinned `Gc` variants as make the declaration fit, the last
+declared first (the allocator tries 0, 1, 2, ... of them; each group of
+8 sharing variants is one 48-bit request to the same buddy allocator, so
+everything else is placed as in the packed layout). Low tags are given
+in declaration order within a block. Raw pointers (`*T`) never share:
+their alignment is not known. A declaration that needs no sharing keeps
+its packed (or classic, or eight-variant) layout exactly, so only
+declarations that did not compile before, or pin `block 45`, change.
+`tests/run/values_explain_shared.lm`:
+
+| Variant | Block | Encoding |
+|---|---|---|
+| `Int(i48)`, `Str`, `Pair`, `Env`, `Raw(*Raw)`, `Vec` | 48 | `0xFFF9`..`0xFFFE` in the top 16 bits |
+| `Sym(Gc<Sym>) block 45`, `Clo(Gc<Clo>)` | 45 | `0xFFFF_0000_0000_0000 \| ptr \| 0`, `.. \| ptr \| 1` |
+| `Char(u32) block 32`, `Nil`, `F`, `T` | 32, 0 | in the 47-bit block |
+
+| Pattern (shared block) | Test / code | x86-64 |
+|---|---|---|
+| `v is Sym` | `(v & M) == (T << 48 \| L)`, `M = 0xFFFF_0000_0000_0007` | `movabs; and; cmp` (constants hoisted in loops) |
+| `match v { Sym(_) => .., Clo(_) => .., ... }` | LLVM switches on `(v & M) - T << 48`: a jump table over `L` | `and; add; cmp; ja; jmp *` |
+| `(a, b) is (Sym, Clo)` | `((a ^ tagS) \| (b ^ tagC)) & M == 0` | one test |
+| `(a, b) is (Str, Clo)` (whole-block `Gc` with shared) | the same, with the shared `M`: a whole-block `Gc` pointer's low bits are 0 | one test |
+| payload | `inttoptr(v & 0xFFFF_FFFF_FFFF) - L`, the `- L` a `getelementptr` | `and`; then `mov 7(%r)` for field offset 8 and `L = 1` |
+| `Sym(p)` | `(p & 0xFFFF_FFFF_FFFF) \| (T << 48 \| L)` | `movabs; or` |
+
+The GC marks a value word through the same payload extraction, so it
+sees the untagged pointer (`--gc-check-roots` validates exactly the
+object start). The JIT's stencil variants per constant tag
+(`--jit-stencils`) select on the same mask and tag. AArch64 needs no top-byte-ignore
+(the tags are stripped before every dereference).
+
+*Costs* (scratch microbenchmark: a loop over 64K values matching four
+pointer variants and an `Int`, reading a field, best of 3 on x86-64):
+whole blocks 20 ms, the four in one shared block 18 ms, one `Obj`
+variant with a `kind` field read from the object 26 ms (5-way periodic
+pattern); with a random pattern (mispredicted) 147, 139 and 155 ms. A
+shared block is as fast as whole blocks here because the match becomes
+one jump table, and a test is one more instruction than `shr; cmp`.
+
+*Why not header type ids.* The other way to have more pointer types
+than tags is one variant whose object header carries the type (a
+`kind` field, CPython's `ob_type`): no encoding bits, but every test is
+a dependent load before the branch (26 vs 18-20 ms above), the objects
+need a common header layout the compiler would have to own, and a
+tuple pattern cannot merge such tests into one compare. Low tags cost
+a mask on the test and nothing on the payload, and keep every variant
+an ordinary variant: patterns, tuple merging, GC tracing, the JIT and
+`--explain-values` work unchanged.
+
 The unboxed limit `NUM` is the lowest tagged word: `0xFFF9 << 48` in the
 classic layout, `0xFFF8_8000_0000_0000` if the 47-bit block is used.
 

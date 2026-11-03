@@ -968,22 +968,72 @@ payloads are as wide as their type says, so `Int(i48)` keeps 48 bits and
 
 | `repr` | Payloads | Tagged variants |
 |---|---|---|
-| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word; `block N` sets the size). |
+| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word; `block N` sets the size). When the 48-bit blocks run out, `Gc` variants share them, up to 8 in a block, told apart by the low 3 bits of the pointer (GC objects are 8-byte aligned): up to 56 `Gc` variants in all, minus 8 per 48-bit integer or raw pointer. |
 | `lowtag` | integers up to 61 bits (`i61`), `bool`, pointers (8-byte aligned) | Up to 8 with any payloads. Beyond 8, pointers and 61-bit integers take one 3-bit tag each, and a variant with an N-bit payload can have a tag of up to 64 - N bits, so narrow variants share what is left. |
 | `boxed` | any number, `bool`, pointers | any number |
 
 For example, a Scheme value with `Num(f64) unboxed`, `Int(i48)`, five
 pointer types, `Char(u32)`, a `Prim(u16)` builtin index and nullary `Nil`,
 `False`, `True`, `Eof` fits a nanbox: the integer and pointers take six
-48-bit blocks and the rest share the remaining space. A declaration that
-does not fit is a compile error naming the variant with no room.
+48-bit blocks and the rest share the remaining space. A Python value
+with `Int(i48)` and a dozen heap types (`Str`, `List`, `Dict`, `Class`,
+`Cell`, ...) fits too: the integer and the first-declared pointer types
+keep 48-bit blocks, and the last-declared `Gc` variants share one (the
+*shared* layout, below). A declaration that does not fit is a compile
+error naming the variant with no room.
+
+<!-- snippet: run "cell 7" "list 2" -->
+```loimi
+import std.io;
+import std.gc;
+object Str { len: u64 }
+object List { len: u64 }
+object Cell { v: i64 }
+object Class { n: u64 }
+object Gen { pc: u64 }
+
+// Nine 48-bit blocks needed (`Int` and eight pointers), seven available:
+// `Class` is pinned to share one (`block 45`), and as few unpinned `Gc`
+// variants as fit, the last declared first, share it too (`Gen`, `C`).
+// `--explain-values` shows the layout.
+#[allow(value_layout)]
+value Value repr nanbox {
+    Float(f64) unboxed,
+    Int(i48),
+    Nil,
+    Str(Gc<Str>), List(Gc<List>), Cell(Gc<Cell>),
+    A(Gc<Str>), B(Gc<Str>), C(Gc<Str>),
+    Class(Gc<Class>) block 45,
+    Gen(Gc<Gen>),
+}
+
+fn describe(v: Value) {
+    match v {
+        Cell(c) => { io.print("cell "); io.print_int(c.v); }
+        List(l) => { io.print("list "); io.print_int(l.len as i64); }
+        Class(_) | Gen(_) => io.print("shared"),
+        _ => io.print("other"),
+    }
+    io.println("");
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    describe(Value.Cell(new(&heap, Cell { v: 7 })));
+    describe(Value.List(new(&heap, List { len: 2 })));
+}
+```
 
 The fast paths do not depend on the layout: a variant test is one shift and
-compare (`(v >> w) == tag` in a nanbox, `(v & mask) == tag` in a lowtag,
-`v == word` for a variant without payload), the unboxed `f64` test is one
-unsigned compare, and tuple patterns whose elements have tags in the same
-position merge into one test. Extracting a pointer is one `and`. See
-[lowering.md](lowering.md) section 2 for the encodings.
+compare (`(v >> w) == tag` in a nanbox, `(v & mask) == tag` in a lowtag
+and for a variant in a shared block, `v == word` for a variant without
+payload), the unboxed `f64` test is one unsigned compare, and tuple
+patterns whose elements have tags in the same position merge into one
+test. Extracting a pointer is one `and` (in a shared block the low tag
+is subtracted in the addressing mode of the loads through it, `[p - 3 +
+8]`, at no cost), and a `match` over the variants of one shared block
+becomes a jump table on the low bits. See [lowering.md](lowering.md)
+section 2 for the encodings and their measured costs.
 
 **Seeing and pinning the layout.** Whether two variants' tests merge,
 and what a raw word looks like, depends on the layout, and the layout
@@ -1004,7 +1054,12 @@ happening silently:
   61). The layout honours it or the declaration is an error ("no room
   for variant"). Pinning `Int(i32) block 48` keeps Int's tests merging
   with the pointers' however many variants follow; pinning a variant
-  narrower than the classic width selects the packed layout.
+  narrower than the classic width selects the packed layout. A `Gc`
+  variant of a nanbox can also be pinned `block 45`: it shares a 48-bit
+  block with other `Gc` variants (the 45 bits are the pointer between
+  the 16-bit tag and the 3-bit low tag). Without pins, the compiler
+  shares as few `Gc` variants as it must, the last-declared first, so
+  declare the hot ones first.
 - **The `value_layout` warning.** When a declaration has too many
   variants for the classic layout, every variant whose block is
   narrower than the classic 48 bits (61 in a lowtag) must be pinned at

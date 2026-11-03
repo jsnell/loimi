@@ -9,7 +9,10 @@
 //!          order. With more, blocks are sized to the payload (48 bits for
 //!          pointers, N for iN/uN, 1 for bool, 0 for none) and allocated
 //!          buddy-style from 0xFFF8_8000_0000_0000 (47 bits) and
-//!          0xFFF9..0xFFFF (48 bits each), widest first.
+//!          0xFFF9..0xFFFF (48 bits each), widest first. If the 48-bit
+//!          blocks run out (or a `Gc` variant is pinned `block 45`), `Gc`
+//!          variants share 48-bit blocks, up to 8 in one, with a low tag
+//!          in the pointer's 3 alignment bits: `tag << 48 | ptr | sub`.
 //! lowtag:  i64. The word is `payload << shift | tag`. With at most 8
 //!          variants the tag is the variant index in the low 3 bits;
 //!          pointers (8-byte aligned) are or'ed with it and integers (up to
