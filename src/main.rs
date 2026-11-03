@@ -326,8 +326,13 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         // `LOIMI_SAFETY_AUDIT=1`: raw-pointer operations by module and kind.
         let a = a.borrow();
         let mut counts: std::collections::BTreeMap<(&str, &str), u32> = Default::default();
-        for (m, cat, _, _) in a.iter() {
+        let sites = std::env::var("LOIMI_SAFETY_AUDIT").is_ok_and(|v| v == "sites");
+        for (m, cat, file, lo) in a.iter() {
             *counts.entry((m.as_str(), cat)).or_default() += 1;
+            if sites && !cat.starts_with("ok_") {
+                let (l, col) = sm.line_col(*file, *lo);
+                eprintln!("safety-site {}:{}:{} {}", sm.files[*file as usize].path, l, col, cat);
+            }
         }
         for ((m, cat), n) in counts {
             eprintln!("safety-audit {} {} {}", m, cat, n);

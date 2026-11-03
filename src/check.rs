@@ -2075,7 +2075,7 @@ impl<'a> Checker<'a> {
                 };
                 let defs = self.prog.structs[sid as usize].fields.clone();
                 if self.foreign_raw_struct(cx, &ty) {
-                    self.raw_op(cx, span, "struct_lit", || format!("building a `{}` (a struct with raw pointers, declared in a module that is not `#![safe]`) with a literal", name.name), "use its module's constructor (`Vec.new()`)")?;
+                    self.raw_op(cx, span, "struct_lit", || format!("building a `{}` (another module's struct with raw pointers) with a literal", name.name), "use its module's constructor (`Vec.new()`)")?;
                 }
                 let mut vals: Vec<Option<TExpr>> = vec![None; defs.len()];
                 for (f, v) in fields {

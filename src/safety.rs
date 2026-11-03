@@ -8,9 +8,9 @@
 //! (from an integer, another pointer type, a function or a `Gc`) and
 //! casts that forge a tag or reference (integer to enum or `value`).
 //! Neither is reaching around another module's invariants: the raw
-//! pointer fields of a struct declared in a module that is not safe (a
-//! slice's `.ptr`), writing any field of such a struct, or building one
-//! with a literal. `..zero` may not make a null `*T`, `assume` and
+//! pointer fields of a struct declared in another module (a slice's
+//! `.ptr`), writing any field of such a struct, or building one with a
+//! literal. `..zero` may not make a null `*T`, `assume` and
 //! `unreachable` (undefined if wrong) are out, and so are calls of
 //! `#[raw]` and extern functions, which take pointers to more than one
 //! value or free memory. Lifetimes are not checked (the known hole).
@@ -59,14 +59,15 @@ impl Checker<'_> {
         }
     }
 
-    /// A struct with a raw-pointer field declared in a module that is not
-    /// safe, seen from another module: its pointers mean what that module
-    /// says (a buffer, a sentinel), and its fields hold that module's
-    /// invariants (`Vec.len` <= `Vec.cap`).
+    /// A struct with a raw-pointer field declared in another module: its
+    /// pointers mean what that module says (a buffer, a sentinel), and
+    /// its fields hold that module's invariants (`Vec.len` <= `Vec.cap`),
+    /// which the module's own `unsafe { }` blocks may rely on (so this
+    /// holds for structs of other safe modules too).
     pub fn foreign_raw_struct(&self, cx: &FnCx, t: &Ty) -> bool {
         let Ty::Struct(sid) = t else { return false };
         let Some(&m) = self.struct_module.get(sid) else { return false };
-        if m == cx.module || self.modules[m].safe {
+        if m == cx.module {
             return false;
         }
         self.prog.structs[*sid as usize].fields.iter().any(|(_, t)| holds_ptr(t))
@@ -99,7 +100,7 @@ impl Checker<'_> {
                             cx,
                             span,
                             "field_write",
-                            || format!("writing {} (a field of a struct with raw pointers, declared in a module that is not `#![safe]`)", f),
+                            || format!("writing {} (a field of another module's struct with raw pointers)", f),
                             "use the methods of its module (`v.clear()`, not `v.len = 0`)",
                         );
                     }
@@ -138,7 +139,7 @@ impl Checker<'_> {
                 cx,
                 r.span,
                 "ptr_field",
-                || format!("reading the pointer {} of a struct declared in a module that is not `#![safe]`", f),
+                || format!("reading the pointer {} of another module's struct", f),
                 "use the methods of its module (`v.items()`, `v.at(i)`)",
             );
         }
