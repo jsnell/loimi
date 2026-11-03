@@ -36,9 +36,9 @@ every interpreter test run in three modes: normal, `stress`, and
   Flags: `LOG` (old and not in the remembered set) and `LARGE`.
 - Each chunk keeps its own free list. The allocator pops the current
   chunk's list (the inlined fast path) and, when it is empty, takes the
-  next chunk of the class with free slots, in index order
-  (`alloc_slow`). Sweeping is eager (no lazy sweeping) and rebuilds the
-  chunk lists.
+  next chunk of the class with free slots, in index order (`refill`).
+  A non-generational heap sweeps eagerly, at the end of each collection;
+  a generational heap sweeps lazily (below).
 - **Large objects** are `calloc`'d with the remembered-set pointer in 16
   bytes before the header, and kept in a vector.
 - **Collection triggers**: `growth` (percent of the live bytes),
@@ -52,16 +52,38 @@ every interpreter test run in three modes: normal, `stress`, and
 measurements are in [`../roadmap.md`](../roadmap.md), open question 2).
 
 - *Young* means allocated since the last collection, *old* means it
-  survived one. Old objects keep their mark bit (sticky marks).
+  survived one (a large object: two). Old objects keep their mark
+  (sticky marks).
+- **Mark epochs.** The mark byte holds the heap's epoch (1 or 2) when
+  set. A major collection flips the epoch, which unmarks every object at
+  once, instead of clearing every mark first (a pass over all headers:
+  12 ms of Scheme's `nboyer` 750 ms run went to it).
 - A **minor collection** marks from the roots and from the remembered set
-  and stops at marked (old) objects. It then sweeps only the chunks that
-  were allocated from since the last collection (a chunk is marked
-  `used` when it becomes a current chunk), and the young large objects.
-  Every survivor becomes old: there is no aging.
-- A **major collection** first clears every mark (a pass over all
-  headers), then runs a full mark-sweep whose survivors stay marked. It
-  runs once the old generation has grown by the growth budget since the
-  last major collection.
+  and stops at marked (old) objects. Marking an object sets its LOG flag
+  and counts its bytes, so the collection itself sweeps nothing but the
+  young large objects: the chunks that were allocated from since the
+  last collection (a chunk is marked `used` when it becomes a current
+  chunk) become *pending*.
+- **Lazy sweeping.** The allocator sweeps a pending chunk when it takes
+  it (`refill`), just before allocating from it, so the sweep's cache
+  misses are the ones allocation would take anyway. A major collection
+  makes every chunk pending; it first sweeps the chunks pending since
+  the previous major collection, whose dead objects may carry the epoch
+  that the flip brings back. Minor pauses are marking only.
+- **Aging, for large objects.** A large object that survives its first
+  minor collection stays young until the next one: it is marked with
+  that collection's *young mark* (3 to 254, a new one each minor
+  collection, so the next one sees it unmarked) and flagged `AGED`. An
+  old object that points to a young survivor stays in the remembered set
+  (flag `INRS`), with LOG set again so that a store into it still calls
+  `remember` (an interpreter that logs an object's parts with it,
+  below, relies on that); an object promoted while it points to one goes
+  into the set. Small objects are promoted when they first survive:
+  aging them too traced the survivors of programs with growing live
+  data twice (Scheme `nboyer`, `earley` and `mperm` 5-8% slower).
+- A **major collection** runs a full mark-sweep whose survivors stay
+  marked. It runs once the old generation has grown by the growth budget
+  since the last major collection.
 - **The nursery** is the same allocation budget as between full
   collections, computed from the live bytes after the last major
   collection (not from the old generation, which also holds promoted
@@ -92,9 +114,10 @@ pub fn barrier(obj: *u8) {
   value into an object (see [`../lowering.md`](../lowering.md) §10). In a
   non-generational heap no object has `LOG`, so the barrier costs a byte
   test and a not-taken branch.
-- `remember` clears `LOG` and appends the object to the remembered set.
-  It runs once per object between collections. A minor collection
-  traces the remembered objects and sets `LOG` again.
+- `remember` clears `LOG` and appends the object to the remembered set
+  (unless it is still there, `INRS`). It runs once per object between
+  collections. A minor collection traces the remembered objects and
+  sets `LOG` again; those that point to young survivors stay in the set.
 - **Stores through raw pointers** bypass the compiler's barrier:
   `gc.write_barrier(h, obj)` after them, naming the object that contains
   the slot (not an interior pointer). `gc.needs_barrier(obj)` and
@@ -103,7 +126,8 @@ pub fn barrier(obj: *u8) {
   table stores test only the table's own header (the parts are never
   older than the table).
 - **Verify mode** (`heap.set_verify(true)`): at the start of every
-  collection, every old object outside the remembered set is traced
+  collection, every old object outside the remembered set (and every
+  young survivor of the last minor collection counts as young) is traced
   without marking, and a reference to a young object (a missing barrier)
   or to a free slot (a dangling reference) aborts with both type names:
 
@@ -143,9 +167,11 @@ when they unwind.
   (not implemented) to free it.
 - Order after marking: ephemerons to a fixpoint, ephemeron sweeping,
   weak references, then the sweepers (`add_sweeper`). In a minor
-  collection old objects count as marked (`is_marked`), so sweepers and
-  weak references stay correct; `heap.is_minor()` tells a sweeper that
-  only young objects can have died.
+  collection old objects count as marked (`h.is_marked(p)`, or the
+  slower `gc.is_marked(p)`, which finds the heap from the object's
+  chunk), so sweepers and weak references stay correct;
+  `heap.is_minor()` tells a sweeper that only young objects can have
+  died.
 - **The sweeper-based weak tables stay.** Mini's string intern table
   and std.obj's transition table are host-side hash tables with weak
   entries keyed by content (string bytes; parent shape, key and
@@ -157,14 +183,15 @@ when they unwind.
 
 Policies as a compile-time parameter (`#![heap = ..]`; generational is a
 run-time switch, and the barrier is always compiled in), incremental
-marking, lazy sweeping, side mark bitmaps, card marking (a large array
-stored into is retraced whole by each minor collection), aging before
-promotion, finalizers, `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
+marking, lazy sweeping in a non-generational heap, side mark bitmaps,
+card marking (a large array stored into is retraced whole by each minor
+collection), aging of small objects (measured, see above), finalizers, `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
 and the `weak` field qualifier (also for inline caches, language.md
 §7.1).
 
 `LOIMI_GC_STATS=1` prints a line per collection to stderr: kind, live
-(old) bytes, and the mark and sweep times.
+(old) bytes, the remembered set's size, the mark and sweep times, and
+the time spent in deferred sweeps so far.
 
 ---
 
