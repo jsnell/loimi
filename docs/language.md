@@ -907,7 +907,10 @@ The raw field `it` (and `x.raw`) is a `u64`, or an `i64` for a signed field
 `regs[a + 1]` should be one 64-bit add, not a wrapping 8-bit add and a
 zero-extension. The width and signedness come from the format and matter
 to the encoders (`Vm.OP(a: u8, ..)`), so one `label` kind serves 8-bit and
-24-bit offsets alike.
+24-bit offsets alike. Comparisons have no implicit conversions, so a
+clause against a count of another type casts: the examples above have
+`u64` counts, and with `nregs: u32` the clause is
+`verify (it as u32) < proto.nregs`.
 
 **Constant operands.** A `const` clause says that what an operand reads
 cannot change once the code is verified:
