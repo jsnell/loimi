@@ -11,6 +11,7 @@ import rt;
 import rt.{Engine, ModInst, Extern};
 
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn writev(fd: i32, iov: *u64, n: i32) -> i64;
 extern "C" fn clock_gettime(clk: i32, ts: *i64) -> i32;
 extern "C" fn isatty(fd: i32) -> i32;
 
@@ -108,15 +109,25 @@ fn fd_write(m: *Machine, a: *u64) -> bool {
     let n = arg32(a, 2);
     let out = arg32(a, 3);
     if fd != 1 and fd != 2 { return ret(a, EBADF); }
+    // Up to 16 buffers per writev (one system call, as wasm3 does; libc's
+    // stdio flushes with two: its buffer and the new data).
+    var vec: [u64; 32] = [0; 32];
+    var k: u64 = 0;
     var total: u64 = 0;
     for i in 0..n {
         let Some(iov) = guest(m, iovs + i * 8, 8) else { m.host_trap = Trap.MemOOB; return false; };
         let base = (iov as *u32).read_unaligned() as u64;
         let len = ((iov + 4) as *u32).read_unaligned() as u64;
         let Some(p) = guest(m, base, len) else { m.host_trap = Trap.MemOOB; return false; };
-        if len > 0 { write(fd as i32, p, len); }
+        if len > 0 {
+            if k == 16 { writev(fd as i32, &vec[0], 16); k = 0; }
+            vec[2 * k] = p as u64;
+            vec[2 * k + 1] = len;
+            k += 1;
+        }
         total += len;
     }
+    if k > 0 { writev(fd as i32, &vec[0], k as i32); }
     if !put32(m, out, total as u32) { m.host_trap = Trap.MemOOB; return false; }
     ret(a, 0)
 }

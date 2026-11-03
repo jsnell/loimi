@@ -1,0 +1,77 @@
+// matrix: dispatch
+// `#[forward]` links between two views of one slot: kinds whose bodies
+// differ only in the type they cast to (an untyped register file read
+// as i32, u32 and f64) link like a single kind, and `optimize` picks the
+// forwarding variant. Kinds that are not places (`imm`, `cnt`: the
+// same body, `it`) never link.
+import std.io;
+
+vm V {
+    context ctx: *i64;
+    state { pc: *u64, regs: *u64 }
+
+    operand ri = *((regs + it) as *i32);
+    operand ru = *((regs + it) as *u32);
+    operand rd = *((regs + it) as *f64);
+    operand imm = it;
+    operand cnt = it;
+
+    encoding fixed(u64) {
+        format RRR { op: 16, a: 16, b: 16, c: 16 }
+    }
+
+    op LOADI(d: ri, v: imm) : RRR { d = v as i32; next }
+    op ADDK(d: ri, a: ri, k: imm) : RRR { d = a +% (k as i32); next }
+    // An unsigned view of the slot ADDK writes: `a` links to ADDK's `d`.
+    op SHRU(d: ru, a: ru, k: cnt) : RRR { d = a >> k; next }
+    op CVT(d: rd, a: ri) : RRR { d = a as f64; next }
+    op FMUL(d: rd, a: rd, b: rd) : RRR { d = a * b; next }
+    op RETF(a: rd) : RRR { exit (a * 1000.0) as i64 }
+
+    #[forward] super ADDK_SHRU = ADDK; SHRU;
+    #[allow(super_overlap)] #[forward] super SHRU_CVT = SHRU; CVT;
+    #[allow(super_overlap)] #[forward] super CVT_FMUL = CVT; FMUL;
+
+    entry run(c: *i64, code: *u64, r: *u64) -> i64 {
+        ctx = c;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+}
+
+fn go(code: []u64, n: u64) {
+    var regs: [u64; 8] = [0; 8];
+    var c: i64 = 0;
+    V.optimize_words(code[0..n]);
+    var i: u64 = 0;
+    while i < n {
+        io.print(V.op_name(code[i]));
+        io.print(" ");
+        i += V.op_size(code[i]);
+    }
+    io.print_int(V.run(&c, &code[0], &regs[0]));
+    io.println("");
+}
+
+fn main() {
+    var code: [u64; 16] = [0; 16];
+    // r1 = r0 + 7 (i32 view); r2 = r1 >> 1 (u32 view of r1): linked
+    code[0] = V.LOADI(0, 9);
+    code[1] = V.ADDK(1, 0, 7);
+    code[2] = V.SHRU(2, 1, 1);
+    // r3 = r2 as f64 (i32 view of r2, written as u32): linked
+    code[3] = V.CVT(3, 2);
+    // r4 = r3 * r3 (f64): linked twice
+    code[4] = V.FMUL(4, 3, 3);
+    code[5] = V.RETF(4);
+    go(code[..], 6);
+    // Not linked: SHRU reads another slot.
+    code[0] = V.LOADI(0, 9);
+    code[1] = V.ADDK(1, 0, 7);
+    code[2] = V.SHRU(2, 0, 1);
+    code[3] = V.RETF(5);
+    go(code[..], 4);
+}
+// expect: LOADI ADDK_SHRU__f1 CVT_FMUL__f3 RETF 64000
+// expect: LOADI ADDK_SHRU RETF 0

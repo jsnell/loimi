@@ -183,9 +183,53 @@ pub fn layout(v: &VmDecl) -> Res<VmLayout> {
     Ok(VmLayout { word_bits, op_shift, op_bits, ops, cache_words, cache_names })
 }
 
+/// Whether operands of kinds `a` and `b` name the same place when their
+/// fields are equal: the same kind, or two views of one slot, kinds
+/// whose bodies (and `verify` clauses) differ only in the types they cast
+/// to (`*((regs + it) as *i32)` and `*((regs + it) as *u32)`, an untyped
+/// register file read as several types). Forwarding between views is a
+/// store and a load of the same address, which LLVM forwards when the
+/// sizes agree.
+fn same_slot_kinds(v: &VmDecl, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let find = |n: &str| v.operands.iter().find(|k| k.name.name == n);
+    let (Some(ka), Some(kb)) = (find(a), find(b)) else { return false };
+    if ka.konst.is_some() || kb.konst.is_some() {
+        return false;
+    }
+    let verify_same = match (&ka.verify, &kb.verify) {
+        (Some(x), Some(y)) => same_modulo_casts(x, y),
+        (None, None) => true,
+        _ => false,
+    };
+    // Places only (a register file read through an index or a pointer).
+    let place = matches!(ka.body.kind, ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _));
+    place && verify_same && same_modulo_casts(&ka.body, &kb.body)
+}
+
+/// Structural equality of two (operand body) expressions, ignoring the
+/// target types of casts; conservative: false for forms it does not know.
+fn same_modulo_casts(x: &Expr, y: &Expr) -> bool {
+    use ExprKind as K;
+    match (&x.kind, &y.kind) {
+        (K::Int(a), K::Int(b)) => a == b,
+        (K::Bool(a), K::Bool(b)) => a == b,
+        (K::Ident(a), K::Ident(b)) => a == b,
+        (K::Field(a, f), K::Field(b, g)) => f.name == g.name && same_modulo_casts(a, b),
+        (K::Index(a, i), K::Index(b, j)) => same_modulo_casts(a, b) && same_modulo_casts(i, j),
+        (K::Unary(o, a), K::Unary(p, b)) => o == p && same_modulo_casts(a, b),
+        (K::Binary(o, a, c), K::Binary(p, b, d)) => o == p && same_modulo_casts(a, b) && same_modulo_casts(c, d),
+        (K::Cast(a, _), K::Cast(b, _)) => same_modulo_casts(a, b),
+        _ => false,
+    }
+}
+
 /// The forwarding candidates of a `#[forward]` super with `parts`: per
 /// later part, up to two operands it does not write itself whose kind is
-/// that of an operand the previous part writes (the first such), as
+/// that of an operand the previous part writes, or another view of the
+/// same slot (`same_slot_kinds`; the first such), as
 /// (part, operand, previous part's operand); at most three in all, and
 /// only between fields of the same signedness.
 fn forward_links(v: &VmDecl, ops: &[OpLayout], parts: &[usize]) -> Vec<(usize, usize, usize)> {
@@ -202,7 +246,7 @@ fn forward_links(v: &VmDecl, ops: &[OpLayout], parts: &[usize]) -> Vec<(usize, u
             if cw.contains(&pi) || n == 2 {
                 continue;
             }
-            if let Some(&d) = pw.iter().find(|&&d| ops[prev].kinds[d] == ops[cur].kinds[pi]) {
+            if let Some(&d) = pw.iter().find(|&&d| same_slot_kinds(v, &ops[prev].kinds[d], &ops[cur].kinds[pi])) {
                 n += 1;
                 if ops[prev].fields[d].3 == ops[cur].fields[pi].3 && links.len() < 3 {
                     links.push((j, pi, d));

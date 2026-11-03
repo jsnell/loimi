@@ -345,3 +345,26 @@ quickening on/off.
       instruction pays for the widest one.
 
     The first is the likely answer; nothing is built yet.
+11. **The cost of a three-operand op.** The wasm interpreter's float
+    benchmarks (`examples/wasm/FRICTION.md`, "Float benchmarks against
+    wasm3") run 30–40% fewer dispatches than wasm3 but trailed it by
+    20–25%, because each dispatch costs more: `F64_MUL d, a, b` is 14
+    instructions (6 to decode three 16-bit fields from the word, 3 for
+    load, multiply and store, 5 to dispatch: load the next word, advance
+    `pc`, extract the opcode, load the handler, jump), where wasm3's
+    `op_f64_Multiply_rs` is 5 (the operand's slot offset is a word of its
+    own, the other operand and the result are `xmm0`, and the next
+    handler's address is in the code stream). `#[forward]` supers close
+    most of the gap on float chains, since a forwarded value skips the
+    store-to-load round trip. Open directions, none built:
+    - an accumulator state variable (`state { .., acc: f64 }` stays in
+      `xmm0`, lowering.md §3) with ops that read or write it, and help
+      from `std.bc` or the generated API to emit "result to `acc`" and
+      "operand from `acc`" variants;
+    - field decoding: three `mov`/`shr`/`movzwl` sequences per op; a
+      format whose fields are pre-scaled byte offsets would drop the
+      `movzwl` and the scaled addressing, and reading fields with narrow
+      loads from `pc` (tried by reloading the word: LLVM does not narrow a
+      load with several uses) would trade ALU work for loads;
+    - direct threading (handler addresses in the code words) for `u64`
+      words, which saves the table load and the opcode extraction.

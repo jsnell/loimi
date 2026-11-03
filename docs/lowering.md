@@ -262,6 +262,29 @@ Notes:
   function in a thread-local slot.
 - Each handler is a separate symbol (`Mini.op.ADD`), so `perf` and other
   profilers attribute time per opcode without any extra tooling.
+- **Loops in tail-call vm code** (handlers, cold blocks, vm functions)
+  carry `!llvm.loop` metadata that turns off vectorization, interleaving
+  and unrolling (what `#pragma clang loop vectorize(disable)
+  interleave(disable) unroll(disable)` gives). Such loops run a few times
+  (zeroing a callee's locals, copying constants or arguments), and the
+  vectorized and unrolled versions need registers enough to give the
+  handler a stack frame: the wasm interpreter's CALL with two copy loops
+  was 154 instructions with `push %rbp` and spills, and is 50 without.
+- **A float state variable stays in an SSE register.** `preserve_none`
+  passes floating-point arguments as the C convention does (`xmm0`..), so
+  `state { .., acc: f64 }` is `xmm0` in every handler: an op
+  `acc = acc * a` is `mulsd (%r14,%rdx,8),%xmm0` and the dispatch, with no
+  load or store of `acc` (checked with LLVM 19 on x86-64). That is
+  wasm3's `fp0`; a vm that wants it needs ops that read and write the
+  accumulator and a translator that keeps a value there between adjacent
+  ops.
+- **Dispatch with many integer arguments.** With at most five integer
+  arguments (context, state variables and the instruction word), x86-64
+  isel folds the table load into the tail jump (`jmp *table(,%rax,8)`);
+  from six on it is `mov table(,%rax,8),%rax; jmp *%rax`, one more
+  fused-domain uop per dispatch. The wasm interpreter (seven) has the
+  longer form; moving its memory size from the state into `ctx` was
+  measured as noise.
 
 ### `next`, `jump`, `redo`, `become`
 
@@ -508,7 +531,13 @@ reach it, so it exists only for defense in depth.
   the stored value (a phi when several paths of `MUL` store), and the
   value stays in a register. The variant is only correct where the
   fields are equal: `optimize` checks them before choosing it, and the
-  verifier rejects it otherwise.
+  verifier rejects it otherwise. Links also join two views of one slot
+  (`ri = *((regs + it) as *i32)`, `ru = .. as *u32`, `rd = .. as *f64`):
+  the store and the load then have the same address, and GVN forwards
+  the value across the type change when the sizes match (a 4-byte store
+  does not forward into an 8-byte load; the variant is still correct).
+  The wasm interpreter relies on this (`I32_ADDK; F64_LOAD` links `ri`
+  to `ru`, `F64_SUB; F64_STORE` links `rd` to `rq`).
 - Family members are ordinary ops that share a format. `become` stores the
   opcode byte (section 3). In a super's part, it stores the part's own word
   and the super's first word (the opcode of the super with that part
