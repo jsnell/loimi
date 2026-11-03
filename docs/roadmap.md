@@ -35,7 +35,7 @@ Progress (2026-11-02):
   it takes 0.29× of Gauche's time and 0.47× of Guile's with Guile's JIT
   off, and about the same time as Guile with its JIT on.
 - Beyond the plan:
-  - closures (non-escaping `block fn`) and traits;
+  - closures (non-escaping `block fn`, escaping `closure fn`) and traits;
   - C embedding (`--lib`, `--shared`, `--header`) with re-entrant natives;
   - a generational, non-moving GC with a write barrier and a verify mode;
   - weak references and ephemerons;
@@ -45,8 +45,8 @@ Progress (2026-11-02):
 
 See [`status.md`](status.md) for details.
 
-The compiler starts in **Rust**, emitting LLVM IR through the LLVM C API
-(`inkwell` or `llvm-sys`), pinned to one LLVM major version (≥ 19). Self-hosting
+The compiler is written in **Rust** with no dependencies; it emits textual
+LLVM IR and drives `clang-19`, pinned to one LLVM major version (≥ 19). Self-hosting
 is a non-goal until the language has stabilized. One natural dogfooding target
 is the compile-time evaluator itself: it is an interpreter, so it could
 eventually be written as a Loimi `vm`.
@@ -117,7 +117,8 @@ quickening on/off.
      without: Mini 0.989, MiniJS 0.996, Scheme 0.993. Scheme is mixed on
      its allocation-heavy programs: mperm −8%, graphs −10%, paraffins
      −12%, but nboyer +6%, earley +9%, string +27%. **Mini and MiniJS
-     turn it on, Scheme does not.** Final, against the old collector:
+     turn it on, Scheme does not** (until the changes under *Done*
+     below). Final, against the old collector:
      Mini 0.996, MiniJS 0.995, Scheme 0.973.
    - *What limited it* (profiled 2026-11-03 with `LOIMI_GC_STATS`,
      which now also prints the remembered set's size and the time in
