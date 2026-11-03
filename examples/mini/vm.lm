@@ -751,7 +751,7 @@ pub vm Mini {
             #fname {
                 // Two floats: a tagged word is a NaN as a double, so a
                 // non-NaN result means both operands were numbers.
-                let r = unsafe { *((regs + a.raw) as *f64) } sym unsafe { *((bbase + b.raw) as *f64) };
+                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
                 if likely(r == r) { dst = r.to_bits() as V; next }
                 match (a, b) {
                     (Num(x), Num(y)) => { dst = Num(x sym y); next }
@@ -766,14 +766,14 @@ pub vm Mini {
             // anything else makes the site float-first.
             #ifname {
                 if let Int(x) = a {
-                    let r = x as f64 sym unsafe { *((bbase + b.raw) as *f64) };
+                    let r = x as f64 sym f64.from_bits(b as u64);
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 cold { become #fname; refuse(fp.cl); redo }
             }
             #finame {
                 if let Int(y) = b {
-                    let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
+                    let r = f64.from_bits(a as u64) sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 cold { become #fname; refuse(fp.cl); redo }
@@ -787,7 +787,7 @@ pub vm Mini {
     }
     inline for (dname, mname, bkind, bbase) in [("DIV", "MOD", reg, regs), ("DIVK", "MODK", kst, k)] {
         op #dname(dst: reg, a: reg, b: bkind) : ABC {
-            let r = unsafe { *((regs + a.raw) as *f64) } / unsafe { *((bbase + b.raw) as *f64) };
+            let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
             if likely(r == r) { dst = r.to_bits() as V; next }
             match (a, b) {
                 (Num(x), Num(y)) => { dst = Num(x / y); next }
@@ -810,12 +810,12 @@ pub vm Mini {
     /// R[dst] = k[b] - R[a] and k[b] / R[a] (a constant left operand).
     op RSUBK(dst: reg, a: reg, b: kst) : ABC {
         if let (Int(x), Int(y)) = (b, a) and let Some(r) = x.sub_checked(y) { dst = Int(r); next }
-        let r = unsafe { *((k + b.raw) as *f64) } - unsafe { *((regs + a.raw) as *f64) };
+        let r = f64.from_bits(b as u64) - f64.from_bits(a as u64);
         if likely(r == r) { dst = r.to_bits() as V; next }
         cold { dst = arith_mixed(ctx, 1, b, a)?; next }
     }
     op RDIVK(dst: reg, a: reg, b: kst) : ABC {
-        let r = unsafe { *((k + b.raw) as *f64) } / unsafe { *((regs + a.raw) as *f64) };
+        let r = f64.from_bits(b as u64) / f64.from_bits(a as u64);
         if likely(r == r) { dst = r.to_bits() as V; next }
         cold { dst = arith_slow(ctx, 3, b, a)?; next }
     }

@@ -3777,6 +3777,41 @@ impl<'a> Checker<'a> {
         Ok(Some(r))
     }
 
+    /// `f64.from_bits(p)` or `f64.from_bits(p as u64)`, with `p` a place
+    /// through a pointer (`ptr[i]`, `*ptr`; a register operand `regs[it]`)
+    /// holding the bits (an integer of the float's width, or a value type
+    /// with an unboxed representation): a load of `p` as the float, so
+    /// that it goes straight to a floating-point register (or into the
+    /// arithmetic instruction's memory operand) instead of through an
+    /// integer register. The same read as `*((ptr + i) as *f64)`, which is
+    /// what it becomes (the JIT's constant-pool patching recognizes that
+    /// form too).
+    fn float_load(&self, t: &Ty, a: &TExpr, span: Span) -> Option<TExpr> {
+        let bits = if *t == Ty::F64 { 64 } else { 32 };
+        let p = match &a.kind {
+            TK::Cast(inner) => inner,
+            _ => a,
+        };
+        let same_bits = match &p.ty {
+            Ty::Int(it) => it.bits == bits,
+            Ty::Value(v) => bits == 64 && self.prog.values[*v as usize].repr != ValueRepr::Boxed,
+            _ => false,
+        };
+        if !same_bits {
+            return None;
+        }
+        let ptr = match &p.kind {
+            TK::Index(b, i) if matches!(b.ty, Ty::Ptr(_)) => {
+                let i = if i.ty == Ty::i64() { (**i).clone() } else { mk(Ty::i64(), TK::Cast(i.clone()), i.span) };
+                mk(b.ty.clone(), TK::Intrinsic(Intr::PtrOffset, vec![(**b).clone(), i]), p.span)
+            }
+            TK::Deref(q) if matches!(q.ty, Ty::Ptr(_)) => (**q).clone(),
+            _ => return None,
+        };
+        let fp = mk(Ty::Ptr(Box::new(t.clone())), TK::Cast(Box::new(ptr)), span);
+        Some(mk(t.clone(), TK::Deref(Box::new(fp)), span))
+    }
+
     fn static_intrinsic(&mut self, cx: &mut FnCx, t: &Ty, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
         match (t, name) {
             (Ty::F64 | Ty::F32, "from_bits") => {
@@ -3785,6 +3820,9 @@ impl<'a> Checker<'a> {
                 }
                 let bt = if *t == Ty::F64 { IntTy::U64 } else { IntTy::U32 };
                 let a = self.expr_coerce(cx, &args[0], &Ty::Int(bt))?;
+                if let Some(r) = self.float_load(t, &a, span) {
+                    return Ok(Some(r));
+                }
                 Ok(Some(mk(t.clone(), TK::Intrinsic(Intr::BitsToFloat, vec![a]), span)))
             }
             _ => Ok(None),

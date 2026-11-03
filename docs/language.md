@@ -722,7 +722,12 @@ fn main() { Sym { id: 5 }.show_line(); }
   `trunc`, `nearest`, `copysign`, `is_nan`, `min`/`max` (C's `fmin`) and
   `minimum`/`maximum` (IEEE 754-2019), and `to_bits` and
   `f64.from_bits(u)` (`f32` too; the list and their exact semantics are
-  in `stdlib.md`, `std.core`).
+  in `stdlib.md`, `std.core`). When `u` reads a place through a pointer
+  (`p[i]`, `*p`, a register operand `regs[it]`), optionally cast to `u64`
+  from a 64-bit integer or an unboxed `value` type, `from_bits` is a load
+  of that place as the float: `f64.from_bits(a as u64)` on a `reg`
+  operand loads straight into a floating-point register, as the unsafe
+  `*((regs + a.raw) as *f64)` does, and needs no `unsafe`.
   In constant expressions (`const`s, array lengths, global initializers),
   overflow of `+ - *`, unary `-` and `/` is a compile error in all builds.
 - **Shifts.** `a << n` and `a >> n` have the type of `a`; `>>` is
@@ -1305,8 +1310,8 @@ before (the default build's handlers are the same). With
 patches each constant into compiled code as a 64-bit immediate, and uses
 stencil variants per tag of a constant of a `value` type, with the
 checks on that tag folded (`docs/design/copy-and-patch.md`, section 12).
-Reads of the pool at a const operand's index through pointer arithmetic
-(`*((k + c.raw) as *f64)`) are patched too.
+Reads of the pool at a const operand's index as another type
+(`f64.from_bits(c as u64)`) are patched too.
 
 ### 3.3 Encodings and formats
 

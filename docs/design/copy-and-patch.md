@@ -818,7 +818,7 @@ panic strings normalized).
 **JIT.** `Vm.build_verified` passes the pool to `loimi_jit_register`.
 
 1. *Values.* In a stencil, a read of a const operand (`k[c]`, and also
-   `*((k + c.raw) as *f64)`, which Mini's float members use) of a 64-bit
+   `f64.from_bits(c as u64)`, which Mini's float members use and the checker turns into `*((k + c.raw) as *f64)`) of a 64-bit
    type becomes the hole `__jit.c.OFF.SHIFT.BITS.u`, an `R_X86_64_64`
    immediate patched with the constant's bits. The hole is read with
    `movabs` in inline asm: as a plain symbol address, clang 19

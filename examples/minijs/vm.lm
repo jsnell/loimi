@@ -768,7 +768,7 @@ pub vm JS {
                 }
             }
             #fname {
-                let r = unsafe { *((regs + a.raw) as *f64) } sym unsafe { *((regs + b.raw) as *f64) };
+                let r = f64.from_bits(a as u64) sym f64.from_bits(b as u64);
                 if likely(r == r) { dst = r.to_bits() as V; next }
                 cold {
                     match (a, b) {
@@ -785,14 +785,14 @@ pub vm JS {
             }
             #ifname {
                 if let Int(x) = a {
-                    let r = x as f64 sym unsafe { *((regs + b.raw) as *f64) };
+                    let r = x as f64 sym f64.from_bits(b as u64);
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 cold { become #fname; refuse(fp.cl); redo }
             }
             #finame {
                 if let Int(y) = b {
-                    let r = unsafe { *((regs + a.raw) as *f64) } sym y as f64;
+                    let r = f64.from_bits(a as u64) sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
                 cold { become #fname; refuse(fp.cl); redo }
@@ -800,7 +800,7 @@ pub vm JS {
         }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
-        let r = unsafe { *((regs + a.raw) as *f64) } / unsafe { *((regs + b.raw) as *f64) };
+        let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
         if likely(r == r) { dst = r.to_bits() as V; next }
         match (a, b) {
             (Int(x), Int(y)) => {

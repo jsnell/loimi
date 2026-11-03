@@ -1,0 +1,74 @@
+// `f64.from_bits(p)` and `f64.from_bits(p as u64)` with `p` a place
+// through a pointer compile to a load of `p` as the float (docs/lowering.md
+// section "Float reads of integer slots"); the value is the same as
+// through an integer. Also the forms the rewrite leaves alone: a
+// converting cast, a narrower integer, a slice element, a local.
+import std.io;
+import std.mem;
+
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+
+vm M {
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    // R[dst] = R[a] + R[b] read as doubles: a tagged word is a NaN.
+    op FADD(dst: reg, a: reg, b: reg) : ABC {
+        let r = f64.from_bits(a as u64) + f64.from_bits(b as u64);
+        if r == r { dst = Num(r); next }
+        dst = Nil;
+        next
+    }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *V) -> V { regs = r; jump code }
+}
+
+fn show(v: V) {
+    match v {
+        Num(x) => io.print_f64(x),
+        Int(i) => io.print_int(i as i64),
+        Nil => io.print("nil"),
+    }
+    io.println("");
+}
+
+fn main() {
+    let words: *u64 = mem.alloc(4);
+    words[0] = (1.5).to_bits();
+    words[1] = (-2.25).to_bits();
+    io.print_f64(f64.from_bits(words[0])); io.println("");
+    io.print_f64(f64.from_bits(*(words + 1))); io.println("");
+    let iw = words as *i64;
+    io.print_f64(f64.from_bits(iw[1] as u64)); io.println("");
+    // A converting cast is not a reinterpretation.
+    let small: *u32 = mem.alloc(2);
+    small[0] = 7;
+    io.print_bool(f64.from_bits(small[0] as u64) == f64.from_bits(7)); io.println("");
+    let fs: *u32 = mem.alloc(1);
+    fs[0] = (0.5 as f32).to_bits();
+    io.print_f64(f32.from_bits(fs[0]) as f64); io.println("");
+    let sl = words.slice(2);
+    io.print_f64(f64.from_bits(sl[1])); io.println("");
+    let l = words[0];
+    io.print_f64(f64.from_bits(l)); io.println("");
+
+    let regs: *V = mem.alloc(4);
+    regs[1] = Num(2.5);
+    regs[2] = Num(0.25);
+    regs[3] = Int(1);
+    var code: [u32; 3] = [0; 3];
+    code[0] = M.FADD(0, 1, 2);
+    code[1] = M.RET(0);
+    show(M.run(&code[0], regs));
+    code[0] = M.FADD(0, 1, 3);
+    show(M.run(&code[0], regs));
+}
+// expect: 1.5
+// expect: -2.25
+// expect: -2.25
+// expect: true
+// expect: 0.5
+// expect: -2.25
+// expect: 1.5
+// expect: 2.75
+// expect: nil

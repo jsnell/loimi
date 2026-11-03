@@ -193,6 +193,19 @@ and-ed. A tuple pattern of `k` values usually costs one test, not `k`.
 `--explain-values` lists the variants by block width: each line is one
 test.
 
+**Float reads of a value slot.** A float-first fast path adds the two
+slots as doubles before testing anything (a tagged word is a NaN, so a
+non-NaN sum means both were numbers): `f64.from_bits(a as u64) +
+f64.from_bits(b as u64)`. The checker turns `from_bits` of a place
+through a pointer (`regs[it]`, `*p`, optionally behind a bit-preserving
+cast to `u64`) into a load of the place as `double`, the IR of
+`*((regs + a.raw) as *f64)`. As `load i64` + `bitcast`, LLVM keeps the
+integer load (GVN merges it with the slow path's integer read of the
+same slot) and moves it to an XMM register: two more instructions on
+the fast path, and Mini's mandelbrot and nbody ran 4–5% slower. With
+the `double` load, `addsd` reads memory and the slow path does the
+`movq` instead.
+
 ### `lowtag`
 
 The word is `payload << s | tag`, where `tag` has `s` bits. With at most 8
