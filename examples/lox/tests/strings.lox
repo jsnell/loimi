@@ -1,0 +1,29 @@
+// Strings: concatenation, equality (all strings are interned, also those
+// built at run time), and strings that die and are made again.
+var a = "con" + "cat";
+print a; // expect: concat
+print a == "concat"; // expect: true
+print "a" + "b" == "ab"; // expect: true
+print "ab" != "a"; // expect: true
+
+fun build(n) {
+  var s = "";
+  for (var i = 0; i < n; i = i + 1) s = s + "x";
+  return s;
+}
+var keep = build(3);
+// Lots of garbage strings; the survivors stay equal to new copies.
+for (var r = 0; r < 300; r = r + 1) {
+  var t = build(r - (r / 7) * 7 + 1);
+}
+print keep == build(3); // expect: true
+print keep; // expect: xxx
+
+// A property name that is also built at run time.
+class Box { init() { this.name = "na" + "me"; } }
+var b = Box();
+print b.name == "name"; // expect: true
+print b.name; // expect: name
+print 1 == 1.0; // expect: true
+print nil == false; // expect: false
+print "1" == 1; // expect: false

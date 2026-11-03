@@ -473,6 +473,74 @@ fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
     }
 }
 
+/// The Lox VM (examples/lox): every tests/NAME.lox prints its
+/// `// expect: ` lines (the official suite's format), exits with
+/// `// expect-exit:` (default 0) and has each `// expect-stderr:` text in
+/// its stderr; run normally and with `--gc-stress`. The official suite is
+/// bench/lox/runtests.py (not in the repository).
+#[test]
+fn lox_programs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let exe = std::env::temp_dir().join(format!("loimi-lox-{}", std::process::id()));
+    let out = loimi().arg("build").args(["-W", "error"]).arg(root.join("examples/lox/main.lm")).arg("--release").arg("-o").arg(&exe).output().unwrap();
+    assert!(out.status.success(), "building lox failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let mut programs: Vec<PathBuf> = std::fs::read_dir(root.join("examples/lox/tests"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "lox"))
+        .collect();
+    programs.sort();
+    let mut failures = Vec::new();
+    for f in &programs {
+        let text = std::fs::read_to_string(f).unwrap();
+        let expect: Vec<String> = text.lines().filter_map(|l| l.split_once("// expect: ").map(|(_, r)| r.to_string())).collect();
+        let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
+        let stderr_want = directives(&text, "expect-stderr");
+        for mode in ["", "--gc-stress"] {
+            let mut cmd = limited(&exe);
+            cmd.arg(f);
+            if !mode.is_empty() {
+                cmd.arg(mode);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let name = format!("{} {}", f.file_name().unwrap().to_string_lossy(), mode);
+            if stdout.lines().collect::<Vec<_>>() != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
+                failures.push(format!("{}: stdout mismatch\n--- expected\n{}\n--- got\n{}\n--- stderr\n{}", name, expect.join("\n"), stdout, stderr));
+                continue;
+            }
+            if out.status.code() != Some(exit) {
+                failures.push(format!("{}: exit {:?}, expected {}\n{}", name, out.status.code(), exit, stderr));
+            }
+            for s in &stderr_want {
+                if !stderr.contains(s.as_str()) {
+                    failures.push(format!("{}: stderr lacks `{}`:\n{}", name, s, stderr));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&exe);
+    assert!(programs.len() >= 5);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
+/// The Lox VM's unit tests (`loimi test examples/lox/lox_test.lm`, which
+/// also runs small programs in-process with GC stress).
+#[test]
+fn lox_unit_tests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = loimi().current_dir(root.join("examples/lox")).arg("test").arg("lox_test.lm").output().unwrap();
+    assert!(
+        out.status.success(),
+        "loimi test examples/lox/lox_test.lm failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Stak, the stack VM (examples/stack): every tests/NAME.stk prints
 /// tests/NAME.expected (stdout and stderr) in every dispatch mode, with and
 /// without GC stress, built with `-W error` (examples/stack/check.sh).

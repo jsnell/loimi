@@ -1,0 +1,25 @@
+// Method calls and fields in loops (the cached paths), and a method
+// table shared by many instances.
+class Counter {
+  init() { this.n = 0; }
+  add(k) { this.n = this.n + k; return this; }
+}
+var c = Counter();
+for (var i = 0; i < 1000; i = i + 1) c.add(i);
+print c.n; // expect: 499500
+print c.add(1).add(2).n; // expect: 499503
+
+class Node {
+  init(left, right) { this.left = left; this.right = right; }
+  check() {
+    if (this.left == nil) return 1;
+    return 1 + this.left.check() + this.right.check();
+  }
+}
+fun tree(d) {
+  if (d == 0) return Node(nil, nil);
+  return Node(tree(d - 1), tree(d - 1));
+}
+var total = 0;
+for (var k = 0; k < 20; k = k + 1) total = total + tree(6).check();
+print total; // expect: 2540

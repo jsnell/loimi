@@ -1,0 +1,73 @@
+// Classes: fields, methods, initializers, inheritance and super, bound
+// methods, and functions stored in fields (not bound), read through
+// monomorphic, polymorphic and megamorphic sites.
+class Point {
+  init(x, y) { this.x = x; this.y = y; }
+  sum() { return this.x + this.y; }
+}
+var p = Point(1, 2);
+print p.sum(); // expect: 3
+print p; // expect: Point instance
+print Point; // expect: Point
+
+class Base {
+  init(n) { this.n = n; }
+  name() { return "base"; }
+  describe() { return this.name() + " " + this.kind(); }
+  kind() { return "plain"; }
+}
+class Derived < Base {
+  init(n) { super.init(n * 2); }
+  name() { return "derived"; }
+  kind() { return "special " + super.kind(); }
+}
+var d = Derived(4);
+print d.n; // expect: 8
+print d.describe(); // expect: derived special plain
+
+// A bound method remembers its receiver.
+var m = d.name;
+print m(); // expect: derived
+
+// A function in a field is called without a receiver; a method is bound.
+fun twice(x) { return x * 2; }
+class Holder {
+  init() { this.f = twice; }
+  method(x) { return x + 1; }
+}
+var h = Holder();
+print h.f(5); // expect: 10
+print h.f; // expect: <fn twice>
+print h.method; // expect: <fn method>
+h.method = twice;
+print h.method(5); // expect: 10
+
+// One site sees many shapes: polymorphic, then megamorphic.
+fun tag(x) { return "field"; }
+class A1 { init() { this.v = 1; } get(x) { return "A1"; } }
+class A2 { init() { this.w = 0; this.v = 2; } get(x) { return "A2"; } }
+class A3 { init() { this.a = 0; this.b = 0; this.v = 3; } get(x) { return "A3"; } }
+class A4 { init() { this.v = 4; this.f = twice; } get(x) { return "A4"; } }
+class A5 { init() { this.v = 5; } get(x) { return "A5"; } }
+class A6 { init() { this.c = 1; this.v = 6; } get(x) { return "A6"; } }
+class A7 { init() { this.v = 7; } get(x) { return "A7"; } }
+class A8 < A7 { get(x) { return "A8"; } }
+class A9 < A7 { }
+class A10 { init() { this.v = 10; this.get = tag; } get(x) { return "A10"; } }
+
+var total = 0;
+var names = "";
+var calls = "";
+for (var round = 0; round < 30; round = round + 1) {
+  fun visit(o) {
+    total = total + o.v;
+    var g = o.get;
+    var r = o.get(1);
+    if (round == 29) { names = names + " " + g(1); calls = calls + " " + r; }
+  }
+  visit(A1()); visit(A2()); visit(A3()); visit(A4()); visit(A5());
+  visit(A6()); visit(A7()); visit(A8()); visit(A9()); visit(A10());
+}
+print total; // expect: 1560
+print names; // expect:  A1 A2 A3 A4 A5 A6 A7 A8 A7 field
+print calls; // expect:  A1 A2 A3 A4 A5 A6 A7 A8 A7 field

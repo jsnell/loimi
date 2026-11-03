@@ -1,0 +1,11 @@
+// A run-time error: the message and the traceback go to stderr.
+fun inner(x) { return x.field; }
+fun outer() { return inner(3); }
+print "before"; // expect: before
+outer();
+print "not reached";
+// expect-exit: 70
+// expect-stderr: Only instances have properties.
+// expect-stderr: [line 2] in inner()
+// expect-stderr: [line 3] in outer()
+// expect-stderr: [line 5] in script

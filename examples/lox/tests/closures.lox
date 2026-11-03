@@ -1,0 +1,51 @@
+// Closures: counters, shared captures, a fresh variable per iteration.
+fun counter() {
+  var n = 0;
+  fun inc() { n = n + 1; return n; }
+  return inc;
+}
+var c1 = counter();
+var c2 = counter();
+c1(); c1();
+print c1(); // expect: 3
+print c2(); // expect: 1
+
+fun pair() {
+  var x = "a";
+  fun get() { return x; }
+  fun set(v) { x = v; }
+  set("b");
+  return get;
+}
+print pair()(); // expect: b
+
+var fs1 = nil;
+var fs2 = nil;
+for (var i = 0; i < 3; i = i + 1) {
+  var j = i * 10;
+  fun f() { return j; }
+  if (i == 1) fs1 = f;
+  if (i == 2) fs2 = f;
+}
+print fs1(); // expect: 10
+print fs2(); // expect: 20
+
+fun outer() {
+  var a = 1;
+  fun middle() {
+    var b = 2;
+    fun inner() { return a + b; }
+    return inner;
+  }
+  return middle();
+}
+print outer()(); // expect: 3
+
+// Many closures, enough garbage to collect.
+var sum = 0;
+for (var k = 0; k < 2000; k = k + 1) {
+  var add = counter();
+  add();
+  sum = sum + add();
+}
+print sum; // expect: 4000
