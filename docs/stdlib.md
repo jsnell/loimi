@@ -1043,7 +1043,7 @@ access is compiled in only when the program uses it.
 - **Counters**: `prof.Counters.new()`, `c.add(name) -> id`, `c.inc(id)`,
   `c.bump(id, n)` (inlined), `c.get(id)`, `c.report()` (stderr),
   `c.free()`: for events `--vm-stats` does not see (cache misses,
-  slow-path entries).
+  slow paths outside `cold` blocks, which `--vm-stats` counts itself).
 - **Vm stats**: in a `loimi build --vm-stats` build,
   `prof.op_counts("Vm") -> ?prof.OpCounts` gives the vm's counters
   (None without the flag or for an unknown vm; `prof.vm_stats_enabled()`).
