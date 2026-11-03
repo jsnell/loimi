@@ -1,0 +1,66 @@
+// A `#![safe]` module: raw-pointer operations need `unsafe { }`, but a
+// `*T` is still a reference: following it, its fields, methods that take
+// one, `new(&arena, ..)`, `&place`, `Vec` and slices are all allowed.
+#![safe]
+
+import std.io;
+import std.mem;
+
+struct Node { val: i64, next: ?*Node }
+
+struct Counter { n: u64, hits: mem.Vec<u64> }
+
+fn Counter.bump(c: *Counter, x: u64) {
+    c.n += 1;
+    c.hits.push(x);
+}
+
+fn sum(list: ?*Node) -> i64 {
+    var s: i64 = 0;
+    var p = list;
+    while let Some(n) = p {
+        s += n.val;
+        p = n.next;
+    }
+    s
+}
+
+fn first(xs: []i64) -> i64 { xs[0] }
+
+fn main() -> i32 {
+    var arena = mem.Arena.new();
+    var list: ?*Node = None;
+    for i in 1..5 {
+        list = Some(new(&arena, Node { val: i, next: list }));
+    }
+    io.print_int(sum(list));
+    io.print(" ");
+
+    var c = Counter { n: 0, hits: mem.Vec.new() };
+    c.bump(3);
+    c.bump(4);
+    let p = &c;
+    io.print_int((p.n + p.hits.at(1)) as i64);
+    io.print(" ");
+
+    var a: [i64; 3] = [7, 8, 9];
+    let r = &a[1];
+    *r = 80;
+    io.print_int(first(a[1..]));
+    io.print(" ");
+
+    var v: mem.Vec<i64> = mem.Vec.new();
+    v.push(5);
+    v.push(6);
+    var t: i64 = 0;
+    for x in v.items() { t += x; }
+    // An escape hatch, justified: the buffer holds `v.len` values.
+    let raw = unsafe { v.items().ptr[1] };
+    io.print_int(t + raw);
+    io.println("");
+    v.free();
+    c.hits.free();
+    arena.free();
+    0
+}
+// expect: 10 6 80 17

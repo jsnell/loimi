@@ -1,0 +1,7 @@
+// error: pointer arithmetic (`p.offset(n)`)
+#![safe]
+import std.mem;
+
+fn f(p: *u8) -> *u8 { p.offset(1) }
+
+fn main() {}

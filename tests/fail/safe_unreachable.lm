@@ -1,0 +1,7 @@
+// error: `unreachable`
+#![safe]
+import std.mem;
+
+fn f(x: bool) -> i32 { if x { 1 } else { unreachable } }
+
+fn main() {}

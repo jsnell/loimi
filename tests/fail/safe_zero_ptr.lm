@@ -1,0 +1,8 @@
+// error: `..zero` making a null pointer
+#![safe]
+import std.mem;
+
+struct S { p: *u8, n: u64 }
+fn f() -> S { S { n: 1, ..zero } }
+
+fn main() {}

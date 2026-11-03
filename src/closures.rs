@@ -337,7 +337,12 @@ impl<'a> Checker<'a> {
                     let lit = |v: i128| Expr { kind: ExprKind::Int(v as u128), span: alloc.span };
                     let name = Ident { name: "alloc_bytes".into(), span: alloc.span };
                     let at = self.ty_name(&a.ty);
-                    self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span).map_err(|d| {
+                    // The compiler's own call: the size and alignment are
+                    // the environment's (`#![safe]` modules allow it).
+                    cx.unsafe_depth += 1;
+                    let r = self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span);
+                    cx.unsafe_depth -= 1;
+                    r.map_err(|d| {
                         d.note(alloc.span, format!(
                             "the environment of `new(a, |..| ..)` is allocated with `a.alloc_bytes(size: u64, align: u64) -> *u8` (`a` is `{}`; `*mem.Arena` has one), or in the GC heap if `a` is a `*gc.Heap`",
                             at
@@ -412,7 +417,12 @@ impl<'a> Checker<'a> {
         let lit = |v: u128| Expr { kind: ExprKind::Int(v), span: alloc.span };
         let name = Ident { name: "alloc_bytes".into(), span: alloc.span };
         let an = self.ty_name(&a.ty);
-        let mem = self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span).map_err(|d| {
+        // The compiler's own call, with the value's size and alignment:
+        // `#![safe]` modules allow it (the result is one `T`).
+        cx.unsafe_depth += 1;
+        let mem = self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span);
+        cx.unsafe_depth -= 1;
+        let mem = mem.map_err(|d| {
             d.note(alloc.span, format!(
                 "`new(a, v)` allocates with `a.alloc_bytes(size: u64, align: u64) -> *u8` (`a` is `{}`; `*mem.Arena` and `*mem.Malloc` have one), or makes an object if `a` is a `*gc.Heap`",
                 an

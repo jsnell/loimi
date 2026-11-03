@@ -1,0 +1,7 @@
+// error: writing `Arena.chunks`
+#![safe]
+import std.mem;
+
+fn f(a: *mem.Arena) { a.chunks.clear(); }
+
+fn main() {}

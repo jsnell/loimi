@@ -1,0 +1,7 @@
+// error: calling `alloc_bytes`
+#![safe]
+import std.mem;
+
+fn f(a: *mem.Arena) -> *u8 { a.alloc_bytes(16, 8) }
+
+fn main() {}

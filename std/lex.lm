@@ -18,6 +18,8 @@
 // escape rules, numeral overflow) are fields of `Syntax`. Text is treated
 // as bytes; identifiers are ASCII.
 
+#![safe]
+
 import std.diag;
 import std.hash;
 import std.map;

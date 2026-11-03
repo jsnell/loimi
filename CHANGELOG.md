@@ -102,6 +102,17 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
+  reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
+  pointer casts, other modules' buffer pointers and invariant fields,
+  `..zero` null pointers, `assume`/`unreachable` and calls of `extern`
+  and `#[raw]` functions need `unsafe { }` there (a check only: the IR
+  is unchanged). `std.mem` marks its pointer+length and freeing
+  functions `#[raw]`. Lifetimes are not checked
+  ([language.md §1.3](docs/language.md#13-memory),
+  [design/safety.md](docs/design/safety.md)). Naming an `#[unsafe]`
+  method through `x.m()` or explicit type arguments now needs `unsafe`
+  too (it slipped through before).
 - **128-bit vectors**: `i8x16` .. `f64x2` with lane-wise operators,
   masks, lanes, shuffles, swizzles, widening and saturating narrowing,
   saturating and rounding arithmetic, IEEE min/max and lane-wise `as`;
@@ -188,6 +199,16 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- **Memory-safe std modules**: `std.lex`, `std.parse`, `std.diag`,
+  `std.text`, `std.hash`, `std.io`, `std.bc` and `std.map` are
+  `#![safe]`, with justified `unsafe` blocks around C calls and the
+  hash tables' masked indexing. `OrderedMap.entry`/`set_value`/`remove_at`
+  panic on an index that is not a live entry (they read out of bounds
+  before), and `HashMap.free`/`OrderedMap.free` leave the map usable
+  (a later call used freed memory); the shared probe core is `#[raw]`. `mem.Vec` gained
+  `extend(s)` (safe when `s` is the vector's own items: fixes a
+  use-after-free in `StrBuf.push_str(b.as_str())`) and `filled(n, x)`;
+  `io.free_file` is `#[raw]` ([design/safety.md](docs/design/safety.md)).
 - **`std.bigint`**: arbitrary-precision integers with Python's semantics
   ([stdlib.md](docs/stdlib.md#stdbigint)).
 - **`std.map.OrderedMap`, `std.dict.Dict`, `std.dict.KeyDict`**:

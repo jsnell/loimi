@@ -1,0 +1,7 @@
+// error: reading a slice's `.ptr`
+#![safe]
+import std.mem;
+
+fn f(s: []u8) -> *u8 { s.ptr }
+
+fn main() {}

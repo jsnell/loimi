@@ -307,7 +307,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
 - **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
   silences one on a match arm, an item (function, `vm`, ...) or a vm item
   (`op`, `family`, vm function, entry), covering everything inside it;
-  `#![allow(name)]` at the top of a file covers the file. An unknown
+  `#![allow(name)]` at the top of a file covers the file (as `#![safe]`,
+  section 1.3, makes a file checked). An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
   `unreachable_arm` (above), `super_overlap` (section 7.3),
@@ -329,7 +330,7 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   a check. `#[allow(..)]` goes anywhere (items, vm items, fields, enum
   variants, match arms, `#![..]`); functions (also extern, trait and vm
   functions) take `#[inline]`, `#[inline(always|never)]`, `#[cold]`,
-  `#[unsafe]`, `#[test]` and `#[track_caller]` (below); `export "C"`
+  `#[unsafe]`, `#[raw]` (section 1.3), `#[test]` and `#[track_caller]` (below); `export "C"`
   functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
   enums named in a C header `#[c_name("..")]` (section 10.1); an
   `object` takes `#[trace(f)]` (section 8); a `vm`
@@ -778,12 +779,12 @@ fn main() { Sym { id: 5 }.show_line(); }
   `#[inline(always)]`, `#[inline(never)]`. `trap()` aborts (there is no
   `assert`); `size_of<T>()` is a type's size in bytes.
 - `unsafe { }` marks code whose correctness the compiler cannot check.
-  As implemented, exactly one operation requires it: making a GC
-  reference from something else (`p as Gc<T>` from a pointer, an address
-  or another `Gc`; section 8), because the collector trusts every `Gc` it
-  finds. Raw pointers do not need it (section 1.3). An `unsafe` block is
-  an ordinary block otherwise, and may be used to mark other unchecked
-  code for readers.
+  Everywhere, it is required for making a GC reference from something
+  else (`p as Gc<T>` from a pointer, an address or another `Gc`; section
+  8), because the collector trusts every `Gc` it finds, and for naming an
+  `#[unsafe]` function. In a module marked `#![safe]` it is also required
+  for raw-pointer operations (section 1.3); elsewhere raw pointers do not
+  need it. An `unsafe` block is an ordinary block otherwise.
 
 #### Vectors
 
@@ -931,15 +932,52 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
 
 - **Arrays and slices are bounds-checked** (in debug and release builds),
   and integer overflow traps in debug builds.
-- **Raw pointers are unchecked, and need no `unsafe`.** `*p`, `p.field`,
-  `p[i]` and `p + n` on a `*T` compile to plain loads, stores and address
-  arithmetic, anywhere. The pointer type is the marker: a `*T` says
-  "no bounds, no lifetime", the way a slice says "checked". Interpreter
-  host code (allocators, hash tables, the collector, register windows)
-  is built on pointers, and the standard library and the example
-  interpreters use them throughout; requiring `unsafe` around each use
-  would mark most of that code without making any of it safer. Use a
-  slice (`p.slice(n)`) where a bounds check is wanted.
+- **Raw pointers are unchecked.** `*p`, `p.field`, `p[i]` and `p + n`
+  on a `*T` compile to plain loads, stores and address arithmetic. In a
+  module without `#![safe]` they need no `unsafe`: the pointer type is
+  the marker, a `*T` says "no bounds, no lifetime" the way a slice says
+  "checked". Interpreter host code (allocators, hash tables, the
+  collector, register windows) is built on pointers, and requiring
+  `unsafe` around each use would mark most of it without making any of
+  it safer. Use a slice (`p.slice(n)`) where a bounds check is wanted.
+- **`#![safe]` modules** (an attribute at the top of the file) are
+  checked: there a `*T` is a reference to one live value. Following it
+  (`*p`, `p.f`, `p.read_unaligned()`, atomics), `&place`, `new(a, v)`,
+  slices, `Vec` and other modules' methods are allowed; outside
+  `unsafe { }`, everything that makes a pointer reach anything else is an
+  error: `p[i]`, `p[a..b]`, `p + n`, `p.offset(n)`, `p.slice(n)`, casts
+  to a pointer (from an integer, another pointer type, a function or a
+  `Gc`) and from an integer to an `enum` or `value` type, reading a
+  slice's `.ptr` or a raw-pointer field of another module's struct,
+  writing any field of another module's struct that has raw-pointer
+  fields (`v.len = 0`; their module's invariants), building one with a
+  literal, `..zero` making a null `*T`, `assume` and `unreachable`, and
+  calls of `extern` functions and of functions marked **`#[raw]`**. A
+  function is marked `#[raw]` when it is unsound for some arguments that
+  are pointers to one value each: it takes a pointer and a length
+  (`mem.copy(dst, src, n)`), frees (`mem.release(p)`), or returns memory
+  that is not one valid value (`mem.alloc<T>(n)`). `#[raw]` changes
+  nothing in modules without `#![safe]`. Vm code is exempt (its operand
+  accesses rest on the verifier, section 6), as is code generated from
+  a `vm` declaration. *Lifetimes are not checked*: a pointer or slice into
+  a `Vec` or map dangles once it grows or is freed, and `&local` may
+  outlive its function. `std.lex`, `std.parse`, `std.diag`, `std.text`,
+  `std.hash`, `std.io`, `std.bc` and `std.map` are `#![safe]`; see
+  `docs/design/safety.md` for the rule's holes and the cost.
+
+  <!-- snippet: fail "indexing a raw pointer"
+  #![safe]
+  {snippet}
+  fn main() {}
+  -->
+  ```loimi
+  fn second(p: *u8) -> u8 { p[1] }               // error: use a slice
+  fn second_ok(s: []u8) -> u8 { s[1] }           // bounds-checked
+  fn second_raw(p: *u8) -> u8 {
+      // unsafe: callers pass a buffer of at least two bytes
+      unsafe { p[1] }
+  }
+  ```
 - **Alignment.** `*p` assumes `p` is aligned for its type (LLVM may
   rely on it: vectorizing, combining accesses), as in C. For an address
   that may not be, such as a guest's memory address or a packed format,

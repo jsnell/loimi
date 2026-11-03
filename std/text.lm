@@ -1,5 +1,7 @@
 // Strings: building, comparison, parsing, interning.
 
+#![safe]
+
 import std.mem;
 import std.hash;
 
@@ -13,11 +15,7 @@ pub fn StrBuf.new() -> StrBuf { StrBuf { bytes: mem.Vec.new() } }
 
 pub fn StrBuf.push(b: *StrBuf, c: u8) { b.bytes.push(c); }
 
-pub fn StrBuf.push_str(b: *StrBuf, s: str) {
-    b.bytes.reserve(s.len);
-    mem.memcpy(b.bytes.ptr + b.bytes.len, s.ptr, s.len);
-    b.bytes.len += s.len;
-}
+pub fn StrBuf.push_str(b: *StrBuf, s: str) { b.bytes.extend(s); }
 
 pub fn StrBuf.push_int(b: *StrBuf, x: i64) {
     var buf: [u8; 24] = [0; 24];
@@ -40,8 +38,11 @@ pub fn StrBuf.push_f64(b: *StrBuf, x: f64) {
     var prec = 1;
     var n: i32 = 0;
     while prec <= 17 {
-        n = snprintf(&buf[0], 40, "%.*g\0".ptr, prec, x);
-        let back = strtod(&buf[0], 0 as **u8);
+        // unsafe: C calls on `buf`, whose size snprintf is given and which it NUL-terminates
+        let back = unsafe {
+            n = snprintf(&buf[0], 40, "%.*g\0".ptr, prec, x);
+            strtod(&buf[0], 0 as **u8)
+        };
         if back == x or x != x { break; }
         prec += 1;
     }
@@ -213,9 +214,10 @@ pub fn parse_int(s: str) -> ?i64 {
 pub fn parse_f64(s: str) -> ?f64 {
     if s.len == 0 or s.len > 63 { return None; }
     var buf: [u8; 64] = [0; 64];
-    mem.memcpy(&buf[0], s.ptr, s.len);
+    for i in 0..s.len { buf[i] = s[i]; }
     var end: *u8 = &buf[0];
-    let v = strtod(&buf[0], &end);
+    // unsafe: strtod reads the NUL-terminated copy in `buf` (s.len < 64) and points `end` into it
+    let v = unsafe { strtod(&buf[0], &end) };
     if (end as u64) - (&buf[0] as u64) != s.len { return None; }
     Some(v)
 }
@@ -225,10 +227,10 @@ pub fn parse_f64(s: str) -> ?f64 {
 /// An open-addressing table of one word per slot, at most half full: the
 /// id + 1 in the low half and the top 32 bits of the string's hash in
 /// the high half, so a probe compares bytes only when the hashes agree.
-pub struct Interner { slots: *u64, mask: u64, names: mem.Vec<str>, arena: mem.Arena }
+pub struct Interner { slots: mem.Vec<u64>, mask: u64, names: mem.Vec<str>, arena: mem.Arena }
 
 pub fn Interner.new() -> Interner {
-    Interner { slots: mem.alloc(64), mask: 63, names: mem.Vec.new(), arena: mem.Arena.new() }
+    Interner { slots: mem.Vec.filled(64, 0), mask: 63, names: mem.Vec.new(), arena: mem.Arena.new() }
 }
 
 /// The id of `s`, if it has one.
@@ -237,7 +239,7 @@ pub fn Interner.find(it: *Interner, s: str) -> ?u32 {
     let tag = h >> 32;
     var i = h & it.mask;
     loop {
-        let w = it.slots[i];
+        let w = it.slots.at(i);
         if w == 0 { return None; }
         if w >> 32 == tag {
             let id = (w & 0xFFFFFFFF) - 1;
@@ -252,7 +254,7 @@ pub fn Interner.intern(it: *Interner, s: str) -> u32 {
     let tag = h >> 32;
     var i = h & it.mask;
     loop {
-        let w = it.slots[i];
+        let w = it.slots.at(i);
         if w == 0 { break; }
         if w >> 32 == tag {
             let id = (w & 0xFFFFFFFF) - 1;
@@ -263,32 +265,31 @@ pub fn Interner.intern(it: *Interner, s: str) -> u32 {
     let owned = it.arena.str(s);
     let id = it.names.len;
     it.names.push(owned);
-    it.slots[i] = (tag << 32) | (id + 1);
+    it.slots.set(i, (tag << 32) | (id + 1));
     if (id + 1) * 2 > it.mask { it.grow(); }
     id as u32
 }
 
 fn Interner.grow(it: *Interner) {
-    let old = it.slots;
+    var old = it.slots;
     let n = it.mask + 1;
     it.mask = n * 2 - 1;
-    it.slots = mem.alloc(n * 2);
-    for j in 0..n {
-        let w = old[j];
+    it.slots = mem.Vec.filled(n * 2, 0);
+    for w in old.items() {
         if w == 0 { continue; }
         let h = hash.bytes(it.names.at((w & 0xFFFFFFFF) - 1));
         var i = h & it.mask;
-        while it.slots[i] != 0 { i = (i + 1) & it.mask; }
-        it.slots[i] = w;
+        while it.slots.at(i) != 0 { i = (i + 1) & it.mask; }
+        it.slots.set(i, w);
     }
-    mem.release(old);
+    old.free();
 }
 
 pub fn Interner.name(it: *Interner, id: u32) -> str { it.names.at(id as u64) }
 
 /// Release the table, the name list and the interned bytes.
 pub fn Interner.free(it: *Interner) {
-    mem.release(it.slots);
+    it.slots.free();
     it.names.free();
     it.arena.free();
 }

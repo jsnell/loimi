@@ -159,6 +159,7 @@ impl<'a> Checker<'a> {
                     }
                 };
                 self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None, verified: None, trace: None });
+                self.struct_module.insert(id, module);
                 Ty::Struct(id)
             }
             GenDecl::Enum(_) => {
@@ -529,6 +530,7 @@ impl<'a> Checker<'a> {
             let mut tmp = b.clone();
             if !self.unify(pt, &r.ty, &mut tmp) {
                 if let Ty::Ptr(_) = pt {
+                    self.check_raw_place(cx, &r, r.span)?;
                     let s = r.span;
                     let t = Ty::Ptr(Box::new(r.ty.clone()));
                     r = mk(t, TK::AddrOf(Box::new(r)), s);

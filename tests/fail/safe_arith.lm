@@ -1,0 +1,7 @@
+// error: pointer arithmetic (`p + n`)
+#![safe]
+import std.mem;
+
+fn f(p: *u8) -> *u8 { p + 1 }
+
+fn main() {}

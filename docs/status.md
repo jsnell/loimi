@@ -179,9 +179,15 @@ those builds.
   -- c)`, `language.md` §3.4a): the verifier checks depths and records
   the maximum (`v.max_stack()`), but the names are not bound in the
   handler, which moves its own stack pointer.
-- **`unsafe`** is required only for `p as Gc<T>`. Raw pointer
-  dereference, indexing and arithmetic are allowed anywhere (the design
-  draft required `unsafe` for them); see `language.md` §1.3 for why.
+- **`unsafe`** is required for `p as Gc<T>` and `#[unsafe]` functions
+  everywhere. Raw pointer dereference, indexing and arithmetic are
+  allowed in modules without `#![safe]` (the design draft required
+  `unsafe` for them everywhere); see `language.md` §1.3 for why. A
+  module marked `#![safe]` is checked: there a `*T` is a reference to
+  one value, and indexing, arithmetic, pointer casts, other modules'
+  buffer pointers and invariant fields, `extern` and `#[raw]` calls need
+  `unsafe { }`; lifetimes are not checked. `std.lex`, `parse`, `diag`, `text`, `hash`,
+  `io`, `bc` and `map` are safe (`design/safety.md`).
   The example interpreters contain no `unsafe`: float reads of a
   register use `f64.from_bits(a as u64)` (compiled to a `double` load
   of the slot), and Mini's coroutine free hook uses `heap.on_free_gc`.

@@ -1,0 +1,7 @@
+// error: calling `release`
+#![safe]
+import std.mem;
+
+fn f() { let g = mem.release<u8>; }
+
+fn main() {}

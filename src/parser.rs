@@ -47,6 +47,8 @@ const ATTRS: &[(&str, &str)] = &[
     ("inline", "functions"),
     ("cold", "functions"),
     ("unsafe", "functions"),
+    ("raw", "functions (a raw-pointer operation: `unsafe { }` in a `#![safe]` module)"),
+    ("safe", "modules (`#![safe]`: raw-pointer operations need `unsafe { }`)"),
     ("thread_local", "module-level `var`s"),
     ("require_verified", "`vm` declarations"),
     ("dispatch", "`vm` declarations"),
@@ -60,7 +62,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("scan_raw_words", "`value` types (words below 2^48 read as variants without references)"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
-pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic", "c_const", "test", "track_caller"];
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "raw", "catch_panic", "c_const", "test", "track_caller"];
 /// Attributes on `vm` declarations.
 pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
 
@@ -100,7 +102,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "raw" | "safe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }
@@ -504,7 +506,7 @@ impl Parser {
                 self.bump();
                 let first = mod_attrs.list.len();
                 self.parse_attr_body(&mut mod_attrs)?;
-                check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec() }, "a module (`#![..]`)", &[])?;
+                check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec() }, "a module (`#![..]`)", &["safe"])?;
                 continue;
             }
             let keep = self.take_cfg()?;

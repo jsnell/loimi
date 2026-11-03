@@ -1,0 +1,7 @@
+// error: pointer arithmetic
+#![safe]
+import std.mem;
+
+fn f(p: *u8) { var q = p; q += 1; }
+
+fn main() {}

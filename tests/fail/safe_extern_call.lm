@@ -1,0 +1,8 @@
+// error: calling `free`
+#![safe]
+import std.mem;
+
+extern "C" fn free(p: *u8);
+fn f(p: *u8) { free(p); }
+
+fn main() {}

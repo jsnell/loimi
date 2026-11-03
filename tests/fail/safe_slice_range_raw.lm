@@ -1,0 +1,7 @@
+// error: slicing a raw pointer
+#![safe]
+import std.mem;
+
+fn f(p: *u8) -> []u8 { p[0..4] }
+
+fn main() {}

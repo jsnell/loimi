@@ -1,0 +1,7 @@
+// error: calling `copy`
+#![safe]
+import std.mem;
+
+fn f(a: *u8, b: *u8) { mem.copy(a, b, 16); }
+
+fn main() {}

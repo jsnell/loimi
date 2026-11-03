@@ -1,0 +1,7 @@
+// error: writing `Vec<u8>.cap`
+#![safe]
+import std.mem;
+
+fn f(v: *mem.Vec<u8>) -> *u64 { &v.cap }
+
+fn main() {}

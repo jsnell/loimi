@@ -52,6 +52,19 @@ Design rules for the library:
   `free_bytes`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
   its elements point to.
+- **Checked where it can be.** `std.lex`, `std.parse`, `std.diag`,
+  `std.text`, `std.hash`, `std.io`, `std.bc` and `std.map` are
+  `#![safe]` modules (`language.md` §1.3): no raw-pointer indexing, arithmetic or
+  casts outside a few commented `unsafe { }` blocks around C calls.
+  Functions that take a pointer and a length, free, or return raw
+  memory are marked `#[raw]` (`mem.alloc`, `grow`, `release`, `copy`,
+  `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`,
+  `Malloc.free_bytes`, `io.free_file`, `map.probe_*`): a `#![safe]` module calls them
+  only in `unsafe { }`; elsewhere they are ordinary functions. A
+  container's methods leave it valid (`free()` leaves it empty and
+  usable); pointers and slices obtained from it (`items()`, `ptr_at`,
+  `get_ptr`, `entry`) are valid until it next grows or is freed, which
+  is not checked. See `design/safety.md` for the audit of every module.
 
 ---
 
@@ -168,6 +181,8 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
 - `Vec<T> { ptr, len, cap }`: `Vec.new()`, `with_capacity(n)`,
   `reserve(extra)`, `push`, `pop -> ?T`, `get(i) -> ?T`, `at(i)`,
   `ptr_at(i)`, `set(i, x)`, `last -> ?T`, `items -> []T`,
+  `extend(s)` (append a slice; `s` may be the vector's own items),
+  `Vec.filled(n, x)` (`n` copies of `x`),
   `truncate(n)`, `clear`, `free`, `sort_by(cmp)`, `try_sort_by(less)`.
   **An empty `Vec` allocates nothing**: `Vec.new()` (and
   `with_capacity(0)`) has capacity 0 and a static sentinel pointer, and
@@ -263,7 +278,8 @@ key. Probing is CPython's (`i = 5i + 1 + perturb`, `perturb >>= 5`).
   fn(K) -> bool) -> ?u64` gives an *entry index*; `put_by(hash, k, v,
   eq) -> (u64, bool)` inserts or replaces in one probe; `insert_new(hash,
   k, v)` appends a key the caller knows is absent; `entry(e) -> *Entry`,
-  `set_value(e, v)`, `is_live(e)`, `remove_at(e)`. `eq` gets a copy of
+  `set_value(e, v)`, `is_live(e)`, `remove_at(e)` (for `OrderedMap`,
+  an `e` that is not a live entry is a panic; `dict.Dict` does not check). `eq` gets a copy of
   each candidate key whose hash matches.
 - **Entry indices and `version`.** An entry index stays valid until the
   table is compacted. `version` changes on every insertion of a new key,
@@ -707,7 +723,8 @@ estimates and per-call work).
 
 `std/io.lm`: `print(s)`, `println(s)`, `print_int(i64)`, `print_f64(f64)`
 (`%.14g`), `print_bool(b)`, their stderr forms `eprint`, `eprintln`,
-`eprint_int`, `eprint_f64`, and `read_file(path) -> ?str` / `free_file(s)`.
+`eprint_int`, `eprint_f64`, and `read_file(path) -> ?str` / `free_file(s)`
+(`#[raw]`: `s` must come from `read_file`).
 These write with one unbuffered `write(2)` per call.
 
 `io.Out` is buffered output: `io.Out.stdout()` (64 KiB) or

@@ -1,0 +1,30 @@
+// mem.Vec.extend, also with the vector's own items (the buffer moves
+// while they are copied), and StrBuf.push_str of its own text.
+#![safe]
+import std.io;
+import std.mem;
+import std.text;
+
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    v.push(2);
+    for i in 0..5 { v.extend(v.items()); }
+    var t: u64 = 0;
+    for x in v.items() { t += x; }
+    io.print_int(v.len as i64);
+    io.print(" ");
+    io.print_int(t as i64);
+    io.print(" ");
+    var b = text.StrBuf.new();
+    b.push_str("ab");
+    for i in 0..4 { b.push_str(b.as_str()); }
+    io.print_int(b.len() as i64);
+    io.print(" ");
+    let z: mem.Vec<u8> = mem.Vec.filled(3, 7);
+    io.print_int(z.at(2) as i64);
+    io.println("");
+    v.free();
+    b.free();
+}
+// expect: 64 96 32 7

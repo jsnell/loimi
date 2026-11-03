@@ -1,0 +1,7 @@
+// error: reading the pointer `Vec<u8>.ptr`
+#![safe]
+import std.mem;
+
+fn f(v: *mem.Vec<u8>) -> *u8 { v.ptr }
+
+fn main() {}
