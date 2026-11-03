@@ -1040,10 +1040,11 @@ pub struct WeakInterner<X> {
     /// pinned entries.
     slots: *u64,
     cap: u64,
-    /// Non-empty slots (live and deleted), live entries, pinned entries.
+    /// Non-empty slots (live and deleted), live entries.
     used: u64,
     live: u64,
-    pinned: u64,
+    /// The pinned strings' addresses, for the scanner.
+    pinned: mem.Vec<u64>,
 }
 
 const WI_DEL: u64 = 1;
@@ -1063,7 +1064,7 @@ pub fn new_str(h: *Heap, s: str, hv: u64) -> Gc<Str> {
 /// A new, empty table registered with `h`.
 pub fn WeakInterner<X>.new(h: *Heap, make: fn(*Heap, str, u64) -> Gc<X>) -> *WeakInterner<X> {
     let t: *WeakInterner<X> = mem.alloc(1);
-    *t = WeakInterner { heap: h, make: make, slots: mem.alloc(64), cap: 64, used: 0, live: 0, pinned: 0 };
+    *t = WeakInterner { heap: h, make: make, slots: mem.alloc(64), cap: 64, used: 0, live: 0, pinned: mem.Vec.new() };
     h.add_scanner(t as *u8, wi_scan<X>);
     h.add_sweeper(t as *u8, wi_sweep<X>);
     t
@@ -1075,6 +1076,7 @@ pub fn WeakInterner<X>.free(t: *WeakInterner<X>) {
     unregister(&h.scanners, t as *u8);
     unregister(&h.sweepers, t as *u8);
     mem.release(t.slots);
+    t.pinned.free();
     mem.release(t);
 }
 
@@ -1155,7 +1157,7 @@ pub fn WeakInterner<X>.key(t: *WeakInterner<X>, x: Gc<X>) -> u64 {
         if w & WI_ADDR == a {
             if w & WI_PIN == 0 {
                 t.slots[i] = w | WI_PIN;
-                t.pinned += 1;
+                t.pinned.push(a);
             }
             return a;
         }
@@ -1207,11 +1209,7 @@ fn wi_resize<X>(t: *WeakInterner<X>) {
 /// Mark the pinned strings.
 fn wi_scan<X>(h: *Heap, data: *u8) {
     let t = data as *WeakInterner<X>;
-    if t.pinned == 0 { return; }
-    for i in 0..t.cap {
-        let w = t.slots[i];
-        if w & WI_PIN != 0 { mark_ptr(h, (w & WI_ADDR) as *u8); }
-    }
+    for i in 0..t.pinned.len { mark_ptr(h, t.pinned.at(i) as *u8); }
 }
 
 /// Drop the strings that died.
