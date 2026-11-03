@@ -422,6 +422,28 @@ Notes:
   handlers mostly 2 to 4 fewer. Not timed: there is no AArch64 hardware
   here, and qemu timings mean nothing.
 
+- **Why slow-path calls give handlers a frame (measured 2026-11-03, not
+  changed).** `-W handler_frame` reports 175–218 framed tail-call
+  handlers across the seven example interpreters on x86-64, most of them
+  from calls to `std.gc.remember`, `std.gc.refill` or a panic on a rare
+  path. The cause is stack alignment, not registers: a handler is
+  entered by `jmp`, so `rsp` is 8 bytes off, and any call needs a
+  16-byte-aligned stack, which costs a `push`. LLVM 19's shrink-wrapping
+  can't sink that push onto the slow path, because once a block has
+  touched the stack, later loads through loaded pointers and the folded
+  dispatch (`TCRETURNmi64`) count as frame uses, so the frame moves to
+  the entry block. A different calling convention for the callee
+  (`preserve_most`/`preserve_all`) does not help by itself.
+
+  An experiment on branch `cold-stub-experiment` (not merged) calls
+  these slow paths through inline asm that realigns the stack and calls
+  a `preserve_all` stub, so LLVM sees no call. It removes the frame from
+  43 of 218 handlers on x86-64 and 96 of 132 on AArch64, but the
+  geometric mean over 102 benchmarks was 0.995 (noise), tail-call
+  `.text` grew 8–30%, and using it in goto mode made Stak 1.34× slower.
+  Not merged for that reason. It could be revisited with AArch64
+  hardware, where most of the frames disappeared.
+
 ### `next`, `jump`, `redo`, `become`
 
 | Word | Lowering |
