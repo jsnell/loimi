@@ -1,0 +1,114 @@
+// Generational mode's lazy sweeping and mark epochs, with verify on and
+// collections forced at chosen points (no stress). A generational heap
+// leaves the chunks to sweep pending until the allocator takes them, and
+// a major collection flips the mark epoch instead of clearing the marks;
+// so chunks that the allocator does not reach can hold dead objects
+// marked with an older epoch. Here old objects die in chunks of one size
+// class while the program allocates only another, across several major
+// collections (the epoch comes back every second one), and the dead
+// objects point to large objects that the major collections free. If a
+// dead object counted as marked again, verify would trace it into a freed
+// object, or the live objects in the same chunks would come back wrong.
+import std.io;
+import std.gc;
+
+object Node { value: i64, big: ?Gc<Big>, next: ?Gc<Node> }
+object Big { tag: i64, pad: [u64] }
+object Other { a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64 }
+
+fn node(h: *gc.Heap, v: i64, big: ?Gc<Big>, next: ?Gc<Node>) -> Gc<Node> {
+    new(h, Node { value: v, big: big, next: next })
+}
+
+/// `tail` with n nodes with values base..base+n prepended, each holding
+/// a large object.
+fn build(h: *gc.Heap, n: i64, base: i64, tail: ?Gc<Node>) -> Gc<Node> {
+    var head = node(h, -1, None, tail);
+    for i in 0..n {
+        let b: Gc<Big> = new(h, Big { tag: base + i }, 600);
+        head = node(h, base + i, Some(b), Some(head));
+    }
+    head
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var s: i64 = 0;
+    var c = l;
+    while let Some(x) = c {
+        if x.value >= 0 {
+            s += x.value;
+            if let Some(b) = x.big { if b.tag != x.value { return -1000000; } }
+        }
+        c = x.next;
+    }
+    s
+}
+
+/// Allocate only `Other` objects (another size class).
+fn other(h: *gc.Heap, n: u64) {
+    for i in 0..n { let o: Gc<Other> = new(h, Other { a: i, b: i, c: i, d: i, e: i, f: i, g: i }); }
+}
+
+fn major(h: *gc.Heap) uses gc {
+    h.want_major = true;
+    gc.collect(h);
+}
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    h.set_growth(100, 1 << 30);   // collections only where the program asks
+
+    // Interleaved lists in the same chunks: `kept` stays alive, `dropped`
+    // becomes garbage once it is old.
+    var kept: ?Gc<Node> = None;
+    var dropped: ?Gc<Node> = None;
+    for r in 0..20 {
+        kept = Some(node(h, r, None, kept));
+        dropped = Some(build(h, 50, 1000 * (r + 1), dropped));
+    }
+    let w = h.new_weak(dropped.unwrap());
+    gc.collect(h);          // major (the first collection)
+    gc.collect(h);          // minor: everything is old now
+    io.print_int(sum(kept)); io.print(" "); io.print_bool(w.get().is_some()); io.println("");
+    dropped = None;
+
+    // Majors and minors with only `Other` allocated in between: the chunks
+    // holding the dead nodes stay pending. Every other round first
+    // allocates a few nodes right before a major collection, so that the
+    // allocator sweeps a chunk with dead nodes in it (they are still
+    // marked: old objects die only in major collections) and it is the
+    // current chunk, not a pending one, when the epoch flips.
+    for round in 0..6 {
+        if round % 2 == 0 {
+            for i in 0..5 { node(h, -1, None, None); }
+            major(h);
+        }
+        other(h, 3000);
+        gc.collect(h);
+        other(h, 3000);
+        major(h);
+        io.print_int(sum(kept)); io.print(" "); io.print_bool(w.get().is_some()); io.println("");
+    }
+
+    // Allocate nodes again: they reuse the dead nodes' slots.
+    var fresh = build(h, 500, 0, None);
+    gc.collect(h);
+    major(h);
+    io.print_int(sum(kept)); io.print(" "); io.print_int(sum(Some(fresh))); io.println("");
+    io.print_bool(h.minors > 0); io.println("");
+    heap.free();
+    0
+}
+
+// expect: 190 true
+// expect: 190 false
+// expect: 190 false
+// expect: 190 false
+// expect: 190 false
+// expect: 190 false
+// expect: 190 false
+// expect: 190 124750
+// expect: true
