@@ -21,6 +21,7 @@ on .wat) are skipped: the interpreter only reads the binary format.
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 
@@ -135,8 +136,10 @@ def run_file(wasm, jpath, verbose, timeout):
     out_lines = []
     crashed = None
     try:
-        p = subprocess.run(["sh", "-c", "ulimit -v 2500000; exec \"$0\" --script \"$1\"", wasm, script],
-                           capture_output=True, timeout=timeout)
+        # LOIMI_RUNNER (e.g. "qemu-aarch64 -L SYSROOT") runs a cross-built interpreter.
+        runner = shlex.split(os.environ.get("LOIMI_RUNNER", ""))
+        p = subprocess.run(["sh", "-c", "ulimit -v 2500000; exec \"$@\"", "sh"] + runner + [wasm, "--script", script],
+                           capture_output=True, timeout=timeout * (5 if runner else 1))
         out_lines = p.stdout.decode("utf-8", "replace").split("\n")
         if p.returncode != 0:
             crashed = "exit status %d: %s" % (p.returncode, p.stderr.decode("utf-8", "replace")[-300:])

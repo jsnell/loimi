@@ -7,6 +7,7 @@
 # - compiles tests/*.c to wasm32 with clang-19 (skipped without wasm-ld)
 #   and compares each program's output with tests/NAME.expected
 #   (-u rewrites them)
+# - LOIMI_RUNNER (e.g. qemu) runs the interpreter when LOIMI_TARGET cross-builds it
 # - if the official spec tests are installed (bench/wasm/install.sh,
 #   bench/wasm/spec.sh), runs the MVP .wast files and requires every
 #   command to pass (--fast: a subset)
@@ -42,7 +43,7 @@ for mode in $modes; do
         for src in "$DIR"/tests/*.c; do
             name=$(basename "$src" .c)
             clang-19 --target=wasm32 -nostdlib -O2 -Wl,--no-entry -Wl,--allow-undefined "$src" -o "$TMP/$name.wasm" || { echo "FAIL: compiling $name"; FAIL=1; continue; }
-            (ulimit -v 2500000; "$TMP/wasm-$mode" "$TMP/$name.wasm") > "$TMP/out" 2>&1
+            (ulimit -v 2500000; ${LOIMI_RUNNER:-} "$TMP/wasm-$mode" "$TMP/$name.wasm") > "$TMP/out" 2>&1
             if [ $UPDATE = 1 ] && [ $mode = tailcall ]; then cp "$TMP/out" "$DIR/tests/$name.expected"; fi
             if ! cmp -s "$TMP/out" "$DIR/tests/$name.expected"; then
                 echo "FAIL: $name ($mode)"; diff "$TMP/out" "$DIR/tests/$name.expected" | head -10; FAIL=1
