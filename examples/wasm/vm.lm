@@ -129,48 +129,9 @@ pub fn Machine.switch_to(m: *Machine, i: *Inst) {
 #[inline(always)]
 fn b2i(c: bool) -> i32 { if c { 1 } else { 0 } }
 
-extern "C" fn ceil(x: f64) -> f64;
-extern "C" fn floor(x: f64) -> f64;
-extern "C" fn trunc(x: f64) -> f64;
-extern "C" fn rint(x: f64) -> f64;
-extern "C" fn ceilf(x: f32) -> f32;
-extern "C" fn floorf(x: f32) -> f32;
-extern "C" fn truncf(x: f32) -> f32;
-extern "C" fn rintf(x: f32) -> f32;
-extern "C" fn sqrtf(x: f32) -> f32;
 extern "C" fn realloc(p: *u8, n: u64) -> ?*u8;
 extern "C" fn memset(p: *u8, c: i32, n: u64) -> *u8;
 extern "C" fn memmove(d: *u8, s: *u8, n: u64) -> *u8;
-
-#[inline(always)]
-pub fn f32_bits(x: f32) -> u32 { var y = x; *((&y) as *u32) }
-#[inline(always)]
-pub fn f32_from(b: u32) -> f32 { var y = b; *((&y) as *f32) }
-
-fn fmin64(a: f64, b: f64) -> f64 {
-    if a < b { return a; }
-    if b < a { return b; }
-    if a == b { return f64.from_bits(a.to_bits() | b.to_bits()); }
-    a + b
-}
-fn fmax64(a: f64, b: f64) -> f64 {
-    if a > b { return a; }
-    if b > a { return b; }
-    if a == b { return f64.from_bits(a.to_bits() & b.to_bits()); }
-    a + b
-}
-fn fmin32(a: f32, b: f32) -> f32 {
-    if a < b { return a; }
-    if b < a { return b; }
-    if a == b { return f32_from(f32_bits(a) | f32_bits(b)); }
-    a + b
-}
-fn fmax32(a: f32, b: f32) -> f32 {
-    if a > b { return a; }
-    if b > a { return b; }
-    if a == b { return f32_from(f32_bits(a) & f32_bits(b)); }
-    a + b
-}
 
 // Saturating truncations (0xFC 0..7).
 fn sat_i32(x: f64) -> i32 {
@@ -280,15 +241,15 @@ pub vm W {
         // floats
         ("F32_ADD", rf, rf, rf, a + b), ("F32_SUB", rf, rf, rf, a - b),
         ("F32_MUL", rf, rf, rf, a * b), ("F32_DIV", rf, rf, rf, a / b),
-        ("F32_MIN", rf, rf, rf, fmin32(a, b)), ("F32_MAX", rf, rf, rf, fmax32(a, b)),
-        ("F32_COPYSIGN", ru, ru, ru, (a & 0x7FFFFFFF) | (b & 0x80000000)),
+        ("F32_MIN", rf, rf, rf, a.minimum(b)), ("F32_MAX", rf, rf, rf, a.maximum(b)),
+        ("F32_COPYSIGN", rf, rf, rf, a.copysign(b)),
         ("F32_EQ", ri, rf, rf, b2i(a == b)), ("F32_NE", ri, rf, rf, b2i(a != b)),
         ("F32_LT", ri, rf, rf, b2i(a < b)), ("F32_GT", ri, rf, rf, b2i(a > b)),
         ("F32_LE", ri, rf, rf, b2i(a <= b)), ("F32_GE", ri, rf, rf, b2i(a >= b)),
         ("F64_ADD", rd, rd, rd, a + b), ("F64_SUB", rd, rd, rd, a - b),
         ("F64_MUL", rd, rd, rd, a * b), ("F64_DIV", rd, rd, rd, a / b),
-        ("F64_MIN", rd, rd, rd, fmin64(a, b)), ("F64_MAX", rd, rd, rd, fmax64(a, b)),
-        ("F64_COPYSIGN", rq, rq, rq, (a & 0x7FFFFFFFFFFFFFFF) | (b & 0x8000000000000000)),
+        ("F64_MIN", rd, rd, rd, a.minimum(b)), ("F64_MAX", rd, rd, rd, a.maximum(b)),
+        ("F64_COPYSIGN", rd, rd, rd, a.copysign(b)),
         ("F64_EQ", ri, rd, rd, b2i(a == b)), ("F64_NE", ri, rd, rd, b2i(a != b)),
         ("F64_LT", ri, rd, rd, b2i(a < b)), ("F64_GT", ri, rd, rd, b2i(a > b)),
         ("F64_LE", ri, rd, rd, b2i(a <= b)), ("F64_GE", ri, rd, rd, b2i(a >= b)),
@@ -353,12 +314,12 @@ pub vm W {
         ("I32_POPCNT", ri, ru, a.popcount() as i32),
         ("I64_CLZ", rl, rq, a.clz() as i64), ("I64_CTZ", rl, rq, a.ctz() as i64),
         ("I64_POPCNT", rl, rq, a.popcount() as i64),
-        ("F32_ABS", ru, ru, a & 0x7FFFFFFF), ("F32_NEG", ru, ru, a ^ 0x80000000),
-        ("F64_ABS", rq, rq, a & 0x7FFFFFFFFFFFFFFF), ("F64_NEG", rq, rq, a ^ 0x8000000000000000),
-        ("F32_SQRT", rf, rf, sqrtf(a)), ("F32_CEIL", rf, rf, ceilf(a)), ("F32_FLOOR", rf, rf, floorf(a)),
-        ("F32_TRUNC", rf, rf, truncf(a)), ("F32_NEAREST", rf, rf, rintf(a)),
-        ("F64_SQRT", rd, rd, a.sqrt()), ("F64_CEIL", rd, rd, ceil(a)), ("F64_FLOOR", rd, rd, floor(a)),
-        ("F64_TRUNC", rd, rd, trunc(a)), ("F64_NEAREST", rd, rd, rint(a)),
+        ("F32_ABS", rf, rf, a.abs()), ("F32_NEG", ru, ru, a ^ 0x80000000),
+        ("F64_ABS", rd, rd, a.abs()), ("F64_NEG", rq, rq, a ^ 0x8000000000000000),
+        ("F32_SQRT", rf, rf, a.sqrt()), ("F32_CEIL", rf, rf, a.ceil()), ("F32_FLOOR", rf, rf, a.floor()),
+        ("F32_TRUNC", rf, rf, a.trunc()), ("F32_NEAREST", rf, rf, a.nearest()),
+        ("F64_SQRT", rd, rd, a.sqrt()), ("F64_CEIL", rd, rd, a.ceil()), ("F64_FLOOR", rd, rd, a.floor()),
+        ("F64_TRUNC", rd, rd, a.trunc()), ("F64_NEAREST", rd, rd, a.nearest()),
         ("I32_WRAP_I64", ri, rl, a as i32),
         ("I64_EXTEND_I32_S", rl, ri, a as i64), ("I64_EXTEND_I32_U", rl, ru, a as i64),
         ("F32_CONVERT_I32_S", rf, ri, a as f32), ("F32_CONVERT_I32_U", rf, ru, a as f32),

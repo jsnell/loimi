@@ -57,7 +57,7 @@ pub fn spectest(e: *Engine) -> *ModInst {
     mi.add_func("print_f64_f64", e.host_func(TDD[0..2], [], nothing, 0));
     mi.add_global("global_i32", T_I32, 666);
     mi.add_global("global_i64", T_I64, 666);
-    mi.add_global("global_f32", T_F32, vm.f32_bits(666.6) as u64);
+    mi.add_global("global_f32", T_F32, (666.6 as f32).to_bits() as u64);
     mi.add_global("global_f64", T_F64, (666.6).to_bits());
     let t = mem.alloc<Table>(1);
     *t = Table { elems: mem.alloc<u64>(10), size: 10, max: 20, reftype: T_FUNCREF };

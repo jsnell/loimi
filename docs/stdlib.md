@@ -66,9 +66,32 @@ import.
   b)` etc., `i64` only).
 - **Bit operations**: `x.clz()`, `x.ctz()`, `x.popcount()` on any
   integer type; shifts `<< >>` (language.md §1.2).
-- **Floats**: `x.sqrt()`, `x.floor()`, `x.to_bits() -> u64`,
-  `f64.from_bits(u64)`; `as` between integers and floats. For floor
-  division and the rest, see `std.num`.
+- **Floats** (`f32` and `f64` alike; each lowers to one LLVM
+  intrinsic): `x.to_bits()` (`u32`/`u64`) and `f32.from_bits(u32)`,
+  `f64.from_bits(u64)`; `x.sqrt()`, `x.abs()`; rounding to an integral
+  value `x.floor()`, `x.ceil()`, `x.trunc()` and `x.nearest()` (to
+  nearest, ties to even: 2.5 rounds to 2.0 and -0.5 to -0.0; wasm
+  `nearest`, C `roundeven`); `x.copysign(y)` (`x`'s
+  magnitude, `y`'s sign bit); `x.is_nan()`. Two kinds of min/max:
+  - `x.min(y)`, `x.max(y)`: C `fmin`/`fmax` (IEEE 754-2008 minNum): if
+    one operand is NaN the other is returned; NaN only if both are
+    (what a signaling NaN gives is unspecified). The result for
+    `min(-0.0, 0.0)` may be either zero.
+  - `x.minimum(y)`, `x.maximum(y)`: IEEE 754-2019 `minimum`/`maximum`,
+    what wasm's `f32.min`/`f64.max` and JavaScript's `Math.min` specify:
+    a NaN operand gives a quiet NaN (a signaling one is quieted, as
+    wasm's "arithmetic NaN" requires), and `-0.0` is less than `0.0`.
+    Use these to implement a guest's IEEE semantics; `min`/`max` are
+    the cheaper choice when NaN cannot occur.
+
+  `sqrt`, `abs`, `copysign` and both min/max kinds compile to SSE2
+  instructions on x86-64 (`sqrtss`/`sqrtsd`, masks, `minsd` with a NaN
+  fix-up; `minimum` adds a sign test). The rounding functions need
+  SSE4.1's `roundss`/`roundsd`, which the default x86-64 target lacks:
+  there they are calls to libm's `floor`, `roundeven`.. (AArch64 has
+  `frintm`/`frintn`.. in the base ISA). `as` converts between integers
+  and floats (and `f32 as f64` and back). For floor division and the
+  rest, see `std.num`.
 - **Options**: `o.is_some()`, `o.is_none()`, `o.unwrap()` (traps on
   None), `o.unwrap_or(d)`, `o ?? d`, and `?` (also on `Result`).
   `o ?? p` with `p: ?T` is `?T`: `o` if it is `Some`, else `p`, which is
@@ -88,9 +111,8 @@ import.
 
 Not built: `fmt` as compile-time checked format strings (`text.StrBuf`
 has `fmt`/`add` with run-time `{}` placeholders, see `std.text`), `assert` / `debug_assert` (write `if !c { trap(); }`),
-`rotl`, `bswap`, `bitcast` (use `to_bits`/`from_bits` and `as`), the f64
-functions `fma`, `copysign`, `trunc`, `nextafter` (and `abs`, `ceil`,
-`is_nan`), `a.add_overflow(b)` as a method, `f64.to_i32_js()`, and
+`rotl`, `bswap`, `bitcast` (use `to_bits`/`from_bits` and `as`), the
+float functions `fma` and `nextafter`, `a.add_overflow(b)` as a method, `f64.to_i32_js()`, and
 saturating conversions. The guest-arithmetic helpers that were planned
 here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
 `to_i64_exact`) are built, in `std.num`.

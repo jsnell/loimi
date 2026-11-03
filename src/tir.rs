@@ -132,6 +132,20 @@ pub enum Intr {
     BitsToFloat,
     Sqrt,
     Floor,
+    Ceil,
+    Trunc,
+    /// Round to nearest, ties to even (`llvm.roundeven`).
+    Nearest,
+    Fabs,
+    IsNan,
+    Copysign,
+    /// C `fmin`/`fmax` (IEEE 754-2008 minNum: a NaN operand is ignored).
+    MinNum,
+    MaxNum,
+    /// IEEE 754-2019 `minimum`/`maximum` (wasm `min`/`max`): NaN
+    /// propagates, -0 < +0.
+    Minimum,
+    Maximum,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
     /// `__panic("msg")` (generated code only): panic with a message.

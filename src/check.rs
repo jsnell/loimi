@@ -3333,7 +3333,7 @@ impl<'a> Checker<'a> {
         let recv = {
             let mut r = recv;
             while let Ty::Ptr(inner) = &r.ty {
-                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64) && name != "offset" && name != "slice" {
+                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32) && name != "offset" && name != "slice" {
                     let t = (**inner).clone();
                     let s = r.span;
                     r = mk(t, TK::Deref(Box::new(r)), s);
@@ -3370,14 +3370,38 @@ impl<'a> Checker<'a> {
                 };
                 mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
             }
-            (Ty::F64, "to_bits") => {
+            (Ty::F64 | Ty::F32, "to_bits") => {
                 argc(0)?;
-                mk(Ty::Int(IntTy::U64), TK::Intrinsic(Intr::FloatBits, vec![recv]), span)
+                let bt = if t == Ty::F64 { IntTy::U64 } else { IntTy::U32 };
+                mk(Ty::Int(bt), TK::Intrinsic(Intr::FloatBits, vec![recv]), span)
             }
-            (Ty::F64, "sqrt" | "floor") => {
+            (Ty::F64 | Ty::F32, "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs") => {
                 argc(0)?;
-                let intr = if name == "sqrt" { Intr::Sqrt } else { Intr::Floor };
-                mk(Ty::F64, TK::Intrinsic(intr, vec![recv]), span)
+                let intr = match name {
+                    "sqrt" => Intr::Sqrt,
+                    "floor" => Intr::Floor,
+                    "ceil" => Intr::Ceil,
+                    "trunc" => Intr::Trunc,
+                    "nearest" => Intr::Nearest,
+                    _ => Intr::Fabs,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
+            }
+            (Ty::F64 | Ty::F32, "is_nan") => {
+                argc(0)?;
+                mk(Ty::Bool, TK::Intrinsic(Intr::IsNan, vec![recv]), span)
+            }
+            (Ty::F64 | Ty::F32, "copysign" | "min" | "max" | "minimum" | "maximum") => {
+                argc(1)?;
+                let y = self.expr_coerce(cx, &args[0], &t)?;
+                let intr = match name {
+                    "copysign" => Intr::Copysign,
+                    "min" => Intr::MinNum,
+                    "max" => Intr::MaxNum,
+                    "minimum" => Intr::Minimum,
+                    _ => Intr::Maximum,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv, y]), span)
             }
             (Ty::Option(_), "is_some" | "is_none") => {
                 argc(0)?;
@@ -3410,12 +3434,13 @@ impl<'a> Checker<'a> {
 
     fn static_intrinsic(&mut self, cx: &mut FnCx, t: &Ty, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
         match (t, name) {
-            (Ty::F64, "from_bits") => {
+            (Ty::F64 | Ty::F32, "from_bits") => {
                 if args.len() != 1 {
                     return Err(Diag::new(span, "`from_bits` takes one argument"));
                 }
-                let a = self.expr_coerce(cx, &args[0], &Ty::Int(IntTy::U64))?;
-                Ok(Some(mk(Ty::F64, TK::Intrinsic(Intr::BitsToFloat, vec![a]), span)))
+                let bt = if *t == Ty::F64 { IntTy::U64 } else { IntTy::U32 };
+                let a = self.expr_coerce(cx, &args[0], &Ty::Int(bt))?;
+                Ok(Some(mk(t.clone(), TK::Intrinsic(Intr::BitsToFloat, vec![a]), span)))
             }
             _ => Ok(None),
         }

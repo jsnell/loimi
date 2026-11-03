@@ -2307,12 +2307,46 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 decl(self.cg, &format!("declare {} @llvm.{}.{}({}{})", lt, n, lt, lt, extra_decl));
                 self.inst(format!("call {} @llvm.{}.{}({} {}{})", lt, n, lt, lt, vals[0], extra))
             }
+            Intr::FloatBits if args[0].ty == Ty::F32 => self.inst(format!("bitcast float {} to i32", vals[0])),
             Intr::FloatBits => self.inst(format!("bitcast double {} to i64", vals[0])),
+            Intr::BitsToFloat if e.ty == Ty::F32 => self.inst(format!("bitcast i32 {} to float", vals[0])),
             Intr::BitsToFloat => self.inst(format!("bitcast i64 {} to double", vals[0])),
-            Intr::Sqrt | Intr::Floor => {
-                let n = if i == Intr::Sqrt { "sqrt" } else { "floor" };
-                decl(self.cg, &format!("declare double @llvm.{}.f64(double)", n));
-                self.inst(format!("call double @llvm.{}.f64(double {})", n, vals[0]))
+            Intr::IsNan => {
+                let ft = self.ty(&args[0].ty);
+                self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))
+            }
+            Intr::Sqrt | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest | Intr::Fabs => {
+                let n = match i {
+                    Intr::Sqrt => "sqrt",
+                    Intr::Floor => "floor",
+                    Intr::Ceil => "ceil",
+                    Intr::Trunc => "trunc",
+                    Intr::Nearest => "roundeven",
+                    _ => "fabs",
+                };
+                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft})"));
+                self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {})", vals[0]))
+            }
+            Intr::Copysign | Intr::MinNum | Intr::MaxNum | Intr::Minimum | Intr::Maximum => {
+                let n = match i {
+                    Intr::Copysign => "copysign",
+                    Intr::MinNum => "minnum",
+                    Intr::MaxNum => "maxnum",
+                    Intr::Minimum => "minimum",
+                    _ => "maximum",
+                };
+                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft}, {ft})"));
+                let r = self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {}, {ft} {})", vals[0], vals[1]));
+                if !matches!(i, Intr::Minimum | Intr::Maximum) {
+                    return r;
+                }
+                // IEEE 754-2019 (and wasm) want a quiet NaN; LLVM may pass
+                // a signaling NaN operand through as is. `a + b` quiets it.
+                let uno = self.inst(format!("fcmp uno {ft} {}, {}", vals[0], vals[1]));
+                let q = self.inst(format!("fadd {ft} {}, {}", vals[0], vals[1]));
+                self.inst(format!("select i1 {uno}, {ft} {q}, {ft} {r}"))
             }
             Intr::GcMark => {
                 crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
