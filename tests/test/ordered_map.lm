@@ -1,0 +1,284 @@
+// std.map.OrderedMap and std.dict.Dict: `loimi test ordered_map.lm`
+// (tests/golden.rs, std_test), output compared with ordered_map.expected.
+// Randomized operation sequences are checked against a Vec-based model
+// (insertion order included), with a fixed seed.
+import std.io;
+import std.test;
+import std.mem;
+import std.hash;
+import std.gc;
+import std.map.{OrderedMap};
+import std.dict.{Dict};
+
+fn main() { io.println("not run by loimi test"); }
+
+/// A key whose hash is chosen by the test: collisions on purpose.
+struct Clash { id: i64, h: u64 }
+fn Clash.hash(k: Clash) -> u64 { k.h }
+fn Clash.eq(a: Clash, b: Clash) -> bool { a.id == b.id }
+impl hash.Hash for Clash;
+
+struct Rng { s: u64 }
+fn Rng.next(r: *Rng) -> u64 {
+    r.s = r.s ^ (r.s << 13);
+    r.s = r.s ^ (r.s >> 7);
+    r.s = r.s ^ (r.s << 17);
+    r.s
+}
+fn Rng.below(r: *Rng, n: u64) -> u64 { r.next() % n }
+
+struct Pair { k: i64, v: i64 }
+
+/// The model: pairs in insertion order.
+fn model_find(m: *mem.Vec<Pair>, k: i64) -> ?u64 {
+    for i in 0..m.len { if m.at(i).k == k { return Some(i); } }
+    None
+}
+
+fn model_remove(m: *mem.Vec<Pair>, i: u64) {
+    var j = i;
+    while j + 1 < m.len { m.set(j, m.at(j + 1)); j += 1; }
+    m.len -= 1;
+}
+
+fn check_same(om: *OrderedMap<i64, i64>, m: *mem.Vec<Pair>) {
+    test.eq(om.len, m.len);
+    var i: u64 = 0;
+    var n: u64 = 0;
+    while let Some(e) = om.next(&i) {
+        test.eq(e.key, m.at(n).k);
+        test.eq(e.value, m.at(n).v);
+        n += 1;
+    }
+    test.eq(n, m.len);
+    for k in 0..80 {
+        match model_find(m, k) {
+            Some(j) => test.eq(test.some(om.get(k)), m.at(j).v),
+            None => test.assert(!om.contains(k)),
+        }
+    }
+}
+
+#[test]
+fn basics() {
+    var m: OrderedMap<str, i64> = OrderedMap.new();
+    test.assert(m.insert("one", 1));
+    test.assert(m.insert("two", 2));
+    test.assert(m.insert("three", 3));
+    test.assert(!m.insert("one", 11));
+    test.eq(m.len, 3);
+    test.eq(test.some(m.get("one")), 11);
+    test.none(m.get("four"));
+    *test.some(m.get_ptr("two")) += 20;
+    test.eq(test.some(m.remove("two")), 22);
+    test.none(m.remove("two"));
+    test.assert(m.insert("two", 2));
+    var i: u64 = 0;
+    var order: [str; 3] = ["one", "three", "two"];
+    var n: u64 = 0;
+    while let Some(e) = m.next(&i) { test.eq(e.key, order[n]); n += 1; }
+    test.eq(n, 3);
+    let (k, v) = test.some(m.pop_last());
+    test.eq(k, "two");
+    test.eq(v, 2);
+    m.clear();
+    test.eq(m.len, 0);
+    test.none(m.pop_last());
+    test.assert(m.insert("x", 1));
+    test.eq(test.some(m.get("x")), 1);
+    m.free();
+}
+
+#[test]
+fn versions_and_entries() {
+    var m: OrderedMap<i64, i64> = OrderedMap.with_capacity(100);
+    for i in 0..50 { m.insert(i, i); }
+    let e = test.some(m.find_by(hash.mix(7), |k| k == 7));
+    let v0 = m.version;
+    m.insert(7, 70);
+    test.eq(m.version, v0);
+    test.eq(m.entry(e).value, 70);
+    m.set_value(e, 71);
+    test.eq(test.some(m.get(7)), 71);
+    m.insert(1000, 1);
+    test.assert(m.version != v0);
+    // No resize below the requested capacity: entry indices stay put.
+    test.eq(m.entry(e).key, 7);
+    m.remove_at(e);
+    test.assert(!m.is_live(e));
+    test.none(m.get(7));
+    let n = m.insert_new(hash.mix(7), 7, 77);
+    test.eq(test.some(m.get(7)), 77);
+    test.eq(m.entry(n).key, 7);
+    m.free();
+}
+
+#[test]
+fn collisions() {
+    var m: OrderedMap<Clash, i64> = OrderedMap.new();
+    for i in 0..200 { m.insert(Clash { id: i, h: (i % 3) as u64 }, i); }
+    for i in 0..200 { if i % 2 == 0 { test.eq(test.some(m.remove(Clash { id: i, h: (i % 3) as u64 })), i); } }
+    for i in 0..200 {
+        let g = m.get(Clash { id: i, h: (i % 3) as u64 });
+        if i % 2 == 0 { test.none(g); } else { test.eq(test.some(g), i); }
+    }
+    for i in 200..300 { m.insert(Clash { id: i, h: 1 }, i); }
+    test.eq(m.len, 200);
+    test.eq(test.some(m.get(Clash { id: 299, h: 1 })), 299);
+    m.free();
+}
+
+#[test]
+fn differential() {
+    var r = Rng { s: 0x9E3779B97F4A7C15 };
+    var om: OrderedMap<i64, i64> = OrderedMap.new();
+    var model: mem.Vec<Pair> = mem.Vec.new();
+    for step in 0..30000 {
+        let op = r.below(100);
+        let k = r.below(80) as i64;
+        if op < 50 {
+            let v = r.below(1000) as i64;
+            let fresh = om.insert(k, v);
+            match model_find(&model, k) {
+                Some(j) => { test.assert(!fresh); model.set(j, Pair { k: k, v: v }); }
+                None => { test.assert(fresh); model.push(Pair { k: k, v: v }); }
+            }
+        } else if op < 85 {
+            let got = om.remove(k);
+            match model_find(&model, k) {
+                Some(j) => { test.eq(test.some(got), model.at(j).v); model_remove(&model, j); }
+                None => test.none(got),
+            }
+        } else if op < 99 {
+            match om.pop_last() {
+                Some((pk, pv)) => {
+                    let last = model.at(model.len - 1);
+                    test.eq(pk, last.k);
+                    test.eq(pv, last.v);
+                    model.len -= 1;
+                }
+                None => test.eq(model.len, 0),
+            }
+        } else {
+            om.clear();
+            model.clear();
+        }
+        if step % 97 == 0 { check_same(&om, &model); }
+    }
+    check_same(&om, &model);
+    om.free();
+    model.free();
+}
+
+/// find_with: an equality that changes the map makes the lookup start
+/// over; one that fails stops it with its error.
+#[test]
+fn find_with_restarts() uses reenter {
+    var m: OrderedMap<Clash, i64> = OrderedMap.new();
+    for i in 0..10 { m.insert(Clash { id: i, h: 5 }, i); }
+    var calls = 0;
+    let r: Result<?u64, str> = m.find_with(5, |k| -> Result<bool, str> {
+        calls += 1;
+        if calls == 3 {
+            // Remove the key being looked for and put it back: it moves to
+            // the end, and the old entry index is dead.
+            m.remove(Clash { id: 6, h: 5 });
+            m.insert(Clash { id: 6, h: 5 }, 66);
+        }
+        Ok(k.id == 6)
+    });
+    let e = test.some(test.ok(r));
+    test.eq(m.entry(e).value, 66);
+    // 3 calls before the change; then the probe starts over, and reaches
+    // id 6 on the 7th call (its new entry reuses its old index slot).
+    test.eq(calls, 10);
+    let bad: Result<?u64, str> = m.find_with(5, |k| -> Result<bool, str> { if k.id == 2 { Err("boom") } else { Ok(false) } });
+    test.eq(test.err(bad), "boom");
+    let none: Result<?u64, str> = m.find_with(6, |k| -> Result<bool, str> { Ok(true) });
+    test.none(test.ok(none));
+    m.free();
+}
+
+fn dict_check(d: Gc<Dict<i64, i64>>, m: *mem.Vec<Pair>) {
+    test.eq(d.len, m.len);
+    var i: u64 = 0;
+    var n: u64 = 0;
+    while let Some(e) = d.next(&i) {
+        test.eq(d.key(e), m.at(n).k);
+        test.eq(d.value(e), m.at(n).v);
+        n += 1;
+    }
+    test.eq(n, m.len);
+    for k in 0..80 {
+        match model_find(m, k) {
+            Some(j) => test.eq(test.some(d.get(k)), m.at(j).v),
+            None => test.assert(!d.contains(k)),
+        }
+    }
+}
+
+/// The GC dict against the same model, in a stress heap.
+#[test]
+fn dict_differential() uses gc {
+    var heap = gc.Heap.new();
+    heap.set_stress(true);
+    let h = &heap;
+    var r = Rng { s: 12345 };
+    var d: Gc<Dict<i64, i64>> = Dict.new(h, 0);
+    var model: mem.Vec<Pair> = mem.Vec.new();
+    for step in 0..20000 {
+        let op = r.below(100);
+        let k = r.below(80) as i64;
+        if op < 50 {
+            let v = r.below(1000) as i64;
+            let fresh = d.insert(h, k, v);
+            match model_find(&model, k) {
+                Some(j) => { test.assert(!fresh); model.set(j, Pair { k: k, v: v }); }
+                None => { test.assert(fresh); model.push(Pair { k: k, v: v }); }
+            }
+        } else if op < 85 {
+            let got = d.remove(k);
+            match model_find(&model, k) {
+                Some(j) => { test.eq(test.some(got), model.at(j).v); model_remove(&model, j); }
+                None => test.none(got),
+            }
+        } else if op < 98 {
+            match d.pop_last() {
+                Some((pk, pv)) => {
+                    let last = model.at(model.len - 1);
+                    test.eq(pk, last.k);
+                    test.eq(pv, last.v);
+                    model.len -= 1;
+                }
+                None => test.eq(model.len, 0),
+            }
+        } else if op < 99 {
+            d = d.copy(h);
+        } else {
+            d.clear();
+            model.clear();
+        }
+        if step % 97 == 0 { dict_check(d, &model); }
+    }
+    dict_check(d, &model);
+    model.free();
+    heap.free();
+}
+
+#[test]
+fn dict_try_insert() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let d: Gc<Dict<i64, i64>> = Dict.new(h, 3);
+    var n: i64 = 0;
+    while d.has_room() {
+        test.some(d.try_insert_new(hash.mix(n as u64), n, n));
+        n += 1;
+    }
+    test.assert(n >= 3);
+    test.none(d.try_insert_new(hash.mix(n as u64), n, n));
+    d.insert_new(h, hash.mix(n as u64), n, n);
+    test.eq(d.len, (n + 1) as u64);
+    test.eq(test.some(d.get(n)), n);
+    heap.free();
+}

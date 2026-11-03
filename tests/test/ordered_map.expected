@@ -1,0 +1,9 @@
+test basics ... ok
+test versions_and_entries ... ok
+test collisions ... ok
+test differential ... ok
+test find_with_restarts ... ok
+test dict_differential ... ok
+test dict_try_insert ... ok
+
+test result: ok. 7 passed; 0 failed; 0 filtered out
