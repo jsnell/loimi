@@ -12,85 +12,122 @@ interpreter in the repository with more than one guest stack.
 (`coro.lm`) with a value stack and a frame stack of its own, in host
 memory (`mem.alloc`, like the main stack) that the object owns. They
 start small, 60 slots and 12 frames, and double when a call needs more,
-up to the main stack's limits. The VM itself does
-not know about coroutines. It runs on whatever stacks the context's
-fields `stack`, `stack_end`, `frames`, `frames_end`, `fp`, `base`, `open`
-and `open_level` describe.
+up to the main stack's limits. The VM runs on whatever stacks the
+context's fields `stack`, `stack_end`, `frames`, `frames_end`, `fp`,
+`base`, `open` and `open_level` describe, with the vm state registers
+(`pc`, `regs`, `k`, `fp`) pointing into them.
 
-- **`resume(co, ...)`** is a native, called from CALL's native path. It
-  does the following:
-  1. Saves the resumer's eight fields into a `Saved` record on its own C
-     stack. The record is linked from `Ctx.chain`.
-  2. Installs the coroutine's stacks.
-  3. Runs the coroutine through a nested entry. A coroutine that has not
-     started yet runs through `Mini.call`, the same entry
-     `table.sort`'s comparator uses. A coroutine that yielded runs
-     through the new `Mini.resume`. That entry reloads `fp`, `regs` and
-     `k` from the installed frame, stores the resume arguments as the
-     results of the pending yield's CALL, and jumps to the instruction
-     after that CALL.
-  4. When the run returns, puts the resumer's state back.
+**A switch is ordinary vm control flow.** Each thread's state, while it
+is not running, is in its own `Coro`: its frame pointer, run base, open
+upvalues, and where the CALL that switched away continues (`ypc`, a
+`Mini.Resume`) with where that CALL's results go (`ydst`, `ynres`).
+The main thread has a `Coro` too (`ctx.main`), on the main stacks. A
+running coroutine links to the thread that resumed it (`Coro.prev`).
+CALL's cold native path recognizes the three calls that switch:
 
-  Each resume is one nested run, so `Mini.depth` bounds nested resumes
-  (200, "C stack overflow") as `LUAI_MAXCCALLS` does in PUC-Lua.
-- **`yield(...)`** is a native that only checks and records. It is an
-  error outside a coroutine. It is also an error unless it was called
-  directly by a CALL instruction of the coroutine's own run, which is
-  `ctx.base == ctx.frames`, with no nested run in between. Otherwise it
-  records the values and sets `ctx.yielded`. CALL's native path then
-  sees the flag and calls the vm function `yield_exit`. That saves the
-  next instruction as a resume point (`next_resume`, a `Mini.Resume`),
-  the CALL's base register and its result count, and leaves the run with
-  `exit`. The resumer's `Mini.call`/`Mini.resume` returns, and `resume`
-  stores the coroutine's `fp`, open upvalues and continuation in the
-  `Coro`.
-- **The end of a coroutine** is its bottom frame's RET, which exits the
-  run as before. RET1, RETN and RET0 now also record how many values they
-  returned (`ctx.nxfer`, and `ctx.xfer` for RETN), so `resume` can pass
-  them all on.
-- **Errors** in the coroutine reach the run's `on raise`, which exits
-  with `Err`. `resume` closes the upvalues still open into the dead
-  stack and drops the stacks. It returns `false, msg`, or for a `wrap`
-  function returns the error, so the caller's `on raise` adds its own
-  line, as Lua 5.4 adds the caller's position.
-- **Several results from natives.** A native can now return several
-  values: it fills `ctx.rbuf` and sets `ctx.nret`, and CALL's native path
-  copies them into its result registers. Before this, every Mini native
-  returned exactly one value.
-- **Values.** `V` gained one variant, `Co(Gc<Coro>)`. It is a thread,
-  or a function made by `coroutine.wrap`: a separate `Coro` whose `wrap`
-  field is the coroutine it resumes, so that it differs from the thread
-  that `coroutine.running()` returns inside. CALL has a cold path for it
-  next to the one for natives. Only one variant was added, not two:
-  friction 2 explains why.
-- **The main thread** has a `Coro` too (`ctx.main`, without stacks), so
-  `coroutine.running()` and `status` treat it like any other thread.
+- **`coroutine.resume(co, ...)` and calling a wrap function**
+  (`switch_in` in vm.lm): if `coro.can_switch` (suspended, under the
+  nesting limit, a Mini function), save the running thread's state
+  into its `Coro` with `ypc = next_resume` (`coro.enter`), install the
+  coroutine's stacks in the context, and set the state registers from
+  its saved frame. A started coroutine continues at its own `ypc`, with
+  the resume's arguments stored as the results of its pending yield; a
+  new one gets frame 0 and jumps to its body's code.
+- **`coroutine.yield(...)`** in a coroutine resumed that way
+  (`switch_out`): save its state the same way (`coro.suspend`, which
+  also logs the `Coro` for the barrier, below), reinstall the resumer's
+  (`coro.leave`), store `true` (not for a wrap function) and the values
+  as the results of the resumer's CALL, and jump to its `ypc`.
+- **The coroutine's last return** (RET1, RETN or RET0 from its bottom
+  frame, a cold branch of the existing "bottom of the run" check) does
+  the same with the returned values, then frees the coroutine's stacks
+  (`finish`).
+- **An error** in it reaches `on raise`, which prefixes the line as
+  before and then, while the running thread is a coroutine resumed in
+  this run, kills it and continues its resumer: with `false` and the
+  message as the CALL's results, or, through a wrap function, by
+  raising the message again at the resumer's CALL (with that line
+  added, as Lua 5.4 does), which may kill the next coroutine in turn.
 
-**Why this keeps the vm state coherent.** Between two instructions the
-only state is the context's fields and the handler registers, and the
-handler registers are reloaded at every entry and after every
-`reenter` call (`reload`). Resume and yield happen exactly at those
-points: inside a native called by CALL (`sync` has published `ctx.fp`),
-or at an `exit`. So no handler ever sees a half-switched thread. The
-shadow stack stays a single stack: a coroutine's run is an ordinary
-nested run on the resumer's C stack, and it is unwound by `exit` before
-the resumer continues.
+There is no native call, no nested entry and no C stack per active
+coroutine: a resume/yield pair is two cold blocks of CALL and a jump
+each way. The argument and result values move directly between the
+two threads' registers.
+
+**Resumes from natives** still nest: a wrap function used as a
+`table.sort` comparator, or resumed by a host native, is resumed by
+the native `coro.resume`. It saves the resumer's state the same way
+(`coro.enter`, `coro.leave`) but runs the coroutine through a nested
+entry: `Mini.call` the first time, and after a yield `Mini.resume`,
+which reloads `fp`, `regs` and `k` from the installed frame, stores the
+resume arguments as the results of the pending yield's CALL, and jumps
+to the instruction after it. Such a coroutine has `inrun` false: its
+yield records the values and sets `ctx.yielded`, and CALL's native path
+calls `yield_exit`, which saves `next_resume`, the CALL's base register
+and its result count, and leaves the run with `exit`; its last return
+and its errors leave the run as well. A coroutine resumed this way can
+resume others in its own run, and a coroutine resumed in a run can call
+natives that start nested runs: each in-run link stays inside one run.
+
+**Nesting limit.** Each nested run counts in `Mini.depth` and each
+in-run resume in `ctx.nco`; together they are bounded by 200 ("C stack
+overflow"), as `LUAI_MAXCCALLS` bounds PUC-Lua's. In-run resumes use no
+C stack, so this is now Lua's limit rather than a need.
+
+**Several results from natives.** A native can return several values:
+it fills `ctx.rbuf` and sets `ctx.nret`, and CALL's native path copies
+them into its result registers (`coroutine.running`, and `resume` when
+it goes through the native).
+
+**Values.** `V` has one variant for threads, `Co(Gc<Coro>)`. It is a
+thread, or a function made by `coroutine.wrap`: a separate `Coro` whose
+`wrap` field is the coroutine it resumes, so that it differs from the
+thread that `coroutine.running()` returns inside. CALL has a cold path
+for it next to the one for natives. Only one variant was added, not
+two: friction 2 explains why.
+
+**Why the vm state stays coherent.** A switch happens inside one
+handler (a CALL, a RET, or `on raise`), which sets every state register
+(`fp`, `regs`, `k`, and `pc` through its `jump`) from the thread it
+installs, and stores the context's fields, so the next handler sees a
+whole thread. `ctx.fp` is also stored at the switch; it is what `sync`
+publishes before any call that may collect or re-enter. The state
+registers are raw pointers, not traced values, so no rooting changes:
+the collector finds the threads through the context (the running one)
+and `Coro.prev` (the resumers). The suspended thread's continuation is
+a `Mini.Resume` made by `next_resume`, the same proof the nested
+`Mini.resume` entry jumps to.
+
+**Yield across a C-call boundary.** `switch_out` is taken only when the
+running coroutine was resumed in this run and no nested run is active
+on its stacks (`ctx.base == ctx.frames`: the innermost run's bottom
+frame is the coroutine's first). Otherwise the call goes to the native,
+which yields through `yield_exit` (a coroutine resumed by a native,
+same condition) or reports "attempt to yield across a C-call boundary",
+as PUC-Lua does for C functions without continuations: yielding from a
+`table.sort` comparator, from a host native's callback, and
+`table.sort(t, coroutine.yield)`. `coroutine.isyieldable()` is false in
+those places. A comparator may still create, resume and finish other
+coroutines (in its own run), and a `wrap` function works as a
+comparator.
 
 **Stack growth.** A coroutine's stacks move when they grow (`vm.grow`):
 the main stack is fixed-size and never moves, but a coroutine's stacks
 start small. CALL's overflow check calls `grow` in a cold block. `grow`
 copies the stacks and rebases each frame's `base`, each open upvalue and
 the context's pointers. The CALL then sets `regs = fp.base` and does
-`redo`. `call_value` (comparators, `mini_call`) now keeps its saved frame
+`redo`. `call_value` (comparators, `mini_call`) keeps its saved frame
 and window as indices, because the nested run may grow the stacks. The
-block that a stack replaced stays allocated until the resume returns
-(`Coro.retired`), because a native of the coroutine's run may still hold
-an `args` pointer into it; once the run has yielded or ended, none can.
+block that a stack replaced stays allocated until the coroutine
+suspends or dies (`Coro.retired`), because a native of its run may
+still hold an `args` pointer into it; a coroutine can only suspend with
+no native active on its stacks.
 
 **GC.**
-- **Roots.** `scan_roots` walks the frames of the running thread, as
-  before, and those of every resumer on `ctx.chain`, and marks
-  `ctx.cur`, `ctx.main` and the multi-result buffer.
+- **Roots.** `scan_roots` walks the frames of the running thread, and
+  those of every resumer, following `Coro.prev` from `ctx.cur` up to
+  each one's saved `fp`, and marks `ctx.cur`, `ctx.main` and the
+  multi-result buffer.
 - **Suspended coroutines** are traced through their objects: `Coro`
   has a `#[trace(trace_coro)]` hook (std.gc's trace hooks), which walks
   the frames of a suspended coroutine and marks each frame's closure
@@ -99,10 +136,10 @@ an `args` pointer into it; once the run has yielded or ended, none can.
   hook marks nothing: its stacks are roots.
 - **Dead coroutines** free their stacks at once (`die`). A suspended
   coroutine that is dropped frees them when the collector finds the
-  `Coro` dead: `resume` registers a free hook (`heap.on_free(co,
-  free_coro)`) when it allocates the stacks. The stacks count towards
-  the next collection (`heap.allocated`), as they did when they were
-  heap objects.
+  `Coro` dead: the first resume registers a free hook (`heap.on_free(co,
+  free_coro)`) when it allocates the stacks (`coro.prepare`). The
+  stacks count towards the next collection (`heap.allocated`), as they
+  did when they were heap objects.
 - **Open upvalues.** An open upvalue into a coroutine's stack has a `co`
   field that keeps the `Coro`, and so its stacks, alive; closing it
   drops the reference. If a suspended coroutine is dropped while one of
@@ -112,17 +149,13 @@ an `args` pointer into it; once the run has yielded or ended, none can.
 - **The generational barrier.** The VM stores into a coroutine's stacks
   without write barriers. While it runs (or is normal), the stacks are
   roots, which every collection scans, minor ones included. When it
-  suspends, `resume` logs the `Coro` (`gc.write_barrier`), so the next
-  minor collection traces it through the hook, and verify mode checks
-  it from then on.
-
-**Yield across a C-call boundary.** Yield across a C-call boundary is an
-error, as in PUC-Lua for C functions without continuations: "attempt to
-yield across a C-call boundary". The cases are yielding from a
-`table.sort` comparator, yielding from a host native's callback, and
-`table.sort(t, coroutine.yield)`. `coroutine.isyieldable()` is false in
-those places. A comparator may still create, resume and finish other
-coroutines, and a `wrap` function works as a comparator.
+  suspends, `coro.suspend` logs the `Coro` (`gc.write_barrier`), so the
+  next minor collection traces it through the hook, and verify mode
+  checks it from then on.
+- **Checked** with GC stress (a collection at every safepoint), verify
+  mode (the barrier check at every collection) and `--gc-check-roots`
+  (the collector validates every reference it finds in a root), in all
+  three dispatch modes and under the JIT.
 
 ## Tests
 
@@ -138,6 +171,19 @@ coroutines, and a `wrap` function works as a comparator.
     upvalues);
   - resume chains and the nesting limit;
   - hundreds of garbage coroutines.
+
+- **`tests/coroutine_switch.mini`** covers the in-run switches and their
+  mix with nested runs: results both ways with fewer and more values
+  than wanted, a chain of resumes (main, a coroutine, a wrap function
+  inside it), errors through `resume` and through two wrap functions
+  (each adding its line), a comparator resuming coroutines in its run,
+  a wrap function as the comparator (a nested run) that resumes another
+  coroutine in its run and yields, an error in a coroutine inside a
+  comparator, the yield-across-a-comparator error from a coroutine
+  resumed by a CALL, upvalues open into suspended and finished
+  coroutines, a chain of 150 live coroutines, the nesting limit, and
+  300 dropped generators. Its expected output is what the nested-entry
+  version printed, byte for byte, in every dispatch and GC mode.
 
   `coroutine_gc.mini` prints exactly what Lua 5.4.9 prints. The scripts
   run in all three gc modes (normal, stress, verify), as every Mini script
@@ -418,21 +464,69 @@ interpreter.
    - **Suggested fix:** finalizers, or a sweeper-friendly "free this
      host block when object X dies" registration (`heap.on_free(obj,
      ptr)`).
-7. **Yield and resume can only happen where a native call happens.**
-   - **What Mini does:** a yield must leave the run at a point where the
-     handler knows the CALL's `pc`, base and result count. Mini does it
-     in CALL's native path, after the native returns, through a flag.
-     A guest operation that yields from another op (a metamethod, an
-     iterator) would need the same code in each op.
-   - **Resume costs a native call and a nested entry.** A cheaper resume
-     would be an op that swaps the state registers. Ops have no
-     supported way to do that across stacks: `reload` restores one
-     fixed shape, and the shadow-stack copies of traced state belong to
-     the run.
-   - **Suggested fix:** language.md §10's `suspend v` (leave the loop
-     with the state saved), with a matching `resume` entry form. Also
-     the `std.rt` `FrameStack`/`ValueStack` that the docs sketch, with
-     growth and relocation built in (item 8).
+7. **Resume cost a native call and a nested entry.** *Resolved in
+   Mini, without a language feature* (2026-11-03): a CALL of
+   `coroutine.resume`, of a wrap function or of `coroutine.yield`, and
+   the coroutine's last return and its errors, switch threads inside
+   the running vm run (Design, "A switch is ordinary vm control flow").
+   A resume/yield pair takes 0.62–0.81 of the time it did (Speed).
+   - **Why no language feature was needed.** Everything a switch does
+     is something handlers already do:
+     - A handler may assign every state variable and `jump` to a code
+       address that vm code saved: CALL and RET do it with each
+       frame's return address (`jump fp.resume`). A switch is the same
+       with another thread's frame: set `fp`, `regs` and `k` from the
+       frame it installs, `jump` to its saved continuation.
+       `next_resume` (item 3) already made that continuation a proof,
+       `Mini.Resume`, so the saved thread state needs no raw pointer
+       to code that was not made by vm code.
+     - The shadow-stack copies of traced state do not belong to the
+       run beyond a call: the compiler copies each traced state
+       variable at each call that may collect, from its current value.
+       A switch happens between calls, so nothing refers to the old
+       thread's registers afterwards. Mini's state registers are raw
+       pointers anyway; the collector finds the threads through Mini's
+       own scanner (`ctx.cur` and `Coro.prev`). Under GC stress, verify
+       mode and `--gc-check-roots`, in all three dispatch modes and
+       under the JIT, the tests pass unchanged.
+     - `reload` is for after a call that may have run guest code; a
+       switch does not call anything that runs guest code, so it does
+       not need it: it sets the registers itself.
+     - `suspend v` (language.md §3.4, §10: leave the loop with the
+       state saved) is the wrong primitive for this: it still leaves
+       and re-enters the run at every switch, which is the cost this
+       removes. It would help a host that drives guest generators from
+       outside the loop; Mini's host-side resume (`coro.resume`, for
+       comparators and host natives) already does that with a nested
+       entry, `exit` and the `Mini.resume` entry.
+   - **What is still the vm's job**, as for return addresses: that the
+     state it installs (frame, registers, constants) belongs to the code
+     it jumps to, and that the thread's context fields and the state
+     registers are switched together. Mini keeps both in three small
+     functions (`coro.enter`, `coro.leave`, `coro.suspend`) and three vm
+     functions (`switch_in`, `switch_out`, `back`).
+   - **Still true:** a yield is recognized at a CALL. A guest operation
+     that yields from another op (a metamethod, an iterator) would need
+     the same check in that op; Mini has neither.
+   - **A tail-call detail:** `switch_in`, `switch_out` and `back` are
+     `#[inline]`. Without it, each switch in tail-call mode went from
+     CALL's outlined cold block through two shared copies of `-> never`
+     vm functions (arguments in thread-local slots, a frame set-up
+     each); inlined, tail-call mode is 10–17% faster on the three
+     benchmarks, and goto and switch modes (which inline every call
+     anyway) are unchanged.
+
+   As it was:
+   - **What Mini did:** a yield had to leave the run at a point where
+     the handler knows the CALL's `pc`, base and result count. Mini did
+     it in CALL's native path, after the native returned, through a
+     flag. Each resume was a native call and a nested entry: in goto
+     and switch mode the entry is the function holding every handler,
+     entered and left once per resume/yield pair (docs/results.md,
+     "Follow-up (2026-11-03)").
+   - **Suggested fix (then):** language.md §10's `suspend v`, with a
+     matching `resume` entry form, on the belief that ops had no
+     supported way to swap the state registers across stacks.
 8. **Stacks that move.** *Unchanged,* except that a replaced block is
    now freed when the resume returns, not when the coroutine dies. As
    it was:

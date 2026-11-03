@@ -2720,10 +2720,27 @@ calls are implemented as nested entries (below).
   Suspending across a host frame is an error (as with Lua's "yield across a
   C-call boundary") unless the coroutine runs on a `std.rt.Fiber`, which has
   its own stack. *Built today:* Mini's coroutines (examples/mini/COROUTINES.md)
-  do this by hand with nested entries. The yield saves `next_resume` and
-  leaves the run with `exit`; the resume is an entry that reinstalls the
-  coroutine's frame and jumps to that resume point (section 6), which
-  `#[require_verified]` accepts.
+  need neither `suspend` nor a new entry form; they use what handlers
+  and entries already have:
+  - **Switching inside the run.** A guest coroutine with its own value
+    and frame stacks is switched to like a call: a handler (Mini's
+    CALL of `coroutine.resume`, of `coroutine.yield`, and its RET from a
+    coroutine's bottom frame) saves the running thread's state where
+    the vm keeps it (Mini: in the thread's `Coro` object, with
+    `next_resume` as where it continues), assigns the state variables
+    from the other thread's saved frame, and `jump`s to that thread's
+    saved resume point (`r.pc()`), as RET jumps to a return address.
+    The run goes on dispatching: no native call, no nested entry, no C
+    stack per coroutine. Traced state variables need nothing extra:
+    the compiler roots them at each call that may collect, from the
+    values they have then (section 8); the collector reaches the saved
+    threads through the vm's own root scanner.
+  - **From host code**, where a native resumes a coroutine (Mini: a
+    `table.sort` comparator that is a coroutine's wrap function), the
+    coroutine runs in a nested entry: the yield saves `next_resume` and
+    leaves the run with `exit`, and the next resume is an entry that
+    reinstalls the coroutine's frame and jumps to that resume point
+    (section 6), which `#[require_verified]` accepts.
 
 ### 10.1 Embedding in a C host (implemented)
 

@@ -95,6 +95,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     var s = c.cur.prev;
     loop {
         let Some(r) = s else { break; };
+        gc_mark(h, r);
         if let Some(u) = r.open { gc_mark(h, u); }
         scan_frames(h, r.frames, r.fp);
         s = r.prev;
@@ -1185,6 +1186,7 @@ pub vm Mini {
     /// The bottom frame of a coroutine resumed in this run returns
     /// `vals[0..n]` (its open upvalues are closed): it dies, and its
     /// resumer continues.
+    #[inline(never)]
     fn finish(vals: *V, n: u64) -> never {
         let co = ctx.cur;
         back(co, Bool(true), !co.via_wrap, vals, n, true)
@@ -1232,7 +1234,7 @@ pub vm Mini {
         let v = src;
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
-            if ctx.cur.inrun and fp == ctx.frames { cold { regs[0] = v; finish(regs, 1) } }
+            if ctx.cur.inrun and fp == ctx.frames { regs[0] = v; finish(regs, 1) }
             ctx.nxfer = 1;
             exit Ok(v)
         }
@@ -1256,7 +1258,7 @@ pub vm Mini {
     op RETN(a: reg, n: retn) : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
-            if ctx.cur.inrun and fp == ctx.frames { cold { finish(regs + a.raw as u64, n as u64) } }
+            if ctx.cur.inrun and fp == ctx.frames { finish(regs + a.raw as u64, n as u64) }
             ctx.xfer = regs + a.raw as u64;
             ctx.nxfer = n as u64;
             exit Ok(a)
@@ -1275,7 +1277,7 @@ pub vm Mini {
     op RET0() : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
-            if ctx.cur.inrun and fp == ctx.frames { cold { finish(regs, 0) } }
+            if ctx.cur.inrun and fp == ctx.frames { finish(regs, 0) }
             ctx.nxfer = 0;
             exit Ok(Nil)
         }
