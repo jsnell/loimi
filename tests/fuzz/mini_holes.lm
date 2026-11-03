@@ -120,10 +120,11 @@ fn verifies(which: u8, run: bool) -> bool uses gc {
     io.println(if child_ok { "ok" } else { "rejected" });
     if !ok { return false; }
     let stack: *V = mem.alloc(nregs as u64);
-    let main = coro.new_main(h);
+    let frames: *Frame = mem.alloc(16);
+    let main = coro.new_main(h, stack, nregs as u64, frames, 16);
     var ctx = Ctx {
         heap: heap, stack: stack, stack_end: stack + nregs as u64,
-        frames: mem.alloc(16), frames_end: 0 as *Frame, fp: 0 as *Frame, base: 0 as *Frame,
+        frames: frames, frames_end: 0 as *Frame, fp: 0 as *Frame, base: 0 as *Frame,
         globals: value.new_table(h), rethrow: V.Nil, out: text.StrBuf.new(),
         open: None, open_level: 0 as *V, host: vm.no_host,
         cur: main, main: main, nret: vm.NRET_ONE, rbuf: mem.alloc(16), rcap: 16,

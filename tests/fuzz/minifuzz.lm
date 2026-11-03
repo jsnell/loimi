@@ -369,12 +369,16 @@ fn main() -> i32 uses gc {
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     let globals = value.new_table(&heap);
-    let main = coro.new_main(&heap);
+    // The main thread's stacks change per program (`ctx.stack`), but
+    // only a coroutine switching back reads them from `main`, and the
+    // fuzzed programs have no coroutine library.
+    let frames: *Frame = mem.alloc(16);
+    let main = coro.new_main(&heap, 0 as *V, 0, frames, 16);
     var ctx = Ctx {
         heap: heap,
         stack: 0 as *V,
         stack_end: 0 as *V,
-        frames: mem.alloc(16),
+        frames: frames,
         frames_end: 0 as *Frame,
         fp: 0 as *Frame,
         base: 0 as *Frame,
