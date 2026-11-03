@@ -16,7 +16,9 @@
 #                             system (unbounded integers, needed by perfect).
 #                             CMake is Kitware's pinned binary release,
 #                             unpacked into src/ (the host has no cmake and
-#                             no python3-venv for pip's cmake).
+#                             no python3-venv for pip's cmake). Its
+#                             RUNPATHs are made $ORIGIN-relative by
+#                             set_runpath.py, so the install can be moved.
 #   programs/*.pl             the SWI-Prolog bench programs, made standalone
 #                             by prepare.py (edits listed in README.md).
 # Tarballs are verified against the sha256 in MANIFEST before extraction.
@@ -68,6 +70,14 @@ swipl() {
         -G "Unix Makefiles") >"$src/swipl-configure.log" 2>&1
     make -C "$dir/build" -j"$jobs" >"$src/swipl-make.log" 2>&1
     make -C "$dir/build" install >"$src/swipl-install.log" 2>&1
+    # CMake installs swipl and libswipl.so with RUNPATH set to the absolute
+    # library directory (cmake/Install.cmake sets CMAKE_INSTALL_RPATH, so a
+    # -D cannot override it): make it $ORIGIN-relative, so that the install
+    # still starts when moved (e.g. when built in a git worktree).
+    arch="$dst/swipl/lib/swipl"
+    python3 -I "$here/set_runpath.py" '$ORIGIN/../../lib/x86_64-linux' \
+        "$arch/bin/x86_64-linux/swipl" "$arch/bin/x86_64-linux/swipl-win"
+    python3 -I "$here/set_runpath.py" '$ORIGIN' "$arch"/lib/x86_64-linux/libswipl.so.*.*.*
     "$dst/swipl/bin/swipl" --version
 }
 

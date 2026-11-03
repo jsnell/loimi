@@ -52,13 +52,6 @@ REFS = {
     "trealla": lambda f: [os.path.join(INSTALL, "trealla/bin/tpl"), "-q", f, "-g", "halt"],
 }
 
-# swipl's RUNPATH is the absolute directory it was installed in; an install
-# that moved (or was built in another checkout) finds libswipl through this.
-_swipl_lib = os.path.join(INSTALL, "swipl/lib/swipl/lib/x86_64-linux")
-if os.path.isdir(_swipl_lib):
-    os.environ["LD_LIBRARY_PATH"] = _swipl_lib + (
-        ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else "")
-
 
 def read_iterations():
     its = {}
