@@ -9,7 +9,8 @@ and relies on the language features in [`../language.md`](../language.md)
 ## As implemented
 
 `std/gc.lm`, tested by `tests/run/gc_*.lm` (among them
-`gc_generational.lm`, `gc_verify_barrier.lm` and `gc_weak.lm`) and by
+`gc_generational.lm`, `gc_verify_barrier.lm`, `gc_weak.lm` and
+`gc_hooks.lm`) and by
 every interpreter test run in three modes: normal, `stress`, and
 `verify` (generational heap, stress, and verification).
 
@@ -165,10 +166,11 @@ when they unwind.
   with `t.free()`. After the roots are marked, the collector marks the
   values of entries with marked keys, drains, and repeats until nothing
   new is marked. It then drops the entries whose key died. The table is
-  not itself a GC object, so a guest `WeakMap` object needs a finalizer
-  (not implemented) to free it.
+  not itself a GC object, so a guest `WeakMap` object frees it with a
+  free hook (`h.on_free`, below).
 - Order after marking: ephemerons to a fixpoint, ephemeron sweeping,
-  weak references, then the sweepers (`add_sweeper`). In a minor
+  weak references, then the sweepers (`add_sweeper`), the free hooks
+  (`on_free`, below) first. In a minor
   collection old objects count as marked (`h.is_marked(p)`, or the
   slower `gc.is_marked(p)`, which finds the heap from the object's
   chunk), so sweepers and weak references stay correct;
@@ -181,13 +183,133 @@ when they unwind.
   map from objects, so neither `Weak` (an extra object per entry) nor
   `Ephemerons` (keyed by identity) fits better than the sweeper.
 
+### Trace hooks, free hooks and dirty pinning
+
+Three hooks for objects whose layout or lifetime the generated code
+cannot see. Mini's coroutines (examples/mini/COROUTINES.md) needed all
+of them; `tests/run/gc_hooks.lm` tests each in a non-generational heap,
+normal and under stress, and in a generational one under stress with
+verify, also built with `--gc-check-roots`.
+
+**`#[trace(f)]` on an `object`: a custom trace for the part the fields
+do not describe.**
+
+<!-- snippet: check -->
+```loimi
+import std.gc;
+
+object Node { v: i64 }
+
+#[trace(trace_stack)]
+object Stack { top: u64, slots: [?Gc<Node>] }
+
+/// Only the slots below `top` are live.
+fn trace_stack(h: *gc.Heap, s: Gc<Stack>) {
+    for i in 0..s.top { gc_mark(h, s.slots[i]); }
+}
+
+fn main() {}
+```
+
+- The generated trace function still traces the declared fields; then,
+  instead of the whole trailing array, it calls `f(h, obj)`. `f` marks
+  what is live (`gc_mark`): a prefix of the trailing array, or
+  references held in memory the object owns outside the heap (Mini's
+  coroutine stacks are `mem.alloc`'d, and their hook walks the frames).
+  Keeping the fields generated means a hook cannot forget one.
+- `f` is a function of the object's module, `fn f(h: *gc.Heap, obj:
+  Gc<Obj>)`, without effects (it runs inside a collection), checked by
+  the compiler. Generic objects cannot have one.
+- **Everything else follows from going through the trace function.** A
+  minor collection traces remembered objects with it, verify mode checks
+  what it marks (a reference to a young object from an old one outside
+  the remembered set aborts as for any field), and in a
+  `--gc-check-roots` build its `gc_mark` calls are checked and reported
+  as such. The barrier contract is the usual one: a store that changes
+  what the hook marks (a young reference into the owned memory, or
+  raising `top` over slots holding young references) needs
+  `gc.write_barrier(h, obj)` unless the compiler emits it (a store into
+  the trailing array does).
+- Why a hook and not a declared live length (`slots: [V] live(top)`):
+  the length form covers only a prefix of a trailing array, and Mini's
+  stacks needed neither (their live part is the frames' register
+  windows, and they are not in the heap). A hook covers both, at the
+  cost of writing the loop.
+
+**`h.on_free(obj, f)`: free hooks, for memory an object owns.**
+
+- `f(obj)` (a `fn(*u8)`) runs once, when a collection finds `obj`
+  unreachable, before the object's slot can be reused; `Heap.free` runs
+  the hooks of all objects still registered. Registered per object, so
+  objects that own nothing yet (a coroutine that has not started) cost
+  nothing.
+- **When.** Inside the collection, after marking, ephemerons and weak
+  references (so no `Weak` reaches the object any more and ephemeron
+  entries keyed by it are gone), as the first sweeper, before
+  `rootck_poison` and the interpreter's sweepers. Not lazily: with lazy
+  sweeping the slot is freed later, but the hook has already run.
+  Objects that die together run their hooks in no particular order.
+- **What it may do.** Release host memory, close descriptors, update
+  host counters. It reads the object's own non-reference fields (raw
+  pointers, integers); the object is not yet swept. It must not
+  allocate in the heap, collect, register hooks, follow references
+  (what they point to may be dead too, and their hooks may have run),
+  or store `obj` anywhere: there is no resurrection.
+- **Why so narrow.** A general finalizer (Lua's `__gc`, Python's
+  `__del__`) runs guest code, which may allocate and resurrect, so it
+  must run outside the collector, after the object has been kept alive
+  for one more cycle (the original design below). Releasing native
+  memory needs none of that, and a hook that cannot reach the heap
+  cannot break it. Guest finalizers can be built on top: an
+  interpreter's hook queues a host-side record, and the interpreter
+  runs the guest code at a safe point.
+- **Cost.** The registry is a host vector held as the data of a sweeper
+  that `on_free` installs on first use, so heaps without hooks pay
+  nothing, and the collector's mark and sweep loops are unchanged. In a
+  minor collection only the entries of young objects are looked at
+  (entries are split old/young like the large objects).
+
+**`h.pin_dirty(obj)` / `h.unpin_dirty(obj)`: objects written without
+barriers.**
+
+- While pinned, the object is a root, and every collection traces it,
+  minor ones included, as if it were always in the remembered set. Stores
+  into it through raw pointers need no `write_barrier`, and verify mode
+  does not check it (it carries `INRS`, which also keeps the barrier from
+  logging it). This is for a GC object that the mutator writes in a hot
+  loop: a register file or a value stack kept in the heap.
+- `unpin_dirty` puts an old object into the remembered set, for the
+  stores made since the last collection; from then on stores need the
+  barrier again. Pins nest; `h.is_pinned_dirty(obj)` tells.
+- The pinned objects are a scanner's data: in each collection the
+  scanner marks them, traces the old ones in a minor collection (marking
+  stops at marked objects), and sets their flags back to "remembered"
+  (the remembered set's processing, a major collection or promotion may
+  have changed them).
+- Why not a scanner of the interpreter's own: a scanner can mark from
+  the object, but verify mode would still check the object, and a
+  scanner cannot put an object into the remembered set (at scan time a
+  young object has no `LOG` flag, so `remember` does nothing, and it
+  becomes old later in the same collection). Mini did it with a sweeper
+  that re-remembered the stacks after each collection. Mini no longer
+  needs either: its stacks left the heap (`on_free`), and a running
+  coroutine's stacks are scanned as roots.
+- Each collection traces the whole object; combine it with a
+  `#[trace]` hook to trace only the live part.
+
+The hook functions in std.gc (`on_free`, `pin_dirty` and their helpers)
+are emitted only where used (src/codegen.rs, `is_lazy`): `Heap.free`
+refers to the two registries' functions, and that is the only change in
+the IR of programs that do not use them (with four type declarations).
+
 ### Not implemented
 
 Policies as a compile-time parameter (`#![heap = ..]`; generational is a
 run-time switch, and the barrier is always compiled in), incremental
 marking, lazy sweeping in a non-generational heap, side mark bitmaps,
 card marking (a large array stored into is retraced whole by each minor
-collection), aging of small objects (measured, see above), finalizers, `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
+collection), aging of small objects (measured, see above), finalizers that run guest
+code (free hooks for host memory are built, below), `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
 and the `weak` field qualifier (also for inline caches, language.md
 §7.1).
 
@@ -201,7 +323,8 @@ the time spent in deferred sweeps so far.
 
 The original design draft. **Not built** unless "As implemented" above
 says so: in particular the policy parameter, `Incremental`, `HeapConfig`,
-`Root<T>`, finalizers, weak inline caches and heap snapshots.
+`Root<T>`, finalizers (only free hooks are built), weak inline caches
+and heap snapshots.
 
 ### Goals
 

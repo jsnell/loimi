@@ -725,8 +725,19 @@ is followed by the barrier on the object, since the callee may store
 through it.
 Other stores through raw pointers get no barrier: the code that makes
 them calls `gc.write_barrier(h, obj)` (see
-[`stdlib/gc.md`](stdlib/gc.md#as-implemented)). Initializing a new
-object (`new(h, T { .. })`) needs none.
+[`stdlib/gc.md`](stdlib/gc.md#as-implemented)), or the object is pinned
+(`h.pin_dirty(obj)`), which makes every collection trace it.
+Initializing a new object (`new(h, T { .. })`) needs none.
+
+**Trace hooks.** `loimi_trace_object(h, obj, tid)` is a switch over the
+type ids; each case marks the traced fields, then the trailing array
+(its length is at `obj - 8`). For an object with `#[trace(f)]` the case
+marks the fields and then calls `f(h, obj)` (an internal function, which
+LLVM may inline) instead of looping over the array. Everything that
+traces an object (marking, the remembered set in a minor collection,
+verify mode) goes through the switch, so the hook is used everywhere;
+in a `--gc-check-roots` build its `gc_mark` calls are checked like any
+other.
 
 `barrier` is `alwaysinline` and tests one header byte:
 

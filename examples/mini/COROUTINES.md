@@ -9,10 +9,10 @@ interpreter in the repository with more than one guest stack.
 ## Design
 
 **No native stack switching.** A coroutine is a `Coro` object
-(`coro.lm`) with a value stack and a frame stack of its own: `VStack`
-(`[V]`) and `FStack` (`[Frame]`). Both are GC objects. They start small:
-60 slots and 12 frames, which keeps each a small object. They double
-when a call needs more, up to the main stack's limits. The VM itself does
+(`coro.lm`) with a value stack and a frame stack of its own, in host
+memory (`mem.alloc`, like the main stack) that the object owns. They
+start small, 60 slots and 12 frames, and double when a call needs more,
+up to the main stack's limits. The VM itself does
 not know about coroutines. It runs on whatever stacks the context's
 fields `stack`, `stack_end`, `frames`, `frames_end`, `fp`, `base`, `open`
 and `open_level` describe.
@@ -82,29 +82,38 @@ copies the stacks and rebases each frame's `base`, each open upvalue and
 the context's pointers. The CALL then sets `regs = fp.base` and does
 `redo`. `call_value` (comparators, `mini_call`) now keeps its saved frame
 and window as indices, because the nested run may grow the stacks. The
-block that a stack replaced stays allocated until the coroutine dies
-(`VStack.prev`), because a host native may still hold an `args` pointer
-into it.
+block that a stack replaced stays allocated until the resume returns
+(`Coro.retired`), because a native of the coroutine's run may still hold
+an `args` pointer into it; once the run has yielded or ended, none can.
 
 **GC.**
 - **Roots.** `scan_roots` walks the frames of the running thread, as
   before, and those of every resumer on `ctx.chain`, and marks
   `ctx.cur`, `ctx.main` and the multi-result buffer.
-- **Suspended coroutines** are traced through their objects. A
-  `VStack` is traced whole, including dead slots above the top (see
-  friction 4).
-- **Dead coroutines** drop their stacks, and the collector frees them.
-- **Open upvalues.** An open upvalue into a coroutine's stack has a
-  `stack` field that keeps the `VStack` alive. If a suspended coroutine
-  is dropped while one of its closures survives, the closure still reads
-  live memory. PUC-Lua closes such upvalues when it frees the thread;
-  Mini has no finalizers.
+- **Suspended coroutines** are traced through their objects: `Coro`
+  has a `#[trace(trace_coro)]` hook (std.gc's trace hooks), which walks
+  the frames of a suspended coroutine and marks each frame's closure
+  and registers, as `scan_roots` does for the running thread. Slots
+  above the top frame are not traced. A running or normal coroutine's
+  hook marks nothing: its stacks are roots.
+- **Dead coroutines** free their stacks at once (`die`). A suspended
+  coroutine that is dropped frees them when the collector finds the
+  `Coro` dead: `resume` registers a free hook (`heap.on_free(co,
+  free_coro)`) when it allocates the stacks. The stacks count towards
+  the next collection (`heap.allocated`), as they did when they were
+  heap objects.
+- **Open upvalues.** An open upvalue into a coroutine's stack has a `co`
+  field that keeps the `Coro`, and so its stacks, alive; closing it
+  drops the reference. If a suspended coroutine is dropped while one of
+  its closures survives, the coroutine stays alive with it, and the
+  closure reads live memory. PUC-Lua closes such upvalues when it frees
+  the thread instead (friction 6).
 - **The generational barrier.** The VM stores into a coroutine's stacks
-  without write barriers. To make that safe, the running coroutine's
-  stacks and its resumers' stacks are kept in the remembered set: the
-  stacks are remembered when a coroutine is switched in, and a sweeper
-  (`coro.sweep`) remembers them again after every collection (friction
-  5).
+  without write barriers. While it runs (or is normal), the stacks are
+  roots, which every collection scans, minor ones included. When it
+  suspends, `resume` logs the `Coro` (`gc.write_barrier`), so the next
+  minor collection traces it through the hook, and verify mode checks
+  it from then on.
 
 **Yield across a C-call boundary.** Yield across a C-call boundary is an
 error, as in PUC-Lua for C functions without continuations: "attempt to
@@ -181,6 +190,20 @@ interpreter is 1.4-1.5× faster on these benchmarks. Its resume is
 assembly that switches `lua_State`s without leaving the dispatch
 loop. Mini's could do the same with a resume *op*, whose handler swaps
 the state registers itself. That is not done: see friction 7.
+
+**Stacks in host memory instead of the heap** (the GC hooks of items 4-6,
+2026-11-03): best of 5, interleaved, both builds `--align-functions=64`,
+new/old: chameneos 1.000, coroutine_ring 0.996, sieve 0.986. On the 14
+clean-room benchmarks (best of 3) the geomean is 0.996, every benchmark
+within ±3% except `oo_methods`, 1.03 in repeated runs, which runs no
+coroutine and no collection and whose handlers differ only in field
+offsets and type ids (placement). The other way, keeping the stacks as
+heap objects with a `#[trace]` hook for their live part and
+`pin_dirty` while active, was not built: it needs a pin and an unpin
+per switch, the hook needs the frames (a separate object) to know
+which slots are live, and growth would still allocate heap objects
+that the old stack keeps alive. Host memory needs one barrier per
+suspend and no sweeper.
 
 **No regression on the 14 clean-room benchmarks.** These are
 `bench/mini/compare.py`, run interleaved, best of 3, both builds with
@@ -280,7 +303,10 @@ interpreter.
      `Mini.Resume`, made only by vm code from `pc + 1` or `next_pc`, and
      accepted by an entry's `jump`. This is what language.md §10 means
      by "resuming re-enters through an entry that restores it".
-4. **No way to trace only the live part of an object.**
+4. **No way to trace only the live part of an object.** *Resolved:*
+   std.gc's `#[trace(f)]` object hooks (stdlib/gc.md, "Trace hooks, free
+   hooks and dirty pinning"); `Coro`'s walks a suspended coroutine's
+   frames. As it was:
    - **What happens:** a coroutine stack is an `object VStack { v: [V]
      }`, and the generated trace function marks every slot. That
      includes slots above the top frame, which keep dead values alive
@@ -293,7 +319,13 @@ interpreter.
      `object`), or a declared live length for a trailing array
      (`v: [V] live(top)`).
 5. **Raw stores into GC-object stacks need the remembered set, and no
-   API says "always rescan this while it is active".**
+   API says "always rescan this while it is active".** *Resolved* twice:
+   std.gc has `heap.pin_dirty(obj)`/`unpin_dirty` (a root that every
+   collection traces, minor ones included, exempt from the barrier and
+   from verify mode), and Mini no longer needs it, because its stacks
+   left the heap (item 6): an active coroutine's stacks are roots, and a
+   suspended one's `Coro` is logged once when it suspends. `coro.sweep`
+   is gone. As it was:
    - **The problem:** the VM stores into the running coroutine's stacks
      through raw pointers without write barriers. If such a stack is
      old, a minor collection misses the young values in it, and verify
@@ -311,7 +343,18 @@ interpreter.
      `remove_root_object`, objects traced as roots in every
      collection, minor ones included, and exempt from the barrier
      check. Or the `Root<T>` handles of gc.md §6.
-6. **No finalizers.**
+6. **No finalizers.** *Resolved for the stacks:* std.gc's free hooks
+   (`heap.on_free(obj, f)`: `f` runs once when `obj` is found dead, and
+   at `Heap.free`; it may release host memory but not allocate, collect
+   or follow references). The stacks are `mem.alloc`'d and owned by the
+   `Coro`. *Not for open upvalues:* closing a dropped coroutine's open
+   upvalues from a free hook would store values from the dead stack,
+   which no one marked, into live upvalues during a collection. A
+   free hook is deliberately too weak for that; PUC-Lua does it by
+   marking the values of open upvalues of unmarked threads
+   (`remarkupvals`), which would take a trace hook on `UpVal` reading
+   the stack, and a barrier story for a slot the VM writes freely. Open
+   upvalues keep their `Coro` alive instead (`UpVal.co`). As it was:
    - **Effect on the stacks:** they cannot be `mem.alloc`'d like the
      main stack, because nothing would free them when a coroutine is
      dropped. They are GC objects instead, which is the cause of items 4
@@ -337,15 +380,18 @@ interpreter.
      with the state saved), with a matching `resume` entry form. Also
      the `std.rt` `FrameStack`/`ValueStack` that the docs sketch, with
      growth and relocation built in (item 8).
-8. **Stacks that move.**
+8. **Stacks that move.** *Unchanged,* except that a replaced block is
+   now freed when the resume returns, not when the coroutine dies. As
+   it was:
    - **The work:** `grow` rebases every frame base, every open upvalue
      and four context pointers by hand.
    - **Handler state:** `reload` covers what the handlers cache, and
      `redo` after the growth works well.
    - **Natives and the nested-run helper:** these hold raw pointers.
      `call_value` had to switch from saved pointers to indices, and
-     superseded blocks are kept allocated (`VStack.prev`) because a host
-     native may still hold an `args` pointer.
+     superseded blocks were kept allocated until the coroutine died
+     (`VStack.prev`) because a host native may still hold an `args`
+     pointer.
    - **The docs:** they say `reload` "should recompute state from ...
      offsets or the frame record" (§5), but nothing helps with the frame
      record itself moving.
