@@ -81,25 +81,15 @@ pub vm Wam {
 
     // Fast paths make no calls (a call anywhere in a handler gives it a
     // stack frame on every execution, `-W handler_frame`): bindings that
-    // need no trail entry and no write barrier store directly, and
-    // allocations first check that the allocator's free list has a slot
-    // (so its refill call is dead code). Everything else is `cold`.
+    // need no trail entry store directly (the write barrier makes no
+    // call), and allocations use `try_new`, whose refill is a `cold`
+    // block ending in `redo`. Everything else is `cold`.
 
-    /// `v` can be bound without a trail entry or a barrier.
-    fn quick_bind(v: Gc<Var>) -> bool {
-        v.stamp >= ctx.b.stamp and !gc.needs_barrier(v as *u8)
-    }
-    /// Bind `v`, checked by `quick_bind`: a raw store, which the compiler's
-    /// barrier does not see (and need not: see quick_bind).
-    fn store_bind(v: Gc<Var>, t: Term) { *(v as *Term) = t; }
+    /// `v` can be bound without a trail entry, and its write barrier will
+    /// not log it (so LLVM drops the barrier's slow path: the inline
+    /// remembered-set push needs registers that GET_VAL_X would spill).
+    fn quick_bind(v: Gc<Var>) -> bool { v.stamp >= ctx.b.stamp and !gc.needs_barrier(v as *u8) }
 
-    /// The heap's free list for 32-byte slots (Var and Cons) is not empty.
-    fn room32() -> bool { (ctx.heap.free[2] as u64) != 0 }
-    /// ... for a Struct of `n` arguments.
-    fn room_struct(n: u64) -> bool {
-        let c = (n * 8 + 39) >> 4;
-        c < 33 and (ctx.heap.free[c] as u64) != 0
-    }
 
     // An unbound variable meeting a non-variable binds in place; anything
     // else is the general unification.
@@ -109,8 +99,8 @@ pub vm Wam {
             let x = deref(r);
             let y = deref(a);
             if x == y { next }
-            if let Ref(v) = x and !is_var(y) and quick_bind(v) { store_bind(v, y); next }
-            if let Ref(v) = y and !is_var(x) and quick_bind(v) { store_bind(v, x); next }
+            if let Ref(v) = x and !is_var(y) and quick_bind(v) { v.val = y; next }
+            if let Ref(v) = y and !is_var(x) and quick_bind(v) { v.val = x; next }
             cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
@@ -124,7 +114,7 @@ pub vm Wam {
             let t = deref(r);
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { store_bind(v, value); next }
+                if quick_bind(v) { v.val = value; next }
                 cold { ctx.bind(v, value); next }
             }
             // Big integers are equal by value.
@@ -135,7 +125,7 @@ pub vm Wam {
         let t = deref(r);
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { store_bind(v, Term.Int(k as i48)); next }
+            if quick_bind(v) { v.val = Term.Int(k as i48); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
@@ -162,9 +152,9 @@ pub vm Wam {
         let t = deref(r);
         if let Lst(c) = t { s = c as *Term; wm = false; next }
         if let Ref(v) = t {
-            if room32() and quick_bind(v) {
-                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
-                store_bind(v, Term.Lst(c));
+            if quick_bind(v) {
+                let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+                v.val = Term.Lst(c);
                 s = c as *Term;
                 wm = true;
                 next
@@ -183,8 +173,7 @@ pub vm Wam {
     inline for (name, kind) in [("UNIFY_VAR_X", xr), ("UNIFY_VAR_Y", yr)] {
         op #name(r: kind) : RR {
             if wm {
-                if unlikely(!room32()) { cold { let v = ctx.new_var(); *s = v; r = v; s = s + 1; next } }
-                let v = ctx.new_var();
+                let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
                 *s = v;
                 r = v;
                 s = s + 1;
@@ -214,7 +203,7 @@ pub vm Wam {
             s = s + 1;
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { store_bind(v, value); next }
+                if quick_bind(v) { v.val = value; next }
                 cold { ctx.bind(v, value); next }
             }
             cold { if unify(ctx, t, value) { next } backtrack() }
@@ -226,7 +215,7 @@ pub vm Wam {
         s = s + 1;
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { store_bind(v, Term.Int(k as i48)); next }
+            if quick_bind(v) { v.val = Term.Int(k as i48); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
@@ -246,8 +235,7 @@ pub vm Wam {
 
     inline for (name, kind) in [("PUT_VAR_X", xr), ("PUT_VAR_Y", yr)] {
         op #name(r: kind, a: xr) : RR {
-            if unlikely(!room32()) { cold { let v = ctx.new_var(); r = v; a = v; next } }
-            let v = ctx.new_var();
+            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
             r = v;
             a = v;
             next
@@ -268,23 +256,14 @@ pub vm Wam {
         }
     }
     op PUT_LIST(r: xr) : RR {
-        if unlikely(!room32()) {
-            cold {
-                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
-                r = Term.Lst(c);
-                s = c as *Term;
-                next
-            }
-        }
-        let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
+        let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
         r = Term.Lst(c);
         s = c as *Term;
         next
     }
     inline for (name, kind) in [("SET_VAR_X", xr), ("SET_VAR_Y", yr)] {
         op #name(r: kind) : RR {
-            if unlikely(!room32()) { cold { let v = ctx.new_var(); *s = v; r = v; s = s + 1; next } }
-            let v = ctx.new_var();
+            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
             *s = v;
             r = v;
             s = s + 1;
@@ -458,7 +437,7 @@ pub vm Wam {
         if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
             let v = st.args[(i as u64) - 1];
             let x = deref(a);
-            if let Ref(xv) = x and quick_bind(xv) { store_bind(xv, v); next }
+            if let Ref(xv) = x and quick_bind(xv) { xv.val = v; next }
             cold { if unify(ctx, x, v) { next } backtrack() }
         }
         cold {

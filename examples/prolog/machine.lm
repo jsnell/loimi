@@ -139,6 +139,24 @@ pub fn Machine.bind(m: *Machine, v: Gc<Var>, t: Term) {
     if v.stamp < m.b.stamp { m.push_trail(Term.Ref(v)); }
 }
 
+/// `new_var` and a list cell without the allocator's refill (a call,
+/// which would give a handler a stack frame): None when the free list is
+/// empty; `make_room` refills it, and the op runs again (`redo`).
+#[inline]
+pub fn Machine.try_var(m: *Machine) -> ?Term {
+    match try_new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }) {
+        Some(v) => Some(Term.Ref(v)),
+        None => None,
+    }
+}
+#[inline]
+pub fn Machine.try_cons(m: *Machine) -> ?Gc<Cons> {
+    try_new(&m.heap, Cons { head: Term.Unb, tail: Term.Unb })
+}
+/// (`Var` and `Cons` are the same size.)
+#[cold]
+pub fn Machine.make_room(m: *Machine) { gc.make_room(&m.heap, size_of<Cons>()); }
+
 #[inline]
 pub fn Machine.new_var(m: *Machine) -> Term {
     Term.Ref(new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }))
@@ -150,9 +168,7 @@ pub fn Machine.untrail(m: *Machine, to: u64) {
     while i > to {
         i -= 1;
         match m.trail[i] {
-            // A raw store: the compiler's write barrier would run for this
-            // store too, though `Unb` is no reference.
-            Ref(v) => *(v as *Term) = Term.Unb,
+            Ref(v) => v.val = Term.Unb,
             Int(off) => {
                 // A catch/3 that exited with choicepoints left: backtracking
                 // into its goal makes it active again.
