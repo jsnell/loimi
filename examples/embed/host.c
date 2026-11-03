@@ -13,7 +13,8 @@
  * errors, and runs an allocation-heavy script with GC stress on. Natives
  * call back into Mini (mini_call, mini_dostring), nested several levels
  * deep, with errors passing through them, also under GC stress; and the
- * host calls Mini functions directly. Last, an internal error in a nested
+ * host calls Mini functions directly, and a native of one state runs the
+ * other while both are under GC stress. Last, an internal error in a nested
  * run comes back as MiniStatus_Internal instead of aborting the host.
  */
 #include <stdio.h>
@@ -226,6 +227,27 @@ int main(void) {
         "print('sorted under stress', ok, t[1], t[200], down(30))");
     mini_set_gc_stress(A, false);
     printf("collections in nested runs: %s\n", mini_gc_count(A) - before > 1000 ? "many" : "few");
+
+    /* Into another state under GC stress: B's natives run A, which
+     * allocates. A's collections see B's frames on the thread's shadow
+     * stack and must leave B's objects alone. */
+    run(A, "A", "function square(x) local t = {} for i = 1, 30 do t[i] = {s = 'a' .. i} end return x * x end");
+    mini_set_gc_stress(A, true);
+    mini_set_gc_stress(B, true);
+    run(B, "B",
+        "local keep = {}\n"
+        "for i = 1, 100 do keep[i] = {s = 'b' .. i} end\n"
+        "local s = 0\n"
+        "for i = 1, 200 do\n"
+        "  local t = {x = 'v' .. i, y = keep}\n"
+        "  s = s + ask_a(i)\n"
+        "  if t.x ~= 'v' .. i then error('corrupt ' .. i) end\n"
+        "end\n"
+        "local bad = 0\n"
+        "for i = 1, 100 do if keep[i].s ~= 'b' .. i then bad = bad + 1 end end\n"
+        "print('B asks A under stress', s, bad)");
+    mini_set_gc_stress(A, false);
+    mini_set_gc_stress(B, false);
 
     mini_free(A);
     /* B outlives A. */

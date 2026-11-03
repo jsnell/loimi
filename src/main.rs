@@ -39,6 +39,8 @@ struct Opts {
     vm_stats: bool,
     /// `--sanitize=address`: build with AddressSanitizer.
     sanitize_address: bool,
+    /// `--sanitize=thread`: build with ThreadSanitizer.
+    sanitize_thread: bool,
     /// `-W error` / `--deny-warnings`: warnings fail the build.
     deny_warnings: bool,
     /// `-W lint`: opt-in lints turned on.
@@ -106,7 +108,7 @@ enum Tls {
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
-                  [--sanitize=address] [-W error | --deny-warnings] [-W hot_gc]
+                  [--sanitize=address|thread] [-W error | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
@@ -297,7 +299,14 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     if let Some(t) = &opts.target {
         ir.insert_str(0, &format!("target triple = \"{}\"\n", t.triple));
     }
-    Ok((if opts.sanitize_address { sanitize_address(&ir, library) } else { ir }, header, jit))
+    let ir = if opts.sanitize_address {
+        sanitize(&ir, library, "sanitize_address")
+    } else if opts.sanitize_thread {
+        sanitize(&ir, library, "sanitize_thread")
+    } else {
+        ir
+    };
+    Ok((ir, header, jit))
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -347,11 +356,12 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, s
     Ok(rt)
 }
 
-/// The ASan runtime to link explicitly, if clang's own is missing.
-/// `Ok(None)`: clang links its runtime itself. Otherwise GCC's shared
-/// libasan (same instrumentation ABI), or `LOIMI_ASAN_RUNTIME`.
-fn asan_runtime(clang: &str) -> Result<Option<PathBuf>, String> {
-    if let Ok(p) = std::env::var("LOIMI_ASAN_RUNTIME") {
+/// The sanitizer runtime (`asan` or `tsan`) to link explicitly, if
+/// clang's own is missing. `Ok(None)`: clang links its runtime itself.
+/// Otherwise GCC's shared libasan/libtsan (same instrumentation ABI), or
+/// `LOIMI_ASAN_RUNTIME` / `LOIMI_TSAN_RUNTIME`.
+fn sanitizer_runtime(clang: &str, san: &str) -> Result<Option<PathBuf>, String> {
+    if let Ok(p) = std::env::var(format!("LOIMI_{}_RUNTIME", san.to_uppercase())) {
         return Ok(Some(PathBuf::from(p)));
     }
     let query = |prog: &str, arg: &str| -> Option<PathBuf> {
@@ -360,28 +370,36 @@ fn asan_runtime(clang: &str) -> Result<Option<PathBuf>, String> {
         if out.status.success() && !s.is_empty() { Some(PathBuf::from(s)) } else { None }
     };
     if let Some(dir) = query(clang, "-print-runtime-dir") {
-        if dir.join("libclang_rt.asan.a").exists() {
+        if dir.join(format!("libclang_rt.{}.a", san)).exists() {
             return Ok(None);
         }
     }
-    if let Some(p) = query("gcc", "-print-file-name=libasan.so") {
+    if let Some(p) = query("gcc", &format!("-print-file-name=lib{}.so", san)) {
         if p.is_absolute() && p.exists() {
             return Ok(Some(p));
         }
     }
-    Err("--sanitize=address: no ASan runtime found (install libclang-rt-19-dev or GCC's libasan, \
-         or set LOIMI_ASAN_RUNTIME to a libasan.so)"
-        .to_string())
+    let flag = if san == "asan" { "address" } else { "thread" };
+    Err(format!(
+        "--sanitize={}: no {} runtime found (install libclang-rt-19-dev or GCC's lib{}, \
+         or set LOIMI_{}_RUNTIME to a lib{}.so)",
+        flag,
+        san,
+        san,
+        san.to_uppercase(),
+        san
+    ))
 }
 
-/// ASan instruments only functions that carry the `sanitize_address`
-/// attribute. Clang adds it to C functions, but IR input has none, so
-/// mark every definition. In executables leak checking is off by default:
-/// programs leave their heaps to the OS (ASAN_OPTIONS=detect_leaks=1
-/// turns it on). Libraries leave ASan's options to the host.
-fn sanitize_address(ir: &str, library: bool) -> String {
+/// ASan and TSan instrument only functions that carry the
+/// `sanitize_address` / `sanitize_thread` attribute (`attr`). Clang adds
+/// it to C functions, but IR input has none, so mark every definition.
+/// In ASan executables leak checking is off by default: programs leave
+/// their heaps to the OS (ASAN_OPTIONS=detect_leaks=1 turns it on).
+/// Libraries leave the sanitizer's options to the host.
+fn sanitize(ir: &str, library: bool, attr: &str) -> String {
     let mut out = String::with_capacity(ir.len() + ir.len() / 16);
-    if !library {
+    if !library && attr == "sanitize_address" {
         out.push_str(
             "@loimi.asan_options = private constant [15 x i8] c\"detect_leaks=0\\00\"\n\
              define ptr @__asan_default_options() {\n  ret ptr @loimi.asan_options\n}\n",
@@ -391,7 +409,8 @@ fn sanitize_address(ir: &str, library: bool) -> String {
         match line.strip_suffix('{') {
             Some(head) if line.starts_with("define ") => {
                 out.push_str(head);
-                out.push_str("sanitize_address {");
+                out.push_str(attr);
+                out.push_str(" {");
             }
             _ => out.push_str(line),
         }
@@ -414,6 +433,7 @@ fn parse_args() -> Result<Opts, String> {
         keep_ll: false,
         vm_stats: false,
         sanitize_address: false,
+        sanitize_thread: false,
         deny_warnings: false,
         warn: vec![],
         align_functions: None,
@@ -471,6 +491,7 @@ fn parse_args() -> Result<Opts, String> {
             "--update" if o.test => o.update = true,
             "--list" if o.test => o.run_args.push(a.clone()),
             "--sanitize=address" => o.sanitize_address = true,
+            "--sanitize=thread" => o.sanitize_thread = true,
             "--deny-warnings" | "-Werror" => o.deny_warnings = true,
             "-W" => match args.next().as_deref() {
                 Some("error") => o.deny_warnings = true,
@@ -485,7 +506,7 @@ fn parse_args() -> Result<Opts, String> {
                 o.align_functions = Some(n);
             }
             s if s.starts_with("--sanitize=") => {
-                return Err(format!("unknown sanitizer `{}` (supported: address)", &s["--sanitize=".len()..]))
+                return Err(format!("unknown sanitizer `{}` (supported: address, thread)", &s["--sanitize=".len()..]))
             }
             "--" => {
                 o.run_args = args.by_ref().collect();
@@ -511,7 +532,7 @@ fn parse_args() -> Result<Opts, String> {
     if o.input.is_none() {
         return Err(USAGE.into());
     }
-    if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
+    if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
         return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
     }
     if o.jit && !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
@@ -522,8 +543,11 @@ fn parse_args() -> Result<Opts, String> {
         // (src/elf.rs reads x86-64 relocations).
         return Err("--jit-stencils supports x86-64 Linux only (not --target=aarch64)".into());
     }
-    if o.sanitize_address && o.target.is_some() {
-        return Err("--sanitize=address is not supported with --target".into());
+    if o.sanitize_address && o.sanitize_thread {
+        return Err("--sanitize=address and --sanitize=thread cannot be combined".into());
+    }
+    if (o.sanitize_address || o.sanitize_thread) && o.target.is_some() {
+        return Err("--sanitize is not supported with --target".into());
     }
     if o.kind != OutKind::Exe {
         if o.run {
@@ -649,9 +673,16 @@ fn compiler_main() -> ExitCode {
         cmd.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
     }
     // Libraries carry the instrumentation only: the host links the ASan
-    // runtime (docs/language.md §10.1).
-    let asan_lib = if opts.sanitize_address && opts.kind == OutKind::Exe {
-        match asan_runtime(&clang) {
+    // or TSan runtime (docs/language.md §10.1).
+    let san = if opts.sanitize_address {
+        Some("asan")
+    } else if opts.sanitize_thread {
+        Some("tsan")
+    } else {
+        None
+    };
+    let san_lib = if let (Some(san), OutKind::Exe) = (san, opts.kind) {
+        match sanitizer_runtime(&clang, san) {
             Ok(lib) => lib,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -668,9 +699,12 @@ fn compiler_main() -> ExitCode {
         cmd.arg("-fsanitize=address")
             .arg("-fsanitize-address-use-after-return=never")
             .arg("-fno-omit-frame-pointer");
-        if asan_lib.is_some() || opts.kind != OutKind::Exe {
-            cmd.arg("-fno-sanitize-link-runtime");
-        }
+    }
+    if opts.sanitize_thread {
+        cmd.arg("-fsanitize=thread").arg("-fno-omit-frame-pointer");
+    }
+    if san.is_some() && (san_lib.is_some() || opts.kind != OutKind::Exe) {
+        cmd.arg("-fno-sanitize-link-runtime");
     }
     cmd.arg("-x").arg("ir").arg(&ll);
     // C runtime sources. A static library compiles each to its own
@@ -696,7 +730,7 @@ fn compiler_main() -> ExitCode {
             cmd.arg("-x").arg("c").arg(rt);
         }
     }
-    if let Some(lib) = &asan_lib {
+    if let Some(lib) = &san_lib {
         cmd.arg("-x").arg("none").arg(lib);
     }
     let target = if opts.kind == OutKind::Static { &obj } else { &exe };

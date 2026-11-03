@@ -1,0 +1,9 @@
+t0: 6/6 rounds ok, runtime error ok, internal error caught (internal error: boom: t0)
+t1: 6/6 rounds ok, runtime error ok, internal error caught (internal error: boom: t1), stressed
+t2: 6/6 rounds ok, runtime error ok, internal error caught (internal error: boom: t2)
+t3: 6/6 rounds ok, runtime error ok, internal error caught (internal error: boom: t3), stressed
+t0 ran t1's state: ok
+t1 ran t2's state: ok
+t2 ran t3's state: ok
+t3 ran t0's state: ok
+main thread ran all 4 states: 4 ok

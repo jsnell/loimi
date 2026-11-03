@@ -2194,6 +2194,51 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
     release (C++ destructors do not run).
   - **Threads.** Handlers are per thread. A panic on a thread with no
     catch aborts, even if another thread has one.
+- **Threads.** Independent interpreter states may run on different
+  threads at the same time, with no lock and no global interpreter
+  lock: a server can give each worker thread its own state. What makes
+  it safe:
+
+  | State | Where it lives |
+  |---|---|
+  | shadow-stack top (GC roots of compiled code) | thread-local |
+  | `Vm.depth`, vm scratch slots (`cold` captures, `-> never` arguments, aggregate results, `raise` values) | thread-local |
+  | `rt.protect`/`catch_panic` handler chain, caught panic message and its 512-byte copy, `#[track_caller]` location | thread-local |
+  | GC heaps: chunks, segments, free lists, remembered set, scanners, weak tables, interners | per heap (`std.gc` has no globals) |
+  | inline caches, rewritten opcodes, constant pools | per state (in its code) |
+  | dispatch tables, string constants, `TypeInfo` | read-only data |
+  | `loimi.argc`/`argv` | written once by `main` (executables only) |
+
+  The rules: one thread at a time per state (a state may move between
+  threads if the hand-over synchronizes, as a mutex or `pthread_join`
+  does); a value of one state is never stored in another (copy it, as
+  `mini_set_string` does); and each thread needs the C stack its
+  nesting depth needs (a native calling back into Mini uses C stack per
+  level, as on the main thread). States on one thread may call into
+  each other (a native of B runs A); the collector then skips the other
+  heap's objects on the shared shadow stack (`stdlib/gc.md` §9).
+  Not thread-safe: module-level `var`s without `#[thread_local]` (plain
+  globals, as in C; `std` has one, `mem`'s read-only empty-`Vec`
+  sentinel, and `std.test`'s, used by the single-threaded test runner),
+  `--vm-stats` counters (process-wide, updated without atomics: profile
+  one thread), and the copy-and-patch JIT (`--jit-stencils`, executables
+  only, one global code buffer). Mini's example compiler keeps its
+  error sink in a `#[thread_local]`; MiniJS's executable keeps its heap
+  in a plain global, which would have to become per-state to embed it.
+
+  `examples/embed/threads.c` runs four Mini states on four threads at
+  once (two under GC stress, nested runs through C natives, a caught
+  internal error on every thread while the others run, then each state
+  run by another thread). `--sanitize=thread` builds with
+  ThreadSanitizer, like `--sanitize=address` (the library carries the
+  instrumentation, the host links the runtime: `gcc -fsanitize=thread`
+  links GCC's `libtsan`); the threaded host is clean under it
+  (`tests/golden.rs`, `mini_threads_tsan`, skipped under `ulimit -v`).
+  The cost: none measurable. Runtime thread-locals were thread-local
+  from the start (initial-exec TLS: one `%fs`-relative access, the same
+  instruction count as an absolute address); turning them into plain
+  globals changes nothing beyond noise on Mini, MiniJS and Scheme
+  (`lowering.md` §4).
 
 **Re-entry.** A C function registered as a native runs inside a
 handler's `cold` block. Its type in Loimi says so: Mini stores natives

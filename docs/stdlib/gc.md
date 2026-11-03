@@ -530,6 +530,28 @@ liveness check (`ShapeId` implements `WeakId` through the shape table).
 - **One mutator thread per heap.** A process can create any number of heaps
   (isolates), each with its own `Interp`. This is the model of Lua states, V8
   isolates, and CPython subinterpreters.
+- **As implemented.** Heaps on different threads run at the same time with
+  no locks: `std.gc` has no process-wide state. Everything a collection
+  touches hangs off its `Heap` (chunks, segments from its own `mmap`
+  calls, free lists, large objects, the remembered set, scanners,
+  sweepers, ephemerons, weak tables, interners); `gc.is_marked(p)` and
+  the write barrier find the heap's data through the chunk header of `p`
+  (`ChunkHead.rs`), never through a global table. The roots the compiler
+  registers live on the shadow stack, whose top (`@loimi.shadow_top`) is
+  thread-local, so a collection only sees the frames of its own thread.
+  A heap may move between threads (a host hands a state to another
+  worker) as long as one thread uses it at a time and the hand-over is
+  synchronized (a mutex, a queue, `pthread_join`). `LOIMI_GC_STATS` is
+  read with `getenv` in `Heap.new`: do not `setenv` concurrently.
+  `examples/embed/threads.c` runs four Mini states on four threads (two
+  under GC stress), clean under ThreadSanitizer.
+- **Several heaps on one thread.** The shadow stack is per thread, not
+  per heap: when a native of state B runs code of state A (a nested run
+  into another state), A's collections see B's frames too. The root walk
+  therefore marks only objects of the heap being collected (a check of
+  the chunk header's heap, made only while walking the shadow stack):
+  marking B's objects with A's mark would make B's next collection take
+  them for already marked and free what they reference.
 - `Gc<T>` doesn't record which heap it belongs to, so cross-heap pointers are
   a bug. Debug builds check the segment header's owning heap at every barrier
   and every handle creation.

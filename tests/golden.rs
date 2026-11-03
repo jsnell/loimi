@@ -920,7 +920,7 @@ fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golde
         }
         let exe = vdir.join("host");
         let mut cc = cc(&clang);
-        cc.arg("-Wall").arg("-Werror").arg("-I").arg(&vdir).arg(host);
+        cc.arg("-Wall").arg("-Werror").arg("-pthread").arg("-I").arg(&vdir).arg(host);
         if shared {
             cc.arg("-L").arg(&vdir).arg("-llm").arg(format!("-Wl,-rpath,{}", vdir.display()));
         } else {
@@ -1110,10 +1110,87 @@ fn c_library_asan() {
 /// Mini embedded in a C host (examples/embed/host.c): two states alive at
 /// once, globals both ways, C natives, syntax and runtime errors,
 /// natives calling back into Mini (nested, failing, under GC stress), the
-/// host calling Mini functions, and an allocation-heavy script under GC stress.
+/// host calling Mini functions, an allocation-heavy script under GC stress,
+/// and a native of one state running the other with both under GC stress
+/// (the collector must not mark the other heap's objects on the shared
+/// shadow stack).
 #[test]
 fn mini_embedded() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
     c_host_run("mini-embed", &root.join("examples/mini/embed.lm"), &e.join("host.c"), &e.join("host.expected"), None);
+}
+
+/// Independent Mini states on four threads at once (examples/embed/threads.c):
+/// allocation-heavy scripts with nested runs, two threads under GC stress,
+/// a caught internal error (panic) on each thread while the others run,
+/// then every state run by a thread other than the one that created it.
+/// Static and shared builds (initial-exec and local-dynamic TLS).
+#[test]
+fn mini_threads() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    c_host_run("mini-threads", &root.join("examples/mini/embed.lm"), &e.join("threads.c"), &e.join("threads.expected"), None);
+}
+
+/// The same under ThreadSanitizer: `--sanitize=thread` instruments the
+/// library, gcc links its libtsan into the host. No data race may be
+/// reported. Skipped under `ulimit -v` (TSan maps terabytes of shadow
+/// memory) and where gcc has no libtsan.
+#[test]
+fn mini_threads_tsan() {
+    if cross() {
+        return;
+    }
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+    if limits.lines().any(|l| l.starts_with("Max address space") && l.split_whitespace().nth(3) != Some("unlimited")) {
+        eprintln!("mini_threads_tsan: skipped under an address-space limit (ulimit -v)");
+        return;
+    }
+    let has_tsan = Command::new("gcc")
+        .arg("-print-file-name=libtsan.so")
+        .output()
+        .is_ok_and(|o| Path::new(String::from_utf8_lossy(&o.stdout).trim()).is_absolute());
+    if !has_tsan {
+        eprintln!("mini_threads_tsan: skipped, gcc has no libtsan");
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    let dir = std::env::temp_dir().join(format!("loimi-tsan-threads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("libmini.a");
+    let out = loimi()
+        .arg("build")
+        .arg(root.join("examples/mini/embed.lm"))
+        .args(["--lib", "--release", "--sanitize=thread", "-o"])
+        .arg(&lib)
+        .arg("--header")
+        .arg(dir.join("mini.h"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let exe = dir.join("threads");
+    let out = Command::new("gcc")
+        .args(["-fsanitize=thread", "-pthread", "-I"])
+        .arg(&dir)
+        .arg(e.join("threads.c"))
+        .arg(&lib)
+        .args(["-lm", "-o"])
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gcc failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(&exe).env("TSAN_OPTIONS", "halt_on_error=1:exitcode=66:history_size=2").output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let got = String::from_utf8_lossy(&out.stdout);
+    let want = std::fs::read_to_string(e.join("threads.expected")).unwrap();
+    assert!(
+        out.status.success() && got == want,
+        "exit {:?}\n--- got\n{}--- stderr\n{}",
+        out.status.code(),
+        got,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

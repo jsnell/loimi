@@ -178,6 +178,29 @@ quickening on/off.
    atomic opcode rewrites under `#[threads(shared_code)]`. Free-threaded guest
    languages need a story for inline caches, which CPython's free-threading
    work could inform.
+
+   **First step done (2026-11-03): independent states on different threads.**
+   An audit of every piece of process-global mutable state (language.md
+   §10.1, Threads, has the table) found the runtime already per thread
+   (initial-exec TLS for the shadow-stack top, `Vm.depth`, vm scratch
+   slots, the panic handler chain and message) and `std.gc` free of
+   globals. Making them plain globals instead measures as noise
+   (geometric means 0.99–1.01 on Mini, MiniJS and Scheme), so there is no
+   single-threaded build mode. `examples/embed/threads.c` runs four Mini
+   states on four threads (GC stress, nested runs, panics caught on every
+   thread, states handed between threads); `--sanitize=thread` was added
+   and reports no race. The audit found one real bug, not about threads
+   but about several states on one thread: the collector's walk of the
+   (per-thread) shadow stack marked another heap's objects during a
+   nested run into another state, so that heap's next collection could
+   free live objects; the walk now marks only its own heap's objects.
+   Still single-threaded by design: `--vm-stats` counters and the
+   copy-and-patch JIT. What remains is everything shared: several
+   threads in one heap (a GIL handing the heap over at safepoints, a
+   per-thread shadow stack registered with the heap, allocation buffers
+   per thread), code and inline caches shared between threads
+   (`#[threads(shared_code)]`), and passing values between heaps without
+   copying.
 5. **`preserve_none` coverage.** Confirmed on x86-64 and AArch64 (LLVM 19+).
    AArch64 Linux is now run, not just compiled: `--target=aarch64-linux-gnu`
    builds pass the whole test suite under qemu user-mode (all dispatch
