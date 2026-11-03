@@ -36,6 +36,7 @@ A.result = 2000
 300
 sorted under stress	199	k0	k99	30
 collections in nested runs: many
+B asks A under stress	2686700.0	0
 B still here	40	42
 [C] status 3: internal error: boom: nested
 [C] status 3: internal error: boom: nested

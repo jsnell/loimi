@@ -214,7 +214,10 @@ pub struct Heap {
     major_live: u64,
     /// Check the barrier invariant at every collection (`set_verify`).
     verify: bool,
-    verifying: bool,
+    /// Checks `mark_ptr` makes on objects it has not marked yet, 0
+    /// normally: VERIFYING (`verify_heap`) or OWN_ONLY (the shadow-stack
+    /// walk, which may see other heaps' objects).
+    checks: u8,
     vparent: *u8,
     /// Print a line per collection to stderr (`LOIMI_GC_STATS` set).
     stats: bool,
@@ -298,7 +301,7 @@ pub fn Heap.new() -> Heap {
         major_limit: 0,
         major_live: 0,
         verify: false,
-        verifying: false,
+        checks: 0,
         vparent: 0 as *u8,
         stats: (getenv("LOIMI_GC_STATS\0".ptr) as u64) != 0,
         mark_ns: 0,
@@ -506,7 +509,9 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
     let ep = h.epoch;
     let m = hd.mark;
     if m == ep { return; }
-    if h.verifying { verify_fail(h, p); }
+    if unlikely(h.checks != 0) {
+        if !mark_check(h, p) { return; }
+    }
     if m == h.young {
         h.young_ref = true;
         return;
@@ -665,6 +670,10 @@ pub fn collect(h: *Heap) uses gc {
         let s = h.scanners.at(i);
         s.scan(h, s.data);
     }
+    // The shadow stack is the thread's, shared by every heap used on
+    // it: in a nested run into another heap, its frames hold that heap's
+    // objects too, which must keep their marks.
+    h.checks = OWN_ONLY;
     var fr = loimi_shadow_top();
     while (fr as u64) != 0 {
         let entries = (fr as *u8 + 16) as *ShadowEntry;
@@ -674,6 +683,7 @@ pub fn collect(h: *Heap) uses gc {
         }
         fr = fr.prev;
     }
+    h.checks = 0;
     drain(h);
     // Ephemerons: mark the values of entries with marked keys until
     // nothing new is marked.
@@ -972,7 +982,7 @@ pub fn maybe_collect(h: *Heap) uses gc {
 // ── verification ────────────────────────────────────────────────────────
 
 fn verify_heap(h: *Heap) {
-    h.verifying = true;
+    h.checks = VERIFYING;
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
         var i = ch.n;
@@ -994,7 +1004,19 @@ fn verify_heap(h: *Heap) {
             loimi_trace_object(h, p, hd.tid as u32);
         }
     }
-    h.verifying = false;
+    h.checks = 0;
+}
+
+/// `Heap.checks`.
+const VERIFYING: u8 = 1;
+const OWN_ONLY: u8 = 2;
+
+/// For `mark_ptr` with `h.checks` set: whether to mark the unmarked
+/// object at `p`.
+#[cold]
+fn mark_check(h: *Heap, p: *u8) -> bool {
+    if h.checks == VERIFYING { verify_fail(h, p); }
+    head_of(p).rs == h.rs
 }
 
 #[cold]
