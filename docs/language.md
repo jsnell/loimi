@@ -173,7 +173,11 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
-  `super_overlap` (section 7.3) and `state_root` (section 8).
+  `super_overlap` (section 7.3) and `state_root` (section 8), and the
+  opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
+  (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
+  the vm state and roots the live traced locals on every execution
+  (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
 - **Attributes** are checked where they appear: an unknown or misplaced
   one is an error (with a "did you mean" for near misses), never
   ignored, since a misspelled `#[require_verified]` would silently drop

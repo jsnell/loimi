@@ -1910,6 +1910,19 @@ pub fn wrap_effects(c: &mut Checker, cx: &mut FnCx, call: TExpr) -> Res<TExpr> {
         if missing & EFF_GC != 0 && c.vms[h.vm as usize].collects.is_none() {
             c.vms[h.vm as usize].collects = Some((span, callee.clone()));
         }
+        // Lint `hot_gc` (opt-in, `-W hot_gc`): a call that may collect on
+        // an op's fast path (outside `cold`) syncs the state and roots the
+        // live traced locals on every execution.
+        if missing & EFF_GC != 0 && h.is_handler && h.op.is_some() && !h.cold {
+            c.warnings.push(Diag::warning(
+                "hot_gc",
+                span,
+                format!(
+                    "{} may collect, on the fast path of this handler: every execution syncs the vm state and roots the live traced locals around it; if the call is rare, move it into a `cold {{ }}` block",
+                    callee
+                ),
+            ));
+        }
         // A plain vm function is inlined into vm code, and sees the
         // caller's state through pointers: its effectful calls are synced
         // in place, as in an op, so that only the path that makes the call

@@ -41,6 +41,8 @@ struct Opts {
     sanitize_address: bool,
     /// `-W error` / `--deny-warnings`: warnings fail the build.
     deny_warnings: bool,
+    /// `-W lint`: opt-in lints turned on.
+    warn: Vec<String>,
     align_functions: Option<u32>,
     /// What to build: an executable, a static archive or a shared object.
     kind: OutKind,
@@ -79,7 +81,7 @@ enum Tls {
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
-                  [--sanitize=address] [-W error | --deny-warnings]
+                  [--sanitize=address] [-W error | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
        loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]
@@ -194,7 +196,9 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             w.lint == Some(n.as_str()) && r.file == w.span.file && r.lo <= w.span.lo && w.span.hi <= r.hi
         })
     };
-    let warnings: Vec<&Diag> = c.warnings.iter().filter(|w| !allowed(w)).collect();
+    // Opt-in lints only when turned on with `-W name`.
+    let off = |w: &Diag| w.lint.is_some_and(|l| diag::OPT_IN.contains(&l) && !opts.warn.iter().any(|x| x == l));
+    let warnings: Vec<&Diag> = c.warnings.iter().filter(|w| !allowed(w) && !off(w)).collect();
     for w in &warnings {
         eprint!("{}", sm.render_as(if opts.deny_warnings { "error" } else { "warning" }, w));
     }
@@ -373,6 +377,7 @@ fn parse_args() -> Result<Opts, String> {
         vm_stats: false,
         sanitize_address: false,
         deny_warnings: false,
+        warn: vec![],
         align_functions: None,
         kind: OutKind::Exe,
         header: None,
@@ -417,7 +422,8 @@ fn parse_args() -> Result<Opts, String> {
             "--deny-warnings" | "-Werror" => o.deny_warnings = true,
             "-W" => match args.next().as_deref() {
                 Some("error") => o.deny_warnings = true,
-                _ => return Err("-W takes `error`".into()),
+                Some(l) if diag::OPT_IN.contains(&l) => o.warn.push(l.to_string()),
+                _ => return Err(format!("-W takes `error` or an opt-in lint ({})", diag::OPT_IN.join(", "))),
             },
             s if s.starts_with("--align-functions=") => {
                 let n: u32 = s["--align-functions=".len()..].parse().map_err(|_| "--align-functions takes a number")?;

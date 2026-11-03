@@ -524,6 +524,10 @@ pub vm Lox {
         v
     }
 
+    // A method read through a monomorphic prototype hit (GETPROP_P) is
+    // bound, which allocates: that is the op's work, so `hot_gc` is
+    // allowed here.
+    #[allow(hot_gc)]
     family GETPROP(dst: reg, o: reg, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = o else { cold { raise "Only instances have properties." } };
@@ -721,6 +725,7 @@ pub vm Lox {
     }
     /// `super.name`: R[dst] holds the superclass; bind its method `name`
     /// to `this`.
+    #[allow(hot_gc)]
     op GETSUPER(dst: reg, this: reg, name: kst) : ABC {
         if let Class(s) = dst and let Some(v) = ctx.m.get(s.methods, key(name)) {
             dst = bind(ctx, this, v);

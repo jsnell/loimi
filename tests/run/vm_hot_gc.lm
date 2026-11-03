@@ -1,0 +1,41 @@
+// args: -W hot_gc
+// Lint `hot_gc` (opt-in): a `uses gc` call on an op's fast path, outside
+// `cold`, syncs and roots on every execution. Calls in `cold` blocks and
+// ops under `#[allow(hot_gc)]` do not warn.
+// expect-stderr: warning[hot_gc]: `grow` may collect, on the fast path of this handler
+// expect-no-stderr: `shrink`
+// expect-no-stderr: `rare`
+// expect: 3
+import std.io;
+import std.gc;
+
+struct M { heap: gc.Heap, n: i64 }
+
+fn grow(m: *M) uses gc { gc.maybe_collect(&m.heap); m.n += 1; }
+fn shrink(m: *M) uses gc { gc.maybe_collect(&m.heap); m.n -= 1; }
+fn rare(m: *M) uses gc { gc.maybe_collect(&m.heap); m.n += 10; }
+
+vm V {
+    context ctx: *M;
+    state { pc: *u32 }
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+
+    op GROW() : A { grow(ctx); next }
+    #[allow(hot_gc)]
+    op SHRINK() : A { shrink(ctx); next }
+    op MAYBE(x: imm) : A {
+        if x == 0 { next }
+        cold { rare(ctx); next }
+    }
+    op END() : A { exit ctx.n }
+
+    entry run(m: *M, code: *u32) -> i64 uses gc { ctx = m; pc = code; jump pc }
+}
+
+fn main() uses gc {
+    var m = M { heap: gc.Heap.new(), n: 0 };
+    var code: [u32; 6] = [V.GROW(), V.GROW(), V.GROW(), V.SHRINK(), V.MAYBE(0), V.END()];
+    let r = V.run(&m, &code[0]);
+    io.print_int(r + 1); io.println("");
+}

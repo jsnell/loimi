@@ -26,7 +26,10 @@ pub struct Diag {
 }
 
 /// The warnings the compiler knows, for `#[allow(..)]`.
-pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "state_root"];
+pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "state_root", "hot_gc"];
+
+/// Lints that are off unless turned on with `-W name`.
+pub const OPT_IN: &[&str] = &["hot_gc"];
 
 impl Diag {
     pub fn new(span: Span, msg: impl Into<String>) -> Diag {
