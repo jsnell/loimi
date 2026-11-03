@@ -75,7 +75,7 @@ for step in "${STEPS[@]}"; do
             for run in "${runs[@]}"; do
                 a=("${args[@]}")
                 [ "$run" = stress ] && a+=(--gc-stress)
-                out=$(cd "$dir" && ulimit -v 2500000 && "$exe" "${a[@]}" 2>&1)
+                out=$(cd "$dir" && ulimit -v 2500000 && ${LOIMI_RUNNER:-} "$exe" "${a[@]}" 2>&1)
                 status=$?
                 COUNT=$((COUNT + 1))
                 label="$step/$name ($mode${run/normal/})"

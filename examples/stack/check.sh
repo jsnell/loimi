@@ -25,7 +25,7 @@ for mode in tailcall goto switch; do
         exp=tests/$name.expected
         for stress in "" --gc-stress; do
             COUNT=$((COUNT + 1))
-            "$TMP/stak-$mode" "$src" $stress > "$TMP/out" 2>&1
+            ${LOIMI_RUNNER:-} "$TMP/stak-$mode" "$src" $stress > "$TMP/out" 2>&1
             status=$?
             if [ $UPDATE = 1 ] && [ $mode = tailcall ] && [ -z "$stress" ]; then cp "$TMP/out" "$exp"; fi
             case $name in

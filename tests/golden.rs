@@ -47,6 +47,53 @@ fn limited(prog: impl AsRef<std::ffi::OsStr>) -> Command {
     c
 }
 
+/// A built program `exe`, run under the memory cap, and under
+/// `LOIMI_RUNNER` (an emulator) if that is set.
+fn program(exe: impl AsRef<std::ffi::OsStr>) -> Command {
+    program_under(&std::env::var("LOIMI_RUNNER").unwrap_or_default(), exe)
+}
+
+/// `exe` under the memory cap and the command `runner` (none if empty).
+fn program_under(runner: &str, exe: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut words = runner.split_whitespace();
+    match words.next() {
+        Some(r) => {
+            let mut c = limited(r);
+            c.args(words).arg(exe);
+            c
+        }
+        None => limited(exe),
+    }
+}
+
+/// Whether the suite is cross-compiled: `LOIMI_TARGET` is set (loimi
+/// reads it as `--target`, with `LOIMI_SYSROOT` as `--sysroot`) and
+/// programs run under `LOIMI_RUNNER`. For example, for AArch64 under
+/// qemu (after bench/cross/install.sh, with absolute paths):
+///
+///     LOIMI_TARGET=aarch64-linux-gnu LOIMI_SYSROOT=$S \
+///     LOIMI_RUNNER="bench/cross/install/bin/qemu-aarch64 -L $S" cargo test --release
+///
+/// Tests of the x86-64 JIT and of ASan skip.
+fn cross() -> bool {
+    std::env::var_os("LOIMI_TARGET").is_some_and(|t| !t.is_empty())
+}
+
+/// The C compiler `clang` (for hosts of Loimi libraries), with the
+/// target, sysroot and linker of a cross-compiled suite.
+fn cc(clang: &str) -> Command {
+    let mut c = limited(clang);
+    if let Ok(t) = std::env::var("LOIMI_TARGET") {
+        if !t.is_empty() {
+            c.arg(format!("--target={}", t)).arg("-fuse-ld=lld");
+            if let Ok(s) = std::env::var("LOIMI_SYSROOT") {
+                c.arg(format!("--sysroot={}", s));
+            }
+        }
+    }
+    c
+}
+
 /// How the interpreters' test programs are run: normally, with GC stress
 /// (collect at every safepoint), and with a generational heap under
 /// stress that verifies the write barriers at every collection (the
@@ -69,9 +116,19 @@ fn loimi() -> Command {
 
 #[test]
 fn run_programs() {
+    run_programs_with(&[], |_, _| true);
+}
+
+/// The tests/run programs that `select(file name, text)` picks, with
+/// `xenv` in loimi's environment (`LOIMI_TARGET`, `LOIMI_RUNNER`, ...).
+fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> bool) {
+    let cross = cross() || xenv.iter().any(|(k, _)| k == "LOIMI_TARGET");
     let mut failures = Vec::new();
     for f in files("tests/run") {
         let text = std::fs::read_to_string(&f).unwrap();
+        if !select(&f.file_name().unwrap().to_string_lossy(), &text) {
+            continue;
+        }
         let expect: Vec<String> = directives(&text, "expect");
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = directives(&text, "expect-stderr");
@@ -81,12 +138,15 @@ fn run_programs() {
             .iter()
             .flat_map(|s| s.split_whitespace().filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))).collect::<Vec<_>>())
             .collect();
+        if cross && extra.iter().any(|a| a == "--jit-stencils") {
+            continue;
+        }
         let matrix = directives(&text, "matrix");
         let modes: Vec<(Vec<String>, Vec<(String, String)>)> = if matrix.iter().any(|m| m.trim() == "dispatch") {
             ["tailcall", "goto", "switch"].iter().map(|d| (vec![format!("--dispatch={}", d)], vec![])).collect()
         } else if matrix.iter().any(|m| m.trim() == "jit") {
             let mut v = vec![(vec![], vec![])];
-            if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+            if cfg!(all(target_arch = "x86_64", target_os = "linux")) && !cross {
                 let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
                 v.push((vec!["--jit-stencils".to_string()], env));
             }
@@ -100,7 +160,7 @@ fn run_programs() {
                 .arg(&f)
                 .args(&extra)
                 .args(&mode)
-                .envs(env.iter().chain(menv.iter()).map(|(k, v)| (k, v)))
+                .envs(xenv.iter().chain(env.iter()).chain(menv.iter()).map(|(k, v)| (k, v)))
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -139,6 +199,9 @@ fn compile_errors() {
         let text = std::fs::read_to_string(&f).unwrap();
         let want = directives(&text, "error");
         let extra: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
+        if cross() && extra.iter().any(|a| a == "--jit-stencils") {
+            continue;
+        }
         let out = loimi().arg("build").arg(&f).args(&extra).arg("--emit-llvm").arg("-o").arg("-").output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         let name = f.file_name().unwrap().to_string_lossy().to_string();
@@ -162,6 +225,11 @@ fn compile_errors() {
 /// NAME.expected and the exit status `// expect-exit:` (default 0).
 #[test]
 fn std_test() {
+    std_test_with(&[]);
+}
+
+/// `std_test` with `xenv` in loimi's environment.
+fn std_test_with(xenv: &[(String, String)]) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test");
     let mut failures = Vec::new();
     for f in files("tests/test") {
@@ -169,7 +237,7 @@ fn std_test() {
         let args: Vec<String> = directives(&text, "args").iter().flat_map(|s| s.split_whitespace().map(String::from).collect::<Vec<_>>()).collect();
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let name = f.file_name().unwrap().to_string_lossy().to_string();
-        let out = loimi().current_dir(&dir).arg("test").arg(&name).args(&args).output().unwrap();
+        let out = loimi().envs(xenv.iter().map(|(k, v)| (k, v))).current_dir(&dir).arg("test").arg(&name).args(&args).output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let want = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         if stdout != want {
@@ -200,6 +268,9 @@ fn mini_scripts() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn mini_jit_stencils() {
+    if cross() {
+        return;
+    }
     let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")];
     mini_scripts_with(&["--jit-stencils"], &env, |_| true);
     mini_conformance_with(&["--jit-stencils"], &env);
@@ -218,10 +289,62 @@ fn mini_reentry_dispatch_modes() {
     }
 }
 
+/// AArch64 Linux under qemu user-mode, when the cross toolchain is
+/// installed (bench/cross/install.sh; otherwise skipped with a message):
+/// a fast subset, cross-compiled with `--target=aarch64-linux-gnu`. The
+/// tests/run programs that run in every dispatch mode, the GC ones and
+/// those using `std.rt`; the `std.test` tests (`catch_panic`'s setjmp);
+/// Mini in every dispatch mode on scripts that collect, re-enter and
+/// throw, with GC stress and barrier verification; and Stak's suite
+/// (examples/stack/check.sh: every dispatch mode, GC stress). The whole
+/// suite runs cross-compiled with `LOIMI_TARGET` (see `cross`).
+#[test]
+fn aarch64_qemu() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let qemu = root.join("bench/cross/install/bin/qemu-aarch64");
+    let sysroot = root.join("bench/cross/sysroot-aarch64");
+    if !qemu.exists() || !sysroot.join("usr/lib/aarch64-linux-gnu/libc.so.6").exists() {
+        eprintln!("aarch64_qemu: skipped: no AArch64 cross toolchain (run bench/cross/install.sh)");
+        return;
+    }
+    let runner = format!("{} -L {}", qemu.display(), sysroot.display());
+    let sysroot = sysroot.display().to_string();
+    let env = [("LOIMI_TARGET", "aarch64-linux-gnu"), ("LOIMI_SYSROOT", sysroot.as_str()), ("LOIMI_RUNNER", runner.as_str())];
+    let xenv: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    run_programs_with(&xenv, |name, text| {
+        directives(text, "matrix").iter().any(|m| m.trim() == "dispatch") || name.starts_with("gc_") || text.contains("import std.rt")
+    });
+    std_test_with(&xenv);
+    for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
+        mini_scripts_with(&[mode], &env, |name| {
+            ["sort", "err_sort", "gc", "lib_gc", "err_syntax", "closures", "tables", "arith_quicken"].iter().any(|p| name.starts_with(p))
+        });
+    }
+    let out = Command::new("bash").arg(root.join("examples/stack/check.sh")).env("LOIMI", env!("CARGO_BIN_EXE_loimi")).env("LOIMI_STD", root).envs(env).output().unwrap();
+    assert!(out.status.success(), "examples/stack/check.sh (aarch64) failed:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
+/// The runner in `env` (`LOIMI_RUNNER`), else the process's.
+fn runner_in(env: &[(&str, &str)]) -> String {
+    env.iter().find(|(k, _)| *k == "LOIMI_RUNNER").map(|(_, v)| v.to_string()).unwrap_or_else(|| std::env::var("LOIMI_RUNNER").unwrap_or_default())
+}
+
+/// Distinguishes the executables of a cross build (`LOIMI_TARGET` in
+/// `env`) from the host's built with the same flags.
+fn target_tag(env: &[(&str, &str)]) -> String {
+    env.iter().find(|(k, _)| *k == "LOIMI_TARGET").map(|(_, v)| format!("-{}", v)).unwrap_or_default()
+}
+
+/// The Mini scripts that `select` picks, with Mini built with `flags`.
+/// `env` is the environment of the build and of the scripts' runs
+/// (`LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` cross-compile).
 fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
-    let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
+    let exe = std::env::temp_dir().join(format!("loimi-mini-{}{}{}", std::process::id(), flags.join("").replace(['-', '='], ""), target_tag(env)));
+    let out = loimi().envs(env.iter().copied()).arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
     assert!(out.status.success(), "building mini {:?} failed:\n{}", flags, String::from_utf8_lossy(&out.stderr));
     let mut failures = Vec::new();
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(root.join("examples/mini/tests"))
@@ -243,7 +366,7 @@ fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str)
         let exit: i32 = lua_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = lua_directives("expect-stderr");
         for mode in GC_MODES {
-            let mut cmd = limited(&exe);
+            let mut cmd = program_under(&runner_in(env), &exe);
             cmd.arg(&f);
             cmd.envs(env.iter().copied());
             if !mode.is_empty() {
@@ -303,7 +426,7 @@ fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)]) {
         let expected = std::fs::read_to_string(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
         for mode in GC_MODES {
-            let mut cmd = limited(&exe);
+            let mut cmd = program(&exe);
             cmd.arg(&f);
             cmd.envs(env.iter().copied());
             if !mode.is_empty() {
@@ -342,6 +465,9 @@ fn scheme_programs() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn scheme_jit_stencils() {
+    if cross() {
+        return;
+    }
     scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
     scheme_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")]);
 }
@@ -370,7 +496,7 @@ fn scheme_programs_with(flags: &[&str], env: &[(&str, &str)]) {
         let exit: i32 = scm_directives("expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = scm_directives("expect-stderr");
         for mode in GC_MODES {
-            let mut cmd = limited(&exe);
+            let mut cmd = program(&exe);
             cmd.arg(&f);
             cmd.envs(env.iter().copied());
             if !mode.is_empty() {
@@ -416,6 +542,9 @@ fn minijs_programs() {
 #[test]
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn minijs_jit_stencils() {
+    if cross() {
+        return;
+    }
     minijs_programs_with(&["--jit-stencils"], &[("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")]);
     // Rewrites of compiled code without recompiles: out-of-line copies,
     // retargets, and sites left to the interpreter.
@@ -443,7 +572,7 @@ fn minijs_programs_with(flags: &[&str], env: &[(&str, &str)]) {
         let expected = std::fs::read(f.with_extension("expected")).unwrap();
         let should_fail = stem.starts_with("err_");
         for mode in GC_MODES {
-            let mut cmd = limited(&exe);
+            let mut cmd = program(&exe);
             cmd.arg(f);
             cmd.envs(env.iter().copied());
             if !mode.is_empty() {
@@ -497,7 +626,7 @@ fn lox_programs() {
         let exit: i32 = directives(&text, "expect-exit").first().map(|s| s.trim().parse().unwrap()).unwrap_or(0);
         let stderr_want = directives(&text, "expect-stderr");
         for mode in ["", "--gc-stress"] {
-            let mut cmd = limited(&exe);
+            let mut cmd = program(&exe);
             cmd.arg(f);
             if !mode.is_empty() {
                 cmd.arg(mode);
@@ -761,7 +890,7 @@ fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golde
             }
         }
         let exe = vdir.join("host");
-        let mut cc = limited(&clang);
+        let mut cc = cc(&clang);
         cc.arg("-Wall").arg("-Werror").arg("-I").arg(&vdir).arg(host);
         if shared {
             cc.arg("-L").arg(&vdir).arg("-llm").arg(format!("-Wl,-rpath,{}", vdir.display()));
@@ -773,7 +902,7 @@ fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golde
             failures.push(format!("{} {}: compiling {} failed:\n{}", name, variant, host.display(), String::from_utf8_lossy(&out.stderr)));
             continue;
         }
-        let out = limited(&exe).current_dir(root).output().unwrap();
+        let out = program(&exe).current_dir(root).output().unwrap();
         let got = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() || got != want {
             failures.push(format!(
@@ -847,9 +976,9 @@ fn vm_stats_library() {
     assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let exe = dir.join("rxhost");
     let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
-    let out = limited(&clang).arg("-I").arg(&dir).arg(rx.join("host.c")).arg(&lib).args(["-lm", "-o"]).arg(&exe).output().unwrap();
+    let out = cc(&clang).arg("-I").arg(&dir).arg(rx.join("host.c")).arg(&lib).args(["-lm", "-o"]).arg(&exe).output().unwrap();
     assert!(out.status.success(), "host: {}", String::from_utf8_lossy(&out.stderr));
-    let out = limited(&exe).arg("demo").output().unwrap();
+    let out = program(&exe).arg("demo").output().unwrap();
     let report = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(out.status.success(), "demo failed:\n{}", report);
     assert!(report.contains("== vm stats: Rx =="), "no report at exit:\n{}", report);
@@ -868,7 +997,7 @@ fn vm_stats_library() {
         .unwrap();
     assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
     let exe = dir.join("two");
-    let out = limited(&clang)
+    let out = cc(&clang)
         .args(["-Wall", "-Werror", "-I"])
         .arg(&dir)
         .arg(root.join("tests/embed/two_stats_host.c"))
@@ -880,7 +1009,7 @@ fn vm_stats_library() {
         .output()
         .unwrap();
     assert!(out.status.success(), "two libraries: {}", String::from_utf8_lossy(&out.stderr));
-    let out = limited(&exe).output().unwrap();
+    let out = program(&exe).output().unwrap();
     let report = String::from_utf8_lossy(&out.stderr).to_string();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success(), "two libraries failed:\n{}", report);
@@ -895,6 +1024,9 @@ fn vm_stats_library() {
 /// cannot run with: its RSS limit bounds it instead.
 #[test]
 fn c_library_asan() {
+    if cross() {
+        return;
+    }
     // ASan reserves terabytes of shadow memory: skip under `ulimit -v`.
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
     if limits.lines().any(|l| l.starts_with("Max address space") && l.split_whitespace().nth(3) != Some("unlimited")) {

@@ -39,10 +39,14 @@ if [ -n "$asan" ]; then
     host=$out/rxhost_asan
 else
     "$loimi" build "$here/lib.lm" --release --lib -o "$out/librx.a" --header "$out/rx.h"
-    clang-19 -O2 -g -I"$out" "$here/host.c" "$out/librx.a" -lm -o "$out/rxhost"
+    # A cross-compiled run (LOIMI_TARGET, LOIMI_SYSROOT; programs run
+    # under LOIMI_RUNNER, e.g. qemu) builds the host for the target too.
+    clang-19 -O2 -g ${LOIMI_TARGET:+--target=$LOIMI_TARGET -fuse-ld=lld} ${LOIMI_SYSROOT:+--sysroot=$LOIMI_SYSROOT} \
+        -I"$out" "$here/host.c" "$out/librx.a" -lm -o "$out/rxhost"
     host=$out/rxhost
 fi
-"$host" demo > "$out/demo.out"
+run=${LOIMI_RUNNER:-}
+$run "$host" demo > "$out/demo.out"
 diff -u "$here/tests/demo.expected" "$out/demo.out"
 
 # The bytecode fuzzer (mutated programs through the verifier) is an
@@ -52,12 +56,12 @@ if [ -n "$asan" ]; then
     timeout 300 "$out/rxfuzz_asan" "$nfuzz" "$seed"
 else
     "$loimi" build "$here/fuzz.lm" --release -o "$out/rxfuzz"
-    timeout 300 "$out/rxfuzz" "$nfuzz" "$seed"
+    timeout 300 $run "$out/rxfuzz" "$nfuzz" "$seed"
 fi
 # Unit tests (std.test): the verifier on bad programs, the API in-process.
 "$loimi" test ${asan:+--sanitize=address} "$here/verify_test.lm" > "$out/unit.out" || { cat "$out/unit.out"; exit 1; }
 
 python3 "$here/tests/gen.py" "$out/cases" "$out/expected" --random "$nrand" --seed "$seed"
-timeout 300 "$host" fuzz "$nfuzz" "$seed"
-timeout 300 "$host" test "$out/cases" > "$out/actual"
+timeout 300 $run "$host" fuzz "$nfuzz" "$seed"
+timeout 300 $run "$host" test "$out/cases" > "$out/actual"
 python3 "$here/tests/compare.py" "$out/cases" "$out/expected" "$out/actual"
