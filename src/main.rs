@@ -107,12 +107,12 @@ enum Tls {
 }
 
 const USAGE: &str = "\
-usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
-                  [--sanitize=address|thread] [-W error | --deny-warnings] [-W hot_gc]
+usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
+                  [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
-       loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]
+       loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
        loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
 
@@ -422,6 +422,10 @@ fn sanitize(ir: &str, library: bool, attr: &str) -> String {
 fn parse_args() -> Result<Opts, String> {
     let mut args = std::env::args().skip(1);
     let cmd = args.next().ok_or(USAGE)?;
+    if matches!(cmd.as_str(), "--help" | "-h" | "help") {
+        println!("{}", USAGE);
+        std::process::exit(0);
+    }
     let mut o = Opts {
         input: None,
         output: None,
