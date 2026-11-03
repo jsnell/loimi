@@ -1,0 +1,405 @@
+// The machine's memory: argument registers, the environment stack, the
+// choicepoint stack, the trail, and the term operations that need them
+// (binding, unification, comparison, copying).
+
+import std.gc;
+import std.mem;
+import std.text;
+import std.hash;
+import std.io;
+import std.map.{HashMap};
+import term.{Term, Var, Struct, Cons, Db, deref};
+import term;
+import std.bigint;
+import arith;
+import compile.{Pred, Clause};
+
+pub const NREGS: u64 = 256;
+const ESTACK_WORDS: u64 = 8 * 1024 * 1024;    // 64 MiB
+const CSTACK_WORDS: u64 = 4 * 1024 * 1024;    // 32 MiB
+
+/// An environment (the WAM's): the caller's environment, the continuation,
+/// and `n` permanent variables after it.
+pub struct Frame { ce: *Frame, cp: *u32, n: u64 }
+
+/// A choicepoint, followed by its `n` saved argument registers.
+pub struct Choice {
+    prev: *Choice,
+    alt: *u32,
+    e: *Frame,
+    cp: *u32,
+    tr: u64,
+    etop: *Term,
+    stamp: u64,
+    n: u64,
+    kind: u64,
+}
+
+pub const CP_PLAIN: u64 = 0;
+pub const CP_CATCH: u64 = 1;
+pub const CP_CATCH_OFF: u64 = 2;
+
+pub const CHOICE_WORDS: u64 = 9;
+
+pub struct Machine {
+    x: [Term; 256],
+    heap: gc.Heap,
+    db: Db,
+    cp: *u32,
+    b: *Choice,
+    b0: *Choice,
+    e: *Frame,
+    cstamp: u64,
+    trail: *Term,
+    tr: u64,
+    trail_cap: u64,
+    ebase: *Term,
+    eend: *Term,
+    ehw: *Term,
+    cbase: *Choice,
+    cend: *u64,
+    ball: Term,
+    bags: mem.Vec<Term>,
+    preds: mem.Vec<*Pred>,
+    consts: mem.Vec<Term>,
+    out: text.StrBuf,
+    flags_dq: u32,
+    halted: bool,
+    halt_code: i32,
+    gensym: u64,
+    stress: bool,
+    ops: HashMap<u64, u32>,
+    clauses: mem.Vec<*Clause>,
+    fail_code: *u32,
+    true_code: *u32,
+    trust_fail: *u32,
+    halt_true: *u32,
+    halt_false: *u32,
+    bmap: HashMap<u32, u32>,
+    globals: HashMap<u32, Term>,
+    flag_unknown_fail: bool,
+    inits: mem.Vec<Term>,
+    loading_library: bool,
+    supers: bool,
+}
+
+pub fn Frame.ys(f: *Frame) -> *Term { (f + 1) as *Term }
+/// The argument registers as a raw pointer (no bounds checks).
+pub fn Machine.xregs(m: *Machine) -> *Term { &m.x[0] }
+pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n }
+pub fn Choice.args(c: *Choice) -> *Term { (c + 1) as *Term }
+pub fn Choice.end(c: *Choice) -> *Choice { ((((c + 1) as *Term) + c.n) as *Choice) }
+
+pub fn Machine.init(m: *Machine) {
+    m.ebase = mem.alloc<Term>(ESTACK_WORDS);
+    m.eend = m.ebase + (ESTACK_WORDS - 64);
+    let base = m.ebase as *Frame;
+    base.n = 0;
+    m.e = base;
+    m.ehw = base.end();
+    let cb = mem.alloc<u64>(CSTACK_WORDS);
+    m.cbase = cb as *Choice;
+    m.cend = cb + (CSTACK_WORDS - 512);
+    // The bottom choicepoint: never popped, its `alt` is set by the
+    // entry that runs a goal.
+    let b = m.cbase;
+    b.prev = b;
+    b.e = base;
+    b.etop = base.end();
+    b.n = 0;
+    b.stamp = 0;
+    b.tr = 0;
+    b.kind = CP_PLAIN;
+    m.b = b;
+    m.b0 = b;
+    m.cstamp = 1;
+    m.trail_cap = 1 << 16;
+    m.trail = mem.alloc<Term>(m.trail_cap);
+    m.tr = 0;
+    for i in 0..NREGS { m.x[i] = Term.Atom(term.A_NIL); }
+    m.ball = Term.Unb;
+}
+
+#[cold]
+pub fn Machine.grow_trail(m: *Machine) {
+    m.trail_cap = m.trail_cap * 2;
+    m.trail = mem.grow(m.trail, m.trail_cap);
+}
+
+#[inline]
+pub fn Machine.push_trail(m: *Machine, t: Term) {
+    if m.tr == m.trail_cap { m.grow_trail(); }
+    m.trail[m.tr] = t;
+    m.tr += 1;
+}
+
+#[inline]
+pub fn Machine.bind(m: *Machine, v: Gc<Var>, t: Term) {
+    v.val = t;
+    if v.stamp < m.b.stamp { m.push_trail(Term.Ref(v)); }
+}
+
+#[inline]
+pub fn Machine.new_var(m: *Machine) -> Term {
+    Term.Ref(new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }))
+}
+
+/// Undo the bindings recorded since trail height `to`.
+pub fn Machine.untrail(m: *Machine, to: u64) {
+    var i = m.tr;
+    while i > to {
+        i -= 1;
+        match m.trail[i] {
+            // A raw store: the compiler's write barrier would run for this
+            // store too, though `Unb` is no reference.
+            Ref(v) => *(v as *Term) = Term.Unb,
+            Int(off) => {
+                // A catch/3 that exited with choicepoints left: backtracking
+                // into its goal makes it active again.
+                let c = ((m.cbase as *u64) + off as u64) as *Choice;
+                c.kind = CP_CATCH;
+            }
+            _ => {}
+        }
+    }
+    m.tr = to;
+}
+
+pub fn Machine.mk_struct(m: *Machine, f: u32, n: u64) -> Gc<Struct> {
+    new(&m.heap, Struct { f: f }, n)
+}
+
+pub fn Machine.mk_cons(m: *Machine, h: Term, t: Term) -> Term {
+    Term.Lst(new(&m.heap, Cons { head: h, tail: t }))
+}
+
+pub fn Machine.mk2(m: *Machine, name: u32, a: Term, b: Term) -> Term {
+    let f = m.db.functor(name, 2);
+    let s = m.mk_struct(f, 2);
+    s.args[0] = a;
+    s.args[1] = b;
+    Term.Str(s)
+}
+
+pub fn Machine.mk1(m: *Machine, name: u32, a: Term) -> Term {
+    let f = m.db.functor(name, 1);
+    let s = m.mk_struct(f, 1);
+    s.args[0] = a;
+    Term.Str(s)
+}
+
+/// Unify two terms, binding (and trailing) variables. Recursion follows the
+/// arguments except the last, which is a loop, so long lists do not recurse.
+pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
+    var a = deref(a0);
+    var b = deref(b0);
+    loop {
+        if a == b { return true; }
+        match (a, b) {
+            (Ref(va), Ref(vb)) => {
+                if va.stamp < vb.stamp { m.bind(vb, a); } else { m.bind(va, b); }
+                return true;
+            }
+            (Ref(va), _) => { m.bind(va, b); return true; }
+            (_, Ref(vb)) => { m.bind(vb, a); return true; }
+            (Lst(x), Lst(y)) => {
+                if !unify(m, x.head, y.head) { return false; }
+                a = deref(x.tail);
+                b = deref(y.tail);
+            }
+            (Big(x), Big(y)) => return bigint.eq(x.num(), y.num()),
+            (Str(x), Str(y)) => {
+                if x.f != y.f { return false; }
+                let n = x.args.len;
+                for i in 0..n - 1 {
+                    if !unify(m, x.args[i], y.args[i]) { return false; }
+                }
+                a = deref(x.args[n - 1]);
+                b = deref(y.args[n - 1]);
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Standard order class: Var < Number < Atom < Compound.
+fn order_class(t: Term) -> i32 {
+    match t {
+        Ref(_) => 0,
+        Flt(_) => 1,
+        Int(_) => 1,
+        Big(_) => 1,
+        Atom(_) => 3,
+        _ => 4,
+    }
+}
+
+fn cmp_i(a: i64, b: i64) -> i32 { if a < b { -1 } else if a > b { 1 } else { 0 } }
+
+fn cmp_num(a: Term, b: Term) -> i32 {
+    let c = arith.cmp(a, b);
+    if c != 0 { return c; }
+    // Equal values: a float comes before an integer.
+    match (a, b) {
+        (Flt(_), Flt(_)) => 0,
+        (Flt(_), _) => -1,
+        (_, Flt(_)) => 1,
+        _ => 0,
+    }
+}
+
+pub fn cmp_atoms(d: *Db, a: u32, b: u32) -> i32 {
+    if a == b { return 0; }
+    mem.compare_bytes(d.name(a), d.name(b))
+}
+
+/// Compare in the standard order of terms: -1, 0 or 1.
+pub fn compare(m: *Machine, a0: Term, b0: Term) -> i32 {
+    var a = deref(a0);
+    var b = deref(b0);
+    loop {
+        if a == b { return 0; }
+        let ca = order_class(a);
+        let cb = order_class(b);
+        if ca != cb { return if ca < cb { -1 } else { 1 }; }
+        match (a, b) {
+            (Ref(x), Ref(y)) => {
+                if x.stamp != y.stamp { return if x.stamp < y.stamp { -1 } else { 1 }; }
+                return if (x as u64) < (y as u64) { -1 } else { 1 };
+            }
+            (Atom(x), Atom(y)) => return cmp_atoms(&m.db, x, y),
+            _ => {}
+        }
+        if ca == 1 { return cmp_num(a, b); }
+        // Compound terms: arity, then name, then the arguments.
+        let (na, aa) = term.name_arity(&m.db, a);
+        let (nb, ab) = term.name_arity(&m.db, b);
+        if aa != ab { return if aa < ab { -1 } else { 1 }; }
+        let c = cmp_atoms(&m.db, na, nb);
+        if c != 0 { return c; }
+        let n = aa as u64;
+        for i in 0..n - 1 {
+            let r = compare(m, term.arg_of(a, i), term.arg_of(b, i));
+            if r != 0 { return r; }
+        }
+        a = deref(term.arg_of(a, n - 1));
+        b = deref(term.arg_of(b, n - 1));
+    }
+}
+
+/// A copy of `t` with fresh variables (`map` maps old variables, by
+/// address, to their copies).
+pub fn copy(m: *Machine, t0: Term, map: *HashMap<u64, Term>) -> Term {
+    let t = deref(t0);
+    match t {
+        Ref(v) => {
+            let key = v as u64;
+            if let Some(c) = map.get(key) { return c; }
+            let c = m.new_var();
+            map.insert(key, c);
+            c
+        }
+        Str(s) => {
+            let n = s.args.len;
+            let r = m.mk_struct(s.f, n);
+            for i in 0..n { r.args[i] = copy(m, s.args[i], map); }
+            Term.Str(r)
+        }
+        Lst(_) => {
+            // Copy the spine iteratively.
+            var cur = t;
+            let head = new(&m.heap, Cons { head: Term.Unb, tail: Term.Unb });
+            var last = head;
+            loop {
+                if let Lst(c) = cur {
+                    let cell = new(&m.heap, Cons { head: copy(m, c.head, map), tail: Term.Unb });
+                    last.tail = Term.Lst(cell);
+                    last = cell;
+                    cur = deref(c.tail);
+                } else {
+                    last.tail = copy(m, cur, map);
+                    break;
+                }
+            }
+            head.tail
+        }
+        _ => t,
+    }
+}
+
+pub fn copy_term(m: *Machine, t: Term) -> Term {
+    var map: HashMap<u64, Term> = HashMap.new();
+    let r = copy(m, t, &map);
+    map.free();
+    r
+}
+
+/// Collect the distinct variables of `t`, in depth-first left-to-right order.
+pub fn term_vars(t0: Term, out: *mem.Vec<Term>, seen: *HashMap<u64, bool>) {
+    var t = deref(t0);
+    loop {
+        match t {
+            Ref(v) => {
+                if seen.insert(v as u64, true) { out.push(t); }
+                return;
+            }
+            Str(s) => {
+                let n = s.args.len;
+                for i in 0..n - 1 { term_vars(s.args[i], out, seen); }
+                t = deref(s.args[n - 1]);
+            }
+            Lst(c) => {
+                term_vars(c.head, out, seen);
+                t = deref(c.tail);
+            }
+            _ => return,
+        }
+    }
+}
+
+pub fn Machine.flush(m: *Machine) {
+    if m.out.len() > 0 {
+        io.print(m.out.as_str());
+        m.out.clear();
+    }
+}
+
+/// The root scanner: argument registers, the live part of the environment
+/// stack, choicepoints' saved arguments, the trail, the pending exception
+/// ball, findall bags and the clause terms kept for clause/2 and retract/1.
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let m = data as *Machine;
+    for i in 0..NREGS { gc_mark(h, m.x[i]); }
+    gc_mark(h, m.ball);
+    for i in 0..m.bags.len { gc_mark(h, m.bags.ptr[i]); }
+    for i in 0..m.inits.len { gc_mark(h, m.inits.ptr[i]); }
+    // Code constants: big integers are in the heap.
+    for i in 0..m.consts.len { gc_mark(h, m.consts.ptr[i]); }
+    for i in 0..m.tr { gc_mark(h, m.trail[i]); }
+    // Environments: everything below the live top is scanned. Frames hold
+    // raw pointers next to terms, which read as floats (term.lm). Above the
+    // live top, words written since the last collection are zeroed so that
+    // the next frames there never expose a stale reference.
+    var top = m.e.end();
+    if m.b.etop > top { top = m.b.etop; }
+    var p = top;
+    while p < m.ehw { *p = Term.Flt(0.0); p = p + 1; }
+    m.ehw = top;
+    p = m.ebase;
+    while p < top { gc_mark(h, *p); p = p + 1; }
+    // Choicepoints.
+    var c = m.b;
+    loop {
+        let a = c.args();
+        for i in 0..c.n { gc_mark(h, a[i]); }
+        if c.prev == c { break; }
+        c = c.prev;
+    }
+    var gi: u64 = 0;
+    while let Some(sl) = m.globals.next(&gi) { gc_mark(h, sl.value); }
+    for i in 0..m.preds.len {
+        let pr = m.preds.ptr[i];
+        var cur = pr.first;
+        while let Some(c) = cur { gc_mark(h, c.term); cur = c.next; }
+    }
+}

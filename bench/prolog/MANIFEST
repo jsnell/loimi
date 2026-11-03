@@ -1,0 +1,25 @@
+# Reference Prolog systems and benchmark sources for the Prolog example.
+# install.sh downloads everything into bench/prolog/src/dl/, verifies the
+# sha256 below, builds the references into bench/prolog/install/{trealla,swipl}/
+# and generates bench/prolog/programs/ from the swi-bench tarball (prepare.py).
+# src/, install/ and programs/ are gitignored: only this manifest and our own
+# scripts/driver are committed.
+#
+# trealla: Trealla Prolog, MIT (LICENSE in its tree). Release v3.14.46
+#   (GitHub tag tarball).
+# swipl: SWI-Prolog, BSD-2-Clause (LICENSE). Release 10.0.2, the latest
+#   stable source release; sha256 matches the .sha256 published next to it.
+# cmake: Kitware's prebuilt Linux x86_64 binary release 3.31.6 (BSD-3-Clause),
+#   used only to configure swipl (no cmake on the host; no python3-venv).
+# swi-bench: https://github.com/SWI-Prolog/bench at commit
+#   d74163e6d7560df26af1fbda9e4d0bfd54787009 (GitHub commit tarball). The van
+#   Roy / Aquarius benchmarks plus later additions. Most programs carry no
+#   license; the suite's README lists 21 of them as "non-free" (no clear
+#   redistribution terms). We therefore never commit them, only download at
+#   bench time; see README.md.
+#
+# name       version   url                                                                                         sha256
+trealla      3.14.46   https://github.com/trealla-prolog/trealla/archive/refs/tags/v3.14.46.tar.gz                 d4f1453806c6f832e60cba20f8e26a7d095e392d78869508bd143532ece763db
+swipl        10.0.2    https://www.swi-prolog.org/download/stable/src/swipl-10.0.2.tar.gz                          e42cc098f7b8a6051c4f79a99b55162d467098aba60f69649bdc7583f0734b57
+cmake        3.31.6    https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz 5a1133ff103c71eb5120e2cc3de922733e7d8a26a98ae716397e8676adb367bf
+swi-bench    d74163e6  https://github.com/SWI-Prolog/bench/archive/d74163e6d7560df26af1fbda9e4d0bfd54787009.tar.gz  318fffbe1edd29e226e63004c78e0a515e58700ac9ee19cfc8551bbfed84a701

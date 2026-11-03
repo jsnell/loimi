@@ -1,0 +1,223 @@
+// The library predicates written in Prolog, consulted at startup. A user
+// program that defines one of these (append/3, say) replaces it.
+//
+// Loimi has no raw strings or file inclusion, so backslashes are doubled.
+
+pub const SOURCE: str = "
+catch(G, _, _) :- '$catch_enter'(L), call(G), '$catch_exit'(L).
+catch(_, C, R) :- '$catch_ball'(C), call(R).
+
+once(G) :- call(G), !.
+ignore(G) :- (call(G) -> true ; true).
+not(G) :- \\+ call(G).
+halt(C) :- '$set_halt'(C), halt.
+
+findall(T, G, L) :- '$fa_begin', '$findall_loop'(T, G), '$fa_end'(L0), L = L0.
+'$findall_loop'(T, G) :- call(G), '$fa_add'(T), fail.
+'$findall_loop'(_, _).
+findall(T, G, L, Tail) :- findall(T, G, L0), append(L0, Tail, L).
+forall(C, A) :- \\+ (call(C), \\+ call(A)).
+
+aggregate_all(count, G, C) :- !, findall(x, G, L), '$length'(L, C).
+aggregate_all(sum(E), G, S) :- !, findall(E, G, L), sum_list(L, S).
+aggregate_all(max(E), G, S) :- !, findall(E, G, L), L = [_|_], max_list(L, S).
+aggregate_all(min(E), G, S) :- !, findall(E, G, L), L = [_|_], min_list(L, S).
+aggregate_all(bag(E), G, L) :- !, findall(E, G, L).
+aggregate_all(set(E), G, S) :- !, findall(E, G, L), sort(L, S).
+
+'$bag_goal'(G, G, B, B) :- var(G), !.
+'$bag_goal'(V^G, G1, B0, B) :- !, term_variables(V, Vs), append(Vs, B0, B1), '$bag_goal'(G, G1, B1, B).
+'$bag_goal'(G, G, B, B).
+bagof(T, G, L) :-
+    '$bag_goal'(G, G1, [], B), term_variables(T+B, TV), term_variables(G1, GV),
+    '$vars_minus'(GV, TV, W),
+    (   W == []
+    ->  findall(T, G1, L), L \\== []
+    ;   Wt =.. ['$w'|W], findall(Wt-T, G1, Pairs), Pairs \\== [],
+        keysort(Pairs, Sorted), '$groups'(Sorted, Groups), '$member'(Wt-L, Groups)
+    ).
+setof(T, G, S) :- bagof(T, G, L), sort(L, S).
+'$vars_minus'([], _, []).
+'$vars_minus'([V|Vs], T, R) :- ( '$var_memberchk'(V, T) -> R = R1 ; R = [V|R1] ), '$vars_minus'(Vs, T, R1).
+'$var_memberchk'(V, [W|Ws]) :- ( V == W -> true ; '$var_memberchk'(V, Ws) ).
+'$groups'([], []).
+'$groups'([K-V|T], [K-[V|Vs]|Gs]) :- '$same_key'(K, T, Vs, Rest), '$groups'(Rest, Gs).
+'$same_key'(K, [K1-V|T], [V|Vs], Rest) :- K1 == K, !, '$same_key'(K, T, Vs, Rest).
+'$same_key'(_, L, [], L).
+
+'$member'(X, [X|_]).
+'$member'(X, [_|T]) :- '$member'(X, T).
+
+retract(C) :- '$clause_parts'(C, H, B), '$clause_gen'(H, G), '$clause_iter'(H, G, -1, R), '$clause'(R, H, B), '$erase'(R).
+clause(H, B) :- '$clause_gen'(H, G), '$clause_iter'(H, G, -1, R), '$clause'(R, H, B).
+'$clause_iter'(H, G, P, R) :- '$clause_next'(H, G, P, R1), ( R = R1 ; '$clause_iter'(H, G, R1, R) ).
+'$clause_parts'(C, H, B) :- nonvar(C), C = (H :- B), !.
+'$clause_parts'(H, H, true).
+retractall(H) :- '$clause_gen'(H, G), '$retractall'(H, G, -1).
+'$retractall'(H, G, P) :- ( '$clause_next'(H, G, P, R) -> ( \\+ \\+ '$clause'(R, H, _) -> '$erase'(R) ; true ), '$retractall'(H, G, R) ; true ).
+
+between(L, H, X) :- integer(X), !, X >= L, X =< H.
+between(L, inf, X) :- !, '$between_inf'(L, X).
+between(L, infinite, X) :- !, '$between_inf'(L, X).
+between(L, H, X) :- L =< H, '$between'(L, H, X).
+'$between'(L, L, X) :- !, X = L.
+'$between'(L, _, L).
+'$between'(L, H, X) :- L1 is L+1, '$between'(L1, H, X).
+'$between_inf'(L, L).
+'$between_inf'(L, X) :- L1 is L+1, '$between_inf'(L1, X).
+
+length(L, N) :- '$length'(L, N0), !, N = N0.
+length(L, N) :- var(N), !, '$length_gen'(L, 0, N).
+length(L, N) :- integer(N), N >= 0, '$length_make'(N, L).
+'$length_gen'([], N, N).
+'$length_gen'([_|T], N0, N) :- N1 is N0+1, '$length_gen'(T, N1, N).
+'$length_make'(0, L) :- !, L = [].
+'$length_make'(N, [_|T]) :- N1 is N-1, '$length_make'(N1, T).
+
+append([], L, L).
+append([H|T], L, [H|R]) :- append(T, L, R).
+append(Ls, L) :- '$append_all'(Ls, L).
+'$append_all'([], []).
+'$append_all'([L|Ls], As) :- append(L, Ws, As), '$append_all'(Ls, Ws).
+member(X, [X|_]).
+member(X, [_|T]) :- member(X, T).
+memberchk(X, L) :- member(X, L), !.
+reverse(L, R) :- '$reverse'(L, [], R).
+'$reverse'([], A, A).
+'$reverse'([H|T], A, R) :- '$reverse'(T, [H|A], R).
+nth0(I, L, E) :- integer(I), !, I >= 0, '$nth'(I, L, E).
+nth0(I, L, E) :- '$nth_gen'(L, E, 0, I).
+nth1(I, L, E) :- integer(I), !, I >= 1, I0 is I-1, '$nth'(I0, L, E).
+nth1(I, L, E) :- '$nth_gen'(L, E, 1, I).
+'$nth'(0, [E|_], E) :- !.
+'$nth'(I, [_|T], E) :- I1 is I-1, '$nth'(I1, T, E).
+'$nth_gen'([E|_], E, B, B).
+'$nth_gen'([_|T], E, B0, B) :- B1 is B0+1, '$nth_gen'(T, E, B1, B).
+last([X], X) :- !.
+last([_|T], X) :- last(T, X).
+sum_list(L, S) :- '$sum_list'(L, 0, S).
+'$sum_list'([], S, S).
+'$sum_list'([X|Xs], S0, S) :- S1 is S0+X, '$sum_list'(Xs, S1, S).
+sumlist(L, S) :- sum_list(L, S).
+max_list([H|T], M) :- '$max_list'(T, H, M).
+'$max_list'([], M, M).
+'$max_list'([H|T], M0, M) :- M1 is max(M0, H), '$max_list'(T, M1, M).
+min_list([H|T], M) :- '$min_list'(T, H, M).
+'$min_list'([], M, M).
+'$min_list'([H|T], M0, M) :- M1 is min(M0, H), '$min_list'(T, M1, M).
+max_member(M, L) :- '$max_member'(L, M).
+'$max_member'([H|T], M) :- '$max_member_'(T, H, M).
+'$max_member_'([], M, M).
+'$max_member_'([H|T], M0, M) :- ( H @> M0 -> '$max_member_'(T, H, M) ; '$max_member_'(T, M0, M) ).
+min_member(M, L) :- '$min_member'(L, M).
+'$min_member'([H|T], M) :- '$min_member_'(T, H, M).
+'$min_member_'([], M, M).
+'$min_member_'([H|T], M0, M) :- ( H @< M0 -> '$min_member_'(T, H, M) ; '$min_member_'(T, M0, M) ).
+numlist(L, H, []) :- L > H, !.
+numlist(L, H, [L|T]) :- L1 is L+1, numlist(L1, H, T).
+select(X, [X|T], T).
+select(X, [H|T], [H|R]) :- select(X, T, R).
+selectchk(X, L, R) :- select(X, L, R), !.
+select(X, Xs, Y, Ys) :- '$select4'(Xs, X, Y, Ys).
+'$select4'([X|T], X, Y, [Y|T]).
+'$select4'([H|T], X, Y, [H|T2]) :- '$select4'(T, X, Y, T2).
+exclude(_, [], []).
+exclude(P, [H|T], R) :- ( call(P, H) -> R = R1 ; R = [H|R1] ), exclude(P, T, R1).
+include(_, [], []).
+include(P, [H|T], R) :- ( call(P, H) -> R = [H|R1] ; R = R1 ), include(P, T, R1).
+partition(_, [], [], []).
+partition(P, [H|T], I, E) :- ( call(P, H) -> I = [H|I1], E = E1 ; I = I1, E = [H|E1] ), partition(P, T, I1, E1).
+maplist(_, []).
+maplist(P, [A|As]) :- call(P, A), maplist(P, As).
+maplist(_, [], []).
+maplist(P, [A|As], [B|Bs]) :- call(P, A, B), maplist(P, As, Bs).
+maplist(_, [], [], []).
+maplist(P, [A|As], [B|Bs], [C|Cs]) :- call(P, A, B, C), maplist(P, As, Bs, Cs).
+maplist(_, [], [], [], []).
+maplist(P, [A|As], [B|Bs], [C|Cs], [D|Ds]) :- call(P, A, B, C, D), maplist(P, As, Bs, Cs, Ds).
+foldl(G, L, A0, A) :- '$foldl'(L, G, A0, A).
+'$foldl'([], _, A, A).
+'$foldl'([X|Xs], G, A0, A) :- call(G, X, A0, A1), '$foldl'(Xs, G, A1, A).
+foldl(G, L1, L2, A0, A) :- '$foldl'(L1, L2, G, A0, A).
+'$foldl'([], [], _, A, A).
+'$foldl'([X|Xs], [Y|Ys], G, A0, A) :- call(G, X, Y, A0, A1), '$foldl'(Xs, Ys, G, A1, A).
+delete([], _, []).
+delete([H|T], X, R) :- ( H \\= X -> R = [H|R1] ; R = R1 ), delete(T, X, R1).
+subtract([], _, []).
+subtract([H|T], L, R) :- ( memberchk(H, L) -> R = R1 ; R = [H|R1] ), subtract(T, L, R1).
+intersection([], _, []).
+intersection([H|T], L, R) :- ( memberchk(H, L) -> R = [H|R1] ; R = R1 ), intersection(T, L, R1).
+union([], L, L).
+union([H|T], L, R) :- ( memberchk(H, L) -> R = R1 ; R = [H|R1] ), union(T, L, R1).
+list_to_set(L, S) :- '$lts'(L, [], S).
+'$lts'([], _, []).
+'$lts'([H|T], Seen, R) :- ( memberchk(H, Seen) -> R = R1 ; R = [H|R1] ), '$lts'(T, [H|Seen], R1).
+permutation([], []).
+permutation(L, [H|T]) :- select(H, L, R), permutation(R, T).
+flatten(L, F) :- '$flatten'(L, [], F0), !, F = F0.
+'$flatten'(V, T, [V|T]) :- var(V), !.
+'$flatten'([], T, T) :- !.
+'$flatten'([H|Rest], T, F) :- !, '$flatten'(H, F1, F), '$flatten'(Rest, T, F1).
+'$flatten'(A, T, [A|T]).
+sort(L, S, _) :- sort(L, S).
+predsort(P, L, Sorted) :- length(L, N), ( N < 2 -> '$predsort_small'(N, P, L, Sorted) ; '$predsort'(P, N, L, _, Sorted1), Sorted = Sorted1 ).
+'$predsort_small'(0, _, [], []).
+'$predsort_small'(1, _, [X], [X]).
+'$predsort'(P, 2, [X1,X2|L], L, R) :- !, call(P, Delta, X1, X2), '$sort2'(Delta, X1, X2, R).
+'$predsort'(_, 1, [X|L], L, [X]) :- !.
+'$predsort'(_, 0, L, L, []) :- !.
+'$predsort'(P, N, L1, L3, R) :- N1 is N // 2, plus(N1, N2, N), '$predsort'(P, N1, L1, L2, R1), '$predsort'(P, N2, L2, L3, R2), '$predmerge'(P, R1, R2, R).
+'$sort2'(<, X1, X2, [X1,X2]).
+'$sort2'(=, X1, _, [X1]).
+'$sort2'(>, X1, X2, [X2,X1]).
+'$predmerge'(_, [], R, R) :- !.
+'$predmerge'(_, R, [], R) :- !.
+'$predmerge'(P, [H1|T1], [H2|T2], Result) :- call(P, Delta, H1, H2), !, '$predmerge_'(Delta, P, H1, H2, T1, T2, Result).
+'$predmerge_'(<, P, H1, H2, T1, T2, [H1|R]) :- '$predmerge'(P, T1, [H2|T2], R).
+'$predmerge_'(=, P, H1, _, T1, T2, [H1|R]) :- '$predmerge'(P, T1, T2, R).
+'$predmerge_'(>, P, H1, H2, T1, T2, [H2|R]) :- '$predmerge'(P, [H1|T1], T2, R).
+pairs_keys_values([], [], []).
+pairs_keys_values([K-V|T], [K|Ks], [V|Vs]) :- pairs_keys_values(T, Ks, Vs).
+pairs_keys([], []).
+pairs_keys([K-_|T], [K|Ks]) :- pairs_keys(T, Ks).
+pairs_values([], []).
+pairs_values([_-V|T], [V|Vs]) :- pairs_values(T, Vs).
+
+atom_concat(A, B, C) :- nonvar(A), nonvar(B), !, '$atom_concat'(A, B, C).
+atom_concat(A, B, C) :- atom_length(C, L), between(0, L, N), '$sub_atom'(C, 0, N, A), M is L-N, '$sub_atom'(C, N, M, B).
+sub_atom(A, B, L, After, Sub) :- atom_length(A, Len), between(0, Len, B), Max is Len-B, between(0, Max, L), After is Len-B-L, '$sub_atom'(A, B, L, Sub).
+atomic_list_concat(L, A) :- '$atomics'(L, A).
+atomic_list_concat(L, Sep, A) :- nonvar(L), '$join'(L, Sep, L1), !, '$atomics'(L1, A).
+atomic_list_concat(L, Sep, A) :- atom(A), atom_codes(Sep, SC), atom_codes(A, AC), '$split'(AC, SC, Parts), '$codes_atoms'(Parts, L).
+'$join'([], _, []).
+'$join'([X], _, [X]) :- !.
+'$join'([X|Xs], S, [X,S|R]) :- '$join'(Xs, S, R).
+'$split'(Cs, Sep, [P|Ps]) :- append(P, Rest, Cs), append(Sep, After, Rest), !, '$split'(After, Sep, Ps).
+'$split'(Cs, _, [Cs]).
+'$codes_atoms'([], []).
+'$codes_atoms'([C|Cs], [A|As]) :- atom_codes(A, C), '$codes_atoms'(Cs, As).
+concat_atom(L, A) :- atomic_list_concat(L, A).
+concat_atom(L, S, A) :- atomic_list_concat(L, S, A).
+
+current_op(P, T, N) :- '$ops'(L), '$member'(op(P, T, N), L).
+
+phrase(G, L) :- phrase(G, L, []).
+phrase(G, L, R) :- '$dcg_body'(G, S0, S, Goal), S0 = L, S = R, call(Goal).
+'$dcg_translate'((H, _ --> _), _) :- !, throw(error(not_supported(pushback), H)).
+'$dcg_translate'((H --> B), (H1 :- B1)) :- '$dcg_nt'(H, S0, S, H1), '$dcg_body'(B, S0, S, B1).
+'$dcg_body'(V, S0, S, phrase(V, S0, S)) :- var(V), !.
+'$dcg_body'((A, B), S0, S, (A1, B1)) :- !, '$dcg_body'(A, S0, S1, A1), '$dcg_body'(B, S1, S, B1).
+'$dcg_body'((A ; B), S0, S, (A1 ; B1)) :- !, '$dcg_body'(A, S0, S, A1), '$dcg_body'(B, S0, S, B1).
+'$dcg_body'((A -> B), S0, S, (A1 -> B1)) :- !, '$dcg_body'(A, S0, S1, A1), '$dcg_body'(B, S1, S, B1).
+'$dcg_body'(\\+ A, S0, S, (\\+ A1, S0 = S)) :- !, '$dcg_body'(A, S0, _, A1).
+'$dcg_body'({G}, S0, S, (G, S0 = S)) :- !.
+'$dcg_body'(!, S0, S, (!, S0 = S)) :- !.
+'$dcg_body'([], S0, S, S0 = S) :- !.
+'$dcg_body'(L, S0, S, S0 = L1) :- L = [_|_], !, '$dcg_terminals'(L, S, L1).
+'$dcg_body'(call(G), S0, S, call(G, S0, S)) :- !.
+'$dcg_body'(call(G, A), S0, S, call(G, A, S0, S)) :- !.
+'$dcg_body'(NT, S0, S, G) :- '$dcg_nt'(NT, S0, S, G).
+'$dcg_terminals'([], S, S).
+'$dcg_terminals'([H|T], S, [H|R]) :- '$dcg_terminals'(T, S, R).
+'$dcg_nt'(NT, S0, S, G) :- NT =.. L, append(L, [S0, S], L2), G =.. L2.
+";

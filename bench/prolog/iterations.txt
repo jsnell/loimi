@@ -1,0 +1,34 @@
+# Iterations K of top/0 per benchmark (run.py), the same for every system.
+# Calibrated with `run.py --calibrate 1.0`: about 1 s under
+# install/swipl/bin/swipl -O on the machine where it was last run, starting
+# from the counts in the suite's programs.pl.
+boyer            57
+browse           41
+chat_parser      160
+crypt            7900
+derive           290000
+divide10         630000
+eval             11000
+fast_mu          29000
+flatten          48000
+log10            1300000
+meta_qsort       4700
+mu               30000
+nand             1100
+nreverse         83000
+ops8             920000
+perfect          3900
+poly_10          510
+prover           25000
+qsort            47000
+queens_8         560
+query            11000
+reducer          640
+sendmore         410
+serialise        78000
+sieve            61
+simple_analyzer  1500
+tak              160
+times10          670000
+unify            13000
+zebra            680

@@ -1,0 +1,730 @@
+// The reader: Prolog tokens and an operator precedence parser, with the
+// operator table that op/3 changes and the writer consults.
+
+import std.text;
+import std.num;
+import std.mem;
+import std.hash;
+import std.map.{HashMap};
+import term.{Term, Var, Struct, Cons, deref};
+import term;
+import machine.{Machine};
+import std.bigint;
+import std.bigint.{Arg};
+import arith;
+
+// Operator types.
+pub const XFX: u32 = 0;
+pub const XFY: u32 = 1;
+pub const YFX: u32 = 2;
+pub const FY: u32 = 3;
+pub const FX: u32 = 4;
+pub const XF: u32 = 5;
+pub const YF: u32 = 6;
+
+const K_PREFIX: u64 = 0;
+const K_INFIX: u64 = 1;
+const K_POSTFIX: u64 = 2;
+
+fn op_key(a: u32, kind: u64) -> u64 { ((a as u64) << 2) | kind }
+
+fn kind_of(typ: u32) -> u64 {
+    if typ <= YFX { K_INFIX } else if typ <= FX { K_PREFIX } else { K_POSTFIX }
+}
+
+/// op/3 for one atom: priority 0 removes the definition.
+pub fn add_op(m: *Machine, prec: u32, typ: u32, a: u32) {
+    let k = op_key(a, kind_of(typ));
+    if prec == 0 { m.ops.remove(k); return; }
+    m.ops.insert(k, (prec << 4) | typ);
+}
+
+pub fn op_type_atom(m: *Machine, s: str) -> ?u32 {
+    match s {
+        "xfx" => Some(XFX), "xfy" => Some(XFY), "yfx" => Some(YFX),
+        "fy" => Some(FY), "fx" => Some(FX), "xf" => Some(XF), "yf" => Some(YF),
+        _ => None,
+    }
+}
+
+pub fn op_type_name(t: u32) -> str {
+    match t {
+        0 => "xfx", 1 => "xfy", 2 => "yfx", 3 => "fy", 4 => "fx", 5 => "xf", _ => "yf",
+    }
+}
+
+pub fn init_ops(m: *Machine) {
+    let table = [
+        (1200, "xfx", ":-"), (1200, "xfx", "-->"), (1200, "fx", ":-"), (1200, "fx", "?-"),
+        (1100, "xfy", ";"), (1100, "xfy", "|"), (1105, "xfy", "|"), (1050, "xfy", "->"), (1050, "xfy", "*->"),
+        (1000, "xfy", ","), (990, "xfx", ":="), (900, "fy", "\\+"),
+        (700, "xfx", "="), (700, "xfx", "\\="), (700, "xfx", "=="), (700, "xfx", "\\=="),
+        (700, "xfx", "@<"), (700, "xfx", "@>"), (700, "xfx", "@=<"), (700, "xfx", "@>="),
+        (700, "xfx", "=.."), (700, "xfx", "is"), (700, "xfx", "=:="), (700, "xfx", "=\\="),
+        (700, "xfx", "<"), (700, "xfx", ">"), (700, "xfx", "=<"), (700, "xfx", ">="),
+        (700, "xfx", ">:<"), (700, "xfx", ":<"), (700, "xfx", "as"),
+        (600, "xfy", ":"), (500, "yfx", "+"), (500, "yfx", "-"), (500, "yfx", "/\\"),
+        (500, "yfx", "\\/"), (500, "yfx", "xor"), (500, "fx", "?"),
+        (400, "yfx", "*"), (400, "yfx", "/"), (400, "yfx", "//"), (400, "yfx", "rdiv"),
+        (400, "yfx", "<<"), (400, "yfx", ">>"), (400, "yfx", "mod"), (400, "yfx", "rem"),
+        (400, "yfx", "div"), (400, "yfx", "divmod"), (200, "xfx", "**"), (200, "xfy", "^"),
+        (200, "fy", "-"), (200, "fy", "+"), (200, "fy", "\\"), (1, "fx", "$"),
+    ];
+    for e in table {
+        let (p, t, n) = e;
+        add_op(m, p as u32, op_type_atom(m, t).unwrap(), m.db.atom(n));
+    }
+    let decl = ["dynamic", "discontiguous", "initialization", "meta_predicate", "module_transparent",
+                "multifile", "public", "thread_local", "table"];
+    for n in decl { add_op(m, 1150, FX, m.db.atom(n)); }
+    add_op(m, 1100, XFY, term.A_BAR);
+}
+
+pub fn is_op(m: *Machine, a: u32) -> bool {
+    m.ops.contains(op_key(a, K_PREFIX)) or m.ops.contains(op_key(a, K_INFIX)) or m.ops.contains(op_key(a, K_POSTFIX))
+}
+
+pub fn op_prec(m: *Machine, a: u32) -> u32 {
+    var p: u32 = 0;
+    for k in [K_PREFIX, K_INFIX, K_POSTFIX] {
+        if let Some(v) = m.ops.get(op_key(a, k)) { if (v >> 4) > p { p = v >> 4; } }
+    }
+    p
+}
+
+/// (priority, left max, right max)
+pub fn infix_op(m: *Machine, a: u32) -> ?(u32, u32, u32) {
+    let v = m.ops.get(op_key(a, K_INFIX))?;
+    let p = v >> 4;
+    match v & 15 {
+        0 => Some((p, p - 1, p - 1)),
+        1 => Some((p, p - 1, p)),
+        _ => Some((p, p, p - 1)),
+    }
+}
+
+/// (priority, argument max)
+pub fn prefix_op(m: *Machine, a: u32) -> ?(u32, u32) {
+    let v = m.ops.get(op_key(a, K_PREFIX))?;
+    let p = v >> 4;
+    if (v & 15) == FY { Some((p, p)) } else { Some((p, p - 1)) }
+}
+
+pub fn postfix_op(m: *Machine, a: u32) -> ?(u32, u32) {
+    let v = m.ops.get(op_key(a, K_POSTFIX))?;
+    let p = v >> 4;
+    if (v & 15) == YF { Some((p, p)) } else { Some((p, p - 1)) }
+}
+
+pub fn op_def(m: *Machine, a: u32, kind: u64) -> ?u32 { m.ops.get(op_key(a, kind)) }
+
+// ---- tokens --------------------------------------------------------------
+
+pub enum Tk { BigInt, Atom, Var, Int, Flt, Str, BackQ, Open, OpenCT, Close, Comma, Bar, OpenList, CloseList, OpenCurly, CloseCurly, End, Eof }
+
+pub struct Token {
+    kind: Tk,
+    text: str,     // atom or variable name (in the reader's arena)
+    int: i64,
+    flt: f64,
+    layout: bool,  // layout (or a comment) before the token
+    line: u32,
+}
+
+pub struct Reader {
+    m: *Machine,
+    src: str,
+    pos: u64,
+    line: u32,
+    tok: Token,
+    peeked: bool,
+    arena: mem.Arena,
+    buf: text.StrBuf,
+    vars: mem.Vec<(str, Term)>,
+    error: ?str,
+    err_line: u32,
+    arg_ctx: bool,
+}
+
+pub fn Reader.new(m: *Machine, src: str) -> Reader {
+    Reader {
+        m: m, src: src, pos: 0, line: 1,
+        tok: Token { kind: Tk.Eof, text: "", int: 0, flt: 0.0, layout: false, line: 1 },
+        peeked: false, arena: mem.Arena.new(), buf: text.StrBuf.new(), vars: mem.Vec.new(),
+        error: None, err_line: 0, arg_ctx: false,
+    }
+}
+
+pub fn Reader.free(r: *Reader) {
+    r.arena.free();
+    r.buf.free();
+    r.vars.free();
+}
+
+fn is_sym(c: u8) -> bool {
+    c == '+' or c == '-' or c == '*' or c == '/' or c == '\\' or c == '^' or c == '<' or c == '>'
+        or c == '=' or c == '~' or c == ':' or c == '.' or c == '?' or c == '@' or c == '#'
+        or c == '&' or c == '$'
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 128
+}
+
+fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
+
+fn Reader.peekc(r: *Reader, off: u64) -> u8 {
+    if r.pos + off < r.src.len { r.src[r.pos + off] } else { 0 }
+}
+
+fn Reader.fail(r: *Reader, msg: str) {
+    if r.error.is_none() { r.error = Some(msg); r.err_line = r.line; }
+}
+
+/// Skip layout and comments; true if there was any.
+fn Reader.skip_layout(r: *Reader) -> bool {
+    let start = r.pos;
+    loop {
+        if r.pos >= r.src.len { break; }
+        let c = r.src[r.pos];
+        if c == '\n' { r.line += 1; r.pos += 1; }
+        else if c == ' ' or c == '\t' or c == '\r' or c == 12 { r.pos += 1; }
+        else if c == '%' {
+            while r.pos < r.src.len and r.src[r.pos] != '\n' { r.pos += 1; }
+        } else if c == '/' and r.peekc(1) == '*' {
+            r.pos += 2;
+            while r.pos < r.src.len and !(r.src[r.pos] == '*' and r.peekc(1) == '/') {
+                if r.src[r.pos] == '\n' { r.line += 1; }
+                r.pos += 1;
+            }
+            r.pos += 2;
+            if r.pos > r.src.len { r.pos = r.src.len; }
+        } else { break; }
+    }
+    r.pos != start
+}
+
+/// One escape sequence after a backslash in a quoted item; None for a
+/// continuation (backslash-newline).
+fn Reader.escape(r: *Reader) -> ?u32 {
+    let c = r.peekc(0);
+    r.pos += 1;
+    match c {
+        'n' => Some(10), 't' => Some(9), 'r' => Some(13), 'a' => Some(7), 'b' => Some(8),
+        'f' => Some(12), 'v' => Some(11), '0'..='7' => {
+            var v: u32 = (c - '0') as u32;
+            while is_digit(r.peekc(0)) and r.peekc(0) < '8' { v = v * 8 + (r.peekc(0) - '0') as u32; r.pos += 1; }
+            if r.peekc(0) == '\\' { r.pos += 1; }
+            Some(v)
+        }
+        'x' => {
+            var v: u32 = 0;
+            while num.is_hex_digit(r.peekc(0)) { v = v * 16 + num.digit_value(r.peekc(0)); r.pos += 1; }
+            if r.peekc(0) == '\\' { r.pos += 1; }
+            Some(v)
+        }
+        'e' => Some(27), 's' => Some(32), 'z' => Some(0xFFFFFFFF),
+        '\n' => { r.line += 1; None }
+        _ => Some(c as u32),
+    }
+}
+
+fn push_code(b: *text.StrBuf, c: u32) {
+    if c < 128 { b.push(c as u8); }
+    else if c < 0x800 { b.push((0xC0 | (c >> 6)) as u8); b.push((0x80 | (c & 63)) as u8); }
+    else if c < 0x10000 { b.push((0xE0 | (c >> 12)) as u8); b.push((0x80 | ((c >> 6) & 63)) as u8); b.push((0x80 | (c & 63)) as u8); }
+    else { b.push((0xF0 | (c >> 18)) as u8); b.push((0x80 | ((c >> 12) & 63)) as u8); b.push((0x80 | ((c >> 6) & 63)) as u8); b.push((0x80 | (c & 63)) as u8); }
+}
+
+/// The body of a quoted item, up to the closing `q`, into `r.buf`.
+fn Reader.quoted(r: *Reader, q: u8) {
+    r.buf.clear();
+    loop {
+        if r.pos >= r.src.len { r.fail("unterminated quoted"); return; }
+        let c = r.src[r.pos];
+        r.pos += 1;
+        if c == q {
+            if r.peekc(0) == q { r.buf.push(q); r.pos += 1; continue; }
+            return;
+        }
+        if c == '\\' {
+            if let Some(e) = r.escape() { push_code(&r.buf, e); }
+            continue;
+        }
+        if c == '\n' { r.line += 1; }
+        r.buf.push(c);
+    }
+}
+
+fn Reader.number(r: *Reader) {
+    let start = r.pos;
+    let t = &r.tok;
+    if r.src[r.pos] == '0' and r.peekc(1) == '\'' {
+        // 0'c
+        r.pos += 2;
+        let c = r.peekc(0);
+        if c == '\\' {
+            r.pos += 1;
+            t.int = (r.escape() ?? 0) as i64;
+        } else if c == '\'' and r.peekc(1) == '\'' {
+            r.pos += 2;
+            t.int = 39;
+        } else {
+            // A UTF-8 sequence is one code.
+            var v = c as u32;
+            var n: u64 = 1;
+            if c >= 0xF0 { v = (c as u32) & 7; n = 4; } else if c >= 0xE0 { v = (c as u32) & 15; n = 3; } else if c >= 0xC0 { v = (c as u32) & 31; n = 2; }
+            for i in 1..n { v = (v << 6) | ((r.peekc(i) as u32) & 63); }
+            r.pos += n;
+            t.int = v as i64;
+        }
+        t.kind = Tk.Int;
+        return;
+    }
+    if r.src[r.pos] == '0' and (r.peekc(1) == 'x' or r.peekc(1) == 'o' or r.peekc(1) == 'b') {
+        let radix: u32 = if r.peekc(1) == 'x' { 16 } else if r.peekc(1) == 'o' { 8 } else { 2 };
+        let ds = r.pos + 2;
+        var e = ds;
+        while e < r.src.len and num.digit_value(r.src[e]) < radix { e += 1; }
+        if e > ds {
+            r.pos = e;
+            match num.parse_i64(r.src[ds..e], radix) {
+                Ok(v) => { t.int = v; t.kind = Tk.Int; }
+                Err(_) => { r.fail("integer too large"); t.kind = Tk.Int; t.int = 0; }
+            }
+            if !term.fits_int(t.int) { r.fail("integer too large"); }
+            return;
+        }
+    }
+    while is_digit(r.peekc(0)) or (r.peekc(0) == '_' and is_digit(r.peekc(1))) { r.pos += 1; }
+    var is_float = false;
+    if r.peekc(0) == '.' and is_digit(r.peekc(1)) {
+        is_float = true;
+        r.pos += 1;
+        while is_digit(r.peekc(0)) { r.pos += 1; }
+    }
+    if (r.peekc(0) == 'e' or r.peekc(0) == 'E') and (is_digit(r.peekc(1)) or ((r.peekc(1) == '+' or r.peekc(1) == '-') and is_digit(r.peekc(2)))) {
+        is_float = true;
+        r.pos += 2;
+        while is_digit(r.peekc(0)) { r.pos += 1; }
+    }
+    if r.peekc(0) == 'I' and r.src.len >= r.pos + 3 and r.src[r.pos..r.pos + 3].eq("Inf") and is_float {
+        r.pos += 3;
+        t.kind = Tk.Flt;
+        t.flt = 1.0 / 0.0;
+        return;
+    }
+    // Digit groups (1_000_000) are dropped.
+    r.buf.clear();
+    for i in start..r.pos { if r.src[i] != '_' { r.buf.push(r.src[i]); } }
+    if is_float {
+        t.kind = Tk.Flt;
+        match num.parse_f64(r.buf.as_str()) { Ok(x) => t.flt = x, Err(_) => r.fail("bad float") }
+    } else {
+        t.kind = Tk.Int;
+        match num.parse_i64(r.buf.as_str(), 10) {
+            Ok(v) => t.int = v,
+            Err(_) => { t.kind = Tk.BigInt; t.text = r.arena.str(r.buf.as_str()); }
+        }
+        if t.kind == Tk.Int and !term.fits_int(t.int) { t.kind = Tk.BigInt; t.text = r.arena.str(r.buf.as_str()); }
+    }
+}
+
+fn Reader.next(r: *Reader) -> *Token {
+    if r.peeked { r.peeked = false; return &r.tok; }
+    let layout = r.skip_layout();
+    let t = &r.tok;
+    t.layout = layout;
+    t.line = r.line;
+    t.text = "";
+    t.int = 0;
+    if r.pos >= r.src.len { t.kind = Tk.Eof; return t; }
+    let c = r.src[r.pos];
+    let start = r.pos;
+    if is_digit(c) {
+        r.number();
+        return t;
+    }
+    if c == '_' or (c >= 'A' and c <= 'Z') {
+        while r.pos < r.src.len and is_alnum(r.src[r.pos]) { r.pos += 1; }
+        t.kind = Tk.Var;
+        t.text = r.src[start..r.pos];
+        return t;
+    }
+    if (c >= 'a' and c <= 'z') or c >= 128 {
+        while r.pos < r.src.len and is_alnum(r.src[r.pos]) { r.pos += 1; }
+        t.kind = Tk.Atom;
+        t.text = r.src[start..r.pos];
+        return t;
+    }
+    r.pos += 1;
+    match c {
+        '(' => { t.kind = if layout { Tk.Open } else { Tk.OpenCT }; return t; }
+        ')' => { t.kind = Tk.Close; return t; }
+        '[' => { t.kind = Tk.OpenList; return t; }
+        ']' => { t.kind = Tk.CloseList; return t; }
+        '{' => { t.kind = Tk.OpenCurly; return t; }
+        '}' => { t.kind = Tk.CloseCurly; return t; }
+        ',' => { t.kind = Tk.Comma; return t; }
+        '|' => {
+            if r.peekc(0) == '|' { r.pos += 1; t.kind = Tk.Atom; t.text = "||"; return t; }
+            t.kind = Tk.Bar;
+            return t;
+        }
+        '!' => { t.kind = Tk.Atom; t.text = "!"; return t; }
+        ';' => { t.kind = Tk.Atom; t.text = ";"; return t; }
+        '\'' => {
+            r.quoted('\'');
+            t.kind = Tk.Atom;
+            t.text = r.arena.str(r.buf.as_str());
+            t.int = 1;     // quoted: never an operator in functional position checks
+            return t;
+        }
+        '"' => {
+            r.quoted('"');
+            t.kind = Tk.Str;
+            t.text = r.arena.str(r.buf.as_str());
+            return t;
+        }
+        '`' => {
+            r.quoted('`');
+            t.kind = Tk.BackQ;
+            t.text = r.arena.str(r.buf.as_str());
+            return t;
+        }
+        _ => {}
+    }
+    if c == '.' {
+        let n = r.peekc(0);
+        if n == 0 or n == ' ' or n == '\n' or n == '\t' or n == '\r' or n == '%' {
+            t.kind = Tk.End;
+            return t;
+        }
+    }
+    if is_sym(c) {
+        while r.pos < r.src.len and is_sym(r.src[r.pos]) { r.pos += 1; }
+        t.kind = Tk.Atom;
+        t.text = r.src[start..r.pos];
+        return t;
+    }
+    r.fail("illegal character");
+    t.kind = Tk.Eof;
+    t
+}
+
+fn Reader.peek(r: *Reader) -> *Token {
+    if !r.peeked { r.next(); r.peeked = true; }
+    &r.tok
+}
+
+fn Reader.variable(r: *Reader, name: str) -> Term {
+    if name.eq("_") { return r.m.new_var(); }
+    for i in 0..r.vars.len {
+        let (n, v) = r.vars.ptr[i];
+        if n.eq(name) { return v; }
+    }
+    let v = r.m.new_var();
+    r.vars.push((r.arena.str(name), v));
+    v
+}
+
+pub fn Reader.codes_pub(r: *Reader, s: str, chars: bool) -> Term { r.codes(s, chars) }
+
+fn Reader.codes(r: *Reader, s: str, chars: bool) -> Term {
+    let m = r.m;
+    var t = Term.Atom(term.A_NIL);
+    // Decode UTF-8 into codes, then build the list from the end.
+    var cs: mem.Vec<u32> = mem.Vec.new();
+    var i: u64 = 0;
+    while i < s.len {
+        let c = s[i];
+        var v = c as u32;
+        var n: u64 = 1;
+        if c >= 0xF0 { v = (c as u32) & 7; n = 4; } else if c >= 0xE0 { v = (c as u32) & 15; n = 3; } else if c >= 0xC0 { v = (c as u32) & 31; n = 2; }
+        for j in 1..n { if i + j < s.len { v = (v << 6) | ((s[i + j] as u32) & 63); } }
+        cs.push(v);
+        i += n;
+    }
+    var k = cs.len;
+    while k > 0 {
+        k -= 1;
+        let e = if chars {
+            var b = text.StrBuf.new();
+            push_code(&b, cs.ptr[k]);
+            let a = m.db.atom(b.as_str());
+            b.free();
+            Term.Atom(a)
+        } else { term.mk_int(cs.ptr[k] as i64) };
+        t = m.mk_cons(e, t);
+    }
+    cs.free();
+    t
+}
+
+/// Can this token start a term?
+fn starts_term(r: *Reader, t: *Token) -> bool {
+    match t.kind {
+        Atom => {
+            // An infix operator that is not also a prefix one cannot.
+            let a = r.m.db.atom(t.text);
+            if infix_op(r.m, a).is_some() and prefix_op(r.m, a).is_none() and t.int == 0 { return false; }
+            true
+        }
+        Var => true, Int => true, Flt => true, Str => true, BackQ => true,
+        Open => true, OpenCT => true, OpenList => true, OpenCurly => true,
+        _ => false,
+    }
+}
+
+fn Reader.expect(r: *Reader, k: Tk, msg: str) {
+    let t = r.next();
+    if t.kind != k { r.fail(msg); }
+}
+
+fn Reader.arglist(r: *Reader, name: u32) -> Term {
+    var args: mem.Vec<Term> = mem.Vec.new();
+    loop {
+        args.push(r.parse_arg());
+        if r.error.is_some() { args.free(); return Term.Atom(term.A_NIL); }
+        let t = r.next();
+        if t.kind == Tk.Comma { continue; }
+        if t.kind != Tk.Close { r.fail("expected , or ) in arguments"); }
+        break;
+    }
+    let m = r.m;
+    let res = if name == term.A_DOT and args.len == 2 {
+        m.mk_cons(args.ptr[0], args.ptr[1])
+    } else {
+        let f = m.db.functor(name, args.len as u32);
+        let s = m.mk_struct(f, args.len);
+        for i in 0..args.len { s.args[i] = args.ptr[i]; }
+        Term.Str(s)
+    };
+    args.free();
+    res
+}
+
+/// A primary term and its priority.
+fn Reader.primary(r: *Reader, maxp: u32) -> (Term, u32) {
+    let m = r.m;
+    let t = r.next();
+    match t.kind {
+        Int => return (term.mk_int(t.int), 0),
+        BigInt => { let s = t.text; return (big_of(r.m, s, false), 0); }
+        Flt => return (Term.Flt(t.flt), 0),
+        Var => { let name = t.text; return (r.variable(name), 0); }
+        Str => {
+            let s = t.text;
+            if m.flags_dq == term.A_ATOM { return (Term.Atom(m.db.atom(s)), 0); }
+            return (r.codes(s, m.flags_dq == term.A_CHARS), 0);
+        }
+        BackQ => { let s = t.text; return (r.codes(s, false), 0); }
+        Open => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return (x, 0); }
+        OpenCT => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return (x, 0); }
+        OpenList => {
+            if r.peek().kind == Tk.CloseList {
+                r.next();
+                return r.after_atom(term.A_NIL, maxp, false);
+            }
+            var items: mem.Vec<Term> = mem.Vec.new();
+            var tail = Term.Atom(term.A_NIL);
+            loop {
+                items.push(r.parse_arg());
+                if r.error.is_some() { break; }
+                let k = r.next().kind;
+                if k == Tk.Comma { continue; }
+                if k == Tk.Bar { tail = r.parse(999); r.expect(Tk.CloseList, "expected ]"); break; }
+                if k != Tk.CloseList { r.fail("expected , | or ] in list"); }
+                break;
+            }
+            var k = items.len;
+            while k > 0 { k -= 1; tail = m.mk_cons(items.ptr[k], tail); }
+            items.free();
+            return (tail, 0);
+        }
+        OpenCurly => {
+            if r.peek().kind == Tk.CloseCurly {
+                r.next();
+                return r.after_atom(term.A_CURLY, maxp, false);
+            }
+            let x = r.parse(1200);
+            r.expect(Tk.CloseCurly, "expected }");
+            return (m.mk1(term.A_CURLY, x), 0);
+        }
+        Atom => {
+            let quoted = t.int != 0;
+            let a = m.db.atom(t.text);
+            return r.after_atom(a, maxp, quoted);
+        }
+        Comma => { r.fail("unexpected ,"); return (Term.Atom(term.A_NIL), 0); }
+        Bar => { r.fail("unexpected |"); return (Term.Atom(term.A_NIL), 0); }
+        End => { r.fail("unexpected end of clause"); return (Term.Atom(term.A_NIL), 0); }
+        Eof => { r.fail("unexpected end of file"); return (Term.Atom(term.A_NIL), 0); }
+        _ => { r.fail("unexpected token"); return (Term.Atom(term.A_NIL), 0); }
+    }
+}
+
+/// An atom just read: functional notation, a prefix operator, a signed
+/// number, or the atom itself.
+fn Reader.after_atom(r: *Reader, a: u32, maxp: u32, quoted: bool) -> (Term, u32) {
+    let m = r.m;
+    let nx = r.peek();
+    if nx.kind == Tk.OpenCT {
+        r.next();
+        return (r.arglist(a), 0);
+    }
+    if !quoted and (a == term.A_MINUS or a == term.A_PLUS) and !nx.layout and (nx.kind == Tk.Int or nx.kind == Tk.Flt or nx.kind == Tk.BigInt) {
+        r.next();
+        let t = &r.tok;
+        if t.kind == Tk.BigInt { let s = t.text; return (big_of(m, s, a == term.A_MINUS), 0); }
+        if t.kind == Tk.Int {
+            return (term.mk_int(if a == term.A_MINUS { 0 - t.int } else { t.int }), 0);
+        }
+        return (Term.Flt(if a == term.A_MINUS { -t.flt } else { t.flt }), 0);
+    }
+    if !quoted {
+        if let Some((p, argmax)) = prefix_op(m, a) {
+            let nx2 = r.peek();
+            var operand = starts_term(r, nx2);
+            // `- (a)` is -(a); an infix operator next means the prefix
+            // operator is an atom operand (`- = x`).
+            if nx2.kind == Tk.Atom and nx2.int == 0 {
+                let b = m.db.atom(nx2.text);
+                if infix_op(m, b).is_some() {
+                    // Look one further: `\+ -1` keeps \+ as prefix.
+                    if prefix_op(m, b).is_none() { operand = false; }
+                }
+            }
+            if operand {
+                var pp = p;
+                var am = argmax;
+                if pp > maxp { pp = 999; am = 999; }
+                let (arg, _) = r.parse_prec(am);
+                let res = m.mk1(a, arg);
+                return (res, pp);
+            }
+            let pr = if p > maxp { 0 } else { p };
+            return (Term.Atom(a), pr);
+        }
+    }
+    let pr = if !quoted and is_op(m, a) { let p = op_prec(m, a); if p > maxp { 0 } else { p } } else { 0 };
+    (Term.Atom(a), pr)
+}
+
+fn Reader.parse(r: *Reader, maxp: u32) -> Term {
+    let (t, _) = r.parse_prec(maxp);
+    t
+}
+
+/// An argument (of a compound or a list): priority 999, but like SWI-Prolog
+/// an operator above 999 other than `,` and `|` is accepted (`f(a :- b)`).
+fn Reader.parse_arg(r: *Reader) -> Term {
+    r.arg_ctx = true;
+    let (t, _) = r.parse_prec(999);
+    t
+}
+
+fn Reader.parse_prec(r: *Reader, maxp0: u32) -> (Term, u32) {
+    let arg = r.arg_ctx;
+    r.arg_ctx = false;
+    var maxp = maxp0;
+    let m = r.m;
+    var (left, lp) = r.primary(maxp0);
+    loop {
+        if r.error.is_some() { return (left, lp); }
+        let t = r.peek();
+        var name: u32 = 0;
+        match t.kind {
+            Atom => name = m.db.atom(t.text),
+            Comma => name = term.A_COMMA,
+            Bar => name = term.A_BAR,
+            _ => return (left, lp),
+        }
+        if let Some((p, la, ra)) = infix_op(m, name) {
+            if arg and p > maxp and name != term.A_COMMA and name != term.A_BAR { maxp = 1200; }
+            if p <= maxp and lp <= la {
+                r.next();
+                let right = r.parse(ra);
+                let nm = if name == term.A_BAR and p >= 1100 { term.A_SEMI } else { name };
+                left = m.mk2(nm, left, right);
+                lp = p;
+                continue;
+            }
+        }
+        if let Some((p, la)) = postfix_op(m, name) {
+            if p <= maxp and lp <= la {
+                r.next();
+                left = m.mk1(name, left);
+                lp = p;
+                continue;
+            }
+        }
+        return (left, lp);
+    }
+}
+
+/// Read one clause; None at the end of the input. On a syntax error,
+/// `r.error` is set and the rest of the clause is skipped.
+pub fn Reader.read(r: *Reader) -> ?Term {
+    r.vars.clear();
+    r.error = None;
+    let t = r.peek();
+    if t.kind == Tk.Eof { r.next(); return None; }
+    let x = r.parse(1200);
+    if r.error.is_none() {
+        let e = r.next();
+        if e.kind != Tk.End { r.fail("operator expected"); }
+    }
+    if r.error.is_some() {
+        // Skip to the end of the clause.
+        loop {
+            let k = r.next().kind;
+            if k == Tk.End or k == Tk.Eof { break; }
+        }
+        return Some(Term.Atom(term.A_EOF));
+    }
+    Some(x)
+}
+
+/// The variables of the last clause read, as Name=Var pairs.
+pub fn Reader.var_list(r: *Reader) -> Term {
+    let m = r.m;
+    var t = Term.Atom(term.A_NIL);
+    var k = r.vars.len;
+    while k > 0 {
+        k -= 1;
+        let (n, v) = r.vars.ptr[k];
+        t = m.mk_cons(m.mk2(term.A_EQ, Term.Atom(m.db.atom(n)), v), t);
+    }
+    t
+}
+
+/// A decimal integer literal too large for 48 bits.
+fn big_of(m: *Machine, digits: str, neg: bool) -> Term {
+    let b = bigint.gc_parse(&m.heap, digits, 10).unwrap();
+    if neg { return arith.norm(bigint.gc_neg(&m.heap, Arg.Ref(b))); }
+    arith.norm(b)
+}
+
+/// Parse a number from text (number_codes/2, atom_number/2).
+pub fn parse_number(m: *Machine, s: str) -> ?Term {
+    var r = Reader.new(m, s);
+    defer r.free();
+    let t = r.next();
+    var neg = false;
+    var kind = t.kind;
+    if kind == Tk.Atom and (t.text.eq("-") or t.text.eq("+")) {
+        neg = t.text.eq("-");
+        r.next();
+        kind = r.tok.kind;
+    }
+    if r.error.is_some() { return None; }
+    var res = Term.Unb;
+    if kind == Tk.Int { res = term.mk_int(if neg { 0 - r.tok.int } else { r.tok.int }); }
+    else if kind == Tk.BigInt { res = big_of(m, r.tok.text, neg); }
+    else if kind == Tk.Flt { res = Term.Flt(if neg { -r.tok.flt } else { r.tok.flt }); }
+    else { return None; }
+    r.skip_layout();
+    if r.pos != r.src.len or r.error.is_some() { return None; }
+    Some(res)
+}

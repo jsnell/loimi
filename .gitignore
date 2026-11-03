@@ -29,3 +29,9 @@ __pycache__/
 examples/python/scratch/
 examples/python/out/
 examples/python/python-loimi
+/bench/prolog/src
+/bench/prolog/install
+/bench/prolog/programs
+/bench/prolog/out
+/examples/prolog/.build
+/bench/prolog/__pycache__

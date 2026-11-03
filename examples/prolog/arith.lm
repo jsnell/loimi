@@ -1,0 +1,365 @@
+// Arithmetic: is/2 and the comparison builtins. Integers are 48-bit
+// (Term.Int(i48)); results that overflow raise evaluation_error(int_overflow)
+// where SWI-Prolog would switch to big integers.
+
+import std.num;
+import term.{Term, deref};
+import term;
+import machine.{Machine};
+import builtins;
+import std.bigint;
+import std.bigint.{Big, Arg};
+
+extern "C" fn pow(x: f64, y: f64) -> f64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+extern "C" fn log2(x: f64) -> f64;
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn tan(x: f64) -> f64;
+extern "C" fn asin(x: f64) -> f64;
+extern "C" fn acos(x: f64) -> f64;
+extern "C" fn atan(x: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn sinh(x: f64) -> f64;
+extern "C" fn cosh(x: f64) -> f64;
+extern "C" fn tanh(x: f64) -> f64;
+extern "C" fn round(x: f64) -> f64;
+
+fn int_result(m: *Machine, v: i64) -> Result<Term, Term> {
+    if !term.fits_int(v) { return Ok(Term.Big(bigint.gc_of_i64(&m.heap, v))); }
+    Ok(term.mk_int(v))
+}
+
+/// A big result back in the small representation if it fits.
+pub fn norm(b: Gc<Big>) -> Term {
+    if let Some(v) = bigint.to_i64(b.num()) { if term.fits_int(v) { return term.mk_int(v); } }
+    Term.Big(b)
+}
+
+fn barg(t: Term) -> Arg {
+    match t { Int(i) => Arg.Small(i as i64), Big(b) => Arg.Ref(b), _ => Arg.Small(0) }
+}
+
+fn is_big(t: Term) -> bool { match t { Big(_) => true, _ => false } }
+
+/// Binary integer arithmetic where an operand is big (or a small result
+/// overflowed).
+fn big_binary(m: *Machine, name: str, x: Term, y: Term) -> Result<Term, Term> {
+    let h = &m.heap;
+    let ys = cmp(y, term.mk_int(0));
+    match name {
+        "+" => Ok(norm(bigint.gc_add(h, barg(x), barg(y)))),
+        "-" => Ok(norm(bigint.gc_sub(h, barg(x), barg(y)))),
+        "*" => Ok(norm(bigint.gc_mul(h, barg(x), barg(y)))),
+        "//" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (q, _) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap(); Ok(norm(q)) }
+        "div" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (q, _) = bigint.gc_divmod(h, barg(x), barg(y), true).unwrap(); Ok(norm(q)) }
+        "mod" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (_, r) = bigint.gc_divmod(h, barg(x), barg(y), true).unwrap(); Ok(norm(r)) }
+        "rem" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (_, r) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap(); Ok(norm(r)) }
+        "/" => {
+            if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); }
+            let (q, r) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap();
+            if bigint.is_zero(r.num()) { return Ok(norm(q)); }
+            flt(m, to_f(x) / to_f(y))
+        }
+        "min" => Ok(if cmp(x, y) <= 0 { x } else { y }),
+        "max" => Ok(if cmp(x, y) >= 0 { x } else { y }),
+        "/\\" => Ok(norm(bigint.gc_and(h, barg(x), barg(y)))),
+        "\\/" => Ok(norm(bigint.gc_or(h, barg(x), barg(y)))),
+        "xor" => Ok(norm(bigint.gc_xor(h, barg(x), barg(y)))),
+        "gcd" => Ok(norm(bigint.gc_gcd(h, barg(x), barg(y)))),
+        ">>" => {
+            let Int(n) = y else { return Err(builtins.resource_error(m, "memory")); };
+            let k = n as i64;
+            if k < 0 { return Ok(norm(bigint.gc_shl(h, barg(x), (0 - k) as u64))); }
+            Ok(norm(bigint.gc_shr(h, barg(x), k as u64)))
+        }
+        "<<" => {
+            let Int(n) = y else { return Err(builtins.resource_error(m, "memory")); };
+            let k = n as i64;
+            if k < 0 { return Ok(norm(bigint.gc_shr(h, barg(x), (0 - k) as u64))); }
+            Ok(norm(bigint.gc_shl(h, barg(x), k as u64)))
+        }
+        "**" => big_pow(m, x, y),
+        "^" => big_pow(m, x, y),
+        _ => Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.atom(name), 2))),
+    }
+}
+
+fn big_pow(m: *Machine, x: Term, y: Term) -> Result<Term, Term> {
+    let Int(e) = y else { return Err(builtins.resource_error(m, "memory")); };
+    if (e as i64) < 0 {
+        if cmp(x, term.mk_int(1)) == 0 { return Ok(term.mk_int(1)); }
+        return Err(builtins.type_error(m, "float", x));
+    }
+    Ok(norm(bigint.gc_pow(&m.heap, barg(x), e as u64)))
+}
+
+
+fn flt(m: *Machine, x: f64) -> Result<Term, Term> {
+    if x.is_nan() { return Err(builtins.eval_error(m, "undefined")); }
+    if x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(builtins.eval_error(m, "float_overflow")); }
+    Ok(Term.Flt(x))
+}
+
+fn to_f(t: Term) -> f64 {
+    match t { Int(i) => i as f64, Flt(x) => x, Big(b) => bigint.to_f64(b.num()), _ => 0.0 }
+}
+
+fn need_int(m: *Machine, t: Term) -> Result<i64, Term> {
+    match t {
+        Int(i) => Ok(i as i64),
+        _ => Err(builtins.type_error(m, "integer", t)),
+    }
+}
+
+fn f_to_int(m: *Machine, x: f64) -> Result<Term, Term> {
+    if x.is_nan() or x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(builtins.eval_error(m, "undefined")); }
+    if x > 9.0e18 or x < -9.0e18 { return Ok(norm(bigint.gc_from_f64(&m.heap, x).unwrap())); }
+    int_result(m, x as i64)
+}
+
+/// Evaluate an arithmetic expression.
+pub fn eval(m: *Machine, t0: Term) -> Result<Term, Term> {
+    let t = deref(t0);
+    match t {
+        Int(_) => return Ok(t),
+        Big(_) => return Ok(t),
+        Flt(_) => return Ok(t),
+        Ref(_) => return Err(builtins.inst_error(m)),
+        Atom(a) => {
+            let s = m.db.name(a);
+            return match s {
+                "pi" => Ok(Term.Flt(3.141592653589793)),
+                "e" => Ok(Term.Flt(2.718281828459045)),
+                "inf" => Ok(Term.Flt(1.0 / 0.0)),
+                "infinite" => Ok(Term.Flt(1.0 / 0.0)),
+                "nan" => Ok(Term.Flt(0.0 / 0.0)),
+                "epsilon" => Ok(Term.Flt(2.220446049250313e-16)),
+                "max_tagged_integer" => Ok(term.mk_int(term.MAX_INT)),
+                "min_tagged_integer" => Ok(term.mk_int(term.MIN_INT)),
+                "random" => Ok(term.mk_int(builtins.random_next(m) as i64 & 0xFFFFFF)),
+                "cputime" => Ok(Term.Flt(builtins.cputime())),
+                "realtime" => Ok(term.mk_int(builtins.walltime() as i64)),
+                "[]" => Err(builtins.type_error(m, "evaluable", t)),
+                _ => Err(builtins.type_error(m, "evaluable", builtins.pi(m, a, 0))),
+            };
+        }
+        Lst(c) => {
+            // "a" evaluates to its code.
+            if deref(c.tail) == Term.Atom(term.A_NIL) { return eval(m, c.head); }
+            return Err(builtins.type_error(m, "evaluable", t));
+        }
+        Str(s) => {
+            let name = m.db.name(m.db.fname(s.f));
+            let n = s.args.len;
+            if n == 1 {
+                let x = eval(m, s.args[0])?;
+                return unary(m, name, x, t);
+            }
+            if n == 2 {
+                let x = eval(m, s.args[0])?;
+                let y = eval(m, s.args[1])?;
+                return binary(m, name, x, y, t);
+            }
+            return Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.fname(s.f), n as u32)));
+        }
+        _ => Err(builtins.type_error(m, "evaluable", t)),
+    }
+}
+
+fn unary(m: *Machine, name: str, x: Term, t: Term) -> Result<Term, Term> {
+    if let Big(b) = x {
+        match name {
+            "-" => return Ok(norm(bigint.gc_neg(&m.heap, Arg.Ref(b)))),
+            "+" => return Ok(x),
+            "abs" => return Ok(if b.neg { norm(bigint.gc_neg(&m.heap, Arg.Ref(b))) } else { x }),
+            "sign" => return Ok(term.mk_int(if b.neg { -1 } else { 1 })),
+            "integer" => return Ok(x),
+            "truncate" => return Ok(x),
+            "round" => return Ok(x),
+            "ceiling" => return Ok(x),
+            "floor" => return Ok(x),
+            "\\" => return Ok(norm(bigint.gc_not(&m.heap, Arg.Ref(b)))),
+            "msb" => return Ok(term.mk_int(bigint.bit_length(b.num()) as i64 - 1)),
+            _ => {}
+        }
+    }
+    match name {
+        "-" => match x { Int(i) => int_result(m, 0 - i as i64), _ => flt(m, 0.0 - to_f(x)) },
+        "+" => Ok(x),
+        "abs" => match x { Int(i) => int_result(m, if (i as i64) < 0 { 0 - i as i64 } else { i as i64 }), _ => flt(m, to_f(x).abs()) },
+        "sign" => match x {
+            Int(i) => Ok(term.mk_int(if (i as i64) < 0 { -1 } else if (i as i64) > 0 { 1 } else { 0 })),
+            _ => { let f = to_f(x); flt(m, if f < 0.0 { -1.0 } else if f > 0.0 { 1.0 } else { 0.0 }) }
+        },
+        "min" => Ok(x), "max" => Ok(x),
+        "sqrt" => { let f = to_f(x); if f < 0.0 { return Err(builtins.eval_error(m, "undefined")); } flt(m, f.sqrt()) }
+        "sin" => flt(m, sin(to_f(x))),
+        "cos" => flt(m, cos(to_f(x))),
+        "tan" => flt(m, tan(to_f(x))),
+        "asin" => flt(m, asin(to_f(x))),
+        "acos" => flt(m, acos(to_f(x))),
+        "atan" => flt(m, atan(to_f(x))),
+        "sinh" => flt(m, sinh(to_f(x))),
+        "cosh" => flt(m, cosh(to_f(x))),
+        "tanh" => flt(m, tanh(to_f(x))),
+        "exp" => flt(m, exp(to_f(x))),
+        "log" => {
+            let f = to_f(x);
+            if f <= 0.0 {
+                if let Int(_) = x { return Err(builtins.eval_error(m, "undefined")); }
+                return Err(builtins.eval_error(m, "undefined"));
+            }
+            flt(m, log(f))
+        }
+        "log2" => { let f = to_f(x); if f <= 0.0 { return Err(builtins.eval_error(m, "undefined")); } flt(m, log2(f)) }
+        "float" => flt(m, to_f(x)),
+        "integer" => match x { Int(_) => Ok(x), _ => f_to_int(m, round(to_f(x))) },
+        "float_integer_part" => flt(m, to_f(x).trunc()),
+        "float_fractional_part" => { let f = to_f(x); flt(m, f - f.trunc()) }
+        "truncate" => match x { Int(_) => Ok(x), _ => f_to_int(m, to_f(x).trunc()) },
+        "round" => match x { Int(_) => Ok(x), _ => f_to_int(m, round(to_f(x))) },
+        "ceiling" => match x { Int(_) => Ok(x), _ => f_to_int(m, to_f(x).ceil()) },
+        "floor" => match x { Int(_) => Ok(x), _ => f_to_int(m, to_f(x).floor()) },
+        "\\" => { let i = need_int(m, x)?; int_result(m, !i) }
+        "msb" => { let i = need_int(m, x)?; Ok(term.mk_int(63 - (i as u64).clz() as i64)) }
+        "succ" => { let i = need_int(m, x)?; int_result(m, i + 1) }
+        "random" => { let i = need_int(m, x)?; if i <= 0 { return Err(builtins.eval_error(m, "undefined")); } Ok(term.mk_int((builtins.random_next(m) % i as u64) as i64)) }
+        "random_float" => flt(m, (builtins.random_next(m) % 1000000) as f64 / 1000000.0),
+        _ => Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.atom(name), 1))),
+    }
+}
+
+fn ipow(m: *Machine, b: i64, e: i64) -> Result<Term, Term> {
+    if e < 0 {
+        if b == 1 { return Ok(term.mk_int(1)); }
+        if b == -1 { return Ok(term.mk_int(if e % 2 == 0 { 1 } else { -1 })); }
+        if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); }
+        return Err(builtins.type_error(m, "float", term.mk_int(b)));
+    }
+    var r: i64 = 1;
+    var i: i64 = 0;
+    while i < e {
+        match r.mul_checked(b) { Some(v) => r = v, None => return big_pow(m, term.mk_int(b), term.mk_int(e)) }
+        if !term.fits_int(r) { return big_pow(m, term.mk_int(b), term.mk_int(e)); }
+        i += 1;
+    }
+    Ok(term.mk_int(r))
+}
+
+fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Term> {
+    if (is_big(x) or is_big(y)) and !is_flt(x) and !is_flt(y) {
+        if !(name.eq("atan2") or name.eq("atan") or name.eq("copysign") or name.eq("log")) { return big_binary(m, name, x, y); }
+    }
+    if let (Int(a), Int(b)) = (x, y) {
+        let a = a as i64;
+        let b = b as i64;
+        match name {
+            "+" => return int_result(m, a + b),
+            "-" => return int_result(m, a - b),
+            "*" => return match a.mul_checked(b) { Some(v) => int_result(m, v), None => big_binary(m, name, x, y) },
+            "//" => { if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } return int_result(m, num.trunc_div(a, b).unwrap()); }
+            "/" => {
+                if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); }
+                if a % b == 0 { return int_result(m, a / b); }
+                return flt(m, a as f64 / b as f64);
+            }
+            "mod" => { if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } return Ok(term.mk_int(num.floor_mod(a, b).unwrap())); }
+            "rem" => { if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } return Ok(term.mk_int(num.trunc_rem(a, b).unwrap())); }
+            "div" => { if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } return int_result(m, num.floor_div(a, b).unwrap()); }
+            "min" => return Ok(if a <= b { x } else { y }),
+            "max" => return Ok(if a >= b { x } else { y }),
+            ">>" => return Ok(term.mk_int(a >> (if b > 63 { 63 } else { b }))),
+            "<<" => {
+                if b < 0 { return Ok(term.mk_int(a >> (if -b > 63 { 63 } else { -b }))); }
+                if b > 15 { return big_binary(m, name, x, y); }
+                return int_result(m, a << b);
+            }
+            "/\\" => return Ok(term.mk_int(a & b)),
+            "\\/" => return Ok(term.mk_int(a | b)),
+            "xor" => return Ok(term.mk_int(a ^ b)),
+            "**" => { if b < 0 { return flt(m, pow(a as f64, b as f64)); } return ipow(m, a, b); }
+            "^" => return ipow(m, a, b),
+            "gcd" => {
+                var p = if a < 0 { 0 - a } else { a };
+                var q = if b < 0 { 0 - b } else { b };
+                while q != 0 { let r = p % q; p = q; q = r; }
+                return Ok(term.mk_int(p));
+            }
+            "atan2" => return flt(m, atan2(a as f64, b as f64)),
+            "atan" => return flt(m, atan2(a as f64, b as f64)),
+            "copysign" => return flt(m, (a as f64).copysign(b as f64)),
+            "log" => return flt(m, log(b as f64) / log(a as f64)),
+            "truncate" => {}
+            _ => {}
+        }
+    }
+    let a = to_f(x);
+    let b = to_f(y);
+    match name {
+        "+" => flt(m, a + b),
+        "-" => flt(m, a - b),
+        "*" => flt(m, a * b),
+        "/" => { if b == 0.0 { return Err(builtins.eval_error(m, "zero_divisor")); } flt(m, a / b) }
+        "**" => flt(m, pow(a, b)),
+        "^" => {
+            if let Int(_) = x { if let Int(_) = y {} }
+            match (x, y) {
+                (Int(_), Flt(_)) => {} (Flt(_), _) => {} _ => return Err(builtins.type_error(m, "integer", x)),
+            }
+            flt(m, pow(a, b))
+        }
+        "min" => { let c = cmp(x, y); Ok(if c < 0 or (c == 0 and is_flt(x)) { x } else { y }) }
+        "max" => { let c = cmp(x, y); Ok(if c > 0 or (c == 0 and is_flt(x)) { x } else { y }) }
+        "atan2" => flt(m, atan2(a, b)),
+        "atan" => flt(m, atan2(a, b)),
+        "copysign" => flt(m, a.copysign(b)),
+        "log" => flt(m, log(b) / log(a)),
+        "//" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "mod" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "rem" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "div" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        ">>" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "<<" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "/\\" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "\\/" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        "xor" => Err(builtins.type_error(m, "integer", if let Int(_) = x { y } else { x })),
+        _ => Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.atom(name), 2))),
+    }
+}
+
+/// Numeric comparison of two evaluated numbers: -1, 0, 1.
+pub fn cmp(x: Term, y: Term) -> i32 {
+    match (x, y) {
+        (Int(a), Int(b)) => if (a as i64) < (b as i64) { -1 } else if (a as i64) > (b as i64) { 1 } else { 0 },
+        (Flt(_), _) => fcmp(to_f(x), to_f(y)),
+        (_, Flt(_)) => fcmp(to_f(x), to_f(y)),
+        _ => {
+            var la: [u64; 1] = [0; 1];
+            var lb: [u64; 1] = [0; 1];
+            let na = match x { Big(b) => b.num(), Int(i) => bigint.from_i64(la[0..1], i as i64), _ => bigint.from_i64(la[0..1], 0) };
+            let nb = match y { Big(b) => b.num(), Int(i) => bigint.from_i64(lb[0..1], i as i64), _ => bigint.from_i64(lb[0..1], 0) };
+            bigint.cmp(na, nb)
+        }
+    }
+}
+
+fn fcmp(a: f64, b: f64) -> i32 { if a < b { -1 } else if a > b { 1 } else { 0 } }
+fn is_flt(t: Term) -> bool { match t { Flt(_) => true, _ => false } }
+
+const OPNAMES: [str; 15] = ["+", "-", "*", "//", "mod", ">>", "<<", "/\\", "\\/", "div", "rem", "xor", "min", "max", "/"];
+
+/// The slow path of the inline arithmetic ops: operands that are bound
+/// variables, floats mixed with integers, overflow and errors.
+pub fn arith2(m: *Machine, kind: u64, a: Term, b: Term) -> Result<Term, Term> {
+    let x = eval(m, a)?;
+    let y = eval(m, b)?;
+    binary(m, OPNAMES[kind], x, y, Term.Unb)
+}
+
+pub fn cmp2(m: *Machine, a: Term, b: Term) -> Result<i32, Term> {
+    let x = eval(m, a)?;
+    let y = eval(m, b)?;
+    Ok(cmp(x, y))
+}

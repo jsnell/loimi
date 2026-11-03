@@ -706,6 +706,28 @@ fn stack_programs() {
     );
 }
 
+/// The Prolog interpreter (examples/prolog/check.sh -q): a tail-call build
+/// with `-W error`, every tests/NAME.pl prints tests/NAME.expected
+/// (SWI-Prolog 10's output, committed), normally and under GC stress.
+/// Needs no reference Prolog.
+#[test]
+fn prolog_programs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/prolog/check.sh"))
+        .arg("-q")
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/prolog/check.sh -q failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The Python-subset interpreter (examples/python/check.sh -q): a tail-call
 /// build, every tests/NAME.py prints tests/NAME.expected (CPython 3.13's
 /// output, committed), normally and under GC stress. Needs no reference
