@@ -41,6 +41,10 @@ extern "C" fn loimi_panic(msg: *u8, len: u64);
 pub const KARATSUBA: u64 = 48;
 /// Squarings of at least this many limbs use Karatsuba squaring.
 pub const KARATSUBA_SQR: u64 = 48;
+/// Products of at least this many limbs (both operands) use Toom-3.
+pub const TOOM3: u64 = 250;
+/// Squarings of at least this many limbs use Toom-3 squaring.
+pub const TOOM3_SQR: u64 = 500;
 /// Schoolbook products and squares sum column by column (Comba) when
 /// the shorter operand has at least this many limbs, row by row below.
 const MUL_COLUMNS: u64 = 14;
@@ -440,7 +444,119 @@ fn ksqr(r: *u64, a: *u64, n: u64) {
 }
 
 /// r[0..2n] = a * a (n >= 1); r must not overlap a.
-fn sqr_mag(r: *u64, a: *u64, n: u64) { ksqr(r, a, n); }
+fn sqr_mag(r: *u64, a: *u64, n: u64) {
+    if n >= TOOM3_SQR { toom3(r, a, a, n); } else { ksqr(r, a, n); }
+}
+
+/// r[0..2n] = a * b, both n limbs: Toom-3, Karatsuba or schoolbook.
+fn mul_n(r: *u64, a: *u64, b: *u64, n: u64) {
+    if n >= TOOM3 { toom3(r, a, b, n); } else if n >= KARATSUBA { kmul(r, a, b, n); } else { mul_basecase(r, a, n, b, n); }
+}
+
+/// x / 3 for x a multiple of 3.
+fn div3(x: Num) -> BigInt {
+    var v = room(max(x.d.len, 1));
+    divrem_1(v.ptr, x.d.ptr, x.d.len, 3);
+    own(v, view(v.ptr, x.d.len, x.neg))
+}
+
+/// x = x + y, replacing (and freeing) x.
+fn acc_add(x: *BigInt, y: Num) { let z = add(x.num(), y); x.free(); *x = z; }
+fn acc_sub(x: *BigInt, y: Num) { let z = sub(x.num(), y); x.free(); *x = z; }
+
+/// The values of a2 t^2 + a1 t + a0 at t = 1, -1, -2: (p1, pm1, pm2).
+fn toom3_eval(a0: Num, a1: Num, a2: Num) -> (BigInt, BigInt, BigInt) {
+    var t = add(a0, a2);
+    let p1 = add(t.num(), a1);
+    var pm1 = sub(t.num(), a1);
+    t.free();
+    // pm2 = 2 (pm1 + a2) - a0
+    var u = add(pm1.num(), a2);
+    var v = shl(u.num(), 1);
+    let pm2 = sub(v.num(), a0);
+    u.free();
+    v.free();
+    (p1, pm1, pm2)
+}
+
+/// r[0..2n] = a * b, both n limbs, by Toom-3: a and b split in three
+/// pieces of k limbs, as polynomials evaluated at 0, 1, -1, -2 and
+/// infinity, five products of about n / 3 limbs (recursively), and
+/// Bodrato's interpolation sequence. a == b squares (five squarings).
+/// Works on owned temporaries: it runs only on hundreds of limbs.
+fn toom3(r: *u64, a: *u64, b: *u64, n: u64) {
+    let k = (n + 2) / 3;
+    let a0 = view(a, k, false);
+    let a1 = view(a + k, k, false);
+    let a2 = view(a + 2 * k, n - 2 * k, false);
+    let b0 = view(b, k, false);
+    let b1 = view(b + k, k, false);
+    let b2 = view(b + 2 * k, n - 2 * k, false);
+    let sq = a == b;
+    let (e1, em1, em2) = toom3_eval(a0, a1, a2);
+    var p1 = e1;
+    var pm1 = em1;
+    var pm2 = em2;
+    var r1 = BigInt { neg: false, d: mem.Vec.new() };
+    var rm1 = BigInt { neg: false, d: mem.Vec.new() };
+    var rm2 = BigInt { neg: false, d: mem.Vec.new() };
+    if sq {
+        r1 = mul(p1.num(), p1.num());
+        rm1 = mul(pm1.num(), pm1.num());
+        rm2 = mul(pm2.num(), pm2.num());
+    } else {
+        let (f1, fm1, fm2) = toom3_eval(b0, b1, b2);
+        var q1 = f1;
+        var qm1 = fm1;
+        var qm2 = fm2;
+        r1 = mul(p1.num(), q1.num());
+        rm1 = mul(pm1.num(), qm1.num());
+        rm2 = mul(pm2.num(), qm2.num());
+        q1.free();
+        qm1.free();
+        qm2.free();
+    }
+    p1.free();
+    pm1.free();
+    pm2.free();
+    var r0 = mul(a0, b0);
+    var rinf = mul(a2, b2);
+    // r3 = (rm2 - r1) / 3
+    acc_sub(&rm2, r1.num());
+    var r3 = div3(rm2.num());
+    rm2.free();
+    // r1 = (r1 - rm1) / 2
+    acc_sub(&r1, rm1.num());
+    var h = shr(r1.num(), 1);
+    r1.free();
+    r1 = h;
+    // r2 = rm1 - r0
+    var r2 = sub(rm1.num(), r0.num());
+    rm1.free();
+    // r3 = (r2 - r3) / 2 + 2 rinf
+    var d = sub(r2.num(), r3.num());
+    r3.free();
+    r3 = shr(d.num(), 1);
+    d.free();
+    acc_add(&r3, rinf.num());
+    acc_add(&r3, rinf.num());
+    // r2 = r2 + r1 - rinf; r1 = r1 - r3
+    acc_add(&r2, r1.num());
+    acc_sub(&r2, rinf.num());
+    acc_sub(&r1, r3.num());
+    // r = r0 + r1 B^k + r2 B^2k + r3 B^3k + rinf B^4k (all nonnegative)
+    mem.memset(r as *u8, 0, 2 * n * 8);
+    mem.copy(r, r0.d.ptr, r0.d.len);
+    add_in(r + k, 2 * n - k, r1.d.ptr, r1.d.len);
+    add_in(r + 2 * k, 2 * n - 2 * k, r2.d.ptr, r2.d.len);
+    add_in(r + 3 * k, 2 * n - 3 * k, r3.d.ptr, r3.d.len);
+    add_in(r + 4 * k, 2 * n - 4 * k, rinf.d.ptr, rinf.d.len);
+    r0.free();
+    r1.free();
+    r2.free();
+    r3.free();
+    rinf.free();
+}
 
 /// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
 fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
@@ -453,7 +569,7 @@ fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
         return;
     }
     if na == nb {
-        kmul(r, a, b, na);
+        mul_n(r, a, b, na);
         return;
     }
     // Unbalanced: multiply b by na / nb pieces of a.
@@ -462,7 +578,7 @@ fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
     var off: u64 = 0;
     while off < na {
         let len = min(nb, na - off);
-        if len == nb { kmul(t, a + off, b, nb); } else { mul_mag(t, b, nb, a + off, len); }
+        if len == nb { mul_n(t, a + off, b, nb); } else { mul_mag(t, b, nb, a + off, len); }
         add_in(r + off, na + nb - off, t, len + nb);
         off += len;
     }

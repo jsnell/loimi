@@ -136,6 +136,13 @@ def gen(rng, n, big):
             b = rand_int(rng, big) if rng.random() < 0.8 else a + rng.choice([-1, 0, 1])
             if op in ('cmp',) and rng.random() < 0.3:
                 b = a
+            if op in ('mul', 'gmul') and rng.random() < 0.25:
+                # Past TOOM3 (250 limbs): balanced, nearly balanced and
+                # unbalanced shapes, patterned limbs.
+                n = rng.randint(200, 3000 if big else 900)
+                m = rng.choice([n, n, n - rng.randint(0, 3), rng.randint(200, 3 * n)])
+                a = patterned(rng, n) * rng.choice([1, -1])
+                b = patterned(rng, max(m, 1)) * rng.choice([1, -1])
             cases.append((op, a, b))
         elif op in ('fdiv', 'tdiv', 'gfdiv', 'gtdiv'):
             if rng.random() < 0.3:
@@ -144,8 +151,12 @@ def gen(rng, n, big):
                 b = divisor(rng, a, big) if rng.random() < 0.97 else 0
             cases.append((op, a, b))
         elif op == 'sqr':
-            if rng.random() < 0.3:
+            r = rng.random()
+            if r < 0.3:
                 a = patterned(rng, rng.randint(1, 3000 if big else 300))
+            elif r < 0.45:
+                # Past TOOM3_SQR (500 limbs).
+                a = patterned(rng, rng.randint(400, 6000 if big else 1200))
             cases.append((op, a, None))
         elif op == 'parse':
             r = rng.choice([10, 10, 10, 3, 7, 36, rng.randint(2, 36)])
