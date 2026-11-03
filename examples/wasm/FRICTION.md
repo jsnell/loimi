@@ -308,6 +308,61 @@ binarytrees and coremark: identical); best of 5, interleaved,
 qemu) all 57 SIMD files pass in tail-call mode and all 147 files in goto
 mode.
 
+**Follow-up: the friction fixed, and a target CPU.**
+
+- *Run-time lanes.* Loimi gained `v.lane_at(i)` and `v.with_lane_at(i, x)`
+  (language.md §1.2, "Vectors": the index is masked to the lane count,
+  no panic path). Extract/replace_lane and the lane loads and stores now
+  use them on the typed vector operands (`d = a.with_lane_at(cache.v, x
+  as i8)`); the `vslot` operand kind is gone. Handler instructions
+  (x86-64 baseline): extract 14 → 15 (the mask: LLVM turns `lane_at`
+  of a loaded vector into one scalar load but cannot see that the
+  verifier bounded `l`), lane stores unchanged (21/23), replace 18 →
+  23..28 and lane loads 25..27 → 32..36 on SSE2, 20 and 27..29 with
+  AVX2. More instructions, but all in registers: `with_lane_at` is a
+  compare-and-select, where the memory form stored the vector and then
+  a lane into the same slot, so the next vector load of it failed store
+  forwarding (and LLVM's own variable-index `insertelement` does the
+  same on the stack). A dependent chain of replace/extract_lane
+  (`lanes.c`, 20 M iterations) runs in 0.410 s against 0.551 s before
+  (0.354 s against 0.582 s at `x86-64-v3`). All 147 spec files pass in
+  every dispatch mode.
+- *Names from names.* `#(name ++ "_X")` in an `inline for` body
+  (language.md §1.4) joins loop variables and literals into one
+  identifier; the v128 load table lost its second name column. (The
+  scalar load/store tables stay two tables: merging them would change
+  the order, and so the numbering, of the scalar ops.)
+- *`--cpu`.* `loimi build --cpu=x86-64-v2|x86-64-v3|native|..` (clang's
+  `-march`; lowering.md §12 has instruction counts per level): `swizzle`
+  becomes `paddusb`+`pshufb` (105 → 6 instructions with loads and the
+  store; `i8x16.shuffle` 209 → 13), rounding `roundps` (28 → 4),
+  `minimum` 28 → 18 (12 with AVX), i64x2 compares 15 → 5. All 147 spec
+  files pass at `x86-64-v2` and `x86-64-v3` in every dispatch mode.
+  Speed, best of 5, `--align-functions=64`, tail calls, seconds
+  (the `_simd` programs are the CLBG sources built with `-msimd128`):
+
+  | benchmark | x86-64 | x86-64-v2 | x86-64-v3 |
+  |---|---:|---:|---:|
+  | binarytrees | 1.437 | 1.472 | 1.447 |
+  | coremark | 1.979 | 1.995 | 1.982 |
+  | fannkuchredux | 1.530 | 1.583 | 1.577 |
+  | fannkuchredux_simd | 1.484 | 1.528 | 1.559 |
+  | fasta | 1.231 | 1.234 | 1.175 |
+  | mandelbrot | 1.507 | 1.504 | 1.575 |
+  | nbody | 2.045 | 2.078 | 1.937 |
+  | nbody_simd | 1.805 | 1.816 | 1.860 |
+  | spectralnorm | 1.622 | 1.623 | 1.624 |
+  | spectralnorm_simd | 1.631 | 1.624 | 1.611 |
+  | lanes (microbenchmark) | 0.360 | 0.334 | 0.333 |
+  | **geomean** | 1.405 | 1.410 (1.004) | 1.401 (0.997) |
+
+  Noise, both ways: the SIMD the CLBG programs contain (f64x2
+  arithmetic, splats, one shuffle in fannkuchredux's setup) was already
+  one or two instructions on SSE2, and dispatch dominates. `--cpu` pays
+  where a program runs the ops SSE2 lacks (`swizzle`/`shuffle`,
+  rounding, `minimum`/`maximum`, 64-bit compares); none of these
+  benchmarks does. The default stays the portable baseline.
+
 ## Summary
 
 | File | Lines | What |
