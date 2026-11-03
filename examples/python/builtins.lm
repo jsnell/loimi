@@ -583,7 +583,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
                 Int(i) => Ok(value.int_val(&c.heap, if i < 0 { 0 - (i as i64) } else { i as i64 })),
                 Float(f) => Ok(Value.Float(f.abs())),
                 Bool(x) => Ok(Value.Int(if x { 1 } else { 0 })),
-                Obj(o) => if o.kind == K_BIG { Ok(big.abs(&c.heap, args[0])) } else { Err(exc(c, E_TYPE, "bad operand type for abs()")) },
+                Long(_) => Ok(big.abs(&c.heap, args[0])),
                 Inst(_) => {
                     if let Some(r) = ops.call_method(c, args[0], "__abs__", [])? { return Ok(r); }
                     Err(exc(c, E_TYPE, "bad operand type for abs()"))
@@ -681,12 +681,12 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             if s.data.len == 0 { return Err(exc(c, E_TYPE, "ord() expected a character, but string of length 0 found")); }
             // decode one UTF-8 character
             let b0 = s.data[0] as i64;
-            if b0 < 0x80 { return Ok(Value.Int(b0 as i32)); }
+            if b0 < 0x80 { return Ok(Value.Int(b0 as i48)); }
             var cp: i64 = 0;
             var k: u64 = 0;
             if b0 >= 0xf0 { cp = b0 & 7; k = 3; } else if b0 >= 0xe0 { cp = b0 & 15; k = 2; } else { cp = b0 & 31; k = 1; }
             for i in 1..k + 1 { if i < s.data.len { cp = (cp << 6) | ((s.data[i] as i64) & 63); } }
-            Ok(Value.Int(cp as i32))
+            Ok(Value.Int(cp as i48))
         }
         Chr => {
             let i = want_int(c, args[0])?;
@@ -875,7 +875,7 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
                 Int(_) => Ok(x),
                 Bool(v) => Ok(Value.Int(if v { 1 } else { 0 })),
                 Float(f) => float_to_int(c, f),
-                Obj(o) => if o.kind == K_BIG { Ok(x) } else { Err(int_arg_error(c, x)) },
+                Long(_) => Ok(x),
                 Inst(_) => {
                     if let Some(r) = ops.call_method(c, x, "__int__", [])? { return Ok(r); }
                     if let Some(r) = ops.call_method(c, x, "__index__", [])? { return Ok(r); }
@@ -1693,8 +1693,8 @@ fn getrandbits(c: *Ctx, k: u64) -> Value {
         let hi = (mt_next(c) >> (64 - k as u32)) as u64;
         let v = lo | (hi << 32);
         if v <= 9223372036854775807 { return value.int_val(&c.heap, v as i64); }
-        let x = big.add(&c.heap, Value.Obj(big.from_i64(&c.heap, (v >> 1) as i64)), Value.Obj(big.from_i64(&c.heap, (v >> 1) as i64)));
-        return big.add(&c.heap, x, Value.Int((v & 1) as i32));
+        let x = big.add(&c.heap, Value.Long(big.from_i64(&c.heap, (v >> 1) as i64)), Value.Long(big.from_i64(&c.heap, (v >> 1) as i64)));
+        return big.add(&c.heap, x, Value.Int((v & 1) as i48));
     }
     // general: little-endian 32-bit words
     var r = Value.Int(0);
@@ -1823,7 +1823,7 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
             if let Float(f) = v { v = float_to_int(c, f)?; }
             var a = big.abs(&c.heap, v);
             while !(a == Value.Int(0)) {
-                let Some((q, r)) = big.divmod(&c.heap, a, Value.Obj(big.from_i64(&c.heap, 4294967296))) else { break; };
+                let Some((q, r)) = big.divmod(&c.heap, a, Value.Long(big.from_i64(&c.heap, 4294967296))) else { break; };
                 key.push((value.as_i64(r) ?? 0) as u32);
                 a = q;
             }

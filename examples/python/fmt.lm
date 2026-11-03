@@ -95,6 +95,8 @@ pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses 
         Nil => b.push_str("None"),
         Undef => b.push_str("<undefined>"),
         Bool(x) => b.push_str(if x { "True" } else { "False" }),
+        Long(_) => big.write(b, v),
+        Cell(_) => b.push_str("<cell>"),
         Int(i) => b.push_int(i as i64),
         Float(f) => value.write_float(b, f),
         Str(s) => write_str_repr(b, s.data),
@@ -159,7 +161,6 @@ pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses 
         }
         Obj(o) => {
             match o.kind {
-                K_BIG => big.write(b, v),
                 K_CLASS => {
                     b.push_str("<class '");
                     if o.n == 0 and !is_builtin_exc(c, o) { b.push_str("__main__."); }

@@ -49,9 +49,18 @@ pub object Box {
     extra: [Value],
 }
 
+/// A closure cell (MAKECELL, LOADCELL, ...).
+pub object Cell { v: Value }
+/// An int outside the i48 range of `Int`: a *medium* one (fits an i64)
+/// has `big` None and the number in `n`; a big one has `big` the limbs.
+/// `s` is the sign (1 or -1) in both.
+pub object Long { n: i64, s: i64, big: ?Gc<Limbs> }
+
+/// The hot variants first, in whole 48-bit blocks; the rest share one
+/// (`block 45`: told apart by the low 3 bits of the pointer).
 pub value Value repr nanbox {
     Float(f64) unboxed,
-    Int(i32) block 32,
+    Int(i48),
     Nil block 0,
     /// An unbound local, a deleted dict entry, "no self" in LOADMETHOD.
     Undef block 0,
@@ -60,10 +69,12 @@ pub value Value repr nanbox {
     Str(Gc<Str>),
     List(Gc<List>),
     Tuple(Gc<Tuple>),
-    Dict(Gc<Dict>),
     Inst(Gc<Inst>),
     Func(Gc<Func>),
-    Obj(Gc<Box>),
+    Dict(Gc<Dict>) block 45,
+    Obj(Gc<Box>) block 45,
+    Cell(Gc<Cell>) block 45,
+    Long(Gc<Long>) block 45,
 }
 
 // Box kinds.
@@ -212,8 +223,8 @@ pub fn hash_of(v: Value) -> ?u64 {
         }
         List(_) => None,
         Dict(_) => None,
+        Long(b) => Some(big_hash(b)),
         Obj(b) => {
-            if b.kind == K_BIG { return Some(big_hash(b)); }
             if b.kind == K_SET { return None; }
             if b.kind == K_FROZENSET { return Some(0xf205e7 ^ (b.dict.unwrap().len)); }
             Some(hash.mix(v as u64))
@@ -229,7 +240,7 @@ pub fn hash_int(i: i64) -> u64 {
     bigint.hash_i64(i) as u64
 }
 
-fn big_hash(b: Gc<Box>) -> u64 {
+fn big_hash(b: Gc<Long>) -> u64 {
     if let Some(l) = b.big { return bigint.hash_py(l.num()) as u64; }
     hash_int(b.n)
 }
@@ -267,8 +278,8 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
             }
             true
         }
+        (Long(x), Long(y)) => big.cmp_long(x, y) == 0,
         (Obj(x), Obj(y)) => {
-            if x.kind == K_BIG and y.kind == K_BIG { return big.cmp_box(x, y) == 0; }
             if (x.kind == K_SET or x.kind == K_FROZENSET) and (y.kind == K_SET or y.kind == K_FROZENSET) {
                 let dx = x.dict.unwrap();
                 let dy = y.dict.unwrap();
@@ -281,8 +292,8 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
             }
             false
         }
-        (Obj(x), Float(y)) => if x.kind == K_BIG { big.to_f64(x) == y } else { false },
-        (Float(x), Obj(y)) => if y.kind == K_BIG { big.to_f64(y) == x } else { false },
+        (Long(x), Float(y)) => big.to_f64(x) == y,
+        (Float(x), Long(y)) => big.to_f64(y) == x,
         _ => false,
     }
 }
@@ -359,8 +370,8 @@ pub fn dict_val(d: Gc<Dict>, e: u64) -> Value { d.value(e) }
 
 /// An integer value from an i64: small ones as Int, others as big ints.
 pub fn int_val(h: *gc.Heap, x: i64) -> Value {
-    if x >= -2147483648 and x <= 2147483647 { return Value.Int(x as i32); }
-    Value.Obj(big.from_i64(h, x))
+    if x >= -140737488355328 and x <= 140737488355327 { return Value.Int(x as i48); }
+    Value.Long(big.from_i64(h, x))
 }
 
 /// The integer in `v` as an i64, if it is an int (or bool) that fits.
@@ -368,7 +379,7 @@ pub fn as_i64(v: Value) -> ?i64 {
     match v {
         Int(i) => Some(i as i64),
         Bool(b) => Some(if b { 1 } else { 0 }),
-        Obj(b) => if b.kind == K_BIG { big.to_i64(b) } else { None },
+        Long(b) => big.to_i64(b),
         _ => None,
     }
 }
@@ -377,7 +388,7 @@ pub fn is_int(v: Value) -> bool {
     match v {
         Int(_) => true,
         Bool(_) => true,
-        Obj(b) => b.kind == K_BIG,
+        Long(_) => true,
         _ => false,
     }
 }
@@ -392,7 +403,7 @@ pub fn to_f64(v: Value) -> ?f64 {
         Float(f) => Some(f),
         Int(i) => Some(i as f64),
         Bool(b) => Some(if b { 1.0 } else { 0.0 }),
-        Obj(b) => if b.kind == K_BIG { Some(big.to_f64(b)) } else { None },
+        Long(b) => Some(big.to_f64(b)),
         _ => None,
     }
 }

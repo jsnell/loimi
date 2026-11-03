@@ -1,22 +1,22 @@
-// Python ints beyond i32, on std.bigint. Values that fit an i32 are
-// always `Int`; the rest are boxes of kind K_BIG: a *medium* int (fits
-// an i64) has `big` None and the number in `n`; a big one has `big` a
-// std.bigint `Big` (limbs and sign). `s` is the sign (1 or -1) in both.
-// Every result is normalized to the smallest of the three forms.
+// Python ints beyond i48, on std.bigint. Values that fit an i48 are
+// always `Int`; the rest are `Long`s: a *medium* int (fits an i64) has
+// `big` None and the number in `n`; a big one has `big` a std.bigint
+// `Big` (limbs and sign). `s` is the sign (1 or -1) in both. Every
+// result is normalized to the smallest of the three forms.
 import std.gc;
 import std.mem;
 import std.text;
 import std.bigint;
 import std.bigint.{Num, Arg, Big};
 import value;
-import value.{Value, Box, K_BIG};
+import value.{Value, Long};
 
-/// An operand for std.bigint: small (an i64) or the limbs of a big box.
+/// An operand for std.bigint: small (an i64) or the limbs of a big int.
 fn arg(v: Value) -> Arg {
     match v {
         Int(i) => Arg.Small(i as i64),
         Bool(b) => Arg.Small(if b { 1 } else { 0 }),
-        Obj(b) => match b.big { Some(l) => Arg.Ref(l), None => Arg.Small(b.n) },
+        Long(b) => match b.big { Some(l) => Arg.Ref(l), None => Arg.Small(b.n) },
         _ => Arg.Small(0),
     }
 }
@@ -27,28 +27,21 @@ fn view(v: Value, buf: *u64) -> Num { arg(v).num(buf) }
 /// A std.bigint result as a value: Int, medium or big.
 fn finish(h: *gc.Heap, l: Gc<Big>) -> Value {
     if let Some(x) = bigint.to_i64(l.num()) { return value.int_val(h, x); }
-    let b = value.new_box(h, K_BIG, 0);
-    b.s = if l.neg { -1 } else { 1 };
-    b.big = Some(l);
-    Value.Obj(b)
+    Value.Long(new(h, Long { n: 0, s: if l.neg { -1 } else { 1 }, big: Some(l) }))
 }
 
-/// An int outside the i32 range that fits an i64: no limbs, `n` holds it.
-pub fn medium(h: *gc.Heap, x: i64) -> Gc<Box> {
-    let b = value.new_box(h, K_BIG, 0);
-    b.n = x;
-    b.s = if x < 0 { -1 } else { 1 };
-    b
+/// A medium `Long` (an int outside the i48 range that fits an i64, or
+/// any i64 as an operand): no limbs, `n` holds it.
+pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Long> {
+    new(h, Long { n: x, s: if x < 0 { -1 } else { 1 }, big: None })
 }
 
-pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Box> { medium(h, x) }
-
-pub fn to_i64(b: Gc<Box>) -> ?i64 {
+pub fn to_i64(b: Gc<Long>) -> ?i64 {
     match b.big { Some(l) => bigint.to_i64(l.num()), None => Some(b.n) }
 }
 
 /// The nearest float (correctly rounded); inf when out of range.
-pub fn to_f64(b: Gc<Box>) -> f64 {
+pub fn to_f64(b: Gc<Long>) -> f64 {
     match b.big { Some(l) => bigint.to_f64(l.num()), None => b.n as f64 }
 }
 
@@ -94,12 +87,12 @@ pub fn cmp(a: Value, b: Value) -> i32 {
     bigint.cmp(view(a, &x), view(b, &y))
 }
 
-pub fn cmp_box(a: Gc<Box>, b: Gc<Box>) -> i32 { cmp(Value.Obj(a), Value.Obj(b)) }
+pub fn cmp_long(a: Gc<Long>, b: Gc<Long>) -> i32 { cmp(Value.Long(a), Value.Long(b)) }
 
 pub fn is_neg(v: Value) -> bool {
     match v {
         Int(i) => i < 0,
-        Obj(b) => b.s < 0,
+        Long(b) => b.s < 0,
         _ => false,
     }
 }

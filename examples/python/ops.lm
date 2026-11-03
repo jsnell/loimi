@@ -64,7 +64,7 @@ pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func>
 pub fn binop_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
     if let Inst(i) = a { return simple_method(c, i.cls, op as u64, 2); }
     if let Inst(i) = b {
-        if value.is_num(a) or value.is_kind(a, K_BIG) or a == Value.Nil {
+        if value.is_num(a) or a == Value.Nil {
             return simple_method(c, i.cls, DN_RBASE + op as u64, 2);
         }
     }
@@ -205,9 +205,10 @@ pub fn type_code(v: Value) -> u32 {
         Builtin(_) => vm.T_BUILTIN,
         Inst(_) => vm.T_OBJECT,
         Undef => vm.T_NONE,
+        Long(_) => vm.T_INT,
+        Cell(_) => vm.T_CELL,
         Obj(b) => match b.kind {
             K_CLASS => vm.T_TYPE,
-            K_BIG => vm.T_INT,
             K_RANGE => vm.T_RANGE,
             K_GEN => vm.T_GEN,
             K_BOUND => vm.T_METHOD,
@@ -425,7 +426,6 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
                 }
                 return Err(attr_error(c, obj, name));
             }
-            if b.kind == K_BIG and (name.data.eq("real") or name.data.eq("numerator")) { return Ok(obj); }
             if b.kind == K_SLICE {
                 if name.data.eq("start") { return Ok(b.a); }
                 if name.data.eq("stop") { return Ok(b.b); }
@@ -445,7 +445,8 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
 
 /// Attributes of builtin values: methods from their type's dict.
 fn builtin_attr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<Value, Value> uses reenter {
-    if let Int(_) = obj {
+    let int_like = match obj { Int(_) | Long(_) => true, _ => false };
+    if int_like {
         if name.data.eq("real") or name.data.eq("numerator") { return Ok(obj); }
         if name.data.eq("imag") { return Ok(Value.Int(0)); }
         if name.data.eq("denominator") { return Ok(Value.Int(1)); }
@@ -463,13 +464,13 @@ fn builtin_attr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<Value, Value> uses
 /// The class's __init__ (None if it has none), cached in the class box
 /// (`c`, valid while `b` holds the current class epoch).
 pub fn cached_init(c: *Ctx, cls: Gc<Box>) -> ?Value {
-    if cls.b == Value.Int(c.epoch as i32) {
+    if cls.b == Value.Int(c.epoch as i48) {
         if cls.c == Value.Undef { return None; }
         return Some(cls.c);
     }
     let r = class_lookup(cls, c.n_init.unwrap());
     cls.c = r ?? Value.Undef;
-    cls.b = Value.Int(c.epoch as i32);
+    cls.b = Value.Int(c.epoch as i48);
     r
 }
 
@@ -1175,7 +1176,7 @@ fn small(v: Value) -> ?i64 {
     match v {
         Int(i) => Some(i as i64),
         Bool(b) => Some(if b { 1 } else { 0 }),
-        Obj(b) => if b.kind == K_BIG and b.big.is_none() { Some(b.n) } else { None },
+        Long(b) => if b.big.is_none() { Some(b.n) } else { None },
         _ => None,
     }
 }
@@ -1214,20 +1215,20 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
         }
         Bool(x) => {
             let i: i64 = if x { 1 } else { 0 };
-            if op == U_NEG { return Ok(Value.Int((0 - i) as i32)); }
-            if op == U_POS { return Ok(Value.Int(i as i32)); }
-            return Ok(Value.Int((~i) as i32));
+            if op == U_NEG { return Ok(Value.Int((0 - i) as i48)); }
+            if op == U_POS { return Ok(Value.Int(i as i48)); }
+            return Ok(Value.Int((~i) as i48));
         }
         Float(x) => {
             if op == U_NEG { return Ok(Value.Float(0.0 - x)); }
             if op == U_POS { return Ok(a); }
         }
-        Obj(b) => if b.kind == K_BIG {
+        Long(_) => {
             if op == U_NEG { return Ok(big.neg(&c.heap, a)); }
             if op == U_POS { return Ok(a); }
             // ~x = -x - 1
             return Ok(big.sub(&c.heap, big.neg(&c.heap, a), Value.Int(1)));
-        } else {},
+        }
         Inst(_) => {
             let name = if op == U_NEG { "__neg__" } else if op == U_POS { "__pos__" } else { "__invert__" };
             if let Some(r) = call_method(c, a, name, [])? { return Ok(r); }
@@ -1899,7 +1900,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                     b.m = o.m;
                     Ok(Value.Obj(b))
                 }
-                K_CLASS | K_BOUND | K_CELL | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_BIG | K_NOTIMPL => {
+                K_CLASS | K_BOUND | K_CELL | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
                     Err(not_iterable(c, v))
                 }
                 _ => Ok(v),  // iterators are their own iterators

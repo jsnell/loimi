@@ -961,7 +961,7 @@ fn C.operand(c: *C, e: *Expr) -> u32 {
 
 fn C.small_const(c: *C, e: *Expr) -> ?u8 {
     let v = match e.e {
-        Int(i) => if i >= -2147483648 and i <= 2147483647 { Value.Int(i as i32) } else { return None; },
+        Int(i) => if i >= -140737488355328 and i <= 140737488355327 { Value.Int(i as i48) } else { return None; },
         Float(x) => Value.Float(x),
         _ => return None,
     };
