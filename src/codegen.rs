@@ -2783,6 +2783,36 @@ impl<'a, 'p> FnGen<'a, 'p> {
             (Ty::Int(a), Ty::Int(b)) if a.bits > b.bits => self.inst(format!("trunc {} {} to {}", ft, v, tt)),
             (Ty::Int(a), Ty::Int(_)) => self.inst(format!("{} {} {} to {}", if a.signed { "sext" } else { "zext" }, ft, v, tt)),
             (Ty::Int(a), _) => self.inst(format!("{} {} {} to {}", if a.signed { "sitofp" } else { "uitofp" }, ft, v, tt)),
+            (Ty::F32, Ty::Int(b)) if self.cg.opts.arch == Arch::X86_64 => {
+                // LLVM scalarizes `fpto[su]i.sat` on vectors for SSE2 (about
+                // 40 instructions); `cvttps2dq` with the out-of-range lanes
+                // fixed up is about 10. It gives 0x80000000 for NaN and
+                // for anything outside the i32 range.
+                let n = 4;
+                self.cg.decls.insert("declare <4 x i32> @llvm.x86.sse2.cvttps2dq(<4 x float>)");
+                let fc = |x: &str| splat_const("float", n, x);
+                let bt = "<4 x i1>";
+                if b.signed {
+                    let t = self.inst(format!("call <4 x i32> @llvm.x86.sse2.cvttps2dq(<4 x float> {})", v));
+                    let big = self.inst(format!("fcmp oge <4 x float> {}, {}", v, fc("0x41E0000000000000")));
+                    let r = self.inst(format!("select {} {}, <4 x i32> {}, <4 x i32> {}", bt, big, splat_const("i32", n, "2147483647"), t));
+                    let nan = self.inst(format!("fcmp uno <4 x float> {}, {}", v, v));
+                    return self.inst(format!("select {} {}, <4 x i32> zeroinitializer, <4 x i32> {}", bt, nan, r));
+                }
+                // Unsigned: NaN and negatives to 0; at or above 2^31,
+                // convert x - 2^31 and set the top bit; at or above 2^32,
+                // all ones.
+                let pos = self.inst(format!("fcmp ogt <4 x float> {}, zeroinitializer", v));
+                let x = self.inst(format!("select {} {}, <4 x float> {}, <4 x float> zeroinitializer", bt, pos, v));
+                let lo = self.inst(format!("call <4 x i32> @llvm.x86.sse2.cvttps2dq(<4 x float> {})", x));
+                let xs = self.inst(format!("fsub <4 x float> {}, {}", x, fc("0x41E0000000000000")));
+                let hs = self.inst(format!("call <4 x i32> @llvm.x86.sse2.cvttps2dq(<4 x float> {})", xs));
+                let hi = self.inst(format!("xor <4 x i32> {}, {}", hs, splat_const("i32", n, "-2147483648")));
+                let big = self.inst(format!("fcmp oge <4 x float> {}, {}", x, fc("0x41E0000000000000")));
+                let r = self.inst(format!("select {} {}, <4 x i32> {}, <4 x i32> {}", bt, big, hi, lo));
+                let ovf = self.inst(format!("fcmp oge <4 x float> {}, {}", x, fc("0x41F0000000000000")));
+                self.inst(format!("select {} {}, <4 x i32> {}, <4 x i32> {}", bt, ovf, splat_const("i32", n, "-1"), r))
+            }
             (_, Ty::Int(b)) => {
                 let name = format!("llvm.fpto{}i.sat.{}.{}", if b.signed { "s" } else { "u" }, ovl(self.p(), to), ovl(self.p(), from));
                 self.cg.decls.insert(format!("declare {} @{}({})", tt, name, ft));
@@ -2892,6 +2922,16 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let ws = format!("i{}", s.bits);
                 let both = self.inst(format!("shufflevector {} {}, {} {}, {}", at, vals[0], at, vals[1], mask_const(0..2 * m)));
                 let (s, d) = (*s, *d);
+                if self.cg.opts.arch == Arch::AArch64 && s.signed {
+                    // `sqxtn`/`sqxtun` and their `2` forms (LLVM does not
+                    // match the clamps to `sqxtun`).
+                    let half = format!("<{} x i{}>", m, d.bits);
+                    let name = format!("llvm.aarch64.neon.sqxt{}n.v{}i{}", if d.signed { "" } else { "u" }, m, d.bits);
+                    self.cg.decls.insert(format!("declare {} @{}({})", half, name, at));
+                    let x = self.inst(format!("call {} @{}({} {})", half, name, at, vals[0]));
+                    let y = self.inst(format!("call {} @{}({} {})", half, name, at, vals[1]));
+                    return self.inst(format!("shufflevector {} {}, {} {}, {}", half, x, half, y, mask_const(0..2 * m)));
+                }
                 let (lo, hi) = (d.min(), d.max());
                 let wty = Ty::Vector(Box::new(Ty::Int(s)), *n);
                 let sfx = ovl(p, &wty);
