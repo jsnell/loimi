@@ -1676,6 +1676,31 @@ fn release_hooks(h: *Heap) {
     }
 }
 
+// ── other threads' roots (std.gil) ──────────────────────────────────────
+
+/// Mark from the shadow-stack frames from `top` down: those of another
+/// thread that shares this heap, saved when it released the heap
+/// (`std.gil`). As for the collecting thread's own frames (`collect`),
+/// only this heap's objects are marked. Emitted only where used.
+pub fn mark_shadow_stack(h: *Heap, top: *ShadowFrame) {
+    let saved = h.checks;
+    h.checks = OWN_ONLY;
+    var fr = top;
+    while (fr as u64) != 0 {
+        let entries = (fr as *u8 + 16) as *ShadowEntry;
+        for i in 0..fr.n {
+            let e = entries + i;
+            e.mark(h, e.slot);
+        }
+        fr = fr.prev;
+    }
+    h.checks = saved;
+}
+
+/// This thread's shadow-stack top: the innermost frame of GC roots that
+/// compiled code has linked. Emitted only where used.
+pub fn shadow_top() -> *ShadowFrame { loimi_shadow_top() }
+
 // ── checked roots (`loimi build --gc-check-roots`) ──────────────────────
 //
 // Built with `--gc-check-roots`, generated code marks every reference

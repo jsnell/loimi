@@ -10,6 +10,8 @@ import vm.{Ctx, Frame, Mini};
 import vm;
 import lib;
 import coro;
+#[cfg(gil)]
+import threads;
 
 const STACK_SLOTS: u64 = 1 << 20;
 const FRAMES: u64 = 1 << 16;
@@ -56,9 +58,13 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
     }
 }
 
-/// Make the heap scan `c` (its globals and VM stack) for roots.
+/// Make the heap scan `c` (its globals and VM stack) for roots. With
+/// `--cfg gil`, also give the state its lock (threads.lm), held by the
+/// calling thread.
 pub fn attach(c: *Ctx) {
     c.heap.add_scanner(c as *u8, vm.scan_roots);
+    #[cfg(gil)]
+    threads.init(c);
 }
 
 /// Free everything `c` owns.
@@ -67,6 +73,8 @@ pub fn free_ctx(c: *Ctx) {
     mem.release(st.slots);
     mem.release(st);
     c.heap.free();
+    #[cfg(gil)]
+    threads.free(c);
     mem.release(c.stack);
     mem.release(c.frames);
     mem.release(c.rbuf);

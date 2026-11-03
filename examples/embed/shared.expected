@@ -1,0 +1,9 @@
+spin: ended by another thread: yes
+main thread detaches: no (it created the state)
+t1: work 6/6, nested 6/6, kept its value 6/6, detached yes
+t2: work 6/6, nested 6/6, kept its value 6/6, detached yes
+t3: work 6/6, nested 6/6, kept its value 6/6, detached yes
+t4: work 6/6, nested 6/6, kept its value 6/6, detached yes
+total 24, counts ok
+collections while shared: many
+lock hand-overs: many

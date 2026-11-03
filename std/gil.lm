@@ -1,0 +1,285 @@
+// std.gil: several threads sharing one heap, one at a time.
+//
+// A `Gil` is a global interpreter lock for one heap (and the interpreter
+// state around it): a thread runs vm code or touches the heap only while
+// it holds the lock. Threads register with it (`attach`, `detach`), and
+// it hands the heap over at safepoints the interpreter chooses:
+//
+//   - the running thread polls `g.waiting()` (one relaxed atomic load)
+//     where it can stop, at loop back-edges and calls, and when another
+//     thread waits it calls `g.yield_now()`, which lets the waiters run
+//     first (first come, first served) and takes the lock back;
+//   - native code that blocks (I/O, sleeping, a host callback that
+//     waits) brackets the wait with `g.unlock()` and `g.lock()`, as
+//     CPython's Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS do.
+//
+// The interpreter keeps one shared state (its globals, its code) and
+// per-thread parts (its value and frame stacks, the running frame). Only
+// the holder's per-thread parts are installed in the shared state: the
+// `save` hook moves them out when a thread lets go of the lock, and
+// `load` installs the next holder's. So vm code, which reads its state
+// through its context, needs no change: from a handler's point of view a
+// hand-over is a call that may collect (`uses gc`).
+//
+// Collections run on the holder. Its own roots are as always: its
+// shadow stack (thread-local) and the root scanners, which see the
+// state it has installed. The `Gil` registers a scanner that adds every
+// other attached thread's: the shadow-stack frames it had linked when it
+// let go of the lock (saved then, and unchanged until it takes it back:
+// the frames below the `unlock` call stay as they were), and its saved
+// per-thread state (the `scan` hook).
+//
+// Under the lock no atomics are needed elsewhere: quickening (`become`),
+// inline caches and the collector's data are only touched by the
+// holder, and the hand-over (a mutex) orders everything one holder did
+// before everything the next one does.
+//
+// docs/stdlib/gc.md, "Threads sharing a heap", has the rules; the Mini
+// embedding (examples/mini/embed.lm built with `--cfg gil`) is the worked
+// example.
+
+import std.gc;
+import std.mem;
+
+extern "C" fn pthread_mutex_init(m: *u8, attr: *u8) -> i32;
+extern "C" fn pthread_mutex_lock(m: *u8) -> i32;
+extern "C" fn pthread_mutex_unlock(m: *u8) -> i32;
+extern "C" fn pthread_mutex_destroy(m: *u8) -> i32;
+extern "C" fn pthread_cond_init(c: *u8, attr: *u8) -> i32;
+extern "C" fn pthread_cond_wait(c: *u8, m: *u8) -> i32;
+extern "C" fn pthread_cond_broadcast(c: *u8) -> i32;
+extern "C" fn pthread_cond_destroy(c: *u8) -> i32;
+
+/// The interpreter's per-thread state, moved in and out of its shared
+/// state. `data` is the interpreter's (passed to each hook first), the
+/// second argument a thread's `Thread.data`.
+pub struct Hooks {
+    data: *u8,
+    /// The thread is letting go of the lock: move its parts out of the
+    /// shared state into its data (it still holds the lock).
+    save: fn(*u8, *u8),
+    /// The thread has taken the lock: install its parts.
+    load: fn(*u8, *u8),
+    /// During a collection, for each attached thread other than the
+    /// collecting one: mark what its saved parts reference (`gc_mark`).
+    scan: fn(*gc.Heap, *u8, *u8),
+}
+
+/// A thread attached to a `Gil`.
+pub struct Thread {
+    gil: *Gil,
+    /// The interpreter's state for this thread (`Hooks`).
+    data: *u8,
+    /// Whether it holds the lock.
+    holding: bool,
+    /// Its shadow-stack top when it last let go of the lock: the roots
+    /// of its compiled code, which the holder's collections mark.
+    top: *gc.ShadowFrame,
+    /// The attached threads (`Gil.threads`), changed under the lock.
+    next: *Thread,
+    /// This OS thread's records, one per `Gil` it is attached to
+    /// (`MINE`).
+    tnext: *Thread,
+}
+
+pub struct Gil {
+    /// Threads waiting to take the lock (read without the mutex by the
+    /// holder's polls; written under it).
+    want: u32,
+    mutex: *u8,
+    cond: *u8,
+    held: bool,
+    holder: *Thread,
+    /// Tickets: the next one to hand out, and the one that may take the
+    /// lock next (first come, first served).
+    next: u64,
+    serving: u64,
+    /// The attached threads that have held the lock (a thread joins the
+    /// list when it first takes it).
+    threads: *Thread,
+    heap: *gc.Heap,
+    hooks: Hooks,
+    /// Times the lock changed hands.
+    switches: u64,
+}
+
+/// This OS thread's records (the first one's address; linked through
+/// `tnext`).
+#[thread_local]
+var MINE: u64 = 0;
+
+fn no_hook(d: *u8, t: *u8) {}
+fn no_scan(h: *gc.Heap, d: *u8, t: *u8) {}
+
+/// A lock for heap `h`, held by the calling thread, which is attached
+/// with per-thread state `data`. `h` must stay at its address.
+pub fn Gil.new(h: *gc.Heap, data: *u8) -> *Gil {
+    let g: *Gil = mem.alloc(1);
+    g.mutex = mem.alloc<u64>(8) as *u8;
+    g.cond = mem.alloc<u64>(8) as *u8;
+    pthread_mutex_init(g.mutex, 0 as *u8);
+    pthread_cond_init(g.cond, 0 as *u8);
+    g.heap = h;
+    g.hooks = Hooks { data: 0 as *u8, save: no_hook, load: no_hook, scan: no_scan };
+    let t = new_thread(g, data);
+    g.held = true;
+    g.holder = t;
+    t.holding = true;
+    g.next = 1;
+    g.serving = 1;
+    t.next = 0 as *Thread;
+    g.threads = t;
+    h.add_scanner(g as *u8, scan_threads);
+    g
+}
+
+/// Set the hooks that move the per-thread state (see `Hooks`).
+pub fn Gil.set_hooks(g: *Gil, hooks: Hooks) { g.hooks = hooks; }
+
+fn new_thread(g: *Gil, data: *u8) -> *Thread {
+    let t: *Thread = mem.alloc(1);
+    t.gil = g;
+    t.data = data;
+    t.tnext = MINE as *Thread;
+    MINE = t as u64;
+    t
+}
+
+/// The calling thread's record for `g` (null if it is not attached).
+pub fn Gil.mine(g: *Gil) -> *Thread {
+    var t = MINE as *Thread;
+    while t != 0 as *Thread and t.gil != g { t = t.tnext; }
+    t
+}
+
+/// The thread holding the lock (the calling one, if it may run code).
+pub fn Gil.holder(g: *Gil) -> *Thread { g.holder }
+
+/// Times the lock changed hands.
+pub fn Gil.switches(g: *Gil) -> u64 { g.switches }
+
+/// Attach the calling thread with per-thread state `data` and take the
+/// lock (waiting for it). It must not be attached already. `data` is
+/// installed with the `load` hook like any thread's, so it must describe
+/// a thread that runs nothing yet.
+pub fn Gil.attach(g: *Gil, data: *u8) uses gc {
+    let t = new_thread(g, data);
+    take(g, t, true);
+}
+
+/// Detach the calling thread, which holds the lock, and let go of it.
+/// Its per-thread state is not saved: free it first.
+pub fn Gil.detach(g: *Gil) {
+    let t = g.holder;
+    if g.threads == t {
+        g.threads = t.next;
+    } else {
+        var q = g.threads;
+        while q.next != t { q = q.next; }
+        q.next = t.next;
+    }
+    forget(t);
+    give(g, t);
+    mem.release(t);
+}
+
+/// Let go of the lock, for native code that blocks (`lock` takes it
+/// back). Until then this thread must not touch the heap or run vm code;
+/// its roots are what it had linked when it called `unlock`.
+pub fn Gil.unlock(g: *Gil) uses gc {
+    let t = g.holder;
+    (g.hooks.save)(g.hooks.data, t.data);
+    t.top = gc.shadow_top();
+    give(g, t);
+}
+
+/// Take the lock back after `unlock` (waiting for it).
+pub fn Gil.lock(g: *Gil) uses gc {
+    let t = g.mine();
+    take(g, t, false);
+}
+
+/// Whether another thread waits for the lock: the poll at the holder's
+/// safepoints, a relaxed atomic load.
+#[inline]
+pub fn Gil.waiting(g: *Gil) -> bool { (&g.want).atomic_load_relaxed() != 0 }
+
+/// Let the threads waiting for the lock run, then take it back.
+pub fn Gil.yield_now(g: *Gil) uses gc {
+    let t = g.holder;
+    (g.hooks.save)(g.hooks.data, t.data);
+    t.top = gc.shadow_top();
+    give(g, t);
+    take(g, t, false);
+}
+
+/// Free the lock. The calling thread must be the only one attached, and
+/// hold it; the heap must not collect again (free it first).
+pub fn Gil.free(g: *Gil) {
+    let t = g.holder;
+    forget(t);
+    mem.release(t);
+    pthread_mutex_destroy(g.mutex);
+    pthread_cond_destroy(g.cond);
+    mem.release(g.mutex);
+    mem.release(g.cond);
+    mem.release(g);
+}
+
+/// Unlink `t` from this OS thread's records.
+fn forget(t: *Thread) {
+    if MINE == t as u64 {
+        MINE = t.tnext as u64;
+        return;
+    }
+    var q = MINE as *Thread;
+    while q.tnext != t { q = q.tnext; }
+    q.tnext = t.tnext;
+}
+
+fn publish(g: *Gil) {
+    (&g.want).atomic_store((g.next - g.serving) as u32);
+}
+
+fn give(g: *Gil, t: *Thread) {
+    pthread_mutex_lock(g.mutex);
+    t.holding = false;
+    g.held = false;
+    g.holder = 0 as *Thread;
+    pthread_cond_broadcast(g.cond);
+    pthread_mutex_unlock(g.mutex);
+}
+
+fn take(g: *Gil, t: *Thread, first: bool) {
+    pthread_mutex_lock(g.mutex);
+    let ticket = g.next;
+    g.next += 1;
+    publish(g);
+    while g.held or g.serving != ticket { pthread_cond_wait(g.cond, g.mutex); }
+    g.held = true;
+    g.serving += 1;
+    g.holder = t;
+    g.switches += 1;
+    t.holding = true;
+    t.top = 0 as *gc.ShadowFrame;
+    publish(g);
+    pthread_mutex_unlock(g.mutex);
+    if first {
+        t.next = g.threads;
+        g.threads = t;
+    }
+    (g.hooks.load)(g.hooks.data, t.data);
+}
+
+/// The scanner: every attached thread but the holder (which collects).
+fn scan_threads(h: *gc.Heap, data: *u8) {
+    let g = data as *Gil;
+    var t = g.threads;
+    while t != 0 as *Thread {
+        if !t.holding {
+            gc.mark_shadow_stack(h, t.top);
+            (g.hooks.scan)(h, g.hooks.data, t.data);
+        }
+        t = t.next;
+    }
+}

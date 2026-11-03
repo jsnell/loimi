@@ -2463,6 +2463,28 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.emit(format!("store {} {}, ptr {}, align 1", lt, vals[1], vals[0]));
                 "zeroinitializer".into()
             }
+            Intr::AtomicLoad | Intr::AtomicLoadRelaxed => {
+                let lt = self.ty(&e.ty);
+                let al = layout::size_of(self.p(), &e.ty);
+                let ord = if i == Intr::AtomicLoad { "acquire" } else { "monotonic" };
+                self.inst(format!("load atomic {}, ptr {} {}, align {}", lt, vals[0], ord, al))
+            }
+            Intr::AtomicStore => {
+                let lt = self.ty(&args[1].ty);
+                let al = layout::size_of(self.p(), &args[1].ty);
+                self.emit(format!("store atomic {} {}, ptr {} release, align {}", lt, vals[1], vals[0], al));
+                "zeroinitializer".into()
+            }
+            Intr::AtomicSwap | Intr::AtomicAdd => {
+                let lt = self.ty(&e.ty);
+                let op = if i == Intr::AtomicSwap { "xchg" } else { "add" };
+                self.inst(format!("atomicrmw {} ptr {}, {} {} seq_cst", op, vals[0], lt, vals[1]))
+            }
+            Intr::AtomicCas => {
+                let lt = self.ty(&args[1].ty);
+                let r = self.inst(format!("cmpxchg ptr {}, {} {}, {} {} seq_cst seq_cst", vals[0], lt, vals[1], lt, vals[2]));
+                self.inst(format!("extractvalue {{ {}, i1 }} {}, 1", lt, r))
+            }
             Intr::IsNan => {
                 let ft = self.ty(&args[0].ty);
                 self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))
@@ -2536,6 +2558,8 @@ const LAZY_STD: &[&str] = &[
     "std.gc.pinned",
     "std.gc.scan_pinned",
     "std.gc.release_hooks",
+    "std.gc.mark_shadow_stack",
+    "std.gc.shadow_top",
     "std.mem.Arena.free_bytes",
     "std.mem.Malloc.new",
     "std.mem.Malloc.alloc_bytes",

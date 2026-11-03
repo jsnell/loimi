@@ -7,7 +7,7 @@ import value;
 import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
 import coro;
-import coro.{Coro};
+import coro.{Coro}; #[cfg(gil)] import std.gil;
 
 extern "C" fn pow(a: f64, b: f64) -> f64;
 
@@ -69,7 +69,7 @@ pub struct Ctx {
     /// The values that coroutine.yield passed, or that the return that
     /// ended a run returned (RETN; RET1 and RET0 set only `nxfer`).
     xfer: *V,
-    nxfer: u64,
+    nxfer: u64, #[cfg(gil)] gil: *gil.Gil, // --cfg gil: the lock of threads sharing the state (threads.lm)
 }
 
 pub const HOST_NATIVE: i32 = 1000;
@@ -897,7 +897,7 @@ pub vm Mini {
     /// The end of a compare-and-branch: jump to the following JMP's
     /// target, or skip the JMP.
     fn branch(take: bool, target: *u32) -> never {
-        if take { jump target }
+        if take { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
         jump pc + 2
     }
 
@@ -938,15 +938,15 @@ pub vm Mini {
         }
     }
 
-    op JMP(target: label) : sJ { jump target }
+    op JMP(target: label) : sJ { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {
-        if !value.truthy(a) { jump target }
+        if !value.truthy(a) { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
         next
     }
     /// Jump if truthy.
     op TESTT(a: reg, target: label) : AsBx {
-        if value.truthy(a) { jump target }
+        if value.truthy(a) { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
         next
     }
 
@@ -1011,7 +1011,7 @@ pub vm Mini {
                 let n = V.Int(i +% s);
                 regs[a] = n;
                 regs[a + 3] = n;
-                jump target
+                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
             }
             next
         }
@@ -1021,7 +1021,7 @@ pub vm Mini {
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
                     regs[a] = Num(n);
                     regs[a + 3] = Num(n);
-                    jump target
+                    #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
                 }
                 next
             }
@@ -1036,7 +1036,7 @@ pub vm Mini {
             let n = value.table_iter(t, i as u64, regs + a + 2);
             if n != 0 {
                 regs[a + 1] = Int(n as i32);
-                jump target
+                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
             }
             next
         }
@@ -1051,7 +1051,7 @@ pub vm Mini {
             regs[a + 1] = Int(i + 1);
             regs[a + 2] = Int(i + 1);
             regs[a + 3] = v;
-            jump target
+            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
         }
         cold { raise iter_error(ctx, regs[a]) }
     }
@@ -1086,7 +1086,7 @@ pub vm Mini {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = callee;
-            jump p.code
+            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump p.code
         }
         if let Native(id) = f {
             cold {

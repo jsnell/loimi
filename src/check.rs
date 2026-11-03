@@ -3465,6 +3465,7 @@ impl<'a> Checker<'a> {
             while let Ty::Ptr(inner) = &r.ty {
                 if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32)
                     && !matches!(name, "offset" | "slice" | "read_unaligned" | "write_unaligned")
+                    && !name.starts_with("atomic_")
                 {
                     let t = (**inner).clone();
                     let s = r.span;
@@ -3568,6 +3569,52 @@ impl<'a> Checker<'a> {
                     argc(1)?;
                     let v = self.expr_coerce(cx, &args[0], inner)?;
                     mk(Ty::Unit, TK::Intrinsic(Intr::StoreUnaligned, vec![recv, v]), span)
+                }
+            }
+            (
+                Ty::Ptr(inner),
+                "atomic_load" | "atomic_load_relaxed" | "atomic_store" | "atomic_swap" | "atomic_add" | "atomic_cas",
+            ) => {
+                let ok = match &**inner {
+                    Ty::Int(it) => matches!(it.bits, 8 | 16 | 32 | 64),
+                    Ty::Ptr(_) => name != "atomic_add",
+                    _ => false,
+                };
+                if !ok {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "`{}` is for pointers to 8-, 16-, 32- and 64-bit integers{}, not `{}`",
+                            name,
+                            if name == "atomic_add" { "" } else { " and to pointers" },
+                            self.ty_name(&t)
+                        ),
+                    ));
+                }
+                let inner = (**inner).clone();
+                match name {
+                    "atomic_load" | "atomic_load_relaxed" => {
+                        argc(0)?;
+                        let i = if name == "atomic_load" { Intr::AtomicLoad } else { Intr::AtomicLoadRelaxed };
+                        mk(inner, TK::Intrinsic(i, vec![recv]), span)
+                    }
+                    "atomic_store" => {
+                        argc(1)?;
+                        let v = self.expr_coerce(cx, &args[0], &inner)?;
+                        mk(Ty::Unit, TK::Intrinsic(Intr::AtomicStore, vec![recv, v]), span)
+                    }
+                    "atomic_cas" => {
+                        argc(2)?;
+                        let old = self.expr_coerce(cx, &args[0], &inner)?;
+                        let new = self.expr_coerce(cx, &args[1], &inner)?;
+                        mk(Ty::Bool, TK::Intrinsic(Intr::AtomicCas, vec![recv, old, new]), span)
+                    }
+                    _ => {
+                        argc(1)?;
+                        let v = self.expr_coerce(cx, &args[0], &inner)?;
+                        let i = if name == "atomic_swap" { Intr::AtomicSwap } else { Intr::AtomicAdd };
+                        mk(inner, TK::Intrinsic(i, vec![recv, v]), span)
+                    }
                 }
             }
             (Ty::Closure(..), "free") => {

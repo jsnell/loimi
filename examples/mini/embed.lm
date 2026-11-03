@@ -47,6 +47,10 @@ import vm;
 import compile;
 import state;
 import coro;
+#[cfg(gil)]
+import std.gil;
+#[cfg(gil)]
+import threads;
 
 extern "C" fn strlen(s: *u8) -> u64;
 
@@ -155,6 +159,121 @@ fn as_str(v: V) -> str {
     }
 }
 
+// ── threads sharing a state (`--cfg gil`) ───────────────────────────
+//
+// Built with `--cfg gil`, a state may be run by several threads, one at a
+// time: it has a lock (std.gil), which the thread that created it holds
+// at first. Every API call needs the lock. Other threads attach
+// (`mini_thread_attach`, which waits for the lock) and detach; a native
+// or the host lets go of the lock around blocking code
+// (`mini_unlock`/`mini_lock`, Python's Py_BEGIN/END_ALLOW_THREADS), and
+// the running code hands it over at loop back-edges and calls when
+// another thread waits. Each thread has its own Mini thread (value and
+// frame stacks, its main coroutine) and its own API value stack, native
+// arguments and error message (threads.lm, `ApiThread`); globals, tables
+// and functions are shared.
+
+/// A thread's part of the API state, saved while another thread holds
+/// the lock.
+#[cfg(gil)]
+struct ApiThread {
+    core: threads.CtxThread,
+    args: *V,
+    nargs: u64,
+    ret: V,
+    vals: mem.Vec<V>,
+    err: text.StrBuf,
+    busy: u32,
+    in_native: u32,
+}
+
+#[cfg(gil)]
+fn new_api_thread() -> *ApiThread {
+    let t: *ApiThread = mem.alloc(1);
+    threads.init_thread(&t.core);
+    t.ret = V.Nil;
+    t.vals = mem.Vec.new();
+    t.err = text.StrBuf.new();
+    t
+}
+
+#[cfg(gil)]
+fn api_save(d: *u8, td: *u8) {
+    let s = d as *MiniState;
+    let t = td as *ApiThread;
+    threads.save(&s.ctx, &t.core);
+    t.args = s.args;
+    t.nargs = s.nargs;
+    t.ret = s.ret;
+    t.vals = s.vals;
+    t.err = s.err;
+    t.busy = s.busy;
+    t.in_native = s.in_native;
+}
+
+#[cfg(gil)]
+fn api_load(d: *u8, td: *u8) {
+    let s = d as *MiniState;
+    let t = td as *ApiThread;
+    threads.load(&s.ctx, &t.core);
+    s.args = t.args;
+    s.nargs = t.nargs;
+    s.ret = t.ret;
+    s.vals = t.vals;
+    s.err = t.err;
+    s.busy = t.busy;
+    s.in_native = t.in_native;
+}
+
+#[cfg(gil)]
+fn api_scan(h: *gc.Heap, d: *u8, td: *u8) {
+    let t = td as *ApiThread;
+    threads.scan(h, &t.core);
+    gc_mark(h, t.ret);
+    for i in 0..t.vals.len { gc_mark(h, t.vals.at(i)); }
+}
+
+/// Built with `--cfg gil`: attach the calling thread to `s` and wait for
+/// the lock. The thread gets a Mini thread of its own (stacks, API value
+/// stack); it must not be attached already.
+#[cfg(gil)]
+export "C" fn mini_thread_attach(s: *MiniState) uses gc {
+    s.ctx.gil.attach(new_api_thread() as *u8);
+}
+
+/// Built with `--cfg gil`: detach the calling thread, which holds the
+/// lock, and let go of it. False (and nothing done) for the thread that
+/// created the state, which stays attached until `mini_free`, or while
+/// Mini code runs on the thread (from a native).
+#[cfg(gil)]
+export "C" fn mini_thread_detach(s: *MiniState) -> bool {
+    let g = s.ctx.gil;
+    let t = g.holder().data as *ApiThread;
+    if !t.core.owned or s.ctx.base != 0 as *vm.Frame { return false; }
+    s.vals.free();
+    s.err.free();
+    threads.save(&s.ctx, &t.core);
+    threads.release(&t.core);
+    mem.release(t);
+    g.detach();
+    true
+}
+
+/// Built with `--cfg gil`: let go of the lock, before code that blocks
+/// (in a native, or in the host between calls). Until `mini_lock`, the
+/// thread must not call the API.
+#[cfg(gil)]
+export "C" fn mini_unlock(s: *MiniState) uses gc { s.ctx.gil.unlock(); }
+
+/// Built with `--cfg gil`: take the lock back after `mini_unlock`
+/// (waiting for it).
+#[cfg(gil)]
+export "C" fn mini_lock(s: *MiniState) uses gc { s.ctx.gil.lock(); }
+
+/// Built with `--cfg gil`: how many times the lock changed hands.
+#[cfg(gil)]
+export "C" fn mini_lock_switches(s: *MiniState) -> u64 { s.ctx.gil.switches() }
+
 // ── states ──────────────────────────────────────────────────────────
 
 /// A new interpreter with the standard library loaded; NULL if out of
@@ -164,6 +283,16 @@ export "C" fn mini_new() -> ?*MiniState {
     let s: *MiniState = mem.alloc(1);
     s.ctx = state.new_ctx(host_call);
     state.attach(&s.ctx);
+    // The creating thread's record holds the API's part too.
+    #[cfg(gil)]
+    {
+        let t = new_api_thread();
+        t.core.fresh = false;
+        let me = s.ctx.gil.holder();
+        mem.release(me.data);
+        me.data = t as *u8;
+        s.ctx.gil.set_hooks(gil.Hooks { data: s as *u8, save: api_save, load: api_load, scan: api_scan });
+    }
     s.ctx.heap.add_scanner(s as *u8, scan_api);
     s.natives = mem.Vec.new();
     s.arena = mem.Arena.new();

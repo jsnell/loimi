@@ -897,6 +897,11 @@ fn keep_ll() {
 /// compare the host's output with `expected`. `header_golden`: the header
 /// must equal this file.
 fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golden: Option<&Path>) {
+    c_host_run_with(name, lib, host, expected, header_golden, &[]);
+}
+
+/// `c_host_run` with extra build flags for the library (`--cfg gil`).
+fn c_host_run_with(name: &str, lib: &Path, host: &Path, expected: &Path, header_golden: Option<&Path>, extra: &[&str]) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("loimi-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -916,7 +921,7 @@ fn c_host_run(name: &str, lib: &Path, host: &Path, expected: &Path, header_golde
         let shared = flags.contains(&"--shared");
         let libfile = vdir.join(if shared { "liblm.so" } else { "liblm.a" });
         let header = vdir.join(header_file(host));
-        let out = loimi().arg("build").arg(lib).args(flags).arg("-o").arg(&libfile).arg("--header").arg(&header).output().unwrap();
+        let out = loimi().arg("build").arg(lib).args(flags).args(extra).arg("-o").arg(&libfile).arg("--header").arg(&header).output().unwrap();
         if !out.status.success() {
             failures.push(format!("{} {}: build failed:\n{}", name, variant, String::from_utf8_lossy(&out.stderr)));
             continue;
@@ -1142,18 +1147,59 @@ fn mini_threads() {
     c_host_run("mini-threads", &root.join("examples/mini/embed.lm"), &e.join("threads.c"), &e.join("threads.expected"), None);
 }
 
+/// One Mini state shared by five threads, one at a time (`--cfg gil`,
+/// examples/embed/shared.c): a hand-over at a loop back-edge, then four
+/// threads calling the same functions on shared tables under GC stress,
+/// releasing the lock in a native and between calls.
+#[test]
+fn mini_shared() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    c_host_run_with(
+        "mini-shared",
+        &root.join("examples/mini/embed.lm"),
+        &e.join("shared.c"),
+        &e.join("shared.expected"),
+        None,
+        &["--cfg", "gil"],
+    );
+}
+
+/// Mini built with the lock (`--cfg gil`) and run by one thread: every
+/// script and conformance test, in every GC mode (the polls at back-edges
+/// and calls never hand over).
+#[test]
+fn mini_gil_single_thread() {
+    mini_scripts_with(&["--cfg", "gil"], &[], |_| true);
+    mini_conformance_with(&["--cfg", "gil"], &[], |_| true);
+}
+
 /// The same under ThreadSanitizer: `--sanitize=thread` instruments the
 /// library, gcc links its libtsan into the host. No data race may be
 /// reported. Skipped under `ulimit -v` (TSan maps terabytes of shadow
 /// memory) and where gcc has no libtsan.
 #[test]
 fn mini_threads_tsan() {
+    tsan_host("threads", &[]);
+}
+
+/// `mini_shared` under ThreadSanitizer: the lock's hand-overs, and the
+/// collector reading other threads' saved state, race-free.
+#[test]
+fn mini_shared_tsan() {
+    tsan_host("shared", &["--cfg", "gil"]);
+}
+
+/// Build examples/mini/embed.lm with `--sanitize=thread` (and `extra`),
+/// link examples/embed/<host>.c with gcc's libtsan, and compare its output
+/// with <host>.expected; no race may be reported.
+fn tsan_host(host: &str, extra: &[&str]) {
     if cross() {
         return;
     }
     let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
     if limits.lines().any(|l| l.starts_with("Max address space") && l.split_whitespace().nth(3) != Some("unlimited")) {
-        eprintln!("mini_threads_tsan: skipped under an address-space limit (ulimit -v)");
+        eprintln!("mini {} tsan: skipped under an address-space limit (ulimit -v)", host);
         return;
     }
     let has_tsan = Command::new("gcc")
@@ -1161,30 +1207,32 @@ fn mini_threads_tsan() {
         .output()
         .is_ok_and(|o| Path::new(String::from_utf8_lossy(&o.stdout).trim()).is_absolute());
     if !has_tsan {
-        eprintln!("mini_threads_tsan: skipped, gcc has no libtsan");
+        eprintln!("mini {} tsan: skipped, gcc has no libtsan", host);
         return;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let e = root.join("examples/embed");
-    let dir = std::env::temp_dir().join(format!("loimi-tsan-threads-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("loimi-tsan-{}-{}", host, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let lib = dir.join("libmini.a");
     let out = loimi()
         .arg("build")
         .arg(root.join("examples/mini/embed.lm"))
-        .args(["--lib", "--release", "--sanitize=thread", "-o"])
+        .args(["--lib", "--release", "--sanitize=thread"])
+        .args(extra)
+        .arg("-o")
         .arg(&lib)
         .arg("--header")
         .arg(dir.join("mini.h"))
         .output()
         .unwrap();
     assert!(out.status.success(), "build failed:\n{}", String::from_utf8_lossy(&out.stderr));
-    let exe = dir.join("threads");
+    let exe = dir.join(host);
     let out = Command::new("gcc")
         .args(["-fsanitize=thread", "-pthread", "-I"])
         .arg(&dir)
-        .arg(e.join("threads.c"))
+        .arg(e.join(format!("{}.c", host)))
         .arg(&lib)
         .args(["-lm", "-o"])
         .arg(&exe)
@@ -1194,7 +1242,7 @@ fn mini_threads_tsan() {
     let out = Command::new(&exe).env("TSAN_OPTIONS", "halt_on_error=1:exitcode=66:history_size=2").output().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let got = String::from_utf8_lossy(&out.stdout);
-    let want = std::fs::read_to_string(e.join("threads.expected")).unwrap();
+    let want = std::fs::read_to_string(e.join(format!("{}.expected", host))).unwrap();
     assert!(
         out.status.success() && got == want,
         "exit {:?}\n--- got\n{}--- stderr\n{}",
