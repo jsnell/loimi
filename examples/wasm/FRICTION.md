@@ -15,7 +15,7 @@ signature checks, and traps.
 |---|---:|---|
 | `decode.lm` | 628 | binary format: LEB128, sections, UTF-8 names, syntax of every instruction (all "malformed" errors) |
 | `compile.lm` | 1142 | validator and translator in one pass: control stack, typed operand stack, pending locals/constants, labels, K-forms, compare-and-branch fusion |
-| `vm.lm` | 812 | the vm (`W`, about 330 ops, most from `inline for` tables), runtime structures, table/bulk helpers |
+| `vm.lm` | 812 | the vm (`W`, about 340 ops, most from `inline for` tables), runtime structures, table/bulk helpers |
 | `rt.lm` | 481 | module validation, linking (imports, `register`), instantiation, segments, start, invocation |
 | `host.lm` | 177 | `spectest`, `env` (`print_i32`, `print_f64`, `putchar`, ..) and a WASI preview 1 subset |
 | `main.lm` | 265 | CLI (`wasm prog.wasm`, `--invoke`, `--disasm`) and the spec-test script protocol |
