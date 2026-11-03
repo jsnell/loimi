@@ -643,7 +643,11 @@ Calls without effects get none of this. In ordinary (non-handler) functions,
 live `Gc` locals at `gc` call sites are stored in an `alloca`'d shadow-stack
 frame `{prev, count, slots[n]}` that is linked into `ctx.roots` on entry and
 unlinked on exit. The frame is only materialized on paths that reach a `gc`
-call.
+call. It lists the traced locals in scope that are assigned on every path
+to the call: a `let` from after its initializer, a pattern binding from
+after the test that matched it (not in `let PAT = e else { .. }`'s else
+block, nor in a later `match` arm), so no slot is scanned before it is
+written.
 
 ## 10. GC barriers and allocation
 

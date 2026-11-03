@@ -1505,7 +1505,10 @@ Rules:
   Called from an entry, nothing is synced (the run loop has not started).
 - **In ordinary functions**, `Gc`/`Value` locals that are live across a `gc`
   call are registered in a compiler-maintained shadow-stack frame. This only
-  happens on paths that can collect, which are slow paths by nature.
+  happens on paths that can collect, which are slow paths by nature. A
+  local is rooted from its initialization on: a pattern's bindings once
+  the pattern has matched, so the else block of `let PAT = e else { .. }`
+  does not root them (there they are unassigned).
 - Syncs only happen where they are needed, so code with no effects never
   writes `pc` to memory. Saving `pc` on every instruction would add a store per
   dispatch.

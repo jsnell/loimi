@@ -232,9 +232,7 @@ fn die(co: Gc<Coro>) {
 }
 
 /// The first resume of a coroutine whose body is a native: a plain call,
-/// which cannot yield. A function of its own: inlined in `resume`, the
-/// collector crashed scanning `resume`'s shadow-stack frame during the
-/// call (COROUTINES.md, friction 1).
+/// which cannot yield.
 fn resume_native(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, V> uses reenter {
     co.started = true;
     co.status = RUNNING;

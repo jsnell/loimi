@@ -195,32 +195,45 @@ variants, measured 1.007 by geomean but 1.04-1.06 on `hash_strings`,
 Ranked by how much each cost or would cost the next multi-stack
 interpreter.
 
-1. **A collector crash that depends on how a native function is
-   written.** This is unexplained, and the most serious item.
+1. **A collector crash that depended on how a native function was
+   written: a compiler bug in the rooting of `let ... else`, now
+   fixed.**
    - **Symptom:** `coroutine.resume(coroutine.create(w))`, where `w`
      is a `wrap` function, segfaulted in tail-call dispatch under GC
-     stress. Goto, switch, verify mode and an ASan build ran it fine.
-   - **Situation:** the crash was in a collection inside the nested run.
-     That run was started by `vm.call_value`, which was called from the
-     native-body branch of `coro.resume`. That branch is a `let F(cl) =
-     co.body else { ...; let r = vm.call_value(..); ...; return .. };`
-     placed before `var saved = Saved { .., cur: Gc<Coro>, open:
-     ?Gc<UpVal>, .. }`, a struct local with traced fields.
-   - **Workaround:** moving the branch into a function of its own
-     (`resume_native`) fixed it.
-   - **What it looks like:** `resume`'s shadow-stack frame lists a
-     traced slot that is not yet initialized on that path. Candidates
-     are the `saved` record and the `let ... else` binding `cl`.
-   - **Not reproduced:** two small programs of that shape
-     (`gc.collect` on an early-return path before a struct local with
-     a `?Gc` field, and before a `let A(x) = .. else` binding) did not
-     crash.
-   - **Suggested fix:** zero every traced shadow-stack slot at function
-     entry (cheap: only functions with `uses gc` calls have them), or
-     register a slot only from its initialization on. Also, a debug
-     mode in which the collector checks that every shadow-stack entry
-     points to an allocated object, as verify mode does for heap
-     references.
+     stress. The crash was in a collection inside the nested run that
+     `vm.call_value` started from the native-body branch of
+     `coro.resume`, written inline as `let F(cl) = co.body else { ...;
+     let r = vm.call_value(..); ...; return .. };`. Moving the branch
+     into a function of its own (`resume_native`) made it go away.
+   - **Cause:** the compiler added the bindings of `let PAT = e else {
+     .. }` to the set of rooted locals when it generated the pattern
+     test, before the else block. So every call that may collect in
+     the else block listed the bindings' slots in its shadow-stack
+     frame, although on that path they were never assigned: they held
+     whatever the stack held before, or an earlier loop iteration's
+     value. Here the slot of `cl` held a stale stack address; an ASan
+     build of the inline version reports `mark_ptr` reading the
+     "header" below a local array of `main`. Whether the garbage was
+     harmless (null, or a live object) depended on what ran earlier on
+     the stack, hence tail-call dispatch only and the dependence on
+     how the code was split. The workaround did not remove the bug:
+     the call `resume_native(..)` in the else block still rooted the
+     unassigned `cl`, the garbage there was just benign.
+   - **Fix:** the bindings are rooted from the end of the pattern
+     test on (src/codegen.rs, `TStmt::LetPat`). The only other change
+     in the IR of the six example interpreters is `coro.resume`, whose
+     else-block call now has one root instead of two.
+     `tests/run/gc_roots_let_else.lm` crashed before the fix in every
+     dispatch mode (a function and a handler with `let .. else` whose
+     else block collects, after a call that leaves pointer-like junk on
+     the stack) and also checked that a loop's else block no longer
+     keeps the previous iteration's object alive. Other pattern forms
+     (`match` arms, `if let`, `while let`) already dropped their
+     bindings before the failure path.
+   - **Lesson for the collector:** an uninitialized or stale root is
+     invisible until the garbage stops being benign. ASan catches it
+     at the first scan if the slot happens to hold a stack address;
+     verify mode does not check roots.
 2. **Adding a value variant silently changed the encoding of the others,
    and broke a fast path.**
    - **What happened:** Mini's `V` had exactly 7 tagged variants. Adding
