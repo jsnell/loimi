@@ -1,0 +1,5 @@
+local t = {5, 3, 8}
+table.sort(t, function(a, b)
+  return a < b
+end)
+print(t[1], t[2], t[3])

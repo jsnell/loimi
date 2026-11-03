@@ -3,9 +3,11 @@
 Status: **prototype**. Built: `on break` (generated breakpoint ops,
 `Vm.set_break`/`clear_break`/`rearm`), `#[unfused]` variants,
 `#[cfg(..)]` on vm items, `std.debug` (breakpoint sites with the
-step-over, line stepping, a command reader), and a debugger for Mini
-(`loimi build --cfg debug examples/mini/main.lm`, then
-`mini --debug script.mini`). Written 2026-11-03.
+step-over, line stepping, line starts, a command reader), and
+debuggers for Mini (`loimi build --cfg debug examples/mini/main.lm`,
+then `mini --debug script.mini`) and for the Python subset
+(`python-loimi --debug prog.py`, pdb-like; section 8, which reports
+what did not fit the first design). Written 2026-11-03.
 
 > Breakpoints, single-stepping and inspecting frames and locals in an
 > interpreter built with Loimi: how much can be generated from the `vm`
@@ -25,7 +27,9 @@ the vm, compiler and `main`. Without `--cfg debug`, Mini's IR is
 byte-identical to before. With it but not debugging, the benchmarks
 are within noise. A program being debugged runs at full speed between
 breakpoints, and at 3.3x the time (1.5x to 4.9x) while a stepping command runs
-(section 6).
+(section 6). A second debugger, for the Python subset, needed no change
+to the instruction-level part and four small additions to `std.debug`
+(section 8).
 
 ## 1. What there was
 
@@ -355,3 +359,190 @@ step-over protocol has two corner cases (the instruction's own wrapper
 runs first; a pending breakpoint across nested runs), and those are
 where a hand-written version breaks. The interpreter keeps what only
 it knows: lines, depth, frames and locals.
+
+## 8. Second interpreter: Python
+
+Is the generic part really generic? The same debugger was added to
+`examples/python` (`loimi build --cfg debug examples/python/main.lm`,
+then `python-loimi --debug prog.py`; SPEC.md, "Debugger"), an
+interpreter that differs from Mini where a debugger cares: generators
+are frames on the same frame array whose registers are saved in the
+generator object between resumes; exceptions unwind through per-prototype
+handler tables in `on raise`, with `try`/`finally`; compare-and-branch
+ops are `then`-fused with the JMP after them; four inline cache layouts
+(globals, attributes with KeyDict entry numbers, `SETATTR`, two-class
+method caches) and four supers; builtins written in Python (a prelude
+that `list(g)` and `sum(g)` go through, `io` compiled at import); and
+nested runs from natives (`sorted` keys, `next(g)`, `g.send`,
+`__repr__`). The debugger behaves like pdb where that is natural
+(locations, `(Pdb)`, `where`), with gdb's `finish`.
+
+**Size.** `examples/python/debugger.lm` is 554 lines of code (Mini's: 333),
+plus `#[cfg(debug)]` hooks on 25 existing lines of the vm, compiler and
+`main` (Mini: 15). The difference is display and locals, not stepping:
+showing values without running Python code (Python's `repr` may call
+`__repr__`, so the debugger has its own, 107 lines; Mini reuses
+`write_value`), and tracking where locals are bound (102 lines; Mini's
+compiler has block-scoped locals with live ranges to report). The
+breakpoint and stepping parts (`on break`, the variant, `stop`,
+`set_line_break`) are the same shape as Mini's.
+
+### 8.1 What fitted as it was
+
+- **`on break`, the generated ops, `set_break`/`clear_break`/`rearm`,
+  `#[unfused]`**, and `std.debug`'s `Breakpoints`, `Stepper`, `Input`
+  and `parse_command`: unchanged. Breakpoints land on `GETATTR`,
+  `LOADMETHOD` (`BREAK__AttrIC`, `BREAK__MethIC`) and the head of
+  `LOADMETHOD_CALLMETHOD`, and quickened members are rearmed as such.
+- **`then`-fused ops.** The JMP after a `LT`-style op is an instruction
+  of its own, so it could carry a breakpoint, and the op reads its label
+  through `then.target`. That stays right with a breakpoint on the JMP:
+  `set_break` writes only the opcode field, so the label field the op
+  decodes is the JMP's. (No line starts at such a JMP, so it does not
+  arise in practice.)
+- **Generators.** A resumed generator is a frame one above the
+  resumer's, in the loop (`FORITER`) or in a nested run (`next(g)`), so
+  the frame index is the depth with nothing generator-specific: `step`
+  at a `for` over a generator stops at the line the generator resumes
+  at, `next` over a `yield` stops in the resumer (pdb's behavior), and a
+  breakpoint in a generator body is an ordinary site. (Mini's coroutines
+  have stacks of their own, which is why its depth is wrong across a
+  `resume`, section 7.)
+- **Exceptions.** `on raise` finds the handler and `jump`s to it through
+  the current table, so the variant sees the handler's first
+  instruction: `next` over a call that raises, or `finish` from the
+  raising function, stops at the `finally` or `except` that catches it,
+  frames above or in the same function, with no exception-specific code.
+- **Backtraces of frames calling natives.** As in Mini, `sync` saves
+  `pc` (into a `#[cfg(debug)]` field of `Frame`), so a frame calling
+  `sorted` shows its line.
+
+### 8.2 What did not fit, and what changed
+
+1. **A frame leaving to a native.** `next` at the last line of a `sorted`
+   key stopped in the *next* call of the key: the native calls it again
+   at the same depth, and the depth alone cannot tell the new frame from
+   the old one. In the loop, a return passes through the caller (a
+   smaller depth) before any new call, so this happens only when a
+   nested run ends. Mini had the same problem with `table.sort`
+   comparators (`step` at a one-line comparator skipped its later calls,
+   as the same line at the same depth). *Generic fix:*
+   `Stepper.left(depth)`, called where a nested run ends (Python's
+   `invoke_at` and `gen_next`, Mini's `call_value`): `step` then stops at
+   whatever runs next, and `next`/`finish` wait for the caller (Mini's
+   new transcript `sort_next`). pdb gets this from frame identity; a frame serial number
+   would cost a store per call.
+2. **Line starts.** Mini's rule (a site at the first word of each run of
+   a line) gave one stop per `for` loop instead of one per iteration:
+   Python's `GETITER` and `FORITER` share the `for` line, and the jump
+   back goes to `FORITER`, in the middle of the run. *Generic:*
+   `debug.line_sites`, which puts the site at a run's *loop head* (the
+   target of a backward jump from another line) when it has one. That
+   runs on every iteration and on entry, so the count of stops is pdb's;
+   the first stop comes after the iterable is evaluated. Jumps within a
+   line (comprehensions, conditional expressions) add no site.
+3. **Walking code with breakpoints set.** Finding loop heads reads jump
+   labels, and `Vm.label` of a breakpoint word is the breakpoint op's
+   (none): a breakpoint on a loop's jump back hid the loop head from a
+   later `break` on the loop's line. Size-preserving breakpoint ops keep
+   *sizes* right for every walker (section 2.1), but not labels, operand
+   kinds or names. *Generic:* `debug.unpatched` copies the code with each
+   site's original word (`Break.word`) for such walks. (A generated
+   `Vm.label` cannot see through a breakpoint: the original opcode is in
+   the `Vm.Break`, not in the code.)
+4. **Instructions of no line.** Python's compiler gives a loop's jump
+   back the line of the body's last statement, so `next` after a
+   `finally` stopped on `out.append(-1)` in an `except` that did not
+   run: the jump back follows it in the code. Mini's compiler happens not
+   to do this. *Generic:* line 0 means "no line" and `Stepper.should_stop`
+   never stops there (CPython 3.10 has the same notion for artificial
+   instructions, PEP 626); Python's compiler gives the jumps back line 0
+   under `--cfg debug` (a JMP never raises, so error lines do not change).
+5. **`#[cfg]` on a struct literal's field.** The saved `pc` is a
+   `#[cfg(debug)]` field of `Frame`, and `main` builds the bottom frame
+   with a literal, which had no way to leave the field out of a default
+   build. *Compiler fix:* `#[cfg(..)]` before a field initializer.
+6. **Code that is not the program's.** The prelude (`__list`, `__via1`,
+   through which `list(g)` and `sum(g)` run generators) and `io` are
+   Python code in the same code objects and frames. `step` stopped in
+   them, and `bt` showed them. The interpreter decides: its `on_step`
+   does not ask the stepper in code outside the program's prototypes,
+   and `bt` skips their frames (pdb's `skip`). Nothing generic was
+   needed, since the stepper only sees what it is asked about; `next`
+   and `finish` treat such frames as frames, so a generator consumed by
+   `list(g)` is "called" from the prelude: `finish` in it runs to the
+   end of `list(g)`.
+7. **Locals.** Python's locals are function-wide registers that are not
+   cleared on entry (reading a local before assignment is not detected),
+   so a register may hold another call's value. Initializing them in
+   debug builds would cost every call; instead the compiler reports where
+   each name is first stored in code order (`store` on the existing lines
+   that bind names), and `locals` shows a local from there on (a local
+   assigned later in a loop than it is read is hidden on the first part
+   of the second iteration). Comprehension targets have live ranges, as
+   Mini's block locals. Cells and free variables are read through their
+   cells.
+8. **Showing values.** Python's `repr` may run `__repr__`, a nested run
+   from inside the `on break` handler that would hit breakpoints and
+   steps of its own (pdb turns tracing off while it evaluates). The
+   debugger prints values without running Python code. Evaluating
+   expressions at a stop needs that "nested run with the debugger
+   suspended": not built.
+9. **Source positions.** The vm is not at the end of `vm.lm` (host
+   functions follow it), so `on break` and the variant had to go on the
+   existing line that closes `on raise`, to keep the default build's
+   panic messages, and IR, unchanged. A layout constraint, not a
+   missing feature.
+
+The debugger state is a module variable rather than a `Ctx` field (the
+Python `Ctx` is built with a full literal in `main`), and the bottom of
+the program's prototypes is recorded before compiling the file, to tell
+the program's code from the prelude's.
+
+Mini's debugger gained the `left` hook (one `#[cfg(debug)]` on an
+existing line); its other transcripts are the same, and its default
+build's IR too.
+
+### 8.3 Cost
+
+Without `--cfg debug`, the IR of the Python interpreter is
+byte-identical to before in all three dispatch modes (and so is every
+other example's). With it, the eleven pyperformance programs
+(`bench/python/compare.py`), tail-call dispatch, best of 3, interleaved,
+on a machine shared with another benchmark run:
+
+| program | default (s) | cfg-debug | attached | stepping |
+|---|---:|---:|---:|---:|
+| chaos | 0.308 | 1.02 | 1.03 | 2.39 |
+| deltablue | 0.575 | 0.98 | 0.97 | 3.59 |
+| fannkuch | 0.449 | 1.02 | 1.04 | 1.98 |
+| float | 0.428 | 1.01 | 1.01 | 2.01 |
+| go | 0.362 | 1.01 | 1.01 | 2.67 |
+| hexiom | 0.513 | 1.00 | 1.01 | 2.92 |
+| nbody | 0.353 | 0.98 | 0.98 | 3.55 |
+| nqueens | 0.716 | 1.03 | 1.02 | 1.90 |
+| raytrace | 0.479 | 0.99 | 0.99 | 2.76 |
+| richards | 0.302 | 1.00 | 1.00 | 3.98 |
+| spectral_norm | 0.310 | 0.98 | 1.00 | 2.57 |
+| **total** | 4.795 | 1.00 | 1.00 | 2.70 |
+
+(Columns as in section 6: *attached* is `--debug` with `continue` at
+the first stop, *stepping* is `finish` at the first stop, so the whole
+program runs under the step variant.) A second run of the first two
+columns, best of 5, gave 1.006 in total (0.98 to 1.02 per program).
+Stepping costs less than in Mini (2.7x against 3.3x) because Python's
+instructions do more work each; the hook is the same, plus the one-entry
+cache that tells the program's code from the prelude's.
+
+### 8.4 Verdict
+
+The instruction-level part carried over without a change: generated
+breakpoint ops, the step-over, unfused stepping and the variant hooks
+worked on a vm with `then`-fused ops, four cache layouts, supers,
+generators-as-frames and handler-table exceptions. Every misfit was at
+the guest level, in what "a line starts here" and "this frame" mean,
+and four of them (`left`, `line_sites`, `unpatched`, line 0) were
+general enough to move into `std.debug`; one was a compiler gap
+(`#[cfg]` on a literal's field). What stayed Python's is what only it
+knows: which code is the program's, where locals are bound, and how to
+show a value without running guest code.

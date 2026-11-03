@@ -384,7 +384,7 @@ pub fn call_value(c: *Ctx, f: V, args: *V, n: u64) -> Result<V, V> uses reenter 
     // collector sees: the arguments are only in the new window.
     for i in 0..nregs { base[i] = if i < n { args[i] } else { V.Nil }; }
     at.base = base;
-    let r = Mini.call(c, at, cl);
+    let r = Mini.call(c, at, cl); #[cfg(debug)] debugger.left(c, fi); // --cfg debug: frame fi's run ended
     c.fp = c.frames + saved_fp;
     c.base = if nested { c.frames + saved_base } else { 0 as *Frame };
     if let Err(e) = r {

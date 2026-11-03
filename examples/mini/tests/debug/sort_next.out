@@ -1,0 +1,23 @@
+sort_next.mini:1 in main chunk
+1	local t = {5, 3, 8}
+(mdb) break 3
+breakpoint 1 at sort_next.mini:3
+(mdb) continue
+breakpoint 1, sort_next.mini:3 in function 'anonymous'
+3	  return a < b
+(mdb) locals
+a = 8
+b = 5
+(mdb) delete 1
+(mdb) step
+sort_next.mini:3 in function 'anonymous'
+3	  return a < b
+(mdb) locals
+a = 3
+b = 5
+(mdb) next
+sort_next.mini:5 in main chunk
+5	print(t[1], t[2], t[3])
+(mdb) continue
+3	5	8
+[program finished]

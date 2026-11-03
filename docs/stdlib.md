@@ -943,8 +943,9 @@ Fix-it hints, ANSI color, multi-line spans, guest tracebacks.
 
 `std/debug.lm`: the generic parts of a source-level debugger for a vm
 with `on break` (language.md §9.1; design in
-[`design/debugging.md`](design/debugging.md)). Mini's `--cfg debug`
-build (`examples/mini/debugger.lm`) is one on top of it.
+[`design/debugging.md`](design/debugging.md)). Mini's and the Python
+subset's `--cfg debug` builds (`examples/mini/debugger.lm`,
+`examples/python/debugger.lm`) are two on top of it.
 
 - `Breakpoints<B>`, over the vm's `Vm.Break`:
   `Breakpoints.new(Vm.clear_break, rearm)` (the vm's functions, as
@@ -962,7 +963,20 @@ build (`examples/mini/debugger.lm`) is one on top of it.
   `start(mode, line, depth)`, `active()`, `should_stop(line, depth)`
   (step: another line or another depth; next: another line at this
   depth, or a return; finish: a return). The interpreter supplies each
-  instruction's line and call depth.
+  instruction's line and call depth; line 0 is "no line" (an
+  instruction such as a loop's jump back, where no command stops).
+  `left(depth)`: the frame at `depth` returned, yielded or raised to the
+  native that started its nested run, so the next instruction may be a
+  new frame at the same depth (a sort key called again): `step` stops
+  there, `next` and `finish` wait for the caller.
+- Line starts: `line_sites(words, lines, line, Vm.base_size, Vm.label,
+  &out)`: the words where a line starts in one code object (the first
+  word of each run of the line, or the run's *loop head*, the target of
+  a backward jump from another line, which runs on every iteration).
+  `unpatched(&bps, words, word, &out)`: a copy of `words` with each
+  breakpoint word replaced by the word it stands for (`word` is
+  `Break.word`), for walks that read labels or operands, which see a
+  breakpoint word as the breakpoint op.
 - Commands: `parse_command(line) -> Command` (`Break(file, line)`,
   `TBreak`, `Delete(id)`, `Continue`, `Step`, `Next`, `Finish`,
   `Backtrace`, `Locals`, `Print(name)`, `Op`, `Info`, `Quit`, `Help`,
