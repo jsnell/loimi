@@ -97,7 +97,7 @@ infrastructure out of macros, compiler extensions, and convention:
 | Value representation | Hand-rolled NaN-boxing / pointer tagging macros | `value` types with a declared `repr`; `match` compiles to optimal bit tests, including multi-value checks |
 | Quickening and inline caches | Ad-hoc bytecode rewriting | `family` ops with `become`, typed inline `cache` words |
 | Superinstructions | Rarely done, because it's painful | `super A = X; Y;`, plus `--vm-stats`, which counts op pairs and suggests `super` declarations |
-| Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks (nothing yet forces `run` to take verified code) |
+| Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks, and `#[require_verified]` makes the entries accept only verified code |
 | Tracing and debugger hooks | A check in every handler, or a second copy of the interpreter | Instrumentation `variant`s: alternate dispatch tables, zero cost when off |
 
 ## Documents
@@ -134,18 +134,29 @@ infrastructure out of macros, compiler extensions, and convention:
 
 ## A taste
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, Bool(bool) }
+enum Arith { Add, Sub }
+struct Proto { nregs: u32, nconsts: u64 }
+struct Interp { proto: *Proto }
+fn arith(c: *Interp, op: Arith, a: Value, b: Value) -> Result<Value, str> { Err("bad operands") }
+fn less_than(a: Value, b: Value) -> Result<bool, str> { Ok(false) }
+fn is_insn_boundary(p: *u32) -> bool { true }
+{snippet}
+-->
 ```loimi
 vm Mini {
     context ctx: *Interp;
 
     state {
-        pc:   Cursor<u32>,      // pinned in a register
-        regs: Window<Value>,    // pinned in a register
-        k:    *const Value,     // pinned in a register
+        pc:   *u32,             // pinned in a register
+        regs: *Value,           // pinned in a register
+        k:    *Value,           // pinned in a register
     }
 
-    operand reg   = regs[it]  verify it < proto.nregs;
-    operand kst   = k[it]     verify it < proto.consts.len;
+    verify_context proto: *Proto;      // what the generated verifier checks against
+    operand reg   = regs[it]  verify (it as u32) < proto.nregs;
+    operand kst   = k[it]     verify it < proto.nconsts;
     operand label = pc + it   verify is_insn_boundary(pc + it);
 
     encoding fixed(u32) {
@@ -165,6 +176,15 @@ vm Mini {
     op JLT(a: reg, b: reg, target: label) : ABsC {
         if less_than(a, b)? { jump target } else { next }
     }
+
+    op RET(a: reg) : ABC { exit Ok(a) }
+
+    entry run(c: *Interp, code: *u32, r: *Value, kp: *Value) -> Result<Value, str> {
+        ctx = c; regs = r; k = kp;
+        jump code
+    }
+
+    on raise(msg: str) { exit Err(msg) }   // where `?` on an Err lands
 }
 ```
 
