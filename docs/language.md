@@ -2757,7 +2757,7 @@ enough to make it precise and cheap:
   that the trace function calls after tracing the declared fields,
   instead of tracing the trailing array: it marks (`gc_mark`) the live
   part of the array, or references in memory the object owns outside
-  the heap. Not on generic objects. With `h.on_free(obj, f)` (a hook
+  the heap. Not on generic objects. With `h.on_free_gc(obj, f)` (a hook
   that releases that memory when the object dies) and
   `h.pin_dirty(obj)`, see [`stdlib/gc.md`](stdlib/gc.md#trace-hooks-free-hooks-and-dirty-pinning).
 - **Generic objects.** `object Obj<V> { shape: Gc<Shape>, inline: [V] }` is

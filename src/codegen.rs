@@ -2601,6 +2601,7 @@ const LAZY_STD_TYPES: &[&str] = &["std.mem.Malloc"];
 const LAZY_STD: &[&str] = &[
     "std.gc.Heap.on_free",
     "std.gc.free_hooks",
+    "std.gc.no_free_hook",
     "std.gc.run_free_hooks",
     "std.gc.Heap.pin_dirty",
     "std.gc.Heap.unpin_dirty",

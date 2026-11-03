@@ -1,0 +1,16 @@
+// A typed free hook (`h.on_free_gc`) runs inside the collection: it
+// cannot be a function that may collect.
+// error: this function uses gc, but the expected type `fn(Gc<Buf>) -> ()` does not allow it
+import std.gc;
+
+object Buf { n: u64 }
+
+fn free_buf(b: Gc<Buf>) uses gc { gc.collect(gc_heap); }
+
+var gc_heap: *gc.Heap = 0 as *gc.Heap;
+
+fn main() uses gc {
+    var h = gc.Heap.new();
+    let b = new(&h, Buf { n: 1 });
+    h.on_free_gc(b, free_buf);
+}

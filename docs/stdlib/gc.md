@@ -261,6 +261,38 @@ fn main() {}
   the hooks of all objects still registered. Registered per object, so
   objects that own nothing yet (a coroutine that has not started) cost
   nothing.
+- `h.on_free_gc(obj, f)` is the same for an object of a known type,
+  with `f` a `fn(Gc<T>)`, so the hook reads the object's fields without
+  an `unsafe` cast from `*u8`:
+
+<!-- snippet: run "1" -->
+```loimi
+import std.gc;
+import std.io;
+import std.mem;
+
+object Buf { n: u64, data: *u8 }
+
+var freed: i64 = 0;
+
+fn free_buf(b: Gc<Buf>) {
+    mem.release(b.data);
+    freed += 1;
+}
+
+fn make(h: *gc.Heap) {
+    let b = new(h, Buf { n: 64, data: mem.alloc(64) });
+    h.on_free_gc(b, free_buf);
+}
+
+fn main() uses gc {
+    var h = gc.Heap.new();
+    make(&h);
+    gc.collect(&h);
+    io.print_int(freed); io.println("");
+}
+```
+
 - **When.** Inside the collection, after marking, ephemerons and weak
   references (so no `Weak` reaches the object any more and ephemeron
   entries keyed by it are gone), as the first sweeper, before

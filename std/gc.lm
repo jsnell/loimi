@@ -1509,6 +1509,19 @@ pub fn Heap.on_free(h: *Heap, obj: *u8, f: fn(*u8)) {
     r.hooks.push(FreeHook { obj: obj, f: f });
 }
 
+/// `on_free` for an object of a known type: call `f(obj)` when `obj`
+/// dies, under the same rules (no allocation, no resurrection: do not
+/// store `obj`; read only its fields that are not references).
+pub fn Heap.on_free_gc<T>(h: *Heap, obj: Gc<T>, f: fn(Gc<T>)) {
+    // `fn(Gc<T>)` and `fn(*u8)` take the same argument (the object's
+    // address): register `f` as the latter.
+    var g: fn(*u8) = no_free_hook;
+    unsafe { *(&g as *fn(Gc<T>)) = f; }
+    h.on_free(obj as *u8, g);
+}
+
+fn no_free_hook(p: *u8) {}
+
 /// The heap's hook registry, made (and registered as the first sweeper,
 /// so that it runs before sweepers that overwrite dead objects, like
 /// `rootck_poison`) on first use.

@@ -894,7 +894,7 @@ into. Not built:
 - Hooks for objects the generated code cannot fully see
   ([details](stdlib/gc.md#trace-hooks-free-hooks-and-dirty-pinning)):
   `#[trace(f)]` on an `object` (a custom trace of the trailing array or
-  of host memory it owns), `heap.on_free(obj, f)` (release host memory
+  of host memory it owns), `heap.on_free(obj, f)` / `heap.on_free_gc(obj, f)` (release host memory
   when `obj` dies; no guest code, no resurrection), and
   `heap.pin_dirty(obj)` / `unpin_dirty` / `is_pinned_dirty` (an object
   written without barriers, traced at every collection).

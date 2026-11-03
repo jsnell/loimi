@@ -3,8 +3,8 @@
 // `--gc-check-roots` (the matrix):
 //   - `#[trace(f)]`: an object traces only the live part of its trailing
 //     array, or references held in memory it owns outside the heap;
-//   - `h.on_free(obj, f)`: f runs once when obj dies (or at `Heap.free`),
-//     and releases that memory;
+//   - `h.on_free_gc(obj, f)` (`h.on_free` for a typed object): f runs
+//     once when obj dies (or at `Heap.free`), and releases that memory;
 //   - `h.pin_dirty(obj)`: stores through raw pointers into a pinned
 //     object need no write barrier.
 // matrix: check-roots
@@ -74,8 +74,7 @@ fn trace_buf(h: *gc.Heap, b: Gc<Buf>) {
 
 /// The free hook: release the host memory (reading only the object's
 /// own non-reference fields).
-fn free_buf(p: *u8) {
-    let b = unsafe { (p as u64) as Gc<Buf> };
+fn free_buf(b: Gc<Buf>) {
     buf_frees += 1;
     buf_sum += b.id;
     mem.release(b.items);
@@ -83,7 +82,7 @@ fn free_buf(p: *u8) {
 
 fn new_buf(h: *gc.Heap, id: i64, n: u64) -> Gc<Buf> {
     let b = new(h, Buf { id: id, n: 0, items: mem.alloc(n) });
-    h.on_free(b as *u8, free_buf);
+    h.on_free_gc(b, free_buf);
     for i in 0..n {
         // A store through a raw pointer: the barrier is ours to call.
         b.items[i] = node(h, id * 100 + i as i64);

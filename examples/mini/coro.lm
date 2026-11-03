@@ -49,7 +49,7 @@ pub const DEAD: u32 = 3;
 /// Its stacks, `nslots` values at `stack` and `nframes` frames at
 /// `frames`, are host memory (`mem.alloc`) that the object owns: allocated
 /// at the first resume, released when it dies, or by the free hook
-/// (`free_coro`) if it is collected first. The collector reaches the
+/// (`release`) if it is collected first. The collector reaches the
 /// values in them through `trace_coro`, which walks the frames of a
 /// suspended coroutine, so the dead slots above its top frame keep
 /// nothing alive. A running or normal coroutine's stacks are roots
@@ -96,12 +96,8 @@ fn trace_coro(h: *gc.Heap, co: Gc<Coro>) {
     if co.status == SUSPENDED and co.frames != 0 as *Frame { vm.scan_frames(h, co.frames, co.fp); }
 }
 
-/// The free hook (`gc.Heap.on_free`) of a coroutine with stacks.
-fn free_coro(p: *u8) {
-    release(unsafe { (p as u64) as Gc<Coro> });
-}
-
-/// Release the stacks and the retired blocks.
+/// Release the stacks and the retired blocks. Also the free hook
+/// (`gc.Heap.on_free_gc`) of a coroutine with stacks.
 fn release(co: Gc<Coro>) {
     if co.stack != 0 as *V {
         mem.release(co.stack);
@@ -346,7 +342,7 @@ pub fn prepare(c: *Ctx, co: Gc<Coro>, cl: Gc<Closure>) {
     // Count the stacks towards the next collection, as if they were in
     // the heap.
     c.heap.allocated += cap * 8 + FS_INIT * size_of<Frame>();
-    c.heap.on_free(co as *u8, free_coro);
+    c.heap.on_free_gc(co, release);
 }
 
 /// Save the running thread's state in its `Coro` (normal from now on)

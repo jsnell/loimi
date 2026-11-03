@@ -136,8 +136,8 @@ no native active on its stacks.
   hook marks nothing: its stacks are roots.
 - **Dead coroutines** free their stacks at once (`die`). A suspended
   coroutine that is dropped frees them when the collector finds the
-  `Coro` dead: the first resume registers a free hook (`heap.on_free(co,
-  free_coro)`) when it allocates the stacks (`coro.prepare`). The
+  `Coro` dead: the first resume registers a free hook (`heap.on_free_gc(co,
+  release)`) when it allocates the stacks (`coro.prepare`). The
   stacks count towards the next collection (`heap.allocated`), as they
   did when they were heap objects.
 - **Open upvalues.** An open upvalue into a coroutine's stack has a `co`
