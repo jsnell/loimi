@@ -149,7 +149,7 @@ check or a coverage counter without a second copy of the interpreter.
 
 `wraps all` would work too, and builds as fast in every dispatch mode
 (the compiler adds wrapper blocks only to the entries that switch to the
-variant, here `run_budget`), but wrapping only the 16 ops that can jump
+variant, here `run_budget`), but wrapping only the 15 ops that can jump
 keeps the step-counting overhead off straight-line code.
 
 ## The fuzzer
@@ -240,8 +240,8 @@ so set ASan's own limit, which aborts the process with a report when its
 resident memory passes it:
 
 ```sh
-loimi build examples/tutorial/step9/fuzz.lm --sanitize=address -o fuzz
 cd examples/tutorial/step9
+loimi build fuzz.lm --sanitize=address -o fuzz
 export ASAN_OPTIONS=hard_rss_limit_mb=2000
 ./fuzz 1 2000 tests/*.pip
 ./fuzz 1 2000 tests/*.pip --gc-stress

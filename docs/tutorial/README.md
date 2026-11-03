@@ -99,6 +99,9 @@ the step files.
 
 Loimi's design ([`docs/language.md`](../language.md)) describes more
 than is built ([`docs/status.md`](../status.md)). This tutorial uses only
-what is implemented. Closures in Loimi itself, `suspend`,
-C-ABI entry points and the generated `Builder` do not exist yet, and
-nothing here pretends otherwise.
+what is implemented. `suspend`, generated C-ABI entry points and the
+generated `Builder` do not exist yet, and nothing here pretends
+otherwise. Some things that do exist are left out: closures in Loimi
+itself, embedding in C (`loimi build --lib`), threads, the generational
+GC mode and the copy-and-patch JIT (`--jit-stencils`); `status.md` lists
+them.

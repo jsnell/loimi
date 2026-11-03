@@ -179,7 +179,9 @@ built)" part you should not plan around.
 
 The core language has generics, static traits (bounds checked when a
 generic is instantiated), function pointers, `defer`, `inline for`
-(chapter 4) and module-level `var`s. It does not have closures,
+(chapter 4), module-level `var`s and closures (`|x| x + 1`, passed as a
+`block fn` argument, or kept as a `closure fn` allocated in an arena or
+the GC heap; the tutorial does not need them). It does not have
 destructors, exceptions or a borrow checker. That is deliberate: the
 complexity budget goes to the parts of an interpreter that C makes hard,
 which start in chapter 3.
