@@ -211,7 +211,7 @@ pub fn grow_memory(m: *Machine, delta: u32) -> i32 {
 /// `cache` used as a 64-bit immediate after CONST64.
 pub vm W {
     context ctx: *Machine;
-    state { pc: *u64, regs: *u64, fp: *Frame, mem: *u8 }
+    state { pc: *u64, regs: *u64, fp: *Frame, mem: *u8, msize: u64 }
     verify_context f: *Func, inst: *Inst;
 
     // A slot, read and written as each wasm type.
@@ -406,7 +406,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: ru, off: imm) : RRR {
             let ea = (a as u64) + off;
-            if ea + size > ctx.mem_size { cold { raise Trap.MemOOB } }
+            if ea + size > msize { cold { raise Trap.MemOOB } }
             let x = *((mem + ea) as *ty);
             d = conv;
             next
@@ -421,7 +421,7 @@ pub vm W {
     ] {
         op #name(a: ru, v: vk, off: imm) : RRR {
             let ea = (a as u64) + off;
-            if ea + size > ctx.mem_size { cold { raise Trap.MemOOB } }
+            if ea + size > msize { cold { raise Trap.MemOOB } }
             *((mem + ea) as *ty) = conv;
             next
         }
@@ -440,7 +440,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: rq) : RRR {
             let ea = a;
-            if ea + size > ctx.mem_size { cold { raise Trap.MemOOB } }
+            if ea + size > msize { cold { raise Trap.MemOOB } }
             let x = *((mem + ea) as *ty);
             d = conv;
             next
@@ -455,25 +455,25 @@ pub vm W {
     ] {
         op #name(a: rq, v: vk) : RRR {
             let ea = a;
-            if ea + size > ctx.mem_size { cold { raise Trap.MemOOB } }
+            if ea + size > msize { cold { raise Trap.MemOOB } }
             *((mem + ea) as *ty) = conv;
             next
         }
     }
 
-    op MEM_SIZE(d: ri) : RRR { d = (ctx.mem_size >> 16) as i32; next }
+    op MEM_SIZE(d: ri) : RRR { d = (msize >> 16) as i32; next }
     op MEM_GROW(d: ri, n: ru) : RRR {
         d = grow_memory(ctx, n);
-        mem = ctx.memory.data;
+        mem = ctx.memory.data; msize = ctx.mem_size;
         next
     }
     op MEM_FILL(dst: ru, v: ri, n: ru) : RRR {
-        if (dst as u64) + (n as u64) > ctx.mem_size { cold { raise Trap.MemOOB } }
+        if (dst as u64) + (n as u64) > msize { cold { raise Trap.MemOOB } }
         memset(mem + (dst as u64), v, n as u64);
         next
     }
     op MEM_COPY(dst: ru, src: ru, n: ru) : RRR {
-        if (dst as u64) + (n as u64) > ctx.mem_size or (src as u64) + (n as u64) > ctx.mem_size {
+        if (dst as u64) + (n as u64) > msize or (src as u64) + (n as u64) > msize {
             cold { raise Trap.MemOOB }
         }
         memmove(mem + (dst as u64), mem + (src as u64), n as u64);
@@ -501,6 +501,15 @@ pub vm W {
         ("BR_I64_GT_S", rl, a > b), ("BR_I64_GT_U", rq, a > b),
         ("BR_I64_LE_S", rl, a <= b), ("BR_I64_LE_U", rq, a <= b),
         ("BR_I64_GE_S", rl, a >= b), ("BR_I64_GE_U", rq, a >= b),
+        // floats: the negated forms are separate ops (NaN compares false)
+        ("BR_F32_EQ", rf, a == b), ("BR_F32_NE", rf, a != b),
+        ("BR_F32_LT", rf, a < b), ("BR_F32_GT", rf, a > b), ("BR_F32_LE", rf, a <= b), ("BR_F32_GE", rf, a >= b),
+        ("BR_F32_NLT", rf, !(a < b)), ("BR_F32_NGT", rf, !(a > b)),
+        ("BR_F32_NLE", rf, !(a <= b)), ("BR_F32_NGE", rf, !(a >= b)),
+        ("BR_F64_EQ", rd, a == b), ("BR_F64_NE", rd, a != b),
+        ("BR_F64_LT", rd, a < b), ("BR_F64_GT", rd, a > b), ("BR_F64_LE", rd, a <= b), ("BR_F64_GE", rd, a >= b),
+        ("BR_F64_NLT", rd, !(a < b)), ("BR_F64_NGT", rd, !(a > b)),
+        ("BR_F64_NLE", rd, !(a <= b)), ("BR_F64_NGE", rd, !(a >= b)),
     ] {
         op #name(a: k, b: k) : RRR then JMP {
             if test { jump then.t }
@@ -570,7 +579,7 @@ pub vm W {
         fp.regs = regs;
         regs = nr;
         ctx.switch_to(f.inst);
-        mem = ctx.memory.data;
+        mem = ctx.memory.data; msize = ctx.mem_size;
         jump f.code
     }
 
@@ -600,7 +609,7 @@ pub vm W {
     // Back from another instance's function (see call_slow).
     op RESTORE() : J {
         ctx.switch_to(fp.inst);
-        mem = ctx.memory.data;
+        mem = ctx.memory.data; msize = ctx.mem_size;
         regs = fp.regs;
         let r = fp.ret;
         fp = fp - 1;
@@ -637,7 +646,7 @@ pub vm W {
         fp.ret = m.halt_pc;
         fp.regs = args;
         fp.inst = m.inst;
-        mem = m.memory.data;
+        mem = m.memory.data; msize = m.mem_size;
         var i = f.nparams as u64;
         let n = f.nlocals as u64;
         while i < n { args[i] = 0; i += 1; }

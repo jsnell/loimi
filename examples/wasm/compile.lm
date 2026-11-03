@@ -468,8 +468,14 @@ fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
 
 /// Compare ops that fuse with a following branch:
 /// (compare op, branch if true, branch if false, compare is a K form).
-fn fusions() -> [(u64, u64, u64, bool); 40] {
+fn fusions() -> [(u64, u64, u64, bool); 52] {
     [
+        (W.OP_F32_EQ, W.OP_BR_F32_EQ, W.OP_BR_F32_NE, false), (W.OP_F32_NE, W.OP_BR_F32_NE, W.OP_BR_F32_EQ, false),
+        (W.OP_F32_LT, W.OP_BR_F32_LT, W.OP_BR_F32_NLT, false), (W.OP_F32_GT, W.OP_BR_F32_GT, W.OP_BR_F32_NGT, false),
+        (W.OP_F32_LE, W.OP_BR_F32_LE, W.OP_BR_F32_NLE, false), (W.OP_F32_GE, W.OP_BR_F32_GE, W.OP_BR_F32_NGE, false),
+        (W.OP_F64_EQ, W.OP_BR_F64_EQ, W.OP_BR_F64_NE, false), (W.OP_F64_NE, W.OP_BR_F64_NE, W.OP_BR_F64_EQ, false),
+        (W.OP_F64_LT, W.OP_BR_F64_LT, W.OP_BR_F64_NLT, false), (W.OP_F64_GT, W.OP_BR_F64_GT, W.OP_BR_F64_NGT, false),
+        (W.OP_F64_LE, W.OP_BR_F64_LE, W.OP_BR_F64_NLE, false), (W.OP_F64_GE, W.OP_BR_F64_GE, W.OP_BR_F64_NGE, false),
         (W.OP_I32_EQ, W.OP_BR_I32_EQ, W.OP_BR_I32_NE, false), (W.OP_I32_NE, W.OP_BR_I32_NE, W.OP_BR_I32_EQ, false),
         (W.OP_I32_LT_S, W.OP_BR_I32_LT_S, W.OP_BR_I32_GE_S, false), (W.OP_I32_GE_S, W.OP_BR_I32_GE_S, W.OP_BR_I32_LT_S, false),
         (W.OP_I32_GT_S, W.OP_BR_I32_GT_S, W.OP_BR_I32_LE_S, false), (W.OP_I32_LE_S, W.OP_BR_I32_LE_S, W.OP_BR_I32_GT_S, false),
@@ -510,7 +516,7 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     return;
                 }
                 let fs = fusions();
-                for i in 0..40 {
+                for i in 0..52 {
                     let (cop, bt, bf, k) = fs[i];
                     if cop != op { continue; }
                     t.code.truncate(last);
