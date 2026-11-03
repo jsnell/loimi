@@ -1,0 +1,8 @@
+// A `#[trace(f)]` hook names a function of the object's module.
+// error: `#[trace(trace_obj)]`: no function `trace_obj` in this module
+import std.gc;
+
+#[trace(trace_obj)]
+object Obj { n: u64 }
+
+fn main() {}

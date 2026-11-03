@@ -313,7 +313,12 @@ pub fn emit_runtime(cg: &mut Codegen) {
                 mark_expr(&mut g, ft, &x, "%h");
             }
         }
-        if let Some((_, et)) = &s.trailing {
+        if let Some(hook) = s.trace {
+            // `#[trace(f)]`: the hook traces the trailing array (as much of
+            // it as is live) and what the object owns outside the heap.
+            let sym = p.fns[hook as usize].symbol.clone();
+            g.emit(format!("call void @\"{}\"(ptr %h, ptr %obj)", sym));
+        } else if let Some((_, et)) = &s.trailing {
             if is_traced(p, et) {
                 let size = layout::size_of(p, &st);
                 let base = g.inst(format!("getelementptr inbounds i8, ptr %obj, i64 {}", size));

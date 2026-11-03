@@ -1,0 +1,230 @@
+// The collector hooks of std.gc, in a non-generational heap (normal and
+// stress) and a generational one (stress and verify), and with
+// `--gc-check-roots` (the matrix):
+//   - `#[trace(f)]`: an object traces only the live part of its trailing
+//     array, or references held in memory it owns outside the heap;
+//   - `h.on_free(obj, f)`: f runs once when obj dies (or at `Heap.free`),
+//     and releases that memory;
+//   - `h.pin_dirty(obj)`: stores through raw pointers into a pinned
+//     object need no write barrier.
+// matrix: check-roots
+import std.io;
+import std.gc;
+import std.mem;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+fn node(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..6 {
+        for j in 0..300 { node(h, -1); }
+        gc.collect(h);
+    }
+}
+
+fn alive(w: Gc<gc.Weak<Node>>) -> i64 {
+    if let Some(n) = w.get() { n.value } else { -1 }
+}
+
+// ── a stack whose slots above `top` are dead ────────────────────────────
+
+#[trace(trace_stack)]
+object Stack { top: u64, slots: [?Gc<Node>] }
+
+fn trace_stack(h: *gc.Heap, s: Gc<Stack>) {
+    for i in 0..s.top { gc_mark(h, s.slots[i]); }
+}
+
+fn stack(h: *gc.Heap) uses gc {
+    let s = new(h, Stack { top: 0 }, 8);
+    let four: u64 = 4;
+    for i in 0..four {
+        s.slots[i] = Some(node(h, 10 + i as i64));
+        s.top = i + 1;
+    }
+    let w1 = h.new_weak(s.slots[1] ?? node(h, 0));
+    let w3 = h.new_weak(s.slots[3] ?? node(h, 0));
+    // Pop two: their slots still hold the nodes, but are not traced.
+    s.top = 2;
+    churn(h);
+    io.print_int(alive(w1)); io.print(" "); io.print_int(alive(w3)); io.println("");
+    var sum: i64 = 0;
+    for i in 0..s.top { if let Some(n) = s.slots[i] { sum += n.value; } }
+    io.print_int(sum); io.println("");
+    // Old stack, young values: the compiler's barrier covers these stores.
+    s.slots[2] = Some(node(h, 20));
+    s.top = 3;
+    churn(h);
+    if let Some(n) = s.slots[2] { io.print_int(n.value); }
+    io.println("");
+}
+
+// ── an object owning host memory that holds references ──────────────────
+
+#[trace(trace_buf)]
+object Buf { id: i64, n: u64, items: *Gc<Node> }
+
+var buf_frees: i64 = 0;
+var buf_sum: i64 = 0;
+
+fn trace_buf(h: *gc.Heap, b: Gc<Buf>) {
+    for i in 0..b.n { gc_mark(h, b.items[i]); }
+}
+
+/// The free hook: release the host memory (reading only the object's
+/// own non-reference fields).
+fn free_buf(p: *u8) {
+    let b = unsafe { (p as u64) as Gc<Buf> };
+    buf_frees += 1;
+    buf_sum += b.id;
+    mem.release(b.items);
+}
+
+fn new_buf(h: *gc.Heap, id: i64, n: u64) -> Gc<Buf> {
+    let b = new(h, Buf { id: id, n: 0, items: mem.alloc(n) });
+    h.on_free(b as *u8, free_buf);
+    for i in 0..n {
+        // A store through a raw pointer: the barrier is ours to call.
+        b.items[i] = node(h, id * 100 + i as i64);
+        b.n = i + 1;
+        gc.write_barrier(h, b as *u8);
+    }
+    b
+}
+
+fn drop_bufs(h: *gc.Heap) {
+    for i in 0..5 { new_buf(h, 1000 + i as i64, 3); }
+}
+
+fn bufs(h: *gc.Heap) uses gc {
+    buf_frees = 0;
+    buf_sum = 0;
+    let keep = new_buf(h, 1, 4);
+    drop_bufs(h);
+    churn(h);
+    io.print_int(buf_frees); io.print(" "); io.print_int(buf_sum); io.println("");
+    // The kept one is old now: store young nodes into its host memory.
+    for i in 0..keep.n {
+        keep.items[i] = node(h, 7 + i as i64);
+        gc.write_barrier(h, keep as *u8);
+    }
+    churn(h);
+    var sum: i64 = 0;
+    for i in 0..keep.n { sum += keep.items[i].value; }
+    io.print_int(sum); io.print(" "); io.print_int(buf_frees); io.println("");
+}
+
+// ── a pinned object written without barriers ────────────────────────────
+
+object Regs { r: [?Gc<Node>] }
+
+fn pinned(h: *gc.Heap) uses gc {
+    let regs = new(h, Regs {}, 16);
+    h.pin_dirty(regs as *u8);
+    churn(h);
+    // Old and pinned: raw stores of young objects, no barrier.
+    let p = regs.r.ptr;
+    for round in 0..4 {
+        for i in 0..16 {
+            p[i] = Some(node(h, (round * 16 + i) as i64));
+            if i % 4 == 0 { gc.maybe_collect(h); }
+        }
+        churn(h);
+    }
+    var sum: i64 = 0;
+    for i in 0..16 { if let Some(n) = p[i] { sum += n.value; } }
+    io.print_int(sum); io.print(" "); io.print_bool(h.is_pinned_dirty(regs as *u8)); io.println("");
+    // Store young objects, then unpin: the object goes into the
+    // remembered set for those stores.
+    for i in 0..16 { p[i] = Some(node(h, 100 + i as i64)); }
+    h.unpin_dirty(regs as *u8);
+    churn(h);
+    sum = 0;
+    for i in 0..16 { if let Some(n) = regs.r[i] { sum += n.value; } }
+    io.print_int(sum); io.print(" "); io.print_bool(h.is_pinned_dirty(regs as *u8)); io.println("");
+    // Pins nest.
+    h.pin_dirty(regs as *u8);
+    h.pin_dirty(regs as *u8);
+    h.unpin_dirty(regs as *u8);
+    io.print_bool(h.is_pinned_dirty(regs as *u8)); io.println("");
+    h.unpin_dirty(regs as *u8);
+}
+
+/// A pinned object is a root.
+fn pinned_root(h: *gc.Heap) uses gc {
+    let w = pin_new(h);
+    churn(h);
+    io.print_int(alive(w)); io.println("");
+    if let Some(m) = w.get() { h.unpin_dirty(m as *u8); }
+    churn(h);
+    io.print_int(alive(w)); io.println("");
+}
+
+fn pin_new(h: *gc.Heap) -> Gc<gc.Weak<Node>> {
+    let n = node(h, 5);
+    h.pin_dirty(n as *u8);
+    h.new_weak(n)
+}
+
+fn run(h: *gc.Heap) uses gc {
+    stack(h);
+    bufs(h);
+    pinned(h);
+    pinned_root(h);
+}
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    run(&heap);
+    // Heap.free runs the hooks of the objects still registered.
+    heap.free();
+    io.print_int(buf_frees); io.println("");
+    var sheap = gc.Heap.new();
+    sheap.set_stress(true);
+    run(&sheap);
+    sheap.free();
+    io.print_int(buf_frees); io.println("");
+    var gheap = gc.Heap.new();
+    gheap.set_generational(true);
+    gheap.set_stress(true);
+    gheap.set_verify(true);
+    run(&gheap);
+    gheap.free();
+    io.print_int(buf_frees); io.println("");
+    0
+}
+
+// expect: 11 -1
+// expect: 21
+// expect: 20
+// expect: 5 5010
+// expect: 34 5
+// expect: 888 true
+// expect: 1720 false
+// expect: true
+// expect: 5
+// expect: -1
+// expect: 6
+// expect: 11 -1
+// expect: 21
+// expect: 20
+// expect: 5 5010
+// expect: 34 5
+// expect: 888 true
+// expect: 1720 false
+// expect: true
+// expect: 5
+// expect: -1
+// expect: 6
+// expect: 11 -1
+// expect: 21
+// expect: 20
+// expect: 5 5010
+// expect: 34 5
+// expect: 888 true
+// expect: 1720 false
+// expect: true
+// expect: 5
+// expect: -1
+// expect: 6

@@ -1,0 +1,8 @@
+// `#[trace(f)]` applies to objects only.
+// error: `trace`
+#[trace(tr)]
+struct S { n: u64 }
+
+fn tr() {}
+
+fn main() {}

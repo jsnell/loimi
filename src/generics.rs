@@ -151,7 +151,7 @@ impl<'a> Checker<'a> {
                         Some(self.object_count - 1)
                     }
                 };
-                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None, verified: None });
+                self.prog.structs.push(StructDef { name, fields: vec![], pattern, object, trailing: None, verified: None, trace: None });
                 Ty::Struct(id)
             }
             GenDecl::Enum(_) => {

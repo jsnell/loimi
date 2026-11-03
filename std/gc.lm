@@ -1229,8 +1229,10 @@ fn eph_sweep<K, V>(h: *Heap, data: *u8) {
     }
 }
 
-/// Free every object (no finalizers run).
+/// Free every object, after running the free hooks (`on_free`) of those
+/// that have one.
 pub fn Heap.free(h: *Heap) {
+    release_hooks(h);
     for i in 0..h.large.len { free(h.large.at(i) as *u8 - 16); }
     h.large.free();
     for i in 0..h.segments.len { munmap(h.segments.at(i), SEG); }
@@ -1471,6 +1473,205 @@ fn wi_sweep<X>(h: *Heap, data: *u8) {
         if w > WI_DEL and !h.is_marked((w & WI_ADDR) as *u8) {
             t.slots[i] = WI_DEL;
             t.live -= 1;
+        }
+    }
+}
+
+// ── free hooks ──────────────────────────────────────────────────────────
+//
+// `h.on_free(obj, f)`: when the collector finds `obj` dead, it calls
+// `f(obj)` once, before the object's memory is reused. The hook is for
+// releasing what the object owns outside the heap (`mem.alloc`'d
+// buffers, file descriptors). It runs inside the collection, after
+// marking, weak references and ephemerons (so no `Weak` reaches the
+// object any more), before the other sweepers. It must not allocate
+// in the heap, collect, register or remove hooks, or store `obj`
+// anywhere (no resurrection), and it should read only the object's own
+// fields that are not references: the objects it references may be dead
+// too. The hooks of objects dying in the same collection run in no
+// particular order. `Heap.free` runs the hooks of every object still
+// registered, dead or alive.
+//
+// The registry is a sweeper's data, so heaps that never register a hook
+// pay nothing; in a minor collection only the entries of young objects
+// are looked at. These functions are emitted only where used
+// (src/codegen.rs, `is_lazy`).
+
+struct FreeHook { obj: *u8, f: fn(*u8) }
+
+/// Registered hooks; those before `old` are of old objects (generational
+/// mode), which a minor collection skips.
+struct FreeHooks { hooks: mem.Vec<FreeHook>, old: u64 }
+
+/// Call `f(obj)` when `obj` dies (see above). Register it once per object.
+pub fn Heap.on_free(h: *Heap, obj: *u8, f: fn(*u8)) {
+    let r = free_hooks(h);
+    r.hooks.push(FreeHook { obj: obj, f: f });
+}
+
+/// The heap's hook registry, made (and registered as the first sweeper,
+/// so that it runs before sweepers that overwrite dead objects, like
+/// `rootck_poison`) on first use.
+fn free_hooks(h: *Heap) -> *FreeHooks {
+    for i in 0..h.sweepers.len {
+        let s = h.sweepers.at(i);
+        if s.scan == run_free_hooks { return s.data as *FreeHooks; }
+    }
+    let r: *FreeHooks = mem.alloc(1);
+    r.hooks = mem.Vec.new();
+    r.old = 0;
+    h.sweepers.push(Scanner { data: r as *u8, scan: run_free_hooks });
+    var i = h.sweepers.len - 1;
+    while i > 0 {
+        h.sweepers.set(i, h.sweepers.at(i - 1));
+        i -= 1;
+    }
+    h.sweepers.set(0, Scanner { data: r as *u8, scan: run_free_hooks });
+    r
+}
+
+/// The sweeper: run the hooks of the objects that died, drop them, and
+/// move the entries of objects that became old before `old`.
+fn run_free_hooks(h: *Heap, data: *u8) {
+    let r = data as *FreeHooks;
+    let first = if h.minor { r.old } else { 0 };
+    var out = first;
+    for i in first..r.hooks.len {
+        let e = r.hooks.at(i);
+        if h.is_marked(e.obj) {
+            r.hooks.set(out, e);
+            out += 1;
+        } else {
+            (e.f)(e.obj);
+        }
+    }
+    r.hooks.truncate(out);
+    var nold: u64 = 0;
+    if h.gen {
+        nold = first;
+        for i in first..out {
+            let e = r.hooks.at(i);
+            if ((e.obj - HEADER) as *Header).mark == h.epoch {
+                r.hooks.set(i, r.hooks.at(nold));
+                r.hooks.set(nold, e);
+                nold += 1;
+            }
+        }
+    }
+    r.old = nold;
+}
+
+// ── dirty pinning ───────────────────────────────────────────────────────
+//
+// `h.pin_dirty(obj)` .. `h.unpin_dirty(obj)`: while pinned, the object is
+// a root, and every collection traces it, minor ones included, as if it
+// were always in the remembered set. Stores into it then need no write
+// barrier, and verify mode does not check it: for an object that the
+// mutator writes through raw pointers in a hot loop (a register file or
+// stack that is a GC object). `unpin_dirty` puts an old object into the
+// remembered set, for the stores made since the last collection. Pins
+// nest (pin twice, unpin twice). Each collection traces the whole
+// object; use a `#[trace(f)]` hook to trace only its live part.
+// Emitted only where used (src/codegen.rs, `is_lazy`).
+
+struct Pinned { objs: mem.Vec<*u8> }
+
+/// Pin `obj` (see above).
+pub fn Heap.pin_dirty(h: *Heap, obj: *u8) {
+    let r = pinned(h);
+    r.objs.push(obj);
+    if h.gen {
+        // As if remembered: the barrier and verify mode skip it.
+        let hd = (obj - HEADER) as *Header;
+        hd.flags = (hd.flags & !LOG) | INRS;
+    }
+}
+
+/// Undo one `pin_dirty(obj)`.
+pub fn Heap.unpin_dirty(h: *Heap, obj: *u8) {
+    let r = pinned(h);
+    var i = r.objs.len;
+    while i > 0 {
+        i -= 1;
+        if r.objs.at(i) == obj {
+            r.objs.set(i, r.objs.at(r.objs.len - 1));
+            r.objs.truncate(r.objs.len - 1);
+            break;
+        }
+    }
+    for j in 0..r.objs.len {
+        if r.objs.at(j) == obj { return; }
+    }
+    if !h.gen { return; }
+    let hd = (obj - HEADER) as *Header;
+    if hd.mark == h.epoch {
+        // Old: stores since the last collection had no barrier.
+        hd.flags = (hd.flags & !LOG) | INRS;
+        h.rs.objs.push(obj);
+    } else {
+        hd.flags = hd.flags & !INRS;
+    }
+}
+
+/// Whether `obj` is pinned.
+pub fn Heap.is_pinned_dirty(h: *Heap, obj: *u8) -> bool {
+    let r = pinned(h);
+    for j in 0..r.objs.len {
+        if r.objs.at(j) == obj { return true; }
+    }
+    false
+}
+
+fn pinned(h: *Heap) -> *Pinned {
+    for i in 0..h.scanners.len {
+        let s = h.scanners.at(i);
+        if s.scan == scan_pinned { return s.data as *Pinned; }
+    }
+    let r: *Pinned = mem.alloc(1);
+    r.objs = mem.Vec.new();
+    h.add_scanner(r as *u8, scan_pinned);
+    r
+}
+
+/// The scanner: mark the pinned objects, and trace the old ones in a minor
+/// collection (marking stops at them). Their flags say "remembered" again
+/// (the remembered set's processing, or a major collection, may have
+/// cleared INRS, and marking sets LOG).
+fn scan_pinned(h: *Heap, data: *u8) {
+    let r = data as *Pinned;
+    for i in 0..r.objs.len {
+        let p = r.objs.at(i);
+        let hd = (p - HEADER) as *Header;
+        if h.minor and hd.mark == h.epoch {
+            loimi_trace_object(h, p, hd.tid as u32);
+        } else {
+            mark_ptr(h, p);
+        }
+        if h.gen { hd.flags = (hd.flags & !LOG) | INRS; }
+    }
+}
+
+/// For `Heap.free`: run every registered free hook and release the
+/// registries.
+fn release_hooks(h: *Heap) {
+    for i in 0..h.sweepers.len {
+        let s = h.sweepers.at(i);
+        if s.scan == run_free_hooks {
+            let r = s.data as *FreeHooks;
+            for j in 0..r.hooks.len {
+                let e = r.hooks.at(j);
+                (e.f)(e.obj);
+            }
+            r.hooks.free();
+            mem.release(r);
+        }
+    }
+    for i in 0..h.scanners.len {
+        let s = h.scanners.at(i);
+        if s.scan == scan_pinned {
+            let r = s.data as *Pinned;
+            r.objs.free();
+            mem.release(r);
         }
     }
 }

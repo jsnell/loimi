@@ -1,0 +1,10 @@
+// A `#[trace(f)]` hook runs inside a collection: no effects.
+// error: `#[trace(tr)]`: the function runs inside a collection, so it must not have effects
+import std.gc;
+
+#[trace(tr)]
+object Obj { n: u64 }
+
+fn tr(h: *gc.Heap, o: Gc<Obj>) uses gc { gc.collect(h); }
+
+fn main() {}

@@ -217,6 +217,7 @@ impl<'a> Checker<'a> {
                     object,
                     trailing: None,
                     verified: None,
+                    trace: None,
                 });
                 def.env_struct = Some((sid, gc as u32));
             }
