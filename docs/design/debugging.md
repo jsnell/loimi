@@ -24,7 +24,7 @@ about 410 lines (`examples/mini/debugger.lm`) plus 14 `#[cfg(debug)]` items in
 the vm, compiler and `main`. Without `--cfg debug`, Mini's IR is
 byte-identical to before. With it but not debugging, the benchmarks
 are within noise. A program being debugged runs at full speed between
-breakpoints, and at about 3x the time while a stepping command runs
+breakpoints, and at 3.3x the time (1.5x to 4.9x) while a stepping command runs
 (section 6).
 
 ## 1. What there was
@@ -289,7 +289,25 @@ source positions in panic messages. (`#[cfg(gil)]` already did this.)
 5, interleaved, tail-call dispatch, x86-64, on a machine shared with
 another benchmark run:
 
-BENCH_TABLE
+| program | default (s) | cfg-debug | attached | stepping |
+|---|---:|---:|---:|---:|
+| binary_trees | 0.859 | 0.98 | 0.97 | 2.45 |
+| closures | 0.473 | 0.99 | 1.00 | 2.94 |
+| fannkuch | 1.209 | 1.03 | 1.04 | 3.61 |
+| fib | 0.962 | 0.99 | 0.98 | 3.45 |
+| hash_strings | 1.031 | 0.98 | 0.97 | 2.78 |
+| interp | 0.982 | 0.97 | 0.97 | 4.88 |
+| mandelbrot | 0.630 | 0.99 | 1.00 | 4.56 |
+| nbody | 0.457 | 1.01 | 1.01 | 4.53 |
+| oo_methods | 0.768 | 0.95 | 0.96 | 2.56 |
+| queens | 0.909 | 0.98 | 0.97 | 3.48 |
+| sieve | 0.716 | 1.02 | 1.02 | 2.50 |
+| sort | 0.795 | 0.99 | 1.00 | 3.39 |
+| spectral_norm | 1.070 | 1.00 | 1.01 | 3.86 |
+| string_build | 0.813 | 0.99 | 1.00 | 1.49 |
+| **total** | 11.673 | 0.99 | 0.99 | 3.32 |
+
+(Ratios to the default build; noise on this machine is a few percent either way.)
 
 - *cfg-debug*: the `--cfg debug` build, run as `mini script`;
 - *attached*: `mini --debug script` with `continue` at the first stop

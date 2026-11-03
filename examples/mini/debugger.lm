@@ -312,6 +312,14 @@ fn Dbg.set_line_break(d: *Dbg, file: str, line: u32, temp: bool) {
     if b.nsites == 0 {
         d.bps.delete(id);
         d.bps.next_id = id;
+        for o in d.bps.list() {
+            if o.line == line {
+                d.out.push_str("breakpoint ");
+                d.out.push_int(o.id as i64);
+                d.out.push_str(" is already at that line\n");
+                return;
+            }
+        }
         d.out.push_str("no code at line ");
         d.out.push_int(line as i64);
         d.out.push_str("\n");
@@ -333,7 +341,9 @@ fn Dbg.sites_in(d: *Dbg, p: Gc<Proto>, id: u32, line: u32) {
     while i < words.len {
         let l = p.lines.data[i];
         if l == line and (i == 0 or prev != line) {
-            if let Some(t) = Mini.set_break(p.code, i) { d.bps.add_site(id, (words.ptr + i) as u64, t); }
+            // One site per word: a second breakpoint there gets none.
+            let at = (words.ptr + i) as u64;
+            if !d.bps.has_site(at) and let Some(t) = Mini.set_break(p.code, i) { d.bps.add_site(id, at, t); }
         }
         prev = l;
         i += Mini.base_size(words[i]);
