@@ -700,6 +700,30 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   alignment 1 (`*T` for integer, float and pointer `T`). On x86-64 and
   AArch64 they compile to the same single `mov`/`ldr` as an aligned
   access.
+- **Atomics.** For memory that threads share outside a lock, a pointer
+  to an 8-, 16-, 32- or 64-bit integer (or to a pointer) has
+  `p.atomic_load()` (acquire), `p.atomic_load_relaxed()` (monotonic),
+  `p.atomic_store(v)` (release), `p.atomic_swap(v)` and `p.atomic_cas(old,
+  new) -> bool` (sequentially consistent), and for integers
+  `p.atomic_add(v)` (returns the old value). Each is one LLVM atomic
+  instruction, which ThreadSanitizer understands. `std.gil`'s poll is an
+  `atomic_load_relaxed`: a plain `mov` on x86-64.
+
+  <!-- snippet: run "8 7"
+  import std.io;
+  fn main() {
+      var n: u32 = 7;
+      let p = &n;
+      {snippet}
+      io.print_int(p.atomic_load() as i64);
+      io.print(" ");
+      io.print_int(old as i64);
+  }
+  -->
+  ```loimi
+  let old = p.atomic_add(1);              // n = 8, old = 7
+  if !p.atomic_cas(8, 8) { trap(); }      // stores: n was 8
+  ```
 - **GC references cannot be forged outside `unsafe`.** A `Gc<T>` comes
   from `new`, from a field or value that holds one, or from
   `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it
@@ -713,8 +737,9 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
 
 `comptime` expressions and `const fn` run in the compiler, Zig-style. This is
 how tables (lexer DFAs, operator precedence tables, op variants) are built.
-**Not built:** `comptime` and `const fn`; `inline for` (below) is the only
-compile-time evaluation, and tables are filled at run time.
+**Not built:** `comptime` and `const fn`; `inline for` (below) and
+`#[cfg(..)]` are the only compile-time evaluation, and tables are filled
+at run time.
 `inline for` unrolls at compile time and can generate items, including ops:
 
 <!-- snippet: check
@@ -738,6 +763,36 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
     }
 }
 ```
+
+**Conditional compilation.** `#[cfg(NAME)]` keeps the item (an
+`import`, a function, a `var`, a struct, ...), struct field or
+statement after it only when the build was given `--cfg NAME`;
+`#[cfg(not(NAME))]` keeps it only without. The parser drops what is not
+kept, before names are resolved, so a build without the name compiles
+exactly as if the code were not there: the IR does not change. Mini's
+`--cfg gil` (section 10.1, Threads) adds a field to its context and polls
+to its handlers this way:
+
+<!-- snippet: run "plain"
+import std.io;
+{snippet}
+fn main() { io.print(build()); }
+-->
+```loimi
+#[cfg(gil)]
+fn build() -> str { "with the lock" }
+#[cfg(not(gil))]
+fn build() -> str { "plain" }
+```
+
+Several `#[cfg(..)]` in a row must all hold. Code that is dropped is
+not checked, so build both ways. One thing still sees it: the
+verifier's "may continue past its last word" scan reads an op's tokens
+(section 6), so a dropped statement that reads `pc` or says `next`
+makes it more conservative, never wrong. A statement keeps its line when
+the attribute is written on the line it guards
+(`#[cfg(gil)] if .. { .. } jump target`): panic messages carry line
+numbers, so that is how Mini's default build stays byte-identical.
 
 `inline for` is token-level expansion. The body is copied once per
 element, and every identifier token equal to a loop variable is replaced
@@ -2756,7 +2811,7 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   shadow-stack top, vm scratch slots, `std.rt` handlers) start zeroed in
   every thread. A host can call any export from any thread at any time;
   the interpreter's own state (a heap, its roots) is created by an export
-  such as `mini_new` and must be used by one thread at a time.
+  such as `mini_new` and must be used by one thread at a time (or by threads taking turns, with a lock: "Threads", below).
 - **Code model.** `--lib` and `--shared` compile with `-fPIC`, so the
   archive links into PIE executables (the default) and shared objects.
   Executables keep `-fno-pic`.
@@ -2911,6 +2966,80 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   only, one global code buffer). Mini's example compiler keeps its
   error sink in a `#[thread_local]`; MiniJS's executable keeps its heap
   in a plain global, which would have to become per-state to embed it.
+
+  **Threads sharing one state** (a global interpreter lock, opt-in).
+  `std.gil` gives a heap a lock that a thread must hold to run vm code
+  or touch the heap; Mini built with `--cfg gil` uses it, so that any
+  number of threads run one state (`examples/embed/shared.c`):
+
+  ```c
+  MiniState *S = mini_new();              /* this thread holds the lock */
+  ...                                      /* other threads: */
+  mini_thread_attach(S);                  /* own Mini thread; waits for the lock */
+  mini_push_global(S, "work"); mini_call(S, 0);
+  mini_unlock(S); sleep(1); mini_lock(S); /* Py_BEGIN/END_ALLOW_THREADS */
+  mini_thread_detach(S);                  /* lets go of the lock */
+  ```
+
+  - **Shared**: the heap, globals, tables, functions and their code
+    (inline caches, quickened opcodes), the string table. **Per
+    thread**: each thread runs on a Mini thread of its own, as Lua's
+    `lua_newthread` gives (value and frame stacks, main coroutine, open
+    upvalues, the innermost run), and has its own API value stack,
+    native arguments and error message. The context holds the running
+    thread's part; when the lock changes hands, a `save` hook moves it
+    out and a `load` hook installs the next holder's
+    (`examples/mini/threads.lm`), as CPython swaps thread states. Vm
+    code reads its state through the context as always, so for a
+    handler a hand-over is a call that may collect (`uses gc`): `sync`
+    has published `ctx.fp`, and the compiler has rooted the state
+    variables' copies.
+  - **Hand-over at safepoints.** A thread that wants the lock takes a
+    ticket and waits; the holder polls `gil.waiting()`, a relaxed atomic
+    load of the waiting count, at every taken jump (loop back-edges
+    among them: JMP, TEST/TESTT, the compare-and-branch ops, FORLOOP,
+    NEXT, INEXT) and every call of a Lua function, and calls
+    `yield_now()`, which lets the waiters run first (first come, first
+    served) and takes the lock back. A Lua loop that never calls a
+    native or allocates still hands over (`spin()` in the test ends
+    only because another thread sets the flag it waits for). Natives
+    that block bracket the wait with `mini_unlock`/`mini_lock`.
+  - **Collections** run on the holder, which marks its own shadow stack
+    and the scanners' roots as always; the lock's scanner adds every
+    other attached thread's: the shadow-stack frames it had linked when
+    it let go (their top is saved then; the frames below the `unlock`
+    call do not change until it takes the lock back) and its saved
+    per-thread state (`scan` hook). So a thread stopped in a native two
+    runs deep keeps its registers, its frames' values and what it has
+    on its API stack (`stdlib/gc.md`, "Threads sharing a heap").
+  - **No atomics anywhere else.** Only the holder runs vm code or
+    touches the heap, and the hand-over is a mutex, which orders all of
+    one holder's writes before the next holder's reads. So `become`,
+    opcode rewrites, inline-cache updates, the write barrier and the
+    collector need nothing. ThreadSanitizer agrees
+    (`tests/golden.rs`, `mini_shared_tsan`).
+  - **Rules.** Every API call needs the lock. The thread that created
+    the state stays attached until `mini_free` (it may let go of the
+    lock); other threads detach outside any run. While a thread has let
+    go of the lock it must not call the API. A Lua coroutine runs on
+    whichever thread resumes it; resuming one that runs on another
+    thread (stopped at a hand-over) fails as resuming a running one
+    does. A read-modify-write such as `total = total + 1` has no
+    safepoint inside, so it is atomic; anything spanning a call or a
+    back-edge is not, as in Python.
+  - **Cost.** Without `--cfg gil` nothing changes (the IR of every
+    example is byte-identical). With it, single-threaded Mini runs
+    1.2-1.4% slower (geometric mean of the 14 benchmarks, best of 3
+    interleaved, `--align-functions=64`, two runs), the worst 4-5%
+    (`oo_methods`, `mandelbrot`, `closures`, `fib`: calls and tight
+    loops), from the poll's two loads and a branch; the hand-over
+    itself is a mutex and a condition variable.
+  - **Not built: free threading.** Threads running vm code in one heap at
+    the same time need atomic (or per-thread) inline caches and opcode
+    rewrites (`#[threads(shared_code)]` in the roadmap), a collector
+    that stops every mutator at safepoints (the polls are where), per
+    thread allocation buffers, and barriers for shared objects;
+    roadmap, open question 4.
 
   `examples/embed/threads.c` runs four Mini states on four threads at
   once (two under GC stress, nested runs through C natives, a caught

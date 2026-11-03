@@ -205,6 +205,40 @@ quickening on/off.
    per thread), code and inline caches shared between threads
    (`#[threads(shared_code)]`), and passing values between heaps without
    copying.
+
+   **Second step done (2026-11-03): several threads sharing one heap and
+   one interpreter state, GIL-style** (language.md §10.1, Threads;
+   stdlib/gc.md, "Threads sharing a heap"). `std.gil` is a lock per heap
+   (tickets under a pthread mutex, first come, first served); threads
+   attach and detach, let go of it around blocking code
+   (`unlock`/`lock`), and the holder polls `waiting()` (a relaxed atomic
+   load) at safepoints of the interpreter's choosing and calls
+   `yield_now()`. The interpreter's state keeps one copy of the
+   per-thread parts, the holder's; hooks move them out and in at each
+   hand-over (CPython's thread-state swap), so vm code is unchanged and,
+   for a handler, a hand-over is just a call that may collect. The
+   holder's collections walk the other threads' shadow stacks, saved
+   when they let go, and their saved states. Mini opts in with `--cfg
+   gil` (new: `--cfg`/`#[cfg]`, and pointer atomics): its own Mini
+   thread per OS thread, polls at every taken jump and Lua call; default
+   builds keep byte-identical IR, and the opt-in costs 1.2–1.4% geomean
+   single-threaded (worst 4–5%, call-heavy code). Under the lock nothing
+   else needs atomics: quickening, inline caches and the collector are
+   the holder's alone, and the mutex orders hand-overs (TSan-clean,
+   `mini_shared_tsan`). What remains is **free threading**: several
+   threads running vm code in one heap at once. That needs (1) inline
+   caches and `become` safe against concurrent readers: atomic word
+   stores where a cache fits one word, a seqlock or per-thread caches
+   otherwise (CPython 3.13t specializes only while one thread runs a
+   code object, and Mini's multi-word caches would need the same or
+   versioning); (2) a stop-the-world collector that brings every mutator
+   to a safepoint (the GIL polls are where) and then walks all shadow
+   stacks as now, or concurrent marking with a barrier; (3) per-thread
+   allocation buffers instead of the heap's shared free lists; (4)
+   atomic or locked updates of shared guest objects (tables), the hard
+   part for a dynamic language, which is why CPython took a decade; and
+   (5) a cheaper poll: polling only backward jumps (a pointer compare)
+   needs the verifier's token scan to ignore `#[cfg]`-dropped code.
 5. **`preserve_none` coverage.** Confirmed on x86-64 and AArch64 (LLVM 19+).
    AArch64 Linux is now run, not just compiled: `--target=aarch64-linux-gnu`
    builds pass the whole test suite under qemu user-mode (all dispatch

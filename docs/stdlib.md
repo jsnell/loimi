@@ -23,6 +23,7 @@ says so. Some modules are design only; their sections say so at the top.
 | `std.diag` | built | `std/diag.lm` |
 | `std.bc` | built (a library, no generated `Builder`) | `std/bc.lm` |
 | `std.gc` | built (mark-sweep, optional generational mode) | `std/gc.lm` |
+| `std.gil` | built (a global interpreter lock per heap) | `std/gil.lm` |
 | `std.obj` | built (no comptime `Model`) | `std/obj.lm` |
 | `std.rt` | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
 | `std.collections` (beyond `HashMap`) | **not built** | |
@@ -565,6 +566,12 @@ into. Not built:
   of a reference into an object. After a store through a raw pointer,
   call `gc.write_barrier(&heap, obj)`; `gc.needs_barrier(obj)` and
   `gc.remember(obj)` log several objects at once.
+
+- Threads sharing a heap, one at a time: `std.gil` (`gil.Gil.new(&heap,
+  data)`, `attach`, `detach`, `unlock`/`lock`, the poll `waiting()` and
+  `yield_now()`, hooks that move per-thread interpreter state); see
+  [`stdlib/gc.md`](stdlib/gc.md#threads-sharing-a-heap-stdgil).
+  `gc.mark_shadow_stack(h, top)` marks another thread's saved roots.
 
 Every object has a 16-byte header (slot size, type id, mark bits, and
 the trailing-array length, which compiled code reads at object - 8), so
