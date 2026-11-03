@@ -7,4 +7,4 @@ vm V {
     entry run(c: *u32) -> i64 { pc = c; jump pc }
 }
 fn main() {}
-// error: cache fields must be integers, floats, `bool`, pointers or function pointers
+// error: cache fields must be integers, floats, `bool`, pointers, function pointers or the vm's `Resume`
