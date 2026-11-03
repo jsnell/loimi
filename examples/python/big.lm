@@ -1,0 +1,567 @@
+// Arbitrary-precision integers: sign and magnitude, 32-bit limbs.
+// Values that fit an i32 are always `Int`; the rest are boxes of kind
+// K_BIG with `s` the sign (1 or -1) and `big` the magnitude.
+import std.gc;
+import std.mem;
+import std.text;
+import value;
+import value.{Value, Box, Limbs, K_BIG};
+
+type Mag = mem.Vec<u32>;
+
+/// A signed number being computed on: sign (-1, 0 handled as empty mag) and magnitude.
+struct Num { neg: bool, m: Mag }
+
+fn trim(m: *Mag) {
+    while m.len > 0 and m.at(m.len - 1) == 0 { m.len -= 1; }
+}
+
+fn mag_from_u64(x: u64) -> Mag {
+    var m: Mag = mem.Vec.new();
+    var v = x;
+    while v != 0 { m.push((v & 0xffffffff) as u32); v = v >> 32; }
+    m
+}
+
+fn num_of(v: Value) -> Num {
+    match v {
+        Int(i) => {
+            let x = i as i64;
+            Num { neg: x < 0, m: mag_from_u64(if x < 0 { (0 - x) as u64 } else { x as u64 }) }
+        }
+        Bool(b) => Num { neg: false, m: mag_from_u64(if b { 1 } else { 0 }) },
+        Obj(b) => {
+            var m: Mag = mem.Vec.new();
+            let l = b.big.unwrap();
+            for i in 0..l.d.len { m.push(l.d[i]); }
+            Num { neg: b.s < 0, m: m }
+        }
+        _ => Num { neg: false, m: mem.Vec.new() },
+    }
+}
+
+/// Normalize to a Value (Int when it fits) and free the magnitude.
+fn finish(h: *gc.Heap, n: Num) -> Value {
+    var m = n.m;
+    trim(&m);
+    if m.len == 0 { m.free(); return Value.Int(0); }
+    if m.len <= 2 {
+        let lo = m.at(0) as u64;
+        let hi = if m.len == 2 { m.at(1) as u64 } else { 0 };
+        let mag = lo | (hi << 32);
+        if !n.neg and mag <= 2147483647 { m.free(); return Value.Int(mag as i32); }
+        if n.neg and mag <= 2147483648 { m.free(); return Value.Int((0 - (mag as i64)) as i32); }
+    }
+    let l = new(h, Limbs {}, m.len);
+    for i in 0..m.len { l.d[i] = m.at(i); }
+    let b = value.new_box(h, K_BIG, 0);
+    b.s = if n.neg { -1 } else { 1 };
+    b.big = Some(l);
+    m.free();
+    Value.Obj(b)
+}
+
+pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Box> {
+    let neg = x < 0;
+    let mag = if neg { (0 -% x) as u64 } else { x as u64 };
+    let m = mag_from_u64(mag);
+    let l = new(h, Limbs {}, m.len);
+    for i in 0..m.len { l.d[i] = m.at(i); }
+    var mm = m;
+    mm.free();
+    let b = value.new_box(h, K_BIG, 0);
+    b.s = if neg { -1 } else { 1 };
+    b.big = Some(l);
+    b
+}
+
+pub fn to_i64(b: Gc<Box>) -> ?i64 {
+    let l = b.big.unwrap();
+    if l.d.len > 2 { return None; }
+    let lo = l.d[0] as u64;
+    let hi = if l.d.len == 2 { l.d[1] as u64 } else { 0 };
+    let mag = lo | (hi << 32);
+    if b.s > 0 {
+        if mag > 9223372036854775807 { return None; }
+        return Some(mag as i64);
+    }
+    if mag > 9223372036854775808 { return None; }
+    Some(0 -% (mag as i64))
+}
+
+pub fn to_f64(b: Gc<Box>) -> f64 {
+    let l = b.big.unwrap();
+    var r: f64 = 0.0;
+    var i = l.d.len;
+    while i > 0 { i -= 1; r = r * 4294967296.0 + (l.d[i] as f64); }
+    if b.s < 0 { 0.0 - r } else { r }
+}
+
+/// An int from a float (truncating), or None for inf/nan.
+pub fn from_f64(h: *gc.Heap, f: f64) -> ?Value {
+    if f != f or f == 1.0 / 0.0 or f == -1.0 / 0.0 { return None; }
+    let t = f.trunc();
+    if t >= -9.0e18 and t <= 9.0e18 { return Some(value.int_val(h, t as i64)); }
+    var x = if t < 0.0 { 0.0 - t } else { t };
+    var exp: u64 = 0;
+    while x >= 9.0e18 { x = x / 2.0; exp += 1; }
+    let n = Num { neg: t < 0.0, m: mag_from_u64(x as u64) };
+    let r = mag_shl(&n.m, exp);
+    var nm = n.m;
+    nm.free();
+    Some(finish(h, Num { neg: n.neg, m: r }))
+}
+
+fn mag_cmp(a: *Mag, b: *Mag) -> i32 {
+    if a.len != b.len { return if a.len < b.len { -1 } else { 1 }; }
+    var i = a.len;
+    while i > 0 {
+        i -= 1;
+        let x = a.at(i);
+        let y = b.at(i);
+        if x != y { return if x < y { -1 } else { 1 }; }
+    }
+    0
+}
+
+fn mag_add(a: *Mag, b: *Mag) -> Mag {
+    var r: Mag = mem.Vec.with_capacity(a.len + 1);
+    let n = if a.len > b.len { a.len } else { b.len };
+    var carry: u64 = 0;
+    for i in 0..n {
+        let x = if i < a.len { a.at(i) as u64 } else { 0 };
+        let y = if i < b.len { b.at(i) as u64 } else { 0 };
+        let s = x + y + carry;
+        r.push((s & 0xffffffff) as u32);
+        carry = s >> 32;
+    }
+    if carry != 0 { r.push(carry as u32); }
+    r
+}
+
+/// a - b with |a| >= |b|.
+fn mag_sub(a: *Mag, b: *Mag) -> Mag {
+    var r: Mag = mem.Vec.with_capacity(a.len);
+    var borrow: i64 = 0;
+    for i in 0..a.len {
+        let x = a.at(i) as i64;
+        let y = if i < b.len { b.at(i) as i64 } else { 0 };
+        var d = x - y - borrow;
+        if d < 0 { d += 4294967296; borrow = 1; } else { borrow = 0; }
+        r.push(d as u32);
+    }
+    trim(&r);
+    r
+}
+
+fn mag_mul(a: *Mag, b: *Mag) -> Mag {
+    var r: Mag = mem.Vec.with_capacity(a.len + b.len);
+    for _i in 0..a.len + b.len { r.push(0); }
+    for i in 0..a.len {
+        var carry: u64 = 0;
+        let x = a.at(i) as u64;
+        if x == 0 { continue; }
+        for j in 0..b.len {
+            let t = x * (b.at(j) as u64) + (r.at(i + j) as u64) + carry;
+            r.set(i + j, (t & 0xffffffff) as u32);
+            carry = t >> 32;
+        }
+        var k = i + b.len;
+        while carry != 0 {
+            let t = (r.at(k) as u64) + carry;
+            r.set(k, (t & 0xffffffff) as u32);
+            carry = t >> 32;
+            k += 1;
+        }
+    }
+    trim(&r);
+    r
+}
+
+fn mag_shl(a: *Mag, n: u64) -> Mag {
+    let limbs = n / 32;
+    let bits = n % 32;
+    var r: Mag = mem.Vec.with_capacity(a.len + limbs + 1);
+    for _i in 0..limbs { r.push(0); }
+    var carry: u64 = 0;
+    for i in 0..a.len {
+        let x = ((a.at(i) as u64) << bits) | carry;
+        r.push((x & 0xffffffff) as u32);
+        carry = x >> 32;
+    }
+    if carry != 0 { r.push(carry as u32); }
+    trim(&r);
+    r
+}
+
+fn mag_shr(a: *Mag, n: u64) -> Mag {
+    let limbs = n / 32;
+    let bits = n % 32;
+    var r: Mag = mem.Vec.new();
+    if limbs >= a.len { return r; }
+    for i in limbs..a.len {
+        var x = (a.at(i) as u64) >> bits;
+        if bits != 0 and i + 1 < a.len { x = x | (((a.at(i + 1) as u64) << (32 - bits)) & 0xffffffff); }
+        r.push(x as u32);
+    }
+    trim(&r);
+    r
+}
+
+/// Divide by a small divisor in place; returns the remainder.
+fn mag_divsmall(a: *Mag, d: u32) -> u32 {
+    var rem: u64 = 0;
+    var i = a.len;
+    while i > 0 {
+        i -= 1;
+        let cur = (rem << 32) | (a.at(i) as u64);
+        a.set(i, (cur / (d as u64)) as u32);
+        rem = cur % (d as u64);
+    }
+    trim(a);
+    rem as u32
+}
+
+/// Knuth's algorithm D: (quotient, remainder) of magnitudes, b nonzero.
+fn mag_divmod(a: *Mag, b: *Mag) -> (Mag, Mag) {
+    if mag_cmp(a, b) < 0 {
+        var r: Mag = mem.Vec.new();
+        for i in 0..a.len { r.push(a.at(i)); }
+        return (mem.Vec.new(), r);
+    }
+    if b.len == 1 {
+        var q: Mag = mem.Vec.new();
+        for i in 0..a.len { q.push(a.at(i)); }
+        let rem = mag_divsmall(&q, b.at(0));
+        return (q, mag_from_u64(rem as u64));
+    }
+    // Normalize so the top limb of b has its high bit set.
+    let s = b.at(b.len - 1).clz() as u64;
+    var bn = mag_shl(b, s);
+    var an = mag_shl(a, s);
+    if an.len == a.len { an.push(0); }
+    while an.len < a.len + 1 { an.push(0); }
+    let n = bn.len;
+    let m = an.len - n;
+    var q: Mag = mem.Vec.with_capacity(m);
+    for _i in 0..m { q.push(0); }
+    let btop = bn.at(n - 1) as u64;
+    let bsec = bn.at(n - 2) as u64;
+    var j = m;
+    while j > 0 {
+        j -= 1;
+        let num = ((an.at(j + n) as u64) << 32) | (an.at(j + n - 1) as u64);
+        var qhat = num / btop;
+        var rhat = num % btop;
+        while qhat >= 4294967296 or qhat * bsec > ((rhat << 32) | (an.at(j + n - 2) as u64)) {
+            qhat -= 1;
+            rhat += btop;
+            if rhat >= 4294967296 { break; }
+        }
+        // Multiply and subtract.
+        var borrow: i64 = 0;
+        var carry: u64 = 0;
+        for i in 0..n {
+            let p = qhat * (bn.at(i) as u64) + carry;
+            carry = p >> 32;
+            let t = (an.at(i + j) as i64) - borrow - ((p & 0xffffffff) as i64);
+            if t < 0 { an.set(i + j, (t + 4294967296) as u32); borrow = 1; } else { an.set(i + j, t as u32); borrow = 0; }
+        }
+        let t = (an.at(j + n) as i64) - borrow - (carry as i64);
+        if t < 0 {
+            an.set(j + n, (t + 4294967296) as u32);
+            // Add back.
+            qhat -= 1;
+            var c: u64 = 0;
+            for i in 0..n {
+                let s2 = (an.at(i + j) as u64) + (bn.at(i) as u64) + c;
+                an.set(i + j, (s2 & 0xffffffff) as u32);
+                c = s2 >> 32;
+            }
+            an.set(j + n, ((an.at(j + n) as u64 + c) & 0xffffffff) as u32);
+        } else {
+            an.set(j + n, t as u32);
+        }
+        q.set(j, qhat as u32);
+    }
+    trim(&q);
+    an.len = n;
+    trim(&an);
+    let r = mag_shr(&an, s);
+    an.free();
+    bn.free();
+    (q, r)
+}
+
+fn free_num(n: *Num) { n.m.free(); }
+
+fn add_signed(a: Num, b: Num) -> Num {
+    var x = a;
+    var y = b;
+    if x.neg == y.neg {
+        let r = mag_add(&x.m, &y.m);
+        return Num { neg: x.neg, m: r };
+    }
+    let c = mag_cmp(&x.m, &y.m);
+    if c == 0 { return Num { neg: false, m: mem.Vec.new() }; }
+    if c > 0 { return Num { neg: x.neg, m: mag_sub(&x.m, &y.m) }; }
+    Num { neg: y.neg, m: mag_sub(&y.m, &x.m) }
+}
+
+pub fn add(h: *gc.Heap, a: Value, b: Value) -> Value {
+    var x = num_of(a);
+    var y = num_of(b);
+    let r = add_signed(x, y);
+    free_num(&x); free_num(&y);
+    finish(h, r)
+}
+
+pub fn sub(h: *gc.Heap, a: Value, b: Value) -> Value {
+    var x = num_of(a);
+    var y = num_of(b);
+    y.neg = !y.neg;
+    let r = add_signed(x, y);
+    free_num(&x); free_num(&y);
+    finish(h, r)
+}
+
+pub fn mul(h: *gc.Heap, a: Value, b: Value) -> Value {
+    var x = num_of(a);
+    var y = num_of(b);
+    let r = mag_mul(&x.m, &y.m);
+    let neg = x.neg != y.neg;
+    free_num(&x); free_num(&y);
+    finish(h, Num { neg: neg, m: r })
+}
+
+pub fn neg(h: *gc.Heap, a: Value) -> Value {
+    var x = num_of(a);
+    x.neg = !x.neg;
+    finish(h, x)
+}
+
+pub fn abs(h: *gc.Heap, a: Value) -> Value {
+    var x = num_of(a);
+    x.neg = false;
+    finish(h, x)
+}
+
+/// Floor division and modulo; None on division by zero.
+pub fn divmod(h: *gc.Heap, a: Value, b: Value) -> ?(Value, Value) {
+    var x = num_of(a);
+    var y = num_of(b);
+    trim(&y.m);
+    if y.m.len == 0 { free_num(&x); free_num(&y); return None; }
+    trim(&x.m);
+    let (q0, r0) = mag_divmod(&x.m, &y.m);
+    var q = q0;
+    var r = r0;
+    var qneg = x.neg != y.neg;
+    var rneg = x.neg;
+    if qneg and r.len > 0 {
+        // floor: q = q + 1, r = |b| - r (sign of b)
+        var one = mag_from_u64(1);
+        let q2 = mag_add(&q, &one);
+        one.free();
+        q.free();
+        q = q2;
+        let r2 = mag_sub(&y.m, &r);
+        r.free();
+        r = r2;
+        rneg = y.neg;
+    }
+    if r.len == 0 { rneg = false; }
+    if q.len == 0 { qneg = false; }
+    free_num(&x); free_num(&y);
+    Some((finish(h, Num { neg: qneg, m: q }), finish(h, Num { neg: rneg, m: r })))
+}
+
+pub fn shl(h: *gc.Heap, a: Value, n: u64) -> Value {
+    var x = num_of(a);
+    let r = mag_shl(&x.m, n);
+    let ng = x.neg;
+    free_num(&x);
+    finish(h, Num { neg: ng, m: r })
+}
+
+pub fn shr(h: *gc.Heap, a: Value, n: u64) -> Value {
+    var x = num_of(a);
+    if !x.neg {
+        let r = mag_shr(&x.m, n);
+        free_num(&x);
+        return finish(h, Num { neg: false, m: r });
+    }
+    // floor(-m / 2^n) = -((m - 1) >> n) - 1
+    var one = mag_from_u64(1);
+    var m1 = mag_sub(&x.m, &one);
+    var r = mag_shr(&m1, n);
+    let r2 = mag_add(&r, &one);
+    one.free(); m1.free(); r.free();
+    free_num(&x);
+    finish(h, Num { neg: true, m: r2 })
+}
+
+/// Two's complement words (little-endian), `len` limbs.
+fn twos(n: *Num, len: u64) -> Mag {
+    var r: Mag = mem.Vec.with_capacity(len);
+    for i in 0..len { r.push(if i < n.m.len { n.m.at(i) } else { 0 }); }
+    if n.neg {
+        var carry: u64 = 1;
+        for i in 0..len {
+            let t = ((!r.at(i)) as u64) + carry;
+            r.set(i, (t & 0xffffffff) as u32);
+            carry = t >> 32;
+        }
+    }
+    r
+}
+
+/// op: 0 and, 1 or, 2 xor.
+pub fn bitop(h: *gc.Heap, a: Value, b: Value, op: u32) -> Value {
+    var x = num_of(a);
+    var y = num_of(b);
+    let len = (if x.m.len > y.m.len { x.m.len } else { y.m.len }) + 1;
+    var tx = twos(&x, len);
+    var ty = twos(&y, len);
+    var r: Mag = mem.Vec.with_capacity(len);
+    for i in 0..len {
+        let p = tx.at(i);
+        let q = ty.at(i);
+        r.push(if op == 0 { p & q } else if op == 1 { p | q } else { p ^ q });
+    }
+    let neg = (r.at(len - 1) >> 31) != 0;
+    if neg {
+        var carry: u64 = 1;
+        for i in 0..len {
+            let t = ((!r.at(i)) as u64) + carry;
+            r.set(i, (t & 0xffffffff) as u32);
+            carry = t >> 32;
+        }
+    }
+    tx.free(); ty.free();
+    free_num(&x); free_num(&y);
+    finish(h, Num { neg: neg, m: r })
+}
+
+pub fn cmp(a: Value, b: Value) -> i32 {
+    var x = num_of(a);
+    var y = num_of(b);
+    trim(&x.m); trim(&y.m);
+    var r: i32 = 0;
+    if x.m.len == 0 { x.neg = false; }
+    if y.m.len == 0 { y.neg = false; }
+    if x.neg != y.neg {
+        r = if x.neg { -1 } else { 1 };
+    } else {
+        let c = mag_cmp(&x.m, &y.m);
+        r = if x.neg { 0 - c } else { c };
+    }
+    free_num(&x); free_num(&y);
+    r
+}
+
+pub fn cmp_box(a: Gc<Box>, b: Gc<Box>) -> i32 { cmp(Value.Obj(a), Value.Obj(b)) }
+
+pub fn is_neg(v: Value) -> bool {
+    match v {
+        Int(i) => i < 0,
+        Obj(b) => b.s < 0,
+        _ => false,
+    }
+}
+
+pub fn is_odd(v: Value) -> bool {
+    match v {
+        Int(i) => (i & 1) != 0,
+        Obj(b) => (b.big.unwrap().d[0] & 1) != 0,
+        _ => false,
+    }
+}
+
+/// Decimal digits.
+pub fn write(b: *text.StrBuf, v: Value) {
+    if let Int(i) = v { b.push_int(i as i64); return; }
+    var x = num_of(v);
+    trim(&x.m);
+    if x.m.len == 0 { b.push('0'); free_num(&x); return; }
+    var chunks: mem.Vec<u32> = mem.Vec.new();
+    while x.m.len > 0 { chunks.push(mag_divsmall(&x.m, 1000000000)); }
+    if x.neg { b.push('-'); }
+    var i = chunks.len;
+    var first = true;
+    while i > 0 {
+        i -= 1;
+        let c = chunks.at(i);
+        if first { b.push_int(c as i64); first = false; }
+        else {
+            var buf: [u8; 9] = [0; 9];
+            var cc = c;
+            var k: u64 = 9;
+            while k > 0 { k -= 1; buf[k] = '0' + (cc % 10) as u8; cc = cc / 10; }
+            b.push_str(buf[0..9]);
+        }
+    }
+    chunks.free();
+    free_num(&x);
+}
+
+/// Parse digits in `radix` (no sign, no prefix, underscores skipped).
+pub fn parse(h: *gc.Heap, s: str, radix: u32, negative: bool) -> ?Value {
+    var m: Mag = mem.Vec.new();
+    var any = false;
+    for i in 0..s.len {
+        let c = s[i];
+        if c == '_' { continue; }
+        var d: u32 = 99;
+        if c >= '0' and c <= '9' { d = (c - '0') as u32; }
+        else if c >= 'a' and c <= 'z' { d = (c - 'a') as u32 + 10; }
+        else if c >= 'A' and c <= 'Z' { d = (c - 'A') as u32 + 10; }
+        if d >= radix { m.free(); return None; }
+        any = true;
+        // m = m * radix + d
+        var carry = d as u64;
+        for j in 0..m.len {
+            let t = (m.at(j) as u64) * (radix as u64) + carry;
+            m.set(j, (t & 0xffffffff) as u32);
+            carry = t >> 32;
+        }
+        if carry != 0 { m.push(carry as u32); }
+    }
+    if !any { m.free(); return None; }
+    Some(finish(h, Num { neg: negative, m: m }))
+}
+
+/// a ** e for e >= 0.
+pub fn pow(h: *gc.Heap, a: Value, e: u64) -> Value {
+    var base = num_of(a);
+    var result = Num { neg: false, m: mag_from_u64(1) };
+    var n = e;
+    while n > 0 {
+        if (n & 1) != 0 {
+            let r = mag_mul(&result.m, &base.m);
+            result.m.free();
+            result.m = r;
+            result.neg = result.neg != base.neg;
+        }
+        n = n >> 1;
+        if n > 0 {
+            let sq = mag_mul(&base.m, &base.m);
+            base.m.free();
+            base.m = sq;
+            base.neg = false;
+        }
+    }
+    free_num(&base);
+    finish(h, result)
+}
+
+/// Number of bits of |v|.
+pub fn bit_length(v: Value) -> u64 {
+    var x = num_of(v);
+    trim(&x.m);
+    if x.m.len == 0 { free_num(&x); return 0; }
+    let top = x.m.at(x.m.len - 1);
+    let r = (x.m.len - 1) * 32 + (32 - top.clz() as u64);
+    free_num(&x);
+    r
+}

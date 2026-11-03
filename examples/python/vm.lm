@@ -1,0 +1,1087 @@
+// The bytecode vm of the Python subset: a register machine with
+// Lua-style register windows, frames in a host array, exceptions through
+// `on raise` and per-prototype handler tables, and generators as frames
+// whose registers are saved in the generator object between resumes.
+import std.gc;
+import std.mem;
+import std.text;
+import std.map;
+import value;
+import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box,
+              K_CLASS, K_BOUND, K_RANGEIT, K_SEQIT, K_GEN, K_CELL, GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
+import ops;
+import builtins;
+
+/// A handler table entry: words [start, end) are protected; an exception
+/// raised there is stored in `reg` and execution continues at `target`.
+pub struct Handler { start: u32, end: u32, target: u32, reg: u32 }
+
+pub const P_VARARGS: u32 = 1;
+pub const P_VARKW: u32 = 2;
+pub const P_GEN: u32 = 4;
+
+pub struct Proto {
+    name: str,
+    nparams: u32,
+    nkwonly: u32,
+    flags: u32,
+    nregs: u32,
+    /// nparams when a call with exactly that many positional arguments
+    /// needs no argument processing, else u32 max.
+    simple: u32,
+    /// Names of the parameters, in register order (Str values).
+    pnames: []Value,
+    /// For each free variable of a function created from this prototype:
+    /// where MAKEFUNC finds the cell: bit 31 set: the creator's free
+    /// variable number; clear: the creator's register holding the cell.
+    freesrc: []u32,
+    words: []u32,
+    code: Verified<Py>,
+    consts: []Value,
+    lines: []u32,
+    handlers: []Handler,
+    /// Index of the first default value's parameter.
+    ndefaults: u32,
+}
+
+pub const F_DISCARD: u64 = 1;
+pub const F_GEN: u64 = 2;
+/// The bottom frame of a nested run (RET and an uncaught raise exit it).
+pub const F_BASE: u64 = 4;
+
+pub struct Frame {
+    func: Value,
+    gen: Value,
+    base: *Value,
+    k: *Value,
+    proto: *Proto,
+    ret_pc: *u32,
+    ret_slot: *Value,
+    alt_pc: *u32,
+    flags: u64,
+}
+
+pub const NTYPES: u64 = 24;
+// Builtin type codes: index into Ctx.types.
+pub const T_NONE: u64 = 0;
+pub const T_BOOL: u64 = 1;
+pub const T_INT: u64 = 2;
+pub const T_FLOAT: u64 = 3;
+pub const T_STR: u64 = 4;
+pub const T_LIST: u64 = 5;
+pub const T_TUPLE: u64 = 6;
+pub const T_DICT: u64 = 7;
+pub const T_SET: u64 = 8;
+pub const T_FUNC: u64 = 9;
+pub const T_BUILTIN: u64 = 10;
+pub const T_TYPE: u64 = 11;
+pub const T_RANGE: u64 = 12;
+pub const T_GEN: u64 = 13;
+pub const T_METHOD: u64 = 14;
+pub const T_MODULE: u64 = 15;
+pub const T_OBJECT: u64 = 16;
+pub const T_ITER: u64 = 17;
+pub const T_FROZENSET: u64 = 18;
+pub const T_SLICE: u64 = 19;
+pub const T_PROPERTY: u64 = 20;
+pub const T_SUPER: u64 = 21;
+pub const T_CELL: u64 = 22;
+pub const T_NOTIMPL: u64 = 23;
+
+pub struct Ctx {
+    heap: gc.Heap,
+    stack: *Value,
+    stack_end: *Value,
+    /// Every stack slot below `hw` may hold a value and is scanned.
+    hw: *Value,
+    frames: *Frame,
+    frames_end: *Frame,
+    fp: *Frame,
+    protos: mem.Vec<*Proto>,
+    globals: ?Gc<Dict>,
+    builtins: ?Gc<Dict>,
+    modules: ?Gc<Dict>,
+    types: [?Gc<Box>; 24],
+    /// Exception classes by builtins.E_* number.
+    excs: [?Gc<Box>; 32],
+    strs: map.HashMap<str, Gc<Str>>,
+    names: mem.Arena,
+    /// Bumped whenever a class dict changes (method caches check it).
+    epoch: u32,
+    next_cls: u32,
+    gen_done: bool,
+    err_line: u32,
+    buf: text.StrBuf,
+    /// Interned names the runtime looks up.
+    n_init: ?Gc<Str>,
+    n_str: Value,
+    n_repr: Value,
+    rand_state: u64,
+    vm_depth: u64,
+}
+
+/// Interned string for a name (kept alive for the run).
+pub fn intern(c: *Ctx, s: str) -> Gc<Str> {
+    if let Some(x) = c.strs.get(s) { return x; }
+    let k = c.names.str(s);
+    let o = value.new_str(&c.heap, k);
+    value.str_hash(o);
+    c.strs.insert(k, o);
+    o
+}
+
+pub fn scan_roots(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.stack;
+    while p < c.hw { gc_mark(h, *p); p = p + 1; }
+    var f = c.frames;
+    while f <= c.fp {
+        gc_mark(h, f.func);
+        gc_mark(h, f.gen);
+        f = f + 1;
+    }
+    for i in 0..c.protos.len {
+        let pr = c.protos.at(i);
+        for j in 0..pr.consts.len { gc_mark(h, pr.consts[j]); }
+        for j in 0..pr.pnames.len { gc_mark(h, pr.pnames[j]); }
+    }
+    gc_mark(h, c.globals);
+    gc_mark(h, c.builtins);
+    gc_mark(h, c.modules);
+    for i in 0..NTYPES { gc_mark(h, c.types[i]); }
+    for i in 0..32 { gc_mark(h, c.excs[i]); }
+    var it: u64 = 0;
+    while let Some(s) = c.strs.next(&it) { gc_mark(h, s.value); }
+    gc_mark(h, c.n_init);
+    gc_mark(h, c.n_str);
+    gc_mark(h, c.n_repr);
+}
+
+pub fn line_of(p: *Proto, pc: *u32) -> u32 {
+    let off = ((pc as u64) - (p.code.start() as u64)) / 4;
+    if off < p.lines.len { p.lines[off] } else { 0 }
+}
+
+pub vm Py {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
+
+    verify_context proto: *Proto;
+    operand reg = regs[it] verify (it as u32) < proto.nregs display "r{}";
+    operand kst = k[it] verify it < proto.consts.len display "k{}";
+    operand imm = it;
+    operand simm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    /// Argument counts: R[base+1 .. base+n] must be in the frame.
+    operand nargs = it verify Py.ABC_a(*pc) + it < proto.nregs as u64;
+    /// MAKEFUNC's prototype index.
+    operand pidx = it verify it < ctx_protos_len();
+
+    encoding fixed(u32) {
+        format ABC  { op: 8, a: 8, b: 8, c: 8 }
+        format ABx  { op: 8, a: 8, bx: 16 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ   { op: 8, sj: s24 }
+    }
+
+    cache GlobalIC { idx: u32, ver: u32, builtin: u32 }
+    cache AttrIC { idx: u32 }
+    cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32 }
+
+    sync { ctx.fp = fp; }
+    reload { fp = ctx.fp; regs = fp.base; k = fp.k; }
+
+    // ── frames ──────────────────────────────────────────────────────
+
+    /// Make sure the stack is scanned up to `top`.
+    fn ensure(top: *Value) {
+        if top > ctx.hw {
+            cold {
+                if top > ctx.stack_end { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                ctx.hw = top;
+            }
+        }
+    }
+
+    /// Push a frame for `f` whose arguments are in place at `win`, and run it.
+    fn push_frame(f: Gc<Func>, win: *Value, slot: *Value, flags: u64) -> never {
+        let p = f.proto;
+        ensure(win + p.nregs as u64);
+        if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+        let nf = fp + 1;
+        nf.func = Func(f);
+        nf.gen = Nil;
+        nf.base = win;
+        nf.k = p.consts.ptr;
+        nf.proto = p;
+        nf.ret_pc = next_pc;
+        nf.ret_slot = slot;
+        nf.flags = flags;
+        fp = nf;
+        regs = win;
+        k = nf.k;
+        jump p.code
+    }
+
+    /// Call R[b] with the `n` arguments at R[win..]; the result goes to R[b].
+    /// `kw` is Nil or a tuple naming the last arguments.
+    fn call_slow(b: u64, win: u64, n: u64, kw: Value) -> never {
+        var callee = regs[b];
+        var w = win;
+        var nn = n;
+        var flags: u64 = 0;
+        loop {
+            match callee {
+                Func(f) => {
+                    let p = f.proto;
+                    if p.simple == nn as u32 and kw == Nil { push_frame(f, regs + w, regs + b, flags) }
+                    ensure(regs + w + p.nregs as u64 + 1);
+                    ops.bind_args(ctx, f, regs + w, nn, kw)?;
+                    if (p.flags & P_GEN) != 0 {
+                        let g = ops.make_gen(ctx, f, regs + w);
+                        if (flags & F_DISCARD) == 0 { regs[b] = g; }
+                        next
+                    }
+                    push_frame(f, regs + w, regs + b, flags)
+                }
+                Builtin(id) => {
+                    let r = builtins.call(ctx, id, regs + w, nn, kw)?;
+                    if (flags & F_DISCARD) == 0 { regs[b] = r; }
+                    next
+                }
+                Obj(o) => {
+                    if o.kind == K_BOUND {
+                        ensure(regs + w + nn + 2);
+                        var i = nn;
+                        while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
+                        regs[w] = o.a;
+                        nn += 1;
+                        callee = o.b;
+                        continue;
+                    }
+                    if o.kind == K_CLASS {
+                        if o.n != 0 {
+                            regs[b] = builtins.construct(ctx, o, regs + w, nn, kw)?;
+                            next
+                        }
+                        let inst = ops.new_instance(ctx, o);
+                        regs[b] = inst;
+                        let init = ops.class_lookup(o, ctx.n_init.unwrap());
+                        let Some(iv) = init else {
+                            if nn > 0 or kw != Nil { raise ops.type_error(ctx, "takes no arguments", inst) }
+                            next
+                        };
+                        ensure(regs + w + nn + 2);
+                        var i = nn;
+                        while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
+                        regs[w] = inst;
+                        nn += 1;
+                        callee = iv;
+                        flags = F_DISCARD;
+                        continue;
+                    }
+                    raise ops.not_callable(ctx, callee)
+                }
+                Inst(o) => {
+                    let Some(m) = ops.class_lookup(o.cls, intern(ctx, "__call__")) else { raise ops.not_callable(ctx, callee) };
+                    ensure(regs + w + nn + 2);
+                    var i = nn;
+                    while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
+                    regs[w] = callee;
+                    nn += 1;
+                    callee = m;
+                    continue;
+                }
+                _ => raise ops.not_callable(ctx, callee),
+            }
+        }
+    }
+
+    /// Return `v` from the current frame.
+    fn ret(v: Value) -> never {
+        if fp.flags == 0 {
+            *fp.ret_slot = v;
+            let r = fp.ret_pc;
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+            jump r
+        }
+        cold {
+            let fl = fp.flags;
+            if (fl & F_GEN) != 0 {
+                if let Obj(g) = fp.gen { g.m = GEN_DONE; }
+                if (fl & F_BASE) != 0 { ctx.gen_done = true; exit Ok(v) }
+                let r = fp.alt_pc;
+                fp = fp - 1;
+                regs = fp.base;
+                k = fp.k;
+                jump r
+            }
+            if (fl & F_BASE) != 0 { exit Ok(v) }
+            if (fl & F_DISCARD) == 0 { *fp.ret_slot = v; }
+            let r = fp.ret_pc;
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+            jump r
+        }
+    }
+
+    /// Resume generator `g`: on yield the value goes to `slot` and
+    /// execution continues at `next_pc`; when it finishes, at `alt`.
+    fn resume(g: Gc<Box>, slot: *Value, alt: *u32) -> never {
+        if g.m == GEN_DONE { jump alt }
+        if g.m == GEN_RUNNING { raise ops.exc(ctx, builtins.E_VALUE, "generator already executing") }
+        let Func(f) = g.a else { trap() };
+        let p = f.proto;
+        let win = regs + fp.proto.nregs as u64;
+        ensure(win + p.nregs as u64);
+        if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+        for i in 0..p.nregs as u64 { win[i] = g.extra[i]; }
+        if g.m == GEN_SUSPENDED { win[g.s as u64] = Nil; }
+        g.m = GEN_RUNNING;
+        let nf = fp + 1;
+        nf.func = g.a;
+        nf.gen = Obj(g);
+        nf.base = win;
+        nf.k = p.consts.ptr;
+        nf.proto = p;
+        nf.ret_pc = next_pc;
+        nf.ret_slot = slot;
+        nf.alt_pc = alt;
+        nf.flags = F_GEN;
+        fp = nf;
+        regs = win;
+        k = nf.k;
+        jump (p.code.start() + g.n as u64)
+    }
+
+    fn gc_point() {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+    }
+
+    // ── moves and constants ─────────────────────────────────────────
+
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op LOADK(dst: reg, c: kst) : ABx { dst = c; next }
+    op LOADI(dst: reg, v: simm) : AsBx { dst = Int(v as i32); next }
+    op LOADNIL(dst: reg) : ABC { dst = Nil; next }
+    op LOADBOOL(dst: reg, v: imm) : ABC { dst = Bool(v != 0); next }
+
+    family GETGLOBAL(dst: reg, name: kst) : ABx + GlobalIC {
+        generic {
+            let Str(s) = name else { trap() };
+            dst = ops.get_global(ctx, fp.func, s, &cache.idx, &cache.ver, &cache.builtin)?;
+            if cache.builtin != 0 { become GETGLOBAL_B; next }
+            become GETGLOBAL_C;
+            next
+        }
+        GETGLOBAL_C {
+            let Func(f) = fp.func else { trap() };
+            let d = f.globals;
+            let i = cache.idx as u64;
+            if likely(i < d.used) {
+                let e = d.ent.items.ptr + 2 * i;
+                if *e == name { dst = *(e + 1); next }
+            }
+            cold { become GETGLOBAL; redo }
+        }
+        GETGLOBAL_B {
+            let Func(f) = fp.func else { trap() };
+            let d = f.globals;
+            if (d.keyver as u32) == cache.ver {
+                let bd = ctx.builtins.unwrap();
+                dst = *(bd.ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                next
+            }
+            cold { become GETGLOBAL; redo }
+        }
+    }
+    op SETGLOBAL(src: reg, name: kst) : ABx {
+        let Str(s) = name else { trap() };
+        let Func(f) = fp.func else { trap() };
+        value.dict_set_str(&ctx.heap, f.globals, s, src);
+        next
+    }
+    op DELGLOBAL(name: kst) : ABx {
+        let Func(f) = fp.func else { trap() };
+        if !value.dict_del(f.globals, name, value.hash_of(name).unwrap()) {
+            raise ops.name_error(ctx, name)
+        }
+        next
+    }
+    /// Class bodies: names live in the namespace dict R[ns].
+    op LOADNAME(dst: reg, ns: reg, name: kst) : ABC {
+        let Str(s) = name else { trap() };
+        let Dict(d) = ns else { trap() };
+        if let Some(v) = value.dict_get_str(d, s) { dst = v; next }
+        var a: u32 = 0; var b: u32 = 0; var c2: u32 = 0;
+        dst = ops.get_global(ctx, fp.func, s, &a, &b, &c2)?;
+        next
+    }
+    op STORENAME(src: reg, ns: reg, name: kst) : ABC {
+        let Str(s) = name else { trap() };
+        let Dict(d) = ns else { trap() };
+        value.dict_set_str(&ctx.heap, d, s, src);
+        next
+    }
+
+    // ── cells (closures) ────────────────────────────────────────────
+
+    op MAKECELL(r: reg) : ABC {
+        gc_point();
+        let c = value.new_box(&ctx.heap, K_CELL, 0);
+        c.a = r;
+        r = Obj(c);
+        next
+    }
+    op LOADCELL(dst: reg, cell: reg) : ABC {
+        let Obj(c) = cell else { trap() };
+        let v = c.a;
+        if v == Undef { raise ops.unbound(ctx) }
+        dst = v;
+        next
+    }
+    op STORECELL(cell: reg, src: reg) : ABC {
+        let Obj(c) = cell else { trap() };
+        c.a = src;
+        next
+    }
+    op LOADFREE(dst: reg, i: imm) : ABC {
+        let Func(f) = fp.func else { trap() };
+        let Obj(c) = f.cells.unwrap().items[i] else { trap() };
+        let v = c.a;
+        if v == Undef { raise ops.unbound(ctx) }
+        dst = v;
+        next
+    }
+    op STOREFREE(src: reg, i: imm) : ABC {
+        let Func(f) = fp.func else { trap() };
+        let Obj(c) = f.cells.unwrap().items[i] else { trap() };
+        c.a = src;
+        next
+    }
+
+    // ── attributes ──────────────────────────────────────────────────
+
+    op GETATTR(dst: reg, obj: reg, name: kst) : ABC + AttrIC {
+        if let Inst(o) = obj {
+            let d = o.dict;
+            let i = cache.idx as u64;
+            if likely(i < d.used) {
+                let e = d.ent.items.ptr + 2 * i;
+                if *e == name { dst = *(e + 1); next }
+            }
+        }
+        cold {
+            let Str(s) = name else { trap() };
+            dst = ops.getattr(ctx, obj, s, &cache.idx)?;
+            next
+        }
+    }
+    op SETATTR(obj: reg, name: kst, src: reg) : ABC + AttrIC {
+        if let Inst(o) = obj {
+            let d = o.dict;
+            let i = cache.idx as u64;
+            if likely(i < d.used) {
+                let e = d.ent.items.ptr + 2 * i;
+                if *e == name {
+                    *(e + 1) = src;
+                    gc.write_barrier(&ctx.heap, d.ent as *u8);
+                    next
+                }
+            }
+        }
+        cold {
+            gc_point();
+            let Str(s) = name else { trap() };
+            ops.setattr(ctx, obj, s, src, &cache.idx)?;
+            next
+        }
+    }
+    op DELATTR(obj: reg, name: kst) : ABC {
+        let Str(s) = name else { trap() };
+        ops.delattr(ctx, obj, s)?;
+        next
+    }
+    /// R[base] = the method, R[base+1] = self (or Undef for a plain value).
+    op LOADMETHOD(base: reg, obj: reg, name: kst) : ABC + MethIC {
+        let o = obj;
+        if let Inst(i) = o {
+            let cls = i.cls;
+            if cls.id == cache.cls and ctx.epoch == cache.epoch {
+                var owner = cls;
+                var d = cache.depth;
+                while d > 0 { owner = owner.base.unwrap(); d -= 1; }
+                regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                regs[base.raw + 1] = o;
+                next
+            }
+        } else if ops.type_code(o) == cache.cls and cache.epoch == 0xffffffff {
+            regs[base.raw] = Builtin(cache.idx);
+            regs[base.raw + 1] = o;
+            next
+        }
+        cold {
+            gc_point();
+            let Str(s) = name else { trap() };
+            let (m, selfv) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+            regs[base.raw] = m;
+            regs[base.raw + 1] = selfv;
+            next
+        }
+    }
+
+    // ── calls ───────────────────────────────────────────────────────
+
+    op CALL(base: reg, n: nargs) : ABC {
+        if let Func(f) = base {
+            if f.proto.simple == n as u32 { push_frame(f, regs + base.raw + 1, regs + base.raw, 0) }
+        }
+        cold { gc_point(); call_slow(base.raw, base.raw + 1, n as u64, Nil) }
+    }
+    /// Method call after LOADMETHOD: R[base] callee, R[base+1] self or
+    /// Undef, then the n arguments.
+    op CALLMETHOD(base: reg, n: imm) : ABC {
+        let f = base;
+        let s = regs[base.raw + 1];
+        if s != Undef {
+            if let Func(fn_) = f {
+                if fn_.proto.simple == (n + 1) as u32 { push_frame(fn_, regs + base.raw + 1, regs + base.raw, 0) }
+            }
+            if let Builtin(id) = f and id == builtins.B_LIST_APPEND and n == 1 and let List(l) = s {
+                gc_point();
+                value.list_push(&ctx.heap, l, regs[base.raw + 2]);
+                regs[base.raw] = Nil;
+                next
+            }
+            cold { gc_point(); call_slow(base.raw, base.raw + 1, n as u64 + 1, Nil) }
+        }
+        cold { gc_point(); call_slow(base.raw, base.raw + 2, n as u64, Nil) }
+    }
+    /// CALL with keyword arguments: the last len(K[kw]) of the n
+    /// arguments are named by the tuple K[kw].
+    op CALLKW(base: reg, n: nargs, kw: kst) : ABC {
+        gc_point();
+        call_slow(base.raw, base.raw + 1, n as u64, kw)
+    }
+    op CALLMETHODKW(base: reg, n: imm, kw: kst) : ABC {
+        gc_point();
+        if regs[base.raw + 1] != Undef { call_slow(base.raw, base.raw + 1, n as u64 + 1, kw) }
+        call_slow(base.raw, base.raw + 2, n as u64, kw)
+    }
+    /// R[base](*R[base+1], **R[base+2]) (R[base+2] may be None).
+    op CALLEX(base: reg) : ABC {
+        gc_point();
+        let (n, kw) = ops.spread_args(ctx, regs + base.raw + 1)?;
+        call_slow(base.raw, base.raw + 1, n, kw)
+    }
+    op RET(src: reg) : ABC { ret(src) }
+    op RETNIL() : ABC { ret(Nil) }
+
+    // ── arithmetic ──────────────────────────────────────────────────
+
+    inline for (name, checked, sym, opn, bkind) in [
+        ("ADD", "add_checked", +, ops.O_ADD, reg),
+        ("SUB", "sub_checked", -, ops.O_SUB, reg),
+        ("MUL", "mul_checked", *, ops.O_MUL, reg),
+        ("ADDK", "add_checked", +, ops.O_ADD, kst),
+        ("SUBK", "sub_checked", -, ops.O_SUB, kst),
+        ("MULK", "mul_checked", *, ops.O_MUL, kst),
+    ] {
+        op #name(dst: reg, a: reg, b: bkind) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { dst = Int(r); next },
+                (Float(x), Float(y)) => { dst = Float(x sym y); next }
+                _ => {}
+            }
+            cold { gc_point(); dst = ops.arith(ctx, opn, a, b)?; next }
+        }
+    }
+    op TRUEDIV(dst: reg, a: reg, b: reg) : ABC {
+        if let (Float(x), Float(y)) = (a, b) and y != 0.0 { dst = Float(x / y); next }
+        cold { gc_point(); dst = ops.arith(ctx, ops.O_TRUEDIV, a, b)?; next }
+    }
+    op FLOORDIV(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            var q = x / y;
+            if (x % y) != 0 and x < 0 { q -= 1; }
+            dst = Int(q);
+            next
+        }
+        cold { gc_point(); dst = ops.arith(ctx, ops.O_FLOORDIV, a, b)?; next }
+    }
+    op MOD(dst: reg, a: reg, b: reg) : ABC {
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            var r = x % y;
+            if r < 0 { r += y; }
+            dst = Int(r);
+            next
+        }
+        cold { gc_point(); dst = ops.arith(ctx, ops.O_MOD, a, b)?; next }
+    }
+    inline for (name, opn) in [("POW", ops.O_POW), ("LSHIFT", ops.O_LSHIFT), ("RSHIFT", ops.O_RSHIFT), ("MATMUL", ops.O_MATMUL)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            gc_point();
+            dst = ops.arith(ctx, opn, a, b)?;
+            next
+        }
+    }
+    inline for (name, sym, opn) in [("BAND", &, ops.O_BAND), ("BOR", |, ops.O_BOR), ("BXOR", ^, ops.O_BXOR)] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            if let (Int(x), Int(y)) = (a, b) { dst = Int(x sym y); next }
+            cold { gc_point(); dst = ops.arith(ctx, opn, a, b)?; next }
+        }
+    }
+    op NEG(dst: reg, a: reg) : ABC {
+        match a {
+            Int(x) => if x != -2147483648 { dst = Int(0 - x); next },
+            Float(x) => { dst = Float(0.0 - x); next }
+            _ => {}
+        }
+        cold { gc_point(); dst = ops.unary(ctx, ops.U_NEG, a)?; next }
+    }
+    op POS(dst: reg, a: reg) : ABC { dst = ops.unary(ctx, ops.U_POS, a)?; next }
+    op INVERT(dst: reg, a: reg) : ABC {
+        if let Int(x) = a { dst = Int(~x); next }
+        cold { dst = ops.unary(ctx, ops.U_INVERT, a)?; next }
+    }
+    op NOT(dst: reg, a: reg) : ABC {
+        match a {
+            Bool(x) => { dst = Bool(!x); next }
+            Nil => { dst = Bool(true); next }
+            _ => {}
+        }
+        cold { dst = Bool(!ops.truthy(ctx, a)?); next }
+    }
+
+    // ── comparisons ─────────────────────────────────────────────────
+
+    inline for (name, test, opn) in [
+        ("LT", x < y, ops.C_LT), ("LE", x <= y, ops.C_LE), ("GT", x > y, ops.C_GT),
+        ("GE", x >= y, ops.C_GE), ("EQ", x == y, ops.C_EQ), ("NE", x != y, ops.C_NE),
+    ] {
+        op #name(dst: reg, a: reg, b: reg) : ABC {
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = Bool(test); next }
+                (Float(x), Float(y)) => { dst = Bool(test); next }
+                _ => {}
+            }
+            cold { dst = ops.compare_value(ctx, opn, a, b)?; next }
+        }
+    }
+    op IS(dst: reg, a: reg, b: reg) : ABC { dst = Bool(ops.is_same(a, b)); next }
+    op ISNOT(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!ops.is_same(a, b)); next }
+    op IN(dst: reg, a: reg, b: reg) : ABC { dst = Bool(ops.contains(ctx, b, a)?); next }
+    op NOTIN(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!ops.contains(ctx, b, a)?); next }
+
+    // ── jumps ───────────────────────────────────────────────────────
+
+    op JMP(target: label) : sJ { jump target }
+    op JT(a: reg, target: label) : AsBx {
+        match a {
+            Bool(x) => { if x { jump target } next }
+            Nil => next,
+            Int(x) => { if x != 0 { jump target } next }
+            _ => {}
+        }
+        cold { if ops.truthy(ctx, a)? { jump target } next }
+    }
+    op JF(a: reg, target: label) : AsBx {
+        match a {
+            Bool(x) => { if !x { jump target } next }
+            Nil => jump target,
+            Int(x) => { if x == 0 { jump target } next }
+            _ => {}
+        }
+        cold { if !ops.truthy(ctx, a)? { jump target } next }
+    }
+
+    /// Compare and branch: followed by a JMP taken when the test fails.
+    fn branch(holds: bool, target: *u32) -> never {
+        if holds { jump pc + 2 }
+        jump target
+    }
+    inline for (name, test, opn, bkind) in [
+        ("JNLT", x < y, ops.C_LT, reg), ("JNLE", x <= y, ops.C_LE, reg),
+        ("JNGT", x > y, ops.C_GT, reg), ("JNGE", x >= y, ops.C_GE, reg),
+        ("JNEQ", x == y, ops.C_EQ, reg), ("JNNE", x != y, ops.C_NE, reg),
+        ("JNLTK", x < y, ops.C_LT, kst), ("JNLEK", x <= y, ops.C_LE, kst),
+        ("JNGTK", x > y, ops.C_GT, kst), ("JNGEK", x >= y, ops.C_GE, kst),
+        ("JNEQK", x == y, ops.C_EQ, kst), ("JNNEK", x != y, ops.C_NE, kst),
+    ] {
+        op #name(a: reg, b: bkind) : ABC then JMP {
+            match (a, b) {
+                (Int(x), Int(y)) => branch(test, then.target),
+                (Float(x), Float(y)) => branch(test, then.target),
+                _ => {}
+            }
+            cold { branch(ops.compare(ctx, opn, a, b)?, then.target) }
+        }
+    }
+
+    // ── containers ──────────────────────────────────────────────────
+
+    op GETINDEX(dst: reg, obj: reg, key: reg) : ABC {
+        match (obj, key) {
+            (List(l), Int(i)) => {
+                let n = l.len;
+                let j = if i < 0 { (i as i64 + n as i64) as u64 } else { i as u64 };
+                if j < n { dst = *(l.arr.items.ptr + j); next }
+            }
+            (Tuple(t), Int(i)) => {
+                let n = t.items.len;
+                let j = if i < 0 { (i as i64 + n as i64) as u64 } else { i as u64 };
+                if j < n { dst = *(t.items.ptr + j); next }
+            }
+            _ => {}
+        }
+        cold { gc_point(); dst = ops.getindex(ctx, obj, key)?; next }
+    }
+    op SETINDEX(obj: reg, key: reg, src: reg) : ABC {
+        if let (List(l), Int(i)) = (obj, key) {
+            let n = l.len;
+            let j = if i < 0 { (i as i64 + n as i64) as u64 } else { i as u64 };
+            if j < n {
+                *(l.arr.items.ptr + j) = src;
+                gc.write_barrier(&ctx.heap, l.arr as *u8);
+                next
+            }
+        }
+        cold { gc_point(); ops.setindex(ctx, obj, key, src)?; next }
+    }
+    op DELINDEX(obj: reg, key: reg) : ABC { ops.delindex(ctx, obj, key)?; next }
+    /// R[dst] = R[obj][R[lo]:R[lo+1]:R[lo+2]]
+    op GETSLICE(dst: reg, obj: reg, lo: reg) : ABC {
+        gc_point();
+        dst = ops.getslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2])?;
+        next
+    }
+    op SETSLICE(obj: reg, lo: reg, src: reg) : ABC {
+        gc_point();
+        ops.setslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2], src)?;
+        next
+    }
+    op NEWLIST(dst: reg, base: reg, n: imm) : ABC {
+        gc_point();
+        dst = List(value.list_of(&ctx.heap, (regs + base.raw).slice(n)));
+        next
+    }
+    op NEWTUPLE(dst: reg, base: reg, n: imm) : ABC {
+        gc_point();
+        dst = Tuple(value.tuple_of(&ctx.heap, (regs + base.raw).slice(n)));
+        next
+    }
+    /// R[dst] = {R[base]: R[base+1], ...} (n pairs)
+    op NEWDICT(dst: reg, base: reg, n: imm) : ABC {
+        gc_point();
+        let d = value.new_dict(&ctx.heap, n);
+        for i in 0..n {
+            ops.dict_put(ctx, d, regs[base.raw + 2 * i], regs[base.raw + 2 * i + 1])?;
+        }
+        dst = Dict(d);
+        next
+    }
+    op NEWSET(dst: reg, base: reg, n: imm) : ABC {
+        gc_point();
+        let s = ops.new_set(ctx, false);
+        for i in 0..n { ops.set_add(ctx, s, regs[base.raw + i])?; }
+        dst = s;
+        next
+    }
+    op LISTAPPEND(l: reg, v: reg) : ABC {
+        gc_point();
+        let List(x) = l else { trap() };
+        value.list_push(&ctx.heap, x, v);
+        next
+    }
+    /// list.extend for [*a] and f(*a): R[l] must be a list.
+    op LISTEXTEND(l: reg, v: reg) : ABC {
+        gc_point();
+        ops.list_extend(ctx, l, v)?;
+        next
+    }
+    op SETADD(s: reg, v: reg) : ABC { gc_point(); ops.set_add(ctx, s, v)?; next }
+    op DICTSET(d: reg, key: reg, v: reg) : ABC {
+        gc_point();
+        let Dict(x) = d else { trap() };
+        ops.dict_put(ctx, x, key, v)?;
+        next
+    }
+    op TOTUPLE(dst: reg, src: reg) : ABC {
+        gc_point();
+        let List(l) = src else { trap() };
+        dst = Tuple(value.tuple_of(&ctx.heap, value.list_items(l)));
+        next
+    }
+    /// Unpack R[src] into R[base..base+n].
+    op UNPACK(base: reg, src: reg, n: imm) : ABC {
+        if let Tuple(t) = src and t.items.len == n {
+            for i in 0..n { regs[base.raw + i] = t.items[i]; }
+            next
+        }
+        if let List(l) = src and l.len == n {
+            for i in 0..n { regs[base.raw + i] = l.arr.items[i]; }
+            next
+        }
+        cold { gc_point(); ops.unpack(ctx, src, regs + base.raw, n, 0xff)?; next }
+    }
+    /// Starred unpack: n = before | (after << 4); the starred list goes
+    /// between them.
+    op UNPACKEX(base: reg, src: reg, n: imm) : ABC {
+        gc_point();
+        ops.unpack(ctx, src, regs + base.raw, n & 15, n >> 4)?;
+        next
+    }
+
+    // ── strings ─────────────────────────────────────────────────────
+
+    /// R[dst] = format(R[v], R[spec]) after conversion `conv` ('r', 's', 'a' or 0);
+    /// spec register 255 means no spec.
+    op FORMAT(dst: reg, v: reg, spec: imm) : ABC {
+        gc_point();
+        dst = ops.format_field(ctx, v, if spec == 255 { Nil } else { regs[spec] }, 0)?;
+        next
+    }
+    op CONVERT(dst: reg, v: reg, conv: imm) : ABC {
+        gc_point();
+        dst = ops.convert(ctx, v, conv)?;
+        next
+    }
+    op BUILDSTR(dst: reg, base: reg, n: imm) : ABC {
+        gc_point();
+        dst = ops.join_strs(ctx, regs + base.raw, n);
+        next
+    }
+
+    // ── iteration ───────────────────────────────────────────────────
+
+    op GETITER(dst: reg, src: reg) : ABC {
+        gc_point();
+        dst = ops.getiter(ctx, src)?;
+        next
+    }
+    /// Next item of R[it] into R[dst], skipping the JMP; or take the JMP
+    /// when the iterator is exhausted.
+    op FORITER(dst: reg, it: reg) : ABC then JMP {
+        if let Obj(b) = it {
+            if b.kind == K_RANGEIT {
+                let i = b.n;
+                if (b.s > 0 and i < b.m) or (b.s < 0 and i > b.m) {
+                    b.n = i + b.s;
+                    if i >= -2147483648 and i <= 2147483647 { dst = Int(i as i32); jump pc + 2 }
+                    cold { dst = value.int_val(&ctx.heap, i); jump pc + 2 }
+                }
+                jump then.target
+            }
+            if b.kind == K_SEQIT {
+                let i = b.n as u64;
+                match b.a {
+                    List(l) => { if i < l.len { b.n += 1; dst = *(l.arr.items.ptr + i); jump pc + 2 } jump then.target }
+                    Tuple(t) => { if i < t.items.len { b.n += 1; dst = *(t.items.ptr + i); jump pc + 2 } jump then.target }
+                    _ => {}
+                }
+            }
+            if b.kind == K_GEN { resume(b, regs + dst.raw, then.target) }
+        }
+        cold {
+            gc_point();
+            match ops.next(ctx, it)? {
+                Some(v) => { dst = v; jump pc + 2 }
+                None => jump then.target,
+            }
+        }
+    }
+    /// R[dst] = (yield R[val]): suspend the generator.
+    op YIELD(dst: reg, val: reg) : ABC {
+        let v = val;
+        let Obj(g) = fp.gen else { trap() };
+        let Func(f) = fp.func else { trap() };
+        let p = f.proto;
+        for i in 0..p.nregs as u64 { g.extra[i] = regs[i]; }
+        g.n = (((next_pc as u64) - (p.code.start() as u64)) / 4) as i64;
+        g.s = dst.raw as i64;
+        g.m = GEN_SUSPENDED;
+        if (fp.flags & F_BASE) != 0 { exit Ok(v) }
+        *fp.ret_slot = v;
+        let r = fp.ret_pc;
+        fp = fp - 1;
+        regs = fp.base;
+        k = fp.k;
+        jump r
+    }
+
+    // ── functions, classes, exceptions ──────────────────────────────
+
+    /// R[dst] = a function of prototype `p`; its defaults are in
+    /// R[dst+1 ..] (the prototype says how many), then its kw-only
+    /// defaults as a dict or None.
+    op MAKEFUNC(dst: reg, p: pidx) : ABx {
+        gc_point();
+        dst = ops.make_func(ctx, fp.func, ctx.protos.at(p), regs, dst.raw)?;
+        next
+    }
+    /// R[dst] = class named R[base] with bases tuple R[base+1] and
+    /// namespace R[base+2].
+    op BUILDCLASS(dst: reg, base: reg) : ABC {
+        gc_point();
+        dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2])?;
+        next
+    }
+    op RAISE(e: reg) : ABC {
+        gc_point();
+        let x = ops.make_exc(ctx, e)?;
+        raise x
+    }
+    op RERAISE(e: reg) : ABC { raise e }
+    /// R[dst] = isinstance(R[e], R[cls]) for an except clause.
+    op EXCMATCH(dst: reg, e: reg, cls: reg) : ABC {
+        dst = Bool(ops.exc_match(ctx, e, cls)?);
+        next
+    }
+    op SUPER(dst: reg, selfv: reg) : ABC {
+        gc_point();
+        dst = ops.make_super(ctx, fp.func, selfv)?;
+        next
+    }
+    op IMPORT(dst: reg, name: kst) : ABx {
+        gc_point();
+        dst = builtins.import_module(ctx, name)?;
+        next
+    }
+    op NOP() : ABC { next }
+
+    entry call(c: *Ctx, at: *Frame, code: *u32) -> Result<Value, Value> uses reenter {
+        ctx = c;
+        fp = at;
+        regs = at.base;
+        k = at.k;
+        jump code
+    }
+
+    on raise(e: Value) {
+        loop {
+            let p = fp.proto;
+            if ctx.err_line == 0 { ctx.err_line = line_of(p, pc); }
+            let start = p.code.start();
+            let off = (((pc as u64) - (start as u64)) / 4) as u32;
+            for i in 0..p.handlers.len {
+                let h = p.handlers[i];
+                if off >= h.start and off < h.end {
+                    regs[h.reg as u64] = e;
+                    ctx.err_line = 0;
+                    jump (start + h.target as u64)
+                }
+            }
+            let fl = fp.flags;
+            if (fl & F_GEN) != 0 { if let Obj(g) = fp.gen { g.m = GEN_DONE; } }
+            if (fl & F_BASE) != 0 { exit Err(e) }
+            pc = fp.ret_pc - 1;
+            fp = fp - 1;
+            regs = fp.base;
+            k = fp.k;
+        }
+    }
+}
+
+/// Number of prototypes, for the verifier (set before verification).
+pub var NPROTOS: u64 = 0;
+fn ctx_protos_len() -> u64 { NPROTOS }
+
+/// Call `f` with `args` from host code, as a nested run above the
+/// current frame.
+pub fn invoke(c: *Ctx, f: Value, args: []Value) -> Result<Value, Value> uses reenter {
+    let caller = c.fp;
+    let top = caller.base + caller.proto.nregs as u64;
+    // top[0] holds the callee; arguments follow.
+    let need = top + args.len + 2;
+    if need > c.stack_end { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+    if need > c.hw { c.hw = need; }
+    top[0] = f;
+    for i in 0..args.len { top[1 + i] = args[i]; }
+    invoke_at(c, top, args.len, Value.Nil)
+}
+
+/// Call the callee at `top[0]` with the `n` arguments after it.
+pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    let caller = c.fp;
+    if caller + 2 >= c.frames_end or c.vm_depth > 180 {
+        return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded"));
+    }
+    let f0 = top[0];
+    match f0 {
+        Func(f) => {
+            let p = f.proto;
+            let win = top + 1;
+            let need = win + p.nregs as u64 + 1;
+            if need > c.stack_end { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+            if need > c.hw { c.hw = need; }
+            if p.simple != n as u32 or kw != Value.Nil {
+                ops.bind_args(c, f, win, n, kw)?;
+            }
+            if (p.flags & P_GEN) != 0 { return Ok(ops.make_gen(c, f, win)); }
+            let nf = caller + 1;
+            nf.func = f0;
+            nf.gen = Value.Nil;
+            nf.base = win;
+            nf.k = p.consts.ptr;
+            nf.proto = p;
+            nf.ret_pc = 0 as *u32;
+            nf.ret_slot = top;
+            nf.flags = F_BASE;
+            c.vm_depth += 1;
+            let r = Py.call(c, nf, p.code.start());
+            c.vm_depth -= 1;
+            c.fp = caller;
+            r
+        }
+        Builtin(id) => builtins.call(c, id, top + 1, n, kw),
+        _ => {
+            // Classes, bound methods, callable instances: through a CALL
+            // instruction of a tiny trampoline.
+            ops.call_generic(c, top, n, kw)
+        }
+    }
+}
+
+/// Resume generator `g` from host code: Ok(Some(v)) for a yielded value,
+/// Ok(None) when it finished.
+pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses reenter {
+    if g.m == GEN_DONE { return Ok(None); }
+    if g.m == GEN_RUNNING { return Err(ops.exc(c, builtins.E_VALUE, "generator already executing")); }
+    let caller = c.fp;
+    if caller + 2 >= c.frames_end or c.vm_depth > 180 {
+        return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded"));
+    }
+    let Func(f) = g.a else { trap() };
+    let p = f.proto;
+    let win = caller.base + caller.proto.nregs as u64;
+    let need = win + p.nregs as u64 + 1;
+    if need > c.stack_end { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+    if need > c.hw { c.hw = need; }
+    for i in 0..p.nregs as u64 { win[i] = g.extra[i]; }
+    if g.m == GEN_SUSPENDED { win[g.s as u64] = send; }
+    g.m = GEN_RUNNING;
+    let nf = caller + 1;
+    nf.func = g.a;
+    nf.gen = Value.Obj(g);
+    nf.base = win;
+    nf.k = p.consts.ptr;
+    nf.proto = p;
+    nf.ret_pc = 0 as *u32;
+    nf.ret_slot = win;
+    nf.flags = F_GEN | F_BASE;
+    c.gen_done = false;
+    c.vm_depth += 1;
+    let r = Py.call(c, nf, p.code.start() + g.n as u64);
+    c.vm_depth -= 1;
+    c.fp = caller;
+    match r {
+        Ok(v) => {
+            if c.gen_done { c.gen_done = false; return Ok(None); }
+            Ok(Some(v))
+        }
+        Err(e) => Err(e),
+    }
+}

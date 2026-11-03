@@ -1,0 +1,309 @@
+// An indentation-sensitive tokenizer for the Python subset. It turns the
+// whole source into a token vector up front, with NEWLINE, INDENT and
+// DEDENT tokens as Python's tokenizer makes them.
+import std.mem;
+import std.text;
+import std.lex;
+import std.hash;
+import std.map;
+
+pub enum T {
+    Eof, Newline, Indent, Dedent,
+    Name, Int, BigInt, Float, Str, FStr,
+    // keywords
+    False, NoneKw, True, And, As, Assert, Break, Class, Continue, Def, Del, Elif, Else,
+    Except, Finally, For, From, Global, If, Import, In, Is, Lambda, Nonlocal, Not, Or,
+    Pass, Raise, Return, Try, While, With, Yield,
+    // operators
+    Plus, Minus, Star, Slash, DSlash, Percent, DStar, At, Shl, Shr, Amp, Pipe, Caret, Tilde,
+    Lt, Gt, Le, Ge, EqEq, Ne, LParen, RParen, LBrack, RBrack, LBrace, RBrace,
+    Comma, Colon, Dot, Semi, Assign, Arrow, Walrus, Ellipsis,
+    PlusEq, MinusEq, StarEq, SlashEq, DSlashEq, PercentEq, DStarEq, ShlEq, ShrEq, AmpEq, PipeEq, CaretEq, AtEq,
+}
+
+pub struct Token { kind: T, line: u32, s: str, i: i64, f: f64 }
+
+pub struct Lexer {
+    src: str,
+    pos: u64,
+    line: u32,
+    toks: mem.Vec<Token>,
+    indents: mem.Vec<u64>,
+    depth: i64,
+    arena: *mem.Arena,
+    kw: map.HashMap<str, T>,
+    ops: lex.OpTable<T>,
+    err: ?str,
+    err_line: u32,
+}
+
+fn add_kw(m: *map.HashMap<str, T>) {
+    let kws = [("False", T.False), ("None", T.NoneKw), ("True", T.True), ("and", T.And), ("as", T.As),
+        ("assert", T.Assert), ("break", T.Break), ("class", T.Class), ("continue", T.Continue),
+        ("def", T.Def), ("del", T.Del), ("elif", T.Elif), ("else", T.Else), ("except", T.Except),
+        ("finally", T.Finally), ("for", T.For), ("from", T.From), ("global", T.Global), ("if", T.If),
+        ("import", T.Import), ("in", T.In), ("is", T.Is), ("lambda", T.Lambda), ("nonlocal", T.Nonlocal),
+        ("not", T.Not), ("or", T.Or), ("pass", T.Pass), ("raise", T.Raise), ("return", T.Return),
+        ("try", T.Try), ("while", T.While), ("with", T.With), ("yield", T.Yield)];
+    for kv in kws { let (k, v) = kv; m.insert(k, v); }
+}
+
+fn add_ops(o: *lex.OpTable<T>) {
+    let ops = [("+", T.Plus), ("-", T.Minus), ("*", T.Star), ("/", T.Slash), ("//", T.DSlash),
+        ("%", T.Percent), ("**", T.DStar), ("@", T.At), ("<<", T.Shl), (">>", T.Shr), ("&", T.Amp),
+        ("|", T.Pipe), ("^", T.Caret), ("~", T.Tilde), ("<", T.Lt), (">", T.Gt), ("<=", T.Le),
+        (">=", T.Ge), ("==", T.EqEq), ("!=", T.Ne), ("(", T.LParen), (")", T.RParen), ("[", T.LBrack),
+        ("]", T.RBrack), ("{", T.LBrace), ("}", T.RBrace), (",", T.Comma), (":", T.Colon), (".", T.Dot),
+        (";", T.Semi), ("=", T.Assign), ("->", T.Arrow), (":=", T.Walrus), ("...", T.Ellipsis),
+        ("+=", T.PlusEq), ("-=", T.MinusEq), ("*=", T.StarEq), ("/=", T.SlashEq), ("//=", T.DSlashEq),
+        ("%=", T.PercentEq), ("**=", T.DStarEq), ("<<=", T.ShlEq), (">>=", T.ShrEq), ("&=", T.AmpEq),
+        ("|=", T.PipeEq), ("^=", T.CaretEq), ("@=", T.AtEq)];
+    for kv in ops { let (k, v) = kv; o.add(k, v); }
+}
+
+pub fn Lexer.new(src: str, arena: *mem.Arena) -> Lexer {
+    var lx = Lexer {
+        src: src, pos: 0, line: 1, toks: mem.Vec.new(), indents: mem.Vec.new(), depth: 0,
+        arena: arena, kw: map.HashMap.new(), ops: lex.OpTable.new(), err: None, err_line: 0,
+    };
+    add_kw(&lx.kw);
+    add_ops(&lx.ops);
+    lx.indents.push(0);
+    lx
+}
+
+pub fn Lexer.free(lx: *Lexer) {
+    lx.toks.free();
+    lx.indents.free();
+    lx.kw.free();
+    lx.ops.free();
+}
+
+fn Lexer.push(lx: *Lexer, k: T) {
+    lx.toks.push(Token { kind: k, line: lx.line, s: "", i: 0, f: 0.0 });
+}
+
+fn Lexer.fail(lx: *Lexer, msg: str) {
+    if lx.err.is_none() { lx.err = Some(msg); lx.err_line = lx.line; }
+}
+
+fn Lexer.peek(lx: *Lexer, k: u64) -> u8 {
+    if lx.pos + k < lx.src.len { lx.src[lx.pos + k] } else { 0 }
+}
+
+fn is_ident_start(c: u8) -> bool { text.is_alpha(c) or c >= 0x80 }
+fn is_ident_char(c: u8) -> bool { text.is_alpha(c) or text.is_digit(c) or c >= 0x80 }
+
+/// Tokenize everything. Errors are recorded in `lx.err`.
+pub fn Lexer.run(lx: *Lexer) {
+    var at_line_start = true;
+    while lx.err.is_none() {
+        if at_line_start and lx.depth == 0 {
+            // Measure indentation; skip blank and comment-only lines.
+            var col: u64 = 0;
+            while lx.pos < lx.src.len and (lx.src[lx.pos] == ' ' or lx.src[lx.pos] == '\t') {
+                col = if lx.src[lx.pos] == '\t' { (col / 8 + 1) * 8 } else { col + 1 };
+                lx.pos += 1;
+            }
+            if lx.pos >= lx.src.len { break; }
+            let c = lx.src[lx.pos];
+            if c == '#' {
+                while lx.pos < lx.src.len and lx.src[lx.pos] != '\n' { lx.pos += 1; }
+                continue;
+            }
+            if c == '\n' { lx.pos += 1; lx.line += 1; continue; }
+            if c == '\r' { lx.pos += 1; continue; }
+            at_line_start = false;
+            let top = lx.indents.at(lx.indents.len - 1);
+            if col > top {
+                lx.indents.push(col);
+                lx.push(T.Indent);
+            } else {
+                while col < lx.indents.at(lx.indents.len - 1) {
+                    lx.indents.pop();
+                    lx.push(T.Dedent);
+                }
+                if col != lx.indents.at(lx.indents.len - 1) { lx.fail("unindent does not match any outer indentation level"); }
+            }
+        }
+        if lx.pos >= lx.src.len { break; }
+        let c = lx.src[lx.pos];
+        if c == ' ' or c == '\t' or c == '\r' { lx.pos += 1; continue; }
+        if c == '#' {
+            while lx.pos < lx.src.len and lx.src[lx.pos] != '\n' { lx.pos += 1; }
+            continue;
+        }
+        if c == '\\' and lx.peek(1) == '\n' { lx.pos += 2; lx.line += 1; continue; }
+        if c == '\n' {
+            if lx.depth == 0 {
+                lx.push(T.Newline);
+                at_line_start = true;
+            }
+            lx.pos += 1;
+            lx.line += 1;
+            continue;
+        }
+        // String prefixes.
+        if is_ident_start(c) {
+            let start = lx.pos;
+            while lx.pos < lx.src.len and is_ident_char(lx.src[lx.pos]) { lx.pos += 1; }
+            let word = lx.src[start..lx.pos];
+            let q = lx.peek(0);
+            if (q == '"' or q == '\'') and word.len <= 2 {
+                var raw = false;
+                var f = false;
+                var ok = true;
+                for i in 0..word.len {
+                    let w = word[i];
+                    if w == 'r' or w == 'R' { raw = true; }
+                    else if w == 'f' or w == 'F' { f = true; }
+                    else if w == 'u' or w == 'U' { }
+                    else { ok = false; }
+                }
+                if ok { lx.string(raw, f); continue; }
+            }
+            if let Some(k) = lx.kw.get(word) { lx.push(k); }
+            else {
+                lx.toks.push(Token { kind: T.Name, line: lx.line, s: word, i: 0, f: 0.0 });
+            }
+            continue;
+        }
+        if text.is_digit(c) or (c == '.' and text.is_digit(lx.peek(1))) { lx.number(); continue; }
+        if c == '"' or c == '\'' { lx.string(false, false); continue; }
+        var cur = lex.Cursor.new(lx.src, 0, lex.none());
+        cur.pos = lx.pos;
+        if let Some(k) = cur.op(&lx.ops) {
+            lx.pos = cur.pos;
+            match k {
+                LParen | LBrack | LBrace => lx.depth += 1,
+                RParen | RBrack | RBrace => lx.depth -= 1,
+                _ => {}
+            }
+            lx.push(k);
+            continue;
+        }
+        lx.fail("invalid character");
+    }
+    if lx.toks.len > 0 {
+        let last = lx.toks.at(lx.toks.len - 1).kind;
+        if last != T.Newline and last != T.Dedent { lx.push(T.Newline); }
+    }
+    while lx.indents.len > 1 { lx.indents.pop(); lx.push(T.Dedent); }
+    lx.push(T.Eof);
+}
+
+fn Lexer.number(lx: *Lexer) {
+    let start = lx.pos;
+    let c0 = lx.peek(0);
+    let c1 = lx.peek(1);
+    if c0 == '0' and (c1 == 'x' or c1 == 'X' or c1 == 'o' or c1 == 'O' or c1 == 'b' or c1 == 'B') {
+        lx.pos += 2;
+        let ds = lx.pos;
+        while lx.pos < lx.src.len and (is_ident_char(lx.src[lx.pos])) { lx.pos += 1; }
+        let radix: i64 = if c1 == 'x' or c1 == 'X' { 16 } else if c1 == 'o' or c1 == 'O' { 8 } else { 2 };
+        lx.toks.push(Token { kind: T.BigInt, line: lx.line, s: lx.src[ds..lx.pos], i: radix, f: 0.0 });
+        return;
+    }
+    var is_float = false;
+    while lx.pos < lx.src.len and (text.is_digit(lx.src[lx.pos]) or lx.src[lx.pos] == '_') { lx.pos += 1; }
+    if lx.peek(0) == '.' and lx.peek(1) != '.' {
+        is_float = true;
+        lx.pos += 1;
+        while lx.pos < lx.src.len and (text.is_digit(lx.src[lx.pos]) or lx.src[lx.pos] == '_') { lx.pos += 1; }
+    }
+    if lx.peek(0) == 'e' or lx.peek(0) == 'E' {
+        let save = lx.pos;
+        lx.pos += 1;
+        if lx.peek(0) == '+' or lx.peek(0) == '-' { lx.pos += 1; }
+        if text.is_digit(lx.peek(0)) {
+            is_float = true;
+            while lx.pos < lx.src.len and text.is_digit(lx.src[lx.pos]) { lx.pos += 1; }
+        } else { lx.pos = save; }
+    }
+    let s = lx.src[start..lx.pos];
+    if lx.peek(0) == 'j' or lx.peek(0) == 'J' { lx.fail("complex numbers are not supported"); return; }
+    if is_float {
+        var b = text.StrBuf.new();
+        for i in 0..s.len { if s[i] != '_' { b.push(s[i]); } }
+        let f = text.parse_f64(b.as_str()) ?? 0.0;
+        b.free();
+        lx.toks.push(Token { kind: T.Float, line: lx.line, s: s, i: 0, f: f });
+        return;
+    }
+    // Decimal integer: small ones as Int, others as BigInt (radix 10).
+    var v: i64 = 0;
+    var big = false;
+    for i in 0..s.len {
+        if s[i] == '_' { continue; }
+        let d = (s[i] - '0') as i64;
+        if let Some(m) = v.mul_checked(10) and let Some(a) = m.add_checked(d) { v = a; } else { big = true; }
+    }
+    if big { lx.toks.push(Token { kind: T.BigInt, line: lx.line, s: s, i: 10, f: 0.0 }); }
+    else { lx.toks.push(Token { kind: T.Int, line: lx.line, s: s, i: v, f: 0.0 }); }
+}
+
+fn hexval(c: u8) -> i64 {
+    if c >= '0' and c <= '9' { return (c - '0') as i64; }
+    if c >= 'a' and c <= 'f' { return (c - 'a') as i64 + 10; }
+    if c >= 'A' and c <= 'F' { return (c - 'A') as i64 + 10; }
+    -1
+}
+
+/// A string literal at `lx.pos` (the quote). F-strings keep their raw
+/// text; the parser splits them.
+fn Lexer.string(lx: *Lexer, raw: bool, f: bool) {
+    let q = lx.src[lx.pos];
+    let triple = lx.peek(1) == q and lx.peek(2) == q;
+    lx.pos += if triple { 3 } else { 1 };
+    let line = lx.line;
+    var b = text.StrBuf.new();
+    loop {
+        if lx.pos >= lx.src.len { lx.fail("unterminated string literal"); b.free(); return; }
+        let c = lx.src[lx.pos];
+        if c == q {
+            if !triple { lx.pos += 1; break; }
+            if lx.peek(1) == q and lx.peek(2) == q { lx.pos += 3; break; }
+        }
+        if c == '\n' {
+            if !triple { lx.fail("unterminated string literal"); b.free(); return; }
+            lx.line += 1;
+        }
+        if c == '\\' and !raw {
+            let e = lx.peek(1);
+            lx.pos += 2;
+            if f and (e == '{' or e == '}') { b.push('\\'); b.push(e); continue; }
+            match e {
+                'n' => b.push('\n'),
+                't' => b.push('\t'),
+                'r' => b.push('\r'),
+                '0' => b.push(0),
+                'a' => b.push(7),
+                'b' => b.push(8),
+                'f' => b.push(12),
+                'v' => b.push(11),
+                '\\' => b.push('\\'),
+                '\'' => b.push('\''),
+                '"' => b.push('"'),
+                '\n' => { lx.line += 1; }
+                'x' => {
+                    let v = hexval(lx.peek(0)) * 16 + hexval(lx.peek(1));
+                    lx.pos += 2;
+                    lex.push_utf8(&b, v as u32);
+                }
+                'u' => {
+                    var v: i64 = 0;
+                    for _i in 0..4 { v = v * 16 + hexval(lx.peek(0)); lx.pos += 1; }
+                    lex.push_utf8(&b, v as u32);
+                }
+                _ => { b.push('\\'); b.push(e); }
+            }
+            continue;
+        }
+        if c == '\\' and raw and lx.peek(1) == q { b.push(c); b.push(q); lx.pos += 2; continue; }
+        b.push(c);
+        lx.pos += 1;
+    }
+    let s = lx.arena.str(b.as_str());
+    b.free();
+    lx.toks.push(Token { kind: if f { T.FStr } else { T.Str }, line: line, s: s, i: 0, f: 0.0 });
+}

@@ -1,0 +1,522 @@
+// Values and heap objects of the Python subset.
+import std.gc;
+import std.mem;
+import std.text;
+import std.hash;
+import std.num;
+import big;
+import vm.{Proto};
+
+/// A string: bytes plus a cached hash (0: not computed yet).
+pub object Str { hash: u64, data: [u8] }
+/// Backing store of a list.
+pub object Arr { items: [Value] }
+pub object List { len: u64, arr: Gc<Arr> }
+pub object Tuple { items: [Value] }
+/// Index table of a dict: -1 empty, -2 deleted, else an entry number.
+pub object Idx { s: [i32] }
+/// An insertion-ordered dict (CPython's compact layout): `ent` holds
+/// key, value pairs in insertion order; deleted keys are `Undef`.
+pub object Dict { len: u64, used: u64, mask: u64, keyver: u64, idx: Gc<Idx>, ent: Gc<Arr> }
+/// An instance of a user class (exceptions too).
+pub object Inst { cls: Gc<Box>, dict: Gc<Dict> }
+pub object Func {
+    proto: *Proto,
+    defaults: ?Gc<Tuple>,
+    kwdefaults: ?Gc<Dict>,
+    cells: ?Gc<Tuple>,
+    globals: Gc<Dict>,
+    /// The class whose body defined it (for `super()`).
+    owner: ?Gc<Box>,
+}
+/// Big integer magnitude, little-endian 32-bit limbs.
+pub object Limbs { d: [u32] }
+/// Every other kind of object: classes, bound methods, iterators,
+/// generators, cells, big integers, sets, modules, ...
+pub object Box {
+    kind: u32,
+    id: u32,
+    n: i64,
+    m: i64,
+    s: i64,
+    a: Value,
+    b: Value,
+    c: Value,
+    dict: ?Gc<Dict>,
+    base: ?Gc<Box>,
+    big: ?Gc<Limbs>,
+    extra: [Value],
+}
+
+pub value Value repr nanbox {
+    Float(f64) unboxed,
+    Int(i32) block 32,
+    Nil block 0,
+    /// An unbound local, a deleted dict entry, "no self" in LOADMETHOD.
+    Undef block 0,
+    Bool(bool) block 1,
+    Builtin(u32) block 32,
+    Str(Gc<Str>),
+    List(Gc<List>),
+    Tuple(Gc<Tuple>),
+    Dict(Gc<Dict>),
+    Inst(Gc<Inst>),
+    Func(Gc<Func>),
+    Obj(Gc<Box>),
+}
+
+// Box kinds.
+pub const K_CLASS: u32 = 1;
+pub const K_BOUND: u32 = 2;
+pub const K_BIG: u32 = 3;
+pub const K_RANGE: u32 = 4;
+pub const K_RANGEIT: u32 = 5;
+pub const K_SEQIT: u32 = 6;
+pub const K_DICTIT: u32 = 7;
+pub const K_GEN: u32 = 8;
+pub const K_CELL: u32 = 9;
+pub const K_SUPER: u32 = 10;
+pub const K_PROPERTY: u32 = 11;
+pub const K_STATICM: u32 = 12;
+pub const K_CLASSM: u32 = 13;
+pub const K_SET: u32 = 14;
+pub const K_MODULE: u32 = 15;
+pub const K_SLICE: u32 = 16;
+pub const K_ENUMIT: u32 = 17;
+pub const K_ZIPIT: u32 = 18;
+pub const K_MAPIT: u32 = 19;
+pub const K_FILTERIT: u32 = 20;
+pub const K_DICTVIEW: u32 = 21;
+pub const K_REVIT: u32 = 22;
+pub const K_NOTIMPL: u32 = 23;
+pub const K_FROZENSET: u32 = 24;
+
+// Generator states (Box.m).
+pub const GEN_NEW: i64 = 0;
+pub const GEN_SUSPENDED: i64 = 1;
+pub const GEN_RUNNING: i64 = 2;
+pub const GEN_DONE: i64 = 3;
+
+pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
+pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
+impl hash.Hash for Value;
+
+// ── strings ─────────────────────────────────────────────────────────
+
+pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
+    let o = new(h, Str { hash: 0 }, s.len);
+    mem.copy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+pub fn str_hash(s: Gc<Str>) -> u64 {
+    if s.hash != 0 { return s.hash; }
+    let hv = hash.bytes(s.data) | 1;
+    s.hash = hv;
+    hv
+}
+
+pub fn str_eq(a: Gc<Str>, b: Gc<Str>) -> bool {
+    if (a as u64) == (b as u64) { return true; }
+    if a.data.len != b.data.len { return false; }
+    if a.hash != 0 and b.hash != 0 and a.hash != b.hash { return false; }
+    mem.equal_bytes(a.data, b.data)
+}
+
+pub fn sv(s: Gc<Str>) -> str { s.data }
+
+// ── lists and tuples ────────────────────────────────────────────────
+
+pub fn new_list(h: *gc.Heap, cap: u64) -> Gc<List> {
+    let c = if cap < 4 { 4 } else { cap };
+    let a = new(h, Arr {}, c);
+    for i in 0..c { a.items[i] = Value.Nil; }
+    new(h, List { len: 0, arr: a })
+}
+
+pub fn list_push(h: *gc.Heap, l: Gc<List>, v: Value) {
+    if l.len == l.arr.items.len { list_grow(h, l, l.len + 1); }
+    l.arr.items[l.len] = v;
+    l.len += 1;
+}
+
+pub fn list_grow(h: *gc.Heap, l: Gc<List>, need: u64) {
+    var c = l.arr.items.len * 2;
+    if c < need { c = need; }
+    if c < 4 { c = 4; }
+    let a = new(h, Arr {}, c);
+    for i in 0..l.len { a.items[i] = l.arr.items[i]; }
+    for i in l.len..c { a.items[i] = Value.Nil; }
+    l.arr = a;
+}
+
+pub fn list_items(l: Gc<List>) -> []Value { l.arr.items[0..l.len] }
+
+pub fn new_tuple(h: *gc.Heap, n: u64) -> Gc<Tuple> {
+    let t = new(h, Tuple {}, n);
+    for i in 0..n { t.items[i] = Value.Nil; }
+    t
+}
+
+pub fn tuple_of(h: *gc.Heap, xs: []Value) -> Gc<Tuple> {
+    let t = new(h, Tuple {}, xs.len);
+    for i in 0..xs.len { t.items[i] = xs[i]; }
+    t
+}
+
+pub fn list_of(h: *gc.Heap, xs: []Value) -> Gc<List> {
+    let l = new_list(h, xs.len);
+    for i in 0..xs.len { l.arr.items[i] = xs[i]; }
+    l.len = xs.len;
+    l
+}
+
+// ── boxes ───────────────────────────────────────────────────────────
+
+pub fn new_box(h: *gc.Heap, kind: u32, n: u64) -> Gc<Box> {
+    let b = new(h, Box { kind: kind, id: 0, n: 0, m: 0, s: 0, a: Value.Nil, b: Value.Nil, c: Value.Nil,
+                         dict: None, base: None, big: None }, n);
+    for i in 0..n { b.extra[i] = Value.Nil; }
+    b
+}
+
+pub fn is_kind(v: Value, k: u32) -> bool {
+    if let Obj(b) = v { return b.kind == k; }
+    false
+}
+
+// ── dicts ───────────────────────────────────────────────────────────
+
+const EMPTY: i32 = -1;
+const DELETED: i32 = -2;
+
+pub fn new_dict(h: *gc.Heap, n: u64) -> Gc<Dict> {
+    var sz: u64 = 8;
+    while sz * 2 < n * 3 { sz *= 2; }
+    let idx = new(h, Idx {}, sz);
+    for i in 0..sz { idx.s[i] = EMPTY; }
+    let cap = (sz * 2) / 3;
+    let ent = new(h, Arr {}, cap * 2);
+    for i in 0..cap * 2 { ent.items[i] = Value.Undef; }
+    new(h, Dict { len: 0, used: 0, mask: sz - 1, keyver: 0, idx: idx, ent: ent })
+}
+
+/// Hash for builtin key types; None for unhashable values and for
+/// instances (which hash by identity: the caller decides).
+pub fn hash_of(v: Value) -> ?u64 {
+    match v {
+        Str(s) => Some(str_hash(s)),
+        Int(i) => Some(hash_int(i as i64)),
+        Bool(b) => Some(if b { 1 } else { 0 }),
+        Nil => Some(0x5ca1ab1e),
+        Float(f) => {
+            if let Some(i) = num.to_i64_exact(f) { return Some(hash_int(i)); }
+            Some(hash.mix(f.to_bits()))
+        }
+        Tuple(t) => {
+            var hv: u64 = 0x345678;
+            for i in 0..t.items.len {
+                let Some(x) = hash_of(t.items[i]) else { return None; };
+                hv = (hv ^ x) *% 1000003 +% (i as u64);
+            }
+            Some(hv)
+        }
+        List(_) => None,
+        Dict(_) => None,
+        Obj(b) => {
+            if b.kind == K_BIG { return Some(big_hash(b)); }
+            if b.kind == K_SET { return None; }
+            if b.kind == K_FROZENSET { return Some(0xf205e7 ^ (b.dict.unwrap().len)); }
+            Some(hash.mix(v as u64))
+        }
+        _ => Some(hash.mix(v as u64)),
+    }
+}
+
+pub fn hash_int(i: i64) -> u64 { if i == -1 { 0xfffffffffffffffe } else { i as u64 } }
+
+fn big_hash(b: Gc<Box>) -> u64 {
+    let l = b.big.unwrap();
+    var hv: u64 = b.s as u64;
+    for i in 0..l.d.len { hv = hash.mix(hv ^ (l.d[i] as u64)); }
+    hv
+}
+
+/// Equality of builtin values without calling guest code. Instances
+/// compare by identity.
+pub fn eq_builtin(a: Value, b: Value) -> bool {
+    if a == b {
+        if let Float(f) = a { return f == f; }
+        return true;
+    }
+    match (a, b) {
+        (Str(x), Str(y)) => str_eq(x, y),
+        (Int(x), Float(y)) => (x as f64) == y,
+        (Float(x), Int(y)) => x == (y as f64),
+        (Float(x), Float(y)) => x == y,
+        (Bool(x), Int(y)) => (if x { 1 } else { 0 }) == y,
+        (Int(x), Bool(y)) => x == (if y { 1 } else { 0 }),
+        (Tuple(x), Tuple(y)) => {
+            if x.items.len != y.items.len { return false; }
+            for i in 0..x.items.len { if !eq_builtin(x.items[i], y.items[i]) { return false; } }
+            true
+        }
+        (List(x), List(y)) => {
+            if x.len != y.len { return false; }
+            for i in 0..x.len { if !eq_builtin(x.arr.items[i], y.arr.items[i]) { return false; } }
+            true
+        }
+        (Dict(x), Dict(y)) => {
+            if x.len != y.len { return false; }
+            var i: u64 = 0;
+            while i < x.used {
+                let k = x.ent.items[2 * i];
+                if k != Value.Undef {
+                    let Some(hv) = hash_of(k) else { return false; };
+                    let Some(v) = dict_get(y, k, hv) else { return false; };
+                    if !eq_builtin(x.ent.items[2 * i + 1], v) { return false; }
+                }
+                i += 1;
+            }
+            true
+        }
+        (Obj(x), Obj(y)) => {
+            if x.kind == K_BIG and y.kind == K_BIG { return big.cmp_box(x, y) == 0; }
+            if (x.kind == K_SET or x.kind == K_FROZENSET) and (y.kind == K_SET or y.kind == K_FROZENSET) {
+                let dx = x.dict.unwrap();
+                let dy = y.dict.unwrap();
+                if dx.len != dy.len { return false; }
+                var i: u64 = 0;
+                while i < dx.used {
+                    let k = dx.ent.items[2 * i];
+                    if k != Value.Undef {
+                        let Some(hv) = hash_of(k) else { return false; };
+                        if dict_get(dy, k, hv).is_none() { return false; }
+                    }
+                    i += 1;
+                }
+                return true;
+            }
+            false
+        }
+        (Obj(x), Float(y)) => if x.kind == K_BIG { big.to_f64(x) == y } else { false },
+        (Float(x), Obj(y)) => if y.kind == K_BIG { big.to_f64(y) == x } else { false },
+        _ => false,
+    }
+}
+
+/// Entry number of `key` in `d`, if present.
+pub fn dict_find(d: Gc<Dict>, key: Value, hv: u64) -> ?u64 {
+    var i = hv & d.mask;
+    var perturb = hv;
+    loop {
+        let ix = d.idx.s[i];
+        if ix == EMPTY { return None; }
+        if ix >= 0 {
+            let k = d.ent.items[2 * (ix as u64)];
+            if k == key or eq_builtin(k, key) { return Some(ix as u64); }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+}
+
+/// Fast path for interned attribute names: pointer comparison first.
+pub fn dict_find_str(d: Gc<Dict>, key: Gc<Str>) -> ?u64 {
+    let hv = str_hash(key);
+    var i = hv & d.mask;
+    var perturb = hv;
+    let kv = Value.Str(key);
+    loop {
+        let ix = d.idx.s[i];
+        if ix == EMPTY { return None; }
+        if ix >= 0 {
+            let k = d.ent.items[2 * (ix as u64)];
+            if k == kv { return Some(ix as u64); }
+            if let Str(ks) = k and str_eq(ks, key) { return Some(ix as u64); }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+}
+
+pub fn dict_get(d: Gc<Dict>, key: Value, hv: u64) -> ?Value {
+    let Some(e) = dict_find(d, key, hv) else { return None; };
+    Some(d.ent.items[2 * e + 1])
+}
+
+pub fn dict_get_str(d: Gc<Dict>, key: Gc<Str>) -> ?Value {
+    let Some(e) = dict_find_str(d, key) else { return None; };
+    Some(d.ent.items[2 * e + 1])
+}
+
+fn dict_insert_slot(d: Gc<Dict>, hv: u64, e: u64) {
+    var i = hv & d.mask;
+    var perturb = hv;
+    loop {
+        if d.idx.s[i] < 0 { d.idx.s[i] = e as i32; return; }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+}
+
+fn dict_resize(h: *gc.Heap, d: Gc<Dict>, n: u64) {
+    var sz: u64 = 8;
+    while sz * 2 < n * 3 { sz *= 2; }
+    let idx = new(h, Idx {}, sz);
+    for i in 0..sz { idx.s[i] = EMPTY; }
+    let cap = (sz * 2) / 3;
+    let ent = new(h, Arr {}, cap * 2);
+    for i in 0..cap * 2 { ent.items[i] = Value.Undef; }
+    let old = d.ent;
+    let oldn = d.used;
+    d.idx = idx;
+    d.ent = ent;
+    d.mask = sz - 1;
+    var j: u64 = 0;
+    for i in 0..oldn {
+        let k = old.items[2 * i];
+        if k != Value.Undef {
+            ent.items[2 * j] = k;
+            ent.items[2 * j + 1] = old.items[2 * i + 1];
+            dict_insert_slot(d, hash_of(k) ?? hash.mix(k as u64), j);
+            j += 1;
+        }
+    }
+    d.used = j;
+    d.keyver += 1;
+}
+
+pub fn dict_set(h: *gc.Heap, d: Gc<Dict>, key: Value, hv: u64, v: Value) {
+    if let Some(e) = dict_find(d, key, hv) {
+        d.ent.items[2 * e + 1] = v;
+        return;
+    }
+    if d.used * 2 >= d.ent.items.len { dict_resize(h, d, d.len + 1); }
+    let e = d.used;
+    d.ent.items[2 * e] = key;
+    d.ent.items[2 * e + 1] = v;
+    d.used += 1;
+    d.len += 1;
+    d.keyver += 1;
+    dict_insert_slot(d, hv, e);
+}
+
+pub fn dict_set_str(h: *gc.Heap, d: Gc<Dict>, key: Gc<Str>, v: Value) {
+    if let Some(e) = dict_find_str(d, key) {
+        d.ent.items[2 * e + 1] = v;
+        return;
+    }
+    dict_set(h, d, Value.Str(key), str_hash(key), v);
+}
+
+pub fn dict_del(d: Gc<Dict>, key: Value, hv: u64) -> bool {
+    var i = hv & d.mask;
+    var perturb = hv;
+    loop {
+        let ix = d.idx.s[i];
+        if ix == EMPTY { return false; }
+        if ix >= 0 {
+            let k = d.ent.items[2 * (ix as u64)];
+            if k == key or eq_builtin(k, key) {
+                d.idx.s[i] = DELETED;
+                d.ent.items[2 * (ix as u64)] = Value.Undef;
+                d.ent.items[2 * (ix as u64) + 1] = Value.Undef;
+                d.len -= 1;
+                d.keyver += 1;
+                return true;
+            }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+}
+
+pub fn dict_clear(h: *gc.Heap, d: Gc<Dict>) {
+    let n = new_dict(h, 0);
+    d.idx = n.idx;
+    d.ent = n.ent;
+    d.mask = n.mask;
+    d.len = 0;
+    d.used = 0;
+    d.keyver += 1;
+}
+
+pub fn dict_copy(h: *gc.Heap, d: Gc<Dict>) -> Gc<Dict> {
+    let r = new_dict(h, d.len);
+    var i: u64 = 0;
+    while i < d.used {
+        let k = d.ent.items[2 * i];
+        if k != Value.Undef { dict_set(h, r, k, hash_of(k) ?? hash.mix(k as u64), d.ent.items[2 * i + 1]); }
+        i += 1;
+    }
+    r
+}
+
+/// Next live entry at or after `*i`.
+pub fn dict_next(d: Gc<Dict>, i: *u64) -> ?u64 {
+    while *i < d.used {
+        let e = *i;
+        *i += 1;
+        if d.ent.items[2 * e] != Value.Undef { return Some(e); }
+    }
+    None
+}
+
+pub fn dict_key(d: Gc<Dict>, e: u64) -> Value { d.ent.items[2 * e] }
+pub fn dict_val(d: Gc<Dict>, e: u64) -> Value { d.ent.items[2 * e + 1] }
+
+// ── numbers ─────────────────────────────────────────────────────────
+
+/// An integer value from an i64: small ones as Int, others as big ints.
+pub fn int_val(h: *gc.Heap, x: i64) -> Value {
+    if x >= -2147483648 and x <= 2147483647 { return Value.Int(x as i32); }
+    Value.Obj(big.from_i64(h, x))
+}
+
+/// The integer in `v` as an i64, if it is an int (or bool) that fits.
+pub fn as_i64(v: Value) -> ?i64 {
+    match v {
+        Int(i) => Some(i as i64),
+        Bool(b) => Some(if b { 1 } else { 0 }),
+        Obj(b) => if b.kind == K_BIG { big.to_i64(b) } else { None },
+        _ => None,
+    }
+}
+
+pub fn is_int(v: Value) -> bool {
+    match v {
+        Int(_) => true,
+        Bool(_) => true,
+        Obj(b) => b.kind == K_BIG,
+        _ => false,
+    }
+}
+
+pub fn is_num(v: Value) -> bool {
+    if let Float(_) = v { return true; }
+    is_int(v)
+}
+
+pub fn to_f64(v: Value) -> ?f64 {
+    match v {
+        Float(f) => Some(f),
+        Int(i) => Some(i as f64),
+        Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+        Obj(b) => if b.kind == K_BIG { Some(big.to_f64(b)) } else { None },
+        _ => None,
+    }
+}
+
+pub fn write_float(b: *text.StrBuf, f: f64) {
+    if f != f { b.push_str("nan"); return; }
+    if f == 1.0 / 0.0 { b.push_str("inf"); return; }
+    if f == -1.0 / 0.0 { b.push_str("-inf"); return; }
+    let start = b.len();
+    num.write_shortest(b, f);
+    // Python writes 1e+16 for 1e16, and 1e-05 for 0.00001.
+    let s = b.as_str();
+    var has_e = false;
+    for i in start..s.len { if s[i] == 'e' { has_e = true; } }
+    if !has_e { num.mark_float(b, start); }
+}

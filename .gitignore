@@ -23,3 +23,7 @@ __pycache__/
 /bench/wasm/install
 /bench/wasm/spec-json
 /bench/wasm/programs-out
+/bench/python/src
+/bench/python/install
+/bench/python/out
+examples/python/scratch/
