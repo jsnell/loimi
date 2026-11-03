@@ -304,6 +304,37 @@ Python's (the only other user of std.bigint) now contains the unused
 `gcd`/`isqrt` functions; its binary has the same symbols with the same
 sizes.
 
+## Follow-up (2026-11-03): subquadratic std.bigint
+
+`std.bigint` gained a squaring routine (schoolbook, Karatsuba, Toom-3),
+Toom-3 products, column-wise (Comba) schoolbook base cases,
+divide-and-conquer (Burnikel-Ziegler) division, Zimmermann's Karatsuba
+square root, divide-and-conquer parsing, and division by precomputed
+reciprocals instead of `div_wide` (a `__udivti3` libcall); thresholds
+and a before/after table in `docs/stdlib.md` ("std.bigint"). pi and
+chudnovsky (best of 3, `--align 64`, seconds; Guile's integers are GMP's):
+
+| benchmark | before | after | goto | switch | guile-nojit | guile | before /guile | after /guile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pi (wall) | 0.258 | 0.158 | 0.160 | 0.160 | 0.112 | 0.109 | 2.37 | 1.45 |
+| chudnovsky (wall) | 0.209 | 0.184 | 0.193 | 0.185 | 0.190 | 0.152 | 1.36 | 1.21 |
+| pi (inner) | 0.251 | 0.157 | | | 0.098 | 0.093 | 2.69 | 1.69 |
+| chudnovsky (inner) | 0.206 | 0.185 | | | 0.180 | 0.136 | 1.49 | 1.36 |
+
+pi's arithmetic (numbers of up to 104 limbs) is 1.8x faster: square
+roots 2.7x, quotients 1.6x, products 1.5x (most are squares). The
+remaining gap to GMP is the base cases: Loimi has no add-with-carry
+intrinsic, so a limb product costs about 3 cycles to GMP's 1-1.5.
+chudnovsky's numbers are mostly a few limbs (its time is the
+interpreter and allocation). The other 41 Scheme programs and the
+Python suite are unchanged (A/B against a build with the previous
+std.bigint: geometric mean old/new 0.998 on the 41, Python's 11 within
+±3%). Against CPython 3.13, whose huge-number conversions and division
+use the subquadratic pure-Python `_pylong`: `str` of a 997,216-digit
+number 284 ms (before 1566, CPython 365), `int` of it 156 ms (963,
+666), the 1M by 0.5M-digit `divmod` 91 ms (764, 478), `isqrt` 65 ms
+(588, 635).
+
 ## Python (2026-11-03)
 
 The python suite was added to `bench/run_all.py` after the run above and

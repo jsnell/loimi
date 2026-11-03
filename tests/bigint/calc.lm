@@ -80,6 +80,11 @@ fn main() uses gc {
 fn run(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
     let op = w[0];
     if op[0] == 'g' and !op.eq("gcd") { return run_gc(h, o, w); }
+    if op.eq("parse") {
+        // Digits in radix w[2] (maybe with leading zeros), in decimal.
+        put_owned(o, bigint.parse(w[1], small(w[2]) as u32).unwrap());
+        return;
+    }
     var a = int(w[1]);
     match op {
         "add" | "sub" | "mul" | "and" | "or" | "xor" | "fdiv" | "tdiv" | "cmp" | "gcd" => {
@@ -110,6 +115,8 @@ fn run(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
             b.free();
         }
         "not" => put_owned(o, bigint.bit_not(a.num())),
+        // a * a with both operands the same limbs (the squaring routine).
+        "sqr" => put_owned(o, bigint.mul(a.num(), a.num())),
         "isqrt" => match bigint.isqrt(a.num()) { Some(r) => put_owned(o, r), None => o.push_str("none") },
         "pow" => put_owned(o, bigint.pow(a.num(), small(w[2]))),
         "shl" => put_owned(o, bigint.shl(a.num(), small(w[2]))),

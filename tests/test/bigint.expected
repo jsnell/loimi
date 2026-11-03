@@ -12,5 +12,9 @@ test caller_buffers ... ok
 test gc_objects ... ok
 test gcd_cases ... ok
 test isqrt_cases ... ok
+test products_at_thresholds ... ok
+test division_at_thresholds ... ok
+test isqrt_sizes ... ok
+test radix_at_thresholds ... ok
 
-test result: ok. 14 passed; 0 failed; 0 filtered out
+test result: ok. 18 passed; 0 failed; 0 filtered out

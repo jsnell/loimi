@@ -61,6 +61,46 @@ def divisor(rng, a, big):
     return rand_int(rng, big)
 
 
+def patterned(rng, n):
+    """A positive n-limb number with limbs that make carries: all ones,
+    zeros, a top bit, random."""
+    x = 0
+    kind = rng.random()
+    for _ in range(n):
+        if kind < 0.3:
+            limb = rng.choice([2**64 - 1, 2**64 - 1, 2**64 - 1, 0, rng.getrandbits(64)])
+        elif kind < 0.5:
+            limb = rng.choice([0, 0, 0, 1, 2**63, 2**64 - 1])
+        else:
+            limb = rng.getrandbits(64)
+        x = (x << 64) | limb
+    return x | (1 << (64 * n - 1)) if rng.random() < 0.5 else max(x, 1)
+
+
+def division(rng, big):
+    """a = q b + r with b and q of up to hundreds (thousands with --big)
+    of limbs, patterned limbs, and r = 0, b - 1 or random: the
+    corrections of the divide-and-conquer steps."""
+    hi = 3000 if big else 300
+    b = patterned(rng, rng.randint(2, hi))
+    k = rng.randint(1, hi)
+    if rng.random() < 0.3:
+        # Quotient limbs all ones: partial remainders whose top limbs
+        # equal the divisor's (the steps whose quotient overflows).
+        q = (1 << (64 * k)) - 1 - rng.choice([0, 0, 1, 2, rng.getrandbits(64)])
+        q >>= 64 * rng.choice([0, 0, rng.randint(0, k - 1)])
+        q = max(q, 1)
+    else:
+        q = patterned(rng, k)
+    r = rng.choice([0, b - 1, rng.randrange(b), b - (b >> 1)])
+    a = q * b + r
+    if rng.random() < 0.5:
+        a = -a
+    if rng.random() < 0.5:
+        b = -b
+    return a, b
+
+
 def floor_divmod(a, b):
     return divmod(a, b)
 
@@ -88,7 +128,7 @@ def gen(rng, n, big):
     ops = ['add', 'sub', 'mul', 'and', 'or', 'xor', 'fdiv', 'tdiv', 'cmp', 'not', 'pow', 'shl', 'shr',
            'hash', 'bitlen', 'i64', 'tof', 'fromf', 'radix',
            'gadd', 'gsub', 'gmul', 'gand', 'gor', 'gxor', 'gfdiv', 'gtdiv', 'gnot', 'gpow', 'gshl', 'gshr',
-           'gcd', 'ggcd', 'isqrt', 'gisqrt']
+           'gcd', 'ggcd', 'isqrt', 'gisqrt', 'sqr', 'parse']
     for _ in range(n):
         op = rng.choice(ops)
         a = rand_int(rng, big)
@@ -96,10 +136,38 @@ def gen(rng, n, big):
             b = rand_int(rng, big) if rng.random() < 0.8 else a + rng.choice([-1, 0, 1])
             if op in ('cmp',) and rng.random() < 0.3:
                 b = a
+            if op in ('mul', 'gmul') and rng.random() < 0.25:
+                # Past TOOM3 (250 limbs): balanced, nearly balanced and
+                # unbalanced shapes, patterned limbs.
+                n = rng.randint(200, 3000 if big else 900)
+                m = rng.choice([n, n, n - rng.randint(0, 3), rng.randint(200, 3 * n)])
+                a = patterned(rng, n) * rng.choice([1, -1])
+                b = patterned(rng, max(m, 1)) * rng.choice([1, -1])
             cases.append((op, a, b))
         elif op in ('fdiv', 'tdiv', 'gfdiv', 'gtdiv'):
-            b = divisor(rng, a, big) if rng.random() < 0.97 else 0
+            if rng.random() < 0.3:
+                a, b = division(rng, big)
+            else:
+                b = divisor(rng, a, big) if rng.random() < 0.97 else 0
             cases.append((op, a, b))
+        elif op == 'sqr':
+            r = rng.random()
+            if r < 0.3:
+                a = patterned(rng, rng.randint(1, 3000 if big else 300))
+            elif r < 0.45:
+                # Past TOOM3_SQR (500 limbs).
+                a = patterned(rng, rng.randint(400, 6000 if big else 1200))
+            cases.append((op, a, None))
+        elif op == 'parse':
+            r = rng.choice([10, 10, 10, 3, 7, 36, rng.randint(2, 36)])
+            if rng.random() < 0.1:
+                # Past PARSE_DC (512 limbs' worth of digits): divide and
+                # conquer.
+                a = patterned(rng, rng.randint(400, 6000 if big else 1600))
+            s = to_radix(abs(a), r)
+            if rng.random() < 0.2:
+                s = '0' * rng.randint(1, 3000) + s
+            cases.append((op, s, r))
         elif op in ('gcd', 'ggcd'):
             # A common factor most of the time, so the result is not just 1.
             g = rand_int(rng, False) if rng.random() < 0.7 else 1
@@ -115,6 +183,11 @@ def gen(rng, n, big):
                 a = s * s + rng.choice([-1, 0, 0, 1])
             elif r < 0.4:
                 a = rng.choice([0, 1, 2, 3, 4, 2**64 - 1, 2**64, 2**128 - 1, (2**64 - 1) ** 2, 2**63, 10**38])
+            elif r < 0.55:
+                # Roots with limb patterns, squared, plus 0, 1 or the
+                # largest remainder (2s), or minus 1.
+                s = patterned(rng, rng.randint(1, 1500 if big else 200))
+                a = s * s + rng.choice([-1, 0, 1, 2 * s])
             cases.append((op, a, None))
         elif op in ('pow', 'gpow'):
             a = rng.choice([a % (1 << 200), rng.randint(-20, 20), rng.getrandbits(64)])
@@ -198,6 +271,10 @@ def expect(op, a, b):
         return str(int(f))
     if op == 'radix':
         return to_radix(a, b)
+    if op == 'sqr':
+        return str(a * a)
+    if op == 'parse':
+        return str(int(a, b))
     raise ValueError(op)
 
 
@@ -264,7 +341,9 @@ def main():
     path = os.path.join(tmp, 'cases.txt')
     with open(path, 'w') as f:
         for op, a, b in cases:
-            if op in ('pow', 'gpow', 'shl', 'gshl', 'shr', 'gshr', 'radix'):
+            if op == 'parse':
+                f.write('%s %s %d\n' % (op, a, b))
+            elif op in ('pow', 'gpow', 'shl', 'gshl', 'shr', 'gshr', 'radix'):
                 f.write('%s %s %d\n' % (op, hexs(a), b))
             elif b is None:
                 f.write('%s %s\n' % (op, hexs(a)))
@@ -288,7 +367,11 @@ def main():
         g = got[k] if k < len(got) else '<missing>'
         if g != want:
             bad += 1
-            if bad <= 5:
+            if bad <= 5 and op == 'parse':
+                print('case %d: parse %s (radix %d)' % (k, a[:300], b))
+                print('  want %s' % want[:300])
+                print('  got  %s' % g[:300])
+            elif bad <= 5:
                 print('case %d: %s %s %s' % (k, op, hexs(a), '' if b is None else (hexs(b) if not isinstance(b, int) or op not in ('pow', 'gpow', 'shl', 'gshl', 'shr', 'gshr', 'radix') else b)))
                 print('  want %s' % want[:300])
                 print('  got  %s' % g[:300])

@@ -316,3 +316,140 @@ fn isqrt_cases() {
     test.eq(s(bigint.gc_isqrt(&h, Arg.Small(99)).unwrap().num()), "9");
     test.eq(bigint.gc_isqrt(&h, Arg.Small(-1)).is_none(), true);
 }
+
+/// n limbs: all ones (kind 0), or a pseudo-random pattern with runs of
+/// ones and zeros (kind 1). Leaks: tests are short.
+fn limbs(n: u64, kind: u64, seed: u64) -> Num {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    var x = seed;
+    for i in 0..n {
+        x = x *% 6364136223846793005 +% 1442695040888963407;
+        let r = x >> 33;
+        v.push(if kind == 0 or r % 4 == 0 { 0xffffffffffffffff } else if r % 4 == 1 { 0 } else { x });
+        if i + 1 == n and v.at(i) == 0 { v.set(i, 1); }
+    }
+    bigint.of_limbs(v.ptr, n, false)
+}
+
+#[test]
+fn products_at_thresholds() {
+    // Sizes around MUL_COLUMNS (14), KARATSUBA and KARATSUBA_SQR (48),
+    // TOOM3 (250) and TOOM3_SQR (500).
+    let sizes: [u64; 14] = [1, 13, 14, 15, 47, 48, 49, 96, 249, 250, 251, 499, 500, 501];
+    var one = bigint.of_i64(1);
+    for i in 0..14 {
+        let k = sizes[i];
+        // (B^k - 1)^2 = B^2k - 2 B^k + 1
+        let x = limbs(k, 0, 1);
+        var sq = bigint.mul(x, x);
+        var bk = bigint.shl(one.num(), 64 * k);
+        var b2k = bigint.shl(one.num(), 128 * k);
+        var t = bigint.sub(b2k.num(), bigint.shl(bk.num(), 1).num());
+        var want = bigint.add(t.num(), one.num());
+        test.assert(bigint.eq(sq.num(), want.num()));
+        // a * b checked by dividing back, and against squares:
+        // 4 a b = (a + b)^2 - (a - b)^2.
+        let a = limbs(k, 1, 2 + k);
+        let b = limbs(k, 1, 3 + k);
+        var p = bigint.mul(a, b);
+        let (q0, r0) = bigint.divmod(p.num(), b, true).unwrap();
+        var q = q0;
+        var r = r0;
+        test.assert(bigint.eq(q.num(), a));
+        test.assert(bigint.is_zero(r.num()));
+        var s1 = bigint.add(a, b);
+        var d1 = bigint.sub(a, b);
+        var s2 = bigint.mul(s1.num(), s1.num());
+        var d2 = bigint.mul(d1.num(), d1.num());
+        var diff = bigint.sub(s2.num(), d2.num());
+        var p4 = bigint.shl(p.num(), 2);
+        test.assert(bigint.eq(diff.num(), p4.num()));
+        // Unbalanced: 3k + 5 by k limbs.
+        let c = limbs(3 * k + 5, 1, 4 + k);
+        var pc = bigint.mul(c, a);
+        let (q1, r1) = bigint.divmod(pc.num(), a, false).unwrap();
+        var qq = q1;
+        var rr = r1;
+        test.assert(bigint.eq(qq.num(), c));
+        test.assert(bigint.is_zero(rr.num()));
+    }
+}
+
+#[test]
+fn division_at_thresholds() {
+    // a = q b + r with r = b - 1 and quotients of all ones or patterned
+    // (the correction steps), divisor and quotient sizes around DIV_DC
+    // (80) and twice it (two levels of recursion).
+    let sizes: [u64; 8] = [2, 40, 79, 80, 81, 160, 161, 330];
+    var one = bigint.of_i64(1);
+    for i in 0..8 {
+        for j in 0..8 {
+            let b = limbs(sizes[i], 1, 10 + i as u64);
+            let q = limbs(sizes[j], (i + j) as u64 % 2, 20 + j as u64);
+            var r = bigint.sub(b, one.num());
+            var qb = bigint.mul(q, b);
+            var a = bigint.add(qb.num(), r.num());
+            let (q0, r0) = bigint.divmod(a.num(), b, true).unwrap();
+            var gq = q0;
+            var gr = r0;
+            test.assert(bigint.eq(gq.num(), q));
+            test.assert(bigint.eq(gr.num(), r.num()));
+        }
+    }
+}
+
+#[test]
+fn isqrt_sizes() {
+    // isqrt(s^2 - 1) = s - 1, isqrt(s^2) = isqrt(s^2 + 2s) = s and
+    // isqrt(s^2 + 2s + 1) = s + 1, for roots of 1 to 130 limbs (odd and
+    // even square sizes, several levels of the Karatsuba square root).
+    var one = bigint.of_i64(1);
+    for k: u64 in 1..131 {
+        if k > 20 and k % 7 != 0 and k != 64 and k != 65 and k != 128 { continue; }
+        for kind: u64 in 0..2 {
+            let s = limbs(k, kind, 30 + k);
+            var sq = bigint.mul(s, s);
+            test.assert(bigint.eq(bigint.isqrt(sq.num()).unwrap().num(), s));
+            var below = bigint.sub(sq.num(), one.num());
+            var sm1 = bigint.sub(s, one.num());
+            test.assert(bigint.eq(bigint.isqrt(below.num()).unwrap().num(), sm1.num()));
+            var top = bigint.add(sq.num(), bigint.shl(s, 1).num());
+            test.assert(bigint.eq(bigint.isqrt(top.num()).unwrap().num(), s));
+            var above = bigint.add(top.num(), one.num());
+            var sp1 = bigint.add(s, one.num());
+            test.assert(bigint.eq(bigint.isqrt(above.num()).unwrap().num(), sp1.num()));
+        }
+    }
+}
+
+#[test]
+fn radix_at_thresholds() {
+    // Powers of ten written and parsed around DC_LIMBS (16 limbs, about
+    // 308 digits) and PARSE_DC (512 limbs' worth: 9728 digits).
+    let ks: [u64; 8] = [300, 308, 309, 330, 9727, 9728, 9729, 20000];
+    var ten = bigint.of_i64(10);
+    var one = bigint.of_i64(1);
+    for i in 0..8 {
+        let k = ks[i];
+        var p = bigint.pow(ten.num(), k);
+        var b = text.StrBuf.new();
+        b.push('1');
+        for _j in 0..k { b.push('0'); }
+        test.eq(s(p.num()), b.as_str());
+        test.assert(bigint.eq(bigint.parse(b.as_str(), 10).unwrap().num(), p.num()));
+        // 10^k - 1 is all nines; with as many leading zeros it parses
+        // the same.
+        var m = bigint.sub(p.num(), one.num());
+        var nines = text.StrBuf.new();
+        for _j in 0..k { nines.push('9'); }
+        test.eq(s(m.num()), nines.as_str());
+        var z = text.StrBuf.new();
+        for _j in 0..k { z.push('0'); }
+        z.push_str(nines.as_str());
+        test.assert(bigint.eq(bigint.parse(z.as_str(), 10).unwrap().num(), m.num()));
+        // A patterned number, round trip in radix 7.
+        let x = limbs(k / 19 + 1, 1, 40 + i as u64);
+        let t = str_r(x, 7);
+        test.assert(bigint.eq(bigint.parse(t, 7).unwrap().num(), x));
+    }
+}

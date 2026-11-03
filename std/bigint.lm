@@ -22,13 +22,16 @@
 // value type and come here on overflow (`num.add_overflow`), making a
 // `Num` of an `i64` with `from_i64(buf, x)` (one limb of buffer).
 //
-// Algorithms: schoolbook and Karatsuba multiplication (above KARATSUBA
-// limbs), Knuth's algorithm D for division, binary powering, and
-// divide-and-conquer radix conversion for formatting above DC_LIMBS
-// limbs (with schoolbook division, so still quadratic, but with a much
-// smaller constant than dividing by one limb at a time). Not built:
-// subquadratic division (Burnikel-Ziegler, Newton), FFT multiplication,
-// a separate squaring routine, divide-and-conquer parsing.
+// Algorithms (thresholds below, in limbs, measured; docs/stdlib.md has
+// the numbers): schoolbook multiplication (row by row, or column by
+// column for longer operands), Karatsuba, Toom-3; the same three for
+// squaring, used whenever both operands are the same limbs; Knuth's
+// algorithm D (dividing by a precomputed reciprocal, not `div_wide`,
+// which is a libcall) and above DIV_DC recursive divide-and-conquer
+// division (Burnikel-Ziegler, as in GMP's mpn_dcpi1_div_qr); Zimmermann's
+// Karatsuba square root; binary powering; divide-and-conquer formatting
+// (over the fast division) and parsing. Not built: FFT multiplication,
+// unbalanced Toom variants, Newton (Barrett) division, subquadratic gcd.
 
 import std.mem;
 import std.text;
@@ -38,10 +41,26 @@ extern "C" fn loimi_panic(msg: *u8, len: u64);
 
 /// Multiplications of at least this many limbs (both operands) use
 /// Karatsuba's algorithm.
-pub const KARATSUBA: u64 = 32;
+pub const KARATSUBA: u64 = 48;
+/// Squarings of at least this many limbs use Karatsuba squaring.
+pub const KARATSUBA_SQR: u64 = 48;
+/// Products of at least this many limbs (both operands) use Toom-3.
+pub const TOOM3: u64 = 250;
+/// Squarings of at least this many limbs use Toom-3 squaring.
+pub const TOOM3_SQR: u64 = 500;
+/// Schoolbook products and squares sum column by column (Comba) when
+/// the shorter operand has at least this many limbs, row by row below.
+const MUL_COLUMNS: u64 = 14;
+const SQR_COLUMNS: u64 = 14;
+/// Divisions whose divisor and quotient both have at least this many
+/// limbs use divide-and-conquer (Burnikel-Ziegler) division.
+pub const DIV_DC: u64 = 80;
 /// Formatting numbers of more limbs than this splits them in halves
 /// (divide and conquer).
-pub const DC_LIMBS: u64 = 30;
+pub const DC_LIMBS: u64 = 16;
+/// Parsing more than this many limbs' worth of digits splits the digits
+/// (divide and conquer).
+pub const PARSE_DC: u64 = 512;
 
 /// A signed integer: `neg` and the magnitude `d` (limbs, least
 /// significant first). Normalized: `d` has no zero limb at the top, and
@@ -222,12 +241,65 @@ fn submul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     c
 }
 
-/// r[0..na + nb] = a * b (na, nb >= 1); r must not overlap a or b.
+/// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
 fn mul_basecase(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
-    r[na] = mul_1(r, a, na, b[0]);
-    for j in 1..nb {
-        r[na + j] = addmul_1(r + j, a, na, b[j]);
+    if nb < MUL_COLUMNS {
+        // Row by row.
+        r[na] = mul_1(r, a, na, b[0]);
+        for j in 1..nb {
+            r[na + j] = addmul_1(r + j, a, na, b[j]);
+        }
+        return;
     }
+    // Column by column (Comba): each result limb is the sum of its
+    // products in a three-limb accumulator, so one store per limb; two
+    // accumulators (alternate products) halve the carry chains.
+    var c0: u64 = 0;
+    var c1: u64 = 0;
+    var c2: u64 = 0;
+    for k in 0..na + nb - 1 {
+        let i0 = if k >= nb { k - nb + 1 } else { 0 };
+        let i1 = if k < na { k + 1 } else { na };
+        var d0: u64 = 0;
+        var d1: u64 = 0;
+        var d2: u64 = 0;
+        var i = i0;
+        while i + 1 < i1 {
+            let (lo, hi) = a[i].mul_wide(b[k - i]);
+            let s0 = c0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = c1 +% t;
+            c2 += if s1 < t { 1 } else { 0 };
+            c0 = s0;
+            c1 = s1;
+            let (lo2, hi2) = a[i + 1].mul_wide(b[k - i - 1]);
+            let e0 = d0 +% lo2;
+            let u = hi2 + (if e0 < lo2 { 1 } else { 0 });
+            let e1 = d1 +% u;
+            d2 += if e1 < u { 1 } else { 0 };
+            d0 = e0;
+            d1 = e1;
+            i += 2;
+        }
+        if i < i1 {
+            let (lo, hi) = a[i].mul_wide(b[k - i]);
+            let s0 = c0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = c1 +% t;
+            c2 += if s1 < t { 1 } else { 0 };
+            c0 = s0;
+            c1 = s1;
+        }
+        let s0 = c0 +% d0;
+        let s1 = c1 +% d1;
+        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
+        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+        r[k] = s0;
+        c0 = s2;
+        c1 = c2;
+        c2 = 0;
+    }
+    r[na + nb - 1] = c0;
 }
 
 /// r[0..2n] = a * b, both n limbs, by Karatsuba's algorithm.
@@ -254,14 +326,253 @@ fn kmul(r: *u64, a: *u64, b: *u64, n: u64) {
     mem.release(t);
 }
 
+/// r[0..2n] = a * a (n >= 1) by schoolbook squaring: the products
+/// a[i] * a[j] for i < j once, doubled, plus the squares a[i] * a[i].
+/// Column by column like mul_basecase (rows for short numbers). r must
+/// not overlap a.
+fn sqr_basecase(r: *u64, a: *u64, n: u64) {
+    if n < SQR_COLUMNS {
+        sqr_rows(r, a, n);
+        return;
+    }
+    var c0: u64 = 0;
+    var c1: u64 = 0;
+    var c2: u64 = 0;
+    for k in 0..2 * n - 1 {
+        // The column's products a[i] a[k - i] for i < k - i, doubled,
+        // plus the square on the diagonal.
+        var d0: u64 = 0;
+        var d1: u64 = 0;
+        var d2: u64 = 0;
+        var i = if k >= n { k - n + 1 } else { 0 };
+        while 2 * i < k {
+            let (lo, hi) = a[i].mul_wide(a[k - i]);
+            let s0 = d0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = d1 +% t;
+            d2 += if s1 < t { 1 } else { 0 };
+            d0 = s0;
+            d1 = s1;
+            i += 1;
+        }
+        d2 = (d2 << 1) | (d1 >> 63);
+        d1 = (d1 << 1) | (d0 >> 63);
+        d0 = d0 << 1;
+        if (k & 1) == 0 {
+            let (lo, hi) = a[k / 2].mul_wide(a[k / 2]);
+            let s0 = d0 +% lo;
+            let s1 = d1 +% hi;
+            let s2 = s1 +% (if s0 < lo { 1 } else { 0 });
+            d2 += (if s1 < hi { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+            d0 = s0;
+            d1 = s2;
+        }
+        let s0 = c0 +% d0;
+        let s1 = c1 +% d1;
+        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
+        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+        r[k] = s0;
+        c0 = s2;
+        c1 = c2;
+        c2 = 0;
+    }
+    r[2 * n - 1] = c0;
+}
+
+/// sqr_basecase row by row: the off-diagonal products with mul_1 and
+/// addmul_1, shifted, plus the diagonal.
+fn sqr_rows(r: *u64, a: *u64, n: u64) {
+    if n == 1 {
+        let (lo, hi) = a[0].mul_wide(a[0]);
+        r[0] = lo;
+        r[1] = hi;
+        return;
+    }
+    r[0] = 0;
+    r[2 * n - 1] = 0;
+    r[n] = mul_1(r + 1, a + 1, n - 1, a[0]);
+    for i in 1..n - 1 {
+        r[n + i] = addmul_1(r + 2 * i + 1, a + i + 1, n - i - 1, a[i]);
+    }
+    lshift(r, r, 2 * n, 1);
+    var c: u64 = 0;
+    for i in 0..n {
+        let (lo, hi) = a[i].mul_wide(a[i]);
+        let x = r[2 * i];
+        let s1 = x +% lo;
+        let s2 = s1 +% c;
+        let c1: u64 = if s1 < x or s2 < s1 { 1 } else { 0 };
+        r[2 * i] = s2;
+        let y = r[2 * i + 1];
+        let t1 = y +% hi;
+        let t2 = t1 +% c1;
+        c = if t1 < y or t2 < t1 { 1 } else { 0 };
+        r[2 * i + 1] = t2;
+    }
+}
+
+/// r[0..2n] = a * a by Karatsuba squaring: with a = a1 B^h + a0,
+/// 2 a0 a1 = a0^2 + a1^2 - (a1 - a0)^2. r must not overlap a.
+fn ksqr(r: *u64, a: *u64, n: u64) {
+    if n < KARATSUBA_SQR {
+        sqr_basecase(r, a, n);
+        return;
+    }
+    let h = n / 2;
+    let hh = n - h;
+    ksqr(r, a, h);
+    ksqr(r + 2 * h, a + h, hh);
+    let t: *u64 = mem.alloc(5 * hh + 1);
+    let d = t;
+    let z = t + hh;
+    let w = t + 3 * hh;
+    // d = |a1 - a0| (hh limbs; a0 has h <= hh)
+    if mag_cmp(a + h, norm(a + h, hh), a, norm(a, h)) >= 0 {
+        sub_to(d, a + h, hh, a, h);
+    } else {
+        // a1 < a0, so a1's limb h (if hh > h) is zero.
+        sub_to(d, a, h, a + h, h);
+        if hh > h { d[h] = 0; }
+    }
+    let nd = norm(d, hh);
+    // w = a0^2 + a1^2 - d^2 = 2 a0 a1
+    mem.copy(w, r + 2 * h, 2 * hh);
+    w[2 * hh] = add_in(w, 2 * hh, r, 2 * h);
+    if nd > 0 {
+        ksqr(z, d, nd);
+        sub_in(w, 2 * hh + 1, z, 2 * nd);
+    }
+    add_in(r + h, 2 * n - h, w, norm(w, 2 * hh + 1));
+    mem.release(t);
+}
+
+/// r[0..2n] = a * a (n >= 1); r must not overlap a.
+fn sqr_mag(r: *u64, a: *u64, n: u64) {
+    if n >= TOOM3_SQR { toom3(r, a, a, n); } else { ksqr(r, a, n); }
+}
+
+/// r[0..2n] = a * b, both n limbs: Toom-3, Karatsuba or schoolbook.
+fn mul_n(r: *u64, a: *u64, b: *u64, n: u64) {
+    if n >= TOOM3 { toom3(r, a, b, n); } else if n >= KARATSUBA { kmul(r, a, b, n); } else { mul_basecase(r, a, n, b, n); }
+}
+
+/// x / 3 for x a multiple of 3.
+fn div3(x: Num) -> BigInt {
+    var v = room(max(x.d.len, 1));
+    divrem_1(v.ptr, x.d.ptr, x.d.len, 3);
+    own(v, view(v.ptr, x.d.len, x.neg))
+}
+
+/// x = x + y, replacing (and freeing) x.
+fn acc_add(x: *BigInt, y: Num) { let z = add(x.num(), y); x.free(); *x = z; }
+fn acc_sub(x: *BigInt, y: Num) { let z = sub(x.num(), y); x.free(); *x = z; }
+
+/// The values of a2 t^2 + a1 t + a0 at t = 1, -1, -2: (p1, pm1, pm2).
+fn toom3_eval(a0: Num, a1: Num, a2: Num) -> (BigInt, BigInt, BigInt) {
+    var t = add(a0, a2);
+    let p1 = add(t.num(), a1);
+    var pm1 = sub(t.num(), a1);
+    t.free();
+    // pm2 = 2 (pm1 + a2) - a0
+    var u = add(pm1.num(), a2);
+    var v = shl(u.num(), 1);
+    let pm2 = sub(v.num(), a0);
+    u.free();
+    v.free();
+    (p1, pm1, pm2)
+}
+
+/// r[0..2n] = a * b, both n limbs, by Toom-3: a and b split in three
+/// pieces of k limbs, as polynomials evaluated at 0, 1, -1, -2 and
+/// infinity, five products of about n / 3 limbs (recursively), and
+/// Bodrato's interpolation sequence. a == b squares (five squarings).
+/// Works on owned temporaries: it runs only on hundreds of limbs.
+fn toom3(r: *u64, a: *u64, b: *u64, n: u64) {
+    let k = (n + 2) / 3;
+    let a0 = view(a, k, false);
+    let a1 = view(a + k, k, false);
+    let a2 = view(a + 2 * k, n - 2 * k, false);
+    let b0 = view(b, k, false);
+    let b1 = view(b + k, k, false);
+    let b2 = view(b + 2 * k, n - 2 * k, false);
+    let sq = a == b;
+    let (e1, em1, em2) = toom3_eval(a0, a1, a2);
+    var p1 = e1;
+    var pm1 = em1;
+    var pm2 = em2;
+    var r1 = BigInt { neg: false, d: mem.Vec.new() };
+    var rm1 = BigInt { neg: false, d: mem.Vec.new() };
+    var rm2 = BigInt { neg: false, d: mem.Vec.new() };
+    if sq {
+        r1 = mul(p1.num(), p1.num());
+        rm1 = mul(pm1.num(), pm1.num());
+        rm2 = mul(pm2.num(), pm2.num());
+    } else {
+        let (f1, fm1, fm2) = toom3_eval(b0, b1, b2);
+        var q1 = f1;
+        var qm1 = fm1;
+        var qm2 = fm2;
+        r1 = mul(p1.num(), q1.num());
+        rm1 = mul(pm1.num(), qm1.num());
+        rm2 = mul(pm2.num(), qm2.num());
+        q1.free();
+        qm1.free();
+        qm2.free();
+    }
+    p1.free();
+    pm1.free();
+    pm2.free();
+    var r0 = mul(a0, b0);
+    var rinf = mul(a2, b2);
+    // r3 = (rm2 - r1) / 3
+    acc_sub(&rm2, r1.num());
+    var r3 = div3(rm2.num());
+    rm2.free();
+    // r1 = (r1 - rm1) / 2
+    acc_sub(&r1, rm1.num());
+    var h = shr(r1.num(), 1);
+    r1.free();
+    r1 = h;
+    // r2 = rm1 - r0
+    var r2 = sub(rm1.num(), r0.num());
+    rm1.free();
+    // r3 = (r2 - r3) / 2 + 2 rinf
+    var d = sub(r2.num(), r3.num());
+    r3.free();
+    r3 = shr(d.num(), 1);
+    d.free();
+    acc_add(&r3, rinf.num());
+    acc_add(&r3, rinf.num());
+    // r2 = r2 + r1 - rinf; r1 = r1 - r3
+    acc_add(&r2, r1.num());
+    acc_sub(&r2, rinf.num());
+    acc_sub(&r1, r3.num());
+    // r = r0 + r1 B^k + r2 B^2k + r3 B^3k + rinf B^4k (all nonnegative)
+    mem.memset(r as *u8, 0, 2 * n * 8);
+    mem.copy(r, r0.d.ptr, r0.d.len);
+    add_in(r + k, 2 * n - k, r1.d.ptr, r1.d.len);
+    add_in(r + 2 * k, 2 * n - 2 * k, r2.d.ptr, r2.d.len);
+    add_in(r + 3 * k, 2 * n - 3 * k, r3.d.ptr, r3.d.len);
+    add_in(r + 4 * k, 2 * n - 4 * k, rinf.d.ptr, rinf.d.len);
+    r0.free();
+    r1.free();
+    r2.free();
+    r3.free();
+    rinf.free();
+}
+
 /// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
 fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
+    if a == b and na == nb {
+        sqr_mag(r, a, na);
+        return;
+    }
     if nb < KARATSUBA {
         mul_basecase(r, a, na, b, nb);
         return;
     }
     if na == nb {
-        kmul(r, a, b, na);
+        mul_n(r, a, b, na);
         return;
     }
     // Unbalanced: multiply b by na / nb pieces of a.
@@ -270,24 +581,66 @@ fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
     var off: u64 = 0;
     while off < na {
         let len = min(nb, na - off);
-        if len == nb { kmul(t, a + off, b, nb); } else { mul_mag(t, b, nb, a + off, len); }
+        if len == nb { mul_n(t, a + off, b, nb); } else { mul_mag(t, b, nb, a + off, len); }
         add_in(r + off, na + nb - off, t, len + nb);
         off += len;
     }
     mem.release(t);
 }
 
+/// The reciprocal floor((B^2 - 1) / d) - B of a normalized limb d
+/// (top bit set), for `div_pi`.
+fn reciprocal(d: u64) -> u64 {
+    let (v, _) = (~d).div_wide(0xffffffffffffffff, d);
+    v
+}
+
+/// (nh nl) divmod d for nh < d, d normalized, di = reciprocal(d):
+/// Moller and Granlund's division by an invariant integer, two
+/// multiplications instead of a 128-bit division (which is a libcall).
+fn div_pi(nh: u64, nl: u64, d: u64, di: u64) -> (u64, u64) {
+    let (pl, ph) = nh.mul_wide(di);
+    let ql = pl +% nl;
+    var qh = ph +% nh +% 1 +% (if ql < pl { 1 } else { 0 });
+    var r = nl -% (qh *% d);
+    if r > ql {
+        qh = qh -% 1;
+        r = r +% d;
+    }
+    if r >= d {
+        qh += 1;
+        r -= d;
+    }
+    (qh, r)
+}
+
 /// q[0..n] = a / d, returns a % d (d != 0). `q` may be `a`.
 fn divrem_1(q: *u64, a: *u64, n: u64, d: u64) -> u64 {
+    if n == 0 { return 0; }
+    let s = d.clz() as u64;
+    let dn = d << s;
+    let di = reciprocal(dn);
     var r: u64 = 0;
     var i = n;
+    if s == 0 {
+        while i > 0 {
+            i -= 1;
+            let (qq, rr) = div_pi(r, a[i], dn, di);
+            q[i] = qq;
+            r = rr;
+        }
+        return r;
+    }
+    // Divide a << s by d << s, shifting a limb at a time.
+    r = a[n - 1] >> (64 - s);
     while i > 0 {
         i -= 1;
-        let (qq, rr) = r.div_wide(a[i], d);
+        let lo = if i > 0 { a[i - 1] >> (64 - s) } else { 0 };
+        let (qq, rr) = div_pi(r, (a[i] << s) | lo, dn, di);
         q[i] = qq;
         r = rr;
     }
-    r
+    r >> s
 }
 
 /// r[0..n] = a << s for 1 <= s < 64; returns the bits shifted out.
@@ -313,23 +666,29 @@ fn rshift(r: *u64, a: *u64, n: u64, s: u64) {
     r[n - 1] = a[n - 1] >> s;
 }
 
-/// Knuth's algorithm D: q[0..na - nb + 1] = a / b and r[0..nb] = a % b,
-/// for na >= nb >= 2 and b normalized. q and r must not overlap a or b.
-fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
-    let s = b[nb - 1].clz() as u64;
-    let bn: *u64 = mem.alloc(nb);
-    let an: *u64 = mem.alloc(na + 1);
-    if s > 0 {
-        lshift(bn, b, nb, s);
-        an[na] = lshift(an, a, na, s);
-    } else {
-        mem.copy(bn, b, nb);
-        mem.copy(an, a, na);
-        an[na] = 0;
+/// q[0..n] -= 1; returns the borrow.
+fn decr(q: *u64, n: u64) -> u64 {
+    var one: [u64; 1] = [1; 1];
+    if n == 0 { return 1; }
+    sub_in(q, n, &one[0], 1)
+}
+
+// Division works on a normalized divisor d (top bit set) and divides in
+// place: the dividend n[0..nn] is overwritten, its low dn limbs ending as
+// the remainder. Each routine writes nn - dn quotient limbs to q and
+// returns the quotient's limb above those (0 or 1).
+
+/// Knuth's algorithm D (nn >= dn >= 2).
+fn sb_div_qr(q: *u64, an: *u64, nn: u64, bn: *u64, nb: u64) -> u64 {
+    var qh: u64 = 0;
+    if mag_cmp(an + nn - nb, nb, bn, nb) >= 0 {
+        sub_in(an + nn - nb, nb, bn, nb);
+        qh = 1;
     }
     let btop = bn[nb - 1];
     let bsec = bn[nb - 2];
-    var j = na - nb + 1;
+    let binv = reciprocal(btop);
+    var j = nn - nb;
     while j > 0 {
         j -= 1;
         let hi = an[j + nb];
@@ -342,7 +701,7 @@ fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
             rhat = lo +% btop;
             rover = rhat < lo;
         } else {
-            let (qq, rr) = hi.div_wide(lo, btop);
+            let (qq, rr) = div_pi(hi, lo, btop, binv);
             qhat = qq;
             rhat = rr;
         }
@@ -368,6 +727,92 @@ fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
         }
         q[j] = qhat;
     }
+    qh
+}
+
+/// Divide-and-conquer division of n[0..2m] by d[0..m] (Burnikel and
+/// Ziegler; the structure of GMP's mpn_dcpi1_div_qr_n): the high half of
+/// the quotient from the top halves of both (recursively), then the
+/// product of that half by d's low half subtracted, then the same for the
+/// low half. tp: m limbs of scratch.
+fn dc_div_qr_n(q: *u64, n: *u64, d: *u64, m: u64, tp: *u64) -> u64 {
+    let lo = m / 2;
+    let hi = m - lo;
+    var qh = if hi < DIV_DC { sb_div_qr(q + lo, n + 2 * lo, 2 * hi, d + lo, hi) } else { dc_div_qr_n(q + lo, n + 2 * lo, d + lo, hi, tp) };
+    mul_mag(tp, q + lo, hi, d, lo);
+    var cy = sub_to(n + lo, n + lo, m, tp, m);
+    if qh != 0 { cy += sub_to(n + m, n + m, lo, d, lo); }
+    while cy != 0 {
+        qh -= decr(q + lo, hi);
+        cy -= add_to(n + lo, n + lo, m, d, m);
+    }
+    let ql = if lo < DIV_DC { sb_div_qr(q, n + hi, 2 * lo, d + hi, lo) } else { dc_div_qr_n(q, n + hi, d + hi, lo, tp) };
+    mul_mag(tp, d, hi, q, lo);
+    cy = sub_to(n, n, m, tp, m);
+    if ql != 0 { cy += sub_to(n + lo, n + lo, hi, d, hi); }
+    while cy != 0 {
+        decr(q, lo);
+        cy -= add_to(n, n, m, d, m);
+    }
+    qh
+}
+
+/// Division of n[0..nn] by d[0..dn] (nn >= dn >= 2): Knuth's algorithm D
+/// when the divisor or the quotient is short, otherwise divide and
+/// conquer in blocks of dn quotient limbs.
+fn div_qr(q: *u64, n: *u64, nn: u64, d: *u64, dn: u64) -> u64 {
+    let qn = nn - dn;
+    if dn < DIV_DC or qn < DIV_DC { return sb_div_qr(q, n, nn, d, dn); }
+    let tp: *u64 = mem.alloc(dn);
+    var qh: u64 = 0;
+    if qn >= dn {
+        // A short block of qn % dn quotient limbs at the top, then full
+        // blocks (each one's remainder is the top of the next dividend).
+        let k = qn % dn;
+        var off = qn - k;
+        var first = true;
+        if k > 0 {
+            qh = div_qr(q + off, n + off, dn + k, d, dn);
+            first = false;
+        }
+        while off > 0 {
+            off -= dn;
+            let h = dc_div_qr_n(q + off, n + off, d, dn, tp);
+            if first { qh = h; first = false; }
+        }
+    } else {
+        // Divide the top 2 qn limbs by d's top qn limbs, then subtract the
+        // quotient times d's low limbs and correct.
+        let lo = dn - qn;
+        qh = dc_div_qr_n(q, n + lo, d + lo, qn, tp);
+        if qn >= lo { mul_mag(tp, q, qn, d, lo); } else { mul_mag(tp, d, lo, q, qn); }
+        var cy = sub_to(n, n, dn, tp, dn);
+        if qh != 0 { cy += sub_to(n + qn, n + qn, lo, d, lo); }
+        while cy != 0 {
+            qh -= decr(q, qn);
+            cy -= add_to(n, n, dn, d, dn);
+        }
+    }
+    mem.release(tp);
+    qh
+}
+
+/// q[0..na - nb + 1] = a / b and r[0..nb] = a % b, for na >= nb >= 2 and
+/// b normalized. q and r must not overlap a or b.
+fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
+    let s = b[nb - 1].clz() as u64;
+    let bn: *u64 = mem.alloc(nb);
+    let an: *u64 = mem.alloc(na + 1);
+    if s > 0 {
+        lshift(bn, b, nb, s);
+        an[na] = lshift(an, a, na, s);
+    } else {
+        mem.copy(bn, b, nb);
+        mem.copy(an, a, na);
+        an[na] = 0;
+    }
+    // an's top limb is below bn's, so the quotient has na - nb + 1 limbs.
+    div_qr(q, an, na + 1, bn, nb);
     if s > 0 { rshift(r, an, nb, s); } else { mem.copy(r, an, nb); }
     mem.release(an);
     mem.release(bn);
@@ -877,9 +1322,8 @@ fn square_above(r: u64, n: u64) -> bool {
     hi != 0 or lo > n
 }
 
-/// floor(sqrt(a)), or None if a is negative. Above one limb this is
-/// Python's `math.isqrt`: Newton steps that double the precision of the
-/// root each time, then a final correction of at most one.
+/// floor(sqrt(a)), or None if a is negative: Zimmermann's Karatsuba
+/// square root (`sqrtrem`) above one limb.
 pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
     if a.neg { return None; }
     need(out, isqrt_size(a));
@@ -893,39 +1337,127 @@ pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
         out[0] = r;
         return Some(view(out.ptr, 1, false));
     }
-    let c = (bit_length(a) - 1) / 2;
-    var x = of_u64(1);
-    var d: u64 = 0;
-    var s = 64 - (c.clz() as u64);
-    while s > 0 {
-        s -= 1;
-        let e = d;
-        d = c >> s;
-        var t1 = shl(x.num(), d - e - 1);
-        var t2 = shr(a, 2 * c - e - d + 1);
-        let (q0, r0) = divmod(t2.num(), x.num(), false).unwrap();
-        var q = q0;
-        var r = r0;
-        let nx = add(t1.num(), q.num());
-        t1.free();
-        t2.free();
-        q.free();
-        r.free();
-        x.free();
-        x = nx;
+    // Scale a by 4^t so that it has an even number of limbs and its top
+    // limb is at least 2^62; then floor(sqrt(a)) = sqrtrem(a 4^t) >> t.
+    let n = a.d.len;
+    let m = (n + 1) / 2;
+    let pad = 2 * m - n;
+    let sh = (a.d[n - 1].clz() as u64) & 62;
+    let w: *u64 = mem.alloc(2 * m + 2 * m + 1);
+    let x = w;
+    let s = w + 2 * m;
+    let r = w + 3 * m;
+    if sh > 0 { lshift(x + pad, a.d.ptr, n, sh); } else { mem.copy(x + pad, a.d.ptr, n); }
+    sqrtrem(s, r, x, m);
+    let t = sh / 2 + 32 * pad;
+    if t > 0 { rshift(out.ptr, s, m, t); } else { mem.copy(out.ptr, s, m); }
+    mem.release(w);
+    Some(view(out.ptr, m, false))
+}
+
+/// The square root and remainder of a two-limb number (a1 >= 2^62):
+/// (s, r0, r1) with s = floor(sqrt(a)) and r1 r0 = a - s^2 (at most 2s).
+fn sqrtrem_2(a1: u64, a0: u64) -> (u64, u64, u64) {
+    let f = ((a1 as f64) * 18446744073709551616.0 + (a0 as f64)).sqrt();
+    var s: u64 = if f >= 18446744073709551615.0 { 0xffffffffffffffff } else { f as u64 };
+    // One Newton step from within 2^-50 of the root, then at most a few
+    // corrections. The step needs a1 < s for the 128 by 64 division.
+    if a1 < s {
+        let (q, _) = a1.div_wide(a0, s);
+        s = (s >> 1) + (q >> 1) + (s & q & 1);
+    } else {
+        s = 0xffffffffffffffff;
     }
-    var sq = mul(x.num(), x.num());
-    if cmp(sq.num(), a) > 0 {
-        var one: [u64; 1] = [1; 1];
-        let y = sub(x.num(), Num { neg: false, d: one[0..1] });
-        x.free();
-        x = y;
+    loop {
+        let (lo, hi) = s.mul_wide(s);
+        if hi > a1 or (hi == a1 and lo > a0) { s -= 1; } else { break; }
     }
-    sq.free();
-    let k = x.d.len;
-    mem.copy(out.ptr, x.d.ptr, k);
-    x.free();
-    Some(view(out.ptr, k, false))
+    while s != 0xffffffffffffffff {
+        let (lo, hi) = (s + 1).mul_wide(s + 1);
+        if hi < a1 or (hi == a1 and lo <= a0) { s += 1; } else { break; }
+    }
+    let (lo, hi) = s.mul_wide(s);
+    let r0 = a0 -% lo;
+    let r1 = a1 -% hi -% (if a0 < lo { 1 } else { 0 });
+    (s, r0, r1)
+}
+
+/// Zimmermann's Karatsuba square root (the structure of GMP's
+/// mpn_dc_sqrtrem): for a[0..2m] with a[2m - 1] >= 2^62, s[0..m] =
+/// floor(sqrt(a)) and r[0..m + 1] = a - s^2. With a = ah B^2l + a1 B^l +
+/// a0 (B = 2^64, l = m / 2): (s', r') = sqrtrem(ah), (q, u) = (r' B^l +
+/// a1) divmod 2 s', s = s' B^l + q, r = u B^l + a0 - q^2, and if r < 0
+/// one correction r += 2s - 1, s -= 1. Returns r's length.
+fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64) -> u64 {
+    if m == 1 {
+        let (s0, r0, r1) = sqrtrem_2(a[1], a[0]);
+        s[0] = s0;
+        r[0] = r0;
+        r[1] = r1;
+        return norm(r, 2);
+    }
+    let l = m / 2;
+    let h = m - l;
+    let sh = s + l;
+    // Scratch: r' (h + 1), N (m + 2), q (m + 2), u (h + 3), R (m + 3), q^2 (2 l).
+    let t: *u64 = mem.alloc(5 * m + 2 * h + 11);
+    let rp = t;
+    let nb = rp + h + 1;
+    let qb = nb + m + 2;
+    let ub = qb + m + 2;
+    let rb = ub + h + 3;
+    let q2 = rb + m + 3;
+    let rn = sqrtrem(sh, rp, a + 2 * l, h);
+    // N = (r' B^l + a1) / 2, and its low bit.
+    mem.copy(nb, a + l, l);
+    mem.copy(nb + l, rp, rn);
+    let low = nb[0] & 1;
+    rshift(nb, nb, m + 1, 1);
+    let nn = norm(nb, m + 1);
+    // (q, u) = N divmod s', then u = 2u + low: (r' B^l + a1) divmod 2 s'.
+    if nn < h {
+        mem.copy(ub, nb, nn);
+    } else if h == 1 {
+        ub[0] = divrem_1(qb, nb, nn, sh[0]);
+    } else {
+        divrem(qb, ub, nb, nn, sh, h);
+    }
+    ub[h] = lshift(ub, ub, h, 1);
+    ub[0] = ub[0] | low;
+    if qb[l] != 0 {
+        // q = B^l: use B^l - 1 and u + 2 s' instead.
+        for i in 0..l { qb[i] = 0xffffffffffffffff; }
+        qb[l] = 0;
+        add_in(ub, h + 3, sh, h);
+        add_in(ub, h + 3, sh, h);
+    }
+    mem.copy(s, qb, l);
+    // R = u B^l + a0 - q^2
+    mem.copy(rb, a, l);
+    mem.copy(rb + l, ub, h + 2);
+    var nr = norm(rb, m + 2);
+    let ql = norm(qb, l);
+    var n2: u64 = 0;
+    if ql > 0 {
+        sqr_mag(q2, qb, ql);
+        n2 = norm(q2, 2 * ql);
+    }
+    if mag_cmp(rb, nr, q2, n2) >= 0 {
+        sub_in(rb, nr, q2, n2);
+        nr = norm(rb, nr);
+        mem.copy(r, rb, nr);
+    } else {
+        // r = 2s - 1 - (q^2 - R), s -= 1
+        sub_to(q2, q2, n2, rb, nr);
+        let nd = norm(q2, n2);
+        r[m] = lshift(r, s, m, 1);
+        decr(r, m + 1);
+        sub_in(r, m + 1, q2, nd);
+        decr(s, m);
+        nr = norm(r, m + 1);
+    }
+    mem.release(t);
+    nr
 }
 
 // ── text ────────────────────────────────────────────────────────────
@@ -959,24 +1491,34 @@ fn write_base(b: *text.StrBuf, x: *u64, n: u64, radix: u32, base: u64, k: u64, p
         m = norm(t, m);
     }
     mem.release(t);
-    var digits: mem.Vec<u8> = mem.Vec.new();
-    var i: u64 = 0;
-    while i < chunks.len {
+    var buf: [u8; 64] = [0; 64];
+    var i = chunks.len;
+    var first = true;
+    while i > 0 {
+        i -= 1;
+        // The chunk's digits, right to left (radix 10 divides by a
+        // constant, which compiles to a multiplication).
         var c = chunks.at(i);
-        let last = i + 1 == chunks.len;
-        var j: u64 = 0;
-        while j < k and (!last or c != 0) {
-            digits.push(DIGITS[c % (radix as u64)]);
-            c = c / (radix as u64);
-            j += 1;
+        var j: u64 = 64;
+        if radix == 10 {
+            while c != 0 { j -= 1; buf[j] = DIGITS[c % 10]; c = c / 10; }
+        } else {
+            let r = radix as u64;
+            while c != 0 { j -= 1; buf[j] = DIGITS[c % r]; c = c / r; }
         }
-        i += 1;
+        if first {
+            var z = (64 - j) + i * k;
+            while z < pad { b.push('0'); z += 1; }
+            first = false;
+        } else {
+            while 64 - j < k { j -= 1; buf[j] = '0'; }
+        }
+        b.push_str(buf[j..64]);
     }
-    var z = digits.len;
-    while z < pad { b.push('0'); z += 1; }
-    var d = digits.len;
-    while d > 0 { d -= 1; b.push(digits.at(d)); }
-    digits.free();
+    if first {
+        var z: u64 = 0;
+        while z < pad { b.push('0'); z += 1; }
+    }
     chunks.free();
 }
 
@@ -1090,6 +1632,27 @@ pub fn parse_into(out: []u64, s: str, radix: u32) -> ?Num {
         return Some(view(r, size, false));
     }
     let (base, k) = chunk_base(radix);
+    if s.len <= PARSE_DC * k {
+        return Some(view(r, parse_base(r, s, radix, base, k), false));
+    }
+    // pows[i] = base^(2^i), for i up to the split of s.
+    var pows: mem.Vec<BigInt> = mem.Vec.new();
+    var b0: [u64; 1] = [base; 1];
+    pows.push(copy(Num { neg: false, d: b0[0..1] }));
+    while (k << pows.len) < s.len {
+        let top = pows.ptr_at(pows.len - 1).num();
+        pows.push(mul(top, top));
+    }
+    let n = parse_dc(r, s, &pows, radix, base, k);
+    for i in 0..pows.len { pows.ptr_at(i).free(); }
+    pows.free();
+    Some(view(r, n, false))
+}
+
+/// r = the digits s (valid, not a power-of-two radix), one limb-sized
+/// chunk at a time; r has parse_size(s.len) zeroed limbs. Returns the
+/// length.
+fn parse_base(r: *u64, s: str, radix: u32, base: u64, k: u64) -> u64 {
     var n: u64 = 0;
     var i: u64 = 0;
     let first = s.len % k;
@@ -1111,7 +1674,38 @@ pub fn parse_into(out: []u64, s: str, radix: u32) -> ?Num {
         i += len;
         len = k;
     }
-    Some(view(r, n, false))
+    n
+}
+
+/// Divide and conquer: the high digits times base^(2^i), plus the low
+/// k 2^i digits, for the largest such split; pows[i] = base^(2^i).
+fn parse_dc(r: *u64, s: str, pows: *mem.Vec<BigInt>, radix: u32, base: u64, k: u64) -> u64 {
+    if s.len <= PARSE_DC * k {
+        return parse_base(r, s, radix, base, k);
+    }
+    var i: u64 = 0;
+    while (k << (i + 1)) < s.len { i += 1; }
+    let split = s.len - (k << i);
+    let hs = s[0..split];
+    let ls = s[split..s.len];
+    let th: *u64 = mem.alloc(parse_size(hs.len, radix));
+    let tl: *u64 = mem.alloc(parse_size(ls.len, radix));
+    let nh = parse_dc(th, hs, pows, radix, base, k);
+    let nl = parse_dc(tl, ls, pows, radix, base, k);
+    let p = pows.ptr_at(i).num();
+    let np = p.d.len;
+    let t: *u64 = mem.alloc(nh + np + nl + 1);
+    if nh > 0 {
+        if nh >= np { mul_mag(t, th, nh, p.d.ptr, np); } else { mul_mag(t, p.d.ptr, np, th, nh); }
+    }
+    let nt = max(nh + np, nl) + 1;
+    add_in(t, nt, tl, nl);
+    let n = norm(t, nt);
+    mem.copy(r, t, n);
+    mem.release(t);
+    mem.release(th);
+    mem.release(tl);
+    n
 }
 
 // ── owned integers ──────────────────────────────────────────────────
