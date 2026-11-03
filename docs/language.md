@@ -36,6 +36,7 @@ roughly C's level of abstraction. It has deliberately few novel features.
 
 ### 1.1 Types
 
+<!-- snippet: skip summary of the type syntax, not a program -->
 ```loimi
 i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
@@ -53,23 +54,26 @@ Gc<closure fn(A) -> R>  // escaping closure in the GC heap
 
 Plus `struct`, `enum` (tagged unions), `bits` (packed bitfield integers),
 `object` (GC-managed structs, section 8), and `value` (section 2).
-**Not built:** `bits` (use shifts and masks, or a vm's generated field
-readers, section 3.3).
+**Not built:** `bits` (`bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }`,
+where `insn.a` reads bits 8..16; use shifts and masks, or a vm's
+generated field readers, section 3.3).
 
 ### 1.2 Basics
 
+<!-- snippet: check
+type Symbol = u32;
+{snippet}
+-->
 ```loimi
 fn gcd(a: u64, b: u64) -> u64 {
     var (x, y) = (a, b);
-    while y != 0 { (x, y) = (y, x % y); }
+    while y != 0 { let r = x % y; x = y; y = r; }
     x
 }
 
 struct Span { start: u32, end: u32 }
 
 enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
-
-bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 ```
 
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
@@ -185,11 +189,25 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   tried. Guarded arms do not count toward exhaustiveness. Note the
   difference from an arm whose *body* is an `if`:
 
+  <!-- snippet: check
+  value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+  vm V {
+      state { pc: *u32, regs: *Value }
+      operand reg = regs[it];
+      encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+      op DIV(dst: reg, a: reg, b: reg) : ABC {
+  {snippet}
+          raise "division by zero"
+      }
+      entry run(code: *u32, r: *Value) -> Result<Value, str> { regs = r; jump code }
+      on raise(e: str) { exit Err(e) }
+  }
+  -->
   ```loimi
   match (a, b) {
       (Int(x), Int(y)) if y != 0 => { dst = Int(x / y); next }   // y == 0: tries the next arm
       (Int(x), Int(y)) => if y != 0 { dst = Int(x / y); next },  // y == 0: continues after the match
-      (Int(x), _) => { .. }
+      (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
       _ => {}
   }
   ```
@@ -222,10 +240,12 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   ignored, since a misspelled `#[require_verified]` would silently drop
   a check. `#[allow(..)]` goes anywhere (items, vm items, fields, enum
   variants, match arms, `#![..]`); functions (also extern, trait and vm
-  functions) take `#[inline]`, `#[inline(always|never)]`, `#[cold]` and
-  `#[unsafe]`; a `vm` takes `#[require_verified]` and
-  `#[dispatch(mode)]`; a module-level `var` takes `#[thread_local]`; a
-  `super` takes `#[forward]`.
+  functions) take `#[inline]`, `#[inline(always|never)]`, `#[cold]`,
+  `#[unsafe]`, `#[test]` and `#[track_caller]` (below); `export "C"`
+  functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
+  enums named in a C header `#[c_name("..")]` (section 10.1); a `vm`
+  takes `#[require_verified]` and `#[dispatch(mode)]`; a module-level
+  `var` takes `#[thread_local]`; a `super` takes `#[forward]`.
 - **Tests.** `#[test]` marks a function `fn name()` (no parameters or
   result; it may declare effects) as a unit test. In a normal build it
   is an ordinary function. `loimi test FILE.lm [build options]
@@ -245,6 +265,7 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
+  <!-- snippet: skip excerpt: std/hash.lm declares the trait; the rest shows bounds with elided bodies -->
   ```loimi
   pub trait Hash {
       fn hash(k: Self) -> u64;
@@ -268,6 +289,17 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 
   Traits can also have:
 
+  <!-- snippet: check
+  import std.io;
+  import std.mem.{Vec};
+  struct Sym { id: u32 }
+  fn Sym.show(s: Sym) { io.print_int(s.id as i64); }
+  fn Sym.conv(s: Sym) -> i64 { s.id as i64 }
+  fn Vec<T>.show(v: Vec<T>) {}
+  {snippet}
+  impl Show for Sym;
+fn main() { Sym { id: 5 }.show_line(); }
+  -->
   ```loimi
   trait Show {
       fn show(x: Self);
@@ -280,7 +312,7 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   }
   impl Conv<i64> for Sym;
   impl<T: Show> Show for Vec<T>;      // every Vec<T> whose T is Show
-  fn total<T: Conv<i64>>(xs: []T) -> i64 { .. xs[i].conv() .. }
+  fn total<T: Conv<i64>>(xs: []T) -> i64 { var t = 0; for x in xs { t += x.conv(); } t }
   ```
 
   - **Default methods** have a body. An impl takes the type's own
@@ -341,6 +373,7 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   with `fn double<N>(x: N) -> N`.
 - **Closures** (`block fn`, non-escaping):
 
+  <!-- snippet: skip signatures and calls out of context, bodies elided -->
   ```loimi
   fn count_if(xs: []i64, pred: block fn(i64) -> bool) -> i64 { .. pred(xs[i]) .. }
   fn Vec<T>.sort_by(v: *Vec<T>, cmp: block fn(*T, *T) -> i32) { .. }
@@ -398,6 +431,7 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
 - **Escaping closures** (`closure fn`, `Gc<closure fn>`; built): closures
   that can be stored, returned and kept in collections.
 
+  <!-- snippet: skip items and statements out of context -->
   ```loimi
   struct Builtin { name: str, call: closure fn(i64) -> i64 }
 
@@ -578,6 +612,20 @@ how tables (lexer DFAs, operator precedence tables, op variants) are built.
 compile-time evaluation, and tables are filled at run time.
 `inline for` unrolls at compile time and can generate items, including ops:
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+enum Cond { Lt, Le, Eq }
+fn compare(c: Cond, a: Value, b: Value) -> Result<bool, str> { Ok(false) }
+vm V {
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    encoding fixed(u32) { format ABsC { op: 8, a: 8, b: 8, sc: s8 } }
+{snippet}
+    entry run(code: *u32, r: *Value) -> Result<Value, str> { regs = r; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+-->
 ```loimi
 inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] {
     op #name(a: reg, b: reg, target: label) : ABsC {
@@ -598,6 +646,12 @@ It can appear at module level, among the items of a `vm`, and as a
 statement in any block: function bodies, op handlers, vm functions,
 entries.
 
+<!-- snippet: run "6"
+import std.io;
+struct Regs { a: i64, b: i64, c: i64 }
+{snippet}
+fn main() { var r = Regs { a: 1, b: 2, c: 3 }; io.print_int(sum_fields(&r)); }
+-->
 ```loimi
 fn sum_fields(r: *Regs) -> i64 {
     var total: i64 = 0;
@@ -673,6 +727,13 @@ Every dynamic-language interpreter has a `Value` type, and its encoding is the
 most performance-critical decision in the VM. Loimi makes the encoding a
 declaration:
 
+<!-- snippet: check
+object Str { len: u64 }
+object Object { n: u64 }
+object Closure { n: u64 }
+object NativeFn { n: u64 }
+{snippet}
+-->
 ```loimi
 value Value repr nanbox {
     Num(f64) unboxed,          // any bit pattern that isn't a boxed tag
@@ -752,6 +813,7 @@ A `vm` block declares one interpreter: its register state, operand kinds,
 instruction encoding, inline caches, instructions, and entry and error
 handlers. It is the center of the language.
 
+<!-- snippet: skip outline of a vm's parts -->
 ```loimi
 vm Mini {
     context ctx: *Interp;                 // cold state, reachable from all handlers
@@ -807,6 +869,22 @@ An operand kind says what an encoded field *means*. Its body is an expression
 over the raw field `it`, evaluated in the handler. Its `verify` clause is
 checked once by the generated verifier instead of on every execution.
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Closure { upvals: *Value }
+struct Ctx { closure: *Closure }
+struct Proto { nregs: u64, consts: []Value, nupvals: u64 }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value, k: *Value }
+    verify_context proto: *Proto;
+{snippet}
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *Value) -> Value { regs = r; jump code }
+}
+-->
 ```loimi
 operand reg   = regs[it]   verify it < proto.nregs;
 operand kst   = k[it]      verify it < proto.consts.len;
@@ -834,6 +912,21 @@ to the encoders (`Vm.OP(a: u8, ..)`), so one `label` kind serves 8-bit and
 **Constant operands.** A `const` clause says that what an operand reads
 cannot change once the code is verified:
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Consts { data: []Value }
+struct Proto { consts: Consts }
+vm V {
+    state { pc: *u32, regs: *Value, k: *Value }
+    verify_context proto: *Proto;
+    operand reg = regs[it];
+{snippet}
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op LOADK(dst: reg, c: kst) : ABC { dst = c; next }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *Value) -> Value { regs = r; jump code }
+}
+-->
 ```loimi
 operand kst = k[it] const proto.consts.data.ptr verify (it as u64) < proto.consts.data.len;
 ```
@@ -859,6 +952,15 @@ Reads of the pool at a const operand's index through pointer arithmetic
 
 ### 3.3 Encodings and formats
 
+<!-- snippet: check
+vm V {
+    state { pc: *u32, acc: i64 }
+    operand imm = it;
+{snippet}
+    op HALT() : ABC { exit acc }
+    entry run(code: *u32) -> i64 { jump code }
+}
+-->
 ```loimi
 encoding fixed(u32) {                 // every instruction is one u32 word
     format ABC  { op: 8, a: 8, b: 8, c: 8 }
@@ -866,7 +968,17 @@ encoding fixed(u32) {                 // every instruction is one u32 word
     format ABsC { op: 8, a: 8, b: 8, sc: s8 }
     format sJ   { op: 8, sj: s24 }
 }
+```
 
+<!-- snippet: fail "only `encoding fixed(T)` is supported so far"
+vm V {
+    state { pc: *u8 }
+{snippet}
+    op HALT() : Z { exit 0 }
+    entry run(code: *u8) -> i64 { jump code }
+}
+-->
+```loimi
 encoding bytes {                       // variable length
     format Z    { op: u8 }
     format U8   { op: u8, x: u8 }
@@ -1001,6 +1113,16 @@ decoded values, signed fields as signed:
 
 ### 3.4 Ops and control words
 
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
 ```loimi
 op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
 ```
@@ -1043,6 +1165,7 @@ load overlaps with the handler's work.
 A stack VM declares what each op pops and pushes, after the format (and
 cache and `then`), in Forth notation:
 
+<!-- snippet: skip syntax excerpt, handler bodies elided (examples/stack has a complete stack vm) -->
 ```loimi
 verify_context word: *Word, words: *mem.Vec<*Word>;
 stack_entry word.nin;                       // depth the code starts with
@@ -1102,6 +1225,7 @@ synced where they are made (section 5). If its return type is `never`, it
 can use control words: `jump`, `next`, `redo`, `raise`, `exit`, `fail`, and
 `?` on the raise type. That makes shared tails easy to write:
 
+<!-- snippet: skip vm functions out of context; `...` elides code -->
 ```loimi
 fn call_closure(c: Gc<Closure>, base: *Value, nargs: u8) -> never { ...; jump c.proto.code }
 
@@ -1124,6 +1248,7 @@ Rules for `-> never` vm functions:
   instruction). It is the return address a shared call helper saves,
   correct for every calling op by construction:
 
+  <!-- snippet: skip excerpt with elided code -->
   ```loimi
   fn call(f: *Func, base: u64) -> never { fp = fp + 1; fp.ret = next_pc; ..; jump f.code }
   op CALL(b: reg, fi: fidx) : ABC { call(ctx.funcs[fi], b.raw) }
@@ -1160,6 +1285,7 @@ also gets where its `next` continues (the super's next part, section
 calling op's inline cache as a parameter of type `cache Name`, and the
 op passes `cache`:
 
+<!-- snippet: skip excerpt with elided code -->
 ```loimi
 cache GlobalIC { version: u64, entry: ?*Entry }
 
@@ -1197,6 +1323,7 @@ the op acts on.
 
 ### 3.6 Entries and the error path
 
+<!-- snippet: skip design sketch: frame stack and window helpers (std.rt) are not built -->
 ```loimi
 entry run(c: Gc<Closure>) {
     ctx.frames.push_entry_marker();
@@ -1263,6 +1390,21 @@ Handler code splits into a short fast path and a large, rare slow path
 path's calls force the compiler to treat the VM registers as clobbered, so the
 *fast* path ends up spilling them. Loimi makes the split explicit:
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+enum Arith { Add }
+struct Interp { x: i64 }
+fn arith(c: *Interp, op: Arith, a: Value, b: Value) -> Result<Value, str> { Err("bad operands") }
+vm V {
+    context ctx: *Interp;
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    entry run(c: *Interp, code: *u32, r: *Value) -> Result<Value, str> { ctx = c; regs = r; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+-->
 ```loimi
 op ADD(dst: reg, a: reg, b: reg) : ABC {
     if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.add_checked(y) {
@@ -1303,6 +1445,7 @@ Loimi has three ordered **effects** on functions:
 | `gc` | callee may run a garbage collection | `sync`, plus every live `Gc`/`Value` local made visible as a root |
 | `reenter` | callee may run guest code (call into the VM) | `gc`, plus state reloaded afterwards (the vm's `reload` block) |
 
+<!-- snippet: skip signatures only -->
 ```loimi
 fn new_string(h: *Heap, s: str) -> Gc<Str> uses gc;
 fn traceback(ctx: *Interp) -> String uses sync;
@@ -1353,6 +1496,22 @@ only that run's.) A vm
 whose handlers or vm functions make such calls declares how to get its
 state back, next to `sync`:
 
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Frame { base: u64, k: *Value }
+struct Ctx { fp: *Frame, stack: *Value }
+fn native(c: *Ctx, v: Value) -> Result<Value, str> uses reenter { Ok(v) }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op CALLN(dst: reg, a: reg) : ABC { dst = native(ctx, a)?; next }
+    entry run(c: *Ctx, code: *u32) -> Result<Value, str> uses gc { ctx = c; fp = c.fp; regs = c.stack; k = fp.k; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+-->
 ```loimi
 sync   { ctx.fp = fp; }                            // before: publish
 reload { fp = ctx.fp; regs = ctx.stack + fp.base; k = fp.k; }   // after: recompute
@@ -1388,6 +1547,12 @@ reload { fp = ctx.fp; regs = ctx.stack + fp.base; k = fp.k; }   // after: recomp
 
 A function type carries effects with the same syntax as a declaration:
 
+<!-- snippet: check
+import std.gc.{Heap};
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Interp { x: i64 }
+{snippet}
+-->
 ```loimi
 struct Hooks {
     scan:  fn(*Heap, *u8),                      // no effects
@@ -1535,6 +1700,7 @@ Mini, Scheme and MiniJS do this.
 **Verified code in an object.** An `object` can hold its code as its
 trailing array, marked as verified by a vm:
 
+<!-- snippet: skip excerpt with elided fields and code (tests/run/vm_verified_object.lm is complete) -->
 ```loimi
 object Proto { nregs: u32, consts: Gc<Arr>, .., code: verified [u32] by Mini }
 
@@ -1585,6 +1751,19 @@ scope. It checks tables the code refers to but the operand clauses do
 not see. MiniJS checks its exception handler table, so that `on raise`
 jumps only to instructions:
 
+<!-- snippet: check
+struct Table { data: []u32 }
+struct Proto { nregs: u32, handlers: Table }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op RET(a: reg) : ABC { exit a }
+{snippet}
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
 ```loimi
 verify handlers {
     let t = proto.handlers.data;   // [start, end, target, reg] per entry
@@ -1648,6 +1827,21 @@ matters for interpreters that load cached or untrusted bytecode files.
 
 ### 7.1 Inline caches
 
+<!-- snippet: run "4"
+import std.io;
+struct Shape { id: u32 }
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+{snippet}
+    op GETPROP(dst: reg, obj: reg, name: imm) : ABC + PropIC { next }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+fn main() { io.print_int(V.op_size(V.GETPROP(0, 1, 2) as u32) as i64); }
+-->
 ```loimi
 cache PropIC { shape: ?*Shape, slot: u32 }
 ```
@@ -1698,6 +1892,17 @@ instruction is an `OP`, or a member of its family, and `then.x` reads its
 operand `x`: decoded from that word with `OP`'s format and evaluated by
 `OP`'s operand kind, with `pc` at that word.
 
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } format sJ { op: 8, sj: s24 } }
+{snippet}
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+-->
 ```loimi
 op JMP(target: label) : sJ { jump target }
 op LT(a: reg, b: reg) : ABC then JMP {
@@ -1719,6 +1924,7 @@ A `family` is a group of ops that share operands, format, and cache, with
 specialized implementations. `become X` rewrites the current instruction's
 opcode in place.
 
+<!-- snippet: skip sketch over an object model that is not shown (examples/minijs has working GETPROP families over std.obj) -->
 ```loimi
 family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
     generic {
@@ -1751,6 +1957,26 @@ atomic store, which the compiler would emit when the vm is declared
 
 ### 7.3 Superinstructions
 
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *f64, k: *f64 }
+    operand reg = regs[it];
+    operand kst = k[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op LOADK(dst: reg, c: kst) : ABC { dst = c; next }
+    op LOADI(dst: reg, v: imm) : ABC { dst = v as f64; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    family ADD(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a + b; become ADD_F; next }
+        ADD_F { dst = a + b; next }
+    }
+    op RETURN(a: reg) : ABC { exit a }
+    op RET1(a: reg) : ABC { exit a }
+{snippet}
+    entry run(code: *u32, r: *f64) -> f64 { regs = r; k = r; jump code }
+}
+-->
 ```loimi
 super LOADK_ADD = LOADK; ADD;
 super MOVE_RETURN = MOVE; RETURN;
@@ -1785,6 +2011,22 @@ whose parts are the same with this part replaced by `X`, if one is
 declared, and otherwise to the sequence's first op, which splits the
 super up. For example, with
 
+<!-- snippet: check
+vm V {
+    state { pc: *u32, regs: *f64 }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op LOADI(dst: reg, v: imm) : ABC { dst = v as f64; next }
+    family ADD(dst: reg, a: reg, b: reg) : ABC {
+        generic { dst = a + b; become ADD_F; next }
+        ADD_F { dst = a + b; if a > 1e9 { become ADD; } next }
+    }
+    op RET(a: reg) : ABC { exit a }
+{snippet}
+    entry run(code: *u32, r: *f64) -> f64 { regs = r; jump code }
+}
+-->
 ```loimi
 super LOADI_ADD = LOADI; ADD;
 super LOADI_ADD_F = LOADI; ADD_F;
@@ -1969,6 +2211,35 @@ system confines rooting to the slow paths that can actually collect.
 
 ## 9. Instrumentation variants
 
+<!-- snippet: check
+struct Stats { ops: [u64; 16] }
+struct Tracer { n: u64 }
+fn Tracer.on_op(t: *Tracer, op: u32, pc: *u32, regs: *i64) uses sync { t.n += 1; }
+fn Tracer.on_line(t: *Tracer, pc: *u32) uses sync { t.n += 1; }
+struct Breakpoints { at: ?*u32 }
+fn Breakpoints.has(b: *Breakpoints, pc: *u32) -> bool { false }
+struct Debugger { n: u64 }
+fn Debugger.stop(d: *Debugger) -> Result<(), str> uses sync { Ok(()) }
+struct Ctx { stats: Stats, tracer: Tracer, breakpoints: Breakpoints, debugger: Debugger, pc: *u32 }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    sync { ctx.pc = pc; }
+    operand reg = regs[it];
+    operand label = pc + it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } format AsBx { op: 8, a: 8, sbx: s16 } }
+    op JMP(target: label) : AsBx { jump target }
+    op JLT(a: reg, target: label) : AsBx { if a < 0 { jump target } next }
+    op JLE(a: reg, target: label) : AsBx { if a <= 0 { jump target } next }
+    op JEQ(a: reg, target: label) : AsBx { if a == 0 { jump target } next }
+    op CALL(a: reg) : ABC { next }
+    op RETURN(a: reg) : ABC { exit Ok(a) }
+    op DEBUG_ON() : ABC { use_variant debug; next }
+{snippet}
+    entry run(c: *Ctx, code: *u32, r: *i64) -> Result<i64, str> { ctx = c; regs = r; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+-->
 ```loimi
 variant count wraps all {
     before { ctx.stats.ops[opcode] += 1; }
@@ -1979,7 +2250,9 @@ variant trace wraps all {
 variant debug wraps all {
     before { if ctx.breakpoints.has(pc) { cold { ctx.debugger.stop()? } } }
 }
-variant line_hook wraps [JMP, JLT, JLE, JEQ, CALL, RETURN] { ... }
+variant line_hook wraps [JMP, JLT, JLE, JEQ, CALL, RETURN] {
+    before { ctx.tracer.on_line(pc) }
+}
 ```
 
 Each variant generates a separate dispatch table of wrapper handlers, each
@@ -2012,17 +2285,25 @@ calls are implemented as nested entries (below).
   run a nested loop on top of the same VM stack, through an entry
   declared `uses reenter` (a *nested entry*):
 
+  <!-- snippet: excerpt examples/mini/vm.lm -->
   ```loimi
   entry call(c: *Ctx, at: *Frame, cl: Gc<Closure>) -> Result<V, V> uses reenter {
       ctx = c;
-      fp = at;                       // a frame above the caller's, args in place
-      fp.cl = cl; fp.nres = 1; k = cl.proto.consts.data.ptr; fp.k = k;
+      let p = cl.proto;
+      fp = at;
+      fp.cl = cl;
+      fp.nres = 1;
+      k = p.consts.data.ptr;
+      fp.k = k;
       regs = fp.base;
-      c.base = fp;                   // the sentinel: RET from here exits
+      c.base = fp;
       c.fp = fp;
-      jump cl.proto.code.ptr
+      jump p.code
   }
   ```
+
+  `at` is a frame above the caller's with the arguments in place, and
+  `c.base = fp` makes it the sentinel: RET from it exits the run.
 
   - **It is an entry**: in tail-call mode, a fresh call that makes the
     first `preserve_none` call into the handlers and returns when one of
@@ -2148,9 +2429,14 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   and aborts the process, host included. An export can catch them
   instead:
 
+  <!-- snippet: check
+  struct Regex { n: u32 }
+  fn run(r: *Regex, s: str, flags: u32) -> i32 { 0 }
+  {snippet}
+  -->
   ```loimi
   #[catch_panic(-1)]
-  export "C" fn rx_exec(r: *Regex, s: str, flags: u32) -> i32 { ... }
+  export "C" fn rx_exec(r: *Regex, s: str, flags: u32) -> i32 { run(r, s, flags) }
   ```
 
   A panic anywhere below the export on the same thread (in Loimi code,
@@ -2294,5 +2580,7 @@ compile to the same IR as without the catches.
 - **No borrow checker or ownership types.** Arenas and the GC cover
   interpreter workloads. The complexity budget goes to the hot loop.
 - **No exceptions or unwinding in host code.** Guest exceptions are a VM
-  concept (`raise` / `on raise`). Host errors are `Result`.
+  concept (`raise` / `on raise`). Host errors are `Result`. The escapes
+  that exist (`std.rt.protect`/`throw`, `#[catch_panic]`) are
+  `longjmp`-style tools for embedding: no `defer`s run (section 10.1).
 - **No implicit runtime.** No hidden allocations, no implicit GC outside `std.gc`.
