@@ -51,10 +51,13 @@ pub type HostFn = fn(*Machine, *u64) -> bool;
 pub struct Func {
     code: Verified<W>,
     nparams: u32,
-    /// Parameters and locals.
+    /// Parameters and locals (zeroed by calls from nparams on).
     nlocals: u32,
-    /// The whole frame: locals, operand stack, scratch.
+    /// The whole frame: locals, constant slots, operand stack, scratch.
     nslots: u32,
+    /// Constant slots, after the locals: calls copy `consts` there.
+    nconsts: u32,
+    consts: *u64,
     nresults: u32,
     /// Canonical signature id: equal ids mean equal function types.
     sig: u32,
@@ -179,11 +182,14 @@ pub vm W {
     state { pc: *u64, regs: *u64, fp: *Frame, mem: *u8, msize: u64 }
     verify_context f: *Func, inst: *Inst;
 
-    // A slot, read and written as each wasm type.
+    // A slot, read and written as each wasm type. The six kinds are views
+    // of one slot (they differ only in the type they cast to), so the
+    // `#[forward]` supers below link across them (I32_ADDK's `d: ri` to
+    // F64_LOAD's `a: ru`, F64_ADD's `d: rd` to F64_STORE's `v: rq`).
     operand ri = *((regs + it) as *i32) verify it < (f.nslots as u64) display "r{}";
     operand ru = *((regs + it) as *u32) verify it < (f.nslots as u64) display "r{}";
     operand rl = *((regs + it) as *i64) verify it < (f.nslots as u64) display "r{}";
-    operand rq = regs[it] verify it < (f.nslots as u64) display "r{}";
+    operand rq = *((regs + it) as *u64) verify it < (f.nslots as u64) display "r{}";
     operand rf = *((regs + it) as *f32) verify it < (f.nslots as u64) display "r{}";
     operand rd = *((regs + it) as *f64) verify it < (f.nslots as u64) display "r{}";
     operand imm = it;
@@ -523,6 +529,11 @@ pub vm W {
         var i = f.nparams as u64;
         let n = f.nlocals as u64;
         while i < n { nr[i] = 0; i += 1; }
+        // Constant slots (the pointer read once: the stores could alias f).
+        let ks = f.consts;
+        let nk = f.nconsts as u64;
+        var j: u64 = 0;
+        while j < nk { nr[n + j] = ks[j]; j += 1; }
         fp = fp + 1;
         fp.ret = next_pc;
         fp.regs = regs;
@@ -543,6 +554,11 @@ pub vm W {
         var i = f.nparams as u64;
         let n = f.nlocals as u64;
         while i < n { nr[i] = 0; i += 1; }
+        // Constant slots (the pointer read once: the stores could alias f).
+        let ks = f.consts;
+        let nk = f.nconsts as u64;
+        var j: u64 = 0;
+        while j < nk { nr[n + j] = ks[j]; j += 1; }
         // A record that RESTORE pops: the caller's instance and return.
         fp = fp + 1;
         fp.ret = next_pc;
@@ -641,6 +657,30 @@ pub vm W {
         ok
     }
 
+    // ── superinstructions ─────────────────────────────────────────────
+    // From `--vm-stats` on the float benchmarks (FRICTION.md, "Float
+    // benchmarks against wasm3"). `#[forward]`: where a part reads the slot
+    // the previous part wrote, the value stays in a machine register (the
+    // job wasm3's `fp0` does); `W.optimize` picks them after verification.
+    #[forward] super F64_MUL_F64_ADD = F64_MUL; F64_ADD;
+    #[allow(super_overlap)] #[forward] super F64_MUL_F64_SUB = F64_MUL; F64_SUB;
+    #[allow(super_overlap)] #[forward] super F64_MUL_F64_MUL = F64_MUL; F64_MUL;
+    #[allow(super_overlap)] #[forward] super F64_SUB_F64_MUL = F64_SUB; F64_MUL;
+    #[allow(super_overlap)] #[forward] super F64_ADD_F64_ADD = F64_ADD; F64_ADD;
+    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_MUL = F64_LOAD; F64_MUL;
+    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_ADD = F64_LOAD; F64_ADD;
+    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_SUB = F64_LOAD; F64_SUB;
+    #[allow(super_overlap)] #[forward] super F64_ADD_F64_STORE = F64_ADD; F64_STORE;
+    #[allow(super_overlap)] #[forward] super F64_SUB_F64_STORE = F64_SUB; F64_STORE;
+    #[allow(super_overlap)] #[forward] super F64_MUL_F64_DIV = F64_MUL; F64_DIV;
+    #[allow(super_overlap)] #[forward] super I32_ADDK_F64_LOAD = I32_ADDK; F64_LOAD;
+    #[allow(super_overlap)] #[forward] super CONST64_F64_DIV = CONST64; F64_DIV;
+    #[allow(super_overlap)] #[forward] super F64_DIV_F64_MUL = F64_DIV; F64_MUL;
+    #[allow(super_overlap)] #[forward] super F64_LOAD_F64_MUL_F64_ADD = F64_LOAD; F64_MUL; F64_ADD;
+    #[allow(super_overlap)] #[forward] super I32_ADD_I32_ADDK = I32_ADD; I32_ADDK;
+    #[allow(super_overlap)] #[forward] super I32_ADDK_BR_I32_NE = I32_ADDK; BR_I32_NE;
+    #[allow(super_overlap)] #[forward] super I32_ADDK_BRNZ = I32_ADDK; BRNZ;
+
     on raise(t: Trap) { fail t }
 
     entry run(m: *Machine, f: *Func, args: *u64) -> Result<(), Trap> {
@@ -654,6 +694,11 @@ pub vm W {
         var i = f.nparams as u64;
         let n = f.nlocals as u64;
         while i < n { args[i] = 0; i += 1; }
+        // Constant slots (the pointer read once: the stores could alias f).
+        let ks = f.consts;
+        let nk = f.nconsts as u64;
+        var j: u64 = 0;
+        while j < nk { args[n + j] = ks[j]; j += 1; }
         jump f.code
     }
 }

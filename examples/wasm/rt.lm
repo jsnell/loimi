@@ -93,7 +93,7 @@ pub fn Engine.new() -> *Engine {
         sigs: map.HashMap.new(),
         arena: mem.Arena.new(),
         stub_func: Func {
-            code: W.placeholder(), nparams: 0, nlocals: 0, nslots: 1, nresults: 0, sig: 0,
+            code: W.placeholder(), nparams: 0, nlocals: 0, nslots: 1, nconsts: 0, consts: 0 as *u64, nresults: 0, sig: 0,
             inst: mem.alloc<Inst>(1), host: None, host_data: 0,
         },
         stub_inst: empty_inst(em),
@@ -324,7 +324,7 @@ pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
         let f = mem.alloc<Func>(1);
         *f = Func {
             code: W.placeholder(), nparams: ft.params.len as u32, nlocals: c.nlocals,
-            nslots: c.nslots, nresults: ft.results.len as u32,
+            nslots: c.nslots, nconsts: c.nconsts, consts: c.consts, nresults: ft.results.len as u32,
             sig: inst.sigs.at(m.funcs.at(i) as u64), inst: inst, host: None, host_data: 0,
         };
         inst.funcs.push(f);
@@ -362,7 +362,7 @@ pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
         let f = inst.funcs.at(i);
         let c = compiled.at(i - (m.nfunc_imports as u64));
         match W.verify(c.words, f, inst) {
-            Ok(v) => f.code = v,
+            Ok(v) => f.code = W.optimize(v),
             Err(err) => {
                 e.msg.clear();
                 e.msg.push_str("internal error: translated code fails verification: ");
@@ -457,7 +457,7 @@ pub fn Engine.host_func(e: *Engine, params: []u8, results: []u8, h: HostFn, data
     let f = mem.alloc<Func>(1);
     *f = Func {
         code: W.placeholder(), nparams: params.len as u32, nlocals: params.len as u32,
-        nslots: (params.len + results.len) as u32, nresults: results.len as u32,
+        nslots: (params.len + results.len) as u32, nconsts: 0, consts: 0 as *u64, nresults: results.len as u32,
         sig: e.sig(params, results), inst: e.m.inst, host: Some(h), host_data: data,
     };
     f

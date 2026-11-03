@@ -67,6 +67,10 @@ pub struct T {
     r: decode.Reader,
     /// Functions that may be referenced by ref.func (declared).
     declared: *mem.Vec<bool>,
+    /// Constant slots: the values (64-bit, 32-bit ones zero-extended) of
+    /// slots nlocals0..nlocals0 + kvals.len, which calls initialize.
+    kvals: mem.Vec<u64>,
+    nlocals0: u64,
 }
 
 fn rrr(op: u64, a: u64, b: u64, c: u64) -> u64 {
@@ -81,11 +85,12 @@ pub fn T.new(m: *decode.Module, declared: *mem.Vec<bool>) -> T {
         nlocals: 0, max_height: 0, last_def_pc: 0, last_def_slot: 0, has_def: false,
         ret_label: bc.Label { id: 0 }, ret_used: false, results: [],
         r: decode.Reader.new([]), declared: declared,
+        kvals: mem.Vec.new(), nlocals0: 0,
     }
 }
 
 fn T.free(t: *T) {
-    t.code.free(); t.vals.free(); t.ctls.free(); t.locals.free();
+    t.code.free(); t.vals.free(); t.ctls.free(); t.locals.free(); t.kvals.free();
 }
 
 fn T.top(t: *T) -> *Ctl { t.ctls.ptr_at(t.ctls.len - 1) }
@@ -131,9 +136,70 @@ fn T.pop(t: *T, want: u8) -> Result<Val, str> {
 fn T.reg(t: *T, v: Val, pos: u64) -> u64 {
     match v.loc {
         Local => v.x,
-        Const => { let h = t.home(pos); t.write_const(h, v.ty, v.x); h }
+        Const => {
+            if let Some(k) = t.kslot(v.x) { return k; }
+            let h = t.home(pos); t.write_const(h, v.ty, v.x); h
+        }
         _ => t.home(pos),
     }
+}
+
+/// The constant slot holding `bits`, if there is one.
+fn T.kslot(t: *T, bits: u64) -> ?u64 {
+    for i in 0..t.kvals.len { if t.kvals.at(i) == bits { return Some(t.nlocals0 + i); } }
+    None
+}
+
+/// The most constant slots a function gets: each costs a copy per call.
+const MAX_KSLOTS: u64 = 32;
+
+/// Finds the constants that appear inside loops of the body (before
+/// translation, with its own reader), and gives each distinct value (but
+/// small integers) a constant slot, so that ops read them in place instead of running
+/// CONST32/CONST64 on every iteration (wasm3's constant slots).
+fn T.scan_consts(t: *T, code: []u8) -> Result<(), str> {
+    var r = decode.Reader.new(code);
+    var loops: mem.Vec<bool> = mem.Vec.new();
+    defer loops.free();
+    var depth: u64 = 0;
+    while !r.at_end() {
+        let op = code[r.pos];
+        var bits: u64 = 0;
+        var is_const = true;
+        match op {
+            // Integers that fit a K form's 16 bits are mostly used by one
+            // (I32_ADDK, BR_I32_LT_SK): only 0 (an absolute address's
+            // base, a stored zero) gets a slot among them.
+            0x41 => {
+                r.pos += 1;
+                let v = r.sleb(32)?;
+                bits = (v as u64) & 0xFFFFFFFF;
+                is_const = v == 0 or !fits16(v);
+            }
+            0x42 => {
+                r.pos += 1;
+                let v = r.sleb(64)?;
+                bits = v as u64;
+                is_const = v == 0 or !fits16(v);
+            }
+            0x43 => { r.pos += 1; bits = r.fixed32()? as u64; }
+            0x44 => { r.pos += 1; bits = r.fixed64()?; }
+            _ => {
+                is_const = false;
+                let o = r.skip_instr()?;
+                if o == 0x02 or o == 0x03 or o == 0x04 {
+                    loops.push(o == 0x03);
+                    if o == 0x03 { depth += 1; }
+                } else if o == 0x0B {
+                    if let Some(l) = loops.pop() { if l { depth -= 1; } }
+                }
+            }
+        }
+        if is_const and depth > 0 and t.kvals.len < MAX_KSLOTS and t.kslot(bits).is_none() {
+            t.kvals.push(bits);
+        }
+    }
+    Ok(())
 }
 
 fn T.write_const(t: *T, slot: u64, ty: u8, bits: u64) {
@@ -1116,7 +1182,8 @@ fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool, ri: u64) 
     Ok(())
 }
 
-pub struct Compiled { words: []u64, nslots: u32, nlocals: u32 }
+/// `consts`: the values of the constant slots, which follow the locals.
+pub struct Compiled { words: []u64, nslots: u32, nlocals: u32, nconsts: u32, consts: *u64 }
 
 /// Validates and translates the body of function `fidx` (a defined one).
 pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result<Compiled, str> {
@@ -1126,7 +1193,11 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     defer t.free();
     for i in 0..ft.params.len { t.locals.push(ft.params[i]); }
     for i in 0..body.locals.len { t.locals.push(body.locals.at(i)); }
-    t.nlocals = t.locals.len;
+    t.nlocals0 = t.locals.len;
+    // Constant slots follow the locals; a malformed body is reported by
+    // the translation proper.
+    if let Err(_) = t.scan_consts(body.code) { t.kvals.truncate(0); }
+    t.nlocals = t.nlocals0 + t.kvals.len;
     t.results = ft.results;
     t.r = decode.Reader.new(body.code);
     t.ret_label = t.code.label();
@@ -1140,5 +1211,10 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     let n = t.code.len();
     let words = mem.alloc<u64>(n);
     t.code.copy_into(words.slice(n));
-    Ok(Compiled { words: words.slice(n), nslots: nslots as u32, nlocals: t.nlocals as u32 })
+    let ks = mem.alloc<u64>(t.kvals.len + 1);
+    for i in 0..t.kvals.len { ks[i] = t.kvals.at(i); }
+    Ok(Compiled {
+        words: words.slice(n), nslots: nslots as u32, nlocals: t.nlocals0 as u32,
+        nconsts: t.kvals.len as u32, consts: ks,
+    })
 }

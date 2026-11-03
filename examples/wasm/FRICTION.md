@@ -34,6 +34,127 @@ binarytrees 0.97, coremark 0.97, fannkuchredux 0.97, fasta 1.00,
 mandelbrot 0.99, nbody 1.00, spectralnorm 1.01; geomean 0.985 (1.881 s
 against 1.909 s).
 
+### Float benchmarks against wasm3
+
+Why nbody, spectralnorm and fasta trailed wasm3 (1.25x, 1.21x, 1.18x)
+while mandelbrot led it, and what changed.
+
+**Evidence.** A wasm3 built with its op counters
+(`-Dd_m3EnableOpProfiling=1`, same flags otherwise) against
+`--vm-stats`:
+
+| | wasm3 ops | Loimi ops (before) | wasm3 ns/op | Loimi ns/op |
+|---|---:|---:|---:|---:|
+| nbody | 2.62 G | 1.87 G | 0.76 | 1.35 |
+| spectralnorm | 2.96 G | 2.16 G | 0.65 | 1.07 |
+| fasta | 1.40 G | 0.87 G | 0.83 | 1.55 |
+| mandelbrot | 2.94 G | 1.94 G | 0.68 | 0.97 |
+
+So the cause is the cost per dispatch, not the number of dispatches:
+wasm3 runs 40–60% more ops (on nbody 503 M `op_SetSlot_f64` and 253 M
+`op_SetSlot_i32` alone, the stores of its register operands to slots)
+at about half the time each. The handlers show why
+(`objdump` of both builds):
+
+- `F64_MUL d, a, b` is 14 instructions: 6 decode three 16-bit fields
+  from the word in `rdx` (`mov; shr; movzwl` per field), 3 load,
+  multiply and store, 5 dispatch (load the next word, advance `pc`,
+  `movzwl` the opcode, load the handler from the table, `jmp`).
+  wasm3's `op_f64_Multiply_rs` is 5: `movslq (%rdi),%rax; mulsd
+  (%rsi,%rax,4),%xmm0`, then the next handler's address from the code
+  stream and `jmp *%rax` (direct threading; one operand and the result
+  are `fp0`, which is `xmm0` across ops).
+- On a dependency chain (`x*y + z`, nbody's and spectralnorm's inner
+  loops), every Loimi intermediate goes through a slot: a store and a
+  load of the same address, about 5 cycles of store forwarding on top
+  of the arithmetic. wasm3's chains stay in `xmm0`. So yes, wasm3's
+  `fp0` (and its `_rs`/`_sr`/`_ss` variants) is what wins.
+
+Checked and not the cause: NaN canonicalization (neither interpreter
+canonicalizes in these handlers), `sqrt` (inline `sqrtsd` in both),
+`f64.div` (both `divsd`), the call path (nbody makes 2.5 M calls,
+spectralnorm 55), bounds checks (the same `lea; add; cmp; ja` in both),
+`floor`/`ceil` (none executed in these four; wasm3 is built
+`-O3 -fomit-frame-pointer`, baseline x86-64, and calls libm `floor`
+through a stack frame too). A target-CPU option was measured by
+compiling the same IR with `-march=x86-64-v2` and `-v3`: 0.998 and 0.989
+of the baseline build's time over nbody, spectralnorm and fasta (noise):
+LLVM 19 decodes the fields the same way with BMI2, and only the rounding
+ops would change (`roundsd`). Not added.
+
+**Loimi changes.**
+
+- *Forwarding between views of a slot* (language.md §7.3,
+  lowering.md §8): `#[forward]` links joined operands of the same kind
+  only, so `I32_ADDK d: ri` could not forward into `F64_LOAD a: ru`, nor
+  `F64_ADD d: rd` into `F64_STORE v: rq`. Kinds whose bodies differ only
+  in the type they cast to now link (`tests/run/vm_super_forward_views.lm`).
+  The six slot kinds here are such views (`rq` is now written
+  `*((regs + it) as *u64)` like the others).
+- *Loops in tail-call vm code are not vectorized or unrolled*
+  (`!llvm.loop` metadata, lowering.md §3): copying the constant slots in
+  CALL (below) made LLVM vectorize two loops, and the handler grew a stack
+  frame (`push %rbp`) and spills: 154 instructions. Now 50, no frame.
+  Mini, MiniJS and Scheme: their IR differs only in the metadata (their
+  Nil-filling loops, mostly in cold paths, are no longer vectorized);
+  benchmarks within noise (Scheme 0.982 by geometric mean; Mini and
+  MiniJS per benchmark within ±3% on reruns).
+- *Documented* (lowering.md §3): a float state variable stays in an SSE
+  register across tail calls (`state { .., acc: f64 }`: `acc = acc * a`
+  compiles to `mulsd (%r14,%rdx,8),%xmm0` plus the dispatch), so wasm3's
+  `fp0` is expressible; and the dispatch's table load folds into the
+  jump (`jmp *table(,%rax,8)`) only with at most five integer arguments
+  (this vm has seven). docs/roadmap.md open question 11 lists what could
+  make a three-operand op cheaper.
+
+**wasm changes.**
+
+- 18 `#[forward]` supers for float chains (`F64_MUL; F64_ADD`,
+  `F64_LOAD; F64_MUL; F64_ADD`, `F64_SUB; F64_STORE`, ..), address
+  arithmetic (`I32_ADDK; F64_LOAD`), loop counters (`I32_ADDK; BRNZ`,
+  `I32_ADDK; BR_I32_NE`) and `CONST64; F64_DIV`; `W.optimize` runs on
+  each function after verification.
+- Constant slots (wasm3's constant table): constants that appear inside
+  loops (floats, integers that do not fit a K form's 16 bits, and 0) get
+  a slot after the locals, which CALL fills from `Func.consts`, so ops
+  read them in place instead of running CONST32/CONST64 every iteration
+  (mandelbrot's `BR_F64_LE a, r24` against 4.0). At most 32 per function.
+
+Dispatches, before and after both: nbody 1.87 G to 1.22 G, spectralnorm
+2.16 G to 1.36 G, fasta 0.87 G to 0.75 G, mandelbrot 1.94 G to 1.36 G.
+- `fd_write` makes one `writev` per call instead of one `write` per
+  buffer (wasi-libc flushes with two): no measurable change on fasta.
+
+**Negative results.** Giving every constant in a loop a slot, small
+integers included, made fannkuchredux 4–6% slower (25 slots in its main
+function, nearly all used only by K forms); hence the filter. Reading
+the operand fields from memory instead of the word in a register
+(reloading the word in each handler) left the code as it was: LLVM does
+not narrow a load with three uses.
+
+**Results** (best of 5, interleaved, `--align-functions=64`, tail
+calls; the machine was shared with another agent's test runs, so
+±3% per benchmark is placement and load noise):
+
+| benchmark | wasm3 | before | after | before / wasm3 | after / wasm3 |
+|---|---:|---:|---:|---:|---:|
+| binarytrees | 1.469 | 1.595 | 1.643 | 1.09 | 1.12 |
+| coremark | 2.044 | 2.169 | 2.127 | 1.06 | 1.04 |
+| fannkuchredux | 1.726 | 1.650 | 1.625 | 0.96 | 0.94 |
+| fasta | 1.153 | 1.349 | 1.291 | 1.17 | 1.12 |
+| mandelbrot | 2.013 | 1.874 | 1.647 | 0.93 | 0.82 |
+| nbody | 1.997 | 2.617 | 2.016 | 1.31 | 1.01 |
+| spectralnorm | 1.921 | 2.335 | 1.868 | 1.22 | 0.97 |
+| **geomean** | 1.729 | 1.896 | 1.725 | 1.10 | **1.00** |
+
+Of that, the supers alone (an earlier run, best of 5): nbody 2.61 to
+2.09, spectralnorm 2.32 to 1.91, mandelbrot 1.89 to 1.72; the constant
+slots then mandelbrot 1.73 to 1.68 and fasta 1.37 to 1.32, others within
+noise. binarytrees (call-heavy: malloc) moved between 0.99x and 1.04x of
+its old time across runs. fasta still trails wasm3 by about 12%: its
+inner loops are integer (`I32_REM_U` random numbers, a binary search
+with two `SELECT4`s), which these changes barely touch.
+
 ## Summary
 
 | File | Lines | What |
