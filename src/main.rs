@@ -218,6 +218,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     vmexpand::expand(sm, &mut modules, opts.jit)?;
     let mut c = check::Checker::new(&modules);
     c.dispatch_override = opts.dispatch;
+    c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
     c.run()?;
     // Warnings, minus those inside an `#[allow(lint)]` region.
     let allowed = |w: &Diag| {

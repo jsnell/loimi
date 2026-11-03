@@ -206,7 +206,9 @@ quickening on/off.
    AArch64 Linux is now run, not just compiled: `--target=aarch64-linux-gnu`
    builds pass the whole test suite under qemu user-mode (all dispatch
    modes, GC stress; the JIT is x86-64 only), and the tail-call handlers
-   keep the vm state in registers with no spills on hot paths. Not yet run
+   keep the vm state in registers with no spills on hot paths; the
+   dispatch table's address is one of those registers, so a dispatch is
+   `ldr`, `and`, `ldr`, `br` with no `adrp`+`add` (lowering.md §3). Not yet run
    on hardware or with 16K/64K pages (qemu-user uses the host's 4K).
    Windows x64 and RISC-V status need checking per LLVM version. The `goto`
    fallback should make this a performance question, not a correctness one.

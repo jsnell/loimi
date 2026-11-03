@@ -278,13 +278,60 @@ Notes:
   wasm3's `fp0`; a vm that wants it needs ops that read and write the
   accumulator and a translator that keeps a value there between adjacent
   ops.
-- **Dispatch with many integer arguments.** With at most five integer
-  arguments (context, state variables and the instruction word), x86-64
-  isel folds the table load into the tail jump (`jmp *table(,%rax,8)`);
-  from six on it is `mov table(,%rax,8),%rax; jmp *%rax`, one more
-  fused-domain uop per dispatch. The wasm interpreter (seven) has the
-  longer form; moving its memory size from the state into `ctx` was
-  measured as noise.
+- **The dispatch table's address.** On x86-64 an executable (`-fno-pic`)
+  indexes the table as an absolute address. Whether the load folds into
+  the jump depends only on how many values the tail call passes in
+  registers: LLVM's x86 isel pattern for a tail call through memory
+  (`X86tcret_6regs` in `X86InstrCompiler.td`) refuses to fold when the
+  call has more than six register operands, a fixed count ("there
+  wouldn't be enough scratch registers for base+index") made for the C
+  convention's six argument registers. It does not look at which
+  registers are free: under `preserve_none` both forms use the same
+  scratch registers. Measured with standalone `.ll` handlers and
+  `clang-19 -O3 -fno-pic` (2026-11-03):
+
+  | register arguments (context, state, instruction word) | dispatch |
+  |---|---|
+  | up to 6 | `movzbl %sil,%eax; jmp *table(,%rax,8)` |
+  | 7 or more | `movzbl %dl,%eax; mov table(,%rax,8),%rax; jmp *%rax` |
+
+  The type and position of the arguments do not matter (the instruction
+  word first or last, `i32` or `i64`, pointers, `double`s in `xmm`
+  registers all count the same), and the fold also needs the table to be
+  a constant (an `internal constant`, as the generated one is). Mini,
+  MiniJS, Scheme and Lox pass 6 and get the folded form; the wasm
+  interpreter passes 7 and Stak 8. The longer form costs nothing
+  measurable: rewriting the wasm interpreter's 360 dispatches to
+  `jmp *table(,%rax,8)` in its assembly and timing both builds
+  (`bench/wasm/bench.py`, best of 3 interleaved, `-align-all-functions=6`)
+  gave a geometric mean of 1.007 of the original's time (per benchmark
+  0.96 to 1.03, within run-to-run noise). With nothing to win, the
+  compiler neither warns about the count nor reorders or packs state to
+  get under it.
+  A table address passed as an argument does not fold on x86-64 at any
+  count (`mov (%r14,%rax,8),%rax; jmp *%rax`), which is one reason the
+  table stays a global there.
+
+  On AArch64 a global's address takes `adrp` and `add` in every handler,
+  since nothing hoists them across tail calls. So in tail-call mode on
+  AArch64 the table's address is a hidden state variable (the `__tbl`
+  that variants use, section 7), set by the entry and kept in a register
+  by every handler; dispatch is
+
+  ```
+  ldr  w26, [x21, #4]!          ; next word, pc += 4
+  and  x8, x26, #0xff           ; opcode
+  ldr  x0, [x25, x8, lsl #3]    ; table in x25
+  br   x0
+  ```
+
+  four instructions instead of six. `preserve_none` has about twenty
+  argument registers on AArch64, so the extra one costs no spills: the
+  wasm interpreter's handlers went from 8045 to 7174 instructions in all
+  (most handlers 2 to 4 fewer; the rest is LLVM duplicating the cheaper
+  dispatch into branches that jumped to a shared one), Mini's hot
+  handlers mostly 2 to 4 fewer. Not timed: there is no AArch64 hardware
+  here, and qemu timings mean nothing.
 
 ### `next`, `jump`, `redo`, `become`
 
@@ -499,8 +546,10 @@ define internal preserve_nonecc void @Mini.count.ADD(ptr %ctx, ptr %pc, ptr %reg
 
 The inner handler dispatches through `%tbl`, which still points at the variant
 table, so the interpreter stays instrumented until the table is switched back.
-When a vm declares no variants, `%tbl` is not a state register: handlers
-address the default table as a global constant, which frees a register.
+When a vm declares no variants, `%tbl` is a state register only in
+tail-call mode on AArch64 (§3, "The dispatch table's address"); elsewhere
+handlers address the default table as a global constant, which frees a
+register.
 
 In goto and switch modes each entry is one function holding every
 handler, and a wrapper is a block that runs `before` and branches to the

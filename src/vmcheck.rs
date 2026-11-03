@@ -476,7 +476,20 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     for p in &d.state {
         add_state(c, p, &mut state)?;
     }
-    let tbl_idx = if d.variants.is_empty() {
+    let dispatch = match c.dispatch_override {
+        Some(x) => x,
+        None => match d.attrs.get("dispatch").and_then(|a| a.first()).map(|s| s.as_str()) {
+            Some("tailcall") | None => Dispatch::TailCall,
+            Some("goto") => Dispatch::Goto,
+            Some("switch") => Dispatch::Switch,
+            Some(x) => return Err(Diag::new(d.name.span, format!("unknown dispatch mode `{}`", x))),
+        },
+    };
+    // The dispatch table's address is a hidden state variable with
+    // variants (`use_variant` switches it), and in tail-call mode on
+    // AArch64, where a global's address costs `adrp`+`add` in every
+    // handler (lowering.md §3).
+    let tbl_idx = if d.variants.is_empty() && !(c.table_in_state && dispatch == Dispatch::TailCall) {
         None
     } else {
         state.push(("__tbl".to_string(), Ty::Ptr(Box::new(Ty::u8()))));
@@ -491,15 +504,6 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
     }
     let caches = cache_infos(c, m, &d, &mut l)?;
     let kinds = operand_kinds(&d, &state)?;
-    let dispatch = match c.dispatch_override {
-        Some(x) => x,
-        None => match d.attrs.get("dispatch").and_then(|a| a.first()).map(|s| s.as_str()) {
-            Some("tailcall") | None => Dispatch::TailCall,
-            Some("goto") => Dispatch::Goto,
-            Some("switch") => Dispatch::Switch,
-            Some(x) => return Err(Diag::new(d.name.span, format!("unknown dispatch mode `{}`", x))),
-        },
-    };
     let cc = if dispatch == Dispatch::TailCall { CallConv::PreserveNone } else { CallConv::C };
     if d.entries.is_empty() {
         return Err(Diag::new(d.name.span, "a vm needs at least one `entry`"));
@@ -1568,7 +1572,7 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
                 };
                 i as u32 + 1
             };
-            let Some(ti) = vd.tbl_idx else {
+            let (false, Some(ti)) = (c.vm_decls[vmi].1.variants.is_empty(), vd.tbl_idx) else {
                 return Err(Diag::new(name.span, "this vm declares no variants"));
             };
             let t = Ty::Ptr(Box::new(Ty::u8()));

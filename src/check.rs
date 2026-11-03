@@ -145,6 +145,9 @@ pub struct Checker<'a> {
     pub object_count: u32,
     pub vm_decls: Vec<(usize, crate::vmast::VmDecl)>,
     pub dispatch_override: Option<Dispatch>,
+    /// Tail-call vms keep their dispatch table's address in a state
+    /// register (AArch64: saves the `adrp`+`add` of every dispatch).
+    pub table_in_state: bool,
     pub vms: Vec<crate::vmcheck::VmInfo>,
     pub traits: crate::traits::Traits,
     pub aliases: Vec<AliasInfo>,
@@ -242,6 +245,7 @@ impl<'a> Checker<'a> {
             pending: vec![],
             vm_decls: vec![],
             dispatch_override: None,
+            table_in_state: false,
             vms: vec![],
             generics: Default::default(),
             traits: Default::default(),
