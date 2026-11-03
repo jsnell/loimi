@@ -51,6 +51,7 @@ fn main() -> i32 uses reenter {
         types: [None; 24], excs: [None; 32], strs: map.HashMap.new(), names: mem.Arena.new(),
         epoch: 1, next_cls: 1, gen_done: false, err_line: 0, buf: text.StrBuf.new(),
         n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0,
+        pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil,
     };
     let c = ctx;
     c.stack_end = c.stack + STACK - 16;
@@ -66,6 +67,7 @@ fn main() -> i32 uses reenter {
     c.fp = c.frames;
     c.n_init = Some(vm.intern(c, "__init__"));
     builtins.setup(c);
+    if let Err(_) = builtins.load_prelude(c) { io.eprintln("internal error: prelude"); return 1; }
     let g = value.new_dict(&c.heap, 32);
     c.globals = Some(g);
     value.dict_set_str(&c.heap, g, vm.intern(c, "__name__"), Value.Str(vm.intern(c, "__main__")));

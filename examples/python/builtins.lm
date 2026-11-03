@@ -111,6 +111,14 @@ pub enum B {
 #[inline(always)]
 pub fn b_list_append() -> u32 { B.LAppend as u32 }
 
+/// Builtins that consume an iterable last argument (see vm.call_slow).
+pub fn consumes(id: u32) -> bool {
+    match id as B {
+        Sum | Min | Max | Sorted | SJoin | LExtend => true,
+        _ => false,
+    }
+}
+
 // ── setup ───────────────────────────────────────────────────────────
 
 fn bv(b: B) -> Value { Value.Builtin(b as u32) }
@@ -1884,6 +1892,18 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         SysExit => Err(exc(c, E_SYSEXIT, "")),
         _ => Err(exc(c, E_TYPE, "unsupported builtin")),
     }
+}
+
+/// Helpers written in Python (see vm.call_slow).
+pub const PRELUDE_SRC: str = "def __list(g):\n    r = []\n    for x in g:\n        r.append(x)\n    return r\ndef __via1(f, g):\n    return f(__list(g))\ndef __via2(f, a, g):\n    return f(a, __list(g))\n";
+
+pub fn load_prelude(c: *Ctx) -> Result<(), Value> uses reenter {
+    let d = value.new_dict(&c.heap, 8);
+    compile.run_module_source(c, PRELUDE_SRC, d)?;
+    c.pre_list = value.dict_get_str(d, vm.intern(c, "__list")).unwrap();
+    c.pre_via1 = value.dict_get_str(d, vm.intern(c, "__via1")).unwrap();
+    c.pre_via2 = value.dict_get_str(d, vm.intern(c, "__via2")).unwrap();
+    Ok(())
 }
 
 /// Python source of the modules written in Python.

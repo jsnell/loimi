@@ -119,6 +119,10 @@ pub struct Ctx {
     mt: [u32; 624],
     mti: u64,
     vm_depth: u64,
+    /// Prelude functions (Python): list(g), f(list(g)), f(a, list(g)).
+    pre_list: Value,
+    pre_via1: Value,
+    pre_via2: Value,
 }
 
 /// Interned string for a name (kept alive for the run).
@@ -156,6 +160,9 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.n_init);
     gc_mark(h, c.n_str);
     gc_mark(h, c.n_repr);
+    gc_mark(h, c.pre_list);
+    gc_mark(h, c.pre_via1);
+    gc_mark(h, c.pre_via2);
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
@@ -248,6 +255,18 @@ pub vm Py {
                     push_frame(f, regs + w, regs + b, flags)
                 }
                 Builtin(id) => {
+                    // A generator argument to a consuming builtin: collect it
+                    // in Python (prelude), so it runs in this loop rather than
+                    // through a nested run per item.
+                    if kw == Nil and nn >= 1 and nn <= 2 and value.is_kind(regs[w + nn - 1], K_GEN) and builtins.consumes(id) {
+                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                        var i = nn;
+                        while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
+                        regs[w] = callee;
+                        callee = if nn == 1 { ctx.pre_via1 } else { ctx.pre_via2 };
+                        nn += 1;
+                        continue;
+                    }
                     let r = builtins.call(ctx, id, regs + w, nn, kw)?;
                     if (flags & F_DISCARD) == 0 { regs[b] = r; }
                     next
@@ -264,6 +283,18 @@ pub vm Py {
                     }
                     if o.kind == K_CLASS {
                         if o.n != 0 {
+                            if kw == Nil and nn == 1 and value.is_kind(regs[w], K_GEN) and o.n < 1000 {
+                                let t = (o.n - 1) as u64;
+                                if t == T_LIST { callee = ctx.pre_list; continue; }
+                                if t == T_TUPLE or t == T_SET or t == T_FROZENSET or t == T_DICT {
+                                    if !ensure(regs + w + 3) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                                    regs[w + 1] = regs[w];
+                                    regs[w] = callee;
+                                    callee = ctx.pre_via1;
+                                    nn = 2;
+                                    continue;
+                                }
+                            }
                             regs[b] = builtins.construct(ctx, o, regs + w, nn, kw)?;
                             next
                         }

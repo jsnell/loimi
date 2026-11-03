@@ -1577,16 +1577,32 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
         for i in 0..n { l.arr.items[j as u64] = src.arr.items[i]; j += step; }
         return Ok(());
     }
-    let stop = if stop0 < start { start } else { stop0 };
-    var xs: mem.Vec<Value> = mem.Vec.new();
-    for i in 0..start as u64 { xs.push(l.arr.items[i]); }
-    for i in 0..src.len { xs.push(src.arr.items[i]); }
-    for i in stop as u64..l.len { xs.push(l.arr.items[i]); }
-    if xs.len > l.arr.items.len { value.list_grow(&c.heap, l, xs.len); }
-    for i in 0..xs.len { l.arr.items[i] = xs.at(i); }
-    for i in xs.len..l.len { l.arr.items[i] = Value.Nil; }
-    l.len = xs.len;
-    xs.free();
+    let stop = (if stop0 < start { start } else { stop0 }) as u64;
+    let a0 = start as u64;
+    let n = src.len;
+    if (src as u64) == (l as u64) {
+        // l[a:b] = l: copy the source first.
+        let cp = value.list_of(&c.heap, value.list_items(src));
+        return setslice(c, obj, lo, hi, st, Value.List(cp));
+    }
+    let old_n = stop - a0;
+    let new_len = l.len - old_n + n;
+    if new_len > l.arr.items.len { value.list_grow(&c.heap, l, new_len); }
+    let items = l.arr.items.ptr;
+    if n != old_n {
+        // Move the tail.
+        let tail = l.len - stop;
+        if n > old_n {
+            var i = tail;
+            while i > 0 { i -= 1; items[a0 + n + i] = items[stop + i]; }
+        } else {
+            for i in 0..tail { items[a0 + n + i] = items[stop + i]; }
+        }
+    }
+    for i in 0..n { items[a0 + i] = src.arr.items[i]; }
+    for i in new_len..l.len { items[i] = Value.Nil; }
+    l.len = new_len;
+    gc.write_barrier(&c.heap, l.arr as *u8);
     Ok(())
 }
 
