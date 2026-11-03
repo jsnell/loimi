@@ -40,8 +40,17 @@ def enc(s):
 MASK = {"i32": 0xFFFFFFFF, "f32": 0xFFFFFFFF, "i64": (1 << 64) - 1, "f64": (1 << 64) - 1}
 
 
+def ref_bits(val):
+    # null is 0; host reference N is N + 1
+    return 0 if val == "null" else int(val) + 1
+
+
 def arg_token(v):
     t = v["type"]
+    if t in ("externref", "funcref"):
+        if t == "funcref" and v["value"] != "null":
+            return None
+        return "ref:%x" % ref_bits(v["value"])
     if t not in MASK:
         return None
     val = v["value"]
@@ -52,10 +61,12 @@ def arg_token(v):
 
 def match_value(exp, got_bits):
     t = exp["type"]
+    if t in ("externref", "funcref"):
+        val = exp.get("value")
+        if val is None or (t == "funcref" and val != "null"):
+            return got_bits != 0   # some non-null function
+        return got_bits == ref_bits(val)
     if t not in MASK:
-        # reference types: only null is representable here
-        if exp.get("value") == "null":
-            return got_bits == 0
         return False
     bits = got_bits & MASK[t]
     val = exp["value"]

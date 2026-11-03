@@ -28,17 +28,11 @@ FAIL=0
 modes="tailcall goto switch"
 if [ $FAST = 1 ]; then modes=tailcall; fi
 
-# The MVP files of the (Wasm 2.0-era) testsuite, plus those of the
-# extensions the interpreter implements (sign extension, saturating
-# truncation, multi-value, memory.copy/fill).
-SPEC_MVP="address align binary-leb128 block br br_if br_table call comments const conversions custom
-data endianness exports f32 f32_bitwise f32_cmp f64 f64_bitwise f64_cmp fac float_exprs float_literals
-float_memory float_misc forward func func_ptrs i32 i64 if imports inline-module int_exprs int_literals
-labels left-to-right linking load local_get local_set local_tee loop memory memory_copy memory_fill
-memory_grow memory_redundancy memory_size memory_trap names nop return skip-stack-guard-page stack start
-store switch table-sub token traps type unreachable unreached-invalid unwind utf8-custom-section-id
-utf8-import-field utf8-import-module utf8-invalid-encoding"
-SPEC_FAST="address block br_table call conversions f64 i32 i64 if loop memory_trap traps unreached-invalid"
+# Every file of the (Wasm 2.0-era) testsuite except SIMD: the MVP plus
+# sign extension, saturating truncation, multi-value, reference types
+# and bulk memory.
+SPEC_MVP=$(ls "$ROOT/bench/wasm/spec-json" 2>/dev/null | grep -v '^simd_' | grep -v '[.]txt$' | grep -v '^[A-Z]*$')
+SPEC_FAST="address block br_table call call_indirect conversions f64 i32 i64 if loop memory_trap table_init traps unreached-invalid"
 
 for mode in $modes; do
     if ! (ulimit -v 2500000; cd "$DIR" && "$LOIMI" build -W error main.lm --release --dispatch="$mode" -o "$TMP/wasm-$mode") > "$TMP/build.log" 2>&1; then

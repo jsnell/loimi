@@ -60,7 +60,7 @@ pub fn spectest(e: *Engine) -> *ModInst {
     mi.add_global("global_f32", T_F32, vm.f32_bits(666.6) as u64);
     mi.add_global("global_f64", T_F64, (666.6).to_bits());
     let t = mem.alloc<Table>(1);
-    *t = Table { elems: mem.alloc<?*Func>(10), size: 10, max: 20, reftype: T_FUNCREF };
+    *t = Table { elems: mem.alloc<u64>(10), size: 10, max: 20, reftype: T_FUNCREF };
     mi.exports.insert("table", Extern { kind: 1, func: None, table: Some(t), memory: None, global: None, gtype: 0, gmut: false });
     let mm = mem.alloc<Memory>(1);
     *mm = Memory { data: mem.alloc<u8>(65536 + 8), size: 65536, max_pages: 2 };

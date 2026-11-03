@@ -71,6 +71,8 @@ pub struct Module {
     elems: mem.Vec<ElemSeg>,
     datas: mem.Vec<DataSeg>,
     data_count: ?u32,
+    /// Code uses memory.init or data.drop (needs a data count section).
+    uses_data_idx: bool,
     bodies: mem.Vec<Body>,
     arena: mem.Arena,
 }
@@ -342,7 +344,7 @@ pub fn Module.new() -> Module {
         types: mem.Vec.new(), imports: mem.Vec.new(), funcs: mem.Vec.new(), nfunc_imports: 0,
         tables: mem.Vec.new(), ntable_imports: 0, mems: mem.Vec.new(), nmem_imports: 0,
         globals: mem.Vec.new(), nglobal_imports: 0, exports: mem.Vec.new(), start: None,
-        elems: mem.Vec.new(), datas: mem.Vec.new(), data_count: None, bodies: mem.Vec.new(),
+        elems: mem.Vec.new(), datas: mem.Vec.new(), data_count: None, uses_data_idx: false, bodies: mem.Vec.new(),
         arena: mem.Arena.new(),
     }
 }
@@ -484,6 +486,7 @@ fn Module.section(m: *Module, id: u8, r: *Reader, nfuncs_declared: *u64) -> Resu
                 while depth > 0 {
                     if b.at_end() { return Err("unexpected end"); }
                     let op = b.skip_instr()?;
+                    if op == 0xFC08 or op == 0xFC09 { m.uses_data_idx = true; }
                     if op == 0x02 or op == 0x03 or op == 0x04 { depth += 1; }
                     if op == 0x0B { depth -= 1; }
                 }
@@ -612,6 +615,7 @@ pub fn decode(buf: []u8) -> Result<Module, str> {
     if let Some(c) = m.data_count {
         if (c as u64) != m.datas.len { return Err("data count and data section have inconsistent lengths"); }
     }
+    if m.uses_data_idx and m.data_count.is_none() and m.datas.len > 0 { return Err("data count section required"); }
     Ok(m)
 }
 

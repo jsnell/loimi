@@ -773,26 +773,20 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let fi = r.u32()? as u64;
             if fi >= t.m.funcs.len { return Err("unknown function"); }
             let ft = t.m.types.at(t.m.funcs.at(fi) as u64);
-            t.call(ft, W.CALL(0, fi as u32), 0, false)?;
+            t.call(ft, W.CALL(0, fi as u32), 0, false, 0)?;
         }
         0x11 => {
             let ti = r.u32()? as u64;
             let tab = r.u32()? as u64;
             if tab >= t.m.tables.len { return Err("unknown table"); }
             if ti >= t.m.types.len { return Err("unknown type"); }
-            if tab != 0 { return Err("call_indirect: only table 0 is supported"); }
+            if t.m.tables.at(tab).reftype != T_FUNCREF { return Err("type mismatch"); }
             let ft = t.m.types.at(ti);
             let idx = t.pop(T_I32)?;
             let p = t.vals.len;
             var ri: u64 = 0;
             if !t.dead() { ri = t.reg(idx, p); }
-            t.call(ft, 0, ti, true)?;
-            if !t.dead() {
-                // patch in the index slot (call emitted with ri = 0)
-                let pc = t.code.pc() - 1;
-                let w = t.code.at(pc);
-                t.code.set(pc, (w & 0x0000FFFFFFFFFFFF) | (ri << 48));
-            }
+            t.call(ft, tab, ti, true, ri)?;
         }
         0x1A => { t.pop_any()?; }
         0x1B | 0x1C => {
@@ -924,6 +918,111 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let v = t.pop(from)?;
             t.push(Val { ty: to, loc: v.loc, x: v.x });
         }
+        0xD0 => {
+            let ty = r.byte()?;
+            t.push(Val { ty: ty, loc: Loc.Const, x: 0 });
+        }
+        0xD1 => {
+            let v = t.pop_any()?;
+            if v.ty != 0 and !is_ref(v.ty) { return Err("type mismatch"); }
+            let p = t.vals.len;
+            if !t.dead() {
+                let rv = t.reg(v, p);
+                let h = t.home(p);
+                t.emit_def(W.REF_IS_NULL(h as u16, rv as u16), h);
+            }
+            t.push_home(T_I32);
+        }
+        0xD2 => {
+            let x = r.u32()? as u64;
+            if x >= t.m.funcs.len { return Err("unknown function"); }
+            if x >= t.declared.len or !t.declared.at(x) { return Err("undeclared function reference"); }
+            let p = t.vals.len;
+            if !t.dead() { let h = t.home(p); t.emit_def(W.REF_FUNC(h as u16, x as u32), h); }
+            t.push_home(T_FUNCREF);
+        }
+        0x25 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let i = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ri = t.reg(i, p);
+                let h = t.home(p);
+                t.bulk(W.OP_TABLE_GET, h, ri, 0, ti);
+            }
+            t.push_home(ty);
+        }
+        0x26 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let v = t.pop(ty)?;
+            let i = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ri = t.reg(i, p);
+                let rv = t.reg(v, p + 1);
+                t.bulk(W.OP_TABLE_SET, ri, rv, 0, ti);
+            }
+        }
+        0xFC08 => {
+            let seg = r.u32()? as u64;
+            r.byte()?;
+            t.need_memory()?;
+            if t.m.data_count.is_none() or seg >= t.m.datas.len { return Err("unknown data segment"); }
+            t.bulk3(W.OP_MEM_INIT, T_I32, T_I32, T_I32, seg)?;
+        }
+        0xFC09 => {
+            let seg = r.u32()? as u64;
+            if t.m.data_count.is_none() or seg >= t.m.datas.len { return Err("unknown data segment"); }
+            if !t.dead() { t.bulk(W.OP_DATA_DROP, 0, 0, 0, seg); }
+        }
+        0xFC0C => {
+            let seg = r.u32()? as u64;
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            if seg >= t.m.elems.len { return Err("unknown elem segment"); }
+            if t.m.elems.ptr_at(seg).reftype != ty { return Err("type mismatch"); }
+            t.bulk3(W.OP_TABLE_INIT, T_I32, T_I32, T_I32, seg | (ti << 32))?;
+        }
+        0xFC0D => {
+            let seg = r.u32()? as u64;
+            if seg >= t.m.elems.len { return Err("unknown elem segment"); }
+            if !t.dead() { t.bulk(W.OP_ELEM_DROP, 0, 0, 0, seg); }
+        }
+        0xFC0E => {
+            let dst = r.u32()? as u64;
+            let src = r.u32()? as u64;
+            let a = t.table_type(dst)?;
+            let b = t.table_type(src)?;
+            if a != b { return Err("type mismatch"); }
+            t.bulk3(W.OP_TABLE_COPY, T_I32, T_I32, T_I32, dst | (src << 32))?;
+        }
+        0xFC0F => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let n = t.pop(T_I32)?;
+            let v = t.pop(ty)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let rv = t.reg(v, p);
+                let rn = t.reg(n, p + 1);
+                t.bulk(W.OP_TABLE_GROW, t.home(p), rv, rn, ti);
+            }
+            t.push_home(T_I32);
+        }
+        0xFC10 => {
+            let ti = r.u32()? as u64;
+            t.table_type(ti)?;
+            let p = t.vals.len;
+            if !t.dead() { t.bulk(W.OP_TABLE_SIZE, t.home(p), 0, 0, ti); }
+            t.push_home(T_I32);
+        }
+        0xFC11 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            t.bulk3(W.OP_TABLE_FILL, T_I32, ty, T_I32, ti)?;
+        }
         0xFC0A => {
             r.byte()?; r.byte()?;
             t.need_memory()?;
@@ -937,6 +1036,35 @@ fn T.instr(t: *T) -> Result<bool, str> {
         _ => return Err("unsupported instruction"),
     }
     Ok(true)
+}
+
+fn is_ref(t: u8) -> bool { t == T_FUNCREF or t == T_EXTERNREF }
+
+fn T.table_type(t: *T, ti: u64) -> Result<u8, str> {
+    if ti >= t.m.tables.len { return Err("unknown table"); }
+    Ok(t.m.tables.at(ti).reftype)
+}
+
+/// A table or bulk-memory op: slots x, y, z and the static indices in
+/// the cache word after it.
+fn T.bulk(t: *T, vop: u64, x: u64, y: u64, z: u64, imm: u64) {
+    let pc = t.emit(rrr(vop, x, y, z));
+    t.code.set(pc + 1, imm);
+}
+
+/// One with three operands from the stack and no result.
+fn T.bulk3(t: *T, vop: u64, ta: u8, tb: u8, tc: u8, imm: u64) -> Result<(), str> {
+    let c = t.pop(tc)?;
+    let b = t.pop(tb)?;
+    let a = t.pop(ta)?;
+    let p = t.vals.len;
+    if !t.dead() {
+        let ra = t.reg(a, p);
+        let rb = t.reg(b, p + 1);
+        let rc = t.reg(c, p + 2);
+        t.bulk(vop, ra, rb, rc, imm);
+    }
+    Ok(())
 }
 
 fn T.ternary_mem(t: *T, vop: u64) -> Result<(), str> {
@@ -961,7 +1089,9 @@ fn T.branch_to(t: *T, depth: u64) {
 /// A call: arguments are the top values, moved to consecutive home slots;
 /// the callee's window starts at the first one, and its results come
 /// back there.
-fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool) -> Result<(), str> {
+/// (`w`: the CALL word, or for call_indirect the table; `ri`: the slot
+/// of the table index.)
+fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool, ri: u64) -> Result<(), str> {
     t.check_top(ft.params)?;
     let np = ft.params.len;
     let p = t.vals.len - np;
@@ -969,7 +1099,12 @@ fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool) -> Result
         for i in p..t.vals.len { t.flush_at(i); }
         let base = t.home(p);
         if indirect {
-            t.emit(W.CALL_INDIRECT(base as u16, ti as u16, 0));
+            if w == 0 {
+                t.emit(W.CALL_INDIRECT(base as u16, ti as u16, ri as u16));
+            } else {
+                let pc = t.emit(W.CALL_INDIRECT_X(base as u16, ti as u16, ri as u16));
+                t.code.set(pc + 1, w);
+            }
         } else {
             t.emit(W.with_opcode(w, W.OP_CALL) | (base << 16));
         }

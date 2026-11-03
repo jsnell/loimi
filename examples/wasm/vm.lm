@@ -66,7 +66,9 @@ pub struct Func {
 
 pub struct Memory { data: *u8, size: u64, max_pages: u64 }
 
-pub struct Table { elems: *?*Func, size: u64, max: u64, reftype: u8 }
+/// Elements are references: a `*Func` as an address for funcref, the
+/// host's value for externref; 0 is null.
+pub struct Table { elems: *u64, size: u64, max: u64, reftype: u8 }
 
 pub struct Inst {
     funcs: mem.Vec<*Func>,
@@ -82,6 +84,8 @@ pub struct Inst {
     /// Dropped passive segments.
     elem_dropped: mem.Vec<bool>,
     data_dropped: mem.Vec<bool>,
+    /// The evaluated references of every element segment.
+    elem_vals: mem.Vec<[]u64>,
 }
 
 /// One activation record: where the caller continues and its window.
@@ -543,8 +547,10 @@ pub vm W {
     }
     op UNREACHABLE() : RRR { raise Trap.Unreachable }
 
-    fn do_call(f: *Func, b: u64) -> never {
-        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b) } }
+    // `ret` is where the caller continues: pc + the calling op's size
+    // (there is no expression for "the next instruction" in a vm fn).
+    fn do_call(f: *Func, b: u64, ret: *u64) -> never {
+        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b, ret) } }
         let nr = regs + b;
         if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
             cold { raise Trap.Exhausted }
@@ -561,21 +567,21 @@ pub vm W {
             cold {
                 zero_slots(nr, p + 4, n);
                 fp = fp + 1;
-                fp.ret = pc + 1;
+                fp.ret = ret;
                 fp.regs = regs;
                 regs = nr;
                 jump f.code
             }
         }
         fp = fp + 1;
-        fp.ret = pc + 1;
+        fp.ret = ret;
         fp.regs = regs;
         regs = nr;
         jump f.code
     }
 
     // Calls of host functions and of functions of other instances.
-    fn call_slow(f: *Func, b: u64) -> never {
+    fn call_slow(f: *Func, b: u64, ret: *u64) -> never {
         let nr = regs + b;
         if let Some(h) = f.host {
             if !h(ctx, nr) { raise ctx.host_trap }
@@ -589,7 +595,7 @@ pub vm W {
         while i < n { nr[i] = 0; i += 1; }
         // A record that RESTORE pops: the caller's instance and return.
         fp = fp + 1;
-        fp.ret = pc + 1;
+        fp.ret = ret;
         fp.regs = regs;
         fp.inst = ctx.inst;
         fp = fp + 1;
@@ -601,14 +607,44 @@ pub vm W {
         jump f.code
     }
 
-    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw) }
+    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw, pc + 1) }
 
     op CALL_INDIRECT(b: base, t: tidx, i: ru) : RRR {
         let tab = ctx.table;
         if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
-        let Some(f) = tab.elems[i as u64] else { cold { raise Trap.UninitElem } };
+        let fv = tab.elems[i as u64];
+        if fv == 0 { cold { raise Trap.UninitElem } }
+        let f = fv as *Func;
         if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
-        do_call(f, b.raw)
+        do_call(f, b.raw, pc + 1)
+    }
+    // call_indirect through a table other than 0 (index in the cache word,
+    // checked here: the verifier does not see cache words).
+    op CALL_INDIRECT_X(b: base, t: tidx, i: ru) : RRR + Imm64 {
+        let ti = cache.v;
+        if ti >= ctx.inst.tables.len { cold { raise Trap.TableOOB } }
+        let tab = ctx.inst.tables.at(ti);
+        if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
+        let fv = tab.elems[i as u64];
+        if fv == 0 { cold { raise Trap.UninitElem } }
+        let f = fv as *Func;
+        if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
+        do_call(f, b.raw, pc + 2)
+    }
+
+    // ── reference types and bulk memory ─────────────────────────────
+    op REF_IS_NULL(d: ri, a: rq) : RRR { d = b2i(a == 0); next }
+    op REF_FUNC(d: rq, fi: fidx) : RU { d = ctx.funcs[fi] as u64; next }
+    // Rare ops: indices (table, segment) in the cache word, operands in
+    // slots; a plain function does the work and checks every bound.
+    inline for (name, which) in [
+        ("TABLE_GET", 0), ("TABLE_SET", 1), ("TABLE_SIZE", 2), ("TABLE_GROW", 3), ("TABLE_FILL", 4),
+        ("TABLE_COPY", 5), ("TABLE_INIT", 6), ("ELEM_DROP", 7), ("MEM_INIT", 8), ("DATA_DROP", 9),
+    ] {
+        op #name(a: rq, b: rq, c: rq) : RRR + Imm64 {
+            if !bulk(ctx, which, regs, a.raw, b.raw, c.raw, cache.v) { raise ctx.host_trap }
+            next
+        }
     }
 
     op RET() : J {
@@ -676,4 +712,101 @@ pub vm W {
 fn zero_slots(p: *u64, from: u64, to: u64) {
     var i = from;
     while i < to { p[i] = 0; i += 1; }
+}
+
+fn table_of(m: *Machine, i: u64) -> ?*Table {
+    if i >= m.inst.tables.len { return None; }
+    Some(m.inst.tables.at(i))
+}
+
+/// Table and bulk memory operations. `x`, `y`, `z` are slot numbers (of
+/// the frame `r`), `imm` packs the static indices (low and high 32 bits).
+/// Returns false with m.host_trap set to trap.
+fn bulk(m: *Machine, which: u32, r: *u64, x: u64, y: u64, z: u64, imm: u64) -> bool {
+    let i0 = imm & 0xFFFFFFFF;
+    let i1 = imm >> 32;
+    let a = r[x];
+    let b = r[y];
+    let c = r[z];
+    m.host_trap = Trap.TableOOB;
+    match which {
+        0 => {  // table.get: r[x] = t[r[y]]
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = b & 0xFFFFFFFF;
+            if i >= t.size { return false; }
+            r[x] = t.elems[i];
+        }
+        1 => {  // table.set t[r[x]] = r[y]
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = a & 0xFFFFFFFF;
+            if i >= t.size { return false; }
+            t.elems[i] = b;
+        }
+        2 => {
+            let Some(t) = table_of(m, i0) else { return false; };
+            r[x] = t.size;
+        }
+        3 => {  // r[x] = table.grow(init r[y], n r[z])
+            let Some(t) = table_of(m, i0) else { return false; };
+            let n = c & 0xFFFFFFFF;
+            let old = t.size;
+            if old + n > t.max or old + n > 10000000 {
+                r[x] = 0xFFFFFFFF;
+            } else {
+                let Some(p) = realloc(t.elems as *u8, (old + n) * 8 + 8) else { r[x] = 0xFFFFFFFF; return true; };
+                t.elems = p as *u64;
+                for k in old..old + n { t.elems[k] = b; }
+                t.size = old + n;
+                r[x] = old;
+            }
+        }
+        4 => {  // table.fill(i r[x], v r[y], n r[z])
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = a & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if i + n > t.size { return false; }
+            for k in i..i + n { t.elems[k] = b; }
+        }
+        5 => {  // table.copy dst i0, src i1
+            let Some(td) = table_of(m, i0) else { return false; };
+            let Some(ts) = table_of(m, i1) else { return false; };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > td.size or s + n > ts.size { return false; }
+            memmove(td.elems as *u8 + d * 8, ts.elems as *u8 + s * 8, n * 8);
+        }
+        6 => {  // table.init seg i0 into table i1
+            let Some(t) = table_of(m, i1) else { return false; };
+            if i0 >= m.inst.elem_vals.len { return false; }
+            let seg = m.inst.elem_vals.at(i0);
+            let len = if m.inst.elem_dropped.at(i0) { 0 } else { seg.len };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > t.size or s + n > len { return false; }
+            for k in 0..n { t.elems[d + k] = seg[s + k]; }
+        }
+        7 => {
+            if i0 >= m.inst.elem_dropped.len { return false; }
+            m.inst.elem_dropped.set(i0, true);
+        }
+        8 => {  // memory.init seg i0
+            m.host_trap = Trap.MemOOB;
+            let datas = &m.inst.module.datas;
+            if i0 >= datas.len { return false; }
+            let bytes = datas.at(i0).bytes;
+            let len = if m.inst.data_dropped.at(i0) { 0 } else { bytes.len };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > m.mem_size or s + n > len { return false; }
+            if n > 0 { memmove(m.memory.data + d, bytes.ptr + s, n); }
+        }
+        _ => {
+            if i0 >= m.inst.data_dropped.len { return false; }
+            m.inst.data_dropped.set(i0, true);
+        }
+    }
+    true
 }

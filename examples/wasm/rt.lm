@@ -49,7 +49,7 @@ fn empty_inst(m: *Module) -> Inst {
     Inst {
         funcs: mem.Vec.new(), globals: mem.Vec.new(), global_types: mem.Vec.new(),
         global_muts: mem.Vec.new(), memory: None, tables: mem.Vec.new(), sigs: mem.Vec.new(),
-        module: m, elem_dropped: mem.Vec.new(), data_dropped: mem.Vec.new(),
+        module: m, elem_dropped: mem.Vec.new(), data_dropped: mem.Vec.new(), elem_vals: mem.Vec.new(),
     }
 }
 
@@ -85,7 +85,7 @@ pub fn Engine.new() -> *Engine {
             frames: mem.alloc<Frame>(FRAMES), frames_end: mem.alloc<Frame>(1),
             halt_pc: mem.alloc<u64>(1), restore_pc: mem.alloc<u64>(1),
             host_trap: Trap.Host,
-            empty_table: Table { elems: mem.alloc<?*Func>(1), size: 0, max: 0, reftype: T_FUNCREF },
+            empty_table: Table { elems: mem.alloc<u64>(1), size: 0, max: 0, reftype: T_FUNCREF },
             empty_memory: Memory { data: mem.alloc<u8>(16), size: 0, max_pages: 0 },
             exit_code: 0,
         },
@@ -244,8 +244,26 @@ fn trap_err(t: Trap) -> Error { Error { kind: ErrKind.Trap, msg: vm.trap_message
 pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
     validate_module(m)?;
     // Validate and translate every function body.
+    // Functions that ref.func may name: those in element segments,
+    // exports and global initializers.
     var declared: mem.Vec<bool> = mem.Vec.new();
     defer declared.free();
+    for i in 0..m.funcs.len { declared.push(false); }
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
+        for j in 0..s.funcs.len {
+            let e = s.funcs.at(j);
+            if e.op == 0xD2 and (e.idx as u64) < m.funcs.len { declared.set(e.idx as u64, true); }
+        }
+    }
+    for i in 0..m.exports.len {
+        let x = m.exports.at(i);
+        if x.kind == 0 and (x.index as u64) < m.funcs.len { declared.set(x.index as u64, true); }
+    }
+    for i in 0..m.globals.len {
+        let e = m.globals.at(i).init;
+        if e.op == 0xD2 and (e.idx as u64) < m.funcs.len { declared.set(e.idx as u64, true); }
+    }
     var compiled: mem.Vec<compile.Compiled> = mem.Vec.new();
     defer compiled.free();
     for i in (m.nfunc_imports as u64)..m.funcs.len {
@@ -326,7 +344,7 @@ pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
         let size = td.lim.min;
         if size > 10000000 { return Err(trap_err(Trap.TableOOB)); }
         let t = mem.alloc<Table>(1);
-        *t = Table { elems: mem.alloc<?*Func>(size), size: size, max: td.lim.max, reftype: td.reftype };
+        *t = Table { elems: mem.alloc<u64>(size + 1), size: size, max: td.lim.max, reftype: td.reftype };
         inst.tables.push(t);
     }
     if (m.nmem_imports as u64) < m.mems.len {
@@ -380,20 +398,25 @@ pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
     // traps (the earlier ones stay written).
     for i in 0..m.elems.len {
         let s = m.elems.ptr_at(i);
-        inst.elem_dropped.push(s.mode != 0);
+        let vals = mem.alloc<u64>(s.funcs.len + 1);
+        for j in 0..s.funcs.len { vals[j] = eval_const(inst, s.funcs.at(j)); }
+        inst.elem_vals.push(vals.slice(s.funcs.len));
+        // passive segments stay; declarative ones are dropped at once
+        inst.elem_dropped.push(s.mode == 2);
+    }
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
         if s.mode != 0 { continue; }
         let t = inst.tables.at(s.table as u64);
         let off = eval_const(inst, s.offset) & 0xFFFFFFFF;
         if off + s.funcs.len > t.size { return Err(trap_err(Trap.TableOOB)); }
-        for j in 0..s.funcs.len {
-            let v = eval_const(inst, s.funcs.at(j));
-            t.elems[off + j] = if v == 0 { None } else { Some(unsafe_func(v)) };
-        }
+        let vals = inst.elem_vals.at(i);
+        for j in 0..vals.len { t.elems[off + j] = vals[j]; }
         inst.elem_dropped.set(i, true);
     }
     for i in 0..m.datas.len {
         let d = m.datas.at(i);
-        inst.data_dropped.push(!d.active);
+        inst.data_dropped.push(false);
         if !d.active { continue; }
         let mm = inst.memory.unwrap();
         let off = eval_const(inst, d.offset) & 0xFFFFFFFF;
