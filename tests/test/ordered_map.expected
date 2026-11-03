@@ -5,5 +5,8 @@ test differential ... ok
 test find_with_restarts ... ok
 test dict_differential ... ok
 test dict_try_insert ... ok
+test keydict_differential ... ok
+test keydict_find_with_and_room ... ok
+test pop_insert_alternating ... ok
 
-test result: ok. 7 passed; 0 failed; 0 filtered out
+test result: ok. 10 passed; 0 failed; 0 filtered out

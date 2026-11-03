@@ -423,13 +423,18 @@ pub fn OrderedMap<K, V>.remove(m: *OrderedMap<K, V>, key: K) -> ?V {
 
 /// Remove and return the last entry in insertion order.
 pub fn OrderedMap<K, V>.pop_last(m: *OrderedMap<K, V>) -> ?(K, V) {
+    // Entries given back come off `cap` until the next resize: their
+    // index slots stay deleted (not empty), and popping and inserting in
+    // turn must not fill the index with them.
+    let was = m.used;
     while m.used > 0 and (m.ents + (m.used - 1)).hash == DEAD { m.used -= 1; }
-    if m.used == 0 { return None; }
+    if m.used == 0 { m.cap -= was; return None; }
     let e = m.used - 1;
     let p = m.ents + e;
     let r = (p.key, p.value);
     m.remove_at(e);
     m.used = e;
+    m.cap -= was - e;
     Some(r)
 }
 
@@ -450,6 +455,7 @@ pub fn OrderedMap<K, V>.clear(m: *OrderedMap<K, V>) {
     mem.memset(m.idx as *u8, 0, (m.mask + 1) * 4);
     m.used = 0;
     m.len = 0;
+    m.cap = usable_for<K>(m.mask + 1);
     m.version += 1;
 }
 
