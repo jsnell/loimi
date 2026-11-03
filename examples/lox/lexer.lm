@@ -56,9 +56,8 @@ fn is_digit(c: u8) -> bool { c >= '0' and c <= '9' }
 
 pub fn Lexer.next(lx: *Lexer) -> Token {
     let c = &lx.cur;
-    // A `//` comment or whitespace cannot fail to scan without block
-    // comments, so the error case does not arise.
-    let _ = c.skip_trivia();
+    // Whitespace and `//` comments (Lox has no block comments).
+    c.skip_space();
     let start = c.pos;
     var t = Token { kind: T.Eof, text: "", line: c.line, num: 0.0 };
     if c.at_end() { return t; }

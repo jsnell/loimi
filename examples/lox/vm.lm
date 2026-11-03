@@ -68,7 +68,7 @@ pub struct Machine {
     names: *text.Interner,
     heap: gc.Heap,
     m: Model,
-    strings: Strings,
+    strings: *Strings,
     natives: *Native,
     /// The interned "init", whose address is the key of initializers.
     init_str: ?Gc<LStr>,
@@ -87,7 +87,7 @@ pub fn Machine.free(m: *Machine) {
     mem.release(m.stack);
     mem.release(m.frames);
     mem.release(m.globals.slots);
-    mem.release(m.strings.slots);
+    m.strings.free();
     m.out.free();
     m.msg.free();
     m.tmp.free();
@@ -140,7 +140,8 @@ fn arity_error(m: *Machine, want: u64, got: u64) -> str {
     m.msg.fmt2("Expected {} arguments but got {}.", want, got).as_str()
 }
 
-/// The key of a property name: the address of its interned string.
+/// The key of a property name: the address of its interned string, which
+/// the compiler pinned (`Strings.key`), so no other string can take it.
 fn key(v: Value) -> u64 {
     if let Str(s) = v { s as u64 } else { 0 }
 }
@@ -152,7 +153,7 @@ fn add_slow(m: *Machine, a: Value, b: Value) -> Result<Value, str> uses gc {
     m.tmp.clear();
     m.tmp.push_str(x.data);
     m.tmp.push_str(y.data);
-    Ok(Value.Str(m.strings.intern(&m.heap, m.tmp.as_str())))
+    Ok(Value.Str(m.strings.intern(m.tmp.as_str())))
 }
 
 fn new_instance(m: *Machine, c: Gc<Class>) -> Gc<Inst> {
@@ -181,8 +182,11 @@ fn grow_template(m: *Machine, o: Gc<Inst>) {
     }
 }
 
-fn read_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64) -> (?Value, obj.IcState) {
-    m.m.read_miss(s, st, o, k)
+/// The slow path of a property read: the value, the site's next state,
+/// and where the value was found (0: a field of `o`; more: a method,
+/// found through the class's method table).
+fn read_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64) -> (?Value, obj.IcState, u32) {
+    m.m.read_miss_at(s, st, o, k)
 }
 
 fn write_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64, v: Value) -> obj.IcState {
@@ -194,7 +198,7 @@ fn write_prop(m: *Machine, s: *obj.Site, st: obj.IcState, o: Gc<Inst>, k: u64, v
 
 /// A method read from an instance becomes a bound method.
 fn bind(m: *Machine, recv: Value, v: Value) -> Value uses gc {
-    let Method(c) = v else { return v; };
+    let Fun(c) = v else { return v; };
     gc.maybe_collect(&m.heap);
     Value.Bound(new(&m.heap, Bound { recv: recv, method: c }))
 }
@@ -506,24 +510,30 @@ pub vm Lox {
     // (monomorphic, polymorphic, megamorphic) in the slow paths.
     cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
 
-    /// R[dst] = property value `v` read from `o`: a method is bound to
-    /// `o` (which allocates, so it is cold), a field is stored as it is.
-    fn found(dst: u64, o: Value, v: Value) -> never {
-        if let Method(_) = v { cold { regs[dst] = bind(ctx, o, v); next } }
+    /// R[dst] = property value `v` read from `o`, found `depth`
+    /// prototype links up: a method (depth 1, the class's method table)
+    /// is bound to `o`, which allocates; a field (depth 0) is stored as it
+    /// is.
+    fn found(dst: u64, o: Value, v: Value, depth: u32) -> never {
+        if depth != 0 { cold { regs[dst] = bind(ctx, o, v); next } }
         regs[dst] = v;
         next
+    }
+    fn found_slow(o: Value, v: Value, depth: u32) -> Value {
+        if depth != 0 { return bind(ctx, o, v); }
+        v
     }
 
     family GETPROP(dst: reg, o: reg, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = o else { cold { raise "Only instances have properties." } };
-            let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
             let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
             if st == obj.IcState.OwnIn { become GETPROP_IN; }
             if st == obj.IcState.OwnOut { become GETPROP_OUT; }
             if st == obj.IcState.Proto { become GETPROP_P; }
             if st == obj.IcState.Poly { become GETPROP_POLY; }
-            dst = bind(ctx, o, v);
+            dst = found_slow(o, v, d);
             next
         }
         GETPROP_IN {
@@ -544,35 +554,35 @@ pub vm Lox {
         GETPROP_MISS {
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.OwnIn, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.OwnIn { become GETPROP_IN; }
                 if st == obj.IcState.OwnOut { become GETPROP_OUT; }
                 if st == obj.IcState.Proto { become GETPROP_P; }
                 if st == obj.IcState.Poly { become GETPROP_POLY; }
                 if st == obj.IcState.Generic { become GETPROP; }
-                dst = bind(ctx, o, v);
+                dst = found_slow(o, v, d);
                 next
             }
         }
         GETPROP_POLY {
-            if let Inst(x) = o and let Some(v) = ctx.m.poly_get(x, cache.ent) { found(dst.raw, o, v) }
+            if let Inst(x) = o and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) { found(dst.raw, o, v, d) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Mega { become GETPROP_MEGA; }
-                dst = bind(ctx, o, v);
+                dst = found_slow(o, v, d);
                 next
             }
         }
         GETPROP_MEGA {
-            if let Inst(x) = o and let Some(v) = ctx.m.mega_get(x, key(name)) { found(dst.raw, o, v) }
+            if let Inst(x) = o and let Some((v, d)) = ctx.m.mega_get_at(x, key(name)) { found(dst.raw, o, v, d) }
             cold {
                 let Inst(x) = o else { raise "Only instances have properties." };
-                let (r, _) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let (r, _, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
-                dst = bind(ctx, o, v);
+                dst = found_slow(o, v, d);
                 next
             }
         }
@@ -634,8 +644,8 @@ pub vm Lox {
     /// `R[base].name(R[base+1], ..., R[base+n])` without making a bound
     /// method: a method found through the class is called with the
     /// receiver as its slot 0.
-    fn invoke_found(v: Value, base: u64, n: u64) -> never {
-        if let Method(c) = v { call_closure(c, base, n, pc + 1 + Lox.CW_PropIC) }
+    fn invoke_found(v: Value, depth: u32, base: u64, n: u64) -> never {
+        if depth != 0 and let Fun(c) = v { call_closure(c, base, n, pc + 1 + Lox.CW_PropIC) }
         regs[base] = v;
         call_value(v, base, n, pc + 1 + Lox.CW_PropIC)
     }
@@ -643,46 +653,46 @@ pub vm Lox {
     family INVOKE(base: reg, n: nargs, name: kst) : ABC + PropIC {
         generic {
             let Inst(x) = base else { cold { raise "Only instances have methods." } };
-            let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
+            let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Generic, x, key(name));
             let Some(v) = r else { cold { raise undefined_prop(ctx, name) } };
             if st == obj.IcState.Proto { become INVOKE_P; }
             if st == obj.IcState.Poly { become INVOKE_POLY; }
-            invoke_found(v, base.raw, n)
+            invoke_found(v, d, base.raw, n)
         }
         INVOKE_P {
             if let Inst(x) = base and x.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(x, cache.slot, cache.cell, cache.depth) {
-                if let Method(c) = v { call_closure(c, base.raw, n, pc + 1 + Lox.CW_PropIC) }
+                if let Fun(c) = v { call_closure(c, base.raw, n, pc + 1 + Lox.CW_PropIC) }
             }
             cold { become INVOKE_MISS; redo }
         }
         INVOKE_MISS {
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Proto, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Proto, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Proto { become INVOKE_P; }
                 if st == obj.IcState.Poly { become INVOKE_POLY; }
                 if st == obj.IcState.Generic or st == obj.IcState.OwnIn or st == obj.IcState.OwnOut { become INVOKE; }
-                invoke_found(v, base.raw, n)
+                invoke_found(v, d, base.raw, n)
             }
         }
         INVOKE_POLY {
-            if let Inst(x) = base and let Some(v) = ctx.m.poly_get(x, cache.ent) { invoke_found(v, base.raw, n) }
+            if let Inst(x) = base and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) { invoke_found(v, d, base.raw, n) }
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, st) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
+                let (r, st, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Poly, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
                 if st == obj.IcState.Mega { become INVOKE_MEGA; }
-                invoke_found(v, base.raw, n)
+                invoke_found(v, d, base.raw, n)
             }
         }
         INVOKE_MEGA {
-            if let Inst(x) = base and let Some(v) = ctx.m.mega_get(x, key(name)) { invoke_found(v, base.raw, n) }
+            if let Inst(x) = base and let Some((v, d)) = ctx.m.mega_get_at(x, key(name)) { invoke_found(v, d, base.raw, n) }
             cold {
                 let Inst(x) = base else { raise "Only instances have methods." };
-                let (r, _) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
+                let (r, _, d) = read_prop(ctx, &cache.sid as *obj.Site, obj.IcState.Mega, x, key(name));
                 let Some(v) = r else { raise undefined_prop(ctx, name) };
-                invoke_found(v, base.raw, n)
+                invoke_found(v, d, base.raw, n)
             }
         }
     }
@@ -701,9 +711,9 @@ pub vm Lox {
         cold { raise "Superclass must be a class." }
     }
     op METHOD(cls: reg, f: reg, name: kst) : ABC {
-        if let (Class(c), Fun(m)) = (cls, f) {
+        if let (Class(c), Fun(_)) = (cls, f) {
             let kk = key(name);
-            ctx.m.set(c.methods, kk, Method(m));
+            ctx.m.set(c.methods, kk, f);
             if let Some(s) = ctx.init_str and kk == s as u64 { c.init = f; }
             next
         }
@@ -721,7 +731,7 @@ pub vm Lox {
     /// `super.name(args)`: R[base] is `this`, the arguments follow, and
     /// the superclass is in R[base+n+1].
     op SUPERINVOKE(base: reg, n: nargs1, name: kst) : ABC {
-        if let Class(s) = regs[base.raw + n + 1] and let Some(Method(c)) = ctx.m.get(s.methods, key(name)) {
+        if let Class(s) = regs[base.raw + n + 1] and let Some(Fun(c)) = ctx.m.get(s.methods, key(name)) {
             call_closure(c, base.raw, n, pc + 1)
         }
         cold { raise undefined_prop(ctx, name) }

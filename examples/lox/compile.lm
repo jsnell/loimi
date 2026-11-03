@@ -10,7 +10,7 @@ import std.mem;
 import std.text;
 import parser;
 import parser.{Node, Expr, Stmt, Var, Fun, FunKind, ClassDecl, LocalInfo, Program};
-import lexer.{T};
+import lexer.{T, Token};
 import value;
 import value.{Value, Proto};
 import vm.{Lox, Machine};
@@ -20,7 +20,9 @@ struct Unit {
     names: *text.Interner,
     infos: *mem.Vec<LocalInfo>,
     protos: mem.Vec<*Proto>,
-    error: ?(str, u32),
+    /// The first error: message, line, and the token it is reported at
+    /// ("" for none).
+    error: ?(str, u32, str),
 }
 
 struct C {
@@ -33,8 +35,16 @@ struct C {
 }
 
 fn C.error(c: *C, msg: str, line: u32) {
-    if c.unit.error.is_none() { c.unit.error = Some((msg, line)); }
+    if c.unit.error.is_none() { c.unit.error = Some((msg, line, "")); }
 }
+
+fn C.error_at(c: *C, msg: str, t: Token) {
+    if c.unit.error.is_none() { c.unit.error = Some((msg, t.line, t.text)); }
+}
+
+/// clox's limit on a loop (a 16-bit backward jump), kept in words: the
+/// reach of JF's 16-bit offset.
+const MAX_LOOP: u64 = 32767;
 
 fn C.info(c: *C, id: u32) -> LocalInfo { c.unit.infos.at(id as u64) }
 
@@ -51,8 +61,16 @@ fn C.k8(c: *C, v: Value, line: u32) -> u8 {
 }
 
 fn C.str_const(c: *C, s: str, line: u32) -> u8 {
-    let m = c.unit.m;
-    c.k8(Value.Str(m.strings.intern(&m.heap, s)), line)
+    c.k8(Value.Str(c.unit.m.strings.intern(s)), line)
+}
+
+/// A property name: a string constant pinned in the string table, so
+/// that its address is a std.obj key for good.
+fn C.name_const(c: *C, s: str, line: u32) -> u8 {
+    let t = c.unit.m.strings;
+    let x = t.intern(s);
+    t.key(x);
+    c.k8(Value.Str(x), line)
 }
 
 fn C.symbol(c: *C, name: str, line: u32) -> u16 {
@@ -75,7 +93,7 @@ fn C.small_lit(c: *C, n: *Node) -> ?u8 {
         Num(x) => Value.Num(x),
         Bool(b) => Value.Bool(b),
         Nil => Value.Nil,
-        Str(s) => { let m = c.unit.m; Value.Str(m.strings.intern(&m.heap, s)) }
+        Str(s) => Value.Str(c.unit.m.strings.intern(s)),
         _ => return None,
     };
     let k = c.consts.add(v)?;
@@ -242,7 +260,7 @@ fn C.expr_to(c: *C, n: *Node, dst: u32) {
         Get(o, name) => {
             let mark = c.regs.mark();
             let r = c.operand(o);
-            let k = c.str_const(name, n.line);
+            let k = c.name_const(name, n.line);
             c.code.set_loc(n.line);
             c.code.op(Lox.GETPROP(d, r as u8, k));
             c.regs.reset(mark);
@@ -251,7 +269,7 @@ fn C.expr_to(c: *C, n: *Node, dst: u32) {
             let mark = c.regs.mark();
             let ro = c.operand(o);
             let rv = c.operand(v);
-            let k = c.str_const(name, n.line);
+            let k = c.name_const(name, n.line);
             c.code.set_loc(n.line);
             c.code.op(Lox.SETPROP(ro as u8, k, rv as u8));
             if rv != dst { c.code.op(Lox.MOVE(d, rv as u8)); }
@@ -263,7 +281,7 @@ fn C.expr_to(c: *C, n: *Node, dst: u32) {
             c.load_var(sup, dst, n.line);
             let rt = c.regs.alloc(1);
             c.load_var(this, rt, n.line);
-            let k = c.str_const(name, n.line);
+            let k = c.name_const(name, n.line);
             c.code.set_loc(n.line);
             c.code.op(Lox.GETSUPER(d, rt as u8, k));
             c.regs.reset(mark);
@@ -283,7 +301,7 @@ fn C.call(c: *C, n: *Node, f: *Node, args: *mem.Vec<*Node>, dst: u32) {
         Get(o, name) => {
             c.expr_to(o, base);
             for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
-            let k = c.str_const(name, n.line);
+            let k = c.name_const(name, n.line);
             c.code.set_loc(n.line);
             c.code.op(Lox.INVOKE(base as u8, nargs as u8, k));
         }
@@ -292,7 +310,7 @@ fn C.call(c: *C, n: *Node, f: *Node, args: *mem.Vec<*Node>, dst: u32) {
             for i in 0..args.len { c.expr_to(args.at(i), base + 1 + i as u32); }
             let rs = c.regs.alloc(1);
             c.load_var(sup, rs, n.line);
-            let k = c.str_const(name, n.line);
+            let k = c.name_const(name, n.line);
             c.code.set_loc(n.line);
             c.code.op(Lox.SUPERINVOKE(base as u8, nargs as u8, k));
         }
@@ -407,7 +425,7 @@ fn C.stmt(c: *C, s: *Stmt) {
                 Set(o, name, v) => {
                     let ro = c.operand(o);
                     let rv = c.operand(v);
-                    let k = c.str_const(name, e.line);
+                    let k = c.name_const(name, e.line);
                     c.code.set_loc(e.line);
                     c.code.op(Lox.SETPROP(ro as u8, k, rv as u8));
                 }
@@ -460,7 +478,7 @@ fn C.stmt(c: *C, s: *Stmt) {
                 c.code.bind(skip);
             }
         }
-        While(cond, body, incr) => {
+        While(cond, body, incr, end) => {
             let top = c.code.here();
             let exit = c.code.label();
             c.jump_if_false(cond, exit);
@@ -470,7 +488,8 @@ fn C.stmt(c: *C, s: *Stmt) {
                 let st = Stmt.Expr(e);
                 c.stmt(&st);
             }
-            c.code.jump(Lox.JMP(0), top);
+            let back = c.code.jump(Lox.JMP(0), top);
+            if back - (c.code.label_pc(top) ?? 0) > MAX_LOOP { c.error_at("Loop body too large.", end); }
             c.code.bind(exit);
         }
         Fun(v, f) => {
@@ -575,20 +594,32 @@ fn C.class(c: *C, d: *ClassDecl) {
         let r = c.regs.alloc(1);
         c.code.set_loc(f.line);
         c.code.op(Lox.CLOSURE(r as u8, child));
-        c.code.op(Lox.METHOD(cls as u8, r as u8, c.str_const(f.name, f.line)));
+        c.code.op(Lox.METHOD(cls as u8, r as u8, c.name_const(f.name, f.line)));
         c.regs.free(r);
     }
     c.regs.leave(level);
 }
 
+/// A conditional jump with the opposite condition, for branch relaxation:
+/// a JF or JT too far for its 16-bit offset becomes the opposite jump over
+/// a JMP (24 bits).
+fn invert(w: u32) -> ?u32 {
+    let op = Lox.opcode(w);
+    if op == Lox.OP_JF { return Some(Lox.JT(Lox.AsBx_a(w) as u8, 0)); }
+    if op == Lox.OP_JT { return Some(Lox.JF(Lox.AsBx_a(w) as u8, 0)); }
+    None
+}
+
 fn new_c(unit: *Unit, f: *Fun) -> C {
-    C {
+    var c = C {
         unit: unit, fun: f,
         code: bc.Code.new(Lox.op_size, Lox.set_label),
         consts: bc.Pool.new(65536),
         regs: bc.Regs.new(256),
         children: mem.Vec.new(),
-    }
+    };
+    c.code.set_relax(Lox.label, invert, Lox.JMP(0));
+    c
 }
 
 /// Compile a nested function; returns its index among this function's
@@ -623,6 +654,7 @@ fn compile_fun(unit: *Unit, f: *Fun) -> *Proto {
 /// prototype.
 fn C.finish(c: *C, f: *Fun) -> *Proto {
     if c.regs.failed() { c.error("Too many registers in function.", f.line); }
+    c.code.relax();
     if let Some(e) = c.code.check() { c.error(e.message(), e.loc); }
     let n = c.code.len();
     let code: *u32 = mem.alloc(n);
@@ -652,7 +684,7 @@ fn C.finish(c: *C, f: *Fun) -> *Proto {
 
 /// Compile a parsed program. The result holds every function, the script
 /// (the top-level code) last.
-pub fn compile(prog: *Program, m: *Machine, names: *text.Interner) -> Result<mem.Vec<*Proto>, (str, u32)> {
+pub fn compile(prog: *Program, m: *Machine, names: *text.Interner) -> Result<mem.Vec<*Proto>, (str, u32, str)> {
     var unit = Unit { m: m, names: names, infos: &prog.locals, protos: mem.Vec.new(), error: None };
     compile_fun(&unit, prog.script);
     if let Some(e) = unit.error { return Err(e); }

@@ -9,7 +9,9 @@ import std.text;
 import vm.{Lox};
 
 /// A string. Every string is interned (see `Strings`), so two strings are
-/// equal exactly when they are the same object.
+/// equal exactly when they are the same object. Property names are pinned
+/// in the table (`Strings.key`), so their addresses are stable std.obj
+/// keys.
 pub object LStr { hash: u64, data: [u8] }
 
 /// A captured variable. A local that some closure captures lives in a
@@ -46,9 +48,7 @@ pub object Bound { recv: Value, method: Gc<Closure> }
 /// A native function.
 pub struct Native { name: str, arity: u32, f: fn(*Value) -> Value }
 
-/// One 64-bit word. `Method` marks a closure stored in a class's method
-/// table, so that a property read can tell a method (which it binds to the
-/// receiver) from a field holding a function. It never reaches Lox code.
+/// One 64-bit word.
 pub value Value repr nanbox {
     Num(f64) unboxed,
     Nil,
@@ -58,7 +58,6 @@ pub value Value repr nanbox {
     Class(Gc<Class>),
     Inst(Gc<Inst>),
     Bound(Gc<Bound>),
-    Method(Gc<Closure>),
     /// A captured local's register holds its cell.
     CellV(Gc<Cell>),
     /// A native function: an index into the machine's table.
@@ -93,68 +92,14 @@ impl hash.Hash for Value;
 
 // ── interned strings ─────────────────────────────────────────────────
 
-/// The string table: every live string, by contents. Weak: a sweeper
-/// drops the strings that were not marked.
-pub struct Strings { slots: *u64, cap: u64, count: u64 }
+/// The string table: std.gc's weak intern table over `LStr`.
+pub type Strings = gc.WeakInterner<LStr>;
 
-pub fn Strings.new() -> Strings { Strings { slots: mem.alloc(256), cap: 256, count: 0 } }
-
-fn str_hash(s: str) -> u64 {
-    // FNV-1a, as good as anything for short strings.
-    var h: u64 = 14695981039346656037;
-    for i in 0..s.len { h = (h ^ (s[i] as u64)) *% 1099511628211; }
-    h
-}
-
-fn as_str(a: u64) -> Gc<LStr> { unsafe { a as Gc<LStr> } }
-
-/// The interned string with contents `s`, made if there is none.
-pub fn Strings.intern(t: *Strings, h: *gc.Heap, s: str) -> Gc<LStr> {
-    let hv = str_hash(s);
-    var i = hv & (t.cap - 1);
-    loop {
-        let a = t.slots[i];
-        if a == 0 { break; }
-        if a != 1 {
-            let x = as_str(a);
-            if x.hash == hv and x.data.eq(s) { return x; }
-        }
-        i = (i + 1) & (t.cap - 1);
-    }
+/// Makes the table's strings.
+pub fn new_lstr(h: *gc.Heap, s: str, hv: u64) -> Gc<LStr> {
     let o = new(h, LStr { hash: hv }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
-    t.insert(o);
     o
-}
-
-fn Strings.insert(t: *Strings, o: Gc<LStr>) {
-    if (t.count + 1) * 2 > t.cap { t.grow(); }
-    var i = o.hash & (t.cap - 1);
-    while t.slots[i] > 1 { i = (i + 1) & (t.cap - 1); }
-    t.slots[i] = o as u64;
-    t.count += 1;
-}
-
-fn Strings.grow(t: *Strings) {
-    let old = t.slots;
-    let n = t.cap;
-    t.cap = n * 2;
-    t.slots = mem.alloc(t.cap);
-    t.count = 0;
-    for i in 0..n { if old[i] > 1 { t.insert(as_str(old[i])); } }
-    mem.release(old);
-}
-
-/// The sweeper: forget strings that died (1 marks a deleted slot).
-pub fn sweep_strings(h: *gc.Heap, data: *u8) {
-    let t = data as *Strings;
-    for i in 0..t.cap {
-        let a = t.slots[i];
-        if a > 1 and !gc.is_marked(a as *u8) {
-            t.slots[i] = 1;
-            t.count -= 1;
-        }
-    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -181,7 +126,6 @@ pub fn write(b: *text.StrBuf, v: Value) {
         Bool(t) => b.push_str(if t { "true" } else { "false" }),
         Str(s) => b.push_str(s.data),
         Fun(c) => write_fn(b, c.proto),
-        Method(c) => write_fn(b, c.proto),
         Bound(m) => write_fn(b, m.method.proto),
         Class(c) => b.push_str(c.name.data),
         Inst(o) => {

@@ -58,8 +58,9 @@ pub enum Stmt {
     VarDecl(Var, ?*Node, u32),
     Block(mem.Vec<Stmt>),
     If(*Node, *Stmt, ?*Stmt),
-    /// `while (cond) body`, and a `for` loop's increment.
-    While(*Node, *Stmt, ?*Node),
+    /// `while (cond) body`, a `for` loop's increment, and the body's last
+    /// token (where clox reports a loop that is too large).
+    While(*Node, *Stmt, ?*Node, Token),
     Fun(Var, *Fun),
     Return(?*Node, u32),
     Class(*ClassDecl),
@@ -601,7 +602,7 @@ fn Parser.statement(p: *Parser) -> Result<Stmt, ()> {
         let c = p.expr()?;
         p.consume(T.RParen, "Expect ')' after condition.")?;
         let body = p.stmt_box(p.statement()?);
-        return Ok(Stmt.While(c, body, None));
+        return Ok(Stmt.While(c, body, None, p.prev));
     }
     if p.match_(T.For) { return p.for_stmt(); }
     if p.match_(T.Return) {
@@ -655,7 +656,7 @@ fn Parser.for_parts(p: *Parser) -> Result<Stmt, ()> {
         p.consume(T.RParen, "Expect ')' after for clauses.")?;
     }
     let body = p.stmt_box(p.statement()?);
-    out.push(Stmt.While(cond, body, incr));
+    out.push(Stmt.While(cond, body, incr, p.prev));
     Ok(Stmt.Block(out))
 }
 

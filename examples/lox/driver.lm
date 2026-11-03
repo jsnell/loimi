@@ -53,7 +53,7 @@ pub fn run_source(src: str, o: Options) -> i32 uses gc {
         stack: mem.alloc(STACK), stack_end: 0 as *Value,
         frames: mem.alloc(FRAMES), frames_end: 0 as *Frame, fp: 0 as *Frame,
         globals: Globals.new(), names: &names, heap: gc.Heap.new(),
-        m: obj.Model.new(value.new_slots, Value.Nil), strings: value.Strings.new(),
+        m: obj.Model.new(value.new_slots, Value.Nil), strings: 0 as *value.Strings,
         natives: &natives[0], init_str: None, protos: 0 as *mem.Vec<*Proto>,
         out: text.StrBuf.new(), msg: text.StrBuf.new(), tmp: text.StrBuf.new(), keys: mem.Vec.new(),
         stress: o.stress,
@@ -62,16 +62,19 @@ pub fn run_source(src: str, o: Options) -> i32 uses gc {
     m.stack_end = m.stack + STACK;
     m.frames_end = m.frames + FRAMES;
     m.fp = m.frames;
-    m.init_str = Some(m.strings.intern(&m.heap, "init"));
+    m.strings = gc.WeakInterner.new(&m.heap, value.new_lstr);
+    let init = m.strings.intern("init");
+    m.strings.key(init);
+    m.init_str = Some(init);
     m.globals.define(names.intern("clock") + 1, Value.Native(0));
 
     // Nothing collects until the program runs, so the constants the
     // compiler allocates need no rooting until `m.protos` is set.
     var all = match compile.compile(&prog, &m, &names) {
         Ok(r) => r,
-        Err((msg, line)) => {
+        Err((msg, line, at)) => {
             var b = text.StrBuf.new();
-            b.fmt2("[line {}] Error: {}", line, msg);
+            if at.len > 0 { b.fmt3("[line {}] Error at '{}': {}", line, at, msg); } else { b.fmt2("[line {}] Error: {}", line, msg); }
             io.eprintln(b.as_str());
             b.free();
             return 65;
@@ -84,7 +87,6 @@ pub fn run_source(src: str, o: Options) -> i32 uses gc {
     m.protos = &all;
     m.m.attach(&m.heap);
     m.heap.add_scanner(&m as *u8, vm.scan_roots);
-    m.heap.add_sweeper(&m.strings as *u8, value.sweep_strings);
     if o.stress { m.heap.set_stress(true); }
 
     // Verify every function before running any, then fuse supers.
