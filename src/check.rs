@@ -549,7 +549,7 @@ impl<'a> Checker<'a> {
             let ty = self.resolve_type(m, &g.ty)?;
             let mut cx = FnCx::new(m, Ty::Unit);
             let v = self.expr(&mut cx, &g.value, Some(&ty))?;
-            let init = null_ptrs(fold_deep(&self.coerce(v, &ty)?));
+            let init = null_ptrs(fold_deep(&self.enum_casts(self.coerce(v, &ty)?)));
             if let Some(d) = const_overflow(&init) {
                 return Err(d);
             }
@@ -1292,7 +1292,7 @@ impl<'a> Checker<'a> {
         let ty = self.resolve_type(m, &decl.ty)?;
         let mut cx = FnCx::new(m, Ty::Unit);
         let v = self.expr(&mut cx, &decl.value, Some(&ty))?;
-        let v = fold_deep(&self.coerce(v, &ty)?);
+        let v = fold_deep(&self.enum_casts(self.coerce(v, &ty)?));
         if let Some(d) = const_overflow(&v) {
             return Err(d);
         }
@@ -1302,6 +1302,36 @@ impl<'a> Checker<'a> {
         self.consts[id as usize].value = Some(v.clone());
         self.consts[id as usize].busy = false;
         Ok(v)
+    }
+
+    /// In a constant expression: `Kind.Name as u32` (a payload-free
+    /// variant cast to an integer) is the variant's discriminant.
+    fn enum_casts(&self, mut e: TExpr) -> TExpr {
+        let take = |x: &mut TExpr| std::mem::replace(x, TExpr { ty: Ty::Unit, kind: TK::Unit, span: Span::default() });
+        match &mut e.kind {
+            TK::Cast(inner) => {
+                if let (Ty::Int(it), Ty::Enum(id), TK::Variant(idx, es)) = (&e.ty, &inner.ty, &inner.kind) {
+                    if es.is_empty() {
+                        let d = self.prog.enums[*id as usize].variants[*idx as usize].discr;
+                        e.kind = TK::Int(wrap_int(d, *it));
+                        return e;
+                    }
+                }
+                **inner = self.enum_casts(take(inner));
+            }
+            TK::Unary(_, a) => **a = self.enum_casts(take(a)),
+            TK::Binary(_, a, b) => {
+                **a = self.enum_casts(take(a));
+                **b = self.enum_casts(take(b));
+            }
+            TK::Struct(es) | TK::Tuple(es) | TK::Array(es) | TK::Variant(_, es) => {
+                for x in es.iter_mut() {
+                    *x = self.enum_casts(take(x));
+                }
+            }
+            _ => {}
+        }
+        e
     }
 
     pub fn coerce(&self, e: TExpr, want: &Ty) -> Res<TExpr> {

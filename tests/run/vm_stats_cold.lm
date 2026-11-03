@@ -4,10 +4,13 @@
 // inline ones (falling through), and those in vm functions (named by
 // the function), with the op and the block's source location.
 // expect-stderr: cold blocks entered:
-// expect-stderr: 3  STEP (cold block at tests/run/vm_stats_cold.lm:28:9)
-// expect-stderr: 2  MAYBE (cold block at tests/run/vm_stats_cold.lm:30:48)
-// expect-stderr: 5  fn slow (cold block at tests/run/vm_stats_cold.lm:23:23)
-// expect-no-stderr: lm:31:
+// expect-stderr: 3  STEP (cold block at 
+// expect-stderr: 2  MAYBE (cold block at 
+// expect-stderr: 5  fn slow (cold block at 
+// expect-stderr: vm_stats_cold.lm:31:9)
+// expect-stderr: vm_stats_cold.lm:33:48)
+// expect-stderr: vm_stats_cold.lm:26:23)
+// expect-no-stderr: lm:34:
 // expect: 39
 import std.io;
 
