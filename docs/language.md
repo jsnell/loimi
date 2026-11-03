@@ -243,7 +243,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   functions) take `#[inline]`, `#[inline(always|never)]`, `#[cold]`,
   `#[unsafe]`, `#[test]` and `#[track_caller]` (below); `export "C"`
   functions take `#[catch_panic]` and `#[c_const(..)]`, and structs and
-  enums named in a C header `#[c_name("..")]` (section 10.1); a `vm`
+  enums named in a C header `#[c_name("..")]` (section 10.1); an
+  `object` takes `#[trace(f)]` (section 8); a `vm`
   takes `#[require_verified]` and `#[dispatch(mode)]`; a module-level
   `var` takes `#[thread_local]`; a `super` takes `#[forward]`.
 - **Tests.** `#[test]` marks a function `fn name()` (no parameters or
@@ -2244,6 +2245,14 @@ enough to make it precise and cheap:
 - **`object` declarations** are GC-managed structs. The compiler generates the
   header (type id, mark bits) and the trace function from field types.
   A trailing variable-length array is allowed (`slots: [Value]`).
+- **Custom tracing.** `#[trace(f)]` on an `object` names a function of
+  the same module, `fn f(h: *gc.Heap, obj: Gc<Obj>)` without effects,
+  that the trace function calls after tracing the declared fields,
+  instead of tracing the trailing array: it marks (`gc_mark`) the live
+  part of the array, or references in memory the object owns outside
+  the heap. Not on generic objects. With `h.on_free(obj, f)` (a hook
+  that releases that memory when the object dies) and
+  `h.pin_dirty(obj)`, see [`stdlib/gc.md`](stdlib/gc.md#trace-hooks-free-hooks-and-dirty-pinning).
 - **Generic objects.** `object Obj<V> { shape: Gc<Shape>, inline: [V] }` is
   a family of object types: each instance (`Obj<Value>`, `Obj<i64>`) is an
   object type of its own, with its own type id and generated trace

@@ -301,6 +301,9 @@ pub struct StructDecl {
     pub is_pub: bool,
     /// `#[c_name("..")]`: its name in a C header.
     pub c_name: Option<String>,
+    /// `#[trace(f)]` on an `object`: a function of the same module that
+    /// traces the trailing array and any memory the object owns.
+    pub trace: Option<Ident>,
 }
 
 #[derive(Clone, Debug)]

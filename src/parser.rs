@@ -94,6 +94,9 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             if n == "catch_panic" && args.len() > 1 {
                 return Err(Diag::new(*sp, "`#[catch_panic]` takes at most one value: what the function returns after a panic"));
             }
+            if n == "trace" && args.len() != 1 {
+                return Err(Diag::new(*sp, "`#[trace(f)]` names one function of the same module: `fn f(h: *gc.Heap, obj: Gc<Obj>)`"));
+            }
             if n == "c_name" && args.len() != 1 {
                 return Err(Diag::new(*sp, "`#[c_name(\"name\")]` takes the C name"));
             }
@@ -550,7 +553,8 @@ impl Parser {
             "vm" => ("a vm".into(), VM_ATTRS),
             "enum" => ("an `enum`".into(), &["c_name"]),
             "struct" => ("a `struct`".into(), &["c_name"]),
-            "impl" | "import" | "object" => (format!("an `{}`", kw), &[]),
+            "object" => ("an `object`".into(), &["trace"]),
+            "impl" | "import" => (format!("an `{}`", kw), &[]),
             "" => ("an item".into(), &[]),
             _ => (format!("a `{}`", kw), &[]),
         };
@@ -615,7 +619,8 @@ impl Parser {
             }
             self.expect("}")?;
             let c_name = attrs.get("c_name").map(|a| a[0].clone());
-            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub, c_name }));
+            let trace = attrs.list.iter().find(|(n, _, _)| n == "trace").map(|(_, a, sp)| Ident { name: a[0].clone(), span: *sp });
+            return Ok(Item::Struct(StructDecl { name, generics, bounds, is_object, fields, is_pub, c_name, trace }));
         }
         if self.is_kw("trait") && matches!(self.peek_at(1), Tok::Ident(_)) {
             self.bump();

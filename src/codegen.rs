@@ -2486,12 +2486,25 @@ impl<'a, 'p> FnGen<'a, 'p> {
 }
 
 /// Which lazy functions (`FnDef::lazy`) some emitted function refers to.
-/// Emitted only where used: the functions marked `LAZY_ATTR`, and the
+/// Emitted only where used: the functions marked `LAZY_ATTR`, the
 /// checks of `--gc-check-roots` in std.gc (`rootck_*`), which only
-/// generated code calls.
+/// generated code calls, and std.gc's free hooks and dirty pinning,
+/// so that the IR of programs that do not use them stays the same.
 fn is_lazy(f: &FnDef) -> bool {
-    f.lazy || f.symbol.starts_with("std.gc.rootck_") || f.symbol.starts_with("loimi_rootck_")
+    f.lazy || f.symbol.starts_with("std.gc.rootck_") || f.symbol.starts_with("loimi_rootck_") || LAZY_STD.contains(&f.symbol.as_str())
 }
+
+const LAZY_STD: &[&str] = &[
+    "std.gc.Heap.on_free",
+    "std.gc.free_hooks",
+    "std.gc.run_free_hooks",
+    "std.gc.Heap.pin_dirty",
+    "std.gc.Heap.unpin_dirty",
+    "std.gc.Heap.is_pinned_dirty",
+    "std.gc.pinned",
+    "std.gc.scan_pinned",
+    "std.gc.release_hooks",
+];
 
 fn lazy_used(p: &Program, check_roots: bool) -> Vec<bool> {
     let mut used = vec![false; p.fns.len()];

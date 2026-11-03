@@ -1,0 +1,10 @@
+// A `#[trace(f)]` hook takes the heap and the object.
+// error: `#[trace(tr)]`: the function must be `fn tr(h: *gc.Heap, obj: Gc<Obj>)`
+import std.gc;
+
+#[trace(tr)]
+object Obj { n: u64, v: [i64] }
+
+fn tr(h: *gc.Heap, o: *Obj) {}
+
+fn main() {}

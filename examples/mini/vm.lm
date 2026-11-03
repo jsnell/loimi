@@ -2,6 +2,7 @@
 
 import std.gc;
 import std.text;
+import std.mem;
 import value;
 import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
@@ -14,12 +15,6 @@ extern "C" fn pow(a: f64, b: f64) -> f64;
 /// the call it is making returns; `nres` is how many results this
 /// frame's caller wants (at least 1). `k` caches cl.proto.consts.
 pub struct Frame { cl: Gc<Closure>, base: *V, resume: *u32, k: *V, nres: u32 }
-
-/// A coroutine's value stack and frame stack (coro.lm). When one grows,
-/// `prev` keeps the block it replaced alive until the coroutine dies: a
-/// native may still hold a pointer into it.
-pub object VStack { prev: ?Gc<VStack>, v: [V] }
-pub object FStack { prev: ?Gc<FStack>, f: [Frame] }
 
 /// `Ctx.nret` when the last native returned one result (its Ok value).
 pub const NRET_ONE: u64 = 0xffffffffffffffff;
@@ -53,9 +48,6 @@ pub struct Ctx {
     /// The running coroutine: `main` when none is.
     cur: Gc<Coro>,
     main: Gc<Coro>,
-    /// The running coroutine's value stack (None on the main stack), which
-    /// open upvalues created now point into.
-    cur_vs: ?Gc<VStack>,
     /// The threads that resumed the running one, innermost first (records
     /// on the C stack of `coro.resume`).
     chain: *Saved,
@@ -107,7 +99,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     }
 }
 
-fn scan_frames(h: *gc.Heap, first: *Frame, last: *Frame) {
+pub fn scan_frames(h: *gc.Heap, first: *Frame, last: *Frame) {
     var f = first;
     while f <= last {
         gc_mark(h, f.cl);
@@ -128,7 +120,7 @@ fn find_upval(c: *Ctx, level: *V) -> Gc<UpVal> {
         prev = cur;
         cur = u.next;
     }
-    let nu = new(&c.heap, UpVal { v: level, closed: V.Nil, next: cur, stack: c.cur_vs });
+    let nu = new(&c.heap, UpVal { v: level, closed: V.Nil, next: cur, co: Some(c.cur) });
     match prev {
         Some(pu) => pu.next = Some(nu),
         None => {
@@ -146,6 +138,7 @@ pub fn close_upvals(c: *Ctx, level: *V) {
         if u.v < level { break; }
         u.closed = *u.v;
         u.v = &u.closed;
+        u.co = None;
         c.open = u.next;
         u.next = None;
     }
@@ -399,25 +392,24 @@ pub const CO_FRAMES: u64 = 1 << 16;
 /// Make room in the running coroutine for registers up to `need` and one
 /// more frame above `fp`, moving its stacks if they must grow; returns
 /// `fp` in the frame stack afterwards. Frame bases, open upvalues and the
-/// context's pointers move along; a moved block stays allocated (`prev`)
-/// for natives that hold pointers into it. The main stack does not grow.
+/// context's pointers move along; a replaced block stays allocated until
+/// the resume returns (`coro.retire`), for natives that hold pointers into
+/// it. The main stack does not grow.
 pub fn grow(c: *Ctx, fp: *Frame, need: *V) -> Result<*Frame, V> {
-    let Some(vs) = c.cur_vs else { return Err(error_msg(c, "stack overflow")); };
     let co = c.cur;
-    let Some(fs) = co.fs else { return Err(error_msg(c, "stack overflow")); };
+    if co == c.main { return Err(error_msg(c, "stack overflow")); }
     let nslots = slot_index(c, need);
     let fi = frame_index(c, fp);
     if nslots > CO_SLOTS or fi + 2 > CO_FRAMES { return Err(error_msg(c, "stack overflow")); }
     var top = fp;
-    if nslots > vs.v.len {
-        var cap = vs.v.len * 2;
+    if nslots > co.nslots {
+        var cap = co.nslots * 2;
         while cap < nslots { cap = cap * 2; }
         if cap > CO_SLOTS { cap = CO_SLOTS; }
-        let nv = new(&c.heap, VStack { prev: Some(vs) }, cap);
         let old = c.stack;
-        let dst = nv.v.ptr;
-        for i in 0..vs.v.len { dst[i] = old[i]; }
-        for i in vs.v.len..cap { dst[i] = V.Nil; }
+        let dst: *V = mem.alloc(cap);
+        c.heap.allocated += (cap - co.nslots) * 8;
+        for i in 0..co.nslots { dst[i] = old[i]; }
         let delta = (dst as u64) -% (old as u64);
         var f = c.frames;
         while f <= fp {
@@ -428,28 +420,30 @@ pub fn grow(c: *Ctx, fp: *Frame, need: *V) -> Result<*Frame, V> {
         loop {
             let Some(uv) = u else { break; };
             uv.v = ((uv.v as u64) +% delta) as *V;
-            uv.stack = Some(nv);
             u = uv.next;
         }
         if c.open_level != 0 as *V { c.open_level = ((c.open_level as u64) +% delta) as *V; }
+        coro.retire(co, old as *u8);
+        co.stack = dst;
+        co.nslots = cap;
         c.stack = dst;
         c.stack_end = dst + cap;
-        co.vs = Some(nv);
-        c.cur_vs = Some(nv);
     }
-    if fi + 2 > fs.f.len {
-        var cap = fs.f.len * 2;
+    if fi + 2 > co.nframes {
+        var cap = co.nframes * 2;
         while cap < fi + 2 { cap = cap * 2; }
         if cap > CO_FRAMES { cap = CO_FRAMES; }
-        let nf = new(&c.heap, FStack { prev: Some(fs) }, cap);
-        let dst = nf.f.ptr;
+        let dst: *Frame = mem.alloc(cap);
+        c.heap.allocated += (cap - co.nframes) * size_of<Frame>();
         for i in 0..fi + 1 { dst[i] = c.frames[i]; }
         let bi = frame_index(c, c.base);
+        coro.retire(co, c.frames as *u8);
         c.frames = dst;
         c.frames_end = dst + cap;
         c.base = dst + bi;
         top = dst + fi;
-        co.fs = Some(nf);
+        co.frames = dst;
+        co.nframes = cap;
     }
     c.fp = top;
     Ok(top)

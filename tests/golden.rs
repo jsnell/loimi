@@ -13,6 +13,7 @@
 //!   // matrix: jit             run without the JIT, and (on x86-64 Linux)
 //!                              built with --jit-stencils and run with
 //!                              LOIMI_JIT=1 LOIMI_JIT_HOT=1: same output
+//!   // matrix: check-roots     run as is and built with --gc-check-roots
 //!   // env: K=V ...            environment of the program (e.g. LOIMI_JIT=1)
 //!   // error: <text>           (tests/fail) substring of the compile error
 
@@ -144,6 +145,9 @@ fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> b
         let matrix = directives(&text, "matrix");
         let modes: Vec<(Vec<String>, Vec<(String, String)>)> = if matrix.iter().any(|m| m.trim() == "dispatch") {
             ["tailcall", "goto", "switch"].iter().map(|d| (vec![format!("--dispatch={}", d)], vec![])).collect()
+        } else if matrix.iter().any(|m| m.trim() == "check-roots") {
+            // `--gc-check-roots`: every reference the collector marks is validated.
+            vec![(vec![], vec![]), (vec!["--gc-check-roots".to_string()], vec![])]
         } else if matrix.iter().any(|m| m.trim() == "jit") {
             let mut v = vec![(vec![], vec![])];
             if cfg!(all(target_arch = "x86_64", target_os = "linux")) && !cross {

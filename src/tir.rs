@@ -327,6 +327,9 @@ pub struct StructDef {
     /// `code: verified [W] by Vm`: the trailing array holds verified code;
     /// the struct id of `Vm`'s proof type `Vm__Verified`.
     pub verified: Option<u32>,
+    /// `#[trace(f)]`: the function that traces the trailing array and the
+    /// memory the object owns, after the generated tracing of its fields.
+    pub trace: Option<FnId>,
 }
 
 #[derive(Clone, Debug)]

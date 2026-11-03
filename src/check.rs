@@ -351,6 +351,7 @@ impl<'a> Checker<'a> {
                             object,
                             trailing: None,
                             verified: None,
+                            trace: None,
                         });
                         self.define(m, &s.name, Def::Struct(id), s.is_pub)?;
                     }
@@ -506,6 +507,7 @@ impl<'a> Checker<'a> {
         for (id, m, f) in &fn_decls {
             self.declare_fn(*id, *m, f, None)?;
         }
+        self.trace_hooks()?;
         for g in 0..self.generics.fns.len() {
             let gf = &self.generics.fns[g];
             let Some(recv) = gf.decl.recv.clone() else { continue };
@@ -582,6 +584,47 @@ impl<'a> Checker<'a> {
     /// bound in `tenv`), its trailing array, and for a `verified` trailing
     /// array the vm's proof type.
     #[allow(clippy::type_complexity)]
+    /// Resolve the `#[trace(f)]` hooks of objects: `f` is a function of
+    /// the object's module, `fn f(h: *gc.Heap, obj: Gc<Obj>)`, without
+    /// effects (it runs inside a collection).
+    fn trace_hooks(&mut self) -> Res<()> {
+        let mut hooks = Vec::new();
+        for (m, module) in self.modules.iter().enumerate() {
+            for item in &module.items {
+                if let Item::Struct(s) = item {
+                    if let Some(h) = &s.trace {
+                        if !s.generics.is_empty() {
+                            return Err(Diag::new(h.span, "`#[trace(f)]` is not supported on generic objects"));
+                        }
+                        hooks.push((m, s.name.name.clone(), h.clone()));
+                    }
+                }
+            }
+        }
+        for (m, sname, h) in hooks {
+            let Some((Def::Struct(sid), _)) = self.scopes[m].get(&sname).cloned() else { unreachable!() };
+            let Some((Def::Fn(fid), _)) = self.scopes[m].get(&h.name).cloned() else {
+                return Err(Diag::new(h.span, format!("`#[trace({})]`: no function `{}` in this module", h.name, h.name)));
+            };
+            let heap = self.prog.structs.iter().position(|s| s.name == "std.gc.Heap");
+            let f = &self.prog.fns[fid as usize];
+            let want_heap = heap.map(|i| Ty::Ptr(Box::new(Ty::Struct(i as u32))));
+            let ok = f.param_tys.len() == 2
+                && Some(&f.param_tys[0]) == want_heap.as_ref()
+                && f.param_tys[1] == Ty::Gc(Box::new(Ty::Struct(sid)))
+                && f.ret == Ty::Unit
+                && !f.variadic;
+            if !ok {
+                return Err(Diag::new(h.span, format!("`#[trace({})]`: the function must be `fn {}(h: *gc.Heap, obj: Gc<{}>)`", h.name, h.name, sname)));
+            }
+            if f.effects != 0 {
+                return Err(Diag::new(h.span, format!("`#[trace({})]`: the function runs inside a collection, so it must not have effects (`uses ..`)", h.name)));
+            }
+            self.prog.structs[sid as usize].trace = Some(fid);
+        }
+        Ok(())
+    }
+
     pub fn struct_fields(&mut self, m: usize, s: &StructDecl) -> Res<(Vec<(String, Ty)>, Option<(String, Ty)>, Option<u32>)> {
         let mut fields = Vec::new();
         let mut trailing = None;
