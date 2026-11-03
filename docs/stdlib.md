@@ -135,7 +135,7 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
 - `Vec<T> { ptr, len, cap }`: `Vec.new()`, `with_capacity(n)`,
   `reserve(extra)`, `push`, `pop -> ?T`, `get(i) -> ?T`, `at(i)`,
   `ptr_at(i)`, `set(i, x)`, `last -> ?T`, `items -> []T`,
-  `truncate(n)`, `clear`, `free`, `sort_by(cmp)`.
+  `truncate(n)`, `clear`, `free`, `sort_by(cmp)`, `try_sort_by(less)`.
   **An empty `Vec` allocates nothing**: `Vec.new()` (and
   `with_capacity(0)`) has capacity 0 and a static sentinel pointer, and
   the first push allocates. `free()` leaves the `Vec` empty and usable
@@ -152,6 +152,18 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
 - `mem.sort_by(p, n, cmp)`: a stable merge sort; `cmp` is a
   `block fn(*T, *T) -> i32`, a closure capturing locals or a plain
   function.
+- `mem.try_sort_by(p, n, less) -> Result<(), E>` (and
+  `Vec.try_sort_by(less)`): a stable sort for comparators that can fail
+  and run guest code, such as a dynamic language's `<` (which may raise,
+  or call a user `__lt__`): `less` is a `block fn(*T, *T) -> Result<bool,
+  E> uses reenter` saying whether `a` goes before `b`, and the sort is
+  `uses reenter`. The first `Err` stops it and is returned, with the
+  elements unchanged. The comparator gets pointers into `p`, which stays
+  untouched while it runs (the sort orders indices, then permutes `p`
+  once, with no calls), so elements that `p` keeps reachable stay
+  reachable when the comparator collects. `p` must stay valid: if guest
+  code could change it, sort a copy. Python's `sorted`/`list.sort` use it
+  (`examples/python/builtins.lm`).
 - `Arena`: `Arena.new()`, `alloc_bytes(n, align) -> *u8`, `str(s) -> str`
   (copy a string into the arena), `free()`. 64 KiB chunks; larger requests
   get their own chunk. `free_bytes(p)` does nothing (arena memory is

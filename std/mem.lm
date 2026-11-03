@@ -183,6 +183,95 @@ pub fn sort_by<T>(p: *T, n: u64, cmp: block fn(*T, *T) -> i32) {
     release(tmp);
 }
 
+/// Sort the elements stably by `less(a, b)` ("does `a` go before `b`"), a
+/// comparator that may fail and may run guest code (see `try_sort_by`).
+pub fn Vec<T>.try_sort_by<E>(v: *Vec<T>, less: block fn(*T, *T) -> Result<bool, E> uses reenter) -> Result<(), E> uses reenter {
+    try_sort_by(v.ptr, v.len, less)
+}
+
+/// Sort `n` values at `p` stably by `less(a, b)`: whether `a` goes before
+/// `b`. The comparator may fail (the first `Err` stops the sort and is
+/// returned, with `p` unchanged) and may collect or call guest code
+/// (`uses reenter`). It is given pointers into `p`, which keeps every
+/// element in place while comparing, so elements that `p` keeps reachable
+/// for the collector (a guest list's items) stay reachable: the sort
+/// orders indices (a bottom-up merge sort, insertion sort for runs of
+/// 16), then permutes `p` once, without calls. `p` must stay valid and
+/// unchanged during the sort: if guest code could change it, sort a copy.
+pub fn try_sort_by<T, E>(p: *T, n: u64, less: block fn(*T, *T) -> Result<bool, E> uses reenter) -> Result<(), E> uses reenter {
+    if n < 2 { return Ok(()); }
+    var idx: *u64 = alloc(n);
+    var tmp: *u64 = alloc(n);
+    for i in 0..n { idx[i] = i; }
+    let sorted = match sort_indices<T, E>(p, n, idx, tmp, less) {
+        Ok(s) => s,
+        Err(e) => {
+            release(idx);
+            release(tmp);
+            return Err(e);
+        }
+    };
+    let vals: *T = alloc(n);
+    copy(vals, p, n);
+    for i in 0..n { p[i] = vals[sorted[i]]; }
+    release(vals);
+    release(idx);
+    release(tmp);
+    Ok(())
+}
+
+/// The merge sort of `try_sort_by` over indices into `p`; the result is
+/// `idx` or `tmp`, whichever holds the last pass.
+fn sort_indices<T, E>(p: *T, n: u64, idx: *u64, tmp: *u64, less: block fn(*T, *T) -> Result<bool, E> uses reenter) -> Result<*u64, E> uses reenter {
+    let run: u64 = 16;
+    var lo: u64 = 0;
+    while lo < n {
+        let hi = if lo + run < n { lo + run } else { n };
+        var i = lo + 1;
+        while i < hi {
+            let x = idx[i];
+            var j = i;
+            while j > lo and less(p + x, p + idx[j - 1])? {
+                idx[j] = idx[j - 1];
+                j -= 1;
+            }
+            idx[j] = x;
+            i += 1;
+        }
+        lo = hi;
+    }
+    var src = idx;
+    var dst = tmp;
+    var w = run;
+    while w < n {
+        var l: u64 = 0;
+        while l < n {
+            let mid = if l + w < n { l + w } else { n };
+            let hi = if l + 2 * w < n { l + 2 * w } else { n };
+            var i = l;
+            var j = mid;
+            var k = l;
+            while k < hi {
+                // Take from the right run only if it is strictly less: stable.
+                if i < mid and (j >= hi or !less(p + src[j], p + src[i])?) {
+                    dst[k] = src[i];
+                    i += 1;
+                } else {
+                    dst[k] = src[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            l = hi;
+        }
+        let t = src;
+        src = dst;
+        dst = t;
+        w *= 2;
+    }
+    Ok(src)
+}
+
 fn insertion_sort<T>(p: *T, lo: u64, hi: u64, cmp: block fn(*T, *T) -> i32) {
     var i = lo + 1;
     while i < hi {

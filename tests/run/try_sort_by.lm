@@ -1,0 +1,70 @@
+// `mem.try_sort_by`: a stable sort whose comparator may fail (the first
+// error is returned and the data is left unchanged) and may collect;
+// objects reachable only through the sorted array survive collections
+// made by the comparator.
+import std.io;
+import std.gc;
+import std.mem;
+import std.mem.{Vec};
+
+object Box { key: i64, tag: i64 }
+
+fn show(v: *Vec<i64>) {
+    for i in 0..v.len { if i > 0 { io.print(" "); } io.print_int(v.at(i)); }
+    io.println("");
+}
+
+fn ok(r: Result<(), str>) -> bool { match r { Ok(_) => true, Err(_) => false } }
+
+fn main() uses reenter {
+    // Plain ints, with a comparator that cannot fail in practice.
+    var v: Vec<i64> = Vec.new();
+    for i in 0..40 { v.push((i * 37) % 23); }
+    let r: Result<(), str> = v.try_sort_by(|a, b| Ok(*a < *b));
+    io.print_bool(ok(r)); io.println("");
+    show(&v);
+
+    // A failing comparator: the error comes back, the data is unchanged.
+    var w: Vec<i64> = Vec.new();
+    for i in 0..10 { w.push(10 - i); }
+    var calls: i64 = 0;
+    let e: Result<(), str> = w.try_sort_by(|a, b| {
+        calls += 1;
+        if *a == 3 or *b == 3 { return Err("cannot compare 3"); }
+        Ok(*a < *b)
+    });
+    match e { Err(m) => io.println(m), Ok(_) => io.println("no error") }
+    show(&w);
+    io.print_bool(calls > 0); io.println("");
+
+    // Stability: sort by key only; equal keys keep their order (tag).
+    var heap = gc.Heap.new();
+    var objs: [Gc<Box>; 64] = [new(&heap, Box { key: 0, tag: 0 }); 64];
+    for i in 0..64 { objs[i] = new(&heap, Box { key: (i as i64 * 7) % 5, tag: i as i64 }); }
+    // The comparator allocates and collects: the boxes are reachable only
+    // through `objs` (a rooted local array), which the sort leaves in
+    // place while comparing.
+    let s: Result<(), str> = mem.try_sort_by(&objs[0], 64, |a, b| {
+        let junk = new(&heap, Box { key: 0, tag: 0 });
+        gc.collect(&heap);
+        Ok(a.key < b.key + junk.key)
+    });
+    io.print_bool(ok(s)); io.println("");
+    var sorted = true;
+    for i in 1..64 {
+        let x = objs[i - 1];
+        let y = objs[i];
+        if x.key > y.key or (x.key == y.key and x.tag > y.tag) { sorted = false; }
+    }
+    io.print_bool(sorted); io.println("");
+    io.print_int(objs[0].key); io.print(" "); io.print_int(objs[0].tag); io.print(" ");
+    io.print_int(objs[63].key); io.print(" "); io.print_int(objs[63].tag); io.println("");
+}
+// expect: true
+// expect: 0 0 1 1 2 2 3 3 4 5 5 6 6 7 7 8 9 10 10 11 11 12 12 13 14 14 15 15 16 16 17 17 18 19 19 20 20 21 21 22
+// expect: cannot compare 3
+// expect: 10 9 8 7 6 5 4 3 2 1
+// expect: true
+// expect: true
+// expect: true
+// expect: 0 0 4 62

@@ -440,48 +440,19 @@ fn lt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
     }
 }
 
-/// Stable merge sort of `keys` (and `vals` alongside) with Python's <.
+/// Stable sort of `vals` by `keys` with Python's < (`mem.try_sort_by`:
+/// the comparator may raise and may run `__lt__`). The caller keeps the
+/// keys and values reachable (tuples) while guest code runs.
 fn msort(c: *Ctx, keys: *mem.Vec<Value>, vals: *mem.Vec<Value>, reverse: bool) -> Result<(), Value> uses reenter {
-    let n = keys.len;
-    var tk: mem.Vec<Value> = mem.Vec.with_capacity(n);
-    var tv: mem.Vec<Value> = mem.Vec.with_capacity(n);
-    for i in 0..n { tk.push(keys.at(i)); tv.push(vals.at(i)); }
-    var width: u64 = 1;
-    var srck = keys;
-    var srcv = vals;
-    var dstk = &tk;
-    var dstv = &tv;
-    var flipped = false;
-    while width < n {
-        var i: u64 = 0;
-        while i < n {
-            let mid = if i + width < n { i + width } else { n };
-            let hi = if i + 2 * width < n { i + 2 * width } else { n };
-            var a = i;
-            var b = mid;
-            var o = i;
-            while a < mid and b < hi {
-                // take from b only if b < a (a <= b keeps stability); reversed: b > a
-                let take_b = if reverse { lt(c, srck.at(a), srck.at(b))? } else { lt(c, srck.at(b), srck.at(a))? };
-                if take_b { dstk.set(o, srck.at(b)); dstv.set(o, srcv.at(b)); b += 1; }
-                else { dstk.set(o, srck.at(a)); dstv.set(o, srcv.at(a)); a += 1; }
-                o += 1;
-            }
-            while a < mid { dstk.set(o, srck.at(a)); dstv.set(o, srcv.at(a)); a += 1; o += 1; }
-            while b < hi { dstk.set(o, srck.at(b)); dstv.set(o, srcv.at(b)); b += 1; o += 1; }
-            i += 2 * width;
-        }
-        let sk = srck; srck = dstk; dstk = sk;
-        let sv = srcv; srcv = dstv; dstv = sv;
-        flipped = !flipped;
-        width *= 2;
+    var pairs: mem.Vec<(Value, Value)> = mem.Vec.with_capacity(keys.len);
+    for i in 0..keys.len { pairs.push((keys.at(i), vals.at(i))); }
+    // reverse=True keeps equal elements in their original order, too.
+    let r = pairs.try_sort_by(|a, b| if reverse { lt(c, b.0, a.0) } else { lt(c, a.0, b.0) });
+    if let Ok(_) = r {
+        for i in 0..pairs.len { vals.set(i, pairs.at(i).1); }
     }
-    if flipped {
-        for i in 0..n { keys.set(i, tk.at(i)); vals.set(i, tv.at(i)); }
-    }
-    tk.free();
-    tv.free();
-    Ok(())
+    pairs.free();
+    r
 }
 
 /// Sort list `l` in place (key may be Nil).
