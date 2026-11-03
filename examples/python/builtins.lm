@@ -803,7 +803,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         Globals => Ok(Value.Dict(c.globals.unwrap())),
         Vars => {
-            if let Inst(i) = args[0] { return Ok(Value.Dict(i.dict)); }
+            if let Inst(i) = args[0] { return Ok(Value.Dict(value.attrs_dict(&c.heap, i.dict))); }
             Err(exc(c, E_TYPE, "vars() argument must have __dict__ attribute"))
         }
         Input => Err(exc(c, E_EOF, "EOF when reading a line")),
@@ -821,7 +821,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         ExcInit => {
             let Inst(i) = args[0] else { return Ok(Value.Nil); };
             let t = value.tuple_of(&c.heap, (args + 1).slice(np - 1));
-            value.dict_set_str(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+            value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
             Ok(Value.Nil)
         }
         ObjEq => Ok(Value.Bool(args[0] == args[1])),
@@ -835,9 +835,9 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
 
 fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
     let cls = c.excs[kind].unwrap();
-    let d = value.new_dict(&c.heap, 1);
+    let d = value.new_attrs(&c.heap, 1);
     let inst = new(&c.heap, Inst { cls: cls, dict: d });
-    value.dict_set_str(&c.heap, d, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
+    value.attr_set(&c.heap, d, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
     Value.Inst(inst)
 }
 

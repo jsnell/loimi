@@ -49,7 +49,7 @@ pub fn write_str(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses r
                 return Ok(());
             }
             if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) and ops.class_lookup(i.cls, vm.intern(c, "__repr__")).is_none() {
-                let args = value.dict_get_str(i.dict, vm.intern(c, "args")) ?? Value.Nil;
+                let args = value.attr_get(i.dict, vm.intern(c, "args")) ?? Value.Nil;
                 if let Tuple(t) = args {
                     if t.items.len == 0 { return Ok(()); }
                     if t.items.len == 1 {
@@ -143,7 +143,7 @@ pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses 
             }
             if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) {
                 b.push_str(ops.class_name(i.cls));
-                let args = value.dict_get_str(i.dict, vm.intern(c, "args")) ?? Value.Nil;
+                let args = value.attr_get(i.dict, vm.intern(c, "args")) ?? Value.Nil;
                 if let Tuple(t) = args and t.items.len == 1 {
                     b.push('(');
                     write_repr(c, b, t.items[0])?;
