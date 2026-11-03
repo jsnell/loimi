@@ -1127,7 +1127,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                         // bind from the scrutinee, which may be a
                         // temporary that nothing else references: it is
                         // rooted while the guard runs.
-                        let root = !matches!(scrut.kind, TK::Vm(_)) && crate::gcgen::is_traced(self.p(), &scrut.ty);
+                        let root = crate::gcgen::is_traced(self.p(), &scrut.ty);
                         if root {
                             self.pending.push((sp.clone(), scrut.ty.clone()));
                         }

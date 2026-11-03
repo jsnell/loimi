@@ -921,6 +921,12 @@ impl Gen {
             chosen.swap(i, j);
         }
         chosen.truncate(n);
+        // Often first: an arm whose guard collects and fails, before the
+        // arms that bind from the scrutinee.
+        if !fx.in_defer && self.r.chance(30) {
+            let tail = if value { format!(" {}", self.lit()) } else { String::new() };
+            out.push_str(&format!("{}_ if gcf(c) => {{{} }}\n", ind2, tail));
+        }
         for &ai in &chosen {
             let (pat, binds) = &arms[ai];
             fx.scopes.push(vec![]);
