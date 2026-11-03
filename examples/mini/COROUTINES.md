@@ -222,21 +222,34 @@ Three existing public benchmarks that use coroutines are in
 `bench/mini/coroutines/`, with their provenance and the mechanical edits
 in the README there. They are LuaJIT-test-cleanup's `coroutine-ring`
 (the Benchmarks Game thread-ring) and `chameneos`, and the classic Lua
-`sieve` (via Luau's bench). The table gives the best of 3 runs, x86-64,
-Mini built `--release`:
+`sieve` (via Luau's bench). With the switches inside the run
+(2026-11-03; friction 7), best of 5, interleaved, x86-64, Mini built
+`--release --align-functions=64`, times in seconds; *before* is the
+commit before (each resume a native call and a nested entry):
 
-| benchmark | Mini | PUC-Lua 5.4.9 | LuaJIT 2.1 `-joff` | Mini/Lua |
-|---|---|---|---|---|
-| chameneos | 0.574 s | 1.010 s | 0.382 s | 0.57 |
-| coroutine_ring | 0.529 s | 1.018 s | 0.381 s | 0.52 |
-| sieve | 0.574 s | 1.116 s | 0.389 s | 0.51 |
+| benchmark | mode | before | now | now/before | PUC-Lua 5.4.9 | LuaJIT 2.1 `-joff` | now/Lua | now/LuaJIT |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| chameneos | tailcall | 0.593 | 0.417 | 0.70 | 1.009 | 0.380 | 0.41 | 1.10 |
+| coroutine_ring | tailcall | 0.524 | 0.356 | 0.68 | 1.005 | 0.379 | 0.35 | 0.94 |
+| sieve | tailcall | 0.576 | 0.390 | 0.68 | 1.104 | 0.388 | 0.35 | 1.01 |
+| chameneos | goto | 0.604 | 0.445 | 0.74 | | | 0.44 | 1.17 |
+| coroutine_ring | goto | 0.581 | 0.392 | 0.67 | | | 0.39 | 1.03 |
+| sieve | goto | 0.655 | 0.413 | 0.63 | | | 0.37 | 1.06 |
+| chameneos | switch | 0.626 | 0.480 | 0.77 | | | 0.48 | 1.26 |
+| coroutine_ring | switch | 0.590 | 0.396 | 0.67 | | | 0.39 | 1.04 |
+| sieve | switch | 0.655 | 0.405 | 0.62 | | | 0.37 | 1.04 |
 
-A resume/yield pair costs one native call, one nested entry, a copy of
-eight context fields each way, and the result copies. LuaJIT's
-interpreter is 1.4-1.5× faster on these benchmarks. Its resume is
-assembly that switches `lua_State`s without leaving the dispatch
-loop. Mini's could do the same with a resume *op*, whose handler swaps
-the state registers itself. That is not done: see friction 7.
+By geometric mean, tail-call Mini takes 0.37 of PUC-Lua's time (0.54
+before) and 1.01 of LuaJIT `-joff`'s (1.47 before); goto 1.09 and
+switch 1.11 of LuaJIT's (1.60 and 1.63 before). A resume/yield pair is
+now two cold blocks of CALL, about a dozen stores into the two `Coro`s
+and the context each way, and the value copies; LuaJIT's resume is
+assembly that switches `lua_State`s the same way, without leaving the
+dispatch loop. The goto and switch builds no longer enter and leave
+the function holding every handler per pair (docs/results.md,
+"Follow-up (2026-11-03)"), so they are within 10% of tail-call here.
+chameneos does more besides switching (upvalue reads, string
+compares), where LuaJIT's interpreter stays ahead.
 
 **Stacks in host memory instead of the heap** (the GC hooks of items 4-6,
 2026-11-03): best of 5, interleaved, both builds `--align-functions=64`,
@@ -252,7 +265,21 @@ which slots are live, and growth would still allocate heap objects
 that the old stack keeps alive. Host memory needs one barrier per
 suspend and no sweeper.
 
-**No regression on the 14 clean-room benchmarks.** These are
+**The switches inside the run cost the other benchmarks nothing**
+(2026-11-03): the 14 clean-room benchmarks, interleaved, best of 3,
+`--align-functions=64`, now/before by geometric mean: tailcall 1.008,
+goto 0.977, switch 0.971. In tail-call mode the handlers' hot paths are
+the same instructions as before (only `Coro.wrap`'s field offset in
+CALL's wrap test, and the raise and run-exit tails, differ); the
+widest, `hash_strings`, is 1.03 in a best-of-7 rerun (placement). The
+bottom-of-run check in RET calls `finish` as a shared copy
+(`#[inline(never)]`): as a `cold` block it kept the instruction word
+live and gave RET1 a larger frame on its hot path (fib 1.026). In goto
+mode, where every handler is in one function, `fib` is 0.88 and
+`interp` 1.04 (reproduced at best of 7), the rest within ±4%.
+
+**No regression on the 14 clean-room benchmarks** (when coroutines
+were added). These are
 `bench/mini/compare.py`, run interleaved, best of 3, both builds with
 `--align-functions=64`. Base is the commit before coroutines. The
 geomean of new/base is 1.005, and every benchmark is within ±3%: 0.97
@@ -469,7 +496,8 @@ interpreter.
    `coroutine.resume`, of a wrap function or of `coroutine.yield`, and
    the coroutine's last return and its errors, switch threads inside
    the running vm run (Design, "A switch is ordinary vm control flow").
-   A resume/yield pair takes 0.62–0.81 of the time it did (Speed).
+   A resume/yield pair takes 0.62–0.77 of the time it did, in every
+   dispatch mode (Speed).
    - **Why no language feature was needed.** Everything a switch does
      is something handlers already do:
      - A handler may assign every state variable and `jump` to a code
@@ -559,18 +587,23 @@ running in a loop needed small wrapper scripts.
 - **The nested-entry model** (`entry .. uses reenter`, `Mini.depth`, `on
   raise` exiting a run with `Err`) is exactly the substrate that
   "coroutines without stack switching" need. `Mini.call` was reused
-  unchanged as the start of a coroutine.
+  unchanged as the start of a coroutine resumed from a native.
+- **Assigning the state in a handler.** Switching threads inside the
+  run took no language support: a handler that sets `fp`, `regs` and
+  `k` and jumps to a saved `Mini.Resume` is a RET to another stack.
+  `#[inline]` and `#[inline(never)]` on the vm functions then decided
+  where the code went (friction 7).
 - **Control words in a `-> never` vm function.** `exit` and `next_resume`
   inside `yield_exit`, called from a `cold` block, made the
   yield-leaves-the-run path a few lines. `redo` after growing the stacks
   re-executes CALL with the new `regs`.
-- **`sync` and `reload` keep handlers correct across thread switches with
-  no new code.** After a resume returns, `reload` reads `ctx.fp`, which
-  `resume` restored.
+- **`sync` and `reload` keep handlers correct across nested resumes
+  with no new code.** After a resume through a native returns, `reload`
+  reads `ctx.fp`, which `resume` restored.
 - **The shadow stack roots the traced state of all nested runs.**
   Interleaved coroutine runs on one C stack needed no new rooting rules.
-  The only new roots are the saved records (`Saved`), walked by the
-  scanner.
+  The only new roots are the resumers' saved frames, which the
+  scanner walks through `Coro.prev`.
 - **Adding a `V` variant was a small change** (but see friction 2).
   Exhaustiveness errors pointed at every `match` to update.
 - **GC stress and verify modes found the barrier issue (5) immediately.**

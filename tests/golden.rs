@@ -284,8 +284,8 @@ fn mini_jit_stencils() {
 }
 
 /// Re-entry (table.sort's comparator runs as a nested run of the
-/// interpreter) and coroutines (each resume is a nested run, each yield
-/// leaves one) in the goto and switch dispatch modes: the sort and
+/// interpreter) and coroutines (switches inside the run, and resumes
+/// from natives as nested runs) in the goto and switch dispatch modes: the sort and
 /// coroutine scripts with a Mini built in each, and the coroutine
 /// conformance test (each in every GC mode).
 #[test]

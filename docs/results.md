@@ -116,7 +116,10 @@ backtracking engine), `wasm` (C programs compiled to wasm32-wasi), `stack`
   (0.999). With the JIT: 0.57–0.99 of the interpreter's time.
 - Mini's coroutine benchmarks take 0.53–0.59 of PUC-Lua's time and
   1.42–1.57 of LuaJIT `-joff`'s; goto and switch builds are 20% slower
-  there (explained in "Follow-up" below).
+  there (explained in "Follow-up" below). Since then coroutines switch
+  inside the dispatch loop: 0.35–0.41 of PUC-Lua's time and 0.94–1.10
+  of LuaJIT `-joff`'s in tail-call mode, goto and switch within 10% of
+  it ("Follow-up (2026-11-03): coroutine switches in the run").
 - MiniJS takes 0.23–0.76 of `node --jitless`'s time and 0.23–0.67 of
   QuickJS's, less on all 14.
 - Scheme takes less time than Guile with its JIT on 12 of 41 programs
@@ -206,9 +209,9 @@ other hot handlers cost about the same in both modes (within ±20% of
 few samples each). At the current master
 (after the resume-point commits) goto takes 1.14× the tail-call time on
 `coroutine_ring` and `sieve` and 1.02× on `chameneos` (best of 5; it was
-1.13–1.27× in the table above). Not changed: a resume op that switches
-coroutines inside the dispatch loop (COROUTINES.md, "Performance") would
-remove the nested entry in every mode.
+1.13–1.27× in the table above). A resume that switches coroutines
+inside the dispatch loop removes the nested entry in every mode: done
+since, see the next section.
 
 **Regex: the 3.5% is `#[catch_panic(-2)]` on `rx_exec`** (ea536af, which
 says so: "5-8% on the ones with a match every 25 ns"). Bisected over the
@@ -229,6 +232,38 @@ catching internal errors per call.
 sieve in 0.091–0.093 s and strings in 0.146–0.157 s (best of 7). The
 difference from the recorded 0.087/0.135 is the machine or session, not
 a code change.
+
+## Follow-up (2026-11-03): coroutine switches in the run
+
+Mini's `coroutine.resume`, wrap functions and `coroutine.yield` (and a
+coroutine's last return and its errors) now switch threads inside the
+running vm run: the CALL handler saves the running thread's state in its
+`Coro`, installs the other thread's stacks and state registers, and
+jumps to its saved resume point. No native call, no nested entry, no C
+stack per active coroutine (examples/mini/COROUTINES.md, Design and
+friction 7). No language feature was needed; no compiler or std change,
+so the other interpreters' IR is unchanged.
+
+Best of 5, interleaved, `--align-functions=64`, x86-64; *before* is
+the previous commit, seconds:
+
+| benchmark | tailcall before | tailcall now | goto before | goto now | switch before | switch now | lua | luajit-joff |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| chameneos | 0.593 | 0.417 | 0.604 | 0.445 | 0.626 | 0.480 | 1.009 | 0.380 |
+| coroutine_ring | 0.524 | 0.356 | 0.581 | 0.392 | 0.590 | 0.396 | 1.005 | 0.379 |
+| sieve | 0.576 | 0.390 | 0.655 | 0.413 | 0.655 | 0.405 | 1.104 | 0.388 |
+
+| mode | now/before (geomean) | now/lua | now/luajit-joff | before/luajit-joff |
+|---|---:|---:|---:|---:|
+| tailcall | 0.69 | 0.37 | 1.01 | 1.47 |
+| goto | 0.68 | 0.40 | 1.09 | 1.60 |
+| switch | 0.68 | 0.41 | 1.11 | 1.63 |
+
+The 14 clean-room benchmarks (best of 3, interleaved), now/before by
+geometric mean: tailcall 1.008 (0.987–1.051; the 1.051, `hash_strings`,
+is 1.03 at best of 7, with the same hot-path instructions as before),
+goto 0.977 (`fib` 0.88, `interp` 1.04 reproduced), switch 0.971
+(0.914–1.007).
 
 ## Per suite
 

@@ -23,7 +23,9 @@ All current numbers, for every example in every dispatch mode, are in
 [`docs/results.md`](docs/results.md); the optimization history is in
 [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md). Mini has Lua 5.4's
 coroutines too ([design and notes](examples/mini/COROUTINES.md)): on
-three coroutine benchmarks it takes 0.53–0.59× of PUC-Lua's time.
+three coroutine benchmarks it takes 0.35–0.41× of PUC-Lua's time, about
+LuaJIT `-joff`'s (a resume or yield switches threads inside the dispatch
+loop).
 
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on
 the standard library's shape and inline-cache support. On its 14
