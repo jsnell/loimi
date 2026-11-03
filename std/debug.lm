@@ -1,0 +1,362 @@
+// std.debug: the generic parts of a guest-program debugger for a vm
+// with `on break` (language.md section 9.1, docs/design/debugging.md).
+//
+// - `Breakpoints<B>`: the sites (patched instruction words) of the
+//   breakpoints the user set, keyed by address, with the step-over that
+//   runs a patched instruction once: the `on break` handler calls `hit`,
+//   which puts the instruction back, and the instrumentation variant the
+//   handler then switches to calls `tick` before each instruction, which
+//   sets the breakpoint again once execution has left it. `B` is the
+//   vm's `Vm.Break`; the vm's `clear_break` and `Break.rearm` are passed
+//   in (as `std.bc` takes `op_size`).
+// - `Stepper`: step / next / finish at the guest line level, from the
+//   line and the call depth the interpreter computes at each instruction.
+// - `Input` and `parse_command`: a line-oriented command reader for a
+//   gdb-like prompt (`break`, `continue`, `step`, `next`, `finish`, `bt`,
+//   `locals`, `print`, `op`, `delete`, `info`, `quit`), driven from stdin
+//   so it can be scripted.
+//
+// What the guest's lines, frames and locals are is the interpreter's
+// (Mini's examples/mini/debugger.lm is one).
+
+import std.mem;
+import std.text;
+
+extern "C" fn read(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn isatty(fd: i32) -> i32;
+
+// ── Breakpoints ─────────────────────────────────────────────────────────
+
+/// One patched word: breakpoint `id`'s site at address `at`. `tok` is the
+/// vm's `Vm.Break`, which knows the instruction it replaced.
+pub struct Site<B> { at: u64, tok: B, id: u32 }
+
+/// A breakpoint as the user set it: `id`, where (`file`, `line`), how many
+/// sites it has, and how often it was hit. `temp`: deleted on its first hit.
+pub struct Bp { id: u32, file: str, line: u32, nsites: u32, hits: u32, temp: bool }
+
+pub struct Breakpoints<B> {
+    sites: mem.Vec<Site<B>>,
+    bps: mem.Vec<Bp>,
+    next_id: u32,
+    clear: fn(B) -> bool,
+    rearm: fn(B) -> ?B,
+    /// The site the step-over put back, to set again once execution has
+    /// left it; `fresh` while the restored instruction itself has not
+    /// started (its own `tick` comes first).
+    pending: ?Site<B>,
+    fresh: bool,
+}
+
+pub fn Breakpoints<B>.new(clear: fn(B) -> bool, rearm: fn(B) -> ?B) -> Breakpoints<B> {
+    Breakpoints { sites: mem.Vec.new(), bps: mem.Vec.new(), next_id: 1, clear: clear, rearm: rearm, pending: None, fresh: false }
+}
+
+/// A new breakpoint (no sites yet): its id. Id 0 is never used.
+pub fn Breakpoints<B>.add(bs: *Breakpoints<B>, file: str, line: u32, temp: bool) -> u32 {
+    let id = bs.next_id;
+    bs.next_id += 1;
+    bs.bps.push(Bp { id: id, file: file, line: line, nsites: 0, hits: 0, temp: temp });
+    id
+}
+
+/// Record a site of breakpoint `id`: the word at `at` was patched (`tok`).
+pub fn Breakpoints<B>.add_site(bs: *Breakpoints<B>, id: u32, at: u64, tok: B) {
+    bs.sites.push(Site { at: at, tok: tok, id: id });
+    if let Some(b) = bs.bp(id) { b.nsites += 1; }
+}
+
+pub fn Breakpoints<B>.bp(bs: *Breakpoints<B>, id: u32) -> ?*Bp {
+    for i in 0..bs.bps.len {
+        if bs.bps.at(i).id == id { return Some(bs.bps.ptr_at(i)); }
+    }
+    None
+}
+
+/// The breakpoints, in the order they were set.
+pub fn Breakpoints<B>.list(bs: *Breakpoints<B>) -> []Bp { bs.bps.items() }
+
+/// Whether a site is at `at` (patched, or put back for a step-over).
+pub fn Breakpoints<B>.has_site(bs: *Breakpoints<B>, at: u64) -> bool {
+    bs.find(at).is_some()
+}
+
+fn Breakpoints<B>.find(bs: *Breakpoints<B>, at: u64) -> ?u64 {
+    for i in 0..bs.sites.len {
+        if bs.sites.at(i).at == at { return Some(i); }
+    }
+    None
+}
+
+/// The site at `at` was hit (from the vm's `on break` handler, `at` its
+/// `pc`): put its instruction back so that the handler can run it, and
+/// remember to set it again (`tick`), unless its breakpoint is temporary,
+/// which is deleted. Returns the breakpoint's id (0 if no site is at `at`,
+/// which a correct handler never sees).
+pub fn Breakpoints<B>.hit(bs: *Breakpoints<B>, at: u64) -> u32 {
+    let Some(i) = bs.find(at) else { return 0; };
+    let s = bs.sites.at(i);
+    let clear = bs.clear;
+    clear(s.tok);
+    let id = s.id;
+    var temp = false;
+    if let Some(b) = bs.bp(id) {
+        b.hits += 1;
+        temp = b.temp;
+    }
+    if temp {
+        bs.delete(id);
+    } else {
+        bs.pending = Some(s);
+        bs.fresh = true;
+    }
+    id
+}
+
+/// Before each instruction while the vm runs its step variant: set the
+/// pending site again once the instruction that was put back has
+/// started. Returns whether a site is still pending (the variant must
+/// stay on until it is not).
+pub fn Breakpoints<B>.tick(bs: *Breakpoints<B>) -> bool {
+    if bs.fresh {
+        bs.fresh = false;
+        return bs.pending.is_some();
+    }
+    let Some(s) = bs.pending else { return false; };
+    bs.pending = None;
+    let rearm = bs.rearm;
+    if let Some(i) = bs.find(s.at) {
+        match rearm(s.tok) {
+            Some(t) => bs.sites.set(i, Site { at: s.at, tok: t, id: s.id }),
+            None => {}
+        }
+    }
+    false
+}
+
+/// Delete breakpoint `id`: put the instructions back at its sites.
+/// False if there is no such breakpoint.
+pub fn Breakpoints<B>.delete(bs: *Breakpoints<B>, id: u32) -> bool {
+    var found = false;
+    var i: u64 = 0;
+    while i < bs.bps.len {
+        if bs.bps.at(i).id == id {
+            for j in i + 1..bs.bps.len { bs.bps.set(j - 1, bs.bps.at(j)); }
+            bs.bps.truncate(bs.bps.len - 1);
+            found = true;
+        } else {
+            i += 1;
+        }
+    }
+    let clear = bs.clear;
+    i = 0;
+    while i < bs.sites.len {
+        let s = bs.sites.at(i);
+        if s.id == id {
+            // A site put back for a step-over is not patched.
+            if let Some(p) = bs.pending and p.at == s.at {
+                bs.pending = None;
+            } else {
+                clear(s.tok);
+            }
+            for j in i + 1..bs.sites.len { bs.sites.set(j - 1, bs.sites.at(j)); }
+            bs.sites.truncate(bs.sites.len - 1);
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+/// Delete every breakpoint (detaching the debugger).
+pub fn Breakpoints<B>.clear_all(bs: *Breakpoints<B>) {
+    while bs.bps.len > 0 { bs.delete(bs.bps.at(0).id); }
+}
+
+pub fn Breakpoints<B>.free(bs: *Breakpoints<B>) {
+    bs.sites.free();
+    bs.bps.free();
+}
+
+// ── Stepping ────────────────────────────────────────────────────────────
+
+/// What the program does until the next stop: `Run` to a breakpoint (or
+/// the end), `Step` to the next line or into a call, `Next` to the next
+/// line of this function (or its caller), `Finish` out of this function.
+pub enum Mode { Run, Step, Next, Finish }
+
+/// A stepping command in progress: the mode, and the line and call depth
+/// where it started.
+pub struct Stepper { mode: Mode, line: u32, depth: u64 }
+
+pub fn Stepper.new() -> Stepper { Stepper { mode: Mode.Run, line: 0, depth: 0 } }
+
+/// Start `mode` at `line` and call depth `depth` (frames below, from 0).
+pub fn Stepper.start(s: *Stepper, mode: Mode, line: u32, depth: u64) {
+    s.mode = mode;
+    s.line = line;
+    s.depth = depth;
+}
+
+/// Whether stepping needs the vm's per-instruction hook.
+pub fn Stepper.active(s: *Stepper) -> bool {
+    match s.mode { Run => false, _ => true }
+}
+
+/// Whether the instruction about to run, on `line` at call depth
+/// `depth`, is where the stepping command stops (then the mode is `Run`
+/// again). Lines are compared within a frame: a loop that jumps back to
+/// the line it is on does not stop.
+pub fn Stepper.should_stop(s: *Stepper, line: u32, depth: u64) -> bool {
+    let stop = match s.mode {
+        Run => false,
+        Step => depth != s.depth or line != s.line,
+        Next => depth < s.depth or (depth == s.depth and line != s.line),
+        Finish => depth < s.depth,
+    };
+    if stop { s.mode = Mode.Run; }
+    stop
+}
+
+// ── Commands ────────────────────────────────────────────────────────────
+
+pub enum Command {
+    /// `break [FILE:]LINE` (`b`): FILE is "" when not given.
+    Break(str, u32),
+    /// `tbreak [FILE:]LINE`: deleted when first hit.
+    TBreak(str, u32),
+    Delete(u32),
+    Continue,
+    Step,
+    Next,
+    Finish,
+    Backtrace,
+    Locals,
+    Print(str),
+    /// `op`: the current instruction, disassembled.
+    Op,
+    /// `info` (`info breakpoints`).
+    Info,
+    Quit,
+    Help,
+    /// An empty line.
+    Empty,
+    /// Anything else: the message to print.
+    Bad(str),
+}
+
+/// Parse one command line.
+pub fn parse_command(line: str) -> Command {
+    let (cmd, arg) = split_word(trim(line));
+    if cmd.len == 0 { return Command.Empty; }
+    if cmd.eq("b") or cmd.eq("break") or cmd.eq("tbreak") {
+        let (file, n) = parse_location(arg);
+        let Some(l) = n else { return Command.Bad("usage: break [FILE:]LINE"); };
+        return if cmd.eq("tbreak") { Command.TBreak(file, l) } else { Command.Break(file, l) };
+    }
+    if cmd.eq("d") or cmd.eq("delete") {
+        let Some(n) = text.parse_int(arg) else { return Command.Bad("usage: delete ID"); };
+        return Command.Delete(n as u32);
+    }
+    if cmd.eq("c") or cmd.eq("continue") { return Command.Continue; }
+    if cmd.eq("s") or cmd.eq("step") { return Command.Step; }
+    if cmd.eq("n") or cmd.eq("next") { return Command.Next; }
+    if cmd.eq("fin") or cmd.eq("finish") { return Command.Finish; }
+    if cmd.eq("bt") or cmd.eq("backtrace") or cmd.eq("where") { return Command.Backtrace; }
+    if cmd.eq("locals") or cmd.eq("l") { return Command.Locals; }
+    if cmd.eq("p") or cmd.eq("print") {
+        if arg.len == 0 { return Command.Bad("usage: print NAME"); }
+        return Command.Print(arg);
+    }
+    if cmd.eq("op") { return Command.Op; }
+    if cmd.eq("info") or cmd.eq("i") { return Command.Info; }
+    if cmd.eq("q") or cmd.eq("quit") { return Command.Quit; }
+    if cmd.eq("h") or cmd.eq("help") { return Command.Help; }
+    Command.Bad("unknown command (try `help`)")
+}
+
+/// The commands `parse_command` knows, one per line.
+pub const HELP: str = "break [FILE:]LINE   set a breakpoint (b; tbreak: one-shot)\ndelete ID           delete a breakpoint (d)\ninfo                list breakpoints\ncontinue            run to the next breakpoint (c)\nstep                to the next line, into calls (s)\nnext                to the next line in this function (n)\nfinish              out of this function (fin)\nbt                  the call stack\nlocals              the current function's locals\nprint NAME          a local's value (p)\nop                  the current instruction\nquit                end the program (q)\n";
+
+/// `[FILE:]LINE` as (FILE or "", LINE).
+pub fn parse_location(s: str) -> (str, ?u32) {
+    var colon: ?u64 = None;
+    for i in 0..s.len {
+        if s[i] == ':' { colon = Some(i); }
+    }
+    let (file, num) = match colon {
+        Some(i) => (s[..i], s[i + 1..]),
+        None => ("", s),
+    };
+    match text.parse_int(num) {
+        Some(n) => if n > 0 and n < 4294967296 { (file, Some(n as u32)) } else { (file, None) },
+        None => (file, None),
+    }
+}
+
+fn trim(s: str) -> str {
+    var a: u64 = 0;
+    var b = s.len;
+    while a < b and text.is_space(s[a]) { a += 1; }
+    while b > a and text.is_space(s[b - 1]) { b -= 1; }
+    s[a..b]
+}
+
+/// The first word of `s` and the rest, trimmed.
+fn split_word(s: str) -> (str, str) {
+    var i: u64 = 0;
+    while i < s.len and !text.is_space(s[i]) { i += 1; }
+    (s[..i], trim(s[i..]))
+}
+
+/// The last path component of `path`.
+pub fn basename(path: str) -> str {
+    var start: u64 = 0;
+    for i in 0..path.len {
+        if path[i] == '/' { start = i + 1; }
+    }
+    path[start..]
+}
+
+// ── Input ───────────────────────────────────────────────────────────────
+
+/// Lines from a file descriptor (stdin for a debugger prompt).
+pub struct Input { fd: i32, buf: text.StrBuf, line: text.StrBuf, pos: u64, eof: bool, tty: bool }
+
+pub fn Input.stdin() -> Input {
+    Input { fd: 0, buf: text.StrBuf.new(), line: text.StrBuf.new(), pos: 0, eof: false, tty: isatty(0) != 0 }
+}
+
+/// The next line, without its newline (valid until the next call), or
+/// None at the end of the input.
+pub fn Input.read_line(inp: *Input) -> ?str {
+    inp.line.clear();
+    loop {
+        let have = inp.buf.as_str();
+        while inp.pos < have.len {
+            let c = have[inp.pos];
+            inp.pos += 1;
+            if c == '\n' { return Some(inp.line.as_str()); }
+            inp.line.push(c);
+        }
+        inp.buf.clear();
+        inp.pos = 0;
+        if inp.eof { break; }
+        var chunk: [u8; 512];
+        let n = read(inp.fd, &chunk[0], 512);
+        if n <= 0 {
+            inp.eof = true;
+        } else {
+            for i in 0..n as u64 { inp.buf.push(chunk[i]); }
+        }
+    }
+    if inp.line.len() > 0 { Some(inp.line.as_str()) } else { None }
+}
+
+/// Whether the input is a terminal (a scripted session echoes commands).
+pub fn Input.is_tty(inp: *Input) -> bool { inp.tty }
+
+pub fn Input.free(inp: *Input) {
+    inp.buf.free();
+    inp.line.free();
+}

@@ -862,8 +862,18 @@ fn check_variants(c: &mut Checker, d: &VmDecl, i: usize, prefix: &str, cc: CallC
                 v
             }
         };
-        let mut wrappers = Vec::new();
+        let mut wrappers: Vec<(u32, FnId)> = Vec::new();
         for k in ops {
+            // `#[unfused]`: a super's table entry is its first part's
+            // wrapper, which runs the first part alone; its `next`
+            // dispatches the next part's word through this table too.
+            if var.unfused && !c.vms[i].ops[k].parts.is_empty() {
+                let base = c.vms[i].ops[k].parts[0];
+                if let Some(&(_, f)) = wrappers.iter().find(|(w, _)| *w as usize == base) {
+                    wrappers.push((k as u32, f));
+                    continue;
+                }
+            }
             let opname = c.vms[i].ops[k].name.clone();
             let fid = new_fn(
                 c,

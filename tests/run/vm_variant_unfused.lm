@@ -1,0 +1,73 @@
+// matrix: dispatch
+// `#[unfused] variant`: superinstructions run as their parts while the
+// variant's table is in use, so its wrapper sees every instruction (a
+// debugger's line hook), and the default table still runs them fused.
+import std.io;
+
+struct Ctx { seen: [i64; 16], fused: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JLT(a: reg, target: label) : AsBx { if a < 10 { jump target } next }
+    op ON() : ABC { use_variant every; next }
+    op RET(src: reg) : ABC { exit src }
+    super MOVE_ADD = MOVE; ADD;
+
+    #[unfused]
+    variant every wraps all {
+        before { ctx.seen[opcode] += 1; }
+    }
+    // A plain variant wraps the super as one instruction.
+    variant fused wraps all {
+        before { if opcode == V.OP_MOVE_ADD { ctx.fused += 1; } }
+    }
+    op FUSED() : ABC { use_variant fused; next }
+
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 { ctx = c; regs = r; jump code }
+}
+
+fn main() {
+    var words: [u32; 32] = [0; 32];
+    let c = words[..];
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 1);
+    at = V.emit.ON(c, at);
+    at = V.emit.MOVE(c, at, 2, 1);        // 3: loop
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.JLT(c, at, 0, -3);
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.FUSED(c, at);
+    at = V.emit.MOVE(c, at, 2, 1);        // 8: loop
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.JLT(c, at, 0, -3);
+    at = V.emit.RET(c, at, 0);
+    V.optimize_words(c[..at]);
+    io.println(V.op_name(words[3]));
+    var ctx = Ctx { seen: [0; 16], fused: 0 };
+    var regs: [i64; 4] = [0; 4];
+    io.print_int(V.run(&ctx, &words[0], &regs[0])); io.println("");
+    // Under `every`: ten MOVEs and ten ADDs, each on its own; the super
+    // never dispatches.
+    io.print_int(ctx.seen[V.OP_MOVE as u64]); io.println("");
+    io.print_int(ctx.seen[V.OP_ADD as u64]); io.println("");
+    io.print_int(ctx.seen[V.OP_MOVE_ADD as u64]); io.println("");
+    io.print_int(ctx.fused); io.println("");
+}
+// expect: MOVE_ADD
+// expect: 10
+// expect: 10
+// expect: 10
+// expect: 0
+// expect: 10

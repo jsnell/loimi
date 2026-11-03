@@ -126,6 +126,9 @@ pub struct VariantDecl {
     /// None = all ops.
     pub wraps: Option<Vec<Ident>>,
     pub before: Block,
+    /// `#[unfused]`: superinstructions run as their parts under this
+    /// variant (each part's word is dispatched, and wrapped, on its own).
+    pub unfused: bool,
 }
 
 #[derive(Clone, Debug)]

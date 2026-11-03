@@ -103,6 +103,7 @@ impl Parser {
                 "super" => ("a `super`".into(), &["forward"]),
                 "on" => ("`on raise` or `on break`".into(), &[]),
                 "op" => ("an `op`".into(), &["accumulate"]),
+                "variant" => ("a `variant`".into(), &["unfused"]),
                 "operand" | "entry" => (format!("an `{}`", kw), &[]),
                 _ => (format!("a `{}`", kw), &[]),
             };
@@ -428,7 +429,7 @@ impl Parser {
                     self.expect_kw("before")?;
                     let before = self.vm_block()?;
                     self.expect("}")?;
-                    vm.variants.push(VariantDecl { name: n, wraps, before });
+                    vm.variants.push(VariantDecl { name: n, wraps, before, unfused: item_attrs.has("unfused") });
                 }
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
