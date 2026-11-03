@@ -10,7 +10,7 @@ import value;
 import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box, K_MODULE, K_STATICM, K_CLASSM,
               K_CLASS, K_BOUND, K_RANGEIT, K_SEQIT, K_GEN, GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
 import ops;
-import builtins;
+import builtins; #[cfg(debug)] import debugger;
 
 /// A handler table entry: words [start, end) are protected; an exception
 /// raised there is stored in `reg` and execution continues at `target`.
@@ -58,7 +58,7 @@ pub struct Frame {
     ret_pc: *u32,
     ret_slot: *Value,
     alt_pc: *u32,
-    flags: u64,
+    flags: u64, #[cfg(debug)] at: *u32, // --cfg debug: where this frame called a native (sync), for the debugger's backtrace
 }
 
 pub const NTYPES: u64 = 24;
@@ -218,8 +218,8 @@ pub vm Py {
     /// Two classes (deltablue's call sites see several).
     cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32, cls2: u32, idx2: u32, depth2: u32 }
 
-    sync { ctx.fp = fp; }
-    reload { fp = ctx.fp; regs = fp.base; k = fp.k; }
+    sync { ctx.fp = fp; #[cfg(debug)] fp.at = pc; } // --cfg debug: where a frame calling a native is (backtraces)
+    reload { fp = ctx.fp; regs = fp.base; k = fp.k; #[cfg(debug)] if debugger.stepping() { use_variant step; } } // --cfg debug: the native ran Python code that steps
 
     // ── frames ──────────────────────────────────────────────────────
 
@@ -1207,7 +1207,7 @@ pub vm Py {
         fp = at;
         regs = at.base;
         k = at.k;
-        jump code
+        #[cfg(debug)] if debugger.stepping() { use_variant step; } jump code
     }
 
     on raise(e: Value) {
@@ -1232,7 +1232,7 @@ pub vm Py {
             regs = fp.base;
             k = fp.k;
         }
-    }
+    } #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc } #[cfg(debug)] #[unfused] variant step wraps all { before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } } } // --cfg debug: the debugger (see the end of this file)
 }
 
 /// Number of prototypes, for the verifier (set before verification).
@@ -1283,7 +1283,7 @@ pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value
             nf.flags = F_BASE;
             c.vm_depth += 1;
             let r = Py.call(c, nf, p.code.start());
-            c.vm_depth -= 1;
+            c.vm_depth -= 1; #[cfg(debug)] debugger.left(c, nf); // --cfg debug: frame nf's run ended (a stepping command in it moves to its caller)
             c.fp = caller;
             r
         }
@@ -1327,7 +1327,7 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
     c.gen_done = false;
     c.vm_depth += 1;
     let r = Py.call(c, nf, p.code.start() + g.n as u64);
-    c.vm_depth -= 1;
+    c.vm_depth -= 1; #[cfg(debug)] debugger.left(c, nf);
     c.fp = caller;
     match r {
         Ok(v) => {
@@ -1337,3 +1337,16 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
         Err(e) => Err(e),
     }
 }
+
+// --cfg debug: the debugger (debugger.lm, docs/design/debugging.md), on
+// the line that ends the vm above. A breakpoint stops, puts its
+// instruction back and runs it under `step`, whose wrapper sets the
+// breakpoint again before the next instruction and stops there if a
+// stepping command says so (and turns itself off when neither waits).
+// `#[unfused]`: under `step`, supers run as their parts, so the first
+// instruction of every line is seen. Runs that start or continue while
+// stepping (`call`, and `reload` after a native) turn `step` on; `sync`
+// saves where a frame calling a native is (`Frame.at`) for backtraces;
+// `invoke_at` and `gen_next` tell the stepper when a nested run's frame
+// has left. (All of it sits on existing lines, so that a build without
+// `--cfg debug` keeps its source positions in panic messages.)

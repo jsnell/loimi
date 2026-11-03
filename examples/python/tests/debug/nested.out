@@ -1,0 +1,124 @@
+> nested.py(1)<module>()
+-> def score(p):
+(Pdb) tbreak 9
+Breakpoint 1 at nested.py:9
+(Pdb) continue
+Deleted breakpoint 1 at nested.py:9
+> nested.py(9)report()
+-> ages = [score(p) for p in people]
+(Pdb) locals
+people = [('ann', 31), ('bob', 25), ('cy', 40)]
+(Pdb) step
+> nested.py(2)score()
+-> name, age = p
+(Pdb) step
+> nested.py(3)score()
+-> return age
+(Pdb) locals
+p = ('ann', 31)
+name = 'ann'
+age = 31
+(Pdb) finish
+> nested.py(9)report()
+-> ages = [score(p) for p in people]
+(Pdb) locals
+people = [('ann', 31), ('bob', 25), ('cy', 40)]
+p = ('ann', 31)
+(Pdb) next
+> nested.py(10)report()
+-> older = {p[0]: a for p, a in zip(people, ages) if a > 26}
+(Pdb) locals
+people = [('ann', 31), ('bob', 25), ('cy', 40)]
+ages = [31, 25, 40]
+(Pdb) next
+> nested.py(11)report()
+-> return ages, older
+(Pdb) locals
+people = [('ann', 31), ('bob', 25), ('cy', 40)]
+ages = [31, 25, 40]
+older = {'ann': 31, 'cy': 40}
+(Pdb) break 2
+Breakpoint 2 at nested.py:2
+(Pdb) continue
+([31, 25, 40], {'ann': 31, 'cy': 40})
+Breakpoint 2, hit 1
+> nested.py(2)score()
+-> name, age = p
+(Pdb) bt
+  nested.py(15)<module>()
+-> ordered = sorted(people, key=score)
+> nested.py(2)score()
+-> name, age = p
+(Pdb) locals
+p = ('ann', 31)
+(Pdb) next
+> nested.py(3)score()
+-> return age
+(Pdb) next
+Breakpoint 2, hit 2
+> nested.py(2)score()
+-> name, age = p
+(Pdb) next
+> nested.py(3)score()
+-> return age
+(Pdb) delete 2
+Deleted breakpoint 2 at nested.py:2
+(Pdb) next
+> nested.py(15)<module>()
+-> ordered = sorted(people, key=score)
+(Pdb) step
+> nested.py(16)<module>()
+-> print(ordered)
+(Pdb) step
+[('bob', 25), ('ann', 31), ('cy', 40)]
+> nested.py(17)<module>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+(Pdb) step
+> nested.py(17)<lambda>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+(Pdb) bt
+  nested.py(17)<module>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+> nested.py(17)<lambda>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+(Pdb) step
+> nested.py(6)by_len()
+-> return len(w)
+(Pdb) bt
+  nested.py(17)<module>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+  nested.py(17)<lambda>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+> nested.py(6)by_len()
+-> return len(w)
+(Pdb) finish
+> nested.py(17)<lambda>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+(Pdb) finish
+> nested.py(17)<module>()
+-> words = sorted(["ccc", "a", "bb"], key=lambda w: by_len(w))
+(Pdb) step
+> nested.py(18)<module>()
+-> print(words)
+(Pdb) next
+['a', 'bb', 'ccc']
+> nested.py(19)<module>()
+-> total = sum(x for x in range(5) if x % 2)
+(Pdb) step
+> nested.py(19)<genexpr>()
+-> total = sum(x for x in range(5) if x % 2)
+(Pdb) locals
+No locals
+(Pdb) step
+> nested.py(19)<module>()
+-> total = sum(x for x in range(5) if x % 2)
+(Pdb) locals
+score = <function score>
+by_len = <function by_len>
+report = <function report>
+people = [('ann', 31), ('bob', 25), ('cy', 40)]
+ordered = [('bob', 25), ('ann', 31), ('cy', 40)]
+words = ['a', 'bb', 'ccc']
+(Pdb) finish
+4
+[program finished]

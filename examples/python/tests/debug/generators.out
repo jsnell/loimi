@@ -1,0 +1,92 @@
+> generators.py(1)<module>()
+-> def countdown(n):
+(Pdb) break 3
+Breakpoint 1 at generators.py:3
+(Pdb) continue
+Breakpoint 1, hit 1
+> generators.py(3)countdown()
+-> got = yield n
+(Pdb) bt
+  generators.py(24)<module>()
+-> consume()
+  generators.py(16)consume()
+-> for v in countdown(3):
+> generators.py(3)countdown()
+-> got = yield n
+(Pdb) locals
+n = 3
+(Pdb) next
+> generators.py(17)consume()
+-> total += v
+(Pdb) next
+> generators.py(16)consume()
+-> for v in countdown(3):
+(Pdb) step
+> generators.py(4)countdown()
+-> if got:
+(Pdb) step
+> generators.py(6)countdown()
+-> n -= 1
+(Pdb) locals
+n = 3
+got = None
+(Pdb) delete 1
+Deleted breakpoint 1 at generators.py:3
+(Pdb) tbreak 19
+Breakpoint 2 at generators.py:19
+(Pdb) continue
+Deleted breakpoint 2 at generators.py:19
+> generators.py(19)consume()
+-> first = next(g)
+(Pdb) step
+> generators.py(2)countdown()
+-> while n > 0:
+(Pdb) step
+> generators.py(3)countdown()
+-> got = yield n
+(Pdb) step
+> generators.py(19)consume()
+-> first = next(g)
+(Pdb) bt
+  generators.py(24)<module>()
+-> consume()
+> generators.py(19)consume()
+-> first = next(g)
+(Pdb) next
+> generators.py(20)consume()
+-> second = g.send("hi")
+(Pdb) step
+> generators.py(4)countdown()
+-> if got:
+(Pdb) step
+> generators.py(5)countdown()
+-> print("got", got)
+(Pdb) step
+got hi
+> generators.py(6)countdown()
+-> n -= 1
+(Pdb) locals
+n = 2
+got = 'hi'
+(Pdb) finish
+> generators.py(20)consume()
+-> second = g.send("hi")
+(Pdb) next
+> generators.py(21)consume()
+-> print(first, second, total)
+(Pdb) step
+2 1 6
+> generators.py(22)consume()
+-> print(list(evens([1, 2, 3, 4])))
+(Pdb) step
+> generators.py(10)evens()
+-> for x in xs:
+(Pdb) step
+> generators.py(11)evens()
+-> if x % 2 == 0:
+(Pdb) finish
+> generators.py(22)consume()
+-> print(list(evens([1, 2, 3, 4])))
+(Pdb) continue
+[20, 40]
+[program finished]

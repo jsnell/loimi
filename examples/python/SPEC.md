@@ -175,3 +175,43 @@ register holds); free variables before assignment raise
 No other modules, no files, no `open`, no `async`, no `match`
 statements, no metaclasses, no `__new__`, no descriptors other than
 `property`, `staticmethod` and `classmethod`, no `exec`/`eval`.
+
+## Debugger (`--cfg debug`)
+
+```sh
+./target/release/loimi build examples/python/main.lm --release --cfg debug -o python-dbg
+./python-dbg --debug prog.py < commands      # or interactively
+```
+
+A pdb-like debugger (`examples/python/debugger.lm`, on the generic
+pieces of `docs/design/debugging.md`). It stops before the first line
+and reads commands: `break [FILE:]LINE` (`b`), `tbreak`, `delete ID`,
+`info`, `continue` (`c`), `step` (`s`), `next` (`n`), `finish` (out of
+the current function, gdb's; pdb's `return` stops before the return
+instead), `bt` (`where`), `locals`, `print NAME` (`p`: a local, else a
+global), `op` (the current instruction, disassembled), `quit`. Locations
+print as pdb's (`> FILE(LINE)FUNC()` and `-> source`, prompt `(Pdb)`).
+
+- A breakpoint on a `for` or `while` line stops on every iteration (at
+  the loop head: for a `for`, after its iterable is evaluated).
+- `step` goes into calls, generator resumptions (`for`, `next(g)`,
+  `g.send`) and functions called back from builtins (a `sorted` key);
+  `next` over a `yield` stops in the code that resumed the generator, as
+  pdb does; `next` or `finish` in a function called back from a builtin
+  stops in its caller once the builtin returns. An exception unwinding
+  out of the function stops `next` and `finish` at the handler (`except`
+  or `finally`) that catches it.
+- The prelude and builtin modules written in Python are not stepped
+  into and not shown in `bt`.
+- `locals` shows a function's locals from their first assignment in
+  code order (a local is not tracked through the paths that ran), and
+  comprehension targets inside the comprehension; at module level, the
+  globals (without `__` names). Values print as `repr` does, except that
+  no Python code runs: instances show as `<C object>` (exceptions as
+  `E('message')`), functions and generators without addresses.
+
+*Differences from pdb:* no expressions (`p` takes a name), no `return`,
+`until`, `jump`, `display`, conditions or `commands`; a line that jumps
+back to itself (a one-line loop) is one step; a stop after a generator
+resumes is at the first line that runs after the `yield` (in `x = yield
+v`, the `yield` itself stores `x`, so that is the next statement).

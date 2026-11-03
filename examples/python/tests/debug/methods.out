@@ -1,0 +1,63 @@
+> methods.py(1)<module>()
+-> class Counter:
+(Pdb) break 7
+Breakpoint 1 at methods.py:7
+(Pdb) info
+Num Type         Disp Where
+1   breakpoint   keep at methods.py:7
+(Pdb) continue
+Breakpoint 1, hit 1
+> methods.py(7)bump()
+-> old = self.n
+(Pdb) bt
+  methods.py(22)<module>()
+-> result = main()
+  methods.py(18)main()
+-> c.bump(k)
+> methods.py(7)bump()
+-> old = self.n
+(Pdb) locals
+self = <Counter object>
+by = 0
+(Pdb) print self
+<Counter object>
+(Pdb) print by
+0
+(Pdb) print old
+*** NameError: name 'old' is not defined
+(Pdb) print nothing
+*** NameError: name 'nothing' is not defined
+(Pdb) next
+> methods.py(8)bump()
+-> self.n = old + by
+(Pdb) locals
+self = <Counter object>
+by = 0
+old = 10
+(Pdb) finish
+> methods.py(18)main()
+-> c.bump(k)
+(Pdb) locals
+c = <Counter object>
+k = 0
+(Pdb) print c
+<Counter object>
+(Pdb) step
+> methods.py(17)main()
+-> for k in range(3):
+(Pdb) step
+> methods.py(18)main()
+-> c.bump(k)
+(Pdb) step
+Breakpoint 1, hit 2
+> methods.py(7)bump()
+-> old = self.n
+(Pdb) next
+> methods.py(8)bump()
+-> self.n = old + by
+(Pdb) delete 1
+Deleted breakpoint 1 at methods.py:7
+(Pdb) continue
+13 3
+[0, 1, 2]
+[program finished]

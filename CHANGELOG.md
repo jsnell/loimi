@@ -17,6 +17,14 @@ implementation; `git log` has the details.
   ([stdlib.md](docs/stdlib.md#stddebug-guest-debuggers)). Mini built with
   `--cfg debug` is a gdb-like debugger (`mini --debug script`); see
   [design/debugging.md](docs/design/debugging.md).
+- **A second guest debugger, for the Python subset** (`--cfg debug`,
+  `python-loimi --debug prog.py`, pdb-like: breakpoints in methods and
+  generators, stepping across `yield` and into `sorted` keys, `finish`
+  across exceptions; [SPEC.md](examples/python/SPEC.md#debugger---cfg-debug)).
+  It needed no change to the generated part; `std.debug` gained
+  `Stepper.left`, `line_sites`, `unpatched` and "line 0 is no line", and
+  struct literals take `#[cfg(..)]` on field initializers
+  ([design/debugging.md §8](docs/design/debugging.md#8-second-interpreter-python)).
 - **`Vm.Resume` inline cache fields**: verified code addresses in the
   instruction stream (try chains, cached callees); the verifier resets
   them to the placeholder, `v.fill_resumes(vals)` sets them, `jump

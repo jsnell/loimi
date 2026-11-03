@@ -195,6 +195,14 @@ pub fn stepping(c: *Ctx) -> bool {
     d.step.active() or d.bps.pending.is_some()
 }
 
+/// The nested run whose bottom frame was number `fi` ended (a
+/// `table.sort` comparator returned or raised): a stepping command in it
+/// waits for its caller, not for the comparator's next call.
+pub fn left(c: *Ctx, fi: u64) {
+    let Some(d) = c.dbg else { return; };
+    d.step.left(fi);
+}
+
 /// The line and call depth of the instruction at `pc` in frame `fp`.
 fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
     (line_of(fp.cl.proto, pc), ((fp as u64) - (c.frames as u64)) / size_of<Frame>())

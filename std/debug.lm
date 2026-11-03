@@ -185,6 +185,77 @@ pub fn Breakpoints<B>.free(bs: *Breakpoints<B>) {
     bs.bps.free();
 }
 
+/// `words` as they are without breakpoints, in `out`: each site in them
+/// gets back the word its breakpoint replaced (`word` is the vm's
+/// `Break.word`). For walks that read more than instruction sizes
+/// (`Vm.label`, `Vm.op_name`, operands), which see a breakpoint word as
+/// the breakpoint op.
+pub fn unpatched<B, W>(bs: *Breakpoints<B>, words: []W, word: fn(B) -> W, out: *mem.Vec<W>) {
+    out.clear();
+    for i in 0..words.len { out.push(words[i]); }
+    let lo = words.ptr as u64;
+    let hi = lo + words.len * size_of<W>();
+    for i in 0..bs.sites.len {
+        let s = bs.sites.at(i);
+        // A site put back for a step-over holds its instruction already.
+        if s.at >= lo and s.at < hi and !(bs.pending.is_some() and bs.pending.unwrap().at == s.at) {
+            out.set((s.at - lo) / size_of<W>(), word(s.tok));
+        }
+    }
+}
+
+/// The instructions where line `line` starts in one code object, for a
+/// breakpoint's sites: `words` its code, `lines` the line of each word,
+/// `size` the vm's `Vm.base_size` and `label` its `Vm.label` (the jump
+/// offset of a word, in words from it). A line starts where the code
+/// enters a run of its words: at the first word of the run, unless the
+/// run holds a *loop head*, an instruction that a backward jump from
+/// another line goes to (a `for` loop's FORITER, from the end of the
+/// body). Then the site is the loop head instead, which runs on every
+/// iteration, including the first. A jump within the line (a
+/// comprehension, a conditional expression) adds no site, so a
+/// breakpoint stops once each time the line runs.
+///
+/// `words` must be the code as it would be without breakpoints: a
+/// breakpoint word has its instruction's size, but `Vm.label` reads it as
+/// the breakpoint op (no label). `unpatched` makes such a copy.
+pub fn line_sites<W>(words: []W, lines: []u32, line: u32, size: fn(W) -> u64, label: fn(W) -> ?i64, out: *mem.Vec<u64>) {
+    // Loop heads of `line`: targets of backward jumps from other lines.
+    var heads: mem.Vec<u64> = mem.Vec.new();
+    var i: u64 = 0;
+    while i < words.len {
+        if lines[i] != line and let Some(off) = label(words[i]) {
+            let t = (i as i64) + off;
+            if t >= 0 and (t as u64) <= i and lines[t as u64] == line { heads.push(t as u64); }
+        }
+        i += size(words[i]);
+    }
+    i = 0;
+    var run_start: u64 = 0;
+    var in_run = false;
+    var site: ?u64 = None;
+    while i < words.len {
+        let l = lines[i];
+        if l == line {
+            if !in_run {
+                in_run = true;
+                run_start = i;
+                site = Some(i);
+            } else if let Some(s) = site and s == run_start {
+                for j in 0..heads.len {
+                    if heads.at(j) == i { site = Some(i); }
+                }
+            }
+        } else if in_run {
+            in_run = false;
+            if let Some(s) = site { out.push(s); }
+        }
+        i += size(words[i]);
+    }
+    if in_run and let Some(s) = site { out.push(s); }
+    heads.free();
+}
+
 // ── Stepping ────────────────────────────────────────────────────────────
 
 /// What the program does until the next stop: `Run` to a breakpoint (or
@@ -215,6 +286,9 @@ pub fn Stepper.active(s: *Stepper) -> bool {
 /// again). Lines are compared within a frame: a loop that jumps back to
 /// the line it is on does not stop.
 pub fn Stepper.should_stop(s: *Stepper, line: u32, depth: u64) -> bool {
+    // Line 0: an instruction of no line (a loop's jump back, which would
+    // otherwise carry the line of the body's last statement).
+    if line == 0 { return false; }
     let stop = match s.mode {
         Run => false,
         Step => depth != s.depth or line != s.line,
@@ -223,6 +297,31 @@ pub fn Stepper.should_stop(s: *Stepper, line: u32, depth: u64) -> bool {
     };
     if stop { s.mode = Mode.Run; }
     stop
+}
+
+/// The frame at call depth `depth` has left to the host: a nested run
+/// ended (a callback such as a sort key returned, a generator resumed
+/// from a native yielded, an exception left the run). The next
+/// instruction the stepper sees may be in a new frame at the same depth
+/// (the native calls the callback again), which the depth alone cannot
+/// tell from the frame that left. So: `step` stops at whatever runs
+/// next, and `next` or `finish` in that frame (or one of its callers)
+/// stop once its caller continues, at depth `depth - 1`. Lines are
+/// numbered from 1: line 0 here matches no instruction's line.
+pub fn Stepper.left(s: *Stepper, depth: u64) {
+    if depth > s.depth { return; }
+    match s.mode {
+        Run => {}
+        Step => {
+            s.line = 0;
+            s.depth = 0xffffffffffffffff;
+        }
+        _ => {
+            s.mode = Mode.Next;
+            s.line = 0;
+            s.depth = if depth > 0 { depth - 1 } else { 0 };
+        }
+    }
 }
 
 // ── Commands ────────────────────────────────────────────────────────────

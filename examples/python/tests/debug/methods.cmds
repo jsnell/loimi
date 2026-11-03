@@ -1,0 +1,20 @@
+break 7
+info
+continue
+bt
+locals
+print self
+print by
+print old
+print nothing
+next
+locals
+finish
+locals
+print c
+step
+step
+step
+next
+delete 1
+continue

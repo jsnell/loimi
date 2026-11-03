@@ -1,0 +1,8 @@
+break 3
+continue
+locals
+delete 1
+step
+locals
+next
+continue

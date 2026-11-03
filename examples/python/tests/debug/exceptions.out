@@ -1,0 +1,88 @@
+> exceptions.py(1)<module>()
+-> class Invalid(ValueError):
+(Pdb) break 18
+Breakpoint 1 at exceptions.py:18
+(Pdb) continue
+Breakpoint 1, hit 1
+> exceptions.py(18)run()
+-> out.append(check(s))
+(Pdb) next
+> exceptions.py(20)run()
+-> print("checked", s)
+(Pdb) next
+checked 4
+> exceptions.py(15)run()
+-> for s in items:
+(Pdb) continue
+Breakpoint 1, hit 2
+> exceptions.py(18)run()
+-> out.append(check(s))
+(Pdb) locals
+items = ['4', 'x', '7', 'y']
+out = [8]
+s = 'x'
+(Pdb) next
+> exceptions.py(20)run()
+-> print("checked", s)
+(Pdb) next
+checked x
+> exceptions.py(21)run()
+-> except ValueError as e:
+(Pdb) next
+> exceptions.py(22)run()
+-> print("error", e)
+(Pdb) next
+error bad: x
+> exceptions.py(23)run()
+-> out.append(-1)
+(Pdb) locals
+items = ['4', 'x', '7', 'y']
+out = [8]
+s = 'x'
+e = Invalid('bad: x')
+(Pdb) print e
+Invalid('bad: x')
+(Pdb) delete 1
+Deleted breakpoint 1 at exceptions.py:18
+(Pdb) break 6
+Breakpoint 2 at exceptions.py:6
+(Pdb) continue
+checked 7
+Breakpoint 2, hit 1
+> exceptions.py(6)parse()
+-> raise Invalid("bad: " + s)
+(Pdb) bt
+  exceptions.py(26)<module>()
+-> print(run(["4", "x", "7", "y"]))
+  exceptions.py(18)run()
+-> out.append(check(s))
+  exceptions.py(10)check()
+-> n = parse(s)
+> exceptions.py(6)parse()
+-> raise Invalid("bad: " + s)
+(Pdb) locals
+s = 'y'
+(Pdb) finish
+> exceptions.py(20)run()
+-> print("checked", s)
+(Pdb) locals
+items = ['4', 'x', '7', 'y']
+out = [8, -1, 14]
+s = 'y'
+(Pdb) step
+checked y
+> exceptions.py(21)run()
+-> except ValueError as e:
+(Pdb) step
+> exceptions.py(22)run()
+-> print("error", e)
+(Pdb) step
+error bad: y
+> exceptions.py(23)run()
+-> out.append(-1)
+(Pdb) next
+> exceptions.py(15)run()
+-> for s in items:
+(Pdb) continue
+[8, -1, 14, -1]
+[program finished]

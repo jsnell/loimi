@@ -1,0 +1,679 @@
+// A source-level debugger for the Python subset, compiled in with
+// `--cfg debug`:
+//
+//   loimi build --cfg debug examples/python/main.lm --release -o python-dbg
+//   ./python-dbg --debug script.py < commands
+//
+// It stops before the first line and reads commands from stdin
+// (`break [FILE:]LINE`, `tbreak`, `delete ID`, `info`, `continue`,
+// `step`, `next`, `finish`, `bt`, `locals`, `print NAME`, `op`, `quit`;
+// `help` lists them), printing locations as pdb does. The generic parts
+// are the compiler's and std.debug's (docs/design/debugging.md):
+// breakpoints are generated BREAK ops (`Py.set_break`), the vm's
+// `on break` handler stops and steps over the instruction under the
+// `step` variant (vm.lm), and std.debug keeps the breakpoint table, the
+// step/next/finish logic and the command reader.
+//
+// What is Python's: lines (each Proto's line table, with loop heads as
+// line starts), call depth (the frame array: generators run as frames on
+// it, and nested runs start above their caller), which code is the
+// program's (not the prelude or a builtin module written in Python),
+// frames, and locals (the compiler reports each local's register and
+// where it is first bound; values are shown without running Python code).
+
+import std.debug;
+import std.io;
+import std.mem;
+import std.text;
+import value;
+import value.{Value, Box, K_CLASS, K_GEN, K_SET, K_FROZENSET, K_RANGE, K_MODULE, K_BOUND};
+import vm;
+import vm.{Ctx, Proto, Frame, Py, F_BASE};
+import ops;
+import builtins;
+import big;
+import fmt;
+
+extern "C" fn exit(code: i32) -> never;
+
+// ── locals, as the compiler reports them ────────────────────────────────
+
+pub const LV_REG: u8 = 0;
+/// A local captured by an inner function: the register holds its cell.
+pub const LV_CELL: u8 = 1;
+/// A free variable: `reg` is its index in the function's cells.
+pub const LV_FREE: u8 = 2;
+
+/// A local variable: where it is (`kind`, `reg`) and the code words where
+/// it is bound (`start` to `end`, exclusive). A function's locals are
+/// bound from their first assignment in code order (the debugger does not
+/// track which assignments ran: a local assigned later in a loop body
+/// than it is read shows from that assignment on); comprehension targets
+/// only inside the comprehension.
+pub struct LocVar { name: str, reg: u32, start: u32, end: u32, kind: u8 }
+
+/// Where the compiler first bound each name in a function being compiled.
+struct Bind { name: str, at: u32 }
+struct Building { key: u64, binds: mem.Vec<Bind>, open: mem.Vec<u64>, vars: mem.Vec<LocVar> }
+struct ProtoInfo { proto: u64, vars: mem.Vec<LocVar> }
+
+var ON: bool = false;
+var BUILDING: ?*mem.Vec<Building> = None;
+var DONE: ?*mem.Vec<ProtoInfo> = None;
+
+/// `--debug` was given: record locals while compiling, and debug.
+pub fn enable() {
+    ON = true;
+    let b: *mem.Vec<Building> = mem.alloc(1);
+    *b = mem.Vec.new();
+    BUILDING = Some(b);
+    let d: *mem.Vec<ProtoInfo> = mem.alloc(1);
+    *d = mem.Vec.new();
+    DONE = Some(d);
+}
+
+fn building(key: u64) -> ?*Building {
+    let Some(bs) = BUILDING else { return None; };
+    for i in 0..bs.len {
+        if bs.at(i).key == key { return Some(bs.ptr_at(i)); }
+    }
+    bs.push(Building { key: key, binds: mem.Vec.new(), open: mem.Vec.new(), vars: mem.Vec.new() });
+    Some(bs.ptr_at(bs.len - 1))
+}
+
+/// The compiler (`c`) stored name `n` up to word `pc`: it is bound from `pc` on.
+pub fn store(c: *u8, n: str, pc: u32) {
+    if !ON { return; }
+    let Some(b) = building(c as u64) else { return; };
+    for i in 0..b.binds.len {
+        let x = b.binds.ptr_at(i);
+        if x.name.eq(n) {
+            if pc < x.at { x.at = pc; }
+            return;
+        }
+    }
+    b.binds.push(Bind { name: n, at: pc });
+}
+
+/// A comprehension target: register `reg` is local `n` from word `pc`.
+pub fn open_local(c: *u8, n: str, reg: u32, pc: u32) {
+    if !ON { return; }
+    let Some(b) = building(c as u64) else { return; };
+    b.open.push(b.vars.len);
+    b.vars.push(LocVar { name: n, reg: reg, start: pc, end: 0xffffffff, kind: LV_REG });
+}
+
+/// The last `n` comprehension targets end at word `pc`.
+pub fn close_locals(c: *u8, n: u64, pc: u32) {
+    if !ON { return; }
+    let Some(b) = building(c as u64) else { return; };
+    for _ in 0..n {
+        let Some(v) = b.open.pop() else { break; };
+        b.vars.ptr_at(v).end = pc;
+    }
+}
+
+/// A function-wide local: bound from word 0 if `param`, else from its
+/// first store.
+pub fn local(c: *u8, n: str, reg: u32, kind: u8, param: bool) {
+    if !ON { return; }
+    let Some(b) = building(c as u64) else { return; };
+    var start: u32 = if param { 0 } else { 0xffffffff };
+    if !param {
+        for i in 0..b.binds.len {
+            if b.binds.at(i).name.eq(n) { start = b.binds.at(i).at; }
+        }
+    }
+    if start == 0xffffffff { return; }
+    b.vars.push(LocVar { name: n, reg: reg, start: start, end: 0xffffffff, kind: kind });
+}
+
+/// The function compiled by `c` is `p`.
+pub fn finish_proto(c: *u8, p: *Proto) {
+    if !ON { return; }
+    let Some(bs) = BUILDING else { return; };
+    let Some(d) = DONE else { return; };
+    for i in 0..bs.len {
+        if bs.at(i).key == c as u64 {
+            let b = bs.at(i);
+            b.binds.free();
+            b.open.free();
+            // In register order (parameters first), free variables last.
+            var vars = b.vars;
+            for j in 1..vars.len {
+                var k = j;
+                while k > 0 and order(vars.at(k)) < order(vars.at(k - 1)) {
+                    let t = vars.at(k);
+                    vars.set(k, vars.at(k - 1));
+                    vars.set(k - 1, t);
+                    k -= 1;
+                }
+            }
+            d.push(ProtoInfo { proto: p as u64, vars: vars });
+            for j in i + 1..bs.len { bs.set(j - 1, bs.at(j)); }
+            bs.truncate(bs.len - 1);
+            return;
+        }
+    }
+    d.push(ProtoInfo { proto: p as u64, vars: mem.Vec.new() });
+}
+
+fn order(v: LocVar) -> u64 { (if v.kind == LV_FREE { 1 << 32 } else { 0 }) + v.reg as u64 }
+
+fn locvars(p: *Proto) -> []LocVar {
+    if let Some(d) = DONE {
+        for i in 0..d.len {
+            let x = d.ptr_at(i);
+            if x.proto == p as u64 { return x.vars.items(); }
+        }
+    }
+    (0 as *LocVar).slice(0)
+}
+
+// ── the debugger ────────────────────────────────────────────────────────
+
+pub struct Dbg {
+    bps: debug.Breakpoints<Py.Break>,
+    step: debug.Stepper,
+    input: debug.Input,
+    file: str,
+    src: str,
+    out: text.StrBuf,
+    /// The program's prototypes are c.protos[user_from..user_to].
+    user_from: u64,
+    user_to: u64,
+    /// The last prototype `is_user` answered for.
+    last: u64,
+    last_user: bool,
+    /// Past the stop before the first line.
+    started: bool,
+    ctx: *Ctx,
+}
+
+var DBG: ?*Dbg = None;
+var USER_FROM: u64 = 0;
+
+fn clear_site(b: Py.Break) -> bool { Py.clear_break(b) }
+fn rearm_site(b: Py.Break) -> ?Py.Break { b.rearm() }
+fn break_word(b: Py.Break) -> u32 { b.word() }
+
+/// The program's prototypes start at number `n` (the prelude's come before).
+pub fn user_code_from(n: u64) { USER_FROM = n; }
+
+/// The program is compiled and about to run (module prototype `mp`):
+/// stop before its first instruction.
+pub fn start(c: *Ctx, mp: *Proto, path: str, src: str) {
+    if !ON { return; }
+    let d: *Dbg = mem.alloc(1);
+    *d = Dbg {
+        bps: debug.Breakpoints.new(clear_site, rearm_site),
+        step: debug.Stepper.new(),
+        input: debug.Input.stdin(),
+        file: path,
+        src: src,
+        out: text.StrBuf.new(),
+        user_from: USER_FROM,
+        user_to: c.protos.len,
+        last: 0,
+        last_user: false,
+        started: false,
+        ctx: c,
+    };
+    // A one-shot breakpoint at the first instruction; its id is free
+    // again once it is hit, so the user's breakpoints count from 1.
+    let id = d.bps.add(path, 0, true);
+    if let Some(t) = Py.set_break(mp.code, 0) { d.bps.add_site(id, mp.code.start() as u64, t); }
+    d.bps.next_id = id;
+    DBG = Some(d);
+}
+
+/// The program ended with status `rc`.
+pub fn finished(rc: i32) {
+    let Some(_) = DBG else { return; };
+    io.println(if rc == 0 { "[program finished]" } else { "[program failed]" });
+}
+
+/// From the vm's `on break` handler: the breakpoint at `pc` was hit.
+pub fn on_break(c: *Ctx, pc: *u32, fp: *Frame) {
+    let Some(d) = DBG else { return; };
+    let id = d.bps.hit(pc as u64);
+    stop(d, c, pc, fp, id);
+}
+
+/// From the `step` variant, before each instruction: whether it must
+/// stay on (a breakpoint waits to be set again, or a command steps).
+pub fn on_step(c: *Ctx, pc: *u32, fp: *Frame) -> bool {
+    let Some(d) = DBG else { return false; };
+    let pending = d.bps.tick();
+    // A breakpoint here stops in its own handler; code that is not the
+    // program's (the prelude) is stepped through.
+    if d.step.active() and !Py.is_break(*pc) and d.is_user(c, fp.proto) {
+        let (line, depth) = where_at(c, pc, fp);
+        if d.step.should_stop(line, depth) { stop(d, c, pc, fp, 0); }
+    }
+    pending or d.step.active()
+}
+
+/// Whether a run that starts or continues after a native must use the
+/// `step` variant.
+pub fn stepping() -> bool {
+    let Some(d) = DBG else { return false; };
+    d.step.active() or d.bps.pending.is_some()
+}
+
+/// The run whose bottom frame is `f` ended (it returned, yielded or
+/// raised to the native that started it).
+pub fn left(c: *Ctx, f: *Frame) {
+    let Some(d) = DBG else { return; };
+    d.step.left(depth_of(c, f));
+}
+
+fn depth_of(c: *Ctx, f: *Frame) -> u64 { ((f as u64) - (c.frames as u64)) / size_of<Frame>() }
+
+fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
+    (vm.line_of(fp.proto, pc), depth_of(c, fp))
+}
+
+fn Dbg.is_user(d: *Dbg, c: *Ctx, p: *Proto) -> bool {
+    if p as u64 == d.last { return d.last_user; }
+    var r = false;
+    for i in d.user_from..d.user_to {
+        if c.protos.at(i) as u64 == p as u64 { r = true; break; }
+    }
+    d.last = p as u64;
+    d.last_user = r;
+    r
+}
+
+fn Dbg.flush(d: *Dbg) {
+    io.print(d.out.as_str());
+    d.out.clear();
+}
+
+/// Text of source line `n` (1-based).
+fn Dbg.source_line(d: *Dbg, n: u32) -> str {
+    var line: u32 = 1;
+    var i: u64 = 0;
+    while i < d.src.len and line < n {
+        if d.src[i] == '\n' { line += 1; }
+        i += 1;
+    }
+    var e = i;
+    while e < d.src.len and d.src[e] != '\n' { e += 1; }
+    d.src[i..e]
+}
+
+/// pdb's frame line: `FILE(LINE)FUNC()`, then `-> SOURCE`.
+fn Dbg.entry(d: *Dbg, p: *Proto, line: u32) {
+    d.out.push_str(debug.basename(d.file));
+    d.out.push_str("(");
+    d.out.push_int(line as i64);
+    d.out.push_str(")");
+    d.out.push_str(p.name);
+    d.out.push_str("()\n-> ");
+    let s = d.source_line(line);
+    var a: u64 = 0;
+    while a < s.len and (s[a] == ' ' or s[a] == '\t') { a += 1; }
+    d.out.push_str(s[a..]);
+    d.out.push_str("\n");
+}
+
+/// Stop at `pc` (breakpoint `id`, or 0 for a step) and run commands
+/// until one continues the program.
+fn stop(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame, id: u32) {
+    let (line, depth) = where_at(c, pc, fp);
+    if id != 0 and let Some(b) = d.bps.bp(id) {
+        d.out.push_str("Breakpoint ");
+        d.out.push_int(id as i64);
+        d.out.push_str(", hit ");
+        d.out.push_int(b.hits as i64);
+        d.out.push_str("\n");
+    } else if id != 0 and d.started {
+        // A `tbreak`, deleted by the hit.
+        d.out.push_str("Deleted breakpoint ");
+        d.out.push_int(id as i64);
+        d.out.push_str(" at ");
+        d.out.push_str(debug.basename(d.file));
+        d.out.push_str(":");
+        d.out.push_int(line as i64);
+        d.out.push_str("\n");
+    }
+    d.started = true;
+    d.out.push_str("> ");
+    d.entry(fp.proto, line);
+    loop {
+        d.out.push_str("(Pdb) ");
+        d.flush();
+        let Some(cmdline) = d.input.read_line() else {
+            // End of the commands: detach and let the program finish.
+            if !d.input.is_tty() { io.println(""); }
+            d.bps.clear_all();
+            d.step.start(debug.Mode.Run, 0, 0);
+            return;
+        };
+        if !d.input.is_tty() {
+            d.out.push_str(cmdline);
+            d.out.push_str("\n");
+        }
+        match debug.parse_command(cmdline) {
+            Break(f, l) => d.set_line_break(c, f, l, false),
+            TBreak(f, l) => d.set_line_break(c, f, l, true),
+            Delete(n) => d.delete(n),
+            Info => d.info(),
+            Continue => { d.step.start(debug.Mode.Run, line, depth); d.flush(); return; }
+            Step => { d.step.start(debug.Mode.Step, line, depth); d.flush(); return; }
+            Next => { d.step.start(debug.Mode.Next, line, depth); d.flush(); return; }
+            Finish => { d.step.start(debug.Mode.Finish, line, depth); d.flush(); return; }
+            Backtrace => d.backtrace(c, pc, fp),
+            Locals => d.locals(fp, pc, ""),
+            Print(name) => d.locals(fp, pc, name),
+            Op => {
+                let words = fp.proto.code.words();
+                Py.disasm_insn(words, ((pc as u64) - (words.ptr as u64)) / 4, &d.out);
+            }
+            Quit => { d.flush(); exit(0) }
+            Help => d.out.push_str(debug.HELP),
+            Empty => {}
+            Bad(msg) => { d.out.push_str("*** "); d.out.push_str(msg); d.out.push_str("\n"); }
+        }
+    }
+}
+
+/// `break [FILE:]LINE`: a site where LINE starts, in every function of
+/// the program.
+fn Dbg.set_line_break(d: *Dbg, c: *Ctx, file: str, line: u32, temp: bool) {
+    if file.len > 0 and !debug.basename(file).eq(debug.basename(d.file)) {
+        d.out.push_str("*** No source file named ");
+        d.out.push_str(file);
+        d.out.push_str("\n");
+        return;
+    }
+    let id = d.bps.add(d.file, line, temp);
+    var at: mem.Vec<u64> = mem.Vec.new();
+    var plain: mem.Vec<u32> = mem.Vec.new();
+    for i in d.user_from..d.user_to {
+        let p = c.protos.at(i);
+        let words = p.code.words();
+        at.clear();
+        // Other breakpoints' words read as BREAK ops: find the line's
+        // starts in the code as it is without them.
+        debug.unpatched(&d.bps, words, break_word, &plain);
+        debug.line_sites(plain.items(), p.lines, line, Py.base_size, Py.label, &at);
+        for j in 0..at.len {
+            let w = (words.ptr + at.at(j)) as u64;
+            // One site per word: a second breakpoint at a line gets none.
+            if !d.bps.has_site(w) and let Some(t) = Py.set_break(p.code, at.at(j)) { d.bps.add_site(id, w, t); }
+        }
+    }
+    at.free();
+    plain.free();
+    let Some(b) = d.bps.bp(id) else { return; };
+    if b.nsites == 0 {
+        d.bps.delete(id);
+        d.bps.next_id = id;
+        for o in d.bps.list() {
+            if o.line == line {
+                d.out.push_str("*** Breakpoint ");
+                d.out.push_int(o.id as i64);
+                d.out.push_str(" is already at that line\n");
+                return;
+            }
+        }
+        d.out.push_str("*** Line ");
+        d.out.push_int(line as i64);
+        d.out.push_str(" has no code\n");
+        return;
+    }
+    d.out.push_str("Breakpoint ");
+    d.out.push_int(id as i64);
+    d.out.push_str(" at ");
+    d.out.push_str(debug.basename(d.file));
+    d.out.push_str(":");
+    d.out.push_int(line as i64);
+    d.out.push_str("\n");
+}
+
+fn Dbg.delete(d: *Dbg, n: u32) {
+    var line: u32 = 0;
+    if let Some(b) = d.bps.bp(n) { line = b.line; }
+    if !d.bps.delete(n) {
+        d.out.push_str("*** No breakpoint numbered ");
+        d.out.push_int(n as i64);
+        d.out.push_str("\n");
+        return;
+    }
+    d.out.push_str("Deleted breakpoint ");
+    d.out.push_int(n as i64);
+    d.out.push_str(" at ");
+    d.out.push_str(debug.basename(d.file));
+    d.out.push_str(":");
+    d.out.push_int(line as i64);
+    d.out.push_str("\n");
+}
+
+fn Dbg.info(d: *Dbg) {
+    let l = d.bps.list();
+    if l.len == 0 { d.out.push_str("No breakpoints\n"); return; }
+    d.out.push_str("Num Type         Disp Where\n");
+    for i in 0..l.len {
+        let b = l[i];
+        d.out.push_int(b.id as i64);
+        d.out.push_str(if b.id < 10 { "   " } else { "  " });
+        d.out.push_str("breakpoint   ");
+        d.out.push_str(if b.temp { "del  " } else { "keep " });
+        d.out.push_str("at ");
+        d.out.push_str(debug.basename(b.file));
+        d.out.push_str(":");
+        d.out.push_int(b.line as i64);
+        d.out.push_str("\n");
+        if b.hits > 0 {
+            d.out.push_str("\tbreakpoint already hit ");
+            d.out.push_int(b.hits as i64);
+            d.out.push_str(if b.hits == 1 { " time\n" } else { " times\n" });
+        }
+    }
+}
+
+/// pdb's `where`: the program's frames, oldest first, the current one
+/// marked `>`. A caller is at its call: the frame above it returns to
+/// `ret_pc` (just after the call), or, when the frame above is the bottom
+/// of a nested run, the caller is in a native and `sync` saved its pc.
+fn Dbg.backtrace(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame) {
+    var f = c.frames + 1;
+    while f <= fp {
+        let at = if f == fp { pc } else {
+            let callee = f + 1;
+            if (callee.flags & F_BASE) != 0 { f.at } else { callee.ret_pc - 1 }
+        };
+        if d.is_user(c, f.proto) {
+            d.out.push_str(if f == fp { "> " } else { "  " });
+            d.entry(f.proto, vm.line_of(f.proto, at));
+        }
+        f = f + 1;
+    }
+}
+
+/// The locals bound at `pc` in frame `fp` (only `name` if not empty;
+/// then a global if there is no such local). At module level, locals are
+/// the globals.
+fn Dbg.locals(d: *Dbg, fp: *Frame, pc: *u32, name: str) {
+    let p = fp.proto;
+    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+    let vars = locvars(p);
+    var found = false;
+    for j in 0..vars.len {
+        let v = vars[j];
+        if (v.start as u64) <= i and i < (v.end as u64) and v.name.len > 0 and v.name[0] != ' ' and v.name[0] != '.' {
+            if name.len == 0 or v.name.eq(name) {
+                let x = local_value(fp, v);
+                if x != Value.Undef {
+                    if name.len == 0 { d.out.push_str(v.name); d.out.push_str(" = "); }
+                    show(&d.out, x, 0);
+                    d.out.push_str("\n");
+                    found = true;
+                }
+            }
+        }
+    }
+    if found { return; }
+    // At module level the locals are the globals; elsewhere a name that
+    // is not a local may be a global.
+    let module = p.name.eq("<module>");
+    if name.len == 0 and !module { d.out.push_str("No locals\n"); return; }
+    if let Func(f) = fp.func {
+        let g = f.globals;
+        var it: u64 = 0;
+        while let Some(e) = value.dict_next(g, &it) {
+            let Str(k) = value.dict_key(g, e) else { continue; };
+            let kn = k.data;
+            if name.len == 0 {
+                if kn.len >= 2 and kn[0] == '_' and kn[1] == '_' { continue; }
+                d.out.push_str(kn);
+                d.out.push_str(" = ");
+                show(&d.out, value.dict_val(g, e), 0);
+                d.out.push_str("\n");
+                found = true;
+            } else if kn.eq(name) {
+                show(&d.out, value.dict_val(g, e), 0);
+                d.out.push_str("\n");
+                return;
+            }
+        }
+    }
+    if name.len == 0 {
+        if !found { d.out.push_str("No locals\n"); }
+        return;
+    }
+    d.out.push_str("*** NameError: name '");
+    d.out.push_str(name);
+    d.out.push_str("' is not defined\n");
+}
+
+fn local_value(fp: *Frame, v: LocVar) -> Value {
+    if v.kind == LV_FREE {
+        let Func(f) = fp.func else { return Value.Undef; };
+        let Some(cs) = f.cells else { return Value.Undef; };
+        if (v.reg as u64) >= cs.items.len { return Value.Undef; }
+        if let Cell(cl) = cs.items[v.reg as u64] { return cl.v; }
+        return Value.Undef;
+    }
+    let x = fp.base[v.reg as u64];
+    if v.kind == LV_CELL {
+        if let Cell(cl) = x { return cl.v; }
+        return Value.Undef;
+    }
+    x
+}
+
+/// A value as `repr` shows it, without running Python code: instances
+/// with a `__repr__` are shown as `<C object>`, and no addresses are
+/// printed (so that transcripts are deterministic).
+fn show(b: *text.StrBuf, v: Value, depth: u32) {
+    if depth > 5 { b.push_str("..."); return; }
+    match v {
+        Nil => b.push_str("None"),
+        Undef => b.push_str("<unbound>"),
+        Bool(x) => b.push_str(if x { "True" } else { "False" }),
+        Int(i) => b.push_int(i as i64),
+        Long(_) => big.write(b, v),
+        Float(f) => value.write_float(b, f),
+        Str(s) => fmt.write_str_repr(b, s.data),
+        Cell(_) => b.push_str("<cell>"),
+        List(l) => {
+            b.push('[');
+            for i in 0..l.len {
+                if i > 0 { b.push_str(", "); }
+                show(b, l.arr.items[i], depth + 1);
+            }
+            b.push(']');
+        }
+        Tuple(t) => {
+            b.push('(');
+            for i in 0..t.items.len {
+                if i > 0 { b.push_str(", "); }
+                show(b, t.items[i], depth + 1);
+            }
+            if t.items.len == 1 { b.push(','); }
+            b.push(')');
+        }
+        Dict(d) => {
+            b.push('{');
+            var it: u64 = 0;
+            var first = true;
+            while let Some(e) = value.dict_next(d, &it) {
+                if !first { b.push_str(", "); }
+                first = false;
+                show(b, value.dict_key(d, e), depth + 1);
+                b.push_str(": ");
+                show(b, value.dict_val(d, e), depth + 1);
+            }
+            b.push('}');
+        }
+        Func(f) => { b.push_str("<function "); b.push_str(f.proto.name); b.push('>'); }
+        Builtin(_) => b.push_str("<built-in function>"),
+        Inst(i) => {
+            let cls = ops.class_name(i.cls);
+            // An exception as its class and arguments.
+            if let Some(d) = DBG and let Some(base) = d.ctx.excs[builtins.E_BASE] and ops.subclass(i.cls, base) {
+                let args = value.attr_get(i.dict, vm.intern(d.ctx, "args")) ?? Value.Nil;
+                if let Tuple(t) = args {
+                    b.push_str(cls);
+                    b.push('(');
+                    for j in 0..t.items.len {
+                        if j > 0 { b.push_str(", "); }
+                        show(b, t.items[j], depth + 1);
+                    }
+                    b.push(')');
+                    return;
+                }
+            }
+            b.push('<');
+            b.push_str(cls);
+            b.push_str(" object>");
+        }
+        Obj(o) => show_obj(b, o, depth),
+    }
+}
+
+fn show_obj(b: *text.StrBuf, o: Gc<Box>, depth: u32) {
+    match o.kind {
+        K_CLASS => { b.push_str("<class '"); b.push_str(ops.class_name(o)); b.push_str("'>"); }
+        K_RANGE => {
+            b.push_str("range(");
+            b.push_int(o.n);
+            b.push_str(", ");
+            b.push_int(o.m);
+            if o.s != 1 { b.push_str(", "); b.push_int(o.s); }
+            b.push(')');
+        }
+        K_SET | K_FROZENSET => {
+            let d = o.dict.unwrap();
+            if d.len == 0 { b.push_str(if o.kind == K_SET { "set()" } else { "frozenset()" }); return; }
+            b.push('{');
+            var it: u64 = 0;
+            var first = true;
+            while let Some(e) = value.dict_next(d, &it) {
+                if !first { b.push_str(", "); }
+                first = false;
+                show(b, value.dict_key(d, e), depth + 1);
+            }
+            b.push('}');
+        }
+        K_GEN => {
+            b.push_str("<generator object ");
+            if let Func(f) = o.a { b.push_str(f.proto.name); }
+            b.push('>');
+        }
+        K_MODULE => {
+            b.push_str("<module '");
+            if let Str(s) = o.a { b.push_str(s.data); }
+            b.push_str("'>");
+        }
+        K_BOUND => {
+            b.push_str("<bound method ");
+            if let Func(f) = o.b { b.push_str(f.proto.name); }
+            b.push('>');
+        }
+        _ => b.push_str("<object>"),
+    }
+}
