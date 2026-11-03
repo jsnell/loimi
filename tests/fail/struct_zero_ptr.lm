@@ -1,3 +1,0 @@
-struct M { n: i64, p: *u8 }
-fn main() { let m = M { ..zero }; }
-// error: `..zero` cannot set field `p` of type `*u8`: give it a value

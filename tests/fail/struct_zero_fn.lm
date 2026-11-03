@@ -1,0 +1,5 @@
+// `..zero` does not null a function pointer: a call through it would jump
+// to address 0. `?fn(..)` starts as None.
+struct M { n: i64, f: fn(i64) -> i64 }
+fn main() { let m = M { ..zero }; }
+// error: `..zero` cannot set field `f` of type `fn(i64) -> i64`: give it a value (a `fn(i64) -> i64` is never null; a field declared `?fn(i64) -> i64` starts as None)

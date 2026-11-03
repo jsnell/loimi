@@ -115,7 +115,8 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, frames: *Frame, st:
     var m = Machine {
         stack: stack, stack_end: stack + 4096, frames: frames, frames_end: frames + 64,
         out: text.StrBuf.new(), error_line: 0, globals: Globals.new(), names: &names, err: text.StrBuf.new(),
-        heap: gc.Heap.new(), fp: frames, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(), steps: 20000,
+        heap: gc.Heap.new(), fp: frames, tmp: text.StrBuf.new(), steps: 20000,
+        ..zero
     };
     var stmts = match parser.parse_program(src, 0, &arena) {
         Ok(s) => s,

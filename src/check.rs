@@ -1841,12 +1841,23 @@ impl<'a> Checker<'a> {
                         (None, Some(rs)) => {
                             let (fname, fty) = &defs[i];
                             if fname.starts_with("__") || !zero_ok(fty) {
+                                // A reference that is never null: `?T` is
+                                // the type that starts as None.
+                                let hint = match fty {
+                                    Ty::Gc(_) | Ty::Fn(..) | Ty::Closure(..) if !fname.starts_with("__") => format!(
+                                        " (a `{}` is never null; a field declared `?{}` starts as None)",
+                                        self.ty_name(fty),
+                                        self.ty_name(fty)
+                                    ),
+                                    _ => String::new(),
+                                };
                                 return Err(Diag::new(
                                     *rs,
                                     format!(
-                                        "`..zero` cannot set field `{}` of type `{}`: give it a value",
+                                        "`..zero` cannot set field `{}` of type `{}`: give it a value{}",
                                         fname,
-                                        self.ty_name(fty)
+                                        self.ty_name(fty),
+                                        hint
                                     ),
                                 ));
                             }
@@ -3795,13 +3806,16 @@ fn irrefutable(p: &TPat) -> bool {
 }
 
 /// Whether all-zero bytes are a valid value of `t` that needs no
-/// constructor, for `..zero`: numbers, `bool`, `?T` (None), slices
-/// (empty), and arrays and tuples of those. Not `*T` and `Gc<T>` (never
-/// null), structs (their constructor may set invariants), enums, `value`
-/// types or functions.
+/// constructor, for `..zero`: numbers, `bool`, `?T` (None, so also
+/// `?*T`, `?Gc<T>` and `?fn`), slices (empty), raw pointers `*T` (null,
+/// as `0 as *T` makes without `unsafe`: a placeholder to assign before
+/// use), and arrays and tuples of those. Not `Gc<T>` (null only through
+/// `unsafe`, and the collector's and every reader's invariant is that it
+/// refers to an object), functions (a call through null), structs
+/// (their constructor may set invariants), enums or `value` types.
 pub fn zero_ok(t: &Ty) -> bool {
     match t {
-        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) => true,
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) | Ty::Ptr(_) => true,
         Ty::Array(e, _) => zero_ok(e),
         Ty::Tuple(ts) => ts.iter().all(zero_ok),
         _ => false,

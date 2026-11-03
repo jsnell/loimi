@@ -686,7 +686,8 @@ pub fn parse_program(src: str, arena: *mem.Arena) -> ?Program {
     let tok = Token { kind: T.Eof, text: "", line: 1, num: 0.0 };
     var p = Parser {
         lx: Lexer.new(src), cur: tok, prev: tok, had_error: false, panic: false,
-        arena: arena, pratt: &pr, fs: 0 as *FnState, cls: None, infos: mem.Vec.new(), err: text.StrBuf.new(),
+        arena: arena, pratt: &pr, infos: mem.Vec.new(), err: text.StrBuf.new(),
+        ..zero
     };
     let script = p.new_fun("script", FunKind.Script, 1);
     var fs = FnState { enclosing: None, fun: script, locals: mem.Vec.new(), scope_depth: 0, nconsts: 0 };

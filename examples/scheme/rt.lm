@@ -44,10 +44,7 @@ pub fn Ctx.new() -> Ctx {
     var c = Ctx {
         heap: gc.Heap.new(),
         stack: mem.alloc(STACK_SLOTS),
-        stack_end: 0 as *V,
         frames: mem.alloc(FRAME_SLOTS),
-        frames_end: 0 as *Frame,
-        fp: 0 as *Frame,
         gvals: mem.Vec.new(),
         gsyms: mem.Vec.new(),
         syms: Symtab.new(),
@@ -57,6 +54,7 @@ pub fn Ctx.new() -> Ctx {
         cont_proto: None,
         input: None,
         input_pos: 0,
+        ..zero
     };
     c.stack_end = c.stack + STACK_SLOTS;
     c.frames_end = c.frames + FRAME_SLOTS;

@@ -103,8 +103,7 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, lstack: *Value, fra
     var m = Machine {
         stack: stack + 1, stack_end: stack + 1 + NSTACK, lstack: lstack, lstack_end: lstack + NSTACK,
         frames: frames, frames_end: frames + 64,
-        words: 0 as *mem.Vec<*Word>, consts: 0 as *Value, globals: 0 as *Value, heap: gc.Heap.new(),
-        sp: stack, lp: lstack, fp: frames,
+        heap: gc.Heap.new(), sp: stack, lp: lstack, fp: frames,
         out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
         steps: 20000, ..zero
     };

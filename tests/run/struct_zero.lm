@@ -1,5 +1,7 @@
 // `..zero` in struct literals, and `[]` as the empty slice.
 import std.io;
+import std.gc;
+import std.mem;
 import std.text;
 import std.diag;
 
@@ -17,6 +19,23 @@ struct Machine {
 }
 
 struct Cfg { limit: i64, name: str, extra: ?u8 }
+
+object Box { x: i64 }
+
+/// Raw pointers start null (placeholders, as `0 as *T` would be), and
+/// `?Gc<T>` and `?fn` start as None.
+struct Vmish {
+    stack: *i64,
+    stack_end: *i64,
+    words: *mem.Vec<*u32>,
+    ptrs: [*u8; 2],
+    cur: ?Gc<Box>,
+    hook: ?fn(i64) -> i64,
+    heap: gc.Heap,
+}
+
+const NULLS: Vmish2 = Vmish2 { n: 5, ..zero };
+struct Vmish2 { n: i64, p: *u8, q: ?*u8 }
 
 const CFG: Cfg = Cfg { limit: 7, ..zero };
 var GCFG: Cfg = Cfg { ..zero };
@@ -50,6 +69,20 @@ fn main() {
     io.print_int(s.lo as i64 + s.hi as i64 + s.file as i64);
     io.println("");
 
+    // Pointer fields.
+    var v = Vmish { stack: mem.alloc(4), heap: gc.Heap.new(), ..zero };
+    io.print_bool(v.stack_end as u64 == 0);
+    io.print_bool(v.words as u64 == 0);
+    io.print_bool(v.ptrs[1] as u64 == 0);
+    io.print_bool(v.cur.is_none());
+    io.print_bool(v.hook.is_none());
+    v.stack_end = v.stack + 4;
+    io.print_int(((v.stack_end as u64) - (v.stack as u64)) as i64);
+    io.print_int(NULLS.n + NULLS.p as i64);
+    io.print_bool(NULLS.q.is_none());
+    io.println("");
+    v.heap.free();
+
     // The empty slice.
     let e: []u32 = [];
     io.print_int(e.len as i64);
@@ -65,4 +98,5 @@ fn main() {
 // expect: 7
 // expect: x
 // expect: 1
+// expect: truetruetruetruetrue325true
 // expect: 0060

@@ -2,4 +2,4 @@ import std.gc;
 object Box { x: i64 }
 struct M { n: i64, b: Gc<Box> }
 fn main() { let m = M { ..zero }; }
-// error: `..zero` cannot set field `b`
+// error: `..zero` cannot set field `b` of type `Gc<Box>`: give it a value (a `Gc<Box>` is never null; a field declared `?Gc<Box>` starts as None)

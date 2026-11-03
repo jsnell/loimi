@@ -38,13 +38,12 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
         frames: frames,
         frames_end: frames + FRAMES,
         fp: frames,
-        base: 0 as *Frame,
         globals: globals,
         rethrow: V.Nil,
         out: text.StrBuf.new(),
         open: None,
-        open_level: 0 as *V,
         host: host,
+        ..zero
     }
 }
 

@@ -67,11 +67,10 @@ fn main() -> i32 uses gc {
     };
     var names = text.Interner.new();
     var m = Machine {
-        stack: mem.alloc(STACK), stack_end: 0 as *Value,
-        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame,
-        out: text.StrBuf.new(), error_line: 0,
-        globals: Globals.new(), names: &names, err: text.StrBuf.new(),
-        heap: gc.Heap.new(), fp: 0 as *Frame, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(), steps: 0,
+        stack: mem.alloc(STACK), frames: mem.alloc(FRAMES),
+        out: text.StrBuf.new(), globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+        heap: gc.Heap.new(), tmp: text.StrBuf.new(),
+        ..zero
     };
     m.stack_end = m.stack + STACK;
     m.frames_end = m.frames + FRAMES;

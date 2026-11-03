@@ -49,11 +49,10 @@ fn run(src: str, stress: bool) -> str uses gc {
     defer arena.free();
     var names = text.Interner.new();
     var m = Machine {
-        stack: mem.alloc(1 << 16), stack_end: 0 as *Value,
-        frames: mem.alloc(1 << 10), frames_end: 0 as *Frame,
-        out: text.StrBuf.new(), error_line: 0,
-        globals: Globals.new(), names: &names, err: text.StrBuf.new(),
-        heap: gc.Heap.new(), fp: 0 as *Frame, protos: 0 as *mem.Vec<*Proto>, tmp: text.StrBuf.new(), steps: 0,
+        stack: mem.alloc(1 << 16), frames: mem.alloc(1 << 10),
+        out: text.StrBuf.new(), globals: Globals.new(), names: &names, err: text.StrBuf.new(),
+        heap: gc.Heap.new(), tmp: text.StrBuf.new(),
+        ..zero
     };
     m.stack_end = m.stack + (1 << 16);
     m.frames_end = m.frames + (1 << 10);
