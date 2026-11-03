@@ -172,6 +172,7 @@ fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
 // ── types ───────────────────────────────────────────────────────────
 
 /// The builtin type code of a value (T_*); instances give T_OBJECT.
+#[inline(always)]
 pub fn type_code(v: Value) -> u32 {
     let t = match v {
         Nil => vm.T_NONE,

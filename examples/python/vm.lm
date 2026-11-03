@@ -221,7 +221,7 @@ pub vm Py {
     /// Push a frame for `f` whose arguments are in place at `win`, and run it.
     fn push_frame(f: Gc<Func>, win: *Value, slot: *Value, flags: u64) -> never {
         let p = f.proto;
-        if !ensure(win + p.nregs as u64) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+        if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
         if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
         let nf = fp + 1;
         nf.func = Func(f);
@@ -251,7 +251,7 @@ pub vm Py {
                 Func(f) => {
                     let p = f.proto;
                     if p.simple == nn as u32 and kw == Nil { push_frame(f, regs + w, regs + b, flags) }
-                    if !ensure(regs + w + p.nregs as u64 + 1) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                    if !ensure(regs + w + p.nregs as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                     ops.bind_args(ctx, f, regs + w, nn, kw)?;
                     if (p.flags & P_GEN) != 0 {
                         let g = ops.make_gen(ctx, f, regs + w);
@@ -265,7 +265,7 @@ pub vm Py {
                     // in Python (prelude), so it runs in this loop rather than
                     // through a nested run per item.
                     if kw == Nil and nn >= 1 and nn <= 2 and value.is_kind(regs[w + nn - 1], K_GEN) and builtins.consumes(id) {
-                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = callee;
@@ -279,7 +279,7 @@ pub vm Py {
                 }
                 Obj(o) => {
                     if o.kind == K_BOUND {
-                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = o.a;
@@ -293,7 +293,7 @@ pub vm Py {
                                 let t = (o.n - 1) as u64;
                                 if t == T_LIST { callee = ctx.pre_list; continue; }
                                 if t == T_TUPLE or t == T_SET or t == T_FROZENSET or t == T_DICT {
-                                    if !ensure(regs + w + 3) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                                    if !ensure(regs + w + 3) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                                     regs[w + 1] = regs[w];
                                     regs[w] = callee;
                                     callee = ctx.pre_via1;
@@ -311,7 +311,7 @@ pub vm Py {
                             if nn > 0 or kw != Nil { raise ops.type_error(ctx, "takes no arguments", inst) }
                             next
                         };
-                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = inst;
@@ -324,7 +324,7 @@ pub vm Py {
                 }
                 Inst(o) => {
                     let Some(m) = ops.class_lookup(o.cls, intern(ctx, "__call__")) else { raise ops.not_callable(ctx, callee) };
-                    if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+                    if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                     var i = nn;
                     while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                     regs[w] = callee;
@@ -372,13 +372,14 @@ pub vm Py {
     /// execution continues at `next_pc`; when it finishes, at `alt`.
     fn resume(g: Gc<Box>, slot: *Value, cont: *u32, alt: *u32) -> never {
         if g.m == GEN_DONE { jump alt }
-        if g.m == GEN_RUNNING { raise ops.exc(ctx, builtins.E_VALUE, "generator already executing") }
+        if g.m == GEN_RUNNING { cold { raise ops.exc(ctx, builtins.E_VALUE, "generator already executing") } }
         let Func(f) = g.a else { trap() };
         let p = f.proto;
         let win = regs + fp.proto.nregs as u64;
-        if !ensure(win + p.nregs as u64) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+        if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
         if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
-        for i in 0..p.nregs as u64 { win[i] = g.extra[i]; }
+        let saved = g.extra.ptr;
+        for i in 0..p.nregs as u64 { win[i] = saved[i]; }
         if g.m == GEN_SUSPENDED { win[g.s as u64] = Nil; }
         g.m = GEN_RUNNING;
         let nf = fp + 1;
@@ -401,7 +402,7 @@ pub vm Py {
     /// operator methods (__add__, __getitem__, ...).
     fn call2(f: Gc<Func>, x: Value, y: Value, dst: u64) -> never {
         let win = regs + fp.proto.nregs as u64;
-        if !ensure(win + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+        if !ensure(win + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
         win[0] = x;
         win[1] = y;
         push_frame(f, win, regs + dst, 0)
@@ -480,7 +481,7 @@ pub vm Py {
     // ── cells (closures) ────────────────────────────────────────────
 
     op MAKECELL(r: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let c = value.new_box(&ctx.heap, K_CELL, 0);
         c.a = r;
         r = Obj(c);
@@ -579,21 +580,27 @@ pub vm Py {
         if let Inst(i) = o {
             let cls = i.cls;
             if ctx.epoch == cache.epoch {
+                // Class chains and class dicts are never None on these paths
+                // (the cache was filled through them); `??` avoids a panic call.
                 if cls.id == cache.cls {
                     var owner = cls;
                     var d = cache.depth;
-                    while d > 0 { owner = owner.base.unwrap(); d -= 1; }
-                    regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx as u64) + 1);
-                    regs[base.raw + 1] = o;
-                    next
+                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
+                    if let Some(od) = owner.dict {
+                        regs[base.raw] = *(od.ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                        regs[base.raw + 1] = o;
+                        next
+                    }
                 }
                 if cls.id == cache.cls2 {
                     var owner = cls;
                     var d = cache.depth2;
-                    while d > 0 { owner = owner.base.unwrap(); d -= 1; }
-                    regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx2 as u64) + 1);
-                    regs[base.raw + 1] = o;
-                    next
+                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
+                    if let Some(od) = owner.dict {
+                        regs[base.raw] = *(od.ent.items.ptr + 2 * (cache.idx2 as u64) + 1);
+                        regs[base.raw + 1] = o;
+                        next
+                    }
                 }
             }
         } else if let Obj(b) = o and cache.epoch == 0xfffffffe and let Some(d) = b.dict {
@@ -664,9 +671,10 @@ pub vm Py {
             if let Func(fn_) = f {
                 if fn_.proto.simple == (n + 1) as u32 { push_frame(fn_, regs + base.raw + 1, regs + base.raw, 0) }
             }
-            if let Builtin(id) = f and id == builtins.b_list_append() and n == 1 and let List(l) = s {
-                gc_point();
-                value.list_push(&ctx.heap, l, regs[base.raw + 2]);
+            if let Builtin(id) = f and id == builtins.b_list_append() and n == 1 and let List(l) = s and l.len < l.arr.items.len {
+                *(l.arr.items.ptr + l.len) = regs[base.raw + 2];
+                l.len += 1;
+                gc.write_barrier(&ctx.heap, l.arr as *u8);
                 regs[base.raw] = Nil;
                 next
             }
@@ -677,17 +685,17 @@ pub vm Py {
     /// CALL with keyword arguments: the last len(K[kw]) of the n
     /// arguments are named by the tuple K[kw].
     op CALLKW(base: reg, n: nargs, kw: kst) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         call_slow(base.raw, base.raw + 1, n as u64, kw)
     }
     op CALLMETHODKW(base: reg, n: imm, kw: kst) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         if regs[base.raw + 1] != Undef { call_slow(base.raw, base.raw + 1, n as u64 + 1, kw) }
         call_slow(base.raw, base.raw + 2, n as u64, kw)
     }
     /// R[base](*R[base+1], **R[base+2]) (R[base+2] may be None).
     op CALLEX(base: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let (n, kw) = ops.spread_args(ctx, regs + base.raw + 1)?;
         call_slow(base.raw, base.raw + 1, n, kw)
     }
@@ -952,28 +960,28 @@ pub vm Py {
     op DELINDEX(obj: reg, key: reg) : ABC { ops.delindex(ctx, obj, key)?; next }
     /// R[dst] = R[obj][R[lo]:R[lo+1]:R[lo+2]]
     op GETSLICE(dst: reg, obj: reg, lo: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.getslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2])?;
         next
     }
     op SETSLICE(obj: reg, lo: reg, src: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         ops.setslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2], src)?;
         next
     }
     op NEWLIST(dst: reg, base: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = List(value.list_of(&ctx.heap, (regs + base.raw).slice(n)));
         next
     }
     op NEWTUPLE(dst: reg, base: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = Tuple(value.tuple_of(&ctx.heap, (regs + base.raw).slice(n)));
         next
     }
     /// R[dst] = {R[base]: R[base+1], ...} (n pairs)
     op NEWDICT(dst: reg, base: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let d = value.new_dict(&ctx.heap, n);
         for i in 0..n {
             ops.dict_put(ctx, d, regs[base.raw + 2 * i], regs[base.raw + 2 * i + 1])?;
@@ -982,33 +990,41 @@ pub vm Py {
         next
     }
     op NEWSET(dst: reg, base: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let s = ops.new_set(ctx, false);
         for i in 0..n { ops.set_add(ctx, s, regs[base.raw + i])?; }
         dst = s;
         next
     }
     op LISTAPPEND(l: reg, v: reg) : ABC {
-        gc_point();
         let List(x) = l else { trap() };
-        value.list_push(&ctx.heap, x, v);
-        next
+        if x.len < x.arr.items.len {
+            *(x.arr.items.ptr + x.len) = v;
+            x.len += 1;
+            gc.write_barrier(&ctx.heap, x.arr as *u8);
+            next
+        }
+        cold {
+            gc_point();
+            value.list_push(&ctx.heap, x, v);
+            next
+        }
     }
     /// list.extend for [*a] and f(*a): R[l] must be a list.
     op LISTEXTEND(l: reg, v: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         ops.list_extend(ctx, l, v)?;
         next
     }
     op SETADD(s: reg, v: reg) : ABC { gc_point(); ops.set_add(ctx, s, v)?; next }
     op DICTSET(d: reg, key: reg, v: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let Dict(x) = d else { trap() };
         ops.dict_put(ctx, x, key, v)?;
         next
     }
     op TOTUPLE(dst: reg, src: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let List(l) = src else { trap() };
         dst = Tuple(value.tuple_of(&ctx.heap, value.list_items(l)));
         next
@@ -1028,7 +1044,7 @@ pub vm Py {
     /// Starred unpack: n = before | (after << 4); the starred list goes
     /// between them.
     op UNPACKEX(base: reg, src: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         ops.unpack(ctx, src, regs + base.raw, n & 15, n >> 4)?;
         next
     }
@@ -1038,17 +1054,17 @@ pub vm Py {
     /// R[dst] = format(R[v], R[spec]) after conversion `conv` ('r', 's', 'a' or 0);
     /// spec register 255 means no spec.
     op FORMAT(dst: reg, v: reg, spec: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.format_field(ctx, v, if spec == 255 { Nil } else { regs[spec] }, 0)?;
         next
     }
     op CONVERT(dst: reg, v: reg, conv: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.convert(ctx, v, conv)?;
         next
     }
     op BUILDSTR(dst: reg, base: reg, n: imm) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.join_strs(ctx, regs + base.raw, n);
         next
     }
@@ -1056,7 +1072,7 @@ pub vm Py {
     // ── iteration ───────────────────────────────────────────────────
 
     op GETITER(dst: reg, src: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         match src {
             List(_) | Tuple(_) => {
                 let b = value.new_box(&ctx.heap, K_SEQIT, 0);
@@ -1111,7 +1127,9 @@ pub vm Py {
         let Obj(g) = fp.gen else { trap() };
         let Func(f) = fp.func else { trap() };
         let p = f.proto;
-        for i in 0..p.nregs as u64 { g.extra[i] = regs[i]; }
+        let saved = g.extra.ptr;
+        for i in 0..p.nregs as u64 { saved[i] = regs[i]; }
+        gc.write_barrier(&ctx.heap, g as *u8);
         g.n = (((next_pc as u64) - (p.code.start() as u64)) / 4) as i64;
         g.s = dst.raw as i64;
         g.m = GEN_SUSPENDED;
@@ -1130,19 +1148,19 @@ pub vm Py {
     /// R[dst+1 ..] (the prototype says how many), then its kw-only
     /// defaults as a dict or None.
     op MAKEFUNC(dst: reg, p: pidx) : ABx {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.make_func(ctx, fp.func, ctx.protos.at(p), regs, dst.raw)?;
         next
     }
     /// R[dst] = class named R[base] with bases tuple R[base+1] and
     /// namespace R[base+2].
     op BUILDCLASS(dst: reg, base: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2])?;
         next
     }
     op RAISE(e: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let x = ops.make_exc(ctx, e)?;
         raise x
     }
@@ -1153,12 +1171,12 @@ pub vm Py {
         next
     }
     op SUPER(dst: reg, selfv: reg) : ABC {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = ops.make_super(ctx, fp.func, selfv)?;
         next
     }
     op IMPORT(dst: reg, name: kst) : ABx {
-        gc_point();
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         dst = builtins.import_module(ctx, name)?;
         next
     }
