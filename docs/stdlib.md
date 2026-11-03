@@ -46,7 +46,7 @@ Design rules for the library:
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
   `OrderedMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`, `Ops`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
-  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Gil`,
+  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Gil`, `Out`,
   `BigInt`, `Bench`, `Counters`; `Malloc` frees each allocation with
   `free_bytes`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
@@ -698,6 +698,18 @@ estimates and per-call work).
 `std/io.lm`: `print(s)`, `println(s)`, `print_int(i64)`, `print_f64(f64)`
 (`%.14g`), `print_bool(b)`, their stderr forms `eprint`, `eprintln`,
 `eprint_int`, `eprint_f64`, and `read_file(path) -> ?str` / `free_file(s)`.
+These write with one unbuffered `write(2)` per call.
+
+`io.Out` is buffered output: `io.Out.stdout()` (64 KiB) or
+`io.Out.new(fd, cap)`, then `o.print(s)`, `println`, `byte(c)`,
+`print_int`, `print_f64`, `print_bool`; the buffer is written out with
+one `write(2)` when it would overflow (a string larger than the buffer
+is written directly after it), and by `o.flush()` and `o.free()` (flush
+and release). There is no flush at exit: flush before the program ends,
+and before writing to the same terminal unbuffered (an `io.eprint`
+error message), or the output comes out of order. A program that
+prints a lot (an interpreter's `print` builtin) gains one system call
+per 64 KiB instead of one per call.
 
 `std/os.lm`: `arg_count() -> u64`, `arg(i) -> ?str` (0 is the program),
 `quit(code) -> never`.
@@ -705,7 +717,7 @@ estimates and per-call work).
 ### Design (not built): `std.io`, `std.os`, `std.ffi`
 
 `std.ffi` does not exist (`extern "C" fn` and `export "C"` are in the
-language, language.md §1.5). Not built: buffered or formatted output,
+language, language.md §1.5). Not built: formatted output (beyond `std.text`),
 stdin, environment variables, clocks, `mmap`, dynamic loading.
 
 ## `std.lex`

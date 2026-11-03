@@ -1,0 +1,43 @@
+// std.io.Out: buffered output. Text stays in the buffer until it is full
+// or flushed, so an unbuffered io.print in between comes out first; a
+// string larger than the buffer is written directly, after what is
+// buffered.
+// expect: unbuffered
+// expect: x = 42, -7, 2.5, true
+// expect: 0123456789
+// expect: abcdefghijklmnopqrstuvwxyzbuffered: 5
+// expect: !
+// expect: end
+
+import std.io;
+
+fn main() {
+    var o = io.Out.stdout();
+    o.print("x = ");
+    o.print_int(42);
+    o.print(", ");
+    o.print_int(-7);
+    o.print(", ");
+    o.print_f64(2.5);
+    o.print(", ");
+    o.print_bool(true);
+    o.byte('\n');
+    io.println("unbuffered");
+    o.flush();
+
+    // An 8-byte buffer: flushed when full, and long strings go directly.
+    var s = io.Out.new(1, 8);
+    for i in 0..10 { s.print_int(i as i64); }
+    s.println("");
+    s.print("abc");
+    s.print("defghijklmnopqrstuvwxyz");
+    s.byte('!');
+    s.byte('\n');
+    s.print("end");
+    io.print("buffered: ");
+    io.print_int(s.buffered() as i64);
+    io.println("");
+    s.byte('\n');
+    s.free();
+    o.free();
+}
