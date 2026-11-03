@@ -115,6 +115,8 @@ impl<'p> Gen<'p> {
             Ty::Slice(_) => return Err("slices other than `str` have no C equivalent".into()),
             Ty::Ptr(x) => match &**x {
                 Ty::Int(it) if it.bits == 8 && !it.signed => format!("void *{}", inner),
+                // A vector through memory: 16 bytes, at any alignment.
+                Ty::Vector(..) => format!("void *{}", inner),
                 Ty::Struct(i) => {
                     let name = &p.structs[*i as usize].name;
                     if p.structs[*i as usize].object.is_some() {
