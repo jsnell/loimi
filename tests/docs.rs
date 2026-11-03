@@ -11,6 +11,11 @@
 //!   <!-- snippet: run "text" "..." --> ... and stdout contains each text
 //!   <!-- snippet: fail "text" -->      fails to compile, the error
 //!                                      contains the text
+//!   <!-- snippet: excerpt FILE -->     the block is copied from FILE (a
+//!                                      path from the repository root):
+//!                                      each part between lines `..` or
+//!                                      `// ..` is consecutive lines of
+//!                                      FILE, ignoring indentation
 //!   <!-- snippet: skip reason -->      not compiled (pseudocode, a design
 //!                                      that is not built, ...): give the
 //!                                      reason
@@ -37,6 +42,7 @@ enum Kind {
     Check,
     Run(Vec<String>),
     Fail(String),
+    Excerpt(PathBuf),
     Skip,
 }
 
@@ -128,6 +134,7 @@ fn parse(file: &Path, text: &str, errors: &mut Vec<String>) -> Vec<Snippet> {
                         "check" if rest.is_empty() => Ok(Kind::Check),
                         "run" => quoted(rest).map(Kind::Run),
                         "fail" => quoted(rest).and_then(|q| if q.len() == 1 { Ok(Kind::Fail(q[0].clone())) } else { Err("fail takes one quoted error text".into()) }),
+                        "excerpt" if !rest.is_empty() && one_line => Ok(Kind::Excerpt(PathBuf::from(rest))),
                         "skip" if !rest.is_empty() && one_line => Ok(Kind::Skip),
                         "skip" => Err("skip needs a reason, on one line".into()),
                         _ => Err(format!("unknown annotation `{}`", first)),
@@ -209,6 +216,20 @@ fn check(s: &Snippet, dir: &Path) -> Result<(), String> {
     };
     match &s.kind {
         Kind::Skip => Ok(()),
+        Kind::Excerpt(f) => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let text = std::fs::read_to_string(root.join(f)).map_err(|e| format!("{}:{}: {}: {}", s.file.display(), s.line, f.display(), e))?;
+            let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+            let body: Vec<&str> = s.source.lines().map(|l| l.trim()).collect();
+            for part in body.split(|l| *l == ".." || *l == "// ..") {
+                let (Some(a), Some(b)) = (part.iter().position(|l| !l.is_empty()), part.iter().rposition(|l| !l.is_empty())) else { continue };
+                let part = &part[a..=b];
+                if !lines.windows(part.len()).any(|w| w == part) {
+                    return Err(format!("{}:{}: not found in {}:\n{}", s.file.display(), s.line, f.display(), part.join("\n")));
+                }
+            }
+            Ok(())
+        }
         Kind::Check | Kind::Fail(_) => {
             let out = loimi().arg("build").arg(&src).arg("--emit-llvm").arg("-o").arg("-").output().unwrap();
             match &s.kind {
@@ -252,11 +273,12 @@ fn doc_snippets() {
     }
     let count = |p: fn(&Kind) -> bool| snippets.iter().filter(|s| p(&s.kind)).count();
     eprintln!(
-        "doc snippets: {} ({} check, {} run, {} fail, {} skip)",
+        "doc snippets: {} ({} check, {} run, {} fail, {} excerpt, {} skip)",
         snippets.len(),
         count(|k| matches!(k, Kind::Check)),
         count(|k| matches!(k, Kind::Run(_))),
         count(|k| matches!(k, Kind::Fail(_))),
+        count(|k| matches!(k, Kind::Excerpt(_))),
         count(|k| matches!(k, Kind::Skip))
     );
     let next = Mutex::new(0usize);
