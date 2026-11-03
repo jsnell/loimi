@@ -18,6 +18,7 @@ import value.{V, Pair, Str, Sym, Vect};
 import rt.{Ctx};
 import rt;
 import read;
+import bignum;
 
 extern "C" fn pow(a: f64, b: f64) -> f64;
 extern "C" fn ceil(a: f64) -> f64;
@@ -92,7 +93,7 @@ fn read_stdin(c: *Ctx) -> V {
     }
 }
 
-pub const NPRIMS: i32 = 147;
+pub const NPRIMS: i32 = 149;
 pub const P_APPLY: i32 = 55;
 pub const P_CALLCC: i32 = 132;
 
@@ -245,14 +246,17 @@ pub fn prim_info(id: i32) -> (str, i32, i32) {
         143 => ("%record", 1, -1),
         144 => ("%record?", 2, 2),
         145 => ("%record-ref", 3, 3),
-        _ => ("%record-set!", 4, 4),
+        146 => ("%record-set!", 4, 4),
+        147 => ("floor-quotient", 2, 2),
+        _ => ("%exact-integer-sqrt", 1, 1),
     }
 }
 
 // ── numbers ─────────────────────────────────────────────────────────
 
 /// Binary arithmetic: op 0 +, 1 -, 2 *, 3 /. Fixnum results that overflow
-/// become flonums; `/` of fixnums is exact when the division is.
+/// become bignums; `/` of exact integers is exact when the division is
+/// (there are no rationals: otherwise it is a flonum).
 pub fn arith(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
     if let (Int(x), Int(y)) = (a, b) {
         match op {
@@ -262,20 +266,33 @@ pub fn arith(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
             _ => {
                 if y == 0 { return Err(rt.err_msg(c, "/: division by zero")); }
                 let (i, j) = (x as i64, y as i64);
-                if i % j == 0 {
-                    let q = i / j;
-                    if q >= -2147483648 and q <= 2147483647 { return Ok(V.Int(q as i32)); }
-                }
+                if i % j == 0 { return Ok(bignum.of_i64(&c.heap, i / j)); }
+                return Ok(V.Num((i as f64) / (j as f64)));
+            }
+        }
+        let (i, j) = (x as i64, y as i64);
+        return Ok(bignum.of_i64(&c.heap, match op { 0 => i + j, 1 => i - j, _ => i * j }));
+    }
+    let name = match op { 0 => "+", 1 => "-", 2 => "*", _ => "/" };
+    if bignum.is_exact(a) and bignum.is_exact(b) {
+        let h = &c.heap;
+        match op {
+            0 => return Ok(bignum.add(h, a, b)),
+            1 => return Ok(bignum.sub(h, a, b)),
+            2 => return Ok(bignum.mul(h, a, b)),
+            _ => {
+                let Some((q, r)) = bignum.divmod(h, a, b, false) else { return Err(rt.err_msg(c, "/: division by zero")); };
+                if r == V.Int(0) { return Ok(q); }
             }
         }
     }
-    let name = match op { 0 => "+", 1 => "-", 2 => "*", _ => "/" };
     let Some(x) = value.to_num(a) else { return Err(rt.type_err(c, name, "number", a)); };
     let Some(y) = value.to_num(b) else { return Err(rt.type_err(c, name, "number", b)); };
     Ok(V.Num(match op { 0 => x + y, 1 => x - y, 2 => x * y, _ => x / y }))
 }
 
-/// Comparison: op 0 =, 1 <, 2 >, 3 <=, 4 >=.
+/// Comparison: op 0 =, 1 <, 2 >, 3 <=, 4 >=. Exact: a bignum and a
+/// flonum compare by their values, not after rounding the bignum.
 pub fn compare(c: *Ctx, op: i32, a: V, b: V) -> Result<bool, V> {
     if let (Int(x), Int(y)) = (a, b) {
         return Ok(match op { 0 => x == y, 1 => x < y, 2 => x > y, 3 => x <= y, _ => x >= y });
@@ -283,7 +300,14 @@ pub fn compare(c: *Ctx, op: i32, a: V, b: V) -> Result<bool, V> {
     let name = match op { 0 => "=", 1 => "<", 2 => ">", 3 => "<=", _ => ">=" };
     let Some(x) = value.to_num(a) else { return Err(rt.type_err(c, name, "number", a)); };
     let Some(y) = value.to_num(b) else { return Err(rt.type_err(c, name, "number", b)); };
-    Ok(match op { 0 => x == y, 1 => x < y, 2 => x > y, 3 => x <= y, _ => x >= y })
+    var r: i32 = 0;
+    match (a, b) {
+        (Big(_), Big(_)) | (Big(_), Int(_)) | (Int(_), Big(_)) => r = bignum.cmp(a, b),
+        (Big(_), Num(f)) => { if f != f { return Ok(false); } r = bignum.cmp_float(a, f); }
+        (Num(f), Big(_)) => { if f != f { return Ok(false); } r = 0 - bignum.cmp_float(b, f); }
+        _ => return Ok(match op { 0 => x == y, 1 => x < y, 2 => x > y, 3 => x <= y, _ => x >= y }),
+    }
+    Ok(match op { 0 => r == 0, 1 => r < 0, 2 => r > 0, 3 => r <= 0, _ => r >= 0 })
 }
 
 fn num_arg(c: *Ctx, who: str, v: V) -> Result<f64, V> {
@@ -293,53 +317,74 @@ fn num_arg(c: *Ctx, who: str, v: V) -> Result<f64, V> {
     }
 }
 
-/// An integer argument (a fixnum, or a flonum with an integral value).
-fn int_arg(c: *Ctx, who: str, v: V) -> Result<i64, V> {
+/// An integer argument: exact, or a flonum with an integral value.
+fn int_check(c: *Ctx, who: str, v: V) -> Result<(), V> {
     match v {
-        Int(i) => Ok(i as i64),
+        Int(_) | Big(_) => Ok(()),
         Num(x) => {
-            if x == x.floor() and x > -9e15 and x < 9e15 { return Ok(x as i64); }
+            if x == x.floor() and x - x == 0.0 { return Ok(()); }
             Err(rt.type_err(c, who, "integer", v))
         }
         _ => Err(rt.type_err(c, who, "integer", v)),
     }
 }
 
-/// An exact integer result: a fixnum if it fits, otherwise a flonum.
-fn integer(x: i64) -> V {
-    if x >= -2147483648 and x <= 2147483647 { V.Int(x as i32) } else { V.Num(x as f64) }
+/// An integer argument as an exact integer (an integral flonum is
+/// converted exactly).
+fn exact_arg(c: *Ctx, who: str, v: V) -> Result<V, V> {
+    int_check(c, who, v)?;
+    match v {
+        Num(x) => Ok(bignum.of_f64(&c.heap, x).unwrap()),
+        _ => Ok(v),
+    }
 }
 
-/// Integer division: op 0 quotient, 1 remainder, 2 modulo.
+/// Integer division: op 0 quotient (truncate-quotient), 1 remainder
+/// (truncate-remainder), 2 modulo (floor-remainder), 3 floor-quotient.
+/// Exact for exact arguments; with a flonum argument, the result is a
+/// flonum.
 pub fn intdiv(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
-    let who = match op { 0 => "quotient", 1 => "remainder", _ => "modulo" };
-    let x = int_arg(c, who, a)?;
-    let y = int_arg(c, who, b)?;
-    if y == 0 { return Err(rt.err_msg(c, "integer division by zero")); }
-    var r = match op {
-        0 => x / y,
-        1 => x % y,
-        _ => {
-            var m = x % y;
-            if m != 0 and (m < 0) != (y < 0) { m += y; }
-            m
-        }
-    };
-    if let (Int(_), Int(_)) = (a, b) { return Ok(integer(r)); }
-    Ok(V.Num(r as f64))
+    let who = match op { 0 => "quotient", 1 => "remainder", 2 => "modulo", _ => "floor-quotient" };
+    if let (Int(x0), Int(y0)) = (a, b) {
+        let (x, y) = (x0 as i64, y0 as i64);
+        if y == 0 { return Err(rt.err_msg(c, "integer division by zero")); }
+        let q = x / y;
+        let r = x % y;
+        let fix = r != 0 and (r < 0) != (y < 0);
+        let v = match op {
+            0 => q,
+            1 => r,
+            2 => if fix { r + y } else { r },
+            _ => if fix { q - 1 } else { q },
+        };
+        return Ok(bignum.of_i64(&c.heap, v));
+    }
+    int_check(c, who, a)?;
+    int_check(c, who, b)?;
+    if bignum.is_exact(a) and bignum.is_exact(b) {
+        let floor = op >= 2;
+        let Some((q, r)) = bignum.divmod(&c.heap, a, b, floor) else {
+            return Err(rt.err_msg(c, "integer division by zero"));
+        };
+        return Ok(if op == 0 or op == 3 { q } else { r });
+    }
+    let x = num_arg(c, who, a)?;
+    let y = num_arg(c, who, b)?;
+    if y == 0.0 { return Err(rt.err_msg(c, "integer division by zero")); }
+    let r = fmod(x, y);
+    let fix = r != 0.0 and (r < 0.0) != (y < 0.0);
+    Ok(V.Num(match op {
+        0 => (x - r) / y,
+        1 => r,
+        2 => if fix { r + y } else { r },
+        _ => { let q = (x - r) / y; if fix { q - 1.0 } else { q } }
+    }))
 }
 
 fn round_like(c: *Ctx, op: i32, v: V) -> Result<V, V> {
-    if let Int(_) = v { return Ok(v); }
+    if bignum.is_exact(v) { return Ok(v); }
     let x = num_arg(c, "round", v)?;
     Ok(V.Num(match op { 0 => x.floor(), 1 => ceil(x), 2 => rint(x), _ => trunc(x) }))
-}
-
-fn gcd2(a: i64, b: i64) -> i64 {
-    var x = if a < 0 { 0 - a } else { a };
-    var y = if b < 0 { 0 - b } else { b };
-    while y != 0 { let t = x % y; x = y; y = t; }
-    x
 }
 
 fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
@@ -352,18 +397,57 @@ fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
         }
         if ok { return Ok(V.Int(r as i32)); }
     }
+    if bignum.is_exact(a) and bignum.is_exact(b) and bignum.sign(b) >= 0 {
+        // 0, 1 and -1 to any power are small; otherwise the exponent
+        // must be a fixnum for the result to fit in memory.
+        if a == V.Int(0) or a == V.Int(1) {
+            return Ok(if b == V.Int(0) { V.Int(1) } else { a });
+        }
+        if a == V.Int(-1) { return Ok(if bignum.is_odd(b) { a } else { V.Int(1) }); }
+        if let Int(e) = b and let Some(r) = bignum.pow(&c.heap, a, e as u64) { return Ok(r); }
+        return Err(rt.err(c, "expt: result too large, exponent", b));
+    }
     let x = num_arg(c, "expt", a)?;
     let y = num_arg(c, "expt", b)?;
     Ok(V.Num(pow(x, y)))
 }
 
+/// sqrt: exact for an exact perfect square, else a flonum.
 fn sqrt(c: *Ctx, a: V) -> Result<V, V> {
     if let Int(x) = a and x >= 0 {
         let r = (x as f64).sqrt() as i64;
         if r * r == x as i64 { return Ok(V.Int(r as i32)); }
     }
+    if let Big(_) = a and bignum.sign(a) > 0 {
+        let s = bignum.isqrt(&c.heap, a).unwrap();
+        if bignum.cmp(bignum.mul(&c.heap, s, s), a) == 0 { return Ok(s); }
+        let f = bignum.to_f64(a);
+        // Beyond the flonum range, the root of the integer part is as close.
+        if f - f != 0.0 { return Ok(V.Num(bignum.to_f64(s))); }
+        return Ok(V.Num(f.sqrt()));
+    }
     let x = num_arg(c, "sqrt", a)?;
     Ok(V.Num(x.sqrt()))
+}
+
+/// exact-integer-sqrt's root (the prelude computes the remainder).
+fn isqrt(c: *Ctx, a: V) -> Result<V, V> {
+    if bignum.is_exact(a) and bignum.sign(a) >= 0 {
+        if let Int(x) = a {
+            var r = (x as f64).sqrt() as i64;
+            while r * r > x as i64 { r -= 1; }
+            while (r + 1) * (r + 1) <= x as i64 { r += 1; }
+            return Ok(V.Int(r as i32));
+        }
+        return Ok(bignum.isqrt(&c.heap, a).unwrap());
+    }
+    Err(rt.type_err(c, "exact-integer-sqrt", "non-negative exact integer", a))
+}
+
+/// A radix argument of number->string or string->number.
+fn radix_arg(c: *Ctx, who: str, v: V) -> Result<u32, V> {
+    if let Int(r) = v and (r == 2 or r == 8 or r == 10 or r == 16) { return Ok(r as u32); }
+    Err(rt.type_err(c, who, "radix (2, 8, 10 or 16)", v))
 }
 
 // ── argument helpers ────────────────────────────────────────────────
@@ -537,14 +621,15 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         13 => Ok(value.boolean(value.is_number(a))),
         14 => {
             match a {
-                Int(_) => Ok(value.t()),
+                Int(_) | Big(_) => Ok(value.t()),
                 Num(x) => Ok(value.boolean(x == x.floor())),
                 _ => Ok(value.f()),
             }
         }
         15 => {
             match a {
-                Int(x) => Ok(if x < 0 { integer(0 - (x as i64)) } else { a }),
+                Int(x) => Ok(if x < 0 { bignum.of_i64(h, 0 - (x as i64)) } else { a }),
+                Big(_) => Ok(if bignum.sign(a) < 0 { bignum.neg(h, a) } else { a }),
                 _ => { let x = num_arg(c, name, a)?; Ok(V.Num(if x < 0.0 { 0.0 - x } else { x })) }
             }
         }
@@ -558,16 +643,16 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
                 let less = compare(c, 1, args[i], acc)?;
                 if (id == 16 and less) or (id == 17 and !less and !compare(c, 0, args[i], acc)?) { acc = args[i]; }
             }
-            if inexact and let Int(x) = acc { acc = V.Num(x as f64); }
+            if inexact { acc = V.Num(value.to_num(acc).unwrap()); }
             Ok(acc)
         }
         18 => sqrt(c, a),
         19 | 22 => Ok(V.Num(num_arg(c, name, a)?)),
         20 | 21 => {
             match a {
-                Int(_) => Ok(a),
+                Int(_) | Big(_) => Ok(a),
                 Num(x) => {
-                    if x == x.floor() and x >= -2147483648.0 and x <= 2147483647.0 { return Ok(V.Int(x as i32)); }
+                    if x == x.floor() and x - x == 0.0 { return Ok(bignum.of_f64(h, x).unwrap()); }
                     Err(rt.err(c, "inexact->exact: no exact representation for", a))
                 }
                 _ => Err(rt.type_err(c, name, "number", a)),
@@ -576,39 +661,48 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         23 | 24 | 25 | 26 => round_like(c, id - 23, a),
         27 => expt(c, a, b),
         28 | 29 => {
-            let x = int_arg(c, name, a)?;
-            Ok(value.boolean((x % 2 == 0) == (id == 28)))
+            int_check(c, name, a)?;
+            let odd = match a { Num(x) => fmod(x, 2.0) != 0.0, _ => bignum.is_odd(a) };
+            Ok(value.boolean(odd == (id == 29)))
         }
         30 => Ok(value.boolean(num_arg(c, name, a)? > 0.0)),
         31 => Ok(value.boolean(num_arg(c, name, a)? < 0.0)),
         32 => {
             num_arg(c, name, a)?;
+            let radix = if n > 1 { radix_arg(c, name, b)? } else { 10 };
             c.tmp.clear();
-            value.print(&c.tmp, a, false);
+            if bignum.is_exact(a) { bignum.write(&c.tmp, a, radix); } else { value.print(&c.tmp, a, false); }
             Ok(V.S(value.new_str(h, c.tmp.as_str())))
         }
         33 => {
             let s = str_arg(c, name, a)?;
-            match read.parse_number(s.data) {
+            let radix = if n > 1 { radix_arg(c, name, b)? } else { 10 };
+            match read.parse_number(h, s.data, radix) {
                 Some(v) => Ok(v),
                 None => Ok(value.f()),
             }
         }
         34 | 35 => {
-            var acc: i64 = if id == 34 { 0 } else { 1 };
+            var acc = V.Int(if id == 34 { 0 } else { 1 });
+            var inexact = false;
             for i in 0..n {
-                let x = int_arg(c, name, args[i])?;
+                if let Num(_) = args[i] { inexact = true; }
+                let x = exact_arg(c, name, args[i])?;
+                let g = bignum.gcd(h, acc, x);
                 if id == 34 {
-                    acc = gcd2(acc, x);
+                    acc = g;
+                } else if g == V.Int(0) {
+                    acc = g;
                 } else {
-                    let g = gcd2(acc, x);
-                    acc = if g == 0 { 0 } else { acc / g * x };
-                    if acc < 0 { acc = 0 - acc; }
+                    let (q, _) = bignum.divmod(h, x, g, false).unwrap();
+                    acc = bignum.mul(h, acc, q);
+                    if bignum.sign(acc) < 0 { acc = bignum.neg(h, acc); }
                 }
             }
-            Ok(integer(acc))
+            if inexact { return Ok(V.Num(bignum.to_f64(acc))); }
+            Ok(acc)
         }
-        36 => { num_arg(c, name, a)?; Ok(value.boolean(match a { Int(_) => true, _ => false })) }
+        36 => { num_arg(c, name, a)?; Ok(value.boolean(bignum.is_exact(a))) }
         37 => { num_arg(c, name, a)?; Ok(value.boolean(match a { Num(_) => true, _ => false })) }
         38 => Ok(value.cons(h, a, b)),
         39 => Ok(pair_arg(c, name, a)?.car),
@@ -874,7 +968,7 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
             let t = now_us();
             if JIFFY0 < 0 { JIFFY0 = t; }
             let d = t - JIFFY0;
-            Ok(if d <= 2147483647 { V.Int(d as i32) } else { V.Num(d as f64) })
+            Ok(bignum.of_i64(h, d))
         }
         131 => Ok(V.Int(1000000)),
         133 => Ok(value.boolean(a == V.Imm(value.IMM_EOF))),
@@ -896,7 +990,9 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
             if a == V.Int(0) { return Ok(a); }
             Ok(V.Num(atan(y)))
         }
-        142 => Ok(value.boolean(match a { Int(_) => true, _ => false })),
+        142 => Ok(value.boolean(bignum.is_exact(a))),
+        147 => intdiv(c, 3, a, b),
+        148 => isqrt(c, a),
         // Records (define-record-type expands into these; see compile.lm).
         143 => {
             let r = value.new_vect(h, n - 1, value.f());

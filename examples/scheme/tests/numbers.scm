@@ -1,4 +1,4 @@
-; Numbers: fixnums, flonums, overflow to flonum, arithmetic builtins.
+; Numbers: fixnums, flonums, overflow to bignum (see bignums.scm), arithmetic builtins.
 
 (define (show x . xs) (display x) (for-each (lambda (x) (display " ") (display x)) xs) (newline))
 
@@ -12,11 +12,11 @@
 ; expect: 1.5 -0.25 3.0 1e+21 0.3333333333333333
 (show (+ 1 2.5) (* 2 1.5) (- 1.5 1) (exact->inexact 7))
 ; expect: 3.5 3.0 0.5 7.0
-; Fixnums are 32-bit; overflow produces a flonum.
+; Fixnums are 32-bit; overflow produces a bignum.
 (show (+ 2147483647 1) (* 65536 65536) (- -2147483648 1))
-; expect: 2147483648.0 4294967296.0 -2147483649.0
+; expect: 2147483648 4294967296 -2147483649
 (show 2147483647 -2147483648 3000000000)
-; expect: 2147483647 -2147483648 3000000000.0
+; expect: 2147483647 -2147483648 3000000000
 (show (quotient 17 5) (remainder 17 5) (modulo 17 5))
 ; expect: 3 2 2
 (show (quotient -17 5) (remainder -17 5) (modulo -17 5) (modulo 17 -5))
@@ -28,7 +28,7 @@
 (show (abs -5) (abs 5) (abs -2.5) (min 3 1 2) (max 3 1 2) (max 1 2.0))
 ; expect: 5 5 2.5 1 3 2.0
 (show (sqrt 16) (sqrt 2) (expt 2 10) (expt 2 40) (expt 2.0 0.5))
-; expect: 4 1.4142135623730951 1024 1099511627776.0 1.4142135623730951
+; expect: 4 1.4142135623730951 1024 1099511627776 1.4142135623730951
 (show (floor 2.5) (ceiling 2.5) (round 2.5) (round 3.5) (truncate -2.7) (floor 7))
 ; expect: 2.0 3.0 2.0 4.0 -2.0 7
 (show (exact->inexact 1) (inexact->exact 4.0) (exact 2.0) (inexact 3))

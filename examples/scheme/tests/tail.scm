@@ -40,7 +40,7 @@
 ; Deep non-tail recursion (100000 deep).
 (define (sum-to n) (if (= n 0) 0 (+ n (sum-to (- n 1)))))
 (display (sum-to 100000)) (newline)
-; expect: 5000050000.0
+; expect: 5000050000
 (define (build n) (if (= n 0) '() (cons n (build (- n 1)))))
 (display (length (build 10000))) (newline)
 ; expect: 10000
