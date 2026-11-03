@@ -8,6 +8,17 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **`Vm.Resume` inline cache fields**: verified code addresses in the
+  instruction stream (try chains, cached callees); the verifier resets
+  them to the placeholder, `v.fill_resumes(vals)` sets them, `jump
+  cache.to` is allowed under `#[require_verified]`; and
+  `Vm.emit.OP_cached(..)` emitters that take a cache's initial contents
+  ([language.md §7.1](docs/language.md#71-inline-caches)).
+- **`#[inline(never)]` on a `-> never` vm function** now keeps the shared
+  copy out of line (it was inlined back by LLVM), and callers skip the
+  instruction word when the copy never reads it
+  ([§3.5](docs/language.md#35-vm-functions)).
+
 - **Accumulators**: `accumulator acc: T for kinds;` state registers and
   `#[accumulate]` ops whose generated variants keep a temporary in a
   machine register between adjacent ops, picked by `Vm.accumulate`
@@ -44,6 +55,11 @@ implementation; `git log` has the details.
 
 ### Values
 
+- **`#[scan_raw_words]`** on a value type: a checked guarantee that words
+  below 2^48 (raw pointers, small integers) read as reference-free
+  variants, for scanners of mixed frames
+  ([language.md §2](docs/language.md#2-value-types-declared-representations)).
+
 - **Shared nanbox blocks**: when the 48-bit blocks run out, up to 8 `Gc`
   variants share one, told apart by the pointer's low 3 bits (up to 56 in
   all) ([language.md §2](docs/language.md#2-value-types-declared-representations),
@@ -56,6 +72,10 @@ implementation; `git log` has the details.
   "Overflow-checked arithmetic on odd widths").
 
 ### Core language
+
+- Literal-only arithmetic takes the other operand's type
+  (`16 + 8 + n` with `n: u64`), and `let t: [T; _] = [..]` takes the
+  array literal's length ([language.md §1](docs/language.md#1-core-language)).
 
 - **Raw string literals** `r"..."` and `r#"..."#`: no escapes, may
   span lines ([§1.2](docs/language.md#lexical-structure)).
@@ -86,6 +106,15 @@ implementation; `git log` has the details.
   distinct names; enum-to-int casts in constants.
 
 ### GC
+
+- **Frameless allocation and barriers in handlers**: `try_new(h, T { .. })
+  -> ?Gc<T>` (no refill call) with `gc.make_room` in a cold block that
+  `redo`es; the write barrier's slow path makes no call (a full
+  remembered set makes the next collection major); stores of values
+  without references (`Term.Unb`, `None`) get no barrier. Framed
+  handlers in the example interpreters 223 -> 200
+  ([language.md §4](docs/language.md#4-slow-paths-cold-blocks),
+  [stdlib/gc.md](docs/stdlib/gc.md), [lowering.md §3, §10](docs/lowering.md)).
 
 - **`heap.on_free_gc(obj, f)`**: a free hook typed `fn(Gc<T>)`, no
   `unsafe` cast from `*u8` ([stdlib/gc.md](docs/stdlib/gc.md)).

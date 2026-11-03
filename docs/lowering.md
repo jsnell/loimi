@@ -478,6 +478,20 @@ Notes:
   Not merged for that reason. It could be revisited with AArch64
   hardware, where most of the frames disappeared.
 
+  Since then (2026-11-03) the two commonest causes are gone without
+  that machinery. The barrier's slow path (`std.gc.log_obj`) pushes onto
+  the remembered set inline, with no call (a full set makes the next
+  collection major instead of growing), and allocation in a handler can
+  use `try_new`, whose refill is a cold block ending in `redo`. Framed
+  handlers in the nine example interpreters went from 223 to 200
+  (`-W handler_frame`): Lox 26 to 22, Mini 40 to 38, MiniJS 67 to 59,
+  Python 51 to 47, Scheme 12 to 7; Prolog stays at 4 with its free-list
+  workaround replaced by `try_new`; Stak 8, Wasm 15, regex 0 unchanged.
+  Compiling the barrier's slow path as an implicit cold block instead
+  was not built: a cold block is outlined only where the rest of its
+  block ends in a control word, which a barrier inside a helper function
+  (`table_set`, inlined by LLVM, not by the compiler) never is.
+
 ### `next`, `jump`, `redo`, `become`
 
 | Word | Lowering |
@@ -508,7 +522,12 @@ lower like the caller's own. In tail-call mode, a call from a `cold` block
 stores the arguments and the caller's instruction size (for `next`) in
 thread-local slots (`@"Vm.fn.NAME.a0"`, ...) and makes a `musttail` call to
 `@"Vm.fn.NAME"`, which has the handler signature, so all cold callers share
-one copy and the state never leaves its registers.
+one copy and the state never leaves its registers. The shared copy is
+`noinline` only under `#[inline(never)]` (otherwise LLVM may inline it
+back into its callers); such a copy that never reads the calling
+instruction's word (no `raise`, `?`, cold block, shared call or chain in
+it) is passed `poison` for it, so the cold blocks calling it do not need
+the word passed in from the handler.
 
 ## 4. Entry points
 
@@ -986,10 +1005,12 @@ question 2). `std.gc.alloc` writes the type id, mark and flags bytes in
 one store after its refill path has merged, so for a store into an
 object allocated earlier in the same function, with no other stores in
 between that could alias the header, LLVM knows the flags are 0 and
-deletes the barrier (Mini's `CLOSURE` has none left). The `remember` call keeps the handler from being a
-leaf: in tail-call mode MiniJS's `SETPROP_IN` gains a `push`/`pop` pair
-that aligns the stack for it on the fast path too, since the slow path
-rejoins the dispatch.
+deletes the barrier (Mini's `CLOSURE` has none left). The slow path (`log_obj`) is inline and makes
+no call, so it does not keep the handler from being a leaf (it used to
+call `remember`, which gave MiniJS's `SETPROP_IN` a `push`/`pop` pair on
+the fast path too). A store of a value with no references (a payload-free
+variant, `None`, literals of such: `gcgen::holds_no_refs`) gets no
+barrier.
 
 **Generational GC: moving or not.** The design question (roadmap, open
 question 2) was settled for the non-moving scheme with sticky mark bits.

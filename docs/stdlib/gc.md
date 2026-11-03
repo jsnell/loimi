@@ -41,6 +41,15 @@ every interpreter test run in three modes: normal, `stress`, and
   next chunk of the class with free slots, in index order (`refill`).
   A non-generational heap sweeps eagerly, at the end of each collection;
   a generational heap sweeps lazily (below).
+- **`try_new(h, T { .. })`** (compiled to `gc.try_alloc`) is `new`
+  without the refill: it pops the free list or gives `None`, and makes
+  no call, so a tail-call handler that allocates with it has no stack
+  frame (`new`'s refill call site gives it one on every execution, even
+  though the refill is rare). `gc.make_room(h, size)` refills the size
+  class of `size` bytes (`size_of<T>()`, plus the trailing array) and
+  never collects; a handler does that in a cold block and `redo`es the
+  op (language.md §4, "Allocating and storing references in a
+  handler"). Large objects are allocated as by `new`.
 - **Large objects** are `calloc`'d with the remembered-set pointer in 16
   bytes before the header, and kept in a vector.
 - **Collection triggers**: `growth` (percent of the live bytes),
@@ -109,7 +118,7 @@ measurements are in [`../roadmap.md`](../roadmap.md), open question 2).
 #[inline]
 pub fn barrier(obj: *u8) {
     let hd = (obj - HEADER) as *Header;
-    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+    if unlikely((hd.flags & LOG) != 0) { log_obj(obj); }
 }
 ```
 
@@ -117,10 +126,20 @@ pub fn barrier(obj: *u8) {
   value into an object (see [`../lowering.md`](../lowering.md) §10). In a
   non-generational heap no object has `LOG`, so the barrier costs a byte
   test and a not-taken branch.
-- `remember` clears `LOG` and appends the object to the remembered set
-  (unless it is still there, `INRS`). It runs once per object between
-  collections. A minor collection traces the remembered objects and
+- `log_obj`, the slow path, clears `LOG` and appends the object to the
+  remembered set (unless it is still there, `INRS`). It runs once per
+  object between collections. It is inline and makes no call (a call
+  site, even a rare one, gives a tail-call handler a stack frame on every
+  execution): when the set is full it only counts the object as
+  `missed`, and the next collection is then a major one, which needs no
+  remembered set; after each collection the set gets room for twice
+  what was logged since the last (at least 256 entries). `remember` is
+  the same with a growing push, out of line, for interpreters that log
+  several objects together. A minor collection traces the remembered objects and
   sets `LOG` again; those that point to young survivors stay in the set.
+- A store of a value statically free of references (a variant without
+  a `Gc` payload, such as `Term.Unb` or `Int(n)`, `None`, or a literal
+  tuple or struct of such) gets no barrier.
 - **Stores through raw pointers** bypass the compiler's barrier:
   `gc.write_barrier(h, obj)` after them, naming the object that contains
   the slot (not an interior pointer). `gc.needs_barrier(obj)` and
