@@ -647,7 +647,59 @@ call. It lists the traced locals in scope that are assigned on every path
 to the call: a `let` from after its initializer, a pattern binding from
 after the test that matched it (not in `let PAT = e else { .. }`'s else
 block, nor in a later `match` arm), so no slot is scanned before it is
-written.
+written. While a `match` guard runs, the frame also lists the
+scrutinee's slot (the copy the match tests), since arms after a failing
+guard still bind from it and a temporary scrutinee (`match f() { .. }`)
+has no other root.
+
+**Checked roots** (`loimi build --gc-check-roots`). `std.gc.mark_ptr`
+trusts every pointer it is given: a root listed too early marks
+through whatever the slot holds. In this mode the collector checks
+every reference that generated code hands it before reading a header:
+
+- Every `mark_ptr` call the compiler emits (the mark functions of
+  shadow-stack entries, so traced locals, values kept for defers and the
+  copies of vm state; `gc_mark` in root scanners; and the fields that
+  `loimi_trace_object` traces) calls `std.gc.rootck_mark` instead. It
+  accepts null, or the start of an allocated object of the heap being
+  collected: inside one of its segments, in a chunk carved out already,
+  at a slot boundary, not a free slot; or one of its large objects. A
+  `value` is checked only in its pointer variants (an immediate is
+  never dereferenced). Anything else aborts:
+
+  ```
+  gc check-roots: bad reference 0x0101010101010101: 0x01 bytes: an unassigned slot, or read from a freed object
+    root #1 of shadow-stack frame #0 (0: the innermost) of
+    main.victim at tests/run/gc_roots_let_else.lm:35:9 (call of main.churn); roots: #0 x: main.E; #1 n: Gc<main.Node>;
+  ```
+
+  To name the root, each frame gets a first entry `{ @info, @loimi_rootck_frame }`
+  whose "mark function" stores `@info` (a constant `{ str, kind }`
+  naming the function, call site and its roots) in a thread-local and
+  resets a slot counter, which each root's mark function increments.
+  `loimi_trace_object` and `gc_mark` set the same thread-local to their
+  own record (the object's type and address; the `gc_mark` call), so a
+  bad heap reference is reported with the object that holds it.
+- Unassigned slots are made recognizable instead of holding whatever
+  the stack held: each traced local's slot is filled with 0x01 bytes on
+  function entry and again where its scope ends (on the path that falls
+  out of the scope). A frame that lists a slot too early, or too long,
+  shows 0x0101010101010101, a non-canonical address that no heap holds.
+- Freed objects are made recognizable: `new` calls `std.gc.rootck_alloc`,
+  which registers (once per heap) a sweeper that fills every object
+  about to be freed with 0x01 bytes (not in a generational heap, where
+  an unmarked object may be old and alive in a minor collection). A
+  reference that outlived its object then reads 0x01 bytes, and a
+  traced field read from it is reported as above.
+
+The `rootck_*` functions of `std.gc` and the externs they use are
+emitted only when this mode references them (`is_lazy` in
+src/codegen.rs), so a default build's IR does not change. The checks
+assume that the shadow stack holds only objects of the heap being
+collected: with several heaps on one thread, a frame of a nested run
+into another heap is reported. Not combinable with `--jit-stencils`.
+The rooting fuzzer (`fuzz_gc_roots` in tests/fuzz.rs, generator in
+tests/fuzz/rootgen.rs) builds its programs in this mode.
 
 ## 10. GC barriers and allocation
 

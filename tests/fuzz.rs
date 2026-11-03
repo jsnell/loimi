@@ -179,7 +179,9 @@ fn gc_roots_seed(seed: u64, modes: &[&str]) -> Result<(), String> {
         let exe = dir.join(format!("roots-{}-{}", seed, m));
         let out = limited(env!("CARGO_BIN_EXE_loimi"))
             .env("LOIMI_STD", env!("CARGO_MANIFEST_DIR"))
-            .args(["build", "--gc-check-roots", &format!("--dispatch={}", m)])
+            .args(["build", &format!("--dispatch={}", m)])
+            // ROOTFUZZ_PLAIN: without the checks (to compare what they add).
+            .args(if std::env::var("ROOTFUZZ_PLAIN").is_ok() { &[][..] } else { &["--gc-check-roots"][..] })
             .arg(&src)
             .arg("-o")
             .arg(&exe)

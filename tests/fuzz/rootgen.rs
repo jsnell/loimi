@@ -124,6 +124,7 @@ enum Lp {
     Val(T),
 }
 
+#[derive(Clone)]
 struct Fx {
     kind: Kind,
     ret: T,
@@ -208,6 +209,7 @@ fn gc(c: *Ctx) -> i64 uses gc {
     1
 }
 fn gcb(c: *Ctx) -> bool uses gc { gc(c); true }
+fn gcf(c: *Ctx) -> bool uses gc { gc(c); false }
 
 fn mk(c: *Ctx, v: i64, l: ?Gc<Node>, r: ?Gc<Node>) -> Gc<Node> {
     new(&c.heap, Node { v: v % 1000, l: l, r: r })
@@ -454,11 +456,12 @@ impl Gen {
     }
 
     fn cond(&mut self, fx: &Fx) -> String {
-        match self.r.below(5) {
+        match self.r.below(6) {
             0 => format!("{} % 2 == 0", self.ex(fx, T::I, 1)),
             1 => format!("{}.v > {}", self.ex(fx, T::N, 1), self.r.below(10)),
             2 => format!("{} % 3 != 1", fx.kname),
             3 if !fx.in_defer => format!("{} % 2 == 1 and gcb(c)", fx.kname),
+            4 if !fx.in_defer => format!("gcb(c) and {} % 3 == 0", fx.kname),
             _ => format!("({} + {}) % 4 < 2", fx.acc, self.ex(fx, T::I, 1)),
         }
     }
@@ -644,7 +647,9 @@ impl Gen {
                         head.push_str(&format!(" and let {} = {}", p2, e2));
                     }
                     fx.depth += 1;
-                    let a = self.stmts_n(fx, 1, 3);
+                    let binds: Vec<(String, T)> = fx.scopes.last().unwrap().iter().map(|v| (v.name.clone(), v.t)).collect();
+                    let mut a = self.use_binds(fx, &binds);
+                    a.push_str(&self.stmts_n(fx, 1, 3));
                     fx.depth -= 1;
                     fx.scopes.pop();
                     let b = self.block_n(fx, 0, 2);
@@ -674,8 +679,11 @@ impl Gen {
                     fx.scopes.pop();
                     (fx.kind, fx.own_from, fx.loops) = save;
                     let Some(dv) = dv else { continue };
+                    let n = fx.scopes.last().unwrap().len();
                     let (p, e) = self.refutable(fx, true);
-                    Some(format!("{}let {} = {} else {}{{\n{}{}{}\n{}}};\n", ind, p, e, if cold { "cold " } else { "" }, s, ind2, dv, ind))
+                    let binds: Vec<(String, T)> = fx.scopes.last().unwrap()[n..].iter().map(|v| (v.name.clone(), v.t)).collect();
+                    let u = self.use_binds(fx, &binds);
+                    Some(format!("{}let {} = {} else {}{{\n{}{}{}\n{}}};\n{}", ind, p, e, if cold { "cold " } else { "" }, s, ind2, dv, ind, u))
                 }
                 // irrefutable destructuring
                 62..=63 => {
@@ -831,6 +839,32 @@ impl Gen {
         (pat, e)
     }
 
+    /// A scrutinee: often a fresh value (a call's result, a new object),
+    /// which only the bindings keep alive.
+    fn scrut(&mut self, fx: &Fx, t: T) -> String {
+        match self.r.below(3) {
+            0 => self.cex(fx, t).unwrap_or_else(|| self.ex(fx, t, 2)),
+            1 => self.ex(&Fx { scopes: vec![], ..fx.clone() }, t, 2),
+            _ => self.tex(fx, t),
+        }
+    }
+
+    /// Often: a collection, then a read through the bindings.
+    fn use_binds(&mut self, fx: &Fx, binds: &[(String, T)]) -> String {
+        if binds.is_empty() || !self.r.chance(60) {
+            return String::new();
+        }
+        let ind = "    ".repeat(fx.depth + 2);
+        let mut s = String::new();
+        if !fx.in_defer {
+            s.push_str(&format!("{}{} += gc(c);\n", ind, fx.acc));
+        }
+        for (b, t) in binds {
+            s.push_str(&format!("{}{} = mix({}, {});\n", ind, fx.acc, fx.acc, digest(*t, b)));
+        }
+        s
+    }
+
     fn match_stmt(&mut self, fx: &mut Fx) -> String {
         let ind = Self::ind(fx);
         let ind2 = "    ".repeat(fx.depth + 2);
@@ -838,7 +872,7 @@ impl Gen {
         let st = self.r.below(4);
         let (scrut, arms): (String, Vec<(String, Vec<(String, T)>)>) = match st {
             0 => {
-                let e = self.tex(fx, T::E);
+                let e = self.scrut(fx, T::E);
                 let (a, b) = (self.fresh("x"), self.fresh("x"));
                 (
                     e,
@@ -853,17 +887,17 @@ impl Gen {
                 )
             }
             1 => {
-                let e = self.tex(fx, T::O);
+                let e = self.scrut(fx, T::O);
                 let a = self.fresh("x");
                 (e, vec![(format!("Some({})", a), vec![(a.clone(), T::N)]), ("None".into(), vec![])])
             }
             2 => {
-                let e = self.tex(fx, T::V);
+                let e = self.scrut(fx, T::V);
                 let a = self.fresh("x");
                 (e, vec![(format!("R({})", a), vec![(a.clone(), T::N)]), ("Num(_) | Nil".into(), vec![]), ("Nil".into(), vec![])])
             }
             _ => {
-                let e = self.tex(fx, T::E);
+                let e = self.scrut(fx, T::E);
                 let o = self.ex(fx, T::O, 1);
                 let (a, b) = (self.fresh("x"), self.fresh("x"));
                 (
@@ -894,13 +928,14 @@ impl Gen {
                 self.declare(fx, b, *t, false);
             }
             let guard = match self.r.below(4) {
-                0 if !fx.in_defer => " if gcb(c)".to_string(),
+                0 if !fx.in_defer => (if self.r.chance(50) { " if gcf(c)" } else { " if gcb(c)" }).to_string(),
                 1 => format!(" if {}", self.cond(fx)),
                 2 if !binds.is_empty() && binds[0].1 == T::N && !fx.in_defer => format!(" if {}.v % 2 == 0 and gcb(c)", binds[0].0),
                 _ => String::new(),
             };
             fx.depth += 1;
-            let body = self.stmts_n(fx, 0, 3);
+            let mut body = self.stmts_n(fx, 0, 3);
+            body.push_str(&self.use_binds(fx, binds));
             let tail = if value { format!("{}{}\n", ind2, self.ex(fx, T::I, 1)) } else { String::new() };
             fx.depth -= 1;
             fx.scopes.pop();

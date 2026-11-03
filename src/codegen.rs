@@ -1123,7 +1123,18 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     self.live.push(vec![]);
                     self.test_pat(&arm.pat, &sp, &l_next);
                     if let Some(g) = &arm.guard {
+                        // A guard that collects runs before later arms
+                        // bind from the scrutinee, which may be a
+                        // temporary that nothing else references: it is
+                        // rooted while the guard runs.
+                        let root = !matches!(scrut.kind, TK::Vm(_)) && crate::gcgen::is_traced(self.p(), &scrut.ty);
+                        if root {
+                            self.pending.push((sp.clone(), scrut.ty.clone()));
+                        }
                         let c = self.val(g);
+                        if root {
+                            self.pending.pop();
+                        }
                         let l_ok = self.fresh_label("guard");
                         self.cond_br(&c, &l_ok, &l_next);
                         self.label(&l_ok);

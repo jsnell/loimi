@@ -491,7 +491,7 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
             let what = if i < ids.len() {
                 fd.locals[ids[i] as usize].name.clone()
             } else if i < nlocal {
-                "(a value kept for defers)".into()
+                "(a value kept for defers, or a scrutinee during a guard)".into()
             } else {
                 "(a copy of a state variable)".into()
             };
