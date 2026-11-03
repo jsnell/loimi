@@ -93,6 +93,7 @@ fn parse_hex(s: str) -> u64 {
 
 /// "-" or a hex-encoded name.
 fn unhex(a: *mem.Arena, s: str) -> str {
+    if s.eq("EMPTY") { return ""; }
     let n = s.len / 2;
     let p = a.alloc_bytes(n + 1, 1);
     for i in 0..n { p[i] = parse_hex(s[i * 2..i * 2 + 2]) as u8; }
@@ -147,10 +148,10 @@ fn Script.command(s: *Script, w: *mem.Vec<str>) {
     let out = &s.out;
     out.clear();
     let cmd = w.at(0);
-    if cmd.eq("module") {
+    if cmd.eq("module") or cmd.eq("check") {
         match load(s.e, w.at(1)) {
             Ok(mi) => {
-                s.current = Some(mi);
+                if cmd.eq("module") { s.current = Some(mi); }
                 if w.len > 2 { s.names.push((unhex(&s.arena, w.at(2)), mi)); }
                 out.push_str("ok");
             }

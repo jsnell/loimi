@@ -288,22 +288,21 @@ pub vm W {
         op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
     }
 
-    // Division: traps on a zero divisor and on MIN / -1.
-    inline for (name, k, min, expr, ovf) in [
-        ("I32_DIV_S", ri, (-2147483647 - 1), a / b, true), ("I32_REM_S", ri, (-2147483647 - 1), a % b, false),
-        ("I64_DIV_S", rl, (-9223372036854775807 - 1), a / b, true),
-        ("I64_REM_S", rl, (-9223372036854775807 - 1), a % b, false),
-    ] {
+    // Division: traps on a zero divisor and on MIN / -1; x rem -1 is 0.
+    inline for (name, k, min) in [("I32_DIV_S", ri, (-2147483647 - 1)), ("I64_DIV_S", rl, (-9223372036854775807 - 1))] {
         op #name(d: k, a: k, b: k) : RRR {
             if b == 0 { cold { raise Trap.DivZero } }
-            if b == -1 {
-                if a == min {
-                    if ovf { cold { raise Trap.IntOverflow } }
-                    d = 0; next
-                }
-                d = 0 -% a; next
-            }
-            d = expr; next
+            if b == -1 and a == min { cold { raise Trap.IntOverflow } }
+            d = a / b;
+            next
+        }
+    }
+    inline for (name, k) in [("I32_REM_S", ri), ("I64_REM_S", rl)] {
+        op #name(d: k, a: k, b: k) : RRR {
+            if b == 0 { cold { raise Trap.DivZero } }
+            if b == -1 { d = 0; next }
+            d = a % b;
+            next
         }
     }
     inline for (name, k, expr) in [

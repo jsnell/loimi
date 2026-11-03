@@ -48,8 +48,6 @@ struct Ctl {
     /// Branch target: the end (block, if) or the head (loop).
     label: bc.Label,
     else_label: bc.Label,
-    /// if with params: where the params were saved for the else branch.
-    save: u32,
 }
 
 pub struct T {
@@ -60,7 +58,6 @@ pub struct T {
     locals: mem.Vec<u8>,
     nlocals: u64,
     max_height: u64,
-    extra: u64,
     last_def_pc: u64,
     last_def_slot: u64,
     has_def: bool,
@@ -70,12 +67,6 @@ pub struct T {
     r: decode.Reader,
     /// Functions that may be referenced by ref.func (declared).
     declared: *mem.Vec<bool>,
-    // MOVs to and from the scratch slots of `if` params, patched at the
-    // end when the slot numbers are known.
-    fixups: mem.Vec<u64>,
-    fixup_slot: mem.Vec<u64>,
-    fixups_src: mem.Vec<u64>,
-    fixup_slot_src: mem.Vec<u64>,
 }
 
 fn rrr(op: u64, a: u64, b: u64, c: u64) -> u64 {
@@ -87,16 +78,14 @@ pub fn T.new(m: *decode.Module, declared: *mem.Vec<bool>) -> T {
         m: m,
         code: bc.Code.new(W.op_size, W.set_label),
         vals: mem.Vec.new(), ctls: mem.Vec.new(), locals: mem.Vec.new(),
-        nlocals: 0, max_height: 0, extra: 0, last_def_pc: 0, last_def_slot: 0, has_def: false,
+        nlocals: 0, max_height: 0, last_def_pc: 0, last_def_slot: 0, has_def: false,
         ret_label: bc.Label { id: 0 }, ret_used: false, results: [],
         r: decode.Reader.new([]), declared: declared,
-        fixups: mem.Vec.new(), fixup_slot: mem.Vec.new(), fixups_src: mem.Vec.new(), fixup_slot_src: mem.Vec.new(),
     }
 }
 
 fn T.free(t: *T) {
     t.code.free(); t.vals.free(); t.ctls.free(); t.locals.free();
-    t.fixups.free(); t.fixup_slot.free(); t.fixups_src.free(); t.fixup_slot_src.free();
 }
 
 fn T.top(t: *T) -> *Ctl { t.ctls.ptr_at(t.ctls.len - 1) }
@@ -196,7 +185,9 @@ fn T.check_top(t: *T, types: []u8) -> Result<(), str> {
     var i = types.len;
     while i > 0 {
         i -= 1;
-        popped.push(t.pop(types[i])?);
+        let v = t.pop_any()?;
+        if v.ty != 0 and v.ty != types[i] { return Err("type mismatch"); }
+        popped.push(v);
     }
     while let Some(v) = popped.pop() { t.push(v); }
     Ok(())
@@ -225,7 +216,8 @@ fn T.needs_move(t: *T, n: u64, dst: u64) -> bool {
     false
 }
 
-/// The return sequence for values at the top of the stack.
+/// The return sequence for values at the top of the stack. It does not
+/// change the translator's stack (it is also emitted in br_table stubs).
 fn T.emit_return(t: *T) {
     let n = t.results.len;
     if n == 0 { t.emit(W.RET()); return; }
@@ -236,7 +228,10 @@ fn T.emit_return(t: *T) {
         t.emit(W.RET1(r as u16));
         return;
     }
-    for i in p..t.vals.len { t.flush_at(i); }
+    // Into the home slots first (a pending local may be one of the
+    // result slots 0..n), then down to 0..n in order (home slots are at
+    // or above their destinations).
+    t.move_top(n, p);
     for j in 0..n { t.emit(W.MOV(j as u16, t.home(p + j) as u16)); }
     t.emit(W.RET());
 }
@@ -274,7 +269,7 @@ fn T.push_ctl(t: *T, kind: u8, params: []u8, results: []u8) -> *Ctl {
         kind: kind, params: params, results: results,
         height: t.vals.len - params.len,
         unreachable: false, dead: parent_dead,
-        label: t.code.label(), else_label: bc.Label { id: 0 }, save: 0,
+        label: t.code.label(), else_label: bc.Label { id: 0 },
     });
     t.top()
 }
@@ -506,27 +501,8 @@ fn T.instr(t: *T) -> Result<bool, str> {
             t.flush_all();
             let else_label = t.code.label();
             if !t.dead() { t.code.jump(W.BRZ(rc as u16, 0), else_label); }
-            let np = params.len;
-            var save: u64 = 0;
-            if np > 0 {
-                // The then branch may overwrite the params: keep a copy
-                // in scratch slots for the else branch.
-                save = t.extra;
-                t.extra += np;
-            }
             let c = t.push_ctl(K_IF, params, results);
             c.else_label = else_label;
-            c.save = save as u32;
-            if np > 0 and !c.dead {
-                // scratch slots live past the operand stack: patched at
-                // the end (slot numbers are known only then), so record
-                // as negative offsets from the end: use a marker.
-                for j in 0..np {
-                    t.emit(W.MOV(0, t.home(c.height + j) as u16));
-                    t.fixups.push(t.code.pc() - 1);
-                    t.fixup_slot.push(save + j);
-                }
-            }
         }
         0x05 => {
             let c = t.top();
@@ -546,16 +522,9 @@ fn T.instr(t: *T) -> Result<bool, str> {
             c.kind = K_ELSE;
             c.unreachable = false;
             c.dead = if t.ctls.len > 1 { let pc = t.ctls.ptr_at(t.ctls.len - 2); pc.dead or pc.unreachable } else { false };
-            let np = c.params.len;
-            for j in 0..np { t.push_home(c.params[j]); }
-            let c = t.top();
-            if np > 0 and !c.dead {
-                for j in 0..np {
-                    t.emit(W.MOV(t.home(c.height + j) as u16, 0));
-                    t.fixups_src.push(t.code.pc() - 1);
-                    t.fixup_slot_src.push((c.save as u64) + j);
-                }
-            }
+            // The else branch is reached only from the BRZ at the `if`, so
+            // the params are still in their home slots.
+            for j in 0..c.params.len { t.push_home(c.params[j]); }
         }
         0x0B => {
             let c = t.top();
@@ -884,20 +853,8 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     while t.instr()? {}
     if !t.r.at_end() { return Err("operators remaining after end of function"); }
     if let Some(e) = t.code.check() { return Err(e.message()); }
-    let nslots = t.nlocals + t.max_height + t.extra + 1;
+    let nslots = t.nlocals + t.max_height + 1;
     if nslots > 65535 { return Err("function too large"); }
-    // Scratch slots (if params) are numbered after the operand stack.
-    let scratch = t.nlocals + t.max_height + 1;
-    for i in 0..t.fixups.len {
-        let pc = t.fixups.at(i);
-        let w = t.code.at(pc);
-        t.code.set(pc, (w & 0xFFFFFFFF0000FFFF) | ((scratch + t.fixup_slot.at(i)) << 16));
-    }
-    for i in 0..t.fixups_src.len {
-        let pc = t.fixups_src.at(i);
-        let w = t.code.at(pc);
-        t.code.set(pc, (w & 0xFFFF0000FFFFFFFF) | ((scratch + t.fixup_slot_src.at(i)) << 32));
-    }
     let n = t.code.len();
     let words = mem.alloc<u64>(n);
     t.code.copy_into(words.slice(n));
