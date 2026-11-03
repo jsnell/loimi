@@ -1,36 +1,63 @@
 // Hash map with open addressing and linear probing. Keys implement
 // `hash.Hash` (`k.hash() -> u64` and `k.eq(other) -> bool`).
+//
+// A `#![safe]` module (language.md section 1.3). The `unsafe` blocks
+// rest on each table's invariants, which only this module's code can
+// break (other modules cannot write the fields of a struct with raw
+// pointers): a HashMap's `slots` holds `cap` slots, `cap` a power of
+// two; an OrderedMap's `idx` holds `mask + 1` slots, each naming an entry
+// below `used`, and `ents` holds at least `cap` >= `used` entries.
+// Pointers that `get_ptr`, `next` and `entry` return are valid until the
+// map changes (lifetimes are not checked).
+
+#![safe]
 
 import std.mem;
 import std.hash;
+import std.rt;
 
 const EMPTY: u8 = 0;
 const FULL: u8 = 1;
 const DELETED: u8 = 2;
+
+/// Zeroed memory that a freed map's tables point to: one EMPTY slot of
+/// a HashMap (cap 1), one empty index slot of an OrderedMap (mask 0, no
+/// entries). Never written, never released.
+var EMPTY_TABLE: [u64; 64] = [0; 64];
+
+fn is_empty_table(p: u64) -> bool { p == (&EMPTY_TABLE[0]) as u64 }
 
 pub struct Slot<K, V> { key: K, value: V, state: u8 }
 
 pub struct HashMap<K: hash.Hash, V> { slots: *Slot<K, V>, cap: u64, len: u64, used: u64 }
 
 pub fn HashMap<K, V>.new() -> HashMap<K, V> {
-    HashMap { slots: mem.alloc(8), cap: 8, len: 0, used: 0 }
+    // unsafe: 8 zeroed slots are 8 EMPTY ones (keys and values unread).
+    HashMap { slots: unsafe { mem.alloc(8) }, cap: 8, len: 0, used: 0 }
 }
 
-/// Index of `key`, or of the slot where it would be inserted.
-fn HashMap<K, V>.probe(m: *HashMap<K, V>, key: K) -> (u64, bool) {
+/// Slot `i` (taken modulo `cap`).
+#[inline(always)]
+fn HashMap<K, V>.slot(m: *HashMap<K, V>, i: u64) -> *Slot<K, V> {
+    // unsafe: `slots` holds `cap` slots, a power of two, so the masked index is in bounds.
+    unsafe { m.slots + (i & (m.cap - 1)) }
+}
+
+/// The slot of `key`, or the slot where it would be inserted.
+fn HashMap<K, V>.probe(m: *HashMap<K, V>, key: K) -> (*Slot<K, V>, bool) {
     let mask = m.cap - 1;
     var i = key.hash() & mask;
-    var tomb: ?u64 = None;
+    var tomb: ?*Slot<K, V> = None;
     loop {
-        let s = m.slots + i;
+        let s = m.slot(i);
         if s.state == EMPTY {
-            return (tomb ?? i, false);
+            return (tomb ?? s, false);
         }
         if s.state == FULL and s.key.eq(key) {
-            return (i, true);
+            return (s, true);
         }
         if s.state == DELETED and tomb.is_none() {
-            tomb = Some(i);
+            tomb = Some(s);
         }
         i = (i + 1) & mask;
     }
@@ -40,21 +67,24 @@ fn HashMap<K, V>.grow(m: *HashMap<K, V>) {
     let old = m.slots;
     let n = m.cap;
     m.cap = n * 2;
-    m.slots = mem.alloc(m.cap);
-    m.len = 0;
-    m.used = 0;
-    for i in 0..n {
-        let s = old + i;
-        if s.state == FULL { m.insert(s.key, s.value); }
+    // unsafe: 2n zeroed (EMPTY) slots; `old` holds the n slots read below,
+    // and is released (unless it is EMPTY_TABLE) after its last use.
+    unsafe {
+        m.slots = mem.alloc(m.cap);
+        m.len = 0;
+        m.used = 0;
+        for i in 0..n {
+            let s = old + i;
+            if s.state == FULL { m.insert(s.key, s.value); }
+        }
+        if !is_empty_table(old as u64) { mem.release(old); }
     }
-    mem.release(old);
 }
 
 /// Insert or replace. Returns true if the key was new.
 pub fn HashMap<K, V>.insert(m: *HashMap<K, V>, key: K, value: V) -> bool {
     if (m.used + 1) * 4 > m.cap * 3 { m.grow(); }
-    let (i, found) = m.probe(key);
-    let s = m.slots + i;
+    let (s, found) = m.probe(key);
     if found {
         s.value = value;
         return false;
@@ -68,13 +98,14 @@ pub fn HashMap<K, V>.insert(m: *HashMap<K, V>, key: K, value: V) -> bool {
 }
 
 pub fn HashMap<K, V>.get(m: *HashMap<K, V>, key: K) -> ?V {
-    let (i, found) = m.probe(key);
-    if found { Some((m.slots + i).value) } else { None }
+    let (s, found) = m.probe(key);
+    if found { Some(s.value) } else { None }
 }
 
+/// A pointer to `key`'s value, valid until the map changes.
 pub fn HashMap<K, V>.get_ptr(m: *HashMap<K, V>, key: K) -> ?*V {
-    let (i, found) = m.probe(key);
-    if found { Some(&(m.slots + i).value) } else { None }
+    let (s, found) = m.probe(key);
+    if found { Some(&s.value) } else { None }
 }
 
 pub fn HashMap<K, V>.contains(m: *HashMap<K, V>, key: K) -> bool {
@@ -82,17 +113,18 @@ pub fn HashMap<K, V>.contains(m: *HashMap<K, V>, key: K) -> bool {
 }
 
 pub fn HashMap<K, V>.remove(m: *HashMap<K, V>, key: K) -> bool {
-    let (i, found) = m.probe(key);
+    let (s, found) = m.probe(key);
     if !found { return false; }
-    (m.slots + i).state = DELETED;
+    s.state = DELETED;
     m.len -= 1;
     true
 }
 
 /// Iteration: `var i: u64 = 0; while let Some(s) = m.next(&i) { ... s.key, s.value ... }`
+/// (the slot pointer is valid until the map changes).
 pub fn HashMap<K, V>.next(m: *HashMap<K, V>, at: *u64) -> ?*Slot<K, V> {
     while *at < m.cap {
-        let s = m.slots + *at;
+        let s = m.slot(*at);
         *at += 1;
         if s.state == FULL { return Some(s); }
     }
@@ -102,14 +134,28 @@ pub fn HashMap<K, V>.next(m: *HashMap<K, V>, at: *u64) -> ?*Slot<K, V> {
 /// Remove every entry, keeping the table's memory.
 pub fn HashMap<K, V>.clear(m: *HashMap<K, V>) {
     if m.used == 0 { return; }
-    for i in 0..m.cap { (m.slots + i).state = EMPTY; }
+    for i in 0..m.cap { m.slot(i).state = EMPTY; }
     m.len = 0;
     m.used = 0;
 }
 
+/// Free the table. The map is then empty, and can be used (or freed)
+/// again; it allocates on the next insertion.
 pub fn HashMap<K, V>.free(m: *HashMap<K, V>) {
-    mem.release(m.slots);
+    // unsafe: `slots` came from `mem.alloc` unless it is EMPTY_TABLE, which
+    // (zeroed, 512 bytes) is one EMPTY slot for a map with cap 1.
+    unsafe {
+        if !is_empty_table(m.slots as u64) { mem.release(m.slots); }
+        if size_of<Slot<K, V>>() <= 512 {
+            m.slots = (&EMPTY_TABLE[0]) as *Slot<K, V>;
+            m.cap = 1;
+        } else {
+            m.slots = mem.alloc(8);
+            m.cap = 8;
+        }
+    }
     m.len = 0;
+    m.used = 0;
 }
 
 // ── OrderedMap: insertion-ordered (CPython's compact dict layout) ────
@@ -123,6 +169,11 @@ pub fn HashMap<K, V>.free(m: *HashMap<K, V>) {
 // code calls it once per key. `std.dict.Dict` is the same table in the
 // GC heap; the `probe_*` functions are the shared core. (Everything here
 // is generic, so a program that does not use it gets no code for it.)
+//
+// The `probe_*` functions take the tables as raw pointers: they are
+// `#[raw]` (a `#![safe]` caller needs `unsafe { }`). Their contract:
+// `idx` holds `mask + 1` slots (a power of two) with at least one empty,
+// and each slot naming entry e has e within `ents`.
 
 /// One entry: the key's hash (top bit clear; DEAD once removed), key, value.
 pub struct Entry<K, V> { hash: u64, key: K, value: V }
@@ -155,80 +206,100 @@ pub fn usable_for<K>(size: u64) -> u64 { (size * 2) / 3 }
 /// The entry of `hash` whose key `eq` accepts, by CPython's perturbed
 /// probing over the index `idx` (mask + 1 slots) and the entries `ents`;
 /// `hash` is a stored hash. `eq` sees only keys whose stored hash matches.
+#[raw]
 #[inline]
 pub fn probe_find<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, hash: u64, eq: block fn(K) -> bool) -> ?u64 {
     var i = hash & mask;
     var perturb = hash;
-    loop {
-        let s = idx[i];
-        if s == SLOT_EMPTY { return None; }
-        if s >= SLOT_BASE {
-            let e = (s - SLOT_BASE) as u64;
-            let p = ents + e;
-            if p.hash == hash and eq(p.key) { return Some(e); }
+    // unsafe: the probe contract (`i` is masked; slots name entries within `ents`).
+    unsafe {
+        loop {
+            let s = idx[i];
+            if s == SLOT_EMPTY { return None; }
+            if s >= SLOT_BASE {
+                let e = (s - SLOT_BASE) as u64;
+                let p = ents + e;
+                if p.hash == hash and eq(p.key) { return Some(e); }
+            }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & mask;
         }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & mask;
     }
 }
 
 /// The index slot that holds entry `e` (whose stored hash is `hash`).
+#[raw]
 pub fn probe_slot_of<K>(idx: *u32, mask: u64, hash: u64, e: u64) -> u64 {
     let want = (e as u32) + SLOT_BASE;
     var i = hash & mask;
     var perturb = hash;
-    loop {
-        if idx[i] == want { return i; }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & mask;
+    // unsafe: the probe contract (`i` is masked).
+    unsafe {
+        loop {
+            if idx[i] == want { return i; }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & mask;
+        }
     }
 }
 
 /// One probe for find-or-insert: `(e, true)` if `eq` accepts the key of
 /// entry `e`, else `(slot, false)` with the first empty or deleted index
 /// slot on the path, where the key goes.
+#[raw]
 #[inline]
 pub fn probe_lookup<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, hash: u64, eq: block fn(K) -> bool) -> (u64, bool) {
     var i = hash & mask;
     var perturb = hash;
     var free = NO_ENTRY;
-    loop {
-        let s = idx[i];
-        if s == SLOT_EMPTY { return (if free == NO_ENTRY { i } else { free }, false); }
-        if s >= SLOT_BASE {
-            let e = (s - SLOT_BASE) as u64;
-            let p = ents + e;
-            if p.hash == hash and eq(p.key) { return (e, true); }
-        } else if free == NO_ENTRY {
-            free = i;
+    // unsafe: the probe contract (`i` is masked; slots name entries within `ents`).
+    unsafe {
+        loop {
+            let s = idx[i];
+            if s == SLOT_EMPTY { return (if free == NO_ENTRY { i } else { free }, false); }
+            if s >= SLOT_BASE {
+                let e = (s - SLOT_BASE) as u64;
+                let p = ents + e;
+                if p.hash == hash and eq(p.key) { return (e, true); }
+            } else if free == NO_ENTRY {
+                free = i;
+            }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & mask;
         }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & mask;
     }
 }
 
 /// Point the first empty or deleted slot on `hash`'s probe path at entry `e`.
+#[raw]
 #[inline]
 pub fn probe_put<K>(idx: *u32, mask: u64, hash: u64, e: u64) {
     var i = hash & mask;
     var perturb = hash;
-    loop {
-        if idx[i] < SLOT_BASE { idx[i] = (e as u32) + SLOT_BASE; return; }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & mask;
+    // unsafe: the probe contract (`i` is masked).
+    unsafe {
+        loop {
+            if idx[i] < SLOT_BASE { idx[i] = (e as u32) + SLOT_BASE; return; }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & mask;
+        }
     }
 }
 
 /// Copy the live entries of `src[0..n]` to `dst` (in order) and index
 /// them in `idx` (all slots empty, mask + 1 of them). Returns how many.
+#[raw]
 pub fn probe_rebuild<K, V>(idx: *u32, mask: u64, dst: *Entry<K, V>, src: *Entry<K, V>, n: u64) -> u64 {
     var j: u64 = 0;
-    for i in 0..n {
-        let p = src + i;
-        if p.hash != DEAD {
-            dst[j] = *p;
-            probe_put<K>(idx, mask, p.hash, j);
-            j += 1;
+    // unsafe: the caller's contract: `src` holds n entries, `dst` room for the live ones.
+    unsafe {
+        for i in 0..n {
+            let p = src + i;
+            if p.hash != DEAD {
+                dst[j] = *p;
+                probe_put<K>(idx, mask, p.hash, j);
+                j += 1;
+            }
         }
     }
     j
@@ -236,18 +307,23 @@ pub fn probe_rebuild<K, V>(idx: *u32, mask: u64, dst: *Entry<K, V>, src: *Entry<
 
 /// Mark entry `e` dead: its slot deleted, its hash DEAD, its key and
 /// value bytes zeroed (so that a traced table no longer keeps them alive).
+#[raw]
 pub fn probe_kill<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, e: u64) {
-    let p = ents + e;
-    let slot = probe_slot_of<K>(idx, mask, p.hash, e);
-    idx[slot] = SLOT_DELETED;
-    p.hash = DEAD;
-    mem.memset((&p.key) as *u8, 0, size_of<K>());
-    mem.memset((&p.value) as *u8, 0, size_of<V>());
+    // unsafe: the caller's contract: `e` is a live entry of `ents`, indexed in `idx`.
+    unsafe {
+        let p = ents + e;
+        let slot = probe_slot_of<K>(idx, mask, p.hash, e);
+        idx[slot] = SLOT_DELETED;
+        p.hash = DEAD;
+        mem.memset((&p.key) as *u8, 0, size_of<K>());
+        mem.memset((&p.value) as *u8, 0, size_of<V>());
+    }
 }
 
 /// The effectful probe shared by `OrderedMap.find_with` and
 /// `dict.Dict.find_with`: `view()` gives the current (index, mask,
 /// entries, version), read again after each `eq` call.
+#[raw]
 pub fn probe_find_with<K, V, E>(hash: u64, view: block fn() -> (*u32, u64, *Entry<K, V>, u64),
                                 eq: block fn(K) -> Result<bool, E> uses reenter) -> Result<?u64, E> uses reenter {
     loop {
@@ -255,22 +331,28 @@ pub fn probe_find_with<K, V, E>(hash: u64, view: block fn() -> (*u32, u64, *Entr
         var i = hash & mask0;
         var perturb = hash;
         var r = RESTART;
-        loop {
-            let (idx, mask, ents, _v) = view();
-            let s = idx[i];
-            if s == SLOT_EMPTY { r = NO_ENTRY; break; }
-            if s >= SLOT_BASE {
-                let e = (s - SLOT_BASE) as u64;
-                if (ents + e).hash == hash {
-                    let k = (ents + e).key;
-                    let same = eq(k)?;
-                    let (_i2, _m2, _e2, ver2) = view();
-                    if ver2 != ver { break; }
-                    if same { r = e; break; }
+        // unsafe: the probe contract for the current view (`i` was masked by the mask
+        // of the same version, slots name entries within `ents`; after `eq` changes
+        // the version the probe restarts).
+        unsafe {
+            loop {
+                let (idx, mask, ents, _v) = view();
+                let s = idx[i];
+                if s == SLOT_EMPTY { r = NO_ENTRY; break; }
+                if s >= SLOT_BASE {
+                    let e = (s - SLOT_BASE) as u64;
+                    let p = ents + e;
+                    if p.hash == hash {
+                        let k = p.key;
+                        let same = eq(k)?;
+                        let (_i2, _m2, _e2, ver2) = view();
+                        if ver2 != ver { break; }
+                        if same { r = e; break; }
+                    }
                 }
+                perturb = perturb >> 5;
+                i = (i * 5 + 1 + perturb) & mask;
             }
-            perturb = perturb >> 5;
-            i = (i * 5 + 1 + perturb) & mask;
         }
         if r == NO_ENTRY { return Ok(None); }
         if r != RESTART { return Ok(Some(r)); }
@@ -284,7 +366,8 @@ pub fn probe_find_with<K, V, E>(hash: u64, view: block fn() -> (*u32, u64, *Entr
 /// Entry indices are stable until the table is compacted (a resize),
 /// which bumps `version`, as does every insertion of a new key, removal
 /// and `clear` (not value updates): an inline cache can hold an entry
-/// index and the version.
+/// index and the version. Functions taking an entry index panic if it is
+/// not a live entry.
 pub struct OrderedMap<K: hash.Hash, V> {
     idx: *u32,
     mask: u64,
@@ -304,7 +387,8 @@ pub fn OrderedMap<K, V>.new() -> OrderedMap<K, V> { OrderedMap.with_capacity(0) 
 pub fn OrderedMap<K, V>.with_capacity(n: u64) -> OrderedMap<K, V> {
     let sz = index_size_for<K>(n);
     let cap = usable_for<K>(sz);
-    OrderedMap { idx: mem.alloc(sz), mask: sz - 1, ents: mem.alloc(cap), used: 0, cap: cap, len: 0, version: 0 }
+    // unsafe: zeroed index slots are empty; `cap` entries, none in use.
+    unsafe { OrderedMap { idx: mem.alloc(sz), mask: sz - 1, ents: mem.alloc(cap), used: 0, cap: cap, len: 0, version: 0 } }
 }
 
 /// Resize (and compact) for `n` live entries.
@@ -313,13 +397,19 @@ pub fn OrderedMap<K, V>.with_capacity(n: u64) -> OrderedMap<K, V> {
 fn OrderedMap<K, V>.resize(m: *OrderedMap<K, V>, n: u64) {
     let sz = index_size_for<K>(n);
     let cap = usable_for<K>(sz);
-    let idx: *u32 = mem.alloc(sz);
-    let ents: *Entry<K, V> = mem.alloc(cap);
-    m.used = probe_rebuild(idx, sz - 1, ents, m.ents, m.used);
-    mem.release(m.idx);
-    mem.release(m.ents);
-    m.idx = idx;
-    m.ents = ents;
+    // unsafe: fresh zeroed tables (sz slots, cap >= n >= live entries); the old ones hold
+    // `used` entries and are released (unless EMPTY_TABLE) after the copy.
+    unsafe {
+        let idx: *u32 = mem.alloc(sz);
+        let ents: *Entry<K, V> = mem.alloc(cap);
+        m.used = probe_rebuild(idx, sz - 1, ents, m.ents, m.used);
+        if !is_empty_table(m.idx as u64) {
+            mem.release(m.idx);
+            mem.release(m.ents);
+        }
+        m.idx = idx;
+        m.ents = ents;
+    }
     m.mask = sz - 1;
     m.cap = cap;
     m.version += 1;
@@ -329,7 +419,8 @@ fn OrderedMap<K, V>.resize(m: *OrderedMap<K, V>, n: u64) {
 /// copy of each candidate key whose hash matches, and must not change the map.
 #[inline]
 pub fn OrderedMap<K, V>.find_by(m: *OrderedMap<K, V>, h: u64, eq: block fn(K) -> bool) -> ?u64 {
-    probe_find(m.idx, m.mask, m.ents, stored_hash<K>(h), eq)
+    // unsafe: the map's tables meet the probe contract.
+    unsafe { probe_find(m.idx, m.mask, m.ents, stored_hash<K>(h), eq) }
 }
 
 /// `find_by` for an `eq` that can fail and run guest code, which may
@@ -340,7 +431,8 @@ pub fn OrderedMap<K, V>.find_by(m: *OrderedMap<K, V>, h: u64, eq: block fn(K) ->
 /// that changes the map on every call makes the lookup loop forever, as
 /// in CPython.
 pub fn OrderedMap<K, V>.find_with<E>(m: *OrderedMap<K, V>, h: u64, eq: block fn(K) -> Result<bool, E> uses reenter) -> Result<?u64, E> uses reenter {
-    probe_find_with<K, V, E>(stored_hash<K>(h), || (m.idx, m.mask, m.ents, m.version), eq)
+    // unsafe: the map's tables meet the probe contract, read afresh by each `view()`.
+    unsafe { probe_find_with<K, V, E>(stored_hash<K>(h), || (m.idx, m.mask, m.ents, m.version), eq) }
 }
 
 /// Append a new entry for a key the caller knows is absent; returns its index.
@@ -348,40 +440,70 @@ pub fn OrderedMap<K, V>.insert_new(m: *OrderedMap<K, V>, h: u64, key: K, value: 
     if m.used == m.cap { m.resize(m.len * 2 + 1); }
     let hs = stored_hash<K>(h);
     let e = m.used;
-    m.ents[e] = Entry { hash: hs, key: key, value: value };
-    probe_put<K>(m.idx, m.mask, hs, e);
+    // unsafe: e = used < cap after the resize check, and the index has an empty slot
+    // (used <= 2/3 of its slots).
+    unsafe {
+        m.ents[e] = Entry { hash: hs, key: key, value: value };
+        probe_put<K>(m.idx, m.mask, hs, e);
+    }
     m.used += 1;
     m.len += 1;
     m.version += 1;
     e
 }
 
-/// Entry `e` (a live entry index from `find_by`, `next`, ...). The pointer
-/// is valid until the map changes.
-pub fn OrderedMap<K, V>.entry(m: *OrderedMap<K, V>, e: u64) -> *Entry<K, V> { m.ents + e }
+#[cold]
+#[inline(never)]
+fn bad_entry(e: u64) -> never {
+    rt.panic("map.OrderedMap: not a live entry index\n");
+}
+
+/// Entry `e` (live or dead), if e < used.
+#[inline(always)]
+fn OrderedMap<K, V>.at(m: *OrderedMap<K, V>, e: u64) -> ?*Entry<K, V> {
+    if e >= m.used { return None; }
+    // unsafe: e < used <= cap, and `ents` holds at least `cap` entries.
+    Some(unsafe { m.ents + e })
+}
+
+/// Entry `e`, which must be live (panics otherwise).
+#[inline(always)]
+fn OrderedMap<K, V>.live(m: *OrderedMap<K, V>, e: u64) -> *Entry<K, V> {
+    let Some(p) = m.at(e) else { bad_entry(e) };
+    if p.hash == DEAD { bad_entry(e); }
+    p
+}
+
+/// Entry `e` (a live entry index from `find_by`, `next`, ...; panics if
+/// it is not one). The pointer is valid until the map changes.
+pub fn OrderedMap<K, V>.entry(m: *OrderedMap<K, V>, e: u64) -> *Entry<K, V> { m.live(e) }
 
 /// Whether entry index `e` is a live entry.
 pub fn OrderedMap<K, V>.is_live(m: *OrderedMap<K, V>, e: u64) -> bool {
-    e < m.used and (m.ents + e).hash != DEAD
+    let Some(p) = m.at(e) else { return false; };
+    p.hash != DEAD
 }
 
-pub fn OrderedMap<K, V>.set_value(m: *OrderedMap<K, V>, e: u64, value: V) { (m.ents + e).value = value; }
+pub fn OrderedMap<K, V>.set_value(m: *OrderedMap<K, V>, e: u64, value: V) { m.live(e).value = value; }
 
-/// Remove the live entry `e`.
+/// Remove the live entry `e` (panics if it is not one).
 pub fn OrderedMap<K, V>.remove_at(m: *OrderedMap<K, V>, e: u64) {
-    probe_kill(m.idx, m.mask, m.ents, e);
+    m.live(e);
+    // unsafe: `e` is live (checked above), so indexed in the map's tables.
+    unsafe { probe_kill(m.idx, m.mask, m.ents, e); }
     m.len -= 1;
     m.version += 1;
 }
 
 pub fn OrderedMap<K, V>.get(m: *OrderedMap<K, V>, key: K) -> ?V {
     let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
-    Some((m.ents + e).value)
+    Some(m.live(e).value)
 }
 
+/// A pointer to `key`'s value, valid until the map changes.
 pub fn OrderedMap<K, V>.get_ptr(m: *OrderedMap<K, V>, key: K) -> ?*V {
     let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
-    Some(&(m.ents + e).value)
+    Some(&m.live(e).value)
 }
 
 pub fn OrderedMap<K, V>.contains(m: *OrderedMap<K, V>, key: K) -> bool {
@@ -398,25 +520,29 @@ pub fn OrderedMap<K, V>.insert(m: *OrderedMap<K, V>, key: K, value: V) -> bool {
 /// (as `find_by`). Returns the entry index and whether the key was new.
 pub fn OrderedMap<K, V>.put_by(m: *OrderedMap<K, V>, h: u64, key: K, value: V, eq: block fn(K) -> bool) -> (u64, bool) {
     let hs = stored_hash<K>(h);
-    let (r, found) = probe_lookup(m.idx, m.mask, m.ents, hs, eq);
-    if found {
-        (m.ents + r).value = value;
-        return (r, false);
+    // unsafe: the map's tables meet the probe contract; a found `r` is an entry below
+    // `used`, else an index slot (masked); e = used < cap is checked before the write.
+    unsafe {
+        let (r, found) = probe_lookup(m.idx, m.mask, m.ents, hs, eq);
+        if found {
+            (m.ents + r).value = value;
+            return (r, false);
+        }
+        if m.used == m.cap { return (m.insert_new(h, key, value), true); }
+        let e = m.used;
+        m.ents[e] = Entry { hash: hs, key: key, value: value };
+        m.idx[r] = (e as u32) + SLOT_BASE;
+        m.used = e + 1;
+        m.len += 1;
+        m.version += 1;
+        (e, true)
     }
-    if m.used == m.cap { return (m.insert_new(h, key, value), true); }
-    let e = m.used;
-    m.ents[e] = Entry { hash: hs, key: key, value: value };
-    m.idx[r] = (e as u32) + SLOT_BASE;
-    m.used = e + 1;
-    m.len += 1;
-    m.version += 1;
-    (e, true)
 }
 
 /// Remove `key`; its value if it was present.
 pub fn OrderedMap<K, V>.remove(m: *OrderedMap<K, V>, key: K) -> ?V {
     let Some(e) = m.find_by(key.hash(), |k| k.eq(key)) else { return None; };
-    let v = (m.ents + e).value;
+    let v = m.live(e).value;
     m.remove_at(e);
     Some(v)
 }
@@ -425,12 +551,13 @@ pub fn OrderedMap<K, V>.remove(m: *OrderedMap<K, V>, key: K) -> ?V {
 pub fn OrderedMap<K, V>.pop_last(m: *OrderedMap<K, V>) -> ?(K, V) {
     // Entries given back come off `cap` until the next resize: their
     // index slots stay deleted (not empty), and popping and inserting in
-    // turn must not fill the index with them.
+    // turn must not fill the index with them. (`cap` only shrinks here,
+    // so `ents` still holds at least `cap` entries.)
     let was = m.used;
-    while m.used > 0 and (m.ents + (m.used - 1)).hash == DEAD { m.used -= 1; }
+    while m.used > 0 and m.at(m.used - 1).unwrap().hash == DEAD { m.used -= 1; }
     if m.used == 0 { m.cap -= was; return None; }
     let e = m.used - 1;
-    let p = m.ents + e;
+    let p = m.live(e);
     let r = (p.key, p.value);
     m.remove_at(e);
     m.used = e;
@@ -440,10 +567,10 @@ pub fn OrderedMap<K, V>.pop_last(m: *OrderedMap<K, V>) -> ?(K, V) {
 
 /// Iteration in insertion order:
 /// `var i: u64 = 0; while let Some(e) = m.next(&i) { .. e.key, e.value .. }`.
-/// The entry index of `e` is `i - 1`.
+/// The entry index of `e` is `i - 1`; the pointer is valid until the map
+/// changes.
 pub fn OrderedMap<K, V>.next(m: *OrderedMap<K, V>, at: *u64) -> ?*Entry<K, V> {
-    while *at < m.used {
-        let p = m.ents + *at;
+    while let Some(p) = m.at(*at) {
         *at += 1;
         if p.hash != DEAD { return Some(p); }
     }
@@ -452,19 +579,32 @@ pub fn OrderedMap<K, V>.next(m: *OrderedMap<K, V>, at: *u64) -> ?*Entry<K, V> {
 
 /// Remove every entry, keeping the memory.
 pub fn OrderedMap<K, V>.clear(m: *OrderedMap<K, V>) {
-    mem.memset(m.idx as *u8, 0, (m.mask + 1) * 4);
+    if !is_empty_table(m.idx as u64) {
+        // unsafe: `idx` holds mask + 1 four-byte slots (zero is empty).
+        unsafe { mem.memset(m.idx as *u8, 0, (m.mask + 1) * 4); }
+    }
     m.used = 0;
     m.len = 0;
     m.cap = usable_for<K>(m.mask + 1);
     m.version += 1;
 }
 
-/// Free the map's memory. The map must not be used afterwards (make a
-/// new one).
+/// Free the map's memory. The map is then empty, and can be used (or
+/// freed) again; it allocates on the next insertion.
 pub fn OrderedMap<K, V>.free(m: *OrderedMap<K, V>) {
-    mem.release(m.idx);
-    mem.release(m.ents);
+    // unsafe: the tables came from `mem.alloc` unless they are EMPTY_TABLE,
+    // which (zeroed) is one empty index slot (mask 0) over no entries (cap 0).
+    unsafe {
+        if !is_empty_table(m.idx as u64) {
+            mem.release(m.idx);
+            mem.release(m.ents);
+        }
+        m.idx = (&EMPTY_TABLE[0]) as *u32;
+        m.ents = (&EMPTY_TABLE[0]) as *Entry<K, V>;
+    }
+    m.mask = 0;
     m.used = 0;
     m.len = 0;
     m.cap = 0;
+    m.version += 1;
 }
