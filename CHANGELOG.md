@@ -120,6 +120,11 @@ implementation; `git log` has the details.
   ([stdlib.md](docs/stdlib.md#ordered-maps-maporderedmap-and-dictdict)).
 - **`mem.try_sort_by`**: a stable sort with a fallible, re-entrant
   comparator ([stdlib.md](docs/stdlib.md#stdmem)).
+- **`std.parse.Ops`**: operator tables changed at run time (Prolog's
+  `op/3`: names, priorities, the seven types, prefix/infix/postfix
+  definitions of one name) and an operator-precedence driver with its
+  hooks as trait methods (`OpHooks`); the Prolog reader uses it
+  ([stdlib.md](docs/stdlib.md#run-time-operator-tables-parseops)).
 
 ### Tooling
 

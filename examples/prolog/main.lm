@@ -10,6 +10,7 @@ import std.mem;
 import std.text;
 import std.gc;
 import std.map.{HashMap};
+import std.parse;
 import term.{Term, deref};
 import term;
 import machine.{Machine};
@@ -41,7 +42,7 @@ fn setup(m: *Machine) {
     m.preds = mem.Vec.new();
     m.consts = mem.Vec.new();
     m.clauses = mem.Vec.new();
-    m.ops = HashMap.new();
+    m.ops = parse.Ops.new();
     m.bmap = HashMap.new();
     m.globals = HashMap.new();
     m.inits = mem.Vec.new();

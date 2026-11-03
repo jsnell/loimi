@@ -8,6 +8,7 @@ import std.text;
 import std.hash;
 import std.io;
 import std.map.{HashMap};
+import std.parse;
 import term.{Term, Var, Struct, Cons, Db, deref};
 import term;
 import std.bigint;
@@ -68,7 +69,7 @@ pub struct Machine {
     halt_code: i32,
     gensym: u64,
     stress: bool,
-    ops: HashMap<u64, u32>,
+    ops: parse.Ops,
     clauses: mem.Vec<*Clause>,
     fail_code: *u32,
     true_code: *u32,

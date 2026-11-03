@@ -1,11 +1,12 @@
-// The reader: Prolog tokens and an operator precedence parser, with the
-// operator table that op/3 changes and the writer consults.
+// The reader: Prolog tokens, and the hooks of std.parse.Ops (the operator
+// precedence parser) over the operator table that op/3 changes and the
+// writer consults.
 
 import std.text;
 import std.num;
 import std.mem;
-import std.hash;
-import std.map.{HashMap};
+import std.parse;
+import std.parse.{OpType, Tok};
 import term.{Term, Var, Struct, Cons, deref};
 import term;
 import machine.{Machine};
@@ -13,45 +14,8 @@ import std.bigint;
 import std.bigint.{Arg};
 import arith;
 
-// Operator types.
-pub const XFX: u32 = 0;
-pub const XFY: u32 = 1;
-pub const YFX: u32 = 2;
-pub const FY: u32 = 3;
-pub const FX: u32 = 4;
-pub const XF: u32 = 5;
-pub const YF: u32 = 6;
-
-const K_PREFIX: u64 = 0;
-const K_INFIX: u64 = 1;
-const K_POSTFIX: u64 = 2;
-
-fn op_key(a: u32, kind: u64) -> u64 { ((a as u64) << 2) | kind }
-
-fn kind_of(typ: u32) -> u64 {
-    if typ <= YFX { K_INFIX } else if typ <= FX { K_PREFIX } else { K_POSTFIX }
-}
-
 /// op/3 for one atom: priority 0 removes the definition.
-pub fn add_op(m: *Machine, prec: u32, typ: u32, a: u32) {
-    let k = op_key(a, kind_of(typ));
-    if prec == 0 { m.ops.remove(k); return; }
-    m.ops.insert(k, (prec << 4) | typ);
-}
-
-pub fn op_type_atom(m: *Machine, s: str) -> ?u32 {
-    match s {
-        "xfx" => Some(XFX), "xfy" => Some(XFY), "yfx" => Some(YFX),
-        "fy" => Some(FY), "fx" => Some(FX), "xf" => Some(XF), "yf" => Some(YF),
-        _ => None,
-    }
-}
-
-pub fn op_type_name(t: u32) -> str {
-    match t {
-        0 => "xfx", 1 => "xfy", 2 => "yfx", 3 => "fy", 4 => "fx", 5 => "xf", _ => "yf",
-    }
-}
+pub fn add_op(m: *Machine, prec: u32, typ: OpType, a: u32) { m.ops.add(a as u64, prec, typ); }
 
 pub fn init_ops(m: *Machine) {
     let table = [
@@ -72,51 +36,25 @@ pub fn init_ops(m: *Machine) {
     ];
     for e in table {
         let (p, t, n) = e;
-        add_op(m, p as u32, op_type_atom(m, t).unwrap(), m.db.atom(n));
+        add_op(m, p as u32, parse.op_type(t).unwrap(), m.db.atom(n));
     }
     let decl = ["dynamic", "discontiguous", "initialization", "meta_predicate", "module_transparent",
                 "multifile", "public", "thread_local", "table"];
-    for n in decl { add_op(m, 1150, FX, m.db.atom(n)); }
-    add_op(m, 1100, XFY, term.A_BAR);
+    for n in decl { add_op(m, 1150, OpType.FX, m.db.atom(n)); }
+    add_op(m, 1100, OpType.XFY, term.A_BAR);
 }
 
-pub fn is_op(m: *Machine, a: u32) -> bool {
-    m.ops.contains(op_key(a, K_PREFIX)) or m.ops.contains(op_key(a, K_INFIX)) or m.ops.contains(op_key(a, K_POSTFIX))
-}
+pub fn is_op(m: *Machine, a: u32) -> bool { m.ops.is_op(a as u64) }
 
-pub fn op_prec(m: *Machine, a: u32) -> u32 {
-    var p: u32 = 0;
-    for k in [K_PREFIX, K_INFIX, K_POSTFIX] {
-        if let Some(v) = m.ops.get(op_key(a, k)) { if (v >> 4) > p { p = v >> 4; } }
-    }
-    p
-}
+pub fn op_prec(m: *Machine, a: u32) -> u32 { m.ops.max_prio(a as u64) }
 
 /// (priority, left max, right max)
-pub fn infix_op(m: *Machine, a: u32) -> ?(u32, u32, u32) {
-    let v = m.ops.get(op_key(a, K_INFIX))?;
-    let p = v >> 4;
-    match v & 15 {
-        0 => Some((p, p - 1, p - 1)),
-        1 => Some((p, p - 1, p)),
-        _ => Some((p, p, p - 1)),
-    }
-}
+pub fn infix_op(m: *Machine, a: u32) -> ?(u32, u32, u32) { let d = m.ops.infix(a as u64)?; Some((d.prio, d.left, d.right)) }
 
 /// (priority, argument max)
-pub fn prefix_op(m: *Machine, a: u32) -> ?(u32, u32) {
-    let v = m.ops.get(op_key(a, K_PREFIX))?;
-    let p = v >> 4;
-    if (v & 15) == FY { Some((p, p)) } else { Some((p, p - 1)) }
-}
+pub fn prefix_op(m: *Machine, a: u32) -> ?(u32, u32) { let d = m.ops.prefix(a as u64)?; Some((d.prio, d.right)) }
 
-pub fn postfix_op(m: *Machine, a: u32) -> ?(u32, u32) {
-    let v = m.ops.get(op_key(a, K_POSTFIX))?;
-    let p = v >> 4;
-    if (v & 15) == YF { Some((p, p)) } else { Some((p, p - 1)) }
-}
-
-pub fn op_def(m: *Machine, a: u32, kind: u64) -> ?u32 { m.ops.get(op_key(a, kind)) }
+pub fn postfix_op(m: *Machine, a: u32) -> ?(u32, u32) { let d = m.ops.postfix(a as u64)?; Some((d.prio, d.left)) }
 
 // ---- tokens --------------------------------------------------------------
 
@@ -143,7 +81,6 @@ pub struct Reader {
     vars: mem.Vec<(str, Term)>,
     error: ?str,
     err_line: u32,
-    arg_ctx: bool,
 }
 
 pub fn Reader.new(m: *Machine, src: str) -> Reader {
@@ -151,7 +88,7 @@ pub fn Reader.new(m: *Machine, src: str) -> Reader {
         m: m, src: src, pos: 0, line: 1,
         tok: Token { kind: Tk.Eof, text: "", int: 0, flt: 0.0, layout: false, line: 1 },
         peeked: false, arena: mem.Arena.new(), buf: text.StrBuf.new(), vars: mem.Vec.new(),
-        error: None, err_line: 0, arg_ctx: false,
+        error: None, err_line: 0,
     }
 }
 
@@ -412,7 +349,7 @@ fn Reader.next(r: *Reader) -> *Token {
     t
 }
 
-fn Reader.peek(r: *Reader) -> *Token {
+fn Reader.look(r: *Reader) -> *Token {
     if !r.peeked { r.next(); r.peeked = true; }
     &r.tok
 }
@@ -461,21 +398,6 @@ fn Reader.codes(r: *Reader, s: str, chars: bool) -> Term {
     t
 }
 
-/// Can this token start a term?
-fn starts_term(r: *Reader, t: *Token) -> bool {
-    match t.kind {
-        Atom => {
-            // An infix operator that is not also a prefix one cannot.
-            let a = r.m.db.atom(t.text);
-            if infix_op(r.m, a).is_some() and prefix_op(r.m, a).is_none() and t.int == 0 { return false; }
-            true
-        }
-        Var => true, Int => true, Flt => true, Str => true, BackQ => true,
-        Open => true, OpenCT => true, OpenList => true, OpenCurly => true,
-        _ => false,
-    }
-}
-
 fn Reader.expect(r: *Reader, k: Tk, msg: str) {
     let t = r.next();
     if t.kind != k { r.fail(msg); }
@@ -504,27 +426,65 @@ fn Reader.arglist(r: *Reader, name: u32) -> Term {
     res
 }
 
-/// A primary term and its priority.
-fn Reader.primary(r: *Reader, maxp: u32) -> (Term, u32) {
+// ---- the operator precedence parser: hooks for std.parse.Ops ------------
+
+impl parse.OpHooks<Term, ()> for Reader;
+
+/// An atom token not followed directly by `(`, unquoted, and not a sign
+/// followed directly by a number, may be an operator at a term start;
+/// after a term, any atom, `,` and `|` may be.
+fn Reader.peek(r: *Reader, prefix: bool) -> Tok {
+    if r.error.is_some() { return Tok.End; }
+    let t = r.look();
+    match t.kind {
+        Atom => {
+            if prefix and (t.int != 0 or r.peekc(0) == '(') { return Tok.Term; }
+            if prefix and (t.text.eq("-") or t.text.eq("+")) and is_digit(r.peekc(0)) { return Tok.Term; }
+            Tok.Name(r.m.db.atom(t.text) as u64)
+        }
+        Comma => Tok.Sep(term.A_COMMA as u64),
+        Bar => Tok.Sep(term.A_BAR as u64),
+        Var => Tok.Term, Int => Tok.Term, BigInt => Tok.Term, Flt => Tok.Term, Str => Tok.Term, BackQ => Tok.Term,
+        Open => Tok.Term, OpenCT => Tok.Term, OpenList => Tok.Term, OpenCurly => Tok.Term,
+        _ => Tok.End,
+    }
+}
+
+fn Reader.advance(r: *Reader) -> Result<(), ()> { r.next(); Ok(()) }
+
+fn Reader.atom(r: *Reader, a: u64) -> Result<Term, ()> { Ok(Term.Atom(a as u32)) }
+
+fn Reader.prefix(r: *Reader, a: u64, x: Term) -> Result<Term, ()> { Ok(r.m.mk1(a as u32, x)) }
+
+fn Reader.infix(r: *Reader, a: u64, x: Term, y: Term) -> Result<Term, ()> {
+    // `|` at priority 1100 or more is `;`.
+    let bar = a == term.A_BAR as u64 and infix_op(r.m, term.A_BAR).unwrap().0 >= 1100;
+    Ok(r.m.mk2(if bar { term.A_SEMI } else { a as u32 }, x, y))
+}
+
+fn Reader.postfix(r: *Reader, a: u64, x: Term) -> Result<Term, ()> { Ok(r.m.mk1(a as u32, x)) }
+
+/// A term that is not an operator application.
+fn Reader.primary(r: *Reader) -> Result<Term, ()> {
     let m = r.m;
     let t = r.next();
     match t.kind {
-        Int => return (term.mk_int(t.int), 0),
-        BigInt => { let s = t.text; return (big_of(r.m, s, false), 0); }
-        Flt => return (Term.Flt(t.flt), 0),
-        Var => { let name = t.text; return (r.variable(name), 0); }
+        Int => return Ok(term.mk_int(t.int)),
+        BigInt => { let s = t.text; return Ok(big_of(r.m, s, false)); }
+        Flt => return Ok(Term.Flt(t.flt)),
+        Var => { let name = t.text; return Ok(r.variable(name)); }
         Str => {
             let s = t.text;
-            if m.flags_dq == term.A_ATOM { return (Term.Atom(m.db.atom(s)), 0); }
-            return (r.codes(s, m.flags_dq == term.A_CHARS), 0);
+            if m.flags_dq == term.A_ATOM { return Ok(Term.Atom(m.db.atom(s))); }
+            return Ok(r.codes(s, m.flags_dq == term.A_CHARS));
         }
-        BackQ => { let s = t.text; return (r.codes(s, false), 0); }
-        Open => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return (x, 0); }
-        OpenCT => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return (x, 0); }
+        BackQ => { let s = t.text; return Ok(r.codes(s, false)); }
+        Open => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return Ok(x); }
+        OpenCT => { let x = r.parse(1200); r.expect(Tk.Close, "expected )"); return Ok(x); }
         OpenList => {
-            if r.peek().kind == Tk.CloseList {
+            if r.look().kind == Tk.CloseList {
                 r.next();
-                return r.after_atom(term.A_NIL, maxp, false);
+                return Ok(r.after_atom(term.A_NIL));
             }
             var items: mem.Vec<Term> = mem.Vec.new();
             var tail = Term.Atom(term.A_NIL);
@@ -540,127 +500,57 @@ fn Reader.primary(r: *Reader, maxp: u32) -> (Term, u32) {
             var k = items.len;
             while k > 0 { k -= 1; tail = m.mk_cons(items.ptr[k], tail); }
             items.free();
-            return (tail, 0);
+            return Ok(tail);
         }
         OpenCurly => {
-            if r.peek().kind == Tk.CloseCurly {
+            if r.look().kind == Tk.CloseCurly {
                 r.next();
-                return r.after_atom(term.A_CURLY, maxp, false);
+                return Ok(r.after_atom(term.A_CURLY));
             }
             let x = r.parse(1200);
             r.expect(Tk.CloseCurly, "expected }");
-            return (m.mk1(term.A_CURLY, x), 0);
+            return Ok(m.mk1(term.A_CURLY, x));
         }
         Atom => {
-            let quoted = t.int != 0;
-            let a = m.db.atom(t.text);
-            return r.after_atom(a, maxp, quoted);
+            let s = t.text;
+            if t.int == 0 and (s.eq("-") or s.eq("+")) and is_digit(r.peekc(0)) {
+                // A signed number: `-` directly followed by a number.
+                let neg = s.eq("-");
+                let n = r.next();
+                if n.kind == Tk.BigInt { let d = n.text; return Ok(big_of(m, d, neg)); }
+                if n.kind == Tk.Int { return Ok(term.mk_int(if neg { 0 - n.int } else { n.int })); }
+                return Ok(Term.Flt(if neg { -n.flt } else { n.flt }));
+            }
+            return Ok(r.after_atom(m.db.atom(s)));
         }
-        Comma => { r.fail("unexpected ,"); return (Term.Atom(term.A_NIL), 0); }
-        Bar => { r.fail("unexpected |"); return (Term.Atom(term.A_NIL), 0); }
-        End => { r.fail("unexpected end of clause"); return (Term.Atom(term.A_NIL), 0); }
-        Eof => { r.fail("unexpected end of file"); return (Term.Atom(term.A_NIL), 0); }
-        _ => { r.fail("unexpected token"); return (Term.Atom(term.A_NIL), 0); }
+        Comma => r.fail("unexpected ,"),
+        Bar => r.fail("unexpected |"),
+        End => r.fail("unexpected end of clause"),
+        Eof => r.fail("unexpected end of file"),
+        _ => r.fail("unexpected token"),
     }
+    Ok(Term.Atom(term.A_NIL))
 }
 
-/// An atom just read: functional notation, a prefix operator, a signed
-/// number, or the atom itself.
-fn Reader.after_atom(r: *Reader, a: u32, maxp: u32, quoted: bool) -> (Term, u32) {
-    let m = r.m;
-    let nx = r.peek();
-    if nx.kind == Tk.OpenCT {
+/// An atom just read: functional notation or the atom itself.
+fn Reader.after_atom(r: *Reader, a: u32) -> Term {
+    if r.look().kind == Tk.OpenCT {
         r.next();
-        return (r.arglist(a), 0);
+        return r.arglist(a);
     }
-    if !quoted and (a == term.A_MINUS or a == term.A_PLUS) and !nx.layout and (nx.kind == Tk.Int or nx.kind == Tk.Flt or nx.kind == Tk.BigInt) {
-        r.next();
-        let t = &r.tok;
-        if t.kind == Tk.BigInt { let s = t.text; return (big_of(m, s, a == term.A_MINUS), 0); }
-        if t.kind == Tk.Int {
-            return (term.mk_int(if a == term.A_MINUS { 0 - t.int } else { t.int }), 0);
-        }
-        return (Term.Flt(if a == term.A_MINUS { -t.flt } else { t.flt }), 0);
-    }
-    if !quoted {
-        if let Some((p, argmax)) = prefix_op(m, a) {
-            let nx2 = r.peek();
-            var operand = starts_term(r, nx2);
-            // `- (a)` is -(a); an infix operator next means the prefix
-            // operator is an atom operand (`- = x`).
-            if nx2.kind == Tk.Atom and nx2.int == 0 {
-                let b = m.db.atom(nx2.text);
-                if infix_op(m, b).is_some() {
-                    // Look one further: `\+ -1` keeps \+ as prefix.
-                    if prefix_op(m, b).is_none() { operand = false; }
-                }
-            }
-            if operand {
-                var pp = p;
-                var am = argmax;
-                if pp > maxp { pp = 999; am = 999; }
-                let (arg, _) = r.parse_prec(am);
-                let res = m.mk1(a, arg);
-                return (res, pp);
-            }
-            let pr = if p > maxp { 0 } else { p };
-            return (Term.Atom(a), pr);
-        }
-    }
-    let pr = if !quoted and is_op(m, a) { let p = op_prec(m, a); if p > maxp { 0 } else { p } } else { 0 };
-    (Term.Atom(a), pr)
+    Term.Atom(a)
 }
 
 fn Reader.parse(r: *Reader, maxp: u32) -> Term {
-    let (t, _) = r.parse_prec(maxp);
+    let Ok((t, _)) = r.op_parse(&r.m.ops, maxp) else { return Term.Atom(term.A_NIL); };
     t
 }
 
 /// An argument (of a compound or a list): priority 999, but like SWI-Prolog
 /// an operator above 999 other than `,` and `|` is accepted (`f(a :- b)`).
 fn Reader.parse_arg(r: *Reader) -> Term {
-    r.arg_ctx = true;
-    let (t, _) = r.parse_prec(999);
+    let Ok(t) = r.op_parse_arg(&r.m.ops) else { return Term.Atom(term.A_NIL); };
     t
-}
-
-fn Reader.parse_prec(r: *Reader, maxp0: u32) -> (Term, u32) {
-    let arg = r.arg_ctx;
-    r.arg_ctx = false;
-    var maxp = maxp0;
-    let m = r.m;
-    var (left, lp) = r.primary(maxp0);
-    loop {
-        if r.error.is_some() { return (left, lp); }
-        let t = r.peek();
-        var name: u32 = 0;
-        match t.kind {
-            Atom => name = m.db.atom(t.text),
-            Comma => name = term.A_COMMA,
-            Bar => name = term.A_BAR,
-            _ => return (left, lp),
-        }
-        if let Some((p, la, ra)) = infix_op(m, name) {
-            if arg and p > maxp and name != term.A_COMMA and name != term.A_BAR { maxp = 1200; }
-            if p <= maxp and lp <= la {
-                r.next();
-                let right = r.parse(ra);
-                let nm = if name == term.A_BAR and p >= 1100 { term.A_SEMI } else { name };
-                left = m.mk2(nm, left, right);
-                lp = p;
-                continue;
-            }
-        }
-        if let Some((p, la)) = postfix_op(m, name) {
-            if p <= maxp and lp <= la {
-                r.next();
-                left = m.mk1(name, left);
-                lp = p;
-                continue;
-            }
-        }
-        return (left, lp);
-    }
 }
 
 /// Read one clause; None at the end of the input. On a syntax error,
@@ -668,7 +558,7 @@ fn Reader.parse_prec(r: *Reader, maxp0: u32) -> (Term, u32) {
 pub fn Reader.read(r: *Reader) -> ?Term {
     r.vars.clear();
     r.error = None;
-    let t = r.peek();
+    let t = r.look();
     if t.kind == Tk.Eof { r.next(); return None; }
     let x = r.parse(1200);
     if r.error.is_none() {
