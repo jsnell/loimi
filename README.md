@@ -118,7 +118,7 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 | [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.42× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
 | [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value) | Every non-SIMD spec test file passes; 0.91× wasm3 |
-| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.53× CPython 3.13, 0.20× MicroPython ([report](examples/python/FRICTION.md)) |
+| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.53× CPython 3.13, 0.18× MicroPython ([results](docs/results.md#python-2026-11-03), [report](examples/python/FRICTION.md)) |
 
 Lox, regex, stack, wasm and python were written by agents that read only
 the docs, as usability studies; each has a `FRICTION.md` report.

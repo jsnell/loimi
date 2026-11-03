@@ -63,7 +63,7 @@ once, in about 5 minutes, mostly builds):
 
 ```sh
 bench/lua/install.sh; bench/js/install.sh; bench/scheme/fetch.sh; bench/scheme/install.sh
-bench/lox/install.sh; bench/wasm/install.sh; bench/wasm/programs.sh
+bench/lox/install.sh; bench/wasm/install.sh; bench/wasm/programs.sh; bench/python/install.sh
 bench/run_all.py [--quick] [--only mini,scheme] [--out DIR]
 bench/run_all.py --report DIR/results.json     # the tables below, again
 ```
@@ -100,6 +100,9 @@ bench/run_all.py --report DIR/results.json     # the tables below, again
 | stack (5) | tailcall | 1 | — |
 | stack (5) | goto | 1.01 | — |
 | stack (5) | switch | 1.22 | — |
+| python (11) | tailcall | 1 | cpython 0.53, micropython 0.18 (0.20 over 8) |
+| python (11) | goto | 1.04 | cpython 0.55, micropython 0.19 (0.20 over 8) |
+| python (11) | switch | 1.12 | cpython 0.59, micropython 0.21 (0.22 over 8) |
 
 (n) is the number of benchmarks. *vs tailcall* is the geometric mean of
 that build's times over the tail-call build's. Suites: `mini` (Mini, a
@@ -107,7 +110,8 @@ Lua 5.4 subset, 14 clean-room benchmarks), `mini-coro` (Mini's three
 coroutine benchmarks), `minijs` (14 clean-room benchmarks), `scheme` (41
 r7rs-benchmarks programs), `lox` (the book's benchmarks), `regex` (the
 backtracking engine), `wasm` (C programs compiled to wasm32-wasi), `stack`
-(Stak).
+(Stak), `python` (the Python subset, 11 pyperformance programs; run
+separately, see "Python" below).
 
 ## Notes
 
@@ -267,12 +271,36 @@ goto 0.977 (`fib` 0.88, `interp` 1.04 reproduced), switch 0.971
 
 ## Follow-up (2026-11-03): Python ints and instance dicts
 
-examples/python (not in the tables below; `bench/python/compare.py`):
+examples/python (an A/B run with `bench/python/compare.py`; the python
+tables are from the later run in "Python" below):
 `/` and `%` on `i48` now fold their division checks after a `y > 0`
 guard, and instance attributes use `std.dict.KeyDict` (no stored hashes).
 The 11 programs, best of 3 interleaved, old/new: geomean 1.00 (each
 within 3%, the machine shared with other jobs); spectral_norm 0.98 (best
 of 9: 1.100 -> 1.076 of the time of the earlier `Int(i32)` build).
+
+## Python (2026-11-03)
+
+The python suite was added to `bench/run_all.py` after the run above and
+run on its own (`bench/run_all.py --only python`, 3.5 minutes), on the
+same machine: commit 0848a6f (live instance `__dict__`), load average
+3.5–4.0 (another agent's builds and benchmarks). Method as above: the
+three dispatch builds with `--align-functions=64`, best of 3, interleaved
+with the references within each program, by `bench/python/compare.py`
+(`--exe NAME=CMD` per build), every output checked against CPython's.
+References from `bench/python/install.sh`: CPython 3.13.18 (`-O3`, no PGO
+or LTO) and MicroPython 1.29.0 (unix port, `-X heapsize=256M`).
+
+- Tail-call: 0.38–0.96 of CPython's time, less on all 11 programs
+  (nqueens 0.96, hexiom 0.76; richards and nbody 0.38).
+- MicroPython's output differs on chaos and go (its `random` is another
+  generator, so other games) and nbody (last float digits). Their times
+  are in the table and in the geometric means of the summary (0.18);
+  `compare.py` leaves them out of its own (0.20 over the other 8).
+- goto takes 1.04× and switch 1.12× the tail-call time (switch 1.29× on
+  nbody).
+- Against the README's python line (0.53× CPython, 0.20×
+  MicroPython by `compare.py`): unchanged.
 
 ## Per suite
 
@@ -443,3 +471,22 @@ Times in seconds.
 
 Times in seconds.
 
+
+### python
+
+| benchmark | tailcall | goto | switch | cpython | micropython | tailcall/cpython | tailcall/micropython |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| chaos | 0.326 | 0.343 | 0.371 | 0.712 | 1.849 | 0.46 | 0.18 |
+| deltablue | 0.588 | 0.600 | 0.641 | 0.966 | 4.807 | 0.61 | 0.12 |
+| fannkuch | 0.472 | 0.495 | 0.527 | 0.904 | 1.404 | 0.52 | 0.34 |
+| float | 0.470 | 0.471 | 0.493 | 0.894 | 2.216 | 0.53 | 0.21 |
+| go | 0.368 | 0.389 | 0.414 | 0.814 | 1.859 | 0.45 | 0.20 |
+| hexiom | 0.530 | 0.557 | 0.611 | 0.699 | 3.081 | 0.76 | 0.17 |
+| nbody | 0.367 | 0.406 | 0.474 | 0.964 | 3.518 | 0.38 | 0.10 |
+| nqueens | 0.773 | 0.792 | 0.828 | 0.808 | 1.655 | 0.96 | 0.47 |
+| raytrace | 0.493 | 0.512 | 0.562 | 0.917 | 3.488 | 0.54 | 0.14 |
+| richards | 0.309 | 0.321 | 0.348 | 0.820 | 3.221 | 0.38 | 0.10 |
+| spectral_norm | 0.321 | 0.318 | 0.344 | 0.714 | 1.411 | 0.45 | 0.23 |
+| **geomean** |  |  |  |  |  | **0.53** | **0.18** |
+
+Times in seconds.
