@@ -111,16 +111,17 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 
 | Example | What it is | Headline |
 |---|---|---|
-| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.53× PUC-Lua 5.4, 0.83× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks ([log](bench/mini/RESULTS.md)) |
+| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.54× PUC-Lua 5.4, 0.85× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks; coroutines 0.41× PUC-Lua ([log](bench/mini/RESULTS.md)) |
 | [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.52× V8's interpreter (`node --jitless`), 0.40× QuickJS |
-| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 41 unmodified r7rs-benchmarks programs: 0.27× Gauche, 0.44× Guile 3 without JIT, 0.96× Guile with its JIT ([notes](bench/scheme/README.md)) |
+| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.26× Gauche, 0.46× Guile 3 without JIT, 0.97× Guile with its JIT ([notes](bench/scheme/README.md)) |
 | [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.45× clox |
-| [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.42× Python's `re` |
+| [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
 | [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.91× wasm3 |
-| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.53× CPython 3.13, 0.18× MicroPython ([results](docs/results.md#python-2026-11-03), [report](examples/python/FRICTION.md)) |
+| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.52× CPython 3.13, 0.18× MicroPython ([report](examples/python/FRICTION.md)) |
+| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.79× SWI-Prolog 10 (`-O`), 0.19× Trealla ([report](examples/prolog/FRICTION.md)) |
 
-Lox, regex, stack, wasm and python were written by agents that read only
+Lox, regex, stack, wasm, python and prolog were written by agents that read only
 the docs, as usability studies; each has a `FRICTION.md` report.
 `loimi build --jit-stencils` turns the same `vm` source into a
 copy-and-patch JIT: 0.75–0.86 of the interpreter's time for Mini, MiniJS
