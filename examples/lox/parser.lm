@@ -190,17 +190,9 @@ fn Parser.consume(p: *Parser, k: T, msg: str) -> Result<(), ()> {
     Err(())
 }
 
-fn Parser.node(p: *Parser, e: Expr, line: u32) -> *Node {
-    let n = p.arena.alloc_bytes(size_of<Node>(), 8) as *Node;
-    *n = Node { e: e, line: line };
-    n
-}
+fn Parser.node(p: *Parser, e: Expr, line: u32) -> *Node { new(&p.arena, Node { e: e, line: line }) }
 
-fn Parser.stmt_box(p: *Parser, s: Stmt) -> *Stmt {
-    let n = p.arena.alloc_bytes(size_of<Stmt>(), 8) as *Stmt;
-    *n = s;
-    n
-}
+fn Parser.stmt_box(p: *Parser, s: Stmt) -> *Stmt { new(&p.arena, s) }
 
 /// Count a constant of the current chunk, as clox would make one.
 fn Parser.constant(p: *Parser) {
@@ -491,12 +483,10 @@ fn Parser.fun_decl(p: *Parser) -> Result<Stmt, ()> {
 }
 
 fn Parser.new_fun(p: *Parser, name: str, kind: FunKind, line: u32) -> *Fun {
-    let f = p.arena.alloc_bytes(size_of<Fun>(), 8) as *Fun;
-    *f = Fun {
+    new(&p.arena, Fun {
         name: name, kind: kind, arity: 0, body: mem.Vec.new(), params: mem.Vec.new(),
         upvals: mem.Vec.new(), slot0: 0, line: line,
-    };
-    f
+    })
 }
 
 /// Parameters and body of a function, in a new FnState.
@@ -543,11 +533,10 @@ fn Parser.class_decl(p: *Parser) -> Result<Stmt, ()> {
     p.constant();
     let target = p.declare(name);
     p.mark_initialized();
-    let d = p.arena.alloc_bytes(size_of<ClassDecl>(), 8) as *ClassDecl;
-    *d = ClassDecl {
+    let d = new(&p.arena, ClassDecl {
         name: name.text, target: target, line: name.line, superclass: None, super_local: 0,
         methods: mem.Vec.new(), nfields: 0,
-    };
+    });
     var cs = ClassState { enclosing: p.cls, has_super: false, fields: mem.Vec.new() };
     p.cls = Some(&cs);
     let r = p.class_body(d, name, &cs);

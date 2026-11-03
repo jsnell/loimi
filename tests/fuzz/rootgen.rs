@@ -6,7 +6,8 @@
 //! binding form (`let`, `var`, `let .. else`, `if let` chains, `while
 //! let`, `match` with guards that collect and or-patterns, `for`, `loop`
 //! with `break` values, `defer`, closures) and with early exits (`return`,
-//! `break`, `continue`, `next`, `raise`, `exit`), around calls that may
+//! `break`, `continue`, `next`, `raise`, `exit`; GC closures `new(heap,
+//! [var st = ..] |i| ..)` whose state the body assigns), around calls that may
 //! collect (`gc(c)`, which collects under GC stress, and generated
 //! functions that call it), in plain functions and in a vm's op handlers,
 //! `cold` blocks, vm functions and `on raise`.
@@ -243,6 +244,14 @@ fn none() -> ?Gc<Node> { None }
 fn each(c: *Ctx, n: i64, f: block fn(i64) -> i64 uses gc) -> i64 uses gc {
     var t: i64 = 0;
     for i in 0..n { t = mix(t, f(i)); gc(c); }
+    t
+}
+
+/// The same with an escaping closure in the GC heap: its environment (the
+/// captures and the closure's own state) is reachable only through `f`.
+fn eachg(c: *Ctx, n: i64, f: Gc<closure fn(i64) -> i64 uses gc>) -> i64 uses gc {
+    var t: i64 = 0;
+    for i in 0..n { gc(c); t = mix(t, f(i)); }
     t
 }
 
@@ -488,8 +497,31 @@ impl Gen {
             Var { name: ca.clone(), t: T::I, mutable: true, depth: fx.scopes.len() + 1 },
         ]);
         let n = 1 + self.r.below(3);
-        let body = self.stmts_n(&mut cfx, 1, 3);
         let ind = "    ".repeat(fx.depth + 2);
+        if self.r.chance(40) {
+            // An escaping GC closure with traced state of its own, which
+            // the body may assign (through the write barrier).
+            let st = self.fresh("st");
+            let tt = *self.r.pick(&TRACED);
+            let init = self.ex(fx, tt, 2);
+            cfx.scopes.last_mut().unwrap().push(Var { name: st.clone(), t: tt, mutable: true, depth: fx.scopes.len() + 1 });
+            let mut body = String::new();
+            if self.r.chance(50) {
+                let e = self.tex(&cfx, tt);
+                body.push_str(&format!("{}{} = {};\n", ind, st, e));
+            }
+            body.push_str(&self.stmts_n(&mut cfx, 1, 3));
+            if self.r.chance(70) {
+                let e = self.tex(&cfx, tt);
+                body.push_str(&format!("{}{} = {};\n", ind, st, e));
+            }
+            let res = digest(tt, &st);
+            return format!(
+                "eachg(c, {}, new(&c.heap, [var {}: {} = {}] |{}| {{\n{}var {}: i64 = {};\n{}{}mix({}, {})\n{}}}))",
+                n, st, tname(tt), init, i, ind, ca, i, body, ind, ca, res, "    ".repeat(fx.depth + 1)
+            );
+        }
+        let body = self.stmts_n(&mut cfx, 1, 3);
         format!("each(c, {}, |{}| {{\n{}var {}: i64 = {};\n{}{}{}\n{}}})", n, i, ind, ca, i, body, ind, ca, "    ".repeat(fx.depth + 1))
     }
 
