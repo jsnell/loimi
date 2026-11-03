@@ -107,8 +107,12 @@ fn next_free(hd: *Header) -> *Header { hd.len as *Header }
 /// may hold objects allocated since then: a minor collection sweeps only
 /// those. `pending`: the chunk still needs sweeping (generational mode
 /// sweeps lazily, when the allocator takes the chunk); `free` and
-/// `nfree` are then meaningless.
-struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool, pending: bool }
+/// `nfree` are then meaningless. `stale`: it has been pending since the
+/// last major collection, so it may hold dead objects marked with the
+/// epoch before, and must be swept before the next flip brings that
+/// epoch back. (Chunks made pending by a minor collection were swept
+/// since.)
+struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool, pending: bool, stale: bool }
 
 /// At the start of each chunk (and 16 bytes before a large object's
 /// header): where the write barrier logs objects.
@@ -341,16 +345,18 @@ fn sweep_chunk(h: *Heap, ch: *Chunk) {
     ch.free = head;
     ch.nfree = nfree;
     ch.pending = false;
+    ch.stale = false;
     h.freed += freed;
     h.count -= freed;
     if h.stats { h.lazy_ns += now_ns() - ts; }
 }
 
-/// Sweep every chunk whose sweep is still pending.
-fn finish_sweep(h: *Heap) {
+/// Sweep the chunks whose sweep is still pending (`all`), or only the
+/// stale ones.
+fn finish_sweep(h: *Heap, all: bool) {
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
-        if ch.pending { sweep_chunk(h, ch); }
+        if ch.pending and (all or ch.stale) { sweep_chunk(h, ch); }
     }
 }
 
@@ -422,7 +428,7 @@ fn add_chunk(h: *Heap, c: u64) {
         hd.len = list as u64;
         list = hd;
     }
-    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true, pending: false });
+    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true, pending: false, stale: false });
     h.free[c] = list;
 }
 
@@ -534,9 +540,12 @@ pub fn collect(h: *Heap) uses gc {
     if h.verify and h.sticky { verify_heap(h); }
     let minor = h.gen and h.sticky and !h.want_major;
     if !minor {
-        // A major collection: first the sweeps deferred from the last
-        // collection, which tell dead from live by the epoch.
-        finish_sweep(h);
+        // A major collection. Chunks still pending since the last major
+        // collection may hold dead objects marked with the epoch that the
+        // flip brings back: sweep them first. (The chunks that minor
+        // collections left pending hold marks of the current epoch or 0,
+        // which the flip turns into dead; they are swept later.)
+        finish_sweep(h, !h.gen);
         if h.sticky {
             if h.gen { new_epoch(h); } else { clear_marks(h); }
         }
@@ -609,7 +618,11 @@ pub fn collect(h: *Heap) uses gc {
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
         if keep {
-            if ch.used or !minor {
+            if !minor {
+                ch.stale = true;
+                ch.pending = true;
+                ch.used = false;
+            } else if ch.used {
                 ch.pending = true;
                 ch.used = false;
             }
