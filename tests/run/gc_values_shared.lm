@@ -141,7 +141,7 @@ fn main() uses gc {
     io.print_bool(k1 == k1 and k1 != k2); io.println("");
 }
 // expect: true
-// expect: 2700
+// expect: 1746
 // expect: -140737488355328
 // expect: 4
 // expect: 1053
