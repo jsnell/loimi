@@ -479,6 +479,17 @@ has the table) took pi from 0.258 s to 0.158 s wall (2.37x Guile ->
 GMP's assembly base cases do a limb product in 1-1.5 cycles, ours (plain
 Loimi, no add-with-carry intrinsic) in about 3.
 
+**Carry-chain base cases (2026-11-03, later).** With the
+`add_carry`/`sub_borrow`/`mul_add_wide` intrinsics (`adc`/`sbb` chains),
+std.bigint's sums are 2.7-3x faster and its products and squares at
+pi's sizes 1.2-1.45x (rows two at a time replace the column sums;
+Karatsuba from 22 limbs, docs/results.md has the details). pi: 0.154 s
+-> 0.140 s wall (1.50x Guile -> 1.36x; inner 1.67x -> 1.52x);
+chudnovsky, mostly a few limbs, 0.178 -> 0.176 s (1.22x). The base case
+now does a limb product in about 3 cycles against GMP's `mulx`/`adx`
+assembly at about 2 on this machine (GMP's whole 26-limb product is
+1.2x faster, its 8-limb quotient 1.6x and 8-limb square root 2.3x).
+
 ## Skipped benchmarks
 
 | benchmark | why |

@@ -335,6 +335,44 @@ number 284 ms (before 1566, CPython 365), `int` of it 156 ms (963,
 666), the 1M by 0.5M-digit `divmod` 91 ms (764, 478), `isqrt` 65 ms
 (588, 635).
 
+## Follow-up (2026-11-03): carry-chain intrinsics in std.bigint
+
+New built-ins `a.add_carry(b, c)` / `a.sub_borrow(b, c)` (`u8`..`u64`,
+`bool` carries) and `a.mul_add_wide(b, c, d)` (`u64`). The first two
+lower to two `llvm.u{add,sub}.with.overflow` steps with the overflows
+or'ed, which LLVM 19 selects as one `adc`/`sbb` (x86-64) or
+`adcs`/`sbcs` (AArch64), chained through the flags when nothing between
+the steps sets them; an `i128` add-with-carry-in does not fold into
+`adc` (LLVM 19 adds the carry separately), and `llvm.x86.addcarry.64`
+is x86-only. std.bigint's base cases use them: `add_n`/`sub_n` four
+limbs a step (the loop compare clobbers the flags, so the carry is
+saved once per four limbs) with a loop-free tail, `addmul_1` /
+`submul_1` / `mul_1` on `mul_add_wide`, and the schoolbook product and
+square row by row two rows a pass (`addmul_2`) instead of column by
+column (Comba), which the new rows beat at every size. With these,
+Karatsuba pays from 22 limbs (was 48), its squaring from 40 (48), and
+divide-and-conquer division from 40 (80). Sums are 2.7-3x faster,
+products and squares of 8 to 1000 limbs 1.2-1.45x, quotients and roots
+of 26 limbs and more 1.1-1.3x (docs/stdlib.md has the table, with
+GMP's numbers: 1.2-1.8x ahead on these). bench/bigint (best of 5, 3
+interleaved runs): fib(100000) 0.41 → 0.30 ms, `str` of 99,722 digits
+8.0 → 6.3 ms, `int` 5.0 → 3.9 ms, the 100k by 21k-digit product 1.65 →
+1.17 ms and `divmod` 3.2 → 2.4 ms (CPython 3.13: 1.7, 32, 17, 7.5,
+15); factorial(5000), products by one limb, unchanged at 1.75 ms.
+Scheme (best of 5, interleaved, `--align 64`, against a build with the
+previous std.bigint):
+
+| benchmark | before | after | guile-nojit | guile | before /guile | after /guile |
+|---|---:|---:|---:|---:|---:|---:|
+| pi (wall) | 0.154 | 0.140 | 0.105 | 0.103 | 1.50 | 1.36 |
+| chudnovsky (wall) | 0.178 | 0.176 | 0.183 | 0.145 | 1.23 | 1.22 |
+| pi (inner) | 0.152 | 0.139 | 0.093 | 0.091 | 1.67 | 1.52 |
+| chudnovsky (inner) | 0.176 | 0.173 | 0.172 | 0.134 | 1.31 | 1.29 |
+
+The compiler change adds only the intrinsics: the release IR of mini,
+minijs, lox, stack, wasm and regex (library and fuzzer) is
+byte-identical to the previous compiler's.
+
 ## Python (2026-11-03)
 
 The python suite was added to `bench/run_all.py` after the run above and

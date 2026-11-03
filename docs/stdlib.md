@@ -465,7 +465,9 @@ first, normalized (no zero limb at the top; zero has no limbs), and a
 sign. Limbs are `u64` because `a.mul_wide(b)` and `hi.div_wide(lo, d)`
 (`std.core`) give the 128-bit products and quotients that 64-bit limbs
 need; that makes multiplication about four times the work per
-instruction of 32-bit limbs (CPython's are 30 bits).
+instruction of 32-bit limbs (CPython's are 30 bits). The base cases are
+carry chains on `add_carry`/`sub_borrow` and `mul_add_wide` (`std.core`,
+"Carry chains"): `adc`/`sbb` on x86-64, `adcs`/`sbcs` on AArch64.
 
 The small case is the interpreter's: an unboxed integer in its value
 type, with overflow checks (`num.add_overflow`, `x.mul_checked(y)`)
@@ -526,20 +528,21 @@ the language's syntax is the caller's).
 **Algorithms.** The thresholds are `pub const`s, in limbs, measured on
 the development machine (2026-11-03, best of 5 of each size on both
 sides of the candidate; within 5% over a wide range in most cases, and
-the values picked from the middle of it):
+the values picked from the middle of it; `KARATSUBA`,
+`KARATSUBA_SQR` and `DIV_DC` retuned after the carry-chain base cases,
+best of 3 interleaved runs of 7 batches):
 
 | operation | algorithm | from |
 |---|---|---|
-| product | schoolbook, row by row (`mul_1`, `addmul_1`) | |
-| | schoolbook, column by column (Comba: each result limb summed in a three-limb accumulator, two of them interleaved to halve the carry chains; 15-20% faster than rows at 16-47 limbs) | 14 (shorter operand) |
-| | Karatsuba | `KARATSUBA` = 48 |
+| product | schoolbook, row by row, two rows a pass (`mul_1`, then `addmul_2`: each pass loads and stores the result once for two limbs of the shorter operand; its loop two limbs a step, so the exit stays predicted). Faster than summing column by column (Comba, used before) at every size: 0-26% at 14-47 limbs | |
+| | Karatsuba | `KARATSUBA` = 22 |
 | | Toom-3 (evaluation at 0, 1, -1, -2, ∞; Bodrato's interpolation; on owned temporaries) | `TOOM3` = 250 |
 | | unbalanced: cut into balanced pieces of the shorter operand's size | |
-| square (both operands the same limbs: `mul(x, x)`, `pow`, and the algorithms below) | schoolbook with each cross product once, rows then columns from 14 | |
-| | Karatsuba squaring (2 a0 a1 = a0² + a1² − (a1 − a0)²) | `KARATSUBA_SQR` = 48 |
+| square (both operands the same limbs: `mul(x, x)`, `pow`, and the algorithms below) | schoolbook with each cross product once, two rows a pass (`addmul_2` after the rows' corner product), then the doubling and the diagonal squares in one pass; 5-19% faster than Comba | |
+| | Karatsuba squaring (2 a0 a1 = a0² + a1² − (a1 − a0)²) | `KARATSUBA_SQR` = 40 |
 | | Toom-3 squaring | `TOOM3_SQR` = 500 |
 | division | Knuth's algorithm D, each quotient limb estimated by Möller and Granlund's division by a precomputed reciprocal (`div_wide` compiles to a `__udivti3` libcall, 2-3x slower) | |
-| | recursive divide and conquer (Burnikel-Ziegler, with GMP's `mpn_dcpi1_div_qr` structure: the quotient's high half from the top halves, recursively, the product of that half by the divisor's low half subtracted, at most a few corrections, then the low half; a long quotient in blocks of the divisor's length): about two products of the same size | `DIV_DC` = 80 (divisor and quotient) |
+| | recursive divide and conquer (Burnikel-Ziegler, with GMP's `mpn_dcpi1_div_qr` structure: the quotient's high half from the top halves, recursively, the product of that half by the divisor's low half subtracted, at most a few corrections, then the low half; a long quotient in blocks of the divisor's length): about two products of the same size | `DIV_DC` = 40 (divisor and quotient) |
 | one-limb divisor | Möller-Granlund, one reciprocal for the whole number | |
 | square root | Zimmermann's Karatsuba square root (GMP's `mpn_dc_sqrtrem`): the root and remainder of the top half recursively, then one division of about n/2 by n/4 limbs and one square of n/4, one correction; on one limb a floating-point estimate and a Newton step | |
 | power | left-to-right binary (squarings) | |
@@ -609,22 +612,24 @@ fn add(h: *gc.Heap, a: Value, b: Value) -> Value {
 ```
 
 Performance (`bench/bigint/bench.lm` against the same work in
-`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine; before:
-schoolbook division and radix conversion, Karatsuba from 32 limbs, no
-squaring routine, 2026-11-03):
+`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine,
+2026-11-03; "subquadratic": before the carry-chain base cases;
+"schoolbook": before that, with schoolbook division and radix
+conversion, Karatsuba from 32 limbs, no squaring routine):
 
-| | std.bigint | before | CPython 3.13 |
-|---|---|---|---|
-| factorial(5000), a running product | 1.8 ms | 1.8 ms | 4.9 ms |
-| fib(100000) by fast doubling | 0.41 ms | 0.58 ms | 1.7 ms |
-| `str` of a 99,722-digit number | 8.0 ms | 19 ms | 32 ms |
-| `int` of it | 5.0 ms | 9.5 ms | 17 ms |
-| product, 99,722 by 20,899 digits | 1.6 ms | 2.0 ms | 7.5 ms |
-| `divmod`, 120,621 by 20,899 digits | 3.2 ms | 6.4 ms | 15 ms |
+| | std.bigint | subquadratic | schoolbook | CPython 3.13 |
+|---|---|---|---|---|
+| factorial(5000), a running product | 1.75 ms | 1.75 ms | 1.8 ms | 4.8 ms |
+| fib(100000) by fast doubling | 0.30 ms | 0.41 ms | 0.58 ms | 1.7 ms |
+| `str` of a 99,722-digit number | 6.3 ms | 8.0 ms | 19 ms | 32 ms |
+| `int` of it | 3.9 ms | 5.0 ms | 9.5 ms | 17 ms |
+| product, 99,722 by 20,899 digits | 1.2 ms | 1.65 ms | 2.0 ms | 7.5 ms |
+| `divmod`, 120,621 by 20,899 digits | 2.4 ms | 3.2 ms | 6.4 ms | 15 ms |
 
-Larger numbers (7^e, best of 3; CPython 3.13 converts big numbers with
-the subquadratic pure-Python `_pylong`, and divides big numbers with it
-too):
+Larger numbers (7^e, best of 3, before the carry-chain base cases,
+which take another 15-25% off at these sizes; CPython 3.13 converts big
+numbers with the subquadratic pure-Python `_pylong`, and divides big
+numbers with it too):
 
 | digits | | str | int | divmod by half size | isqrt |
 |---|---|---|---|---|---|
@@ -649,6 +654,30 @@ n by n limbs, a quotient 2n by n, a root of 2n limbs; before → after):
 | 100 | 8267 → 7105 | 8288 → 4610 | 14850 → 12108 | 24816 → 8260 | 41952 → 19066 |
 | 1000 | 354 → 284 us | 358 → 203 us | 1152 → 573 us | 1171 → 374 us | 1040 → 603 us |
 
+The carry-chain base cases (`add_carry`, `sub_borrow`, `mul_add_wide`;
+rows two at a time instead of columns; thresholds retuned), ns per
+operation through the `*_into` functions (into caller buffers, random
+limbs), before → after, and GMP 6.3's `mpn` functions on the same
+operands in parentheses (`mpn_add_n`, `mpn_mul_n`, `mpn_sqr`,
+`mpn_tdiv_qr`, `mpn_sqrtrem`; best of 5 batches, best of 3 interleaved
+runs, a 3.4-4 GHz Skylake):
+
+| limbs | sum | product | square | quotient 2n by n | isqrt of 2n |
+|---|---|---|---|---|---|
+| 8 | 8 → 5 (4) | 76 → 60 (41) | 63 → 45 (31) | 202 → 201 (125) | 486 → 451 (194) |
+| 26 | 31 → 13 (9) | 635 → 515 (425) | 388 → 316 (242) | 1100 → 1003 (682) | 1406 → 1277 (704) |
+| 52 | 70 → 23 (17) | 2282 → 1714 (1346) | 1518 → 1055 (784) | 3724 → 3229 (2286) | 3091 → 2751 (1719) |
+| 100 | 134 → 50 (30) | 7110 → 5205 (3476) | 4671 → 3195 (2283) | 11533 → 9630 (6753) | 8234 → 7130 (4662) |
+| 1000 | 1354 → 475 (325) | 286 → 200 us (109 us) | 191 → 132 us (73 us) | 560 → 427 us (261 us) | 375 → 288 us (182 us) |
+
+Sums are 2.7-3x faster (an `adc` chain four limbs a step: about 1.7
+cycles a limb against GMP's 1.2), products and squares 1.2-1.45x (the
+base case does a limb product in about 0.8 ns, 3 cycles; GMP's x86-64
+assembly uses `mulx` and the two carry chains of `adcx`/`adox`, which
+need BMI2 and ADX, beyond the baseline x86-64 that Loimi targets). Quotients of up to 16 limbs and decimal formatting are
+unchanged: their time is the quotient-limb estimates and the per-call
+work, not carries.
+
 ### Design (not built)
 
 FFT (Schönhage-Strassen or number-theoretic) multiplication, Toom-4
@@ -659,10 +688,10 @@ precomputed inverses for formatting (GMP-style; formatting is now
 division-bound: a 2n by n division costs about two n by n products),
 a subquadratic (Lehmer or half-gcd) `gcd`, correctly rounded `a / b`
 to `f64`, and in-place operations on an owned `BigInt` (each operation
-returns a new one). The base cases are plain Loimi, so 2-3x behind
-GMP's assembly per limb product (no add-with-carry intrinsic: LLVM
-finds `adc` chains for the column sums but not for `addmul_2`-style
-loops).
+returns a new one). The base cases are carry chains in plain Loimi,
+1.2-1.8x behind GMP's assembly on sums, products and squares (table
+above); quotients of a few limbs are 1.6-3.5x behind (the quotient-limb
+estimates and per-call work).
 
 ## `std.io` and `std.os`
 
