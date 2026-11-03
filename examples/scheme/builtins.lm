@@ -291,6 +291,24 @@ pub fn arith(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> {
     Ok(V.Num(match op { 0 => x + y, 1 => x - y, 2 => x * y, _ => x / y }))
 }
 
+/// `arith` for the ops' cold paths, which are safepoints: a bignum
+/// result is allocated here, so collect if due (the result is a traced
+/// local, the operands are in the vm's registers).
+#[cold]
+pub fn arith_gc(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> uses gc {
+    let r = arith(c, op, a, b)?;
+    if c.heap.allocated > c.heap.threshold { gc.collect(&c.heap); }
+    Ok(r)
+}
+
+/// `intdiv` for the ops' cold paths (see `arith_gc`).
+#[cold]
+pub fn intdiv_gc(c: *Ctx, op: i32, a: V, b: V) -> Result<V, V> uses gc {
+    let r = intdiv(c, op, a, b)?;
+    if c.heap.allocated > c.heap.threshold { gc.collect(&c.heap); }
+    Ok(r)
+}
+
 /// Comparison: op 0 =, 1 <, 2 >, 3 <=, 4 >=. Exact: a bignum and a
 /// flonum compare by their values, not after rounding the bignum.
 pub fn compare(c: *Ctx, op: i32, a: V, b: V) -> Result<bool, V> {
@@ -388,15 +406,6 @@ fn round_like(c: *Ctx, op: i32, v: V) -> Result<V, V> {
 }
 
 fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
-    if let (Int(x), Int(y)) = (a, b) and y >= 0 {
-        var r: i64 = 1;
-        var ok = true;
-        for _ in 0..y as u64 {
-            r = r * x as i64;
-            if r > 2147483647 or r < -2147483648 { ok = false; break; }
-        }
-        if ok { return Ok(V.Int(r as i32)); }
-    }
     if bignum.is_exact(a) and bignum.is_exact(b) and bignum.sign(b) >= 0 {
         // 0, 1 and -1 to any power are small; otherwise the exponent
         // must be a fixnum for the result to fit in memory.
@@ -404,6 +413,16 @@ fn expt(c: *Ctx, a: V, b: V) -> Result<V, V> {
             return Ok(if b == V.Int(0) { V.Int(1) } else { a });
         }
         if a == V.Int(-1) { return Ok(if bignum.is_odd(b) { a } else { V.Int(1) }); }
+        if let (Int(x), Int(y)) = (a, b) {
+            // |x| >= 2: a fixnum result takes at most 31 steps.
+            var r: i64 = 1;
+            var ok = true;
+            for _ in 0..y as u64 {
+                r = r * x as i64;
+                if r > 2147483647 or r < -2147483648 { ok = false; break; }
+            }
+            if ok { return Ok(V.Int(r as i32)); }
+        }
         if let Int(e) = b and let Some(r) = bignum.pow(&c.heap, a, e as u64) { return Ok(r); }
         return Err(rt.err(c, "expt: result too large, exponent", b));
     }

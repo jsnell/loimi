@@ -220,8 +220,8 @@ pub vm Scheme {
     // Arithmetic: fixnum and flonum fast paths; mixed operands, bignums
     // and fixnum overflow (which produces a bignum) go to the cold path.
     // A bignum result is allocated there, so the cold path is also a
-    // safepoint (after the result is stored): a loop of bignum
-    // arithmetic that makes no call or pair still collects.
+    // safepoint (builtins.arith_gc): a loop of bignum arithmetic that
+    // makes no call or pair still collects.
     inline for (name, checked, sym, code) in [
         ("ADD", "add_checked", +, 0),
         ("SUB", "sub_checked", -, 1),
@@ -233,38 +233,22 @@ pub vm Scheme {
                 (Num(x), Num(y)) => { dst = Num(x sym y); next }
                 _ => {}
             }
-            cold {
-            dst = builtins.arith(ctx, code, a, b)?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+            cold { dst = builtins.arith_gc(ctx, code, a, b)?; next }
         }
     }
     /// R[dst] = R[a] + sc (a small signed constant).
     op ADDI(dst: reg, a: reg, sc: simm) : ABsC {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
-        cold {
-            dst = builtins.arith(ctx, 0, a, Int(sc as i32))?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+        cold { dst = builtins.arith_gc(ctx, 0, a, Int(sc as i32))?; next }
     }
     /// quotient, remainder, modulo: fixnums with a positive divisor inline.
     op QUO(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x / y); next }
-        cold {
-            dst = builtins.intdiv(ctx, 0, a, b)?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+        cold { dst = builtins.intdiv_gc(ctx, 0, a, b)?; next }
     }
     op REM(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) and y > 0 { dst = Int(x % y); next }
-        cold {
-            dst = builtins.intdiv(ctx, 1, a, b)?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+        cold { dst = builtins.intdiv_gc(ctx, 1, a, b)?; next }
     }
     op MOD(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
@@ -272,19 +256,11 @@ pub vm Scheme {
             dst = Int(if r < 0 { r + y } else { r });
             next
         }
-        cold {
-            dst = builtins.intdiv(ctx, 2, a, b)?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+        cold { dst = builtins.intdiv_gc(ctx, 2, a, b)?; next }
     }
     op DIV(dst: reg, a: reg, b: reg) : ABC {
         if let (Num(x), Num(y)) = (a, b) { dst = Num(x / y); next }
-        cold {
-            dst = builtins.arith(ctx, 3, a, b)?;
-            if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-            next
-        }
+        cold { dst = builtins.arith_gc(ctx, 3, a, b)?; next }
     }
     inline for (name, sym, code) in [
         ("NUMEQ", ==, 0),

@@ -328,10 +328,11 @@ The benchmarks are the public
 unmodified and downloaded at a pinned commit, and the reference is
 chibi-scheme 0.12 (a bytecode VM) built from source; see
 [`bench/scheme/README.md`](../../bench/scheme/README.md) for how they are
-run, the inputs, all results and the skipped programs. 41 of the 57
-programs the suite's `bench` script runs are included; of the other 16,
-equal, pi, chudnovsky, mbrotZ and bv2string would need a sharing-aware
-`equal?`, bignums, complex numbers or bytevectors, and 11 need file ports.
+run, the inputs, all results and the skipped programs. 43 of the 57
+programs the suite's `bench` script runs are included (pi and chudnovsky,
+which need bignums, since 2026-11-03); of the other 14, equal, mbrotZ and
+bv2string would need a sharing-aware `equal?`, complex numbers or
+bytevectors, and 11 need file ports.
 
 Geometric mean of ours / reference over the 41 programs (wall time,
 whole process; Intel i7-6700, 2026-11-02): Gauche 0.29, Guile 3 without
