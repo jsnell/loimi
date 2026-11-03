@@ -8,7 +8,7 @@ import std.io;
 import std.lex;
 import value;
 import value.{Value, Str, List, Tuple, Dict, Inst, Func, Box,
-              K_CLASS, K_BOUND, K_BIG, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_SET, K_FROZENSET, K_MODULE,
+              K_CLASS, K_BOUND, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_SET, K_FROZENSET, K_MODULE,
               K_PROPERTY, K_STATICM, K_CLASSM, K_SUPER, K_ENUMIT, K_ZIPIT, K_MAPIT, K_FILTERIT, K_DICTVIEW, K_REVIT,
               K_SLICE, K_NOTIMPL, GEN_DONE};
 import big;

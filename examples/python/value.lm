@@ -29,11 +29,11 @@ pub object Func {
     /// The class whose body defined it (for `super()`).
     owner: ?Gc<Box>,
 }
-/// A big integer's limbs and sign (std.bigint's GC object; `Box.s`
+/// A big integer's limbs and sign (std.bigint's GC object; `Long.s`
 /// repeats the sign).
 pub type Limbs = bigint.Big;
 /// Every other kind of object: classes, bound methods, iterators,
-/// generators, cells, big integers, sets, modules, ...
+/// generators, sets, modules, ...
 pub object Box {
     kind: u32,
     id: u32,
@@ -45,7 +45,6 @@ pub object Box {
     c: Value,
     dict: ?Gc<Dict>,
     base: ?Gc<Box>,
-    big: ?Gc<Limbs>,
     extra: [Value],
 }
 
@@ -80,13 +79,13 @@ pub value Value repr nanbox {
 // Box kinds.
 pub const K_CLASS: u32 = 1;
 pub const K_BOUND: u32 = 2;
-pub const K_BIG: u32 = 3;
+// 3 was K_BIG (now `Long`).
 pub const K_RANGE: u32 = 4;
 pub const K_RANGEIT: u32 = 5;
 pub const K_SEQIT: u32 = 6;
 pub const K_DICTIT: u32 = 7;
 pub const K_GEN: u32 = 8;
-pub const K_CELL: u32 = 9;
+// 9 was K_CELL (now `Cell`).
 pub const K_SUPER: u32 = 10;
 pub const K_PROPERTY: u32 = 11;
 pub const K_STATICM: u32 = 12;
@@ -187,7 +186,7 @@ pub fn list_of(h: *gc.Heap, xs: []Value) -> Gc<List> {
 
 pub fn new_box(h: *gc.Heap, kind: u32, n: u64) -> Gc<Box> {
     let b = new(h, Box { kind: kind, id: 0, n: 0, m: 0, s: 0, a: Value.Nil, b: Value.Nil, c: Value.Nil,
-                         dict: None, base: None, big: None }, n);
+                         dict: None, base: None }, n);
     for i in 0..n { b.extra[i] = Value.Nil; }
     b
 }

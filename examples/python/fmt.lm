@@ -5,7 +5,7 @@ import std.text;
 import std.num;
 import value;
 import value.{Value, Str, List, Tuple, Dict, Inst, Func, Box,
-              K_CLASS, K_BOUND, K_BIG, K_RANGE, K_SET, K_FROZENSET, K_MODULE, K_DICTVIEW, K_GEN, K_NOTIMPL};
+              K_CLASS, K_BOUND, K_RANGE, K_SET, K_FROZENSET, K_MODULE, K_DICTVIEW, K_GEN, K_NOTIMPL};
 import big;
 import vm;
 import vm.{Ctx};

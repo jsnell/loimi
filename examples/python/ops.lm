@@ -6,7 +6,7 @@ import std.hash;
 import std.num;
 import value;
 import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box, Limbs,
-              K_CLASS, K_BOUND, K_BIG, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_CELL, K_SUPER,
+              K_CLASS, K_BOUND, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_SUPER,
               K_PROPERTY, K_STATICM, K_CLASSM, K_SET, K_MODULE, K_SLICE, K_ENUMIT, K_ZIPIT, K_MAPIT,
               K_FILTERIT, K_DICTVIEW, K_REVIT, K_NOTIMPL, K_FROZENSET,
               GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
@@ -218,7 +218,6 @@ pub fn type_code(v: Value) -> u32 {
             K_SLICE => vm.T_SLICE,
             K_PROPERTY => vm.T_PROPERTY,
             K_SUPER => vm.T_SUPER,
-            K_CELL => vm.T_CELL,
             K_NOTIMPL => vm.T_NOTIMPL,
             _ => vm.T_ITER,
         },
@@ -238,7 +237,7 @@ pub fn class_name(cls: Gc<Box>) -> str {
 }
 
 pub fn type_name(c: *Ctx, v: Value) -> str {
-    if let Obj(b) = v and b.kind >= K_RANGEIT and b.kind != K_GEN and b.kind != K_CELL and b.kind != K_SUPER and b.kind != K_PROPERTY
+    if let Obj(b) = v and b.kind >= K_RANGEIT and b.kind != K_GEN and b.kind != K_SUPER and b.kind != K_PROPERTY
         and b.kind != K_STATICM and b.kind != K_CLASSM and b.kind != K_SET and b.kind != K_MODULE and b.kind != K_SLICE
         and b.kind != K_NOTIMPL and b.kind != K_FROZENSET {
         return match b.kind {
@@ -1900,7 +1899,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                     b.m = o.m;
                     Ok(Value.Obj(b))
                 }
-                K_CLASS | K_BOUND | K_CELL | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
+                K_CLASS | K_BOUND | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
                     Err(not_iterable(c, v))
                 }
                 _ => Ok(v),  // iterators are their own iterators
