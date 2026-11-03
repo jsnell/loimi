@@ -57,6 +57,9 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Raw string literals** `r"..."` and `r#"..."#`: no escapes, may
+  span lines ([§1.2](docs/language.md#lexical-structure)).
+
 - **Constants in patterns** match their value; the `unreachable_arm`
   warning; or-patterns with bindings
   ([§1.2](docs/language.md#12-basics)).
@@ -120,6 +123,14 @@ implementation; `git log` has the details.
   ([stdlib.md](docs/stdlib.md#ordered-maps-maporderedmap-and-dictdict)).
 - **`mem.try_sort_by`**: a stable sort with a fallible, re-entrant
   comparator ([stdlib.md](docs/stdlib.md#stdmem)).
+- **`std.io.Out`**: buffered output (`print`, `byte`, `print_int`,
+  .., flushed when full and by `flush`)
+  ([stdlib.md](docs/stdlib.md#stdio-and-stdos)).
+- **`std.parse.Ops`**: operator tables changed at run time (Prolog's
+  `op/3`: names, priorities, the seven types, prefix/infix/postfix
+  definitions of one name) and an operator-precedence driver with its
+  hooks as trait methods (`OpHooks`); the Prolog reader uses it
+  ([stdlib.md](docs/stdlib.md#run-time-operator-tables-parseops)).
 
 ### Tooling
 

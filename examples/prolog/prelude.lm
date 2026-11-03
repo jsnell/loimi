@@ -1,22 +1,22 @@
 // The library predicates written in Prolog, consulted at startup. A user
 // program that defines one of these (append/3, say) replaces it.
 //
-// Loimi has no raw strings or file inclusion, so backslashes are doubled.
+// A raw string: Prolog's backslashes (`\+`, `\==`) are written as is.
 
-pub const SOURCE: str = "
+pub const SOURCE: str = r"
 catch(G, _, _) :- '$catch_enter'(L), call(G), '$catch_exit'(L).
 catch(_, C, R) :- '$catch_ball'(C), call(R).
 
 once(G) :- call(G), !.
 ignore(G) :- (call(G) -> true ; true).
-not(G) :- \\+ call(G).
+not(G) :- \+ call(G).
 halt(C) :- '$set_halt'(C), halt.
 
 findall(T, G, L) :- '$fa_begin', '$findall_loop'(T, G), '$fa_end'(L0), L = L0.
 '$findall_loop'(T, G) :- call(G), '$fa_add'(T), fail.
 '$findall_loop'(_, _).
 findall(T, G, L, Tail) :- findall(T, G, L0), append(L0, Tail, L).
-forall(C, A) :- \\+ (call(C), \\+ call(A)).
+forall(C, A) :- \+ (call(C), \+ call(A)).
 
 aggregate_all(count, G, C) :- !, findall(x, G, L), '$length'(L, C).
 aggregate_all(sum(E), G, S) :- !, findall(E, G, L), sum_list(L, S).
@@ -32,8 +32,8 @@ bagof(T, G, L) :-
     '$bag_goal'(G, G1, [], B), term_variables(T+B, TV), term_variables(G1, GV),
     '$vars_minus'(GV, TV, W),
     (   W == []
-    ->  findall(T, G1, L), L \\== []
-    ;   Wt =.. ['$w'|W], findall(Wt-T, G1, Pairs), Pairs \\== [],
+    ->  findall(T, G1, L), L \== []
+    ;   Wt =.. ['$w'|W], findall(Wt-T, G1, Pairs), Pairs \== [],
         keysort(Pairs, Sorted), '$groups'(Sorted, Groups), '$member'(Wt-L, Groups)
     ).
 setof(T, G, S) :- bagof(T, G, L), sort(L, S).
@@ -54,7 +54,7 @@ clause(H, B) :- '$clause_gen'(H, G), '$clause_iter'(H, G, -1, R), '$clause'(R, H
 '$clause_parts'(C, H, B) :- nonvar(C), C = (H :- B), !.
 '$clause_parts'(H, H, true).
 retractall(H) :- '$clause_gen'(H, G), '$retractall'(H, G, -1).
-'$retractall'(H, G, P) :- ( '$clause_next'(H, G, P, R) -> ( \\+ \\+ '$clause'(R, H, _) -> '$erase'(R) ; true ), '$retractall'(H, G, R) ; true ).
+'$retractall'(H, G, P) :- ( '$clause_next'(H, G, P, R) -> ( \+ \+ '$clause'(R, H, _) -> '$erase'(R) ; true ), '$retractall'(H, G, R) ; true ).
 
 between(L, H, X) :- integer(X), !, X >= L, X =< H.
 between(L, inf, X) :- !, '$between_inf'(L, X).
@@ -142,7 +142,7 @@ foldl(G, L1, L2, A0, A) :- '$foldl'(L1, L2, G, A0, A).
 '$foldl'([], [], _, A, A).
 '$foldl'([X|Xs], [Y|Ys], G, A0, A) :- call(G, X, Y, A0, A1), '$foldl'(Xs, Ys, G, A1, A).
 delete([], _, []).
-delete([H|T], X, R) :- ( H \\= X -> R = [H|R1] ; R = R1 ), delete(T, X, R1).
+delete([H|T], X, R) :- ( H \= X -> R = [H|R1] ; R = R1 ), delete(T, X, R1).
 subtract([], _, []).
 subtract([H|T], L, R) :- ( memberchk(H, L) -> R = R1 ; R = [H|R1] ), subtract(T, L, R1).
 intersection([], _, []).
@@ -209,7 +209,7 @@ phrase(G, L, R) :- '$dcg_body'(G, S0, S, Goal), S0 = L, S = R, call(Goal).
 '$dcg_body'((A, B), S0, S, (A1, B1)) :- !, '$dcg_body'(A, S0, S1, A1), '$dcg_body'(B, S1, S, B1).
 '$dcg_body'((A ; B), S0, S, (A1 ; B1)) :- !, '$dcg_body'(A, S0, S, A1), '$dcg_body'(B, S0, S, B1).
 '$dcg_body'((A -> B), S0, S, (A1 -> B1)) :- !, '$dcg_body'(A, S0, S1, A1), '$dcg_body'(B, S1, S, B1).
-'$dcg_body'(\\+ A, S0, S, (\\+ A1, S0 = S)) :- !, '$dcg_body'(A, S0, _, A1).
+'$dcg_body'(\+ A, S0, S, (\+ A1, S0 = S)) :- !, '$dcg_body'(A, S0, _, A1).
 '$dcg_body'({G}, S0, S, (G, S0 = S)) :- !.
 '$dcg_body'(!, S0, S, (!, S0 = S)) :- !.
 '$dcg_body'([], S0, S, S0 = S) :- !.
