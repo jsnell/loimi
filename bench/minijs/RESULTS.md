@@ -1,5 +1,8 @@
 # MiniJS results
 
+(See [`docs/results.md`](../../docs/results.md) for current numbers,
+all dispatch modes and the JIT, measured 2026-11-03.)
+
 `bench/minijs/compare.py -n 3 --align 64` on 2026-11-02, at the end of
 the performance pass below, tailcall dispatch. Times are the minimum
 wall-clock time over 3 runs, in seconds, and every output is checked.
