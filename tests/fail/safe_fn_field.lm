@@ -1,0 +1,12 @@
+// error: reading the pointer `Holder.cb`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f(h: *lib.Holder) {
+    var x: u8 = 0;
+    let cb = h.cb;  // a callback that expects lib's pointers
+    cb(&x);
+}
+
+fn main() {}

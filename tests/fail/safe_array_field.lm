@@ -1,0 +1,8 @@
+// error: reading the pointer `Holder.arr`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f(h: *lib.Holder) -> *u8 { h.arr[0] }
+
+fn main() {}

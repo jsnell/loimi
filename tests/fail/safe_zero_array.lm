@@ -1,0 +1,9 @@
+// error: making a null pointer (field `a`)
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+struct S { a: [*u8; 2] }
+fn f() -> S { S { ..zero } }
+
+fn main() {}

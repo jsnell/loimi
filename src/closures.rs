@@ -342,12 +342,14 @@ impl<'a> Checker<'a> {
                     cx.unsafe_depth += 1;
                     let r = self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span);
                     cx.unsafe_depth -= 1;
-                    r.map_err(|d| {
+                    let r = r.map_err(|d| {
                         d.note(alloc.span, format!(
                             "the environment of `new(a, |..| ..)` is allocated with `a.alloc_bytes(size: u64, align: u64) -> *u8` (`a` is `{}`; `*mem.Arena` has one), or in the GC heap if `a` is a `*gc.Heap`",
                             at
                         ))
-                    })?
+                    })?;
+                    self.check_trusted_alloc(cx, &r, &at, span)?;
+                    r
                 }
                 // Inside a generic body checked against its bounds: no code.
                 None => a,
@@ -431,6 +433,7 @@ impl<'a> Checker<'a> {
         if !matches!(mem.ty, Ty::Ptr(_)) {
             return Err(Diag::new(alloc.span, "`alloc_bytes` must return a pointer (`*u8`)"));
         }
+        self.check_trusted_alloc(cx, &mem, &an, span)?;
         let pt = Ty::Ptr(Box::new(t.clone()));
         cx.scopes.push(vec![]);
         let x = cx.declare("new value", t.clone(), false);

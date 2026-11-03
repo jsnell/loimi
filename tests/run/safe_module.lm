@@ -27,6 +27,17 @@ fn sum(list: ?*Node) -> i64 {
 
 fn first(xs: []i64) -> i64 { xs[0] }
 
+// This module's own enum may carry and give back a pointer (another
+// module's may not: its pointers mean what that module says).
+enum Ref { To(*i64), Nowhere }
+
+fn deref(r: Ref) -> i64 {
+    match r {
+        Ref.To(q) => *q,
+        Ref.Nowhere => 0,
+    }
+}
+
 fn main() -> i32 {
     var arena = mem.Arena.new();
     var list: ?*Node = None;
@@ -57,10 +68,12 @@ fn main() -> i32 {
     // An escape hatch, justified: the buffer holds `v.len` values.
     let raw = unsafe { v.items().ptr[1] };
     io.print_int(t + raw);
+    io.print(" ");
+    io.print_int(deref(Ref.To(&t)) + deref(Ref.Nowhere));
     io.println("");
     v.free();
     c.hits.free();
     arena.free();
     0
 }
-// expect: 10 6 80 17
+// expect: 10 6 80 17 11

@@ -1,0 +1,11 @@
+// error: reading the pointer `Holder.tup`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f(h: *lib.Holder) -> *u8 {
+    let (p, _) = h.tup;  // destructuring a tuple field: still a field read
+    p
+}
+
+fn main() {}

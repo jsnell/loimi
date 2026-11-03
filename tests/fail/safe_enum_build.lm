@@ -1,0 +1,11 @@
+// error: building a variant of `Buf`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f() -> lib.Buf {
+    var b: u8 = 0;
+    lib.Buf.Bytes(&b, 100)  // one byte, claimed to be 100
+}
+
+fn main() {}

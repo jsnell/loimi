@@ -1,0 +1,8 @@
+// error: writing `Outer.inner`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f(o: *lib.Outer, i: lib.Inner) { o.inner = i; }
+
+fn main() {}

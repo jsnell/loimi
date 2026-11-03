@@ -35,7 +35,10 @@ outside `unsafe { }`:
 | passing, storing, comparing pointers; `p as u64` | casts that forge a tag or a reference: integer to `enum` or `value` |
 | methods of other modules' structs; reading their non-pointer fields | reading a raw-pointer field of *another module's* struct (`v.ptr`), or a slice's `.ptr` |
 | | writing any field of another module's struct that has raw-pointer fields (`v.len = 0`), `&v.len`, mutating methods on such a field (`a.chunks.push(..)`), or building one with a literal |
-| | `..zero` that makes a null `*T` (use `?*T`) |
+| this module's enums with pointer payloads | binding a pointer payload of *another module's* enum or `value` type in a pattern (`lib.Buf.Bytes(p, _)`; `_` is fine), or building such a variant |
+| | `..zero` or a `var` without initializer that makes a null `*T` (use `?*T`), also inside arrays, tuples and structs, and null `fn`s and `Gc`s |
+| `new(&arena, v)` | `new(&a, v)` with an allocator whose `alloc_bytes` is not `#[raw]` (nothing promises it returns `size` bytes) |
+| | declaring a `vm` (its handlers are exempt: put it in another module) |
 | | `assume(c)` and `unreachable` (undefined behavior if wrong; `trap()` is fine) |
 | | calling (or naming) an `extern "C"` function or a function marked `#[raw]` |
 | | calling an `#[unsafe]` function (as everywhere) |
@@ -76,7 +79,11 @@ in another module carries that module's invariants (`Vec`: `ptr` holds
 `cap` values, `len <= cap`); its own `unsafe` blocks rely on them. A
 safe module may read its non-pointer fields (`v.len`) and call its
 methods, but not write its fields, take their address, read its
-pointers or build one with a literal. Copying a whole value is allowed
+pointers or build one with a literal. "Raw-pointer field" means a field
+whose type holds a `*T` by value (`*T`, `?*T`, and tuples, arrays and
+options of them, and function types taking or returning one), and "a
+struct with raw-pointer fields" is transitive through struct and enum
+fields (a struct holding a `Vec` is one). Copying a whole value is allowed
 (that is the aliasing part of the lifetime hole, section 3). This holds
 for structs of other *safe* modules too: their `unsafe` blocks rely on
 their invariants.
@@ -84,6 +91,8 @@ their invariants.
 **Exempt:** vm code (handlers, vm functions: their operand accesses are
 unchecked because the verifier ran, section 6 of language.md), code
 generated from a `vm` declaration, and every module without `#![safe]`.
+Since handler bodies are exempt, a `#![safe]` module cannot declare a
+`vm` at all.
 Generic functions are checked as their defining module says: a safe
 module's generic body is checked; `mem.Vec.push` instantiated from a
 safe module is not (it is `mem`'s code).
@@ -127,9 +136,28 @@ unsafe { write(fd, s.ptr, s.len) }
    x86-64/AArch64 Linux, but LLVM treats the load as undefined.
 5. **Data races.** Not addressed (`std.gil` serializes guest threads;
    atomics are allowed on any `*T`).
-6. **Struct patterns.** `let Vec { ptr, .. } = v` reads `ptr` without
-   going through the field rule (destructuring other modules' structs
-   with raw pointers is rare; not checked).
+6. **Invariants without raw pointers.** The field rule protects structs
+   that hold a raw pointer (directly or through a field of struct, enum,
+   tuple, array or option type). Another module's struct whose fields
+   are only slices and integers can be written field by field; a module
+   whose `unsafe` code relies on an invariant between such fields (an
+   index field below a slice's length, read through `.ptr`) must keep
+   them private behind a raw pointer or check them. No std module does.
+7. **Asserted contracts.** `#[raw]` on a safe module's own function is
+   an unchecked claim, like Rust's `unsafe impl`: `new(&a, v)` trusts an
+   `alloc_bytes` marked `#[raw]` to return `size` bytes, and its body is
+   checked like any other but nothing checks that promise.
+8. **Conservative cases.** A generic struct or enum of another module
+   instantiated with the safe module's own pointer type (`lib.Box<*u8>`)
+   counts as foreign: reading `b.v` is flagged though the pointer came
+   from the safe module. A struct of the safe module that reaches it
+   through another module's generic type (`lib.Lookup<Mine>` bound in a
+   pattern) is not followed: its pointer fields are its own module's.
+
+Section 3a lists the adversarial pass that closed the other bypasses
+(struct-destructuring was on this list: Loimi has no struct patterns,
+`let Vec { ptr, .. } = v` does not parse, but tuple fields, arrays of
+pointers and enum payloads were real bypasses).
 
 ## 3. Audit of std (before this work)
 
@@ -187,6 +215,34 @@ capacity, so a later lookup on the same map read freed memory (section
 accessors (`Vec.ptr_at`, `Vec.items`, `map.get_ptr`, `OrderedMap.entry`,
 `next`, `diag.SourceMap.file`, `diag.Diagnostics.at`) valid until the
 next growth, and `Arena.free`.
+
+## 3a. Adversarial pass (closing bypasses)
+
+Programs that try to reach raw memory in a `#![safe]` module without
+`unsafe` (each is a `tests/fail/safe_*.lm` now, or was already
+rejected). "Was" is the compiler before this pass.
+
+| attempt | was | now |
+|---|---|---|
+| `let (p, _) = h.tup` / `h.tup.0` on another module's `(*u8, u64)` field | allowed | rejected: a field whose type holds a pointer through a tuple, array, option or function type is a pointer field |
+| `h.arr[0]` on `[*u8; 2]` (e.g. `gc.Heap.free`) | allowed | rejected (same) |
+| `let cb = h.cb; cb(&x)` on a `fn(*u8)` field (a callback expecting that module's pointers) | allowed | rejected (same) |
+| `match b { lib.Buf.Bytes(p, _) => p }` (another module's enum or `value` type with a pointer payload) | allowed | rejected; `Bytes(_, n)` is fine |
+| `lib.Buf.Bytes(&one_byte, 100)` (building such a variant) | allowed | rejected, like a struct literal |
+| `o.inner = i` where `Outer { inner: Inner }`, `Inner { p: *u8 }` | allowed | rejected: "has raw-pointer fields" is transitive |
+| `var p: *u8;` / `var s: S;` (zero-initialized: a null pointer) | allowed | rejected (also a null `fn`, `Gc`, through arrays, tuples, structs) |
+| `S { ..zero }` with a `[*u8; 2]` or `(*u8, u8)` field | allowed | rejected (only a direct `*T` field was) |
+| `new(&a, v)` / `new(&a, \|..\| ..)` with a safe module's allocator whose `alloc_bytes` returns `&one_byte` | allowed (heap overflow) | rejected unless `alloc_bytes` is `#[raw]` (`mem.Arena`, `mem.Malloc` are) |
+| a `vm` declared in a `#![safe]` module (handler bodies are exempt) | allowed | rejected: declare it in a module of its own |
+| `p[i]` in a closure, a `defer`, an `inline for` body, a generic function instantiated with `*u8` | rejected | rejected |
+| `p as fn() -> u64`, `x as fn() -> u64`, `s as []u64` | rejected (no such casts) | — |
+| `const P: *u8 = 0 as *u8` used; `var G: *u8 = 0 as *u8` | rejected | rejected (an unused constant is never checked, and makes no code) |
+| calling `#[raw]` `alloc_bytes` through an unbounded generic (`fn al<X>(a: *X) { a.alloc_bytes(..) }`) | rejected | rejected (checked per instance) |
+| `c.free(&malloc)` on a `closure fn` (frees through `Malloc.free_bytes`) | rejected | rejected |
+| `x as V` for a `value` type | rejected | rejected |
+
+None of the std safe modules needed a change, and no example's IR
+changed (the checks only reject programs).
 
 ## 4. Migration
 

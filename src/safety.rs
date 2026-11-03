@@ -19,14 +19,23 @@ use crate::check::{Checker, FnCx};
 use crate::diag::{Diag, Res, Span};
 use crate::tir::{TExpr, Ty, TK};
 
-/// A type that holds a raw pointer directly: `*T` or `?*T`.
+/// A type whose values hand out a raw pointer when read or destructured:
+/// `*T`, `?*T`, and tuples, arrays and options of them, and function
+/// types that take or return one (a callback stored in a struct expects
+/// that module's pointers). Structs and enums are not followed: their
+/// own fields and payloads are guarded where they are read (a foreign
+/// struct's fields, a foreign enum's payloads).
 pub fn holds_ptr(t: &Ty) -> bool {
     match t {
         Ty::Ptr(_) => true,
-        Ty::Option(i) => matches!(**i, Ty::Ptr(_)),
+        Ty::Option(i) | Ty::Array(i, _) => holds_ptr(i),
+        Ty::Result(a, b) => holds_ptr(a) || holds_ptr(b),
+        Ty::Tuple(ts) => ts.iter().any(holds_ptr),
+        Ty::Fn(ps, r, _) | Ty::Closure(ps, r, _) => ps.iter().any(holds_ptr) || holds_ptr(r),
         _ => false,
     }
 }
+
 
 impl Checker<'_> {
     /// Whether raw-pointer operations are checked here: a `#![safe]`
@@ -64,13 +73,123 @@ impl Checker<'_> {
     /// its fields hold that module's invariants (`Vec.len` <= `Vec.cap`),
     /// which the module's own `unsafe { }` blocks may rely on (so this
     /// holds for structs of other safe modules too).
+    ///
+    /// "Has a raw-pointer field" is transitive through fields of struct
+    /// and enum type (`Outer { inner: Inner }` with `Inner { p: *u8 }`,
+    /// a struct holding a `Vec`), since the outer module's invariants may
+    /// tie the inner pointers to its other fields.
     pub fn foreign_raw_struct(&self, cx: &FnCx, t: &Ty) -> bool {
         let Ty::Struct(sid) = t else { return false };
         let Some(&m) = self.struct_module.get(sid) else { return false };
         if m == cx.module {
             return false;
         }
-        self.prog.structs[*sid as usize].fields.iter().any(|(_, t)| holds_ptr(t))
+        self.prog.structs[*sid as usize].fields.iter().any(|(_, t)| self.deep_raw(t, 0))
+    }
+
+    /// Whether `t` contains a raw pointer anywhere by value: through
+    /// tuples, arrays, options, struct fields and enum payloads (not
+    /// behind a pointer, a slice or a `Gc`).
+    pub fn deep_raw(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match t {
+            _ if holds_ptr(t) => true,
+            Ty::Option(i) | Ty::Array(i, _) => self.deep_raw(i, depth + 1),
+            Ty::Result(a, b) => self.deep_raw(a, depth + 1) || self.deep_raw(b, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.deep_raw(t, depth + 1)),
+            Ty::Struct(s) => self.prog.structs[*s as usize].fields.iter().any(|(_, t)| self.deep_raw(t, depth + 1)),
+            Ty::Enum(e) => self.prog.enums[*e as usize].variants.iter().any(|v| v.fields.iter().any(|t| self.deep_raw(t, depth + 1))),
+            _ => false,
+        }
+    }
+
+    /// Whether the zero value of `t` (`..zero`, a `var` without
+    /// initializer) holds a null reference that is not an option: a `*T`,
+    /// a function, a `Gc`, through arrays, tuples, struct fields and the
+    /// first variant's payload (`?*T`'s zero is None).
+    pub fn zero_is_null_ptr(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match t {
+            Ty::Ptr(_) | Ty::Fn(..) | Ty::Closure(..) | Ty::Gc(_) => true,
+            Ty::Array(i, _) => self.zero_is_null_ptr(i, depth + 1),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.zero_is_null_ptr(t, depth + 1)),
+            Ty::Struct(s) => self.prog.structs[*s as usize].fields.iter().any(|(_, t)| self.zero_is_null_ptr(t, depth + 1)),
+            Ty::Enum(e) => self.prog.enums[*e as usize].variants.first().is_some_and(|v| v.fields.iter().any(|t| self.zero_is_null_ptr(t, depth + 1))),
+            _ => false,
+        }
+    }
+
+    /// `new(a, v)` (and `new(a, |..| ..)`) trust `a.alloc_bytes(size,
+    /// align)` to return `size` writable bytes: in a `#![safe]` module,
+    /// only an `alloc_bytes` marked `#[raw]` (`mem.Arena`, `mem.Malloc`)
+    /// says so. A plain one could return `&one_byte`, and `new` would
+    /// write past it. `call` is the checked `alloc_bytes` call.
+    pub fn check_trusted_alloc(&self, cx: &FnCx, call: &TExpr, an: &str, span: Span) -> Res<()> {
+        if !self.safe_here(cx) {
+            return Ok(());
+        }
+        if let TK::Call(f, _) = &call.kind {
+            if let TK::FnRef(id) = f.kind {
+                if self.raw_fns.contains(&id) {
+                    return Ok(());
+                }
+            }
+        }
+        self.raw_op(
+            cx,
+            span,
+            "raw_call",
+            || format!("`new(a, ..)` with an allocator whose `alloc_bytes` is not `#[raw]` (`a` is `{}`)", an),
+            "mark `alloc_bytes` `#[raw]` (its contract: it returns `size` writable bytes aligned to `align`), or use `mem.Arena` or `mem.Malloc`",
+        )
+    }
+
+    /// The module declaring enum or `value` type `t`, if it is one.
+    fn sum_module(&self, t: &Ty) -> Option<usize> {
+        match t {
+            Ty::Enum(e) => self.enum_module.get(e).copied(),
+            Ty::Value(v) => self.value_module.get(v).copied(),
+            _ => None,
+        }
+    }
+
+    /// Building variant `idx` of `t` (`lib.E.Buf(p, n)`): a raw-pointer
+    /// operation if `t` is another module's enum or `value` type and the
+    /// variant's payload holds a raw pointer (it means what that module
+    /// says: a buffer, a sentinel).
+    pub fn check_variant_build(&self, cx: &FnCx, t: &Ty, fields: &[Ty], span: Span) -> Res<()> {
+        if !self.safe_here(cx) || !fields.iter().any(holds_ptr) || self.sum_module(t).is_none_or(|m| m == cx.module) {
+            return Ok(());
+        }
+        let n = self.ty_name(t);
+        self.raw_op(
+            cx,
+            span,
+            "struct_lit",
+            || format!("building a variant of `{}` (another module's type) with a raw-pointer payload", n),
+            "use its module's functions to make one",
+        )
+    }
+
+    /// Binding a payload of type `ft` from a variant of `t` in a pattern
+    /// (`match e { lib.E.Buf(p, n) => .. }`): reading a raw pointer that
+    /// another module's enum holds, as `v.ptr` is for a struct.
+    pub fn check_variant_bind(&self, cx: &FnCx, t: &Ty, ft: &Ty, span: Span) -> Res<()> {
+        if !self.safe_here(cx) || !holds_ptr(ft) || self.sum_module(t).is_none_or(|m| m == cx.module) {
+            return Ok(());
+        }
+        let n = self.ty_name(t);
+        self.raw_op(
+            cx,
+            span,
+            "ptr_field",
+            || format!("binding a raw-pointer payload of `{}` (another module's type)", n),
+            "use `_` for the pointer, or the methods of its module",
+        )
     }
 
     fn field_name(&self, t: &Ty, idx: u32) -> String {

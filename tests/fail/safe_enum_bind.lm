@@ -1,0 +1,13 @@
+// error: binding a raw-pointer payload of `Buf`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f(b: lib.Buf) -> *u8 {
+    match b {
+        lib.Buf.Bytes(p, _) => p,
+        _ => trap(),
+    }
+}
+
+fn main() {}

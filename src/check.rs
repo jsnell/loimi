@@ -176,6 +176,10 @@ pub struct Checker<'a> {
     /// The module declaring each struct (generic instances too), for the
     /// `#![safe]` rule on other modules' structs with raw pointers.
     pub struct_module: HashMap<u32, usize>,
+    /// The same for enums and `value` types (variants with raw-pointer
+    /// payloads).
+    pub enum_module: HashMap<u32, usize>,
+    pub value_module: HashMap<u32, usize>,
     /// Generated source files (vm expansions): exempt from `#![safe]`.
     pub generated_files: std::collections::HashSet<u32>,
     /// `LOIMI_SAFETY_AUDIT=1`: every module is checked as if `#![safe]`,
@@ -277,6 +281,8 @@ impl<'a> Checker<'a> {
             struct_files: HashMap::new(),
             raw_fns: Default::default(),
             struct_module: HashMap::new(),
+            enum_module: HashMap::new(),
+            value_module: HashMap::new(),
             generated_files: Default::default(),
             safety_audit: std::env::var_os("LOIMI_SAFETY_AUDIT").map(|_| Default::default()),
             encoder_notes: HashMap::new(),
@@ -381,6 +387,7 @@ impl<'a> Checker<'a> {
                     }
                     Item::Enum(e) => {
                         let id = self.prog.enums.len() as u32;
+                        self.enum_module.insert(id, m);
                         self.prog.type_spans.insert(format!("{}.{}", prefix, e.name.name), e.name.span);
                         if let Some(c) = &e.c_name {
                             self.prog.c_names.insert(format!("{}.{}", prefix, e.name.name), c.clone());
@@ -394,6 +401,7 @@ impl<'a> Checker<'a> {
                     }
                     Item::Value(v) => {
                         let id = self.prog.values.len() as u32;
+                        self.value_module.insert(id, m);
                         self.prog.values.push(ValueDef {
                             name: format!("{}.{}", prefix, v.name.name),
                             repr: ValueRepr::NanBox,
@@ -433,6 +441,12 @@ impl<'a> Checker<'a> {
                         self.define(m, &g.name, Def::Global(id), g.is_pub)?;
                     }
                     Item::Vm(v) => {
+                        if self.modules[m].safe {
+                            return Err(Diag::new(
+                                v.name.span,
+                                "a `vm` cannot be declared in a `#![safe]` module: its handlers' operand accesses rest on the verifier, not on this check; declare it in a module of its own",
+                            ));
+                        }
                         let id = self.vm_decls.len() as u32;
                         self.vm_decls.push((m, (**v).clone()));
                         self.define(m, &v.name, Def::Vm(id), v.is_pub)?;
@@ -1512,6 +1526,10 @@ impl<'a> Checker<'a> {
                         if init.is_none() && !mutable {
                             return Err(Diag::new(*span, "a `let` binding needs an initializer"));
                         }
+                        if init.is_none() && self.zero_is_null_ptr(&t, 0) {
+                            let n = name.clone();
+                            self.raw_op(cx, *span, "zero_ptr", || format!("a `var` without initializer making a null pointer (`{}`)", n), "give it a value, or declare it `?*T` (None is the null pointer)")?;
+                        }
                         let id = cx.declare(name, t, *mutable || *pm);
                         stmts.push(TStmt::Let(id, init));
                     } else {
@@ -1809,6 +1827,9 @@ impl<'a> Checker<'a> {
                 }
                 let mut out = Vec::new();
                 for (ap, ft) in args.iter().zip(fields.iter()) {
+                    if !matches!(ap.kind, PatKind::Wild) {
+                        self.check_variant_bind(cx, ty, ft, ap.span)?;
+                    }
                     out.push(self.pat(cx, ap, ft, mutable)?);
                 }
                 TPK::Variant(idx, out)
@@ -2115,7 +2136,7 @@ impl<'a> Checker<'a> {
                                     ),
                                 ));
                             }
-                            if matches!(fty, Ty::Ptr(_)) {
+                            if self.zero_is_null_ptr(fty, 0) {
                                 let f = fname.clone();
                                 self.raw_op(cx, *rs, "zero_ptr", || format!("`..zero` making a null pointer (field `{}`)", f), "declare the field `?*T` (None is the null pointer), or give it a value")?;
                             }
@@ -3164,6 +3185,7 @@ impl<'a> Checker<'a> {
         if fields.len() != args.len() {
             return Err(Diag::new(span, format!("variant expects {} argument(s), got {}", fields.len(), args.len())));
         }
+        self.check_variant_build(cx, ty, &fields, span)?;
         let mut out = Vec::new();
         for (a, ft) in args.iter().zip(fields.iter()) {
             out.push(self.expr_coerce(cx, a, ft)?);

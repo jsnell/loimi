@@ -1,0 +1,6 @@
+// Helper for the safe_*.lm tests: a module (not #![safe]) whose types
+// hold raw pointers in ways the field rule must see through.
+pub struct Holder { tup: (*u8, u64), arr: [*u8; 2], cb: fn(*u8), n: u64 }
+pub struct Inner { p: *u8 }
+pub struct Outer { inner: Inner, n: u64 }
+pub enum Buf { Bytes(*u8, u64), Empty }

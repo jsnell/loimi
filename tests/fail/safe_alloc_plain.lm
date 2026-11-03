@@ -1,0 +1,13 @@
+// error: with an allocator whose `alloc_bytes` is not `#[raw]`
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+struct OneByte { b: u8 }
+fn OneByte.alloc_bytes(a: *OneByte, size: u64, align: u64) -> *u8 { &a.b }  // ignores size
+fn f() -> *[u64; 8] {
+    var a = OneByte { b: 0 };
+    new(&a, [0 as u64; 8])
+}
+
+fn main() {}

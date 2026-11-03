@@ -1,0 +1,11 @@
+// error: a `var` without initializer making a null pointer
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+fn f() -> u8 {
+    var p: *u8;
+    *p
+}
+
+fn main() {}

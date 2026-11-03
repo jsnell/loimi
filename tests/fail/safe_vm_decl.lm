@@ -1,0 +1,13 @@
+// error: a `vm` cannot be declared in a `#![safe]` module
+#![safe]
+import safe_mod.lib;
+import std.mem;
+
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op NOP() : A { next }
+    entry run(code: *u32) -> u64 { jump code }
+}
+
+fn main() {}
