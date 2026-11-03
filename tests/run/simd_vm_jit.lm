@@ -1,0 +1,38 @@
+// simd_vm.lm's vm built with --jit-stencils (and run with the JIT on):
+// vector operand kinds and a vector state register in stencils.
+// matrix: jit
+import std.io;
+import std.mem;
+
+vm M {
+    state { pc: *u32, regs: *u64, acc: i32x4 }
+    // A vector in two 8-byte slots: 8-byte aligned only.
+    operand vi = *((regs + it) as *i32x4);
+    operand vf = *((regs + it) as *f32x4);
+    operand r = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op VADD(d: vi, a: vi, b: vi) : ABC { d = a + b; next }
+    op VMULF(d: vf, a: vf, b: vf) : ABC { d = a * b; next }
+    op ACC(a: vi) : ABC { acc = acc + a; next }
+    op STACC(d: vi) : ABC { d = acc; next }
+    op SUM(d: r, a: vi) : ABC { d = (a.lane(0) +% a.lane(1) +% a.lane(2) +% a.lane(3)) as u64; next }
+    op RET(a: r) : ABC { exit a }
+    entry run(code: *u32, rr: *u64) -> u64 { regs = rr; acc = i32x4.splat(0); jump code }
+}
+
+fn main() {
+    let regs: *u64 = mem.alloc(16);
+    let v = (regs + 1) as *i32x4;
+    *v = i32x4.new(1, 2, 3, 4);
+    *((regs + 3) as *i32x4) = i32x4.splat(10);
+    var code: [u32; 8] = [0; 8];
+    code[0] = M.VADD(5, 1, 3);
+    code[1] = M.ACC(5);
+    code[2] = M.ACC(5);
+    code[3] = M.STACC(7);
+    code[4] = M.SUM(0, 7);
+    code[5] = M.RET(0);
+    io.print_int(M.run(&code as *u32, regs) as i64);
+    io.println("");
+}
+// expect: 100
