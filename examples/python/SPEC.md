@@ -107,8 +107,8 @@ class attributes, methods, `__init__`, `super()` (zero-argument in
 methods, two-argument `super(C, self)`), `@staticmethod`,
 `@classmethod`, `@property` with `.setter`, `__slots__` (accepted and
 ignored), class attributes set after the class is created, dynamic
-instance attributes, `__dict__` (of an instance: a copy, so storing
-into it does not change the instance; same for `vars(obj)`),
+instance attributes, `__dict__` and `vars(obj)` (the live attribute
+dict, any keys; assigning `obj.__dict__` replaces it),
 `__class__`, `__name__`.
 
 Special methods: `__init__ __repr__ __str__ __eq__ __ne__ __lt__ __le__

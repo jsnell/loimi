@@ -803,7 +803,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         Globals => Ok(Value.Dict(c.globals.unwrap())),
         Vars => {
-            if let Inst(i) = args[0] { return Ok(Value.Dict(value.attrs_dict(&c.heap, i.dict))); }
+            if let Inst(i) = args[0] { return Ok(Value.Dict(ops.inst_dict(c, i))); }
             Err(exc(c, E_TYPE, "vars() argument must have __dict__ attribute"))
         }
         Input => Err(exc(c, E_EOF, "EOF when reading a line")),

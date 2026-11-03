@@ -20,8 +20,9 @@ pub object Tuple { items: [Value] }
 pub type Dict = dict.Dict<Value, Value>;
 /// Instance attributes: string keys only, so std.dict's KeyDict, whose
 /// entries have no stored hash (16 bytes instead of 24; CPython's
-/// str-keys dict layout). `__dict__` and `vars()` give a copy as a
-/// `Dict`.
+/// str-keys dict layout). `__dict__` and `vars()` move the attributes
+/// to a `Dict` (any keys, live): the AttrDict is then a *marker* (see
+/// `attrs_full`) that no attribute cache can hit or append to.
 pub type AttrDict = dict.KeyDict<Value, Value>;
 /// An instance of a user class (exceptions too).
 pub object Inst { cls: Gc<Box>, dict: Gc<AttrDict> }
@@ -403,12 +404,46 @@ pub fn attr_append_new(d: Gc<AttrDict>, key: Gc<Str>, v: Value) -> bool {
     }).is_some()
 }
 
+/// The `Dict` holding the attributes of an instance whose `__dict__` was
+/// taken: its AttrDict is then a marker with one entry, key `Undef` (no
+/// name matches it, so the GETATTR/SETATTR caches miss) and value the
+/// Dict, and no room (`popped`), so SETATTR's append fails too.
+#[inline]
+pub fn attrs_full(d: Gc<AttrDict>) -> ?Gc<Dict> {
+    if d.used != 1 { return None; }
+    let e = d.ents.e.ptr;
+    if e.key != Value.Undef { return None; }
+    let Dict(r) = e.value else { return None; };
+    Some(r)
+}
+
+/// The instance's attributes as a live `Dict` (`__dict__`, `vars()`):
+/// on first use the attributes move there and `o.dict` becomes a marker.
+pub fn attrs_view(h: *gc.Heap, o: Gc<Inst>) -> Gc<Dict> {
+    if let Some(r) = attrs_full(o.dict) { return r; }
+    let r = attrs_dict(h, o.dict);
+    attrs_replace(h, o, r);
+    r
+}
+
+/// `obj.__dict__ = r`.
+pub fn attrs_replace(h: *gc.Heap, o: Gc<Inst>, r: Gc<Dict>) {
+    let m = new_attrs(h, 0);
+    m.insert_new(h, 0, Value.Undef, Value.Dict(r));
+    m.popped = m.ents.e.len;
+    o.dict = m;
+}
+
 pub fn attr_get(d: Gc<AttrDict>, key: Gc<Str>) -> ?Value {
-    let Some(e) = attr_find(d, key) else { return None; };
+    let Some(e) = attr_find(d, key) else {
+        if let Some(r) = attrs_full(d) { return dict_get_str(r, key); }
+        return None;
+    };
     Some(d.value(e))
 }
 
 pub fn attr_set(h: *gc.Heap, d: Gc<AttrDict>, key: Gc<Str>, v: Value) {
+    if let Some(r) = attrs_full(d) { dict_set_str(h, r, key, v); return; }
     let kv = Value.Str(key);
     d.put_by(h, str_hash(key), kv, v, |k| -> bool {
         if k == kv { return true; }
@@ -418,13 +453,16 @@ pub fn attr_set(h: *gc.Heap, d: Gc<AttrDict>, key: Gc<Str>, v: Value) {
 }
 
 pub fn attr_del(d: Gc<AttrDict>, key: Gc<Str>) -> bool {
-    let Some(e) = attr_find(d, key) else { return false; };
+    let Some(e) = attr_find(d, key) else {
+        if let Some(r) = attrs_full(d) { return dict_del(r, Value.Str(key), str_hash(key)); }
+        return false;
+    };
     d.remove_at(e);
     true
 }
 
-/// The attributes as a new `Dict` (`__dict__`, `vars()`).
-pub fn attrs_dict(h: *gc.Heap, d: Gc<AttrDict>) -> Gc<Dict> {
+/// The attributes as a new `Dict`.
+fn attrs_dict(h: *gc.Heap, d: Gc<AttrDict>) -> Gc<Dict> {
     let r: Gc<Dict> = Dict.new(h, d.len);
     var i: u64 = 0;
     while let Some(e) = d.next(&i) { r.insert_new(h, d.hash_at(e), d.key(e), d.value(e)); }

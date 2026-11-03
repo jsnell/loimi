@@ -1,0 +1,24 @@
+dict {'x': 3, 'y': 4} 2
+True True
+10 116
+{'x': 10, 'y': 4, 'z': 5} True ['x', 'y', 'z']
+False ['x', 'z']
+AttributeError 'P' object has no attribute 'y'
+[('x', 10), ('z', 5), ('y', 2)] 104
+{'x': 10, 'y': 2}
+2 tuple 4
+['x', 'y', 1, (1, 2)]
+1 2 3
+7 7
+1 False none
+{'x': 10, 'y': 2, (1, 2): 'tuple', 'b': 2, 'c': 3, 'e': 7}
+104 shadowed 104 
+2 {'x': 1, 'y': 1} True
+0 0 1 1 2 2 
+4 8 4 8
+7 8 113 True
+{'x': 1, 'y': 8}
+TypeError
+{} False
+3 ('msg',)
+Pt(x=1, y='a') {'x': 4, 'y': 6}
