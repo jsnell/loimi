@@ -22,7 +22,7 @@
 
 use std::fmt::Write;
 
-use crate::codegen::{c_abi_attr, llty, ret_llty, Codegen};
+use crate::codegen::{c_abi_attr, llty, ret_llty, Arch, Codegen};
 use crate::ast::Linkage;
 
 /// glibc's `jmp_buf` is 200 bytes on x86-64 and 312 on AArch64.
@@ -31,19 +31,21 @@ const JMP_BUF_BYTES: u32 = 512;
 /// On x86-64 the handlers use LLVM's builtin setjmp (`__builtin_setjmp`):
 /// it saves the frame pointer, stack pointer and resume address in five
 /// words, and the function that calls it saves the callee-saved
-/// registers itself. Elsewhere, glibc's `_setjmp`/`longjmp`, which also
-/// save the signal-free context and mangle pointers.
-const BUILTIN_SJLJ: bool = cfg!(target_arch = "x86_64");
+/// registers itself. Elsewhere (AArch64), glibc's `_setjmp`/`longjmp`,
+/// which also save the signal-free context and mangle pointers.
+fn builtin_sjlj(arch: Arch) -> bool {
+    arch == Arch::X86_64
+}
 
 /// The jump buffer's type in `%loimi.handler`.
-fn buf_ty() -> String {
-    if BUILTIN_SJLJ { "[5 x ptr]".into() } else { format!("[{} x i8]", JMP_BUF_BYTES) }
+fn buf_ty(arch: Arch) -> String {
+    if builtin_sjlj(arch) { "[5 x ptr]".into() } else { format!("[{} x i8]", JMP_BUF_BYTES) }
 }
 
 /// IR lines: `%r` = 0 after saving the context in `%buf`, nonzero when
 /// a jump comes back.
-fn setjmp_ir() -> &'static str {
-    if BUILTIN_SJLJ {
+fn setjmp_ir(arch: Arch) -> &'static str {
+    if builtin_sjlj(arch) {
         "  %fa = call ptr @llvm.frameaddress.p0(i32 0)\n  \
            store ptr %fa, ptr %buf\n  \
            %sa = call ptr @llvm.stacksave.p0()\n  \
@@ -56,8 +58,8 @@ fn setjmp_ir() -> &'static str {
 }
 
 /// IR line: jump to the handler whose buffer is `%buf`.
-fn longjmp_ir() -> &'static str {
-    if BUILTIN_SJLJ {
+fn longjmp_ir(arch: Arch) -> &'static str {
+    if builtin_sjlj(arch) {
         "  call void @llvm.eh.sjlj.longjmp(ptr %buf) noreturn\n"
     } else {
         "  call void @longjmp(ptr %buf, i32 1) noreturn\n"
@@ -65,7 +67,7 @@ fn longjmp_ir() -> &'static str {
 }
 
 fn declare_sjlj(cg: &mut Codegen) {
-    if BUILTIN_SJLJ {
+    if builtin_sjlj(cg.opts.arch) {
         cg.decls.insert("declare ptr @llvm.frameaddress.p0(i32 immarg)");
         cg.decls.insert("declare ptr @llvm.stacksave.p0()");
         cg.decls.insert("declare i32 @llvm.eh.sjlj.setjmp(ptr)");
@@ -103,7 +105,7 @@ fn depth_globals(cg: &Codegen) -> Vec<String> {
 /// The body of a function that installs a handler of `kind`, runs `call`,
 /// and on a longjmp back runs `caught`. `call` and `caught` are IR lines
 /// (`caught` ends in a `ret`); the handler is `%h`.
-fn handler_body(kind: u32, depths: &[String], call: &str, caught: &str) -> String {
+fn handler_body(arch: Arch, kind: u32, depths: &[String], call: &str, caught: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "entry:\n  %h = alloca %loimi.handler, align 16");
     for (i, _) in depths.iter().enumerate() {
@@ -139,7 +141,7 @@ fn handler_body(kind: u32, depths: &[String], call: &str, caught: &str) -> Strin
            %shadow2 = load volatile ptr, ptr %hs\n  \
            store ptr %prev2, ptr @loimi.handler_top\n  \
            store ptr %shadow2, ptr @loimi.shadow_top",
-        setjmp_ir(),
+        setjmp_ir(arch),
         call.lines().map(|l| format!("  {}\n", l)).collect::<String>(),
         "  ret RESULT\n"
     );
@@ -233,7 +235,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
         }
         return;
     }
-    let _ = writeln!(cg.globals, "%loimi.handler = type {{ ptr, ptr, i64, {} }}", buf_ty());
+    let _ = writeln!(cg.globals, "%loimi.handler = type {{ ptr, ptr, i64, {} }}", buf_ty(cg.opts.arch));
     let _ = writeln!(cg.globals, "@loimi.handler_top = internal thread_local(initialexec) global ptr null");
     let _ = writeln!(cg.globals, "@loimi.panic_msg = internal thread_local(initialexec) global ptr null");
     let _ = writeln!(cg.globals, "@loimi.panic_len = internal thread_local(initialexec) global i64 0");
@@ -243,7 +245,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
     for (name, kind) in [("loimi_protect", KIND_THROW), ("loimi_catch_panic", KIND_PANIC)] {
         cg.decls.0.remove(name);
         // `f` has no effects, so it cannot enter a vm: no depths to save.
-        let body = handler_body(kind, &[], "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
+        let body = handler_body(cg.opts.arch, kind, &[], "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
         let _ = writeln!(cg.fns, "define internal i32 @{}(ptr %f, ptr %data) nounwind noinline {{\n{}}}\n", name, body);
     }
     // The same for a function that may collect or run a vm (`std.test`
@@ -251,7 +253,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
     // counted up, so restore them.
     if cg.decls.0.remove("loimi_catch_panic_reenter").is_some() {
         let depths = depth_globals(cg);
-        let body = handler_body(KIND_PANIC, &depths, "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
+        let body = handler_body(cg.opts.arch, KIND_PANIC, &depths, "call void %f(ptr %data)", "  ret i32 0\n").replace("RESULT", "i32 1");
         let _ = writeln!(cg.fns, "define internal i32 @loimi_catch_panic_reenter(ptr %f, ptr %data) nounwind noinline {{\n{}}}\n", body);
     }
     if cg.decls.0.remove("loimi_throw").is_some() {
@@ -279,7 +281,7 @@ pub fn emit_runtime(cg: &mut Codegen) {
              }}\n",
             KIND_THROW,
             msg.len(),
-            longjmp_ir()
+            longjmp_ir(cg.opts.arch)
         );
     }
     emit_catch_wrappers(cg);
@@ -307,7 +309,7 @@ fn emit_catch_wrappers(cg: &mut Codegen) {
                 format!("  ret {} {}\n", rt, v),
             )
         };
-        let body = handler_body(KIND_PANIC, &depths, &call, &caught).replace("RESULT", &ok);
+        let body = handler_body(cg.opts.arch, KIND_PANIC, &depths, &call, &caught).replace("RESULT", &ok);
         let _ = writeln!(
             cg.fns,
             "define {}{} @\"{}\"({}) nounwind {{\n{}}}\n",
@@ -340,6 +342,6 @@ pub fn panic_body(cg: &Codegen) -> String {
          {}  \
            unreachable\n\
          die:\n{}",
-        KIND_PANIC, longjmp_ir(), die
+        KIND_PANIC, longjmp_ir(cg.opts.arch), die
     )
 }

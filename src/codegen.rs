@@ -18,6 +18,23 @@ pub struct Options {
     pub library: bool,
     /// `--jit-stencils`: hooks for the copy-and-patch JIT, and stencils.
     pub jit: bool,
+    /// The target architecture (`--target`, else the host's).
+    pub arch: Arch,
+}
+
+/// Target architectures. The IR is the same for both except where the
+/// runtime needs the machine: the setjmp in `std.rt`'s handlers
+/// (src/rtgen.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arch {
+    X86_64,
+    AArch64,
+}
+
+impl Arch {
+    pub fn host() -> Arch {
+        if cfg!(target_arch = "aarch64") { Arch::AArch64 } else { Arch::X86_64 }
+    }
 }
 
 /// Parameter or result attribute at a C-ABI boundary (`extern "C"`,

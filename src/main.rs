@@ -61,6 +61,31 @@ struct Opts {
     test: bool,
     /// `loimi test --update`: `test.golden` rewrites its files.
     update: bool,
+    /// `--target=TRIPLE`: cross-compile (clang `--target`, linked with
+    /// lld). None: the host.
+    target: Option<Target>,
+    /// `--sysroot=DIR` (or `LOIMI_SYSROOT`): the target's libc and crt files.
+    sysroot: Option<PathBuf>,
+}
+
+/// A `--target` triple.
+struct Target {
+    triple: &'static str,
+    arch: codegen::Arch,
+}
+
+/// The targets `--target` takes, by the names it accepts.
+fn parse_target(s: &str) -> Option<Target> {
+    use codegen::Arch;
+    Some(match s {
+        "aarch64-linux-gnu" | "aarch64-unknown-linux-gnu" | "aarch64" | "arm64" => {
+            Target { triple: "aarch64-unknown-linux-gnu", arch: Arch::AArch64 }
+        }
+        "x86_64-linux-gnu" | "x86_64-unknown-linux-gnu" | "x86_64" | "x86-64" => {
+            Target { triple: "x86_64-unknown-linux-gnu", arch: Arch::X86_64 }
+        }
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -84,7 +109,9 @@ usage: loimi build <file.lm> [-o out] [--release] [--emit-llvm] [--dispatch=tail
                   [--sanitize=address] [-W error | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
+                  [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
        loimi run <file.lm> [--release] [--dispatch=...] [--keep-ll] [-- args...]
+                  (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
        loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
 
 fn std_root() -> PathBuf {
@@ -245,7 +272,13 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     let cg = codegen::Codegen::new(
         &prog,
         sm,
-        codegen::Options { overflow_checks: !opts.release, vm_stats: opts.vm_stats, library, jit: opts.jit },
+        codegen::Options {
+            overflow_checks: !opts.release,
+            vm_stats: opts.vm_stats,
+            library,
+            jit: opts.jit,
+            arch: opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch),
+        },
     );
     let (mut ir, stencils) = cg.generate_with_stencils();
     let jit = jit.map(|(ops, nops)| JitParts { stencils, ops, nops });
@@ -258,6 +291,11 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         Tls::InitialExec => {}
         Tls::LocalDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local(localdynamic)"),
         Tls::GeneralDynamic => ir = ir.replace("thread_local(initialexec)", "thread_local"),
+    }
+    // A cross build's IR names its target, so that `--emit-llvm` output
+    // compiles alone. (Host builds leave it to clang's default.)
+    if let Some(t) = &opts.target {
+        ir.insert_str(0, &format!("target triple = \"{}\"\n", t.triple));
     }
     Ok((if opts.sanitize_address { sanitize_address(&ir, library) } else { ir }, header, jit))
 }
@@ -386,6 +424,13 @@ fn parse_args() -> Result<Opts, String> {
         jit: false,
         test: false,
         update: false,
+        // `LOIMI_TARGET`: a default for `--target` (for running whole test
+        // suites cross-compiled).
+        target: match std::env::var("LOIMI_TARGET") {
+            Ok(t) if !t.is_empty() => Some(parse_target(&t).ok_or_else(|| format!("LOIMI_TARGET: unknown target `{}`", t))?),
+            _ => None,
+        },
+        sysroot: std::env::var_os("LOIMI_SYSROOT").filter(|s| !s.is_empty()).map(PathBuf::from),
     };
     match cmd.as_str() {
         "build" => {}
@@ -414,6 +459,13 @@ fn parse_args() -> Result<Opts, String> {
                     m => return Err(format!("unknown TLS model `{}` (initial-exec, local-dynamic, global-dynamic)", m)),
                 })
             }
+            s if s.starts_with("--target=") => {
+                let t = &s["--target=".len()..];
+                o.target = Some(parse_target(t).ok_or_else(|| {
+                    format!("unknown target `{}` (supported: aarch64-linux-gnu, x86_64-linux-gnu)", t)
+                })?)
+            }
+            s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
             "--vm-stats" => o.vm_stats = true,
             "--jit-stencils" => o.jit = true,
             "--update" if o.test => o.update = true,
@@ -464,6 +516,14 @@ fn parse_args() -> Result<Opts, String> {
     }
     if o.jit && !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
         return Err("--jit-stencils supports x86-64 Linux only".into());
+    }
+    if o.jit && o.target.as_ref().is_some_and(|t| t.arch != codegen::Arch::X86_64) {
+        // The stencils are x86-64 machine code patched in place
+        // (src/elf.rs reads x86-64 relocations).
+        return Err("--jit-stencils supports x86-64 Linux only (not --target=aarch64)".into());
+    }
+    if o.sanitize_address && o.target.is_some() {
+        return Err("--sanitize=address is not supported with --target".into());
     }
     if o.kind != OutKind::Exe {
         if o.run {
@@ -554,8 +614,18 @@ fn compiler_main() -> ExitCode {
         OutKind::Static => PathBuf::from(format!("lib{}.a", stem)),
         OutKind::Shared => PathBuf::from(format!("lib{}.so", stem)),
     });
+    // Cross builds: clang's `--target`, the sysroot's libc, and lld (the
+    // host's linker does not know the target).
+    let mut cross: Vec<String> = Vec::new();
+    if let Some(t) = &opts.target {
+        cross.push(format!("--target={}", t.triple));
+        cross.push("-fuse-ld=lld".into());
+    }
+    if let Some(s) = &opts.sysroot {
+        cross.push(format!("--sysroot={}", s.display()));
+    }
     let mut cmd = Command::new(&clang);
-    cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module");
+    cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);
     // The object goes into the archive.
     let obj = tmpdir.join(format!("{}.o", stem));
     match opts.kind {
@@ -611,6 +681,7 @@ fn compiler_main() -> ExitCode {
             let o = rt.with_extension("o");
             let ok = Command::new(&clang)
                 .args([if opts.release { "-O3" } else { "-O1" }, "-fPIC", "-c", "-x", "c"])
+                .args(&cross)
                 .arg(rt)
                 .arg("-o")
                 .arg(&o)
@@ -682,7 +753,18 @@ fn compiler_main() -> ExitCode {
     }
     let _ = std::fs::remove_file(&ll);
     if opts.run {
-        let mut cmd = Command::new(&exe);
+        // `LOIMI_RUNNER="qemu-aarch64 -L sysroot"`: run the program under
+        // an emulator (or any wrapper), split at whitespace.
+        let runner: Vec<String> =
+            std::env::var("LOIMI_RUNNER").unwrap_or_default().split_whitespace().map(String::from).collect();
+        let mut cmd = match runner.split_first() {
+            Some((prog, rest)) => {
+                let mut c = Command::new(prog);
+                c.args(rest).arg(&exe);
+                c
+            }
+            None => Command::new(&exe),
+        };
         cmd.args(&opts.run_args);
         if opts.test {
             // Tests run in their file's directory, so that `test.golden`
