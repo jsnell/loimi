@@ -195,7 +195,10 @@ From the declarations, the compiler generates, for each op:
   and `Calc.NUM_OPS`;
 
 and for the vm: `Calc.disasm(code, &out)`, `Calc.verify(code, lim)`,
-field readers such as `Calc.ABC_b(w)`, `Calc.label(w)` and
+field readers such as `Calc.ABC_b(w)` and setters such as
+`Calc.set_ABC_a(w, r)` (None if `r` does not fit the field), one encoder
+per format for code that picks the opcode at run time
+(`Calc.encode.ABC(Calc.OP_ADD, d, a, b)`), `Calc.label(w)` and
 `Calc.set_label(w, off)` for jumps, `Calc.optimize` (chapter 8) and
 `Calc.deopt`. They are ordinary Loimi functions named `Calc.*`.
 

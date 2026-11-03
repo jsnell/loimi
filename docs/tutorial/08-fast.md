@@ -70,7 +70,13 @@ a hot handler's assembly:
   itself are not a worry in tail-call handlers: they are compiled so
   that a zeroing or copying loop stays a loop instead of becoming a
   `memset`/`memcpy` call (a call to a C function you declared, such as
-  `memset` itself, is still a call: put it in `cold` or use a loop);
+  `memset` itself, is still a call: put it in `cold` or use a loop).
+  `loimi build --release -W handler_frame` finds these for you: it
+  warns about every handler whose fast path sets up a frame and names
+  the calls that may have caused it. On step 8 it lists five handlers:
+  DEFGLOBAL, NEWLIST, NEWARRAY and PRINT, which run rarely, and
+  SETINDEX, where the frame is a `push`/`pop` pair around the call to
+  `std.gc.remember` in the compiler's write barrier (chapter 7);
 - **no reloads of state** from memory;
 - **one dispatch sequence per exit**: load the next word, advance `pc`,
   index the table, jump.
@@ -311,7 +317,24 @@ point: try them, measure, keep what pays.
 
 `fib` and `loop` are 23-26% faster. `sieve` is bounded by array
 accesses and `strings` by allocation and copying, which none of these
-changes touched. Step 6 (no GC) runs `fib` in 0.404 s against step 7's
+changes touched.
+
+`--vm-stats` also counts how often each `cold` block is entered, which
+shows a fast path that misses a common case. On `sieve`:
+
+```text
+cold blocks entered:
+       2211180  MUL (cold block at examples/tutorial/step8/vm.lm:238:17)
+       2211180  JNLE (cold block at examples/tutorial/step8/vm.lm:368:13)
+            29  NEWARRAY (cold block at examples/tutorial/step8/vm.lm:397:68)
+```
+
+`i * i` overflows `Int(i32)` for every prime above 46340, so MUL goes
+cold and returns a float, and the comparison `j <= n` that follows
+mixes a float with an integer, which neither of JNLE's fast cases
+covers. Each is about 0.5% of the ops executed, so not worth a
+fast case here; on `strings`, every `+` is ADD's cold block (string
+joining), which is expected. Step 6 (no GC) runs `fib` in 0.404 s against step 7's
 0.466: the price of clearing a callee's registers in CALL (chapter 7)
 and of the larger value type.
 

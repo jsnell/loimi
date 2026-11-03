@@ -43,7 +43,25 @@ A `Value` is one 64-bit word. `Num` is `unboxed`: a double is stored as
 itself. The other variants live in the NaN space, each with its own
 tag. The compiler picks the tags; you get constructors (`Int(3)`,
 `Value.Nil`), patterns, `==` on the bits, and a cast to `u64` if you
-need the raw word.
+need the raw word. To see the tags it picked, `loimi build
+--explain-values` prints each value type's layout and stops:
+
+```text
+value value.Value repr nanbox: classic layout, 3 tagged variants
+  Num(f64)    unboxed: the words below 0xFFF9_0000_0000_0000 (`limit`)
+  Int(i32)    block 48   mask 0xFFFF_0000_0000_0000  tag 0xFFF9_0000_0000_0000  ...
+  Nil         block 48   mask 0xFFFF_0000_0000_0000  tag 0xFFFA_0000_0000_0000  ...
+  Bool(bool)  block 48   mask 0xFFFF_0000_0000_0000  tag 0xFFFB_0000_0000_0000  ...
+  tuple patterns: elements whose variants have the same block width merge into one test, ...
+    block 48: Int, Nil, Bool
+    unboxed:  Num  (umax(a, b, ..) < limit)
+```
+
+The layout depends on how many variants there are: past seven tagged
+variants the compiler packs some into narrower blocks, which changes
+their encoding and which tuple tests merge (below). It warns
+(`value_layout`) when a new variant narrows others, and `block N` after
+a variant pins its width (language.md section 2). Pip stays at six.
 
 Two properties come for free that hand-written NaN-boxing regularly
 misses. Constructing a `Num` canonicalizes NaNs, so a guest computation

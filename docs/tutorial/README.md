@@ -102,6 +102,8 @@ than is built ([`docs/status.md`](../status.md)). This tutorial uses only
 what is implemented. `suspend`, generated C-ABI entry points and the
 generated `Builder` do not exist yet, and nothing here pretends
 otherwise. Some things that do exist are left out: closures in Loimi
-itself, embedding in C (`loimi build --lib`), threads, the generational
-GC mode and the copy-and-patch JIT (`--jit-stencils`); `status.md` lists
-them.
+itself, embedding in C (`loimi build --lib`), threads (and heaps shared
+behind `std.gil`), the generational GC mode, resume points for
+coroutines (`Vm.Resume`), accumulator registers, cross-compiling for
+AArch64 (`--target`) and the copy-and-patch JIT (`--jit-stencils`);
+`status.md` lists them.

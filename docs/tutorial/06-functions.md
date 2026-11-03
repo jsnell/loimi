@@ -116,7 +116,10 @@ which is the caller's `base`.
 `base.raw` is the field itself, the register number. The handler
 assigns all four state variables and jumps: the callee runs with its
 own `regs` and `k` in the same machine registers. `jump p.code` jumps
-to the start of the callee's verified code. The vm is
+to the start of the callee's verified code. `fp.ret = pc + 1` is the
+return address because CALL is one word; for an op with cache words, or
+a call helper shared by several ops, write `fp.ret = next_pc`, the
+address `next` would continue at (language.md section 3.5). The vm is
 `#[require_verified]` and its entry, too, jumps to `main.code`, so every
 function that runs was verified.
 

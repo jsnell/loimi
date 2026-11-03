@@ -119,6 +119,9 @@ fn find(xs: []i64, want: i64) -> ?u64 {
 }
 ```
 
+`for i in a..b` counts; when the index is not needed, `for x in xs`
+runs over the elements of an array or slice (`for x in xs { s += x; }`).
+
 Errors are values. `Result<T, E>` with `?` returns early on `Err`:
 
 ```loimi

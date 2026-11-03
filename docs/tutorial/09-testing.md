@@ -26,6 +26,13 @@ builds each step and runs every test
   every safepoint and turns a missing root into a wrong answer or a
   crash in the first run that depends on it (chapter 7).
 
+`check.sh` does not use `--gc-check-roots` (chapter 7), but the stress
+runs are worth repeating with it after a change to rooting or to the
+root scanner: a build with `loimi build main.lm --gc-check-roots`
+reports a bad root where a plain stress run might only print a wrong
+answer. Step 9's tests pass in that mode, and `loimi test
+--gc-check-roots unit_test.lm` checks the unit tests the same way.
+
 ```sh
 examples/tutorial/check.sh            # every step
 examples/tutorial/check.sh step7      # one step
@@ -329,5 +336,7 @@ Pip is deliberately small. Natural next steps, each a chapter's worth:
 - string interning, so string equality is one compare.
 
 [`docs/language.md`](../language.md) and [`docs/stdlib.md`](../stdlib.md)
-are the references for everything used here; the three example
-interpreters show the same techniques at full size.
+are the references for everything used here; the example interpreters
+in [`examples/`](../../examples) (Mini, MiniJS, Scheme, Lox, Python and
+the others the main README lists) show the same techniques at full
+size.
