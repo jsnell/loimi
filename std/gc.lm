@@ -22,12 +22,13 @@
 // pointers inside NaN-boxed values) as `loimi_trace_object`.
 //
 // Generational mode (`Heap.set_generational`), non-moving with sticky
-// mark bits: an object is *old* once it survived a collection, and old
-// objects keep their mark bit. A minor collection marks from the roots
-// and the remembered set, treats marked (old) objects as done, and sweeps
-// only the chunks allocated from since the last collection; its
-// survivors become old. A major collection clears the marks and runs a
-// full mark-sweep. The write barrier keeps the invariant that an old
+// mark bits: an object is *old* once it survived a collection (a large
+// object: two), and old objects keep their mark. A minor collection marks
+// from the roots and the remembered set and treats marked (old) objects
+// as done; the chunks allocated from since the last collection are swept
+// lazily, by the allocator. A major collection flips the mark epoch,
+// which unmarks every object, and runs a full mark (its sweep is lazy
+// too). The write barrier keeps the invariant that an old
 // object not in the remembered set points to no young object: the
 // compiler calls `barrier(obj)` after every store of a traced value
 // (`Gc`, a `value` type with references, a struct or option holding
@@ -165,29 +166,6 @@ pub struct Heap {
     seg_next: *u8,
     seg_left: u64,
     rs: *RemSet,
-    /// The mark byte of a marked object (1 or 2). A generational heap's
-    /// major collection flips it instead of clearing every mark first:
-    /// after a major collection every allocated object is unmarked (0) or
-    /// marked with the current epoch, so after the flip all are unmarked.
-    /// (A non-generational heap clears the marks as it sweeps; its epoch
-    /// stays 1.)
-    epoch: u8,
-    /// Flags that marking sets: LOG in a generational heap (a survivor is
-    /// old), else none.
-    mark_flags: u8,
-    /// Bytes marked with the epoch in the collection in progress (in a
-    /// minor collection, the objects promoted).
-    marked: u64,
-    /// The mark of young survivors: of the minor collection in progress,
-    /// or since the last one (NO_YOUNG after a major collection).
-    young: u8,
-    /// The mark an unmarked object gets when it was not AGED: `young` in
-    /// a minor collection, else the epoch.
-    first_mark: u8,
-    /// Set by `mark_ptr` when a reference leads to a young survivor.
-    young_ref: bool,
-    /// Spare vector for rebuilding the remembered set.
-    rs_tmp: mem.Vec<*u8>,
     /// Called after marking, before sweeping (for weak tables).
     sweepers: mem.Vec<Scanner>,
     ephemerons: mem.Vec<EphHook>,
@@ -242,11 +220,36 @@ pub struct Heap {
     stats: bool,
     mark_ns: u64,
     sweep_ns: u64,
-    /// Time in deferred sweeps (`sweep_chunk`).
-    lazy_ns: u64,
     /// Free for the embedder (for example, runtime data that allocation
     /// helpers need but that is not passed to them).
     user: *u8,
+    // Fields added for the generational mode's epochs, lazy sweeping and
+    // aging (after the others, so that their offsets stay put).
+    /// The mark byte of a marked object (1 or 2). A generational heap's
+    /// major collection flips it instead of clearing every mark first:
+    /// after a major collection every allocated object is unmarked (0) or
+    /// marked with the current epoch, so after the flip all are unmarked.
+    /// (A non-generational heap clears the marks as it sweeps; its epoch
+    /// stays 1.)
+    epoch: u8,
+    /// Flags that marking sets: LOG in a generational heap (a survivor is
+    /// old), else none.
+    mark_flags: u8,
+    /// Bytes marked with the epoch in the collection in progress (in a
+    /// minor collection, the objects promoted).
+    marked: u64,
+    /// The mark of young survivors: of the minor collection in progress,
+    /// or since the last one (NO_YOUNG after a major collection).
+    young: u8,
+    /// The mark an unmarked object gets when it was not AGED: `young` in
+    /// a minor collection, else the epoch.
+    first_mark: u8,
+    /// Set by `mark_ptr` when a reference leads to a young survivor.
+    young_ref: bool,
+    /// Spare vector for rebuilding the remembered set.
+    rs_tmp: mem.Vec<*u8>,
+    /// Time in deferred sweeps (`sweep_chunk`).
+    lazy_ns: u64,
 }
 
 pub fn Heap.new() -> Heap {
