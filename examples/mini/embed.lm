@@ -46,6 +46,7 @@ import vm.{Mini, Ctx};
 import vm;
 import compile;
 import state;
+import coro;
 
 extern "C" fn strlen(s: *u8) -> u64;
 
@@ -54,7 +55,7 @@ extern "C" fn strlen(s: *u8) -> u64;
 enum MiniStatus: i32 { Ok, Syntax, Runtime, Internal }
 
 /// The type of a value (mini_get_type, mini_arg_type).
-enum MiniType: i32 { Nil, Boolean, Number, String, Table, Function }
+enum MiniType: i32 { Nil, Boolean, Number, String, Table, Function, Thread }
 
 /// A native callable from Mini: returns 0 with its result set by a
 /// `mini_return_*` call (nil if none), or nonzero after `mini_raise`. It
@@ -143,6 +144,7 @@ fn type_of(v: V) -> MiniType {
         S(_) => MiniType.String,
         T(_) => MiniType.Table,
         F(_) | Native(_) => MiniType.Function,
+        Co(c) => if coro.is_wrap(c) { MiniType.Function } else { MiniType.Thread },
     }
 }
 

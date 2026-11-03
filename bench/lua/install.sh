@@ -21,6 +21,14 @@ tar -C "$src" -xzf "$tgz"
 make -C "$src/lua-$v" -j"$(nproc)" linux CC="${CC:-cc}" >/dev/null
 cp "$src/lua-$v/src/lua" "$dst/bin/lua"
 
+# ── PUC-Lua test suite (sources only; not built or run here) ─────────
+v=$(field luatests 2); url=$(field luatests 3); sum=$(field luatests 4)
+tgz="$src/lua-$v-tests.tar.gz"
+[ -f "$tgz" ] || curl -fsSL -o "$tgz" "$url"
+echo "$sum  $tgz" | sha256sum -c -
+rm -rf "$src/lua-$v-tests"
+tar -C "$src" -xzf "$tgz"
+
 # ── LuaJIT ───────────────────────────────────────────────────────────
 url=$(field luajit 3); commit=$(field luajit 4)
 if [ ! -d "$src/luajit/.git" ]; then

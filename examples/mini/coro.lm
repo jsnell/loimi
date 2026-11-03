@@ -1,0 +1,408 @@
+// Lua 5.4 coroutines for Mini: the `coroutine` library.
+//
+// A coroutine is a `Coro` object with a value stack and a frame stack of
+// its own (`VStack` and `FStack`, GC objects that grow by doubling). The
+// VM runs on whichever stacks the context's fields (`stack` .. `open_level`)
+// describe; `resume` saves the resumer's into a `Saved` record on its C
+// stack, installs the coroutine's, and runs it through a nested entry
+// (`Mini.call` the first time, `Mini.resume` after a yield). A CALL of
+// coroutine.yield leaves that run (`native_results` in vm.lm) after
+// recording where to continue, so the resumer's native call returns: no
+// native stack switching. Yielding with a native in between (a table.sort
+// comparator, a host function) is an error, as in PUC-Lua for C functions
+// without continuations.
+
+import std.gc;
+import std.mem;
+import value;
+import value.{V, UpVal, Table};
+import vm;
+import vm.{Ctx, Frame, VStack, FStack, Mini, NRET_ONE};
+
+pub const SUSPENDED: u32 = 0;
+pub const RUNNING: u32 = 1;
+pub const NORMAL: u32 = 2;
+pub const DEAD: u32 = 3;
+
+/// A coroutine. While suspended after a yield, `fp`, `open` and
+/// `open_level` are its saved thread state and the yield's CALL continues
+/// at `ypc`, storing its `ynres` results from register `ydst`. Stacks are
+/// allocated at the first resume and dropped when it dies.
+pub object Coro {
+    status: u32,
+    started: bool,
+    body: V,
+    vs: ?Gc<VStack>,
+    fs: ?Gc<FStack>,
+    fp: *Frame,
+    open: ?Gc<UpVal>,
+    open_level: *V,
+    ypc: *u32,
+    ydst: u32,
+    ynres: u32,
+    /// The error that killed it, until coroutine.close reports it.
+    err: V,
+    /// Set in the function that coroutine.wrap returns (a Coro of its own,
+    /// so that it is not the thread that coroutine.running returns): the
+    /// coroutine it resumes.
+    wrap: ?Gc<Coro>,
+}
+
+pub fn is_wrap(co: Gc<Coro>) -> bool {
+    match co.wrap {
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// The state of a thread that resumed another, on `resume`'s C stack and
+/// linked from `Ctx.chain` (the collector walks its frames).
+pub struct Saved {
+    stack: *V,
+    stack_end: *V,
+    frames: *Frame,
+    frames_end: *Frame,
+    fp: *Frame,
+    base: *Frame,
+    open: ?Gc<UpVal>,
+    open_level: *V,
+    cur: Gc<Coro>,
+    cur_vs: ?Gc<VStack>,
+    prev: *Saved,
+}
+
+/// Native ids (vm.call_native sends ids from FIRST up here).
+pub const FIRST: i32 = 50;
+const CREATE: i32 = 50;
+const RESUME: i32 = 51;
+const YIELD: i32 = 52;
+const STATUS: i32 = 53;
+const ISYIELDABLE: i32 = 54;
+const RUNNING_FN: i32 = 55;
+const WRAP: i32 = 56;
+const CLOSE: i32 = 57;
+
+/// Initial stack sizes: a VStack of 60 slots and an FStack of 12 frames
+/// are small objects (at most 512 bytes with the header).
+const VS_INIT: u64 = 60;
+const FS_INIT: u64 = 12;
+
+fn set(h: *gc.Heap, t: Gc<Table>, name: str, v: V) {
+    let k = V.S(value.new_str(h, name));
+    value.table_set(h, t, k, v);
+}
+
+pub fn install(h: *gc.Heap, globals: Gc<Table>) {
+    let t = value.new_table(h);
+    set(h, t, "create", V.Native(CREATE));
+    set(h, t, "resume", V.Native(RESUME));
+    set(h, t, "yield", V.Native(YIELD));
+    set(h, t, "status", V.Native(STATUS));
+    set(h, t, "isyieldable", V.Native(ISYIELDABLE));
+    set(h, t, "running", V.Native(RUNNING_FN));
+    set(h, t, "wrap", V.Native(WRAP));
+    set(h, t, "close", V.Native(CLOSE));
+    set(h, globals, "coroutine", V.T(t));
+}
+
+/// The main thread's coroutine object (what coroutine.running returns
+/// outside any coroutine): running, without stacks of its own.
+pub fn new_main(h: *gc.Heap) -> Gc<Coro> {
+    new(h, Coro { status: RUNNING, started: true, body: V.Nil, err: V.Nil, ..zero })
+}
+
+fn msg(c: *Ctx, s: str) -> V { V.S(value.new_str(&c.heap, s)) }
+
+fn bad_arg(c: *Ctx, i: u64, name: str, want: str) -> V {
+    c.out.clear();
+    c.out.push_str("bad argument #");
+    c.out.push_int(i as i64 + 1);
+    c.out.push_str(" to '");
+    c.out.push_str(name);
+    c.out.push_str("' (");
+    c.out.push_str(want);
+    c.out.push_str(" expected)");
+    V.S(value.new_str(&c.heap, c.out.as_str()))
+}
+
+/// The result buffer with room for `n` values; the native returns
+/// several results by filling it and setting `c.nret`.
+fn results(c: *Ctx, n: u64) -> *V {
+    if n > c.rcap {
+        var cap = c.rcap * 2;
+        while cap < n { cap = cap * 2; }
+        c.rbuf = mem.grow(c.rbuf, cap);
+        c.rcap = cap;
+    }
+    c.rbuf
+}
+
+fn two(c: *Ctx, a: V, b: V) -> Result<V, V> {
+    let r = results(c, 2);
+    r[0] = a;
+    r[1] = b;
+    c.nret = 2;
+    Ok(a)
+}
+
+fn check_co(c: *Ctx, args: *V, n: u64, name: str) -> Result<Gc<Coro>, V> {
+    if n > 0 {
+        if let Co(co) = args[0] and !is_wrap(co) { return Ok(co); }
+    }
+    Err(bad_arg(c, 0, name, "coroutine"))
+}
+
+pub fn call(c: *Ctx, id: i32, args: *V, n: u64, from_vm: bool) -> Result<V, V> uses reenter {
+    if id == CREATE or id == WRAP {
+        let f = if n > 0 { args[0] } else { V.Nil };
+        match f {
+            F(_) | Native(_) => {}
+            Co(w) if is_wrap(w) => {}
+            _ => return Err(bad_arg(c, 0, if id == CREATE { "create" } else { "wrap" }, "function")),
+        }
+        let co = new(&c.heap, Coro { status: SUSPENDED, started: false, body: f, err: V.Nil, ..zero });
+        if id == CREATE { return Ok(V.Co(co)); }
+        return Ok(V.Co(new(&c.heap, Coro { status: DEAD, started: true, body: V.Nil, err: V.Nil, wrap: Some(co), ..zero })));
+    }
+    if id == RESUME {
+        let co = check_co(c, args, n, "resume")?;
+        return resume(c, co, args + 1, n - 1, false);
+    }
+    if id == YIELD {
+        if c.cur == c.main { return Err(msg(c, "attempt to yield from outside a coroutine")); }
+        if !from_vm or c.base != c.frames { return Err(msg(c, "attempt to yield across a C-call boundary")); }
+        c.xfer = args;
+        c.nxfer = n;
+        c.yielded = true;
+        c.nret = 0;
+        return Ok(V.Nil);
+    }
+    if id == STATUS {
+        let co = check_co(c, args, n, "status")?;
+        return Ok(msg(c, status_name(c, co)));
+    }
+    if id == ISYIELDABLE {
+        if n > 0 and args[0] != V.Nil {
+            let co = check_co(c, args, n, "isyieldable")?;
+            if co != c.cur { return Ok(V.Bool(co != c.main)); }
+        }
+        return Ok(V.Bool(c.cur != c.main and from_vm and c.base == c.frames));
+    }
+    if id == RUNNING_FN {
+        return two(c, V.Co(c.cur), V.Bool(c.cur == c.main));
+    }
+    // CLOSE
+    let co = check_co(c, args, n, "close")?;
+    if co.status == SUSPENDED {
+        // Close the upvalues still open into its stack, then free it.
+        var u = co.open;
+        loop {
+            let Some(uv) = u else { break; };
+            uv.closed = *uv.v;
+            uv.v = &uv.closed;
+            uv.stack = None;
+            u = uv.next;
+            uv.next = None;
+        }
+        die(co);
+        return Ok(V.Bool(true));
+    }
+    if co.status == DEAD {
+        let e = co.err;
+        if e == V.Nil { return Ok(V.Bool(true)); }
+        co.err = V.Nil;
+        return two(c, V.Bool(false), e);
+    }
+    Err(msg(c, if co == c.cur { "cannot close a running coroutine" } else { "cannot close a normal coroutine" }))
+}
+
+fn status_name(c: *Ctx, co: Gc<Coro>) -> str {
+    if co == c.cur { return "running"; }
+    if co.status == SUSPENDED { return "suspended"; }
+    if co.status == DEAD { return "dead"; }
+    "normal"
+}
+
+fn die(co: Gc<Coro>) {
+    co.status = DEAD;
+    co.vs = None;
+    co.fs = None;
+    co.open = None;
+    co.body = V.Nil;
+}
+
+/// The first resume of a coroutine whose body is a native: a plain call,
+/// which cannot yield. A function of its own: inlined in `resume`, the
+/// collector crashed scanning `resume`'s shadow-stack frame during the
+/// call (COROUTINES.md, friction 1).
+fn resume_native(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, V> uses reenter {
+    co.started = true;
+    co.status = RUNNING;
+    let r = vm.call_value(c, co.body, args, n);
+    die(co);
+    match r {
+        Ok(v) => {
+            if wrap { return Ok(v); }
+            two(c, V.Bool(true), v)
+        }
+        Err(e) => {
+            c.rethrow = V.Nil;
+            if wrap { return Err(e); }
+            co.err = e;
+            two(c, V.Bool(false), e)
+        }
+    }
+}
+
+/// coroutine.resume(co, args[0..n]) (`wrap` false: results true and the
+/// values, or false and the error) and calling a wrap function (`wrap`
+/// true: the values, or the error raised).
+pub fn resume(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, V> uses reenter {
+    if co.status != SUSPENDED {
+        let m = msg(c, if co.status == DEAD { "cannot resume dead coroutine" } else { "cannot resume non-suspended coroutine" });
+        if wrap { return Err(m); }
+        return two(c, V.Bool(false), m);
+    }
+    if Mini.depth >= vm.MAX_NESTING {
+        let m = msg(c, "C stack overflow");
+        if wrap { return Err(m); }
+        return two(c, V.Bool(false), m);
+    }
+    if !co.started {
+        let F(cl) = co.body else { return resume_native(c, co, args, n, wrap); };
+        let nregs = cl.proto.nregs as u64;
+        let cap = if nregs > VS_INIT { nregs } else { VS_INIT };
+        co.vs = Some(new(&c.heap, VStack { prev: None }, cap));
+        co.fs = Some(new(&c.heap, FStack { prev: None }, FS_INIT));
+    }
+    let Some(vs) = co.vs else { unreachable };
+    let Some(fs) = co.fs else { unreachable };
+    var saved = Saved {
+        stack: c.stack,
+        stack_end: c.stack_end,
+        frames: c.frames,
+        frames_end: c.frames_end,
+        fp: c.fp,
+        base: c.base,
+        open: c.open,
+        open_level: c.open_level,
+        cur: c.cur,
+        cur_vs: c.cur_vs,
+        prev: c.chain,
+    };
+    c.chain = &saved;
+    c.cur.status = NORMAL;
+    c.stack = vs.v.ptr;
+    c.stack_end = vs.v.ptr + vs.v.len;
+    c.frames = fs.f.ptr;
+    c.frames_end = fs.f.ptr + fs.f.len;
+    c.base = c.frames;
+    c.open = co.open;
+    c.open_level = co.open_level;
+    c.cur = co;
+    c.cur_vs = co.vs;
+    co.status = RUNNING;
+    // The VM stores into the running coroutine's stacks without write
+    // barriers: keep them in the remembered set while it runs (`sweep`
+    // puts them back after each collection).
+    gc.write_barrier(&c.heap, vs as *u8);
+    gc.write_barrier(&c.heap, fs as *u8);
+    var r: Result<V, V> = Ok(V.Nil);
+    if co.started {
+        c.fp = co.fp;
+        c.ypc = co.ypc;
+        c.ydst = co.ydst;
+        c.ynres = co.ynres;
+        r = Mini.resume(c, args, n);
+    } else {
+        co.started = true;
+        let F(cl) = co.body else { unreachable };
+        let nregs = cl.proto.nregs as u64;
+        let base = c.stack;
+        for i in 0..nregs { base[i] = if i < n { args[i] } else { V.Nil }; }
+        c.frames.base = base;
+        c.fp = c.frames;
+        c.frames.cl = cl;
+        r = Mini.call(c, c.frames, cl);
+    }
+    // Collect the results before the coroutine's stack can go away.
+    let lead: u64 = if wrap { 0 } else { 1 };
+    var first = V.Nil;
+    var failed = false;
+    match r {
+        Ok(v) => {
+            var src = c.xfer;
+            var cnt = c.nxfer;
+            if c.yielded {
+                c.yielded = false;
+                co.status = SUSPENDED;
+                co.fp = c.fp;
+                co.open = c.open;
+                co.open_level = c.open_level;
+                co.ypc = c.ypc;
+                co.ydst = c.ydst;
+                co.ynres = c.ynres;
+            } else {
+                co.status = DEAD;
+                if cnt == 1 { src = &v; }
+            }
+            let out = results(c, cnt + lead);
+            if !wrap { out[0] = V.Bool(true); }
+            for i in 0..cnt { out[lead + i] = src[i]; }
+            c.nret = cnt + lead;
+            first = if cnt + lead > 0 { out[0] } else { V.Nil };
+        }
+        Err(e) => {
+            // Errors leave the coroutine dead; close what it left open.
+            vm.close_upvals(c, c.stack);
+            co.status = DEAD;
+            co.err = e;
+            c.rethrow = V.Nil;
+            failed = true;
+            first = e;
+        }
+    }
+    c.stack = saved.stack;
+    c.stack_end = saved.stack_end;
+    c.frames = saved.frames;
+    c.frames_end = saved.frames_end;
+    c.fp = saved.fp;
+    c.base = saved.base;
+    c.open = saved.open;
+    c.open_level = saved.open_level;
+    c.cur = saved.cur;
+    c.cur_vs = saved.cur_vs;
+    c.chain = saved.prev;
+    c.cur.status = RUNNING;
+    if co.status == DEAD {
+        let e = co.err;
+        die(co);
+        co.err = e;
+    }
+    if failed {
+        if wrap {
+            co.err = V.Nil;
+            return Err(first);
+        }
+        return two(c, V.Bool(false), first);
+    }
+    Ok(first)
+}
+
+/// A sweeper (state.attach): the stacks of the running coroutine and of
+/// its resumers back into the remembered set, which the collection that
+/// just traced them emptied.
+pub fn sweep(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    keep(c.cur);
+    var s = c.chain;
+    while s != 0 as *Saved {
+        keep(s.cur);
+        s = s.prev;
+    }
+}
+
+fn keep(co: Gc<Coro>) {
+    if let Some(v) = co.vs { gc.remember(v as *u8); }
+    if let Some(f) = co.fs { gc.remember(f as *u8); }
+}

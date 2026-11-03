@@ -5,7 +5,9 @@ import std.gc;
 import std.mem;
 import std.hash;
 import std.text;
-import vm.{Mini};
+import vm.{Mini, VStack};
+import coro;
+import coro.{Coro};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
@@ -58,7 +60,10 @@ pub object Proto {
 /// A captured variable. While open, `v` points at the variable's stack
 /// slot and `next` links the open list (sorted by level, highest first).
 /// Closing copies the value into `closed` and points `v` at it.
-pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal> }
+/// `stack` is the coroutine stack that `v` points into while open (None on
+/// the main stack): an open upvalue keeps it alive, as the stack is
+/// freed with its coroutine.
+pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal>, stack: ?Gc<VStack> }
 pub object Closure { proto: Gc<Proto>, upvals: [Gc<UpVal>] }
 
 pub value V repr nanbox {
@@ -70,6 +75,10 @@ pub value V repr nanbox {
     T(Gc<Table>),
     F(Gc<Closure>),
     Native(i32),
+    /// A coroutine (Lua's "thread"), or a function made by coroutine.wrap
+    /// (a Coro whose `wrap` is the coroutine it resumes). One variant: an
+    /// eighth keeps every other variant's 48-bit block (lowering.md §2).
+    Co(Gc<Coro>),
 }
 
 /// The string intern table: every live Str, so equal strings are the
@@ -235,6 +244,7 @@ pub fn type_name(v: V) -> str {
         S(_) => "string",
         T(_) => "table",
         F(_) | Native(_) => "function",
+        Co(c) => if coro.is_wrap(c) { "function" } else { "thread" },
     }
 }
 
@@ -337,7 +347,7 @@ pub fn int_index(k: V) -> u64 {
     (k as u64) -% (V.Int(1) as u64)
 }
 
-/// Int words xor this are below 2^48 exactly for Ints (the tag cancels
+/// Int words xor this are below 2^32 exactly for Ints (the tag cancels
 /// out), and as unsigned numbers they are ordered like the integers
 /// (the payload's sign bit is flipped). So two Ints are tested and
 /// compared without extracting their payloads.
@@ -569,6 +579,7 @@ pub fn write_value(b: *text.StrBuf, v: V) {
         T(t) => push_addr(b, "table: ", t as u64),
         F(c) => push_addr(b, "function: ", c as u64),
         Native(_) => b.push_str("function: builtin"),
+        Co(c) => push_addr(b, if coro.is_wrap(c) { "function: " } else { "thread: " }, c as u64),
     }
 }
 

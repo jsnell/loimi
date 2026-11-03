@@ -67,7 +67,19 @@ For the example in language.md:
 
 Declarations written before wide tags existed keep exactly this encoding.
 
-**Packed layout (more than 7 tagged variants).** Each variant needs a block
+**Eight tagged variants**, when one of them has a payload of at most 47
+bits: the classic layout for seven of them, in declaration order, and
+the start of the 47-bit block `0xFFF8_8000_0000_0000` for the narrowest
+(the last of that width; a variant without payload is that one word).
+Adding an eighth variant thus keeps every other variant's 48-bit block, so
+tuple tests that mix pointers with a narrow integer (`(T(t), Int(_))`
+with `Int(i32)`) still merge into one test; under the packed layout below
+the `i32` would get a 32-bit block, and such tests split in two (Mini's
+`hash_strings`, `interp` and `queens` ran 4-6% slower when coroutines
+added variants; examples/mini/COROUTINES.md). `NUM` is
+`0xFFF8_8000_0000_0000`.
+
+**Packed layout (more than 8 tagged variants, or 8 with no payload under 48 bits).** Each variant needs a block
 of 2^w words, where `w` is its payload width: 48 for pointers, `N` for
 `iN`/`uN`, 1 for `bool`, 0 for no payload. The free space is the seven
 48-bit blocks `0xFFF9..0xFFFF` and the 47-bit block

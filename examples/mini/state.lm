@@ -9,6 +9,7 @@ import value.{V, Strings};
 import vm.{Ctx, Frame};
 import vm;
 import lib;
+import coro;
 
 const STACK_SLOTS: u64 = 1 << 20;
 const FRAMES: u64 = 1 << 16;
@@ -29,6 +30,8 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
     heap.set_generational(true);
     let globals = value.new_table(&heap);
     lib.install(&heap, globals);
+    coro.install(&heap, globals);
+    let main = coro.new_main(&heap);
     let stack: *V = mem.alloc(STACK_SLOTS);
     let frames: *Frame = mem.alloc(FRAMES);
     Ctx {
@@ -43,6 +46,11 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
         out: text.StrBuf.new(),
         open: None,
         host: host,
+        cur: main,
+        main: main,
+        nret: vm.NRET_ONE,
+        rbuf: mem.alloc(16),
+        rcap: 16,
         ..zero
     }
 }
@@ -50,6 +58,7 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
 /// Make the heap scan `c` (its globals and VM stack) for roots.
 pub fn attach(c: *Ctx) {
     c.heap.add_scanner(c as *u8, vm.scan_roots);
+    c.heap.add_sweeper(c as *u8, coro.sweep);
 }
 
 /// Free everything `c` owns.
@@ -60,5 +69,6 @@ pub fn free_ctx(c: *Ctx) {
     c.heap.free();
     mem.release(c.stack);
     mem.release(c.frames);
+    mem.release(c.rbuf);
     c.out.free();
 }

@@ -1,0 +1,73 @@
+// nanbox with exactly 8 tagged variants, one of them narrow: the classic
+// 48-bit blocks for seven, in declaration order, and the 47-bit block for
+// the narrowest (docs/lowering.md §2). Mini's value (an i32, Nil, Bool,
+// four pointers and a native id) has this shape.
+import std.io;
+
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Nil,
+    Bool(bool),
+    A(*Obj),
+    B(*Obj),
+    C(*Obj),
+    Id(i32),
+    D(*Obj),
+}
+
+fn hex(x: u64) {
+    let digits = "0123456789abcdef";
+    var i: u64 = 0;
+    while i < 16 {
+        io.print(digits[((x >> (60 - 4 * i)) & 15)..((x >> (60 - 4 * i)) & 15) + 1]);
+        i = i + 1;
+    }
+    io.println("");
+}
+
+fn describe(v: V) -> str {
+    match v {
+        Num(_) => "num",
+        Int(_) => "int",
+        Nil => "nil",
+        Bool(_) => "bool",
+        A(_) => "a",
+        B(_) => "b",
+        C(_) => "c",
+        Id(_) => "id",
+        D(_) => "d",
+    }
+}
+
+fn main() -> i32 {
+    var o = Obj { id: 1 };
+    let vals: [V; 9] = [V.Num(-1.5), V.Int(-1), V.Nil, V.Bool(true), V.A(&o), V.B(&o), V.C(&o), V.Id(7), V.D(&o)];
+    for i in 0..9 { io.println(describe(vals[i])); }
+    hex(V.Int(-1) as u64);
+    hex(V.Nil as u64);
+    hex(V.Bool(true) as u64);
+    hex(V.Id(7) as u64);
+    // Int and pointer variants share the 48-bit width: one merged test.
+    if let (A(_), Int(x)) = (vals[4], vals[1]) { io.print_int(x as i64); io.println(""); }
+    let nan = 0.0 / 0.0;
+    io.println(describe(V.Num(nan)));
+    0
+}
+// expect: num
+// expect: int
+// expect: nil
+// expect: bool
+// expect: a
+// expect: b
+// expect: c
+// expect: id
+// expect: d
+// expect: fff90000ffffffff
+// expect: fff8800000000000
+// expect: fffa000000000001
+// expect: fffe000000000007
+// expect: -1
+// expect: num

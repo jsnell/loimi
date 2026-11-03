@@ -1,0 +1,12 @@
+testing coroutines
+yields in tail calls
+recursive
+sieve
+coroutine.close
+testing 'coroutine.close'
+yielding across C boundaries
+errors in coroutines
+old bug: attempt to resume itself
+infinite recursion of coroutines
++
+OK

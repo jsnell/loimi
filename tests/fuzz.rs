@@ -84,7 +84,7 @@ fn fuzz_mini() {
     let dir = tmp("mini-src");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    for m in ["value", "vm", "lib"] {
+    for m in ["value", "vm", "lib", "coro"] {
         std::os::unix::fs::symlink(root.join(format!("examples/mini/{m}.lm")), dir.join(format!("{m}.lm"))).unwrap();
     }
     std::os::unix::fs::symlink(root.join("tests/fuzz/minifuzz.lm"), dir.join("minifuzz.lm")).unwrap();

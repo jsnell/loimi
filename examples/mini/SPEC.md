@@ -35,7 +35,8 @@ behaviour.
 
 ## 2. Values and types
 
-The types are nil, boolean, number, string, table and function.
+The types are nil, boolean, number, string, table, function and thread
+(a coroutine, §5).
 
 ### 2.1 Numbers
 
@@ -266,6 +267,24 @@ strings, such as `s:sub(1, 2)`, is not part of Mini.
   for arrays of up to 100 elements (Lua randomizes some pivots in larger
   ones). Calling Mini functions from `comp` nests the interpreter: more
   than 200 nested calls through natives fail with "C stack overflow".
+
+**`coroutine`:** as in Lua 5.4: `coroutine.create(f)`, `resume(co, ...)`,
+`yield(...)`, `status(co)`, `isyieldable([co])`, `running()`, `wrap(f)`
+and `close(co)`. Values pass both ways through resume and yield, an error
+inside a coroutine makes `resume` return false and the message (and the
+coroutine dead), and a `wrap` function raises it. Yield works from any
+depth of Mini calls inside the coroutine.
+- `resume` returns `true` followed by the values, so keep them with
+  `local ok, a, b = coroutine.resume(co)` (§3.1).
+- Yielding while a library function is between the yield and the
+  coroutine, as from inside a `table.sort` comparator, is an error
+  ("attempt to yield across a C-call boundary"), as in Lua for C
+  functions without continuations. A coroutine may still resume others
+  from a comparator.
+- More than 200 coroutines resuming each other at once (nested resumes,
+  together with nested comparator calls) fail with "C stack overflow".
+- `tostring(co)` starts with `"thread: "`. Error messages are unspecified
+  (Mini prefixes `line N: `; Lua's position looks different).
 
 **`io`:**
 - `io.write(...)`: writes strings and numbers, with nothing added

@@ -5,6 +5,8 @@ import std.text;
 import value;
 import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
+import coro;
+import coro.{Coro, Saved};
 
 extern "C" fn pow(a: f64, b: f64) -> f64;
 
@@ -12,6 +14,15 @@ extern "C" fn pow(a: f64, b: f64) -> f64;
 /// the call it is making returns; `nres` is how many results this
 /// frame's caller wants (at least 1). `k` caches cl.proto.consts.
 pub struct Frame { cl: Gc<Closure>, base: *V, resume: *u32, k: *V, nres: u32 }
+
+/// A coroutine's value stack and frame stack (coro.lm). When one grows,
+/// `prev` keeps the block it replaced alive until the coroutine dies: a
+/// native may still hold a pointer into it.
+pub object VStack { prev: ?Gc<VStack>, v: [V] }
+pub object FStack { prev: ?Gc<FStack>, f: [Frame] }
+
+/// `Ctx.nret` when the last native returned one result (its Ok value).
+pub const NRET_ONE: u64 = 0xffffffffffffffff;
 
 pub struct Ctx {
     heap: gc.Heap,
@@ -37,6 +48,32 @@ pub struct Ctx {
     /// (embed.lm); `no_host` in the standalone interpreter. They may call
     /// back into Mini (`call_value`).
     host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter,
+    // Coroutines (coro.lm). The fields above from `stack` to `open_level`
+    // describe the running thread's stacks: resume swaps them.
+    /// The running coroutine: `main` when none is.
+    cur: Gc<Coro>,
+    main: Gc<Coro>,
+    /// The running coroutine's value stack (None on the main stack), which
+    /// open upvalues created now point into.
+    cur_vs: ?Gc<VStack>,
+    /// The threads that resumed the running one, innermost first (records
+    /// on the C stack of `coro.resume`).
+    chain: *Saved,
+    /// Results of the last native when it returned several: `nret` of
+    /// them in `rbuf` (capacity `rcap`). NRET_ONE otherwise.
+    nret: u64,
+    rbuf: *V,
+    rcap: u64,
+    /// Set when a CALL of coroutine.yield left the run, with where to
+    /// continue (`ypc`) and where the CALL's `ynres` results go (`ydst`).
+    yielded: bool,
+    ypc: *u32,
+    ydst: u32,
+    ynres: u32,
+    /// The values that coroutine.yield passed, or that the return that
+    /// ended a run returned (RETN; RET1 and RET0 set only `nxfer`).
+    xfer: *V,
+    nxfer: u64,
 }
 
 pub const HOST_NATIVE: i32 = 1000;
@@ -53,8 +90,26 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.globals);
     gc_mark(h, c.rethrow);
     if let Some(u) = c.open { gc_mark(h, u); }
-    var f = c.frames;
-    while f <= c.fp {
+    scan_frames(h, c.frames, c.fp);
+    // Coroutines: the running one, and the resumers with their stacks
+    // (a suspended coroutine's stacks are traced through its object).
+    gc_mark(h, c.cur);
+    gc_mark(h, c.main);
+    var s = c.chain;
+    while s != 0 as *Saved {
+        gc_mark(h, s.cur);
+        if let Some(u) = s.open { gc_mark(h, u); }
+        scan_frames(h, s.frames, s.fp);
+        s = s.prev;
+    }
+    if c.nret != NRET_ONE {
+        for i in 0..c.nret { gc_mark(h, c.rbuf[i]); }
+    }
+}
+
+fn scan_frames(h: *gc.Heap, first: *Frame, last: *Frame) {
+    var f = first;
+    while f <= last {
         gc_mark(h, f.cl);
         let n = f.cl.proto.nregs as u64;
         for i in 0..n { gc_mark(h, f.base[i]); }
@@ -73,7 +128,7 @@ fn find_upval(c: *Ctx, level: *V) -> Gc<UpVal> {
         prev = cur;
         cur = u.next;
     }
-    let nu = new(&c.heap, UpVal { v: level, closed: V.Nil, next: cur });
+    let nu = new(&c.heap, UpVal { v: level, closed: V.Nil, next: cur, stack: c.cur_vs });
     match prev {
         Some(pu) => pu.next = Some(nu),
         None => {
@@ -241,9 +296,12 @@ fn refuse(cl: Gc<Closure>) {
 
 /// The single dispatch point for natives. Most allocate but never
 /// collect; `table.sort` and host natives may call back into Mini.
-fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> uses reenter {
+/// `from_vm`: called by a CALL instruction, so coroutine.yield may leave
+/// the run there (not through call_value: a native in between).
+fn call_native(c: *Ctx, id: i32, args: *V, n: u64, from_vm: bool) -> Result<V, V> uses reenter {
     if id >= HOST_NATIVE { return c.host(c, id, args, n); }
     if id == lib.T_SORT { return table_sort(c, args, n); }
+    if id >= coro.FIRST { return coro.call(c, id, args, n, from_vm); }
     lib.call(&c.heap, id, args, n)
 }
 
@@ -275,35 +333,126 @@ pub const MAX_NESTING: u32 = 200;
 pub fn call_value(c: *Ctx, f: V, args: *V, n: u64) -> Result<V, V> uses reenter {
     let cl = match f {
         F(cl) => cl,
-        Native(id) => return call_native(c, id, args, n),
+        Native(id) => {
+            let r = call_native(c, id, args, n, false);
+            c.nret = NRET_ONE;
+            return r;
+        }
+        Co(w) if coro.is_wrap(w) => {
+            let Some(co) = w.wrap else { unreachable };
+            let r = coro.resume(c, co, args, n, true);
+            c.nret = NRET_ONE;
+            return r;
+        }
         _ => return Err(error(c, "attempt to call a ", f)),
     };
     if Mini.depth >= MAX_NESTING { return Err(error_msg(c, "C stack overflow")); }
-    let saved_fp = c.fp;
-    let saved_base = c.base;
-    var at = c.frames;
-    var base = c.stack;
-    if saved_base != 0 as *Frame {
-        at = c.fp + 1;
-        base = c.fp.base + c.fp.cl.proto.nregs as u64;
-    }
     let nregs = cl.proto.nregs as u64;
-    if base + nregs > c.stack_end or at + 1 >= c.frames_end {
+    // Frames and registers by index: in a coroutine, the stacks move when
+    // they grow (`grow`), also during the nested run.
+    let nested = c.base != 0 as *Frame;
+    var fi: u64 = 0;
+    var bi: u64 = 0;
+    if nested {
+        fi = frame_index(c, c.fp) + 1;
+        bi = slot_index(c, c.fp.base) + c.fp.cl.proto.nregs as u64;
+        let need = c.stack + bi + nregs;
+        if need > c.stack_end or c.frames + fi + 1 >= c.frames_end {
+            c.fp = grow(c, c.fp, need)?;
+        }
+    } else if c.stack + nregs > c.stack_end or c.frames + 1 >= c.frames_end {
         return Err(error_msg(c, "stack overflow"));
     }
+    let saved_fp = frame_index(c, c.fp);
+    let saved_base = if nested { frame_index(c, c.base) } else { NRET_ONE };
+    let at = c.frames + fi;
+    let base = c.stack + bi;
     // No collection until the run starts and `at` is a frame the
     // collector sees: the arguments are only in the new window.
     for i in 0..nregs { base[i] = if i < n { args[i] } else { V.Nil }; }
     at.base = base;
     let r = Mini.call(c, at, cl);
-    c.fp = saved_fp;
-    c.base = saved_base;
+    c.fp = c.frames + saved_fp;
+    c.base = if nested { c.frames + saved_base } else { 0 as *Frame };
     if let Err(e) = r {
         // The run stopped mid-call: close what its frames left open.
-        close_upvals(c, base);
+        close_upvals(c, c.stack + bi);
         c.rethrow = e;
     }
     r
+}
+
+/// The index of frame `f` in the running thread's frame stack (may be
+/// one below it: `f` = frames - 1 for an empty stack).
+fn frame_index(c: *Ctx, f: *Frame) -> u64 {
+    ((f as u64) -% (c.frames as u64)) / size_of<Frame>()
+}
+
+fn slot_index(c: *Ctx, p: *V) -> u64 {
+    ((p as u64) - (c.stack as u64)) / 8
+}
+
+/// The stack limits of a coroutine (as the main stack's, state.lm).
+pub const CO_SLOTS: u64 = 1 << 20;
+pub const CO_FRAMES: u64 = 1 << 16;
+
+/// Make room in the running coroutine for registers up to `need` and one
+/// more frame above `fp`, moving its stacks if they must grow; returns
+/// `fp` in the frame stack afterwards. Frame bases, open upvalues and the
+/// context's pointers move along; a moved block stays allocated (`prev`)
+/// for natives that hold pointers into it. The main stack does not grow.
+pub fn grow(c: *Ctx, fp: *Frame, need: *V) -> Result<*Frame, V> {
+    let Some(vs) = c.cur_vs else { return Err(error_msg(c, "stack overflow")); };
+    let co = c.cur;
+    let Some(fs) = co.fs else { return Err(error_msg(c, "stack overflow")); };
+    let nslots = slot_index(c, need);
+    let fi = frame_index(c, fp);
+    if nslots > CO_SLOTS or fi + 2 > CO_FRAMES { return Err(error_msg(c, "stack overflow")); }
+    var top = fp;
+    if nslots > vs.v.len {
+        var cap = vs.v.len * 2;
+        while cap < nslots { cap = cap * 2; }
+        if cap > CO_SLOTS { cap = CO_SLOTS; }
+        let nv = new(&c.heap, VStack { prev: Some(vs) }, cap);
+        let old = c.stack;
+        let dst = nv.v.ptr;
+        for i in 0..vs.v.len { dst[i] = old[i]; }
+        for i in vs.v.len..cap { dst[i] = V.Nil; }
+        let delta = (dst as u64) -% (old as u64);
+        var f = c.frames;
+        while f <= fp {
+            f.base = ((f.base as u64) +% delta) as *V;
+            f = f + 1;
+        }
+        var u = c.open;
+        loop {
+            let Some(uv) = u else { break; };
+            uv.v = ((uv.v as u64) +% delta) as *V;
+            uv.stack = Some(nv);
+            u = uv.next;
+        }
+        if c.open_level != 0 as *V { c.open_level = ((c.open_level as u64) +% delta) as *V; }
+        c.stack = dst;
+        c.stack_end = dst + cap;
+        co.vs = Some(nv);
+        c.cur_vs = Some(nv);
+    }
+    if fi + 2 > fs.f.len {
+        var cap = fs.f.len * 2;
+        while cap < fi + 2 { cap = cap * 2; }
+        if cap > CO_FRAMES { cap = CO_FRAMES; }
+        let nf = new(&c.heap, FStack { prev: Some(fs) }, cap);
+        let dst = nf.f.ptr;
+        for i in 0..fi + 1 { dst[i] = c.frames[i]; }
+        let bi = frame_index(c, c.base);
+        c.frames = dst;
+        c.frames_end = dst + cap;
+        c.base = dst + bi;
+        top = dst + fi;
+        co.fs = Some(nf);
+    }
+    c.fp = top;
+    Ok(top)
 }
 
 #[require_verified]
@@ -754,7 +903,7 @@ pub vm Mini {
         inline for (opname, want) in [(name, true), (nname, false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
-                if (x | y) < (1 << 48) { branch((isub) == want, then.target) }
+                if (x | y) < (1 << 32) { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }
@@ -903,7 +1052,12 @@ pub vm Mini {
             let callee = regs + base + 1;
             let n = p.nregs as u64;
             if callee + n > ctx.stack_end or fp + 1 >= ctx.frames_end {
-                cold { raise error_msg(ctx, "stack overflow") }
+                // A coroutine's stacks grow; the main stack does not.
+                cold {
+                    fp = grow(ctx, fp, callee + n)?;
+                    regs = fp.base;
+                    redo
+                }
             }
             var i = nargs as u64;
             while i < n {
@@ -923,23 +1077,54 @@ pub vm Mini {
         if let Native(id) = f {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
-                let v = call_native(ctx, id, regs + base + 1, nargs as u64)?;
-                regs[base] = v;
-                var i: u64 = 1;
-                while i < nres as u64 {
-                    regs[base + i] = Nil;
-                    i += 1;
-                }
-                next
+                let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
+                native_results(base as u64, nres as u64, v)
+            }
+        }
+        if let Co(w) = f and let Some(co) = w.wrap {
+            cold {
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
+                native_results(base as u64, nres as u64, v)
             }
         }
         cold { raise error(ctx, "attempt to call a ", f) }
+    }
+    /// After a native returned `v` to CALL: store its results in
+    /// R[base .. base+nres-1], or, after coroutine.yield, leave the run
+    /// (`coro.resume` picks up the state).
+    fn native_results(base: u64, nres: u64, v: V) -> never {
+        let m = ctx.nret;
+        if m == NRET_ONE {
+            regs[base] = v;
+            var i: u64 = 1;
+            while i < nres {
+                regs[base + i] = Nil;
+                i += 1;
+            }
+            next
+        }
+        ctx.nret = NRET_ONE;
+        if ctx.yielded {
+            ctx.ypc = pc + 1;
+            ctx.ydst = base as u32;
+            ctx.ynres = nres as u32;
+            ctx.fp = fp;
+            exit Ok(Nil)
+        }
+        for i in 0..nres {
+            regs[base + i] = if i < m { ctx.rbuf[i] } else { Nil };
+        }
+        next
     }
     /// Return one value.
     op RET1(src: reg) : ABC {
         let v = src;
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.base { exit Ok(v) }
+        if fp == ctx.base {
+            ctx.nxfer = 1;
+            exit Ok(v)
+        }
         *(regs - 1) = v;
         let want = fp.nres as u64;
         if unlikely(want > 1) {
@@ -959,7 +1144,11 @@ pub vm Mini {
     /// Return R[a .. a+n-1], adjusted to the number of results wanted.
     op RETN(a: reg, n: retn) : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.base { exit Ok(a) }
+        if fp == ctx.base {
+            ctx.xfer = regs + a.raw as u64;
+            ctx.nxfer = n as u64;
+            exit Ok(a)
+        }
         let want = fp.nres as u64;
         let src = regs + a.raw as u64;
         let dst = regs - 1;
@@ -973,7 +1162,10 @@ pub vm Mini {
     }
     op RET0() : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
-        if fp == ctx.base { exit Ok(Nil) }
+        if fp == ctx.base {
+            ctx.nxfer = 0;
+            exit Ok(Nil)
+        }
         let want = fp.nres as u64;
         let dst = regs - 1;
         for i in 0..want { dst[i] = Nil; }
@@ -1064,6 +1256,20 @@ pub vm Mini {
         c.base = fp;
         c.fp = fp;
         jump p.code
+    }
+
+    /// Continue a coroutine suspended in coroutine.yield (coro.resume has
+    /// installed its stacks): `vals[0..n]` are the yield's results.
+    entry resume(c: *Ctx, vals: *V, n: u64) -> Result<V, V> uses reenter {
+        ctx = c;
+        fp = c.fp;
+        regs = fp.base;
+        k = fp.k;
+        let dst = regs + c.ydst as u64;
+        for i in 0..c.ynres as u64 { dst[i] = if i < n { vals[i] } else { V.Nil }; }
+        // A return address a verified CALL saved (as `fp.resume`), which
+        // the entry cannot prove: see COROUTINES.md.
+        unsafe { jump c.ypc }
     }
 
     on raise(e: V) {

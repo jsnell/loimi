@@ -1,7 +1,10 @@
 # Reference interpreters for benchmarking. Built from source by install.sh
-# into bench/lua/install/ (gitignored). Nothing here is committed except
-# this manifest and the script.
+# into bench/lua/install/ (gitignored). install.sh also fetches PUC-Lua's
+# test suite (luatests) into bench/lua/src/lua-5.4.9-tests/ (gitignored);
+# examples/mini/tests/conformance/coroutine_lua.lua is derived from it.
+# Nothing here is committed except this manifest and the script.
 #
 # name    version   url                                                          sha256 / commit
 lua       5.4.9     https://www.lua.org/ftp/lua-5.4.9.tar.gz                     2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
+luatests  5.4.9     https://www.lua.org/tests/lua-5.4.9-tests.tar.gz             7d971845f545ffc09fbb3128a86b2c6524161c70d0fdf0154a16e8c00c343fca
 luajit    2.1       https://github.com/LuaJIT/LuaJIT.git                         ea9eb7edb5eac4a9d175d74523db34fac0fa5180
