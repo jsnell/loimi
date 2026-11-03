@@ -1,0 +1,52 @@
+// Generic instances over two types of the same name from different
+// modules are different instances (with different symbols): types,
+// functions, methods, nested instances, and generic types of the same
+// name as arguments.
+import std.io;
+import std.mem;
+import same_name_mod.m1;
+import same_name_mod.m2;
+
+struct Pair<A, B> { a: A, b: B }
+
+fn first<T>(v: *mem.Vec<T>) -> T { return v.at(0); }
+fn size<T>(x: T) -> i64 { return size_of<T>() as i64; }
+
+fn out(x: i64) { io.print_int(x); io.println(""); }
+
+fn main() {
+    var a: mem.Vec<m1.Handler> = mem.Vec.new();
+    var b: mem.Vec<m2.Handler> = mem.Vec.new();
+    a.push(m1.Handler { start: 1, end: 2 });
+    b.push(m2.Handler { name: 65 });
+    out(first(&a).end);
+    out(first(&b).name as i64);
+    out(size(m1.Kind.B));
+    out(size(m2.Handler { name: 1 }));
+    out(size(m1.Handler { start: 0, end: 0 }));
+    // Nested: a Vec of Vecs of each Handler.
+    var aa: mem.Vec<mem.Vec<m1.Handler>> = mem.Vec.new();
+    var bb: mem.Vec<mem.Vec<m2.Handler>> = mem.Vec.new();
+    aa.push(a);
+    bb.push(b);
+    out(aa.at(0).at(0).start);
+    out(bb.at(0).at(0).name as i64);
+    // Generic types of the same name as arguments.
+    let p: Pair<m1.Box<i64>, m2.Box<i64>> = Pair { a: m1.wrap(3 as i64), b: m2.wrap(4 as i64) };
+    let q: Pair<m2.Box<i64>, m1.Box<i64>> = Pair { a: m2.wrap(5 as i64), b: m1.wrap(6 as i64) };
+    out(p.a.v + p.b.v + p.b.n as i64);
+    out(q.a.v + q.b.v + q.a.n as i64);
+    let ok: ?m1.Kind = m1.Kind.B;
+    let ok2: ?m2.Kind = m2.Kind.Z;
+    out(size(ok) + size(ok2));
+}
+// expect: 2
+// expect: 65
+// expect: 4
+// expect: 1
+// expect: 16
+// expect: 1
+// expect: 65
+// expect: 14
+// expect: 18
+// expect: 16

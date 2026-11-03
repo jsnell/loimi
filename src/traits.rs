@@ -611,7 +611,7 @@ impl<'a> Checker<'a> {
             }
         }
         let env: Vec<(String, Ty)> = params.iter().cloned().zip(env_args.iter().cloned()).collect();
-        let name = self.inst_name(&decl, &env_args);
+        let name = self.inst_name(m, &decl, &env_args);
         let scratch = self.prog.fns.len() as FnId;
         self.prog.fns.push(crate::check::placeholder_fn(decl.name.span));
         self.traits.opaque_depth += 1;

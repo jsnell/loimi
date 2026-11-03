@@ -1,0 +1,5 @@
+// A `Handler` with other fields than m1's.
+pub struct Handler { name: u8 }
+pub enum Kind { X, Y, Z }
+pub struct Box<T> { v: T, n: i32 }
+pub fn wrap<T>(v: T) -> Box<T> { return Box { v: v, n: 7 }; }

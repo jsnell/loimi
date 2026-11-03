@@ -867,6 +867,22 @@ impl<'a> Checker<'a> {
     // ── types ───────────────────────────────────────────────────────
 
     pub fn ty_name(&self, t: &Ty) -> String {
+        self.ty_name_q(t, false)
+    }
+
+    /// As `ty_name`; with `q`, struct, enum and value types are named
+    /// with their modules (`m2.Handler`), for the names of generic
+    /// instances that would otherwise collide (`Checker::unique_name`).
+    pub fn ty_name_q(&self, t: &Ty, q: bool) -> String {
+        if q {
+            match t {
+                Ty::Struct(i) => return self.prog.structs[*i as usize].name.clone(),
+                Ty::Enum(i) => return self.prog.enums[*i as usize].name.clone(),
+                Ty::Value(i) => return self.prog.values[*i as usize].name.clone(),
+                _ => {}
+            }
+        }
+        let tn = |t: &Ty| self.ty_name_q(t, q);
         match t {
             Ty::Int(it) => format!("{}{}", if it.signed { "i" } else { "u" }, it.bits),
             Ty::F32 => "f32".into(),
@@ -874,16 +890,16 @@ impl<'a> Checker<'a> {
             Ty::Bool => "bool".into(),
             Ty::Unit => "()".into(),
             Ty::Never => "never".into(),
-            Ty::Ptr(t) => format!("*{}", self.ty_name(t)),
-            Ty::Slice(t) => format!("[]{}", self.ty_name(t)),
-            Ty::Array(t, n) => format!("[{}; {}]", self.ty_name(t), n),
-            Ty::Option(t) => format!("?{}", self.ty_name(t)),
-            Ty::Result(a, b) => format!("Result<{}, {}>", self.ty_name(a), self.ty_name(b)),
-            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", ")),
+            Ty::Ptr(t) => format!("*{}", tn(t)),
+            Ty::Slice(t) => format!("[]{}", tn(t)),
+            Ty::Array(t, n) => format!("[{}; {}]", tn(t), n),
+            Ty::Option(t) => format!("?{}", tn(t)),
+            Ty::Result(a, b) => format!("Result<{}, {}>", tn(a), tn(b)),
+            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", ")),
             Ty::Fn(ps, r, e) => format!(
                 "fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
             Ty::Struct(i) => {
@@ -900,18 +916,18 @@ impl<'a> Checker<'a> {
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
             Ty::Param(i) => format!("?T{}", i),
-            Ty::Gc(t) => format!("Gc<{}>", self.ty_name(t)),
+            Ty::Gc(t) => format!("Gc<{}>", tn(t)),
             Ty::Opaque(o) => self.traits.opaques[*o as usize].name.clone(),
             Ty::Closure(ps, r, e) => format!(
                 "closure fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
             Ty::Block(ps, r, e) => format!(
                 "block fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
         }
@@ -2713,7 +2729,7 @@ impl<'a> Checker<'a> {
             _ => return Ok(()),
         };
         if cx.unsafe_depth == 0 {
-            let name = name.rsplit('.').next().unwrap_or(&name).replace("__", ".");
+            let name = short_name(&name).replace("__", ".");
             return Err(Diag::new(
                 span,
                 format!("`{}` is unsafe: nothing checks what it promises; wrap the call in `unsafe {{ }}`", name),
@@ -2884,7 +2900,7 @@ impl<'a> Checker<'a> {
         match self.struct_files.get(&sid) {
             Some(&file) if file != f.span.file => {
                 let sname = self.prog.structs[sid as usize].name.clone();
-                let sname = sname.rsplit('.').next().unwrap_or(&sname).replace("__", ".");
+                let sname = short_name(&sname).replace("__", ".");
                 Err(Diag::new(
                     f.span,
                     format!("field `{}` of `{}` is private to the file that declares it", f.name, sname),
@@ -4004,7 +4020,23 @@ pub fn placeholder_fn(span: Span) -> FnDef {
 }
 
 fn short(s: &str) -> String {
-    s.rsplit('.').next().unwrap_or(s).to_string()
+    short_name(s).to_string()
+}
+
+/// The last component of a dotted name, ignoring dots inside `<..>`:
+/// `std.mem.Vec<m1.Handler>` is `Vec<m1.Handler>`.
+pub fn short_name(s: &str) -> &str {
+    let mut depth = 0i32;
+    let mut cut = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            '.' if depth == 0 => cut = i + 1,
+            _ => {}
+        }
+    }
+    &s[cut..]
 }
 
 pub fn effects_of(attrs: &Attrs) -> Res<u8> {

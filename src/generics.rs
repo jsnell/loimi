@@ -36,6 +36,9 @@ pub struct Generics {
     pub inst_of: HashMap<Ty, (u32, Vec<Ty>)>,
     pub fns: Vec<GenericFn>,
     pub fn_inst: HashMap<(u32, Vec<Ty>), FnId>,
+    /// Names of type instances and symbols of function instances made so
+    /// far (`Checker::unique_name`).
+    pub inst_names: std::collections::HashSet<String>,
     /// (generic type, method name) → generic fn.
     pub methods: HashMap<(u32, String), u32>,
     /// (non-generic type, method name) → generic fn: methods with their
@@ -127,14 +130,18 @@ impl<'a> Checker<'a> {
         if let Some(t) = self.generics.type_inst.get(&(g, args.clone())) {
             return Ok(t.clone());
         }
-        let gt = &self.generics.types[g as usize];
         let pattern = args.iter().any(|a| contains_param(a, &self.generics));
-        let name = format!(
-            "{}.{}<{}>",
-            self.module_prefix(module),
-            gt.name,
-            args.iter().map(|a| self.ty_name(a)).collect::<Vec<_>>().join(", ")
-        );
+        let gt = &self.generics.types[g as usize];
+        let gtname = gt.name.clone();
+        let name = self.unique_name(|c, q| {
+            format!(
+                "{}.{}<{}>",
+                c.module_prefix(module),
+                gtname,
+                args.iter().map(|a| c.ty_name_q(a, q)).collect::<Vec<_>>().join(", ")
+            )
+        });
+        let gt = &self.generics.types[g as usize];
         let env: Vec<(String, Ty)> = gt.params.iter().cloned().zip(args.iter().cloned()).collect();
         let decl = gt.decl.clone();
         let ty = match &decl {
@@ -182,14 +189,53 @@ impl<'a> Checker<'a> {
         Ok(ty)
     }
 
+    /// The name of a new generic instance, made by `f(checker, qualify)`:
+    /// type arguments are named by their short names (`Vec<Handler>`)
+    /// unless that name is already taken by another instance (two
+    /// `Handler`s from different modules); then they are named with their
+    /// modules (`Vec<m2.Handler>`). Programs without such collisions keep
+    /// short symbols, and the first of two colliding instances keeps its
+    /// name.
+    pub fn unique_name(&mut self, f: impl Fn(&Self, bool) -> String) -> String {
+        let mut name = f(self, false);
+        if self.generics.inst_names.contains(&name) {
+            name = f(self, true);
+            let base = name.clone();
+            let mut n = 1;
+            while self.generics.inst_names.contains(&name) {
+                name = format!("{}#{}", base, n);
+                n += 1;
+            }
+        }
+        self.generics.inst_names.insert(name.clone());
+        name
+    }
+
     /// The display name of an instance: `f<i64>`, `Vec<u8>.push`, `Box<T>.map<U>`.
-    pub fn inst_name(&self, decl: &FnDecl, args: &[Ty]) -> String {
-        let names: Vec<String> = args.iter().map(|a| self.ty_name(a)).collect();
+    pub fn inst_name(&self, m: usize, decl: &FnDecl, args: &[Ty]) -> String {
+        self.inst_name_q(m, decl, args, false)
+    }
+
+    /// `inst_name`, with `q` as in `ty_name_q`. A method of a generic type
+    /// is named after the receiver's instance (`Vec<m2.Handler>.push` if
+    /// that is the instance's name).
+    pub fn inst_name_q(&self, m: usize, decl: &FnDecl, args: &[Ty], q: bool) -> String {
+        let names: Vec<String> = args.iter().map(|a| self.ty_name_q(a, q)).collect();
         match &decl.recv {
             Some(r) => {
                 let (ra, ma) = names.split_at(decl.recv_generics);
                 let mut b = r.name.clone();
-                if !ra.is_empty() {
+                let recv_inst = match self.scopes[m].get(&r.name) {
+                    Some((crate::check::Def::GenericType(g), _)) => {
+                        self.generics.type_inst.get(&(*g, args[..decl.recv_generics].to_vec()))
+                    }
+                    _ => None,
+                };
+                if let Some(Ty::Struct(i)) = recv_inst {
+                    b = crate::check::short_name(&self.prog.structs[*i as usize].name).to_string();
+                } else if let Some(Ty::Enum(i)) = recv_inst {
+                    b = crate::check::short_name(&self.prog.enums[*i as usize].name).to_string();
+                } else if !ra.is_empty() {
                     b = format!("{}<{}>", b, ra.join(", "));
                 }
                 b = format!("{}.{}", b, decl.name.name);
@@ -213,17 +259,19 @@ impl<'a> Checker<'a> {
         let module = gf.module;
         let decl = gf.decl.clone();
         let env: Vec<(String, Ty)> = gf.params.iter().cloned().zip(args.iter().cloned()).collect();
-        let base = self.inst_name(&decl, &args);
+        let base = self.inst_name(module, &decl, &args);
         if let Some(a) = args.iter().find(|a| contains_block(a)) {
             return Err(Diag::new(span, format!("a `block fn` cannot be a type argument (`{}` in `{}`)", self.ty_name(a), base)));
         }
         let bounds = self.fn_bounds(g, &args)?;
         self.check_bounds(&bounds, &args, base.clone(), span)?;
+        let prefix = self.module_prefix(module);
+        let symbol = self.unique_name(|c, q| format!("{}.{}", prefix, c.inst_name_q(module, &decl, &args, q)));
+        let base = symbol[prefix.len() + 1..].to_string();
         let pattern = args.iter().any(|a| contains_param(a, &self.generics));
         let id = self.prog.fns.len() as FnId;
         self.prog.fns.push(crate::check::placeholder_fn(span));
         self.generics.fn_inst.insert((g, args.clone()), id);
-        let symbol = format!("{}.{}", self.module_prefix(module), base);
         self.prog.fns[id as usize].name = base.clone();
         let saved = std::mem::replace(&mut self.sig_only, pattern);
         let r = self.with_tenv(env.clone(), |c| c.declare_fn(id, module, &decl, Some(symbol)));

@@ -641,7 +641,7 @@ pub fn is_boxed(p: &Program, t: &Ty) -> bool {
 /// width in bits; `limit`: words below it are the `unboxed` variant.
 pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool), String> {
     let var = &d.variants[idx as usize];
-    let short = d.name.rsplit('.').next().unwrap_or(&d.name);
+    let short = crate::check::short_name(&d.name);
     if d.repr == ValueRepr::Boxed {
         return Err(format!("`{}` is boxed (a tag word and a payload word): its variants have no encoding constants", short));
     }
