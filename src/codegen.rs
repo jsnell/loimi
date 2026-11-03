@@ -2439,6 +2439,31 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let a = self.inst(format!("insertvalue {{ ptr, i64 }} poison, ptr {}, 0", vals[0]));
                 self.inst(format!("insertvalue {{ ptr, i64 }} {}, i64 {}, 1", a, vals[1]))
             }
+            Intr::MulWide => {
+                let a = self.inst(format!("zext i64 {} to i128", vals[0]));
+                let b = self.inst(format!("zext i64 {} to i128", vals[1]));
+                let p = self.inst(format!("mul nuw i128 {}, {}", a, b));
+                let lo = self.inst(format!("trunc i128 {} to i64", p));
+                let h = self.inst(format!("lshr i128 {}, 64", p));
+                let hi = self.inst(format!("trunc i128 {} to i64", h));
+                let ot = self.ty(&e.ty);
+                let t = self.inst(format!("insertvalue {} poison, i64 {}, 0", ot, lo));
+                self.inst(format!("insertvalue {} {}, i64 {}, 1", ot, t, hi))
+            }
+            Intr::DivWide => {
+                let h = self.inst(format!("zext i64 {} to i128", vals[0]));
+                let hs = self.inst(format!("shl i128 {}, 64", h));
+                let l = self.inst(format!("zext i64 {} to i128", vals[1]));
+                let n = self.inst(format!("or i128 {}, {}", hs, l));
+                let d = self.inst(format!("zext i64 {} to i128", vals[2]));
+                let q = self.inst(format!("udiv i128 {}, {}", n, d));
+                let q64 = self.inst(format!("trunc i128 {} to i64", q));
+                let qd = self.inst(format!("mul i64 {}, {}", q64, vals[2]));
+                let r = self.inst(format!("sub i64 {}, {}", vals[1], qd));
+                let ot = self.ty(&e.ty);
+                let t = self.inst(format!("insertvalue {} poison, i64 {}, 0", ot, q64));
+                self.inst(format!("insertvalue {} {}, i64 {}, 1", ot, t, r))
+            }
             Intr::Clz | Intr::Ctz | Intr::Popcount => {
                 let lt = self.ty(&e.ty);
                 let (n, extra) = match i {

@@ -128,6 +128,11 @@ pub enum Intr {
     Clz,
     Ctz,
     Popcount,
+    /// `a.mul_wide(b)` on `u64`: the full product as (low, high).
+    MulWide,
+    /// `hi.div_wide(lo, d)` on `u64`: (hi * 2^64 + lo) / d and the
+    /// remainder; the caller guarantees hi < d.
+    DivWide,
     FloatBits,
     BitsToFloat,
     Sqrt,

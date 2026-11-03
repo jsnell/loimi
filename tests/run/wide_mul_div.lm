@@ -1,0 +1,42 @@
+// `mul_wide` and `div_wide` on u64: the 128-bit product, and a 128-bit
+// dividend over a 64-bit divisor (the building blocks of std.bigint).
+import std.io;
+
+fn pair(p: (u64, u64)) {
+    let (a, b) = p;
+    io.print_int(a as i64); io.print(" "); io.print_int(b as i64); io.println("");
+}
+
+fn main() {
+    let m: u64 = 0xffffffffffffffff;
+    pair(m.mul_wide(m));                       // (1, 2^64 - 2)
+    pair((3 as u64).mul_wide(5));              // (15, 0)
+    pair((0x100000000 as u64).mul_wide(0x100000000));  // (0, 1)
+    let (lo, hi) = m.mul_wide(m);
+    pair(hi.div_wide(lo, m));                  // (2^64 - 1, 0)
+    pair((5 as u64).div_wide(123456789, 10000000000));
+    pair((0 as u64).div_wide(17, 5));
+    // Round trip: (q * d + r) == n for a few values.
+    var ok = true;
+    var x: u64 = 0x9E3779B97F4A7C15;
+    for _i in 0..1000 {
+        x = x *% 6364136223846793005 +% 1442695040888963407;
+        let d = x | 1;
+        let hi2 = (x >> 7) % d;
+        let lo2 = x ^ 0x5555;
+        let (q, r) = hi2.div_wide(lo2, d);
+        let (pl, ph) = q.mul_wide(d);
+        let s = pl +% r;
+        let c: u64 = if s < pl { 1 } else { 0 };
+        if s != lo2 or ph + c != hi2 or r >= d { ok = false; }
+    }
+    io.print_bool(ok); io.println("");
+}
+
+// expect: 1 -2
+// expect: 15 0
+// expect: 0 1
+// expect: -1 0
+// expect: 9223372036 8671214869
+// expect: 3 2
+// expect: true

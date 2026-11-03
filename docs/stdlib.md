@@ -68,6 +68,13 @@ import.
   b)` etc., `i64` only).
 - **Bit operations**: `x.clz()`, `x.ctz()`, `x.popcount()` on any
   integer type; shifts `<< >>` (language.md §1.2).
+- **Wide arithmetic** on `u64` (for multi-word integers, `std.bigint`):
+  `a.mul_wide(b) -> (u64, u64)` is the full 128-bit product as (low,
+  high); `hi.div_wide(lo, d) -> (u64, u64)` divides the 128-bit number
+  `hi * 2^64 + lo` by `d` and gives (quotient, remainder). The caller
+  guarantees `hi < d` (so the quotient fits; `d` is then nonzero), as for
+  the x86-64 `div` instruction. They lower to LLVM `i128` operations: a
+  `mul` instruction, and a call of the runtime's `__udivti3`.
 - **Floats** (`f32` and `f64` alike; each lowers to one LLVM
   intrinsic): `x.to_bits()` (`u32`/`u64`) and `f32.from_bits(u32)`,
   `f64.from_bits(u64)`; `x.sqrt()`, `x.abs()`; rounding to an integral
