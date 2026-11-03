@@ -58,7 +58,6 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
 /// Make the heap scan `c` (its globals and VM stack) for roots.
 pub fn attach(c: *Ctx) {
     c.heap.add_scanner(c as *u8, vm.scan_roots);
-    c.heap.add_sweeper(c as *u8, coro.sweep);
 }
 
 /// Free everything `c` owns.

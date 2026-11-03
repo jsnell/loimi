@@ -5,7 +5,7 @@ import std.gc;
 import std.mem;
 import std.hash;
 import std.text;
-import vm.{Mini, VStack};
+import vm.{Mini};
 import coro;
 import coro.{Coro};
 
@@ -60,10 +60,10 @@ pub object Proto {
 /// A captured variable. While open, `v` points at the variable's stack
 /// slot and `next` links the open list (sorted by level, highest first).
 /// Closing copies the value into `closed` and points `v` at it.
-/// `stack` is the coroutine stack that `v` points into while open (None on
-/// the main stack): an open upvalue keeps it alive, as the stack is
-/// freed with its coroutine.
-pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal>, stack: ?Gc<VStack> }
+/// `co` is the coroutine whose stack `v` points into while open: an open
+/// upvalue keeps it alive (and so its stack, which it frees when it is
+/// collected). Closing the upvalue drops it.
+pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal>, co: ?Gc<Coro> }
 pub object Closure { proto: Gc<Proto>, upvals: [Gc<UpVal>] }
 
 pub value V repr nanbox {
