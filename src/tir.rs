@@ -464,6 +464,10 @@ pub struct ValueVariantDef {
     pub shift: u32,
     /// `block N` in the declaration: the block width is pinned.
     pub pinned: bool,
+    /// nanbox, shared layout: a `Gc` variant sharing its 48-bit block
+    /// with other `Gc` variants holds this value in the low 3 bits of the
+    /// (8-byte aligned) pointer: the word is `tag << 48 | ptr | sub`.
+    pub sub: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -475,7 +479,9 @@ pub struct ValueDef {
     /// f64 variant.
     pub num_limit: u64,
     /// The layout the compiler chose, for `--explain-values`: "classic",
-    /// "eight" (nanbox: classic plus the 47-bit block), "packed", "boxed".
+    /// "eight" (nanbox: classic plus the 47-bit block), "packed",
+    /// "shared" (nanbox: packed, with some `Gc` variants sharing blocks),
+    /// "boxed".
     pub layout: &'static str,
 }
 

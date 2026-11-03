@@ -125,6 +125,8 @@ pub fn const_variants(p: &Program, vi: usize) -> Vec<ConstVariant> {
             let v = &d.variants[t as usize];
             let (mask, value, ult) = match d.repr {
                 ValueRepr::NanBox if v.unboxed => (0, d.num_limit, true),
+                // A shared block: the high tag and the pointer's low 3 bits.
+                ValueRepr::NanBox if v.sub.is_some() => (!(low(v.shift) & !7), (v.tag << v.shift) | v.sub.unwrap(), false),
                 ValueRepr::NanBox => {
                     // The payload's bits: narrower integers are stored
                     // zero-extended.

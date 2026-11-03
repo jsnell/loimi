@@ -33,6 +33,11 @@ const NAN_HALF_BLOCK: u64 = 0xFFF8_8000_0000_0000;
 const LOW_BITS: u32 = 3;
 /// Bits a nanbox keeps of a pointer payload.
 const NAN_PTR_BITS: u32 = 48;
+/// The low bits of a `Gc` pointer that a shared nanbox block uses to tell
+/// its variants apart (objects are at least 8-byte aligned), and the
+/// block width of such a variant (`block 45`).
+const NAN_SUB_BITS: u32 = 3;
+const NAN_SHARED_BITS: u32 = NAN_PTR_BITS - NAN_SUB_BITS;
 
 /// Bits a payload of type `t` needs (pointers: `ptr_bits`), or None if the
 /// type cannot be a payload of a one-word value.
@@ -138,9 +143,13 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             }
             let max = if repr == ValueRepr::NanBox { 48 } else { 64 - LOW_BITS };
             let is_ptr = matches!(payload, Some(Ty::Ptr(_) | Ty::Gc(_)));
+            // A nanbox `Gc` variant may share a 48-bit block (`block 45`).
+            let shares = repr == ValueRepr::NanBox && matches!(payload, Some(Ty::Gc(_))) && n == NAN_SHARED_BITS;
             let min = if is_ptr { max } else { tagged.last().unwrap().1 };
-            if n < min || n > max {
-                let what = if is_ptr {
+            if (n < min || n > max) && !shares {
+                let what = if is_ptr && repr == ValueRepr::NanBox && matches!(payload, Some(Ty::Gc(_))) {
+                    format!("a `Gc` pointer takes a whole {}-bit block, or shares one with `block {}`", max, NAN_SHARED_BITS)
+                } else if is_ptr {
                     format!("a pointer takes a whole {}-bit block", max)
                 } else {
                     format!("it can be from its payload's {} bits to {}", min, max)
@@ -150,13 +159,18 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             tagged.last_mut().unwrap().1 = n;
             pinned = true;
         }
-        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0, pinned });
+        variants.push(ValueVariantDef { name: vv.name.name.clone(), payload, unboxed: vv.unboxed, tag: i as u64, shift: 0, pinned, sub: None });
     }
     let too_many = |i: usize, what: &str| Diag::new(v.variants[i].name.span, format!("no room for variant `{}` in the {}", v.variants[i].name.name, what));
     let mut num_limit = NAN_TAG_BASE << 48;
     let classic = if repr == ValueRepr::NanBox { 48 } else { 64 - LOW_BITS };
     // Pinned blocks narrower than the classic ones.
     let narrow_pins: Vec<usize> = tagged.iter().filter(|&&(i, w)| variants[i].pinned && w < classic).map(|t| t.0).collect();
+    // Variants pinned `block 45`: `Gc` pointers sharing a 48-bit block.
+    let shared_pins: Vec<bool> = (0..variants.len())
+        .map(|i| repr == ValueRepr::NanBox && variants[i].pinned && matches!(variants[i].payload, Some(Ty::Gc(_))) && tagged.iter().any(|t| t.0 == i && t.1 == NAN_SHARED_BITS))
+        .collect();
+    let shared_pin = |i: usize| shared_pins[i];
     let layout;
     match repr {
         ValueRepr::NanBox if tagged.len() <= 7 && narrow_pins.is_empty() => {
@@ -173,7 +187,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
         // 48-bit block: tuple tests that mix pointers with an i32 still
         // merge into one test (the packed layout would give an i32 a
         // 32-bit block).
-        ValueRepr::NanBox if tagged.len() == 8 && narrow_pins.len() <= 1 && tagged.iter().any(|t| t.1 <= 47) => {
+        ValueRepr::NanBox if tagged.len() == 8 && narrow_pins.len() <= 1 && !narrow_pins.iter().any(|&i| shared_pin(i)) && tagged.iter().any(|t| t.1 <= 47) => {
             layout = "eight";
             let half = match narrow_pins.first() {
                 Some(&i) => i,
@@ -193,19 +207,62 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             num_limit = NAN_HALF_BLOCK;
         }
         ValueRepr::NanBox => {
-            layout = "packed";
-            let mut need = tagged.clone();
-            need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+            // Packed: blocks sized to the payloads. If the 48-bit blocks
+            // run out (or a variant is pinned `block 45`), `Gc` variants
+            // share 48-bit blocks, up to 8 in one, told apart by the low 3
+            // bits of the pointer: those pinned `block 45`, then as few
+            // unpinned ones as fit, the last declared first.
             let mut free = vec![(NAN_HALF_BLOCK, 47)];
             free.extend((NAN_TAG_BASE..=0xFFFF).map(|t| (t << 48, 48)));
-            // A block is (start, payload bits); halves are its low and high half.
-            let blocks = buddy(free, &need, |start, s| (start, start + (1u64 << (s - 1)))).map_err(|i| {
-                too_many(i, "nanbox's NaN space (seven 48-bit blocks for pointers and 48-bit integers, one 47-bit block)")
-            })?;
+            let pinned_shared: Vec<usize> = tagged.iter().map(|t| t.0).filter(|&i| shared_pin(i)).collect();
+            let candidates: Vec<usize> = tagged
+                .iter()
+                .rev()
+                .map(|t| t.0)
+                .filter(|&i| !variants[i].pinned && matches!(variants[i].payload, Some(Ty::Gc(_))))
+                .collect();
+            let group_size = 1usize << NAN_SUB_BITS;
+            let mut result = None;
+            let mut first_err = None;
+            for k in 0..=candidates.len() {
+                let mut shared: Vec<usize> = pinned_shared.iter().chain(&candidates[..k]).copied().collect();
+                shared.sort();
+                let groups: Vec<&[usize]> = shared.chunks(group_size).collect();
+                // Pseudo-variants for the shared blocks: indices past the variants.
+                let mut need: Vec<(usize, u32)> = tagged.iter().filter(|t| !shared.contains(&t.0)).copied().collect();
+                need.extend((0..groups.len()).map(|g| (variants.len() + g, NAN_PTR_BITS)));
+                need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+                // A block is (start, payload bits); halves are its low and high half.
+                match buddy(free.clone(), &need, |start, s| (start, start + (1u64 << (s - 1)))) {
+                    Ok(blocks) => {
+                        result = Some((blocks, groups.iter().map(|g| g.to_vec()).collect::<Vec<_>>()));
+                        break;
+                    }
+                    Err(i) => {
+                        let i = if i >= variants.len() { groups[i - variants.len()][0] } else { i };
+                        first_err.get_or_insert(i);
+                    }
+                }
+            }
+            let Some((blocks, groups)) = result else {
+                return Err(too_many(
+                    first_err.unwrap(),
+                    "nanbox's NaN space (seven 48-bit blocks for 48-bit integers and pointers, up to 8 `Gc` pointers sharing one; one 47-bit block)",
+                ));
+            };
+            layout = if groups.is_empty() { "packed" } else { "shared" };
             for (i, start) in blocks {
-                let w = tagged.iter().find(|t| t.0 == i).unwrap().1;
-                variants[i].tag = start >> w;
-                variants[i].shift = w;
+                if i >= variants.len() {
+                    for (l, &j) in groups[i - variants.len()].iter().enumerate() {
+                        variants[j].tag = start >> NAN_PTR_BITS;
+                        variants[j].shift = NAN_PTR_BITS;
+                        variants[j].sub = Some(l as u64);
+                    }
+                } else {
+                    let w = tagged.iter().find(|t| t.0 == i).unwrap().1;
+                    variants[i].tag = start >> w;
+                    variants[i].shift = w;
+                }
                 num_limit = num_limit.min(start);
             }
         }
@@ -242,7 +299,7 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
     // every narrowed block is pinned (`block N`): adding a variant must not
     // silently change how the others are encoded (examples/mini/
     // COROUTINES.md, friction 2).
-    if layout == "eight" || layout == "packed" {
+    if layout == "eight" || layout == "packed" || layout == "shared" {
         let narrowed: Vec<usize> =
             tagged.iter().map(|t| t.0).filter(|&i| !variants[i].pinned && block_bits(repr, &variants[i]) < classic).collect();
         if let Some(&first) = narrowed.first() {
@@ -286,6 +343,9 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
 /// A tagged variant's block width in bits: nanbox, the payload bits below
 /// the tag; lowtag, the bits above it.
 pub fn block_bits(repr: ValueRepr, v: &ValueVariantDef) -> u32 {
+    if v.sub.is_some() {
+        return NAN_SHARED_BITS;
+    }
     match repr {
         ValueRepr::NanBox => v.shift,
         ValueRepr::LowTag => 64 - v.shift,
@@ -416,7 +476,7 @@ pub fn make(g: &mut FnGen, t: &Ty, idx: u32, args: &[TExpr], vals: &[String]) ->
                 let nan = g.inst(format!("fcmp uno double {}, {}", vals[0], vals[0]));
                 return g.inst(format!("select i1 {}, i64 {}, i64 {}", nan, CANONICAL_NAN as i64, bits));
             }
-            let tag = (shl(var.tag, var.shift) as i64).to_string();
+            let tag = ((shl(var.tag, var.shift) | var.sub.unwrap_or(0)) as i64).to_string();
             match &var.payload {
                 None => tag,
                 Some(pt) => {
@@ -466,6 +526,11 @@ pub fn is_variant(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
     let var = &d.variants[idx as usize];
     match d.repr {
         ValueRepr::NanBox if var.unboxed => g.inst(format!("icmp ult i64 {}, {}", v, d.num_limit as i64)),
+        ValueRepr::NanBox if var.sub.is_some() => {
+            let (mask, tag) = mask_tag(d, var);
+            let m = g.inst(format!("and i64 {}, {}", v, mask as i64));
+            g.inst(format!("icmp eq i64 {}, {}", m, tag as i64))
+        }
         ValueRepr::NanBox if var.shift == 0 => g.inst(format!("icmp eq i64 {}, {}", v, var.tag as i64)),
         ValueRepr::NanBox => {
             let h = g.inst(format!("lshr i64 {}, {}", v, var.shift));
@@ -494,7 +559,14 @@ pub fn payload(g: &mut FnGen, d: &ValueDef, idx: u32, v: &str) -> String {
             }
             if let Ty::Ptr(_) | Ty::Gc(_) = pt {
                 let m = g.inst(format!("and i64 {}, {}", v, low_mask(var.shift)));
-                return g.inst(format!("inttoptr i64 {} to ptr", m));
+                let p = g.inst(format!("inttoptr i64 {} to ptr", m));
+                // A shared block: the pointer plus its low tag. Subtracting
+                // the tag as an offset lets LLVM fold it into the
+                // displacement of the loads and stores through it.
+                return match var.sub {
+                    Some(l) if l != 0 => g.inst(format!("getelementptr i8, ptr {}, i64 {}", p, -(l as i64))),
+                    _ => p,
+                };
             }
             v.to_string()
         }
@@ -576,16 +648,23 @@ pub fn try_merged_tuple(g: &mut FnGen, pats: &[TPat], tuple_ty: &Ty, ptr: &str, 
     let mut mask: Option<u64> = None;
     let mut unboxed = Vec::new();
     let mut conds = Vec::new();
+    // With a variant of a shared block among them, whole-block `Gc`
+    // variants of a nanbox merge with it: their pointers' low bits are 0.
+    let shared_mask = loaded.iter().find_map(|(d, idx, _, _)| {
+        let var = &d.variants[*idx as usize];
+        var.sub.map(|_| mask_tag(d, var).0)
+    });
     for (d, idx, _, v) in &loaded {
         let var = &d.variants[*idx as usize];
         match d.repr {
             ValueRepr::NanBox if var.unboxed => unboxed.push(v.clone()),
             ValueRepr::NanBox | ValueRepr::LowTag => {
-                let (m, tagbits) = if d.repr == ValueRepr::NanBox {
-                    (!low_mask(var.shift), shl(var.tag, var.shift))
-                } else {
-                    (low_mask(var.shift), var.tag)
-                };
+                let (mut m, tagbits) = mask_tag(d, var);
+                if let Some(sm) = shared_mask {
+                    if d.repr == ValueRepr::NanBox && var.shift == NAN_PTR_BITS && matches!(var.payload, Some(Ty::Gc(_))) && sm & m == m {
+                        m = sm;
+                    }
+                }
                 if mask.is_some_and(|x| x != m) {
                     let c = is_variant(g, d, *idx, v);
                     conds.push(c);
@@ -665,6 +744,9 @@ pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool),
 
 /// A tagged variant's (mask, tag): a word `w` holds it iff `w & mask == tag`.
 fn mask_tag(d: &ValueDef, v: &ValueVariantDef) -> (u64, u64) {
+    if let Some(l) = v.sub {
+        return (!low_mask(v.shift) | low_mask(NAN_SUB_BITS), shl(v.tag, v.shift) | l);
+    }
     match d.repr {
         ValueRepr::NanBox => (!low_mask(v.shift), shl(v.tag, v.shift)),
         _ => (low_mask(v.shift), v.tag),
@@ -693,6 +775,9 @@ pub fn explain(c: &Checker) -> String {
             (ValueRepr::NanBox, "classic") => "every tagged variant has a 48-bit block, 0xFFF9.. in declaration order",
             (ValueRepr::NanBox, "eight") => {
                 "seven tagged variants have 48-bit blocks, 0xFFF9.. in declaration order, and one the start of the 47-bit block 0xFFF8_8000_0000_0000"
+            }
+            (ValueRepr::NanBox, "shared") => {
+                "more 48-bit blocks needed than the NaN space has (or `block 45` pinned): blocks sized to the payloads, and `Gc` variants sharing 48-bit blocks, up to 8 in one, told apart by the low 3 bits of the pointer"
             }
             (ValueRepr::NanBox, _) => {
                 "more than 8 tagged variants (or 8 with none narrower than 48 bits, or narrow blocks pinned): blocks sized to the payloads (or to `block N`), allocated widest first"
@@ -723,6 +808,8 @@ pub fn explain(c: &Checker) -> String {
             let (mask, tag) = mask_tag(d, v);
             let words = if mask == u64::MAX {
                 format!("the word {}", hex(tag))
+            } else if let Some(l) = v.sub {
+                format!("words {} | ptr, low 3 bits {}", hex(tag & !low_mask(NAN_SUB_BITS)), l)
             } else if d.repr == ValueRepr::NanBox {
                 format!("words {} ..= {}", hex(tag), hex(tag | !mask))
             } else {
@@ -759,6 +846,9 @@ pub fn explain(c: &Checker) -> String {
         }
         if let Some(u) = d.variants.iter().find(|v| v.unboxed) {
             let _ = writeln!(s, "    unboxed:  {}  (umax(a, b, ..) < limit)", u.name);
+        }
+        if d.variants.iter().any(|v| v.sub.is_some()) {
+            let _ = writeln!(s, "    (with a block-{} variant, the 48-bit blocks of `Gc` variants merge into its test: their pointers' low 3 bits are 0)", NAN_SHARED_BITS);
         }
         if groups.len() + d.variants.iter().filter(|v| v.unboxed).count() > 1 {
             let _ = writeln!(s, "  elements from different lines do not merge (their tags sit at different bits): one test per line, and-ed");
