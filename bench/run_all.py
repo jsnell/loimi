@@ -16,6 +16,7 @@ per-suite scripts with those binaries as columns:
     regex     rxhost bench + examples/regex/bench.py   vs PCRE2 (no JIT), Python re
     wasm      bench/wasm/bench.py              vs wasm3
     stack     examples/stack/bench/run.py      (no reference)
+    python    bench/python/compare.py          vs CPython 3.13, MicroPython
 
 Every script interleaves its columns within a benchmark (bench.py does
 not, so it runs -n 1 in RUNS rounds here and keeps the minimum). Times
@@ -42,10 +43,12 @@ INTERPS = {
     "lox": ("examples/lox/main.lm", False),
     "wasm": ("examples/wasm/main.lm", False),
     "stack": ("examples/stack/main.lm", False),
+    "python": ("examples/python/main.lm", False),
 }
-SUITES = ["mini", "mini-coro", "minijs", "scheme", "lox", "regex", "wasm", "stack"]
+SUITES = ["mini", "mini-coro", "minijs", "scheme", "lox", "regex", "wasm", "stack", "python"]
 QUICK = {"mini": "fib", "mini-coro": "coroutine_ring", "minijs": "richards", "scheme": "fib",
-         "lox": "fib", "regex": None, "wasm": "nbody", "stack": None}
+         "lox": "fib", "regex": None, "wasm": "nbody", "stack": None,
+         "python": "richards"}
 # Reference columns per suite, in table order (name as the script prints it).
 REFS = {
     "mini": ["lua", "luajit-joff"],
@@ -56,6 +59,7 @@ REFS = {
     "regex": ["pcre2", "python-re"],
     "wasm": ["wasm3"],
     "stack": [],
+    "python": ["cpython", "micropython"],
 }
 
 
@@ -211,6 +215,14 @@ def run_suite(suite, out, n, quick):
         res = parse_columns(t, {os.path.basename(e): m for m, e in exes.items()})
         return {k[:-4] if k.endswith(".stk") else k: v for k, v in res.items()
                 if not quick or k == "fib.stk"}
+    if suite == "python":
+        exes = build_cache(out, suite)
+        have(os.path.join(ROOT, "bench/python/install/bin/python3"), "CPython (bench/python/install.sh)")
+        t = capture(suite, out, [sys.executable, os.path.join(ROOT, "bench/python/compare.py"), "-n", str(n)] +
+                    [f"--exe={m}={e}" for m, e in exes.items()] + (["--only"] + q if q else []))
+        # Cells of output mismatches ("1.234 MISMATCH": MicroPython's random
+        # and last float digits) keep their time.
+        return parse_md(t, {f"{c} (s)": c for c in MODES + REFS["python"]})
     if suite == "regex":
         return run_regex(out, n, quick)
     raise SystemExit(f"unknown suite {suite}")

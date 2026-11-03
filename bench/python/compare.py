@@ -5,10 +5,13 @@ Runs every bench/python/programs/<name>.py under each interpreter, best of N
 wall-clock runs (interleaved: run 1 of every interpreter, then run 2, ...),
 checks stdout against <name>.expected, and prints a markdown table.
 
-  bench/python/compare.py [--loimi CMD] [-n N] [--only a,b]
+  bench/python/compare.py [--loimi CMD | --exe NAME=CMD ...] [-n N] [--only a,b]
 
 --loimi/--cpython/--micropython are commands (shell-split) that take the .py
 path as their last argument; loimi defaults to examples/python/python-loimi.
+`--exe NAME=CMD` (repeatable) replaces the loimi column with one column per
+build, named NAME (bench/run_all.py: one per dispatch mode); ratios are
+given for each of them.
 A missing interpreter is skipped (e.g. no loimi binary -> references only).
 Children run with `ulimit -v 2500000` (RLIMIT_AS) and a 600 s timeout.
 
@@ -70,6 +73,8 @@ def main():
     # float.py); give it a large one, like CPython's unbounded heap.
     ap.add_argument("--micropython", default=os.path.join(HERE, "install/bin/micropython")
                     + " -X heapsize=256M")
+    ap.add_argument("--exe", action="append", default=[], metavar="NAME=CMD",
+                    help="a loimi build as column NAME (repeatable; replaces --loimi)")
     ap.add_argument("-n", type=int, default=3, help="runs per program (best of N)")
     ap.add_argument("--only", help="comma-separated benchmark names")
     args = ap.parse_args()
@@ -82,9 +87,9 @@ def main():
             sys.exit("unknown benchmark(s): " + ", ".join(unknown))
         names = want
 
+    ours = [tuple(e.split("=", 1)) for e in args.exe] or [("loimi", args.loimi)]
     interps = []
-    for label, cmd in (("loimi", args.loimi), ("cpython", args.cpython),
-                       ("micropython", args.micropython)):
+    for label, cmd in ours + [("cpython", args.cpython), ("micropython", args.micropython)]:
         argv = shlex.split(cmd)
         if os.sep in argv[0]:
             argv[0] = os.path.abspath(argv[0])  # children run in programs/
@@ -93,6 +98,7 @@ def main():
         else:
             print("note: %s not found (%s); skipped" % (label, cmd), file=sys.stderr)
     labels = [l for l, _ in interps]
+    mine = [l for l, _ in ours if l in labels]
 
     rows = []
     for name in names:
@@ -119,11 +125,10 @@ def main():
                          " (%s)" % note[l] if note[l] else "") for l in labels),
               file=sys.stderr, flush=True)
 
-    ratios = {"cpython": [], "micropython": []}
+    refs = [r for r in ("cpython", "micropython") if r in labels]
+    ratios = {(o, r): [] for o in mine for r in refs}
     hdr = ["benchmark"] + ["%s (s)" % l for l in labels]
-    have_loimi = "loimi" in labels
-    if have_loimi:
-        hdr += ["loimi/%s" % r for r in ratios if r in labels]
+    hdr += ["%s/%s" % k for k in ratios]
     print("| " + " | ".join(hdr) + " |")
     print("|" + "---|" * len(hdr))
     for name, best, note in rows:
@@ -133,24 +138,18 @@ def main():
                 cells.append("FAIL (%s)" % note[l])
             else:
                 cells.append("%.3f%s" % (best[l], " MISMATCH" if note[l] else ""))
-        if have_loimi:
-            for r in ratios:
-                if r not in labels:
-                    continue
-                ok = all(best[x] is not None and not note[x] for x in ("loimi", r))
-                if ok:
-                    q = best["loimi"] / best[r]
-                    ratios[r].append(q)
-                    cells.append("%.2f" % q)
-                else:
-                    cells.append("-")
+        for (o, r), qs in ratios.items():
+            ok = all(best[x] is not None and not note[x] for x in (o, r))
+            if ok:
+                q = best[o] / best[r]
+                qs.append(q)
+                cells.append("%.2f" % q)
+            else:
+                cells.append("-")
         print("| " + " | ".join(cells) + " |")
-    if have_loimi:
+    if ratios:
         cells = ["geomean"] + [""] * len(labels)
-        for r in ratios:
-            if r not in labels:
-                continue
-            qs = ratios[r]
+        for qs in ratios.values():
             cells.append("%.2f (%d)" % (math.exp(sum(map(math.log, qs)) / len(qs)), len(qs))
                          if qs else "-")
         print("| " + " | ".join(cells) + " |")

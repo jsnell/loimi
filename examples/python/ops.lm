@@ -351,6 +351,28 @@ fn bind_attr(c: *Ctx, selfv: Value, v: Value) -> Result<Value, Value> uses reent
     }
 }
 
+/// Instance attribute `name` (filling the GETATTR cache with its entry),
+/// from the AttrDict or, once `__dict__` was taken, the Dict.
+#[inline]
+fn inst_get(o: Gc<Inst>, name: Gc<Str>, ic: *u32) -> ?Value {
+    if let Some(e) = value.attr_find(o.dict, name) {
+        *ic = e as u32;
+        return Some(o.dict.value(e));
+    }
+    if let Some(d) = value.attrs_full(o.dict) { return value.dict_get_str(d, name); }
+    None
+}
+
+/// `obj.__dict__`, `vars(obj)`: the attributes as a live Dict. Writes to
+/// it bypass setattr, so the class's method caches go off (as when an
+/// instance attribute hides a class attribute).
+pub fn inst_dict(c: *Ctx, o: Gc<Inst>) -> Gc<Dict> {
+    if let Some(d) = value.attrs_full(o.dict) { return d; }
+    o.cls.m = 1;
+    c.epoch +%= 1;
+    value.attrs_view(&c.heap, o)
+}
+
 pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_GETATTR);
     match obj {
@@ -358,20 +380,16 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
             // Data descriptors (properties) on the class win over the instance
             // dict; classes without any (flag 2 in `s`) skip the check.
             if (o.cls.s & 2) == 0 {
-                if let Some(e) = value.attr_find(o.dict, name) {
+                if let Some(v) = inst_get(o, name, ic) {
                     builtins.count(314);
-                    *ic = e as u32;
-                    return Ok(o.dict.value(e));
+                    return Ok(v);
                 }
             }
             let cv = class_lookup(o.cls, name);
             if let Some(Obj(b)) = cv and b.kind == K_PROPERTY { return bind_attr(c, obj, Value.Obj(b)); }
-            if let Some(e) = value.attr_find(o.dict, name) {
-                *ic = e as u32;
-                return Ok(o.dict.value(e));
-            }
+            if let Some(v) = inst_get(o, name, ic) { return Ok(v); }
             if let Some(v) = cv { builtins.count(315); return bind_attr(c, obj, v); }
-            if name.data.eq("__dict__") { return Ok(Value.Dict(value.attrs_dict(&c.heap, o.dict))); }
+            if name.data.eq("__dict__") { return Ok(Value.Dict(inst_dict(c, o))); }
             if name.data.eq("__class__") { return Ok(Value.Obj(o.cls)); }
             let ga = vm.intern(c, "__getattr__");
             if let Some(g) = class_lookup(o.cls, ga) {
@@ -490,6 +508,12 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
                 *ic = e as u32;
                 return Ok(());
             }
+            if name.data.eq("__dict__") {
+                let Dict(nd) = v else { return Err(exc(c, E_TYPE, "__dict__ must be set to a dictionary")); };
+                inst_dict(c, o);
+                value.attrs_replace(&c.heap, o, nd);
+                return Ok(());
+            }
             if cv.is_some() {
                 // The instance now hides a class attribute: method caches
                 // that skip the instance dict must not hit for this class.
@@ -541,7 +565,8 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
     builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
-            if value.attr_find(o.dict, name).is_none() {
+            var ic0: u32 = 0;
+            if inst_get(o, name, &ic0).is_none() {
                 if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
                     if let Func(_) = v {
                         if o.cls.m == 0 {
