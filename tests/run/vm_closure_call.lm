@@ -2,7 +2,9 @@
 // vm code cannot create closures, but it can call stored ones: a builtin
 // table of `closure fn`s and a GC closure in the context, called from
 // handlers like any function pointer (synced and rooted per their
-// effects), and a vm function taking a `closure fn` parameter.
+// effects), and a vm function taking a `closure fn` parameter. Closures
+// with state of their own (`[var n = ..]`) keep it between calls from
+// handlers; the GC hook replaces its traced state on each call.
 import std.io;
 import std.mem;
 import std.mem.{Vec, Arena};
@@ -40,7 +42,12 @@ fn scan_ctx(h: *gc.Heap, p: *u8) {
 
 fn make_hook(h: *gc.Heap, k: i64) -> Gc<closure fn(i64) -> i64 uses gc> {
     let b = new(h, Box { v: k });
-    new(h, |x| { gc.collect(h); x + b.v })
+    new(h, [var last = b] |x| {
+        gc.collect(h);
+        let r = x + last.v;
+        last = new(h, Box { v: last.v + 1 });
+        r
+    })
 }
 
 fn main() uses gc {
@@ -52,12 +59,13 @@ fn main() uses gc {
     let ten = 10;
     c.natives.push(new(a, |x| x * ten));
     c.natives.push(new(a, |x| x + 3));
+    c.natives.push(new(a, [var calls = 0] |x| { calls += 1; x + calls }));
     c.hook = Some(make_hook(&c.heap, 1000));
-    var code: [u32; 5] = [M.NATIVE(0), M.NATIVE(1), M.HOOK(), M.TWICE(1), M.HALT()];
+    var code: [u32; 8] = [M.NATIVE(0), M.NATIVE(1), M.HOOK(), M.TWICE(1), M.NATIVE(2), M.NATIVE(2), M.HOOK(), M.HALT()];
     io.print_int(M.run(&c, &code[0]));
     io.println("");
     c.natives.free();
     c.heap.free();
     arena.free();
 }
-// expect: 1019
+// expect: 2023

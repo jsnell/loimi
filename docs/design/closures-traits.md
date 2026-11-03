@@ -587,7 +587,7 @@ That is also how a C host's callback is wrapped on the Loimi side.
 closures with `arena.free()`; GC closures are collected. A closure used
 after its arena was freed is a use-after-free, like any pointer into the
 arena (`--sanitize=address` reports it); the compiler cannot detect it.
-There is no per-closure `free` (see "Left out").
+One closure is freed with `c.free(a)` (see "State and freeing").
 
 **Generic code.** `closure fn(T) -> U` is an ordinary type: it unifies
 like `fn` types in inference (`fn map<T, U>(xs: []T, f: closure fn(T) ->
@@ -596,11 +596,6 @@ generic function over `F` can take closures of any signature.
 
 ### Left out (for now)
 
-- Per-closure freeing of a malloc'd environment (`mem.release` of the
-  environment needs a way to tell a real environment from a converted
-  plain function's; an arena per lifetime or the GC covers the uses in
-  the repository).
-- Mutable captures (`FnMut`-style state in the environment).
 - `Gc<closure fn>` to `block fn` (needs the object rooted for the
   duration of the call).
 - Closures as C callbacks (code + data pair in the header).
@@ -657,3 +652,57 @@ As designed above; the details:
   `tests/fail/escaping_*.lm` for each error. Removing the body's root
   of its environment, or the tracing of environment objects, makes the
   GC test fail.
+
+### State and freeing (built 2026-11-03)
+
+The two gaps left above, mutable captures and per-closure freeing:
+
+- **State lists, not assignable captures.** Assigning a captured `var`
+  in an escaping closure stays an error. Making it work by reference
+  would need the variable boxed on the heap whenever an escaping closure
+  captures it (Swift, C#, Go), an allocation nobody wrote, and making
+  it a write to the closure's copy (Rust `move` closures) would let
+  `count += 1` silently not count. Instead the closure declares its own
+  variables where it is created: `new(a, [var i = lo, var n] |..|
+  body)` (C++ and Swift capture-list syntax). The parser takes `[var`
+  at the start of an expression as a state list (an array literal
+  cannot start with `var`); `ExprKind::Closure` carries the list, and a
+  `block fn` literal with one is an error. The checker evaluates the
+  initializers in the enclosing scope, then declares the state
+  variables in the closure's scope *before* its `start` index, so the
+  closure's capture computation (locals used with an id below `start`)
+  treats them as captures: they become environment fields with no other
+  change to environment layout, tracing or codegen. `new_closure` wraps
+  the result in `{ let n = init; ..; NewClosure }`, so the enclosing
+  frame holds (and roots) the initial values until they are copied in.
+  `check_escaping_captures` lets state be assigned; in a GC closure, a
+  traced state variable assigned from a nested `block fn` is an error.
+  Codegen: an assignment in a GC closure's body whose place is rooted in
+  one of its environment fields and whose type is traced is followed by
+  `std.gc.barrier(%env)` (`gcgen::env_barrier`); without it the
+  generational verify mode reports the old environment pointing to a
+  young object (`tests/run/gc_closures_state.lm`).
+- **Shared state** stays explicit: a cell from `new(a, v)` (with `a` not
+  a `*gc.Heap`: `a.alloc_bytes(size_of T, align_of T) as *T`, then a
+  store), captured as a pointer. Values with GC references are rejected
+  there, as in arena closures.
+- **`c.free(a)`** lowers to `{ let c' = c; if let Some(p) =
+  closure_env(c') { a.free_bytes(p) } }`. The intrinsic gives the
+  environment unless it is null (no captures) or the code is the
+  signature's trampoline (a converted plain function, whose environment
+  is the function); trampolines are keyed by LLVM signature, which
+  effects do not change, so a closure converted to a type with more
+  effects is still recognized. `a` is evaluated only when there is
+  something to free. `std.mem.Malloc` (C heap, `live` count) and
+  `Arena.free_bytes` (no-op) are new; they and the `Malloc` LLVM type are
+  emitted only where used (`LAZY_STD`, `LAZY_STD_TYPES`), so the IR of
+  every example is unchanged. No ownership tracking: a copy of a freed
+  closure dangles, as with `Vec.free`.
+- **Tests**: `tests/run/closures_state.lm`, `gc_closures_state.lm`
+  (generational, verify, `--gc-check-roots`), `closures_free.lm`,
+  `closures_shared_cell.lm`; `tests/fail/closure_state_*.lm`,
+  `closure_free_*.lm`, `new_cell_*.lm`; the rooting fuzzer
+  (`tests/fuzz/rootgen.rs`) generates GC closures with traced state the
+  body assigns around collections. Under `--sanitize=address` with
+  `detect_leaks=1`, the run tests report no leaks, and a call after
+  `free` is reported as a heap use-after-free.

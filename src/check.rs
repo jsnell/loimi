@@ -3611,9 +3611,14 @@ impl<'a> Checker<'a> {
         if name == "new" && args.len() == 2 && matches!(args[1].kind, ExprKind::Closure(..)) {
             return self.new_closure(cx, &args[0], &args[1], exp, span).map(Some);
         }
+        // `new(a, v)` with an allocator; otherwise `a` (checked once) is
+        // the heap of the object form below.
+        let mut heap = None;
         if name == "new" && args.len() == 2 {
-            if let Some(r) = self.new_in_allocator(cx, &args[0], &args[1], exp, span)? {
-                return Ok(Some(r));
+            let a = self.expr(cx, &args[0], None)?;
+            match self.new_in_allocator(cx, a, &args[0], &args[1], exp, span)? {
+                Ok(r) => return Ok(Some(r)),
+                Err(a) => heap = Some(a),
             }
         }
         if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
@@ -3623,7 +3628,10 @@ impl<'a> Checker<'a> {
             if args.len() != 2 && args.len() != 3 {
                 return Err(Diag::new(span, "`new` takes a heap, an object literal, and (for trailing arrays) a length"));
             }
-            let h = self.expr(cx, &args[0], None)?;
+            let h = match heap.take() {
+                Some(h) => h,
+                None => self.expr(cx, &args[0], None)?,
+            };
             if !matches!(h.ty, Ty::Ptr(_)) {
                 return Err(Diag::new(args[0].span, "the first argument of `new` must be a pointer to a heap"));
             }

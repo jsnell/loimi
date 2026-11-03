@@ -154,7 +154,15 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
   function.
 - `Arena`: `Arena.new()`, `alloc_bytes(n, align) -> *u8`, `str(s) -> str`
   (copy a string into the arena), `free()`. 64 KiB chunks; larger requests
-  get their own chunk.
+  get their own chunk. `free_bytes(p)` does nothing (arena memory is
+  freed all at once), so `c.free(&arena)` on an escaping closure and code
+  generic over the allocator work.
+- `Malloc`: an allocator on the C heap whose allocations are freed one
+  by one: `Malloc.new()`, `alloc_bytes(n, align) -> *u8` (alignment up
+  to 16), `free_bytes(p)`, and `live`, the number of allocations not
+  freed yet. For escaping closures freed one at a time (`new(&m, |..|
+  ..)`, `c.free(&m)`) and cells (`new(&m, v)`, `m.free_bytes(p as
+  *u8)`).
 
 ### Design (not built)
 

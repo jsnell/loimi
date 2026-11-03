@@ -467,10 +467,83 @@ fn main() { Sym { id: 5 }.show_line(); }
   - **Captures are copies**, made when the closure is created, so the
     closure may outlive the frame. Assigning a captured variable inside
     the body (also from a nested `block fn` closure) is an error: the
-    closure has its own copy, and the write would not be seen outside.
-    State the closure updates lives behind a pointer it captures (a
-    generator's position, a counter). Capturing a `block fn` parameter
-    is an error (it only lives during its call).
+    closure has its own copy, and the write would not be seen outside
+    (the error's note shows the two ways below). Capturing a `block fn`
+    parameter is an error (it only lives during its call).
+  - **State of its own**: a *state list* before the literal,
+    `new(a, [var i = lo, var n] |..| body)`, declares variables that
+    belong to the closure. They are fields of its environment, set when
+    the closure is created (`var n` alone copies the local `n`; `var n:
+    T = e` gives a type), and the body may assign them; the values stay
+    between calls. Copies of a closure value share one environment, so
+    they share the state. The enclosing function's variables never
+    change: `[var n]` makes a new `n` that hides the outer one in the
+    body.
+
+    <!-- snippet: run "18 13 10" -->
+    ```loimi
+    import std.io;
+    import std.mem.{Arena};
+
+    fn range(a: *Arena, lo: i64, hi: i64) -> closure fn() -> ?i64 {
+        new(a, [var i = lo] || {              // the position, in the environment
+            if i >= hi { return None; }
+            i += 1;
+            Some(i - 1)
+        })
+    }
+
+    fn main() {
+        var arena = Arena.new();
+        let r = range(&arena, 3, 7);
+        var sum: i64 = 0;
+        while let Some(x) = r() { sum += x; }
+        var n: i64 = 10;
+        let count: closure fn() -> i64 = new(&arena, [var n] || { n += 1; n });
+        count(); count();
+        io.print_int(sum); io.print(" "); io.print_int(count()); io.print(" ");
+        io.print_int(n); io.println("");   // 18 13 10
+        arena.free();
+    }
+    ```
+
+    Why a list and not assignable captures: an assignment to a captured
+    `var` reads as a write to the caller's variable, which for an
+    escaping closure would need the variable moved to the heap behind
+    the programmer's back (Swift's boxes, C#'s display classes). Loimi
+    does not allocate implicitly, so a closure that wants state says so
+    where it is created, and the state costs nothing beyond the
+    environment the closure already has. In a GC closure, traced state
+    is marked through the environment object, and an assignment in the
+    body gets the write barrier; assigning traced state from a `block
+    fn` nested in the body is an error (that store would go through a
+    pointer, without the barrier).
+  - **Shared state** between a closure and its creator (or between
+    closures) is a cell both capture as a pointer. `new(a, v)` with an
+    allocator makes one: it copies `v` into `a.alloc_bytes(size, align)`
+    and gives a `*T` (with a `*gc.Heap` it is the object form, section
+    8; GC references cannot go into allocator memory):
+
+    <!-- snippet: run "3 3"
+    import std.io;
+    import std.mem.{Arena};
+    {snippet}
+    fn main() {
+        var arena = Arena.new();
+        let c = counter(&arena);
+        c.inc(); c.inc(); c.inc();
+        io.print_int(c.get()); io.print(" "); io.print_int(*c.n); io.println("");
+        arena.free();
+    }
+    -->
+    ```loimi
+    struct Counter { n: *i64, inc: closure fn(), get: closure fn() -> i64 }
+
+    fn counter(a: *Arena) -> Counter {
+        let n = new(a, 0);                    // a *i64 in the arena
+        Counter { n: n, inc: new(a, || *n += 1), get: new(a, || *n) }
+    }
+    ```
   - **GC.** Capturing a traced value (`Gc<T>`, a `value` type with
     references, a struct holding one) is only allowed in
     `new(heap, ..)`: the arena environment is invisible to the collector,
@@ -489,9 +562,38 @@ fn main() { Sym { id: 5 }.show_line(); }
     `Gc<closure fn>` converts to neither (an untraced copy would not keep
     it alive).
   - **Freeing** belongs to the allocator: `arena.free()` frees every
-    environment in it; the GC frees GC closures. Calling a closure whose
-    arena was freed is a use-after-free that the compiler does not
-    detect (`--sanitize=address` does).
+    environment in it; the GC frees GC closures. One `closure fn` is
+    freed with `c.free(a)`, where `a` is the allocator that made it: it
+    calls `a.free_bytes(env: *u8)` if `new(a, ..)` allocated an
+    environment, and does nothing for a closure that owns no memory (one
+    without captures or state, or a plain function converted to `closure
+    fn`), so a table mixing both can free every entry. `std.mem.Malloc`
+    is an allocator on the C heap whose allocations are freed one by one
+    (its `live` counts them); `Arena.free_bytes` does nothing, so code
+    generic over the allocator can free either way. As with `Vec.free`,
+    there is no ownership tracking: the closure value and its copies
+    still hold the old environment, and calling one, or freeing it
+    again, is a use-after-free that the compiler does not detect
+    (`--sanitize=address` does). Freeing the environment frees nothing
+    its captures or state point to (a captured `Vec`'s buffer); a cell
+    from `new(a, v)` is freed with `a.free_bytes(p as *u8)`.
+
+    <!-- snippet: run "live 0" -->
+    ```loimi
+    import std.io;
+    import std.mem.{Malloc};
+
+    fn double(x: i64) -> i64 { x * 2 }
+
+    fn main() {
+        var m = Malloc.new();
+        let k = 5;
+        let fs: [closure fn(i64) -> i64; 3] = [new(&m, |x| x + k), new(&m, |x| -x), double];
+        io.print_int(fs[0](1) + fs[1](1) + fs[2](1)); io.println("");   // 6 - 1 + 2
+        for f in fs { f.free(&m); }           // frees the first one's environment
+        io.print("live "); io.print_int(m.live as i64); io.println("");
+    }
+    ```
   - **vm code** cannot create closures (as for `block fn`), but handlers
     and vm functions can call stored ones, which are synced and rooted
     per their effects like `fn` fields; vm functions may take
@@ -575,7 +677,9 @@ fn main() { Sym { id: 5 }.show_line(); }
 
 There is no borrow checker. Host memory is managed through explicit allocators,
 mostly arenas (`std.mem`), which suit compilers and interpreters well: ASTs,
-IR, and per-compilation data die together. Guest memory lives in the GC heap
+IR, and per-compilation data die together. `new(a, v)` with such an
+allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
+(`new(&arena, Node { .. })`). Guest memory lives in the GC heap
 (section 8). This is "safety-leaning", not memory-safe:
 
 - **Arrays and slices are bounds-checked** (in debug and release builds),

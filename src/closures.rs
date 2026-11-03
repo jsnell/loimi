@@ -370,14 +370,14 @@ impl<'a> Checker<'a> {
     /// copy of `v` in memory from `a.alloc_bytes(size, align)`, `{ let x =
     /// v; let p = a.alloc_bytes(..) as *T; *p = x; p }`. A cell that
     /// escaping closures and their creator share by capturing the
-    /// pointer. None when `a` is a GC heap (or not a pointer): that is
-    /// `new(heap, Obj { .. })`.
-    pub fn new_in_allocator(&mut self, cx: &mut FnCx, alloc: &Expr, init: &Expr, exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
-        let mut probe = cx.probe();
-        let Ok(at) = self.expr(&mut probe, alloc, None).map(|a| a.ty) else { return Ok(None) };
-        let gc = matches!(&at, Ty::Ptr(t) if matches!(**t, Ty::Struct(s) if self.prog.structs[s as usize].name == "std.gc.Heap"));
+    /// pointer. `a` (checked, from the expression `alloc`) is given back
+    /// when it is a GC heap (or not a pointer): that is `new(heap, Obj {
+    /// .. })`.
+    pub fn new_in_allocator(&mut self, cx: &mut FnCx, a: TExpr, alloc: &Expr, init: &Expr, exp: Option<&Ty>, span: Span) -> Res<Result<TExpr, TExpr>> {
+        let at = &a.ty;
+        let gc = matches!(at, Ty::Ptr(t) if matches!(**t, Ty::Struct(s) if self.prog.structs[s as usize].name == "std.gc.Heap"));
         if gc || !matches!(at, Ty::Ptr(_)) {
-            return Ok(None);
+            return Ok(Err(a));
         }
         let want = match exp {
             Some(Ty::Ptr(t)) => Some((**t).clone()),
@@ -403,7 +403,6 @@ impl<'a> Checker<'a> {
                 format!("`{}` holds GC references, but memory from `a.alloc_bytes` is not traced: keep it in an object (`new(heap, ..)`)", self.ty_name(&t)),
             ));
         }
-        let a = self.expr(cx, alloc, None)?;
         let concrete = self.traits.opaque_depth == 0 && !matches!(t, Ty::Opaque(_) | Ty::Param(_));
         let (size, align) = if concrete {
             (crate::layout::size_of(&self.prog, &t) as u128, crate::layout::align_of(&self.prog, &t).max(1) as u128)
@@ -429,7 +428,7 @@ impl<'a> Checker<'a> {
         cx.scopes.pop();
         let cell = mk(pt.clone(), TK::Local(p), span);
         let store = mk(Ty::Unit, TK::Assign(Box::new(mk(t.clone(), TK::Deref(Box::new(cell.clone())), span)), Box::new(mk(t, TK::Local(x), span))), span);
-        Ok(Some(mk(
+        Ok(Ok(mk(
             pt.clone(),
             TK::Block(
                 vec![
