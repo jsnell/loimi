@@ -391,8 +391,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     while let Some(sl) = m.globals.next(&gi) { gc_mark(h, sl.value); }
     for i in 0..m.preds.len {
         let pr = m.preds.ptr[i];
-        for j in 0..pr.clauses.len {
-            gc_mark(h, pr.clauses.ptr[j].term);
-        }
+        var cur = pr.first;
+        while let Some(c) = cur { gc_mark(h, c.term); cur = c.next; }
     }
 }

@@ -25,12 +25,23 @@ pub struct Clause {
     erased: bool,
     pred: *Pred,
     id: u64,
+    next: ?*Clause,
+    prev: ?*Clause,
+    knext: ?*Clause,
+    kprev: ?*Clause,
 }
+
+/// The clauses of one first-argument key, in order (for clause/2 and
+/// retract/1 on large dynamic predicates).
+pub struct KList { head: ?*Clause, tail: ?*Clause }
 
 pub struct Pred {
     f: u32,
     arity: u32,
-    clauses: mem.Vec<*Clause>,
+    first: ?*Clause,
+    last: ?*Clause,
+    kmap: HashMap<u64, KList>,
+    kvar: u64,
     code: *u32,
     var_code: *u32,
     lst_code: *u32,
@@ -128,7 +139,10 @@ pub fn new_pred(m: *Machine, f: u32) -> *Pred {
     let p = mem.alloc<Pred>(1);
     p.f = f;
     p.arity = m.db.farity(f);
-    p.clauses = mem.Vec.new();
+    p.first = None;
+    p.last = None;
+    p.kmap = HashMap.new();
+    p.kvar = 0;
     p.mask = 0;
     p.dynamic = false;
     p.defined = false;
@@ -159,6 +173,58 @@ pub fn ensure_preds(m: *Machine) {
     }
 }
 
+fn klink(p: *Pred, c: *Clause, front: bool) {
+    if c.key == 0 { p.kvar += 1; return; }
+    if let Some(kl) = p.kmap.get_ptr(c.key) {
+        if front {
+            c.knext = kl.head;
+            if let Some(h) = kl.head { h.kprev = Some(c); } else { kl.tail = Some(c); }
+            kl.head = Some(c);
+        } else {
+            c.kprev = kl.tail;
+            if let Some(t) = kl.tail { t.knext = Some(c); } else { kl.head = Some(c); }
+            kl.tail = Some(c);
+        }
+    } else {
+        p.kmap.insert(c.key, KList { head: Some(c), tail: Some(c) });
+    }
+}
+
+pub fn clear_clauses(p: *Pred) {
+    p.first = None;
+    p.last = None;
+    p.kmap.clear();
+    p.kvar = 0;
+}
+
+pub fn link_last(p: *Pred, c: *Clause) {
+    klink(p, c, false);
+    c.next = None;
+    c.prev = p.last;
+    if let Some(l) = p.last { l.next = Some(c); } else { p.first = Some(c); }
+    p.last = Some(c);
+}
+
+pub fn link_first(p: *Pred, c: *Clause) {
+    klink(p, c, true);
+    c.prev = None;
+    c.next = p.first;
+    if let Some(f) = p.first { f.prev = Some(c); } else { p.last = Some(c); }
+    p.first = Some(c);
+}
+
+/// Take an erased clause out of its predicate's list. Its own `next` stays,
+/// so an iteration standing on it (retract/1, clause/2) can go on.
+pub fn unlink(p: *Pred, c: *Clause) {
+    if let Some(pr) = c.prev { pr.next = c.next; } else { p.first = c.next; }
+    if let Some(nx) = c.next { nx.prev = c.prev; } else { p.last = c.prev; }
+    if c.key == 0 { p.kvar -= 1; return; }
+    if let Some(kl) = p.kmap.get_ptr(c.key) {
+        if let Some(pr) = c.kprev { pr.knext = c.knext; } else { kl.head = c.knext; }
+        if let Some(nx) = c.knext { nx.kprev = c.kprev; } else { kl.tail = c.kprev; }
+    }
+}
+
 pub fn mark_dirty(p: *Pred) {
     p.code = p.stub;
 }
@@ -166,13 +232,8 @@ pub fn mark_dirty(p: *Pred) {
 /// Rebuild a predicate's entry code from its live clauses.
 pub fn reindex(m: *Machine, p: *Pred) {
     var live: mem.Vec<*Clause> = mem.Vec.new();
-    for i in 0..p.clauses.len {
-        let c = p.clauses.ptr[i];
-        if !c.erased { live.push(c); }
-    }
-    // Drop erased clauses from the list (their code stays).
-    p.clauses.clear();
-    for i in 0..live.len { p.clauses.push(live.ptr[i]); }
+    var cur = p.first;
+    while let Some(c) = cur { if !c.erased { live.push(c); } cur = c.next; }
     p.mask = 0;
     if live.len == 0 {
         p.code = if p.dynamic or p.defined { m.fail_code } else { block1(m, Wam.UNDEF(p.f)) };
@@ -642,16 +703,16 @@ fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
     let lcut = Term.Atom(m.db.atom("$localcut"));
     if cname == term.A_NOT {
         // \+ G:  aux :- G, !, fail.  aux.
-        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), m.mk2(term.A_COMMA, lcut, Term.Atom(term.A_FAIL)));
+        let b1 = m.mk2(term.A_COMMA, opaque(m, s.args[0]), m.mk2(term.A_COMMA, lcut, Term.Atom(term.A_FAIL)));
         add_compiled(m, p, head, b1, None);
         add_compiled(m, p, head, Term.Atom(term.A_TRUE), None);
     } else if cname == term.A_ARROW {
         // (C -> T):  aux :- C, !, T.
-        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), m.mk2(term.A_COMMA, lcut, s.args[1]));
+        let b1 = m.mk2(term.A_COMMA, opaque(m, s.args[0]), m.mk2(term.A_COMMA, lcut, s.args[1]));
         add_compiled(m, p, head, b1, cut);
     } else if cname == term.A_SOFT {
         // (C *-> T) alone is (C, T).
-        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), s.args[1]);
+        let b1 = m.mk2(term.A_COMMA, opaque(m, s.args[0]), s.args[1]);
         add_compiled(m, p, head, b1, cut);
     } else {
         // A ; B, with (C -> T ; E) and (C *-> T ; E).
@@ -660,7 +721,7 @@ fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
         if let Str(ls) = l and ls.args.len == 2 {
             let lname = m.db.fname(ls.f);
             if lname == term.A_ARROW {
-                let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
+                let b1 = m.mk2(term.A_COMMA, opaque(m, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
                 add_compiled(m, p, head, b1, cut);
                 add_compiled(m, p, head, s.args[1], cut);
                 done = true;
@@ -668,7 +729,7 @@ fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
                 // aux :- '$softmark'(L), C, '$softcut'(L), T.   aux :- '$softfail'(L)?
                 // Approximation: soft-cut as if-then-else when C succeeds
                 // at most once.
-                let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
+                let b1 = m.mk2(term.A_COMMA, opaque(m, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
                 add_compiled(m, p, head, b1, cut);
                 add_compiled(m, p, head, s.args[1], cut);
                 done = true;
@@ -684,10 +745,16 @@ fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
     vars.free();
 }
 
+/// A goal whose cuts must stay local (a condition, the goal of \\+): wrapped
+/// in call/1 only if it contains a cut.
+fn opaque(m: *Machine, g: Term) -> Term {
+    if has_cut(m, g) { m.mk1(term.A_CALL, g) } else { g }
+}
+
 fn add_compiled(m: *Machine, p: *Pred, head: Term, body: Term, cv: ?Term) {
     if let Some(cl) = compile_clause(m, head, body, cv) {
         cl.pred = p;
-        p.clauses.push(cl);
+        link_last(p, cl);
     }
 }
 
@@ -706,7 +773,7 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     let lcut_atom = m.db.atom("$localcut");
     for i in 0..goals.len {
         let g = goals.ptr_at(i);
-        if g.kind == GoalKind.Builtin and g.t == Term.Atom(lcut_atom) { g.kind = GoalKind.Cut; }
+        if g.t == Term.Atom(lcut_atom) { g.kind = GoalKind.Cut; }
     }
     // Chunks: a call of a predicate ends one.
     let arity = match head { Str(s) => s.args.len, _ => 0 };
@@ -854,6 +921,10 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     cl.key = if arity > 0 { key_of(deref(term.arg_of(head, 0))) } else { 0 };
     cl.term = Term.Atom(term.A_TRUE);
     cl.erased = false;
+    cl.next = None;
+    cl.prev = None;
+    cl.knext = None;
+    cl.kprev = None;
     cl.id = m.clauses.len;
     m.clauses.push(cl);
     c.code.free();
@@ -903,6 +974,6 @@ pub fn prepare_call(m: *Machine, n: u64) -> Result<*u32, Term> {
     if ar as u64 >= machine.NREGS { return Err(builtins.resource_error(m, "arity")); }
     for i in 0..ar as u64 { m.x[i] = term.arg_of(g, i); }
     let p = pred_of(m, f);
-    if !p.defined and p.clauses.len == 0 and m.flag_unknown_fail { return Ok(m.fail_code); }
+    if !p.defined and p.first.is_none() and m.flag_unknown_fail { return Ok(m.fail_code); }
     Ok(p.code)
 }

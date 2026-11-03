@@ -31,7 +31,7 @@ pub enum B {
     Format1, Format2, Format3,
     Throw, Cut, CatchEnter, CatchExit, CatchBall,
     FaBegin, FaAdd, FaEnd,
-    Assert, Asserta, Clauses, ClauseRef, Erase, Dynamic, Abolish,
+    Assert, Asserta, Clauses, ClauseNext, ClauseRef, Erase, Dynamic, Abolish,
     Msort, Sort, Sort4, Keysort, Length2,
     Op, Ops, SetFlag, Halt1, Statistics, GarbageCollect,
     AddClause, TermVariables, Succ, Plus, NbSetval, NbGetval, Tab2, Numbervars, CharType, Atomics, Ignore2,
@@ -58,7 +58,7 @@ pub fn register(m: *Machine) {
         ("format", 1, B.Format1), ("format", 2, B.Format2), ("format", 3, B.Format3),
         ("throw", 1, B.Throw), ("$cut", 1, B.Cut), ("$catch_enter", 1, B.CatchEnter), ("$catch_exit", 1, B.CatchExit),
         ("$catch_ball", 1, B.CatchBall), ("$fa_begin", 0, B.FaBegin), ("$fa_add", 1, B.FaAdd), ("$fa_end", 1, B.FaEnd),
-        ("assert", 1, B.Assert), ("assertz", 1, B.Assert), ("asserta", 1, B.Asserta), ("$clauses", 2, B.Clauses),
+        ("assert", 1, B.Assert), ("assertz", 1, B.Assert), ("asserta", 1, B.Asserta), ("$clause_gen", 2, B.Clauses), ("$clause_next", 4, B.ClauseNext),
         ("$clause", 3, B.ClauseRef), ("$erase", 1, B.Erase), ("dynamic", 1, B.Dynamic), ("abolish", 1, B.Abolish),
         ("discontiguous", 1, B.Ignore2), ("ensure_loaded", 1, B.Ignore2), ("use_module", 1, B.Ignore2), ("style_check", 1, B.Ignore2),
         ("msort", 2, B.Msort), ("sort", 2, B.Sort), ("sort", 4, B.Sort4), ("keysort", 2, B.Keysort), ("$length", 2, B.Length2),
@@ -293,14 +293,7 @@ pub fn add_clause(m: *Machine, c0: Term, front: bool, keep_term: bool) -> Result
     let Some(cl) = compile.compile_clause(m, h, body, None) else { return Ok(false); };
     cl.pred = p;
     if keep_term { cl.term = m.mk2(term.A_NECK, h, body); }
-    if front {
-        p.clauses.push(cl);
-        var i = p.clauses.len - 1;
-        while i > 0 { p.clauses.ptr[i] = p.clauses.ptr[i - 1]; i -= 1; }
-        p.clauses.ptr[0] = cl;
-    } else {
-        p.clauses.push(cl);
-    }
+    if front { compile.link_first(p, cl); } else { compile.link_last(p, cl); }
     compile.mark_dirty(p);
     Ok(true)
 }
@@ -316,7 +309,7 @@ pub fn consult_clause(m: *Machine, c: Term, library: bool) -> Result<bool, Term>
         let p = compile.pred_of(m, f);
         if p.library and !library {
             p.library = false;
-            p.clauses.clear();
+            compile.clear_clauses(p);
             compile.mark_dirty(p);
         }
         let r = add_clause(m, c, false, p.dynamic);
@@ -885,20 +878,42 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
         Assert => add_clause(m, m.x[0], false, true),
         Asserta => add_clause(m, m.x[0], true, true),
         Clauses => {
+            // '$clause_gen'(Head, Gen): the newest clause id now, for the
+            // logical update view of clause/2 and retract/1.
             let h = x(m, 0);
-            let Some(p) = pred_of_head(m, h, false)? else { return Ok(unify(m, m.x[1], Term.Atom(term.A_NIL))); };
+            let Some(p) = pred_of_head(m, h, true)? else { return Ok(false); };
             if !p.dynamic and p.defined {
                 let (name, ar) = term.name_arity(&m.db, h);
                 return Err(permission_error(m, "access", "private_procedure", pi(m, name, ar)));
             }
-            var refs: mem.Vec<Term> = mem.Vec.new();
-            for i in 0..p.clauses.len {
-                let c = p.clauses.ptr[i];
-                if !c.erased { refs.push(term.mk_int(c.id as i64)); }
+            Ok(unify(m, m.x[1], term.mk_int(m.clauses.len as i64)))
+        }
+        ClauseNext => {
+            // '$clause_next'(Head, Gen, Prev, Ref): the next live clause
+            // after Prev (-1: the first) that is older than Gen and whose
+            // first argument can match Head's.
+            let h = x(m, 0);
+            let gen = get_int(m, x(m, 1))? as u64;
+            let prev = get_int(m, x(m, 2))?;
+            let Some(p) = pred_of_head(m, h, false)? else { return Ok(false); };
+            let key = if p.arity > 0 { compile.key_of(deref(term.arg_of(h, 0))) } else { 0 };
+            if key != 0 and p.kvar == 0 {
+                // Only clauses with this key can match: follow its list.
+                var kc = if prev < 0 { match p.kmap.get(key) { Some(kl) => kl.head, None => None } } else { m.clauses.ptr[prev as u64].knext };
+                while let Some(c) = kc {
+                    if !c.erased and c.id < gen { return Ok(unify(m, m.x[3], term.mk_int(c.id as i64))); }
+                    kc = c.knext;
+                }
+                return Ok(false);
             }
-            let l = mk_list(m, &refs, 0);
-            refs.free();
-            Ok(unify(m, m.x[1], l))
+            var cur = if prev < 0 { p.first } else { m.clauses.ptr[prev as u64].next };
+            while let Some(c) = cur {
+                if !c.erased and c.id < gen and (key == 0 or c.key == 0 or c.key == key) {
+                    return Ok(unify(m, m.x[3], term.mk_int(c.id as i64)));
+                }
+                cur = c.next;
+            }
+            Ok(false)
         }
         ClauseRef => {
             let id = get_int(m, x(m, 0))?;
@@ -911,7 +926,7 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
         Erase => {
             let id = get_int(m, x(m, 0))?;
             let c = m.clauses.ptr[id as u64];
-            if !c.erased { c.erased = true; compile.mark_dirty(c.pred); }
+            if !c.erased { c.erased = true; compile.unlink(c.pred, c); compile.mark_dirty(c.pred); }
             Ok(true)
         }
         Dynamic => decl_dynamic(m, m.x[0]),

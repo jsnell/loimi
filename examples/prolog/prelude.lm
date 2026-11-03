@@ -48,13 +48,13 @@ setof(T, G, S) :- bagof(T, G, L), sort(L, S).
 '$member'(X, [X|_]).
 '$member'(X, [_|T]) :- '$member'(X, T).
 
-retract(C) :- '$clause_parts'(C, H, B), '$clauses'(H, Rs), '$member'(R, Rs), '$clause'(R, H, B), '$erase'(R).
-clause(H, B) :- '$clauses'(H, Rs), '$member'(R, Rs), '$clause'(R, H, B).
+retract(C) :- '$clause_parts'(C, H, B), '$clause_gen'(H, G), '$clause_iter'(H, G, -1, R), '$clause'(R, H, B), '$erase'(R).
+clause(H, B) :- '$clause_gen'(H, G), '$clause_iter'(H, G, -1, R), '$clause'(R, H, B).
+'$clause_iter'(H, G, P, R) :- '$clause_next'(H, G, P, R1), ( R = R1 ; '$clause_iter'(H, G, R1, R) ).
 '$clause_parts'(C, H, B) :- nonvar(C), C = (H :- B), !.
 '$clause_parts'(H, H, true).
-retractall(H) :- '$clauses'(H, Rs), '$retractall'(Rs, H).
-'$retractall'([], _).
-'$retractall'([R|Rs], H) :- ( \\+ \\+ '$clause'(R, H, _) -> '$erase'(R) ; true ), '$retractall'(Rs, H).
+retractall(H) :- '$clause_gen'(H, G), '$retractall'(H, G, -1).
+'$retractall'(H, G, P) :- ( '$clause_next'(H, G, P, R) -> ( \\+ \\+ '$clause'(R, H, _) -> '$erase'(R) ; true ), '$retractall'(H, G, R) ; true ).
 
 between(L, H, X) :- integer(X), !, X >= L, X =< H.
 between(L, inf, X) :- !, '$between_inf'(L, X).
