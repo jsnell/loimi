@@ -338,7 +338,7 @@ quickening on/off.
 
    *Decided (first version):* the API is whatever the interpreter writes as
    `export "C"` functions; `loimi build --lib`/`--shared` builds the library
-   and `--header` declares them (`language.md` §10). Interpreter state is an
+   and `--header` declares them (`language.md` §10.1). Interpreter state is an
    opaque struct pointer (`MiniState *`), error codes are payload-less enums
    (a typedef plus `E_Variant` constants), strings are `loimi_str`
    (pointer and length). There are no value handles: `Gc<T>` and `value`

@@ -981,7 +981,7 @@ Why it falls so far short of the bound:
   holes, so LLVM cannot know they are the same register. (Not the
   match arms: where the indices are known equal, GVN merges the arms'
   stored values in a phi.) Fixed independently of any cache: forwarding
-  variants of `#[forward]` supers (language.md section 7), measured in
+  variants of `#[forward]` supers (language.md §7.3), measured in
   `bench/mini/RESULTS.md`.
 - Integers pay a round trip `movq` to and from xmm15 (2 + 2 cycles on
   Skylake), about what the store-to-load forwarding cost. Integer code
