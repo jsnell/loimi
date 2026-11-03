@@ -287,7 +287,7 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
   `error_at(start, msg)`, `error_here(msg)`. Character classes are ASCII
   (`lex.is_digit`, `is_alpha`, `is_ident_start`, `is_ident_char`,
   `is_hex_digit`, `is_space`).
-- Scanners: `skip_trivia`, `ident -> ?str`, `at_number`/`number` (via
+- Scanners: `skip_trivia` (fails on an unterminated block or long comment), `skip_space` (whitespace and line comments only: cannot fail; for syntaxes without block comments), `ident -> ?str`, `at_number`/`number` (via
   std.num, with `3abc` reported as malformed), `quoted(&buf)` (escapes
   decoded into a `StrBuf`, including `\ddd`, `\xHH`, `\u{..}`, `\z`, line
   continuation; after a bad escape it still scans to the closing quote so

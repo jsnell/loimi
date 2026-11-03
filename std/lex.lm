@@ -271,6 +271,29 @@ pub fn Cursor.skip_trivia(c: *Cursor) -> Result<(), Error> {
     }
 }
 
+/// Skip whitespace and line comments: `skip_trivia` for syntaxes in which
+/// no comment can be unterminated, so it cannot fail. It stops at a block
+/// comment, and at a long comment of a syntax with `long_comments`
+/// (use `skip_trivia` for those).
+pub fn Cursor.skip_space(c: *Cursor) {
+    let lc = c.syntax.line_comment;
+    loop {
+        while c.pos < c.src.len and is_space(c.src[c.pos]) { c.bump(); }
+        if lc.len > 0 and c.starts_with(lc) {
+            if c.syntax.long_comments {
+                let save = c.pos;
+                c.advance(lc.len);
+                let long = c.long_bracket_level().is_some();
+                c.pos = save;
+                if long { return; }
+            }
+            while c.pos < c.src.len and c.src[c.pos] != '\n' { c.pos += 1; }
+            continue;
+        }
+        return;
+    }
+}
+
 /// Skip a block comment at the cursor (which must be at `block_open`).
 fn Cursor.block_comment(c: *Cursor) -> Result<(), Error> {
     let start = c.pos;
