@@ -5,7 +5,8 @@ import std.gc;
 import std.mem;
 import std.hash;
 import std.text;
-import vm.{Mini};
+import vm.{Mini, VStack};
+import coro.{Coro};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
@@ -58,7 +59,10 @@ pub object Proto {
 /// A captured variable. While open, `v` points at the variable's stack
 /// slot and `next` links the open list (sorted by level, highest first).
 /// Closing copies the value into `closed` and points `v` at it.
-pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal> }
+/// `stack` is the coroutine stack that `v` points into while open (None on
+/// the main stack): an open upvalue keeps it alive, as the stack is
+/// freed with its coroutine.
+pub object UpVal { v: *V, closed: V, next: ?Gc<UpVal>, stack: ?Gc<VStack> }
 pub object Closure { proto: Gc<Proto>, upvals: [Gc<UpVal>] }
 
 pub value V repr nanbox {
@@ -70,6 +74,10 @@ pub value V repr nanbox {
     T(Gc<Table>),
     F(Gc<Closure>),
     Native(i32),
+    /// A coroutine (Lua's "thread").
+    Co(Gc<Coro>),
+    /// A function made by coroutine.wrap: calling it resumes the coroutine.
+    Wrap(Gc<Coro>),
 }
 
 /// The string intern table: every live Str, so equal strings are the
@@ -234,7 +242,8 @@ pub fn type_name(v: V) -> str {
         Bool(_) => "boolean",
         S(_) => "string",
         T(_) => "table",
-        F(_) | Native(_) => "function",
+        F(_) | Native(_) | Wrap(_) => "function",
+        Co(_) => "thread",
     }
 }
 
@@ -569,6 +578,8 @@ pub fn write_value(b: *text.StrBuf, v: V) {
         T(t) => push_addr(b, "table: ", t as u64),
         F(c) => push_addr(b, "function: ", c as u64),
         Native(_) => b.push_str("function: builtin"),
+        Co(c) => push_addr(b, "thread: ", c as u64),
+        Wrap(c) => push_addr(b, "function: ", c as u64),
     }
 }
 
