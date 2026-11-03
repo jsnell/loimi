@@ -2088,6 +2088,7 @@ pub fn convert(c: *Ctx, v: Value, conv: u64) -> Result<Value, Value> uses reente
 pub fn format_field(c: *Ctx, v: Value, spec: Value, conv: u64) -> Result<Value, Value> uses reenter {
     let Str(s) = spec else {
         if let Str(_) = v { return Ok(v); }
+        if let Inst(_) = v { return fmt.format(c, v, ""); }
         return fmt.to_str(c, v);
     };
     fmt.format(c, v, s.data)

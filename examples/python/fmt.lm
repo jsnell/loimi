@@ -325,11 +325,11 @@ fn pad(b: *text.StrBuf, body: str, sp: *Spec, numeric: bool) {
 }
 
 pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter {
-    if spec.len == 0 { return to_str(c, v); }
     if let Inst(_) = v {
         let args = [Value.Str(value.new_str(&c.heap, spec))];
         if let Some(r) = ops.call_method(c, v, "__format__", args[..])? { return Ok(r); }
     }
+    if spec.len == 0 { return to_str(c, v); }
     let Some(sp0) = parse_spec(spec) else { return Err(ops.exc(c, E_VALUE, "Invalid format specifier")); };
     var sp = sp0;
     var body = text.StrBuf.new();

@@ -759,9 +759,22 @@ fn P.atom(p: *P) -> *Expr {
             let ks = p.exprs();
             let vs = p.exprs();
             if p.eat(T.RBrace) { return p.mk(E.Dict(ks, vs), line); }
-            if p.eat(T.DStar) {
-                p.fail("dict unpacking is not supported");
-                return p.mk(E.NoneE, line);
+            if p.at(T.DStar) {
+                // {**a, k: v, ...}: `**x` entries are Starred keys.
+                loop {
+                    if p.eat(T.DStar) {
+                        let l2 = p.line();
+                        ks.push(p.mk(E.Starred(p.expr()), l2));
+                        vs.push(p.mk(E.NoneE, l2));
+                    } else {
+                        ks.push(p.test());
+                        p.expect(T.Colon, "expected ':'");
+                        vs.push(p.test());
+                    }
+                    if !p.eat(T.Comma) or p.at(T.RBrace) { break; }
+                }
+                p.expect(T.RBrace, "expected '}'");
+                return p.mk(E.Dict(ks, vs), line);
             }
             let first = p.test_star();
             if p.eat(T.Colon) {
@@ -775,6 +788,12 @@ fn P.atom(p: *P) -> *Expr {
                 vs.push(v);
                 while p.eat(T.Comma) {
                     if p.at(T.RBrace) { break; }
+                    if p.eat(T.DStar) {
+                        let l2 = p.line();
+                        ks.push(p.mk(E.Starred(p.expr()), l2));
+                        vs.push(p.mk(E.NoneE, l2));
+                        continue;
+                    }
                     ks.push(p.test());
                     p.expect(T.Colon, "expected ':'");
                     vs.push(p.test());

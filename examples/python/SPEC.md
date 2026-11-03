@@ -87,7 +87,7 @@ All operators with Python's precedence, chained comparisons, `and`/`or`
 returning operands, `not`, `in`/`not in`, `is`/`is not`, conditional
 expressions, lambdas, calls with positional, keyword, `*args` and
 `**kwargs` arguments, attribute access, subscripts and slices, list,
-tuple, dict and set displays (with `*x` in lists, tuples and sets), list,
+tuple, dict and set displays (with `*x` in lists, tuples and sets and `**d` in dicts), list,
 set and dict comprehensions (several `for` and `if` clauses), generator
 expressions, `yield`, `yield from` (iteration only: sent values are not
 forwarded).

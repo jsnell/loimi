@@ -1116,7 +1116,9 @@ fn C.expr_to(c: *C, e: *Expr, dst: u32) {
             }
         }
         Dict(ks, vs) => {
-            if ks.len <= 64 {
+            var unpack = false;
+            for i in 0..ks.len { if let Starred(_) = ks.at(i).e { unpack = true; } }
+            if ks.len <= 64 and !unpack {
                 let base = c.alloc(2 * ks.len as u32);
                 for i in 0..ks.len {
                     c.expr_to(ks.at(i), base + 2 * i as u32);
@@ -1128,9 +1130,16 @@ fn C.expr_to(c: *C, e: *Expr, dst: u32) {
                 c.emit(Py.NEWDICT(t as u8, 0, 0));
                 for i in 0..ks.len {
                     let m = c.regs.mark();
-                    let rk = c.operand(ks.at(i));
-                    let rv = c.operand(vs.at(i));
-                    c.emit(Py.DICTSET(t as u8, rk as u8, rv as u8));
+                    if let Starred(x) = ks.at(i).e {
+                        let mb = c.alloc(3);
+                        c.emit(Py.LOADMETHOD(mb as u8, t as u8, c.name8("update")));
+                        c.expr_to(x, mb + 2);
+                        c.emit(Py.CALLMETHOD(mb as u8, 1));
+                    } else {
+                        let rk = c.operand(ks.at(i));
+                        let rv = c.operand(vs.at(i));
+                        c.emit(Py.DICTSET(t as u8, rk as u8, rv as u8));
+                    }
                     c.regs.reset(m);
                 }
                 c.emit(Py.MOVE(d, t as u8));
