@@ -14,6 +14,8 @@
 // of the diagnostics pushed into it into its own arena, so they can be built
 // in a temporary StrBuf.
 
+#![safe]
+
 import std.io;
 import std.mem;
 import std.text;

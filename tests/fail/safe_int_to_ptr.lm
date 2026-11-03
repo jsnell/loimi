@@ -1,0 +1,7 @@
+// error: casting an integer to a pointer
+#![safe]
+import std.mem;
+
+fn f() -> *u8 { 0 as *u8 }
+
+fn main() {}

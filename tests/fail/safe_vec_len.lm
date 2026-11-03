@@ -1,0 +1,7 @@
+// error: writing `Vec<u8>.len`
+#![safe]
+import std.mem;
+
+fn f(v: *mem.Vec<u8>) { v.len = 100; }
+
+fn main() {}

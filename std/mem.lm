@@ -21,6 +21,7 @@ var EMPTY: [u64; 2] = [0; 2];
 fn empty_ptr<T>() -> *T { (&EMPTY[0]) as *T }
 
 /// Allocate `n` zeroed values of type T.
+#[raw]
 pub fn alloc<T>(n: u64) -> *T {
     let p = calloc(if n == 0 { 1 } else { n }, size_of<T>());
     if (p as u64) == 0 { panic_oom(); }
@@ -29,6 +30,7 @@ pub fn alloc<T>(n: u64) -> *T {
 
 /// Allocate `n` zeroed values of type T, or None when out of memory
 /// (or when `n` values do not fit in the address space).
+#[raw]
 pub fn try_alloc<T>(n: u64) -> ?*T {
     let p = calloc(if n == 0 { 1 } else { n }, size_of<T>());
     if (p as u64) == 0 { return None; }
@@ -37,6 +39,7 @@ pub fn try_alloc<T>(n: u64) -> ?*T {
 
 /// Resize an allocation made with `alloc` (or the pointer of an empty
 /// `Vec`).
+#[raw]
 pub fn grow<T>(p: *T, n: u64) -> *T {
     if p == empty_ptr<T>() { return alloc(n); }
     let q = realloc(p as *u8, n * size_of<T>());
@@ -46,10 +49,12 @@ pub fn grow<T>(p: *T, n: u64) -> *T {
 
 /// Free an allocation made with `alloc` or `grow`. The pointer of an
 /// empty `Vec` is ignored.
+#[raw]
 pub fn release<T>(p: *T) {
     if p != empty_ptr<T>() { free(p as *u8); }
 }
 
+#[raw]
 pub fn copy<T>(dst: *T, src: *T, n: u64) {
     memmove(dst as *u8, src as *u8, n * size_of<T>());
 }
@@ -153,6 +158,7 @@ pub fn Vec<T>.sort_by(v: *Vec<T>, cmp: block fn(*T, *T) -> i32) {
 /// Sort `n` values at `p` stably by `cmp` (see `Vec.sort_by`): insertion
 /// sort for runs of 16, then a bottom-up merge sort through a buffer of
 /// `n` values.
+#[raw]
 pub fn sort_by<T>(p: *T, n: u64, cmp: block fn(*T, *T) -> i32) {
     let run: u64 = 16;
     var lo: u64 = 0;
@@ -198,6 +204,7 @@ pub fn Vec<T>.try_sort_by<E>(v: *Vec<T>, less: block fn(*T, *T) -> Result<bool, 
 /// orders indices (a bottom-up merge sort, insertion sort for runs of
 /// 16), then permutes `p` once, without calls. `p` must stay valid and
 /// unchanged during the sort: if guest code could change it, sort a copy.
+#[raw]
 pub fn try_sort_by<T, E>(p: *T, n: u64, less: block fn(*T, *T) -> Result<bool, E> uses reenter) -> Result<(), E> uses reenter {
     if n < 2 { return Ok(()); }
     var idx: *u64 = alloc(n);
@@ -354,6 +361,7 @@ pub fn Arena.new() -> Arena {
     Arena { chunk: malloc(65536), used: 0, size: 65536, chunks: Vec.new() }
 }
 
+#[raw]
 pub fn Arena.alloc_bytes(a: *Arena, n: u64, align: u64) -> *u8 {
     var off = (a.used + align - 1) & (0 -% align);
     if off + n > a.size {
@@ -392,6 +400,7 @@ pub struct Malloc { live: u64 }
 
 pub fn Malloc.new() -> Malloc { Malloc { live: 0 } }
 
+#[raw]
 pub fn Malloc.alloc_bytes(m: *Malloc, n: u64, align: u64) -> *u8 {
     if align > 16 {
         let msg = "Malloc.alloc_bytes: alignment over 16\n";
@@ -404,6 +413,7 @@ pub fn Malloc.alloc_bytes(m: *Malloc, n: u64, align: u64) -> *u8 {
 }
 
 /// Free an allocation of `alloc_bytes`.
+#[raw]
 pub fn Malloc.free_bytes(m: *Malloc, p: *u8) {
     m.live -= 1;
     free(p);

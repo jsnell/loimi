@@ -1,0 +1,7 @@
+// error: a pointer cast (`*u64` to `*u8`)
+#![safe]
+import std.mem;
+
+fn f(p: *u64) -> *u8 { p as *u8 }
+
+fn main() {}

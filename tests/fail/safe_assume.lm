@@ -1,0 +1,7 @@
+// error: `assume`
+#![safe]
+import std.mem;
+
+fn f(x: u64) { assume(x < 4); }
+
+fn main() {}

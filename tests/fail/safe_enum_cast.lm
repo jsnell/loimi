@@ -1,0 +1,8 @@
+// error: casting an integer to an enum
+#![safe]
+import std.mem;
+
+enum E { A, B }
+fn f(x: i32) -> E { x as E }
+
+fn main() {}

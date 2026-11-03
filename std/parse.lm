@@ -45,6 +45,8 @@
 // operator's right power (`pr.infix_of(k).right`), reaching the table
 // through its parser state.
 
+#![safe]
+
 import std.mem;
 import std.map;
 

@@ -1,0 +1,7 @@
+// error: building a `Vec`
+#![safe]
+import std.mem;
+
+fn f(p: *u8) -> mem.Vec<u8> { mem.Vec { ptr: p, len: 9, cap: 9 } }
+
+fn main() {}

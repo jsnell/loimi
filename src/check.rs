@@ -170,6 +170,17 @@ pub struct Checker<'a> {
     /// are private to it (the generated `Vm__Verified` is built only by
     /// the vm's own generated functions).
     pub struct_files: HashMap<u32, u32>,
+    /// Functions declared `#[raw]`, and extern functions: naming one in a
+    /// `#![safe]` module needs an `unsafe { }` block (`safety.rs`).
+    pub raw_fns: std::collections::HashSet<FnId>,
+    /// The module declaring each struct (generic instances too), for the
+    /// `#![safe]` rule on other modules' structs with raw pointers.
+    pub struct_module: HashMap<u32, usize>,
+    /// Generated source files (vm expansions): exempt from `#![safe]`.
+    pub generated_files: std::collections::HashSet<u32>,
+    /// `LOIMI_SAFETY_AUDIT=1`: every module is checked as if `#![safe]`,
+    /// and the raw-pointer operations are counted instead of reported.
+    pub safety_audit: Option<std::cell::RefCell<std::collections::BTreeSet<(String, &'static str, u32, u32)>>>,
 }
 
 pub fn mk(ty: Ty, kind: TK, span: Span) -> TExpr {
@@ -264,6 +275,10 @@ impl<'a> Checker<'a> {
             closure_count: 0,
             unsafe_fns: Default::default(),
             struct_files: HashMap::new(),
+            raw_fns: Default::default(),
+            struct_module: HashMap::new(),
+            generated_files: Default::default(),
+            safety_audit: std::env::var_os("LOIMI_SAFETY_AUDIT").map(|_| Default::default()),
             encoder_notes: HashMap::new(),
         }
     }
@@ -348,6 +363,7 @@ impl<'a> Checker<'a> {
                             None
                         };
                         self.struct_files.insert(id, s.name.span.file);
+                        self.struct_module.insert(id, m);
                         self.prog.type_spans.insert(format!("{}.{}", prefix, s.name.name), s.name.span);
                         if let Some(c) = &s.c_name {
                             self.prog.c_names.insert(format!("{}.{}", prefix, s.name.name), c.clone());
@@ -798,6 +814,9 @@ impl<'a> Checker<'a> {
         };
         if f.attrs.has("unsafe") {
             self.unsafe_fns.insert(id);
+        }
+        if f.attrs.has("raw") || f.linkage == Linkage::Extern {
+            self.raw_fns.insert(id);
         }
         if let Some((_, args, sp)) = f.attrs.list.iter().find(|(n, _, _)| n == "c_const") {
             if f.linkage != Linkage::Export {
@@ -1955,6 +1974,9 @@ impl<'a> Checker<'a> {
                     Ty::Array(t, _) | Ty::Slice(t) | Ty::Ptr(t) => (**t).clone(),
                     t => return Err(Diag::new(base.span, format!("cannot index a value of type `{}`", self.ty_name(t)))),
                 };
+                if matches!(b.ty, Ty::Ptr(_)) {
+                    self.raw_op(cx, span, "index", || "indexing a raw pointer (`p[i]`)".into(), "use a slice (`[]T`, bounds-checked), a `Vec` method, or wrap it in `unsafe { }` with a comment saying why the index is in bounds")?;
+                }
                 Ok(mk(elem, TK::Index(Box::new(b), Box::new(i)), span))
             }
             ExprKind::SliceRange(base, lo, hi) => {
@@ -1965,6 +1987,9 @@ impl<'a> Checker<'a> {
                     Ty::Ptr(t) if hi.is_some() => (**t).clone(),
                     t => return Err(Diag::new(base.span, format!("cannot slice a value of type `{}`", self.ty_name(t)))),
                 };
+                if matches!(b.ty, Ty::Ptr(_)) {
+                    self.raw_op(cx, span, "slice_from_raw", || "slicing a raw pointer (`p[a..b]`)".into(), "keep the buffer as a slice, or wrap it in `unsafe { }` with a comment saying why the range is valid")?;
+                }
                 let u = Ty::Int(IntTy::U64);
                 let lo = match lo {
                     Some(l) => Some(Box::new(self.expr_coerce(cx, l, &u)?)),
@@ -2026,6 +2051,9 @@ impl<'a> Checker<'a> {
                         return Ok(mk(to, TK::Variant(idx as u32, vec![]), span));
                     }
                 }
+                if let Some((cat, what)) = crate::safety::raw_cast(&v.ty, &to) {
+                    self.raw_op(cx, span, cat, || format!("{} (`{}` to `{}`)", what, self.ty_name(&v.ty), self.ty_name(&to)), "a pointer can only be made by `&place` or `new(..)` in safe code; `?*T` is the pointer that may be null; or wrap the cast in `unsafe { }` with a comment saying why it is valid")?;
+                }
                 Ok(mk(to, TK::Cast(Box::new(v)), span))
             }
             ExprKind::StructLit(path, fields, rest) => {
@@ -2046,6 +2074,9 @@ impl<'a> Checker<'a> {
                     return Err(Diag::new(span, format!("`{}` is not a struct", name.name)));
                 };
                 let defs = self.prog.structs[sid as usize].fields.clone();
+                if self.foreign_raw_struct(cx, &ty) {
+                    self.raw_op(cx, span, "struct_lit", || format!("building a `{}` (a struct with raw pointers, declared in a module that is not `#![safe]`) with a literal", name.name), "use its module's constructor (`Vec.new()`)")?;
+                }
                 let mut vals: Vec<Option<TExpr>> = vec![None; defs.len()];
                 for (f, v) in fields {
                     self.check_private_field(sid, f)?;
@@ -2083,6 +2114,10 @@ impl<'a> Checker<'a> {
                                         hint
                                     ),
                                 ));
+                            }
+                            if matches!(fty, Ty::Ptr(_)) {
+                                let f = fname.clone();
+                                self.raw_op(cx, *rs, "zero_ptr", || format!("`..zero` making a null pointer (field `{}`)", f), "declare the field `?*T` (None is the null pointer), or give it a value")?;
                             }
                             out.push(mk(fty.clone(), TK::Zeroed, *rs));
                         }
@@ -2367,6 +2402,7 @@ impl<'a> Checker<'a> {
             ExprKind::Assign(lhs, rhs) => {
                 let l = self.expr(cx, lhs, None)?;
                 self.check_assignable(cx, &l, lhs.span)?;
+                self.check_raw_place(cx, &l, lhs.span)?;
                 let r = self.expr_coerce(cx, rhs, &l.ty.clone())?;
                 Ok(mk(Ty::Unit, TK::Assign(Box::new(l), Box::new(r)), span))
             }
@@ -2795,6 +2831,7 @@ impl<'a> Checker<'a> {
             return Ok(r);
         }
         if name == "unreachable" {
+            self.raw_op(cx, span, "hint", || "`unreachable` (undefined behavior if reached)".into(), "use `trap()`, which aborts")?;
             return Ok(mk(Ty::Never, TK::Unreachable, span));
         }
         if name == "None" {
@@ -2839,6 +2876,15 @@ impl<'a> Checker<'a> {
     /// Naming a `#[unsafe]` function (to call it or take it as a value)
     /// needs an `unsafe { }` block.
     pub fn check_unsafe_def(&self, cx: &FnCx, def: &Def, span: Span) -> Res<()> {
+        let raw = match def {
+            Def::Fn(id) if self.raw_fns.contains(id) => Some(self.prog.fns[*id as usize].name.clone()),
+            Def::GenericFn(g) if self.generics.fns[*g as usize].decl.attrs.has("raw") => Some(self.generics.fns[*g as usize].decl.name.name.clone()),
+            _ => None,
+        };
+        if let Some(n) = raw {
+            let n = short_name(&n).replace("__", ".");
+            self.raw_op(cx, span, "raw_call", || format!("calling `{}` (`#[raw]` or extern: it takes pointers to more than one value, or frees memory)", n), "use a safe counterpart that takes a slice, or wrap the call in `unsafe { }` with a comment saying why its arguments are valid")?;
+        }
         let name = match def {
             Def::Fn(id) if self.unsafe_fns.contains(id) => self.prog.fns[*id as usize].name.clone(),
             Def::GenericFn(g) if self.generics.fns[*g as usize].decl.attrs.has("unsafe") => {
@@ -3004,7 +3050,9 @@ impl<'a> Checker<'a> {
             }
         }
         let b = self.expr(cx, base, None)?;
-        self.field_of(b, name, span)
+        let r = self.field_of(b, name, span)?;
+        self.check_field_read(cx, &r)?;
+        Ok(r)
     }
 
     /// Fields whose names start with `__` are private to the file that
@@ -3248,6 +3296,7 @@ impl<'a> Checker<'a> {
             }
             return Err(Diag::new(inner.span, "explicit type arguments need a generic function name"));
         };
+        self.check_unsafe_def(cx, &Def::GenericFn(g), span)?;
         let mut explicit = Vec::new();
         for t in targs {
             explicit.push(self.resolve_type(cx.module, t)?);
@@ -3272,6 +3321,7 @@ impl<'a> Checker<'a> {
         exp: Option<&Ty>,
         span: Span,
     ) -> Res<TExpr> {
+        self.check_unsafe_def(cx, &Def::GenericFn(g), span)?;
         let gf = &self.generics.fns[g as usize];
         let (nall, nrecv) = (gf.params.len(), gf.decl.recv_generics);
         // The receiver's arguments come from the receiver (methods) or are
@@ -3562,6 +3612,7 @@ impl<'a> Checker<'a> {
             return self.generic_call(cx, gf, vec![recv], vec![], args, exp, span);
         }
         if let Some(fid) = self.methods.get(&(base_ty.clone(), name.name.clone())).copied() {
+            self.check_unsafe_def(cx, &Def::Fn(fid), name.span)?;
             let fdef = &self.prog.fns[fid as usize];
             let Some(p0) = fdef.param_tys.first().cloned() else {
                 return Err(Diag::new(name.span, format!("`{}` takes no receiver", name.name)));
@@ -3573,6 +3624,7 @@ impl<'a> Checker<'a> {
                     break;
                 }
                 if p0 == Ty::Ptr(Box::new(r.ty.clone())) {
+                    self.check_raw_place(cx, &r, r.span)?;
                     let span = r.span;
                     r = mk(p0.clone(), TK::AddrOf(Box::new(r)), span);
                     break;
@@ -3729,6 +3781,7 @@ impl<'a> Checker<'a> {
                 mk((**inner).clone(), TK::Intrinsic(Intr::UnwrapOr, vec![recv, d]), span)
             }
             (Ty::Ptr(_), "offset") => {
+                self.raw_op(cx, span, "arith", || "pointer arithmetic (`p.offset(n)`)".into(), "use a slice and an index, or wrap it in `unsafe { }` with a comment saying why the result is in bounds")?;
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::i64())?;
                 mk(t.clone(), TK::Intrinsic(Intr::PtrOffset, vec![recv, n]), span)
@@ -3806,6 +3859,7 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(span, "a `block fn` has no memory of its own to free"));
             }
             (Ty::Ptr(inner), "slice") => {
+                self.raw_op(cx, span, "slice_from_raw", || "making a slice from a raw pointer (`p.slice(n)`)".into(), "keep the buffer as a slice (`Vec.items()`), or wrap it in `unsafe { }` with a comment saying why `n` values are there")?;
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::Int(IntTy::U64))?;
                 mk(Ty::Slice(inner.clone()), TK::Intrinsic(Intr::SliceFromRaw, vec![recv, n]), span)
@@ -4231,6 +4285,9 @@ impl<'a> Checker<'a> {
             "trap" => (Intr::Trap, Ty::Never),
             _ => return Ok(None),
         };
+        if name == "assume" {
+            self.raw_op(cx, span, "hint", || "`assume` (undefined behavior if false)".into(), "check the condition (`if !c { trap(); }`), or wrap it in `unsafe { }`")?;
+        }
         let mut out = Vec::new();
         for a in args {
             out.push(self.expr_coerce(cx, a, &Ty::Bool)?);
@@ -4274,6 +4331,7 @@ impl<'a> Checker<'a> {
                 let Ty::Ptr(t) = v.ty.clone() else {
                     return Err(Diag::new(span, format!("cannot dereference `{}`", self.ty_name(&v.ty))));
                 };
+                self.audit_count(cx, "ok_deref", span);
                 Ok(mk(*t, TK::Deref(Box::new(v)), span))
             }
             UnOp::AddrOf => {
@@ -4295,6 +4353,7 @@ impl<'a> Checker<'a> {
                         ));
                     }
                 }
+                self.check_raw_place(cx, &v, span)?;
                 let v = if is_place(&v) {
                     v
                 } else {
@@ -4320,6 +4379,7 @@ impl<'a> Checker<'a> {
             // Pointer arithmetic: `p + n`, `p - n` (in elements).
             let a = self.expr(cx, l, exp)?;
             if let Ty::Ptr(_) = a.ty {
+                self.raw_op(cx, span, "arith", || "pointer arithmetic (`p + n`)".into(), "use a slice and an index, or wrap it in `unsafe { }` with a comment saying why the result is in bounds")?;
                 let n = self.expr(cx, r, Some(&Ty::i64()))?;
                 if !n.ty.is_int() {
                     return Err(Diag::new(r.span, "pointer offset must be an integer"));

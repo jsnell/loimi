@@ -14,6 +14,7 @@ mod layout;
 mod lexer;
 mod parser;
 mod rtgen;
+mod safety;
 mod tir;
 mod tirwalk;
 mod values;
@@ -221,7 +222,7 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>,
         let fid = sm.add(file.display().to_string(), text.clone());
         let toks = lexer::lex(fid, &text)?;
         let mut p = parser::Parser::new(toks);
-        let (mut items, _attrs) = p.parse_module()?;
+        let (mut items, mod_attrs) = p.parse_module()?;
         allows.append(&mut p.allows);
         if test && path == ["main"] {
             test_main(sm, &mut items)?;
@@ -234,7 +235,7 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>,
                 queue.push((ipath, base.join(rel).with_extension("lm"), imp.span));
             }
         }
-        modules.push(ast::Module { path, items });
+        modules.push(ast::Module { path, items, safe: mod_attrs.has("safe") });
     }
     Ok(modules)
 }
@@ -317,9 +318,21 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     }
     vmexpand::expand(sm, &mut modules, opts.jit)?;
     let mut c = check::Checker::new(&modules);
+    c.generated_files = sm.files.iter().enumerate().filter(|(_, f)| f.generated.is_some()).map(|(i, _)| i as u32).collect();
     c.dispatch_override = opts.dispatch;
     c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
     c.run()?;
+    if let Some(a) = &c.safety_audit {
+        // `LOIMI_SAFETY_AUDIT=1`: raw-pointer operations by module and kind.
+        let a = a.borrow();
+        let mut counts: std::collections::BTreeMap<(&str, &str), u32> = Default::default();
+        for (m, cat, _, _) in a.iter() {
+            *counts.entry((m.as_str(), cat)).or_default() += 1;
+        }
+        for ((m, cat), n) in counts {
+            eprintln!("safety-audit {} {} {}", m, cat, n);
+        }
+    }
     // Warnings, minus those inside an `#[allow(lint)]` region.
     let allowed = |w: &Diag| {
         allows.iter().any(|(n, _, r)| {

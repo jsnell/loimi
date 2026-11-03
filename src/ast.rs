@@ -384,4 +384,7 @@ pub enum Item {
 pub struct Module {
     pub path: Vec<String>,
     pub items: Vec<Item>,
+    /// `#![safe]`: raw-pointer operations need `unsafe { }`
+    /// (language.md section 1.3).
+    pub safe: bool,
 }
