@@ -1,0 +1,51 @@
+// State shared between escaping closures and their creator: a cell made
+// with `new(a, v)` (a `*T` to a copy of `v` in `a`'s memory), captured as
+// a pointer. Writes through it are seen by everyone holding the pointer.
+// expect: 3 3
+// expect: 12 7
+// expect: 1.5
+// expect: live 0
+import std.io;
+import std.mem;
+import std.mem.{Vec, Arena, Malloc};
+
+struct Pos { x: i64, y: i64 }
+
+struct Counter { inc: closure fn(), get: closure fn() -> i64 }
+
+fn counter(a: *Arena) -> Counter {
+    let n = new(a, 0);
+    Counter { inc: new(a, || *n += 1), get: new(a, || *n) }
+}
+
+fn main() {
+    var arena = Arena.new();
+    let a = &arena;
+
+    let c = counter(a);
+    c.inc(); c.inc(); c.inc();
+    io.print_int(c.get()); io.print(" ");
+    let hits: *i64 = new(a, 0);
+    let f: closure fn(i64) = new(a, |k| *hits += k);
+    f(1); f(2);
+    io.print_int(*hits); io.println("");
+
+    // A struct cell; fields through the pointer.
+    let p = new(a, Pos { x: 2, y: 3 });
+    let mv: closure fn(i64, i64) = new(a, |dx, dy| { p.x += dx; p.y += dy; });
+    mv(10, 4);
+    io.print_int(p.x); io.print(" "); io.print_int(p.y); io.println("");
+
+    let half: *f64 = new(a, 3.0 / 2.0);
+    io.print_f64(*half); io.println("");
+    arena.free();
+
+    // With an allocator that frees one by one.
+    var m = Malloc.new();
+    let total = new(&m, 0);
+    let add: closure fn(i64) = new(&m, |k| *total += k);
+    add(5);
+    add.free(&m);
+    m.free_bytes(total as *u8);
+    io.print("live "); io.print_int(m.live as i64); io.println("");
+}

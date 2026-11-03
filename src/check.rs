@@ -3611,6 +3611,11 @@ impl<'a> Checker<'a> {
         if name == "new" && args.len() == 2 && matches!(args[1].kind, ExprKind::Closure(..)) {
             return self.new_closure(cx, &args[0], &args[1], exp, span).map(Some);
         }
+        if name == "new" && args.len() == 2 {
+            if let Some(r) = self.new_in_allocator(cx, &args[0], &args[1], exp, span)? {
+                return Ok(Some(r));
+            }
+        }
         if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
             return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
         }

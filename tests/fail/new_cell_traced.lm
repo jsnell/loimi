@@ -1,0 +1,11 @@
+// `new(a, v)` puts `v` in untraced memory: no GC references there.
+import std.mem;
+import std.gc;
+object Node { v: i64 }
+fn main() {
+    var heap = gc.Heap.new();
+    var arena = mem.Arena.new();
+    let n = new(&heap, Node { v: 1 });
+    let cell = new(&arena, Some(n));
+}
+// error: `?Gc<Node>` holds GC references, but memory from `a.alloc_bytes` is not traced

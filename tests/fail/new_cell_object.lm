@@ -1,0 +1,9 @@
+// Objects are made in the GC heap, not by an allocator.
+import std.mem;
+import std.gc;
+object Node { v: i64 }
+fn main() {
+    var arena = mem.Arena.new();
+    let n = new(&arena, Node { v: 1 });
+}
+// error: `Node` is an `object`: objects live in the GC heap

@@ -366,6 +366,83 @@ impl<'a> Checker<'a> {
         Ok(mk(ty, TK::Block(stmts, Some(Box::new(v))), sp))
     }
 
+    /// `new(a, v)` with an allocator `a` (not a `*gc.Heap`): a `*T` to a
+    /// copy of `v` in memory from `a.alloc_bytes(size, align)`, `{ let x =
+    /// v; let p = a.alloc_bytes(..) as *T; *p = x; p }`. A cell that
+    /// escaping closures and their creator share by capturing the
+    /// pointer. None when `a` is a GC heap (or not a pointer): that is
+    /// `new(heap, Obj { .. })`.
+    pub fn new_in_allocator(&mut self, cx: &mut FnCx, alloc: &Expr, init: &Expr, exp: Option<&Ty>, span: Span) -> Res<Option<TExpr>> {
+        let mut probe = cx.probe();
+        let Ok(at) = self.expr(&mut probe, alloc, None).map(|a| a.ty) else { return Ok(None) };
+        let gc = matches!(&at, Ty::Ptr(t) if matches!(**t, Ty::Struct(s) if self.prog.structs[s as usize].name == "std.gc.Heap"));
+        if gc || !matches!(at, Ty::Ptr(_)) {
+            return Ok(None);
+        }
+        let want = match exp {
+            Some(Ty::Ptr(t)) => Some((**t).clone()),
+            _ => None,
+        };
+        let v = self.expr(cx, init, want.as_ref())?;
+        let v = match &want {
+            Some(t) => self.coerce(v, t)?,
+            None => v,
+        };
+        let t = v.ty.clone();
+        if let Ty::Struct(sid) = t {
+            if self.prog.structs[sid as usize].object.is_some() {
+                return Err(Diag::new(init.span, format!("`{}` is an `object`: objects live in the GC heap (`new(heap, ..)` with a `*gc.Heap`)", self.ty_name(&t))));
+            }
+        }
+        if matches!(t, Ty::Unit | Ty::Never | Ty::Block(..)) || has_hole(&t) {
+            return Err(Diag::new(init.span, format!("`new(a, v)` cannot store a `{}`", self.ty_name(&t))));
+        }
+        if self.traits.opaque_depth == 0 && crate::gcgen::is_traced(&self.prog, &t) {
+            return Err(Diag::new(
+                init.span,
+                format!("`{}` holds GC references, but memory from `a.alloc_bytes` is not traced: keep it in an object (`new(heap, ..)`)", self.ty_name(&t)),
+            ));
+        }
+        let a = self.expr(cx, alloc, None)?;
+        let concrete = self.traits.opaque_depth == 0 && !matches!(t, Ty::Opaque(_) | Ty::Param(_));
+        let (size, align) = if concrete {
+            (crate::layout::size_of(&self.prog, &t) as u128, crate::layout::align_of(&self.prog, &t).max(1) as u128)
+        } else {
+            (8, 8)
+        };
+        let lit = |v: u128| Expr { kind: ExprKind::Int(v), span: alloc.span };
+        let name = Ident { name: "alloc_bytes".into(), span: alloc.span };
+        let an = self.ty_name(&a.ty);
+        let mem = self.method_call(cx, a, &name, &[lit(size), lit(align)], None, span).map_err(|d| {
+            d.note(alloc.span, format!(
+                "`new(a, v)` allocates with `a.alloc_bytes(size: u64, align: u64) -> *u8` (`a` is `{}`; `*mem.Arena` and `*mem.Malloc` have one), or makes an object if `a` is a `*gc.Heap`",
+                an
+            ))
+        })?;
+        if !matches!(mem.ty, Ty::Ptr(_)) {
+            return Err(Diag::new(alloc.span, "`alloc_bytes` must return a pointer (`*u8`)"));
+        }
+        let pt = Ty::Ptr(Box::new(t.clone()));
+        cx.scopes.push(vec![]);
+        let x = cx.declare("new value", t.clone(), false);
+        let p = cx.declare("new cell", pt.clone(), false);
+        cx.scopes.pop();
+        let cell = mk(pt.clone(), TK::Local(p), span);
+        let store = mk(Ty::Unit, TK::Assign(Box::new(mk(t.clone(), TK::Deref(Box::new(cell.clone())), span)), Box::new(mk(t, TK::Local(x), span))), span);
+        Ok(Some(mk(
+            pt.clone(),
+            TK::Block(
+                vec![
+                    TStmt::Let(x, Some(v)),
+                    TStmt::Let(p, Some(mk(pt, TK::Cast(Box::new(mem)), span))),
+                    TStmt::Expr(store),
+                ],
+                Some(Box::new(cell)),
+            ),
+            span,
+        )))
+    }
+
     /// `c.free(a)`: give a `closure fn`'s environment back to the
     /// allocator that made it, `{ let c' = c; if let Some(p) =
     /// closure_env(c') { a.free_bytes(p) } }`. Closures that own no memory
