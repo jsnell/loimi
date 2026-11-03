@@ -706,6 +706,28 @@ fn stack_programs() {
     );
 }
 
+/// The Python-subset interpreter (examples/python/check.sh -q): a tail-call
+/// build, every tests/NAME.py prints tests/NAME.expected (CPython 3.13's
+/// output, committed), normally and under GC stress. Needs no reference
+/// interpreter.
+#[test]
+fn python_programs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/python/check.sh"))
+        .arg("-q")
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/python/check.sh -q failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The WebAssembly interpreter (examples/wasm/check.sh --fast): a tail-call
 /// build with `-W error`, the C programs in tests/ compiled to wasm32 (when
 /// clang-19 and wasm-ld are there) and a subset of the official spec tests

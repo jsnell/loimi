@@ -188,6 +188,20 @@ pub vm Py {
     /// MAKEFUNC's prototype index.
     operand pidx = it verify it < ctx_protos_len();
 
+    /// Exception handler table: `on raise` jumps to `start + target` and
+    /// writes `regs[reg]`, so both must be valid for the code.
+    verify handlers {
+        var ok = true;
+        for i in 0..proto.handlers.len {
+            let h = proto.handlers[i];
+            if !is_insn_boundary(code.ptr + h.target as u64) or h.reg >= proto.nregs or h.start > h.end {
+                reject(h.start as u64, "bad exception handler entry");
+                ok = false;
+            }
+        }
+        ok
+    }
+
     encoding fixed(u32) {
         format ABC  { op: 8, a: 8, b: 8, c: 8 }
         format ABx  { op: 8, a: 8, bx: 16 }

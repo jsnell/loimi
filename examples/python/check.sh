@@ -5,12 +5,12 @@
 # python3). Each test also runs under GC stress and, in the tail-call build,
 # under the generational verify mode and in a --gc-check-roots build.
 #   check.sh            all modes
-#   check.sh -q         tail-call build only, normal runs only
+#   check.sh -q         tail-call build only, normal and GC-stress runs (tests/golden.rs)
 #   check.sh -u         regenerate the .expected files with CPython
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-loimi="$root/target/release/loimi"
+loimi="${LOIMI:-$root/target/release/loimi}"
 out="$here/out"
 mkdir -p "$out"
 ulimit -v 2500000 2>/dev/null || true
@@ -55,8 +55,8 @@ run() {     # run BINARY LABEL FLAGS...
 
 build python-tailcall --dispatch=tailcall
 run "$out/python-tailcall" tailcall
+run "$out/python-tailcall" tailcall-stress --gc-stress
 if [ $quick -eq 0 ]; then
-    run "$out/python-tailcall" tailcall-stress --gc-stress
     run "$out/python-tailcall" tailcall-verify --gc-verify
     build python-goto --dispatch=goto
     run "$out/python-goto" goto

@@ -1,0 +1,26 @@
+'a 1b-2\n'
+1, 2, 3!
+1.4142135623730951 3.142 2 -2
+[82, 15, 4, 95, 36] 0.24489185380347622
+4 True True False [0, 1, 4, 9] 9 5
+False True
+describe(1, 'x', flag=True, n=None)
+x|y.
+bob   | 25|  3.50|3.500000e+00
+carol | 25|  4.00|4.000000e+00
+alice | 30|  2.25|2.250000e+00
+carol
+{25: ['bob', 'carol'], 30: ['alice']}
+  1   2   3
+  2   4   6
+  3   6   9
+NoneType float list dict tuple
+True False True
+True False True True
+5 -12 1000.0 -0.5 True [-4, 1]
+True False
+[1, 2, 3] 3
+1 -1 7
+2 1
+[1, 2, 3, 4]
+e 2 [1, 3] 0.0
