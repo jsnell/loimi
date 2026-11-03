@@ -119,17 +119,58 @@ quickening on/off.
      −12%, but nboyer +6%, earley +9%, string +27%. **Mini and MiniJS
      turn it on, Scheme does not.** Final, against the old collector:
      Mini 0.996, MiniJS 0.995, Scheme 0.973.
-   - *What limits it.* Every minor survivor is promoted (no aging), so
-     objects in use at a minor collection fill the old generation until
-     the next major; a small nursery made this worse than no generations,
-     so the nursery is the full growth budget. Sweeping is eager. Minor
-     collections sweep only the chunks allocated from, but that is still
-     every chunk the nursery passed through. Majors pay an extra pass to
-     clear the sticky marks.
-   - *Left open*: aging (which needs remembered-set entries kept while
-     they point at young survivors), card marking for large arrays
-     (stored into, they are retraced whole by each minor collection),
-     lazy sweeping, and epoch marks instead of the clearing pass.
+   - *What limited it* (profiled 2026-11-03 with `LOIMI_GC_STATS`,
+     which now also prints the remembered set's size and the time in
+     deferred sweeps, and page-fault counts). Scheme stores few
+     references into old objects (remembered sets of 0-9 objects), so the
+     barrier was not the cost. `nboyer`'s live data grows steadily to 42
+     MB: generations saved no marking, its last major collection spent
+     12 ms of 29 ms clearing marks, and its minor collections swept the
+     whole 46 MB nursery (GC time 146 ms against 101 ms without
+     generations). `earley` is the same on a smaller scale. `string`
+     spent no time in the collector at all: its loss was 4,000 more page
+     faults per run (11 ms of system time against 3 ms), because each
+     minor collection promoted the current large string, so the old
+     generation filled with dead large strings that `free` returned to
+     glibc a major collection later, and glibc trimmed and regrew its
+     heap (with `GLIBC_TUNABLES=glibc.malloc.top_pad=4194304` the two
+     modes ran alike). Mini's `string_build` promotes its `parts` tables
+     in use at each minor collection.
+   - *Done* (2026-11-03): **epoch marks** (a major collection flips the
+     mark value between 1 and 2 instead of clearing every mark),
+     **lazy sweeping** in generational heaps (collections leave the
+     chunks to sweep pending, and the allocator sweeps each when it takes
+     it; a major collection first sweeps only the chunks pending since
+     the previous major, whose dead objects may carry the epoch that
+     comes back), and **aging for large objects** (promoted at their
+     second minor collection; old objects that point to young survivors
+     stay in the remembered set with LOG set again, so that an
+     interpreter's grouped logging still sees them). `nboyer`'s GC time
+     went to 64 ms of marking plus 38 ms of deferred sweeps. Generations
+     on against off, best of 3, interleaved, `--align-functions=64`:
+     Scheme 0.986 (before 0.996): `string` 1.00 (was 1.21), `nboyer`
+     1.02 (1.06), `earley` 1.05 (1.10), `paraffins` 0.84, `mperm` 0.91,
+     `graphs` 0.94, `gcbench` 0.95. **Scheme turns generations on.**
+     Mini 0.982 (before 0.988; `binary_trees` 0.76, `string_build`
+     still 1.05: its `parts` tables are small objects), MiniJS 0.987
+     (0.985). With generations on, against the previous generational
+     collector: Mini 0.996, MiniJS 1.003, Scheme 0.998, all within
+     noise except Mini `binary_trees` 0.94 and MiniJS `binary_trees`
+     0.95 (best of 7). Without generations: Mini 1.002, MiniJS 1.000,
+     Scheme 1.008 (non-allocating Scheme benchmarks moved up to 8% either
+     way, placement).
+   - *Measured and not kept: aging small objects.* Keeping every first
+     survivor young (same mechanism, all sizes) fixed `string` too, but
+     traced the survivors of programs with growing live data twice:
+     `nboyer` 0.798 s against 0.762 s without aging,
+     `earley` +9%, `mperm` +7%. Small objects are promoted at their
+     first survival.
+   - *Left open*: card marking for large arrays (stored into, they are
+     retraced whole by each minor collection), lazy sweeping in
+     non-generational heaps (it needs the epochs, and a flip at every
+     collection), and aging that targets objects in use at a minor
+     collection (by allocation time, for example) rather than all of
+     them, for `string_build`-like programs.
 3. **Variable-length encodings and superinstructions.** Reusing words for
    fusion (language.md §7.3) is clean for fixed widths. For byte streams it
    needs either padding or "fused only at build time". Which one?
