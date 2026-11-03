@@ -313,15 +313,24 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             let w = Diag::warning(
                 "value_layout",
                 v.name.span,
-                format!(
-                    "`{}` has {} tagged variants, more than the classic {} layout holds ({}), so these get blocks narrower than {} bits: {}",
-                    v.name.name,
-                    tagged.len(),
-                    v.repr.name,
-                    if repr == ValueRepr::NanBox { "7, or 8 if one is at most 47 bits wide" } else { "8" },
-                    classic,
-                    list.join(", ")
-                ),
+                if tagged.len() > if repr == ValueRepr::NanBox { 7 } else { 8 } {
+                    format!(
+                        "`{}` has {} tagged variants, more than the classic {} layout holds ({}), so these get blocks narrower than {} bits: {}",
+                        v.name.name,
+                        tagged.len(),
+                        v.repr.name,
+                        if repr == ValueRepr::NanBox { "7, or 8 if one is at most 47 bits wide" } else { "8" },
+                        classic,
+                        list.join(", ")
+                    )
+                } else {
+                    // Few enough for the classic layout, but a pin narrower
+                    // than the classic width selected another one.
+                    format!(
+                        "`{}` pins a block narrower than {} bits, which selects the {} layout, so these get blocks narrower than {} bits too: {}",
+                        v.name.name, classic, layout, classic, list.join(", ")
+                    )
+                },
             )
             .note(
                 v.variants[first].name.span,
