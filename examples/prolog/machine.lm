@@ -394,7 +394,8 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     for i in 0..m.consts.len { gc_mark(h, m.consts.ptr[i]); }
     for i in 0..m.tr { gc_mark(h, m.trail[i]); }
     // Environments: everything below the live top is scanned. Frames hold
-    // raw pointers next to terms, which read as floats (term.lm). Above the
+    // raw pointers next to terms, which read as floats: `Term` is
+    // `#[scan_raw_words]`, which the compiler checks (term.lm). Above the
     // live top, words written since the last collection are zeroed so that
     // the next frames there never expose a stale reference.
     var top = m.e.end();

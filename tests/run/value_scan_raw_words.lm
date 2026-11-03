@@ -1,0 +1,23 @@
+// `#[scan_raw_words]` on a nanbox with an unboxed float: words below 2^48
+// (raw pointers, small integers) read as floats, so a root scanner may
+// mark memory that mixes them with values.
+import std.io;
+import std.gc;
+object O { x: i64 }
+#[scan_raw_words]
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32),
+    Obj(Gc<O>),
+}
+
+fn main() {
+    let w: u64 = 0x7fff_1234_5678;
+    let v = w as V;
+    match v {
+        Num(_) => io.println("raw pointer reads as Num"),
+        _ => io.println("not a float"),
+    }
+}
+
+// expect: raw pointer reads as Num
