@@ -105,8 +105,10 @@ fn next_free(hd: *Header) -> *Header { hd.len as *Header }
 /// free slots (chunk index + 1; 0 ends the list). `used` is set while the
 /// chunk is (or since the last collection was) a current chunk, i.e. it
 /// may hold objects allocated since then: a minor collection sweeps only
-/// those.
-struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool }
+/// those. `pending`: the chunk still needs sweeping (generational mode
+/// sweeps lazily, when the allocator takes the chunk); `free` and
+/// `nfree` are then meaningless.
+struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool, pending: bool }
 
 /// At the start of each chunk (and 16 bytes before a large object's
 /// header): where the write barrier logs objects.
@@ -115,7 +117,9 @@ struct ChunkHead { rs: *RemSet, pad: u64 }
 /// The remembered set: old objects stored into since the last collection.
 /// Allocated separately so its address stays fixed when the `Heap`
 /// struct is moved.
-struct RemSet { objs: mem.Vec<*u8> }
+/// `epoch` is the value of a set mark (see `Heap.epoch`), here so that
+/// `is_marked` finds it from an object's address.
+struct RemSet { objs: mem.Vec<*u8>, epoch: u8 }
 
 /// Shadow-stack frame written by compiled code; entries follow `n`.
 pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
@@ -142,6 +146,19 @@ pub struct Heap {
     seg_next: *u8,
     seg_left: u64,
     rs: *RemSet,
+    /// The mark byte of a marked object (1 or 2). A generational heap's
+    /// major collection flips it instead of clearing every mark first:
+    /// after a major collection every allocated object is unmarked (0) or
+    /// marked with the current epoch, so after the flip all are unmarked.
+    /// (A non-generational heap clears the marks as it sweeps; its epoch
+    /// stays 1.)
+    epoch: u8,
+    /// Flags that marking sets: LOG in a generational heap (a survivor is
+    /// old), else none.
+    mark_flags: u8,
+    /// Bytes marked in the collection in progress (in a minor collection,
+    /// the young survivors).
+    marked: u64,
     /// Called after marking, before sweeping (for weak tables).
     sweepers: mem.Vec<Scanner>,
     ephemerons: mem.Vec<EphHook>,
@@ -196,6 +213,8 @@ pub struct Heap {
     stats: bool,
     mark_ns: u64,
     sweep_ns: u64,
+    /// Time in deferred sweeps (`sweep_chunk`).
+    lazy_ns: u64,
     /// Free for the embedder (for example, runtime data that allocation
     /// helpers need but that is not passed to them).
     user: *u8,
@@ -204,6 +223,7 @@ pub struct Heap {
 pub fn Heap.new() -> Heap {
     let rs: *RemSet = mem.alloc(1);
     rs.objs = mem.Vec.new();
+    rs.epoch = 1;
     Heap {
         large: mem.Vec.new(),
         large_old: 0,
@@ -214,6 +234,9 @@ pub fn Heap.new() -> Heap {
         seg_next: 0 as *u8,
         seg_left: 0,
         rs: rs,
+        epoch: 1,
+        mark_flags: 0,
+        marked: 0,
         sweepers: mem.Vec.new(),
         ephemerons: mem.Vec.new(),
         weaks: mem.Vec.new(),
@@ -243,6 +266,7 @@ pub fn Heap.new() -> Heap {
         stats: (getenv("LOIMI_GC_STATS\0".ptr) as u64) != 0,
         mark_ns: 0,
         sweep_ns: 0,
+        lazy_ns: 0,
         user: 0 as *u8,
     }
 }
@@ -270,19 +294,64 @@ pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
 /// current chunk; returns its first free slot.
 #[inline(never)]
 fn refill(h: *Heap, c: u64) -> *Header {
-    let a = h.avail[c];
-    if a != 0 {
+    loop {
+        let a = h.avail[c];
+        if a == 0 {
+            add_chunk(h, c);
+            return h.free[c];
+        }
         let ch = h.chunks.ptr_at(a - 1);
         h.avail[c] = ch.next;
         ch.next = 0;
-        ch.used = true;
-        h.free[c] = ch.free;
-        ch.free = 0 as *Header;
-        ch.nfree = 0;
-    } else {
-        add_chunk(h, c);
+        if ch.pending { sweep_chunk(h, ch); }
+        if ch.nfree != 0 {
+            ch.used = true;
+            h.free[c] = ch.free;
+            ch.free = 0 as *Header;
+            ch.nfree = 0;
+            return h.free[c];
+        }
     }
-    h.free[c]
+}
+
+/// Sweep a chunk of a generational heap whose sweep was deferred: free the
+/// objects not marked with the current epoch (survivors keep their mark
+/// and their LOG flag, set when they were marked).
+fn sweep_chunk(h: *Heap, ch: *Chunk) {
+    let ts = if h.stats { now_ns() } else { 0 };
+    let ep = h.epoch;
+    var head = 0 as *Header;
+    var nfree: u64 = 0;
+    var freed: u64 = 0;
+    var i = ch.n;
+    while i > 0 {
+        i -= 1;
+        let hd = (ch.base + i * ch.size) as *Header;
+        if hd.tid != FREE {
+            if hd.mark == ep { continue; }
+            hd.tid = FREE;
+            hd.flags = 0;
+            freed += 1;
+        }
+        hd.mark = 0;
+        hd.len = head as u64;
+        head = hd;
+        nfree += 1;
+    }
+    ch.free = head;
+    ch.nfree = nfree;
+    ch.pending = false;
+    h.freed += freed;
+    h.count -= freed;
+    if h.stats { h.lazy_ns += now_ns() - ts; }
+}
+
+/// Sweep every chunk whose sweep is still pending.
+fn finish_sweep(h: *Heap) {
+    for ci in 0..h.chunks.len {
+        let ch = h.chunks.ptr_at(ci);
+        if ch.pending { sweep_chunk(h, ch); }
+    }
 }
 
 #[inline(never)]
@@ -353,7 +422,7 @@ fn add_chunk(h: *Heap, c: u64) {
         hd.len = list as u64;
         list = hd;
     }
-    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true });
+    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true, pending: false });
     h.free[c] = list;
 }
 
@@ -362,7 +431,18 @@ fn add_chunk(h: *Heap, c: u64) {
 /// as marked.
 pub fn is_marked(p: *u8) -> bool {
     let hd = (p - HEADER) as *Header;
-    hd.mark != 0
+    hd.mark == head_of(p).rs.epoch
+}
+
+/// The `ChunkHead` of the chunk holding `obj` (or of a large object).
+#[inline]
+fn head_of(obj: *u8) -> *ChunkHead {
+    let hd = (obj - HEADER) as *Header;
+    if (hd.flags & LARGE) != 0 {
+        (obj - HEADER - 16) as *ChunkHead
+    } else {
+        ((obj as u64) & !(CHUNK - 1)) as *ChunkHead
+    }
 }
 
 /// Whether the collection in progress is a minor one (for sweepers that
@@ -373,9 +453,12 @@ pub fn Heap.is_minor(h: *Heap) -> bool { h.minor }
 pub fn mark_ptr(h: *Heap, p: *u8) {
     if (p as u64) == 0 { return; }
     let hd = (p - HEADER) as *Header;
-    if hd.mark != 0 { return; }
+    let ep = h.epoch;
+    if hd.mark == ep { return; }
     if h.verifying { verify_fail(h, p); }
-    hd.mark = 1;
+    hd.mark = ep;
+    hd.flags = hd.flags | h.mark_flags;
+    h.marked += hd.size as u64;
     h.stack.push(p);
 }
 
@@ -415,12 +498,7 @@ pub fn remember(obj: *u8) {
     let hd = (obj - HEADER) as *Header;
     if (hd.flags & LOG) == 0 { return; }
     hd.flags = hd.flags & !LOG;
-    let head = if (hd.flags & LARGE) != 0 {
-        (obj - HEADER - 16) as *ChunkHead
-    } else {
-        ((obj as u64) & !(CHUNK - 1)) as *ChunkHead
-    };
-    head.rs.objs.push(obj);
+    head_of(obj).rs.objs.push(obj);
 }
 
 // ── hooks ───────────────────────────────────────────────────────────────
@@ -455,7 +533,17 @@ pub fn collect(h: *Heap) uses gc {
     let t0 = if h.stats { now_ns() } else { 0 };
     if h.verify and h.sticky { verify_heap(h); }
     let minor = h.gen and h.sticky and !h.want_major;
-    if !minor and h.sticky { clear_marks(h); }
+    if !minor {
+        // A major collection: first the sweeps deferred from the last
+        // collection, which tell dead from live by the epoch.
+        finish_sweep(h);
+        if h.sticky {
+            if h.gen { new_epoch(h); } else { clear_marks(h); }
+        }
+    }
+    let rs_n = h.rs.objs.len;
+    h.marked = 0;
+    h.mark_flags = if h.gen { LOG } else { 0 };
     h.minor = minor;
     if minor {
         // Old objects stored into: trace them, and log them again on the
@@ -504,14 +592,15 @@ pub fn collect(h: *Heap) uses gc {
     }
     let t1 = if h.stats { now_ns() } else { 0 };
     let keep = h.gen;
-    // Bytes of the survivors, and of those that were young (no LOG flag:
-    // in a generational heap every old object has it at this point).
+    let ep = h.epoch;
+    // Bytes of the survivors (generational: counted when marked).
     var live: u64 = 0;
-    var promoted: u64 = 0;
     var freed: u64 = 0;
     // Small objects: sweep the chunks (in a minor collection, those
     // allocated from), rebuild their free lists in address order, and
-    // relink the chunks with free slots per class in index order.
+    // relink the chunks with free slots per class in index order. A
+    // generational heap defers the sweeps to the allocator (`refill`):
+    // the chunks are linked as pending.
     var tail: [u64; 33] = [0; 33];
     for c in 0..NCLASS {
         h.free[c] = 0 as *Header;
@@ -519,7 +608,12 @@ pub fn collect(h: *Heap) uses gc {
     }
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
-        if ch.used or !minor {
+        if keep {
+            if ch.used or !minor {
+                ch.pending = true;
+                ch.used = false;
+            }
+        } else if ch.used or !minor {
             var head = 0 as *Header;
             var nfree: u64 = 0;
             var i = ch.n;
@@ -527,13 +621,8 @@ pub fn collect(h: *Heap) uses gc {
                 i -= 1;
                 let hd = (ch.base + i * ch.size) as *Header;
                 if hd.tid != FREE {
-                    if hd.mark != 0 {
-                        if keep {
-                            if hd.flags == 0 { promoted += ch.size; }
-                            hd.flags = LOG;
-                        } else {
-                            hd.mark = 0;
-                        }
+                    if hd.mark == ep {
+                        hd.mark = 0;
                         live += ch.size;
                         continue;
                     }
@@ -553,7 +642,7 @@ pub fn collect(h: *Heap) uses gc {
             ch.used = false;
         }
         ch.next = 0;
-        if ch.nfree != 0 {
+        if ch.nfree != 0 or ch.pending {
             let c = ch.size >> 4;
             if tail[c] == 0 {
                 h.avail[c] = ci + 1;
@@ -568,13 +657,8 @@ pub fn collect(h: *Heap) uses gc {
     var out = first;
     for i in first..h.large.len {
         let cur = h.large.at(i);
-        if cur.mark != 0 {
-            if keep {
-                if cur.flags == LARGE { promoted += cur.size as u64; }
-                cur.flags = LARGE | LOG;
-            } else {
-                cur.mark = 0;
-            }
+        if cur.mark == ep {
+            if !keep { cur.mark = 0; }
             live += cur.size as u64;
             h.large.set(out, cur);
             out += 1;
@@ -590,9 +674,11 @@ pub fn collect(h: *Heap) uses gc {
     h.allocated = 0;
     h.collections += 1;
     h.sticky = keep;
+    if keep { live = h.marked; }
     if minor {
         h.minors += 1;
-        h.live_bytes += promoted;
+        // Every object marked in a minor collection was young.
+        h.live_bytes += h.marked;
         if h.live_bytes > h.major_limit { h.want_major = true; }
     } else {
         h.live_bytes = live;
@@ -613,7 +699,9 @@ pub fn collect(h: *Heap) uses gc {
         io.eprint_int(h.collections as i64);
         io.eprint(" live ");
         io.eprint_int((h.live_bytes >> 10) as i64);
-        io.eprint("K mark ");
+        io.eprint("K rs ");
+        io.eprint_int(rs_n as i64);
+        io.eprint(" mark ");
         io.eprint_int(((t1 - t0) / 1000) as i64);
         io.eprint("us sweep ");
         io.eprint_int(((t2 - t1) / 1000) as i64);
@@ -621,12 +709,25 @@ pub fn collect(h: *Heap) uses gc {
         io.eprint_int((h.mark_ns / 1000000) as i64);
         io.eprint("ms sweep ");
         io.eprint_int((h.sweep_ns / 1000000) as i64);
+        io.eprint("ms lazy sweep ");
+        io.eprint_int((h.lazy_ns / 1000000) as i64);
         io.eprintln("ms");
     }
 }
 
+/// Before a major collection of a generational heap: flip the epoch, which
+/// unmarks every object, and forget the remembered set. (Old objects keep
+/// their LOG flag; the sweep sets it again on the survivors.)
+fn new_epoch(h: *Heap) {
+    h.epoch = 3 - h.epoch;
+    h.rs.epoch = h.epoch;
+    h.large_old = 0;
+    h.rs.objs.clear();
+    h.sticky = false;
+}
+
 /// Clear every mark bit and LOG flag, and forget the remembered set
-/// (before a full collection of a heap whose live objects are marked).
+/// (before a full collection of a heap that was generational).
 fn clear_marks(h: *Heap) {
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
@@ -751,7 +852,7 @@ fn verify_heap(h: *Heap) {
         while i > 0 {
             i -= 1;
             let hd = (ch.base + i * ch.size) as *Header;
-            if hd.tid != FREE and hd.mark != 0 and (hd.flags & LOG) != 0 {
+            if hd.tid != FREE and hd.mark == h.epoch and (hd.flags & LOG) != 0 {
                 let p = hd as *u8 + HEADER;
                 h.vparent = p;
                 loimi_trace_object(h, p, hd.tid as u32);
@@ -760,7 +861,7 @@ fn verify_heap(h: *Heap) {
     }
     for i in 0..h.large.len {
         let hd = h.large.at(i);
-        if hd.mark != 0 and (hd.flags & LOG) != 0 {
+        if hd.mark == h.epoch and (hd.flags & LOG) != 0 {
             let p = hd as *u8 + HEADER;
             h.vparent = p;
             loimi_trace_object(h, p, hd.tid as u32);
