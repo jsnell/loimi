@@ -726,10 +726,12 @@ fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
                 add_compiled(m, p, head, s.args[1], cut);
                 done = true;
             } else if lname == term.A_SOFT {
-                // aux :- '$softmark'(L), C, '$softcut'(L), T.   aux :- '$softfail'(L)?
-                // Approximation: soft-cut as if-then-else when C succeeds
-                // at most once.
-                let b1 = m.mk2(term.A_COMMA, opaque(m, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
+                // (C *-> T ; E): aux :- '$soft_enter'(L), C, '$softcut'(L), T.  aux :- E.
+                // '$softcut' turns the aux's own choicepoint (the second
+                // clause) into a failure, keeping C's.
+                let lv = m.new_var();
+                let sc = m.mk2(term.A_COMMA, m.mk1(m.db.atom("$softcut"), lv), ls.args[1]);
+                let b1 = m.mk2(term.A_COMMA, m.mk1(m.db.atom("$soft_enter"), lv), m.mk2(term.A_COMMA, opaque(m, ls.args[0]), sc));
                 add_compiled(m, p, head, b1, cut);
                 add_compiled(m, p, head, s.args[1], cut);
                 done = true;

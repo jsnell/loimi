@@ -1,3 +1,4 @@
+:- set_prolog_flag(double_quotes, codes).
 app([], L, L).
 app([H|T], L, [H|R]) :- app(T, L, R).
 nrev([], []).
@@ -5,7 +6,7 @@ nrev([H|T], R) :- nrev(T, RT), app(RT, [H], R).
 
 main :-
     write(hello), nl,
-    X = f(a, _, 'x y'), print(X), nl,
+    X = f(a, 'x y', "ab"), print(X), nl,
     app([1,2], [3], L), write(L), nl,
     nrev([1,2,3,4,5], R), write(R), nl,
     Y is 3 + 4 * 2, write(Y), nl,

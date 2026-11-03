@@ -53,6 +53,13 @@ fn setup(m: *Machine) {
     m.fail_code = compile.finish(m, &mem.Vec { ptr: &fv[0], len: 1, cap: 1 }, 0);
     let tv: [u32; 1] = [Wam.PROCEED()];
     m.true_code = compile.finish(m, &mem.Vec { ptr: &tv[0], len: 1, cap: 1 }, 0);
+    var tfv: mem.Vec<u32> = mem.Vec.new();
+    tfv.push(Wam.TRUST());
+    let fa = m.fail_code as u64;
+    tfv.push((fa & 0xFFFFFFFF) as u32);
+    tfv.push((fa >> 32) as u32);
+    m.trust_fail = compile.finish(m, &tfv, 0);
+    tfv.free();
     let ht: [u32; 1] = [Wam.HALT_TRUE()];
     m.halt_true = compile.finish(m, &mem.Vec { ptr: &ht[0], len: 1, cap: 1 }, 0);
     let hf: [u32; 1] = [Wam.HALT_FALSE()];

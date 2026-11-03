@@ -34,7 +34,7 @@ pub enum B {
     Assert, Asserta, Clauses, ClauseNext, ClauseRef, Erase, Dynamic, Abolish,
     Msort, Sort, Sort4, Keysort, Length2,
     Op, Ops, SetFlag, Halt1, Statistics, GarbageCollect,
-    AddClause, TermVariables, Succ, Plus, NbSetval, NbGetval, Tab2, Numbervars, CharType, Atomics, Ignore2,
+    AddClause, SoftEnter, SoftCut, TermVariables, Succ, Plus, NbSetval, NbGetval, Tab2, Numbervars, CharType, Atomics, Ignore2,
     COUNT,
 }
 
@@ -69,7 +69,7 @@ pub fn register(m: *Machine) {
         ("tab", 2, B.Tab2), ("numbervars", 3, B.Numbervars), ("char_type", 2, B.CharType), ("$atomics", 2, B.Atomics),
         ("use_module", 2, B.Ignore2), ("garbage_collect_atoms", 0, B.GarbageCollect), ("print_message", 2, B.Ignore2),
         ("set_stream", 2, B.Ignore2), ("license", 1, B.Ignore2), ("flush_output", 0, B.GarbageCollect),
-        ("flush_output", 1, B.Ignore2), ("$skip", 0, B.GarbageCollect), ("$skip", 1, B.Ignore2), ("$add_clause", 1, B.AddClause),
+        ("flush_output", 1, B.Ignore2), ("$skip", 0, B.GarbageCollect), ("$skip", 1, B.Ignore2), ("$add_clause", 1, B.AddClause), ("$soft_enter", 1, B.SoftEnter), ("$softcut", 1, B.SoftCut),
     ];
     for e in tbl {
         let (name, ar, b) = e;
@@ -393,6 +393,7 @@ fn format(m: *Machine, to_err: bool, f0: Term, args0: Term) -> Result<bool, Term
     var i: u64 = 0;
     var ai: u64 = 0;
     var fill_from: u64 = 0;
+    var fill_at: i64 = -1;
     while i < s.len {
         let c = s[i];
         i += 1;
@@ -423,18 +424,32 @@ fn format(m: *Machine, to_err: bool, f0: Term, args0: Term) -> Result<bool, Term
             for _j in 0..k { out.push('\n'); }
             continue;
         }
-        if d == 't' or d == '|' or d == '+' {
-            // Column handling: pad from the last column stop.
-            if d == '|' or d == '+' {
-                let line_start = match mem.rfind_byte(out.as_str(), '\n') { Some(p) => p + 1, None => 0 };
-                let col = out.len() - line_start;
-                let target = if d == '+' {
-                    let stop = if fill_from > line_start { fill_from - line_start } else { 0 };
-                    stop + (if numarg < 0 { 8 } else { numarg as u64 })
-                } else { if numarg < 0 { col } else { numarg as u64 } };
-                while out.len() - line_start < target { out.push(' '); }
-                fill_from = out.len();
+        if d == 't' { fill_at = out.len() as i64; continue; }
+        if d == '|' or d == '+' {
+            // Column stop: pad the segment since the last stop, at its ~t
+            // if it has one (right-aligning what follows), else at its end.
+            let line_start = match mem.rfind_byte(out.as_str(), '\n') { Some(p) => p + 1, None => 0 };
+            let col = out.len() - line_start;
+            let target = if d == '+' {
+                let stop = if fill_from > line_start { fill_from - line_start } else { 0 };
+                stop + (if numarg < 0 { 8 } else { numarg as u64 })
+            } else { if numarg < 0 { col } else { numarg as u64 } };
+            if col < target {
+                let pad = target - col;
+                if fill_at >= 0 and fill_at as u64 >= fill_from and fill_at as u64 >= line_start {
+                    let fill_at = fill_at as u64;
+                    let tail_len = out.len() - fill_at;
+                    for _j in 0..pad { out.push(' '); }
+                    let bp = out.bytes.ptr;
+                    var k = tail_len;
+                    while k > 0 { k -= 1; bp[fill_at + pad + k] = bp[fill_at + k]; }
+                    for j in 0..pad { bp[fill_at + j] = ' '; }
+                } else {
+                    for _j in 0..pad { out.push(' '); }
+                }
             }
+            fill_from = out.len();
+            fill_at = -1;
             continue;
         }
         if ai >= args.len {
@@ -845,6 +860,17 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
             c.kind = machine.CP_CATCH;
             let off = ((c as u64) - (m.cbase as u64)) / 8;
             Ok(unify(m, m.x[0], term.mk_int(off as i64)))
+        }
+        SoftEnter => {
+            let off = ((m.b as u64) - (m.cbase as u64)) / 8;
+            Ok(unify(m, m.x[0], term.mk_int(off as i64)))
+        }
+        SoftCut => {
+            if let Int(off) = x(m, 0) {
+                let c = ((m.cbase as *u64) + off as u64) as *Choice;
+                if c <= m.b { c.alt = m.trust_fail; }
+            }
+            Ok(true)
         }
         CatchExit => {
             if let Int(off) = x(m, 0) {

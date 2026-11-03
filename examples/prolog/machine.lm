@@ -70,6 +70,7 @@ pub struct Machine {
     clauses: mem.Vec<*Clause>,
     fail_code: *u32,
     true_code: *u32,
+    trust_fail: *u32,
     halt_true: *u32,
     halt_false: *u32,
     bmap: HashMap<u32, u32>,

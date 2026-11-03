@@ -1,0 +1,91 @@
+1+2
+1+2*3
+(1+2)*3
+1-(2-3)
+1-2-3
+2**3
+- 1
+- 1
+- - 1
+-a
+- -a
+1- -1
+1+ -2
+a=b
+a:-b
+a:-b,c
+a,b
+f((a,b))
+f((a:-b))
+a;b
+a->b;c
+\+a
+\+ (a,b)
+f(-)
+f(+,-)
+[a,b,c]
+[a|b]
+[[1,2],[3]]
+[]
+[]
+{a,b}
+{x}
+f(x,y)=g
+a:b:c
+- (1+2)
+- 3+4
+3- -3
+1 mod 2
+a is b
+f(a mod b)
+- - -a
+\a
+a rem b rem c
+1.0
+-0.0
+3.25e+100
+1.0e-10
+hello
+'Hello'
+'hello world'
+[]
+''
+'it\'s'
+a+'B'
+f('A',b,c)
+'\n'
++
+f(+)
+- 1
+- - 1
+[a,'B'|c]
+'/*'
+;
+!
+','
+'|'
+f(',','|')
+{x}
+-a
+1-a
+f(;,'|',[])
+foo('X',y)
+f(x,'A',[1,2],+(1,2))
+f('A',1+2)
+[1,2]
+hello and 'World'
+abc|42|3.14|xyz|A
+1.500000e+00 2.0000 3
+'q q'
+no args
+left                          right
+name                value
+     right
+1,234,567
+        abc
+~ tilde
+hello
+2
+1
+f(x,'Y')
+1

@@ -140,6 +140,7 @@ pub struct Reader {
     vars: mem.Vec<(str, Term)>,
     error: ?str,
     err_line: u32,
+    arg_ctx: bool,
 }
 
 pub fn Reader.new(m: *Machine, src: str) -> Reader {
@@ -147,7 +148,7 @@ pub fn Reader.new(m: *Machine, src: str) -> Reader {
         m: m, src: src, pos: 0, line: 1,
         tok: Token { kind: Tk.Eof, text: "", int: 0, flt: 0.0, layout: false, line: 1 },
         peeked: false, arena: mem.Arena.new(), buf: text.StrBuf.new(), vars: mem.Vec.new(),
-        error: None, err_line: 0,
+        error: None, err_line: 0, arg_ctx: false,
     }
 }
 
@@ -480,7 +481,7 @@ fn Reader.expect(r: *Reader, k: Tk, msg: str) {
 fn Reader.arglist(r: *Reader, name: u32) -> Term {
     var args: mem.Vec<Term> = mem.Vec.new();
     loop {
-        args.push(r.parse(999));
+        args.push(r.parse_arg());
         if r.error.is_some() { args.free(); return Term.Atom(term.A_NIL); }
         let t = r.next();
         if t.kind == Tk.Comma { continue; }
@@ -524,7 +525,7 @@ fn Reader.primary(r: *Reader, maxp: u32) -> (Term, u32) {
             var items: mem.Vec<Term> = mem.Vec.new();
             var tail = Term.Atom(term.A_NIL);
             loop {
-                items.push(r.parse(999));
+                items.push(r.parse_arg());
                 if r.error.is_some() { break; }
                 let k = r.next().kind;
                 if k == Tk.Comma { continue; }
@@ -574,7 +575,7 @@ fn Reader.after_atom(r: *Reader, a: u32, maxp: u32, quoted: bool) -> (Term, u32)
         if t.kind == Tk.Int {
             return (term.mk_int(if a == term.A_MINUS { 0 - t.int } else { t.int }), 0);
         }
-        return (Term.Flt(if a == term.A_MINUS { 0.0 - t.flt } else { t.flt }), 0);
+        return (Term.Flt(if a == term.A_MINUS { -t.flt } else { t.flt }), 0);
     }
     if !quoted {
         if let Some((p, argmax)) = prefix_op(m, a) {
@@ -610,9 +611,20 @@ fn Reader.parse(r: *Reader, maxp: u32) -> Term {
     t
 }
 
-fn Reader.parse_prec(r: *Reader, maxp: u32) -> (Term, u32) {
+/// An argument (of a compound or a list): priority 999, but like SWI-Prolog
+/// an operator above 999 other than `,` and `|` is accepted (`f(a :- b)`).
+fn Reader.parse_arg(r: *Reader) -> Term {
+    r.arg_ctx = true;
+    let (t, _) = r.parse_prec(999);
+    t
+}
+
+fn Reader.parse_prec(r: *Reader, maxp0: u32) -> (Term, u32) {
+    let arg = r.arg_ctx;
+    r.arg_ctx = false;
+    var maxp = maxp0;
     let m = r.m;
-    var (left, lp) = r.primary(maxp);
+    var (left, lp) = r.primary(maxp0);
     loop {
         if r.error.is_some() { return (left, lp); }
         let t = r.peek();
@@ -624,6 +636,7 @@ fn Reader.parse_prec(r: *Reader, maxp: u32) -> (Term, u32) {
             _ => return (left, lp),
         }
         if let Some((p, la, ra)) = infix_op(m, name) {
+            if arg and p > maxp and name != term.A_COMMA and name != term.A_BAR { maxp = 1200; }
             if p <= maxp and lp <= la {
                 r.next();
                 let right = r.parse(ra);
@@ -696,7 +709,7 @@ pub fn parse_number(m: *Machine, s: str) -> ?Term {
     if r.error.is_some() { return None; }
     var res = Term.Unb;
     if kind == Tk.Int { res = term.mk_int(if neg { 0 - r.tok.int } else { r.tok.int }); }
-    else if kind == Tk.Flt { res = Term.Flt(if neg { 0.0 - r.tok.flt } else { r.tok.flt }); }
+    else if kind == Tk.Flt { res = Term.Flt(if neg { -r.tok.flt } else { r.tok.flt }); }
     else { return None; }
     r.skip_layout();
     if r.pos != r.src.len or r.error.is_some() { return None; }

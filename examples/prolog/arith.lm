@@ -192,7 +192,7 @@ fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Ter
             "/\\" => return Ok(term.mk_int(a & b)),
             "\\/" => return Ok(term.mk_int(a | b)),
             "xor" => return Ok(term.mk_int(a ^ b)),
-            "**" => return ipow(m, a, b),
+            "**" => { if b < 0 { return flt(m, pow(a as f64, b as f64)); } return ipow(m, a, b); }
             "^" => return ipow(m, a, b),
             "gcd" => {
                 var p = if a < 0 { 0 - a } else { a };
@@ -223,8 +223,8 @@ fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Ter
             }
             flt(m, pow(a, b))
         }
-        "min" => Ok(if cmp(x, y) <= 0 { x } else { y }),
-        "max" => Ok(if cmp(x, y) >= 0 { x } else { y }),
+        "min" => { let c = cmp(x, y); Ok(if c < 0 or (c == 0 and is_flt(x)) { x } else { y }) }
+        "max" => { let c = cmp(x, y); Ok(if c > 0 or (c == 0 and is_flt(x)) { x } else { y }) }
         "atan2" => flt(m, atan2(a, b)),
         "atan" => flt(m, atan2(a, b)),
         "copysign" => flt(m, a.copysign(b)),
@@ -253,3 +253,4 @@ pub fn cmp(x: Term, y: Term) -> i32 {
         }
     }
 }
+fn is_flt(t: Term) -> bool { match t { Flt(_) => true, _ => false } }
