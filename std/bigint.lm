@@ -23,8 +23,8 @@
 // `Num` of an `i64` with `from_i64(buf, x)` (one limb of buffer).
 //
 // Algorithms (thresholds below, in limbs, measured; docs/stdlib.md has
-// the numbers): schoolbook multiplication (row by row, or column by
-// column for longer operands), Karatsuba, Toom-3; the same three for
+// the numbers): schoolbook multiplication (row by row, two rows a
+// pass), Karatsuba, Toom-3; the same three for
 // squaring, used whenever both operands are the same limbs; Knuth's
 // algorithm D (dividing by a precomputed reciprocal, not `div_wide`,
 // which is a libcall) and above DIV_DC recursive divide-and-conquer
@@ -48,10 +48,6 @@ pub const KARATSUBA_SQR: u64 = 48;
 pub const TOOM3: u64 = 250;
 /// Squarings of at least this many limbs use Toom-3 squaring.
 pub const TOOM3_SQR: u64 = 500;
-/// Schoolbook products and squares sum column by column (Comba) when
-/// the shorter operand has at least this many limbs, row by row below.
-const MUL_COLUMNS: u64 = 14;
-const SQR_COLUMNS: u64 = 14;
 /// Divisions whose divisor and quotient both have at least this many
 /// limbs use divide-and-conquer (Burnikel-Ziegler) division.
 pub const DIV_DC: u64 = 80;
@@ -112,101 +108,135 @@ fn mag_cmp(a: *u64, na: u64, b: *u64, nb: u64) -> i32 {
     0
 }
 
-/// r[0..na] = a + b (na >= nb); returns the carry. `r` may be `a`.
-fn add_to(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) -> u64 {
-    var c: u64 = 0;
+/// r[0..n] = a + b; returns the carry. `r` may be `a` or `b`.
+fn add_n(r: *u64, a: *u64, b: *u64, n: u64) -> bool {
+    var c = false;
     var i: u64 = 0;
-    while i < nb {
-        let x = a[i];
-        let s = x +% b[i];
-        let t = s +% c;
-        c = if s < x or t < s { 1 } else { 0 };
-        r[i] = t;
-        i += 1;
+    // Four limbs a step, so the carry stays in the flags between them
+    // (the loop's compare clobbers it), and the rest without a loop (a
+    // loop of 0-3 steps costs a mispredicted exit at small sizes).
+    let n4 = n & ~(3 as u64);
+    while i < n4 {
+        let (t0, c0) = a[i].add_carry(b[i], c);
+        let (t1, c1) = a[i + 1].add_carry(b[i + 1], c0);
+        let (t2, c2) = a[i + 2].add_carry(b[i + 2], c1);
+        let (t3, c3) = a[i + 3].add_carry(b[i + 3], c2);
+        r[i] = t0;
+        r[i + 1] = t1;
+        r[i + 2] = t2;
+        r[i + 3] = t3;
+        c = c3;
+        i += 4;
     }
-    while i < na {
-        let x = a[i];
-        let t = x +% c;
-        c = if t < x { 1 } else { 0 };
+    if (n & 2) != 0 {
+        let (t0, c0) = a[i].add_carry(b[i], c);
+        let (t1, c1) = a[i + 1].add_carry(b[i + 1], c0);
+        r[i] = t0;
+        r[i + 1] = t1;
+        c = c1;
+        i += 2;
+    }
+    if (n & 1) != 0 {
+        let (t, co) = a[i].add_carry(b[i], c);
         r[i] = t;
-        i += 1;
+        c = co;
     }
     c
+}
+
+/// r[0..na] = a + b (na >= nb); returns the carry. `r` may be `a`.
+fn add_to(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) -> u64 {
+    var c = add_n(r, a, b, nb);
+    for i in nb..na {
+        let (t, co) = a[i].add_carry(0, c);
+        r[i] = t;
+        c = co;
+    }
+    c as u64
 }
 
 /// r[0..rn] += b[0..nb] (rn >= nb), stopping once the carry is
 /// absorbed; returns the carry out of r[rn - 1].
 fn add_in(r: *u64, rn: u64, b: *u64, nb: u64) -> u64 {
-    var c: u64 = 0;
-    var i: u64 = 0;
-    while i < nb {
-        let x = r[i];
-        let s = x +% b[i];
-        let t = s +% c;
-        c = if s < x or t < s { 1 } else { 0 };
-        r[i] = t;
-        i += 1;
-    }
-    while c != 0 and i < rn {
+    var c = add_n(r, r, b, nb);
+    var i = nb;
+    while c and i < rn {
         let t = r[i] +% 1;
         r[i] = t;
-        c = if t == 0 { 1 } else { 0 };
+        c = t == 0;
         i += 1;
     }
-    c
+    c as u64
+}
+
+/// r[0..n] = a - b; returns the borrow. `r` may be `a` or `b`.
+fn sub_n(r: *u64, a: *u64, b: *u64, n: u64) -> bool {
+    var br = false;
+    var i: u64 = 0;
+    // Four limbs a step, so the carry stays in the flags between them
+    // (the loop's compare clobbers it), and the rest without a loop (a
+    // loop of 0-3 steps costs a mispredicted exit at small sizes).
+    let n4 = n & ~(3 as u64);
+    while i < n4 {
+        let (t0, c0) = a[i].sub_borrow(b[i], br);
+        let (t1, c1) = a[i + 1].sub_borrow(b[i + 1], c0);
+        let (t2, c2) = a[i + 2].sub_borrow(b[i + 2], c1);
+        let (t3, c3) = a[i + 3].sub_borrow(b[i + 3], c2);
+        r[i] = t0;
+        r[i + 1] = t1;
+        r[i + 2] = t2;
+        r[i + 3] = t3;
+        br = c3;
+        i += 4;
+    }
+    if (n & 2) != 0 {
+        let (t0, c0) = a[i].sub_borrow(b[i], br);
+        let (t1, c1) = a[i + 1].sub_borrow(b[i + 1], c0);
+        r[i] = t0;
+        r[i + 1] = t1;
+        br = c1;
+        i += 2;
+    }
+    if (n & 1) != 0 {
+        let (t, co) = a[i].sub_borrow(b[i], br);
+        r[i] = t;
+        br = co;
+    }
+    br
 }
 
 /// r[0..na] = a - b (na >= nb); returns the borrow. `r` may be `a`.
 fn sub_to(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) -> u64 {
-    var br: u64 = 0;
-    var i: u64 = 0;
-    while i < nb {
-        let x = a[i];
-        let y = b[i];
-        let d = x -% y;
-        r[i] = d -% br;
-        br = if x < y or d < br { 1 } else { 0 };
-        i += 1;
+    var br = sub_n(r, a, b, nb);
+    for i in nb..na {
+        let (d, bo) = a[i].sub_borrow(0, br);
+        r[i] = d;
+        br = bo;
     }
-    while i < na {
-        let x = a[i];
-        r[i] = x -% br;
-        br = if x < br { 1 } else { 0 };
-        i += 1;
-    }
-    br
+    br as u64
 }
 
 /// r[0..rn] -= b[0..nb] (rn >= nb), stopping once the borrow is
 /// absorbed; returns the borrow.
 fn sub_in(r: *u64, rn: u64, b: *u64, nb: u64) -> u64 {
-    var br: u64 = 0;
-    var i: u64 = 0;
-    while i < nb {
-        let x = r[i];
-        let y = b[i];
-        let d = x -% y;
-        r[i] = d -% br;
-        br = if x < y or d < br { 1 } else { 0 };
-        i += 1;
-    }
-    while br != 0 and i < rn {
+    var br = sub_n(r, r, b, nb);
+    var i = nb;
+    while br and i < rn {
         let x = r[i];
         r[i] = x -% 1;
-        br = if x == 0 { 1 } else { 0 };
+        br = x == 0;
         i += 1;
     }
-    br
+    br as u64
 }
 
 /// r[0..n] = a * m; returns the carry limb. `r` may be `a`.
 fn mul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     var c: u64 = 0;
     for i in 0..n {
-        let (lo, hi) = a[i].mul_wide(m);
-        let t = lo +% c;
-        c = hi + (if t < lo { 1 } else { 0 });
-        r[i] = t;
+        let (lo, hi) = a[i].mul_add_wide(m, c, 0);
+        r[i] = lo;
+        c = hi;
     }
     c
 }
@@ -215,91 +245,58 @@ fn mul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
 fn addmul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     var c: u64 = 0;
     for i in 0..n {
-        let (lo, hi) = a[i].mul_wide(m);
-        let t = lo +% c;
-        var h = hi + (if t < lo { 1 } else { 0 });
-        let u = r[i] +% t;
-        h += if u < t { 1 } else { 0 };
-        r[i] = u;
-        c = h;
+        let (lo, hi) = a[i].mul_add_wide(m, r[i], c);
+        r[i] = lo;
+        c = hi;
     }
     c
+}
+
+/// r[0..n] += a * (m0 + m1 B) + c, writing r[n] (not read) and
+/// returning the limb above it: two rows of a product in one pass over a
+/// and r.
+fn addmul_2(r: *u64, a: *u64, n: u64, m0: u64, m1: u64, c: u64) -> u64 {
+    var c0 = c;
+    var c1: u64 = 0;
+    for i in 0..n {
+        let x = a[i];
+        let (l0, h0) = x.mul_add_wide(m0, r[i], c0);
+        r[i] = l0;
+        let (l1, h1) = x.mul_add_wide(m1, h0, c1);
+        c0 = l1;
+        c1 = h1;
+    }
+    r[n] = c0;
+    c1
 }
 
 /// r[0..n] -= a * m; returns the borrow limb.
 fn submul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     var c: u64 = 0;
     for i in 0..n {
-        let (lo, hi) = a[i].mul_wide(m);
-        let t = lo +% c;
-        var h = hi + (if t < lo { 1 } else { 0 });
-        let x = r[i];
-        r[i] = x -% t;
-        h += if x < t { 1 } else { 0 };
-        c = h;
+        let (lo, hi) = a[i].mul_add_wide(m, c, 0);
+        let (d, bo) = r[i].sub_borrow(lo, false);
+        r[i] = d;
+        c = hi + bo as u64;
     }
     c
 }
 
 /// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
+/// Row by row, two rows a pass (addmul_2): faster than summing column
+/// by column (Comba) at every size below Karatsuba's, as the inner loops
+/// all have the same length (their exits are predicted) and each pass
+/// loads and stores r once for two rows.
 fn mul_basecase(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
-    if nb < MUL_COLUMNS {
-        // Row by row.
-        r[na] = mul_1(r, a, na, b[0]);
-        for j in 1..nb {
-            r[na + j] = addmul_1(r + j, a, na, b[j]);
-        }
-        return;
+    r[na] = mul_1(r, a, na, b[0]);
+    var j: u64 = 1;
+    while j + 1 < nb {
+        r[na + j + 1] = addmul_2(r + j, a, na, b[j], b[j + 1], 0);
+        j += 2;
     }
-    // Column by column (Comba): each result limb is the sum of its
-    // products in a three-limb accumulator, so one store per limb; two
-    // accumulators (alternate products) halve the carry chains.
-    var c0: u64 = 0;
-    var c1: u64 = 0;
-    var c2: u64 = 0;
-    for k in 0..na + nb - 1 {
-        let i0 = if k >= nb { k - nb + 1 } else { 0 };
-        let i1 = if k < na { k + 1 } else { na };
-        var d0: u64 = 0;
-        var d1: u64 = 0;
-        var d2: u64 = 0;
-        var i = i0;
-        while i + 1 < i1 {
-            let (lo, hi) = a[i].mul_wide(b[k - i]);
-            let s0 = c0 +% lo;
-            let t = hi + (if s0 < lo { 1 } else { 0 });
-            let s1 = c1 +% t;
-            c2 += if s1 < t { 1 } else { 0 };
-            c0 = s0;
-            c1 = s1;
-            let (lo2, hi2) = a[i + 1].mul_wide(b[k - i - 1]);
-            let e0 = d0 +% lo2;
-            let u = hi2 + (if e0 < lo2 { 1 } else { 0 });
-            let e1 = d1 +% u;
-            d2 += if e1 < u { 1 } else { 0 };
-            d0 = e0;
-            d1 = e1;
-            i += 2;
-        }
-        if i < i1 {
-            let (lo, hi) = a[i].mul_wide(b[k - i]);
-            let s0 = c0 +% lo;
-            let t = hi + (if s0 < lo { 1 } else { 0 });
-            let s1 = c1 +% t;
-            c2 += if s1 < t { 1 } else { 0 };
-            c0 = s0;
-            c1 = s1;
-        }
-        let s0 = c0 +% d0;
-        let s1 = c1 +% d1;
-        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
-        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
-        r[k] = s0;
-        c0 = s2;
-        c1 = c2;
-        c2 = 0;
+    if j < nb {
+        r[na + j] = addmul_1(r + j, a, na, b[j]);
     }
-    r[na + nb - 1] = c0;
 }
 
 /// r[0..2n] = a * b, both n limbs, by Karatsuba's algorithm.
@@ -327,61 +324,9 @@ fn kmul(r: *u64, a: *u64, b: *u64, n: u64) {
 }
 
 /// r[0..2n] = a * a (n >= 1) by schoolbook squaring: the products
-/// a[i] * a[j] for i < j once, doubled, plus the squares a[i] * a[i].
-/// Column by column like mul_basecase (rows for short numbers). r must
-/// not overlap a.
+/// a[i] a[j] for i < j once (row by row, two rows a pass), then doubled
+/// and the squares a[i] a[i] added in one pass. r must not overlap a.
 fn sqr_basecase(r: *u64, a: *u64, n: u64) {
-    if n < SQR_COLUMNS {
-        sqr_rows(r, a, n);
-        return;
-    }
-    var c0: u64 = 0;
-    var c1: u64 = 0;
-    var c2: u64 = 0;
-    for k in 0..2 * n - 1 {
-        // The column's products a[i] a[k - i] for i < k - i, doubled,
-        // plus the square on the diagonal.
-        var d0: u64 = 0;
-        var d1: u64 = 0;
-        var d2: u64 = 0;
-        var i = if k >= n { k - n + 1 } else { 0 };
-        while 2 * i < k {
-            let (lo, hi) = a[i].mul_wide(a[k - i]);
-            let s0 = d0 +% lo;
-            let t = hi + (if s0 < lo { 1 } else { 0 });
-            let s1 = d1 +% t;
-            d2 += if s1 < t { 1 } else { 0 };
-            d0 = s0;
-            d1 = s1;
-            i += 1;
-        }
-        d2 = (d2 << 1) | (d1 >> 63);
-        d1 = (d1 << 1) | (d0 >> 63);
-        d0 = d0 << 1;
-        if (k & 1) == 0 {
-            let (lo, hi) = a[k / 2].mul_wide(a[k / 2]);
-            let s0 = d0 +% lo;
-            let s1 = d1 +% hi;
-            let s2 = s1 +% (if s0 < lo { 1 } else { 0 });
-            d2 += (if s1 < hi { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
-            d0 = s0;
-            d1 = s2;
-        }
-        let s0 = c0 +% d0;
-        let s1 = c1 +% d1;
-        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
-        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
-        r[k] = s0;
-        c0 = s2;
-        c1 = c2;
-        c2 = 0;
-    }
-    r[2 * n - 1] = c0;
-}
-
-/// sqr_basecase row by row: the off-diagonal products with mul_1 and
-/// addmul_1, shifted, plus the diagonal.
-fn sqr_rows(r: *u64, a: *u64, n: u64) {
     if n == 1 {
         let (lo, hi) = a[0].mul_wide(a[0]);
         r[0] = lo;
@@ -391,23 +336,34 @@ fn sqr_rows(r: *u64, a: *u64, n: u64) {
     r[0] = 0;
     r[2 * n - 1] = 0;
     r[n] = mul_1(r + 1, a + 1, n - 1, a[0]);
-    for i in 1..n - 1 {
+    // Rows i and i + 1 (a[i] a[j] at i + j for j > i, a[i + 1] a[j] for
+    // j > i + 1) in one pass: their corner a[i] a[i + 1], then both over
+    // a[i + 2..n].
+    var i: u64 = 1;
+    while i + 2 < n {
+        let p = 2 * i + 1;
+        let (lo, hi) = a[i].mul_add_wide(a[i + 1], r[p], 0);
+        r[p] = lo;
+        r[n + i + 1] = addmul_2(r + p + 1, a + i + 2, n - i - 2, a[i], a[i + 1], hi);
+        i += 2;
+    }
+    if i + 1 < n {
         r[n + i] = addmul_1(r + 2 * i + 1, a + i + 1, n - i - 1, a[i]);
     }
-    lshift(r, r, 2 * n, 1);
-    var c: u64 = 0;
-    for i in 0..n {
-        let (lo, hi) = a[i].mul_wide(a[i]);
-        let x = r[2 * i];
-        let s1 = x +% lo;
-        let s2 = s1 +% c;
-        let c1: u64 = if s1 < x or s2 < s1 { 1 } else { 0 };
-        r[2 * i] = s2;
-        let y = r[2 * i + 1];
-        let t1 = y +% hi;
-        let t2 = t1 +% c1;
-        c = if t1 < y or t2 < t1 { 1 } else { 0 };
-        r[2 * i + 1] = t2;
+    // r = 2 r + the squares, limb pair by limb pair (the doubled
+    // triangle's top bit is zero: it is below a^2).
+    var c = false;
+    var top: u64 = 0;
+    for k in 0..n {
+        let x = r[2 * k];
+        let y = r[2 * k + 1];
+        let (lo, hi) = a[k].mul_wide(a[k]);
+        let (s0, c0) = lo.add_carry((x << 1) | top, c);
+        let (s1, c1) = hi.add_carry((y << 1) | (x >> 63), c0);
+        r[2 * k] = s0;
+        r[2 * k + 1] = s1;
+        top = y >> 63;
+        c = c1;
     }
 }
 
@@ -599,9 +555,8 @@ fn reciprocal(d: u64) -> u64 {
 /// Moller and Granlund's division by an invariant integer, two
 /// multiplications instead of a 128-bit division (which is a libcall).
 fn div_pi(nh: u64, nl: u64, d: u64, di: u64) -> (u64, u64) {
-    let (pl, ph) = nh.mul_wide(di);
-    let ql = pl +% nl;
-    var qh = ph +% nh +% 1 +% (if ql < pl { 1 } else { 0 });
+    let (ql, ph) = nh.mul_add_wide(di, nl, 0);
+    var qh = ph +% nh +% 1;
     var r = nl -% (qh *% d);
     if r > ql {
         qh = qh -% 1;
