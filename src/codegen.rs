@@ -124,6 +124,7 @@ pub fn llty(p: &Program, t: &Ty) -> String {
         Ty::Int(it) => format!("i{}", it.bits),
         Ty::F32 => "float".into(),
         Ty::F64 => "double".into(),
+        Ty::Vector(l, n) => format!("<{} x {}>", n, llty(p, l)),
         Ty::Bool => "i1".into(),
         Ty::Unit | Ty::Never => "{}".into(),
         Ty::Ptr(_) | Ty::Fn(..) => "ptr".into(),
@@ -633,6 +634,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
             return "zeroinitializer".into();
         }
         let lt = self.ty(t);
+        if has_vector(self.p(), t) {
+            return self.inst(format!("load {}, ptr {}, align 1", lt, ptr));
+        }
         self.inst(format!("load {}, ptr {}", lt, ptr))
     }
     pub fn store(&mut self, t: &Ty, v: &str, ptr: &str) {
@@ -648,6 +652,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
         }
         let lt = self.ty(t);
+        if has_vector(self.p(), t) {
+            self.emit(format!("store {} {}, ptr {}, align 1", lt, v, ptr));
+            return;
+        }
         self.emit(format!("store {} {}, ptr {}", lt, v, ptr));
     }
 
@@ -1009,7 +1017,13 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let v = self.val(inner);
                 let t = self.ty(&e.ty);
                 match op {
-                    UnOp::Neg if e.ty.is_float() => self.inst(format!("fneg {} {}", t, v)),
+                    UnOp::Neg if e.ty.lane().is_float() => self.inst(format!("fneg {} {}", t, v)),
+                    UnOp::Neg if e.ty.is_vector() => self.inst(format!("sub {} zeroinitializer, {}", t, v)),
+                    UnOp::Not if e.ty.is_vector() => {
+                        let Ty::Vector(l, n) = &e.ty else { unreachable!() };
+                        let c = splat_const(&self.ty(l), *n, "-1");
+                        self.inst(format!("xor {} {}, {}", t, v, c))
+                    }
                     UnOp::Neg => self.inst(format!("sub {} 0, {}", t, v)),
                     UnOp::Not if e.ty == Ty::Bool => self.inst(format!("xor i1 {}, true", v)),
                     UnOp::Not => self.inst(format!("xor {} {}, -1", t, v)),
@@ -1885,6 +1899,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let x = self.val(a);
         let y = self.val(b);
         let t = &a.ty;
+        if t.is_vector() {
+            return self.vec_binary(op, a, b, &x, &y);
+        }
         let lt = self.ty(t);
         if t.is_float() {
             let ins = match op {
@@ -2165,6 +2182,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let fsigned = matches!(from, Ty::Int(it) if it.signed) || matches!(from, Ty::Enum(_));
         let tsigned = matches!(to, Ty::Int(it) if it.signed);
         match (from, to) {
+            (Ty::Vector(..), Ty::Vector(..)) => self.vec_cast(&v, from, to),
             (Ty::Int(_) | Ty::Bool | Ty::Enum(_) | Ty::Value(_), Ty::Int(_) | Ty::Value(_) | Ty::Enum(_)) => {
                 let (fb, tb) = (bits(from, p), bits(to, p));
                 if fb == tb {
@@ -2387,6 +2405,24 @@ impl<'a, 'p> FnGen<'a, 'p> {
             cg.decls.insert(s.to_string());
         };
         match i {
+            Intr::VSplat
+            | Intr::VNew
+            | Intr::VBitcast
+            | Intr::VLane
+            | Intr::VWithLane
+            | Intr::IAbs
+            | Intr::IMin
+            | Intr::IMax
+            | Intr::AddSat
+            | Intr::SubSat
+            | Intr::Avgr
+            | Intr::VSelect
+            | Intr::Bitmask
+            | Intr::WidenLow
+            | Intr::WidenHigh
+            | Intr::NarrowSat
+            | Intr::Shuffle
+            | Intr::Swizzle => self.vec_intrinsic(e, i, args, &vals),
             Intr::ClosureEnv => {
                 // Null (None) unless `new(a, ..)` allocated the environment:
                 // a converted plain function's code is the trampoline of
@@ -2530,8 +2566,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     _ => ("ctpop", ""),
                 };
                 let extra_decl = if extra.is_empty() { "" } else { ", i1" };
-                decl(self.cg, &format!("declare {} @llvm.{}.{}({}{})", lt, n, lt, lt, extra_decl));
-                self.inst(format!("call {} @llvm.{}.{}({} {}{})", lt, n, lt, lt, vals[0], extra))
+                let sfx = ovl(self.p(), &e.ty);
+                decl(self.cg, &format!("declare {} @llvm.{}.{}({}{})", lt, n, sfx, lt, extra_decl));
+                self.inst(format!("call {} @llvm.{}.{}({} {}{})", lt, n, sfx, lt, vals[0], extra))
             }
             Intr::FloatBits if args[0].ty == Ty::F32 => self.inst(format!("bitcast float {} to i32", vals[0])),
             Intr::FloatBits => self.inst(format!("bitcast double {} to i64", vals[0])),
@@ -2581,7 +2618,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Intr::Nearest => "roundeven",
                     _ => "fabs",
                 };
-                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                let (ft, sfx) = (self.ty(&e.ty), ovl(self.p(), &e.ty));
                 decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft})"));
                 self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {})", vals[0]))
             }
@@ -2593,7 +2630,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Intr::Minimum => "minimum",
                     _ => "maximum",
                 };
-                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                let (ft, sfx) = (self.ty(&e.ty), ovl(self.p(), &e.ty));
                 decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft}, {ft})"));
                 let r = self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {}, {ft} {})", vals[0], vals[1]));
                 if !matches!(i, Intr::Minimum | Intr::Maximum) {
@@ -2603,7 +2640,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 // a signaling NaN operand through as is. `a + b` quiets it.
                 let uno = self.inst(format!("fcmp uno {ft} {}, {}", vals[0], vals[1]));
                 let q = self.inst(format!("fadd {ft} {}, {}", vals[0], vals[1]));
-                self.inst(format!("select i1 {uno}, {ft} {q}, {ft} {r}"))
+                let ct = if let Ty::Vector(_, n) = &e.ty { format!("<{} x i1>", n) } else { "i1".to_string() };
+                self.inst(format!("select {ct} {uno}, {ft} {q}, {ft} {r}"))
             }
             Intr::GcMark => {
                 if crate::gcgen::check_roots(self) {
@@ -2614,6 +2652,286 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
                 "zeroinitializer".into()
             }
+        }
+    }
+}
+
+
+/// LLVM's overload suffix of a type: `f64`, `i32`, `v4f32`, `v16i8`.
+pub fn ovl(p: &Program, t: &Ty) -> String {
+    match t {
+        Ty::Vector(l, n) => format!("v{}{}", n, ovl(p, l)),
+        Ty::F32 => "f32".into(),
+        Ty::F64 => "f64".into(),
+        t => llty(p, t),
+    }
+}
+
+/// Whether values of `t` contain a vector: they are loaded and stored
+/// without assuming alignment (docs/language.md section 1.3).
+pub fn has_vector(p: &Program, t: &Ty) -> bool {
+    match t {
+        Ty::Vector(..) => true,
+        Ty::Array(e, _) | Ty::Option(e) => has_vector(p, e),
+        Ty::Result(a, b) => has_vector(p, a) || has_vector(p, b),
+        Ty::Tuple(ts) => ts.iter().any(|t| has_vector(p, t)),
+        Ty::Struct(i) => p.structs[*i as usize].fields.iter().any(|(_, t)| has_vector(p, t)),
+        _ => false,
+    }
+}
+
+/// A constant vector of `n` lanes of type `lt` (LLVM name), each `v`.
+fn splat_const(lt: &str, n: u32, v: &str) -> String {
+    let lanes: Vec<String> = (0..n).map(|_| format!("{} {}", lt, v)).collect();
+    format!("<{}>", lanes.join(", "))
+}
+
+/// A constant `<n x i32>` shuffle mask.
+fn mask_const(idx: impl Iterator<Item = u32>) -> String {
+    let lanes: Vec<String> = idx.map(|i| format!("i32 {}", i)).collect();
+    format!("<{} x i32> <{}>", lanes.len(), lanes.join(", "))
+}
+
+impl<'a, 'p> FnGen<'a, 'p> {
+    /// Every lane of a `<n x lt>` vector set to scalar `x`.
+    fn vsplat(&mut self, lt: &str, n: u32, x: &str) -> String {
+        let vt = format!("<{} x {}>", n, lt);
+        let a = self.inst(format!("insertelement {} poison, {} {}, i64 0", vt, lt, x));
+        self.inst(format!("shufflevector {} {}, {} poison, <{} x i32> zeroinitializer", vt, a, vt, n))
+    }
+
+    /// A lane-wise binary operator on vectors (`op` checked by the checker).
+    fn vec_binary(&mut self, op: BinOp, a: &TExpr, b: &TExpr, x: &str, y: &str) -> String {
+        use BinOp::*;
+        let Ty::Vector(l, n) = &a.ty else { unreachable!() };
+        let n = *n;
+        let vt = self.ty(&a.ty);
+        let et = self.ty(l);
+        let mt = format!("<{} x i{}>", n, 128 / n);
+        let bt = format!("<{} x i1>", n);
+        if l.is_float() {
+            let ins = match op {
+                Add => "fadd",
+                Sub => "fsub",
+                Mul => "fmul",
+                Div => "fdiv",
+                Eq => "fcmp oeq",
+                Ne => "fcmp une",
+                Lt => "fcmp olt",
+                Le => "fcmp ole",
+                Gt => "fcmp ogt",
+                Ge => "fcmp oge",
+                _ => unreachable!(),
+            };
+            let r = self.inst(format!("{} {} {}, {}", ins, vt, x, y));
+            return if op.is_cmp() { self.inst(format!("sext {} {} to {}", bt, r, mt)) } else { r };
+        }
+        let signed = matches!(**l, Ty::Int(it) if it.signed);
+        if op.is_cmp() {
+            let c = match (op, signed) {
+                (Eq, _) => "eq",
+                (Ne, _) => "ne",
+                (Lt, true) => "slt",
+                (Le, true) => "sle",
+                (Gt, true) => "sgt",
+                (Ge, true) => "sge",
+                (Lt, false) => "ult",
+                (Le, false) => "ule",
+                (Gt, false) => "ugt",
+                (Ge, false) => "uge",
+                _ => unreachable!(),
+            };
+            let r = self.inst(format!("icmp {} {} {}, {}", c, vt, x, y));
+            return self.inst(format!("sext {} {} to {}", bt, r, mt));
+        }
+        let ins = match op {
+            Add | AddWrap => "add",
+            Sub | SubWrap => "sub",
+            Mul | MulWrap => "mul",
+            And => "and",
+            Or => "or",
+            Xor => "xor",
+            Shl => "shl",
+            Shr => if signed { "ashr" } else { "lshr" },
+            _ => unreachable!(),
+        };
+        if matches!(op, Shl | Shr) {
+            // A scalar amount, taken modulo the lane width, the same for
+            // every lane (one `psllw`/`pslld`/.. or `shl`/`ushl` by a
+            // register; x86 has no 8-bit lane shifts, LLVM widens them).
+            let Ty::Int(it) = **l else { unreachable!() };
+            let Ty::Int(st) = &b.ty else { unreachable!() };
+            let w = it.bits.max(st.bits);
+            let wt = format!("i{}", w);
+            let yw = if st.bits < w { self.inst(format!("zext i{} {} to {}", st.bits, y, wt)) } else { y.to_string() };
+            let m = self.inst(format!("and {} {}, {}", wt, yw, it.bits - 1));
+            let m = if it.bits < w { self.inst(format!("trunc {} {} to {}", wt, m, et)) } else { m };
+            let s = self.vsplat(&et, n, &m);
+            return self.inst(format!("{} {} {}, {}", ins, vt, x, s));
+        }
+        self.inst(format!("{} {} {}, {}", ins, vt, x, y))
+    }
+
+    /// `v as U` between vectors with the same lane count: lane by lane,
+    /// as the scalar `as`.
+    fn vec_cast(&mut self, v: &str, from: &Ty, to: &Ty) -> String {
+        let (Ty::Vector(fl, _), Ty::Vector(tl, _)) = (from, to) else { unreachable!() };
+        let ft = self.ty(from);
+        let tt = self.ty(to);
+        match (&**fl, &**tl) {
+            (Ty::Int(a), Ty::Int(b)) if a.bits == b.bits => v.to_string(),
+            (Ty::Int(a), Ty::Int(b)) if a.bits > b.bits => self.inst(format!("trunc {} {} to {}", ft, v, tt)),
+            (Ty::Int(a), Ty::Int(_)) => self.inst(format!("{} {} {} to {}", if a.signed { "sext" } else { "zext" }, ft, v, tt)),
+            (Ty::Int(a), _) => self.inst(format!("{} {} {} to {}", if a.signed { "sitofp" } else { "uitofp" }, ft, v, tt)),
+            (_, Ty::Int(b)) => {
+                let name = format!("llvm.fpto{}i.sat.{}.{}", if b.signed { "s" } else { "u" }, ovl(self.p(), to), ovl(self.p(), from));
+                self.cg.decls.insert(format!("declare {} @{}({})", tt, name, ft));
+                self.inst(format!("call {} @{}({} {})", tt, name, ft, v))
+            }
+            (Ty::F32, Ty::F64) => self.inst(format!("fpext {} {} to {}", ft, v, tt)),
+            (Ty::F64, Ty::F32) => self.inst(format!("fptrunc {} {} to {}", ft, v, tt)),
+            _ => v.to_string(),
+        }
+    }
+
+    /// The vector intrinsics (`Intr::VSplat` ..), with `vals` evaluated.
+    fn vec_intrinsic(&mut self, e: &TExpr, i: Intr, args: &[TExpr], vals: &[String]) -> String {
+        let p = self.p();
+        let rt = self.ty(&e.ty);
+        let at = self.ty(&args[0].ty);
+        let call2 = |g: &mut Self, name: &str, t: &str, a: &str, b: &str| {
+            g.cg.decls.insert(format!("declare {t} @{name}({t}, {t})"));
+            g.inst(format!("call {t} @{name}({t} {a}, {t} {b})"))
+        };
+        match i {
+            Intr::VSplat => {
+                let Ty::Vector(l, n) = &e.ty else { unreachable!() };
+                let et = self.ty(l);
+                self.vsplat(&et, *n, &vals[0])
+            }
+            Intr::VNew => {
+                let Ty::Vector(l, _) = &e.ty else { unreachable!() };
+                let et = self.ty(l);
+                let mut acc = "poison".to_string();
+                for (k, x) in vals.iter().enumerate() {
+                    acc = self.inst(format!("insertelement {} {}, {} {}, i64 {}", rt, acc, et, x, k));
+                }
+                acc
+            }
+            Intr::VBitcast if rt == at => vals[0].clone(),
+            Intr::VBitcast => self.inst(format!("bitcast {} {} to {}", at, vals[0], rt)),
+            Intr::VLane => self.inst(format!("extractelement {} {}, i64 {}", at, vals[0], vals[1])),
+            Intr::VWithLane => {
+                let et = self.ty(&args[2].ty);
+                self.inst(format!("insertelement {} {}, {} {}, i64 {}", at, vals[0], et, vals[2], vals[1]))
+            }
+            Intr::IAbs => {
+                let s = ovl(p, &e.ty);
+                self.cg.decls.insert(format!("declare {rt} @llvm.abs.{s}({rt}, i1)"));
+                self.inst(format!("call {rt} @llvm.abs.{s}({rt} {}, i1 false)", vals[0]))
+            }
+            Intr::IMin | Intr::IMax | Intr::AddSat | Intr::SubSat => {
+                let signed = matches!(e.ty.lane(), Ty::Int(it) if it.signed);
+                let base = match i {
+                    Intr::IMin => "min",
+                    Intr::IMax => "max",
+                    Intr::AddSat => "add.sat",
+                    _ => "sub.sat",
+                };
+                let name = format!("llvm.{}{}.{}", if signed { "s" } else { "u" }, base, ovl(p, &e.ty));
+                call2(self, &name, &rt, &vals[0], &vals[1])
+            }
+            Intr::Avgr => {
+                // (a + b + 1) >> 1 in lanes of twice the width: `pavgb`,
+                // `pavgw` on x86-64, `urhadd` on AArch64.
+                let Ty::Vector(l, n) = &e.ty else { unreachable!() };
+                let Ty::Int(it) = **l else { unreachable!() };
+                let wt = format!("<{} x i{}>", n, it.bits * 2);
+                let a = self.inst(format!("zext {} {} to {}", rt, vals[0], wt));
+                let b = self.inst(format!("zext {} {} to {}", rt, vals[1], wt));
+                let s = self.inst(format!("add nuw nsw {} {}, {}", wt, a, b));
+                let one = splat_const(&format!("i{}", it.bits * 2), *n, "1");
+                let s1 = self.inst(format!("add nuw nsw {} {}, {}", wt, s, one));
+                let h = self.inst(format!("lshr {} {}, {}", wt, s1, one));
+                self.inst(format!("trunc {} {} to {}", wt, h, rt))
+            }
+            Intr::VSelect => {
+                let Ty::Vector(_, n) = &args[0].ty else { unreachable!() };
+                let c = self.inst(format!("icmp ne {} {}, zeroinitializer", at, vals[0]));
+                let _ = n;
+                self.inst(format!("select {} {}, {} {}, {} {}", format_args!("<{} x i1>", n), c, rt, vals[1], rt, vals[2]))
+            }
+            Intr::Bitmask => {
+                let Ty::Vector(_, n) = &args[0].ty else { unreachable!() };
+                let c = self.inst(format!("icmp slt {} {}, zeroinitializer", at, vals[0]));
+                let m = self.inst(format!("bitcast <{} x i1> {} to i{}", n, c, n));
+                self.inst(format!("zext i{} {} to i32", n, m))
+            }
+            Intr::WidenLow | Intr::WidenHigh => {
+                let Ty::Vector(l, n) = &args[0].ty else { unreachable!() };
+                let h = n / 2;
+                let off = if i == Intr::WidenLow { 0 } else { h };
+                let et = self.ty(l);
+                let ht = format!("<{} x {}>", h, et);
+                let half = self.inst(format!("shufflevector {} {}, {} poison, {}", at, vals[0], at, mask_const(off..off + h)));
+                let ext = match &**l {
+                    Ty::Int(it) if it.signed => "sext",
+                    Ty::Int(_) => "zext",
+                    _ => "fpext",
+                };
+                self.inst(format!("{} {} {} to {}", ext, ht, half, rt))
+            }
+            Intr::NarrowSat => {
+                // Both halves side by side, clamped to the result's lane
+                // range (read by the operands' signedness), truncated:
+                // `packsswb`/`packuswb`/`packssdw` on x86-64, `sqxtn`/`sqxtun`
+                // on AArch64.
+                let (Ty::Vector(sl, m), Ty::Vector(dl, n)) = (&args[0].ty, &e.ty) else { unreachable!() };
+                let (Ty::Int(s), Ty::Int(d)) = (&**sl, &**dl) else { unreachable!() };
+                let wt = format!("<{} x i{}>", n, s.bits);
+                let ws = format!("i{}", s.bits);
+                let both = self.inst(format!("shufflevector {} {}, {} {}, {}", at, vals[0], at, vals[1], mask_const(0..2 * m)));
+                let (s, d) = (*s, *d);
+                let (lo, hi) = (d.min(), d.max());
+                let wty = Ty::Vector(Box::new(Ty::Int(s)), *n);
+                let sfx = ovl(p, &wty);
+                let mut v = both;
+                if s.signed {
+                    let lo_c = splat_const(&ws, *n, &lo.to_string());
+                    let hi_c = splat_const(&ws, *n, &hi.to_string());
+                    v = call2(self, &format!("llvm.smax.{}", sfx), &wt, &v, &lo_c);
+                    v = call2(self, &format!("llvm.smin.{}", sfx), &wt, &v, &hi_c);
+                } else {
+                    let hi_c = splat_const(&ws, *n, &hi.to_string());
+                    v = call2(self, &format!("llvm.umin.{}", sfx), &wt, &v, &hi_c);
+                }
+                self.inst(format!("trunc {} {} to {}", wt, v, rt))
+            }
+            Intr::Shuffle => {
+                let idx: Vec<u32> = vals[2..].iter().map(|s| s.parse().unwrap()).collect();
+                self.inst(format!("shufflevector {} {}, {} {}, {}", at, vals[0], at, vals[1], mask_const(idx.into_iter())))
+            }
+            Intr::Swizzle => {
+                let it = self.ty(&args[1].ty);
+                if self.cg.opts.arch == Arch::AArch64 {
+                    // `tbl` has exactly these semantics (0 for an index >= 16).
+                    self.cg.decls.insert("declare <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8>, <16 x i8>)");
+                    return self.inst(format!("call <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8> {}, {} {})", vals[0], it, vals[1]));
+                }
+                // Baseline x86-64 (SSE2) has no byte shuffle by a vector
+                // (`pshufb` is SSSE3): lane by lane, through memory.
+                let mut acc = "zeroinitializer".to_string();
+                for k in 0..16 {
+                    let ix = self.inst(format!("extractelement <16 x i8> {}, i64 {}", vals[1], k));
+                    let ok = self.inst(format!("icmp ult i8 {}, 16", ix));
+                    let ixm = self.inst(format!("and i8 {}, 15", ix));
+                    let x = self.inst(format!("extractelement <16 x i8> {}, i8 {}", vals[0], ixm));
+                    let r = self.inst(format!("select i1 {}, i8 {}, i8 0", ok, x));
+                    acc = self.inst(format!("insertelement <16 x i8> {}, i8 {}, i64 {}", acc, r, k));
+                }
+                acc
+            }
+            _ => unreachable!(),
         }
     }
 }

@@ -56,6 +56,7 @@ fn ty_name(p: &Program, t: &Ty) -> String {
         Ty::Int(it) => format!("{}{}", if it.signed { "i" } else { "u" }, it.bits),
         Ty::F32 => "f32".into(),
         Ty::F64 => "f64".into(),
+        Ty::Vector(l, n) => format!("{}x{}", ty_name(p, l), n),
         Ty::Bool => "bool".into(),
         Ty::Unit => "()".into(),
         Ty::Never => "never".into(),
@@ -104,6 +105,9 @@ impl<'p> Gen<'p> {
             Ty::Int(it) => base(&format!("{}int{}_t", if it.signed { "" } else { "u" }, it.bits)),
             Ty::F32 => base("float"),
             Ty::F64 => base("double"),
+            Ty::Vector(..) => {
+                return Err(format!("`{}` has no portable C equivalent; pass vectors through memory (`*{}`)", ty_name(p, t), ty_name(p, t)))
+            }
             Ty::Bool => base("bool"),
             Ty::Unit | Ty::Never if is_result => base("void"),
             Ty::Unit | Ty::Never => return Err("`()` is only allowed as a result".into()),

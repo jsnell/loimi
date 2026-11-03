@@ -56,6 +56,10 @@ pub enum Ty {
     /// with the environment in host memory (not traced). Under `Gc<..>`:
     /// a closure object `{ code, captures.. }` in the GC heap.
     Closure(Vec<Ty>, Box<Ty>, u8),
+    /// A 128-bit SIMD vector (`i32x4`, `f64x2`, ..): lane type (an
+    /// 8- to 64-bit integer, `f32` or `f64`) and lane count. LLVM's
+    /// `<N x T>`.
+    Vector(Box<Ty>, u32),
 }
 
 impl Ty {
@@ -76,6 +80,26 @@ impl Ty {
     }
     pub fn is_numeric(&self) -> bool {
         self.is_int() || self.is_float()
+    }
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Ty::Vector(..))
+    }
+    /// The lane type of a vector; the type itself otherwise.
+    pub fn lane(&self) -> &Ty {
+        match self {
+            Ty::Vector(l, _) => l,
+            t => t,
+        }
+    }
+    /// The vector type with `bits`-wide integer lanes of the given
+    /// signedness (or `f32`/`f64` lanes for `float`), 128 bits in all.
+    pub fn vector_of(lane: Ty) -> Ty {
+        let bits = match &lane {
+            Ty::Int(it) => it.bits as u32,
+            Ty::F32 => 32,
+            _ => 64,
+        };
+        Ty::Vector(Box::new(lane), 128 / bits)
     }
     pub fn is_unitlike(&self) -> bool {
         matches!(self, Ty::Unit | Ty::Never)
@@ -182,6 +206,37 @@ pub enum Intr {
     ClosureEnv,
     /// `__panic("msg")` (generated code only): panic with a message.
     Panic,
+    /// Vectors (`Ty::Vector`). `T.splat(x)`: every lane `x`.
+    VSplat,
+    /// `T.new(a, b, ..)`: one argument per lane.
+    VNew,
+    /// `T.from_bits(v)`: the same 128 bits as another vector type.
+    VBitcast,
+    /// `v.lane(i)`, `v.with_lane(i, x)`; `i` is a constant (`TK::Int`).
+    VLane,
+    VWithLane,
+    /// Integer lanes: `abs` (wrapping: MIN stays MIN), `min`/`max` by
+    /// signedness, saturating `add_sat`/`sub_sat`, unsigned rounding
+    /// average `avgr`.
+    IAbs,
+    IMin,
+    IMax,
+    AddSat,
+    SubSat,
+    Avgr,
+    /// `m.select(a, b)`: lane-wise `m != 0 ? a : b`.
+    VSelect,
+    /// `v.bitmask()`: the top bit of each lane, lane 0 in bit 0 (`u32`).
+    Bitmask,
+    /// `v.widen_low()`, `v.widen_high()`: half the lanes at twice the width.
+    WidenLow,
+    WidenHigh,
+    /// `T.narrow_sat(a, b)`: the lanes of `a` then `b`, saturated to T's lanes.
+    NarrowSat,
+    /// `a.shuffle(b, [i, ..])`: arguments a, b, then the constant indices.
+    Shuffle,
+    /// `a.swizzle(idx)`: lane i is `a[idx[i]]`, or 0 if `idx[i] >= 16`.
+    Swizzle,
 }
 
 #[derive(Clone, Debug)]
