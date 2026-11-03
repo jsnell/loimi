@@ -1,0 +1,171 @@
+// `add_carry` and `sub_borrow` (u8 to u64) and `mul_add_wide` (u64): the
+// carry-chain building blocks of std.bigint. Edge cases at 0 and the
+// maximum with carry in and out, constant-folded and not (through
+// `#[inline(never)]` functions), an exhaustive check on u8, and a
+// multi-limb carry chain.
+import std.io;
+
+fn out(v: u64, c: bool) {
+    io.print_int(v as i64); io.print(" "); io.print_bool(c); io.println("");
+}
+
+fn pair(p: (u64, u64)) {
+    let (a, b) = p;
+    io.print_int(a as i64); io.print(" "); io.print_int(b as i64); io.println("");
+}
+
+#[inline(never)]
+fn adc64(a: u64, b: u64, c: bool) -> (u64, bool) { a.add_carry(b, c) }
+#[inline(never)]
+fn sbb64(a: u64, b: u64, c: bool) -> (u64, bool) { a.sub_borrow(b, c) }
+#[inline(never)]
+fn adc32(a: u32, b: u32, c: bool) -> (u32, bool) { a.add_carry(b, c) }
+#[inline(never)]
+fn sbb32(a: u32, b: u32, c: bool) -> (u32, bool) { a.sub_borrow(b, c) }
+#[inline(never)]
+fn mad(a: u64, b: u64, c: u64, d: u64) -> (u64, u64) { a.mul_add_wide(b, c, d) }
+
+fn both64(a: u64, b: u64, c: bool) {
+    // The folded and the run-time result agree.
+    let (s, co) = a.add_carry(b, c);
+    let (s2, co2) = adc64(a, b, c);
+    if s != s2 or co != co2 { io.println("add_carry: folded and run-time differ"); }
+    out(s, co);
+    let (d, bo) = a.sub_borrow(b, c);
+    let (d2, bo2) = sbb64(a, b, c);
+    if d != d2 or bo != bo2 { io.println("sub_borrow: folded and run-time differ"); }
+    out(d, bo);
+}
+
+#[inline(never)]
+fn add_n(r: *u64, a: *u64, b: *u64, n: u64) -> bool {
+    var c = false;
+    for i in 0..n {
+        let (s, co) = a[i].add_carry(b[i], c);
+        r[i] = s;
+        c = co;
+    }
+    c
+}
+
+#[inline(never)]
+fn sub_n(r: *u64, a: *u64, b: *u64, n: u64) -> bool {
+    var c = false;
+    for i in 0..n {
+        let (s, co) = a[i].sub_borrow(b[i], c);
+        r[i] = s;
+        c = co;
+    }
+    c
+}
+
+fn main() {
+    let m: u64 = 0xffffffffffffffff;
+    both64(0, 0, false);       // 0 false / 0 false
+    both64(0, 0, true);        // 1 false / -1 true
+    both64(m, 0, true);        // 0 true / -2 false
+    both64(m, m, false);       // -2 true / 0 false
+    both64(m, m, true);        // -1 true / -1 true
+    both64(0, m, false);       // -1 false / 1 true
+    both64(0, m, true);        // 0 true / 0 true
+    both64(1, 0, true);        // 2 false / 0 false
+
+    let (s, c) = adc32(0xffffffff, 0, true);
+    io.print_int(s as i64); io.print(" "); io.print_bool(c); io.println("");   // 0 true
+    let (s, c) = adc32(0xffffffff, 0xffffffff, true);
+    io.print_int(s as i64); io.print(" "); io.print_bool(c); io.println("");   // 4294967295 true
+    let (s, c) = sbb32(0, 0, true);
+    io.print_int(s as i64); io.print(" "); io.print_bool(c); io.println("");   // 4294967295 true
+    let (s, c) = sbb32(5, 4, true);
+    io.print_int(s as i64); io.print(" "); io.print_bool(c); io.println("");   // 0 false
+
+    pair(mad(m, m, m, m));     // 2^128 - 1: -1 -1
+    pair(m.mul_add_wide(m, m, m));
+    pair(mad(0, 0, 0, 0));     // 0 0
+    pair(mad(0, 7, m, m));     // 2^65 - 2: -2 1
+    pair(mad(m, 1, 1, 0));     // 2^64: 0 1
+    pair(mad(3, 5, 7, 11));    // 33 0
+
+    // u8 and u16, exhaustively for u8, against u32 arithmetic.
+    var ok = true;
+    for x in 0..256 {
+        for y in 0..256 {
+            for ci in 0..2 {
+                let a = x as u8;
+                let b = y as u8;
+                let c = ci == 1;
+                let (s, co) = a.add_carry(b, c);
+                let w = (x + y + ci) as u32;
+                if s as u32 != (w & 255) or co != (w > 255) { ok = false; }
+                let (d, bo) = a.sub_borrow(b, c);
+                let v = ((x as i64) - (y as i64) - (ci as i64));
+                if d as i64 != (v & 255) or bo != (v < 0) { ok = false; }
+                let (s16, co16) = (a as u16 * 257).add_carry(b as u16 * 257, c);
+                let w16 = (x * 257 + y * 257 + ci) as u32;
+                if s16 as u32 != (w16 & 65535) or co16 != (w16 > 65535) { ok = false; }
+            }
+        }
+    }
+    io.print_bool(ok); io.println("");     // true
+
+    // A carry through every limb: (2^256 - 1) + 1 = 2^256, and back.
+    var a: [u64; 4] = [m; 4];
+    var b: [u64; 4] = [0; 4];
+    b[0] = 1;
+    var r: [u64; 4] = [7; 4];
+    let c = add_n(&r[0], &a[0], &b[0], 4);
+    io.print_int(r[0] as i64); io.print_int(r[1] as i64); io.print_int(r[2] as i64); io.print_int(r[3] as i64);
+    io.print(" "); io.print_bool(c); io.println("");    // 0000 true
+    let br = sub_n(&a[0], &r[0], &b[0], 4);
+    io.print_int(a[0] as i64); io.print_int(a[1] as i64); io.print_int(a[2] as i64); io.print_int(a[3] as i64);
+    io.print(" "); io.print_bool(br); io.println("");   // -1-1-1-1 true
+
+    // mul_add_wide against mul_wide plus add_carry on pseudo-random values.
+    var ok2 = true;
+    var z: u64 = 0x9E3779B97F4A7C15;
+    for _i in 0..10000 {
+        z = z *% 6364136223846793005 +% 1442695040888963407;
+        let p = z;
+        let q = (z >> 17) | (z << 47);
+        let u = z ^ 0x5555555555555555;
+        let v = ~z;
+        let (lo, hi) = mad(p, q, u, v);
+        let (pl, ph) = p.mul_wide(q);
+        let (l1, c1) = pl.add_carry(u, false);
+        let (l2, c2) = l1.add_carry(v, false);
+        let h = ph + (c1 as u64) + (c2 as u64);
+        if lo != l2 or hi != h { ok2 = false; }
+    }
+    io.print_bool(ok2); io.println("");     // true
+}
+
+// expect: 0 false
+// expect: 0 false
+// expect: 1 false
+// expect: -1 true
+// expect: 0 true
+// expect: -2 false
+// expect: -2 true
+// expect: 0 false
+// expect: -1 true
+// expect: -1 true
+// expect: -1 false
+// expect: 1 true
+// expect: 0 true
+// expect: 0 true
+// expect: 2 false
+// expect: 0 false
+// expect: 0 true
+// expect: 4294967295 true
+// expect: 4294967295 true
+// expect: 0 false
+// expect: -1 -1
+// expect: -1 -1
+// expect: 0 0
+// expect: -2 1
+// expect: 0 1
+// expect: 33 0
+// expect: true
+// expect: 0000 true
+// expect: -1-1-1-1 true
+// expect: true

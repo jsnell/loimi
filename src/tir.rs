@@ -133,6 +133,14 @@ pub enum Intr {
     /// `hi.div_wide(lo, d)` on `u64`: (hi * 2^64 + lo) / d and the
     /// remainder; the caller guarantees hi < d.
     DivWide,
+    /// `a.add_carry(b, c)` on unsigned integers: a + b + c as (sum,
+    /// carry out), with c a `bool` carry in.
+    AddCarry,
+    /// `a.sub_borrow(b, c)`: a - b - c as (difference, borrow out).
+    SubBorrow,
+    /// `a.mul_add_wide(b, c, d)` on `u64`: a * b + c + d (which fits in
+    /// 128 bits) as (low, high).
+    MulAddWide,
     FloatBits,
     BitsToFloat,
     Sqrt,

@@ -2489,6 +2489,39 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let t = self.inst(format!("insertvalue {} poison, i64 {}, 0", ot, q64));
                 self.inst(format!("insertvalue {} {}, i64 {}, 1", ot, t, r))
             }
+            Intr::AddCarry | Intr::SubBorrow => {
+                // Two `*.with.overflow` steps, their carries or'ed: the
+                // pattern LLVM's instruction selection turns into one
+                // `adc`/`sbb` (x86-64) or `adcs`/`sbcs` (AArch64) with the
+                // carry in the flags, chained across calls. (An `i128`
+                // add does not fold the carry in, and
+                // `llvm.x86.addcarry` is x86-only.)
+                let Ty::Int(it) = args[0].ty else { unreachable!() };
+                let lt = format!("i{}", it.bits);
+                let op = if i == Intr::AddCarry { "add" } else { "sub" };
+                let (s, o1) = self.overflow_op(it, op, &vals[0], &vals[1]);
+                let c = self.inst(format!("zext i1 {} to {}", vals[2], lt));
+                let (t, o2) = self.overflow_op(it, op, &s, &c);
+                let co = self.inst(format!("or i1 {}, {}", o1, o2));
+                let ot = self.ty(&e.ty);
+                let a = self.inst(format!("insertvalue {} poison, {} {}, 0", ot, lt, t));
+                self.inst(format!("insertvalue {} {}, i1 {}, 1", ot, a, co))
+            }
+            Intr::MulAddWide => {
+                let a = self.inst(format!("zext i64 {} to i128", vals[0]));
+                let b = self.inst(format!("zext i64 {} to i128", vals[1]));
+                let c = self.inst(format!("zext i64 {} to i128", vals[2]));
+                let d = self.inst(format!("zext i64 {} to i128", vals[3]));
+                let p = self.inst(format!("mul nuw i128 {}, {}", a, b));
+                let pc = self.inst(format!("add nuw i128 {}, {}", p, c));
+                let s = self.inst(format!("add nuw i128 {}, {}", pc, d));
+                let lo = self.inst(format!("trunc i128 {} to i64", s));
+                let h = self.inst(format!("lshr i128 {}, 64", s));
+                let hi = self.inst(format!("trunc i128 {} to i64", h));
+                let ot = self.ty(&e.ty);
+                let t = self.inst(format!("insertvalue {} poison, i64 {}, 0", ot, lo));
+                self.inst(format!("insertvalue {} {}, i64 {}, 1", ot, t, hi))
+            }
             Intr::Clz | Intr::Ctz | Intr::Popcount => {
                 let lt = self.ty(&e.ty);
                 let (n, extra) = match i {

@@ -3634,6 +3634,26 @@ impl<'a> Checker<'a> {
                 let intr = if name == "mul_wide" { Intr::MulWide } else { Intr::DivWide };
                 mk(Ty::Tuple(vec![t.clone(), t.clone()]), TK::Intrinsic(intr, vals), span)
             }
+            (Ty::Int(it), "mul_add_wide") if *it == IntTy::U64 => {
+                // `a.mul_add_wide(b, c, d)`: a * b + c + d as (low, high);
+                // it fits in 128 bits.
+                argc(3)?;
+                let mut vals = vec![recv];
+                for a in &args[..3] {
+                    vals.push(self.expr_coerce(cx, a, &t)?);
+                }
+                mk(Ty::Tuple(vec![t.clone(), t.clone()]), TK::Intrinsic(Intr::MulAddWide, vals), span)
+            }
+            (Ty::Int(it), "add_carry" | "sub_borrow") if !it.signed && matches!(it.bits, 8 | 16 | 32 | 64) => {
+                // `a.add_carry(b, c)`: a + b + c as (sum, carry out);
+                // `a.sub_borrow(b, c)`: a - b - c as (difference, borrow
+                // out). The carry and borrow are `bool`s.
+                argc(2)?;
+                let y = self.expr_coerce(cx, &args[0], &t)?;
+                let c = self.expr_coerce(cx, &args[1], &Ty::Bool)?;
+                let intr = if name == "add_carry" { Intr::AddCarry } else { Intr::SubBorrow };
+                mk(Ty::Tuple(vec![t.clone(), Ty::Bool]), TK::Intrinsic(intr, vec![recv, y, c]), span)
+            }
             (Ty::Int(_), "clz" | "ctz" | "popcount") => {
                 argc(0)?;
                 let intr = match name {

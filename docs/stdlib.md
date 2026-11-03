@@ -77,6 +77,19 @@ import.
   guarantees `hi < d` (so the quotient fits; `d` is then nonzero), as for
   the x86-64 `div` instruction. They lower to LLVM `i128` operations: a
   `mul` instruction, and a call of the runtime's `__udivti3`.
+  `a.mul_add_wide(b, c, d) -> (u64, u64)` is `a * b + c + d` as (low,
+  high): it always fits (at most 2^128 - 1), the step of a
+  multiply-and-accumulate loop.
+- **Carry chains** on `u8`, `u16`, `u32` and `u64`: `a.add_carry(b, c)
+  -> (T, bool)` is `a + b + c` (the `bool` carry in counting 1) as (sum
+  modulo 2^bits, carry out), and `a.sub_borrow(b, c) -> (T, bool)` is `a
+  - b - c` as (difference modulo 2^bits, borrow out). A loop that feeds
+  each carry out into the next carry in compiles to a chain of `adc`/`sbb`
+  (x86-64) or `adcs`/`sbcs` (AArch64) instructions, the carry staying in
+  the flags register when nothing between the steps sets flags: each
+  lowers to two `llvm.uadd.with.overflow` (or `usub`) steps whose
+  overflows are or'ed, the pattern LLVM selects as one add-with-carry.
+  `c as u64` turns a carry into a limb.
 - **Floats** (`f32` and `f64` alike; each lowers to one LLVM
   intrinsic): `x.to_bits()` (`u32`/`u64`) and `f32.from_bits(u32)`,
   `f64.from_bits(u64)`; `x.sqrt()`, `x.abs()`; rounding to an integral

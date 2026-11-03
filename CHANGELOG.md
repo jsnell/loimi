@@ -64,7 +64,9 @@ implementation; `git log` has the details.
 - **Float built-ins** on `f32`/`f64` (`to_bits`/`from_bits`, `ceil`,
   `trunc`, `nearest`, `abs`, `copysign`, `is_nan`, `min`/`max`,
   `minimum`/`maximum`) and **`u64` `mul_wide`/`div_wide`**
-  ([§1.2](docs/language.md#12-basics)).
+  ([§1.2](docs/language.md#12-basics)); **carry chains**:
+  `add_carry`/`sub_borrow` on `u8`..`u64` (`adc`/`sbb`, `adcs`/`sbcs`)
+  and `u64` `mul_add_wide` ([stdlib.md](docs/stdlib.md), `std.core`).
 - **`p.read_unaligned()` / `p.write_unaligned(v)`**
   ([§1.3](docs/language.md#13-memory)).
 - **`..zero`** in struct literals also nulls raw pointer fields

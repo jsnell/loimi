@@ -717,8 +717,10 @@ fn main() { Sym { id: 5 }.show_line(); }
   semantics need constantly. **Not built:** `a.add_overflow(b) -> (T, bool)`
   as a method; `std.num.add_overflow(a, b)` is a function over `i64`.
   Other built-in methods: `clz`, `ctz`, `popcount` on integers,
-  `mul_wide` and `div_wide` on `u64` (128-bit product and quotient, for
-  multi-word arithmetic); on floats `sqrt`, `abs`, `floor`, `ceil`,
+  `mul_wide`, `mul_add_wide` and `div_wide` on `u64` (128-bit product,
+  product plus two limbs, and quotient) and `add_carry`/`sub_borrow` on
+  `u8`..`u64` (add or subtract with a `bool` carry in and out; `adc`/`sbb`
+  chains), for multi-word arithmetic; on floats `sqrt`, `abs`, `floor`, `ceil`,
   `trunc`, `nearest`, `copysign`, `is_nan`, `min`/`max` (C's `fmin`) and
   `minimum`/`maximum` (IEEE 754-2019), and `to_bits` and
   `f64.from_bits(u)` (`f32` too; the list and their exact semantics are
