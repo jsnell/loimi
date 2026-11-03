@@ -1,6 +1,8 @@
 # Prolog in Loimi: the supported subset
 
-`prolog FILE.pl [-g GOAL] [--gc-stress | --gc-verify | --gc-tiny] [--disasm]`
+`prolog FILE.pl [-g GOAL] [--gc-stress | --gc-verify | --gc-tiny] [--disasm] [--no-supers]`
+(`--gc-tiny`: collect after every 64 KiB; `--disasm`: print every
+compiled block; `--no-supers`: skip the superinstruction pass)
 consults FILE (running its directives as it goes), then runs the goals
 of its `:- initialization(G)` directives in order; with none, `main/0`
 if FILE defines it; with `-g`, GOAL instead. Output goes to stdout
@@ -113,4 +115,5 @@ Modules, streams other than the two standard ones, `read/1`, strings,
 rationals, attributed variables, `freeze`, tabling,
 global variables with backtracking, `assert` of clauses with more than
 255 distinct variables plus arguments, `consult/1` from a running
-program, `succ_or_fail`-style SWI extensions not listed above.
+program, and SWI-Prolog extensions not listed above (yall lambdas,
+`format(atom(A), ..)`, `string_*`, ...).

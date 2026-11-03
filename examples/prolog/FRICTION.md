@@ -4,35 +4,38 @@ A usability study: a Prolog interpreter written from the docs
 (`README.md`, `docs/language.md`, `docs/stdlib.md`, `docs/stdlib/gc.md`,
 the tutorial), `std/` and `loimi --help`, without reading the other
 example interpreters. It stresses what earlier studies did not:
-unification, backtracking with choicepoints, the trail, cut, first-argument
-indexing, exceptions (`catch/3`), and a term representation in the GC heap.
-The supported subset is in [SPEC.md](SPEC.md).
+unification, backtracking with choicepoints, the trail and undoing
+bindings, cut, first-argument indexing, `catch/throw`, and a term
+representation in the GC heap. The supported subset is in
+[SPEC.md](SPEC.md).
 
 ## Summary
 
 | | |
 |---|---|
-| Files | `term.lm` 154 (terms, atoms, functors), `machine.lm` 403 (stacks, trail, unify, compare, copy, root scanner), `vm.lm` 531 (the WAM), `compile.lm` 1221 (clauses to WAM code, indexing, call/N), `builtins.lm` 1228, `arith.lm` 272, `reader.lm` 717 (tokens, operator precedence parser), `write.lm` 322, `prelude.lm` 223 (library predicates in Prolog), `main.lm` 251, `check.sh` 93 |
-| Features | ISO core plus the common SWI library: see SPEC.md. WAM compilation with first-argument indexing, last-call optimization, inline arithmetic, `catch/throw`, cut through `;`/`->`, soft-cut, DCG, assert/retract with the logical update view, findall/bagof/setof, `format/2` |
-| Tests | 10 programs in `tests/` (control, exceptions, terms, arith, write, atoms, database, lists, gc, basics), each printing exactly SWI-Prolog 10's output; `check.sh` runs them in the three dispatch modes, each normally, under GC stress and in GC verify mode (generational, stress, barrier verification), plus a `--gc-check-roots` build under stress: 100 runs. `cargo test` runs the quick form (`prolog_programs` in tests/golden.rs, 13 s) |
-| Benchmarks | 29 of the 30 van Roy / Aquarius programs from SWI-Prolog's bench suite run (`perfect` needs integers beyond 48 bits); see the table below |
-| Time | first doc read 15:32:52; first commit of a working interpreter (prelude, tests, all benchmarks but four running) 16:01:17; every test passing in all modes 16:24:24 (commit timestamps, same day) |
+| Files (lines) | `term.lm` 157 (terms, atoms, functors), `machine.lm` 405 (stacks, trail, unify, compare, copy, root scanner), `vm.lm` 579 (the WAM), `compile.lm` 1325 (clauses to WAM code, register allocation, indexing, call/N), `builtins.lm` 1245, `arith.lm` 365 (with big integers), `reader.lm` 730 (tokens, operator precedence parser), `write.lm` 325, `prelude.lm` 223 (library predicates in Prolog), `main.lm` 251, `check.sh` 93; 5,700 in all |
+| Features | ISO core plus the common SWI-Prolog library (SPEC.md): WAM compilation with first-argument indexing, last-call optimization, argument-register allocation, inline arithmetic and type tests, unbounded integers on `std.bigint`, `catch/throw` with ISO error terms, cut through `;`/`->`, soft-cut, DCG, assert/retract with the logical update view, findall/bagof/setof, `format/2`, `op/3` |
+| Tests | 11 programs in `tests/` (control, exceptions, terms, arith, bigint, write, atoms, database, lists, gc, basics), each printing exactly SWI-Prolog 10's output. `check.sh` runs them in the three dispatch modes, each normally, under GC stress and in GC verify mode (generational heap, stress, barrier verification), plus a `--gc-check-roots` build under stress: 110 runs, all pass. `cargo test` runs the quick form (`prolog_programs` in tests/golden.rs, 13 s) |
+| Benchmarks | All 30 van Roy / Aquarius programs of SWI-Prolog's bench suite (bench/prolog): 0.81x SWI-Prolog's time and 0.20x Trealla's, geometric means (table below) |
+| Time | first doc read 15:32:52; first commit of a working interpreter (reader, compiler, vm, prelude; a first test program) 16:01:17, 28 minutes later; 29 of 30 benchmarks running 16:09:40; all tests passing in every mode 16:24:24; 29 benchmarks at 0.83x SWI-Prolog 16:43; all 30 at 0.81x 16:55 (commit timestamps, same day) |
 
-The design: terms live in the `std.gc` heap (`object Var`, `Struct`,
-`Cons`; a nanboxed `value Term` with atoms and 48-bit integers
-immediate), not in a WAM heap array. That gives up instant reclamation on
-backtracking, but makes the term GC Loimi's precise mark-sweep collector
-with compiler-rooted locals instead of a hand-written sliding collector
-for a heap the machine also uses as a stack, and it exercises Loimi's GC
-integration, which a raw cell array would bypass. Variables are separate
-`Var` objects (no unsafe variables, so `put_unsafe_value` and
-environment trimming are not needed); a binding is trailed only if the
-variable is older than the newest choicepoint, compared by a creation
-stamp instead of heap addresses. Environments and choicepoints are
-WAM-style stacks in `mem.alloc`'d memory, scanned by a root scanner.
-Control constructs in clause bodies compile to auxiliary predicates, with
-a level variable for cuts that must cut the parent clause; `catch/3` is
-a two-clause library predicate whose choicepoint is the catch frame.
+**Design.** Terms live in the `std.gc` heap (`object Var`, `Struct`,
+`Cons`, and std.bigint's `Big`; a nanboxed `value Term` with atoms and
+48-bit integers immediate), not in a WAM heap array. That gives up
+instant reclamation on backtracking, but makes the term GC Loimi's
+precise mark-sweep collector with compiler-rooted locals, instead of a
+hand-written sliding collector for a heap the machine also uses as a
+stack, and it exercises Loimi's GC integration, which a raw cell array
+would bypass. Every variable is its own `Var` object (no stack
+variables, so no unsafe variables, `put_unsafe_value` or environment
+trimming); a binding is trailed only if the variable is older than the
+newest choicepoint, compared by a creation stamp instead of heap
+addresses. Environments and choicepoints are WAM stacks in `mem.alloc`'d
+memory, found by a root scanner. Control constructs in clause bodies
+compile to auxiliary predicates, with a level variable for cuts that cut
+the parent clause; `catch/3` is a two-clause library predicate whose
+choicepoint is the catch frame (marked inactive, through the trail, when
+its goal exits leaving choicepoints).
 
 ## Friction items
 
@@ -73,9 +76,13 @@ if `v` is younger than the newest choicepoint (no trail entry) and
 which the compiler's barrier does not see; otherwise a cold block calls
 the full `bind`. (c) follows from (b). Structure allocation (variable
 size: `memset` is a call too) moved to `cold` entirely. Result: only
-CALLB, METACALL and REINDEX (which exist to call) keep a frame. With
-integer fast paths for `//`, `mod` and friends in the same commit, the
-benchmarks got 0.65-0.95 of the time (table below, "frameless").
+CALLB, METACALL and REINDEX (which exist to call) keep a frame.
+Measured (interleaved A/B, best of 3, ten benchmarks), together with
+integer fast paths for `//`, `mod` and friends in the same commit: 0.95
+of the time by geometric mean, 0.69 for crypt (mostly the integer fast
+paths), 0.92-1.03 for the rest. So a frame per execution was a few
+percent here, not more; finding and removing them took an hour, most of
+it working out the free-list check.
 
 *Suggested fix.* std: `gc.has_room<T>(h, n)` (or a `try_new` returning
 `?Gc<T>`) documented as the way to allocate in a handler without a
@@ -109,10 +116,13 @@ with the handler signature" that language.md §3.5 describes for
 `#[inline(never)]` ("makes every call in tail-call mode use the shared
 copy").
 
-*What happened.* No shared copy exists in the binary (`objdump -d` has no
-symbol for it); its body (an untrail loop and an argument restore loop)
-is inlined into every handler that fails, which is how item 2's barrier
-reached them.
+*What happened.* No shared copy exists in the binary (`nm` lists the
+ops, `on_raise`, `invalid` and the disassembler, nothing else of the
+vm); its body (an untrail loop and an argument restore loop) is inlined
+into every handler that fails, which is how item 2's barrier reached
+them. The same holds for the repository's own `tests/run/vm_never_fn.lm`:
+its `#[inline(never)] fn bump` has no symbol of its own in a release
+build either (one caller there, so it proves less).
 
 *What I did.* Nothing more (after item 2 the inlined copies are frameless).
 
@@ -242,6 +252,16 @@ indirect jumps can keep the proof.
   one path: `raise ball` from any handler or `?` on a builtin's
   `Result<bool, Term>`, unwinding in one handler.
 - Circular module imports (vm ↔ compile ↔ builtins) just work.
+- **std.bigint** made unbounded integers (needed by `perfect`) about 150
+  lines: a `Big(Gc<Big>)` variant of `Term`, the `gc_*` operations on
+  `Arg.Small`/`Arg.Ref`, and a `norm` back to the immediate form. The only
+  Prolog-specific care was that `==` on a `value` compares bits, so two
+  equal big integers needed value comparison in unification, standard
+  order and the constant-matching ops (a cold path), and no
+  first-argument index key.
+- **Dispatch modes**: the same source in all three, with no differences
+  in behaviour across 110 test runs. Speed (A/B, six benchmarks): goto
+  1.00x tail-call, switch 1.04x.
 
 ## Generated code
 
@@ -286,7 +306,88 @@ read:
   ...                             ; next
 ```
 
+## Would the other examples have helped?
+
+Skimmed after this one worked. Mini's `value.lm` has the same hand-made
+barrier pattern as item 1 (`gc.needs_barrier` inline, `remember` out of
+line) and would have saved some of that hour; Scheme's `prelude.lm`
+embeds its library as a string the same way (item 7); Scheme's reader
+and Python's `big.lm` (bigint promotion) solve similar problems but
+nothing Prolog-specific (operators, unification, choicepoints), so the
+docs were the right source for the rest.
+
+## Optimizations: what helped
+
+Interleaved A/B runs, best of 3 (`.build/ab.py`, not committed), and the
+full table (`bench/prolog/run.py`) at three points.
+
+| Change | Effect |
+|---|---|
+| Cut-free `\+` goals and if-then-else conditions compiled into the auxiliary clause instead of through `call/1` (which compiles a clause per call) | derive, divide10, log10, ops8, times10: from over 20 s to under 1 s |
+| Clause lists per first-argument key for `retract/1` and `clause/2` on dynamic predicates, with lazy iteration | sieve: over 20 s to 2.3 s |
+| **Baseline** | **1.04x SWI-Prolog, 0.25x Trealla** (geomean, 29 programs) |
+| Inline `is/2` and comparisons on registers (ADD/SUB/MUL with i48 overflow checks, immediate forms, integer fast paths) | tak 0.46, crypt 0.43 of the time |
+| Head temporaries allocated to the argument register they are passed in (WAM register allocation) | nreverse: PUT_VAL_X from 17.8% of executed ops to 0 |
+| Five superinstructions from `--vm-stats` (`GET_LIST; UNIFY_VAR_X; UNIFY_VAR_X`, `PUT_VAL_Y; PUT_VAL_Y`, `DEALLOCATE; EXECUTE`, ...) | 0.97 (geomean of seven) |
+| Frameless fast paths (item 1) and integer fast paths for `//`, `mod`, `>>`, ... | 0.95 (ten); crypt 0.69 |
+| **Optimized, without bigints** | **0.83x SWI-Prolog, 0.20x Trealla** (29 programs) |
+| Inline `=/2` (a new variable on one side is just a register write), type tests, `arg/3`, the cut of auxiliary clauses | 0.92 (ten); unify 0.72, flatten 0.78 |
+| Unbounded integers (perfect runs) | no change elsewhere |
+| **Final** | **0.81x SWI-Prolog, 0.20x Trealla** (all 30) |
+
+What Loimi made hard: item 1 (allocation and barriers in handlers),
+item 5 (no way to describe mixed frames to the GC), item 6 (raw jumps
+through cache words instead of verified code). What it made easy: trying
+each change (an op family in a few lines with `inline for`, a super in
+one line), and finding where time goes (`--vm-stats` op and cold-block
+counts, `-W handler_frame`, every op its own symbol in `objdump`).
+
 ## Benchmarks
 
-See the table in [the results section](#results) (filled from
-`bench/prolog/run.py`).
+`bench/prolog/run.py -n 3`: wall-clock seconds, best of three
+interleaved runs, startup included, on a shared 8-core x86-64 machine
+(another agent was running builds and tests). SWI-Prolog 10.0.2 with `-O`,
+Trealla 3.14.46, ours a release build with tail-call dispatch.
+
+| benchmark | K | swipl s | trealla s | loimi s | loimi/swipl | loimi/trealla |
+|---|--:|--:|--:|--:|--:|--:|
+| boyer | 57 | 1.056 | 5.186 | 1.858 | 1.76 | 0.36 |
+| browse | 41 | 1.044 | 6.592 | 0.871 | 0.83 | 0.13 |
+| chat_parser | 160 | 1.049 | 3.784 | 0.963 | 0.92 | 0.25 |
+| crypt | 7900 | 1.034 | 3.838 | 0.584 | 0.56 | 0.15 |
+| derive | 290000 | 1.023 | 2.863 | 0.687 | 0.67 | 0.24 |
+| divide10 | 630000 | 1.040 | 2.828 | 0.784 | 0.75 | 0.28 |
+| eval | 11000 | 0.982 | 2.610 | 0.667 | 0.68 | 0.26 |
+| fast_mu | 29000 | 1.028 | 4.019 | 0.857 | 0.83 | 0.21 |
+| flatten | 48000 | 1.029 | 5.497 | 0.843 | 0.82 | 0.15 |
+| log10 | 1300000 | 1.013 | 3.698 | 0.612 | 0.60 | 0.17 |
+| meta_qsort | 4700 | 1.039 | 5.327 | 0.593 | 0.57 | 0.11 |
+| mu | 30000 | 1.026 | 4.366 | 0.637 | 0.62 | 0.15 |
+| nand | 1100 | 0.983 | 3.795 | 0.765 | 0.78 | 0.20 |
+| nreverse | 83000 | 1.056 | 8.269 | 0.799 | 0.76 | 0.10 |
+| ops8 | 920000 | 1.066 | 3.390 | 0.671 | 0.63 | 0.20 |
+| perfect | 3900 | 1.026 | 5.075 | 0.880 | 0.86 | 0.17 |
+| poly_10 | 510 | 1.023 | 2.691 | 0.912 | 0.89 | 0.34 |
+| prover | 25000 | 1.017 | 3.710 | 0.592 | 0.58 | 0.16 |
+| qsort | 47000 | 1.024 | 6.246 | 0.622 | 0.61 | 0.10 |
+| queens_8 | 560 | 1.004 | 5.524 | 1.064 | 1.06 | 0.19 |
+| query | 11000 | 1.047 | 4.784 | 1.051 | 1.00 | 0.22 |
+| reducer | 640 | 1.020 | 4.761 | 0.966 | 0.95 | 0.20 |
+| sendmore | 410 | 0.990 | 3.565 | 1.167 | 1.18 | 0.33 |
+| serialise | 78000 | 1.006 | 5.359 | 0.697 | 0.69 | 0.13 |
+| sieve | 61 | 1.008 | 2.542 | 1.938 | 1.92 | 0.76 |
+| simple_analyzer | 1500 | 1.006 | 5.052 | 0.848 | 0.84 | 0.17 |
+| tak | 160 | 1.037 | 3.630 | 0.784 | 0.76 | 0.22 |
+| times10 | 670000 | 1.002 | 2.991 | 0.671 | 0.67 | 0.22 |
+| unify | 13000 | 1.006 | 6.676 | 0.901 | 0.90 | 0.14 |
+| zebra | 680 | 1.049 | 3.783 | 0.865 | 0.82 | 0.23 |
+| geomean |  |  |  |  | 0.81 | 0.20 |
+
+Ours is faster than SWI-Prolog on 25 of the 30 and slower on boyer
+(1.76x: functor/3 and many permanent-variable moves per call),
+sieve (1.92x: assert/retract, each `assertz` compiling and verifying a
+clause, each `retract` copying a stored clause term), sendmore (1.18x),
+queens_8 (1.06x) and query (1.00x). Trealla takes 4-10x longer than
+ours on everything but sieve. Earlier points: the baseline (before the
+optimizations above, 29 programs) was 1.04x SWI-Prolog and 0.25x
+Trealla.

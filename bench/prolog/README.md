@@ -182,3 +182,45 @@ startup included: ~0.02 s for swipl, ~0.03 s for tpl). All programs print
 | unify | 13000 | 0.968 | 6.540 | 6.76 |
 | zebra | 680 | 1.010 | 3.638 | 3.60 |
 | geomean |  |  |  | 4.13 |
+
+## Results: the Loimi Prolog (examples/prolog)
+
+`run.py -n 3 --loimi examples/prolog/.build/pl` with a release build
+(`loimi build examples/prolog/main.lm --release -o ...`, tail-call
+dispatch), 2026-11-03, best of 3 interleaved runs, on a shared machine.
+Geometric means: 0.81x SWI-Prolog, 0.20x Trealla. How it got there, and
+what Loimi made easy or hard: `examples/prolog/FRICTION.md`.
+
+| benchmark | K | swipl s | trealla s | loimi s | loimi/swipl | loimi/trealla |
+|---|--:|--:|--:|--:|--:|--:|
+| boyer | 57 | 1.056 | 5.186 | 1.858 | 1.76 | 0.36 |
+| browse | 41 | 1.044 | 6.592 | 0.871 | 0.83 | 0.13 |
+| chat_parser | 160 | 1.049 | 3.784 | 0.963 | 0.92 | 0.25 |
+| crypt | 7900 | 1.034 | 3.838 | 0.584 | 0.56 | 0.15 |
+| derive | 290000 | 1.023 | 2.863 | 0.687 | 0.67 | 0.24 |
+| divide10 | 630000 | 1.040 | 2.828 | 0.784 | 0.75 | 0.28 |
+| eval | 11000 | 0.982 | 2.610 | 0.667 | 0.68 | 0.26 |
+| fast_mu | 29000 | 1.028 | 4.019 | 0.857 | 0.83 | 0.21 |
+| flatten | 48000 | 1.029 | 5.497 | 0.843 | 0.82 | 0.15 |
+| log10 | 1300000 | 1.013 | 3.698 | 0.612 | 0.60 | 0.17 |
+| meta_qsort | 4700 | 1.039 | 5.327 | 0.593 | 0.57 | 0.11 |
+| mu | 30000 | 1.026 | 4.366 | 0.637 | 0.62 | 0.15 |
+| nand | 1100 | 0.983 | 3.795 | 0.765 | 0.78 | 0.20 |
+| nreverse | 83000 | 1.056 | 8.269 | 0.799 | 0.76 | 0.10 |
+| ops8 | 920000 | 1.066 | 3.390 | 0.671 | 0.63 | 0.20 |
+| perfect | 3900 | 1.026 | 5.075 | 0.880 | 0.86 | 0.17 |
+| poly_10 | 510 | 1.023 | 2.691 | 0.912 | 0.89 | 0.34 |
+| prover | 25000 | 1.017 | 3.710 | 0.592 | 0.58 | 0.16 |
+| qsort | 47000 | 1.024 | 6.246 | 0.622 | 0.61 | 0.10 |
+| queens_8 | 560 | 1.004 | 5.524 | 1.064 | 1.06 | 0.19 |
+| query | 11000 | 1.047 | 4.784 | 1.051 | 1.00 | 0.22 |
+| reducer | 640 | 1.020 | 4.761 | 0.966 | 0.95 | 0.20 |
+| sendmore | 410 | 0.990 | 3.565 | 1.167 | 1.18 | 0.33 |
+| serialise | 78000 | 1.006 | 5.359 | 0.697 | 0.69 | 0.13 |
+| sieve | 61 | 1.008 | 2.542 | 1.938 | 1.92 | 0.76 |
+| simple_analyzer | 1500 | 1.006 | 5.052 | 0.848 | 0.84 | 0.17 |
+| tak | 160 | 1.037 | 3.630 | 0.784 | 0.76 | 0.22 |
+| times10 | 670000 | 1.002 | 2.991 | 0.671 | 0.67 | 0.22 |
+| unify | 13000 | 1.006 | 6.676 | 0.901 | 0.90 | 0.14 |
+| zebra | 680 | 1.049 | 3.783 | 0.865 | 0.82 | 0.23 |
+| geomean |  |  |  |  | 0.81 | 0.20 |
