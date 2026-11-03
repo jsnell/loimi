@@ -76,6 +76,63 @@ struct Opts {
     sysroot: Option<PathBuf>,
     /// `--cfg NAME`: names `#[cfg(NAME)]` keeps (language.md section 1.4).
     cfg: Vec<String>,
+    /// `--cpu=NAME` (or `LOIMI_CPU`): the CPU to compile for (clang's
+    /// `-march` on x86-64, `-mcpu` on AArch64). None: the target's baseline.
+    cpu: Option<Cpu>,
+}
+
+/// A `--cpu`: its name and what clang says it has.
+struct Cpu {
+    name: String,
+    features: codegen::CpuFeatures,
+}
+
+impl Cpu {
+    /// The clang option selecting it.
+    fn flag(&self, arch: codegen::Arch) -> String {
+        match arch {
+            codegen::Arch::X86_64 => format!("-march={}", self.name),
+            codegen::Arch::AArch64 => format!("-mcpu={}", self.name),
+        }
+    }
+}
+
+/// The clang to run (`LOIMI_CLANG`, else clang-19).
+fn clang_cmd() -> String {
+    std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into())
+}
+
+/// Resolve `--cpu=NAME` for `target`: clang's predefined macros for that
+/// CPU (`clang -march=NAME -E -dM`) say which extensions it has, so
+/// `native` and any CPU name clang knows work, and a name it does not
+/// know is an error here rather than at link time.
+fn resolve_cpu(name: &str, target: Option<&Target>) -> Result<Cpu, String> {
+    let arch = target.map_or(codegen::Arch::host(), |t| t.arch);
+    let mut cpu = Cpu { name: name.to_string(), features: codegen::CpuFeatures::default() };
+    let clang = clang_cmd();
+    let mut cmd = Command::new(&clang);
+    if let Some(t) = target {
+        cmd.arg(format!("--target={}", t.triple));
+    }
+    let out = cmd
+        .arg(cpu.flag(arch))
+        .args(["-x", "c", "-E", "-dM", "-"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("--cpu: cannot run {}: {}", clang, e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err.lines().next().unwrap_or("").trim();
+        return Err(format!("--cpu={}: {} does not accept it ({})", name, clang, first));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let has = |m: &str| text.lines().any(|l| l.split_whitespace().nth(1) == Some(m));
+    if arch == codegen::Arch::X86_64 {
+        cpu.features.ssse3 = has("__SSSE3__");
+        cpu.features.sse41 = has("__SSE4_1__");
+    }
+    Ok(cpu)
 }
 
 /// A `--target` triple.
@@ -123,6 +180,7 @@ usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
                   [--explain-values]   (print each value type's encoding and which tuple tests merge, then stop)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
+                  [--cpu=NAME]   (x86-64, x86-64-v2, x86-64-v3, native, ..: clang's -march (-mcpu on AArch64); default: the baseline)
        loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
        loimi test <file.lm> [build options] [--update] [--list] [FILTER...]";
@@ -348,6 +406,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             jit: opts.jit,
             arch: opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch),
             gc_check_roots: opts.gc_check_roots,
+            cpu: opts.cpu.as_ref().map(|c| c.features).unwrap_or_default(),
         },
     );
     let (mut ir, stencils) = cg.generate_with_stencils();
@@ -367,6 +426,12 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     if let Some(t) = &opts.target {
         ir.insert_str(0, &format!("target triple = \"{}\"\n", t.triple));
     }
+    // Code for a `--cpu` may use its instructions' intrinsics (`pshufb`),
+    // which only compile for that CPU.
+    if let Some(c) = &opts.cpu {
+        let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
+        ir.insert_str(0, &format!("; built for --cpu={}: compile with {}\n", c.name, c.flag(arch)));
+    }
     let ir = if opts.sanitize_address {
         sanitize(&ir, library, "sanitize_address")
     } else if opts.sanitize_thread {
@@ -380,7 +445,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
 /// `--jit-stencils`: compile the stencils to an object file, read them
 /// back, and append them to the program's IR as data. Returns the C
 /// runtime's path.
-fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, stem: &str) -> Result<PathBuf, String> {
+fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, cpu_flag: &[String], tmpdir: &Path, stem: &str) -> Result<PathBuf, String> {
     let t0 = std::time::Instant::now();
     let sll = tmpdir.join(format!("{}.stencils.ll", stem));
     let so = tmpdir.join(format!("{}.stencils.o", stem));
@@ -388,6 +453,7 @@ fn build_stencils(ir: &mut String, jit: &JitParts, clang: &str, tmpdir: &Path, s
     let st = Command::new(clang)
         .args(["-O3", "-Wno-override-module", "-fno-pic", "-ffunction-sections", "-fdata-sections", "-fno-asynchronous-unwind-tables", "-c", "-x", "ir"])
         .args(if jitgen::split_stencils() { &["-fsplit-machine-functions"][..] } else { &[] })
+        .args(cpu_flag)
         .arg(&sll)
         .arg("-o")
         .arg(&so)
@@ -526,7 +592,11 @@ fn parse_args() -> Result<Opts, String> {
         },
         sysroot: std::env::var_os("LOIMI_SYSROOT").filter(|s| !s.is_empty()).map(PathBuf::from),
         cfg: vec![],
+        cpu: None,
     };
+    // `LOIMI_CPU`: a default for `--cpu` (for running whole test suites
+    // for one CPU).
+    let mut cpu_name: Option<String> = std::env::var("LOIMI_CPU").ok().filter(|s| !s.is_empty());
     match cmd.as_str() {
         "build" => {}
         "run" => o.run = true,
@@ -560,6 +630,7 @@ fn parse_args() -> Result<Opts, String> {
                     format!("unknown target `{}` (supported: aarch64-linux-gnu, x86_64-linux-gnu)", t)
                 })?)
             }
+            s if s.starts_with("--cpu=") => cpu_name = Some(s["--cpu=".len()..].to_string()),
             s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
             "--cfg" => o.cfg.push(args.next().ok_or("--cfg needs a name")?),
             s if s.starts_with("--cfg=") => o.cfg.push(s["--cfg=".len()..].to_string()),
@@ -610,6 +681,9 @@ fn parse_args() -> Result<Opts, String> {
     }
     if o.input.is_none() {
         return Err(USAGE.into());
+    }
+    if let Some(name) = cpu_name.filter(|n| !n.is_empty()) {
+        o.cpu = Some(resolve_cpu(&name, o.target.as_ref())?);
     }
     if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
         return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
@@ -687,9 +761,11 @@ fn compiler_main() -> ExitCode {
     }
     let tmpdir = std::env::temp_dir().join(format!("loimi-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmpdir);
-    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
+    let clang = clang_cmd();
+    let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
+    let cpu_flag: Vec<String> = opts.cpu.iter().map(|c| c.flag(arch)).collect();
     let jit_rt = match &jit {
-        Some(j) => match build_stencils(&mut ir, j, &clang, &tmpdir, &stem) {
+        Some(j) => match build_stencils(&mut ir, j, &clang, &cpu_flag, &tmpdir, &stem) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("error: --jit-stencils: {}", e);
@@ -730,6 +806,9 @@ fn compiler_main() -> ExitCode {
     if let Some(s) = &opts.sysroot {
         cross.push(format!("--sysroot={}", s.display()));
     }
+    // `--cpu`: for every clang run below (the program, the C runtimes,
+    // the assembly of -W handler_frame).
+    cross.extend(cpu_flag.iter().cloned());
     let mut cmd = Command::new(&clang);
     cmd.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);
     // The object goes into the archive.
