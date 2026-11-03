@@ -2443,6 +2443,21 @@ process exits; several such libraries can link into one host (the stats
 runtime's symbols are weak, and named by a hash of its source). (**Not built:** a separate `loimi vm suggest-supers`
 command.)
 
+The report also counts how often each `cold` block was entered, after
+the op counts: one line per block and op it is generated in (a block in
+a plain vm function, which is compiled once, is counted under `fn name`),
+with the block's source location:
+
+```text
+cold blocks entered:
+       1595161  LOADMETHOD_CALLMETHOD (cold block at examples/python/vm.lm:643:9)
+        987261  CALL (cold block at examples/python/vm.lm:681:9)
+```
+
+That is usually the next question after the op counts: which slow
+paths run, and how often. The counters cost nothing without
+`--vm-stats`; with it, one increment per entry.
+
 ### 7.4 Accumulators
 
 A register vm passes every intermediate value through a slot: in `x*y + z`

@@ -68,6 +68,11 @@ pub struct Codegen<'p> {
     /// captured locals, symbol, of a counting copy).
     pub cold_queue: Vec<(FnId, TExpr, Vec<LocalId>, String, bool)>,
     pub cold_count: u32,
+    /// `--vm-stats`: per vm, the counted cold blocks' labels (op or
+    /// function, source location), and the index of each (function,
+    /// block) pair.
+    pub cold_stats: Vec<Vec<String>>,
+    pub cold_stat_index: std::collections::HashMap<(FnId, Span), usize>,
     /// The same for counting copies (`--jit-stencils`).
     pub cold_count_jc: u32,
     /// Thread-local argument slots of shared `-> never` vm functions already defined.
@@ -188,6 +193,8 @@ impl<'p> Codegen<'p> {
             nan_safe: Default::default(),
             cold_queue: vec![],
             cold_count: 0,
+            cold_stats: vec![Vec::new(); p.vms.len()],
+            cold_stat_index: std::collections::HashMap::new(),
             cold_count_jc: 0,
             tls_defined: Default::default(),
             tramps: Default::default(),

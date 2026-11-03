@@ -464,6 +464,7 @@ pub fn word_place(g: &mut FnGen, off: u32) -> String {
 pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
     match v {
         TVm::Cold(b) => {
+            count_cold(g, e.span);
             if can_outline(g, b) {
                 outline(g, b);
                 return g.poison(&e.ty);
@@ -878,6 +879,38 @@ fn shared_slot(g: &mut FnGen, fid: FnId, i: usize, t: &Ty) -> String {
     name
 }
 
+/// `--vm-stats`: count an entry into the cold block at `span` (one
+/// counter per block and op or vm function it is generated in).
+fn count_cold(g: &mut FnGen, span: crate::diag::Span) {
+    if !g.cg.opts.vm_stats {
+        return;
+    }
+    let Some(vm) = g.f().vm else { return };
+    let p = g.p();
+    let vd = &p.vms[vm as usize];
+    let key = (g.fid, span);
+    let idx = match g.cg.cold_stat_index.get(&key) {
+        Some(&i) => i,
+        None => {
+            let f = g.f();
+            let owner = match f.vm_role {
+                VmRole::Handler(k) => vd.ops[k as usize].name.clone(),
+                _ => format!("fn {}", crate::check::short_name(&f.name)),
+            };
+            let label = format!("{} (cold block at {})", owner, g.cg.location(span));
+            let list = &mut g.cg.cold_stats[vm as usize];
+            list.push(label);
+            let i = list.len() - 1;
+            g.cg.cold_stat_index.insert(key, i);
+            i
+        }
+    };
+    let cp = g.inst(format!("getelementptr inbounds i64, ptr @\"{}.stats.cold\", i64 {}", vd.symbol, idx));
+    let c = g.inst(format!("load i64, ptr {}", cp));
+    let c1 = g.inst(format!("add i64 {}, 1", c));
+    g.emit(format!("store i64 {}, ptr {}", c1, cp));
+}
+
 /// `--vm-stats`: count this op and the (previous op, this op) pair.
 fn count_op(g: &mut FnGen, k: u32) {
     if !g.cg.opts.vm_stats {
@@ -939,6 +972,21 @@ pub fn emit_stats(cg: &mut crate::codegen::Codegen) {
             names.push(format!("ptr {}", s));
         }
         let _ = writeln!(cg.globals, "@\"{}.stats.names\" = internal constant [{} x ptr] [{}]", sym, n, names.join(", "));
+        // Cold block counters (`count_cold`) and their labels.
+        let vi = p.vms.iter().position(|v| std::ptr::eq(v, vd)).unwrap();
+        let colds = cg.cold_stats[vi].clone();
+        let nc = colds.len();
+        let cold_names: Vec<String> = colds.iter().map(|l| format!("ptr {}", cg.string_const(format!("{}\0", l).as_bytes()))).collect();
+        let _ = writeln!(cg.globals, "@\"{}.stats.cold\" = internal global [{} x i64] zeroinitializer", sym, nc.max(1));
+        let _ = writeln!(
+            cg.globals,
+            "@\"{}.stats.cold_names\" = internal constant [{} x ptr] {}",
+            sym,
+            nc.max(1),
+            if nc == 0 { "zeroinitializer".to_string() } else { format!("[{}]", cold_names.join(", ")) }
+        );
+        let cold_head = cg.string_const(b"\ncold blocks entered:\n\0");
+        let cold_row = cg.string_const(b"%14llu  %s\n\0");
         // Whether each op may appear in a suggested pair (supers may not).
         let plain: Vec<String> = vd.ops.iter().map(|o| format!("i1 {}", o.parts.is_empty())).collect();
         let _ = writeln!(cg.globals, "@\"{}.stats.plain\" = internal constant [{} x i1] [{}]", sym, n, plain.join(", "));
@@ -1000,6 +1048,26 @@ opnext:
   %odone = icmp eq i64 %oi1, {n}
   br i1 %odone, label %pairs, label %oploop
 pairs:
+  br i1 {nocold}, label %suggest, label %coldhead
+coldhead:
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {cold_head})
+  br label %coldloop
+coldloop:
+  %ci = phi i64 [ 0, %coldhead ], [ %ci1, %coldnext ]
+  %ccp = getelementptr inbounds i64, ptr @"{sym}.stats.cold", i64 %ci
+  %cc = load i64, ptr %ccp
+  %cnz = icmp ne i64 %cc, 0
+  br i1 %cnz, label %coldprint, label %coldnext
+coldprint:
+  %cnp = getelementptr inbounds ptr, ptr @"{sym}.stats.cold_names", i64 %ci
+  %cn = load ptr, ptr %cnp
+  call i32 (ptr, ptr, ...) @fprintf(ptr %err, ptr {cold_row}, i64 %cc, ptr %cn)
+  br label %coldnext
+coldnext:
+  %ci1 = add i64 %ci, 1
+  %cdone = icmp eq i64 %ci1, {nc}
+  br i1 %cdone, label %suggest, label %coldloop
+suggest:
   call void @{suggest}(ptr @"{sym}.stats.seq", ptr @"{sym}.stats.pairs", i64 {n}, ptr @"{sym}.stats.names", ptr @"{sym}.stats.plain", i64 %tot1, ptr @"{sym}.stats.supers", i64 {nsw})
   br label %done
 done:
@@ -1008,6 +1076,7 @@ done:
 "#,
             nsw = super_words.len(),
             suggest = stats_rt_sym("suggest"),
+            nocold = if nc == 0 { "true" } else { "false" },
         );
         // `prof.OpCounts.reset`: zero the counts, pairs and sequences.
         let _ = writeln!(
@@ -1015,6 +1084,7 @@ done:
             r#"define internal void @"{sym}.stats.reset"() {{
   call void @llvm.memset.p0.i64(ptr @"{sym}.stats.counts", i8 0, i64 {cb}, i1 false)
   call void @llvm.memset.p0.i64(ptr @"{sym}.stats.pairs", i8 0, i64 {pb}, i1 false)
+  call void @llvm.memset.p0.i64(ptr @"{sym}.stats.cold", i8 0, i64 {ccb}, i1 false)
   store i64 {n}, ptr @"{sym}.stats.last"
   store ptr null, ptr @"{sym}.stats.next"
   %tabp = getelementptr inbounds i64, ptr @"{sym}.stats.seq", i64 4
@@ -1026,6 +1096,7 @@ done:
 "#,
             cb = n * 8,
             pb = (n + 1) * n * 8,
+            ccb = nc.max(1) * 8,
         );
         dtors.push(format!("{{ i32, ptr, ptr }} {{ i32 65535, ptr {}, ptr null }}", f));
     }
