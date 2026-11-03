@@ -339,7 +339,9 @@ whole process; Intel i7-6700, 2026-11-02): Gauche 0.29, Guile 3 without
 its JIT 0.47, Guile 3 with its JIT 1.02 (chibi: 0.10 before the compiler
 passes). Ours is faster than Gauche and than Guile's bytecode VM on every
 program; the per-program tables, the timed-loop times and the changelog
-of the optimizations are in the benchmark README.
+of the optimizations are in the benchmark README. On the two bignum
+programs (2026-11-03) ours is 4-11x faster than Gauche, level with
+Guile's VM on chudnovsky and 2.3-2.7x slower than Guile (GMP) on pi.
 
 The programs this directory used before were reproduced from memory by
 the interpreter's author; they were removed in favour of the public suite.
