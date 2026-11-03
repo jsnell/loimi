@@ -6,6 +6,48 @@ use crate::lexer::Tok;
 use crate::parser::Parser;
 use crate::vmast::*;
 
+/// The name of the generated breakpoint op for words of inline cache
+/// layout `cache` (None: no cache), see `desugar_break`.
+pub fn break_op_name(cache: Option<&str>) -> String {
+    match cache {
+        None => "BREAK".to_string(),
+        Some(c) => format!("BREAK__{c}"),
+    }
+}
+
+/// `on break { .. }`: one op per inline cache layout, plus one without a
+/// cache, all running the block. `Vm.set_break` writes the one with the
+/// patched instruction's (or its first part's) cache over its opcode, so
+/// the breakpoint has the instruction's size: walks over the code
+/// (`resume_at`, the disassembler, `deopt`, the step-over) stay on
+/// instruction boundaries with breakpoints in place.
+fn desugar_break(vm: &mut VmDecl) -> Res<()> {
+    let Some(body) = vm.on_break.clone() else { return Ok(()) };
+    let Some(fmt) = vm.formats.first() else { return Ok(()) };
+    if let Some(o) = vm.ops.iter().find(|o| o.name.name == "BREAK" || o.name.name.starts_with("BREAK__")) {
+        return Err(Diag::new(o.name.span, format!("`{}` is the name of a generated breakpoint op (this vm has `on break`)", o.name.name)));
+    }
+    if vm.ops.iter().any(|o| o.stack.is_some()) {
+        return Err(Diag::new(body.span, "`on break` is not supported in stack vms yet"));
+    }
+    let span = body.span;
+    let caches: Vec<Option<Ident>> = std::iter::once(None).chain(vm.caches.iter().map(|c| Some(c.name.clone()))).collect();
+    for c in caches {
+        vm.ops.push(OpDecl {
+            name: Ident { name: break_op_name(c.as_ref().map(|c| c.name.as_str())), span },
+            params: vec![],
+            format: fmt.name.clone(),
+            cache: c,
+            body: body.clone(),
+            family: None,
+            then: None,
+            stack: None,
+            accumulate: false,
+        });
+    }
+    Ok(())
+}
+
 impl Parser {
     pub fn parse_vm(&mut self, attrs: Attrs, is_pub: bool) -> Res<VmDecl> {
         self.expect_kw("vm")?;
@@ -25,6 +67,7 @@ impl Parser {
             fns: vec![],
             entries: vec![],
             on_raise: None,
+            on_break: None,
             variants: vec![],
             sync: None,
             reload: None,
@@ -45,6 +88,10 @@ impl Parser {
                 loop_vars.extend(self.expand_inline_for(false)?);
                 continue;
             }
+            // `#[cfg(NAME)]` on a vm item: parsed, then dropped when NAME
+            // is not enabled (the vm is as if the item were not written).
+            let keep = self.take_cfg()?;
+            let saved = if keep { None } else { Some((vm.clone(), self.vm_loop_vars.len())) };
             let mark = self.allow_mark();
             let item_attrs = self.parse_attrs()?;
             let kw = match self.peek() {
@@ -54,7 +101,7 @@ impl Parser {
             let (what, known): (String, &[&str]) = match kw.as_str() {
                 "fn" => ("a vm function".into(), crate::parser::FN_ATTRS),
                 "super" => ("a `super`".into(), &["forward"]),
-                "on" => ("`on raise`".into(), &[]),
+                "on" => ("`on raise` or `on break`".into(), &[]),
                 "op" => ("an `op`".into(), &["accumulate"]),
                 "operand" | "entry" => (format!("an `{}`", kw), &[]),
                 _ => (format!("a `{}`", kw), &[]),
@@ -246,6 +293,16 @@ impl Parser {
                     let body = self.vm_block()?;
                     vm.entries.push(EntryDecl { name: n, params, ret, body, effects });
                 }
+                "on" if self.is_kw_at(1, "break") => {
+                    // `on break { .. }`: the handler of the generated
+                    // breakpoint ops (see `desugar_break`).
+                    self.bump();
+                    self.bump();
+                    if vm.on_break.is_some() {
+                        return self.err("a vm has at most one `on break` block");
+                    }
+                    vm.on_break = Some(self.vm_block()?);
+                }
                 "on" => {
                     self.bump();
                     self.expect_kw("raise")?;
@@ -376,8 +433,13 @@ impl Parser {
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
             self.close_allows(mark);
+            if let Some((v, n)) = saved {
+                vm = v;
+                self.vm_loop_vars.truncate(n);
+            }
         }
         loop_vars.append(&mut self.vm_loop_vars);
+        desugar_break(&mut vm)?;
         crate::vmacc::desugar(&mut vm)?;
         for v in &loop_vars {
             if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {

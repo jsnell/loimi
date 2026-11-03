@@ -149,6 +149,9 @@ pub struct VmDecl {
     pub fns: Vec<FnDecl>,
     pub entries: Vec<EntryDecl>,
     pub on_raise: Option<RaiseDecl>,
+    /// `on break { .. }`: the body of the generated breakpoint ops
+    /// (`vmparse::desugar_break`), which are added to `ops`.
+    pub on_break: Option<Block>,
     pub variants: Vec<VariantDecl>,
     pub sync: Option<Block>,
     /// `reload { .. }`: run after a call that may re-enter the vm, to

@@ -702,6 +702,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 ));
             }
         }
+        // Breakpoints (`on break`) stand for an instruction that only
+        // `Vm.Break` knows: code with breakpoints set does not verify.
+        if is_break_op(o) {
+            arms.push(fail("__i", "BadOpcode", &op_at("__i")));
+        }
         if !arms.is_empty() {
             let _ = writeln!(s, "      {} => {{ {} }}", o.opcode, arms.join(" "));
         }
@@ -1005,6 +1010,75 @@ fn generate_resume_caches(v: &VmDecl, l: &VmLayout) -> String {
          \x20 }}\n\
          \x20 __j == vals.len\n}}",
         bits = l.word_bits
+    );
+    s
+}
+
+/// Whether `o` is one of the breakpoint ops `on break` generates.
+fn is_break_op(o: &OpLayout) -> bool {
+    o.parts.is_empty() && (o.name == "BREAK" || o.name.starts_with("BREAK__"))
+}
+
+/// Breakpoints, for a vm with `on break { .. }` (language.md section 9.1):
+///
+/// - `Vm.Break`: a breakpoint that is set, a proof that its word is an
+///   instruction boundary of verified code and of the word it replaced
+///   (fields private to the expansion); `b.pc()`, `b.word()`.
+/// - `Vm.set_break(v, i) -> ?Vm.Break`: write the breakpoint op with the
+///   same size as the instruction at word `i` of verified code `v` over
+///   its opcode (None if `i` is not an instruction boundary or is already
+///   a breakpoint). A superinstruction that spans word `i` is split
+///   first (its head becomes its first part), so that the word runs on
+///   its own.
+/// - `Vm.clear_break(b) -> bool`: put the replaced word back.
+/// - `b.rearm() -> ?Vm.Break`: set the breakpoint again at the same word,
+///   over whatever instruction is there now (it may have been quickened
+///   while the breakpoint was off), as a new `Vm.Break`.
+/// - `Vm.is_break(w)`.
+fn generate_break(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    let brk = |cache: Option<usize>| {
+        let name = crate::vmparse::break_op_name(cache.map(|c| l.cache_names[c].as_str()));
+        l.ops.iter().find(|o| o.name == name).map(|o| o.opcode).unwrap_or(0)
+    };
+    let is_arms = l.ops.iter().filter(|o| is_break_op(o)).map(|o| (o.opcode, "true".to_string()));
+    match_fn(&mut s, &format!("{vis}fn {n}__is_break(w: {w}) -> bool"), &format!("match {n}__opcode(w)"), is_arms, "_ => false");
+    // The breakpoint op for a word: the one with its first part's cache.
+    let op_arms = l.ops.iter().enumerate().filter(|(_, o)| !is_break_op(o)).map(|(i, o)| (o.opcode, brk(l.ops[l.base(i)].cache).to_string()));
+    match_fn(&mut s, &format!("fn {n}__break_op(w: {w}) -> {w}"), &format!("match {n}__opcode(w)"), op_arms, &format!("_ => {}", brk(None)));
+    // A super's head as its first part alone.
+    let part0 = l.ops.iter().filter(|o| !o.parts.is_empty()).map(|o| (o.opcode, l.ops[o.parts[0]].opcode.to_string()));
+    match_fn(&mut s, &format!("fn {n}__part0(w: {w}) -> {w}"), &format!("match {n}__opcode(w)"), part0, &format!("_ => {n}__opcode(w)"));
+    let _ = writeln!(
+        s,
+        "{vis}struct {n}__Break {{ __at: *{w}, __word: {w} }}\n\
+         {vis}fn {n}__Break.pc(b: {n}__Break) -> *{w} {{ b.__at }}\n\
+         {vis}fn {n}__Break.word(b: {n}__Break) -> {w} {{ b.__word }}\n\
+         {vis}fn {n}__set_break(v: {n}__Verified, i: u64) -> ?{n}__Break {{\n\
+         \x20 let __code = v.__code;\n\
+         \x20 var __j: u64 = 0;\n\
+         \x20 while __j < i and __j < __code.len {{\n\
+         \x20   let __w = __code[__j];\n\
+         \x20   if __j + {n}__op_size(__w) > i and {n}__part0(__w) != {n}__opcode(__w) {{ __code[__j] = {n}__with_opcode(__w, {n}__part0(__w)); }}\n\
+         \x20   __j += {n}__base_size(__code[__j]);\n\
+         \x20 }}\n\
+         \x20 if __j != i or i >= __code.len or {n}__is_break(__code[i]) {{ return None; }}\n\
+         \x20 let __w = __code[i];\n\
+         \x20 __code[i] = {n}__with_opcode(__w, {n}__break_op(__w));\n\
+         \x20 Some({n}__Break {{ __at: __code.ptr + i, __word: __w }})\n}}\n\
+         {vis}fn {n}__clear_break(b: {n}__Break) -> bool {{\n\
+         \x20 let __w = *b.__at;\n\
+         \x20 if !{n}__is_break(__w) or {n}__with_opcode(__w, 0) != {n}__with_opcode(b.__word, 0) {{ return false; }}\n\
+         \x20 *b.__at = b.__word;\n\
+         \x20 true\n}}\n\
+         {vis}fn {n}__Break.rearm(b: {n}__Break) -> ?{n}__Break {{\n\
+         \x20 let __w = *b.__at;\n\
+         \x20 if {n}__is_break(__w) {{ return None; }}\n\
+         \x20 *b.__at = {n}__with_opcode(__w, {n}__break_op(__w));\n\
+         \x20 Some({n}__Break {{ __at: b.__at, __word: __w }})\n}}"
     );
     s
 }
@@ -1476,7 +1550,8 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
     let _ = writeln!(s, "    let __f = {n}__family(__code[__i]);");
     let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
     let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
-    let _ = writeln!(s, "    var __k: u64 = 1;");
+    // A breakpoint's cache words are the patched instruction's: they stay.
+    let _ = writeln!(s, "    var __k: u64 = {};", if v.on_break.is_some() { format!("if {n}__is_break(__code[__i]) {{ __size }} else {{ 1 }}") } else { "1".into() });
     if has_resume_caches(v) {
         // Resume points stay: they are where the code goes, not what it learned.
         let _ = writeln!(
@@ -2259,6 +2334,12 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     word_extern = true;
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
+                if v.on_break.is_some() {
+                    if jit {
+                        return Err(Diag::new(v.name.span, "`on break` is not supported with `--jit-stencils` yet"));
+                    }
+                    src.push_str(&generate_break(v, &l));
+                }
                 if resume {
                     src.push_str(&generate_resume(v, &l));
                 }

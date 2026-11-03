@@ -1,0 +1,130 @@
+// matrix: dispatch
+// `on break`: generated breakpoint ops, `Vm.set_break`/`clear_break`/
+// `rearm`, and the step-over a debugger does with an instrumentation
+// variant: the breakpoint's handler puts the instruction back, switches
+// to the `step` table and runs it (`jump pc`); the `step` wrapper of the
+// next instruction sets the breakpoint again and switches back.
+import std.io;
+import std.text;
+
+struct Ctx { hits: i64, steps: i64, pending: ?V.Break, live: ?V.Break, code: V.Verified, fresh: bool }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    verify_context nregs: u32;
+    operand reg = regs[it] verify (it as u32) < nregs;
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    cache Seen { n: u32, last: u64 }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    family ADD(dst: reg, a: reg, b: reg) : ABC + Seen {
+        generic { cache.n += 1; dst = a + b; become ADD_Q; next }
+        ADD_Q { cache.n += 1; dst = a + b; next }
+    }
+    op MOVE(dst: reg, src: reg) : ABC { dst = src; next }
+    op JLT(a: reg, target: label) : AsBx { if a < 10 { jump target } next }
+    op RET(src: reg) : ABC { exit src }
+    super MOVE_ADD = MOVE; ADD;
+
+    on break {
+        ctx.hits += 1;
+        // Step over: the instruction goes back for one run under `step`.
+        let Some(b) = ctx.live else { exit -1 };
+        if !V.clear_break(b) { exit -2 }
+        ctx.pending = Some(b);
+        ctx.live = None;
+        ctx.fresh = true;
+        use_variant step;
+        jump pc
+    }
+    variant step wraps all {
+        before {
+            ctx.steps += 1;
+            // The first wrapper to run is the restored instruction's own.
+            if ctx.fresh { ctx.fresh = false; } else {
+                if let Some(b) = ctx.pending {
+                    ctx.live = b.rearm();
+                    ctx.pending = None;
+                }
+                use_variant default;
+            }
+        }
+    }
+
+    entry run(c: *Ctx, code: V.Verified, r: *i64) -> i64 { ctx = c; regs = r; jump code }
+}
+
+fn main() {
+    var words: [u32; 32] = [0; 32];
+    let c = words[..];
+    var at: u64 = 0;
+    at = V.emit.LOADI(c, at, 0, 0);       // 0: r0 = 0
+    at = V.emit.LOADI(c, at, 1, 1);       // 1: r1 = 1
+    at = V.emit.MOVE(c, at, 2, 1);        // 2: loop: r2 = r1
+    at = V.emit.ADD(c, at, 0, 0, 2);      // 3: r0 += r2   (4 words with the cache)
+    at = V.emit.JLT(c, at, 0, -5);        // 7: while r0 < 10
+    at = V.emit.RET(c, at, 0);            // 8
+    let code = c[..at];
+    let Ok(v) = V.verify(code, 4) else { io.println("verify failed"); return; };
+    V.optimize(v);
+    // MOVE; ADD fused.
+    io.println(V.op_name(words[2]));
+    var ctx = Ctx { hits: 0, steps: 0, pending: None, live: None, code: v, fresh: false };
+    // Not a boundary: inside ADD's cache.
+    io.println(if V.set_break(v, 4).is_none() { "no break in a cache" } else { "?" });
+    // A breakpoint on the ADD part splits the super.
+    ctx.live = V.set_break(v, 3);
+    io.println(V.op_name(words[2]));
+    io.println(V.op_name(words[3]));
+    io.println(if V.is_break(words[3]) { "is break" } else { "?" });
+    // A second breakpoint on the same word is refused.
+    io.println(if V.set_break(v, 3).is_none() { "already set" } else { "?" });
+    // Code with breakpoints does not verify; deopt keeps them.
+    match V.verify(code, 4) { Ok(_) => io.println("?"), Err(e) => io.println(e.message()) }
+    V.deopt(v);
+    io.println(V.op_name(words[3]));
+    var b = text.StrBuf.new();
+    V.disasm(code, &b);
+    io.print(b.as_str());
+    var regs: [i64; 4] = [0; 4];
+    io.print_int(V.run(&ctx, v, &regs[0])); io.println("");
+    io.print_int(ctx.hits); io.println(" hits");
+    // Each hit runs two wrappers: the instruction's own and the next one's
+    // (ten iterations, a hit each).
+    io.print_int(ctx.steps); io.println(" steps");
+    // The breakpoint was set again over the quickened ADD.
+    let Some(live) = ctx.live else { io.println("?"); return; };
+    io.println(V.op_name(live.word()));
+    io.println(if V.clear_break(live) { "cleared" } else { "?" });
+    io.println(V.op_name(words[3]));
+    io.println(if V.clear_break(live) { "?" } else { "not set" });
+    match V.verify(code, 4) { Ok(_) => io.println("verifies"), Err(e) => io.println(e.message()) }
+}
+// expect: MOVE_ADD
+// expect: no break in a cache
+// expect: MOVE
+// expect: BREAK__Seen
+// expect: is break
+// expect: already set
+// expect: invalid opcode
+// expect: BREAK__Seen
+// expect:     0  LOADI dst=0 v=0
+// expect:     1  LOADI dst=1 v=1
+// expect:     2  MOVE dst=2 src=1
+// expect:     3  BREAK__Seen [cache n=0 last=0]
+// expect:     7  JLT a=0 target -> 2
+// expect:     8  RET src=0
+// expect: 10
+// expect: 10 hits
+// expect: 20 steps
+// expect: ADD_Q
+// expect: cleared
+// expect: ADD_Q
+// expect: not set
+// expect: verifies
