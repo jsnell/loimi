@@ -35,6 +35,50 @@ pub const U_NEG: u32 = 0;
 pub const U_POS: u32 = 1;
 pub const U_INVERT: u32 = 2;
 
+// Indexes of Ctx.dn (interned dunder names).
+pub const DN_RBASE: u64 = 13;
+pub const DN_CMP: u64 = 26;
+pub const DN_GETITEM: u64 = 32;
+pub const DN_EQ: u64 = 30;
+
+pub fn init_dunders(c: *Ctx) {
+    for op: u64 in 0..13 {
+        c.dn[op] = Value.Str(vm.intern(c, dunder(op as u32)));
+        c.dn[DN_RBASE + op] = Value.Str(vm.intern(c, rdunder(op as u32)));
+    }
+    for op: u64 in 0..6 { c.dn[DN_CMP + op] = Value.Str(vm.intern(c, cmp_dunder(op as u32))); }
+    c.dn[DN_GETITEM] = Value.Str(vm.intern(c, "__getitem__"));
+}
+
+/// A plain function `name` of the class with `nargs` parameters and no
+/// argument processing, for calling in the vm loop.
+pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
+    let Str(name) = c.dn[which] else { return None; };
+    let Some(Func(f)) = class_lookup(cls, name) else { return None; };
+    if f.proto.simple != nargs { return None; }
+    Some(f)
+}
+
+/// The operator method for `a op b` to call in the loop: a's __op__ if a
+/// is an instance, else b's __rop__ (called as (b, a)).
+pub fn binop_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
+    if let Inst(i) = a { return simple_method(c, i.cls, op as u64, 2); }
+    if let Inst(i) = b {
+        if value.is_num(a) or value.is_kind(a, K_BIG) or a == Value.Nil {
+            return simple_method(c, i.cls, DN_RBASE + op as u64, 2);
+        }
+    }
+    None
+}
+
+/// The comparison method to call in the loop (b's reflected one when a is
+/// not an instance).
+pub fn cmp_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
+    if let Inst(i) = a { return simple_method(c, i.cls, DN_CMP + op as u64, 2); }
+    if let Inst(i) = b and value.is_num(a) { return simple_method(c, i.cls, DN_CMP + swap_op(op) as u64, 2); }
+    None
+}
+
 pub const C_LT: u32 = 0;
 pub const C_LE: u32 = 1;
 pub const C_GT: u32 = 2;
@@ -289,16 +333,25 @@ fn bind_attr(c: *Ctx, selfv: Value, v: Value) -> Result<Value, Value> uses reent
 }
 
 pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_GETATTR);
     match obj {
         Inst(o) => {
-            // Data descriptors (properties) on the class win over the instance dict.
+            // Data descriptors (properties) on the class win over the instance
+            // dict; classes without any (flag 2 in `s`) skip the check.
+            if (o.cls.s & 2) == 0 {
+                if let Some(e) = value.dict_find_str(o.dict, name) {
+                    builtins.count(314);
+                    *ic = e as u32;
+                    return Ok(value.dict_val(o.dict, e));
+                }
+            }
             let cv = class_lookup(o.cls, name);
             if let Some(Obj(b)) = cv and b.kind == K_PROPERTY { return bind_attr(c, obj, Value.Obj(b)); }
             if let Some(e) = value.dict_find_str(o.dict, name) {
                 *ic = e as u32;
                 return Ok(value.dict_val(o.dict, e));
             }
-            if let Some(v) = cv { return bind_attr(c, obj, v); }
+            if let Some(v) = cv { builtins.count(315); return bind_attr(c, obj, v); }
             if name.data.eq("__dict__") { return Ok(Value.Dict(o.dict)); }
             if name.data.eq("__class__") { return Ok(Value.Obj(o.cls)); }
             let ga = vm.intern(c, "__getattr__");
@@ -309,7 +362,12 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
             Err(attr_error(c, obj, name))
         }
         Obj(b) => {
+            builtins.count(316 + (b.kind as u64));
             if b.kind == K_CLASS {
+                if let Some(d) = b.dict and let Some(e) = value.dict_find_str(d, name) {
+                    let v = value.dict_val(d, e);
+                    if !value.is_kind(v, K_STATICM) and !value.is_kind(v, K_CLASSM) { *ic = e as u32; return Ok(v); }
+                }
                 if let Some(v) = class_lookup(b, name) {
                     if let Obj(x) = v {
                         if x.kind == K_STATICM { return Ok(x.a); }
@@ -336,7 +394,8 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
                 return Err(attr_error(c, obj, name));
             }
             if b.kind == K_MODULE {
-                if let Some(v) = value.dict_get_str(b.dict.unwrap(), name) { return Ok(v); }
+                let d = b.dict.unwrap();
+                if let Some(e) = value.dict_find_str(d, name) { *ic = e as u32; return Ok(value.dict_val(d, e)); }
                 return Err(attr_error(c, obj, name));
             }
             if b.kind == K_SUPER {
@@ -396,6 +455,7 @@ pub fn cached_init(c: *Ctx, cls: Gc<Box>) -> ?Value {
 }
 
 pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u32, iepoch: *u32) -> Result<(), Value> uses reenter {
+    builtins.count(builtins.CNT_SETATTR);
     match obj {
         Inst(o) => {
             let cv = class_lookup(o.cls, name);
@@ -429,6 +489,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
         }
         Obj(b) => {
             if b.kind == K_CLASS and b.n == 0 {
+                if value.is_kind(v, K_PROPERTY) { b.s = b.s | 2; }
                 value.dict_set_str(&c.heap, b.dict.unwrap(), name, v);
                 c.epoch +%= 1;
                 return Ok(());
@@ -458,6 +519,7 @@ pub fn delattr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<(), Value> {
 /// lookup can be repeated without the instance dict.
 pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32)
     -> Result<(Value, Value), Value> uses reenter {
+    builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
             if value.dict_find_str(o.dict, name).is_none() {
@@ -477,7 +539,29 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
             Ok((getattr(c, obj, name, &ic)?, Value.Undef))
         }
         Obj(b) => {
-            if b.kind == K_MODULE or b.kind == K_CLASS or b.kind == K_SUPER {
+            if b.kind == K_MODULE or b.kind == K_CLASS {
+                let d = b.dict.unwrap();
+                if let Some(e) = value.dict_find_str(d, name) {
+                    let v = value.dict_val(d, e);
+                    let plain = if let Func(_) = v { true } else { false };
+                    if plain or value.is_kind(v, K_STATICM) or value.is_kind(v, K_CLASSM) or b.kind == K_MODULE {
+                        *ccls = 0;
+                        *cepoch = 0xfffffffe;
+                        *cidx = e as u32;
+                        if let Obj(sm) = v and sm.kind == K_STATICM { return Ok((sm.a, Value.Undef)); }
+                        if let Obj(cm) = v and cm.kind == K_CLASSM { return Ok((cm.a, obj)); }
+                        return Ok((v, Value.Undef));
+                    }
+                }
+                var ic: u32 = 0;
+                return Ok((getattr(c, obj, name, &ic)?, Value.Undef));
+            }
+            if b.kind == K_SUPER {
+                // Methods found through super() are called with self, unbound.
+                if let Some(cls) = b.base.unwrap().base and let Some(v) = class_lookup(cls, name) {
+                    if let Func(_) = v { return Ok((v, b.a)); }
+                    if let Builtin(_) = v { return Ok((v, b.a)); }
+                }
                 var ic: u32 = 0;
                 return Ok((getattr(c, obj, name, &ic)?, Value.Undef));
             }
@@ -522,6 +606,16 @@ fn arg_error(c: *Ctx, f: Gc<Func>, msg: str) -> Value {
 /// tuple `kw`) into `f`'s parameter registers.
 pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result<(), Value> {
     let p = f.proto;
+    // Positional arguments only, some defaults: no copying aside.
+    if kw == Value.Nil and (p.flags & (P_VARARGS | P_VARKW)) == 0 and p.nkwonly == 0 and n <= p.nparams as u64 {
+        let np = p.nparams as u64;
+        let nd = if let Some(d) = f.defaults { d.items.len } else { 0 };
+        if n + nd >= np {
+            for i in n..np { win[i] = f.defaults.unwrap().items[i + nd - np]; }
+            for i in np..p.nregs as u64 { win[i] = Value.Undef; }
+            return Ok(());
+        }
+    }
     let nkw = if let Tuple(t) = kw { t.items.len } else { 0 };
     let npos = n - nkw;
     let np = p.nparams as u64;
@@ -728,14 +822,22 @@ pub fn call_generic(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Va
 
 /// Call a method found on an instance's class with `args` (self first).
 pub fn call_method(c: *Ctx, obj: Value, name: str, args: []Value) -> Result<?Value, Value> uses reenter {
+    call_method_s(c, obj, vm.intern(c, name), args)
+}
+
+pub fn call_method_s(c: *Ctx, obj: Value, name: Gc<Str>, args: []Value) -> Result<?Value, Value> uses reenter {
     let cls = class_of(c, obj);
-    let Some(m) = class_lookup(cls, vm.intern(c, name)) else { return Ok(None); };
-    var xs: mem.Vec<Value> = mem.Vec.new();
-    xs.push(obj);
-    for i in 0..args.len { xs.push(args[i]); }
-    let r = vm.invoke(c, m, xs.items());
-    xs.free();
+    let Some(m) = class_lookup(cls, name) else { return Ok(None); };
+    var xs: [Value; 4] = [Value.Nil; 4];
+    xs[0] = obj;
+    for i in 0..args.len { xs[i + 1] = args[i]; }
+    let r = vm.invoke(c, m, xs[0..args.len + 1]);
     Ok(Some(r?))
+}
+
+fn dn(c: *Ctx, i: u64) -> Gc<Str> {
+    let Str(s) = c.dn[i] else { trap() };
+    s
 }
 
 pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> Result<Value, Value> {
@@ -777,7 +879,7 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
     cls.base = Some(base);
     cls.id = c.next_cls;
     c.next_cls += 1;
-    cls.s = base.s;
+    cls.s = base.s & 2;
     // A subclass of a builtin type (other than object) makes instances of
     // that type: `class C(list): pass` works, but methods C adds are not
     // seen by its instances (SPEC.md).
@@ -788,6 +890,7 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
         var v = value.dict_val(d, e);
         if let Obj(b) = v and (b.kind == K_STATICM or b.kind == K_CLASSM) { v = b.a; }
         if let Obj(b) = v and b.kind == K_PROPERTY {
+            cls.s = cls.s | 2;
             if let Func(g) = b.a { if g.owner.is_none() { g.owner = Some(cls); } }
             if let Func(g) = b.b { if g.owner.is_none() { g.owner = Some(cls); } }
         }
@@ -867,6 +970,7 @@ fn rdunder(op: u32) -> str {
 fn is_notimpl(v: Value) -> bool { value.is_kind(v, K_NOTIMPL) }
 
 pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_ARITH);
     if value.is_int(a) and value.is_int(b) { return int_arith(c, op, a, b); }
     if value.is_num(a) and value.is_num(b) {
         let x = value.to_f64(a).unwrap();
@@ -1121,6 +1225,7 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
 }
 
 pub fn truthy(c: *Ctx, v: Value) -> Result<bool, Value> uses reenter {
+    builtins.count(builtins.CNT_TRUTHY);
     match v {
         Bool(b) => Ok(b),
         Nil => Ok(false),
@@ -1178,13 +1283,14 @@ pub fn compare(c: *Ctx, op: u32, a: Value, b: Value) -> Result<bool, Value> uses
 
 /// Python rich comparison; the result may be any value for instances.
 pub fn compare_value(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_COMPARE);
     if let Inst(_) = a {
         let args = [b];
-        if let Some(r) = call_method(c, a, cmp_dunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+        if let Some(r) = call_method_s(c, a, dn(c, DN_CMP + op as u64), args[..])? { if !is_notimpl(r) { return Ok(r); } }
     }
     if let Inst(_) = b {
         let args = [a];
-        if let Some(r) = call_method(c, b, cmp_dunder(swap_op(op)), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+        if let Some(r) = call_method_s(c, b, dn(c, DN_CMP + swap_op(op) as u64), args[..])? { if !is_notimpl(r) { return Ok(r); } }
     }
     if op == C_EQ { return Ok(Value.Bool(equal(c, a, b)?)); }
     if op == C_NE { return Ok(Value.Bool(!equal(c, a, b)?)); }
@@ -1216,16 +1322,16 @@ pub fn equal(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
     match (a, b) {
         (Inst(_), _) => {
             let args = [b];
-            if let Some(r) = call_method(c, a, "__eq__", args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
+            if let Some(r) = call_method_s(c, a, dn(c, DN_EQ), args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
             if let Inst(_) = b {
                 let args2 = [a];
-                if let Some(r) = call_method(c, b, "__eq__", args2[..])? { if !is_notimpl(r) { return truthy(c, r); } }
+                if let Some(r) = call_method_s(c, b, dn(c, DN_EQ), args2[..])? { if !is_notimpl(r) { return truthy(c, r); } }
             }
             Ok(false)
         }
         (_, Inst(_)) => {
             let args = [a];
-            if let Some(r) = call_method(c, b, "__eq__", args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
+            if let Some(r) = call_method_s(c, b, dn(c, DN_EQ), args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
             Ok(false)
         }
         (List(x), List(y)) => {
@@ -1387,6 +1493,7 @@ fn seq_index(c: *Ctx, key: Value, n: u64, what: str) -> Result<u64, Value> {
 }
 
 pub fn getindex(c: *Ctx, obj: Value, key: Value) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_GETINDEX);
     if let Obj(sl) = key and sl.kind == K_SLICE { return getslice(c, obj, sl.a, sl.b, sl.c); }
     match obj {
         List(l) => Ok(l.arr.items[seq_index(c, key, l.len, "list")?]),
@@ -1426,6 +1533,7 @@ fn not_subscriptable(c: *Ctx, obj: Value) -> Value {
 }
 
 pub fn setindex(c: *Ctx, obj: Value, key: Value, v: Value) -> Result<(), Value> uses reenter {
+    builtins.count(builtins.CNT_SETINDEX);
     if let Obj(sl) = key and sl.kind == K_SLICE { return setslice(c, obj, sl.a, sl.b, sl.c, v); }
     match obj {
         List(l) => {
@@ -1606,7 +1714,50 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
     Ok(())
 }
 
+/// `x in container` without guest code: 1 yes, 0 no, 2 don't know.
+pub fn contains_fast(container: Value, x: Value) -> u32 {
+    let simple = match x { Int(_) => true, Str(_) => true, Nil => true, Bool(_) => true, Float(_) => true, _ => false };
+    if !simple { return 2; }
+    match container {
+        Dict(d) => {
+            let Some(hv) = value.hash_of(x) else { return 2; };
+            if value.dict_find(d, x, hv).is_some() { 1 } else { 0 }
+        }
+        List(l) => {
+            for i in 0..l.len {
+                let e = l.arr.items[i];
+                if e == x { return 1; }
+                match e {
+                    Inst(_) => return 2,
+                    _ => if value.eq_builtin(e, x) { return 1; },
+                }
+            }
+            0
+        }
+        Tuple(t) => {
+            for i in 0..t.items.len {
+                let e = t.items[i];
+                if e == x { return 1; }
+                match e {
+                    Inst(_) => return 2,
+                    _ => if value.eq_builtin(e, x) { return 1; },
+                }
+            }
+            0
+        }
+        Obj(b) => {
+            if b.kind == K_SET or b.kind == K_FROZENSET {
+                let Some(hv) = value.hash_of(x) else { return 2; };
+                return if value.dict_find(b.dict.unwrap(), x, hv).is_some() { 1 } else { 0 };
+            }
+            2
+        }
+        _ => 2,
+    }
+}
+
 pub fn contains(c: *Ctx, container: Value, x: Value) -> Result<bool, Value> uses reenter {
+    builtins.count(builtins.CNT_CONTAINS);
     match container {
         List(l) => {
             for i in 0..l.len { if equal(c, l.arr.items[i], x)? { return Ok(true); } }
@@ -1707,6 +1858,7 @@ pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Resu
 // ── iteration ───────────────────────────────────────────────────────
 
 pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_GETITER);
     match v {
         List(_) | Tuple(_) | Str(_) => {
             let b = value.new_box(&c.heap, K_SEQIT, 0);
@@ -1768,6 +1920,7 @@ fn not_iterable(c: *Ctx, v: Value) -> Value {
 
 /// The next item of an iterator, or None when it is exhausted.
 pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
+    builtins.count(builtins.CNT_NEXT);
     match it {
         Obj(b) => {
             match b.kind {

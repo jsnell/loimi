@@ -15,6 +15,8 @@ import fmt;
 import builtins;
 import compile;
 
+extern "C" fn getenv(name: *u8) -> *u8;
+
 const STACK: u64 = 1 << 20;
 const FRAMES: u64 = 4096;
 
@@ -51,7 +53,7 @@ fn main() -> i32 uses reenter {
         types: [None; 24], excs: [None; 32], strs: map.HashMap.new(), names: mem.Arena.new(),
         epoch: 1, next_cls: 1, gen_done: false, err_line: 0, buf: text.StrBuf.new(),
         n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0,
-        pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil,
+        pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil, dn: [Value.Nil; 40],
     };
     let c = ctx;
     c.stack_end = c.stack + STACK - 16;
@@ -67,6 +69,7 @@ fn main() -> i32 uses reenter {
     c.fp = c.frames;
     c.n_init = Some(vm.intern(c, "__init__"));
     builtins.setup(c);
+    ops.init_dunders(c);
     if let Err(_) = builtins.load_prelude(c) { io.eprintln("internal error: prelude"); return 1; }
     let g = value.new_dict(&c.heap, 32);
     c.globals = Some(g);
@@ -105,10 +108,12 @@ fn main() -> i32 uses reenter {
     else { c.heap.set_growth(300, 8 << 20); }
     let mp = c.protos.at(idx as u64);
     let f = new(&c.heap, Func { proto: mp, defaults: None, kwdefaults: None, cells: None, globals: g, owner: None });
-    match vm.invoke(c, Value.Func(f), []) {
+    let rc: i32 = match vm.invoke(c, Value.Func(f), []) {
         Ok(_) => 0,
         Err(e) => report(c, e),
-    }
+    };
+    if getenv("PYLOIMI_COUNTS\0".ptr) != 0 as *u8 { builtins.print_counts(); }
+    rc
 }
 
 fn report(c: *Ctx, e: Value) -> i32 uses reenter {

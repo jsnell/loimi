@@ -109,6 +109,9 @@ pub enum B {
 }
 
 #[inline(always)]
+pub fn b_len() -> u32 { B.Len as u32 }
+
+#[inline(always)]
 pub fn b_list_append() -> u32 { B.LAppend as u32 }
 
 /// Builtins that consume an iterable last argument (see vm.call_slow).
@@ -531,7 +534,41 @@ fn minmax(c: *Ctx, args: *Value, n: u64, kw: Value, is_max: bool) -> Result<Valu
 
 // ── calls ───────────────────────────────────────────────────────────
 
+/// Slow-path counters, printed at exit with PYLOIMI_COUNTS=1.
+pub var COUNTS: [u64; 512] = [0; 512];
+pub const CNT_GETATTR: u64 = 300;
+pub const CNT_SETATTR: u64 = 301;
+pub const CNT_LOADMETHOD: u64 = 302;
+pub const CNT_CALLSLOW: u64 = 303;
+pub const CNT_ARITH: u64 = 304;
+pub const CNT_COMPARE: u64 = 305;
+pub const CNT_GETINDEX: u64 = 306;
+pub const CNT_NEXT: u64 = 307;
+pub const CNT_GETITER: u64 = 308;
+pub const CNT_TRUTHY: u64 = 309;
+pub const CNT_SETINDEX: u64 = 310;
+pub const CNT_INVOKE: u64 = 311;
+pub const CNT_GENNEXT: u64 = 312;
+pub const CNT_CONTAINS: u64 = 313;
+
+pub fn count(i: u64) { COUNTS[i] += 1; }
+
+pub fn print_counts() {
+    var b = text.StrBuf.new();
+    for i in 0..512 {
+        if COUNTS[i] != 0 {
+            b.push_int(i as i64);
+            if i < 300 { b.push_str(" builtin "); } else { b.push_str(" slow "); }
+            b.push_int(COUNTS[i] as i64);
+            b.push('\n');
+        }
+    }
+    io.eprint(b.as_str());
+    b.free();
+}
+
 pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    count(id as u64);
     let b = id as B;
     let np = npos(kw, n);
     match b {

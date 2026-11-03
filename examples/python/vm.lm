@@ -7,7 +7,7 @@ import std.mem;
 import std.text;
 import std.map;
 import value;
-import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box,
+import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box, K_MODULE, K_STATICM, K_CLASSM,
               K_CLASS, K_BOUND, K_RANGEIT, K_SEQIT, K_GEN, K_CELL, GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
 import ops;
 import builtins;
@@ -123,6 +123,8 @@ pub struct Ctx {
     pre_list: Value,
     pre_via1: Value,
     pre_via2: Value,
+    /// Interned dunder names (ops.DN_*).
+    dn: [Value; 40],
 }
 
 /// Interned string for a name (kept alive for the run).
@@ -163,6 +165,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.pre_list);
     gc_mark(h, c.pre_via1);
     gc_mark(h, c.pre_via2);
+    for i in 0..40 { gc_mark(h, c.dn[i]); }
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
@@ -193,11 +196,13 @@ pub vm Py {
     }
 
     cache GlobalIC { idx: u32, ver: u32, builtin: u32 }
-    cache AttrIC { idx: u32 }
+    /// Two entry numbers: attribute reads see instances of two layouts.
+    cache AttrIC { idx: u32, idx2: u32 }
     /// SETATTR: idx is where the attribute is (or, for instances of class
     /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
     cache SetIC { idx: u32, cls: u32, epoch: u32 }
-    cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32 }
+    /// Two classes (deltablue's call sites see several).
+    cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32, cls2: u32, idx2: u32, depth2: u32 }
 
     sync { ctx.fp = fp; }
     reload { fp = ctx.fp; regs = fp.base; k = fp.k; }
@@ -236,6 +241,7 @@ pub vm Py {
     /// Call R[b] with the `n` arguments at R[win..]; the result goes to R[b].
     /// `kw` is Nil or a tuple naming the last arguments.
     fn call_slow(b: u64, win: u64, n: u64, kw: Value) -> never {
+        builtins.count(builtins.CNT_CALLSLOW);
         var callee = regs[b];
         var w = win;
         var nn = n;
@@ -391,6 +397,16 @@ pub vm Py {
         jump (p.code.start() + g.n as u64)
     }
 
+    /// Call `f(x, y)` in this loop, the result going to R[dst]: for
+    /// operator methods (__add__, __getitem__, ...).
+    fn call2(f: Gc<Func>, x: Value, y: Value, dst: u64) -> never {
+        let win = regs + fp.proto.nregs as u64;
+        if !ensure(win + 2) { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") }
+        win[0] = x;
+        win[1] = y;
+        push_frame(f, win, regs + dst, 0)
+    }
+
     fn gc_point() {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
     }
@@ -507,10 +523,25 @@ pub vm Py {
                 let e = d.ent.items.ptr + 2 * i;
                 if *e == name { dst = *(e + 1); next }
             }
+            let j = cache.idx2 as u64;
+            if j < d.used {
+                let e = d.ent.items.ptr + 2 * j;
+                if *e == name { dst = *(e + 1); next }
+            }
+        } else if let Obj(b) = obj and (b.kind == K_CLASS or b.kind == K_MODULE) and let Some(d) = b.dict {
+            // A plain attribute of the class (or module) itself; ops.getattr
+            // fills the cache only for values that need no binding.
+            let i = cache.idx as u64;
+            if i < d.used {
+                let e = d.ent.items.ptr + 2 * i;
+                if *e == name { dst = *(e + 1); next }
+            }
         }
         cold {
             let Str(s) = name else { trap() };
+            let old = cache.idx;
             dst = ops.getattr(ctx, obj, s, &cache.idx)?;
+            if cache.idx != old { cache.idx2 = old; }
             next
         }
     }
@@ -547,13 +578,37 @@ pub vm Py {
         let o = obj;
         if let Inst(i) = o {
             let cls = i.cls;
-            if cls.id == cache.cls and ctx.epoch == cache.epoch {
-                var owner = cls;
-                var d = cache.depth;
-                while d > 0 { owner = owner.base.unwrap(); d -= 1; }
-                regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx as u64) + 1);
-                regs[base.raw + 1] = o;
-                next
+            if ctx.epoch == cache.epoch {
+                if cls.id == cache.cls {
+                    var owner = cls;
+                    var d = cache.depth;
+                    while d > 0 { owner = owner.base.unwrap(); d -= 1; }
+                    regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx as u64) + 1);
+                    regs[base.raw + 1] = o;
+                    next
+                }
+                if cls.id == cache.cls2 {
+                    var owner = cls;
+                    var d = cache.depth2;
+                    while d > 0 { owner = owner.base.unwrap(); d -= 1; }
+                    regs[base.raw] = *(owner.dict.unwrap().ent.items.ptr + 2 * (cache.idx2 as u64) + 1);
+                    regs[base.raw + 1] = o;
+                    next
+                }
+            }
+        } else if let Obj(b) = o and cache.epoch == 0xfffffffe and let Some(d) = b.dict {
+            // A function in a module's or class's own dict, called without self.
+            let i = cache.idx as u64;
+            if i < d.used and (b.kind == K_MODULE or b.kind == K_CLASS) {
+                let e = d.ent.items.ptr + 2 * i;
+                if *e == name {
+                    let v = *(e + 1);
+                    if let Obj(sm) = v and sm.kind == K_STATICM { regs[base.raw] = sm.a; regs[base.raw + 1] = Undef; next }
+                    if let Obj(cm) = v and cm.kind == K_CLASSM { regs[base.raw] = cm.a; regs[base.raw + 1] = o; next }
+                    regs[base.raw] = v;
+                    regs[base.raw + 1] = Undef;
+                    next
+                }
             }
         } else if ops.type_code(o) == cache.cls and cache.epoch == 0xffffffff {
             regs[base.raw] = Builtin(cache.idx);
@@ -563,7 +618,16 @@ pub vm Py {
         cold {
             gc_point();
             let Str(s) = name else { trap() };
+            // Keep the previous class as the second entry.
+            let (pc_, pe, pi, pd) = (cache.cls, cache.epoch, cache.idx, cache.depth);
             let (m, selfv) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+            if pe == cache.epoch and pe != 0xffffffff and pe != 0xfffffffe and pc_ != cache.cls and pc_ != 0 {
+                cache.cls2 = pc_;
+                cache.idx2 = pi;
+                cache.depth2 = pd;
+            } else if pe != cache.epoch {
+                cache.cls2 = 0;
+            }
             regs[base.raw] = m;
             regs[base.raw + 1] = selfv;
             next
@@ -575,6 +639,15 @@ pub vm Py {
     op CALL(base: reg, n: nargs) : ABC {
         if let Func(f) = base {
             if f.proto.simple == n as u32 { push_frame(f, regs + base.raw + 1, regs + base.raw, 0) }
+        }
+        if let Builtin(id) = base and id == builtins.b_len() and n == 1 {
+            match regs[base.raw + 1] {
+                List(l) => { regs[base.raw] = Int(l.len as i32); next }
+                Tuple(t) => { regs[base.raw] = Int(t.items.len as i32); next }
+                Str(s) => { regs[base.raw] = Int(s.data.len as i32); next }
+                Dict(d) => { regs[base.raw] = Int(d.len as i32); next }
+                _ => {}
+            }
         }
         cold { gc_point(); call_slow(base.raw, base.raw + 1, n as u64, Nil) }
     }
@@ -633,7 +706,20 @@ pub vm Py {
                 (Float(x), Float(y)) => { dst = Float(x sym y); next }
                 _ => {}
             }
-            cold { gc_point(); dst = ops.arith(ctx, opn, a, b)?; next }
+            cold {
+                match (a, b) {
+                    (Int(x), Float(y)) => { dst = Float((x as f64) sym y); next }
+                    (Float(x), Int(y)) => { dst = Float(x sym (y as f64)); next }
+                    _ => {}
+                }
+                if let Some(f) = ops.binop_method(ctx, opn, a, b) {
+                    if let Inst(_) = a { call2(f, a, b, dst.raw) }
+                    call2(f, b, a, dst.raw)
+                }
+                gc_point();
+                dst = ops.arith(ctx, opn, a, b)?;
+                next
+            }
         }
     }
     /// `a += b`: lists extend in place.
@@ -652,7 +738,21 @@ pub vm Py {
     }
     op TRUEDIV(dst: reg, a: reg, b: reg) : ABC {
         if let (Float(x), Float(y)) = (a, b) and y != 0.0 { dst = Float(x / y); next }
-        cold { gc_point(); dst = ops.arith(ctx, ops.O_TRUEDIV, a, b)?; next }
+        cold {
+            match (a, b) {
+                (Int(x), Float(y)) => if y != 0.0 { dst = Float((x as f64) / y); next },
+                (Float(x), Int(y)) => if y != 0 { dst = Float(x / (y as f64)); next },
+                (Int(x), Int(y)) => if y != 0 { dst = Float((x as f64) / (y as f64)); next },
+                _ => {}
+            }
+            if let Some(f) = ops.binop_method(ctx, ops.O_TRUEDIV, a, b) {
+                if let Inst(_) = a { call2(f, a, b, dst.raw) }
+                call2(f, b, a, dst.raw)
+            }
+            gc_point();
+            dst = ops.arith(ctx, ops.O_TRUEDIV, a, b)?;
+            next
+        }
     }
     op FLOORDIV(dst: reg, a: reg, b: reg) : ABC {
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
@@ -719,13 +819,33 @@ pub vm Py {
                 (Float(x), Float(y)) => { dst = Bool(test); next }
                 _ => {}
             }
-            cold { dst = ops.compare_value(ctx, opn, a, b)?; next }
+            cold {
+                match (a, b) {
+                    (Int(i), Float(y)) => { let x = i as f64; dst = Bool(test); next }
+                    (Float(x), Int(j)) => { let y = j as f64; dst = Bool(test); next }
+                    _ => {}
+                }
+                if let Some(f) = ops.cmp_method(ctx, opn, a, b) {
+                    if let Inst(_) = a { call2(f, a, b, dst.raw) }
+                    call2(f, b, a, dst.raw)
+                }
+                dst = ops.compare_value(ctx, opn, a, b)?;
+                next
+            }
         }
     }
     op IS(dst: reg, a: reg, b: reg) : ABC { dst = Bool(ops.is_same(a, b)); next }
     op ISNOT(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!ops.is_same(a, b)); next }
-    op IN(dst: reg, a: reg, b: reg) : ABC { dst = Bool(ops.contains(ctx, b, a)?); next }
-    op NOTIN(dst: reg, a: reg, b: reg) : ABC { dst = Bool(!ops.contains(ctx, b, a)?); next }
+    op IN(dst: reg, a: reg, b: reg) : ABC {
+        let r = ops.contains_fast(b, a);
+        if r != 2 { dst = Bool(r == 1); next }
+        cold { dst = Bool(ops.contains(ctx, b, a)?); next }
+    }
+    op NOTIN(dst: reg, a: reg, b: reg) : ABC {
+        let r = ops.contains_fast(b, a);
+        if r != 2 { dst = Bool(r == 0); next }
+        cold { dst = Bool(!ops.contains(ctx, b, a)?); next }
+    }
 
     // ── jumps ───────────────────────────────────────────────────────
 
@@ -768,7 +888,14 @@ pub vm Py {
                 (Float(x), Float(y)) => branch(test, then.target),
                 _ => {}
             }
-            cold { branch(ops.compare(ctx, opn, a, b)?, then.target) }
+            cold {
+                match (a, b) {
+                    (Int(i), Float(y)) => { let x = i as f64; branch(test, then.target) }
+                    (Float(x), Int(j)) => { let y = j as f64; branch(test, then.target) }
+                    _ => {}
+                }
+                branch(ops.compare(ctx, opn, a, b)?, then.target)
+            }
         }
     }
 
@@ -788,7 +915,12 @@ pub vm Py {
             }
             _ => {}
         }
-        cold { gc_point(); dst = ops.getindex(ctx, obj, key)?; next }
+        cold {
+            if let Inst(o) = obj and let Some(f) = ops.simple_method(ctx, o.cls, ops.DN_GETITEM, 2) { call2(f, obj, key, dst.raw) }
+            gc_point();
+            dst = ops.getindex(ctx, obj, key)?;
+            next
+        }
     }
     op SETINDEX(obj: reg, key: reg, src: reg) : ABC {
         if let (List(l), Int(i)) = (obj, key) {
@@ -910,8 +1042,22 @@ pub vm Py {
 
     op GETITER(dst: reg, src: reg) : ABC {
         gc_point();
-        dst = ops.getiter(ctx, src)?;
-        next
+        match src {
+            List(_) | Tuple(_) => {
+                let b = value.new_box(&ctx.heap, K_SEQIT, 0);
+                b.a = src;
+                dst = Obj(b);
+                next
+            }
+            Obj(o) => if o.kind == value.K_RANGE {
+                let b = value.new_box(&ctx.heap, K_RANGEIT, 0);
+                b.n = o.n; b.m = o.m; b.s = o.s;
+                dst = Obj(b);
+                next
+            } else if o.kind == K_GEN { dst = src; next },
+            _ => {}
+        }
+        cold { dst = ops.getiter(ctx, src)?; next }
     }
     /// Next item of R[it] into R[dst], skipping the JMP; or take the JMP
     /// when the iterator is exhausted.
@@ -1056,6 +1202,7 @@ pub fn invoke(c: *Ctx, f: Value, args: []Value) -> Result<Value, Value> uses ree
 
 /// Call the callee at `top[0]` with the `n` arguments after it.
 pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    builtins.count(builtins.CNT_INVOKE);
     let caller = c.fp;
     if caller + 2 >= c.frames_end or c.vm_depth > 180 {
         return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded"));
@@ -1099,6 +1246,7 @@ pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value
 /// Resume generator `g` from host code: Ok(Some(v)) for a yielded value,
 /// Ok(None) when it finished.
 pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses reenter {
+    builtins.count(builtins.CNT_GENNEXT);
     if g.m == GEN_DONE { return Ok(None); }
     if g.m == GEN_RUNNING { return Err(ops.exc(c, builtins.E_VALUE, "generator already executing")); }
     let caller = c.fp;
