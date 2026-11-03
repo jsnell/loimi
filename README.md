@@ -6,11 +6,12 @@ is designed around a single goal: the code you write for an interpreter's inner
 loop should compile to what an expert would write by hand in assembly, without
 you having to write assembly, macros, or `__attribute__` soup.
 
-Status: **early implementation**. The compiler, the dispatch strategies,
-value representations, the GC integration, generated verifiers and
-instrumentation work, and a Lua-like interpreter written in Loimi runs on
-them. See [`docs/status.md`](docs/status.md) for what is built and how it
-differs from the design.
+Status: **working, pre-1.0**. The compiler, the dispatch strategies,
+value representations, the GC, generated verifiers, instrumentation, C
+embedding, a test runner and an opt-in copy-and-patch JIT work, and six
+example interpreters are written in Loimi. See
+[`docs/status.md`](docs/status.md) for what is built and how it differs
+from the design.
 
 **Results so far.** `examples/mini` implements a Lua 5.4 subset
 ([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
@@ -31,6 +32,22 @@ time and 0.47× of Guile 3's time with Guile's JIT off, and is on par with
 Guile with its JIT (1.02×)
 ([`bench/scheme/README.md`](bench/scheme/README.md)).
 
+Three more examples were written by agents that read only the docs, as
+usability studies (each has a `FRICTION.md` report):
+[`examples/lox`](examples/lox) implements Lox from *Crafting
+Interpreters*. It passes all 246 tests of the book's official suite and
+takes 0.45× of the time of the book's C interpreter, clox, by geometric
+mean over its official benchmarks (faster on all 10).
+[`examples/regex`](examples/regex) is a backtracking regex engine shipped
+as a C library, checked against Python's `re`.
+[`examples/stack`](examples/stack) is a Forth-like stack VM using
+declared stack effects.
+
+`loimi build --jit-stencils` (x86-64 Linux) generates a copy-and-patch
+JIT from the same `vm` declarations, with no extra interpreter source:
+0.77–0.86 of the interpreter's time for Mini, MiniJS and Scheme
+([`docs/design/copy-and-patch.md`](docs/design/copy-and-patch.md)).
+
 ## Getting started
 
 Requirements: Rust (stable) and clang/LLVM 19.
@@ -46,6 +63,7 @@ cargo test                                             # all tests
 tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
 bench/run.sh                                           # Loimi VM vs hand-written C
 bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
+./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
 ```
 
 ## Why a new language?
@@ -90,6 +108,11 @@ infrastructure out of macros, compiler extensions, and convention:
   also built as a C library ([`examples/embed/`](examples/embed)).
 - [`examples/scheme/`](examples/scheme): an R7RS-small subset with proper
   tail calls, flat closures and a register VM.
+- [`examples/minijs/`](examples/minijs): a JavaScript subset on shapes and
+  inline caches from `std.obj`.
+- [`examples/lox/`](examples/lox), [`examples/regex/`](examples/regex),
+  [`examples/stack/`](examples/stack): written from the docs alone, with
+  usability reports.
 - [`bench/`](bench): the dispatch benchmark against hand-written C, and
   [`bench/mini`](bench/mini): Mini vs PUC-Lua and LuaJIT.
 
@@ -134,4 +157,5 @@ becomes its own LLVM function using the `preserve_none` calling convention, and
 every `next` becomes a `musttail` call through the dispatch table. `pc`,
 `regs`, `k`, and `ctx` stay in machine registers across the whole interpreter.
 The `(Int, Int)` check compiles to one xor/or/shift/compare. The `cold` block is
-outlined behind a `preserve_most` call, so the hot path never spills.
+moved to its own function and reached with a tail call, so the hot path
+makes no call and needs no stack frame.
