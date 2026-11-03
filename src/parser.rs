@@ -1793,13 +1793,18 @@ impl Parser {
                 self.eat(",");
                 break;
             }
+            // `#[cfg(..)]` on a field initializer, to match a field
+            // declared under the same condition.
+            let keep = self.take_cfg()?;
             let f = self.ident()?;
             let v = if self.eat(":") {
                 self.parse_expr()?
             } else {
                 Expr { kind: ExprKind::Ident(f.name.clone()), span: f.span }
             };
-            fields.push((f, v));
+            if keep {
+                fields.push((f, v));
+            }
             if !self.eat(",") {
                 break;
             }

@@ -17,7 +17,7 @@ import big;
 import vm;
 import vm.{Ctx, Proto, Py, P_VARARGS, P_VARKW, P_GEN};
 import ops;
-import builtins;
+import builtins; #[cfg(debug)] import debugger;
 
 // ── scopes ──────────────────────────────────────────────────────────
 
@@ -660,7 +660,7 @@ fn C.for_stmt(c: *C, t: *Expr, iter: *Expr, body: Body, orelse: Body) {
     if let Name(n) = t.e and let Local(r) = c.kind(n) { dst = r; direct = true; }
     if !direct { dst = c.alloc(1); }
     c.emit(Py.FORITER(dst as u8, it as u8));
-    c.code.jump(Py.JMP(0), els);
+    c.code.jump(Py.JMP(0), els); #[cfg(debug)] if let Name(n) = t.e and direct { debugger.store(c as *u8, n, c.pc32()); }
     if !direct { c.assign(t, dst); }
     c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
     let m2 = c.regs.mark();
@@ -829,14 +829,14 @@ fn C.store_name(c: *C, n: str, src: u32) {
         Free(i) => c.emit(Py.STOREFREE(src as u8, i as u8)),
         Global => c.emit(Py.SETGLOBAL(src as u8, c.kstr(n) as u16)),
         ClassNs => c.emit(Py.STORENAME(src as u8, c.class_ns as u8, c.name8(n))),
-    }
+    } #[cfg(debug)] debugger.store(c as *u8, n, c.pc32()); // --cfg debug: `n` is bound from here on
 }
 
 /// Assign the value of `v` to target `t`, computing straight into a
 /// local's register when possible.
 fn C.assign_expr(c: *C, t: *Expr, v: *Expr) {
     if let Name(n) = t.e and let Local(r) = c.kind(n) {
-        c.expr_to(v, r);
+        c.expr_to(v, r); #[cfg(debug)] debugger.store(c as *u8, n, c.pc32());
         return;
     }
     let r = c.alloc(1);
@@ -1242,13 +1242,13 @@ fn C.comp(c: *C, cs: *mem.Vec<Comp>, i: u64, kind: u32, acc: u32, x: *Expr, y: *
     let top = c.code.here();
     let done = c.code.label();
     c.emit(Py.FORITER(v as u8, it as u8));
-    c.code.jump(Py.JMP(0), done);
+    c.code.jump(Py.JMP(0), done); #[cfg(debug)] c.debug_shadows(saved); // --cfg debug: the targets are locals from here
     if !simple { c.assign(cm.target, v); }
     for j in 0..cm.ifs.len { c.jump_if_false(cm.ifs.at(j), top); }
     c.comp(cs, i + 1, kind, acc, x, y);
     c.code.jump(Py.JMP(0), top);
     c.code.bind(done);
-    c.shadow.len = saved;
+    c.shadow.len = saved; #[cfg(debug)] debugger.close_locals(c as *u8, ns.len, c.pc32());
     ns.free();
 }
 
@@ -1652,7 +1652,7 @@ fn finish(c: *C, name: str, np: u32, nk: u32, flags: u32, pnames: []Value, simpl
     };
     hs.free();
     let idx = u.c.protos.len as u32;
-    u.c.protos.push(p);
+    u.c.protos.push(p); #[cfg(debug)] c.debug_finish(p);
     p.simple = if simple { np } else { 0xffffffff };
     idx
 }
@@ -1735,4 +1735,30 @@ pub fn run_module_source(c: *Ctx, src: str, d: Gc<Dict>) -> Result<(), Value> us
     let f = new(&c.heap, Func { proto: p, defaults: None, kwdefaults: None, cells: None, globals: d, owner: None });
     vm.invoke(c, Value.Func(f), [])?;
     Ok(())
+}
+
+// --cfg debug: the debugger's view of locals (debugger.lm). Kept at the
+// end of the file so that a build without it keeps its line numbers.
+
+/// The comprehension targets from shadow entry `from` on are locals
+/// from here on.
+#[cfg(debug)]
+fn C.debug_shadows(c: *C, from: u64) {
+    for j in from..c.shadow.len {
+        let (n, r) = c.shadow.at(j);
+        debugger.open_local(c as *u8, n, r, c.pc32());
+    }
+}
+
+/// The function compiled by `c` is `p`: its locals (parameters, cells,
+/// free variables) for the debugger.
+#[cfg(debug)]
+fn C.debug_finish(c: *C, p: *Proto) {
+    var it: u64 = 0;
+    while let Some(sl) = c.locals.next(&it) {
+        let cell = c.s.cells.contains(sl.key);
+        debugger.local(c as *u8, sl.key, sl.value, if cell { debugger.LV_CELL } else { debugger.LV_REG }, (sl.value as u64) < p.pnames.len);
+    }
+    for j in 0..c.s.frees.len { debugger.local(c as *u8, c.s.frees.at(j), j as u32, debugger.LV_FREE, true); }
+    debugger.finish_proto(c as *u8, p);
 }
