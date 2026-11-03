@@ -1026,6 +1026,40 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
             }
         }
     }
+    // A temporary first seen inside a head structure that chunk 0's only
+    // goal passes as argument i can live in Ai, if Ai is not needed any
+    // more when the variable is first written (its head argument comes at
+    // or after argument i): the WAM's register allocation, saving the
+    // moves before the call.
+    if chunk0.len == 1 {
+        let g = goals.ptr[chunk0.ptr[0]];
+        let (_, ga) = term.name_arity(&m.db, g.t);
+        var used: u64 = 0;     // argument registers taken (kept variables), as a bitmask for i < 64
+        var kat: u64 = 0;
+        while let Some(slot) = c.kept.next(&kat) {
+            let r = c.vars.get_ptr(slot.key).unwrap().reg;
+            if r < 64 { used = used | (1 << (r as u64)); }
+        }
+        for i in 0..ga as u64 {
+            if i >= 64 { break; }
+            if (used & (1 << i)) != 0 { continue; }
+            let a = deref(term.arg_of(g.t, i));
+            let Ref(_) = a else { continue; };
+            let key = var_key(a);
+            let vi = c.info(a);
+            if vi.perm or vi.occ == 1 or c.kept.contains(key) { continue; }
+            var j: u64 = 0;
+            var found = false;
+            while j < arity { if occurs(term.arg_of(head, j), a) { found = true; break; } j += 1; }
+            if found {
+                if deref(term.arg_of(head, j)) == a { continue; }
+                if j < i and i < arity { continue; }
+            }
+            vi.reg = i as u32;
+            c.kept.insert(key, true);
+            used = used | (1 << i);
+        }
+    }
     chunk0.free();
     // Every other temporary gets its own register.
     at = 0;
