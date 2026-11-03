@@ -689,6 +689,10 @@ static MiniResume on_stop(MiniState *s, void *ud, MiniStop reason, uint32_t bp) 
             jfree(m);
             if (done) break;
         }
+        pthread_mutex_lock(&q_mu);
+        int gone = q_eof && !q_head;
+        pthread_mutex_unlock(&q_mu);
+        if (gone) _exit(0); /* the client went away */
         STORE(running, 1);
         return MiniResume_Keep;
     }

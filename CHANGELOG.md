@@ -25,6 +25,18 @@ implementation; `git log` has the details.
   `Stepper.left`, `line_sites`, `unpatched` and "line 0 is no line", and
   struct literals take `#[cfg(..)]` on field initializers
   ([design/debugging.md §8](docs/design/debugging.md#8-second-interpreter-python)).
+- **Debugging Mini from an editor**: a stop-callback C API in the
+  `--cfg debug` library (`mini_debug_*`: breakpoints by file and line,
+  conditions and hit counts, break on uncaught errors, pause from any
+  thread, frames, locals, globals, lazily expanded tables, evaluation),
+  and `mini-dap`, a Debug Adapter Protocol server in C over it
+  (`examples/mini/dap`; VS Code or any DAP client). Conditions run as
+  nested runs from inside the stopped handler, with the breakpoints
+  suspended (`std.debug`'s `Breakpoints.suspend`); a pause is a flag
+  polled at back-edges and calls in debug builds (0.5% in total, within noise).
+  The command line gained `break LINE if COND` and `print EXPR`
+  ([design/debugging.md §9](docs/design/debugging.md#9-editors-a-stop-callback-api-and-a-dap-adapter),
+  [SPEC.md §8](examples/mini/SPEC.md#8-debugger---cfg-debug)).
 - **`Vm.Resume` inline cache fields**: verified code addresses in the
   instruction stream (try chains, cached callees); the verifier resets
   them to the placeholder, `v.fill_resumes(vals)` sets them, `jump

@@ -3235,7 +3235,11 @@ variant whose wrapper sets the breakpoint again before the next
 instruction: the step-over gdb does. `std.debug` implements that
 protocol (`Breakpoints.hit` and `tick`), with line stepping and a
 command reader; Mini's `--cfg debug` build is a debugger on top of it
-(`examples/mini/debugger.lm`, `docs/design/debugging.md`).
+(`examples/mini/debugger.lm`, `docs/design/debugging.md`), with a C API
+and a Debug Adapter Protocol server for editors (`examples/mini/dap`).
+A hook that evaluates guest code at a stop (a breakpoint condition) is
+declared `uses reenter`, so the handler syncs before it and reloads
+after, as around a native that calls back.
 
 What keeps this sound:
 

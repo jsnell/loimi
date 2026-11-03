@@ -307,3 +307,47 @@ a "stack overflow" error.
 
 Memory is managed automatically. Programs may allocate as much as they
 like, and unreachable objects are reclaimed.
+
+## 8. Debugger (`--cfg debug`)
+
+Not part of the language: what the debug build of this implementation
+adds (`examples/mini/debugger.lm`; design in
+`docs/design/debugging.md`, sections 1 to 7 and 9).
+
+**Command line.**
+
+```sh
+./target/release/loimi build examples/mini/main.lm --release --cfg debug -o mini-dbg
+./mini-dbg --debug script.mini < commands      # or interactively
+```
+
+It stops before the first line and reads gdb-like commands:
+`break [FILE:]LINE` (`b`), `break LINE if COND` (stop only when the Mini
+expression COND holds there), `tbreak`, `delete ID` (`d`), `info`,
+`continue` (`c`), `step` (`s`), `next` (`n`), `finish` (`fin`), `bt`,
+`locals`, `print NAME` (a local) or `print EXPR` (any expression in the
+current frame), `op` (the current instruction, disassembled), `quit`,
+`help`. An error that nothing catches stops before it unwinds, with
+its message, so `bt` and `locals` show where it happened.
+
+**Editors (DAP).** `examples/mini/dap/mini_dap.c` is a Debug Adapter
+Protocol server over the C debugging API (section 9 of the design note;
+the `mini_debug_*` functions at the end of `embed.lm`):
+
+```sh
+./target/release/loimi build --cfg debug examples/mini/embed.lm --lib -o libmini.a --header mini.h
+clang-19 -I. examples/mini/dap/mini_dap.c libmini.a -lm -pthread -o mini-dap
+```
+
+An editor runs `mini-dap` as the debug adapter for `.mini` files, with
+a launch configuration such as `{"type": "mini", "request": "launch",
+"program": "${file}", "stopOnEntry": false}` (in VS Code, a
+`debuggers` contribution whose `program` is `mini-dap`). It supports
+breakpoints with conditions and hit counts (`N`, `>= N`, `% N`, ...),
+stopping on uncaught errors (the "Uncaught errors" exception filter),
+step in, over and out, pause, the call stack, locals (with upvalues)
+and globals (without the standard library) with tables expanded on
+demand, and evaluating expressions in a frame (watches, hovers, and
+statements such as `done = true` in the debug console). Locals are
+copies there: assigning to one in the console does not change the
+program's. Set `MINI_DAP_LOG=file` to log the protocol.

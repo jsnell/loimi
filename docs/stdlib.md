@@ -22,7 +22,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
 | [`std.parse`](#stdparse) | built (`Pratt`, `Parser`, `Ops`; no `TokenStream`) | `std/parse.lm` |
 | [`std.diag`](#stddiag) | built | `std/diag.lm` |
-| [`std.debug`](#stddebug-guest-debuggers) | built (breakpoints, stepping, commands; frames and locals are the interpreter's) | `std/debug.lm` |
+| [`std.debug`](#stddebug-guest-debuggers) | built (breakpoints with conditions and hit counts, stepping, pause requests, handles for lazy expansion, commands; frames and locals are the interpreter's) | `std/debug.lm` |
 | [`std.bc`](#stdbc-bytecode-construction) | built (a library, no generated `Builder`) | `std/bc.lm` |
 | [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
 | [`std.gil`](stdlib/gc.md#threads-sharing-a-heap-stdgil) | built (a global interpreter lock per heap) | `std/gil.lm` |
@@ -977,8 +977,25 @@ subset's `--cfg debug` builds (`examples/mini/debugger.lm`,
   breakpoint word replaced by the word it stands for (`word` is
   `Break.word`), for walks that read labels or operands, which see a
   breakpoint word as the breakpoint op.
+- For front ends that embed the debugger (an editor's, through a C API
+  and the Debug Adapter Protocol; Mini's `mini_debug_*`,
+  design/debugging.md §9): `Bp.cond` (an expression the interpreter
+  evaluates at each hit) and `Bp.hitc`, set with
+  `set_condition(id, cond, hitc)`; `counts(id) -> bool` counts a hit
+  whose condition held and checks the hit condition (`HitCond`, from
+  `parse_hit_condition("N" | "== N" | ">= N" | "> N" | "<= N" | "< N" |
+  "% N" | "")`). `suspend()`/`unsuspend()`/`suspended()`: take the
+  breakpoints out of the code while the debugger runs guest code from a
+  stop (a condition, an expression), leaving the pending step-over
+  alone; `tick` does nothing meanwhile. `Reason` (`Entry`,
+  `Breakpoint`, `Step`, `Pause`, `Error`). `Refs<T>`: handles (from 1)
+  for what a client expands lazily (`add(x, same)`, `get(id)`,
+  `items()`, `clear()`). `request_pause(&flag)` (any thread, a relaxed
+  atomic store) and `take_pause(&flag)`, for a pause flag the
+  interpreter polls at back-edges and calls.
 - Commands: `parse_command(line) -> Command` (`Break(file, line)`,
-  `TBreak`, `Delete(id)`, `Continue`, `Step`, `Next`, `Finish`,
+  `TBreak`, `BreakIf(file, line, cond)` for `break LINE if COND`,
+  `Delete(id)`, `Continue`, `Step`, `Next`, `Finish`,
   `Backtrace`, `Locals`, `Print(name)`, `Op`, `Info`, `Quit`, `Help`,
   `Empty`, `Bad(msg)`, with gdb's short forms), `HELP`,
   `parse_location("[FILE:]LINE")`, `basename(path)`.

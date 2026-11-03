@@ -176,6 +176,13 @@ separate threads (runtime state is thread-local; `--sanitize=thread`),
 and threads sharing one heap behind a lock (`std.gil`). `--cfg NAME`
 with `#[cfg(..)]` and pointer atomics.
 
+**Debugging guest programs** ([§9.1](docs/language.md#91-breakpoints-on-break), [design](docs/design/debugging.md)):
+generated breakpoint ops patched over verified code, at no cost when not
+debugging, with `std.debug` for stepping and breakpoints. Mini's debug
+build is debuggable from editors: a stop-callback C API and `mini-dap`,
+a Debug Adapter Protocol server (`examples/mini/dap`), with conditional
+breakpoints, break on error, pause and evaluation.
+
 **Core language** ([§1](docs/language.md#1-core-language)): structs,
 enums, generics with static traits, `iN`/`uN` of any width, pattern
 matching (with constants as patterns), non-escaping and escaping

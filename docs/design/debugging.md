@@ -7,7 +7,11 @@ step-over, line stepping, line starts, a command reader), and
 debuggers for Mini (`loimi build --cfg debug examples/mini/main.lm`,
 then `mini --debug script.mini`) and for the Python subset
 (`python-loimi --debug prog.py`, pdb-like; section 8, which reports
-what did not fit the first design). Written 2026-11-03.
+what did not fit the first design). For editors (section 9): Mini's
+stop-callback C API (`mini_debug_*`, `--cfg debug`), conditional and
+hit-counted breakpoints, break on error, a pause from another thread,
+expression evaluation, and a Debug Adapter Protocol server
+(`examples/mini/dap/mini_dap.c`). Written 2026-11-03.
 
 > Breakpoints, single-stepping and inspecting frames and locals in an
 > interpreter built with Loimi: how much can be generated from the `vm`
@@ -228,8 +232,9 @@ command is pending, so `continue` runs at full speed. A breakpoint hit
 while stepping stops once: the wrapper skips the stepper on a
 breakpoint word, and the breakpoint's handler stops.
 
-Exceptions: Mini's `on raise` ends the run or unwinds coroutines; a
-"break on error" would be one more hook there (not built).
+Exceptions: Mini's `on raise` ends the run or unwinds coroutines;
+"break on error" is one more hook there, before the error unwinds
+(section 9.4).
 
 ## 4. Inspection
 
@@ -251,10 +256,11 @@ Exceptions: Mini's `on raise` ends the run or unwinds coroutines; a
   and functions are printed without their addresses (so that
   transcripts are deterministic).
 
-## 5. Embedding: a C API (not built)
+## 5. Embedding: a C API (built: section 9)
 
-A host drives the debugger the way the command loop does. What a DAP
-adapter needs, as `export "C"` functions over the same pieces:
+A host drives the debugger the way the command loop does. The first
+sketch of what a DAP adapter needs, as `export "C"` functions over the
+same pieces (section 9.1 has the API as built):
 
 ```c
 int  mini_debug_break(mini_State *s, const char *file, int line);  /* -> id, or 0 */
@@ -340,10 +346,9 @@ nothing (*attached*).
   coroutine's stack, so `next` across a `coroutine.resume` treats the
   coroutine's frames as shallower or deeper by accident. A per-thread
   depth (the stack of resumers) would fix it.
-- **Conditional breakpoints, watchpoints, setting variables, break on
-  error**: each a few lines over the same pieces (a condition evaluated
-  at `hit`, a store hook in a variant wrapping the SET ops, a hook in
-  `on raise`).
+- **Watchpoints, setting variables**: a store hook in a variant
+  wrapping the SET ops; a store into the frame's register (not built).
+  Conditional breakpoints and break on error: section 9.
 - **JIT and threads**: section 2.4.
 - **Stack vms**: `on break` is rejected there for now (the breakpoint ops
   would need the stack effect of the instruction they stand for).
@@ -546,3 +551,279 @@ general enough to move into `std.debug`; one was a compiler gap
 (`#[cfg]` on a literal's field). What stayed Python's is what only it
 knows: which code is the program's, where locals are bound, and how to
 show a value without running guest code.
+
+## 9. Editors: a stop-callback API and a DAP adapter
+
+Section 5 sketched a C API; this is it as built, for Mini, with what an
+editor needs on top of the command line: conditional and hit-counted
+breakpoints, break on error, a pause button, expressions, and a Debug
+Adapter Protocol server (`examples/mini/dap/mini_dap.c`) that VS Code
+or any DAP client can run as its debug adapter.
+
+### 9.1 The API
+
+Mini built with `--cfg debug` as a library (`loimi build --cfg debug
+examples/mini/embed.lm --lib --header mini.h`) has, at the end of
+`embed.lm`:
+
+| call | what |
+|---|---|
+| `mini_debug_attach(s, cb, ud)` | debug state `s`; `cb(s, ud, reason, bp) -> MiniResume` runs at each stop |
+| `mini_debug_load(s, name, src)` | compile a chunk named `name` (its file) and push it, for `mini_call` |
+| `mini_debug_stop_on_entry(s)` | stop before the first instruction of the chunk loaded last |
+| `mini_debug_break_on_error(s, on)` | stop at errors nothing catches, before they unwind |
+| `mini_debug_set_break(s, file, line) -> id` | a breakpoint, in code loaded now or later (pending until then) |
+| `mini_debug_condition(s, id, cond, hit)` | a Mini expression, and a hit condition (`N`, `>= N`, `% N`, ...) |
+| `mini_debug_code_line(s, file, line)` | the first line at or after `line` with code (where an editor moves a breakpoint) |
+| `mini_debug_break_sites`, `mini_debug_delete` | |
+| `mini_debug_pause(s)` | stop soon; **the one call another thread may make** |
+| at a stop: `mini_debug_message`, `_depth`, `_frame(level, &func, &file, &line)` | the error or failed condition; frames |
+| at a stop: `mini_debug_scope(level, Locals or Globals) -> handle` | handles for lazy expansion |
+| at a stop: `mini_debug_variables(handle, start, count, f, ud)` | `f(ud, name, value, child)` per variable; `child` is a table's handle |
+| at a stop: `mini_debug_eval(level, expr, &out, &child)` | an expression or a statement in that frame |
+
+The reasons are `MiniStop_Entry`, `_Breakpoint`, `_Step`, `_Pause`,
+`_Error`; the resumptions `MiniResume_Continue`, `_Step`, `_Next`,
+`_Finish`, and `_Keep`, which continues as before the stop (a `next`
+in progress goes on), for a host that stopped the program for its own
+work (section 9.5). The callback runs on the interpreter's thread,
+inside the instruction where the program stopped, as the command line
+does: it is the command line's loop with the commands replaced by C
+calls. Both front ends share one core (`debugger.lm`: `Dbg`, its hooks,
+frames, variables, evaluation); the command line gained `break LINE if
+COND`, `print EXPR`, and a stop at uncaught errors.
+
+Variables are shown as text (strings quoted, `table (3 entries)`,
+`function 'name'`, no addresses, so transcripts are deterministic).
+Handles (`std.debug.Refs`) are ids for a frame's locals, the globals
+(without the library's, recorded when the debugger attaches) or a
+table, valid until the program continues; the tables they name are GC
+roots meanwhile. Locals include the closure's upvalues, whose names the
+compiler now reports too (`compile.debug_upvals`, under `--cfg debug`).
+Chunks loaded for debugging stay alive (their code holds breakpoints),
+and their source is copied (local names point into it).
+
+Strings cross the boundary as `loimi_str` (`{ptr, len}`), which takes two
+argument registers; the header generator rejects an export whose `str`
+would not fit in the first six. That shaped two calls: the condition is
+set by a call of its own, and the variable callback has no `type`.
+
+### 9.2 Conditions: running guest code from inside a stop
+
+A condition is a Mini expression evaluated in the stopped frame at each
+hit, before deciding to stop; `mini_debug_eval` and the command line's
+`print EXPR` are the same thing at a stop. The program is stopped
+*inside a handler* (`on break`, the step variant's wrapper, or `on
+raise`), so evaluating means a nested run from there. Three questions:
+
+1. **Compiling against the frame.** Mini's locals are registers, and
+   Mini has no `load` with an environment. The expression is compiled as
+   the body of a function whose parameters are the names visible at the
+   stop (the live locals from the compiler's records, inner ones hiding
+   outer ones, then the upvalues): `return function(n, total, i) return
+   (EXPR) end`. The chunk's one closure is called with their values. So
+   locals are read-only copies (assigning to one changes the copy),
+   globals are the real ones (`done = true` works: a statement is tried
+   when the text is not an expression), and upvalue cells are not
+   shared. The compiler's local records are off meanwhile, so an
+   evaluation leaves nothing behind but garbage. An error comes back
+   without its `line 1:` (the expression's own line).
+2. **Running nested from a handler.** The hooks are `uses reenter`, so
+   the compiler puts the vm's `sync` before them and `reload` after
+   (language.md §5.1), as for a native that calls back: `ctx.fp` is the
+   stopped frame, the nested run (`vm.call_value`) starts above its
+   registers, the collector sees every frame, and the handler reloads
+   `fp`, `regs` and `k` afterwards (a coroutine's stack may have moved).
+   That needed no change to the vm beyond the effect. The instruction
+   under the breakpoint has already been put back for the step-over
+   (section 2.3), and runs after the hook returns (`jump pc`). If the
+   nested run executes and quickens that same instruction, `jump pc`
+   runs the quickened one, which is fine, and `rearm` later patches
+   whatever is there.
+3. **The debugger off during the run.** A breakpoint hit inside the
+   evaluation must not stop (or recurse) and, worse, must not disturb
+   the step-over in progress: `hit` would set the pending site again
+   first (it takes a pending site to mean "its instruction started, in a
+   run a native interrupted"), and then `jump pc` would hit the stopped
+   breakpoint forever. A step variant switched on in the nested run would
+   call `tick`, which sets the pending site again too. So
+   `Breakpoints.suspend` (std.debug) takes every site but the pending
+   one out of the code, `tick` does nothing while suspended, and the
+   interpreter's hooks (`on_step`, `stepping`, `left`, `on_error`)
+   return at once; `unsuspend` sets the sites again over what the code
+   holds then. That is one store per site, and an evaluation compiles
+   and runs a chunk anyway. A flag that made the breakpoint handler skip
+   the stop instead would have needed the step-over of each nested hit
+   without touching the pending one: two step-overs at once, which
+   `Breakpoints` does not represent.
+
+A condition that fails to evaluate stops, with the error as the stop's
+message (VS Code's behavior); a false one continues at once (`on_break`
+returns without a stop; the handler runs the step-over either way).
+
+**Hit counts** count the hits at which the condition held
+(`Bp.count`), and the hit condition is checked on that count
+(`HitCond`, parsed from DAP's strings: `N` or `== N`, `>= N`, `> N`,
+`<= N`, `< N`, `% N`). Both are generic (`Breakpoints.set_condition`,
+`counts`).
+
+### 9.3 Pause
+
+`mini_debug_pause` comes from another thread (the adapter's reader)
+while the interpreter runs. What may it touch?
+
+- **Patch breakpoints into the code from that thread** (a breakpoint at
+  every line start): free when not pausing, but the patching races with
+  the running code's own writes (`become` quickens the word being
+  patched; the step-over clears and rearms sites) and with its use of
+  the `Breakpoints` tables; making that safe needs atomic code writes
+  and a lock the interpreter takes at each hit.
+- **A signal** to the interpreter's thread, whose handler patches: no
+  data race on the code, but the handler may interrupt the debugger
+  itself (inside `hit` or `tick`) or `malloc`.
+- **A flag the running code polls**, as CPython's eval breaker: the
+  other thread only stores a word (`std.debug.request_pause`, a relaxed
+  atomic store into `Ctx.pause`); the interpreter, at a poll, switches
+  to the step variant (`use_variant step`), whose wrapper sees the flag
+  at the next instruction (`take_pause`) and stops with reason Pause.
+  Everything else happens on the interpreter's thread.
+
+**Chosen: the poll**, in debug builds only, where every long
+computation passes: the `JMP` (a `while` loop's back-edge), `FORLOOP`,
+`NEXT`, `INEXT` (the other loops), and `CALL` (recursion without
+loops); the places of `--cfg gil`'s hand-over poll, less the
+conditional jumps. Those were most of the cost: polling them too (with
+a `target <= pc` test so that forward branches skip the load) cost 1.2%
+in total and 4 to 5% on branchy programs (interp, queens, mandelbrot);
+without them, 0.5% (section 9.7). The one loop that ends in a
+conditional jump, `repeat ... until`, compiles in debug builds to a
+conditional exit and a `JMP` back (one more dispatch per iteration,
+debug builds only), so that every loop polls. A pause asked for while
+the program is stopped is dropped when it continues.
+
+### 9.4 Break on error
+
+Mini's `on raise` gets every error at the instruction that raised it,
+with the frames intact. The hook (`debugger.on_error`, `#[cfg(debug)]`
+on the existing line) runs there for an error raised in this run (not
+one passed on from a nested run, whose own run had it first), and
+stops if nothing will catch it. Mini has no `pcall`: an error is caught
+only by `coroutine.resume` (which returns `false, msg`). So it is
+uncaught if no coroutine between the running one and the main thread
+was resumed by `coroutine.resume` (rather than through a `wrap`
+function, which raises it again). The stop has the message and the
+raising frame's stack; continuing lets the error unwind as before. The
+command line stops there too.
+
+### 9.5 The adapter
+
+`mini_dap.c` (770 lines of C, a JSON reader and writer included) runs
+the script in-process. Of its three threads, one calls into Mini:
+
+- the **main thread** handles requests until `configurationDone`,
+  then runs the chunk (`mini_call`); at each stop, the callback sends a
+  `stopped` event and handles requests until one resumes;
+- a **reader thread** frames and parses requests into a queue. While
+  the script runs, it answers `threads` itself, and for anything else
+  calls `mini_debug_pause`: after a `pause` request, a stop the user
+  sees; after any other (VS Code sends `setBreakpoints` while the
+  program runs), an internal one, where the callback handles the queue
+  and returns `MiniResume_Keep`, so the program goes on as before;
+- a **pump thread** turns the script's stdout (fd 1, which the adapter
+  points at a pipe, keeping the protocol on a duplicate of the
+  original) into `output` events. At each stop and at the end, the main
+  thread flushes stdio and drains the pipe under the pump's lock before
+  sending the event, so output comes before the stop that follows it.
+
+Coverage: `initialize` (capabilities: configuration done, conditional
+and hit-conditional breakpoints, hover evaluation, terminate, the
+exception filter "Uncaught errors", on by default), `launch` (`program`,
+`stopOnEntry`; a syntax error fails it), `setBreakpoints` (moved to the
+next line with code; unverified where there is none or the hit
+condition does not parse), `setExceptionBreakpoints`,
+`configurationDone`, `threads` (one), `stackTrace` (`startFrame`,
+`levels`), `scopes` (Locals, Globals), `variables` (`start`, `count`;
+nested tables by handle), `evaluate` (any context; errors as failed
+responses), `continue`, `next`, `stepIn`, `stepOut`, `pause`,
+`disconnect`, `terminate`; events `initialized`, `stopped` (entry,
+breakpoint with `hitBreakpointIds`, step, pause, exception with its
+message), `output` (stdout, and the final error on stderr), `exited`,
+`terminated`. Not built: `attach`, `setVariable`, `restart`,
+`loadedSources`, `breakpointLocations`, coroutines as DAP threads,
+columns (Mini records lines only).
+
+### 9.6 Tests
+
+- `examples/mini/dap/test_dap.py` drives the adapter through a session
+  on `examples/mini/tests/dap/session.mini` and prints a transcript
+  (requests, responses, events; sequence numbers dropped, consecutive
+  output events joined, the directory as `$DIR`): breakpoints moved off
+  a blank line, conditional (`n == 4` in a recursive function),
+  hit-counted, refused (a bad hit condition, no code), set while the
+  program runs; `stepIn`, `next`, `stepOut` across calls; stack traces;
+  scopes and nested tables with paging; evaluation (in the frame,
+  calling a function that passes a breakpoint, failing); a pause in a
+  loop that only `done = true` from the debugger ends; break on error
+  with its stack. The golden test (`mini_dap`) builds the library and
+  the adapter in each dispatch mode; the transcript is the same in all
+  three, and over repeated runs.
+- `examples/embed/debug.c` tests the C API without DAP, under GC stress,
+  with the library built four ways (`mini_debug_api`): pending
+  breakpoints, a syntax error, conditions (true, false, failing), hit
+  counts, frames, upvalues, globals without the library, evaluation at
+  two levels with statements and errors, expansions from inside the
+  variable callback, a pause from a second thread.
+- The command line's transcripts (`examples/mini/tests/debug`) gained
+  `cond` (conditions, `print EXPR`, the error stop).
+
+### 9.7 Cost
+
+Mini's default build is unchanged: `--release --emit-llvm` is
+byte-identical in all three dispatch modes, for `main.lm` and for the
+library `embed.lm`, and so is every other example's (the Python
+subset's included: its debugger needed one line, for the new
+`break .. if` command). The debug build gained the pause polls and the
+`repeat` jump. The 14 Mini benchmarks, tail-call dispatch, best of 5,
+interleaved, the debug build before and after (not debugging):
+
+| program | before (s) | after | polls only |
+|---|---:|---:|---:|
+| binary_trees | 0.870 | 1.01 | 1.01 |
+| closures | 0.490 | 1.01 | 1.00 |
+| fannkuch | 1.226 | 1.04 | 1.01 |
+| fib | 1.026 | 0.93 | 0.98 |
+| hash_strings | 1.066 | 0.95 | 1.02 |
+| interp | 0.968 | 1.02 | 1.02 |
+| mandelbrot | 0.635 | 1.01 | 1.00 |
+| nbody | 0.468 | 0.98 | 1.02 |
+| oo_methods | 0.751 | 1.00 | 1.02 |
+| queens | 0.965 | 1.08 | 1.00 |
+| sieve | 0.833 | 0.99 | 0.99 |
+| sort | 0.891 | 1.02 | 1.01 |
+| spectral_norm | 1.186 | 1.01 | 1.01 |
+| string_build | 1.138 | 1.04 | 0.99 |
+| **geometric mean** | | 1.005 | 1.005 |
+
+*after*: this build against the one before; *polls only*: an earlier
+run of the polls without the `repeat` change. The machine was shared
+with other benchmark runs (a third run, at load 5.7, scattered from
+0.78 to 1.09 per program both ways, so it is not shown). fannkuch,
+whose inner loops are `repeat`, was 4% slower here and 1% slower in the
+noisy run, probably the extra `JMP`; queens' 8% was 1.00 with the same
+polls before and 0.93 in the noisy run. The rest is within noise. A conditional breakpoint costs a compile and a nested
+run per hit, about a one-line `mini_dostring`, like conditions in
+debuggers that evaluate source text.
+
+### 9.8 What is generic
+
+`std.debug` gained what another interpreter's API would use unchanged:
+`Reason`, conditions and hit conditions on `Bp` (`set_condition`,
+`counts`, `parse_hit_condition`), `Breakpoints.suspend`/`unsuspend`/
+`suspended` (no stops, and the step-over left alone, while the debugger
+runs guest code), `Refs` (handles for lazy expansion),
+`request_pause`/`take_pause` (the flag), and `break .. if` in the
+command reader. What stayed Mini's is what section 8 found
+interpreter-specific: how an expression is compiled against a frame
+(the parameter trick needs the compiler's records of locals), which
+errors are uncaught, how values are shown, and where the polls go. The
+adapter is Mini's only by the C names and the two scopes.
