@@ -814,8 +814,14 @@ fn T.instr(t: *T) -> Result<bool, str> {
             if !t.dead() {
                 let rb = t.reg(b, p + 1);
                 let rc = t.reg(c, p + 2);
-                // The result goes where the first operand is.
                 let h = t.home(p);
+                if h < 4096 and rb < 4096 and rc < 4096 and (a.loc != Loc.Local or a.x < 4096) {
+                    let ra = t.reg(a, p);
+                    t.emit_def(W.SELECT4(h as u16, ra as u16, rb as u16, rc as u16), h);
+                    t.push_home(ty);
+                    return Ok(true);
+                }
+                // The result goes where the first operand is.
                 match a.loc {
                     Local => { t.emit(W.MOV(h as u16, a.x as u16)); }
                     Const => { t.write_const(h, a.ty, a.x); }
@@ -844,7 +850,12 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     if let Some(last) = t.code.last() {
                         if last == t.last_def_pc {
                             let w = t.code.at(last);
-                            t.code.set(last, (w & 0xFFFFFFFF0000FFFF) | (x << 16));
+                            if W.opcode(w) == W.OP_SELECT4 {
+                                if x < 4096 { t.code.set(last, (w & 0xFFFFFFFFF000FFFF) | (x << 16)); }
+                                else { retargeted = false; t.emit(W.MOV(x as u16, t.home(p) as u16)); retargeted = true; }
+                            } else {
+                                t.code.set(last, (w & 0xFFFFFFFF0000FFFF) | (x << 16));
+                            }
                             retargeted = true;
                         }
                     }

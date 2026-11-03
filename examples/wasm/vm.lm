@@ -235,6 +235,7 @@ pub vm W {
         format RU  { op: 16, a: 16, x: 32 }
         format J   { op: 16, off: s32 }
         format RRK { op: 16, a: 16, b: 16, k: s16 }
+        format R4  { op: 16, a: 12, b: 12, c: 12, d: 12 }
     }
 
     cache Imm64 { v: u64 }
@@ -247,6 +248,8 @@ pub vm W {
     op MOV32(d: ru, a: ru) : RRR { d = a; next }
     // select: d = c != 0 ? d : b (d holds the first operand).
     op SELECT(d: rq, b: rq, c: ri) : RRR { if c == 0 { d = b; } next }
+    // d = c != 0 ? a : b, for frames whose slots fit 12 bits.
+    op SELECT4(d: rq, a: rq, b: rq, c: ri) : R4 { d = if c != 0 { a } else { b }; next }
 
     // ── i32 and i64 arithmetic ────────────────────────────────────────
     inline for (name, dk, ak, bk, expr) in [

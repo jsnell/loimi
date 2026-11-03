@@ -12,6 +12,7 @@ import rt.{Engine, ModInst, Extern};
 
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn clock_gettime(clk: i32, ts: *i64) -> i32;
+extern "C" fn isatty(fd: i32) -> i32;
 
 fn nothing(m: *Machine, a: *u64) -> bool { true }
 
@@ -148,7 +149,9 @@ fn fd_fdstat_get(m: *Machine, a: *u64) -> bool {
     if fd > 2 { return ret(a, EBADF); }
     let Some(p) = guest(m, arg32(a, 1), 24) else { m.host_trap = Trap.MemOOB; return false; };
     for i in 0..24 { p[i] = 0; }
-    *p = 2;   // character device
+    // A terminal is a character device (libc line-buffers it); anything
+    // else is reported as a regular file, so output is fully buffered.
+    *p = if isatty(fd as i32) != 0 { 2 } else { 4 };
     ret(a, 0)
 }
 
