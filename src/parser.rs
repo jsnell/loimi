@@ -36,6 +36,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("require_verified", "`vm` declarations"),
     ("dispatch", "`vm` declarations"),
     ("forward", "`super` declarations in a vm"),
+    ("accumulate", "`op` declarations in a vm with an `accumulator`"),
     ("catch_panic", "`export \"C\"` functions"),
     ("c_name", "structs and enums named in a C header"),
     ("c_const", "`export \"C\"` functions (pointer parameters `const` in C)"),
@@ -83,7 +84,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "test" | "track_caller");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }

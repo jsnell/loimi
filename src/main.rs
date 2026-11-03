@@ -16,6 +16,7 @@ mod rtgen;
 mod tir;
 mod tirwalk;
 mod values;
+mod vmacc;
 mod vmast;
 mod vmcheck;
 mod vmexpand;

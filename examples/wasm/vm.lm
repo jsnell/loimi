@@ -193,6 +193,32 @@ pub vm W {
     operand rf = *((regs + it) as *f32) verify it < (f.nslots as u64) display "r{}";
     operand rd = *((regs + it) as *f64) verify it < (f.nslots as u64) display "r{}";
     operand imm = it;
+    // wasm3's r0 and fp0: a value that one op computes and the next alone
+    // consumes stays in a register (the `accumulate` ops, `W.accumulate`
+    // in compile.lm).
+    accumulator iacc: u64 for ri, ru, rl, rq;
+    accumulator facc: f64 for rd;
+    // The ops that get variants (each variant is an opcode and a handler:
+    // marking every op would double the vm, and goto mode's one function
+    // would not fit in memory). The ones executed by the benchmarks,
+    // and their neighbours in the tables.
+    accumulate
+        I32_ADD, I32_SUB, I32_MUL, I32_AND, I32_OR, I32_XOR, I32_SHL, I32_SHR_S, I32_SHR_U,
+        I32_ROTL, I32_EQ, I32_NE, I32_LT_S, I32_LT_U,
+        I64_ADD, I64_SUB, I64_MUL, I64_AND, I64_OR, I64_XOR, I64_SHL, I64_SHR_U,
+        F64_ADD, F64_SUB, F64_MUL, F64_DIV, F64_LT, F64_LE,
+        I32_ADDK, I32_MULK, I32_ANDK, I32_ORK, I32_XORK, I32_SHLK, I32_SHR_SK, I32_SHR_UK,
+        I64_ADDK, I64_ANDK, I64_SHLK, I64_SHR_UK,
+        I32_EQZ, I32_CLZ, F64_SQRT, F64_NEG, F64_ABS, F64_CONVERT_I32_S, F64_CONVERT_I32_U,
+        I32_WRAP_I64, I64_EXTEND_I32_S, I64_EXTEND_I32_U, I32_DIV_U, I32_REM_U,
+        I32_LOAD, I64_LOAD, F64_LOAD, I32_LOAD8_U, I32_LOAD8_S, I32_LOAD16_U, I32_LOAD16_S,
+        I32_STORE, I64_STORE, F64_STORE, I32_STORE8, I32_STORE16,
+        BR_I32_EQ, BR_I32_NE, BR_I32_LT_S, BR_I32_LT_U, BR_I32_GT_S, BR_I32_GT_U,
+        BR_I32_LE_S, BR_I32_LE_U, BR_I32_GE_S, BR_I32_GE_U,
+        BR_F64_LT, BR_F64_LE, BR_F64_GT, BR_F64_GE,
+        BR_I32_EQK, BR_I32_NEK, BR_I32_LT_SK, BR_I32_LT_UK, BR_I32_GT_SK, BR_I32_GT_UK,
+        BR_I32_LE_SK, BR_I32_LE_UK, BR_I32_GE_SK, BR_I32_GE_UK,
+        BRZ, BRNZ;
     operand label = pc + it verify is_insn_boundary(pc + it);
     // The base of a callee's window: anywhere in the frame.
     operand base = it verify it <= (f.nslots as u64) display "r{}";
@@ -321,7 +347,7 @@ pub vm W {
         ("I64_CLZ", rl, rq, a.clz() as i64), ("I64_CTZ", rl, rq, a.ctz() as i64),
         ("I64_POPCNT", rl, rq, a.popcount() as i64),
         ("F32_ABS", rf, rf, a.abs()), ("F32_NEG", ru, ru, a ^ 0x80000000),
-        ("F64_ABS", rd, rd, a.abs()), ("F64_NEG", rq, rq, a ^ 0x8000000000000000),
+        ("F64_ABS", rd, rd, a.abs()), ("F64_NEG", rd, rd, -a),
         ("F32_SQRT", rf, rf, a.sqrt()), ("F32_CEIL", rf, rf, a.ceil()), ("F32_FLOOR", rf, rf, a.floor()),
         ("F32_TRUNC", rf, rf, a.trunc()), ("F32_NEAREST", rf, rf, a.nearest()),
         ("F64_SQRT", rd, rd, a.sqrt()), ("F64_CEIL", rd, rd, a.ceil()), ("F64_FLOOR", rd, rd, a.floor()),
@@ -389,7 +415,7 @@ pub vm W {
     }
     inline for (name, vk, ty, conv, size) in [
         ("I32_STORE", ri, i32, v, 4), ("I64_STORE", rl, i64, v, 8),
-        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rq, u64, v, 8),
+        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rd, f64, v, 8),
         ("I32_STORE8", ri, u8, v as u8, 1), ("I32_STORE16", ri, u16, v as u16, 2),
         ("I64_STORE8", rl, u8, v as u8, 1), ("I64_STORE16", rl, u16, v as u16, 2),
         ("I64_STORE32", rl, u32, v as u32, 4),

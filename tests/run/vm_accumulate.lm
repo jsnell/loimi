@@ -1,0 +1,121 @@
+// matrix: dispatch
+// `accumulator` and `#[accumulate]`: variants of an op that write their
+// result to an accumulator register (`__A..`) or read a source from one,
+// and `V.accumulate(code, first_temp)`, which picks them where a slot at
+// or above first_temp is written by one op and read only by the next.
+// The variants are verified like other ops: the operands they still take
+// from slots are checked, the ones in an accumulator are not fields.
+import std.io;
+import std.text;
+
+struct Frame { nregs: u64 }
+
+vm V {
+    state { pc: *u64, regs: *u64 }
+    verify_context f: *Frame;
+
+    operand ri = *((regs + it) as *i32) verify it < f.nregs;
+    operand rd = *((regs + it) as *f64) verify it < f.nregs;
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    accumulator iacc: u64 for ri;
+    accumulator facc: f64 for rd;
+
+    encoding fixed(u64) {
+        format RRR { op: 16, a: 16, b: 16, c: 16 }
+        format RI { op: 16, a: 16, imm: s32 }
+        format RRK { op: 16, a: 16, b: 16, k: s16 }
+    }
+
+    op LOADI(d: ri, v: imm) : RRR { d = v as i32; next }
+    #[accumulate] op ADD(d: ri, a: ri, b: ri) : RRR { d = a +% b; next }
+    #[accumulate] op SUB(d: ri, a: ri, b: ri) : RRR { d = a -% b; next }
+    #[accumulate] op ADDK(d: ri, a: ri, k: imm) : RRK { d = a +% (k as i32); next }
+    #[accumulate] op CVT(d: rd, a: ri) : RRR { d = a as f64; next }
+    #[accumulate] op FMUL(d: rd, a: rd, b: rd) : RRR { d = a * b; next }
+    // Reads its destination: only source variants.
+    #[accumulate] op FACC(d: rd, a: rd) : RRR { d = d + a; next }
+    #[accumulate] op BRNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    op RETF(a: rd) : RRR { exit (a * 10.0) as i64 }
+    op RETI(a: ri) : RRR { exit a as i64 }
+
+    entry run(code: Verified<V>, r: *u64) -> i64 {
+        regs = r;
+        jump code
+    }
+}
+
+fn show(code: []u64) {
+    var i: u64 = 0;
+    while i < code.len {
+        io.print(V.op_name(code[i]));
+        io.print(" ");
+        i += V.op_size(code[i]);
+    }
+}
+
+fn go(code: []u64, first_temp: u64) {
+    var regs: [u64; 8] = [0; 8];
+    var f = Frame { nregs: 8 };
+    V.accumulate(code, first_temp);
+    show(code);
+    match V.verify(code, &f) {
+        Ok(v) => io.print_int(V.run(v, &regs[0])),
+        Err(e) => {
+            var b = text.StrBuf.new();
+            e.write(&b);
+            io.print(b.as_str());
+            b.free();
+        }
+    }
+    io.println("");
+}
+
+fn main() {
+    var code: [u64; 16] = [0; 16];
+    // ((r0 + r1) - r2 + 1) as f64 * r3, temporaries r4..: one chain.
+    code[0] = V.LOADI(0, 9);
+    code[1] = V.LOADI(1, 5);
+    code[2] = V.LOADI(2, 4);
+    code[3] = V.ADD(4, 0, 1);
+    code[4] = V.SUB(4, 4, 2);       // r4 - r2: the first source
+    code[5] = V.ADDK(5, 4, 1);
+    code[6] = V.CVT(6, 5);
+    code[7] = V.LOADI(3, 3);
+    code[8] = V.CVT(3, 3);
+    code[9] = V.FMUL(7, 3, 6);      // r6 is not read by the next op: stays a slot
+    code[10] = V.FMUL(7, 3, 7);     // the second source
+    code[11] = V.RETF(7);
+    go(code[0..12], 4);
+    // The same with first_temp 8: nothing is a temporary.
+    code[3] = V.ADD(4, 0, 1);
+    code[4] = V.SUB(4, 4, 2);
+    code[5] = V.ADDK(5, 4, 1);
+    code[6] = V.CVT(6, 5);
+    code[9] = V.FMUL(7, 3, 6);
+    code[10] = V.FMUL(7, 3, 7);
+    go(code[0..12], 8);
+    // Not chained: the next op reads the slot twice (r4 + r4), or is a
+    // jump target, or (FACC) reads its destination, which stays a slot.
+    code[0] = V.LOADI(0, 3);
+    code[1] = V.ADDK(4, 0, 1);      // r4 = 4
+    code[2] = V.ADD(5, 4, 4);       // r5 = 8, the loop's target
+    code[3] = V.ADDK(0, 0, -1);
+    code[4] = V.ADDK(6, 0, 0);
+    code[5] = V.BRNZ(6, -3);        // reads the accumulator
+    code[6] = V.CVT(7, 5);
+    code[7] = V.FACC(7, 7);         // r7 read twice: stays
+    code[8] = V.RETF(7);
+    go(code[0..9], 4);
+    // A variant's slot operands are still verified.
+    code[0] = V.LOADI(0, 2);
+    code[1] = V.ADD(4, 0, 0);
+    code[2] = V.ADD(5, 4, 9);       // r9 is out of range
+    code[3] = V.RETI(5);
+    go(code[0..4], 4);
+}
+// expect: LOADI LOADI LOADI ADD__ARR SUB__AAR ADDK__AA CVT__RA LOADI CVT FMUL__ARR FMUL__RRA RETF 990
+// expect: LOADI LOADI LOADI ADD SUB ADDK CVT LOADI CVT FMUL FMUL RETF 990
+// expect: LOADI ADDK ADD ADDK ADDK__AR BRNZ__A CVT FACC RETF 160
+// expect: LOADI ADD__ARR ADD__RAR RETI word 2 (ADD__RAR): operand `b` (ri) fails `it < f.nregs`

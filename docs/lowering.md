@@ -287,9 +287,8 @@ Notes:
   `state { .., acc: f64 }` is `xmm0` in every handler: an op
   `acc = acc * a` is `mulsd (%r14,%rdx,8),%xmm0` and the dispatch, with no
   load or store of `acc` (checked with LLVM 19 on x86-64). That is
-  wasm3's `fp0`; a vm that wants it needs ops that read and write the
-  accumulator and a translator that keeps a value there between adjacent
-  ops.
+  wasm3's `fp0`. An `accumulator` declaration (language.md §7.4) adds
+  such a state variable and derives the ops that read and write it.
 - **The dispatch table's address.** On x86-64 an executable (`-fno-pic`)
   indexes the table as an absolute address. Whether the load folds into
   the jump depends only on how many values the tail call passes in

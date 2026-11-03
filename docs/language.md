@@ -1030,6 +1030,7 @@ type.
 | `Vm.stack_effect(w) -> ?(u32, u32)`, `Vm.stack_effect_text(w) -> str`, `v.max_stack() -> u32` | stack VMs: an op's declared (pops, pushes) when they depend only on its operands, its effect as text, and the verified maximum depth (section 3.4a) |
 | `Vm.optimize(v)`, `Vm.optimize_words(code)` | superinstruction peephole (section 7.3) |
 | `Vm.deopt(v)`, `Vm.deopt_words(code)` | back to generic ops, supers split, caches zeroed (section 7.2) |
+| `Vm.accumulate(code, first_temp)`, `Vm.acc_variant(op, d, s) -> W` | accumulator variant selection, before verification (vms with an `accumulator`, section 7.4) |
 | `Vm.real_word(w) -> W` | the real word behind a JIT enter word (below) |
 | `Vm.depth: u32` | thread-local count of active nested runs, if the vm has a nested entry (section 10) |
 | `Vm.ENTRY(..)` | each `entry` (section 3.6) |
@@ -2147,6 +2148,92 @@ In a library (`--lib`, `--shared`) the report prints when the host
 process exits; several such libraries can link into one host (the stats
 runtime's symbols are weak, and named by a hash of its source). (**Not built:** a separate `loimi vm suggest-supers`
 command.)
+
+### 7.4 Accumulators
+
+A register vm passes every intermediate value through a slot: in `x*y + z`
+the multiply stores its product and the add loads it back, a store and a
+load of the same address on the critical path, and each op decodes three
+fields. wasm3 keeps one value in a machine register across ops (`r0` for
+integers, `fp0` for floats) and has a variant of each op per operand that
+can be that register. Loimi derives such variants:
+
+<!-- snippet: check
+vm V {
+    state { pc: *u64, regs: *u64 }
+    operand ri = *((regs + it) as *i32);
+    operand rl = *((regs + it) as *i64);
+    operand rd = *((regs + it) as *f64);
+    operand imm = it;
+    encoding fixed(u64) { format RRR { op: 16, a: 16, b: 16, c: 16 } }
+{snippet}
+    op RET(a: rd) : RRR { exit a }
+    entry run(code: *u64, r: *u64) -> f64 { regs = r; jump code }
+}
+-->
+```loimi
+accumulator iacc: u64 for ri, rl;     // integer views of a slot
+accumulator facc: f64 for rd;
+
+#[accumulate] op ADD(d: ri, a: ri, b: ri) : RRR { d = a +% b; next }
+#[accumulate] op CVT(d: rd, a: ri) : RRR { d = a as f64; next }
+#[accumulate] op FMUL(d: rd, a: rd, b: rd) : RRR { d = a * b; next }
+```
+
+An `accumulator` is a state register (zeroed by every entry; in tail-call
+mode a handler argument, so it stays in a machine register: a float one in
+`xmm0`, section 3 of `lowering.md`) for values of the listed operand
+kinds. Each kind must be a place whose type the declaration spells
+(`*(E as *T)`, or `s[it]` for a state variable `s: *T`) and a number of
+the accumulator's class: integers for an integer accumulator, floats for
+a float one (the value is converted with `as`, so an `i32` view of a
+`u64` accumulator reads its low 32 bits). Accumulators hold numbers
+only: no GC references, so a value in one needs no rooting.
+
+`#[accumulate]` on an op derives its **variants**: the operand of an
+accumulator's kind that the body only assigns (`d = ..`) is the result,
+and those it never assigns are sources. There is one variant per choice
+of result (slot or accumulator) and of at most one source taken from an
+accumulator, except the op itself: `ADD` gets `ADD__ARR` (`iacc = a +% b`),
+`ADD__AAR` (`iacc = iacc +% b`), `ADD__ARA`, `ADD__RAR` (`d = iacc +% b`)
+and `ADD__RRA`; the letters stand for the result and the sources in operand
+order, `A` for the accumulator. A variant has the op's format and operand
+positions; an operand in an accumulator keeps its field, which the
+handler ignores and the verifier does not check (it shows as `d__acc` in
+the disassembly). The variants are ordinary ops after the declared ones:
+they get handlers, opcodes (`Vm.OP_ADD__ARR`), `--vm-stats` counts, and
+can be parts of supers. An op whose result is also read (`d = d + a`)
+gets source variants only; an op without operands of an accumulator's
+kind gets none, so an `inline for` may mark a whole table. The vm item
+`accumulate ADD, CVT, FMUL;` marks the ops it names, for picking a few
+ops out of `inline for` tables: every variant is an opcode and a
+handler, and in goto mode all handlers are one function, whose
+compilation time and memory grow faster than linearly (the wasm
+interpreter marks 90 ops, which gives 287 variants: 669 opcodes instead
+of 382, and its goto build takes 1 GB; marking every op with an operand
+of an accumulator's kind gave about 660 variants, and the goto build no
+longer fit in 2.5 GB).
+
+`Vm.accumulate(code, first_temp)` selects them, on unverified words
+before `Vm.verify`: where an op writes a slot at or above `first_temp`
+that the next op reads as a source of the same accumulator and names in
+no other field, and that next op is not a jump target (a `pc + it`
+operand of some op in `code`), the first gets a variant that writes the
+accumulator and the second one that reads it (chains continue: `ADD`,
+`ADDK`, `CVT` can become `ADD__ARR`, `ADDK__AA`, `CVT__RA`). The caller
+promises what makes this correct: a value written to a slot at or above
+`first_temp` is read at most once, by the first op that reads it after
+the write. That is the case for a translator's operand stack
+temporaries, which are popped once (the wasm interpreter passes the
+first operand stack home, `examples/wasm/compile.lm`). A broken promise
+gives wrong values, not memory unsafety: accumulators hold numbers, and
+the verifier still checks every operand that names a slot.
+`Vm.optimize` can run afterwards; supers whose parts are variants form
+like any other.
+
+What it gains (wasm interpreter, `examples/wasm/FRICTION.md`): a variant
+reading or writing the accumulator is 7 to 11 instructions where the slot
+form is 13 or 14, and a chain's values never touch memory.
 
 ---
 

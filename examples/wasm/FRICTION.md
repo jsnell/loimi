@@ -156,6 +156,85 @@ its old time across runs. fasta still trails wasm3 by about 12%: its
 inner loops are integer (`I32_REM_U` random numbers, a binary search
 with two `SELECT4`s), which these changes barely touch.
 
+### Accumulators (wasm3's `r0` and `fp0`), generated
+
+The float study above found wasm3's ops cost about half of Loimi's
+because one value lives in a machine register between ops. Loimi now
+derives such ops (`language.md` §7.4): `accumulator iacc: u64 for ri,
+ru, rl, rq; accumulator facc: f64 for rd;` adds two state registers
+(`facc` is `xmm0` in every handler), the vm item `accumulate I32_ADD,
+F64_MUL, F64_LOAD, BR_I32_LT_U, ..;` (90 ops) derives 287 variants
+(`F64_MUL__ARR`: `facc = a * b`; `F64_MUL__AAR`: `facc = facc * b`;
+`F64_STORE__RA`: store `facc`; ..), and `compile.lm` calls
+`W.accumulate(words, nlocals)` before verification: an op whose result
+goes to an operand stack home that the next op alone reads (and that is
+not a jump target) writes the accumulator, and the next op reads it.
+
+**Upper bound first** (hand-generated, not committed: a script wrote the
+variants of every eligible op and a table-driven pass in `compile.lm`).
+Best of 3 interleaved, `--align-functions=64`, seconds:
+
+| | base | base + supers | acc | acc + supers | wasm3 |
+|---|---:|---:|---:|---:|---:|
+| geomean (7) | 1.767 | 1.648 (0.933) | 1.640 (0.928) | 1.416 (0.801) | 1.854 |
+
+("supers": every super `--vm-stats` suggested on the seven benchmarks
+for that build, 31 for base and 45 for acc, `#[forward]`.) Accumulators
+alone gained 7%, and with the supers 14% over base with its supers: well
+over the 5% bar, so the generic feature was built.
+
+**Built** (the committed vm; best of 5 interleaved, `--align-functions=64`,
+tail calls, seconds; the machine was shared with another agent, so ±3%
+per benchmark is noise):
+
+| benchmark | wasm3 | before | acc | acc / before | acc / wasm3 | acc + supers |
+|---|---:|---:|---:|---:|---:|---:|
+| binarytrees | 1.543 | 1.534 | 1.483 | 0.97 | 0.96 | 1.455 |
+| coremark | 2.109 | 2.241 | 2.031 | 0.91 | 0.96 | 1.782 |
+| fannkuchredux | 1.713 | 1.649 | 1.528 | 0.93 | 0.89 | 1.370 |
+| fasta | 1.507 | 1.286 | 1.136 | 0.88 | 0.75 | 0.989 |
+| mandelbrot | 2.031 | 1.677 | 1.533 | 0.91 | 0.75 | 1.224 |
+| nbody | 2.064 | 2.075 | 1.959 | 0.94 | 0.95 | 1.665 |
+| spectralnorm | 2.020 | 2.007 | 1.658 | 0.83 | 0.82 | 1.391 |
+| **geomean** | 1.839 | 1.753 | **1.593** | **0.91** | **0.87** | 1.389 |
+
+"before" with its own 31 suggested supers measured 1.600 in the same
+run (0.91): accumulators are worth as much as a benchmark-tuned set of
+supers, without being tuned, and the two add up ("acc + supers", the 46
+supers `--vm-stats` suggests for the accumulator build: 0.79 of before,
+0.87 of before-plus-its-supers). The supers are not committed: most are
+four-op sequences of one benchmark's inner loop.
+
+**Dispatches and instructions.** Executed ops (`--vm-stats`), before and
+after: nbody 1.22 G to 1.80 G, spectralnorm 1.36 G to 1.76 G,
+mandelbrot 1.36 G to 1.64 G, fasta 0.75 G to 0.79 G, the others
+unchanged. More dispatches, because a variant breaks up the `#[forward]`
+supers the plain ops formed (`F64_MUL_F64_ADD`), yet faster: 44–74% of
+the executed ops are variants (29% on binarytrees), and a variant is
+7–11 instructions where the slot form is 13–14 (`F64_MUL__AAR`:
+`shr $0x30,%rcx; mulsd (%r14,%rcx,8),%xmm0` and the 5-instruction
+dispatch, which is wasm3's `op_f64_Multiply_rs` plus a table load), and
+on a chain no value is stored and loaded back. Plain handlers did not
+change (the two extra state registers cost no spills in `CALL`, `RET1`,
+`I32_ADD`, ..).
+
+**What it took in the vm.** Two kind changes: `F64_STORE` reads its
+value as `rd` (it was `rq`, an integer view, so a float chain could not
+end in it) and `F64_NEG` is `-a` on `rd` (was `a ^ sign` on `rq`; LLVM's
+`fneg` flips only the sign bit, as wasm requires). The `accumulate` list
+names 90 ops: marking every op with an operand of an accumulator's kind
+gave about 660 variants, and the goto-mode build (one function with
+every handler) ran out of its 2.5 GB address space in instruction
+selection; with 287 it takes 1 GB and 3.5 minutes.
+
+**Limits.** Selection is greedy left to right and per adjacent pair: in
+`x = a / b; y = load; x * y` the division keeps its slot because the
+load is in between. Values used twice (`local.tee`) and locals stay in
+slots (wasm3 has `_rs` ops with a slot result and `SetSlot`; Loimi's
+translator already writes results straight into locals). Stak, a stack
+vm that caches the top of stack in a state register by hand, has no
+slot operands for `accumulate` to replace: not applied.
+
 ## Summary
 
 | File | Lines | What |

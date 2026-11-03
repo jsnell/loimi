@@ -358,15 +358,21 @@ quickening on/off.
     own, the other operand and the result are `xmm0`, and the next
     handler's address is in the code stream). `#[forward]` supers close
     most of the gap on float chains, since a forwarded value skips the
-    store-to-load round trip. Open directions, none built:
-    - an accumulator state variable (`state { .., acc: f64 }` stays in
-      `xmm0`, lowering.md §3) with ops that read or write it, and help
-      from `std.bc` or the generated API to emit "result to `acc`" and
-      "operand from `acc`" variants;
-    - field decoding: three `mov`/`shr`/`movzwl` sequences per op; a
+    store-to-load round trip. Directions:
+    - *built*: accumulators (language.md §7.4): `accumulator facc: f64
+      for rd;` is a state register (`xmm0`), `#[accumulate]` derives
+      each op's "result to the accumulator" and "operand from it"
+      variants, and `Vm.accumulate` selects them where a temporary goes
+      from one op to the next. The wasm interpreter got 0.91 of its time
+      (geometric mean of seven programs; 0.87 of wasm3's), and 0.79 with
+      supers over the variants (`examples/wasm/FRICTION.md`). Open: the
+      goto-mode build's memory grows faster than the op count (the wasm
+      vm marks 90 ops, not all), and selection is a greedy pass over
+      adjacent pairs;
+    - not built: field decoding: three `mov`/`shr`/`movzwl` sequences per op; a
       format whose fields are pre-scaled byte offsets would drop the
       `movzwl` and the scaled addressing, and reading fields with narrow
       loads from `pc` (tried by reloading the word: LLVM does not narrow a
       load with several uses) would trade ALU work for loads;
-    - direct threading (handler addresses in the code words) for `u64`
+    - not built: direct threading (handler addresses in the code words) for `u64`
       words, which saves the table load and the opcode extraction.
