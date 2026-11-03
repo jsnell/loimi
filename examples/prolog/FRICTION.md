@@ -39,7 +39,7 @@ its goal exits leaving choicepoints).
 
 ## Friction items
 
-Ranked by how much they cost (time or performance), highest first.
+Roughly by how much they cost (time, performance or risk), highest first.
 
 ### 1. Every allocating or binding handler had a stack frame on every execution
 
@@ -86,13 +86,12 @@ it working out the free-list check.
 
 *Suggested fix.* std: `gc.has_room<T>(h, n)` (or a `try_new` returning
 `?Gc<T>`) documented as the way to allocate in a handler without a
-frame; or have the compiler outline the refill path of an inlined `new`
-in a handler the way it outlines `cold` blocks (a tail call to a stub
-that allocates and returns to the handler's continuation is not possible,
-but a `cold`-style split of the op at the allocation is). Language: the
-barrier's `remember` call in a handler could go through the same
-mechanism. Docs: say plainly in language.md §5.2 that `new` in a handler
-gives it a frame today.
+frame; or have the compiler split an op at an inlined `new` whose
+refill may run, the way it outlines `cold` blocks (the refill and the
+rest of the op in an outlined copy). The barrier's `remember` call in a
+handler could be treated the same way. Docs: say plainly in
+language.md §5.2 that `new` and reference stores in a handler give it a
+frame today, and show the free-list check.
 
 ### 2. The compiler emits a write barrier for stores of payload-free variants
 
@@ -145,7 +144,7 @@ symbol-char atoms, `''` inside quotes and `\NNN\` octal escapes closed by
 a backslash, none of which `Syntax` describes.
 
 *What I did.* A hand-written tokenizer and precedence parser (reader.lm,
-717 lines, half of it the parser).
+730 lines, half of it the parser).
 
 *Suggested fix.* A `Pratt` keyed by `u64` (or a hash map of operator
 definitions) that can change while parsing; for Prolog-family languages
@@ -228,13 +227,15 @@ indirect jumps can keep the proof.
 
 ## What worked well
 
-- **Rooting.** No GC bug of mine survived to a crash: everything the
-  machine keeps in registers is rooted by the compiler at `uses gc`
-  calls, the root scanner is short, and stress, verify (generational,
-  barrier checks) and `--gc-check-roots` runs passed from the first full
-  run. Only the deliberately raw stores (items 1, 2) needed thought
-  about barriers, and verify mode covers them.
-- **`value` types.** `Term` with seven variants, `match` on `(a, b)`,
+- **Rooting.** Not one rooting bug: everything the machine keeps in
+  registers is rooted by the compiler at `uses gc` calls, the root
+  scanner is 40 lines, and every failure the stress, verify
+  (generational, barrier checks) and `--gc-check-roots` runs found was a
+  bug in my clause compiler (the chunk mask below, unbounded recursion on
+  long lists), which collections at other moments exposed. Only the
+  deliberately raw stores (items 1, 2) needed thought about barriers, and
+  verify mode covers them.
+- **`value` types.** `Term` with eight variants, `match` on `(a, b)`,
   `==` on bits for atom/integer comparison, nanboxed floats: the head
   unification fast paths are a few instructions (below).
 - **The generated disassembler**, through a five-line `--disasm` switch,
