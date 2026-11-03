@@ -4,9 +4,9 @@
     bench/run_all.py [--quick] [-n RUNS] [--out DIR] [--only SUITE,...] [--report JSON]
 
 Builds each interpreter in all three dispatch modes (tailcall, goto,
-switch) and, for Mini, MiniJS and Scheme, a `--jit-stencils` build run
-with LOIMI_JIT=1, all with `--align-functions=64`, then runs the existing
-per-suite scripts with those binaries as columns:
+switch) and, for Mini, MiniJS, Scheme and Prolog, a `--jit-stencils` build
+run with LOIMI_JIT=1, all with `--align-functions=64`, then runs the
+existing per-suite scripts with those binaries as columns:
 
     mini      bench/mini/compare.py            vs PUC-Lua 5.4, LuaJIT -joff
     mini-coro bench/mini/coroutines/run.py     vs PUC-Lua 5.4, LuaJIT -joff
@@ -15,8 +15,12 @@ per-suite scripts with those binaries as columns:
     lox       bench/lox/compare.py             vs clox
     regex     rxhost bench + examples/regex/bench.py   vs PCRE2 (no JIT), Python re
     wasm      bench/wasm/bench.py              vs wasm3
+    wasm-simd bench/wasm/bench.py              vs the MVP builds (column mvp:
+              the wasm suite's tail-call time; wasm3 has no SIMD)
     stack     examples/stack/bench/run.py      (no reference)
     python    bench/python/compare.py          vs CPython 3.13, MicroPython
+    prolog    bench/prolog/run.py              vs SWI-Prolog (-O), Trealla (a run
+              over 10 s is not repeated: the JIT build on sieve, marked †)
 
 Every script interleaves its columns within a benchmark (bench.py does
 not, so it runs -n 1 in RUNS rounds here and keeps the minimum). Times
@@ -44,11 +48,22 @@ INTERPS = {
     "wasm": ("examples/wasm/main.lm", False),
     "stack": ("examples/stack/main.lm", False),
     "python": ("examples/python/main.lm", False),
+    "prolog": ("examples/prolog/main.lm", True),
 }
-SUITES = ["mini", "mini-coro", "minijs", "scheme", "lox", "regex", "wasm", "stack", "python"]
+SUITES = ["mini", "mini-coro", "minijs", "scheme", "lox", "regex", "wasm", "wasm-simd", "stack", "python",
+          "prolog"]
+# The MVP programs of bench/wasm/programs.sh and the SIMD builds of programs-simd.sh.
+WASM_MVP = ["binarytrees", "coremark", "fannkuchredux", "fasta", "mandelbrot", "nbody", "spectralnorm"]
+WASM_SIMD = ["fannkuchredux_simd", "nbody_simd", "spectralnorm_simd"]
+# (suite, column, benchmark) cells marked in the tables and left out of a
+# second geometric mean in the summary.
+PATHOLOGICAL = {
+    ("prolog", "jit", "sieve"): "every assert/retract makes code objects that are never freed, "
+                                "and the JIT compiles each one as it gets hot",
+}
 QUICK = {"mini": "fib", "mini-coro": "coroutine_ring", "minijs": "richards", "scheme": "fib",
          "lox": "fib", "regex": None, "wasm": "nbody", "stack": None,
-         "python": "richards"}
+         "python": "richards", "wasm-simd": "nbody_simd", "prolog": "nreverse"}
 # Reference columns per suite, in table order (name as the script prints it).
 REFS = {
     "mini": ["lua", "luajit-joff"],
@@ -60,6 +75,8 @@ REFS = {
     "wasm": ["wasm3"],
     "stack": [],
     "python": ["cpython", "micropython"],
+    "wasm-simd": ["mvp"],
+    "prolog": ["swipl", "trealla"],
 }
 
 
@@ -195,18 +212,34 @@ def run_suite(suite, out, n, quick):
         t = capture(suite, out, [sys.executable, os.path.join(ROOT, "bench/lox/compare.py"), "-n", str(n)] +
                     [f"{m}={e}" for m, e in exes.items()] + (["--"] + q if q else []))
         return parse_md(t, {})
-    if suite == "wasm":
-        exes = build_cache(out, suite)
+    if suite in ("wasm", "wasm-simd"):
+        exes = build_cache(out, "wasm")
         if not have(os.path.join(ROOT, "bench/wasm/programs-out"), "wasm programs (bench/wasm/programs.sh)"):
             return {}
-        args = [f"--interp=wasm3={os.path.join(ROOT, 'bench/wasm/install/bin/wasm3')} {{wasm}}"] \
-            if have(os.path.join(ROOT, "bench/wasm/install/bin/wasm3"), "wasm3") else []
+        if suite == "wasm-simd":
+            if not have(os.path.join(ROOT, "bench/wasm/programs-out/nbody_simd.wasm"),
+                        "wasm SIMD programs (bench/wasm/programs-simd.sh)"):
+                return {}
+            args = []
+        else:
+            args = [f"--interp=wasm3={os.path.join(ROOT, 'bench/wasm/install/bin/wasm3')} {{wasm}}"] \
+                if have(os.path.join(ROOT, "bench/wasm/install/bin/wasm3"), "wasm3") else []
         args += [f"--interp={m}={e} {{wasm}}" for m, e in exes.items()]
+        names = q or (WASM_SIMD if suite == "wasm-simd" else WASM_MVP)
         res = {}
         for _ in range(n):  # bench.py does not interleave: rounds of -n 1
-            t = capture(suite, out, [sys.executable, os.path.join(ROOT, "bench/wasm/bench.py"), "-n", "1"] + args + q)
+            t = capture(suite, out, [sys.executable, os.path.join(ROOT, "bench/wasm/bench.py"), "-n", "1"] +
+                        args + names)
             merge_min(res, parse_md(t, {}))
         return res
+    if suite == "prolog":
+        exes = build_cache(out, suite)
+        if not have(os.path.join(ROOT, "bench/prolog/programs"), "Prolog programs (bench/prolog/install.sh)"):
+            return {}
+        t = capture(suite, out, [sys.executable, os.path.join(ROOT, "bench/prolog/run.py"), "-n", str(n)] +
+                    [f"--exe={m}={e}" for m, e in exes.items()] + ["--slow", "10"] + q)
+        res = parse_md(t, {f"{c} s": c for c in MODES + ["jit"] + REFS["prolog"]})
+        return {b: {c: v for c, v in row.items() if c != "K"} for b, row in res.items()}
     if suite == "stack":
         exes = build_cache(out, suite)
         log("note: stack: no CPython versions of the Stak benchmarks in the repository; no reference column.")
@@ -279,7 +312,7 @@ def geo(xs):
 
 
 def ours(suite):
-    return MODES + (["jit"] if suite in ("mini", "mini-coro", "minijs", "scheme") else [])
+    return MODES + (["jit"] if suite in ("mini", "mini-coro", "minijs", "scheme", "prolog") else [])
 
 
 def fmt(v, prec=3):
@@ -292,6 +325,9 @@ def render(data):
         res = data.get(suite)
         if not res:
             continue
+        if suite == "wasm-simd":  # the MVP build's tail-call time as the reference
+            mvp = data.get("wasm", {})
+            res = {b: dict(row, mvp=mvp.get(b[:-len("_simd")], {}).get("tailcall")) for b, row in res.items()}
         cols = [c for c in ours(suite) if any(r.get(c) is not None for r in res.values())]
         refs = [r for r in REFS[suite] if any(x.get(r) is not None for x in res.values())]
         ms = suite == "regex"
@@ -304,7 +340,8 @@ def render(data):
         for b in sorted(res):
             row = res[b]
             k = 1000 if ms else 1
-            cells = [b] + [fmt(row.get(c) and row[c] * k, 1 if ms else 3) for c in cols + refs]
+            cells = [b] + [fmt(row.get(c) and row[c] * k, 1 if ms else 3) +
+                           ("†" if (suite, c, b) in PATHOLOGICAL else "") for c in cols + refs]
             for r in refs:
                 cells.append(fmt(ratio(row, cols[0], r), 2))
             for r in refs:
@@ -320,18 +357,31 @@ def render(data):
                 g.append("**" + fmt(geo([ratio(x, "jit", r) for x in res.values()]), 2) + "**")
         lines.append("| " + " | ".join(g) + " |")
         lines.append(f"\nTimes in {'milliseconds' if ms else 'seconds'}.\n")
+        for (s_, c, b), why in PATHOLOGICAL.items():
+            if s_ == suite and res.get(b, {}).get(c) is not None:
+                lines.append(f"† {c} on {b}: {why}.\n")
         for c in cols:
             s = {"suite": suite, "ours": c, "n": len(res)}
             for r in refs:
                 s[r] = geo([ratio(x, c, r) for x in res.values()])
             if c != "tailcall":
                 s["tailcall"] = geo([ratio(x, c, "tailcall") for x in res.values()])
+            bad = [b for (s_, c_, b) in PATHOLOGICAL if s_ == suite and c_ == c and b in res]
+            if bad:  # the same without the marked benchmarks
+                keep = [x for b, x in res.items() if b not in bad]
+                s["without"] = (", ".join(bad), len(keep), {r: geo([ratio(x, c, r) for x in keep]) for r in refs},
+                                geo([ratio(x, c, "tailcall") for x in keep]))
             summary.append(s)
     out = ["## Summary: geometric mean of ours / reference\n",
            "| interpreter | build | vs tailcall | references (ours / ref) |", "|---|---|---:|---|"]
     for s in summary:
         refs = ", ".join(f"{r} {fmt(s[r], 2)}" for r in REFS[s["suite"]] if s.get(r) is not None)
-        out.append(f"| {s['suite']} ({s['n']}) | {s['ours']} | {fmt(s.get('tailcall'), 2) if s['ours'] != 'tailcall' else '1'} | {refs or '—'} |")
+        vs = fmt(s.get('tailcall'), 2) if s['ours'] != 'tailcall' else '1'
+        if "without" in s:
+            bad, k, g, t = s["without"]
+            vs += f" ({fmt(t, 2)} without {bad})"
+            refs += f" ({', '.join(f'{r} {fmt(v, 2)}' for r, v in g.items() if v is not None)} over {k}, without {bad})"
+        out.append(f"| {s['suite']} ({s['n']}) | {s['ours']} | {vs} | {refs or '—'} |")
     return "\n".join(out) + "\n\n## Per suite\n\n" + "\n".join(lines)
 
 
