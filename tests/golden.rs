@@ -728,6 +728,38 @@ fn python_programs() {
     );
 }
 
+/// std.bigint against Python's int (tests/bigint/diff.py): 3000 random
+/// cases through the owned and GC APIs, then 1000 more with the GC
+/// collecting at every safepoint. Uses CPython from bench/python/install
+/// if it was built, else `python3` (int semantics are the same in every
+/// Python 3); skipped when there is neither.
+#[test]
+fn bigint_vs_python() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let built = root.join("bench/python/install/bin/python3");
+    let python = if built.exists() { built.to_string_lossy().to_string() } else { "python3".to_string() };
+    if Command::new(&python).arg("-c").arg("pass").output().is_err() {
+        eprintln!("bigint_vs_python: no python3, skipped");
+        return;
+    }
+    for extra in [&["--seed", "1"][..], &["--seed", "2", "--cases", "1000", "--stress"][..]] {
+        let out = Command::new(&python)
+            .arg(root.join("tests/bigint/diff.py"))
+            .arg(env!("CARGO_BIN_EXE_loimi"))
+            .args(extra)
+            .env("LOIMI_STD", root)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "tests/bigint/diff.py {:?} failed:\n{}{}",
+            extra,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// The WebAssembly interpreter (examples/wasm/check.sh --fast): a tail-call
 /// build with `-W error`, the C programs in tests/ compiled to wasm32 (when
 /// clang-19 and wasm-ld are there) and a subset of the official spec tests

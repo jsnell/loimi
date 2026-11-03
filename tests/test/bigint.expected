@@ -1,0 +1,14 @@
+test add_sub ... ok
+test mul_signs_and_karatsuba ... ok
+test divmod_floor_and_trunc ... ok
+test division_identity_large ... ok
+test shifts ... ok
+test bitwise_twos_complement ... ok
+test pow_cases ... ok
+test conversions ... ok
+test hashes_match_python ... ok
+test text_radix ... ok
+test caller_buffers ... ok
+test gc_objects ... ok
+
+test result: ok. 12 passed; 0 failed; 0 filtered out

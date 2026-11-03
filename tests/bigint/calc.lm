@@ -1,0 +1,177 @@
+// The std.bigint side of the differential test against CPython
+// (tests/bigint/diff.py writes the cases and checks the output).
+//
+// Reads a file of cases, one per line: an operation and its operands,
+// integers in hexadecimal with an optional `-`. Writes one result line
+// per case. Operations whose name starts with `g` go through the GC API
+// (`gc_add`, ...), the others through the owned `BigInt` API, so both
+// are checked against the same expected output. `LOIMI_GC_STRESS=1`
+// collects at every allocation.
+import std.io;
+import std.os;
+import std.mem;
+import std.text;
+import std.gc;
+import std.hash;
+import std.bigint;
+import std.bigint.{Num, BigInt, Big, Arg};
+
+fn int(s: str) -> BigInt {
+    if s.len > 0 and s[0] == '-' {
+        var x = bigint.parse(s[1..s.len], 16).unwrap();
+        x.neg = x.d.len != 0;
+        return x;
+    }
+    bigint.parse(s, 16).unwrap()
+}
+
+fn small(s: str) -> u64 { text.parse_int(s).unwrap() as u64 }
+
+fn put(o: *text.StrBuf, x: Num) { bigint.write(o, x, 10); }
+
+fn put_owned(o: *text.StrBuf, x: BigInt) {
+    var y = x;
+    bigint.write(o, y.num(), 10);
+    y.free();
+}
+
+fn arg(h: *gc.Heap, x: *BigInt) -> Arg uses gc {
+    // Small values go in unboxed, as an interpreter would pass them.
+    if let Some(v) = bigint.to_i64(x.num()) { return Arg.Small(v); }
+    Arg.Ref(bigint.gc_copy(h, x.num()))
+}
+
+fn main() uses gc {
+    var h = gc.Heap.new();
+    if let Some(s) = os.arg(2) { if s.len > 0 and s[0] == '1' { h.set_stress(true); } }
+    let input = io.read_file(os.arg(1).unwrap()).unwrap();
+    var o = text.StrBuf.new();
+    var w: mem.Vec<str> = mem.Vec.new();
+    var start: u64 = 0;
+    var i: u64 = 0;
+    while i <= input.len {
+        if i == input.len or input[i] == '\n' {
+            let line = input[start..i];
+            start = i + 1;
+            i += 1;
+            if line.len == 0 { continue; }
+            w.clear();
+            var ws: u64 = 0;
+            for j in 0..line.len + 1 {
+                if j == line.len or line[j] == ' ' {
+                    w.push(line[ws..j]);
+                    ws = j + 1;
+                }
+            }
+            run(&h, &o, w.items());
+            o.push('\n');
+            continue;
+        }
+        i += 1;
+    }
+    io.print(o.as_str());
+    o.free();
+    w.free();
+}
+
+fn run(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
+    let op = w[0];
+    if op[0] == 'g' { return run_gc(h, o, w); }
+    var a = int(w[1]);
+    match op {
+        "add" | "sub" | "mul" | "and" | "or" | "xor" | "fdiv" | "tdiv" | "cmp" => {
+            var b = int(w[2]);
+            let x = a.num();
+            let y = b.num();
+            match op {
+                "add" => put_owned(o, bigint.add(x, y)),
+                "sub" => put_owned(o, bigint.sub(x, y)),
+                "mul" => put_owned(o, bigint.mul(x, y)),
+                "and" => put_owned(o, bigint.bit_and(x, y)),
+                "or" => put_owned(o, bigint.bit_or(x, y)),
+                "xor" => put_owned(o, bigint.bit_xor(x, y)),
+                "cmp" => o.push_int(bigint.cmp(x, y) as i64),
+                _ => {
+                    match bigint.divmod(x, y, op.eq("fdiv")) {
+                        Some(qr) => {
+                            let (q, r) = qr;
+                            put_owned(o, q);
+                            o.push(' ');
+                            put_owned(o, r);
+                        }
+                        None => o.push_str("zerodiv"),
+                    }
+                }
+            }
+            b.free();
+        }
+        "not" => put_owned(o, bigint.bit_not(a.num())),
+        "pow" => put_owned(o, bigint.pow(a.num(), small(w[2]))),
+        "shl" => put_owned(o, bigint.shl(a.num(), small(w[2]))),
+        "shr" => put_owned(o, bigint.shr(a.num(), small(w[2]))),
+        "hash" => o.push_int(bigint.hash_py(a.num())),
+        "bitlen" => o.push_u64(bigint.bit_length(a.num())),
+        "i64" => match bigint.to_i64(a.num()) { Some(v) => o.push_int(v), None => o.push_str("none") },
+        // The f64 nearest to a, as its bits (hex), or inf.
+        "tof" => {
+            let f = bigint.to_f64(a.num());
+            if f == 1.0 / 0.0 or f == -1.0 / 0.0 { o.push_str("inf"); } else {
+                var bits: [u64; 1] = [f.to_bits(); 1];
+                bigint.write(o, bigint.of_limbs(&bits[0], 1, false), 16);
+            }
+        }
+        // int(f) for the f64 with bits a.
+        "fromf" => {
+            let f = f64.from_bits(bigint.to_u64(a.num()).unwrap());
+            match bigint.of_f64(f) { Some(x) => put_owned(o, x), None => o.push_str("none") }
+        }
+        // a in radix r, then parsed back (both directions checked).
+        "radix" => {
+            let r = small(w[2]) as u32;
+            let start = o.len();
+            bigint.write(o, a.num(), r);
+            let s = o.as_str()[start..o.len()];
+            let neg = s.len > 0 and s[0] == '-';
+            var back = bigint.parse(if neg { s[1..s.len] } else { s }, r).unwrap();
+            back.neg = neg;
+            if bigint.cmp(back.num(), a.num()) != 0 { o.push_str(" PARSE-MISMATCH"); }
+            back.free();
+        }
+        _ => o.push_str("unknown op"),
+    }
+    a.free();
+}
+
+fn run_gc(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
+    let op = w[0];
+    var a = int(w[1]);
+    let x = arg(h, &a);
+    a.free();
+    if op.eq("gnot") { put(o, bigint.gc_not(h, x).num()); return; }
+    if op.eq("gpow") { put(o, bigint.gc_pow(h, x, small(w[2])).num()); return; }
+    if op.eq("gshl") { put(o, bigint.gc_shl(h, x, small(w[2])).num()); return; }
+    if op.eq("gshr") { put(o, bigint.gc_shr(h, x, small(w[2])).num()); return; }
+    var b = int(w[2]);
+    let y = arg(h, &b);
+    b.free();
+    match op {
+        "gadd" => put(o, bigint.gc_add(h, x, y).num()),
+        "gsub" => put(o, bigint.gc_sub(h, x, y).num()),
+        "gmul" => put(o, bigint.gc_mul(h, x, y).num()),
+        "gand" => put(o, bigint.gc_and(h, x, y).num()),
+        "gor" => put(o, bigint.gc_or(h, x, y).num()),
+        "gxor" => put(o, bigint.gc_xor(h, x, y).num()),
+        "gfdiv" | "gtdiv" => {
+            match bigint.gc_divmod(h, x, y, op.eq("gfdiv")) {
+                Some(qr) => {
+                    let (q, r) = qr;
+                    put(o, q.num());
+                    o.push(' ');
+                    put(o, r.num());
+                }
+                None => o.push_str("zerodiv"),
+            }
+        }
+        _ => o.push_str("unknown op"),
+    }
+}

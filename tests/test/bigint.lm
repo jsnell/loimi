@@ -1,0 +1,288 @@
+// Unit tests of std.bigint (`loimi test bigint.lm`); the differential
+// test against CPython is tests/bigint/diff.py.
+import std.test;
+import std.text;
+import std.mem;
+import std.gc;
+import std.bigint;
+import std.bigint.{Num, BigInt, Big, Arg};
+
+fn main() {}
+
+/// A decimal numeral with an optional sign.
+fn n(s: str) -> BigInt {
+    if s[0] == '-' {
+        var x = bigint.parse(s[1..s.len], 10).unwrap();
+        x.neg = x.d.len != 0;
+        return x;
+    }
+    bigint.parse(s, 10).unwrap()
+}
+
+/// x in `radix` (the buffer leaks: tests are short).
+fn str_r(x: Num, radix: u32) -> str {
+    var b = text.StrBuf.new();
+    bigint.write(&b, x, radix);
+    b.as_str()
+}
+
+fn s(x: Num) -> str { str_r(x, 10) }
+
+fn so(x: BigInt) -> str { var y = x; s(y.num()) }
+
+#[test]
+fn add_sub() {
+    var a = n("18446744073709551615");      // 2^64 - 1
+    var one = n("1");
+    test.eq(so(bigint.add(a.num(), one.num())), "18446744073709551616");
+    test.eq(so(bigint.sub(one.num(), a.num())), "-18446744073709551614");
+    test.eq(so(bigint.sub(a.num(), a.num())), "0");
+    var b = n("-340282366920938463463374607431768211456");   // -2^128
+    test.eq(so(bigint.add(b.num(), one.num())), "-340282366920938463463374607431768211455");
+    test.eq(so(bigint.sub(one.num(), b.num())), "340282366920938463463374607431768211457");
+    test.eq(so(bigint.add(b.num(), bigint.neg(b.num()))), "0");
+    test.eq(bigint.sign(bigint.add(b.num(), bigint.neg(b.num())).num()), 0);
+}
+
+#[test]
+fn mul_signs_and_karatsuba() {
+    var a = n("-123456789012345678901234567890");
+    var b = n("987654321098765432109876543210");
+    test.eq(so(bigint.mul(a.num(), b.num())), "-121932631137021795226185032733622923332237463801111263526900");
+    test.eq(so(bigint.mul(a.num(), a.num())), "15241578753238836750495351562536198787501905199875019052100");
+    var z = n("0");
+    test.eq(so(bigint.mul(a.num(), z.num())), "0");
+    // (x + y)^2 == x^2 + 2xy + y^2 with operands far above the
+    // Karatsuba threshold and of unequal sizes.
+    var three = n("3");
+    var x = bigint.pow(three.num(), 20000);       // 497 limbs
+    var y = bigint.pow(n("-7").num(), 5000);       // 220 limbs
+    var sum = bigint.add(x.num(), y.num());
+    var lhs = bigint.mul(sum.num(), sum.num());
+    var x2 = bigint.mul(x.num(), x.num());
+    var y2 = bigint.mul(y.num(), y.num());
+    var xy = bigint.mul(x.num(), y.num());
+    var xy2 = bigint.shl(xy.num(), 1);
+    var r1 = bigint.add(x2.num(), xy2.num());
+    var rhs = bigint.add(r1.num(), y2.num());
+    test.eq(bigint.cmp(lhs.num(), rhs.num()), 0);
+    test.assert(bigint.eq(lhs.num(), rhs.num()));
+}
+
+#[test]
+fn divmod_floor_and_trunc() {
+    let cases: [(str, str, str, str, str, str); 6] = [
+        // a, b, floor q, floor r, trunc q, trunc r
+        ("7", "2", "3", "1", "3", "1"),
+        ("-7", "2", "-4", "1", "-3", "-1"),
+        ("7", "-2", "-4", "-1", "-3", "1"),
+        ("-7", "-2", "3", "-1", "3", "-1"),
+        ("-1", "100000000000000000000000", "-1", "99999999999999999999999", "0", "-1"),
+        ("340282366920938463463374607431768211455", "-18446744073709551616",
+         "-18446744073709551616", "-1", "-18446744073709551615", "18446744073709551615"),
+    ];
+    for c in cases {
+        let (sa, sb, fq, fr, tq, tr) = c;
+        var a = n(sa);
+        var b = n(sb);
+        let (q1, r1) = bigint.divmod(a.num(), b.num(), true).unwrap();
+        test.eq(so(q1), fq);
+        test.eq(so(r1), fr);
+        let (q2, r2) = bigint.divmod(a.num(), b.num(), false).unwrap();
+        test.eq(so(q2), tq);
+        test.eq(so(r2), tr);
+    }
+    var z = n("0");
+    var one = n("1");
+    test.assert(bigint.divmod(one.num(), z.num(), true).is_none());
+}
+
+#[test]
+fn division_identity_large() {
+    // a == q * b + r and 0 <= r < |b| for b positive, many sizes.
+    var seed: u64 = 12345;
+    for i in 1..40 {
+        var buf_a: mem.Vec<u64> = mem.Vec.new();
+        var buf_b: mem.Vec<u64> = mem.Vec.new();
+        for _j in 0..(i * 7) {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            buf_a.push(seed);
+        }
+        for _j in 0..i {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            // A top limb with the high bit set or not, to vary the
+            // normalization shift; runs of ones find the add-back step.
+            buf_b.push(if (i % 3) == 0 { 0xffffffffffffffff } else { seed >> (i as u64 % 64) });
+        }
+        let a = bigint.of_limbs(buf_a.ptr, buf_a.len, false);
+        let b = bigint.of_limbs(buf_b.ptr, buf_b.len, false);
+        let (q0, r0) = bigint.divmod(a, b, true).unwrap();
+        var q = q0;
+        var r = r0;
+        var qb = bigint.mul(q.num(), b);
+        var back = bigint.add(qb.num(), r.num());
+        test.eq(bigint.cmp(back.num(), a), 0);
+        test.assert(bigint.cmp(r.num(), b) < 0);
+        test.assert(bigint.sign(r.num()) >= 0);
+    }
+}
+
+#[test]
+fn shifts() {
+    var a = n("-5");
+    test.eq(so(bigint.shr(a.num(), 1)), "-3");          // floor
+    test.eq(so(bigint.shr(a.num(), 100)), "-1");
+    test.eq(so(bigint.shl(a.num(), 64)), "-92233720368547758080");
+    var b = n("-18446744073709551616");                 // -2^64
+    test.eq(so(bigint.shr(b.num(), 64)), "-1");
+    test.eq(so(bigint.shr(b.num(), 65)), "-1");
+    test.eq(so(bigint.shr(b.num(), 63)), "-2");
+    var c = n("18446744073709551617");
+    test.eq(so(bigint.shr(c.num(), 64)), "1");
+    test.eq(so(bigint.shr(c.num(), 1000)), "0");
+}
+
+#[test]
+fn bitwise_twos_complement() {
+    var a = n("-12");
+    var b = n("10");
+    test.eq(so(bigint.bit_and(a.num(), b.num())), "0");
+    test.eq(so(bigint.bit_or(a.num(), b.num())), "-2");
+    test.eq(so(bigint.bit_xor(a.num(), b.num())), "-2");
+    test.eq(so(bigint.bit_not(a.num())), "11");
+    test.eq(so(bigint.bit_not(b.num())), "-11");
+    var z = n("0");
+    test.eq(so(bigint.bit_not(z.num())), "-1");
+    var c = n("-18446744073709551616");                 // -2^64
+    var d = n("-1");
+    test.eq(so(bigint.bit_and(c.num(), d.num())), "-18446744073709551616");
+    test.eq(so(bigint.bit_xor(c.num(), d.num())), "18446744073709551615");
+    var e = n("-340282366920938463463374607431768211455"); // -(2^128 - 1)
+    test.eq(so(bigint.bit_and(e.num(), c.num())), "-340282366920938463463374607431768211456");
+}
+
+#[test]
+fn pow_cases() {
+    var z = n("0");
+    var m = n("-1");
+    var two = n("2");
+    test.eq(so(bigint.pow(z.num(), 0)), "1");
+    test.eq(so(bigint.pow(z.num(), 5)), "0");
+    test.eq(so(bigint.pow(m.num(), 7)), "-1");
+    test.eq(so(bigint.pow(m.num(), 8)), "1");
+    test.eq(so(bigint.pow(two.num(), 100)), "1267650600228229401496703205376");
+    var t = n("-3");
+    test.eq(so(bigint.pow(t.num(), 41)), "-36472996377170786403");
+}
+
+#[test]
+fn conversions() {
+    var buf: [u64; 1] = [0; 1];
+    test.eq(bigint.to_i64(bigint.from_i64(buf[0..1], -9223372036854775807 - 1)).unwrap(), -9223372036854775807 - 1);
+    var big = n("9223372036854775808");
+    test.none(bigint.to_i64(big.num()));
+    test.eq(bigint.to_i64(bigint.neg(big.num())).unwrap(), -9223372036854775807 - 1);
+    test.eq(bigint.to_u64(big.num()).unwrap(), 9223372036854775808);
+    test.none(bigint.to_u64(bigint.neg(big.num())));
+    test.eq(bigint.to_u64_wrapping(bigint.neg(big.num())), 9223372036854775808);
+    test.eq(bigint.bit_length(big.num()), 64);
+    // to_f64 rounds to nearest, ties to even (2^53 + 1 is a tie).
+    var t = n("9007199254740993");
+    test.eq(bigint.to_f64(t.num()), 9007199254740992.0);
+    var u = n("9007199254740995");
+    test.eq(bigint.to_f64(u.num()), 9007199254740996.0);
+    // A tie far above 64 bits, broken by a low bit: rounds up.
+    var w = n("85070591730234625310576617597232480257");   // (2^53+1) * 2^73 + 1
+    test.eq(bigint.to_f64(w.num()), 85070591730234634755309583336522907648.0);
+    var w2 = n("85070591730234625310576617597232480256");  // the tie itself: to even
+    test.eq(bigint.to_f64(w2.num()), 85070591730234615865843651857942052864.0);
+    var two = n("2");
+    var huge = bigint.pow(two.num(), 1024);
+    test.eq(bigint.to_f64(huge.num()), 1.0 / 0.0);
+    test.eq(so(bigint.of_f64(1.0e20).unwrap()), "100000000000000000000");
+    test.eq(so(bigint.of_f64(-2.5).unwrap()), "-2");
+    test.eq(so(bigint.of_f64(0.75).unwrap()), "0");
+    test.eq(so(bigint.of_f64(1.7976931348623157e308).unwrap()).len, 309);
+    test.none(bigint.of_f64(0.0 / 0.0));
+}
+
+#[test]
+fn hashes_match_python() {
+    test.eq(bigint.hash_i64(-1), -2);
+    test.eq(bigint.hash_i64(5), 5);
+    test.eq(bigint.hash_i64(2305843009213693951), 0);     // 2^61 - 1
+    test.eq(bigint.hash_i64(-2305843009213693952), -1 - 1);    // hash(-2^61) == -2
+    var a = n("18446744073709551616");                     // 2^64: 8
+    test.eq(bigint.hash_py(a.num()), 8);
+    var b = n("-340282366920938463463374607431768211456"); // -2^128: -64
+    test.eq(bigint.hash_py(b.num()), -64);
+}
+
+#[test]
+fn text_radix() {
+    var a = n("-255");
+    test.eq(str_r(a.num(), 16), "-ff");
+    test.eq(str_r(a.num(), 2), "-11111111");
+    test.eq(str_r(a.num(), 36), "-73");
+    test.eq(str_r(a.num(), 7), "-513");
+    var z = n("0");
+    test.eq(str_r(z.num(), 16), "0");
+    test.eq(so(bigint.parse("ZZ", 36).unwrap()), "1295");
+    test.eq(so(bigint.parse("0000000000000000000000000000012", 10).unwrap()), "12");
+    test.none(bigint.parse("", 10));
+    test.none(bigint.parse("12a", 10));
+    test.none(bigint.parse("-1", 10));
+    test.none(bigint.parse("2", 2));
+    // Divide-and-conquer formatting: 10^1000 - 1 is a thousand nines,
+    // 10^1000 a one and a thousand zeros (pads the low halves).
+    var ten = n("10");
+    var p = bigint.pow(ten.num(), 1000);
+    let ps = s(p.num());
+    test.eq(ps.len, 1001);
+    test.eq(ps[0], '1');
+    var all_zero = true;
+    for i in 1..ps.len { if ps[i] != '0' { all_zero = false; } }
+    test.assert(all_zero);
+    var one = n("1");
+    let ns = so(bigint.sub(p.num(), one.num()));
+    test.eq(ns.len, 1000);
+    var all_nine = true;
+    for i in 0..ns.len { if ns[i] != '9' { all_nine = false; } }
+    test.assert(all_nine);
+    var back = bigint.parse(ps, 10).unwrap();
+    test.assert(bigint.eq(back.num(), p.num()));
+}
+
+#[test]
+fn caller_buffers() {
+    // The core API: results land at the start of the caller's buffer.
+    var out: [u64; 4] = [7; 4];
+    var x: [u64; 1] = [0; 1];
+    var y: [u64; 1] = [0; 1];
+    let a = bigint.from_i64(x[0..1], -3);
+    let b = bigint.from_u64(y[0..1], 0xffffffffffffffff);
+    test.eq(bigint.mul_size(a, b), 2);
+    let r = bigint.mul_into(out[0..4], a, b);
+    test.eq(r.d.ptr as u64, (&out[0]) as u64);
+    test.eq(s(r), "-55340232221128654845");
+    test.eq(bigint.add_size(a, b), 2);
+}
+
+#[test]
+fn gc_objects() uses gc {
+    var h = gc.Heap.new();
+    h.set_stress(true);
+    let a = bigint.gc_parse(&h, "123456789012345678901234567890", 10).unwrap();
+    let b = bigint.gc_mul(&h, Arg.Ref(a), Arg.Ref(a));
+    let c = bigint.gc_add(&h, Arg.Ref(b), Arg.Small(-1));
+    test.eq(s(c.num()), "15241578753238836750495351562536198787501905199875019052099");
+    let (q, r) = bigint.gc_divmod(&h, Arg.Ref(c), Arg.Ref(a), true).unwrap();
+    test.eq(s(q.num()), "123456789012345678901234567889");
+    test.eq(s(r.num()), "123456789012345678901234567889");
+    test.eq(s(bigint.gc_shl(&h, Arg.Small(1), 70).num()), "1180591620717411303424");
+    test.eq(s(bigint.gc_pow(&h, Arg.Small(-2), 65).num()), "-36893488147419103232");
+    test.eq(s(bigint.gc_from_f64(&h, 1.0e30).unwrap().num()), "1000000000000000019884624838656");
+    test.eq(s(bigint.gc_not(&h, Arg.Small(0)).num()), "-1");
+    test.eq(s(bigint.gc_neg(&h, Arg.Ref(a)).num()), "-123456789012345678901234567890");
+    h.free();
+}
