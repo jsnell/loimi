@@ -962,7 +962,7 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   a `vm` declaration. *Lifetimes are not checked*: a pointer or slice into
   a `Vec` or map dangles once it grows or is freed, and `&local` may
   outlive its function. `std.lex`, `std.parse`, `std.diag`, `std.text`,
-  `std.hash`, `std.io` and `std.bc` are `#![safe]`; see
+  `std.hash`, `std.io`, `std.bc` and `std.map` are `#![safe]`; see
   `docs/design/safety.md` for the rule's holes and the cost.
 
   <!-- snippet: fail "indexing a raw pointer"

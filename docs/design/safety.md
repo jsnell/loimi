@@ -15,9 +15,9 @@ arithmetic, `p.slice(n)`, casts to pointers, another module's buffer
 pointers, C calls, functions marked `#[raw]`) needs `unsafe { }`. What
 is not checked is *lifetime*: a `*T` or slice obtained from a container
 dangles once the container grows, shrinks or is freed, and nothing
-stops safe code from keeping it (section 2). Seven std modules (`lex`,
-`parse`, `diag`, `text`, `hash`, `io`, `bc`) are now safe; `map` and
-`dict` are in section 5. It is a check only: no example's IR changed
+stops safe code from keeping it (section 2). Eight std modules (`lex`,
+`parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`) are now safe;
+`dict` is not (section 5). It is a check only: no example's IR changed
 from adding `#![safe]` and `#[raw]`, and the migrations' own IR changes
 (slices instead of pointer arithmetic, so bounds checks) are measured
 in section 6.
@@ -119,7 +119,7 @@ unsafe { write(fd, s.ptr, s.len) }
    `--gc-check-roots` are the tools.
 3. **Trusted modules.** A `#![safe]` module is only as safe as the
    functions it calls in modules that are not: those must honor the
-   `#[raw]` contract above. std's are audited (section 4); an example
+   `#[raw]` contract above. std's are audited (section 3); an example
    interpreter's are not.
 4. **Uninitialized and zero values from elsewhere.** `..zero` cannot make
    a null `*T` in a safe module, but a non-safe module can hand one over
@@ -199,6 +199,7 @@ next growth, and `Arena.free`.
 | `text` | 2 | | +23 −22 | `StrBuf.push_str` is `bytes.extend(s)`; `Interner`'s slot table is a `Vec<u64>` (bounds-checked `at`/`set`); `parse_f64` copies into its buffer by a checked loop; `snprintf`/`strtod` in `unsafe` |
 | `io` | 4 | `free_file` | +67 −48 | one `write_some(fd, s: []u8)` helper and one `format_g14` (the two C calls); `Out` buffers in a `Vec<u8>` (`extend`, `push`); `read_file` (C stdio) is one `unsafe` block; `free_file` frees what `read_file` returned |
 | `bc` | 0 | | +7 −4 | `relax`'s position table is a `Vec<u64>` slice; `unreachable` → `trap()` |
+| `map` | 21 | 7 (`probe_*`) | +266 −126 | section 5 |
 | `mem` | — | 10 functions | +39 | `#[raw]` on `alloc`, `try_alloc`, `grow`, `release`, `copy`, `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`, `Malloc.free_bytes`; new `Vec.extend(s)` and `Vec.filled(n, x)` |
 
 The `unsafe` blocks, each with its one-line justification:
@@ -234,7 +235,47 @@ complicated); `debug` belongs to another work stream.
 
 ## 5. `std.map` and `std.dict`
 
-MAPDICT
+**`std.map` is `#![safe]`**, with 21 `unsafe` blocks, all of them
+over the tables' own invariants (`slots` holds `cap` slots, `cap` a
+power of two; an `OrderedMap`'s `idx` holds `mask + 1` slots naming
+entries below `used`, `used <= cap <=` the allocation), which only
+`map`'s own code can break since other modules cannot write the fields
+of a struct with raw pointers. `HashMap` goes through one private
+accessor, `slot(i)`, that masks the index (`m.slots + (i & (m.cap -
+1))`: in bounds by construction; LLVM folds the second mask), plus
+`new`, `grow` and `free`. The CPython-style probing core shared with
+`std.dict` (`probe_find`, `probe_slot_of`, `probe_lookup`, `probe_put`,
+`probe_rebuild`, `probe_kill`, `probe_find_with`) takes a raw index
+pointer, a mask and an entries pointer: it is `#[raw]`, one `unsafe`
+body each, with the contract documented. `OrderedMap` has ten blocks
+(allocation, resize, the probing methods, `clear`, `free`) and a
+bounds-checked entry accessor.
+
+Two soundness bugs in the API were fixed on the way:
+
+- `OrderedMap.entry(e)`, `set_value(e)` and `remove_at(e)` took any `e`
+  unchecked (out of bounds reads and writes; `remove_at` of a dead
+  entry looped forever). They now panic ("not a live entry index")
+  unless `e` is a live entry. No example uses `OrderedMap` on a hot path
+  (the Python interpreter's entry-index calls are on `dict.Dict`).
+- `HashMap.free` and `OrderedMap.free` released the table but kept its
+  capacity, so a later call on the map used freed memory. `free` now
+  points the map at a shared zeroed sentinel table (a fresh table for
+  slots over 512 bytes), which `grow`, `resize`, `clear` and `free` never
+  write or release, so the map stays usable and the next insert
+  allocates (`tests/run/map_free_reuse.lm`).
+
+**`std.dict` stays non-safe.** It is the same table in the GC heap: 41
+raw-pointer sites (14 `.ptr` reads of trailing arrays, 11 casts, 8
+pointer arithmetic, 8 pointer indexing), plus about 14 calls of the
+now-`#[raw]` probe core. Every probe passes `d.index.s.ptr` and
+`d.ents.e.ptr` (raw pointers into GC trailing arrays); write barriers
+take `Gc` objects cast to `*u8`; `place()` stores without barriers on
+purpose. A safe `dict` would need slice-taking probe functions (a
+bounds check per probe on Python's hottest path), a `gc.barrier` that
+takes a `Gc<T>`, and checked entry-index methods; without those it
+would be 15–20 `unsafe` blocks for little gain. Its public API keeps the
+`OrderedMap`-style unchecked entry indices, documented as such.
 
 ## 6. Cost
 
@@ -267,4 +308,12 @@ only at compile time or for printing (their IR differs in the same std
 functions only), and `lex`/`parse` did not change, so their front ends
 are unaffected.
 
-MAPCOST
+**`std.map`.** Release machine code: `HashMap.insert` is about 5% smaller
+in every interpreter (`probe` returns the slot pointer, so callers do
+not index again); `get` is unchanged or ±1 instruction (Wasm's
+`HashMap<[]u8, Extern>.get` 140 → 152 instructions); no op handler
+changed size. Benchmarks (best of 3 to 5, interleaved): Python within
+±3% (nqueens' 4% went away on a rerun), Lox geomean equal (0.46 vs 0.46
+of clox, per-benchmark swings flipping sign between runs), Prolog
+within ±3% except `mu` +4.8% (no handler changed: noise). No
+measurable cost.

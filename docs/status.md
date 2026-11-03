@@ -186,7 +186,8 @@ those builds.
   module marked `#![safe]` is checked: there a `*T` is a reference to
   one value, and indexing, arithmetic, pointer casts, other modules'
   buffer pointers and invariant fields, `extern` and `#[raw]` calls need
-  `unsafe { }`; lifetimes are not checked (`design/safety.md`).
+  `unsafe { }`; lifetimes are not checked. `std.lex`, `parse`, `diag`, `text`, `hash`,
+  `io`, `bc` and `map` are safe (`design/safety.md`).
   The example interpreters contain no `unsafe`: float reads of a
   register use `f64.from_bits(a as u64)` (compiled to a `double` load
   of the slot), and Mini's coroutine free hook uses `heap.on_free_gc`.

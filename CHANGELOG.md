@@ -188,8 +188,12 @@ implementation; `git log` has the details.
 ### Standard library
 
 - **Memory-safe std modules**: `std.lex`, `std.parse`, `std.diag`,
-  `std.text`, `std.hash`, `std.io` and `std.bc` are `#![safe]`, with a
-  handful of justified `unsafe` blocks around C calls. `mem.Vec` gained
+  `std.text`, `std.hash`, `std.io`, `std.bc` and `std.map` are
+  `#![safe]`, with justified `unsafe` blocks around C calls and the
+  hash tables' masked indexing. `OrderedMap.entry`/`set_value`/`remove_at`
+  panic on an index that is not a live entry (they read out of bounds
+  before), and `HashMap.free`/`OrderedMap.free` leave the map usable
+  (a later call used freed memory); the shared probe core is `#[raw]`. `mem.Vec` gained
   `extend(s)` (safe when `s` is the vector's own items: fixes a
   use-after-free in `StrBuf.push_str(b.as_str())`) and `filled(n, x)`;
   `io.free_file` is `#[raw]` ([design/safety.md](docs/design/safety.md)).
