@@ -41,7 +41,7 @@ i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
 [T; N]          // fixed array
 []T             // slice (ptr + len), bounds-checked; [] is the empty one
-*T, *mut T      // raw non-null pointers; null is ?*T
+*T, *mut T      // raw pointers; ?*T (None = null) for one that may be absent
 ?T              // option; ?*T is pointer-sized
 Result<T, E>
 Gc<T>           // traced reference into the GC heap (section 8)
@@ -135,12 +135,24 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   `if let`) each pattern tests the length and the bytes in turn.
 - **`..zero` in struct literals.** `Machine { heap: gc.Heap.new(), depth: 3, ..zero }`
   sets every field not given to zero. It is allowed only where zero is a
-  valid value that needs no constructor: integers, floats, `bool`, `?T`
-  (None), slices (empty) and arrays and tuples of those. A field of type
-  `*T` or `Gc<T>` (never null), a struct (its constructor may set
-  invariants), an enum, a `value` type or a function must be given, and
-  so must private (`__`) fields; the error names the field. It also works
-  in `const` and global initializers.
+  value that needs no constructor: integers, floats, `bool`, `?T` (None,
+  so `?*T`, `?Gc<T>` and `?fn(..)` too), slices (empty), raw pointers
+  `*T` (null) and arrays and tuples of those. A field of type `Gc<T>` or
+  `fn(..)`, a struct (its constructor may set invariants), an enum or a
+  `value` type must be given, and so must private (`__`) fields; the
+  error names the field (and suggests `?Gc<T>`/`?fn` for a reference).
+  It also works in `const` and global initializers.
+
+  The rule for pointers follows what the language already lets you
+  write without `unsafe`. A null `*T` is what `0 as *T` makes: a
+  placeholder for a field set before use (a vm's `stack_end`, `fp` or
+  `words`, filled in once the stack is allocated or the program
+  compiled), and dereferencing it crashes as in C. `?*T` remains the
+  type of a pointer that is *meant* to be absent, with the check at each
+  use. A null `Gc<T>` needs `unsafe`, and the collector and every reader
+  assume it refers to an object; a null function pointer would be a call
+  to address 0. Those stay required, and the field type that starts
+  empty is the option.
 - **Empty slices.** `[]` where a slice type is expected is the empty
   slice: `let s: []u32 = [];`, `f([])`, `x.words = [];`.
 - **Match guards.** `pat if cond => body` matches only when `cond` (which
@@ -172,12 +184,14 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The lints are `match_fallout`,
-  `super_overlap` (section 7.3) and `state_root` (section 8), and the
+  the warnings that remain into errors. The lints are `match_fallout` and
+  `super_overlap` (section 7.3), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
   (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
+  The retired `state_root` (section 8: traced state is now rooted
+  automatically) is still accepted by `#[allow(..)]`, with no effect.
 - **Attributes** are checked where they appear: an unknown or misplaced
   one is an error (with a "did you mean" for near misses), never
   ignored, since a misspelled `#[require_verified]` would silently drop
@@ -1240,10 +1254,12 @@ Rules:
   a type error.
 - **In handlers**, the compiler inserts the sync at each effectful call site:
   store `pc` and the stack top to `ctx.sync`, and spill live `Value`/`Gc`
-  locals into a per-vm temporary root area. With a moving collector it also
+  locals, and state variables of those types, into a per-vm temporary
+  root area. With a moving collector it also
   reloads them afterwards. Calls without effects pay nothing. (As built:
   the sync is the vm's `sync` block, and traced locals go into a
-  shadow-stack frame. **Not built:** a moving collector.)
+  shadow-stack frame, with copies of the traced state variables taken at
+  the call (section 8). **Not built:** a moving collector.)
 - **In plain vm functions** (section 3.5), effectful calls are synced in
   place exactly as in a handler, without declaring the effect: a vm
   function sees the calling handler's state through pointers and is
@@ -1840,10 +1856,42 @@ enough to make it precise and cheap:
   root scanners registered with `heap.add_scanner`. **Not built:**
   `Root<T>`, the `ctx.sync` area and roots generated from state kinds.)
   A **state variable of a traced type** (a stack VM's cached top of stack,
-  `state { .., tos: Value }`) lives in a register, which no scanner can
-  read: `sync` must store it (`ctx.tos = tos`) and the scanner mark the
-  copy. Lint `state_root` warns when vm code may collect and `sync` never
-  mentions such a variable. (The state is not rooted automatically.)
+  `state { .., tos: Value }`, or a current closure, `cl: Gc<Closure>`)
+  is rooted by the compiler: neither `sync` nor a root scanner needs to
+  know it. As built:
+  - *Where.* At every call that may collect (`uses gc` or `reenter`, a
+    `gc` function pointer or closure type) made from vm code: op
+    handlers and their `cold` blocks (inline or outlined), `on raise`,
+    variant wrappers, `-> never` vm functions, entries (also before the
+    first dispatch), and plain vm functions. These are the calls that
+    already run `sync` and link a shadow-stack frame for traced locals;
+    the traced state joins that frame. A call that cannot collect, and
+    every dispatch, pays nothing.
+  - *How.* Each such variable is copied, at the call, into a stack slot
+    of its own that the frame lists; the variable itself never has its
+    address taken, so it stays in a register everywhere else in all three
+    dispatch modes (in goto and switch modes, where the state lives in
+    the one loop function, rooting the variable's own slot would have
+    forced it into memory in every handler). In a vm function, which sees
+    the state through pointers, the copy is read through them. A call of
+    a vm function of the same vm roots no state: the function roots it at
+    its own calls that may collect, so `fn gc_point() { if .. { cold {
+    gc.collect(..) } } }` costs its callers nothing. Entries start with
+    their traced state zeroed, so a variable that no one has assigned yet
+    is a valid (empty) root.
+  - *Nested runs and unwinding.* A `reenter` call keeps the caller's
+    frame, and with it the copies, linked while the nested run executes,
+    so the outer state survives collections in it; the nested run roots
+    its own state the same way. `rt.catch_panic`, `rt.protect` and
+    `#[catch_panic]` restore the saved shadow-stack top, which drops the
+    frames (and copies) of the calls they unwound.
+  - *Moving collectors* (not built) would also copy each slot back into
+    its variable after the call, next to the reload of spilled locals.
+
+  The lint `state_root`, which warned when `sync` did not store such a
+  variable, is retired: `#[allow(state_root)]` is still accepted and does
+  nothing. Code that stored the variable in `sync` and marked it in a
+  scanner keeps working; the store and the mark can go.
 - **Moving is opt-in.** The default `MarkSweep` is non-moving and
   size-segregated, which keeps interior pointers into the stack and objects
   stable across handlers. A moving policy makes the compiler reload spilled

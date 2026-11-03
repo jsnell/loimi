@@ -1,0 +1,55 @@
+// matrix: dispatch
+// expect: -1
+// expect: 42 1
+// A panic in a call that may collect, made from a handler: the call's
+// shadow-stack frame holds a copy of the traced state variable `top`.
+// `#[catch_panic]` restores the shadow-stack top it saved, which drops
+// that frame with the abandoned handler; the next run's collections
+// walk only live frames and still root that run's `top`.
+import std.io;
+import std.gc;
+import std.rt;
+
+object Str { n: i64 }
+value V repr nanbox { Num(f64) unboxed, S(Gc<Str>), Nil }
+
+struct Ctx { heap: gc.Heap, live: u64 }
+
+fn collect(c: *Ctx, boom: bool) uses gc {
+    gc.collect(&c.heap);
+    c.live = c.heap.count;
+    for i in 0..256 { let _ = new(&c.heap, Str { n: 7 }); }
+    if boom { rt.panic("boom"); }
+}
+
+fn n_of(v: V) -> i64 {
+    match v { S(s) => s.n, _ => -1 }
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, top: V }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    op NEW() : N { top = S(new(&ctx.heap, Str { n: 42 })); next }
+    op GC() : N { collect(ctx, false); next }
+    op BOOM() : N { collect(ctx, true); next }
+    op HALT() : N { exit n_of(top) }
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; top = Nil; jump code }
+}
+
+#[catch_panic(-1)]
+export "C" fn guarded(c: *Ctx, code: *u32) -> i64 uses gc { M.run(c, code) }
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new(), live: 0 };
+    var a: [u32; 3] = [M.NEW(), M.BOOM(), M.HALT()];
+    io.print_int(guarded(&c, &a[0]));
+    io.println("");
+    var b: [u32; 4] = [M.NEW(), M.GC(), M.GC(), M.HALT()];
+    io.print_int(guarded(&c, &b[0]));
+    io.print(" ");
+    io.print_int(c.live as i64);
+    io.println("");
+}

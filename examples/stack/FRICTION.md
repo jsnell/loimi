@@ -20,8 +20,8 @@ This report is kept as written. Since then:
 | 5, 9 | Fixed: stdlib docs lead with what exists; unbuilt features are marked "Not built"; §3.3 lists the generated API. |
 | 6 | Fixed: `text.Fmt`, `StrBuf.add`, `b.fmt("{} {}", a, b)`. |
 | 7 | Fixed: string patterns in `match`. |
-| 8 | Partly: `..zero` for fields where zero is valid, and `[]` as the empty slice; pointer fields must still be given. |
-| 10 | Partly: lint `state_root` warns when a traced state variable is not in `sync`; no automatic rooting. |
+| 8 | Fixed: `..zero` for fields where zero is valid, raw pointers (null) included, and `[]` as the empty slice; `Gc<T>` and function fields must be given (`?Gc<T>`, `?fn` start as None). `main.lm` and `fuzz.lm` no longer spell out `0 as *T`. |
+| 10 | Fixed: the compiler roots traced state variables at every call that may collect (a copy in the call's shadow-stack frame; nothing per dispatch), in all three dispatch modes (`language.md` §8). Stak no longer stores `tos` in `sync` or marks it in its scanner; the lint `state_root` is retired. |
 | 11 | Fixed in the tutorial's fuzzing chapter. |
 
 ## Summary

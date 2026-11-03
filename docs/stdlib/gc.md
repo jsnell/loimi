@@ -111,6 +111,20 @@ pub fn barrier(obj: *u8) {
   gc verify: old object of type value.Arr points to a young object of type value.Str but is not in the remembered set: missing write barrier
   ```
 
+### Roots
+
+A collection marks from the root scanners (`heap.add_scanner`), then
+from the shadow stack: the frames compiled code links at each call
+that may collect (`uses gc`), listing the traced locals in scope, the
+values pending across defers, and, in vm code, a copy of each state
+variable of a traced type (a cached top of stack, a current closure),
+taken at the call so that the variable itself stays in a register
+(language.md §8). An interpreter's scanner therefore marks memory only:
+its stacks up to the top that `sync` published, frames, globals,
+constants. Nothing that lives only in a handler's registers needs
+scanning. `rt.protect`/`rt.catch_panic` restore the shadow-stack top
+when they unwind.
+
 ### Weak references and ephemerons
 
 - **`Weak<T>`** is a library object, `object Weak<T> { addr: u64 }`, made
