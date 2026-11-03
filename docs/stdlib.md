@@ -14,7 +14,7 @@ says so. Some modules are design only; their sections say so at the top.
 |---|---|---|
 | `std.core` (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
 | `std.mem` | built | `std/mem.lm` |
-| `std.hash`, `std.map`, `std.dict` | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
+| `std.hash`, `std.map`, `std.dict` | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
 | `std.text` | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
 | `std.num` | built | `std/num.lm` |
 | `std.bigint` | built (no subquadratic division) | `std/bigint.lm` |
@@ -227,7 +227,10 @@ key. Probing is CPython's (`i = 5i + 1 + perturb`, `perturb >>= 5`).
   `with_capacity(n)`, `insert(k, v) -> bool` (true if new; a replaced
   key keeps its place), `get -> ?V`, `get_ptr -> ?*V`, `contains`,
   `remove(k) -> ?V`, `pop_last() -> ?(K, V)` (reclaims trailing dead
-  entries, so a stack-like use stays compact), `clear()` (keeps the
+  entries, so a stack-like use stays compact; their index slots stay
+  deleted, so the reclaimed room counts as used until the next resize,
+  else popping and inserting in turn would fill the index with deleted
+  slots), `clear()` (keeps the
   memory), `len` (a field), iteration in insertion order with
   `var i: u64 = 0; while let Some(e) = m.next(&i) { .. e.key, e.value .. }`,
   and `free`.
@@ -311,7 +314,42 @@ best of 5). Entries of 24 bytes instead of 16 (the stored hash) make
 `P(i, 2)` in a loop about 20% slower (more allocation per instance
 dict); dict-heavy code with int and string keys is a few percent faster.
 CPython avoids the hash in instance dicts with a str-keys-only entry
-layout; Loimi's does not have one.
+layout: `dict.KeyDict` (below).
+
+#### `dict.KeyDict`: keys that carry their hash
+
+`dict.KeyDict<K: dict.CachedHash, V>` is `Dict` without stored hashes:
+entries are `dict.KeyEntry<K, V> { key, value }` (16 bytes for `Value`
+keys instead of 24), for keys whose hash is cached in the key, such as
+interned attribute names (CPython's str-keys dict). `K` provides
+`fn K.cached_hash(k) -> u64` (the hash callers pass for that key; it must
+not fail or run guest code, computing and caching it on first use is
+fine) and `fn K.eq(a, b) -> bool`, and `impl dict.CachedHash for K;`.
+Resizing, removal (`remove_at` finds the index slot by the key's hash)
+and `copy` ask the key for its hash. A removed entry is zeroed and is
+recognized by its all-zero key bytes, so a live key must never be all
+zero bits (a string `Value` is a tagged pointer). Everything else is
+`Dict`'s: the index and probing, the API (`new`, `find_by`, `find_with`
+with its restart rule, `put_by`, `try_add_by`, `try_insert_new`,
+`insert_new`, `has_room`, `key`/`value`/`set_value`, `hash_at` (from the
+key), `is_live`, `remove_at`, `get`/`contains`/`insert`/`remove`,
+`pop_last`, `next`, `clear`, `copy`), entry indices stable until a
+compaction, `version`, tracing, no collection on allocation. With no
+stored hash to filter by, `find_by`'s `eq` sees every live key on the
+probe path: test identity first, then the candidate's cached hash
+(`str_eq` in examples/python compares lengths and cached hashes before
+bytes). Tested like `Dict`: `tests/test/ordered_map.lm`
+(`keydict_differential` against the model in a stress heap with
+colliding hashes, `keydict_find_with_and_room`, `pop_insert_alternating`)
+and `tests/run/dict_gc.lm` (its traced-key checks on a KeyDict too).
+
+examples/python keeps instance attributes in a `KeyDict<Value, Value>`
+(`__dict__` gives a copy). Measured against `Dict` there (2026-11-03,
+best of 3-9 interleaved): the 11 benchmarks 0.99 by geomean, each
+within noise (raytrace 0.97 in one run, 1.02 in another); creating an
+instance with 7 attributes in a loop 0.84-0.90 of the time; `P(i, 2, 3)`
+in a loop unchanged (smaller allocations, but `eq` now loads colliding
+keys on the probe path where the stored hash used to reject them).
 
 ### Design (not built): `std.collections`
 
