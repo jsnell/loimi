@@ -17,7 +17,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.hash`, `std.map`](#stdhash-and-stdmap), [`std.dict`](#ordered-maps-maporderedmap-and-dictdict) | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
 | [`std.text`](#stdtext) | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
 | [`std.num`](#stdnum) | built | `std/num.lm` |
-| [`std.bigint`](#stdbigint) | built (no subquadratic division) | `std/bigint.lm` |
+| [`std.bigint`](#stdbigint) | built (Karatsuba, Toom-3, divide-and-conquer division, square root and radix conversion; no FFT) | `std/bigint.lm` |
 | [`std.io`, `std.os`](#stdio-and-stdos) | built (minimal) | `std/io.lm`, `std/os.lm` |
 | [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
 | [`std.parse`](#stdparse) | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
@@ -438,10 +438,14 @@ configuration.
 `std/bigint.lm`: arbitrary-precision integers with Python's semantics
 (floor and truncating division, infinite two's complement for bitwise
 operations on negative numbers, correctly rounded conversion to `f64`,
-Python's `hash`). Tested by `tests/test/bigint.lm` and by a differential
+Python's `hash`). Tested by `tests/test/bigint.lm` (also products, divisions, roots
+and conversions at every threshold below) and by a differential
 test against CPython (`tests/bigint/diff.py`, run by `cargo test`
 as `bigint_vs_python`: 3000 random cases, and 1000 more collecting
-between the steps of the GC operations; longer runs by hand).
+between the steps of the GC operations; the cases include products,
+squares, divisions with all-ones quotients, square roots and parsing
+past every threshold; longer runs by hand, `--big` for thousands of
+limbs).
 
 **Representation.** A magnitude of 64-bit limbs, least significant
 first, normalized (no zero limb at the top; zero has no limbs), and a
@@ -470,7 +474,7 @@ layers over one representation:
   `from_u64` (one limb), `gcd_into(out, a, b)` (`gcd_size`; never
   negative, Euclid's algorithm on limbs and then on machine words),
   `isqrt_into(out, a) -> ?Num` (`isqrt_size`; None for a negative a;
-  CPython's precision-doubling Newton iteration, floor of the root),
+  the floor of the root),
   `from_f64_into` (`f64_size`, truncates; None
   for inf and nan), `parse_into(out, digits, radix)` (`parse_size`).
   Views need no buffer: `neg`, `abs`, `cmp`, `cmp_abs`, `eq`, `sign`,
@@ -506,14 +510,34 @@ Formatting: `bigint.write(b, x, radix)` appends to a `text.StrBuf`
 `parse_into` takes digits only (no sign, prefix, spaces or underscores:
 the language's syntax is the caller's).
 
-Algorithms: schoolbook multiplication, Karatsuba from `KARATSUBA` (32)
-limbs (an unbalanced product is cut into balanced pieces), Knuth's
-algorithm D for division (one `div_wide` per quotient limb), left to
-right binary powering, power-of-two radixes by bit extraction, other
-radixes by dividing out the largest power of the radix that fits a limb
-up to `DC_LIMBS` (30) limbs and above that divide and conquer (split by
-radix^(k·2^i), the halves formatted recursively, the low ones padded with
-zeros), parsing by multiplying in a limb's worth of digits at a time.
+**Algorithms.** The thresholds are `pub const`s, in limbs, measured on
+the development machine (2026-11-03, best of 5 of each size on both
+sides of the candidate; within 5% over a wide range in most cases, and
+the values picked from the middle of it):
+
+| operation | algorithm | from |
+|---|---|---|
+| product | schoolbook, row by row (`mul_1`, `addmul_1`) | |
+| | schoolbook, column by column (Comba: each result limb summed in a three-limb accumulator, two of them interleaved to halve the carry chains; 15-20% faster than rows at 16-47 limbs) | 14 (shorter operand) |
+| | Karatsuba | `KARATSUBA` = 48 |
+| | Toom-3 (evaluation at 0, 1, -1, -2, ∞; Bodrato's interpolation; on owned temporaries) | `TOOM3` = 250 |
+| | unbalanced: cut into balanced pieces of the shorter operand's size | |
+| square (both operands the same limbs: `mul(x, x)`, `pow`, and the algorithms below) | schoolbook with each cross product once, rows then columns from 14 | |
+| | Karatsuba squaring (2 a0 a1 = a0² + a1² − (a1 − a0)²) | `KARATSUBA_SQR` = 48 |
+| | Toom-3 squaring | `TOOM3_SQR` = 500 |
+| division | Knuth's algorithm D, each quotient limb estimated by Möller and Granlund's division by a precomputed reciprocal (`div_wide` compiles to a `__udivti3` libcall, 2-3x slower) | |
+| | recursive divide and conquer (Burnikel-Ziegler, with GMP's `mpn_dcpi1_div_qr` structure: the quotient's high half from the top halves, recursively, the product of that half by the divisor's low half subtracted, at most a few corrections, then the low half; a long quotient in blocks of the divisor's length): about two products of the same size | `DIV_DC` = 80 (divisor and quotient) |
+| one-limb divisor | Möller-Granlund, one reciprocal for the whole number | |
+| square root | Zimmermann's Karatsuba square root (GMP's `mpn_dc_sqrtrem`): the root and remainder of the top half recursively, then one division of about n/2 by n/4 limbs and one square of n/4, one correction; on one limb a floating-point estimate and a Newton step | |
+| power | left-to-right binary (squarings) | |
+| formatting, radix 2^k | bit extraction | |
+| formatting, other radixes | dividing out the largest power of the radix that fits a limb, a limb's worth of digits at a time (constant division for radix 10) | |
+| | divide and conquer: split by radix^(k·2^i) (the precomputed squares) with the fast division, halves recursively, the low ones zero-padded | `DC_LIMBS` = 16 |
+| parsing | a limb's worth of digits at a time (one `mul_1` pass per chunk: quadratic but cheap per step) | |
+| | divide and conquer: the high digits times radix^(k·2^i) plus the low k·2^i digits, recursively | `PARSE_DC` = 512 limbs' worth of digits |
+
+With these, every operation but `gcd` is O(M(n) log n) or better, with
+M(n) Karatsuba's or Toom-3's cost.
 
 <!-- snippet: run "93326215443944152681699238856266700490715968264381621468592963895217599993229915608941463976156518286253697920827223758251185210916864000000000000000000000000" "-ff" -->
 ```loimi
@@ -572,26 +596,60 @@ fn add(h: *gc.Heap, a: Value, b: Value) -> Value {
 ```
 
 Performance (`bench/bigint/bench.lm` against the same work in
-`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine):
+`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine; before:
+schoolbook division and radix conversion, Karatsuba from 32 limbs, no
+squaring routine, 2026-11-03):
 
-| | std.bigint | CPython 3.13 |
-|---|---|---|
-| factorial(5000), a running product | 1.8 ms | 4.9 ms |
-| fib(100000) by fast doubling | 0.58 ms | 1.7 ms |
-| `str` of a 99,722-digit number | 20 ms | 33 ms |
-| `int` of it | 9.7 ms | 17 ms |
-| product, 99,722 by 20,899 digits | 2.0 ms | 7.5 ms |
-| `divmod`, 120,621 by 20,899 digits | 6.4 ms | 15 ms |
+| | std.bigint | before | CPython 3.13 |
+|---|---|---|---|
+| factorial(5000), a running product | 1.8 ms | 1.8 ms | 4.9 ms |
+| fib(100000) by fast doubling | 0.41 ms | 0.58 ms | 1.7 ms |
+| `str` of a 99,722-digit number | 8.0 ms | 19 ms | 32 ms |
+| `int` of it | 5.0 ms | 9.5 ms | 17 ms |
+| product, 99,722 by 20,899 digits | 1.6 ms | 2.0 ms | 7.5 ms |
+| `divmod`, 120,621 by 20,899 digits | 3.2 ms | 6.4 ms | 15 ms |
+
+Larger numbers (7^e, best of 3; CPython 3.13 converts big numbers with
+the subquadratic pure-Python `_pylong`, and divides big numbers with it
+too):
+
+| digits | | str | int | divmod by half size | isqrt |
+|---|---|---|---|---|---|
+| 99,722 | std.bigint | 8.1 ms | 5.1 ms | 2.6 ms | 1.8 ms |
+| | before | 19 ms | 9.6 ms | 7.5 ms | 6.8 ms |
+| | CPython | 32 ms | 17 ms | 12 ms | 16 ms |
+| 299,165 | std.bigint | 44 ms | 25 ms | 15 ms | 10 ms |
+| | before | 147 ms | 85 ms | 68 ms | 55 ms |
+| | CPython | 86 ms | 99 ms | 72 ms | 95 ms |
+| 997,216 | std.bigint | 284 ms | 156 ms | 91 ms | 65 ms |
+| | before | 1566 ms | 963 ms | 764 ms | 588 ms |
+| | CPython | 365 ms | 666 ms | 478 ms | 635 ms |
+
+At the sizes of examples/scheme's pi benchmark (ns per operation,
+n by n limbs, a quotient 2n by n, a root of 2n limbs; before → after):
+
+| limbs | product | square | quotient | isqrt | `write` decimal |
+|---|---|---|---|---|---|
+| 8 | 85 → 87 | 84 → 75 | 372 → 225 | 1422 → 496 | 1843 → 821 |
+| 26 | 760 → 651 | 911 → 408 | 1852 → 1091 | 4094 → 1379 | 11350 → 3534 |
+| 52 | 2653 → 2254 | 2632 → 1505 | 4998 → 3761 | 9636 → 3249 | 20533 → 8050 |
+| 100 | 8267 → 7105 | 8288 → 4610 | 14850 → 12108 | 24816 → 8260 | 41952 → 19066 |
+| 1000 | 354 → 284 us | 358 → 203 us | 1152 → 573 us | 1171 → 374 us | 1040 → 603 us |
 
 ### Design (not built)
 
-Subquadratic division (Burnikel-Ziegler or Newton) and with it
-subquadratic radix conversion (formatting is divide and conquer over
-schoolbook division, so still quadratic; CPython 3.12+ converts huge
-numbers with `_pylong`, which is asymptotically faster), divide-and-conquer
-parsing, a squaring routine, FFT multiplication, a subquadratic
-(Lehmer or half-gcd) `gcd`, correctly rounded `a / b` to `f64`, and in-place operations on an
-owned `BigInt` (each operation returns a new one).
+FFT (Schönhage-Strassen or number-theoretic) multiplication, Toom-4
+and the unbalanced Toom variants (Toom-3 works on owned temporaries:
+fine at hundreds of limbs, wasteful lower), division by a Newton
+reciprocal (Barrett) for very large numbers, short products and
+precomputed inverses for formatting (GMP-style; formatting is now
+division-bound: a 2n by n division costs about two n by n products),
+a subquadratic (Lehmer or half-gcd) `gcd`, correctly rounded `a / b`
+to `f64`, and in-place operations on an owned `BigInt` (each operation
+returns a new one). The base cases are plain Loimi, so 2-3x behind
+GMP's assembly per limb product (no add-with-carry intrinsic: LLVM
+finds `adc` chains for the column sums but not for `addmul_2`-style
+loops).
 
 ## `std.io` and `std.os`
 

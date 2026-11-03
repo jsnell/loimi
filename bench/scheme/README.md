@@ -470,6 +470,15 @@ programs (string, gcbench), and the empty program starts 0.08 ms later
 dispatch 4-12% on tak, diviter and ack; the collection now happens in a
 `#[cold]` helper (`builtins.arith_gc`).
 
+**Subquadratic std.bigint (2026-11-03, later).** Squaring, Toom-3,
+divide-and-conquer division, Zimmermann's square root and division by
+precomputed reciprocals (docs/stdlib.md, "std.bigint"; docs/results.md
+has the table) took pi from 0.258 s to 0.158 s wall (2.37x Guile ->
+1.45x; inner time 2.69x -> 1.69x) and chudnovsky from 0.209 s to 0.184 s
+(1.36x -> 1.21x). What remains on pi is per-limb speed at 10-100 limbs:
+GMP's assembly base cases do a limb product in 1-1.5 cycles, ours (plain
+Loimi, no add-with-carry intrinsic) in about 3.
+
 ## Skipped benchmarks
 
 | benchmark | why |

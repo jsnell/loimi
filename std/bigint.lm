@@ -22,13 +22,16 @@
 // value type and come here on overflow (`num.add_overflow`), making a
 // `Num` of an `i64` with `from_i64(buf, x)` (one limb of buffer).
 //
-// Algorithms: schoolbook and Karatsuba multiplication (above KARATSUBA
-// limbs), Knuth's algorithm D for division, binary powering, and
-// divide-and-conquer radix conversion for formatting above DC_LIMBS
-// limbs (with schoolbook division, so still quadratic, but with a much
-// smaller constant than dividing by one limb at a time). Not built:
-// subquadratic division (Burnikel-Ziegler, Newton), FFT multiplication,
-// a separate squaring routine, divide-and-conquer parsing.
+// Algorithms (thresholds below, in limbs, measured; docs/stdlib.md has
+// the numbers): schoolbook multiplication (row by row, or column by
+// column for longer operands), Karatsuba, Toom-3; the same three for
+// squaring, used whenever both operands are the same limbs; Knuth's
+// algorithm D (dividing by a precomputed reciprocal, not `div_wide`,
+// which is a libcall) and above DIV_DC recursive divide-and-conquer
+// division (Burnikel-Ziegler, as in GMP's mpn_dcpi1_div_qr); Zimmermann's
+// Karatsuba square root; binary powering; divide-and-conquer formatting
+// (over the fast division) and parsing. Not built: FFT multiplication,
+// unbalanced Toom variants, Newton (Barrett) division, subquadratic gcd.
 
 import std.mem;
 import std.text;
@@ -1319,9 +1322,8 @@ fn square_above(r: u64, n: u64) -> bool {
     hi != 0 or lo > n
 }
 
-/// floor(sqrt(a)), or None if a is negative. Above one limb this is
-/// Python's `math.isqrt`: Newton steps that double the precision of the
-/// root each time, then a final correction of at most one.
+/// floor(sqrt(a)), or None if a is negative: Zimmermann's Karatsuba
+/// square root (`sqrtrem`) above one limb.
 pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
     if a.neg { return None; }
     need(out, isqrt_size(a));
