@@ -127,6 +127,35 @@ pub fn Vec<T>.set(v: *Vec<T>, i: u64, x: T) {
     v.items()[i] = x;
 }
 
+/// Append the values of `s`. `s` may be (part of) `v`'s own items
+/// (`v.extend(v.items())`): it is read after the buffer moves.
+pub fn Vec<T>.extend(v: *Vec<T>, s: []T) {
+    var src = s.ptr;
+    if v.len + s.len > v.cap { src = v.grow_for(s); }
+    memcpy((v.ptr + v.len) as *u8, src as *u8, s.len * size_of<T>());
+    v.len += s.len;
+}
+
+/// Make room for `s` (see `extend`), and return where `s` is now: if it
+/// was inside the buffer that moved, at the same index in the new one.
+#[cold]
+#[inline(never)]
+fn Vec<T>.grow_for(v: *Vec<T>, s: []T) -> *T {
+    let base = v.ptr as u64;
+    let at = s.ptr as u64;
+    let inside = size_of<T>() != 0 and at >= base and at < base + v.len * size_of<T>();
+    v.reserve(s.len);
+    if inside { v.ptr + ((at - base) / size_of<T>()) } else { s.ptr }
+}
+
+/// A `Vec` of `n` copies of `x`.
+pub fn Vec<T>.filled(n: u64, x: T) -> Vec<T> {
+    var v: Vec<T> = Vec.with_capacity(n);
+    for i in 0..n { v.ptr[i] = x; }
+    v.len = n;
+    v
+}
+
 pub fn Vec<T>.last(v: *Vec<T>) -> ?T {
     if v.len == 0 { None } else { Some(v.ptr[v.len - 1]) }
 }

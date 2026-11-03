@@ -1,24 +1,41 @@
 // Minimal I/O on top of libc.
 
+#![safe]
+
+import std.mem;
+
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
+/// One write(2) of `s`: the number of bytes written, or -1.
+fn write_some(fd: i32, s: []u8) -> i64 {
+    // unsafe: write(2) reads the s.len bytes of `s`
+    unsafe { write(fd, s.ptr, s.len) }
+}
+
+/// `%.14g` of `x` into `buf`; the length.
+fn format_g14(buf: *[u8; 64], x: f64) -> u64 {
+    // unsafe: snprintf writes at most the 64 bytes it is told `buf` has
+    let n = unsafe { snprintf(&buf[0], 64, "%.14g\0".ptr, x) };
+    if n < 0 { 0 } else if n > 63 { 63 } else { n as u64 }
+}
+
 pub fn print(s: str) {
-    write(1, s.ptr, s.len);
+    write_some(1, s);
 }
 
 pub fn println(s: str) {
-    write(1, s.ptr, s.len);
-    write(1, "\n".ptr, 1);
+    write_some(1, s);
+    write_some(1, "\n");
 }
 
 pub fn eprint(s: str) {
-    write(2, s.ptr, s.len);
+    write_some(2, s);
 }
 
 pub fn eprintln(s: str) {
-    write(2, s.ptr, s.len);
-    write(2, "\n".ptr, 1);
+    write_some(2, s);
+    write_some(2, "\n");
 }
 
 pub fn print_int(x: i64) { write_int(1, x); }
@@ -42,13 +59,13 @@ fn write_int(fd: i32, x: i64) {
         i -= 1;
         buf[i] = '-';
     }
-    write(fd, &buf[i], 24 - i);
+    write_some(fd, buf[i..24]);
 }
 
 fn write_f64(fd: i32, x: f64) {
     var buf: [u8; 64];
-    let n = snprintf(&buf[0], 64, "%.14g\0".ptr, x);
-    write(fd, &buf[0], n as u64);
+    let n = format_g14(&buf, x);
+    write_some(fd, buf[0..n]);
 }
 
 pub fn print_bool(b: bool) {
@@ -67,24 +84,31 @@ extern "C" fn memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
 /// Read a whole file. The returned string is heap-allocated: release it
 /// with `free_file`.
 pub fn read_file(path: str) -> ?str {
-    let cpath = malloc(path.len + 1);
-    memcpy(cpath, path.ptr, path.len);
-    cpath[path.len] = 0;
-    let f = fopen(cpath, "rb\0".ptr);
-    free(cpath);
-    if (f as u64) == 0 { return None; }
-    fseek(f, 0, 2);
-    let n = ftell(f);
-    fseek(f, 0, 0);
-    if n < 0 { fclose(f); return None; }
-    let buf = malloc(n as u64 + 1);
-    let got = fread(buf, 1, n as u64, f);
-    fclose(f);
-    Some(buf.slice(got))
+    // unsafe: C stdio on a NUL-terminated copy of `path`; fread fills at most the n bytes malloc'd
+    unsafe {
+        let cpath = malloc(path.len + 1);
+        memcpy(cpath, path.ptr, path.len);
+        cpath[path.len] = 0;
+        let f = fopen(cpath, "rb\0".ptr);
+        free(cpath);
+        if (f as u64) == 0 { return None; }
+        fseek(f, 0, 2);
+        let n = ftell(f);
+        fseek(f, 0, 0);
+        if n < 0 { fclose(f); return None; }
+        let buf = malloc(n as u64 + 1);
+        let got = fread(buf, 1, n as u64, f);
+        fclose(f);
+        Some(buf.slice(got))
+    }
 }
 
-/// Release a string returned by `read_file`.
-pub fn free_file(s: str) { free(s.ptr); }
+/// Release a string returned by `read_file` (`#[raw]`: `s` must be one).
+#[raw]
+pub fn free_file(s: str) {
+    // unsafe: the caller passes memory read_file malloc'd
+    unsafe { free(s.ptr); }
+}
 
 // ── Out: buffered output ────────────────────────────────────────────────
 
@@ -94,7 +118,7 @@ pub fn free_file(s: str) { free(s.ptr); }
 /// `flush` (or `free`) before the program ends, and before writing to the
 /// same terminal another way (`io.eprint` for an error message, or
 /// `io.print`), or the output comes out of order.
-pub struct Out { fd: i32, buf: *u8, len: u64, cap: u64 }
+pub struct Out { fd: i32, buf: mem.Vec<u8> }
 
 /// A writer on stdout with a 64 KiB buffer.
 pub fn Out.stdout() -> Out { Out.new(1, 65536) }
@@ -102,13 +126,13 @@ pub fn Out.stdout() -> Out { Out.new(1, 65536) }
 /// A writer on `fd` with a buffer of `cap` bytes (at least 1).
 pub fn Out.new(fd: i32, cap: u64) -> Out {
     let c = if cap == 0 { 1 } else { cap };
-    Out { fd: fd, buf: malloc(c), len: 0, cap: c }
+    Out { fd: fd, buf: mem.Vec.with_capacity(c) }
 }
 
-fn write_all(fd: i32, p: *u8, n: u64) {
+fn write_all(fd: i32, s: []u8) {
     var off: u64 = 0;
-    while off < n {
-        let w = write(fd, p + off, n - off);
+    while off < s.len {
+        let w = write_some(fd, s[off..]);
         if w <= 0 { return; }
         off += w as u64;
     }
@@ -116,27 +140,25 @@ fn write_all(fd: i32, p: *u8, n: u64) {
 
 /// Write out what is buffered.
 pub fn Out.flush(o: *Out) {
-    if o.len > 0 { write_all(o.fd, o.buf, o.len); o.len = 0; }
+    if o.buf.len > 0 { write_all(o.fd, o.buf.items()); o.buf.clear(); }
 }
 
 /// Buffer `s`; a string that does not fit in an empty buffer is
 /// written directly.
 pub fn Out.print(o: *Out, s: str) {
-    if o.len + s.len > o.cap {
+    if o.buf.len + s.len > o.buf.cap {
         o.flush();
-        if s.len >= o.cap { write_all(o.fd, s.ptr, s.len); return; }
+        if s.len >= o.buf.cap { write_all(o.fd, s); return; }
     }
-    memcpy(o.buf + o.len, s.ptr, s.len);
-    o.len += s.len;
+    o.buf.extend(s);
 }
 
 pub fn Out.println(o: *Out, s: str) { o.print(s); o.byte('\n'); }
 
 /// Buffer one byte.
 pub fn Out.byte(o: *Out, c: u8) {
-    if o.len == o.cap { o.flush(); }
-    o.buf[o.len] = c;
-    o.len += 1;
+    if o.buf.len == o.buf.cap { o.flush(); }
+    o.buf.push(c);
 }
 
 pub fn Out.print_int(o: *Out, x: i64) {
@@ -150,26 +172,23 @@ pub fn Out.print_int(o: *Out, x: i64) {
         if u == 0 { break; }
     }
     if x < 0 { i -= 1; buf[i] = '-'; }
-    o.print((&buf[i]).slice(24 - i));
+    o.print(buf[i..24]);
 }
 
 /// `%.14g`, as `io.print_f64`.
 pub fn Out.print_f64(o: *Out, x: f64) {
     var buf: [u8; 64];
-    let n = snprintf(&buf[0], 64, "%.14g\0".ptr, x);
-    o.print((&buf[0]).slice(n as u64));
+    let n = format_g14(&buf, x);
+    o.print(buf[0..n]);
 }
 
 pub fn Out.print_bool(o: *Out, b: bool) { o.print(if b { "true" } else { "false" }); }
 
 /// The number of bytes buffered.
-pub fn Out.buffered(o: *Out) -> u64 { o.len }
+pub fn Out.buffered(o: *Out) -> u64 { o.buf.len }
 
 /// Flush and release the buffer.
 pub fn Out.free(o: *Out) {
     o.flush();
-    free(o.buf);
-    o.buf = 0 as *u8;
-    o.cap = 0;
-    o.len = 0;
+    o.buf.free();
 }

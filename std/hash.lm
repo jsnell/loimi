@@ -1,5 +1,7 @@
 // Hashing and equality for map keys.
 
+#![safe]
+
 import std.mem;
 
 /// Map keys: `HashMap<K: Hash, V>`. A type implements it by defining the
@@ -43,6 +45,4 @@ pub fn u64.eq(a: u64, b: u64) -> bool { a == b }
 pub fn i64.eq(a: i64, b: i64) -> bool { a == b }
 pub fn u32.eq(a: u32, b: u32) -> bool { a == b }
 pub fn i32.eq(a: i32, b: i32) -> bool { a == b }
-pub fn str.eq(a: str, b: str) -> bool {
-    a.len == b.len and mem.memcmp(a.ptr, b.ptr, a.len) == 0
-}
+pub fn str.eq(a: str, b: str) -> bool { mem.equal_bytes(a, b) }

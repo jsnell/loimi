@@ -90,6 +90,17 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
+  reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
+  pointer casts, other modules' buffer pointers and invariant fields,
+  `..zero` null pointers, `assume`/`unreachable` and calls of `extern`
+  and `#[raw]` functions need `unsafe { }` there (a check only: the IR
+  is unchanged). `std.mem` marks its pointer+length and freeing
+  functions `#[raw]`. Lifetimes are not checked
+  ([language.md §1.3](docs/language.md#13-memory),
+  [design/safety.md](docs/design/safety.md)). Naming an `#[unsafe]`
+  method through `x.m()` or explicit type arguments now needs `unsafe`
+  too (it slipped through before).
 - **128-bit vectors**: `i8x16` .. `f64x2` with lane-wise operators,
   masks, lanes, shuffles, swizzles, widening and saturating narrowing,
   saturating and rounding arithmetic, IEEE min/max and lane-wise `as`;
@@ -176,6 +187,12 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- **Memory-safe std modules**: `std.lex`, `std.parse`, `std.diag`,
+  `std.text`, `std.hash`, `std.io` and `std.bc` are `#![safe]`, with a
+  handful of justified `unsafe` blocks around C calls. `mem.Vec` gained
+  `extend(s)` (safe when `s` is the vector's own items: fixes a
+  use-after-free in `StrBuf.push_str(b.as_str())`) and `filled(n, x)`;
+  `io.free_file` is `#[raw]` ([design/safety.md](docs/design/safety.md)).
 - **`std.bigint`**: arbitrary-precision integers with Python's semantics
   ([stdlib.md](docs/stdlib.md#stdbigint)).
 - **`std.map.OrderedMap`, `std.dict.Dict`, `std.dict.KeyDict`**:

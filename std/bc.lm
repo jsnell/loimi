@@ -41,6 +41,8 @@
 // sit in host memory while a function is compiled: compile between
 // collections, as Mini and Scheme do, or root them yourself.
 
+#![safe]
+
 import std.mem;
 import std.hash;
 import std.map;
@@ -506,7 +508,8 @@ pub fn Code<W>.needs_relax(c: *Code<W>) -> bool { c.far.len > 0 }
 pub fn Code<W>.relax(c: *Code<W>) -> bool {
     if c.far.len == 0 { return true; }
     let n = c.words.len;
-    let newpc: *u64 = mem.alloc(n + 1);
+    var newpcs: mem.Vec<u64> = mem.Vec.filled(n + 1, 0);
+    let newpc = newpcs.items();
     var out: mem.Vec<W> = mem.Vec.new();
     var ok = false;
     var failed = false;
@@ -520,7 +523,7 @@ pub fn Code<W>.relax(c: *Code<W>) -> bool {
             if size == 0 { size = 1; }
             for i in 0..size { if pc + i < n { newpc[pc + i] = pc + i + shift; } }
             if c.far.contains(pc) {
-                let Some(inv) = c.invert(w) else { unreachable };
+                let Some(inv) = c.invert(w) else { trap() };
                 shift += c.size(inv) + c.size(c.goto) - size;
             }
             pc += size;
@@ -535,7 +538,7 @@ pub fn Code<W>.relax(c: *Code<W>) -> bool {
             var size = c.size(w);
             if size == 0 { size = 1; }
             if let Some(t) = c.far.get(pc) {
-                let Some(inv) = c.invert(w) else { unreachable };
+                let Some(inv) = c.invert(w) else { trap() };
                 let isz = c.size(inv);
                 let skip = isz + c.size(c.goto);
                 let Some(iw) = c.patch_fn(inv, skip as i64) else { failed = true; c.fail(ErrorKind.JumpRange, pc); break; };
@@ -584,7 +587,7 @@ pub fn Code<W>.relax(c: *Code<W>) -> bool {
         c.far.clear();
     }
     out.free();
-    mem.release(newpc);
+    newpcs.free();
     ok and !failed
 }
 
