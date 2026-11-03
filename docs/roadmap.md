@@ -365,10 +365,10 @@ quickening on/off.
       variants, and `Vm.accumulate` selects them where a temporary goes
       from one op to the next. The wasm interpreter got 0.91 of its time
       (geometric mean of seven programs; 0.87 of wasm3's), and 0.79 with
-      supers over the variants (`examples/wasm/FRICTION.md`). Open: the
-      goto-mode build's memory grows faster than the op count (the wasm
-      vm marks 90 ops, not all), and selection is a greedy pass over
-      adjacent pairs;
+      supers over the variants (`examples/wasm/FRICTION.md`). Open:
+      selection is a greedy pass over adjacent pairs (the goto-mode
+      build's cost, which grew about 7x per doubling of the op count, is
+      solved: `lowering.md` §5);
     - not built: field decoding: three `mov`/`shr`/`movzwl` sequences per op; a
       format whose fields are pre-scaled byte offsets would drop the
       `movzwl` and the scaled addressing, and reading fields with narrow

@@ -199,8 +199,8 @@ pub vm W {
     accumulator iacc: u64 for ri, ru, rl, rq;
     accumulator facc: f64 for rd;
     // The ops that get variants (each variant is an opcode and a handler:
-    // marking every op would double the vm, and goto mode's one function
-    // would not fit in memory). The ones executed by the benchmarks,
+    // marking every op would about double the vm's code). The ones
+    // executed by the benchmarks,
     // and their neighbours in the tables.
     accumulate
         I32_ADD, I32_SUB, I32_MUL, I32_AND, I32_OR, I32_XOR, I32_SHL, I32_SHR_S, I32_SHR_U,

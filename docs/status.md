@@ -128,10 +128,12 @@ three dispatch modes and three GC settings. Found and fixed: a `match`
 guard that collects ran with a temporary scrutinee (`match f() {..}`)
 unrooted, so arms after a failing guard bound freed objects; in vm
 code also with the earlier fix, since a call there is a vm node
-(`tests/run/gc_roots_match_guard.lm`). Found, not fixed: LLVM 19
-crashes in `LoopSimplifyCFG` (at `-O1` and `-O3`) on the goto-mode run
-loop of about 1% of the generated programs; the IR verifies, and the
-fuzzer skips that build (reproduce: `ROOTFUZZ_SEEDS=1088`).
+(`tests/run/gc_roots_match_guard.lm`). Found: LLVM 19
+crashed in `LoopSimplifyCFG` (at `-O1` and `-O3`) on the goto-mode run
+loop of about 1% of the generated programs (the IR verified); gone since
+goto mode emits one shared dispatch block (`lowering.md` §5,
+`tests/run/goto_loop_simplifycfg.lm`), and the fuzzer no longer skips
+those builds.
 
 ## Differences from the design
 

@@ -549,7 +549,7 @@ The empty `asm` keeps the address computation in the handlers. Without it,
 LLVM folds the identical table loads (and the `pc` increments) of all
 handlers into the shared block, which then has five instructions, more than
 post-RA tail duplication copies: dispatch stays a single shared indirect jump,
-16% slower on the wasm benchmarks.
+16% slower on the wasm benchmarks (below).
 
 *Why not replicate in IR, or copy before register allocation.* Until
 2026-11 the IR itself ended every `next` in its own `indirectbr`. With `S`
@@ -561,22 +561,44 @@ placement pay for. Copying the shared block before register allocation (the
 default for small indirect-branch blocks) recreates the same phis in machine
 IR. After register allocation there are no phis: the state lives in the same
 registers in every handler, and the copies are a few hundred `jmp *%rax`.
-Measured on clang 19 (`-ftime-report`, i7-6700):
+Measured with clang 19 on an i7-6700 (wall time and peak RSS of the clang
+step for the synthetic vms, of the whole `loimi build --release` for wasm;
+the synthetic vm has `N` ops of one to three lines each, five state
+variables):
 
-| vm (opcodes) | replicated `indirectbr` in IR | shared block, copied after RA |
+| vm (dispatch targets) | `indirectbr` per `next` | shared block, copied after RA |
 |---|---|---|
-| wasm (669: 382 ops + 287 accumulator variants) | 214 s, 973 MB | 13 s, 220 MB |
-| synthetic, 400 small ops | 21 s, 256 MB | 1.3 s, 130 MB |
-| synthetic, 800 small ops | 157 s, 707 MB | 8.2 s, 183 MB |
-| synthetic, 1600 small ops | (extrapolated: ~20 min, ~2.5 GB) | GROWTH1600 |
+| synthetic, N = 400 | 21 s, 256 MB | 1.5 s, 126 MB |
+| synthetic, N = 800 | 157 s, 707 MB | 4.7 s, 183 MB |
+| synthetic, N = 1600 | (~7x per doubling: ~20 min, over 2 GB; not run) | 24 s, 367 MB |
+| wasm (670: 382 ops + 287 accumulator variants) | 237 s, 970 MB | 17 s, 220 MB |
+| wasm with every eligible op accumulated (1170) | out of 2.5 GB | 39 s, 325 MB (tailcall 28 s, switch 27 s) |
 
-In the old form the time went to block placement (64 s on wasm), the machine
-scheduler (33 s), loop canonicalization (24 s across IR and machine IR), GVN
-(17 s), loop unrolling and vectorization, the coalescer and PHI elimination.
-The generated code got faster too (wasm benchmarks 11% by geometric mean,
-Mini, MiniJS and Scheme within noise; see the commit message for the
-tables): the handlers are register-allocated around one join point, where
-every state variable has one home register.
+The old form grew about 7x per doubling of the op count; the new one about
+3-5x at these sizes (still superlinear: the machine CFG has the same
+`S×H` edges, and block placement and the IR passes that remain are not
+linear in them), but a thousand-opcode vm now builds in goto mode about as
+fast as in the other modes. In the old form the time went to block
+placement (64 s on wasm, cubic: its tail duplication considers every
+predecessor of every successor), the machine scheduler (33 s), loop
+canonicalization (23 s across IR and machine IR), GVN (17 s), loop
+unrolling, vectorization and load elimination (14 s), the coalescer and
+PHI elimination. Copying before register allocation (the shared block
+without the `asm`, with the size limits lifted) left 56 s of which the
+coalescer, early tail duplication and PHI elimination took 34 s.
+
+The generated code got faster, too: the handlers are register-allocated
+around one join point, where every state variable has one home register.
+Old against new, `--align-functions=64`, best of 3, interleaved: wasm 0.87
+of the time (geometric mean of the seven benchmarks; every one faster but
+binarytrees, +4%), Mini 0.97 (fib +4 to 7%, closures +2%, fannkuch -13%),
+MiniJS 0.99, Scheme 0.99 (41 r7rs programs). A single shared indirect jump
+(no copies at all) is 1.16 on wasm.
+
+The old form also crashed LLVM 19's LoopSimplifyCFG (at `-O1` and `-O3`)
+on about 1% of the rooting fuzzer's programs (`tests/fuzz/rootgen.rs`;
+`tests/run/goto_loop_simplifycfg.lm` is seed 5026); the IR verified. The
+shared dispatch block does not trigger it.
 
 `cold` blocks stay inline and are marked unlikely. Register pressure is
 shared across all handlers, which is why `tailcall` is preferred where it is

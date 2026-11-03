@@ -1,0 +1,693 @@
+// args: --dispatch=goto
+// Regression: tests/fuzz/rootgen.rs seed 5026. With one indirectbr per
+// `next` (before goto mode shared one dispatch block), LLVM 19 crashed in
+// LoopSimplifyCFG on this program's run loop at -O1 (docs/lowering.md §5).
+// expect: 238 f0
+// expect: 526 f0
+// expect: 232 f1
+// expect: 235 f1
+// expect: 10 f2
+// expect: 10 f2
+// expect: 755483 f3
+// expect: 370530 f3
+// expect: 88315 vm0
+// expect: 88315 vm0
+// expect: 929461 vm1
+// expect: 929461 vm1
+// expect: 4793 vm2
+// expect: 4793 vm2
+// expect: 402956 sum
+// expect: leaks 0
+import std.io;
+import std.gc;
+import std.os;
+
+object Node { v: i64, l: ?Gc<Node>, r: ?Gc<Node> }
+struct Pair { a: Gc<Node>, b: ?Gc<Node>, k: i64 }
+enum E { Nil, One(Gc<Node>), Two(Gc<Node>, Gc<Node>), Pr(Pair) }
+value V repr nanbox { Num(f64) unboxed, R(Gc<Node>), Nil }
+
+struct Ctx { heap: gc.Heap, keep: ?Gc<Node>, sum: i64, fuel: i64, leaks: i64, gen: bool, gcs: i64 }
+
+const MD: i64 = 1000003;
+
+fn mix(a: i64, b: i64) -> i64 { (a * 31 + b) % MD }
+
+fn scan(h: *gc.Heap, p: *u8) {
+    let c = p as *Ctx;
+    gc_mark(h, c.keep);
+}
+
+/// A safepoint: collects at every call under GC stress, then allocates
+/// garbage that reuses what was freed.
+fn gc(c: *Ctx) -> i64 uses gc {
+    c.gcs += 1;
+    gc.maybe_collect(&c.heap);
+    for i in 0..3 { let _ = new(&c.heap, Node { v: 7, l: None, r: None }); }
+    1
+}
+fn gcb(c: *Ctx) -> bool uses gc { gc(c); true }
+fn gcf(c: *Ctx) -> bool uses gc { gc(c); false }
+
+fn mk(c: *Ctx, v: i64, l: ?Gc<Node>, r: ?Gc<Node>) -> Gc<Node> {
+    new(&c.heap, Node { v: v % 1000, l: l, r: r })
+}
+
+fn dig(n: ?Gc<Node>, d: i64) -> i64 {
+    match n {
+        None => 1,
+        Some(x) => if d == 0 { x.v } else { (x.v * 3 + dig(x.l, d - 1) * 5 + dig(x.r, d - 1) * 7) % MD },
+    }
+}
+fn dn(n: Gc<Node>) -> i64 { dig(Some(n), 3) }
+fn dp(p: Pair) -> i64 { mix(mix(dn(p.a), dig(p.b, 3)), p.k % MD) }
+fn de(e: E) -> i64 {
+    match e {
+        E.Nil => 2,
+        E.One(a) => mix(3, dn(a)),
+        E.Two(a, b) => mix(dn(a), dn(b)),
+        E.Pr(p) => mix(5, dp(p)),
+    }
+}
+fn dv(v: V) -> i64 {
+    match v { R(n) => mix(7, dn(n)), Num(f) => (f * 4.0) as i64, Nil => 11 }
+}
+fn dt(t: (Gc<Node>, i64)) -> i64 { mix(dn(t.0), t.1 % MD) }
+fn da(a: [?Gc<Node>; 2]) -> i64 { mix(dig(a[0], 3), dig(a[1], 3)) }
+
+fn pick(a: Gc<Node>, b: Gc<Node>, k: i64) -> Gc<Node> { if k % 2 == 0 { a } else { b } }
+fn none() -> ?Gc<Node> { None }
+
+fn each(c: *Ctx, n: i64, f: block fn(i64) -> i64 uses gc) -> i64 uses gc {
+    var t: i64 = 0;
+    for i in 0..n { t = mix(t, f(i)); gc(c); }
+    t
+}
+
+/// 0; counts a leak if the target of `w` survives a full collection.
+fn dead(c: *Ctx, w: ?Gc<gc.Weak<Node>>) -> i64 uses gc {
+    gc.collect(&c.heap);
+    if let Some(x) = w {
+        if !c.gen and x.get().is_some() { c.leaks += 1; }
+    }
+    0
+}
+
+fn f0(c: *Ctx, k: i64, a: Gc<Node>, b: ?Gc<Node>) -> V uses gc {
+    if c.fuel <= 0 { return V.Nil; }
+    c.fuel -= 1;
+    var acc: i64 = k;
+    if let E.Pr(x1) = E.Nil and k % 2 == 1 and gcb(c) {
+            acc += gc(c);
+            acc = mix(acc, dp(x1));
+        var s3: i64 = 0;
+        let x4: [?Gc<Node>; 2] = loop {
+            s3 += 1;
+            if s3 > 2 { break [b, b]; }
+            defer { c.sum = mix(c.sum, dig([none(), b][0], 3)); gc(c); }
+            if (acc + dt((a, k))) % 4 < 2 { break [b, b]; }
+        };
+    } else {
+        {
+            if let R(x5) = V.Num(2.5) and let E.Pr(x7) = E.Pr((Pair { a: x5, b: b, k: k })) {
+                    acc += gc(c);
+                    acc = mix(acc, dn(x5));
+                    acc = mix(acc, dp(x7));
+                acc = mix(acc, dv(f1(c, a.v, a, b)));
+                let Some(x11) = b else {
+                    let R(x9) = f1(c, mk(c, 3, None, None).v, (x5, acc).0, [b, b][1]) else {
+                        return f1(c, 13, a, b);
+                    };
+                    return V.R((mk(c, 5, None, None), k).0);
+                };
+                    acc += gc(c);
+                    acc = mix(acc, dn(x11));
+            } else {
+            }
+        }
+    }
+    acc += gc(c);
+    acc += gc(c);
+    pick(mk(c, 13, None, None), a, k).r = none();
+    V.R(mk(c, acc, b, b))
+}
+
+fn f1(c: *Ctx, k: i64, a: Gc<Node>, b: ?Gc<Node>) -> V uses gc {
+    if c.fuel <= 0 { return V.Nil; }
+    c.fuel -= 1;
+    var acc: i64 = k;
+    match f2(c, acc, a, c.keep) {
+        Nil => {
+        }
+        R(x13) if gcf(c) => {
+        acc = mix(acc, match E.Nil {
+            E.Nil | E.One(_) if gcf(c) => {
+            let (x16, x17) = (x13, acc);
+            k
+            }
+            _ => {
+            14
+            }
+        });
+        if k % 3 != 1 {
+            var s18: i64 = 0;
+            let x19: E = loop {
+                s18 += 1;
+                if s18 > 2 { break E.Nil; }
+                if gcb(c) and k % 3 == 0 {
+                    let x20: i64 = (acc % 13);
+                    acc += gc(c);
+                } else {
+                    var x21: i64 = f3(c, acc, (Pair { a: mk(c, 10, None, None), b: b, k: acc }).a, [b, b][1]);
+                    acc += gc(c);
+                }
+                if k % 2 == 1 and gcb(c) { break E.Nil; }
+            };
+        } else {
+            var w22: ?Gc<Node> = b;
+            var s23: i64 = 0;
+            while let Some(x24) = w22 {
+                s23 += 1;
+                if s23 > 3 { break; }
+                w22 = x24.l;
+                c.keep = b;
+                acc += gc(c);
+            }
+        }
+            acc += gc(c);
+            acc = mix(acc, dn(x13));
+        }
+        _ => {
+        }
+    }
+    defer { c.sum = mix(c.sum, dt((a, k))); gc(c); }
+    defer { c.sum = mix(c.sum, dt((a, k))); }
+    acc = mix(acc, dp((Pair { a: a, b: b, k: (acc % 13) })));
+    let x25: E = E.One(a);
+    var x26: V = V.R(a);
+    let x27: E = x25;
+    var s28: i64 = 0;
+    let x29: Pair = loop {
+        s28 += 1;
+        if s28 > 2 { break (Pair { a: a, b: (Pair { a: a, b: b, k: acc }).b, k: k }); }
+        var wk30: ?Gc<gc.Weak<Node>> = None;
+        {
+            let t31 = mk(c, 15, None, None);
+            let (x32, x33) = (pick(a, t31, k), acc);
+            wk30 = Some(c.heap.new_weak(t31));
+        }
+        acc += dead(c, wk30);
+        if gcb(c) and k % 3 == 0 { break (Pair { a: a, b: b, k: dt((a, k)) }); }
+    };
+    V.R(a)
+}
+
+fn f2(c: *Ctx, k: i64, a: Gc<Node>, b: ?Gc<Node>) -> V uses gc {
+    if c.fuel <= 0 { return V.Nil; }
+    c.fuel -= 1;
+    var acc: i64 = k;
+    var x34: [?Gc<Node>; 2] = [b, b];
+    let x35: [?Gc<Node>; 2] = x34;
+    var s36: i64 = 0;
+    let x37: V = loop {
+        s36 += 1;
+        if s36 > 2 { break V.R(a); }
+        var x38: Gc<Node> = (Pair { a: a, b: b, k: k }).a;
+        if (k + k) % 97 % 2 == 0 { break V.Num(2.5); }
+    };
+    let E.Two(x39, x40) = E.Pr((Pair { a: mk(c, 19, None, None), b: b, k: acc })) else {
+        if k % 3 != 1 { return x37; }
+        return x37;
+    };
+    var w41: ?Gc<Node> = x40.l;
+    var s42: i64 = 0;
+    while let Some(x43) = w41 {
+        s42 += 1;
+        if s42 > 3 { break; }
+        w41 = x43.l;
+        var wk44: ?Gc<gc.Weak<Node>> = None;
+        {
+            let t45 = mk(c, 14, None, None);
+            var w46: ?Gc<Node> = b;
+            var s47: i64 = 0;
+            while let Some(x48) = w46 {
+                s47 += 1;
+                if s47 > 3 { break; }
+                w46 = x48.l;
+                acc = mix(acc, da([Some(x48), b]));
+                let (x49, x50) = (a, dp((Pair { a: x39, b: b, k: k })));
+            }
+            wk44 = Some(c.heap.new_weak(t45));
+        }
+        acc += dead(c, wk44);
+        var w51: ?Gc<Node> = (Pair { a: x43, b: b, k: k }).b;
+        var s52: i64 = 0;
+        while let Some(x53) = w51 {
+            s52 += 1;
+            if s52 > 3 { break; }
+            w51 = x53.l;
+            for i54 in 0..1 {
+                var x55: E = E.Pr((Pair { a: a, b: b, k: i54 }));
+                var wk56: ?Gc<gc.Weak<Node>> = None;
+                {
+                    let t57 = mk(c, 7, None, None);
+                    if gcb(c) and k % 3 == 0 { continue; }
+                    let x58: Pair = (Pair { a: x43, b: b, k: acc });
+                    wk56 = Some(c.heap.new_weak(t57));
+                }
+                acc += dead(c, wk56);
+            }
+        }
+    }
+    x37
+}
+
+fn f3(c: *Ctx, k: i64, a: Gc<Node>, b: ?Gc<Node>) -> i64 uses gc {
+    if c.fuel <= 0 { return k; }
+    c.fuel -= 1;
+    var acc: i64 = k;
+    acc += gc(c);
+    let (x59, x60) = (a, acc);
+    acc += gc(c);
+    if let E.Pr(x61) = E.Two(a, x59) and k % 2 == 1 and gcb(c) {
+            acc += gc(c);
+            acc = mix(acc, dp(x61));
+        if k % 2 == 1 and gcb(c) {
+            var x63: V = V.R(x61.a);
+            let (x64, x65) = (x59, x60);
+            var x66: ?Gc<Node> = [b, b][1];
+        } else {
+            let E.One(x67) = E.Nil else {
+                return gc(c);
+            };
+                acc += gc(c);
+                acc = mix(acc, dn(x67));
+        }
+    } else {
+        acc = mix(acc, dv(V.Nil));
+    }
+    acc = mix(acc, da([c.keep, b]));
+    if k % 2 == 1 and gcb(c) {
+        acc += gc(c);
+        var wk69: ?Gc<gc.Weak<Node>> = None;
+        {
+            let t70 = mk(c, 6, None, None);
+            acc = mix(acc, dn(mk(c, k, b, b)));
+            var x71: V = V.Nil;
+            if let Some(x72) = (Pair { a: mk(c, 6, None, None), b: b, k: k }).b and (acc + (k + acc) % 97) % 4 < 2 and let E.Two(x74, x75) = E.Pr((Pair { a: x59, b: b, k: k })) {
+                    acc += gc(c);
+                    acc = mix(acc, dn(x72));
+                    acc = mix(acc, dn(x74));
+                    acc = mix(acc, dn(x75));
+                for i76 in 0..2 {
+                    acc = mix(acc, dt((x59, dn(x59))));
+                    acc += gc(c);
+                    defer { c.sum = mix(c.sum, dn((b ?? x75))); gc(c); }
+                }
+                let x77: ?Gc<Node> = c.keep;
+            } else {
+            }
+            wk69 = Some(c.heap.new_weak(t70));
+        }
+        acc += dead(c, wk69);
+    } else {
+        for i78 in 0..3 {
+            let E.One(x79) = E.Pr((Pair { a: x59, b: b, k: k })) else {
+                continue;
+            };
+                acc += gc(c);
+                acc = mix(acc, dn(x79));
+            var x81: Pair = (Pair { a: pick(mk(c, 6, None, None), x59, k), b: b, k: a.v });
+            acc = mix(acc, dn(pick(a, mk(c, 7, Some(mk(c, 0, None, None)), b), dp((Pair { a: mk(c, 8, None, None), b: b, k: i78 })))));
+        }
+    }
+    mix(acc, da([b, Some(a)]))
+}
+
+vm M {
+    context c: *Ctx;
+    state { pc: *u32, acc: i64, cur: ?Gc<Node>, tos: V }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    fn vf0(k: i64, a: Gc<Node>) -> i64 {
+        var w82: ?Gc<Node> = Some(a);
+        var s83: i64 = 0;
+        while let Some(x84) = w82 {
+            s83 += 1;
+            if s83 > 3 { break; }
+            w82 = x84.l;
+            let x85: [?Gc<Node>; 2] = [none(), cur];
+            acc += gc(c);
+            if k % 2 == 0 {
+                var x86: Gc<Node> = pick(x84, x84, k);
+            } else {
+                acc = mix(acc, dp((Pair { a: a, b: x85[1], k: (acc % 13) })));
+            }
+        }
+        acc = mix(acc, dv(V.R(a)));
+        mix(acc, dt((a, k)))
+    }
+    fn vf1(k: i64, a: Gc<Node>) -> i64 {
+        acc += gc(c);
+        acc += gc(c);
+        if let Some(x87) = Some(a) {
+            let x89: i64 = k;
+        } else {
+            var s90: i64 = 0;
+            let x91: (Gc<Node>, i64) = loop {
+                s90 += 1;
+                if s90 > 2 { break ((Pair { a: a, b: Some(mk(c, 8, None, None)), k: k }).a, k); }
+                let x92: (Gc<Node>, i64) = (a, dt((a, k)));
+                let E.Two(x93, x94) = E.Nil else {
+                    acc += gc(c);
+                    acc += gc(c);
+                    break x92;
+                };
+                    acc += gc(c);
+                    acc = mix(acc, dn(x93));
+                    acc = mix(acc, dn(x94));
+                if k % 2 == 0 { break (x93, k); }
+            };
+        }
+        defer { c.sum = mix(c.sum, dig(c.keep, 3)); }
+        mix(acc, dig(c.keep, 3))
+    }
+    op OP0(k: imm) : N {
+        let kk: i64 = k as i64;
+        var wk95: ?Gc<gc.Weak<Node>> = None;
+        {
+            let t96 = mk(c, 11, None, None);
+            let x97: V = V.R((Some(mk(c, 12, None, None)) ?? t96));
+            var x98: [?Gc<Node>; 2] = [Some(t96), t96.l];
+            wk95 = Some(c.heap.new_weak(t96));
+        }
+        acc += dead(c, wk95);
+        match E.Pr((Pair { a: mk(c, 19, None, None), b: none(), k: kk })) {
+            E.Nil if gcb(c) and kk % 3 == 0 => {
+            let Some(x102) = mk(c, kk, none(), none()).l else {
+                var x101: Gc<Node> = mk(c, kk, mk(c, 1, None, None).l, c.keep);
+                next
+            };
+                acc += gc(c);
+                acc = mix(acc, dn(x102));
+            }
+            E.Two(_, x100) if x100.v > 8 => {
+            if (acc + (acc % 13)) % 4 < 2 { cold {
+                acc = mix(acc, dp((Pair { a: x100, b: c.keep, k: kk })));
+                if x100.v % 2 == 0 {
+                    acc += gc(c);
+                    let (x104, x105) = (x100, kk);
+                } else {
+                }
+                acc = mix(acc, match (E.Pr((Pair { a: x100, b: none(), k: kk })), x100.l) {
+                    (_, Some(x107)) => {
+                    let x108: i64 = gc(c);
+                    let x109: Pair = (Pair { a: x100, b: c.keep, k: kk });
+                    (acc % 13)
+                    }
+                    (E.Two(x106, _), _) if x106.v % 2 == 0 and gcb(c) => {
+                    let (x110, x111) = (x100, dn(x100));
+                    let (E.One(x112), Some(x113)) = (E.Nil, cur) else {
+                        raise x111
+                    };
+                        acc += gc(c);
+                        acc = mix(acc, dn(x112));
+                        acc = mix(acc, dn(x113));
+                        acc += gc(c);
+                        acc = mix(acc, dn(x106));
+                    x113.v
+                    }
+                    (E.Pr(x106), None) => {
+                        acc += gc(c);
+                        acc = mix(acc, dp(x106));
+                    kk
+                    }
+                    (E.One(x106), Some(x107)) if x106.v % 2 == 0 and gcb(c) => {
+                        acc += gc(c);
+                        acc = mix(acc, dn(x106));
+                        acc = mix(acc, dn(x107));
+                    (acc % 13)
+                    }
+                    _ => {
+                    17
+                    }
+                });
+                next
+            } }
+            let x114: E = E.Two(x100, (none() ?? x100));
+                acc += gc(c);
+                acc = mix(acc, dn(x100));
+            }
+            E.One(x99) if x99.v % 2 == 0 and gcb(c) => {
+                acc += gc(c);
+                acc = mix(acc, dn(x99));
+            }
+            E.Nil | E.One(_) if gcb(c) => {
+            var w115: ?Gc<Node> = c.keep;
+            var s116: i64 = 0;
+            while let Some(x117) = w115 {
+                s116 += 1;
+                if s116 > 3 { break; }
+                w115 = x117.l;
+                let E.One(x118) = E.Pr((Pair { a: x117, b: Some(mk(c, 3, None, None)), k: kk })) else cold {
+                    next
+                };
+            }
+            acc += gc(c);
+            }
+            _ => {
+            }
+        }
+        if gcb(c) and kk % 3 == 0 {
+            acc += gc(c);
+        } else {
+            let x120: [?Gc<Node>; 2] = [Some(mk(c, 19, None, None)), none()];
+        }
+        next
+    }
+    op OP1(k: imm) : N {
+        let kk: i64 = k as i64;
+        let x121: (Gc<Node>, i64) = (mk(c, kk, none(), none()), kk);
+        match Some(pick(mk(c, 17, None, None), mk(c, 5, None, None), kk)) {
+            None => {
+            var x123: (Gc<Node>, i64) = (mk(c, kk, Some(mk(c, 11, None, None)), none()), kk);
+            }
+            Some(x122) if gcb(c) => {
+            var wk124: ?Gc<gc.Weak<Node>> = None;
+            {
+                let t125 = mk(c, 17, None, None);
+                if kk % 2 == 1 and gcb(c) {
+                    defer { c.sum = mix(c.sum, da([Some(mk(c, 10, None, None)), none()])); gc(c); }
+                } else {
+                    let x126: V = f2(c, kk, mk(c, kk, none(), Some(mk(c, 11, None, None))), c.keep);
+                }
+                var w127: ?Gc<Node> = t125.l;
+                var s128: i64 = 0;
+                while let Some(x129) = w127 {
+                    s128 += 1;
+                    if s128 > 3 { break; }
+                    w127 = x129.l;
+                    let Some(x131) = x129.l else {
+                        let x130: [?Gc<Node>; 2] = [cur, [Some(mk(c, 16, None, None)), Some(mk(c, 12, None, None))][0]];
+                        acc = mix(acc, dig(none(), 3));
+                        next
+                    };
+                        acc += gc(c);
+                        acc = mix(acc, dn(x131));
+                    let x133: Gc<Node> = x131;
+                    defer { c.sum = mix(c.sum, dn(mk(c, kk, Some(mk(c, 19, None, None)), Some(mk(c, 18, None, None))))); gc(c); }
+                }
+                var x134: ?Gc<Node> = cur;
+                acc += gc(c);
+                wk124 = Some(c.heap.new_weak(t125));
+            }
+            acc += dead(c, wk124);
+                acc += gc(c);
+                acc = mix(acc, dn(x122));
+            }
+            _ => {
+                let x135: Gc<Node> = mk(c, 7, None, None);
+            }
+        }
+        let (E.One(x166), Some(x167)) = (E.Nil, none()) else {
+            if let (E.One(x136), Some(x137)) = (E.Two((Some(mk(c, 18, None, None)) ?? mk(c, 10, None, None)), x121.0), cur) and let E.Pr(x138) = E.Two(mk(c, kk, Some(mk(c, 9, None, None)), Some(mk(c, 6, None, None))), x136) {
+                var wk140: ?Gc<gc.Weak<Node>> = None;
+                {
+                    let t141 = mk(c, 6, None, None);
+                    let x142: E = E.Pr(x138);
+                    let x143: (Gc<Node>, i64) = (x138.a, kk);
+                    acc = mix(acc, dt((x136, kk)));
+                    acc = mix(acc, dt(x143));
+                    wk140 = Some(c.heap.new_weak(t141));
+                }
+                acc += dead(c, wk140);
+                if let Some(x144) = Some(mk(c, kk, none(), Some(mk(c, 10, None, None)))) {
+                        acc += gc(c);
+                        acc = mix(acc, dn(x144));
+                    defer { c.sum = mix(c.sum, de(E.Two(x136, x136))); }
+                } else {
+                    defer { c.sum = mix(c.sum, dig(Some(x136), 3)); gc(c); }
+                }
+                if let E.Two(x146, x147) = E.Two(x137, mk(c, kk, none(), Some(mk(c, 17, None, None)))) and x121.0.v > 8 {
+                        acc += gc(c);
+                        acc = mix(acc, dn(x146));
+                        acc = mix(acc, dn(x147));
+                    let Some(x148) = [Some(mk(c, 6, None, None)), none()][1] else {
+                        next
+                    };
+                    let Some(x152) = c.keep else cold {
+                        let E.Pr(x150) = E.Two(x121.0, pick(x136, mk(c, 11, None, None), kk)) else {
+                            if (acc + 2) % 4 < 2 { next }
+                            c.keep = none();
+                            next
+                        };
+                        cur = [none(), none()][1];
+                        raise (acc % 13)
+                    };
+                } else {
+                }
+            } else {
+            }
+            if (acc + kk) % 4 < 2 {
+                match (E.Two(mk(c, 17, None, None), x121.0), mk(c, 3, None, None).l) {
+                    (E.One(x154), Some(x155)) if x154.v % 2 == 0 and gcb(c) => {
+                    let (x156, x157) = x121;
+                    }
+                    _ => {
+                    }
+                }
+                let x158: [?Gc<Node>; 2] = [Some(mk(c, 5, None, None)), Some(mk(c, 7, None, None))];
+                if kk % 2 == 0 { cold {
+                    var x159: ?Gc<Node> = cur;
+                    next
+                } }
+            } else {
+                acc += gc(c);
+                if let Some(x160) = Some(pick(mk(c, 4, None, None), mk(c, 12, None, None), 0)) and kk % 2 == 1 and gcb(c) {
+                        acc += gc(c);
+                        acc = mix(acc, dn(x160));
+                    let x162: i64 = vf1(kk, (Pair { a: mk(c, 1, None, None), b: Some(mk(c, 3, None, None)), k: kk }).a);
+                    acc = mix(acc, da([none(), Some(x160)]));
+                } else {
+                    let E.Two(x164, x165) = E.Pr((Pair { a: mk(c, 17, None, None), b: Some(mk(c, 17, None, None)), k: kk })) else {
+                        let x163: (Gc<Node>, i64) = x121;
+                        next
+                    };
+                }
+            }
+            raise (acc % 13)
+        };
+            acc += gc(c);
+            acc = mix(acc, dn(x166));
+            acc = mix(acc, dn(x167));
+        next
+    }
+    op OP2(k: imm) : N {
+        let kk: i64 = k as i64;
+        let Some(x172) = (Some(mk(c, 2, None, None)) ?? mk(c, 0, None, None)).l else cold {
+            acc = mix(acc, da([Some(mk(c, 5, None, None)), Some(mk(c, 19, None, None))]));
+            var w168: ?Gc<Node> = cur;
+            var s169: i64 = 0;
+            while let Some(x170) = w168 {
+                s169 += 1;
+                if s169 > 3 { break; }
+                w168 = x170.l;
+                let x171: E = E.Pr((Pair { a: x170, b: Some(mk(c, 3, None, None)), k: kk }));
+            }
+            next
+        };
+            acc += gc(c);
+            acc = mix(acc, dn(x172));
+        var s174: i64 = 0;
+        let x175: Gc<Node> = loop {
+            s174 += 1;
+            if s174 > 2 { break pick(mk(c, kk, none(), Some(mk(c, 15, None, None))), (Pair { a: mk(c, 19, None, None), b: none(), k: kk }).a, kk); }
+            defer { c.sum = mix(c.sum, da([none(), none()])); gc(c); }
+            var x176: ?Gc<Node> = [none(), Some(mk(c, 8, None, None))][1];
+            let E.One(x179) = E.Two(x172, x172) else cold {
+                let Some(x177) = none() else {
+                    next
+                };
+                    acc += gc(c);
+                    acc = mix(acc, dn(x177));
+                raise 13
+            };
+                acc += gc(c);
+                acc = mix(acc, dn(x179));
+            if kk % 2 == 0 { break x172; }
+        };
+        next
+    }
+    op HALT() : N { exit (acc + dig(cur, 3) + dv(tos)) % MD }
+
+    operand imm = it;
+
+    on raise(e: i64) {
+        let x181: (Gc<Node>, i64) = (pick(mk(c, 12, None, None), mk(c, 5, None, None), e), e);
+        exit (acc + e) % MD
+    }
+
+    entry run(cx: *Ctx, code: *u32) -> i64 uses gc { c = cx; pc = code; acc = 0; cur = None; tos = V.Nil; jump code }
+}
+
+fn main() uses gc {
+    let mode = os.arg_count();
+    var c = Ctx { heap: gc.Heap.new(), keep: None, sum: 0, fuel: 0, leaks: 0, gen: false, gcs: 0 };
+    c.heap.add_scanner(&c as *u8, scan);
+    if mode == 2 { c.heap.set_stress(true); }
+    if mode == 3 { c.heap.set_generational(true); c.heap.set_stress(true); c.heap.set_verify(true); c.gen = true; }
+    c.fuel = 40;
+    io.print_int(dv(f0(&c, 1, mk(&c, 1, None, None), None)));
+    io.println(" f0");
+    c.fuel = 40;
+    io.print_int(dv(f0(&c, 5, mk(&c, 2, None, None), Some(mk(&c, 4, None, None)))));
+    io.println(" f0");
+    c.fuel = 40;
+    io.print_int(dv(f1(&c, 16, mk(&c, 1, None, None), None)));
+    io.println(" f1");
+    c.fuel = 40;
+    io.print_int(dv(f1(&c, 10, mk(&c, 2, None, None), Some(mk(&c, 4, None, None)))));
+    io.println(" f1");
+    c.fuel = 40;
+    io.print_int(dv(f2(&c, 0, mk(&c, 1, None, None), None)));
+    io.println(" f2");
+    c.fuel = 40;
+    io.print_int(dv(f2(&c, 18, mk(&c, 2, None, None), Some(mk(&c, 4, None, None)))));
+    io.println(" f2");
+    c.fuel = 40;
+    io.print_int(((f3(&c, 19, mk(&c, 1, None, None), None)) % MD + MD) % MD);
+    io.println(" f3");
+    c.fuel = 40;
+    io.print_int(((f3(&c, 10, mk(&c, 2, None, None), Some(mk(&c, 4, None, None)))) % MD + MD) % MD);
+    io.println(" f3");
+    {
+        var code: [u32; 8] = [M.OP0(4), M.OP1(9), M.OP0(3), M.OP0(19), M.OP1(0), M.OP1(16), M.OP1(10), M.HALT()];
+        for i in 0..2 {
+            c.fuel = 40;
+            io.print_int(M.run(&c, &code[0]));
+            io.println(" vm0");
+        }
+    }
+    {
+        var code: [u32; 7] = [M.OP0(9), M.OP2(9), M.OP0(5), M.OP2(3), M.OP0(11), M.OP2(9), M.HALT()];
+        for i in 0..2 {
+            c.fuel = 40;
+            io.print_int(M.run(&c, &code[0]));
+            io.println(" vm1");
+        }
+    }
+    {
+        var code: [u32; 3] = [M.OP1(8), M.OP2(2), M.HALT()];
+        for i in 0..2 {
+            c.fuel = 40;
+            io.print_int(M.run(&c, &code[0]));
+            io.println(" vm2");
+        }
+    }
+    io.print_int(c.sum);
+    io.println(" sum");
+    io.print("leaks ");
+    io.print_int(if c.gen { 0 } else { c.leaks });
+    io.println("");
+    c.heap.free();
+}

@@ -225,7 +225,12 @@ end in it) and `F64_NEG` is `-a` on `rd` (was `a ^ sign` on `rq`; LLVM's
 names 90 ops: marking every op with an operand of an accumulator's kind
 gave about 660 variants, and the goto-mode build (one function with
 every handler) ran out of its 2.5 GB address space in instruction
-selection; with 287 it takes 1 GB and 3.5 minutes.
+selection; with 287 it took 1 GB and 3.5 minutes. Since goto mode emits
+one shared dispatch block that LLVM copies into the handlers after
+register allocation (`docs/lowering.md` §5), the build with 287 takes
+17 s and 220 MB, and marking every eligible op (1170 dispatch targets)
+39 s and 325 MB: the op count is no longer limited by goto mode. The
+list stays at 90 ops for the tail-call build's size.
 
 **Limits.** Selection is greedy left to right and per adjacent pair: in
 `x = a / b; y = load; x * y` the division keeps its slot because the
