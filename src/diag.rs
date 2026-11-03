@@ -217,3 +217,42 @@ impl SourceMap {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A user file, and an expansion that copies `x + 1` from it.
+    fn map() -> SourceMap {
+        let mut sm = SourceMap::default();
+        sm.add("a.lm".into(), "vm V {\n    operand r = it verify x + 1;\n}\n".into());
+        let text = "fn f() {\n  let __w = 0; if !(x + 1) { }\n}\n";
+        let lo = text.find("x + 1").unwrap() as u32;
+        let src = Span { file: 0, lo: 33, hi: 38 };
+        let o = Origin { lo, hi: lo + 5, src, whole: src, ctx: "the generated verifier".into() };
+        sm.add_generated("<vm V expansion>".into(), text.into(), Generated { vm: "V".into(), origins: vec![o] });
+        sm
+    }
+
+    #[test]
+    fn user_text_in_expansion() {
+        let sm = map();
+        let lo = sm.files[1].text.find("x + 1").unwrap() as u32;
+        let out = sm.render(&Diag::new(Span { file: 1, lo, hi: lo + 1 }, "unknown name `x`"));
+        assert!(out.contains("--> a.lm:2:27\n"), "{out}");
+        assert!(out.contains("note: in the generated verifier\n"), "{out}");
+        // `(x + 1)`, with generated parentheses: the user's part.
+        assert_eq!(sm.user_span(Span { file: 1, lo: lo - 1, hi: lo + 6 }), Span { file: 0, lo: 33, hi: 38 });
+        // Generated text spanning lines is not the user's.
+        assert_eq!(sm.user_span(Span { file: 1, lo: 0, hi: lo + 6 }), Span { file: 1, lo: 0, hi: lo + 6 });
+    }
+
+    #[test]
+    fn generated_glue() {
+        let sm = map();
+        let out = sm.render(&Diag::new(Span { file: 1, lo: 11, hi: 14 }, "oops"));
+        assert!(out.contains("--> <vm V expansion>:2:3"), "{out}");
+        assert!(out.contains("note: internal: generated code"), "{out}");
+        assert!(out.contains("LOIMI_DUMP_VM_EXPANSION=1"), "{out}");
+    }
+}

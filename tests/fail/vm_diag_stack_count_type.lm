@@ -1,0 +1,28 @@
+// A count of the wrong type is reported at the count.
+// error: cannot cast `[]u8` to `i64`
+// error: vm_diag_stack_count_type.lm:18:33
+// error: note: in the generated stack check, counting op `SUM`'s stack effect
+struct Fn { nin: u32, nout: u32 }
+
+vm S {
+    state { pc: *u32, sp: *i64 }
+    verify_context f: *Fn;
+    stack_entry f.nin;
+
+    operand imm = it;
+    operand cnt = it;
+
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    op PUSH(v: imm) : N stack(-- v) { sp = sp + 1; *sp = v as i64; next }
+    op SUM(n: cnt) : N stack(xs["n"] -- s) { sp = sp - n + 1; next }
+    op RET() : N stack(r[f.nout] --) { exit *sp }
+
+    entry run(code: Verified<S>, stack: *i64) -> i64 { pc = code.start(); sp = stack; jump code }
+}
+
+fn main() {
+    let f0 = Fn { nin: 0, nout: 1 };
+    var code: [u32; 2] = [S.PUSH(1), S.RET()];
+    let _ = S.verify(code[..], &f0);
+}

@@ -565,6 +565,14 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
         }
     }
+    for o in &v.operands {
+        if let Some(e) = &o.verify {
+            check_call_arity(sm, e.span, &[("is_insn_boundary", 1)])?;
+        }
+    }
+    for (_, b) in &v.checks {
+        check_call_arity(sm, b.span, &[("is_insn_boundary", 1), ("reject", 2)])?;
+    }
     let boundary = format!("{n}__boundary(__code, &__bits, ");
     let clause = |kind: &str| -> Option<String> {
         let e = v.operands.iter().find(|o| o.name.name == kind)?.verify.as_ref()?;
@@ -1501,6 +1509,47 @@ fn call_segs(segs: Vec<Seg>, name: &str, repl: &str) -> Vec<Seg> {
         }
     }
     out
+}
+
+/// The calls `splice_calls` rewrites take hidden arguments, so the
+/// checker's argument counts would be off: check each `(name, n)`'s calls
+/// in the user's text at `span` take `n` arguments.
+fn check_call_arity(sm: &SourceMap, span: Span, calls: &[(&str, usize)]) -> Res<()> {
+    use crate::lexer::Tok;
+    let Ok(toks) = crate::lexer::lex(span.file, sm.text(span)) else { return Ok(()) };
+    for (i, t) in toks.iter().enumerate() {
+        let Tok::Ident(x) = &t.tok else { continue };
+        let Some(&(name, want)) = calls.iter().find(|c| c.0 == x) else { continue };
+        if i > 0 && toks[i - 1].tok == Tok::Punct(".") || toks.get(i + 1).map(|t| &t.tok) != Some(&Tok::Punct("(")) {
+            continue;
+        }
+        let (mut depth, mut commas, mut empty) = (0, 0, true);
+        let mut end = t.span;
+        for u in &toks[i + 1..] {
+            end = u.span;
+            match &u.tok {
+                Tok::Punct("(" | "[" | "{") => depth += 1,
+                Tok::Punct(")" | "]" | "}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Punct(",") if depth == 1 => commas += 1,
+                _ => {}
+            }
+            if depth >= 1 && u.tok != Tok::Punct("(") {
+                empty = false;
+            }
+        }
+        let got = if empty { 0 } else { commas + 1 };
+        if got != want {
+            let at = Span { file: span.file, lo: span.lo + t.span.lo, hi: span.lo + end.hi };
+            let what = if name == "reject" { "2 arguments (`reject(at, msg)`)" } else { "1 argument (`is_insn_boundary(p)`)" };
+            return Err(Diag::new(at, format!("`{name}` takes {what}, got {got}")));
+        }
+    }
+    Ok(())
 }
 
 /// The generated source without the markers `splice` adds, and where the

@@ -1,0 +1,50 @@
+// `is_insn_boundary` takes one argument.
+// error: `is_insn_boundary` takes 1 argument (`is_insn_boundary(p)`), got 2
+// error: vm_diag_boundary_arity.lm:12:36
+struct Proto { nregs: u32, nconsts: u64, consts: *i64 }
+
+vm M {
+    state { pc: *u32, regs: *i64, k: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs display "r{}";
+    operand kst = k[it] const proto.consts verify it < proto.nconsts;
+    operand label = pc + it verify is_insn_boundary(pc, it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format J { op: 8, sx: s24 }
+    }
+
+    op LOADK(dst: reg, c: kst) : ABC { dst = c; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { if b == 0 { cold { raise 1 } } dst = a + b; next }
+    family NEG(dst: reg, a: reg) : ABC {
+        generic { become NEG_Q; redo }
+        NEG_Q { dst = 0 - a; next }
+    }
+    op JMP(t: label) : J { jump t }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_RET = ADD; RET;
+
+    verify nonempty {
+        var ok = code.len > 0;
+        if code.len > 1 and !is_insn_boundary(code.ptr + 1) { reject(1, "split"); }
+        ok
+    }
+
+    on raise(e: i64) { exit 0 - e }
+
+    variant count wraps all { before { let n = 1; } }
+
+    entry run(code: *u32, r: *i64, consts: *i64) -> i64 { pc = code; regs = r; k = consts; jump pc }
+}
+
+fn main() {
+    var ks: [i64; 1] = [5];
+    var p = Proto { nregs: 2, consts: &ks[0], nconsts: 1 };
+    var code: [u32; 2] = [M.LOADK(0, 0), M.RET(0)];
+    let _ = M.verify(code[..], &p);
+    var regs: [i64; 2] = [0; 2];
+    let _ = M.run(&code[0], &regs[0], &ks[0]);
+}
