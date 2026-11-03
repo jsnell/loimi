@@ -17,3 +17,4 @@ __pycache__/
 /bench/cross/src
 /bench/cross/install
 /bench/cross/sysroot-aarch64
+/qemu_*.core

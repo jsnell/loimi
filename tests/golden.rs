@@ -40,10 +40,10 @@ fn directives(text: &str, key: &str) -> Vec<String> {
 /// runaway test program fails instead of exhausting the machine.
 const MEM_LIMIT_KB: u64 = 2 * 1024 * 1024;
 
-/// `prog`, run under the memory cap.
+/// `prog`, run under the memory cap, without core dumps (qemu writes its own).
 fn limited(prog: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut c = Command::new("sh");
-    c.arg("-c").arg(format!("ulimit -v {} && exec \"$0\" \"$@\"", MEM_LIMIT_KB)).arg(prog);
+    c.arg("-c").arg(format!("ulimit -v {} && ulimit -c 0 && exec \"$0\" \"$@\"", MEM_LIMIT_KB)).arg(prog);
     c
 }
 
@@ -314,17 +314,24 @@ fn aarch64_qemu() {
     let sysroot = sysroot.display().to_string();
     let env = [("LOIMI_TARGET", "aarch64-linux-gnu"), ("LOIMI_SYSROOT", sysroot.as_str()), ("LOIMI_RUNNER", runner.as_str())];
     let xenv: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    run_programs_with(&xenv, |name, text| {
-        directives(text, "matrix").iter().any(|m| m.trim() == "dispatch") || name.starts_with("gc_") || text.contains("import std.rt")
-    });
-    std_test_with(&xenv);
-    for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
-        mini_scripts_with(&[mode], &env, |name| {
-            ["sort", "err_sort", "gc", "lib_gc", "err_syntax", "closures", "tables", "arith_quicken"].iter().any(|p| name.starts_with(p))
+    // Mostly clang and qemu time: three parts side by side.
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            run_programs_with(&xenv, |name, text| {
+                directives(text, "matrix").iter().any(|m| m.trim() == "dispatch") || name.starts_with("gc_") || text.contains("import std.rt")
+            })
         });
-    }
-    let out = Command::new("bash").arg(root.join("examples/stack/check.sh")).env("LOIMI", env!("CARGO_BIN_EXE_loimi")).env("LOIMI_STD", root).envs(env).output().unwrap();
-    assert!(out.status.success(), "examples/stack/check.sh (aarch64) failed:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        s.spawn(|| {
+            for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
+                mini_scripts_with(&[mode], &env, |name| {
+                    ["sort", "err_sort", "gc", "lib_gc", "err_syntax", "closures", "tables", "arith_quicken"].iter().any(|p| name.starts_with(p))
+                });
+            }
+        });
+        std_test_with(&xenv);
+        let out = Command::new("bash").arg(root.join("examples/stack/check.sh")).env("LOIMI", env!("CARGO_BIN_EXE_loimi")).env("LOIMI_STD", root).envs(env).output().unwrap();
+        assert!(out.status.success(), "examples/stack/check.sh (aarch64) failed:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    });
 }
 
 /// The runner in `env` (`LOIMI_RUNNER`), else the process's.
