@@ -6,7 +6,7 @@
 use std::fmt::Write;
 
 use crate::ast::*;
-use crate::diag::{Diag, Res, SourceMap};
+use crate::diag::{Diag, Generated, Origin, Res, SourceMap, Span};
 use crate::values::low_mask;
 use crate::vmast::*;
 
@@ -565,8 +565,11 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             return Err(Diag::new(p.name.span, format!("`{}` is reserved in verify clauses; rename this verify_context", p.name.name)));
         }
     }
+    let boundary = format!("{n}__boundary(__code, &__bits, ");
     let clause = |kind: &str| -> Option<String> {
-        Some(replace_call(&clause_text(sm, v, kind)?, "is_insn_boundary", &format!("{n}__boundary(__code, &__bits, ")))
+        let e = v.operands.iter().find(|o| o.name.name == kind)?.verify.as_ref()?;
+        let ctx = format!("the generated verifier, checking operand kind `{kind}`");
+        Some(splice_calls(sm, e.span, &ctx, &[("is_insn_boundary", &boundary)]))
     };
     let mut s = generate_verifier_types(sm, v, l);
     let stack = has_stack(v);
@@ -588,7 +591,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     );
     let mut params = vec![format!("__code: []{w}")];
     for p in &v.verify_ctx {
-        params.push(format!("{}: {}", p.name.name, sm.text(p.ty.span)));
+        params.push(format!("{}: {}", p.name.name, splice(sm, p.ty.span, &ctx_param_note(p))));
     }
     // `const` operand kinds: the constant pool of verified code, from the
     // verify context, as the type of the state register the kinds index
@@ -598,7 +601,8 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         let crate::ast::ExprKind::Index(b, _) = &o.body.kind else { return None };
         let crate::ast::ExprKind::Ident(sn) = &b.kind else { return None };
         let st = v.state.iter().find(|p| p.name.name == *sn)?;
-        Some((sm.text(e.span).to_string(), sm.text(st.ty.span).to_string()))
+        let ctx = format!("the generated constant pool accessor of `const` operand kind `{}`", o.name.name);
+        Some((splice(sm, e.span, &ctx), splice(sm, st.ty.span, &ctx)))
     });
     if let Some((e, t)) = &konst {
         let _ = writeln!(s, "fn {n}__const_pool({}) -> *u8 {{ let __p: {t} = {e}; __p as *u8 }}", params[1..].join(", "));
@@ -753,8 +757,12 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
             if v.verify_ctx.iter().any(|p| p.name.name == "code") {
                 return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
             }
-            let text = replace_call(sm.text(b.span), "is_insn_boundary", &format!("{n}__boundary(code, __bits, "));
-            let text = replace_call(&text, "reject", &format!("return {n}__reject(code, {i}, "));
+            let text = splice_calls(
+                sm,
+                b.span,
+                &format!("the generated verifier, running `verify {}`", name.name),
+                &[("is_insn_boundary", &format!("{n}__boundary(code, __bits, ")), ("reject", &format!("return {n}__reject(code, {i}, "))],
+            );
             let _ = writeln!(
                 s,
                 "  {{ let __ok: bool = {text}; if !__ok {{ return Err({n}__VerifyError {{ at: 0, reason: {n}__VerifyReason.Check, op: {n}__NUM_OPS, operand: {i}, kind: {nk}, msg: \"\" }}); }} }}"
@@ -775,6 +783,11 @@ fn proof_src(v: &VmDecl, code: &str, max: &str) -> String {
     } else {
         format!("{n}__Verified {{ __code: {code} }}")
     }
+}
+
+/// The context of a verify_context parameter's type in generated code.
+fn ctx_param_note(p: &Param) -> String {
+    format!("the generated verifier's parameters (verify_context `{}`)", p.name.name)
 }
 
 /// The source text of operand kind `kind`'s `verify` clause, if it has one.
@@ -957,13 +970,13 @@ fn generate_build_verified(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool, 
             args.push("__o".into());
             continue;
         }
-        params.push(format!(", {}: {}", p.name.name, sm.text(p.ty.span)));
+        params.push(format!(", {}: {}", p.name.name, splice(sm, p.ty.span, &ctx_param_note(p))));
         args.push(p.name.name.clone());
     }
     let (generics, obj) = match v.verify_owner {
         Some(i) => {
             let TypeKind::Named(_, a) = &v.verify_ctx[i].ty.kind else { unreachable!("checked by the parser") };
-            ("<__H>", sm.text(a[0].span).to_string())
+            ("<__H>", splice(sm, a[0].span, &format!("the generated `{n}.build_verified` (verify_context owner `{}`)", v.verify_ctx[i].name.name)))
         }
         None => ("<__H, __T>", "__T".to_string()),
     };
@@ -1394,28 +1407,130 @@ fn mark_lazy(v: &VmDecl, items: &mut [Item]) {
     }
 }
 
-/// `text` with each call `name(` replaced by `repl` (which ends with the
-/// opening parenthesis), where `name` is a whole word (not a method or a
-/// longer name's suffix) and whitespace may come before the parenthesis.
-fn replace_call(text: &str, name: &str, repl: &str) -> String {
-    let word = |c: char| c.is_alphanumeric() || c == '_';
+// ── user text in the generated source ───────────────────────────────
+//
+// Clauses the user writes in a vm declaration (`verify` and `const`
+// clauses, verify_context types, `verify NAME { .. }` blocks, stack
+// effect counts, `stack_entry`) are copied into the generated source.
+// `splice` wraps each copied piece in markers that name where it came
+// from; `expand` strips them before parsing and keeps the positions as
+// the expansion's `Origin`s, so that diagnostics (and panic locations)
+// in user text point at the user's source. The stripped source is the
+// same text as without markers. (A private-use character in the user's
+// text would confuse the markers; such text is not valid Loimi outside
+// string literals.)
+
+const MARK_OPEN: char = '\u{E000}';
+const MARK_TEXT: char = '\u{E001}';
+const MARK_CLOSE: char = '\u{E002}';
+
+/// A piece of generated text: user text at an offset of the spliced
+/// span, or generated text.
+enum Seg {
+    User(u32, String),
+    Gen(String),
+}
+
+/// The user's text at `span`, to splice into generated source as part of
+/// `ctx` (what the note on a diagnostic in it says it is in: "the
+/// generated verifier, ...").
+fn splice(sm: &SourceMap, span: Span, ctx: &str) -> String {
+    splice_calls(sm, span, ctx, &[])
+}
+
+/// `splice`, with each call `name(` replaced by `repl` (which ends with
+/// the opening parenthesis) for each `(name, repl)` in turn: see
+/// `call_segs`.
+fn splice_calls(sm: &SourceMap, span: Span, ctx: &str, calls: &[(&str, &str)]) -> String {
+    let mut segs = vec![Seg::User(0, sm.text(span).to_string())];
+    for (name, repl) in calls {
+        segs = call_segs(segs, name, repl);
+    }
     let mut out = String::new();
-    let mut rest = text;
-    while let Some(p) = rest.find(name) {
-        let prev = rest[..p].chars().next_back().or_else(|| out.chars().next_back());
-        out.push_str(&rest[..p]);
-        let after = &rest[p + name.len()..];
-        let args = after.trim_start();
-        if !prev.is_some_and(|c| word(c) || c == '.') && args.starts_with('(') {
-            out.push_str(repl);
-            rest = &args[1..];
-        } else {
-            out.push_str(name);
-            rest = after;
+    for s in segs {
+        match s {
+            Seg::User(_, t) if t.is_empty() => {}
+            Seg::User(off, t) => {
+                let _ = write!(out, "{MARK_OPEN}{} {} {} {} {ctx}{MARK_TEXT}{t}{MARK_CLOSE}", span.file, span.lo + off, span.lo, span.hi);
+            }
+            Seg::Gen(t) => out.push_str(&t),
         }
     }
-    out.push_str(rest);
     out
+}
+
+/// Replace each call `name(` in the user text of `segs` by `repl`, where
+/// `name` is a whole word (not a method or a longer name's suffix) and
+/// whitespace may come before the parenthesis.
+fn call_segs(segs: Vec<Seg>, name: &str, repl: &str) -> Vec<Seg> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    // The last character of the text so far.
+    let mut last: Option<char> = None;
+    for seg in segs {
+        let (off, text) = match seg {
+            Seg::Gen(t) => {
+                last = t.chars().next_back().or(last);
+                out.push(Seg::Gen(t));
+                continue;
+            }
+            Seg::User(off, text) => (off, text),
+        };
+        // `text[start..]` is not output yet; the search resumes at `i`.
+        let (mut start, mut i) = (0, 0);
+        while let Some(q) = text[i..].find(name) {
+            let p = i + q;
+            let prev = if p > start { text[..p].chars().next_back() } else { last };
+            let after = p + name.len();
+            let args = after + (text[after..].len() - text[after..].trim_start().len());
+            if !prev.is_some_and(|c| word(c) || c == '.') && text[args..].starts_with('(') {
+                if p > start {
+                    out.push(Seg::User(off + start as u32, text[start..p].to_string()));
+                }
+                out.push(Seg::Gen(repl.to_string()));
+                last = repl.chars().next_back().or(last);
+                start = args + 1;
+                i = start;
+            } else {
+                i = after;
+            }
+        }
+        if start < text.len() {
+            last = text.chars().next_back();
+            out.push(Seg::User(off + start as u32, text[start..].to_string()));
+        }
+    }
+    out
+}
+
+/// The generated source without the markers `splice` adds, and where the
+/// spliced pieces came from.
+fn strip_marks(src: &str) -> (String, Vec<Origin>) {
+    let mut out = String::with_capacity(src.len());
+    let mut origins = Vec::new();
+    let mut rest = src;
+    while let Some(p) = rest.find(MARK_OPEN) {
+        out.push_str(&rest[..p]);
+        let r = &rest[p + MARK_OPEN.len_utf8()..];
+        let (head, r) = r.split_once(MARK_TEXT).expect("a splice marker");
+        let (text, r) = r.split_once(MARK_CLOSE).expect("a splice marker");
+        let mut f = head.splitn(5, ' ');
+        let mut num = || f.next().and_then(|x| x.parse::<u32>().ok()).expect("a splice marker");
+        let (file, at, lo, hi) = (num(), num(), num(), num());
+        let ctx = f.next().unwrap_or("").to_string();
+        let start = out.len() as u32;
+        out.push_str(text);
+        origins.push(Origin {
+            lo: start,
+            hi: out.len() as u32,
+            src: Span { file, lo: at, hi: at + text.len() as u32 },
+            whole: Span { file, lo, hi },
+            ctx,
+        });
+        rest = r;
+    }
+    out.push_str(rest);
+    (out, origins)
 }
 
 /// A string as a Loimi string literal.
@@ -1747,10 +1862,12 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 src.push_str(&generate_labels(v, &l, jit));
                 src.push_str(&generate_disasm(v, &l, jit));
                 src.push_str(&generate_format_api(v, &l, jit));
+                let (src, origins) = strip_marks(&src);
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
                     eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
                 }
-                let fid = sm.add(format!("<vm {} expansion>", v.name.name), src.clone());
+                let generated = Generated { vm: v.name.name.clone(), origins };
+                let fid = sm.add_generated(format!("<vm {} expansion>", v.name.name), src.clone(), generated);
                 let toks = crate::lexer::lex(fid, &src)?;
                 let mut p = crate::parser::Parser::new(toks);
                 let (mut items, _) = p.parse_module()?;
@@ -1801,12 +1918,12 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
             ));
         }
     }
-    let count = |items: &[StackItem]| -> String {
+    let count = |items: &[StackItem], op: &str| -> String {
         let fixed = items.iter().filter(|i| i.count.is_none()).count();
         let mut terms = vec![fixed.to_string()];
         for i in items {
             if let Some(e) = &i.count {
-                terms.push(format!("(({}) as i64)", text(e)));
+                terms.push(format!("(({}) as i64)", splice(sm, e.span, &format!("the generated stack check, counting op `{op}`'s stack effect"))));
             }
         }
         terms.join(" + ")
@@ -1858,7 +1975,7 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let mut params = vec![];
     let mut args = vec![];
     for p in &v.verify_ctx {
-        params.push(format!("{}: {}", p.name.name, sm.text(p.ty.span)));
+        params.push(format!("{}: {}", p.name.name, splice(sm, p.ty.span, &ctx_param_note(p))));
         args.push(p.name.name.clone());
     }
     let ctx_params: String = params.iter().map(|p| format!(", {p}")).collect();
@@ -1867,7 +1984,7 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
     let by_base = format!("{rl}match {n}__base_op(__w)");
     // Ops (not supers) with their stack effects.
     let effects = || l.ops.iter().enumerate().filter(|(_, o)| o.parts.is_empty()).map(|(k, o)| (o, v.ops[k].stack.as_ref().unwrap()));
-    let counts = effects().map(|(o, e)| (o.opcode, format!("{{ {}({}, {}, {}) }}", binds(o), count(&e.ins), count(&e.outs), e.rest)));
+    let counts = effects().map(|(o, e)| (o.opcode, format!("{{ {}({}, {}, {}) }}", binds(o), count(&e.ins, &o.name), count(&e.outs, &o.name), e.rest)));
     match_fn(&mut s, &format!("fn {n}__stack_counts(__w: {w}{ctx_params}) -> (i64, i64, bool)"), &by_base, counts, "_ => (0, 0, false)");
     // Counts for tools, without the context.
     let fixed = effects().filter(|(o, e)| {
@@ -1875,14 +1992,14 @@ fn generate_stack(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res<St
         let all = e.ins.iter().chain(e.outs.iter()).all(|i| i.count.as_ref().is_none_or(|c| operand_only(c, &params)));
         !e.rest && all
     });
-    let fixed = fixed.map(|(o, e)| (o.opcode, format!("{{ {}Some((({}) as u32, ({}) as u32)) }}", binds(o), count(&e.ins), count(&e.outs))));
+    let fixed = fixed.map(|(o, e)| (o.opcode, format!("{{ {}Some((({}) as u32, ({}) as u32)) }}", binds(o), count(&e.ins, &o.name), count(&e.outs, &o.name))));
     match_fn(&mut s, &format!("{vis}fn {n}__stack_effect(__w: {w}) -> ?(u32, u32)"), &by_base, fixed, "_ => None");
     let texts = effects().map(|(o, e)| (o.opcode, str_lit(&eff_text(e))));
     match_fn(&mut s, &format!("{vis}fn {n}__stack_effect_text(__w: {w}) -> str"), &by_base, texts, "_ => \"\"");
     // The pass. `__d[i]` is the depth before word i plus one (0: not
     // reached yet); `__work` holds each reached word once.
     let entry = match &v.stack_entry {
-        Some(e) => format!("(({}) as i64)", text(e)),
+        Some(e) => format!("(({}) as i64)", splice(sm, e.span, "the generated stack check, computing `stack_entry`")),
         None => "0".to_string(),
     };
     let err = |at: &str, reason: &str, op: &str, a: &str, b: &str| {
