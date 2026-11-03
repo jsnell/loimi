@@ -191,6 +191,7 @@ fn main() -> i32 uses gc {
     var verify = false;
     var disasm = false;
     var tiny = false;
+    var supers = true;
     var i: u64 = 1;
     while i < os.arg_count() {
         let a = os.arg(i).unwrap();
@@ -198,6 +199,7 @@ fn main() -> i32 uses gc {
         else if a.eq("--gc-verify") { verify = true; }
         else if a.eq("--disasm") { disasm = true; }
         else if a.eq("--gc-tiny") { tiny = true; }
+        else if a.eq("--no-supers") { supers = false; }
         else if a.eq("-g") { i += 1; goal = os.arg(i); }
         else { file = Some(a); }
         i += 1;
@@ -212,6 +214,7 @@ fn main() -> i32 uses gc {
         return 2;
     };
     let m = mem.alloc<Machine>(1);
+    m.supers = supers;
     setup(m);
     m.heap.add_scanner(m as *u8, machine.scan_roots);
     consult(m, prelude.SOURCE, true);

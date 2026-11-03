@@ -99,7 +99,7 @@ pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
         b.free();
     }
     match Wam.verify(p.slice(n), &vc) {
-        Ok(_) => {}
+        Ok(_) => { if m.supers { Wam.optimize_words(p.slice(n)); } }
         Err(e) => {
             var b = text.StrBuf.new();
             b.push_str("internal error: code failed verification: ");

@@ -78,9 +78,12 @@ pub struct Machine {
     flag_unknown_fail: bool,
     inits: mem.Vec<Term>,
     loading_library: bool,
+    supers: bool,
 }
 
 pub fn Frame.ys(f: *Frame) -> *Term { (f + 1) as *Term }
+/// The argument registers as a raw pointer (no bounds checks).
+pub fn Machine.xregs(m: *Machine) -> *Term { &m.x[0] }
 pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n }
 pub fn Choice.args(c: *Choice) -> *Term { (c + 1) as *Term }
 pub fn Choice.end(c: *Choice) -> *Choice { ((((c + 1) as *Term) + c.n) as *Choice) }
@@ -145,7 +148,9 @@ pub fn Machine.untrail(m: *Machine, to: u64) {
     while i > to {
         i -= 1;
         match m.trail[i] {
-            Ref(v) => v.val = Term.Unb,
+            // A raw store: the compiler's write barrier would run for this
+            // store too, though `Unb` is no reference.
+            Ref(v) => *(v as *Term) = Term.Unb,
             Int(off) => {
                 // A catch/3 that exited with choicepoints left: backtracking
                 // into its goal makes it active again.
