@@ -254,3 +254,19 @@ pub fn cmp(x: Term, y: Term) -> i32 {
     }
 }
 fn is_flt(t: Term) -> bool { match t { Flt(_) => true, _ => false } }
+
+const OPNAMES: [str; 15] = ["+", "-", "*", "//", "mod", ">>", "<<", "/\\", "\\/", "div", "rem", "xor", "min", "max", "/"];
+
+/// The slow path of the inline arithmetic ops: operands that are bound
+/// variables, floats mixed with integers, overflow and errors.
+pub fn arith2(m: *Machine, kind: u64, a: Term, b: Term) -> Result<Term, Term> {
+    let x = eval(m, a)?;
+    let y = eval(m, b)?;
+    binary(m, OPNAMES[kind], x, y, Term.Unb)
+}
+
+pub fn cmp2(m: *Machine, a: Term, b: Term) -> Result<i32, Term> {
+    let x = eval(m, a)?;
+    let y = eval(m, b)?;
+    Ok(cmp(x, y))
+}

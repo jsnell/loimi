@@ -618,6 +618,133 @@ fn C.build(c: *C, t: Term, target: u8) {
     tmps.free();
 }
 
+// Inline arithmetic ----------------------------------------------------
+
+/// The op for a binary arithmetic functor, if inlined.
+fn arith_op(name: str) -> ?u32 {
+    match name {
+        "+" => Some(Wam.OP_ADD), "-" => Some(Wam.OP_SUB), "*" => Some(Wam.OP_MUL),
+        "//" => Some(Wam.OP_IDIV), "mod" => Some(Wam.OP_MOD), ">>" => Some(Wam.OP_SHR),
+        "<<" => Some(Wam.OP_SHL), "/\\" => Some(Wam.OP_AND), "\\/" => Some(Wam.OP_OR),
+        "div" => Some(Wam.OP_DIV), "rem" => Some(Wam.OP_REM), "xor" => Some(Wam.OP_XOR),
+        "min" => Some(Wam.OP_MIN), "max" => Some(Wam.OP_MAX), "/" => Some(Wam.OP_FDIV),
+        _ => None,
+    }
+}
+
+/// Can `t` be compiled to inline arithmetic: numbers, variables already
+/// bound by this clause, and the inlined operators.
+fn C.arith_ok(c: *C, t0: Term, depth: u32) -> bool {
+    if depth > 20 { return false; }
+    let t = deref(t0);
+    match t {
+        Int(_) => true,
+        Flt(_) => true,
+        Ref(_) => { let vi = c.info(t); vi.seen and !vi.level }
+        Str(s) => {
+            let name = c.m.db.name(c.m.db.fname(s.f));
+            if s.args.len == 2 and arith_op(name).is_some() { return c.arith_ok(s.args[0], depth + 1) and c.arith_ok(s.args[1], depth + 1); }
+            if s.args.len == 1 and name.eq("-") { return c.arith_ok(s.args[0], depth + 1); }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Compile an expression `arith_ok` accepted; the register holding its
+/// value, and whether it is a temporary to release.
+fn C.expr(c: *C, t0: Term) -> (u32, bool) {
+    let t = deref(t0);
+    match t {
+        Ref(_) => {
+            let vi = c.info(t);
+            if vi.perm { let r = c.temp(); c.emit(Wam.PUT_VAL_Y(vi.reg as u8, r as u8)); return (r, true); }
+            (vi.reg, false)
+        }
+        Str(s) => {
+            let name = c.m.db.name(c.m.db.fname(s.f));
+            if s.args.len == 1 {
+                let (a, oa) = c.expr(s.args[0]);
+                if oa { c.release(a); }
+                let r = c.temp();
+                c.emit(Wam.NEG(r as u8, a as u8));
+                return (r, true);
+            }
+            let op = arith_op(name).unwrap();
+            let rhs = deref(s.args[1]);
+            // Small integer right operands of + - * fold into the op.
+            if let Int(k) = rhs and (k as i64) >= -128 and (k as i64) <= 127 and (op == Wam.OP_ADD or op == Wam.OP_SUB or op == Wam.OP_MUL) {
+                let (a, oa) = c.expr(s.args[0]);
+                if oa { c.release(a); }
+                let r = c.temp();
+                let iop = if op == Wam.OP_ADD { Wam.OP_ADDI } else if op == Wam.OP_SUB { Wam.OP_SUBI } else { Wam.OP_MULI };
+                c.emit(Wam.encode.R3s(iop, r as u8, a as u8, k as i8));
+                return (r, true);
+            }
+            let (a, oa) = c.expr(s.args[0]);
+            let (b, ob) = c.expr(rhs);
+            if ob { c.release(b); }
+            if oa { c.release(a); }
+            let r = c.temp();
+            c.emit(Wam.encode.R3(op, r as u8, a as u8, b as u8));
+            (r, true)
+        }
+        _ => {
+            let r = c.temp();
+            c.put_arg(t, r as u8);
+            (r, true)
+        }
+    }
+}
+
+/// is/2 and the arithmetic comparisons on registers, without building the
+/// expression; false if `g` is not one of them or uses something else.
+fn C.inline_arith(c: *C, g: Term) -> bool {
+    let Str(s) = g else { return false; };
+    if s.args.len != 2 { return false; }
+    let name = c.m.db.name(c.m.db.fname(s.f));
+    let cmp_op: ?u32 = match name {
+        "<" => Some(Wam.OP_LT), "=<" => Some(Wam.OP_LE), ">" => Some(Wam.OP_GT), ">=" => Some(Wam.OP_GE),
+        "=:=" => Some(Wam.OP_NEQ), "=\\=" => Some(Wam.OP_NNE), _ => None,
+    };
+    if let Some(op) = cmp_op {
+        if !c.arith_ok(s.args[0], 0) or !c.arith_ok(s.args[1], 0) { return false; }
+        let (a, oa) = c.expr(s.args[0]);
+        let (b, ob) = c.expr(s.args[1]);
+        c.emit(Wam.encode.R3(op, a as u8, b as u8, 0));
+        if ob { c.release(b); }
+        if oa { c.release(a); }
+        return true;
+    }
+    if !name.eq("is") { return false; }
+    let lhs = deref(s.args[0]);
+    let Ref(_) = lhs else { return false; };
+    if !c.arith_ok(s.args[1], 0) { return false; }
+    var (r, owned) = c.expr(s.args[1]);
+    if let Ref(_) = deref(s.args[1]) {
+        // X is Y: Y must still be evaluated (a number, or an error).
+        if owned { c.release(r); }
+        let t = c.temp();
+        c.emit(Wam.encode.R3s(Wam.OP_ADDI, t as u8, r as u8, 0));
+        r = t;
+        owned = true;
+    }
+    let vi = c.info(lhs);
+    if vi.occ == 1 and !vi.level {
+        // The value is not used, but the evaluation's errors still matter.
+    } else if !vi.seen {
+        vi.seen = true;
+        if vi.perm { c.emit(Wam.GET_VAR_Y(vi.reg as u8, r as u8)); }
+        else if vi.reg != r { c.emit(Wam.GET_VAR_X(vi.reg as u8, r as u8)); }
+    } else if vi.perm {
+        c.emit(Wam.GET_VAL_Y(vi.reg as u8, r as u8));
+    } else {
+        c.emit(Wam.GET_VAL_X(vi.reg as u8, r as u8));
+    }
+    if owned { c.release(r); }
+    true
+}
+
 // Goals -----------------------------------------------------------------
 
 /// A body goal after flattening: a call (of a predicate or a builtin), or
@@ -930,6 +1057,10 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
                 if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
             }
             Builtin => {
+                if c.inline_arith(g.t) {
+                    if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
+                    continue;
+                }
                 let (_, ga) = term.name_arity(&m.db, g.t);
                 for j in 0..ga as u64 { c.put_arg(term.arg_of(g.t, j), j as u8); }
                 c.emit(Wam.CALLB(g.id));
