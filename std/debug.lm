@@ -94,6 +94,13 @@ fn Breakpoints<B>.find(bs: *Breakpoints<B>, at: u64) -> ?u64 {
 /// which is deleted. Returns the breakpoint's id (0 if no site is at `at`,
 /// which a correct handler never sees).
 pub fn Breakpoints<B>.hit(bs: *Breakpoints<B>, at: u64) -> u32 {
+    // A site still pending from an earlier hit (one in a run that a
+    // native interrupted with a nested run, whose table starts with no
+    // variant) goes back first: its instruction has started.
+    if let Some(p) = bs.pending and p.at != at {
+        bs.fresh = false;
+        bs.tick();
+    }
     let Some(i) = bs.find(at) else { return 0; };
     let s = bs.sites.at(i);
     let clear = bs.clear;

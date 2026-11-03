@@ -1,0 +1,23 @@
+frobnicate
+break nosuch.mini:3
+break 5
+break calls.mini:8
+info
+continue
+bt
+locals
+op
+next
+delete 1
+tbreak 3
+info
+continue
+bt
+print n
+print k
+finish
+locals
+next
+next
+step
+continue

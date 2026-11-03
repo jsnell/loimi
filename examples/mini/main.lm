@@ -13,9 +13,9 @@ import vm.{Mini};
 import vm;
 import compile;
 import lib;
-import state;
+import state; #[cfg(debug)] import debugger;
 
-fn main() -> i32 uses gc {
+fn main() -> i32 uses gc { #[cfg(debug)] if let Some(a) = os.arg(1) and a.eq("--debug") { return debugger.main(); } // --cfg debug: `mini --debug script`
     let Some(path) = os.arg(1) else {
         io.eprintln("usage: mini <script>");
         return 2;

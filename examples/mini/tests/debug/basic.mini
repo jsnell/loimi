@@ -1,0 +1,17 @@
+local function square(x)
+  local y = x * x
+  return y
+end
+
+local function sum_squares(n)
+  local total = 0
+  for i = 1, n do
+    total = total + square(i)
+  end
+  return total
+end
+
+local name = "squares"
+local r = sum_squares(3)
+print(name, r)
+print(sum_squares(4))

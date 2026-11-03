@@ -1,0 +1,62 @@
+calls.mini:4 in main chunk
+4	end
+(mdb) frobnicate
+unknown command (try `help`)
+(mdb) break nosuch.mini:3
+no source file named nosuch.mini
+(mdb) break 5
+no code at line 5
+(mdb) break calls.mini:8
+breakpoint 1 at calls.mini:8
+(mdb) info
+breakpoint 1 at calls.mini:8, hit 0 times
+(mdb) continue
+breakpoint 1, calls.mini:8 in function 'anonymous'
+8	  return a < b
+(mdb) bt
+#0 calls.mini:8 in function 'anonymous'
+#1 calls.mini:9 in main chunk
+(mdb) locals
+a = 1
+b = 5
+(mdb) op
+    0  LT dst=2 a=0 b=1
+(mdb) next
+breakpoint 1, calls.mini:8 in function 'anonymous'
+8	  return a < b
+(mdb) delete 1
+(mdb) tbreak 3
+breakpoint 2 at calls.mini:3
+(mdb) info
+breakpoint 2 at calls.mini:3, hit 0 times
+(mdb) continue
+1	3	5	8
+calls.mini:3 in function 'fib'
+3	  return fib(n - 1) + fib(n - 2)
+(mdb) bt
+#0 calls.mini:3 in function 'fib'
+#1 calls.mini:15 in main chunk
+(mdb) print n
+n = 2
+(mdb) print k
+no local 'k'
+(mdb) finish
+calls.mini:15 in main chunk
+15	  acc = acc + fib(k)
+(mdb) locals
+t = <table>
+acc = 1
+i = 2
+k = 2
+(mdb) next
+calls.mini:16 in main chunk
+16	end
+(mdb) next
+calls.mini:14 in main chunk
+14	  local k = i
+(mdb) step
+calls.mini:15 in main chunk
+15	  acc = acc + fib(k)
+(mdb) continue
+4
+[program failed]

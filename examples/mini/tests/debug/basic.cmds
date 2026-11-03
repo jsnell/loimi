@@ -1,0 +1,25 @@
+locals
+help
+break 2
+continue
+bt
+locals
+print x
+print nope
+op
+next
+next
+locals
+finish
+step
+step
+step
+continue
+delete 1
+info
+break 17
+continue
+step
+step
+finish
+continue

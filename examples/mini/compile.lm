@@ -22,7 +22,7 @@ import std.bc;
 import std.rt;
 import value;
 import value.{V, Str, Arr, Table, Proto, Lines, Protos, UpDescs};
-import vm.{Mini};
+import vm.{Mini}; #[cfg(debug)] import debugger;
 
 // ── lexer ────────────────────────────────────────────────────────────
 
@@ -921,7 +921,7 @@ fn Parser.leave_block(p: *Parser) {
     let Some(b) = p.fs.blocks.pop() else { internal_error("block underflow") };
     // The function's outermost block needs no CLOSE: returning closes.
     if b.upval and p.fs.blocks.len > 0 { p.emit(Mini.CLOSE(b.nactive as u8)); }
-    p.fs.locals.truncate(b.first_local);
+    #[cfg(debug)] debugger.close_locals(p.fs as *u8, b.first_local, p.fs.code.len()); p.fs.locals.truncate(b.first_local);
     p.fs.regs.leave(b.nactive);
 }
 
@@ -943,7 +943,7 @@ fn Parser.block(p: *Parser) {
 
 /// Make register `r` (already reserved) the local `name`.
 fn Parser.add_local(p: *Parser, name: str, r: u32) {
-    p.fs.locals.push(Local { name: name, reg: r });
+    #[cfg(debug)] debugger.open_local(p.fs as *u8, name, r, p.fs.code.len()); p.fs.locals.push(Local { name: name, reg: r });
     p.fs.regs.activate(r + 1 - p.fs.regs.nactive);
 }
 
@@ -1478,7 +1478,7 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
             internal_error(b.as_str())
         }
     };
-    Mini.optimize(proto.code);
+    Mini.optimize(proto.code); #[cfg(debug)] debugger.finish_proto(fs as *u8, proto);
     fs.code.free();
     fs.consts.free();
     fs.locals.free();

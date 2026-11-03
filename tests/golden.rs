@@ -283,6 +283,54 @@ fn mini_jit_stencils() {
     mini_conformance_with(&["--jit-stencils"], &env, |_| true);
 }
 
+/// The Mini debugger (`--cfg debug`, examples/mini/debugger.lm): each
+/// examples/mini/tests/debug/NAME.mini run as `mini --debug NAME.mini`
+/// with NAME.cmds on stdin must print the transcript NAME.out, in every
+/// dispatch mode. The debug build also runs the scripts that re-enter
+/// the vm (sort comparators, coroutines) without the debugger.
+#[test]
+fn mini_debugger() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("examples/mini/tests/debug");
+    let mut tests: Vec<PathBuf> =
+        std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "mini")).collect();
+    tests.sort();
+    assert!(!tests.is_empty());
+    let mut failures = Vec::new();
+    for mode in ["tailcall", "goto", "switch"] {
+        let exe = std::env::temp_dir().join(format!("loimi-mini-debug-{}-{}", std::process::id(), mode));
+        let out = loimi()
+            .args(["build", "-W", "error", "--cfg", "debug", &format!("--dispatch={mode}")])
+            .arg(root.join("examples/mini/main.lm"))
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "building mini --cfg debug ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        for t in &tests {
+            let cmds = std::fs::File::open(t.with_extension("cmds")).unwrap();
+            let want = std::fs::read_to_string(t.with_extension("out")).unwrap();
+            let out = limited(&exe).arg("--debug").arg(t).stdin(cmds).output().unwrap();
+            let got = String::from_utf8_lossy(&out.stdout);
+            if got != want {
+                failures.push(format!(
+                    "{} ({mode}): transcript mismatch\n--- expected\n{want}\n--- got\n{got}\n--- stderr\n{}",
+                    t.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        let _ = std::fs::remove_file(&exe);
+    }
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+    mini_scripts_with(&["--cfg", "debug"], &[], |name| ["sort", "coroutine", "functions", "closures"].iter().any(|p| name.starts_with(p)));
+}
+
 /// Re-entry (table.sort's comparator runs as a nested run of the
 /// interpreter) and coroutines (switches inside the run, and resumes
 /// from natives as nested runs) in the goto and switch dispatch modes: the sort and
