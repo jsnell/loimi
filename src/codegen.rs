@@ -2609,6 +2609,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let ft = self.ty(&args[0].ty);
                 self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))
             }
+            Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest if e.ty.is_vector() && self.cg.opts.arch == Arch::X86_64 => {
+                self.vec_round_sse2(i, &e.ty, &vals[0])
+            }
             Intr::Sqrt | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest | Intr::Fabs => {
                 let n = match i {
                     Intr::Sqrt => "sqrt",
@@ -2822,6 +2825,49 @@ impl<'a, 'p> FnGen<'a, 'p> {
             (Ty::F64, Ty::F32) => self.inst(format!("fptrunc {} {} to {}", ft, v, tt)),
             _ => v.to_string(),
         }
+    }
+
+    /// `floor`, `ceil`, `trunc` and `nearest` on float vectors without
+    /// SSE4.1's `roundps`/`roundpd`, which LLVM would make per-lane libm
+    /// calls: `(|x| + 2^23) - 2^23` (2^52 for f64) rounds |x| to the
+    /// nearest integer, ties to even, when |x| < 2^23 (larger floats are
+    /// integers already); floor and ceil adjust that by one, and the
+    /// result takes `x`'s sign (`floor(-0.5)` is -1, `ceil(-0.5)` -0).
+    /// `x + 0.0` passes the large ones and quiets a NaN.
+    fn vec_round_sse2(&mut self, i: Intr, t: &Ty, x: &str) -> String {
+        let Ty::Vector(l, n) = t else { unreachable!() };
+        let n = *n;
+        let vt = self.ty(t);
+        let (et, sfx, c) = if **l == Ty::F32 { ("float", ovl(self.p(), t), "0x4160000000000000") } else { ("double", ovl(self.p(), t), "0x4330000000000000") };
+        let bt = format!("<{} x i1>", n);
+        let cv = splat_const(et, n, c);
+        let one = splat_const(et, n, "1.0");
+        self.cg.decls.insert(format!("declare {vt} @llvm.fabs.{sfx}({vt})"));
+        self.cg.decls.insert(format!("declare {vt} @llvm.copysign.{sfx}({vt}, {vt})"));
+        let ax = self.inst(format!("call {vt} @llvm.fabs.{sfx}({vt} {x})"));
+        let s1 = self.inst(format!("fadd {vt} {ax}, {cv}"));
+        let r = self.inst(format!("fsub {vt} {s1}, {cv}"));
+        // Nearest of |x|; trunc is floor of |x|; floor and ceil work on
+        // the signed value.
+        let r = match i {
+            Intr::Nearest => r,
+            Intr::Trunc => {
+                let gt = self.inst(format!("fcmp ogt {vt} {r}, {ax}"));
+                let m = self.inst(format!("fsub {vt} {r}, {one}"));
+                self.inst(format!("select {bt} {gt}, {vt} {m}, {vt} {r}"))
+            }
+            _ => {
+                let rs = self.inst(format!("call {vt} @llvm.copysign.{sfx}({vt} {r}, {vt} {x})"));
+                let (cmp, op) = if i == Intr::Floor { ("ogt", "fsub") } else { ("olt", "fadd") };
+                let c = self.inst(format!("fcmp {cmp} {vt} {rs}, {x}"));
+                let a = self.inst(format!("{op} {vt} {rs}, {one}"));
+                self.inst(format!("select {bt} {c}, {vt} {a}, {vt} {rs}"))
+            }
+        };
+        let r = self.inst(format!("call {vt} @llvm.copysign.{sfx}({vt} {r}, {vt} {x})"));
+        let small = self.inst(format!("fcmp olt {vt} {ax}, {cv}"));
+        let big = self.inst(format!("fadd {vt} {x}, zeroinitializer"));
+        self.inst(format!("select {bt} {small}, {vt} {r}, {vt} {big}"))
     }
 
     /// The vector intrinsics (`Intr::VSplat` ..), with `vals` evaluated.

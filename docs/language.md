@@ -863,8 +863,10 @@ fn main() {
   few instructions on both. Where SSE2 lacks an instruction, LLVM
   expands the operation: 8-bit shifts, 64-bit compares, `i64x2`
   multiplies and `minimum`/`maximum` take from a handful to about 30
-  instructions; the float rounding methods are per-lane libm calls (as
-  for scalars, section "Floats" in `stdlib.md`); `u16x8.narrow_sat` of
+  instructions; the float rounding methods, which need SSE4.1's
+  `roundps` (scalars call libm, `stdlib.md`, "Floats"), add and subtract
+  2^23 (2^52) and fix up the sign, about 25 instructions with no call;
+  `u16x8.narrow_sat` of
   `i32x4` (SSE4.1's `packusdw`) is about 25. `f32x4 as i32x4`/`u32x4`
   use `cvttps2dq` with fix-ups (about 10 and 15 instructions), and
   `swizzle` goes lane by lane through memory on x86-64 (`pshufb` is

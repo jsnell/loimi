@@ -1,0 +1,56 @@
+// Vector floor, ceil, trunc and nearest agree bit for bit with the scalar
+// ones (libm on x86-64) at the edges: ties, -0, 2^23 and 2^52 and around,
+// infinities, NaN (quieted). x86-64 rounds vectors inline on SSE2.
+import std.io;
+
+#[inline(never)]
+fn id<T>(x: T) -> T { x }
+
+fn same32(a: f32, b: f32) -> bool {
+    if a != a { return b != b && (b.to_bits() & 0x00400000) != 0; }
+    a.to_bits() == b.to_bits()
+}
+fn same64(a: f64, b: f64) -> bool {
+    if a != a { return b != b && (b.to_bits() & 0x0008000000000000) != 0; }
+    a.to_bits() == b.to_bits()
+}
+
+fn main() {
+    let vals: [f32; 24] = [-0.5, 0.5, -0.0, 0.0, 1.5, 2.5, -2.5, -1.5, 8388607.5, 8388608.0, 1.0e30, -1.0e30,
+        1.0 / 0.0, -1.0 / 0.0, 0.0 / 0.0, 0.49999997, -0.49999997, 4194303.5, -4194304.5, 0.7, -0.7, 3.0, -3.0, 16777215.0];
+    var bad = 0;
+    var i = 0;
+    while i < 24 {
+        let v = id(f32x4.new(vals[i], vals[i + 1], vals[i + 2], vals[i + 3]));
+        let fl = v.floor(); let ce = v.ceil(); let tr = v.trunc(); let ne = v.nearest();
+        var buf: [f32; 16] = [0.0; 16];
+        *((&buf as *f32x4) + 0) = fl; *((&buf as *f32x4) + 1) = ce; *((&buf as *f32x4) + 2) = tr; *((&buf as *f32x4) + 3) = ne;
+        for k in 0..4 {
+            let x = vals[i + k];
+            if !same32(x.floor(), buf[k]) { bad += 1; io.print("floor "); io.print_f64(x as f64); io.println(""); }
+            if !same32(x.ceil(), buf[4 + k]) { bad += 1; io.print("ceil "); io.print_f64(x as f64); io.println(""); }
+            if !same32(x.trunc(), buf[8 + k]) { bad += 1; io.print("trunc "); io.print_f64(x as f64); io.println(""); }
+            if !same32(x.nearest(), buf[12 + k]) { bad += 1; io.print("nearest "); io.print_f64(x as f64); io.println(""); }
+        }
+        i += 4;
+    }
+    let dv: [f64; 12] = [-0.5, 0.5, -0.0, 2.5, 4503599627370495.5, 4503599627370496.0, -1.0e300, 0.0 / 0.0, 0.49999999999999994, -2.5, 0.7, -0.7];
+    var j = 0;
+    while j < 12 {
+        let v = id(f64x2.new(dv[j], dv[j + 1]));
+        let r = [v.floor(), v.ceil(), v.trunc(), v.nearest()];
+        for k in 0..2 {
+            let x = dv[j + k];
+            let l0 = if k == 0 { r[0].lane(0) } else { r[0].lane(1) };
+            let l1 = if k == 0 { r[1].lane(0) } else { r[1].lane(1) };
+            let l2 = if k == 0 { r[2].lane(0) } else { r[2].lane(1) };
+            let l3 = if k == 0 { r[3].lane(0) } else { r[3].lane(1) };
+            if !same64(x.floor(), l0) || !same64(x.ceil(), l1) || !same64(x.trunc(), l2) || !same64(x.nearest(), l3) {
+                bad += 1; io.print("f64 "); io.print_f64(x); io.println("");
+            }
+        }
+        j += 2;
+    }
+    io.print("bad "); io.print_int(bad); io.println("");
+}
+// expect: bad 0
