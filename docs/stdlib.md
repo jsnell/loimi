@@ -22,6 +22,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
 | [`std.parse`](#stdparse) | built (`Pratt`, `Parser`, `Ops`; no `TokenStream`) | `std/parse.lm` |
 | [`std.diag`](#stddiag) | built | `std/diag.lm` |
+| [`std.debug`](#stddebug-guest-debuggers) | built (breakpoints, stepping, commands; frames and locals are the interpreter's) | `std/debug.lm` |
 | [`std.bc`](#stdbc-bytecode-construction) | built (a library, no generated `Builder`) | `std/bc.lm` |
 | [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
 | [`std.gil`](stdlib/gc.md#threads-sharing-a-heap-stdgil) | built (a global interpreter lock per heap) | `std/gil.lm` |
@@ -937,6 +938,39 @@ compile time.
 ### Design (not built)
 
 Fix-it hints, ANSI color, multi-line spans, guest tracebacks.
+
+## `std.debug`: guest debuggers
+
+`std/debug.lm`: the generic parts of a source-level debugger for a vm
+with `on break` (language.md §9.1; design in
+[`design/debugging.md`](design/debugging.md)). Mini's `--cfg debug`
+build (`examples/mini/debugger.lm`) is one on top of it.
+
+- `Breakpoints<B>`, over the vm's `Vm.Break`:
+  `Breakpoints.new(Vm.clear_break, rearm)` (the vm's functions, as
+  `std.bc` takes `op_size`); `add(file, line, temp) -> id` (ids from 1),
+  `add_site(id, at, tok)` (a word `Vm.set_break` patched), `bp(id)`,
+  `list()`, `has_site(at)`, `delete(id)` (puts the instructions back),
+  `clear_all`, `free`. `Bp` has `id`, `file`, `line`, `nsites`, `hits`,
+  `temp` (deleted at its first hit).
+- The step-over: `hit(at) -> id`, from the vm's `on break` handler at
+  `pc`: puts the instruction back and remembers it; `tick() -> bool`,
+  from the wrapper of a variant the handler switches to before running
+  the instruction (`jump pc`): sets the breakpoint again once execution
+  has left it, and says whether the variant must stay on.
+- `Stepper`: `Mode` is `Run`, `Step`, `Next` or `Finish`;
+  `start(mode, line, depth)`, `active()`, `should_stop(line, depth)`
+  (step: another line or another depth; next: another line at this
+  depth, or a return; finish: a return). The interpreter supplies each
+  instruction's line and call depth.
+- Commands: `parse_command(line) -> Command` (`Break(file, line)`,
+  `TBreak`, `Delete(id)`, `Continue`, `Step`, `Next`, `Finish`,
+  `Backtrace`, `Locals`, `Print(name)`, `Op`, `Info`, `Quit`, `Help`,
+  `Empty`, `Bad(msg)`, with gdb's short forms), `HELP`,
+  `parse_location("[FILE:]LINE")`, `basename(path)`.
+- `Input.stdin()`: `read_line() -> ?str` (unbuffered `read(2)`, so a
+  script of commands can follow the program's own input), `is_tty()`
+  (a scripted session echoes its commands), `free`.
 
 ## `std.bc`: bytecode construction
 

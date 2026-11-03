@@ -8,6 +8,15 @@ implementation; `git log` has the details.
 
 ### `vm` declarations and dispatch
 
+- **Debugging guest programs** (prototype): `on break { .. }` generates
+  breakpoint ops and `Vm.set_break`/`clear_break`/`Break.rearm`, sound on
+  verified code (size-preserving, supers split, caches kept);
+  `#[unfused]` variants run supers as their parts; `#[cfg(..)]` on vm
+  items ([language.md §9.1](docs/language.md#91-breakpoints-on-break)).
+  `std.debug` has the step-over, line stepping and a command reader
+  ([stdlib.md](docs/stdlib.md#stddebug-guest-debuggers)). Mini built with
+  `--cfg debug` is a gdb-like debugger (`mini --debug script`); see
+  [design/debugging.md](docs/design/debugging.md).
 - **`Vm.Resume` inline cache fields**: verified code addresses in the
   instruction stream (try chains, cached callees); the verifier resets
   them to the placeholder, `v.fill_resumes(vals)` sets them, `jump

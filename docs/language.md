@@ -2396,7 +2396,7 @@ entry resume(c: *Ctx, vals: *V, n: u64) -> Result<V, V> uses reenter {
     // The instruction after the yield's CALL: a resume point, which
     // only vm code makes (`next_resume`), so `#[require_verified]`
     // lets the entry jump to it.
-    jump c.ypc
+    #[cfg(debug)] if debugger.stepping(c) { use_variant step; } jump c.ypc
 }
 ```
 
@@ -3159,6 +3159,103 @@ op-pair counters, and a counter per `cold` block, into the handlers and
 prints them at exit (section 7.3). The
 program can read them too (`std.prof.op_counts`).
 
+**`#[unfused]`**: under a variant marked `#[unfused]`, superinstructions
+run as their parts. A super's entry in the variant's table is its first
+part's wrapper, which runs that part alone; its `next` dispatches the
+next part's word through the same table. So the wrapper sees every
+instruction, which a line hook needs (a line can start at a later part
+of a super). The default table still runs supers fused. A `become` in
+the first part rewrites the head word as it would for that op alone,
+which splits the super (`Vm.optimize` fuses it again). Without the
+attribute, a super is one instruction to a variant, as above.
+
+**`#[cfg(NAME)]` on vm items** keeps or drops any item of a `vm` block
+(an op, a variant, `on break`, ...), as on module items, so an
+interpreter can build its debugger in only with `--cfg debug`.
+
+### 9.1 Breakpoints: `on break`
+
+A breakpoint replaces an instruction's opcode with a generated
+breakpoint op, as CPython 3.12 does: code without breakpoints runs at
+full speed, and nothing checks for them. `on break { .. }` in a vm
+declares what a breakpoint does. It is an op body without operands (it
+sees the state and `pc`, and must leave with a control word):
+
+<!-- snippet: excerpt tests/run/vm_break.lm -->
+```loimi
+on break {
+    ctx.hits += 1;
+    // Step over: the instruction goes back for one run under `step`.
+    let Some(b) = ctx.live else { exit -1 };
+    if !V.clear_break(b) { exit -2 }
+    ctx.pending = Some(b);
+    ctx.live = None;
+    ctx.fresh = true;
+    use_variant step;
+    jump pc
+}
+variant step wraps all {
+    before {
+        ctx.steps += 1;
+        // The first wrapper to run is the restored instruction's own.
+        if ctx.fresh { ctx.fresh = false; } else {
+            if let Some(b) = ctx.pending {
+                ctx.live = b.rearm();
+                ctx.pending = None;
+            }
+            use_variant default;
+        }
+    }
+}
+```
+
+The vm gets one breakpoint op per inline cache layout, `BREAK` (no
+cache) and `BREAK__C` for each cache `C`, with the size of the
+instructions they replace: walks over the code (`resume_at`, the
+disassembler, `deopt`, the verifier's) stay on instruction boundaries
+with breakpoints set. Generated with them:
+
+- **`Vm.set_break(v, i) -> ?Vm.Break`**: patch the instruction at word
+  `i` of verified code `v` (None if no instruction starts there, or it
+  is a breakpoint already). A superinstruction that spans word `i` is
+  split first (its head becomes its first part), so the word runs on its
+  own. `Vm.Break` is the proof: its fields are private to the vm's
+  expansion, like `Verified`'s, and it holds the word it replaced
+  (`b.word()`, `b.pc()`).
+- **`Vm.clear_break(b) -> bool`**: put the replaced word back (false if
+  the word there is not that breakpoint).
+- **`b.rearm() -> ?Vm.Break`**: set it again at the same word, over the
+  instruction that is there now (it may have been quickened in between).
+- **`Vm.is_break(w)`**.
+
+To run the instruction under a breakpoint, the handler puts it back
+and executes it again (`jump pc` dispatches the word anew), under a
+variant whose wrapper sets the breakpoint again before the next
+instruction: the step-over gdb does. `std.debug` implements that
+protocol (`Breakpoints.hit` and `tick`), with line stepping and a
+command reader; Mini's `--cfg debug` build is a debugger on top of it
+(`examples/mini/debugger.lm`, `docs/design/debugging.md`).
+
+What keeps this sound:
+
+- *Verification.* Code with breakpoints set does not verify (a
+  breakpoint op is `BadOpcode` to `Vm.verify`): the instruction it
+  stands for is in the `Vm.Break`. `set_break` takes the proof of the
+  code, checks the boundary, and changes nothing else, so the code
+  stays as safe as the verifier left it.
+- *Quickening.* A word under a breakpoint is not an instruction that
+  runs, so no `become` writes it. When it is put back and runs, a
+  `become` rewrites it as usual, and `rearm` patches the new op.
+- *Superinstructions.* `set_break` splits a super that spans the word;
+  a breakpoint is not a part of any super, so `optimize` does not fuse
+  over it.
+- *Inline caches.* The breakpoint op keeps the instruction's cache
+  words, and `Vm.deopt` leaves them alone.
+
+**Not built:** breakpoints with `--jit-stencils` (an error for now; the
+design invalidates compiled code of the patched object), stack vms, and
+atomic patching for code shared between threads.
+
 ---
 
 ## 10. Calls, reentrancy, coroutines, embedding
@@ -3190,12 +3287,14 @@ calls are implemented as nested entries (below).
       regs = fp.base;
       c.base = fp;
       c.fp = fp;
-      jump p.code
+      #[cfg(debug)] if debugger.stepping(c) { use_variant step; } jump p.code
   }
   ```
 
   `at` is a frame above the caller's with the arguments in place, and
-  `c.base = fp` makes it the sentinel: RET from it exits the run.
+  `c.base = fp` makes it the sentinel: RET from it exits the run. (The
+  `#[cfg(debug)]` line is Mini's debugger: a nested run that starts
+  while it steps uses its `step` variant, §9.1.)
 
   - **It is an entry**: in tail-call mode, a fresh call that makes the
     first `preserve_none` call into the handlers and returns when one of

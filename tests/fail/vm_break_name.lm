@@ -1,0 +1,10 @@
+// error: `BREAK` is the name of a generated breakpoint op (this vm has `on break`)
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op BREAK(a: reg) : ABC { exit a }
+    on break { jump pc }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+fn main() {}
