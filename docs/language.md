@@ -126,6 +126,25 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **Integer patterns** are literals (`0x45`, `-1`, `'a'`) and inclusive
+  ranges (`0x28..=0x3E`, `'a'..='z'`); a pattern outside the
+  scrutinee's type is an error. Integers count as covered only by `_`
+  or a binding.
+- **Constants in patterns.** A name in a pattern is, in this order: a
+  variant of the type matched (`Nil`, `Red`), a constant (a `const` of
+  this module or imported with `import m.{LIMIT}`, also written
+  `m.LIMIT`, and a vm's generated constants such as `Vm.OP_ADD`), else
+  a new binding. A constant matches its value, as if its literal stood
+  there: `match loc { LOCAL => .., CONST => .., _ => .. }`. Integer,
+  `bool`, `str`, enum and tuple constants qualify; float constants are
+  an error (there are no float patterns: NaN and `-0.0` make equality
+  the wrong test), and so is a constant whose type is not the
+  scrutinee's. A local variable shadows a constant of the same name
+  (the pattern binds again), and `var X` always binds. Arms after one
+  that matches every value (a binding or `_`, no guard) can never run
+  and draw the warning `unreachable_arm`; when that arm is a binding,
+  the note says so, which catches a misspelled or unimported constant
+  (`LOCAL =>` without `const LOCAL` in scope binds `LOCAL` to anything).
 - **String patterns.** On a `str`, `match` arms may be string literals:
   `match name { "dup" => .., "swap" | "exch" => .., _ => .. }`. As with
   integers, only `_` or a binding makes such a match exhaustive. A run
@@ -184,8 +203,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The lints are `match_fallout` and
-  `super_overlap` (section 7.3), and the
+  the warnings that remain into errors. The lints are `match_fallout`,
+  `unreachable_arm` (above) and `super_overlap` (section 7.3), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
@@ -626,8 +645,9 @@ How a name is resolved depends on where it is:
 - in `x.y`, `x` is looked up among types and modules first: with both
   `fn parse` and `import std.parse`, `parse.Prec` is the module's struct
   (a function has no fields, so nothing is lost);
-- patterns resolve variant names against the type being matched, so
-  they are not affected by items in scope.
+- patterns resolve variant names against the type being matched first;
+  a name that is not a variant is a constant in scope if there is one
+  (section 1.2, "Constants in patterns"), else a binding.
 
 Enum and `value` variants are not module items: bare `Arr(..)` or
 `Nil` is found through the expected type (or written `Value.Arr(..)`).

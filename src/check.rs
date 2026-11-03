@@ -1447,6 +1447,75 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The constant a pattern path names, if any: `LIMIT` (a `const` of
+    /// this module or imported, not shadowed by a local), `mod.LIMIT`,
+    /// `Vm.OP_ADD`.
+    fn pat_const(&self, cx: &FnCx, path: &[Ident]) -> Option<u32> {
+        if cx.lookup(&path[0].name).is_some() {
+            return None;
+        }
+        if path.len() == 1 {
+            let n = &path[0].name;
+            return match self.value_def(cx.module, n).or_else(|| self.scopes[cx.module].get(n).cloned()) {
+                Some((Def::Const(id), _)) => Some(id),
+                _ => None,
+            };
+        }
+        let mut base = Expr { kind: ExprKind::Ident(path[0].name.clone()), span: path[0].span };
+        for id in &path[1..path.len() - 1] {
+            base = Expr { kind: ExprKind::Field(Box::new(base), id.clone()), span: id.span };
+        }
+        let last = &path[path.len() - 1].name;
+        if let Some(Def::Const(id)) = self.vm_item(cx, &base, last) {
+            return Some(id);
+        }
+        let m = self.module_path(cx, &base)?;
+        match self.scopes[m].get(last) {
+            Some((Def::Const(id), true)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// A pattern that matches the value of constant `id`.
+    fn const_pat(&mut self, id: u32, name: &str, ty: &Ty, span: Span) -> Res<TPat> {
+        let v = self.const_value(id, span)?;
+        if v.ty != *ty {
+            return Err(Diag::new(
+                span,
+                format!(
+                    "constant `{}` has type `{}`, but the value matched has type `{}`",
+                    name,
+                    self.ty_name(&v.ty),
+                    self.ty_name(ty)
+                ),
+            ));
+        }
+        fn conv(c: &Checker, e: &TExpr, name: &str, span: Span) -> Res<TPat> {
+            let kind = match &e.kind {
+                TK::Int(v) => TPK::Int(*v),
+                TK::Bool(b) => TPK::Bool(*b),
+                TK::Str(s) => TPK::Str(s.clone()),
+                TK::Unit => TPK::Wild,
+                TK::Tuple(es) => TPK::Tuple(es.iter().map(|x| conv(c, x, name, span)).collect::<Res<_>>()?),
+                TK::Variant(i, es) if !matches!(e.ty, Ty::Value(_)) => {
+                    TPK::Variant(*i, es.iter().map(|x| conv(c, x, name, span)).collect::<Res<_>>()?)
+                }
+                _ => {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "constant `{}` cannot be a pattern: only integer, `bool`, `str`, enum and tuple constants can (this part has type `{}`)",
+                            name,
+                            c.ty_name(&e.ty)
+                        ),
+                    ))
+                }
+            };
+            Ok(TPat { ty: e.ty.clone(), kind })
+        }
+        conv(self, &v, name, span)
+    }
+
     pub fn pat(&mut self, cx: &mut FnCx, p: &Pat, ty: &Ty, mutable: bool) -> Res<TPat> {
         let kind = match &p.kind {
             PatKind::Wild => TPK::Wild,
@@ -1456,7 +1525,18 @@ impl<'a> Checker<'a> {
                         return Ok(TPat { ty: ty.clone(), kind: TPK::Variant(idx, vec![]) });
                     }
                 }
+                if !*pm {
+                    if let Some(id) = self.pat_const(cx, std::slice::from_ref(&Ident { name: name.clone(), span: p.span })) {
+                        return self.const_pat(id, name, ty, p.span);
+                    }
+                }
                 TPK::Bind(cx.declare(name, ty.clone(), mutable || *pm))
+            }
+            // `mod.LIMIT`, `Vm.OP_ADD`: a constant compares with its value.
+            PatKind::Variant(path, None) if path.len() >= 2 && !path[0].name.is_empty() && self.pat_const(cx, path).is_some() => {
+                let id = self.pat_const(cx, path).unwrap();
+                let name = path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".");
+                return self.const_pat(id, &name, ty, p.span);
             }
             PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) if !ty.is_int() => {
                 return Err(Diag::new(p.span, format!("integer pattern for a value of type `{}`", self.ty_name(ty))));
@@ -2329,6 +2409,7 @@ impl<'a> Checker<'a> {
             tarms.push(a);
         }
         self.check_exhaustive(&s.ty, &tarms, span)?;
+        self.lint_unreachable_arms(&tarms, arms);
         if cx.vm.as_ref().is_some_and(|h| h.allow_control) {
             self.lint_lone_if_arms(&tarms, arms);
         }
@@ -2346,6 +2427,34 @@ impl<'a> Checker<'a> {
     /// control continues after the `match`, not with the later arm.
     /// An explicit `else {}` (or a guard, `pat if cond => ..`) says
     /// which is meant.
+    /// Warn about arms after an arm that matches everything (a binding or
+    /// `_`, no guard): they can never run. A binding named like a
+    /// constant (`LOCAL =>` with no `const LOCAL` in scope) is the usual
+    /// cause, so the note says what it is.
+    fn lint_unreachable_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
+        let Some(i) = tarms.iter().position(|a| a.guard.is_none() && irrefutable(&a.pat)) else { return };
+        if i + 1 >= tarms.len() {
+            return;
+        }
+        let span = arms[i + 1].pat.span;
+        if self.warnings.iter().any(|w| w.span == span) {
+            return;
+        }
+        let mut w = Diag::warning(
+            "unreachable_arm",
+            span,
+            if tarms.len() - i - 1 == 1 { "unreachable arm".to_string() } else { format!("{} unreachable arms", tarms.len() - i - 1) },
+        )
+        .note(arms[i].pat.span, "this earlier arm matches every value");
+        if let PatKind::Ident(n, false) = &arms[i].pat.kind {
+            w = w.note(
+                arms[i].pat.span,
+                format!("`{}` binds a new variable; it is not a constant in scope (a `const` of this module, an imported one, or `mod.{}`, would compare with its value)", n, n),
+            );
+        }
+        self.warnings.push(w);
+    }
+
     pub fn lint_lone_if_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
         fn lone_if(e: &TExpr) -> bool {
             match &e.kind {

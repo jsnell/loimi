@@ -1,0 +1,8 @@
+// Float constants cannot be patterns (no float patterns: NaN, -0.0).
+// error: constant `HALF` cannot be a pattern
+const HALF: f64 = 0.5;
+fn f(x: f64) -> i64 {
+    match x { HALF => 1, _ => 2 }
+}
+
+fn main() { f(1.0); }
