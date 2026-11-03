@@ -333,11 +333,11 @@ fn limbs(n: u64, kind: u64, seed: u64) -> Num {
 
 #[test]
 fn products_at_thresholds() {
-    // Sizes around MUL_COLUMNS (14), KARATSUBA and KARATSUBA_SQR (48),
-    // TOOM3 (250) and TOOM3_SQR (500).
-    let sizes: [u64; 14] = [1, 13, 14, 15, 47, 48, 49, 96, 249, 250, 251, 499, 500, 501];
+    // Sizes around KARATSUBA (22), KARATSUBA_SQR (40), TOOM3 (250) and
+    // TOOM3_SQR (500), and odd and even row counts (two rows a pass).
+    let sizes: [u64; 17] = [1, 2, 3, 13, 21, 22, 23, 39, 40, 41, 96, 249, 250, 251, 499, 500, 501];
     var one = bigint.of_i64(1);
-    for i in 0..14 {
+    for i in 0..17 {
         let k = sizes[i];
         // (B^k - 1)^2 = B^2k - 2 B^k + 1
         let x = limbs(k, 0, 1);
@@ -379,8 +379,8 @@ fn products_at_thresholds() {
 fn division_at_thresholds() {
     // a = q b + r with r = b - 1 and quotients of all ones or patterned
     // (the correction steps), divisor and quotient sizes around DIV_DC
-    // (80) and twice it (two levels of recursion).
-    let sizes: [u64; 8] = [2, 40, 79, 80, 81, 160, 161, 330];
+    // (40) and twice it (two levels of recursion).
+    let sizes: [u64; 8] = [2, 20, 39, 40, 41, 80, 81, 170];
     var one = bigint.of_i64(1);
     for i in 0..8 {
         for j in 0..8 {

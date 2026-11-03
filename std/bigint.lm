@@ -41,16 +41,16 @@ extern "C" fn loimi_panic(msg: *u8, len: u64);
 
 /// Multiplications of at least this many limbs (both operands) use
 /// Karatsuba's algorithm.
-pub const KARATSUBA: u64 = 48;
+pub const KARATSUBA: u64 = 22;
 /// Squarings of at least this many limbs use Karatsuba squaring.
-pub const KARATSUBA_SQR: u64 = 48;
+pub const KARATSUBA_SQR: u64 = 40;
 /// Products of at least this many limbs (both operands) use Toom-3.
 pub const TOOM3: u64 = 250;
 /// Squarings of at least this many limbs use Toom-3 squaring.
 pub const TOOM3_SQR: u64 = 500;
 /// Divisions whose divisor and quotient both have at least this many
 /// limbs use divide-and-conquer (Burnikel-Ziegler) division.
-pub const DIV_DC: u64 = 80;
+pub const DIV_DC: u64 = 40;
 /// Formatting numbers of more limbs than this splits them in halves
 /// (divide and conquer).
 pub const DC_LIMBS: u64 = 16;
@@ -258,7 +258,23 @@ fn addmul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
 fn addmul_2(r: *u64, a: *u64, n: u64, m0: u64, m1: u64, c: u64) -> u64 {
     var c0 = c;
     var c1: u64 = 0;
-    for i in 0..n {
+    // Two limbs a step: half the trip count, so the loop's exit stays
+    // predicted to about twice the length.
+    var i: u64 = 0;
+    while i + 1 < n {
+        let x = a[i];
+        let (l0, h0) = x.mul_add_wide(m0, r[i], c0);
+        r[i] = l0;
+        let (l1, h1) = x.mul_add_wide(m1, h0, c1);
+        let y = a[i + 1];
+        let (l2, h2) = y.mul_add_wide(m0, r[i + 1], l1);
+        r[i + 1] = l2;
+        let (l3, h3) = y.mul_add_wide(m1, h2, h1);
+        c0 = l3;
+        c1 = h3;
+        i += 2;
+    }
+    if i < n {
         let x = a[i];
         let (l0, h0) = x.mul_add_wide(m0, r[i], c0);
         r[i] = l0;
