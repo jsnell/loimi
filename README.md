@@ -6,91 +6,18 @@ is designed around a single goal: the code you write for an interpreter's inner
 loop should compile to what an expert would write by hand in assembly, without
 you having to write assembly, macros, or `__attribute__` soup.
 
-Status: **working, pre-1.0**. The compiler, the dispatch strategies,
-value representations, the GC, generated verifiers, instrumentation, C
-embedding, a test runner and an opt-in copy-and-patch JIT work, and seven
-example interpreters are written in Loimi. See
-[`docs/status.md`](docs/status.md) for what is built and how it differs
-from the design.
+You declare the interpreter (its state, instruction formats, value
+representation, ops, slow paths and inline caches) and the compiler
+generates the dispatch loop in the strategy you pick at build time, plus
+the tools that must agree with it: encoders, a disassembler, a bytecode
+verifier, a superinstruction peephole pass, GC tracing and even a
+copy-and-patch JIT.
 
-**Results so far.** `examples/mini` implements a Lua 5.4 subset
-([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
-from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
-0.29–0.76× of Lua's time (0.53× by geometric mean). It also takes less
-time than LuaJIT's hand-written assembly interpreter (`luajit -joff`) on
-13 of them and the same on the 14th (0.83× by geometric mean).
-All current numbers, for every example in every dispatch mode, are in
-[`docs/results.md`](docs/results.md); the optimization history is in
-[`bench/mini/RESULTS.md`](bench/mini/RESULTS.md). Mini has Lua 5.4's
-coroutines too ([design and notes](examples/mini/COROUTINES.md)): on
-three coroutine benchmarks it takes 0.35–0.41× of PUC-Lua's time, about
-LuaJIT `-joff`'s (a resume or yield switches threads inside the dispatch
-loop).
-
-[`examples/minijs`](examples/minijs) implements a JavaScript subset on
-the standard library's shape and inline-cache support. On its 14
-clean-room benchmarks it is faster than V8's bytecode interpreter
-(`node --jitless`: 0.52× of its time by geometric mean, 0.23–0.76× per
-benchmark) and faster than QuickJS (0.40×), on every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
-[`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
-public r7rs-benchmarks suite. By geometric mean it takes 0.27× of Gauche's
-time and 0.44× of Guile 3's time with Guile's JIT off, and 0.96× of
-Guile's with its JIT on
-([`bench/scheme/README.md`](bench/scheme/README.md)).
-
-Four more examples were written by agents that read only the docs, as
-usability studies (each has a `FRICTION.md` report):
-[`examples/lox`](examples/lox) implements Lox from *Crafting
-Interpreters*. It passes all 246 tests of the book's official suite and
-takes 0.45× of the time of the book's C interpreter, clox, by geometric
-mean over its official benchmarks (faster on all 10).
-[`examples/regex`](examples/regex) is a backtracking regex engine shipped
-as a C library, checked against Python's `re` (0.42× of its time and
-0.44× of the PCRE2 interpreter's by geometric mean over 8 patterns).
-[`examples/stack`](examples/stack) is a Forth-like stack VM using
-declared stack effects. [`examples/wasm`](examples/wasm) is a
-WebAssembly interpreter that passes every non-SIMD file of the spec
-test suite (0.91× of wasm3's time by geometric mean over 7 programs).
-
-`loimi build --jit-stencils` (x86-64 Linux) generates a copy-and-patch
-JIT from the same `vm` declarations, with no extra interpreter source:
-0.75–0.86 of the interpreter's time for Mini, MiniJS and Scheme
-([`docs/design/copy-and-patch.md`](docs/design/copy-and-patch.md)).
-
-## Getting started
-
-Requirements: Rust (stable) and clang/LLVM 19.
-
-```sh
-cargo build --release
-./target/release/loimi run tests/run/hello.lm          # compile and run
-./target/release/loimi build examples/mini/main.lm --release -o mini
-./mini examples/mini/tests/functions.mini              # the Lua-like example
-./target/release/loimi build examples/mini/embed.lm --lib -o libmini.a --header mini.h
-clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host   # Mini embedded in C
-cargo test                                             # all tests
-tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
-bench/run.sh                                           # Loimi VM vs hand-written C
-bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
-bench/run_all.py --quick                               # every example vs its references (docs/results.md)
-./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
-```
-
-Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
-user-mode, built from source with an extracted Debian sysroot, no root):
-
-```sh
-bench/cross/install.sh                                 # qemu-aarch64 + sysroot
-S=$PWD/bench/cross/sysroot-aarch64
-./target/release/loimi build examples/mini/main.lm --release --target=aarch64-linux-gnu --sysroot=$S -o mini-arm
-bench/cross/install/bin/qemu-aarch64 -L $S ./mini-arm examples/mini/tests/functions.mini
-LOIMI_RUNNER="$PWD/bench/cross/install/bin/qemu-aarch64 -L $S" \
-  ./target/release/loimi run tests/run/hello.lm --target=aarch64-linux-gnu --sysroot=$S
-```
-
-`cargo test` runs a subset under qemu when the toolchain is installed
-(`aarch64_qemu`); `LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` run the
-whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
+Status: **working, pre-1.0**. Eight example interpreters, from a Lua
+subset to Python and WebAssembly, are written in Loimi, and most take
+less time than the established interpreters they are compared with. See
+[`docs/status.md`](docs/status.md) for what is built and how it
+differs from the design, and [`CHANGELOG.md`](CHANGELOG.md) for what is new.
 
 ## Why a new language?
 
@@ -108,39 +35,8 @@ infrastructure out of macros, compiler extensions, and convention:
 | Quickening and inline caches | Ad-hoc bytecode rewriting | `family` ops with `become`, typed inline `cache` words |
 | Superinstructions | Rarely done, because it's painful | `super A = X; Y;`, plus `--vm-stats`, which counts op pairs and suggests `super` declarations |
 | Untrusted bytecode | Either trust it or bounds-check everything in the hot loop | Generated verifier; verified code runs without operand bounds checks, and `#[require_verified]` makes the entries accept only verified code |
+| GC roots | Manual `PUSH_ROOT`/handle scopes, conservative stack scanning | Collection only at calls marked `uses gc`; the compiler roots traced locals and vm state there, and `--gc-check-roots` checks every root |
 | Tracing and debugger hooks | A check in every handler, or a second copy of the interpreter | Instrumentation `variant`s: alternate dispatch tables, zero cost when off |
-
-## Documents
-
-- [`docs/tutorial/`](docs/tutorial/README.md): **start here**. A
-  step-by-step tutorial that builds a small language from a calculator to
-  a fast, garbage-collected, fuzzed bytecode interpreter, with working
-  code for every step in [`examples/tutorial/`](examples/tutorial).
-- [`docs/language.md`](docs/language.md): the language. The core is short;
-  most of the document covers the interpreter-specific features (`value`, `vm`,
-  effects, quickening, verification, GC integration, instrumentation).
-- [`docs/lowering.md`](docs/lowering.md): how each feature lowers to LLVM IR,
-  with IR sketches. Everything uses stock LLVM; there is no custom backend.
-- [`docs/stdlib.md`](docs/stdlib.md): the standard library, aimed at the
-  rest of an interpreter: lexing, parsing, diagnostics, bytecode building,
-  GC, objects and shapes, strings, numbers, runtime support, and testing.
-- [`docs/roadmap.md`](docs/roadmap.md): implementation plan, benchmarks
-  that define success, and open questions.
-- [`docs/status.md`](docs/status.md): implementation status and deviations
-  from the design.
-- [`examples/mini/`](examples/mini): a working interpreter for a small
-  Lua-like language: lexer, single-pass compiler, register VM with
-  NaN-boxed values, GC-managed strings and tables, generated verifier;
-  also built as a C library ([`examples/embed/`](examples/embed)).
-- [`examples/scheme/`](examples/scheme): an R7RS-small subset with proper
-  tail calls, flat closures and a register VM.
-- [`examples/minijs/`](examples/minijs): a JavaScript subset on shapes and
-  inline caches from `std.obj`.
-- [`examples/lox/`](examples/lox), [`examples/regex/`](examples/regex),
-  [`examples/stack/`](examples/stack), [`examples/wasm/`](examples/wasm):
-  written from the docs alone, with usability reports.
-- [`bench/`](bench): the dispatch benchmark against hand-written C, and
-  [`bench/mini`](bench/mini): Mini vs PUC-Lua and LuaJIT.
 
 ## A taste
 
@@ -205,3 +101,156 @@ every `next` becomes a `musttail` call through the dispatch table. `pc`,
 The `(Int, Int)` check compiles to one xor/or/shift/compare. The `cold` block is
 moved to its own function and reached with a tail call, so the hot path
 makes no call and needs no stack frame.
+
+## Example interpreters
+
+Each has its own tests, run by `cargo test`. Ratios are run time over the reference's, geometric means over
+each suite, tail-call builds; every number, for every dispatch mode and
+the JIT, is in [`docs/results.md`](docs/results.md) (made with
+`bench/run_all.py`).
+
+| Example | What it is | Headline |
+|---|---|---|
+| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.53× PUC-Lua 5.4, 0.83× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks ([log](bench/mini/RESULTS.md)) |
+| [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.52× V8's interpreter (`node --jitless`), 0.40× QuickJS |
+| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 41 unmodified r7rs-benchmarks programs: 0.27× Gauche, 0.44× Guile 3 without JIT, 0.96× Guile with its JIT ([notes](bench/scheme/README.md)) |
+| [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.45× clox |
+| [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.42× Python's `re` |
+| [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
+| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value) | Every non-SIMD spec test file passes; 0.91× wasm3 |
+| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.53× CPython 3.13, 0.20× MicroPython ([report](examples/python/FRICTION.md)) |
+
+Lox, regex, stack, wasm and python were written by agents that read only
+the docs, as usability studies; each has a `FRICTION.md` report.
+`loimi build --jit-stencils` turns the same `vm` source into a
+copy-and-patch JIT: 0.75–0.86 of the interpreter's time for Mini, MiniJS
+and Scheme ([design](docs/design/copy-and-patch.md)).
+
+## What is in it
+
+**`vm` declarations** ([language.md §3](docs/language.md#3-the-vm-declaration), [§7](docs/language.md#7-specialization-quickening-inline-caches-superinstructions)):
+`state` pinned in registers, operand kinds with `verify` clauses,
+fixed-width formats, ops ending in control words (`next`, `jump`,
+`exit`, `raise`), vm functions (`next_pc`, `then_next_pc`), entries,
+nested entries for natives that call guest code, and resume points
+(`Vm.Resume`) for coroutines and generators. Generated from them:
+encoders, emitters, per-format readers, setters and encoders, a
+disassembler, the verifier and its `Verified<Vm>` proof type.
+Specialization: inline `cache`s, quickening with `family`/`become`,
+`then OP`, `super` instructions (with `#[forward]` register forwarding),
+accumulator registers (`#[accumulate]`), stack effects for stack VMs,
+and instrumentation `variant`s.
+
+**Dispatch and code generation** ([§3.7](docs/language.md#37-dispatch-strategies), [lowering.md](docs/lowering.md)):
+`--dispatch=tailcall` (`preserve_none` + `musttail`, the default),
+`goto` (one shared dispatch block copied into each handler) or `switch`
+over the same source. `cold` blocks are outlined; effects (`uses sync`,
+`gc`, `reenter`) make the compiler sync state before calls that need
+it. Handlers are kept free of stack frames (no `memcpy` formation or loop
+vectorization in them), and `-W handler_frame` reports those that still
+set one up. Targets: x86-64 and AArch64 Linux (`--target`).
+
+**Values** ([§2](docs/language.md#2-value-types-declared-representations)):
+`value` types with a declared `repr` (`nanbox`, `lowtag`, `boxed`);
+`match`, also on tuples of values, compiles to a few bit tests.
+Payloads up to 48 bits, and up to 56 `Gc` variants in a nanbox by
+sharing NaN blocks. `--explain-values` prints the chosen layout,
+`block N` pins it, and the `value_layout` warning says when adding a
+variant would change it.
+
+**GC** ([§8](docs/language.md#8-gc-integration), [stdlib/gc.md](docs/stdlib/gc.md)):
+`object` types and `Gc<T>`, tracing generated by the compiler, a
+mark-sweep collector written in Loimi (`std.gc`) with an optional
+generational mode (sticky marks, lazy sweeping, compiler-emitted write
+barriers). Collection happens only in calls marked `uses gc`; the
+compiler roots traced locals and vm state there. Weak references,
+ephemerons, trace and free hooks. Testing aids: GC stress, a verify mode
+for write barriers, `--gc-check-roots`, and a rooting fuzzer.
+
+**Embedding and threads** ([§10.1](docs/language.md#101-embedding-in-a-c-host-implemented)):
+`--lib`/`--shared` with `export "C"` functions and a generated C header,
+panics caught at the boundary, independent interpreter states on
+separate threads (runtime state is thread-local; `--sanitize=thread`),
+and threads sharing one heap behind a lock (`std.gil`). `--cfg NAME`
+with `#[cfg(..)]` and pointer atomics.
+
+**Core language** ([§1](docs/language.md#1-core-language)): structs,
+enums, generics with static traits, `iN`/`uN` of any width, pattern
+matching (with constants as patterns), non-escaping and escaping
+closures, `defer`, `inline for`, float and wide-integer built-ins
+(`mul_wide`, `div_wide`), unaligned loads and stores, raw pointers.
+
+**Standard library** ([stdlib.md](docs/stdlib.md)): lexing (`std.lex`),
+Pratt parsing (`std.parse`), diagnostics (`std.diag`), exact number
+parsing and formatting (`std.num`), bytecode building (`std.bc`),
+hidden classes and inline caches (`std.obj`), the GC (`std.gc`,
+`std.gil`), arbitrary-precision integers (`std.bigint`), hash and
+insertion-ordered maps (`std.map`, `std.dict`), strings (`std.text`),
+collections and allocators (`std.mem`), non-local exits (`std.rt`),
+tests (`std.test`) and timing (`std.prof`).
+
+**Tooling**: `loimi test` runs `#[test]` functions; `--vm-stats` counts
+ops, op sequences (printed as suggested `super` declarations) and
+entries into cold blocks; `--sanitize=address`; a bytecode fuzzer for
+verified code (`tests/fuzz/run.sh`); `bench/run_all.py` runs every
+example against its references.
+
+## Getting started
+
+Requirements: Rust (stable) and clang/LLVM 19, on x86-64 Linux (AArch64
+Linux is a cross target, below).
+
+```sh
+cargo build --release
+./target/release/loimi run tests/run/hello.lm          # compile and run
+./target/release/loimi build examples/mini/main.lm --release -o mini
+./mini examples/mini/tests/functions.mini              # the Lua-like example
+./target/release/loimi build examples/mini/embed.lm --lib -o libmini.a --header mini.h
+clang-19 -I. examples/embed/host.c libmini.a -lm -o host && ./host   # Mini embedded in C
+./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
+./target/release/loimi --help                          # every build option
+```
+
+Testing and benchmarking:
+
+```sh
+cargo test --release                                   # everything, including the doc snippets
+tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
+bench/run.sh                                           # Loimi VM vs hand-written C
+bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
+bench/run_all.py --quick                               # every example vs its references
+```
+
+Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
+user-mode, built from source with an extracted Debian sysroot, no root):
+
+```sh
+bench/cross/install.sh                                 # qemu-aarch64 + sysroot
+S=$PWD/bench/cross/sysroot-aarch64
+./target/release/loimi build examples/mini/main.lm --release --target=aarch64-linux-gnu --sysroot=$S -o mini-arm
+bench/cross/install/bin/qemu-aarch64 -L $S ./mini-arm examples/mini/tests/functions.mini
+LOIMI_RUNNER="$PWD/bench/cross/install/bin/qemu-aarch64 -L $S" \
+  ./target/release/loimi run tests/run/hello.lm --target=aarch64-linux-gnu --sysroot=$S
+```
+
+`cargo test` runs a subset under qemu when the toolchain is installed
+(`aarch64_qemu`); `LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` run the
+whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
+
+## Where to read next
+
+- [`docs/tutorial/`](docs/tutorial/README.md): **start here**. Builds a
+  small language from a calculator to a fast, garbage-collected, fuzzed
+  bytecode interpreter, with working code for every step in
+  [`examples/tutorial/`](examples/tutorial).
+- [`docs/language.md`](docs/language.md): the language. The core is
+  short; most of it covers the interpreter-specific features.
+- [`docs/stdlib.md`](docs/stdlib.md): the standard library, with
+  [`stdlib/gc.md`](docs/stdlib/gc.md) and [`stdlib/obj.md`](docs/stdlib/obj.md).
+- [`docs/lowering.md`](docs/lowering.md): how each feature lowers to LLVM
+  IR, and what it costs. Everything uses stock LLVM.
+- [`docs/status.md`](docs/status.md): what is built and how it differs
+  from the design; [`CHANGELOG.md`](CHANGELOG.md): what is new.
+- [`docs/results.md`](docs/results.md): benchmark results;
+  [`docs/roadmap.md`](docs/roadmap.md): plan and open questions.
+- The examples above, and their `FRICTION.md` usability reports.
