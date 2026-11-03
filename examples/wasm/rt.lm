@@ -432,8 +432,6 @@ pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
     Ok(mi)
 }
 
-fn unsafe_func(v: u64) -> *Func { v as *Func }
-
 /// Calls `f` with `args`; the results are in `e.m.stack[0..f.nresults]`.
 pub fn Engine.invoke(e: *Engine, f: *Func, args: []u64) -> Result<(), Trap> {
     let st = e.m.stack;
