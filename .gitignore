@@ -18,3 +18,8 @@ __pycache__/
 /bench/cross/install
 /bench/cross/sysroot-aarch64
 /qemu_*.core
+/examples/wasm/probe
+/bench/wasm/src
+/bench/wasm/install
+/bench/wasm/spec-json
+/bench/wasm/programs-out

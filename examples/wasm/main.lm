@@ -1,0 +1,264 @@
+// wasm: a WebAssembly (MVP) interpreter.
+//
+//   wasm prog.wasm              run a module: its start function, then
+//                               `_start` (WASI) or `main` if exported
+//   wasm --invoke F prog.wasm A..   call export F with i32/i64 args
+//   wasm --script cmds.txt      the spec test command protocol (below)
+//   wasm --disasm prog.wasm     print the translated code
+import std.io;
+import std.os;
+import std.mem;
+import std.text;
+import decode;
+import vm;
+import vm.{W, Func, Trap};
+import rt;
+import rt.{Engine, ModInst, Error, ErrKind};
+import host;
+
+fn usage() -> i32 {
+    io.eprintln("usage: wasm prog.wasm | wasm --invoke F prog.wasm ARGS.. | wasm --script FILE | wasm --disasm prog.wasm");
+    2
+}
+
+fn load(e: *Engine, path: str) -> Result<*ModInst, Error> {
+    let Some(bytes) = io.read_file(path) else { return Err(Error { kind: ErrKind.Malformed, msg: "cannot read file" }); };
+    let m = mem.alloc<decode.Module>(1);
+    match decode.decode(bytes) {
+        Ok(mm) => *m = mm,
+        Err(msg) => return Err(Error { kind: ErrKind.Malformed, msg: msg }),
+    }
+    e.instantiate(m)
+}
+
+fn kind_name(k: ErrKind) -> str {
+    match k { Malformed => "malformed", Invalid => "invalid", Unlinkable => "unlinkable", Trap => "trap" }
+}
+
+fn report(err: Error) -> i32 {
+    io.eprint("error: ");
+    io.eprint(kind_name(err.kind));
+    io.eprint(": ");
+    io.eprintln(err.msg);
+    1
+}
+
+fn new_engine() -> *Engine {
+    let e = Engine.new();
+    e.register("spectest", host.spectest(e));
+    e.register("env", host.env(e));
+    e.register("wasi_snapshot_preview1", host.wasi(e));
+    e
+}
+
+fn run_program(path: str) -> i32 {
+    let e = new_engine();
+    let mi = match load(e, path) {
+        Ok(mi) => mi,
+        Err(err) => {
+            if err.kind == ErrKind.Trap and e.m.host_trap == Trap.Exit { return e.m.exit_code; }
+            return report(err);
+        }
+    };
+    let entry = mi.exports.get("_start") ?? mi.exports.get("main");
+    if let Some(x) = entry {
+        if let Some(f) = x.func {
+            var args: [u64; 2] = [0; 2];
+            let n = f.nparams as u64;
+            if n > 2 { io.eprintln("error: entry function takes too many parameters"); return 1; }
+            match e.invoke(f, args[0..n]) {
+                Ok(_) => {
+                    if f.nresults == 1 { return e.m.stack[0] as i32; }
+                }
+                Err(t) => {
+                    if t == Trap.Exit { return e.m.exit_code; }
+                    io.eprint("trap: "); io.eprintln(vm.trap_message(t));
+                    return 1;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn parse_hex(s: str) -> u64 {
+    var v: u64 = 0;
+    for i in 0..s.len {
+        let c = s[i];
+        let d: u64 = if c >= '0' and c <= '9' { (c - '0') as u64 } else if c >= 'a' and c <= 'f' { (c - 'a' + 10) as u64 } else { (c - 'A' + 10) as u64 };
+        v = (v << 4) | d;
+    }
+    v
+}
+
+/// "-" or a hex-encoded name.
+fn unhex(a: *mem.Arena, s: str) -> str {
+    let n = s.len / 2;
+    let p = a.alloc_bytes(n + 1, 1);
+    for i in 0..n { p[i] = parse_hex(s[i * 2..i * 2 + 2]) as u8; }
+    p.slice(n)
+}
+
+fn push_hex(b: *text.StrBuf, v: u64) {
+    let digits = "0123456789abcdef";
+    var started = false;
+    var i: u32 = 16;
+    while i > 0 {
+        i -= 1;
+        let d = (v >> (i * 4)) & 15;
+        if d != 0 or started or i == 0 { b.push(digits[d]); started = true; }
+    }
+}
+
+fn split(line: str, out: *mem.Vec<str>) {
+    out.clear();
+    var i: u64 = 0;
+    while i < line.len {
+        while i < line.len and line[i] == ' ' { i += 1; }
+        let start = i;
+        while i < line.len and line[i] != ' ' { i += 1; }
+        if i > start { out.push(line[start..i]); }
+    }
+}
+
+struct Script {
+    e: *Engine,
+    arena: mem.Arena,
+    names: mem.Vec<(str, *ModInst)>,
+    current: ?*ModInst,
+    out: text.StrBuf,
+}
+
+fn Script.find(s: *Script, name: str) -> ?*ModInst {
+    if name.eq("-") { return s.current; }
+    let n = unhex(&s.arena, name);
+    var i = s.names.len;
+    while i > 0 {
+        i -= 1;
+        let (k, mi) = s.names.at(i);
+        if k.eq(n) { return Some(mi); }
+    }
+    None
+}
+
+fn type_tag(t: u8) -> str { decode.type_name(t) }
+
+fn Script.command(s: *Script, w: *mem.Vec<str>) {
+    let out = &s.out;
+    out.clear();
+    let cmd = w.at(0);
+    if cmd.eq("module") {
+        match load(s.e, w.at(1)) {
+            Ok(mi) => {
+                s.current = Some(mi);
+                if w.len > 2 { s.names.push((unhex(&s.arena, w.at(2)), mi)); }
+                out.push_str("ok");
+            }
+            Err(err) => { out.push_str(kind_name(err.kind)); out.push_str(" "); out.push_str(err.msg); }
+        }
+    } else if cmd.eq("register") {
+        let as_name = unhex(&s.arena, w.at(1));
+        let target = if w.len > 2 { s.find(w.at(2)) } else { s.current };
+        if let Some(mi) = target { s.e.register(as_name, mi); out.push_str("ok"); }
+        else { out.push_str("error unknown module"); }
+    } else if cmd.eq("invoke") or cmd.eq("get") {
+        let Some(mi) = s.find(w.at(1)) else { out.push_str("error unknown module"); return; };
+        let field = unhex(&s.arena, w.at(2));
+        let Some(x) = mi.exports.get(field) else { out.push_str("error unknown export"); return; };
+        if cmd.eq("get") {
+            let Some(g) = x.global else { out.push_str("error not a global"); return; };
+            out.push_str("ok ");
+            out.push_str(type_tag(x.gtype)); out.push_str(":"); push_hex(out, *g);
+            return;
+        }
+        let Some(f) = x.func else { out.push_str("error not a function"); return; };
+        var args: mem.Vec<u64> = mem.Vec.new();
+        defer args.free();
+        for i in 3..w.len {
+            let a = w.at(i);
+            let colon = text.find(a, ':') ?? 0;
+            args.push(parse_hex(a[colon + 1..a.len]));
+        }
+        match s.e.invoke(f, args.items()) {
+            Ok(_) => {
+                out.push_str("ok");
+                let ft = f.inst.module.types.len;
+                for i in 0..(f.nresults as u64) {
+                    out.push_str(" ");
+                    var v = s.e.m.stack[i];
+                    out.push_str("v:");
+                    push_hex(out, v);
+                }
+            }
+            Err(t) => { out.push_str("trap "); out.push_str(vm.trap_message(t)); }
+        }
+    } else {
+        out.push_str("error unknown command");
+    }
+}
+
+fn run_script(path: str) -> i32 {
+    let Some(src) = io.read_file(path) else { io.eprintln("cannot read script"); return 1; };
+    var s = Script { e: new_engine(), arena: mem.Arena.new(), names: mem.Vec.new(), current: None, out: text.StrBuf.new() };
+    var words: mem.Vec<str> = mem.Vec.new();
+    var start: u64 = 0;
+    for i in 0..src.len {
+        if src[i] == '\n' {
+            let line = src[start..i];
+            start = i + 1;
+            split(line, &words);
+            if words.len == 0 { continue; }
+            s.command(&words);
+            s.out.push_str("\n");
+            io.print(s.out.as_str());
+        }
+    }
+    0
+}
+
+fn disasm(path: str) -> i32 {
+    let e = new_engine();
+    let mi = match load(e, path) { Ok(mi) => mi, Err(err) => return report(err) };
+    let inst = mi.inst;
+    var b = text.StrBuf.new();
+    for i in (inst.module.nfunc_imports as u64)..inst.funcs.len {
+        let f = inst.funcs.at(i);
+        b.clear();
+        b.fmt("func {}", i).fmt2(": {} slots, {} locals\n", f.nslots, f.nlocals);
+        W.disasm(f.code.words(), &b);
+        io.print(b.as_str());
+    }
+    0
+}
+
+fn main() -> i32 {
+    let n = os.arg_count();
+    if n < 2 { return usage(); }
+    let a1 = os.arg(1).unwrap();
+    if a1.eq("--script") {
+        if n < 3 { return usage(); }
+        return run_script(os.arg(2).unwrap());
+    }
+    if a1.eq("--disasm") {
+        if n < 3 { return usage(); }
+        return disasm(os.arg(2).unwrap());
+    }
+    if a1.eq("--invoke") {
+        if n < 4 { return usage(); }
+        let fname = os.arg(2).unwrap();
+        let e = new_engine();
+        let mi = match load(e, os.arg(3).unwrap()) { Ok(mi) => mi, Err(err) => return report(err) };
+        let Some(x) = mi.exports.get(fname) else { io.eprintln("no such export"); return 1; };
+        let Some(f) = x.func else { io.eprintln("not a function"); return 1; };
+        var args: mem.Vec<u64> = mem.Vec.new();
+        for i in 4..n { args.push((text.parse_int(os.arg(i).unwrap()) ?? 0) as u64); }
+        match e.invoke(f, args.items()) {
+            Ok(_) => {
+                for i in 0..(f.nresults as u64) { io.print_int(e.m.stack[i] as i64); io.println(""); }
+                return 0;
+            }
+            Err(t) => { io.eprint("trap: "); io.eprintln(vm.trap_message(t)); return 1; }
+        }
+    }
+    run_program(a1)
+}
