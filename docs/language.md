@@ -233,6 +233,11 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
   (often right, as for an allocation the op exists to make: `#[allow(hot_gc)]`).
+  The opt-in `handler_frame` (`-W handler_frame`) reports tail-call op
+  handlers whose fast path sets up a stack frame (section 4), naming the
+  calls in the handler that can cause it (with the message of each panic
+  site: `.unwrap()`, bounds checks); it compiles the IR to assembly a
+  second time, so it roughly doubles the build's clang time.
   The retired `state_root` (section 8: traced state is now rooted
   automatically) is still accepted by `#[allow(..)]`, with no effect.
 - **Attributes** are checked where they appear: an unknown or misplaced
@@ -1617,9 +1622,31 @@ state and control words: the outlined function returns a small code ("next",
 "jump to X", "raise E") and the handler performs the transfer.
 **Not built** as described: in tail-call mode a cold block that ends in
 control words becomes its own handler-shaped function reached with
-`musttail` (no call, no return code); other cold blocks, and all of them in
-goto and switch modes, stay inline and are marked unlikely (`status.md`). Branches into
-cold blocks are weighted as unlikely. A `cold` block is also an expression:
+`musttail` (no call, no return code). A cold block that falls through
+but sits in an `if` whose enclosing block goes on to end in a control
+word (`if unlikely(c) { cold { gc.collect(&ctx.heap); } } ..; next`, at
+any nesting depth in the op) gets a copy of that rest, so that it ends
+in a control word too and is outlined. Other cold blocks (in a vm
+function, in a loop, or where the rest of the block does not end in a
+control word), and all of them in goto and switch modes, stay inline
+and are marked unlikely (`status.md`). Branches into cold blocks are
+weighted as unlikely.
+
+A call left inline (a slow path outside `cold`, an inline cold block, a
+panic for `.unwrap()` or a failed bounds check, a write barrier's
+`remember`) needs an aligned stack, and LLVM often sets up the frame at
+the handler's entry rather than on the rare path, so every execution
+pays a `push` or more. `-W handler_frame` finds such handlers in the
+generated code (section 1.2, under Warnings). Outlining fall-through cold blocks as
+calls that return (`preserve_most`, with their captures and the state
+they change through thread-locals) was considered and not built: the
+pattern that needs it is a `cold` block in a plain vm function such as
+`fn gc_point() { if .. { cold { gc.collect(..) } } }`, whose check can
+be written in the op instead (where the rest is copied). Turning panic calls
+in handlers into tail calls to a handler-shaped stub was measured: it
+removed the frame of 1 of the 218 handlers with one in the seven
+example interpreters (the others also make other calls), so it was not
+kept. A `cold` block is also an expression:
 `let ok = match (a, b) { ..., _ => cold { compare_slow(ctx, a, b)? } };`
 
 ---
