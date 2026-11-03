@@ -79,7 +79,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
 - Module-level `var NAME: T = init;` declares a global. `init` must be a
   constant expression (literals, consts, `[x; N]`, aggregate and enum
-  literals of constants, functions). `#[thread_local] var` gives each thread
+  literals of constants, functions, and `0 as *T`, a null pointer, as
+  `..zero` makes one). `#[thread_local] var` gives each thread
   its own copy, which is what an interpreter wants for "current VM" or
   per-thread caches. `pub var` is visible to other modules. Globals are not
   GC roots.
@@ -155,6 +156,12 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   and draw the warning `unreachable_arm`; when that arm is a binding,
   the note says so, which catches a misspelled or unimported constant
   (`LOCAL =>` without `const LOCAL` in scope binds `LOCAL` to anything).
+- **Alternatives** (`A | B`) may bind names when they are the whole
+  pattern of a `match` arm: `And(a, b) | Or(a, b) if a > 0 => a + b`
+  is one arm per alternative, each with the guard and the body (so the
+  body is compiled once per alternative, and each alternative must bind
+  what the body uses). Nested alternatives (`Some(A(x) | B(x))`) may
+  not bind.
 - **String patterns.** On a `str`, `match` arms may be string literals:
   `match name { "dup" => .., "swap" | "exch" => .., _ => .. }`. As with
   integers, only `_` or a binding makes such a match exhaustive. A run
@@ -395,7 +402,7 @@ fn main() { Sym { id: 5 }.show_line(); }
   `block fn(A, B) -> R uses E` is the type of a closure parameter. A
   closure literal `|a, b| expr` (parameter types from the parameter,
   or written `|a: T|`; `|| expr` takes none; `|a| -> R { .. }` gives the
-  result type) can only be an argument for such a parameter, and a
+  result type) can only be an argument for such a parameter (or a local closure, below), and a
   `block fn` parameter can only be called or passed on as such an
   argument (also to a closure that calls it). It cannot be stored in a
   local, a field or a global, returned, cast, or be a type argument;
@@ -414,6 +421,13 @@ fn main() { Sym { id: 5 }.show_line(); }
     calling a `block fn` has its type's effects, with the usual rules.
   - A plain function (or `fn` value) converts to a `block fn` with the
     same signature and no more effects: `v.sort_by(cmp_i64)` works.
+  - **Local closures.** `let f = |x: i64| x * scale;` (parameter types
+    written, result type from the body) is a local `block fn` with the
+    same rules as a `block fn` parameter: it can be called (`f(2)`) or
+    passed on (`v.sort_by(f)`), nothing else, so it cannot outlive the
+    locals it captures. Its type has no effects if its body makes no
+    effectful calls (so it can be passed to any `block fn` parameter),
+    else the enclosing function's.
   - In a generic call, closure arguments are checked last, so their
     parameter types can come from the other arguments, and their result
     type from the body (`map(xs, |x| x as f64 / 2.0)` infers `U = f64`).

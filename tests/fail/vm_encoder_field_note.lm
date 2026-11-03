@@ -1,0 +1,19 @@
+// Operands take the format's fields in order: an op with fewer operands
+// than fields puts its operand in the first field, and a mismatched
+// encoder argument says which field that is.
+// error: mismatched types: expected `u8`, found `u16`
+// error: operand `name` of `DELGLOBAL` is field `a` of format `ABx` (8 bits): operands take the format's fields in order (`DELGLOBAL` has 1 operand(s) for 2 fields; a placeholder operand such as `z: imm` moves the next ones along)
+vm V {
+    state { pc: *u32, k: *i64 }
+    operand kst = k[it];
+    encoding fixed(u32) { format ABx { op: 8, a: 8, bx: 16 } }
+    op DELGLOBAL(name: kst) : ABx { next }
+    op END(name: kst) : ABx { exit 0 }
+    entry run(code: *u32, ks: *i64) -> i64 { k = ks; jump code }
+}
+
+fn main() {
+    var code: [u32; 2] = [0; 2];
+    let idx: u16 = 300;
+    V.emit.DELGLOBAL(code[..], 0, idx);
+}

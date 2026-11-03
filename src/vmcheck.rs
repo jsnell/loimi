@@ -540,6 +540,33 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 Some(cn) => Some(caches.iter().position(|ci: &CacheInfo| ci.name == cn.name).unwrap()),
                 None => None,
             };
+            // For mismatched arguments of the op's encoders
+            // (`V.OP(..)`, `V.emit.OP(..)`): which field each operand is.
+            if let Some(fd) = d.formats.iter().find(|f| f.name.name == od.format.name) {
+                let fields: Vec<&crate::vmast::FormatField> = fd.fields.iter().filter(|f| f.name.name != "op").collect();
+                let notes: Vec<String> = od
+                    .params
+                    .iter()
+                    .zip(&fields)
+                    .map(|(p, f)| {
+                        let mut n = format!(
+                            "operand `{}` of `{}` is field `{}` of format `{}` ({} bits): operands take the format's fields in order",
+                            p.name.name, od.name.name, f.name.name, fd.name.name, f.bits
+                        );
+                        if od.params.len() < fields.len() {
+                            n.push_str(&format!(
+                                " (`{}` has {} operand(s) for {} fields; a placeholder operand such as `z: imm` moves the next ones along)",
+                                od.name.name,
+                                od.params.len(),
+                                fields.len()
+                            ));
+                        }
+                        n
+                    })
+                    .collect();
+                c.encoder_notes.insert(format!("{}__{}", d.name.name, od.name.name), (0, notes.clone()));
+                c.encoder_notes.insert(format!("{}__emit_{}", d.name.name, od.name.name), (2, notes));
+            }
             (
                 od.format.name.clone(),
                 cache,
