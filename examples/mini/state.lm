@@ -31,9 +31,9 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
     let globals = value.new_table(&heap);
     lib.install(&heap, globals);
     coro.install(&heap, globals);
-    let main = coro.new_main(&heap);
     let stack: *V = mem.alloc(STACK_SLOTS);
     let frames: *Frame = mem.alloc(FRAMES);
+    let main = coro.new_main(&heap, stack, STACK_SLOTS, frames, FRAMES);
     Ctx {
         heap: heap,
         stack: stack,

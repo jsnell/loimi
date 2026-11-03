@@ -7,7 +7,7 @@ import value;
 import lib;
 import value.{V, Str, Arr, Table, Proto, Closure, UpVal};
 import coro;
-import coro.{Coro, Saved};
+import coro.{Coro};
 
 extern "C" fn pow(a: f64, b: f64) -> f64;
 
@@ -44,13 +44,14 @@ pub struct Ctx {
     /// back into Mini (`call_value`).
     host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter,
     // Coroutines (coro.lm). The fields above from `stack` to `open_level`
-    // describe the running thread's stacks: resume swaps them.
-    /// The running coroutine: `main` when none is.
+    // describe the running thread's stacks: a switch swaps them.
+    /// The running coroutine: `main` when none is. The threads that
+    /// resumed it, innermost first, are linked through `Coro.prev`.
     cur: Gc<Coro>,
     main: Gc<Coro>,
-    /// The threads that resumed the running one, innermost first (records
-    /// on the C stack of `coro.resume`).
-    chain: *Saved,
+    /// How many of those resumes happened inside a vm run (a CALL), which
+    /// count towards MAX_NESTING as the nested runs (`Mini.depth`) do.
+    nco: u32,
     /// Results of the last native when it returned several: `nret` of
     /// them in `rbuf` (capacity `rcap`). NRET_ONE otherwise.
     nret: u64,
@@ -86,16 +87,17 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.rethrow);
     if let Some(u) = c.open { gc_mark(h, u); }
     scan_frames(h, c.frames, c.fp);
-    // Coroutines: the running one, and the resumers with their stacks
-    // (a suspended coroutine's stacks are traced through its object).
+    // Coroutines: the running one, and the (normal) resumers with their
+    // stacks, up to their saved frame pointers (a suspended coroutine's
+    // stacks are traced through its object).
     gc_mark(h, c.cur);
     gc_mark(h, c.main);
-    var s = c.chain;
-    while s != 0 as *Saved {
-        gc_mark(h, s.cur);
-        if let Some(u) = s.open { gc_mark(h, u); }
-        scan_frames(h, s.frames, s.fp);
-        s = s.prev;
+    var s = c.cur.prev;
+    loop {
+        let Some(r) = s else { break; };
+        if let Some(u) = r.open { gc_mark(h, u); }
+        scan_frames(h, r.frames, r.fp);
+        s = r.prev;
     }
     if c.nret != NRET_ONE {
         for i in 0..c.nret { gc_mark(h, c.rbuf[i]); }
@@ -160,6 +162,20 @@ fn error(c: *Ctx, msg: str, v: V) -> V {
     let s = value.new_str(&c.heap, b.as_str());
     b.free();
     V.S(s)
+}
+
+/// `e` prefixed with the line of the instruction at `at` in `p`'s code:
+/// "line N: e".
+fn at_line(c: *Ctx, p: Gc<Proto>, at: *u32, e: V) -> V {
+    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    var line: u32 = 0;
+    if i < p.lines.data.len { line = p.lines.data[i]; }
+    c.out.clear();
+    c.out.push_str("line ");
+    c.out.push_int(line as i64);
+    c.out.push_str(": ");
+    value.write_value(&c.out, e);
+    V.S(value.new_str(&c.heap, c.out.as_str()))
 }
 
 fn iter_error(c: *Ctx, v: V) -> V {
@@ -1073,6 +1089,14 @@ pub vm Mini {
         }
         if let Native(id) = f {
             cold {
+                // coroutine.resume and coroutine.yield switch threads in
+                // this run when they can; the native reports the rest.
+                if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
+                    switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
+                }
+                if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
+                    switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
+                }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
                 if ctx.yielded { yield_exit(base as u64, nres as u64) }
@@ -1081,6 +1105,7 @@ pub vm Mini {
         }
         if let Co(w) = f and let Some(co) = w.wrap {
             cold {
+                if coro.can_switch(ctx, co) { switch_in(co, regs + base + 1, nargs as u64, base as u64, nres as u64, true) }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
                 if ctx.yielded { yield_exit(base as u64, nres as u64) }
@@ -1108,10 +1133,89 @@ pub vm Mini {
         }
         next
     }
-    /// After a CALL of coroutine.yield: leave the run (`coro.resume` picks
-    /// up the state), saving where the CALL's `nres` results go and where
-    /// to continue: the next instruction, as a resume point, which
-    /// `Mini.resume` may jump to.
+    /// A CALL resumes `co` (`coro.can_switch`) in this run: save this
+    /// thread's state, with where the CALL's `nres` results go (R[dst..])
+    /// and where it continues (the next instruction, as a resume point),
+    /// install the coroutine's and continue it: after its yield's CALL,
+    /// with `args[0..n]` as that CALL's results, or at the start of its
+    /// body with them as arguments. `wrap`: through its wrap function.
+    fn switch_in(co: Gc<Coro>, args: *V, n: u64, dst: u64, nres: u64, wrap: bool) -> never {
+        ctx.fp = fp;
+        let me = ctx.cur;
+        me.ypc = next_resume;
+        me.ydst = dst as u32;
+        me.ynres = nres as u32;
+        ctx.nco += 1;
+        if co.started {
+            coro.enter(ctx, co, true, wrap);
+            fp = co.fp;
+            regs = fp.base;
+            k = fp.k;
+            ctx.fp = fp;
+            let d = regs + co.ydst as u64;
+            for i in 0..co.ynres as u64 { d[i] = if i < n { args[i] } else { Nil }; }
+            jump co.ypc.pc()
+        }
+        let F(cl) = co.body else { unreachable };
+        coro.prepare(ctx, co, cl);
+        coro.enter(ctx, co, true, wrap);
+        co.started = true;
+        let p = cl.proto;
+        fp = ctx.frames;
+        fp.cl = cl;
+        fp.base = ctx.stack;
+        fp.nres = 1;
+        k = p.consts.data.ptr;
+        fp.k = k;
+        regs = ctx.stack;
+        for i in 0..p.nregs as u64 { regs[i] = if i < n { args[i] } else { Nil }; }
+        ctx.fp = fp;
+        jump p.code
+    }
+    /// A CALL of coroutine.yield in a coroutine resumed in this run, with
+    /// `vals[0..n]` to pass: suspend it (its CALL's `nres` results will go
+    /// to R[dst..]) and continue its resumer.
+    fn switch_out(vals: *V, n: u64, dst: u64, nres: u64) -> never {
+        let co = ctx.cur;
+        coro.suspend(ctx, co, fp, next_resume, dst as u32, nres as u32);
+        back(co, Bool(true), !co.via_wrap, vals, n, false)
+    }
+    /// The bottom frame of a coroutine resumed in this run returns
+    /// `vals[0..n]` (its open upvalues are closed): it dies, and its
+    /// resumer continues.
+    fn finish(vals: *V, n: u64) -> never {
+        let co = ctx.cur;
+        back(co, Bool(true), !co.via_wrap, vals, n, true)
+    }
+    /// Continue the thread that resumed `co` (whose state is saved, or
+    /// which is `dead`) in this run: its CALL gets `first` (if `lead`)
+    /// and `vals[0..n]`, which may be in `co`'s stack.
+    fn back(co: Gc<Coro>, first: V, lead: bool, vals: *V, n: u64, dead: bool) -> never {
+        ctx.nco -= 1;
+        let r = coro.leave(ctx, co);
+        fp = r.fp;
+        regs = fp.base;
+        k = fp.k;
+        let d = regs + r.ydst as u64;
+        let want = r.ynres as u64;
+        var i: u64 = 0;
+        if lead {
+            d[0] = first;
+            i = 1;
+        }
+        let src = vals - i;
+        while i < want {
+            d[i] = if i < n + (lead as u64) { src[i] } else { Nil };
+            i += 1;
+        }
+        if dead { coro.die(co); }
+        jump r.ypc.pc()
+    }
+    /// After a CALL of coroutine.yield in a coroutine resumed by a native
+    /// (`coro.resume`): leave the run (`coro.resume` picks up the state),
+    /// saving where the CALL's `nres` results go and where to continue:
+    /// the next instruction, as a resume point, which `Mini.resume` may
+    /// jump to.
     fn yield_exit(base: u64, nres: u64) -> never {
         ctx.nret = NRET_ONE;
         ctx.ypc = next_resume;
@@ -1125,6 +1229,7 @@ pub vm Mini {
         let v = src;
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
+            if ctx.cur.inrun and fp == ctx.frames { cold { regs[0] = v; finish(regs, 1) } }
             ctx.nxfer = 1;
             exit Ok(v)
         }
@@ -1148,6 +1253,7 @@ pub vm Mini {
     op RETN(a: reg, n: retn) : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
+            if ctx.cur.inrun and fp == ctx.frames { cold { finish(regs + a.raw as u64, n as u64) } }
             ctx.xfer = regs + a.raw as u64;
             ctx.nxfer = n as u64;
             exit Ok(a)
@@ -1166,6 +1272,7 @@ pub vm Mini {
     op RET0() : ABC {
         if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
         if fp == ctx.base {
+            if ctx.cur.inrun and fp == ctx.frames { cold { finish(regs, 0) } }
             ctx.nxfer = 0;
             exit Ok(Nil)
         }
@@ -1278,21 +1385,31 @@ pub vm Mini {
 
     on raise(e: V) {
         ctx.fp = fp;
-        // An error from a nested run already has its line.
+        var err = e;
         if e != V.Nil and e == ctx.rethrow {
+            // An error from a nested run already has its line.
             ctx.rethrow = Nil;
-            exit Err(e)
+        } else {
+            err = at_line(ctx, fp.cl.proto, pc, e);
         }
-        // Prefix the message with the line of the failing instruction.
-        let p = fp.cl.proto;
-        let i = ((pc as u64) - (p.code.start() as u64)) / 4;
-        var line: u32 = 0;
-        if i < p.lines.data.len { line = p.lines.data[i]; }
-        ctx.out.clear();
-        ctx.out.push_str("line ");
-        ctx.out.push_int(line as i64);
-        ctx.out.push_str(": ");
-        value.write_value(&ctx.out, e);
-        exit Err(S(value.new_str(&ctx.heap, ctx.out.as_str())))
+        // A coroutine resumed in this run dies of it, and its resumer
+        // continues: with false and the error, or through a wrap
+        // function, raising it at the CALL (with that line too).
+        loop {
+            let co = ctx.cur;
+            if !co.inrun or ctx.base != ctx.frames { exit Err(err) }
+            close_upvals(ctx, ctx.stack);
+            if !co.via_wrap {
+                co.err = err;
+                back(co, Bool(false), true, &co.err, 1, true)
+            }
+            ctx.nco -= 1;
+            let r = coro.leave(ctx, co);
+            coro.die(co);
+            fp = r.fp;
+            regs = fp.base;
+            k = fp.k;
+            err = at_line(ctx, fp.cl.proto, r.ypc.pc() - 1, err);
+        }
     }
 }

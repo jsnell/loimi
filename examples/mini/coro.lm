@@ -3,19 +3,28 @@
 // A coroutine is a `Coro` object with a value stack and a frame stack of
 // its own (host memory that the object owns, growing by doubling). The
 // VM runs on whichever stacks the context's fields (`stack` .. `open_level`)
-// describe; `resume` saves the resumer's into a `Saved` record on its C
-// stack, installs the coroutine's, and runs it through a nested entry
-// (`Mini.call` the first time, `Mini.resume` after a yield). A CALL of
-// coroutine.yield leaves that run (`native_results` in vm.lm) after
-// recording where to continue, so the resumer's native call returns: no
-// native stack switching. Yielding with a native in between (a table.sort
-// comparator, a host function) is an error, as in PUC-Lua for C functions
-// without continuations.
+// describe. A switch saves the running thread's state (its frame pointer,
+// run base, open upvalues and where to continue) in its own `Coro` and
+// installs the other's:
+//
+// - A CALL of coroutine.resume or of a wrap function switches inside the
+//   running vm run (`switch_in` in vm.lm), and the coroutine's yield, its
+//   last return and its errors switch back the same way (`switch_out`,
+//   `on raise`): no native call, no nested entry, no C stack.
+// - A resume from a native (a table.sort comparator calling a wrap
+//   function, a host function) is `resume` below: it runs the coroutine
+//   through a nested entry (`Mini.call` the first time, `Mini.resume`
+//   after a yield), and the coroutine's yield leaves that run
+//   (`yield_exit` in vm.lm).
+//
+// Yielding with a native in between (a table.sort comparator, a host
+// function) is an error, as in PUC-Lua for C functions without
+// continuations.
 
 import std.gc;
 import std.mem;
 import value;
-import value.{V, UpVal, Table};
+import value.{V, UpVal, Table, Closure};
 import vm;
 import vm.{Ctx, Frame, Mini, NRET_ONE};
 
@@ -24,9 +33,18 @@ pub const RUNNING: u32 = 1;
 pub const NORMAL: u32 = 2;
 pub const DEAD: u32 = 3;
 
-/// A coroutine. While suspended after a yield, `fp`, `open` and
-/// `open_level` are its saved thread state and the yield's CALL continues
-/// at `ypc`, storing its `ynres` results from register `ydst`.
+/// A coroutine (or the main thread, `Ctx.main`). While it is not
+/// running (suspended after a yield, or normal: it resumed another),
+/// `fp`, `base`, `open` and `open_level` are its saved thread state, and
+/// the CALL that yielded (or resumed) continues at `ypc`, storing its
+/// `ynres` results from register `ydst`.
+///
+/// While it runs, `prev` is the thread that resumed it, and `inrun` says
+/// whether that happened inside the resumer's vm run (a CALL), so that
+/// its yield, return and errors switch back in the run, or through a
+/// native (`resume`), so that they leave the run. `via_wrap`: resumed by
+/// calling its wrap function (results without the leading true, errors
+/// raised in the resumer).
 ///
 /// Its stacks, `nslots` values at `stack` and `nframes` frames at
 /// `frames`, are host memory (`mem.alloc`) that the object owns: allocated
@@ -50,11 +68,15 @@ pub object Coro {
     /// released when the resume returns.
     retired: *Retired,
     fp: *Frame,
+    base: *Frame,
     open: ?Gc<UpVal>,
     open_level: *V,
     ypc: Mini.Resume,
     ydst: u32,
     ynres: u32,
+    prev: ?Gc<Coro>,
+    inrun: bool,
+    via_wrap: bool,
     /// The error that killed it, until coroutine.close reports it.
     err: V,
     /// Set in the function that coroutine.wrap returns (a Coro of its own,
@@ -94,7 +116,7 @@ fn release(co: Gc<Coro>) {
     release_retired(co);
 }
 
-fn release_retired(co: Gc<Coro>) {
+pub fn release_retired(co: Gc<Coro>) {
     var r = co.retired;
     while r != 0 as *Retired {
         let next = r.next;
@@ -120,26 +142,11 @@ pub fn is_wrap(co: Gc<Coro>) -> bool {
     }
 }
 
-/// The state of a thread that resumed another, on `resume`'s C stack and
-/// linked from `Ctx.chain` (the collector walks its frames).
-pub struct Saved {
-    stack: *V,
-    stack_end: *V,
-    frames: *Frame,
-    frames_end: *Frame,
-    fp: *Frame,
-    base: *Frame,
-    open: ?Gc<UpVal>,
-    open_level: *V,
-    cur: Gc<Coro>,
-    prev: *Saved,
-}
-
 /// Native ids (vm.call_native sends ids from FIRST up here).
 pub const FIRST: i32 = 50;
 const CREATE: i32 = 50;
-const RESUME: i32 = 51;
-const YIELD: i32 = 52;
+pub const RESUME: i32 = 51;
+pub const YIELD: i32 = 52;
 const STATUS: i32 = 53;
 const ISYIELDABLE: i32 = 54;
 const RUNNING_FN: i32 = 55;
@@ -169,9 +176,11 @@ pub fn install(h: *gc.Heap, globals: Gc<Table>) {
 }
 
 /// The main thread's coroutine object (what coroutine.running returns
-/// outside any coroutine): running, without stacks of its own.
-pub fn new_main(h: *gc.Heap) -> Gc<Coro> {
-    new(h, Coro { status: RUNNING, started: true, body: V.Nil, err: V.Nil, ypc: Mini.Resume.placeholder(), ..zero })
+/// outside any coroutine): running, on the main stacks (which it does not
+/// own: they never grow, and `Ctx` frees them).
+pub fn new_main(h: *gc.Heap, stack: *V, nslots: u64, frames: *Frame, nframes: u64) -> Gc<Coro> {
+    new(h, Coro { status: RUNNING, started: true, body: V.Nil, err: V.Nil, ypc: Mini.Resume.placeholder(),
+        stack: stack, nslots: nslots, frames: frames, nframes: nframes, ..zero })
 }
 
 fn msg(c: *Ctx, s: str) -> V { V.S(value.new_str(&c.heap, s)) }
@@ -286,7 +295,7 @@ fn status_name(c: *Ctx, co: Gc<Coro>) -> str {
     "normal"
 }
 
-fn die(co: Gc<Coro>) {
+pub fn die(co: Gc<Coro>) {
     co.status = DEAD;
     release(co);
     co.open = None;
@@ -314,57 +323,115 @@ fn resume_native(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<
     }
 }
 
+/// Whether a CALL may resume `co` inside its run (vm.lm, `switch_in`):
+/// suspended, under the nesting limit, and with Mini code to run. The
+/// other cases go through `resume`, which reports them.
+pub fn can_switch(c: *Ctx, co: Gc<Coro>) -> bool {
+    if co.status != SUSPENDED or Mini.depth + c.nco >= vm.MAX_NESTING { return false; }
+    if co.started { return true; }
+    match co.body {
+        F(_) => true,
+        _ => false,
+    }
+}
+
+/// Give a coroutine that is about to start its stacks.
+pub fn prepare(c: *Ctx, co: Gc<Coro>, cl: Gc<Closure>) {
+    let nregs = cl.proto.nregs as u64;
+    let cap = if nregs > VS_INIT { nregs } else { VS_INIT };
+    co.stack = mem.alloc(cap);
+    co.nslots = cap;
+    co.frames = mem.alloc(FS_INIT);
+    co.nframes = FS_INIT;
+    // Count the stacks towards the next collection, as if they were in
+    // the heap.
+    c.heap.allocated += cap * 8 + FS_INIT * size_of<Frame>();
+    c.heap.on_free(co as *u8, free_coro);
+}
+
+/// Save the running thread's state in its `Coro` (normal from now on)
+/// and install `co`'s stacks, `co` resumed by it (`inrun`: by a CALL in
+/// the same vm run). The caller sets up the frame registers.
+pub fn enter(c: *Ctx, co: Gc<Coro>, inrun: bool, wrap: bool) {
+    let r = c.cur;
+    r.fp = c.fp;
+    r.base = c.base;
+    r.open = c.open;
+    r.open_level = c.open_level;
+    r.status = NORMAL;
+    co.prev = Some(r);
+    co.inrun = inrun;
+    co.via_wrap = wrap;
+    co.status = RUNNING;
+    // From here until it suspends, its stacks are roots (vm.scan_roots),
+    // and so are the resumer's (through `prev`).
+    c.stack = co.stack;
+    c.stack_end = co.stack + co.nslots;
+    c.frames = co.frames;
+    c.frames_end = co.frames + co.nframes;
+    c.base = co.frames;
+    c.open = co.open;
+    c.open_level = co.open_level;
+    c.cur = co;
+}
+
+/// Reinstall the state of the thread that resumed `co`, which stopped
+/// running (its own state is saved, or it is dead); returns that thread.
+pub fn leave(c: *Ctx, co: Gc<Coro>) -> Gc<Coro> {
+    let Some(r) = co.prev else { unreachable };
+    co.prev = None;
+    c.stack = r.stack;
+    c.stack_end = r.stack + r.nslots;
+    c.frames = r.frames;
+    c.frames_end = r.frames + r.nframes;
+    c.fp = r.fp;
+    c.base = r.base;
+    c.open = r.open;
+    c.open_level = r.open_level;
+    c.cur = r;
+    r.status = RUNNING;
+    r
+}
+
+/// Suspend the running coroutine `co`, whose top frame is `fp`: the
+/// yield's CALL continues at `ypc` with its `nres` results from register
+/// `dst`.
+pub fn suspend(c: *Ctx, co: Gc<Coro>, fp: *Frame, ypc: Mini.Resume, dst: u32, nres: u32) {
+    co.status = SUSPENDED;
+    co.fp = fp;
+    co.base = c.base;
+    co.open = c.open;
+    co.open_level = c.open_level;
+    co.ypc = ypc;
+    co.ydst = dst;
+    co.ynres = nres;
+    release_retired(co);
+    // Its stacks are no longer roots, and the VM wrote them without
+    // barriers: a minor collection must trace them.
+    gc.write_barrier(&c.heap, co as *u8);
+}
+
 /// coroutine.resume(co, args[0..n]) (`wrap` false: results true and the
 /// values, or false and the error) and calling a wrap function (`wrap`
-/// true: the values, or the error raised).
+/// true: the values, or the error raised), from a native or from a CALL
+/// that cannot switch (`can_switch`). The coroutine runs through a nested
+/// entry, which returns when it yields, returns or fails.
 pub fn resume(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, V> uses reenter {
     if co.status != SUSPENDED {
         let m = msg(c, if co.status == DEAD { "cannot resume dead coroutine" } else { "cannot resume non-suspended coroutine" });
         if wrap { return Err(m); }
         return two(c, V.Bool(false), m);
     }
-    if Mini.depth >= vm.MAX_NESTING {
+    if Mini.depth + c.nco >= vm.MAX_NESTING {
         let m = msg(c, "C stack overflow");
         if wrap { return Err(m); }
         return two(c, V.Bool(false), m);
     }
     if !co.started {
         let F(cl) = co.body else { return resume_native(c, co, args, n, wrap); };
-        let nregs = cl.proto.nregs as u64;
-        let cap = if nregs > VS_INIT { nregs } else { VS_INIT };
-        co.stack = mem.alloc(cap);
-        co.nslots = cap;
-        co.frames = mem.alloc(FS_INIT);
-        co.nframes = FS_INIT;
-        // Count the stacks towards the next collection, as if they were
-        // in the heap.
-        c.heap.allocated += cap * 8 + FS_INIT * size_of<Frame>();
-        c.heap.on_free(co as *u8, free_coro);
+        prepare(c, co, cl);
     }
-    var saved = Saved {
-        stack: c.stack,
-        stack_end: c.stack_end,
-        frames: c.frames,
-        frames_end: c.frames_end,
-        fp: c.fp,
-        base: c.base,
-        open: c.open,
-        open_level: c.open_level,
-        cur: c.cur,
-        prev: c.chain,
-    };
-    c.chain = &saved;
-    c.cur.status = NORMAL;
-    c.stack = co.stack;
-    c.stack_end = co.stack + co.nslots;
-    c.frames = co.frames;
-    c.frames_end = co.frames + co.nframes;
-    c.base = c.frames;
-    c.open = co.open;
-    c.open_level = co.open_level;
-    c.cur = co;
-    // From here until it suspends, its stacks are roots (vm.scan_roots).
-    co.status = RUNNING;
+    enter(c, co, false, wrap);
     var r: Result<V, V> = Ok(V.Nil);
     if co.started {
         c.fp = co.fp;
@@ -393,16 +460,7 @@ pub fn resume(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, 
             var cnt = c.nxfer;
             if c.yielded {
                 c.yielded = false;
-                co.status = SUSPENDED;
-                co.fp = c.fp;
-                co.open = c.open;
-                co.open_level = c.open_level;
-                co.ypc = c.ypc;
-                co.ydst = c.ydst;
-                co.ynres = c.ynres;
-                // Its stacks are no longer roots, and the VM wrote them
-                // without barriers: a minor collection must trace them.
-                gc.write_barrier(&c.heap, co as *u8);
+                suspend(c, co, c.fp, c.ypc, c.ydst, c.ynres);
             } else {
                 co.status = DEAD;
                 if cnt == 1 { src = &v; }
@@ -423,17 +481,7 @@ pub fn resume(c: *Ctx, co: Gc<Coro>, args: *V, n: u64, wrap: bool) -> Result<V, 
             first = e;
         }
     }
-    c.stack = saved.stack;
-    c.stack_end = saved.stack_end;
-    c.frames = saved.frames;
-    c.frames_end = saved.frames_end;
-    c.fp = saved.fp;
-    c.base = saved.base;
-    c.open = saved.open;
-    c.open_level = saved.open_level;
-    c.cur = saved.cur;
-    c.chain = saved.prev;
-    c.cur.status = RUNNING;
+    leave(c, co);
     release_retired(co);
     if co.status == DEAD {
         let e = co.err;

@@ -1,0 +1,170 @@
+-- Coroutine switches inside one vm run (a CALL of coroutine.resume, of
+-- a wrap function, or of coroutine.yield swaps the thread state without
+-- leaving the run) mixed with resumes from natives (a table.sort
+-- comparator calling a wrap function runs the coroutine in a nested
+-- run): results both ways, errors through resume and through chains of
+-- wrap functions, returns, upvalues, deep chains, garbage.
+
+-- Results: fewer and more values than wanted, both ways.
+local co = coroutine.create(function(a, b, c)
+  local x, y = coroutine.yield(a, b, c, 4)
+  local z = coroutine.yield()
+  return x, y, z
+end)
+local ok, p, q = coroutine.resume(co, 1, 2, 3, 99)
+print(ok, p, q)
+local r1, r2, r3, r4, r5, r6 = coroutine.resume(co, "x")
+print(r1, r2, r3, r4, r5, r6)
+local s1, s2, s3, s4 = coroutine.resume(co, 5, 6, 7)
+print(s1, s2, s3, s4)
+s1, s2 = coroutine.resume(co)
+print(s1, s2)
+
+-- A chain: main resumes A, A resumes B, B yields to A, A yields to main.
+local B = coroutine.wrap(function(v)
+  for i = 1, 3 do v = coroutine.yield(v * 10) end
+  return "B done"
+end)
+local A = coroutine.create(function()
+  local t = 0
+  for i = 1, 4 do
+    local r = B(i)
+    print("A got", r)
+    coroutine.yield(i)
+  end
+  return "A done"
+end)
+for i = 1, 6 do local a1, a2 = coroutine.resume(A); print(a1, a2) end
+
+-- Errors: through resume (false, msg), through a wrap (raised at the
+-- call, which adds its own line), and through two wraps.
+local e1 = coroutine.create(function() local t = nil; return t.x end)
+local f1, m1 = coroutine.resume(e1)
+print(f1, m1)
+local c1, c2 = coroutine.close(e1)
+print(coroutine.status(e1), c1, c2)
+local w1 = coroutine.wrap(function() error("inner") end)
+local w2 = coroutine.wrap(function() return w1() end)
+local e2 = coroutine.create(function() return w2() end)
+local f2, m2 = coroutine.resume(e2)
+print(f2, m2)
+local w3 = coroutine.wrap(function() coroutine.yield(1); error({}) end)
+print(w3())
+local e3 = coroutine.create(function() return w3() end)
+local okk, ee = coroutine.resume(e3)
+print(okk, type(ee))
+local f4, m4 = coroutine.resume(coroutine.create(function() error() end))
+print(f4, m4)
+
+-- A comparator (a nested run) resuming coroutines inside its run.
+local gen = coroutine.wrap(function()
+  local i = 0
+  while true do i = i + 1; coroutine.yield(i) end
+end)
+local calls = 0
+local t = {5, 3, 8, 1, 9, 2, 7}
+table.sort(t, function(a, b)
+  calls = calls + gen()
+  return a < b
+end)
+print(t[1], t[2], t[7], calls > 0)
+-- A wrap function as the comparator: resumed from a native (nested
+-- run), it resumes another coroutine in its run and yields.
+local inner = coroutine.wrap(function()
+  while true do coroutine.yield(true) end
+end)
+local cmp = coroutine.wrap(function(a, b)
+  while true do
+    inner()
+    a, b = coroutine.yield(a < b)
+  end
+end)
+local u = {4, 2, 6, 1, 3}
+table.sort(u, cmp)
+print(u[1], u[2], u[3], u[4], u[5])
+-- An error in a coroutine resumed inside the comparator's run.
+local bad = coroutine.wrap(function() error("in cmp") end)
+local okc, ec = coroutine.resume(coroutine.create(function()
+  table.sort({3, 2, 1}, function(a, b) return bad() end)
+end))
+print(okc, ec)
+-- A coroutine resumed from a comparator may not yield across it.
+local okd, ed = coroutine.resume(coroutine.create(function()
+  local c2 = coroutine.wrap(function() table.sort({2, 1}, function(a, b) coroutine.yield() end) end)
+  c2()
+end))
+print(okd, ed)
+
+-- Upvalues open into suspended and finished coroutines.
+local get, set
+local uc = coroutine.create(function()
+  local x = 1
+  get = function() return x end
+  set = function(v) x = v end
+  coroutine.yield()
+  x = x + 1
+  coroutine.yield()
+  return x
+end)
+coroutine.resume(uc)
+set(10)
+coroutine.resume(uc)
+print(get())
+local u1, u2 = coroutine.resume(uc)
+print(u1, u2)
+set(5)
+print(get())
+
+-- Deep chains: each coroutine resumes the next, then all unwind.
+local function chain(n)
+  if n == 0 then return 0 end
+  local c = coroutine.wrap(function() local v = chain(n - 1); coroutine.yield(v + 1); return -1 end)
+  return c()
+end
+print(chain(150))
+local function forever() local c = coroutine.wrap(forever); return c() end
+local f5, m5 = coroutine.resume(coroutine.create(forever))
+print(f5, string.sub(m5, -16), #m5)
+
+-- Garbage: coroutines dropped while suspended, many switches with
+-- allocation in between.
+local live = 0
+for i = 1, 300 do
+  local g = coroutine.wrap(function(a)
+    local tt = {}
+    for j = 1, 5 do tt[j] = {j}; a = coroutine.yield(#tt + a) end
+  end)
+  live = live + g(1) + g(2)
+end
+print(live)
+
+-- expect: true	1	2
+-- expect: true	nil	nil	nil	nil	nil
+-- expect: true	x	nil	5
+-- expect: false	cannot resume dead coroutine
+-- expect: A got	10
+-- expect: true	1
+-- expect: A got	20
+-- expect: true	2
+-- expect: A got	30
+-- expect: true	3
+-- expect: A got	B done
+-- expect: true	4
+-- expect: true	A done
+-- expect: false	cannot resume dead coroutine
+-- expect: false	line 41: attempt to index a nil value
+-- expect: dead	false	line 41: attempt to index a nil value
+-- expect: false	line 48: line 47: line 46: inner
+-- expect: 1
+-- expect: false	string
+-- expect: false	line 56: nil
+-- expect: 1	2	9	true
+-- expect: 1	2	3	4	6
+-- expect: false	line 88: line 86: in cmp
+-- expect: false	line 94: line 93: attempt to yield across a C-call boundary
+-- expect: 11
+-- expect: true	11
+-- expect: 5
+-- expect: 150
+-- expect: false	C stack overflow	2016
+-- expect: 1800
