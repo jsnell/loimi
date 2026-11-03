@@ -146,6 +146,10 @@ pub enum Intr {
     /// propagates, -0 < +0.
     Minimum,
     Maximum,
+    /// `p.read_unaligned()`, `p.write_unaligned(v)`: `load`/`store` with
+    /// `align 1`.
+    LoadUnaligned,
+    StoreUnaligned,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
     /// `__panic("msg")` (generated code only): panic with a message.

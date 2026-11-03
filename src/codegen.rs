@@ -2328,6 +2328,15 @@ impl<'a, 'p> FnGen<'a, 'p> {
             Intr::FloatBits => self.inst(format!("bitcast double {} to i64", vals[0])),
             Intr::BitsToFloat if e.ty == Ty::F32 => self.inst(format!("bitcast i32 {} to float", vals[0])),
             Intr::BitsToFloat => self.inst(format!("bitcast i64 {} to double", vals[0])),
+            Intr::LoadUnaligned => {
+                let lt = self.ty(&e.ty);
+                self.inst(format!("load {}, ptr {}, align 1", lt, vals[0]))
+            }
+            Intr::StoreUnaligned => {
+                let lt = self.ty(&args[1].ty);
+                self.emit(format!("store {} {}, ptr {}, align 1", lt, vals[1], vals[0]));
+                "zeroinitializer".into()
+            }
             Intr::IsNan => {
                 let ft = self.ty(&args[0].ty);
                 self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))

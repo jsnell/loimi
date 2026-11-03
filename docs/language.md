@@ -548,6 +548,13 @@ IR, and per-compilation data die together. Guest memory lives in the GC heap
   interpreters use them throughout; requiring `unsafe` around each use
   would mark most of that code without making any of it safer. Use a
   slice (`p.slice(n)`) where a bounds check is wanted.
+- **Alignment.** `*p` assumes `p` is aligned for its type (LLVM may
+  rely on it: vectorizing, combining accesses), as in C. For an address
+  that may not be, such as a guest's memory address or a packed format,
+  `p.read_unaligned()` and `p.write_unaligned(v)` load and store with
+  alignment 1 (`*T` for integer, float and pointer `T`). On x86-64 and
+  AArch64 they compile to the same single `mov`/`ldr` as an aligned
+  access.
 - **GC references cannot be forged outside `unsafe`.** A `Gc<T>` comes
   from `new`, from a field or value that holds one, or from
   `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it

@@ -362,7 +362,8 @@ pub vm W {
 
     // ── memory ────────────────────────────────────────────────────────
     // d = load(a + off): the effective address is computed in 64 bits,
-    // so it cannot wrap, and checked against the memory's size.
+    // so it cannot wrap, and checked against the memory's size. Guest
+    // addresses need not be aligned: `read_unaligned` (LLVM `align 1`).
     inline for (name, dk, ty, conv, size) in [
         ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
         ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
@@ -375,7 +376,7 @@ pub vm W {
         op #name(d: dk, a: ru, off: imm) : RRR {
             let ea = (a as u64) + off;
             if ea + size > msize { cold { raise Trap.MemOOB } }
-            let x = *((mem + ea) as *ty);
+            let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
         }
@@ -390,7 +391,7 @@ pub vm W {
         op #name(a: ru, v: vk, off: imm) : RRR {
             let ea = (a as u64) + off;
             if ea + size > msize { cold { raise Trap.MemOOB } }
-            *((mem + ea) as *ty) = conv;
+            ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
     }
@@ -409,7 +410,7 @@ pub vm W {
         op #name(d: dk, a: rq) : RRR {
             let ea = a;
             if ea + size > msize { cold { raise Trap.MemOOB } }
-            let x = *((mem + ea) as *ty);
+            let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
         }
@@ -424,7 +425,7 @@ pub vm W {
         op #name(a: rq, v: vk) : RRR {
             let ea = a;
             if ea + size > msize { cold { raise Trap.MemOOB } }
-            *((mem + ea) as *ty) = conv;
+            ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
     }

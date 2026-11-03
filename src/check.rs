@@ -3335,7 +3335,9 @@ impl<'a> Checker<'a> {
         let recv = {
             let mut r = recv;
             while let Ty::Ptr(inner) = &r.ty {
-                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32) && name != "offset" && name != "slice" {
+                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32)
+                    && !matches!(name, "offset" | "slice" | "read_unaligned" | "write_unaligned")
+                {
                     let t = (**inner).clone();
                     let s = r.span;
                     r = mk(t, TK::Deref(Box::new(r)), s);
@@ -3423,6 +3425,22 @@ impl<'a> Checker<'a> {
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::i64())?;
                 mk(t.clone(), TK::Intrinsic(Intr::PtrOffset, vec![recv, n]), span)
+            }
+            (Ty::Ptr(inner), "read_unaligned" | "write_unaligned") => {
+                if !matches!(**inner, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Ptr(_)) {
+                    return Err(Diag::new(
+                        span,
+                        format!("`{}` is for pointers to integers, floats and pointers, not `{}`", name, self.ty_name(&t)),
+                    ));
+                }
+                if name == "read_unaligned" {
+                    argc(0)?;
+                    mk((**inner).clone(), TK::Intrinsic(Intr::LoadUnaligned, vec![recv]), span)
+                } else {
+                    argc(1)?;
+                    let v = self.expr_coerce(cx, &args[0], inner)?;
+                    mk(Ty::Unit, TK::Intrinsic(Intr::StoreUnaligned, vec![recv, v]), span)
+                }
             }
             (Ty::Ptr(inner), "slice") => {
                 argc(1)?;
