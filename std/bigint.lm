@@ -38,9 +38,13 @@ extern "C" fn loimi_panic(msg: *u8, len: u64);
 
 /// Multiplications of at least this many limbs (both operands) use
 /// Karatsuba's algorithm.
-pub const KARATSUBA: u64 = 24;
+pub const KARATSUBA: u64 = 48;
 /// Squarings of at least this many limbs use Karatsuba squaring.
 pub const KARATSUBA_SQR: u64 = 48;
+/// Schoolbook products and squares sum column by column (Comba) when
+/// the shorter operand has at least this many limbs, row by row below.
+const MUL_COLUMNS: u64 = 14;
+const SQR_COLUMNS: u64 = 14;
 /// Divisions whose divisor and quotient both have at least this many
 /// limbs use divide-and-conquer (Burnikel-Ziegler) division.
 pub const DIV_DC: u64 = 80;
@@ -230,12 +234,65 @@ fn submul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     c
 }
 
-/// r[0..na + nb] = a * b (na, nb >= 1); r must not overlap a or b.
+/// r[0..na + nb] = a * b (na >= nb >= 1); r must not overlap a or b.
 fn mul_basecase(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
-    r[na] = mul_1(r, a, na, b[0]);
-    for j in 1..nb {
-        r[na + j] = addmul_1(r + j, a, na, b[j]);
+    if nb < MUL_COLUMNS {
+        // Row by row.
+        r[na] = mul_1(r, a, na, b[0]);
+        for j in 1..nb {
+            r[na + j] = addmul_1(r + j, a, na, b[j]);
+        }
+        return;
     }
+    // Column by column (Comba): each result limb is the sum of its
+    // products in a three-limb accumulator, so one store per limb; two
+    // accumulators (alternate products) halve the carry chains.
+    var c0: u64 = 0;
+    var c1: u64 = 0;
+    var c2: u64 = 0;
+    for k in 0..na + nb - 1 {
+        let i0 = if k >= nb { k - nb + 1 } else { 0 };
+        let i1 = if k < na { k + 1 } else { na };
+        var d0: u64 = 0;
+        var d1: u64 = 0;
+        var d2: u64 = 0;
+        var i = i0;
+        while i + 1 < i1 {
+            let (lo, hi) = a[i].mul_wide(b[k - i]);
+            let s0 = c0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = c1 +% t;
+            c2 += if s1 < t { 1 } else { 0 };
+            c0 = s0;
+            c1 = s1;
+            let (lo2, hi2) = a[i + 1].mul_wide(b[k - i - 1]);
+            let e0 = d0 +% lo2;
+            let u = hi2 + (if e0 < lo2 { 1 } else { 0 });
+            let e1 = d1 +% u;
+            d2 += if e1 < u { 1 } else { 0 };
+            d0 = e0;
+            d1 = e1;
+            i += 2;
+        }
+        if i < i1 {
+            let (lo, hi) = a[i].mul_wide(b[k - i]);
+            let s0 = c0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = c1 +% t;
+            c2 += if s1 < t { 1 } else { 0 };
+            c0 = s0;
+            c1 = s1;
+        }
+        let s0 = c0 +% d0;
+        let s1 = c1 +% d1;
+        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
+        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+        r[k] = s0;
+        c0 = s2;
+        c1 = c2;
+        c2 = 0;
+    }
+    r[na + nb - 1] = c0;
 }
 
 /// r[0..2n] = a * b, both n limbs, by Karatsuba's algorithm.
@@ -264,8 +321,60 @@ fn kmul(r: *u64, a: *u64, b: *u64, n: u64) {
 
 /// r[0..2n] = a * a (n >= 1) by schoolbook squaring: the products
 /// a[i] * a[j] for i < j once, doubled, plus the squares a[i] * a[i].
-/// r must not overlap a.
+/// Column by column like mul_basecase (rows for short numbers). r must
+/// not overlap a.
 fn sqr_basecase(r: *u64, a: *u64, n: u64) {
+    if n < SQR_COLUMNS {
+        sqr_rows(r, a, n);
+        return;
+    }
+    var c0: u64 = 0;
+    var c1: u64 = 0;
+    var c2: u64 = 0;
+    for k in 0..2 * n - 1 {
+        // The column's products a[i] a[k - i] for i < k - i, doubled,
+        // plus the square on the diagonal.
+        var d0: u64 = 0;
+        var d1: u64 = 0;
+        var d2: u64 = 0;
+        var i = if k >= n { k - n + 1 } else { 0 };
+        while 2 * i < k {
+            let (lo, hi) = a[i].mul_wide(a[k - i]);
+            let s0 = d0 +% lo;
+            let t = hi + (if s0 < lo { 1 } else { 0 });
+            let s1 = d1 +% t;
+            d2 += if s1 < t { 1 } else { 0 };
+            d0 = s0;
+            d1 = s1;
+            i += 1;
+        }
+        d2 = (d2 << 1) | (d1 >> 63);
+        d1 = (d1 << 1) | (d0 >> 63);
+        d0 = d0 << 1;
+        if (k & 1) == 0 {
+            let (lo, hi) = a[k / 2].mul_wide(a[k / 2]);
+            let s0 = d0 +% lo;
+            let s1 = d1 +% hi;
+            let s2 = s1 +% (if s0 < lo { 1 } else { 0 });
+            d2 += (if s1 < hi { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+            d0 = s0;
+            d1 = s2;
+        }
+        let s0 = c0 +% d0;
+        let s1 = c1 +% d1;
+        let s2 = s1 +% (if s0 < d0 { 1 } else { 0 });
+        c2 += d2 + (if s1 < d1 { 1 } else { 0 }) + (if s2 < s1 { 1 } else { 0 });
+        r[k] = s0;
+        c0 = s2;
+        c1 = c2;
+        c2 = 0;
+    }
+    r[2 * n - 1] = c0;
+}
+
+/// sqr_basecase row by row: the off-diagonal products with mul_1 and
+/// addmul_1, shifted, plus the diagonal.
+fn sqr_rows(r: *u64, a: *u64, n: u64) {
     if n == 1 {
         let (lo, hi) = a[0].mul_wide(a[0]);
         r[0] = lo;
