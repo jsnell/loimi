@@ -24,6 +24,20 @@ pub struct Options {
     /// marks, and traced slots are poisoned when unassigned
     /// (`crate::gcgen`, docs/lowering.md section 9).
     pub gc_check_roots: bool,
+    /// `--cpu=NAME`: the instruction set extensions the target CPU has,
+    /// where the vector lowering has a better sequence for them.
+    pub cpu: CpuFeatures,
+}
+
+/// Instruction set extensions beyond the target's baseline (SSE2 on
+/// x86-64) that change Loimi's own lowering (`--cpu`, docs/lowering.md
+/// "Vectors"). Everything else LLVM picks up from clang's `-march`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CpuFeatures {
+    /// SSSE3: `pshufb` (`swizzle`).
+    pub ssse3: bool,
+    /// SSE4.1: `roundps`/`roundpd` (vector `floor`, `ceil`, `trunc`, `nearest`).
+    pub sse41: bool,
 }
 
 /// Target architectures. The IR is the same for both except where the
@@ -2610,7 +2624,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let ft = self.ty(&args[0].ty);
                 self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))
             }
-            Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest if e.ty.is_vector() && self.cg.opts.arch == Arch::X86_64 => {
+            Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest if e.ty.is_vector() && self.cg.opts.arch == Arch::X86_64 && !self.cg.opts.cpu.sse41 => {
                 self.vec_round_sse2(i, &e.ty, &vals[0])
             }
             Intr::Sqrt | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest | Intr::Fabs => {
@@ -2898,6 +2912,24 @@ impl<'a, 'p> FnGen<'a, 'p> {
             Intr::VBitcast if rt == at => vals[0].clone(),
             Intr::VBitcast => self.inst(format!("bitcast {} {} to {}", at, vals[0], rt)),
             Intr::VLane => self.inst(format!("extractelement {} {}, i64 {}", at, vals[0], vals[1])),
+            Intr::VWithLane if vals[1].parse::<i64>().is_err() => {
+                // `with_lane_at` (the index already masked below the lane
+                // count): a select of the lane equal to the index from a
+                // splat of `x`. LLVM inserts at a variable index through a
+                // stack slot (a vector store, a lane store, a vector load:
+                // a store-forwarding stall on x86-64).
+                let Ty::Vector(l, n) = &args[0].ty else { unreachable!() };
+                let n = *n;
+                let et = self.ty(l);
+                let w = 128 / n;
+                let it = format!("i{}", w);
+                let ix = if w < 64 { self.inst(format!("trunc i64 {} to {}", vals[1], it)) } else { vals[1].clone() };
+                let ixs = self.vsplat(&it, n, &ix);
+                let lanes: Vec<String> = (0..n).map(|k| format!("{} {}", it, k)).collect();
+                let c = self.inst(format!("icmp eq <{} x {}> {}, <{}>", n, it, ixs, lanes.join(", ")));
+                let xs = self.vsplat(&et, n, &vals[2]);
+                self.inst(format!("select <{} x i1> {}, {} {}, {} {}", n, c, at, xs, at, vals[0]))
+            }
             Intr::VWithLane => {
                 let et = self.ty(&args[2].ty);
                 self.inst(format!("insertelement {} {}, {} {}, i64 {}", at, vals[0], et, vals[2], vals[1]))
@@ -3004,6 +3036,16 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     // `tbl` has exactly these semantics (0 for an index >= 16).
                     self.cg.decls.insert("declare <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8>, <16 x i8>)");
                     return self.inst(format!("call <16 x i8> @llvm.aarch64.neon.tbl1.v16i8(<16 x i8> {}, {} {})", vals[0], it, vals[1]));
+                }
+                if self.cg.opts.cpu.ssse3 {
+                    // `pshufb` gives 0 where an index has its top bit set
+                    // and otherwise uses its low 4 bits: a saturating
+                    // `+ 0x70` keeps 0..15 below 0x80 and puts 16..255 at
+                    // or above it (`paddusb`, `pshufb`).
+                    self.cg.decls.insert("declare <16 x i8> @llvm.uadd.sat.v16i8(<16 x i8>, <16 x i8>)");
+                    self.cg.decls.insert("declare <16 x i8> @llvm.x86.ssse3.pshuf.b.128(<16 x i8>, <16 x i8>)");
+                    let ix = self.inst(format!("call <16 x i8> @llvm.uadd.sat.v16i8(<16 x i8> {}, <16 x i8> {})", vals[1], splat_const("i8", 16, "112")));
+                    return self.inst(format!("call <16 x i8> @llvm.x86.ssse3.pshuf.b.128(<16 x i8> {}, <16 x i8> {})", vals[0], ix));
                 }
                 // Baseline x86-64 (SSE2) has no byte shuffle by a vector
                 // (`pshufb` is SSSE3): lane by lane, through memory.

@@ -88,6 +88,12 @@ implementation; `git log` has the details.
 - **Raw string literals** `r"..."` and `r#"..."#`: no escapes, may
   span lines ([§1.2](docs/language.md#lexical-structure)).
 
+- **`lane_at`/`with_lane_at`**: vector lanes chosen at run time (the
+  index masked to the lane count), `with_lane_at` as a compare and
+  select in registers ([language.md §1.2, "Vectors"](docs/language.md#vectors)).
+- **`#(a ++ "_X")`** in `inline for` bodies builds one identifier from
+  several parts ([§1.4](docs/language.md#14-compile-time-evaluation)).
+
 - **Constants in patterns** match their value; the `unreachable_arm`
   warning; or-patterns with bindings
   ([§1.2](docs/language.md#12-basics)).
@@ -180,6 +186,10 @@ implementation; `git log` has the details.
 - **`bench/run_all.py`** runs every example against its references in
   every dispatch mode; the results are in [`docs/results.md`](docs/results.md).
 - `loimi --help` prints the usage.
+- **`--cpu=NAME`** (`x86-64-v2`, `x86-64-v3`, `native`, ..; `LOIMI_CPU`)
+  compiles for a newer CPU: clang's `-march`/`-mcpu`, plus `pshufb` for
+  `swizzle` and `roundps` for vector rounding; the default stays the
+  portable baseline ([lowering.md §12](docs/lowering.md#12-driver-settings)).
 
 ### Examples
 

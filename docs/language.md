@@ -829,7 +829,18 @@ fn main() {
   zero-extends it) and `v.with_lane(i, x)` is a copy with one lane
   replaced. `i` must be a constant expression (a literal or a `const`):
   the instructions take the lane as an immediate. For a lane chosen at
-  run time, store the vector and index the memory.
+  run time (an index decoded from bytecode), `v.lane_at(i)` and
+  `v.with_lane_at(i, x)` take `i` of any integer type and use lane
+  `i & (N - 1)`: the index is **masked**, not checked, as shift amounts
+  are taken modulo the lane width, so there is no panic path (an `and`,
+  which LLVM drops when it can see the index is in range). `lane_at` of
+  a vector just loaded from memory is one scalar load; otherwise the
+  vector goes through a stack slot. `with_lane_at` compares a splat of
+  the index with the lane numbers and selects a splat of `x` (about 7
+  SSE2 instructions, 3 with AVX2, all in registers): LLVM's own
+  variable-index insert stores the vector to the stack, stores the lane
+  and reloads it, a store-forwarding stall. With a constant index both
+  are `lane`/`with_lane`.
 - **Operators**, lane by lane, both operands of one vector type: `+ - *`
   (integer lanes always wrap, in debug builds too; `+% -% *%` are the
   same), `/` (float lanes only), unary `-`, and on integer lanes `& | ^`
@@ -894,7 +905,18 @@ fn main() {
   `i32x4` (SSE4.1's `packusdw`) is about 25. `f32x4 as i32x4`/`u32x4`
   use `cvttps2dq` with fix-ups (about 10 and 15 instructions), and
   `swizzle` goes lane by lane through memory on x86-64 (`pshufb` is
-  SSSE3) and is one `tbl` on AArch64. `--header` rejects vectors in
+  SSSE3, about 100 instructions) and is one `tbl` on AArch64.
+  `loimi build --cpu=NAME` compiles for a newer CPU instead
+  (`x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native`, or any name clang's
+  `-march` takes; on AArch64 clang's `-mcpu`, e.g. `neoverse-n1`): LLVM
+  then uses what the CPU has, and Loimi's own lowering switches
+  `swizzle` to `paddusb`+`pshufb` (SSSE3, 3 instructions) and the
+  rounding methods to `roundps`/`roundpd` (SSE4.1, 1). At `x86-64-v2`
+  (SSE4.2) `minimum`/`maximum` are about 15 instructions, 64-bit
+  compares 2, `u16x8.narrow_sat` 2; table in lowering.md section 12.
+  The binary then needs that CPU (it dies with SIGILL elsewhere); the
+  default stays the portable baseline. `LOIMI_CPU` sets a default for
+  `--cpu`. `--header` rejects vectors in
   `export "C"` signatures (C has no portable vector type): pass a
   pointer.
 
@@ -1026,7 +1048,12 @@ by that element's tokens (in parentheses when there is more than one
 token, so `v * 10` with `v = 2 + 3` is `(2 + 3) * 10`). That includes
 field names (`r.f`) and binders (`let v`), so pick loop variable names
 that do not collide with names in the body. `#v` turns a string or
-identifier value into an identifier.
+identifier value into an identifier, and `#(a ++ "_X" ++ b)` makes one
+identifier from several parts: loop variables (string, identifier or
+integer values), string literals and integer literals, so one table
+entry can name several items (`op #name(..)` and `op #(name ++ "_X")(..)`).
+In nested loops each loop fills in its own variables (outside-in) and
+the innermost completes the name.
 
 It can appear at module level, among the items of a `vm`, and as a
 statement in any block: function bodies, op handlers, vm functions,

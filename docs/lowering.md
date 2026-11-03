@@ -1096,3 +1096,65 @@ interleaved, `--align-functions=64`).
 | target check: `preserve_none` available? otherwise warn and fall back to `goto` (not implemented: both targets have it) | portability |
 | executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
 | initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
+| `--cpu=NAME` (or `LOIMI_CPU`): `-march=NAME` on x86-64, `-mcpu=NAME` on AArch64, for every clang run of the build (the program, JIT stencils, C runtimes, `-W handler_frame`'s assembly); default none, the target's baseline (SSE2, NEON) | portable binaries by default; vector code for a newer CPU when asked (below) |
+
+**`--cpu`.** The driver asks clang which extensions the CPU has
+(`clang -march=NAME -E -dM`: `__SSSE3__`, `__SSE4_1__`), so `native` and
+every CPU name clang knows work, and an unknown name is an error before
+anything is built. Two of Loimi's own vector lowerings depend on them;
+everything else LLVM picks up from `-march`:
+
+- `swizzle` with SSSE3: `paddusb` of 0x70 (indices 0..15 keep their low
+  bits below 0x80, 16..255 saturate at or above it) and `pshufb`, which
+  zeroes lanes whose index has the top bit set. Without it, lane by lane
+  through memory.
+- `floor`, `ceil`, `trunc`, `nearest` on vectors with SSE4.1: the LLVM
+  intrinsics, which become `roundps`/`roundpd`. Without it, the
+  add-and-subtract-2^23 sequence (language.md §1.2, "Vectors").
+
+`--emit-llvm` output for a `--cpu` starts with a comment naming the
+`-march` it needs (it may call `llvm.x86.ssse3.pshuf.b.128`).
+
+Instructions per operation (a function taking its operands and result
+through pointers, so each count includes two or three loads and a store;
+clang 19, `--release --lib`, `llvm-objdump`, `ret` excluded). `native`
+on the i7-6700 used here (Skylake: AVX2, no AVX-512) is the same as
+`x86-64-v3`:
+
+| operation | x86-64 | x86-64-v2 | x86-64-v3 | x86-64-v4 | AArch64 |
+|---|---:|---:|---:|---:|---:|
+| `u8x16.swizzle` | 105 | 6 | 6 | 6 | 4 |
+| wasm `i8x16.shuffle` (two swizzles, `or`) | 209 | 13 | 12 | 12 | 9 |
+| `f32x4.minimum` | 28 | 18 | 12 | 12 | 9 |
+| `f64x2.maximum` | 30 | 18 | 12 | 12 | 9 |
+| `i8x16 << n` | 12 | 11 | 10 | 10 | 5 |
+| `i8x16 >> n` | 17 | 14 | 14 | 13 | 6 |
+| `i64x2 < i64x2` | 15 | 5 | 4 | 4 | 4 |
+| `i64x2 * i64x2` | 14 | 14 | 12 | 4 | 11 |
+| `f32x4.floor` | 28 | 4 | 3 | 3 | 3 |
+| `f64x2.nearest` | 19 | 4 | 3 | 3 | 3 |
+| `f32x4.trunc` | 26 | 4 | 3 | 3 | 3 |
+| `u16x8.narrow_sat(i32x4, i32x4)` | 27 | 5 | 4 | 7 | 5 |
+| `f32x4 as i32x4` | 13 | 10 | 11 | 9 | 3 |
+| `f32x4 as u32x4` | 18 | 16 | 17 | 13 | 3 |
+| `f64x2 as i64x2` | 20 | 20 | 20 | 20 | 3 |
+| `i64x2.abs` | 7 | 6 | 6 | 3 | 3 |
+| `u32x4.min` | 12 | 5 | 4 | 4 | 4 |
+| `u8x16.popcount` | 17 | 13 | 11 | 11 | 3 |
+| scalar `f64.floor` | 1 (`jmp floor`) | 2 (`roundsd`) | 2 | 2 | 1 |
+
+On AArch64 `-mcpu` changes none of these except `i64x2 *` (4 with SVE2,
+`neoverse-v2`): NEON is the baseline and has the rest.
+
+Interpreters gain nothing measurable from it. `x86-64-v3` against the
+baseline, `bench/run_all.py` (best of 3, `--align-functions=64`, two
+runs one after the other on a shared machine), geometric means of
+v3/baseline per suite, tail calls: Stak 1.05 (5 programs), Lox 0.87
+(10), Scheme 1.00 (43), Mini 0.99 (14); the unchanged reference
+interpreters moved as much between the runs (clox 0.88, Lua 0.96,
+Gauche 0.98), so all of it is noise; goto, switch and JIT builds alike.
+The wasm interpreter, on its MVP and `-msimd128` benchmarks: 0.997
+(examples/wasm/FRICTION.md, "Fixed-width SIMD"). Vector code that runs
+`swizzle`, shuffles, rounding or `minimum`/`maximum` is where `--cpu`
+pays; the default stays the baseline, so that binaries run on any
+x86-64.

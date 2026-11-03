@@ -148,7 +148,8 @@ over the same source. `cold` blocks are outlined; effects (`uses sync`,
 `gc`, `reenter`) make the compiler sync state before calls that need
 it. Handlers are kept free of stack frames (no `memcpy` formation or loop
 vectorization in them), and `-W handler_frame` reports those that still
-set one up. Targets: x86-64 and AArch64 Linux (`--target`).
+set one up. Targets: x86-64 and AArch64 Linux (`--target`), for the
+baseline CPU or a newer one (`--cpu=x86-64-v3`, `native`).
 
 **Values** ([§2](docs/language.md#2-value-types-declared-representations)):
 `value` types with a declared `repr` (`nanbox`, `lowtag`, `boxed`);

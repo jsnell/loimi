@@ -249,10 +249,8 @@ pub vm W {
     operand vul = *((regs + it) as *u64x2) verify it + 1 < (f.nslots as u64) display "r{}";
     operand vf = *((regs + it) as *f32x4) verify it + 1 < (f.nslots as u64) display "r{}";
     operand vd = *((regs + it) as *f64x2) verify it + 1 < (f.nslots as u64) display "r{}";
-    // The index of a v128's first slot, for lane access through memory
-    // (a lane index from the code cannot be a constant of the handler).
-    operand vslot = it verify it + 1 < (f.nslots as u64) display "r{}";
-    // Lane indices.
+    // Lane indices from the code (`lane_at`/`with_lane_at` take them at
+    // run time).
     operand l16 = it verify it < 16;
     operand l8 = it verify it < 8;
     operand l4 = it verify it < 4;
@@ -876,31 +874,27 @@ pub vm W {
         op #name(d: k, a: k, b: ri) : RRR { d = expr; next }
     }
 
-    // Lanes: d = lane `l` of the v128 in slots a, a + 1 (little-endian).
-    inline for (name, dk, ty, lk, conv) in [
-        ("I8X16_EXTRACT_LANE_S", ri, i8, l16, x as i32), ("I8X16_EXTRACT_LANE_U", ri, u8, l16, x as i32),
-        ("I16X8_EXTRACT_LANE_S", ri, i16, l8, x as i32), ("I16X8_EXTRACT_LANE_U", ri, u16, l8, x as i32),
-        ("I32X4_EXTRACT_LANE", ri, i32, l4, x), ("I64X2_EXTRACT_LANE", rl, i64, l2, x),
-        ("F32X4_EXTRACT_LANE", rf, f32, l4, x), ("F64X2_EXTRACT_LANE", rd, f64, l2, x),
+    // Lanes: d = lane `l` of a (`l` checked by the verifier).
+    inline for (name, dk, vk, lk, conv) in [
+        ("I8X16_EXTRACT_LANE_S", ri, vb, l16, x as i32), ("I8X16_EXTRACT_LANE_U", ri, vub, l16, x as i32),
+        ("I16X8_EXTRACT_LANE_S", ri, vh, l8, x as i32), ("I16X8_EXTRACT_LANE_U", ri, vuh, l8, x as i32),
+        ("I32X4_EXTRACT_LANE", ri, vi, l4, x), ("I64X2_EXTRACT_LANE", rl, vl, l2, x),
+        ("F32X4_EXTRACT_LANE", rf, vf, l4, x), ("F64X2_EXTRACT_LANE", rd, vd, l2, x),
     ] {
-        op #name(d: dk, a: vslot, l: lk) : RRR {
-            let x = *(((regs + a) as *ty) + l);
+        op #name(d: dk, a: vk, l: lk) : RRR {
+            let x = a.lane_at(l);
             d = conv;
             next
         }
     }
-    // d = a with a lane (from the cache word, masked) replaced by x.
-    inline for (name, xk, ty, conv, mask) in [
-        ("I8X16_REPLACE_LANE", ri, i8, x as i8, 15), ("I16X8_REPLACE_LANE", ri, i16, x as i16, 7),
-        ("I32X4_REPLACE_LANE", ri, i32, x, 3), ("I64X2_REPLACE_LANE", rl, i64, x, 1),
-        ("F32X4_REPLACE_LANE", rf, f32, x, 3), ("F64X2_REPLACE_LANE", rd, f64, x, 1),
+    // d = a with lane `cache.v` (masked by `with_lane_at`) replaced by x.
+    inline for (name, vk, xk, conv) in [
+        ("I8X16_REPLACE_LANE", vb, ri, x as i8), ("I16X8_REPLACE_LANE", vh, ri, x as i16),
+        ("I32X4_REPLACE_LANE", vi, ri, x), ("I64X2_REPLACE_LANE", vl, rl, x),
+        ("F32X4_REPLACE_LANE", vf, rf, x), ("F64X2_REPLACE_LANE", vd, rd, x),
     ] {
-        op #name(d: vslot, a: vul, x: xk) : RRR + Imm64 {
-            let v = a;
-            let y = conv;
-            let i = cache.v & mask;
-            *((regs + d) as *u64x2) = v;
-            *(((regs + d) as *ty) + i) = y;
+        op #name(d: vk, a: vk, x: xk) : RRR + Imm64 {
+            d = a.with_lane_at(cache.v, conv);
             next
         }
     }
@@ -912,20 +906,20 @@ pub vm W {
     }
 
     // Memory: as the scalar loads (`_X`: a 64-bit address from ADDR).
-    inline for (name, xname, dk, ty, conv, size) in [
-        ("V128_LOAD", "V128_LOAD_X", vul, u64x2, x, 16),
-        ("V128_LOAD8X8_S", "V128_LOAD8X8_S_X", vh, u64, i8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD8X8_U", "V128_LOAD8X8_U_X", vuh, u64, u8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD16X4_S", "V128_LOAD16X4_S_X", vi, u64, i16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD16X4_U", "V128_LOAD16X4_U_X", vui, u64, u16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD32X2_S", "V128_LOAD32X2_S_X", vl, u64, i32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD32X2_U", "V128_LOAD32X2_U_X", vul, u64, u32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
-        ("V128_LOAD8_SPLAT", "V128_LOAD8_SPLAT_X", vb, i8, i8x16.splat(x), 1),
-        ("V128_LOAD16_SPLAT", "V128_LOAD16_SPLAT_X", vh, i16, i16x8.splat(x), 2),
-        ("V128_LOAD32_SPLAT", "V128_LOAD32_SPLAT_X", vi, i32, i32x4.splat(x), 4),
-        ("V128_LOAD64_SPLAT", "V128_LOAD64_SPLAT_X", vl, i64, i64x2.splat(x), 8),
-        ("V128_LOAD32_ZERO", "V128_LOAD32_ZERO_X", vui, u32, u32x4.new(x, 0, 0, 0), 4),
-        ("V128_LOAD64_ZERO", "V128_LOAD64_ZERO_X", vul, u64, u64x2.new(x, 0), 8),
+    inline for (name, dk, ty, conv, size) in [
+        ("V128_LOAD", vul, u64x2, x, 16),
+        ("V128_LOAD8X8_S", vh, u64, i8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD8X8_U", vuh, u64, u8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD16X4_S", vi, u64, i16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD16X4_U", vui, u64, u16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD32X2_S", vl, u64, i32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD32X2_U", vul, u64, u32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD8_SPLAT", vb, i8, i8x16.splat(x), 1),
+        ("V128_LOAD16_SPLAT", vh, i16, i16x8.splat(x), 2),
+        ("V128_LOAD32_SPLAT", vi, i32, i32x4.splat(x), 4),
+        ("V128_LOAD64_SPLAT", vl, i64, i64x2.splat(x), 8),
+        ("V128_LOAD32_ZERO", vui, u32, u32x4.new(x, 0, 0, 0), 4),
+        ("V128_LOAD64_ZERO", vul, u64, u64x2.new(x, 0), 8),
     ] {
         op #name(d: dk, a: ru, off: imm) : RRR {
             let ea = (a as u64) + off;
@@ -934,7 +928,7 @@ pub vm W {
             d = conv;
             next
         }
-        op #xname(d: dk, a: rq) : RRR {
+        op #(name ++ "_X")(d: dk, a: rq) : RRR {
             let ea = a;
             if ea + size > msize { cold { raise Trap.MemOOB } }
             let x = ((mem + ea) as *ty).read_unaligned();
@@ -954,32 +948,28 @@ pub vm W {
         ((mem + ea) as *u64x2).write_unaligned(v);
         next
     }
-    // Lane loads and stores: offset | lane << 32 in the cache word.
-    inline for (name, ty, mask, size) in [
-        ("V128_LOAD8_LANE", u8, 15, 1), ("V128_LOAD16_LANE", u16, 7, 2),
-        ("V128_LOAD32_LANE", u32, 3, 4), ("V128_LOAD64_LANE", u64, 1, 8),
+    // Lane loads and stores: offset | lane << 32 in the cache word (the
+    // lane masked by `with_lane_at`/`lane_at`).
+    inline for (name, vk, ty, size) in [
+        ("V128_LOAD8_LANE", vub, u8, 1), ("V128_LOAD16_LANE", vuh, u16, 2),
+        ("V128_LOAD32_LANE", vui, u32, 4), ("V128_LOAD64_LANE", vul, u64, 8),
     ] {
-        op #name(d: vslot, a: ru, v: vul) : RRR + Imm64 {
+        op #name(d: vk, a: ru, v: vk) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
-            let i = (cache.v >> 32) & mask;
             if ea + size > msize { cold { raise Trap.MemOOB } }
             let x = ((mem + ea) as *ty).read_unaligned();
-            let w = v;
-            *((regs + d) as *u64x2) = w;
-            *(((regs + d) as *ty) + i) = x;
+            d = v.with_lane_at(cache.v >> 32, x);
             next
         }
     }
-    inline for (name, ty, mask, size) in [
-        ("V128_STORE8_LANE", u8, 15, 1), ("V128_STORE16_LANE", u16, 7, 2),
-        ("V128_STORE32_LANE", u32, 3, 4), ("V128_STORE64_LANE", u64, 1, 8),
+    inline for (name, vk, ty, size) in [
+        ("V128_STORE8_LANE", vub, u8, 1), ("V128_STORE16_LANE", vuh, u16, 2),
+        ("V128_STORE32_LANE", vui, u32, 4), ("V128_STORE64_LANE", vul, u64, 8),
     ] {
-        op #name(a: ru, v: vslot, z: imm) : RRR + Imm64 {
+        op #name(a: ru, v: vk, z: imm) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
-            let i = (cache.v >> 32) & mask;
             if ea + size > msize { cold { raise Trap.MemOOB } }
-            let x = *(((regs + v) as *ty) + i);
-            ((mem + ea) as *ty).write_unaligned(x);
+            ((mem + ea) as *ty).write_unaligned(v.lane_at(cache.v >> 32));
             next
         }
     }

@@ -342,6 +342,25 @@ fn aarch64_qemu() {
     });
 }
 
+/// The vector (`simd_`) programs built for x86-64-v2 and x86-64-v3
+/// (`--cpu`, through `LOIMI_CPU`): `swizzle` becomes `pshufb` and the
+/// float rounding methods `roundps`/`roundpd` there (docs/lowering.md,
+/// "Vectors"). v3 only on a host with AVX2.
+#[test]
+fn simd_cpu_levels() {
+    if cross() || !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let avx2 = std::fs::read_to_string("/proc/cpuinfo").is_ok_and(|s| s.contains(" avx2"));
+    for cpu in ["x86-64-v2", "x86-64-v3"] {
+        if cpu == "x86-64-v3" && !avx2 {
+            eprintln!("simd_cpu_levels: x86-64-v3 skipped: the host has no AVX2");
+            continue;
+        }
+        run_programs_with(&[("LOIMI_CPU".to_string(), cpu.to_string())], |name, _| name.starts_with("simd_"));
+    }
+}
+
 /// The runner in `env` (`LOIMI_RUNNER`), else the process's.
 fn runner_in(env: &[(&str, &str)]) -> String {
     env.iter().find(|(k, _)| *k == "LOIMI_RUNNER").map(|(_, v)| v.to_string()).unwrap_or_else(|| std::env::var("LOIMI_RUNNER").unwrap_or_default())
