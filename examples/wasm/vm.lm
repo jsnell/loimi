@@ -508,10 +508,10 @@ pub vm W {
     }
     op UNREACHABLE() : RRR { raise Trap.Unreachable }
 
-    // `ret` is where the caller continues: pc + the calling op's size
-    // (there is no expression for "the next instruction" in a vm fn).
-    fn do_call(f: *Func, b: u64, ret: *u64) -> never {
-        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b, ret) } }
+    // The caller continues at `next_pc`, after the calling op whatever
+    // its size (CALL_INDIRECT_X has a cache word).
+    fn do_call(f: *Func, b: u64) -> never {
+        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b) } }
         let nr = regs + b;
         if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
             cold { raise Trap.Exhausted }
@@ -528,21 +528,21 @@ pub vm W {
             cold {
                 zero_slots(nr, p + 4, n);
                 fp = fp + 1;
-                fp.ret = ret;
+                fp.ret = next_pc;
                 fp.regs = regs;
                 regs = nr;
                 jump f.code
             }
         }
         fp = fp + 1;
-        fp.ret = ret;
+        fp.ret = next_pc;
         fp.regs = regs;
         regs = nr;
         jump f.code
     }
 
     // Calls of host functions and of functions of other instances.
-    fn call_slow(f: *Func, b: u64, ret: *u64) -> never {
+    fn call_slow(f: *Func, b: u64) -> never {
         let nr = regs + b;
         if let Some(h) = f.host {
             if !h(ctx, nr) { raise ctx.host_trap }
@@ -556,7 +556,7 @@ pub vm W {
         while i < n { nr[i] = 0; i += 1; }
         // A record that RESTORE pops: the caller's instance and return.
         fp = fp + 1;
-        fp.ret = ret;
+        fp.ret = next_pc;
         fp.regs = regs;
         fp.inst = ctx.inst;
         fp = fp + 1;
@@ -568,7 +568,7 @@ pub vm W {
         jump f.code
     }
 
-    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw, pc + 1) }
+    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw) }
 
     op CALL_INDIRECT(b: base, t: tidx, i: ru) : RRR {
         let tab = ctx.table;
@@ -577,7 +577,7 @@ pub vm W {
         if fv == 0 { cold { raise Trap.UninitElem } }
         let f = fv as *Func;
         if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
-        do_call(f, b.raw, pc + 1)
+        do_call(f, b.raw)
     }
     // call_indirect through a table other than 0 (index in the cache word,
     // checked here: the verifier does not see cache words).
@@ -590,7 +590,7 @@ pub vm W {
         if fv == 0 { cold { raise Trap.UninitElem } }
         let f = fv as *Func;
         if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
-        do_call(f, b.raw, pc + 2)
+        do_call(f, b.raw)
     }
 
     // ── reference types and bulk memory ─────────────────────────────

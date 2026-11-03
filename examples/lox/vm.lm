@@ -437,8 +437,9 @@ pub vm Lox {
     // ── calls ────────────────────────────────────────────────────────
 
     /// Call closure `c` with its window at R[base] and `n` arguments;
-    /// the caller continues at `ret`.
-    fn call_closure(c: Gc<Closure>, base: u64, n: u64, ret: *u32) -> never {
+    /// the caller continues after the calling op (`next_pc`, whatever
+    /// its size).
+    fn call_closure(c: Gc<Closure>, base: u64, n: u64) -> never {
         let p = c.proto;
         if n != p.arity as u64 { cold { raise arity_error(ctx, p.arity as u64, n) } }
         let callee = regs + base;
@@ -452,7 +453,7 @@ pub vm Lox {
             callee[i] = Nil;
             i += 1;
         }
-        fp.ret = ret;
+        fp.ret = next_pc;
         fp = fp + 1;
         fp.cl = c;
         fp.base = callee;
@@ -462,25 +463,25 @@ pub vm Lox {
     }
 
     /// Call R[base] (which is `f`) with `n` arguments.
-    fn call_value(f: Value, base: u64, n: u64, ret: *u32) -> never {
+    fn call_value(f: Value, base: u64, n: u64) -> never {
         match f {
-            Fun(c) => call_closure(c, base, n, ret),
+            Fun(c) => call_closure(c, base, n),
             Bound(b) => {
                 regs[base] = b.recv;
-                call_closure(b.method, base, n, ret)
+                call_closure(b.method, base, n)
             }
             Class(c) => {
                 gc_point();
                 regs[base] = Inst(new_instance(ctx, c));
-                if let Fun(init) = c.init { call_closure(init, base, n, ret) }
+                if let Fun(init) = c.init { call_closure(init, base, n) }
                 if n != 0 { cold { raise arity_error(ctx, 0, n) } }
-                jump ret
+                next
             }
             Native(i) => {
                 let nf = ctx.natives + i as u64;
                 if n != nf.arity as u64 { cold { raise arity_error(ctx, nf.arity as u64, n) } }
                 regs[base] = (nf.f)(regs + base + 1);
-                jump ret
+                next
             }
             _ => {}
         }
@@ -489,8 +490,8 @@ pub vm Lox {
 
     op CALL(base: reg, n: nargs) : ABC {
         let f = base;
-        if let Fun(c) = f { call_closure(c, base.raw, n, pc + 1) }
-        call_value(f, base.raw, n, pc + 1)
+        if let Fun(c) = f { call_closure(c, base.raw, n) }
+        call_value(f, base.raw, n)
     }
 
     /// Return R[src] to the caller, in its R[base] (our r0).
@@ -649,9 +650,9 @@ pub vm Lox {
     /// method: a method found through the class is called with the
     /// receiver as its slot 0.
     fn invoke_found(v: Value, depth: u32, base: u64, n: u64) -> never {
-        if depth != 0 and let Fun(c) = v { call_closure(c, base, n, pc + 1 + Lox.CW_PropIC) }
+        if depth != 0 and let Fun(c) = v { call_closure(c, base, n) }
         regs[base] = v;
-        call_value(v, base, n, pc + 1 + Lox.CW_PropIC)
+        call_value(v, base, n)
     }
 
     family INVOKE(base: reg, n: nargs, name: kst) : ABC + PropIC {
@@ -665,7 +666,7 @@ pub vm Lox {
         }
         INVOKE_P {
             if let Inst(x) = base and x.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(x, cache.slot, cache.cell, cache.depth) {
-                if let Fun(c) = v { call_closure(c, base.raw, n, pc + 1 + Lox.CW_PropIC) }
+                if let Fun(c) = v { call_closure(c, base.raw, n) }
             }
             cold { become INVOKE_MISS; redo }
         }
@@ -737,7 +738,7 @@ pub vm Lox {
     /// the superclass is in R[base+n+1].
     op SUPERINVOKE(base: reg, n: nargs1, name: kst) : ABC {
         if let Class(s) = regs[base.raw + n + 1] and let Some(Fun(c)) = ctx.m.get(s.methods, key(name)) {
-            call_closure(c, base.raw, n, pc + 1)
+            call_closure(c, base.raw, n)
         }
         cold { raise undefined_prop(ctx, name) }
     }

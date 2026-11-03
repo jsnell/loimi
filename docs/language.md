@@ -1100,6 +1100,23 @@ Rules for `-> never` vm functions:
   caller's instruction (in a superinstruction part, it continues with the
   next part). A function that uses `next` can only be reached from op
   handlers, not from entries or `on raise`.
+- `next_pc` is the address `next` continues at: the calling op's `pc`
+  plus its size (cache words included; in a superinstruction part, the
+  part's own size, so the address of the next part's original
+  instruction). It is the return address a shared call helper saves,
+  correct for every calling op by construction:
+
+  ```loimi
+  fn call(f: *Func, base: u64) -> never { fp = fp + 1; fp.ret = next_pc; ..; jump f.code }
+  op CALL(b: reg, fi: fidx) : ABC { call(ctx.funcs[fi], b.raw) }
+  op CALL_IC(b: reg, fi: fidx) : ABC + CallIC { ..; call(f, b.raw) }   // returns past the cache word
+  ```
+
+  Writing `pc + 1` instead is wrong for an op with cache words, and
+  nothing would catch it. `next_pc` is available where `next` is (op
+  handlers, and `-> never` vm functions reached from them; a shared copy
+  gets the size from its caller, like `next`). It is an ordinary name:
+  a local or state variable called `next_pc` hides it.
 - The body sees the vm state and its own parameters, but not the caller's
   operands: pass `dst.raw` or values as arguments. `become` is not
   allowed, since it belongs to the calling op, and neither is `cache`;
