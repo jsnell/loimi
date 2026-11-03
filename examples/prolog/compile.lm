@@ -91,6 +91,13 @@ pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
     let p = mem.alloc<u32>(n + 1);
     for i in 0..n { p[i] = words.ptr[i]; }
     var vc = VCtx { nperm: nperm, nconsts: m.consts.len, npreds: m.db.functors.len, natoms: m.db.atoms.names.len };
+    if m.stress and nperm != 999999 {
+        var b = text.StrBuf.new();
+        b.push_str("-- block\n");
+        Wam.disasm(p.slice(n), &b);
+        io.eprint(b.as_str());
+        b.free();
+    }
     match Wam.verify(p.slice(n), &vc) {
         Ok(_) => {}
         Err(e) => {
@@ -300,7 +307,8 @@ pub fn reindex(m: *Machine, p: *Pred) {
 
 struct VarInfo {
     occ: u32,
-    chunks: u64,      // bitmask of chunks it occurs in (chunk >= 63 folds into bit 63)
+    first_chunk: u32,
+    last_chunk: u32,
     perm: bool,
     reg: u32,
     seen: bool,
@@ -330,7 +338,6 @@ fn C.info(c: *C, t: Term) -> *VarInfo {
     c.vars.get_ptr(var_key(t)).unwrap()
 }
 
-fn chunk_bit(k: u32) -> u64 { if k >= 63 { 1 << 63 } else { 1 << (k as u64) } }
 
 fn C.count(c: *C, t0: Term, chunk: u32) {
     let t = deref(t0);
@@ -339,9 +346,9 @@ fn C.count(c: *C, t0: Term, chunk: u32) {
             let k = var_key(t);
             if let Some(vi) = c.vars.get_ptr(k) {
                 vi.occ += 1;
-                vi.chunks = vi.chunks | chunk_bit(chunk);
+                vi.last_chunk = chunk;
             } else {
-                c.vars.insert(k, VarInfo { occ: 1, chunks: chunk_bit(chunk), perm: false, reg: 0, seen: false, level: false });
+                c.vars.insert(k, VarInfo { occ: 1, first_chunk: chunk, last_chunk: chunk, perm: false, reg: 0, seen: false, level: false });
             }
         }
         Str(s) => { for i in 0..s.args.len { c.count(s.args[i], chunk); } }
@@ -802,9 +809,9 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
         if let Some(vi) = c.vars.get_ptr(lk) {
             vi.level = true;
             vi.seen = true;
-            vi.chunks = vi.chunks | 3;
+            vi.last_chunk = vi.first_chunk + 1;
         } else {
-            c.vars.insert(lk, VarInfo { occ: 1, chunks: 3, perm: true, reg: 0, seen: true, level: true });
+            c.vars.insert(lk, VarInfo { occ: 1, first_chunk: 0, last_chunk: 1, perm: true, reg: 0, seen: true, level: true });
         }
     }
     // Is an environment needed: a call that is not the last goal.
@@ -828,7 +835,7 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     var at: u64 = 0;
     while let Some(slot) = c.vars.next(&at) {
         let vi = &slot.value;
-        let multi = (vi.chunks & (vi.chunks - 1)) != 0;
+        let multi = vi.first_chunk != vi.last_chunk;
         if multi or vi.level {
             vi.perm = true;
             vi.reg = c.nperm;

@@ -189,11 +189,13 @@ fn main() -> i32 uses gc {
     var goal: ?str = None;
     var stress = false;
     var verify = false;
+    var disasm = false;
     var i: u64 = 1;
     while i < os.arg_count() {
         let a = os.arg(i).unwrap();
         if a.eq("--gc-stress") { stress = true; }
         else if a.eq("--gc-verify") { verify = true; }
+        else if a.eq("--disasm") { disasm = true; }
         else if a.eq("-g") { i += 1; goal = os.arg(i); }
         else { file = Some(a); }
         i += 1;
@@ -211,6 +213,7 @@ fn main() -> i32 uses gc {
     setup(m);
     m.heap.add_scanner(m as *u8, machine.scan_roots);
     consult(m, prelude.SOURCE, true);
+    m.stress = disasm;
     if stress { m.heap.set_stress(true); }
     if verify { m.heap.set_generational(true); m.heap.set_stress(true); m.heap.set_verify(true); }
     // The initialization goals live in a Prolog list across collections.
