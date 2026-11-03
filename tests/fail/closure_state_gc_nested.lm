@@ -1,0 +1,16 @@
+// Traced state of a GC closure is assigned in the closure's own body,
+// where the store gets the write barrier; a nested `block fn` writes it
+// through a pointer, without one.
+import std.gc;
+object Node { v: i64 }
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let n = new(h, Node { v: 1 });
+    let f: Gc<closure fn() -> i64> = new(h, [var last = n] || {
+        each(2, |i| { last = n; });
+        last.v
+    });
+}
+// error: cannot assign `last` here: it is traced state in a GC closure's environment

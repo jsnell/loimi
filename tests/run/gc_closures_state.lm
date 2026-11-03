@@ -1,0 +1,103 @@
+// GC closures with state of their own (`new(heap, [var n = e] |..| ..)`)
+// on a generational heap under stress, in verify mode: traced state is a
+// field of the closure's environment object, marked through it, and an
+// assignment to it in the body gets the write barrier (the environment
+// is usually old by the time the body stores a young object into it).
+// matrix: check-roots
+import std.io;
+import std.mem;
+import std.mem.{Vec};
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+
+struct Pair { a: ?Gc<Node>, n: i64 }
+
+fn garbage(h: *gc.Heap, n: i64) {
+    for i in 0..n { new(h, Node { value: i, next: None }); }
+}
+
+fn sum(l: ?Gc<Node>) -> i64 {
+    var t: i64 = 0;
+    var c = l;
+    while let Some(n) = c {
+        t += n.value;
+        c = n.next;
+    }
+    t
+}
+
+// A stack the closure owns: each call pushes a fresh node onto it.
+fn pusher(h: *gc.Heap) -> Gc<closure fn(i64) -> i64 uses gc> uses gc {
+    new(h, [var top: ?Gc<Node> = None] |x| {
+        garbage(h, 3);
+        top = Some(new(h, Node { value: x, next: top }));
+        gc.collect(h);
+        sum(top)
+    })
+}
+
+// Struct state with a traced field, assigned field by field; a nested
+// `block fn` writes the untraced field.
+fn pairer(h: *gc.Heap, first: Gc<Node>) -> Gc<closure fn(i64) -> i64 uses gc> uses gc {
+    new(h, [var p = Pair { a: Some(first), n: 0 }] |x| {
+        p.a = Some(new(h, Node { value: x, next: p.a }));
+        each(2, |i| { garbage(h, 2); p.n += i + 1; });
+        gc.collect(h);
+        sum(p.a) * 1000 + p.n
+    })
+}
+
+fn each(n: i64, f: block fn(i64) uses gc) uses gc {
+    for i in 0..n { f(i); }
+}
+
+fn scan_vec(h: *gc.Heap, p: *u8) {
+    let v = p as *Vec<Gc<closure fn(i64) -> i64 uses gc>>;
+    for i in 0..v.len { gc_mark(h, v.at(i)); }
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    heap.set_stress(true); heap.set_generational(true); heap.set_verify(true);
+    let h = &heap;
+
+    let f = pusher(h);
+    for i in 1..5 {
+        garbage(h, 10);
+        gc.collect(h);
+        f(i);
+    }
+    io.print_int(f(100)); io.println("");
+
+    let g = pairer(h, new(h, Node { value: 5, next: None }));
+    g(1);
+    garbage(h, 20);
+    gc.collect(h);
+    io.print_int(g(2)); io.println("");
+
+    // The state's initial value is reachable only through the closure.
+    var fs: Vec<Gc<closure fn(i64) -> i64 uses gc>> = Vec.new();
+    h.add_scanner(&fs as *u8, scan_vec);
+    for i in 0..10 {
+        fs.push(new(h, [var l = Some(new(h, Node { value: i, next: None }))] |x| {
+            l = Some(new(h, Node { value: x, next: l }));
+            garbage(h, 2);
+            sum(l)
+        }));
+    }
+    gc.collect(h);
+    var t: i64 = 0;
+    for round in 0..2 {
+        for i in 0..fs.len { t += fs.at(i)(round + 1); }
+        garbage(h, 30);
+        gc.collect(h);
+    }
+    io.print_int(t); io.println("");
+
+    fs.free();
+    heap.free();
+}
+// expect: 110
+// expect: 8006
+// expect: 130

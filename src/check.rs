@@ -3570,6 +3570,16 @@ impl<'a> Checker<'a> {
                     mk(Ty::Unit, TK::Intrinsic(Intr::StoreUnaligned, vec![recv, v]), span)
                 }
             }
+            (Ty::Closure(..), "free") => {
+                argc(1)?;
+                return self.closure_free(cx, recv, &args[0], span).map(Some);
+            }
+            (Ty::Gc(inner), "free") if matches!(**inner, Ty::Closure(..)) => {
+                return Err(Diag::new(span, "a GC closure (`Gc<closure fn(..)>`) is freed by the collector, not by `free`"));
+            }
+            (Ty::Block(..), "free") => {
+                return Err(Diag::new(span, "a `block fn` has no memory of its own to free"));
+            }
             (Ty::Ptr(inner), "slice") => {
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::Int(IntTy::U64))?;

@@ -1,0 +1,10 @@
+// Assigning a capture that is not in the state list: the note says how
+// to give the closure state of its own.
+import std.mem;
+fn main() {
+    var arena = mem.Arena.new();
+    var n: i64 = 0;
+    let f: closure fn() -> i64 = new(&arena, || { n += 1; n });
+}
+// error: `n` is captured by value
+// error: state of the closure's own goes in its state list: `new(a, [var n] |..| ..)`

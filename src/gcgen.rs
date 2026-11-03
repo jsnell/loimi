@@ -684,6 +684,25 @@ pub fn needs_barrier(g: &mut FnGen, lhs: &TExpr) -> bool {
     if !in_object(lhs) || !is_traced(g.p(), &lhs.ty) {
         return false;
     }
+    has_barrier(g)
+}
+
+/// The object to pass to the write barrier after an assignment to `lhs`
+/// that is not `in_object` but still stores into one: a GC closure's
+/// state (`[var n = ..]`), which lives in the closure's environment
+/// object `%env` (the checker allows assigning it only in the closure's
+/// own body).
+pub fn env_barrier(g: &mut FnGen, lhs: &TExpr) -> Option<String> {
+    let f = g.f();
+    f.env_root?;
+    let (l, _) = crate::closures::place_root(lhs)?;
+    if !f.env.as_ref().is_some_and(|caps| caps.contains(&l)) || !is_traced(g.p(), &lhs.ty) {
+        return None;
+    }
+    has_barrier(g).then(|| "%env".to_string())
+}
+
+fn has_barrier(g: &mut FnGen) -> bool {
     if g.cg.gc_barrier.is_none() {
         let p = g.p();
         let has = p.fns.iter().any(|f| f.symbol == "std.gc.barrier" && f.body.is_some());

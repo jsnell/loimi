@@ -1,0 +1,112 @@
+// Escaping closures with state of their own: `new(a, [var n = e] |..| ..)`.
+// The state variables live in the environment, start with their initial
+// values, and keep what the body assigns between calls; the enclosing
+// function's variables are not changed.
+// expect: 18 true
+// expect: 13 10
+// expect: 14
+// expect: 1 10
+// expect: 3 32 9
+// expect: 3
+// expect: 2002
+// expect: 2
+// expect: 9 4
+import std.io;
+import std.mem;
+import std.mem.{Vec, Arena};
+
+// A generator: one allocation, the position in the environment.
+fn range(a: *Arena, lo: i64, hi: i64) -> closure fn() -> ?i64 {
+    new(a, [var i = lo] || {
+        if i >= hi { return None; }
+        i += 1;
+        Some(i - 1)
+    })
+}
+
+struct Stats { n: i64, sum: i64, max: i64 }
+
+// Struct state, assigned field by field; another capture read-only.
+fn summer(a: *Arena, scale: i64) -> closure fn(i64) -> Stats {
+    new(a, [var st = Stats { n: 0, sum: 0, max: 0 }] |x| {
+        st.n += 1;
+        st.sum += x * scale;
+        if x > st.max { st.max = x; }
+        st
+    })
+}
+
+// A closure that owns a growing buffer (a `Vec` changed through its
+// methods). Freeing the environment does not free what the state owns:
+// here a negative argument frees the buffer.
+fn collector(a: *Arena) -> closure fn(i64) -> u64 {
+    new(a, [var seen: Vec<i64> = Vec.new()] |x| {
+        if x < 0 { seen.free(); return 0; }
+        seen.push(x);
+        seen.len
+    })
+}
+
+fn sum_block(n: i64, f: block fn(i64) -> i64) -> i64 {
+    var t: i64 = 0;
+    for i in 0..n { t += f(i); }
+    t
+}
+
+fn main() {
+    var arena = Arena.new();
+    let a = &arena;
+
+    let r = range(a, 3, 7);
+    var sum: i64 = 0;
+    while let Some(i) = r() { sum += i; }
+    io.print_int(sum); io.print(" ");
+    io.print_bool(r().is_none()); io.println("");
+
+    // `[var n]` copies the local `n`; the body's `n` is the closure's own.
+    var n: i64 = 10;
+    let count: closure fn() -> i64 = new(a, [var n] || { n += 1; n });
+    count(); count();
+    io.print_int(count()); io.print(" "); io.print_int(n); io.println("");
+    n = 100;
+    io.print_int(count()); io.println("");
+
+    // Two closures from one function have separate state.
+    let r1 = range(a, 0, 3);
+    let r2 = range(a, 10, 13);
+    r1();
+    io.print_int(r1() ?? -1); io.print(" "); io.print_int(r2() ?? -1); io.println("");
+
+    let s = summer(a, 2);
+    s(3); s(9);
+    let st = s(4);
+    io.print_int(st.n); io.print(" "); io.print_int(st.sum); io.print(" "); io.print_int(st.max); io.println("");
+
+    let c = collector(a);
+    c(1); c(2);
+    io.print_int(c(3) as i64); io.println("");
+    c(-1);
+
+    // State next to ordinary captures, several state variables, and a
+    // nested `block fn` that writes the state.
+    let step = 5;
+    let acc: closure fn(i64) -> i64 = new(a, [var total = 0, var calls = 0] |k| {
+        calls += 1;
+        total += sum_block(k, |i| { total += 0; i * step });
+        total * 100 + calls
+    });
+    acc(3);
+    io.print_int(acc(2)); io.println("");
+
+    // Copies: a copy of a closure shares its environment (the state).
+    let r3 = range(a, 0, 100);
+    let r4 = r3;
+    r3(); r3();
+    io.print_int(r4() ?? -1); io.println("");
+
+    // Converted to a `block fn`: the state still updates.
+    let ticks: closure fn(i64) -> i64 = new(a, [var t = 0] |i| { t += 1; i + t });
+    io.print_int(sum_block(3, ticks)); io.print(" "); io.print_int(ticks(0)); io.println("");
+
+    arena.free();
+}

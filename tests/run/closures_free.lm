@@ -1,0 +1,76 @@
+// Freeing escaping closures one by one: `c.free(a)` gives the environment
+// back with `a.free_bytes(p)`. Closures that own no memory (a converted
+// plain function, a closure without captures) free nothing, so a table
+// that mixes them can free every entry. `mem.Malloc` counts its live
+// allocations; an arena's `free_bytes` does nothing.
+// expect: 3 1 15 36
+// expect: live 4
+// expect: live 0
+// expect: 17 10
+// expect: live 0
+// expect: 5 live 0
+// expect: 3 live 0
+// expect: live 0
+import std.io;
+import std.mem;
+import std.gc;
+import std.mem.{Vec, Arena, Malloc};
+
+struct Entry { name: str, f: closure fn(i64) -> i64 }
+
+fn double(x: i64) -> i64 { x * 2 }
+
+fn adder(m: *Malloc, k: i64) -> closure fn(i64) -> i64 { new(m, |x| x + k) }
+
+// Generic over the allocator: frees either kind.
+fn use_once<A>(a: A, k: i64) -> i64 {
+    let f: closure fn(i64) -> i64 = new(a, [var calls = 0] |x| { calls += 1; x * k + calls });
+    let r = f(1);
+    f.free(a);
+    r
+}
+
+fn main() uses gc {
+    var m = Malloc.new();
+    let a = &m;
+
+    var tab: Vec<Entry> = Vec.new();
+    tab.push(Entry { name: "add2", f: adder(a, 2) });
+    tab.push(Entry { name: "neg", f: new(a, |x| -x) });          // no captures: no allocation
+    tab.push(Entry { name: "double", f: double });               // a plain function
+    let big = [1, 2, 3, 4, 5];
+    tab.push(Entry { name: "sum", f: new(a, |x| { var t = x; for v in big { t += v; } t }) });
+    var ctr: i64 = 0;
+    let pc = &ctr;
+    tab.push(Entry { name: "count", f: new(a, |x| { *pc += x; *pc }) });
+    tab.push(Entry { name: "state", f: new(a, [var n = 30] |x| { n += x; n }) });
+    io.print_int(tab.at(0).f(1)); io.print(" ");
+    io.print_int(tab.at(1).f(-1)); io.print(" ");
+    io.print_int(tab.at(3).f(0)); io.print(" ");
+    io.print_int(tab.at(5).f(6)); io.println("");
+    io.print("live "); io.print_int(m.live as i64); io.println("");
+    for i in 0..tab.len { tab.at(i).f.free(a); }
+    tab.free();
+    io.print("live "); io.print_int(m.live as i64); io.println("");
+
+    // A closure with more effects than the plain function it came from,
+    // and one converted through `closure fn` to a type with more effects:
+    // still not freed.
+    let g: closure fn(i64) -> i64 uses gc = double;
+    let h: closure fn(i64) -> i64 = adder(a, 7);
+    let h2: closure fn(i64) -> i64 uses gc = h;
+    io.print_int(h2(10)); io.print(" "); io.print_int(g(5)); io.println("");
+    g.free(a);
+    h2.free(a);
+    io.print("live "); io.print_int(m.live as i64); io.println("");
+
+    io.print_int(use_once(a, 4)); io.print(" live "); io.print_int(m.live as i64); io.println("");
+    var arena = Arena.new();
+    io.print_int(use_once(&arena, 2)); io.print(" live "); io.print_int(m.live as i64); io.println("");
+    arena.free();
+
+    // Created and freed right away.
+    let k = adder(a, 1);
+    k.free(a);
+    io.print("live "); io.print_int(m.live as i64); io.println("");
+}

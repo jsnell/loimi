@@ -143,6 +143,36 @@ impl Parser {
         }
     }
 
+    /// A closure literal: `|a, b: T| expr`, `|| expr`, `|a| -> R { .. }`.
+    fn closure_lit(&mut self) -> Res<(Vec<(Ident, Option<TypeExpr>)>, Option<TypeExpr>, Expr)> {
+        let mut params = Vec::new();
+        if self.bump().tok == Tok::Punct("|") {
+            while !self.is("|") {
+                let name = self.ident()?;
+                let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
+                params.push((name, ty));
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect("|")?;
+        }
+        let saved = self.no_struct;
+        self.no_struct = false;
+        let (ret, body) = if self.eat("->") {
+            let t = self.parse_type()?;
+            let b = self.parse_block()?;
+            let span = b.span;
+            (Some(t), Expr { kind: ExprKind::Block(b), span })
+        } else {
+            // The body may be an assignment: `|i| sum += i`.
+            let e = self.parse_expr()?;
+            (None, self.parse_assign_tail(e)?)
+        };
+        self.no_struct = saved;
+        Ok((params, ret, body))
+    }
+
     // ── token helpers ────────────────────────────────────────────────
 
     pub fn peek(&self) -> &Tok {
@@ -1450,33 +1480,31 @@ impl Parser {
                 mk(ExprKind::Tuple(es), self)
             }
             Tok::Punct("|") | Tok::Punct("||") => {
-                // A closure: `|a, b: T| expr`, `|| expr`, `|a| -> R { .. }`.
-                let mut params = Vec::new();
-                if self.bump().tok == Tok::Punct("|") {
-                    while !self.is("|") {
-                        let name = self.ident()?;
-                        let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
-                        params.push((name, ty));
-                        if !self.eat(",") {
-                            break;
-                        }
+                let (params, ret, body) = self.closure_lit()?;
+                mk(ExprKind::Closure(params, ret, Box::new(body), vec![]), self)
+            }
+            Tok::Punct("[") if self.is_kw_at(1, "var") => {
+                // An escaping closure's state list: `[var n = e, var m] |..| body`.
+                self.bump();
+                let mut state = Vec::new();
+                loop {
+                    if !self.eat_kw("var") {
+                        return self.err("expected `var` in a closure's state list (`[var n = 0, var m] || ..`)");
                     }
-                    self.expect("|")?;
+                    let name = self.ident()?;
+                    let ty = if self.eat(":") { Some(self.parse_type()?) } else { None };
+                    let init = if self.eat("=") { Some(self.parse_expr()?) } else { None };
+                    state.push((name, ty, init));
+                    if !self.eat(",") {
+                        break;
+                    }
                 }
-                let saved = self.no_struct;
-                self.no_struct = false;
-                let (ret, body) = if self.eat("->") {
-                    let t = self.parse_type()?;
-                    let b = self.parse_block()?;
-                    let span = b.span;
-                    (Some(t), Expr { kind: ExprKind::Block(b), span })
-                } else {
-                    // The body may be an assignment: `|i| sum += i`.
-                    let e = self.parse_expr()?;
-                    (None, self.parse_assign_tail(e)?)
-                };
-                self.no_struct = saved;
-                mk(ExprKind::Closure(params, ret, Box::new(body)), self)
+                self.expect("]")?;
+                if !self.is("|") && !self.is("||") {
+                    return self.err("expected a closure literal after its state list (`[var n = 0] || ..`)");
+                }
+                let (params, ret, body) = self.closure_lit()?;
+                mk(ExprKind::Closure(params, ret, Box::new(body), state), self)
             }
             Tok::Punct("[") => {
                 self.bump();

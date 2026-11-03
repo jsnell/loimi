@@ -132,8 +132,11 @@ pub enum ExprKind {
     Try(P<Expr>),
     SizeOf(TypeExpr),
     /// `|a, b: T| body` or `|a| -> R { .. }`: a closure literal (only as an
-    /// argument for a `block fn` parameter).
-    Closure(Vec<(Ident, Option<TypeExpr>)>, Option<TypeExpr>, P<Expr>),
+    /// argument for a `block fn` parameter, or in `new(a, ..)`). The last
+    /// part is the state list of an escaping closure, `[var n: T = e, var m]`
+    /// before the literal: variables of the closure's own, in its
+    /// environment (no initializer: the local of the same name).
+    Closure(Vec<(Ident, Option<TypeExpr>)>, Option<TypeExpr>, P<Expr>, Vec<(Ident, Option<TypeExpr>, Option<Expr>)>),
     /// `f<T, U>`: explicit type arguments (only as a callee: `f<T>(..)`).
     TypeArgs(P<Expr>, Vec<TypeExpr>),
     /// VM control words and constructs (only valid in handlers).

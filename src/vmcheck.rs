@@ -1357,7 +1357,7 @@ impl AstAny<'_> {
             ExprKind::For(_, _, lo, hi, b) => go(lo) || hi.as_ref().is_some_and(|e| go(e)) || self.block(b),
             ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
             ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
-            ExprKind::Closure(_, _, body) => self.closures && go(body),
+            ExprKind::Closure(_, _, body, st) => self.closures && (go(body) || st.iter().any(|(_, _, x)| x.as_ref().is_some_and(|x| go(x)))),
             ExprKind::Vm(v) => {
                 self.vm
                     && match v {

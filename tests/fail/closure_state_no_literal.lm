@@ -1,0 +1,4 @@
+fn main() {
+    let x = [var n = 1] 5;
+}
+// error: expected a closure literal after its state list

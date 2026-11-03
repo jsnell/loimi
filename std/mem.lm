@@ -290,3 +290,32 @@ pub fn Arena.free(a: *Arena) {
     free(a.chunk);
     a.chunks.free();
 }
+
+/// Arena memory is freed all at once (`free`): giving back one
+/// allocation does nothing. (So `c.free(&arena)` is allowed on a closure
+/// made with `new(&arena, ..)`, and generic code can free either kind.)
+pub fn Arena.free_bytes(a: *Arena, p: *u8) {}
+
+/// An allocator on the C heap whose allocations are freed one by one:
+/// escaping closures made with `new(&m, |..| ..)` that `c.free(&m)`
+/// gives back. `live` counts the allocations not freed yet.
+pub struct Malloc { live: u64 }
+
+pub fn Malloc.new() -> Malloc { Malloc { live: 0 } }
+
+pub fn Malloc.alloc_bytes(m: *Malloc, n: u64, align: u64) -> *u8 {
+    if align > 16 {
+        let msg = "Malloc.alloc_bytes: alignment over 16\n";
+        loimi_panic(msg.ptr, msg.len);
+    }
+    let p = malloc(if n == 0 { 1 } else { n });
+    if (p as u64) == 0 { panic_oom(); }
+    m.live += 1;
+    p
+}
+
+/// Free an allocation of `alloc_bytes`.
+pub fn Malloc.free_bytes(m: *Malloc, p: *u8) {
+    m.live -= 1;
+    free(p);
+}

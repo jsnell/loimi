@@ -152,6 +152,11 @@ pub enum Intr {
     StoreUnaligned,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
+    /// The environment of a `closure fn` if it was allocated by `new(a,
+    /// ..)` (`?*u8`): None for a closure that captures nothing (null
+    /// environment) and for a plain function converted to `closure fn`
+    /// (whose environment is the function, under a trampoline).
+    ClosureEnv,
     /// `__panic("msg")` (generated code only): panic with a message.
     Panic,
 }

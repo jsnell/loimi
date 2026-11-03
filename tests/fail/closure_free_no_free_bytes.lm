@@ -1,0 +1,11 @@
+// `c.free(a)` needs `a.free_bytes(p: *u8)`.
+struct Pool { n: i64 }
+fn Pool.alloc_bytes(p: *Pool, n: u64, align: u64) -> *u8 { p as *u8 }
+fn main() {
+    var p = Pool { n: 0 };
+    let k = 3;
+    let f: closure fn() -> i64 = new(&p, || k);
+    f.free(&p);
+}
+// error: no method `free_bytes`
+// error: `c.free(a)` gives the environment back with `a.free_bytes(p: *u8)`

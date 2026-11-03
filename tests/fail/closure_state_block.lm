@@ -1,0 +1,6 @@
+// A `block fn` closure captures by reference: it has no state list.
+fn each(n: i64, f: block fn(i64)) { for i in 0..n { f(i); } }
+fn main() {
+    each(3, [var t = 0] |i| t += i);
+}
+// error: a `block fn` closure captures by reference and has no state list

@@ -181,7 +181,10 @@ fn walk(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) {
                 walk(x, f);
             }
         }
-        ExprKind::Closure(_, _, b) => walk(b, f),
+        ExprKind::Closure(_, _, b, st) => {
+            st.iter_mut().filter_map(|(_, _, x)| x.as_mut()).for_each(|x| walk(x, f));
+            walk(b, f)
+        }
         ExprKind::Vm(w) => match w {
             VmExpr::Jump(x) | VmExpr::Exit(x) | VmExpr::Raise(x) | VmExpr::Fail(x) => walk(x, f),
             VmExpr::Cold(b) => walk_block(b, f),

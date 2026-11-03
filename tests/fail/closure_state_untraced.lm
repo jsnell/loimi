@@ -1,0 +1,10 @@
+// State is in the environment: traced state needs a GC environment.
+import std.mem;
+import std.gc;
+object Node { v: i64 }
+fn main() {
+    var heap = gc.Heap.new();
+    var arena = mem.Arena.new();
+    let f: closure fn() -> i64 = new(&arena, [var n: ?Gc<Node> = None] || { if let Some(x) = n { x.v } else { 0 } });
+}
+// error: this closure captures `n` of type `?Gc<Node>`, which holds GC references, but its environment is not traced

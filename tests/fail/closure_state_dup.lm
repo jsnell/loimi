@@ -1,0 +1,6 @@
+import std.mem;
+fn main() {
+    var arena = mem.Arena.new();
+    let f: closure fn() -> i64 = new(&arena, [var n = 1, var n = 2] || n);
+}
+// error: `n` is twice in this closure's state list

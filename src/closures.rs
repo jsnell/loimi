@@ -35,7 +35,12 @@ impl<'a> Checker<'a> {
     /// plain function value.
     pub fn block_arg(&mut self, cx: &mut FnCx, a: &Expr, want: &Ty) -> Res<TExpr> {
         let v = match &a.kind {
-            ExprKind::Closure(ps, ret, body) => return self.closure(cx, ps, ret.as_ref(), body, want, a.span, false),
+            ExprKind::Closure(ps, ret, body, st) => {
+                if let Some((n, _, _)) = st.first() {
+                    return Err(Diag::new(n.span, "a `block fn` closure captures by reference and has no state list: `[var ..]` is for escaping closures (`new(a, [var n = 0] || ..)`)"));
+                }
+                return self.closure(cx, ps, ret.as_ref(), body, &[], want, a.span, false);
+            }
             ExprKind::Ident(n) if cx.lookup(n).is_some() => {
                 cx.block_use = true;
                 let r = self.expr(cx, a, Some(want));
@@ -69,6 +74,7 @@ impl<'a> Checker<'a> {
         params: &[(Ident, Option<TypeExpr>)],
         ret: Option<&TypeExpr>,
         body: &Expr,
+        state: &[(Ident, TExpr)],
         want: &Ty,
         span: Span,
         gc: bool,
@@ -136,6 +142,14 @@ impl<'a> Checker<'a> {
         let saved_eff = std::mem::replace(&mut cx.effects, *eff);
         let saved_closure = std::mem::replace(&mut cx.closure_ty, Some(shown));
         cx.scopes.push(vec![]);
+        // The state list's variables are the closure's own, declared
+        // before its parameters but captured like enclosing locals: they
+        // are fields of the environment, and the enclosing function only
+        // initializes them (`new_closure`).
+        let mut state_ids = Vec::new();
+        for (name, init) in state {
+            state_ids.push(cx.declare(&name.name, init.ty.clone(), true));
+        }
         let start = cx.locals.len() as LocalId;
         let mut pids = Vec::new();
         for ((name, _), t) in params.iter().zip(&ptys) {
@@ -160,7 +174,7 @@ impl<'a> Checker<'a> {
         crate::tirwalk::locals(&b, &mut used, &mut declared);
         let caps: Vec<LocalId> = used.into_iter().filter(|l| *l < start).collect();
         if escaping {
-            self.check_escaping_captures(cx, &b, &caps, gc)?;
+            self.check_escaping_captures(cx, &b, &caps, &state_ids, gc)?;
         }
         let n = self.closure_count;
         self.closure_count += 1;
@@ -241,7 +255,7 @@ impl<'a> Checker<'a> {
 
 /// The place `e` is rooted at, if it is (part of) a local's own storage:
 /// `x`, `x.f`, `x[i]` on an array, but not through a pointer or slice.
-fn place_root(e: &TExpr) -> Option<(LocalId, Span)> {
+pub fn place_root(e: &TExpr) -> Option<(LocalId, Span)> {
     match &e.kind {
         TK::Local(l) => Some((*l, e.span)),
         TK::Field(b, _) => place_root(b).map(|(l, _)| (l, e.span)),
@@ -255,8 +269,30 @@ impl<'a> Checker<'a> {
     /// allocated by `a` (a `closure fn`), or in the GC heap when `a` is a
     /// `*gc.Heap` (a `Gc<closure fn>`).
     pub fn new_closure(&mut self, cx: &mut FnCx, alloc: &Expr, lit: &Expr, exp: Option<&Ty>, span: Span) -> Res<TExpr> {
-        let ExprKind::Closure(ps, ret, body) = &lit.kind else { unreachable!() };
+        let ExprKind::Closure(ps, ret, body, st) = &lit.kind else { unreachable!() };
         let a = self.expr(cx, alloc, None)?;
+        // The state list's initial values, in the enclosing scope.
+        let mut state = Vec::new();
+        for (name, ann, init) in st {
+            if state.iter().any(|(n, _): &(Ident, TExpr)| n.name == name.name) {
+                return Err(Diag::new(name.span, format!("`{}` is twice in this closure's state list", name.name)));
+            }
+            let at = match ann {
+                Some(te) => Some(self.resolve_type(cx.module, te)?),
+                None => None,
+            };
+            let ident = Expr { kind: ExprKind::Ident(name.name.clone()), span: name.span };
+            let e = init.as_ref().unwrap_or(&ident);
+            let v = match &at {
+                Some(t) => self.expr_coerce(cx, e, t)?,
+                None => self.expr(cx, e, None)?,
+            };
+            if matches!(v.ty, Ty::Unit | Ty::Never) || has_hole(&v.ty) {
+                return Err(Diag::new(name.span, format!("closure state `{}` has no usable type (`{}`)", name.name, self.ty_name(&v.ty))));
+            }
+            state.push((name.clone(), v));
+        }
+        let first_state = cx.locals.len() as LocalId;
         let gc = matches!(&a.ty, Ty::Ptr(t) if matches!(**t, Ty::Struct(s) if self.prog.structs[s as usize].name == "std.gc.Heap"));
         let mut sig = exp;
         if let Some(Ty::Option(inner)) = sig {
@@ -287,7 +323,7 @@ impl<'a> Checker<'a> {
                 Ty::Closure(pts, Box::new(Ty::Param(HOLE)), 0)
             }
         };
-        let mut v = self.closure(cx, ps, ret.as_ref(), body, &want, lit.span, gc)?;
+        let mut v = self.closure(cx, ps, ret.as_ref(), body, &state, &want, lit.span, gc)?;
         let TK::NewClosure(fid, caps, _) = &v.kind else { unreachable!() };
         let (fid, caps) = (*fid, caps.clone());
         let mem = if gc || caps.is_empty() {
@@ -316,13 +352,58 @@ impl<'a> Checker<'a> {
             return Err(Diag::new(alloc.span, "`alloc_bytes` must return a pointer (`*u8`)"));
         }
         v.kind = TK::NewClosure(fid, caps, Box::new(mem));
-        Ok(v)
+        if state.is_empty() {
+            return Ok(v);
+        }
+        // `{ let n = init; ..; new(..) }`: the state variables are set in
+        // the enclosing frame, then copied into the environment.
+        let stmts = state
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, init))| TStmt::Let(first_state + i as LocalId, Some(init)))
+            .collect();
+        let (ty, sp) = (v.ty.clone(), v.span);
+        Ok(mk(ty, TK::Block(stmts, Some(Box::new(v))), sp))
+    }
+
+    /// `c.free(a)`: give a `closure fn`'s environment back to the
+    /// allocator that made it, `{ let c' = c; if let Some(p) =
+    /// closure_env(c') { a.free_bytes(p) } }`. Closures that own no memory
+    /// (no captures, or a converted plain function) free nothing.
+    pub fn closure_free(&mut self, cx: &mut FnCx, recv: TExpr, alloc: &Expr, span: Span) -> Res<TExpr> {
+        let a = self.expr(cx, alloc, None)?;
+        let at = self.ty_name(&a.ty);
+        cx.scopes.push(vec![]);
+        let c = cx.declare("closure to free", recv.ty.clone(), false);
+        let env_ty = Ty::Ptr(Box::new(Ty::u8()));
+        let p = cx.declare("closure env", env_ty.clone(), false);
+        let name = Ident { name: "free_bytes".into(), span: alloc.span };
+        let arg = Expr { kind: ExprKind::Ident("closure env".into()), span: alloc.span };
+        let call = self.method_call(cx, a, &name, &[arg], None, span).map_err(|d| {
+            d.note(alloc.span, format!(
+                "`c.free(a)` gives the environment back with `a.free_bytes(p: *u8)` (`a` is `{}`; `*mem.Malloc` has one, and `*mem.Arena` has one that does nothing)",
+                at
+            ))
+        });
+        cx.scopes.pop();
+        let call = call?;
+        let opt = Ty::Option(Box::new(env_ty.clone()));
+        let rt = recv.ty.clone();
+        let env = mk(opt.clone(), TK::Intrinsic(Intr::ClosureEnv, vec![mk(rt, TK::Local(c), span)]), span);
+        let pat = TPat { ty: opt, kind: TPK::Variant(1, vec![TPat { ty: env_ty, kind: TPK::Bind(p) }]) };
+        let body = mk(Ty::Unit, TK::Block(vec![TStmt::Expr(call)], None), span);
+        let iff = mk(Ty::Unit, TK::If(vec![TCond::Let(pat, env)], Box::new(body), None), span);
+        Ok(mk(Ty::Unit, TK::Block(vec![TStmt::Let(c, Some(recv))], Some(Box::new(iff))), span))
     }
 
     /// What an escaping closure may capture: no `block fn` (it only lives
     /// during its call), nothing traced unless the environment is in the
     /// GC heap, and captured locals are copies: assigning one is an error.
-    fn check_escaping_captures(&mut self, cx: &FnCx, body: &TExpr, caps: &[LocalId], gc: bool) -> Res<()> {
+    /// The closure's own state (`[var n = ..]`) can be assigned, but in a
+    /// GC closure a traced one only in the body itself, where the store
+    /// gets the write barrier (not from a nested `block fn` closure, which
+    /// writes it through a pointer).
+    fn check_escaping_captures(&mut self, cx: &FnCx, body: &TExpr, caps: &[LocalId], state: &[LocalId], gc: bool) -> Res<()> {
         for l in caps {
             let ld = &cx.locals[*l as usize];
             if matches!(ld.ty, Ty::Block(..)) {
@@ -347,14 +428,25 @@ impl<'a> Checker<'a> {
         }
         let mut err: Option<Diag> = None;
         let prog = &self.prog;
-        let check = |e: &TExpr, err: &mut Option<Diag>| {
+        let check = |e: &TExpr, nested: bool, err: &mut Option<Diag>| {
             if err.is_some() {
                 return;
             }
             match &e.kind {
                 TK::Assign(lhs, _) => {
                     if let Some((l, sp)) = place_root(lhs) {
-                        if caps.contains(&l) {
+                        if state.contains(&l) {
+                            if gc && nested && crate::gcgen::is_traced(prog, &lhs.ty) {
+                                let name = &cx.locals[l as usize].name;
+                                *err = Some(Diag::new(
+                                    sp,
+                                    format!(
+                                        "cannot assign `{}` here: it is traced state in a GC closure's environment, and a nested closure would store it without the write barrier; assign it in the closure's own body",
+                                        name
+                                    ),
+                                ));
+                            }
+                        } else if caps.contains(&l) {
                             let name = &cx.locals[l as usize].name;
                             *err = Some(
                                 Diag::new(
@@ -364,7 +456,7 @@ impl<'a> Checker<'a> {
                                         name, name
                                     ),
                                 )
-                                .note(body.span, "keep shared or changing state behind a pointer that the closure captures"),
+                                .note(body.span, format!("state of the closure's own goes in its state list: `new(a, [var {}] |..| ..)` (a copy, kept between calls); state shared with the caller goes behind a pointer the closure captures", name)),
                             );
                         }
                     }
@@ -387,13 +479,13 @@ impl<'a> Checker<'a> {
             }
         };
         // Nested closures write the same locals.
-        let mut bodies = vec![body.clone()];
-        while let Some(b) = bodies.pop() {
+        let mut bodies = vec![(body.clone(), false)];
+        while let Some((b, nested)) = bodies.pop() {
             crate::tirwalk::for_each_expr(&b, &mut |e| {
-                check(e, &mut err);
+                check(e, nested, &mut err);
                 if let TK::Closure(fid, _) | TK::NewClosure(fid, _, _) = &e.kind {
                     if let Some(nb) = &prog.fns[*fid as usize].body {
-                        bodies.push(nb.clone());
+                        bodies.push((nb.clone(), true));
                     }
                 }
             });

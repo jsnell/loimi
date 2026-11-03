@@ -1,0 +1,9 @@
+// The collector frees GC closures.
+import std.gc;
+fn main() {
+    var heap = gc.Heap.new();
+    let k = 2;
+    let f: Gc<closure fn() -> i64> = new(&heap, || k);
+    f.free(&heap);
+}
+// error: a GC closure (`Gc<closure fn(..)>`) is freed by the collector, not by `free`
