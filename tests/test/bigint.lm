@@ -286,3 +286,33 @@ fn gc_objects() uses gc {
     test.eq(s(bigint.gc_neg(&h, Arg.Ref(a)).num()), "-123456789012345678901234567890");
     h.free();
 }
+
+#[test]
+fn gcd_cases() {
+    var a = n("-340282366920938463463374607431768211456");     // -2^128
+    var b = n("36893488147419103232");                         // 2^65
+    test.eq(so(bigint.gcd(a.num(), b.num())), "36893488147419103232");
+    var z = n("0");
+    test.eq(so(bigint.gcd(a.num(), z.num())), "340282366920938463463374607431768211456");
+    test.eq(so(bigint.gcd(z.num(), z.num())), "0");
+    var p = n("1000000000000000000000000000057");
+    var q = n("-30000000000000000000000000001710");            // -30 p
+    test.eq(so(bigint.gcd(p.num(), q.num())), "1000000000000000000000000000057");
+    var h = gc.Heap.new();
+    test.eq(s(bigint.gc_gcd(&h, Arg.Small(-12), Arg.Small(18)).num()), "6");
+}
+
+#[test]
+fn isqrt_cases() {
+    var a = n("340282366920938463463374607431768211455");      // 2^128 - 1
+    test.eq(so(bigint.isqrt(a.num()).unwrap()), "18446744073709551615");
+    var b = n("340282366920938463463374607431768211456");      // 2^128
+    test.eq(so(bigint.isqrt(b.num()).unwrap()), "18446744073709551616");
+    var c = n("18446744073709551615");                         // 2^64 - 1
+    test.eq(so(bigint.isqrt(c.num()).unwrap()), "4294967295");
+    var m = n("-4");
+    test.eq(bigint.isqrt(m.num()).is_none(), true);
+    var h = gc.Heap.new();
+    test.eq(s(bigint.gc_isqrt(&h, Arg.Small(99)).unwrap().num()), "9");
+    test.eq(bigint.gc_isqrt(&h, Arg.Small(-1)).is_none(), true);
+}

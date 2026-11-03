@@ -815,6 +815,119 @@ pub fn pow_into(out: []u64, a: Num, e: u64) -> Num {
     view(out.ptr, nx, rneg)
 }
 
+/// Limbs for `gcd_into`.
+pub fn gcd_size(a: Num, b: Num) -> u64 { max(max(a.d.len, b.d.len), 1) }
+
+/// The greatest common divisor of |a| and |b| (never negative; zero when
+/// both are zero): Euclid's algorithm, on machine words once both
+/// numbers fit one limb.
+pub fn gcd_into(out: []u64, a: Num, b: Num) -> Num {
+    let n = max(a.d.len, b.d.len);
+    need(out, max(n, 1));
+    if a.d.len == 0 or b.d.len == 0 {
+        let c = if a.d.len == 0 { b } else { a };
+        mem.copy(out.ptr, c.d.ptr, c.d.len);
+        return view(out.ptr, c.d.len, false);
+    }
+    // Rotating buffers: x mod y goes to z, then (x, y, z) = (y, z, x).
+    let m = n + 2;
+    var x: *u64 = mem.alloc(m);
+    var y: *u64 = mem.alloc(m);
+    var z: *u64 = mem.alloc(m);
+    let q: *u64 = mem.alloc(m);
+    mem.copy(x, a.d.ptr, a.d.len);
+    mem.copy(y, b.d.ptr, b.d.len);
+    var nx = a.d.len;
+    var ny = b.d.len;
+    while ny != 0 {
+        if nx == 1 and ny == 1 {
+            var u = x[0];
+            var v = y[0];
+            while v != 0 {
+                let t = u % v;
+                u = v;
+                v = t;
+            }
+            x[0] = u;
+            break;
+        }
+        let (_, r) = divmod_into(q.slice(m), z.slice(m), view(x, nx, false), view(y, ny, false), false).unwrap();
+        let nr = r.d.len;
+        let t = x;
+        x = y;
+        nx = ny;
+        y = z;
+        ny = nr;
+        z = t;
+    }
+    mem.copy(out.ptr, x, nx);
+    mem.release(x);
+    mem.release(y);
+    mem.release(z);
+    mem.release(q);
+    view(out.ptr, nx, false)
+}
+
+/// Limbs for `isqrt_into`.
+pub fn isqrt_size(a: Num) -> u64 { a.d.len / 2 + 1 }
+
+/// Whether r * r > n.
+fn square_above(r: u64, n: u64) -> bool {
+    let (lo, hi) = r.mul_wide(r);
+    hi != 0 or lo > n
+}
+
+/// floor(sqrt(a)), or None if a is negative. Above one limb this is
+/// Python's `math.isqrt`: Newton steps that double the precision of the
+/// root each time, then a final correction of at most one.
+pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
+    if a.neg { return None; }
+    need(out, isqrt_size(a));
+    if a.d.len == 0 { return Some(zero()); }
+    if a.d.len == 1 {
+        let n = a.d[0];
+        // Within one of the root (the conversion may round n up).
+        var r = (n as f64).sqrt() as u64;
+        while square_above(r, n) { r -= 1; }
+        while !square_above(r + 1, n) { r += 1; }
+        out[0] = r;
+        return Some(view(out.ptr, 1, false));
+    }
+    let c = (bit_length(a) - 1) / 2;
+    var x = of_u64(1);
+    var d: u64 = 0;
+    var s = 64 - (c.clz() as u64);
+    while s > 0 {
+        s -= 1;
+        let e = d;
+        d = c >> s;
+        var t1 = shl(x.num(), d - e - 1);
+        var t2 = shr(a, 2 * c - e - d + 1);
+        let (q0, r0) = divmod(t2.num(), x.num(), false).unwrap();
+        var q = q0;
+        var r = r0;
+        let nx = add(t1.num(), q.num());
+        t1.free();
+        t2.free();
+        q.free();
+        r.free();
+        x.free();
+        x = nx;
+    }
+    var sq = mul(x.num(), x.num());
+    if cmp(sq.num(), a) > 0 {
+        var one: [u64; 1] = [1; 1];
+        let y = sub(x.num(), Num { neg: false, d: one[0..1] });
+        x.free();
+        x = y;
+    }
+    sq.free();
+    let k = x.d.len;
+    mem.copy(out.ptr, x.d.ptr, k);
+    x.free();
+    Some(view(out.ptr, k, false))
+}
+
 // ── text ────────────────────────────────────────────────────────────
 
 const DIGITS: str = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -1084,6 +1197,16 @@ pub fn divmod(a: Num, b: Num, floor: bool) -> ?(BigInt, BigInt) {
     Some((own(q, x), own(r, y)))
 }
 
+/// gcd(|a|, |b|); see `gcd_into`.
+pub fn gcd(a: Num, b: Num) -> BigInt { var v = room(gcd_size(a, b)); own(v, gcd_into(space(&v), a, b)) }
+
+/// floor(sqrt(a)), or None if a is negative.
+pub fn isqrt(a: Num) -> ?BigInt {
+    if a.neg { return None; }
+    var v = room(isqrt_size(a));
+    Some(own(v, isqrt_into(space(&v), a).unwrap()))
+}
+
 /// a in `radix`, appended to `b` (see `write`).
 pub fn BigInt.write(x: *BigInt, b: *text.StrBuf, radix: u32) { write(b, x.num(), radix); }
 
@@ -1188,6 +1311,17 @@ pub fn gc_divmod(h: *gc.Heap, a: Arg, b: Arg, floor: bool) -> ?(Gc<Big>, Gc<Big>
     let r = new_big(h, rem_size(a.num(&x), b.num(&y)));
     let (qv, rv) = divmod_into(q.d, r.d, a.num(&x), b.num(&y), floor).unwrap();
     Some((set(q, qv), set(r, rv)))
+}
+
+/// gcd(|a|, |b|); see `gcd_into`.
+pub fn gc_gcd(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, gcd_size, gcd_into) }
+
+/// floor(sqrt(a)), or None if a is negative.
+pub fn gc_isqrt(h: *gc.Heap, a: Arg) -> ?Gc<Big> {
+    var x: u64 = 0;
+    if a.num(&x).neg { return None; }
+    let o = new_big(h, isqrt_size(a.num(&x)));
+    Some(set(o, isqrt_into(o.d, a.num(&x)).unwrap()))
 }
 
 /// The integer part of x, or None for inf and nan.

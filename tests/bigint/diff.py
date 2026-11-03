@@ -12,6 +12,7 @@ tests/golden.rs (bigint_vs_python) runs the default; longer runs are
 manual, e.g. `diff.py target/release/loimi --seed 7 --cases 200000 --big`.
 Exit status 0 when everything matches.
 """
+import math
 import os
 import random
 import struct
@@ -86,7 +87,8 @@ def gen(rng, n, big):
     cases = []
     ops = ['add', 'sub', 'mul', 'and', 'or', 'xor', 'fdiv', 'tdiv', 'cmp', 'not', 'pow', 'shl', 'shr',
            'hash', 'bitlen', 'i64', 'tof', 'fromf', 'radix',
-           'gadd', 'gsub', 'gmul', 'gand', 'gor', 'gxor', 'gfdiv', 'gtdiv', 'gnot', 'gpow', 'gshl', 'gshr']
+           'gadd', 'gsub', 'gmul', 'gand', 'gor', 'gxor', 'gfdiv', 'gtdiv', 'gnot', 'gpow', 'gshl', 'gshr',
+           'gcd', 'ggcd', 'isqrt', 'gisqrt']
     for _ in range(n):
         op = rng.choice(ops)
         a = rand_int(rng, big)
@@ -98,6 +100,22 @@ def gen(rng, n, big):
         elif op in ('fdiv', 'tdiv', 'gfdiv', 'gtdiv'):
             b = divisor(rng, a, big) if rng.random() < 0.97 else 0
             cases.append((op, a, b))
+        elif op in ('gcd', 'ggcd'):
+            # A common factor most of the time, so the result is not just 1.
+            g = rand_int(rng, False) if rng.random() < 0.7 else 1
+            b = rand_int(rng, big)
+            if rng.random() < 0.1:
+                b = 0
+            cases.append((op, a * g, b * g))
+        elif op in ('isqrt', 'gisqrt'):
+            r = rng.random()
+            if r < 0.3:
+                # Perfect squares and their neighbours.
+                s = abs(rand_int(rng, big))
+                a = s * s + rng.choice([-1, 0, 0, 1])
+            elif r < 0.4:
+                a = rng.choice([0, 1, 2, 3, 4, 2**64 - 1, 2**64, 2**128 - 1, (2**64 - 1) ** 2, 2**63, 10**38])
+            cases.append((op, a, None))
         elif op in ('pow', 'gpow'):
             a = rng.choice([a % (1 << 200), rng.randint(-20, 20), rng.getrandbits(64)])
             if rng.random() < 0.5:
@@ -151,6 +169,10 @@ def expect(op, a, b):
             return 'zerodiv'
         q, r = floor_divmod(a, b) if 'f' in op else trunc_divmod(a, b)
         return '%d %d' % (q, r)
+    if op in ('gcd', 'ggcd'):
+        return str(math.gcd(a, b))
+    if op in ('isqrt', 'gisqrt'):
+        return 'none' if a < 0 else str(math.isqrt(a))
     if op == 'cmp':
         return str((a > b) - (a < b))
     if op in ('not', 'gnot'):
