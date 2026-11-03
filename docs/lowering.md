@@ -446,7 +446,9 @@ op.ADD:
 The driver disables LLVM's branch tail-merging for this function, which would
 otherwise fold the replicated `indirectbr`s back into a single dispatch point
 and undo the main benefit of threaded code. `cold` blocks are outlined exactly
-as in tail-call mode. Register pressure is shared across all handlers, which is
+as in tail-call mode. (*As implemented:* the driver sets no such option, and
+LLVM keeps the `indirectbr`s replicated on its own; `cold` blocks stay inline
+and are marked unlikely.) Register pressure is shared across all handlers, which is
 why `tailcall` is preferred where it is available.
 
 ## 6. `switch` mode
@@ -660,11 +662,11 @@ interleaved, `--align-functions=64`).
 
 | Setting | Why |
 |---|---|
-| `-O3` with the new pass manager by default | standard |
-| branch tail-merge disabled for `goto`-mode run functions | keeps `indirectbr` replicated |
+| `-O3` with the new pass manager (as implemented: `-O3` with `--release`, `-O1` otherwise) | standard |
+| branch tail-merge disabled for `goto`-mode run functions (not needed so far, not implemented) | keeps `indirectbr` replicated |
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
 | optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |
-| target check: `preserve_none` available? otherwise warn and fall back to `goto` | portability |
+| target check: `preserve_none` available? otherwise warn and fall back to `goto` (not implemented: both targets have it) | portability |
 | executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
 | initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
