@@ -25,6 +25,21 @@ pub struct Parser {
     open_allows: Vec<(String, Span)>,
 }
 
+thread_local! {
+    /// The names `--cfg NAME` enabled for this build: `#[cfg(NAME)]`
+    /// keeps what it is attached to, `#[cfg(not(NAME))]` drops it.
+    static CFG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Enable the `#[cfg(..)]` names of the build (`--cfg NAME`).
+pub fn set_cfg(names: &[String]) {
+    CFG.with(|c| *c.borrow_mut() = names.to_vec());
+}
+
+fn cfg_enabled(name: &str) -> bool {
+    CFG.with(|c| c.borrow().iter().any(|n| n == name))
+}
+
 /// Every attribute and where it applies, for messages. `allow` is
 /// accepted everywhere.
 const ATTRS: &[(&str, &str)] = &[
@@ -487,9 +502,13 @@ impl Parser {
                 check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec() }, "a module (`#![..]`)", &[])?;
                 continue;
             }
+            let keep = self.take_cfg()?;
             let mark = self.open_allows.len();
-            items.push(self.parse_item()?);
+            let item = self.parse_item()?;
             self.close_allows(mark);
+            if keep {
+                items.push(item);
+            }
         }
         // `#![allow(..)]`: the whole file.
         let file = self.toks.last().map(|t| t.span.file).unwrap_or(0);
@@ -561,6 +580,33 @@ impl Parser {
         Ok(())
     }
 
+    /// A leading `#[cfg(NAME)]` or `#[cfg(not(NAME))]` (several may
+    /// follow each other; all must hold): consumed, and whether what follows
+    /// is kept. The parser drops what is not, before name resolution, so a
+    /// build without the name compiles as if the code were not there (the
+    /// IR is the same as without it).
+    pub fn take_cfg(&mut self) -> Res<bool> {
+        let mut keep = true;
+        while self.is("#") && self.is_at(1, "[") && self.is_kw_at(2, "cfg") && self.is_at(3, "(") {
+            for _ in 0..4 {
+                self.bump();
+            }
+            let neg = self.is_kw("not") && self.is_at(1, "(");
+            if neg {
+                self.bump();
+                self.bump();
+            }
+            let name = self.ident()?;
+            if neg {
+                self.expect(")")?;
+            }
+            self.expect(")")?;
+            self.expect("]")?;
+            keep &= cfg_enabled(&name.name) != neg;
+        }
+        Ok(keep)
+    }
+
     pub fn parse_attrs(&mut self) -> Res<Attrs> {
         let mut attrs = Attrs::default();
         while self.is("#") && self.is_at(1, "[") {
@@ -620,6 +666,7 @@ impl Parser {
             self.expect("{")?;
             let mut fields = Vec::new();
             while !self.is("}") {
+                let keep = self.take_cfg()?;
                 let mark = self.allow_mark();
                 let fattrs = self.parse_attrs()?;
                 check_attrs(&fattrs, "a field", &[])?;
@@ -641,7 +688,9 @@ impl Parser {
                 } else {
                     self.parse_type()?
                 };
-                fields.push((f, t));
+                if keep {
+                    fields.push((f, t));
+                }
                 self.close_allows(mark);
                 if !self.eat(",") {
                     break;
@@ -1073,7 +1122,11 @@ impl Parser {
                 }
                 continue;
             }
-            stmts.push(self.parse_stmt()?);
+            let keep = self.take_cfg()?;
+            let st = self.parse_stmt()?;
+            if keep {
+                stmts.push(st);
+            }
         }
         let end = self.expect("}")?;
         self.no_struct = saved;

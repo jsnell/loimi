@@ -302,6 +302,74 @@ are emitted only where used (src/codegen.rs, `is_lazy`): `Heap.free`
 refers to the two registries' functions, and that is the only change in
 the IR of programs that do not use them (with four type declarations).
 
+### Threads sharing a heap: `std.gil`
+
+`std/gil.lm`: a global interpreter lock per heap, so that several threads
+share one heap (and the interpreter state around it), one at a time.
+Opt-in: a program that does not import it is unchanged. Mini built with
+`--cfg gil` is the worked example (`examples/mini/threads.lm`,
+`examples/mini/embed.lm`, `examples/embed/shared.c`; language.md §10.1,
+Threads).
+
+<!-- snippet: check
+import std.gc;
+import std.gil;
+struct Interp { heap: gc.Heap, gil: *gil.Gil }
+struct PerThread { top: u64 }
+fn save(d: *u8, t: *u8) {}
+fn load(d: *u8, t: *u8) {}
+fn scan(h: *gc.Heap, d: *u8, t: *u8) {}
+fn blocking_io() {}
+fn setup(it: *Interp, me: *PerThread) uses gc {
+    {snippet}
+}
+fn main() {}
+-->
+```loimi
+it.gil = gil.Gil.new(&it.heap, me as *u8);   // held by this thread
+it.gil.set_hooks(gil.Hooks { data: it as *u8, save: save, load: load, scan: scan });
+it.gil.unlock();                             // around code that blocks
+blocking_io();
+it.gil.lock();
+```
+
+- **The lock.** `Gil.new(h, data)` creates it held by the calling
+  thread, attached with per-thread state `data`. Another thread calls
+  `g.attach(data)` (waits for the lock) and, holding it, `g.detach()`.
+  `g.unlock()` / `g.lock()` let go and take it back around blocking
+  code. Waiting is first come, first served (tickets under a pthread
+  mutex and condition variable).
+- **Hand-over at safepoints.** `g.waiting()` is a relaxed atomic load of
+  the number of waiting threads, which the holder polls where its state
+  is synced: Mini at every taken jump and every call of a Lua function.
+  When it is non-zero, `g.yield_now()` (`uses gc`) lets the waiters run
+  and takes the lock back. Polls are plain code in the handlers,
+  `#[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } }`,
+  so a handler syncs and roots its state for them as for any call that
+  may collect.
+- **Per-thread state moves.** The interpreter's state has one copy of
+  the per-thread parts (stacks, the running frame), the holder's. The
+  hooks move them: `save(data, thread)` when a thread lets go,
+  `load(data, thread)` when one takes the lock (a thread attached with
+  fresh data gets its stacks there), `scan(h, data, thread)` in
+  collections.
+- **Roots of the other threads.** `Gil.new` registers a scanner. In
+  each collection (run by the holder, which marks its own shadow stack
+  as always) it walks every other attached thread: the shadow-stack
+  frames it had linked when it let go of the lock, saved then
+  (`gc.mark_shadow_stack`, which marks only this heap's objects, like
+  the collector's own walk), and its per-thread state (`scan`). The
+  frames stay valid until it takes the lock back: they belong to calls
+  that have not returned, and `unlock`, `lock` and `yield_now` are
+  `uses gc`, so their callers link their own traced locals. While a
+  thread has let go, it must not touch the heap.
+- **Generational heaps** need nothing more: stacks are scanned as roots
+  in every collection, minor ones included, whichever thread's they are.
+- **No other synchronization.** The collector, the write barrier,
+  allocation, quickening and inline caches run only on the holder, and
+  the mutex orders one holder's writes before the next one's reads.
+  `examples/embed/shared.c` is clean under ThreadSanitizer.
+
 ### Not implemented
 
 Policies as a compile-time parameter (`#![heap = ..]`; generational is a
@@ -680,6 +748,11 @@ liveness check (`ShapeId` implements `WeakId` through the shape table).
   read with `getenv` in `Heap.new`: do not `setenv` concurrently.
   `examples/embed/threads.c` runs four Mini states on four threads (two
   under GC stress), clean under ThreadSanitizer.
+- **Several threads in one heap, one at a time** (`std.gil`, above,
+  "Threads sharing a heap"): the threads register with the heap's
+  lock, and the holder's collections also walk the shadow stacks the
+  others saved when they let go of it. Several threads in one heap at
+  the same time (free threading) is not built.
 - **Several heaps on one thread.** The shadow stack is per thread, not
   per heap: when a native of state B runs code of state A (a nested run
   into another state), A's collections see B's frames too. The root walk

@@ -1,0 +1,203 @@
+// Several OS threads running one Mini state, one at a time (`std.gil`):
+// built in with `--cfg gil` (state.lm, vm.lm, embed.lm).
+//
+// The state (heap, globals, code, string table) is shared. Each OS
+// thread has a Mini thread of its own, as Lua's lua_newthread gives:
+// a value stack, a frame stack, its main coroutine, open upvalues, the
+// innermost run. `Ctx` holds the running thread's; when the lock
+// changes hands, `save` moves them into the thread's `CtxThread` and
+// `load` installs the next holder's. Handlers read their state through
+// `ctx` as always, so a hand-over at a poll is, for them, a call that
+// may collect: the vm's `sync` has published `ctx.fp`, and the compiler
+// has rooted the state variables' copies in the handler's shadow-stack
+// frame, which the holder's collections walk (`std.gil`).
+
+import std.gc;
+import std.gil;
+import std.mem;
+import value;
+import value.{V, UpVal};
+import vm;
+import vm.{Ctx, Frame, Mini, NRET_ONE};
+import coro;
+import coro.{Coro};
+
+/// A thread's part of `Ctx` while another thread holds the lock (the
+/// fields from `stack` to `open_level`, and from `cur` on, but `host`).
+pub struct CtxThread {
+    /// Attached, but has not held the lock yet: `load` gives it stacks.
+    fresh: bool,
+    /// Owns its stacks (freed by `release`); the creating thread's are
+    /// the state's, freed with it.
+    owned: bool,
+    stack: *V,
+    stack_end: *V,
+    frames: *Frame,
+    frames_end: *Frame,
+    fp: *Frame,
+    base: *Frame,
+    rethrow: V,
+    open: ?Gc<UpVal>,
+    open_level: *V,
+    cur: ?Gc<Coro>,
+    main: ?Gc<Coro>,
+    nco: u32,
+    nret: u64,
+    rbuf: *V,
+    rcap: u64,
+    yielded: bool,
+    ypc: Mini.Resume,
+    ydst: u32,
+    ynres: u32,
+    xfer: *V,
+    nxfer: u64,
+}
+
+/// A record for a thread that has run nothing yet.
+pub fn new_thread() -> *CtxThread {
+    let t: *CtxThread = mem.alloc(1);
+    init_thread(t);
+    t
+}
+
+/// Make zeroed memory at `t` a record for a thread that has run nothing.
+pub fn init_thread(t: *CtxThread) {
+    t.fresh = true;
+    t.rethrow = V.Nil;
+    t.ypc = Mini.Resume.placeholder();
+}
+
+/// Move the running thread's part of `c` into `t`.
+pub fn save(c: *Ctx, t: *CtxThread) {
+    t.fresh = false;
+    t.stack = c.stack;
+    t.stack_end = c.stack_end;
+    t.frames = c.frames;
+    t.frames_end = c.frames_end;
+    t.fp = c.fp;
+    t.base = c.base;
+    t.rethrow = c.rethrow;
+    t.open = c.open;
+    t.open_level = c.open_level;
+    t.cur = Some(c.cur);
+    t.main = Some(c.main);
+    t.nco = c.nco;
+    t.nret = c.nret;
+    t.rbuf = c.rbuf;
+    t.rcap = c.rcap;
+    t.yielded = c.yielded;
+    t.ypc = c.ypc;
+    t.ydst = c.ydst;
+    t.ynres = c.ynres;
+    t.xfer = c.xfer;
+    t.nxfer = c.nxfer;
+}
+
+/// Install `t`'s part of `c` (stacks of its own if it is fresh, as
+/// large as the state's: state.lm's sizes, which are a coroutine's
+/// limits).
+pub fn load(c: *Ctx, t: *CtxThread) {
+    if t.fresh {
+        t.fresh = false;
+        t.owned = true;
+        let stack: *V = mem.alloc(vm.CO_SLOTS);
+        let frames: *Frame = mem.alloc(vm.CO_FRAMES);
+        t.stack = stack;
+        t.stack_end = stack + vm.CO_SLOTS;
+        t.frames = frames;
+        t.frames_end = frames + vm.CO_FRAMES;
+        t.fp = frames;
+        t.base = 0 as *Frame;
+        t.open = None;
+        t.open_level = 0 as *V;
+        let m = coro.new_main(&c.heap, stack, vm.CO_SLOTS, frames, vm.CO_FRAMES);
+        t.cur = Some(m);
+        t.main = Some(m);
+        t.nco = 0;
+        t.nret = NRET_ONE;
+        t.rbuf = mem.alloc(16);
+        t.rcap = 16;
+        t.yielded = false;
+        t.ydst = 0;
+        t.ynres = 0;
+        t.xfer = 0 as *V;
+        t.nxfer = 0;
+    }
+    c.stack = t.stack;
+    c.stack_end = t.stack_end;
+    c.frames = t.frames;
+    c.frames_end = t.frames_end;
+    c.fp = t.fp;
+    c.base = t.base;
+    c.rethrow = t.rethrow;
+    c.open = t.open;
+    c.open_level = t.open_level;
+    let Some(cur) = t.cur else { unreachable };
+    let Some(m) = t.main else { unreachable };
+    c.cur = cur;
+    c.main = m;
+    c.nco = t.nco;
+    c.nret = t.nret;
+    c.rbuf = t.rbuf;
+    c.rcap = t.rcap;
+    c.yielded = t.yielded;
+    c.ypc = t.ypc;
+    c.ydst = t.ydst;
+    c.ynres = t.ynres;
+    c.xfer = t.xfer;
+    c.nxfer = t.nxfer;
+}
+
+/// Mark what a saved thread references: as `vm.scan_roots` does for the
+/// running one (its frames, open upvalues, coroutines and their
+/// resumers, multiple results).
+pub fn scan(h: *gc.Heap, t: *CtxThread) {
+    if t.fresh { return; }
+    gc_mark(h, t.rethrow);
+    if let Some(u) = t.open { gc_mark(h, u); }
+    // Before its first run, the bottom frame is empty.
+    if *(t.frames as *u64) != 0 { vm.scan_frames(h, t.frames, t.fp); }
+    if let Some(m) = t.main { gc_mark(h, m); }
+    let Some(cur) = t.cur else { return; };
+    gc_mark(h, cur);
+    var s = cur.prev;
+    loop {
+        let Some(r) = s else { break; };
+        gc_mark(h, r);
+        if let Some(u) = r.open { gc_mark(h, u); }
+        vm.scan_frames(h, r.frames, r.fp);
+        s = r.prev;
+    }
+    if t.nret != NRET_ONE {
+        for i in 0..t.nret { gc_mark(h, t.rbuf[i]); }
+    }
+}
+
+/// Free the stacks of a thread that is leaving. It must run no Mini
+/// code (no frames, no open upvalues); its coroutine object is garbage.
+pub fn release(t: *CtxThread) {
+    if !t.owned { return; }
+    mem.release(t.stack);
+    mem.release(t.frames);
+    mem.release(t.rbuf);
+    t.owned = false;
+}
+
+fn hook_save(d: *u8, t: *u8) { save(d as *Ctx, t as *CtxThread); }
+fn hook_load(d: *u8, t: *u8) { load(d as *Ctx, t as *CtxThread); }
+fn hook_scan(h: *gc.Heap, d: *u8, t: *u8) { scan(h, t as *CtxThread); }
+
+/// Give state `c` (at its final address) its lock, held by the calling
+/// thread, whose part is the one in `c` now.
+pub fn init(c: *Ctx) {
+    let t = new_thread();
+    t.fresh = false;
+    c.gil = gil.Gil.new(&c.heap, t as *u8);
+    c.gil.set_hooks(gil.Hooks { data: c as *u8, save: hook_save, load: hook_load, scan: hook_scan });
+}
+
+/// Free the lock of state `c` and the calling (creating) thread's record.
+pub fn free(c: *Ctx) {
+    mem.release(c.gil.holder().data);
+    c.gil.free();
+}

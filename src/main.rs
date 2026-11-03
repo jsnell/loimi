@@ -73,6 +73,8 @@ struct Opts {
     target: Option<Target>,
     /// `--sysroot=DIR` (or `LOIMI_SYSROOT`): the target's libc and crt files.
     sysroot: Option<PathBuf>,
+    /// `--cfg NAME`: names `#[cfg(NAME)]` keeps (language.md section 1.4).
+    cfg: Vec<String>,
 }
 
 /// A `--target` triple.
@@ -115,6 +117,7 @@ const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
+                  [--cfg NAME]   (keep code marked #[cfg(NAME)], drop #[cfg(not(NAME))]; docs/language.md section 1.4)
                   [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
                   [--explain-values]   (print each value type's encoding and which tuple tests merge, then stop)
@@ -246,6 +249,7 @@ const SWITCH_LLVM_ARGS: &[&str] = &["-enable-tail-merge=false"];
 fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
+    parser::set_cfg(&opts.cfg);
     let mut modules = load(sm, input, &mut allows, opts.test)?;
     for (name, span, _) in &allows {
         if !diag::LINTS.contains(&name.as_str()) && !diag::RETIRED.contains(&name.as_str()) {
@@ -507,6 +511,7 @@ fn parse_args() -> Result<Opts, String> {
             _ => None,
         },
         sysroot: std::env::var_os("LOIMI_SYSROOT").filter(|s| !s.is_empty()).map(PathBuf::from),
+        cfg: vec![],
     };
     match cmd.as_str() {
         "build" => {}
@@ -542,6 +547,8 @@ fn parse_args() -> Result<Opts, String> {
                 })?)
             }
             s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
+            "--cfg" => o.cfg.push(args.next().ok_or("--cfg needs a name")?),
+            s if s.starts_with("--cfg=") => o.cfg.push(s["--cfg=".len()..].to_string()),
             "--vm-stats" => o.vm_stats = true,
             "--gc-check-roots" => o.gc_check_roots = true,
             "--explain-values" => o.explain_values = true,

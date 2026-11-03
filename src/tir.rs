@@ -150,6 +150,16 @@ pub enum Intr {
     /// `align 1`.
     LoadUnaligned,
     StoreUnaligned,
+    /// `p.atomic_load()` (acquire), `p.atomic_load_relaxed()`
+    /// (monotonic), `p.atomic_store(v)` (release), `p.atomic_swap(v)`,
+    /// `p.atomic_add(v)` (the old value) and `p.atomic_cas(old, new)`
+    /// (whether it stored), the last three sequentially consistent.
+    AtomicLoad,
+    AtomicLoadRelaxed,
+    AtomicStore,
+    AtomicSwap,
+    AtomicAdd,
+    AtomicCas,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
     /// The environment of a `closure fn` if it was allocated by `new(a,
