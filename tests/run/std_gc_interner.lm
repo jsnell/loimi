@@ -1,0 +1,83 @@
+// std.gc's WeakInterner: equal contents give the same object, dead
+// strings leave the table, pinned strings (`key`) stay, and the table
+// grows and is freed. Also the ready-made `gc.Str`.
+import std.io;
+import std.gc;
+import std.mem;
+import std.text;
+
+object LStr { hash: u64, tag: u32, data: [u8] }
+
+fn new_lstr(h: *gc.Heap, s: str, hv: u64) -> Gc<LStr> {
+    let o = new(h, LStr { hash: hv, tag: 7 }, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); io.println(""); }
+fn show(label: str, x: u64) { io.print(label); io.print(" "); io.print_int(x as i64); io.println(""); }
+
+struct Roots { keep: ?Gc<LStr> }
+fn scan(h: *gc.Heap, data: *u8) {
+    let r = data as *Roots;
+    if let Some(k) = r.keep { gc_mark(h, k); }
+}
+
+fn fill(t: *gc.WeakInterner<LStr>, n: u64) {
+    var b = text.StrBuf.new();
+    for i in 0..n {
+        b.clear();
+        b.fmt("s{}", i);
+        t.intern(b.as_str());
+    }
+    b.free();
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    var roots = Roots { keep: None };
+    heap.add_scanner(&roots as *u8, scan);
+    let t = gc.WeakInterner.new(&heap, new_lstr);
+    let a = t.intern("abc");
+    // expect: same object true
+    yes("same object", t.intern("abc") == a);
+    // expect: made by make true
+    yes("made by make", a.tag == 7 and a.data.eq("abc"));
+    // expect: different true
+    yes("different", t.intern("abd") != a);
+    // expect: find true
+    yes("find", t.find("abd").is_some() and t.find("zzz").is_none());
+    let k = t.intern("name");
+    let key = t.key(k);
+    // expect: key is the address true
+    yes("key is the address", key == k as u64);
+    // expect: pinned true false
+    io.print("pinned "); io.print_bool(t.is_pinned(k)); io.print(" "); io.print_bool(t.is_pinned(a)); io.println("");
+    roots.keep = Some(a);
+    fill(t, 1000);
+    // expect: before 1003
+    show("before", t.len());
+    gc.collect(&heap);
+    // The kept and the pinned strings survive; the rest died.
+    // expect: after 2
+    show("after", t.len());
+    // expect: kept true
+    yes("kept", t.find("abc").is_some() and t.intern("abc") == a);
+    // expect: pinned survives true
+    yes("pinned survives", t.find("name").is_some() and t.intern("name") as u64 == key);
+    // expect: dead gone true
+    yes("dead gone", t.find("s5").is_none() and t.find("abd").is_none());
+    // Reuse after deletion.
+    fill(t, 100);
+    // expect: refilled 102
+    show("refilled", t.len());
+    t.free();
+
+    // The ready-made string type.
+    let u = gc.WeakInterner.new(&heap, gc.new_str);
+    let x = u.intern("hello");
+    // expect: gc.Str true
+    yes("gc.Str", x.data.eq("hello") and u.intern("hello") == x);
+    u.free();
+    heap.free();
+}

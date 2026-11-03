@@ -43,6 +43,7 @@
 
 import std.mem;
 import std.io;
+import std.hash;
 
 extern "C" fn loimi_trace_object(h: *Heap, obj: *u8, tid: u32);
 extern "C" fn loimi_shadow_top() -> *ShadowFrame;
@@ -998,4 +999,229 @@ pub fn Heap.free(h: *Heap) {
     h.weaks.free();
     h.rs.objs.free();
     mem.release(h.rs);
+}
+
+// ── weak intern tables ──────────────────────────────────────────────────
+
+/// A weak intern table for strings in the GC heap: `intern(s)` returns the
+/// one live string object with contents `s` (made if there is none), so
+/// that equal strings are the same object and string equality is a
+/// pointer compare. Entries are weak: a string that nothing else
+/// references dies in the next collection and leaves the table (the next
+/// `intern` of the same contents makes a new object, at a new or reused
+/// address).
+///
+/// The string type X is the interpreter's own object, with at least the
+/// fields `hash: u64` (set by `make` to the hash it is given) and
+/// `data: [u8]`; `make(h, s, hash)` allocates one (`gc.new_str` for the
+/// ready-made `gc.Str`):
+///
+///     object LStr { hash: u64, data: [u8] }
+///     fn new_lstr(h: *gc.Heap, s: str, hv: u64) -> Gc<LStr> {
+///         let o = new(h, LStr { hash: hv }, s.len);
+///         mem.memcpy(o.data.ptr, s.ptr, s.len);
+///         o
+///     }
+///     let strings = gc.WeakInterner.new(&heap, new_lstr);
+///     let a = strings.intern("abc");      // never collects
+///
+/// Keys. A string's address is not a stable key on its own: once the
+/// string dies, another object may get its address. `key(x)` pins `x`
+/// (it stays alive, and in the table, for the table's lifetime) and
+/// returns its address, which then names the contents for good: use it
+/// for std.obj property keys and other side tables keyed by name.
+///
+/// The table lives in host memory: `new` registers it with the heap
+/// (a sweeper, and a scanner for the pinned strings); `free` releases it.
+pub struct WeakInterner<X> {
+    heap: *Heap,
+    make: fn(*Heap, str, u64) -> Gc<X>,
+    /// Open addressing over addresses: 0 empty, 1 deleted; PIN set on
+    /// pinned entries.
+    slots: *u64,
+    cap: u64,
+    /// Non-empty slots (live and deleted), live entries, pinned entries.
+    used: u64,
+    live: u64,
+    pinned: u64,
+}
+
+const WI_DEL: u64 = 1;
+const WI_PIN: u64 = 0x8000000000000000;
+const WI_ADDR: u64 = 0x7FFFFFFFFFFFFFFF;
+
+/// A ready-made GC string for `WeakInterner` (`gc.new_str` makes one).
+pub object Str { hash: u64, data: [u8] }
+
+/// The `make` function for `WeakInterner<gc.Str>`.
+pub fn new_str(h: *Heap, s: str, hv: u64) -> Gc<Str> {
+    let o = new(h, Str { hash: hv }, s.len);
+    mem.memcpy(o.data.ptr, s.ptr, s.len);
+    o
+}
+
+/// A new, empty table registered with `h`.
+pub fn WeakInterner<X>.new(h: *Heap, make: fn(*Heap, str, u64) -> Gc<X>) -> *WeakInterner<X> {
+    let t: *WeakInterner<X> = mem.alloc(1);
+    *t = WeakInterner { heap: h, make: make, slots: mem.alloc(64), cap: 64, used: 0, live: 0, pinned: 0 };
+    h.add_scanner(t as *u8, wi_scan<X>);
+    h.add_sweeper(t as *u8, wi_sweep<X>);
+    t
+}
+
+/// Unregister the table and free it (the strings stay in the heap).
+pub fn WeakInterner<X>.free(t: *WeakInterner<X>) {
+    let h = t.heap;
+    unregister(&h.scanners, t as *u8);
+    unregister(&h.sweepers, t as *u8);
+    mem.release(t.slots);
+    mem.release(t);
+}
+
+fn unregister(v: *mem.Vec<Scanner>, data: *u8) {
+    var out: u64 = 0;
+    for i in 0..v.len {
+        let e = v.at(i);
+        if e.data != data {
+            v.set(out, e);
+            out += 1;
+        }
+    }
+    v.truncate(out);
+}
+
+/// Live strings (including those that died since the last collection).
+pub fn WeakInterner<X>.len(t: *WeakInterner<X>) -> u64 { t.live }
+
+fn wi_obj<X>(a: u64) -> Gc<X> { unsafe { (a & WI_ADDR) as Gc<X> } }
+
+/// The string with contents `s`, if there is one.
+pub fn WeakInterner<X>.find(t: *WeakInterner<X>, s: str) -> ?Gc<X> {
+    let hv = hash.bytes(s);
+    let mask = t.cap - 1;
+    var i = hv & mask;
+    loop {
+        let a = t.slots[i];
+        if a == 0 { return None; }
+        if a != WI_DEL {
+            let x = wi_obj<X>(a);
+            if x.hash == hv and x.data.eq(s) { return Some(x); }
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// The string with contents `s`, made if there is none. Allocates but
+/// never collects.
+pub fn WeakInterner<X>.intern(t: *WeakInterner<X>, s: str) -> Gc<X> {
+    let hv = hash.bytes(s);
+    let mask = t.cap - 1;
+    var i = hv & mask;
+    var free = NO_SLOT;
+    loop {
+        let a = t.slots[i];
+        if a == 0 { break; }
+        if a == WI_DEL {
+            if free == NO_SLOT { free = i; }
+        } else {
+            let x = wi_obj<X>(a);
+            if x.hash == hv and x.data.eq(s) { return x; }
+        }
+        i = (i + 1) & mask;
+    }
+    let x = (t.make)(t.heap, s, hv);
+    if free != NO_SLOT {
+        t.slots[free] = x as u64;
+    } else {
+        t.slots[i] = x as u64;
+        t.used += 1;
+    }
+    t.live += 1;
+    if t.used * 2 > t.cap { wi_resize(t); }
+    x
+}
+
+const NO_SLOT: u64 = 0xFFFFFFFFFFFFFFFF;
+
+/// Pin `x` (a string from this table) and return its address: a key that
+/// names `x`'s contents for the table's lifetime.
+pub fn WeakInterner<X>.key(t: *WeakInterner<X>, x: Gc<X>) -> u64 {
+    let a = x as u64;
+    let mask = t.cap - 1;
+    var i = x.hash & mask;
+    loop {
+        let w = t.slots[i];
+        if w == 0 { abort_msg("std.gc: WeakInterner.key of a string that is not in the table"); }
+        if w & WI_ADDR == a {
+            if w & WI_PIN == 0 {
+                t.slots[i] = w | WI_PIN;
+                t.pinned += 1;
+            }
+            return a;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Whether `x` is pinned (`key`).
+pub fn WeakInterner<X>.is_pinned(t: *WeakInterner<X>, x: Gc<X>) -> bool {
+    let a = x as u64;
+    let mask = t.cap - 1;
+    var i = x.hash & mask;
+    loop {
+        let w = t.slots[i];
+        if w == 0 { return false; }
+        if w & WI_ADDR == a { return w & WI_PIN != 0; }
+        i = (i + 1) & mask;
+    }
+}
+
+fn abort_msg(m: str) {
+    write(2, m.ptr, m.len);
+    write(2, "\n".ptr, 1);
+    abort();
+}
+
+/// Rehash without deleted slots, growing if more than a quarter full.
+fn wi_resize<X>(t: *WeakInterner<X>) {
+    var cap = t.cap;
+    while t.live * 4 > cap { cap *= 2; }
+    let old = t.slots;
+    let n = t.cap;
+    t.slots = mem.alloc(cap);
+    t.cap = cap;
+    t.used = 0;
+    let mask = cap - 1;
+    for j in 0..n {
+        let w = old[j];
+        if w > WI_DEL {
+            var i = wi_obj<X>(w).hash & mask;
+            while t.slots[i] != 0 { i = (i + 1) & mask; }
+            t.slots[i] = w;
+            t.used += 1;
+        }
+    }
+    mem.release(old);
+}
+
+/// Mark the pinned strings.
+fn wi_scan<X>(h: *Heap, data: *u8) {
+    let t = data as *WeakInterner<X>;
+    if t.pinned == 0 { return; }
+    for i in 0..t.cap {
+        let w = t.slots[i];
+        if w & WI_PIN != 0 { mark_ptr(h, (w & WI_ADDR) as *u8); }
+    }
+}
+
+/// Drop the strings that died.
+fn wi_sweep<X>(h: *Heap, data: *u8) {
+    let t = data as *WeakInterner<X>;
+    for i in 0..t.cap {
+        let w = t.slots[i];
+        if w > WI_DEL and !is_marked((w & WI_ADDR) as *u8) {
+            t.slots[i] = WI_DEL;
+            t.live -= 1;
+        }
+    }
 }
