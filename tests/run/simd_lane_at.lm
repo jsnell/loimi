@@ -13,7 +13,8 @@ fn main() {
     let l = i64x2.new(-9, 9);
     var i: u32 = 0;
     while i < 16 {
-        io.print_int(b.lane_at(id(i)) as i64); io.print(" ");
+        if i > 0 { io.print(" "); }
+        io.print_int(b.lane_at(id(i)) as i64);
         i += 1;
     }
     io.println("");
