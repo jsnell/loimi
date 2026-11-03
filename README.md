@@ -19,7 +19,9 @@ from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
 0.36–0.76× of Lua's time. It is also faster than LuaJIT's hand-written
 assembly interpreter (`luajit -joff`) on 11 of them, and within 8% on
 the other three.
-See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md).
+See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md). Mini has Lua 5.4's
+coroutines too ([design and notes](examples/mini/COROUTINES.md)): on
+three public coroutine benchmarks it takes about half of PUC-Lua's time.
 
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on
 the standard library's shape and inline-cache support. On its 14

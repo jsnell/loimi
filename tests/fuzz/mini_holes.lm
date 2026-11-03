@@ -30,6 +30,7 @@ import value;
 import value.{V, Proto, Lines, Protos, UpDescs};
 import vm.{Mini, Ctx, Frame};
 import vm;
+import coro;
 
 /// A prototype for `code`, and whether the code passed Mini.verify. If it
 /// did not, the Proto holds it anyway (`build_assume_verified`): the
@@ -119,11 +120,13 @@ fn verifies(which: u8, run: bool) -> bool uses gc {
     io.println(if child_ok { "ok" } else { "rejected" });
     if !ok { return false; }
     let stack: *V = mem.alloc(nregs as u64);
+    let main = coro.new_main(h);
     var ctx = Ctx {
         heap: heap, stack: stack, stack_end: stack + nregs as u64,
         frames: mem.alloc(16), frames_end: 0 as *Frame, fp: 0 as *Frame, base: 0 as *Frame,
         globals: value.new_table(h), rethrow: V.Nil, out: text.StrBuf.new(),
         open: None, open_level: 0 as *V, host: vm.no_host,
+        cur: main, main: main, nret: vm.NRET_ONE, rbuf: mem.alloc(16), rcap: 16, ..zero
     };
     ctx.frames_end = ctx.frames + 16;
     ctx.fp = ctx.frames;

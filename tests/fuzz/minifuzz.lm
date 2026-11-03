@@ -32,6 +32,7 @@ import value;
 import value.{V, Arr, Proto, Lines, Protos, UpDescs, Closure};
 import vm.{Mini, Ctx, Frame};
 import vm;
+import coro;
 
 extern "C" fn ualarm(usecs: u32, interval: u32) -> u32;
 
@@ -368,6 +369,7 @@ fn main() -> i32 uses gc {
     var heap = gc.Heap.new();
     value.init_strings(&heap);
     let globals = value.new_table(&heap);
+    let main = coro.new_main(&heap);
     var ctx = Ctx {
         heap: heap,
         stack: 0 as *V,
@@ -382,6 +384,12 @@ fn main() -> i32 uses gc {
         open: None,
         open_level: 0 as *V,
         host: vm.no_host,
+        cur: main,
+        main: main,
+        nret: vm.NRET_ONE,
+        rbuf: mem.alloc(16),
+        rcap: 16,
+        ..zero
     };
     ctx.frames_end = ctx.frames + 16;
     // Frame 0 starts with a one-register closure (never run: RET0), until

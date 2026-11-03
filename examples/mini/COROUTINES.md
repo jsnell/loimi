@@ -56,10 +56,12 @@ and `open_level` describe.
   values: it fills `ctx.rbuf` and sets `ctx.nret`, and CALL's native path
   copies them into its result registers. Before this, every Mini native
   returned exactly one value.
-- **Values.** `V` gained `Co(Gc<Coro>)`, whose type is "thread", and
-  `Wrap(Gc<Coro>)`, a function made by `coroutine.wrap`. CALL has a cold
-  path for `Wrap` next to the one for natives. The nanbox had room for
-  both: no fast path changed.
+- **Values.** `V` gained one variant, `Co(Gc<Coro>)`. It is a thread,
+  or a function made by `coroutine.wrap`: a separate `Coro` whose `wrap`
+  field is the coroutine it resumes, so that it differs from the thread
+  that `coroutine.running()` returns inside. CALL has a cold path for it
+  next to the one for natives. Only one variant was added, not two:
+  friction 2 explains why.
 - **The main thread** has a `Coro` too (`ctx.main`, without stacks), so
   `coroutine.running()` and `status` treat it like any other thread.
 
@@ -90,7 +92,7 @@ into it.
   `ctx.cur`, `ctx.main` and the multi-result buffer.
 - **Suspended coroutines** are traced through their objects. A
   `VStack` is traced whole, including dead slots above the top (see
-  friction 3).
+  friction 4).
 - **Dead coroutines** drop their stacks, and the collector frees them.
 - **Open upvalues.** An open upvalue into a coroutine's stack has a
   `stack` field that keeps the `VStack` alive. If a suspended coroutine
@@ -102,7 +104,7 @@ into it.
   stacks and its resumers' stacks are kept in the remembered set: the
   stacks are remembered when a coroutine is switched in, and a sweeper
   (`coro.sweep`) remembers them again after every collection (friction
-  4).
+  5).
 
 **Yield across a C-call boundary.** Yield across a C-call boundary is an
 error, as in PUC-Lua for C functions without continuations: "attempt to
@@ -169,19 +171,24 @@ Mini built `--release`:
 
 | benchmark | Mini | PUC-Lua 5.4.9 | LuaJIT 2.1 `-joff` | Mini/Lua |
 |---|---|---|---|---|
-| chameneos | 0.671 s | 1.134 s | 0.451 s | 0.59 |
-| coroutine_ring | 0.716 s | 1.377 s | 0.408 s | 0.52 |
-| sieve | 0.703 s | 1.496 s | 0.532 s | 0.47 |
+| chameneos | 0.574 s | 1.010 s | 0.382 s | 0.57 |
+| coroutine_ring | 0.529 s | 1.018 s | 0.381 s | 0.52 |
+| sieve | 0.574 s | 1.116 s | 0.389 s | 0.51 |
 
 A resume/yield pair costs one native call, one nested entry, a copy of
 eight context fields each way, and the result copies. LuaJIT's
-interpreter is 1.3-1.75× faster on these benchmarks. Its resume is
+interpreter is 1.4-1.5× faster on these benchmarks. Its resume is
 assembly that switches `lua_State`s without leaving the dispatch
 loop. Mini's could do the same with a resume *op*, whose handler swaps
-the state registers itself. That is not done: see friction 6.
+the state registers itself. That is not done: see friction 7.
 
-The 14 clean-room benchmarks (`bench/mini/compare.py`), base vs this
-change: see the results at the end of this file.
+**No regression on the 14 clean-room benchmarks.** These are
+`bench/mini/compare.py`, run interleaved, best of 3, both builds with
+`--align-functions=64`. Base is the commit before coroutines. The
+geomean of new/base is 1.005, and every benchmark is within ±3%: 0.97
+(fib) to 1.024 (queens). The first version, which added two `V`
+variants, measured 1.007 by geomean but 1.04-1.06 on `hash_strings`,
+`interp` and `queens` (friction 2).
 
 ## Friction: what Loimi made hard
 
@@ -214,7 +221,39 @@ interpreter.
      mode in which the collector checks that every shadow-stack entry
      points to an allocated object, as verify mode does for heap
      references.
-2. **Entries cannot resume at a saved pc.**
+2. **Adding a value variant silently changed the encoding of the others,
+   and broke a fast path.**
+   - **What happened:** Mini's `V` had exactly 7 tagged variants. Adding
+     `Co` and `Wrap` made 9, which switched the nanbox from the classic
+     layout to the packed one. There, `Int(i32)` gets a 32-bit block
+     instead of a 48-bit one.
+   - **Two effects:**
+     - *Correctness.* Mini's compare-and-branch fast path tests "both
+       Ints" as `(a ^ bias) | (b ^ bias) < 2^48`. In the packed layout
+       that also accepts Nil and Bool, so `tests/compare_jumps.mini`
+       printed a wrong checksum. No compile-time diagnostic flagged it.
+     - *Speed.* Tuple patterns such as `(T(tab), Int(_))` no longer merge
+       into one test, because the elements have different block widths.
+       `hash_strings`, `interp` and `queens` ran 4-6% slower. Measured
+       with dummy variants on the base: the layout alone accounts for it.
+   - **Fixes made:**
+     - The fast path now tests `< 2^32`, which is right in both layouts.
+     - Compiler (`src/values.rs`): with exactly eight tagged variants and
+       one of them at most 47 bits wide, seven keep the classic blocks
+       and the narrowest takes the 47-bit block. The layout is documented
+       in lowering.md §2 and tested by `tests/run/values_nanbox_eight.lm`.
+       No other value declaration in the repository has exactly 8
+       variants.
+     - Mini merged its two new variants into one `Co`.
+   - **Suggested fixes:**
+     - Pinned tags or a minimum block width per variant (`Int(i32)
+       block 48`), which language.md lists as not built.
+     - A way for code to ask for a variant's block width
+       (`V.Int.width`), so that tricks like the int bias need not
+       hard-code 48.
+     - A note when a declaration crosses from the classic to the packed
+       layout.
+3. **Entries cannot resume at a saved pc.**
    - **Error:** `Mini.resume` needs `jump c.ypc` to continue after the
      yield's CALL, which fails with: "`Mini` is `#[require_verified]`:
      an entry starts only in verified code, `jump v` with `v:
@@ -228,7 +267,7 @@ interpreter.
      `Mini.Resume`, made only by vm code from `pc + 1` or `next_pc`, and
      accepted by an entry's `jump`. This is what language.md §10 means
      by "resuming re-enters through an entry that restores it".
-3. **No way to trace only the live part of an object.**
+4. **No way to trace only the live part of an object.**
    - **What happens:** a coroutine stack is an `object VStack { v: [V]
      }`, and the generated trace function marks every slot. That
      includes slots above the top frame, which keep dead values alive
@@ -240,7 +279,7 @@ interpreter.
    - **Suggested fix:** a per-type trace hook (`#[trace(fn)]` on an
      `object`), or a declared live length for a trailing array
      (`v: [V] live(top)`).
-4. **Raw stores into GC-object stacks need the remembered set, and no
+5. **Raw stores into GC-object stacks need the remembered set, and no
    API says "always rescan this while it is active".**
    - **The problem:** the VM stores into the running coroutine's stacks
      through raw pointers without write barriers. If such a stack is
@@ -259,18 +298,18 @@ interpreter.
      `remove_root_object`, objects traced as roots in every
      collection, minor ones included, and exempt from the barrier
      check. Or the `Root<T>` handles of gc.md §6.
-5. **No finalizers.**
+6. **No finalizers.**
    - **Effect on the stacks:** they cannot be `mem.alloc`'d like the
      main stack, because nothing would free them when a coroutine is
-     dropped. They are GC objects instead, which is the cause of items 3
-     and 4.
+     dropped. They are GC objects instead, which is the cause of items 4
+     and 5.
    - **Effect on open upvalues:** PUC-Lua closes a dropped thread's open
      upvalues when it frees the thread. Mini instead keeps the dead
      stack alive from each open upvalue (`UpVal.stack`).
    - **Suggested fix:** finalizers, or a sweeper-friendly "free this
      host block when object X dies" registration (`heap.on_free(obj,
      ptr)`).
-6. **Yield and resume can only happen where a native call happens.**
+7. **Yield and resume can only happen where a native call happens.**
    - **What Mini does:** a yield must leave the run at a point where the
      handler knows the CALL's `pc`, base and result count. Mini does it
      in CALL's native path, after the native returns, through a flag.
@@ -284,8 +323,8 @@ interpreter.
    - **Suggested fix:** language.md §10's `suspend v` (leave the loop
      with the state saved), with a matching `resume` entry form. Also
      the `std.rt` `FrameStack`/`ValueStack` that the docs sketch, with
-     growth and relocation built in (item 7).
-7. **Stacks that move.**
+     growth and relocation built in (item 8).
+8. **Stacks that move.**
    - **The work:** `grow` rebases every frame base, every open upvalue
      and four context pointers by hand.
    - **Handler state:** `reload` covers what the handlers cache, and
@@ -299,7 +338,7 @@ interpreter.
      record itself moving.
    - **Suggested fix:** a `std.rt` stack type with index-based frames
      and a relocation callback.
-8. **Mini's natives returned exactly one value.** `resume` returns `true`
+9. **Mini's natives returned exactly one value.** `resume` returns `true`
    plus the values, and `running` returns two values, so Mini needed a
    multi-result protocol (`ctx.nret`/`rbuf`). This is Mini's design, not
    Loimi's, but no example interpreter had a multi-value native ABI to
@@ -326,7 +365,8 @@ running in a loop needed small wrapper scripts.
   Interleaved coroutine runs on one C stack needed no new rooting rules.
   The only new roots are the saved records (`Saved`), walked by the
   scanner.
-- **Adding two `V` variants was a three-line change.** Exhaustiveness
-  errors pointed at every `match` to update.
-- **GC stress and verify modes found the barrier issue (4) immediately.**
-  GC stress also exposed item 1.
+- **Adding a `V` variant was a small change** (but see friction 2).
+  Exhaustiveness errors pointed at every `match` to update.
+- **GC stress and verify modes found the barrier issue (5) immediately.**
+  GC stress also exposed item 1, and the existing compare-and-branch test
+  exposed item 2.
