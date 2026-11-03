@@ -13,7 +13,9 @@
 // left out).
 //
 // Keys are u64: symbol ids (`text.Interner`) or other integers that stay
-// meaningful while shapes use them. They are not traced.
+// meaningful while shapes use them. They are not traced: the address of a
+// GC string is a key only if the string can never die (pin it with
+// `gc.WeakInterner.key`); see "Keys for guest strings" in docs/stdlib/obj.md.
 //
 // The object type is generic over the interpreter's `value` type V. The
 // ready-made `Obj<V>` and `Slots<V>` below have exactly the fields the
@@ -1136,9 +1138,11 @@ pub fn Model<O, S, V>.optimize(m: *Model<O, S, V>, o: O) {
 
 /// Read `key` through the chain, filling `h` with how to read it again
 /// (when the receiver is in fast mode and the key exists).
+/// `h.depth` tells where a found value came from (0: `o` itself, n: n
+/// prototype links up), even when there is nothing to cache.
 pub fn Model<O, S, V>.read(m: *Model<O, S, V>, o: O, key: u64, h: *Hit) -> ?V {
     *h = Hit.empty();
-    if o.dict.is_some() { return m.get_chain(o, key); }
+    if o.dict.is_some() { return m.chain_at(o, key, &h.depth); }
     if let Some(i) = m.find(o, key) {
         h.sid = o.shape.id;
         h.slot = slot_ref(i, o.inline.len as u32);
@@ -1161,6 +1165,22 @@ pub fn Model<O, S, V>.read(m: *Model<O, S, V>, o: O, key: u64, h: *Hit) -> ?V {
         let Some(q) = cur.proto else { return None; };
         cur = q;
         depth += 1;
+    }
+}
+
+/// `key` on `o` or its prototypes, with the number of prototype links
+/// from `o` to the holder in `*depth`.
+fn Model<O, S, V>.chain_at(m: *Model<O, S, V>, o: O, key: u64, depth: *u32) -> ?V {
+    var cur = o;
+    var d: u32 = 0;
+    loop {
+        if let Some(i) = m.find(cur, key) {
+            *depth = d;
+            return Some(m.load(cur, i));
+        }
+        let Some(q) = cur.proto else { return None; };
+        cur = q;
+        d += 1;
     }
 }
 
@@ -1203,6 +1223,32 @@ pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
     None
 }
 
+/// `poly_get` that also says where the value was found: `(v, depth)`,
+/// with depth 0 for an own property of `o`, n >= 1 for one found n
+/// prototype links up, and ABSENT for an absent-property hit (v is nil).
+/// For languages that treat the two differently: Lox, Python and Ruby
+/// bind a method found on the class, but not a function stored in a
+/// field (`if d != 0 { bind }`).
+pub fn Model<O, S, V>.poly_get_at(m: *Model<O, S, V>, o: O, ent: u32) -> ?(V, u32) {
+    let p = m.ic.poly.ptr + (ent - 1) as u64;
+    let sid = o.shape.id;
+    for i in 0..p.n {
+        if p.sids[i] == sid {
+            let c = p.cells[i];
+            let r = p.slots[i];
+            if r == ABSENT {
+                let Some(v) = m.absent(c) else { return None; };
+                return Some((v, ABSENT));
+            }
+            if c == 0 { return Some((m.load_ref(o, r), 0)); }
+            let d = p.depths[i];
+            let Some(v) = m.proto_load(o, r, c, d) else { return None; };
+            return Some((v, d));
+        }
+    }
+    None
+}
+
 /// A hit in the shared MegaCache (no fill).
 pub fn Model<O, S, V>.mega_get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
     let x = m.ic.mega.entry(o.shape.id, key);
@@ -1210,6 +1256,19 @@ pub fn Model<O, S, V>.mega_get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
     if x.slot == ABSENT { return m.absent(x.cell); }
     if x.cell == 0 { return Some(m.load_ref(o, x.slot)); }
     m.proto_load(o, x.slot, x.cell, x.depth)
+}
+
+/// `mega_get` with the hit's provenance, as `poly_get_at`.
+pub fn Model<O, S, V>.mega_get_at(m: *Model<O, S, V>, o: O, key: u64) -> ?(V, u32) {
+    let x = m.ic.mega.entry(o.shape.id, key);
+    if x.sid != o.shape.id or x.key != key { return None; }
+    if x.slot == ABSENT {
+        let Some(v) = m.absent(x.cell) else { return None; };
+        return Some((v, ABSENT));
+    }
+    if x.cell == 0 { return Some((m.load_ref(o, x.slot), 0)); }
+    let Some(v) = m.proto_load(o, x.slot, x.cell, x.depth) else { return None; };
+    Some((v, x.depth))
 }
 
 /// A store through the shared MegaCache (no fill): true if it holds an
@@ -1240,12 +1299,22 @@ pub fn Model<O, S, V>.has_mega(m: *Model<O, S, V>, o: O, key: u64) -> bool {
 /// Read `key` through the chain using MegaCache `c`, filling it on a miss
 /// (needs a `proto: ?O` field).
 pub fn Model<O, S, V>.read_mega(m: *Model<O, S, V>, c: *MegaCache, o: O, key: u64) -> ?V {
+    var d: u32 = 0;
+    m.read_mega_at(c, o, key, &d)
+}
+
+/// `read_mega` that also sets `*depth` as `poly_get_at` does.
+fn Model<O, S, V>.read_mega_at(m: *Model<O, S, V>, c: *MegaCache, o: O, key: u64, depth: *u32) -> ?V {
     if let Some(h) = c.get(o.shape.id, key) {
         var hh = h;
-        if let Some(v) = m.hit(o, &hh) { return Some(v); }
+        if let Some(v) = m.hit(o, &hh) {
+            *depth = if hh.slot == ABSENT { ABSENT } else { hh.depth };
+            return Some(v);
+        }
     }
     var h = Hit.empty();
     let v = m.read(o, key, &h);
+    *depth = h.depth;
     if v.is_none() { m.absent_hit(o, &h); }
     if h.sid != EMPTY_ID { c.put(key, &h); }
     v
@@ -1299,9 +1368,24 @@ fn mono_state(h: *Hit) -> IcState {
 /// polymorphic (keeping its old hit); a Poly entry that fills up starts
 /// over `ic.resets` times, then the site goes megamorphic.
 pub fn Model<O, S, V>.read_miss(m: *Model<O, S, V>, s: *Site, st: IcState, o: O, key: u64) -> (?V, IcState) {
-    if st == IcState.Mega { return (m.read_mega(&m.ic.mega, o, key), IcState.Mega); }
+    var d: u32 = 0;
+    m.read_miss_d(s, st, o, key, &d)
+}
+
+/// `read_miss` that also says where a found value came from: depth 0 for
+/// an own property of `o`, n for one n prototype links up (as
+/// `poly_get_at`).
+pub fn Model<O, S, V>.read_miss_at(m: *Model<O, S, V>, s: *Site, st: IcState, o: O, key: u64) -> (?V, IcState, u32) {
+    var d: u32 = 0;
+    let (v, st2) = m.read_miss_d(s, st, o, key, &d);
+    (v, st2, d)
+}
+
+fn Model<O, S, V>.read_miss_d(m: *Model<O, S, V>, s: *Site, st: IcState, o: O, key: u64, depth: *u32) -> (?V, IcState) {
+    if st == IcState.Mega { return (m.read_mega_at(&m.ic.mega, o, key, depth), IcState.Mega); }
     var h = Hit.empty();
     let v = m.read(o, key, &h);
+    *depth = h.depth;
     if v.is_none() {
         // Absent properties are cached in Poly entries (monomorphic
         // members cannot express them).

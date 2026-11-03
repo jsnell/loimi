@@ -67,13 +67,36 @@ puts in the `Model` are fixed or dropped:
 
 | Design option | As implemented |
 |---|---|
-| `.key` | `u64`: symbol ids (`text.Interner`) or other integers that stay meaningful while shapes use them. Keys are not traced. |
+| `.key` | `u64`: symbol ids (`text.Interner`) or other integers that stay meaningful while shapes use them. Keys are not traced: see "Keys for guest strings" below. |
 | `.attributes` | a u32 of bits per property, meaning chosen by the interpreter; no `SetError` |
 | `.prototypes` | `.in_shape`: one root shape per (prototype, inline count). Objects without prototypes use `root(n)`. |
 | `.ordered` | always: `keys` returns insertion order in both modes |
 | `.inline_slots` | per allocation: the object's `inline.len`, which must match the root shape's count (`root(n)`, `root_for(proto, n)`, `template_root(&t)`) |
 | `.dict_threshold` | `m.dict_threshold` (default 64) |
 | `.elements` | not built |
+
+### Keys for guest strings
+
+A key must name the same property for as long as any shape, cache or
+dictionary holds it. Keys are plain words that the collector does not
+see, so the address of a GC string is a key only while that string
+lives: once it dies, the next object allocated at its address would
+silently alias the property in every shape that has it. Two safe ways
+to key properties by a guest language's strings:
+
+- **Pinned interned strings** (Lox, `examples/lox`): intern every
+  string in a `gc.WeakInterner` (equal strings are one object) and use
+  `strings.key(s)` for each property name. It pins the string (kept
+  alive, and in the table, for the table's lifetime) and returns its
+  address, which then names those contents for good. The compiler pins
+  names when it makes property-name constants, so the handlers use the
+  constant's address directly.
+- **Host symbol ids** (MiniJS, `examples/minijs`): a `text.Interner`
+  maps contents to small ids that are never reused; a string object
+  caches its id (`ks.key`), computed on first use as a key.
+
+Either way, names used as keys are never freed: memory grows with the
+number of distinct property names, as in JS engines' symbol tables.
 
 ### Shapes
 
@@ -200,10 +223,30 @@ family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
   fills up starts over `m.ic.resets` times (default 8), then the site
   goes megamorphic.
 - A hit is an `obj.Hit { sid, slot, cell, depth }` of plain words: for
-  own properties `cell` is 0; for prototype hits it is the validity cell
-  of the receiver's prototype and `depth` the number of `proto` links to
-  the holder. `m.read(o, key, &hit)` fills one, `m.hit(o, &hit)` checks
-  one.
+  own properties `cell` and `depth` are 0; for prototype hits `cell` is
+  the validity cell of the receiver's prototype and `depth` the number
+  of `proto` links to the holder. `m.read(o, key, &hit)` fills one (its
+  `depth` says where the value was found even when there is nothing to
+  cache), `m.hit(o, &hit)` checks one.
+- **Where a value came from.** Languages that bind methods (Lox, Python,
+  Ruby) must tell a value found on the receiver (a field, which may hold
+  a function) from one found through its class. In the monomorphic
+  states the member says it (`Proto` vs `OwnIn`/`OwnOut`). For the
+  others, `m.poly_get_at(o, ent)` and `m.mega_get_at(o, key)` return
+  `?(V, u32)`: the value and its depth (0 own, n >= 1 found n prototype
+  links up, `obj.ABSENT` for an absent-property hit), and
+  `m.read_miss_at(..)` returns `(?V, IcState, depth)`. The depth is
+  already in the cache entry, so this costs a register:
+
+  ```loimi
+  GETPROP_POLY {
+      if let Inst(x) = o and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) {
+          if d != 0 { cold { dst = bind(ctx, o, v); next } }   // a method
+          dst = v; next
+      }
+      cold { .. }
+  }
+  ```
 - The megamorphic cache `m.ic.mega` (an `obj.MegaCache`, 4096 entries)
   is direct-mapped on (shape id, key) and holds own and prototype hits.
   It is never cleared: ids name layouts, and prototype hits carry their

@@ -1,0 +1,102 @@
+// std.obj: where a hit's value came from (`poly_get_at`, `mega_get_at`,
+// `read_miss_at`): 0 for an own property, n for one found n prototype
+// links up, ABSENT for a cached absent property. Dictionary-mode
+// receivers report it too.
+import std.io;
+import std.gc;
+import std.obj;
+
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+object Obj { shape: Gc<obj.Shape>, dict: ?Gc<obj.Dict>, overflow: ?Gc<Slots>, proto: ?Gc<Obj>, inline: [Value] }
+object Slots { data: [Value] }
+
+fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
+
+struct World { heap: gc.Heap, m: obj.Model<Gc<Obj>, Gc<Slots>, Value> }
+
+fn World.obj(w: *World, proto: ?Gc<Obj>, n: u32) -> Gc<Obj> {
+    new(&w.heap, Obj { shape: w.m.root_for(proto, n), dict: None, overflow: None, proto: proto }, n as u64)
+}
+
+fn show(label: str, r: ?(Value, u32)) {
+    io.print(label);
+    match r {
+        Some((Int(i), d)) => { io.print(" "); io.print_int(i as i64); io.print(" at "); io.print_int(if d == obj.ABSENT { -1 } else { d as i64 }); }
+        Some((Nil, d)) => { io.print(" nil at "); io.print_int(if d == obj.ABSENT { -1 } else { d as i64 }); }
+        Some(_) => io.print(" ?"),
+        None => io.print(" miss"),
+    }
+    io.println("");
+}
+
+fn show3(label: str, r: (?Value, obj.IcState, u32)) {
+    let (v, _, d) = r;
+    match v {
+        Some(x) => show(label, Some((x, d))),
+        None => show(label, None),
+    }
+}
+
+const M: u64 = 1;  // a "method" on the class
+const F: u64 = 2;  // a field
+const G: u64 = 3;  // on the grandparent
+const Z: u64 = 4;  // nowhere
+
+fn empty_site() -> obj.Site { obj.Site { sid: 0, slot: 0, cell: 0, depth: 0, ent: 0, miss: 0 } }
+
+fn main() uses gc {
+    var w = World { heap: gc.Heap.new(), m: obj.Model.new(new_slots, Value.Nil) };
+    w.m.attach(&w.heap);
+    w.m.ic.absent = true;
+    let top = w.obj(None, 1);
+    w.m.set(top, G, Value.Int(30));
+    let class = w.obj(Some(top), 1);
+    w.m.set(class, M, Value.Int(10));
+    let a = w.obj(Some(class), 2);
+    w.m.set(a, F, Value.Int(1));
+    let b = w.obj(Some(class), 2);
+    w.m.set(b, 99, Value.Int(0));
+    w.m.set(b, F, Value.Int(2));
+    w.m.set(b, M, Value.Int(3));   // shadows the method
+
+    var s = empty_site();
+    // expect: generic m 10 at 1
+    show3("generic m", w.m.read_miss_at(&s, obj.IcState.Generic, a, M));
+    // expect: refill m 3 at 0
+    show3("refill m", w.m.read_miss_at(&s, obj.IcState.Proto, b, M));
+    var i = 0;
+    while i < 10 {
+        let (_, st, _) = w.m.read_miss_at(&s, obj.IcState.Proto, if i % 2 == 0 { a } else { b }, M);
+        if st == obj.IcState.Poly { break; }
+        i += 1;
+    }
+    // expect: poly a 10 at 1
+    show("poly a", w.m.poly_get_at(a, s.ent));
+    // expect: poly b 3 at 0
+    show("poly b", w.m.poly_get_at(b, s.ent));
+
+    var s2 = empty_site();
+    w.m.read_miss_at(&s2, obj.IcState.Generic, a, Z);
+    // expect: poly absent nil at -1
+    show("poly absent", w.m.poly_get_at(a, s2.ent));
+
+    // expect: mega fill g 30 at 2
+    show3("mega fill g", w.m.read_miss_at(&s, obj.IcState.Mega, a, G));
+    // expect: mega g 30 at 2
+    show("mega g", w.m.mega_get_at(a, G));
+    w.m.read_miss_at(&s, obj.IcState.Mega, b, F);
+    // expect: mega f 2 at 0
+    show("mega f", w.m.mega_get_at(b, F));
+    // expect: mega z miss
+    show("mega z", w.m.mega_get_at(b, Z));
+
+    // A dictionary-mode receiver: nothing to cache, but the depth is known.
+    let d = w.obj(Some(class), 1);
+    w.m.set(d, F, Value.Int(7));
+    w.m.to_dict(d);
+    var s3 = empty_site();
+    // expect: dict m 10 at 1
+    show3("dict m", w.m.read_miss_at(&s3, obj.IcState.Generic, d, M));
+    // expect: dict f 7 at 0
+    show3("dict f", w.m.read_miss_at(&s3, obj.IcState.Generic, d, F));
+}
