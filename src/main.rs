@@ -5,6 +5,7 @@ mod closures;
 mod codegen;
 mod diag;
 mod elf;
+mod framelint;
 mod gcgen;
 mod generics;
 mod header;
@@ -115,7 +116,7 @@ enum Tls {
 
 const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
-                  [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc]
+                  [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc] [-W handler_frame]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--cfg NAME]   (keep code marked #[cfg(NAME)], drop #[cfg(not(NAME))]; docs/language.md section 1.4)
                   [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
@@ -246,7 +247,7 @@ const SWITCH_LLVM_ARGS: &[&str] = &["-enable-tail-merge=false"];
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
 /// The options: the LLVM options the program's dispatch modes need
 /// (`GOTO_LLVM_ARGS`, `SWITCH_LLVM_ARGS`).
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>), Diag> {
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, Vec<framelint::Site>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     parser::set_cfg(&opts.cfg);
@@ -285,6 +286,19 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         std::process::exit(0);
     }
     let prog = c.prog;
+    // Lint `handler_frame`: the tail-call handlers to check in the
+    // assembly, minus those under `#[allow(handler_frame)]`.
+    let mut frame_sites = Vec::new();
+    if opts.warn.iter().any(|w| w == "handler_frame") {
+        for vd in prog.vms.iter().filter(|v| v.dispatch == tir::Dispatch::TailCall) {
+            for op in &vd.ops {
+                let f = &prog.fns[op.fid as usize];
+                if !allowed(&Diag::warning("handler_frame", f.span, "")) {
+                    frame_sites.push(framelint::Site { symbol: f.symbol.clone(), op: op.name.clone(), span: f.span });
+                }
+            }
+        }
+    }
     let mut llvm_args: Vec<&'static str> = Vec::new();
     if prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Goto) {
         llvm_args.extend(GOTO_LLVM_ARGS);
@@ -360,7 +374,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     } else {
         ir
     };
-    Ok((ir, header, jit, llvm_args))
+    Ok((ir, header, jit, llvm_args, frame_sites))
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -646,7 +660,7 @@ fn compiler_main() -> ExitCode {
         }
     };
     let mut sm = SourceMap::default();
-    let (mut ir, header, jit, llvm_args) = match compile(&mut sm, &opts) {
+    let (mut ir, header, jit, llvm_args, frame_sites) = match compile(&mut sm, &opts) {
         Ok(r) => r,
         Err(d) => {
             eprint!("{}", sm.render(&d));
@@ -818,6 +832,36 @@ fn compiler_main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("error: cannot run {}: {}", clang, e);
+            return ExitCode::from(1);
+        }
+    }
+    // Lint `handler_frame`: the same IR to assembly, with the same options.
+    if !frame_sites.is_empty() {
+        let s = tmpdir.join(format!("{}.s", stem));
+        let mut asm = Command::new(&clang);
+        asm.arg(if opts.release { "-O3" } else { "-O1" }).arg("-Wno-override-module").args(&cross);
+        asm.arg(if opts.kind == OutKind::Exe { "-fno-pic" } else { "-fPIC" });
+        if let Some(n) = opts.align_functions {
+            asm.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
+        }
+        for a in &llvm_args {
+            asm.arg("-mllvm").arg(a);
+        }
+        asm.arg("-S").arg("-x").arg("ir").arg(&ll).arg("-o").arg(&s);
+        let text = match asm.status() {
+            Ok(st) if st.success() => std::fs::read_to_string(&s).unwrap_or_default(),
+            _ => {
+                eprintln!("error: {} failed to produce assembly for -W handler_frame", clang);
+                return ExitCode::from(1);
+            }
+        };
+        let arch = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch);
+        let ws = framelint::check(&text, arch, &frame_sites);
+        for w in &ws {
+            eprint!("{}", sm.render_as(if opts.deny_warnings { "error" } else { "warning" }, w));
+        }
+        if opts.deny_warnings && !ws.is_empty() {
+            eprintln!("error: {} warning(s) treated as errors (-W error)", ws.len());
             return ExitCode::from(1);
         }
     }

@@ -48,7 +48,7 @@ struct Gen<'p> {
 }
 
 fn short(s: &str) -> &str {
-    s.rsplit('.').next().unwrap_or(s)
+    crate::check::short_name(s)
 }
 
 fn ty_name(p: &Program, t: &Ty) -> String {

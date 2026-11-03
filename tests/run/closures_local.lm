@@ -1,0 +1,54 @@
+// A closure in a `let` is a local `block fn`: it captures by reference,
+// can be called and passed on to `block fn` parameters, and nothing else
+// (so it cannot outlive what it captures). Also: or-patterns with
+// bindings, null pointers in module-level initializers.
+import std.io;
+import std.gc;
+
+object Box { v: i64 }
+
+struct A { x: i64 }
+var NOWHERE: *A = 0 as *A;
+var PAIR: (i64, *A) = (7, 0 as *A);
+
+enum E { And(i64, i64), Or(i64, i64), Not(i64), Lit(bool) }
+
+fn eval(e: E) -> i64 {
+    match e {
+        And(a, b) | Or(b, a) if a > 0 => a * 10 + b,
+        And(a, _) | Or(_, a) | Not(a) => -a,
+        Lit(_) => 0,
+    }
+}
+
+fn twice(f: block fn(i64) -> i64, x: i64) -> i64 { f(f(x)) }
+
+fn main() uses gc {
+    var total = 0;
+    let add = |x: i64| { total += x; total };
+    add(5);
+    add(7);
+    io.print_int(total); io.println("");
+    let scale = 3;
+    let mul = |x: i64| x * scale;
+    io.print_int(twice(mul, 2)); io.println("");
+    io.print_int(mul(add(1))); io.println("");
+    // A closure that collects, capturing a traced local.
+    var heap = gc.Heap.new();
+    heap.set_stress(true);
+    let b = new(&heap, Box { v: 40 });
+    let bump = |n: i64| -> i64 {
+        let junk = new(&heap, Box { v: n });
+        gc.collect(&heap);
+        b.v + junk.v
+    };
+    io.print_int(bump(2)); io.println("");
+    io.print_int(eval(E.And(2, 3)) + eval(E.Or(4, 1)) + eval(E.And(-1, 9)) + eval(E.Not(6))); io.println("");
+    io.print_bool(NOWHERE as u64 == 0); io.print(" "); io.print_int(PAIR.0); io.println("");
+}
+// expect: 12
+// expect: 18
+// expect: 39
+// expect: 42
+// expect: 32
+// expect: true 7

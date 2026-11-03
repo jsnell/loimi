@@ -1,0 +1,50 @@
+// args: --release -W handler_frame
+// Lint `handler_frame` (opt-in): an op whose fast path sets up a stack
+// frame, found in the generated assembly, with the calls that cause it.
+// A call in a `cold` block (outlined) does not count, nor does one in
+// `if c { cold { .. } }` followed by a control word (the rest of the op
+// is copied into the cold block, which is then outlined), nor an op under
+// `#[allow(handler_frame)]`.
+// expect-stderr: warning[handler_frame]: op `SLOW` sets up a stack frame on its fast path
+// expect-stderr: `main.work`
+// expect-no-stderr: op `RARE`
+// expect-no-stderr: op `CHECK`
+// expect-no-stderr: op `ALLOWED`
+// expect-no-stderr: op `END`
+// expect: 113
+import std.io;
+
+struct M { n: i64 }
+
+#[inline(never)]
+fn work(m: *M) { m.n += 100; }
+
+vm V {
+    context ctx: *M;
+    state { pc: *u32 }
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+
+    op SLOW() : A { work(ctx); next }
+    op RARE(x: imm) : A {
+        if x == 0 { ctx.n += 1; next }
+        cold { work(ctx); next }
+    }
+    op CHECK() : A {
+        if unlikely(ctx.n > 1000000) { cold { work(ctx); } }
+        ctx.n += 10;
+        next
+    }
+    #[allow(handler_frame)]
+    op ALLOWED() : A { work(ctx); ctx.n -= 100; next }
+    op END() : A { exit ctx.n }
+
+    entry run(m: *M, code: *u32) -> i64 { ctx = m; pc = code; jump pc }
+}
+
+fn main() {
+    var m = M { n: 0 };
+    var code: [u32; 7] = [V.SLOW(), V.RARE(0), V.RARE(0), V.CHECK(), V.ALLOWED(), V.RARE(0), V.END()];
+    let r = V.run(&m, &code[0]);
+    io.print_int(r); io.println("");
+}

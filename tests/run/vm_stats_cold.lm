@@ -1,0 +1,54 @@
+// args: --vm-stats
+// matrix: dispatch
+// `--vm-stats` counts entries into each `cold` block: outlined ones,
+// inline ones (falling through), and those in vm functions (named by
+// the function), with the op and the block's source location.
+// expect-stderr: cold blocks entered:
+// expect-stderr: 3  STEP (cold block at 
+// expect-stderr: 2  MAYBE (cold block at 
+// expect-stderr: 5  fn slow (cold block at 
+// expect-stderr: vm_stats_cold.lm:31:9)
+// expect-stderr: vm_stats_cold.lm:33:48)
+// expect-stderr: vm_stats_cold.lm:26:23)
+// expect-no-stderr: lm:34:
+// expect: 39
+import std.io;
+
+struct C { n: i64 }
+
+vm V {
+    context ctx: *C;
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+
+    fn slow(x: i64) { cold { ctx.n += x; } }
+
+    op STEP(x: reg, k: imm) : A {
+        x = x + 1;
+        if k == 0 { next }
+        cold { slow(1); x = x + 10; next }
+    }
+    op MAYBE(x: reg, k: imm) : A { if k == 1 { cold { x = x - 1; } } slow(2); next }
+    op NEVER(x: reg) : A { if x > 100000 { cold { x = 0; } } next }
+    op RET(x: reg) : A { exit x + ctx.n }
+    entry run(c: *C, code: *u32, regs: *i64) -> i64 { ctx = c; pc = code; r = regs; jump pc }
+}
+
+fn main() {
+    var code: [u32; 8] = [0; 8];
+    var at: u64 = 0;
+    let s = code[..];
+    at = V.emit.STEP(s, at, 0, 1);
+    at = V.emit.STEP(s, at, 0, 1);
+    at = V.emit.STEP(s, at, 0, 0);
+    at = V.emit.STEP(s, at, 0, 1);
+    at = V.emit.MAYBE(s, at, 0, 1);
+    at = V.emit.MAYBE(s, at, 0, 1);
+    at = V.emit.NEVER(s, at, 0);
+    at = V.emit.RET(s, at, 0);
+    var regs: [i64; 4] = [0; 4];
+    var c = C { n: 0 };
+    io.print_int(V.run(&c, &code[0], &regs[0])); io.println("");
+}

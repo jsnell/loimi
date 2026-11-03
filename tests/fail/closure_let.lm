@@ -1,2 +1,3 @@
-fn main() { let f = |x: i64| x + 1; }
-// error: a closure can only be an argument for a `block fn` parameter
+// A closure in a `let` is a local `block fn`: it cannot be copied (or stored).
+fn main() { let f = |x: i64| x + 1; let g = f; }
+// error: `f` is a `block fn`: it can only be called, or passed on as an argument for a `block fn` parameter

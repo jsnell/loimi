@@ -162,6 +162,10 @@ pub struct Checker<'a> {
     /// Functions declared `#[unsafe]` (`Vm.assume_verified`): naming one
     /// needs an `unsafe { }` block.
     pub unsafe_fns: std::collections::HashSet<FnId>,
+    /// A vm op's encoder functions (`V__OP`, `V__emit_OP`, by short name):
+    /// the number of leading non-operand parameters, and per operand a
+    /// note saying which format field it is (for mismatched arguments).
+    pub encoder_notes: HashMap<String, (usize, Vec<String>)>,
     /// The file declaring each struct: fields whose names start with `__`
     /// are private to it (the generated `Vm__Verified` is built only by
     /// the vm's own generated functions).
@@ -257,6 +261,7 @@ impl<'a> Checker<'a> {
             closure_count: 0,
             unsafe_fns: Default::default(),
             struct_files: HashMap::new(),
+            encoder_notes: HashMap::new(),
         }
     }
 
@@ -544,14 +549,14 @@ impl<'a> Checker<'a> {
             let ty = self.resolve_type(m, &g.ty)?;
             let mut cx = FnCx::new(m, Ty::Unit);
             let v = self.expr(&mut cx, &g.value, Some(&ty))?;
-            let init = fold_deep(&self.coerce(v, &ty)?);
+            let init = null_ptrs(fold_deep(&self.enum_casts(self.coerce(v, &ty)?)));
             if let Some(d) = const_overflow(&init) {
                 return Err(d);
             }
             if let Some(bad) = self.static_init_error(&init) {
                 return Err(Diag::new(
                     bad,
-                    "the initializer of a module-level `var` must be a constant expression (literals, `[x; N]`, struct, tuple, array and enum literals of constants, functions)",
+                    "the initializer of a module-level `var` must be a constant expression (literals, `[x; N]`, struct, tuple, array and enum literals of constants, functions, `0 as *T`)",
                 ));
             }
             let symbol = format!("{}.{}", self.module_prefix(m), g.name.name);
@@ -867,6 +872,22 @@ impl<'a> Checker<'a> {
     // ── types ───────────────────────────────────────────────────────
 
     pub fn ty_name(&self, t: &Ty) -> String {
+        self.ty_name_q(t, false)
+    }
+
+    /// As `ty_name`; with `q`, struct, enum and value types are named
+    /// with their modules (`m2.Handler`), for the names of generic
+    /// instances that would otherwise collide (`Checker::unique_name`).
+    pub fn ty_name_q(&self, t: &Ty, q: bool) -> String {
+        if q {
+            match t {
+                Ty::Struct(i) => return self.prog.structs[*i as usize].name.clone(),
+                Ty::Enum(i) => return self.prog.enums[*i as usize].name.clone(),
+                Ty::Value(i) => return self.prog.values[*i as usize].name.clone(),
+                _ => {}
+            }
+        }
+        let tn = |t: &Ty| self.ty_name_q(t, q);
         match t {
             Ty::Int(it) => format!("{}{}", if it.signed { "i" } else { "u" }, it.bits),
             Ty::F32 => "f32".into(),
@@ -874,16 +895,16 @@ impl<'a> Checker<'a> {
             Ty::Bool => "bool".into(),
             Ty::Unit => "()".into(),
             Ty::Never => "never".into(),
-            Ty::Ptr(t) => format!("*{}", self.ty_name(t)),
-            Ty::Slice(t) => format!("[]{}", self.ty_name(t)),
-            Ty::Array(t, n) => format!("[{}; {}]", self.ty_name(t), n),
-            Ty::Option(t) => format!("?{}", self.ty_name(t)),
-            Ty::Result(a, b) => format!("Result<{}, {}>", self.ty_name(a), self.ty_name(b)),
-            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", ")),
+            Ty::Ptr(t) => format!("*{}", tn(t)),
+            Ty::Slice(t) => format!("[]{}", tn(t)),
+            Ty::Array(t, n) => format!("[{}; {}]", tn(t), n),
+            Ty::Option(t) => format!("?{}", tn(t)),
+            Ty::Result(a, b) => format!("Result<{}, {}>", tn(a), tn(b)),
+            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", ")),
             Ty::Fn(ps, r, e) => format!(
                 "fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
             Ty::Struct(i) => {
@@ -900,18 +921,18 @@ impl<'a> Checker<'a> {
             Ty::Enum(i) => short(&self.prog.enums[*i as usize].name),
             Ty::Value(i) => short(&self.prog.values[*i as usize].name),
             Ty::Param(i) => format!("?T{}", i),
-            Ty::Gc(t) => format!("Gc<{}>", self.ty_name(t)),
+            Ty::Gc(t) => format!("Gc<{}>", tn(t)),
             Ty::Opaque(o) => self.traits.opaques[*o as usize].name.clone(),
             Ty::Closure(ps, r, e) => format!(
                 "closure fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
             Ty::Block(ps, r, e) => format!(
                 "block fn({}) -> {}{}",
-                ps.iter().map(|t| self.ty_name(t)).collect::<Vec<_>>().join(", "),
-                self.ty_name(r),
+                ps.iter().map(|t| tn(t)).collect::<Vec<_>>().join(", "),
+                tn(r),
                 if *e == 0 { String::new() } else { format!(" uses {}", effect_name(*e)) }
             ),
         }
@@ -1271,7 +1292,7 @@ impl<'a> Checker<'a> {
         let ty = self.resolve_type(m, &decl.ty)?;
         let mut cx = FnCx::new(m, Ty::Unit);
         let v = self.expr(&mut cx, &decl.value, Some(&ty))?;
-        let v = fold_deep(&self.coerce(v, &ty)?);
+        let v = fold_deep(&self.enum_casts(self.coerce(v, &ty)?));
         if let Some(d) = const_overflow(&v) {
             return Err(d);
         }
@@ -1281,6 +1302,36 @@ impl<'a> Checker<'a> {
         self.consts[id as usize].value = Some(v.clone());
         self.consts[id as usize].busy = false;
         Ok(v)
+    }
+
+    /// In a constant expression: `Kind.Name as u32` (a payload-free
+    /// variant cast to an integer) is the variant's discriminant.
+    fn enum_casts(&self, mut e: TExpr) -> TExpr {
+        let take = |x: &mut TExpr| std::mem::replace(x, TExpr { ty: Ty::Unit, kind: TK::Unit, span: Span::default() });
+        match &mut e.kind {
+            TK::Cast(inner) => {
+                if let (Ty::Int(it), Ty::Enum(id), TK::Variant(idx, es)) = (&e.ty, &inner.ty, &inner.kind) {
+                    if es.is_empty() {
+                        let d = self.prog.enums[*id as usize].variants[*idx as usize].discr;
+                        e.kind = TK::Int(wrap_int(d, *it));
+                        return e;
+                    }
+                }
+                **inner = self.enum_casts(take(inner));
+            }
+            TK::Unary(_, a) => **a = self.enum_casts(take(a)),
+            TK::Binary(_, a, b) => {
+                **a = self.enum_casts(take(a));
+                **b = self.enum_casts(take(b));
+            }
+            TK::Struct(es) | TK::Tuple(es) | TK::Array(es) | TK::Variant(_, es) => {
+                for x in es.iter_mut() {
+                    *x = self.enum_casts(take(x));
+                }
+            }
+            _ => {}
+        }
+        e
     }
 
     pub fn coerce(&self, e: TExpr, want: &Ty) -> Res<TExpr> {
@@ -1376,6 +1427,31 @@ impl<'a> Checker<'a> {
                         None => None,
                     };
                     let init = match init {
+                        // `let f = |x: T| ..;`: a local `block fn`, with the
+                        // rules of a `block fn` parameter (it can only be
+                        // called or passed on), so it cannot outlive the
+                        // locals it captures.
+                        Some(e @ Expr { kind: ExprKind::Closure(ps, ..), .. })
+                            if decl_ty.is_none() && matches!(pat.kind, PatKind::Ident(..)) =>
+                        {
+                            if *mutable {
+                                return Err(Diag::new(*span, "a local closure is a `block fn`: declare it with `let`, not `var`"));
+                            }
+                            // Without effects if the body allows (so it can be
+                            // passed to any `block fn` parameter), else with
+                            // the enclosing function's.
+                            let want = |eff| Ty::Block(vec![Ty::Param(HOLE); ps.len()], Box::new(Ty::Param(HOLE)), eff);
+                            let (nscopes, nloops) = (cx.scopes.len(), cx.loops.len());
+                            match self.block_arg(cx, e, &want(0)) {
+                                Ok(v) => Some(v),
+                                Err(_) if cx.effects != 0 => {
+                                    cx.scopes.truncate(nscopes);
+                                    cx.loops.truncate(nloops);
+                                    Some(self.block_arg(cx, e, &want(cx.effects))?)
+                                }
+                                Err(d) => return Err(d),
+                            }
+                        }
                         Some(e) => {
                             let v = self.expr(cx, e, decl_ty.as_ref())?;
                             Some(match &decl_ty {
@@ -1711,7 +1787,7 @@ impl<'a> Checker<'a> {
                     out.push(self.pat(cx, a, ty, mutable)?);
                 }
                 if cx.locals.len() != before {
-                    return Err(Diag::new(p.span, "bindings in `|` patterns are not supported"));
+                    return Err(Diag::new(p.span, "bindings in `|` patterns are only supported at the top of a `match` arm (`A(x) | B(x) => ..`)"));
                 }
                 TPK::Or(out)
             }
@@ -2187,7 +2263,17 @@ impl<'a> Checker<'a> {
                 cx.scopes.pop();
                 cx.loops.pop();
                 cx.scopes.pop();
-                let b = b?;
+                // A range of literals is i64: say so where a mismatch may
+                // come from it.
+                let literal_range = ann.is_none() && is_literal_expr(lo) && is_literal_expr(hi);
+                let b = b.map_err(|d| {
+                    if literal_range && d.msg.starts_with("mismatched types") && d.msg.contains(&format!("`{}`", self.ty_name(&ity))) {
+                        let t = self.ty_name(&ity);
+                        d.note(lo.span.to(hi.span), format!("`{}` is `{}`: its range has only literals; write `for {}: T in ..` for another type", var.name, t, var.name))
+                    } else {
+                        d
+                    }
+                })?;
                 let local = |id| mk(ity.clone(), TK::Local(id), span);
                 let cond = mk(Ty::Bool, TK::Binary(BinOp::Lt, Box::new(local(ctr)), Box::new(local(end))), span);
                 let inner = mk(
@@ -2325,7 +2411,7 @@ impl<'a> Checker<'a> {
             ExprKind::TypeArgs(inner, targs) => self.type_args_value(cx, inner, targs, span),
             ExprKind::Closure(..) => Err(Diag::new(
                 span,
-                "a closure can only be an argument for a `block fn` parameter (`fn f(cb: block fn(i64) -> bool)`), or escape when created with `new(arena, |..| ..)` or `new(heap, |..| ..)`",
+                "a closure can only be an argument for a `block fn` parameter (`fn f(cb: block fn(i64) -> bool)`), a local (`let f = |x: i64| ..;`, called or passed on), or escape when created with `new(arena, |..| ..)` or `new(heap, |..| ..)`",
             )),
             ExprKind::SizeOf(t) => {
                 let _ = self.resolve_type(cx.module, t)?;
@@ -2500,6 +2586,32 @@ impl<'a> Checker<'a> {
 
     fn match_expr(&mut self, cx: &mut FnCx, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>, span: Span) -> Res<TExpr> {
         let s = self.expr(cx, scrut, None)?;
+        // An arm `P1 | P2 => body` whose alternatives bind names is one
+        // arm per alternative, with the same guard and body (the body is
+        // compiled once per alternative).
+        let binds = |c: &mut Self, p: &Pat| {
+            let mut q = cx.probe();
+            q.scopes.push(vec![]);
+            let before = q.locals.len();
+            c.pat(&mut q, p, &s.ty, false).is_ok() && q.locals.len() != before
+        };
+        let mut split: Option<Vec<Arm>> = None;
+        for (i, arm) in arms.iter().enumerate() {
+            let alts = match &arm.pat.kind {
+                PatKind::Or(alts) if alts.iter().any(|a| binds(self, a)) => Some(alts),
+                _ => None,
+            };
+            if let Some(alts) = alts {
+                let v = split.get_or_insert_with(|| arms[..i].to_vec());
+                v.extend(alts.iter().map(|a| Arm { pat: a.clone(), guard: arm.guard.clone(), body: arm.body.clone() }));
+            } else if let Some(v) = &mut split {
+                v.push(arm.clone());
+            }
+        }
+        let arms: &[Arm] = match &split {
+            Some(v) => v,
+            None => arms,
+        };
         let mut ty: Option<Ty> = exp.cloned();
         let mut tarms = Vec::new();
         for arm in arms {
@@ -2697,6 +2809,11 @@ impl<'a> Checker<'a> {
                 " (`{}` is a control word: it is only available in op handlers, vm functions, entries and `on raise`)",
                 name
             ),
+            "std" => " (std modules are used through an import: `import std.lex;`, then `lex.push_utf8(..)`)".to_string(),
+            // A module loaded for another file, not imported here.
+            _ if self.modules.iter().any(|m| m.path.len() == 2 && m.path[0] == "std" && m.path[1] == name) => {
+                format!(" (add `import std.{};`)", name)
+            }
             _ => String::new(),
         };
         Err(Diag::new(span, format!("unknown name `{}`{}", name, hint)))
@@ -2713,7 +2830,7 @@ impl<'a> Checker<'a> {
             _ => return Ok(()),
         };
         if cx.unsafe_depth == 0 {
-            let name = name.rsplit('.').next().unwrap_or(&name).replace("__", ".");
+            let name = short_name(&name).replace("__", ".");
             return Err(Diag::new(
                 span,
                 format!("`{}` is unsafe: nothing checks what it promises; wrap the call in `unsafe {{ }}`", name),
@@ -2884,7 +3001,7 @@ impl<'a> Checker<'a> {
         match self.struct_files.get(&sid) {
             Some(&file) if file != f.span.file => {
                 let sname = self.prog.structs[sid as usize].name.clone();
-                let sname = sname.rsplit('.').next().unwrap_or(&sname).replace("__", ".");
+                let sname = short_name(&sname).replace("__", ".");
                 Err(Diag::new(
                     f.span,
                     format!("field `{}` of `{}` is private to the file that declares it", f.name, sname),
@@ -3306,7 +3423,17 @@ impl<'a> Checker<'a> {
                 if matches!(pt, Ty::Block(..)) {
                     pre.push(self.block_arg(cx, a, &pt)?);
                 } else {
-                    pre.push(self.expr_coerce(cx, a, &pt)?);
+                    let v = self.expr_coerce(cx, a, &pt).map_err(|d| {
+                        let TK::FnRef(id) = f.kind else { return d };
+                        match self.encoder_notes.get(short_name(&self.prog.fns[id as usize].name)) {
+                            Some((lead, notes)) if pi >= *lead && pi - lead < notes.len() && d.msg.starts_with("mismatched types") => {
+                                let n = notes[pi - lead].clone();
+                                d.note(a.span, n)
+                            }
+                            _ => d,
+                        }
+                    })?;
+                    pre.push(v);
                 }
             } else {
                 let mut v = self.expr(cx, a, None)?;
@@ -4050,8 +4177,44 @@ pub fn placeholder_fn(span: Span) -> FnDef {
     }
 }
 
+/// In a constant initializer, `0 as *T` (a null pointer, as `..zero`
+/// makes) is a zeroed value.
+fn null_ptrs(mut e: TExpr) -> TExpr {
+    match &mut e.kind {
+        TK::Cast(inner) if matches!(e.ty, Ty::Ptr(_)) && matches!(inner.kind, TK::Int(0)) => {
+            e.kind = TK::Zeroed;
+        }
+        TK::Struct(es) | TK::Tuple(es) | TK::Array(es) | TK::Variant(_, es) => {
+            for x in es.iter_mut() {
+                *x = null_ptrs(std::mem::replace(x, TExpr { ty: Ty::Unit, kind: TK::Unit, span: Span::default() }));
+            }
+        }
+        TK::ArrayRepeat(v, _) => {
+            **v = null_ptrs(std::mem::replace(&mut **v, TExpr { ty: Ty::Unit, kind: TK::Unit, span: Span::default() }));
+        }
+        _ => {}
+    }
+    e
+}
+
 fn short(s: &str) -> String {
-    s.rsplit('.').next().unwrap_or(s).to_string()
+    short_name(s).to_string()
+}
+
+/// The last component of a dotted name, ignoring dots inside `<..>`:
+/// `std.mem.Vec<m1.Handler>` is `Vec<m1.Handler>`.
+pub fn short_name(s: &str) -> &str {
+    let mut depth = 0i32;
+    let mut cut = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            '.' if depth == 0 => cut = i + 1,
+            _ => {}
+        }
+    }
+    &s[cut..]
 }
 
 pub fn effects_of(attrs: &Attrs) -> Res<u8> {

@@ -540,6 +540,33 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
                 Some(cn) => Some(caches.iter().position(|ci: &CacheInfo| ci.name == cn.name).unwrap()),
                 None => None,
             };
+            // For mismatched arguments of the op's encoders
+            // (`V.OP(..)`, `V.emit.OP(..)`): which field each operand is.
+            if let Some(fd) = d.formats.iter().find(|f| f.name.name == od.format.name) {
+                let fields: Vec<&crate::vmast::FormatField> = fd.fields.iter().filter(|f| f.name.name != "op").collect();
+                let notes: Vec<String> = od
+                    .params
+                    .iter()
+                    .zip(&fields)
+                    .map(|(p, f)| {
+                        let mut n = format!(
+                            "operand `{}` of `{}` is field `{}` of format `{}` ({} bits): operands take the format's fields in order",
+                            p.name.name, od.name.name, f.name.name, fd.name.name, f.bits
+                        );
+                        if od.params.len() < fields.len() {
+                            n.push_str(&format!(
+                                " (`{}` has {} operand(s) for {} fields; a placeholder operand such as `z: imm` moves the next ones along)",
+                                od.name.name,
+                                od.params.len(),
+                                fields.len()
+                            ));
+                        }
+                        n
+                    })
+                    .collect();
+                c.encoder_notes.insert(format!("{}__{}", d.name.name, od.name.name), (0, notes.clone()));
+                c.encoder_notes.insert(format!("{}__emit_{}", d.name.name, od.name.name), (2, notes));
+            }
             (
                 od.format.name.clone(),
                 cache,
@@ -1623,7 +1650,29 @@ pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<O
         return Err(Diag::new(span, "`cache` on its own can only be passed to a vm function parameter declared `cache Name`"));
     }
     if name == "next_pc" {
+        // In an op with `then OP`, `next` continues at the `then`
+        // instruction (a JMP that takes the branch), which is rarely the
+        // return address meant: warn, and point at `then_next_pc`.
+        if let Some(op) = h.op {
+            let info = &c.vms[h.vm as usize];
+            if let (Some(t), None) = (info.ops[op].then, h.part) {
+                c.warnings.push(Diag::warning(
+                    "next_pc_then",
+                    span,
+                    format!(
+                        "in op `{}` (`then {}`), `next_pc` is the address of the `{}` instruction, where `next` continues; for the address after it, write `then_next_pc`{}",
+                        info.ops[op].name,
+                        info.ops[t].name,
+                        info.ops[t].name,
+                        if h.in_fn { " in the op and pass it in" } else { "" }
+                    ),
+                ));
+            }
+        }
         return next_pc(c, &h, span).map(Some);
+    }
+    if name == "then_next_pc" {
+        return then_next_pc(c, &h, span).map(Some);
     }
     if name == "next_resume" {
         // `next_pc` as a resume point: the address of the next instruction
@@ -1682,6 +1731,33 @@ fn next_pc(c: &mut Checker, h: &HandlerCx, span: Span) -> Res<TExpr> {
             "`next_pc` (the address `next` continues at) is only available where `next` is: op handlers and the `-> never` vm functions they call",
         ));
     };
+    Ok(mk(pc_ty, TK::Intrinsic(Intr::PtrOffset, vec![pc, n]), span))
+}
+
+/// `then_next_pc`, in an op with `then OP`: the address after the `then`
+/// instruction (where `next` would continue from it), the op's `pc` plus
+/// its size plus the `then` op's size.
+fn then_next_pc(c: &mut Checker, h: &HandlerCx, span: Span) -> Res<TExpr> {
+    let vmi = h.vm as usize;
+    let op = match h.op {
+        Some(op) if !h.in_fn && h.part.is_none() && h.allow_control => op,
+        _ => {
+            return Err(Diag::new(
+                span,
+                "`then_next_pc` is only available in op handlers (not in vm functions or superinstruction parts: pass it as an argument)",
+            ))
+        }
+    };
+    let Some(t) = c.vms[vmi].ops[op].then else {
+        return Err(Diag::new(
+            span,
+            format!("op `{}` does not declare `then OP`; `next_pc` is the address after it", c.vms[vmi].ops[op].name),
+        ));
+    };
+    let size = c.vms[vmi].ops[op].size + c.vms[vmi].ops[t].size;
+    let pc_ty = c.vms[vmi].state[c.vms[vmi].pc_idx].1.clone();
+    let pc = mk(pc_ty.clone(), TK::Local(h.state[c.vms[vmi].pc_idx]), span);
+    let n = mk(Ty::i64(), TK::Int(size as i128), span);
     Ok(mk(pc_ty, TK::Intrinsic(Intr::PtrOffset, vec![pc, n]), span))
 }
 

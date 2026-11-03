@@ -499,7 +499,7 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
                 }
             }
             match (name.as_str(), t.get(i + 1).map(|x| &x.tok)) {
-                ("next" | "pc" | "next_pc" | "next_resume", _) => f.direct = true,
+                ("next" | "pc" | "next_pc" | "then_next_pc" | "next_resume", _) => f.direct = true,
                 ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
                 (_, Some(Tok::Punct("("))) => f.calls.push((name.clone(), call_args(t, i + 1))),
                 _ => {}

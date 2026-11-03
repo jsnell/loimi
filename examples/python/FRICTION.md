@@ -12,6 +12,26 @@ formatting (f-strings, `%`, `.format`). I did not read `examples/*`
 until the interpreter passed its tests (see the end of this file for
 whether they would have helped).
 
+## Follow-up (what has been done since)
+
+This report is kept as written. Since then:
+
+| # | Status |
+|---|---|
+| 1 | Fixed: generic instances over two types of the same name from different modules get different names. An instance keeps the short names of its arguments (`std.mem.Vec<Handler>`) unless another instance already has that name; then its arguments are named with their modules (`std.mem.Vec<vm.Handler>`), so programs without a collision keep their symbols (the IR of every example is byte-identical). Types, function and method instances (methods are named after the receiver instance), nested instances and same-named generic types as arguments: `tests/run/same_name_generics.lm`. |
+| 2 | Not addressed here (other work covers `BigInt` and an ordered map). |
+| 3 | Unchanged. |
+| 4 | Partly a misreading, now documented: a `cold` block that falls through is outlined when the rest of its enclosing block ends in a control word (`if unlikely(..) { cold { gc.collect(..); } } ..; next`): the compiler copies that rest into it. That already held for MAKECELL and the other ops here (with or without `redo`); their frames come from the allocation's `gc.refill` and the barrier's `remember` on the fast path. It does not hold in a plain vm function (`gc_point`), which has no rest to copy (language.md section 4 and tutorial chapter 7 now say so). Outlining fall-through blocks as returning `preserve_most` calls (captures and changed state through thread-locals) was judged not worth its cost for that one pattern. |
+| 5 | Fixed (opt-in): lint `handler_frame`, `loimi build --release -W handler_frame`, compiles the IR to assembly a second time and reports each tail-call handler whose fall-through path sets up a frame, with the calls in it as likely causes, panics with their messages: ``op `LOADCELL` sets up a stack frame on its fast path (`pushq %rbp`) ..: `std.gc.refill`, `ops.exc_of`, a panic (`examples/python/ops.lm:111:15: unwrap of None`)`` (50 handlers here; 40 in Mini, 67 MiniJS, 12 Scheme). Making panic paths in handlers tail calls to a handler-shaped stub was tried and measured: it removed the frame of 1 of the 218 handlers with one across the seven interpreters (the others make other calls too), so it was not kept. |
+| 6 | Not addressed here (other work covers the barrier's call). |
+| 7 | Fixed: `then_next_pc`, the address after an op's `then` instruction, in ops declared `then OP`; `next_pc` in such an op (or a vm function inlined into it) warns (`next_pc_then`), since it is the `then` word's address (language.md section 3.5). FORITER uses `then_next_pc` (same IR). A generators section is not written. |
+| 8 | Unchanged. |
+| 9 | Fixed: `mem.try_sort_by(p, n, less)` / `Vec.try_sort_by(less)`, a stable sort whose comparator returns `Result<bool, E>` and is `uses reenter`; it sorts indices and permutes once, so elements stay in place (reachable) while guest code runs, and the data is unchanged on error (stdlib.md). `sorted`/`list.sort` use it (the 40-line merge sort is gone). Mini's `table.sort` cannot: it reproduces Lua's quicksort (unstable, and its "invalid order function" detection depends on that algorithm). |
+| 10 | Mostly fixed: `0 as *T` in global initializers; enum-to-int casts in constants (they failed whenever the constant was used); `A(a, b) \| B(a, b) =>` with bindings (one arm per alternative); `let f = \|x: T\| ..;` is a local `block fn` (called or passed on, never stored, so it cannot outlive its captures); a mismatch in the body of `for j in 0..3` notes that `j` is `i64`; `unknown name std` (and an unimported std module that is loaded) suggests the import; a mismatched encoder argument notes which format field the operand is ("operand `name` of `DELGLOBAL` is field `a` of format `ABx` (8 bits) .. a placeholder operand such as `z: imm` moves the next ones along"). Literal-only expressions are still typed `i64` without context. |
+| 11 | Unchanged. |
+| 12 | Unchanged (by design). |
+| 13 | Fixed: `--vm-stats` counts entries into each `cold` block, per op, with its source location (`CALL (cold block at examples/python/vm.lm:681:9)`; blocks in plain vm functions under `fn name`), at no cost without `--vm-stats` (language.md section 7.3). richards: LOADMETHOD_CALLMETHOD's slow path 1.6M times, CALL's 0.99M. |
+
 ## Summary
 
 | | |

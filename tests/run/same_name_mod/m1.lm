@@ -1,0 +1,5 @@
+// A `Handler` for same_name_generics.lm (another one is in m2.lm).
+pub struct Handler { start: i64, end: i64 }
+pub enum Kind { A, B }
+pub struct Box<T> { v: T }
+pub fn wrap<T>(v: T) -> Box<T> { return Box { v: v }; }

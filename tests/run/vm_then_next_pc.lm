@@ -1,0 +1,76 @@
+// matrix: dispatch
+// In an op with `then OP`, `next` continues at the `then` instruction, and
+// so does `next_pc` (with a warning, `next_pc_then`); `then_next_pc` is
+// the address after the `then` instruction. Also in a superinstruction's
+// last part.
+// expect-stderr: warning[next_pc_then]: in op `SAVE` (`then JMP`), `next_pc` is the address of the `JMP` instruction
+// expect-stderr: warning[next_pc_then]: in op `SAVE` (`then JMP`), `next_pc` is the address of the `JMP` instruction, where `next` continues; for the address after it, write `then_next_pc` in the op and pass it in
+// expect-no-stderr: op `QUIET`
+// expect: 55
+// expect: 1 2 1
+import std.io;
+
+struct Ctx { at_next: i64, at_after: i64, at_fn: i64, base: *u32 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    fn word_of(p: *u32) -> i64 { ((p as u64 - ctx.base as u64) / 4) as i64 }
+    fn save_fn(after: *u32) -> never { ctx.at_fn = word_of(next_pc); jump after }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + b; next }
+    op JMP(target: label) : sJ { jump target }
+    // Loop while a < b: the JMP jumps back; past it is the exit.
+    op LT(a: reg, b: reg) : ABC then JMP {
+        if a < b { next }
+        jump then_next_pc
+    }
+    op SAVE() : ABC then JMP {
+        ctx.at_next = word_of(next_pc);
+        ctx.at_after = word_of(then_next_pc);
+        save_fn(then_next_pc)
+    }
+    #[allow(next_pc_then)]
+    op QUIET() : ABC then JMP { ctx.at_next = word_of(next_pc) - 1 + 1; jump then_next_pc }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_LT = ADD; LT;
+
+    entry run(c: *Ctx, code: *u32, r: *i64) -> i64 { ctx = c; pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 8] = [0; 8];
+    var cx = Ctx { at_next: 0, at_after: 0, at_fn: 0, base: &code[0] };
+    let c = code[..];
+    // SAVE; JMP; r0 = 0; r1 = 10; r2 = 0; loop: r2 += 1; r0 += r2; if r2 < r1 goto loop; ret r0
+    var at: u64 = 0;
+    at = V.emit.SAVE(c, at);
+    at = V.emit.JMP(c, at, 0);
+    at = V.emit.LOADI(c, at, 0, 0);
+    at = V.emit.LOADI(c, at, 1, 10);
+    at = V.emit.LOADI(c, at, 2, 0);
+    at = V.emit.LOADI(c, at, 3, 1);
+    let top = at;
+    at = V.emit.ADD(c, at, 2, 2, 3);
+    at = V.emit.ADD(c, at, 0, 0, 2);
+    at = V.emit.LT(c, at, 2, 1);
+    at = V.emit.JMP(c, at, (top as i64 - at as i64) as i32);
+    at = V.emit.RET(c, at, 0);
+    let r = V.run(&cx, &code[0], &regs[0]);
+    io.print_int(r); io.println("");
+    io.print_int(cx.at_next); io.print(" "); io.print_int(cx.at_after); io.print(" "); io.print_int(cx.at_fn); io.println("");
+}

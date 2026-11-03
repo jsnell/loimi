@@ -1,0 +1,20 @@
+// A payload-free variant cast to an integer is a constant expression:
+// in `const`s (also declared before the enum), arrays of them, and
+// module-level initializers.
+import std.io;
+
+pub const K: u32 = B.X as u32;
+pub const K2: u32 = (B.Y as u32) * 10 + 1;
+const ARR: [u8; 3] = [B.Y as u8, B.X as u8, B.W as u8];
+var G: (i64, u16) = (C.Hi as i64, C.Lo as u16);
+
+pub enum B { W, X, Y }
+enum C: i32 { Lo = -2, Hi = 70000 }
+
+fn main() {
+    io.print_int(K as i64); io.print(" ");
+    io.print_int(K2 as i64); io.print(" ");
+    io.print_int(ARR[0] as i64 + ARR[1] as i64 * 10); io.print(" ");
+    io.print_int(G.0); io.print(" "); io.print_int(G.1 as i64); io.println("");
+}
+// expect: 1 21 12 70000 65534

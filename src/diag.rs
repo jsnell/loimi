@@ -26,7 +26,7 @@ pub struct Diag {
 }
 
 /// The warnings the compiler knows, for `#[allow(..)]`.
-pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc", "unreachable_arm", "value_layout"];
+pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc", "unreachable_arm", "value_layout", "handler_frame", "next_pc_then"];
 
 /// Lints that no longer exist, still accepted by `#[allow(..)]` (which
 /// then has no effect) so that code naming them keeps building:
@@ -35,7 +35,7 @@ pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc", "unreac
 pub const RETIRED: &[&str] = &["state_root"];
 
 /// Lints that are off unless turned on with `-W name`.
-pub const OPT_IN: &[&str] = &["hot_gc"];
+pub const OPT_IN: &[&str] = &["hot_gc", "handler_frame"];
 
 impl Diag {
     pub fn new(span: Span, msg: impl Into<String>) -> Diag {
