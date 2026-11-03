@@ -687,7 +687,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     Const => { t.write_const(h, a.ty, a.x); }
                     _ => {}
                 }
-                t.emit_def(W.SELECT(h as u16, rb as u16, rc as u16), h);
+                t.emit(W.SELECT(h as u16, rb as u16, rc as u16));
             }
             t.push_home(ty);
         }

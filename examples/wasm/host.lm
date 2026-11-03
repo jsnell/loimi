@@ -43,7 +43,7 @@ var TII: [u8; 2] = [0x7F, 0x7F];
 var TIII: [u8; 3] = [0x7F, 0x7F, 0x7F];
 var TIIII: [u8; 4] = [0x7F, 0x7F, 0x7F, 0x7F];
 var TILI: [u8; 3] = [0x7F, 0x7E, 0x7F];
-var TIILII: [u8; 5] = [0x7F, 0x7F, 0x7E, 0x7F, 0x7F];
+var TILII: [u8; 4] = [0x7F, 0x7E, 0x7F, 0x7F];
 
 pub fn spectest(e: *Engine) -> *ModInst {
     let mi = ModInst.new();
@@ -166,7 +166,7 @@ pub fn wasi(e: *Engine) -> *ModInst {
     mi.add_func("clock_time_get", e.host_func(TILI[0..3], TI[0..1], clock_time_get, 0));
     mi.add_func("fd_fdstat_get", e.host_func(TII[0..2], TI[0..1], fd_fdstat_get, 0));
     mi.add_func("fd_close", e.host_func(TI[0..1], TI[0..1], ebadf, 0));
-    mi.add_func("fd_seek", e.host_func(TIILII[0..5], TI[0..1], ebadf, 0));
+    mi.add_func("fd_seek", e.host_func(TILII[0..4], TI[0..1], ebadf, 0));
     mi.add_func("fd_read", e.host_func(TIIII[0..4], TI[0..1], ebadf, 0));
     mi.add_func("fd_prestat_get", e.host_func(TII[0..2], TI[0..1], ebadf, 0));
     mi.add_func("fd_prestat_dir_name", e.host_func(TIII[0..3], TI[0..1], ebadf, 0));
