@@ -1,0 +1,11 @@
+// With -W error, a layout that narrows unpinned blocks fails the build:
+// adding a ninth variant cannot silently change how the others are encoded.
+// args: -W error
+// error: `V` has 9 tagged variants, more than the classic nanbox layout holds
+struct Obj { id: i64 }
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32), Nil, Bool(bool),
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj), F(*Obj),
+}
+fn main() {}

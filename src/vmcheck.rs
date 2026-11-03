@@ -63,6 +63,9 @@ pub struct VmInfo {
     pub fn_calls: Vec<(FnId, FnId)>,
     /// The generated proof type `Vm__Verified` (`Verified<Vm>`).
     pub verified: u32,
+    /// The generated resume point type `Vm__Resume` (`Vm.Resume`), if the
+    /// program uses resume points (vmexpand's `uses_resume`).
+    pub resume: Option<u32>,
     /// `#[require_verified]`: entries start only in verified code (`jump v`
     /// with `v: Verified<Vm>`), unless inside `unsafe { }`.
     pub require_verified: bool,
@@ -740,6 +743,10 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         verified: match c.scopes[m].get(&format!("{}__Verified", d.name.name)) {
             Some((Def::Struct(sid), _)) => *sid,
             _ => unreachable!("vmexpand generates Vm__Verified"),
+        },
+        resume: match c.scopes[m].get(&format!("{}__Resume", d.name.name)) {
+            Some((Def::Struct(sid), _)) => Some(*sid),
+            _ => None,
         },
         require_verified: d.attrs.has("require_verified"),
         collects: None,
@@ -1489,12 +1496,20 @@ pub fn check_vm_expr(c: &mut Checker, cx: &mut FnCx, v: &VmExpr, exp: Option<&Ty
                 let start = mk(Ty::Ptr(Box::new(wt)), TK::Field(Box::new(code), 0), sp);
                 return never(TVm::Jump(Box::new(c.coerce(start, &pc_ty)?)));
             }
+            // `jump r` with `r: Vm.Resume`: an instruction boundary of
+            // verified code, saved by vm code (`next_resume`).
+            if c.vms[vmi].resume.is_some_and(|r| te.ty == Ty::Struct(r)) {
+                let sp = te.span;
+                let wt = Ty::Int(c.vms[vmi].word);
+                let at = mk(Ty::Ptr(Box::new(wt)), TK::Field(Box::new(te), 0), sp);
+                return never(TVm::Jump(Box::new(c.coerce(at, &pc_ty)?)));
+            }
             if h.entry && c.vms[vmi].require_verified && cx.unsafe_depth == 0 {
                 let vname = c.vms[vmi].name.clone();
                 return Err(Diag::new(
                     t.span,
                     format!(
-                        "`{vname}` is `#[require_verified]`: an entry starts only in verified code, `jump v` with `v: Verified<{vname}>` (from `{vname}.verify`); found `{}`",
+                        "`{vname}` is `#[require_verified]`: an entry starts only in verified code, `jump v` with `v: Verified<{vname}>` (from `{vname}.verify`) or `v: {vname}.Resume` (from `next_resume`); found `{}`",
                         c.ty_name(&te.ty)
                     ),
                 ));
@@ -1609,6 +1624,16 @@ pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<O
     }
     if name == "next_pc" {
         return next_pc(c, &h, span).map(Some);
+    }
+    if name == "next_resume" {
+        // `next_pc` as a resume point: the address of the next instruction
+        // of verified code (the verifier rejects code whose last
+        // instruction reads it, as it rejects one that uses `next`).
+        let at = next_pc(c, &h, span).map_err(|_| {
+            Diag::new(span, "`next_resume` (where `next` continues, as a resume point) is only available where `next` is: op handlers and the `-> never` vm functions they call")
+        })?;
+        let rsid = c.vms[h.vm as usize].resume.expect("vmexpand generates Vm__Resume where `next_resume` appears");
+        return Ok(Some(mk(Ty::Struct(rsid), TK::Struct(vec![at]), span)));
     }
     if let Some((_, kind, raw)) = h.operands.iter().find(|(n, _, _)| n == name) {
         let body = c.vms[h.vm as usize].kinds[*kind].body.clone();

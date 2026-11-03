@@ -757,8 +757,9 @@ Available representations:
 | `boxed` | Two words `{tag, payload}`, passed and returned in two registers | PUC Lua (`TValue`) |
 | `pointer` | **Not built:** everything is a `Gc<_>` with a header type tag | CPython |
 
-The compiler chooses tag assignments, or you can pin them
-(`Int(i32) = tag 0b001`; **Not built:** pinning). In return you get:
+The compiler chooses tag assignments. You can pin a variant's block
+width (`Int(i32) block 48`, below; **Not built:** pinning the tag
+itself, `Int(i32) = tag 0b001`). In return you get:
 
 - **Constructors and patterns.** `Int(3)`, `match v { Int(x) => ... }`, and
   `if v is Nil` (**Not built:** `is`; write `if let Nil = v`). No macros.
@@ -786,7 +787,7 @@ payloads are as wide as their type says, so `Int(i48)` keeps 48 bits and
 
 | `repr` | Payloads | Tagged variants |
 |---|---|---|
-| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word). |
+| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word; `block N` sets the size). |
 | `lowtag` | integers up to 61 bits (`i61`), `bool`, pointers (8-byte aligned) | Up to 8 with any payloads. Beyond 8, pointers and 61-bit integers take one 3-bit tag each, and a variant with an N-bit payload can have a tag of up to 64 - N bits, so narrow variants share what is left. |
 | `boxed` | any number, `bool`, pointers | any number |
 
@@ -802,6 +803,65 @@ compare (`(v >> w) == tag` in a nanbox, `(v & mask) == tag` in a lowtag,
 unsigned compare, and tuple patterns whose elements have tags in the same
 position merge into one test. Extracting a pointer is one `and`. See
 [lowering.md](lowering.md) section 2 for the encodings.
+
+**Seeing and pinning the layout.** Whether two variants' tests merge,
+and what a raw word looks like, depends on the layout, and the layout
+depends on how many variants there are. So adding a variant can change
+the encoding of the others: Mini's ninth variant moved `Int(i32)` from a
+48-bit block to a 32-bit one, which split its tuple tests in two and
+broke a fast path that tested raw words
+(examples/mini/COROUTINES.md, friction 2). Four things keep that from
+happening silently:
+
+- **`loimi build --explain-values`** prints every value type's layout
+  and stops: each variant's block width, mask, tag and words, and which
+  variants' tests merge in a tuple pattern (those with the same block
+  width) and which do not.
+- **`block N`** after a variant pins its block width: the payload bits
+  below the tag in a nanbox (from the payload's width to 48; pointers
+  take 48), the bits above the tag in a lowtag (to 61; pointers take
+  61). The layout honours it or the declaration is an error ("no room
+  for variant"). Pinning `Int(i32) block 48` keeps Int's tests merging
+  with the pointers' however many variants follow; pinning a variant
+  narrower than the classic width selects the packed layout.
+- **The `value_layout` warning.** When a declaration has too many
+  variants for the classic layout, every variant whose block is
+  narrower than the classic 48 bits (61 in a lowtag) must be pinned at
+  its width, or the compiler warns, naming them. So a new variant that
+  narrows others is a warning, and an error under `-W error`; pin the
+  widths to accept them (`Nil block 0`), or `#[allow(value_layout)]`.
+- **Encoding constants**, for code that tests raw words:
+  `V.Int.mask` (the bits that identify the variant), `V.Int.tag` (their
+  value: a word `w` holds `Int` exactly when `w & V.Int.mask ==
+  V.Int.tag`), `V.Int.block` (the block width), and `V.Num.limit` for
+  the `unboxed` variant (its words are those below it). They are
+  constants, so tests built from them cost what hand-written ones do,
+  and they follow the layout.
+
+<!-- snippet: run "both ints" -->
+```loimi
+import std.io;
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32) block 48,      // the classic block, whatever comes later
+    Nil block 0,            // one word, in the 47-bit block
+    Bool(bool),
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj),
+}
+
+// Two Ints, tested and ordered without extracting the payloads: the
+// biased words have no bits under the mask exactly for Ints.
+fn both_ints(a: V, b: V) -> bool {
+    let bias = V.Int(-2147483648) as u64;
+    (((a as u64 ^ bias) | (b as u64 ^ bias)) & V.Int.mask) == 0
+}
+
+fn main() {
+    if both_ints(V.Int(1), V.Int(-2)) and !both_ints(V.Int(1), V.Nil) { io.println("both ints"); }
+}
+```
 
 Switching `repr` is a one-word change, which makes the representation
 something you can benchmark rather than something you commit to on day one.
@@ -1288,7 +1348,9 @@ Rules for `-> never` vm functions:
   nothing would catch it. `next_pc` is available where `next` is (op
   handlers, and `-> never` vm functions reached from them; a shared copy
   gets the size from its caller, like `next`). It is an ordinary name:
-  a local or state variable called `next_pc` hides it.
+  a local or state variable called `next_pc` hides it. `next_resume`
+  is the same address as a `Vm.Resume`, a resume point that an entry
+  may jump to (section 6).
 - The body sees the vm state and its own parameters, but not the caller's
   operands: pass `dst.raw` or values as arguments. `become` is not
   allowed, since it belongs to the calling op, and neither is `cache`;
@@ -1728,6 +1790,89 @@ are made structural by the data: a prototype whose code is verified
 (a `Verified<Mini>` field, or a verified array, below) has no raw code
 to jump to, so `jump p.code` in CALL reaches only verified functions.
 Mini, Scheme and MiniJS do this.
+
+**Resume points.** An entry may also continue in the middle of verified
+code, where an earlier run left it: after a coroutine's yield, say.
+`Mini.Resume` is the proof for that: an instruction boundary of
+verified code, and `jump r` with `r: Mini.Resume` is allowed in an
+entry under `#[require_verified]`. There are two ways to get one:
+
+- **`next_resume`**, in vm code: `next_pc` (the address `next` continues
+  at, section 3.5) as a `Mini.Resume`, available where `next` is (op
+  handlers and the `-> never` vm functions they call, also as shared
+  copies). The running code is verified and the next instruction
+  exists: the verifier rejects code whose last instruction mentions
+  `next_pc` or `next_resume`, as it rejects one that uses `next`.
+- **`v.resume_at(i) -> ?Mini.Resume`**, on a `Verified<Mini>`: the
+  instruction starting at word `i`, or None if no instruction starts
+  there. It walks the code from its start, so it costs a pass over the
+  words before `i` (for host code such as a debugger, not a hot path).
+
+`r.pc()` reads the address. `Mini.Resume.placeholder()` is a resume
+point at the trap word of `Mini.placeholder()`, for a slot that needs a
+value before there is anything to resume: jumping to it traps.
+`unsafe { Mini.assume_resume(p) }` makes one from a raw pointer, like
+`assume_verified`.
+
+<!-- snippet: excerpt examples/mini/vm.lm -->
+```loimi
+fn yield_exit(base: u64, nres: u64) -> never {
+    ctx.nret = NRET_ONE;
+    ctx.ypc = next_resume;
+    ctx.ydst = base as u32;
+    ctx.ynres = nres as u32;
+    ctx.fp = fp;
+    exit Ok(Nil)
+}
+```
+
+and the entry that continues the coroutine:
+
+<!-- snippet: excerpt examples/mini/vm.lm -->
+```loimi
+entry resume(c: *Ctx, vals: *V, n: u64) -> Result<V, V> uses reenter {
+    ctx = c;
+    fp = c.fp;
+    regs = fp.base;
+    k = fp.k;
+    let dst = regs + c.ydst as u64;
+    for i in 0..c.ynres as u64 { dst[i] = if i < n { vals[i] } else { V.Nil }; }
+    // The instruction after the yield's CALL: a resume point, which
+    // only vm code makes (`next_resume`), so `#[require_verified]`
+    // lets the entry jump to it.
+    jump c.ypc
+}
+```
+
+What is checked, and when:
+
+- *At compile time:* only `next_resume`, `resume_at`, `placeholder` and
+  the `#[unsafe]` `assume_resume` build a `Mini.Resume`. Its field is
+  private to the vm's generated code, so a struct literal cannot forge
+  one, and `..zero` cannot make a null one: a slot that starts empty
+  holds `Mini.Resume.placeholder()` (or is a `?Mini.Resume`). The type
+  is per vm: another vm's entry cannot jump to it.
+- *At verification time:* that code cannot end with an instruction that
+  saves its successor (so `next_resume` always names an instruction).
+- *At run time:* `resume_at` checks the boundary, and the placeholder
+  traps; nothing else is.
+
+What is not checked is the same as for return addresses (`jump
+fp.resume`) and for a `Verified<Mini>` kept outside its object: that
+the code is still there when the point is used, and that the state the
+entry installs (registers, constants, frame) belongs to that code. A
+resume point is an address, not a reference: it does not keep a code
+object alive, so the vm keeps the code reachable while it holds one
+(Mini's suspended coroutine keeps its frames, whose closures hold the
+prototypes). Rewriting verified code in place (`become`, `optimize`,
+`deopt`) keeps every boundary a boundary, so a resume point survives
+quickening. As with `Verified`, the proof is about the type: raw
+pointer casts, which Loimi allows without `unsafe`, can still forge
+anything.
+
+The types and functions are generated only for programs that mention
+them (`next_resume`, `Resume`, `resume_at` or `assume_resume`), so other
+programs compile exactly as before.
 
 **Verified code in an object.** An `object` can hold its code as its
 trailing array, marked as verified by a vm:
@@ -2470,7 +2615,11 @@ calls are implemented as nested entries (below).
   state saved, and resuming re-enters through an entry that restores it.
   Suspending across a host frame is an error (as with Lua's "yield across a
   C-call boundary") unless the coroutine runs on a `std.rt.Fiber`, which has
-  its own stack.
+  its own stack. *Built today:* Mini's coroutines (examples/mini/COROUTINES.md)
+  do this by hand with nested entries. The yield saves `next_resume` and
+  leaves the run with `exit`; the resume is an entry that reinstalls the
+  coroutine's frame and jumps to that resume point (section 6), which
+  `#[require_verified]` accepts.
 
 ### 10.1 Embedding in a C host (implemented)
 

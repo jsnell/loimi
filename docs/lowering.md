@@ -79,6 +79,20 @@ the `i32` would get a 32-bit block, and such tests split in two (Mini's
 added variants; examples/mini/COROUTINES.md). `NUM` is
 `0xFFF8_8000_0000_0000`.
 
+**Pinned blocks (`block N`).** A pinned variant needs a block of `N`
+bits instead of its payload width. The classic layout is used only if
+no pin is narrower than 48 bits; the eight-variant layout only if at
+most one is, and that one takes the 47-bit block (unpinned variants
+pinned at 48 never do); otherwise the packed layout allocates the pinned
+widths. Mini pins `Int(i32) block 48` and `Nil block 0`: the same
+eight-variant layout as without pins, and a ninth variant would move
+only unpinned narrow variants. After choosing, the compiler warns
+(`value_layout`) about every unpinned variant whose block is narrower
+than 48 bits, so a layout change caused by a new variant never goes
+unnoticed. `V.X.mask` is `!(2^w - 1)` and `V.X.tag` is `T << w`
+(`w` = `V.X.block`); `V.Num.limit` is `NUM`. `--explain-values` prints
+all of them.
+
 **Packed layout (more than 8 tagged variants, or 8 with no payload under 48 bits).** Each variant needs a block
 of 2^w words, where `w` is its payload width: 48 for pointers, `N` for
 `iN`/`uN`, 1 for `bool`, 0 for no payload. The free space is the seven
@@ -117,6 +131,8 @@ Pattern tests (`T` is the variant's tag, `w` its block width):
 Tuple elements with tags in the same position (same `w`) merge into one
 test; elements with different widths are tested separately and the results
 and-ed. A tuple pattern of `k` values usually costs one test, not `k`.
+`--explain-values` lists the variants by block width: each line is one
+test.
 
 ### `lowtag`
 
@@ -126,6 +142,9 @@ aligned) are or-ed with it, integers of up to 61 bits are shifted by 3.
 With more, pointers and 61-bit integers take 3-bit tags, and a variant with
 an `N`-bit payload gets a tag of `64 - N` bits allocated from what is left
 (the same buddy allocator, where splitting a tag appends a 0 or a 1 bit).
+`block N` asks for a tag of `64 - N` bits (and a pin below 61 selects
+this layout); `V.X.mask` is `2^s - 1` and `V.X.tag` the tag, and
+`V.X.block` is `64 - s`.
 
 | Pattern | Test |
 |---|---|
@@ -860,6 +879,26 @@ field read. The checks are all at compile time: the `__` field is
 private to the vm's expansion file, `#[unsafe]` functions need an
 `unsafe { }` block, and `#[require_verified]` is checked on each
 entry's `jump` (vmcheck).
+
+`Vm.Resume` (resume points) is `Vm__Resume { __pc: *W }`, one pointer.
+`next_resume` is `next_pc` wrapped in it (`pc` plus the op's size, or
+plus the size argument in a vm function's shared copy), and `jump r`
+lowers to the field, as a raw `jump`. So Mini's resume entry
+(`jump c.ypc` with `ypc: Mini.Resume`) is the same code as the
+`unsafe { jump c.ypc }` it replaced, and the struct has the layout of
+the `*u32` field it replaced. (Keeping it in a `?Mini.Resume` instead
+made `Ctx` 8 bytes longer, which moved the fields after it and cost
+3% on `fib`, whose code was otherwise identical: placement noise
+that `Mini.Resume.placeholder()` avoids.) `v.resume_at(i)` is a
+generated loop that steps through the code by `Vm.base_size`
+(superinstruction parts are instructions)
+until it reaches or passes `i`. The verifier's "may continue" scan (the
+code cannot end with such an instruction) counts `next_pc` and
+`next_resume` as reads of `pc`. Before resume points it missed
+`next_pc`, so code that ended with a call op saving `next_pc` (Lox's
+calls) passed verification. The `Vm__Resume` items are generated only
+when some source file names them, so other programs' IR does not
+change.
 
 Where the proof is stored is the interpreter's choice, and that can
 cost. A `Verified` field in the prototype is a `{ ptr, len }` that

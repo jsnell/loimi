@@ -1,0 +1,52 @@
+// `--explain-values` prints each value type's layout and which tuple
+// tests merge, then stops. `V` has nine tagged variants, so the packed
+// layout narrows the unpinned `Bool`, which the `value_layout` warning
+// reports; `Int` is pinned to its classic 48-bit block.
+// args: --explain-values
+// expect-stderr: warning[value_layout]: `V` has 9 tagged variants
+// expect-stderr: `Bool(bool) block 1` (or `block 48` to keep the classic block)
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32) block 48,
+    Nil block 0,
+    Bool(bool),
+    A(*Obj), B(*Obj), C(*Obj), D(*Obj), E(*Obj), G(*Obj),
+}
+
+value L repr lowtag { Int(i61), Nil, R(*Obj) }
+
+value X repr boxed { Int(i64), Nil }
+
+fn main() {}
+// expect: value main.V repr nanbox: packed layout, 9 tagged variants
+// expect:   more than 8 tagged variants (or 8 with none narrower than 48 bits, or narrow blocks pinned): blocks sized to the payloads (or to `block N`), allocated widest first
+// expect:   Num(f64)    unboxed: the words below 0xFFF8_8000_0000_0000 (`limit`)
+// expect:   Int(i32)    block 48 (pinned)  mask 0xFFFF_0000_0000_0000  tag 0xFFF9_0000_0000_0000  words 0xFFF9_0000_0000_0000 ..= 0xFFF9_FFFF_FFFF_FFFF
+// expect:   Nil         block  0 (pinned)  mask 0xFFFF_FFFF_FFFF_FFFF  tag 0xFFF8_8000_0000_0002  the word 0xFFF8_8000_0000_0002
+// expect:   Bool(bool)  block  1           mask 0xFFFF_FFFF_FFFF_FFFE  tag 0xFFF8_8000_0000_0000  words 0xFFF8_8000_0000_0000 ..= 0xFFF8_8000_0000_0001
+// expect:   A(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFA_0000_0000_0000  words 0xFFFA_0000_0000_0000 ..= 0xFFFA_FFFF_FFFF_FFFF
+// expect:   B(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFB_0000_0000_0000  words 0xFFFB_0000_0000_0000 ..= 0xFFFB_FFFF_FFFF_FFFF
+// expect:   C(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFC_0000_0000_0000  words 0xFFFC_0000_0000_0000 ..= 0xFFFC_FFFF_FFFF_FFFF
+// expect:   D(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFD_0000_0000_0000  words 0xFFFD_0000_0000_0000 ..= 0xFFFD_FFFF_FFFF_FFFF
+// expect:   E(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFE_0000_0000_0000  words 0xFFFE_0000_0000_0000 ..= 0xFFFE_FFFF_FFFF_FFFF
+// expect:   G(*Obj)     block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFF_0000_0000_0000  words 0xFFFF_0000_0000_0000 ..= 0xFFFF_FFFF_FFFF_FFFF
+// expect:   tuple patterns: elements whose variants have the same block width merge into one test, ((a ^ tag) | (b ^ tag') | ..) & mask == 0:
+// expect:     block 48: Int, A, B, C, D, E, G
+// expect:     block  1: Bool
+// expect:     block  0: Nil
+// expect:     unboxed:  Num  (umax(a, b, ..) < limit)
+// expect:   elements from different lines do not merge (their tags sit at different bits): one test per line, and-ed
+// expect: value main.L repr lowtag: classic layout, 3 tagged variants
+// expect:   every variant has a 3-bit tag (the variant's index) below a 61-bit block
+// expect:   Int(i61)  block 61           mask 0x0000_0000_0000_0007  tag 0x0000_0000_0000_0000  words whose low 3 bits are 0b0
+// expect:   Nil       block 61           mask 0x0000_0000_0000_0007  tag 0x0000_0000_0000_0001  words whose low 3 bits are 0b1
+// expect:   R(*Obj)   block 61           mask 0x0000_0000_0000_0007  tag 0x0000_0000_0000_0002  words whose low 3 bits are 0b10
+// expect:   tuple patterns: elements whose variants have the same block width merge into one test, ((a ^ tag) | (b ^ tag') | ..) & mask == 0:
+// expect:     block 61: Int, Nil, R
+// expect: value main.X repr boxed: boxed layout, 2 tagged variants
+// expect:   a tag word and a payload word
+// expect:   Int(i64)  tag 0
+// expect:   Nil       tag 1
+// expect:   tuple patterns test each element's tag word separately

@@ -1,0 +1,5 @@
+// A pointer always takes a whole block.
+// error: `block 32` is out of range for `R`: a pointer takes a whole 48-bit block
+struct Obj { id: i64 }
+value V repr nanbox { Num(f64) unboxed, R(*Obj) block 32, Nil }
+fn main() {}

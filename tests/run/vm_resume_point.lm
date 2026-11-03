@@ -1,0 +1,135 @@
+// matrix: dispatch
+// Resume points (`V.Resume`): an op saves `next_resume`, the instruction
+// after itself, and leaves the run; a `#[require_verified]` entry later
+// continues there with `jump r`, no `unsafe`. Also: `next_resume` past an
+// op with a cache word and from the shared copy of a vm function (a
+// call from a cold block), `r.pc()`, `V.Resume.placeholder()`,
+// `Verified.resume_at` (only at instruction boundaries), and the
+// verifier rejecting code whose last instruction saves `next_pc` or
+// `next_resume` (it would resume past the end).
+import std.io;
+
+struct Proto { nregs: u32 }
+struct Ctx { at: ?V.Resume, raw: *u32 }
+
+#[require_verified]
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+    }
+    cache Pad { x: u32 }
+
+    /// Leave the run; a resume continues after the calling op.
+    fn suspend(v: i64) -> never {
+        ctx.at = Some(next_resume);
+        exit v
+    }
+    #[inline(never)]
+    fn suspend_shared(v: i64) -> never { suspend(v) }
+
+    op INC(a: reg) : ABC { a = a + 1; next }
+    op YIELD(a: reg) : ABC { suspend(a) }
+    op YIELD_IC(a: reg) : ABC + Pad { cache.x += 1; suspend(a) }
+    op YIELD_COLD(a: reg) : ABC { cold { suspend_shared(a) } }
+    /// Saves a raw return address (no `next`, no `pc`): may continue too.
+    op SAVE() : ABC { ctx.raw = next_pc; exit 0 }
+    op RET(a: reg) : ABC { exit a }
+
+    entry start(c: *Ctx, code: Verified<V>, r: *i64) -> i64 { ctx = c; regs = r; jump code }
+    entry resume(c: *Ctx, r: *i64) -> i64 {
+        ctx = c;
+        regs = r;
+        let Some(at) = c.at else { exit -1 };
+        jump at
+    }
+}
+
+fn show(r: Result<Verified<V>, V.VerifyError>) {
+    match r {
+        Ok(_) => io.println("ok"),
+        Err(e) => { io.print("bad at "); io.print_int(e.at as i64); io.print(": "); io.println(e.message()); }
+    }
+}
+
+fn main() {
+    var p = Proto { nregs: 2 };
+    var code: [u32; 16] = [0; 16];
+    var regs: [i64; 2] = [0; 2];
+    let c = code[..];
+    // 0: INC r0; 1: YIELD r0; 2: INC r0; 3: YIELD_IC r0 (+1 cache word);
+    // 5: INC r0; 6: YIELD_COLD r0; 7: INC r0; 8: SAVE; 9: RET r0
+    var at: u64 = 0;
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.YIELD(c, at, 0);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.YIELD_IC(c, at, 0);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.YIELD_COLD(c, at, 0);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.SAVE(c, at);
+    at = V.emit.RET(c, at, 0);
+    let Ok(v) = V.verify(c[0..at], &p) else { io.println("not verified"); return; };
+    var cx = Ctx { at: None, raw: 0 as *u32 };
+    var r = V.start(&cx, v, &regs[0]);
+    var steps = 0;
+    while steps < 5 {
+        io.print_int(r);
+        io.print(" at ");
+        match cx.at {
+            Some(a) => io.print_int(((a.pc() as u64 - v.start() as u64) / 4) as i64),
+            None => io.print("-"),
+        }
+        io.println("");
+        if steps == 3 { break; }
+        r = V.resume(&cx, &regs[0]);
+        steps += 1;
+    }
+    io.print("raw ");
+    io.print_int(((cx.raw as u64 - v.start() as u64) / 4) as i64);
+    io.println("");
+    // resume_at: instruction boundaries only.
+
+    for i in 0..11 {
+        io.print(if v.resume_at(i as u64).is_some() { "y" } else { "n" });
+    }
+    io.println("");
+    // A resume point found by resume_at works like one from next_resume.
+    regs[0] = 100;
+    let Some(r7) = v.resume_at(7) else { return; };
+    cx.at = Some(r7);
+    let r2 = V.resume(&cx, &regs[0]);
+    io.print_int(r2 + regs[0]);
+    io.println("");
+    // The placeholder resume point is the placeholder proof's trap word.
+    io.println(if V.Resume.placeholder().pc() == V.placeholder().start() { "placeholder" } else { "no" });
+    // Code that ends with an op saving `next_resume` or `next_pc`: the
+    // resume would run past the end.
+    var end: [u32; 4] = [0; 4];
+    let e = end[..];
+    var k = V.emit.INC(e, 0, 0);
+    k = V.emit.YIELD(e, k, 0);
+    show(V.verify(e[0..k], &p));
+    k = V.emit.INC(e, 0, 0);
+    k = V.emit.SAVE(e, k);
+    show(V.verify(e[0..k], &p));
+    k = V.emit.YIELD(e, 0, 0);
+    k = V.emit.RET(e, k, 0);
+    show(V.verify(e[0..k], &p));
+}
+// expect: 1 at 2
+// expect: 2 at 5
+// expect: 3 at 7
+// expect: 0 at 7
+// expect: raw 9
+// expect: yyyynyyyyyn
+// expect: 101
+// expect: placeholder
+// expect: bad at 1: execution can run off the end of the code after this instruction
+// expect: bad at 1: execution can run off the end of the code after this instruction
+// expect: ok

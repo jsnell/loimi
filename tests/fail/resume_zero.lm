@@ -1,0 +1,10 @@
+// `..zero` cannot make a V.Resume (a null resume point).
+struct Saved { at: V.Resume, n: u64 }
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry run(code: Verified<V>) -> i64 { jump code }
+}
+fn main() { let s = Saved { n: 1, ..zero }; }
+// error: `..zero` cannot set field `at` of type `V.Resume`

@@ -40,6 +40,8 @@ struct Opts {
     vm_stats: bool,
     /// `--gc-check-roots`: validate every reference the collector marks.
     gc_check_roots: bool,
+    /// `--explain-values`: print each value type's layout and stop.
+    explain_values: bool,
     /// `--sanitize=address`: build with AddressSanitizer.
     sanitize_address: bool,
     /// `--sanitize=thread`: build with ThreadSanitizer.
@@ -115,6 +117,7 @@ usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
+                  [--explain-values]   (print each value type's encoding and which tuple tests merge, then stop)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
        loimi run <file.lm> [build options] [-- args...]
                   (LOIMI_RUNNER=\"qemu-aarch64 -L DIR\" runs the program under that command)
@@ -263,6 +266,10 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             Span { file: u32::MAX, lo: 0, hi: 0 },
             format!("{} warning{} treated as error{} (-W error)", n, if n == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" }),
         ));
+    }
+    if opts.explain_values {
+        print!("{}", values::explain(&c));
+        std::process::exit(0);
     }
     let prog = c.prog;
     let has_goto = prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Goto);
@@ -465,6 +472,7 @@ fn parse_args() -> Result<Opts, String> {
         keep_ll: false,
         vm_stats: false,
         gc_check_roots: false,
+        explain_values: false,
         sanitize_address: false,
         sanitize_thread: false,
         deny_warnings: false,
@@ -521,6 +529,7 @@ fn parse_args() -> Result<Opts, String> {
             s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
             "--vm-stats" => o.vm_stats = true,
             "--gc-check-roots" => o.gc_check_roots = true,
+            "--explain-values" => o.explain_values = true,
             "--jit-stencils" => o.jit = true,
             "--update" if o.test => o.update = true,
             "--list" if o.test => o.run_args.push(a.clone()),

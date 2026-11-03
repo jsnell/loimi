@@ -178,6 +178,8 @@ pub struct ValueVariant {
     pub name: Ident,
     pub payload: Option<TypeExpr>,
     pub unboxed: bool,
+    /// `block N`: the variant's block width, pinned (language.md section 2).
+    pub block: Option<(u32, crate::diag::Span)>,
 }
 
 #[derive(Clone, Debug)]

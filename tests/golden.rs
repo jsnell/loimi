@@ -277,20 +277,22 @@ fn mini_jit_stencils() {
     }
     let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1")];
     mini_scripts_with(&["--jit-stencils"], &env, |_| true);
-    mini_conformance_with(&["--jit-stencils"], &env);
+    mini_conformance_with(&["--jit-stencils"], &env, |_| true);
     let env = [("LOIMI_JIT", "1"), ("LOIMI_JIT_HOT", "1"), ("LOIMI_JIT_RECOMPILE", "1")];
     mini_scripts_with(&["--jit-stencils"], &env, |_| true);
-    mini_conformance_with(&["--jit-stencils"], &env);
+    mini_conformance_with(&["--jit-stencils"], &env, |_| true);
 }
 
 /// Re-entry (table.sort's comparator runs as a nested run of the
 /// interpreter) and coroutines (each resume is a nested run, each yield
 /// leaves one) in the goto and switch dispatch modes: the sort and
-/// coroutine scripts with a Mini built in each.
+/// coroutine scripts with a Mini built in each, and the coroutine
+/// conformance test (each in every GC mode).
 #[test]
 fn mini_reentry_dispatch_modes() {
     for mode in ["--dispatch=goto", "--dispatch=switch"] {
         mini_scripts_with(&[mode], &[], |name| ["sort", "err_sort", "coroutine", "err_coroutine"].iter().any(|p| name.starts_with(p)));
+        mini_conformance_with(&[mode], &[], |name| name.starts_with("coroutine"));
     }
 }
 
@@ -415,10 +417,12 @@ fn mini_scripts_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str)
 /// the output before the error. Run normally and with GC stress.
 #[test]
 fn mini_conformance() {
-    mini_conformance_with(&[], &[]);
+    mini_conformance_with(&[], &[], |_| true);
 }
 
-fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)]) {
+/// The conformance scripts whose name `select` picks, with Mini built
+/// with `flags` and run in `env`.
+fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)], select: impl Fn(&str) -> bool) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("loimi-mini-conf-{}{}", std::process::id(), flags.join("").replace(['-', '='], "")));
     let out = loimi().arg("build").args(["-W", "error"]).args(flags).arg(root.join("examples/mini/main.lm")).arg("-o").arg(&exe).output().unwrap();
@@ -427,7 +431,7 @@ fn mini_conformance_with(flags: &[&str], env: &[(&str, &str)]) {
     let mut scripts: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "lua"))
+        .filter(|p| p.extension().is_some_and(|x| x == "lua") && select(&p.file_name().unwrap().to_string_lossy()))
         .collect();
     scripts.sort();
     let mut failures = Vec::new();

@@ -1,0 +1,16 @@
+// A resume point belongs to its vm: another vm's entry cannot jump to it.
+vm A {
+    state { pc: *u32 }
+    encoding fixed(u32) { format F { op: 8 } }
+    op RET() : F { exit 0 }
+    entry run(code: Verified<A>) -> i64 { jump code }
+}
+#[require_verified]
+vm B {
+    state { pc: *u32 }
+    encoding fixed(u32) { format F { op: 8 } }
+    op RET() : F { exit 0 }
+    entry resume(r: A.Resume) -> i64 { jump r }
+}
+fn main() {}
+// error: `B` is `#[require_verified]`: an entry starts only in verified code, `jump v` with `v: Verified<B>` (from `B.verify`) or `v: B.Resume` (from `next_resume`); found `A.Resume`

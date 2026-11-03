@@ -1,0 +1,146 @@
+// `block N` pins a variant's block width (language.md section 2), and
+// `V.X.mask`, `V.X.tag`, `V.X.block`, `V.Num.limit` give the encoding as
+// constants. Nine tagged variants would put Int(i32) in a 32-bit block
+// (the packed layout); pinned to 48 bits it keeps the classic block, so a
+// tuple test with pointers still merges, and raw tests written against
+// the constants hold in every layout.
+import std.io;
+
+struct Obj { id: i64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i32) block 48,
+    Nil block 0,
+    Bool(bool) block 1,
+    S(*Obj),
+    T(*Obj),
+    F(*Obj),
+    Native(i32) block 32,
+    Co(*Obj),
+    Wrap(*Obj),
+}
+
+// Fewer than eight variants, but one pinned narrower than 48 bits: the
+// packed layout.
+value P repr nanbox {
+    Num(f64) unboxed,
+    Small(i32) block 32,
+    Nil block 0,
+    R(*Obj),
+}
+
+// A lowtag with a pinned narrow block: Ch takes a 32-bit tag below its
+// 32-bit block.
+value L repr lowtag {
+    Int(i61),
+    Ch(u32) block 32,
+    R(*Obj),
+}
+
+fn hex(x: u64) {
+    let digits = "0123456789abcdef";
+    var i: u64 = 0;
+    while i < 16 {
+        io.print(digits[((x >> (60 - 4 * i)) & 15)..((x >> (60 - 4 * i)) & 15) + 1]);
+        i = i + 1;
+    }
+    io.println("");
+}
+
+/// Mini's compare-and-branch trick, written against the constants: both
+/// Ints iff the biased words have no bits under the mask.
+fn both_ints(a: V, b: V) -> bool {
+    let bias = V.Int(-2147483648) as u64;
+    (((a as u64 ^ bias) | (b as u64 ^ bias)) & V.Int.mask) == 0
+}
+
+fn holds(w: u64, mask: u64, tag: u64) -> bool { (w & mask) == tag }
+
+fn main() {
+    let o = Obj { id: 1 };
+    let p = &o;
+    hex(V.Int(-1) as u64);
+    hex(V.Nil as u64);
+    hex(V.Bool(true) as u64);
+    hex(V.Native(7) as u64);
+    hex((V.S(p) as u64) & V.S.mask);
+    hex((V.Wrap(p) as u64) & V.Wrap.mask);
+    hex(V.Int.mask);
+    hex(V.Int.tag);
+    hex(V.Nil.mask);
+    hex(V.Native.mask);
+    hex(V.Num.limit);
+    let b: u32 = V.Int.block;
+    { io.print_int(b as i64); io.println(""); }
+    { io.print_int(V.Nil.block); io.println(""); }
+    { io.print_int(V.Native.block); io.println(""); }
+    // Each constant pair matches its variant and no other.
+    let vals = [V.Num(1.5), V.Int(-5), V.Nil, V.Bool(false), V.S(p), V.Native(3), V.Wrap(p)];
+
+    for i in 0..7 {
+        let w = vals[i] as u64;
+        let m = (if holds(w, V.Int.mask, V.Int.tag) { 1 } else { 0 })
+            + (if holds(w, V.Nil.mask, V.Nil.tag) { 2 } else { 0 })
+            + (if holds(w, V.Bool.mask, V.Bool.tag) { 4 } else { 0 })
+            + (if holds(w, V.S.mask, V.S.tag) { 8 } else { 0 })
+            + (if holds(w, V.Native.mask, V.Native.tag) { 16 } else { 0 })
+            + (if holds(w, V.Wrap.mask, V.Wrap.tag) { 32 } else { 0 })
+            + (if w < V.Num.limit { 64 } else { 0 });
+        io.print_int(m);
+        io.print(if i < 6 { " " } else { "" });
+    }
+    io.println("");
+    io.println(if both_ints(V.Int(3), V.Int(-4)) { "ints" } else { "not ints" });
+    io.println(if both_ints(V.Int(3), V.Nil) { "ints" } else { "not ints" });
+    io.println(if both_ints(V.Native(3), V.Int(1)) { "ints" } else { "not ints" });
+    // A tuple test mixing Int and pointers, one merged test.
+    match (V.S(p), V.Int(9)) {
+        (S(_), Int(x)) => { io.print_int(x as i64); io.println(""); }
+        _ => io.println("no"),
+    }
+    hex(P.Small(-1) as u64);
+    hex(P.Nil as u64);
+    hex((P.R(p) as u64) & P.R.mask);
+    { io.print_int(P.Small.block); io.println(""); }
+    hex(L.Int(-1) as u64);
+    hex(L.Ch(65) as u64);
+    hex(L.Ch.mask);
+    hex(L.Ch.tag);
+    { io.print_int(L.Ch.block); io.println(""); }
+    { io.print_int(L.R.block); io.println(""); }
+    match L.Ch(66) {
+        Ch(c) => { io.print_int(c as i64); io.println(""); }
+        _ => io.println("no"),
+    }
+}
+// expect: fff90000ffffffff
+// expect: fff8800100000002
+// expect: fff8800100000001
+// expect: fff8800000000007
+// expect: fffa000000000000
+// expect: fffe000000000000
+// expect: ffff000000000000
+// expect: fff9000000000000
+// expect: ffffffffffffffff
+// expect: ffffffff00000000
+// expect: fff8800000000000
+// expect: 48
+// expect: 0
+// expect: 32
+// expect: 64 1 2 4 8 16 32
+// expect: ints
+// expect: not ints
+// expect: not ints
+// expect: 9
+// expect: fff88000ffffffff
+// expect: fff8800100000000
+// expect: fff9000000000000
+// expect: 32
+// expect: fffffffffffffff8
+// expect: 0000004100000002
+// expect: 00000000ffffffff
+// expect: 0000000000000002
+// expect: 32
+// expect: 61
+// expect: 66

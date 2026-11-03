@@ -6,7 +6,7 @@ import std.mem;
 import std.text;
 import value;
 import value.{V, Strings};
-import vm.{Ctx, Frame};
+import vm.{Ctx, Frame, Mini};
 import vm;
 import lib;
 import coro;
@@ -51,6 +51,7 @@ pub fn new_ctx(host: fn(*Ctx, i32, *V, u64) -> Result<V, V> uses reenter) -> Ctx
         nret: vm.NRET_ONE,
         rbuf: mem.alloc(16),
         rcap: 16,
+        ypc: Mini.Resume.placeholder(),
         ..zero
     }
 }

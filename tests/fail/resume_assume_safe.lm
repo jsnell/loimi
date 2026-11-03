@@ -1,0 +1,12 @@
+// `V.assume_resume` (a resume point from a raw pointer) needs `unsafe`.
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op RET() : A { exit 0 }
+    entry resume(r: V.Resume) -> i64 { jump r }
+}
+fn main() {
+    var code: [u32; 1] = [0; 1];
+    V.resume(V.assume_resume(&code[0]));
+}
+// error: `V.assume_resume` is unsafe

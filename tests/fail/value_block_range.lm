@@ -1,0 +1,4 @@
+// `block N` cannot be narrower than the payload.
+// error: `block 20` is out of range for `Int`: it can be from its payload's 32 bits to 48
+value V repr nanbox { Num(f64) unboxed, Int(i32) block 20, Nil }
+fn main() {}

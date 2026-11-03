@@ -1,0 +1,4 @@
+// A variant's encoding constants are `mask`, `tag` and `block`.
+// error: no constant `width` for variant `V.Int`: it has `mask`, `tag` and `block`
+value V repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+fn main() { let w = V.Int.width; }

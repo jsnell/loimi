@@ -442,6 +442,8 @@ pub struct ValueVariantDef {
     /// payload has `shift` bits); lowtag: `payload << shift | tag` (the tag
     /// has `shift` bits). Unused for boxed and the unboxed variant.
     pub shift: u32,
+    /// `block N` in the declaration: the block width is pinned.
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -452,6 +454,9 @@ pub struct ValueDef {
     /// nanbox: the lowest tagged encoding; words below it are the unboxed
     /// f64 variant.
     pub num_limit: u64,
+    /// The layout the compiler chose, for `--explain-values`: "classic",
+    /// "eight" (nanbox: classic plus the 47-bit block), "packed", "boxed".
+    pub layout: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

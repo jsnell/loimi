@@ -21,6 +21,7 @@ value L repr lowtag {
     B(bool),
 }
 
+#[allow(value_layout)]
 value M repr lowtag {
     P0(*Obj), P1(*Obj), P2(*Obj), P3(*Obj), P4(*Obj), P5(*Obj), P6(*Obj),
     Int(i60),

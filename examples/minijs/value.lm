@@ -171,18 +171,21 @@ pub object Proto {
     code: verified [u32] by JS,
 }
 
+/// Ten tagged variants: the packed layout, where the narrow variants get
+/// narrow blocks, pinned with `block N` so that a new variant cannot change
+/// them silently (`loimi build --explain-values`).
 pub value V repr nanbox {
     Num(f64) unboxed,
-    Int(i32),
+    Int(i32) block 32,
     S(Gc<Str>),
     O(Gc<Obj>),
     A(Gc<Arr>),
     F(Gc<Fn>),
     B(Gc<Box>),
     R(Gc<Rope>),
-    Undef,
-    Null,
-    Bool(bool),
+    Undef block 0,
+    Null block 0,
+    Bool(bool) block 1,
 }
 
 // ── strings ─────────────────────────────────────────────────────────

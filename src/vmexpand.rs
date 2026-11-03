@@ -378,7 +378,8 @@ fn decode_src(word_bits: u32, bits: u32, shift: u32, signed: bool) -> String {
 }
 
 /// Ops whose handler may continue past the instruction's last word: it
-/// uses `next`, or reads `pc` (to save a return address such as `pc + 1`),
+/// uses `next`, or reads `pc` (to save a return address such as `pc + 1`,
+/// `next_pc` or `next_resume`),
 /// directly, in a vm function it calls, or in an op it can `become`.
 /// Code whose last instruction is one of these could run off the end.
 ///
@@ -498,7 +499,7 @@ fn may_continue(sm: &SourceMap, v: &VmDecl, l: &VmLayout) -> Vec<bool> {
                 }
             }
             match (name.as_str(), t.get(i + 1).map(|x| &x.tok)) {
-                ("next" | "pc", _) => f.direct = true,
+                ("next" | "pc" | "next_pc" | "next_resume", _) => f.direct = true,
                 ("become", Some(Tok::Ident(target))) => f.becomes.push(target.clone()),
                 (_, Some(Tok::Punct("("))) => f.calls.push((name.clone(), call_args(t, i + 1))),
                 _ => {}
@@ -846,6 +847,50 @@ fn ctx_param_note(p: &Param) -> String {
 fn clause_text(sm: &SourceMap, v: &VmDecl, kind: &str) -> Option<String> {
     let k = v.operands.iter().find(|o| o.name.name == kind)?;
     Some(sm.text(k.verify.as_ref()?.span).to_string())
+}
+
+/// Resume points, `Vm__Resume`: an instruction boundary of verified code,
+/// made by vm code (`next_resume`) or found in a proof (`resume_at`),
+/// which an entry may `jump` to under `#[require_verified]`. Generated
+/// only for programs that mention them (`uses_resume`), so that other
+/// programs' code does not change.
+fn generate_resume(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{vis}struct {n}__Resume {{ __pc: *{w} }}\n\
+         {vis}fn {n}__Resume.pc(r: {n}__Resume) -> *{w} {{ r.__pc }}\n\
+         {vis}fn {n}__Verified.resume_at(v: {n}__Verified, i: u64) -> ?{n}__Resume {{\n\
+         \x20 var __j: u64 = 0;\n\
+         \x20 while __j < v.__code.len {{\n\
+         \x20   if __j == i {{ return Some({n}__Resume {{ __pc: v.__code.ptr + __j }}); }}\n\
+         \x20   __j += {n}__base_size(v.__code[__j]);\n\
+         \x20 }}\n\
+         \x20 None\n}}\n\
+         #[unsafe]\n{vis}fn {n}__assume_resume(pc: *{w}) -> {n}__Resume {{ {n}__Resume {{ __pc: pc }} }}"
+    );
+    // A resume point at the placeholder's trap word, for a slot that needs
+    // a value before there is code to resume (when `placeholder` exists).
+    let used: std::collections::HashSet<u32> = l.ops.iter().map(|o| o.opcode).collect();
+    if (0..1u64 << l.op_bits.min(16)).any(|x| !used.contains(&(x as u32))) {
+        let _ = writeln!(s, "{vis}fn {n}__Resume.placeholder() -> {n}__Resume {{ {n}__Resume {{ __pc: {n}__TRAP[..].ptr }} }}");
+    }
+    s
+}
+
+/// Whether any source file names a resume point item (`next_resume`,
+/// `Vm.Resume`, `resume_at`, `assume_resume`): only then are they
+/// generated (`generate_resume`).
+fn uses_resume(sm: &SourceMap) -> bool {
+    sm.files.iter().any(|f| {
+        f.generated.is_none()
+            && crate::lexer::lex(0, &f.text).is_ok_and(|t| {
+                t.iter().any(|t| matches!(&t.tok, crate::lexer::Tok::Ident(x) if matches!(x.as_str(), "next_resume" | "Resume" | "resume_at" | "assume_resume")))
+            })
+    })
 }
 
 /// For `generate_verifier`: the proof type `Vm__Verified` and its
@@ -2027,6 +2072,7 @@ fn c_externs(items: &mut [Item]) {
 
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
+    let resume = uses_resume(sm);
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
         // Each C function is declared once per module.
@@ -2047,6 +2093,9 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     word_extern = true;
                 }
                 src.push_str(&generate_verifier(sm, v, &l, jit)?);
+                if resume {
+                    src.push_str(&generate_resume(v, &l));
+                }
                 if has_stack(v) {
                     src.push_str(&generate_stack(sm, v, &l, jit)?);
                 }
