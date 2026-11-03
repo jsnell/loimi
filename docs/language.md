@@ -3020,7 +3020,7 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
     (`tests/golden.rs`, `mini_shared_tsan`).
   - **Rules.** Every API call needs the lock. The thread that created
     the state stays attached until `mini_free` (it may let go of the
-    lock); other threads detach outside any run. While a thread has let
+    lock); other threads detach outside any run, and before `mini_free`. While a thread has let
     go of the lock it must not call the API. A Lua coroutine runs on
     whichever thread resumes it; resuming one that runs on another
     thread (stopped at a hand-over) fails as resuming a running one
