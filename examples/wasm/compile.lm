@@ -1,0 +1,1142 @@
+// Validator and translator: one pass over a function body that type
+// checks it (the spec's validation algorithm, with a control stack and
+// an operand stack of types) and, at the same time, emits code for the
+// register vm in vm.lm.
+//
+// Every operand stack position i has a home slot, nlocals + i. A value on
+// the translator's stack is either in its home slot, or still pending:
+// a local (`local.get` emits nothing until the value is used, so
+// `local.get a; local.get b; i32.add` is one ADD reading the locals'
+// slots) or a constant. Pending values are written to their home slots
+// ("flushed") wherever control flow merges, before a local they read is
+// assigned, and for calls. Structured control flow becomes jumps to
+// labels of std.bc; a branch that carries values moves them to the
+// target's home slots first.
+import std.mem;
+import std.bc;
+import std.text;
+import decode;
+import decode.{T_I32, T_I64, T_F32, T_F64, T_FUNCREF, T_EXTERNREF};
+import vm;
+import vm.{W, Func, Inst};
+
+// Where a stack value is. (These were u8 consts at first: a const name
+// in a `match` pattern silently binds a new variable instead, so every
+// value took the first arm. See FRICTION.md.)
+enum Loc { Home, Local, Const }
+
+/// An operand stack entry: its type (0 = unknown, in unreachable code)
+/// and where its value is.
+struct Val { ty: u8, loc: Loc, x: u64 }
+
+const K_BLOCK: u8 = 0;
+const K_LOOP: u8 = 1;
+const K_IF: u8 = 2;
+const K_ELSE: u8 = 3;
+const K_FUNC: u8 = 4;
+
+struct Ctl {
+    kind: u8,
+    params: []u8,
+    results: []u8,
+    /// Operand stack height at the start (below the params).
+    height: u64,
+    /// Validation: the rest of the block is unreachable (stack polymorphic).
+    unreachable: bool,
+    /// Emission: the code of this block is not emitted.
+    dead: bool,
+    /// Branch target: the end (block, if) or the head (loop).
+    label: bc.Label,
+    else_label: bc.Label,
+}
+
+pub struct T {
+    m: *decode.Module,
+    code: bc.Code<u64>,
+    vals: mem.Vec<Val>,
+    ctls: mem.Vec<Ctl>,
+    locals: mem.Vec<u8>,
+    nlocals: u64,
+    max_height: u64,
+    last_def_pc: u64,
+    last_def_slot: u64,
+    has_def: bool,
+    ret_label: bc.Label,
+    ret_used: bool,
+    results: []u8,
+    r: decode.Reader,
+    /// Functions that may be referenced by ref.func (declared).
+    declared: *mem.Vec<bool>,
+}
+
+fn rrr(op: u64, a: u64, b: u64, c: u64) -> u64 {
+    W.with_opcode(W.I32_ADD(a as u16, b as u16, c as u16), op)
+}
+
+pub fn T.new(m: *decode.Module, declared: *mem.Vec<bool>) -> T {
+    T {
+        m: m,
+        code: bc.Code.new(W.op_size, W.set_label),
+        vals: mem.Vec.new(), ctls: mem.Vec.new(), locals: mem.Vec.new(),
+        nlocals: 0, max_height: 0, last_def_pc: 0, last_def_slot: 0, has_def: false,
+        ret_label: bc.Label { id: 0 }, ret_used: false, results: [],
+        r: decode.Reader.new([]), declared: declared,
+    }
+}
+
+fn T.free(t: *T) {
+    t.code.free(); t.vals.free(); t.ctls.free(); t.locals.free();
+}
+
+fn T.top(t: *T) -> *Ctl { t.ctls.ptr_at(t.ctls.len - 1) }
+fn T.dead(t: *T) -> bool { t.top().dead }
+fn T.home(t: *T, pos: u64) -> u64 { t.nlocals + pos }
+
+fn T.emit(t: *T, w: u64) -> u64 {
+    t.has_def = false;
+    t.code.op(w)
+}
+/// Emits an op whose first operand is the slot it writes.
+fn T.emit_def(t: *T, w: u64, slot: u64) {
+    let pc = t.code.op(w);
+    t.last_def_pc = pc;
+    t.last_def_slot = slot;
+    t.has_def = true;
+}
+
+fn T.push(t: *T, v: Val) {
+    t.vals.push(v);
+    if t.vals.len > t.max_height { t.max_height = t.vals.len; }
+}
+fn T.push_home(t: *T, ty: u8) { t.push(Val { ty: ty, loc: Loc.Home, x: 0 }); }
+
+fn T.pop_any(t: *T) -> Result<Val, str> {
+    let c = t.top();
+    if t.vals.len == c.height {
+        if c.unreachable { return Ok(Val { ty: 0, loc: Loc.Home, x: 0 }); }
+        return Err("type mismatch");
+    }
+    Ok(t.vals.pop().unwrap())
+}
+
+fn T.pop(t: *T, want: u8) -> Result<Val, str> {
+    let v = t.pop_any()?;
+    if v.ty != want and v.ty != 0 and want != 0 { return Err("type mismatch"); }
+    if v.ty == 0 { return Ok(Val { ty: want, loc: v.loc, x: v.x }); }
+    Ok(v)
+}
+
+/// The slot holding the value `v` that sits at stack position `pos`
+/// (just popped), materializing a constant into its home slot.
+fn T.reg(t: *T, v: Val, pos: u64) -> u64 {
+    match v.loc {
+        Local => v.x,
+        Const => { let h = t.home(pos); t.write_const(h, v.ty, v.x); h }
+        _ => t.home(pos),
+    }
+}
+
+fn T.write_const(t: *T, slot: u64, ty: u8, bits: u64) {
+    let s = slot as u16;
+    if ty == T_I32 or ty == T_F32 {
+        t.emit_def(W.CONST32(s, bits as u32), slot);
+    } else if ty == T_I64 and (bits as i64) >= -2147483648 and (bits as i64) <= 2147483647 {
+        t.emit_def(W.CONSTL(s, bits as i32), slot);
+    } else {
+        let pc = t.code.op(W.CONST64(s));
+        t.code.set(pc + 1, bits);
+        t.last_def_pc = pc; t.last_def_slot = slot; t.has_def = true;
+    }
+}
+
+/// Moves stack entry `i` to its home slot.
+fn T.flush_at(t: *T, i: u64) {
+    let v = t.vals.at(i);
+    if v.loc == Loc.Home { return; }
+    let h = t.home(i);
+    if !t.dead() {
+        if v.loc == Loc.Local { t.emit_def(W.MOV(h as u16, v.x as u16), h); }
+        else { t.write_const(h, v.ty, v.x); }
+    }
+    t.vals.set(i, Val { ty: v.ty, loc: Loc.Home, x: 0 });
+}
+fn T.flush_all(t: *T) {
+    for i in 0..t.vals.len { t.flush_at(i); }
+}
+fn T.flush_local(t: *T, x: u64) {
+    for i in 0..t.vals.len {
+        let v = t.vals.at(i);
+        if v.loc == Loc.Local and v.x == x { t.flush_at(i); }
+    }
+}
+
+fn T.label_types(t: *T, c: *Ctl) -> []u8 { if c.kind == K_LOOP { c.params } else { c.results } }
+
+fn T.ctl_at(t: *T, depth: u64) -> Result<*Ctl, str> {
+    if depth >= t.ctls.len { return Err("unknown label"); }
+    Ok(t.ctls.ptr_at(t.ctls.len - 1 - depth))
+}
+
+/// Type checks the top `types.len` values against `types` (without
+/// popping them for good).
+fn T.check_top(t: *T, types: []u8) -> Result<(), str> {
+    var popped: mem.Vec<Val> = mem.Vec.new();
+    defer popped.free();
+    var i = types.len;
+    while i > 0 {
+        i -= 1;
+        let v = t.pop_any()?;
+        if v.ty != 0 and v.ty != types[i] { return Err("type mismatch"); }
+        popped.push(v);
+    }
+    while let Some(v) = popped.pop() { t.push(v); }
+    Ok(())
+}
+
+/// Copies the top `n` stack values to the home slots of positions
+/// `dst..dst + n` (code only; the stack is unchanged).
+fn T.move_top(t: *T, n: u64, dst: u64) {
+    let src = t.vals.len - n;
+    for j in 0..n {
+        let i = src + j;
+        let v = t.vals.at(i);
+        let d = t.home(dst + j);
+        match v.loc {
+            Local => { t.emit(W.MOV(d as u16, v.x as u16)); }
+            Const => { t.write_const(d, v.ty, v.x); }
+            _ => if i != dst + j { t.emit(W.MOV(d as u16, t.home(i) as u16)); },
+        }
+    }
+}
+
+fn T.needs_move(t: *T, n: u64, dst: u64) -> bool {
+    let src = t.vals.len - n;
+    if src != dst { return n > 0; }
+    for j in 0..n { if t.vals.at(src + j).loc != Loc.Home { return true; } }
+    false
+}
+
+/// The return sequence for values at the top of the stack. It does not
+/// change the translator's stack (it is also emitted in br_table stubs).
+fn T.emit_return(t: *T) {
+    let n = t.results.len;
+    if n == 0 { t.emit(W.RET()); return; }
+    let p = t.vals.len - n;
+    if n == 1 {
+        let v = t.vals.at(p);
+        let r = t.reg(v, p);
+        t.emit(W.RET1(r as u16));
+        return;
+    }
+    // Into the home slots first (a pending local may be one of the
+    // result slots 0..n), then down to 0..n in order (home slots are at
+    // or above their destinations).
+    t.move_top(n, p);
+    for j in 0..n { t.emit(W.MOV(j as u16, t.home(p + j) as u16)); }
+    t.emit(W.RET());
+}
+
+/// Code for a branch to `c` with its values on top of the stack.
+fn T.emit_branch(t: *T, c: *Ctl) {
+    if c.kind == K_FUNC { t.emit_return(); return; }
+    let n = t.label_types(c).len as u64;
+    t.move_top(n, c.height);
+    t.code.jump(W.JMP(0), c.label);
+}
+
+fn T.set_unreachable(t: *T) {
+    let c = t.top();
+    t.vals.truncate(c.height);
+    c.unreachable = true;
+    c.dead = true;
+}
+
+fn T.block_type(t: *T, bt: i64) -> Result<([]u8, []u8), str> {
+    if bt == -64 { return Ok(([], [])); }
+    if bt < 0 {
+        let p = t.m.arena.alloc_bytes(1, 1);
+        *p = (-bt) as u8;
+        return Ok(([], p.slice(1)));
+    }
+    if (bt as u64) >= t.m.types.len { return Err("unknown type"); }
+    let ft = t.m.types.at(bt as u64);
+    Ok((ft.params, ft.results))
+}
+
+fn T.push_ctl(t: *T, kind: u8, params: []u8, results: []u8) -> *Ctl {
+    let parent_dead = if t.ctls.len > 0 { t.dead() } else { false };
+    t.ctls.push(Ctl {
+        kind: kind, params: params, results: results,
+        height: t.vals.len - params.len,
+        unreachable: false, dead: parent_dead,
+        label: t.code.label(), else_label: bc.Label { id: 0 },
+    });
+    t.top()
+}
+
+pub struct Numeric { op: u64, a: u8, b: u8, r: u8 }
+
+fn num(op: u64, a: u8, b: u8, r: u8) -> ?Numeric { Some(Numeric { op: op, a: a, b: b, r: r }) }
+
+/// Plain numeric instructions: vm op, operand types (b = 0 for unary)
+/// and result type.
+fn numeric(op: u32) -> ?Numeric {
+    let (i, l, f, d) = (T_I32, T_I64, T_F32, T_F64);
+    match op {
+        0x45 => num(W.OP_I32_EQZ, i, 0, i),
+        0x46 => num(W.OP_I32_EQ, i, i, i), 0x47 => num(W.OP_I32_NE, i, i, i),
+        0x48 => num(W.OP_I32_LT_S, i, i, i), 0x49 => num(W.OP_I32_LT_U, i, i, i),
+        0x4A => num(W.OP_I32_GT_S, i, i, i), 0x4B => num(W.OP_I32_GT_U, i, i, i),
+        0x4C => num(W.OP_I32_LE_S, i, i, i), 0x4D => num(W.OP_I32_LE_U, i, i, i),
+        0x4E => num(W.OP_I32_GE_S, i, i, i), 0x4F => num(W.OP_I32_GE_U, i, i, i),
+        0x50 => num(W.OP_I64_EQZ, l, 0, i),
+        0x51 => num(W.OP_I64_EQ, l, l, i), 0x52 => num(W.OP_I64_NE, l, l, i),
+        0x53 => num(W.OP_I64_LT_S, l, l, i), 0x54 => num(W.OP_I64_LT_U, l, l, i),
+        0x55 => num(W.OP_I64_GT_S, l, l, i), 0x56 => num(W.OP_I64_GT_U, l, l, i),
+        0x57 => num(W.OP_I64_LE_S, l, l, i), 0x58 => num(W.OP_I64_LE_U, l, l, i),
+        0x59 => num(W.OP_I64_GE_S, l, l, i), 0x5A => num(W.OP_I64_GE_U, l, l, i),
+        0x5B => num(W.OP_F32_EQ, f, f, i), 0x5C => num(W.OP_F32_NE, f, f, i),
+        0x5D => num(W.OP_F32_LT, f, f, i), 0x5E => num(W.OP_F32_GT, f, f, i),
+        0x5F => num(W.OP_F32_LE, f, f, i), 0x60 => num(W.OP_F32_GE, f, f, i),
+        0x61 => num(W.OP_F64_EQ, d, d, i), 0x62 => num(W.OP_F64_NE, d, d, i),
+        0x63 => num(W.OP_F64_LT, d, d, i), 0x64 => num(W.OP_F64_GT, d, d, i),
+        0x65 => num(W.OP_F64_LE, d, d, i), 0x66 => num(W.OP_F64_GE, d, d, i),
+        0x67 => num(W.OP_I32_CLZ, i, 0, i), 0x68 => num(W.OP_I32_CTZ, i, 0, i),
+        0x69 => num(W.OP_I32_POPCNT, i, 0, i),
+        0x6A => num(W.OP_I32_ADD, i, i, i), 0x6B => num(W.OP_I32_SUB, i, i, i),
+        0x6C => num(W.OP_I32_MUL, i, i, i), 0x6D => num(W.OP_I32_DIV_S, i, i, i),
+        0x6E => num(W.OP_I32_DIV_U, i, i, i), 0x6F => num(W.OP_I32_REM_S, i, i, i),
+        0x70 => num(W.OP_I32_REM_U, i, i, i), 0x71 => num(W.OP_I32_AND, i, i, i),
+        0x72 => num(W.OP_I32_OR, i, i, i), 0x73 => num(W.OP_I32_XOR, i, i, i),
+        0x74 => num(W.OP_I32_SHL, i, i, i), 0x75 => num(W.OP_I32_SHR_S, i, i, i),
+        0x76 => num(W.OP_I32_SHR_U, i, i, i), 0x77 => num(W.OP_I32_ROTL, i, i, i),
+        0x78 => num(W.OP_I32_ROTR, i, i, i),
+        0x79 => num(W.OP_I64_CLZ, l, 0, l), 0x7A => num(W.OP_I64_CTZ, l, 0, l),
+        0x7B => num(W.OP_I64_POPCNT, l, 0, l),
+        0x7C => num(W.OP_I64_ADD, l, l, l), 0x7D => num(W.OP_I64_SUB, l, l, l),
+        0x7E => num(W.OP_I64_MUL, l, l, l), 0x7F => num(W.OP_I64_DIV_S, l, l, l),
+        0x80 => num(W.OP_I64_DIV_U, l, l, l), 0x81 => num(W.OP_I64_REM_S, l, l, l),
+        0x82 => num(W.OP_I64_REM_U, l, l, l), 0x83 => num(W.OP_I64_AND, l, l, l),
+        0x84 => num(W.OP_I64_OR, l, l, l), 0x85 => num(W.OP_I64_XOR, l, l, l),
+        0x86 => num(W.OP_I64_SHL, l, l, l), 0x87 => num(W.OP_I64_SHR_S, l, l, l),
+        0x88 => num(W.OP_I64_SHR_U, l, l, l), 0x89 => num(W.OP_I64_ROTL, l, l, l),
+        0x8A => num(W.OP_I64_ROTR, l, l, l),
+        0x8B => num(W.OP_F32_ABS, f, 0, f), 0x8C => num(W.OP_F32_NEG, f, 0, f),
+        0x8D => num(W.OP_F32_CEIL, f, 0, f), 0x8E => num(W.OP_F32_FLOOR, f, 0, f),
+        0x8F => num(W.OP_F32_TRUNC, f, 0, f), 0x90 => num(W.OP_F32_NEAREST, f, 0, f),
+        0x91 => num(W.OP_F32_SQRT, f, 0, f),
+        0x92 => num(W.OP_F32_ADD, f, f, f), 0x93 => num(W.OP_F32_SUB, f, f, f),
+        0x94 => num(W.OP_F32_MUL, f, f, f), 0x95 => num(W.OP_F32_DIV, f, f, f),
+        0x96 => num(W.OP_F32_MIN, f, f, f), 0x97 => num(W.OP_F32_MAX, f, f, f),
+        0x98 => num(W.OP_F32_COPYSIGN, f, f, f),
+        0x99 => num(W.OP_F64_ABS, d, 0, d), 0x9A => num(W.OP_F64_NEG, d, 0, d),
+        0x9B => num(W.OP_F64_CEIL, d, 0, d), 0x9C => num(W.OP_F64_FLOOR, d, 0, d),
+        0x9D => num(W.OP_F64_TRUNC, d, 0, d), 0x9E => num(W.OP_F64_NEAREST, d, 0, d),
+        0x9F => num(W.OP_F64_SQRT, d, 0, d),
+        0xA0 => num(W.OP_F64_ADD, d, d, d), 0xA1 => num(W.OP_F64_SUB, d, d, d),
+        0xA2 => num(W.OP_F64_MUL, d, d, d), 0xA3 => num(W.OP_F64_DIV, d, d, d),
+        0xA4 => num(W.OP_F64_MIN, d, d, d), 0xA5 => num(W.OP_F64_MAX, d, d, d),
+        0xA6 => num(W.OP_F64_COPYSIGN, d, d, d),
+        0xA7 => num(W.OP_I32_WRAP_I64, l, 0, i),
+        0xA8 => num(W.OP_I32_TRUNC_F32_S, f, 0, i), 0xA9 => num(W.OP_I32_TRUNC_F32_U, f, 0, i),
+        0xAA => num(W.OP_I32_TRUNC_F64_S, d, 0, i), 0xAB => num(W.OP_I32_TRUNC_F64_U, d, 0, i),
+        0xAC => num(W.OP_I64_EXTEND_I32_S, i, 0, l), 0xAD => num(W.OP_I64_EXTEND_I32_U, i, 0, l),
+        0xAE => num(W.OP_I64_TRUNC_F32_S, f, 0, l), 0xAF => num(W.OP_I64_TRUNC_F32_U, f, 0, l),
+        0xB0 => num(W.OP_I64_TRUNC_F64_S, d, 0, l), 0xB1 => num(W.OP_I64_TRUNC_F64_U, d, 0, l),
+        0xB2 => num(W.OP_F32_CONVERT_I32_S, i, 0, f), 0xB3 => num(W.OP_F32_CONVERT_I32_U, i, 0, f),
+        0xB4 => num(W.OP_F32_CONVERT_I64_S, l, 0, f), 0xB5 => num(W.OP_F32_CONVERT_I64_U, l, 0, f),
+        0xB6 => num(W.OP_F32_DEMOTE_F64, d, 0, f),
+        0xB7 => num(W.OP_F64_CONVERT_I32_S, i, 0, d), 0xB8 => num(W.OP_F64_CONVERT_I32_U, i, 0, d),
+        0xB9 => num(W.OP_F64_CONVERT_I64_S, l, 0, d), 0xBA => num(W.OP_F64_CONVERT_I64_U, l, 0, d),
+        0xBB => num(W.OP_F64_PROMOTE_F32, f, 0, d),
+        0xC0 => num(W.OP_I32_EXTEND8_S, i, 0, i), 0xC1 => num(W.OP_I32_EXTEND16_S, i, 0, i),
+        0xC2 => num(W.OP_I64_EXTEND8_S, l, 0, l), 0xC3 => num(W.OP_I64_EXTEND16_S, l, 0, l),
+        0xC4 => num(W.OP_I64_EXTEND32_S, l, 0, l),
+        0xFC00 => num(W.OP_I32_TRUNC_SAT_F32_S, f, 0, i), 0xFC01 => num(W.OP_I32_TRUNC_SAT_F32_U, f, 0, i),
+        0xFC02 => num(W.OP_I32_TRUNC_SAT_F64_S, d, 0, i), 0xFC03 => num(W.OP_I32_TRUNC_SAT_F64_U, d, 0, i),
+        0xFC04 => num(W.OP_I64_TRUNC_SAT_F32_S, f, 0, l), 0xFC05 => num(W.OP_I64_TRUNC_SAT_F32_U, f, 0, l),
+        0xFC06 => num(W.OP_I64_TRUNC_SAT_F64_S, d, 0, l), 0xFC07 => num(W.OP_I64_TRUNC_SAT_F64_U, d, 0, l),
+        _ => None,
+    }
+}
+
+/// Loads and stores: (vm op, vm op with a 64-bit address, value type,
+/// natural alignment as a power of two, is a store).
+fn memop(op: u32) -> ?(u64, u64, u8, u32, bool) {
+    let (i, l, f, d) = (T_I32, T_I64, T_F32, T_F64);
+    match op {
+        0x28 => Some((W.OP_I32_LOAD, W.OP_I32_LOAD_X, i, 2, false)),
+        0x29 => Some((W.OP_I64_LOAD, W.OP_I64_LOAD_X, l, 3, false)),
+        0x2A => Some((W.OP_F32_LOAD, W.OP_F32_LOAD_X, f, 2, false)),
+        0x2B => Some((W.OP_F64_LOAD, W.OP_F64_LOAD_X, d, 3, false)),
+        0x2C => Some((W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_X, i, 0, false)),
+        0x2D => Some((W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_X, i, 0, false)),
+        0x2E => Some((W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_X, i, 1, false)),
+        0x2F => Some((W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_X, i, 1, false)),
+        0x30 => Some((W.OP_I64_LOAD8_S, W.OP_I64_LOAD8_S_X, l, 0, false)),
+        0x31 => Some((W.OP_I64_LOAD8_U, W.OP_I64_LOAD8_U_X, l, 0, false)),
+        0x32 => Some((W.OP_I64_LOAD16_S, W.OP_I64_LOAD16_S_X, l, 1, false)),
+        0x33 => Some((W.OP_I64_LOAD16_U, W.OP_I64_LOAD16_U_X, l, 1, false)),
+        0x34 => Some((W.OP_I64_LOAD32_S, W.OP_I64_LOAD32_S_X, l, 2, false)),
+        0x35 => Some((W.OP_I64_LOAD32_U, W.OP_I64_LOAD32_U_X, l, 2, false)),
+        0x36 => Some((W.OP_I32_STORE, W.OP_I32_STORE_X, i, 2, true)),
+        0x37 => Some((W.OP_I64_STORE, W.OP_I64_STORE_X, l, 3, true)),
+        0x38 => Some((W.OP_F32_STORE, W.OP_F32_STORE_X, f, 2, true)),
+        0x39 => Some((W.OP_F64_STORE, W.OP_F64_STORE_X, d, 3, true)),
+        0x3A => Some((W.OP_I32_STORE8, W.OP_I32_STORE8_X, i, 0, true)),
+        0x3B => Some((W.OP_I32_STORE16, W.OP_I32_STORE16_X, i, 1, true)),
+        0x3C => Some((W.OP_I64_STORE8, W.OP_I64_STORE8_X, l, 0, true)),
+        0x3D => Some((W.OP_I64_STORE16, W.OP_I64_STORE16_X, l, 1, true)),
+        0x3E => Some((W.OP_I64_STORE32, W.OP_I64_STORE32_X, l, 2, true)),
+        _ => None,
+    }
+}
+
+fn is_num(t: u8) -> bool { t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 }
+
+fn T.global_type(t: *T, g: u64) -> Result<(u8, bool), str> {
+    if g >= t.m.globals.len { return Err("unknown global"); }
+    let gd = t.m.globals.at(g);
+    Ok((gd.ty, gd.mutable))
+}
+
+fn T.need_memory(t: *T) -> Result<(), str> {
+    if t.m.mems.len == 0 { return Err("unknown memory"); }
+    Ok(())
+}
+
+
+/// The signed value of a constant of an integer type.
+fn const_value(v: Val) -> i64 {
+    if v.ty == T_I32 { ((v.x as u32) as i32) as i64 } else { v.x as i64 }
+}
+
+fn fits16(x: i64) -> bool { x >= -32768 and x <= 32767 }
+
+/// (reg op, K op, commutative)
+fn kforms() -> [(u64, u64, bool); 38] {
+    [
+        (W.OP_I32_ADD, W.OP_I32_ADDK, true), (W.OP_I32_MUL, W.OP_I32_MULK, true),
+        (W.OP_I32_AND, W.OP_I32_ANDK, true), (W.OP_I32_OR, W.OP_I32_ORK, true),
+        (W.OP_I32_XOR, W.OP_I32_XORK, true), (W.OP_I32_SHL, W.OP_I32_SHLK, false),
+        (W.OP_I32_SHR_S, W.OP_I32_SHR_SK, false), (W.OP_I32_SHR_U, W.OP_I32_SHR_UK, false),
+        (W.OP_I32_EQ, W.OP_I32_EQK, true), (W.OP_I32_NE, W.OP_I32_NEK, true),
+        (W.OP_I32_LT_S, W.OP_I32_LT_SK, false), (W.OP_I32_LT_U, W.OP_I32_LT_UK, false),
+        (W.OP_I32_GT_S, W.OP_I32_GT_SK, false), (W.OP_I32_GT_U, W.OP_I32_GT_UK, false),
+        (W.OP_I32_LE_S, W.OP_I32_LE_SK, false), (W.OP_I32_LE_U, W.OP_I32_LE_UK, false),
+        (W.OP_I32_GE_S, W.OP_I32_GE_SK, false), (W.OP_I32_GE_U, W.OP_I32_GE_UK, false),
+        (W.OP_I64_ADD, W.OP_I64_ADDK, true), (W.OP_I64_MUL, W.OP_I64_MULK, true),
+        (W.OP_I64_AND, W.OP_I64_ANDK, true), (W.OP_I64_OR, W.OP_I64_ORK, true),
+        (W.OP_I64_XOR, W.OP_I64_XORK, true), (W.OP_I64_SHL, W.OP_I64_SHLK, false),
+        (W.OP_I64_SHR_S, W.OP_I64_SHR_SK, false), (W.OP_I64_SHR_U, W.OP_I64_SHR_UK, false),
+        (W.OP_I64_EQ, W.OP_I64_EQK, true), (W.OP_I64_NE, W.OP_I64_NEK, true),
+        (W.OP_I64_LT_S, W.OP_I64_LT_SK, false), (W.OP_I64_LT_U, W.OP_I64_LT_UK, false),
+        (W.OP_I64_GT_S, W.OP_I64_GT_SK, false), (W.OP_I64_GT_U, W.OP_I64_GT_UK, false),
+        (W.OP_I64_LE_S, W.OP_I64_LE_SK, false), (W.OP_I64_LE_U, W.OP_I64_LE_UK, false),
+        (W.OP_I64_GE_S, W.OP_I64_GE_SK, false), (W.OP_I64_GE_U, W.OP_I64_GE_UK, false),
+        (W.OP_I32_SUB, W.OP_I32_ADDK, false), (W.OP_I64_SUB, W.OP_I64_ADDK, false),
+    ]
+}
+
+fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
+    let h = t.home(p);
+    let ks = kforms();
+    for i in 0..38 {
+        let (rop, kop, comm) = ks[i];
+        if rop != op { continue; }
+        let sub = op == W.OP_I32_SUB or op == W.OP_I64_SUB;
+        if b.loc == Loc.Const {
+            var k = const_value(b);
+            if sub { k = 0 - k; }
+            if fits16(k) {
+                let ra = t.reg(a, p);
+                t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, ra as u16, k as i16), kop), h);
+                return;
+            }
+        }
+        if comm and a.loc == Loc.Const and fits16(const_value(a)) {
+            let rb = t.reg(b, p + 1);
+            t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, rb as u16, const_value(a) as i16), kop), h);
+            return;
+        }
+        break;
+    }
+    let ra = t.reg(a, p);
+    let rb = t.reg(b, p + 1);
+    t.emit_def(rrr(op, h, ra, rb), h);
+}
+
+/// Compare ops that fuse with a following branch:
+/// (compare op, branch if true, branch if false, compare is a K form).
+fn fusions() -> [(u64, u64, u64, bool); 52] {
+    [
+        (W.OP_F32_EQ, W.OP_BR_F32_EQ, W.OP_BR_F32_NE, false), (W.OP_F32_NE, W.OP_BR_F32_NE, W.OP_BR_F32_EQ, false),
+        (W.OP_F32_LT, W.OP_BR_F32_LT, W.OP_BR_F32_NLT, false), (W.OP_F32_GT, W.OP_BR_F32_GT, W.OP_BR_F32_NGT, false),
+        (W.OP_F32_LE, W.OP_BR_F32_LE, W.OP_BR_F32_NLE, false), (W.OP_F32_GE, W.OP_BR_F32_GE, W.OP_BR_F32_NGE, false),
+        (W.OP_F64_EQ, W.OP_BR_F64_EQ, W.OP_BR_F64_NE, false), (W.OP_F64_NE, W.OP_BR_F64_NE, W.OP_BR_F64_EQ, false),
+        (W.OP_F64_LT, W.OP_BR_F64_LT, W.OP_BR_F64_NLT, false), (W.OP_F64_GT, W.OP_BR_F64_GT, W.OP_BR_F64_NGT, false),
+        (W.OP_F64_LE, W.OP_BR_F64_LE, W.OP_BR_F64_NLE, false), (W.OP_F64_GE, W.OP_BR_F64_GE, W.OP_BR_F64_NGE, false),
+        (W.OP_I32_EQ, W.OP_BR_I32_EQ, W.OP_BR_I32_NE, false), (W.OP_I32_NE, W.OP_BR_I32_NE, W.OP_BR_I32_EQ, false),
+        (W.OP_I32_LT_S, W.OP_BR_I32_LT_S, W.OP_BR_I32_GE_S, false), (W.OP_I32_GE_S, W.OP_BR_I32_GE_S, W.OP_BR_I32_LT_S, false),
+        (W.OP_I32_GT_S, W.OP_BR_I32_GT_S, W.OP_BR_I32_LE_S, false), (W.OP_I32_LE_S, W.OP_BR_I32_LE_S, W.OP_BR_I32_GT_S, false),
+        (W.OP_I32_LT_U, W.OP_BR_I32_LT_U, W.OP_BR_I32_GE_U, false), (W.OP_I32_GE_U, W.OP_BR_I32_GE_U, W.OP_BR_I32_LT_U, false),
+        (W.OP_I32_GT_U, W.OP_BR_I32_GT_U, W.OP_BR_I32_LE_U, false), (W.OP_I32_LE_U, W.OP_BR_I32_LE_U, W.OP_BR_I32_GT_U, false),
+        (W.OP_I64_EQ, W.OP_BR_I64_EQ, W.OP_BR_I64_NE, false), (W.OP_I64_NE, W.OP_BR_I64_NE, W.OP_BR_I64_EQ, false),
+        (W.OP_I64_LT_S, W.OP_BR_I64_LT_S, W.OP_BR_I64_GE_S, false), (W.OP_I64_GE_S, W.OP_BR_I64_GE_S, W.OP_BR_I64_LT_S, false),
+        (W.OP_I64_GT_S, W.OP_BR_I64_GT_S, W.OP_BR_I64_LE_S, false), (W.OP_I64_LE_S, W.OP_BR_I64_LE_S, W.OP_BR_I64_GT_S, false),
+        (W.OP_I64_LT_U, W.OP_BR_I64_LT_U, W.OP_BR_I64_GE_U, false), (W.OP_I64_GE_U, W.OP_BR_I64_GE_U, W.OP_BR_I64_LT_U, false),
+        (W.OP_I64_GT_U, W.OP_BR_I64_GT_U, W.OP_BR_I64_LE_U, false), (W.OP_I64_LE_U, W.OP_BR_I64_LE_U, W.OP_BR_I64_GT_U, false),
+        (W.OP_I32_EQK, W.OP_BR_I32_EQK, W.OP_BR_I32_NEK, true), (W.OP_I32_NEK, W.OP_BR_I32_NEK, W.OP_BR_I32_EQK, true),
+        (W.OP_I32_LT_SK, W.OP_BR_I32_LT_SK, W.OP_BR_I32_GE_SK, true), (W.OP_I32_GE_SK, W.OP_BR_I32_GE_SK, W.OP_BR_I32_LT_SK, true),
+        (W.OP_I32_GT_SK, W.OP_BR_I32_GT_SK, W.OP_BR_I32_LE_SK, true), (W.OP_I32_LE_SK, W.OP_BR_I32_LE_SK, W.OP_BR_I32_GT_SK, true),
+        (W.OP_I32_LT_UK, W.OP_BR_I32_LT_UK, W.OP_BR_I32_GE_UK, true), (W.OP_I32_GE_UK, W.OP_BR_I32_GE_UK, W.OP_BR_I32_LT_UK, true),
+        (W.OP_I32_GT_UK, W.OP_BR_I32_GT_UK, W.OP_BR_I32_LE_UK, true), (W.OP_I32_LE_UK, W.OP_BR_I32_LE_UK, W.OP_BR_I32_GT_UK, true),
+        (W.OP_I64_EQK, W.OP_BR_I64_EQK, W.OP_BR_I64_NEK, true), (W.OP_I64_NEK, W.OP_BR_I64_NEK, W.OP_BR_I64_EQK, true),
+        (W.OP_I64_LT_SK, W.OP_BR_I64_LT_SK, W.OP_BR_I64_GE_SK, true), (W.OP_I64_GE_SK, W.OP_BR_I64_GE_SK, W.OP_BR_I64_LT_SK, true),
+        (W.OP_I64_GT_SK, W.OP_BR_I64_GT_SK, W.OP_BR_I64_LE_SK, true), (W.OP_I64_LE_SK, W.OP_BR_I64_LE_SK, W.OP_BR_I64_GT_SK, true),
+        (W.OP_I64_LT_UK, W.OP_BR_I64_LT_UK, W.OP_BR_I64_GE_UK, true), (W.OP_I64_GE_UK, W.OP_BR_I64_GE_UK, W.OP_BR_I64_LT_UK, true),
+        (W.OP_I64_GT_UK, W.OP_BR_I64_GT_UK, W.OP_BR_I64_LE_UK, true), (W.OP_I64_LE_UK, W.OP_BR_I64_LE_UK, W.OP_BR_I64_GT_UK, true),
+    ]
+}
+
+/// Jumps to `l` if `cond` (just popped, at position p) is nonzero
+/// (`when` true) or zero. A comparison emitted just before is fused
+/// into a compare-and-branch followed by its JMP.
+fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
+    if cond.loc == Loc.Home and t.has_def and t.last_def_slot == t.home(p) {
+        if let Some(last) = t.code.last() {
+            if last == t.last_def_pc {
+                let w = t.code.at(last);
+                let op = W.opcode(w);
+                if op == W.OP_I32_EQZ {
+                    t.code.truncate(last);
+                    let x = W.RRR_b(w);
+                    t.code.jump(if when { W.BRZ(x as u16, 0) } else { W.BRNZ(x as u16, 0) }, l);
+                    t.has_def = false;
+                    return;
+                }
+                let fs = fusions();
+                for i in 0..52 {
+                    let (cop, bt, bf, k) = fs[i];
+                    if cop != op { continue; }
+                    t.code.truncate(last);
+                    let bop = if when { bt } else { bf };
+                    let x = W.RRR_b(w);
+                    if k {
+                        let kv = W.RRK_k(w);
+                        t.code.op(W.with_opcode(W.BR_I32_EQK(x as u16, kv as i32), bop));
+                    } else {
+                        let y = W.RRR_c(w);
+                        t.code.op(W.with_opcode(W.BR_I32_EQ(x as u16, y as u16), bop));
+                    }
+                    t.code.jump(W.JMP(0), l);
+                    t.has_def = false;
+                    return;
+                }
+            }
+        }
+    }
+    let rc = t.reg(cond, p);
+    t.code.jump(if when { W.BRNZ(rc as u16, 0) } else { W.BRZ(rc as u16, 0) }, l);
+    t.has_def = false;
+}
+
+/// Translates one instruction. Returns false after the function's final `end`.
+fn T.instr(t: *T) -> Result<bool, str> {
+    let r = &t.r;
+    let op = r.byte()? as u32;
+    let op = if op == 0xFC { 0xFC00 + r.u32()? } else { op };
+    if let Some(n) = numeric(op) {
+        if n.b == 0 {
+            let a = t.pop(n.a)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ra = t.reg(a, p);
+                let h = t.home(p);
+                t.emit_def(rrr(n.op, h, ra, 0), h);
+            }
+        } else {
+            let b = t.pop(n.b)?;
+            let a = t.pop(n.a)?;
+            let p = t.vals.len;
+            if !t.dead() { t.binop(n.op, a, b, p); }
+        }
+        t.push_home(n.r);
+        return Ok(true);
+    }
+    if let Some((vop, xop, ty, natural, store)) = memop(op) {
+        let align = r.u32()?;
+        let offset = r.u32()? as u64;
+        t.need_memory()?;
+        if align > natural { return Err("alignment must not be larger than natural"); }
+        if store {
+            let v = t.pop(ty)?;
+            let a = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ra = t.reg(a, p);
+                let rv = t.reg(v, p + 1);
+                if offset < 65536 {
+                    t.emit(rrr(vop, ra, rv, offset));
+                } else {
+                    let h = t.home(p);
+                    let pc = t.emit(W.ADDR(h as u16, ra as u16));
+                    t.code.set(pc + 1, offset);
+                    t.emit(rrr(xop, h, rv, 0));
+                }
+            }
+        } else {
+            let a = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ra = t.reg(a, p);
+                let h = t.home(p);
+                if offset < 65536 {
+                    t.emit_def(rrr(vop, h, ra, offset), h);
+                } else {
+                    let pc = t.emit(W.ADDR(h as u16, ra as u16));
+                    t.code.set(pc + 1, offset);
+                    t.emit_def(rrr(xop, h, h, 0), h);
+                }
+            }
+            t.push_home(ty);
+        }
+        return Ok(true);
+    }
+    match op {
+        0x00 => {
+            if !t.dead() { t.emit(W.UNREACHABLE()); }
+            t.set_unreachable();
+        }
+        0x01 => {}
+        0x02 | 0x03 => {
+            let bt = r.blocktype()?;
+            let (params, results) = t.block_type(bt)?;
+            t.check_top(params)?;
+            t.flush_all();
+            let c = t.push_ctl(if op == 0x02 { K_BLOCK } else { K_LOOP }, params, results);
+            if op == 0x03 {
+                let l = c.label;
+                t.code.bind(l);
+                t.has_def = false;
+            }
+        }
+        0x04 => {
+            let bt = r.blocktype()?;
+            let (params, results) = t.block_type(bt)?;
+            let cond = t.pop(T_I32)?;
+            t.check_top(params)?;
+            let p = t.vals.len;
+            t.flush_all();
+            let else_label = t.code.label();
+            if !t.dead() { t.cond_jump(cond, p, false, else_label); }
+            let c = t.push_ctl(K_IF, params, results);
+            c.else_label = else_label;
+        }
+        0x05 => {
+            let c = t.top();
+            if c.kind != K_IF { return Err("else without if"); }
+            let results = c.results;
+            t.check_top(results)?;
+            let c = t.top();
+            if t.vals.len != c.height + results.len { return Err("type mismatch"); }
+            if !c.dead {
+                for i in c.height..t.vals.len { t.flush_at(i); }
+                t.code.jump(W.JMP(0), c.label);
+            }
+            let c = t.top();
+            t.code.bind(c.else_label);
+            t.has_def = false;
+            t.vals.truncate(c.height);
+            c.kind = K_ELSE;
+            c.unreachable = false;
+            c.dead = if t.ctls.len > 1 { let pc = t.ctls.ptr_at(t.ctls.len - 2); pc.dead or pc.unreachable } else { false };
+            // The else branch is reached only from the BRZ at the `if`, so
+            // the params are still in their home slots.
+            for j in 0..c.params.len { t.push_home(c.params[j]); }
+        }
+        0x0B => {
+            let c = t.top();
+            let results = c.results;
+            t.check_top(results)?;
+            let c = t.top();
+            if t.vals.len != c.height + results.len { return Err("type mismatch"); }
+            if c.kind == K_IF {
+                // No else: the params pass through as the results.
+                if c.params.len != results.len { return Err("type mismatch"); }
+                for j in 0..results.len { if c.params[j] != results[j] { return Err("type mismatch"); } }
+            }
+            if c.kind == K_FUNC {
+                if !c.dead {
+                    for i in c.height..t.vals.len { t.flush_at(i); }
+                }
+                if t.ret_used { t.code.bind(t.ret_label); }
+                if !c.dead or t.ret_used { t.emit_return(); }
+                t.ctls.pop();
+                return Ok(false);
+            }
+            if !c.dead {
+                for i in c.height..t.vals.len { t.flush_at(i); }
+            }
+            let c = t.top();
+            if c.kind != K_LOOP { t.code.bind(c.label); }
+            if c.kind == K_IF { t.code.bind(c.else_label); }
+            t.has_def = false;
+            let h = c.height;
+            t.ctls.pop();
+            t.vals.truncate(h);
+            for j in 0..results.len { t.push_home(results[j]); }
+        }
+        0x0C => {
+            let depth = r.u32()? as u64;
+            let c = t.ctl_at(depth)?;
+            let types = t.label_types(c);
+            t.check_top(types)?;
+            if !t.dead() { t.branch_to(depth); }
+            t.set_unreachable();
+        }
+        0x0D => {
+            let depth = r.u32()? as u64;
+            let cond = t.pop(T_I32)?;
+            let c = t.ctl_at(depth)?;
+            let types = t.label_types(c);
+            t.check_top(types)?;
+            // The values stay, with the label's types (also unknown ones).
+            let base = t.vals.len - types.len;
+            for j in 0..types.len {
+                let v = t.vals.at(base + j);
+                t.vals.set(base + j, Val { ty: types[j], loc: v.loc, x: v.x });
+            }
+            if !t.dead() {
+                let p = t.vals.len;
+                let c = t.ctl_at(depth)?;
+                let n = types.len as u64;
+                if c.kind != K_FUNC and !t.needs_move(n, c.height) {
+                    t.cond_jump(cond, p, true, c.label);
+                } else {
+                    let skip = t.code.label();
+                    t.cond_jump(cond, p, false, skip);
+                    t.branch_to(depth);
+                    t.code.bind(skip);
+                }
+                t.has_def = false;
+            }
+        }
+        0x0E => {
+            let n = r.u32()? as u64;
+            var targets: mem.Vec<u64> = mem.Vec.new();
+            defer targets.free();
+            for i in 0..n + 1 { targets.push(r.u32()? as u64); }
+            let idx = t.pop(T_I32)?;
+            let def = t.ctl_at(targets.at(n))?;
+            let arity = t.label_types(def).len;
+            for i in 0..n + 1 {
+                let c = t.ctl_at(targets.at(i))?;
+                let types = t.label_types(c);
+                if types.len != arity { return Err("type mismatch"); }
+                t.check_top(types)?;
+            }
+            if !t.dead() {
+                let p = t.vals.len;
+                let ri = t.reg(idx, p);
+                t.emit(W.BR_TABLE(ri as u16, n as u32));
+                // One JMP per target; targets that need moves go
+                // through a stub after the table.
+                var stubs: mem.Vec<(bc.Label, u64)> = mem.Vec.new();
+                defer stubs.free();
+                for i in 0..n + 1 {
+                    let depth = targets.at(i);
+                    let c = t.ctl_at(depth)?;
+                    if c.kind != K_FUNC and !t.needs_move(arity as u64, c.height) {
+                        t.code.jump(W.JMP(0), c.label);
+                    } else {
+                        let s = t.code.label();
+                        t.code.jump(W.JMP(0), s);
+                        stubs.push((s, depth));
+                    }
+                }
+                for i in 0..stubs.len {
+                    let (s, depth) = stubs.at(i);
+                    t.code.bind(s);
+                    t.branch_to(depth);
+                }
+            }
+            t.set_unreachable();
+        }
+        0x0F => {
+            let results = t.results;
+            t.check_top(results)?;
+            if !t.dead() { t.emit_return(); }
+            t.set_unreachable();
+        }
+        0x10 => {
+            let fi = r.u32()? as u64;
+            if fi >= t.m.funcs.len { return Err("unknown function"); }
+            let ft = t.m.types.at(t.m.funcs.at(fi) as u64);
+            t.call(ft, W.CALL(0, fi as u32), 0, false, 0)?;
+        }
+        0x11 => {
+            let ti = r.u32()? as u64;
+            let tab = r.u32()? as u64;
+            if tab >= t.m.tables.len { return Err("unknown table"); }
+            if ti >= t.m.types.len { return Err("unknown type"); }
+            if t.m.tables.at(tab).reftype != T_FUNCREF { return Err("type mismatch"); }
+            let ft = t.m.types.at(ti);
+            let idx = t.pop(T_I32)?;
+            let p = t.vals.len;
+            var ri: u64 = 0;
+            if !t.dead() { ri = t.reg(idx, p); }
+            t.call(ft, tab, ti, true, ri)?;
+        }
+        0x1A => { t.pop_any()?; }
+        0x1B | 0x1C => {
+            var want: u8 = 0;
+            if op == 0x1C {
+                let n = r.u32()?;
+                if n != 1 { return Err("invalid result arity"); }
+                want = r.valtype()?;
+            }
+            let c = t.pop(T_I32)?;
+            let b = t.pop(want)?;
+            let a = t.pop(want)?;
+            if op == 0x1B {
+                if (a.ty != 0 and !is_num(a.ty)) or (b.ty != 0 and !is_num(b.ty)) { return Err("type mismatch"); }
+            }
+            if a.ty != 0 and b.ty != 0 and a.ty != b.ty { return Err("type mismatch"); }
+            let ty = if a.ty != 0 { a.ty } else { b.ty };
+            let p = t.vals.len;
+            if !t.dead() {
+                let rb = t.reg(b, p + 1);
+                let rc = t.reg(c, p + 2);
+                let h = t.home(p);
+                if h < 4096 and rb < 4096 and rc < 4096 and (a.loc != Loc.Local or a.x < 4096) {
+                    let ra = t.reg(a, p);
+                    t.emit_def(W.SELECT4(h as u16, ra as u16, rb as u16, rc as u16), h);
+                    t.push_home(ty);
+                    return Ok(true);
+                }
+                // The result goes where the first operand is.
+                match a.loc {
+                    Local => { t.emit(W.MOV(h as u16, a.x as u16)); }
+                    Const => { t.write_const(h, a.ty, a.x); }
+                    _ => {}
+                }
+                t.emit(W.SELECT(h as u16, rb as u16, rc as u16));
+            }
+            t.push_home(ty);
+        }
+        0x20 => {
+            let x = r.u32()? as u64;
+            if x >= t.locals.len { return Err("unknown local"); }
+            t.push(Val { ty: t.locals.at(x), loc: Loc.Local, x: x });
+        }
+        0x21 | 0x22 => {
+            let x = r.u32()? as u64;
+            if x >= t.locals.len { return Err("unknown local"); }
+            let ty = t.locals.at(x);
+            let v = t.pop(ty)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                t.flush_local(x);
+                let mut_ok = v.loc == Loc.Home and t.has_def and t.last_def_slot == t.home(p);
+                var retargeted = false;
+                if mut_ok {
+                    if let Some(last) = t.code.last() {
+                        if last == t.last_def_pc {
+                            let w = t.code.at(last);
+                            if W.opcode(w) == W.OP_SELECT4 {
+                                if x < 4096 { t.code.set(last, (w & 0xFFFFFFFFF000FFFF) | (x << 16)); }
+                                else { retargeted = false; t.emit(W.MOV(x as u16, t.home(p) as u16)); retargeted = true; }
+                            } else {
+                                t.code.set(last, (w & 0xFFFFFFFF0000FFFF) | (x << 16));
+                            }
+                            retargeted = true;
+                        }
+                    }
+                }
+                if !retargeted {
+                    match v.loc {
+                        Const => { t.write_const(x, ty, v.x); }
+                        Local => { if v.x != x { t.emit(W.MOV(x as u16, v.x as u16)); } }
+                        _ => { t.emit(W.MOV(x as u16, t.home(p) as u16)); }
+                    }
+                }
+                t.has_def = false;
+            }
+            if op == 0x22 { t.push(Val { ty: ty, loc: Loc.Local, x: x }); }
+        }
+        0x23 => {
+            let g = r.u32()? as u64;
+            let (ty, _) = t.global_type(g)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let h = t.home(p);
+                t.emit_def(W.GLOBAL_GET(h as u16, g as u32), h);
+            }
+            t.push_home(ty);
+        }
+        0x24 => {
+            let g = r.u32()? as u64;
+            let (ty, mutable) = t.global_type(g)?;
+            if !mutable { return Err("global is immutable"); }
+            let v = t.pop(ty)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let rv = t.reg(v, p);
+                t.emit(W.GLOBAL_SET(rv as u16, g as u32));
+            }
+        }
+        0x3F => {
+            r.byte()?;
+            t.need_memory()?;
+            let p = t.vals.len;
+            if !t.dead() { let h = t.home(p); t.emit_def(W.MEM_SIZE(h as u16), h); }
+            t.push_home(T_I32);
+        }
+        0x40 => {
+            r.byte()?;
+            t.need_memory()?;
+            let n = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let rn = t.reg(n, p);
+                let h = t.home(p);
+                t.emit_def(W.MEM_GROW(h as u16, rn as u16), h);
+            }
+            t.push_home(T_I32);
+        }
+        0x41 => { let v = r.sleb(32)?; t.push(Val { ty: T_I32, loc: Loc.Const, x: (v as u64) & 0xFFFFFFFF }); }
+        0x42 => { let v = r.sleb(64)?; t.push(Val { ty: T_I64, loc: Loc.Const, x: v as u64 }); }
+        0x43 => { let v = r.fixed32()?; t.push(Val { ty: T_F32, loc: Loc.Const, x: v as u64 }); }
+        0x44 => { let v = r.fixed64()?; t.push(Val { ty: T_F64, loc: Loc.Const, x: v }); }
+        0xBC | 0xBD | 0xBE | 0xBF => {
+            // Reinterpretations: same bits, new type.
+            let (from, to) = match op {
+                0xBC => (T_F32, T_I32), 0xBD => (T_F64, T_I64),
+                0xBE => (T_I32, T_F32), _ => (T_I64, T_F64),
+            };
+            let v = t.pop(from)?;
+            t.push(Val { ty: to, loc: v.loc, x: v.x });
+        }
+        0xD0 => {
+            let ty = r.byte()?;
+            t.push(Val { ty: ty, loc: Loc.Const, x: 0 });
+        }
+        0xD1 => {
+            let v = t.pop_any()?;
+            if v.ty != 0 and !is_ref(v.ty) { return Err("type mismatch"); }
+            let p = t.vals.len;
+            if !t.dead() {
+                let rv = t.reg(v, p);
+                let h = t.home(p);
+                t.emit_def(W.REF_IS_NULL(h as u16, rv as u16), h);
+            }
+            t.push_home(T_I32);
+        }
+        0xD2 => {
+            let x = r.u32()? as u64;
+            if x >= t.m.funcs.len { return Err("unknown function"); }
+            if x >= t.declared.len or !t.declared.at(x) { return Err("undeclared function reference"); }
+            let p = t.vals.len;
+            if !t.dead() { let h = t.home(p); t.emit_def(W.REF_FUNC(h as u16, x as u32), h); }
+            t.push_home(T_FUNCREF);
+        }
+        0x25 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let i = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ri = t.reg(i, p);
+                let h = t.home(p);
+                t.bulk(W.OP_TABLE_GET, h, ri, 0, ti);
+            }
+            t.push_home(ty);
+        }
+        0x26 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let v = t.pop(ty)?;
+            let i = t.pop(T_I32)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let ri = t.reg(i, p);
+                let rv = t.reg(v, p + 1);
+                t.bulk(W.OP_TABLE_SET, ri, rv, 0, ti);
+            }
+        }
+        0xFC08 => {
+            let seg = r.u32()? as u64;
+            r.byte()?;
+            t.need_memory()?;
+            if t.m.data_count.is_none() or seg >= t.m.datas.len { return Err("unknown data segment"); }
+            t.bulk3(W.OP_MEM_INIT, T_I32, T_I32, T_I32, seg)?;
+        }
+        0xFC09 => {
+            let seg = r.u32()? as u64;
+            if t.m.data_count.is_none() or seg >= t.m.datas.len { return Err("unknown data segment"); }
+            if !t.dead() { t.bulk(W.OP_DATA_DROP, 0, 0, 0, seg); }
+        }
+        0xFC0C => {
+            let seg = r.u32()? as u64;
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            if seg >= t.m.elems.len { return Err("unknown elem segment"); }
+            if t.m.elems.ptr_at(seg).reftype != ty { return Err("type mismatch"); }
+            t.bulk3(W.OP_TABLE_INIT, T_I32, T_I32, T_I32, seg | (ti << 32))?;
+        }
+        0xFC0D => {
+            let seg = r.u32()? as u64;
+            if seg >= t.m.elems.len { return Err("unknown elem segment"); }
+            if !t.dead() { t.bulk(W.OP_ELEM_DROP, 0, 0, 0, seg); }
+        }
+        0xFC0E => {
+            let dst = r.u32()? as u64;
+            let src = r.u32()? as u64;
+            let a = t.table_type(dst)?;
+            let b = t.table_type(src)?;
+            if a != b { return Err("type mismatch"); }
+            t.bulk3(W.OP_TABLE_COPY, T_I32, T_I32, T_I32, dst | (src << 32))?;
+        }
+        0xFC0F => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            let n = t.pop(T_I32)?;
+            let v = t.pop(ty)?;
+            let p = t.vals.len;
+            if !t.dead() {
+                let rv = t.reg(v, p);
+                let rn = t.reg(n, p + 1);
+                t.bulk(W.OP_TABLE_GROW, t.home(p), rv, rn, ti);
+            }
+            t.push_home(T_I32);
+        }
+        0xFC10 => {
+            let ti = r.u32()? as u64;
+            t.table_type(ti)?;
+            let p = t.vals.len;
+            if !t.dead() { t.bulk(W.OP_TABLE_SIZE, t.home(p), 0, 0, ti); }
+            t.push_home(T_I32);
+        }
+        0xFC11 => {
+            let ti = r.u32()? as u64;
+            let ty = t.table_type(ti)?;
+            t.bulk3(W.OP_TABLE_FILL, T_I32, ty, T_I32, ti)?;
+        }
+        0xFC0A => {
+            r.byte()?; r.byte()?;
+            t.need_memory()?;
+            t.ternary_mem(W.OP_MEM_COPY)?;
+        }
+        0xFC0B => {
+            r.byte()?;
+            t.need_memory()?;
+            t.ternary_mem(W.OP_MEM_FILL)?;
+        }
+        _ => return Err("unsupported instruction"),
+    }
+    Ok(true)
+}
+
+fn is_ref(t: u8) -> bool { t == T_FUNCREF or t == T_EXTERNREF }
+
+fn T.table_type(t: *T, ti: u64) -> Result<u8, str> {
+    if ti >= t.m.tables.len { return Err("unknown table"); }
+    Ok(t.m.tables.at(ti).reftype)
+}
+
+/// A table or bulk-memory op: slots x, y, z and the static indices in
+/// the cache word after it.
+fn T.bulk(t: *T, vop: u64, x: u64, y: u64, z: u64, imm: u64) {
+    let pc = t.emit(rrr(vop, x, y, z));
+    t.code.set(pc + 1, imm);
+}
+
+/// One with three operands from the stack and no result.
+fn T.bulk3(t: *T, vop: u64, ta: u8, tb: u8, tc: u8, imm: u64) -> Result<(), str> {
+    let c = t.pop(tc)?;
+    let b = t.pop(tb)?;
+    let a = t.pop(ta)?;
+    let p = t.vals.len;
+    if !t.dead() {
+        let ra = t.reg(a, p);
+        let rb = t.reg(b, p + 1);
+        let rc = t.reg(c, p + 2);
+        t.bulk(vop, ra, rb, rc, imm);
+    }
+    Ok(())
+}
+
+fn T.ternary_mem(t: *T, vop: u64) -> Result<(), str> {
+    let n = t.pop(T_I32)?;
+    let b = t.pop(T_I32)?;
+    let a = t.pop(T_I32)?;
+    let p = t.vals.len;
+    if !t.dead() {
+        let ra = t.reg(a, p);
+        let rb = t.reg(b, p + 1);
+        let rn = t.reg(n, p + 2);
+        t.emit(rrr(vop, ra, rb, rn));
+    }
+    Ok(())
+}
+
+fn T.branch_to(t: *T, depth: u64) {
+    let c = t.ctls.ptr_at(t.ctls.len - 1 - depth);
+    t.emit_branch(c);
+}
+
+/// A call: arguments are the top values, moved to consecutive home slots;
+/// the callee's window starts at the first one, and its results come
+/// back there.
+/// (`w`: the CALL word, or for call_indirect the table; `ri`: the slot
+/// of the table index.)
+fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool, ri: u64) -> Result<(), str> {
+    t.check_top(ft.params)?;
+    let np = ft.params.len;
+    let p = t.vals.len - np;
+    if !t.dead() {
+        for i in p..t.vals.len { t.flush_at(i); }
+        let base = t.home(p);
+        if indirect {
+            if w == 0 {
+                t.emit(W.CALL_INDIRECT(base as u16, ti as u16, ri as u16));
+            } else {
+                let pc = t.emit(W.CALL_INDIRECT_X(base as u16, ti as u16, ri as u16));
+                t.code.set(pc + 1, w);
+            }
+        } else {
+            t.emit(W.with_opcode(w, W.OP_CALL) | (base << 16));
+        }
+    }
+    t.vals.truncate(p);
+    for j in 0..ft.results.len { t.push_home(ft.results[j]); }
+    Ok(())
+}
+
+pub struct Compiled { words: []u64, nslots: u32, nlocals: u32 }
+
+/// Validates and translates the body of function `fidx` (a defined one).
+pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result<Compiled, str> {
+    let body = m.bodies.ptr_at(fidx - (m.nfunc_imports as u64));
+    let ft = m.types.at(m.funcs.at(fidx) as u64);
+    var t = T.new(m, declared);
+    defer t.free();
+    for i in 0..ft.params.len { t.locals.push(ft.params[i]); }
+    for i in 0..body.locals.len { t.locals.push(body.locals.at(i)); }
+    t.nlocals = t.locals.len;
+    t.results = ft.results;
+    t.r = decode.Reader.new(body.code);
+    t.ret_label = t.code.label();
+    let c = t.push_ctl(K_FUNC, [], ft.results);
+    c.label = t.ret_label;
+    while t.instr()? {}
+    if !t.r.at_end() { return Err("operators remaining after end of function"); }
+    if let Some(e) = t.code.check() { return Err(e.message()); }
+    let nslots = t.nlocals + t.max_height + 1;
+    if nslots > 65535 { return Err("function too large"); }
+    let n = t.code.len();
+    let words = mem.alloc<u64>(n);
+    t.code.copy_into(words.slice(n));
+    Ok(Compiled { words: words.slice(n), nslots: nslots as u32, nlocals: t.nlocals as u32 })
+}

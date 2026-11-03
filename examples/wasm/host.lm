@@ -1,0 +1,177 @@
+// Host modules: `spectest` (for the official test suite), a tiny `env`
+// (print_i32, print_i64, print_f64, putchar) and a minimal WASI preview 1
+// subset (enough for wasi-libc programs that print and exit).
+import std.io;
+import std.mem;
+import std.text;
+import decode.{T_I32, T_I64, T_F32, T_F64, T_FUNCREF};
+import vm;
+import vm.{Machine, Memory, Table, Func, Trap};
+import rt;
+import rt.{Engine, ModInst, Extern};
+
+extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
+extern "C" fn clock_gettime(clk: i32, ts: *i64) -> i32;
+extern "C" fn isatty(fd: i32) -> i32;
+
+fn nothing(m: *Machine, a: *u64) -> bool { true }
+
+fn print_i32(m: *Machine, a: *u64) -> bool {
+    io.print_int(*((a) as *i32) as i64); io.println(""); true
+}
+fn print_i64(m: *Machine, a: *u64) -> bool { io.print_int(a[0] as i64); io.println(""); true }
+fn print_f64(m: *Machine, a: *u64) -> bool { io.print_f64(f64.from_bits(a[0])); io.println(""); true }
+fn putchar(m: *Machine, a: *u64) -> bool {
+    var c = a[0] as u8;
+    write(1, &c, 1);
+    true
+}
+
+const I: [u8; 1] = [0x7F];
+const L: [u8; 1] = [0x7E];
+const F: [u8; 1] = [0x7D];
+const D: [u8; 1] = [0x7C];
+const IF: [u8; 2] = [0x7F, 0x7D];
+const DD: [u8; 2] = [0x7C, 0x7C];
+
+var TI: [u8; 1] = [0x7F];
+var TL: [u8; 1] = [0x7E];
+var TF: [u8; 1] = [0x7D];
+var TD: [u8; 1] = [0x7C];
+var TIF: [u8; 2] = [0x7F, 0x7D];
+var TDD: [u8; 2] = [0x7C, 0x7C];
+var TII: [u8; 2] = [0x7F, 0x7F];
+var TIII: [u8; 3] = [0x7F, 0x7F, 0x7F];
+var TIIII: [u8; 4] = [0x7F, 0x7F, 0x7F, 0x7F];
+var TILI: [u8; 3] = [0x7F, 0x7E, 0x7F];
+var TILII: [u8; 4] = [0x7F, 0x7E, 0x7F, 0x7F];
+
+pub fn spectest(e: *Engine) -> *ModInst {
+    let mi = ModInst.new();
+    mi.add_func("print", e.host_func([], [], nothing, 0));
+    mi.add_func("print_i32", e.host_func(TI[0..1], [], nothing, 0));
+    mi.add_func("print_i64", e.host_func(TL[0..1], [], nothing, 0));
+    mi.add_func("print_f32", e.host_func(TF[0..1], [], nothing, 0));
+    mi.add_func("print_f64", e.host_func(TD[0..1], [], nothing, 0));
+    mi.add_func("print_i32_f32", e.host_func(TIF[0..2], [], nothing, 0));
+    mi.add_func("print_f64_f64", e.host_func(TDD[0..2], [], nothing, 0));
+    mi.add_global("global_i32", T_I32, 666);
+    mi.add_global("global_i64", T_I64, 666);
+    mi.add_global("global_f32", T_F32, vm.f32_bits(666.6) as u64);
+    mi.add_global("global_f64", T_F64, (666.6).to_bits());
+    let t = mem.alloc<Table>(1);
+    *t = Table { elems: mem.alloc<u64>(10), size: 10, max: 20, reftype: T_FUNCREF };
+    mi.exports.insert("table", Extern { kind: 1, func: None, table: Some(t), memory: None, global: None, gtype: 0, gmut: false });
+    let mm = mem.alloc<Memory>(1);
+    *mm = Memory { data: mem.alloc<u8>(65536 + 8), size: 65536, max_pages: 2 };
+    mi.exports.insert("memory", Extern { kind: 2, func: None, table: None, memory: Some(mm), global: None, gtype: 0, gmut: false });
+    mi
+}
+
+pub fn env(e: *Engine) -> *ModInst {
+    let mi = ModInst.new();
+    mi.add_func("print_i32", e.host_func(TI[0..1], [], print_i32, 0));
+    mi.add_func("print_i64", e.host_func(TL[0..1], [], print_i64, 0));
+    mi.add_func("print_f64", e.host_func(TD[0..1], [], print_f64, 0));
+    mi.add_func("putchar", e.host_func(TI[0..1], [], putchar, 0));
+    mi
+}
+
+// ── WASI preview 1 (a subset) ─────────────────────────────────────────
+
+const EBADF: u64 = 8;
+const ENOSYS: u64 = 52;
+const EINVAL: u64 = 28;
+
+/// Guest memory at `addr` for `n` bytes, or None if out of bounds.
+fn guest(m: *Machine, addr: u64, n: u64) -> ?*u8 {
+    if addr + n > m.mem_size { return None; }
+    Some(m.memory.data + addr)
+}
+fn put32(m: *Machine, addr: u64, v: u32) -> bool {
+    let Some(p) = guest(m, addr, 4) else { return false; };
+    *(p as *u32) = v;
+    true
+}
+fn put64(m: *Machine, addr: u64, v: u64) -> bool {
+    let Some(p) = guest(m, addr, 8) else { return false; };
+    *(p as *u64) = v;
+    true
+}
+fn arg32(a: *u64, i: u64) -> u64 { (a[i] & 0xFFFFFFFF) }
+fn ret(a: *u64, errno: u64) -> bool { a[0] = errno; true }
+
+// fd_write(fd, iovs, iovs_len, nwritten) -> errno
+fn fd_write(m: *Machine, a: *u64) -> bool {
+    let fd = arg32(a, 0);
+    let iovs = arg32(a, 1);
+    let n = arg32(a, 2);
+    let out = arg32(a, 3);
+    if fd != 1 and fd != 2 { return ret(a, EBADF); }
+    var total: u64 = 0;
+    for i in 0..n {
+        let Some(iov) = guest(m, iovs + i * 8, 8) else { m.host_trap = Trap.MemOOB; return false; };
+        let base = *(iov as *u32) as u64;
+        let len = *((iov + 4) as *u32) as u64;
+        let Some(p) = guest(m, base, len) else { m.host_trap = Trap.MemOOB; return false; };
+        if len > 0 { write(fd as i32, p, len); }
+        total += len;
+    }
+    if !put32(m, out, total as u32) { m.host_trap = Trap.MemOOB; return false; }
+    ret(a, 0)
+}
+
+fn proc_exit(m: *Machine, a: *u64) -> bool {
+    m.exit_code = a[0] as i32;
+    m.host_trap = Trap.Exit;
+    false
+}
+
+// args_sizes_get(argc*, argv_buf_size*) / environ_sizes_get: none.
+fn sizes_get(m: *Machine, a: *u64) -> bool {
+    if !put32(m, arg32(a, 0), 0) or !put32(m, arg32(a, 1), 0) { m.host_trap = Trap.MemOOB; return false; }
+    ret(a, 0)
+}
+fn args_get(m: *Machine, a: *u64) -> bool { ret(a, 0) }
+
+// clock_time_get(id, precision: i64, time*) -> errno
+fn clock_time_get(m: *Machine, a: *u64) -> bool {
+    var ts: [i64; 2] = [0; 2];
+    clock_gettime(if arg32(a, 0) == 0 { 0 } else { 1 }, &ts[0]);
+    let ns = (ts[0] as u64) * 1000000000 + (ts[1] as u64);
+    if !put64(m, arg32(a, 2), ns) { m.host_trap = Trap.MemOOB; return false; }
+    ret(a, 0)
+}
+
+// fd_fdstat_get(fd, stat*) -> errno: stdout/stderr are character devices.
+fn fd_fdstat_get(m: *Machine, a: *u64) -> bool {
+    let fd = arg32(a, 0);
+    if fd > 2 { return ret(a, EBADF); }
+    let Some(p) = guest(m, arg32(a, 1), 24) else { m.host_trap = Trap.MemOOB; return false; };
+    for i in 0..24 { p[i] = 0; }
+    // A terminal is a character device (libc line-buffers it); anything
+    // else is reported as a regular file, so output is fully buffered.
+    *p = if isatty(fd as i32) != 0 { 2 } else { 4 };
+    ret(a, 0)
+}
+
+fn enosys(m: *Machine, a: *u64) -> bool { ret(a, ENOSYS) }
+fn ebadf(m: *Machine, a: *u64) -> bool { ret(a, EBADF) }
+
+pub fn wasi(e: *Engine) -> *ModInst {
+    let mi = ModInst.new();
+    mi.add_func("fd_write", e.host_func(TIIII[0..4], TI[0..1], fd_write, 0));
+    mi.add_func("proc_exit", e.host_func(TI[0..1], [], proc_exit, 0));
+    mi.add_func("args_sizes_get", e.host_func(TII[0..2], TI[0..1], sizes_get, 0));
+    mi.add_func("environ_sizes_get", e.host_func(TII[0..2], TI[0..1], sizes_get, 0));
+    mi.add_func("args_get", e.host_func(TII[0..2], TI[0..1], args_get, 0));
+    mi.add_func("environ_get", e.host_func(TII[0..2], TI[0..1], args_get, 0));
+    mi.add_func("clock_time_get", e.host_func(TILI[0..3], TI[0..1], clock_time_get, 0));
+    mi.add_func("fd_fdstat_get", e.host_func(TII[0..2], TI[0..1], fd_fdstat_get, 0));
+    mi.add_func("fd_close", e.host_func(TI[0..1], TI[0..1], ebadf, 0));
+    mi.add_func("fd_seek", e.host_func(TILII[0..4], TI[0..1], ebadf, 0));
+    mi.add_func("fd_read", e.host_func(TIIII[0..4], TI[0..1], ebadf, 0));
+    mi.add_func("fd_prestat_get", e.host_func(TII[0..2], TI[0..1], ebadf, 0));
+    mi.add_func("fd_prestat_dir_name", e.host_func(TIII[0..3], TI[0..1], ebadf, 0));
+    mi
+}

@@ -1,0 +1,812 @@
+// The register vm that wasm code is translated to (compile.lm), and the
+// runtime structures it works on.
+//
+// A wasm function's frame is a window of untyped 64-bit slots:
+// [params and locals][operand stack homes][scratch]. Every value is
+// stored in one slot; i32 and f32 values occupy its low 4 bytes, and the
+// operand kinds below read and write a slot as the type the op needs.
+// The wasm validator has proved the types, so an op never reads a slot
+// as a type that was not written there; the vm verifier proves that
+// every slot index is inside the frame.
+import std.io;
+import std.mem;
+import decode;
+
+pub enum Trap {
+    Unreachable,
+    MemOOB,
+    DivZero,
+    IntOverflow,
+    InvalidConv,
+    UndefElem,
+    UninitElem,
+    SigMismatch,
+    Exhausted,
+    Host,
+    TableOOB,
+    Exit,
+}
+
+pub fn trap_message(t: Trap) -> str {
+    match t {
+        Unreachable => "unreachable",
+        MemOOB => "out of bounds memory access",
+        DivZero => "integer divide by zero",
+        IntOverflow => "integer overflow",
+        InvalidConv => "invalid conversion to integer",
+        UndefElem => "undefined element",
+        UninitElem => "uninitialized element",
+        SigMismatch => "indirect call type mismatch",
+        Exhausted => "call stack exhausted",
+        Host => "host error",
+        TableOOB => "out of bounds table access",
+        Exit => "exit",
+    }
+}
+
+/// A host function: arguments in `args[0..nparams]`, results written to
+/// `args[0..nresults]`. Returns false to trap (the trap is in m.host_trap).
+pub type HostFn = fn(*Machine, *u64) -> bool;
+
+pub struct Func {
+    code: Verified<W>,
+    nparams: u32,
+    /// Parameters and locals.
+    nlocals: u32,
+    /// The whole frame: locals, operand stack, scratch.
+    nslots: u32,
+    nresults: u32,
+    /// Canonical signature id: equal ids mean equal function types.
+    sig: u32,
+    inst: *Inst,
+    host: ?HostFn,
+    /// Host functions: an argument for the host function's use.
+    host_data: u64,
+}
+
+pub struct Memory { data: *u8, size: u64, max_pages: u64 }
+
+/// Elements are references: a `*Func` as an address for funcref, the
+/// host's value for externref; 0 is null.
+pub struct Table { elems: *u64, size: u64, max: u64, reftype: u8 }
+
+pub struct Inst {
+    funcs: mem.Vec<*Func>,
+    /// Pointers to global cells (imported ones are shared).
+    globals: mem.Vec<*u64>,
+    global_types: mem.Vec<u8>,
+    global_muts: mem.Vec<bool>,
+    memory: ?*Memory,
+    tables: mem.Vec<*Table>,
+    /// Canonical signature id per type index.
+    sigs: mem.Vec<u32>,
+    module: *decode.Module,
+    /// Dropped passive segments.
+    elem_dropped: mem.Vec<bool>,
+    data_dropped: mem.Vec<bool>,
+    /// The evaluated references of every element segment.
+    elem_vals: mem.Vec<[]u64>,
+}
+
+/// One activation record: where the caller continues and its window.
+/// `inst` is used only by the records cross-instance calls push.
+pub struct Frame { ret: *u64, regs: *u64, inst: *Inst }
+
+pub struct Machine {
+    inst: *Inst,
+    // Caches of the current instance, read by the handlers.
+    funcs: **Func,
+    globals: **u64,
+    sigs: *u32,
+    table: *Table,
+    memory: *Memory,
+    mem_size: u64,
+
+    stack: *u64,
+    stack_end: *u64,
+    frames: *Frame,
+    frames_end: *Frame,
+    /// Verified one-op stubs: HALT ends a run, RESTORE returns from a
+    /// call into another instance.
+    halt_pc: *u64,
+    restore_pc: *u64,
+    host_trap: Trap,
+    empty_table: Table,
+    empty_memory: Memory,
+    exit_code: i32,
+}
+
+pub fn Machine.switch_to(m: *Machine, i: *Inst) {
+    m.inst = i;
+    m.funcs = i.funcs.ptr;
+    m.globals = i.globals.ptr;
+    m.sigs = i.sigs.ptr;
+    m.table = if i.tables.len > 0 { i.tables.at(0) } else { &m.empty_table };
+    m.memory = i.memory ?? &m.empty_memory;
+    m.mem_size = m.memory.size;
+}
+
+#[inline(always)]
+fn b2i(c: bool) -> i32 { if c { 1 } else { 0 } }
+
+extern "C" fn ceil(x: f64) -> f64;
+extern "C" fn floor(x: f64) -> f64;
+extern "C" fn trunc(x: f64) -> f64;
+extern "C" fn rint(x: f64) -> f64;
+extern "C" fn ceilf(x: f32) -> f32;
+extern "C" fn floorf(x: f32) -> f32;
+extern "C" fn truncf(x: f32) -> f32;
+extern "C" fn rintf(x: f32) -> f32;
+extern "C" fn sqrtf(x: f32) -> f32;
+extern "C" fn realloc(p: *u8, n: u64) -> ?*u8;
+extern "C" fn memset(p: *u8, c: i32, n: u64) -> *u8;
+extern "C" fn memmove(d: *u8, s: *u8, n: u64) -> *u8;
+
+#[inline(always)]
+pub fn f32_bits(x: f32) -> u32 { var y = x; *((&y) as *u32) }
+#[inline(always)]
+pub fn f32_from(b: u32) -> f32 { var y = b; *((&y) as *f32) }
+
+fn fmin64(a: f64, b: f64) -> f64 {
+    if a < b { return a; }
+    if b < a { return b; }
+    if a == b { return f64.from_bits(a.to_bits() | b.to_bits()); }
+    a + b
+}
+fn fmax64(a: f64, b: f64) -> f64 {
+    if a > b { return a; }
+    if b > a { return b; }
+    if a == b { return f64.from_bits(a.to_bits() & b.to_bits()); }
+    a + b
+}
+fn fmin32(a: f32, b: f32) -> f32 {
+    if a < b { return a; }
+    if b < a { return b; }
+    if a == b { return f32_from(f32_bits(a) | f32_bits(b)); }
+    a + b
+}
+fn fmax32(a: f32, b: f32) -> f32 {
+    if a > b { return a; }
+    if b > a { return b; }
+    if a == b { return f32_from(f32_bits(a) & f32_bits(b)); }
+    a + b
+}
+
+// Saturating truncations (0xFC 0..7).
+fn sat_i32(x: f64) -> i32 {
+    if x != x { return 0; }
+    if x <= -2147483648.0 { return -2147483648; }
+    if x >= 2147483647.0 { return 2147483647; }
+    x as i32
+}
+fn sat_u32(x: f64) -> u32 {
+    if x != x or x <= 0.0 { return 0; }
+    if x >= 4294967295.0 { return 4294967295; }
+    x as u32
+}
+fn sat_i64(x: f64) -> i64 {
+    if x != x { return 0; }
+    if x <= -9223372036854775808.0 { return -9223372036854775807 - 1; }
+    if x >= 9223372036854775808.0 { return 9223372036854775807; }
+    x as i64
+}
+fn sat_u64(x: f64) -> u64 {
+    if x != x or x <= 0.0 { return 0; }
+    if x >= 18446744073709551616.0 { return 0xFFFFFFFFFFFFFFFF; }
+    x as u64
+}
+
+/// memory.grow: the old size in pages, or -1.
+pub fn grow_memory(m: *Machine, delta: u32) -> i32 {
+    let mem = m.memory;
+    if mem == &m.empty_memory { return -1; }
+    let old = mem.size >> 16;
+    let new = old + (delta as u64);
+    if new > mem.max_pages or new > 32768 { return -1; }
+    if delta == 0 { return old as i32; }
+    let Some(p) = realloc(mem.data, (new << 16) + 8) else { return -1; };
+    memset(p + mem.size, 0, (delta as u64) << 16);
+    mem.data = p;
+    mem.size = new << 16;
+    m.mem_size = mem.size;
+    old as i32
+}
+
+/// `cache` used as a 64-bit immediate after CONST64.
+pub vm W {
+    context ctx: *Machine;
+    state { pc: *u64, regs: *u64, fp: *Frame, mem: *u8, msize: u64 }
+    verify_context f: *Func, inst: *Inst;
+
+    // A slot, read and written as each wasm type.
+    operand ri = *((regs + it) as *i32) verify it < (f.nslots as u64) display "r{}";
+    operand ru = *((regs + it) as *u32) verify it < (f.nslots as u64) display "r{}";
+    operand rl = *((regs + it) as *i64) verify it < (f.nslots as u64) display "r{}";
+    operand rq = regs[it] verify it < (f.nslots as u64) display "r{}";
+    operand rf = *((regs + it) as *f32) verify it < (f.nslots as u64) display "r{}";
+    operand rd = *((regs + it) as *f64) verify it < (f.nslots as u64) display "r{}";
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+    // The base of a callee's window: anywhere in the frame.
+    operand base = it verify it <= (f.nslots as u64) display "r{}";
+    operand fidx = it verify it < inst.funcs.len display "f{}";
+    operand gidx = it verify it < inst.globals.len display "g{}";
+    operand tidx = it verify it < inst.sigs.len display "t{}";
+
+    encoding fixed(u64) {
+        format RRR { op: 16, a: 16, b: 16, c: 16 }
+        format RI  { op: 16, a: 16, imm: s32 }
+        format RU  { op: 16, a: 16, x: 32 }
+        format J   { op: 16, off: s32 }
+        format RRK { op: 16, a: 16, b: 16, k: s16 }
+        format R4  { op: 16, a: 12, b: 12, c: 12, d: 12 }
+    }
+
+    cache Imm64 { v: u64 }
+
+    // ── constants and moves ───────────────────────────────────────────
+    op CONST32(d: ru, v: imm) : RU { d = v as u32; next }
+    op CONSTL(d: rl, v: imm) : RI { d = v; next }
+    op CONST64(d: rq) : RU + Imm64 { d = cache.v; next }
+    op MOV(d: rq, a: rq) : RRR { d = a; next }
+    op MOV32(d: ru, a: ru) : RRR { d = a; next }
+    // select: d = c != 0 ? d : b (d holds the first operand).
+    op SELECT(d: rq, b: rq, c: ri) : RRR { if c == 0 { d = b; } next }
+    // d = c != 0 ? a : b, for frames whose slots fit 12 bits.
+    op SELECT4(d: rq, a: rq, b: rq, c: ri) : R4 { d = if c != 0 { a } else { b }; next }
+
+    // ── i32 and i64 arithmetic ────────────────────────────────────────
+    inline for (name, dk, ak, bk, expr) in [
+        ("I32_ADD", ri, ri, ri, a +% b), ("I32_SUB", ri, ri, ri, a -% b), ("I32_MUL", ri, ri, ri, a *% b),
+        ("I32_AND", ri, ri, ri, a & b), ("I32_OR", ri, ri, ri, a | b), ("I32_XOR", ri, ri, ri, a ^ b),
+        ("I32_SHL", ri, ri, ri, a << b), ("I32_SHR_S", ri, ri, ri, a >> b), ("I32_SHR_U", ru, ru, ru, a >> b),
+        ("I32_ROTL", ru, ru, ru, (a << b) | (a >> (32 - (b & 31)))),
+        ("I32_ROTR", ru, ru, ru, (a >> b) | (a << (32 - (b & 31)))),
+        ("I32_EQ", ri, ri, ri, b2i(a == b)), ("I32_NE", ri, ri, ri, b2i(a != b)),
+        ("I32_LT_S", ri, ri, ri, b2i(a < b)), ("I32_LT_U", ri, ru, ru, b2i(a < b)),
+        ("I32_GT_S", ri, ri, ri, b2i(a > b)), ("I32_GT_U", ri, ru, ru, b2i(a > b)),
+        ("I32_LE_S", ri, ri, ri, b2i(a <= b)), ("I32_LE_U", ri, ru, ru, b2i(a <= b)),
+        ("I32_GE_S", ri, ri, ri, b2i(a >= b)), ("I32_GE_U", ri, ru, ru, b2i(a >= b)),
+        ("I64_ADD", rl, rl, rl, a +% b), ("I64_SUB", rl, rl, rl, a -% b), ("I64_MUL", rl, rl, rl, a *% b),
+        ("I64_AND", rl, rl, rl, a & b), ("I64_OR", rl, rl, rl, a | b), ("I64_XOR", rl, rl, rl, a ^ b),
+        ("I64_SHL", rl, rl, rl, a << b), ("I64_SHR_S", rl, rl, rl, a >> b), ("I64_SHR_U", rq, rq, rq, a >> b),
+        ("I64_ROTL", rq, rq, rq, (a << b) | (a >> (64 - (b & 63)))),
+        ("I64_ROTR", rq, rq, rq, (a >> b) | (a << (64 - (b & 63)))),
+        ("I64_EQ", ri, rl, rl, b2i(a == b)), ("I64_NE", ri, rl, rl, b2i(a != b)),
+        ("I64_LT_S", ri, rl, rl, b2i(a < b)), ("I64_LT_U", ri, rq, rq, b2i(a < b)),
+        ("I64_GT_S", ri, rl, rl, b2i(a > b)), ("I64_GT_U", ri, rq, rq, b2i(a > b)),
+        ("I64_LE_S", ri, rl, rl, b2i(a <= b)), ("I64_LE_U", ri, rq, rq, b2i(a <= b)),
+        ("I64_GE_S", ri, rl, rl, b2i(a >= b)), ("I64_GE_U", ri, rq, rq, b2i(a >= b)),
+        // floats
+        ("F32_ADD", rf, rf, rf, a + b), ("F32_SUB", rf, rf, rf, a - b),
+        ("F32_MUL", rf, rf, rf, a * b), ("F32_DIV", rf, rf, rf, a / b),
+        ("F32_MIN", rf, rf, rf, fmin32(a, b)), ("F32_MAX", rf, rf, rf, fmax32(a, b)),
+        ("F32_COPYSIGN", ru, ru, ru, (a & 0x7FFFFFFF) | (b & 0x80000000)),
+        ("F32_EQ", ri, rf, rf, b2i(a == b)), ("F32_NE", ri, rf, rf, b2i(a != b)),
+        ("F32_LT", ri, rf, rf, b2i(a < b)), ("F32_GT", ri, rf, rf, b2i(a > b)),
+        ("F32_LE", ri, rf, rf, b2i(a <= b)), ("F32_GE", ri, rf, rf, b2i(a >= b)),
+        ("F64_ADD", rd, rd, rd, a + b), ("F64_SUB", rd, rd, rd, a - b),
+        ("F64_MUL", rd, rd, rd, a * b), ("F64_DIV", rd, rd, rd, a / b),
+        ("F64_MIN", rd, rd, rd, fmin64(a, b)), ("F64_MAX", rd, rd, rd, fmax64(a, b)),
+        ("F64_COPYSIGN", rq, rq, rq, (a & 0x7FFFFFFFFFFFFFFF) | (b & 0x8000000000000000)),
+        ("F64_EQ", ri, rd, rd, b2i(a == b)), ("F64_NE", ri, rd, rd, b2i(a != b)),
+        ("F64_LT", ri, rd, rd, b2i(a < b)), ("F64_GT", ri, rd, rd, b2i(a > b)),
+        ("F64_LE", ri, rd, rd, b2i(a <= b)), ("F64_GE", ri, rd, rd, b2i(a >= b)),
+    ] {
+        op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
+    }
+
+    // Constant right operands (a 16-bit immediate, sign-extended).
+    inline for (name, dk, ak, expr) in [
+        ("I32_ADDK", ri, ri, a +% (k as i32)), ("I32_MULK", ri, ri, a *% (k as i32)),
+        ("I32_ANDK", ri, ri, a & (k as i32)), ("I32_ORK", ri, ri, a | (k as i32)),
+        ("I32_XORK", ri, ri, a ^ (k as i32)),
+        ("I32_SHLK", ri, ri, a << k), ("I32_SHR_SK", ri, ri, a >> k), ("I32_SHR_UK", ru, ru, a >> k),
+        ("I32_EQK", ri, ri, b2i(a == (k as i32))), ("I32_NEK", ri, ri, b2i(a != (k as i32))),
+        ("I32_LT_SK", ri, ri, b2i(a < (k as i32))), ("I32_LT_UK", ri, ru, b2i(a < (k as u32))),
+        ("I32_GT_SK", ri, ri, b2i(a > (k as i32))), ("I32_GT_UK", ri, ru, b2i(a > (k as u32))),
+        ("I32_LE_SK", ri, ri, b2i(a <= (k as i32))), ("I32_LE_UK", ri, ru, b2i(a <= (k as u32))),
+        ("I32_GE_SK", ri, ri, b2i(a >= (k as i32))), ("I32_GE_UK", ri, ru, b2i(a >= (k as u32))),
+        ("I64_ADDK", rl, rl, a +% k), ("I64_MULK", rl, rl, a *% k),
+        ("I64_ANDK", rl, rl, a & k), ("I64_ORK", rl, rl, a | k), ("I64_XORK", rl, rl, a ^ k),
+        ("I64_SHLK", rl, rl, a << k), ("I64_SHR_SK", rl, rl, a >> k), ("I64_SHR_UK", rq, rq, a >> k),
+        ("I64_EQK", ri, rl, b2i(a == k)), ("I64_NEK", ri, rl, b2i(a != k)),
+        ("I64_LT_SK", ri, rl, b2i(a < k)), ("I64_LT_UK", ri, rq, b2i(a < (k as u64))),
+        ("I64_GT_SK", ri, rl, b2i(a > k)), ("I64_GT_UK", ri, rq, b2i(a > (k as u64))),
+        ("I64_LE_SK", ri, rl, b2i(a <= k)), ("I64_LE_UK", ri, rq, b2i(a <= (k as u64))),
+        ("I64_GE_SK", ri, rl, b2i(a >= k)), ("I64_GE_UK", ri, rq, b2i(a >= (k as u64))),
+    ] {
+        op #name(d: dk, a: ak, k: imm) : RRK { d = expr; next }
+    }
+
+    // Division: traps on a zero divisor and on MIN / -1; x rem -1 is 0.
+    inline for (name, k, min) in [("I32_DIV_S", ri, (-2147483647 - 1)), ("I64_DIV_S", rl, (-9223372036854775807 - 1))] {
+        op #name(d: k, a: k, b: k) : RRR {
+            if b == 0 { cold { raise Trap.DivZero } }
+            if b == -1 and a == min { cold { raise Trap.IntOverflow } }
+            d = a / b;
+            next
+        }
+    }
+    inline for (name, k) in [("I32_REM_S", ri), ("I64_REM_S", rl)] {
+        op #name(d: k, a: k, b: k) : RRR {
+            if b == 0 { cold { raise Trap.DivZero } }
+            if b == -1 { d = 0; next }
+            d = a % b;
+            next
+        }
+    }
+    inline for (name, k, expr) in [
+        ("I32_DIV_U", ru, a / b), ("I32_REM_U", ru, a % b),
+        ("I64_DIV_U", rq, a / b), ("I64_REM_U", rq, a % b),
+    ] {
+        op #name(d: k, a: k, b: k) : RRR {
+            if b == 0 { cold { raise Trap.DivZero } }
+            d = expr; next
+        }
+    }
+
+    // ── unary ops and conversions ─────────────────────────────────────
+    inline for (name, dk, ak, expr) in [
+        ("I32_EQZ", ri, ri, b2i(a == 0)), ("I64_EQZ", ri, rl, b2i(a == 0)),
+        ("I32_CLZ", ri, ru, a.clz() as i32), ("I32_CTZ", ri, ru, a.ctz() as i32),
+        ("I32_POPCNT", ri, ru, a.popcount() as i32),
+        ("I64_CLZ", rl, rq, a.clz() as i64), ("I64_CTZ", rl, rq, a.ctz() as i64),
+        ("I64_POPCNT", rl, rq, a.popcount() as i64),
+        ("F32_ABS", ru, ru, a & 0x7FFFFFFF), ("F32_NEG", ru, ru, a ^ 0x80000000),
+        ("F64_ABS", rq, rq, a & 0x7FFFFFFFFFFFFFFF), ("F64_NEG", rq, rq, a ^ 0x8000000000000000),
+        ("F32_SQRT", rf, rf, sqrtf(a)), ("F32_CEIL", rf, rf, ceilf(a)), ("F32_FLOOR", rf, rf, floorf(a)),
+        ("F32_TRUNC", rf, rf, truncf(a)), ("F32_NEAREST", rf, rf, rintf(a)),
+        ("F64_SQRT", rd, rd, a.sqrt()), ("F64_CEIL", rd, rd, ceil(a)), ("F64_FLOOR", rd, rd, floor(a)),
+        ("F64_TRUNC", rd, rd, trunc(a)), ("F64_NEAREST", rd, rd, rint(a)),
+        ("I32_WRAP_I64", ri, rl, a as i32),
+        ("I64_EXTEND_I32_S", rl, ri, a as i64), ("I64_EXTEND_I32_U", rl, ru, a as i64),
+        ("F32_CONVERT_I32_S", rf, ri, a as f32), ("F32_CONVERT_I32_U", rf, ru, a as f32),
+        ("F32_CONVERT_I64_S", rf, rl, a as f32), ("F32_CONVERT_I64_U", rf, rq, a as f32),
+        ("F64_CONVERT_I32_S", rd, ri, a as f64), ("F64_CONVERT_I32_U", rd, ru, a as f64),
+        ("F64_CONVERT_I64_S", rd, rl, a as f64), ("F64_CONVERT_I64_U", rd, rq, a as f64),
+        ("F32_DEMOTE_F64", rf, rd, a as f32), ("F64_PROMOTE_F32", rd, rf, a as f64),
+        ("I32_EXTEND8_S", ri, ri, (a as i8) as i32), ("I32_EXTEND16_S", ri, ri, (a as i16) as i32),
+        ("I64_EXTEND8_S", rl, rl, (a as i8) as i64), ("I64_EXTEND16_S", rl, rl, (a as i16) as i64),
+        ("I64_EXTEND32_S", rl, rl, (a as i32) as i64),
+        ("I32_TRUNC_SAT_F32_S", ri, rf, sat_i32(a as f64)), ("I32_TRUNC_SAT_F32_U", ru, rf, sat_u32(a as f64)),
+        ("I32_TRUNC_SAT_F64_S", ri, rd, sat_i32(a)), ("I32_TRUNC_SAT_F64_U", ru, rd, sat_u32(a)),
+        ("I64_TRUNC_SAT_F32_S", rl, rf, sat_i64(a as f64)), ("I64_TRUNC_SAT_F32_U", rq, rf, sat_u64(a as f64)),
+        ("I64_TRUNC_SAT_F64_S", rl, rd, sat_i64(a)), ("I64_TRUNC_SAT_F64_U", rq, rd, sat_u64(a)),
+    ] {
+        op #name(d: dk, a: ak) : RRR { d = expr; next }
+    }
+
+    // Trapping float-to-int truncation: `lo < x < hi` must hold (the
+    // bounds are exact in f64 for every case).
+    inline for (name, dk, ak, lo, hi, ty) in [
+        ("I32_TRUNC_F32_S", ri, rf, -2147483649.0, 2147483648.0, i32),
+        ("I32_TRUNC_F32_U", ru, rf, -1.0, 4294967296.0, u32),
+        ("I32_TRUNC_F64_S", ri, rd, -2147483649.0, 2147483648.0, i32),
+        ("I32_TRUNC_F64_U", ru, rd, -1.0, 4294967296.0, u32),
+        ("I64_TRUNC_F32_S", rl, rf, -9223372036854777856.0, 9223372036854775808.0, i64),
+        ("I64_TRUNC_F32_U", rq, rf, -1.0, 18446744073709551616.0, u64),
+        ("I64_TRUNC_F64_S", rl, rd, -9223372036854777856.0, 9223372036854775808.0, i64),
+        ("I64_TRUNC_F64_U", rq, rd, -1.0, 18446744073709551616.0, u64),
+    ] {
+        op #name(d: dk, a: ak) : RRR {
+            let x = a as f64;
+            if x > lo and x < hi { d = x as ty; next }
+            cold {
+                if x != x { raise Trap.InvalidConv }
+                raise Trap.IntOverflow
+            }
+        }
+    }
+
+    // ── memory ────────────────────────────────────────────────────────
+    // d = load(a + off): the effective address is computed in 64 bits,
+    // so it cannot wrap, and checked against the memory's size.
+    inline for (name, dk, ty, conv, size) in [
+        ("I32_LOAD", ri, i32, x, 4), ("I64_LOAD", rl, i64, x, 8),
+        ("F32_LOAD", rf, f32, x, 4), ("F64_LOAD", rd, f64, x, 8),
+        ("I32_LOAD8_S", ri, i8, x as i32, 1), ("I32_LOAD8_U", ri, u8, x as i32, 1),
+        ("I32_LOAD16_S", ri, i16, x as i32, 2), ("I32_LOAD16_U", ri, u16, x as i32, 2),
+        ("I64_LOAD8_S", rl, i8, x as i64, 1), ("I64_LOAD8_U", rl, u8, x as i64, 1),
+        ("I64_LOAD16_S", rl, i16, x as i64, 2), ("I64_LOAD16_U", rl, u16, x as i64, 2),
+        ("I64_LOAD32_S", rl, i32, x as i64, 4), ("I64_LOAD32_U", rl, u32, x as i64, 4),
+    ] {
+        op #name(d: dk, a: ru, off: imm) : RRR {
+            let ea = (a as u64) + off;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = *((mem + ea) as *ty);
+            d = conv;
+            next
+        }
+    }
+    inline for (name, vk, ty, conv, size) in [
+        ("I32_STORE", ri, i32, v, 4), ("I64_STORE", rl, i64, v, 8),
+        ("F32_STORE", ru, u32, v, 4), ("F64_STORE", rq, u64, v, 8),
+        ("I32_STORE8", ri, u8, v as u8, 1), ("I32_STORE16", ri, u16, v as u16, 2),
+        ("I64_STORE8", rl, u8, v as u8, 1), ("I64_STORE16", rl, u16, v as u16, 2),
+        ("I64_STORE32", rl, u32, v as u32, 4),
+    ] {
+        op #name(a: ru, v: vk, off: imm) : RRR {
+            let ea = (a as u64) + off;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            *((mem + ea) as *ty) = conv;
+            next
+        }
+    }
+    // An offset that does not fit 16 bits: add it first, in 64 bits.
+    // d (a scratch slot) = a + off, read by the access as a 64-bit address.
+    op ADDR(d: rq, a: ru) : RRR + Imm64 { d = (a as u64) + cache.v; next }
+    inline for (name, dk, ty, conv, size) in [
+        ("I32_LOAD_X", ri, i32, x, 4), ("I64_LOAD_X", rl, i64, x, 8),
+        ("F32_LOAD_X", rf, f32, x, 4), ("F64_LOAD_X", rd, f64, x, 8),
+        ("I32_LOAD8_S_X", ri, i8, x as i32, 1), ("I32_LOAD8_U_X", ri, u8, x as i32, 1),
+        ("I32_LOAD16_S_X", ri, i16, x as i32, 2), ("I32_LOAD16_U_X", ri, u16, x as i32, 2),
+        ("I64_LOAD8_S_X", rl, i8, x as i64, 1), ("I64_LOAD8_U_X", rl, u8, x as i64, 1),
+        ("I64_LOAD16_S_X", rl, i16, x as i64, 2), ("I64_LOAD16_U_X", rl, u16, x as i64, 2),
+        ("I64_LOAD32_S_X", rl, i32, x as i64, 4), ("I64_LOAD32_U_X", rl, u32, x as i64, 4),
+    ] {
+        op #name(d: dk, a: rq) : RRR {
+            let ea = a;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = *((mem + ea) as *ty);
+            d = conv;
+            next
+        }
+    }
+    inline for (name, vk, ty, conv, size) in [
+        ("I32_STORE_X", ri, i32, v, 4), ("I64_STORE_X", rl, i64, v, 8),
+        ("F32_STORE_X", ru, u32, v, 4), ("F64_STORE_X", rq, u64, v, 8),
+        ("I32_STORE8_X", ri, u8, v as u8, 1), ("I32_STORE16_X", ri, u16, v as u16, 2),
+        ("I64_STORE8_X", rl, u8, v as u8, 1), ("I64_STORE16_X", rl, u16, v as u16, 2),
+        ("I64_STORE32_X", rl, u32, v as u32, 4),
+    ] {
+        op #name(a: rq, v: vk) : RRR {
+            let ea = a;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            *((mem + ea) as *ty) = conv;
+            next
+        }
+    }
+
+    op MEM_SIZE(d: ri) : RRR { d = (msize >> 16) as i32; next }
+    op MEM_GROW(d: ri, n: ru) : RRR {
+        d = grow_memory(ctx, n);
+        mem = ctx.memory.data; msize = ctx.mem_size;
+        next
+    }
+    op MEM_FILL(dst: ru, v: ri, n: ru) : RRR {
+        if (dst as u64) + (n as u64) > msize { cold { raise Trap.MemOOB } }
+        memset(mem + (dst as u64), v, n as u64);
+        next
+    }
+    op MEM_COPY(dst: ru, src: ru, n: ru) : RRR {
+        if (dst as u64) + (n as u64) > msize or (src as u64) + (n as u64) > msize {
+            cold { raise Trap.MemOOB }
+        }
+        memmove(mem + (dst as u64), mem + (src as u64), n as u64);
+        next
+    }
+
+    // ── globals ───────────────────────────────────────────────────────
+    op GLOBAL_GET(d: rq, g: gidx) : RU { d = *ctx.globals[g]; next }
+    op GLOBAL_SET(a: rq, g: gidx) : RU { *ctx.globals[g] = a; next }
+
+    // ── control ───────────────────────────────────────────────────────
+    op JMP(t: label) : J { jump t }
+    op BRZ(a: ri, t: label) : RI { if a == 0 { jump t } next }
+    op BRNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    // Compare and branch: a fused compare and br_if/if. The JMP after it
+    // holds the target (`then JMP`): taken if the comparison holds.
+    inline for (name, k, test) in [
+        ("BR_I32_EQ", ri, a == b), ("BR_I32_NE", ri, a != b),
+        ("BR_I32_LT_S", ri, a < b), ("BR_I32_LT_U", ru, a < b),
+        ("BR_I32_GT_S", ri, a > b), ("BR_I32_GT_U", ru, a > b),
+        ("BR_I32_LE_S", ri, a <= b), ("BR_I32_LE_U", ru, a <= b),
+        ("BR_I32_GE_S", ri, a >= b), ("BR_I32_GE_U", ru, a >= b),
+        ("BR_I64_EQ", rl, a == b), ("BR_I64_NE", rl, a != b),
+        ("BR_I64_LT_S", rl, a < b), ("BR_I64_LT_U", rq, a < b),
+        ("BR_I64_GT_S", rl, a > b), ("BR_I64_GT_U", rq, a > b),
+        ("BR_I64_LE_S", rl, a <= b), ("BR_I64_LE_U", rq, a <= b),
+        ("BR_I64_GE_S", rl, a >= b), ("BR_I64_GE_U", rq, a >= b),
+        // floats: the negated forms are separate ops (NaN compares false)
+        ("BR_F32_EQ", rf, a == b), ("BR_F32_NE", rf, a != b),
+        ("BR_F32_LT", rf, a < b), ("BR_F32_GT", rf, a > b), ("BR_F32_LE", rf, a <= b), ("BR_F32_GE", rf, a >= b),
+        ("BR_F32_NLT", rf, !(a < b)), ("BR_F32_NGT", rf, !(a > b)),
+        ("BR_F32_NLE", rf, !(a <= b)), ("BR_F32_NGE", rf, !(a >= b)),
+        ("BR_F64_EQ", rd, a == b), ("BR_F64_NE", rd, a != b),
+        ("BR_F64_LT", rd, a < b), ("BR_F64_GT", rd, a > b), ("BR_F64_LE", rd, a <= b), ("BR_F64_GE", rd, a >= b),
+        ("BR_F64_NLT", rd, !(a < b)), ("BR_F64_NGT", rd, !(a > b)),
+        ("BR_F64_NLE", rd, !(a <= b)), ("BR_F64_NGE", rd, !(a >= b)),
+    ] {
+        op #name(a: k, b: k) : RRR then JMP {
+            if test { jump then.t }
+            jump pc + 2
+        }
+    }
+    inline for (name, k, test) in [
+        ("BR_I32_EQK", ri, a == (c as i32)), ("BR_I32_NEK", ri, a != (c as i32)),
+        ("BR_I32_LT_SK", ri, a < (c as i32)), ("BR_I32_LT_UK", ru, a < (c as u32)),
+        ("BR_I32_GT_SK", ri, a > (c as i32)), ("BR_I32_GT_UK", ru, a > (c as u32)),
+        ("BR_I32_LE_SK", ri, a <= (c as i32)), ("BR_I32_LE_UK", ru, a <= (c as u32)),
+        ("BR_I32_GE_SK", ri, a >= (c as i32)), ("BR_I32_GE_UK", ru, a >= (c as u32)),
+        ("BR_I64_EQK", rl, a == c), ("BR_I64_NEK", rl, a != c),
+        ("BR_I64_LT_SK", rl, a < c), ("BR_I64_LT_UK", rq, a < (c as u64)),
+        ("BR_I64_GT_SK", rl, a > c), ("BR_I64_GT_UK", rq, a > (c as u64)),
+        ("BR_I64_LE_SK", rl, a <= c), ("BR_I64_LE_UK", rq, a <= (c as u64)),
+        ("BR_I64_GE_SK", rl, a >= c), ("BR_I64_GE_UK", rq, a >= (c as u64)),
+    ] {
+        op #name(a: k, c: imm) : RI then JMP {
+            if test { jump then.t }
+            jump pc + 2
+        }
+    }
+    // Followed by n + 1 JMPs (checked by `verify brtable` below).
+    op BR_TABLE(a: ru, n: imm) : RU {
+        let i = if (a as u64) < n { a as u64 } else { n };
+        jump pc + 1 + i
+    }
+    op UNREACHABLE() : RRR { raise Trap.Unreachable }
+
+    // `ret` is where the caller continues: pc + the calling op's size
+    // (there is no expression for "the next instruction" in a vm fn).
+    fn do_call(f: *Func, b: u64, ret: *u64) -> never {
+        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b, ret) } }
+        let nr = regs + b;
+        if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
+            cold { raise Trap.Exhausted }
+        }
+        // Zero the non-parameter locals. A loop here becomes a memset
+        // call, which gives the handler a stack frame on every path; so
+        // the first four are stored unconditionally (slots past nlocals
+        // are the callee's scratch, and the stack has slack beyond
+        // stack_end), and longer runs go to a cold path.
+        let p = f.nparams as u64;
+        let n = f.nlocals as u64;
+        nr[p] = 0; nr[p + 1] = 0; nr[p + 2] = 0; nr[p + 3] = 0;
+        if n > p + 4 {
+            cold {
+                zero_slots(nr, p + 4, n);
+                fp = fp + 1;
+                fp.ret = ret;
+                fp.regs = regs;
+                regs = nr;
+                jump f.code
+            }
+        }
+        fp = fp + 1;
+        fp.ret = ret;
+        fp.regs = regs;
+        regs = nr;
+        jump f.code
+    }
+
+    // Calls of host functions and of functions of other instances.
+    fn call_slow(f: *Func, b: u64, ret: *u64) -> never {
+        let nr = regs + b;
+        if let Some(h) = f.host {
+            if !h(ctx, nr) { raise ctx.host_trap }
+            next
+        }
+        if nr + (f.nslots as u64) > ctx.stack_end or fp + 3 >= ctx.frames_end {
+            raise Trap.Exhausted
+        }
+        var i = f.nparams as u64;
+        let n = f.nlocals as u64;
+        while i < n { nr[i] = 0; i += 1; }
+        // A record that RESTORE pops: the caller's instance and return.
+        fp = fp + 1;
+        fp.ret = ret;
+        fp.regs = regs;
+        fp.inst = ctx.inst;
+        fp = fp + 1;
+        fp.ret = ctx.restore_pc;
+        fp.regs = regs;
+        regs = nr;
+        ctx.switch_to(f.inst);
+        mem = ctx.memory.data; msize = ctx.mem_size;
+        jump f.code
+    }
+
+    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw, pc + 1) }
+
+    op CALL_INDIRECT(b: base, t: tidx, i: ru) : RRR {
+        let tab = ctx.table;
+        if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
+        let fv = tab.elems[i as u64];
+        if fv == 0 { cold { raise Trap.UninitElem } }
+        let f = fv as *Func;
+        if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
+        do_call(f, b.raw, pc + 1)
+    }
+    // call_indirect through a table other than 0 (index in the cache word,
+    // checked here: the verifier does not see cache words).
+    op CALL_INDIRECT_X(b: base, t: tidx, i: ru) : RRR + Imm64 {
+        let ti = cache.v;
+        if ti >= ctx.inst.tables.len { cold { raise Trap.TableOOB } }
+        let tab = ctx.inst.tables.at(ti);
+        if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
+        let fv = tab.elems[i as u64];
+        if fv == 0 { cold { raise Trap.UninitElem } }
+        let f = fv as *Func;
+        if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
+        do_call(f, b.raw, pc + 2)
+    }
+
+    // ── reference types and bulk memory ─────────────────────────────
+    op REF_IS_NULL(d: ri, a: rq) : RRR { d = b2i(a == 0); next }
+    op REF_FUNC(d: rq, fi: fidx) : RU { d = ctx.funcs[fi] as u64; next }
+    // Rare ops: indices (table, segment) in the cache word, operands in
+    // slots; a plain function does the work and checks every bound.
+    inline for (name, which) in [
+        ("TABLE_GET", 0), ("TABLE_SET", 1), ("TABLE_SIZE", 2), ("TABLE_GROW", 3), ("TABLE_FILL", 4),
+        ("TABLE_COPY", 5), ("TABLE_INIT", 6), ("ELEM_DROP", 7), ("MEM_INIT", 8), ("DATA_DROP", 9),
+    ] {
+        op #name(a: rq, b: rq, c: rq) : RRR + Imm64 {
+            if !bulk(ctx, which, regs, a.raw, b.raw, c.raw, cache.v) { raise ctx.host_trap }
+            next
+        }
+    }
+
+    op RET() : J {
+        regs = fp.regs;
+        let r = fp.ret;
+        fp = fp - 1;
+        jump r
+    }
+    op RET1(a: rq) : RRR {
+        regs[0] = a;
+        regs = fp.regs;
+        let r = fp.ret;
+        fp = fp - 1;
+        jump r
+    }
+    // Back from another instance's function (see call_slow).
+    op RESTORE() : J {
+        ctx.switch_to(fp.inst);
+        mem = ctx.memory.data; msize = ctx.mem_size;
+        regs = fp.regs;
+        let r = fp.ret;
+        fp = fp - 1;
+        jump r
+    }
+    op HALT() : J { exit Ok(()) }
+
+    verify brtable {
+        var ok = true;
+        var i: u64 = 0;
+        while ok and i < code.len {
+            let w = code[i];
+            if W.opcode(w) == W.OP_BR_TABLE {
+                let n = W.RU_x(w);
+                if i + 2 + n > code.len {
+                    ok = false;
+                } else {
+                    for j in 0..n + 1 {
+                        if W.opcode(code[i + 1 + j]) != W.OP_JMP { ok = false; }
+                    }
+                }
+            }
+            i += W.op_size(w);
+        }
+        ok
+    }
+
+    on raise(t: Trap) { fail t }
+
+    entry run(m: *Machine, f: *Func, args: *u64) -> Result<(), Trap> {
+        ctx = m;
+        regs = args;
+        fp = m.frames;
+        fp.ret = m.halt_pc;
+        fp.regs = args;
+        fp.inst = m.inst;
+        mem = m.memory.data; msize = m.mem_size;
+        var i = f.nparams as u64;
+        let n = f.nlocals as u64;
+        while i < n { args[i] = 0; i += 1; }
+        jump f.code
+    }
+}
+
+#[inline(never)]
+fn zero_slots(p: *u64, from: u64, to: u64) {
+    var i = from;
+    while i < to { p[i] = 0; i += 1; }
+}
+
+fn table_of(m: *Machine, i: u64) -> ?*Table {
+    if i >= m.inst.tables.len { return None; }
+    Some(m.inst.tables.at(i))
+}
+
+/// Table and bulk memory operations. `x`, `y`, `z` are slot numbers (of
+/// the frame `r`), `imm` packs the static indices (low and high 32 bits).
+/// Returns false with m.host_trap set to trap.
+fn bulk(m: *Machine, which: u32, r: *u64, x: u64, y: u64, z: u64, imm: u64) -> bool {
+    let i0 = imm & 0xFFFFFFFF;
+    let i1 = imm >> 32;
+    let a = r[x];
+    let b = r[y];
+    let c = r[z];
+    m.host_trap = Trap.TableOOB;
+    match which {
+        0 => {  // table.get: r[x] = t[r[y]]
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = b & 0xFFFFFFFF;
+            if i >= t.size { return false; }
+            r[x] = t.elems[i];
+        }
+        1 => {  // table.set t[r[x]] = r[y]
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = a & 0xFFFFFFFF;
+            if i >= t.size { return false; }
+            t.elems[i] = b;
+        }
+        2 => {
+            let Some(t) = table_of(m, i0) else { return false; };
+            r[x] = t.size;
+        }
+        3 => {  // r[x] = table.grow(init r[y], n r[z])
+            let Some(t) = table_of(m, i0) else { return false; };
+            let n = c & 0xFFFFFFFF;
+            let old = t.size;
+            if old + n > t.max or old + n > 10000000 {
+                r[x] = 0xFFFFFFFF;
+            } else {
+                let Some(p) = realloc(t.elems as *u8, (old + n) * 8 + 8) else { r[x] = 0xFFFFFFFF; return true; };
+                t.elems = p as *u64;
+                for k in old..old + n { t.elems[k] = b; }
+                t.size = old + n;
+                r[x] = old;
+            }
+        }
+        4 => {  // table.fill(i r[x], v r[y], n r[z])
+            let Some(t) = table_of(m, i0) else { return false; };
+            let i = a & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if i + n > t.size { return false; }
+            for k in i..i + n { t.elems[k] = b; }
+        }
+        5 => {  // table.copy dst i0, src i1
+            let Some(td) = table_of(m, i0) else { return false; };
+            let Some(ts) = table_of(m, i1) else { return false; };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > td.size or s + n > ts.size { return false; }
+            memmove(td.elems as *u8 + d * 8, ts.elems as *u8 + s * 8, n * 8);
+        }
+        6 => {  // table.init seg i0 into table i1
+            let Some(t) = table_of(m, i1) else { return false; };
+            if i0 >= m.inst.elem_vals.len { return false; }
+            let seg = m.inst.elem_vals.at(i0);
+            let len = if m.inst.elem_dropped.at(i0) { 0 } else { seg.len };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > t.size or s + n > len { return false; }
+            for k in 0..n { t.elems[d + k] = seg[s + k]; }
+        }
+        7 => {
+            if i0 >= m.inst.elem_dropped.len { return false; }
+            m.inst.elem_dropped.set(i0, true);
+        }
+        8 => {  // memory.init seg i0
+            m.host_trap = Trap.MemOOB;
+            let datas = &m.inst.module.datas;
+            if i0 >= datas.len { return false; }
+            let bytes = datas.at(i0).bytes;
+            let len = if m.inst.data_dropped.at(i0) { 0 } else { bytes.len };
+            let d = a & 0xFFFFFFFF;
+            let s = b & 0xFFFFFFFF;
+            let n = c & 0xFFFFFFFF;
+            if d + n > m.mem_size or s + n > len { return false; }
+            if n > 0 { memmove(m.memory.data + d, bytes.ptr + s, n); }
+        }
+        _ => {
+            if i0 >= m.inst.data_dropped.len { return false; }
+            m.inst.data_dropped.set(i0, true);
+        }
+    }
+    true
+}

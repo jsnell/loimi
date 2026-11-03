@@ -697,6 +697,28 @@ fn stack_programs() {
     );
 }
 
+/// The WebAssembly interpreter (examples/wasm/check.sh --fast): a tail-call
+/// build with `-W error`, the C programs in tests/ compiled to wasm32 (when
+/// clang-19 and wasm-ld are there) and a subset of the official spec tests
+/// (when bench/wasm/install.sh and spec.sh have run; skipped otherwise).
+#[test]
+fn wasm_interpreter() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/wasm/check.sh"))
+        .arg("--fast")
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/wasm/check.sh failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The regex library (examples/regex/check.sh, fast): its C host's demo,
 /// the bytecode fuzzer, the verifier test, random byte patterns on both
 /// engines, and both engines against Python's `re` on the hand-written

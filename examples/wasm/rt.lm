@@ -1,0 +1,481 @@
+// Module validation (everything but function bodies), linking,
+// instantiation and invocation.
+import std.mem;
+import std.map;
+import std.hash;
+import std.text;
+import std.io;
+import decode;
+import decode.{Module, ConstExpr, Limits, T_I32, T_I64, T_F32, T_F64, T_FUNCREF, T_EXTERNREF};
+import compile;
+import vm;
+import vm.{W, Func, Inst, Machine, Memory, Table, Frame, Trap, HostFn};
+
+extern "C" fn memcpy(d: *u8, s: *u8, n: u64) -> *u8;
+
+/// What an export or import refers to.
+pub struct Extern {
+    kind: u8,
+    func: ?*Func,
+    table: ?*Table,
+    memory: ?*Memory,
+    global: ?*u64,
+    gtype: u8,
+    gmut: bool,
+}
+
+pub struct ModInst {
+    inst: *Inst,
+    exports: map.HashMap<str, Extern>,
+}
+
+pub enum ErrKind { Malformed, Invalid, Unlinkable, Trap }
+pub struct Error { kind: ErrKind, msg: str }
+
+const STACK_SLOTS: u64 = 1 << 20;
+const FRAMES: u64 = 30000;
+
+pub struct Engine {
+    m: Machine,
+    registry: map.HashMap<str, *ModInst>,
+    sigs: map.HashMap<str, u32>,
+    arena: mem.Arena,
+    stub_func: Func,
+    stub_inst: Inst,
+    msg: text.StrBuf,
+}
+
+fn empty_inst(m: *Module) -> Inst {
+    Inst {
+        funcs: mem.Vec.new(), globals: mem.Vec.new(), global_types: mem.Vec.new(),
+        global_muts: mem.Vec.new(), memory: None, tables: mem.Vec.new(), sigs: mem.Vec.new(),
+        module: m, elem_dropped: mem.Vec.new(), data_dropped: mem.Vec.new(), elem_vals: mem.Vec.new(),
+    }
+}
+
+var EMPTY_MODULE: ?*Module = None;
+
+fn empty_module() -> *Module {
+    if let Some(m) = EMPTY_MODULE { return m; }
+    let m = mem.alloc<Module>(1);
+    *m = Module.new();
+    EMPTY_MODULE = Some(m);
+    m
+}
+
+/// A verified one-instruction stub (HALT, RESTORE).
+fn stub(e: *Engine, w: u64) -> *u64 {
+    let code = mem.alloc<u64>(1);
+    code[0] = w;
+    match W.verify(code.slice(1), &e.stub_func, &e.stub_inst) {
+        Ok(v) => v.start(),
+        Err(err) => { io.eprintln(err.message()); trap() }
+    }
+}
+
+pub fn Engine.new() -> *Engine {
+    let e = mem.alloc<Engine>(1);
+    let em = empty_module();
+    *e = Engine {
+        m: Machine {
+            inst: mem.alloc<Inst>(1),
+            funcs: mem.alloc<*Func>(1), globals: mem.alloc<*u64>(1), sigs: mem.alloc<u32>(1),
+            table: mem.alloc<Table>(1), memory: mem.alloc<Memory>(1), mem_size: 0,
+            stack: mem.alloc<u64>(STACK_SLOTS), stack_end: mem.alloc<u64>(1),
+            frames: mem.alloc<Frame>(FRAMES), frames_end: mem.alloc<Frame>(1),
+            halt_pc: mem.alloc<u64>(1), restore_pc: mem.alloc<u64>(1),
+            host_trap: Trap.Host,
+            empty_table: Table { elems: mem.alloc<u64>(1), size: 0, max: 0, reftype: T_FUNCREF },
+            empty_memory: Memory { data: mem.alloc<u8>(16), size: 0, max_pages: 0 },
+            exit_code: 0,
+        },
+        registry: map.HashMap.new(),
+        sigs: map.HashMap.new(),
+        arena: mem.Arena.new(),
+        stub_func: Func {
+            code: W.placeholder(), nparams: 0, nlocals: 0, nslots: 1, nresults: 0, sig: 0,
+            inst: mem.alloc<Inst>(1), host: None, host_data: 0,
+        },
+        stub_inst: empty_inst(em),
+        msg: text.StrBuf.new(),
+    };
+    e.m.stack_end = e.m.stack + (STACK_SLOTS - 1024);
+    e.m.frames_end = e.m.frames + (FRAMES - 4);
+    *e.m.inst = empty_inst(em);
+    e.m.switch_to(e.m.inst);
+    e.m.halt_pc = stub(e, W.HALT());
+    e.m.restore_pc = stub(e, W.RESTORE());
+    e
+}
+
+/// The canonical id of a function type.
+pub fn Engine.sig(e: *Engine, params: []u8, results: []u8) -> u32 {
+    var b = text.StrBuf.new();
+    defer b.free();
+    for i in 0..params.len { b.push(params[i]); }
+    b.push(0);
+    for i in 0..results.len { b.push(results[i]); }
+    if let Some(id) = e.sigs.get(b.as_str()) { return id; }
+    let id = e.sigs.len as u32;
+    let key = e.arena.str(b.as_str());
+    e.sigs.insert(key, id);
+    id
+}
+
+fn invalid(msg: str) -> Error { Error { kind: ErrKind.Invalid, msg: msg } }
+
+fn check_limits(l: Limits, max: u64, msg: str) -> Result<(), Error> {
+    if l.min > max or (l.has_max and l.max > max) { return Err(invalid(msg)); }
+    if l.has_max and l.min > l.max { return Err(invalid("size minimum must not be greater than maximum")); }
+    Ok(())
+}
+
+/// The type of a constant expression, checked against `want`.
+fn check_const(m: *Module, e: ConstExpr, want: u8, nglobals: u64) -> Result<(), Error> {
+    if !e.ok {
+        if e.nops == 0 or e.op != 0xFF { return Err(invalid("type mismatch")); }
+        return Err(invalid("constant expression required"));
+    }
+    let ty = match e.op {
+        0x41 => T_I32, 0x42 => T_I64, 0x43 => T_F32, 0x44 => T_F64,
+        0x23 => {
+            if (e.idx as u64) >= nglobals { return Err(invalid("unknown global")); }
+            if e.idx >= m.nglobal_imports { return Err(invalid("unknown global")); }
+            let g = m.globals.at(e.idx as u64);
+            if g.mutable { return Err(invalid("constant expression required")); }
+            g.ty
+        }
+        0xD0 => e.idx as u8,
+        0xD2 => {
+            if (e.idx as u64) >= m.funcs.len { return Err(invalid("unknown function")); }
+            T_FUNCREF
+        }
+        _ => return Err(invalid("constant expression required")),
+    };
+    if ty != want { return Err(invalid("type mismatch")); }
+    Ok(())
+}
+
+/// Module-level validation (bodies are validated by compile).
+pub fn validate_module(m: *Module) -> Result<(), Error> {
+    let ntypes = m.types.len;
+    for i in 0..m.funcs.len {
+        if (m.funcs.at(i) as u64) >= ntypes { return Err(invalid("unknown type")); }
+    }
+    for i in 0..m.tables.len {
+        check_limits(m.tables.at(i).lim, 0xFFFFFFFF, "table size must be at most 2^32-1")?;
+    }
+    if m.mems.len > 1 { return Err(invalid("multiple memories")); }
+    for i in 0..m.mems.len {
+        check_limits(m.mems.at(i), 65536, "memory size must be at most 65536 pages (4GiB)")?;
+    }
+    for i in (m.nglobal_imports as u64)..m.globals.len {
+        let g = m.globals.at(i);
+        check_const(m, g.init, g.ty, i)?;
+    }
+    var names: map.HashMap<str, bool> = map.HashMap.new();
+    defer names.free();
+    for i in 0..m.exports.len {
+        let x = m.exports.at(i);
+        if !names.insert(x.name, true) { return Err(invalid("duplicate export name")); }
+        let n = match x.kind {
+            0 => m.funcs.len, 1 => m.tables.len, 2 => m.mems.len, _ => m.globals.len,
+        };
+        if (x.index as u64) >= n {
+            return Err(invalid(match x.kind {
+                0 => "unknown function", 1 => "unknown table", 2 => "unknown memory", _ => "unknown global",
+            }));
+        }
+    }
+    if let Some(s) = m.start {
+        if (s as u64) >= m.funcs.len { return Err(invalid("unknown function")); }
+        let ft = m.types.at(m.funcs.at(s as u64) as u64);
+        if ft.params.len != 0 or ft.results.len != 0 { return Err(invalid("start function")); }
+    }
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
+        if s.mode == 0 {
+            if (s.table as u64) >= m.tables.len { return Err(invalid("unknown table")); }
+            check_const(m, s.offset, T_I32, m.globals.len)?;
+            if m.tables.at(s.table as u64).reftype != s.reftype { return Err(invalid("type mismatch")); }
+        }
+        for j in 0..s.funcs.len {
+            check_const(m, s.funcs.at(j), s.reftype, m.globals.len)?;
+        }
+    }
+    for i in 0..m.datas.len {
+        let d = m.datas.at(i);
+        if d.active {
+            if (d.mem as u64) >= m.mems.len { return Err(invalid("unknown memory")); }
+            check_const(m, d.offset, T_I32, m.globals.len)?;
+        }
+    }
+    Ok(())
+}
+
+fn unlinkable(msg: str) -> Error { Error { kind: ErrKind.Unlinkable, msg: msg } }
+
+fn limits_match(have_min: u64, have_max: u64, have_has: bool, want: Limits) -> bool {
+    if have_min < want.min { return false; }
+    if want.has_max {
+        if !have_has { return false; }
+        if have_max > want.max { return false; }
+    }
+    true
+}
+
+fn Engine.lookup(e: *Engine, module: str, name: str) -> ?Extern {
+    let mi = e.registry.get(module)?;
+    mi.exports.get(name)
+}
+
+fn eval_const(inst: *Inst, c: ConstExpr) -> u64 {
+    match c.op {
+        0x23 => *inst.globals.at(c.idx as u64),
+        0xD0 => 0,
+        0xD2 => inst.funcs.at(c.idx as u64) as u64,
+        _ => c.bits,
+    }
+}
+
+fn trap_err(t: Trap) -> Error { Error { kind: ErrKind.Trap, msg: vm.trap_message(t) } }
+
+/// Validates, links and instantiates `m`, running its start function.
+pub fn Engine.instantiate(e: *Engine, m: *Module) -> Result<*ModInst, Error> {
+    validate_module(m)?;
+    // Validate and translate every function body.
+    // Functions that ref.func may name: those in element segments,
+    // exports and global initializers.
+    var declared: mem.Vec<bool> = mem.Vec.new();
+    defer declared.free();
+    for i in 0..m.funcs.len { declared.push(false); }
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
+        for j in 0..s.funcs.len {
+            let e = s.funcs.at(j);
+            if e.op == 0xD2 and (e.idx as u64) < m.funcs.len { declared.set(e.idx as u64, true); }
+        }
+    }
+    for i in 0..m.exports.len {
+        let x = m.exports.at(i);
+        if x.kind == 0 and (x.index as u64) < m.funcs.len { declared.set(x.index as u64, true); }
+    }
+    for i in 0..m.globals.len {
+        let e = m.globals.at(i).init;
+        if e.op == 0xD2 and (e.idx as u64) < m.funcs.len { declared.set(e.idx as u64, true); }
+    }
+    var compiled: mem.Vec<compile.Compiled> = mem.Vec.new();
+    defer compiled.free();
+    for i in (m.nfunc_imports as u64)..m.funcs.len {
+        match compile.compile(m, i, &declared) {
+            Ok(c) => compiled.push(c),
+            Err(msg) => {
+                e.msg.clear();
+                e.msg.fmt("{}", msg).add(" (function ").add(i).add(")");
+                return Err(invalid(e.msg.as_str()));
+            }
+        }
+    }
+
+    let inst = mem.alloc<Inst>(1);
+    *inst = empty_inst(m);
+    for i in 0..m.types.len {
+        let ft = m.types.at(i);
+        inst.sigs.push(e.sig(ft.params, ft.results));
+    }
+    // Imports.
+    for i in 0..m.imports.len {
+        let imp = m.imports.ptr_at(i);
+        let Some(x) = e.lookup(imp.module, imp.name) else { return Err(unlinkable("unknown import")); };
+        if x.kind != imp.kind { return Err(unlinkable("incompatible import type")); }
+        match imp.kind {
+            0 => {
+                let f = x.func.unwrap();
+                if f.sig != inst.sigs.at(imp.index as u64) { return Err(unlinkable("incompatible import type")); }
+                inst.funcs.push(f);
+            }
+            1 => {
+                let t = x.table.unwrap();
+                if t.reftype != imp.reftype or !limits_match(t.size, t.max, t.max != 0xFFFFFFFFFFFFFFFF, imp.lim) {
+                    return Err(unlinkable("incompatible import type"));
+                }
+                inst.tables.push(t);
+            }
+            2 => {
+                let mm = x.memory.unwrap();
+                if !limits_match(mm.size >> 16, mm.max_pages, mm.max_pages != 65536, imp.lim) {
+                    return Err(unlinkable("incompatible import type"));
+                }
+                inst.memory = Some(mm);
+            }
+            _ => {
+                if x.gtype != imp.gtype or x.gmut != imp.gmut { return Err(unlinkable("incompatible import type")); }
+                inst.globals.push(x.global.unwrap());
+                inst.global_types.push(x.gtype);
+                inst.global_muts.push(x.gmut);
+            }
+        }
+    }
+    // Functions: create them all first (the verifier checks call
+    // targets against the instance's function count).
+    for i in (m.nfunc_imports as u64)..m.funcs.len {
+        let ft = m.types.at(m.funcs.at(i) as u64);
+        let c = compiled.at(i - (m.nfunc_imports as u64));
+        let f = mem.alloc<Func>(1);
+        *f = Func {
+            code: W.placeholder(), nparams: ft.params.len as u32, nlocals: c.nlocals,
+            nslots: c.nslots, nresults: ft.results.len as u32,
+            sig: inst.sigs.at(m.funcs.at(i) as u64), inst: inst, host: None, host_data: 0,
+        };
+        inst.funcs.push(f);
+    }
+    // Globals.
+    for i in (m.nglobal_imports as u64)..m.globals.len {
+        let g = m.globals.at(i);
+        let cell = mem.alloc<u64>(1);
+        *cell = eval_const(inst, g.init);
+        inst.globals.push(cell);
+        inst.global_types.push(g.ty);
+        inst.global_muts.push(g.mutable);
+    }
+    // Tables and memory.
+    for i in (m.ntable_imports as u64)..m.tables.len {
+        let td = m.tables.at(i);
+        let size = td.lim.min;
+        if size > 10000000 { return Err(trap_err(Trap.TableOOB)); }
+        let t = mem.alloc<Table>(1);
+        *t = Table { elems: mem.alloc<u64>(size + 1), size: size, max: td.lim.max, reftype: td.reftype };
+        inst.tables.push(t);
+    }
+    if (m.nmem_imports as u64) < m.mems.len {
+        let l = m.mems.at(0);
+        if l.min > 32768 { return Err(Error { kind: ErrKind.Trap, msg: "memory too large for this host" }); }
+        let mm = mem.alloc<Memory>(1);
+        let Some(data) = mem.try_alloc<u8>((l.min << 16) + 8) else {
+            return Err(Error { kind: ErrKind.Trap, msg: "out of memory" });
+        };
+        *mm = Memory { data: data, size: l.min << 16, max_pages: if l.has_max { l.max } else { 65536 } };
+        inst.memory = Some(mm);
+    }
+    // Verify the translated code against the instance.
+    for i in (m.nfunc_imports as u64)..m.funcs.len {
+        let f = inst.funcs.at(i);
+        let c = compiled.at(i - (m.nfunc_imports as u64));
+        match W.verify(c.words, f, inst) {
+            Ok(v) => f.code = v,
+            Err(err) => {
+                e.msg.clear();
+                e.msg.push_str("internal error: translated code fails verification: ");
+                err.write(&e.msg);
+                io.eprintln(e.msg.as_str());
+                var b = text.StrBuf.new();
+                W.disasm(c.words, &b);
+                io.eprintln(b.as_str());
+                return Err(invalid(e.msg.as_str()));
+            }
+        }
+    }
+    // Exports.
+    let mi = mem.alloc<ModInst>(1);
+    *mi = ModInst { inst: inst, exports: map.HashMap.new() };
+    for i in 0..m.exports.len {
+        let x = m.exports.at(i);
+        let idx = x.index as u64;
+        var ext = Extern { kind: x.kind, func: None, table: None, memory: None, global: None, gtype: 0, gmut: false };
+        match x.kind {
+            0 => ext.func = Some(inst.funcs.at(idx)),
+            1 => ext.table = Some(inst.tables.at(idx)),
+            2 => ext.memory = inst.memory,
+            _ => {
+                ext.global = Some(inst.globals.at(idx));
+                ext.gtype = inst.global_types.at(idx);
+                ext.gmut = inst.global_muts.at(idx);
+            }
+        }
+        mi.exports.insert(x.name, ext);
+    }
+    // Element and data segments, in order; the first out-of-bounds one
+    // traps (the earlier ones stay written).
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
+        let vals = mem.alloc<u64>(s.funcs.len + 1);
+        for j in 0..s.funcs.len { vals[j] = eval_const(inst, s.funcs.at(j)); }
+        inst.elem_vals.push(vals.slice(s.funcs.len));
+        // passive segments stay; declarative ones are dropped at once
+        inst.elem_dropped.push(s.mode == 2);
+    }
+    for i in 0..m.elems.len {
+        let s = m.elems.ptr_at(i);
+        if s.mode != 0 { continue; }
+        let t = inst.tables.at(s.table as u64);
+        let off = eval_const(inst, s.offset) & 0xFFFFFFFF;
+        if off + s.funcs.len > t.size { return Err(trap_err(Trap.TableOOB)); }
+        let vals = inst.elem_vals.at(i);
+        for j in 0..vals.len { t.elems[off + j] = vals[j]; }
+        inst.elem_dropped.set(i, true);
+    }
+    for i in 0..m.datas.len {
+        let d = m.datas.at(i);
+        inst.data_dropped.push(false);
+        if !d.active { continue; }
+        let mm = inst.memory.unwrap();
+        let off = eval_const(inst, d.offset) & 0xFFFFFFFF;
+        if off + d.bytes.len > mm.size { return Err(trap_err(Trap.MemOOB)); }
+        if d.bytes.len > 0 { memcpy(mm.data + off, d.bytes.ptr, d.bytes.len); }
+        inst.data_dropped.set(i, true);
+    }
+    if let Some(s) = m.start {
+        let f = inst.funcs.at(s as u64);
+        var none: [u64; 1] = [0; 1];
+        if let Err(t) = e.invoke(f, none[0..0]) { return Err(trap_err(t)); }
+    }
+    Ok(mi)
+}
+
+fn unsafe_func(v: u64) -> *Func { v as *Func }
+
+/// Calls `f` with `args`; the results are in `e.m.stack[0..f.nresults]`.
+pub fn Engine.invoke(e: *Engine, f: *Func, args: []u64) -> Result<(), Trap> {
+    let st = e.m.stack;
+    for i in 0..args.len { st[i] = args[i]; }
+    if let Some(h) = f.host {
+        if !h(&e.m, st) { return Err(e.m.host_trap); }
+        return Ok(());
+    }
+    e.m.switch_to(f.inst);
+    W.run(&e.m, f, st)
+}
+
+pub fn Engine.register(e: *Engine, name: str, mi: *ModInst) {
+    let key = e.arena.str(name);
+    e.registry.insert(key, mi);
+}
+
+// ── host modules ─────────────────────────────────────────────────────
+
+pub fn Engine.host_func(e: *Engine, params: []u8, results: []u8, h: HostFn, data: u64) -> *Func {
+    let f = mem.alloc<Func>(1);
+    *f = Func {
+        code: W.placeholder(), nparams: params.len as u32, nlocals: params.len as u32,
+        nslots: (params.len + results.len) as u32, nresults: results.len as u32,
+        sig: e.sig(params, results), inst: e.m.inst, host: Some(h), host_data: data,
+    };
+    f
+}
+
+pub fn ModInst.new() -> *ModInst {
+    let mi = mem.alloc<ModInst>(1);
+    *mi = ModInst { inst: mem.alloc<Inst>(1), exports: map.HashMap.new() };
+    *mi.inst = empty_inst(empty_module());
+    mi
+}
+
+pub fn ModInst.add_func(mi: *ModInst, name: str, f: *Func) {
+    mi.exports.insert(name, Extern { kind: 0, func: Some(f), table: None, memory: None, global: None, gtype: 0, gmut: false });
+}
+
+pub fn ModInst.add_global(mi: *ModInst, name: str, ty: u8, bits: u64) {
+    let cell = mem.alloc<u64>(1);
+    *cell = bits;
+    mi.exports.insert(name, Extern { kind: 3, func: None, table: None, memory: None, global: Some(cell), gtype: ty, gmut: false });
+}

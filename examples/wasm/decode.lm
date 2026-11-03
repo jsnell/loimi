@@ -1,0 +1,628 @@
+// WebAssembly binary format decoder.
+//
+// Decodes a .wasm module into `Module`, checking everything the spec
+// calls "malformed" (LEB128 encodings, section order and sizes, UTF-8
+// names, opcode syntax inside function bodies). Type checking is the
+// validator's job (compile.lm), which runs only on modules that decoded.
+import std.mem;
+import std.text;
+
+pub const T_I32: u8 = 0x7F;
+pub const T_I64: u8 = 0x7E;
+pub const T_F32: u8 = 0x7D;
+pub const T_F64: u8 = 0x7C;
+pub const T_FUNCREF: u8 = 0x70;
+pub const T_EXTERNREF: u8 = 0x6F;
+
+pub const K_FUNC: u8 = 0;
+pub const K_TABLE: u8 = 1;
+pub const K_MEM: u8 = 2;
+pub const K_GLOBAL: u8 = 3;
+
+/// Limits of a table or memory. `max` is u64.MAX when absent.
+pub struct Limits { min: u64, max: u64, has_max: bool }
+
+pub struct FuncType { params: []u8, results: []u8 }
+
+/// A constant expression. `ok` is false if it is anything but one
+/// constant instruction followed by `end` (the validator reports it).
+/// op: 0x41..0x44 consts, 0x23 global.get, 0xD0 ref.null, 0xD2 ref.func.
+pub struct ConstExpr { op: u8, bits: u64, idx: u32, ok: bool, nops: u32 }
+
+pub struct Import {
+    module: str,
+    name: str,
+    kind: u8,
+    /// Function: type index. Global: value type.
+    index: u32,
+    lim: Limits,
+    reftype: u8,
+    gtype: u8,
+    gmut: bool,
+}
+
+pub struct Export { name: str, kind: u8, index: u32 }
+pub struct TableDef { lim: Limits, reftype: u8 }
+pub struct GlobalDef { ty: u8, mutable: bool, init: ConstExpr }
+
+/// mode: 0 active, 1 passive, 2 declarative.
+pub struct ElemSeg { mode: u8, table: u32, offset: ConstExpr, reftype: u8, funcs: mem.Vec<ConstExpr> }
+pub struct DataSeg { active: bool, mem: u32, offset: ConstExpr, bytes: []u8 }
+
+/// A function body: local declarations expanded to one type per local
+/// (parameters not included), and the instruction bytes up to and
+/// including the final `end`.
+pub struct Body { locals: mem.Vec<u8>, code: []u8, offset: u64 }
+
+pub struct Module {
+    types: mem.Vec<FuncType>,
+    imports: mem.Vec<Import>,
+    /// Type index of every function, imported ones first.
+    funcs: mem.Vec<u32>,
+    nfunc_imports: u32,
+    tables: mem.Vec<TableDef>,
+    ntable_imports: u32,
+    mems: mem.Vec<Limits>,
+    nmem_imports: u32,
+    globals: mem.Vec<GlobalDef>,
+    nglobal_imports: u32,
+    exports: mem.Vec<Export>,
+    start: ?u32,
+    elems: mem.Vec<ElemSeg>,
+    datas: mem.Vec<DataSeg>,
+    data_count: ?u32,
+    /// Code uses memory.init or data.drop (needs a data count section).
+    uses_data_idx: bool,
+    bodies: mem.Vec<Body>,
+    arena: mem.Arena,
+}
+
+pub struct Reader { buf: []u8, pos: u64, end: u64 }
+
+pub fn Reader.new(buf: []u8) -> Reader { Reader { buf: buf, pos: 0, end: buf.len } }
+
+pub fn Reader.at_end(r: *Reader) -> bool { r.pos >= r.end }
+
+pub fn Reader.byte(r: *Reader) -> Result<u8, str> {
+    if r.pos >= r.end { return Err("unexpected end"); }
+    let b = r.buf[r.pos];
+    r.pos += 1;
+    Ok(b)
+}
+
+pub fn Reader.bytes(r: *Reader, n: u64) -> Result<[]u8, str> {
+    if n > r.end - r.pos { return Err("unexpected end"); }
+    let s = r.buf[r.pos..r.pos + n];
+    r.pos += n;
+    Ok(s)
+}
+
+/// Unsigned LEB128 of at most `bits` bits.
+pub fn Reader.uleb(r: *Reader, bits: u32) -> Result<u64, str> {
+    var result: u64 = 0;
+    var shift: u32 = 0;
+    loop {
+        if r.pos >= r.end { return Err("unexpected end"); }
+        let b = r.buf[r.pos];
+        r.pos += 1;
+        let maxbytes = (bits + 6) / 7;
+        if shift / 7 + 1 == maxbytes {
+            // Last byte allowed: no continuation, unused bits zero.
+            if b & 0x80 != 0 { return Err("integer representation too long"); }
+            let used = bits - shift;
+            if used < 7 and (b as u64) >> used != 0 { return Err("integer too large"); }
+            result = result | ((b as u64) << shift);
+            return Ok(result);
+        }
+        result = result | (((b & 0x7F) as u64) << shift);
+        if b & 0x80 == 0 { return Ok(result); }
+        shift += 7;
+    }
+}
+
+/// Signed LEB128 of at most `bits` bits, sign-extended to i64.
+pub fn Reader.sleb(r: *Reader, bits: u32) -> Result<i64, str> {
+    var result: u64 = 0;
+    var shift: u32 = 0;
+    loop {
+        if r.pos >= r.end { return Err("unexpected end"); }
+        let b = r.buf[r.pos];
+        r.pos += 1;
+        let maxbytes = (bits + 6) / 7;
+        if shift / 7 + 1 == maxbytes {
+            if b & 0x80 != 0 { return Err("integer representation too long"); }
+            let used = bits - shift;
+            // The bits above `used` (within 7) must equal the sign bit.
+            if used < 7 {
+                let sign = (b >> (used - 1)) & 1;
+                let rest = (b & 0x7F) >> used;
+                let want: u8 = if sign == 1 { (0x7F >> used) } else { 0 };
+                if rest != want { return Err("integer too large"); }
+            }
+            result = result | (((b & 0x7F) as u64) << shift);
+            shift += 7;
+            if shift < 64 and (b & 0x40) != 0 { result = result | (~(0 as u64) << shift); }
+            return Ok(result as i64);
+        }
+        result = result | (((b & 0x7F) as u64) << shift);
+        shift += 7;
+        if b & 0x80 == 0 {
+            if shift < 64 and (b & 0x40) != 0 { result = result | (~(0 as u64) << shift); }
+            return Ok(result as i64);
+        }
+    }
+}
+
+pub fn Reader.u32(r: *Reader) -> Result<u32, str> { Ok(r.uleb(32)? as u32) }
+
+pub fn Reader.fixed32(r: *Reader) -> Result<u32, str> {
+    let s = r.bytes(4)?;
+    Ok((s[0] as u32) | ((s[1] as u32) << 8) | ((s[2] as u32) << 16) | ((s[3] as u32) << 24))
+}
+
+pub fn Reader.fixed64(r: *Reader) -> Result<u64, str> {
+    let lo = r.fixed32()? as u64;
+    let hi = r.fixed32()? as u64;
+    Ok(lo | (hi << 32))
+}
+
+pub fn valid_utf8(s: []u8) -> bool {
+    var i: u64 = 0;
+    while i < s.len {
+        let c = s[i];
+        if c < 0x80 { i += 1; continue; }
+        var n: u64 = 0;
+        var min: u32 = 0;
+        var cp: u32 = 0;
+        if c & 0xE0 == 0xC0 { n = 1; min = 0x80; cp = (c & 0x1F) as u32; }
+        else if c & 0xF0 == 0xE0 { n = 2; min = 0x800; cp = (c & 0x0F) as u32; }
+        else if c & 0xF8 == 0xF0 { n = 3; min = 0x10000; cp = (c & 0x07) as u32; }
+        else { return false; }
+        if i + n >= s.len { return false; }
+        for j in 1..n + 1 {
+            let d = s[i + j];
+            if d & 0xC0 != 0x80 { return false; }
+            cp = (cp << 6) | ((d & 0x3F) as u32);
+        }
+        if cp < min or cp > 0x10FFFF or (cp >= 0xD800 and cp < 0xE000) { return false; }
+        i += n + 1;
+    }
+    true
+}
+
+pub fn Reader.name(r: *Reader) -> Result<str, str> {
+    let n = r.u32()? as u64;
+    let s = r.bytes(n)?;
+    if !valid_utf8(s) { return Err("malformed UTF-8 encoding"); }
+    Ok(s)
+}
+
+pub fn is_valtype(t: u8) -> bool {
+    t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 or t == T_FUNCREF or t == T_EXTERNREF
+}
+
+pub fn Reader.valtype(r: *Reader) -> Result<u8, str> {
+    let t = r.byte()?;
+    if !is_valtype(t) { return Err("malformed value type"); }
+    Ok(t)
+}
+
+pub fn Reader.reftype(r: *Reader) -> Result<u8, str> {
+    let t = r.byte()?;
+    if t != T_FUNCREF and t != T_EXTERNREF { return Err("malformed reference type"); }
+    Ok(t)
+}
+
+pub fn Reader.limits(r: *Reader, bits: u32) -> Result<Limits, str> {
+    let flag = r.byte()?;
+    if flag > 1 { return Err("integer too large"); }
+    let min = r.uleb(bits)?;
+    if flag == 1 {
+        let max = r.uleb(bits)?;
+        return Ok(Limits { min: min, max: max, has_max: true });
+    }
+    Ok(Limits { min: min, max: 0xFFFFFFFFFFFFFFFF, has_max: false })
+}
+
+/// Skips one block type: 0x40, a value type, or a type index (s33).
+pub fn Reader.blocktype(r: *Reader) -> Result<i64, str> {
+    if r.pos >= r.end { return Err("unexpected end"); }
+    let b = r.buf[r.pos];
+    if b == 0x40 { r.pos += 1; return Ok(-64); }
+    if b >= 0x40 and b < 0x80 {
+        r.pos += 1;
+        if !is_valtype(b) { return Err("malformed value type"); }
+        return Ok(-(b as i64));   // negative: a value type
+    }
+    let x = r.sleb(33)?;
+    if x < 0 { return Err("malformed type index"); }
+    Ok(x)
+}
+
+pub fn Reader.memarg(r: *Reader) -> Result<(u32, u32), str> {
+    let align = r.u32()?;
+    let offset = r.u32()?;
+    Ok((align, offset))
+}
+
+/// Reads one instruction's opcode and immediates without interpreting
+/// them; returns the opcode (0xFC-prefixed ones as 0xFC00 + sub).
+/// This is the syntactic check: unknown opcodes and bad immediates are
+/// malformed.
+pub fn Reader.skip_instr(r: *Reader) -> Result<u32, str> {
+    let op = r.byte()?;
+    match op {
+        0x00 | 0x01 | 0x05 | 0x0B | 0x0F | 0x1A | 0x1B | 0xD1 => {}
+        0x02 | 0x03 | 0x04 => { r.blocktype()?; }
+        0x0C | 0x0D => { r.u32()?; }
+        0x0E => {
+            let n = r.u32()?;
+            for i in 0..n + 1 { r.u32()?; }
+        }
+        0x10 => { r.u32()?; }
+        0x11 => { r.u32()?; r.u32()?; }
+        0x1C => {
+            let n = r.u32()?;
+            for i in 0..n { r.valtype()?; }
+        }
+        0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 => { r.u32()?; }
+        0x28..=0x3E => { r.memarg()?; }
+        0x3F | 0x40 => {
+            let b = r.byte()?;
+            if b != 0 { return Err("zero byte expected"); }
+        }
+        0x41 => { r.sleb(32)?; }
+        0x42 => { r.sleb(64)?; }
+        0x43 => { r.fixed32()?; }
+        0x44 => { r.fixed64()?; }
+        0x45..=0xC4 => {}
+        0xD0 => { r.reftype()?; }
+        0xD2 => { r.u32()?; }
+        0xFC => {
+            let sub = r.u32()?;
+            match sub {
+                0..=7 => {}
+                8 => { r.u32()?; let b = r.byte()?; if b != 0 { return Err("zero byte expected"); } }
+                9 => { r.u32()?; }
+                10 => {
+                    let a = r.byte()?; let b = r.byte()?;
+                    if a != 0 or b != 0 { return Err("zero byte expected"); }
+                }
+                11 => { let b = r.byte()?; if b != 0 { return Err("zero byte expected"); } }
+                12 => { r.u32()?; r.u32()?; }
+                13 => { r.u32()?; }
+                14 => { r.u32()?; r.u32()?; }
+                15 | 16 | 17 => { r.u32()?; }
+                _ => return Err("illegal opcode"),
+            }
+            return Ok(0xFC00 + sub);
+        }
+        _ => return Err("illegal opcode"),
+    }
+    Ok(op as u32)
+}
+
+/// A constant expression: instructions up to `end`. Records the first
+/// instruction if it is the only one.
+pub fn Reader.const_expr(r: *Reader) -> Result<ConstExpr, str> {
+    var e = ConstExpr { op: 0, bits: 0, idx: 0, ok: false, nops: 0 };
+    var depth: u32 = 0;
+    loop {
+        let start = r.pos;
+        let op = r.skip_instr()?;
+        if op == 0x0B {
+            if depth == 0 { break; }
+            depth -= 1;
+            continue;
+        }
+        if op == 0x02 or op == 0x03 or op == 0x04 { depth += 1; }
+        e.nops += 1;
+        if e.nops == 1 {
+            // Re-read the immediate.
+            var s = Reader { buf: r.buf, pos: start + 1, end: r.end };
+            e.op = op as u8;
+            match op {
+                0x41 => { e.bits = (s.sleb(32)? as u64) & 0xFFFFFFFF; e.ok = true; }
+                0x42 => { e.bits = s.sleb(64)? as u64; e.ok = true; }
+                0x43 => { e.bits = s.fixed32()? as u64; e.ok = true; }
+                0x44 => { e.bits = s.fixed64()?; e.ok = true; }
+                0x23 => { e.idx = s.u32()?; e.ok = true; }
+                0xD0 => { e.idx = s.byte()? as u32; e.ok = true; }
+                0xD2 => { e.idx = s.u32()?; e.ok = true; }
+                _ => { e.op = 0xFF; }
+            }
+        } else {
+            e.ok = false;
+        }
+    }
+    if e.nops != 1 { e.ok = false; }
+    Ok(e)
+}
+
+pub fn Module.new() -> Module {
+    Module {
+        types: mem.Vec.new(), imports: mem.Vec.new(), funcs: mem.Vec.new(), nfunc_imports: 0,
+        tables: mem.Vec.new(), ntable_imports: 0, mems: mem.Vec.new(), nmem_imports: 0,
+        globals: mem.Vec.new(), nglobal_imports: 0, exports: mem.Vec.new(), start: None,
+        elems: mem.Vec.new(), datas: mem.Vec.new(), data_count: None, uses_data_idx: false, bodies: mem.Vec.new(),
+        arena: mem.Arena.new(),
+    }
+}
+
+fn Module.copy_types(m: *Module, ts: *mem.Vec<u8>) -> []u8 {
+    let n = ts.len;
+    if n == 0 { return []; }
+    let p = m.arena.alloc_bytes(n, 1);
+    mem.copy(p, ts.ptr, n);
+    p.slice(n)
+}
+
+fn Module.section(m: *Module, id: u8, r: *Reader, nfuncs_declared: *u64) -> Result<(), str> {
+    match id {
+        1 => {
+            let n = r.u32()?;
+            for i in 0..n {
+                let form = r.byte()?;
+                if form != 0x60 { return Err("integer representation too long"); }
+                var ps: mem.Vec<u8> = mem.Vec.new();
+                let np = r.u32()?;
+                for j in 0..np { ps.push(r.valtype()?); }
+                var rs: mem.Vec<u8> = mem.Vec.new();
+                let nr = r.u32()?;
+                for j in 0..nr { rs.push(r.valtype()?); }
+                let params = m.copy_types(&ps);
+                let results = m.copy_types(&rs);
+                ps.free(); rs.free();
+                m.types.push(FuncType { params: params, results: results });
+            }
+        }
+        2 => {
+            let n = r.u32()?;
+            for i in 0..n {
+                let module = r.name()?;
+                let name = r.name()?;
+                let kind = r.byte()?;
+                var imp = Import {
+                    module: module, name: name, kind: kind, index: 0,
+                    lim: Limits { min: 0, max: 0, has_max: false }, reftype: 0, gtype: 0, gmut: false,
+                };
+                match kind {
+                    0 => {
+                        imp.index = r.u32()?;
+                        m.funcs.push(imp.index);
+                        m.nfunc_imports += 1;
+                    }
+                    1 => {
+                        imp.reftype = r.reftype()?;
+                        imp.lim = r.limits(32)?;
+                        m.tables.push(TableDef { lim: imp.lim, reftype: imp.reftype });
+                        m.ntable_imports += 1;
+                    }
+                    2 => {
+                        imp.lim = r.limits(32)?;
+                        m.mems.push(imp.lim);
+                        m.nmem_imports += 1;
+                    }
+                    3 => {
+                        imp.gtype = r.valtype()?;
+                        let mu = r.byte()?;
+                        if mu > 1 { return Err("malformed mutability"); }
+                        imp.gmut = mu == 1;
+                        m.globals.push(GlobalDef {
+                            ty: imp.gtype, mutable: imp.gmut,
+                            init: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 },
+                        });
+                        m.nglobal_imports += 1;
+                    }
+                    _ => return Err("malformed import kind"),
+                }
+                m.imports.push(imp);
+            }
+        }
+        3 => {
+            let n = r.u32()?;
+            *nfuncs_declared = n as u64;
+            for i in 0..n { m.funcs.push(r.u32()?); }
+        }
+        4 => {
+            let n = r.u32()?;
+            for i in 0..n {
+                let rt = r.reftype()?;
+                let lim = r.limits(32)?;
+                m.tables.push(TableDef { lim: lim, reftype: rt });
+            }
+        }
+        5 => {
+            let n = r.u32()?;
+            for i in 0..n { m.mems.push(r.limits(32)?); }
+        }
+        6 => {
+            let n = r.u32()?;
+            for i in 0..n {
+                let ty = r.valtype()?;
+                let mu = r.byte()?;
+                if mu > 1 { return Err("malformed mutability"); }
+                let init = r.const_expr()?;
+                m.globals.push(GlobalDef { ty: ty, mutable: mu == 1, init: init });
+            }
+        }
+        7 => {
+            let n = r.u32()?;
+            for i in 0..n {
+                let name = r.name()?;
+                let kind = r.byte()?;
+                if kind > 3 { return Err("malformed export kind"); }
+                let index = r.u32()?;
+                m.exports.push(Export { name: name, kind: kind, index: index });
+            }
+        }
+        8 => { m.start = Some(r.u32()?); }
+        9 => {
+            let n = r.u32()?;
+            for i in 0..n { m.elems.push(r.elem_seg()?); }
+        }
+        10 => {
+            let n = r.u32()? as u64;
+            if n != *nfuncs_declared { return Err("function and code section have inconsistent lengths"); }
+            for i in 0..n {
+                let size = r.u32()? as u64;
+                if size > r.end - r.pos { return Err("unexpected end"); }
+                var b = Reader { buf: r.buf, pos: r.pos, end: r.pos + size };
+                r.pos += size;
+                var locals: mem.Vec<u8> = mem.Vec.new();
+                let ngroups = b.u32()?;
+                var total: u64 = 0;
+                for g in 0..ngroups {
+                    let cnt = b.u32()? as u64;
+                    let t = b.valtype()?;
+                    total += cnt;
+                    if total > 50000 { return Err("too many locals"); }
+                    for k in 0..cnt { locals.push(t); }
+                }
+                let start = b.pos;
+                // Syntax check of the instructions; the body must end
+                // exactly at its last `end`.
+                var depth: u64 = 1;
+                while depth > 0 {
+                    if b.at_end() { return Err("unexpected end"); }
+                    let op = b.skip_instr()?;
+                    if op == 0xFC08 or op == 0xFC09 { m.uses_data_idx = true; }
+                    if op == 0x02 or op == 0x03 or op == 0x04 { depth += 1; }
+                    if op == 0x0B { depth -= 1; }
+                }
+                if !b.at_end() { return Err("section size mismatch"); }
+                m.bodies.push(Body { locals: locals, code: r.buf[start..b.pos], offset: start });
+            }
+        }
+        11 => {
+            let n = r.u32()?;
+            if let Some(c) = m.data_count {
+                if c != n { return Err("data count and data section have inconsistent lengths"); }
+            }
+            for i in 0..n {
+                let flag = r.u32()?;
+                match flag {
+                    0 => {
+                        let off = r.const_expr()?;
+                        let len = r.u32()? as u64;
+                        let bytes = r.bytes(len)?;
+                        m.datas.push(DataSeg { active: true, mem: 0, offset: off, bytes: bytes });
+                    }
+                    1 => {
+                        let len = r.u32()? as u64;
+                        let bytes = r.bytes(len)?;
+                        m.datas.push(DataSeg { active: false, mem: 0, offset: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 }, bytes: bytes });
+                    }
+                    2 => {
+                        let mi = r.u32()?;
+                        let off = r.const_expr()?;
+                        let len = r.u32()? as u64;
+                        let bytes = r.bytes(len)?;
+                        m.datas.push(DataSeg { active: true, mem: mi, offset: off, bytes: bytes });
+                    }
+                    _ => return Err("malformed data segment kind"),
+                }
+            }
+        }
+        12 => { m.data_count = Some(r.u32()?); }
+        _ => return Err("malformed section id"),
+    }
+    Ok(())
+}
+
+fn funcref_expr(idx: u32) -> ConstExpr { ConstExpr { op: 0xD2, bits: 0, idx: idx, ok: true, nops: 1 } }
+
+pub fn Reader.elem_seg(r: *Reader) -> Result<ElemSeg, str> {
+    let flag = r.u32()?;
+    if flag > 7 { return Err("malformed elements segment kind"); }
+    var seg = ElemSeg {
+        mode: 0, table: 0, offset: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 },
+        reftype: T_FUNCREF, funcs: mem.Vec.new(),
+    };
+    // bit 0: passive/declarative, bit 1: explicit table (active) or
+    // declarative (passive), bit 2: expressions instead of indices.
+    if flag & 1 == 0 {
+        seg.mode = 0;
+        if flag & 2 != 0 { seg.table = r.u32()?; }
+        seg.offset = r.const_expr()?;
+    } else {
+        seg.mode = if flag & 2 != 0 { 2 } else { 1 };
+    }
+    let exprs = flag & 4 != 0;
+    if flag & 3 != 0 {
+        // elemkind or reftype
+        if exprs {
+            seg.reftype = r.reftype()?;
+        } else {
+            let k = r.byte()?;
+            if k != 0 { return Err("malformed elements segment kind"); }
+        }
+    }
+    let n = r.u32()?;
+    for i in 0..n {
+        if exprs {
+            seg.funcs.push(r.const_expr()?);
+        } else {
+            seg.funcs.push(funcref_expr(r.u32()?));
+        }
+    }
+    Ok(seg)
+}
+
+fn section_rank(id: u8) -> u32 {
+    match id {
+        1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6, 7 => 7, 8 => 8, 9 => 9,
+        12 => 10, 10 => 11, 11 => 12,
+        _ => 100,
+    }
+}
+
+/// Decodes a whole module. Byte slices in the result point into `buf`,
+/// which must outlive the module.
+pub fn decode(buf: []u8) -> Result<Module, str> {
+    var m = Module.new();
+    var r = Reader.new(buf);
+    if buf.len < 4 { return Err("unexpected end"); }
+    let magic = r.fixed32()?;
+    if magic != 0x6D736100 { return Err("magic header not detected"); }
+    if buf.len < 8 { return Err("unexpected end"); }
+    let version = r.fixed32()?;
+    if version != 1 { return Err("unknown binary version"); }
+    var last: u32 = 0;
+    var nfuncs_declared: u64 = 0;
+    var saw_code = false;
+    while !r.at_end() {
+        let id = r.byte()?;
+        let size = r.u32()? as u64;
+        if size > r.end - r.pos { return Err("unexpected end of section or function"); }
+        var s = Reader { buf: buf, pos: r.pos, end: r.pos + size };
+        r.pos += size;
+        if id == 0 {
+            s.name()?;
+            continue;
+        }
+        let rank = section_rank(id);
+        if rank == 100 { return Err("malformed section id"); }
+        if rank <= last { return Err("unexpected content after last section"); }
+        last = rank;
+        if id == 10 { saw_code = true; }
+        m.section(id, &s, &nfuncs_declared)?;
+        if !s.at_end() { return Err("section size mismatch"); }
+    }
+    if !saw_code and nfuncs_declared != 0 {
+        return Err("function and code section have inconsistent lengths");
+    }
+    if let Some(c) = m.data_count {
+        if (c as u64) != m.datas.len { return Err("data count and data section have inconsistent lengths"); }
+    }
+    if m.uses_data_idx and m.data_count.is_none() and m.datas.len > 0 { return Err("data count section required"); }
+    Ok(m)
+}
+
+pub fn type_name(t: u8) -> str {
+    match t {
+        0x7F => "i32", 0x7E => "i64", 0x7D => "f32", 0x7C => "f64",
+        0x70 => "funcref", 0x6F => "externref",
+        _ => "?",
+    }
+}
