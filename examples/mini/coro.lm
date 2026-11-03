@@ -348,14 +348,24 @@ pub fn prepare(c: *Ctx, co: Gc<Coro>, cl: Gc<Closure>) {
 /// Save the running thread's state in its `Coro` (normal from now on)
 /// and install `co`'s stacks, `co` resumed by it (`inrun`: by a CALL in
 /// the same vm run). The caller sets up the frame registers.
+///
+/// `enter` and `suspend` store references through raw pointers, which
+/// skips the compiler's write barrier, and log the objects themselves
+/// with `gc.remember`, out of line. The compiler's barrier has its slow
+/// path inline (std.gc `log_obj`), which made the two too large for LLVM
+/// to inline into `switch_in`/`switch_out` (vm.lm): chameneos and
+/// coroutine_ring took 6% longer in tail-call mode. (`#[inline]` on them
+/// instead made switch mode 7-10% slower.)
 pub fn enter(c: *Ctx, co: Gc<Coro>, inrun: bool, wrap: bool) {
     let r = c.cur;
     r.fp = c.fp;
     r.base = c.base;
-    r.open = c.open;
+    let ro = &r.open;
+    *ro = c.open;
     r.open_level = c.open_level;
     r.status = NORMAL;
-    co.prev = Some(r);
+    let cp = &co.prev;
+    *cp = Some(r);
     co.inrun = inrun;
     co.via_wrap = wrap;
     co.status = RUNNING;
@@ -369,6 +379,9 @@ pub fn enter(c: *Ctx, co: Gc<Coro>, inrun: bool, wrap: bool) {
     c.open = co.open;
     c.open_level = co.open_level;
     c.cur = co;
+    // Last, so that the rare call is a tail call and `enter` needs no
+    // stack frame.
+    if unlikely(gc.needs_barrier(r as *u8) or gc.needs_barrier(co as *u8)) { log_pair(r, co); }
 }
 
 /// Reinstall the state of the thread that resumed `co`, which stopped
@@ -396,15 +409,23 @@ pub fn suspend(c: *Ctx, co: Gc<Coro>, fp: *Frame, ypc: Mini.Resume, dst: u32, nr
     co.status = SUSPENDED;
     co.fp = fp;
     co.base = c.base;
-    co.open = c.open;
+    let o = &co.open;
+    *o = c.open;
     co.open_level = c.open_level;
     co.ypc = ypc;
     co.ydst = dst;
     co.ynres = nres;
     release_retired(co);
     // Its stacks are no longer roots, and the VM wrote them without
-    // barriers: a minor collection must trace them.
-    gc.write_barrier(&c.heap, co as *u8);
+    // barriers: a minor collection must trace them (and `open`).
+    if unlikely(gc.needs_barrier(co as *u8)) { gc.remember(co as *u8); }
+}
+
+/// The write barrier of `enter`'s stores into `a` and `b`.
+#[inline(never)]
+fn log_pair(a: Gc<Coro>, b: Gc<Coro>) {
+    gc.remember(a as *u8);
+    gc.remember(b as *u8);
 }
 
 /// coroutine.resume(co, args[0..n]) (`wrap` false: results true and the

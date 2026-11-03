@@ -133,7 +133,11 @@ pub fn barrier(obj: *u8) {
   execution): when the set is full it only counts the object as
   `missed`, and the next collection is then a major one, which needs no
   remembered set; after each collection the set gets room for twice
-  what was logged since the last (at least 256 entries). `remember` is
+  what was logged since the last (at least 256 entries). Being inline,
+  it makes functions with barriers larger, which can stop LLVM from
+  inlining them (lowering.md section 3: Mini's thread switch lost 6%
+  this way). For such a helper, store through raw pointers and log with
+  `needs_barrier` and `remember` (below). `remember` is
   the same with a growing push, out of line, for interpreters that log
   several objects together. A minor collection traces the remembered objects and
   sets `LOG` again; those that point to young survivors stay in the set.

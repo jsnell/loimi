@@ -149,9 +149,13 @@ no native active on its stacks.
 - **The generational barrier.** The VM stores into a coroutine's stacks
   without write barriers. While it runs (or is normal), the stacks are
   roots, which every collection scans, minor ones included. When it
-  suspends, `coro.suspend` logs the `Coro` (`gc.write_barrier`), so the
+  suspends, `coro.suspend` logs the `Coro` (`gc.remember`), so the
   next minor collection traces it through the hook, and verify mode
-  checks it from then on.
+  checks it from then on. `coro.enter` and `coro.suspend` store their
+  references (`open`, `prev`) through raw pointers and log the objects
+  with `gc.remember` out of line, instead of the compiler's barrier,
+  whose inline slow path made them too large for LLVM to inline (6% on
+  chameneos and coroutine_ring in tail-call mode).
 - **Checked** with GC stress (a collection at every safepoint), verify
   mode (the barrier check at every collection) and `--gc-check-roots`
   (the collector validates every reference it finds in a root), in all

@@ -492,6 +492,20 @@ Notes:
   block ends in a control word, which a barrier inside a helper function
   (`table_set`, inlined by LLVM, not by the compiler) never is.
 
+  The inline slow path has a cost outside handlers: each barrier site
+  adds the slow path's instructions (where there was one call) to LLVM's
+  inlining cost of the function it is in, so a small helper
+  with a few barriers can grow past the inlining threshold and become a
+  call. Mini's thread switch (`coro.enter`, `coro.suspend`, called from
+  `switch_in`/`switch_out`) did, which made chameneos and coroutine_ring
+  6% slower in tail-call mode (no collections run in them). `#[inline]`
+  on the two restored tail-call mode but made switch mode 7-10% slower
+  (more code in its one big dispatch function). What Mini does instead:
+  it stores the references through raw pointers (no compiler barrier)
+  and logs the objects itself, one `gc.needs_barrier` test per object
+  and an out-of-line `gc.remember`, which keeps both functions small. The
+  same commit made MiniJS's `Ctx.arr_set` (`SETINDEX`'s cold path) a call.
+
 ### `next`, `jump`, `redo`, `become`
 
 | Word | Lowering |

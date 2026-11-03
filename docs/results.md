@@ -268,12 +268,31 @@ is a0efc73 ("Frameless allocation and barriers in handlers: ...
 call-free barrier slow path; no barrier for reference-free stores"),
 1.037–1.044× its parent 0492cab; chameneos and coroutine_ring 6%,
 sieve unchanged; every earlier commit within 1%. The 14 clean-room Mini
-benchmarks did not move (0.994 in that commit's own A/B). Likely cause,
-not verified: the barrier's slow path (logging into the remembered set)
-is now inlined at every barrier site, and the thread switch stores many
-references into `Coro` objects; or, with a remembered set that can no
-longer grow from the barrier, a full set makes the next collection a
-major one.
+benchmarks did not move (0.994 in that commit's own A/B).
+
+**Cause and fix.** Not the remembered set: chameneos and coroutine_ring
+run no collection at all (`LOIMI_GC_STATS`), and sieve, which does,
+did not move. The barrier's slow path, now inline at each barrier site
+instead of one call, made `coro.enter` (two barriers) and
+`coro.suspend` (two) too large for LLVM to inline: in the tail-call
+binary they became out-of-line functions (363 and 315 bytes) called
+from the CALL handlers' cold blocks (`switch_in`) and `switch_out`; no
+other Mini function lost its inlining. `#[inline]` on the two restored
+tail-call mode (1.004× 0492cab) but made switch mode 7-10% slower, so
+instead `enter` and `suspend` store their references (`open`, `prev`)
+through raw pointers and log the objects themselves: a
+`gc.needs_barrier` test per object and an out-of-line `gc.remember`,
+at the end of `enter` so that the rare call is a tail call (in the
+middle it gave `enter`, out of line in goto and switch mode, a frame
+of four pushes: 2% in goto mode). Best of 7, interleaved,
+`--align-functions=64`, 0492cab / master / fix, tail-call: chameneos
+0.405 / 0.427 / 0.413 s, coroutine_ring 0.344 / 0.365 / 0.339, sieve
+0.371 / 0.371 / 0.361 (fix 0.992× 0492cab, 0.957× master). Goto, fix
+against master: 0.99–1.02; switch 0.995–0.997; JIT (best of 5)
+0.92–1.00. The 14 Mini benchmarks: 0.997 against 0492cab, as master.
+`-W handler_frame` counts unchanged (Mini 38; the nine interpreters
+201 at master, 223 at 0492cab). std.gc and the compiler are unchanged,
+so the IR of every example other than Mini is identical.
 
 ## Per suite
 
