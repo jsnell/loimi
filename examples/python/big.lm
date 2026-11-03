@@ -31,6 +31,10 @@ fn num_of(v: Value) -> Num {
         }
         Bool(b) => Num { neg: false, m: mag_from_u64(if b { 1 } else { 0 }) },
         Obj(b) => {
+            if b.big.is_none() {
+                let x = b.n;
+                return Num { neg: x < 0, m: mag_from_u64(if x < 0 { (0 -% x) as u64 } else { x as u64 }) };
+            }
             var m: Mag = mem.Vec.new();
             let l = b.big.unwrap();
             for i in 0..l.d.len { m.push(l.d[i]); }
@@ -51,6 +55,8 @@ fn finish(h: *gc.Heap, n: Num) -> Value {
         let mag = lo | (hi << 32);
         if !n.neg and mag <= 2147483647 { m.free(); return Value.Int(mag as i32); }
         if n.neg and mag <= 2147483648 { m.free(); return Value.Int((0 - (mag as i64)) as i32); }
+        if !n.neg and mag <= 9223372036854775807 { m.free(); return Value.Obj(medium(h, mag as i64)); }
+        if n.neg and mag <= 9223372036854775808 { m.free(); return Value.Obj(medium(h, 0 -% (mag as i64))); }
     }
     let l = new(h, Limbs {}, m.len);
     for i in 0..m.len { l.d[i] = m.at(i); }
@@ -61,7 +67,17 @@ fn finish(h: *gc.Heap, n: Num) -> Value {
     Value.Obj(b)
 }
 
-pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Box> {
+/// An int outside the i32 range that fits an i64: no limbs, `n` holds it.
+pub fn medium(h: *gc.Heap, x: i64) -> Gc<Box> {
+    let b = value.new_box(h, K_BIG, 0);
+    b.n = x;
+    b.s = if x < 0 { -1 } else { 1 };
+    b
+}
+
+pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Box> { medium(h, x) }
+
+fn from_i64_limbs(h: *gc.Heap, x: i64) -> Gc<Box> {
     let neg = x < 0;
     let mag = if neg { (0 -% x) as u64 } else { x as u64 };
     let m = mag_from_u64(mag);
@@ -76,6 +92,7 @@ pub fn from_i64(h: *gc.Heap, x: i64) -> Gc<Box> {
 }
 
 pub fn to_i64(b: Gc<Box>) -> ?i64 {
+    if b.big.is_none() { return Some(b.n); }
     let l = b.big.unwrap();
     if l.d.len > 2 { return None; }
     let lo = l.d[0] as u64;
@@ -90,6 +107,7 @@ pub fn to_i64(b: Gc<Box>) -> ?i64 {
 }
 
 pub fn to_f64(b: Gc<Box>) -> f64 {
+    if b.big.is_none() { return b.n as f64; }
     let l = b.big.unwrap();
     var r: f64 = 0.0;
     var i = l.d.len;
@@ -473,7 +491,7 @@ pub fn is_neg(v: Value) -> bool {
 pub fn is_odd(v: Value) -> bool {
     match v {
         Int(i) => (i & 1) != 0,
-        Obj(b) => (b.big.unwrap().d[0] & 1) != 0,
+        Obj(b) => if let Some(l) = b.big { (l.d[0] & 1) != 0 } else { (b.n & 1) != 0 },
         _ => false,
     }
 }

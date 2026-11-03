@@ -187,6 +187,9 @@ pub vm Py {
 
     cache GlobalIC { idx: u32, ver: u32, builtin: u32 }
     cache AttrIC { idx: u32 }
+    /// SETATTR: idx is where the attribute is (or, for instances of class
+    /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
+    cache SetIC { idx: u32, cls: u32, epoch: u32 }
     cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32 }
 
     sync { ctx.fp = fp; }
@@ -266,7 +269,7 @@ pub vm Py {
                         }
                         let inst = ops.new_instance(ctx, o);
                         regs[b] = inst;
-                        let init = ops.class_lookup(o, ctx.n_init.unwrap());
+                        let init = ops.cached_init(ctx, o);
                         let Some(iv) = init else {
                             if nn > 0 or kw != Nil { raise ops.type_error(ctx, "takes no arguments", inst) }
                             next
@@ -480,7 +483,7 @@ pub vm Py {
             next
         }
     }
-    op SETATTR(obj: reg, name: kst, src: reg) : ABC + AttrIC {
+    op SETATTR(obj: reg, name: kst, src: reg) : ABC + SetIC {
         if let Inst(o) = obj {
             let d = o.dict;
             let i = cache.idx as u64;
@@ -491,12 +494,15 @@ pub vm Py {
                     gc.write_barrier(&ctx.heap, d.ent as *u8);
                     next
                 }
+            } else if i == d.used and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
+                let Str(s) = name else { trap() };
+                if value.dict_append_new(d, s, src) { next }
             }
         }
         cold {
             gc_point();
             let Str(s) = name else { trap() };
-            ops.setattr(ctx, obj, s, src, &cache.idx)?;
+            ops.setattr(ctx, obj, s, src, &cache.idx, &cache.cls, &cache.epoch)?;
             next
         }
     }

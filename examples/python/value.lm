@@ -236,6 +236,7 @@ pub fn hash_of(v: Value) -> ?u64 {
 pub fn hash_int(i: i64) -> u64 { if i == -1 { 0xfffffffffffffffe } else { i as u64 } }
 
 fn big_hash(b: Gc<Box>) -> u64 {
+    if b.big.is_none() { return hash_int(b.n); }
     let l = b.big.unwrap();
     var hv: u64 = b.s as u64;
     for i in 0..l.d.len { hv = hash.mix(hv ^ (l.d[i] as u64)); }
@@ -338,6 +339,38 @@ pub fn dict_find_str(d: Gc<Dict>, key: Gc<Str>) -> ?u64 {
         perturb = perturb >> 5;
         i = (i * 5 + 1 + perturb) & d.mask;
     }
+}
+
+/// Append `key` (an interned name) with `v` if it is not present and the
+/// dict has room; false (nothing done) otherwise.
+pub fn dict_append_new(d: Gc<Dict>, key: Gc<Str>, v: Value) -> bool {
+    if (d.used + 1) * 2 > d.ent.items.len { return false; }
+    let hv = key.hash;
+    if hv == 0 { return false; }
+    var i = hv & d.mask;
+    var perturb = hv;
+    let kv = Value.Str(key);
+    var slot: u64 = 0xffffffffffffffff;
+    loop {
+        let ix = d.idx.s[i];
+        if ix == EMPTY { if slot == 0xffffffffffffffff { slot = i; } break; }
+        if ix == DELETED { if slot == 0xffffffffffffffff { slot = i; } }
+        else {
+            let k = d.ent.items[2 * (ix as u64)];
+            if k == kv { return false; }
+            if let Str(ks) = k and str_eq(ks, key) { return false; }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+    let e = d.used;
+    d.ent.items[2 * e] = kv;
+    d.ent.items[2 * e + 1] = v;
+    d.idx.s[slot] = e as i32;
+    d.used += 1;
+    d.len += 1;
+    d.keyver += 1;
+    true
 }
 
 pub fn dict_get(d: Gc<Dict>, key: Value, hv: u64) -> ?Value {

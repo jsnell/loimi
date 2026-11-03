@@ -100,6 +100,7 @@ fn main() -> i32 uses reenter {
     }
     if verify { c.heap.set_generational(true); c.heap.set_verify(true); c.heap.set_stress(true); }
     else if stress { c.heap.set_stress(true); }
+    else { c.heap.set_growth(300, 8 << 20); }
     let mp = c.protos.at(idx as u64);
     let f = new(&c.heap, Func { proto: mp, defaults: None, kwdefaults: None, cells: None, globals: g, owner: None });
     match vm.invoke(c, Value.Func(f), []) {

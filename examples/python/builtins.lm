@@ -747,7 +747,9 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         SetAttr => {
             let s = want_str(c, args[1])?;
             var ic: u32 = 0;
-            ops.setattr(c, args[0], vm.intern(c, s.data), args[2], &ic)?;
+            var ic2: u32 = 0;
+            var ic3: u32 = 0;
+            ops.setattr(c, args[0], vm.intern(c, s.data), args[2], &ic, &ic2, &ic3)?;
             Ok(Value.Nil)
         }
         HasAttr => {
