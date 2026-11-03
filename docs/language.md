@@ -228,7 +228,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
   the warnings that remain into errors. The lints are `match_fallout`,
-  `unreachable_arm` (above) and `super_overlap` (section 7.3), and the
+  `unreachable_arm` (above), `super_overlap` (section 7.3),
+  `value_layout` (section 2) and `next_pc_then` (section 3.5), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
@@ -1460,6 +1461,20 @@ Rules for `-> never` vm functions:
   a local or state variable called `next_pc` hides it. `next_resume`
   is the same address as a `Vm.Resume`, a resume point that an entry
   may jump to (section 6).
+
+  In an op declared `then OP` (section 7.1a), `next` continues at the
+  `then` instruction (for a Lua-style `LT .. then JMP`, falling into the
+  JMP takes the branch), so `next_pc` is the address *of* that
+  instruction, not past it. That is consistent but rarely the address
+  meant as a return address (a generator resumed by `FORITER .. then
+  JMP` must continue past the JMP), so `next_pc` in such an op, directly
+  or in a vm function inlined into it, warns (`next_pc_then`). The
+  address past the `then` instruction is `then_next_pc` (the op's `pc`
+  plus its size plus the `then` op's size: where `next` would continue
+  from the `then` instruction). Like `then.x`, it is available in the
+  op's own body only: pass it to vm functions as an argument
+  (`resume(g, then_next_pc)`). `#[allow(next_pc_then)]` says the `then`
+  word is meant.
 - The body sees the vm state and its own parameters, but not the caller's
   operands: pass `dst.raw` or values as arguments. `become` is not
   allowed, since it belongs to the calling op, and neither is `cache`;
@@ -2215,11 +2230,13 @@ vm V {
 op JMP(target: label) : sJ { jump target }
 op LT(a: reg, b: reg) : ABC then JMP {
     if a < b { jump then.target }
-    jump pc + 2                    // skip the JMP
+    jump then_next_pc              // skip the JMP
 }
 ```
 
-The JMP stays a separate instruction (`next` skips only `LT`); the
+The JMP stays a separate instruction (`next` skips only `LT`, and
+`next_pc` is the JMP's address; `then_next_pc` is the address after the
+JMP, section 3.5); the
 generated verifier checks that it is there, and checks its operands at its
 own word. `then` operands are read-only, and not available in vm
 functions (pass them as arguments). This is the same idea as an inline

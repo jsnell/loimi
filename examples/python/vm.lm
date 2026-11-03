@@ -387,7 +387,7 @@ pub vm Py {
     }
 
     /// Resume generator `g`: on yield the value goes to `slot` and
-    /// execution continues at `next_pc`; when it finishes, at `alt`.
+    /// execution continues at `cont` (FORITER: `then_next_pc`); when done, at `alt`.
     fn resume(g: Gc<Box>, slot: *Value, cont: *u32, alt: *u32) -> never {
         if g.m == GEN_DONE { jump alt }
         if g.m == GEN_RUNNING { cold { raise ops.exc(ctx, builtins.E_VALUE, "generator already executing") } }
@@ -1120,25 +1120,25 @@ pub vm Py {
                 let i = b.n;
                 if (b.s > 0 and i < b.m) or (b.s < 0 and i > b.m) {
                     b.n = i + b.s;
-                    if i >= -2147483648 and i <= 2147483647 { dst = Int(i as i32); jump pc + 2 }
-                    cold { dst = value.int_val(&ctx.heap, i); jump pc + 2 }
+                    if i >= -2147483648 and i <= 2147483647 { dst = Int(i as i32); jump then_next_pc }
+                    cold { dst = value.int_val(&ctx.heap, i); jump then_next_pc }
                 }
                 jump then.target
             }
             if b.kind == K_SEQIT {
                 let i = b.n as u64;
                 match b.a {
-                    List(l) => { if i < l.len { b.n += 1; dst = *(l.arr.items.ptr + i); jump pc + 2 } jump then.target }
-                    Tuple(t) => { if i < t.items.len { b.n += 1; dst = *(t.items.ptr + i); jump pc + 2 } jump then.target }
+                    List(l) => { if i < l.len { b.n += 1; dst = *(l.arr.items.ptr + i); jump then_next_pc } jump then.target }
+                    Tuple(t) => { if i < t.items.len { b.n += 1; dst = *(t.items.ptr + i); jump then_next_pc } jump then.target }
                     _ => {}
                 }
             }
-            if b.kind == K_GEN { resume(b, regs + dst.raw, pc + 2, then.target) }
+            if b.kind == K_GEN { resume(b, regs + dst.raw, then_next_pc, then.target) }
         }
         cold {
             gc_point();
             match ops.next(ctx, it)? {
-                Some(v) => { dst = v; jump pc + 2 }
+                Some(v) => { dst = v; jump then_next_pc }
                 None => jump then.target,
             }
         }
