@@ -705,6 +705,104 @@ fn C.expr(c: *C, t0: Term) -> (u32, bool) {
 
 /// is/2 and the arithmetic comparisons on registers, without building the
 /// expression; false if `g` is not one of them or uses something else.
+/// The register holding term `t` for an inline goal: a variable's own (X)
+/// register, or a temporary it is put into (true: release it).
+fn C.operand(c: *C, t0: Term) -> (u32, bool) {
+    let t = deref(t0);
+    if let Ref(_) = t {
+        let vi = c.info(t);
+        if vi.seen and !vi.perm { return (vi.reg, false); }
+    }
+    let r = c.temp();
+    c.put_arg(t, r as u8);
+    (r, true)
+}
+
+/// Builtins compiled to ops: `=/2`, type tests, arg/3, '$cut'/1. False if
+/// `g` is not one of them.
+fn C.inline_builtin(c: *C, g: Term) -> bool {
+    let m = c.m;
+    let (name_a, ar) = term.name_arity(&m.db, g);
+    let name = m.db.name(name_a);
+    if ar == 1 {
+        let a = deref(term.arg_of(g, 0));
+        if name.eq("$cut") {
+            let Ref(_) = a else { return false; };
+            let vi = c.info(a);
+            if !vi.seen { return false; }
+            if vi.perm { c.emit(Wam.CUT_Y(vi.reg as u8)); } else { c.emit(Wam.CUT_X(vi.reg as u8)); }
+            return true;
+        }
+        let op: ?u32 = match name {
+            "var" => Some(Wam.OP_T_VAR), "nonvar" => Some(Wam.OP_T_NONVAR), "atom" => Some(Wam.OP_T_ATOM),
+            "atomic" => Some(Wam.OP_T_ATOMIC), "integer" => Some(Wam.OP_T_INTEGER), "number" => Some(Wam.OP_T_NUMBER),
+            "compound" => Some(Wam.OP_T_COMPOUND), "callable" => Some(Wam.OP_T_CALLABLE),
+            _ => None,
+        };
+        let Some(o) = op else { return false; };
+        let (r, owned) = c.operand(a);
+        c.emit(Wam.encode.RR(o, r as u8, 0));
+        if owned { c.release(r); }
+        return true;
+    }
+    if ar == 3 and name.eq("arg") {
+        let (rn, on) = c.operand(term.arg_of(g, 0));
+        let (rt, ot) = c.operand(term.arg_of(g, 1));
+        let (ra, oa) = c.operand(term.arg_of(g, 2));
+        c.emit(Wam.ARG(rn as u8, rt as u8, ra as u8));
+        if oa { c.release(ra); }
+        if ot { c.release(rt); }
+        if on { c.release(rn); }
+        return true;
+    }
+    if ar == 2 and name.eq("=") {
+        let l = deref(term.arg_of(g, 0));
+        let r = deref(term.arg_of(g, 1));
+        // X = T with X new: T goes straight to X's register.
+        inline for (v, other) in [(l, r), (r, l)] {
+            if let Ref(_) = v {
+                let vi = c.info(v);
+                if vi.occ == 1 and !vi.level {
+                    // `_ = T` binds nothing; T may still mention new variables
+                    // that later goals need: build it anyway if it is compound.
+                    let (t, ot) = c.operand(other);
+                    if ot { c.release(t); }
+                    return true;
+                }
+                if !vi.seen and !vi.perm {
+                    vi.seen = true;
+                    c.put_arg(other, vi.reg as u8);
+                    return true;
+                }
+                if !vi.seen and vi.perm {
+                    let (t, ot) = c.operand(other);
+                    vi.seen = true;
+                    c.emit(Wam.GET_VAR_Y(vi.reg as u8, t as u8));
+                    if ot { c.release(t); }
+                    return true;
+                }
+            }
+        }
+        // Both sides already have values: unify them.
+        if let Ref(_) = l {
+            let vi = c.info(l);
+            if vi.perm {
+                let (t, ot) = c.operand(r);
+                c.emit(Wam.GET_VAL_Y(vi.reg as u8, t as u8));
+                if ot { c.release(t); }
+                return true;
+            }
+        }
+        let (a, oa) = c.operand(l);
+        let (b, ob) = c.operand(r);
+        c.emit(Wam.GET_VAL_X(a as u8, b as u8));
+        if ob { c.release(b); }
+        if oa { c.release(a); }
+        return true;
+    }
+    false
+}
+
 fn C.inline_arith(c: *C, g: Term) -> bool {
     let Str(s) = g else { return false; };
     if s.args.len != 2 { return false; }
@@ -1097,7 +1195,7 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
                 if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
             }
             Builtin => {
-                if c.inline_arith(g.t) {
+                if c.inline_arith(g.t) or c.inline_builtin(g.t) {
                     if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
                     continue;
                 }

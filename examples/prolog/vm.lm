@@ -422,6 +422,53 @@ pub vm Wam {
         if let Int(off) = r { cut_to((((ctx.cbase as *u64) + off as u64)) as *Choice); }
         next
     }
+    /// '$cut'(L) with L in a temporary: the cut of an auxiliary clause.
+    op CUT_X(r: xr) : RR {
+        if let Int(off) = deref(r) { cut_to((((ctx.cbase as *u64) + off as u64)) as *Choice); }
+        next
+    }
+
+    // ---- inline type tests and arg/3 -------------------------------------
+
+    inline for (name, test) in [
+        ("T_VAR", is_var(t)),
+        ("T_NONVAR", !is_var(t)),
+        ("T_ATOM", is_atom(t)),
+        ("T_ATOMIC", term.is_atomic(t)),
+        ("T_INTEGER", is_int(t)),
+        ("T_NUMBER", is_num(t)),
+        ("T_COMPOUND", is_compound(t)),
+        ("T_CALLABLE", term.is_callable(t)),
+    ] {
+        op #name(a: xr) : RR {
+            let t = deref(a);
+            if test { next }
+            backtrack()
+        }
+    }
+    fn is_atom(t: Term) -> bool { match t { Atom(_) => true, _ => false } }
+    fn is_int(t: Term) -> bool { match t { Int(_) => true, Big(_) => true, _ => false } }
+    fn is_num(t: Term) -> bool { match t { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false } }
+    fn is_compound(t: Term) -> bool { match t { Str(_) => true, Lst(_) => true, _ => false } }
+
+    /// arg(N, T, A) with its arguments in registers.
+    op ARG(n: xr, t: xr, a: xr) : R3 {
+        let nn = deref(n);
+        let tt = deref(t);
+        if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
+            let v = st.args[(i as u64) - 1];
+            let x = deref(a);
+            if let Ref(xv) = x and quick_bind(xv) { store_bind(xv, v); next }
+            cold { if unify(ctx, x, v) { next } backtrack() }
+        }
+        cold {
+            match builtins.arg3(ctx, nn, tt, a) {
+                Ok(true) => next,
+                Ok(false) => backtrack(),
+                Err(ball) => raise ball,
+            }
+        }
+    }
 
     // ---- clause selection ----------------------------------------------
 

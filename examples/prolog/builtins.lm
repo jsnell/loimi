@@ -1208,6 +1208,20 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
     }
 }
 
+/// arg/3 outside the ARG op's fast path.
+pub fn arg3(m: *Machine, n0: Term, t0: Term, a: Term) -> Result<bool, Term> {
+    let n = get_int(m, deref(n0))?;
+    let t = deref(t0);
+    let (_, ar) = match t {
+        Str(_) => term.name_arity(&m.db, t),
+        Lst(_) => (term.A_DOT, 2),
+        Ref(_) => return Err(inst_error(m)),
+        _ => return Err(type_error(m, "compound", t)),
+    };
+    if n < 1 or n > ar as i64 { return Ok(false); }
+    Ok(unify(m, a, term.arg_of(t, (n - 1) as u64)))
+}
+
 fn atom_text(m: *Machine, chars: bool, number: bool) -> Result<bool, Term> {
     let a = x(m, 0);
     if let Ref(_) = a {

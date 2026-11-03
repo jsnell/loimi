@@ -33,10 +33,9 @@ expected output is its output).
 
 ## Terms and numbers
 
-- Integers are 48-bit (−2^47 .. 2^47−1). An arithmetic result outside
-  that range raises `evaluation_error(int_overflow)`, and a literal
-  outside it is a syntax error, where SWI-Prolog switches to unbounded
-  integers. (This is why `perfect`, which needs 10^61, does not run.)
+- Integers are unbounded: 48-bit integers are immediate, larger ones
+  are `std.bigint` numbers in the GC heap, and results switch between
+  the two as they grow and shrink.
 - Floats are IEEE doubles, printed as SWI-Prolog prints them (shortest
   round-trip digits, positional unless the exponent is below −4 or the
   number would need more than three trailing zeros: `100.0`, `1.0e+04`,
@@ -111,7 +110,7 @@ left unbound (SWI fills it; programs that print it differ).
 ## Not supported
 
 Modules, streams other than the two standard ones, `read/1`, strings,
-unbounded integers, rationals, attributed variables, `freeze`, tabling,
+rationals, attributed variables, `freeze`, tabling,
 global variables with backtracking, `assert` of clauses with more than
 255 distinct variables plus arguments, `consult/1` from a running
 program, `succ_or_fail`-style SWI extensions not listed above.
