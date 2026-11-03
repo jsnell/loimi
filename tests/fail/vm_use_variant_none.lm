@@ -1,0 +1,16 @@
+// error: this vm declares no variants
+// args: --target=aarch64-linux-gnu
+// On AArch64 a tail-call vm keeps its table's address in a hidden state
+// variable even without variants; `use_variant` still needs some.
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+    }
+    op OFF() : ABC { use_variant default; next }
+    op RET(src: reg) : ABC { exit src }
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {}

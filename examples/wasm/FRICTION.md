@@ -103,8 +103,9 @@ ops would change (`roundsd`). Not added.
   register across tail calls (`state { .., acc: f64 }`: `acc = acc * a`
   compiles to `mulsd (%r14,%rdx,8),%xmm0` plus the dispatch), so wasm3's
   `fp0` is expressible; and the dispatch's table load folds into the
-  jump (`jmp *table(,%rax,8)`) only with at most five integer arguments
-  (this vm has seven). docs/roadmap.md open question 11 lists what could
+  jump (`jmp *table(,%rax,8)`) only when the tail call passes at most six
+  values in registers (this vm passes seven; LLVM's isel counts them),
+  which turned out to cost nothing measurable (lowering.md §3). docs/roadmap.md open question 11 lists what could
   make a three-operand op cheaper.
 
 **wasm changes.**
