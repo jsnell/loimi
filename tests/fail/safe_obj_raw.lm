@@ -1,0 +1,8 @@
+// error: calling `valid`
+#![safe]
+import std.obj;
+
+// An unchecked validity-cell index (obj's inline-cache API trusts its cache words).
+fn f(s: *obj.Shapes) -> bool { s.valid(1000000) }
+
+fn main() {}

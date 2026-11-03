@@ -70,7 +70,9 @@ sound for every such argument: pointers to one value. A function that
 reads or writes beyond that (`mem.copy(dst, src, n)`), that frees
 (`mem.release(p)`), that returns memory that is not one valid value
 (`mem.alloc<T>(n)`: n zeroed `T`s, maybe not valid `T`s), or that
-requires a pointer from a particular allocator (`Malloc.free_bytes`) is
+requires a pointer from a particular allocator (`Malloc.free_bytes`), or
+that trusts an index or cache word without checking it (`obj`'s inline-cache
+readers: `Model.load_ref(o, r)`) is
 marked `#[raw]`. A `#[raw]` function is an ordinary function in modules
 that are not safe (no change for the example interpreters), and needs
 `unsafe { }` in a safe module, as `p[i]` does. Extern functions are
@@ -261,6 +263,7 @@ changed (the checks only reject programs).
 | `bc` | 0 | | +7 −4 | `relax`'s position table is a `Vec<u64>` slice; `unreachable` → `trap()` |
 | `map` | 21 | 7 (`probe_*`) | +266 −126 | section 5 |
 | `mem` | — | 10 functions | +39 | `#[raw]` on `alloc`, `try_alloc`, `grow`, `release`, `copy`, `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`, `Malloc.free_bytes`; new `Vec.extend(s)` and `Vec.filled(n, x)` |
+| `obj` | — | 15 functions | +15 | `#[raw]` on the inline-cache API that trusts its cache words (slot refs, validity cells, Poly entry indices, `Hit`s: a safe module can build any `Hit`): `Shapes.valid`, `Poly.add`, `MegaCache.new` (`n` a power of two), `put`, `free` (leaves the cache dangling), `Model.load_ref`, `store_ref`, `load_inline`, `load_out`, `proto_load`, `hit`, `poly_get`, `poly_get_at`, `poly_set`, `add_hit`. The rest of `obj`'s public API checks its indices (slices) or takes only values it made. No IR change. |
 
 The `unsafe` blocks, each with its one-line justification:
 

@@ -2904,7 +2904,7 @@ impl<'a> Checker<'a> {
         };
         if let Some(n) = raw {
             let n = short_name(&n).replace("__", ".");
-            self.raw_op(cx, span, "raw_call", || format!("calling `{}` (`#[raw]` or extern: it takes pointers to more than one value, or frees memory)", n), "use a safe counterpart that takes a slice, or wrap the call in `unsafe { }` with a comment saying why its arguments are valid")?;
+            self.raw_op(cx, span, "raw_call", || format!("calling `{}` (`#[raw]` or extern: unsound for some arguments: pointers to more than one value, unchecked indices, or memory it frees)", n), "use a safe counterpart that takes a slice, or wrap the call in `unsafe { }` with a comment saying why its arguments are valid")?;
         }
         let name = match def {
             Def::Fn(id) if self.unsafe_fns.contains(id) => self.prog.fns[*id as usize].name.clone(),

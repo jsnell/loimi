@@ -59,7 +59,9 @@ Design rules for the library:
   Functions that take a pointer and a length, free, or return raw
   memory are marked `#[raw]` (`mem.alloc`, `grow`, `release`, `copy`,
   `sort_by`, `try_sort_by`, `Arena.alloc_bytes`, `Malloc.alloc_bytes`,
-  `Malloc.free_bytes`, `io.free_file`, `map.probe_*`): a `#![safe]` module calls them
+  `Malloc.free_bytes`, `io.free_file`, `map.probe_*`, and `obj`'s
+  inline-cache readers and writers that trust their cache words:
+  `Model.load_ref`, `hit`, `poly_get`, `MegaCache.put`, ...): a `#![safe]` module calls them
   only in `unsafe { }`; elsewhere they are ordinary functions. A
   container's methods leave it valid (`free()` leaves it empty and
   usable); pointers and slices obtained from it (`items()`, `ptr_at`,

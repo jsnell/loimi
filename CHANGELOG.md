@@ -227,6 +227,9 @@ implementation; `git log` has the details.
   `extend(s)` (safe when `s` is the vector's own items: fixes a
   use-after-free in `StrBuf.push_str(b.as_str())`) and `filled(n, x)`;
   `io.free_file` is `#[raw]` ([design/safety.md](docs/design/safety.md)).
+  `std.obj`'s inline-cache API that trusts cache words without checking
+  them (`Model.load_ref`, `hit`, `poly_get`, `MegaCache.put`, ..., 15
+  functions) is `#[raw]` too (no IR change).
 - **`std.bigint`**: arbitrary-precision integers with Python's semantics
   ([stdlib.md](docs/stdlib.md#stdbigint)).
 - **`std.map.OrderedMap`, `std.dict.Dict`, `std.dict.KeyDict`**:

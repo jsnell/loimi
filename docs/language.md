@@ -961,7 +961,8 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   function is marked `#[raw]` when it is unsound for some arguments that
   are pointers to one value each: it takes a pointer and a length
   (`mem.copy(dst, src, n)`), frees (`mem.release(p)`), or returns memory
-  that is not one valid value (`mem.alloc<T>(n)`). `#[raw]` changes
+  that is not one valid value (`mem.alloc<T>(n)`), or trusts an index it
+  does not check (`obj`'s inline-cache readers). `#[raw]` changes
   nothing in modules without `#![safe]`. Vm code is exempt (its operand
   accesses rest on the verifier, section 6), as is code generated from
   a `vm` declaration; so a `#![safe]` module cannot declare a `vm`.
