@@ -287,3 +287,37 @@ quickening on/off.
    from C++. Still open: `const` pointers (Loimi has none, so `*u8` is
    `void *` and C passes `const` data with a cast), and generated
    C-ABI entry points.
+10. **Immediates wider than a format's word.** The wasm study
+    (`examples/wasm/FRICTION.md` item 4) needed a 64-bit constant, a
+    32-bit memory offset next to two 16-bit slots, and table/segment
+    indices next to three operands, in a `u64` word whose fields were
+    already full. It used an inline cache layout (`cache Imm64 { v: u64 }`)
+    as an immediate word, written after `emit` zeroed it. That works and
+    disassembles, but the verifier cannot see cache words, so indices
+    stored there are bounds-checked at run time in every execution, which
+    is what operand kinds exist to avoid. Options:
+    - *Trailing immediate words in formats*:
+      `format RRRX { op: 16, a: 16, b: 16, c: 16 } + imm: u64` (or
+      `+ imm: s32` packed into one word). The trailing fields map to
+      operands by position like other fields, take operand kinds and
+      `verify` clauses (checked once by `Vm.verify`), are encoder and
+      emitter parameters, and print in the disassembly. `op_size` grows by
+      the trailing words, before any cache words; `next`/`next_pc` skip
+      them. Handlers read them `pc`-relative, as they read cache fields.
+      This is the smallest change and covers every case in the study.
+      Open: whether a trailing field may be a label (`pc + it`, relaxed by
+      `std.bc`), and how supers whose parts have trailing words lay them
+      out (as today for caches: each part keeps its words).
+    - *Immutable cache fields*: `cache Imm64 { const v: u64 }`: the
+      verifier may read and check `const` fields (they are set by the
+      emitter, never by handlers), and `deopt` does not zero them. It
+      reuses the cache machinery, but mixes two ideas (run-time state
+      and instruction operands) in one construct, and the emitter would
+      need parameters for them.
+    - *`encoding bytes`* (variable-length instructions, not built) would
+      make any field width possible, at the cost of byte-stream decoding
+      and the questions in item 3.
+    - *Wider words* (`encoding fixed(u128)`): no new concept, but every
+      instruction pays for the widest one.
+
+    The first is the likely answer; nothing is built yet.

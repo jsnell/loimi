@@ -213,6 +213,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        lazy: false,
         env: None,
         env_val: vec![],
         env_struct: None,
@@ -1342,7 +1343,7 @@ impl AstAny<'_> {
             ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => self.block(b),
             ExprKind::If(cs, t, f) => conds(cs) || self.block(t) || f.as_ref().is_some_and(|e| go(e)),
             ExprKind::While(cs, b) => conds(cs) || self.block(b),
-            ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || self.block(b),
+            ExprKind::For(_, _, lo, hi, b) => go(lo) || hi.as_ref().is_some_and(|e| go(e)) || self.block(b),
             ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
             ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
             ExprKind::Closure(_, _, body) => self.closures && go(body),
@@ -1602,6 +1603,9 @@ pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<O
     if name == "cache" && h.op.is_some() && !h.in_fn {
         return Err(Diag::new(span, "`cache` on its own can only be passed to a vm function parameter declared `cache Name`"));
     }
+    if name == "next_pc" {
+        return next_pc(c, &h, span).map(Some);
+    }
     if let Some((_, kind, raw)) = h.operands.iter().find(|(n, _, _)| n == name) {
         let body = c.vms[h.vm as usize].kinds[*kind].body.clone();
         cx.scopes.push(vec![("it".to_string(), *raw)]);
@@ -1620,6 +1624,36 @@ pub fn vm_ident(c: &mut Checker, cx: &mut FnCx, name: &str, span: Span) -> Res<O
         }
     }
     Ok(None)
+}
+
+/// `next_pc`: the address `next` would continue at, the calling op's
+/// `pc` plus its size (a superinstruction part's own size), for saving a
+/// return address. Where `next` is allowed: op handlers and the `-> never`
+/// vm functions they call (a shared copy gets the size from its caller).
+fn next_pc(c: &mut Checker, h: &HandlerCx, span: Span) -> Res<TExpr> {
+    let vmi = h.vm as usize;
+    let pc_ty = c.vms[vmi].state[c.vms[vmi].pc_idx].1.clone();
+    let pc_local = h.state[c.vms[vmi].pc_idx];
+    let mut pc = mk(pc_ty.clone(), TK::Local(pc_local), span);
+    if h.by_ptr {
+        pc = mk(pc_ty.clone(), TK::Deref(Box::new(mk(Ty::Ptr(Box::new(pc_ty.clone())), TK::Local(pc_local), span))), span);
+    }
+    let n = if let (None, Some((j, size, _))) = (h.op, h.shared) {
+        c.vms[vmi].never_fns[j].uses_next = true;
+        mk(Ty::i64(), TK::Local(size), span)
+    } else if let (Some(op), true) = (h.op, h.allow_control) {
+        let size = match h.part {
+            Some((_, size)) => size,
+            None => c.vms[vmi].ops[op].size,
+        };
+        mk(Ty::i64(), TK::Int(size as i128), span)
+    } else {
+        return Err(Diag::new(
+            span,
+            "`next_pc` (the address `next` continues at) is only available where `next` is: op handlers and the `-> never` vm functions they call",
+        ));
+    };
+    Ok(mk(pc_ty, TK::Intrinsic(Intr::PtrOffset, vec![pc, n]), span))
 }
 
 pub fn vm_field(c: &mut Checker, cx: &mut FnCx, base: &Expr, name: &Ident, span: Span) -> Res<Option<TExpr>> {

@@ -285,7 +285,10 @@ fn nan_safe_in(safe: &HashSet<LocalId>, e: &TExpr) -> bool {
         TK::Local(l) => safe.contains(l),
         TK::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, a, b) => nan_safe_in(safe, a) && nan_safe_in(safe, b),
         TK::Unary(UnOp::Neg, a) => nan_safe_in(safe, a),
-        TK::Intrinsic(Intr::Sqrt | Intr::Floor, args) => args.iter().all(|a| nan_safe_in(safe, a)),
+        TK::Intrinsic(
+            Intr::Sqrt | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest | Intr::MinNum | Intr::MaxNum | Intr::Minimum | Intr::Maximum,
+            args,
+        ) => args.iter().all(|a| nan_safe_in(safe, a)),
         _ => false,
     }
 }

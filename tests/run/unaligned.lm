@@ -1,0 +1,39 @@
+// `p.read_unaligned()` and `p.write_unaligned(v)`: loads and stores at any
+// byte address (LLVM `align 1`), for guest memory and packed formats.
+import std.io;
+import std.mem;
+
+fn main() {
+    let buf = mem.alloc<u8>(32);
+    var i: u64 = 0;
+    while i < 32 { buf[i] = i as u8; i += 1; }
+    // Little-endian reads at odd addresses.
+    let p32 = (buf + 1) as *u32;
+    io.print_int(p32.read_unaligned() as i64); io.println("");      // 0x04030201
+    let p64 = (buf + 3) as *u64;
+    io.print_int((p64.read_unaligned() & 0xFFFF) as i64); io.println("");  // 0x0403
+    // Writes at odd addresses; the neighbours stay.
+    let q = (buf + 5) as *i16;
+    q.write_unaligned(-2);
+    io.print_int(q.read_unaligned() as i64); io.println("");
+    io.print_int(buf[4] as i64); io.print(" "); io.print_int(buf[5] as i64); io.print(" ");
+    io.print_int(buf[6] as i64); io.print(" "); io.print_int(buf[7] as i64); io.println("");
+    // Floats and pointers.
+    let f = (buf + 9) as *f64;
+    f.write_unaligned(2.5);
+    io.print_f64(f.read_unaligned()); io.println("");
+    let g = (buf + 19) as *f32;
+    g.write_unaligned(0.75);
+    io.print_f64(g.read_unaligned() as f64); io.println("");
+    let pp = (buf + 23) as **u8;
+    pp.write_unaligned(buf);
+    io.print_bool(pp.read_unaligned() == buf); io.println("");
+    mem.free(buf);
+}
+// expect: 67305985
+// expect: 1027
+// expect: -2
+// expect: 4 254 255 7
+// expect: 2.5
+// expect: 0.75
+// expect: true

@@ -1,0 +1,3 @@
+// Constants for const_patterns.lm.
+pub const BIG: u32 = 4294967295;
+pub const SMALL: u32 = 3;

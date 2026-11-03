@@ -107,6 +107,12 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   bounds are literals (or `Kind.COUNT`), the type comes from an annotation
   on the variable, `for i: u8 in 0..10`, and is `i64` without one; the
   bounds must fit it. (The loop variable's later uses are not looked at.)
+- **Element loops.** `for x in e`, with `e` an array or a slice, runs
+  the body with `x` bound to a copy of each element in order (`break`
+  and `continue` work): `for row in table() { let (op, k) = row; .. }`.
+  An array that is a place (a variable, field, `p.xs`) is read in
+  place; an array-valued call is stored in a temporary first. The loop
+  variable is a name, not a pattern.
 - **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
   takes type arguments. After any other type name, `<` begins type
   arguments only when a balanced `<...>` made of type tokens follows
@@ -126,6 +132,25 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
+- **Integer patterns** are literals (`0x45`, `-1`, `'a'`) and inclusive
+  ranges (`0x28..=0x3E`, `'a'..='z'`); a pattern outside the
+  scrutinee's type is an error. Integers count as covered only by `_`
+  or a binding.
+- **Constants in patterns.** A name in a pattern is, in this order: a
+  variant of the type matched (`Nil`, `Red`), a constant (a `const` of
+  this module or imported with `import m.{LIMIT}`, also written
+  `m.LIMIT`, and a vm's generated constants such as `Vm.OP_ADD`), else
+  a new binding. A constant matches its value, as if its literal stood
+  there: `match loc { LOCAL => .., CONST => .., _ => .. }`. Integer,
+  `bool`, `str`, enum and tuple constants qualify; float constants are
+  an error (there are no float patterns: NaN and `-0.0` make equality
+  the wrong test), and so is a constant whose type is not the
+  scrutinee's. A local variable shadows a constant of the same name
+  (the pattern binds again), and `var X` always binds. Arms after one
+  that matches every value (a binding or `_`, no guard) can never run
+  and draw the warning `unreachable_arm`; when that arm is a binding,
+  the note says so, which catches a misspelled or unimported constant
+  (`LOCAL =>` without `const LOCAL` in scope binds `LOCAL` to anything).
 - **String patterns.** On a `str`, `match` arms may be string literals:
   `match name { "dup" => .., "swap" | "exch" => .., _ => .. }`. As with
   integers, only `_` or a binding makes such a match exhaustive. A run
@@ -184,8 +209,8 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   (`op`, `family`, vm function, entry), covering everything inside it;
   `#![allow(name)]` at the top of a file covers the file. An unknown
   name is an error. `loimi build -W error` (or `--deny-warnings`) turns
-  the warnings that remain into errors. The lints are `match_fallout` and
-  `super_overlap` (section 7.3), and the
+  the warnings that remain into errors. The lints are `match_fallout`,
+  `unreachable_arm` (above) and `super_overlap` (section 7.3), and the
   opt-in `hot_gc`, turned on with `-W hot_gc`: a call that may collect
   (`uses gc`) on an op handler's fast path, outside `cold`, which syncs
   the vm state and roots the live traced locals on every execution
@@ -529,6 +554,13 @@ IR, and per-compilation data die together. Guest memory lives in the GC heap
   interpreters use them throughout; requiring `unsafe` around each use
   would mark most of that code without making any of it safer. Use a
   slice (`p.slice(n)`) where a bounds check is wanted.
+- **Alignment.** `*p` assumes `p` is aligned for its type (LLVM may
+  rely on it: vectorizing, combining accesses), as in C. For an address
+  that may not be, such as a guest's memory address or a packed format,
+  `p.read_unaligned()` and `p.write_unaligned(v)` load and store with
+  alignment 1 (`*T` for integer, float and pointer `T`). On x86-64 and
+  AArch64 they compile to the same single `mov`/`ldr` as an aligned
+  access.
 - **GC references cannot be forged outside `unsafe`.** A `Gc<T>` comes
   from `new`, from a field or value that holds one, or from
   `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it
@@ -626,8 +658,9 @@ How a name is resolved depends on where it is:
 - in `x.y`, `x` is looked up among types and modules first: with both
   `fn parse` and `import std.parse`, `parse.Prec` is the module's struct
   (a function has no fields, so nothing is lost);
-- patterns resolve variant names against the type being matched, so
-  they are not affected by items in scope.
+- patterns resolve variant names against the type being matched first;
+  a name that is not a variant is a constant in scope if there is one
+  (section 1.2, "Constants in patterns"), else a binding.
 
 Enum and `value` variants are not module items: bare `Arr(..)` or
 `Nil` is found through the expected type (or written `Value.Arr(..)`).
@@ -872,6 +905,8 @@ type.
 | `Vm.op_name(w) -> str` | name of the op (`"<invalid>"` for an unused opcode) |
 | `Vm.Op`, `Vm.op_of(w) -> Vm.Op` | an enum with one variant per op as host code sees it (`Vm.Op.ADD`; no supers, a family as its generic op), whose discriminant is the opcode (`Vm.Op.ADD as W == Vm.OP_ADD`), and the op word `w` stands for alone: a super's head gives its first part, a quickened member its family. An invalid opcode panics (verified code has none). For host tools (a second interpreter, a compiler pass, a disassembler) that `match` over the ops: the match is exhaustive, so adding an op is a compile error there |
 | `Vm.FMT_field(w) -> u64` / `i64` | field `field` of format `FMT` (`Vm.AsBx_sbx(w)`): `i64` for a signed field |
+| `Vm.set_FMT_field(w, v) -> ?W` | `w` with field `field` of format `FMT` set to `v` (`u64`, or `i64` for a signed field), the other bits kept; None if `v` does not fit the field. For peepholes that retarget an operand (`Vm.set_ABC_a(w, r)`) |
+| `Vm.encode.FMT(op, a, b, ..) -> W` | the word of opcode `op` in format `FMT` with these fields (typed and masked like an op's encoder): one encoder for every op of a format, for code that picks the opcode at run time (`Vm.encode.ABC(Vm.OP_ADD, d, a, b) == Vm.ADD(d, a, b)`) |
 | `Vm.set_label(w, off) -> ?W` / `Vm.label(w) -> ?i64` | re-encode / decode the jump offset of an op whose operand kind is `pc + it` (below) |
 | `Vm.operand_count(w)`, `operand_kind(w, i)`, `operand_bits(w, i)`, `operand_signed(w, i)`, `operand_name(w, i)` | per-op operand metadata (below) |
 | `Vm.NUM_KINDS`, `kind_name(k)`, `kind_is_label(k)`, `verify_clause(k)`, `check_name(i)` | operand kinds and `verify` blocks, by index |
@@ -912,7 +947,10 @@ In more detail:
   returns None if `off` does not fit the field or the op has no label;
   `Vm.label(w) -> ?i64` decodes it; `Vm.FMT_field(w)` reads field
   `field` of format `FMT` (`Vm.AsBx_sbx(w)`), as a `u64` or, for a
-  signed field, an `i64`. A superinstruction's head word answers for its
+  signed field, an `i64`, and `Vm.set_FMT_field(w, v)` writes it
+  (None if `v` does not fit). `Vm.encode.FMT(op, ..)` encodes any op of
+  a format. The setters and format encoders are compiled only into
+  programs that call them. A superinstruction's head word answers for its
   first part. `set_label` and `label` are the patch and jump-threading
   functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`;
 - `Vm.real_word(w)`: the instruction word that code word `w` stands
@@ -1080,6 +1118,23 @@ Rules for `-> never` vm functions:
   caller's instruction (in a superinstruction part, it continues with the
   next part). A function that uses `next` can only be reached from op
   handlers, not from entries or `on raise`.
+- `next_pc` is the address `next` continues at: the calling op's `pc`
+  plus its size (cache words included; in a superinstruction part, the
+  part's own size, so the address of the next part's original
+  instruction). It is the return address a shared call helper saves,
+  correct for every calling op by construction:
+
+  ```loimi
+  fn call(f: *Func, base: u64) -> never { fp = fp + 1; fp.ret = next_pc; ..; jump f.code }
+  op CALL(b: reg, fi: fidx) : ABC { call(ctx.funcs[fi], b.raw) }
+  op CALL_IC(b: reg, fi: fidx) : ABC + CallIC { ..; call(f, b.raw) }   // returns past the cache word
+  ```
+
+  Writing `pc + 1` instead is wrong for an op with cache words, and
+  nothing would catch it. `next_pc` is available where `next` is (op
+  handlers, and `-> never` vm functions reached from them; a shared copy
+  gets the size from its caller, like `next`). It is an ordinary name:
+  a local or state variable called `next_pc` hides it.
 - The body sees the vm state and its own parameters, but not the caller's
   operands: pass `dst.raw` or values as arguments. `become` is not
   allowed, since it belongs to the calling op, and neither is `cache`;
@@ -1186,7 +1241,16 @@ Selected per build (`--dispatch=` or `#[dispatch(...)]` on the vm):
 | `switch` | one function, loop plus `switch` | portability, wasm without tail calls, debugging |
 
 All three are produced from the same source, so a benchmark can compare them
-directly. The dispatch table pointer can be a state register (needed for
+directly.
+
+In `tailcall` mode, handlers (and their outlined cold blocks and the
+rest functions of superinstructions) carry LLVM's `no-builtin-memset`,
+`no-builtin-memcpy` and `no-builtin-memmove`: a loop that zeroes or
+copies memory stays a loop instead of becoming a library call, which
+would give the handler a stack frame and spills on every path even when
+the loop is short (as in a call op zeroing the callee's locals). Shared
+copies of `-> never` vm functions (cold call sites) and ordinary
+functions keep the usual behavior. The dispatch table pointer can be a state register (needed for
 instrumentation variants, section 9) or a global constant (saves a register);
 by default the compiler uses a register only if the vm declares variants.
 

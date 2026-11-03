@@ -1,0 +1,10 @@
+// A name that is not a constant in scope binds a new variable, and the
+// arms after it can never match: a warning (an error with -W error).
+// args: -W error
+// error: error[unreachable_arm]: 2 unreachable arms
+// error: `A` binds a new variable; it is not a constant in scope
+fn f(x: u8) -> i64 {
+    match x { A => 10, B => 20, _ => 30 }
+}
+
+fn main() { f(1); }

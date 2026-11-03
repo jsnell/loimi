@@ -1,0 +1,89 @@
+// A `const` named in a pattern compares with its value (also imported,
+// qualified with its module, and a vm's generated `Vm.OP_X`); a name that
+// is not a constant in scope binds a new variable. Locals shadow.
+import std.io;
+import const_patterns_mod.limits;
+import const_patterns_mod.limits.{BIG};
+
+const HOME: u8 = 0;
+const LOCAL: u8 = 1;
+const CONST: u8 = 2;
+const LO: i32 = -5;
+const NAME: str = "dup";
+const YES: bool = true;
+const PAIR: (u8, bool) = (1, false);
+
+enum Color { Red, Green, Blue }
+const FAV: Color = Color.Green;
+
+vm W {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+    op NOP() : AB { next }
+    op ADD(a: reg, b: reg) : AB { a = a + b; next }
+    op RET(a: reg) : AB { exit a }
+    entry run(code: *u32, r0: *i64) -> i64 { pc = code; r = r0; jump pc }
+}
+
+fn loc(x: u8) -> i64 {
+    match x {
+        LOCAL => 10,
+        CONST => 20,
+        HOME => 30,
+        _ => 40,
+    }
+}
+
+fn op_name(op: u32) -> str {
+    match op {
+        W.OP_ADD => "add",
+        W.OP_RET => "ret",
+        _ => "other",
+    }
+}
+
+fn main() {
+    { io.print_int(loc(0)); io.println(""); }
+    { io.print_int(loc(1)); io.println(""); }
+    { io.print_int(loc(2)); io.println(""); }
+    { io.print_int(loc(9)); io.println(""); }
+    // Negative constants, in or-patterns.
+    let v: i32 = -5;
+    { io.print_int(match v { LO | 0 => 1, _ => 2 }); io.println(""); }
+    // Imported (`import m.{C}`) and qualified (`m.C`) constants.
+    let m: u32 = 4294967295;
+    { io.print_int(match m { BIG => 1, _ => 2 }); io.println(""); }
+    { io.print_int(match 3 as u32 { limits.SMALL => 1, _ => 2 }); io.println(""); }
+    io.println(match "dup" { NAME => "name", _ => "no" });
+    io.println(match false { YES => "yes", false => "no" });
+    { io.print_int(match (1 as u8, false) { PAIR => 1, _ => 2 }); io.println(""); }
+    { io.print_int(match Color.Green { FAV => 1, _ => 2 }); io.println(""); }
+    io.println(op_name(W.OP_ADD as u32));
+    io.println(op_name(W.OP_RET as u32));
+    io.println(op_name(W.OP_NOP as u32));
+    // In `if let` too.
+    if let LOCAL = 1 as u8 { io.println("if let"); }
+    // A local of the same name shadows the constant: a binding again.
+    let CONST: u8 = 7;
+    { io.print_int(match 5 as u8 { CONST => CONST as i64 }); io.println(""); }
+    // `var` always binds.
+    { io.print_int(match 9 as u8 { var LOCAL => { LOCAL += 1; LOCAL as i64 } }); io.println(""); }
+}
+// expect: 30
+// expect: 10
+// expect: 20
+// expect: 40
+// expect: 1
+// expect: 1
+// expect: 1
+// expect: name
+// expect: no
+// expect: 1
+// expect: 1
+// expect: add
+// expect: ret
+// expect: other
+// expect: if let
+// expect: 5
+// expect: 10

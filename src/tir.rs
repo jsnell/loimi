@@ -132,6 +132,24 @@ pub enum Intr {
     BitsToFloat,
     Sqrt,
     Floor,
+    Ceil,
+    Trunc,
+    /// Round to nearest, ties to even (`llvm.roundeven`).
+    Nearest,
+    Fabs,
+    IsNan,
+    Copysign,
+    /// C `fmin`/`fmax` (IEEE 754-2008 minNum: a NaN operand is ignored).
+    MinNum,
+    MaxNum,
+    /// IEEE 754-2019 `minimum`/`maximum` (wasm `min`/`max`): NaN
+    /// propagates, -0 < +0.
+    Minimum,
+    Maximum,
+    /// `p.read_unaligned()`, `p.write_unaligned(v)`: `load`/`store` with
+    /// `align 1`.
+    LoadUnaligned,
+    StoreUnaligned,
     /// `gc_mark(heap, x)`: mark every GC reference held by `x`.
     GcMark,
     /// `__panic("msg")` (generated code only): panic with a message.
@@ -365,6 +383,9 @@ pub struct FnDef {
     /// synced in place, as in an op; callers root their traced locals at
     /// a call of this function as if it had these effects.
     pub sync_effects: u8,
+    /// Emitted only if some emitted function refers to it (generated vm
+    /// helpers few programs use: `crate::vmexpand::LAZY_ATTR`).
+    pub lazy: bool,
     /// Closure bodies: the captured locals of the enclosing function, in
     /// environment order. The function takes the environment pointer as
     /// a hidden first parameter, and reaches these locals through it.

@@ -9,6 +9,31 @@ flow resolved to jumps at load time, a validator the bytecode verifier
 leans on, linear memory with bounds checks, `call_indirect` with
 signature checks, and traps.
 
+## Follow-up (what has been done since)
+
+This report is kept as written. Since then:
+
+| # | Status |
+|---|---|
+| 1 | Fixed: a name in a pattern that is a constant in scope (this module's, imported with `import m.{C}`, or qualified: `m.C`, `W.OP_ADD`) matches its value; a variant of the matched type still comes first, a local of the same name shadows, `var X` always binds, and a float constant is an error (language.md §1.2, "Constants in patterns"). Arms after one that matches everything draw the new warning `unreachable_arm`, whose note says when that arm is a binding: `match x { A => 10, B => 20, _ => 30 }` without constants now warns (an error under `-W error`, which `check.sh` uses). `Loc` stays an enum (exhaustive); its comment is updated. |
+| 2 | Fixed: `f32` has what `f64` has (`to_bits -> u32`, `f32.from_bits`, `sqrt`, `floor`), and both have `ceil`, `trunc`, `nearest` (ties to even), `abs`, `copysign`, `is_nan`, `min`/`max` (C `fmin`/`fmax`: a NaN operand is ignored) and `minimum`/`maximum` (IEEE 754-2019 and wasm: NaN propagates, quieted; `-0 < +0`), each one LLVM intrinsic (stdlib.md, "Floats"). `sqrt`, `abs`, `copysign` and min/max are inline SSE2; the rounding functions stay libm calls on baseline x86-64, which lacks `roundsd` (SSE4.1). The libm externs, the pointer punning and the hand-written `fmin`/`fmax` are gone; `F64_MIN` is 32 instructions, `F32_NEAREST` a `roundevenf` call as `rintf` was. |
+| 3 | Fixed: `next_pc`, the address `next` continues at (the calling op's `pc` plus its size, cache words included; a super part's own size), in op handlers and the `-> never` vm functions they call, shared copies included (language.md §3.5). `do_call` and `call_slow` lost their `ret` parameter and save `next_pc`; Lox's `call_closure`/`call_value` too (its `pc + 1 + Lox.CW_PropIC` call sites are gone; Lox benchmarks 0.996x by geometric mean, within noise). |
+| 4 | Open (design note): docs/roadmap.md open question 10 compares trailing immediate words in formats (`format RRRX {..} + imm: u64`, with operand kinds and `verify`), `const` cache fields, `encoding bytes` and wider words. |
+| 5 | Fixed: `Vm.set_FMT_field(w, v) -> ?W` (None if `v` does not fit the field) and `Vm.encode.FMT(op, a, b, ..)` (language.md §3.3). They are compiled only into programs that call them, so other vms' IR is unchanged. The masks, the `SELECT4` special case (now `match W.set_R4_a(w, x)`) and the `with_opcode` templates are gone. |
+| 6 | Fixed: tail-call handlers (and their cold blocks and super resume functions) carry `no-builtin-memset`/`memcpy`/`memmove`, so LLVM keeps loops as loops (language.md §3.7). CALL zeroes the callee's locals with a plain loop again, without a frame (63 instructions with the loop, against 46 for the four-stores workaround; geomean 0.99x of the workaround's time). Mini, MiniJS and Scheme compile to byte-identical `.text`; Stak's HALT/RET store their zeroed result differently. |
+| 7 | Fixed: `p.read_unaligned()` and `p.write_unaligned(v)` (`align 1`; language.md §1.3); every guest memory access in the handlers and the WASI host functions uses them, and `I32_LOAD` is unchanged (19 instructions in this build, the access one `mov`). |
+| 8 | Partly: `for x in e` iterates over an array or slice (language.md §1.2), so the K-form and fusion tables are walked without repeating their lengths; the return types still spell them (`[T; _]` is not built). |
+| 9 | Fixed: "`Vec` is a generic type, not a value; .. write `var v: Vec<T> = Vec.new();`". |
+| 10 | Range patterns are documented (language.md §1.2, "Integer patterns"). `bool as` integer, a profiler and an op-table dump are unchanged. |
+| 11 | Not Loimi's. |
+
+Spec tests after these changes: all 90 non-SIMD files pass in all three
+dispatch modes (`check.sh`). Benchmarks (best of 3, interleaved,
+`--align-functions=64`, tail calls), this version against the study's:
+binarytrees 0.97, coremark 0.97, fannkuchredux 0.97, fasta 1.00,
+mandelbrot 0.99, nbody 1.00, spectralnorm 1.01; geomean 0.985 (1.881 s
+against 1.909 s).
+
 ## Summary
 
 | File | Lines | What |

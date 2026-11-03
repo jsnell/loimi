@@ -1,0 +1,72 @@
+// matrix: dispatch
+// `next_pc`, the address `next` continues at, as a return address saved
+// by a shared call helper: correct for a one-word op, an op with a cache
+// word, a call from a cold block (the shared copy of the helper gets the
+// size from its caller) and a call that is the first part of a super.
+import std.io;
+
+struct M { stack: [*u32; 8], sp: u64 }
+
+vm V {
+    context ctx: *M;
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format sJ { op: 8, sj: s24 }
+    }
+    cache Pad { x: u32 }
+
+    // Push the return address and jump: works for every calling op.
+    fn call_to(target: *u32) -> never {
+        ctx.stack[ctx.sp] = next_pc;
+        ctx.sp += 1;
+        jump target
+    }
+    #[inline(never)]
+    fn call_shared(target: *u32) -> never { call_to(target) }
+
+    op CALL(target: label) : sJ { call_to(target) }
+    op CALL_IC(target: label) : sJ + Pad { cache.x += 1; call_to(target) }
+    op CALL_COLD(target: label) : sJ + Pad { cold { call_shared(target) } }
+    op CALL_SHARED(target: label) : sJ { call_shared(target) }
+    op RET() : ABC { ctx.sp -= 1; jump ctx.stack[ctx.sp] }
+    op INC(dst: reg) : ABC { dst = dst + 1; next }
+    op HALT(src: reg) : ABC { exit src }
+
+    super CALL_INC = CALL; INC;
+
+    entry run(m: *M, code: *u32, r: *i64) -> i64 { ctx = m; regs = r; jump code }
+}
+
+fn main() {
+    var code: [u32; 32] = [0; 32];
+    var regs: [i64; 4] = [0; 4];
+    var m = M { stack: [0 as *u32; 8], sp: 0 };
+    let c = code[..];
+    // 0: CALL 12; 1: INC; 2: CALL_IC 12 (+1 cache word); 4: INC;
+    // 5: CALL_COLD 12 (+1); 7: INC; 8: CALL_SHARED 12; 9: INC; 10: HALT
+    // 12: INC r1; RET
+    var at: u64 = 0;
+    at = V.emit.CALL(c, at, 12);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.CALL_IC(c, at, 10);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.CALL_COLD(c, at, 7);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.CALL_SHARED(c, at, 4);
+    at = V.emit.INC(c, at, 0);
+    at = V.emit.HALT(c, at, 0);
+    at = 12;
+    at = V.emit.INC(c, at, 1);
+    at = V.emit.RET(c, at);
+    V.optimize_words(c[0..at]);
+    io.print_int(V.run(&m, &code[0], &regs[0]));
+    io.println("");
+    io.print_int(regs[1]);
+    io.println("");
+}
+// expect: 4
+// expect: 4

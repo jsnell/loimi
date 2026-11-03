@@ -1,0 +1,10 @@
+// `next_pc` exists only where `next` does: not in an entry.
+// error: `next_pc` (the address `next` continues at) is only available where `next` is
+vm V {
+    state { pc: *u32, regs: *i64 }
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump next_pc }
+}
+
+fn main() {}

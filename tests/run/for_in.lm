@@ -1,0 +1,41 @@
+// `for x in e` over the elements of an array or a slice: in place for an
+// array variable, through a temporary for an array-valued call; `break`
+// and `continue` work; the element is a copy.
+import std.io;
+
+fn table() -> [(u64, bool); 4] { [(1, true), (2, false), (3, true), (40, true)] }
+
+struct S { xs: [i32; 3] }
+
+fn main() {
+    var sum: u64 = 0;
+    for row in table() {
+        let (v, ok) = row;
+        if !ok { continue; }
+        sum += v;
+    }
+    io.print_int(sum as i64); io.println("");
+    var a: [i64; 5] = [5, 4, 3, 2, 1];
+    var n: i64 = 0;
+    for x in a {
+        if x == 2 { break; }
+        n = n * 10 + x;
+    }
+    io.print_int(n); io.println("");
+    let s = a[1..4];
+    for x in s { io.print_int(x); }
+    io.println("");
+    let st = S { xs: [7, 8, 9] };
+    let p = &st;
+    for x in p.xs { io.print_int(x as i64); }
+    io.println("");
+    let empty: []u8 = [];
+    for c in empty { io.print_int(c as i64); }
+    for c in "hi" { io.print_int(c as i64); io.print("."); }
+    io.println("");
+}
+// expect: 44
+// expect: 543
+// expect: 432
+// expect: 789
+// expect: 104.105.

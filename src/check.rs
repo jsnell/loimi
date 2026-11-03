@@ -784,6 +784,7 @@ impl<'a> Checker<'a> {
             vm_state: vec![],
             effects: effects_of(&f.attrs)?,
             sync_effects: 0,
+            lazy: f.attrs.has(crate::vmexpand::LAZY_ATTR),
             env: None,
             env_val: vec![],
             env_struct: None,
@@ -1447,6 +1448,75 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The constant a pattern path names, if any: `LIMIT` (a `const` of
+    /// this module or imported, not shadowed by a local), `mod.LIMIT`,
+    /// `Vm.OP_ADD`.
+    fn pat_const(&self, cx: &FnCx, path: &[Ident]) -> Option<u32> {
+        if cx.lookup(&path[0].name).is_some() {
+            return None;
+        }
+        if path.len() == 1 {
+            let n = &path[0].name;
+            return match self.value_def(cx.module, n).or_else(|| self.scopes[cx.module].get(n).cloned()) {
+                Some((Def::Const(id), _)) => Some(id),
+                _ => None,
+            };
+        }
+        let mut base = Expr { kind: ExprKind::Ident(path[0].name.clone()), span: path[0].span };
+        for id in &path[1..path.len() - 1] {
+            base = Expr { kind: ExprKind::Field(Box::new(base), id.clone()), span: id.span };
+        }
+        let last = &path[path.len() - 1].name;
+        if let Some(Def::Const(id)) = self.vm_item(cx, &base, last) {
+            return Some(id);
+        }
+        let m = self.module_path(cx, &base)?;
+        match self.scopes[m].get(last) {
+            Some((Def::Const(id), true)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// A pattern that matches the value of constant `id`.
+    fn const_pat(&mut self, id: u32, name: &str, ty: &Ty, span: Span) -> Res<TPat> {
+        let v = self.const_value(id, span)?;
+        if v.ty != *ty {
+            return Err(Diag::new(
+                span,
+                format!(
+                    "constant `{}` has type `{}`, but the value matched has type `{}`",
+                    name,
+                    self.ty_name(&v.ty),
+                    self.ty_name(ty)
+                ),
+            ));
+        }
+        fn conv(c: &Checker, e: &TExpr, name: &str, span: Span) -> Res<TPat> {
+            let kind = match &e.kind {
+                TK::Int(v) => TPK::Int(*v),
+                TK::Bool(b) => TPK::Bool(*b),
+                TK::Str(s) => TPK::Str(s.clone()),
+                TK::Unit => TPK::Wild,
+                TK::Tuple(es) => TPK::Tuple(es.iter().map(|x| conv(c, x, name, span)).collect::<Res<_>>()?),
+                TK::Variant(i, es) if !matches!(e.ty, Ty::Value(_)) => {
+                    TPK::Variant(*i, es.iter().map(|x| conv(c, x, name, span)).collect::<Res<_>>()?)
+                }
+                _ => {
+                    return Err(Diag::new(
+                        span,
+                        format!(
+                            "constant `{}` cannot be a pattern: only integer, `bool`, `str`, enum and tuple constants can (this part has type `{}`)",
+                            name,
+                            c.ty_name(&e.ty)
+                        ),
+                    ))
+                }
+            };
+            Ok(TPat { ty: e.ty.clone(), kind })
+        }
+        conv(self, &v, name, span)
+    }
+
     pub fn pat(&mut self, cx: &mut FnCx, p: &Pat, ty: &Ty, mutable: bool) -> Res<TPat> {
         let kind = match &p.kind {
             PatKind::Wild => TPK::Wild,
@@ -1456,7 +1526,18 @@ impl<'a> Checker<'a> {
                         return Ok(TPat { ty: ty.clone(), kind: TPK::Variant(idx, vec![]) });
                     }
                 }
+                if !*pm {
+                    if let Some(id) = self.pat_const(cx, std::slice::from_ref(&Ident { name: name.clone(), span: p.span })) {
+                        return self.const_pat(id, name, ty, p.span);
+                    }
+                }
                 TPK::Bind(cx.declare(name, ty.clone(), mutable || *pm))
+            }
+            // `mod.LIMIT`, `Vm.OP_ADD`: a constant compares with its value.
+            PatKind::Variant(path, None) if path.len() >= 2 && !path[0].name.is_empty() && self.pat_const(cx, path).is_some() => {
+                let id = self.pat_const(cx, path).unwrap();
+                let name = path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(".");
+                return self.const_pat(id, &name, ty, p.span);
             }
             PatKind::Int(_) | PatKind::Range(..) | PatKind::Char(..) if !ty.is_int() => {
                 return Err(Diag::new(p.span, format!("integer pattern for a value of type `{}`", self.ty_name(ty))));
@@ -1959,7 +2040,69 @@ impl<'a> Checker<'a> {
                 let ty = lc.break_ty.unwrap_or(Ty::Never);
                 Ok(mk(ty, TK::Loop { body: Box::new(b), step: None, id }, span))
             }
-            ExprKind::For(var, ann, lo, hi, body) => {
+            ExprKind::For(var, ann, coll, None, body) => {
+                // `for x in e`: over a slice, or an array (in place if it is
+                // one, else a temporary), by index.
+                if ann.is_some() {
+                    return Err(Diag::new(var.span, "`for x in e` takes the element type from `e`: no annotation"));
+                }
+                let c = self.expr(cx, coll, None)?;
+                let c = self.auto_deref_for_index(c);
+                let elem = match &c.ty {
+                    Ty::Array(t, _) | Ty::Slice(t) => (**t).clone(),
+                    t => {
+                        return Err(Diag::new(
+                            coll.span,
+                            format!("`for` iterates over a range `lo..hi`, an array or a slice, not `{}`", self.ty_name(t)),
+                        ))
+                    }
+                };
+                let sty = Ty::Slice(Box::new(elem.clone()));
+                let u = Ty::Int(IntTy::U64);
+                let mut pre = Vec::new();
+                cx.scopes.push(vec![]);
+                let slice = match &c.ty {
+                    Ty::Array(..) if !matches!(c.kind, TK::Local(_) | TK::Global(_) | TK::Field(..) | TK::Index(..) | TK::Deref(_)) => {
+                        let tmp = cx.temp(c.ty.clone());
+                        let cs = c.span;
+                        let aty = c.ty.clone();
+                        pre.push(TStmt::Let(tmp, Some(c)));
+                        mk(sty.clone(), TK::SliceRange(Box::new(mk(aty, TK::Local(tmp), cs)), None, None), cs)
+                    }
+                    Ty::Array(..) => {
+                        let cs = c.span;
+                        mk(sty.clone(), TK::SliceRange(Box::new(c), None, None), cs)
+                    }
+                    _ => c,
+                };
+                let s = cx.temp(sty.clone());
+                let ctr = cx.temp(u.clone());
+                let end = cx.temp(u.clone());
+                let id = self.push_loop(cx, false);
+                cx.scopes.push(vec![]);
+                let user = cx.declare(&var.name, elem.clone(), false);
+                let b = self.block(cx, body, Some(&Ty::Unit));
+                cx.scopes.pop();
+                cx.loops.pop();
+                cx.scopes.pop();
+                let b = b?;
+                let local = |id, t: &Ty| mk(t.clone(), TK::Local(id), span);
+                let len = mk(u.clone(), TK::Field(Box::new(local(s, &sty)), 1), span);
+                let cond = mk(Ty::Bool, TK::Binary(BinOp::Lt, Box::new(local(ctr, &u)), Box::new(local(end, &u))), span);
+                let item = mk(elem.clone(), TK::Index(Box::new(local(s, &sty)), Box::new(local(ctr, &u))), span);
+                let inner = mk(Ty::Unit, TK::Block(vec![TStmt::Let(user, Some(item)), TStmt::Expr(b)], None), span);
+                let brk = mk(Ty::Never, TK::Break(id, None), span);
+                let body = mk(Ty::Unit, TK::If(vec![TCond::Expr(cond)], Box::new(inner), Some(Box::new(brk))), span);
+                let one = mk(u.clone(), TK::Int(1), span);
+                let inc = mk(u.clone(), TK::Binary(BinOp::AddWrap, Box::new(local(ctr, &u)), Box::new(one)), span);
+                let step = mk(Ty::Unit, TK::Assign(Box::new(local(ctr, &u)), Box::new(inc)), span);
+                let lp = mk(Ty::Unit, TK::Loop { body: Box::new(body), step: Some(Box::new(step)), id }, span);
+                pre.push(TStmt::Let(s, Some(slice)));
+                pre.push(TStmt::Let(ctr, Some(mk(u.clone(), TK::Int(0), span))));
+                pre.push(TStmt::Let(end, Some(len)));
+                Ok(mk(Ty::Unit, TK::Block(pre, Some(Box::new(lp))), span))
+            }
+            ExprKind::For(var, ann, lo, Some(hi), body) => {
                 // The range's type: the annotation, else the bound that is
                 // not a literal (`0..n` with `n: u64` is a u64 range), else
                 // i64.
@@ -2329,6 +2472,7 @@ impl<'a> Checker<'a> {
             tarms.push(a);
         }
         self.check_exhaustive(&s.ty, &tarms, span)?;
+        self.lint_unreachable_arms(&tarms, arms);
         if cx.vm.as_ref().is_some_and(|h| h.allow_control) {
             self.lint_lone_if_arms(&tarms, arms);
         }
@@ -2346,6 +2490,34 @@ impl<'a> Checker<'a> {
     /// control continues after the `match`, not with the later arm.
     /// An explicit `else {}` (or a guard, `pat if cond => ..`) says
     /// which is meant.
+    /// Warn about arms after an arm that matches everything (a binding or
+    /// `_`, no guard): they can never run. A binding named like a
+    /// constant (`LOCAL =>` with no `const LOCAL` in scope) is the usual
+    /// cause, so the note says what it is.
+    fn lint_unreachable_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
+        let Some(i) = tarms.iter().position(|a| a.guard.is_none() && irrefutable(&a.pat)) else { return };
+        if i + 1 >= tarms.len() {
+            return;
+        }
+        let span = arms[i + 1].pat.span;
+        if self.warnings.iter().any(|w| w.span == span) {
+            return;
+        }
+        let mut w = Diag::warning(
+            "unreachable_arm",
+            span,
+            if tarms.len() - i - 1 == 1 { "unreachable arm".to_string() } else { format!("{} unreachable arms", tarms.len() - i - 1) },
+        )
+        .note(arms[i].pat.span, "this earlier arm matches every value");
+        if let PatKind::Ident(n, false) = &arms[i].pat.kind {
+            w = w.note(
+                arms[i].pat.span,
+                format!("`{}` binds a new variable; it is not a constant in scope (a `const` of this module, an imported one, or `mod.{}`, would compare with its value)", n, n),
+            );
+        }
+        self.warnings.push(w);
+    }
+
     pub fn lint_lone_if_arms(&mut self, tarms: &[TArm], arms: &[Arm]) {
         fn lone_if(e: &TExpr) -> bool {
             match &e.kind {
@@ -2513,6 +2685,13 @@ impl<'a> Checker<'a> {
                 Ok(v)
             }
             Def::Global(id) => Ok(mk(self.prog.globals[id as usize].ty.clone(), TK::Global(id), span)),
+            Def::GenericType(_) => Err(Diag::new(
+                span,
+                format!(
+                    "`{n}` is a generic type, not a value; its static functions take their type arguments from the expected type, not as `{n}<T>.f(..)`: write `var v: {n}<T> = {n}.new();` (qualified as the type is, e.g. `mem.{n}`)",
+                    n = name
+                ),
+            )),
             _ => Err(Diag::new(span, format!("`{}` is not a value", name))),
         }
     }
@@ -2578,6 +2757,7 @@ impl<'a> Checker<'a> {
         };
         let (vm, prefix) = match &base.kind {
             ExprKind::Field(b2, mid) if mid.name == "emit" => (vm_of(b2)?, "emit_"),
+            ExprKind::Field(b2, mid) if mid.name == "encode" => (vm_of(b2)?, "encode_"),
             _ => (vm_of(base)?, ""),
         };
         let (m, decl) = &self.vm_decls[vm as usize];
@@ -3224,7 +3404,9 @@ impl<'a> Checker<'a> {
         let recv = {
             let mut r = recv;
             while let Ty::Ptr(inner) = &r.ty {
-                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64) && name != "offset" && name != "slice" {
+                if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32)
+                    && !matches!(name, "offset" | "slice" | "read_unaligned" | "write_unaligned")
+                {
                     let t = (**inner).clone();
                     let s = r.span;
                     r = mk(t, TK::Deref(Box::new(r)), s);
@@ -3261,14 +3443,38 @@ impl<'a> Checker<'a> {
                 };
                 mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
             }
-            (Ty::F64, "to_bits") => {
+            (Ty::F64 | Ty::F32, "to_bits") => {
                 argc(0)?;
-                mk(Ty::Int(IntTy::U64), TK::Intrinsic(Intr::FloatBits, vec![recv]), span)
+                let bt = if t == Ty::F64 { IntTy::U64 } else { IntTy::U32 };
+                mk(Ty::Int(bt), TK::Intrinsic(Intr::FloatBits, vec![recv]), span)
             }
-            (Ty::F64, "sqrt" | "floor") => {
+            (Ty::F64 | Ty::F32, "sqrt" | "floor" | "ceil" | "trunc" | "nearest" | "abs") => {
                 argc(0)?;
-                let intr = if name == "sqrt" { Intr::Sqrt } else { Intr::Floor };
-                mk(Ty::F64, TK::Intrinsic(intr, vec![recv]), span)
+                let intr = match name {
+                    "sqrt" => Intr::Sqrt,
+                    "floor" => Intr::Floor,
+                    "ceil" => Intr::Ceil,
+                    "trunc" => Intr::Trunc,
+                    "nearest" => Intr::Nearest,
+                    _ => Intr::Fabs,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
+            }
+            (Ty::F64 | Ty::F32, "is_nan") => {
+                argc(0)?;
+                mk(Ty::Bool, TK::Intrinsic(Intr::IsNan, vec![recv]), span)
+            }
+            (Ty::F64 | Ty::F32, "copysign" | "min" | "max" | "minimum" | "maximum") => {
+                argc(1)?;
+                let y = self.expr_coerce(cx, &args[0], &t)?;
+                let intr = match name {
+                    "copysign" => Intr::Copysign,
+                    "min" => Intr::MinNum,
+                    "max" => Intr::MaxNum,
+                    "minimum" => Intr::Minimum,
+                    _ => Intr::Maximum,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv, y]), span)
             }
             (Ty::Option(_), "is_some" | "is_none") => {
                 argc(0)?;
@@ -3289,6 +3495,22 @@ impl<'a> Checker<'a> {
                 let n = self.expr_coerce(cx, &args[0], &Ty::i64())?;
                 mk(t.clone(), TK::Intrinsic(Intr::PtrOffset, vec![recv, n]), span)
             }
+            (Ty::Ptr(inner), "read_unaligned" | "write_unaligned") => {
+                if !matches!(**inner, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Ptr(_)) {
+                    return Err(Diag::new(
+                        span,
+                        format!("`{}` is for pointers to integers, floats and pointers, not `{}`", name, self.ty_name(&t)),
+                    ));
+                }
+                if name == "read_unaligned" {
+                    argc(0)?;
+                    mk((**inner).clone(), TK::Intrinsic(Intr::LoadUnaligned, vec![recv]), span)
+                } else {
+                    argc(1)?;
+                    let v = self.expr_coerce(cx, &args[0], inner)?;
+                    mk(Ty::Unit, TK::Intrinsic(Intr::StoreUnaligned, vec![recv, v]), span)
+                }
+            }
             (Ty::Ptr(inner), "slice") => {
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::Int(IntTy::U64))?;
@@ -3301,12 +3523,13 @@ impl<'a> Checker<'a> {
 
     fn static_intrinsic(&mut self, cx: &mut FnCx, t: &Ty, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
         match (t, name) {
-            (Ty::F64, "from_bits") => {
+            (Ty::F64 | Ty::F32, "from_bits") => {
                 if args.len() != 1 {
                     return Err(Diag::new(span, "`from_bits` takes one argument"));
                 }
-                let a = self.expr_coerce(cx, &args[0], &Ty::Int(IntTy::U64))?;
-                Ok(Some(mk(Ty::F64, TK::Intrinsic(Intr::BitsToFloat, vec![a]), span)))
+                let bt = if *t == Ty::F64 { IntTy::U64 } else { IntTy::U32 };
+                let a = self.expr_coerce(cx, &args[0], &Ty::Int(bt))?;
+                Ok(Some(mk(t.clone(), TK::Intrinsic(Intr::BitsToFloat, vec![a]), span)))
             }
             _ => Ok(None),
         }
@@ -3688,6 +3911,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        lazy: false,
         env: None,
         env_val: vec![],
         env_struct: None,

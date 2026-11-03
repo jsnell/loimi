@@ -342,7 +342,11 @@ impl<'p> Codegen<'p> {
             let align = layout::align_of(p, &g.ty).max(1);
             let _ = writeln!(self.globals, "@\"{}\" = internal {}global {} {}, align {}", g.symbol, tl, llty(p, &g.ty), init, align);
         }
+        let keep = lazy_used(p);
         for (i, f) in p.fns.iter().enumerate() {
+            if f.lazy && !keep[i] {
+                continue;
+            }
             if f.body.is_none() {
                 if f.linkage == Linkage::Extern {
                     let mut ps: Vec<String> = f.param_tys.iter().map(|t| format!("{} {}", llty(p, t), c_abi_attr(t)).trim_end().to_string()).collect();
@@ -682,6 +686,19 @@ impl<'a, 'p> FnGen<'a, 'p> {
         if cold.is_some() {
             attrs.push("cold");
             attrs.push("noinline");
+        }
+        // Tail-call handlers: LLVM must not turn a loop into a call of
+        // memset/memcpy/memmove (loop idiom recognition), which would
+        // give the handler a stack frame and spills on every path. Their cold
+        // blocks and super resume functions get them too: LLVM inlines a
+        // callee only into a caller with at least its `no-builtin` set,
+        // and cold blocks inline handlers and resume functions. Shared
+        // copies of `-> never` vm functions (called from cold paths) may
+        // still call memset.
+        if matches!(f.vm_role, VmRole::Handler(_) | VmRole::Resume(..))
+            && f.vm.is_some_and(|v| p.vms[v as usize].dispatch == crate::tir::Dispatch::TailCall)
+        {
+            attrs.push("\"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\"");
         }
         let symbol = match (&cold, &self.stencil) {
             (Some((_, _, s)), _) => s.clone(),
@@ -2307,12 +2324,55 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 decl(self.cg, &format!("declare {} @llvm.{}.{}({}{})", lt, n, lt, lt, extra_decl));
                 self.inst(format!("call {} @llvm.{}.{}({} {}{})", lt, n, lt, lt, vals[0], extra))
             }
+            Intr::FloatBits if args[0].ty == Ty::F32 => self.inst(format!("bitcast float {} to i32", vals[0])),
             Intr::FloatBits => self.inst(format!("bitcast double {} to i64", vals[0])),
+            Intr::BitsToFloat if e.ty == Ty::F32 => self.inst(format!("bitcast i32 {} to float", vals[0])),
             Intr::BitsToFloat => self.inst(format!("bitcast i64 {} to double", vals[0])),
-            Intr::Sqrt | Intr::Floor => {
-                let n = if i == Intr::Sqrt { "sqrt" } else { "floor" };
-                decl(self.cg, &format!("declare double @llvm.{}.f64(double)", n));
-                self.inst(format!("call double @llvm.{}.f64(double {})", n, vals[0]))
+            Intr::LoadUnaligned => {
+                let lt = self.ty(&e.ty);
+                self.inst(format!("load {}, ptr {}, align 1", lt, vals[0]))
+            }
+            Intr::StoreUnaligned => {
+                let lt = self.ty(&args[1].ty);
+                self.emit(format!("store {} {}, ptr {}, align 1", lt, vals[1], vals[0]));
+                "zeroinitializer".into()
+            }
+            Intr::IsNan => {
+                let ft = self.ty(&args[0].ty);
+                self.inst(format!("fcmp uno {} {}, {}", ft, vals[0], vals[0]))
+            }
+            Intr::Sqrt | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::Nearest | Intr::Fabs => {
+                let n = match i {
+                    Intr::Sqrt => "sqrt",
+                    Intr::Floor => "floor",
+                    Intr::Ceil => "ceil",
+                    Intr::Trunc => "trunc",
+                    Intr::Nearest => "roundeven",
+                    _ => "fabs",
+                };
+                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft})"));
+                self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {})", vals[0]))
+            }
+            Intr::Copysign | Intr::MinNum | Intr::MaxNum | Intr::Minimum | Intr::Maximum => {
+                let n = match i {
+                    Intr::Copysign => "copysign",
+                    Intr::MinNum => "minnum",
+                    Intr::MaxNum => "maxnum",
+                    Intr::Minimum => "minimum",
+                    _ => "maximum",
+                };
+                let (ft, sfx) = if e.ty == Ty::F32 { ("float", "f32") } else { ("double", "f64") };
+                decl(self.cg, &format!("declare {ft} @llvm.{n}.{sfx}({ft}, {ft})"));
+                let r = self.inst(format!("call {ft} @llvm.{n}.{sfx}({ft} {}, {ft} {})", vals[0], vals[1]));
+                if !matches!(i, Intr::Minimum | Intr::Maximum) {
+                    return r;
+                }
+                // IEEE 754-2019 (and wasm) want a quiet NaN; LLVM may pass
+                // a signaling NaN operand through as is. `a + b` quiets it.
+                let uno = self.inst(format!("fcmp uno {ft} {}, {}", vals[0], vals[1]));
+                let q = self.inst(format!("fadd {ft} {}, {}", vals[0], vals[1]));
+                self.inst(format!("select i1 {uno}, {ft} {q}, {ft} {r}"))
             }
             Intr::GcMark => {
                 crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
@@ -2320,6 +2380,28 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
         }
     }
+}
+
+/// Which lazy functions (`FnDef::lazy`) some emitted function refers to.
+fn lazy_used(p: &Program) -> Vec<bool> {
+    let mut used = vec![false; p.fns.len()];
+    if !p.fns.iter().any(|f| f.lazy) {
+        return used;
+    }
+    let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !p.fns[i].lazy).collect();
+    while let Some(i) = work.pop() {
+        let Some(body) = &p.fns[i].body else { continue };
+        crate::tirwalk::for_each_expr(body, &mut |e| {
+            if let TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) = &e.kind {
+                let id = *id as usize;
+                if p.fns[id].lazy && !used[id] {
+                    used[id] = true;
+                    work.push(id);
+                }
+            }
+        });
+    }
+    used
 }
 
 /// The literals of a string pattern (`"a"` or `"a" | "b"`), if it is one.

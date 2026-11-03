@@ -1557,11 +1557,10 @@ impl Parser {
                         let saved = self.no_struct;
                         self.no_struct = true;
                         let lo = self.parse_bin(2)?;
-                        self.expect("..")?;
-                        let hi = self.parse_bin(2)?;
+                        let hi = if self.eat("..") { Some(Box::new(self.parse_bin(2)?)) } else { None };
                         self.no_struct = saved;
                         let body = self.parse_block()?;
-                        mk(ExprKind::For(var, ty, Box::new(lo), Box::new(hi), body), self)
+                        mk(ExprKind::For(var, ty, Box::new(lo), hi, body), self)
                     }
                     "unsafe" if self.is_at(1, "{") => {
                         self.bump();

@@ -57,7 +57,7 @@ pub fn spectest(e: *Engine) -> *ModInst {
     mi.add_func("print_f64_f64", e.host_func(TDD[0..2], [], nothing, 0));
     mi.add_global("global_i32", T_I32, 666);
     mi.add_global("global_i64", T_I64, 666);
-    mi.add_global("global_f32", T_F32, vm.f32_bits(666.6) as u64);
+    mi.add_global("global_f32", T_F32, (666.6 as f32).to_bits() as u64);
     mi.add_global("global_f64", T_F64, (666.6).to_bits());
     let t = mem.alloc<Table>(1);
     *t = Table { elems: mem.alloc<u64>(10), size: 10, max: 20, reftype: T_FUNCREF };
@@ -90,12 +90,12 @@ fn guest(m: *Machine, addr: u64, n: u64) -> ?*u8 {
 }
 fn put32(m: *Machine, addr: u64, v: u32) -> bool {
     let Some(p) = guest(m, addr, 4) else { return false; };
-    *(p as *u32) = v;
+    (p as *u32).write_unaligned(v);
     true
 }
 fn put64(m: *Machine, addr: u64, v: u64) -> bool {
     let Some(p) = guest(m, addr, 8) else { return false; };
-    *(p as *u64) = v;
+    (p as *u64).write_unaligned(v);
     true
 }
 fn arg32(a: *u64, i: u64) -> u64 { (a[i] & 0xFFFFFFFF) }
@@ -111,8 +111,8 @@ fn fd_write(m: *Machine, a: *u64) -> bool {
     var total: u64 = 0;
     for i in 0..n {
         let Some(iov) = guest(m, iovs + i * 8, 8) else { m.host_trap = Trap.MemOOB; return false; };
-        let base = *(iov as *u32) as u64;
-        let len = *((iov + 4) as *u32) as u64;
+        let base = (iov as *u32).read_unaligned() as u64;
+        let len = ((iov + 4) as *u32).read_unaligned() as u64;
         let Some(p) = guest(m, base, len) else { m.host_trap = Trap.MemOOB; return false; };
         if len > 0 { write(fd as i32, p, len); }
         total += len;

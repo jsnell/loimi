@@ -1,0 +1,92 @@
+// Float built-ins on f32 and f64: bits, rounding, abs, copysign, the two
+// kinds of min/max (C fmin vs IEEE 754-2019 minimum), is_nan.
+import std.io;
+
+fn p(x: f64) { io.print_f64(x); io.println(""); }
+fn h(x: u64) { io.print_int(x as i64); io.println(""); }
+fn b(x: bool) { io.print_bool(x); io.println(""); }
+
+fn main() {
+    // f32 bits.
+    let one: f32 = 1.0;
+    h(one.to_bits() as u64);                 // 0x3F800000
+    p(f32.from_bits(0x40490FDB) as f64);     // pi, rounded to f32
+    let x: f32 = 2.0;
+    p(x.sqrt() as f64);
+    let y: f32 = -2.5;
+    p(y.floor() as f64);
+    p(y.ceil() as f64);
+    p(y.trunc() as f64);
+    p(y.nearest() as f64);                   // ties to even: -2
+    p(y.abs() as f64);
+    // f64 rounding, ties to even.
+    let a: f64 = 0.5;
+    p(a.nearest());
+    p((1.5 as f64).nearest());
+    p((2.5 as f64).nearest());
+    p((-0.5 as f64).nearest());              // -0
+    h((-0.5 as f64).nearest().to_bits() >> 63);
+    p((-3.7 as f64).ceil());
+    p((-3.7 as f64).trunc());
+    p((-3.7 as f64).abs());
+    // copysign.
+    p((3.0 as f64).copysign(-0.0));
+    let z: f32 = 3.0;
+    p(z.copysign(-1.0) as f64);
+    // NaN handling.
+    let nan: f64 = 0.0 / 0.0;
+    b(nan.is_nan());
+    b(a.is_nan());
+    p(a.min(nan));                           // fmin: the number
+    p(nan.max(a));
+    b(a.minimum(nan).is_nan());              // minimum: NaN propagates
+    b(nan.maximum(a).is_nan());
+    // -0 and +0: minimum orders them, fmin may return either.
+    let pz: f64 = 0.0;
+    let nz: f64 = -0.0;
+    h(pz.minimum(nz).to_bits() >> 63);       // 1: -0
+    h(nz.maximum(pz).to_bits() >> 63);       // 0: +0
+    p((1.0 as f64).min(2.0));
+    p((1.0 as f64).max(2.0));
+    let f1: f32 = 1.0;
+    let fnan: f32 = f32.from_bits(0x7FC00000);
+    b(fnan.is_nan());
+    p(f1.min(fnan) as f64);
+    b(f1.maximum(fnan).is_nan());
+    // Through a pointer (auto-deref, as for f64).
+    var cell: f32 = 9.0;
+    let ptr = &cell;
+    p(ptr.sqrt() as f64);
+}
+// expect: 1065353216
+// expect: 3.1415927410126
+// expect: 1.4142135381699
+// expect: -3
+// expect: -2
+// expect: -2
+// expect: -2
+// expect: 2.5
+// expect: 0
+// expect: 2
+// expect: 2
+// expect: -0
+// expect: 1
+// expect: -3
+// expect: -3
+// expect: 3.7
+// expect: -3
+// expect: -3
+// expect: true
+// expect: false
+// expect: 0.5
+// expect: 0.5
+// expect: true
+// expect: true
+// expect: 1
+// expect: 0
+// expect: 1
+// expect: 2
+// expect: true
+// expect: 1
+// expect: true
+// expect: 3
