@@ -519,6 +519,21 @@ the state lives in `alloca`s that mem2reg turns into SSA values, so
 `reload`'s assignments simply become the values later code uses. A
 `reenter` call in a vm without `reload` is a compile error.
 
+The call's shadow-stack frame (below) lists the handler's traced locals
+and, after them, one fresh `alloca` per state variable of a traced type,
+stored just before the call:
+
+```llvm
+%tos.copy = alloca i64                     ; one per call site
+store i64 %tos, ptr %tos.copy              ; %tos: the state variable's value
+; frame entries: { ptr %local.slot, @mark.T }, ..., { ptr %tos.copy, @mark.Value }
+```
+
+The state variable's own `alloca` never escapes, so mem2reg keeps it in
+SSA form in every dispatch mode; in goto and switch mode that slot is
+shared by the whole loop function, which a frame entry pointing at it
+would have pinned to memory in every handler.
+
 Calls without effects get none of this. In ordinary (non-handler) functions,
 live `Gc` locals at `gc` call sites are stored in an `alloca`'d shadow-stack
 frame `{prev, count, slots[n]}` that is linked into `ctx.roots` on entry and
