@@ -1,0 +1,56 @@
+// `--explain-values` for the shared layout: `V` needs eight 48-bit blocks
+// (`Int(i48)` and seven pointers) and the NaN space has seven, so `Gc`
+// variants share one, told apart by the low 3 bits of the pointer.
+// `Sym` is pinned to share (`block 45`); of the unpinned `Gc` variants,
+// the last declared share too, as few as fit (`Clo`), which the
+// `value_layout` warning reports. A raw pointer (`Raw`) never shares.
+// args: --explain-values
+// expect-stderr: warning[value_layout]: `V` has 12 tagged variants
+// expect-stderr: these get blocks narrower than 48 bits: `Clo` 45 bits, `Nil` 0 bits, `F` 0 bits, `T` 0 bits
+// expect-stderr: `Clo(Gc<Clo>) block 45` (or `block 48` to keep the classic block)
+object Str { len: u64 }
+object Sym { id: u64 }
+object Vec { len: u64 }
+object Clo { n: u64 }
+object Pair { a: u64 }
+object Env { n: u64 }
+struct Raw { x: u64 }
+
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i48),
+    Str(Gc<Str>),
+    Pair(Gc<Pair>),
+    Env(Gc<Env>),
+    Raw(*Raw),
+    Sym(Gc<Sym>) block 45,
+    Vec(Gc<Vec>),
+    Clo(Gc<Clo>),
+    Char(u32) block 32,
+    Nil, F, T,
+}
+
+fn main() {}
+// expect: value main.V repr nanbox: shared layout, 12 tagged variants
+// expect:   more 48-bit blocks needed than the NaN space has (or `block 45` pinned): blocks sized to the payloads, and `Gc` variants sharing 48-bit blocks, up to 8 in one, told apart by the low 3 bits of the pointer
+// expect:   Num(f64)        unboxed: the words below 0xFFF8_8000_0000_0000 (`limit`)
+// expect:   Int(i48)        block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFF9_0000_0000_0000  words 0xFFF9_0000_0000_0000 ..= 0xFFF9_FFFF_FFFF_FFFF
+// expect:   Str(Gc<Str>)    block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFA_0000_0000_0000  words 0xFFFA_0000_0000_0000 ..= 0xFFFA_FFFF_FFFF_FFFF
+// expect:   Pair(Gc<Pair>)  block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFB_0000_0000_0000  words 0xFFFB_0000_0000_0000 ..= 0xFFFB_FFFF_FFFF_FFFF
+// expect:   Env(Gc<Env>)    block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFC_0000_0000_0000  words 0xFFFC_0000_0000_0000 ..= 0xFFFC_FFFF_FFFF_FFFF
+// expect:   Raw(*Raw)       block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFD_0000_0000_0000  words 0xFFFD_0000_0000_0000 ..= 0xFFFD_FFFF_FFFF_FFFF
+// expect:   Sym(Gc<Sym>)    block 45 (pinned)  mask 0xFFFF_0000_0000_0007  tag 0xFFFF_0000_0000_0000  words 0xFFFF_0000_0000_0000 | ptr, low 3 bits 0
+// expect:   Vec(Gc<Vec>)    block 48           mask 0xFFFF_0000_0000_0000  tag 0xFFFE_0000_0000_0000  words 0xFFFE_0000_0000_0000 ..= 0xFFFE_FFFF_FFFF_FFFF
+// expect:   Clo(Gc<Clo>)    block 45           mask 0xFFFF_0000_0000_0007  tag 0xFFFF_0000_0000_0001  words 0xFFFF_0000_0000_0000 | ptr, low 3 bits 1
+// expect:   Char(u32)       block 32 (pinned)  mask 0xFFFF_FFFF_0000_0000  tag 0xFFF8_8000_0000_0000  words 0xFFF8_8000_0000_0000 ..= 0xFFF8_8000_FFFF_FFFF
+// expect:   Nil             block  0           mask 0xFFFF_FFFF_FFFF_FFFF  tag 0xFFF8_8001_0000_0000  the word 0xFFF8_8001_0000_0000
+// expect:   F               block  0           mask 0xFFFF_FFFF_FFFF_FFFF  tag 0xFFF8_8001_0000_0001  the word 0xFFF8_8001_0000_0001
+// expect:   T               block  0           mask 0xFFFF_FFFF_FFFF_FFFF  tag 0xFFF8_8001_0000_0002  the word 0xFFF8_8001_0000_0002
+// expect:   tuple patterns: elements whose variants have the same block width merge into one test, ((a ^ tag) | (b ^ tag') | ..) & mask == 0:
+// expect:     block 48: Int, Str, Pair, Env, Raw, Vec
+// expect:     block 45: Sym, Clo
+// expect:     block 32: Char
+// expect:     block  0: Nil, F, T
+// expect:     unboxed:  Num  (umax(a, b, ..) < limit)
+// expect:     (with a block-45 variant, the 48-bit blocks of `Gc` variants merge into its test: their pointers' low 3 bits are 0)
+// expect:   elements from different lines do not merge (their tags sit at different bits): one test per line, and-ed

@@ -1,0 +1,8 @@
+// Sharing makes room for `Gc` variants only: seven 48-bit integers leave
+// no 48-bit block for the pointers to share.
+// error: no room for variant `A` in the nanbox's NaN space (seven 48-bit blocks for 48-bit integers and pointers, up to 8 `Gc` pointers sharing one
+object O { x: i64 }
+value V repr nanbox {
+    Num(f64) unboxed, I1(i48), I2(i48), I3(i48), I4(i48), I5(i48), I6(i48), I7(i48), A(Gc<O>), B(Gc<O>),
+}
+fn main() {}

@@ -1,0 +1,6 @@
+// A `Gc` variant takes a whole block or shares one at `block 45`; there is
+// no other width.
+// error: `block 44` is out of range for `R`: a `Gc` pointer takes a whole 48-bit block, or shares one with `block 45`
+object Obj { id: i64 }
+value V repr nanbox { Num(f64) unboxed, R(Gc<Obj>) block 44, Nil }
+fn main() {}

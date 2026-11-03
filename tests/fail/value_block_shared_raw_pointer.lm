@@ -1,0 +1,6 @@
+// Only `Gc` variants can share a block (`block 45`): the low 3 bits of a
+// raw pointer need not be free.
+// error: `block 45` is out of range for `R`: a pointer takes a whole 48-bit block
+struct Obj { id: i64 }
+value V repr nanbox { Num(f64) unboxed, R(*Obj) block 45, Nil }
+fn main() {}

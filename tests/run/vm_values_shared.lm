@@ -1,0 +1,155 @@
+// matrix: dispatch
+// A vm whose registers hold a nanbox in the shared layout (`Int(i48)`
+// and nine `Gc` variants: five keep 48-bit blocks, `Cell`, `Pair`, `Str`
+// and `Box` share one, told apart by the pointer's low 3 bits), with GC
+// collections between the ops: handlers test, build and
+// unpack shared variants, in tuple patterns too, and the collector marks
+// the registers' tagged pointers.
+import std.io;
+import std.gc;
+
+object Str { data: [u8] }
+object Pair { a: V, b: V }
+object Cell { v: V }
+object Box { n: i64 }
+object O1 { n: i64 }
+object O2 { n: i64 }
+object O3 { n: i64 }
+object O4 { n: i64 }
+object O5 { n: i64 }
+
+#[allow(value_layout)]
+value V repr nanbox {
+    Num(f64) unboxed,
+    Int(i48),
+    Nil,
+    A1(Gc<O1>), A2(Gc<O2>), A3(Gc<O3>), A4(Gc<O4>), A5(Gc<O5>),
+    Cell(Gc<Cell>),
+    Pair(Gc<Pair>),
+    Str(Gc<Str>),
+    Box(Gc<Box>) block 45,
+}
+
+struct Ctx { heap: gc.Heap, base: *V, top: *V }
+
+fn scan(h: *gc.Heap, data: *u8) {
+    let c = data as *Ctx;
+    var p = c.base;
+    while p < c.top {
+        gc_mark(h, *p);
+        p = p + 1;
+    }
+}
+
+fn concat(h: *gc.Heap, a: Gc<Str>, b: Gc<Str>) -> Gc<Str> {
+    let n = a.data.len + b.data.len;
+    let s = new(h, Str {}, n);
+    for i in 0..a.data.len { s.data[i] = a.data[i]; }
+    for i in 0..b.data.len { s.data[a.data.len + i] = b.data[i]; }
+    s
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *V }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+
+    sync { ctx.top = regs + 8; }
+
+    op STR(dst: reg, ch: imm) : ABC {
+        let s = new(&ctx.heap, Str {}, 1);
+        s.data[0] = ch as u8;
+        dst = Str(s);
+        next
+    }
+    op INT(dst: reg, v: imm) : ABC { dst = Int((v as i48) * 1000000000); next }
+    op PAIR(dst: reg, a: reg, b: reg) : ABC { dst = Pair(new(&ctx.heap, Pair { a: a, b: b })); next }
+    op CELL(dst: reg, a: reg) : ABC { dst = Cell(new(&ctx.heap, Cell { v: a })); next }
+    op BOX(dst: reg, v: imm) : ABC { dst = Box(new(&ctx.heap, Box { n: v as i64 })); next }
+    op O1(dst: reg, v: imm) : ABC { dst = A1(new(&ctx.heap, O1 { n: v as i64 })); next }
+    // Concatenate strings, add ints, unwrap cells and pairs.
+    op ADD(dst: reg, a: reg, b: reg) : ABC {
+        match (a, b) {
+            (Str(x), Str(y)) => { dst = Str(concat(&ctx.heap, x, y)); next }
+            (Int(x), Int(y)) => { dst = Int(x + y); next }
+            (Cell(x), Cell(y)) => { dst = Pair(new(&ctx.heap, Pair { a: x.v, b: y.v })); next }
+            (Pair(x), Str(_)) => { dst = x.b; next }
+            (A1(x), Box(y)) => { dst = Int((x.n * 100 + y.n) as i48); next }
+            _ => { dst = Nil; next }
+        }
+    }
+    // Rotate the values through a chain of cells and pairs.
+    op FST(dst: reg, a: reg) : ABC {
+        match a {
+            Pair(p) => dst = p.a,
+            Cell(c) => dst = c.v,
+            Box(b) => dst = Int(b.n as i48),
+            _ => dst = Nil,
+        }
+        next
+    }
+    op CLEAR(dst: reg) : ABC { dst = Nil; next }
+    op GC() : ABC { gc.collect(&ctx.heap); next }
+    op RET(src: reg) : ABC { exit src }
+
+    entry run(c: *Ctx, code: *u32) -> V uses gc {
+        ctx = c;
+        pc = code;
+        regs = c.base;
+        jump pc
+    }
+}
+
+fn show(v: V) {
+    match v {
+        Str(s) => io.print(s.data),
+        Int(x) => io.print_int(x as i64),
+        Pair(p) => { io.print("("); show(p.a); io.print(" "); show(p.b); io.print(")"); }
+        Cell(c) => { io.print("cell "); show(c.v); }
+        Box(b) => { io.print("box "); io.print_int(b.n); }
+        Nil => io.print("nil"),
+        _ => io.print("?"),
+    }
+}
+
+fn main() uses gc {
+    var ctx = Ctx { heap: gc.Heap.new(), base: 0 as *V, top: 0 as *V };
+    var regs: [V; 8] = [V.Nil; 8];
+    ctx.base = &regs[0];
+    ctx.top = &regs[0];
+    ctx.heap.add_scanner(&ctx as *u8, scan);
+    var code: [u32; 64] = [0; 64];
+    let c = code[..];
+    var at: u64 = 0;
+    at = M.emit.STR(c, at, 0, 'a');
+    at = M.emit.STR(c, at, 1, 'b');
+    at = M.emit.ADD(c, at, 0, 0, 1);    // r0 = "ab"
+    at = M.emit.CELL(c, at, 2, 0);      // r2 = cell "ab"
+    at = M.emit.INT(c, at, 3, 200);
+    at = M.emit.INT(c, at, 4, 7);
+    at = M.emit.ADD(c, at, 3, 3, 4);    // r3 = 207e9 (past i32)
+    at = M.emit.CELL(c, at, 4, 3);      // r4 = cell 207e9
+    at = M.emit.ADD(c, at, 5, 2, 4);    // r5 = ("ab" 207e9)
+    at = M.emit.CLEAR(c, at, 2);
+    at = M.emit.CLEAR(c, at, 4);
+    at = M.emit.STR(c, at, 1, 'c');
+    at = M.emit.GC(c, at);
+    at = M.emit.ADD(c, at, 6, 5, 1);    // r6 = 207e9 (second of the pair)
+    at = M.emit.PAIR(c, at, 5, 5, 6);   // r5 = (("ab" 207e9) 207e9)
+    at = M.emit.BOX(c, at, 2, 42);
+    at = M.emit.O1(c, at, 4, 3);
+    at = M.emit.ADD(c, at, 4, 4, 2);    // r4 = 342
+    at = M.emit.GC(c, at);
+    at = M.emit.FST(c, at, 2, 2);       // r2 = 42
+    at = M.emit.PAIR(c, at, 5, 5, 4);
+    at = M.emit.PAIR(c, at, 5, 5, 2);
+    at = M.emit.GC(c, at);
+    at = M.emit.RET(c, at, 5);
+    let r = M.run(&ctx, &code[0]);
+    show(r); io.println("");
+    io.print_bool(ctx.heap.freed > 0); io.println("");
+}
+// expect: ((((ab 207000000000) 207000000000) 342) 42)
+// expect: true

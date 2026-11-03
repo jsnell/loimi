@@ -1,0 +1,6 @@
+// Shared blocks are a nanbox layout: a lowtag pointer already has its tag
+// in the low bits.
+// error: `block 45` is out of range for `R`: a pointer takes a whole 61-bit block
+object Obj { id: i64 }
+value V repr lowtag { Int(i61), R(Gc<Obj>) block 45, Nil }
+fn main() {}
