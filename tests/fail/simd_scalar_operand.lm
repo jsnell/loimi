@@ -1,0 +1,2 @@
+fn main() { let a = i32x4.splat(6); let _ = a + 1; }
+// error: mismatched types: expected `i32x4`, found `i64` (a scalar is not a vector: write `i32x4.splat(x)`)

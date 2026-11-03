@@ -300,7 +300,8 @@ fn mini_reentry_dispatch_modes() {
 /// installed (bench/cross/install.sh; otherwise skipped with a message):
 /// a fast subset, cross-compiled with `--target=aarch64-linux-gnu`. The
 /// tests/run programs that run in every dispatch mode, the GC ones, the
-/// wide (multi-word arithmetic) ones and those using `std.rt`; the `std.test` tests (`catch_panic`'s setjmp);
+/// wide (multi-word arithmetic) ones, the vector (`simd_`) ones and those
+/// using `std.rt`; the `std.test` tests (`catch_panic`'s setjmp);
 /// Mini in every dispatch mode on scripts that collect, re-enter and
 /// throw, with GC stress and barrier verification; and Stak's suite
 /// (examples/stack/check.sh: every dispatch mode, GC stress). The whole
@@ -325,7 +326,7 @@ fn aarch64_qemu() {
     std::thread::scope(|s| {
         s.spawn(|| {
             run_programs_with(&xenv, |name, text| {
-                directives(text, "matrix").iter().any(|m| m.trim() == "dispatch") || name.starts_with("gc_") || name.starts_with("wide_") || text.contains("import std.rt")
+                directives(text, "matrix").iter().any(|m| m.trim() == "dispatch") || name.starts_with("gc_") || name.starts_with("wide_") || name.starts_with("simd_") || text.contains("import std.rt")
             })
         });
         s.spawn(|| {

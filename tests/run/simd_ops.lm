@@ -1,0 +1,310 @@
+// 128-bit vectors (docs/language.md section 1.1, "Vectors"): every op
+// family, with the edge cases: NaN, saturation, lane boundaries, shift
+// amounts at and past the lane width, out-of-range swizzle indices.
+// The printers store a vector into an array of its lanes, which is only
+// as aligned as one lane: vector stores assume no alignment.
+import std.io;
+
+fn sp() { io.print(" "); }
+fn nl() { io.println(""); }
+
+fn p8(v: i8x16) {
+    var a: [i8; 16] = [0; 16];
+    *(&a as *i8x16) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn pu8(v: u8x16) {
+    var a: [u8; 16] = [0; 16];
+    *(&a as *u8x16) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn p16(v: i16x8) {
+    var a: [i16; 8] = [0; 8];
+    *(&a as *i16x8) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn pu16(v: u16x8) {
+    var a: [u16; 8] = [0; 8];
+    *(&a as *u16x8) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn p32(v: i32x4) {
+    var a: [i32; 4] = [0; 4];
+    *(&a as *i32x4) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn pu32(v: u32x4) {
+    var a: [u32; 4] = [0; 4];
+    *(&a as *u32x4) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; io.print_int(x as i64); }
+    nl();
+}
+fn p64(v: i64x2) { io.print_int(v.lane(0)); sp(); io.print_int(v.lane(1)); nl(); }
+fn pu64(v: u64x2) { io.print_int(v.lane(0) as i64); sp(); io.print_int(v.lane(1) as i64); nl(); }
+fn f1(x: f64) {
+    if x != x { io.print("nan"); } else { io.print_f64(x); }
+}
+fn pf(v: f32x4) {
+    var a: [f32; 4] = [0.0; 4];
+    *(&a as *f32x4) = v;
+    var first = true;
+    for x in a { if !first { sp(); } first = false; f1(x as f64); }
+    nl();
+}
+fn pd(v: f64x2) { f1(v.lane(0)); sp(); f1(v.lane(1)); nl(); }
+
+struct Pair { tag: u8, v: f64x2, w: u16x8 }
+
+// Opaque to the optimizer, so that the operations run on the machine
+// and are not folded at compile time.
+#[inline(never)]
+fn id<T>(x: T) -> T { x }
+
+fn main() {
+    // Construction, lanes, bit casts.
+    let a = id(i32x4.new(1, -2, 3, 2147483647));
+    let b = id(i32x4.splat(5));
+    p32(a);
+    p32(a.with_lane(0, 7).with_lane(3, -1));
+    io.print_int(a.lane(3) as i64); nl();
+    let bytes = id(u8x16.new(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 250, 251, 254, 255));
+    io.print_int(bytes.lane(15) as i64); sp(); io.print_int(i8x16.from_bits(bytes).lane(15) as i64); nl();
+    pu32(u32x4.from_bits(bytes));                      // little-endian lanes
+    p64(i64x2.from_bits(i32x4.new(-1, 0, 0, -2147483648)));
+
+    // Integer arithmetic wraps.
+    p32(a + b);
+    p32(a - b);
+    p32(a * b);
+    p32(a +% b);
+    p32(-a);
+    p32(~a);
+    p32(a & b);
+    p32(a | b);
+    p32(a ^ b);
+    p64(id(i64x2.new(3, -4)) * id(i64x2.new(-5000000000, 6)));
+    pu8(bytes + u8x16.splat(10));
+
+    // Shifts: a scalar amount modulo the lane width.
+    p32(a << 1);
+    p32(a >> 1);                                       // arithmetic
+    pu32(u32x4.from_bits(a) >> 1);                     // logical
+    p32(a << 33);                                      // 33 mod 32 = 1
+    let k: u8 = 255;
+    pu8(bytes >> k);                                   // 255 mod 8 = 7
+    p8(i8x16.from_bits(bytes) >> 7);
+    p16(i16x8.splat(-32768) >> 15);
+    p64(id(i64x2.new(-1, 1)) << 63);
+
+    // Comparisons: masks of signed lanes.
+    p32(a < b);
+    p32(a >= b);
+    pu8(u8x16.from_bits(bytes > u8x16.splat(9)));      // unsigned
+    p8(i8x16.from_bits(bytes) > i8x16.splat(9));       // signed: 250.. are negative
+    p64(id(i64x2.new(-1, 5)) < id(i64x2.new(0, 5)));
+    pu64(u64x2.from_bits(id(u64x2.new(0xFFFFFFFFFFFFFFFF, 1)) < id(u64x2.new(0, 2))));
+
+    // min, max, abs, saturating add/sub, rounding average, popcount.
+    p32(a.min(b));
+    p32(a.max(b));
+    pu32(u32x4.from_bits(a).min(u32x4.from_bits(b)));
+    p32(id(i32x4.new(-2147483648, -1, 0, 1)).abs());     // MIN stays MIN
+    p8(id(i8x16.new(120, -120, 100, -100, 0, 1, -1, 127, -128, 50, -50, 64, -64, 3, -3, 0)).add_sat(i8x16.splat(10)));
+    p8(id(i8x16.new(120, -120, 100, -100, 0, 1, -1, 127, -128, 50, -50, 64, -64, 3, -3, 0)).sub_sat(i8x16.splat(10)));
+    pu8(bytes.add_sat(u8x16.splat(4)));
+    pu8(bytes.sub_sat(u8x16.splat(4)));
+    pu16(id(u16x8.new(0, 1, 2, 65535, 65534, 100, 7, 8)).avgr(u16x8.new(0, 0, 1, 65535, 65535, 200, 8, 8)));
+    pu8(bytes.avgr(u8x16.splat(255)));
+    pu8(bytes.popcount());
+    p32(id(i32x4.new(0, 1, -1, 65536)).clz());
+    p32(id(i32x4.new(0, 1, -1, 65536)).ctz());
+
+    // Selection, bitmask.
+    let m = a > b;
+    p32(m.select(a, b));
+    let fm = f32x4.splat(1.0) < id(f32x4.new(0.0, 2.0, 0.0, 3.0));
+    pf(fm.select(f32x4.splat(9.0), f32x4.splat(-9.0)));
+    io.print_int(id(i8x16.from_bits(bytes)).bitmask() as i64); nl();     // lanes 12..15 negative
+    io.print_int((a < b).bitmask() as i64); nl();
+    io.print_int(id(i64x2.new(-1, 1)).bitmask() as i64); nl();
+    io.print_bool((a == i32x4.splat(0)).bitmask() == 0); nl();            // all lanes non-zero
+
+    // Widening and saturating narrowing.
+    p16(i8x16.from_bits(bytes).widen_low());
+    p16(i8x16.from_bits(bytes).widen_high());
+    pu16(bytes.widen_high());
+    p64(a.widen_high());
+    pd(id(f32x4.new(1.5, -0.25, 3.0, 4.0)).widen_high());
+    let wide = id(i16x8.new(-300, -129, -128, -1, 0, 127, 128, 300));
+    p8(i8x16.narrow_sat(wide, wide));
+    pu8(u8x16.narrow_sat(wide, i16x8.splat(255)));
+    pu8(u8x16.narrow_sat(u16x8.from_bits(wide), u16x8.splat(255)));   // unsigned inputs: 65236 saturates to 255
+    p16(i16x8.narrow_sat(id(i32x4.new(-40000, 40000, -32768, 32767)), i32x4.splat(1)));
+    pu16(u16x8.narrow_sat(id(i32x4.new(-40000, 40000, -1, 65535)), i32x4.splat(70000)));
+
+    // Shuffles (constant lanes from both operands) and swizzles.
+    p32(a.shuffle(b, [7, 0, 3, 4]));
+    pu8(bytes.shuffle(bytes, [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]));
+    pu8(bytes.swizzle(id(u8x16.new(15, 0, 16, 255, 128, 17, 1, 2, 3, 4, 5, 6, 7, 8, 9, 14))));
+    p8(i8x16.from_bits(bytes).swizzle(id(i8x16.new(-1, 0, 15, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1))));
+
+    // Floats: arithmetic, NaN, the two kinds of min/max, rounding.
+    let nan: f32 = id(0.0) / 0.0;
+    let f = id(f32x4.new(1.5, -2.5, 0.0, 3.0));
+    pf(f + f);
+    pf(f * f - f);
+    pf(f / f32x4.splat(2.0));
+    pf(-f);
+    pf(f.abs());
+    pf(f.sqrt().with_lane(1, 0.0));
+    pf(f.floor());
+    pf(f.ceil());
+    pf(f.trunc());
+    pf(f.nearest());                                   // ties to even
+    let g = f32x4.new(nan, 1.0, -0.0, 0.0);
+    let h = f32x4.new(1.0, nan, 0.0, -0.0);
+    pf(g.min(h));                                      // C fmin: NaN ignored
+    pf(g.minimum(h));                                  // IEEE: NaN propagates
+    p32(i32x4.from_bits(g.minimum(h)) >> 31);          // -0 < +0: sign bits
+    p32(i32x4.from_bits(g.maximum(h)) >> 31);
+    p32(g == g);                                       // NaN is not equal to itself
+    p32(g != g);
+    p32(g < h);
+    pf(f.copysign(f32x4.splat(-1.0)));
+    let d = id(f64x2.new(-1.5, 2.5));
+    pd(d * d);
+    pd(d.nearest());
+    pd(d.minimum(f64x2.new(0.0 / 0.0, 3.0)));
+
+    // Lane-wise conversions: same lane count, scalar `as` per lane.
+    p32(id(f32x4.new(nan, -1.9, 3000000000.0, -3000000000.0)) as i32x4);
+    pu32(id(f32x4.new(nan, -1.9, 3000000000.0, 5000000000.0)) as u32x4);
+    pf(id(i32x4.new(-1, 16777217, 0, 7)) as f32x4);
+    pf(id(u32x4.new(4294967295, 1, 0, 2147483648)) as f32x4);
+    p64(id(f64x2.new(-1.0e19, 1.0e19)) as i64x2);
+    pd(id(i64x2.new(-3, 9007199254740993)) as f64x2);
+    pu32(a as u32x4);
+
+    // Vectors in structs, arrays, through pointers (any alignment).
+    var s = Pair { tag: 1, v: f64x2.splat(0.5), w: u16x8.splat(3) };
+    s.v = s.v + f64x2.new(1.0, 2.0);
+    pd(s.v);
+    var arr: [i32x4; 3] = [b; 3];
+    arr[1] = a;
+    p32(arr[0] + arr[1]);
+    var buf: [u8; 40] = [0; 40];
+    let q = ((&buf as *u8) + 3) as *i32x4;
+    *q = a;
+    q.write_unaligned(*q + b);
+    p32(q.read_unaligned());
+    io.print_int(buf[3] as i64); nl();
+    io.print_int(size_of<Pair>() as i64); sp(); io.print_int(size_of<i8x16>() as i64); nl();
+}
+// expect: 1 -2 3 2147483647
+// expect: 7 -2 3 -1
+// expect: 2147483647
+// expect: 255 -1
+// expect: 50462976 117835012 185207048 4294900730
+// expect: 4294967295 -9223372036854775808
+// expect: 6 3 8 -2147483644
+// expect: -4 -7 -2 2147483642
+// expect: 5 -10 15 2147483643
+// expect: 6 3 8 -2147483644
+// expect: -1 2 -3 -2147483647
+// expect: -2 1 -4 -2147483648
+// expect: 1 4 1 5
+// expect: 5 -1 7 2147483647
+// expect: 4 -5 6 2147483642
+// expect: -15000000000 -24
+// expect: 10 11 12 13 14 15 16 17 18 19 20 21 4 5 8 9
+// expect: 2 -4 6 -2
+// expect: 0 -1 1 1073741823
+// expect: 0 2147483647 1 1073741823
+// expect: 2 -4 6 -2
+// expect: 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1
+// expect: 0 0 0 0 0 0 0 0 0 0 0 0 -1 -1 -1 -1
+// expect: -1 -1 -1 -1 -1 -1 -1 -1
+// expect: -9223372036854775808 -9223372036854775808
+// expect: -1 -1 -1 0
+// expect: 0 0 0 -1
+// expect: 0 0 0 0 0 0 0 0 0 0 255 255 255 255 255 255
+// expect: 0 0 0 0 0 0 0 0 0 0 -1 -1 0 0 0 0
+// expect: -1 0
+// expect: 0 -1
+// expect: 1 -2 3 5
+// expect: 5 5 5 2147483647
+// expect: 1 5 3 5
+// expect: -2147483648 1 0 1
+// expect: 127 -110 110 -90 10 11 9 127 -118 60 -40 74 -54 13 7 10
+// expect: 110 -128 90 -110 -10 -9 -11 117 -128 40 -60 54 -74 -7 -13 -10
+// expect: 4 5 6 7 8 9 10 11 12 13 14 15 254 255 255 255
+// expect: 0 0 0 0 0 1 2 3 4 5 6 7 246 247 250 251
+// expect: 0 1 2 65535 65535 150 8 8
+// expect: 128 128 129 129 130 130 131 131 132 132 133 133 253 253 255 255
+// expect: 0 1 1 2 1 2 2 3 1 2 2 3 6 7 7 8
+// expect: 32 31 0 15
+// expect: 32 0 0 16
+// expect: 5 5 5 2147483647
+// expect: -9 9 -9 9
+// expect: 61440
+// expect: 7
+// expect: 1
+// expect: true
+// expect: 0 1 2 3 4 5 6 7
+// expect: 8 9 10 11 -6 -5 -2 -1
+// expect: 8 9 10 11 250 251 254 255
+// expect: 3 2147483647
+// expect: 3 4
+// expect: -128 -128 -128 -1 0 127 127 127 -128 -128 -128 -1 0 127 127 127
+// expect: 0 0 0 0 0 127 128 255 255 255 255 255 255 255 255 255
+// expect: 255 255 255 255 0 127 128 255 255 255 255 255 255 255 255 255
+// expect: -32768 32767 -32768 32767 1 1 1 1
+// expect: 0 40000 0 65535 65535 65535 65535 65535
+// expect: 5 1 2147483647 5
+// expect: 255 254 251 250 11 10 9 8 7 6 5 4 3 2 1 0
+// expect: 255 0 0 0 0 0 1 2 3 4 5 6 7 8 9 254
+// expect: 0 0 -1 0 1 1 1 1 1 1 1 1 1 1 1 1
+// expect: 3 -5 0 6
+// expect: 0.75 8.75 0 6
+// expect: 0.75 -1.25 0 1.5
+// expect: -1.5 2.5 -0 -3
+// expect: 1.5 2.5 0 3
+// expect: 1.2247449159622 0 0 1.7320507764816
+// expect: 1 -3 0 3
+// expect: 2 -2 0 3
+// expect: 1 -2 0 3
+// expect: 2 -2 0 3
+// expect: 1 1 -0 -0
+// expect: nan nan -0 -0
+// expect: 0 0 -1 -1
+// expect: 0 0 0 0
+// expect: 0 -1 -1 -1
+// expect: -1 0 0 0
+// expect: 0 0 0 0
+// expect: -1.5 -2.5 -0 -3
+// expect: 2.25 6.25
+// expect: -2 2
+// expect: nan 2.5
+// expect: 0 -1 2147483647 -2147483648
+// expect: 0 0 3000000000 4294967295
+// expect: -1 16777216 0 7
+// expect: 4294967296 1 0 2147483648
+// expect: -9223372036854775808 9223372036854775807
+// expect: -3 9.007199254741e+15
+// expect: 1 4294967294 3 2147483647
+// expect: 1.5 2.5
+// expect: 6 3 8 -2147483644
+// expect: 6 3 8 -2147483644
+// expect: 6
+// expect: 48 16

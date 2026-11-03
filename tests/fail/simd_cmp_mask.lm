@@ -1,0 +1,2 @@
+fn main() { let a = i32x4.splat(1); if a == a { } }
+// error: expected `bool`

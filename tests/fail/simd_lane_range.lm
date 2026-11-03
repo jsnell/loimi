@@ -1,0 +1,2 @@
+fn main() { let v = i16x8.splat(1); let _ = v.with_lane(8, 2); }
+// error: the lane index 8 is out of range: it must be below 8

@@ -1385,9 +1385,13 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
+        let hint = match want {
+            Ty::Vector(..) if e.ty.is_numeric() => format!(" (a scalar is not a vector: write `{}.splat(x)`)", self.ty_name(want)),
+            _ => String::new(),
+        };
         Err(Diag::new(
             value_span(&e),
-            format!("mismatched types: expected `{}`, found `{}`", self.ty_name(want), self.ty_name(&e.ty)),
+            format!("mismatched types: expected `{}`, found `{}`{}", self.ty_name(want), self.ty_name(&e.ty), hint),
         ))
     }
 
@@ -3982,7 +3986,7 @@ impl<'a> Checker<'a> {
             "swizzle" => {
                 argc(1)?;
                 only(matches!(&*lane, Ty::Int(it) if it.bits == 8), "8-bit lane")?;
-                let ix = self.expr(cx, &args[0], Some(&Ty::vector_of(Ty::u8())))?;
+                let ix = self.expr(cx, &args[0], None)?;
                 if !matches!(&ix.ty, Ty::Vector(l, _) if matches!(**l, Ty::Int(IntTy { bits: 8, .. }))) {
                     return Err(Diag::new(
                         args[0].span,
