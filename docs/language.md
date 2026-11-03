@@ -1392,7 +1392,7 @@ Selected per build (`--dispatch=` or `#[dispatch(...)]` on the vm):
 | Strategy | Lowering | When to use |
 |---|---|---|
 | `tailcall` (default where supported) | one LLVM function per handler, `preserve_none` convention, `musttail` calls | x86-64 and AArch64 with LLVM ≥ 19; best register allocation, fast compiles |
-| `goto` | one function, `indirectbr` replicated at every `next` | targets without `preserve_none` |
+| `goto` | one function; one shared `indirectbr` that LLVM copies into every handler (`lowering.md` §5) | targets without `preserve_none` |
 | `switch` | one function, loop plus `switch` | portability, wasm without tail calls, debugging |
 
 All three are produced from the same source, so a benchmark can compare them
@@ -2207,12 +2207,11 @@ gets source variants only; an op without operands of an accumulator's
 kind gets none, so an `inline for` may mark a whole table. The vm item
 `accumulate ADD, CVT, FMUL;` marks the ops it names, for picking a few
 ops out of `inline for` tables: every variant is an opcode and a
-handler, and in goto mode all handlers are one function, whose
-compilation time and memory grow faster than linearly (the wasm
+handler, and in goto mode all handlers are one function (the wasm
 interpreter marks 90 ops, which gives 287 variants: 669 opcodes instead
-of 382, and its goto build takes 1 GB; marking every op with an operand
-of an accumulator's kind gave about 660 variants, and the goto build no
-longer fit in 2.5 GB).
+of 382; its goto build takes 17 s and 220 MB, `lowering.md` §5, where it
+took 4 minutes and 1 GB before goto mode shared one dispatch block, and
+marking every op then no longer fit in 2.5 GB).
 
 `Vm.accumulate(code, first_temp)` selects them, on unverified words
 before `Vm.verify`: where an op writes a slot at or above `first_temp`

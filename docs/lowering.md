@@ -512,8 +512,9 @@ nothing when there is one.
 
 ## 5. `goto` mode
 
-A single function with one basic block per handler. State variables are phis
-in each handler block, and every `next` ends in its own `indirectbr`:
+A single function with one basic block per handler. State variables are phis,
+and every `next` loads the next handler's address from the labels table and
+branches to one shared dispatch block, a lone `indirectbr`:
 
 ```llvm
 @Mini.labels = internal constant [N x ptr] [ptr blockaddress(@Mini.run_goto, %op.MOVE), ...]
@@ -521,16 +522,65 @@ in each handler block, and every `next` ends in its own `indirectbr`:
 op.ADD:
   ; ... body ...
   %h = load ptr, ptr (gep @Mini.labels, opcode(%pc1))
-  indirectbr ptr %h, [label %op.MOVE, label %op.ADD, ...]
+  %h1 = call ptr asm "", "=r,0"(ptr %h)    ; opaque copy, see below
+  store ptr %h1, ptr %target               ; a phi in %dispatch after SROA
+  br label %dispatch
+
+dispatch:
+  %t = load ptr, ptr %target
+  indirectbr ptr %t, [label %op.MOVE, label %op.ADD, ...]
 ```
 
-The driver disables LLVM's branch tail-merging for this function, which would
-otherwise fold the replicated `indirectbr`s back into a single dispatch point
-and undo the main benefit of threaded code. `cold` blocks are outlined exactly
-as in tail-call mode. (*As implemented:* the driver sets no such option, and
-LLVM keeps the `indirectbr`s replicated on its own; `cold` blocks stay inline
-and are marked unlikely.) Register pressure is shared across all handlers, which is
-why `tailcall` is preferred where it is available.
+The machine code is threaded nonetheless: LLVM's tail duplication copies the
+dispatch block into every handler *after register allocation*, so each
+handler ends in its own `mov table(,%rax,8),%rax; jmp *%rax`. The driver
+passes the LLVM options that make it so (§12; only when the program has a
+goto-mode vm):
+
+- `-tail-dup-pred-size`, `-tail-dup-succ-size` raised: since LLVM 18, tail
+  duplication skips blocks with more than 16 predecessors and 16 successors
+  at once, which the dispatch block always has;
+- `-tail-dup-indirect-size=0`: no copies *before* register allocation;
+- `-tail-dup-placement=false`: no tail duplication during block placement
+  (it would find nothing left to copy for dispatch, but searching costs time
+  cubic in the op count).
+
+The empty `asm` keeps the address computation in the handlers. Without it,
+LLVM folds the identical table loads (and the `pc` increments) of all
+handlers into the shared block, which then has five instructions, more than
+post-RA tail duplication copies: dispatch stays a single shared indirect jump,
+16% slower on the wasm benchmarks.
+
+*Why not replicate in IR, or copy before register allocation.* Until
+2026-11 the IR itself ended every `next` in its own `indirectbr`. With `S`
+dispatch sites and `H` handlers, that CFG has `S×H` edges, and SSA gives
+every handler a phi per state variable with an entry per dispatch site:
+`S×H×K` phi operands for `K` state variables, which every IR pass (loop
+canonicalization, GVN), PHI elimination, the register coalescer and block
+placement pay for. Copying the shared block before register allocation (the
+default for small indirect-branch blocks) recreates the same phis in machine
+IR. After register allocation there are no phis: the state lives in the same
+registers in every handler, and the copies are a few hundred `jmp *%rax`.
+Measured on clang 19 (`-ftime-report`, i7-6700):
+
+| vm (opcodes) | replicated `indirectbr` in IR | shared block, copied after RA |
+|---|---|---|
+| wasm (669: 382 ops + 287 accumulator variants) | 214 s, 973 MB | 13 s, 220 MB |
+| synthetic, 400 small ops | 21 s, 256 MB | 1.3 s, 130 MB |
+| synthetic, 800 small ops | 157 s, 707 MB | 8.2 s, 183 MB |
+| synthetic, 1600 small ops | (extrapolated: ~20 min, ~2.5 GB) | GROWTH1600 |
+
+In the old form the time went to block placement (64 s on wasm), the machine
+scheduler (33 s), loop canonicalization (24 s across IR and machine IR), GVN
+(17 s), loop unrolling and vectorization, the coalescer and PHI elimination.
+The generated code got faster too (wasm benchmarks 11% by geometric mean,
+Mini, MiniJS and Scheme within noise; see the commit message for the
+tables): the handlers are register-allocated around one join point, where
+every state variable has one home register.
+
+`cold` blocks stay inline and are marked unlikely. Register pressure is
+shared across all handlers, which is why `tailcall` is preferred where it is
+available.
 
 ## 6. `switch` mode
 
@@ -756,7 +806,7 @@ interleaved, `--align-functions=64`).
 | Setting | Why |
 |---|---|
 | `-O3` with the new pass manager (as implemented: `-O3` with `--release`, `-O1` otherwise) | standard |
-| branch tail-merge disabled for `goto`-mode run functions (not needed so far, not implemented) | keeps `indirectbr` replicated |
+| goto mode: `-mllvm -tail-dup-indirect-size=0 -tail-dup-pred-size=1000000 -tail-dup-succ-size=1000000 -tail-dup-placement=false` when the program has a goto-mode vm (§5) | the shared dispatch block is copied into every handler after register allocation; compile time near linear in the op count |
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
 | optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |
