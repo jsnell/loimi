@@ -24,6 +24,7 @@ bench/wasm/install.sh      # tools + MVP sysroot -> bench/wasm/install/ (~5 min,
 bench/wasm/spec.sh         # testsuite -> bench/wasm/spec-json/<name>/<name>.json
 bench/wasm/spec.sh --check #   ... and run wabt's spectest-interp on each json
 bench/wasm/programs.sh     # benchmarks -> bench/wasm/programs-out/<name>.wasm
+bench/wasm/programs-simd.sh  # nbody, fannkuchredux, spectralnorm with -msimd128 -> <name>_simd.wasm
 bench/wasm/bench.py        # time wasm3 and wasm-interp (best of 3, markdown table)
 bench/wasm/bench.py -n 1 --add-default --interp loimi='path/to/interp {wasm}' nbody
 ```
@@ -54,6 +55,13 @@ reference-types) that MVP decoders, including wasm3 0.5.0, reject.
 | binarytrees | `binarytrees.gcc` (#1) | 15 |
 | mandelbrot | `mandelbrot.gcc-8.gcc` (PBM to stdout) | 2400 |
 | fasta | `fasta.gcc` (#1, 25 MB to stdout) | 2500000 |
+
+`programs-simd.sh` builds three of them again with `-mcpu=mvp -msimd128`
+(clang's auto-vectorizer; the libc stays MVP) as `<name>_simd.wasm`:
+nbody (about 50 SIMD instructions), fannkuchredux (12) and spectralnorm
+(2); the other programs get none. wasm3 0.5 has no SIMD, so their
+`.expected` is a copy of the MVP build's; `bench/run_all.py` times them
+as the `wasm-simd` suite against the MVP builds.
 
 The Benchmarks Game programs are unmodified single-threaded C versions (no
 pthreads/OpenMP/SIMD intrinsics); their wasm outputs match native gcc builds.

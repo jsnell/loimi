@@ -2,8 +2,9 @@
 """Run the Prolog benchmarks under the reference systems that
 bench/prolog/install.sh built, and optionally under our Prolog.
 
-Usage: bench/prolog/run.py [-n RUNS] [--loimi PATH] [--refs REF,...]
-                           [--emit] [--calibrate SECONDS] [NAME ...]
+Usage: bench/prolog/run.py [-n RUNS] [--loimi PATH] [--exe NAME=CMD ...]
+                           [--refs REF,...] [--emit] [--calibrate SECONDS]
+                           [NAME ...]
 
 Each runnable program is out/NAME.pl, the concatenation of
 
@@ -18,6 +19,8 @@ same file:
     swipl    install/swipl/bin/swipl -O -q -g halt out/NAME.pl
     trealla  install/trealla/bin/tpl -q out/NAME.pl -g halt
     loimi    PATH out/NAME.pl                    (with --loimi PATH)
+    NAME     CMD out/NAME.pl                     (with --exe NAME=CMD, repeatable;
+                                                  CMD may be a wrapper script)
 
 SWI-Prolog runs with -O (arithmetic compiled inline; the suite's own
 calibration did not use it, but it is SWI's fast mode). Trealla's default
@@ -26,9 +29,11 @@ is its optimized mode. A run passes if its stdout is exactly "done\\n"
 minimum over RUNS (default 3) runs, interleaved round-robin over
 benchmarks and systems, of the whole process's wall-clock time, startup
 and loading included (about 0.02 s for both references). Ratio columns
-are our time over each reference's (or, without --loimi, trealla over
-swipl), with their geometric mean over the benchmarks all compared
-systems passed.
+are each of our builds' time over each reference's (or, without --loimi
+or --exe, trealla over swipl), with their geometric mean over the
+benchmarks all compared systems passed. With --slow S, a benchmark that
+took more than S seconds under a system is not run again under it (its
+time is that one run).
 
 --emit only writes out/*.pl. --calibrate S rewrites iterations.txt so
 that each benchmark takes about S seconds under swipl.
@@ -46,6 +51,13 @@ REFS = {
     "swipl": lambda f: [os.path.join(INSTALL, "swipl/bin/swipl"), "-O", "-q", "-g", "halt", f],
     "trealla": lambda f: [os.path.join(INSTALL, "trealla/bin/tpl"), "-q", f, "-g", "halt"],
 }
+
+# swipl's RUNPATH is the absolute directory it was installed in; an install
+# that moved (or was built in another checkout) finds libswipl through this.
+_swipl_lib = os.path.join(INSTALL, "swipl/lib/swipl/lib/x86_64-linux")
+if os.path.isdir(_swipl_lib):
+    os.environ["LD_LIBRARY_PATH"] = _swipl_lib + (
+        ":" + os.environ["LD_LIBRARY_PATH"] if os.environ.get("LD_LIBRARY_PATH") else "")
 
 
 def read_iterations():
@@ -116,6 +128,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("-n", type=int, default=3, help="runs per benchmark and system (best of)")
     ap.add_argument("--loimi", metavar="PATH", help="our Prolog: run as PATH FILE.pl")
+    ap.add_argument("--exe", action="append", default=[], metavar="NAME=CMD",
+                    help="one of our builds, run as CMD FILE.pl (repeatable)")
+    ap.add_argument("--slow", type=float, metavar="SECONDS",
+                    help="run a (benchmark, system) once if its first run took longer")
     ap.add_argument("--refs", default="swipl,trealla", help="comma-separated references")
     ap.add_argument("--emit", action="store_true", help="only write out/*.pl")
     ap.add_argument("--calibrate", type=float, metavar="SECONDS")
@@ -144,6 +160,13 @@ def main():
     if a.loimi:
         path = os.path.abspath(a.loimi)
         systems["loimi"] = lambda f: [path, f]
+    ours = ["loimi"] if a.loimi else []
+    for spec in a.exe:
+        name, sep, cmd = spec.partition("=")
+        if not sep:
+            ap.error("--exe wants NAME=CMD")
+        systems[name] = (lambda c: lambda f: [c, f])(os.path.abspath(cmd))
+        ours.append(name)
     sysnames = list(systems)
 
     best = {(n, s): None for n in names for s in sysnames}
@@ -151,7 +174,7 @@ def main():
     for i in range(a.n):
         for n in names:
             for s in sysnames:
-                if (n, s) in fail:
+                if (n, s) in fail or (a.slow and i > 0 and best[(n, s)] > a.slow):
                     continue
                 t, ok, detail = run(systems[s](files[n]))
                 if not ok:
@@ -161,8 +184,8 @@ def main():
                     best[(n, s)] = t
         print("round %d/%d done" % (i + 1, a.n), file=sys.stderr)
 
-    if "loimi" in systems:
-        pairs = [("loimi", r) for r in sysnames if r != "loimi"]
+    if ours:
+        pairs = [(o, r) for o in ours for r in sysnames if r not in ours]
     elif "swipl" in systems and "trealla" in systems:
         pairs = [("trealla", "swipl")]
     else:

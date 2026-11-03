@@ -3,6 +3,7 @@
     bench/prolog/install.sh          # build references, generate programs/ (~2 min)
     bench/prolog/run.py              # time swipl and trealla, best of 3 (~9 min)
     bench/prolog/run.py --loimi PATH # ... and our Prolog, with ratios
+    bench/prolog/run.py --exe tailcall=PATH --exe jit=WRAPPER   # several builds
     bench/prolog/run.py --emit       # only write out/NAME.pl
 
 ## Reference systems
