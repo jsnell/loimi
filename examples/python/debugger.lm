@@ -358,6 +358,7 @@ fn stop(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame, id: u32) {
         match debug.parse_command(cmdline) {
             Break(f, l) => d.set_line_break(c, f, l, false),
             TBreak(f, l) => d.set_line_break(c, f, l, true),
+            BreakIf(_, _, _) => d.out.push_str("*** conditional breakpoints are not supported\n"),
             Delete(n) => d.delete(n),
             Info => d.info(),
             Continue => { d.step.start(debug.Mode.Run, line, depth); d.flush(); return; }

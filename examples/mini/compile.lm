@@ -1254,7 +1254,7 @@ fn Parser.statement_inner(p: *Parser) {
                 p.patch(p.jump(), start);
                 p.patch(exit, p.pc());
             } else {
-                p.fs.code.patch_list(&f, start);
+                #[cfg(not(debug))] p.fs.code.patch_list(&f, start); #[cfg(debug)] { let exit = p.jump(); p.patch_here(&f); p.patch(p.jump(), start); p.patch(exit, p.pc()); } // --cfg debug: the jump back is a JMP, which polls for a pause
             }
             f.free();
             p.leave_block();
@@ -1567,4 +1567,12 @@ pub fn try_compile(h: *gc.Heap, name: str, src: str, err: *text.StrBuf) -> ?Gc<P
     let ok = rt.protect(compile_job, &job as *u8);
     error_out = saved;
     if ok { job.proto } else { None }
+}
+
+/// `--cfg debug`: the names of the upvalues of the function being
+/// compiled with FuncState `fs`, in order (debugger.lm).
+#[cfg(debug)]
+pub fn debug_upvals(fs: *u8, out: *mem.Vec<str>) {
+    let f = fs as *FuncState;
+    for i in 0..f.upvals.len { out.push(f.upvals.at(i).name); }
 }

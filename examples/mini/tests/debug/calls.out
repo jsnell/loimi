@@ -59,4 +59,8 @@ calls.mini:15 in main chunk
 15	  acc = acc + fib(k)
 (mdb) continue
 4
+error: line 19: attempt to index a nil value
+calls.mini:19 in main chunk
+19	print(bad.field)
+(mdb) 
 [program failed]

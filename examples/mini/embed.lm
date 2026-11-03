@@ -46,7 +46,7 @@ import vm.{Mini, Ctx};
 import vm;
 import compile;
 import state;
-import coro;
+import coro; #[cfg(debug)] import debugger; #[cfg(debug)] import debugger.{Dbg, Resume, Ref, RefKind}; #[cfg(debug)] import std.debug; // --cfg debug: the debugging API (at the end)
 #[cfg(gil)]
 import std.gil;
 #[cfg(gil)]
@@ -573,4 +573,274 @@ export "C" fn mini_raise(s: *MiniState, msg: str) -> i32 {
     let o = value.new_str(&s.ctx.heap, msg);
     s.ret = V.S(o);
     1
+}
+
+// ── debugging (`--cfg debug`) ───────────────────────────────────────
+//
+// Mini's debugging API, in the C library built with `--cfg debug`:
+//
+//   loimi build --cfg debug examples/mini/embed.lm --lib --header mini.h
+//
+// A host (an editor's debug adapter: examples/mini/dap) attaches a stop
+// callback to a state, loads chunks through `mini_debug_load` (so that
+// the debugger knows their lines and locals), sets breakpoints by file
+// and line, and runs the chunk with `mini_call`. Each time the program
+// stops (at entry, a breakpoint, the end of a step, a pause, an uncaught
+// error), the callback runs on the interpreter's thread, inside the
+// instruction where it stopped. From there, and only there, the host may
+// query the stack (`mini_debug_depth`, `mini_debug_frame`), variables
+// (`mini_debug_scope`, `mini_debug_variables`, tables expanded lazily
+// through handles), evaluate expressions (`mini_debug_eval`), and set or
+// delete breakpoints; it returns how to go on (`MiniResume`). It must not
+// call `mini_dostring` or `mini_call` there.
+//
+// `mini_debug_pause` is the only call another thread may make while the
+// program runs: it sets a flag that the running code polls at loop
+// back-edges and calls (one relaxed load each, in debug builds only), and
+// the program then stops at the next instruction with MiniStop_Pause. A
+// host that needs the program stopped for its own work (new breakpoints
+// from the editor while it runs) pauses it the same way and returns
+// MiniResume_Keep, which continues as before (a `next` in progress goes
+// on).
+//
+// Breakpoint conditions are Mini expressions evaluated in the stopped
+// frame (its locals, upvalues and the globals), as is `mini_debug_eval`:
+// the expression is compiled as a function of those variables and run
+// nested above the frame, with every breakpoint taken out of the code
+// meanwhile, so that it neither stops nor disturbs the step-over of the
+// instruction the program is stopped at (debugger.lm, `Dbg.eval_at`;
+// docs/design/debugging.md section 9).
+//
+// Strings returned to C are valid until the next `mini_debug_*` call on
+// the state (names of functions and chunks: while the program is
+// stopped); those passed to the variable callback, during the call.
+
+#[cfg(debug)]
+/// Why the program stopped (the stop callback's `reason`).
+enum MiniStop: i32 { Entry, Breakpoint, Step, Pause, Error }
+
+#[cfg(debug)]
+/// What the program does after a stop: run to the next breakpoint, step
+/// into calls, step over them, run until the function returns, or
+/// (after a pause the host made for itself) whatever it was doing.
+enum MiniResume: i32 { Continue, Step, Next, Finish, Keep }
+
+#[cfg(debug)]
+/// The variables of a frame (`mini_debug_scope`).
+enum MiniScope: i32 { Locals, Globals }
+
+#[cfg(debug)]
+/// The stop callback: `bp` is the breakpoint's id (reason Breakpoint).
+type StopCb = fn(*MiniState, *u8, MiniStop, u32) -> MiniResume uses reenter;
+
+#[cfg(debug)]
+struct Host { s: *MiniState, cb: StopCb, ud: *u8 }
+
+#[cfg(debug)]
+fn host_stop(d: *Dbg, data: *u8) -> Resume uses reenter {
+    let h = data as *Host;
+    let Some(st) = d.at else { return Resume.Continue; };
+    let reason = match st.reason {
+        Entry => MiniStop.Entry,
+        Breakpoint => MiniStop.Breakpoint,
+        Step => MiniStop.Step,
+        Pause => MiniStop.Pause,
+        Error => MiniStop.Error,
+    };
+    let cb = h.cb;
+    match cb(h.s, h.ud, reason, st.bp) {
+        Continue => Resume.Continue,
+        Step => Resume.Step,
+        Next => Resume.Next,
+        Finish => Resume.Finish,
+        Keep => Resume.Keep,
+    }
+}
+
+#[cfg(debug)]
+fn dbg(s: *MiniState) -> ?*Dbg { s.ctx.dbg }
+
+#[cfg(debug)]
+/// Debug `s`: `cb(s, ud, reason, bp)` runs at each stop. Globals set so
+/// far (the library, natives registered before) are left out of the
+/// globals scope.
+export "C" fn mini_debug_attach(s: *MiniState, cb: fn(*MiniState, *u8, MiniStop, u32) -> MiniResume uses reenter, ud: *u8) {
+    if let Some(d) = dbg(s) {
+        let h = d.data as *Host;
+        h.cb = cb;
+        h.ud = ud;
+        return;
+    }
+    let h: *Host = s.arena.alloc_bytes(size_of<Host>(), 8) as *Host;
+    *h = Host { s: s, cb: cb, ud: ud };
+    debugger.attach(&s.ctx, host_stop, h as *u8);
+}
+
+#[cfg(debug)]
+/// Compile `src` as chunk `name` (the file name breakpoints and frames
+/// use) and push it as a function, for `mini_call`. Breakpoints set
+/// before apply to it. On a syntax error, nothing is pushed and the
+/// message is in `mini_error`. Needs `mini_debug_attach` first.
+export "C" fn mini_debug_load(s: *MiniState, name: str, src: str) -> MiniStatus {
+    s.err.clear();
+    let Some(d) = dbg(s) else {
+        s.err.push_str("mini_debug_load: no debugger attached");
+        return MiniStatus.Runtime;
+    };
+    // The debugger keeps the chunk (names of locals point into it).
+    let n = s.arena.str(name);
+    let t = s.arena.str(src);
+    let Some(p) = d.load(n, t, &s.err) else { return MiniStatus.Syntax; };
+    s.vals.push(V.F(value.new_closure(&s.ctx.heap, p)));
+    MiniStatus.Ok
+}
+
+#[cfg(debug)]
+/// Stop (MiniStop_Entry) before the first instruction of the chunk
+/// loaded last.
+export "C" fn mini_debug_stop_on_entry(s: *MiniState) {
+    let Some(d) = dbg(s) else { return; };
+    if d.chunks.len == 0 { return; }
+    d.break_at_entry(d.chunks.at(d.chunks.len - 1).main);
+}
+
+#[cfg(debug)]
+/// Stop (MiniStop_Error) at an error that nothing catches, before it
+/// unwinds: the message is in `mini_debug_message`, and the frames are
+/// those of the error. The error goes on once the program continues.
+export "C" fn mini_debug_break_on_error(s: *MiniState, on: bool) {
+    if let Some(d) = dbg(s) { d.break_on_error = on; }
+}
+
+#[cfg(debug)]
+/// A breakpoint at line `line` of chunk `file` (by its last path
+/// component), in code loaded now or later: its id.
+export "C" fn mini_debug_set_break(s: *MiniState, file: str, line: u32) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    d.add_break(s.arena.str(file), line, false)
+}
+
+#[cfg(debug)]
+/// Give breakpoint `id` a condition and a hit condition. `cond` ("" for
+/// none) is a Mini expression that must be true for it to stop; `hit`
+/// ("" for none) is on the number of hits where `cond` held: "N" or
+/// "== N" (the Nth), ">= N", "> N", "<= N", "< N", "% N" (every Nth).
+/// False if there is no such breakpoint or `hit` is not a hit condition.
+export "C" fn mini_debug_condition(s: *MiniState, id: u32, cond: str, hit: str) -> bool {
+    let Some(d) = dbg(s) else { return false; };
+    let Some(h) = debug.parse_hit_condition(hit) else { return false; };
+    d.bps.set_condition(id, cond, h)
+}
+
+#[cfg(debug)]
+/// The instructions breakpoint `id` is set at (0: no code at its line
+/// yet, or no such breakpoint).
+export "C" fn mini_debug_break_sites(s: *MiniState, id: u32) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    let Some(b) = d.bps.bp(id) else { return 0; };
+    b.nsites
+}
+
+#[cfg(debug)]
+/// The first line at or after `line` that has code in chunk `file`, 0 if
+/// none: where to move a breakpoint set on a blank line.
+export "C" fn mini_debug_code_line(s: *MiniState, file: str, line: u32) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    d.code_line(file, line)
+}
+
+#[cfg(debug)]
+/// Delete breakpoint `id` (false if there is none).
+export "C" fn mini_debug_delete(s: *MiniState, id: u32) -> bool {
+    let Some(d) = dbg(s) else { return false; };
+    d.bps.delete(id)
+}
+
+#[cfg(debug)]
+/// Stop the running program soon (MiniStop_Pause). Safe from any thread;
+/// a request made while it is stopped is dropped when it continues.
+export "C" fn mini_debug_pause(s: *MiniState) { debugger.pause(&s.ctx); }
+
+// ── at a stop ───────────────────────────────────────────────────────
+
+#[cfg(debug)]
+/// At a stop: the error (MiniStop_Error), or why a breakpoint's condition
+/// failed to evaluate (MiniStop_Breakpoint); else empty.
+export "C" fn mini_debug_message(s: *MiniState) -> str {
+    let Some(d) = dbg(s) else { return ""; };
+    d.msg.as_str()
+}
+
+#[cfg(debug)]
+/// At a stop: the number of frames (0 if not stopped).
+export "C" fn mini_debug_depth(s: *MiniState) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    d.depth()
+}
+
+#[cfg(debug)]
+/// At a stop: frame `level` (0 the innermost): its function's name
+/// ("main chunk" for a chunk), chunk name and line. False if there is no
+/// such frame.
+export "C" fn mini_debug_frame(s: *MiniState, level: u32, func: *str, file: *str, line: *u32) -> bool {
+    let Some(d) = dbg(s) else { return false; };
+    let Some((f, ch, l)) = d.frame_info(level) else { return false; };
+    *func = f;
+    *file = ch;
+    *line = l;
+    true
+}
+
+#[cfg(debug)]
+/// At a stop: the handle of a scope of frame `level`, for
+/// `mini_debug_variables` (0 if there is no such frame). Handles are
+/// valid until the program continues.
+export "C" fn mini_debug_scope(s: *MiniState, level: u32, scope: MiniScope) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    if d.frame(level).is_none() { return 0; }
+    match scope {
+        Locals => d.ref_of(Ref { kind: RefKind.Locals, level: level, v: V.Nil }),
+        Globals => d.ref_of(Ref { kind: RefKind.Globals, level: 0, v: V.Nil }),
+    }
+}
+
+#[cfg(debug)]
+/// At a stop: call `f(ud, name, value, child)` for the variables
+/// of `handle` from number `start`, at most `count` of them (0: all).
+/// `value` is shown as the debugger shows values (strings quoted, tables
+/// as "table (N entries)"); `child` is the handle of a table's entries
+/// (0 for other values). Returns the number of variables in all (0 for a
+/// bad handle).
+export "C" fn mini_debug_variables(s: *MiniState, handle: u32, start: u32, count: u32, f: fn(*u8, str, str, u32), ud: *u8) -> u32 {
+    let Some(d) = dbg(s) else { return 0; };
+    d.variables(handle, start, count, f, ud)
+}
+
+#[cfg(debug)]
+/// At a stop: evaluate `expr` in frame `level` (its locals and upvalues,
+/// as copies, and the globals): an expression, or else a statement (an
+/// assignment to a global, a call). MiniStatus_Ok with `*out` the
+/// result as shown and `*child` its handle (as for variables), or
+/// MiniStatus_Runtime with `*out` the error message. The code runs
+/// with breakpoints off.
+export "C" fn mini_debug_eval(s: *MiniState, level: u32, expr: str, out: *str, child: *u32) -> MiniStatus uses reenter {
+    *out = "";
+    *child = 0;
+    let Some(d) = dbg(s) else { return MiniStatus.Runtime; };
+    if d.at.is_none() { *out = "not stopped"; return MiniStatus.Runtime; }
+    let r = d.eval(level, expr, true);
+    d.out.clear();
+    match r {
+        Ok(v) => {
+            debugger.render(&d.out, v);
+            *child = d.child_ref(v);
+            *out = d.out.as_str();
+            MiniStatus.Ok
+        }
+        Err(e) => {
+            value.write_value(&d.out, e);
+            *out = d.out.as_str();
+            MiniStatus.Runtime
+        }
+    }
 }

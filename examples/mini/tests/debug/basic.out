@@ -15,6 +15,7 @@ locals              the current function's locals
 print NAME          a local's value (p)
 op                  the current instruction
 quit                end the program (q)
+break LINE if COND  stop there when COND (a Mini expression) holds
 (mdb) break 2
 breakpoint 1 at basic.mini:2
 (mdb) break 2

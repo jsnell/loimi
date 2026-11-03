@@ -1,0 +1,20 @@
+break 3 if item.n % 2 == 0 and scale > 2
+break 13 if nosuch.field
+break 15 if
+info
+continue
+delete 2
+continue
+locals
+continue
+print item
+print item.n * scale
+print item.x.y
+print (
+continue
+info
+delete 1
+continue
+bt
+locals
+continue

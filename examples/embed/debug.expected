@@ -1,0 +1,119 @@
+set 3 before loading: id 1 sites 0
+condition: 1
+syntax error: line 1: unexpected symbol
+breakpoint 1 now has 1 site(s)
+code line for 6: 7
+set 10: id 3 sites 1, bad hit condition: 0
+hit condition >= 4: 1
+condition that fails: 1
+delete 99: 0
+stop 1: entry
+  #0 prog.mini:1 main chunk
+  locals:
+stop 2: breakpoint 1
+  #0 prog.mini:3 add
+  #1 prog.mini:10 main chunk
+  locals:
+    a = 3
+    b = 10
+    base = 100
+    eval #0 a * 2 + b -> 16
+    eval #0 base -> 100
+    eval #0 t -> nil
+    eval #1 t.sub -> table (1 entry) {...}
+      k = true
+    eval #1 add(3, 0) -> 103
+    eval #0 seen = a -> nil
+    eval #0 seen -> 3
+    eval #0 1 + -> error: unexpected symbol
+    eval #0 nil .. 1 -> error: attempt to concatenate a nil value
+    eval #1 add(nil, 1) -> error: line 3: attempt to perform arithmetic on a nil value
+  globals:
+    seen = 3
+    total = 223
+stop 3: step
+  #0 prog.mini:4 add
+  #1 prog.mini:10 main chunk
+  locals:
+    a = 3
+    b = 10
+    s = 113
+    base = 100
+stop 4: step
+  #0 prog.mini:10 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+    i = 3
+stop 5: step
+  #0 prog.mini:11 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+stop 6: breakpoint 3
+  #0 prog.mini:10 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+    i = 4
+stop 7: breakpoint 3
+  #0 prog.mini:10 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+    i = 5
+delete 3: 1
+stop 8: breakpoint 4 (error in condition `nosuch.field`: attempt to index a nil value)
+  #0 prog.mini:12 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+total	565
+stop 9: error (line 14: attempt to index a nil value)
+  #0 prog.mini:14 main chunk
+  locals:
+    base = 100
+    add = function 'add'
+    t = table (4 entries) {...}
+      [1] = 10
+      [2] = 20
+      name = "t"
+      sub = table (1 entry) {...}
+        k = true
+    u = nil
+run: status 2: line 14: attempt to index a nil value
+stops: 9 of 9 scripted
+stop: pause at spin.mini:2
+    eval #0 done = true -> nil
+spun	true
+spin: status 0

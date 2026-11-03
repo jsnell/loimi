@@ -1372,6 +1372,26 @@ fn mini_shared() {
     );
 }
 
+/// Mini's debugging API (`--cfg debug`, the end of examples/mini/embed.lm)
+/// from a C host (examples/embed/debug.c): stop on entry, pending
+/// breakpoints, conditions and hit conditions, stepping, frames, locals
+/// and globals, lazy table expansion, evaluation with breakpoints
+/// suspended, break on error, a pause from another thread; under GC
+/// stress.
+#[test]
+fn mini_debug_api() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let e = root.join("examples/embed");
+    c_host_run_with(
+        "mini-debug-api",
+        &root.join("examples/mini/embed.lm"),
+        &e.join("debug.c"),
+        &e.join("debug.expected"),
+        None,
+        &["--cfg", "debug"],
+    );
+}
+
 /// Mini built with the lock (`--cfg gil`) and run by one thread: every
 /// script and conformance test, in every GC mode (the polls at back-edges
 /// and calls never hand over).

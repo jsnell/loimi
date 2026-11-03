@@ -69,7 +69,7 @@ pub struct Ctx {
     /// The values that coroutine.yield passed, or that the return that
     /// ended a run returned (RETN; RET1 and RET0 set only `nxfer`).
     xfer: *V,
-    nxfer: u64, #[cfg(gil)] gil: *gil.Gil, #[cfg(debug)] dbg: ?*debugger.Dbg, // --cfg gil: the lock of threads sharing the state (threads.lm); --cfg debug: the debugger, when running under one (debugger.lm)
+    nxfer: u64, #[cfg(gil)] gil: *gil.Gil, #[cfg(debug)] dbg: ?*debugger.Dbg, #[cfg(debug)] pause: u32, // --cfg gil: the lock of threads sharing the state (threads.lm); --cfg debug: the debugger, when running under one (debugger.lm)
 }
 
 pub const HOST_NATIVE: i32 = 1000;
@@ -938,7 +938,7 @@ pub vm Mini {
         }
     }
 
-    op JMP(target: label) : sJ { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
+    op JMP(target: label) : sJ { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target }
     /// Jump if falsy.
     op TEST(a: reg, target: label) : AsBx {
         if !value.truthy(a) { #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target }
@@ -1011,7 +1011,7 @@ pub vm Mini {
                 let n = V.Int(i +% s);
                 regs[a] = n;
                 regs[a + 3] = n;
-                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
+                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
             }
             next
         }
@@ -1021,7 +1021,7 @@ pub vm Mini {
                 if (s > 0.0 and n <= l) or (s < 0.0 and n >= l) {
                     regs[a] = Num(n);
                     regs[a + 3] = Num(n);
-                    #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
+                    #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
                 }
                 next
             }
@@ -1036,7 +1036,7 @@ pub vm Mini {
             let n = value.table_iter(t, i as u64, regs + a + 2);
             if n != 0 {
                 regs[a + 1] = Int(n as i32);
-                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
+                #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
             }
             next
         }
@@ -1051,7 +1051,7 @@ pub vm Mini {
             regs[a + 1] = Int(i + 1);
             regs[a + 2] = Int(i + 1);
             regs[a + 3] = v;
-            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump target
+            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump target
         }
         cold { raise iter_error(ctx, regs[a]) }
     }
@@ -1086,7 +1086,7 @@ pub vm Mini {
             k = p.consts.data.ptr;
             fp.k = k;
             regs = callee;
-            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } jump p.code
+            #[cfg(gil)] if unlikely(ctx.gil.waiting()) { cold { ctx.gil.yield_now(); } } #[cfg(debug)] if unlikely((&ctx.pause).atomic_load_relaxed() != 0) { use_variant step; } jump p.code
         }
         if let Native(id) = f {
             cold {
@@ -1395,7 +1395,7 @@ pub vm Mini {
             // An error from a nested run already has its line.
             ctx.rethrow = Nil;
         } else {
-            err = at_line(ctx, fp.cl.proto, pc, e);
+            err = at_line(ctx, fp.cl.proto, pc, e); #[cfg(debug)] debugger.on_error(ctx, pc, fp, err); // --cfg debug: break on error, before unwinding
         }
         // A coroutine resumed in this run dies of it, and its resumer
         // continues: with false and the error, or through a wrap

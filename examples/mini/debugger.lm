@@ -1,12 +1,16 @@
-// A source-level debugger for Mini, compiled in with `--cfg debug`:
+// A source-level debugger for Mini, compiled in with `--cfg debug`. Two
+// front ends share it:
 //
-//   loimi build --cfg debug examples/mini/main.lm -o mini-dbg
-//   ./mini-dbg --debug script.mini < commands
+// - a gdb-like command line, `mini --debug script.mini < commands`
+//   (`main` below): it stops before the first line and reads `break
+//   [FILE:]LINE [if COND]`, `continue`, `step`, `next`, `finish`, `bt`,
+//   `locals`, `print NAME` or `print EXPR`, `op`, `info`, `delete ID`, `quit` (`help`
+//   lists them) from stdin;
+// - the embedding API's (embed_debug.lm, for editors through the DAP
+//   adapter in examples/mini/dap): a C callback at each stop, which
+//   queries frames, variables and expressions and says how to continue.
 //
-// It stops before the first line and reads gdb-like commands from stdin
-// (`break [FILE:]LINE`, `continue`, `step`, `next`, `finish`, `bt`,
-// `locals`, `print NAME`, `op`, `info`, `delete ID`, `quit`; `help`
-// lists them). The generic parts are the compiler's and std.debug's
+// The generic parts are the compiler's and std.debug's
 // (docs/design/debugging.md):
 //
 // - breakpoints are generated BREAK ops patched over instructions
@@ -19,15 +23,19 @@
 //
 // What is Mini's: lines (each Proto's line table), call depth (the frame
 // stack), frames and locals (the compiler records each local's register
-// and live range with `open_local`/`close_locals`/`finish_proto`).
+// and live range with `open_local`/`close_locals`/`finish_proto`), what
+// an uncaught error is (`on_error`), and evaluating an expression in a
+// stopped frame (`Dbg.eval`: the expression compiled as a function of
+// the frame's locals, run nested with the breakpoints suspended).
 
 import std.debug;
+import std.gc;
 import std.io;
 import std.mem;
 import std.os;
 import std.text;
 import value;
-import value.{V, Proto};
+import value.{V, Proto, Table};
 import vm;
 import vm.{Ctx, Frame, Mini};
 import compile;
@@ -45,22 +53,25 @@ pub struct LocVar { name: str, reg: u32, start: u32, end: u32 }
 /// The locals of a function being compiled (`key` is its FuncState), as
 /// a stack parallel to the compiler's `locals` (indices into `vars`).
 struct Building { key: u64, open: mem.Vec<u64>, vars: mem.Vec<LocVar> }
-/// The locals of a compiled function.
-struct ProtoInfo { proto: u64, vars: mem.Vec<LocVar> }
-struct Registry { building: mem.Vec<Building>, done: mem.Vec<ProtoInfo> }
+/// The locals and upvalue names of a compiled function, and the chunk
+/// (file) it is from.
+struct ProtoInfo { proto: u64, vars: mem.Vec<LocVar>, ups: mem.Vec<str>, chunk: str }
+/// `chunk`: the name of the chunk being compiled. `off`: not recording
+/// (the debugger compiles an expression).
+struct Registry { building: mem.Vec<Building>, done: mem.Vec<ProtoInfo>, chunk: str, off: bool }
 
 var registry: ?*Registry = None;
 
-fn reg() -> *Registry {
+fn the_registry() -> *Registry {
     if let Some(r) = registry { return r; }
     let r: *Registry = mem.alloc(1);
-    *r = Registry { building: mem.Vec.new(), done: mem.Vec.new() };
+    *r = Registry { building: mem.Vec.new(), done: mem.Vec.new(), chunk: "", off: false };
     registry = Some(r);
     r
 }
 
 fn building(key: u64) -> *Building {
-    let r = reg();
+    let r = the_registry();
     for i in 0..r.building.len {
         if r.building.at(i).key == key { return r.building.ptr_at(i); }
     }
@@ -70,6 +81,7 @@ fn building(key: u64) -> *Building {
 
 /// The compiler made register `reg` the local `name`, live from word `pc`.
 pub fn open_local(fs: *u8, name: str, reg: u32, pc: u64) {
+    if the_registry().off { return; }
     let b = building(fs as u64);
     b.open.push(b.vars.len);
     b.vars.push(LocVar { name: name, reg: reg, start: pc as u32, end: 4294967295 });
@@ -77,6 +89,7 @@ pub fn open_local(fs: *u8, name: str, reg: u32, pc: u64) {
 
 /// The compiler left a block: locals from number `first` on end at `pc`.
 pub fn close_locals(fs: *u8, first: u64, pc: u64) {
+    if the_registry().off { return; }
     let b = building(fs as u64);
     while b.open.len > first {
         let Some(v) = b.open.pop() else { break; };
@@ -86,260 +99,196 @@ pub fn close_locals(fs: *u8, first: u64, pc: u64) {
 
 /// The function compiled with FuncState `fs` is `p`.
 pub fn finish_proto(fs: *u8, p: Gc<Proto>) {
-    let r = reg();
+    let r = the_registry();
+    if r.off { return; }
     let b = building(fs as u64);
     let vars = b.vars;
     b.open.free();
     let i = ((b as u64) - (r.building.ptr as u64)) / size_of<Building>();
     for j in i + 1..r.building.len { r.building.set(j - 1, r.building.at(j)); }
     r.building.truncate(r.building.len - 1);
-    r.done.push(ProtoInfo { proto: p as u64, vars: vars });
+    var ups: mem.Vec<str> = mem.Vec.new();
+    compile.debug_upvals(fs, &ups);
+    // A function at the address of one that was collected replaces it.
+    for j in 0..r.done.len {
+        let d = r.done.ptr_at(j);
+        if d.proto == p as u64 {
+            d.vars.free();
+            d.ups.free();
+            *d = ProtoInfo { proto: p as u64, vars: vars, ups: ups, chunk: r.chunk };
+            return;
+        }
+    }
+    r.done.push(ProtoInfo { proto: p as u64, vars: vars, ups: ups, chunk: r.chunk });
+}
+
+fn info_of(p: Gc<Proto>) -> ?*ProtoInfo {
+    let r = the_registry();
+    for i in 0..r.done.len {
+        let d = r.done.ptr_at(i);
+        if d.proto == p as u64 { return Some(d); }
+    }
+    None
 }
 
 fn locvars(p: Gc<Proto>) -> []LocVar {
-    let r = reg();
-    for i in 0..r.done.len {
-        let d = r.done.ptr_at(i);
-        if d.proto == p as u64 { return d.vars.items(); }
+    if let Some(d) = info_of(p) { return d.vars.items(); }
+    (the_registry().done.ptr as *LocVar).slice(0)
+}
+
+/// The name of the chunk (file) function `p` was compiled from.
+fn chunk_of(p: Gc<Proto>) -> str {
+    if let Some(d) = info_of(p) { return d.chunk; }
+    "?"
+}
+
+/// Start compiling chunk `name`: locals are recorded as from it. (A failed
+/// compile leaves functions half built: they are dropped.)
+fn begin_chunk(name: str) {
+    let r = the_registry();
+    r.chunk = name;
+    for i in 0..r.building.len {
+        r.building.ptr_at(i).open.free();
+        r.building.ptr_at(i).vars.free();
     }
-    (r.done.ptr as *LocVar).slice(0)
+    r.building.clear();
 }
 
 // ── the debugger ────────────────────────────────────────────────────────
 
+/// How the program continues after a stop: `Keep` continues as before
+/// the stop (a stepping command in progress goes on), for a front end
+/// that stopped the program for its own work (a pause request it made to
+/// apply new breakpoints, say) rather than for the user.
+pub enum Resume { Continue, Step, Next, Finish, Keep }
+
+/// Where the program is stopped: at `pc` in frame `fp`.
+pub struct Stop { pc: *u32, fp: *Frame, reason: debug.Reason, bp: u32 }
+
+/// Code the debugger knows: a chunk, with its source and main function
+/// (kept alive: breakpoints may be in it).
+pub struct Chunk { name: str, src: str, main: Gc<Proto> }
+
+/// A handle for the client to expand (`debug.Refs`): a frame's locals
+/// (`level`), the globals, or a table.
+pub enum RefKind: u32 { Locals, Globals, Value }
+pub struct Ref { kind: RefKind, level: u32, v: V }
+
+fn same_ref(a: Ref, b: Ref) -> bool { a.kind == b.kind and a.level == b.level and a.v == b.v }
+
+/// What a front end does at a stop (`data` is its own).
+pub type StopFn = fn(*Dbg, *u8) -> Resume uses reenter;
+
 pub struct Dbg {
+    c: *Ctx,
     bps: debug.Breakpoints<Mini.Break>,
     step: debug.Stepper,
-    input: debug.Input,
-    file: str,
-    src: str,
-    main: Gc<Proto>,
+    front: StopFn,
+    data: *u8,
+    /// The stop the front end is at.
+    at: ?Stop,
+    chunks: mem.Vec<Chunk>,
+    refs: debug.Refs<Ref>,
+    /// At a stop: the error (reason Error), or why a breakpoint's
+    /// condition could not be evaluated.
+    msg: text.StrBuf,
+    /// Text the front end reads (a value, a name), valid until the next
+    /// call that writes it.
     out: text.StrBuf,
+    tmp: text.StrBuf,
+    /// Stop at errors that nothing catches.
+    break_on_error: bool,
+    /// The one-shot breakpoint that stops before the first line (0: none).
+    entry: u32,
+    /// Globals set before the program ran (the library): not shown.
+    builtins: mem.Vec<V>,
+    /// Values the debugger holds for a moment (arguments of an
+    /// evaluation, the result): roots.
+    vals: mem.Vec<V>,
 }
 
 fn clear_site(b: Mini.Break) -> bool { Mini.clear_break(b) }
 fn rearm_site(b: Mini.Break) -> ?Mini.Break { b.rearm() }
 
-/// `mini --debug FILE`: run FILE under the debugger.
-pub fn main() -> i32 uses gc {
-    let Some(path) = os.arg(2) else {
-        io.eprintln("usage: mini --debug <script>");
-        return 2;
-    };
-    let Some(src) = io.read_file(path) else {
-        io.eprint("cannot read ");
-        io.eprintln(path);
-        return 1;
-    };
-    var ctx = state.new_ctx(vm.no_host);
-    let proto = compile.compile(&ctx.heap, path, src);
-    let main_closure = value.new_closure(&ctx.heap, proto);
-    state.attach(&ctx);
-    var d = Dbg {
+/// The debugger of state `c`, stopping through `front`. The globals set
+/// so far are the library's, which the globals scope leaves out.
+pub fn attach(c: *Ctx, front: StopFn, data: *u8) -> *Dbg {
+    let d: *Dbg = mem.alloc(1);
+    *d = Dbg {
+        c: c,
         bps: debug.Breakpoints.new(clear_site, rearm_site),
         step: debug.Stepper.new(),
-        input: debug.Input.stdin(),
-        file: path,
-        src: src,
-        main: proto,
+        front: front,
+        data: data,
+        at: None,
+        chunks: mem.Vec.new(),
+        refs: debug.Refs.new(),
+        msg: text.StrBuf.new(),
         out: text.StrBuf.new(),
+        tmp: text.StrBuf.new(),
+        break_on_error: false,
+        entry: 0,
+        builtins: mem.Vec.new(),
+        vals: mem.Vec.new(),
     };
-    // Stop before the first instruction: a one-shot breakpoint there.
-    let id = d.bps.add(path, 0, true);
-    if let Some(t) = Mini.set_break(proto.code, 0) { d.bps.add_site(id, proto.code.start() as u64, t); }
-    // Its id is free again before the first command (the hit deletes it):
-    // the user's breakpoints count from 1.
-    d.bps.next_id = id;
-    ctx.dbg = Some(&d);
-    let r = Mini.run(&ctx, main_closure);
-    lib.flush();
-    if let Err(e) = r {
-        var b = text.StrBuf.new();
-        b.push_str("error: ");
-        value.write_value(&b, e);
-        io.eprintln(b.as_str());
-        io.println("[program failed]");
-        return 1;
+    var kv: [V; 2] = [V.Nil, V.Nil];
+    var i = value.table_iter(c.globals, 0, &kv[0]);
+    while i != 0 {
+        d.builtins.push(kv[0]);
+        i = value.table_iter(c.globals, i, &kv[0]);
     }
-    io.println("[program finished]");
-    0
+    c.heap.add_scanner(d as *u8, scan_dbg);
+    c.dbg = Some(d);
+    d
 }
 
-/// From the vm's `on break` handler: the breakpoint at `pc` was hit.
-/// Stop, with the instruction put back for the handler to run.
-pub fn on_break(c: *Ctx, pc: *u32, fp: *Frame) {
-    let Some(d) = c.dbg else { return; };
-    let id = d.bps.hit(pc as u64);
-    stop(d, c, pc, fp, id);
+/// GC roots: the chunks (whose code the breakpoints patch), and the
+/// values handed out or held.
+fn scan_dbg(h: *gc.Heap, data: *u8) {
+    let d = data as *Dbg;
+    for i in 0..d.chunks.len { gc_mark(h, d.chunks.at(i).main); }
+    let rs = d.refs.items();
+    for i in 0..rs.len { gc_mark(h, rs[i].v); }
+    for i in 0..d.builtins.len { gc_mark(h, d.builtins.at(i)); }
+    for i in 0..d.vals.len { gc_mark(h, d.vals.at(i)); }
 }
 
-/// From the `step` variant, before each instruction: whether the variant
-/// must stay on (a breakpoint waits to be set again, or a stepping
-/// command runs).
-pub fn on_step(c: *Ctx, pc: *u32, fp: *Frame) -> bool {
-    let Some(d) = c.dbg else { return false; };
-    let pending = d.bps.tick();
-    // A breakpoint here stops in its own handler.
-    if d.step.active() and !Mini.is_break(*pc) {
-        let (line, depth) = where_at(c, pc, fp);
-        if d.step.should_stop(line, depth) { stop(d, c, pc, fp, 0); }
+/// Compile chunk `name` (`src` must outlive the debugger) for debugging:
+/// its locals are recorded and the breakpoints set so far apply to it.
+/// A syntax error appends its message to `err`.
+pub fn Dbg.load(d: *Dbg, name: str, src: str, err: *text.StrBuf) -> ?Gc<Proto> {
+    begin_chunk(name);
+    let r = compile.try_compile(&d.c.heap, name, src, err);
+    the_registry().chunk = "";
+    let Some(p) = r else { return None; };
+    d.chunks.push(Chunk { name: name, src: src, main: p });
+    for b in d.bps.list() {
+        if b.id != d.entry and file_matches(b.file, name) { d.sites_in(p, b.id, b.line); }
     }
-    pending or d.step.active()
+    Some(p)
 }
 
-/// Whether a stepping command or a step-over is in progress: a run that
-/// starts or continues after a native (a nested run, or its caller after
-/// it) turns the `step` variant on.
-pub fn stepping(c: *Ctx) -> bool {
-    let Some(d) = c.dbg else { return false; };
-    d.step.active() or d.bps.pending.is_some()
+/// Stop before the first instruction of `p`.
+pub fn Dbg.break_at_entry(d: *Dbg, p: Gc<Proto>) {
+    let id = d.bps.add("", 0, true);
+    if let Some(t) = Mini.set_break(p.code, 0) { d.bps.add_site(id, p.code.start() as u64, t); }
+    d.entry = id;
 }
 
-/// The nested run whose bottom frame was number `fi` ended (a
-/// `table.sort` comparator returned or raised): a stepping command in it
-/// waits for its caller, not for the comparator's next call.
-pub fn left(c: *Ctx, fi: u64) {
-    let Some(d) = c.dbg else { return; };
-    d.step.left(fi);
+fn file_matches(want: str, chunk: str) -> bool {
+    want.len == 0 or debug.basename(want).eq(debug.basename(chunk))
 }
 
-/// The line and call depth of the instruction at `pc` in frame `fp`.
-fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
-    (line_of(fp.cl.proto, pc), ((fp as u64) - (c.frames as u64)) / size_of<Frame>())
-}
-
-fn line_of(p: Gc<Proto>, pc: *u32) -> u32 {
-    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
-    if i < p.lines.data.len { p.lines.data[i] } else { 0 }
-}
-
-fn Dbg.flush(d: *Dbg) {
-    io.print(d.out.as_str());
-    d.out.clear();
-}
-
-/// Text of source line `n` (1-based).
-fn Dbg.source_line(d: *Dbg, n: u32) -> str {
-    var line: u32 = 1;
-    var start: u64 = 0;
-    for i in 0..d.src.len {
-        if line == n {
-            var e = i;
-            while e < d.src.len and d.src[e] != '\n' { e += 1; }
-            return d.src[i..e];
-        }
-        if d.src[i] == '\n' {
-            line += 1;
-            start = i + 1;
-        }
+/// A breakpoint at each instruction that starts a run of `line`'s code,
+/// in the chunks named like `file` (every chunk if ""), and in those
+/// loaded later: its id (its `nsites` 0 if no code is there yet).
+pub fn Dbg.add_break(d: *Dbg, file: str, line: u32, temp: bool) -> u32 {
+    let id = d.bps.add(file, line, temp);
+    for i in 0..d.chunks.len {
+        let ch = d.chunks.at(i);
+        if file_matches(file, ch.name) { d.sites_in(ch.main, id, line); }
     }
-    let _ = start;
-    ""
-}
-
-fn Dbg.location(d: *Dbg, p: Gc<Proto>, line: u32) {
-    d.out.push_str(debug.basename(d.file));
-    d.out.push_str(":");
-    d.out.push_int(line as i64);
-    d.out.push_str(" in ");
-    let n = p.name.data;
-    if p == d.main { d.out.push_str("main chunk"); } else { d.out.push_str("function '"); d.out.push_str(n); d.out.push_str("'"); }
-}
-
-/// Stop at `pc` (breakpoint `id`, or 0 for a step) and run commands
-/// until one continues the program.
-fn stop(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame, id: u32) {
-    lib.flush();
-    let p = fp.cl.proto;
-    let (line, depth) = where_at(c, pc, fp);
-    if id != 0 {
-        if let Some(b) = d.bps.bp(id) and !b.temp {
-            d.out.push_str("breakpoint ");
-            d.out.push_int(id as i64);
-            d.out.push_str(", ");
-        }
-    }
-    d.location(p, line);
-    d.out.push_str("\n");
-    d.out.push_int(line as i64);
-    d.out.push_str("\t");
-    d.out.push_str(d.source_line(line));
-    d.out.push_str("\n");
-    loop {
-        d.out.push_str("(mdb) ");
-        d.flush();
-        let Some(cmdline) = d.input.read_line() else {
-            // End of the commands: detach and let the program finish.
-            if !d.input.is_tty() { io.println(""); }
-            d.bps.clear_all();
-            d.step.start(debug.Mode.Run, 0, 0);
-            return;
-        };
-        if !d.input.is_tty() {
-            d.out.push_str(cmdline);
-            d.out.push_str("\n");
-        }
-        match debug.parse_command(cmdline) {
-            Break(f, l) => d.set_line_break(f, l, false),
-            TBreak(f, l) => d.set_line_break(f, l, true),
-            Delete(n) => {
-                if !d.bps.delete(n) { d.out.push_str("no breakpoint "); d.out.push_int(n as i64); d.out.push_str("\n"); }
-            }
-            Info => d.info(),
-            Continue => { d.step.start(debug.Mode.Run, line, depth); d.flush(); return; }
-            Step => { d.step.start(debug.Mode.Step, line, depth); d.flush(); return; }
-            Next => { d.step.start(debug.Mode.Next, line, depth); d.flush(); return; }
-            Finish => { d.step.start(debug.Mode.Finish, line, depth); d.flush(); return; }
-            Backtrace => d.backtrace(c, pc, fp),
-            Locals => d.locals(fp, pc, ""),
-            Print(name) => d.locals(fp, pc, name),
-            Op => {
-                let words = p.code.words();
-                Mini.disasm_insn(words, ((pc as u64) - (words.ptr as u64)) / 4, &d.out);
-            }
-            Quit => { d.flush(); lib.flush(); exit(0) }
-            Help => d.out.push_str(debug.HELP),
-            Empty => {}
-            Bad(msg) => { d.out.push_str(msg); d.out.push_str("\n"); }
-        }
-    }
-}
-
-/// `break [FILE:]LINE`: a site at each instruction that starts a run of
-/// LINE's code, in every function.
-fn Dbg.set_line_break(d: *Dbg, file: str, line: u32, temp: bool) {
-    if file.len > 0 and !debug.basename(file).eq(debug.basename(d.file)) {
-        d.out.push_str("no source file named ");
-        d.out.push_str(file);
-        d.out.push_str("\n");
-        return;
-    }
-    let id = d.bps.add(d.file, line, temp);
-    d.sites_in(d.main, id, line);
-    let Some(b) = d.bps.bp(id) else { return; };
-    if b.nsites == 0 {
-        d.bps.delete(id);
-        d.bps.next_id = id;
-        for o in d.bps.list() {
-            if o.line == line {
-                d.out.push_str("breakpoint ");
-                d.out.push_int(o.id as i64);
-                d.out.push_str(" is already at that line\n");
-                return;
-            }
-        }
-        d.out.push_str("no code at line ");
-        d.out.push_int(line as i64);
-        d.out.push_str("\n");
-        return;
-    }
-    d.out.push_str("breakpoint ");
-    d.out.push_int(id as i64);
-    d.out.push_str(" at ");
-    d.out.push_str(debug.basename(d.file));
-    d.out.push_str(":");
-    d.out.push_int(line as i64);
-    d.out.push_str("\n");
+    id
 }
 
 fn Dbg.sites_in(d: *Dbg, p: Gc<Proto>, id: u32, line: u32) {
@@ -359,67 +308,713 @@ fn Dbg.sites_in(d: *Dbg, p: Gc<Proto>, id: u32, line: u32) {
     for j in 0..p.protos.data.len { d.sites_in(p.protos.data[j], id, line); }
 }
 
-fn Dbg.info(d: *Dbg) {
+/// The first source line at or after `line` where a breakpoint would
+/// have a site in chunk `file`'s code (0 if none): where an editor
+/// shows a breakpoint set on a blank line or a comment.
+pub fn Dbg.code_line(d: *Dbg, file: str, line: u32) -> u32 {
+    var best: u32 = 0;
+    for i in 0..d.chunks.len {
+        let ch = d.chunks.at(i);
+        if file_matches(file, ch.name) {
+            let l = first_line_from(ch.main, line);
+            if l != 0 and (best == 0 or l < best) { best = l; }
+        }
+    }
+    best
+}
+
+fn first_line_from(p: Gc<Proto>, line: u32) -> u32 {
+    var best: u32 = 0;
+    let ls = p.lines.data;
+    for i in 0..ls.len {
+        if ls[i] >= line and (best == 0 or ls[i] < best) { best = ls[i]; }
+    }
+    for j in 0..p.protos.data.len {
+        let l = first_line_from(p.protos.data[j], line);
+        if l != 0 and (best == 0 or l < best) { best = l; }
+    }
+    best
+}
+
+// ── hooks, from the vm ──────────────────────────────────────────────────
+
+/// From the vm's `on break` handler: the breakpoint at `pc` was hit, and
+/// its instruction is put back for the handler to run. Stop, unless the
+/// breakpoint's condition is false or its hit condition says not yet.
+pub fn on_break(c: *Ctx, pc: *u32, fp: *Frame) uses reenter {
+    let Some(d) = c.dbg else { return; };
+    let id = d.bps.hit(pc as u64);
+    var reason = debug.Reason.Breakpoint;
+    if id == d.entry {
+        reason = debug.Reason.Entry;
+        d.entry = 0;
+    } else if let Some(b) = d.bps.bp(id) {
+        if b.cond.len > 0 {
+            let cond = b.cond;
+            match d.eval_at(fp, pc, cond, false) {
+                Ok(v) => if !value.truthy(v) { return; },
+                Err(e) => {
+                    // A condition that fails stops, saying why.
+                    d.msg.clear();
+                    d.msg.push_str("error in condition `");
+                    d.msg.push_str(cond);
+                    d.msg.push_str("`: ");
+                    value.write_value(&d.msg, e);
+                }
+            }
+        }
+        if !d.bps.counts(id) { d.msg.clear(); return; }
+    }
+    d.stop(pc, fp, reason, id);
+}
+
+/// From the `step` variant, before each instruction: whether the variant
+/// must stay on (a breakpoint waits to be set again, or a stepping
+/// command runs).
+pub fn on_step(c: *Ctx, pc: *u32, fp: *Frame) -> bool uses reenter {
+    let Some(d) = c.dbg else { return false; };
+    // Guest code the debugger itself runs from a stop.
+    if d.bps.suspended() { return false; }
+    let pending = d.bps.tick();
+    // A breakpoint here stops in its own handler.
+    if !Mini.is_break(*pc) {
+        if debug.take_pause(&c.pause) {
+            d.stop(pc, fp, debug.Reason.Pause, 0);
+        } else if d.step.active() {
+            let (line, depth) = where_at(c, pc, fp);
+            if d.step.should_stop(line, depth) { d.stop(pc, fp, debug.Reason.Step, 0); }
+        }
+    }
+    pending or d.step.active()
+}
+
+/// From `on raise`, before an error raised at `pc` in frame `fp` unwinds
+/// (not when an error from a nested run passes through): with
+/// break-on-error, stop if nothing catches it, that is, if no coroutine
+/// on the way to the main thread was resumed by `coroutine.resume`
+/// (Mini has no pcall).
+pub fn on_error(c: *Ctx, pc: *u32, fp: *Frame, e: V) uses reenter {
+    let Some(d) = c.dbg else { return; };
+    if !d.break_on_error or d.bps.suspended() { return; }
+    var co = c.cur;
+    while co != c.main {
+        if !co.via_wrap { return; }
+        let Some(p) = co.prev else { break; };
+        co = p;
+    }
+    d.msg.clear();
+    value.write_value(&d.msg, e);
+    d.stop(pc, fp, debug.Reason.Error, 0);
+}
+
+/// Whether a stepping command or a step-over is in progress: a run that
+/// starts or continues after a native (a nested run, or its caller after
+/// it) turns the `step` variant on.
+pub fn stepping(c: *Ctx) -> bool {
+    let Some(d) = c.dbg else { return false; };
+    if d.bps.suspended() { return false; }
+    d.step.active() or d.bps.pending.is_some()
+}
+
+/// The nested run whose bottom frame was number `fi` ended (a
+/// `table.sort` comparator returned or raised): a stepping command in it
+/// waits for its caller, not for the comparator's next call.
+pub fn left(c: *Ctx, fi: u64) {
+    let Some(d) = c.dbg else { return; };
+    if d.bps.suspended() { return; }
+    d.step.left(fi);
+}
+
+/// The line and call depth of the instruction at `pc` in frame `fp`.
+fn where_at(c: *Ctx, pc: *u32, fp: *Frame) -> (u32, u64) {
+    (line_of(fp.cl.proto, pc), ((fp as u64) - (c.frames as u64)) / size_of<Frame>())
+}
+
+fn line_of(p: Gc<Proto>, pc: *u32) -> u32 {
+    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
+    if i < p.lines.data.len { p.lines.data[i] } else { 0 }
+}
+
+/// Stop at `pc` in frame `fp` and let the front end decide how to go on.
+fn Dbg.stop(d: *Dbg, pc: *u32, fp: *Frame, reason: debug.Reason, id: u32) uses reenter {
+    lib.flush();
+    let c = d.c;
+    // Evaluations run nested above the stopped frame.
+    c.fp = fp;
+    d.at = Some(Stop { pc: pc, fp: fp, reason: reason, bp: id });
+    let front = d.front;
+    let r = front(d, d.data);
+    d.at = None;
+    d.refs.clear();
+    d.msg.clear();
+    let (line, depth) = where_at(c, pc, fp);
+    match r {
+        Continue => d.step.start(debug.Mode.Run, line, depth),
+        Step => d.step.start(debug.Mode.Step, line, depth),
+        Next => d.step.start(debug.Mode.Next, line, depth),
+        Finish => d.step.start(debug.Mode.Finish, line, depth),
+        Keep => {}
+    }
+    // A pause asked for while stopped is moot.
+    (&c.pause).atomic_store(0);
+}
+
+/// Ask the running program to stop (from any thread).
+pub fn pause(c: *Ctx) { debug.request_pause(&c.pause); }
+
+// ── inspecting a stop ───────────────────────────────────────────────────
+
+/// Frame `level` of the stop (0 the innermost) and where it is: the stop
+/// itself, or a caller at its CALL.
+pub fn Dbg.frame(d: *Dbg, level: u32) -> ?(*Frame, *u32) {
+    let Some(st) = d.at else { return None; };
+    var f = st.fp;
+    var at = st.pc;
+    var n: u32 = 0;
+    while n < level {
+        if f == d.c.frames { return None; }
+        f = f - 1;
+        at = f.resume - 1;
+        n += 1;
+    }
+    Some((f, at))
+}
+
+/// Frames at the stop.
+pub fn Dbg.depth(d: *Dbg) -> u32 {
+    let Some(st) = d.at else { return 0; };
+    (((st.fp as u64) - (d.c.frames as u64)) / size_of<Frame>() + 1) as u32
+}
+
+/// Frame `level`'s function name, chunk and line.
+pub fn Dbg.frame_info(d: *Dbg, level: u32) -> ?(str, str, u32) {
+    let Some((f, at)) = d.frame(level) else { return None; };
+    let p = f.cl.proto;
+    let name = if d.is_main(p) { "main chunk" } else { p.name.data };
+    Some((name, chunk_of(p), line_of(p, at)))
+}
+
+fn Dbg.is_main(d: *Dbg, p: Gc<Proto>) -> bool {
+    for i in 0..d.chunks.len {
+        if d.chunks.at(i).main == p { return true; }
+    }
+    false
+}
+
+/// The locals live at `at` in frame `f`, innermost scope last, without
+/// the compiler's hidden ones; then the upvalues of its closure.
+fn each_local(f: *Frame, at: *u32, visit: block fn(str, V)) {
+    let p = f.cl.proto;
+    let i = ((at as u64) - (p.code.start() as u64)) / 4;
+    let vars = locvars(p);
+    for j in 0..vars.len {
+        let v = vars[j];
+        if (v.start as u64) <= i and i < (v.end as u64) and v.name.len > 0 and v.name[0] != '(' {
+            visit(v.name, f.base[v.reg]);
+        }
+    }
+}
+
+fn each_upval(f: *Frame, visit: block fn(str, V)) {
+    let Some(info) = info_of(f.cl.proto) else { return; };
+    let ups = f.cl.upvals;
+    for j in 0..info.ups.len {
+        if j < ups.len { visit(info.ups.at(j), *ups[j].v); }
+    }
+}
+
+/// The handle for expanding `r` (0 for a value that has nothing to show).
+pub fn Dbg.ref_of(d: *Dbg, r: Ref) -> u32 { d.refs.add(r, same_ref) }
+
+/// The handle of a value's children: a table's entries (0 for others).
+pub fn Dbg.child_ref(d: *Dbg, v: V) -> u32 {
+    match v {
+        T(_) => d.ref_of(Ref { kind: RefKind.Value, level: 0, v: v }),
+        _ => 0,
+    }
+}
+
+/// One variable for the client: name and value as text, and the handle
+/// of its children (0 if none).
+pub type VarFn = fn(*u8, str, str, u32);
+
+/// Visit the variables of handle `id`, from number `start`, at most
+/// `count` (0: all): a frame's locals (upvalues last), the globals (not
+/// the library's), a table's entries (array part first, then the other
+/// keys, sorted). Returns how many there are in all; false (0) for a bad
+/// handle.
+pub fn Dbg.variables(d: *Dbg, id: u32, start: u32, count: u32, f: VarFn, ud: *u8) -> u32 {
+    let Some(r) = d.refs.get(id) else { return 0; };
+    // The values go on `vals` above what is there (the callback may ask
+    // for a table's entries in turn); names of locals in `names`.
+    let base = d.vals.len;
+    var names: mem.Vec<str> = mem.Vec.new();
+    match r.kind {
+        Locals => {
+            let Some((fr, at)) = d.frame(r.level) else { return 0; };
+            each_local(fr, at, |n, v| {
+                // An inner local hides an outer one of the same name.
+                var k: u64 = 0;
+                while k < names.len and !names.at(k).eq(n) { k += 1; }
+                if k < names.len { d.vals.set(base + k, v); } else { names.push(n); d.vals.push(v); }
+            });
+            each_upval(fr, |n, v| {
+                var k: u64 = 0;
+                while k < names.len and !names.at(k).eq(n) { k += 1; }
+                if k == names.len { names.push(n); d.vals.push(v); }
+            });
+        }
+        Globals => d.entries(d.c.globals, true),
+        Value => {
+            let T(t) = r.v else { return 0; };
+            d.entries(t, false);
+        }
+    }
+    // Table entries: the keys, then the values.
+    let keyed = match r.kind { Locals => false, _ => true };
+    let n = if keyed { (d.vals.len - base) / 2 } else { d.vals.len - base };
+    var name = text.StrBuf.new();
+    var shown = text.StrBuf.new();
+    var i = start as u64;
+    var k: u32 = 0;
+    while i < n and (count == 0 or k < count) {
+        name.clear();
+        var v = V.Nil;
+        if keyed {
+            v = d.vals.at(base + n + i);
+            key_name(&name, d.vals.at(base + i));
+        } else {
+            v = d.vals.at(base + i);
+            name.push_str(names.at(i));
+        }
+        shown.clear();
+        render(&shown, v);
+        let child = d.child_ref(v);
+        f(ud, name.as_str(), shown.as_str(), child);
+        k += 1;
+        i += 1;
+    }
+    name.free();
+    shown.free();
+    names.free();
+    d.vals.truncate(base);
+    n as u32
+}
+
+/// `t`'s entries into `vals`: the keys, then the values in the same
+/// order. Integer keys first, in order, then the others sorted by name.
+/// `globals`: leave out the library's.
+fn Dbg.entries(d: *Dbg, t: Gc<Table>, globals: bool) {
+    var keys: mem.Vec<V> = mem.Vec.new();
+    var kv: [V; 2] = [V.Nil, V.Nil];
+    var i = value.table_iter(t, 0, &kv[0]);
+    while i != 0 {
+        if !(globals and d.is_builtin(kv[0])) { keys.push(kv[0]); }
+        i = value.table_iter(t, i, &kv[0]);
+    }
+    var a = text.StrBuf.new();
+    var b = text.StrBuf.new();
+    keys.sort_by(|x, y| {
+        match (*x, *y) {
+            (Int(p), Int(q)) => if p < q { -1 } else if p > q { 1 } else { 0 },
+            (Int(_), _) => -1,
+            (_, Int(_)) => 1,
+            _ => {
+                a.clear();
+                b.clear();
+                key_name(&a, *x);
+                key_name(&b, *y);
+                mem.compare_bytes(a.as_str(), b.as_str())
+            }
+        }
+    });
+    a.free();
+    b.free();
+    for j in 0..keys.len { d.vals.push(keys.at(j)); }
+    for j in 0..keys.len { d.vals.push(value.table_get(t, keys.at(j))); }
+    keys.free();
+}
+
+fn Dbg.is_builtin(d: *Dbg, k: V) -> bool {
+    for i in 0..d.builtins.len {
+        if d.builtins.at(i) == k { return true; }
+    }
+    false
+}
+
+/// A table key as a variable name: a string as is, others in brackets.
+fn key_name(b: *text.StrBuf, k: V) {
+    match k {
+        S(s) => b.push_str(s.data),
+        _ => { b.push_str("["); render(b, k); b.push_str("]"); }
+    }
+}
+
+/// A value as the debugger shows it: strings quoted, tables (with their
+/// number of entries) and functions without their addresses, so that
+/// transcripts are deterministic.
+pub fn render(b: *text.StrBuf, v: V) {
+    match v {
+        S(s) => { b.push_str("\""); b.push_str(s.data); b.push_str("\""); }
+        T(t) => {
+            var n: i64 = 0;
+            var kv: [V; 2] = [V.Nil, V.Nil];
+            var i = value.table_iter(t, 0, &kv[0]);
+            while i != 0 {
+                n += 1;
+                i = value.table_iter(t, i, &kv[0]);
+            }
+            b.push_str("table (");
+            b.push_int(n);
+            b.push_str(if n == 1 { " entry)" } else { " entries)" });
+        }
+        F(cl) => { b.push_str("function '"); b.push_str(cl.proto.name.data); b.push_str("'"); }
+        Native(_) => b.push_str("builtin function"),
+        Co(_) => b.push_str(value.type_name(v)),
+        _ => value.write_value(b, v),
+    }
+}
+
+// ── evaluating expressions ──────────────────────────────────────────────
+
+/// Evaluate `src` in frame `level` of the stop: an expression, or (with
+/// `stmt`) a statement such as an assignment to a global.
+pub fn Dbg.eval(d: *Dbg, level: u32, src: str, stmt: bool) -> Result<V, V> uses reenter {
+    let Some((f, at)) = d.frame(level) else { return Err(V.S(value.new_str(&d.c.heap, "no frame"))); };
+    d.eval_at(f, at, src, stmt)
+}
+
+/// Evaluate `src` as if at `at` in frame `f`: compiled as the body of a
+/// function whose parameters are the locals and upvalues visible there
+/// (so assigning to them changes copies), and called with their values,
+/// nested above the stopped frame. Breakpoints and stepping are
+/// suspended meanwhile: the run neither stops nor disturbs the step-over
+/// in progress. An error comes back as Err.
+fn Dbg.eval_at(d: *Dbg, f: *Frame, at: *u32, src: str, stmt: bool) -> Result<V, V> uses reenter {
+    let c = d.c;
+    var names: mem.Vec<str> = mem.Vec.new();
+    var args: mem.Vec<V> = mem.Vec.new();
+    let add = |n: str, v: V, shadow: bool| {
+        var k: u64 = 0;
+        while k < names.len and !names.at(k).eq(n) { k += 1; }
+        if k < names.len {
+            if shadow { args.set(k, v); }
+        } else {
+            names.push(n);
+            args.push(v);
+        }
+    };
+    each_local(f, at, |n, v| add(n, v, true));
+    each_upval(f, |n, v| add(n, v, false));
+    var code = text.StrBuf.new();
+    var err = text.StrBuf.new();
+    var proto: ?Gc<Proto> = None;
+    var tries: u32 = if stmt { 2 } else { 1 };
+    var k: u32 = 0;
+    while k < tries and proto.is_none() {
+        code.clear();
+        code.push_str("return function(");
+        for i in 0..names.len {
+            if i > 0 { code.push_str(", "); }
+            code.push_str(names.at(i));
+        }
+        code.push_str(if k == 0 { ") return (" } else { ") " });
+        code.push_str(src);
+        // One line (errors say "line 1"), unless a comment would end it.
+        let nl = mem.find_bytes(src, "--").is_some();
+        code.push_str(if nl { "\n" } else { " " });
+        code.push_str(if k == 0 { ") end" } else { "end" });
+        // The error reported is the expression's.
+        var e2 = text.StrBuf.new();
+        the_registry().off = true;
+        proto = compile.try_compile(&c.heap, "=(eval)", code.as_str(), if k == 0 { &err } else { &e2 });
+        the_registry().off = false;
+        e2.free();
+        k += 1;
+    }
+    names.free();
+    code.free();
+    let Some(p) = proto else {
+        args.free();
+        let e = without_line1(c, err.as_str());
+        err.free();
+        return Err(e);
+    };
+    err.free();
+    // The arguments are roots while the chunk runs (it may collect).
+    let base = d.vals.len;
+    for i in 0..args.len { d.vals.push(args.at(i)); }
+    args.free();
+    d.bps.suspend();
+    let cl = value.new_closure(&c.heap, p);
+    var r = vm.call_value(c, V.F(cl), 0 as *V, 0);
+    if let Ok(g) = r {
+        r = vm.call_value(c, g, d.vals.ptr + base, d.vals.len - base);
+    }
+    d.bps.unsuspend();
+    d.vals.truncate(base);
+    // The error is reported, not raised: nothing will pass it on.
+    c.rethrow = V.Nil;
+    match r {
+        Err(S(m)) => Err(without_line1(c, m.data)),
+        _ => r,
+    }
+}
+
+/// An error message without "line 1: ", the line of the expression
+/// itself (an error from a function it called has that function's line).
+fn without_line1(c: *Ctx, m: str) -> V {
+    let p = "line 1: ";
+    if m.len >= p.len and m[..p.len].eq(p) { return V.S(value.new_str(&c.heap, m[p.len..])); }
+    V.S(value.new_str(&c.heap, m))
+}
+
+// ── the command line ────────────────────────────────────────────────────
+
+/// The command-line front end's state.
+struct Cli { input: debug.Input, file: str, src: str, out: text.StrBuf }
+
+/// `mini --debug FILE`: run FILE under the debugger.
+pub fn main() -> i32 uses gc {
+    let Some(path) = os.arg(2) else {
+        io.eprintln("usage: mini --debug <script>");
+        return 2;
+    };
+    let Some(src) = io.read_file(path) else {
+        io.eprint("cannot read ");
+        io.eprintln(path);
+        return 1;
+    };
+    var ctx = state.new_ctx(vm.no_host);
+    state.attach(&ctx);
+    var cli = Cli { input: debug.Input.stdin(), file: path, src: src, out: text.StrBuf.new() };
+    let d = attach(&ctx, cli_stop, &cli as *u8);
+    d.break_on_error = true;
+    var err = text.StrBuf.new();
+    let Some(proto) = d.load(path, src, &err) else {
+        io.eprintln(err.as_str());
+        return 1;
+    };
+    let main_closure = value.new_closure(&ctx.heap, proto);
+    // Stop before the first instruction. Its id is free again before the
+    // first command (the hit deletes it): the user's breakpoints count
+    // from 1.
+    d.break_at_entry(proto);
+    d.bps.next_id = d.entry;
+    let r = Mini.run(&ctx, main_closure);
+    lib.flush();
+    if let Err(e) = r {
+        var b = text.StrBuf.new();
+        b.push_str("error: ");
+        value.write_value(&b, e);
+        io.eprintln(b.as_str());
+        io.println("[program failed]");
+        return 1;
+    }
+    io.println("[program finished]");
+    0
+}
+
+fn Cli.flush(cl: *Cli) {
+    io.print(cl.out.as_str());
+    cl.out.clear();
+}
+
+/// Text of source line `n` (1-based).
+fn Cli.source_line(cl: *Cli, n: u32) -> str {
+    var line: u32 = 1;
+    for i in 0..cl.src.len {
+        if line == n {
+            var e = i;
+            while e < cl.src.len and cl.src[e] != '\n' { e += 1; }
+            return cl.src[i..e];
+        }
+        if cl.src[i] == '\n' { line += 1; }
+    }
+    ""
+}
+
+fn Cli.location(cl: *Cli, d: *Dbg, p: Gc<Proto>, line: u32) {
+    cl.out.push_str(debug.basename(cl.file));
+    cl.out.push_str(":");
+    cl.out.push_int(line as i64);
+    cl.out.push_str(" in ");
+    if d.is_main(p) { cl.out.push_str("main chunk"); } else { cl.out.push_str("function '"); cl.out.push_str(p.name.data); cl.out.push_str("'"); }
+}
+
+/// The command loop at a stop.
+fn cli_stop(d: *Dbg, data: *u8) -> Resume uses reenter {
+    let cl = data as *Cli;
+    let Some(st) = d.at else { return Resume.Continue; };
+    let (pc, fp) = (st.pc, st.fp);
+    let p = fp.cl.proto;
+    let line = line_of(p, pc);
+    // (A one-shot breakpoint is gone once hit.)
+    if st.reason == debug.Reason.Breakpoint and let Some(b) = d.bps.bp(st.bp) and !b.temp {
+        cl.out.push_str("breakpoint ");
+        cl.out.push_int(st.bp as i64);
+        cl.out.push_str(", ");
+    }
+    if d.msg.len() > 0 {
+        if st.reason == debug.Reason.Error { cl.out.push_str("error: "); }
+        cl.out.push_str(d.msg.as_str());
+        cl.out.push_str("\n");
+    }
+    cl.location(d, p, line);
+    cl.out.push_str("\n");
+    cl.out.push_int(line as i64);
+    cl.out.push_str("\t");
+    cl.out.push_str(cl.source_line(line));
+    cl.out.push_str("\n");
+    loop {
+        cl.out.push_str("(mdb) ");
+        cl.flush();
+        let Some(cmdline) = cl.input.read_line() else {
+            // End of the commands: detach and let the program finish.
+            if !cl.input.is_tty() { io.println(""); }
+            d.bps.clear_all();
+            return Resume.Continue;
+        };
+        if !cl.input.is_tty() {
+            cl.out.push_str(cmdline);
+            cl.out.push_str("\n");
+        }
+        match debug.parse_command(cmdline) {
+            Break(f, l) => cl.set_line_break(d, f, l, false, ""),
+            TBreak(f, l) => cl.set_line_break(d, f, l, true, ""),
+            BreakIf(f, l, cond) => cl.set_line_break(d, f, l, false, cond),
+            Delete(n) => {
+                if !d.bps.delete(n) { cl.out.push_str("no breakpoint "); cl.out.push_int(n as i64); cl.out.push_str("\n"); }
+            }
+            Info => cl.info(d),
+            Continue => { cl.flush(); return Resume.Continue; }
+            Step => { cl.flush(); return Resume.Step; }
+            Next => { cl.flush(); return Resume.Next; }
+            Finish => { cl.flush(); return Resume.Finish; }
+            Backtrace => cl.backtrace(d),
+            Locals => cl.locals(fp, pc, ""),
+            Print(e) => {
+                // A name: the local. Anything else: an expression.
+                if is_name(e) { cl.locals(fp, pc, e); } else {
+                    cl.out.push_str(e);
+                    match d.eval_at(fp, pc, e, false) {
+                        Ok(v) => { cl.out.push_str(" = "); show(&cl.out, v); }
+                        Err(m) => { cl.out.push_str(": error: "); value.write_value(&cl.out, m); }
+                    }
+                    cl.out.push_str("\n");
+                }
+            }
+            Op => {
+                let words = p.code.words();
+                Mini.disasm_insn(words, ((pc as u64) - (words.ptr as u64)) / 4, &cl.out);
+            }
+            Quit => { cl.flush(); lib.flush(); exit(0) }
+            Help => {
+                cl.out.push_str(debug.HELP);
+                cl.out.push_str("break LINE if COND  stop there when COND (a Mini expression) holds\n");
+            }
+            Empty => {}
+            Bad(msg) => { cl.out.push_str(msg); cl.out.push_str("\n"); }
+        }
+    }
+}
+
+/// `break [FILE:]LINE [if COND]`: a site at each instruction that starts
+/// a run of LINE's code, in every function.
+fn Cli.set_line_break(cl: *Cli, d: *Dbg, file: str, line: u32, temp: bool, cond: str) {
+    if file.len > 0 and !debug.basename(file).eq(debug.basename(cl.file)) {
+        cl.out.push_str("no source file named ");
+        cl.out.push_str(file);
+        cl.out.push_str("\n");
+        return;
+    }
+    let id = d.add_break(cl.file, line, temp);
+    let Some(b) = d.bps.bp(id) else { return; };
+    if b.nsites == 0 {
+        d.bps.delete(id);
+        d.bps.next_id = id;
+        for o in d.bps.list() {
+            if o.line == line {
+                cl.out.push_str("breakpoint ");
+                cl.out.push_int(o.id as i64);
+                cl.out.push_str(" is already at that line\n");
+                return;
+            }
+        }
+        cl.out.push_str("no code at line ");
+        cl.out.push_int(line as i64);
+        cl.out.push_str("\n");
+        return;
+    }
+    d.bps.set_condition(id, cond, debug.HitCond.always());
+    cl.out.push_str("breakpoint ");
+    cl.out.push_int(id as i64);
+    cl.out.push_str(" at ");
+    cl.out.push_str(debug.basename(cl.file));
+    cl.out.push_str(":");
+    cl.out.push_int(line as i64);
+    if cond.len > 0 { cl.out.push_str(" if "); cl.out.push_str(cond); }
+    cl.out.push_str("\n");
+}
+
+fn Cli.info(cl: *Cli, d: *Dbg) {
     let l = d.bps.list();
-    if l.len == 0 { d.out.push_str("no breakpoints\n"); return; }
+    if l.len == 0 { cl.out.push_str("no breakpoints\n"); return; }
     for i in 0..l.len {
         let b = l[i];
-        d.out.push_str("breakpoint ");
-        d.out.push_int(b.id as i64);
-        d.out.push_str(" at ");
-        d.out.push_str(debug.basename(b.file));
-        d.out.push_str(":");
-        d.out.push_int(b.line as i64);
-        d.out.push_str(", hit ");
-        d.out.push_int(b.hits as i64);
-        d.out.push_str(if b.hits == 1 { " time\n" } else { " times\n" });
+        cl.out.push_str("breakpoint ");
+        cl.out.push_int(b.id as i64);
+        cl.out.push_str(" at ");
+        cl.out.push_str(debug.basename(b.file));
+        cl.out.push_str(":");
+        cl.out.push_int(b.line as i64);
+        if b.cond.len > 0 { cl.out.push_str(" if "); cl.out.push_str(b.cond); }
+        cl.out.push_str(", hit ");
+        cl.out.push_int(b.hits as i64);
+        cl.out.push_str(if b.hits == 1 { " time\n" } else { " times\n" });
     }
 }
 
 /// Frames from the innermost: each function and the line it is at (a
 /// caller at its CALL).
-fn Dbg.backtrace(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame) {
-    var f = fp;
-    var at = pc;
-    var n: i64 = 0;
-    loop {
-        d.out.push_str("#");
-        d.out.push_int(n);
-        d.out.push_str(" ");
-        d.location(f.cl.proto, line_of(f.cl.proto, at));
-        d.out.push_str("\n");
-        if f == c.frames { break; }
-        f = f - 1;
-        at = f.resume - 1;
+fn Cli.backtrace(cl: *Cli, d: *Dbg) {
+    var n: u32 = 0;
+    while let Some((f, at)) = d.frame(n) {
+        cl.out.push_str("#");
+        cl.out.push_int(n as i64);
+        cl.out.push_str(" ");
+        cl.location(d, f.cl.proto, line_of(f.cl.proto, at));
+        cl.out.push_str("\n");
         n += 1;
     }
 }
 
 /// The locals live at `pc` in frame `fp` (only `name`'s if not empty),
 /// innermost scope last.
-fn Dbg.locals(d: *Dbg, fp: *Frame, pc: *u32, name: str) {
-    let p = fp.cl.proto;
-    let i = ((pc as u64) - (p.code.start() as u64)) / 4;
-    let vars = locvars(p);
+fn Cli.locals(cl: *Cli, fp: *Frame, pc: *u32, name: str) {
     var found = false;
-    for j in 0..vars.len {
-        let v = vars[j];
-        if (v.start as u64) <= i and i < (v.end as u64) and v.name.len > 0 and v.name[0] != '(' {
-            if name.len == 0 or v.name.eq(name) {
-                d.out.push_str(v.name);
-                d.out.push_str(" = ");
-                show(&d.out, fp.base[v.reg]);
-                d.out.push_str("\n");
-                found = true;
-            }
+    each_local(fp, pc, |n, v| {
+        if name.len == 0 or n.eq(name) {
+            cl.out.push_str(n);
+            cl.out.push_str(" = ");
+            show(&cl.out, v);
+            cl.out.push_str("\n");
+            found = true;
         }
-    }
+    });
     if !found {
-        if name.len == 0 { d.out.push_str("no locals\n"); } else { d.out.push_str("no local '"); d.out.push_str(name); d.out.push_str("'\n"); }
+        if name.len == 0 { cl.out.push_str("no locals\n"); } else { cl.out.push_str("no local '"); cl.out.push_str(name); cl.out.push_str("'\n"); }
     }
 }
 
-/// A value as the debugger shows it: strings quoted, tables and
+fn is_name(s: str) -> bool {
+    for i in 0..s.len {
+        if !(text.is_alpha(s[i]) or s[i] == '_' or (i > 0 and text.is_digit(s[i]))) { return false; }
+    }
+    s.len > 0
+}
+
+/// A value as the command line shows it: strings quoted, tables and
 /// functions without their addresses.
 fn show(b: *text.StrBuf, v: V) {
     match v {

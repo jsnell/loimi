@@ -1,0 +1,50 @@
+cond.mini:1 in main chunk
+1	local scale = 3
+(mdb) break 3 if item.n % 2 == 0 and scale > 2
+breakpoint 1 at cond.mini:3 if item.n % 2 == 0 and scale > 2
+(mdb) break 13 if nosuch.field
+breakpoint 2 at cond.mini:13 if nosuch.field
+(mdb) break 15 if
+usage: break [FILE:]LINE [if COND]
+(mdb) info
+breakpoint 1 at cond.mini:3 if item.n % 2 == 0 and scale > 2, hit 0 times
+breakpoint 2 at cond.mini:13 if nosuch.field, hit 0 times
+(mdb) continue
+breakpoint 2, error in condition `nosuch.field`: attempt to index a nil value
+cond.mini:13 in main chunk
+13	  sum = sum + weight(items[i])
+(mdb) delete 2
+(mdb) continue
+breakpoint 1, cond.mini:3 in function 'weight'
+3	  local w = item.n * scale
+(mdb) locals
+item = <table>
+(mdb) continue
+breakpoint 1, cond.mini:3 in function 'weight'
+3	  local w = item.n * scale
+(mdb) print item
+item = <table>
+(mdb) print item.n * scale
+item.n * scale = 12
+(mdb) print item.x.y
+item.x.y: error: attempt to index a nil value
+(mdb) print (
+(: error: unexpected symbol
+(mdb) continue
+breakpoint 1, cond.mini:3 in function 'weight'
+3	  local w = item.n * scale
+(mdb) info
+breakpoint 1 at cond.mini:3 if item.n % 2 == 0 and scale > 2, hit 6 times
+(mdb) delete 1
+(mdb) continue
+sum	63
+error: line 3: attempt to index a nil value
+cond.mini:3 in function 'weight'
+3	  local w = item.n * scale
+(mdb) bt
+#0 cond.mini:3 in function 'weight'
+#1 cond.mini:18 in main chunk
+(mdb) locals
+item = nil
+(mdb) continue
+[program failed]

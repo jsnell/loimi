@@ -1,0 +1,19 @@
+local scale = 3
+local function weight(item)
+  local w = item.n * scale
+  return w
+end
+
+local items = {}
+for i = 1, 6 do
+  items[i] = {n = i}
+end
+local sum = 0
+for i = 1, 6 do
+  sum = sum + weight(items[i])
+end
+print("sum", sum)
+items[4] = nil
+for i = 1, 6 do
+  sum = sum + weight(items[i])
+end
