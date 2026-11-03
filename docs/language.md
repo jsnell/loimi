@@ -785,7 +785,7 @@ payloads are as wide as their type says, so `Int(i48)` keeps 48 bits and
 
 | `repr` | Payloads | Tagged variants |
 |---|---|---|
-| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads. Beyond 7, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word). |
+| `nanbox` | integers up to 48 bits (`i48`, `u32`, ...), `bool`, pointers (48 bits: x86-64 and AArch64 user-space addresses) | Up to 7 with any payloads, and 8 if one has a payload of at most 47 bits (it takes the 47-bit block). Beyond that, the NaN space is divided by payload width: it holds seven 48-bit blocks and one 47-bit block, and each variant takes a block of 2^(payload bits) (a pointer or `i48` a whole 48-bit block, `i47` the 47-bit one, `u32` 2^32 words, a variant without payload one word). |
 | `lowtag` | integers up to 61 bits (`i61`), `bool`, pointers (8-byte aligned) | Up to 8 with any payloads. Beyond 8, pointers and 61-bit integers take one 3-bit tag each, and a variant with an N-bit payload can have a tag of up to 64 - N bits, so narrow variants share what is left. |
 | `boxed` | any number, `bool`, pointers | any number |
 

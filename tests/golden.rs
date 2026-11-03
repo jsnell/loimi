@@ -280,12 +280,13 @@ fn mini_jit_stencils() {
 }
 
 /// Re-entry (table.sort's comparator runs as a nested run of the
-/// interpreter) in the goto and switch dispatch modes: the sort scripts
-/// with a Mini built in each.
+/// interpreter) and coroutines (each resume is a nested run, each yield
+/// leaves one) in the goto and switch dispatch modes: the sort and
+/// coroutine scripts with a Mini built in each.
 #[test]
 fn mini_reentry_dispatch_modes() {
     for mode in ["--dispatch=goto", "--dispatch=switch"] {
-        mini_scripts_with(&[mode], &[], |name| name.starts_with("sort") || name.starts_with("err_sort"));
+        mini_scripts_with(&[mode], &[], |name| ["sort", "err_sort", "coroutine", "err_coroutine"].iter().any(|p| name.starts_with(p)));
     }
 }
 
@@ -324,7 +325,7 @@ fn aarch64_qemu() {
         s.spawn(|| {
             for mode in ["--dispatch=tailcall", "--dispatch=goto", "--dispatch=switch"] {
                 mini_scripts_with(&[mode], &env, |name| {
-                    ["sort", "err_sort", "gc", "lib_gc", "err_syntax", "closures", "tables", "arith_quicken"].iter().any(|p| name.starts_with(p))
+                    ["sort", "err_sort", "coroutine", "err_coroutine", "gc","lib_gc", "err_syntax", "closures", "tables", "arith_quicken"].iter().any(|p| name.starts_with(p))
                 });
             }
         });

@@ -1,0 +1,87 @@
+-- Coroutines: values both ways through resume/yield, wrap generators,
+-- yield from nested calls, errors, running/status/isyieldable, yield
+-- across a table.sort comparator (an error), upvalues and close.
+local co = coroutine.create(function(a, b)
+  print("start", a, b)
+  local c, d = coroutine.yield(a + b)
+  print("got", c, d)
+  local e = coroutine.yield(c * d)
+  print("got2", e)
+  return "done", 42
+end)
+print(type(co), coroutine.status(co))
+local ok, v = coroutine.resume(co, 1, 2)
+print(ok, v, coroutine.status(co))
+ok, v = coroutine.resume(co, 3, 4)
+print(ok, v)
+local ok2, r1, r2 = coroutine.resume(co, "x")
+print(ok2, r1, r2, coroutine.status(co))
+ok, v = coroutine.resume(co)
+print(ok, v)
+-- generator
+local function gen(n)
+  return coroutine.wrap(function()
+    for i = 1, n do coroutine.yield(i) end
+  end)
+end
+local s = 0
+local g = gen(10)
+for i = 1, 10 do s = s + g() end
+print("sum", s)
+-- nested calls yield
+local function deep(n) if n == 0 then coroutine.yield("bottom") return 0 end return 1 + deep(n - 1) end
+local co2 = coroutine.create(function() return deep(500) end)
+ok, v = coroutine.resume(co2)
+print(ok, v)
+ok, v = coroutine.resume(co2)
+print(ok, v)
+-- errors
+local co3 = coroutine.create(function() local x = nil; return x.y end)
+ok, v = coroutine.resume(co3)
+print(ok, v, coroutine.status(co3))
+local w = coroutine.wrap(function() error("boom") end)
+-- running
+local m, ismain = coroutine.running()
+print(type(m), ismain, coroutine.isyieldable())
+local co4 = coroutine.create(function()
+  local r, im = coroutine.running()
+  print(coroutine.status(r), im, coroutine.isyieldable(), coroutine.status(m))
+end)
+coroutine.resume(co4)
+-- yield across sort
+local co5 = coroutine.create(function()
+  local t = {3, 1, 2}
+  table.sort(t, function(a, b) coroutine.yield() return a < b end)
+end)
+ok, v = coroutine.resume(co5)
+print(ok, v)
+local ok6, e6 = coroutine.resume(coroutine.running())
+print(ok6, e6)
+ok6, e6 = coroutine.resume(co5)
+print(ok6, e6)
+-- upvalues shared across coroutine
+local get
+local co7 = coroutine.create(function() local x = 10; get = function() return x end; coroutine.yield(); x = 20; coroutine.yield() end)
+coroutine.resume(co7) print(get()) coroutine.resume(co7) print(get())
+print(coroutine.close(co7), coroutine.status(co7), get())
+
+-- expect: thread	suspended
+-- expect: start	1	2
+-- expect: true	3	suspended
+-- expect: got	3	4
+-- expect: true	12
+-- expect: got2	x
+-- expect: true	done	42	dead
+-- expect: false	cannot resume dead coroutine
+-- expect: sum	55
+-- expect: true	bottom
+-- expect: true	500
+-- expect: false	line 39: attempt to index a nil value	dead
+-- expect: thread	true	false
+-- expect: running	false	true	normal
+-- expect: false	line 54: attempt to yield across a C-call boundary
+-- expect: false	cannot resume non-suspended coroutine
+-- expect: false	cannot resume dead coroutine
+-- expect: 10
+-- expect: 20
+-- expect: true	dead	20

@@ -1,0 +1,11 @@
+-- An error in a wrap function's coroutine propagates to the caller, with
+-- the caller's line in front (as Lua 5.4 adds its position).
+local w = coroutine.wrap(function(a)
+  coroutine.yield(a)
+  error("boom")
+end)
+print(w(1))
+w()
+-- expect: 1
+-- expect-exit: 1
+-- expect-stderr: line 8: line 5: boom

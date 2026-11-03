@@ -137,6 +137,27 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
                 variants[i].shift = 48;
             }
         }
+        // Eight: the classic layout for seven of them, in declaration
+        // order, and the start of the 47-bit block for the narrowest (the
+        // last of that width). So adding an eighth variant keeps every
+        // other variant's 48-bit block: tuple tests that mix pointers with
+        // an i32 still merge into one test (the packed layout would give
+        // an i32 a 32-bit block).
+        ValueRepr::NanBox if tagged.len() == 8 && tagged.iter().any(|t| t.1 <= 47) => {
+            let half = tagged.iter().rev().min_by_key(|t| t.1).unwrap().0;
+            let mut k = 0;
+            for &(i, w) in &tagged {
+                if i == half {
+                    variants[i].tag = NAN_HALF_BLOCK >> w;
+                    variants[i].shift = w;
+                } else {
+                    variants[i].tag = NAN_TAG_BASE + k;
+                    variants[i].shift = 48;
+                    k += 1;
+                }
+            }
+            num_limit = NAN_HALF_BLOCK;
+        }
         ValueRepr::NanBox => {
             let mut need = tagged.clone();
             need.sort_by_key(|&(_, w)| std::cmp::Reverse(w));

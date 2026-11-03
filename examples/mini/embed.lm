@@ -46,6 +46,7 @@ import vm.{Mini, Ctx};
 import vm;
 import compile;
 import state;
+import coro;
 
 extern "C" fn strlen(s: *u8) -> u64;
 
@@ -142,8 +143,8 @@ fn type_of(v: V) -> MiniType {
         Int(_) | Num(_) => MiniType.Number,
         S(_) => MiniType.String,
         T(_) => MiniType.Table,
-        F(_) | Native(_) | Wrap(_) => MiniType.Function,
-        Co(_) => MiniType.Thread,
+        F(_) | Native(_) => MiniType.Function,
+        Co(c) => if coro.is_wrap(c) { MiniType.Function } else { MiniType.Thread },
     }
 }
 

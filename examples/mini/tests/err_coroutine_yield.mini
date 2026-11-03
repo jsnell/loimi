@@ -1,0 +1,6 @@
+-- Yielding outside a coroutine is an error.
+print("before")
+coroutine.yield(1)
+-- expect: before
+-- expect-exit: 1
+-- expect-stderr: attempt to yield from outside a coroutine

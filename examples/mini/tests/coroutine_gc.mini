@@ -1,0 +1,104 @@
+-- Coroutines and the collector: many suspended coroutines, garbage
+-- generators, an open upvalue keeping a dropped coroutine's stack alive,
+-- stack growth with open upvalues, resume chains, nesting limits.
+-- GC and stack growth
+local getters = {}
+local cos = {}
+for i = 1, 200 do
+  local co = coroutine.create(function(n)
+    local x = {n}
+    getters[#getters + 1] = function() return x[1] end
+    local function rec(d)
+      if d == 0 then
+        local s = "s" .. n
+        coroutine.yield(s)
+        return 1
+      end
+      local t = {d}
+      return t[1] - d + 1 + rec(d - 1)
+    end
+    local r = rec(n % 50 + 1)
+    x[1] = x[1] + 1000
+    coroutine.yield(r)
+    return "end" .. n
+  end)
+  cos[i] = co
+  local ok, v = coroutine.resume(co, i)
+  assert(ok and v == "s" .. i)
+end
+local total = 0
+for i = 1, 200 do
+  local ok, v = coroutine.resume(cos[i])
+  assert(ok, v)
+  total = total + v
+  if i % 2 == 0 then cos[i] = nil end
+end
+print("total", total)
+local acc = 0
+for i = 1, 200 do acc = acc + getters[i]() end
+print("getters", acc)
+-- garbage generators
+local s = 0
+for k = 1, 300 do
+  local g = coroutine.wrap(function(a)
+    local t = {}
+    for i = 1, 20 do t[i] = {i}; coroutine.yield(t[i][1] + a) end
+  end)
+  for i = 1, 20 do s = s + g(k) end
+end
+print("gen", s)
+-- open upvalue keeps a dropped coroutine's stack alive
+local f
+do
+  local co = coroutine.create(function() local v = {"alive"}; f = function() return v[1] end; coroutine.yield() end)
+  coroutine.resume(co)
+end
+local junk = {}
+for i = 1, 10000 do junk[i % 100 + 1] = {i} end
+print(f())
+-- deep recursion in a coroutine (stack growth), with upvalues across growth
+local co = coroutine.create(function()
+  local up = 1
+  local function inc() up = up + 1 end
+  local function d(n) if n == 0 then inc() return 0 end local r = d(n - 1) return r + 1 end
+  local r = d(9000)
+  coroutine.yield(r, up)
+  return up
+end)
+local ok, a, b = coroutine.resume(co)
+print(ok, a, b)
+local okr, upr = coroutine.resume(co)
+print(okr, upr)
+-- coroutines resuming coroutines
+local function chain(n)
+  if n == 0 then return coroutine.yield("leaf") end
+  local c = coroutine.create(chain)
+  local ok, v = coroutine.resume(c, n - 1)
+  local r = coroutine.yield(v .. n)
+  local ok2, v2 = coroutine.resume(c, r)
+  return v2
+end
+local c = coroutine.create(chain)
+local o1, v1 = coroutine.resume(c, 50)
+print(o1, v1)
+local o2, v2 = coroutine.resume(c, "back")
+print(o2, v2)
+-- too deep nesting
+local function nest(n)
+  local c = coroutine.wrap(function() return nest(n + 1) end)
+  return c()
+end
+local co9 = coroutine.create(function() return nest(0) end)
+local ok9, e9 = coroutine.resume(co9)
+print(ok9, string.sub(e9, -16))
+
+-- Same output as Lua 5.4.
+-- expect: total	5300
+-- expect: getters	220100
+-- expect: gen	966000
+-- expect: alive
+-- expect: true	9000	2
+-- expect: true	2
+-- expect: true	leaf1234567891011121314151617181920212223242526272829303132333435363738394041424344454647484950
+-- expect: true	back
+-- expect: false	C stack overflow

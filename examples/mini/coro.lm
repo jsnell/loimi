@@ -42,6 +42,17 @@ pub object Coro {
     ynres: u32,
     /// The error that killed it, until coroutine.close reports it.
     err: V,
+    /// Set in the function that coroutine.wrap returns (a Coro of its own,
+    /// so that it is not the thread that coroutine.running returns): the
+    /// coroutine it resumes.
+    wrap: ?Gc<Coro>,
+}
+
+pub fn is_wrap(co: Gc<Coro>) -> bool {
+    match co.wrap {
+        Some(_) => true,
+        None => false,
+    }
 }
 
 /// The state of a thread that resumed another, on `resume`'s C stack and
@@ -136,7 +147,7 @@ fn two(c: *Ctx, a: V, b: V) -> Result<V, V> {
 
 fn check_co(c: *Ctx, args: *V, n: u64, name: str) -> Result<Gc<Coro>, V> {
     if n > 0 {
-        if let Co(co) = args[0] { return Ok(co); }
+        if let Co(co) = args[0] and !is_wrap(co) { return Ok(co); }
     }
     Err(bad_arg(c, 0, name, "coroutine"))
 }
@@ -145,11 +156,13 @@ pub fn call(c: *Ctx, id: i32, args: *V, n: u64, from_vm: bool) -> Result<V, V> u
     if id == CREATE or id == WRAP {
         let f = if n > 0 { args[0] } else { V.Nil };
         match f {
-            F(_) | Native(_) | Wrap(_) => {}
+            F(_) | Native(_) => {}
+            Co(w) if is_wrap(w) => {}
             _ => return Err(bad_arg(c, 0, if id == CREATE { "create" } else { "wrap" }, "function")),
         }
         let co = new(&c.heap, Coro { status: SUSPENDED, started: false, body: f, err: V.Nil, ..zero });
-        return Ok(if id == CREATE { V.Co(co) } else { V.Wrap(co) });
+        if id == CREATE { return Ok(V.Co(co)); }
+        return Ok(V.Co(new(&c.heap, Coro { status: DEAD, started: true, body: V.Nil, err: V.Nil, wrap: Some(co), ..zero })));
     }
     if id == RESUME {
         let co = check_co(c, args, n, "resume")?;

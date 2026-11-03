@@ -16,6 +16,7 @@ import std.hash;
 import std.text;
 import value;
 import value.{V, Str, Table};
+import coro;
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 extern "C" fn printf(fmt: *u8, ...) -> i32;
@@ -750,7 +751,8 @@ pub fn sort(h: *gc.Heap, args: *V, n: u64, less: block fn(V, V) -> Result<bool, 
     let len = value.table_len(t);
     if len > 1 {
         match arg(args, n, 1) {
-            Nil | F(_) | Native(_) | Wrap(_) => {}
+            Nil | F(_) | Native(_) => {}
+            Co(c) if coro.is_wrap(c) => {}
             _ => return Err(type_error(h, args, n, 1, "sort", "function")),
         }
         auxsort(h, t, 1, len, 0, less)?;

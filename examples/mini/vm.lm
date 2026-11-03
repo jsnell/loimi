@@ -338,7 +338,8 @@ pub fn call_value(c: *Ctx, f: V, args: *V, n: u64) -> Result<V, V> uses reenter 
             c.nret = NRET_ONE;
             return r;
         }
-        Wrap(co) => {
+        Co(w) if coro.is_wrap(w) => {
+            let Some(co) = w.wrap else { unreachable };
             let r = coro.resume(c, co, args, n, true);
             c.nret = NRET_ONE;
             return r;
@@ -902,7 +903,7 @@ pub vm Mini {
         inline for (opname, want) in [(name, true), (nname, false)] {
             op #opname(unused: imm, a: reg, b: bkind) : ABC then JMP {
                 let (x, y) = ((a as u64) ^ value.int_bias(), (b as u64) ^ value.int_bias());
-                if (x | y) < (1 << 48) { branch((isub) == want, then.target) }
+                if (x | y) < (1 << 32) { branch((isub) == want, then.target) }
                 if let (Num(x), Num(y)) = (a, b) { branch((fsub) == want, then.target) }
                 cold { branch(slow? == want, then.target) }
             }
@@ -1080,7 +1081,7 @@ pub vm Mini {
                 native_results(base as u64, nres as u64, v)
             }
         }
-        if let Wrap(co) = f {
+        if let Co(w) = f and let Some(co) = w.wrap {
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = coro.resume(ctx, co, regs + base + 1, nargs as u64, true)?;
