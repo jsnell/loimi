@@ -1,0 +1,8 @@
+# Reference Python interpreters and benchmark sources. Built/fetched by
+# install.sh into bench/python/install/ and bench/python/src/ (gitignored).
+# Committed: this manifest, the scripts, README.md and programs/.
+#
+# name           version  url                                                                                              sha256
+cpython          3.13.18  https://www.python.org/ftp/python/3.13.18/Python-3.13.18.tar.xz                                  abb0102e6d4ae027509bcb82327d9dd85515b44a3ba8ad538cfc5e9847029f68
+micropython      1.29.0   https://github.com/micropython/micropython/releases/download/v1.29.0/micropython-1.29.0.tar.xz  d925a7c664e79a2bdf3dfcb285ba5e2237041cc35a0bd4ee573b6c5711efeca0
+pyperformance    1.14.0   https://github.com/python/pyperformance/archive/refs/tags/1.14.0.tar.gz                          2eb90812292522297bb046e589e0876c00ec5b5f49e8653eca39f8fd942840ed

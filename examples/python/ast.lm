@@ -1,0 +1,100 @@
+// Syntax tree of the Python subset. Everything lives in one arena.
+import std.mem;
+
+pub enum BinOp { Add, Sub, Mul, Div, FloorDiv, Mod, Pow, LShift, RShift, BitAnd, BitOr, BitXor, MatMul }
+pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, In, NotIn, Is, IsNot }
+pub enum UnOp { Neg, Pos, Not, Invert }
+
+pub type Exprs = *mem.Vec<*Expr>;
+pub type Body = *mem.Vec<*Stmt>;
+
+/// A call argument: positional (`name` None, star 0), keyword, `*x` (1) or `**x` (2).
+pub struct Arg { name: ?str, value: *Expr, star: u8 }
+pub struct Comp { target: *Expr, iter: *Expr, ifs: Exprs }
+/// One piece of an f-string: literal text, or a replacement field.
+pub struct FPart { lit: str, expr: ?*Expr, conv: u8, spec: ?*Expr }
+
+pub enum E {
+    Name(str),
+    Int(i64),
+    Big(str, i64),
+    Float(f64),
+    Str(str),
+    Bool(bool),
+    NoneE,
+    Ellipsis,
+    FStr(*mem.Vec<FPart>),
+    Bin(BinOp, *Expr, *Expr),
+    Un(UnOp, *Expr),
+    And(*Expr, *Expr),
+    Or(*Expr, *Expr),
+    Cmp(*Expr, *mem.Vec<CmpOp>, Exprs),
+    Call(*Expr, *mem.Vec<Arg>),
+    Attr(*Expr, str),
+    Index(*Expr, *Expr),
+    Slice(?*Expr, ?*Expr, ?*Expr),
+    List(Exprs),
+    Tuple(Exprs),
+    Set(Exprs),
+    Dict(Exprs, Exprs),
+    IfExp(*Expr, *Expr, *Expr),
+    Lambda(*FuncDef),
+    ListComp(*Expr, *mem.Vec<Comp>),
+    SetComp(*Expr, *mem.Vec<Comp>),
+    DictComp(*Expr, *Expr, *mem.Vec<Comp>),
+    /// A generator expression; the parser wraps it in a FuncDef.
+    GenExp(*FuncDef, *Expr),
+    Starred(*Expr),
+    Yield(?*Expr),
+    YieldFrom(*Expr),
+    Walrus(str, *Expr),
+}
+
+pub struct Expr { e: E, line: u32 }
+
+/// kind: 0 positional, 1 `*args`, 2 `**kwargs`, 3 keyword-only.
+pub struct Param { name: str, default: ?*Expr, kind: u8 }
+
+pub struct FuncDef {
+    name: str,
+    params: *mem.Vec<Param>,
+    body: Body,
+    decorators: Exprs,
+    is_lambda: bool,
+    /// For a generator expression: the comprehension it iterates.
+    genexp: ?*Expr,
+    gencomps: ?*mem.Vec<Comp>,
+    line: u32,
+}
+
+pub struct ClassDef { name: str, bases: Exprs, body: Body, decorators: Exprs, line: u32 }
+pub struct Handler { typ: ?*Expr, name: ?str, body: Body, line: u32 }
+pub struct TryS { body: Body, handlers: *mem.Vec<Handler>, orelse: Body, finalbody: Body }
+pub struct WithItem { ctx: *Expr, target: ?*Expr }
+
+pub enum S {
+    ExprS(*Expr),
+    Assign(Exprs, *Expr),
+    AugAssign(BinOp, *Expr, *Expr),
+    AnnAssign(*Expr, ?*Expr),
+    If(*Expr, Body, Body),
+    While(*Expr, Body, Body),
+    For(*Expr, *Expr, Body, Body),
+    Def(*FuncDef),
+    Class(*ClassDef),
+    Return(?*Expr),
+    Pass,
+    Break,
+    Continue,
+    Global(*mem.Vec<str>),
+    Nonlocal(*mem.Vec<str>),
+    Del(Exprs),
+    Raise(?*Expr, ?*Expr),
+    Try(*TryS),
+    With(*mem.Vec<WithItem>, Body),
+    Assert(*Expr, ?*Expr),
+    Import(str, ?str),
+    ImportFrom(str, *mem.Vec<str>, *mem.Vec<str>),
+}
+
+pub struct Stmt { s: S, line: u32 }

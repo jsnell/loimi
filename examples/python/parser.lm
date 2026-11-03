@@ -1,0 +1,913 @@
+// Recursive-descent parser for the Python subset.
+import std.mem;
+import std.text;
+import lexer;
+import lexer.{T, Token, Lexer};
+import ast;
+import ast.{E, Expr, S, Stmt, Exprs, Body, BinOp, CmpOp, UnOp, Arg, Comp, FPart, Param, FuncDef, ClassDef, Handler, TryS, WithItem};
+
+pub struct P {
+    toks: []Token,
+    i: u64,
+    arena: *mem.Arena,
+    err: ?str,
+    err_line: u32,
+    genexps: u64,
+}
+
+pub fn P.new(toks: []Token, arena: *mem.Arena) -> P {
+    P { toks: toks, i: 0, arena: arena, err: None, err_line: 0, genexps: 0 }
+}
+
+fn P.ok(p: *P) -> bool { p.err.is_none() }
+fn P.peek(p: *P) -> T { p.toks[p.i].kind }
+fn P.peek2(p: *P) -> T { if p.i + 1 < p.toks.len { p.toks[p.i + 1].kind } else { T.Eof } }
+fn P.tok(p: *P) -> Token { p.toks[p.i] }
+fn P.line(p: *P) -> u32 { p.toks[p.i].line }
+fn P.bump(p: *P) -> Token {
+    let t = p.toks[p.i];
+    if t.kind != T.Eof { p.i += 1; }
+    t
+}
+fn P.at(p: *P, k: T) -> bool { p.toks[p.i].kind == k }
+fn P.eat(p: *P, k: T) -> bool {
+    if p.at(k) { p.bump(); return true; }
+    false
+}
+fn P.fail(p: *P, msg: str) {
+    if p.err.is_none() { p.err = Some(msg); p.err_line = p.line(); }
+    // Stop consuming: jump to the end.
+    p.i = p.toks.len - 1;
+}
+fn P.expect(p: *P, k: T, msg: str) {
+    if !p.eat(k) { p.fail(msg); }
+}
+
+fn P.mk(p: *P, e: E, line: u32) -> *Expr { new(p.arena, Expr { e: e, line: line }) }
+fn P.st(p: *P, s: S, line: u32) -> *Stmt { new(p.arena, Stmt { s: s, line: line }) }
+fn P.exprs(p: *P) -> Exprs { new(p.arena, mem.Vec.new()) }
+fn P.body(p: *P) -> Body { new(p.arena, mem.Vec.new()) }
+
+pub fn P.file(p: *P) -> Body {
+    let b = p.body();
+    while p.ok() and !p.at(T.Eof) {
+        if p.eat(T.Newline) { continue; }
+        p.statement(b);
+    }
+    b
+}
+
+/// Parse one statement (or a line of simple statements) into `out`.
+fn P.statement(p: *P, out: Body) {
+    let line = p.line();
+    match p.peek() {
+        If => { out.push(p.if_stmt()); return; }
+        While => {
+            p.bump();
+            let c = p.named_test();
+            let b = p.block();
+            var e = p.body();
+            if p.eat(T.Else) { e = p.block(); }
+            out.push(p.st(S.While(c, b, e), line));
+            return;
+        }
+        For => {
+            p.bump();
+            let t = p.target_list();
+            p.expect(T.In, "expected 'in'");
+            let it = p.testlist();
+            let b = p.block();
+            var e = p.body();
+            if p.eat(T.Else) { e = p.block(); }
+            out.push(p.st(S.For(t, it, b, e), line));
+            return;
+        }
+        Def => { out.push(p.st(S.Def(p.funcdef(p.exprs())), line)); return; }
+        Class => { out.push(p.st(S.Class(p.classdef(p.exprs())), line)); return; }
+        At => {
+            let decs = p.exprs();
+            while p.eat(T.At) {
+                decs.push(p.test());
+                p.expect(T.Newline, "expected newline after decorator");
+            }
+            if p.at(T.Def) { out.push(p.st(S.Def(p.funcdef(decs)), line)); }
+            else if p.at(T.Class) { out.push(p.st(S.Class(p.classdef(decs)), line)); }
+            else { p.fail("expected def or class after decorator"); }
+            return;
+        }
+        Try => { out.push(p.try_stmt()); return; }
+        With => {
+            p.bump();
+            let items: *mem.Vec<WithItem> = new(p.arena, mem.Vec.new());
+            loop {
+                let c = p.test();
+                var v: ?*Expr = None;
+                if p.eat(T.As) { v = Some(p.target()); }
+                items.push(WithItem { ctx: c, target: v });
+                if !p.eat(T.Comma) { break; }
+            }
+            let b = p.block();
+            out.push(p.st(S.With(items, b), line));
+            return;
+        }
+        _ => {}
+    }
+    loop {
+        out.push(p.simple());
+        if !p.eat(T.Semi) { break; }
+        if p.at(T.Newline) { break; }
+    }
+    if !p.eat(T.Newline) and !p.at(T.Eof) { p.fail("invalid syntax"); }
+}
+
+fn P.if_stmt(p: *P) -> *Stmt {
+    let line = p.line();
+    p.bump(); // if / elif
+    let c = p.named_test();
+    let b = p.block();
+    var e = p.body();
+    if p.at(T.Elif) { e.push(p.if_stmt()); }
+    else if p.eat(T.Else) { e = p.block(); }
+    p.st(S.If(c, b, e), line)
+}
+
+fn P.try_stmt(p: *P) -> *Stmt {
+    let line = p.line();
+    p.bump();
+    let body = p.block();
+    let hs: *mem.Vec<Handler> = new(p.arena, mem.Vec.new());
+    while p.at(T.Except) {
+        let hl = p.line();
+        p.bump();
+        var typ: ?*Expr = None;
+        var name: ?str = None;
+        if !p.at(T.Colon) {
+            typ = Some(p.test());
+            if p.eat(T.As) {
+                let t = p.bump();
+                if t.kind != T.Name { p.fail("expected name after 'as'"); }
+                name = Some(t.s);
+            }
+        }
+        let hb = p.block();
+        hs.push(Handler { typ: typ, name: name, body: hb, line: hl });
+    }
+    var orelse = p.body();
+    if p.eat(T.Else) { orelse = p.block(); }
+    var fin = p.body();
+    if p.eat(T.Finally) { fin = p.block(); }
+    if hs.len == 0 and fin.len == 0 { p.fail("expected 'except' or 'finally' block"); }
+    p.st(S.Try(new(p.arena, TryS { body: body, handlers: hs, orelse: orelse, finalbody: fin })), line)
+}
+
+fn P.block(p: *P) -> Body {
+    p.expect(T.Colon, "expected ':'");
+    let b = p.body();
+    if p.eat(T.Newline) {
+        p.expect(T.Indent, "expected an indented block");
+        while p.ok() and !p.at(T.Dedent) and !p.at(T.Eof) {
+            if p.eat(T.Newline) { continue; }
+            p.statement(b);
+        }
+        p.eat(T.Dedent);
+    } else {
+        loop {
+            b.push(p.simple());
+            if !p.eat(T.Semi) { break; }
+            if p.at(T.Newline) { break; }
+        }
+        if !p.eat(T.Newline) and !p.at(T.Eof) { p.fail("invalid syntax"); }
+    }
+    b
+}
+
+fn P.name(p: *P) -> str {
+    let t = p.bump();
+    if t.kind != T.Name { p.fail("expected a name"); return "_"; }
+    t.s
+}
+
+fn P.params(p: *P, close: T) -> *mem.Vec<Param> {
+    let ps: *mem.Vec<Param> = new(p.arena, mem.Vec.new());
+    var kwonly = false;
+    while p.ok() and !p.at(close) {
+        if p.eat(T.Star) {
+            if p.at(T.Comma) { kwonly = true; }
+            else { ps.push(Param { name: p.name(), default: None, kind: 1 }); kwonly = true; if p.eat(T.Colon) { p.test(); } }
+        } else if p.eat(T.DStar) {
+            ps.push(Param { name: p.name(), default: None, kind: 2 });
+            if p.eat(T.Colon) { p.test(); }
+        } else if p.eat(T.Slash) {
+            // positional-only marker: ignore
+        } else {
+            let n = p.name();
+            if close == T.RParen and p.eat(T.Colon) { p.test(); }
+            var d: ?*Expr = None;
+            if p.eat(T.Assign) { d = Some(p.test()); }
+            ps.push(Param { name: n, default: d, kind: if kwonly { 3 } else { 0 } });
+        }
+        if !p.eat(T.Comma) { break; }
+    }
+    ps
+}
+
+fn P.funcdef(p: *P, decs: Exprs) -> *FuncDef {
+    let line = p.line();
+    p.expect(T.Def, "expected 'def'");
+    let name = p.name();
+    p.expect(T.LParen, "expected '('");
+    let ps = p.params(T.RParen);
+    p.expect(T.RParen, "expected ')'");
+    if p.eat(T.Arrow) { p.test(); }
+    let body = p.block();
+    new(p.arena, FuncDef { name: name, params: ps, body: body, decorators: decs, is_lambda: false,
+                           genexp: None, gencomps: None, line: line })
+}
+
+fn P.classdef(p: *P, decs: Exprs) -> *ClassDef {
+    let line = p.line();
+    p.expect(T.Class, "expected 'class'");
+    let name = p.name();
+    let bases = p.exprs();
+    if p.eat(T.LParen) {
+        while p.ok() and !p.at(T.RParen) {
+            if p.at(T.Name) and p.peek2() == T.Assign {
+                // metaclass=... and other keywords: not supported
+                p.fail("class keyword arguments are not supported");
+            }
+            bases.push(p.test());
+            if !p.eat(T.Comma) { break; }
+        }
+        p.expect(T.RParen, "expected ')'");
+    }
+    let body = p.block();
+    new(p.arena, ClassDef { name: name, bases: bases, body: body, decorators: decs, line: line })
+}
+
+fn aug_op(k: T) -> ?BinOp {
+    match k {
+        PlusEq => Some(BinOp.Add), MinusEq => Some(BinOp.Sub), StarEq => Some(BinOp.Mul),
+        SlashEq => Some(BinOp.Div), DSlashEq => Some(BinOp.FloorDiv), PercentEq => Some(BinOp.Mod),
+        DStarEq => Some(BinOp.Pow), ShlEq => Some(BinOp.LShift), ShrEq => Some(BinOp.RShift),
+        AmpEq => Some(BinOp.BitAnd), PipeEq => Some(BinOp.BitOr), CaretEq => Some(BinOp.BitXor),
+        AtEq => Some(BinOp.MatMul),
+        _ => None,
+    }
+}
+
+fn P.simple(p: *P) -> *Stmt {
+    let line = p.line();
+    match p.peek() {
+        Pass => { p.bump(); return p.st(S.Pass, line); }
+        Break => { p.bump(); return p.st(S.Break, line); }
+        Continue => { p.bump(); return p.st(S.Continue, line); }
+        Return => {
+            p.bump();
+            if p.at(T.Newline) or p.at(T.Semi) or p.at(T.Eof) { return p.st(S.Return(None), line); }
+            return p.st(S.Return(Some(p.testlist_star())), line);
+        }
+        Global | Nonlocal => {
+            let k = p.bump().kind;
+            let names: *mem.Vec<str> = new(p.arena, mem.Vec.new());
+            loop { names.push(p.name()); if !p.eat(T.Comma) { break; } }
+            return p.st(if k == T.Global { S.Global(names) } else { S.Nonlocal(names) }, line);
+        }
+        Del => {
+            p.bump();
+            let ts = p.exprs();
+            loop { ts.push(p.target()); if !p.eat(T.Comma) { break; } if p.at(T.Newline) { break; } }
+            return p.st(S.Del(ts), line);
+        }
+        Raise => {
+            p.bump();
+            if p.at(T.Newline) or p.at(T.Semi) { return p.st(S.Raise(None, None), line); }
+            let e = p.test();
+            var cause: ?*Expr = None;
+            if p.eat(T.From) { cause = Some(p.test()); }
+            return p.st(S.Raise(Some(e), cause), line);
+        }
+        Assert => {
+            p.bump();
+            let c = p.test();
+            var m: ?*Expr = None;
+            if p.eat(T.Comma) { m = Some(p.test()); }
+            return p.st(S.Assert(c, m), line);
+        }
+        Import => {
+            p.bump();
+            let n = p.dotted();
+            var alias: ?str = None;
+            if p.eat(T.As) { alias = Some(p.name()); }
+            if p.at(T.Comma) { p.fail("import one module per statement"); }
+            return p.st(S.Import(n, alias), line);
+        }
+        From => {
+            p.bump();
+            let m = p.dotted();
+            p.expect(T.Import, "expected 'import'");
+            let names: *mem.Vec<str> = new(p.arena, mem.Vec.new());
+            let aliases: *mem.Vec<str> = new(p.arena, mem.Vec.new());
+            let paren = p.eat(T.LParen);
+            loop {
+                if p.eat(T.Star) { names.push("*"); aliases.push("*"); }
+                else {
+                    let n = p.name();
+                    names.push(n);
+                    if p.eat(T.As) { aliases.push(p.name()); } else { aliases.push(n); }
+                }
+                if !p.eat(T.Comma) { break; }
+                if paren and p.at(T.RParen) { break; }
+            }
+            if paren { p.expect(T.RParen, "expected ')'"); }
+            return p.st(S.ImportFrom(m, names, aliases), line);
+        }
+        _ => {}
+    }
+    let first = p.testlist_star();
+    if let Some(op) = aug_op(p.peek()) {
+        p.bump();
+        let v = if p.at(T.Yield) { p.yield_expr() } else { p.testlist() };
+        return p.st(S.AugAssign(op, first, v), line);
+    }
+    if p.at(T.Colon) {
+        // annotated assignment
+        p.bump();
+        p.test();
+        var v: ?*Expr = None;
+        if p.eat(T.Assign) { v = Some(p.testlist_star()); }
+        return p.st(S.AnnAssign(first, v), line);
+    }
+    if p.at(T.Assign) {
+        let targets = p.exprs();
+        targets.push(first);
+        var value = first;
+        while p.eat(T.Assign) {
+            value = if p.at(T.Yield) { p.yield_expr() } else { p.testlist_star() };
+            if p.at(T.Assign) { targets.push(value); }
+        }
+        return p.st(S.Assign(targets, value), line);
+    }
+    p.st(S.ExprS(first), line)
+}
+
+fn P.dotted(p: *P) -> str {
+    let first = p.name();
+    if !p.at(T.Dot) { return first; }
+    var b = text.StrBuf.new();
+    b.push_str(first);
+    while p.eat(T.Dot) { b.push('.'); b.push_str(p.name()); }
+    let s = p.arena.str(b.as_str());
+    b.free();
+    s
+}
+
+// ── expressions ─────────────────────────────────────────────────────
+
+/// A comma-separated list of tests (a tuple if there is a comma).
+fn P.testlist(p: *P) -> *Expr {
+    let line = p.line();
+    let first = p.test();
+    if !p.at(T.Comma) { return first; }
+    let xs = p.exprs();
+    xs.push(first);
+    while p.eat(T.Comma) {
+        if !p.starts_expr() { break; }
+        xs.push(p.test());
+    }
+    p.mk(E.Tuple(xs), line)
+}
+
+/// Like testlist, but elements may be starred (`a, *b = ...`, `return *x, y`).
+fn P.testlist_star(p: *P) -> *Expr {
+    let line = p.line();
+    if p.at(T.Yield) { return p.yield_expr(); }
+    let first = p.test_star();
+    if !p.at(T.Comma) { return first; }
+    let xs = p.exprs();
+    xs.push(first);
+    while p.eat(T.Comma) {
+        if !p.starts_expr() { break; }
+        xs.push(p.test_star());
+    }
+    p.mk(E.Tuple(xs), line)
+}
+
+fn P.test_star(p: *P) -> *Expr {
+    let line = p.line();
+    if p.eat(T.Star) { return p.mk(E.Starred(p.expr()), line); }
+    p.named_test()
+}
+
+fn P.starts_expr(p: *P) -> bool {
+    match p.peek() {
+        Newline | Eof | Assign | RParen | RBrack | RBrace | Colon | Semi | In | Dedent => false,
+        PlusEq | MinusEq | StarEq | SlashEq | DSlashEq | PercentEq | DStarEq | ShlEq | ShrEq | AmpEq | PipeEq | CaretEq => false,
+        _ => true,
+    }
+}
+
+/// Targets of a for loop: `x`, `x, y`, `(x, y)`.
+fn P.target_list(p: *P) -> *Expr {
+    let line = p.line();
+    let first = p.target();
+    if !p.at(T.Comma) { return first; }
+    let xs = p.exprs();
+    xs.push(first);
+    while p.eat(T.Comma) {
+        if p.at(T.In) or p.at(T.Assign) { break; }
+        xs.push(p.target());
+    }
+    p.mk(E.Tuple(xs), line)
+}
+
+fn P.target(p: *P) -> *Expr {
+    let line = p.line();
+    if p.eat(T.Star) { return p.mk(E.Starred(p.target()), line); }
+    p.or_expr()
+}
+
+fn P.yield_expr(p: *P) -> *Expr {
+    let line = p.line();
+    p.expect(T.Yield, "expected 'yield'");
+    if p.eat(T.From) { return p.mk(E.YieldFrom(p.test()), line); }
+    if !p.starts_expr() or p.at(T.RParen) { return p.mk(E.Yield(None), line); }
+    p.mk(E.Yield(Some(p.testlist_star())), line)
+}
+
+fn P.named_test(p: *P) -> *Expr {
+    if p.at(T.Name) and p.peek2() == T.Walrus {
+        let line = p.line();
+        let n = p.name();
+        p.bump();
+        return p.mk(E.Walrus(n, p.test()), line);
+    }
+    p.test()
+}
+
+pub fn P.test(p: *P) -> *Expr {
+    let line = p.line();
+    if p.at(T.Lambda) { return p.lambda(); }
+    let c = p.or_test();
+    if p.at(T.If) {
+        // A conditional expression, unless this is a comprehension's `if`.
+        p.bump();
+        let cond = p.or_test();
+        p.expect(T.Else, "expected 'else' in conditional expression");
+        let e = p.test();
+        return p.mk(E.IfExp(cond, c, e), line);
+    }
+    c
+}
+
+fn P.test_nocond(p: *P) -> *Expr {
+    if p.at(T.Lambda) { return p.lambda(); }
+    p.or_test()
+}
+
+fn P.lambda(p: *P) -> *Expr {
+    let line = p.line();
+    p.bump();
+    let ps = p.params(T.Colon);
+    p.expect(T.Colon, "expected ':'");
+    let e = p.test();
+    let body = p.body();
+    body.push(p.st(S.Return(Some(e)), line));
+    let f = new(p.arena, FuncDef { name: "<lambda>", params: ps, body: body, decorators: p.exprs(),
+                                   is_lambda: true, genexp: None, gencomps: None, line: line });
+    p.mk(E.Lambda(f), line)
+}
+
+fn P.or_test(p: *P) -> *Expr {
+    var l = p.and_test();
+    while p.at(T.Or) {
+        let line = p.line();
+        p.bump();
+        let r = p.and_test();
+        l = p.mk(E.Or(l, r), line);
+    }
+    l
+}
+
+fn P.and_test(p: *P) -> *Expr {
+    var l = p.not_test();
+    while p.at(T.And) {
+        let line = p.line();
+        p.bump();
+        let r = p.not_test();
+        l = p.mk(E.And(l, r), line);
+    }
+    l
+}
+
+fn P.not_test(p: *P) -> *Expr {
+    if p.at(T.Not) {
+        let line = p.line();
+        p.bump();
+        return p.mk(E.Un(UnOp.Not, p.not_test()), line);
+    }
+    p.comparison()
+}
+
+fn P.cmp_op(p: *P) -> ?CmpOp {
+    match p.peek() {
+        Lt => { p.bump(); Some(CmpOp.Lt) }
+        Gt => { p.bump(); Some(CmpOp.Gt) }
+        Le => { p.bump(); Some(CmpOp.Le) }
+        Ge => { p.bump(); Some(CmpOp.Ge) }
+        EqEq => { p.bump(); Some(CmpOp.Eq) }
+        Ne => { p.bump(); Some(CmpOp.Ne) }
+        In => { p.bump(); Some(CmpOp.In) }
+        Not => if p.peek2() == T.In { p.bump(); p.bump(); Some(CmpOp.NotIn) } else { None },
+        Is => {
+            p.bump();
+            if p.eat(T.Not) { Some(CmpOp.IsNot) } else { Some(CmpOp.Is) }
+        }
+        _ => None,
+    }
+}
+
+fn P.comparison(p: *P) -> *Expr {
+    let line = p.line();
+    let first = p.or_expr();
+    let Some(op0) = p.cmp_op() else { return first; };
+    let ops: *mem.Vec<CmpOp> = new(p.arena, mem.Vec.new());
+    let rest = p.exprs();
+    ops.push(op0);
+    rest.push(p.or_expr());
+    while let Some(op) = p.cmp_op() {
+        ops.push(op);
+        rest.push(p.or_expr());
+    }
+    p.mk(E.Cmp(first, ops, rest), line)
+}
+
+/// Binary operators from `|` down to `*`, by precedence level.
+fn bin_level(k: T) -> ?(u32, BinOp) {
+    match k {
+        Pipe => Some((1, BinOp.BitOr)),
+        Caret => Some((2, BinOp.BitXor)),
+        Amp => Some((3, BinOp.BitAnd)),
+        Shl => Some((4, BinOp.LShift)),
+        Shr => Some((4, BinOp.RShift)),
+        Plus => Some((5, BinOp.Add)),
+        Minus => Some((5, BinOp.Sub)),
+        Star => Some((6, BinOp.Mul)),
+        Slash => Some((6, BinOp.Div)),
+        DSlash => Some((6, BinOp.FloorDiv)),
+        Percent => Some((6, BinOp.Mod)),
+        At => Some((6, BinOp.MatMul)),
+        _ => None,
+    }
+}
+
+fn P.or_expr(p: *P) -> *Expr { p.binary(1) }
+fn P.expr(p: *P) -> *Expr { p.binary(1) }
+
+fn P.binary(p: *P, min: u32) -> *Expr {
+    var l = p.factor();
+    loop {
+        let Some((lvl, op)) = bin_level(p.peek()) else { break; };
+        if lvl < min { break; }
+        let line = p.line();
+        p.bump();
+        let r = p.binary(lvl + 1);
+        l = p.mk(E.Bin(op, l, r), line);
+    }
+    l
+}
+
+fn P.factor(p: *P) -> *Expr {
+    let line = p.line();
+    match p.peek() {
+        Minus => {
+            p.bump();
+            let x = p.factor();
+            // Fold negative literals so that -2147483648 stays small.
+            if let Int(v) = x.e { return p.mk(E.Int(0 - v), line); }
+            if let Float(v) = x.e { return p.mk(E.Float(-v), line); }
+            return p.mk(E.Un(UnOp.Neg, x), line);
+        }
+        Plus => { p.bump(); return p.mk(E.Un(UnOp.Pos, p.factor()), line); }
+        Tilde => { p.bump(); return p.mk(E.Un(UnOp.Invert, p.factor()), line); }
+        _ => {}
+    }
+    p.power()
+}
+
+fn P.power(p: *P) -> *Expr {
+    let line = p.line();
+    let b = p.primary();
+    if p.eat(T.DStar) {
+        let e = p.factor();
+        return p.mk(E.Bin(BinOp.Pow, b, e), line);
+    }
+    b
+}
+
+fn P.primary(p: *P) -> *Expr {
+    var e = p.atom();
+    while p.ok() {
+        let line = p.line();
+        if p.eat(T.Dot) {
+            e = p.mk(E.Attr(e, p.name()), line);
+        } else if p.eat(T.LParen) {
+            e = p.mk(E.Call(e, p.call_args()), line);
+        } else if p.eat(T.LBrack) {
+            let idx = p.subscript();
+            p.expect(T.RBrack, "expected ']'");
+            e = p.mk(E.Index(e, idx), line);
+        } else { break; }
+    }
+    e
+}
+
+fn P.call_args(p: *P) -> *mem.Vec<Arg> {
+    let args: *mem.Vec<Arg> = new(p.arena, mem.Vec.new());
+    while p.ok() and !p.at(T.RParen) {
+        if p.eat(T.Star) { args.push(Arg { name: None, value: p.test(), star: 1 }); }
+        else if p.eat(T.DStar) { args.push(Arg { name: None, value: p.test(), star: 2 }); }
+        else if p.at(T.Name) and p.peek2() == T.Assign {
+            let n = p.name();
+            p.bump();
+            args.push(Arg { name: Some(n), value: p.test(), star: 0 });
+        } else {
+            let line = p.line();
+            let v = p.named_test();
+            if p.at(T.For) {
+                // f(x for x in y)
+                let g = p.genexp(v, line);
+                args.push(Arg { name: None, value: g, star: 0 });
+            } else {
+                args.push(Arg { name: None, value: v, star: 0 });
+            }
+        }
+        if !p.eat(T.Comma) { break; }
+    }
+    p.expect(T.RParen, "expected ')'");
+    args
+}
+
+fn P.subscript(p: *P) -> *Expr {
+    let line = p.line();
+    let first = p.slice_item();
+    if !p.at(T.Comma) { return first; }
+    let xs = p.exprs();
+    xs.push(first);
+    while p.eat(T.Comma) {
+        if p.at(T.RBrack) { break; }
+        xs.push(p.slice_item());
+    }
+    p.mk(E.Tuple(xs), line)
+}
+
+fn P.slice_item(p: *P) -> *Expr {
+    let line = p.line();
+    var lo: ?*Expr = None;
+    if !p.at(T.Colon) { lo = Some(p.test()); }
+    if !p.at(T.Colon) { return lo.unwrap(); }
+    p.bump();
+    var hi: ?*Expr = None;
+    var step: ?*Expr = None;
+    if !p.at(T.Colon) and !p.at(T.RBrack) and !p.at(T.Comma) { hi = Some(p.test()); }
+    if p.eat(T.Colon) {
+        if !p.at(T.RBrack) and !p.at(T.Comma) { step = Some(p.test()); }
+    }
+    p.mk(E.Slice(lo, hi, step), line)
+}
+
+fn P.comps(p: *P) -> *mem.Vec<Comp> {
+    let cs: *mem.Vec<Comp> = new(p.arena, mem.Vec.new());
+    while p.eat(T.For) {
+        let t = p.target_list();
+        p.expect(T.In, "expected 'in'");
+        let it = p.or_test();
+        let ifs = p.exprs();
+        while p.eat(T.If) { ifs.push(p.test_nocond()); }
+        cs.push(Comp { target: t, iter: it, ifs: ifs });
+    }
+    cs
+}
+
+fn P.genexp(p: *P, elt: *Expr, line: u32) -> *Expr {
+    let cs = p.comps();
+    let first_iter = cs.at(0).iter;
+    let f = new(p.arena, FuncDef { name: "<genexpr>", params: new(p.arena, mem.Vec.new()), body: p.body(),
+                                   decorators: p.exprs(), is_lambda: false, genexp: Some(elt), gencomps: Some(cs), line: line });
+    p.mk(E.GenExp(f, first_iter), line)
+}
+
+fn P.atom(p: *P) -> *Expr {
+    let t = p.tok();
+    let line = t.line;
+    match t.kind {
+        Name => { p.bump(); p.mk(E.Name(t.s), line) }
+        Int => { p.bump(); p.mk(E.Int(t.i), line) }
+        BigInt => { p.bump(); p.mk(E.Big(t.s, t.i), line) }
+        Float => { p.bump(); p.mk(E.Float(t.f), line) }
+        True => { p.bump(); p.mk(E.Bool(true), line) }
+        False => { p.bump(); p.mk(E.Bool(false), line) }
+        NoneKw => { p.bump(); p.mk(E.NoneE, line) }
+        Ellipsis => { p.bump(); p.mk(E.Ellipsis, line) }
+        Str | FStr => p.strings(),
+        LParen => {
+            p.bump();
+            if p.eat(T.RParen) { return p.mk(E.Tuple(p.exprs()), line); }
+            if p.at(T.Yield) {
+                let y = p.yield_expr();
+                p.expect(T.RParen, "expected ')'");
+                return y;
+            }
+            let first = p.test_star();
+            if p.at(T.For) {
+                let g = p.genexp(first, line);
+                p.expect(T.RParen, "expected ')'");
+                return g;
+            }
+            if !p.at(T.Comma) {
+                p.expect(T.RParen, "expected ')'");
+                return first;
+            }
+            let xs = p.exprs();
+            xs.push(first);
+            while p.eat(T.Comma) {
+                if p.at(T.RParen) { break; }
+                xs.push(p.test_star());
+            }
+            p.expect(T.RParen, "expected ')'");
+            p.mk(E.Tuple(xs), line)
+        }
+        LBrack => {
+            p.bump();
+            let xs = p.exprs();
+            if p.eat(T.RBrack) { return p.mk(E.List(xs), line); }
+            let first = p.test_star();
+            if p.at(T.For) {
+                let cs = p.comps();
+                p.expect(T.RBrack, "expected ']'");
+                return p.mk(E.ListComp(first, cs), line);
+            }
+            xs.push(first);
+            while p.eat(T.Comma) {
+                if p.at(T.RBrack) { break; }
+                xs.push(p.test_star());
+            }
+            p.expect(T.RBrack, "expected ']'");
+            p.mk(E.List(xs), line)
+        }
+        LBrace => {
+            p.bump();
+            let ks = p.exprs();
+            let vs = p.exprs();
+            if p.eat(T.RBrace) { return p.mk(E.Dict(ks, vs), line); }
+            if p.at(T.DStar) {
+                // {**a, k: v, ...}: `**x` entries are Starred keys.
+                loop {
+                    if p.eat(T.DStar) {
+                        let l2 = p.line();
+                        ks.push(p.mk(E.Starred(p.expr()), l2));
+                        vs.push(p.mk(E.NoneE, l2));
+                    } else {
+                        ks.push(p.test());
+                        p.expect(T.Colon, "expected ':'");
+                        vs.push(p.test());
+                    }
+                    if !p.eat(T.Comma) or p.at(T.RBrace) { break; }
+                }
+                p.expect(T.RBrace, "expected '}'");
+                return p.mk(E.Dict(ks, vs), line);
+            }
+            let first = p.test_star();
+            if p.eat(T.Colon) {
+                let v = p.test();
+                if p.at(T.For) {
+                    let cs = p.comps();
+                    p.expect(T.RBrace, "expected '}'");
+                    return p.mk(E.DictComp(first, v, cs), line);
+                }
+                ks.push(first);
+                vs.push(v);
+                while p.eat(T.Comma) {
+                    if p.at(T.RBrace) { break; }
+                    if p.eat(T.DStar) {
+                        let l2 = p.line();
+                        ks.push(p.mk(E.Starred(p.expr()), l2));
+                        vs.push(p.mk(E.NoneE, l2));
+                        continue;
+                    }
+                    ks.push(p.test());
+                    p.expect(T.Colon, "expected ':'");
+                    vs.push(p.test());
+                }
+                p.expect(T.RBrace, "expected '}'");
+                return p.mk(E.Dict(ks, vs), line);
+            }
+            if p.at(T.For) {
+                let cs = p.comps();
+                p.expect(T.RBrace, "expected '}'");
+                return p.mk(E.SetComp(first, cs), line);
+            }
+            ks.push(first);
+            while p.eat(T.Comma) {
+                if p.at(T.RBrace) { break; }
+                ks.push(p.test_star());
+            }
+            p.expect(T.RBrace, "expected '}'");
+            p.mk(E.Set(ks), line)
+        }
+        _ => {
+            p.fail("invalid syntax");
+            p.mk(E.NoneE, line)
+        }
+    }
+}
+
+/// Adjacent string literals, plain and f-strings, joined.
+fn P.strings(p: *P) -> *Expr {
+    let line = p.line();
+    let parts: *mem.Vec<FPart> = new(p.arena, mem.Vec.new());
+    var any_f = false;
+    while p.at(T.Str) or p.at(T.FStr) {
+        let t = p.bump();
+        if t.kind == T.Str { parts.push(FPart { lit: t.s, expr: None, conv: 0, spec: None }); }
+        else { any_f = true; p.fstring(t.s, line, parts); }
+    }
+    if !any_f {
+        if parts.len == 1 { return p.mk(E.Str(parts.at(0).lit), line); }
+        var b = text.StrBuf.new();
+        for i in 0..parts.len { b.push_str(parts.at(i).lit); }
+        let s = p.arena.str(b.as_str());
+        b.free();
+        return p.mk(E.Str(s), line);
+    }
+    p.mk(E.FStr(parts), line)
+}
+
+/// Split an f-string's text into literal and replacement parts.
+fn P.fstring(p: *P, s: str, line: u32, parts: *mem.Vec<FPart>) {
+    var b = text.StrBuf.new();
+    var i: u64 = 0;
+    while i < s.len {
+        let c = s[i];
+        if c == '{' and i + 1 < s.len and s[i + 1] == '{' { b.push('{'); i += 2; continue; }
+        if c == '}' and i + 1 < s.len and s[i + 1] == '}' { b.push('}'); i += 2; continue; }
+        if c != '{' { b.push(c); i += 1; continue; }
+        if b.len() > 0 {
+            parts.push(FPart { lit: p.arena.str(b.as_str()), expr: None, conv: 0, spec: None });
+            b.clear();
+        }
+        // Find the end of the expression: a '!', ':' or '}' at depth 0.
+        i += 1;
+        let start = i;
+        var depth: i64 = 0;
+        var q: u8 = 0;
+        while i < s.len {
+            let d = s[i];
+            if q != 0 { if d == q { q = 0; } i += 1; continue; }
+            if d == '\'' or d == '"' { q = d; }
+            else if d == '(' or d == '[' or d == '{' { depth += 1; }
+            else if d == ')' or d == ']' or d == '}' { if depth == 0 { break; } depth -= 1; }
+            else if depth == 0 and (d == ':' or (d == '!' and i + 1 < s.len and s[i + 1] != '=')) { break; }
+            i += 1;
+        }
+        let src = s[start..i];
+        let e = p.sub_expr(src, line);
+        var conv: u8 = 0;
+        var spec: ?*Expr = None;
+        if i < s.len and s[i] == '!' { conv = s[i + 1]; i += 2; }
+        if i < s.len and s[i] == ':' {
+            i += 1;
+            let ss = i;
+            var dd: i64 = 0;
+            while i < s.len {
+                if s[i] == '{' { dd += 1; }
+                if s[i] == '}' { if dd == 0 { break; } dd -= 1; }
+                i += 1;
+            }
+            let sp: *mem.Vec<FPart> = new(p.arena, mem.Vec.new());
+            p.fstring(s[ss..i], line, sp);
+            spec = Some(p.mk(E.FStr(sp), line));
+        }
+        if i >= s.len or s[i] != '}' { p.fail("f-string: expecting '}'"); b.free(); return; }
+        i += 1;
+        parts.push(FPart { lit: "", expr: Some(e), conv: conv, spec: spec });
+    }
+    if b.len() > 0 { parts.push(FPart { lit: p.arena.str(b.as_str()), expr: None, conv: 0, spec: None }); }
+    b.free();
+}
+
+fn P.sub_expr(p: *P, src0: str, line: u32) -> *Expr {
+    // Replacement fields may start with spaces, which must not read as an indent.
+    var a: u64 = 0;
+    while a < src0.len and (src0[a] == ' ' or src0[a] == '\t') { a += 1; }
+    let src = src0[a..src0.len];
+    var lx = Lexer.new(src, p.arena);
+    lx.line = line;
+    lx.run();
+    if let Some(m) = lx.err { p.fail(m); lx.free(); return p.mk(E.NoneE, line); }
+    let toks = lx.toks.items();
+    var sp = P.new(toks, p.arena);
+    // Skip a leading NEWLINE-free stream: the expression, then NEWLINE.
+    let e = sp.testlist();
+    if let Some(m) = sp.err { p.fail(m); }
+    e
+}

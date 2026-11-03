@@ -1,0 +1,2001 @@
+// Builtin functions, builtin types and their methods, exceptions, and the
+// native modules (math, random, time, sys).
+import std.gc;
+import std.mem;
+import std.text;
+import std.num;
+import std.io;
+import std.lex;
+import value;
+import value.{Value, Str, List, Tuple, Dict, Inst, Func, Box,
+              K_CLASS, K_BOUND, K_BIG, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_SET, K_FROZENSET, K_MODULE,
+              K_PROPERTY, K_STATICM, K_CLASSM, K_SUPER, K_ENUMIT, K_ZIPIT, K_MAPIT, K_FILTERIT, K_DICTVIEW, K_REVIT,
+              K_SLICE, K_NOTIMPL, GEN_DONE};
+import big;
+import vm;
+import vm.{Ctx, T_NONE, T_BOOL, T_INT, T_FLOAT, T_STR, T_LIST, T_TUPLE, T_DICT, T_SET, T_FUNC, T_BUILTIN, T_TYPE,
+           T_RANGE, T_GEN, T_METHOD, T_MODULE, T_OBJECT, T_ITER, T_FROZENSET, T_SLICE, T_PROPERTY, T_SUPER, T_CELL, T_NOTIMPL};
+import ops;
+import ops.{exc, exc_buf, type_name};
+import fmt;
+import compile;
+
+extern "C" fn sqrt(x: f64) -> f64;
+extern "C" fn sin(x: f64) -> f64;
+extern "C" fn cos(x: f64) -> f64;
+extern "C" fn tan(x: f64) -> f64;
+extern "C" fn asin(x: f64) -> f64;
+extern "C" fn acos(x: f64) -> f64;
+extern "C" fn atan(x: f64) -> f64;
+extern "C" fn atan2(y: f64, x: f64) -> f64;
+extern "C" fn exp(x: f64) -> f64;
+extern "C" fn log(x: f64) -> f64;
+extern "C" fn log10(x: f64) -> f64;
+extern "C" fn log2(x: f64) -> f64;
+extern "C" fn pow(x: f64, y: f64) -> f64;
+extern "C" fn fmod(x: f64, y: f64) -> f64;
+extern "C" fn hypot(x: f64, y: f64) -> f64;
+extern "C" fn sinh(x: f64) -> f64;
+extern "C" fn cosh(x: f64) -> f64;
+extern "C" fn tanh(x: f64) -> f64;
+extern "C" fn round(x: f64) -> f64;
+extern "C" fn clock_gettime(id: i32, ts: *i64) -> i32;
+
+pub fn pow_f(x: f64, y: f64) -> f64 { pow(x, y) }
+
+// Exception kinds (index into Ctx.excs).
+pub const E_BASE: u64 = 0;
+pub const E_EXC: u64 = 1;
+pub const E_TYPE: u64 = 2;
+pub const E_VALUE: u64 = 3;
+pub const E_INDEX: u64 = 4;
+pub const E_KEY: u64 = 5;
+pub const E_ATTRIBUTE: u64 = 6;
+pub const E_NAME: u64 = 7;
+pub const E_ZERODIV: u64 = 8;
+pub const E_STOPITER: u64 = 9;
+pub const E_UNBOUND: u64 = 10;
+pub const E_OVERFLOW: u64 = 11;
+pub const E_RUNTIME: u64 = 12;
+pub const E_NOTIMPL: u64 = 13;
+pub const E_RECURSION: u64 = 14;
+pub const E_ARITH: u64 = 15;
+pub const E_LOOKUP: u64 = 16;
+pub const E_ASSERT: u64 = 17;
+pub const E_GENEXIT: u64 = 18;
+pub const E_KBINT: u64 = 19;
+pub const E_SYSEXIT: u64 = 20;
+pub const E_IMPORT: u64 = 21;
+pub const E_MEMORY: u64 = 22;
+pub const E_OS: u64 = 23;
+pub const E_EOF: u64 = 24;
+pub const E_UNICODE: u64 = 25;
+pub const E_MODNOTFOUND: u64 = 26;
+
+/// Builtin functions and methods. Their number is the Builtin(id) payload.
+pub enum B {
+    // functions
+    Print, Len, IsInstance, IsSubclass, Repr, Abs, Min, Max, Sum, Sorted, Reversed, Enumerate, Zip, Map, Filter,
+    Iter, Next, Hash, Id, Ord, Chr, Divmod, Pow, Round, Any, All, GetAttr, SetAttr, HasAttr, DelAttr, Callable,
+    Hex, Oct, Bin, Format, Globals, Vars, Input,
+    // object / exceptions
+    ObjInit, ExcInit, ObjEq, ObjNe, ObjHash, ObjRepr, ObjStr,
+    // str methods
+    SJoin, SSplit, SRsplit, SStrip, SLstrip, SRstrip, SStartswith, SEndswith, SFind, SRfind, SIndex, SRindex,
+    SReplace, SUpper, SLower, SFormat, SCount, SIsdigit, SIsalpha, SIsspace, SIsupper, SIslower, SIsalnum,
+    SSplitlines, SLjust, SRjust, SCenter, SZfill, STitle, SCapitalize, SPartition, SRpartition, SSwapcase, SEncode,
+    // list methods
+    LAppend, LExtend, LPop, LInsert, LRemove, LIndex, LCount, LSort, LReverse, LCopy, LClear,
+    // tuple
+    TIndex, TCount,
+    // dict methods
+    DGet, DKeys, DValues, DItems, DPop, DSetdefault, DUpdate, DCopy, DClear, DPopitem, DFromkeys,
+    // set methods
+    StAdd, StRemove, StDiscard, StPop, StClear, StCopy, StUpdate, StUnion, StIntersection, StDifference,
+    StIssubset, StIssuperset, StSymdiff, StIsdisjoint,
+    // int / float
+    IBitLength, FIsInteger, IConjugate,
+    // generator
+    GSend, GClose, GThrow,
+    PropSetter, PropGetter,
+    // math
+    MSqrt, MSin, MCos, MTan, MAsin, MAcos, MAtan, MAtan2, MExp, MLog, MLog10, MLog2, MPow, MFloor, MCeil, MFabs,
+    MHypot, MIsnan, MIsinf, MIsfinite, MRadians, MDegrees, MGcd, MFactorial, MTrunc, MCopysign, MSinh, MCosh, MTanh,
+    MFsum, MModf, MFmod, MIsqrt, MProd,
+    // random
+    RSeed, RRandom, RRandrange, RRandint, RChoice, RShuffle, RUniform, RGetrandbits, RSample,
+    // time / sys
+    TTime, TPerfCounter, SysSetrecursionlimit, SysGetrecursionlimit, SysExit,
+}
+
+#[inline(always)]
+pub fn b_len() -> u32 { B.Len as u32 }
+
+#[inline(always)]
+pub fn b_list_append() -> u32 { B.LAppend as u32 }
+
+/// Builtins that consume an iterable last argument (see vm.call_slow).
+pub fn consumes(id: u32) -> bool {
+    match id as B {
+        Sum | Min | Max | Sorted | SJoin | LExtend => true,
+        _ => false,
+    }
+}
+
+// ── setup ───────────────────────────────────────────────────────────
+
+fn bv(b: B) -> Value { Value.Builtin(b as u32) }
+
+fn new_class(c: *Ctx, name: str, base: ?Gc<Box>, tcode: i64) -> Gc<Box> {
+    let cls = value.new_box(&c.heap, K_CLASS, 0);
+    cls.a = Value.Str(vm.intern(c, name));
+    cls.dict = Some(value.new_dict(&c.heap, 4));
+    cls.base = base;
+    cls.id = c.next_cls;
+    c.next_cls += 1;
+    cls.n = tcode;
+    cls
+}
+
+fn put(c: *Ctx, d: Gc<Dict>, name: str, v: Value) {
+    value.dict_set_str(&c.heap, d, vm.intern(c, name), v);
+}
+
+fn meth(c: *Ctx, t: u64, name: str, b: B) {
+    put(c, c.types[t].unwrap().dict.unwrap(), name, bv(b));
+}
+
+pub fn setup(c: *Ctx) {
+    let obj = new_class(c, "object", None, (T_OBJECT + 1) as i64);
+    c.types[T_OBJECT] = Some(obj);
+    let tnames = ["NoneType", "bool", "int", "float", "str", "list", "tuple", "dict", "set", "function",
+                  "builtin_function_or_method", "type", "range", "generator", "method", "module", "object",
+                  "iterator", "frozenset", "slice", "property", "super", "cell", "NotImplementedType"];
+    for i in 0..vm.NTYPES {
+        if i == T_OBJECT { continue; }
+        c.types[i] = Some(new_class(c, tnames[i], Some(obj), (i + 1) as i64));
+    }
+    c.types[T_BOOL].unwrap().base = c.types[T_INT];
+    let bd = value.new_dict(&c.heap, 128);
+    c.builtins = Some(bd);
+    // Exceptions.
+    let enames = ["BaseException", "Exception", "TypeError", "ValueError", "IndexError", "KeyError",
+                  "AttributeError", "NameError", "ZeroDivisionError", "StopIteration", "UnboundLocalError",
+                  "OverflowError", "RuntimeError", "NotImplementedError", "RecursionError", "ArithmeticError",
+                  "LookupError", "AssertionError", "GeneratorExit", "KeyboardInterrupt", "SystemExit",
+                  "ImportError", "MemoryError", "OSError", "EOFError", "UnicodeError", "ModuleNotFoundError"];
+    let eparents = [99, 0, 1, 1, 16, 16, 1, 1, 15, 1, 7, 15, 1, 12, 12, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 3, 21];
+    // Parents first: repeat until every class exists.
+    var made: u64 = 0;
+    while made < enames.len {
+        for i in 0..enames.len {
+            if c.excs[i].is_some() { continue; }
+            let p = eparents[i];
+            if p != 99 and c.excs[p as u64].is_none() { continue; }
+            let base = if p == 99 { obj } else { c.excs[p as u64].unwrap() };
+            let e = new_class(c, enames[i], Some(base), 0);
+            c.excs[i] = Some(e);
+            put(c, bd, enames[i], Value.Obj(e));
+            made += 1;
+        }
+    }
+    put(c, c.excs[E_BASE].unwrap().dict.unwrap(), "__init__", bv(B.ExcInit));
+    put(c, obj.dict.unwrap(), "__init__", bv(B.ObjInit));
+    // Builtin types visible by name.
+    let visible = [("int", T_INT), ("float", T_FLOAT), ("str", T_STR), ("bool", T_BOOL), ("list", T_LIST),
+                   ("tuple", T_TUPLE), ("dict", T_DICT), ("set", T_SET), ("frozenset", T_FROZENSET),
+                   ("range", T_RANGE), ("object", T_OBJECT), ("type", T_TYPE), ("property", T_PROPERTY),
+                   ("super", T_SUPER), ("slice", T_SLICE)];
+    for x in visible { let (n, t) = x; put(c, bd, n, Value.Obj(c.types[t].unwrap())); }
+    let st = value.new_box(&c.heap, K_CLASS, 0);
+    st.a = Value.Str(vm.intern(c, "staticmethod")); st.dict = Some(value.new_dict(&c.heap, 0)); st.base = Some(obj);
+    st.n = 1000; st.id = c.next_cls; c.next_cls += 1;
+    put(c, bd, "staticmethod", Value.Obj(st));
+    let cm = value.new_box(&c.heap, K_CLASS, 0);
+    cm.a = Value.Str(vm.intern(c, "classmethod")); cm.dict = Some(value.new_dict(&c.heap, 0)); cm.base = Some(obj);
+    cm.n = 1001; cm.id = c.next_cls; c.next_cls += 1;
+    put(c, bd, "classmethod", Value.Obj(cm));
+    let ni = value.new_box(&c.heap, K_NOTIMPL, 0);
+    put(c, bd, "NotImplemented", Value.Obj(ni));
+    put(c, bd, "Ellipsis", Value.Nil);
+    put(c, bd, "__name__", Value.Str(vm.intern(c, "__main__")));
+    let fns = [("print", B.Print), ("len", B.Len), ("isinstance", B.IsInstance), ("issubclass", B.IsSubclass),
+               ("repr", B.Repr), ("abs", B.Abs), ("min", B.Min), ("max", B.Max), ("sum", B.Sum), ("sorted", B.Sorted),
+               ("reversed", B.Reversed), ("enumerate", B.Enumerate), ("zip", B.Zip), ("map", B.Map), ("filter", B.Filter),
+               ("iter", B.Iter), ("next", B.Next), ("hash", B.Hash), ("id", B.Id), ("ord", B.Ord), ("chr", B.Chr),
+               ("divmod", B.Divmod), ("pow", B.Pow), ("round", B.Round), ("any", B.Any), ("all", B.All),
+               ("getattr", B.GetAttr), ("setattr", B.SetAttr), ("hasattr", B.HasAttr), ("delattr", B.DelAttr),
+               ("callable", B.Callable), ("hex", B.Hex), ("oct", B.Oct), ("bin", B.Bin), ("format", B.Format),
+               ("globals", B.Globals), ("vars", B.Vars), ("input", B.Input)];
+    for x in fns { let (n, b) = x; put(c, bd, n, bv(b)); }
+    // Methods.
+    let strm = [("join", B.SJoin), ("split", B.SSplit), ("rsplit", B.SRsplit), ("strip", B.SStrip), ("lstrip", B.SLstrip),
+                ("rstrip", B.SRstrip), ("startswith", B.SStartswith), ("endswith", B.SEndswith), ("find", B.SFind),
+                ("rfind", B.SRfind), ("index", B.SIndex), ("rindex", B.SRindex), ("replace", B.SReplace), ("upper", B.SUpper),
+                ("lower", B.SLower), ("format", B.SFormat), ("count", B.SCount), ("isdigit", B.SIsdigit),
+                ("isalpha", B.SIsalpha), ("isspace", B.SIsspace), ("isupper", B.SIsupper), ("islower", B.SIslower),
+                ("isalnum", B.SIsalnum), ("splitlines", B.SSplitlines), ("ljust", B.SLjust), ("rjust", B.SRjust),
+                ("center", B.SCenter), ("zfill", B.SZfill), ("title", B.STitle), ("capitalize", B.SCapitalize),
+                ("partition", B.SPartition), ("rpartition", B.SRpartition), ("swapcase", B.SSwapcase), ("encode", B.SEncode)];
+    for x in strm { let (n, b) = x; meth(c, T_STR, n, b); }
+    let listm = [("append", B.LAppend), ("extend", B.LExtend), ("pop", B.LPop), ("insert", B.LInsert), ("remove", B.LRemove),
+                 ("index", B.LIndex), ("count", B.LCount), ("sort", B.LSort), ("reverse", B.LReverse), ("copy", B.LCopy),
+                 ("clear", B.LClear)];
+    for x in listm { let (n, b) = x; meth(c, T_LIST, n, b); }
+    meth(c, T_TUPLE, "index", B.TIndex);
+    meth(c, T_TUPLE, "count", B.TCount);
+    let dictm = [("get", B.DGet), ("keys", B.DKeys), ("values", B.DValues), ("items", B.DItems), ("pop", B.DPop),
+                 ("setdefault", B.DSetdefault), ("update", B.DUpdate), ("copy", B.DCopy), ("clear", B.DClear),
+                 ("popitem", B.DPopitem), ("fromkeys", B.DFromkeys)];
+    for x in dictm { let (n, b) = x; meth(c, T_DICT, n, b); }
+    let setm = [("add", B.StAdd), ("remove", B.StRemove), ("discard", B.StDiscard), ("pop", B.StPop), ("clear", B.StClear),
+                ("copy", B.StCopy), ("update", B.StUpdate), ("union", B.StUnion), ("intersection", B.StIntersection),
+                ("difference", B.StDifference), ("issubset", B.StIssubset), ("issuperset", B.StIssuperset),
+                ("symmetric_difference", B.StSymdiff), ("isdisjoint", B.StIsdisjoint)];
+    for x in setm { let (n, b) = x; meth(c, T_SET, n, b); meth(c, T_FROZENSET, n, b); }
+    meth(c, T_INT, "bit_length", B.IBitLength);
+    meth(c, T_INT, "conjugate", B.IConjugate);
+    meth(c, T_FLOAT, "is_integer", B.FIsInteger);
+    meth(c, T_PROPERTY, "setter", B.PropSetter);
+    meth(c, T_PROPERTY, "getter", B.PropGetter);
+    meth(c, T_GEN, "send", B.GSend);
+    meth(c, T_GEN, "close", B.GClose);
+    meth(c, T_GEN, "throw", B.GThrow);
+    c.modules = Some(value.new_dict(&c.heap, 8));
+}
+
+// ── helpers ─────────────────────────────────────────────────────────
+
+fn s_of(c: *Ctx, s: str) -> Value { Value.Str(value.new_str(&c.heap, s)) }
+
+fn buf_str(c: *Ctx, b: *text.StrBuf) -> Value {
+    let v = s_of(c, b.as_str());
+    b.free();
+    v
+}
+
+pub fn char_str(c: *Ctx, ch: u8) -> Value {
+    var a: [u8; 1] = [ch];
+    Value.Str(vm.intern(c, a[0..1]))
+}
+
+fn nargs_error(c: *Ctx, name: str, want: str, got: u64) -> Value {
+    var b = text.StrBuf.new();
+    b.push_str(name);
+    b.push_str("() takes ");
+    b.push_str(want);
+    b.push_str(" arguments (");
+    b.push_int(got as i64);
+    b.push_str(" given)");
+    exc_buf(c, E_TYPE, &b)
+}
+
+/// The value of keyword argument `name`, if given.
+fn kwarg(kw: Value, args: *Value, n: u64, name: str) -> ?Value {
+    let Tuple(t) = kw else { return None; };
+    let npos = n - t.items.len;
+    for i in 0..t.items.len {
+        if let Str(s) = t.items[i] and s.data.eq(name) { return Some(args[npos + i]); }
+    }
+    None
+}
+
+fn npos(kw: Value, n: u64) -> u64 {
+    if let Tuple(t) = kw { n - t.items.len } else { n }
+}
+
+fn want_int(c: *Ctx, v: Value) -> Result<i64, Value> {
+    if let Some(i) = value.as_i64(v) { return Ok(i); }
+    var b = text.StrBuf.new();
+    b.push('\'');
+    b.push_str(type_name(c, v));
+    b.push_str("' object cannot be interpreted as an integer");
+    Err(exc_buf(c, E_TYPE, &b))
+}
+
+fn want_f64(c: *Ctx, v: Value) -> Result<f64, Value> {
+    if let Some(f) = value.to_f64(v) { return Ok(f); }
+    var b = text.StrBuf.new();
+    b.push_str("must be real number, not ");
+    b.push_str(type_name(c, v));
+    Err(exc_buf(c, E_TYPE, &b))
+}
+
+fn want_str(c: *Ctx, v: Value) -> Result<Gc<Str>, Value> {
+    if let Str(s) = v { return Ok(s); }
+    var b = text.StrBuf.new();
+    b.push_str("must be str, not ");
+    b.push_str(type_name(c, v));
+    Err(exc_buf(c, E_TYPE, &b))
+}
+
+pub fn range_len(b: Gc<Box>) -> u64 {
+    if b.s > 0 { if b.m > b.n { return ((b.m - b.n + b.s - 1) / b.s) as u64; } return 0; }
+    if b.n > b.m { return ((b.n - b.m + (0 - b.s) - 1) / (0 - b.s)) as u64; }
+    0
+}
+
+pub fn len_of(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
+    match v {
+        Str(s) => Ok(s.data.len),
+        List(l) => Ok(l.len),
+        Tuple(t) => Ok(t.items.len),
+        Dict(d) => Ok(d.len),
+        Obj(b) => {
+            if b.kind == K_SET or b.kind == K_FROZENSET { return Ok(b.dict.unwrap().len); }
+            if b.kind == K_RANGE { return Ok(range_len(b)); }
+            if b.kind == K_DICTVIEW { if let Dict(d) = b.a { return Ok(d.len); } }
+            Err(no_len(c, v))
+        }
+        Inst(_) => {
+            if let Some(r) = ops.call_method(c, v, "__len__", [])? { return Ok(want_int(c, r)? as u64); }
+            Err(no_len(c, v))
+        }
+        _ => Err(no_len(c, v)),
+    }
+}
+
+fn no_len(c: *Ctx, v: Value) -> Value {
+    var b = text.StrBuf.new();
+    b.push_str("object of type '");
+    b.push_str(type_name(c, v));
+    b.push_str("' has no len()");
+    exc_buf(c, E_TYPE, &b)
+}
+
+pub fn float_to_int(c: *Ctx, x: f64) -> Result<Value, Value> {
+    match big.from_f64(&c.heap, x) {
+        Some(v) => Ok(v),
+        None => Err(exc(c, if x != x { E_VALUE } else { E_OVERFLOW },
+                        if x != x { "cannot convert float NaN to integer" } else { "cannot convert float infinity to integer" })),
+    }
+}
+
+pub fn write_radix(h: *gc.Heap, b: *text.StrBuf, v: Value, radix: u64, upper: bool) {
+    // v >= 0
+    var digits: mem.Vec<u8> = mem.Vec.new();
+    var x = v;
+    if let Int(0) = x { b.push('0'); return; }
+    while true {
+        if let Int(0) = x { break; }
+        let Some((q, r)) = big.divmod(h, x, Value.Int(radix as i32)) else { break; };
+        let d = (value.as_i64(r) ?? 0) as u8;
+        digits.push(if d < 10 { '0' + d } else if upper { 'A' + d - 10 } else { 'a' + d - 10 });
+        x = q;
+    }
+    var i = digits.len;
+    while i > 0 { i -= 1; b.push(digits.at(i)); }
+    digits.free();
+}
+
+/// The items of any iterable.
+fn items_of(c: *Ctx, v: Value) -> Result<Gc<List>, Value> uses reenter { ops.to_list(c, v) }
+
+// ── sets ────────────────────────────────────────────────────────────
+
+fn set_dict(v: Value) -> ?Gc<Dict> {
+    if let Obj(b) = v and (b.kind == K_SET or b.kind == K_FROZENSET) { return b.dict; }
+    None
+}
+
+pub fn set_op(c: *Ctx, op: u32, x: Gc<Box>, y: Gc<Box>) -> Result<Value, Value> uses reenter {
+    let r = ops.new_set(c, x.kind == K_FROZENSET);
+    let dx = x.dict.unwrap();
+    let dy = y.dict.unwrap();
+    var it: u64 = 0;
+    if op == ops.O_BOR {
+        while let Some(e) = value.dict_next(dx, &it) { ops.set_add(c, r, value.dict_key(dx, e))?; }
+        it = 0;
+        while let Some(e) = value.dict_next(dy, &it) { ops.set_add(c, r, value.dict_key(dy, e))?; }
+    } else if op == ops.O_BAND {
+        while let Some(e) = value.dict_next(dx, &it) {
+            let k = value.dict_key(dx, e);
+            if ops.dict_lookup(c, dy, k)?.is_some() { ops.set_add(c, r, k)?; }
+        }
+    } else if op == ops.O_SUB {
+        while let Some(e) = value.dict_next(dx, &it) {
+            let k = value.dict_key(dx, e);
+            if ops.dict_lookup(c, dy, k)?.is_none() { ops.set_add(c, r, k)?; }
+        }
+    } else {
+        while let Some(e) = value.dict_next(dx, &it) {
+            let k = value.dict_key(dx, e);
+            if ops.dict_lookup(c, dy, k)?.is_none() { ops.set_add(c, r, k)?; }
+        }
+        it = 0;
+        while let Some(e) = value.dict_next(dy, &it) {
+            let k = value.dict_key(dy, e);
+            if ops.dict_lookup(c, dx, k)?.is_none() { ops.set_add(c, r, k)?; }
+        }
+    }
+    Ok(r)
+}
+
+fn is_subset(dx: Gc<Dict>, dy: Gc<Dict>) -> bool {
+    var it: u64 = 0;
+    while let Some(e) = value.dict_next(dx, &it) {
+        let k = value.dict_key(dx, e);
+        if value.dict_get(dy, k, value.hash_of(k) ?? 0).is_none() { return false; }
+    }
+    true
+}
+
+/// Set "order" for < <= > >=: -1 proper subset, 0 equal, 1 proper superset, 2 neither.
+pub fn set_order(x: Gc<Box>, y: Gc<Box>) -> i32 {
+    let dx = x.dict.unwrap();
+    let dy = y.dict.unwrap();
+    let a = is_subset(dx, dy);
+    let b = is_subset(dy, dx);
+    if a and b { 0 } else if a { -1 } else if b { 1 } else { 2 }
+}
+
+// ── sorting ─────────────────────────────────────────────────────────
+
+fn lt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
+    match (a, b) {
+        (Int(x), Int(y)) => Ok(x < y),
+        (Float(x), Float(y)) => Ok(x < y),
+        (Str(x), Str(y)) => Ok(mem.compare_bytes(x.data, y.data) < 0),
+        _ => ops.compare(c, ops.C_LT, a, b),
+    }
+}
+
+/// Stable merge sort of `keys` (and `vals` alongside) with Python's <.
+fn msort(c: *Ctx, keys: *mem.Vec<Value>, vals: *mem.Vec<Value>, reverse: bool) -> Result<(), Value> uses reenter {
+    let n = keys.len;
+    var tk: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    var tv: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    for i in 0..n { tk.push(keys.at(i)); tv.push(vals.at(i)); }
+    var width: u64 = 1;
+    var srck = keys;
+    var srcv = vals;
+    var dstk = &tk;
+    var dstv = &tv;
+    var flipped = false;
+    while width < n {
+        var i: u64 = 0;
+        while i < n {
+            let mid = if i + width < n { i + width } else { n };
+            let hi = if i + 2 * width < n { i + 2 * width } else { n };
+            var a = i;
+            var b = mid;
+            var o = i;
+            while a < mid and b < hi {
+                // take from b only if b < a (a <= b keeps stability); reversed: b > a
+                let take_b = if reverse { lt(c, srck.at(a), srck.at(b))? } else { lt(c, srck.at(b), srck.at(a))? };
+                if take_b { dstk.set(o, srck.at(b)); dstv.set(o, srcv.at(b)); b += 1; }
+                else { dstk.set(o, srck.at(a)); dstv.set(o, srcv.at(a)); a += 1; }
+                o += 1;
+            }
+            while a < mid { dstk.set(o, srck.at(a)); dstv.set(o, srcv.at(a)); a += 1; o += 1; }
+            while b < hi { dstk.set(o, srck.at(b)); dstv.set(o, srcv.at(b)); b += 1; o += 1; }
+            i += 2 * width;
+        }
+        let sk = srck; srck = dstk; dstk = sk;
+        let sv = srcv; srcv = dstv; dstv = sv;
+        flipped = !flipped;
+        width *= 2;
+    }
+    if flipped {
+        for i in 0..n { keys.set(i, tk.at(i)); vals.set(i, tv.at(i)); }
+    }
+    tk.free();
+    tv.free();
+    Ok(())
+}
+
+/// Sort list `l` in place (key may be Nil).
+pub fn sort_list(c: *Ctx, l: Gc<List>, key: Value, reverse: bool) -> Result<(), Value> uses reenter {
+    var keys: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
+    var vals: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
+    for i in 0..l.len { vals.push(l.arr.items[i]); }
+    // Keep the values alive in a tuple while keys are computed (guest code may collect).
+    let keep = value.tuple_of(&c.heap, vals.items());
+    let keept = value.new_tuple(&c.heap, l.len);
+    for i in 0..l.len {
+        if key == Value.Nil { keys.push(keep.items[i]); }
+        else {
+            let args = [keep.items[i]];
+            let r = vm.invoke(c, key, args[..]);
+            match r { Ok(k) => { keys.push(k); keept.items[i] = k; } Err(e) => { keys.free(); vals.free(); return Err(e); } }
+        }
+    }
+    let r = msort(c, &keys, &vals, reverse);
+    if let Err(e) = r { keys.free(); vals.free(); return Err(e); }
+    for i in 0..l.len { l.arr.items[i] = vals.at(i); }
+    keys.free();
+    vals.free();
+    Ok(())
+}
+
+// ── min / max / sum ─────────────────────────────────────────────────
+
+fn minmax(c: *Ctx, args: *Value, n: u64, kw: Value, is_max: bool) -> Result<Value, Value> uses reenter {
+    let np = npos(kw, n);
+    let key = kwarg(kw, args, n, "key") ?? Value.Nil;
+    let dflt = kwarg(kw, args, n, "default");
+    let l = if np == 1 { items_of(c, args[0])? } else { value.list_of(&c.heap, args.slice(np)) };
+    if l.len == 0 {
+        if let Some(d) = dflt { return Ok(d); }
+        return Err(exc(c, E_VALUE, if is_max { "max() iterable argument is empty" } else { "min() iterable argument is empty" }));
+    }
+    var best = l.arr.items[0];
+    var bestk = best;
+    if key != Value.Nil { let a = [best]; bestk = vm.invoke(c, key, a[..])?; }
+    for i in 1..l.len {
+        let v = l.arr.items[i];
+        var k = v;
+        if key != Value.Nil { let a = [v]; k = vm.invoke(c, key, a[..])?; }
+        let better = if is_max { lt(c, bestk, k)? } else { lt(c, k, bestk)? };
+        if better { best = v; bestk = k; }
+    }
+    Ok(best)
+}
+
+// ── calls ───────────────────────────────────────────────────────────
+
+/// Slow-path counters, printed at exit with PYLOIMI_COUNTS=1.
+pub var COUNTS: [u64; 512] = [0; 512];
+pub const CNT_GETATTR: u64 = 300;
+pub const CNT_SETATTR: u64 = 301;
+pub const CNT_LOADMETHOD: u64 = 302;
+pub const CNT_CALLSLOW: u64 = 303;
+pub const CNT_ARITH: u64 = 304;
+pub const CNT_COMPARE: u64 = 305;
+pub const CNT_GETINDEX: u64 = 306;
+pub const CNT_NEXT: u64 = 307;
+pub const CNT_GETITER: u64 = 308;
+pub const CNT_TRUTHY: u64 = 309;
+pub const CNT_SETINDEX: u64 = 310;
+pub const CNT_INVOKE: u64 = 311;
+pub const CNT_GENNEXT: u64 = 312;
+pub const CNT_CONTAINS: u64 = 313;
+
+pub fn count(i: u64) { COUNTS[i] += 1; }
+
+pub fn print_counts() {
+    var b = text.StrBuf.new();
+    for i in 0..512 {
+        if COUNTS[i] != 0 {
+            b.push_int(i as i64);
+            if i < 300 { b.push_str(" builtin "); } else { b.push_str(" slow "); }
+            b.push_int(COUNTS[i] as i64);
+            b.push('\n');
+        }
+    }
+    io.eprint(b.as_str());
+    b.free();
+}
+
+pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    count(id as u64);
+    let b = id as B;
+    let np = npos(kw, n);
+    match b {
+        Print => {
+            let sep = kwarg(kw, args, n, "sep") ?? Value.Nil;
+            let end = kwarg(kw, args, n, "end") ?? Value.Nil;
+            let file = kwarg(kw, args, n, "file") ?? Value.Nil;
+            var out = text.StrBuf.new();
+            for i in 0..np {
+                if i > 0 { if let Str(s) = sep { out.push_str(s.data); } else { out.push(' '); } }
+                let r = fmt.write_str(c, &out, args[i]);
+                if let Err(e) = r { out.free(); return Err(e); }
+            }
+            if let Str(s) = end { out.push_str(s.data); } else { out.push('\n'); }
+            if file != Value.Nil {
+                let sv = s_of(c, out.as_str());
+                out.free();
+                let a = [sv];
+                ops.call_method(c, file, "write", a[..])?;
+                return Ok(Value.Nil);
+            }
+            io.print(out.as_str());
+            out.free();
+            Ok(Value.Nil)
+        }
+        Len => {
+            if n != 1 { return Err(nargs_error(c, "len", "exactly one", n)); }
+            Ok(value.int_val(&c.heap, len_of(c, args[0])? as i64))
+        }
+        IsInstance => {
+            if n != 2 { return Err(nargs_error(c, "isinstance", "2", n)); }
+            Ok(Value.Bool(isinst(c, args[0], args[1])?))
+        }
+        IsSubclass => {
+            let Obj(x) = args[0] else { return Err(exc(c, E_TYPE, "issubclass() arg 1 must be a class")); };
+            match args[1] {
+                Obj(y) => Ok(Value.Bool(ops.subclass(x, y))),
+                Tuple(t) => {
+                    for i in 0..t.items.len { if let Obj(y) = t.items[i] and ops.subclass(x, y) { return Ok(Value.Bool(true)); } }
+                    Ok(Value.Bool(false))
+                }
+                _ => Err(exc(c, E_TYPE, "issubclass() arg 2 must be a class")),
+            }
+        }
+        Repr => fmt.repr(c, args[0]),
+        Abs => {
+            match args[0] {
+                Int(i) => Ok(value.int_val(&c.heap, if i < 0 { 0 - (i as i64) } else { i as i64 })),
+                Float(f) => Ok(Value.Float(f.abs())),
+                Bool(x) => Ok(Value.Int(if x { 1 } else { 0 })),
+                Obj(o) => if o.kind == K_BIG { Ok(big.abs(&c.heap, args[0])) } else { Err(exc(c, E_TYPE, "bad operand type for abs()")) },
+                Inst(_) => {
+                    if let Some(r) = ops.call_method(c, args[0], "__abs__", [])? { return Ok(r); }
+                    Err(exc(c, E_TYPE, "bad operand type for abs()"))
+                }
+                _ => Err(exc(c, E_TYPE, "bad operand type for abs()")),
+            }
+        }
+        Min => minmax(c, args, n, kw, false),
+        Max => minmax(c, args, n, kw, true),
+        Sum => {
+            let l = items_of(c, args[0])?;
+            var acc = if np > 1 { args[1] } else { Value.Int(0) };
+            for i in 0..l.len {
+                let v = l.arr.items[i];
+                acc = match (acc, v) {
+                    (Int(x), Int(y)) => value.int_val(&c.heap, x as i64 + y as i64),
+                    (Float(x), Float(y)) => Value.Float(x + y),
+                    _ => ops.arith(c, ops.O_ADD, acc, v)?,
+                };
+            }
+            Ok(acc)
+        }
+        Sorted => {
+            let src = items_of(c, args[0])?;
+            let l = value.list_of(&c.heap, value.list_items(src));
+            let key = kwarg(kw, args, n, "key") ?? Value.Nil;
+            let rev = kwarg(kw, args, n, "reverse") ?? Value.Bool(false);
+            sort_list(c, l, key, ops.truthy(c, rev)?)?;
+            Ok(Value.List(l))
+        }
+        Reversed => {
+            let v = args[0];
+            match v {
+                List(_) | Tuple(_) | Str(_) => {
+                    let r = value.new_box(&c.heap, K_REVIT, 0);
+                    r.a = v;
+                    r.n = len_of(c, v)? as i64;
+                    Ok(Value.Obj(r))
+                }
+                _ => {
+                    if let Inst(_) = v {
+                        if let Some(r) = ops.call_method(c, v, "__reversed__", [])? { return Ok(r); }
+                    }
+                    let l = items_of(c, v)?;
+                    let cp = value.list_of(&c.heap, value.list_items(l));
+                    let r = value.new_box(&c.heap, K_REVIT, 0);
+                    r.a = Value.List(cp);
+                    r.n = cp.len as i64;
+                    Ok(Value.Obj(r))
+                }
+            }
+        }
+        Enumerate => {
+            let it = ops.getiter(c, args[0])?;
+            let r = value.new_box(&c.heap, K_ENUMIT, 0);
+            r.a = it;
+            let st = if np > 1 { args[1] } else { kwarg(kw, args, n, "start") ?? Value.Int(0) };
+            r.n = want_int(c, st)?;
+            Ok(Value.Obj(r))
+        }
+        Zip => {
+            let t = value.new_tuple(&c.heap, np);
+            for i in 0..np { t.items[i] = ops.getiter(c, args[i])?; }
+            let r = value.new_box(&c.heap, K_ZIPIT, 0);
+            r.a = Value.Tuple(t);
+            Ok(Value.Obj(r))
+        }
+        Map => {
+            let t = value.new_tuple(&c.heap, np - 1);
+            for i in 1..np { t.items[i - 1] = ops.getiter(c, args[i])?; }
+            let r = value.new_box(&c.heap, K_MAPIT, 0);
+            r.a = args[0];
+            r.b = Value.Tuple(t);
+            Ok(Value.Obj(r))
+        }
+        Filter => {
+            let r = value.new_box(&c.heap, K_FILTERIT, 0);
+            r.a = args[0];
+            r.b = ops.getiter(c, args[1])?;
+            Ok(Value.Obj(r))
+        }
+        Iter => ops.getiter(c, args[0]),
+        Next => {
+            if let Some(v) = ops.next(c, args[0])? { return Ok(v); }
+            if np > 1 { return Ok(args[1]); }
+            Err(exc_of_empty(c, E_STOPITER))
+        }
+        Hash => {
+            let h = ops.hash_key(c, args[0])?;
+            Ok(value.int_val(&c.heap, (h as i64) >> 4))
+        }
+        Id => Ok(value.int_val(&c.heap, ((args[0] as u64) & 0xffffffffffff) as i64)),
+        Ord => {
+            let s = want_str(c, args[0])?;
+            if s.data.len == 0 { return Err(exc(c, E_TYPE, "ord() expected a character, but string of length 0 found")); }
+            // decode one UTF-8 character
+            let b0 = s.data[0] as i64;
+            if b0 < 0x80 { return Ok(Value.Int(b0 as i32)); }
+            var cp: i64 = 0;
+            var k: u64 = 0;
+            if b0 >= 0xf0 { cp = b0 & 7; k = 3; } else if b0 >= 0xe0 { cp = b0 & 15; k = 2; } else { cp = b0 & 31; k = 1; }
+            for i in 1..k + 1 { if i < s.data.len { cp = (cp << 6) | ((s.data[i] as i64) & 63); } }
+            Ok(Value.Int(cp as i32))
+        }
+        Chr => {
+            let i = want_int(c, args[0])?;
+            if i < 128 and i >= 0 { return Ok(char_str(c, i as u8)); }
+            var b2 = text.StrBuf.new();
+            lex.push_utf8(&b2, i as u32);
+            Ok(buf_str(c, &b2))
+        }
+        Divmod => {
+            let q = ops.arith(c, ops.O_FLOORDIV, args[0], args[1])?;
+            let r = ops.arith(c, ops.O_MOD, args[0], args[1])?;
+            let t = value.new_tuple(&c.heap, 2);
+            t.items[0] = q;
+            t.items[1] = r;
+            Ok(Value.Tuple(t))
+        }
+        Pow => {
+            if np == 3 {
+                // modular exponentiation
+                var base = ops.arith(c, ops.O_MOD, args[0], args[2])?;
+                var e = args[1];
+                var r = Value.Int(1);
+                while !(e == Value.Int(0)) {
+                    if big.is_odd(e) { r = ops.arith(c, ops.O_MOD, ops.arith(c, ops.O_MUL, r, base)?, args[2])?; }
+                    e = ops.arith(c, ops.O_FLOORDIV, e, Value.Int(2))?;
+                    base = ops.arith(c, ops.O_MOD, ops.arith(c, ops.O_MUL, base, base)?, args[2])?;
+                }
+                return Ok(r);
+            }
+            ops.arith(c, ops.O_POW, args[0], args[1])
+        }
+        Round => {
+            let x = args[0];
+            if value.is_int(x) { return Ok(x); }
+            let f = want_f64(c, x)?;
+            if np < 2 or args[1] == Value.Nil {
+                return float_to_int(c, f.nearest());
+            }
+            let nd = want_int(c, args[1])?;
+            var buf = text.StrBuf.new();
+            fmt.write_c_float_pub(&buf, 'f', nd, f);
+            let r = text.parse_f64(buf.as_str()) ?? f;
+            buf.free();
+            Ok(Value.Float(r))
+        }
+        Any => {
+            let it = ops.getiter(c, args[0])?;
+            while let Some(v) = ops.next(c, it)? { if ops.truthy(c, v)? { return Ok(Value.Bool(true)); } }
+            Ok(Value.Bool(false))
+        }
+        All => {
+            let it = ops.getiter(c, args[0])?;
+            while let Some(v) = ops.next(c, it)? { if !ops.truthy(c, v)? { return Ok(Value.Bool(false)); } }
+            Ok(Value.Bool(true))
+        }
+        GetAttr => {
+            let s = want_str(c, args[1])?;
+            var ic: u32 = 0;
+            match ops.getattr(c, args[0], s, &ic) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    if np > 2 and ops.isinstance(c, e, c.excs[E_ATTRIBUTE].unwrap()) { return Ok(args[2]); }
+                    Err(e)
+                }
+            }
+        }
+        SetAttr => {
+            let s = want_str(c, args[1])?;
+            var ic: u32 = 0;
+            var ic2: u32 = 0;
+            var ic3: u32 = 0;
+            ops.setattr(c, args[0], vm.intern(c, s.data), args[2], &ic, &ic2, &ic3)?;
+            Ok(Value.Nil)
+        }
+        HasAttr => {
+            let s = want_str(c, args[1])?;
+            var ic: u32 = 0;
+            match ops.getattr(c, args[0], s, &ic) {
+                Ok(_) => Ok(Value.Bool(true)),
+                Err(e) => {
+                    if ops.isinstance(c, e, c.excs[E_ATTRIBUTE].unwrap()) { return Ok(Value.Bool(false)); }
+                    Err(e)
+                }
+            }
+        }
+        DelAttr => {
+            let s = want_str(c, args[1])?;
+            ops.delattr(c, args[0], s)?;
+            Ok(Value.Nil)
+        }
+        Callable => {
+            let v = args[0];
+            let r = match v {
+                Func(_) => true,
+                Builtin(_) => true,
+                Obj(o) => o.kind == K_CLASS or o.kind == K_BOUND,
+                Inst(i) => ops.class_lookup(i.cls, vm.intern(c, "__call__")).is_some(),
+                _ => false,
+            };
+            Ok(Value.Bool(r))
+        }
+        Hex | Oct | Bin => {
+            let x = args[0];
+            if !value.is_int(x) { return Err(exc(c, E_TYPE, "an integer is required")); }
+            var buf = text.StrBuf.new();
+            if big.is_neg(x) { buf.push('-'); }
+            buf.push_str(if b == B.Hex { "0x" } else if b == B.Oct { "0o" } else { "0b" });
+            write_radix(&c.heap, &buf, big.abs(&c.heap, x), if b == B.Hex { 16 } else if b == B.Oct { 8 } else { 2 }, false);
+            Ok(buf_str(c, &buf))
+        }
+        Format => {
+            let spec = if np > 1 { want_str(c, args[1])?.data } else { "" };
+            fmt.format(c, args[0], spec)
+        }
+        Globals => Ok(Value.Dict(c.globals.unwrap())),
+        Vars => {
+            if let Inst(i) = args[0] { return Ok(Value.Dict(i.dict)); }
+            Err(exc(c, E_TYPE, "vars() argument must have __dict__ attribute"))
+        }
+        Input => Err(exc(c, E_EOF, "EOF when reading a line")),
+        ObjInit => {
+            if n > 1 {
+                if let Inst(i) = args[0] {
+                    var m = text.StrBuf.new();
+                    m.push_str(ops.class_name(i.cls));
+                    m.push_str("() takes no arguments");
+                    return Err(exc_buf(c, E_TYPE, &m));
+                }
+            }
+            Ok(Value.Nil)
+        }
+        ExcInit => {
+            let Inst(i) = args[0] else { return Ok(Value.Nil); };
+            let t = value.tuple_of(&c.heap, (args + 1).slice(np - 1));
+            value.dict_set_str(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+            Ok(Value.Nil)
+        }
+        ObjEq => Ok(Value.Bool(args[0] == args[1])),
+        ObjNe => Ok(Value.Bool(args[0] != args[1])),
+        ObjHash => Ok(value.int_val(&c.heap, ((args[0] as u64 >> 4) & 0x7fffffff) as i64)),
+        ObjRepr => fmt.repr(c, args[0]),
+        ObjStr => fmt.to_str(c, args[0]),
+        _ => call_method_builtin(c, b, args, n, kw),
+    }
+}
+
+fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
+    let cls = c.excs[kind].unwrap();
+    let d = value.new_dict(&c.heap, 1);
+    let inst = new(&c.heap, Inst { cls: cls, dict: d });
+    value.dict_set_str(&c.heap, d, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
+    Value.Inst(inst)
+}
+
+pub fn isinst(c: *Ctx, v: Value, cls: Value) -> Result<bool, Value> {
+    match cls {
+        Obj(k) => {
+            if k.kind != K_CLASS { return Err(exc(c, E_TYPE, "isinstance() arg 2 must be a type or tuple of types")); }
+            Ok(ops.isinstance(c, v, k))
+        }
+        Tuple(t) => {
+            for i in 0..t.items.len { if isinst(c, v, t.items[i])? { return Ok(true); } }
+            Ok(false)
+        }
+        _ => Err(exc(c, E_TYPE, "isinstance() arg 2 must be a type or tuple of types")),
+    }
+}
+
+// ── constructors of builtin types ───────────────────────────────────
+
+pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    let np = npos(kw, n);
+    if cls.n == 1000 or cls.n == 1001 {
+        let b = value.new_box(&c.heap, if cls.n == 1000 { K_STATICM } else { K_CLASSM }, 0);
+        b.a = args[0];
+        return Ok(Value.Obj(b));
+    }
+    let t = (cls.n - 1) as u64;
+    match t {
+        T_INT => {
+            if np == 0 { return Ok(Value.Int(0)); }
+            let x = args[0];
+            let basev = if np > 1 { Some(args[1]) } else { kwarg(kw, args, n, "base") };
+            if let Str(s) = x { return parse_int(c, s.data, if let Some(bv2) = basev { want_int(c, bv2)? } else { 10 }); }
+            match x {
+                Int(_) => Ok(x),
+                Bool(v) => Ok(Value.Int(if v { 1 } else { 0 })),
+                Float(f) => float_to_int(c, f),
+                Obj(o) => if o.kind == K_BIG { Ok(x) } else { Err(int_arg_error(c, x)) },
+                Inst(_) => {
+                    if let Some(r) = ops.call_method(c, x, "__int__", [])? { return Ok(r); }
+                    if let Some(r) = ops.call_method(c, x, "__index__", [])? { return Ok(r); }
+                    Err(int_arg_error(c, x))
+                }
+                _ => Err(int_arg_error(c, x)),
+            }
+        }
+        T_FLOAT => {
+            if np == 0 { return Ok(Value.Float(0.0)); }
+            let x = args[0];
+            if let Str(s) = x { return parse_float(c, s.data); }
+            if let Inst(_) = x {
+                if let Some(r) = ops.call_method(c, x, "__float__", [])? { return Ok(r); }
+            }
+            Ok(Value.Float(want_f64(c, x)?))
+        }
+        T_STR => { if np == 0 { return Ok(s_of(c, "")); } fmt.to_str(c, args[0]) }
+        T_BOOL => { if np == 0 { return Ok(Value.Bool(false)); } Ok(Value.Bool(ops.truthy(c, args[0])?)) }
+        T_LIST => {
+            if np == 0 { return Ok(Value.List(value.new_list(&c.heap, 0))); }
+            let l = value.new_list(&c.heap, 0);
+            ops.list_extend(c, Value.List(l), args[0])?;
+            Ok(Value.List(l))
+        }
+        T_TUPLE => {
+            if np == 0 { return Ok(Value.Tuple(value.new_tuple(&c.heap, 0))); }
+            if let Tuple(_) = args[0] { return Ok(args[0]); }
+            let l = items_of(c, args[0])?;
+            Ok(Value.Tuple(value.tuple_of(&c.heap, value.list_items(l))))
+        }
+        T_DICT => {
+            let d = value.new_dict(&c.heap, 0);
+            if np > 0 { dict_update(c, d, args[0])?; }
+            if let Tuple(kt) = kw {
+                for i in 0..kt.items.len { ops.dict_put(c, d, kt.items[i], args[np + i])?; }
+            }
+            Ok(Value.Dict(d))
+        }
+        T_SET | T_FROZENSET => {
+            let s = ops.new_set(c, t == T_FROZENSET);
+            if np > 0 and let List(l) = args[0] {
+                for i in 0..l.len { ops.set_add(c, s, l.arr.items[i])?; }
+                return Ok(s);
+            }
+            if np > 0 {
+                let it = ops.getiter(c, args[0])?;
+                while let Some(v) = ops.next(c, it)? { ops.set_add(c, s, v)?; }
+            }
+            Ok(s)
+        }
+        T_RANGE => {
+            let r = value.new_box(&c.heap, K_RANGE, 0);
+            r.s = 1;
+            if np == 1 { r.m = want_int(c, args[0])?; }
+            else if np >= 2 { r.n = want_int(c, args[0])?; r.m = want_int(c, args[1])?; }
+            else { return Err(exc(c, E_TYPE, "range expected at least 1 argument, got 0")); }
+            if np >= 3 {
+                r.s = want_int(c, args[2])?;
+                if r.s == 0 { return Err(exc(c, E_VALUE, "range() arg 3 must not be zero")); }
+            }
+            Ok(Value.Obj(r))
+        }
+        T_OBJECT => Ok(ops.new_instance(c, cls)),
+        T_TYPE => {
+            if np == 1 { return Ok(Value.Obj(ops.class_of(c, args[0]))); }
+            Err(exc(c, E_TYPE, "type() with 3 arguments is not supported"))
+        }
+        T_PROPERTY => {
+            let p = value.new_box(&c.heap, K_PROPERTY, 0);
+            p.a = if np > 0 { args[0] } else { kwarg(kw, args, n, "fget") ?? Value.Nil };
+            p.b = if np > 1 { args[1] } else { kwarg(kw, args, n, "fset") ?? Value.Nil };
+            Ok(Value.Obj(p))
+        }
+        T_SUPER => {
+            if np != 2 { return Err(exc(c, E_RUNTIME, "super(): only the two-argument form is a call")); }
+            let Obj(k) = args[0] else { return Err(exc(c, E_TYPE, "super() argument 1 must be a type")); };
+            let s = value.new_box(&c.heap, K_SUPER, 0);
+            s.a = args[1];
+            s.base = Some(k);
+            Ok(Value.Obj(s))
+        }
+        T_SLICE => {
+            let s = value.new_box(&c.heap, K_SLICE, 0);
+            if np == 1 { s.b = args[0]; }
+            else { s.a = args[0]; s.b = if np > 1 { args[1] } else { Value.Nil }; s.c = if np > 2 { args[2] } else { Value.Nil }; }
+            Ok(Value.Obj(s))
+        }
+        _ => Err(ops.not_callable(c, Value.Obj(cls))),
+    }
+}
+
+fn int_arg_error(c: *Ctx, x: Value) -> Value {
+    var b = text.StrBuf.new();
+    b.push_str("int() argument must be a string, a bytes-like object or a real number, not '");
+    b.push_str(type_name(c, x));
+    b.push('\'');
+    exc_buf(c, E_TYPE, &b)
+}
+
+fn trim_ws(s: str) -> str {
+    var a: u64 = 0;
+    var z = s.len;
+    while a < z and text.is_space(s[a]) { a += 1; }
+    while z > a and text.is_space(s[z - 1]) { z -= 1; }
+    s[a..z]
+}
+
+fn parse_int(c: *Ctx, s0: str, base0: i64) -> Result<Value, Value> {
+    let s = trim_ws(s0);
+    var i: u64 = 0;
+    var neg = false;
+    if i < s.len and (s[i] == '+' or s[i] == '-') { neg = s[i] == '-'; i += 1; }
+    var base = base0;
+    if (base == 16 or base == 0) and i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X') { base = 16; i += 2; }
+    else if (base == 8 or base == 0) and i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'o' or s[i + 1] == 'O') { base = 8; i += 2; }
+    else if (base == 2 or base == 0) and i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'b' or s[i + 1] == 'B') { base = 2; i += 2; }
+    if base == 0 { base = 10; }
+    if let Some(v) = big.parse(&c.heap, s[i..s.len], base as u32, neg) { return Ok(v); }
+    var b = text.StrBuf.new();
+    b.push_str("invalid literal for int() with base ");
+    b.push_int(base0);
+    b.push_str(": ");
+    fmt.write_str_repr(&b, s0);
+    Err(exc_buf(c, E_VALUE, &b))
+}
+
+fn parse_float(c: *Ctx, s0: str) -> Result<Value, Value> {
+    let s = trim_ws(s0);
+    var low = text.StrBuf.new();
+    for i in 0..s.len { let ch = s[i]; low.push(if ch >= 'A' and ch <= 'Z' { ch + 32 } else { ch }); }
+    let l = low.as_str();
+    var r: ?f64 = None;
+    if l.eq("inf") or l.eq("+inf") or l.eq("infinity") { r = Some(1.0 / 0.0); }
+    else if l.eq("-inf") or l.eq("-infinity") { r = Some(-1.0 / 0.0); }
+    else if l.eq("nan") or l.eq("+nan") or l.eq("-nan") { r = Some(0.0 / 0.0); }
+    else if let Ok(f) = num.parse_f64(s) { r = Some(f); }
+    low.free();
+    if let Some(f) = r { return Ok(Value.Float(f)); }
+    var b = text.StrBuf.new();
+    b.push_str("could not convert string to float: ");
+    fmt.write_str_repr(&b, s0);
+    Err(exc_buf(c, E_VALUE, &b))
+}
+
+fn dict_update(c: *Ctx, d: Gc<Dict>, src: Value) -> Result<(), Value> uses reenter {
+    if let Dict(s) = src {
+        var it: u64 = 0;
+        while let Some(e) = value.dict_next(s, &it) { ops.dict_put(c, d, value.dict_key(s, e), value.dict_val(s, e))?; }
+        return Ok(());
+    }
+    let it = ops.getiter(c, src)?;
+    while let Some(p) = ops.next(c, it)? {
+        let l = items_of(c, p)?;
+        if l.len != 2 { return Err(exc(c, E_VALUE, "dictionary update sequence element has wrong length")); }
+        ops.dict_put(c, d, l.arr.items[0], l.arr.items[1])?;
+    }
+    Ok(())
+}
+
+// ── methods ─────────────────────────────────────────────────────────
+
+fn is_ws(ch: u8) -> bool { ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r' or ch == 11 or ch == 12 }
+
+fn inset(chars: ?str, ch: u8) -> bool {
+    if let Some(cs) = chars { return mem.find_byte(cs, ch).is_some(); }
+    is_ws(ch)
+}
+
+fn strip_chars(s: str, chars: ?str, left: bool, right: bool) -> str {
+    var a: u64 = 0;
+    var z = s.len;
+    if left { while a < z and inset(chars, s[a]) { a += 1; } }
+    if right { while z > a and inset(chars, s[z - 1]) { z -= 1; } }
+    s[a..z]
+}
+
+fn affix(sub: str, p: str, starts: bool) -> bool {
+    if p.len > sub.len { return false; }
+    if starts { mem.equal_bytes(sub[0..p.len], p) } else { mem.equal_bytes(sub[sub.len - p.len..sub.len], p) }
+}
+
+fn find_sub(s: str, sub: str, start: u64, end: u64) -> ?u64 {
+    if start > end or end > s.len { return None; }
+    if sub.len == 0 { return Some(start); }
+    let r = mem.find_bytes(s[start..end], sub)?;
+    Some(start + r)
+}
+
+fn rfind_sub(s: str, sub: str, start: u64, end: u64) -> ?u64 {
+    if start > end or end > s.len or sub.len > end - start { return None; }
+    var i = end - sub.len + 1;
+    while i > start {
+        i -= 1;
+        if mem.equal_bytes(s[i..i + sub.len], sub) { return Some(i); }
+    }
+    None
+}
+
+/// Slice bounds for str.find-like methods.
+fn bounds(c: *Ctx, args: *Value, np: u64, first: u64, len: u64) -> Result<(u64, u64), Value> {
+    var a: i64 = 0;
+    var z: i64 = len as i64;
+    if np > first and args[first] != Value.Nil { a = want_int(c, args[first])?; if a < 0 { a += len as i64; } if a < 0 { a = 0; } }
+    if np > first + 1 and args[first + 1] != Value.Nil { z = want_int(c, args[first + 1])?; if z < 0 { z += len as i64; } if z < 0 { z = 0; } }
+    if z > len as i64 { z = len as i64; }
+    if a > len as i64 { a = len as i64 + 1; }
+    Ok((a as u64, z as u64))
+}
+
+fn split_str(c: *Ctx, s: str, sep: Value, maxsplit: i64, from_right: bool) -> Result<Value, Value> {
+    let l = value.new_list(&c.heap, 0);
+    if sep == Value.Nil {
+        // whitespace split
+        var parts: mem.Vec<(u64, u64)> = mem.Vec.new();
+        var i: u64 = 0;
+        while i < s.len {
+            while i < s.len and is_ws(s[i]) { i += 1; }
+            if i >= s.len { break; }
+            let st = i;
+            while i < s.len and !is_ws(s[i]) { i += 1; }
+            parts.push((st, i));
+        }
+        if maxsplit >= 0 and parts.len as i64 > maxsplit + 1 {
+            let k = maxsplit as u64;
+            if !from_right {
+                for j in 0..k { let (a, z) = parts.at(j); value.list_push(&c.heap, l, s_of(c, s[a..z])); }
+                let (a, _z) = parts.at(k);
+                value.list_push(&c.heap, l, s_of(c, strip_chars(s[a..s.len], None, false, true)));
+            } else {
+                let first = parts.len - k;
+                let (_a, z) = parts.at(first - 1);
+                value.list_push(&c.heap, l, s_of(c, strip_chars(s[0..z], None, true, false)));
+                for j in first..parts.len { let (a, z2) = parts.at(j); value.list_push(&c.heap, l, s_of(c, s[a..z2])); }
+            }
+        } else {
+            for j in 0..parts.len { let (a, z) = parts.at(j); value.list_push(&c.heap, l, s_of(c, s[a..z])); }
+        }
+        parts.free();
+        return Ok(Value.List(l));
+    }
+    let sp = want_str(c, sep)?.data;
+    if sp.len == 0 { return Err(exc(c, E_VALUE, "empty separator")); }
+    if from_right and maxsplit >= 0 {
+        var pieces: mem.Vec<(u64, u64)> = mem.Vec.new();
+        var end = s.len;
+        var count: i64 = 0;
+        while count < maxsplit {
+            let Some(p) = rfind_sub(s, sp, 0, end) else { break; };
+            pieces.push((p + sp.len, end));
+            end = p;
+            count += 1;
+        }
+        value.list_push(&c.heap, l, s_of(c, s[0..end]));
+        var j = pieces.len;
+        while j > 0 { j -= 1; let (a, z) = pieces.at(j); value.list_push(&c.heap, l, s_of(c, s[a..z])); }
+        pieces.free();
+        return Ok(Value.List(l));
+    }
+    var start: u64 = 0;
+    var count: i64 = 0;
+    loop {
+        if maxsplit >= 0 and count >= maxsplit { break; }
+        let Some(p) = find_sub(s, sp, start, s.len) else { break; };
+        value.list_push(&c.heap, l, s_of(c, s[start..p]));
+        start = p + sp.len;
+        count += 1;
+    }
+    value.list_push(&c.heap, l, s_of(c, s[start..s.len]));
+    Ok(Value.List(l))
+}
+
+fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    let np = npos(kw, n);
+    let selfv = args[0];
+    match b {
+        // ── str
+        SJoin => {
+            let s = want_str(c, selfv)?;
+            let l = items_of(c, args[1])?;
+            var out = text.StrBuf.new();
+            for i in 0..l.len {
+                if i > 0 { out.push_str(s.data); }
+                let Str(x) = l.arr.items[i] else {
+                    out.free();
+                    var m = text.StrBuf.new();
+                    m.fmt("sequence item {}: expected str instance, ", i);
+                    m.push_str(type_name(c, l.arr.items[i]));
+                    m.push_str(" found");
+                    return Err(exc_buf(c, E_TYPE, &m));
+                };
+                out.push_str(x.data);
+            }
+            Ok(buf_str(c, &out))
+        }
+        SSplit | SRsplit => {
+            let s = want_str(c, selfv)?;
+            let sep = if np > 1 { args[1] } else { kwarg(kw, args, n, "sep") ?? Value.Nil };
+            let mx = if np > 2 { want_int(c, args[2])? } else if let Some(m) = kwarg(kw, args, n, "maxsplit") { want_int(c, m)? } else { -1 };
+            split_str(c, s.data, sep, mx, b == B.SRsplit)
+        }
+        SStrip | SLstrip | SRstrip => {
+            let s = want_str(c, selfv)?;
+            let chars: ?str = if np > 1 and args[1] != Value.Nil { Some(want_str(c, args[1])?.data) } else { None };
+            let r = strip_chars(s.data, chars, b != B.SRstrip, b != B.SLstrip);
+            if r.len == s.data.len { return Ok(selfv); }
+            Ok(s_of(c, r))
+        }
+        SStartswith | SEndswith => {
+            let s = want_str(c, selfv)?.data;
+            let (a, z) = bounds(c, args, np, 2, s.len)?;
+            if a > z { return Ok(Value.Bool(false)); }
+            let sub = s[a..z];
+            let starts = b == B.SStartswith;
+            if let Tuple(t) = args[1] {
+                for i in 0..t.items.len { if let Str(p) = t.items[i] and affix(sub, p.data, starts) { return Ok(Value.Bool(true)); } }
+                return Ok(Value.Bool(false));
+            }
+            Ok(Value.Bool(affix(sub, want_str(c, args[1])?.data, starts)))
+        }
+        SFind | SRfind | SIndex | SRindex => {
+            let s = want_str(c, selfv)?.data;
+            let sub = want_str(c, args[1])?.data;
+            let (a, z) = bounds(c, args, np, 2, s.len)?;
+            let r = if b == B.SFind or b == B.SIndex { find_sub(s, sub, a, z) } else { rfind_sub(s, sub, a, z) };
+            match r {
+                Some(i) => Ok(value.int_val(&c.heap, i as i64)),
+                None => if b == B.SFind or b == B.SRfind { Ok(Value.Int(-1)) } else { Err(exc(c, E_VALUE, "substring not found")) },
+            }
+        }
+        SCount => {
+            let s = want_str(c, selfv)?.data;
+            let sub = want_str(c, args[1])?.data;
+            let (a, z) = bounds(c, args, np, 2, s.len)?;
+            var k: i64 = 0;
+            var i = a;
+            if sub.len == 0 { return Ok(value.int_val(&c.heap, (z - a + 1) as i64)); }
+            while let Some(p) = find_sub(s, sub, i, z) { k += 1; i = p + sub.len; }
+            Ok(value.int_val(&c.heap, k))
+        }
+        SReplace => {
+            let s = want_str(c, selfv)?.data;
+            let old = want_str(c, args[1])?.data;
+            let new_ = want_str(c, args[2])?.data;
+            let mx = if np > 3 { want_int(c, args[3])? } else { -1 };
+            var out = text.StrBuf.new();
+            var i: u64 = 0;
+            var k: i64 = 0;
+            if old.len == 0 {
+                while i <= s.len and (mx < 0 or k < mx) {
+                    out.push_str(new_);
+                    if i < s.len { out.push(s[i]); }
+                    i += 1;
+                    k += 1;
+                }
+                if i < s.len { out.push_str(s[i..s.len]); }
+                return Ok(buf_str(c, &out));
+            }
+            while i < s.len {
+                if mx >= 0 and k >= mx { break; }
+                let Some(p) = find_sub(s, old, i, s.len) else { break; };
+                out.push_str(s[i..p]);
+                out.push_str(new_);
+                i = p + old.len;
+                k += 1;
+            }
+            out.push_str(s[i..s.len]);
+            Ok(buf_str(c, &out))
+        }
+        SUpper | SLower | SSwapcase | STitle | SCapitalize => {
+            let s = want_str(c, selfv)?.data;
+            var out = text.StrBuf.new();
+            var prev_alpha = false;
+            for i in 0..s.len {
+                let ch = s[i];
+                let up = ch >= 'a' and ch <= 'z';
+                let lo = ch >= 'A' and ch <= 'Z';
+                var r = ch;
+                if b == B.SUpper { if up { r = ch - 32; } }
+                else if b == B.SLower { if lo { r = ch + 32; } }
+                else if b == B.SSwapcase { if up { r = ch - 32; } else if lo { r = ch + 32; } }
+                else if b == B.STitle { if !prev_alpha and up { r = ch - 32; } else if prev_alpha and lo { r = ch + 32; } }
+                else { if i == 0 and up { r = ch - 32; } else if i > 0 and lo { r = ch + 32; } }
+                prev_alpha = up or lo;
+                out.push(r);
+            }
+            Ok(buf_str(c, &out))
+        }
+        SIsdigit | SIsalpha | SIsspace | SIsupper | SIslower | SIsalnum => {
+            let s = want_str(c, selfv)?.data;
+            if s.len == 0 { return Ok(Value.Bool(false)); }
+            var any_cased = false;
+            for i in 0..s.len {
+                let ch = s[i];
+                let isd = ch >= '0' and ch <= '9';
+                let isa = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z');
+                let ok = match b {
+                    SIsdigit => isd,
+                    SIsalpha => isa,
+                    SIsspace => is_ws(ch),
+                    SIsalnum => isd or isa,
+                    SIsupper => { if ch >= 'A' and ch <= 'Z' { any_cased = true; } !(ch >= 'a' and ch <= 'z') }
+                    _ => { if ch >= 'a' and ch <= 'z' { any_cased = true; } !(ch >= 'A' and ch <= 'Z') }
+                };
+                if !ok { return Ok(Value.Bool(false)); }
+            }
+            if b == B.SIsupper or b == B.SIslower { return Ok(Value.Bool(any_cased)); }
+            Ok(Value.Bool(true))
+        }
+        SSplitlines => {
+            let s = want_str(c, selfv)?.data;
+            let keep = np > 1 and ops.truthy(c, args[1])?;
+            let l = value.new_list(&c.heap, 0);
+            var st: u64 = 0;
+            var i: u64 = 0;
+            while i < s.len {
+                if s[i] == '\n' or s[i] == '\r' {
+                    var e = i + 1;
+                    if s[i] == '\r' and e < s.len and s[e] == '\n' { e += 1; }
+                    value.list_push(&c.heap, l, s_of(c, s[st..if keep { e } else { i }]));
+                    st = e;
+                    i = e;
+                } else { i += 1; }
+            }
+            if st < s.len { value.list_push(&c.heap, l, s_of(c, s[st..s.len])); }
+            Ok(Value.List(l))
+        }
+        SLjust | SRjust | SCenter | SZfill => {
+            let s = want_str(c, selfv)?.data;
+            let w = want_int(c, args[1])?;
+            if w <= s.len as i64 { return Ok(selfv); }
+            let fill: u8 = if b == B.SZfill { '0' } else if np > 2 { want_str(c, args[2])?.data[0] } else { ' ' };
+            let padn = (w as u64) - s.len;
+            var out = text.StrBuf.new();
+            if b == B.SLjust { out.push_str(s); for _i in 0..padn { out.push(fill); } }
+            else if b == B.SRjust { for _i in 0..padn { out.push(fill); } out.push_str(s); }
+            else if b == B.SCenter {
+                let left = padn / 2 + (padn & (w as u64) & 1);
+                for _i in 0..left { out.push(fill); }
+                out.push_str(s);
+                for _i in 0..padn - left { out.push(fill); }
+            } else {
+                var k: u64 = 0;
+                if s.len > 0 and (s[0] == '-' or s[0] == '+') { out.push(s[0]); k = 1; }
+                for _i in 0..padn { out.push('0'); }
+                out.push_str(s[k..s.len]);
+            }
+            Ok(buf_str(c, &out))
+        }
+        SPartition | SRpartition => {
+            let s = want_str(c, selfv)?.data;
+            let sep = want_str(c, args[1])?.data;
+            let t = value.new_tuple(&c.heap, 3);
+            let r = if b == B.SPartition { find_sub(s, sep, 0, s.len) } else { rfind_sub(s, sep, 0, s.len) };
+            match r {
+                Some(p) => { t.items[0] = s_of(c, s[0..p]); t.items[1] = args[1]; t.items[2] = s_of(c, s[p + sep.len..s.len]); }
+                None => {
+                    if b == B.SPartition { t.items[0] = selfv; t.items[1] = s_of(c, ""); t.items[2] = s_of(c, ""); }
+                    else { t.items[0] = s_of(c, ""); t.items[1] = s_of(c, ""); t.items[2] = selfv; }
+                }
+            }
+            Ok(Value.Tuple(t))
+        }
+        SEncode => Ok(selfv),
+        SFormat => str_format(c, want_str(c, selfv)?, args + 1, np - 1, kw, n - np),
+        // ── list
+        LAppend => {
+            let List(l) = selfv else { return Err(exc(c, E_TYPE, "descriptor 'append' requires a 'list' object")); };
+            value.list_push(&c.heap, l, args[1]);
+            Ok(Value.Nil)
+        }
+        LExtend => { ops.list_extend(c, selfv, args[1])?; Ok(Value.Nil) }
+        LPop => {
+            let List(l) = selfv else { trap() };
+            if l.len == 0 { return Err(exc(c, E_INDEX, "pop from empty list")); }
+            var i = l.len as i64 - 1;
+            if np > 1 { i = want_int(c, args[1])?; if i < 0 { i += l.len as i64; } }
+            if i < 0 or i >= l.len as i64 { return Err(exc(c, E_INDEX, "pop index out of range")); }
+            let j = i as u64;
+            let v = l.arr.items[j];
+            for k in j..l.len - 1 { l.arr.items[k] = l.arr.items[k + 1]; }
+            l.len -= 1;
+            l.arr.items[l.len] = Value.Nil;
+            Ok(v)
+        }
+        LInsert => {
+            let List(l) = selfv else { trap() };
+            var i = want_int(c, args[1])?;
+            if i < 0 { i += l.len as i64; if i < 0 { i = 0; } }
+            if i > l.len as i64 { i = l.len as i64; }
+            value.list_push(&c.heap, l, Value.Nil);
+            var k = l.len - 1;
+            while k > i as u64 { l.arr.items[k] = l.arr.items[k - 1]; k -= 1; }
+            l.arr.items[i as u64] = args[2];
+            Ok(Value.Nil)
+        }
+        LRemove => {
+            let List(l) = selfv else { trap() };
+            for i in 0..l.len {
+                if ops.equal(c, l.arr.items[i], args[1])? {
+                    for k in i..l.len - 1 { l.arr.items[k] = l.arr.items[k + 1]; }
+                    l.len -= 1;
+                    l.arr.items[l.len] = Value.Nil;
+                    return Ok(Value.Nil);
+                }
+            }
+            Err(exc(c, E_VALUE, "list.remove(x): x not in list"))
+        }
+        LIndex | TIndex => {
+            let xs = if let List(l) = selfv { value.list_items(l) } else if let Tuple(t) = selfv { t.items } else { trap() };
+            let (a, z) = bounds(c, args, np, 2, xs.len)?;
+            for i in a..z { if ops.equal(c, xs[i], args[1])? { return Ok(value.int_val(&c.heap, i as i64)); } }
+            Err(exc(c, E_VALUE, if b == B.LIndex { "list.index(x): x not in list" } else { "tuple.index(x): x not in tuple" }))
+        }
+        LCount | TCount => {
+            let xs = if let List(l) = selfv { value.list_items(l) } else if let Tuple(t) = selfv { t.items } else { trap() };
+            var k: i64 = 0;
+            for i in 0..xs.len { if ops.equal(c, xs[i], args[1])? { k += 1; } }
+            Ok(value.int_val(&c.heap, k))
+        }
+        LSort => {
+            let List(l) = selfv else { trap() };
+            let key = kwarg(kw, args, n, "key") ?? Value.Nil;
+            let rev = kwarg(kw, args, n, "reverse") ?? Value.Bool(false);
+            sort_list(c, l, key, ops.truthy(c, rev)?)?;
+            Ok(Value.Nil)
+        }
+        LReverse => {
+            let List(l) = selfv else { trap() };
+            if l.len > 1 {
+                var i: u64 = 0;
+                var j = l.len - 1;
+                while i < j { let t = l.arr.items[i]; l.arr.items[i] = l.arr.items[j]; l.arr.items[j] = t; i += 1; j -= 1; }
+            }
+            Ok(Value.Nil)
+        }
+        LCopy => { let List(l) = selfv else { trap() }; Ok(Value.List(value.list_of(&c.heap, value.list_items(l)))) }
+        LClear => {
+            let List(l) = selfv else { trap() };
+            for i in 0..l.len { l.arr.items[i] = Value.Nil; }
+            l.len = 0;
+            Ok(Value.Nil)
+        }
+        // ── dict
+        DGet => {
+            let Dict(d) = selfv else { trap() };
+            if let Some(v) = ops.dict_lookup(c, d, args[1])? { return Ok(v); }
+            Ok(if np > 2 { args[2] } else { Value.Nil })
+        }
+        DKeys | DValues | DItems => {
+            let v = value.new_box(&c.heap, K_DICTVIEW, 0);
+            v.a = selfv;
+            v.m = if b == B.DKeys { 0 } else if b == B.DValues { 1 } else { 2 };
+            Ok(Value.Obj(v))
+        }
+        DPop => {
+            let Dict(d) = selfv else { trap() };
+            if let Some(v) = ops.dict_lookup(c, d, args[1])? {
+                let hv = ops.hash_key(c, args[1])?;
+                value.dict_del(d, args[1], hv);
+                return Ok(v);
+            }
+            if np > 2 { return Ok(args[2]); }
+            Err(ops.key_error(c, args[1]))
+        }
+        DSetdefault => {
+            let Dict(d) = selfv else { trap() };
+            if let Some(v) = ops.dict_lookup(c, d, args[1])? { return Ok(v); }
+            let dv = if np > 2 { args[2] } else { Value.Nil };
+            ops.dict_put(c, d, args[1], dv)?;
+            Ok(dv)
+        }
+        DUpdate => {
+            let Dict(d) = selfv else { trap() };
+            if np > 1 { dict_update(c, d, args[1])?; }
+            if let Tuple(kt) = kw { for i in 0..kt.items.len { ops.dict_put(c, d, kt.items[i], args[np + i])?; } }
+            Ok(Value.Nil)
+        }
+        DCopy => { let Dict(d) = selfv else { trap() }; Ok(Value.Dict(value.dict_copy(&c.heap, d))) }
+        DClear => { let Dict(d) = selfv else { trap() }; value.dict_clear(&c.heap, d); Ok(Value.Nil) }
+        DPopitem => {
+            let Dict(d) = selfv else { trap() };
+            if d.len == 0 { return Err(exc(c, E_KEY, "popitem(): dictionary is empty")); }
+            var e = d.used;
+            while e > 0 { e -= 1; if value.dict_key(d, e) != Value.Undef { break; } }
+            let k = value.dict_key(d, e);
+            let t = value.new_tuple(&c.heap, 2);
+            t.items[0] = k;
+            t.items[1] = value.dict_val(d, e);
+            value.dict_del(d, k, ops.hash_key(c, k)?);
+            Ok(Value.Tuple(t))
+        }
+        DFromkeys => {
+            let d = value.new_dict(&c.heap, 0);
+            let off: u64 = if value.is_kind(args[0], K_CLASS) { 1 } else { 0 };
+            let l = items_of(c, args[off])?;
+            let v = if np > off + 1 { args[off + 1] } else { Value.Nil };
+            for i in 0..l.len { ops.dict_put(c, d, l.arr.items[i], v)?; }
+            Ok(Value.Dict(d))
+        }
+        // ── set
+        StAdd => { ops.set_add(c, selfv, args[1])?; Ok(Value.Nil) }
+        StRemove | StDiscard => {
+            let d = set_dict(selfv).unwrap();
+            let hv = ops.hash_key(c, args[1])?;
+            if !value.dict_del(d, args[1], hv) and b == B.StRemove { return Err(ops.key_error(c, args[1])); }
+            Ok(Value.Nil)
+        }
+        StPop => {
+            let d = set_dict(selfv).unwrap();
+            var it: u64 = 0;
+            let Some(e) = value.dict_next(d, &it) else { return Err(exc(c, E_KEY, "pop from an empty set")); };
+            let k = value.dict_key(d, e);
+            value.dict_del(d, k, ops.hash_key(c, k)?);
+            Ok(k)
+        }
+        StClear => { value.dict_clear(&c.heap, set_dict(selfv).unwrap()); Ok(Value.Nil) }
+        StCopy => {
+            let Obj(o) = selfv else { trap() };
+            let r = value.new_box(&c.heap, o.kind, 0);
+            r.dict = Some(value.dict_copy(&c.heap, o.dict.unwrap()));
+            Ok(Value.Obj(r))
+        }
+        StUpdate => {
+            for i in 1..np {
+                let it = ops.getiter(c, args[i])?;
+                while let Some(v) = ops.next(c, it)? { ops.set_add(c, selfv, v)?; }
+            }
+            Ok(Value.Nil)
+        }
+        StUnion | StIntersection | StDifference | StSymdiff => {
+            let Obj(o) = selfv else { trap() };
+            var acc = selfv;
+            if np == 1 {
+                let r = value.new_box(&c.heap, o.kind, 0);
+                r.dict = Some(value.dict_copy(&c.heap, o.dict.unwrap()));
+                return Ok(Value.Obj(r));
+            }
+            for i in 1..np {
+                var other = args[i];
+                if set_dict(other).is_none() {
+                    let s = ops.new_set(c, false);
+                    let it = ops.getiter(c, other)?;
+                    while let Some(v) = ops.next(c, it)? { ops.set_add(c, s, v)?; }
+                    other = s;
+                }
+                let Obj(x) = acc else { trap() };
+                let Obj(y) = other else { trap() };
+                let op = if b == B.StUnion { ops.O_BOR } else if b == B.StIntersection { ops.O_BAND } else if b == B.StDifference { ops.O_SUB } else { ops.O_BXOR };
+                acc = set_op(c, op, x, y)?;
+            }
+            Ok(acc)
+        }
+        StIssubset | StIssuperset | StIsdisjoint => {
+            var other = args[1];
+            if set_dict(other).is_none() {
+                let s = ops.new_set(c, false);
+                let it = ops.getiter(c, other)?;
+                while let Some(v) = ops.next(c, it)? { ops.set_add(c, s, v)?; }
+                other = s;
+            }
+            let dx = set_dict(selfv).unwrap();
+            let dy = set_dict(other).unwrap();
+            if b == B.StIssubset { return Ok(Value.Bool(is_subset(dx, dy))); }
+            if b == B.StIssuperset { return Ok(Value.Bool(is_subset(dy, dx))); }
+            var it: u64 = 0;
+            while let Some(e) = value.dict_next(dx, &it) {
+                let k = value.dict_key(dx, e);
+                if value.dict_get(dy, k, value.hash_of(k) ?? 0).is_some() { return Ok(Value.Bool(false)); }
+            }
+            Ok(Value.Bool(true))
+        }
+        // ── numbers
+        IBitLength => Ok(value.int_val(&c.heap, big.bit_length(selfv) as i64)),
+        IConjugate => Ok(selfv),
+        FIsInteger => {
+            let f = want_f64(c, selfv)?;
+            Ok(Value.Bool(f == f.floor() and f - f == 0.0))
+        }
+        // ── generators
+        GSend => {
+            let Obj(g) = selfv else { trap() };
+            if g.m == value.GEN_NEW and args[1] != Value.Nil {
+                return Err(exc(c, E_TYPE, "can't send non-None value to a just-started generator"));
+            }
+            match vm.gen_next(c, g, args[1])? {
+                Some(v) => Ok(v),
+                None => Err(exc_of_empty(c, E_STOPITER)),
+            }
+        }
+        GClose => { let Obj(g) = selfv else { trap() }; g.m = GEN_DONE; Ok(Value.Nil) }
+        GThrow => Err(ops.make_exc(c, args[1])?),
+        PropSetter | PropGetter => {
+            let Obj(o) = selfv else { trap() };
+            let p = value.new_box(&c.heap, K_PROPERTY, 0);
+            p.a = if b == B.PropGetter { args[1] } else { o.a };
+            p.b = if b == B.PropSetter { args[1] } else { o.b };
+            Ok(Value.Obj(p))
+        }
+        _ => module_call(c, b, args, n, kw),
+    }
+}
+
+/// str.format: positional {} / {0} and keyword {name} fields with specs.
+fn str_format(c: *Ctx, fs: Gc<Str>, args: *Value, np: u64, kw: Value, nkw: u64) -> Result<Value, Value> uses reenter {
+    let f = fs.data;
+    var out = text.StrBuf.new();
+    var auto: u64 = 0;
+    var i: u64 = 0;
+    while i < f.len {
+        let ch = f[i];
+        if ch == '{' and i + 1 < f.len and f[i + 1] == '{' { out.push('{'); i += 2; continue; }
+        if ch == '}' and i + 1 < f.len and f[i + 1] == '}' { out.push('}'); i += 2; continue; }
+        if ch != '{' { out.push(ch); i += 1; continue; }
+        i += 1;
+        let st = i;
+        while i < f.len and f[i] != '}' and f[i] != ':' and f[i] != '!' { i += 1; }
+        let field = f[st..i];
+        var conv: u8 = 0;
+        if i < f.len and f[i] == '!' { conv = f[i + 1]; i += 2; }
+        var spec: str = "";
+        if i < f.len and f[i] == ':' {
+            i += 1;
+            let ss = i;
+            while i < f.len and f[i] != '}' { i += 1; }
+            spec = f[ss..i];
+        }
+        i += 1;
+        var v: Value = Value.Nil;
+        if field.len == 0 {
+            if auto >= np { out.free(); return Err(exc(c, E_INDEX, "Replacement index out of range for positional args tuple")); }
+            v = args[auto];
+            auto += 1;
+        } else if text.is_digit(field[0]) {
+            let k = (text.parse_int(field) ?? 0) as u64;
+            if k >= np { out.free(); return Err(exc(c, E_INDEX, "Replacement index out of range for positional args tuple")); }
+            v = args[k];
+        } else {
+            // keyword, possibly with .attr
+            var name = field;
+            var rest: str = "";
+            if let Some(d) = mem.find_byte(field, '.') { name = field[0..d]; rest = field[d + 1..field.len]; }
+            var found = false;
+            if let Tuple(t) = kw {
+                for j in 0..t.items.len { if let Str(s) = t.items[j] and s.data.eq(name) { v = args[np + j]; found = true; } }
+            }
+            if !found { out.free(); return Err(ops.key_error(c, s_of(c, name))); }
+            if rest.len > 0 {
+                var ic: u32 = 0;
+                v = ops.getattr(c, v, vm.intern(c, rest), &ic)?;
+            }
+        }
+        if conv == 'r' { v = fmt.repr(c, v)?; } else if conv == 's' { v = fmt.to_str(c, v)?; }
+        let r = fmt.format(c, v, spec)?;
+        if let Str(s) = r { out.push_str(s.data); }
+    }
+    Ok(buf_str(c, &out))
+}
+
+// ── modules ─────────────────────────────────────────────────────────
+
+fn mt_seed(c: *Ctx, key: *mem.Vec<u32>) {
+    let mt = &c.mt[0];
+    mt[0] = 19650218;
+    for i in 1..624 { mt[i] = ((1812433253 as u64 * ((mt[i - 1] ^ (mt[i - 1] >> 30)) as u64) + i as u64) & 0xffffffff) as u32; }
+    var i: u64 = 1;
+    var j: u64 = 0;
+    let klen = key.len;
+    var k = if 624 > klen { 624 } else { klen };
+    while k > 0 {
+        mt[i] = (((mt[i] ^ (((mt[i - 1] ^ (mt[i - 1] >> 30)) as u64 * 1664525) & 0xffffffff) as u32) as u64
+                  + key.at(j) as u64 + j as u64) & 0xffffffff) as u32;
+        i += 1; j += 1;
+        if i >= 624 { mt[0] = mt[623]; i = 1; }
+        if j >= klen { j = 0; }
+        k -= 1;
+    }
+    k = 623;
+    while k > 0 {
+        mt[i] = ((((mt[i] ^ (((mt[i - 1] ^ (mt[i - 1] >> 30)) as u64 * 1566083941) & 0xffffffff) as u32) as u64)
+                  -% i as u64) & 0xffffffff) as u32;
+        i += 1;
+        if i >= 624 { mt[0] = mt[623]; i = 1; }
+        k -= 1;
+    }
+    mt[0] = 0x80000000;
+    c.mti = 624;
+}
+
+fn mt_next(c: *Ctx) -> u32 {
+    let mt = &c.mt[0];
+    if c.mti >= 624 {
+        for kk in 0..624 {
+            let y = (mt[kk] & 0x80000000) | (mt[(kk + 1) % 624] & 0x7fffffff);
+            mt[kk] = mt[(kk + 397) % 624] ^ (y >> 1) ^ (if (y & 1) != 0 { 0x9908b0df } else { 0 });
+        }
+        c.mti = 0;
+    }
+    var y = mt[c.mti];
+    c.mti += 1;
+    y = y ^ (y >> 11);
+    y = y ^ ((y << 7) & 0x9d2c5680);
+    y = y ^ ((y << 15) & 0xefc60000);
+    y = y ^ (y >> 18);
+    y
+}
+
+fn rand_f64(c: *Ctx) -> f64 {
+    let a = (mt_next(c) >> 5) as f64;
+    let b = (mt_next(c) >> 6) as f64;
+    (a * 67108864.0 + b) * (1.0 / 9007199254740992.0)
+}
+
+fn getrandbits(c: *Ctx, k: u64) -> Value {
+    if k <= 32 { return value.int_val(&c.heap, (mt_next(c) >> (32 - k as u32)) as i64); }
+    if k <= 64 {
+        let lo = mt_next(c) as u64;
+        let hi = (mt_next(c) >> (64 - k as u32)) as u64;
+        let v = lo | (hi << 32);
+        if v <= 9223372036854775807 { return value.int_val(&c.heap, v as i64); }
+        let x = big.add(&c.heap, Value.Obj(big.from_i64(&c.heap, (v >> 1) as i64)), Value.Obj(big.from_i64(&c.heap, (v >> 1) as i64)));
+        return big.add(&c.heap, x, Value.Int((v & 1) as i32));
+    }
+    // general: little-endian 32-bit words
+    var r = Value.Int(0);
+    var left = k;
+    var shift: u64 = 0;
+    while left > 0 {
+        var w = mt_next(c) as u64;
+        if left < 32 { w = w >> (32 - left); }
+        r = big.add(&c.heap, r, big.shl(&c.heap, value.int_val(&c.heap, w as i64), shift));
+        shift += 32;
+        left = if left > 32 { left - 32 } else { 0 };
+    }
+    r
+}
+
+fn randbelow(c: *Ctx, n: Value) -> Result<Value, Value> {
+    if !value.is_int(n) or big.is_neg(n) or n == Value.Int(0) { return Err(exc(c, E_VALUE, "empty range for randrange()")); }
+    let k = big.bit_length(n);
+    loop {
+        let r = getrandbits(c, k);
+        if big.cmp(r, n) < 0 { return Ok(r); }
+    }
+}
+
+fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
+    let np = npos(kw, n);
+    match b {
+        MSqrt => {
+            let x = want_f64(c, args[0])?;
+            if x < 0.0 { return Err(exc(c, E_VALUE, "math domain error")); }
+            Ok(Value.Float(x.sqrt()))
+        }
+        MSin => Ok(Value.Float(sin(want_f64(c, args[0])?))),
+        MCos => Ok(Value.Float(cos(want_f64(c, args[0])?))),
+        MTan => Ok(Value.Float(tan(want_f64(c, args[0])?))),
+        MAsin => Ok(Value.Float(asin(want_f64(c, args[0])?))),
+        MAcos => Ok(Value.Float(acos(want_f64(c, args[0])?))),
+        MAtan => Ok(Value.Float(atan(want_f64(c, args[0])?))),
+        MAtan2 => Ok(Value.Float(atan2(want_f64(c, args[0])?, want_f64(c, args[1])?))),
+        MExp => Ok(Value.Float(exp(want_f64(c, args[0])?))),
+        MSinh => Ok(Value.Float(sinh(want_f64(c, args[0])?))),
+        MCosh => Ok(Value.Float(cosh(want_f64(c, args[0])?))),
+        MTanh => Ok(Value.Float(tanh(want_f64(c, args[0])?))),
+        MLog => {
+            let x = want_f64(c, args[0])?;
+            if x <= 0.0 { return Err(exc(c, E_VALUE, "math domain error")); }
+            if np > 1 { return Ok(Value.Float(log(x) / log(want_f64(c, args[1])?))); }
+            Ok(Value.Float(log(x)))
+        }
+        MLog10 => Ok(Value.Float(log10(want_f64(c, args[0])?))),
+        MLog2 => Ok(Value.Float(log2(want_f64(c, args[0])?))),
+        MPow => Ok(Value.Float(pow(want_f64(c, args[0])?, want_f64(c, args[1])?))),
+        MFmod => Ok(Value.Float(fmod(want_f64(c, args[0])?, want_f64(c, args[1])?))),
+        MHypot => Ok(Value.Float(hypot(want_f64(c, args[0])?, want_f64(c, args[1])?))),
+        MFloor | MCeil | MTrunc => {
+            let x = args[0];
+            if value.is_int(x) { return Ok(x); }
+            let f = want_f64(c, x)?;
+            float_to_int(c, if b == B.MFloor { f.floor() } else if b == B.MCeil { f.ceil() } else { f.trunc() })
+        }
+        MFabs => Ok(Value.Float(want_f64(c, args[0])?.abs())),
+        MIsnan => { let f = want_f64(c, args[0])?; Ok(Value.Bool(f != f)) }
+        MIsinf => { let f = want_f64(c, args[0])?; Ok(Value.Bool(f == 1.0 / 0.0 or f == -1.0 / 0.0)) }
+        MIsfinite => { let f = want_f64(c, args[0])?; Ok(Value.Bool(f == f and f != 1.0 / 0.0 and f != -1.0 / 0.0)) }
+        MRadians => Ok(Value.Float(want_f64(c, args[0])? * 3.141592653589793 / 180.0)),
+        MDegrees => Ok(Value.Float(want_f64(c, args[0])? * 180.0 / 3.141592653589793)),
+        MCopysign => Ok(Value.Float(want_f64(c, args[0])?.copysign(want_f64(c, args[1])?))),
+        MGcd => {
+            var a = big.abs(&c.heap, args[0]);
+            var bb = if np > 1 { big.abs(&c.heap, args[1]) } else { Value.Int(0) };
+            while !(bb == Value.Int(0)) {
+                let r = ops.arith(c, ops.O_MOD, a, bb)?;
+                a = bb;
+                bb = r;
+            }
+            Ok(a)
+        }
+        MFactorial => {
+            let k = want_int(c, args[0])?;
+            if k < 0 { return Err(exc(c, E_VALUE, "factorial() not defined for negative values")); }
+            var r = Value.Int(1);
+            for i in 2..k + 1 { r = big.mul(&c.heap, r, value.int_val(&c.heap, i)); }
+            Ok(r)
+        }
+        MIsqrt => {
+            let x = args[0];
+            if big.is_neg(x) { return Err(exc(c, E_VALUE, "isqrt() argument must be nonnegative")); }
+            // Newton's method on ints
+            if x == Value.Int(0) { return Ok(x); }
+            var r = x;
+            loop {
+                let y = ops.arith(c, ops.O_FLOORDIV, ops.arith(c, ops.O_ADD, r, ops.arith(c, ops.O_FLOORDIV, x, r)?)?, Value.Int(2))?;
+                if big.cmp(y, r) >= 0 { return Ok(r); }
+                r = y;
+            }
+        }
+        MFsum | MProd => {
+            let l = items_of(c, args[0])?;
+            if b == B.MFsum {
+                var s: f64 = 0.0;
+                var comp: f64 = 0.0;
+                for i in 0..l.len {
+                    let y = want_f64(c, l.arr.items[i])? - comp;
+                    let t = s + y;
+                    comp = (t - s) - y;
+                    s = t;
+                }
+                return Ok(Value.Float(s));
+            }
+            var acc = Value.Int(1);
+            for i in 0..l.len { acc = ops.arith(c, ops.O_MUL, acc, l.arr.items[i])?; }
+            Ok(acc)
+        }
+        MModf => {
+            let f = want_f64(c, args[0])?;
+            let t = value.new_tuple(&c.heap, 2);
+            t.items[0] = Value.Float(f - f.trunc());
+            t.items[1] = Value.Float(f.trunc());
+            Ok(Value.Tuple(t))
+        }
+        RSeed => {
+            var key: mem.Vec<u32> = mem.Vec.new();
+            var v = if np > 0 { args[0] } else { Value.Nil };
+            if v == Value.Nil { v = Value.Int(0); }
+            if let Str(s) = v { v = value.int_val(&c.heap, (value.hash_of(v).unwrap() & 0x7fffffffffffffff) as i64); }
+            if let Float(f) = v { v = float_to_int(c, f)?; }
+            var a = big.abs(&c.heap, v);
+            while !(a == Value.Int(0)) {
+                let Some((q, r)) = big.divmod(&c.heap, a, Value.Obj(big.from_i64(&c.heap, 4294967296))) else { break; };
+                key.push((value.as_i64(r) ?? 0) as u32);
+                a = q;
+            }
+            if key.len == 0 { key.push(0); }
+            mt_seed(c, &key);
+            key.free();
+            Ok(Value.Nil)
+        }
+        RRandom => Ok(Value.Float(rand_f64(c))),
+        RGetrandbits => Ok(getrandbits(c, want_int(c, args[0])? as u64)),
+        RRandrange => {
+            if np == 1 { return randbelow(c, args[0]); }
+            let start = args[0];
+            let stop = args[1];
+            let step = if np > 2 { args[2] } else { Value.Int(1) };
+            let width = ops.arith(c, ops.O_SUB, stop, start)?;
+            if step == Value.Int(1) { return ops.arith(c, ops.O_ADD, start, randbelow(c, width)?); }
+            let nn = ops.arith(c, ops.O_FLOORDIV, ops.arith(c, ops.O_SUB, ops.arith(c, ops.O_ADD, width, step)?, Value.Int(if big.is_neg(step) { -1 } else { 1 }))?, step)?;
+            ops.arith(c, ops.O_ADD, start, ops.arith(c, ops.O_MUL, step, randbelow(c, nn)?)?)
+        }
+        RRandint => {
+            let width = ops.arith(c, ops.O_ADD, ops.arith(c, ops.O_SUB, args[1], args[0])?, Value.Int(1))?;
+            ops.arith(c, ops.O_ADD, args[0], randbelow(c, width)?)
+        }
+        RChoice => {
+            let k = len_of(c, args[0])?;
+            if k == 0 { return Err(exc(c, E_INDEX, "Cannot choose from an empty sequence")); }
+            let i = randbelow(c, value.int_val(&c.heap, k as i64))?;
+            ops.getindex(c, args[0], i)
+        }
+        RShuffle => {
+            let List(l) = args[0] else { return Err(exc(c, E_TYPE, "shuffle needs a list")); };
+            var i = l.len;
+            while i > 1 {
+                i -= 1;
+                let j = (value.as_i64(randbelow(c, value.int_val(&c.heap, (i + 1) as i64))?) ?? 0) as u64;
+                let t = l.arr.items[i];
+                l.arr.items[i] = l.arr.items[j];
+                l.arr.items[j] = t;
+            }
+            Ok(Value.Nil)
+        }
+        RUniform => {
+            let a = want_f64(c, args[0])?;
+            let z = want_f64(c, args[1])?;
+            Ok(Value.Float(a + (z - a) * rand_f64(c)))
+        }
+        RSample => {
+            let src = items_of(c, args[0])?;
+            let k = want_int(c, args[1])? as u64;
+            let pool = value.list_of(&c.heap, value.list_items(src));
+            let r = value.new_list(&c.heap, k);
+            let nn = pool.len;
+            for i in 0..k {
+                let j = (value.as_i64(randbelow(c, value.int_val(&c.heap, (nn - i) as i64))?) ?? 0) as u64;
+                value.list_push(&c.heap, r, pool.arr.items[j]);
+                pool.arr.items[j] = pool.arr.items[nn - i - 1];
+            }
+            Ok(Value.List(r))
+        }
+        TTime | TPerfCounter => {
+            var ts: [i64; 2] = [0, 0];
+            clock_gettime(if b == B.TTime { 0 } else { 1 }, &ts[0]);
+            Ok(Value.Float(ts[0] as f64 + (ts[1] as f64) * 1e-9))
+        }
+        SysSetrecursionlimit => Ok(Value.Nil),
+        SysGetrecursionlimit => Ok(Value.Int(1000)),
+        SysExit => Err(exc(c, E_SYSEXIT, "")),
+        _ => Err(exc(c, E_TYPE, "unsupported builtin")),
+    }
+}
+
+/// Helpers written in Python (see vm.call_slow).
+pub const PRELUDE_SRC: str = "def __list(g):\n    r = []\n    for x in g:\n        r.append(x)\n    return r\ndef __via1(f, g):\n    return f(__list(g))\ndef __via2(f, a, g):\n    return f(a, __list(g))\n";
+
+pub fn load_prelude(c: *Ctx) -> Result<(), Value> uses reenter {
+    let d = value.new_dict(&c.heap, 8);
+    compile.run_module_source(c, PRELUDE_SRC, d)?;
+    c.pre_list = value.dict_get_str(d, vm.intern(c, "__list")).unwrap();
+    c.pre_via1 = value.dict_get_str(d, vm.intern(c, "__via1")).unwrap();
+    c.pre_via2 = value.dict_get_str(d, vm.intern(c, "__via2")).unwrap();
+    Ok(())
+}
+
+/// Python source of the modules written in Python.
+const IO_SRC: str = "class StringIO:\n    def __init__(self, initial=''):\n        self._parts = [initial]\n    def write(self, s):\n        self._parts.append(s)\n        return len(s)\n    def getvalue(self):\n        return ''.join(self._parts)\n";
+
+pub fn import_module(c: *Ctx, name: Value) -> Result<Value, Value> uses reenter {
+    let Str(s) = name else { trap() };
+    let mods = c.modules.unwrap();
+    if let Some(m) = value.dict_get_str(mods, s) { return Ok(m); }
+    let m = value.new_box(&c.heap, K_MODULE, 0);
+    m.a = name;
+    let d = value.new_dict(&c.heap, 16);
+    m.dict = Some(d);
+    let nm = s.data;
+    if nm.eq("math") {
+        let fs = [("sqrt", B.MSqrt), ("sin", B.MSin), ("cos", B.MCos), ("tan", B.MTan), ("asin", B.MAsin), ("acos", B.MAcos),
+                  ("atan", B.MAtan), ("atan2", B.MAtan2), ("exp", B.MExp), ("log", B.MLog), ("log10", B.MLog10),
+                  ("log2", B.MLog2), ("pow", B.MPow), ("floor", B.MFloor), ("ceil", B.MCeil), ("fabs", B.MFabs),
+                  ("hypot", B.MHypot), ("isnan", B.MIsnan), ("isinf", B.MIsinf), ("isfinite", B.MIsfinite),
+                  ("radians", B.MRadians), ("degrees", B.MDegrees), ("gcd", B.MGcd), ("factorial", B.MFactorial),
+                  ("trunc", B.MTrunc), ("copysign", B.MCopysign), ("sinh", B.MSinh), ("cosh", B.MCosh), ("tanh", B.MTanh),
+                  ("fsum", B.MFsum), ("modf", B.MModf), ("fmod", B.MFmod), ("isqrt", B.MIsqrt), ("prod", B.MProd)];
+        for x in fs { let (n2, bb) = x; put(c, d, n2, bv(bb)); }
+        put(c, d, "pi", Value.Float(3.141592653589793));
+        put(c, d, "e", Value.Float(2.718281828459045));
+        put(c, d, "tau", Value.Float(6.283185307179586));
+        put(c, d, "inf", Value.Float(1.0 / 0.0));
+        put(c, d, "nan", Value.Float(0.0 / 0.0));
+    } else if nm.eq("random") {
+        let fs = [("seed", B.RSeed), ("random", B.RRandom), ("randrange", B.RRandrange), ("randint", B.RRandint),
+                  ("choice", B.RChoice), ("shuffle", B.RShuffle), ("uniform", B.RUniform), ("getrandbits", B.RGetrandbits),
+                  ("sample", B.RSample)];
+        for x in fs { let (n2, bb) = x; put(c, d, n2, bv(bb)); }
+    } else if nm.eq("time") {
+        put(c, d, "time", bv(B.TTime));
+        put(c, d, "perf_counter", bv(B.TPerfCounter));
+    } else if nm.eq("sys") {
+        put(c, d, "setrecursionlimit", bv(B.SysSetrecursionlimit));
+        put(c, d, "getrecursionlimit", bv(B.SysGetrecursionlimit));
+        put(c, d, "exit", bv(B.SysExit));
+        put(c, d, "argv", Value.List(value.new_list(&c.heap, 0)));
+        put(c, d, "maxsize", value.int_val(&c.heap, 9223372036854775807));
+    } else if nm.eq("io") {
+        compile.run_module_source(c, IO_SRC, d)?;
+    } else {
+        var b = text.StrBuf.new();
+        b.push_str("No module named '");
+        b.push_str(nm);
+        b.push('\'');
+        return Err(exc_buf(c, E_MODNOTFOUND, &b));
+    }
+    value.dict_set_str(&c.heap, mods, s, Value.Obj(m));
+    Ok(Value.Obj(m))
+}

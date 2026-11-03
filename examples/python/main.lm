@@ -1,0 +1,134 @@
+// python-loimi: run a Python-subset program.
+//   main FILE.py [--gc-stress] [--gc-verify] [--disasm]
+import std.gc;
+import std.mem;
+import std.text;
+import std.map;
+import std.io;
+import std.os;
+import value;
+import value.{Value, Func, Inst};
+import vm;
+import vm.{Ctx, Proto, Frame, Py};
+import ops;
+import fmt;
+import builtins;
+import compile;
+
+extern "C" fn getenv(name: *u8) -> *u8;
+
+const STACK: u64 = 1 << 20;
+const FRAMES: u64 = 4096;
+
+fn usage() -> i32 {
+    io.eprintln("usage: python-loimi FILE.py [--gc-stress] [--gc-verify] [--disasm]");
+    2
+}
+
+fn main() -> i32 uses reenter {
+    var path: ?str = None;
+    var stress = false;
+    var verify = false;
+    var disasm = false;
+    for i in 1..os.arg_count() {
+        let a = os.arg(i).unwrap();
+        if a.eq("--gc-stress") { stress = true; }
+        else if a.eq("--gc-verify") { verify = true; }
+        else if a.eq("--disasm") { disasm = true; }
+        else if a.eq("--no-supers") { compile.NO_SUPERS = true; }
+        else if path.is_none() { path = Some(a); }
+        else { return usage(); }
+    }
+    let Some(p) = path else { return usage(); };
+    let Some(src) = io.read_file(p) else {
+        io.eprint("python-loimi: can't open file '");
+        io.eprint(p);
+        io.eprintln("'");
+        return 2;
+    };
+    let ctx: *Ctx = mem.alloc(1);
+    *ctx = Ctx {
+        heap: gc.Heap.new(), stack: mem.alloc(STACK), stack_end: 0 as *Value, hw: 0 as *Value,
+        frames: mem.alloc(FRAMES), frames_end: 0 as *Frame, fp: 0 as *Frame,
+        protos: mem.Vec.new(), globals: None, builtins: None, modules: None,
+        types: [None; 24], excs: [None; 32], strs: map.HashMap.new(), names: mem.Arena.new(),
+        epoch: 1, next_cls: 1, gen_done: false, err_line: 0, buf: text.StrBuf.new(),
+        n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0,
+        pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil, dn: [Value.Nil; 40],
+    };
+    let c = ctx;
+    c.stack_end = c.stack + STACK - 16;
+    c.hw = c.stack;
+    c.frames_end = c.frames + FRAMES - 4;
+    c.heap.add_scanner(c as *u8, vm.scan_roots);
+    // The bottom frame, below the module's: a prototype with no registers.
+    let dummy: *Proto = mem.alloc(1);
+    *dummy = Proto { name: "<host>", nparams: 0, nkwonly: 0, flags: 0, nregs: 0, simple: 0, pnames: [], freesrc: [],
+                     words: [], code: Py.placeholder(), consts: [], lines: [], handlers: [], ndefaults: 0 };
+    c.frames[0] = Frame { func: Value.Nil, gen: Value.Nil, base: c.stack, k: 0 as *Value, proto: dummy,
+                          ret_pc: 0 as *u32, ret_slot: c.stack, alt_pc: 0 as *u32, flags: 0 };
+    c.fp = c.frames;
+    c.n_init = Some(vm.intern(c, "__init__"));
+    builtins.setup(c);
+    ops.init_dunders(c);
+    if let Err(_) = builtins.load_prelude(c) { io.eprintln("internal error: prelude"); return 1; }
+    let g = value.new_dict(&c.heap, 32);
+    c.globals = Some(g);
+    value.dict_set_str(&c.heap, g, vm.intern(c, "__name__"), Value.Str(vm.intern(c, "__main__")));
+    var arena = mem.Arena.new();
+    let r = compile.compile_source(c, src, &arena);
+    let idx = match r {
+        Ok(i) => i,
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("  File \"");
+            b.push_str(p);
+            b.push_str("\", line ");
+            b.push_int(e.line as i64);
+            b.push_str("\nSyntaxError: ");
+            b.push_str(e.msg);
+            io.eprintln(b.as_str());
+            return 1;
+        }
+    };
+    if let Err(m) = compile.verify_from(c, 0) { io.eprintln(m); return 1; }
+    if disasm {
+        for i in 0..c.protos.len {
+            let pr = c.protos.at(i);
+            var b = text.StrBuf.new();
+            b.push_str("fn ");
+            b.push_str(pr.name);
+            b.push_str(":\n");
+            Py.disasm(pr.code.words(), &b);
+            io.print(b.as_str());
+            b.free();
+        }
+    }
+    if verify { c.heap.set_generational(true); c.heap.set_verify(true); c.heap.set_stress(true); }
+    else if stress { c.heap.set_stress(true); }
+    else { c.heap.set_growth(300, 8 << 20); }
+    let mp = c.protos.at(idx as u64);
+    let f = new(&c.heap, Func { proto: mp, defaults: None, kwdefaults: None, cells: None, globals: g, owner: None });
+    let rc: i32 = match vm.invoke(c, Value.Func(f), []) {
+        Ok(_) => 0,
+        Err(e) => report(c, e),
+    };
+    if getenv("PYLOIMI_COUNTS\0".ptr) != 0 as *u8 { builtins.print_counts(); }
+    rc
+}
+
+fn report(c: *Ctx, e: Value) -> i32 uses reenter {
+    if let Inst(i) = e and ops.subclass(i.cls, c.excs[builtins.E_SYSEXIT].unwrap()) { return 0; }
+    var b = text.StrBuf.new();
+    b.push_str("Traceback (most recent call last):\n  line ");
+    b.push_int(c.err_line as i64);
+    b.push('\n');
+    b.push_str(ops.type_name(c, e));
+    var m = text.StrBuf.new();
+    let r = fmt.write_str(c, &m, e);
+    if let Ok(_) = r {
+        if m.len() > 0 { b.push_str(": "); b.push_str(m.as_str()); }
+    }
+    io.eprintln(b.as_str());
+    1
+}

@@ -1,0 +1,19 @@
+['.#..', '...@'] 2 True False Grid(4, 2) [Grid(4, 2)]
+proxied:anything 1 proxied:other
+$12.34 $0.05 9 2.5 350
+False True 7 -3
+['a', 'b', 'c'] [1, 2, 3] 3 True ('c', 3)
+{'a': 1, 'b': 2, 'c': 3} {} {'a': 1, 'b': 2, 'c': 3, 'z': 0}
+café AB 4 \n \d+ tab	here abc
+[0, 1, 'caught KeyError(1)', 2]
+[0, 0, -1, 2, -2, -3]
+6 15
+9 9 a-b
+100.0 212.0 {'_c': 100.0}
+False
+[1, 2, 3] 3 6 3 [3, 2, 1]
+leaf+base:M base:M base:B
+['Leaf', 'Mid', 'Base', 'object']
+no multiple inheritance here either
+[[1, 4], [2, 5], [3, 6]] {(0, 0): 0, (0, 1): 0, (1, 0): 0, (1, 1): 1}
+[('b', 1), ('a', 2)] [(1, 2), ('a', 'b')]

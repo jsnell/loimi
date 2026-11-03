@@ -1,0 +1,24 @@
+i 0
+i 2
+for-else ran
+while-else 12
+big yes no last 3
+chained ok
+True False True True True
+['neg', 'zero', 'small', 'large']
+walrus 10
+14
+0 1 2
+1 3 4
+6
+7 None
+301711
+[1, 1, 2, 3, 4, 5, 6, 9] [9, 6, 5, 4, 3, 2, 1, 1] 9 1 3.875
+[(0, 3), (1, 2), (2, 1), (3, 0)]
+count 1
+count 3
+True False True False True False True
+short circuit
+[3] [] 0 4
+-1 0 1
+[1, 3]
