@@ -1,0 +1,154 @@
+// Terms: the tagged cells of the machine, and the atom and functor tables.
+//
+// Terms live in the std.gc heap (see README "Design"): an unbound variable is
+// a `Var` object whose `val` is `Unb`, a binding stores the bound term in it,
+// a compound term is a `Struct` with its arguments as a trailing array, and a
+// list cell is a `Cons`. Atoms and integers are immediate.
+
+import std.gc;
+import std.mem;
+import std.text;
+import std.hash;
+import std.map.{HashMap};
+
+/// A logic variable. `stamp` is the choicepoint counter when it was made: a
+/// binding is trailed only if the variable is older than the newest
+/// choicepoint (the WAM's `H < HB` test, without a heap order).
+pub object Var { val: Term, stamp: u64 }
+
+/// A compound term other than a list cell: functor id and arguments.
+pub object Struct { f: u32, args: [Term] }
+
+/// A list cell '[|]'(Head, Tail).
+pub object Cons { head: Term, tail: Term }
+
+/// A Prolog term. Floats are unboxed; everything that is not a float lives in
+/// the NaN space. Raw pointers (top 16 bits zero) read as floats, which the
+/// environment-stack scanner relies on (machine.lm).
+pub value Term repr nanbox {
+    Flt(f64) unboxed,
+    Int(i48),
+    Atom(u32),
+    Ref(Gc<Var>),
+    Str(Gc<Struct>),
+    Lst(Gc<Cons>),
+    Unb,
+}
+
+pub const MAX_INT: i64 = 140737488355327;     // 2^47 - 1
+pub const MIN_INT: i64 = -140737488355328;
+
+// Atoms interned first, in this order, so their ids are constants.
+pub const A_NIL: u32 = 0;
+pub const A_DOT: u32 = 1;        // '[|]'
+pub const A_TRUE: u32 = 2;
+pub const A_FAIL: u32 = 3;
+pub const A_COMMA: u32 = 4;
+pub const A_SEMI: u32 = 5;
+pub const A_ARROW: u32 = 6;      // ->
+pub const A_NECK: u32 = 7;       // :-
+pub const A_CUT: u32 = 8;        // !
+pub const A_CURLY: u32 = 9;      // {}
+pub const A_MINUS: u32 = 10;
+pub const A_PLUS: u32 = 11;
+pub const A_NOT: u32 = 12;       // \+
+pub const A_CALL: u32 = 13;
+pub const A_ERROR: u32 = 14;
+pub const A_EMPTY: u32 = 15;     // ''
+pub const A_EOF: u32 = 16;       // end_of_file
+pub const A_FALSE: u32 = 17;
+pub const A_SOFT: u32 = 18;      // *->
+pub const A_DCG: u32 = 19;       // -->
+pub const A_BAR: u32 = 20;       // |
+pub const A_SLASH: u32 = 21;     // /
+pub const A_EQ: u32 = 22;        // =
+pub const A_CATCH: u32 = 23;
+pub const A_FINDALL: u32 = 24;
+pub const A_USER: u32 = 25;
+pub const A_ON: u32 = 26;
+pub const A_OFF: u32 = 27;
+pub const A_CODES: u32 = 28;
+pub const A_CHARS: u32 = 29;
+pub const A_ATOM: u32 = 30;
+pub const A_STAR: u32 = 31;
+pub const A_HAT: u32 = 32;       // ^
+pub const A_COLON: u32 = 33;
+
+const PREDEFINED: [str; 34] = [
+    "[]", "[|]", "true", "fail", ",", ";", "->", ":-", "!", "{}", "-", "+", "\\+", "call",
+    "error", "", "end_of_file", "false", "*->", "-->", "|", "/", "=", "catch", "findall",
+    "user", "on", "off", "codes", "chars", "atom", "*", "^", ":",
+];
+
+pub struct Functor { name: u32, arity: u32 }
+
+/// Atoms and functors. Functor ids are also predicate ids.
+pub struct Db {
+    atoms: text.Interner,
+    functors: mem.Vec<Functor>,
+    fmap: HashMap<u64, u32>,
+}
+
+pub fn Db.new() -> Db {
+    var d = Db { atoms: text.Interner.new(), functors: mem.Vec.new(), fmap: HashMap.new() };
+    for s in PREDEFINED { d.atoms.intern(s); }
+    d
+}
+
+pub fn Db.atom(d: *Db, s: str) -> u32 { d.atoms.intern(s) }
+pub fn Db.name(d: *Db, a: u32) -> str { d.atoms.name(a) }
+
+pub fn Db.functor(d: *Db, name: u32, arity: u32) -> u32 {
+    let key = ((name as u64) << 32) | arity as u64;
+    if let Some(f) = d.fmap.get(key) { return f; }
+    let id = d.functors.len as u32;
+    d.functors.push(Functor { name: name, arity: arity });
+    d.fmap.insert(key, id);
+    id
+}
+
+pub fn Db.fname(d: *Db, f: u32) -> u32 { d.functors.ptr[f as u64].name }
+pub fn Db.farity(d: *Db, f: u32) -> u32 { d.functors.ptr[f as u64].arity }
+
+/// Follow bound variables.
+#[inline]
+pub fn deref(t: Term) -> Term {
+    var x = t;
+    while let Ref(v) = x {
+        let n = v.val;
+        if n == Term.Unb { return x; }
+        x = n;
+    }
+    x
+}
+
+pub fn is_callable(t: Term) -> bool {
+    match t { Atom(_) => true, Str(_) => true, Lst(_) => true, _ => false }
+}
+
+pub fn is_atomic(t: Term) -> bool {
+    match t { Atom(_) => true, Int(_) => true, Flt(_) => true, _ => false }
+}
+
+/// A term's name and arity (lists are '[|]'/2), if it is callable or atomic.
+pub fn name_arity(d: *Db, t: Term) -> (u32, u32) {
+    match t {
+        Atom(a) => (a, 0),
+        Str(s) => (d.fname(s.f), d.farity(s.f)),
+        Lst(_) => (A_DOT, 2),
+        _ => (A_EMPTY, 0),
+    }
+}
+
+/// Argument `i` (0-based) of a compound term.
+pub fn arg_of(t: Term, i: u64) -> Term {
+    match t {
+        Str(s) => s.args[i],
+        Lst(c) => if i == 0 { c.head } else { c.tail },
+        _ => Term.Unb,
+    }
+}
+
+pub fn mk_int(i: i64) -> Term { Term.Int(i as i48) }
+
+pub fn fits_int(i: i64) -> bool { i >= MIN_INT and i <= MAX_INT }

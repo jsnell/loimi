@@ -1,0 +1,307 @@
+// Term output: write/1, writeq/1, print/1, write_canonical/1, with
+// operators and SWI-Prolog's spacing and float format.
+
+import std.text;
+import std.num;
+import std.mem;
+import term.{Term, Var, Struct, Cons, deref};
+import term;
+import machine.{Machine};
+import reader;
+
+pub struct WOpts { quoted: bool, ignore_ops: bool, numbervars: bool }
+
+struct W {
+    m: *Machine,
+    b: *text.StrBuf,
+    o: WOpts,
+}
+
+fn is_symch(c: u8) -> bool {
+    c == '+' or c == '-' or c == '*' or c == '/' or c == '\\' or c == '^' or c == '<' or c == '>'
+        or c == '=' or c == '~' or c == ':' or c == '.' or c == '?' or c == '@' or c == '#'
+        or c == '&' or c == '$'
+}
+
+fn is_alnum(c: u8) -> bool {
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 128
+}
+
+fn W.last(w: *W) -> u8 {
+    let n = w.b.len();
+    if n == 0 { 0 } else { w.b.bytes.ptr[n - 1] }
+}
+
+/// Emit a token, with a space first if it would otherwise run into the
+/// previous one.
+fn W.token(w: *W, s: str) {
+    if s.len > 0 {
+        let l = w.last();
+        let c = s[0];
+        if (is_alnum(l) and is_alnum(c)) or (is_symch(l) and is_symch(c)) or (l == ',' and !w.o.ignore_ops and false) {
+            w.b.push(' ');
+        }
+    }
+    w.b.push_str(s);
+}
+
+/// Does atom `s` need quotes to read back?
+pub fn needs_quotes(s: str) -> bool {
+    if s.len == 0 { return true; }
+    if s.eq("[]") or s.eq("!") or s.eq(";") or s.eq("{}") or s.eq(",") or s.eq("|") {
+        return s.eq(",") or s.eq("|");
+    }
+    let c = s[0];
+    if c >= 'a' and c <= 'z' {
+        for i in 1..s.len { if !is_alnum(s[i]) or s[i] >= 128 { return true; } }
+        return false;
+    }
+    if is_symch(c) {
+        for i in 1..s.len { if !is_symch(s[i]) { return true; } }
+        return false;
+    }
+    true
+}
+
+fn W.atom(w: *W, a: u32) {
+    let s = w.m.db.name(a);
+    if w.o.quoted and needs_quotes(s) {
+        var q = text.StrBuf.new();
+        q.push('\'');
+        for i in 0..s.len {
+            let c = s[i];
+            if c == '\'' { q.push_str("\\'"); }
+            else if c == '\\' { q.push_str("\\\\"); }
+            else if c == '\n' { q.push_str("\\n"); }
+            else if c == '\t' { q.push_str("\\t"); }
+            else { q.push(c); }
+        }
+        q.push('\'');
+        w.token(q.as_str());
+        q.free();
+    } else {
+        w.token(s);
+    }
+}
+
+/// SWI-Prolog's float format: the shortest digits that read back, always
+/// with a fraction or an exponent.
+pub fn write_float(b: *text.StrBuf, x: f64) {
+    if x.is_nan() { b.push_str("nan"); return; }
+    if x == 1.0 / 0.0 { b.push_str("inf"); return; }
+    if x == -1.0 / 0.0 { b.push_str("-inf"); return; }
+    let sh = num.shortest(x);
+    if x < 0.0 or (x == 0.0 and (x.to_bits() >> 63) == 1) { b.push('-'); }
+    let n = sh.n as i32;
+    let e = sh.exp;      // value = 0.d1d2..dn * 10^e
+    if x == 0.0 { b.push_str("0.0"); return; }
+    if e > 15 or e < -3 {
+        // d.ddde(e-1)
+        b.push(sh.digits[0]);
+        b.push('.');
+        if n == 1 { b.push('0'); } else { for i in 1..n as u64 { b.push(sh.digits[i]); } }
+        b.push('e');
+        b.push_int((e - 1) as i64);
+        return;
+    }
+    if e <= 0 {
+        b.push_str("0.");
+        var z = e;
+        while z < 0 { b.push('0'); z += 1; }
+        for i in 0..n as u64 { b.push(sh.digits[i]); }
+        return;
+    }
+    for i in 0..e as u64 {
+        if i < n as u64 { b.push(sh.digits[i]); } else { b.push('0'); }
+    }
+    b.push('.');
+    if n <= e { b.push('0'); } else { for i in e as u64..n as u64 { b.push(sh.digits[i]); } }
+}
+
+fn W.number(w: *W, t: Term) {
+    var tmp = text.StrBuf.new();
+    match t {
+        Int(i) => tmp.push_int(i as i64),
+        Flt(x) => write_float(&tmp, x),
+        _ => {}
+    }
+    w.token(tmp.as_str());
+    tmp.free();
+}
+
+fn var_name(n: i64, b: *text.StrBuf) {
+    b.push(('A' as i64 + n % 26) as u8);
+    if n >= 26 { b.push_int(n / 26); }
+}
+
+fn W.write(w: *W, t0: Term, prec: u32) {
+    let t = deref(t0);
+    let m = w.m;
+    match t {
+        Ref(v) => {
+            var tmp = text.StrBuf.new();
+            tmp.push_str("_G");
+            tmp.push_u64(((v as u64) >> 4) & 0xFFFFFF);
+            w.token(tmp.as_str());
+            tmp.free();
+        }
+        Int(_) => {
+            if prec < 200 and is_negative(t) { w.b.push('('); w.number(t); w.b.push(')'); } else { w.number(t); }
+        }
+        Flt(_) => {
+            if prec < 200 and is_negative(t) { w.b.push('('); w.number(t); w.b.push(')'); } else { w.number(t); }
+        }
+        Atom(a) => {
+            if prec < 1200 and !w.o.ignore_ops and reader.is_op(m, a) {
+                // An operator as an operand: parenthesize when it could be
+                // read as one.
+                if prec < 999 or reader.op_prec(m, a) > prec {
+                    w.b.push('(');
+                    w.atom(a);
+                    w.b.push(')');
+                    return;
+                }
+            }
+            w.atom(a);
+        }
+        Lst(_) => w.list(t),
+        Str(s) => w.compound(t, s, prec),
+        _ => w.token("?"),
+    }
+}
+
+fn is_negative(t: Term) -> bool {
+    match t {
+        Int(i) => (i as i64) < 0,
+        Flt(x) => x < 0.0 or (x == 0.0 and (x.to_bits() >> 63) == 1),
+        _ => false,
+    }
+}
+
+fn W.list(w: *W, t: Term) {
+    w.token("[");
+    var cur = t;
+    var first = true;
+    loop {
+        if let Lst(c) = cur {
+            if !first { w.b.push(','); }
+            w.write(c.head, 999);
+            first = false;
+            cur = deref(c.tail);
+        } else {
+            break;
+        }
+    }
+    if cur != Term.Atom(term.A_NIL) {
+        w.b.push('|');
+        w.write(cur, 999);
+    }
+    w.b.push(']');
+}
+
+fn W.args(w: *W, s: Gc<Struct>) {
+    w.b.push('(');
+    for i in 0..s.args.len {
+        if i > 0 { w.b.push(','); }
+        w.write(s.args[i], 999);
+    }
+    w.b.push(')');
+}
+
+fn W.compound(w: *W, t: Term, s: Gc<Struct>, prec: u32) {
+    let m = w.m;
+    let name = m.db.fname(s.f);
+    let n = s.args.len;
+    if w.o.numbervars and n == 1 and m.db.name(name).eq("$VAR") {
+        let a = deref(s.args[0]);
+        if let Int(i) = a {
+            var tmp = text.StrBuf.new();
+            var_name(i as i64, &tmp);
+            w.token(tmp.as_str());
+            tmp.free();
+            return;
+        }
+    }
+    if !w.o.ignore_ops {
+        if name == term.A_CURLY and n == 1 {
+            w.token("{");
+            w.write(s.args[0], 1200);
+            w.b.push('}');
+            return;
+        }
+        if n == 2 {
+            if let Some((p, lp, rp)) = reader.infix_op(m, name) {
+                let open = p > prec;
+                if open { w.b.push('('); }
+                w.write(s.args[0], lp);
+                if name == term.A_COMMA {
+                    w.b.push(',');
+                } else {
+                    let ns = m.db.name(name);
+                    let alpha = ns.len > 0 and is_alnum(ns[0]);
+                    if alpha or name == term.A_ARROW or name == term.A_NECK or name == term.A_DCG or name == term.A_SOFT {
+                        if alpha { w.b.push(' '); }
+                        w.atom(name);
+                        if alpha { w.b.push(' '); }
+                    } else {
+                        w.atom(name);
+                    }
+                }
+                let r = deref(s.args[1]);
+                w.write(r, rp);
+                if open { w.b.push(')'); }
+                return;
+            }
+        }
+        if n == 1 {
+            if let Some((p, ap)) = reader.prefix_op(m, name) {
+                if name != term.A_MINUS and name != term.A_PLUS or !is_number(deref(s.args[0])) {
+                    let open = p > prec;
+                    if open { w.b.push('('); }
+                    w.atom(name);
+                    let a = deref(s.args[0]);
+                    let ns = m.db.name(name);
+                    let alpha = ns.len > 0 and is_alnum(ns[0]);
+                    // An operand that is itself an operator atom, or an
+                    // opening parenthesis, needs a space.
+                    if alpha { w.b.push(' '); }
+                    else if let Atom(aa) = a and reader.is_op(m, aa) { w.b.push(' '); }
+                    else if let Str(sa) = a and is_op_term(m, sa, ap) { }
+                    w.write(a, ap);
+                    if open { w.b.push(')'); }
+                    return;
+                }
+                // - 1 and + 1: the space keeps them from reading as numbers.
+                w.atom(name);
+                w.b.push(' ');
+                w.number(deref(s.args[0]));
+                return;
+            }
+            if let Some((p, ap)) = reader.postfix_op(m, name) {
+                let open = p > prec;
+                if open { w.b.push('('); }
+                w.write(s.args[0], ap);
+                w.atom(name);
+                if open { w.b.push(')'); }
+                return;
+            }
+        }
+    }
+    w.atom(name);
+    w.args(s);
+}
+
+fn is_op_term(m: *Machine, s: Gc<Struct>, ap: u32) -> bool { false }
+
+fn is_number(t: Term) -> bool {
+    match t { Int(_) => true, Flt(_) => true, _ => false }
+}
+
+pub fn write_term(m: *Machine, b: *text.StrBuf, t: Term, o: WOpts) {
+    var w = W { m: m, b: b, o: o };
+    w.write(t, 1200);
+}
+
+pub fn plain() -> WOpts { WOpts { quoted: false, ignore_ops: false, numbervars: true } }
+pub fn quoted() -> WOpts { WOpts { quoted: true, ignore_ops: false, numbervars: true } }
+pub fn canonical() -> WOpts { WOpts { quoted: true, ignore_ops: true, numbervars: false } }

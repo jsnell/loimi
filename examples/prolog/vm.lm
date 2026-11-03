@@ -1,0 +1,376 @@
+// The WAM: a register machine over terms in the GC heap.
+//
+// State: `pc`, the current environment `e`, the structure pointer `s` and the
+// read/write mode `wm` of the unify instructions. Argument registers are an
+// array inside the machine (`ctx.x`); the continuation, choicepoint and cut
+// barrier are machine fields (they change on calls, not on every
+// instruction).
+
+import std.gc;
+import std.mem;
+import term.{Term, Var, Struct, Cons, deref};
+import term;
+import machine.{Machine, Frame, Choice, unify};
+import machine;
+import compile.{Pred};
+import compile;
+import builtins;
+import arith;
+
+pub struct VCtx { nperm: u64, nconsts: u64, npreds: u64, natoms: u64 }
+
+pub const EXIT_TRUE: i32 = 0;
+pub const EXIT_FALSE: i32 = 1;
+pub const EXIT_THROW: i32 = 2;
+pub const EXIT_HALT: i32 = 3;
+
+pub vm Wam {
+    context ctx: *Machine;
+    state { pc: *u32, e: *Frame, s: *Term, wm: bool }
+
+    sync { ctx.e = e; }
+
+    verify_context vc: *VCtx;
+
+    operand xr = ctx.x[it] display "x{}";
+    operand yr = ((e + 1) as *Term)[it] verify it < vc.nperm display "y{}";
+    operand atom = it verify it < vc.natoms;
+    operand fun = it verify it < vc.npreds;
+    operand pred = it verify it < vc.npreds;
+    operand kst = ctx.consts.ptr[it] verify it < vc.nconsts display "k{}";
+    operand imm = it;
+    operand simm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format A   { op: 8, a: 24 }
+        format sA  { op: 8, sa: s24 }
+        format RB  { op: 8, r: 8, b: 16 }
+        format RsB { op: 8, r: 8, sb: s16 }
+        format RR  { op: 8, r: 8, q: 8 }
+    }
+
+    /// The code of a clause or of a try chain, two words after the op.
+    cache Target { code: u64 }
+
+    // ---- backtracking -------------------------------------------------
+
+    #[inline(never)]
+    fn backtrack() -> never {
+        let b = ctx.b;
+        ctx.untrail(b.tr);
+        e = b.e;
+        ctx.cp = b.cp;
+        let a = b.args();
+        for i in 0..b.n { ctx.x[i] = a[i]; }
+        ctx.b0 = b.prev;
+        jump b.alt
+    }
+
+    fn cut_to(c: *Choice) {
+        if c < ctx.b { ctx.b = c; }
+    }
+
+    // ---- head: get ----------------------------------------------------
+
+    op GET_VAR_X(r: xr, a: xr) : RR { r = a; next }
+    op GET_VAR_Y(r: yr, a: xr) : RR { r = a; next }
+    op GET_VAL_X(r: xr, a: xr) : RR {
+        if r == a { next }
+        cold { if unify(ctx, r, a) { next } backtrack() }
+    }
+    op GET_VAL_Y(r: yr, a: xr) : RR {
+        if r == a { next }
+        cold { if unify(ctx, r, a) { next } backtrack() }
+    }
+    op GET_ATOM(r: xr, c: atom) : RB {
+        let t = deref(r);
+        if t == Term.Atom(c as u32) { next }
+        if let Ref(v) = t { ctx.bind(v, Term.Atom(c as u32)); next }
+        backtrack()
+    }
+    op GET_INT(r: xr, v: simm) : RsB {
+        let t = deref(r);
+        if t == Term.Int(v as i48) { next }
+        if let Ref(x) = t { ctx.bind(x, Term.Int(v as i48)); next }
+        backtrack()
+    }
+    op GET_CONST(r: xr, k: kst) : RB {
+        let t = deref(r);
+        if t == k { next }
+        if let Ref(x) = t { ctx.bind(x, k); next }
+        backtrack()
+    }
+    op GET_STRUCT(r: xr, f: fun) : RB {
+        let t = deref(r);
+        if let Str(st) = t {
+            if st.f == f as u32 { s = st.args.ptr; wm = false; next }
+            backtrack()
+        }
+        if let Ref(v) = t {
+            let n = ctx.db.farity(f as u32) as u64;
+            let st = ctx.mk_struct(f as u32, n);
+            ctx.bind(v, Term.Str(st));
+            s = st.args.ptr;
+            wm = true;
+            next
+        }
+        backtrack()
+    }
+    op GET_LIST(r: xr) : RR {
+        let t = deref(r);
+        if let Lst(c) = t { s = c as *Term; wm = false; next }
+        if let Ref(v) = t {
+            let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
+            ctx.bind(v, Term.Lst(c));
+            s = c as *Term;
+            wm = true;
+            next
+        }
+        backtrack()
+    }
+
+    op UNIFY_VAR_X(r: xr) : RR {
+        if wm { let v = ctx.new_var(); *s = v; r = v; } else { r = *s; }
+        s = s + 1;
+        next
+    }
+    op UNIFY_VAR_Y(r: yr) : RR {
+        if wm { let v = ctx.new_var(); *s = v; r = v; } else { r = *s; }
+        s = s + 1;
+        next
+    }
+    op UNIFY_VAL_X(r: xr) : RR {
+        if wm { *s = r; s = s + 1; next }
+        let t = *s;
+        s = s + 1;
+        if t == r { next }
+        cold { if unify(ctx, r, t) { next } backtrack() }
+    }
+    op UNIFY_VAL_Y(r: yr) : RR {
+        if wm { *s = r; s = s + 1; next }
+        let t = *s;
+        s = s + 1;
+        if t == r { next }
+        cold { if unify(ctx, r, t) { next } backtrack() }
+    }
+    op UNIFY_ATOM(c: atom) : A {
+        if wm { *s = Term.Atom(c as u32); s = s + 1; next }
+        let t = deref(*s);
+        s = s + 1;
+        if t == Term.Atom(c as u32) { next }
+        if let Ref(v) = t { ctx.bind(v, Term.Atom(c as u32)); next }
+        backtrack()
+    }
+    op UNIFY_INT(v: simm) : sA {
+        if wm { *s = Term.Int(v as i48); s = s + 1; next }
+        let t = deref(*s);
+        s = s + 1;
+        if t == Term.Int(v as i48) { next }
+        if let Ref(x) = t { ctx.bind(x, Term.Int(v as i48)); next }
+        backtrack()
+    }
+    op UNIFY_CONST(k: kst) : A {
+        if wm { *s = k; s = s + 1; next }
+        let t = deref(*s);
+        s = s + 1;
+        if t == k { next }
+        if let Ref(x) = t { ctx.bind(x, k); next }
+        backtrack()
+    }
+    op UNIFY_VOID(n: imm) : A {
+        if wm {
+            for i in 0..n { *s = ctx.new_var(); s = s + 1; }
+            next
+        }
+        s = s + n;
+        next
+    }
+
+    // ---- body: put and set ---------------------------------------------
+
+    op PUT_VAR_X(r: xr, a: xr) : RR { let v = ctx.new_var(); r = v; a = v; next }
+    op PUT_VAR_Y(r: yr, a: xr) : RR { let v = ctx.new_var(); r = v; a = v; next }
+    op PUT_VAL_X(r: xr, a: xr) : RR { a = r; next }
+    op PUT_VAL_Y(r: yr, a: xr) : RR { a = r; next }
+    op PUT_ATOM(r: xr, c: atom) : RB { r = Term.Atom(c as u32); next }
+    op PUT_INT(r: xr, v: simm) : RsB { r = Term.Int(v as i48); next }
+    op PUT_CONST(r: xr, k: kst) : RB { r = k; next }
+    op PUT_STRUCT(r: xr, f: fun) : RB {
+        let n = ctx.db.farity(f as u32) as u64;
+        let st = ctx.mk_struct(f as u32, n);
+        r = Term.Str(st);
+        s = st.args.ptr;
+        next
+    }
+    op PUT_LIST(r: xr) : RR {
+        let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
+        r = Term.Lst(c);
+        s = c as *Term;
+        next
+    }
+    op SET_VAR_X(r: xr) : RR { let v = ctx.new_var(); *s = v; r = v; s = s + 1; next }
+    op SET_VAR_Y(r: yr) : RR { let v = ctx.new_var(); *s = v; r = v; s = s + 1; next }
+    op SET_VAL_X(r: xr) : RR { *s = r; s = s + 1; next }
+    op SET_VAL_Y(r: yr) : RR { *s = r; s = s + 1; next }
+    op SET_ATOM(c: atom) : A { *s = Term.Atom(c as u32); s = s + 1; next }
+    op SET_INT(v: simm) : sA { *s = Term.Int(v as i48); s = s + 1; next }
+    op SET_CONST(k: kst) : A { *s = k; s = s + 1; next }
+    op SET_VOID(n: imm) : A {
+        for i in 0..n { *s = ctx.new_var(); s = s + 1; }
+        next
+    }
+
+    // ---- control --------------------------------------------------------
+
+    op ALLOCATE(n: imm) : A {
+        var top = e.end();
+        let bt = ctx.b.etop;
+        if bt > top { top = bt; }
+        let end = top + 3 + n;
+        if end >= ctx.eend { cold { raise builtins.resource_error(ctx, "stack") } }
+        if end > ctx.ehw { ctx.ehw = end; }
+        let ne = top as *Frame;
+        ne.ce = e;
+        ne.cp = ctx.cp;
+        ne.n = n;
+        e = ne;
+        next
+    }
+    op DEALLOCATE() : A {
+        ctx.cp = e.cp;
+        e = e.ce;
+        next
+    }
+    op CALL(p: pred) : A {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        ctx.cp = next_pc;
+        ctx.b0 = ctx.b;
+        jump ctx.preds.ptr[p].code
+    }
+    op EXECUTE(p: pred) : A {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        ctx.b0 = ctx.b;
+        jump ctx.preds.ptr[p].code
+    }
+    op PROCEED() : A { jump ctx.cp }
+    op FAIL() : A { backtrack() }
+
+    /// A deterministic builtin on the argument registers.
+    op CALLB(id: imm) : A {
+        match builtins.call(ctx, id) {
+            Ok(true) => next,
+            Ok(false) => backtrack(),
+            Err(ball) => raise ball,
+        }
+    }
+
+    op NECK_CUT() : A { cut_to(ctx.b0); next }
+    op GET_LEVEL(r: yr) : RR {
+        r = Term.Int((((ctx.b0 as u64) - (ctx.cbase as u64)) / 8) as i48);
+        next
+    }
+    op CUT_Y(r: yr) : RR {
+        if let Int(off) = r { cut_to((((ctx.cbase as *u64) + off as u64)) as *Choice); }
+        next
+    }
+
+    // ---- clause selection ----------------------------------------------
+
+    fn push_choice(n: u64, alt: *u32) {
+        let b = ctx.b;
+        let c = b.end();
+        if (c as *u64) + 9 + n >= ctx.cend { cold { builtins.cstack_overflow(); } }
+        c.prev = b;
+        c.alt = alt;
+        c.e = e;
+        c.cp = ctx.cp;
+        c.tr = ctx.tr;
+        var top = e.end();
+        if b.etop > top { top = b.etop; }
+        c.etop = top;
+        ctx.cstamp += 1;
+        c.stamp = ctx.cstamp;
+        c.n = n;
+        c.kind = machine.CP_PLAIN;
+        let a = c.args();
+        for i in 0..n { a[i] = ctx.x[i]; }
+        ctx.b = c;
+    }
+
+    op TRY(n: imm) : A + Target {
+        push_choice(n, next_pc);
+        jump (cache.code as *u32)
+    }
+    op RETRY() : A + Target {
+        ctx.b.alt = next_pc;
+        jump (cache.code as *u32)
+    }
+    op TRUST() : A + Target {
+        ctx.b = ctx.b.prev;
+        jump (cache.code as *u32)
+    }
+
+    /// First-argument indexing: pick the clauses that can match A1.
+    op INDEX(p: pred) : A {
+        let pr = ctx.preds.ptr[p];
+        let t = deref(ctx.x[0]);
+        match t {
+            Ref(_) => jump pr.var_code,
+            Lst(_) => jump pr.lst_code,
+            _ => jump pr.lookup(compile.key_of(t)),
+        }
+    }
+
+    /// A predicate whose clauses changed since its index was built.
+    op REINDEX(p: pred) : A {
+        let pr = ctx.preds.ptr[p];
+        compile.reindex(ctx, pr);
+        jump pr.code
+    }
+
+    op UNDEF(p: pred) : A {
+        cold { raise builtins.existence_error(ctx, p as u32) }
+    }
+
+    /// call/N: the goal in A1, N-1 extra arguments after it.
+    op METACALL(n: imm) : A {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        match compile.prepare_call(ctx, n) {
+            Ok(code) => jump code,
+            Err(ball) => raise ball,
+        }
+    }
+
+    op HALT_TRUE() : A { ctx.e = e; exit EXIT_TRUE }
+    op HALT_FALSE() : A { ctx.e = e; exit EXIT_FALSE }
+    op HALT() : A { ctx.e = e; exit EXIT_HALT }
+
+    entry run(m: *Machine, code: *u32) -> i32 uses gc {
+        ctx = m;
+        e = m.e;
+        s = m.ebase;
+        wm = false;
+        jump code
+    }
+
+    /// throw/1, and errors from builtins: unwind to the newest active
+    /// catch/3 and backtrack into it, where its recovery clause takes the
+    /// ball (builtins.lm, '$catch_ball').
+    on raise(ball: Term) {
+        let copy = machine.copy_term(ctx, ball);
+        var c = ctx.b;
+        loop {
+            if c.kind == machine.CP_CATCH { break; }
+            if c.prev == c {
+                ctx.ball = copy;
+                ctx.e = e;
+                exit EXIT_THROW
+            }
+            c = c.prev;
+        }
+        ctx.b = c;
+        ctx.ball = copy;
+        backtrack()
+    }
+}

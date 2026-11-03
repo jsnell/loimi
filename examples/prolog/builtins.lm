@@ -1,0 +1,1187 @@
+// Deterministic builtins, called by CALLB with their arguments in the
+// argument registers. Nondeterministic library predicates are in Prolog
+// (prelude.lm), on top of these.
+
+import std.mem;
+import std.text;
+import std.io;
+import std.os;
+import std.hash;
+import std.map.{HashMap};
+import term.{Term, Var, Struct, Cons, deref};
+import term;
+import machine.{Machine, Choice, unify, compare};
+import machine;
+import compile.{Pred, Clause};
+import compile;
+import write;
+import reader;
+import arith;
+
+extern "C" fn clock() -> i64;
+extern "C" fn time(p: *u8) -> i64;
+
+pub enum B {
+    Unify, NotUnify, Eq, NotEq, Lt, Gt, Le, Ge, Compare,
+    IsVar, NonVar, IsAtom, IsNumber, IsInteger, IsFloat, IsAtomic, IsCompound, IsCallable, IsList, Ground,
+    Is, NumEq, NumNe, NumLt, NumGt, NumLe, NumGe,
+    Functor, Arg, Univ, CopyTerm,
+    AtomCodes, AtomChars, CharCode, AtomLength, NumberCodes, AtomNumber, AtomConcat2, SubAtom4, UpcaseAtom, NumberChars, AtomToTerm, TermToAtom,
+    Write, Print, Writeq, WriteCanonical, WriteTerm, Nl, Tab, PutChar, Write2, Nl1, Writeq2,
+    Format1, Format2, Format3,
+    Throw, Cut, CatchEnter, CatchExit, CatchBall,
+    FaBegin, FaAdd, FaEnd,
+    Assert, Asserta, Clauses, ClauseRef, Erase, Dynamic, Abolish,
+    Msort, Sort, Sort4, Keysort, Length2,
+    Op, Ops, SetFlag, Halt1, Statistics, GarbageCollect,
+    AddClause, TermVariables, Succ, Plus, NbSetval, NbGetval, Tab2, Numbervars, CharType, Atomics, Ignore2,
+    COUNT,
+}
+
+pub fn register(m: *Machine) {
+    let tbl = [
+        ("=", 2, B.Unify), ("\\=", 2, B.NotUnify), ("==", 2, B.Eq), ("\\==", 2, B.NotEq),
+        ("@<", 2, B.Lt), ("@>", 2, B.Gt), ("@=<", 2, B.Le), ("@>=", 2, B.Ge), ("compare", 3, B.Compare),
+        ("var", 1, B.IsVar), ("nonvar", 1, B.NonVar), ("atom", 1, B.IsAtom), ("number", 1, B.IsNumber),
+        ("integer", 1, B.IsInteger), ("float", 1, B.IsFloat), ("atomic", 1, B.IsAtomic),
+        ("compound", 1, B.IsCompound), ("callable", 1, B.IsCallable), ("is_list", 1, B.IsList), ("ground", 1, B.Ground),
+        ("is", 2, B.Is), ("=:=", 2, B.NumEq), ("=\\=", 2, B.NumNe), ("<", 2, B.NumLt), (">", 2, B.NumGt),
+        ("=<", 2, B.NumLe), (">=", 2, B.NumGe),
+        ("functor", 3, B.Functor), ("arg", 3, B.Arg), ("=..", 2, B.Univ), ("copy_term", 2, B.CopyTerm),
+        ("atom_codes", 2, B.AtomCodes), ("atom_chars", 2, B.AtomChars), ("char_code", 2, B.CharCode),
+        ("atom_length", 2, B.AtomLength), ("number_codes", 2, B.NumberCodes), ("atom_number", 2, B.AtomNumber),
+        ("$atom_concat", 3, B.AtomConcat2), ("$sub_atom", 4, B.SubAtom4), ("upcase_atom", 2, B.UpcaseAtom),
+        ("number_chars", 2, B.NumberChars), ("atom_to_term", 3, B.AtomToTerm), ("term_to_atom", 2, B.TermToAtom),
+        ("write", 1, B.Write), ("print", 1, B.Print), ("writeq", 1, B.Writeq), ("write_canonical", 1, B.WriteCanonical),
+        ("write_term", 2, B.WriteTerm), ("nl", 0, B.Nl), ("tab", 1, B.Tab), ("put_char", 1, B.PutChar),
+        ("write", 2, B.Write2), ("nl", 1, B.Nl1), ("writeq", 2, B.Writeq2),
+        ("format", 1, B.Format1), ("format", 2, B.Format2), ("format", 3, B.Format3),
+        ("throw", 1, B.Throw), ("$cut", 1, B.Cut), ("$catch_enter", 1, B.CatchEnter), ("$catch_exit", 1, B.CatchExit),
+        ("$catch_ball", 1, B.CatchBall), ("$fa_begin", 0, B.FaBegin), ("$fa_add", 1, B.FaAdd), ("$fa_end", 1, B.FaEnd),
+        ("assert", 1, B.Assert), ("assertz", 1, B.Assert), ("asserta", 1, B.Asserta), ("$clauses", 2, B.Clauses),
+        ("$clause", 3, B.ClauseRef), ("$erase", 1, B.Erase), ("dynamic", 1, B.Dynamic), ("abolish", 1, B.Abolish),
+        ("discontiguous", 1, B.Ignore2), ("ensure_loaded", 1, B.Ignore2), ("use_module", 1, B.Ignore2), ("style_check", 1, B.Ignore2),
+        ("msort", 2, B.Msort), ("sort", 2, B.Sort), ("sort", 4, B.Sort4), ("keysort", 2, B.Keysort), ("$length", 2, B.Length2),
+        ("op", 3, B.Op), ("$ops", 1, B.Ops), ("set_prolog_flag", 2, B.SetFlag), ("$set_halt", 1, B.Halt1),
+        ("statistics", 2, B.Statistics), ("garbage_collect", 0, B.GarbageCollect),
+        ("term_variables", 2, B.TermVariables), ("succ", 2, B.Succ), ("plus", 3, B.Plus),
+        ("nb_setval", 2, B.NbSetval), ("b_setval", 2, B.NbSetval), ("nb_getval", 2, B.NbGetval), ("b_getval", 2, B.NbGetval),
+        ("tab", 2, B.Tab2), ("numbervars", 3, B.Numbervars), ("char_type", 2, B.CharType), ("$atomics", 2, B.Atomics),
+        ("use_module", 2, B.Ignore2), ("garbage_collect_atoms", 0, B.GarbageCollect), ("print_message", 2, B.Ignore2),
+        ("set_stream", 2, B.Ignore2), ("license", 1, B.Ignore2), ("flush_output", 0, B.GarbageCollect),
+        ("flush_output", 1, B.Ignore2), ("$skip", 0, B.GarbageCollect), ("$skip", 1, B.Ignore2), ("$add_clause", 1, B.AddClause),
+    ];
+    for e in tbl {
+        let (name, ar, b) = e;
+        let f = m.db.functor(m.db.atom(name), ar as u32);
+        m.bmap.insert(f, b as u32);
+    }
+}
+
+// ---- errors -------------------------------------------------------------
+
+pub fn err(m: *Machine, formal: Term) -> Term {
+    m.mk2(term.A_ERROR, formal, m.new_var())
+}
+
+pub fn inst_error(m: *Machine) -> Term { err(m, Term.Atom(m.db.atom("instantiation_error"))) }
+
+pub fn type_error(m: *Machine, kind: str, culprit: Term) -> Term {
+    err(m, m.mk2(m.db.atom("type_error"), Term.Atom(m.db.atom(kind)), culprit))
+}
+
+pub fn domain_error(m: *Machine, kind: str, culprit: Term) -> Term {
+    err(m, m.mk2(m.db.atom("domain_error"), Term.Atom(m.db.atom(kind)), culprit))
+}
+
+pub fn eval_error(m: *Machine, what: str) -> Term {
+    err(m, m.mk1(m.db.atom("evaluation_error"), Term.Atom(m.db.atom(what))))
+}
+
+pub fn resource_error(m: *Machine, what: str) -> Term {
+    err(m, m.mk1(m.db.atom("resource_error"), Term.Atom(m.db.atom(what))))
+}
+
+pub fn pi(m: *Machine, name: u32, ar: u32) -> Term {
+    m.mk2(term.A_SLASH, Term.Atom(name), term.mk_int(ar as i64))
+}
+
+pub fn existence_error(m: *Machine, f: u32) -> Term {
+    let p = pi(m, m.db.fname(f), m.db.farity(f));
+    err(m, m.mk2(m.db.atom("existence_error"), Term.Atom(m.db.atom("procedure")), p))
+}
+
+pub fn permission_error(m: *Machine, action: str, kind: str, culprit: Term) -> Term {
+    let f = m.db.functor(m.db.atom("permission_error"), 3);
+    let s = m.mk_struct(f, 3);
+    s.args[0] = Term.Atom(m.db.atom(action));
+    s.args[1] = Term.Atom(m.db.atom(kind));
+    s.args[2] = culprit;
+    err(m, Term.Str(s))
+}
+
+pub fn cstack_overflow() {
+    io.eprintln("fatal: choicepoint stack overflow");
+    os.quit(2);
+}
+
+pub fn random_next(m: *Machine) -> u64 {
+    m.gensym = m.gensym *% 6364136223846793005 +% 1442695040888963407;
+    m.gensym >> 17
+}
+
+pub fn cputime() -> f64 { clock() as f64 / 1000000.0 }
+pub fn walltime() -> u64 { time(0 as *u8) as u64 }
+
+// ---- helpers ---------------------------------------------------------------
+
+fn x(m: *Machine, i: u64) -> Term { deref(m.x[i]) }
+
+fn get_atom(m: *Machine, t: Term) -> Result<u32, Term> {
+    match t {
+        Atom(a) => Ok(a),
+        Ref(_) => Err(inst_error(m)),
+        _ => Err(type_error(m, "atom", t)),
+    }
+}
+
+fn get_int(m: *Machine, t: Term) -> Result<i64, Term> {
+    match t {
+        Int(i) => Ok(i as i64),
+        Ref(_) => Err(inst_error(m)),
+        _ => Err(type_error(m, "integer", t)),
+    }
+}
+
+/// The text of an atom or number (for atom_length/2, atom_codes/2, ...).
+fn text_of(m: *Machine, t: Term, b: *text.StrBuf) -> bool {
+    match t {
+        Atom(a) => { b.push_str(m.db.name(a)); true }
+        Int(i) => { b.push_int(i as i64); true }
+        Flt(f) => { write.write_float(b, f); true }
+        _ => false,
+    }
+}
+
+/// Elements of a proper list, or an error.
+fn list_items(m: *Machine, t0: Term, out: *mem.Vec<Term>) -> Result<(), Term> {
+    var t = deref(t0);
+    loop {
+        match t {
+            Lst(c) => { out.push(c.head); t = deref(c.tail); }
+            Atom(a) => { if a == term.A_NIL { return Ok(()); } return Err(type_error(m, "list", t0)); }
+            Ref(_) => return Err(inst_error(m)),
+            _ => return Err(type_error(m, "list", t0)),
+        }
+    }
+}
+
+fn mk_list(m: *Machine, items: *mem.Vec<Term>, from: u64) -> Term {
+    var t = Term.Atom(term.A_NIL);
+    var k = items.len;
+    while k > from { k -= 1; t = m.mk_cons(items.ptr[k], t); }
+    t
+}
+
+/// Text from a code or char list.
+fn text_from_list(m: *Machine, t: Term, b: *text.StrBuf) -> Result<(), Term> {
+    var items: mem.Vec<Term> = mem.Vec.new();
+    let r = list_items(m, t, &items);
+    if let Err(e) = r { items.free(); return Err(e); }
+    for i in 0..items.len {
+        let c = deref(items.ptr[i]);
+        match c {
+            Int(v) => push_code(b, v as u32),
+            Atom(a) => b.push_str(m.db.name(a)),
+            Ref(_) => { items.free(); return Err(inst_error(m)); }
+            _ => { items.free(); return Err(type_error(m, "character_code", c)); }
+        }
+    }
+    items.free();
+    Ok(())
+}
+
+fn push_code(b: *text.StrBuf, c: u32) {
+    if c < 128 { b.push(c as u8); }
+    else if c < 0x800 { b.push((0xC0 | (c >> 6)) as u8); b.push((0x80 | (c & 63)) as u8); }
+    else if c < 0x10000 { b.push((0xE0 | (c >> 12)) as u8); b.push((0x80 | ((c >> 6) & 63)) as u8); b.push((0x80 | (c & 63)) as u8); }
+    else { b.push((0xF0 | (c >> 18)) as u8); b.push((0x80 | ((c >> 12) & 63)) as u8); b.push((0x80 | ((c >> 6) & 63)) as u8); b.push((0x80 | (c & 63)) as u8); }
+}
+
+/// Codes (or one-char atoms) of a UTF-8 string.
+fn str_list(m: *Machine, s: str, chars: bool) -> Term {
+    var r = reader.Reader.new(m, "");
+    let t = reader_codes(&r, s, chars);
+    r.free();
+    t
+}
+
+fn reader_codes(r: *reader.Reader, s: str, chars: bool) -> Term { r.codes_pub(s, chars) }
+
+fn num_eval2(m: *Machine) -> Result<i32, Term> {
+    let a = arith.eval(m, m.x[0])?;
+    let b = arith.eval(m, m.x[1])?;
+    Ok(arith.cmp(a, b))
+}
+
+fn out_buf(m: *Machine, stream: Term) -> Result<bool, Term> {
+    // true: stderr
+    match stream {
+        Atom(a) => {
+            let s = m.db.name(a);
+            if s.eq("user_error") { return Ok(true); }
+            if s.eq("user_output") { return Ok(false); }
+            Err(domain_error(m, "stream_or_alias", stream))
+        }
+        Ref(_) => Err(inst_error(m)),
+        _ => Err(domain_error(m, "stream_or_alias", stream)),
+    }
+}
+
+fn emit(m: *Machine, to_err: bool, s: str) {
+    if to_err {
+        m.flush();
+        io.eprint(s);
+    } else {
+        m.out.push_str(s);
+        if m.out.len() > 65536 { m.flush(); }
+    }
+}
+
+fn write_to(m: *Machine, to_err: bool, t: Term, o: write.WOpts) {
+    var b = text.StrBuf.new();
+    write.write_term(m, &b, t, o);
+    emit(m, to_err, b.as_str());
+    b.free();
+}
+
+/// Sort `items` in the standard order (stable merge sort).
+fn sort_terms(m: *Machine, items: *mem.Vec<Term>, key: bool) {
+    items.sort_by(|a, b| {
+        if key { compare(m, term.arg_of(deref(*a), 0), term.arg_of(deref(*b), 0)) } else { compare(m, *a, *b) }
+    });
+}
+
+// ---- assert and friends ---------------------------------------------------------
+
+fn split_clause(m: *Machine, c: Term) -> (Term, Term) {
+    if let Str(s) = c and s.f == m.db.functor(term.A_NECK, 2) {
+        return (deref(s.args[0]), deref(s.args[1]));
+    }
+    (c, Term.Atom(term.A_TRUE))
+}
+
+pub fn add_clause(m: *Machine, c0: Term, front: bool, keep_term: bool) -> Result<bool, Term> {
+    let c = machine.copy_term(m, c0);
+    let (h, body) = split_clause(m, c);
+    match h {
+        Ref(_) => return Err(inst_error(m)),
+        Atom(_) => {}
+        Str(_) => {}
+        _ => return Err(type_error(m, "callable", h)),
+    }
+    if let Ref(_) = body { }
+    let (name, ar) = term.name_arity(&m.db, h);
+    let f = m.db.functor(name, ar);
+    if m.bmap.contains(f) or is_control_name(m, name, ar) {
+        return Err(permission_error(m, "modify", "static_procedure", pi(m, name, ar)));
+    }
+    let p = compile.pred_of(m, f);
+    if p.system { return Err(permission_error(m, "modify", "static_procedure", pi(m, name, ar))); }
+    if keep_term { p.dynamic = true; }
+    p.defined = true;
+    let Some(cl) = compile.compile_clause(m, h, body, None) else { return Ok(false); };
+    cl.pred = p;
+    if keep_term { cl.term = m.mk2(term.A_NECK, h, body); }
+    if front {
+        p.clauses.push(cl);
+        var i = p.clauses.len - 1;
+        while i > 0 { p.clauses.ptr[i] = p.clauses.ptr[i - 1]; i -= 1; }
+        p.clauses.ptr[0] = cl;
+    } else {
+        p.clauses.push(cl);
+    }
+    compile.mark_dirty(p);
+    Ok(true)
+}
+
+/// A clause read from a file. The first clause a program gives for a
+/// library predicate replaces the library's definition.
+pub fn consult_clause(m: *Machine, c: Term, library: bool) -> Result<bool, Term> {
+    let (h, _) = split_clause(m, deref(c));
+    let hd = deref(h);
+    if term.is_callable(hd) {
+        let (name, ar) = term.name_arity(&m.db, hd);
+        let f = m.db.functor(name, ar);
+        let p = compile.pred_of(m, f);
+        if p.library and !library {
+            p.library = false;
+            p.clauses.clear();
+            compile.mark_dirty(p);
+        }
+        let r = add_clause(m, c, false, p.dynamic);
+        if library { p.library = true; }
+        return r;
+    }
+    add_clause(m, c, false, false)
+}
+
+fn is_control_name(m: *Machine, name: u32, ar: u32) -> bool {
+    (ar == 2 and (name == term.A_COMMA or name == term.A_SEMI or name == term.A_ARROW)) or (ar == 1 and name == term.A_NOT)
+}
+
+fn pred_of_head(m: *Machine, h: Term, create: bool) -> Result<?*Pred, Term> {
+    match h {
+        Ref(_) => return Err(inst_error(m)),
+        Atom(_) => {}
+        Str(_) => {}
+        Lst(_) => {}
+        _ => return Err(type_error(m, "callable", h)),
+    }
+    let (name, ar) = term.name_arity(&m.db, h);
+    let f = m.db.functor(name, ar);
+    if (f as u64) >= m.preds.len and !create { return Ok(None); }
+    let p = compile.pred_of(m, f);
+    if create and !p.defined { p.dynamic = true; p.defined = true; compile.mark_dirty(p); }
+    Ok(Some(p))
+}
+
+fn decl_dynamic(m: *Machine, spec0: Term) -> Result<bool, Term> {
+    let spec = deref(spec0);
+    if let Str(s) = spec and s.args.len == 2 {
+        let nm = m.db.fname(s.f);
+        if nm == term.A_COMMA or m.db.name(nm).eq("/") == false {
+            if nm == term.A_COMMA {
+                decl_dynamic(m, s.args[0])?;
+                return decl_dynamic(m, s.args[1]);
+            }
+        } else {
+            let n = get_atom(m, deref(s.args[0]))?;
+            let a = get_int(m, deref(s.args[1]))?;
+            let f = m.db.functor(n, a as u32);
+            let p = compile.pred_of(m, f);
+            if !p.defined or p.dynamic { p.dynamic = true; p.defined = true; compile.mark_dirty(p); }
+            return Ok(true);
+        }
+    }
+    if let Lst(_) = spec {
+        var items: mem.Vec<Term> = mem.Vec.new();
+        list_items(m, spec, &items)?;
+        for i in 0..items.len { decl_dynamic(m, items.ptr[i])?; }
+        items.free();
+        return Ok(true);
+    }
+    if spec == Term.Atom(term.A_NIL) { return Ok(true); }
+    Err(type_error(m, "predicate_indicator", spec))
+}
+
+// ---- format/2 ---------------------------------------------------------------
+
+fn format(m: *Machine, to_err: bool, f0: Term, args0: Term) -> Result<bool, Term> {
+    var fb = text.StrBuf.new();
+    defer fb.free();
+    let f = deref(f0);
+    match f {
+        Atom(_) => { text_of(m, f, &fb); }
+        Lst(_) => text_from_list(m, f, &fb)?,
+        _ => { if !text_of(m, f, &fb) { return Err(type_error(m, "text", f)); } }
+    }
+    var args: mem.Vec<Term> = mem.Vec.new();
+    defer args.free();
+    let a = deref(args0);
+    match a {
+        Lst(_) => list_items(m, a, &args)?,
+        Atom(n) => { if n != term.A_NIL { args.push(a); } }
+        _ => args.push(a),
+    }
+    var out = text.StrBuf.new();
+    defer out.free();
+    let s = fb.as_str();
+    var i: u64 = 0;
+    var ai: u64 = 0;
+    var fill_from: u64 = 0;
+    while i < s.len {
+        let c = s[i];
+        i += 1;
+        if c != '~' { out.push(c); continue; }
+        // ~N<d> argument, or ~*c
+        var numarg: i64 = -1;
+        if i < s.len and s[i] == '*' {
+            if ai >= args.len { return Err(err(m, Term.Atom(m.db.atom("format_error")))); }
+            numarg = get_int(m, deref(args.ptr[ai]))?;
+            ai += 1;
+            i += 1;
+        } else if i < s.len and s[i] == '`' {
+            numarg = s[i + 1] as i64;
+            i += 2;
+        } else {
+            while i < s.len and s[i] >= '0' and s[i] <= '9' {
+                if numarg < 0 { numarg = 0; }
+                numarg = numarg * 10 + (s[i] - '0') as i64;
+                i += 1;
+            }
+        }
+        if i >= s.len { break; }
+        let d = s[i];
+        i += 1;
+        if d == '~' { out.push('~'); continue; }
+        if d == 'n' {
+            let k = if numarg < 0 { 1 } else { numarg };
+            for _j in 0..k { out.push('\n'); }
+            continue;
+        }
+        if d == 't' or d == '|' or d == '+' {
+            // Column handling: pad from the last column stop.
+            if d == '|' or d == '+' {
+                let line_start = match mem.rfind_byte(out.as_str(), '\n') { Some(p) => p + 1, None => 0 };
+                let col = out.len() - line_start;
+                let target = if d == '+' {
+                    let stop = if fill_from > line_start { fill_from - line_start } else { 0 };
+                    stop + (if numarg < 0 { 8 } else { numarg as u64 })
+                } else { if numarg < 0 { col } else { numarg as u64 } };
+                while out.len() - line_start < target { out.push(' '); }
+                fill_from = out.len();
+            }
+            continue;
+        }
+        if ai >= args.len {
+            return Err(err(m, m.mk2(m.db.atom("format"), Term.Atom(m.db.atom("not enough arguments")), Term.Atom(term.A_NIL))));
+        }
+        let arg = deref(args.ptr[ai]);
+        ai += 1;
+        match d {
+            'w' => write.write_term(m, &out, arg, write.plain()),
+            'p' => write.write_term(m, &out, arg, write.quoted()),
+            'q' => write.write_term(m, &out, arg, write.quoted()),
+            'a' => { if !text_of(m, arg, &out) { return Err(type_error(m, "atomic", arg)); } }
+            'd' => {
+                let v = get_int(m, arg)?;
+                if numarg > 0 {
+                    var tmp = text.StrBuf.new();
+                    tmp.push_int(if v < 0 { 0 - v } else { v });
+                    if v < 0 { out.push('-'); }
+                    let ds = tmp.as_str();
+                    let k = numarg as u64;
+                    if ds.len <= k {
+                        out.push_str("0.");
+                        for _j in ds.len..k { out.push('0'); }
+                        out.push_str(ds);
+                    } else {
+                        out.push_str(ds[0..ds.len - k]);
+                        out.push('.');
+                        out.push_str(ds[ds.len - k..ds.len]);
+                    }
+                    tmp.free();
+                } else {
+                    out.push_int(v);
+                }
+            }
+            'D' => {
+                let v = get_int(m, arg)?;
+                var tmp = text.StrBuf.new();
+                tmp.push_int(if v < 0 { 0 - v } else { v });
+                if v < 0 { out.push('-'); }
+                let ds = tmp.as_str();
+                for j in 0..ds.len {
+                    if j > 0 and (ds.len - j) % 3 == 0 { out.push(','); }
+                    out.push(ds[j]);
+                }
+                tmp.free();
+            }
+            'f' => {
+                let v = arith.eval(m, arg)?;
+                let fv = match v { Int(k) => k as f64, Flt(z) => z, _ => 0.0 };
+                fmt_fixed(&out, fv, if numarg < 0 { 6 } else { numarg });
+            }
+            'e' => {
+                let v = arith.eval(m, arg)?;
+                let fv = match v { Int(k) => k as f64, Flt(z) => z, _ => 0.0 };
+                fmt_c(&out, fv, if numarg < 0 { 6 } else { numarg }, 'e');
+            }
+            'g' => {
+                let v = arith.eval(m, arg)?;
+                let fv = match v { Int(k) => k as f64, Flt(z) => z, _ => 0.0 };
+                fmt_c(&out, fv, if numarg < 0 { 6 } else { numarg }, 'g');
+            }
+            's' => text_from_list(m, arg, &out)?,
+            'c' => {
+                let v = get_int(m, arg)?;
+                let k = if numarg < 0 { 1 } else { numarg };
+                for _j in 0..k { push_code(&out, v as u32); }
+            }
+            'r' => {
+                let v = get_int(m, arg)?;
+                let radix = if numarg < 2 { 8 } else { numarg };
+                var digits: mem.Vec<u8> = mem.Vec.new();
+                var u = if v < 0 { 0 - v } else { v };
+                if u == 0 { digits.push('0'); }
+                while u > 0 { let dg = (u % radix) as u8; digits.push(if dg < 10 { '0' + dg } else { 'a' + dg - 10 }); u = u / radix; }
+                if v < 0 { out.push('-'); }
+                var k = digits.len;
+                while k > 0 { k -= 1; out.push(digits.ptr[k]); }
+                digits.free();
+            }
+            'i' => {}
+            _ => return Err(err(m, m.mk2(m.db.atom("format"), Term.Atom(m.db.atom("unknown directive")), Term.Atom(term.A_NIL)))),
+        }
+    }
+    emit(m, to_err, out.as_str());
+    Ok(true)
+}
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+
+fn fmt_c(out: *text.StrBuf, v: f64, prec: i64, conv: u8) {
+    var f: [u8; 8] = [0; 8];
+    f[0] = '%'; f[1] = '.'; f[2] = '*'; f[3] = conv; f[4] = 0;
+    var buf: [u8; 400] = [0; 400];
+    let n = snprintf(&buf[0], 400, &f[0], prec as i32, v);
+    for i in 0..n as u64 { out.push(buf[i]); }
+}
+
+fn fmt_fixed(out: *text.StrBuf, v: f64, prec: i64) { fmt_c(out, v, prec, 'f'); }
+
+// ---- dispatch ------------------------------------------------------------------
+
+pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
+    let b = id as B;
+    match b {
+        Unify => Ok(unify(m, m.x[0], m.x[1])),
+        NotUnify => {
+            let tr = m.tr;
+            // Bind everything (trail all) so the attempt can be undone.
+            let saved = m.b.stamp;
+            m.b.stamp = 0xFFFFFFFFFFFFFFFF;
+            let r = unify(m, m.x[0], m.x[1]);
+            m.untrail(tr);
+            m.b.stamp = saved;
+            Ok(!r)
+        }
+        Eq => Ok(compare(m, m.x[0], m.x[1]) == 0),
+        NotEq => Ok(compare(m, m.x[0], m.x[1]) != 0),
+        Lt => Ok(compare(m, m.x[0], m.x[1]) < 0),
+        Gt => Ok(compare(m, m.x[0], m.x[1]) > 0),
+        Le => Ok(compare(m, m.x[0], m.x[1]) <= 0),
+        Ge => Ok(compare(m, m.x[0], m.x[1]) >= 0),
+        Compare => {
+            let o = x(m, 0);
+            if let Atom(a) = o {
+                let s = m.db.name(a);
+                if !(s.eq("<") or s.eq(">") or s.eq("=")) { return Err(domain_error(m, "order", o)); }
+            } else if let Ref(_) = o {} else { return Err(type_error(m, "atom", o)); }
+            let c = compare(m, m.x[1], m.x[2]);
+            let r = if c < 0 { "<" } else if c > 0 { ">" } else { "=" };
+            Ok(unify(m, m.x[0], Term.Atom(m.db.atom(r))))
+        }
+        IsVar => Ok(match x(m, 0) { Ref(_) => true, _ => false }),
+        NonVar => Ok(match x(m, 0) { Ref(_) => false, _ => true }),
+        IsAtom => Ok(match x(m, 0) { Atom(_) => true, _ => false }),
+        IsNumber => Ok(match x(m, 0) { Int(_) => true, Flt(_) => true, _ => false }),
+        IsInteger => Ok(match x(m, 0) { Int(_) => true, _ => false }),
+        IsFloat => Ok(match x(m, 0) { Flt(_) => true, _ => false }),
+        IsAtomic => Ok(term.is_atomic(x(m, 0))),
+        IsCompound => Ok(match x(m, 0) { Str(_) => true, Lst(_) => true, _ => false }),
+        IsCallable => Ok(term.is_callable(x(m, 0))),
+        IsList => {
+            var t = x(m, 0);
+            loop {
+                match t { Lst(c) => t = deref(c.tail), _ => break }
+            }
+            Ok(t == Term.Atom(term.A_NIL))
+        }
+        Ground => {
+            var vs: mem.Vec<Term> = mem.Vec.new();
+            var seen: HashMap<u64, bool> = HashMap.new();
+            machine.term_vars(m.x[0], &vs, &seen);
+            let r = vs.len == 0;
+            vs.free();
+            seen.free();
+            Ok(r)
+        }
+        Is => { let v = arith.eval(m, m.x[1])?; Ok(unify(m, m.x[0], v)) }
+        NumEq => Ok(num_eval2(m)? == 0),
+        NumNe => Ok(num_eval2(m)? != 0),
+        NumLt => Ok(num_eval2(m)? < 0),
+        NumGt => Ok(num_eval2(m)? > 0),
+        NumLe => Ok(num_eval2(m)? <= 0),
+        NumGe => Ok(num_eval2(m)? >= 0),
+        Functor => {
+            let t = x(m, 0);
+            match t {
+                Ref(_) => {
+                    let n = x(m, 1);
+                    let a = get_int(m, x(m, 2))?;
+                    if a == 0 {
+                        if let Ref(_) = n { return Err(inst_error(m)); }
+                        return Ok(unify(m, t, n));
+                    }
+                    if a < 0 { return Err(domain_error(m, "not_less_than_zero", term.mk_int(a))); }
+                    let name = match n { Atom(q) => q, Ref(_) => return Err(inst_error(m)),
+                        _ => { if term.is_atomic(n) { return Err(type_error(m, "atomic", n)); } return Err(type_error(m, "atomic", n)); } };
+                    if name == term.A_DOT and a == 2 {
+                        let c = m.mk_cons(m.new_var(), m.new_var());
+                        return Ok(unify(m, t, c));
+                    }
+                    let f = m.db.functor(name, a as u32);
+                    let s = m.mk_struct(f, a as u64);
+                    for i in 0..a as u64 { s.args[i] = m.new_var(); }
+                    Ok(unify(m, t, Term.Str(s)))
+                }
+                Atom(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
+                Int(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
+                Flt(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
+                _ => {
+                    let (name, a) = term.name_arity(&m.db, t);
+                    Ok(unify(m, m.x[1], Term.Atom(name)) and unify(m, m.x[2], term.mk_int(a as i64)))
+                }
+            }
+        }
+        Arg => {
+            let n = get_int(m, x(m, 0))?;
+            let t = x(m, 1);
+            let (_, a) = match t {
+                Str(_) => term.name_arity(&m.db, t),
+                Lst(_) => (term.A_DOT, 2),
+                Ref(_) => return Err(inst_error(m)),
+                _ => return Err(type_error(m, "compound", t)),
+            };
+            if n < 1 or n > a as i64 { return Ok(false); }
+            Ok(unify(m, m.x[2], term.arg_of(t, (n - 1) as u64)))
+        }
+        Univ => {
+            let t = x(m, 0);
+            match t {
+                Ref(_) => {
+                    var items: mem.Vec<Term> = mem.Vec.new();
+                    defer items.free();
+                    list_items(m, m.x[1], &items)?;
+                    if items.len == 0 { return Err(domain_error(m, "non_empty_list", Term.Atom(term.A_NIL))); }
+                    let h = deref(items.ptr[0]);
+                    if items.len == 1 { return Ok(unify(m, t, h)); }
+                    let name = match h { Atom(a) => a, Ref(_) => return Err(inst_error(m)), _ => return Err(type_error(m, "atom", h)) };
+                    let n = items.len - 1;
+                    if name == term.A_DOT and n == 2 {
+                        return Ok(unify(m, t, m.mk_cons(items.ptr[1], items.ptr[2])));
+                    }
+                    let f = m.db.functor(name, n as u32);
+                    let s = m.mk_struct(f, n);
+                    for i in 0..n { s.args[i] = items.ptr[i + 1]; }
+                    Ok(unify(m, t, Term.Str(s)))
+                }
+                Str(_) => {
+                    let (name, a) = term.name_arity(&m.db, t);
+                    var l = Term.Atom(term.A_NIL);
+                    var k = a as u64;
+                    while k > 0 { k -= 1; l = m.mk_cons(term.arg_of(t, k), l); }
+                    l = m.mk_cons(Term.Atom(name), l);
+                    Ok(unify(m, m.x[1], l))
+                }
+                Lst(c) => {
+                    let l = m.mk_cons(Term.Atom(term.A_DOT), m.mk_cons(c.head, m.mk_cons(c.tail, Term.Atom(term.A_NIL))));
+                    Ok(unify(m, m.x[1], l))
+                }
+                _ => Ok(unify(m, m.x[1], m.mk_cons(t, Term.Atom(term.A_NIL)))),
+            }
+        }
+        CopyTerm => { let c = machine.copy_term(m, m.x[0]); Ok(unify(m, m.x[1], c)) }
+        AtomCodes => atom_text(m, false, false),
+        AtomChars => atom_text(m, true, false),
+        NumberCodes => atom_text(m, false, true),
+        NumberChars => atom_text(m, true, true),
+        CharCode => {
+            let a = x(m, 0);
+            if let Atom(at) = a {
+                let s = m.db.name(at);
+                let l = str_list(m, s, false);
+                if let Lst(c) = l { return Ok(unify(m, m.x[1], c.head)); }
+                return Err(type_error(m, "character", a));
+            }
+            let c = get_int(m, x(m, 1))?;
+            var b = text.StrBuf.new();
+            push_code(&b, c as u32);
+            let r = Term.Atom(m.db.atom(b.as_str()));
+            b.free();
+            Ok(unify(m, a, r))
+        }
+        AtomLength => {
+            let a = x(m, 0);
+            var b = text.StrBuf.new();
+            if let Ref(_) = a { return Err(inst_error(m)); }
+            if !text_of(m, a, &b) { b.free(); return Err(type_error(m, "atom", a)); }
+            // Count code points.
+            var n: i64 = 0;
+            let s = b.as_str();
+            for i in 0..s.len { if (s[i] & 0xC0) != 0x80 { n += 1; } }
+            b.free();
+            let l = x(m, 1);
+            match l { Ref(_) => {}, Int(_) => {}, _ => return Err(type_error(m, "integer", l)) }
+            Ok(unify(m, l, term.mk_int(n)))
+        }
+        AtomNumber => {
+            let a = x(m, 0);
+            match a {
+                Atom(at) => match reader.parse_number(m, m.db.name(at)) {
+                    Some(n) => Ok(unify(m, m.x[1], n)),
+                    None => Ok(false),
+                },
+                Ref(_) => {
+                    let n = x(m, 1);
+                    var b = text.StrBuf.new();
+                    if let Ref(_) = n { return Err(inst_error(m)); }
+                    if !text_of(m, n, &b) { b.free(); return Err(type_error(m, "number", n)); }
+                    let r = Term.Atom(m.db.atom(b.as_str()));
+                    b.free();
+                    Ok(unify(m, a, r))
+                }
+                _ => Err(type_error(m, "atom", a)),
+            }
+        }
+        AtomConcat2 => {
+            var b = text.StrBuf.new();
+            let a1 = x(m, 0);
+            let a2 = x(m, 1);
+            if let Ref(_) = a1 { b.free(); return Err(inst_error(m)); }
+            if let Ref(_) = a2 { b.free(); return Err(inst_error(m)); }
+            if !text_of(m, a1, &b) { b.free(); return Err(type_error(m, "atomic", a1)); }
+            if !text_of(m, a2, &b) { b.free(); return Err(type_error(m, "atomic", a2)); }
+            let r = Term.Atom(m.db.atom(b.as_str()));
+            b.free();
+            Ok(unify(m, m.x[2], r))
+        }
+        SubAtom4 => {
+            // '$sub_atom'(Atom, Before, Length, Sub), in bytes.
+            let a = get_atom(m, x(m, 0))?;
+            let bf = get_int(m, x(m, 1))?;
+            let ln = get_int(m, x(m, 2))?;
+            let s = m.db.name(a);
+            if bf < 0 or ln < 0 or (bf + ln) as u64 > s.len { return Ok(false); }
+            let sub = Term.Atom(m.db.atom(s[bf as u64..(bf + ln) as u64]));
+            Ok(unify(m, m.x[3], sub))
+        }
+        UpcaseAtom => {
+            let a = get_atom(m, x(m, 0))?;
+            var b = text.StrBuf.new();
+            let s = m.db.name(a);
+            for i in 0..s.len { let c = s[i]; b.push(if c >= 'a' and c <= 'z' { c - 32 } else { c }); }
+            let r = Term.Atom(m.db.atom(b.as_str()));
+            b.free();
+            Ok(unify(m, m.x[1], r))
+        }
+        AtomToTerm => {
+            let a = x(m, 0);
+            var b = text.StrBuf.new();
+            if !text_of(m, a, &b) { b.free(); return Err(inst_error(m)); }
+            b.push_str(" .");
+            var r = reader.Reader.new(m, b.as_str());
+            let t = r.read();
+            let vl = r.var_list();
+            let bad = r.error.is_some();
+            r.free();
+            b.free();
+            if bad { return Err(err(m, Term.Atom(m.db.atom("syntax_error")))); }
+            let tt = t ?? Term.Atom(term.A_EOF);
+            Ok(unify(m, m.x[1], tt) and unify(m, m.x[2], vl))
+        }
+        TermToAtom => {
+            let t = x(m, 0);
+            var b = text.StrBuf.new();
+            write.write_term(m, &b, t, write.quoted());
+            let r = Term.Atom(m.db.atom(b.as_str()));
+            b.free();
+            Ok(unify(m, m.x[1], r))
+        }
+        Write => { write_to(m, false, m.x[0], write.plain()); Ok(true) }
+        Print => { write_to(m, false, m.x[0], write.quoted()); Ok(true) }
+        Writeq => { write_to(m, false, m.x[0], write.quoted()); Ok(true) }
+        WriteCanonical => { write_to(m, false, m.x[0], write.canonical()); Ok(true) }
+        WriteTerm => {
+            var o = write.WOpts { quoted: false, ignore_ops: false, numbervars: false };
+            var opts: mem.Vec<Term> = mem.Vec.new();
+            list_items(m, m.x[1], &opts)?;
+            for i in 0..opts.len {
+                let op = deref(opts.ptr[i]);
+                if let Str(s) = op and s.args.len == 1 {
+                    let on = deref(s.args[0]) == Term.Atom(term.A_TRUE);
+                    let nm = m.db.name(m.db.fname(s.f));
+                    if nm.eq("quoted") { o.quoted = on; }
+                    if nm.eq("ignore_ops") { o.ignore_ops = on; }
+                    if nm.eq("numbervars") { o.numbervars = on; }
+                }
+            }
+            opts.free();
+            write_to(m, false, m.x[0], o);
+            Ok(true)
+        }
+        Write2 => { let e = out_buf(m, x(m, 0))?; write_to(m, e, m.x[1], write.plain()); Ok(true) }
+        Writeq2 => { let e = out_buf(m, x(m, 0))?; write_to(m, e, m.x[1], write.quoted()); Ok(true) }
+        Nl => { emit(m, false, "\n"); Ok(true) }
+        Nl1 => { let e = out_buf(m, x(m, 0))?; emit(m, e, "\n"); Ok(true) }
+        Tab => {
+            let n = arith.eval(m, m.x[0])?;
+            let k = get_int(m, n)?;
+            for _i in 0..k { emit(m, false, " "); }
+            Ok(true)
+        }
+        Tab2 => {
+            let e = out_buf(m, x(m, 0))?;
+            let n = arith.eval(m, m.x[1])?;
+            let k = get_int(m, n)?;
+            for _i in 0..k { emit(m, e, " "); }
+            Ok(true)
+        }
+        PutChar => { let a = get_atom(m, x(m, 0))?; emit(m, false, m.db.name(a)); Ok(true) }
+        Format1 => format(m, false, m.x[0], Term.Atom(term.A_NIL)),
+        Format2 => format(m, false, m.x[0], m.x[1]),
+        Format3 => { let e = out_buf(m, x(m, 0))?; format(m, e, m.x[1], m.x[2]) }
+        Throw => {
+            let b = x(m, 0);
+            if let Ref(_) = b { return Err(inst_error(m)); }
+            Err(b)
+        }
+        Cut => {
+            if let Int(off) = x(m, 0) {
+                let c = ((m.cbase as *u64) + off as u64) as *Choice;
+                if c < m.b { m.b = c; }
+            }
+            Ok(true)
+        }
+        CatchEnter => {
+            // At the start of catch/3's first clause the newest choicepoint
+            // is catch/3's own, whose alternative is the recovery clause.
+            let c = m.b;
+            c.kind = machine.CP_CATCH;
+            let off = ((c as u64) - (m.cbase as u64)) / 8;
+            Ok(unify(m, m.x[0], term.mk_int(off as i64)))
+        }
+        CatchExit => {
+            if let Int(off) = x(m, 0) {
+                let c = ((m.cbase as *u64) + off as u64) as *Choice;
+                if c == m.b {
+                    m.b = c.prev;
+                } else if c < m.b {
+                    c.kind = machine.CP_CATCH_OFF;
+                    m.push_trail(Term.Int(off));
+                }
+            }
+            Ok(true)
+        }
+        CatchBall => {
+            let ball = m.ball;
+            if ball == Term.Unb { return Ok(false); }
+            m.ball = Term.Unb;
+            if unify(m, m.x[0], ball) { return Ok(true); }
+            Err(ball)
+        }
+        FaBegin => { m.bags.push(Term.Unb); Ok(true) }
+        FaAdd => { let c = machine.copy_term(m, m.x[0]); m.bags.push(c); Ok(true) }
+        FaEnd => {
+            var k = m.bags.len;
+            while k > 0 and m.bags.ptr[k - 1] != Term.Unb { k -= 1; }
+            let l = mk_list(m, &m.bags, k);
+            m.bags.truncate(if k > 0 { k - 1 } else { 0 });
+            Ok(unify(m, m.x[0], l))
+        }
+        AddClause => consult_clause(m, m.x[0], m.loading_library),
+        Assert => add_clause(m, m.x[0], false, true),
+        Asserta => add_clause(m, m.x[0], true, true),
+        Clauses => {
+            let h = x(m, 0);
+            let Some(p) = pred_of_head(m, h, false)? else { return Ok(unify(m, m.x[1], Term.Atom(term.A_NIL))); };
+            if !p.dynamic and p.defined {
+                let (name, ar) = term.name_arity(&m.db, h);
+                return Err(permission_error(m, "access", "private_procedure", pi(m, name, ar)));
+            }
+            var refs: mem.Vec<Term> = mem.Vec.new();
+            for i in 0..p.clauses.len {
+                let c = p.clauses.ptr[i];
+                if !c.erased { refs.push(term.mk_int(c.id as i64)); }
+            }
+            let l = mk_list(m, &refs, 0);
+            refs.free();
+            Ok(unify(m, m.x[1], l))
+        }
+        ClauseRef => {
+            let id = get_int(m, x(m, 0))?;
+            let c = m.clauses.ptr[id as u64];
+            if c.erased { return Ok(false); }
+            let ct = machine.copy_term(m, c.term);
+            let (h, bd) = split_clause(m, ct);
+            Ok(unify(m, m.x[1], h) and unify(m, m.x[2], bd))
+        }
+        Erase => {
+            let id = get_int(m, x(m, 0))?;
+            let c = m.clauses.ptr[id as u64];
+            if !c.erased { c.erased = true; compile.mark_dirty(c.pred); }
+            Ok(true)
+        }
+        Dynamic => decl_dynamic(m, m.x[0]),
+        Abolish => Ok(true),
+        Ignore2 => Ok(true),
+        Msort => {
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, m.x[0], &items)?;
+            sort_terms(m, &items, false);
+            Ok(unify(m, m.x[1], mk_list(m, &items, 0)))
+        }
+        Sort => {
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, m.x[0], &items)?;
+            sort_terms(m, &items, false);
+            var out: mem.Vec<Term> = mem.Vec.new();
+            defer out.free();
+            for i in 0..items.len {
+                if out.len == 0 or compare(m, out.ptr[out.len - 1], items.ptr[i]) != 0 { out.push(items.ptr[i]); }
+            }
+            Ok(unify(m, m.x[1], mk_list(m, &out, 0)))
+        }
+        Sort4 => {
+            let k = get_int(m, x(m, 0))?;
+            let ord = get_atom(m, x(m, 1))?;
+            let os = m.db.name(ord);
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, m.x[2], &items)?;
+            let desc = os.eq("@>") or os.eq("@>=");
+            let dedup = os.eq("@<") or os.eq("@>");
+            items.sort_by(|a, b| {
+                let ka = if k == 0 { *a } else { term.arg_of(deref(*a), (k - 1) as u64) };
+                let kb = if k == 0 { *b } else { term.arg_of(deref(*b), (k - 1) as u64) };
+                let c = compare(m, ka, kb);
+                if desc { 0 - c } else { c }
+            });
+            var out: mem.Vec<Term> = mem.Vec.new();
+            defer out.free();
+            for i in 0..items.len {
+                if dedup and out.len > 0 {
+                    let ka = if k == 0 { out.ptr[out.len - 1] } else { term.arg_of(deref(out.ptr[out.len - 1]), (k - 1) as u64) };
+                    let kb = if k == 0 { items.ptr[i] } else { term.arg_of(deref(items.ptr[i]), (k - 1) as u64) };
+                    if compare(m, ka, kb) == 0 { continue; }
+                }
+                out.push(items.ptr[i]);
+            }
+            Ok(unify(m, m.x[3], mk_list(m, &out, 0)))
+        }
+        Keysort => {
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, m.x[0], &items)?;
+            for i in 0..items.len {
+                let it = deref(items.ptr[i]);
+                if let Str(s) = it and s.f == m.db.functor(term.A_MINUS, 2) { continue; }
+                if let Ref(_) = it { return Err(inst_error(m)); }
+                return Err(type_error(m, "pair", it));
+            }
+            sort_terms(m, &items, true);
+            Ok(unify(m, m.x[1], mk_list(m, &items, 0)))
+        }
+        Length2 => {
+            // '$length'(List, N): N for a proper list, else fail.
+            var t = x(m, 0);
+            var n: i64 = 0;
+            loop { match t { Lst(c) => { n += 1; t = deref(c.tail); } _ => break } }
+            if t != Term.Atom(term.A_NIL) { return Ok(false); }
+            Ok(unify(m, m.x[1], term.mk_int(n)))
+        }
+        Op => {
+            let p = get_int(m, x(m, 0))?;
+            let ty = get_atom(m, x(m, 1))?;
+            let Some(typ) = reader.op_type_atom(m, m.db.name(ty)) else { return Err(domain_error(m, "operator_specifier", x(m, 1))); };
+            let names = x(m, 2);
+            if let Atom(a) = names {
+                if a != term.A_NIL { reader.add_op(m, p as u32, typ, a); }
+                return Ok(true);
+            }
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, names, &items)?;
+            for i in 0..items.len { let a = get_atom(m, deref(items.ptr[i]))?; reader.add_op(m, p as u32, typ, a); }
+            Ok(true)
+        }
+        Ops => {
+            // '$ops'(L): L = [op(P, T, Name), ...]
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            var i: u64 = 0;
+            let f = m.db.functor(m.db.atom("op"), 3);
+            while let Some(sl) = m.ops.next(&i) {
+                let s = m.mk_struct(f, 3);
+                s.args[0] = term.mk_int((sl.value >> 4) as i64);
+                s.args[1] = Term.Atom(m.db.atom(reader.op_type_name(sl.value & 15)));
+                s.args[2] = Term.Atom((sl.key >> 2) as u32);
+                items.push(Term.Str(s));
+            }
+            Ok(unify(m, m.x[0], mk_list(m, &items, 0)))
+        }
+        SetFlag => {
+            let f = get_atom(m, x(m, 0))?;
+            let v = x(m, 1);
+            let fs = m.db.name(f);
+            if fs.eq("double_quotes") { if let Atom(a) = v { m.flags_dq = a; } }
+            if fs.eq("unknown") { if let Atom(a) = v { m.flag_unknown_fail = m.db.name(a).eq("fail"); } }
+            Ok(true)
+        }
+        Halt1 => {
+            let c = get_int(m, x(m, 0))?;
+            m.halt_code = c as i32;
+            m.halted = true;
+            Ok(true)
+        }
+        Statistics => {
+            let k = get_atom(m, x(m, 0))?;
+            let ks = m.db.name(k);
+            let ms = (cputime() * 1000.0) as i64;
+            if ks.eq("runtime") or ks.eq("process_cputime") or ks.eq("real_time") or ks.eq("walltime") or ks.eq("system_time") {
+                let l = m.mk_cons(term.mk_int(ms), m.mk_cons(term.mk_int(0), Term.Atom(term.A_NIL)));
+                return Ok(unify(m, m.x[1], l));
+            }
+            if ks.eq("cputime") { return Ok(unify(m, m.x[1], Term.Flt(cputime()))); }
+            if ks.eq("inferences") { return Ok(unify(m, m.x[1], term.mk_int(0))); }
+            Err(domain_error(m, "statistics_key", x(m, 0)))
+        }
+        GarbageCollect => { m.flush(); Ok(true) }
+        TermVariables => {
+            var vs: mem.Vec<Term> = mem.Vec.new();
+            var seen: HashMap<u64, bool> = HashMap.new();
+            machine.term_vars(m.x[0], &vs, &seen);
+            let l = mk_list(m, &vs, 0);
+            vs.free();
+            seen.free();
+            Ok(unify(m, m.x[1], l))
+        }
+        Succ => {
+            let a = x(m, 0);
+            if let Int(i) = a {
+                if (i as i64) < 0 { return Err(type_error(m, "not_less_than_zero", a)); }
+                return Ok(unify(m, m.x[1], term.mk_int(i as i64 + 1)));
+            }
+            let b = get_int(m, x(m, 1))?;
+            if b <= 0 { if b < 0 { return Err(type_error(m, "not_less_than_zero", x(m, 1))); } return Ok(false); }
+            Ok(unify(m, a, term.mk_int(b - 1)))
+        }
+        Plus => {
+            let a = x(m, 0);
+            let b = x(m, 1);
+            let c = x(m, 2);
+            if let (Int(p), Int(q)) = (a, b) { return Ok(unify(m, c, term.mk_int(p as i64 + q as i64))); }
+            if let (Int(p), Int(r)) = (a, c) { return Ok(unify(m, b, term.mk_int(r as i64 - p as i64))); }
+            if let (Int(q), Int(r)) = (b, c) { return Ok(unify(m, a, term.mk_int(r as i64 - q as i64))); }
+            Err(inst_error(m))
+        }
+        NbSetval => {
+            let k = get_atom(m, x(m, 0))?;
+            let v = machine.copy_term(m, m.x[1]);
+            m.globals.insert(k, v);
+            Ok(true)
+        }
+        NbGetval => {
+            let k = get_atom(m, x(m, 0))?;
+            match m.globals.get(k) {
+                Some(v) => Ok(unify(m, m.x[1], v)),
+                None => Err(err(m, m.mk2(m.db.atom("existence_error"), Term.Atom(m.db.atom("variable")), x(m, 0)))),
+            }
+        }
+        Numbervars => {
+            var n = get_int(m, x(m, 1))?;
+            var vs: mem.Vec<Term> = mem.Vec.new();
+            var seen: HashMap<u64, bool> = HashMap.new();
+            machine.term_vars(m.x[0], &vs, &seen);
+            let f = m.db.functor(m.db.atom("$VAR"), 1);
+            for i in 0..vs.len {
+                let s = m.mk_struct(f, 1);
+                s.args[0] = term.mk_int(n);
+                n += 1;
+                unify(m, vs.ptr[i], Term.Str(s));
+            }
+            vs.free();
+            seen.free();
+            Ok(unify(m, m.x[2], term.mk_int(n)))
+        }
+        CharType => {
+            let a = x(m, 0);
+            let ty = x(m, 1);
+            let Atom(ca) = a else { return Err(inst_error(m)); };
+            let s = m.db.name(ca);
+            if s.len == 0 { return Ok(false); }
+            let c = s[0];
+            let tn = match ty { Atom(t) => m.db.name(t), Str(st) => m.db.name(m.db.fname(st.f)), _ => return Err(inst_error(m)) };
+            let r = match tn {
+                "alpha" => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_',
+                "alnum" => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'),
+                "digit" => {
+                    if let Str(st) = ty { return Ok(c >= '0' and c <= '9' and unify(m, st.args[0], term.mk_int((c - '0') as i64))); }
+                    c >= '0' and c <= '9'
+                }
+                "space" => c == ' ' or c == '\t' or c == '\n' or c == '\r',
+                "white" => c == ' ' or c == '\t',
+                "upper" => {
+                    if let Str(st) = ty {
+                        if !(c >= 'A' and c <= 'Z') { return Ok(false); }
+                        var b = text.StrBuf.new();
+                        b.push(c + 32);
+                        let r = unify(m, st.args[0], Term.Atom(m.db.atom(b.as_str())));
+                        b.free();
+                        return Ok(r);
+                    }
+                    c >= 'A' and c <= 'Z'
+                }
+                "lower" => {
+                    if let Str(st) = ty {
+                        if !(c >= 'a' and c <= 'z') { return Ok(false); }
+                        var b = text.StrBuf.new();
+                        b.push(c - 32);
+                        let r = unify(m, st.args[0], Term.Atom(m.db.atom(b.as_str())));
+                        b.free();
+                        return Ok(r);
+                    }
+                    c >= 'a' and c <= 'z'
+                }
+                "punct" => c > 32 and c < 127 and !((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')),
+                "csym" => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_',
+                "csymf" => (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_',
+                "end_of_line" => c == '\n' or c == '\r',
+                "graph" => c > 32 and c < 127,
+                _ => false,
+            };
+            Ok(r)
+        }
+        Atomics => {
+            // '$atomics'(List, Atom): concatenate atomic texts.
+            var items: mem.Vec<Term> = mem.Vec.new();
+            defer items.free();
+            list_items(m, m.x[0], &items)?;
+            var b = text.StrBuf.new();
+            for i in 0..items.len {
+                let it = deref(items.ptr[i]);
+                if !text_of(m, it, &b) { b.free(); return Err(inst_error(m)); }
+            }
+            let r = Term.Atom(m.db.atom(b.as_str()));
+            b.free();
+            Ok(unify(m, m.x[1], r))
+        }
+        COUNT => Ok(false),
+    }
+}
+
+fn atom_text(m: *Machine, chars: bool, number: bool) -> Result<bool, Term> {
+    let a = x(m, 0);
+    if let Ref(_) = a {
+        var b = text.StrBuf.new();
+        defer b.free();
+        text_from_list(m, m.x[1], &b)?;
+        if number {
+            match reader.parse_number(m, b.as_str()) {
+                Some(n) => return Ok(unify(m, a, n)),
+                None => return Err(err(m, m.mk1(m.db.atom("syntax_error"), Term.Atom(m.db.atom("illegal_number"))))),
+            }
+        }
+        let r = Term.Atom(m.db.atom(b.as_str()));
+        return Ok(unify(m, a, r));
+    }
+    var b = text.StrBuf.new();
+    if !text_of(m, a, &b) { b.free(); return Err(type_error(m, if number { "number" } else { "atom" }, a)); }
+    let l = str_list(m, b.as_str(), chars);
+    b.free();
+    Ok(unify(m, m.x[1], l))
+}

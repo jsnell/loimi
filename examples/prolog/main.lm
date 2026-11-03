@@ -1,0 +1,235 @@
+// A Prolog interpreter: `prolog FILE.pl [-g GOAL] [--gc-stress | --gc-verify]`.
+//
+// Consults FILE (running its directives), then runs the goals of its
+// `:- initialization(G)` directives, or `main` if it has none and defines
+// main/0, or GOAL.
+
+import std.io;
+import std.os;
+import std.mem;
+import std.text;
+import std.gc;
+import std.map.{HashMap};
+import term.{Term, deref};
+import term;
+import machine.{Machine};
+import machine;
+import compile;
+import builtins;
+import reader;
+import write;
+import vm.{Wam};
+import vm;
+import prelude;
+
+fn sys_block(m: *Machine, name: str, ar: u32, words: []u32) {
+    let f = m.db.functor(m.db.atom(name), ar);
+    let p = compile.pred_of(m, f);
+    var v: mem.Vec<u32> = mem.Vec.new();
+    for w in words { v.push(w); }
+    p.code = compile.finish(m, &v, 0);
+    p.system = true;
+    p.defined = true;
+    v.free();
+}
+
+fn setup(m: *Machine) {
+    m.db = term.Db.new();
+    m.heap = gc.Heap.new();
+    m.out = text.StrBuf.new();
+    m.bags = mem.Vec.new();
+    m.preds = mem.Vec.new();
+    m.consts = mem.Vec.new();
+    m.clauses = mem.Vec.new();
+    m.ops = HashMap.new();
+    m.bmap = HashMap.new();
+    m.globals = HashMap.new();
+    m.inits = mem.Vec.new();
+    m.flags_dq = term.A_CODES;
+    m.init();
+    reader.init_ops(m);
+    builtins.register(m);
+    let fv: [u32; 1] = [Wam.FAIL()];
+    m.fail_code = compile.finish(m, &mem.Vec { ptr: &fv[0], len: 1, cap: 1 }, 0);
+    let tv: [u32; 1] = [Wam.PROCEED()];
+    m.true_code = compile.finish(m, &mem.Vec { ptr: &tv[0], len: 1, cap: 1 }, 0);
+    let ht: [u32; 1] = [Wam.HALT_TRUE()];
+    m.halt_true = compile.finish(m, &mem.Vec { ptr: &ht[0], len: 1, cap: 1 }, 0);
+    let hf: [u32; 1] = [Wam.HALT_FALSE()];
+    m.halt_false = compile.finish(m, &mem.Vec { ptr: &hf[0], len: 1, cap: 1 }, 0);
+    // Builtins are predicates too, for call/N.
+    var i: u64 = 0;
+    var bs: mem.Vec<(u32, u32)> = mem.Vec.new();
+    while let Some(sl) = m.bmap.next(&i) { bs.push((sl.key, sl.value)); }
+    for j in 0..bs.len {
+        let (f, id) = bs.ptr[j];
+        let p = compile.pred_of(m, f);
+        var v: mem.Vec<u32> = mem.Vec.new();
+        v.push(Wam.CALLB(id));
+        v.push(Wam.PROCEED());
+        p.code = compile.finish(m, &v, 0);
+        p.system = true;
+        p.defined = true;
+        v.free();
+    }
+    bs.free();
+    for n in 1..9 {
+        let w: [u32; 1] = [Wam.METACALL((n - 1) as u32)];
+        sys_block(m, "call", n as u32, w[..]);
+    }
+    let h: [u32; 1] = [Wam.HALT()];
+    sys_block(m, "halt", 0, h[..]);
+    let fl: [u32; 1] = [Wam.FAIL()];
+    sys_block(m, "fail", 0, fl[..]);
+    sys_block(m, "false", 0, fl[..]);
+    let tr: [u32; 1] = [Wam.PROCEED()];
+    sys_block(m, "true", 0, tr[..]);
+    sys_block(m, "otherwise", 0, tr[..]);
+    sys_block(m, "!", 0, tr[..]);
+}
+
+/// Reset the stacks between top-level goals.
+fn reset(m: *Machine) {
+    m.e = m.ebase as *machine.Frame;
+    m.b = m.cbase;
+    m.b0 = m.cbase;
+    m.tr = 0;
+    m.ball = Term.Unb;
+    m.bags.clear();
+}
+
+fn print_ball(m: *Machine, what: str, ball: Term) {
+    m.flush();
+    var b = text.StrBuf.new();
+    b.push_str("Warning: ");
+    b.push_str(what);
+    b.push_str(": uncaught exception: ");
+    write.write_term(m, &b, ball, write.quoted());
+    io.eprintln(b.as_str());
+    b.free();
+}
+
+/// Run `goal` once. Returns the vm's exit code.
+fn run_goal(m: *Machine, goal: Term, what: str) -> i32 uses gc {
+    let top = Term.Atom(m.db.atom("$top"));
+    let Some(cl) = compile.compile_clause(m, top, goal, None) else { return vm.EXIT_FALSE; };
+    reset(m);
+    m.cp = m.halt_true;
+    m.cbase.alt = m.halt_false;
+    let r = Wam.run(m, cl.code);
+    if r == vm.EXIT_THROW {
+        print_ball(m, what, m.ball);
+    } else if r == vm.EXIT_FALSE {
+        m.flush();
+        io.eprint("Warning: ");
+        io.eprint(what);
+        io.eprintln(": goal failed");
+    }
+    reset(m);
+    r
+}
+
+fn consult(m: *Machine, src: str, library: bool) -> bool uses gc {
+    m.loading_library = library;
+    var r = reader.Reader.new(m, src);
+    defer r.free();
+    let neck1 = m.db.functor(term.A_NECK, 1);
+    let dcg = m.db.functor(term.A_DCG, 2);
+    let init1 = m.db.functor(m.db.atom("initialization"), 1);
+    let init2 = m.db.functor(m.db.atom("initialization"), 2);
+    let addc = m.db.atom("$add_clause");
+    loop {
+        let Some(t0) = r.read() else { break; };
+        if let Some(msg) = r.error {
+            m.flush();
+            io.eprint("Syntax error: line ");
+            io.eprint_int(r.err_line as i64);
+            io.eprint(": ");
+            io.eprintln(msg);
+            continue;
+        }
+        let t = deref(t0);
+        if let Str(s) = t and s.f == neck1 {
+            let d = deref(s.args[0]);
+            if let Str(ds) = d and (ds.f == init1 or ds.f == init2) {
+                m.inits.push(ds.args[0]);
+                continue;
+            }
+            if run_goal(m, d, "directive") == vm.EXIT_HALT { return false; }
+            if m.halted { return false; }
+            continue;
+        }
+        if let Str(s) = t and s.f == dcg {
+            let c = m.new_var();
+            let g = m.mk2(term.A_COMMA, m.mk2(m.db.atom("$dcg_translate"), t, c), m.mk1(addc, c));
+            run_goal(m, g, "DCG rule");
+            continue;
+        }
+        add(m, t, library);
+    }
+    true
+}
+
+fn add(m: *Machine, t: Term, library: bool) {
+    match builtins.consult_clause(m, t, library) {
+        Ok(_) => {}
+        Err(ball) => print_ball(m, "clause", ball),
+    }
+}
+
+fn main() -> i32 uses gc {
+    var file: ?str = None;
+    var goal: ?str = None;
+    var stress = false;
+    var verify = false;
+    var i: u64 = 1;
+    while i < os.arg_count() {
+        let a = os.arg(i).unwrap();
+        if a.eq("--gc-stress") { stress = true; }
+        else if a.eq("--gc-verify") { verify = true; }
+        else if a.eq("-g") { i += 1; goal = os.arg(i); }
+        else { file = Some(a); }
+        i += 1;
+    }
+    let Some(path) = file else {
+        io.eprintln("usage: prolog FILE.pl [-g GOAL] [--gc-stress | --gc-verify]");
+        return 2;
+    };
+    let Some(src) = io.read_file(path) else {
+        io.eprint("cannot read ");
+        io.eprintln(path);
+        return 2;
+    };
+    let m = mem.alloc<Machine>(1);
+    setup(m);
+    m.heap.add_scanner(m as *u8, machine.scan_roots);
+    consult(m, prelude.SOURCE, true);
+    if stress { m.heap.set_stress(true); }
+    if verify { m.heap.set_generational(true); m.heap.set_stress(true); m.heap.set_verify(true); }
+    // The initialization goals live in a Prolog list across collections.
+    var code: i32 = 0;
+    if consult(m, src, false) {
+        if let Some(g) = goal {
+            var gb = text.StrBuf.new();
+            gb.push_str(g);
+            gb.push_str(" .");
+            var r = reader.Reader.new(m, gb.as_str());
+            let gt = r.read();
+            r.free();
+            gb.free();
+            if let Some(gg) = gt { m.inits.push(gg); }
+        } else if m.inits.len == 0 {
+            let mf = m.db.functor(m.db.atom("main"), 0);
+            if (mf as u64) < m.preds.len and compile.pred_of(m, mf).defined { m.inits.push(Term.Atom(m.db.atom("main"))); }
+        }
+        for j in 0..m.inits.len {
+            let g = m.inits.ptr[j];
+            let r = run_goal(m, g, "initialization goal");
+            if r == vm.EXIT_HALT or m.halted { break; }
+            if r != vm.EXIT_TRUE { code = 1; }
+        }
+    }
+    if m.halted { code = m.halt_code; }
+    m.flush();
+    code
+}

@@ -1,0 +1,908 @@
+// Clause compiler: Prolog clauses to WAM code, and predicate entry code
+// (first-argument indexing and try/retry/trust chains).
+//
+// Control constructs in bodies (`;`, `->`, `\+`) become auxiliary
+// predicates; a cut inside their branches cuts the parent clause through a
+// level variable passed to the auxiliary predicate.
+
+import std.mem;
+import std.text;
+import std.io;
+import std.hash;
+import std.map.{HashMap};
+import term.{Term, Var, Struct, Cons, deref};
+import term;
+import machine.{Machine};
+import machine;
+import vm.{Wam, VCtx};
+import builtins;
+
+pub struct Clause {
+    code: *u32,
+    len: u64,
+    key: u64,
+    term: Term,
+    erased: bool,
+    pred: *Pred,
+    id: u64,
+}
+
+pub struct Pred {
+    f: u32,
+    arity: u32,
+    clauses: mem.Vec<*Clause>,
+    code: *u32,
+    var_code: *u32,
+    lst_code: *u32,
+    def_code: *u32,
+    keys: *u64,
+    vals: *u64,
+    mask: u64,
+    dynamic: bool,
+    defined: bool,
+    system: bool,
+    library: bool,
+    stub: *u32,
+}
+
+/// Key of a first argument: its bits for an atomic term, a tagged functor
+/// id for a compound. 0 marks a variable (no key); `KEY_LIST` a list cell.
+const KEY_LIST: u64 = 1;
+const KEY_EMPTY: u64 = 2;
+
+pub fn key_of(t: Term) -> u64 {
+    match t {
+        Ref(_) => 0,
+        Lst(_) => KEY_LIST,
+        Str(s) => (Term.Atom(s.f) as u64) | (1 << 40),
+        _ => t as u64,
+    }
+}
+
+pub fn Pred.lookup(p: *Pred, k: u64) -> *u32 {
+    if p.mask == 0 { return p.def_code; }
+    var i = hash.mix(k) & p.mask;
+    loop {
+        let kk = p.keys[i];
+        if kk == k { return p.vals[i] as *u32; }
+        if kk == KEY_EMPTY { return p.def_code; }
+        i = (i + 1) & p.mask;
+    }
+}
+
+// ---- code blocks ------------------------------------------------------
+
+/// Copy `words` to permanent memory and verify them. Code is never freed:
+/// a running choicepoint may still point into a clause that was retracted
+/// or a chain that was rebuilt.
+pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
+    let n = words.len;
+    let p = mem.alloc<u32>(n + 1);
+    for i in 0..n { p[i] = words.ptr[i]; }
+    var vc = VCtx { nperm: nperm, nconsts: m.consts.len, npreds: m.db.functors.len, natoms: m.db.atoms.names.len };
+    match Wam.verify(p.slice(n), &vc) {
+        Ok(_) => {}
+        Err(e) => {
+            var b = text.StrBuf.new();
+            b.push_str("internal error: code failed verification: ");
+            e.write(&b);
+            b.push_str("\n");
+            Wam.disasm(p.slice(n), &b);
+            io.eprintln(b.as_str());
+            b.free();
+        }
+    }
+    p
+}
+
+fn block1(m: *Machine, w: u32) -> *u32 {
+    var v: mem.Vec<u32> = mem.Vec.new();
+    v.push(w);
+    let p = finish(m, &v, 0);
+    v.free();
+    p
+}
+
+fn push_target(v: *mem.Vec<u32>, w: u32, code: *u32) {
+    v.push(w);
+    let a = code as u64;
+    v.push((a & 0xFFFFFFFF) as u32);
+    v.push((a >> 32) as u32);
+}
+
+/// Code that tries `cs` in order.
+fn chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> *u32 {
+    if cs.len == 0 { return m.fail_code; }
+    if cs.len == 1 { return cs.ptr[0].code; }
+    var v: mem.Vec<u32> = mem.Vec.new();
+    for i in 0..cs.len {
+        let w = if i == 0 { Wam.TRY(p.arity) } else if i + 1 == cs.len { Wam.TRUST() } else { Wam.RETRY() };
+        push_target(&v, w, cs.ptr[i].code);
+    }
+    let r = finish(m, &v, 0);
+    v.free();
+    r
+}
+
+pub fn new_pred(m: *Machine, f: u32) -> *Pred {
+    let p = mem.alloc<Pred>(1);
+    p.f = f;
+    p.arity = m.db.farity(f);
+    p.clauses = mem.Vec.new();
+    p.mask = 0;
+    p.dynamic = false;
+    p.defined = false;
+    p.system = false;
+    p.library = false;
+    p.stub = block1(m, Wam.REINDEX(f));
+    p.code = block1(m, Wam.UNDEF(f));
+    p.var_code = p.code;
+    p.lst_code = p.code;
+    p.def_code = p.code;
+    p
+}
+
+/// The predicate of functor `f`, created on first use.
+pub fn pred_of(m: *Machine, f: u32) -> *Pred {
+    while m.preds.len <= f as u64 {
+        let id = m.preds.len as u32;
+        // Make sure the functor exists before its predicate.
+        m.preds.push(new_pred(m, id));
+    }
+    m.preds.ptr[f as u64]
+}
+
+pub fn ensure_preds(m: *Machine) {
+    while m.preds.len < m.db.functors.len {
+        let id = m.preds.len as u32;
+        m.preds.push(new_pred(m, id));
+    }
+}
+
+pub fn mark_dirty(p: *Pred) {
+    p.code = p.stub;
+}
+
+/// Rebuild a predicate's entry code from its live clauses.
+pub fn reindex(m: *Machine, p: *Pred) {
+    var live: mem.Vec<*Clause> = mem.Vec.new();
+    for i in 0..p.clauses.len {
+        let c = p.clauses.ptr[i];
+        if !c.erased { live.push(c); }
+    }
+    // Drop erased clauses from the list (their code stays).
+    p.clauses.clear();
+    for i in 0..live.len { p.clauses.push(live.ptr[i]); }
+    p.mask = 0;
+    if live.len == 0 {
+        p.code = if p.dynamic or p.defined { m.fail_code } else { block1(m, Wam.UNDEF(p.f)) };
+        live.free();
+        return;
+    }
+    var any_key = false;
+    if p.arity > 0 {
+        for i in 0..live.len { if live.ptr[i].key != 0 { any_key = true; } }
+    }
+    let all = chain(m, p, &live);
+    if !any_key or live.len == 1 {
+        p.code = all;
+        live.free();
+        return;
+    }
+    p.var_code = all;
+    var sub: mem.Vec<*Clause> = mem.Vec.new();
+    for i in 0..live.len {
+        let k = live.ptr[i].key;
+        if k == 0 or k == KEY_LIST { sub.push(live.ptr[i]); }
+    }
+    p.lst_code = chain(m, p, &sub);
+    sub.clear();
+    for i in 0..live.len { if live.ptr[i].key == 0 { sub.push(live.ptr[i]); } }
+    p.def_code = chain(m, p, &sub);
+    // Distinct constant and functor keys.
+    var keys: mem.Vec<u64> = mem.Vec.new();
+    for i in 0..live.len {
+        let k = live.ptr[i].key;
+        if k == 0 or k == KEY_LIST { continue; }
+        var dup = false;
+        for j in 0..keys.len { if keys.ptr[j] == k { dup = true; } }
+        if !dup { keys.push(k); }
+    }
+    if keys.len > 0 {
+        var size: u64 = 4;
+        while size < keys.len * 2 { size *= 2; }
+        p.keys = mem.alloc<u64>(size);
+        p.vals = mem.alloc<u64>(size);
+        for i in 0..size { p.keys[i] = KEY_EMPTY; }
+        p.mask = size - 1;
+        for j in 0..keys.len {
+            let k = keys.ptr[j];
+            sub.clear();
+            for i in 0..live.len {
+                let ck = live.ptr[i].key;
+                if ck == 0 or ck == k { sub.push(live.ptr[i]); }
+            }
+            let code = chain(m, p, &sub);
+            var at = hash.mix(k) & p.mask;
+            while p.keys[at] != KEY_EMPTY { at = (at + 1) & p.mask; }
+            p.keys[at] = k;
+            p.vals[at] = code as u64;
+        }
+    }
+    keys.free();
+    sub.free();
+    live.free();
+    p.code = block1(m, Wam.INDEX(p.f));
+}
+
+// ---- the clause compiler ------------------------------------------------
+
+struct VarInfo {
+    occ: u32,
+    chunks: u64,      // bitmask of chunks it occurs in (chunk >= 63 folds into bit 63)
+    perm: bool,
+    reg: u32,
+    seen: bool,
+    level: bool,
+}
+
+struct C {
+    m: *Machine,
+    code: mem.Vec<u32>,
+    vars: HashMap<u64, VarInfo>,
+    nperm: u32,
+    next_temp: u32,
+    free_temps: mem.Vec<u32>,
+    calls_emitted: u32,
+    has_env: bool,
+    level_var: Term,
+    level_used: bool,
+    kept: HashMap<u64, bool>,
+    error: ?str,
+}
+
+fn var_key(t: Term) -> u64 {
+    match t { Ref(v) => v as u64, _ => 0 }
+}
+
+fn C.info(c: *C, t: Term) -> *VarInfo {
+    c.vars.get_ptr(var_key(t)).unwrap()
+}
+
+fn chunk_bit(k: u32) -> u64 { if k >= 63 { 1 << 63 } else { 1 << (k as u64) } }
+
+fn C.count(c: *C, t0: Term, chunk: u32) {
+    let t = deref(t0);
+    match t {
+        Ref(_) => {
+            let k = var_key(t);
+            if let Some(vi) = c.vars.get_ptr(k) {
+                vi.occ += 1;
+                vi.chunks = vi.chunks | chunk_bit(chunk);
+            } else {
+                c.vars.insert(k, VarInfo { occ: 1, chunks: chunk_bit(chunk), perm: false, reg: 0, seen: false, level: false });
+            }
+        }
+        Str(s) => { for i in 0..s.args.len { c.count(s.args[i], chunk); } }
+        Lst(l) => {
+            var cur = t;
+            while let Lst(x) = cur {
+                c.count(x.head, chunk);
+                cur = deref(x.tail);
+            }
+            c.count(cur, chunk);
+        }
+        _ => {}
+    }
+}
+
+fn occurs(t0: Term, v: Term) -> bool {
+    let t = deref(t0);
+    if t == v { return true; }
+    match t {
+        Str(s) => { for i in 0..s.args.len { if occurs(s.args[i], v) { return true; } } false }
+        Lst(l) => occurs(l.head, v) or occurs(l.tail, v),
+        _ => false,
+    }
+}
+
+fn C.temp(c: *C) -> u32 {
+    if let Some(r) = c.free_temps.pop() { return r; }
+    let r = c.next_temp;
+    c.next_temp += 1;
+    if c.next_temp >= 255 { c.error = Some("clause needs too many registers"); c.next_temp = 200; }
+    r
+}
+
+fn C.release(c: *C, r: u32) { c.free_temps.push(r); }
+
+fn C.emit(c: *C, w: u32) { c.code.push(w); }
+
+fn small16(i: i64) -> bool { i >= -32768 and i <= 32767 }
+fn small24(i: i64) -> bool { i >= -8388608 and i <= 8388607 }
+
+fn C.konst(c: *C, t: Term) -> u16 {
+    let m = c.m;
+    for i in 0..m.consts.len {
+        if m.consts.ptr[i] == t { return i as u16; }
+    }
+    if m.consts.len >= 65535 { c.error = Some("too many constants"); return 0; }
+    m.consts.push(t);
+    (m.consts.len - 1) as u16
+}
+
+// Head ------------------------------------------------------------------
+
+fn C.get_arg(c: *C, t0: Term, a: u8) {
+    let t = deref(t0);
+    match t {
+        Ref(_) => {
+            let vi = c.info(t);
+            if vi.occ == 1 and !vi.level { return; }
+            if !vi.seen {
+                vi.seen = true;
+                if vi.perm { c.emit(Wam.GET_VAR_Y(vi.reg as u8, a)); }
+                else if vi.reg != a as u32 { c.emit(Wam.GET_VAR_X(vi.reg as u8, a)); }
+            } else if vi.perm {
+                c.emit(Wam.GET_VAL_Y(vi.reg as u8, a));
+            } else {
+                c.emit(Wam.GET_VAL_X(vi.reg as u8, a));
+            }
+        }
+        Atom(x) => {
+            if x < 65536 { c.emit(Wam.GET_ATOM(a, x as u16)); }
+            else { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
+        }
+        Int(i) => {
+            if small16(i as i64) { c.emit(Wam.GET_INT(a, i as i16)); }
+            else { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
+        }
+        Flt(_) => { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
+        Str(s) => {
+            if s.f >= 65536 { c.error = Some("too many functors"); return; }
+            c.emit(Wam.GET_STRUCT(a, s.f as u16));
+            c.unify_args(t);
+        }
+        Lst(_) => {
+            c.emit(Wam.GET_LIST(a));
+            c.unify_args(t);
+        }
+        _ => {}
+    }
+}
+
+/// The unify instructions for the arguments of compound `t`; nested
+/// compounds go to temporaries and are matched after it.
+fn C.unify_args(c: *C, t: Term) {
+    let n = match t { Str(s) => s.args.len, _ => 2 };
+    var pending: mem.Vec<(u32, Term)> = mem.Vec.new();
+    var voids: u64 = 0;
+    for i in 0..n {
+        let a = deref(term.arg_of(t, i));
+        if let Ref(_) = a {
+            let vi = c.info(a);
+            if vi.occ == 1 and !vi.level { voids += 1; continue; }
+        }
+        if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); voids = 0; }
+        match a {
+            Ref(_) => {
+                let vi = c.info(a);
+                if !vi.seen {
+                    vi.seen = true;
+                    if vi.perm { c.emit(Wam.UNIFY_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.UNIFY_VAR_X(vi.reg as u8)); }
+                } else if vi.perm {
+                    c.emit(Wam.UNIFY_VAL_Y(vi.reg as u8));
+                } else {
+                    c.emit(Wam.UNIFY_VAL_X(vi.reg as u8));
+                }
+            }
+            Atom(x) => c.emit(Wam.UNIFY_ATOM(x)),
+            Int(v) => {
+                if small24(v as i64) { c.emit(Wam.UNIFY_INT(v as i32)); }
+                else { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+            }
+            Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+            _ => {
+                let r = c.temp();
+                c.emit(Wam.UNIFY_VAR_X(r as u8));
+                pending.push((r, a));
+            }
+        }
+    }
+    if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); }
+    for i in 0..pending.len {
+        let (r, a) = pending.ptr[i];
+        c.release(r);
+        match a {
+            Str(s) => {
+                if s.f >= 65536 { c.error = Some("too many functors"); return; }
+                c.emit(Wam.GET_STRUCT(r as u8, s.f as u16));
+            }
+            _ => c.emit(Wam.GET_LIST(r as u8)),
+        }
+        c.unify_args(a);
+    }
+    pending.free();
+}
+
+// Body ------------------------------------------------------------------
+
+fn C.put_arg(c: *C, t0: Term, a: u8) {
+    let t = deref(t0);
+    match t {
+        Ref(_) => {
+            let vi = c.info(t);
+            if vi.occ == 1 and !vi.level { c.emit(Wam.PUT_VAR_X(a, a)); return; }
+            if !vi.seen {
+                vi.seen = true;
+                if vi.perm { c.emit(Wam.PUT_VAR_Y(vi.reg as u8, a)); } else { c.emit(Wam.PUT_VAR_X(vi.reg as u8, a)); }
+            } else if vi.perm {
+                c.emit(Wam.PUT_VAL_Y(vi.reg as u8, a));
+            } else if vi.reg != a as u32 {
+                c.emit(Wam.PUT_VAL_X(vi.reg as u8, a));
+            }
+        }
+        Atom(x) => {
+            if x < 65536 { c.emit(Wam.PUT_ATOM(a, x as u16)); }
+            else { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
+        }
+        Int(i) => {
+            if small16(i as i64) { c.emit(Wam.PUT_INT(a, i as i16)); }
+            else { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
+        }
+        Flt(_) => { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
+        _ => c.build(t, a),
+    }
+}
+
+/// Build compound `t` into register `target`, inner compounds first.
+fn C.build(c: *C, t: Term, target: u8) {
+    let n = match t { Str(s) => s.args.len, _ => 2 };
+    var tmps: mem.Vec<u32> = mem.Vec.new();
+    for i in 0..n {
+        let a = deref(term.arg_of(t, i));
+        match a {
+            Str(_) => { let r = c.temp(); c.build(a, r as u8); tmps.push(r); }
+            Lst(_) => { let r = c.temp(); c.build(a, r as u8); tmps.push(r); }
+            _ => tmps.push(0),
+        }
+    }
+    match t {
+        Str(s) => {
+            if s.f >= 65536 { c.error = Some("too many functors"); return; }
+            c.emit(Wam.PUT_STRUCT(target, s.f as u16));
+        }
+        _ => c.emit(Wam.PUT_LIST(target)),
+    }
+    var voids: u64 = 0;
+    for i in 0..n {
+        let a = deref(term.arg_of(t, i));
+        if let Ref(_) = a {
+            let vi = c.info(a);
+            if vi.occ == 1 and !vi.level { voids += 1; continue; }
+        }
+        if voids > 0 { c.emit(Wam.SET_VOID(voids as u32)); voids = 0; }
+        match a {
+            Ref(_) => {
+                let vi = c.info(a);
+                if !vi.seen {
+                    vi.seen = true;
+                    if vi.perm { c.emit(Wam.SET_VAR_Y(vi.reg as u8)); } else { c.emit(Wam.SET_VAR_X(vi.reg as u8)); }
+                } else if vi.perm {
+                    c.emit(Wam.SET_VAL_Y(vi.reg as u8));
+                } else {
+                    c.emit(Wam.SET_VAL_X(vi.reg as u8));
+                }
+            }
+            Atom(x) => c.emit(Wam.SET_ATOM(x)),
+            Int(v) => {
+                if small24(v as i64) { c.emit(Wam.SET_INT(v as i32)); }
+                else { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
+            }
+            Flt(_) => { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
+            _ => {
+                let r = tmps.ptr[i];
+                c.emit(Wam.SET_VAL_X(r as u8));
+                c.release(r);
+            }
+        }
+    }
+    if voids > 0 { c.emit(Wam.SET_VOID(voids as u32)); }
+    tmps.free();
+}
+
+// Goals -----------------------------------------------------------------
+
+/// A body goal after flattening: a call (of a predicate or a builtin), or
+/// a cut of this clause.
+enum GoalKind { Call, Builtin, Cut }
+
+struct Goal { kind: GoalKind, t: Term, f: u32, id: u32 }
+
+fn is_control(m: *Machine, t: Term) -> bool {
+    match t {
+        Str(s) => {
+            let name = m.db.fname(s.f);
+            let ar = s.args.len;
+            (ar == 2 and (name == term.A_COMMA or name == term.A_SEMI or name == term.A_ARROW or name == term.A_SOFT))
+                or (ar == 1 and name == term.A_NOT)
+        }
+        Atom(a) => a == term.A_CUT,
+        _ => false,
+    }
+}
+
+/// Does `t` contain a cut that is transparent (not inside call/1, \+ or the
+/// condition of an if-then-else)?
+fn has_cut(m: *Machine, t0: Term) -> bool {
+    let t = deref(t0);
+    match t {
+        Atom(a) => a == term.A_CUT,
+        Str(s) => {
+            let name = m.db.fname(s.f);
+            if s.args.len == 2 and (name == term.A_COMMA or name == term.A_SEMI) {
+                return has_cut(m, s.args[0]) or has_cut(m, s.args[1]);
+            }
+            if s.args.len == 2 and (name == term.A_ARROW or name == term.A_SOFT) {
+                return has_cut(m, s.args[1]);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn C.flatten(c: *C, t0: Term, cv: ?Term, out: *mem.Vec<Goal>) {
+    let m = c.m;
+    let t = deref(t0);
+    match t {
+        Ref(_) => {
+            out.push(Goal { kind: GoalKind.Call, t: m.mk1(term.A_CALL, t), f: m.db.functor(term.A_CALL, 1), id: 0 });
+            return;
+        }
+        Atom(a) => {
+            if a == term.A_TRUE { return; }
+            if a == term.A_CUT {
+                if let Some(v) = cv {
+                    let g = m.mk1(m.db.atom("$cut"), v);
+                    c.goal(g, out);
+                } else {
+                    out.push(Goal { kind: GoalKind.Cut, t: t, f: 0, id: 0 });
+                }
+                return;
+            }
+        }
+        Str(s) => {
+            let name = m.db.fname(s.f);
+            if s.args.len == 2 and name == term.A_COMMA {
+                c.flatten(s.args[0], cv, out);
+                c.flatten(s.args[1], cv, out);
+                return;
+            }
+            if is_control(m, t) {
+                c.aux(t, cv, out);
+                return;
+            }
+        }
+        Int(_) => {}
+        Flt(_) => {}
+        _ => {}
+    }
+    match t {
+        Int(_) => { out.push(Goal { kind: GoalKind.Call, t: m.mk1(term.A_CALL, t), f: m.db.functor(term.A_CALL, 1), id: 0 }); }
+        Flt(_) => { out.push(Goal { kind: GoalKind.Call, t: m.mk1(term.A_CALL, t), f: m.db.functor(term.A_CALL, 1), id: 0 }); }
+        _ => c.goal(t, out),
+    }
+}
+
+fn C.goal(c: *C, t: Term, out: *mem.Vec<Goal>) {
+    let m = c.m;
+    let (name, ar) = term.name_arity(&m.db, t);
+    let f = m.db.functor(name, ar);
+    if let Some(id) = m.bmap.get(f) {
+        out.push(Goal { kind: GoalKind.Builtin, t: t, f: f, id: id });
+    } else {
+        out.push(Goal { kind: GoalKind.Call, t: t, f: f, id: 0 });
+    }
+}
+
+/// Replace a control construct by a call of a new auxiliary predicate.
+fn C.aux(c: *C, t: Term, cv: ?Term, out: *mem.Vec<Goal>) {
+    let m = c.m;
+    // The cut level the branches cut to: this clause's (a level variable
+    // set at its entry) or the one it was given.
+    var cut: ?Term = cv;
+    if has_cut(m, t) and cut.is_none() {
+        c.level_used = true;
+        cut = Some(c.level_var);
+    }
+    var vars: mem.Vec<Term> = mem.Vec.new();
+    var seen: HashMap<u64, bool> = HashMap.new();
+    machine.term_vars(t, &vars, &seen);
+    if let Some(v) = cut {
+        if !seen.contains(var_key(v)) { vars.push(v); }
+    }
+    seen.free();
+    m.gensym += 1;
+    var nb = text.StrBuf.new();
+    nb.push_str("$aux");
+    nb.push_int(m.gensym as i64);
+    let name = m.db.atom(nb.as_str());
+    nb.free();
+    let f = m.db.functor(name, vars.len as u32);
+    let head = if vars.len == 0 { Term.Atom(name) } else {
+        let s = m.mk_struct(f, vars.len);
+        for i in 0..vars.len { s.args[i] = vars.ptr[i]; }
+        Term.Str(s)
+    };
+    let p = pred_of(m, f);
+    p.defined = true;
+    let s = match t { Str(s) => s, _ => { vars.free(); return; } };
+    let cname = m.db.fname(s.f);
+    let lcut = Term.Atom(m.db.atom("$localcut"));
+    if cname == term.A_NOT {
+        // \+ G:  aux :- G, !, fail.  aux.
+        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), m.mk2(term.A_COMMA, lcut, Term.Atom(term.A_FAIL)));
+        add_compiled(m, p, head, b1, None);
+        add_compiled(m, p, head, Term.Atom(term.A_TRUE), None);
+    } else if cname == term.A_ARROW {
+        // (C -> T):  aux :- C, !, T.
+        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), m.mk2(term.A_COMMA, lcut, s.args[1]));
+        add_compiled(m, p, head, b1, cut);
+    } else if cname == term.A_SOFT {
+        // (C *-> T) alone is (C, T).
+        let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, s.args[0]), s.args[1]);
+        add_compiled(m, p, head, b1, cut);
+    } else {
+        // A ; B, with (C -> T ; E) and (C *-> T ; E).
+        let l = deref(s.args[0]);
+        var done = false;
+        if let Str(ls) = l and ls.args.len == 2 {
+            let lname = m.db.fname(ls.f);
+            if lname == term.A_ARROW {
+                let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
+                add_compiled(m, p, head, b1, cut);
+                add_compiled(m, p, head, s.args[1], cut);
+                done = true;
+            } else if lname == term.A_SOFT {
+                // aux :- '$softmark'(L), C, '$softcut'(L), T.   aux :- '$softfail'(L)?
+                // Approximation: soft-cut as if-then-else when C succeeds
+                // at most once.
+                let b1 = m.mk2(term.A_COMMA, m.mk1(term.A_CALL, ls.args[0]), m.mk2(term.A_COMMA, lcut, ls.args[1]));
+                add_compiled(m, p, head, b1, cut);
+                add_compiled(m, p, head, s.args[1], cut);
+                done = true;
+            }
+        }
+        if !done {
+            add_compiled(m, p, head, s.args[0], cut);
+            add_compiled(m, p, head, s.args[1], cut);
+        }
+    }
+    reindex(m, p);
+    out.push(Goal { kind: GoalKind.Call, t: head, f: f, id: 0 });
+    vars.free();
+}
+
+fn add_compiled(m: *Machine, p: *Pred, head: Term, body: Term, cv: ?Term) {
+    if let Some(cl) = compile_clause(m, head, body, cv) {
+        cl.pred = p;
+        p.clauses.push(cl);
+    }
+}
+
+/// Compile one clause. `cv` is the level variable that cuts in the body cut
+/// to (for the clauses of auxiliary predicates), or None for a cut of this
+/// clause.
+pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clause {
+    let head = deref(head0);
+    var c = C {
+        m: m, code: mem.Vec.new(), vars: HashMap.new(), nperm: 0, next_temp: 0,
+        free_temps: mem.Vec.new(), calls_emitted: 0, has_env: false,
+        level_var: m.new_var(), level_used: false, kept: HashMap.new(), error: None,
+    };
+    var goals: mem.Vec<Goal> = mem.Vec.new();
+    c.flatten(body, cv, &goals);
+    let lcut_atom = m.db.atom("$localcut");
+    for i in 0..goals.len {
+        let g = goals.ptr_at(i);
+        if g.kind == GoalKind.Builtin and g.t == Term.Atom(lcut_atom) { g.kind = GoalKind.Cut; }
+    }
+    // Chunks: a call of a predicate ends one.
+    let arity = match head { Str(s) => s.args.len, _ => 0 };
+    for i in 0..arity { c.count(term.arg_of(head, i), 0); }
+    var chunk: u32 = 0;
+    var ncalls: u32 = 0;
+    var max_arity = arity;
+    var cut_after_call = false;
+    for i in 0..goals.len {
+        let g = goals.ptr[i];
+        match g.kind {
+            Cut => { if ncalls > 0 { cut_after_call = true; } }
+            _ => {
+                let (_, ga) = term.name_arity(&m.db, g.t);
+                if ga as u64 > max_arity { max_arity = ga as u64; }
+                for j in 0..ga as u64 { c.count(term.arg_of(g.t, j), chunk); }
+                if g.kind == GoalKind.Call { chunk += 1; ncalls += 1; }
+            }
+        }
+    }
+    if cut_after_call { c.level_used = true; }
+    if c.level_used {
+        let lk = var_key(c.level_var);
+        if let Some(vi) = c.vars.get_ptr(lk) {
+            vi.level = true;
+            vi.seen = true;
+            vi.chunks = vi.chunks | 3;
+        } else {
+            c.vars.insert(lk, VarInfo { occ: 1, chunks: 3, perm: true, reg: 0, seen: true, level: true });
+        }
+    }
+    // Is an environment needed: a call that is not the last goal.
+    var last_call: i64 = -1;
+    for i in 0..goals.len { if goals.ptr[i].kind == GoalKind.Call { last_call = i as i64; } }
+    var env = false;
+    if ncalls > 1 { env = true; }
+    if ncalls == 1 and (last_call as u64) + 1 < goals.len { env = true; }
+    // Head variables may stay in the argument register they arrive in if
+    // chunk 0 has at most one goal (cuts aside) and that goal leaves the
+    // register alone (has the variable at the same position, or fewer
+    // arguments).
+    var chunk0: mem.Vec<u64> = mem.Vec.new();
+    for i in 0..goals.len {
+        let g = goals.ptr[i];
+        if g.kind == GoalKind.Cut { continue; }
+        chunk0.push(i);
+        if g.kind == GoalKind.Call { break; }
+    }
+    c.next_temp = max_arity as u32;
+    var at: u64 = 0;
+    while let Some(slot) = c.vars.next(&at) {
+        let vi = &slot.value;
+        let multi = (vi.chunks & (vi.chunks - 1)) != 0;
+        if multi or vi.level {
+            vi.perm = true;
+            vi.reg = c.nperm;
+            c.nperm += 1;
+            env = true;
+        }
+    }
+    if chunk0.len <= 1 {
+        for i in 0..arity {
+            let a = deref(term.arg_of(head, i));
+            if let Ref(_) = a {
+                let vi = c.info(a);
+                if vi.perm or vi.occ == 1 or c.kept.contains(var_key(a)) { continue; }
+                var keep = true;
+                for j in 0..i { if occurs(term.arg_of(head, j), a) { keep = false; } }
+                if chunk0.len == 1 {
+                    let g = goals.ptr[chunk0.ptr[0]];
+                    let (_, ga) = term.name_arity(&m.db, g.t);
+                    if (i as u32) < ga and deref(term.arg_of(g.t, i)) != a { keep = false; }
+                }
+                if keep { vi.reg = i as u32; c.kept.insert(var_key(a), true); }
+            }
+        }
+    }
+    chunk0.free();
+    // Every other temporary gets its own register.
+    at = 0;
+    while let Some(slot) = c.vars.next(&at) {
+        let vi = &slot.value;
+        if !vi.perm and !c.kept.contains(slot.key) {
+            vi.reg = c.next_temp;
+            c.next_temp += 1;
+        }
+    }
+    if c.next_temp >= 255 { c.error = Some("clause needs too many registers"); }
+    c.has_env = env;
+    if env {
+        c.emit(Wam.ALLOCATE(c.nperm));
+        if c.level_used {
+            let vi = c.info(c.level_var);
+            c.emit(Wam.GET_LEVEL(vi.reg as u8));
+        }
+    }
+    for i in 0..arity { c.get_arg(term.arg_of(head, i), i as u8); }
+    var called = false;
+    for i in 0..goals.len {
+        let g = goals.ptr[i];
+        let last = i + 1 == goals.len;
+        match g.kind {
+            Cut => {
+                if !called { c.emit(Wam.NECK_CUT()); }
+                else { let vi = c.info(c.level_var); c.emit(Wam.CUT_Y(vi.reg as u8)); }
+                if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
+            }
+            Builtin => {
+                let (_, ga) = term.name_arity(&m.db, g.t);
+                for j in 0..ga as u64 { c.put_arg(term.arg_of(g.t, j), j as u8); }
+                c.emit(Wam.CALLB(g.id));
+                if last { if env { c.emit(Wam.DEALLOCATE()); } c.emit(Wam.PROCEED()); }
+            }
+            Call => {
+                let (_, ga) = term.name_arity(&m.db, g.t);
+                for j in 0..ga as u64 { c.put_arg(term.arg_of(g.t, j), j as u8); }
+                pred_of(m, g.f);
+                if last {
+                    if env { c.emit(Wam.DEALLOCATE()); }
+                    c.emit(Wam.EXECUTE(g.f));
+                } else {
+                    c.emit(Wam.CALL(g.f));
+                }
+                called = true;
+            }
+        }
+    }
+    if goals.len == 0 {
+        if env { c.emit(Wam.DEALLOCATE()); }
+        c.emit(Wam.PROCEED());
+    }
+    goals.free();
+    c.vars.free();
+    c.free_temps.free();
+    c.kept.free();
+    if let Some(msg) = c.error {
+        io.eprint("error: ");
+        io.eprintln(msg);
+        c.code.free();
+        return None;
+    }
+    let cl = mem.alloc<Clause>(1);
+    cl.code = finish(m, &c.code, c.nperm as u64);
+    cl.len = c.code.len;
+    cl.key = if arity > 0 { key_of(deref(term.arg_of(head, 0))) } else { 0 };
+    cl.term = Term.Atom(term.A_TRUE);
+    cl.erased = false;
+    cl.id = m.clauses.len;
+    m.clauses.push(cl);
+    c.code.free();
+    Some(cl)
+}
+
+/// call/N: build the goal from A1 and the N-1 extra arguments, load its
+/// arguments and return the code to run. Control constructs compile to a
+/// temporary clause (cut inside is local to the call).
+pub fn prepare_call(m: *Machine, n: u64) -> Result<*u32, Term> {
+    var g = deref(m.x[0]);
+    match g {
+        Ref(_) => return Err(builtins.inst_error(m)),
+        Int(_) => return Err(builtins.type_error(m, "callable", g)),
+        Flt(_) => return Err(builtins.type_error(m, "callable", g)),
+        _ => {}
+    }
+    if n > 0 {
+        let (name, ar) = term.name_arity(&m.db, g);
+        let f = m.db.functor(name, ar + n as u32);
+        let s = m.mk_struct(f, ar as u64 + n);
+        for i in 0..ar as u64 { s.args[i] = term.arg_of(g, i); }
+        for i in 0..n { s.args[ar as u64 + i] = m.x[1 + i]; }
+        g = Term.Str(s);
+    }
+    if is_control(m, g) {
+        var vars: mem.Vec<Term> = mem.Vec.new();
+        var seen: HashMap<u64, bool> = HashMap.new();
+        machine.term_vars(g, &vars, &seen);
+        seen.free();
+        let name = m.db.atom("$call");
+        let f = m.db.functor(name, vars.len as u32);
+        let head = if vars.len == 0 { Term.Atom(name) } else {
+            let s = m.mk_struct(f, vars.len);
+            for i in 0..vars.len { s.args[i] = vars.ptr[i]; }
+            Term.Str(s)
+        };
+        let Some(cl) = compile_clause(m, head, g, None) else { vars.free(); return Err(builtins.type_error(m, "callable", g)); };
+        for i in 0..vars.len { m.x[i] = vars.ptr[i]; }
+        vars.free();
+        return Ok(cl.code);
+    }
+    // A callable term with a control construct inside (a, (b ; c)) is
+    // handled above; anything else calls its predicate.
+    let (name, ar) = term.name_arity(&m.db, g);
+    let f = m.db.functor(name, ar);
+    if ar as u64 >= machine.NREGS { return Err(builtins.resource_error(m, "arity")); }
+    for i in 0..ar as u64 { m.x[i] = term.arg_of(g, i); }
+    let p = pred_of(m, f);
+    if !p.defined and p.clauses.len == 0 and m.flag_unknown_fail { return Ok(m.fail_code); }
+    Ok(p.code)
+}
