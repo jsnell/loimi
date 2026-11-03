@@ -95,7 +95,11 @@ problem size with its expected result. Smaller sizes were taken from the
 cpstak, ctak, takl); the others were checked by running chibi on them. All
 expected results are verified by the benchmark itself under chibi. Sizes
 were chosen so that chibi takes about 1–3 s (graphs, at its smallest
-interesting size, takes 4.5 s).
+interesting size, takes 4.5 s). The two bignum programs, pi and
+chudnovsky, run the suite's own inputs (ours takes 0.2–0.3 s, Gauche
+1.2–3.7 s), and chibi is not run on them (`SKIP` in compare.py): its
+bignums take 21 s for one of pi's 100 iterations, so the expected
+output is Gauche's.
 
 | benchmark | count | parameters → expected | | benchmark | count | parameters → expected |
 |---|---|---|---|---|---|---|
@@ -118,8 +122,8 @@ interesting size, takes 4.5 s).
 | sumfp | 10 | (suite) | | sboyer | 1 | 3 → 5375678 |
 | fft | 3 | (suite) | | gcbench | 1 | 13 |
 | mbrot | 10 | (suite) | | mperm | — | M=1, N=9, K=2, L=1 |
-| nucleic | 1 | (suite) | | | | |
-| pnpoly | 10000 | (suite) | | | | |
+| nucleic | 1 | (suite) | | pi | 100 | (suite: 50 to 500 digits) |
+| pnpoly | 10000 | (suite) | | chudnovsky | 1000 | (suite: 50 to 500 digits) |
 | simplex | 15000 | (suite) | | | | |
 
 ## Results
@@ -307,10 +311,10 @@ per call plus a few per op (see `examples/scheme/README.md`).
   a growing heap (mperm keeps 65 MB live). Our pairs are 32 bytes
   (16-byte header), Guile's 16.
 
-**Caveats** that favour ours: 32-bit fixnums that overflow to flonums
-instead of bignums (none of these programs overflows, but the fast paths
-of the references check for bignum overflow), escape-only continuations,
-and byte strings. One that favours Guile: the suite's 100 MB initial
+**Caveats** that favour ours: escape-only continuations and byte
+strings. (Until 2026-11-03 fixnum overflow produced a flonum; none of the
+41 programs overflows, and exact bignums, added then, changed only the
+cold paths of the arithmetic ops; see "Bignums" below.) One that favours Guile: the suite's 100 MB initial
 heap.
 
 **chibi-scheme** is about 8–10× slower than ours on every program
@@ -428,13 +432,50 @@ Not done, with reasons:
   under 2% of the executed ops except in cpstak and ctak, where the
   closures are continuations that escape.
 
+## Bignums (2026-11-03)
+
+Exact bignums (`examples/scheme/bignum.lm`, on `std.bigint`) made pi
+and chudnovsky runnable: pi computes 50 to 500 digits of pi three ways
+(Brent-Salamin, quadratic and quartic Borwein: `exact-integer-sqrt`,
+`quotient` and products of numbers of up to 1000 digits), chudnovsky the
+same digits by binary splitting. Both run the suite's inputs, pass their
+own checks and print the same output as Gauche and Guile. Best of 3,
+interleaved, `--align 64`, seconds:
+
+| benchmark | ours tailcall | goto | switch | gauche | guile-nojit | guile | /gauche | /guile-nojit | /guile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| pi (wall) | 0.262 | 0.257 | 0.269 | 3.027 | 0.112 | 0.110 | 0.09 | 2.34 | 2.39 |
+| chudnovsky (wall) | 0.209 | 0.211 | 0.209 | 1.015 | 0.195 | 0.153 | 0.21 | 1.07 | 1.37 |
+| pi (inner) | 0.247 | | | 2.987 | 0.094 | 0.091 | 0.08 | 2.63 | 2.70 |
+| chudnovsky (inner) | 0.196 | | | 0.987 | 0.172 | 0.141 | 0.20 | 1.14 | 1.39 |
+
+Ours is 4-11x faster than Gauche, level with Guile's VM on chudnovsky
+and 2.3-2.7x slower than Guile on pi. Guile's integers are GMP's, and
+pi is dominated by the operations where GMP is far ahead: integer square
+roots and divisions of 500-1000 digit numbers (std.bigint has
+schoolbook division and a Newton isqrt built on it; GMP has
+subquadratic division and a dedicated square root). Against CPython 3.13
+std.bigint is faster on the same sizes (1000 by 500 digits: product
+2.3 us vs 6.3, quotient 2.0 vs 5.2, isqrt 5.7 vs 7.6).
+
+The 41 other programs do not overflow, and the bignum support changed
+only cold paths there (overflow and mixed operands already left the fast
+paths): the A/B against the previous commit (best of 3, interleaved,
+`--align-functions=64`, geometric mean new/old) was 1.015 tailcall,
+1.023 goto, 1.026 switch, on a machine shared with another agent's
+builds; the largest repeatable differences are 0.5-1 ms on the 20 ms
+programs (string, gcbench), and the empty program starts 0.08 ms later
+(six more prelude definitions). A first version that called
+`gc.collect` directly in the arithmetic ops' cold paths cost goto
+dispatch 4-12% on tak, diviter and ack; the collection now happens in a
+`#[cold]` helper (`builtins.arith_gc`).
+
 ## Skipped benchmarks
 
 | benchmark | why |
 |---|---|
 | cat, tail, wc, read1, sum1, ray, parsing, dynamic, slatex, scheme, compiler | file ports (`open-input-file`, `call-with-output-file`, `read-char`, `read-line`, `file-exists?`, `delete-file`); slatex and compiler also need `define-syntax`, `parameterize`, `case-lambda`, `delay` |
 | equal | its DAG-with-sharing case (`(equal? x y)` on `make-test-tree1 100`) needs R7RS's sharing-aware `equal?`; our recursive `equal?` is exponential on it and times out |
-| pi, chudnovsky | bignums |
 | mbrotZ | complex numbers |
 | bv2string | bytevectors, `string->utf8`/`utf8->string` |
 | read0, alexpander | not run by the suite's `bench` script either |

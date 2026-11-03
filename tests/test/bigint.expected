@@ -10,5 +10,7 @@ test hashes_match_python ... ok
 test text_radix ... ok
 test caller_buffers ... ok
 test gc_objects ... ok
+test gcd_cases ... ok
+test isqrt_cases ... ok
 
-test result: ok. 12 passed; 0 failed; 0 filtered out
+test result: ok. 14 passed; 0 failed; 0 filtered out

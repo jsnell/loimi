@@ -1,18 +1,26 @@
 // Runtime values of the Scheme interpreter: NaN-boxed values, GC-managed
 // pairs, strings, symbols, vectors, closures and procedure prototypes.
 //
-// A nanbox has room for seven tagged variants besides the unboxed flonum,
-// so the immediates that need no payload of their own share one variant,
+// A nanbox has seven 48-bit blocks besides the unboxed flonum, so the
+// immediates that need no payload of their own share one variant,
 // `Imm(i32)`, distinguished by its payload:
 //
 //   0 '()   1 #f   2 #t   3 unspecified   4 undefined (unbound / uninit)
 //   5 eof   PRIM_BASE + i: builtin procedure i   CHAR_BASE + c: char c
+//
+// Bignums (`Big`, exact integers that do not fit a fixnum) are an eighth
+// variant: it shares a 48-bit block with `Sym` (`block 45`: the two are
+// told apart by the pointer's low 3 bits), so every other variant keeps
+// the block, tag and tests it had before (the fixnum and pair fast paths
+// do not change; `--explain-values` shows the layout).
 
 import std.gc;
 import std.mem;
 import std.hash;
 import std.text;
 import std.map;
+import std.bigint;
+import std.bigint.{Big};
 import vm.{Scheme};
 
 pub object Pair { car: V, cdr: V }
@@ -59,13 +67,16 @@ pub object Closure { proto: Gc<Proto>, free: [V] }
 
 pub value V repr nanbox {
     Num(f64) unboxed,
-    Int(i32),
-    Imm(i32),
+    Int(i32) block 48,
+    Imm(i32) block 48,
     P(Gc<Pair>),
-    Sym(Gc<Sym>),
+    Sym(Gc<Sym>) block 45,
     S(Gc<Str>),
     Vec(Gc<Vect>),
     Clo(Gc<Closure>),
+    /// An exact integer outside the fixnum range (never one inside it:
+    /// results are normalized, see bignum.lm).
+    Big(Gc<Big>) block 45,
 }
 
 pub const NO_GLOBAL: u32 = 0xFFFFFFFF;
@@ -137,7 +148,7 @@ pub fn new_closure(h: *gc.Heap, p: Gc<Proto>) -> Gc<Closure> {
 
 pub fn is_number(v: V) -> bool {
     match v {
-        Int(_) | Num(_) => true,
+        Int(_) | Num(_) | Big(_) => true,
         _ => false,
     }
 }
@@ -153,6 +164,7 @@ pub fn to_num(v: V) -> ?f64 {
     match v {
         Int(i) => Some(i as f64),
         Num(x) => Some(x),
+        Big(b) => Some(bigint.to_f64(b.num())),
         _ => None,
     }
 }
@@ -161,6 +173,7 @@ pub fn to_num(v: V) -> ?f64 {
 pub fn eqv(a: V, b: V) -> bool {
     if a == b { return true; }
     if let (Num(x), Num(y)) = (a, b) { return x == y; }
+    if let (Big(x), Big(y)) = (a, b) { return bigint.eq(x.num(), y.num()); }
     false
 }
 
@@ -191,7 +204,7 @@ pub fn equal(a: V, b: V) -> bool {
 
 pub fn type_name(v: V) -> str {
     match v {
-        Num(_) | Int(_) => "number",
+        Num(_) | Int(_) | Big(_) => "number",
         P(_) => "pair",
         Sym(_) => "symbol",
         S(_) => "string",
@@ -253,6 +266,7 @@ pub fn print(b: *text.StrBuf, v: V, write: bool) {
     match v {
         Int(i) => b.push_int(i as i64),
         Num(x) => push_flonum(b, x),
+        Big(x) => bigint.write(b, x.num(), 10),
         Sym(s) => b.push_str(s.name),
         S(s) => {
             if !write { b.push_str(s.data); return; }

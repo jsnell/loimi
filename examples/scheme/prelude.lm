@@ -50,5 +50,14 @@ pub fn source() -> str {
     (if (if (pair? v) (eq? (car v) %values-tag) #f)
         (apply consumer (cdr v))
         (consumer v))))
+
+(define (truncate-quotient n d) (quotient n d))
+(define (truncate-remainder n d) (remainder n d))
+(define (floor-remainder n d) (modulo n d))
+(define (truncate/ n d) (values (quotient n d) (remainder n d)))
+(define (floor/ n d) (values (floor-quotient n d) (modulo n d)))
+(define (exact-integer-sqrt n)
+  (let ((s (%exact-integer-sqrt n)))
+    (values s (- n (* s s)))))
 "
 }

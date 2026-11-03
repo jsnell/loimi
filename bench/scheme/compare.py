@@ -78,6 +78,9 @@ INPUTS = {
     "fib":       ["20", "30", "832040"],
     "fibc":      ["2", "25", "75025"],
     "fibfp":     ["5", "30.0", "832040.0"],
+    # bignums: the suite's inputs (ours takes 0.2-0.3 s)
+    "pi":        [],
+    "chudnovsky": [],
     "sum":       ["5000"],
     "sumfp":     ["10"],
     "fft":       ["3"],
@@ -108,6 +111,10 @@ INPUTS = {
     "gcbench":   ["1", "13"],
     "mperm":     ["1", "9", "2", "1"],
 }
+
+# (reference, benchmark) pairs not run: chibi's bignums take 21 s for one
+# of pi's 100 iterations (ours: 3.5 ms), so it would need over half an hour.
+SKIP = {("chibi", "pi"), ("chibi", "chudnovsky")}
 
 def skip_space(text, i):
     while i < len(text):
@@ -316,7 +323,12 @@ def main():
         # slow drifts in machine load affect all columns alike.
         times, outs, errs = [None] * len(impls), [""] * len(impls), [""] * len(impls)
         progs, failed = [], [False] * len(impls)
+        skipped = [(i.name, b) in SKIP for i in impls]
         for k, i in enumerate(impls):
+            if skipped[k]:
+                progs.append(None)
+                failed[k] = True
+                continue
             prog = program(b, i.kind)
             progs.append(prog)
             err = i.prepare(prog) if i.prepare else None
@@ -337,8 +349,8 @@ def main():
                   if t is not None and k >= len(ours)]
         expect = passed[0] if passed else outs[0]
         ok = [t is not None and o == expect for t, o in zip(times, outs)]
-        cells = [f"{t:>13.3f}s" if good else f"{'FAIL' if t is None else 'DIFFERS':>14}"
-                 for t, good in zip(times, ok)]
+        cells = [f"{t:>13.3f}s" if good else f"{'skipped' if skip else 'FAIL' if t is None else 'DIFFERS':>14}"
+                 for t, good, skip in zip(times, ok, skipped)]
         for k in range(1, len(ours)):
             if ok[0] and ok[k]:
                 ab[k].append(times[k] / times[0])
@@ -349,8 +361,8 @@ def main():
             else:
                 cells.append(f"{'-':>13}")
         print(f"{b:<12}" + "".join(cells), flush=True)
-        for i, t, good, o, e in zip(impls, times, ok, outs, errs):
-            if not good:
+        for i, t, good, o, e, skip in zip(impls, times, ok, outs, errs, skipped):
+            if not good and not skip:
                 status = 1
                 if a.check:
                     detail = e if t is None else o

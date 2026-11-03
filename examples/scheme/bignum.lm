@@ -1,0 +1,147 @@
+// Exact integers beyond the fixnums, on std.bigint's GC layer. An exact
+// integer is a fixnum (`Int`, i32) when it fits one and a `Big` (limbs
+// and a sign in the GC heap) otherwise: every result is normalized, so
+// the fixnum fast paths never see a small `Big`, and `eqv?` on fixnums
+// stays a word compare. These functions allocate but never collect (the
+// callers are natives and the cold paths of the arithmetic ops).
+
+import std.gc;
+import std.text;
+import std.bigint;
+import std.bigint.{Num, Arg, Big};
+import value;
+import value.{V};
+
+/// Whether v is an exact integer.
+pub fn is_exact(v: V) -> bool {
+    match v {
+        Int(_) | Big(_) => true,
+        _ => false,
+    }
+}
+
+/// An exact integer as an operand for std.bigint (no object for a fixnum).
+fn arg(v: V) -> Arg {
+    match v {
+        Big(b) => Arg.Ref(b),
+        Int(i) => Arg.Small(i as i64),
+        _ => Arg.Small(0),
+    }
+}
+
+/// The view of an exact integer; `buf` holds the limb of a fixnum.
+fn view(v: V, buf: *u64) -> Num { arg(v).num(buf) }
+
+/// A std.bigint result as a value: a fixnum if it fits.
+pub fn norm(l: Gc<Big>) -> V {
+    if let Some(x) = bigint.to_i64(l.num()) and x >= -2147483648 and x <= 2147483647 {
+        return V.Int(x as i32);
+    }
+    V.Big(l)
+}
+
+/// An i64 as an exact integer.
+pub fn of_i64(h: *gc.Heap, x: i64) -> V {
+    if x >= -2147483648 and x <= 2147483647 { return V.Int(x as i32); }
+    V.Big(bigint.gc_of_i64(h, x))
+}
+
+/// The exact integer as an i64, if it fits.
+pub fn to_i64(v: V) -> ?i64 {
+    var x: u64 = 0;
+    bigint.to_i64(view(v, &x))
+}
+
+pub fn add(h: *gc.Heap, a: V, b: V) -> V { norm(bigint.gc_add(h, arg(a), arg(b))) }
+pub fn sub(h: *gc.Heap, a: V, b: V) -> V { norm(bigint.gc_sub(h, arg(a), arg(b))) }
+pub fn mul(h: *gc.Heap, a: V, b: V) -> V { norm(bigint.gc_mul(h, arg(a), arg(b))) }
+pub fn neg(h: *gc.Heap, a: V) -> V { norm(bigint.gc_neg(h, arg(a))) }
+
+/// Quotient and remainder, rounding the quotient toward negative
+/// infinity (`floor`) or zero; None for a zero divisor.
+pub fn divmod(h: *gc.Heap, a: V, b: V, floor: bool) -> ?(V, V) {
+    let Some((q, r)) = bigint.gc_divmod(h, arg(a), arg(b), floor) else { return None; };
+    Some((norm(q), norm(r)))
+}
+
+/// -1, 0 or 1 as a < b, a = b, a > b.
+pub fn cmp(a: V, b: V) -> i32 {
+    if let (Int(x), Int(y)) = (a, b) { return if x < y { -1 } else if x > y { 1 } else { 0 }; }
+    var x: u64 = 0;
+    var y: u64 = 0;
+    bigint.cmp(view(a, &x), view(b, &y))
+}
+
+/// Compare an exact integer with a flonum that is not a NaN, exactly
+/// (R7RS: comparisons are transitive, so a bignum is not rounded to the
+/// nearest flonum first).
+pub fn cmp_float(a: V, f: f64) -> i32 {
+    if f == 1.0 / 0.0 { return -1; }
+    if f == -1.0 / 0.0 { return 1; }
+    // The integer part of f fits the 17 limbs of an f64 below 2^1024.
+    var buf: [u64; 18] = [0; 18];
+    let t = bigint.from_f64_into(buf[0..18], f).unwrap();
+    var x: u64 = 0;
+    let c = bigint.cmp(view(a, &x), t);
+    if c != 0 { return c; }
+    let ft = f.trunc();
+    if f > ft { -1 } else if f < ft { 1 } else { 0 }
+}
+
+/// -1, 0 or 1.
+pub fn sign(v: V) -> i32 {
+    var x: u64 = 0;
+    bigint.sign(view(v, &x))
+}
+
+pub fn is_odd(v: V) -> bool {
+    var x: u64 = 0;
+    bigint.is_odd(view(v, &x))
+}
+
+/// The nearest flonum (correctly rounded; ±inf beyond the range).
+pub fn to_f64(v: V) -> f64 {
+    var x: u64 = 0;
+    bigint.to_f64(view(v, &x))
+}
+
+/// The exact integer equal to an integral flonum (None for inf and nan).
+pub fn of_f64(h: *gc.Heap, f: f64) -> ?V {
+    if f >= -2147483648.0 and f <= 2147483647.0 { return Some(V.Int(f as i32)); }
+    let Some(l) = bigint.gc_from_f64(h, f) else { return None; };
+    Some(norm(l))
+}
+
+/// a^e for e >= 0; None when the result would not fit in memory.
+pub fn pow(h: *gc.Heap, a: V, e: u64) -> ?V {
+    var x: u64 = 0;
+    let bits = bigint.bit_length(view(a, &x));
+    if bits > 1 and e > 0 {
+        let Some(t) = bits.mul_checked(e) else { return None; };
+        if t > 0x100000000 { return None; }
+    }
+    Some(norm(bigint.gc_pow(h, arg(a), e)))
+}
+
+/// gcd(|a|, |b|).
+pub fn gcd(h: *gc.Heap, a: V, b: V) -> V { norm(bigint.gc_gcd(h, arg(a), arg(b))) }
+
+/// floor(sqrt(a)) for a >= 0.
+pub fn isqrt(h: *gc.Heap, a: V) -> ?V {
+    let Some(r) = bigint.gc_isqrt(h, arg(a)) else { return None; };
+    Some(norm(r))
+}
+
+/// Digits in `radix` (2 to 36, lowercase), with a `-` if negative.
+pub fn write(b: *text.StrBuf, v: V, radix: u32) {
+    if let Int(i) = v and radix == 10 { b.push_int(i as i64); return; }
+    var x: u64 = 0;
+    bigint.write(b, view(v, &x), radix);
+}
+
+/// An unsigned numeral in `radix` (digits only), negated if `negative`.
+pub fn parse(h: *gc.Heap, digits: str, radix: u32, negative: bool) -> ?V {
+    let Some(l) = bigint.gc_parse(h, digits, radix) else { return None; };
+    l.neg = negative and l.len != 0;
+    Some(norm(l))
+}

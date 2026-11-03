@@ -274,6 +274,31 @@ The 11 programs, best of 3 interleaved, old/new: geomean 1.00 (each
 within 3%, the machine shared with other jobs); spectral_norm 0.98 (best
 of 9: 1.100 -> 1.076 of the time of the earlier `Int(i32)` build).
 
+## Follow-up (2026-11-03): Scheme bignums
+
+examples/scheme now has exact bignums (`examples/scheme/bignum.lm`, on
+`std.bigint`'s GC layer, which gained `gcd` and `isqrt`): fixnum
+overflow promotes instead of producing a flonum. Two more r7rs-benchmarks
+programs run, with the suite's own inputs (chibi is skipped on them: 21 s
+for one of pi's 100 iterations). Best of 3, interleaved,
+`--align-functions=64`, seconds:
+
+| benchmark | ours tailcall | goto | switch | gauche | guile-nojit | guile | /gauche | /guile-nojit | /guile |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| pi (wall) | 0.262 | 0.257 | 0.269 | 3.027 | 0.112 | 0.110 | 0.09 | 2.34 | 2.39 |
+| chudnovsky (wall) | 0.209 | 0.211 | 0.209 | 1.015 | 0.195 | 0.153 | 0.21 | 1.07 | 1.37 |
+| pi (inner) | 0.247 | | | 2.987 | 0.094 | 0.091 | 0.08 | 2.63 | 2.70 |
+| chudnovsky (inner) | 0.196 | | | 0.987 | 0.172 | 0.141 | 0.20 | 1.14 | 1.39 |
+
+pi is 2.3-2.7x slower than Guile, whose GMP has subquadratic division
+and square root; see `bench/scheme/README.md` ("Bignums"). The other 41
+programs: new/old geometric mean 1.015 tailcall, 1.023 goto, 1.026
+switch (noise on a shared machine is about that size; the tables below
+are from before the change). Other examples' IR: unchanged except that
+Python's (the only other user of std.bigint) now contains the unused
+`gcd`/`isqrt` functions; its binary has the same symbols with the same
+sizes.
+
 ## Per suite
 
 ### mini

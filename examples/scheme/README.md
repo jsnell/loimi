@@ -20,6 +20,7 @@ bench/scheme/compare.py         # benchmarks vs chibi-scheme (see bench/scheme/R
 
 | File | Contents |
 |---|---|
+| `bignum.lm` | exact integers beyond the fixnums, on `std.bigint`: promotion, normalization back to fixnums, exact comparison with flonums, radix I/O |
 | `value.lm` | the `V` value type, heap objects (pairs, strings, symbols, vectors, closures, prototypes), printing, `eqv?`/`equal?`, the symbol table |
 | `read.lm` | the reader, on `std.lex` (cursor, comments) and `std.num` (numerals) |
 | `compile.lm` | s-expressions → AST (derived forms expanded, variables resolved) → inlining, contification → bytecode |
@@ -35,7 +36,8 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
 
 ## What is supported
 
-- **Data.** Fixnums (32-bit), flonums, booleans, characters, strings,
+- **Data.** Exact integers (32-bit fixnums, and bignums beyond them),
+  flonums, booleans, characters, strings,
   interned symbols, pairs and lists, vectors, records, procedures,
   unspecified.
 - **Reader.** Lists with `()` or `[]`, dotted pairs, `'` `` ` `` `,` `,@`,
@@ -51,20 +53,21 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
   vectors), `define-record-type` (top level and in bodies). Keywords can be
   shadowed by local variables. A top-level `(import ...)` is accepted and
   ignored: every procedure the program can name is built in.
-- **Builtins** (126 natives plus the prelude): numbers (`+ - * / quotient
-  remainder modulo = < > <= >= zero? positive? negative? even? odd? number?
-  integer? exact? inexact? exact-integer? abs min max gcd lcm sqrt expt exp
-  log sin cos tan asin acos atan floor ceiling round truncate
-  exact->inexact inexact->exact exact inexact square number->string
-  string->number`), pairs and lists (`cons car cdr` and
-  `c[ad]{2,4}r`, `set-car! set-cdr! list length append reverse list-tail
-  list-ref list-copy last-pair memq memv member assq assv assoc map
-  for-each apply`), predicates (`null? pair? list? eq? eqv? equal? not
-  symbol? string? procedure? vector? boolean? char?`), vectors
-  (`make-vector vector vector-ref vector-set! vector-length vector->list
-  list->vector vector-fill! vector-map vector-for-each`), strings and chars
-  (`string-length string-ref substring string-append string=? string<?`
-  and friends, `string-copy string->list list->string make-string string
+- **Builtins** (149 natives plus the prelude): numbers (`+ - * / quotient
+  remainder modulo floor/ truncate/ floor-quotient floor-remainder
+  truncate-quotient truncate-remainder exact-integer-sqrt = < > <= >= zero?
+  positive? negative? even? odd? number? integer? exact? inexact?
+  exact-integer? abs min max gcd lcm sqrt expt exp log sin cos tan asin acos
+  atan floor ceiling round truncate exact->inexact inexact->exact exact
+  inexact square number->string string->number`), pairs and lists (`cons car
+  cdr` and `c[ad]{2,4}r`, `set-car! set-cdr! list length append reverse
+  list-tail list-ref list-copy last-pair memq memv member assq assv assoc
+  map for-each apply`), predicates (`null? pair? list? eq? eqv? equal? not
+  symbol? string? procedure? vector? boolean? char?`), vectors (`make-vector
+  vector vector-ref vector-set! vector-length vector->list list->vector
+  vector-fill! vector-map vector-for-each`), strings and chars
+  (`string-length string-ref substring string-append string=? string<?` and
+  friends, `string-copy string->list list->string make-string string
   string-set! symbol->string string->symbol char->integer integer->char
   char=? char<? char-upcase char-alphabetic?` ...), output (`display write
   newline write-string write-char flush-output-port current-output-port`;
@@ -84,11 +87,20 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
 
 ### Deviations and choices
 
-- **Fixnum overflow produces a flonum** (`(* 65536 65536)` ⇒
-  `4294967296.0`). There are no bignums and no rationals: `(/ 1 3)` is
-  `0.3333333333333333`, while `(/ 6 3)` stays exact. Integer literals that
-  do not fit in 32 bits read as flonums. 32 bits is what a nanbox payload
-  holds (see "Language features missed").
+- **Exact integers are fixnums or bignums.** Fixnums are 32-bit (`Int`
+  in the nanbox); a result that overflows becomes a bignum (`Big`, a
+  `std.bigint` GC object), and a bignum result that fits a fixnum is a
+  fixnum again, so `eqv?` on small integers stays a word compare and the
+  fixnum fast paths never see a small bignum. The fast paths are
+  unchanged: overflow, like mixed operands, goes to the op's cold path,
+  which is also a safepoint (a loop of bignum arithmetic with no call
+  still collects). Comparisons between bignums and flonums are exact
+  (`(< (+ (expt 2 53) 1) 9007199254740992.0)` is `#f`), `exact->inexact`
+  rounds correctly, `number->string` and `string->number` take radix 2,
+  8, 10 or 16, and the reader takes `#x #o #b #d #e #i` prefixes,
+  `+inf.0`, `-inf.0` and `+nan.0`. There are no rationals: `(/ 1 3)` is
+  `0.3333333333333333`, while `(/ 6 3)` and `(/ (expt 10 30) (expt 10
+  28))` stay exact; an exact negative exponent in `expt` gives a flonum.
 - **Strings are byte strings.** `string-length` and `string-ref` count
   bytes; characters are code points, and `#\λ` or `\x3bb;` are encoded as
   UTF-8 when put into a string.
@@ -120,7 +132,7 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
   call.
 - Not supported: `dynamic-wind`, `syntax-rules`/`define-syntax` (they are
   reported as unsupported), re-entrant continuations, file and string
-  ports, `delay`, bytevectors, bignums, rationals, complex numbers.
+  ports, `delay`, bytevectors, rationals, complex numbers.
 
 ## Architecture
 
@@ -316,17 +328,20 @@ The benchmarks are the public
 unmodified and downloaded at a pinned commit, and the reference is
 chibi-scheme 0.12 (a bytecode VM) built from source; see
 [`bench/scheme/README.md`](../../bench/scheme/README.md) for how they are
-run, the inputs, all results and the skipped programs. 41 of the 57
-programs the suite's `bench` script runs are included; of the other 16,
-equal, pi, chudnovsky, mbrotZ and bv2string would need a sharing-aware
-`equal?`, bignums, complex numbers or bytevectors, and 11 need file ports.
+run, the inputs, all results and the skipped programs. 43 of the 57
+programs the suite's `bench` script runs are included (pi and chudnovsky,
+which need bignums, since 2026-11-03); of the other 14, equal, mbrotZ and
+bv2string would need a sharing-aware `equal?`, complex numbers or
+bytevectors, and 11 need file ports.
 
 Geometric mean of ours / reference over the 41 programs (wall time,
 whole process; Intel i7-6700, 2026-11-02): Gauche 0.29, Guile 3 without
 its JIT 0.47, Guile 3 with its JIT 1.02 (chibi: 0.10 before the compiler
 passes). Ours is faster than Gauche and than Guile's bytecode VM on every
 program; the per-program tables, the timed-loop times and the changelog
-of the optimizations are in the benchmark README.
+of the optimizations are in the benchmark README. On the two bignum
+programs (2026-11-03) ours is 4-11x faster than Gauche, level with
+Guile's VM on chudnovsky and 2.3-2.7x slower than Guile (GMP) on pi.
 
 The programs this directory used before were reproduced from memory by
 the interpreter's author; they were removed in favour of the public suite.

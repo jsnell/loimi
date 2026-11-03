@@ -22,6 +22,7 @@ import std.text;
 import std.lex;
 import std.num;
 import value;
+import bignum;
 import value.{V, Symtab, Pair, Vect};
 
 pub struct Reader {
@@ -147,9 +148,10 @@ pub fn Reader.read(r: *Reader) -> ?V {
     if s[0] == '#' {
         if s.eq("#t") or s.eq("#true") { return Some(value.t()); }
         if s.eq("#f") or s.eq("#false") { return Some(value.f()); }
+        if let Some(n) = parse_number(r.heap, s, 10) { return Some(n); }
         fail(line, "bad # syntax");
     }
-    if let Some(n) = parse_number(s) { return Some(n); }
+    if let Some(n) = parse_number(r.heap, s, 10) { return Some(n); }
     if s.eq(".") { fail(line, "unexpected '.'"); }
     Some(r.sym(s))
 }
@@ -165,20 +167,71 @@ pub fn list_to_vect(h: *gc.Heap, l: V) -> Gc<Vect> {
     v
 }
 
-/// A number literal (all of `s`): an exact integer, which is a flonum if
-/// it does not fit in a fixnum, or a decimal flonum. Scheme writes hex as
-/// `#x..`, so std.num's `0x` prefix is not accepted.
-pub fn parse_number(s: str) -> ?V {
-    var i: u64 = 0;
-    if s.len > 0 and (s[0] == '+' or s[0] == '-') { i = 1; }
-    if i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X') { return None; }
-    match num.parse_number(s) {
-        Ok(Int(x)) => {
-            if x >= -2147483648 and x <= 2147483647 { Some(V.Int(x as i32)) } else { Some(V.Num(x as f64)) }
+/// A number literal (all of `s`), in `radix` unless a `#x`, `#o`, `#b` or
+/// `#d` prefix says otherwise (`#e`/`#i` set the exactness): an exact
+/// integer (a bignum when it does not fit a fixnum), a decimal flonum,
+/// or `+inf.0`, `-inf.0`, `+nan.0`. There are no rationals: `1/2` is
+/// not a number. Scheme writes hex as `#x..`, so std.num's `0x` prefix
+/// is not accepted.
+pub fn parse_number(h: *gc.Heap, s0: str, radix0: u32) -> ?V {
+    var s = s0;
+    var radix = radix0;
+    var exactness: u8 = 0;
+    var radix_set = false;
+    while s.len >= 2 and s[0] == '#' {
+        let c = s[1] | 0x20;
+        if c == 'e' or c == 'i' {
+            if exactness != 0 { return None; }
+            exactness = c;
+        } else {
+            if radix_set { return None; }
+            radix_set = true;
+            if c == 'x' { radix = 16; }
+            else if c == 'b' { radix = 2; }
+            else if c == 'o' { radix = 8; }
+            else if c == 'd' { radix = 10; }
+            else { return None; }
         }
-        Ok(Float(f)) => Some(V.Num(f)),
-        Err(_) => None,
+        s = s[2..s.len];
     }
+    if s.len == 0 { return None; }
+    let negative = s[0] == '-';
+    let start: u64 = if s[0] == '+' or s[0] == '-' { 1 } else { 0 };
+    let digits = s[start..s.len];
+    var all = digits.len > 0;
+    for i in 0..digits.len {
+        if num.digit_value(digits[i]) >= radix { all = false; break; }
+    }
+    if all {
+        var v = V.Int(0);
+        if digits.len <= 9 {
+            var x: i64 = 0;
+            for i in 0..digits.len { x = x * (radix as i64) + (num.digit_value(digits[i]) as i64); }
+            v = bignum.of_i64(h, if negative { 0 - x } else { x });
+        } else {
+            let Some(b) = bignum.parse(h, digits, radix, negative) else { return None; };
+            v = b;
+        }
+        if exactness == 'i' { return Some(V.Num(bignum.to_f64(v))); }
+        return Some(v);
+    }
+    if radix != 10 { return None; }
+    var f: f64 = 0.0;
+    if s.eq("+inf.0") { f = 1.0 / 0.0; }
+    else if s.eq("-inf.0") { f = -1.0 / 0.0; }
+    else if s.eq("+nan.0") or s.eq("-nan.0") { f = 0.0 / 0.0; }
+    else {
+        if start + 1 < s.len and s[start] == '0' and (s[start + 1] == 'x' or s[start + 1] == 'X') { return None; }
+        match num.parse_number(s) {
+            Ok(Float(x)) => f = x,
+            _ => return None,
+        }
+    }
+    if exactness == 'e' {
+        if f != f.floor() { return None; }
+        return bignum.of_f64(h, f);
+    }
+    Some(V.Num(f))
 }
 
 fn Reader.list(r: *Reader, close: u8, line: u32) -> V {

@@ -467,7 +467,11 @@ layers over one representation:
   `shl_into` / `shr_into` (arithmetic: `-1 >> n` is -1), `and_into`,
   `or_into`, `xor_into` (`bitop_size`), `not_into`, `pow_into`
   (`pow_size -> ?u64`, None when the size overflows), `from_i64`,
-  `from_u64` (one limb), `from_f64_into` (`f64_size`, truncates; None
+  `from_u64` (one limb), `gcd_into(out, a, b)` (`gcd_size`; never
+  negative, Euclid's algorithm on limbs and then on machine words),
+  `isqrt_into(out, a) -> ?Num` (`isqrt_size`; None for a negative a;
+  CPython's precision-doubling Newton iteration, floor of the root),
+  `from_f64_into` (`f64_size`, truncates; None
   for inf and nan), `parse_into(out, digits, radix)` (`parse_size`).
   Views need no buffer: `neg`, `abs`, `cmp`, `cmp_abs`, `eq`, `sign`,
   `is_zero`, `is_odd`, `bit_length`, `to_i64` / `to_u64 -> ?..`,
@@ -481,14 +485,14 @@ layers over one representation:
 - **`BigInt`, owned**: `struct BigInt { neg: bool, d: mem.Vec<u64> }` on
   the C heap. `bigint.add(a, b) -> BigInt` (and `sub`, `mul`, `divmod(a,
   b, floor) -> ?(BigInt, BigInt)`, `pow`, `shl`, `shr`, `bit_and`,
-  `bit_or`, `bit_xor`, `bit_not`, `copy`, `of_i64`, `of_u64`, `of_f64`,
+  `bit_or`, `bit_xor`, `bit_not`, `gcd`, `isqrt -> ?BigInt`, `copy`, `of_i64`, `of_u64`, `of_f64`,
   `parse(s, radix) -> ?BigInt`) take views, so owned and GC numbers mix;
   `x.num()` is an owned number's view, `x.free()` releases it.
 - **`Big`, in the GC heap**: `object Big { neg: bool, len: u64, d: [u64] }`
   (`len` limbs of `d` are the number: results are allocated at their
   size bound). `gc_add(h, a, b) -> Gc<Big>` (and `gc_sub`, `gc_mul`,
   `gc_divmod`, `gc_pow`, `gc_shl`, `gc_shr`, `gc_and`, `gc_or`,
-  `gc_xor`, `gc_not`, `gc_neg`, `gc_copy`, `gc_of_i64`, `gc_from_f64`,
+  `gc_xor`, `gc_not`, `gc_neg`, `gc_gcd`, `gc_isqrt -> ?Gc<Big>`, `gc_copy`, `gc_of_i64`, `gc_from_f64`,
   `gc_parse`) take `Arg`s, `enum Arg { Small(i64), Ref(Gc<Big>) }`, so
   a small operand needs no object. `b.num()` is a `Big`'s view. Allocating
   does not collect (collections run at the interpreter's safepoints), so
@@ -585,8 +589,8 @@ Subquadratic division (Burnikel-Ziegler or Newton) and with it
 subquadratic radix conversion (formatting is divide and conquer over
 schoolbook division, so still quadratic; CPython 3.12+ converts huge
 numbers with `_pylong`, which is asymptotically faster), divide-and-conquer
-parsing, a squaring routine, FFT multiplication, `gcd`, integer square
-root, correctly rounded `a / b` to `f64`, and in-place operations on an
+parsing, a squaring routine, FFT multiplication, a subquadratic
+(Lehmer or half-gcd) `gcd`, correctly rounded `a / b` to `f64`, and in-place operations on an
 owned `BigInt` (each operation returns a new one).
 
 ## `std.io` and `std.os`
