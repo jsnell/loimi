@@ -1474,3 +1474,156 @@ fn wi_sweep<X>(h: *Heap, data: *u8) {
         }
     }
 }
+
+// ── checked roots (`loimi build --gc-check-roots`) ──────────────────────
+//
+// Built with `--gc-check-roots`, generated code marks every reference
+// (shadow-stack roots, copies of vm state, `gc_mark` in scanners, fields
+// traced by `loimi_trace_object`) through `rootck_mark` instead of
+// `mark_ptr`: the reference must be null, or the start of an allocated
+// object in one of this heap's chunks or among its large objects, before
+// its header is read. Anything else (stack garbage in a slot listed too
+// early, a pointer to an object freed while it was not rooted) aborts
+// with the reference and what held it: the root's slot, its frame (the
+// function, call site and the frame's roots) and the frame's depth on
+// the shadow stack; or the object or `gc_mark` call. The compiler also
+// fills traced locals' slots with 0x01 bytes where they are unassigned
+// (on entry, and when their scope ends), and the first check of a
+// non-generational heap installs a sweeper that fills the objects about
+// to be freed with 0x01 bytes, so that a use after free reads garbage
+// instead of the old values. These functions are emitted only in that
+// mode (src/codegen.rs, `is_lazy`), so other builds' IR is unchanged.
+// Every heap whose objects the shadow stack holds must be the heap being
+// collected: references into another heap are reported too.
+
+extern "C" fn loimi_rootck_what() -> str;
+extern "C" fn loimi_rootck_kind() -> i64;
+extern "C" fn loimi_rootck_idx() -> i64;
+extern "C" fn loimi_rootck_info() -> u64;
+
+/// `mark_ptr` with the checks of `--gc-check-roots`.
+pub fn rootck_mark(h: *Heap, p: *u8) {
+    if (p as u64) == 0 { return; }
+    let why = rootck_check(h, p);
+    if why != 0 { rootck_fail(h, p, why); }
+    rootck_install(h);
+    mark_ptr(h, p);
+}
+
+/// 0 if `p` is the start of an allocated object of `h`, else why not.
+pub fn rootck_check(h: *Heap, p: *u8) -> u64 {
+    let a = p as u64;
+    if (a & 15) != 0 { return 1; }
+    for si in 0..h.segments.len {
+        let seg = h.segments.ptr[si] as u64;
+        if a >= seg and a < seg + SEG {
+            let ci = si * SEG_CHUNKS + (a - seg) / CHUNK;
+            if ci >= h.chunks.len { return 3; }
+            let ch = h.chunks.ptr + ci;
+            let base = ch.base as u64;
+            if (base & !(CHUNK - 1)) != seg + ((a - seg) & !(CHUNK - 1)) { return 6; }
+            if a < base + HEADER { return 4; }
+            let off = a - HEADER - base;
+            if off % ch.size != 0 or off / ch.size >= ch.n { return 4; }
+            let hd = (a - HEADER) as *Header;
+            if hd.tid == FREE { return 5; }
+            return 0;
+        }
+    }
+    for i in 0..h.large.len {
+        if (h.large.ptr[i] as u64) + HEADER == a { return 0; }
+    }
+    2
+}
+
+#[cold]
+pub fn rootck_fail(h: *Heap, p: *u8, why: u64) {
+    io.eprint("gc check-roots: bad reference 0x");
+    rootck_hex(p as u64);
+    io.eprint(": ");
+    io.eprintln(if why == 1 {
+        "misaligned"
+    } else if why == 2 {
+        "not in this heap"
+    } else if why == 3 {
+        "in a part of a segment not yet used"
+    } else if why == 4 {
+        "not the start of an object"
+    } else if why == 5 {
+        "a freed object"
+    } else {
+        "chunk table mismatch"
+    });
+    let k = loimi_rootck_kind();
+    let idx = loimi_rootck_idx();
+    if k == 0 {
+        io.eprint("  root #");
+        io.eprint_int(idx);
+        io.eprint(" of shadow-stack frame #");
+        io.eprint_int(rootck_depth());
+        io.eprintln(" (0: the innermost) of");
+        io.eprint("  ");
+    } else if k == 1 {
+        io.eprint("  in the object at 0x");
+        rootck_hex(idx as u64);
+        io.eprint(", ");
+    } else if k == 2 {
+        io.eprint("  ");
+    } else {
+        io.eprint("  (unknown source)");
+    }
+    io.eprintln(loimi_rootck_what());
+    abort();
+}
+
+/// The depth on the shadow stack of the frame being scanned.
+pub fn rootck_depth() -> i64 {
+    let info = loimi_rootck_info();
+    var fr = loimi_shadow_top();
+    var d: i64 = 0;
+    while (fr as u64) != 0 {
+        let entries = (fr as *u8 + 16) as *ShadowEntry;
+        if fr.n > 0 and (entries.slot as u64) == info { return d; }
+        d += 1;
+        fr = fr.prev;
+    }
+    -1
+}
+
+pub fn rootck_hex(x: u64) {
+    var buf: [u8; 16] = [0; 16];
+    for i in 0..16 {
+        let d = (x >> ((15 - i) * 4)) & 15;
+        buf[i] = if d < 10 { (d + 48) as u8 } else { (d + 87) as u8 };
+    }
+    write(2, &buf[0], 16);
+}
+
+/// Install `rootck_poison` as a sweeper of `h` (once; not in a
+/// generational heap, whose unmarked objects are not all dead).
+pub fn rootck_install(h: *Heap) {
+    if h.gen { return; }
+    let tag = h.rs as *u8;
+    for i in 0..h.sweepers.len {
+        if h.sweepers.ptr[i].data == tag { return; }
+    }
+    h.add_sweeper(tag, rootck_poison);
+}
+
+/// Fill the objects this collection frees with 0x01 bytes.
+pub fn rootck_poison(h: *Heap, data: *u8) {
+    if h.gen { return; }
+    for ci in 0..h.chunks.len {
+        let ch = h.chunks.ptr + ci;
+        for i in 0..ch.n {
+            let hd = (ch.base + i * ch.size) as *Header;
+            if hd.tid != FREE and hd.mark != h.epoch {
+                mem.memset(hd as *u8 + HEADER, 1, ch.size - HEADER);
+            }
+        }
+    }
+    for i in 0..h.large.len {
+        let hd = h.large.ptr[i];
+        if hd.mark != h.epoch { mem.memset(hd as *u8 + HEADER, 1, hd.size as u64 - HEADER); }
+    }
+}

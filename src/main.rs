@@ -37,6 +37,8 @@ struct Opts {
     dispatch: Option<tir::Dispatch>,
     keep_ll: bool,
     vm_stats: bool,
+    /// `--gc-check-roots`: validate every reference the collector marks.
+    gc_check_roots: bool,
     /// `--sanitize=address`: build with AddressSanitizer.
     sanitize_address: bool,
     /// `--sanitize=thread`: build with ThreadSanitizer.
@@ -110,6 +112,7 @@ const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
+                  [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
                   [--target=aarch64-linux-gnu|x86_64-linux-gnu [--sysroot=DIR]]   (cross-compile; links with lld)
        loimi run <file.lm> [build options] [-- args...]
@@ -281,6 +284,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             library,
             jit: opts.jit,
             arch: opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch),
+            gc_check_roots: opts.gc_check_roots,
         },
     );
     let (mut ir, stencils) = cg.generate_with_stencils();
@@ -437,6 +441,7 @@ fn parse_args() -> Result<Opts, String> {
         dispatch: None,
         keep_ll: false,
         vm_stats: false,
+        gc_check_roots: false,
         sanitize_address: false,
         sanitize_thread: false,
         deny_warnings: false,
@@ -492,6 +497,7 @@ fn parse_args() -> Result<Opts, String> {
             }
             s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
             "--vm-stats" => o.vm_stats = true,
+            "--gc-check-roots" => o.gc_check_roots = true,
             "--jit-stencils" => o.jit = true,
             "--update" if o.test => o.update = true,
             "--list" if o.test => o.run_args.push(a.clone()),
@@ -539,6 +545,9 @@ fn parse_args() -> Result<Opts, String> {
     }
     if o.jit && (o.kind != OutKind::Exe || o.sanitize_address || o.sanitize_thread || o.dispatch.is_some_and(|d| d != tir::Dispatch::TailCall)) {
         return Err("--jit-stencils builds executables with tail-call dispatch, without sanitizers".into());
+    }
+    if o.jit && o.gc_check_roots {
+        return Err("--gc-check-roots cannot be combined with --jit-stencils".into());
     }
     if o.jit && !(cfg!(target_arch = "x86_64") && cfg!(target_os = "linux")) {
         return Err("--jit-stencils supports x86-64 Linux only".into());

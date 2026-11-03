@@ -20,6 +20,10 @@ pub struct Options {
     pub jit: bool,
     /// The target architecture (`--target`, else the host's).
     pub arch: Arch,
+    /// `--gc-check-roots`: the collector validates every reference it
+    /// marks, and traced slots are poisoned when unassigned
+    /// (`crate::gcgen`, docs/lowering.md section 9).
+    pub gc_check_roots: bool,
 }
 
 /// Target architectures. The IR is the same for both except where the
@@ -94,6 +98,8 @@ pub struct Codegen<'p> {
     pub jit_counted: std::collections::HashSet<FnId>,
     /// The program installs panic handlers (`rtgen::has_handlers`).
     pub panic_handlers: bool,
+    /// `--gc-check-roots`: info records emitted (`gcgen::rootck_info`).
+    pub rootck_count: u32,
 }
 
 /// External declarations, deduplicated by symbol.
@@ -194,6 +200,7 @@ impl<'p> Codegen<'p> {
             stencils: String::new(),
             jit_counted: Default::default(),
             panic_handlers: false,
+            rootck_count: 0,
         }
     }
 
@@ -355,9 +362,9 @@ impl<'p> Codegen<'p> {
             let align = layout::align_of(p, &g.ty).max(1);
             let _ = writeln!(self.globals, "@\"{}\" = internal {}global {} {}, align {}", g.symbol, tl, llty(p, &g.ty), init, align);
         }
-        let keep = lazy_used(p);
+        let keep = lazy_used(p, self.opts.gc_check_roots);
         for (i, f) in p.fns.iter().enumerate() {
-            if f.lazy && !keep[i] {
+            if is_lazy(f) && !keep[i] {
                 continue;
             }
             if f.body.is_none() {
@@ -562,6 +569,45 @@ impl<'a, 'p> FnGen<'a, 'p> {
         let _ = writeln!(self.allocas, "  {} = alloca {}, align {}", name, lt, layout::align_of(self.p(), t).max(1));
         name
     }
+    /// The stack slot of a local. With `--gc-check-roots`, a traced one
+    /// starts out poisoned (`poison_slot`).
+    pub fn local_slot(&mut self, t: &Ty) -> String {
+        let s = self.alloca(t);
+        if crate::gcgen::check_roots(self) && crate::gcgen::is_traced(self.p(), t) {
+            let size = layout::size_of(self.p(), t);
+            self.cg.decls.insert("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)");
+            let _ = writeln!(self.allocas, "  call void @llvm.memset.p0.i64(ptr {}, i8 1, i64 {}, i1 false)", s, size);
+        }
+        s
+    }
+
+    /// `--gc-check-roots`: fill the slot of a traced local with 0x01
+    /// bytes, a non-canonical address in every pointer (and `Some` in
+    /// every option flag), where it is unassigned: at function entry and
+    /// when its scope ends. A frame that lists it there makes the
+    /// collector report it, whatever the stack held.
+    fn poison_slot(&mut self, l: LocalId) {
+        let t = self.f().locals[l as usize].ty.clone();
+        if !crate::gcgen::is_traced(self.p(), &t) {
+            return;
+        }
+        let size = layout::size_of(self.p(), &t);
+        let slot = self.slots[l as usize].clone();
+        self.cg.decls.insert("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)");
+        self.emit(format!("call void @llvm.memset.p0.i64(ptr {}, i8 1, i64 {}, i1 false)", slot, size));
+    }
+
+    /// Close the innermost scope of `live`; with `--gc-check-roots`,
+    /// poison its traced locals on the path that falls out of it.
+    fn pop_live(&mut self) {
+        let scope = self.live.pop().unwrap();
+        if crate::gcgen::check_roots(self) && !self.terminated {
+            for l in scope {
+                self.poison_slot(l);
+            }
+        }
+    }
+
     pub fn load(&mut self, t: &Ty, ptr: &str) -> String {
         if t.is_unitlike() {
             return "zeroinitializer".into();
@@ -604,7 +650,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.slots.push("%unused".into());
                 continue;
             }
-            let s = self.alloca(&l.ty);
+            let s = self.local_slot(&l.ty);
             self.slots.push(s);
         }
         let mut params = Vec::new();
@@ -1015,7 +1061,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     }
                     self.unroot_pending(rooted);
                 }
-                self.live.pop();
+                self.pop_live();
                 v
             }
             TK::If(conds, then, els) => {
@@ -1027,7 +1073,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.conds(conds, &l_else);
                 self.label(&l_then);
                 let v = self.val(then);
-                self.live.pop();
+                self.pop_live();
                 if let Some(s) = &slot {
                     if !self.terminated {
                         self.store(&e.ty, &v, s);
@@ -1083,7 +1129,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                         self.label(&l_ok);
                     }
                     let v = self.val(&arm.body);
-                    self.live.pop();
+                    self.pop_live();
                     if let Some(s) = &slot {
                         if !self.terminated {
                             self.store(&e.ty, &v, s);
@@ -1477,7 +1523,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.label(l);
             self.live.push(vec![]);
             let v = self.val(&a.body);
-            self.live.pop();
+            self.pop_live();
             if let Some(s) = slot {
                 if !self.terminated {
                     self.store(rty, &v, s);
@@ -2416,6 +2462,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.inst(format!("select i1 {uno}, {ft} {q}, {ft} {r}"))
             }
             Intr::GcMark => {
+                if crate::gcgen::check_roots(self) {
+                    let text = format!("gc_mark in {} at {}", self.f().symbol, self.cg.location(e.span));
+                    let info = crate::gcgen::rootck_info(self.cg, crate::gcgen::RC_GC_MARK, &text);
+                    crate::gcgen::rootck_set(self, &info, "-1");
+                }
                 crate::gcgen::mark_expr(self, &args[1].ty, &vals[1], &vals[0]);
                 "zeroinitializer".into()
             }
@@ -2424,18 +2475,33 @@ impl<'a, 'p> FnGen<'a, 'p> {
 }
 
 /// Which lazy functions (`FnDef::lazy`) some emitted function refers to.
-fn lazy_used(p: &Program) -> Vec<bool> {
+/// Emitted only where used: the functions marked `LAZY_ATTR`, and the
+/// checks of `--gc-check-roots` in std.gc (`rootck_*`), which only
+/// generated code calls.
+fn is_lazy(f: &FnDef) -> bool {
+    f.lazy || f.symbol.starts_with("std.gc.rootck_") || f.symbol.starts_with("loimi_rootck_")
+}
+
+fn lazy_used(p: &Program, check_roots: bool) -> Vec<bool> {
     let mut used = vec![false; p.fns.len()];
-    if !p.fns.iter().any(|f| f.lazy) {
+    if !p.fns.iter().any(is_lazy) {
         return used;
     }
-    let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !p.fns[i].lazy).collect();
+    let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !is_lazy(&p.fns[i])).collect();
+    if check_roots {
+        for (i, f) in p.fns.iter().enumerate() {
+            if f.symbol == "std.gc.rootck_mark" {
+                used[i] = true;
+                work.push(i);
+            }
+        }
+    }
     while let Some(i) = work.pop() {
         let Some(body) = &p.fns[i].body else { continue };
         crate::tirwalk::for_each_expr(body, &mut |e| {
             if let TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) = &e.kind {
                 let id = *id as usize;
-                if p.fns[id].lazy && !used[id] {
+                if is_lazy(&p.fns[id]) && !used[id] {
                     used[id] = true;
                     work.push(id);
                 }
