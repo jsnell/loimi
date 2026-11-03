@@ -602,7 +602,7 @@ machinery. Only the cycle logic and barriers differ.
 
 | Feature | How to enable | What it does |
 |---|---|---|
-| **Stress** | `HeapConfig.stress = true` or `LOIMI_GC_STRESS=1` | collect at every refill; with `stress_every_alloc`, at every allocation (slow) |
+| **Stress** | `HeapConfig.stress = true` (as built: `heap.set_stress(true)`; there is no environment variable) | collect at every refill; with `stress_every_alloc`, at every allocation (slow) |
 | **Verify** | `HeapConfig.verify = .before_and_after` | after marking, check that every pointer in every marked object refers to a marked, valid object of a known type. Catches missing roots and missing barriers |
 | **Poison** | debug builds | freed cells are filled with `0xDEAD...`; use-after-free shows up as an obviously invalid value |
 | **Snapshot** | `heap.snapshot(writer)` | writes the object graph (nodes, edges, sizes, type names) as JSON in a Chrome-heap-snapshot-compatible subset, for finding leaks |
