@@ -1510,9 +1510,16 @@ pub fn rootck_mark(h: *Heap, p: *u8) {
     mark_ptr(h, p);
 }
 
+/// `alloc` for `new` in `--gc-check-roots` builds.
+pub fn rootck_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    rootck_install(h);
+    alloc(h, size, tid, n)
+}
+
 /// 0 if `p` is the start of an allocated object of `h`, else why not.
 pub fn rootck_check(h: *Heap, p: *u8) -> u64 {
     let a = p as u64;
+    if a == 0x0101010101010101 { return 7; }
     if (a & 15) != 0 { return 1; }
     for si in 0..h.segments.len {
         let seg = h.segments.ptr[si] as u64;
@@ -1551,6 +1558,8 @@ pub fn rootck_fail(h: *Heap, p: *u8, why: u64) {
         "not the start of an object"
     } else if why == 5 {
         "a freed object"
+    } else if why == 7 {
+        "0x01 bytes: an unassigned slot, or read from a freed object"
     } else {
         "chunk table mismatch"
     });

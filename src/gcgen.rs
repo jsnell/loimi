@@ -421,7 +421,10 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
         _ => ("0".to_string(), size.to_string()),
     };
     let tid = s.object.unwrap();
-    let obj = g.inst(format!("call ptr @\"std.gc.alloc\"(ptr {}, i64 {}, i32 {}, i64 {})", h, total, tid, n));
+    // `--gc-check-roots`: `rootck_alloc` installs the sweeper that
+    // poisons freed objects before the heap's first collection.
+    let alloc = if check_roots(g) { "std.gc.rootck_alloc" } else { "std.gc.alloc" };
+    let obj = g.inst(format!("call ptr @\"{}\"(ptr {}, i64 {}, i32 {}, i64 {})", alloc, h, total, tid, n));
     if !s.fields.is_empty() {
         let lt = llty(p, &init.ty);
         g.emit(format!("store {} {}, ptr {}", lt, v, obj));

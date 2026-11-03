@@ -2490,7 +2490,7 @@ fn lazy_used(p: &Program, check_roots: bool) -> Vec<bool> {
     let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !is_lazy(&p.fns[i])).collect();
     if check_roots {
         for (i, f) in p.fns.iter().enumerate() {
-            if f.symbol == "std.gc.rootck_mark" {
+            if f.symbol == "std.gc.rootck_mark" || f.symbol == "std.gc.rootck_alloc" {
                 used[i] = true;
                 work.push(i);
             }
