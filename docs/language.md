@@ -8,6 +8,50 @@ Features described here that do not exist are marked **Not built:**
 where they appear; [`status.md`](status.md) lists every difference
 between this design and the compiler.
 
+**Contents**
+
+- [0. Principles](#0-principles)
+- [1. Core language](#1-core-language):
+  [1.1 Types](#11-types) (including `iN`/`uN`),
+  [1.2 Basics](#12-basics) ([bindings and loops](#bindings-loops-and-types),
+  [patterns](#patterns-literals-and-match),
+  [warnings and attributes](#warnings-attributes-and-tests),
+  [generics and traits](#generics-and-traits),
+  [closures](#closures), [operators and arithmetic](#errors-operators-and-arithmetic)),
+  [1.3 Memory](#13-memory) (allocators, pointers, unaligned access, atomics),
+  [1.4 Compile-time evaluation](#14-compile-time-evaluation) (`#[cfg]`, `inline for`),
+  [1.5 Modules and interop](#15-modules-and-interop)
+- [2. `value` types](#2-value-types-declared-representations):
+  `nanbox`/`lowtag`/`boxed`, payload widths, `--explain-values` and `block N` pins
+- [3. The `vm` declaration](#3-the-vm-declaration):
+  [3.1 `state` and `context`](#31-state-and-context),
+  [3.2 Operand kinds](#32-operand-kinds),
+  [3.3 Encodings and formats](#33-encodings-and-formats) (the generated API),
+  [3.4 Ops and control words](#34-ops-and-control-words),
+  [3.4a Stack effects](#34a-stack-effects-stack-vms),
+  [3.5 VM functions](#35-vm-functions) (`next_pc`, `then_next_pc`),
+  [3.6 Entries and the error path](#36-entries-and-the-error-path),
+  [3.7 Dispatch strategies](#37-dispatch-strategies)
+- [4. Slow paths: `cold` blocks](#4-slow-paths-cold-blocks)
+- [5. Effects and sync points](#5-effects-and-sync-points):
+  [5.1 `reenter` and the cached state](#51-reenter-and-the-cached-state),
+  [5.2 Effects on function types](#52-effects-on-function-types)
+- [6. Verification](#6-verification-unchecked-by-proof): errors,
+  `#[require_verified]`, resume points (`Vm.Resume`), verified code in
+  objects, side tables, mutation
+- [7. Specialization](#7-specialization-quickening-inline-caches-superinstructions):
+  [7.1 Inline caches](#71-inline-caches),
+  [7.1a The following instruction: `then`](#71a-the-following-instruction-then),
+  [7.2 Families and `become`](#72-families-and-become),
+  [7.3 Superinstructions](#73-superinstructions) (`#[forward]`, `--vm-stats`),
+  [7.4 Accumulators](#74-accumulators)
+- [8. GC integration](#8-gc-integration) (objects, trace hooks, barriers, rooting of traced state)
+- [9. Instrumentation variants](#9-instrumentation-variants)
+- [10. Calls, reentrancy, coroutines, embedding](#10-calls-reentrancy-coroutines-embedding):
+  [10.1 Embedding in a C host](#101-embedding-in-a-c-host-implemented)
+  (header, panics, threads, re-entry)
+- [11. What Loimi deliberately leaves out](#11-what-loimi-deliberately-leaves-out)
+
 ## 0. Principles
 
 1. **The hot loop is the product.** A feature earns its place by improving the
@@ -76,6 +120,8 @@ struct Span { start: u32, end: u32 }
 enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
 ```
 
+#### Bindings, loops and types
+
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
 - Module-level `var NAME: T = init;` declares a global. `init` must be a
   constant expression (literals, consts, `[x; N]`, aggregate and enum
@@ -136,6 +182,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   and their parameters take no bounds: the bounds of the aliased type
   are checked where it is instantiated. Aliases are imported like other
   items (`import m.{Name}`, `m.Name`).
+#### Patterns, literals and `match`
+
 - `match` is exhaustive. `if let`, `let ... else`, and `while let` are supported.
 - **Integer patterns** are literals (`0x45`, `-1`, `'a'`) and inclusive
   ranges (`0x28..=0x3E`, `'a'..='z'`); a pattern outside the
@@ -229,6 +277,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   to try the later arms, or write `else {}` to say that falling out of the
   `match` is intended. Arms followed only by `_ => {}` do not warn, since
   falling out of the `match` is then the same as trying the rest.
+#### Warnings, attributes and tests
+
 - **Warnings** are named (`warning[match_fallout]: ..`). `#[allow(name)]`
   silences one on a match arm, an item (function, `vm`, ...) or a vm item
   (`op`, `family`, vm function, entry), covering everything inside it;
@@ -276,6 +326,8 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   others pass on its own caller's location instead, so an assertion
   helper reports the line of the test that called it. Calls of other
   functions pay nothing.
+#### Generics and traits
+
 - Generics are monomorphized. Interfaces (`trait`-like) use static dispatch only.
 - **Traits** state what a generic parameter needs:
 
@@ -385,6 +437,8 @@ fn main() { Sym { id: 5 }.show_line(); }
   are checked first, and then the known parts (here `T`) are enough if
   they determine the function's type arguments, as in `apply(double, 21)`
   with `fn double<N>(x: N) -> N`.
+#### Closures
+
 - **Closures** (`block fn`, non-escaping):
 
   <!-- snippet: skip signatures and calls out of context, bodies elided -->
@@ -626,6 +680,8 @@ fn main() { Sym { id: 5 }.show_line(); }
   struct; a call loads the code (from the pair, or the object's first
   word) and passes the environment first. See
   `design/closures-traits.md`, "Escaping closures".
+#### Errors, operators and arithmetic
+
 - `defer stmt` runs `stmt` when the enclosing scope exits.
 - Error handling uses `Result` and `?`. There are no host-level exceptions or unwinding.
 - **Operators**, from the tightest binding to the loosest:
@@ -662,9 +718,11 @@ fn main() { Sym { id: 5 }.show_line(); }
   as a method; `std.num.add_overflow(a, b)` is a function over `i64`.
   Other built-in methods: `clz`, `ctz`, `popcount` on integers,
   `mul_wide` and `div_wide` on `u64` (128-bit product and quotient, for
-  multi-word arithmetic); `sqrt`,
-  `floor`, `to_bits` and `f64.from_bits(u)` on floats (the list is in
-  `stdlib.md`, `std.core`).
+  multi-word arithmetic); on floats `sqrt`, `abs`, `floor`, `ceil`,
+  `trunc`, `nearest`, `copysign`, `is_nan`, `min`/`max` (C's `fmin`) and
+  `minimum`/`maximum` (IEEE 754-2019), and `to_bits` and
+  `f64.from_bits(u)` (`f32` too; the list and their exact semantics are
+  in `stdlib.md`, `std.core`).
   In constant expressions (`const`s, array lengths, global initializers),
   overflow of `+ - *`, unary `-` and `/` is a compile error in all builds.
 - **Shifts.** `a << n` and `a >> n` have the type of `a`; `>>` is
@@ -1694,6 +1752,9 @@ code. `on raise` is an ordinary handler: it receives the live state, so the
 An entry declared `entry call(..) -> R uses reenter` is a *nested
 entry*: it starts a run above the frames of a run that is already
 active, for host code (a native) that calls guest code. See section 10.
+An entry may also continue in the middle of verified code, at a resume
+point (`Vm.Resume`, saved with `next_resume`; section 6, "Resume
+points").
 An entry whose vm code may collect declares `uses gc`
 (`entry run(..) -> R uses gc`), which its callers then need too
 (section 5, "Effects on function types").
@@ -1720,7 +1781,10 @@ the loop is short (as in a call op zeroing the callee's locals). Shared
 copies of `-> never` vm functions (cold call sites) and ordinary
 functions keep the usual behavior. The dispatch table pointer can be a state register (needed for
 instrumentation variants, section 9) or a global constant (saves a register);
-by default the compiler uses a register only if the vm declares variants.
+by default the compiler uses a register only if the vm declares variants,
+and in tail-call mode on AArch64, where a global's address would take
+`adrp` and `add` in every handler (`lowering.md` §3, "The dispatch
+table's address").
 
 ---
 
@@ -1790,6 +1854,10 @@ example interpreters (the others also make other calls), so it was not
 kept. A `cold` block is also an expression:
 `let ok = match (a, b) { ..., _ => cold { compare_slow(ctx, a, b)? } };`
 
+To see which slow paths actually run, `loimi build --vm-stats` counts
+the entries into each `cold` block, per op, with its source location
+(section 7.3).
+
 ---
 
 ## 5. Effects and sync points
@@ -1849,7 +1917,7 @@ Rules:
   writes `pc` to memory. Saving `pc` on every instruction would add a store per
   dispatch.
 
-### `reenter` and the cached state
+### 5.1 `reenter` and the cached state
 
 A call with `reenter` may run guest code on the same VM stack, nested
 above the calling frame (section 10). Rooting traced locals, as for `gc`,
@@ -1909,7 +1977,7 @@ reload { fp = ctx.fp; regs = ctx.stack + fp.base; k = fp.k; }   // after: recomp
   slots) are read before any call can re-enter, so nested runs do not
   clobber them.
 
-### Effects on function types
+### 5.2 Effects on function types
 
 A function type carries effects with the same syntax as a declaration:
 
@@ -2762,6 +2830,12 @@ enough to make it precise and cheap:
   variable, is retired: `#[allow(state_root)]` is still accepted and does
   nothing. Code that stored the variable in `sync` and marked it in a
   scanner keeps working; the store and the mark can go.
+
+  To find rooting mistakes in a program's own code (a reference kept
+  in a raw pointer across a call that collects, a scanner that misses
+  one), build with `--gc-check-roots`: the collector then checks every
+  reference it is handed and fills freed objects with a pattern
+  ([`stdlib/gc.md`](stdlib/gc.md#checking-roots---gc-check-roots)).
 - **Moving is opt-in.** The default `MarkSweep` is non-moving and
   size-segregated, which keeps interior pointers into the stack and objects
   stable across handlers. A moving policy makes the compiler reload spilled
@@ -2828,7 +2902,8 @@ no second copy of the interpreter to maintain. This is how debuggers, profilers,
 coverage, and `sys.settrace`-style hooks are implemented.
 
 `loimi build --vm-stats` does not need a variant: it compiles op and
-op-pair counters into the handlers and prints them at exit. The
+op-pair counters, and a counter per `cold` block, into the handlers and
+prints them at exit (section 7.3). The
 program can read them too (`std.prof.op_counts`).
 
 ---
