@@ -16,7 +16,7 @@ representation in the GC heap. The supported subset is in
 | Files (lines) | `term.lm` 157 (terms, atoms, functors), `machine.lm` 405 (stacks, trail, unify, compare, copy, root scanner), `vm.lm` 579 (the WAM), `compile.lm` 1325 (clauses to WAM code, register allocation, indexing, call/N), `builtins.lm` 1245, `arith.lm` 365 (with big integers), `reader.lm` 730 (tokens, operator precedence parser), `write.lm` 325, `prelude.lm` 223 (library predicates in Prolog), `main.lm` 251, `check.sh` 93; 5,700 in all |
 | Features | ISO core plus the common SWI-Prolog library (SPEC.md): WAM compilation with first-argument indexing, last-call optimization, argument-register allocation, inline arithmetic and type tests, unbounded integers on `std.bigint`, `catch/throw` with ISO error terms, cut through `;`/`->`, soft-cut, DCG, assert/retract with the logical update view, findall/bagof/setof, `format/2`, `op/3` |
 | Tests | 11 programs in `tests/` (control, exceptions, terms, arith, bigint, write, atoms, database, lists, gc, basics), each printing exactly SWI-Prolog 10's output. `check.sh` runs them in the three dispatch modes, each normally, under GC stress and in GC verify mode (generational heap, stress, barrier verification), plus a `--gc-check-roots` build under stress: 110 runs, all pass. `cargo test` runs the quick form (`prolog_programs` in tests/golden.rs, 13 s) |
-| Benchmarks | All 30 van Roy / Aquarius programs of SWI-Prolog's bench suite (bench/prolog): 0.81x SWI-Prolog's time and 0.20x Trealla's, geometric means (table below) |
+| Benchmarks | All 30 van Roy / Aquarius programs of SWI-Prolog's bench suite (bench/prolog): 0.79x SWI-Prolog's time and 0.19x Trealla's, geometric means (table below) |
 | Time | first doc read 15:32:52; first commit of a working interpreter (reader, compiler, vm, prelude; a first test program) 16:01:17, 28 minutes later; 29 of 30 benchmarks running 16:09:40; all tests passing in every mode 16:24:24; 29 benchmarks at 0.83x SWI-Prolog 16:43; all 30 at 0.81x 16:55 (commit timestamps, same day) |
 
 **Design.** Terms live in the `std.gc` heap (`object Var`, `Struct`,
@@ -188,9 +188,38 @@ so the vm cannot be `#[require_verified]` (every block is still verified
 when built, by `Wam.verify` with the clause's permanent-variable count
 as verify context; the proof is dropped).
 
+A consequence found later: the copy-and-patch JIT (`--jit-stencils`)
+builds, but only registers code made by `Vm.build_verified` (verified code
+in a GC object), so with these raw blocks `LOIMI_JIT=1` compiles nothing.
+Moving clause code into `verified [u32] by Wam` objects would need the
+chain words to point at objects that a collection does not move (true of
+std.gc today) and code reachable from the root scanner.
+
 *Suggested fix.* Emitters/encoders that take cache initial values, and a
 cache field type holding a `Verified<Vm>` (or a verified jump table) so
 indirect jumps can keep the proof.
+
+### 6a. A GC'd term heap pays for sweeping what backtracking would free
+
+*What happened.* With terms in `std.gc`, every structure a failed or
+completed branch built is garbage the collector must sweep; a WAM heap
+would have reset its top on backtracking for free. `LOIMI_GC_STATS=1`
+shows the sweep (eager, proportional to the slots allocated) at 15-21%
+of the run for the allocation-heavy benchmarks whose live data is a few
+KiB (nreverse 169 ms of 0.8 s, derive 120 of 0.69, qsort 97 of 0.62),
+and marking at under 1%. The generational mode (lazy sweeping) was no
+better here (nreverse 1.06x, boyer 0.82x, the rest within noise), and a
+larger growth factor only helps when the live data is large: 400%
+instead of the default 100% made boyer (4.5 MB live) 0.69 of the time
+and is now the default.
+
+*What I did.* Nothing more; it is the price of the design choice
+(justified in the summary).
+
+*Suggested fix.* std.gc: a bump-allocated nursery that is evacuated or
+dropped wholesale (non-moving old space can stay), or an API to free a
+region of recently allocated slots in bulk, which a Prolog could call on
+backtracking past the choicepoint that started the region.
 
 ### 7. Small paper cuts
 
@@ -334,7 +363,9 @@ full table (`bench/prolog/run.py`) at three points.
 | **Optimized, without bigints** | **0.83x SWI-Prolog, 0.20x Trealla** (29 programs) |
 | Inline `=/2` (a new variable on one side is just a register write), type tests, `arg/3`, the cut of auxiliary clauses | 0.92 (ten); unify 0.72, flatten 0.78 |
 | Unbounded integers (perfect runs) | no change elsewhere |
-| **Final** | **0.81x SWI-Prolog, 0.20x Trealla** (all 30) |
+| **All 30, std.gc's default heap growth** | **0.81x SWI-Prolog, 0.20x Trealla** |
+| Heap growth 400% (item 6a) | boyer 0.69, browse 0.93, the rest within noise |
+| **Final** | **0.79x SWI-Prolog, 0.19x Trealla** (all 30) |
 
 What Loimi made hard: item 1 (allocation and barriers in handlers),
 item 5 (no way to describe mixed frames to the GC), item 6 (raw jumps
@@ -352,43 +383,36 @@ Trealla 3.14.46, ours a release build with tail-call dispatch.
 
 | benchmark | K | swipl s | trealla s | loimi s | loimi/swipl | loimi/trealla |
 |---|--:|--:|--:|--:|--:|--:|
-| boyer | 57 | 1.056 | 5.186 | 1.858 | 1.76 | 0.36 |
-| browse | 41 | 1.044 | 6.592 | 0.871 | 0.83 | 0.13 |
-| chat_parser | 160 | 1.049 | 3.784 | 0.963 | 0.92 | 0.25 |
-| crypt | 7900 | 1.034 | 3.838 | 0.584 | 0.56 | 0.15 |
-| derive | 290000 | 1.023 | 2.863 | 0.687 | 0.67 | 0.24 |
-| divide10 | 630000 | 1.040 | 2.828 | 0.784 | 0.75 | 0.28 |
-| eval | 11000 | 0.982 | 2.610 | 0.667 | 0.68 | 0.26 |
-| fast_mu | 29000 | 1.028 | 4.019 | 0.857 | 0.83 | 0.21 |
-| flatten | 48000 | 1.029 | 5.497 | 0.843 | 0.82 | 0.15 |
-| log10 | 1300000 | 1.013 | 3.698 | 0.612 | 0.60 | 0.17 |
-| meta_qsort | 4700 | 1.039 | 5.327 | 0.593 | 0.57 | 0.11 |
-| mu | 30000 | 1.026 | 4.366 | 0.637 | 0.62 | 0.15 |
-| nand | 1100 | 0.983 | 3.795 | 0.765 | 0.78 | 0.20 |
-| nreverse | 83000 | 1.056 | 8.269 | 0.799 | 0.76 | 0.10 |
-| ops8 | 920000 | 1.066 | 3.390 | 0.671 | 0.63 | 0.20 |
-| perfect | 3900 | 1.026 | 5.075 | 0.880 | 0.86 | 0.17 |
-| poly_10 | 510 | 1.023 | 2.691 | 0.912 | 0.89 | 0.34 |
-| prover | 25000 | 1.017 | 3.710 | 0.592 | 0.58 | 0.16 |
-| qsort | 47000 | 1.024 | 6.246 | 0.622 | 0.61 | 0.10 |
-| queens_8 | 560 | 1.004 | 5.524 | 1.064 | 1.06 | 0.19 |
-| query | 11000 | 1.047 | 4.784 | 1.051 | 1.00 | 0.22 |
-| reducer | 640 | 1.020 | 4.761 | 0.966 | 0.95 | 0.20 |
-| sendmore | 410 | 0.990 | 3.565 | 1.167 | 1.18 | 0.33 |
-| serialise | 78000 | 1.006 | 5.359 | 0.697 | 0.69 | 0.13 |
-| sieve | 61 | 1.008 | 2.542 | 1.938 | 1.92 | 0.76 |
-| simple_analyzer | 1500 | 1.006 | 5.052 | 0.848 | 0.84 | 0.17 |
-| tak | 160 | 1.037 | 3.630 | 0.784 | 0.76 | 0.22 |
-| times10 | 670000 | 1.002 | 2.991 | 0.671 | 0.67 | 0.22 |
-| unify | 13000 | 1.006 | 6.676 | 0.901 | 0.90 | 0.14 |
-| zebra | 680 | 1.049 | 3.783 | 0.865 | 0.82 | 0.23 |
-| geomean |  |  |  |  | 0.81 | 0.20 |
+| boyer | 57 | 1.144 | 5.269 | 1.312 | 1.15 | 0.25 |
+| browse | 41 | 1.048 | 6.726 | 0.910 | 0.87 | 0.14 |
+| chat_parser | 160 | 1.102 | 3.833 | 0.952 | 0.86 | 0.25 |
+| crypt | 7900 | 1.028 | 3.897 | 0.568 | 0.55 | 0.15 |
+| derive | 290000 | 1.007 | 2.859 | 0.702 | 0.70 | 0.25 |
+| divide10 | 630000 | 1.016 | 2.835 | 0.787 | 0.77 | 0.28 |
+| eval | 11000 | 0.990 | 2.611 | 0.683 | 0.69 | 0.26 |
+| fast_mu | 29000 | 1.082 | 4.253 | 0.891 | 0.82 | 0.21 |
+| flatten | 48000 | 1.076 | 5.773 | 0.813 | 0.76 | 0.14 |
+| log10 | 1300000 | 1.065 | 3.881 | 0.654 | 0.61 | 0.17 |
+| meta_qsort | 4700 | 1.083 | 5.490 | 0.633 | 0.58 | 0.12 |
+| mu | 30000 | 1.084 | 4.453 | 0.631 | 0.58 | 0.14 |
+| nand | 1100 | 0.992 | 3.745 | 0.788 | 0.79 | 0.21 |
+| nreverse | 83000 | 1.030 | 8.226 | 0.802 | 0.78 | 0.10 |
+| ops8 | 920000 | 1.029 | 3.309 | 0.659 | 0.64 | 0.20 |
+| perfect | 3900 | 1.018 | 5.033 | 0.857 | 0.84 | 0.17 |
+| poly_10 | 510 | 1.033 | 2.830 | 0.990 | 0.96 | 0.35 |
+| prover | 25000 | 1.041 | 3.674 | 0.590 | 0.57 | 0.16 |
+| qsort | 47000 | 1.085 | 6.240 | 0.628 | 0.58 | 0.10 |
+| queens_8 | 560 | 1.023 | 5.609 | 1.085 | 1.06 | 0.19 |
+| query | 11000 | 1.034 | 4.938 | 1.086 | 1.05 | 0.22 |
+| reducer | 640 | 1.040 | 4.916 | 0.994 | 0.96 | 0.20 |
+| sendmore | 410 | 1.033 | 3.491 | 1.139 | 1.10 | 0.33 |
+| serialise | 78000 | 1.081 | 5.387 | 0.721 | 0.67 | 0.13 |
+| sieve | 61 | 1.028 | 2.764 | 2.086 | 2.03 | 0.75 |
+| simple_analyzer | 1500 | 1.038 | 5.040 | 0.884 | 0.85 | 0.18 |
+| tak | 160 | 1.147 | 4.014 | 0.660 | 0.58 | 0.16 |
+| times10 | 670000 | 1.055 | 2.968 | 0.660 | 0.63 | 0.22 |
+| unify | 13000 | 0.989 | 6.611 | 0.927 | 0.94 | 0.14 |
+| zebra | 680 | 1.029 | 3.666 | 0.854 | 0.83 | 0.23 |
+| geomean |  |  |  |  | 0.79 | 0.19 |
 
-Ours is faster than SWI-Prolog on 25 of the 30 and slower on boyer
-(1.76x: functor/3 and many permanent-variable moves per call),
-sieve (1.92x: assert/retract, each `assertz` compiling and verifying a
-clause, each `retract` copying a stored clause term), sendmore (1.18x),
-queens_8 (1.06x) and query (1.00x). Trealla takes 4-10x longer than
-ours on everything but sieve. Earlier points: the baseline (before the
-optimizations above, 29 programs) was 1.04x SWI-Prolog and 0.25x
-Trealla.
+Ours takes less time than SWI-Prolog on 25 of the 30; not on sieve (2.03x), boyer (1.15x), sendmore (1.10x), queens_8 (1.06x), query (1.05x). Boyer does many functor/3 calls and permanent-variable moves per call; sieve is assert/retract (each `assertz` compiles and verifies a clause, each `retract` copies a stored clause term). Trealla takes 3-10x longer than ours on everything but sieve. The baseline (before the optimizations above, 29 programs) was 1.04x SWI-Prolog and 0.25x Trealla.
