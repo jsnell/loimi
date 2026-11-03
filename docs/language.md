@@ -640,7 +640,9 @@ fn main() { Sym { id: 5 }.show_line(); }
   directly to LLVM's `*.with.overflow` intrinsics, which guest integer
   semantics need constantly. **Not built:** `a.add_overflow(b) -> (T, bool)`
   as a method; `std.num.add_overflow(a, b)` is a function over `i64`.
-  Other built-in methods: `clz`, `ctz`, `popcount` on integers; `sqrt`,
+  Other built-in methods: `clz`, `ctz`, `popcount` on integers,
+  `mul_wide` and `div_wide` on `u64` (128-bit product and quotient, for
+  multi-word arithmetic); `sqrt`,
   `floor`, `to_bits` and `f64.from_bits(u)` on floats (the list is in
   `stdlib.md`, `std.core`).
   In constant expressions (`const`s, array lengths, global initializers),
