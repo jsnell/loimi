@@ -78,14 +78,7 @@ pub vm Wam {
 
     op GET_VAR_X(r: xr, a: xr) : RR { r = a; next }
     op GET_VAR_Y(r: yr, a: xr) : RR { r = a; next }
-    op GET_VAL_X(r: xr, a: xr) : RR {
-        if r == a { next }
-        cold { if unify(ctx, r, a) { next } backtrack() }
-    }
-    op GET_VAL_Y(r: yr, a: xr) : RR {
-        if r == a { next }
-        cold { if unify(ctx, r, a) { next } backtrack() }
-    }
+
     // Fast paths make no calls (a call anywhere in a handler gives it a
     // stack frame on every execution, `-W handler_frame`): bindings that
     // need no trail entry and no write barrier store directly, and
@@ -107,6 +100,21 @@ pub vm Wam {
         let c = (n * 8 + 39) >> 4;
         c < 33 and (ctx.heap.free[c] as u64) != 0
     }
+
+    // An unbound variable meeting a non-variable binds in place; anything
+    // else is the general unification.
+    inline for (name, kind) in [("GET_VAL_X", xr), ("GET_VAL_Y", yr)] {
+        op #name(r: kind, a: xr) : RR {
+            if r == a { next }
+            let x = deref(r);
+            let y = deref(a);
+            if x == y { next }
+            if let Ref(v) = x and !is_var(y) and quick_bind(v) { store_bind(v, y); next }
+            if let Ref(v) = y and !is_var(x) and quick_bind(v) { store_bind(v, x); next }
+            cold { if unify(ctx, x, y) { next } backtrack() }
+        }
+    }
+    fn is_var(t: Term) -> bool { match t { Ref(_) => true, _ => false } }
 
     inline for (name, kind, value) in [
         ("GET_ATOM", atom, Term.Atom(c as u32)),
