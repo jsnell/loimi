@@ -1267,6 +1267,56 @@ fn vm_stats_library() {
     assert!(report.contains("== vm stats: Rx ==") && report.contains("== vm stats: R =="), "reports:\n{}", report);
 }
 
+/// Stale pointers into std's containers under `--sanitize=address`
+/// (docs/design/safety.md section 7): each tests/asan program built with
+/// ASan must be reported with its `// expect-stderr:` text (a nonzero
+/// exit), or print its `// expect:` lines and exit 0. Skipped under
+/// `ulimit -v` (ASan reserves terabytes of shadow memory) and when
+/// cross-compiling.
+#[test]
+fn asan_stale_pointers() {
+    if cross() {
+        return;
+    }
+    let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+    if limits.lines().any(|l| l.starts_with("Max address space") && l.split_whitespace().nth(3) != Some("unlimited")) {
+        eprintln!("asan_stale_pointers: skipped under an address-space limit (ulimit -v)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("loimi-asan-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut failures = Vec::new();
+    for f in files("tests/asan") {
+        let text = std::fs::read_to_string(&f).unwrap();
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let exe = dir.join(name.trim_end_matches(".lm"));
+        let out = loimi().arg("build").arg(&f).args(["--sanitize=address", "-o"]).arg(&exe).output().unwrap();
+        if !out.status.success() {
+            failures.push(format!("{}: build failed:\n{}", name, String::from_utf8_lossy(&out.stderr)));
+            continue;
+        }
+        let mut c = Command::new("sh");
+        c.arg("-c").arg("ulimit -c 0 && exec \"$0\"").arg(&exe);
+        let out = c.env("ASAN_OPTIONS", "hard_rss_limit_mb=2000:detect_leaks=0").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let want_err = directives(&text, "expect-stderr");
+        if want_err.is_empty() {
+            let expect = directives(&text, "expect");
+            if !out.status.success() || stdout.lines().collect::<Vec<_>>() != expect.iter().map(|s| s.as_str()).collect::<Vec<_>>() {
+                failures.push(format!("{}: exit {:?}, stdout:\n{}\nstderr:\n{}", name, out.status.code(), stdout, stderr));
+            }
+        } else if out.status.success() || !want_err.iter().all(|w| stderr.contains(w.as_str())) {
+            failures.push(format!("{}: expected an ASan report with {:?}; exit {:?}, stderr:\n{}", name, want_err, out.status.code(), stderr));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
 /// `--sanitize=address` with `--lib` and `--shared`: the library carries
 /// the instrumentation, the host links ASan's runtime (gcc's libasan,
 /// as `loimi build --sanitize=address` does for executables). Caught

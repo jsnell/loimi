@@ -12,6 +12,36 @@ extern "C" fn memchr(p: *u8, c: i32, n: u64) -> ?*u8;
 extern "C" fn memrchr(p: *u8, c: i32, n: u64) -> ?*u8;
 extern "C" fn memmem(h: *u8, hn: u64, n: *u8, nn: u64) -> ?*u8;
 
+// Stale-pointer detection in ASan builds (`--sanitize=address` sets
+// `#[cfg(sanitize_address)]`; docs/design/safety.md section 7). ASan
+// already reports a use of memory that was freed, and so of a buffer a
+// `Vec` or map grew out of (its `realloc` always moves). What it cannot
+// see is memory a container keeps but no longer uses: a `Vec`'s spare
+// capacity after `pop`, `truncate` or `clear`, the unused tail of an
+// arena chunk. std poisons that memory, so a pointer or slice still
+// pointing there is reported ("use-after-poison") instead of reading a
+// stale value or aliasing a later push. Other builds drop all of it at
+// parse time: their IR does not change.
+#[cfg(sanitize_address)]
+extern "C" fn __asan_poison_memory_region(p: *u8, n: u64);
+#[cfg(sanitize_address)]
+extern "C" fn __asan_unpoison_memory_region(p: *u8, n: u64);
+
+/// ASan builds: make the `n` values at `p` unaddressable until
+/// `unpoison`ed (code that hands out memory it keeps, like `Vec`).
+#[cfg(sanitize_address)]
+#[raw]
+pub fn poison<T>(p: *T, n: u64) {
+    if n != 0 and size_of<T>() != 0 { __asan_poison_memory_region(p as *u8, n * size_of<T>()); }
+}
+
+/// ASan builds: make the `n` values at `p` addressable again.
+#[cfg(sanitize_address)]
+#[raw]
+pub fn unpoison<T>(p: *T, n: u64) {
+    if n != 0 and size_of<T>() != 0 { __asan_unpoison_memory_region(p as *u8, n * size_of<T>()); }
+}
+
 /// What the pointer of an empty `Vec` (capacity 0) points to: never read,
 /// written or freed. `release` and `grow` know it, so code that takes
 /// ownership of `v.ptr` (`mem.release(v.items().ptr)`) works for an
@@ -78,6 +108,12 @@ pub fn Vec<T>.new() -> Vec<T> { Vec { ptr: empty_ptr(), len: 0, cap: 0 } }
 
 pub fn Vec<T>.with_capacity(n: u64) -> Vec<T> {
     if n == 0 { return Vec.new(); }
+    #[cfg(sanitize_address)]
+    {
+        let v: Vec<T> = Vec { ptr: alloc(n), len: 0, cap: n };
+        poison(v.ptr, n);
+        return v;
+    }
     Vec { ptr: alloc(n), len: 0, cap: n }
 }
 
@@ -87,10 +123,14 @@ pub fn Vec<T>.reserve(v: *Vec<T>, extra: u64) {
     if c < v.len + extra { c = v.len + extra; }
     v.ptr = grow(v.ptr, c);
     v.cap = c;
+    #[cfg(sanitize_address)]
+    poison(v.ptr + v.len, c - v.len);
 }
 
 pub fn Vec<T>.push(v: *Vec<T>, x: T) {
     if v.len == v.cap { v.grow_one(); }
+    #[cfg(sanitize_address)]
+    unpoison(v.ptr + v.len, 1);
     v.ptr[v.len] = x;
     v.len += 1;
 }
@@ -100,11 +140,19 @@ pub fn Vec<T>.push(v: *Vec<T>, x: T) {
 fn Vec<T>.grow_one(v: *Vec<T>) {
     v.cap = if v.cap == 0 { 4 } else { v.cap * 2 };
     v.ptr = grow(v.ptr, v.cap);
+    #[cfg(sanitize_address)]
+    poison(v.ptr + v.len, v.cap - v.len);
 }
 
 pub fn Vec<T>.pop(v: *Vec<T>) -> ?T {
     if v.len == 0 { return None; }
     v.len -= 1;
+    #[cfg(sanitize_address)]
+    {
+        let x = v.ptr[v.len];
+        poison(v.ptr + v.len, 1);
+        return Some(x);
+    }
     Some(v.ptr[v.len])
 }
 
@@ -132,6 +180,8 @@ pub fn Vec<T>.set(v: *Vec<T>, i: u64, x: T) {
 pub fn Vec<T>.extend(v: *Vec<T>, s: []T) {
     var src = s.ptr;
     if v.len + s.len > v.cap { src = v.grow_for(s); }
+    #[cfg(sanitize_address)]
+    unpoison(v.ptr + v.len, s.len);
     memcpy((v.ptr + v.len) as *u8, src as *u8, s.len * size_of<T>());
     v.len += s.len;
 }
@@ -151,6 +201,8 @@ fn Vec<T>.grow_for(v: *Vec<T>, s: []T) -> *T {
 /// A `Vec` of `n` copies of `x`.
 pub fn Vec<T>.filled(n: u64, x: T) -> Vec<T> {
     var v: Vec<T> = Vec.with_capacity(n);
+    #[cfg(sanitize_address)]
+    unpoison(v.ptr, n);
     for i in 0..n { v.ptr[i] = x; }
     v.len = n;
     v
@@ -163,10 +215,18 @@ pub fn Vec<T>.last(v: *Vec<T>) -> ?T {
 pub fn Vec<T>.items(v: *Vec<T>) -> []T { v.ptr.slice(v.len) }
 
 pub fn Vec<T>.truncate(v: *Vec<T>, n: u64) {
-    if n < v.len { v.len = n; }
+    if n < v.len {
+        #[cfg(sanitize_address)]
+        poison(v.ptr + n, v.len - n);
+        v.len = n;
+    }
 }
 
-pub fn Vec<T>.clear(v: *Vec<T>) { v.len = 0; }
+pub fn Vec<T>.clear(v: *Vec<T>) {
+    #[cfg(sanitize_address)]
+    poison(v.ptr, v.len);
+    v.len = 0;
+}
 
 /// Free the elements' memory. The `Vec` is then empty, and can be used
 /// (or freed) again.
@@ -387,6 +447,12 @@ pub fn equal_bytes(a: []u8, b: []u8) -> bool {
 pub struct Arena { chunk: *u8, used: u64, size: u64, chunks: Vec<*u8> }
 
 pub fn Arena.new() -> Arena {
+    #[cfg(sanitize_address)]
+    {
+        let a = Arena { chunk: malloc(65536), used: 0, size: 65536, chunks: Vec.new() };
+        poison(a.chunk, 65536);
+        return a;
+    }
     Arena { chunk: malloc(65536), used: 0, size: 65536, chunks: Vec.new() }
 }
 
@@ -399,8 +465,12 @@ pub fn Arena.alloc_bytes(a: *Arena, n: u64, align: u64) -> *u8 {
         a.chunk = malloc(sz);
         a.size = sz;
         off = 0;
+        #[cfg(sanitize_address)]
+        poison(a.chunk, sz);
     }
     a.used = off + n;
+    #[cfg(sanitize_address)]
+    unpoison(a.chunk + off, n);
     a.chunk + off
 }
 
@@ -411,10 +481,21 @@ pub fn Arena.str(a: *Arena, s: str) -> str {
     p.slice(s.len)
 }
 
+/// Free every allocation. The arena is then empty, and can be used (or
+/// freed) again: its next allocation starts a new chunk.
 pub fn Arena.free(a: *Arena) {
-    for i in 0..a.chunks.len { free(a.chunks.at(i)); }
-    free(a.chunk);
+    let none = empty_ptr<u8>();
+    for i in 0..a.chunks.len {
+        let c = a.chunks.at(i);
+        if c != none { free(c); }
+    }
+    if a.chunk != none { free(a.chunk); }
     a.chunks.free();
+    // No chunk: the next `alloc_bytes` takes its slow path, which keeps
+    // this sentinel in `chunks` (skipped above) and mallocs a chunk.
+    a.chunk = none;
+    a.used = 0;
+    a.size = 0;
 }
 
 /// Arena memory is freed all at once (`free`): giving back one

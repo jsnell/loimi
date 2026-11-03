@@ -1,0 +1,11 @@
+// expect-stderr: heap-use-after-free
+// A value from an arena used after `Arena.free`.
+import std.io;
+import std.mem;
+
+fn main() {
+    var a = mem.Arena.new();
+    let p = new(&a, 42 as i64);
+    a.free();
+    io.print_int(*p);
+}

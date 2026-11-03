@@ -603,6 +603,8 @@ fn log_obj(obj: *u8) {
     let rs = head_of(obj).rs;
     let n = rs.objs.len;
     if n < rs.objs.cap {
+        #[cfg(sanitize_address)]
+        mem.unpoison(rs.objs.ptr + n, 1);
         rs.objs.ptr[n] = obj;
         rs.objs.len = n + 1;
         hd.flags = f | INRS;

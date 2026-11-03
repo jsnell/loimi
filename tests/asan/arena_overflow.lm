@@ -1,0 +1,10 @@
+// expect-stderr: use-after-poison
+// Reading past an arena allocation into the chunk's unused tail.
+import std.io;
+import std.mem;
+
+fn main() {
+    var a = mem.Arena.new();
+    let p = unsafe { a.alloc_bytes(4, 1) };
+    io.print_int(unsafe { p[6] } as i64);
+}

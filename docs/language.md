@@ -948,10 +948,15 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   error: `p[i]`, `p[a..b]`, `p + n`, `p.offset(n)`, `p.slice(n)`, casts
   to a pointer (from an integer, another pointer type, a function or a
   `Gc`) and from an integer to an `enum` or `value` type, reading a
-  slice's `.ptr` or a raw-pointer field of another module's struct,
-  writing any field of another module's struct that has raw-pointer
-  fields (`v.len = 0`; their module's invariants), building one with a
-  literal, `..zero` making a null `*T`, `assume` and `unreachable`, and
+  slice's `.ptr` or a raw-pointer field of another module's struct (a
+  field holding a `*T` directly or in a tuple, array, option or function
+  type), writing any field of another module's struct that has
+  raw-pointer fields, directly or through its struct fields (`v.len = 0`;
+  their module's invariants), building one with a literal, binding a
+  pointer payload of another module's enum or `value` type in a pattern
+  or building such a variant, `..zero` or a `var` without initializer
+  making a null `*T`, `new(&a, v)` with an allocator whose `alloc_bytes`
+  is not `#[raw]`, `assume` and `unreachable`, and
   calls of `extern` functions and of functions marked **`#[raw]`**. A
   function is marked `#[raw]` when it is unsound for some arguments that
   are pointers to one value each: it takes a pointer and a length
@@ -959,9 +964,14 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   that is not one valid value (`mem.alloc<T>(n)`). `#[raw]` changes
   nothing in modules without `#![safe]`. Vm code is exempt (its operand
   accesses rest on the verifier, section 6), as is code generated from
-  a `vm` declaration. *Lifetimes are not checked*: a pointer or slice into
+  a `vm` declaration; so a `#![safe]` module cannot declare a `vm`.
+  *Lifetimes are not checked*: a pointer or slice into
   a `Vec` or map dangles once it grows or is freed, and `&local` may
-  outlive its function. `std.lex`, `std.parse`, `std.diag`, `std.text`,
+  outlive its function. Built with `--sanitize=address`, std's
+  containers poison the memory they keep but no longer use (a `Vec`'s
+  spare capacity, an arena chunk's unused tail), so ASan reports a
+  stale pointer into it as well as into freed memory; other builds are
+  unchanged. `std.lex`, `std.parse`, `std.diag`, `std.text`,
   `std.hash`, `std.io`, `std.bc` and `std.map` are `#![safe]`; see
   `docs/design/safety.md` for the rule's holes and the cost.
 
@@ -1056,7 +1066,10 @@ initializer in a struct literal, or statement after it only when the
 build was given `--cfg NAME`;
 `#[cfg(not(NAME))]` keeps it only without. The parser drops what is not
 kept, before names are resolved, so a build without the name compiles
-exactly as if the code were not there: the IR does not change. Mini's
+exactly as if the code were not there: the IR does not change.
+`--sanitize=address` and `--sanitize=thread` also set the names
+`sanitize_address` and `sanitize_thread` (std's containers poison
+memory they keep but no longer use under the first). Mini's
 `--cfg gil` (section 10.1, Threads) adds a field to its context and polls
 to its handlers this way:
 

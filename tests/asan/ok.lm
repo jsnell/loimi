@@ -1,0 +1,44 @@
+// expect: 120 49995017
+// Correct use of the poisoned containers: no report.
+import std.io;
+import std.mem;
+import std.map;
+import std.text;
+
+fn main() {
+    var v: mem.Vec<i64> = mem.Vec.with_capacity(3);
+    for i in 0..10 { v.push(i); }
+    v.pop();
+    v.truncate(5);
+    v.push(50);
+    v.extend(v.items());
+    v.sort_by(|a, b| if *a < *b { -1 } else if *a > *b { 1 } else { 0 });
+    var t: i64 = 0;
+    for x in v.items() { t += x; }
+    v.clear();
+    v.push(1);
+    let f: mem.Vec<u8> = mem.Vec.filled(5, 2);
+    var a = mem.Arena.new();
+    var s: i64 = 0;
+    for i in 0..10000 { let p = new(&a, i as i64); s += *p; }
+    let w = a.str("arena");
+    s += w.len as i64;
+    a.free();
+    let q = new(&a, 5 as i64);
+    s += *q;
+    a.free();
+    a.free();
+    var b = text.StrBuf.new();
+    b.push_str("ab");
+    b.push_str(b.as_str());
+    b.clear();
+    b.push_int(t);
+    var m: map.OrderedMap<u64, i64> = map.OrderedMap.new();
+    for i: u64 in 0..100 { m.insert(i, i as i64); }
+    m.clear();
+    m.insert(3, 4);
+    io.print(b.as_str());
+    io.print(" ");
+    io.print_int(s + (v.at(0) + f.at(4) as i64 + m.get(3).unwrap()));
+    io.println("");
+}

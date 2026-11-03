@@ -1,0 +1,12 @@
+// expect-stderr: heap-use-after-free
+// A `HashMap.get_ptr` pointer kept across inserts that grew the table.
+import std.io;
+import std.map;
+
+fn main() {
+    var m: map.HashMap<u64, i64> = map.HashMap.new();
+    m.insert(1, 10);
+    let p = m.get_ptr(1).unwrap();
+    for i: u64 in 2..100 { m.insert(i, 0); }
+    io.print_int(*p);
+}

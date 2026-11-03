@@ -112,7 +112,25 @@ implementation; `git log` has the details.
   ([language.md §1.3](docs/language.md#13-memory),
   [design/safety.md](docs/design/safety.md)). Naming an `#[unsafe]`
   method through `x.m()` or explicit type arguments now needs `unsafe`
-  too (it slipped through before).
+  too (it slipped through before). An adversarial pass closed bypasses
+  ([design/safety.md §3a](docs/design/safety.md)): pointers in another
+  module's tuple, array, option and function-typed fields (`let (p, _) =
+  h.tup`, `gc.Heap.free[0]`), pointer payloads of another module's enums
+  and `value` types (binding and building), writes to structs that hold
+  pointers only through nested structs, `var p: *T;` (zero-initialized,
+  null), `new(&a, v)` with an allocator whose `alloc_bytes` is not
+  `#[raw]` (could return too few bytes), and `vm` declarations (whose
+  handlers are exempt) are rejected in `#![safe]` modules.
+- **Stale pointers into std containers are caught under
+  `--sanitize=address`**, which now also sets `#[cfg(sanitize_address)]`:
+  `Vec` poisons its spare capacity (after `pop`, `truncate`, `clear`,
+  and beyond `len` generally) and `Arena` the unused tail of its chunk,
+  so a pointer or slice kept across them is reported as
+  "use-after-poison" (growth and `free` were already caught as
+  use-after-free). Other builds are unchanged (cfg'd out at parse time)
+  ([design/safety.md §7](docs/design/safety.md)). `Arena.free` now
+  leaves the arena usable (it kept a pointer to its freed chunk, so the
+  next allocation wrote to freed memory).
 - **128-bit vectors**: `i8x16` .. `f64x2` with lane-wise operators,
   masks, lanes, shuffles, swizzles, widening and saturating narrowing,
   saturating and rounding arithmetic, IEEE min/max and lane-wise `as`;

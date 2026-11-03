@@ -387,6 +387,14 @@ pub fn OrderedMap<K, V>.new() -> OrderedMap<K, V> { OrderedMap.with_capacity(0) 
 pub fn OrderedMap<K, V>.with_capacity(n: u64) -> OrderedMap<K, V> {
     let sz = index_size_for<K>(n);
     let cap = usable_for<K>(sz);
+    // ASan builds: the entries past `used` are poisoned (std.mem), so a
+    // pointer kept from `entry`/`next` across `clear` is reported.
+    #[cfg(sanitize_address)]
+    unsafe {
+        let m: OrderedMap<K, V> = OrderedMap { idx: mem.alloc(sz), mask: sz - 1, ents: mem.alloc(cap), used: 0, cap: cap, len: 0, version: 0 };
+        mem.poison(m.ents, cap);
+        return m;
+    }
     // unsafe: zeroed index slots are empty; `cap` entries, none in use.
     unsafe { OrderedMap { idx: mem.alloc(sz), mask: sz - 1, ents: mem.alloc(cap), used: 0, cap: cap, len: 0, version: 0 } }
 }
@@ -403,6 +411,8 @@ fn OrderedMap<K, V>.resize(m: *OrderedMap<K, V>, n: u64) {
         let idx: *u32 = mem.alloc(sz);
         let ents: *Entry<K, V> = mem.alloc(cap);
         m.used = probe_rebuild(idx, sz - 1, ents, m.ents, m.used);
+        #[cfg(sanitize_address)]
+        mem.poison(ents + m.used, cap - m.used);
         if !is_empty_table(m.idx as u64) {
             mem.release(m.idx);
             mem.release(m.ents);
@@ -443,6 +453,8 @@ pub fn OrderedMap<K, V>.insert_new(m: *OrderedMap<K, V>, h: u64, key: K, value: 
     // unsafe: e = used < cap after the resize check, and the index has an empty slot
     // (used <= 2/3 of its slots).
     unsafe {
+        #[cfg(sanitize_address)]
+        mem.unpoison(m.ents + e, 1);
         m.ents[e] = Entry { hash: hs, key: key, value: value };
         probe_put<K>(m.idx, m.mask, hs, e);
     }
@@ -530,6 +542,8 @@ pub fn OrderedMap<K, V>.put_by(m: *OrderedMap<K, V>, h: u64, key: K, value: V, e
         }
         if m.used == m.cap { return (m.insert_new(h, key, value), true); }
         let e = m.used;
+        #[cfg(sanitize_address)]
+        mem.unpoison(m.ents + e, 1);
         m.ents[e] = Entry { hash: hs, key: key, value: value };
         m.idx[r] = (e as u32) + SLOT_BASE;
         m.used = e + 1;
@@ -582,6 +596,9 @@ pub fn OrderedMap<K, V>.clear(m: *OrderedMap<K, V>) {
     if !is_empty_table(m.idx as u64) {
         // unsafe: `idx` holds mask + 1 four-byte slots (zero is empty).
         unsafe { mem.memset(m.idx as *u8, 0, (m.mask + 1) * 4); }
+        // unsafe: `ents` holds `used` entries, dead from here on.
+        #[cfg(sanitize_address)]
+        unsafe { mem.poison(m.ents, m.used); }
     }
     m.used = 0;
     m.len = 0;

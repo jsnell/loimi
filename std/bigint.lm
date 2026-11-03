@@ -1694,9 +1694,23 @@ pub fn BigInt.free(x: *BigInt) {
 }
 
 /// Room for n limbs.
-fn room(n: u64) -> mem.Vec<u64> { mem.Vec.with_capacity(if n == 0 { 1 } else { n }) }
+/// The limbs are written through `v.ptr` and `space` before `len` is set,
+/// so in ASan builds the spare capacity is addressable (std.mem poisons it).
+fn room(n: u64) -> mem.Vec<u64> {
+    #[cfg(sanitize_address)]
+    {
+        let v: mem.Vec<u64> = mem.Vec.with_capacity(if n == 0 { 1 } else { n });
+        mem.unpoison(v.ptr, v.cap);
+        return v;
+    }
+    mem.Vec.with_capacity(if n == 0 { 1 } else { n })
+}
 
-fn space(v: *mem.Vec<u64>) -> []u64 { v.ptr.slice(v.cap) }
+fn space(v: *mem.Vec<u64>) -> []u64 {
+    #[cfg(sanitize_address)]
+    mem.unpoison(v.ptr, v.cap);
+    v.ptr.slice(v.cap)
+}
 
 fn own(v: mem.Vec<u64>, r: Num) -> BigInt {
     var w = v;

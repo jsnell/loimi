@@ -1,0 +1,24 @@
+// `Arena.free` leaves the arena empty and usable: the next allocation
+// starts a new chunk (it used to bump-allocate in the freed chunk), and
+// freeing again frees nothing twice.
+import std.io;
+import std.mem;
+
+struct Pair { a: i64, b: i64 }
+
+fn main() {
+    var a = mem.Arena.new();
+    var s: i64 = 0;
+    for i in 0..20000 {
+        let p = new(&a, Pair { a: i, b: 1 });
+        s += p.a + p.b;
+    }
+    a.free();
+    let p = new(&a, Pair { a: 7, b: 8 });
+    s += p.a + p.b;
+    a.free();
+    a.free();
+    io.print_int(s);
+    io.println("");
+}
+// expect: 200010015

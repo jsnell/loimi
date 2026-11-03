@@ -309,7 +309,18 @@ const SWITCH_LLVM_ARGS: &[&str] = &["-enable-tail-merge=false"];
 fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, Vec<framelint::Site>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
-    parser::set_cfg(&opts.cfg);
+    // `--sanitize=address` also sets `#[cfg(sanitize_address)]`: std's
+    // containers poison the memory they keep but no longer use (a `Vec`'s
+    // spare capacity, an arena's unused chunk tail), so ASan reports a
+    // stale pointer into it (docs/design/safety.md section 7).
+    let mut cfg = opts.cfg.clone();
+    if opts.sanitize_address {
+        cfg.push("sanitize_address".into());
+    }
+    if opts.sanitize_thread {
+        cfg.push("sanitize_thread".into());
+    }
+    parser::set_cfg(&cfg);
     let mut modules = load(sm, input, &mut allows, opts.test)?;
     for (name, span, _) in &allows {
         if !diag::LINTS.contains(&name.as_str()) && !diag::RETIRED.contains(&name.as_str()) {

@@ -1,0 +1,14 @@
+// expect-stderr: use-after-poison
+// An `OrderedMap` entry pointer kept across `clear` (the table is kept,
+// its entries are dead).
+import std.io;
+import std.map;
+
+fn main() {
+    var m: map.OrderedMap<u64, i64> = map.OrderedMap.new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    let p = m.get_ptr(2).unwrap();
+    m.clear();
+    io.print_int(*p);
+}

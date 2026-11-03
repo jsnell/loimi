@@ -2273,6 +2273,8 @@ fn check_reserved_names(items: &[Item]) -> Res<()> {
     let vms: Vec<&str> = items.iter().filter_map(|it| if let Item::Vm(v) = it { Some(v.name.name.as_str()) } else { None }).collect();
     for it in items {
         let name = match it {
+            // C runtime symbols may start with `__` (`__asan_poison_memory_region`).
+            Item::Fn(f) if f.linkage == Linkage::Extern && !f.name.name.starts_with("__extern") => continue,
             Item::Fn(f) if f.recv.is_none() => &f.name,
             Item::Struct(d) => &d.name,
             Item::Enum(d) => &d.name,

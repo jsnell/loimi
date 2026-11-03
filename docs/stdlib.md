@@ -64,7 +64,13 @@ Design rules for the library:
   container's methods leave it valid (`free()` leaves it empty and
   usable); pointers and slices obtained from it (`items()`, `ptr_at`,
   `get_ptr`, `entry`) are valid until it next grows or is freed, which
-  is not checked. See `design/safety.md` for the audit of every module.
+  is not checked at compile time. Under `--sanitize=address`, `Vec`,
+  `Arena` and `OrderedMap` poison the memory they keep but no longer use
+  (`mem.poison(p, n)`/`mem.unpoison(p, n)`, `#[raw]`, defined only in
+  such builds: `#[cfg(sanitize_address)]`), so ASan reports a stale
+  pointer into it as it reports one into freed memory. See
+  `design/safety.md` for the audit of every module and section 7 for
+  the run-time check.
 
 ---
 
@@ -213,7 +219,8 @@ here (`floor_div`, `floor_mod`, `trunc_div`, `trunc_rem`,
   code could change it, sort a copy. Python's `sorted`/`list.sort` use it
   (`examples/python/builtins.lm`).
 - `Arena`: `Arena.new()`, `alloc_bytes(n, align) -> *u8`, `str(s) -> str`
-  (copy a string into the arena), `free()`. 64 KiB chunks; larger requests
+  (copy a string into the arena), `free()` (the arena stays usable:
+  the next allocation starts a new chunk). 64 KiB chunks; larger requests
   get their own chunk. `free_bytes(p)` does nothing (arena memory is
   freed all at once), so `c.free(&arena)` on an escaping closure and code
   generic over the allocator work.

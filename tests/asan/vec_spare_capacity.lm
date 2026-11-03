@@ -1,0 +1,11 @@
+// expect-stderr: use-after-poison
+// Reading a `Vec`'s spare capacity through its raw buffer.
+import std.io;
+import std.mem;
+
+fn main() {
+    var v: mem.Vec<i64> = mem.Vec.with_capacity(8);
+    v.push(1);
+    // Wrong: only v.len values are items.
+    io.print_int(unsafe { v.items().ptr[3] });
+}

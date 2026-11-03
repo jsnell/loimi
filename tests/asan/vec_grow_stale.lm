@@ -1,0 +1,13 @@
+// expect-stderr: heap-use-after-free
+// A pointer into a `Vec` that grew: the old buffer was freed (ASan's
+// realloc always moves).
+import std.io;
+import std.mem;
+
+fn main() {
+    var v: mem.Vec<i64> = mem.Vec.new();
+    v.push(1);
+    let p = v.ptr_at(0);
+    for i in 0..100 { v.push(i); }
+    io.print_int(*p);
+}

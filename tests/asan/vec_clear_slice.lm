@@ -1,0 +1,13 @@
+// expect-stderr: use-after-poison
+// A slice of a `Vec`'s items kept across `clear` (its length is the old
+// one, so the bounds check passes).
+import std.io;
+import std.mem;
+
+fn main() {
+    var v: mem.Vec<u8> = mem.Vec.new();
+    v.extend("hello");
+    let s = v.items();
+    v.clear();
+    io.print_int(s[1] as i64);
+}

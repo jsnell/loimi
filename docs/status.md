@@ -186,7 +186,13 @@ those builds.
   module marked `#![safe]` is checked: there a `*T` is a reference to
   one value, and indexing, arithmetic, pointer casts, other modules'
   buffer pointers and invariant fields, `extern` and `#[raw]` calls need
-  `unsafe { }`; lifetimes are not checked. `std.lex`, `parse`, `diag`, `text`, `hash`,
+  `unsafe { }`; so do reading pointers held in another module's
+  tuple/array/function fields or enum payloads, zero-initialized
+  pointers, `new` with an allocator whose `alloc_bytes` is not `#[raw]`,
+  and declaring a `vm`. Lifetimes are not checked at compile time; under
+  `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
+  longer use, so stale pointers into it are reported at run time.
+  `std.lex`, `parse`, `diag`, `text`, `hash`,
   `io`, `bc` and `map` are safe (`design/safety.md`).
   The example interpreters contain no `unsafe`: float reads of a
   register use `f64.from_bits(a as u64)` (compiled to a `double` load

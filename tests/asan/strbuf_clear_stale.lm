@@ -1,0 +1,12 @@
+// expect-stderr: use-after-poison
+// A `StrBuf`'s text kept across `clear`.
+import std.io;
+import std.text;
+
+fn main() {
+    var b = text.StrBuf.new();
+    b.push_str("stale");
+    let s = b.as_str();
+    b.clear();
+    io.print(s);
+}

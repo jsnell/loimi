@@ -1,0 +1,11 @@
+// expect-stderr: use-after-poison
+// A pointer past the new end of a truncated `Vec`.
+import std.io;
+import std.mem;
+
+fn main() {
+    var v: mem.Vec<u32> = mem.Vec.filled(10, 7);
+    let p = v.ptr_at(8);
+    v.truncate(4);
+    io.print_int(*p as i64);
+}

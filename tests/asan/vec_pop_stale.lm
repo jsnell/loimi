@@ -1,0 +1,15 @@
+// expect-stderr: use-after-poison
+// A pointer to an element that `pop` removed: the slot is spare
+// capacity now, poisoned in ASan builds.
+import std.io;
+import std.mem;
+
+fn main() {
+    var v: mem.Vec<i64> = mem.Vec.new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    let p = v.ptr_at(2);
+    v.pop();
+    io.print_int(*p);
+}

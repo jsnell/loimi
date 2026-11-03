@@ -15,7 +15,10 @@ arithmetic, `p.slice(n)`, casts to pointers, another module's buffer
 pointers, C calls, functions marked `#[raw]`) needs `unsafe { }`. What
 is not checked is *lifetime*: a `*T` or slice obtained from a container
 dangles once the container grows, shrinks or is freed, and nothing
-stops safe code from keeping it (section 2). Eight std modules (`lex`,
+stops safe code from keeping it at compile time (section 2); built with
+`--sanitize=address`, std's containers poison the memory they keep but
+no longer use, so most such uses are reported at run time (section 7).
+Eight std modules (`lex`,
 `parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`) are now safe;
 `dict` is not (section 5). It is a check only: no example's IR changed
 from adding `#![safe]` and `#[raw]`, and the migrations' own IR changes
@@ -121,7 +124,8 @@ unsafe { write(fd, s.ptr, s.len) }
    checker, which Loimi deliberately leaves out (language.md section
    11); index- and callback-based APIs (`Vec.at(i)`, `OrderedMap`
    entry indices with `version`) are the safe alternative where they
-   are cheap.
+   are cheap. Built with `--sanitize=address`, most stale uses are
+   reported at run time (section 7).
 2. **GC references in host memory.** A `Gc<T>` kept somewhere the
    collector does not scan (a `Vec<Gc<T>>` that is not a root) dangles
    after a collection. Unchanged by this work; `gc.Heap` roots and
@@ -373,3 +377,82 @@ changed size. Benchmarks (best of 3 to 5, interleaved): Python within
 of clox, per-benchmark swings flipping sign between runs), Prolog
 within ±3% except `mu` +4.8% (no handler changed: noise). No
 measurable cost.
+
+## 7. Catching dangling pointers at run time (ASan builds)
+
+The lifetime hole (section 2, item 1) cannot be closed at compile time
+without ownership. It can be made *detectable*: a pointer or slice
+into a container should fail loudly once the container has moved,
+shrunk or freed the memory it points to.
+
+**Options considered.**
+
+- *Checked handles.* Containers keep a generation counter, bumped on
+  every reallocation, `clear` and `free`; in debug builds `Vec.items`,
+  `ptr_at`, `get_ptr`, `entry`, ... return (pointer, container,
+  generation) and every dereference compares generations. Rejected:
+  `*T` and `[]T` are plain machine values everywhere (struct fields,
+  `vm` state, C interop), so the check would need a second pointer
+  representation that exists only in debug builds, a container pointer
+  that itself dangles when the container is moved or freed, and a
+  validation at every `*p` and `s[i]` in all code, not just std's.
+  Debug and release builds would no longer run the same code.
+- *Pattern-filling* freed and abandoned memory in debug builds (fill
+  the old buffer with `0xdd` before `free`, force growth to move). Cheap
+  and needs no tool, but a stale read gives garbage, not a report, and
+  `malloc` hands the filled block out again soon, so the garbage is
+  often valid data.
+- *AddressSanitizer poisoning* (picked). `--sanitize=address` already
+  reports use of freed memory precisely, with the stacks of the use, the
+  free and the allocation, and it already covers most of the hole: a
+  `Vec` or map that grows calls `realloc`, which under ASan always
+  moves and frees (quarantines) the old buffer; `Vec.free`, map `free`
+  and `Arena.free` call `free`. What ASan cannot see is memory a
+  container *keeps* but no longer uses. ASan's manual poisoning API
+  (`__asan_poison_memory_region`, `__asan_unpoison_memory_region`) marks
+  that memory, so a stale access is reported as `use-after-poison`.
+  The cost is confined to ASan builds: the calls are statements under
+  `#[cfg(sanitize_address)]`, which `--sanitize=address` now sets, and
+  the parser drops them in every other build.
+
+**What std poisons** (`std.mem.poison`/`unpoison`, `#[raw]`, ASan
+builds only):
+
+| container | poisoned | caught stale use |
+|---|---|---|
+| `mem.Vec` (so `text.StrBuf`, `diag.SourceMap`, `diag.Diagnostics`, every `Vec`-backed table) | the spare capacity `[len, cap)`: on `with_capacity`, after growth, on `pop`, `truncate`, `clear`; `push`, `extend` and `filled` unpoison what they write | `ptr_at(i)`/`last` pointers and `items()` slices kept across `pop`, `truncate`, `clear`; reads of spare capacity through the raw buffer |
+| `mem.Arena` | each chunk when it is allocated; `alloc_bytes` unpoisons what it hands out | reads and writes past an arena allocation (into the unused tail or alignment padding) |
+| `map.OrderedMap` | entries `[used, cap)`: on creation, after `resize`, on `clear` | `entry`, `get_ptr`, `next` pointers kept across `clear` |
+| freed memory (ASan itself) | — | anything kept across growth (`Vec`, `HashMap`, `OrderedMap`, `StrBuf`), `free` of any of them, `Arena.free` |
+
+Not covered: a `HashMap` slot pointer kept across `remove` or `clear`
+(the slots stay in the table, and probing reads them), an `OrderedMap`
+entry kept across `remove_at` (dead entries stay below `used` until the
+next resize), objects in the GC heap (hole 2: `--gc-check-roots` is the
+tool there), and anything in an interpreter's own allocators.
+
+Code outside `std.mem` that writes a `Vec`'s spare capacity before
+raising `len` must unpoison it: `std.bigint` (limbs written through
+`space(v)` and `room(n)`) and the collector's remembered set
+(`rs.objs.ptr[n] = obj`) do, under the same `cfg`.
+
+**Bugs found.** `Arena.free` released its chunks but kept the current
+chunk's pointer, offset and size, so the next `alloc_bytes` on the same
+arena wrote into freed memory, and a second `free` freed it twice
+(`tests/run/arena_free_reuse.lm`; the rule "a container's methods leave
+it valid" now holds for arenas too: the next allocation starts a new
+chunk). The change is the only one in release IR: `Arena.free` gained
+two compares (no hot path calls it). No example interpreter tripped a
+poisoned access or freed memory: every test program of Python (14,
+plus the 11 benchmark programs), Prolog (11), Scheme (26), Lox (6),
+MiniJS (66, with its conformance tests), Stak (13), Mini (46) and the
+Wasm C tests (2), built with `--sanitize=address` as debug builds, and
+Python, Prolog, Scheme, MiniJS and Mini again as release builds, normally
+and with `--gc-stress` (about 600 runs), printed the expected output with
+no report.
+
+**Tests.** `tests/asan/*.lm` (run by `asan_stale_pointers` in
+`tests/golden.rs`, without `ulimit -v`, which ASan cannot run under):
+one program per row above that must be reported, and one that uses
+every poisoned container correctly and must run clean. Release IR of
+every example is unchanged apart from `Arena.free`.
