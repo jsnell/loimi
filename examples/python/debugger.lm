@@ -138,7 +138,18 @@ pub fn finish_proto(c: *u8, p: *Proto) {
             let b = bs.at(i);
             b.binds.free();
             b.open.free();
-            d.push(ProtoInfo { proto: p as u64, vars: b.vars });
+            // In register order (parameters first), free variables last.
+            var vars = b.vars;
+            for j in 1..vars.len {
+                var k = j;
+                while k > 0 and order(vars.at(k)) < order(vars.at(k - 1)) {
+                    let t = vars.at(k);
+                    vars.set(k, vars.at(k - 1));
+                    vars.set(k - 1, t);
+                    k -= 1;
+                }
+            }
+            d.push(ProtoInfo { proto: p as u64, vars: vars });
             for j in i + 1..bs.len { bs.set(j - 1, bs.at(j)); }
             bs.truncate(bs.len - 1);
             return;
@@ -146,6 +157,8 @@ pub fn finish_proto(c: *u8, p: *Proto) {
     }
     d.push(ProtoInfo { proto: p as u64, vars: mem.Vec.new() });
 }
+
+fn order(v: LocVar) -> u64 { (if v.kind == LV_FREE { 1 << 32 } else { 0 }) + v.reg as u64 }
 
 fn locvars(p: *Proto) -> []LocVar {
     if let Some(d) = DONE {
@@ -172,6 +185,9 @@ pub struct Dbg {
     /// The last prototype `is_user` answered for.
     last: u64,
     last_user: bool,
+    /// Past the stop before the first line.
+    started: bool,
+    ctx: *Ctx,
 }
 
 var DBG: ?*Dbg = None;
@@ -200,6 +216,8 @@ pub fn start(c: *Ctx, mp: *Proto, path: str, src: str) {
         user_to: c.protos.len,
         last: 0,
         last_user: false,
+        started: false,
+        ctx: c,
     };
     // A one-shot breakpoint at the first instruction; its id is free
     // again once it is hit, so the user's breakpoints count from 1.
@@ -310,7 +328,17 @@ fn stop(d: *Dbg, c: *Ctx, pc: *u32, fp: *Frame, id: u32) {
         d.out.push_str(", hit ");
         d.out.push_int(b.hits as i64);
         d.out.push_str("\n");
+    } else if id != 0 and d.started {
+        // A `tbreak`, deleted by the hit.
+        d.out.push_str("Deleted breakpoint ");
+        d.out.push_int(id as i64);
+        d.out.push_str(" at ");
+        d.out.push_str(debug.basename(d.file));
+        d.out.push_str(":");
+        d.out.push_int(line as i64);
+        d.out.push_str("\n");
     }
+    d.started = true;
     d.out.push_str("> ");
     d.entry(fp.proto, line);
     loop {
@@ -584,8 +612,23 @@ fn show(b: *text.StrBuf, v: Value, depth: u32) {
         Func(f) => { b.push_str("<function "); b.push_str(f.proto.name); b.push('>'); }
         Builtin(_) => b.push_str("<built-in function>"),
         Inst(i) => {
+            let cls = ops.class_name(i.cls);
+            // An exception as its class and arguments.
+            if let Some(d) = DBG and let Some(base) = d.ctx.excs[builtins.E_BASE] and ops.subclass(i.cls, base) {
+                let args = value.attr_get(i.dict, vm.intern(d.ctx, "args")) ?? Value.Nil;
+                if let Tuple(t) = args {
+                    b.push_str(cls);
+                    b.push('(');
+                    for j in 0..t.items.len {
+                        if j > 0 { b.push_str(", "); }
+                        show(b, t.items[j], depth + 1);
+                    }
+                    b.push(')');
+                    return;
+                }
+            }
             b.push('<');
-            b.push_str(ops.class_name(i.cls));
+            b.push_str(cls);
             b.push_str(" object>");
         }
         Obj(o) => show_obj(b, o, depth),

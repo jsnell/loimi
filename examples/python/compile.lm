@@ -512,7 +512,7 @@ fn C.stmt(c: *C, st: *Stmt) {
             c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
             c.block(body);
             c.loops.pop();
-            c.code.jump(Py.JMP(0), top);
+            #[cfg(debug)] c.code.set_loc(0); c.code.jump(Py.JMP(0), top); #[cfg(debug)] c.code.set_loc(c.line); // --cfg debug: the jump back belongs to no line
             c.code.bind(els);
             c.block(orelse);
             c.code.bind(brk);
@@ -667,7 +667,7 @@ fn C.for_stmt(c: *C, t: *Expr, iter: *Expr, body: Body, orelse: Body) {
     c.block(body);
     c.regs.reset(m2);
     c.loops.pop();
-    c.code.jump(Py.JMP(0), top);
+    #[cfg(debug)] c.code.set_loc(0); c.code.jump(Py.JMP(0), top); #[cfg(debug)] c.code.set_loc(c.line); // --cfg debug: the jump back belongs to no line
     c.code.bind(els);
     c.block(orelse);
     c.code.bind(brk);

@@ -286,6 +286,9 @@ pub fn Stepper.active(s: *Stepper) -> bool {
 /// again). Lines are compared within a frame: a loop that jumps back to
 /// the line it is on does not stop.
 pub fn Stepper.should_stop(s: *Stepper, line: u32, depth: u64) -> bool {
+    // Line 0: an instruction of no line (a loop's jump back, which would
+    // otherwise carry the line of the body's last statement).
+    if line == 0 { return false; }
     let stop = match s.mode {
         Run => false,
         Step => depth != s.depth or line != s.line,

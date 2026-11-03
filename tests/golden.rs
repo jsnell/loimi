@@ -818,6 +818,69 @@ fn python_programs() {
     );
 }
 
+/// The Python-subset debugger (`--cfg debug`, examples/python/debugger.lm):
+/// each examples/python/tests/debug/NAME.py run as `python-loimi --debug
+/// NAME.py` with NAME.cmds on stdin must print the transcript NAME.out, in
+/// every dispatch mode. The tail-call debug build also runs every
+/// examples/python/tests program without the debugger.
+#[test]
+fn python_debugger() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("examples/python/tests/debug");
+    let mut tests: Vec<PathBuf> =
+        std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "py")).collect();
+    tests.sort();
+    assert!(!tests.is_empty());
+    let mut failures = Vec::new();
+    for mode in ["tailcall", "goto", "switch"] {
+        let exe = std::env::temp_dir().join(format!("loimi-python-debug-{}-{}", std::process::id(), mode));
+        let out = loimi()
+            .args(["build", "-W", "error", "--release", "--cfg", "debug", &format!("--dispatch={mode}")])
+            .arg(root.join("examples/python/main.lm"))
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "building python --cfg debug ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        for t in &tests {
+            let cmds = std::fs::File::open(t.with_extension("cmds")).unwrap();
+            let want = std::fs::read_to_string(t.with_extension("out")).unwrap();
+            let out = limited(&exe).current_dir(&dir).arg("--debug").arg(t.file_name().unwrap()).stdin(cmds).output().unwrap();
+            let got = String::from_utf8_lossy(&out.stdout);
+            if got != want {
+                failures.push(format!(
+                    "{} ({mode}): transcript mismatch\n--- expected\n{want}\n--- got\n{got}\n--- stderr\n{}",
+                    t.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+        }
+        if mode == "tailcall" {
+            let progs = root.join("examples/python/tests");
+            let mut ps: Vec<PathBuf> = std::fs::read_dir(&progs)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "py") && p.with_extension("expected").exists())
+                .collect();
+            ps.sort();
+            for p in &ps {
+                let want = std::fs::read_to_string(p.with_extension("expected")).unwrap();
+                let out = limited(&exe).arg(p).output().unwrap();
+                if String::from_utf8_lossy(&out.stdout) != want {
+                    failures.push(format!("{} (--cfg debug build, no debugger): output differs", p.display()));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&exe);
+    }
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
 /// std.bigint against Python's int (tests/bigint/diff.py): 3000 random
 /// cases through the owned and GC APIs, then 1000 more with the GC
 /// collecting at every safepoint. Uses CPython from bench/python/install

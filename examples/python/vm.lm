@@ -1232,32 +1232,7 @@ pub vm Py {
             regs = fp.base;
             k = fp.k;
         }
-    }
-
-    // --cfg debug: the debugger (debugger.lm, docs/design/debugging.md).
-    // A breakpoint stops, puts its instruction back and runs it under
-    // `step`, whose wrapper sets the breakpoint again before the next
-    // instruction and stops there if a stepping command says so (and
-    // turns itself off when neither waits). `#[unfused]`: under `step`,
-    // supers run as their parts, so the first instruction of every line
-    // is seen. Runs that start or continue while stepping (`call`, and
-    // `reload` after a native) turn `step` on; `sync` saves where a frame
-    // calling a native is (`Frame.at`) for backtraces. (These additions
-    // sit on existing lines, or here at the end, so that a build without
-    // `--cfg debug` keeps its source positions.)
-    #[cfg(debug)]
-    on break {
-        debugger.on_break(ctx, pc, fp);
-        use_variant step;
-        jump pc
-    }
-    #[cfg(debug)]
-    #[unfused]
-    variant step wraps all {
-        before {
-            if !debugger.on_step(ctx, pc, fp) { use_variant default; }
-        }
-    }
+    } #[cfg(debug)] on break { debugger.on_break(ctx, pc, fp); use_variant step; jump pc } #[cfg(debug)] #[unfused] variant step wraps all { before { if !debugger.on_step(ctx, pc, fp) { use_variant default; } } } // --cfg debug: the debugger (see the end of this file)
 }
 
 /// Number of prototypes, for the verifier (set before verification).
@@ -1362,3 +1337,16 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
         Err(e) => Err(e),
     }
 }
+
+// --cfg debug: the debugger (debugger.lm, docs/design/debugging.md), on
+// the line that ends the vm above. A breakpoint stops, puts its
+// instruction back and runs it under `step`, whose wrapper sets the
+// breakpoint again before the next instruction and stops there if a
+// stepping command says so (and turns itself off when neither waits).
+// `#[unfused]`: under `step`, supers run as their parts, so the first
+// instruction of every line is seen. Runs that start or continue while
+// stepping (`call`, and `reload` after a native) turn `step` on; `sync`
+// saves where a frame calling a native is (`Frame.at`) for backtraces;
+// `invoke_at` and `gen_next` tell the stepper when a nested run's frame
+// has left. (All of it sits on existing lines, so that a build without
+// `--cfg debug` keeps its source positions in panic messages.)
