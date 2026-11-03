@@ -1,0 +1,107 @@
+-> initialize {"adapterID": "mini", "columnsStartAt1": true, "linesStartAt1": true}
+<- response initialize ok {"exceptionBreakpointFilters": [{"default": true, "filter": "error", "label": "Uncaught errors"}], "supportsConditionalBreakpoints": true, "supportsConfigurationDoneRequest": true, "supportsEvaluateForHovers": true, "supportsHitConditionalBreakpoints": true, "supportsTerminateRequest": true}
+-> launch {"program": "$DIR/session.mini", "stopOnEntry": true}
+<- response launch ok 
+<- event initialized 
+-> setBreakpoints {"breakpoints": [{"condition": "n == 4", "line": 3}, {"hitCondition": "3", "line": 9}, {"line": 5}, {"line": 40}, {"hitCondition": "lots", "line": 2}], "source": {"path": "$DIR/session.mini"}}
+<- response setBreakpoints ok {"breakpoints": [{"id": 1, "line": 3, "verified": true}, {"id": 2, "line": 9, "verified": true}, {"id": 3, "line": 6, "verified": true}, {"line": 40, "message": "no code at or after this line", "verified": false}, {"line": 2, "message": "bad hit condition (N, == N, >= N, > N, <= N, < N, % N)", "verified": false}]}
+-> setExceptionBreakpoints {"filters": ["error"]}
+<- response setExceptionBreakpoints ok 
+-> configurationDone 
+<- response configurationDone ok 
+<- event stopped {"allThreadsStopped": true, "reason": "entry", "threadId": 1}
+-> threads 
+<- response threads ok {"threads": [{"id": 1, "name": "main"}]}
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 4, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event stopped {"allThreadsStopped": true, "hitBreakpointIds": [3], "reason": "breakpoint", "threadId": 1}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event stopped {"allThreadsStopped": true, "hitBreakpointIds": [2], "reason": "breakpoint", "threadId": 1}
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 9, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> scopes {"frameId": 1}
+<- response scopes ok {"scopes": [{"expensive": false, "name": "Locals", "presentationHint": "locals", "variablesReference": 1}, {"expensive": false, "name": "Globals", "variablesReference": 2}]}
+-> variables {"variablesReference": 1}
+<- response variables ok {"variables": [{"name": "fib", "value": "function 'fib'", "variablesReference": 0}, {"name": "config", "value": "table (3 entries)", "variablesReference": 3}, {"name": "total", "value": "2", "variablesReference": 0}, {"name": "i", "value": "3", "variablesReference": 0}]}
+-> variables {"variablesReference": 2}
+<- response variables ok {"variables": []}
+-> variables {"variablesReference": 3}
+<- response variables ok {"variables": [{"name": "name", "value": "\"demo\"", "variablesReference": 0}, {"name": "nested", "value": "table (1 entry)", "variablesReference": 4}, {"name": "sizes", "value": "table (3 entries)", "variablesReference": 5}]}
+-> variables {"count": 2, "start": 1, "variablesReference": 5}
+<- response variables ok {"variables": [{"name": "[2]", "value": "5", "variablesReference": 0}, {"name": "[3]", "value": "8", "variablesReference": 0}]}
+-> evaluate {"context": "watch", "expression": "total * 10 + i", "frameId": 1}
+<- response evaluate ok {"result": "23", "variablesReference": 0}
+-> evaluate {"context": "repl", "expression": "fib(5)", "frameId": 1}
+<- response evaluate ok {"result": "5", "variablesReference": 0}
+-> evaluate {"context": "hover", "expression": "config.nested", "frameId": 1}
+<- response evaluate ok {"result": "table (1 entry)", "variablesReference": 4}
+-> evaluate {"context": "watch", "expression": "config.nope.x", "frameId": 1}
+<- response evaluate FAILED "attempt to index a nil value" 
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event stopped {"allThreadsStopped": true, "hitBreakpointIds": [1], "reason": "breakpoint", "threadId": 1}
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 3, "name": "fib", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}, {"column": 1, "id": 2, "line": 9, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 2}
+-> next {"threadId": 1}
+<- response next ok 
+<- event stopped {"allThreadsStopped": true, "reason": "step", "threadId": 1}
+-> stackTrace {"levels": 1, "threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 9, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> setBreakpoints {"breakpoints": [], "source": {"path": "$DIR/session.mini"}}
+<- response setBreakpoints ok {"breakpoints": []}
+-> stepIn {"threadId": 1}
+<- response stepIn ok 
+<- event stopped {"allThreadsStopped": true, "reason": "step", "threadId": 1}
+-> stackTrace {"levels": 1, "threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 10, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> stepIn {"threadId": 1}
+<- response stepIn ok 
+<- event stopped {"allThreadsStopped": true, "reason": "step", "threadId": 1}
+-> stackTrace {"levels": 1, "threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 9, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> stepIn {"threadId": 1}
+<- response stepIn ok 
+<- event stopped {"allThreadsStopped": true, "reason": "step", "threadId": 1}
+-> stackTrace {"levels": 1, "threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 2, "name": "fib", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 2}
+-> stepOut {"threadId": 1}
+<- response stepOut ok 
+<- event stopped {"allThreadsStopped": true, "reason": "step", "threadId": 1}
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 9, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+-> setBreakpoints {"breakpoints": [{"line": 17}], "source": {"path": "$DIR/session.mini"}}
+<- event output {"category": "stdout", "output": "total\t54\n"}
+<- response setBreakpoints ok {"breakpoints": [{"id": 6, "line": 17, "verified": true}]}
+-> pause {"threadId": 1}
+<- event stopped {"allThreadsStopped": true, "reason": "pause", "threadId": 1}
+<- response pause ok 
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 16, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 1}
+-> evaluate {"context": "watch", "expression": "n > 0", "frameId": 1}
+<- response evaluate ok {"result": "true", "variablesReference": 0}
+-> evaluate {"context": "repl", "expression": "done = true", "frameId": 1}
+<- response evaluate ok {"result": "nil", "variablesReference": 0}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event stopped {"allThreadsStopped": true, "hitBreakpointIds": [6], "reason": "breakpoint", "threadId": 1}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event output {"category": "stdout", "output": "spun\n"}
+<- event stopped {"allThreadsStopped": true, "description": "Uncaught error", "reason": "exception", "text": "line 13: attempt to index a nil value", "threadId": 1}
+-> stackTrace {"threadId": 1}
+<- response stackTrace ok {"stackFrames": [{"column": 1, "id": 1, "line": 13, "name": "check", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}, {"column": 1, "id": 2, "line": 18, "name": "main chunk", "source": {"name": "session.mini", "path": "$DIR/session.mini"}}], "totalFrames": 2}
+-> evaluate {"context": "watch", "expression": "v.name", "frameId": 1}
+<- response evaluate ok {"result": "\"demo\"", "variablesReference": 0}
+-> continue {"threadId": 1}
+<- response continue ok {"allThreadsContinued": true}
+<- event output {"category": "stderr", "output": "error: line 13: attempt to index a nil value\n"}
+<- event exited {"exitCode": 1}
+<- event terminated 
+-> disconnect {}
+<- response disconnect ok 
+exit 0

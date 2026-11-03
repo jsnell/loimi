@@ -1392,6 +1392,67 @@ fn mini_debug_api() {
     );
 }
 
+/// The DAP adapter for Mini (examples/mini/dap/mini_dap.c, over the
+/// debugging API) driven through a scripted session by
+/// examples/mini/dap/test_dap.py: breakpoints (moved off a blank line,
+/// conditional, hit-counted, set while the program runs), stepping,
+/// stack traces, scopes, nested table expansion, evaluation, a pause,
+/// break on error, the program's output as events. The transcript must
+/// be examples/mini/tests/dap/session.out, in every dispatch mode.
+#[test]
+fn mini_dap() {
+    if cross() || Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("mini_dap: skipped (cross-compiling, or no python3)");
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dap = root.join("examples/mini/dap");
+    let want = std::fs::read_to_string(root.join("examples/mini/tests/dap/session.out")).unwrap();
+    let dir = std::env::temp_dir().join(format!("loimi-mini-dap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let clang = std::env::var("LOIMI_CLANG").unwrap_or_else(|_| "clang-19".into());
+    let mut failures = Vec::new();
+    for mode in ["tailcall", "goto", "switch"] {
+        let lib = dir.join(format!("libmini-{mode}.a"));
+        let header = dir.join("mini.h");
+        let out = loimi()
+            .args(["build", "-W", "error", "--cfg", "debug", "--lib", &format!("--dispatch={mode}")])
+            .arg(root.join("examples/mini/embed.lm"))
+            .arg("-o")
+            .arg(&lib)
+            .arg("--header")
+            .arg(&header)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "building the debug library ({mode}) failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let exe = dir.join(format!("mini-dap-{mode}"));
+        let out = cc(&clang)
+            .args(["-Wall", "-Wextra", "-Werror", "-pthread", "-I"])
+            .arg(&dir)
+            .arg(dap.join("mini_dap.c"))
+            .arg(&lib)
+            .args(["-lm", "-o"])
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "compiling mini_dap.c failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        let out = limited("python3").arg(dap.join("test_dap.py")).arg(&exe).output().unwrap();
+        let got = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || got != want {
+            failures.push(format!(
+                "{mode}: transcript mismatch (exit {:?})\n--- expected\n{want}\n--- got\n{got}\n--- stderr\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if !failures.is_empty() {
+        panic!("{} failure(s):\n\n{}", failures.len(), failures.join("\n\n"));
+    }
+}
+
 /// Mini built with the lock (`--cfg gil`) and run by one thread: every
 /// script and conformance test, in every GC mode (the polls at back-edges
 /// and calls never hand over).
