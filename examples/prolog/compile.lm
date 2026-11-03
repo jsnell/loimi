@@ -17,8 +17,13 @@ import machine;
 import vm.{Wam, VCtx};
 import builtins;
 
+/// A block of verified code: a clause, a try chain, a predicate's stub.
+/// Built by `Wam.build_verified` (so the JIT knows it) and kept alive by
+/// `Machine.codes` (code is never freed, see `finish`).
+pub object Code { code: verified [u32] by Wam }
+
 pub struct Clause {
-    code: *u32,
+    code: Verified<Wam>,
     len: u64,
     key: u64,
     term: Term,
@@ -42,18 +47,18 @@ pub struct Pred {
     last: ?*Clause,
     kmap: HashMap<u64, KList>,
     kvar: u64,
-    code: *u32,
-    var_code: *u32,
-    lst_code: *u32,
-    def_code: *u32,
+    code: Verified<Wam>,
+    var_code: Verified<Wam>,
+    lst_code: Verified<Wam>,
+    def_code: Verified<Wam>,
     keys: *u64,
-    vals: *u64,
+    vals: *Verified<Wam>,
     mask: u64,
     dynamic: bool,
     defined: bool,
     system: bool,
     library: bool,
-    stub: *u32,
+    stub: Verified<Wam>,
 }
 
 /// Key of a first argument: its bits for an atomic term, a tagged functor
@@ -71,12 +76,12 @@ pub fn key_of(t: Term) -> u64 {
     }
 }
 
-pub fn Pred.lookup(p: *Pred, k: u64) -> *u32 {
+pub fn Pred.lookup(p: *Pred, k: u64) -> Verified<Wam> {
     if p.mask == 0 { return p.def_code; }
     var i = hash.mix(k) & p.mask;
     loop {
         let kk = p.keys[i];
-        if kk == k { return p.vals[i] as *u32; }
+        if kk == k { return p.vals[i]; }
         if kk == KEY_EMPTY { return p.def_code; }
         i = (i + 1) & p.mask;
     }
@@ -84,13 +89,12 @@ pub fn Pred.lookup(p: *Pred, k: u64) -> *u32 {
 
 // ---- code blocks ------------------------------------------------------
 
-/// Copy `words` to permanent memory and verify them. Code is never freed:
-/// a running choicepoint may still point into a clause that was retracted
-/// or a chain that was rebuilt.
-pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
+/// Copy `words` into a verified code object. Code is never freed (the
+/// object stays in `m.codes`): a running choicepoint may still point into
+/// a clause that was retracted or a chain that was rebuilt.
+pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> Verified<Wam> {
     let n = words.len;
-    let p = mem.alloc<u32>(n + 1);
-    for i in 0..n { p[i] = words.ptr[i]; }
+    let p = words.ptr;
     var vc = VCtx { nperm: nperm, nconsts: m.consts.len, npreds: m.db.functors.len, natoms: m.db.atoms.names.len };
     if m.stress and nperm != 999999 {
         var b = text.StrBuf.new();
@@ -99,8 +103,12 @@ pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
         io.eprint(b.as_str());
         b.free();
     }
-    match Wam.verify(p.slice(n), &vc) {
-        Ok(_) => { if m.supers { Wam.optimize_words(p.slice(n)); } }
+    match Wam.build_verified(&m.heap, Code {}, p.slice(n), &vc) {
+        Ok(o) => {
+            m.codes.push(o);
+            if m.supers { Wam.optimize(o.code); }
+            o.code
+        }
         Err(e) => {
             var b = text.StrBuf.new();
             b.push_str("internal error: code failed verification: ");
@@ -109,12 +117,12 @@ pub fn finish(m: *Machine, words: *mem.Vec<u32>, nperm: u64) -> *u32 {
             Wam.disasm(p.slice(n), &b);
             io.eprintln(b.as_str());
             b.free();
+            Wam.placeholder()
         }
     }
-    p
 }
 
-fn block1(m: *Machine, w: u32) -> *u32 {
+fn block1(m: *Machine, w: u32) -> Verified<Wam> {
     var v: mem.Vec<u32> = mem.Vec.new();
     v.push(w);
     let p = finish(m, &v, 0);
@@ -122,24 +130,28 @@ fn block1(m: *Machine, w: u32) -> *u32 {
     p
 }
 
-fn push_target(v: *mem.Vec<u32>, w: u32, code: *u32) {
+/// TRY, RETRY or TRUST `w` with its cache words (the target, a
+/// `Wam.Resume`, is filled in after verification: `fill_resumes`).
+pub fn push_target(v: *mem.Vec<u32>, w: u32) {
     v.push(w);
-    let a = code as u64;
-    v.push((a & 0xFFFFFFFF) as u32);
-    v.push((a >> 32) as u32);
+    for _ in 0..Wam.CW_Target { v.push(0); }
 }
 
 /// Code that tries `cs` in order.
-fn chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> *u32 {
+fn chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> Verified<Wam> {
     if cs.len == 0 { return m.fail_code; }
     if cs.len == 1 { return cs.ptr[0].code; }
     var v: mem.Vec<u32> = mem.Vec.new();
+    var to: mem.Vec<Wam.Resume> = mem.Vec.new();
     for i in 0..cs.len {
         let w = if i == 0 { Wam.TRY(p.arity) } else if i + 1 == cs.len { Wam.TRUST() } else { Wam.RETRY() };
-        push_target(&v, w, cs.ptr[i].code);
+        push_target(&v, w);
+        to.push(cs.ptr[i].code.resume_at(0).unwrap());
     }
     let r = finish(m, &v, 0);
+    r.fill_resumes(to.ptr.slice(to.len));
     v.free();
+    to.free();
     r
 }
 
@@ -281,7 +293,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
         var size: u64 = 4;
         while size < keys.len * 2 { size *= 2; }
         p.keys = mem.alloc<u64>(size);
-        p.vals = mem.alloc<u64>(size);
+        p.vals = mem.alloc<Verified<Wam>>(size);
         for i in 0..size { p.keys[i] = KEY_EMPTY; }
         p.mask = size - 1;
         for j in 0..keys.len {
@@ -295,7 +307,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
             var at = hash.mix(k) & p.mask;
             while p.keys[at] != KEY_EMPTY { at = (at + 1) & p.mask; }
             p.keys[at] = k;
-            p.vals[at] = code as u64;
+            p.vals[at] = code;
         }
     }
     keys.free();
@@ -1270,7 +1282,7 @@ fn abstract_goal(m: *Machine, t0: Term, fresh: *mem.Vec<(Term, Term)>) -> Term {
 /// call/N: build the goal from A1 and the N-1 extra arguments, load its
 /// arguments and return the code to run. Control constructs compile to a
 /// temporary clause (cut inside is local to the call).
-pub fn prepare_call(m: *Machine, n: u64) -> Result<*u32, Term> {
+pub fn prepare_call(m: *Machine, n: u64) -> Result<Verified<Wam>, Term> {
     var g = deref(m.x[0]);
     match g {
         Ref(_) => return Err(builtins.inst_error(m)),

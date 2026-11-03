@@ -10,6 +10,7 @@ import std.mem;
 import std.text;
 import std.gc;
 import std.map.{HashMap};
+import std.parse;
 import term.{Term, deref};
 import term;
 import machine.{Machine};
@@ -36,12 +37,13 @@ fn sys_block(m: *Machine, name: str, ar: u32, words: []u32) {
 fn setup(m: *Machine) {
     m.db = term.Db.new();
     m.heap = gc.Heap.new();
-    m.out = text.StrBuf.new();
+    m.out = io.Out.stdout();
     m.bags = mem.Vec.new();
     m.preds = mem.Vec.new();
     m.consts = mem.Vec.new();
     m.clauses = mem.Vec.new();
-    m.ops = HashMap.new();
+    m.codes = mem.Vec.new();
+    m.ops = parse.Ops.new();
     m.bmap = HashMap.new();
     m.globals = HashMap.new();
     m.inits = mem.Vec.new();
@@ -54,16 +56,16 @@ fn setup(m: *Machine) {
     let tv: [u32; 1] = [Wam.PROCEED()];
     m.true_code = compile.finish(m, &mem.Vec { ptr: &tv[0], len: 1, cap: 1 }, 0);
     var tfv: mem.Vec<u32> = mem.Vec.new();
-    tfv.push(Wam.TRUST());
-    let fa = m.fail_code as u64;
-    tfv.push((fa & 0xFFFFFFFF) as u32);
-    tfv.push((fa >> 32) as u32);
-    m.trust_fail = compile.finish(m, &tfv, 0);
+    compile.push_target(&tfv, Wam.TRUST());
+    let tf = compile.finish(m, &tfv, 0);
+    let to: [Wam.Resume; 1] = [m.fail_code.resume_at(0).unwrap()];
+    tf.fill_resumes(to[..]);
+    m.trust_fail = tf.start();
     tfv.free();
     let ht: [u32; 1] = [Wam.HALT_TRUE()];
-    m.halt_true = compile.finish(m, &mem.Vec { ptr: &ht[0], len: 1, cap: 1 }, 0);
+    m.halt_true = compile.finish(m, &mem.Vec { ptr: &ht[0], len: 1, cap: 1 }, 0).start();
     let hf: [u32; 1] = [Wam.HALT_FALSE()];
-    m.halt_false = compile.finish(m, &mem.Vec { ptr: &hf[0], len: 1, cap: 1 }, 0);
+    m.halt_false = compile.finish(m, &mem.Vec { ptr: &hf[0], len: 1, cap: 1 }, 0).start();
     // Builtins are predicates too, for call/N.
     var i: u64 = 0;
     var bs: mem.Vec<(u32, u32)> = mem.Vec.new();

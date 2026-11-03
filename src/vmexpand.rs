@@ -783,6 +783,12 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
         }
         let _ = writeln!(s, "  if let Err(__e) = __r {{ return Err(__e); }}");
     }
+    if has_resume_caches(v) {
+        // Resume cache fields hold resume points that only vm code and
+        // `fill_resumes` write: whatever the words said, they start at
+        // the placeholder.
+        let _ = writeln!(s, "  {n}__reset_resumes(__code);");
+    }
     let _ = writeln!(s, "  Ok({})\n}}", proof_src(v, "__code", if stack { "__max" } else { "0" }));
     if !v.checks.is_empty() {
         let _ = writeln!(
@@ -878,7 +884,138 @@ fn generate_resume(v: &VmDecl, l: &VmLayout) -> String {
     if (0..1u64 << l.op_bits.min(16)).any(|x| !used.contains(&(x as u32))) {
         let _ = writeln!(s, "{vis}fn {n}__Resume.placeholder() -> {n}__Resume {{ {n}__Resume {{ __pc: {n}__TRAP[..].ptr }} }}");
     }
+    s.push_str(&generate_resume_caches(v, l));
     s
+}
+
+/// For `Vm.emit_OP_cached`: its cache parameters and the statements that
+/// store them, or None if a field's type has no plain `as u64` (floats,
+/// options, function pointers).
+fn cached_emitter_parts(v: &VmDecl, c: &crate::vmast::CacheDecl, wb: u32, n: &str) -> Option<(Vec<String>, String)> {
+    let mut ps = vec![];
+    let mut puts = String::new();
+    let mut off = "1".to_string();
+    let mut any = false;
+    for (f, t, _) in &c.fields {
+        let words = format!("(size_of<{}>() + {})/{}", type_src(t), wb - 1, wb);
+        if !is_resume_field(v, t) {
+            let simple = match &t.kind {
+                TypeKind::Named(path, args) if path.len() == 1 && args.is_empty() => {
+                    let x = path[0].name.as_str();
+                    x == "bool" || ((x.starts_with('u') || x.starts_with('i')) && x[1..].parse::<u32>().is_ok())
+                }
+                TypeKind::Ptr(_) => true,
+                _ => false,
+            };
+            if !simple {
+                return None;
+            }
+            ps.push(format!("__c_{}: {}", f.name, type_src(t)));
+            let _ = write!(puts, "{n}__put_words(__code, __at + {off}, __c_{} as u64, {words}); ", f.name);
+            any = true;
+        }
+        off = format!("{off} + {words}");
+    }
+    any.then_some((ps, puts))
+}
+
+/// Whether a cache field has type `Vm.Resume`.
+fn is_resume_field(v: &VmDecl, t: &TypeExpr) -> bool {
+    matches!(&t.kind, TypeKind::Named(path, args) if args.is_empty() && path.len() == 2 && path[0].name == v.name.name && path[1].name == "Resume")
+}
+
+/// Whether some inline cache layout of `v` has a `Vm.Resume` field.
+pub fn has_resume_caches(v: &VmDecl) -> bool {
+    v.caches.iter().any(|c| c.fields.iter().any(|(_, t, _)| is_resume_field(v, t)))
+}
+
+/// Cache fields of type `Vm.Resume` (verified code addresses in the
+/// instruction stream, such as the clause a try chain continues at):
+/// - `Vm__resume_words(w)`: a mask of the cache words (bit k: word k of
+///   the instruction) that hold resume points, for the op `w` stands
+///   for alone (a super's head: its first part);
+/// - `Vm__put_resume(code, at, r)`: write `r` at word `at`;
+/// - `Vm__reset_resumes(code)`: every resume field to the placeholder
+///   (the verifier calls it: words built by the host are not trusted);
+/// - `v.fill_resumes(vals) -> bool`: set the resume fields of verified
+///   code `v`, in code order, from `vals` (false if the counts differ).
+fn generate_resume_caches(v: &VmDecl, l: &VmLayout) -> String {
+    if !has_resume_caches(v) {
+        return String::new();
+    }
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let wb = (l.word_bits / 8) as u64;
+    let vis = if v.is_pub { "pub " } else { "" };
+    let rw = 8u64.div_ceil(wb);
+    let mut s = String::new();
+    // The mask per cache layout, as source: each field starts a word.
+    let masks: Vec<String> = v
+        .caches
+        .iter()
+        .map(|c| {
+            let mut off = "1".to_string();
+            let mut parts = vec![];
+            for (_, t, _) in &c.fields {
+                if is_resume_field(v, t) {
+                    parts.push(format!("(({} as u64) << ({}))", (1u64 << rw) - 1, off));
+                }
+                off = format!("{} + (size_of<{}>() + {})/{}", off, type_src(t), wb - 1, wb);
+            }
+            if parts.is_empty() { "0".to_string() } else { parts.join(" | ") }
+        })
+        .collect();
+    let arms = l.ops.iter().enumerate().filter_map(|(i, o)| {
+        let b = l.base(i);
+        let c = l.ops[b].cache?;
+        (masks[c] != "0").then(|| (o.opcode, masks[c].clone()))
+    });
+    match_fn(&mut s, &format!("fn {n}__resume_words(w: {w}) -> u64"), &format!("match {n}__opcode(w)"), arms, "_ => 0");
+    let _ = writeln!(
+        s,
+        "fn {n}__put_resume(__code: []{w}, __at: u64, __r: {n}__Resume) {{\n\
+         \x20 let __a = __r.__pc as u64;\n\
+         \x20 var __b: u64 = 0;\n\
+         \x20 while __b < {rw} {{ __code[__at + __b] = (__a >> (__b * {bits})) as {w}; __b += 1; }}\n}}\n\
+         fn {n}__reset_resumes(__code: []{w}) {{\n\
+         \x20 let __ph = {n}__Resume.placeholder();\n\
+         \x20 var __i: u64 = 0;\n\
+         \x20 while __i < __code.len {{\n\
+         \x20   let __m = {n}__resume_words(__code[__i]);\n\
+         \x20   var __k: u64 = 1;\n\
+         \x20   while (__m >> __k) != 0 {{ if ((__m >> __k) & 1) != 0 {{ {n}__put_resume(__code, __i + __k, __ph); __k += {rw}; }} else {{ __k += 1; }} }}\n\
+         \x20   __i += {n}__base_size(__code[__i]);\n\
+         \x20 }}\n}}\n\
+         {vis}fn {n}__Verified.fill_resumes(v: {n}__Verified, vals: []{n}__Resume) -> bool {{\n\
+         \x20 let __code = v.__code;\n\
+         \x20 var __j: u64 = 0;\n\
+         \x20 var __i: u64 = 0;\n\
+         \x20 while __i < __code.len {{\n\
+         \x20   let __m = {n}__resume_words(__code[__i]);\n\
+         \x20   var __k: u64 = 1;\n\
+         \x20   while (__m >> __k) != 0 {{\n\
+         \x20     if ((__m >> __k) & 1) != 0 {{\n\
+         \x20       if __j >= vals.len {{ return false; }}\n\
+         \x20       {n}__put_resume(__code, __i + __k, vals[__j]);\n\
+         \x20       __j += 1;\n\
+         \x20       __k += {rw};\n\
+         \x20     }} else {{ __k += 1; }}\n\
+         \x20   }}\n\
+         \x20   __i += {n}__base_size(__code[__i]);\n\
+         \x20 }}\n\
+         \x20 __j == vals.len\n}}",
+        bits = l.word_bits
+    );
+    s
+}
+
+/// Whether any source file names an `emit.OP_cached` emitter: only then
+/// are they generated, so that other programs' code does not change.
+fn uses_cached_emitters(sm: &SourceMap) -> bool {
+    sm.files.iter().any(|f| {
+        f.generated.is_none()
+            && crate::lexer::lex(0, &f.text).is_ok_and(|t| t.iter().any(|t| matches!(&t.tok, crate::lexer::Tok::Ident(x) if x.ends_with("_cached"))))
+    })
 }
 
 /// Whether any source file names a resume point item (`next_resume`,
@@ -1110,7 +1247,7 @@ fn generate_build_verified(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool, 
     s
 }
 
-pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
+pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let mask = (1u64 << l.op_bits) - 1;
@@ -1146,6 +1283,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let total = if words.is_empty() { "0".to_string() } else { words.join(" + ") };
         let _ = writeln!(s, "{vis}const {n}__CW_{}: u64 = {};", c.name.name, total);
     }
+    let mut has_cached = false;
     for (i, o) in l.ops.iter().enumerate() {
         let _ = writeln!(s, "{vis}const {n}__OP_{}: {w} = {};", o.name, o.opcode);
         if !o.parts.is_empty() {
@@ -1169,6 +1307,25 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let mut ps = vec![format!("__code: []{w}"), "__at: u64".to_string()];
         ps.extend(params);
         let _ = writeln!(s, "{vis}fn {n}__emit_{}({}) -> u64 {{ {} __at + {} }}", o.name, ps.join(", "), body, size);
+        // `Vm.emit_OP_cached(code, at, operands.., fields..)`: the same with
+        // the inline cache's initial contents (its integer, `bool` and
+        // pointer fields, in declaration order; `Vm.Resume` fields are set
+        // after verification, by `fill_resumes`).
+        if let Some(c) = o.cache.filter(|_| cached) {
+            if let Some((cps, puts)) = cached_emitter_parts(v, &v.caches[c], l.word_bits / 8, n) {
+                let mut ps = ps.clone();
+                ps.extend(cps);
+                let _ = writeln!(s, "{vis}fn {n}__emit_{}_cached({}) -> u64 {{ {} {} __at + {} }}", o.name, ps.join(", "), body, puts, size);
+                has_cached = true;
+            }
+        }
+    }
+    if has_cached {
+        let _ = writeln!(
+            s,
+            "fn {n}__put_words(__code: []{w}, __at: u64, __v: u64, __nw: u64) {{ var __b: u64 = 0; while __b < __nw {{ __code[__at + __b] = (__v >> (__b * {})) as {w}; __b += 1; }} }}",
+            l.word_bits
+        );
     }
     // Sizes and names.
     let by_op = format!("{rl}match {n}__opcode(w)");
@@ -1320,7 +1477,15 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let _ = writeln!(s, "    if __f != {} {{ __code[__i] = {n}__with_opcode(__code[__i], __f as {w}); }}", u64::MAX);
     let _ = writeln!(s, "    let __size = {n}__base_size(__code[__i]);");
     let _ = writeln!(s, "    var __k: u64 = 1;");
-    let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
+    if has_resume_caches(v) {
+        // Resume points stay: they are where the code goes, not what it learned.
+        let _ = writeln!(
+            s,
+            "    let __keep = {n}__resume_words(__code[__i]);\n    while __k < __size and __i + __k < __code.len {{ if ((__keep >> __k) & 1) == 0 {{ __code[__i + __k] = 0; }} __k += 1; }}"
+        );
+    } else {
+        let _ = writeln!(s, "    while __k < __size and __i + __k < __code.len {{ __code[__i + __k] = 0; __k += 1; }}");
+    }
     let _ = writeln!(s, "    __i += __size;\n  }}");
     if jit {
         let _ = writeln!(s, "  __extern_loimi_jit_rewritten(__code.ptr as *u8);");
@@ -2073,6 +2238,7 @@ fn c_externs(items: &mut [Item]) {
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     let resume = uses_resume(sm);
+    let cached = uses_cached_emitters(sm);
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
         // Each C function is declared once per module.
@@ -2081,7 +2247,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
         for it in &m.items {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
-                let mut src = generate(v, &l, jit);
+                let mut src = generate(v, &l, jit, cached);
                 if jit && !jit_externs {
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.

@@ -1,0 +1,91 @@
+// matrix: dispatch
+// `try_new(h, T { .. })`: the allocator's inline path only; None where
+// `new` would refill a free list, after which `gc.make_room` makes the
+// next try succeed. In a handler: `let Some(o) = try_new(..) else cold {
+// gc.make_room(..); redo }`, which keeps the refill call out of the op.
+// Large objects and trailing arrays are allocated as by `new`.
+import std.io;
+import std.gc;
+
+object Pair { a: i64, b: ?Gc<Pair> }
+object Big { pad: [u64; 80] }
+object Arr { n: u64, items: [i64] }
+
+struct Ctx { heap: gc.Heap, list: ?Gc<Pair>, made: i64, rooms: i64 }
+
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8, a: 24 } }
+    op CONS(n: imm) : A {
+        let Some(p) = try_new(&ctx.heap, Pair { a: n as i64, b: ctx.list }) else cold {
+            ctx.rooms += 1;
+            gc.make_room(&ctx.heap, size_of<Pair>());
+            redo
+        };
+        ctx.list = Some(p);
+        ctx.made += 1;
+        next
+    }
+    op LOOP(n: imm) : A { if ctx.made < n as i64 { jump pc - 1 } next }
+    op HALT() : A { exit 0 }
+    operand imm = it;
+    entry run(c: *Ctx, code: *u32) -> i64 { ctx = c; jump code }
+}
+
+fn main() {
+    var h = gc.Heap.new();
+    // Plain code: count the Nones.
+    var nones = 0;
+    var keep: ?Gc<Pair> = None;
+    var i = 0;
+    while i < 5000 {
+        if let Some(p) = try_new(&h, Pair { a: i, b: keep }) {
+            keep = Some(p);
+            i += 1;
+        } else {
+            nones += 1;
+            gc.make_room(&h, size_of<Pair>());
+        }
+    }
+    var sum = 0;
+    var cur = keep;
+    while let Some(p) = cur { sum += p.a; cur = p.b; }
+    io.print("sum ");
+    io.print_int(sum);
+    io.println(if nones > 0 { " (some refills)" } else { " (no refills?)" });
+    // A large object and a trailing array: never None.
+    let b = try_new(&h, Big { pad: [7; 80] });
+    io.println(if let Some(x) = b { if x.pad[79] == 7 { "big ok" } else { "big bad" } } else { "big none" });
+    var got = 0;
+    var j = 0;
+    while j < 100 {
+        if let Some(a) = try_new(&h, Arr { n: 3 }, 3) {
+            if a.items[0] == 0 and a.items[2] == 0 and a.n == 3 { got += 1; }
+        } else {
+            gc.make_room(&h, size_of<Arr>() + 3 * 8);
+        }
+        j += 1;
+    }
+    io.println(if got > 90 { "arrays ok" } else { "arrays bad" });
+    // In a handler.
+    var c = Ctx { heap: gc.Heap.new(), list: None, made: 0, rooms: 0 };
+    var code: [u32; 3] = [0; 3];
+    var at: u64 = 0;
+    at = V.emit.CONS(code[..], at, 2);
+    at = V.emit.LOOP(code[..], at, 3000);
+    at = V.emit.HALT(code[..], at);
+    let _ = at;
+    let _ = V.run(&c, &code[0]);
+    var n = 0;
+    var cur2 = c.list;
+    while let Some(p) = cur2 { n += p.a; cur2 = p.b; }
+    io.print("vm ");
+    io.print_int(n);
+    io.println(if c.rooms > 0 { " with make_room" } else { " without make_room?" });
+}
+
+// expect: sum 12497500 (some refills)
+// expect: big ok
+// expect: arrays ok
+// expect: vm 6000 with make_room

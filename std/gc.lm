@@ -138,8 +138,15 @@ struct ChunkHead { rs: *RemSet, pad: u64 }
 /// Allocated separately so its address stays fixed when the `Heap`
 /// struct is moved.
 /// `epoch` is the value of a set mark (see `Heap.epoch`), here so that
-/// `is_marked` finds it from an object's address.
-struct RemSet { objs: mem.Vec<*u8>, epoch: u8, young: u8 }
+/// `is_marked` finds it from an object's address. `missed`: objects the
+/// write barrier logged without adding them, because `objs` was full (it
+/// makes no calls, so it cannot grow the vector); if any, the next
+/// collection is a major one, which needs no remembered set, and the set
+/// gets more room after it.
+struct RemSet { objs: mem.Vec<*u8>, epoch: u8, young: u8, missed: u64 }
+
+/// The least free room in the remembered set after a collection.
+const RS_MIN: u64 = 256;
 
 /// Shadow-stack frame written by compiled code; entries follow `n`.
 pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
@@ -260,6 +267,7 @@ pub fn Heap.new() -> Heap {
     rs.objs = mem.Vec.new();
     rs.epoch = 1;
     rs.young = NO_YOUNG;
+    rs.missed = 0;
     Heap {
         large: mem.Vec.new(),
         large_old: 0,
@@ -328,6 +336,41 @@ pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let p = hd as *u8 + HEADER;
     mem.memset(p, 0, size);
     p
+}
+
+/// Called by compiled code for `try_new`: `alloc` without its refill, so
+/// that it makes no call (in a tail-call handler, a call anywhere gives
+/// the handler a stack frame on every execution). Null if the size
+/// class's free list is empty; `make_room` refills it. Large objects (over
+/// 496 bytes with the header) are allocated as by `alloc` (a call), and
+/// a trailing array's zeroing is a `memset` call unless its length is a
+/// constant.
+#[inline]
+pub fn try_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let c = (HEADER + size + 15) >> 4;
+    if c >= NCLASS { return alloc_large(h, size, tid, n); }
+    let hd = h.free[c];
+    if (hd as u64) == 0 { return 0 as *u8; }
+    h.free[c] = next_free(hd);
+    *((hd as *u8 + 4) as *u32) = tid & 0xFFFF;
+    hd.len = n;
+    h.count += 1;
+    h.allocated += c << 4;
+    let p = hd as *u8 + HEADER;
+    mem.memset(p, 0, size);
+    p
+}
+
+/// Make the next allocation of `size` bytes (`size_of<T>()`, plus the
+/// trailing array's bytes) take the allocator's fast path, so that
+/// `try_new` succeeds. Never collects. The slow path of `try_new` in a
+/// handler:
+///
+///     let Some(c) = try_new(h, Cons { .. }) else cold { gc.make_room(h, size_of<Cons>()); redo };
+#[inline(never)]
+pub fn make_room(h: *Heap, size: u64) {
+    let c = (HEADER + size + 15) >> 4;
+    if c < NCLASS and (h.free[c] as u64) == 0 { refill(h, c); }
 }
 
 /// Make the next chunk of class `c` with free slots (or a new one) the
@@ -541,7 +584,32 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
 #[inline]
 pub fn barrier(obj: *u8) {
     let hd = (obj - HEADER) as *Header;
-    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+    if unlikely((hd.flags & LOG) != 0) { log_obj(obj); }
+}
+
+/// The barrier's slow path, `remember` without calls: a call anywhere in a
+/// tail-call handler gives it a stack frame on every execution (lowering.md
+/// section 3), and this path is rare. When the remembered set is full it
+/// only clears LOG and counts the object in `missed`, which makes the next collection a
+/// major one (that marking sets LOG again on the survivors).
+#[inline]
+fn log_obj(obj: *u8) {
+    let hd = (obj - HEADER) as *Header;
+    let f = hd.flags & !LOG;
+    if (f & INRS) != 0 {
+        hd.flags = f;
+        return;
+    }
+    let rs = head_of(obj).rs;
+    let n = rs.objs.len;
+    if n < rs.objs.cap {
+        rs.objs.ptr[n] = obj;
+        rs.objs.len = n + 1;
+        hd.flags = f | INRS;
+    } else {
+        rs.missed += 1;
+        hd.flags = f;
+    }
 }
 
 /// The write barrier for stores that bypass the compiler's: after storing
@@ -553,7 +621,7 @@ pub fn barrier(obj: *u8) {
 #[inline]
 pub fn write_barrier(h: *Heap, obj: *u8) {
     let hd = (obj - HEADER) as *Header;
-    if unlikely((hd.flags & LOG) != 0) { remember(obj); }
+    if unlikely((hd.flags & LOG) != 0) { log_obj(obj); }
 }
 
 /// Whether a store into `obj` would need logging (old and not logged).
@@ -617,7 +685,7 @@ fn drain(h: *Heap) {
 pub fn collect(h: *Heap) uses gc {
     let t0 = if h.stats { now_ns() } else { 0 };
     if h.verify and h.sticky { verify_heap(h); }
-    let minor = h.gen and h.sticky and !h.want_major;
+    let minor = h.gen and h.sticky and !h.want_major and h.rs.missed == 0;
     if !minor {
         // A major collection. Chunks still pending since the last major
         // collection may hold dead objects marked with the epoch that the
@@ -820,6 +888,13 @@ pub fn collect(h: *Heap) uses gc {
         h.major_live = live;
     }
     h.minor = false;
+    // Room for the barrier to log objects without growing the set: twice
+    // what was logged since the last collection.
+    if h.gen {
+        let want = 2 * (rs_n + h.rs.missed);
+        h.rs.objs.reserve(if want > RS_MIN { want } else { RS_MIN });
+    }
+    h.rs.missed = 0;
     // In stress mode a generational heap still runs a major collection
     // now and then, so both kinds are exercised.
     if h.stress and h.gen and h.collections % 8 == 7 { h.want_major = true; }
@@ -944,6 +1019,7 @@ pub fn Heap.set_stress(h: *Heap, on: bool) {
 pub fn Heap.set_generational(h: *Heap, on: bool) {
     h.gen = on;
     if on {
+        h.rs.objs.reserve(h.rs.objs.len + RS_MIN);
         h.major_live = h.live_bytes;
         h.major_limit = h.live_bytes + budget(h, h.live_bytes);
     } else {

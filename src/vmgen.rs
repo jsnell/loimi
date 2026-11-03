@@ -353,6 +353,29 @@ pub fn load_pc(g: &mut FnGen) -> String {
     g.inst(format!("load ptr, ptr {}", s))
 }
 
+/// Whether shared copy `fid` may read the instruction word it is passed
+/// (the calling instruction's): directly, or by passing it on to a cold
+/// block, `on raise`, another shared copy or a chained op.
+fn shared_reads_insn(p: &Program, fid: FnId) -> bool {
+    let Some(body) = &p.fns[fid as usize].body else { return true };
+    let mut reads = false;
+    crate::tirwalk::for_each_expr(body, &mut |e| {
+        if let TK::Vm(v) = &e.kind
+            && matches!(
+                v,
+                TVm::Word(0) | TVm::Raise(_) | TVm::RaiseSlot | TVm::Cold(_) | TVm::Chain(_) | TVm::Shared(..) | TVm::SharedNext(..) | TVm::Fallthrough(..) | TVm::Part(..)
+            )
+        {
+            reads = true;
+        }
+        // `?` in vm code raises.
+        if matches!(e.kind, TK::Try(_)) {
+            reads = true;
+        }
+    });
+    reads
+}
+
 /// Store `v` (a `ptr`) to `pc`.
 pub fn store_pc(g: &mut FnGen, v: &str) {
     let s = pc_slot(g);
@@ -618,7 +641,16 @@ pub fn vm_expr(g: &mut FnGen, e: &TExpr, v: &TVm) -> String {
                 g.store(&t, &v, &slot);
             }
             // Entries have no current instruction; the shared copy ignores it.
-            let w = if g.vm.as_ref().unwrap().role == VmRole::Entry { "0".to_string() } else { current_word(g, vd) };
+            // An `#[inline(never)]` copy that never reads it gets poison, so
+            // that callers need not keep the word live (in a cold block,
+            // the handler would have to pass it: one more register).
+            let w = if g.vm.as_ref().unwrap().role == VmRole::Entry {
+                "0".to_string()
+            } else if p.fns[*fid as usize].inline == Some(false) && !shared_reads_insn(p, *fid) {
+                "poison".to_string()
+            } else {
+                current_word(g, vd)
+            };
             tail_to(g, vd, &format!("@\"{}\"", crate::jitgen::callee_symbol(g, *fid)), &w);
             g.poison(&e.ty)
         }

@@ -1,0 +1,20 @@
+// Literal arithmetic takes its type from the other operand (`16 + 8 + n`
+// with `n: u64`), and `[T; _]` takes its length from an array literal.
+import std.io;
+
+fn slots(n: u64) -> u64 { let c = (16 + 8 + 8 * n + 15) >> 4; c }
+fn small(x: u8) -> u8 { 2 * 3 + x }
+
+fn main() {
+    let t: [(str, u32); _] = [("a", 1), ("b", 2), ("c", 3)];
+    io.print_int(t.len as i64);
+    io.println("");
+    io.print_int(slots(3) as i64);
+    io.println("");
+    io.print_int(small(240) as i64);
+    io.println("");
+}
+
+// expect: 3
+// expect: 3
+// expect: 246

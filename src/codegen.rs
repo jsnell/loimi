@@ -1274,7 +1274,8 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             TK::Assign(lhs, rhs) => {
                 let v = self.val(rhs);
-                if crate::gcgen::needs_barrier(self, lhs) {
+                let no_refs = crate::gcgen::holds_no_refs(self.p(), rhs);
+                if !no_refs && crate::gcgen::needs_barrier(self, lhs) {
                     crate::gcgen::store_with_barrier(self, lhs, &v);
                     return "zeroinitializer".into();
                 }
@@ -1289,7 +1290,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     self.emit(format!("store {} {}, ptr {}, align {}", t, v, p, a));
                 } else {
                     self.store(&lhs.ty, &v, &p);
-                    if let Some(obj) = crate::gcgen::env_barrier(self, lhs) {
+                    if let Some(obj) = crate::gcgen::env_barrier(self, lhs).filter(|_| !no_refs) {
                         self.emit(format!("call void @\"std.gc.barrier\"(ptr {})", obj));
                     }
                 }
@@ -1321,7 +1322,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.poison(&e.ty)
             }
             TK::Vm(v) => crate::vmgen::vm_expr(self, e, v),
-            TK::New { heap, init, len } => crate::gcgen::new_object(self, e, heap, init, len.as_deref()),
+            TK::New { heap, init, len, fast } => crate::gcgen::new_object(self, e, heap, init, len.as_deref(), *fast),
             TK::Trailing(obj) => crate::gcgen::trailing(self, obj),
         }
     }
@@ -3028,12 +3029,22 @@ impl<'a, 'p> FnGen<'a, 'p> {
 /// generated code calls, and std.gc's free hooks and dirty pinning,
 /// so that the IR of programs that do not use them stays the same.
 fn is_lazy(f: &FnDef) -> bool {
-    f.lazy || f.symbol.starts_with("std.gc.rootck_") || f.symbol.starts_with("loimi_rootck_") || LAZY_STD.contains(&f.symbol.as_str())
+    f.lazy
+        || f.symbol.starts_with("std.gc.rootck_")
+        || f.symbol.starts_with("loimi_rootck_")
+        || LAZY_STD.contains(&f.symbol.as_str())
+        || LAZY_STD_PREFIX.iter().any(|p| f.symbol.starts_with(p))
+        || f.symbol.contains("<u64, OpBits>")
 }
+
+/// Prefixes of std functions emitted only where used (newer modules'
+/// parts, so that programs that do not use them keep their IR).
+const LAZY_STD_PREFIX: &[&str] =
+    &["std.io.Out.", "std.io.write_all", "std.parse.Ops.", "std.parse.OpType.", "std.parse.op_type", "std.parse.fixity_of", "std.parse.decode", "std.map.HashMap<u64, OpBits>."];
 
 /// std struct types whose LLVM definition is emitted only where used, so
 /// that the IR of programs that do not use them stays the same.
-const LAZY_STD_TYPES: &[&str] = &["std.mem.Malloc"];
+const LAZY_STD_TYPES: &[&str] = &["std.mem.Malloc", "std.io.Out", "std.parse.Ops", "std.parse.Op", "std.parse.OpEntry", "std.parse.OpBits"];
 
 const LAZY_STD: &[&str] = &[
     "std.gc.Heap.on_free",
@@ -3048,6 +3059,8 @@ const LAZY_STD: &[&str] = &[
     "std.gc.release_hooks",
     "std.gc.mark_shadow_stack",
     "std.gc.shadow_top",
+    "std.gc.try_alloc",
+    "std.gc.make_room",
     "std.mem.Arena.free_bytes",
     "std.mem.Malloc.new",
     "std.mem.Malloc.alloc_bytes",
@@ -3068,15 +3081,19 @@ fn lazy_used(p: &Program, check_roots: bool) -> Vec<bool> {
             }
         }
     }
+    // `try_new` calls `std.gc.try_alloc` (without `--gc-check-roots`).
+    let try_alloc = p.fns.iter().position(|f| f.symbol == "std.gc.try_alloc");
     while let Some(i) = work.pop() {
         let Some(body) = &p.fns[i].body else { continue };
         crate::tirwalk::for_each_expr(body, &mut |e| {
-            if let TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) = &e.kind {
-                let id = *id as usize;
-                if is_lazy(&p.fns[id]) && !used[id] {
-                    used[id] = true;
-                    work.push(id);
-                }
+            let id = match &e.kind {
+                TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) => *id as usize,
+                TK::New { fast: true, .. } if !check_roots && try_alloc.is_some() => try_alloc.unwrap(),
+                _ => return,
+            };
+            if is_lazy(&p.fns[id]) && !used[id] {
+                used[id] = true;
+                work.push(id);
             }
         });
     }

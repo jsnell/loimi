@@ -1,0 +1,5 @@
+// A raw string ends only at `"` followed by as many `#`s as it began with.
+// error: unterminated raw string literal
+fn main() {
+    let s = r#"a " b"";
+}

@@ -20,7 +20,7 @@ says so. Some modules are design only; their sections say so at the top.
 | [`std.bigint`](#stdbigint) | built (Karatsuba, Toom-3, divide-and-conquer division, square root and radix conversion; no FFT) | `std/bigint.lm` |
 | [`std.io`, `std.os`](#stdio-and-stdos) | built (minimal) | `std/io.lm`, `std/os.lm` |
 | [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
-| [`std.parse`](#stdparse) | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
+| [`std.parse`](#stdparse) | built (`Pratt`, `Parser`, `Ops`; no `TokenStream`) | `std/parse.lm` |
 | [`std.diag`](#stddiag) | built | `std/diag.lm` |
 | [`std.bc`](#stdbc-bytecode-construction) | built (a library, no generated `Builder`) | `std/bc.lm` |
 | [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
@@ -44,9 +44,9 @@ Design rules for the library:
   follows the same discipline it asks of users.
 - **Everything that owns memory can give it back.** Each std type that
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
-  `OrderedMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
+  `OrderedMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`, `Ops`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
-  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Gil`,
+  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Gil`, `Out`,
   `BigInt`, `Bench`, `Counters`; `Malloc` frees each allocation with
   `free_bytes`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
@@ -707,6 +707,18 @@ estimates and per-call work).
 `std/io.lm`: `print(s)`, `println(s)`, `print_int(i64)`, `print_f64(f64)`
 (`%.14g`), `print_bool(b)`, their stderr forms `eprint`, `eprintln`,
 `eprint_int`, `eprint_f64`, and `read_file(path) -> ?str` / `free_file(s)`.
+These write with one unbuffered `write(2)` per call.
+
+`io.Out` is buffered output: `io.Out.stdout()` (64 KiB) or
+`io.Out.new(fd, cap)`, then `o.print(s)`, `println`, `byte(c)`,
+`print_int`, `print_f64`, `print_bool`; the buffer is written out with
+one `write(2)` when it would overflow (a string larger than the buffer
+is written directly after it), and by `o.flush()` and `o.free()` (flush
+and release). There is no flush at exit: flush before the program ends,
+and before writing to the same terminal unbuffered (an `io.eprint`
+error message), or the output comes out of order. A program that
+prints a lot (an interpreter's `print` builtin) gains one system call
+per 64 KiB instead of one per call.
 
 `std/os.lm`: `arg_count() -> u64`, `arg(i) -> ?str` (0 is the program),
 `quit(code) -> never`.
@@ -714,7 +726,7 @@ estimates and per-call work).
 ### Design (not built): `std.io`, `std.os`, `std.ffi`
 
 `std.ffi` does not exist (`extern "C" fn` and `export "C"` are in the
-language, language.md §1.5). Not built: buffered or formatted output,
+language, language.md §1.5). Not built: formatted output (beyond `std.text`),
 stdin, environment variables, clocks, `mmap`, dynamic loading.
 
 ## `std.lex`
@@ -835,6 +847,59 @@ Also not built: UTF-8 aware character classes.
   The calls are direct, so they inline.
 - The hooks' types have no effects, so `parse` has none and runs from any
   function: hooks may allocate but not collect (collect between parses).
+
+### Run-time operator tables: `parse.Ops`
+
+`Pratt` and `Parser` index their tables by a token-kind enum fixed
+when the parser is built. Prolog-family languages define operators
+while parsing (`:- op(700, xfx, ===)`), name them by atoms, and give each
+a priority (1..1200, larger binds looser) and one of seven types. `Ops`
+is that table and the operator-precedence driver for it:
+
+- `Ops.new()`, `free()`; `add(name, prio, typ)` with `name: u64` (an
+  interned atom id, below 2^62) and `typ: parse.OpType` (`XFX`, `XFY`,
+  `YFX`, `FY`, `FX`, `XF`, `YF`; `parse.op_type("xfx")` and
+  `t.name()` convert): replaces the definition of the same kind, and
+  priority 0 removes it, as `op/3` does. A name has at most one prefix,
+  one infix and one postfix definition, independently (`-` is `fy 200`
+  and `yfx 500`).
+- Lookups: `prefix(name)`, `infix(name)`, `postfix(name)` return
+  `?parse.Op { prio, typ, left, right }`, where `left`/`right` are the
+  highest priorities the arguments may have (`p - 1` on an `x` side, `p`
+  on a `y` side); `is_op(name)`, `max_prio(name)`; `next(&at)` iterates
+  (`current_op/3`).
+- The driver: the parser state implements
+  `parse.OpHooks<E, X>` (`impl parse.OpHooks<Term, Err> for Reader;`)
+  and calls `p.op_parse(&ops, max)` for a term of priority at most
+  `max` (returns `(E, priority)`) or `p.op_parse_arg(&ops)` for an
+  argument. The hooks: `peek(p, prefix) -> parse.Tok` classifies the
+  current token, `advance`, `primary` (any term that is not an operator
+  application: numbers, variables, strings, compound terms, lists,
+  brackets; it recurses with `op_parse`), `atom(name)` (an operator name
+  as an atom), and `prefix`, `infix`, `postfix` to build applications.
+  `Tok` is `Name(u64)` (may be an operator), `Sep(u64)` (`,` and `|`:
+  infix operators that also separate arguments), `Term` (starts a term
+  that is not an operator application) or `End`.
+- The driver implements the rules that make Prolog's operator grammar
+  hard to get right: argument priorities by type; a prefix operator is
+  an atom when the next token cannot start a term or is an infix
+  operator that is not also prefix (`- = x`, `f(-)`, `[-|T]`, `- , a`);
+  an operator as an atom has its priority (0 above `max`, so `f(:-)`
+  parses); a prefix operator above `max` is read at 999 (`X = \+a`);
+  `op_parse_arg` is priority 999 but accepts infix operators above 999
+  other than the `Sep`s (`f(a :- b)`), as SWI-Prolog does (use
+  `op_parse(&ops, 999)` for ISO's strict rule).
+- Token-level distinctions stay in `peek`, which is told whether a term
+  starts at the token (`prefix`): there a name followed directly by `(`
+  (functional notation `-(1)`) and a sign followed directly by a number
+  (`-1`, a negative literal; `- 1` is `-(1)`) are `Tok.Term`, while after
+  a term the same tokens are infix operators (`X-1`, `a -(b)`).
+- `Ops.parse<P, E, X>(p, max)` and `parse_arg<P, E, X>(p)` are the same
+  driver called with explicit type arguments (the `OpHooks` methods
+  exist because `E` and `X` are not inferred from `P`'s `impl`).
+
+The Prolog reader (`examples/prolog/reader.lm`) parses with it;
+`tests/run/std_parse_ops.lm` is a small Prolog-term reader.
 
 `Span` and `SourceMap` live in `std.diag`.
 

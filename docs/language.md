@@ -13,7 +13,8 @@ between this design and the compiler.
 - [0. Principles](#0-principles)
 - [1. Core language](#1-core-language):
   [1.1 Types](#11-types) (including `iN`/`uN`),
-  [1.2 Basics](#12-basics) ([bindings and loops](#bindings-loops-and-types),
+  [1.2 Basics](#12-basics) ([lexical structure](#lexical-structure),
+  [bindings and loops](#bindings-loops-and-types),
   [patterns](#patterns-literals-and-match),
   [warnings and attributes](#warnings-attributes-and-tests),
   [generics and traits](#generics-and-traits),
@@ -121,6 +122,23 @@ struct Span { start: u32, end: u32 }
 enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
 ```
 
+#### Lexical structure
+
+- Comments are `// ..` to the end of the line and `/* .. */`, which
+  nest.
+- Integer literals are decimal, `0x`, `0o` or `0b`, with `_` between
+  digits allowed (`1_000_000`); float literals have a fraction or an
+  exponent (`1.5`, `2e-3`; `1..2` is a range).
+- Character literals (`'a'`, `'\n'`, same escapes as strings) are byte values: integers.
+- String literals (`"..."`, type `str`) take the escapes `\n`, `\t`,
+  `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH`, and may span lines.
+- **Raw string literals** `r"..."` process no escapes: a backslash is
+  a backslash, so text in another language's syntax (a Prolog library,
+  a regular expression, a grammar) is written as is. `r#"..."#` may
+  contain `"`: it ends at `"` followed by as many `#`s as it began
+  with (`r##"say "#hi"#"##`). They may span lines and have type `str`,
+  like other string literals.
+
 #### Bindings, loops and types
 
 - `let` declares an immutable binding and `var` a mutable one. Blocks are expressions.
@@ -148,6 +166,12 @@ enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
   is local: it does not look at later uses of `r`, so `var r = Ok(false);`
   needs an annotation (`var r: Result<bool, str> = Ok(false);`), and the
   error says so.
+- **Literal arithmetic** takes its type from the other operand: in
+  `(16 + 8 + 8 * n) >> 4` with `n: u64`, `16 + 8` is `u64` (without
+  another operand or an annotation it is `i64`).
+- **Array lengths from the literal.** `let t: [(str, u32); _] = [..];`
+  takes the length from the array literal, so a table's annotation need
+  not count its rows.
 - **Reserved words**: `fn let var if else while loop for in return break
   continue struct enum const import extern export match as true false and
   or pub defer unsafe never`. They cannot be names (`in` included: write
@@ -1282,6 +1306,16 @@ fn main() {
 Switching `repr` is a one-word change, which makes the representation
 something you can benchmark rather than something you commit to on day one.
 
+**`#[scan_raw_words]`** on a value type asks the compiler to guarantee
+that every word below 2^48 (a user-space pointer on x86-64 and AArch64,
+or a small non-negative integer) reads as a variant without references,
+and is an error if the layout does not (only `repr nanbox` with an
+unboxed float variant does: such words are floats). A root scanner may
+then `gc_mark` memory that mixes raw pointers and counts with values of
+the type, word by word, as Prolog's environment stack does (frames of
+`{ ce: *Frame, cp: *u32, n: u64 }` followed by terms); switching the
+type to `lowtag` then fails to compile instead of breaking the scanner.
+
 ---
 
 ## 3. The `vm` declaration
@@ -1800,7 +1834,10 @@ the size `next` skips, go through thread-local slots, and the state stays
 in registers. Called from a superinstruction's part before the last, it
 also gets where its `next` continues (the super's next part, section
 7.3), in one more slot; shared copies never called that way have none. `#[inline]` on the function inlines every call;
-`#[inline(never)]` makes every call in tail-call mode use the shared copy.
+`#[inline(never)]` makes every call in tail-call mode use the shared copy
+(it is `noinline` in LLVM; a copy that never reads the calling
+instruction's word is passed none, so cold callers need not keep it
+live).
 
 **Passing the inline cache.** A vm function (either kind) can take the
 calling op's inline cache as a parameter of type `cache Name`, and the
@@ -1960,11 +1997,41 @@ and are marked unlikely (`status.md`). Branches into cold blocks are
 weighted as unlikely.
 
 A call left inline (a slow path outside `cold`, an inline cold block, a
-panic for `.unwrap()` or a failed bounds check, a write barrier's
-`remember`) needs an aligned stack, and LLVM often sets up the frame at
+panic for `.unwrap()` or a failed bounds check, the free-list refill of
+`new`) needs an aligned stack, and LLVM often sets up the frame at
 the handler's entry rather than on the rare path, so every execution
 pays a `push` or more. `-W handler_frame` finds such handlers in the
-generated code (section 1.2, under Warnings). Outlining fall-through cold blocks as
+generated code (section 1.2, under Warnings).
+
+**Allocating and storing references in a handler.** The write barrier
+after `o.f = v` makes no call (its rare slow path pushes onto the
+remembered set inline), so stores of references cost a handler no frame;
+stores of values statically free of references (`Term.Unb`, `Int(n)`,
+`None`, literals of such) have no barrier at all. `new` does call: its
+free-list refill (rare, but a call site) gives the handler a frame. In a
+handler, allocate with `try_new`, which takes only the allocator's
+inline path and is `None` where `new` would refill, and refill in a cold
+block that runs the op again:
+
+<!-- snippet: skip excerpt of a vm, declarations elided -->
+```loimi
+op CONS(dst: reg, a: reg, b: reg) : ABC {
+    let Some(c) = try_new(&ctx.heap, Pair { head: a, tail: b }) else cold {
+        gc.make_room(&ctx.heap, size_of<Pair>());   // never collects
+        redo
+    };
+    dst = Value.Pair(c);
+    next
+}
+```
+
+`try_new(h, T { .. })` (and `try_new(h, T { .. }, n)` for a trailing
+array) has type `?Gc<T>`; nothing before it in the op may have side
+effects that `redo` would repeat. Objects over 496 bytes (with the
+header) and the zeroing of a trailing array whose length is not a
+constant are calls (`std.gc.alloc_large`, `memset`) as with `new`.
+
+Outlining fall-through cold blocks as
 calls that return (`preserve_most`, with their captures and the state
 they change through thread-locals) was considered and not built: the
 pattern that needs it is a `cold` block in a plain vm function such as
@@ -2492,8 +2559,9 @@ reserves and zero-fills it, and the disassembler prints it. Inside the handler,
 `cache.shape` reads and writes the words directly.
 
 **Field types and sizes.** A field is an integer, a float, `bool`, a
-pointer, a function pointer, or an option of a pointer (`?*Shape`, None
-is null, which is what a zero-filled cache holds). Each field starts a
+pointer, a function pointer, an option of a pointer (`?*Shape`, None
+is null, which is what a zero-filled cache holds), or the vm's resume
+point `Vm.Resume` (below). Each field starts a
 new code word and takes as many words as its type needs: in a `u32`
 vm, `u32` and smaller take one word, and `u64`, `f64` and pointers take
 two, so `PropIC` above is three words and `op_size` of `GETPROP` is 4.
@@ -2509,6 +2577,42 @@ alignment the field does not have; read the field, or assign it. Fields
 no wider than a word may still be passed by address. Wide fields are
 written with ordinary stores, which are not atomic if the code is shared
 between threads.
+
+**Initial contents.** `Vm.emit.OP_cached(code, at, operands.., fields..)`
+emits an op with its cache's integer, `bool` and pointer fields set (in
+declaration order; other fields zero). It is generated for ops whose
+cache has such fields, in programs that name one.
+
+**Code addresses: `Vm.Resume` fields.** A cache field of type
+`Vm.Resume` holds a resume point (section 6, "Resume points"), an
+instruction boundary of verified code, so `jump cache.to` is a jump
+to verified code that `#[require_verified]` accepts, with no `unsafe`.
+A try chain (Prolog's TRY/RETRY/TRUST, each continuing at a clause) or
+a call site that caches its callee's code is built this way. Such a
+field is set only by vm code (`cache.to = next_resume`, or any other
+`Vm.Resume`) and by the host through the proof:
+
+- the verifier sets every `Vm.Resume` field of the code it checks to
+  `Vm.Resume.placeholder()` (which traps if jumped to), whatever the
+  words held: words the host wrote are not trusted;
+- `v.fill_resumes(vals) -> bool`, on a `Verified<Vm>` (or a verified
+  array, `p.code`), writes `vals[0]`, `vals[1]`, .. into the resume
+  fields of its instructions in code order, and is false if their
+  number differs from `vals.len` (it fills what it can);
+- `deopt` keeps resume fields (it zeroes the rest of each cache).
+
+<!-- snippet: skip excerpt: Prolog's try chains (examples/prolog), declarations elided -->
+```loimi
+cache Target { to: Wam.Resume }
+op TRY(n: imm) : A + Target { push_choice(n, next_pc); jump cache.to }
+
+// chain = [TRY, RETRY, .., TRUST] with zeroed caches, then
+let ch = Wam.build_verified(heap, Code {}, words, &vc)?;
+ch.code.fill_resumes(targets);   // targets[i] = clause[i].code.resume_at(0).unwrap()
+```
+
+As for other resume points, what is not checked is that the target
+code is still alive: the vm keeps it reachable.
 
 **No GC references.** A cache field cannot hold `Gc<T>`, a `value` type
 or anything else the collector traces: the collector does not scan

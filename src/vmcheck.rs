@@ -419,7 +419,14 @@ fn cache_infos(c: &mut Checker, m: usize, d: &VmDecl, l: &mut crate::vmexpand::V
                 return Err(Diag::new(f.span, format!("duplicate field `{}` in cache `{}`", f.name, cd.name.name)));
             }
             let ft = c.resolve_type(m, t)?;
-            if let Some(why) = bad_cache_type(&ft) {
+            // `Vm.Resume`: a resume point of this vm (verified code's
+            // instruction boundary), reset by the verifier and set by
+            // `fill_resumes` or by vm code.
+            let resume = match c.scopes[m].get(&format!("{}__Resume", d.name.name)) {
+                Some((Def::Struct(sid), _)) => Some(Ty::Struct(*sid)),
+                _ => None,
+            };
+            if Some(&ft) != resume.as_ref() && let Some(why) = bad_cache_type(&ft) {
                 return Err(Diag::new(t.span, format!("cache field `{}` has type `{}`: {}", f.name, c.ty_name(&ft), why)));
             }
             let words = crate::layout::size_of(&c.prog, &ft).max(1).div_ceil(wb) as u32;
@@ -650,7 +657,14 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
             let shared = if dispatch == Dispatch::TailCall && inline != Some(true) {
                 let idx = never_fns.len() as u32;
                 let sym = format!("{}.fn.{}", prefix, f.name.name);
-                Some(new_fn(c, sym, f.name.name.clone(), state_tys.clone(), ret.clone(), cc, vm, VmRole::Shared(idx), f.name.span))
+                let sid = new_fn(c, sym, f.name.name.clone(), state_tys.clone(), ret.clone(), cc, vm, VmRole::Shared(idx), f.name.span);
+                // `#[inline(never)]`: keep the one shared copy out of
+                // line (LLVM would otherwise inline the `musttail` calls
+                // to it back into every caller).
+                if inline == Some(false) {
+                    c.prog.fns[sid as usize].inline = Some(false);
+                }
+                Some(sid)
             } else {
                 None
             };
@@ -1634,7 +1648,7 @@ fn bad_cache_type(t: &Ty) -> Option<&'static str> {
         Ty::Gc(_) | Ty::Value(_) | Ty::Option(_) => Some(
             "inline caches cannot hold GC references, since the collector does not scan bytecode; cache a pointer to a non-moving structure, an id or a version number, and validate it on use",
         ),
-        _ => Some("cache fields must be integers, floats, `bool`, pointers or function pointers"),
+        _ => Some("cache fields must be integers, floats, `bool`, pointers, function pointers or the vm's `Resume`"),
     }
 }
 

@@ -349,6 +349,22 @@ pub fn check_value_decl(c: &mut Checker, m: usize, v: &ValueDecl) -> Res<ValueDe
             c.warnings.push(w);
         }
     }
+    // `#[scan_raw_words]`: a root scanner may read memory that mixes
+    // values with raw pointers and small integers as values. Only a
+    // nanbox whose unboxed (float) variant takes every word below 2^48
+    // guarantees that.
+    if let Some(sp) = v.scan_raw {
+        let ok = repr == ValueRepr::NanBox && variants.iter().any(|x| x.unboxed && x.payload.as_ref().is_none_or(|t| !matches!(t, Ty::Gc(_)))) && num_limit >= 1u64 << 48;
+        if !ok {
+            return Err(Diag::new(
+                sp,
+                format!(
+                    "`#[scan_raw_words]`: `{}` does not read every word below 2^48 as a variant without references (that needs `repr nanbox` with an unboxed float variant)",
+                    v.name.name
+                ),
+            ));
+        }
+    }
     Ok(ValueDef { name: format!("{}.{}", c.module_prefix(m), v.name.name), repr, variants, num_limit, layout })
 }
 

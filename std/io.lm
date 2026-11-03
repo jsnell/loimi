@@ -85,3 +85,91 @@ pub fn read_file(path: str) -> ?str {
 
 /// Release a string returned by `read_file`.
 pub fn free_file(s: str) { free(s.ptr); }
+
+// ── Out: buffered output ────────────────────────────────────────────────
+
+/// A buffered writer on a file descriptor: `print` copies into the
+/// buffer and writes it out (one `write(2)`) when it is full; `flush`
+/// writes what is buffered. Nothing is written at exit by itself:
+/// `flush` (or `free`) before the program ends, and before writing to the
+/// same terminal another way (`io.eprint` for an error message, or
+/// `io.print`), or the output comes out of order.
+pub struct Out { fd: i32, buf: *u8, len: u64, cap: u64 }
+
+/// A writer on stdout with a 64 KiB buffer.
+pub fn Out.stdout() -> Out { Out.new(1, 65536) }
+
+/// A writer on `fd` with a buffer of `cap` bytes (at least 1).
+pub fn Out.new(fd: i32, cap: u64) -> Out {
+    let c = if cap == 0 { 1 } else { cap };
+    Out { fd: fd, buf: malloc(c), len: 0, cap: c }
+}
+
+fn write_all(fd: i32, p: *u8, n: u64) {
+    var off: u64 = 0;
+    while off < n {
+        let w = write(fd, p + off, n - off);
+        if w <= 0 { return; }
+        off += w as u64;
+    }
+}
+
+/// Write out what is buffered.
+pub fn Out.flush(o: *Out) {
+    if o.len > 0 { write_all(o.fd, o.buf, o.len); o.len = 0; }
+}
+
+/// Buffer `s`; a string that does not fit in an empty buffer is
+/// written directly.
+pub fn Out.print(o: *Out, s: str) {
+    if o.len + s.len > o.cap {
+        o.flush();
+        if s.len >= o.cap { write_all(o.fd, s.ptr, s.len); return; }
+    }
+    memcpy(o.buf + o.len, s.ptr, s.len);
+    o.len += s.len;
+}
+
+pub fn Out.println(o: *Out, s: str) { o.print(s); o.byte('\n'); }
+
+/// Buffer one byte.
+pub fn Out.byte(o: *Out, c: u8) {
+    if o.len == o.cap { o.flush(); }
+    o.buf[o.len] = c;
+    o.len += 1;
+}
+
+pub fn Out.print_int(o: *Out, x: i64) {
+    var buf: [u8; 24];
+    var i: u64 = 24;
+    var u: u64 = if x < 0 { 0 -% (x as u64) } else { x as u64 };
+    loop {
+        i -= 1;
+        buf[i] = '0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 { break; }
+    }
+    if x < 0 { i -= 1; buf[i] = '-'; }
+    o.print((&buf[i]).slice(24 - i));
+}
+
+/// `%.14g`, as `io.print_f64`.
+pub fn Out.print_f64(o: *Out, x: f64) {
+    var buf: [u8; 64];
+    let n = snprintf(&buf[0], 64, "%.14g\0".ptr, x);
+    o.print((&buf[0]).slice(n as u64));
+}
+
+pub fn Out.print_bool(o: *Out, b: bool) { o.print(if b { "true" } else { "false" }); }
+
+/// The number of bytes buffered.
+pub fn Out.buffered(o: *Out) -> u64 { o.len }
+
+/// Flush and release the buffer.
+pub fn Out.free(o: *Out) {
+    o.flush();
+    free(o.buf);
+    o.buf = 0 as *u8;
+    o.cap = 0;
+    o.len = 0;
+}

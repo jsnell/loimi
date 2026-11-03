@@ -188,4 +188,7 @@ pub struct ValueDecl {
     pub repr: Ident,
     pub variants: Vec<ValueVariant>,
     pub is_pub: bool,
+    /// `#[scan_raw_words]`: the layout must read every word below 2^48 as a
+    /// variant without references (checked).
+    pub scan_raw: Option<crate::diag::Span>,
 }

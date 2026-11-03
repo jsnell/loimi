@@ -1,0 +1,12 @@
+// `#[scan_raw_words]` needs a layout that reads raw pointers as variants
+// without references.
+// error: `#[scan_raw_words]`: `V` does not read every word below 2^48 as a variant without references (that needs `repr nanbox` with an unboxed float variant)
+import std.gc;
+object O { x: i64 }
+#[scan_raw_words]
+value V repr lowtag {
+    Int(i61),
+    Obj(Gc<O>),
+}
+
+fn main() {}

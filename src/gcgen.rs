@@ -407,8 +407,9 @@ define internal i64 @loimi_rootck_info() nounwind {{
     );
 }
 
-/// `new(heap, init, len?)`
-pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>) -> String {
+/// `new(heap, init, len?)`, or `try_new` (`fast`): null (`None`) where
+/// the allocator would refill a free list.
+pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>, fast: bool) -> String {
     let p = g.p();
     let h = g.val(heap);
     let v = g.val(init);
@@ -428,13 +429,31 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
     let tid = s.object.unwrap();
     // `--gc-check-roots`: `rootck_alloc` installs the sweeper that
     // poisons freed objects before the heap's first collection.
-    let alloc = if check_roots(g) { "std.gc.rootck_alloc" } else { "std.gc.alloc" };
+    // (`try_new` under `--gc-check-roots` always allocates.)
+    let alloc = if check_roots(g) {
+        "std.gc.rootck_alloc"
+    } else if fast {
+        "std.gc.try_alloc"
+    } else {
+        "std.gc.alloc"
+    };
     let obj = g.inst(format!("call ptr @\"{}\"(ptr {}, i64 {}, i32 {}, i64 {})", alloc, h, total, tid, n));
     if !s.fields.is_empty() {
         let lt = llty(p, &init.ty);
         // Objects are 8-byte aligned: a vector field is stored unaligned.
         let al = if crate::codegen::has_vector(p, &init.ty) { ", align 1" } else { "" };
-        g.emit(format!("store {} {}, ptr {}{}", lt, v, obj, al));
+        if fast && !check_roots(g) {
+            let ok = g.inst(format!("icmp ne ptr {}, null", obj));
+            let l_init = g.fresh_label("tn_init");
+            let l_done = g.fresh_label("tn_done");
+            g.cond_br(&ok, &l_init, &l_done);
+            g.label(&l_init);
+            g.emit(format!("store {} {}, ptr {}{}", lt, v, obj, al));
+            g.br(&l_done);
+            g.label(&l_done);
+        } else {
+            g.emit(format!("store {} {}, ptr {}{}", lt, v, obj, al));
+        }
     }
     let _ = e;
     obj
@@ -687,6 +706,22 @@ pub fn needs_barrier(g: &mut FnGen, lhs: &TExpr) -> bool {
         return false;
     }
     has_barrier(g)
+}
+
+/// Whether the value of `e` holds no GC reference, whatever its type
+/// says: a variant without references (`Term.Unb`, `Term.Int(n)`, `None`)
+/// or a literal tuple, struct or array of such. Storing it needs no
+/// write barrier.
+pub fn holds_no_refs(p: &Program, e: &TExpr) -> bool {
+    if !is_traced(p, &e.ty) {
+        return true;
+    }
+    match &e.kind {
+        TK::Variant(_, xs) | TK::Tuple(xs) | TK::Struct(xs) | TK::Array(xs) => xs.iter().all(|x| holds_no_refs(p, x)),
+        TK::ArrayRepeat(x, _) => holds_no_refs(p, x),
+        TK::Zeroed => true,
+        _ => false,
+    }
 }
 
 /// The object to pass to the write barrier after an assignment to `lhs`

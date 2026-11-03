@@ -290,7 +290,9 @@ pub enum TK {
     Unreachable,
     Vm(TVm),
     /// `new(heap, Obj { .. })` / `new(heap, Obj { .. }, n)`: allocate a GC object.
-    New { heap: B, init: B, len: Option<B> },
+    /// `fast`: `try_new`, which only takes the allocator's inline path and
+    /// gives `None` where `new` would refill a free list.
+    New { heap: B, init: B, len: Option<B>, fast: bool },
     /// The trailing array of an object, as a slice.
     Trailing(B),
     /// A closure literal: the closure's function and the captured locals,

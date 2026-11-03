@@ -8,6 +8,7 @@ import std.io;
 import std.os;
 import std.hash;
 import std.map.{HashMap};
+import std.parse;
 import term.{Term, Var, Struct, Cons, deref};
 import term;
 import machine.{Machine, Choice, unify, compare};
@@ -245,8 +246,7 @@ fn emit(m: *Machine, to_err: bool, s: str) {
         m.flush();
         io.eprint(s);
     } else {
-        m.out.push_str(s);
-        if m.out.len() > 65536 { m.flush(); }
+        m.out.print(s);
     }
 }
 
@@ -1031,7 +1031,7 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
         Op => {
             let p = get_int(m, x(m, 0))?;
             let ty = get_atom(m, x(m, 1))?;
-            let Some(typ) = reader.op_type_atom(m, m.db.name(ty)) else { return Err(domain_error(m, "operator_specifier", x(m, 1))); };
+            let Some(typ) = parse.op_type(m.db.name(ty)) else { return Err(domain_error(m, "operator_specifier", x(m, 1))); };
             let names = x(m, 2);
             if let Atom(a) = names {
                 if a != term.A_NIL { reader.add_op(m, p as u32, typ, a); }
@@ -1049,11 +1049,11 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
             defer items.free();
             var i: u64 = 0;
             let f = m.db.functor(m.db.atom("op"), 3);
-            while let Some(sl) = m.ops.next(&i) {
+            while let Some(e) = m.ops.next(&i) {
                 let s = m.mk_struct(f, 3);
-                s.args[0] = term.mk_int((sl.value >> 4) as i64);
-                s.args[1] = Term.Atom(m.db.atom(reader.op_type_name(sl.value & 15)));
-                s.args[2] = Term.Atom((sl.key >> 2) as u32);
+                s.args[0] = term.mk_int(e.op.prio as i64);
+                s.args[1] = Term.Atom(m.db.atom(e.op.typ.name()));
+                s.args[2] = Term.Atom(e.name as u32);
                 items.push(Term.Str(s));
             }
             Ok(unify(m, m.x[0], mk_list(m, &items, 0)))

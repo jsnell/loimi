@@ -265,7 +265,7 @@ fn walk<'a>(e: &'a TExpr, f: &mut dyn FnMut(Event<'a>)) {
                 go(x, f);
             }
         }
-        TK::New { heap, init, len } => {
+        TK::New { heap, init, len, .. } => {
             go(heap, f);
             go(init, f);
             if let Some(l) = len {

@@ -230,6 +230,9 @@ fn is_literal_expr(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Char(_) => true,
         ExprKind::Unary(UnOp::Neg, inner) => is_literal_expr(inner),
+        // `16 + 8` in `16 + 8 + n`: arithmetic on literals takes its type
+        // from the other operand too.
+        ExprKind::Binary(op, a, b) if !op.is_cmp() && !matches!(op, BinOp::LAnd | BinOp::LOr) => is_literal_expr(a) && is_literal_expr(b),
         // `Kind.COUNT` types like a literal.
         ExprKind::Field(_, n) => n.name == "COUNT",
         _ => false,
@@ -1427,9 +1430,15 @@ impl<'a> Checker<'a> {
                     stmts.push(TStmt::Defer(e));
                 }
                 Stmt::Let { pat, mutable, ty, init, els, span } => {
-                    let decl_ty = match ty {
-                        Some(t) => Some(self.resolve_type(cx.module, t)?),
-                        None => None,
+                    let decl_ty = match (ty, init) {
+                        // `let a: [T; _] = [x, y, z];`: the length from the literal.
+                        (Some(TypeExpr { kind: TypeKind::Array(inner, n), .. }), Some(Expr { kind: ExprKind::ArrayLit(xs), .. }))
+                            if matches!(&n.kind, ExprKind::Ident(x) if x == "_") =>
+                        {
+                            Some(Ty::Array(Box::new(self.resolve_type(cx.module, inner)?), xs.len() as u64))
+                        }
+                        (Some(t), _) => Some(self.resolve_type(cx.module, t)?),
+                        (None, _) => None,
                     };
                     let init = match init {
                         // `let f = |x: T| ..;`: a local `block fn`, with the
@@ -4095,12 +4104,13 @@ impl<'a> Checker<'a> {
                 Err(a) => heap = Some(a),
             }
         }
-        if (name == "new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
+        if (name == "new" || name == "try_new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
             return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
         }
-        if name == "new" {
+        if name == "new" || name == "try_new" {
+            let fast = name == "try_new";
             if args.len() != 2 && args.len() != 3 {
-                return Err(Diag::new(span, "`new` takes a heap, an object literal, and (for trailing arrays) a length"));
+                return Err(Diag::new(span, format!("`{}` takes a heap, an object literal, and (for trailing arrays) a length", name)));
             }
             let h = match heap.take() {
                 Some(h) => h,
@@ -4110,7 +4120,11 @@ impl<'a> Checker<'a> {
                 return Err(Diag::new(args[0].span, "the first argument of `new` must be a pointer to a heap"));
             }
             let want = match exp {
-                Some(Ty::Gc(t)) => Some((**t).clone()),
+                Some(Ty::Gc(t)) if !fast => Some((**t).clone()),
+                Some(Ty::Option(o)) if fast => match &**o {
+                    Ty::Gc(t) => Some((**t).clone()),
+                    _ => None,
+                },
                 _ => None,
             };
             let init = self.expr(cx, &args[1], want.as_ref())?;
@@ -4143,8 +4157,11 @@ impl<'a> Checker<'a> {
                 (Some(_), _) => return Err(Diag::new(span, "this object has a trailing array: pass its length")),
                 (None, _) => return Err(Diag::new(span, "this object has no trailing array")),
             };
-            let t = Ty::Gc(Box::new(init.ty.clone()));
-            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len }, span)));
+            let mut t = Ty::Gc(Box::new(init.ty.clone()));
+            if fast {
+                t = Ty::Option(Box::new(t));
+            }
+            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len, fast }, span)));
         }
         if name == "__verified_words" {
             // In a vm's generated code (`Vm.build_verified`): the words of

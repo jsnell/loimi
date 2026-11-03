@@ -1,0 +1,30 @@
+// Raw string literals: r"..." and r#"..."# (any number of #s), with no
+// escape processing; they may span lines. `r` alone is still a name.
+// expect: \+ a :- \n \t \\
+// expect: say "hi" \x41
+// expect: a "# b
+// expect:
+// expect: 12
+// expect: line one
+// expect:   \line two
+// expect: true
+// expect: 5
+
+import std.io;
+import std.mem;
+
+fn main() {
+    io.println(r"\+ a :- \n \t \\");
+    io.println(r#"say "hi" \x41"#);
+    io.println(r##"a "# b"##);
+    io.println(r"");
+    io.print_int(r"\n\t\\\x41\'".len as i64);
+    io.println("");
+    io.println(r"line one
+  \line two");
+    io.print_bool(mem.equal_bytes(r"a\n", "a\\n"));
+    io.println("");
+    let r = 5;
+    io.print_int(r);
+    io.println("");
+}

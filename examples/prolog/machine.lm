@@ -8,11 +8,13 @@ import std.text;
 import std.hash;
 import std.io;
 import std.map.{HashMap};
+import std.parse;
 import term.{Term, Var, Struct, Cons, Db, deref};
 import term;
 import std.bigint;
 import arith;
-import compile.{Pred, Clause};
+import compile.{Pred, Clause, Code};
+import vm.{Wam};
 
 pub const NREGS: u64 = 256;
 const ESTACK_WORDS: u64 = 8 * 1024 * 1024;    // 64 MiB
@@ -62,16 +64,18 @@ pub struct Machine {
     bags: mem.Vec<Term>,
     preds: mem.Vec<*Pred>,
     consts: mem.Vec<Term>,
-    out: text.StrBuf,
+    out: io.Out,
     flags_dq: u32,
     halted: bool,
     halt_code: i32,
     gensym: u64,
     stress: bool,
-    ops: HashMap<u64, u32>,
+    ops: parse.Ops,
     clauses: mem.Vec<*Clause>,
-    fail_code: *u32,
-    true_code: *u32,
+    fail_code: Verified<Wam>,
+    true_code: Verified<Wam>,
+    /// Every code object (never freed: see `compile.finish`).
+    codes: mem.Vec<Gc<Code>>,
     trust_fail: *u32,
     halt_true: *u32,
     halt_false: *u32,
@@ -139,6 +143,24 @@ pub fn Machine.bind(m: *Machine, v: Gc<Var>, t: Term) {
     if v.stamp < m.b.stamp { m.push_trail(Term.Ref(v)); }
 }
 
+/// `new_var` and a list cell without the allocator's refill (a call,
+/// which would give a handler a stack frame): None when the free list is
+/// empty; `make_room` refills it, and the op runs again (`redo`).
+#[inline]
+pub fn Machine.try_var(m: *Machine) -> ?Term {
+    match try_new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }) {
+        Some(v) => Some(Term.Ref(v)),
+        None => None,
+    }
+}
+#[inline]
+pub fn Machine.try_cons(m: *Machine) -> ?Gc<Cons> {
+    try_new(&m.heap, Cons { head: Term.Unb, tail: Term.Unb })
+}
+/// (`Var` and `Cons` are the same size.)
+#[cold]
+pub fn Machine.make_room(m: *Machine) { gc.make_room(&m.heap, size_of<Cons>()); }
+
 #[inline]
 pub fn Machine.new_var(m: *Machine) -> Term {
     Term.Ref(new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }))
@@ -150,9 +172,7 @@ pub fn Machine.untrail(m: *Machine, to: u64) {
     while i > to {
         i -= 1;
         match m.trail[i] {
-            // A raw store: the compiler's write barrier would run for this
-            // store too, though `Unb` is no reference.
-            Ref(v) => *(v as *Term) = Term.Unb,
+            Ref(v) => v.val = Term.Unb,
             Int(off) => {
                 // A catch/3 that exited with choicepoints left: backtracking
                 // into its goal makes it active again.
@@ -358,10 +378,7 @@ pub fn term_vars(t0: Term, out: *mem.Vec<Term>, seen: *HashMap<u64, bool>) {
 }
 
 pub fn Machine.flush(m: *Machine) {
-    if m.out.len() > 0 {
-        io.print(m.out.as_str());
-        m.out.clear();
-    }
+    m.out.flush();
 }
 
 /// The root scanner: argument registers, the live part of the environment
@@ -377,7 +394,8 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     for i in 0..m.consts.len { gc_mark(h, m.consts.ptr[i]); }
     for i in 0..m.tr { gc_mark(h, m.trail[i]); }
     // Environments: everything below the live top is scanned. Frames hold
-    // raw pointers next to terms, which read as floats (term.lm). Above the
+    // raw pointers next to terms, which read as floats: `Term` is
+    // `#[scan_raw_words]`, which the compiler checks (term.lm). Above the
     // live top, words written since the last collection are zeroed so that
     // the next frames there never expose a stale reference.
     var top = m.e.end();
@@ -397,6 +415,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     }
     var gi: u64 = 0;
     while let Some(sl) = m.globals.next(&gi) { gc_mark(h, sl.value); }
+    for i in 0..m.codes.len { gc_mark(h, m.codes.ptr[i]); }
     for i in 0..m.preds.len {
         let pr = m.preds.ptr[i];
         var cur = pr.first;

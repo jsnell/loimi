@@ -498,6 +498,6 @@ impl Parser {
             }
         }
         self.expect("}")?;
-        Ok(ValueDecl { name, repr, variants, is_pub })
+        Ok(ValueDecl { name, repr, variants, is_pub, scan_raw: None })
     }
 }

@@ -1,0 +1,87 @@
+// matrix: dispatch
+// Resume points in inline caches (`cache T { to: V.Resume }`): code
+// addresses in the instruction stream that `jump` may take under
+// `#[require_verified]`. The verifier resets such fields to the
+// placeholder (words the host wrote are not trusted); `fill_resumes` sets
+// them on verified code, in code order. `emit.OP_cached` writes a cache's
+// other fields. `deopt_words` keeps resume fields.
+import std.io;
+
+struct Proto { nregs: u32 }
+
+#[require_verified]
+vm V {
+    context ctx: *Proto;
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+    }
+    /// Where to go, and how much to add first.
+    cache Go { add: u32, to: V.Resume, hits: u16 }
+
+    op INC(a: reg) : ABC { a = a + 1; next }
+    op GO(a: reg) : ABC + Go {
+        a = a + cache.add as i64;
+        cache.hits += 1;
+        jump cache.to
+    }
+    op RET(a: reg) : ABC { exit a }
+
+    entry run(c: *Proto, code: Verified<V>, r: *i64) -> i64 { ctx = c; regs = r; jump code }
+}
+
+fn main() {
+    var p = Proto { nregs: 1 };
+    var regs: [i64; 1] = [0; 1];
+    // Target code: INC r0; INC r0; RET r0.
+    var tw: [u32; 3] = [0; 3];
+    var at: u64 = 0;
+    at = V.emit.INC(tw[..], at, 0);
+    at = V.emit.INC(tw[..], at, 0);
+    at = V.emit.RET(tw[..], at, 0);
+    let Ok(t) = V.verify(tw[..], &p) else { io.println("target not verified"); return; };
+    // Code: GO r0 (add 10, to t at 1); GO r0 (add 100, to t at 0).
+    let gs = 1 + V.CW_Go;
+    var gw: [u32; 32] = [0; 32];
+    at = 0;
+    at = V.emit.GO_cached(gw[..], at, 0, 10, 7);
+    io.print("cached words: ");
+    io.print_int(gw[1] as i64);
+    io.print(" ");
+    io.print_int(gw[gs - 1] as i64);
+    io.println("");
+    // A forged address in the resume field: the verifier resets it.
+    gw[2] = 12345;
+    at = V.emit.GO_cached(gw[..], at, 0, 100, 0);
+    let g = gw[0..at];
+    let Ok(v) = V.verify(g, &p) else { io.println("not verified"); return; };
+    let ph = V.Resume.placeholder().pc() as u64;
+    let lo = ph & 0xFFFFFFFF;
+    io.println(if (gw[2] as u64) == lo { "reset to placeholder" } else { "not reset" });
+    // Wrong counts are refused.
+    let one: [V.Resume; 1] = [t.resume_at(0).unwrap()];
+    io.println(if v.fill_resumes(one[..]) { "filled 1?" } else { "1 refused" });
+    let two: [V.Resume; 2] = [t.resume_at(1).unwrap(), t.resume_at(0).unwrap()];
+    io.println(if v.fill_resumes(two[..]) { "filled 2" } else { "2 refused" });
+    // The first GO jumps into t at INC (word 1): 0 + 10 + 1.
+    io.print_int(V.run(&p, v, &regs[0]));
+    io.println("");
+    // Deoptimized: `add` is 0 again, the target stays: 0 + 1.
+    regs[0] = 0;
+    V.deopt_words(g);
+    io.println(if (gw[2] as u64) == ((two[0].pc() as u64) & 0xFFFFFFFF) { "deopt kept the resume point" } else { "deopt dropped it" });
+    io.print_int(V.run(&p, v, &regs[0]));
+    io.println("");
+}
+
+// expect: cached words: 10 7
+// expect: reset to placeholder
+// expect: 1 refused
+// expect: filled 2
+// expect: 11
+// expect: deopt kept the resume point
+// expect: 1

@@ -57,6 +57,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("c_const", "`export \"C\"` functions (pointer parameters `const` in C)"),
     ("test", "functions without parameters (run by `loimi test`)"),
     ("track_caller", "functions (`test.caller()` is the call's location)"),
+    ("scan_raw_words", "`value` types (words below 2^48 read as variants without references)"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
 pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "catch_panic", "c_const", "test", "track_caller"];
@@ -99,7 +100,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }
@@ -630,6 +631,7 @@ impl Parser {
             "enum" => ("an `enum`".into(), &["c_name"]),
             "struct" => ("a `struct`".into(), &["c_name"]),
             "object" => ("an `object`".into(), &["trace"]),
+            "value" => ("a `value` type".into(), &["scan_raw_words"]),
             "impl" | "import" => (format!("an `{}`", kw), &[]),
             "" => ("an item".into(), &[]),
             _ => (format!("a `{}`", kw), &[]),
@@ -834,7 +836,9 @@ impl Parser {
             return Ok(Item::Vm(Box::new(self.parse_vm(attrs, is_pub)?)));
         }
         if self.is_kw("value") {
-            return Ok(Item::Value(self.parse_value_decl(is_pub)?));
+            let mut v = self.parse_value_decl(is_pub)?;
+            v.scan_raw = attrs.list.iter().find(|a| a.0 == "scan_raw_words").map(|a| a.2);
+            return Ok(Item::Value(v));
         }
         self.err(format!("expected an item, found {}", self.describe()))
     }
