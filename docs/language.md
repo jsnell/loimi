@@ -1013,8 +1013,9 @@ inline for (name, cc) in [("JLT", Cond.Lt), ("JLE", Cond.Le), ("JEQ", Cond.Eq)] 
 ```
 
 **Conditional compilation.** `#[cfg(NAME)]` keeps the item (an
-`import`, a function, a `var`, a struct, ...), struct field or
-statement after it only when the build was given `--cfg NAME`;
+`import`, a function, a `var`, a struct, ...), struct field, field
+initializer in a struct literal, or statement after it only when the
+build was given `--cfg NAME`;
 `#[cfg(not(NAME))]` keeps it only without. The parser drops what is not
 kept, before names are resolved, so a build without the name compiles
 exactly as if the code were not there: the IR does not change. Mini's

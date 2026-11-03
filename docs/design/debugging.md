@@ -378,8 +378,8 @@ nested runs from natives (`sorted` keys, `next(g)`, `g.send`,
 (locations, `(Pdb)`, `where`), with gdb's `finish`.
 
 **Size.** `examples/python/debugger.lm` is 554 lines of code (Mini's: 333),
-plus `#[cfg(debug)]` hooks on 25 existing lines of the vm, compiler and
-`main` (Mini: 15). The difference is display and locals, not stepping:
+plus 25 `#[cfg(debug)]` items in the vm, compiler and `main`, on
+existing lines but for two helpers at the end of `compile.lm` (Mini: 15). The difference is display and locals, not stepping:
 showing values without running Python code (Python's `repr` may call
 `__repr__`, so the debugger has its own, 107 lines; Mini reuses
 `write_value`), and tracking where locals are bound (102 lines; Mini's
