@@ -405,6 +405,136 @@ fn T.need_memory(t: *T) -> Result<(), str> {
     Ok(())
 }
 
+
+/// The signed value of a constant of an integer type.
+fn const_value(v: Val) -> i64 {
+    if v.ty == T_I32 { ((v.x as u32) as i32) as i64 } else { v.x as i64 }
+}
+
+fn fits16(x: i64) -> bool { x >= -32768 and x <= 32767 }
+
+/// (reg op, K op, commutative)
+fn kforms() -> [(u64, u64, bool); 38] {
+    [
+        (W.OP_I32_ADD, W.OP_I32_ADDK, true), (W.OP_I32_MUL, W.OP_I32_MULK, true),
+        (W.OP_I32_AND, W.OP_I32_ANDK, true), (W.OP_I32_OR, W.OP_I32_ORK, true),
+        (W.OP_I32_XOR, W.OP_I32_XORK, true), (W.OP_I32_SHL, W.OP_I32_SHLK, false),
+        (W.OP_I32_SHR_S, W.OP_I32_SHR_SK, false), (W.OP_I32_SHR_U, W.OP_I32_SHR_UK, false),
+        (W.OP_I32_EQ, W.OP_I32_EQK, true), (W.OP_I32_NE, W.OP_I32_NEK, true),
+        (W.OP_I32_LT_S, W.OP_I32_LT_SK, false), (W.OP_I32_LT_U, W.OP_I32_LT_UK, false),
+        (W.OP_I32_GT_S, W.OP_I32_GT_SK, false), (W.OP_I32_GT_U, W.OP_I32_GT_UK, false),
+        (W.OP_I32_LE_S, W.OP_I32_LE_SK, false), (W.OP_I32_LE_U, W.OP_I32_LE_UK, false),
+        (W.OP_I32_GE_S, W.OP_I32_GE_SK, false), (W.OP_I32_GE_U, W.OP_I32_GE_UK, false),
+        (W.OP_I64_ADD, W.OP_I64_ADDK, true), (W.OP_I64_MUL, W.OP_I64_MULK, true),
+        (W.OP_I64_AND, W.OP_I64_ANDK, true), (W.OP_I64_OR, W.OP_I64_ORK, true),
+        (W.OP_I64_XOR, W.OP_I64_XORK, true), (W.OP_I64_SHL, W.OP_I64_SHLK, false),
+        (W.OP_I64_SHR_S, W.OP_I64_SHR_SK, false), (W.OP_I64_SHR_U, W.OP_I64_SHR_UK, false),
+        (W.OP_I64_EQ, W.OP_I64_EQK, true), (W.OP_I64_NE, W.OP_I64_NEK, true),
+        (W.OP_I64_LT_S, W.OP_I64_LT_SK, false), (W.OP_I64_LT_U, W.OP_I64_LT_UK, false),
+        (W.OP_I64_GT_S, W.OP_I64_GT_SK, false), (W.OP_I64_GT_U, W.OP_I64_GT_UK, false),
+        (W.OP_I64_LE_S, W.OP_I64_LE_SK, false), (W.OP_I64_LE_U, W.OP_I64_LE_UK, false),
+        (W.OP_I64_GE_S, W.OP_I64_GE_SK, false), (W.OP_I64_GE_U, W.OP_I64_GE_UK, false),
+        (W.OP_I32_SUB, W.OP_I32_ADDK, false), (W.OP_I64_SUB, W.OP_I64_ADDK, false),
+    ]
+}
+
+fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
+    let h = t.home(p);
+    let ks = kforms();
+    for i in 0..38 {
+        let (rop, kop, comm) = ks[i];
+        if rop != op { continue; }
+        let sub = op == W.OP_I32_SUB or op == W.OP_I64_SUB;
+        if b.loc == Loc.Const {
+            var k = const_value(b);
+            if sub { k = 0 - k; }
+            if fits16(k) {
+                let ra = t.reg(a, p);
+                t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, ra as u16, k as i16), kop), h);
+                return;
+            }
+        }
+        if comm and a.loc == Loc.Const and fits16(const_value(a)) {
+            let rb = t.reg(b, p + 1);
+            t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, rb as u16, const_value(a) as i16), kop), h);
+            return;
+        }
+        break;
+    }
+    let ra = t.reg(a, p);
+    let rb = t.reg(b, p + 1);
+    t.emit_def(rrr(op, h, ra, rb), h);
+}
+
+/// Compare ops that fuse with a following branch:
+/// (compare op, branch if true, branch if false, compare is a K form).
+fn fusions() -> [(u64, u64, u64, bool); 40] {
+    [
+        (W.OP_I32_EQ, W.OP_BR_I32_EQ, W.OP_BR_I32_NE, false), (W.OP_I32_NE, W.OP_BR_I32_NE, W.OP_BR_I32_EQ, false),
+        (W.OP_I32_LT_S, W.OP_BR_I32_LT_S, W.OP_BR_I32_GE_S, false), (W.OP_I32_GE_S, W.OP_BR_I32_GE_S, W.OP_BR_I32_LT_S, false),
+        (W.OP_I32_GT_S, W.OP_BR_I32_GT_S, W.OP_BR_I32_LE_S, false), (W.OP_I32_LE_S, W.OP_BR_I32_LE_S, W.OP_BR_I32_GT_S, false),
+        (W.OP_I32_LT_U, W.OP_BR_I32_LT_U, W.OP_BR_I32_GE_U, false), (W.OP_I32_GE_U, W.OP_BR_I32_GE_U, W.OP_BR_I32_LT_U, false),
+        (W.OP_I32_GT_U, W.OP_BR_I32_GT_U, W.OP_BR_I32_LE_U, false), (W.OP_I32_LE_U, W.OP_BR_I32_LE_U, W.OP_BR_I32_GT_U, false),
+        (W.OP_I64_EQ, W.OP_BR_I64_EQ, W.OP_BR_I64_NE, false), (W.OP_I64_NE, W.OP_BR_I64_NE, W.OP_BR_I64_EQ, false),
+        (W.OP_I64_LT_S, W.OP_BR_I64_LT_S, W.OP_BR_I64_GE_S, false), (W.OP_I64_GE_S, W.OP_BR_I64_GE_S, W.OP_BR_I64_LT_S, false),
+        (W.OP_I64_GT_S, W.OP_BR_I64_GT_S, W.OP_BR_I64_LE_S, false), (W.OP_I64_LE_S, W.OP_BR_I64_LE_S, W.OP_BR_I64_GT_S, false),
+        (W.OP_I64_LT_U, W.OP_BR_I64_LT_U, W.OP_BR_I64_GE_U, false), (W.OP_I64_GE_U, W.OP_BR_I64_GE_U, W.OP_BR_I64_LT_U, false),
+        (W.OP_I64_GT_U, W.OP_BR_I64_GT_U, W.OP_BR_I64_LE_U, false), (W.OP_I64_LE_U, W.OP_BR_I64_LE_U, W.OP_BR_I64_GT_U, false),
+        (W.OP_I32_EQK, W.OP_BR_I32_EQK, W.OP_BR_I32_NEK, true), (W.OP_I32_NEK, W.OP_BR_I32_NEK, W.OP_BR_I32_EQK, true),
+        (W.OP_I32_LT_SK, W.OP_BR_I32_LT_SK, W.OP_BR_I32_GE_SK, true), (W.OP_I32_GE_SK, W.OP_BR_I32_GE_SK, W.OP_BR_I32_LT_SK, true),
+        (W.OP_I32_GT_SK, W.OP_BR_I32_GT_SK, W.OP_BR_I32_LE_SK, true), (W.OP_I32_LE_SK, W.OP_BR_I32_LE_SK, W.OP_BR_I32_GT_SK, true),
+        (W.OP_I32_LT_UK, W.OP_BR_I32_LT_UK, W.OP_BR_I32_GE_UK, true), (W.OP_I32_GE_UK, W.OP_BR_I32_GE_UK, W.OP_BR_I32_LT_UK, true),
+        (W.OP_I32_GT_UK, W.OP_BR_I32_GT_UK, W.OP_BR_I32_LE_UK, true), (W.OP_I32_LE_UK, W.OP_BR_I32_LE_UK, W.OP_BR_I32_GT_UK, true),
+        (W.OP_I64_EQK, W.OP_BR_I64_EQK, W.OP_BR_I64_NEK, true), (W.OP_I64_NEK, W.OP_BR_I64_NEK, W.OP_BR_I64_EQK, true),
+        (W.OP_I64_LT_SK, W.OP_BR_I64_LT_SK, W.OP_BR_I64_GE_SK, true), (W.OP_I64_GE_SK, W.OP_BR_I64_GE_SK, W.OP_BR_I64_LT_SK, true),
+        (W.OP_I64_GT_SK, W.OP_BR_I64_GT_SK, W.OP_BR_I64_LE_SK, true), (W.OP_I64_LE_SK, W.OP_BR_I64_LE_SK, W.OP_BR_I64_GT_SK, true),
+        (W.OP_I64_LT_UK, W.OP_BR_I64_LT_UK, W.OP_BR_I64_GE_UK, true), (W.OP_I64_GE_UK, W.OP_BR_I64_GE_UK, W.OP_BR_I64_LT_UK, true),
+        (W.OP_I64_GT_UK, W.OP_BR_I64_GT_UK, W.OP_BR_I64_LE_UK, true), (W.OP_I64_LE_UK, W.OP_BR_I64_LE_UK, W.OP_BR_I64_GT_UK, true),
+    ]
+}
+
+/// Jumps to `l` if `cond` (just popped, at position p) is nonzero
+/// (`when` true) or zero. A comparison emitted just before is fused
+/// into a compare-and-branch followed by its JMP.
+fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
+    if cond.loc == Loc.Home and t.has_def and t.last_def_slot == t.home(p) {
+        if let Some(last) = t.code.last() {
+            if last == t.last_def_pc {
+                let w = t.code.at(last);
+                let op = W.opcode(w);
+                if op == W.OP_I32_EQZ {
+                    t.code.truncate(last);
+                    let x = W.RRR_b(w);
+                    t.code.jump(if when { W.BRZ(x as u16, 0) } else { W.BRNZ(x as u16, 0) }, l);
+                    t.has_def = false;
+                    return;
+                }
+                let fs = fusions();
+                for i in 0..40 {
+                    let (cop, bt, bf, k) = fs[i];
+                    if cop != op { continue; }
+                    t.code.truncate(last);
+                    let bop = if when { bt } else { bf };
+                    let x = W.RRR_b(w);
+                    if k {
+                        let kv = W.RRK_k(w);
+                        t.code.op(W.with_opcode(W.BR_I32_EQK(x as u16, kv as i32), bop));
+                    } else {
+                        let y = W.RRR_c(w);
+                        t.code.op(W.with_opcode(W.BR_I32_EQ(x as u16, y as u16), bop));
+                    }
+                    t.code.jump(W.JMP(0), l);
+                    t.has_def = false;
+                    return;
+                }
+            }
+        }
+    }
+    let rc = t.reg(cond, p);
+    t.code.jump(if when { W.BRNZ(rc as u16, 0) } else { W.BRZ(rc as u16, 0) }, l);
+    t.has_def = false;
+}
+
 /// Translates one instruction. Returns false after the function's final `end`.
 fn T.instr(t: *T) -> Result<bool, str> {
     let r = &t.r;
@@ -423,12 +553,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let b = t.pop(n.b)?;
             let a = t.pop(n.a)?;
             let p = t.vals.len;
-            if !t.dead() {
-                let ra = t.reg(a, p);
-                let rb = t.reg(b, p + 1);
-                let h = t.home(p);
-                t.emit_def(rrr(n.op, h, ra, rb), h);
-            }
+            if !t.dead() { t.binop(n.op, a, b, p); }
         }
         t.push_home(n.r);
         return Ok(true);
@@ -496,11 +621,9 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let cond = t.pop(T_I32)?;
             t.check_top(params)?;
             let p = t.vals.len;
-            var rc: u64 = 0;
-            if !t.dead() { rc = t.reg(cond, p); }
             t.flush_all();
             let else_label = t.code.label();
-            if !t.dead() { t.code.jump(W.BRZ(rc as u16, 0), else_label); }
+            if !t.dead() { t.cond_jump(cond, p, false, else_label); }
             let c = t.push_ctl(K_IF, params, results);
             c.else_label = else_label;
         }
@@ -572,16 +695,21 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let c = t.ctl_at(depth)?;
             let types = t.label_types(c);
             t.check_top(types)?;
+            // The values stay, with the label's types (also unknown ones).
+            let base = t.vals.len - types.len;
+            for j in 0..types.len {
+                let v = t.vals.at(base + j);
+                t.vals.set(base + j, Val { ty: types[j], loc: v.loc, x: v.x });
+            }
             if !t.dead() {
                 let p = t.vals.len;
-                let rc = t.reg(cond, p);
                 let c = t.ctl_at(depth)?;
                 let n = types.len as u64;
                 if c.kind != K_FUNC and !t.needs_move(n, c.height) {
-                    t.code.jump(W.BRNZ(rc as u16, 0), c.label);
+                    t.cond_jump(cond, p, true, c.label);
                 } else {
                     let skip = t.code.label();
-                    t.code.jump(W.BRZ(rc as u16, 0), skip);
+                    t.cond_jump(cond, p, false, skip);
                     t.branch_to(depth);
                     t.code.bind(skip);
                 }

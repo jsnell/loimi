@@ -187,9 +187,11 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--markdown", action="store_true")
+    ap.add_argument("--skip", action="append", default=[], help="skip files whose name contains this")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     names = a.names or sorted(n for n in os.listdir(a.json_dir) if os.path.isdir(os.path.join(a.json_dir, n)))
+    names = [n for n in names if not any(k in n for k in a.skip)]
     tp = tf = ts = 0
     rows = []
     for n in names:

@@ -234,6 +234,7 @@ pub vm W {
         format RI  { op: 16, a: 16, imm: s32 }
         format RU  { op: 16, a: 16, x: 32 }
         format J   { op: 16, off: s32 }
+        format RRK { op: 16, a: 16, b: 16, k: s16 }
     }
 
     cache Imm64 { v: u64 }
@@ -286,6 +287,29 @@ pub vm W {
         ("F64_LE", ri, rd, rd, b2i(a <= b)), ("F64_GE", ri, rd, rd, b2i(a >= b)),
     ] {
         op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
+    }
+
+    // Constant right operands (a 16-bit immediate, sign-extended).
+    inline for (name, dk, ak, expr) in [
+        ("I32_ADDK", ri, ri, a +% (k as i32)), ("I32_MULK", ri, ri, a *% (k as i32)),
+        ("I32_ANDK", ri, ri, a & (k as i32)), ("I32_ORK", ri, ri, a | (k as i32)),
+        ("I32_XORK", ri, ri, a ^ (k as i32)),
+        ("I32_SHLK", ri, ri, a << k), ("I32_SHR_SK", ri, ri, a >> k), ("I32_SHR_UK", ru, ru, a >> k),
+        ("I32_EQK", ri, ri, b2i(a == (k as i32))), ("I32_NEK", ri, ri, b2i(a != (k as i32))),
+        ("I32_LT_SK", ri, ri, b2i(a < (k as i32))), ("I32_LT_UK", ri, ru, b2i(a < (k as u32))),
+        ("I32_GT_SK", ri, ri, b2i(a > (k as i32))), ("I32_GT_UK", ri, ru, b2i(a > (k as u32))),
+        ("I32_LE_SK", ri, ri, b2i(a <= (k as i32))), ("I32_LE_UK", ri, ru, b2i(a <= (k as u32))),
+        ("I32_GE_SK", ri, ri, b2i(a >= (k as i32))), ("I32_GE_UK", ri, ru, b2i(a >= (k as u32))),
+        ("I64_ADDK", rl, rl, a +% k), ("I64_MULK", rl, rl, a *% k),
+        ("I64_ANDK", rl, rl, a & k), ("I64_ORK", rl, rl, a | k), ("I64_XORK", rl, rl, a ^ k),
+        ("I64_SHLK", rl, rl, a << k), ("I64_SHR_SK", rl, rl, a >> k), ("I64_SHR_UK", rq, rq, a >> k),
+        ("I64_EQK", ri, rl, b2i(a == k)), ("I64_NEK", ri, rl, b2i(a != k)),
+        ("I64_LT_SK", ri, rl, b2i(a < k)), ("I64_LT_UK", ri, rq, b2i(a < (k as u64))),
+        ("I64_GT_SK", ri, rl, b2i(a > k)), ("I64_GT_UK", ri, rq, b2i(a > (k as u64))),
+        ("I64_LE_SK", ri, rl, b2i(a <= k)), ("I64_LE_UK", ri, rq, b2i(a <= (k as u64))),
+        ("I64_GE_SK", ri, rl, b2i(a >= k)), ("I64_GE_UK", ri, rq, b2i(a >= (k as u64))),
+    ] {
+        op #name(d: dk, a: ak, k: imm) : RRK { d = expr; next }
     }
 
     // Division: traps on a zero divisor and on MIN / -1; x rem -1 is 0.
@@ -464,6 +488,42 @@ pub vm W {
     op JMP(t: label) : J { jump t }
     op BRZ(a: ri, t: label) : RI { if a == 0 { jump t } next }
     op BRNZ(a: ri, t: label) : RI { if a != 0 { jump t } next }
+    // Compare and branch: a fused compare and br_if/if. The JMP after it
+    // holds the target (`then JMP`): taken if the comparison holds.
+    inline for (name, k, test) in [
+        ("BR_I32_EQ", ri, a == b), ("BR_I32_NE", ri, a != b),
+        ("BR_I32_LT_S", ri, a < b), ("BR_I32_LT_U", ru, a < b),
+        ("BR_I32_GT_S", ri, a > b), ("BR_I32_GT_U", ru, a > b),
+        ("BR_I32_LE_S", ri, a <= b), ("BR_I32_LE_U", ru, a <= b),
+        ("BR_I32_GE_S", ri, a >= b), ("BR_I32_GE_U", ru, a >= b),
+        ("BR_I64_EQ", rl, a == b), ("BR_I64_NE", rl, a != b),
+        ("BR_I64_LT_S", rl, a < b), ("BR_I64_LT_U", rq, a < b),
+        ("BR_I64_GT_S", rl, a > b), ("BR_I64_GT_U", rq, a > b),
+        ("BR_I64_LE_S", rl, a <= b), ("BR_I64_LE_U", rq, a <= b),
+        ("BR_I64_GE_S", rl, a >= b), ("BR_I64_GE_U", rq, a >= b),
+    ] {
+        op #name(a: k, b: k) : RRR then JMP {
+            if test { jump then.t }
+            jump pc + 2
+        }
+    }
+    inline for (name, k, test) in [
+        ("BR_I32_EQK", ri, a == (c as i32)), ("BR_I32_NEK", ri, a != (c as i32)),
+        ("BR_I32_LT_SK", ri, a < (c as i32)), ("BR_I32_LT_UK", ru, a < (c as u32)),
+        ("BR_I32_GT_SK", ri, a > (c as i32)), ("BR_I32_GT_UK", ru, a > (c as u32)),
+        ("BR_I32_LE_SK", ri, a <= (c as i32)), ("BR_I32_LE_UK", ru, a <= (c as u32)),
+        ("BR_I32_GE_SK", ri, a >= (c as i32)), ("BR_I32_GE_UK", ru, a >= (c as u32)),
+        ("BR_I64_EQK", rl, a == c), ("BR_I64_NEK", rl, a != c),
+        ("BR_I64_LT_SK", rl, a < c), ("BR_I64_LT_UK", rq, a < (c as u64)),
+        ("BR_I64_GT_SK", rl, a > c), ("BR_I64_GT_UK", rq, a > (c as u64)),
+        ("BR_I64_LE_SK", rl, a <= c), ("BR_I64_LE_UK", rq, a <= (c as u64)),
+        ("BR_I64_GE_SK", rl, a >= c), ("BR_I64_GE_UK", rq, a >= (c as u64)),
+    ] {
+        op #name(a: k, c: imm) : RI then JMP {
+            if test { jump then.t }
+            jump pc + 2
+        }
+    }
     // Followed by n + 1 JMPs (checked by `verify brtable` below).
     op BR_TABLE(a: ru, n: imm) : RU {
         let i = if (a as u64) < n { a as u64 } else { n };
