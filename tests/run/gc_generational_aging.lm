@@ -1,0 +1,109 @@
+// Generational mode's aging, with verify on and collections forced at
+// chosen points (no stress). A large object that survives its first
+// minor collection stays young until the next one: old objects that
+// point to it stay in the remembered set (with LOG set again, so that a
+// store logs them and whatever an interpreter logs with them), and an
+// object promoted while pointing to it goes into the remembered set. A
+// young survivor that dies before its second minor collection is freed
+// by that collection, and a weak reference to it is cleared then.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node>, big: ?Gc<Big> }
+object Big { tag: i64, items: [?Gc<Node>] }
+object Part { slots: [?Gc<Node>] }
+
+fn node(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None, big: None }) }
+
+/// A large object (over 512 bytes) whose items hold young nodes.
+fn big(h: *gc.Heap, tag: i64) -> Gc<Big> {
+    let b: Gc<Big> = new(h, Big { tag: tag }, 100);
+    for i in 0..100 { b.items[i] = Some(node(h, tag + i as i64)); }
+    b
+}
+
+fn bsum(b: ?Gc<Big>) -> i64 {
+    let Some(x) = b else { return -1; };
+    var s = x.tag;
+    for i in 0..100 { if let Some(n) = x.items[i] { s += n.value; } }
+    s
+}
+
+/// Overwrite freed small slots.
+fn scribble(h: *gc.Heap) {
+    for i in 0..3000 { node(h, 1000000); }
+}
+
+fn minor(h: *gc.Heap) uses gc {
+    scribble(h);
+    gc.collect(h);
+}
+
+fn main() -> i32 uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    h.set_growth(100, 1 << 30);   // collections only where the program asks
+
+    let old = node(h, 1);
+    let part: Gc<Part> = new(h, Part {}, 4);
+    gc.collect(h);                // major: `old` and `part` are old
+    minor(h);
+
+    // An old object stored into: it points to a young large object.
+    old.big = Some(big(h, 1000));
+    var tgt: ?Gc<Big> = Some(big(h, 5000));  // dies young
+    let w = h.new_weak(tgt.unwrap());
+    minor(h);                     // the large objects survive once
+    io.print_int(bsum(old.big)); io.print(" "); io.print_bool(w.get().is_some()); io.println("");
+
+    // `old` is still in the remembered set and logs again: a store into
+    // `part` through a raw pointer, logged together with `old` (as an
+    // interpreter logs a table with its parts), must reach `part` too.
+    if gc.needs_barrier(old as *u8) {
+        gc.remember(old as *u8);
+        gc.remember(part as *u8);
+    }
+    let p = part.slots.ptr;
+    p[1] = Some(node(h, 7));
+    old.next = Some(node(h, 8));
+    tgt = None;
+    minor(h);                     // promotes `old.big`; frees the dead one
+    io.print_int(bsum(old.big)); io.print(" "); io.print_bool(w.get().is_some());
+    io.print(" "); io.print_int(val(part.slots[1]) + val(old.next)); io.println("");
+
+    // A small object promoted at its first survival while it points to a
+    // young large object goes into the remembered set.
+    let n = node(h, 2);
+    n.big = Some(big(h, 2000));
+    old.next = Some(n);
+    minor(h);
+    n.big.unwrap().items[0] = Some(node(h, 9));   // young into a young survivor
+    minor(h);
+    minor(h);
+    io.print_int(bsum(n.big)); io.println("");
+
+    // Majors and minors mixed.
+    for r in 0..4 {
+        old.big = Some(big(h, 3000 + r));
+        minor(h);
+        if r % 2 == 0 { h.want_major = true; }
+        minor(h);
+    }
+    io.print_int(bsum(old.big)); io.print(" "); io.print_int(bsum(n.big));
+    io.print(" "); io.print_int(val(part.slots[1])); io.println("");
+    io.print_bool(h.minors > 4 and h.minors < h.collections); io.println("");
+    heap.free();
+    0
+}
+
+fn val(n: ?Gc<Node>) -> i64 {
+    if let Some(x) = n { x.value } else { -1 }
+}
+
+// expect: 105950 true
+// expect: 105950 false 15
+// expect: 204959
+// expect: 308253 204959 7
+// expect: true

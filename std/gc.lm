@@ -86,6 +86,21 @@ const LOG: u8 = 1;
 /// Header flag: a large object (calloc'd, remembered-set pointer before
 /// the header).
 const LARGE: u8 = 2;
+/// Header flag: the large object survived a minor collection
+/// (generational mode); it is promoted when it survives the next one.
+/// Small objects are promoted when they first survive.
+const AGED: u8 = 4;
+/// Header flag: the object is in the remembered set (so `remember` does
+/// not add it twice). An object stays there, with LOG set again, while
+/// it points to young objects that survived a minor collection.
+const INRS: u8 = 8;
+/// The mark byte's values: 0 unmarked, 1 or 2 the epoch (old, or marked
+/// in a major collection), YOUNG0..=YOUNG1 a young survivor of the last
+/// minor collection (a new value each time), and NO_YOUNG none (the young
+/// mark of a major collection, which promotes every survivor).
+const YOUNG0: u8 = 3;
+const YOUNG1: u8 = 254;
+const NO_YOUNG: u8 = 255;
 
 /// Lives just before every object (16 bytes, so a pair of two words takes
 /// a 32-byte slot). `size` is the slot size; `len` is the length of the
@@ -123,7 +138,7 @@ struct ChunkHead { rs: *RemSet, pad: u64 }
 /// struct is moved.
 /// `epoch` is the value of a set mark (see `Heap.epoch`), here so that
 /// `is_marked` finds it from an object's address.
-struct RemSet { objs: mem.Vec<*u8>, epoch: u8 }
+struct RemSet { objs: mem.Vec<*u8>, epoch: u8, young: u8 }
 
 /// Shadow-stack frame written by compiled code; entries follow `n`.
 pub struct ShadowFrame { prev: *ShadowFrame, n: u64 }
@@ -160,9 +175,19 @@ pub struct Heap {
     /// Flags that marking sets: LOG in a generational heap (a survivor is
     /// old), else none.
     mark_flags: u8,
-    /// Bytes marked in the collection in progress (in a minor collection,
-    /// the young survivors).
+    /// Bytes marked with the epoch in the collection in progress (in a
+    /// minor collection, the objects promoted).
     marked: u64,
+    /// The mark of young survivors: of the minor collection in progress,
+    /// or since the last one (NO_YOUNG after a major collection).
+    young: u8,
+    /// The mark an unmarked object gets when it was not AGED: `young` in
+    /// a minor collection, else the epoch.
+    first_mark: u8,
+    /// Set by `mark_ptr` when a reference leads to a young survivor.
+    young_ref: bool,
+    /// Spare vector for rebuilding the remembered set.
+    rs_tmp: mem.Vec<*u8>,
     /// Called after marking, before sweeping (for weak tables).
     sweepers: mem.Vec<Scanner>,
     ephemerons: mem.Vec<EphHook>,
@@ -228,6 +253,7 @@ pub fn Heap.new() -> Heap {
     let rs: *RemSet = mem.alloc(1);
     rs.objs = mem.Vec.new();
     rs.epoch = 1;
+    rs.young = NO_YOUNG;
     Heap {
         large: mem.Vec.new(),
         large_old: 0,
@@ -241,6 +267,10 @@ pub fn Heap.new() -> Heap {
         epoch: 1,
         mark_flags: 0,
         marked: 0,
+        young: NO_YOUNG,
+        first_mark: 1,
+        young_ref: false,
+        rs_tmp: mem.Vec.new(),
         sweepers: mem.Vec.new(),
         ephemerons: mem.Vec.new(),
         weaks: mem.Vec.new(),
@@ -324,6 +354,7 @@ fn refill(h: *Heap, c: u64) -> *Header {
 fn sweep_chunk(h: *Heap, ch: *Chunk) {
     let ts = if h.stats { now_ns() } else { 0 };
     let ep = h.epoch;
+    let yg = h.young;
     var head = 0 as *Header;
     var nfree: u64 = 0;
     var freed: u64 = 0;
@@ -332,7 +363,8 @@ fn sweep_chunk(h: *Heap, ch: *Chunk) {
         i -= 1;
         let hd = (ch.base + i * ch.size) as *Header;
         if hd.tid != FREE {
-            if hd.mark == ep { continue; }
+            let m = hd.mark;
+            if m == ep or m == yg { continue; }
             hd.tid = FREE;
             hd.flags = 0;
             freed += 1;
@@ -437,7 +469,8 @@ fn add_chunk(h: *Heap, c: u64) {
 /// as marked. `h.is_marked(p)` is the same, faster.
 pub fn is_marked(p: *u8) -> bool {
     let hd = (p - HEADER) as *Header;
-    hd.mark == head_of(p).rs.epoch
+    let rs = head_of(p).rs;
+    hd.mark == rs.epoch or hd.mark == rs.young
 }
 
 /// Whether the object at `p`, in heap `h`, survived marking (see the
@@ -445,7 +478,7 @@ pub fn is_marked(p: *u8) -> bool {
 #[inline]
 pub fn Heap.is_marked(h: *Heap, p: *u8) -> bool {
     let hd = (p - HEADER) as *Header;
-    hd.mark == h.epoch
+    hd.mark == h.epoch or hd.mark == h.young
 }
 
 /// The `ChunkHead` of the chunk holding `obj` (or of a large object).
@@ -468,11 +501,28 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
     if (p as u64) == 0 { return; }
     let hd = (p - HEADER) as *Header;
     let ep = h.epoch;
-    if hd.mark == ep { return; }
+    let m = hd.mark;
+    if m == ep { return; }
     if h.verifying { verify_fail(h, p); }
-    hd.mark = ep;
-    hd.flags = hd.flags | h.mark_flags;
-    h.marked += hd.size as u64;
+    if m == h.young {
+        h.young_ref = true;
+        return;
+    }
+    // Unmarked. In a minor collection a young large object surviving for
+    // the first time stays young (AGED); one that survived before, and
+    // every small object, is promoted. (Aging small objects too traced
+    // the survivors of programs with growing live data twice: Scheme's
+    // nboyer, earley and mperm ran 5-8% slower.) A major collection
+    // promotes every survivor.
+    let nm = if (hd.flags & (AGED | LARGE)) != LARGE { ep } else { h.first_mark };
+    hd.mark = nm;
+    if nm == ep {
+        hd.flags = hd.flags | h.mark_flags;
+        h.marked += hd.size as u64;
+    } else {
+        hd.flags = hd.flags | AGED;
+        h.young_ref = true;
+    }
     h.stack.push(p);
 }
 
@@ -512,6 +562,8 @@ pub fn remember(obj: *u8) {
     let hd = (obj - HEADER) as *Header;
     if (hd.flags & LOG) == 0 { return; }
     hd.flags = hd.flags & !LOG;
+    if (hd.flags & INRS) != 0 { return; }
+    hd.flags = hd.flags | INRS;
     head_of(obj).rs.objs.push(obj);
 }
 
@@ -535,7 +587,18 @@ pub fn Heap.add_sweeper(h: *Heap, data: *u8, sweep: fn(*Heap, *u8)) {
 fn drain(h: *Heap) {
     while let Some(p) = h.stack.pop() {
         let hd = (p - HEADER) as *Header;
-        loimi_trace_object(h, p, hd.tid as u32);
+        if h.minor and hd.mark == h.epoch {
+            // Promoted in this minor collection: if it points to young
+            // survivors, it goes into the remembered set.
+            h.young_ref = false;
+            loimi_trace_object(h, p, hd.tid as u32);
+            if h.young_ref and (hd.flags & INRS) == 0 {
+                hd.flags = hd.flags | INRS;
+                h.rs.objs.push(p);
+            }
+        } else {
+            loimi_trace_object(h, p, hd.tid as u32);
+        }
     }
 }
 
@@ -563,17 +626,38 @@ pub fn collect(h: *Heap) uses gc {
     h.mark_flags = if h.gen { LOG } else { 0 };
     h.minor = minor;
     if minor {
+        // A new young mark: the young survivors of the last minor
+        // collection count as unmarked.
+        h.young = if h.young >= YOUNG1 { YOUNG0 } else { h.young + 1 };
+        h.first_mark = h.young;
+        h.rs.young = h.young;
         // Old objects stored into: trace them, and log them again on the
-        // next store.
+        // next store. Those that point to young survivors stay in the
+        // set (with LOG set: a store must still log the objects that an
+        // interpreter logs together with them, `remember`).
         let rs = h.rs;
-        for i in 0..rs.objs.len {
-            let p = rs.objs.at(i);
+        let old = rs.objs;
+        rs.objs = h.rs_tmp;
+        rs.objs.clear();
+        for i in 0..old.len {
+            let p = old.at(i);
             let hd = (p - HEADER) as *Header;
+            h.young_ref = false;
             loimi_trace_object(h, p, hd.tid as u32);
             hd.flags = hd.flags | LOG;
+            if h.young_ref {
+                rs.objs.push(p);
+            } else {
+                hd.flags = hd.flags & !INRS;
+            }
         }
+        h.rs_tmp = old;
+    } else {
+        h.young = NO_YOUNG;
+        h.first_mark = h.epoch;
+        h.rs.young = NO_YOUNG;
+        h.rs.objs.clear();
     }
-    h.rs.objs.clear();
     for i in 0..h.scanners.len {
         let s = h.scanners.at(i);
         s.scan(h, s.data);
@@ -675,10 +759,11 @@ pub fn collect(h: *Heap) uses gc {
     }
     // Large objects (in a minor collection, the young ones).
     let first = if minor { h.large_old } else { 0 };
+    let yg = h.young;
     var out = first;
     for i in first..h.large.len {
         let cur = h.large.at(i);
-        if cur.mark == ep {
+        if cur.mark == ep or cur.mark == yg {
             if !keep { cur.mark = 0; }
             live += cur.size as u64;
             h.large.set(out, cur);
@@ -689,7 +774,21 @@ pub fn collect(h: *Heap) uses gc {
         }
     }
     h.large.truncate(out);
-    h.large_old = if keep { out } else { 0 };
+    // Move the promoted ones (the rest stay young) to the old part.
+    var nold = first;
+    if minor {
+        for i in first..out {
+            let cur = h.large.at(i);
+            if cur.mark == ep {
+                h.large.set(i, h.large.at(nold));
+                h.large.set(nold, cur);
+                nold += 1;
+            }
+        }
+    } else {
+        nold = out;
+    }
+    h.large_old = if keep { nold } else { 0 };
     h.freed += freed;
     h.count -= freed;
     h.allocated = 0;
@@ -743,6 +842,10 @@ fn new_epoch(h: *Heap) {
     h.epoch = 3 - h.epoch;
     h.rs.epoch = h.epoch;
     h.large_old = 0;
+    for i in 0..h.rs.objs.len {
+        let hd = (h.rs.objs.at(i) - HEADER) as *Header;
+        hd.flags = hd.flags & !INRS;
+    }
     h.rs.objs.clear();
     h.sticky = false;
 }
@@ -873,7 +976,7 @@ fn verify_heap(h: *Heap) {
         while i > 0 {
             i -= 1;
             let hd = (ch.base + i * ch.size) as *Header;
-            if hd.tid != FREE and hd.mark == h.epoch and (hd.flags & LOG) != 0 {
+            if hd.tid != FREE and hd.mark == h.epoch and (hd.flags & (LOG | INRS)) == LOG {
                 let p = hd as *u8 + HEADER;
                 h.vparent = p;
                 loimi_trace_object(h, p, hd.tid as u32);
@@ -882,7 +985,7 @@ fn verify_heap(h: *Heap) {
     }
     for i in 0..h.large.len {
         let hd = h.large.at(i);
-        if hd.mark == h.epoch and (hd.flags & LOG) != 0 {
+        if hd.mark == h.epoch and (hd.flags & (LOG | INRS)) == LOG {
             let p = hd as *u8 + HEADER;
             h.vparent = p;
             loimi_trace_object(h, p, hd.tid as u32);
@@ -1120,6 +1223,7 @@ pub fn Heap.free(h: *Heap) {
     h.ephemerons.free();
     h.weaks.free();
     h.rs.objs.free();
+    h.rs_tmp.free();
     mem.release(h.rs);
 }
 
