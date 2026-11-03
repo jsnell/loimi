@@ -9,7 +9,7 @@
 #   (-u rewrites them)
 # - LOIMI_RUNNER (e.g. qemu) runs the interpreter when LOIMI_TARGET cross-builds it
 # - if the official spec tests are installed (bench/wasm/install.sh,
-#   bench/wasm/spec.sh), runs the MVP .wast files and requires every
+#   bench/wasm/spec.sh), runs every .wast file (SIMD included) and requires every
 #   command to pass (--fast: a subset)
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -29,11 +29,11 @@ FAIL=0
 modes="tailcall goto switch"
 if [ $FAST = 1 ]; then modes=tailcall; fi
 
-# Every file of the (Wasm 2.0-era) testsuite except SIMD: the MVP plus
-# sign extension, saturating truncation, multi-value, reference types
-# and bulk memory.
-SPEC_MVP=$(ls "$ROOT/bench/wasm/spec-json" 2>/dev/null | grep -v '^simd_' | grep -v '[.]txt$' | grep -v '^[A-Z]*$')
-SPEC_FAST="address block br_table call call_indirect conversions f64 i32 i64 if loop memory_trap table_init traps unreached-invalid"
+# Every file of the (Wasm 2.0-era) testsuite: the MVP plus sign
+# extension, saturating truncation, multi-value, reference types, bulk
+# memory and fixed-width SIMD.
+SPEC_ALL=$(ls "$ROOT/bench/wasm/spec-json" 2>/dev/null | grep -v '[.]txt$' | grep -v '^[A-Z]*$')
+SPEC_FAST="address block br_table call call_indirect conversions f64 i32 i64 if loop memory_trap table_init traps unreached-invalid simd_const simd_lane simd_load8_lane simd_i32x4_arith simd_f32x4_arith"
 
 for mode in $modes; do
     if ! (ulimit -v 2500000; cd "$DIR" && "$LOIMI" build -W error main.lm --release --dispatch="$mode" -o "$TMP/wasm-$mode") > "$TMP/build.log" 2>&1; then
@@ -53,7 +53,7 @@ for mode in $modes; do
         echo "skip: tests/*.c (no clang-19/wasm-ld)"
     fi
     if [ -d "$ROOT/bench/wasm/spec-json" ]; then
-        files=$SPEC_MVP
+        files=$SPEC_ALL
         if [ $FAST = 1 ]; then files=$SPEC_FAST; fi
         python3 "$ROOT/bench/wasm/spec_run.py" --wasm "$TMP/wasm-$mode" $files > "$TMP/spec.txt"
         tail -1 "$TMP/spec.txt" | sed "s/^/spec ($mode): /"

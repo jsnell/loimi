@@ -1,0 +1,2 @@
+fn main() { let a = i8x16.splat(1); let _ = a.avgr(a); }
+// error: `avgr` is for unsigned integer vectors, not `i8x16`

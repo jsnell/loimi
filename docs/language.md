@@ -84,6 +84,7 @@ roughly C's level of abstraction. It has deliberately few novel features.
 ```loimi
 i8 i16 i32 i64 isize   u8 u16 u32 u64 usize   f32 f64   bool   never
 iN uN           // any width 1..=64: i48, u24, i61, ... (see below)
+i8x16 u8x16 i16x8 u16x8 i32x4 u32x4 i64x2 u64x2 f32x4 f64x2   // 128-bit vectors (section 1.2, "Vectors")
 [T; N]          // fixed array
 []T             // slice (ptr + len), bounds-checked; [] is the empty one
 *T, *mut T      // raw pointers; ?*T (None = null) for one that may be absent
@@ -760,6 +761,119 @@ fn main() { Sym { id: 5 }.show_line(); }
   an ordinary block otherwise, and may be used to mark other unchecked
   code for readers.
 
+#### Vectors
+
+`i8x16`, `u8x16`, `i16x8`, `u16x8`, `i32x4`, `u32x4`, `i64x2`, `u64x2`,
+`f32x4` and `f64x2` are 128-bit SIMD vectors: the lanes have the named
+scalar type, and the type is LLVM's `<N x T>`. They are plain values:
+locals, parameters, results, struct and object fields, enum payloads,
+`?T`, array elements and `vm` state registers (one vector register each,
+`xmm`/`q`, across tail calls). Signedness is part of the type, as for
+scalars: it chooses what `>>`, `<`, `min`, `max`, `add_sat`, widening and
+`as` do, so `u8x16` and `i8x16` are different types holding the same
+bits. Nothing converts implicitly; a scalar operand is an error that
+says to `splat` it.
+
+<!-- snippet: run "6 3 8 -2147483644 | 7 | 0 -1 0 0 | 255 0 3" -->
+```loimi
+import std.io;
+
+fn show(v: i32x4) {
+    io.print_int(v.lane(0) as i64); io.print(" "); io.print_int(v.lane(1) as i64); io.print(" ");
+    io.print_int(v.lane(2) as i64); io.print(" "); io.print_int(v.lane(3) as i64);
+}
+
+fn main() {
+    let a = i32x4.new(1, -2, 3, 2147483647);
+    let b = i32x4.splat(5);
+    show(a + b); io.print(" | ");                 // lane-wise, integer lanes wrap
+    io.print_int((a < b).bitmask() as i64); io.print(" | ");  // lanes 0..2 are below 5
+    let m = f32x4.new(1.0, 0.0 / 0.0, 2.0, -1.0) != f32x4.new(1.0, 0.0, 2.0, -1.0);
+    show(m); io.print(" | ");                     // a mask: NaN != anything
+    let bytes = u8x16.splat(250).add_sat(u8x16.splat(10));     // saturates at 255
+    let ix = u8x16.new(0, 16, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3);
+    let s = u8x16.new(255, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15).swizzle(ix);
+    io.print_int(bytes.lane(15) as i64); io.print(" ");
+    io.print_int(s.lane(1) as i64); io.print(" "); io.print_int(s.lane(2) as i64); io.println("");
+}
+```
+
+- **Making one**: `T.splat(x)` (every lane `x`), `T.new(a, b, ..)` (one
+  argument per lane, lane 0 first), `T.from_bits(v)` (the same 128 bits
+  as another vector type: a bitcast, no instruction).
+- **Lanes**: `v.lane(i)` reads a lane (`u8` for `u8x16`, so `as i32`
+  zero-extends it) and `v.with_lane(i, x)` is a copy with one lane
+  replaced. `i` must be a constant expression (a literal or a `const`):
+  the instructions take the lane as an immediate. For a lane chosen at
+  run time, store the vector and index the memory.
+- **Operators**, lane by lane, both operands of one vector type: `+ - *`
+  (integer lanes always wrap, in debug builds too; `+% -% *%` are the
+  same), `/` (float lanes only), unary `-`, and on integer lanes `& | ^`
+  and `~`/`!`. `v << n` and `v >> n` shift every lane by the scalar
+  integer `n`, taken modulo the lane width as for scalars (`>>` is
+  arithmetic on signed lanes and logical on unsigned ones). Comparisons
+  `== != < <= > >=` give a **mask**: a vector of signed integers of the
+  lane width (`i32x4` for `f32x4` and `u32x4` operands), all ones where
+  the comparison holds and zero elsewhere. Float comparisons are ordered
+  except `!=`, as for scalars: a NaN lane compares unequal and not less
+  or greater. A mask is not a `bool`; `m.bitmask()` gives one bit per
+  lane.
+- **Methods** (lane-wise unless said otherwise):
+  - all lanes: `abs`, `min`, `max` (integers by signedness; floats are C
+    `fmin`/`fmax`, as for scalars);
+  - integer lanes: `add_sat`, `sub_sat` (saturating, by signedness),
+    `clz`, `ctz`, `popcount`; `avgr` on unsigned lanes (`(a + b + 1) >>
+    1` without overflow); `m.select(a, b)` (lane `i` of `a` where lane
+    `i` of the mask `m` is non-zero, else of `b`; `a` and `b` have `m`'s
+    lane count); `v.bitmask() -> u32` (bit `i` is the top bit of lane
+    `i`: all-true is `(v == T.splat(0)).bitmask() == 0`);
+  - float lanes: `sqrt`, `floor`, `ceil`, `trunc`, `nearest` (ties to
+    even), `copysign`, and `minimum`/`maximum` (IEEE 754-2019, wasm's
+    `f32x4.min`: NaN propagates, `-0 < +0`);
+  - `v.widen_low()`, `v.widen_high()`: the low or high half of the lanes
+    at twice the width (sign- or zero-extended by signedness; `f32x4` to
+    `f64x2`);
+  - `T.narrow_sat(a, b)`: `a`'s lanes then `b`'s, each saturated into
+    `T`'s lane range (`T` has 8-, 16- or 32-bit integer lanes; `a` and
+    `b` have lanes twice as wide, read by their own signedness):
+    `u8x16.narrow_sat(x, y)` with `i16x8` operands is x86's `packuswb`;
+  - `a.shuffle(b, [i0, i1, ..])`: lane `k` is lane `ik` of the lanes of
+    `a` followed by those of `b`; one constant index per lane, each below
+    twice the lane count;
+  - `a.swizzle(idx)` on 8-bit lanes: lane `k` is lane `idx[k]` of `a`,
+    or 0 if `idx[k]` (read unsigned) is 16 or more (wasm's
+    `i8x16.swizzle`, AArch64's `tbl`).
+- **`as`** converts lane by lane between vector types with the same
+  number of lanes, as the scalar `as` does: `i32x4 as f32x4`,
+  `f64x2 as u64x2` (float to integer saturates and gives 0 for NaN),
+  `i32x4 as u32x4` (the same bits). Between different lane counts it is
+  an error that points to `from_bits`, `widen_*` and `narrow_sat`.
+- **In memory** a vector is 16 bytes and 16-byte aligned in layouts
+  (struct fields, arrays, `size_of`), as in C. Loads and stores of
+  vectors, and of aggregates that contain one, **assume no alignment**
+  (`movdqu`/`movups`, `ldr q`; unlike the scalar rule in section 1.3):
+  an 8-byte aligned GC object, a register file of 8-byte slots read as
+  `*((regs + it) as *i32x4)`, or guest memory all hold vectors without
+  care. On current x86-64 and AArch64 cores an unaligned vector access
+  costs the same as an aligned one; the price is that SSE2 code cannot
+  fold the load into the arithmetic instruction. `p.read_unaligned()`
+  and `p.write_unaligned(v)` accept vector pointers too.
+- **Targets.** The code is for the baseline of each target: SSE2 on
+  x86-64, NEON (Advanced SIMD) on AArch64. Most operations are one or a
+  few instructions on both. Where SSE2 lacks an instruction, LLVM
+  expands the operation: 8-bit shifts, 64-bit compares, `i64x2`
+  multiplies and `minimum`/`maximum` take from a handful to about 30
+  instructions; the float rounding methods, which need SSE4.1's
+  `roundps` (scalars call libm, `stdlib.md`, "Floats"), add and subtract
+  2^23 (2^52) and fix up the sign, about 25 instructions with no call;
+  `u16x8.narrow_sat` of
+  `i32x4` (SSE4.1's `packusdw`) is about 25. `f32x4 as i32x4`/`u32x4`
+  use `cvttps2dq` with fix-ups (about 10 and 15 instructions), and
+  `swizzle` goes lane by lane through memory on x86-64 (`pshufb` is
+  SSSE3) and is one `tbl` on AArch64. `--header` rejects vectors in
+  `export "C"` signatures (C has no portable vector type): pass a
+  pointer.
+
 ### 1.3 Memory
 
 There is no borrow checker. Host memory is managed through explicit allocators,
@@ -784,9 +898,10 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   rely on it: vectorizing, combining accesses), as in C. For an address
   that may not be, such as a guest's memory address or a packed format,
   `p.read_unaligned()` and `p.write_unaligned(v)` load and store with
-  alignment 1 (`*T` for integer, float and pointer `T`). On x86-64 and
-  AArch64 they compile to the same single `mov`/`ldr` as an aligned
-  access.
+  alignment 1 (`*T` for integer, float, vector and pointer `T`). On
+  x86-64 and AArch64 they compile to the same single `mov`/`ldr` as an
+  aligned access. Vectors are the exception to the rule: `*p` on a
+  vector pointer assumes no alignment either (section 1.2, "Vectors").
 - **Atomics.** For memory that threads share outside a lock, a pointer
   to an 8-, 16-, 32- or 64-bit integer (or to a pointer) has
   `p.atomic_load()` (acquire), `p.atomic_load_relaxed()` (monotonic),

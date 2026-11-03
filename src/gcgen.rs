@@ -432,7 +432,9 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
     let obj = g.inst(format!("call ptr @\"{}\"(ptr {}, i64 {}, i32 {}, i64 {})", alloc, h, total, tid, n));
     if !s.fields.is_empty() {
         let lt = llty(p, &init.ty);
-        g.emit(format!("store {} {}, ptr {}", lt, v, obj));
+        // Objects are 8-byte aligned: a vector field is stored unaligned.
+        let al = if crate::codegen::has_vector(p, &init.ty) { ", align 1" } else { "" };
+        g.emit(format!("store {} {}, ptr {}{}", lt, v, obj, al));
     }
     let _ = e;
     obj

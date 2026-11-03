@@ -3,7 +3,8 @@
 //
 // A wasm function's frame is a window of untyped 64-bit slots:
 // [params and locals][operand stack homes][scratch]. Every value is
-// stored in one slot; i32 and f32 values occupy its low 4 bytes, and the
+// stored in one slot but v128, which takes two consecutive ones; i32 and
+// f32 values occupy a slot's low 4 bytes, and the
 // operand kinds below read and write a slot as the type the op needs.
 // The wasm validator has proved the types, so an op never reads a slot
 // as a type that was not written there; the vm verifier proves that
@@ -65,6 +66,8 @@ pub struct Func {
     host: ?HostFn,
     /// Host functions: an argument for the host function's use.
     host_data: u64,
+    /// The result types (the script protocol prints results by type).
+    results: []u8,
 }
 
 pub struct Memory { data: *u8, size: u64, max_pages: u64 }
@@ -176,6 +179,46 @@ pub fn grow_memory(m: *Machine, delta: u32) -> i32 {
     old as i32
 }
 
+// SIMD helpers: pairwise sums, the dot product and q15 rounding multiply.
+#[inline(always)]
+fn pairs_i8(a: i8x16) -> i16x8 {
+    let lo = a.widen_low();
+    let hi = a.widen_high();
+    lo.shuffle(hi, [0, 2, 4, 6, 8, 10, 12, 14]) +% lo.shuffle(hi, [1, 3, 5, 7, 9, 11, 13, 15])
+}
+#[inline(always)]
+fn pairs_u8(a: u8x16) -> u16x8 {
+    let lo = a.widen_low();
+    let hi = a.widen_high();
+    lo.shuffle(hi, [0, 2, 4, 6, 8, 10, 12, 14]) +% lo.shuffle(hi, [1, 3, 5, 7, 9, 11, 13, 15])
+}
+#[inline(always)]
+fn pairs_i16(a: i16x8) -> i32x4 {
+    let lo = a.widen_low();
+    let hi = a.widen_high();
+    lo.shuffle(hi, [0, 2, 4, 6]) +% lo.shuffle(hi, [1, 3, 5, 7])
+}
+#[inline(always)]
+fn pairs_u16(a: u16x8) -> u32x4 {
+    let lo = a.widen_low();
+    let hi = a.widen_high();
+    lo.shuffle(hi, [0, 2, 4, 6]) +% lo.shuffle(hi, [1, 3, 5, 7])
+}
+#[inline(always)]
+fn dot_s(a: i16x8, b: i16x8) -> i32x4 {
+    let p = a.widen_low() *% b.widen_low();
+    let q = a.widen_high() *% b.widen_high();
+    p.shuffle(q, [0, 2, 4, 6]) +% p.shuffle(q, [1, 3, 5, 7])
+}
+/// (a * b + 0x4000) >> 15 per lane, saturated (only -32768 * -32768 needs it).
+#[inline(always)]
+fn q15mulr(a: i16x8, b: i16x8) -> i16x8 {
+    let r = i32x4.splat(0x4000);
+    let lo = ((a.widen_low() *% b.widen_low()) +% r) >> 15;
+    let hi = ((a.widen_high() *% b.widen_high()) +% r) >> 15;
+    i16x8.narrow_sat(lo, hi)
+}
+
 /// `cache` used as a 64-bit immediate after CONST64.
 pub vm W {
     context ctx: *Machine;
@@ -193,6 +236,27 @@ pub vm W {
     operand rf = *((regs + it) as *f32) verify it < (f.nslots as u64) display "r{}";
     operand rd = *((regs + it) as *f64) verify it < (f.nslots as u64) display "r{}";
     operand imm = it;
+    // A v128 takes two consecutive slots (`it` and `it + 1`), read and
+    // written as each vector type. Vector loads and stores assume no
+    // alignment, so the 8-byte slots are fine.
+    operand vb = *((regs + it) as *i8x16) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vub = *((regs + it) as *u8x16) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vh = *((regs + it) as *i16x8) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vuh = *((regs + it) as *u16x8) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vi = *((regs + it) as *i32x4) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vui = *((regs + it) as *u32x4) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vl = *((regs + it) as *i64x2) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vul = *((regs + it) as *u64x2) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vf = *((regs + it) as *f32x4) verify it + 1 < (f.nslots as u64) display "r{}";
+    operand vd = *((regs + it) as *f64x2) verify it + 1 < (f.nslots as u64) display "r{}";
+    // The index of a v128's first slot, for lane access through memory
+    // (a lane index from the code cannot be a constant of the handler).
+    operand vslot = it verify it + 1 < (f.nslots as u64) display "r{}";
+    // Lane indices.
+    operand l16 = it verify it < 16;
+    operand l8 = it verify it < 8;
+    operand l4 = it verify it < 4;
+    operand l2 = it verify it < 2;
     // wasm3's r0 and fp0: a value that one op computes and the next alone
     // consumes stays in a register (the `accumulate` ops, `W.accumulate`
     // in compile.lm).
@@ -236,6 +300,7 @@ pub vm W {
     }
 
     cache Imm64 { v: u64 }
+    cache Imm128 { lo: u64, hi: u64 }
 
     // ── constants and moves ───────────────────────────────────────────
     op CONST32(d: ru, v: imm) : RU { d = v as u32; next }
@@ -662,6 +727,262 @@ pub vm W {
         jump r
     }
     op HALT() : J { exit Ok(()) }
+
+    // ── SIMD ──────────────────────────────────────────────────────────
+    // v128 values take two slots; the vector operand kinds view them as
+    // each lane type. Lane-wise arithmetic is Loimi's vector operators
+    // and methods; ops with a lane index from the code go through memory.
+    op CONSTV(d: vul) : RU + Imm128 { d = u64x2.new(cache.lo, cache.hi); next }
+    op MOVV(d: vul, a: vul) : RRR { d = a; next }
+    // select: d = c != 0 ? d : b (d holds the first operand).
+    op SELECTV(d: vul, b: vul, c: ri) : RRR { if c == 0 { d = b; } next }
+    // bitselect: d = (d & c) | (b & ~c) (d holds the first operand).
+    op V128_BITSELECT(d: vul, b: vul, c: vul) : RRR { d = (d & c) | (b & ~c); next }
+    op GLOBAL_GETV(d: vul, g: gidx) : RU { d = *(ctx.globals[g] as *u64x2); next }
+    op GLOBAL_SETV(a: vul, g: gidx) : RU { *(ctx.globals[g] as *u64x2) = a; next }
+    op RETV(a: vul) : RRR {
+        *(regs as *u64x2) = a;
+        regs = fp.regs;
+        let r = fp.ret;
+        fp = fp - 1;
+        jump r
+    }
+
+    inline for (name, dk, ak, bk, expr) in [
+        ("V128_AND", vul, vul, vul, a & b), ("V128_ANDNOT", vul, vul, vul, a & ~b),
+        ("V128_OR", vul, vul, vul, a | b), ("V128_XOR", vul, vul, vul, a ^ b),
+        ("I8X16_SWIZZLE", vub, vub, vub, a.swizzle(b)),
+        ("I8X16_EQ", vb, vb, vb, a == b), ("I8X16_NE", vb, vb, vb, a != b),
+        ("I8X16_LT_S", vb, vb, vb, a < b), ("I8X16_LT_U", vb, vub, vub, a < b),
+        ("I8X16_GT_S", vb, vb, vb, a > b), ("I8X16_GT_U", vb, vub, vub, a > b),
+        ("I8X16_LE_S", vb, vb, vb, a <= b), ("I8X16_LE_U", vb, vub, vub, a <= b),
+        ("I8X16_GE_S", vb, vb, vb, a >= b), ("I8X16_GE_U", vb, vub, vub, a >= b),
+        ("I16X8_EQ", vh, vh, vh, a == b), ("I16X8_NE", vh, vh, vh, a != b),
+        ("I16X8_LT_S", vh, vh, vh, a < b), ("I16X8_LT_U", vh, vuh, vuh, a < b),
+        ("I16X8_GT_S", vh, vh, vh, a > b), ("I16X8_GT_U", vh, vuh, vuh, a > b),
+        ("I16X8_LE_S", vh, vh, vh, a <= b), ("I16X8_LE_U", vh, vuh, vuh, a <= b),
+        ("I16X8_GE_S", vh, vh, vh, a >= b), ("I16X8_GE_U", vh, vuh, vuh, a >= b),
+        ("I32X4_EQ", vi, vi, vi, a == b), ("I32X4_NE", vi, vi, vi, a != b),
+        ("I32X4_LT_S", vi, vi, vi, a < b), ("I32X4_LT_U", vi, vui, vui, a < b),
+        ("I32X4_GT_S", vi, vi, vi, a > b), ("I32X4_GT_U", vi, vui, vui, a > b),
+        ("I32X4_LE_S", vi, vi, vi, a <= b), ("I32X4_LE_U", vi, vui, vui, a <= b),
+        ("I32X4_GE_S", vi, vi, vi, a >= b), ("I32X4_GE_U", vi, vui, vui, a >= b),
+        ("I64X2_EQ", vl, vl, vl, a == b), ("I64X2_NE", vl, vl, vl, a != b),
+        ("I64X2_LT_S", vl, vl, vl, a < b), ("I64X2_GT_S", vl, vl, vl, a > b),
+        ("I64X2_LE_S", vl, vl, vl, a <= b), ("I64X2_GE_S", vl, vl, vl, a >= b),
+        ("F32X4_EQ", vi, vf, vf, a == b), ("F32X4_NE", vi, vf, vf, a != b),
+        ("F32X4_LT", vi, vf, vf, a < b), ("F32X4_GT", vi, vf, vf, a > b),
+        ("F32X4_LE", vi, vf, vf, a <= b), ("F32X4_GE", vi, vf, vf, a >= b),
+        ("F64X2_EQ", vl, vd, vd, a == b), ("F64X2_NE", vl, vd, vd, a != b),
+        ("F64X2_LT", vl, vd, vd, a < b), ("F64X2_GT", vl, vd, vd, a > b),
+        ("F64X2_LE", vl, vd, vd, a <= b), ("F64X2_GE", vl, vd, vd, a >= b),
+        ("I8X16_NARROW_I16X8_S", vb, vh, vh, i8x16.narrow_sat(a, b)),
+        ("I8X16_NARROW_I16X8_U", vub, vh, vh, u8x16.narrow_sat(a, b)),
+        ("I16X8_NARROW_I32X4_S", vh, vi, vi, i16x8.narrow_sat(a, b)),
+        ("I16X8_NARROW_I32X4_U", vuh, vi, vi, u16x8.narrow_sat(a, b)),
+        ("I8X16_ADD", vb, vb, vb, a +% b), ("I8X16_SUB", vb, vb, vb, a -% b),
+        ("I8X16_ADD_SAT_S", vb, vb, vb, a.add_sat(b)), ("I8X16_ADD_SAT_U", vub, vub, vub, a.add_sat(b)),
+        ("I8X16_SUB_SAT_S", vb, vb, vb, a.sub_sat(b)), ("I8X16_SUB_SAT_U", vub, vub, vub, a.sub_sat(b)),
+        ("I8X16_MIN_S", vb, vb, vb, a.min(b)), ("I8X16_MIN_U", vub, vub, vub, a.min(b)),
+        ("I8X16_MAX_S", vb, vb, vb, a.max(b)), ("I8X16_MAX_U", vub, vub, vub, a.max(b)),
+        ("I8X16_AVGR_U", vub, vub, vub, a.avgr(b)),
+        ("I16X8_ADD", vh, vh, vh, a +% b), ("I16X8_SUB", vh, vh, vh, a -% b), ("I16X8_MUL", vh, vh, vh, a *% b),
+        ("I16X8_ADD_SAT_S", vh, vh, vh, a.add_sat(b)), ("I16X8_ADD_SAT_U", vuh, vuh, vuh, a.add_sat(b)),
+        ("I16X8_SUB_SAT_S", vh, vh, vh, a.sub_sat(b)), ("I16X8_SUB_SAT_U", vuh, vuh, vuh, a.sub_sat(b)),
+        ("I16X8_MIN_S", vh, vh, vh, a.min(b)), ("I16X8_MIN_U", vuh, vuh, vuh, a.min(b)),
+        ("I16X8_MAX_S", vh, vh, vh, a.max(b)), ("I16X8_MAX_U", vuh, vuh, vuh, a.max(b)),
+        ("I16X8_AVGR_U", vuh, vuh, vuh, a.avgr(b)),
+        ("I16X8_Q15MULR_SAT_S", vh, vh, vh, q15mulr(a, b)),
+        ("I16X8_EXTMUL_LOW_I8X16_S", vh, vb, vb, a.widen_low() *% b.widen_low()),
+        ("I16X8_EXTMUL_HIGH_I8X16_S", vh, vb, vb, a.widen_high() *% b.widen_high()),
+        ("I16X8_EXTMUL_LOW_I8X16_U", vuh, vub, vub, a.widen_low() *% b.widen_low()),
+        ("I16X8_EXTMUL_HIGH_I8X16_U", vuh, vub, vub, a.widen_high() *% b.widen_high()),
+        ("I32X4_ADD", vi, vi, vi, a +% b), ("I32X4_SUB", vi, vi, vi, a -% b), ("I32X4_MUL", vi, vi, vi, a *% b),
+        ("I32X4_MIN_S", vi, vi, vi, a.min(b)), ("I32X4_MIN_U", vui, vui, vui, a.min(b)),
+        ("I32X4_MAX_S", vi, vi, vi, a.max(b)), ("I32X4_MAX_U", vui, vui, vui, a.max(b)),
+        ("I32X4_DOT_I16X8_S", vi, vh, vh, dot_s(a, b)),
+        ("I32X4_EXTMUL_LOW_I16X8_S", vi, vh, vh, a.widen_low() *% b.widen_low()),
+        ("I32X4_EXTMUL_HIGH_I16X8_S", vi, vh, vh, a.widen_high() *% b.widen_high()),
+        ("I32X4_EXTMUL_LOW_I16X8_U", vui, vuh, vuh, a.widen_low() *% b.widen_low()),
+        ("I32X4_EXTMUL_HIGH_I16X8_U", vui, vuh, vuh, a.widen_high() *% b.widen_high()),
+        ("I64X2_ADD", vl, vl, vl, a +% b), ("I64X2_SUB", vl, vl, vl, a -% b), ("I64X2_MUL", vl, vl, vl, a *% b),
+        ("I64X2_EXTMUL_LOW_I32X4_S", vl, vi, vi, a.widen_low() *% b.widen_low()),
+        ("I64X2_EXTMUL_HIGH_I32X4_S", vl, vi, vi, a.widen_high() *% b.widen_high()),
+        ("I64X2_EXTMUL_LOW_I32X4_U", vul, vui, vui, a.widen_low() *% b.widen_low()),
+        ("I64X2_EXTMUL_HIGH_I32X4_U", vul, vui, vui, a.widen_high() *% b.widen_high()),
+        ("F32X4_ADD", vf, vf, vf, a + b), ("F32X4_SUB", vf, vf, vf, a - b),
+        ("F32X4_MUL", vf, vf, vf, a * b), ("F32X4_DIV", vf, vf, vf, a / b),
+        ("F32X4_MIN", vf, vf, vf, a.minimum(b)), ("F32X4_MAX", vf, vf, vf, a.maximum(b)),
+        ("F32X4_PMIN", vf, vf, vf, (b < a).select(b, a)), ("F32X4_PMAX", vf, vf, vf, (a < b).select(b, a)),
+        ("F64X2_ADD", vd, vd, vd, a + b), ("F64X2_SUB", vd, vd, vd, a - b),
+        ("F64X2_MUL", vd, vd, vd, a * b), ("F64X2_DIV", vd, vd, vd, a / b),
+        ("F64X2_MIN", vd, vd, vd, a.minimum(b)), ("F64X2_MAX", vd, vd, vd, a.maximum(b)),
+        ("F64X2_PMIN", vd, vd, vd, (b < a).select(b, a)), ("F64X2_PMAX", vd, vd, vd, (a < b).select(b, a)),
+    ] {
+        op #name(d: dk, a: ak, b: bk) : RRR { d = expr; next }
+    }
+
+    inline for (name, dk, ak, expr) in [
+        ("V128_NOT", vul, vul, ~a),
+        ("V128_ANY_TRUE", ri, vul, b2i((a == u64x2.splat(0)).bitmask() != 3)),
+        ("I8X16_ABS", vb, vb, a.abs()), ("I8X16_NEG", vb, vb, -a), ("I8X16_POPCNT", vub, vub, a.popcount()),
+        ("I8X16_ALL_TRUE", ri, vb, b2i((a == i8x16.splat(0)).bitmask() == 0)),
+        ("I8X16_BITMASK", ri, vb, a.bitmask() as i32),
+        ("I16X8_ABS", vh, vh, a.abs()), ("I16X8_NEG", vh, vh, -a),
+        ("I16X8_ALL_TRUE", ri, vh, b2i((a == i16x8.splat(0)).bitmask() == 0)),
+        ("I16X8_BITMASK", ri, vh, a.bitmask() as i32),
+        ("I16X8_EXTEND_LOW_I8X16_S", vh, vb, a.widen_low()), ("I16X8_EXTEND_HIGH_I8X16_S", vh, vb, a.widen_high()),
+        ("I16X8_EXTEND_LOW_I8X16_U", vuh, vub, a.widen_low()), ("I16X8_EXTEND_HIGH_I8X16_U", vuh, vub, a.widen_high()),
+        ("I16X8_EXTADD_PAIRWISE_I8X16_S", vh, vb, pairs_i8(a)), ("I16X8_EXTADD_PAIRWISE_I8X16_U", vuh, vub, pairs_u8(a)),
+        ("I32X4_ABS", vi, vi, a.abs()), ("I32X4_NEG", vi, vi, -a),
+        ("I32X4_ALL_TRUE", ri, vi, b2i((a == i32x4.splat(0)).bitmask() == 0)),
+        ("I32X4_BITMASK", ri, vi, a.bitmask() as i32),
+        ("I32X4_EXTEND_LOW_I16X8_S", vi, vh, a.widen_low()), ("I32X4_EXTEND_HIGH_I16X8_S", vi, vh, a.widen_high()),
+        ("I32X4_EXTEND_LOW_I16X8_U", vui, vuh, a.widen_low()), ("I32X4_EXTEND_HIGH_I16X8_U", vui, vuh, a.widen_high()),
+        ("I32X4_EXTADD_PAIRWISE_I16X8_S", vi, vh, pairs_i16(a)), ("I32X4_EXTADD_PAIRWISE_I16X8_U", vui, vuh, pairs_u16(a)),
+        ("I64X2_ABS", vl, vl, a.abs()), ("I64X2_NEG", vl, vl, -a),
+        ("I64X2_ALL_TRUE", ri, vl, b2i((a == i64x2.splat(0)).bitmask() == 0)),
+        ("I64X2_BITMASK", ri, vl, a.bitmask() as i32),
+        ("I64X2_EXTEND_LOW_I32X4_S", vl, vi, a.widen_low()), ("I64X2_EXTEND_HIGH_I32X4_S", vl, vi, a.widen_high()),
+        ("I64X2_EXTEND_LOW_I32X4_U", vul, vui, a.widen_low()), ("I64X2_EXTEND_HIGH_I32X4_U", vul, vui, a.widen_high()),
+        ("F32X4_ABS", vf, vf, a.abs()), ("F32X4_NEG", vf, vf, -a), ("F32X4_SQRT", vf, vf, a.sqrt()),
+        ("F32X4_CEIL", vf, vf, a.ceil()), ("F32X4_FLOOR", vf, vf, a.floor()),
+        ("F32X4_TRUNC", vf, vf, a.trunc()), ("F32X4_NEAREST", vf, vf, a.nearest()),
+        ("F64X2_ABS", vd, vd, a.abs()), ("F64X2_NEG", vd, vd, -a), ("F64X2_SQRT", vd, vd, a.sqrt()),
+        ("F64X2_CEIL", vd, vd, a.ceil()), ("F64X2_FLOOR", vd, vd, a.floor()),
+        ("F64X2_TRUNC", vd, vd, a.trunc()), ("F64X2_NEAREST", vd, vd, a.nearest()),
+        ("I32X4_TRUNC_SAT_F32X4_S", vi, vf, a as i32x4), ("I32X4_TRUNC_SAT_F32X4_U", vui, vf, a as u32x4),
+        ("F32X4_CONVERT_I32X4_S", vf, vi, a as f32x4), ("F32X4_CONVERT_I32X4_U", vf, vui, a as f32x4),
+        ("I32X4_TRUNC_SAT_F64X2_S_ZERO", vi, vd, i32x4.narrow_sat(a as i64x2, i64x2.splat(0))),
+        ("I32X4_TRUNC_SAT_F64X2_U_ZERO", vui, vd, u32x4.narrow_sat(a as u64x2, u64x2.splat(0))),
+        ("F64X2_CONVERT_LOW_I32X4_S", vd, vi, a.widen_low() as f64x2),
+        ("F64X2_CONVERT_LOW_I32X4_U", vd, vui, a.widen_low() as f64x2),
+        ("F32X4_DEMOTE_F64X2_ZERO", vf, vd, f32x4.new(a.lane(0) as f32, a.lane(1) as f32, 0.0, 0.0)),
+        ("F64X2_PROMOTE_LOW_F32X4", vd, vf, a.widen_low()),
+        ("I8X16_SPLAT", vb, ri, i8x16.splat(a as i8)), ("I16X8_SPLAT", vh, ri, i16x8.splat(a as i16)),
+        ("I32X4_SPLAT", vi, ri, i32x4.splat(a)), ("I64X2_SPLAT", vl, rl, i64x2.splat(a)),
+        ("F32X4_SPLAT", vf, rf, f32x4.splat(a)), ("F64X2_SPLAT", vd, rd, f64x2.splat(a)),
+    ] {
+        op #name(d: dk, a: ak) : RRR { d = expr; next }
+    }
+
+    // Shifts: the amount is taken modulo the lane width, as in wasm.
+    inline for (name, k, expr) in [
+        ("I8X16_SHL", vb, a << b), ("I8X16_SHR_S", vb, a >> b), ("I8X16_SHR_U", vub, a >> b),
+        ("I16X8_SHL", vh, a << b), ("I16X8_SHR_S", vh, a >> b), ("I16X8_SHR_U", vuh, a >> b),
+        ("I32X4_SHL", vi, a << b), ("I32X4_SHR_S", vi, a >> b), ("I32X4_SHR_U", vui, a >> b),
+        ("I64X2_SHL", vl, a << b), ("I64X2_SHR_S", vl, a >> b), ("I64X2_SHR_U", vul, a >> b),
+    ] {
+        op #name(d: k, a: k, b: ri) : RRR { d = expr; next }
+    }
+
+    // Lanes: d = lane `l` of the v128 in slots a, a + 1 (little-endian).
+    inline for (name, dk, ty, lk, conv) in [
+        ("I8X16_EXTRACT_LANE_S", ri, i8, l16, x as i32), ("I8X16_EXTRACT_LANE_U", ri, u8, l16, x as i32),
+        ("I16X8_EXTRACT_LANE_S", ri, i16, l8, x as i32), ("I16X8_EXTRACT_LANE_U", ri, u16, l8, x as i32),
+        ("I32X4_EXTRACT_LANE", ri, i32, l4, x), ("I64X2_EXTRACT_LANE", rl, i64, l2, x),
+        ("F32X4_EXTRACT_LANE", rf, f32, l4, x), ("F64X2_EXTRACT_LANE", rd, f64, l2, x),
+    ] {
+        op #name(d: dk, a: vslot, l: lk) : RRR {
+            let x = *(((regs + a) as *ty) + l);
+            d = conv;
+            next
+        }
+    }
+    // d = a with a lane (from the cache word, masked) replaced by x.
+    inline for (name, xk, ty, conv, mask) in [
+        ("I8X16_REPLACE_LANE", ri, i8, x as i8, 15), ("I16X8_REPLACE_LANE", ri, i16, x as i16, 7),
+        ("I32X4_REPLACE_LANE", ri, i32, x, 3), ("I64X2_REPLACE_LANE", rl, i64, x, 1),
+        ("F32X4_REPLACE_LANE", rf, f32, x, 3), ("F64X2_REPLACE_LANE", rd, f64, x, 1),
+    ] {
+        op #name(d: vslot, a: vul, x: xk) : RRR + Imm64 {
+            let v = a;
+            let y = conv;
+            let i = cache.v & mask;
+            *((regs + d) as *u64x2) = v;
+            *(((regs + d) as *ty) + i) = y;
+            next
+        }
+    }
+    // The 16 lane indices (< 32, checked by the validator) in the cache.
+    op I8X16_SHUFFLE(d: vub, a: vub, b: vub) : RRR + Imm128 {
+        let idx = u8x16.from_bits(u64x2.new(cache.lo, cache.hi));
+        d = a.swizzle(idx) | b.swizzle(idx -% u8x16.splat(16));
+        next
+    }
+
+    // Memory: as the scalar loads (`_X`: a 64-bit address from ADDR).
+    inline for (name, xname, dk, ty, conv, size) in [
+        ("V128_LOAD", "V128_LOAD_X", vul, u64x2, x, 16),
+        ("V128_LOAD8X8_S", "V128_LOAD8X8_S_X", vh, u64, i8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD8X8_U", "V128_LOAD8X8_U_X", vuh, u64, u8x16.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD16X4_S", "V128_LOAD16X4_S_X", vi, u64, i16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD16X4_U", "V128_LOAD16X4_U_X", vui, u64, u16x8.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD32X2_S", "V128_LOAD32X2_S_X", vl, u64, i32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD32X2_U", "V128_LOAD32X2_U_X", vul, u64, u32x4.from_bits(u64x2.new(x, 0)).widen_low(), 8),
+        ("V128_LOAD8_SPLAT", "V128_LOAD8_SPLAT_X", vb, i8, i8x16.splat(x), 1),
+        ("V128_LOAD16_SPLAT", "V128_LOAD16_SPLAT_X", vh, i16, i16x8.splat(x), 2),
+        ("V128_LOAD32_SPLAT", "V128_LOAD32_SPLAT_X", vi, i32, i32x4.splat(x), 4),
+        ("V128_LOAD64_SPLAT", "V128_LOAD64_SPLAT_X", vl, i64, i64x2.splat(x), 8),
+        ("V128_LOAD32_ZERO", "V128_LOAD32_ZERO_X", vui, u32, u32x4.new(x, 0, 0, 0), 4),
+        ("V128_LOAD64_ZERO", "V128_LOAD64_ZERO_X", vul, u64, u64x2.new(x, 0), 8),
+    ] {
+        op #name(d: dk, a: ru, off: imm) : RRR {
+            let ea = (a as u64) + off;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            d = conv;
+            next
+        }
+        op #xname(d: dk, a: rq) : RRR {
+            let ea = a;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            d = conv;
+            next
+        }
+    }
+    op V128_STORE(a: ru, v: vul, off: imm) : RRR {
+        let ea = (a as u64) + off;
+        if ea + 16 > msize { cold { raise Trap.MemOOB } }
+        ((mem + ea) as *u64x2).write_unaligned(v);
+        next
+    }
+    op V128_STORE_X(a: rq, v: vul) : RRR {
+        let ea = a;
+        if ea + 16 > msize { cold { raise Trap.MemOOB } }
+        ((mem + ea) as *u64x2).write_unaligned(v);
+        next
+    }
+    // Lane loads and stores: offset | lane << 32 in the cache word.
+    inline for (name, ty, mask, size) in [
+        ("V128_LOAD8_LANE", u8, 15, 1), ("V128_LOAD16_LANE", u16, 7, 2),
+        ("V128_LOAD32_LANE", u32, 3, 4), ("V128_LOAD64_LANE", u64, 1, 8),
+    ] {
+        op #name(d: vslot, a: ru, v: vul) : RRR + Imm64 {
+            let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
+            let i = (cache.v >> 32) & mask;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            let w = v;
+            *((regs + d) as *u64x2) = w;
+            *(((regs + d) as *ty) + i) = x;
+            next
+        }
+    }
+    inline for (name, ty, mask, size) in [
+        ("V128_STORE8_LANE", u8, 15, 1), ("V128_STORE16_LANE", u16, 7, 2),
+        ("V128_STORE32_LANE", u32, 3, 4), ("V128_STORE64_LANE", u64, 1, 8),
+    ] {
+        op #name(a: ru, v: vslot, z: imm) : RRR + Imm64 {
+            let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
+            let i = (cache.v >> 32) & mask;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = *(((regs + v) as *ty) + i);
+            ((mem + ea) as *ty).write_unaligned(x);
+            next
+        }
+    }
 
     verify brtable {
         var ok = true;

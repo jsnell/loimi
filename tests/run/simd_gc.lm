@@ -1,0 +1,34 @@
+// Vectors in GC objects, enum payloads and options: places only 8-byte
+// aligned (vector loads and stores assume no alignment), kept across
+// collections.
+import std.io;
+import std.gc;
+
+object Box { tag: u8, v: f32x4, next: ?Gc<Box> }
+enum E { None, Lanes(u8, i16x8) }
+
+fn churn(h: *gc.Heap) uses gc {
+    for i in 0..2000 { new(h, Box { tag: 0, v: f32x4.splat(i as f32), next: None }); }
+    gc.collect(h);
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    var b = new(h, Box { tag: 1, v: f32x4.new(1.0, 2.0, 3.0, 4.0), next: None });
+    b = new(h, Box { tag: 2, v: f32x4.splat(0.5), next: Some(b) });
+    churn(h);
+    let n = b.next.unwrap();
+    n.v = n.v * b.v;
+    io.print_f64((n.v.lane(0) + n.v.lane(3)) as f64); io.println("");
+    let e = E.Lanes(3, i16x8.new(1, 2, 3, 4, 5, 6, 7, -8));
+    match e {
+        E.Lanes(k, v) => { io.print_int(k as i64 + v.lane(7) as i64); io.println(""); }
+        E.None => {}
+    }
+    let o: ?i64x2 = Some(i64x2.new(5, 6));
+    io.print_int(o.unwrap().lane(1)); io.println("");
+}
+// expect: 2.5
+// expect: -5
+// expect: 6

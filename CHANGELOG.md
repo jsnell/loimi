@@ -57,6 +57,13 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **128-bit vectors**: `i8x16` .. `f64x2` with lane-wise operators,
+  masks, lanes, shuffles, swizzles, widening and saturating narrowing,
+  saturating and rounding arithmetic, IEEE min/max and lane-wise `as`;
+  usable as fields, array elements and vm state registers, and through
+  pointers at any alignment
+  ([language.md §1.2, "Vectors"](docs/language.md#vectors)). The wasm
+  interpreter uses them for the SIMD proposal.
 - **Constants in patterns** match their value; the `unreachable_arm`
   warning; or-patterns with bindings
   ([§1.2](docs/language.md#12-basics)).

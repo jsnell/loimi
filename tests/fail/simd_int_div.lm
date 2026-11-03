@@ -1,0 +1,2 @@
+fn main() { let a = i32x4.splat(6); let _ = a / i32x4.splat(2); }
+// error: (integer vectors have no division)

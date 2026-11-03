@@ -1,4 +1,4 @@
-// wasm: a WebAssembly (MVP) interpreter.
+// wasm: a WebAssembly interpreter (MVP, SIMD and the other Wasm 2.0 features).
 //
 //   wasm prog.wasm              run a module: its start function, then
 //                               `_start` (WASI) or `main` if exported
@@ -111,6 +111,18 @@ fn push_hex(b: *text.StrBuf, v: u64) {
     }
 }
 
+/// A 128-bit value (`lo`, `hi`) in hex, high digits first.
+fn push_hex128(b: *text.StrBuf, lo: u64, hi: u64) {
+    if hi == 0 { push_hex(b, lo); return; }
+    push_hex(b, hi);
+    let digits = "0123456789abcdef";
+    var i: u32 = 16;
+    while i > 0 {
+        i -= 1;
+        b.push(digits[(lo >> (i * 4)) & 15]);
+    }
+}
+
 fn split(line: str, out: *mem.Vec<str>) {
     out.clear();
     var i: u64 = 0;
@@ -169,7 +181,8 @@ fn Script.command(s: *Script, w: *mem.Vec<str>) {
         if cmd.eq("get") {
             let Some(g) = x.global else { out.push_str("error not a global"); return; };
             out.push_str("ok ");
-            out.push_str(type_tag(x.gtype)); out.push_str(":"); push_hex(out, *g);
+            out.push_str(type_tag(x.gtype)); out.push_str(":");
+            if x.gtype == decode.T_V128 { push_hex128(out, g[0], g[1]); } else { push_hex(out, *g); }
             return;
         }
         let Some(f) = x.func else { out.push_str("error not a function"); return; };
@@ -178,17 +191,30 @@ fn Script.command(s: *Script, w: *mem.Vec<str>) {
         for i in 3..w.len {
             let a = w.at(i);
             let colon = text.find(a, ':') ?? 0;
-            args.push(parse_hex(a[colon + 1..a.len]));
+            let h = a[colon + 1..a.len];
+            if text.starts_with(a, "v128:") {
+                // Two slots: the low 64 bits, then the high ones.
+                let split = if h.len > 16 { h.len - 16 } else { 0 };
+                args.push(parse_hex(h[split..h.len]));
+                args.push(parse_hex(h[0..split]));
+            } else {
+                args.push(parse_hex(h));
+            }
         }
         match s.e.invoke(f, args.items()) {
             Ok(_) => {
                 out.push_str("ok");
-                let ft = f.inst.module.types.len;
+                var slot: u64 = 0;
                 for i in 0..(f.nresults as u64) {
-                    out.push_str(" ");
-                    var v = s.e.m.stack[i];
-                    out.push_str("v:");
-                    push_hex(out, v);
+                    out.push_str(" v:");
+                    let st = s.e.m.stack;
+                    if i < f.results.len and f.results[i] == decode.T_V128 {
+                        push_hex128(out, st[slot], st[slot + 1]);
+                        slot += 2;
+                    } else {
+                        push_hex(out, st[slot]);
+                        slot += 1;
+                    }
                 }
             }
             Err(t) => { out.push_str("trap "); out.push_str(vm.trap_message(t)); }

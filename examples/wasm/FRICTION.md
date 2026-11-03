@@ -240,6 +240,74 @@ translator already writes results straight into locals). Stak, a stack
 vm that caches the top of stack in a state register by hand, has no
 slot operands for `accumulate` to replace: not applied.
 
+### Fixed-width SIMD
+
+Built on the vector types Loimi gained for it (`i8x16` .. `f64x2`,
+language.md): the whole SIMD proposal (236 instructions), and
+`check.sh` now runs every spec file. **All 57 `simd_*.wast` files pass
+(25,469 commands, 0 failures; 510 skipped, all text-format
+`assert_malformed`), and all 90 others still do (27,331), in each of the
+three dispatch modes.**
+
+**Values.** A v128 takes two consecutive 64-bit slots: locals, operand
+stack homes and call windows are laid out by width (`Val.s` in
+compile.lm is a value's home relative to the first one; `T.lslots` maps
+a local index to its slot), so a frame without v128 values is laid out
+exactly as before and no scalar op changed. Global cells are two words.
+Vector operand kinds view the pair as each lane type
+(`operand vi = *((regs + it) as *i32x4) verify it + 1 < f.nslots`);
+Loimi loads and stores vectors without assuming alignment, which the
+8-byte slots need. A separate v128 register file was the alternative;
+two slots kept calls, branches with values, multi-value returns and
+`select` working through the existing moves, with `MOVV`, `SELECTV`,
+`RETV` and `GLOBAL_GETV`/`SETV` as the only v128 variants of control ops.
+
+**Ops** (about 250, after the existing ones so that their opcodes do not
+move): most are one line in an `inline for` table, e.g.
+`("I16X8_ADD_SAT_U", vuh, vuh, vuh, a.add_sat(b))`,
+`("F32X4_PMIN", vf, vf, vf, (b < a).select(b, a))`,
+`("I32X4_TRUNC_SAT_F64X2_U_ZERO", vui, vd, u32x4.narrow_sat(a as u64x2, u64x2.splat(0)))`;
+extadd_pairwise, dot and q15mulr_sat are small helpers from
+`widen_low`/`widen_high`, `shuffle` and `narrow_sat`. The translator
+needed no new paths for them: SIMD instructions without immediates go
+through the same table-driven `numeric` path as the scalar ones (v128
+as one more operand type), and SIMD loads and stores through `memop`.
+`v128.const` and `i8x16.shuffle` carry 16 bytes in two cache words;
+shuffle is `a.swizzle(idx) | b.swizzle(idx - 16)`, since its indices come
+from the code, not from the handler.
+
+**Friction.** Small, all of one kind: a lane index that comes from the
+bytecode is not a compile-time constant, so `v.lane(i)` and
+`v.with_lane(i, x)` do not apply; extract/replace_lane and the lane
+loads and stores address the slot's bytes instead
+(`*(((regs + a) as *i16) + l)`, with lane operand kinds `l8`, `l4`, ..
+whose `verify it < 8` keeps that inside the frame), or mask a lane index
+from the cache word. Each could have been 16 ops per type from an
+`inline for` over lanes; the memory form is one. An `inline for` name
+cannot be built from another (`#(name ++ "_X")`), so the load table
+spells both names of each load. The compiler accepted the rest as
+written; no bug was hit.
+
+**Speed.** Non-SIMD programs are unchanged (best of 3, 5 for binarytrees and coremark,
+`--align-functions=64`, against the previous commit: binarytrees 1.00,
+coremark 0.98, the others within 1%). The CLBG programs built with
+`-msimd128` (clang 19, the same sources: nbody gets 53 SIMD
+instructions, fannkuchredux 13, spectralnorm 2; the others none) run
+under Loimi in 1.818 s (nbody), 1.484 s (fannkuchredux) and 1.608 s
+(spectralnorm), against 1.971, 1.510 and 1.649 s for their MVP builds,
+and 54.5, 58.1 and 81.2 s under wabt's wasm-interp (wasm3 0.5 has no
+SIMD).
+
+Checked afterwards: the handlers of the non-SIMD ops are the same
+instructions as before (objdump, addresses normalized), and the
+translator emits the same code for the benchmarks (`--disasm` of
+binarytrees and coremark: identical); best of 5, interleaved,
+`--align-functions=64`, tail calls: geomean 0.998 of before (binarytrees
+1.003, coremark 0.988, fannkuchredux 1.003, fasta 0.999, mandelbrot
+0.999, nbody 1.005, spectralnorm 0.987). On AArch64 (cross-built, under
+qemu) all 57 SIMD files pass in tail-call mode and all 147 files in goto
+mode.
+
 ## Summary
 
 | File | Lines | What |

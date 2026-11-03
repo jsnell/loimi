@@ -1,0 +1,3 @@
+fn f(a: i32x4, k: i64) -> i32x4 { a.shuffle(a, [0, 1, 2, k]) }
+fn main() { let _ = f(i32x4.splat(1), 0); }
+// error: a shuffle index must be a constant expression

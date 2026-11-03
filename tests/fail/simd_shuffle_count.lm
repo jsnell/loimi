@@ -1,0 +1,2 @@
+fn main() { let a = u8x16.splat(1); let _ = a.shuffle(a, [0, 1, 2, 3]); }
+// error: `shuffle` on `u8x16` takes 16 lane indices, not 4

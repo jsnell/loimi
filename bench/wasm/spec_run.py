@@ -14,6 +14,9 @@ one process (`wasm --script FILE`), one output line per command:
     invoke NAME|- FIELD ARGS..  -> ok v:HEX.. | trap MSG
     get NAME|- FIELD            -> ok TYPE:HEX
 
+ARGS are TYPE:HEX; a v128 is `v128:HEX` with all 128 bits in one number
+(lane 0 in the low bits), and results print the same way.
+
 Names are hex-encoded UTF-8 (export names in the suite contain spaces and
 arbitrary Unicode). Text-format modules (assert_malformed/assert_invalid
 on .wat) are skipped: the interpreter only reads the binary format.
@@ -24,6 +27,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,8 +50,25 @@ def ref_bits(val):
     return 0 if val == "null" else int(val) + 1
 
 
+LANE_BITS = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "f32": 32, "f64": 64}
+
+
+def v128_bits(v):
+    """The 128-bit value of a v128 constant, or None if a lane is a NaN pattern."""
+    w = LANE_BITS[v["lane_type"]]
+    x = 0
+    for i, lane in enumerate(v["value"]):
+        if lane.startswith("nan"):
+            return None
+        x |= (int(lane) & ((1 << w) - 1)) << (i * w)
+    return x
+
+
 def arg_token(v):
     t = v["type"]
+    if t == "v128":
+        x = v128_bits(v)
+        return None if x is None else "v128:%x" % x
     if t in ("externref", "funcref"):
         if t == "funcref" and v["value"] != "null":
             return None
@@ -60,8 +81,25 @@ def arg_token(v):
     return "%s:%x" % (t, int(val) & MASK[t])
 
 
+def match_lane(t, val, bits):
+    if val == "nan:canonical":
+        if t == "f32":
+            return bits & 0x7FFFFFFF == 0x7FC00000
+        return bits & 0x7FFFFFFFFFFFFFFF == 0x7FF8000000000000
+    if val == "nan:arithmetic":
+        if t == "f32":
+            return bits & 0x7FC00000 == 0x7FC00000
+        return bits & 0x7FF8000000000000 == 0x7FF8000000000000
+    return bits == int(val) & ((1 << LANE_BITS[t]) - 1)
+
+
 def match_value(exp, got_bits):
     t = exp["type"]
+    if t == "v128":
+        lt = exp["lane_type"]
+        w = LANE_BITS[lt]
+        return all(match_lane(lt, val, (got_bits >> (i * w)) & ((1 << w) - 1))
+                   for i, val in enumerate(exp["value"]))
     if t in ("externref", "funcref"):
         val = exp.get("value")
         if val is None or (t == "funcref" and val != "null"):
@@ -71,15 +109,7 @@ def match_value(exp, got_bits):
         return False
     bits = got_bits & MASK[t]
     val = exp["value"]
-    if val == "nan:canonical":
-        if t == "f32":
-            return bits & 0x7FFFFFFF == 0x7FC00000
-        return bits & 0x7FFFFFFFFFFFFFFF == 0x7FF8000000000000
-    if val == "nan:arithmetic":
-        if t == "f32":
-            return bits & 0x7FC00000 == 0x7FC00000
-        return bits & 0x7FF8000000000000 == 0x7FF8000000000000
-    return bits == int(val) & MASK[t]
+    return match_lane(t, val, bits)
 
 
 def action_line(a):
@@ -129,8 +159,9 @@ def run_file(wasm, jpath, verbose, timeout):
             lines.append((line, c, t))
         else:
             skipped += 1
-    script = os.path.join(d, "script.txt")
-    with open(script, "w") as f:
+    # The script goes to a temporary file, not into the (shared) JSON directory.
+    fd, script = tempfile.mkstemp(prefix="spec-", suffix=".txt")
+    with os.fdopen(fd, "w") as f:
         for line, _, _ in lines:
             f.write(line + "\n")
     out_lines = []
@@ -146,6 +177,8 @@ def run_file(wasm, jpath, verbose, timeout):
     except subprocess.TimeoutExpired as e:
         out_lines = (e.stdout or b"").decode("utf-8", "replace").split("\n")
         crashed = "timeout"
+    finally:
+        os.unlink(script)
     passed = failed = 0
     msg_mismatch = 0
     failures = []

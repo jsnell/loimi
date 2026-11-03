@@ -1,0 +1,2 @@
+fn main() { let a = f32x4.splat(1.0); let _ = a & a; }
+// error: bitwise operators are for integer vectors

@@ -1,0 +1,3 @@
+fn get(v: i32x4, i: i64) -> i32 { v.lane(i) }
+fn main() { let _ = get(i32x4.splat(1), 0); }
+// error: the lane index must be a constant expression

@@ -1,0 +1,2 @@
+fn main() { let a = i16x8.splat(6); let _ = a as i32x4; }
+// error: `as` converts lane by lane between vectors with the same number of lanes

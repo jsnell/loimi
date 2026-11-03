@@ -892,6 +892,7 @@ impl<'a> Checker<'a> {
             Ty::Int(it) => format!("{}{}", if it.signed { "i" } else { "u" }, it.bits),
             Ty::F32 => "f32".into(),
             Ty::F64 => "f64".into(),
+            Ty::Vector(l, n) => format!("{}x{}", tn(l), n),
             Ty::Bool => "bool".into(),
             Ty::Unit => "()".into(),
             Ty::Never => "never".into(),
@@ -1384,9 +1385,13 @@ impl<'a> Checker<'a> {
                 ));
             }
         }
+        let hint = match want {
+            Ty::Vector(..) if e.ty.is_numeric() => format!(" (a scalar is not a vector: write `{}.splat(x)`)", self.ty_name(want)),
+            _ => String::new(),
+        };
         Err(Diag::new(
             value_span(&e),
-            format!("mismatched types: expected `{}`, found `{}`", self.ty_name(want), self.ty_name(&e.ty)),
+            format!("mismatched types: expected `{}`, found `{}`{}", self.ty_name(want), self.ty_name(&e.ty), hint),
         ))
     }
 
@@ -1992,6 +1997,9 @@ impl<'a> Checker<'a> {
                 if !self.castable(&v.ty, &to) {
                     let why = match &to {
                         Ty::Enum(_) if v.ty.is_int() => " (only enums without payloads can be cast from integers)",
+                        Ty::Vector(..) if v.ty.is_vector() => {
+                            " (`as` converts lane by lane between vectors with the same number of lanes; reinterpret the bits with `T.from_bits(v)`)"
+                        }
                         _ => "",
                     };
                     return Err(Diag::new(
@@ -3696,6 +3704,7 @@ impl<'a> Checker<'a> {
                 };
                 mk(t.clone(), TK::Intrinsic(intr, vec![recv, y]), span)
             }
+            (Ty::Vector(..), _) => return self.vector_method(cx, recv, name, args, span),
             (Ty::Option(_), "is_some" | "is_none") => {
                 argc(0)?;
                 let intr = if name == "is_some" { Intr::IsSome } else { Intr::IsNone };
@@ -3716,10 +3725,10 @@ impl<'a> Checker<'a> {
                 mk(t.clone(), TK::Intrinsic(Intr::PtrOffset, vec![recv, n]), span)
             }
             (Ty::Ptr(inner), "read_unaligned" | "write_unaligned") => {
-                if !matches!(**inner, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Ptr(_)) {
+                if !matches!(**inner, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Ptr(_) | Ty::Vector(..)) {
                     return Err(Diag::new(
                         span,
-                        format!("`{}` is for pointers to integers, floats and pointers, not `{}`", name, self.ty_name(&t)),
+                        format!("`{}` is for pointers to integers, floats, vectors and pointers, not `{}`", name, self.ty_name(&t)),
                     ));
                 }
                 if name == "read_unaligned" {
@@ -3832,7 +3841,227 @@ impl<'a> Checker<'a> {
         Some(mk(t.clone(), TK::Deref(Box::new(fp)), span))
     }
 
+    /// A lane index or shuffle index: a constant expression below `n`.
+    fn lane_index(&mut self, cx: &mut FnCx, e: &Expr, n: u32, what: &str) -> Res<TExpr> {
+        let te = fold(&self.expr_coerce(cx, e, &Ty::i64())?);
+        match te.kind {
+            TK::Int(v) if (0..n as i128).contains(&v) => Ok(mk(Ty::i64(), TK::Int(v), e.span)),
+            TK::Int(v) => Err(Diag::new(e.span, format!("{} {} is out of range: it must be below {}", what, v, n))),
+            _ => Err(Diag::new(
+                e.span,
+                format!(
+                    "{} must be a constant expression (an integer literal or a `const`); for a lane chosen at run time, store the vector and index the memory",
+                    what
+                ),
+            )),
+        }
+    }
+
+    /// Methods of vector types (`Ty::Vector`).
+    fn vector_method(&mut self, cx: &mut FnCx, recv: TExpr, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
+        let t = recv.ty.clone();
+        let Ty::Vector(lane, n) = t.clone() else { unreachable!() };
+        let tn = self.ty_name(&t);
+        let argc = |k: usize| -> Res<()> {
+            if args.len() != k {
+                return Err(Diag::new(span, format!("`{}` takes {} argument(s)", name, k)));
+            }
+            Ok(())
+        };
+        let int = lane.is_int();
+        let float = lane.is_float();
+        let signed = matches!(*lane, Ty::Int(IntTy { signed: true, .. }));
+        let only = |ok: bool, what: &str| -> Res<()> {
+            if ok { Ok(()) } else { Err(Diag::new(span, format!("`{}` is for {} vectors, not `{}`", name, what, tn))) }
+        };
+        let r = match name {
+            "lane" => {
+                argc(1)?;
+                let i = self.lane_index(cx, &args[0], n, "the lane index")?;
+                mk((*lane).clone(), TK::Intrinsic(Intr::VLane, vec![recv, i]), span)
+            }
+            "with_lane" => {
+                argc(2)?;
+                let i = self.lane_index(cx, &args[0], n, "the lane index")?;
+                let x = self.expr_coerce(cx, &args[1], &lane)?;
+                mk(t.clone(), TK::Intrinsic(Intr::VWithLane, vec![recv, i, x]), span)
+            }
+            "abs" => {
+                argc(0)?;
+                mk(t.clone(), TK::Intrinsic(if float { Intr::Fabs } else { Intr::IAbs }, vec![recv]), span)
+            }
+            "min" | "max" | "add_sat" | "sub_sat" | "avgr" | "minimum" | "maximum" | "copysign" => {
+                argc(1)?;
+                let intr = match (name, float) {
+                    ("min", true) => Intr::MinNum,
+                    ("max", true) => Intr::MaxNum,
+                    ("min", false) => Intr::IMin,
+                    ("max", false) => Intr::IMax,
+                    ("minimum" | "maximum" | "copysign", _) => {
+                        only(float, "float")?;
+                        match name {
+                            "minimum" => Intr::Minimum,
+                            "maximum" => Intr::Maximum,
+                            _ => Intr::Copysign,
+                        }
+                    }
+                    ("avgr", _) => {
+                        only(int && !signed, "unsigned integer")?;
+                        Intr::Avgr
+                    }
+                    _ => {
+                        only(int, "integer")?;
+                        if name == "add_sat" { Intr::AddSat } else { Intr::SubSat }
+                    }
+                };
+                let y = self.expr_coerce(cx, &args[0], &t)?;
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv, y]), span)
+            }
+            "sqrt" | "floor" | "ceil" | "trunc" | "nearest" => {
+                argc(0)?;
+                only(float, "float")?;
+                let intr = match name {
+                    "sqrt" => Intr::Sqrt,
+                    "floor" => Intr::Floor,
+                    "ceil" => Intr::Ceil,
+                    "trunc" => Intr::Trunc,
+                    _ => Intr::Nearest,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
+            }
+            "clz" | "ctz" | "popcount" => {
+                argc(0)?;
+                only(int, "integer")?;
+                let intr = match name {
+                    "clz" => Intr::Clz,
+                    "ctz" => Intr::Ctz,
+                    _ => Intr::Popcount,
+                };
+                mk(t.clone(), TK::Intrinsic(intr, vec![recv]), span)
+            }
+            "select" => {
+                argc(2)?;
+                only(int, "integer (mask)")?;
+                let a = self.expr(cx, &args[0], None)?;
+                if !matches!(&a.ty, Ty::Vector(_, m) if *m == n) {
+                    return Err(Diag::new(
+                        args[0].span,
+                        format!("`select` on a `{}` mask picks between vectors of {} lanes, not `{}`", tn, n, self.ty_name(&a.ty)),
+                    ));
+                }
+                let at = a.ty.clone();
+                let b = self.expr_coerce(cx, &args[1], &at)?;
+                mk(at, TK::Intrinsic(Intr::VSelect, vec![recv, a, b]), span)
+            }
+            "bitmask" => {
+                argc(0)?;
+                only(int, "integer")?;
+                mk(Ty::Int(IntTy::U32), TK::Intrinsic(Intr::Bitmask, vec![recv]), span)
+            }
+            "widen_low" | "widen_high" => {
+                argc(0)?;
+                let wide = match &*lane {
+                    Ty::Int(it) if it.bits < 64 => Ty::Int(IntTy { signed: it.signed, bits: it.bits * 2 }),
+                    Ty::F32 => Ty::F64,
+                    _ => return Err(Diag::new(span, format!("`{}` has no wider lanes to widen to", tn))),
+                };
+                let intr = if name == "widen_low" { Intr::WidenLow } else { Intr::WidenHigh };
+                mk(Ty::vector_of(wide), TK::Intrinsic(intr, vec![recv]), span)
+            }
+            "shuffle" => {
+                argc(2)?;
+                let b = self.expr_coerce(cx, &args[0], &t)?;
+                let ExprKind::ArrayLit(idx) = &args[1].kind else {
+                    return Err(Diag::new(args[1].span, format!("the lanes of `shuffle` are an array literal of {} constant indices", n)));
+                };
+                if idx.len() != n as usize {
+                    return Err(Diag::new(args[1].span, format!("`shuffle` on `{}` takes {} lane indices, not {}", tn, n, idx.len())));
+                }
+                let mut vals = vec![recv, b];
+                for e in idx {
+                    vals.push(self.lane_index(cx, e, 2 * n, "a shuffle index")?);
+                }
+                mk(t.clone(), TK::Intrinsic(Intr::Shuffle, vals), span)
+            }
+            "swizzle" => {
+                argc(1)?;
+                only(matches!(&*lane, Ty::Int(it) if it.bits == 8), "8-bit lane")?;
+                let ix = self.expr(cx, &args[0], None)?;
+                if !matches!(&ix.ty, Ty::Vector(l, _) if matches!(**l, Ty::Int(IntTy { bits: 8, .. }))) {
+                    return Err(Diag::new(
+                        args[0].span,
+                        format!("the indices of `swizzle` are a `u8x16` or `i8x16`, not `{}`", self.ty_name(&ix.ty)),
+                    ));
+                }
+                mk(t.clone(), TK::Intrinsic(Intr::Swizzle, vec![recv, ix]), span)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(r))
+    }
+
+    /// `T.splat(x)`, `T.new(..)`, `T.from_bits(v)`, `T.narrow_sat(a, b)`
+    /// for a vector type `T`.
+    fn vector_static(&mut self, cx: &mut FnCx, t: &Ty, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
+        let Ty::Vector(lane, n) = t else { unreachable!() };
+        let tn = self.ty_name(t);
+        let r = match name {
+            "splat" => {
+                if args.len() != 1 {
+                    return Err(Diag::new(span, "`splat` takes one argument"));
+                }
+                let x = self.expr_coerce(cx, &args[0], lane)?;
+                mk(t.clone(), TK::Intrinsic(Intr::VSplat, vec![x]), span)
+            }
+            "new" => {
+                if args.len() != *n as usize {
+                    return Err(Diag::new(span, format!("`{}.new` takes {} arguments, one per lane", tn, n)));
+                }
+                let mut xs = vec![];
+                for a in args {
+                    xs.push(self.expr_coerce(cx, a, lane)?);
+                }
+                mk(t.clone(), TK::Intrinsic(Intr::VNew, xs), span)
+            }
+            "from_bits" => {
+                if args.len() != 1 {
+                    return Err(Diag::new(span, "`from_bits` takes one argument"));
+                }
+                let v = self.expr(cx, &args[0], None)?;
+                if !v.ty.is_vector() {
+                    return Err(Diag::new(args[0].span, format!("`{}.from_bits` takes a vector, not `{}`", tn, self.ty_name(&v.ty))));
+                }
+                mk(t.clone(), TK::Intrinsic(Intr::VBitcast, vec![v]), span)
+            }
+            "narrow_sat" => {
+                if args.len() != 2 {
+                    return Err(Diag::new(span, "`narrow_sat` takes two arguments"));
+                }
+                let it = match **lane {
+                    Ty::Int(it) if it.bits < 64 => it,
+                    _ => return Err(Diag::new(span, format!("`narrow_sat` makes vectors of 8-, 16- or 32-bit integer lanes, not `{}`", tn))),
+                };
+                let a = self.expr(cx, &args[0], None)?;
+                let ok = matches!(&a.ty, Ty::Vector(l, _) if matches!(**l, Ty::Int(w) if w.bits == it.bits * 2));
+                if !ok {
+                    return Err(Diag::new(
+                        args[0].span,
+                        format!("`{}.narrow_sat` takes vectors of {}-bit integer lanes, not `{}`", tn, it.bits * 2, self.ty_name(&a.ty)),
+                    ));
+                }
+                let at = a.ty.clone();
+                let b = self.expr_coerce(cx, &args[1], &at)?;
+                mk(t.clone(), TK::Intrinsic(Intr::NarrowSat, vec![a, b]), span)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(r))
+    }
+
     fn static_intrinsic(&mut self, cx: &mut FnCx, t: &Ty, name: &str, args: &[Expr], span: Span) -> Res<Option<TExpr>> {
+        if let Ty::Vector(..) = t {
+            return self.vector_static(cx, t, name, args, span);
+        }
         match (t, name) {
             (Ty::F64 | Ty::F32, "from_bits") => {
                 if args.len() != 1 {
@@ -3983,21 +4212,21 @@ impl<'a> Checker<'a> {
                     return self.int_lit(-(v as i128), exp, span);
                 }
                 let v = self.expr(cx, inner, exp)?;
-                if !v.ty.is_numeric() {
+                if !v.ty.is_numeric() && !v.ty.is_vector() {
                     return Err(Diag::new(span, format!("cannot negate `{}`", self.ty_name(&v.ty))));
                 }
                 Ok(mk(v.ty.clone(), TK::Unary(op, Box::new(v)), span))
             }
             UnOp::Not => {
                 let v = self.expr(cx, inner, exp)?;
-                if v.ty != Ty::Bool && !v.ty.is_int() {
+                if v.ty != Ty::Bool && !v.ty.lane().is_int() {
                     return Err(Diag::new(span, format!("cannot apply `!` to `{}`", self.ty_name(&v.ty))));
                 }
                 Ok(mk(v.ty.clone(), TK::Unary(op, Box::new(v)), span))
             }
             UnOp::BitNot => {
                 let v = self.expr(cx, inner, exp)?;
-                if !v.ty.is_int() {
+                if !v.ty.lane().is_int() {
                     let hint = if v.ty == Ty::Bool { " (use `!` for logical not)" } else { "" };
                     return Err(Diag::new(span, format!("cannot apply `~` to `{}`{}", self.ty_name(&v.ty), hint)));
                 }
@@ -4074,7 +4303,7 @@ impl<'a> Checker<'a> {
                 let b = if a.ty == Ty::Never { b } else { self.coerce(b, &at)? };
                 (a, b)
             };
-            if !a.ty.is_numeric() {
+            if !a.ty.is_numeric() && !a.ty.is_vector() {
                 return Err(Diag::new(span, format!("operator `{:?}` is not defined for `{}`", op, self.ty_name(&a.ty))));
             }
             let t = a.ty.clone();
@@ -4087,10 +4316,13 @@ impl<'a> Checker<'a> {
             let a = self.expr(cx, l, operand_exp)?;
             let b = if is_literal_expr(r) && a.ty.is_int() {
                 self.expr_coerce(cx, r, &a.ty.clone())?
+            } else if is_literal_expr(r) && a.ty.lane().is_int() {
+                // A vector shifted by a scalar amount: a literal one is a `u32`.
+                self.expr_coerce(cx, r, &Ty::Int(IntTy::U32))?
             } else {
                 self.expr(cx, r, None)?
             };
-            if a.ty.is_int() && !b.ty.is_int() && b.ty != Ty::Never {
+            if a.ty.lane().is_int() && !b.ty.is_int() && b.ty != Ty::Never {
                 return Err(Diag::new(r.span, format!("shift amount must be an integer, found `{}`", self.ty_name(&b.ty))));
             }
             (a, b)
@@ -4106,6 +4338,27 @@ impl<'a> Checker<'a> {
             (a, b)
         };
         let t = a.ty.clone();
+        if let Ty::Vector(l, n) = &t {
+            // Lane-wise; comparisons give a mask of signed integers of the
+            // lane width (all ones where true).
+            let ok = match op {
+                Add | Sub | Mul => true,
+                Div => l.is_float(),
+                AddWrap | SubWrap | MulWrap | Shl | Shr | And | Or | Xor => l.is_int(),
+                Eq | Ne | Lt | Le | Gt | Ge => true,
+                Rem | LAnd | LOr => false,
+            };
+            if !ok {
+                let hint = match op {
+                    Div => " (integer vectors have no division)",
+                    And | Or | Xor => " (bitwise operators are for integer vectors; reinterpret with `T.from_bits(v)`)",
+                    _ => "",
+                };
+                return Err(Diag::new(span, format!("operator `{:?}` is not defined for `{}`{}", op, self.ty_name(&t), hint)));
+            }
+            let ty = if op.is_cmp() { Ty::Vector(Box::new(Ty::Int(IntTy { signed: true, bits: (128 / n) as u8 })), *n) } else { t };
+            return Ok(mk(ty, TK::Binary(op, Box::new(a), Box::new(b)), span));
+        }
         let ok = match op {
             Add | Sub | Mul | Div | Rem => t.is_numeric(),
             AddWrap | SubWrap | MulWrap | Shl | Shr => t.is_int(),
@@ -4132,6 +4385,7 @@ impl<'a> Checker<'a> {
         let num = |t: &Ty| t.is_numeric();
         match (from, to) {
             (a, b) if num(a) && num(b) => true,
+            (Ty::Vector(_, n), Ty::Vector(_, m)) => n == m,
             (Ty::Bool, Ty::Int(_)) => true,
             (Ty::Ptr(_) | Ty::Fn(..) | Ty::Gc(_), Ty::Ptr(_)) => true,
             (Ty::Gc(_), Ty::Int(it)) => it.bits == 64,
@@ -4334,6 +4588,10 @@ pub fn prim_type(name: &str) -> Option<Ty> {
         "f64" => Ty::F64,
         "bool" => Ty::Bool,
         "str" => Ty::str(),
+        "i8x16" | "u8x16" | "i16x8" | "u16x8" | "i32x4" | "u32x4" | "i64x2" | "u64x2" | "f32x4" | "f64x2" => {
+            let (lane, _) = name.split_once('x').unwrap();
+            Ty::vector_of(prim_type(lane).unwrap())
+        }
         _ => return arbitrary_int(name).map(Ty::Int),
     })
 }
@@ -4402,7 +4660,7 @@ fn irrefutable(p: &TPat) -> bool {
 /// (their constructor may set invariants), enums or `value` types.
 pub fn zero_ok(t: &Ty) -> bool {
     match t {
-        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) | Ty::Ptr(_) => true,
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Option(_) | Ty::Slice(_) | Ty::Ptr(_) | Ty::Vector(..) => true,
         Ty::Array(e, _) => zero_ok(e),
         Ty::Tuple(ts) => ts.iter().all(zero_ok),
         _ => false,
