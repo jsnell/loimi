@@ -62,7 +62,8 @@ import.
 - **Types**: `i8`..`i64`, `u8`..`u64`, `isize`, `usize`, any-width
   `iN`/`uN` (1..=64), `f32`, `f64`, `bool`, `str` (a `[]u8` slice), slices
   `[]T` (`.len`, `.ptr`, `s[a..b]`), arrays `[T; N]`, pointers `*T`,
-  `?T`, `Result<T, E>`, tuples (language.md §1.1).
+  `?T`, `Result<T, E>`, tuples, 128-bit vectors `i8x16` .. `f64x2`
+  (language.md §1.1).
 - **Integer arithmetic**: `+ - *` trap on overflow in debug builds and
   wrap in release builds; `+% -% *%` always wrap;
   `a.add_checked(b)`, `a.sub_checked(b)`, `a.mul_checked(b)` return `?T`.
@@ -116,6 +117,14 @@ import.
   `frintm`/`frintn`.. in the base ISA). `as` converts between integers
   and floats (and `f32 as f64` and back). For floor division and the
   rest, see `std.num`.
+- **Vectors** (`i8x16` .. `f64x2`, language.md §1.2, "Vectors"):
+  `T.splat(x)`, `T.new(..)`, `T.from_bits(v)`, `T.narrow_sat(a, b)`;
+  `v.lane(i)`, `v.with_lane(i, x)` (constant `i`); lane-wise operators
+  (comparisons give masks); `abs`, `min`, `max`, `add_sat`, `sub_sat`,
+  `avgr`, `clz`, `ctz`, `popcount`, `select`, `bitmask`, `widen_low`,
+  `widen_high`, `shuffle`, `swizzle`, and the float methods above
+  (`sqrt` .. `minimum`/`maximum`, without `is_nan` and `to_bits`)
+  lane by lane; `as` between vectors with the same lane count.
 - **Options**: `o.is_some()`, `o.is_none()`, `o.unwrap()` (traps on
   None), `o.unwrap_or(d)`, `o ?? d`, and `?` (also on `Result`).
   `o ?? p` with `p: ?T` is `?T`: `o` if it is `Some`, else `p`, which is
