@@ -2040,7 +2040,69 @@ impl<'a> Checker<'a> {
                 let ty = lc.break_ty.unwrap_or(Ty::Never);
                 Ok(mk(ty, TK::Loop { body: Box::new(b), step: None, id }, span))
             }
-            ExprKind::For(var, ann, lo, hi, body) => {
+            ExprKind::For(var, ann, coll, None, body) => {
+                // `for x in e`: over a slice, or an array (in place if it is
+                // one, else a temporary), by index.
+                if ann.is_some() {
+                    return Err(Diag::new(var.span, "`for x in e` takes the element type from `e`: no annotation"));
+                }
+                let c = self.expr(cx, coll, None)?;
+                let c = self.auto_deref_for_index(c);
+                let elem = match &c.ty {
+                    Ty::Array(t, _) | Ty::Slice(t) => (**t).clone(),
+                    t => {
+                        return Err(Diag::new(
+                            coll.span,
+                            format!("`for` iterates over a range `lo..hi`, an array or a slice, not `{}`", self.ty_name(t)),
+                        ))
+                    }
+                };
+                let sty = Ty::Slice(Box::new(elem.clone()));
+                let u = Ty::Int(IntTy::U64);
+                let mut pre = Vec::new();
+                cx.scopes.push(vec![]);
+                let slice = match &c.ty {
+                    Ty::Array(..) if !matches!(c.kind, TK::Local(_) | TK::Global(_) | TK::Field(..) | TK::Index(..) | TK::Deref(_)) => {
+                        let tmp = cx.temp(c.ty.clone());
+                        let cs = c.span;
+                        let aty = c.ty.clone();
+                        pre.push(TStmt::Let(tmp, Some(c)));
+                        mk(sty.clone(), TK::SliceRange(Box::new(mk(aty, TK::Local(tmp), cs)), None, None), cs)
+                    }
+                    Ty::Array(..) => {
+                        let cs = c.span;
+                        mk(sty.clone(), TK::SliceRange(Box::new(c), None, None), cs)
+                    }
+                    _ => c,
+                };
+                let s = cx.temp(sty.clone());
+                let ctr = cx.temp(u.clone());
+                let end = cx.temp(u.clone());
+                let id = self.push_loop(cx, false);
+                cx.scopes.push(vec![]);
+                let user = cx.declare(&var.name, elem.clone(), false);
+                let b = self.block(cx, body, Some(&Ty::Unit));
+                cx.scopes.pop();
+                cx.loops.pop();
+                cx.scopes.pop();
+                let b = b?;
+                let local = |id, t: &Ty| mk(t.clone(), TK::Local(id), span);
+                let len = mk(u.clone(), TK::Field(Box::new(local(s, &sty)), 1), span);
+                let cond = mk(Ty::Bool, TK::Binary(BinOp::Lt, Box::new(local(ctr, &u)), Box::new(local(end, &u))), span);
+                let item = mk(elem.clone(), TK::Index(Box::new(local(s, &sty)), Box::new(local(ctr, &u))), span);
+                let inner = mk(Ty::Unit, TK::Block(vec![TStmt::Let(user, Some(item)), TStmt::Expr(b)], None), span);
+                let brk = mk(Ty::Never, TK::Break(id, None), span);
+                let body = mk(Ty::Unit, TK::If(vec![TCond::Expr(cond)], Box::new(inner), Some(Box::new(brk))), span);
+                let one = mk(u.clone(), TK::Int(1), span);
+                let inc = mk(u.clone(), TK::Binary(BinOp::AddWrap, Box::new(local(ctr, &u)), Box::new(one)), span);
+                let step = mk(Ty::Unit, TK::Assign(Box::new(local(ctr, &u)), Box::new(inc)), span);
+                let lp = mk(Ty::Unit, TK::Loop { body: Box::new(body), step: Some(Box::new(step)), id }, span);
+                pre.push(TStmt::Let(s, Some(slice)));
+                pre.push(TStmt::Let(ctr, Some(mk(u.clone(), TK::Int(0), span))));
+                pre.push(TStmt::Let(end, Some(len)));
+                Ok(mk(Ty::Unit, TK::Block(pre, Some(Box::new(lp))), span))
+            }
+            ExprKind::For(var, ann, lo, Some(hi), body) => {
                 // The range's type: the annotation, else the bound that is
                 // not a literal (`0..n` with `n: u64` is a u64 range), else
                 // i64.
@@ -2623,6 +2685,13 @@ impl<'a> Checker<'a> {
                 Ok(v)
             }
             Def::Global(id) => Ok(mk(self.prog.globals[id as usize].ty.clone(), TK::Global(id), span)),
+            Def::GenericType(_) => Err(Diag::new(
+                span,
+                format!(
+                    "`{n}` is a generic type, not a value; its static functions take their type arguments from the expected type, not as `{n}<T>.f(..)`: write `var v: {n}<T> = {n}.new();` (qualified as the type is, e.g. `mem.{n}`)",
+                    n = name
+                ),
+            )),
             _ => Err(Diag::new(span, format!("`{}` is not a value", name))),
         }
     }

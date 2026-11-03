@@ -107,6 +107,12 @@ bits Insn: u32 { op: 8, a: 8, b: 8, c: 8 }   // insn.a reads bits 8..16
   bounds are literals (or `Kind.COUNT`), the type comes from an annotation
   on the variable, `for i: u8 in 0..10`, and is `i64` without one; the
   bounds must fit it. (The loop variable's later uses are not looked at.)
+- **Element loops.** `for x in e`, with `e` an array or a slice, runs
+  the body with `x` bound to a copy of each element in order (`break`
+  and `continue` work): `for row in table() { let (op, k) = row; .. }`.
+  An array that is a place (a variable, field, `p.xs`) is read in
+  place; an array-valued call is stored in a temporary first. The loop
+  variable is a name, not a pattern.
 - **`<` after `as`.** `x as u64 < y` is a comparison: a primitive type never
   takes type arguments. After any other type name, `<` begins type
   arguments only when a balanced `<...>` made of type tokens follows

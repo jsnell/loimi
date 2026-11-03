@@ -1,0 +1,6 @@
+// A generic type takes no explicit type arguments on a static call; the
+// error says what to write instead.
+// error: `Vec` is a generic type, not a value
+// error: write `var v: Vec<T> = Vec.new();`
+import std.mem;
+fn main() { var v = mem.Vec<u64>.new(); v.push(1); }

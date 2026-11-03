@@ -1,0 +1,3 @@
+// `for` iterates over a range, an array or a slice.
+// error: `for` iterates over a range `lo..hi`, an array or a slice, not `i64`
+fn main() { let n: i64 = 5; for i in n { } }

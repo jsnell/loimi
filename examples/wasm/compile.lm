@@ -440,9 +440,8 @@ fn kforms() -> [(u64, u64, bool); 38] {
 
 fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
     let h = t.home(p);
-    let ks = kforms();
-    for i in 0..ks.len {
-        let (rop, kop, comm) = ks[i];
+    for row in kforms() {
+        let (rop, kop, comm) = row;
         if rop != op { continue; }
         let sub = op == W.OP_I32_SUB or op == W.OP_I64_SUB;
         if b.loc == Loc.Const {
@@ -515,9 +514,8 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     t.has_def = false;
                     return;
                 }
-                let fs = fusions();
-                for i in 0..fs.len {
-                    let (cop, bt, bf, k) = fs[i];
+                for row in fusions() {
+                    let (cop, bt, bf, k) = row;
                     if cop != op { continue; }
                     t.code.truncate(last);
                     let bop = if when { bt } else { bf };

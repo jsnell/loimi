@@ -1343,7 +1343,7 @@ impl AstAny<'_> {
             ExprKind::Block(b) | ExprKind::Unsafe(b) | ExprKind::Loop(b) => self.block(b),
             ExprKind::If(cs, t, f) => conds(cs) || self.block(t) || f.as_ref().is_some_and(|e| go(e)),
             ExprKind::While(cs, b) => conds(cs) || self.block(b),
-            ExprKind::For(_, _, lo, hi, b) => go(lo) || go(hi) || self.block(b),
+            ExprKind::For(_, _, lo, hi, b) => go(lo) || hi.as_ref().is_some_and(|e| go(e)) || self.block(b),
             ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| go(&a.body) || a.guard.as_ref().is_some_and(|g| go(g))),
             ExprKind::Return(v) | ExprKind::Break(v) => v.as_ref().is_some_and(|e| go(e)),
             ExprKind::Closure(_, _, body) => self.closures && go(body),
