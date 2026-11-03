@@ -434,6 +434,18 @@ with all of it.
   fixups in it); `mark_target()`.
 - `thread_jumps(target_of, is_goto)`: retargets jumps that land on an
   unconditional jump, following chains up to 8 deep; nothing moves.
+- Branch relaxation: `set_relax(Vm.label, invert, Vm.JMP(0))` turns it
+  on. A conditional jump whose offset does not fit its field is then
+  recorded instead of failing, and `relax()`, called after the last label
+  is bound, rewrites each into `invert(w)` (the opposite condition,
+  jumping over the next instruction) followed by the long unconditional
+  jump to the target. Later code moves down: every jump offset, the
+  position table and placed labels are updated (and a jump that stops
+  fitting is relaxed too); pcs kept from before are stale. `invert`
+  returns None for words without a long form, which stay errors.
+  `needs_relax()` tells if any jump waits; `check()` reports them as
+  `JumpRange` until `relax()` runs. Lox (`examples/lox/compile.lm`) and
+  `tests/run/std_bc_relax.lm` use it.
 - `bc.Field { shift, bits, signed }` with `fits`, `get`/`set` (and
   `get32`/`set32`): range-checked access to an encoded field.
 - `Pool<K: hash.Hash>`: `Pool.new(limit)`, `add(k) -> ?u32` (deduplicated
@@ -459,7 +471,6 @@ into. Not built:
 
 - emitters as `b.ADD(r1, r2, r3)` methods (the generated `Vm.ADD(..)`
   encoders plus `code.op` cover it);
-- branch relaxation (a too-long jump is an error, reported by `check`);
 - an exception table (ranges to handler pc) for `on raise`;
 - `Proto` assembly that calls the verifier and returns `Verified<V>` (each
   interpreter's `Proto` and verify context differ; the compiler calls
@@ -496,6 +507,16 @@ into. Not built:
 - Weak references: `heap.new_weak(x) -> Gc<gc.Weak<T>>`, `w.get() ->
   ?Gc<T>`, `w.set(..)`. Ephemerons: `gc.Ephemerons.new(&heap) ->
   *Ephemerons<K, V>`, `get`, `set`, `remove`, `len`, `free`.
+- Weak intern tables for GC strings: `gc.WeakInterner.new(&heap, make)
+  -> *WeakInterner<X>` over the interpreter's string object X (fields
+  `hash: u64` and `data: [u8]`; `make(h, s, hash)` allocates one, or use
+  the ready-made `gc.Str` and `gc.new_str`). `intern(s) -> Gc<X>` (the
+  one live string with those contents; allocates, never collects),
+  `find(s)`, `len`, `free`. Entries are weak: dead strings leave the
+  table at the next collection. `key(x) -> u64` pins `x` (alive and in
+  the table for the table's lifetime) and returns its address, a stable
+  key for `std.obj` properties and other name-keyed tables (an unpinned
+  string's address can be reused once it dies); `is_pinned(x)`.
 - Write barriers: the compiler emits `gc.barrier(obj)` after every store
   of a reference into an object. After a store through a raw pointer,
   call `gc.write_barrier(&heap, obj)`; `gc.needs_barrier(obj)` and
@@ -545,8 +566,11 @@ names a transition path), inline and overflow slots, dictionary mode,
 per-property attribute bits, prototype chains with validity cells (plain
 ids, so a prototype hit is a few plain words), the inline-cache state
 machine (`obj.Site`, `read_miss`/`write_miss`: refill, polymorphic,
-megamorphic, cached property adds) and allocation templates. Keys are
-u64 symbol ids. Use the ready-made generic `obj.Obj<V>` / `obj.Slots<V>`,
+megamorphic, cached property adds; `poly_get_at`, `mega_get_at` and
+`read_miss_at` also say whether a value came from the receiver or a
+prototype, for method binding) and allocation templates. Keys are u64
+symbol ids or pinned string addresses (`gc.WeakInterner.key`; see
+"Keys for guest strings" in `stdlib/obj.md`). Use the ready-made generic `obj.Obj<V>` / `obj.Slots<V>`,
 or declare your own object type (fields `shape`, `dict`, `overflow`,
 optionally `proto`, and trailing `inline: [Value]`) and slot-array type;
 either way, instantiate `obj.Model<O, S, V>` with a function that
