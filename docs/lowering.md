@@ -249,7 +249,28 @@ Relational compares of odd widths likewise compare the operands shifted to
 the top (`shl; shl; cmp`, not `shl; sar` per operand), and `/` and `%`
 wider than 32 bits use a 32-bit divide when both operands are non-negative
 and below 2^31 (64-bit `idiv` is two to three times slower on many x86
-cores).
+cores; the test is `(x | y) << k` against bits 31 and up, one `test` with
+a mask). The division checks (`y == 0`, `x == MIN and y == -1`) test the
+shifted operands too, so that a dominating compare such as Python's
+`y > 0` guard on floor division (`icmp sgt i64 (y << 16), 0`) folds them
+away: with them in `i48` form LLVM kept both checks and their `panic`
+calls, and the handler set up a stack frame on its fast path.
+
+On AArch64 the shifted forms fold into the shifted-register operands:
+an `Int(i48)` add is `lsl; adds x, x, y, lsl #16; b.vs; mov; bfxil`, a
+compare `lsl; cmp x, y, lsl #16`, and a multiply
+`lsl; sbfx; mul; smulh; cmp ..., asr #63; b.ne` (no flag-setting multiply).
+
+Measured alternatives (2026-11-03, Python interpreter, micro benchmarks
+of int loops): doing add/sub in i64 on sign-extended operands, which
+cannot overflow, and then checking that the sum fits in 48 bits
+(`shl; sar` per operand, `add`, a range check) is 12 instructions instead
+of 6 and 5-10% slower; computing the value with a plain 48-bit add next
+to the shifted overflow add (shorter dependency chain: `add; and; or`) is
+2-5% slower (more instructions; these handlers are throughput-bound). The
+remaining cost against `Int(i32)` is the two `shl` per operation and the
+`shr` before re-tagging; avoiding them needs the tag in the low bits of
+the rotated word, which the checked operation does not know.
 
 ### `boxed`
 

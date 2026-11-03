@@ -1951,13 +1951,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     // Odd widths (i48 payloads): compare in i64 with both
                     // operands shifted to the top, one `shl` each, instead
                     // of LLVM's sign-extension (`shl` + `sar`) of each.
-                    let k = 64 - it.bits as u32;
-                    let mut w = Vec::new();
-                    for v in [&x, &y] {
-                        let z = self.inst(format!("zext {} {} to i64", lt, v));
-                        w.push(self.inst(format!("shl i64 {}, {}", z, k)));
-                    }
-                    return self.inst(format!("icmp {} i64 {}, {}", c, w[0], w[1]));
+                    let xs = self.odd_shifted(*it, &x);
+                    let ys = self.odd_shifted(*it, &y);
+                    return self.inst(format!("icmp {} i64 {}, {}", c, xs, ys));
                 }
             }
             return self.inst(format!("icmp {} {} {}, {}", c, lt, x, y));
@@ -1974,13 +1970,23 @@ impl<'a, 'p> FnGen<'a, 'p> {
             return r;
         }
         if matches!(op, Div | Rem) && t.is_int() {
-            let z = self.inst(format!("icmp eq {} {}, 0", lt, y));
+            let Ty::Int(it) = t else { unreachable!() };
+            // Odd widths test the shifted operands, like their compares,
+            // so that a dominating `y > 0` (`icmp sgt i64 (y << k), 0`)
+            // folds the checks away.
+            let odd = !matches!(it.bits, 8 | 16 | 32 | 64);
+            let (xc, yc, ct) = if odd {
+                (self.odd_shifted(*it, &x), self.odd_shifted(*it, &y), "i64".to_string())
+            } else {
+                (x.clone(), y.clone(), lt.clone())
+            };
+            let k = if odd { 64 - it.bits as u32 } else { 0 };
+            let z = self.inst(format!("icmp eq {} {}, 0", ct, yc));
             self.check(&z, "division by zero", e.span);
             if signed {
                 // MIN / -1 overflows (and traps in hardware).
-                let Ty::Int(it) = t else { unreachable!() };
-                let m1 = self.inst(format!("icmp eq {} {}, -1", lt, y));
-                let mn = self.inst(format!("icmp eq {} {}, {}", lt, x, it.min()));
+                let m1 = self.inst(format!("icmp eq {} {}, {}", ct, yc, -1i64 << k));
+                let mn = self.inst(format!("icmp eq {} {}, {}", ct, xc, if odd { i64::MIN as i128 } else { it.min() }));
                 let both = self.inst(format!("and i1 {}, {}", m1, mn));
                 self.check(&both, "integer overflow in division", e.span);
             }
@@ -2032,8 +2038,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
     fn narrow_div(&mut self, it: IntTy, ins32: &str, ins: &str, x: &str, y: &str) -> String {
         let nt = format!("i{}", it.bits);
         let o = self.inst(format!("or {} {}, {}", nt, x, y));
-        let hi = self.inst(format!("lshr {} {}, 31", nt, o));
-        let small = self.inst(format!("icmp eq {} {}, 0", nt, hi));
+        // Bits 31 and up of the operands, tested on the shifted word (one
+        // `shl` and `shr`, no 48-bit mask constant).
+        let os = self.odd_shifted(it, &o);
+        let hi = self.inst(format!("lshr i64 {}, {}", os, 64 - it.bits as u32 + 31));
+        let small = self.inst(format!("icmp eq i64 {}, 0", hi));
         let (l_fast, l_slow, l_join) = (self.fresh_label("divfast"), self.fresh_label("divslow"), self.fresh_label("divjoin"));
         self.cond_br(&small, &l_fast, &l_slow);
         self.label(&l_fast);
@@ -2047,6 +2056,15 @@ impl<'a, 'p> FnGen<'a, 'p> {
         self.br(&l_join);
         self.label(&l_join);
         self.inst(format!("phi {} [ {}, %{} ], [ {}, %{} ]", nt, rf, l_fast, rw, l_slow))
+    }
+
+    /// An odd-width integer (not 8/16/32/64 bits) moved to the top of an
+    /// i64, `zext(x) << (64 - bits)`: such values compare (signed or
+    /// unsigned) like the narrow ones, with one `shl` each instead of a
+    /// sign extension, and LLVM folds the zext of a truncated word away.
+    fn odd_shifted(&mut self, it: IntTy, x: &str) -> String {
+        let z = self.inst(format!("zext i{} {} to i64", it.bits, x));
+        self.inst(format!("shl i64 {}, {}", z, 64 - it.bits as u32))
     }
 
     /// `x op y` (add, sub or mul) on integer type `it` with overflow

@@ -44,6 +44,9 @@ pub object Dict<K: hash.Hash, V> {
     version: u64,
     index: Gc<DictIndex>,
     ents: Gc<DictEntries<K, V>>,
+    /// Entries given back by `pop_last` since the last rebuild: their
+    /// index slots stay deleted, so they still count against the room.
+    popped: u64,
 }
 
 /// A dict with room for `n` entries before it resizes.
@@ -51,7 +54,7 @@ pub fn Dict<K, V>.new(h: *gc.Heap, n: u64) -> Gc<Dict<K, V>> {
     let sz = map.index_size_for<K>(n);
     let index = new(h, DictIndex {}, sz);
     let ents: Gc<DictEntries<K, V>> = new(h, DictEntries {}, map.usable_for<K>(sz));
-    new(h, Dict { len: 0, used: 0, mask: sz - 1, version: 0, index: index, ents: ents })
+    new(h, Dict { len: 0, used: 0, mask: sz - 1, version: 0, index: index, ents: ents, popped: 0 })
 }
 
 /// Resize (and compact) for `n` live entries.
@@ -67,6 +70,7 @@ fn Dict<K, V>.resize(d: Gc<Dict<K, V>>, h: *gc.Heap, n: u64) {
     d.index = index;
     d.ents = ents;
     d.mask = sz - 1;
+    d.popped = 0;
     d.version += 1;
 }
 
@@ -88,13 +92,13 @@ pub fn Dict<K, V>.find_with<E>(d: Gc<Dict<K, V>>, hv: u64, eq: block fn(K) -> Re
 
 /// Whether `insert_new` would not resize.
 #[inline]
-pub fn Dict<K, V>.has_room(d: Gc<Dict<K, V>>) -> bool { d.used < d.ents.e.len }
+pub fn Dict<K, V>.has_room(d: Gc<Dict<K, V>>) -> bool { d.used + d.popped < d.ents.e.len }
 
 /// Append a new entry for a key the caller knows is absent, if there is
 /// room without resizing (`has_room`); its index, else None. Does not
 /// allocate.
 pub fn Dict<K, V>.try_insert_new(d: Gc<Dict<K, V>>, hv: u64, key: K, value: V) -> ?u64 {
-    if d.used >= d.ents.e.len { return None; }
+    if d.used + d.popped >= d.ents.e.len { return None; }
     let hs = map.stored_hash<K>(hv);
     let e = d.used;
     d.ents.e[e] = Entry { hash: hs, key: key, value: value };
@@ -107,7 +111,7 @@ pub fn Dict<K, V>.try_insert_new(d: Gc<Dict<K, V>>, hv: u64, key: K, value: V) -
 
 /// Append a new entry for a key the caller knows is absent; its index.
 pub fn Dict<K, V>.insert_new(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V) -> u64 {
-    if d.used >= d.ents.e.len { d.resize(h, d.len * 2 + 1); }
+    if d.used + d.popped >= d.ents.e.len { d.resize(h, d.len * 2 + 1); }
     d.try_insert_new(hv, key, value).unwrap()
 }
 
@@ -136,7 +140,7 @@ pub fn Dict<K, V>.put_by(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value:
         d.ents.e[r].value = value;
         return (r, false);
     }
-    if d.used < d.ents.e.len { return (d.place(r, hs, key, value), true); }
+    if d.used + d.popped < d.ents.e.len { return (d.place(r, hs, key, value), true); }
     (d.insert_new(h, hv, key, value), true)
 }
 
@@ -144,7 +148,7 @@ pub fn Dict<K, V>.put_by(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value:
 /// room without resizing: the new entry's index; None if the key is
 /// present or the dict is full (nothing done). Does not allocate.
 pub fn Dict<K, V>.try_add_by(d: Gc<Dict<K, V>>, hv: u64, key: K, value: V, eq: block fn(K) -> bool) -> ?u64 {
-    if d.used >= d.ents.e.len { return None; }
+    if d.used + d.popped >= d.ents.e.len { return None; }
     let hs = map.stored_hash<K>(hv);
     let (r, found) = map.probe_lookup(d.index.s.ptr, d.mask, d.ents.e.ptr, hs, eq);
     if found { return None; }
@@ -198,12 +202,17 @@ pub fn Dict<K, V>.remove(d: Gc<Dict<K, V>>, key: K) -> ?V {
 
 /// Remove and return the last entry in insertion order.
 pub fn Dict<K, V>.pop_last(d: Gc<Dict<K, V>>) -> ?(K, V) {
+    // Entries given back stay counted (their index slots are deleted,
+    // not empty): without that, popping and inserting in turn would fill
+    // the index with deleted slots and a probe would never end.
+    let was = d.used;
     while d.used > 0 and d.ents.e[d.used - 1].hash == map.DEAD { d.used -= 1; }
-    if d.used == 0 { return None; }
+    if d.used == 0 { d.popped += was; return None; }
     let e = d.used - 1;
     let r = (d.ents.e[e].key, d.ents.e[e].value);
     d.remove_at(e);
     d.used = e;
+    d.popped += was - e;
     Some(r)
 }
 
@@ -227,6 +236,7 @@ pub fn Dict<K, V>.clear(d: Gc<Dict<K, V>>) {
     mem.memset(d.ents.e.ptr as *u8, 0, d.used * size_of<Entry<K, V>>());
     d.used = 0;
     d.len = 0;
+    d.popped = 0;
     d.version += 1;
 }
 
@@ -234,6 +244,327 @@ pub fn Dict<K, V>.clear(d: Gc<Dict<K, V>>) {
 pub fn Dict<K, V>.copy(d: Gc<Dict<K, V>>, h: *gc.Heap) -> Gc<Dict<K, V>> {
     let r: Gc<Dict<K, V>> = Dict.new(h, d.len);
     r.used = map.probe_rebuild(r.index.s.ptr, r.mask, r.ents.e.ptr, d.ents.e.ptr, d.used);
+    r.len = r.used;
+    gc.write_barrier(h, r.ents as *u8);
+    r
+}
+
+// ── KeyDict: keys that carry their hash (no stored hash) ─────────────
+//
+// CPython's "unicode keys" layout: when every key caches its own hash (an
+// interned attribute name, a string object with its hash in a field), an
+// entry is just (key, value), 16 bytes for `Value` keys instead of 24,
+// and resizing, removal and `copy` ask the key for its hash. The index,
+// probing, entry indices, `version` and the GC behavior are `Dict`'s.
+// A removed entry is zeroed and is told apart by its all-zero key bytes:
+// a live key must never be all zero bits (a `Value` string is a tagged
+// pointer). Lookups have no stored hash to filter candidates by, so `eq`
+// sees every live key on the probe path: test identity first, then the
+// candidate's cached hash, then the contents.
+
+/// Keys of a `KeyDict`: `cached_hash` is the hash callers pass to
+/// `find_by` & co. for that key, read from the key (it must not fail or
+/// run guest code; computing and caching it on first use is fine).
+pub trait CachedHash {
+    fn cached_hash(k: Self) -> u64;
+    fn eq(a: Self, b: Self) -> bool;
+}
+
+/// One entry of a `KeyDict`: no hash.
+pub struct KeyEntry<K, V> { key: K, value: V }
+
+/// The entries of a `KeyDict`, in insertion order.
+pub object KeyEntries<K, V> { e: [KeyEntry<K, V>] }
+
+pub object KeyDict<K: CachedHash, V> {
+    /// Live entries.
+    len: u64,
+    /// Entries in use, dead ones included.
+    used: u64,
+    mask: u64,
+    version: u64,
+    index: Gc<DictIndex>,
+    ents: Gc<KeyEntries<K, V>>,
+    /// As `Dict.popped`.
+    popped: u64,
+}
+
+/// Whether the key bytes at `k` are not all zero (a live entry).
+#[inline(always)]
+fn key_live<K>(k: *K) -> bool {
+    if size_of<K>() % 8 == 0 {
+        let w = k as *u64;
+        for i in 0..size_of<K>() / 8 { if w[i] != 0 { return true; } }
+        return false;
+    }
+    let b = k as *u8;
+    for i in 0..size_of<K>() { if b[i] != 0 { return true; } }
+    false
+}
+
+/// The stored hash of entry `p`'s key.
+#[inline(always)]
+fn key_hash<K: CachedHash, V>(p: *KeyEntry<K, V>) -> u64 { map.stored_hash<K>(p.key.cached_hash()) }
+
+/// `map.probe_find` without stored hashes.
+#[inline]
+fn key_probe_find<K, V>(idx: *u32, mask: u64, ents: *KeyEntry<K, V>, hash: u64, eq: block fn(K) -> bool) -> ?u64 {
+    var i = hash & mask;
+    var perturb = hash;
+    loop {
+        let s = idx[i];
+        if s == map.SLOT_EMPTY { return None; }
+        if s >= map.SLOT_BASE {
+            let e = (s - map.SLOT_BASE) as u64;
+            if eq((ents + e).key) { return Some(e); }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// `map.probe_lookup` without stored hashes: `(e, true)` for the entry
+/// `eq` accepts, else `(slot, false)` where the key goes.
+#[inline]
+fn key_probe_lookup<K, V>(idx: *u32, mask: u64, ents: *KeyEntry<K, V>, hash: u64, eq: block fn(K) -> bool) -> (u64, bool) {
+    var i = hash & mask;
+    var perturb = hash;
+    var free: u64 = 0xffffffffffffffff;
+    loop {
+        let s = idx[i];
+        if s == map.SLOT_EMPTY { return (if free == 0xffffffffffffffff { i } else { free }, false); }
+        if s >= map.SLOT_BASE {
+            let e = (s - map.SLOT_BASE) as u64;
+            if eq((ents + e).key) { return (e, true); }
+        } else if free == 0xffffffffffffffff {
+            free = i;
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
+/// `map.probe_rebuild`, with each key's hash from the key.
+fn key_probe_rebuild<K: CachedHash, V>(idx: *u32, mask: u64, dst: *KeyEntry<K, V>, src: *KeyEntry<K, V>, n: u64) -> u64 {
+    var j: u64 = 0;
+    for i in 0..n {
+        let p = src + i;
+        if key_live<K>(&p.key) {
+            dst[j] = *p;
+            map.probe_put<K>(idx, mask, key_hash(p), j);
+            j += 1;
+        }
+    }
+    j
+}
+
+/// A dict with room for `n` entries before it resizes.
+pub fn KeyDict<K, V>.new(h: *gc.Heap, n: u64) -> Gc<KeyDict<K, V>> {
+    let sz = map.index_size_for<K>(n);
+    let index = new(h, DictIndex {}, sz);
+    let ents: Gc<KeyEntries<K, V>> = new(h, KeyEntries {}, map.usable_for<K>(sz));
+    new(h, KeyDict { len: 0, used: 0, mask: sz - 1, version: 0, index: index, ents: ents, popped: 0 })
+}
+
+/// Resize (and compact) for `n` live entries.
+#[cold]
+#[inline(never)]
+fn KeyDict<K, V>.resize(d: Gc<KeyDict<K, V>>, h: *gc.Heap, n: u64) {
+    let sz = map.index_size_for<K>(n);
+    let index = new(h, DictIndex {}, sz);
+    let ents: Gc<KeyEntries<K, V>> = new(h, KeyEntries {}, map.usable_for<K>(sz));
+    // The raw copy bypasses the compiler's barriers: one for the object.
+    d.used = key_probe_rebuild(index.s.ptr, sz - 1, ents.e.ptr, d.ents.e.ptr, d.used);
+    gc.write_barrier(h, ents as *u8);
+    d.index = index;
+    d.ents = ents;
+    d.mask = sz - 1;
+    d.popped = 0;
+    d.version += 1;
+}
+
+/// The entry index of the key with hash `hv` that `eq` accepts. `eq` gets
+/// a copy of each live key on the probe path (no hash filter), and must
+/// not change the dict.
+#[inline]
+pub fn KeyDict<K, V>.find_by(d: Gc<KeyDict<K, V>>, hv: u64, eq: block fn(K) -> bool) -> ?u64 {
+    key_probe_find(d.index.s.ptr, d.mask, d.ents.e.ptr, map.stored_hash<K>(hv), eq)
+}
+
+/// `Dict.find_with`: an `eq` that can fail and run guest code; after each
+/// `eq` call the lookup starts over if `version` changed.
+pub fn KeyDict<K, V>.find_with<E>(d: Gc<KeyDict<K, V>>, hv: u64, eq: block fn(K) -> Result<bool, E> uses reenter) -> Result<?u64, E> uses reenter {
+    let hash = map.stored_hash<K>(hv);
+    loop {
+        let ver = d.version;
+        var i = hash & d.mask;
+        var perturb = hash;
+        var restart = false;
+        loop {
+            let s = (d.index.s.ptr)[i];
+            if s == map.SLOT_EMPTY { break; }
+            if s >= map.SLOT_BASE {
+                let e = (s - map.SLOT_BASE) as u64;
+                let k = (d.ents.e.ptr + e).key;
+                let same = eq(k)?;
+                if d.version != ver { restart = true; break; }
+                if same { return Ok(Some(e)); }
+            }
+            perturb = perturb >> 5;
+            i = (i * 5 + 1 + perturb) & d.mask;
+        }
+        if !restart { return Ok(None); }
+    }
+}
+
+/// Whether `insert_new` would not resize.
+#[inline]
+pub fn KeyDict<K, V>.has_room(d: Gc<KeyDict<K, V>>) -> bool { d.used + d.popped < d.ents.e.len }
+
+/// Append a new entry for a key the caller knows is absent, if there is
+/// room without resizing; its index, else None. Does not allocate.
+pub fn KeyDict<K, V>.try_insert_new(d: Gc<KeyDict<K, V>>, hv: u64, key: K, value: V) -> ?u64 {
+    if d.used + d.popped >= d.ents.e.len { return None; }
+    let e = d.used;
+    d.ents.e[e] = KeyEntry { key: key, value: value };
+    map.probe_put<K>(d.index.s.ptr, d.mask, map.stored_hash<K>(hv), e);
+    d.used = e + 1;
+    d.len += 1;
+    d.version += 1;
+    Some(e)
+}
+
+/// Append a new entry for a key the caller knows is absent; its index.
+pub fn KeyDict<K, V>.insert_new(d: Gc<KeyDict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V) -> u64 {
+    if d.used + d.popped >= d.ents.e.len { d.resize(h, d.len * 2 + 1); }
+    d.try_insert_new(hv, key, value).unwrap()
+}
+
+/// Entry `e` := (key, value), indexed at `slot`.
+#[inline(always)]
+fn KeyDict<K, V>.place(d: Gc<KeyDict<K, V>>, slot: u64, key: K, value: V) -> u64 {
+    let e = d.used;
+    let p = d.ents.e.ptr + e;
+    p.key = key;
+    p.value = value;
+    gc.barrier(d.ents as *u8);
+    (d.index.s.ptr)[slot] = (e as u32) + map.SLOT_BASE;
+    d.used = e + 1;
+    d.len += 1;
+    d.version += 1;
+    e
+}
+
+/// Insert or replace in one probe (as `Dict.put_by`). Returns the entry
+/// index and whether the key was new.
+pub fn KeyDict<K, V>.put_by(d: Gc<KeyDict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V, eq: block fn(K) -> bool) -> (u64, bool) {
+    let (r, found) = key_probe_lookup(d.index.s.ptr, d.mask, d.ents.e.ptr, map.stored_hash<K>(hv), eq);
+    if found {
+        d.ents.e[r].value = value;
+        return (r, false);
+    }
+    if d.used + d.popped < d.ents.e.len { return (d.place(r, key, value), true); }
+    (d.insert_new(h, hv, key, value), true)
+}
+
+/// Insert a key that `eq` finds absent, in one probe, if the dict has
+/// room without resizing (as `Dict.try_add_by`). Does not allocate.
+pub fn KeyDict<K, V>.try_add_by(d: Gc<KeyDict<K, V>>, hv: u64, key: K, value: V, eq: block fn(K) -> bool) -> ?u64 {
+    if d.used + d.popped >= d.ents.e.len { return None; }
+    let (r, found) = key_probe_lookup(d.index.s.ptr, d.mask, d.ents.e.ptr, map.stored_hash<K>(hv), eq);
+    if found { return None; }
+    Some(d.place(r, key, value))
+}
+
+/// Key, value and (stored) hash of entry `e` (a live entry index).
+#[inline]
+pub fn KeyDict<K, V>.key(d: Gc<KeyDict<K, V>>, e: u64) -> K { d.ents.e[e].key }
+#[inline]
+pub fn KeyDict<K, V>.value(d: Gc<KeyDict<K, V>>, e: u64) -> V { d.ents.e[e].value }
+#[inline]
+pub fn KeyDict<K, V>.hash_at(d: Gc<KeyDict<K, V>>, e: u64) -> u64 { key_hash(d.ents.e.ptr + e) }
+#[inline]
+pub fn KeyDict<K, V>.set_value(d: Gc<KeyDict<K, V>>, e: u64, value: V) { d.ents.e[e].value = value; }
+
+/// Whether entry index `e` is a live entry.
+pub fn KeyDict<K, V>.is_live(d: Gc<KeyDict<K, V>>, e: u64) -> bool {
+    e < d.used and key_live<K>(&(d.ents.e.ptr + e).key)
+}
+
+/// Remove the live entry `e`.
+pub fn KeyDict<K, V>.remove_at(d: Gc<KeyDict<K, V>>, e: u64) {
+    if e >= d.used { d.ents.e[e]; }
+    let p = d.ents.e.ptr + e;
+    let slot = map.probe_slot_of<K>(d.index.s.ptr, d.mask, key_hash(p), e);
+    (d.index.s.ptr)[slot] = map.SLOT_DELETED;
+    mem.memset((&p.key) as *u8, 0, size_of<K>());
+    mem.memset((&p.value) as *u8, 0, size_of<V>());
+    d.len -= 1;
+    d.version += 1;
+}
+
+pub fn KeyDict<K, V>.get(d: Gc<KeyDict<K, V>>, key: K) -> ?V {
+    let Some(e) = d.find_by(key.cached_hash(), |k| k.eq(key)) else { return None; };
+    Some(d.ents.e[e].value)
+}
+
+pub fn KeyDict<K, V>.contains(d: Gc<KeyDict<K, V>>, key: K) -> bool {
+    d.find_by(key.cached_hash(), |k| k.eq(key)).is_some()
+}
+
+/// Insert or replace (a replaced key keeps its place). True if the key was new.
+pub fn KeyDict<K, V>.insert(d: Gc<KeyDict<K, V>>, h: *gc.Heap, key: K, value: V) -> bool {
+    d.put_by(h, key.cached_hash(), key, value, |k| k.eq(key)).1
+}
+
+/// Remove `key`; its value if it was present.
+pub fn KeyDict<K, V>.remove(d: Gc<KeyDict<K, V>>, key: K) -> ?V {
+    let Some(e) = d.find_by(key.cached_hash(), |k| k.eq(key)) else { return None; };
+    let v = d.ents.e[e].value;
+    d.remove_at(e);
+    Some(v)
+}
+
+/// Remove and return the last entry in insertion order.
+pub fn KeyDict<K, V>.pop_last(d: Gc<KeyDict<K, V>>) -> ?(K, V) {
+    // Entries given back stay counted (their index slots are deleted,
+    // not empty): without that, popping and inserting in turn would fill
+    // the index with deleted slots and a probe would never end.
+    let was = d.used;
+    while d.used > 0 and !key_live<K>(&(d.ents.e.ptr + (d.used - 1)).key) { d.used -= 1; }
+    if d.used == 0 { d.popped += was; return None; }
+    let e = d.used - 1;
+    let r = (d.ents.e[e].key, d.ents.e[e].value);
+    d.remove_at(e);
+    d.used = e;
+    d.popped += was - e;
+    Some(r)
+}
+
+/// Iteration in insertion order, by entry index (as `Dict.next`).
+pub fn KeyDict<K, V>.next(d: Gc<KeyDict<K, V>>, at: *u64) -> ?u64 {
+    while *at < d.used {
+        let e = *at;
+        *at += 1;
+        if key_live<K>(&(d.ents.e.ptr + e).key) { return Some(e); }
+    }
+    None
+}
+
+/// Remove every entry, keeping the tables (cleared, so they keep nothing alive).
+pub fn KeyDict<K, V>.clear(d: Gc<KeyDict<K, V>>) {
+    mem.memset(d.index.s.ptr as *u8, 0, d.index.s.len * 4);
+    mem.memset(d.ents.e.ptr as *u8, 0, d.used * size_of<KeyEntry<K, V>>());
+    d.used = 0;
+    d.len = 0;
+    d.popped = 0;
+    d.version += 1;
+}
+
+/// A new dict with the live entries of `d`, in order (compacted).
+pub fn KeyDict<K, V>.copy(d: Gc<KeyDict<K, V>>, h: *gc.Heap) -> Gc<KeyDict<K, V>> {
+    let r: Gc<KeyDict<K, V>> = KeyDict.new(h, d.len);
+    r.used = key_probe_rebuild(r.index.s.ptr, r.mask, r.ents.e.ptr, d.ents.e.ptr, d.used);
     r.len = r.used;
     gc.write_barrier(h, r.ents as *u8);
     r

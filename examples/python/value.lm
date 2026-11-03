@@ -18,8 +18,13 @@ pub object Tuple { items: [Value] }
 /// An insertion-ordered dict: std.dict's (CPython's compact layout).
 /// Entry numbers are stable until a resize, which bumps `version`.
 pub type Dict = dict.Dict<Value, Value>;
+/// Instance attributes: string keys only, so std.dict's KeyDict, whose
+/// entries have no stored hash (16 bytes instead of 24; CPython's
+/// str-keys dict layout). `__dict__` and `vars()` give a copy as a
+/// `Dict`.
+pub type AttrDict = dict.KeyDict<Value, Value>;
 /// An instance of a user class (exceptions too).
-pub object Inst { cls: Gc<Box>, dict: Gc<Dict> }
+pub object Inst { cls: Gc<Box>, dict: Gc<AttrDict> }
 pub object Func {
     proto: *Proto,
     defaults: ?Gc<Tuple>,
@@ -111,6 +116,12 @@ pub const GEN_DONE: i64 = 3;
 pub fn Value.hash(v: Value) -> u64 { hash.mix(v as u64) }
 pub fn Value.eq(a: Value, b: Value) -> bool { a == b }
 impl hash.Hash for Value;
+/// An AttrDict key's hash: a string's cached hash (the only keys there).
+pub fn Value.cached_hash(v: Value) -> u64 {
+    if let Str(s) = v { return str_hash(s); }
+    hash.mix(v as u64)
+}
+impl dict.CachedHash for Value;
 
 // ── strings ─────────────────────────────────────────────────────────
 
@@ -364,6 +375,61 @@ pub fn dict_next(d: Gc<Dict>, i: *u64) -> ?u64 { d.next(i) }
 
 pub fn dict_key(d: Gc<Dict>, e: u64) -> Value { d.key(e) }
 pub fn dict_val(d: Gc<Dict>, e: u64) -> Value { d.value(e) }
+
+// Instance attribute dicts (AttrDict: string keys, no stored hashes).
+
+pub fn new_attrs(h: *gc.Heap, n: u64) -> Gc<AttrDict> { AttrDict.new(h, n) }
+
+/// Entry number of attribute `key` (pointer comparison first).
+#[inline]
+pub fn attr_find(d: Gc<AttrDict>, key: Gc<Str>) -> ?u64 {
+    let kv = Value.Str(key);
+    d.find_by(str_hash(key), |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    })
+}
+
+/// `dict_append_new` for attributes.
+pub fn attr_append_new(d: Gc<AttrDict>, key: Gc<Str>, v: Value) -> bool {
+    let hv = key.hash;
+    if hv == 0 { return false; }
+    let kv = Value.Str(key);
+    d.try_add_by(hv, kv, v, |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    }).is_some()
+}
+
+pub fn attr_get(d: Gc<AttrDict>, key: Gc<Str>) -> ?Value {
+    let Some(e) = attr_find(d, key) else { return None; };
+    Some(d.value(e))
+}
+
+pub fn attr_set(h: *gc.Heap, d: Gc<AttrDict>, key: Gc<Str>, v: Value) {
+    let kv = Value.Str(key);
+    d.put_by(h, str_hash(key), kv, v, |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    });
+}
+
+pub fn attr_del(d: Gc<AttrDict>, key: Gc<Str>) -> bool {
+    let Some(e) = attr_find(d, key) else { return false; };
+    d.remove_at(e);
+    true
+}
+
+/// The attributes as a new `Dict` (`__dict__`, `vars()`).
+pub fn attrs_dict(h: *gc.Heap, d: Gc<AttrDict>) -> Gc<Dict> {
+    let r: Gc<Dict> = Dict.new(h, d.len);
+    var i: u64 = 0;
+    while let Some(e) = d.next(&i) { r.insert_new(h, d.hash_at(e), d.key(e), d.value(e)); }
+    r
+}
 
 // ── numbers ─────────────────────────────────────────────────────────
 

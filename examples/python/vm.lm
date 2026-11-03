@@ -575,7 +575,7 @@ pub vm Py {
                 }
             } else if i == d.used and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
                 let Str(s) = name else { trap() };
-                if value.dict_append_new(d, s, src) { next }
+                if value.attr_append_new(d, s, src) { next }
             }
         }
         cold {

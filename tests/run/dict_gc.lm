@@ -8,7 +8,8 @@
 import std.io;
 import std.gc;
 import std.hash;
-import std.dict.{Dict};
+import std.dict;
+import std.dict.{Dict, KeyDict};
 
 object Box { n: i64 }
 
@@ -29,6 +30,9 @@ fn Value.eq(a: Value, b: Value) -> bool {
     }
 }
 impl hash.Hash for Value;
+/// For KeyDict: the hash is read from the key (a box's number).
+fn Value.cached_hash(v: Value) -> u64 { v.hash() }
+impl dict.CachedHash for Value;
 
 fn boxed(h: *gc.Heap, n: i64) -> Value uses gc { Value.B(new(h, Box { n: n })) }
 
@@ -129,9 +133,105 @@ fn effectful(h: *gc.Heap) uses reenter {
     if let Err(m) = bad { io.println(m); }
 }
 
+// The same against a KeyDict (keys carry their hash: `cached_hash`).
+/// Keys and values are fresh boxes, reachable only through the dict.
+fn kfill(h: *gc.Heap, n: i64) -> Gc<KeyDict<Value, Value>> uses gc {
+    let d: Gc<KeyDict<Value, Value>> = KeyDict.new(h, 0);
+    for i in 0..n {
+        let k = boxed(h, i);
+        let v = boxed(h, i * 10);
+        d.insert(h, k, v);
+    }
+    d
+}
+
+fn ksum_values(d: Gc<KeyDict<Value, Value>>) -> i64 {
+    var s: i64 = 0;
+    var i: u64 = 0;
+    while let Some(e) = d.next(&i) { s += num(d.value(e)); }
+    s
+}
+
+fn kbasic(h: *gc.Heap) uses gc {
+    let d = kfill(h, 500);
+    gc.collect(h);
+    // Remove the odd keys; replace some values.
+    for i in 0..500 {
+        if i % 2 == 1 {
+            let k = boxed(h, i);
+            d.remove(k);
+        }
+    }
+    for i in 0..50 {
+        let k = boxed(h, i * 2);
+        let v = boxed(h, 1);
+        d.insert(h, k, v);
+    }
+    gc.collect(h);
+    // Grow again past the dead entries (compaction).
+    for i in 500..700 {
+        let k = boxed(h, i);
+        let v = boxed(h, i * 10);
+        d.insert(h, k, v);
+    }
+    gc.collect(h);
+    io.print_int(d.len as i64); io.print(" "); io.print_int(ksum_values(d)); io.println("");
+    // Order: the first keys are 0, 2, 4.
+    var i: u64 = 0;
+    var shown = 0;
+    while let Some(e) = d.next(&i) {
+        if shown < 3 { if shown > 0 { io.print(" "); } io.print_int(num(d.key(e))); }
+        shown += 1;
+    }
+    io.println("");
+    let c = d.copy(h);
+    gc.collect(h);
+    let (lk, lv) = c.pop_last().unwrap();
+    io.print_int(num(lk)); io.print(" "); io.print_int(num(lv)); io.print(" ");
+    io.print_int(c.len as i64); io.print(" "); io.print_int(d.len as i64); io.println("");
+    c.clear();
+    let k5 = boxed(h, 5);
+    let v5 = boxed(h, 55);
+    c.insert(h, k5, v5);
+    gc.collect(h);
+    io.print_int(num(c.get(Value.Int(0)) ?? Value.Nil)); io.print(" ");
+    let k5b = boxed(h, 5);
+    io.print_int(num(c.get(k5b) ?? Value.Nil)); io.println("");
+}
+
+/// An equality that allocates (so it may collect) and, the first time,
+/// inserts into the dict being searched: the lookup starts over.
+fn keffectful(h: *gc.Heap) uses reenter {
+    let d = kfill(h, 40);
+    var calls = 0;
+    var mutated = false;
+    let key = boxed(h, 17);
+    let r: Result<?u64, str> = d.find_with(key.cached_hash(), |k| -> Result<bool, str> {
+        calls += 1;
+        let junk = boxed(h, 12345);
+        gc.collect(h);
+        if !mutated {
+            mutated = true;
+            for j in 100..200 {
+                let v = boxed(h, j);
+                d.insert(h, v, junk);
+            }
+        }
+        Ok(k.eq(key))
+    });
+    if let Ok(Some(e)) = r {
+        io.print_int(num(d.key(e))); io.print(" "); io.print_int(num(d.value(e)));
+    }
+    io.print(" "); io.print_int(calls); io.print(" "); io.print_int(d.len as i64); io.println("");
+    let bad: Result<?u64, str> = d.find_with(key.cached_hash(), |k| -> Result<bool, str> { Err("eq failed") });
+    if let Err(m) = bad { io.println(m); }
+}
+
 fn run(h: *gc.Heap) uses reenter {
     basic(h);
     effectful(h);
+    kbasic(h);
+    keffectful(h);
 }
 
 fn main() -> i32 uses reenter {
@@ -151,6 +251,24 @@ fn main() -> i32 uses reenter {
     0
 }
 
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed
+// expect: 450 1797050
+// expect: 0 2 4
+// expect: 699 6990 449 450
+// expect: -1 55
+// expect: 17 170 2 140
+// expect: eq failed
 // expect: 450 1797050
 // expect: 0 2 4
 // expect: 699 6990 449 450

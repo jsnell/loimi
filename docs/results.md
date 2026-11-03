@@ -265,6 +265,15 @@ is 1.03 at best of 7, with the same hot-path instructions as before),
 goto 0.977 (`fib` 0.88, `interp` 1.04 reproduced), switch 0.971
 (0.914–1.007).
 
+## Follow-up (2026-11-03): Python ints and instance dicts
+
+examples/python (not in the tables below; `bench/python/compare.py`):
+`/` and `%` on `i48` now fold their division checks after a `y > 0`
+guard, and instance attributes use `std.dict.KeyDict` (no stored hashes).
+The 11 programs, best of 3 interleaved, old/new: geomean 1.00 (each
+within 3%, the machine shared with other jobs); spectral_norm 0.98 (best
+of 9: 1.100 -> 1.076 of the time of the earlier `Int(i32)` build).
+
 ## Per suite
 
 ### mini

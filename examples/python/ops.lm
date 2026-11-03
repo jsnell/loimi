@@ -113,11 +113,11 @@ pub fn exc(c: *Ctx, kind: u64, msg: str) -> Value {
 }
 
 pub fn exc_of(c: *Ctx, cls: Gc<Box>, arg: Value) -> Value {
-    let d = value.new_dict(&c.heap, 1);
+    let d = value.new_attrs(&c.heap, 1);
     let inst = new(&c.heap, Inst { cls: cls, dict: d });
     let args = value.new_tuple(&c.heap, 1);
     args.items[0] = arg;
-    value.dict_set_str(&c.heap, d, vm.intern(c, "args"), Value.Tuple(args));
+    value.attr_set(&c.heap, d, vm.intern(c, "args"), Value.Tuple(args));
     Value.Inst(inst)
 }
 
@@ -299,7 +299,7 @@ fn class_lookup_at(cls: Gc<Box>, name: Gc<Str>) -> ?(Value, u64, u32) {
 }
 
 pub fn new_instance(c: *Ctx, cls: Gc<Box>) -> Value {
-    let d = value.new_dict(&c.heap, 4);
+    let d = value.new_attrs(&c.heap, 4);
     Value.Inst(new(&c.heap, Inst { cls: cls, dict: d }))
 }
 
@@ -358,20 +358,20 @@ pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Va
             // Data descriptors (properties) on the class win over the instance
             // dict; classes without any (flag 2 in `s`) skip the check.
             if (o.cls.s & 2) == 0 {
-                if let Some(e) = value.dict_find_str(o.dict, name) {
+                if let Some(e) = value.attr_find(o.dict, name) {
                     builtins.count(314);
                     *ic = e as u32;
-                    return Ok(value.dict_val(o.dict, e));
+                    return Ok(o.dict.value(e));
                 }
             }
             let cv = class_lookup(o.cls, name);
             if let Some(Obj(b)) = cv and b.kind == K_PROPERTY { return bind_attr(c, obj, Value.Obj(b)); }
-            if let Some(e) = value.dict_find_str(o.dict, name) {
+            if let Some(e) = value.attr_find(o.dict, name) {
                 *ic = e as u32;
-                return Ok(value.dict_val(o.dict, e));
+                return Ok(o.dict.value(e));
             }
             if let Some(v) = cv { builtins.count(315); return bind_attr(c, obj, v); }
-            if name.data.eq("__dict__") { return Ok(Value.Dict(o.dict)); }
+            if name.data.eq("__dict__") { return Ok(Value.Dict(value.attrs_dict(&c.heap, o.dict))); }
             if name.data.eq("__class__") { return Ok(Value.Obj(o.cls)); }
             let ga = vm.intern(c, "__getattr__");
             if let Some(g) = class_lookup(o.cls, ga) {
@@ -485,7 +485,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
                 return Ok(());
             }
             let d = o.dict;
-            if let Some(e) = value.dict_find_str(d, name) {
+            if let Some(e) = value.attr_find(d, name) {
                 d.set_value(e, v);
                 *ic = e as u32;
                 return Ok(());
@@ -496,8 +496,8 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
                 o.cls.m = 1;
                 c.epoch +%= 1;
             }
-            value.dict_set_str(&c.heap, d, name, v);
-            if let Some(e) = value.dict_find_str(d, name) {
+            value.attr_set(&c.heap, d, name, v);
+            if let Some(e) = value.attr_find(d, name) {
                 *ic = e as u32;
                 // Appending this name to dicts of this size is safe for
                 // instances of this class while no class changes.
@@ -526,7 +526,7 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
 
 pub fn delattr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<(), Value> {
     if let Inst(o) = obj {
-        if value.dict_del(o.dict, Value.Str(name), value.str_hash(name)) { return Ok(()); }
+        if value.attr_del(o.dict, name) { return Ok(()); }
     }
     if let Obj(b) = obj and b.kind == K_CLASS and b.n == 0 {
         if value.dict_del(b.dict.unwrap(), Value.Str(name), value.str_hash(name)) { c.epoch +%= 1; return Ok(()); }
@@ -541,7 +541,7 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
     builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
-            if value.dict_find_str(o.dict, name).is_none() {
+            if value.attr_find(o.dict, name).is_none() {
                 if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
                     if let Func(_) = v {
                         if o.cls.m == 0 {
