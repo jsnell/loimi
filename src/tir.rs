@@ -379,6 +379,9 @@ pub struct FnDef {
     /// synced in place, as in an op; callers root their traced locals at
     /// a call of this function as if it had these effects.
     pub sync_effects: u8,
+    /// Emitted only if some emitted function refers to it (generated vm
+    /// helpers few programs use: `crate::vmexpand::LAZY_ATTR`).
+    pub lazy: bool,
     /// Closure bodies: the captured locals of the enclosing function, in
     /// environment order. The function takes the environment pointer as
     /// a hidden first parameter, and reaches these locals through it.

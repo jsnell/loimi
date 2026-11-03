@@ -892,6 +892,8 @@ type.
 | `Vm.op_name(w) -> str` | name of the op (`"<invalid>"` for an unused opcode) |
 | `Vm.Op`, `Vm.op_of(w) -> Vm.Op` | an enum with one variant per op as host code sees it (`Vm.Op.ADD`; no supers, a family as its generic op), whose discriminant is the opcode (`Vm.Op.ADD as W == Vm.OP_ADD`), and the op word `w` stands for alone: a super's head gives its first part, a quickened member its family. An invalid opcode panics (verified code has none). For host tools (a second interpreter, a compiler pass, a disassembler) that `match` over the ops: the match is exhaustive, so adding an op is a compile error there |
 | `Vm.FMT_field(w) -> u64` / `i64` | field `field` of format `FMT` (`Vm.AsBx_sbx(w)`): `i64` for a signed field |
+| `Vm.set_FMT_field(w, v) -> ?W` | `w` with field `field` of format `FMT` set to `v` (`u64`, or `i64` for a signed field), the other bits kept; None if `v` does not fit the field. For peepholes that retarget an operand (`Vm.set_ABC_a(w, r)`) |
+| `Vm.encode.FMT(op, a, b, ..) -> W` | the word of opcode `op` in format `FMT` with these fields (typed and masked like an op's encoder): one encoder for every op of a format, for code that picks the opcode at run time (`Vm.encode.ABC(Vm.OP_ADD, d, a, b) == Vm.ADD(d, a, b)`) |
 | `Vm.set_label(w, off) -> ?W` / `Vm.label(w) -> ?i64` | re-encode / decode the jump offset of an op whose operand kind is `pc + it` (below) |
 | `Vm.operand_count(w)`, `operand_kind(w, i)`, `operand_bits(w, i)`, `operand_signed(w, i)`, `operand_name(w, i)` | per-op operand metadata (below) |
 | `Vm.NUM_KINDS`, `kind_name(k)`, `kind_is_label(k)`, `verify_clause(k)`, `check_name(i)` | operand kinds and `verify` blocks, by index |
@@ -932,7 +934,10 @@ In more detail:
   returns None if `off` does not fit the field or the op has no label;
   `Vm.label(w) -> ?i64` decodes it; `Vm.FMT_field(w)` reads field
   `field` of format `FMT` (`Vm.AsBx_sbx(w)`), as a `u64` or, for a
-  signed field, an `i64`. A superinstruction's head word answers for its
+  signed field, an `i64`, and `Vm.set_FMT_field(w, v)` writes it
+  (None if `v` does not fit). `Vm.encode.FMT(op, ..)` encodes any op of
+  a format. The setters and format encoders are compiled only into
+  programs that call them. A superinstruction's head word answers for its
   first part. `set_label` and `label` are the patch and jump-threading
   functions `std.bc` takes: `bc.Code.new(Vm.op_size, Vm.set_label)`;
 - `Vm.real_word(w)`: the instruction word that code word `w` stands

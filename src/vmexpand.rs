@@ -1327,6 +1327,73 @@ fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     s
 }
 
+/// Setters (`Vm.set_FMT_field(w, v) -> ?W`, None if `v` does not fit)
+/// and per-format encoders (`Vm.encode.FMT(op, a, b, ..) -> W`, masked
+/// like the op encoders). Emitted only where called (`LAZY_ATTR`), and
+/// last in the expansion, so that the line numbers of the rest (in panic
+/// messages) do not move.
+fn generate_format_api(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
+    let n = &v.name.name;
+    let jw = maps_words(l, jit);
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    for f in &v.formats {
+        let mut shift = 0;
+        let mut params = vec![format!("__op: {w}")];
+        let mut enc = String::new();
+        for fld in &f.fields {
+            let (bits, name) = (fld.bits, &fld.name.name);
+            let mask = low_mask(bits);
+            if name == "op" {
+                let _ = write!(enc, "((__op & {mask}) << {shift})");
+                shift += bits;
+                continue;
+            }
+            let (vt, range) = if fld.signed {
+                let lim = 1i128 << (bits - 1);
+                ("i64", if bits >= 64 { String::new() } else { format!("if __v < {} or __v > {} {{ return None; }} ", -lim, lim - 1) })
+            } else {
+                ("u64", if bits >= 64 { String::new() } else { format!("if __v > {mask} {{ return None; }} ") })
+            };
+            let _ = writeln!(
+                s,
+                "{vis}fn {n}__set_{}_{name}(__w: {w}, __v: {vt}) -> ?{w} {{ {}{range}Some((__w & !(({mask} as {w}) << {shift})) | (((__v as {w}) & {mask}) << {shift})) }}",
+                f.name.name,
+                real_let(n, jw, "__w"),
+            );
+            params.push(format!("{name}: {}", field_ty(bits, fld.signed)));
+            let _ = write!(enc, " | ((({name} as {w}) & {mask}) << {shift})");
+            shift += bits;
+        }
+        let _ = writeln!(s, "{vis}fn {n}__encode_{}({}) -> {w} {{ {} }}", f.name.name, params.join(", "), enc);
+    }
+    s
+}
+
+/// Generated functions marked with this internal attribute (added after
+/// parsing, so user code cannot name it) are only emitted when called:
+/// helpers most programs never use leave their IR alone.
+pub const LAZY_ATTR: &str = "__lazy";
+
+/// Mark the setters and per-format encoders of `generate_labels` lazy.
+fn mark_lazy(v: &VmDecl, items: &mut [Item]) {
+    let n = &v.name.name;
+    for it in items {
+        if let Item::Fn(f) = it {
+            if let Some(short) = f.name.name.strip_prefix(&format!("{n}__")) {
+                let setter = short.strip_prefix("set_").is_some_and(|r| {
+                    v.formats.iter().any(|f| f.fields.iter().any(|x| x.name.name != "op" && r == format!("{}_{}", f.name.name, x.name.name)))
+                });
+                let encoder = short.strip_prefix("encode_").is_some_and(|r| v.formats.iter().any(|f| r == f.name.name));
+                if setter || encoder {
+                    f.attrs.list.push((LAZY_ATTR.to_string(), vec![], f.name.span));
+                }
+            }
+        }
+    }
+}
+
 /// `text` with each call `name(` replaced by `repl` (which ends with the
 /// opening parenthesis), where `name` is a whole word (not a method or a
 /// longer name's suffix) and whitespace may come before the parenthesis.
@@ -1679,6 +1746,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 }
                 src.push_str(&generate_labels(v, &l, jit));
                 src.push_str(&generate_disasm(v, &l, jit));
+                src.push_str(&generate_format_api(v, &l, jit));
                 if std::env::var_os("LOIMI_DUMP_VM_EXPANSION").is_some() {
                     eprintln!("// <vm {} expansion>\n{}", v.name.name, src);
                 }
@@ -1687,6 +1755,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 let mut p = crate::parser::Parser::new(toks);
                 let (mut items, _) = p.parse_module()?;
                 c_externs(&mut items);
+                mark_lazy(v, &mut items);
                 check_generated_names(v, &items)?;
                 extra.extend(items);
             }

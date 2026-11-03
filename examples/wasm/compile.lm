@@ -20,9 +20,9 @@ import decode.{T_I32, T_I64, T_F32, T_F64, T_FUNCREF, T_EXTERNREF};
 import vm;
 import vm.{W, Func, Inst};
 
-// Where a stack value is. (These were u8 consts at first: a const name
-// in a `match` pattern silently binds a new variable instead, so every
-// value took the first arm. See FRICTION.md.)
+// Where a stack value is. (u8 consts at first; a const name in a pattern
+// then bound a new variable, so every value took the first arm. Constants
+// in patterns now match their value, but an enum is checked exhaustively.)
 enum Loc { Home, Local, Const }
 
 /// An operand stack entry: its type (0 = unknown, in unreachable code)
@@ -70,7 +70,7 @@ pub struct T {
 }
 
 fn rrr(op: u64, a: u64, b: u64, c: u64) -> u64 {
-    W.with_opcode(W.I32_ADD(a as u16, b as u16, c as u16), op)
+    W.encode.RRR(op, a as u16, b as u16, c as u16)
 }
 
 pub fn T.new(m: *decode.Module, declared: *mem.Vec<bool>) -> T {
@@ -441,7 +441,7 @@ fn kforms() -> [(u64, u64, bool); 38] {
 fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
     let h = t.home(p);
     let ks = kforms();
-    for i in 0..38 {
+    for i in 0..ks.len {
         let (rop, kop, comm) = ks[i];
         if rop != op { continue; }
         let sub = op == W.OP_I32_SUB or op == W.OP_I64_SUB;
@@ -450,13 +450,13 @@ fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
             if sub { k = 0 - k; }
             if fits16(k) {
                 let ra = t.reg(a, p);
-                t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, ra as u16, k as i16), kop), h);
+                t.emit_def(W.encode.RRK(kop, h as u16, ra as u16, k as i16), h);
                 return;
             }
         }
         if comm and a.loc == Loc.Const and fits16(const_value(a)) {
             let rb = t.reg(b, p + 1);
-            t.emit_def(W.with_opcode(W.I32_ADDK(h as u16, rb as u16, const_value(a) as i16), kop), h);
+            t.emit_def(W.encode.RRK(kop, h as u16, rb as u16, const_value(a) as i16), h);
             return;
         }
         break;
@@ -516,7 +516,7 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     return;
                 }
                 let fs = fusions();
-                for i in 0..52 {
+                for i in 0..fs.len {
                     let (cop, bt, bf, k) = fs[i];
                     if cop != op { continue; }
                     t.code.truncate(last);
@@ -524,10 +524,10 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     let x = W.RRR_b(w);
                     if k {
                         let kv = W.RRK_k(w);
-                        t.code.op(W.with_opcode(W.BR_I32_EQK(x as u16, kv as i32), bop));
+                        t.code.op(W.encode.RI(bop, x as u16, kv as i32));
                     } else {
                         let y = W.RRR_c(w);
-                        t.code.op(W.with_opcode(W.BR_I32_EQ(x as u16, y as u16), bop));
+                        t.code.op(W.encode.RRR(bop, x as u16, y as u16, 0));
                     }
                     t.code.jump(W.JMP(0), l);
                     t.has_def = false;
@@ -844,11 +844,15 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     if let Some(last) = t.code.last() {
                         if last == t.last_def_pc {
                             let w = t.code.at(last);
+                            // The destination is field `a`: 12 bits in SELECT4's
+                            // format, 16 in the others.
                             if W.opcode(w) == W.OP_SELECT4 {
-                                if x < 4096 { t.code.set(last, (w & 0xFFFFFFFFF000FFFF) | (x << 16)); }
-                                else { retargeted = false; t.emit(W.MOV(x as u16, t.home(p) as u16)); retargeted = true; }
+                                match W.set_R4_a(w, x) {
+                                    Some(w2) => t.code.set(last, w2),
+                                    None => { t.emit(W.MOV(x as u16, t.home(p) as u16)); }
+                                }
                             } else {
-                                t.code.set(last, (w & 0xFFFFFFFF0000FFFF) | (x << 16));
+                                t.code.set(last, W.set_RRR_a(w, x).unwrap());
                             }
                             retargeted = true;
                         }
@@ -1106,7 +1110,7 @@ fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool, ri: u64) 
                 t.code.set(pc + 1, w);
             }
         } else {
-            t.emit(W.with_opcode(w, W.OP_CALL) | (base << 16));
+            t.emit(W.set_RU_a(w, base).unwrap());
         }
     }
     t.vals.truncate(p);

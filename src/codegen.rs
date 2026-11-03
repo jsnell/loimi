@@ -342,7 +342,11 @@ impl<'p> Codegen<'p> {
             let align = layout::align_of(p, &g.ty).max(1);
             let _ = writeln!(self.globals, "@\"{}\" = internal {}global {} {}, align {}", g.symbol, tl, llty(p, &g.ty), init, align);
         }
+        let keep = lazy_used(p);
         for (i, f) in p.fns.iter().enumerate() {
+            if f.lazy && !keep[i] {
+                continue;
+            }
             if f.body.is_none() {
                 if f.linkage == Linkage::Extern {
                     let mut ps: Vec<String> = f.param_tys.iter().map(|t| format!("{} {}", llty(p, t), c_abi_attr(t)).trim_end().to_string()).collect();
@@ -2354,6 +2358,28 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
         }
     }
+}
+
+/// Which lazy functions (`FnDef::lazy`) some emitted function refers to.
+fn lazy_used(p: &Program) -> Vec<bool> {
+    let mut used = vec![false; p.fns.len()];
+    if !p.fns.iter().any(|f| f.lazy) {
+        return used;
+    }
+    let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !p.fns[i].lazy).collect();
+    while let Some(i) = work.pop() {
+        let Some(body) = &p.fns[i].body else { continue };
+        crate::tirwalk::for_each_expr(body, &mut |e| {
+            if let TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) = &e.kind {
+                let id = *id as usize;
+                if p.fns[id].lazy && !used[id] {
+                    used[id] = true;
+                    work.push(id);
+                }
+            }
+        });
+    }
+    used
 }
 
 /// The literals of a string pattern (`"a"` or `"a" | "b"`), if it is one.

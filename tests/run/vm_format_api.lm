@@ -1,0 +1,57 @@
+// Generated per-format helpers: `Vm.set_FMT_field(w, v) -> ?W` re-encodes
+// one field (None if `v` does not fit it), `Vm.encode.FMT(op, ..) -> W`
+// encodes any op of a format, `Vm.FMT_field(w)` reads a field.
+import std.io;
+
+vm V {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    operand imm = it;
+    operand simm = it;
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+    op ADD(d: reg, a: reg, b: reg) : ABC { d = a + b; next }
+    op SUB(d: reg, a: reg, b: reg) : ABC { d = a - b; next }
+    op LOADI(d: reg, v: simm) : AsBx { d = v as i64; next }
+    op RET(a: reg) : ABC { exit a }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn show(x: ?u32) {
+    match x { Some(w) => io.print_int(w as i64), None => io.print("none") }
+    io.println("");
+}
+
+fn main() {
+    // A format encoder gives the same word as the op's encoder.
+    let op = V.OP_SUB;
+    let w = V.encode.ABC(op, 1, 2, 3);
+    io.print_bool(w == V.SUB(1, 2, 3)); io.println("");
+    io.print_bool(V.encode.AsBx(V.OP_LOADI, 4, -7) == V.LOADI(4, -7)); io.println("");
+    // Retarget the destination: the other fields stay.
+    let w2 = V.set_ABC_a(w, 9).unwrap();
+    io.print_bool(w2 == V.SUB(9, 2, 3)); io.println("");
+    io.print_int(V.ABC_a(w2) as i64); io.println("");
+    // Range checks: unsigned 8 bits, signed 16 bits.
+    show(V.set_ABC_c(w, 256));
+    show(V.set_AsBx_sbx(V.LOADI(0, 0), -32769));
+    io.print_int(V.AsBx_sbx(V.set_AsBx_sbx(V.LOADI(0, 0), -32768).unwrap())); io.println("");
+    // Run code built with them.
+    var code: [u32; 4] = [0; 4];
+    var regs: [i64; 4] = [0; 4];
+    code[0] = V.encode.AsBx(V.OP_LOADI, 0, 40);
+    code[1] = V.set_AsBx_sbx(V.LOADI(1, 0), 2).unwrap();
+    code[2] = V.encode.ABC(V.OP_ADD, 2, 0, 1);
+    code[3] = V.RET(2);
+    io.print_int(V.run(&code[0], &regs[0])); io.println("");
+}
+// expect: true
+// expect: true
+// expect: true
+// expect: 9
+// expect: none
+// expect: none
+// expect: -32768
+// expect: 42

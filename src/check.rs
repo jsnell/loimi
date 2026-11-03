@@ -784,6 +784,7 @@ impl<'a> Checker<'a> {
             vm_state: vec![],
             effects: effects_of(&f.attrs)?,
             sync_effects: 0,
+            lazy: f.attrs.has(crate::vmexpand::LAZY_ATTR),
             env: None,
             env_val: vec![],
             env_struct: None,
@@ -2687,6 +2688,7 @@ impl<'a> Checker<'a> {
         };
         let (vm, prefix) = match &base.kind {
             ExprKind::Field(b2, mid) if mid.name == "emit" => (vm_of(b2)?, "emit_"),
+            ExprKind::Field(b2, mid) if mid.name == "encode" => (vm_of(b2)?, "encode_"),
             _ => (vm_of(base)?, ""),
         };
         let (m, decl) = &self.vm_decls[vm as usize];
@@ -3822,6 +3824,7 @@ pub fn placeholder_fn(span: Span) -> FnDef {
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        lazy: false,
         env: None,
         env_val: vec![],
         env_struct: None,

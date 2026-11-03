@@ -213,6 +213,7 @@ fn new_fn(c: &mut Checker, symbol: String, name: String, param_tys: Vec<Ty>, ret
         vm_state: vec![],
         effects: 0,
         sync_effects: 0,
+        lazy: false,
         env: None,
         env_val: vec![],
         env_struct: None,
