@@ -1,0 +1,119 @@
+// std.bc branch relaxation: conditional jumps with a 16-bit offset that
+// do not fit become an inverted jump over a 24-bit JMP, forward and
+// backward, and the code still runs right.
+import std.io;
+import std.bc;
+
+struct Machine { n: i64 }
+
+vm Far {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it verify is_insn_boundary(pc + it);
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+        format sJ { op: 8, sj: s24 }
+    }
+
+    op SETI(dst: reg, v: imm) : ABC { dst = v as i64; next }
+    op DEC(r: reg) : ABC { r = r - 1; next }
+    op INC(r: reg) : ABC { r = r + 1; next }
+    op NOP() : ABC { next }
+    op PRINT(a: reg) : ABC { io.print_int(a); io.println(""); next }
+    /// Jump if R[a] is zero / nonzero.
+    op JZ(a: reg, target: label) : AsBx { if a == 0 { jump target } next }
+    op JNZ(a: reg, target: label) : AsBx { if a != 0 { jump target } next }
+    op JMP(target: label) : sJ { jump target }
+    op RET() : ABC { exit 0 }
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> i64 { ctx = m; pc = code; regs = r; jump pc }
+}
+
+fn invert(w: u32) -> ?u32 {
+    let op = Far.opcode(w);
+    if op == Far.OP_JZ { return Some(Far.JNZ(Far.AsBx_a(w) as u8, 0)); }
+    if op == Far.OP_JNZ { return Some(Far.JZ(Far.AsBx_a(w) as u8, 0)); }
+    None
+}
+
+fn run(code: *bc.Code<u32>) {
+    let n = code.len();
+    let words: *u32 = mem.alloc(n);
+    code.copy_into(words.slice(n));
+    var regs: [i64; 4] = [0; 4];
+    var m = Machine { n: 0 };
+    Far.run(&m, words, &regs[0]);
+    mem.release(words);
+}
+
+import std.mem;
+
+fn main() {
+    var code: bc.Code<u32> = bc.Code.new(Far.op_size, Far.set_label);
+    code.set_relax(Far.label, invert, Far.JMP(0));
+    // r0 = 3; loop: if r0 == 0 goto done (far: 40000 NOPs in the body);
+    // print r0; r0 -= 1; goto loop. Then a far backward JNZ.
+    code.op(Far.SETI(0, 3));
+    let top = code.here();
+    let done = code.label();
+    code.set_loc(10);
+    code.jump(Far.JZ(0, 0), done);
+    code.set_loc(11);
+    code.op(Far.PRINT(0));
+    for i in 0..40000 { code.op(Far.NOP()); }
+    code.op(Far.DEC(0));
+    code.jump(Far.JMP(0), top);
+    code.bind(done);
+    // r1 = 2; again: print r1 + 100.. (r2 counts); r1 -= 1; if r1 != 0 goto again (far back).
+    code.set_loc(20);
+    code.op(Far.SETI(1, 2));
+    let again = code.here();
+    code.op(Far.INC(2));
+    code.op(Far.PRINT(2));
+    for i in 0..40000 { code.op(Far.NOP()); }
+    code.op(Far.DEC(1));
+    code.set_loc(21);
+    code.jump(Far.JNZ(1, 0), again);
+    // A short jump over far code: the relaxed jumps inside move it.
+    let end = code.label();
+    code.jump(Far.JMP(0), end);
+    code.op(Far.PRINT(0));
+    code.bind(end);
+    code.op(Far.RET());
+    let before = code.len();
+    // expect: relax needed: true
+    io.print("relax needed: "); io.print_bool(code.needs_relax()); io.println("");
+    // expect: check before relax: jump too long
+    if let Some(e) = code.check() { io.print("check before relax: "); io.println(e.message()); }
+    // expect: relaxed: true
+    io.print("relaxed: "); io.print_bool(code.relax()); io.println("");
+    // expect: grew by 2
+    io.print("grew by "); io.print_int((code.len() - before) as i64); io.println("");
+    // expect: no error
+    if code.check().is_none() { io.println("no error"); }
+    // Positions moved with the code: the relaxed JZ's goto is line 10.
+    // expect: line of pc 2: 10
+    io.print("line of pc 2: "); io.print_int(code.loc_at(2) as i64); io.println("");
+    // expect: 3
+    // expect: 2
+    // expect: 1
+    // expect: 1
+    // expect: 2
+    run(&code);
+
+    // Without relaxation: an error, as before.
+    var c2: bc.Code<u32> = bc.Code.new(Far.op_size, Far.set_label);
+    let l = c2.label();
+    c2.jump(Far.JZ(0, 0), l);
+    for i in 0..40000 { c2.op(Far.NOP()); }
+    c2.bind(l);
+    // expect: jump too long
+    if let Some(e) = c2.check() { io.println(e.message()); }
+    code.free();
+    c2.free();
+}

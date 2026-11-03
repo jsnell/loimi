@@ -146,7 +146,17 @@ pub struct Code<W> {
     labels: mem.Vec<LabelInfo>,
     fixups: mem.Vec<Fixup>,
     error: ?Error,
+    /// Branch relaxation (`set_relax`): jumps that did not fit, by pc,
+    /// with their target pcs, waiting for `relax`.
+    relax_on: bool,
+    target_of: fn(W) -> ?i64,
+    invert: fn(W) -> ?W,
+    goto: W,
+    far: map.HashMap<u64, u64>,
 }
+
+fn no_target<W>(w: W) -> ?i64 { None }
+fn no_invert<W>(w: W) -> ?W { None }
 
 pub fn Code<W>.new(size: fn(W) -> u64, patch: fn(W, i64) -> ?W) -> Code<W> {
     Code {
@@ -154,6 +164,7 @@ pub fn Code<W>.new(size: fn(W) -> u64, patch: fn(W, i64) -> ?W) -> Code<W> {
         run_pc: mem.Vec.new(), run_loc: mem.Vec.new(), loc: 0,
         last_at: NONE, barrier: NONE,
         labels: mem.Vec.new(), fixups: mem.Vec.new(), error: None,
+        relax_on: false, target_of: no_target<W>, invert: no_invert<W>, goto: 0 as W, far: map.HashMap.new(),
     }
 }
 
@@ -196,6 +207,13 @@ pub fn Code<W>.fail(c: *Code<W>, kind: ErrorKind, pc: u64) {
 
 /// The first error, if any (including labels used but never placed).
 pub fn Code<W>.check(c: *Code<W>) -> ?Error {
+    if c.error.is_none() and c.far.len > 0 {
+        // Jumps waiting for `relax` (not recorded: `relax` may fix them).
+        var it: u64 = 0;
+        var first = NONE;
+        while let Some(e) = c.far.next(&it) { if e.key < first { first = e.key; } }
+        return Some(Error { kind: ErrorKind.JumpRange, pc: first, loc: c.loc_at(first) });
+    }
     if c.error.is_none() {
         for i in 0..c.labels.len {
             let l = c.labels.at(i);
@@ -269,8 +287,21 @@ pub fn Code<W>.patch(c: *Code<W>, at: u64, target: u64) -> bool {
     let off = target as i64 - at as i64;
     if c.barrier == NONE or target > c.barrier { c.barrier = target; }
     match c.patch_fn(c.words.at(at), off) {
-        Some(w) => { c.words.set(at, w); true }
-        None => { c.fail(ErrorKind.JumpRange, at); false }
+        Some(w) => {
+            c.words.set(at, w);
+            if c.far.len > 0 { c.far.remove(at); }
+            true
+        }
+        None => {
+            if c.relax_on and c.invert(c.words.at(at)).is_some() {
+                // Rewritten into the long form by `relax`.
+                c.far.remove(at);
+                c.far.insert(at, target);
+                return true;
+            }
+            c.fail(ErrorKind.JumpRange, at);
+            false
+        }
     }
 }
 
@@ -431,6 +462,132 @@ pub fn line_at(table: []u8, pc: u64) -> u32 {
     result as u32
 }
 
+// Branch relaxation.
+
+/// Turn on branch relaxation. A conditional jump whose offset does not fit
+/// its field is then not an error: `relax` rewrites it into the long form
+///
+///     invert(w)   (the opposite condition, jumping over the next instruction)
+///     goto        (an unconditional jump with a wider offset, to the target)
+///
+/// `target_of` reads a jump word's offset (the generated `Vm.label`);
+/// `invert(w)` is the jump with the opposite condition (offset left to
+/// `relax`), None for words that have no long form (including `goto`
+/// itself); `goto` is the long jump's word (`Vm.JMP(0)`). For example,
+/// with `JF a, sBx` and `JMP sJ`:
+///
+///     fn invert(w: u32) -> ?u32 {
+///         let op = Vm.opcode(w);
+///         if op == Vm.OP_JF { return Some(Vm.JT(Vm.AsBx_a(w), 0)); }
+///         if op == Vm.OP_JT { return Some(Vm.JF(Vm.AsBx_a(w), 0)); }
+///         None
+///     }
+///     code.set_relax(Vm.label, invert, Vm.JMP(0));
+///
+/// Jumps the vm treats as fixed-distance pairs (a compare-and-branch op
+/// that skips the jump after it) stay together: only words `invert`
+/// accepts grow.
+pub fn Code<W>.set_relax(c: *Code<W>, target_of: fn(W) -> ?i64, invert: fn(W) -> ?W, goto: W) {
+    c.relax_on = true;
+    c.target_of = target_of;
+    c.invert = invert;
+    c.goto = goto;
+}
+
+/// Whether some jump waits for `relax`.
+pub fn Code<W>.needs_relax(c: *Code<W>) -> bool { c.far.len > 0 }
+
+/// After the last label is bound: rewrite the jumps that did not fit into
+/// their long forms (see `set_relax`). Code after each moves down, so
+/// every jump offset is recomputed (a jump that stops fitting is relaxed
+/// too), and positions and placed labels move with their code; pcs
+/// returned by `op` or `jump` before are stale (use `label_pc`). Returns
+/// false (with JumpRange recorded) if a jump still does not fit.
+pub fn Code<W>.relax(c: *Code<W>) -> bool {
+    if c.far.len == 0 { return true; }
+    let n = c.words.len;
+    let newpc: *u64 = mem.alloc(n + 1);
+    var out: mem.Vec<W> = mem.Vec.new();
+    var ok = false;
+    var failed = false;
+    while !ok and !failed {
+        // New positions: each far jump grows into its long form.
+        var shift: u64 = 0;
+        var pc: u64 = 0;
+        while pc < n {
+            let w = c.words.at(pc);
+            var size = c.size(w);
+            if size == 0 { size = 1; }
+            for i in 0..size { if pc + i < n { newpc[pc + i] = pc + i + shift; } }
+            if c.far.contains(pc) {
+                let Some(inv) = c.invert(w) else { unreachable };
+                shift += c.size(inv) + c.size(c.goto) - size;
+            }
+            pc += size;
+        }
+        newpc[n] = n + shift;
+        // Emit, re-patching every jump.
+        out.clear();
+        ok = true;
+        pc = 0;
+        while pc < n and ok {
+            let w = c.words.at(pc);
+            var size = c.size(w);
+            if size == 0 { size = 1; }
+            if let Some(t) = c.far.get(pc) {
+                let Some(inv) = c.invert(w) else { unreachable };
+                let isz = c.size(inv);
+                let skip = isz + c.size(c.goto);
+                let Some(iw) = c.patch_fn(inv, skip as i64) else { failed = true; c.fail(ErrorKind.JumpRange, pc); break; };
+                out.push(iw);
+                for i in 1..isz { out.push(0 as W); }
+                let at = out.len;
+                let Some(gw) = c.patch_fn(c.goto, newpc[t] as i64 - at as i64) else { failed = true; c.fail(ErrorKind.JumpRange, pc); break; };
+                out.push(gw);
+                for i in 1..c.size(c.goto) { out.push(0 as W); }
+                pc += size;
+                continue;
+            }
+            if let Some(off) = c.target_of(w) {
+                let t = pc as i64 + off;
+                if t >= 0 and (t as u64) <= n {
+                    let noff = newpc[t as u64] as i64 - newpc[pc] as i64;
+                    match c.patch_fn(w, noff) {
+                        Some(nw) => out.push(nw),
+                        None => {
+                            if c.invert(w).is_none() { failed = true; c.fail(ErrorKind.JumpRange, pc); break; }
+                            // Relax this one too, and start over.
+                            c.far.insert(pc, t as u64);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    for i in 1..size { out.push(c.words.at(pc + i)); }
+                    pc += size;
+                    continue;
+                }
+            }
+            for i in 0..size { if pc + i < n { out.push(c.words.at(pc + i)); } }
+            pc += size;
+        }
+    }
+    if ok and !failed {
+        c.words.clear();
+        for i in 0..out.len { c.words.push(out.at(i)); }
+        for i in 0..c.run_pc.len { c.run_pc.set(i, newpc[c.run_pc.at(i)]); }
+        for i in 0..c.labels.len {
+            let l = c.labels.ptr_at(i);
+            if l.pc != NONE and l.pc <= n { l.pc = newpc[l.pc]; }
+        }
+        if c.barrier != NONE and c.barrier <= n { c.barrier = newpc[c.barrier]; }
+        c.last_at = NONE;
+        c.far.clear();
+    }
+    out.free();
+    mem.release(newpc);
+    ok and !failed
+}
+
 // Jump threading.
 
 /// Retarget jumps that land on an unconditional jump to that jump's final
@@ -480,6 +637,7 @@ pub fn Code<W>.clear(c: *Code<W>) {
     c.run_loc.clear();
     c.labels.clear();
     c.fixups.clear();
+    c.far.clear();
     c.last_at = NONE;
     c.barrier = NONE;
     c.error = None;
@@ -491,6 +649,7 @@ pub fn Code<W>.free(c: *Code<W>) {
     c.run_loc.free();
     c.labels.free();
     c.fixups.free();
+    c.far.free();
 }
 
 // ── constant pool ───────────────────────────────────────────────────────
