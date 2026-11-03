@@ -24,7 +24,7 @@ says so. Some modules are design only; their sections say so at the top.
 | `std.bc` | built (a library, no generated `Builder`) | `std/bc.lm` |
 | `std.gc` | built (mark-sweep, optional generational mode) | `std/gc.lm` |
 | `std.obj` | built (no comptime `Model`) | `std/obj.lm` |
-| `std.rt` | `protect`/`throw` only (no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
+| `std.rt` | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
 | `std.collections` (beyond `HashMap`) | **not built** | |
 | `std.ast` | **not built** | |
 | `std.prof` | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
@@ -44,7 +44,8 @@ Design rules for the library:
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
   `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
-  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `Bench`, `Counters`), and `io.read_file`'s result
+  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Bench`,
+  `Counters`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
   its elements point to.
 
@@ -206,7 +207,7 @@ Everything here except `HashMap` is design only:
   argument (`fmt` takes one argument, `fmt2` to `fmt4` two to four;
   `{{` and `}}` are literal braces). `b.add(x)` appends one value. Both
   return the buffer, so calls chain:
-  `b.fmt("unknown word `{}`", name).add(" at line ").add(line).as_str()`.
+  `` b.fmt("unknown word `{}`", name).add(" at line ").add(line).as_str() ``.
   The format string is not checked at compile time: a `{}` without an
   argument stays `{}`, and an argument without a `{}` is appended at the
   end. Arguments are any type that implements the trait `text.Fmt`
@@ -281,6 +282,17 @@ stdin, environment variables, clocks, `mmap`, dynamic loading.
 module is a `Cursor` toolkit, and a lexer is a short function that tries
 the scanners in order:
 
+<!-- snippet: check
+import std.lex;
+import std.num;
+import std.text;
+import std.diag;
+enum T { Eof, Name, Number, String, Plus }
+struct Token { kind: T, span: diag.Span }
+struct Lexer { cur: lex.Cursor, ops: lex.OpTable<T>, keywords: lex.Keywords<T>, buf: text.StrBuf, num: num.Number }
+fn Lexer.tok(lx: *Lexer, k: T, start: u64) -> Token { Token { kind: k, span: lx.cur.span_from(start) } }
+{snippet}
+-->
 ```loimi
 fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
     let c = &lx.cur;
@@ -335,6 +347,7 @@ A comptime lexer generator: a token specification turned into a DFA at
 compile time, with longest match, priority by declaration order, and
 keyword tables via perfect hashing:
 
+<!-- snippet: skip design, not built (no comptime) -->
 ```loimi
 const Tok = std.lex.define(.{
     .skip     = .{ "[ \t\r\n]+", "--[^\n]*" },
@@ -573,7 +586,8 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md). Not built:
 
 - heap policies as a compile-time parameter (`#![heap = ...]`) and the
   `Incremental` policy (tri-color, snapshot-at-the-beginning barrier);
-- lazy sweeping, card marking, aging before promotion, a moving collector;
+- lazy sweeping in a non-generational heap, card marking, aging of small
+  objects before promotion, a moving collector;
 - roots generated from `vm` state kinds and frame structs (write a root
   scanner), `Root<T>`, `GcVec<T>`;
 - finalizers, poisoning, heap snapshots;
@@ -701,6 +715,10 @@ library over the pair counts; confidence intervals in `Bench`.
 
 `std/test.lm` and the `loimi test` command (language.md §1.2).
 
+<!-- snippet: check
+{snippet}
+fn run_script(path: str) uses gc {}
+-->
 ```loimi
 import std.test;
 
@@ -714,7 +732,7 @@ fn arithmetic() {
 }
 
 #[test]
-fn runs_a_program() uses gc { .. }
+fn runs_a_program() uses gc { run_script("fib.lua"); }
 ```
 
 ```text

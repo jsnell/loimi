@@ -30,19 +30,35 @@ stress); `bench/obj` measures a cache hit.
 There is no comptime. The library declares a generic object type over
 the interpreter's `Value`, with exactly the fields it needs:
 
+<!-- snippet: run
+import std.gc;
+import std.obj;
+{snippet}
+-->
 ```loimi
-value Value repr nanbox { .., O(Gc<obj.Obj<Value>>) }
+value Value repr nanbox { Num(f64) unboxed, Nil, O(Gc<obj.Obj<Value>>) }
 
-var m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value> =
-    obj.Model.new(obj.new_slots<Value>, Value.Nil);
-m.attach(&heap);
-let o = obj.new_obj(&heap, m.root(4), None, 4);   // shape, prototype, inline slots
+fn main() {
+    var heap = gc.Heap.new();
+    var m: obj.Model<Gc<obj.Obj<Value>>, Gc<obj.Slots<Value>>, Value> =
+        obj.Model.new(obj.new_slots<Value>, Value.Nil);
+    m.attach(&heap);
+    let o = obj.new_obj<Value>(&heap, m.root(4), None, 4);   // shape, prototype, inline slots
+    m.set(o, 1, Value.Num(2.5));                      // key 1: a symbol id
+}
 ```
 
 An interpreter that wants other fields in its objects (a class pointer,
 a hash, flags) declares the types itself, and the library is generic
 over them:
 
+<!-- snippet: run
+import std.gc;
+import std.obj;
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil, O(Gc<Obj>) }
+const sym_x: u64 = 1;
+{snippet}
+-->
 ```loimi
 object Obj {
     shape: Gc<obj.Shape>,
@@ -55,10 +71,13 @@ object Obj {
 object Slots { data: [Value] }
 fn new_slots(h: *gc.Heap, n: u64) -> Gc<Slots> { new(h, Slots {}, n) }
 
-var m: obj.Model<Gc<Obj>, Gc<Slots>, Value> = obj.Model.new(new_slots, Value.Nil);
-m.attach(&heap);                  // scanner + sweeper; `m` must not move afterwards
-let o = new(&heap, Obj { shape: m.root(4), dict: None, overflow: None, proto: None }, 4);
-m.set(o, sym_x, Value.Int(1));
+fn main() {
+    var heap = gc.Heap.new();
+    var m: obj.Model<Gc<Obj>, Gc<Slots>, Value> = obj.Model.new(new_slots, Value.Nil);
+    m.attach(&heap);              // scanner + sweeper; `m` must not move afterwards
+    let o = new(&heap, Obj { shape: m.root(4), dict: None, overflow: None, proto: None }, 4);
+    m.set(o, sym_x, Value.Int(1));
+}
 ```
 
 Generic bodies resolve field accesses per instance, so a function that
@@ -195,6 +214,7 @@ The vm declares the cache words and does the check itself, so the hit
 path stays in the handler. std.obj runs the state machine of design section 5
 in its slow paths, over six cache words laid out as an `obj.Site`:
 
+<!-- snippet: skip excerpt of a vm with members elided; full version in tests/run/std_obj_sites.lm -->
 ```loimi
 cache PropIC { sid: u32, slot: u32, cell: u32, depth: u32, ent: u32, miss: u32 }
 family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
@@ -238,6 +258,7 @@ family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
   `m.read_miss_at(..)` returns `(?V, IcState, depth)`. The depth is
   already in the cache entry, so this costs a register:
 
+  <!-- snippet: skip excerpt of a family member (Lox-style `Inst` variant), rest elided -->
   ```loimi
   GETPROP_POLY {
       if let Inst(x) = o and let Some((v, d)) = ctx.m.poly_get_at(x, cache.ent) {
@@ -376,6 +397,7 @@ elements, `Globals` property cells and `SetError`.
 
 Everything is generated from a compile-time configuration:
 
+<!-- snippet: skip design, not built (no comptime `Model`) -->
 ```loimi
 const Model = std.obj.Model(.{
     .value          = Value,          // the interpreter's `value` type
@@ -409,6 +431,7 @@ own layout and the prototype for inline caches.
 
 ### 2. Shapes
 
+<!-- snippet: skip design, not built: the real `obj.Shape` is in "Shapes" above -->
 ```loimi
 object Shape {
     id: ShapeId,                   // stable u32 index into the shape table
@@ -455,6 +478,7 @@ a child copies on first write, so a straight chain shares a single table.
 
 ### 3. Objects
 
+<!-- snippet: skip design, not built: no elements; a SlotRef is a u32 with bit 31 `obj.OUT` -->
 ```loimi
 object Object {
     shape: Gc<Shape>,
@@ -479,6 +503,7 @@ bits SlotRef: u32 {
 
 #### Allocation templates
 
+<!-- snippet: skip design, not built: the real one is `obj.Template` -->
 ```loimi
 struct ObjectTemplate {
     shape: Gc<Shape>,
@@ -541,6 +566,7 @@ state machine:
 
 #### Cache layouts
 
+<!-- snippet: skip design, not built: the real cache words are `obj.Site` -->
 ```loimi
 // Monomorphic: 2 words.
 cache PropIC { shape: weak ShapeId, slot: SlotRef }
@@ -556,6 +582,7 @@ object ProtoEntry { cell: Gc<ValidityCell>, holder: Gc<Object>, slot: SlotRef }
 
 #### The global megamorphic cache
 
+<!-- snippet: skip design, not built: the real `obj.MegaCache` holds `Hit`s and is never cleared -->
 ```loimi
 struct MegaCache {                       // direct-mapped, 4096 entries, per heap
     entries: [MegaEntry; 4096],
@@ -570,6 +597,7 @@ reused afterwards.
 
 #### A complete property-read family
 
+<!-- snippet: skip design, not built: see "Inline caches" above for the real family -->
 ```loimi
 family GETPROP(dst: reg, obj: reg, name: kst) : ABC + PropIC {
     generic {
@@ -613,6 +641,7 @@ A load that finds its property on a prototype is cached against **the receiver's
 shape** plus a **validity cell** that represents "the prototype chain above
 this shape is unchanged".
 
+<!-- snippet: skip design, not built: validity cells are ids, from `m.cell(p)` -->
 ```loimi
 object ValidityCell { valid: bool }
 
@@ -641,6 +670,7 @@ Globals are a hot path in most dynamic languages, and dictionary versioning
 (invalidate everything when the global dict changes) tends to be too coarse.
 `std.obj.Globals` stores each binding in its own cell:
 
+<!-- snippet: skip design, not built (no `Globals`) -->
 ```loimi
 object PropertyCell { value: Value, state: CellState }   // .valid | .deleted
 struct Globals { map: HashMap<Key, Gc<PropertyCell>> }
@@ -661,6 +691,7 @@ stay valid.
 
 ### 8. Iteration and reflection
 
+<!-- snippet: skip design, not built: `m.keys(o, &vec)` copies the keys out -->
 ```loimi
 fn Model.keys(o: Gc<Object>) -> KeyIter;                 // insertion order if `.ordered`
 fn Model.entries(o: Gc<Object>) -> EntryIter;
@@ -679,6 +710,7 @@ don't visit added), Python-like (raise "dict changed size"), or Lua-like
 
 ### 9. Core API summary
 
+<!-- snippet: skip design, not built: see "As implemented" for the real `obj.Model` methods -->
 ```loimi
 enum Lookup { Own(SlotRef), Proto(Gc<Object>, SlotRef), Missing }
 
