@@ -298,6 +298,16 @@ under Loimi in 1.818 s (nbody), 1.484 s (fannkuchredux) and 1.608 s
 and 54.5, 58.1 and 81.2 s under wabt's wasm-interp (wasm3 0.5 has no
 SIMD).
 
+Checked afterwards: the handlers of the non-SIMD ops are the same
+instructions as before (objdump, addresses normalized), and the
+translator emits the same code for the benchmarks (`--disasm` of
+binarytrees and coremark: identical); best of 5, interleaved,
+`--align-functions=64`, tail calls: geomean 0.998 of before (binarytrees
+1.003, coremark 0.988, fannkuchredux 1.003, fasta 0.999, mandelbrot
+0.999, nbody 1.005, spectralnorm 0.987). On AArch64 (cross-built, under
+qemu) all 57 SIMD files pass in tail-call mode and all 147 files in goto
+mode.
+
 ## Summary
 
 | File | Lines | What |
