@@ -1228,7 +1228,16 @@ Selected per build (`--dispatch=` or `#[dispatch(...)]` on the vm):
 | `switch` | one function, loop plus `switch` | portability, wasm without tail calls, debugging |
 
 All three are produced from the same source, so a benchmark can compare them
-directly. The dispatch table pointer can be a state register (needed for
+directly.
+
+In `tailcall` mode, handlers (and their outlined cold blocks and the
+rest functions of superinstructions) carry LLVM's `no-builtin-memset`,
+`no-builtin-memcpy` and `no-builtin-memmove`: a loop that zeroes or
+copies memory stays a loop instead of becoming a library call, which
+would give the handler a stack frame and spills on every path even when
+the loop is short (as in a call op zeroing the callee's locals). Shared
+copies of `-> never` vm functions (cold call sites) and ordinary
+functions keep the usual behavior. The dispatch table pointer can be a state register (needed for
 instrumentation variants, section 9) or a global constant (saves a register);
 by default the compiler uses a register only if the vm declares variants.
 

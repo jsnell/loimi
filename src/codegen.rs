@@ -687,6 +687,19 @@ impl<'a, 'p> FnGen<'a, 'p> {
             attrs.push("cold");
             attrs.push("noinline");
         }
+        // Tail-call handlers: LLVM must not turn a loop into a call of
+        // memset/memcpy/memmove (loop idiom recognition), which would
+        // give the handler a stack frame and spills on every path. Their cold
+        // blocks and super resume functions get them too: LLVM inlines a
+        // callee only into a caller with at least its `no-builtin` set,
+        // and cold blocks inline handlers and resume functions. Shared
+        // copies of `-> never` vm functions (called from cold paths) may
+        // still call memset.
+        if matches!(f.vm_role, VmRole::Handler(_) | VmRole::Resume(..))
+            && f.vm.is_some_and(|v| p.vms[v as usize].dispatch == crate::tir::Dispatch::TailCall)
+        {
+            attrs.push("\"no-builtin-memset\" \"no-builtin-memcpy\" \"no-builtin-memmove\"");
+        }
         let symbol = match (&cold, &self.stencil) {
             (Some((_, _, s)), _) => s.clone(),
             (None, Some(st)) => st.symbol.clone(),

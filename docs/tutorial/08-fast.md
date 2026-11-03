@@ -66,7 +66,11 @@ a hot handler's assembly:
 
 - **no stack frame** (`push`, `sub $..., %rsp`): a plain call on any
   path gives the handler a frame on *every* path. Mini found this in
-  GETINDEX and SETINDEX; the cure is `cold`.
+  GETINDEX and SETINDEX; the cure is `cold`. Calls LLVM would add
+  itself are not a worry in tail-call handlers: they are compiled so
+  that a zeroing or copying loop stays a loop instead of becoming a
+  `memset`/`memcpy` call (a call to a C function you declared, such as
+  `memset` itself, is still a call: put it in `cold` or use a loop);
 - **no reloads of state** from memory;
 - **one dispatch sequence per exit**: load the next word, advance `pc`,
   index the table, jump.

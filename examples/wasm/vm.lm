@@ -516,24 +516,12 @@ pub vm W {
         if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
             cold { raise Trap.Exhausted }
         }
-        // Zero the non-parameter locals. A loop here becomes a memset
-        // call, which gives the handler a stack frame on every path; so
-        // the first four are stored unconditionally (slots past nlocals
-        // are the callee's scratch, and the stack has slack beyond
-        // stack_end), and longer runs go to a cold path.
-        let p = f.nparams as u64;
+        // Zero the non-parameter locals. (The loop stays a loop: LLVM does
+        // not turn loops in handlers into memset calls, which would give
+        // CALL a stack frame.)
+        var i = f.nparams as u64;
         let n = f.nlocals as u64;
-        nr[p] = 0; nr[p + 1] = 0; nr[p + 2] = 0; nr[p + 3] = 0;
-        if n > p + 4 {
-            cold {
-                zero_slots(nr, p + 4, n);
-                fp = fp + 1;
-                fp.ret = next_pc;
-                fp.regs = regs;
-                regs = nr;
-                jump f.code
-            }
-        }
+        while i < n { nr[i] = 0; i += 1; }
         fp = fp + 1;
         fp.ret = next_pc;
         fp.regs = regs;
@@ -667,12 +655,6 @@ pub vm W {
         while i < n { args[i] = 0; i += 1; }
         jump f.code
     }
-}
-
-#[inline(never)]
-fn zero_slots(p: *u64, from: u64, to: u64) {
-    var i = from;
-    while i < to { p[i] = 0; i += 1; }
 }
 
 fn table_of(m: *Machine, i: u64) -> ?*Table {
