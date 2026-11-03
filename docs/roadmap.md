@@ -138,6 +138,11 @@ quickening on/off.
    languages need a story for inline caches, which CPython's free-threading
    work could inform.
 5. **`preserve_none` coverage.** Confirmed on x86-64 and AArch64 (LLVM 19+).
+   AArch64 Linux is now run, not just compiled: `--target=aarch64-linux-gnu`
+   builds pass the whole test suite under qemu user-mode (all dispatch
+   modes, GC stress; the JIT is x86-64 only), and the tail-call handlers
+   keep the vm state in registers with no spills on hot paths. Not yet run
+   on hardware or with 16K/64K pages (qemu-user uses the host's 4K).
    Windows x64 and RISC-V status need checking per LLVM version. The `goto`
    fallback should make this a performance question, not a correctness one.
 6. **Copy-and-patch JIT.** Handlers are separate functions with a fixed

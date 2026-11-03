@@ -66,6 +66,22 @@ bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJI
 ./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
 ```
 
+Cross-compiling for AArch64 Linux (links with `ld.lld`; tested under qemu
+user-mode, built from source with an extracted Debian sysroot, no root):
+
+```sh
+bench/cross/install.sh                                 # qemu-aarch64 + sysroot
+S=$PWD/bench/cross/sysroot-aarch64
+./target/release/loimi build examples/mini/main.lm --release --target=aarch64-linux-gnu --sysroot=$S -o mini-arm
+bench/cross/install/bin/qemu-aarch64 -L $S ./mini-arm examples/mini/tests/functions.mini
+LOIMI_RUNNER="$PWD/bench/cross/install/bin/qemu-aarch64 -L $S" \
+  ./target/release/loimi run tests/run/hello.lm --target=aarch64-linux-gnu --sysroot=$S
+```
+
+`cargo test` runs a subset under qemu when the toolchain is installed
+(`aarch64_qemu`); `LOIMI_TARGET`, `LOIMI_SYSROOT` and `LOIMI_RUNNER` run the
+whole suite cross-compiled (see `cross()` in `tests/golden.rs`).
+
 ## Why a new language?
 
 Every serious interpreter written in C or C++ ends up rebuilding the same
