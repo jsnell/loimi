@@ -44,6 +44,10 @@ pub fn c_abi_attr(t: &Ty) -> &'static str {
     if *t == Ty::Bool { "zeroext " } else { "" }
 }
 
+/// First metadata number of the loop properties of vm code (numbered far
+/// from the JIT's stencil metadata).
+const LOOP_MD: u32 = 1_000_000;
+
 pub struct Codegen<'p> {
     pub p: &'p Program,
     pub sm: &'p SourceMap,
@@ -69,6 +73,10 @@ pub struct Codegen<'p> {
     pub nan_safe: std::collections::HashMap<FnId, std::collections::HashSet<LocalId>>,
     /// Trampolines that call a plain function as a `block fn`, by signature.
     pub tramps: std::collections::HashMap<String, String>,
+    /// Loop IDs of loops in tail-call vm code (`TK::Loop`), appended to
+    /// the module with the properties they share (`LOOP_MD`).
+    pub loop_md: String,
+    pub loop_md_count: u32,
     /// Whether `std.gc.barrier` exists (stores into objects call it); computed on first use.
     pub gc_barrier: Option<bool>,
     /// `--jit-stencils`: each handler's outlined cold blocks, in order.
@@ -177,6 +185,8 @@ impl<'p> Codegen<'p> {
             cold_count_jc: 0,
             tls_defined: Default::default(),
             tramps: Default::default(),
+            loop_md: String::new(),
+            loop_md_count: 0,
             cold_syms: Default::default(),
             jit_holes: Default::default(),
             reg_delay: crate::jitgen::reg_delay(),
@@ -422,6 +432,14 @@ impl<'p> Codegen<'p> {
         out.push_str(&copies);
         for d in self.decls.0.values() {
             let _ = writeln!(out, "{}", d);
+        }
+        if self.loop_md_count > 0 {
+            // What clang emits for `#pragma clang loop vectorize(disable)
+            // interleave(disable) unroll(disable)`.
+            let _ = writeln!(out, "!{} = !{{!\"llvm.loop.vectorize.width\", i32 1}}", LOOP_MD);
+            let _ = writeln!(out, "!{} = !{{!\"llvm.loop.interleave.count\", i32 1}}", LOOP_MD + 1);
+            let _ = writeln!(out, "!{} = !{{!\"llvm.loop.unroll.disable\"}}", LOOP_MD + 2);
+            out.push_str(&self.loop_md);
         }
         (out, std::mem::take(&mut self.stencils))
     }
@@ -1096,7 +1114,20 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 if let Some(s) = step {
                     self.val(s);
                 }
-                self.br(&head);
+                // In tail-call vm code (handlers, their cold blocks, vm
+                // functions), loops are not vectorized, interleaved or
+                // unrolled: they run a few times (zeroing a frame's
+                // locals, copying arguments), and the wide versions'
+                // registers can give the handler a stack frame and spills.
+                let f = self.f();
+                if f.vm.is_some_and(|v| self.p().vms[v as usize].dispatch == crate::tir::Dispatch::TailCall) {
+                    let n = LOOP_MD + 3 + self.cg.loop_md_count;
+                    self.cg.loop_md_count += 1;
+                    let _ = writeln!(self.cg.loop_md, "!{n} = distinct !{{!{n}, !{}, !{}, !{}}}", LOOP_MD, LOOP_MD + 1, LOOP_MD + 2);
+                    self.term(format!("br label %{}, !llvm.loop !{}", head, n));
+                } else {
+                    self.br(&head);
+                }
                 self.loops.pop();
                 self.label(&exit);
                 match slot {
