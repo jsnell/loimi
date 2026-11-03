@@ -633,6 +633,28 @@ State variables are loop phis. This mode is used for wasm without tail calls,
 and works anywhere. On wasm with tail calls, `tailcall` mode lowers to
 `return_call_indirect` and the calling convention is ignored.
 
+On x86-64 the switch becomes one shared dispatch block (load the word,
+compare the opcode with the largest case, `jmp *table(,%rax,8)`): LLVM
+does not copy it into the handlers, since it has more than 16
+predecessors and successors and more instructions than post-RA tail
+duplication copies. The state stays in registers (checked on the wasm
+interpreter: no spills in the hot handlers, the `f64` accumulator in
+`xmm6` and the integer one in `r15` across the whole loop).
+
+The driver turns off LLVM's tail merging when the program has a
+switch-mode vm (`-enable-tail-merge=false`, §12). With it, branch folding
+kept one copy of the handlers' common tails (store a result to a
+register slot, `pc += 1`, branch to the switch), so many handlers took
+two to four unconditional jumps to reach the dispatch block; Lox's EQK
+took four. Measured 2026-11-03 (best of 3, interleaved,
+`--align-functions=64`), switch builds with tail merging off against on:
+wasm 0.79 of the time (geometric mean of 7; mandelbrot and nbody 0.73),
+Lox `equality` 0.71 (other Lox benchmarks within 4%), Mini 0.93, MiniJS
+0.95, Stak 0.98, Scheme 1.00 (geometric means; results.md, "Follow-up").
+The single dispatch site remains: wasm switch still takes about 1.4
+times the tail-call time (1.5–1.6 on mandelbrot and nbody, where
+handlers are three to five instructions).
+
 ## 7. Dispatch tables and variants
 
 ```llvm
@@ -931,6 +953,7 @@ interleaved, `--align-functions=64`).
 |---|---|
 | `-O3` with the new pass manager (as implemented: `-O3` with `--release`, `-O1` otherwise) | standard |
 | goto mode: `-mllvm -tail-dup-indirect-size=0 -tail-dup-pred-size=1000000 -tail-dup-succ-size=1000000 -tail-dup-placement=false` when the program has a goto-mode vm (§5) | the shared dispatch block is copied into every handler after register allocation; compile time near linear in the op count |
+| switch mode: `-mllvm -enable-tail-merge=false` when the program has a switch-mode vm (§6) | handlers branch straight back to the switch instead of through shared tails |
 | handlers `nounwind`; whole program `-fno-exceptions`-equivalent | no unwind tables in the hot path |
 | `cold` functions placed in `.text.unlikely` | i-cache locality for handlers |
 | optional handler ordering from `--vm-stats` profiles (not yet implemented) | hot handlers placed together |

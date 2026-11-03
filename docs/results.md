@@ -116,14 +116,14 @@ backtracking engine), `wasm` (C programs compiled to wasm32-wasi), `stack`
   (0.999). With the JIT: 0.57–0.99 of the interpreter's time.
 - Mini's coroutine benchmarks take 0.53–0.59 of PUC-Lua's time and
   1.42–1.57 of LuaJIT `-joff`'s; goto and switch builds are 20% slower
-  there.
+  there (explained in "Follow-up" below).
 - MiniJS takes 0.23–0.76 of `node --jitless`'s time and 0.23–0.67 of
   QuickJS's, less on all 14.
 - Scheme takes less time than Guile with its JIT on 12 of 41 programs
   (geometric mean 0.96); with Loimi's JIT, 0.78.
 - Lox takes 0.29–0.69 of clox's time. The switch build is 1.8× slower
   than tail-call on `equality` (reproduced in both runs) and within 5%
-  elsewhere.
+  elsewhere (fixed since: "Follow-up" below).
 - Regex: the backtracker takes less time than the PCRE2 interpreter and
   Python's `re` except on `literal` (1.27–1.29) and, against Python,
   `dot-star` (1.29). `pathological` is rejected by the required-byte check
@@ -134,7 +134,8 @@ backtracking engine), `wasm` (C programs compiled to wasm32-wasi), `stack`
   `examples/wasm/FRICTION.md` and 1.15 s here, with our time unchanged
   (1.14–1.15 s), so the geometric mean moved from 0.87 to 0.91.
 - The switch builds of the wasm interpreter take 1.67× the tail-call time
-  (2× on mandelbrot and nbody).
+  (2× on mandelbrot and nbody; about 1.4× since the fix in "Follow-up"
+  below).
 
 ## Against the last recorded numbers
 
@@ -154,9 +155,80 @@ recorded run.
   in `literal-alt`, `words` and `capture` (1.08–1.11); the PCRE2 times
   are unchanged. The b88a8ce build itself is up to 10% slower here than
   the `FRICTION.md` table (`class` 63 against 57 ms), which was built
-  without `--align-functions` at another time.
+  without `--align-functions` at another time. The cause is in
+  "Follow-up" below.
 - Stak, tail-call: 1.04 of its `FRICTION.md` times (sieve and strings
   1.06–1.07, nbody 0.97).
+
+## Follow-up (2026-11-03): the anomalies above
+
+The tables on this page are from before these changes; the numbers here
+are A/B runs on the same machine (best of 3, or 5 where noted,
+interleaved, `--align-functions=64`; the machine was loaded, so absolute
+times are higher than in the tables).
+
+**Switch mode was slowed by LLVM's tail merging.** In the switch builds
+(one function, one shared `switch`), branch folding kept a single copy
+of the handlers' common tails (store the result, `pc += 1`, branch to
+the switch), so handlers reached the dispatch block through two to four
+unconditional jumps (Lox's EQK through four). The state was not the
+problem: no spills in the hot handlers, and the wasm accumulators stay
+in `xmm6` and `r15` across the loop. The driver now passes
+`-enable-tail-merge=false` when a program has a switch-mode vm
+(`lowering.md` §6, §12; tail-call and goto builds are unchanged). Switch
+builds, new over old:
+
+| suite | geomean | range |
+|---|---:|---|
+| wasm (7) | 0.79 | 0.73 (mandelbrot, nbody) – 0.88 (fasta) |
+| lox `equality` | 0.71 | other Lox benchmarks 0.96–1.02 |
+| mini (14) | 0.93 | 0.75 (closures) – 1.05 (sieve) |
+| minijs (14) | 0.95 | 0.81 (bitops) – 1.01 |
+| scheme (41) | 1.00 | 0.93 – 1.15 (puzzle; placement) |
+| stack (5) | 0.98 | 0.92 – 1.02 |
+| mini-coro (3) | 0.93 | |
+
+Wasm switch is now about 1.35–1.4× its tail-call time (was 1.67×; 1.5–1.6×
+on mandelbrot and nbody, whose handlers are three to five instructions
+around the one shared indirect jump), Lox `equality` 1.24× (was 1.8×).
+
+**Mini's coroutine benchmarks in goto and switch mode** pay for the
+nested run each `resume` makes (`examples/mini/COROUTINES.md`). In
+tail-call mode the entry (`Mini.resume`) is a small function that LLVM
+inlines into the `resume` native; in goto and switch mode it is the
+function holding every handler, entered and left once per resume/yield
+pair: six pushes and pops, a 1.3 KB frame (24 shadow-stack frames of
+different handlers, never overlapped since they carry no lifetime
+markers), the state set-up. A sampling profile of `coroutine_ring` (goto)
+puts 11% of the time in that entry block before the first dispatch, and
+the yield path (MOVE_CALL plus the exit) 35% above tail-call's. The
+other hot handlers cost about the same in both modes (within ±20% of
+few samples each). At the current master
+(after the resume-point commits) goto takes 1.14× the tail-call time on
+`coroutine_ring` and `sieve` and 1.02× on `chameneos` (best of 5; it was
+1.13–1.27× in the table above). Not changed: a resume op that switches
+coroutines inside the dispatch loop (COROUTINES.md, "Performance") would
+remove the nested entry in every mode.
+
+**Regex: the 3.5% is `#[catch_panic(-2)]` on `rx_exec`** (ea536af, which
+says so: "5-8% on the ones with a match every 25 ns"). Bisected over the
+101 first-parent commits from b88a8ce (each commit's own compiler and
+example, best of 5): 31fefd4 is at 0.997, ea536af at 1.049, and every
+later commit 1.03–1.04. Master with the attribute removed from `rx_exec`
+is 1.003. The cost is per call: installing the handler (two TLS loads and
+stores) about 1.5%, the frame pointer that the builtin setjmp needs
+about 1%, the setjmp about 1% (variants of master's IR: without the
+setjmp 1.025, without setjmp and frame address 1.016). Not inlining the
+body into the wrapper (the arguments then cross the setjmp in memory) is
+slower, 1.044, as ea536af found; passing them through an opaque copy
+after the setjmp gains nothing (1.042). Kept: it is the price of
+catching internal errors per call.
+
+**Stak's sieve and strings** are not slower than at the commit of its
+`FRICTION.md` table: a8ccba2, b88a8ce and master built today all run
+sieve in 0.091–0.093 s and strings in 0.146–0.157 s (best of 7). The
+difference from the recorded 0.087/0.135 is the machine or session, not
+a code change.
 
 ## Per suite
 
