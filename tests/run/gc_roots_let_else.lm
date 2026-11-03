@@ -1,0 +1,119 @@
+// matrix: dispatch
+// `let PAT = e else { .. }` binds traced locals only when the pattern
+// matches, so a collection in the else block must not scan them: there
+// they are unassigned on a first pass, and hold an earlier iteration's
+// values in a loop. They were rooted from the `let` on, and the
+// collector followed whatever the uninitialized slot held (Mini's
+// coroutine.resume crashed under GC stress, examples/mini/COROUTINES.md,
+// friction 1). Here: a function called from a handler, a handler's own
+// `let .. else`, and a loop whose else block would keep the first
+// iteration's node alive; each else block collects (GC stress).
+import std.io;
+import std.gc;
+
+object Node { v: i64 }
+enum E { Nil, N(Gc<Node>) }
+
+struct Ctx { heap: gc.Heap, cur: ?Gc<Node> }
+
+fn churn(h: *gc.Heap) uses gc { gc.collect(h); }
+
+/// Leaves pointer-like junk in the stack below its caller, where the next
+/// call's frame (and its unassigned slots) will be.
+#[inline(never)]
+fn spray(k: u64) -> u64 {
+    var a: [u64; 64] = [0; 64];
+    for i in 0..64 { a[i] = 0x0000_7777_0000_1230 + (i as u64) * 8 + k; }
+    var s: u64 = 0;
+    for i in 0..64 { s += a[(i * 7) % 64]; }
+    s & 1
+}
+
+#[inline(never)]
+fn victim(h: *gc.Heap, x: E) -> i64 uses gc {
+    let E.N(n) = x else {
+        churn(h);
+        return 0;
+    };
+    churn(h);
+    n.v
+}
+
+/// Whether the node bound in the first iteration survives the second
+/// iteration's else block (it must not: nothing references it).
+fn leaks(h: *gc.Heap) -> bool uses gc {
+    var w: ?Gc<gc.Weak<Node>> = None;
+    for i in 0..2 {
+        let x = if i == 0 { E.N(new(h, Node { v: 5 })) } else { E.Nil };
+        let E.N(n) = x else {
+            churn(h);
+            let Some(wk) = w else { return false; };
+            return match wk.get() { Some(_) => true, None => false };
+        };
+        w = Some(h.new_weak(n));
+    }
+    false
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    // Calls `victim` with a node on odd counts, without one on even.
+    op CALL(k: imm) : N {
+        let x = if k % 2 == 1 { E.N(new(&ctx.heap, Node { v: 2 })) } else { E.Nil };
+        acc += spray(k as u64) as i64;
+        acc += victim(&ctx.heap, x);
+        next
+    }
+    // Adds the current node's value; without one, collects and adds 100.
+    op CUR() : N {
+        let Some(n) = ctx.cur else {
+            churn(&ctx.heap);
+            acc += 100;
+            next
+        };
+        churn(&ctx.heap);
+        acc += n.v;
+        next
+    }
+    op SET(k: imm) : N {
+        ctx.cur = if k == 0 { None } else { Some(new(&ctx.heap, Node { v: k as i64 })) };
+        next
+    }
+    op HALT() : N { exit acc }
+
+    operand imm = it;
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; acc = 0; jump code }
+}
+
+fn scan_ctx(h: *gc.Heap, p: *u8) {
+    let c = p as *Ctx;
+    gc_mark(h, c.cur);
+}
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new(), cur: None };
+    c.heap.set_stress(true);
+    c.heap.add_scanner(&c as *u8, scan_ctx);
+    var t: i64 = 0;
+    for i in 0..200 {
+        t += spray(i as u64) as i64;
+        t += victim(&c.heap, if i % 2 == 0 { E.Nil } else { E.N(new(&c.heap, Node { v: 2 })) });
+    }
+    io.print_int(t);
+    io.println("");
+    io.println(if leaks(&c.heap) { "leaked" } else { "freed" });
+    var code: [u32; 10] = [M.CALL(0), M.CALL(1), M.CUR(), M.SET(7), M.CUR(), M.SET(0), M.CUR(), M.CALL(2), M.CALL(3), M.HALT()];
+    for i in 0..50 {
+        t += M.run(&c, &code[0]);
+    }
+    io.print_int(t);
+    io.println("");
+    c.heap.free();
+}
+// expect: 200
+// expect: freed
+// expect: 10750

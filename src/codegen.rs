@@ -1321,7 +1321,13 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     Some(eb) => {
                         let l_else = self.fresh_label("letelse");
                         let l_ok = self.fresh_label("letok");
+                        // The bindings are rooted from the match on: the
+                        // else block runs with their slots unassigned (or
+                        // holding a previous iteration's values), so a
+                        // collection there must not scan them.
+                        let n = self.live.last().unwrap().len();
                         self.test_pat(p, &sp, &l_else);
+                        let bound = self.live.last_mut().unwrap().split_off(n);
                         self.br(&l_ok);
                         self.label(&l_else);
                         self.val(eb);
@@ -1329,6 +1335,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                             self.term("unreachable");
                         }
                         self.label(&l_ok);
+                        self.live.last_mut().unwrap().extend(bound);
                     }
                 }
             }
