@@ -5,6 +5,7 @@ import std.text;
 import std.hash;
 import std.num;
 import std.dict;
+import std.bigint;
 import big;
 import vm.{Proto};
 
@@ -28,8 +29,9 @@ pub object Func {
     /// The class whose body defined it (for `super()`).
     owner: ?Gc<Box>,
 }
-/// Big integer magnitude, little-endian 32-bit limbs.
-pub object Limbs { d: [u32] }
+/// A big integer's limbs and sign (std.bigint's GC object; `Box.s`
+/// repeats the sign).
+pub type Limbs = bigint.Big;
 /// Every other kind of object: classes, bound methods, iterators,
 /// generators, cells, big integers, sets, modules, ...
 pub object Box {
@@ -220,14 +222,16 @@ pub fn hash_of(v: Value) -> ?u64 {
     }
 }
 
-pub fn hash_int(i: i64) -> u64 { if i == -1 { 0xfffffffffffffffe } else { i as u64 } }
+/// CPython's hash of an int (n mod 2^61 - 1, with its sign; -1 is -2).
+pub fn hash_int(i: i64) -> u64 {
+    if i == -1 { return 0xfffffffffffffffe; }
+    if i > -2305843009213693951 and i < 2305843009213693951 { return i as u64; }
+    bigint.hash_i64(i) as u64
+}
 
 fn big_hash(b: Gc<Box>) -> u64 {
-    if b.big.is_none() { return hash_int(b.n); }
-    let l = b.big.unwrap();
-    var hv: u64 = b.s as u64;
-    for i in 0..l.d.len { hv = hash.mix(hv ^ (l.d[i] as u64)); }
-    hv
+    if let Some(l) = b.big { return bigint.hash_py(l.num()) as u64; }
+    hash_int(b.n)
 }
 
 /// Equality of builtin values without calling guest code. Instances

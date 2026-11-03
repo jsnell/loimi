@@ -12,6 +12,14 @@ formatting (f-strings, `%`, `.format`). I did not read `examples/*`
 until the interpreter passed its tests (see the end of this file for
 whether they would have helped).
 
+## Follow-up (what has been done since)
+
+This report is kept as written. Since then:
+
+| # | Status |
+|---|---|
+| 2 | Built: `std.bigint` (stdlib.md): 64-bit limbs on new `u64` intrinsics `mul_wide`/`div_wide`, Karatsuba, Knuth division, divide-and-conquer formatting, Python's floor division, two's-complement bit operations, correctly rounded `to_f64` and CPython's int `hash`; a caller-buffer core over `Num` views, an owned `BigInt` and a GC `Big` with `gc_add(h, Arg, Arg)`-style functions. `big.lm` is now a 140-line adapter (was 585): ints are 1.5-10x faster (`fact(3000)` 11 → 1 ms, `fib(20000)` by additions 37 → 8 ms), `hex`/`oct`/`bin`/`format` of big ints are no longer quadratic, `float(n)` is correctly rounded, and `hash(n)` is CPython's. The dict is `std.dict.Dict<Value, Value>` (CPython's compact layout with stored hashes, entry indices stable until a compaction, a `version` counter for inline caches): its three lookups became `find_by` closures and `find_with` (fallible, re-entrant, restarts when `__eq__` changed the dict; the old code could index out of bounds there), `dict_append_new` became `try_add_by`, resize uses stored hashes (the old one recomputed them without user `__hash__`). Benchmarks 0.97x of the old dict's time by geomean; instance creation is about 20% slower because entries are 24 bytes (stored hash) instead of 16. Remaining gap: no hash-less, string-keys-only layout like CPython's for instance dicts. |
+
 ## Summary
 
 | | |
