@@ -246,8 +246,7 @@ fn emit(m: *Machine, to_err: bool, s: str) {
         m.flush();
         io.eprint(s);
     } else {
-        m.out.push_str(s);
-        if m.out.len() > 65536 { m.flush(); }
+        m.out.print(s);
     }
 }
 

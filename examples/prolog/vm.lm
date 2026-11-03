@@ -24,6 +24,7 @@ pub const EXIT_FALSE: i32 = 1;
 pub const EXIT_THROW: i32 = 2;
 pub const EXIT_HALT: i32 = 3;
 
+#[require_verified]
 pub vm Wam {
     context ctx: *Machine;
     state { pc: *u32, e: *Frame, s: *Term, wm: bool }
@@ -52,8 +53,9 @@ pub vm Wam {
         format R3s { op: 8, a: 8, b: 8, sc: s8 }
     }
 
-    /// The code of a clause or of a try chain, two words after the op.
-    cache Target { code: u64 }
+    /// The clause a try chain continues at: a resume point (the start of
+    /// the clause's verified code), set by `fill_resumes` (compile.chain).
+    cache Target { code: Wam.Resume }
 
     // ---- backtracking -------------------------------------------------
 
@@ -475,15 +477,15 @@ pub vm Wam {
     op TRY(n: imm) : A + Target {
         if unlikely((ctx.b.end() as *u64) + 9 + n >= ctx.cend) { cold { raise builtins.resource_error(ctx, "choicepoints") } }
         push_choice(n, next_pc);
-        jump (cache.code as *u32)
+        jump cache.code
     }
     op RETRY() : A + Target {
         ctx.b.alt = next_pc;
-        jump (cache.code as *u32)
+        jump cache.code
     }
     op TRUST() : A + Target {
         ctx.b = ctx.b.prev;
-        jump (cache.code as *u32)
+        jump cache.code
     }
 
     /// First-argument indexing: pick the clauses that can match A1.
@@ -528,7 +530,7 @@ pub vm Wam {
     super PVX2 = PUT_VAL_X; PUT_VAL_X;
     super DEALLOC_EXEC = DEALLOCATE; EXECUTE;
 
-    entry run(m: *Machine, code: *u32) -> i32 uses gc {
+    entry run(m: *Machine, code: Verified<Wam>) -> i32 uses gc {
         ctx = m;
         e = m.e;
         s = m.ebase;
