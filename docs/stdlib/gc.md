@@ -152,6 +152,24 @@ constants. Nothing that lives only in a handler's registers needs
 scanning. `rt.protect`/`rt.catch_panic` restore the shadow-stack top
 when they unwind.
 
+### Checking roots: `--gc-check-roots`
+
+`loimi build --gc-check-roots` (also for `run` and `test`) builds a
+program whose collector checks every reference that generated code
+hands it before reading its header: shadow-stack roots (traced locals,
+values kept for defers, the copies of vm state), `gc_mark` calls in
+scanners and `#[trace]` hooks, and traced fields. A reference must be
+null or the start of a live object of the heap being collected. It also
+fills unassigned traced slots and the objects a collection frees with
+0x01 bytes, so a root listed too early or kept too long is caught the
+first time it is marked, and reports a bad reference with its frame,
+function, call site and slot. The checks live in std.gc (`rootck_*`);
+how the compiler wires them is in [`../lowering.md`](../lowering.md)
+§9 ("Checked roots"). Interpreter test scripts run their suites in this
+mode (`examples/python/check.sh`, the GC tests); the rooting fuzzer
+(`tests/fuzz/rootgen.rs`, [`../status.md`](../status.md)) builds every
+program with it.
+
 ### Weak references and ephemerons
 
 - **`Weak<T>`** is a library object, `object Weak<T> { addr: u64 }`, made
@@ -338,7 +356,11 @@ it.gil.lock();
   `g.attach(data)` (waits for the lock) and, holding it, `g.detach()`.
   `g.unlock()` / `g.lock()` let go and take it back around blocking
   code. Waiting is first come, first served (tickets under a pthread
-  mutex and condition variable).
+  mutex and condition variable). `g.mine()` is the calling thread's
+  record (null if not attached), `g.holder()` the holder's,
+  `g.switches()` counts hand-overs. `g.free()` releases the lock once
+  the calling thread is the only one attached and holds it, after the
+  heap's last collection (free the heap first).
 - **Hand-over at safepoints.** `g.waiting()` is a relaxed atomic load of
   the number of waiting threads, which the holder polls where its state
   is synced: Mini at every taken jump and every call of a Lua function.
@@ -377,7 +399,8 @@ run-time switch, and the barrier is always compiled in), incremental
 marking, lazy sweeping in a non-generational heap, side mark bitmaps,
 card marking (a large array stored into is retraced whole by each minor
 collection), aging of small objects (measured, see above), finalizers that run guest
-code (free hooks for host memory are built, below), `Root<T>`/`GcVec<T>`, heap snapshots, poisoning,
+code (free hooks for host memory are built, above), `Root<T>`/`GcVec<T>`, heap snapshots, poisoning (except in
+`--gc-check-roots` builds, above),
 and the `weak` field qualifier (also for inline caches, language.md
 §7.1).
 

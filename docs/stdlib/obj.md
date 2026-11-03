@@ -9,9 +9,11 @@ It builds on [`gc.md`](gc.md), and on inline caches and families in
 `std.obj` implements **record-like objects with symbol keys**: JS objects,
 Python instances, Ruby objects, Lua tables used as records. Hash-table-like
 containers keyed by arbitrary values (Lua tables used as maps, Python dicts)
-are a hash table the interpreter writes itself (`std.collections.Table` and
-`IndexMap` are design only, see `../stdlib.md`). An interpreter typically
-uses both.
+are a hash table: `std.dict.Dict` (insertion-ordered, in the GC heap, with
+lookups whose equality may run guest code; examples/python's dicts), or
+one the interpreter writes itself (the Lua-style hybrid
+`std.collections.Table` is design only; see `../stdlib.md`). An
+interpreter typically uses both.
 
 ## As implemented
 

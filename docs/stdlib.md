@@ -12,26 +12,26 @@ says so. Some modules are design only; their sections say so at the top.
 
 | Module | Status | Source |
 |---|---|---|
-| `std.core` (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
-| `std.mem` | built | `std/mem.lm` |
-| `std.hash`, `std.map`, `std.dict` | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
-| `std.text` | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
-| `std.num` | built | `std/num.lm` |
-| `std.bigint` | built (no subquadratic division) | `std/bigint.lm` |
-| `std.io`, `std.os` | built (minimal) | `std/io.lm`, `std/os.lm` |
-| `std.lex` | built (a cursor toolkit, no generator) | `std/lex.lm` |
-| `std.parse` | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
-| `std.diag` | built | `std/diag.lm` |
-| `std.bc` | built (a library, no generated `Builder`) | `std/bc.lm` |
-| `std.gc` | built (mark-sweep, optional generational mode) | `std/gc.lm` |
-| `std.gil` | built (a global interpreter lock per heap) | `std/gil.lm` |
-| `std.obj` | built (no comptime `Model`) | `std/obj.lm` |
-| `std.rt` | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
-| `std.collections` (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
-| `std.ast` | **not built** | |
-| `std.prof` | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
-| `std.ffi` | **not built** (`extern "C"` is in the language) | |
-| `std.test` | built (`#[test]`, `loimi test`, assertions, capture, golden files; no matrix or differential runner) | `std/test.lm` |
+| [`std.core`](#stdcore-built-in-types-and-operations) (built-ins) | built in part (no `assert`, `rotl`, ...; formatting is in `std.text`) | the compiler |
+| [`std.mem`](#stdmem) | built | `std/mem.lm` |
+| [`std.hash`, `std.map`](#stdhash-and-stdmap), [`std.dict`](#ordered-maps-maporderedmap-and-dictdict) | built (`HashMap`, insertion-ordered `OrderedMap`; `Dict`, the same in the GC heap; `KeyDict`, without stored hashes, for keys that cache theirs) | `std/hash.lm`, `std/map.lm`, `std/dict.lm` |
+| [`std.text`](#stdtext) | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
+| [`std.num`](#stdnum) | built | `std/num.lm` |
+| [`std.bigint`](#stdbigint) | built (no subquadratic division) | `std/bigint.lm` |
+| [`std.io`, `std.os`](#stdio-and-stdos) | built (minimal) | `std/io.lm`, `std/os.lm` |
+| [`std.lex`](#stdlex) | built (a cursor toolkit, no generator) | `std/lex.lm` |
+| [`std.parse`](#stdparse) | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
+| [`std.diag`](#stddiag) | built | `std/diag.lm` |
+| [`std.bc`](#stdbc-bytecode-construction) | built (a library, no generated `Builder`) | `std/bc.lm` |
+| [`std.gc`](#stdgc), [details](stdlib/gc.md) | built (mark-sweep, optional generational mode) | `std/gc.lm` |
+| [`std.gil`](stdlib/gc.md#threads-sharing-a-heap-stdgil) | built (a global interpreter lock per heap) | `std/gil.lm` |
+| [`std.obj`](#stdobj-objects-and-shapes), [details](stdlib/obj.md) | built (no comptime `Model`) | `std/obj.lm` |
+| [`std.rt`](#stdrt-runtime-support) | built in part (`protect`/`throw`, `catch_panic`/`panic`; no `ValueStack`, `FrameStack`, `Fiber`) | `std/rt.lm` |
+| [`std.collections`](#design-not-built-stdcollections) (beyond `HashMap`, `OrderedMap`, `Dict`) | **not built** | |
+| [`std.ast`](#stdast) | **not built** | |
+| [`std.prof`](#stdprof) | built (clock, `Bench`, `Counters`, `--vm-stats` counts; no sampling profiler) | `std/prof.lm` |
+| [`std.ffi`](#design-not-built-stdio-stdos-stdffi) | **not built** (`extern "C"` is in the language) | |
+| [`std.test`](#stdtest) | built (`#[test]`, `loimi test`, assertions, capture, golden files; no matrix or differential runner) | `std/test.lm` |
 
 Design rules for the library:
 
@@ -46,8 +46,9 @@ Design rules for the library:
   holds heap memory has a `free()` method (`Vec`, `Arena`, `HashMap`,
   `OrderedMap`, `StrBuf`, `Interner`, `OpTable`, `Keywords`, `Pratt`, `Parser`,
   `SourceMap`, `Diag`, `Diagnostics`, `Code`, `Pool`, `Heap`, `Shapes`,
-  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Bench`,
-  `Counters`), and `io.read_file`'s result
+  `MegaCache`, `Ics`, `Model`, `Ephemerons`, `WeakInterner`, `Gil`,
+  `BigInt`, `Bench`, `Counters`; `Malloc` frees each allocation with
+  `free_bytes`), and `io.read_file`'s result
   is released with `io.free_file`. Freeing a container does not free what
   its elements point to.
 
@@ -293,7 +294,8 @@ and values may be `Value`s or `Gc<T>`s; a guest dict can be a
 `Gc<Dict<Value, Value>>` (examples/python's is). It has the same API
 with the dict as a `Gc` receiver and the heap on calls that may allocate
 (`Dict.new(h, n)`, `insert(h, k, v)`, `put_by(h, ..)`, `insert_new(h,
-..)`, `copy(h)`); like any `new`, they never collect, so they can run in
+..)`, `copy(h)`; `try_insert_new(hash, k, v) -> ?u64` appends without
+resizing); like any `new`, they never collect, so they can run in
 a handler's fast path. Iteration is by entry index (`next(&i) -> ?u64`,
 then `key(e)`, `value(e)`, `hash_at(e)`), which stays usable across
 allocation and guest code (compare `version` to detect "changed during
@@ -491,7 +493,9 @@ layers over one representation:
   a small operand needs no object. `b.num()` is a `Big`'s view. Allocating
   does not collect (collections run at the interpreter's safepoints), so
   these have no effect. An interpreter can store `Gc<Big>` in its own
-  objects (Python's `Box.big`) or as a `value` variant's payload.
+  objects (examples/python's `Long`, an object behind its own
+  `value` variant, holds an optional `Gc<Big>`) or as a `value` variant's
+  payload.
 
 Formatting: `bigint.write(b, x, radix)` appends to a `text.StrBuf`
 (radix 2 to 36, lowercase, `-` for negatives, no prefix);
@@ -536,7 +540,7 @@ fn main() {
 In an interpreter, the overflow of a small-int fast path goes to the GC
 layer with the operands as `Arg`s, and a result that fits the small case
 again goes back to it (examples/python/big.lm is this, with an i64
-"medium" box in between):
+"medium" `Long` in between):
 
 <!-- snippet: check
 import std.gc;
@@ -851,13 +855,15 @@ into. Not built:
   `gc.maybe_collect(&heap)` (collects if `heap.allocated >
   heap.threshold`, or in stress mode), both `uses gc`. Allocation never
   collects.
-- Roots: traced locals are rooted by the compiler at `uses gc` calls.
-  Everything else (globals, VM stacks, state registers, host tables) is
+- Roots: traced locals, and in vm code copies of traced `state`
+  variables, are rooted by the compiler at `uses gc` calls.
+  Everything else (globals, VM stacks in memory, host tables) is
   marked by a root scanner, `heap.add_scanner(data, scan)`, where
   `scan: fn(*Heap, *u8)` calls `gc_mark(h, v)` on each reference.
   Scanners have no effects: they cannot collect.
 - `heap.add_sweeper(data, sweep)`: runs after marking; with
-  `gc.is_marked(p)` it drops references to dead objects (weak tables).
+  `h.is_marked(p)` (or the slower `gc.is_marked(p)`) it drops references
+  to dead objects (weak tables).
   `heap.is_minor()` tells it only young objects can have died.
 - Tuning: `set_growth(percent, min_heap)` (default 100% and 1 MiB),
   `set_max_budget(bytes)`, `set_generational(on)`, `set_nursery(bytes)`,
@@ -881,8 +887,19 @@ into. Not built:
   of a reference into an object. After a store through a raw pointer,
   call `gc.write_barrier(&heap, obj)`; `gc.needs_barrier(obj)` and
   `gc.remember(obj)` log several objects at once.
-
-- Threads sharing a heap, one at a time: `std.gil` (`gil.Gil.new(&heap,
+- Hooks for objects the generated code cannot fully see
+  ([details](stdlib/gc.md#trace-hooks-free-hooks-and-dirty-pinning)):
+  `#[trace(f)]` on an `object` (a custom trace of the trailing array or
+  of host memory it owns), `heap.on_free(obj, f)` (release host memory
+  when `obj` dies; no guest code, no resurrection), and
+  `heap.pin_dirty(obj)` / `unpin_dirty` / `is_pinned_dirty` (an object
+  written without barriers, traced at every collection).
+- `loimi build --gc-check-roots` validates every reference the collector
+  marks and poisons unassigned slots and freed objects
+  ([details](stdlib/gc.md#checking-roots---gc-check-roots)).
+- Threads: heaps have no shared state, so independent heaps run on
+  different threads without locks ([`stdlib/gc.md`](stdlib/gc.md#9-heaps-and-threads)).
+  Threads sharing a heap, one at a time: `std.gil` (`gil.Gil.new(&heap,
   data)`, `attach`, `detach`, `unlock`/`lock`, the poll `waiting()` and
   `yield_now()`, hooks that move per-thread interpreter state); see
   [`stdlib/gc.md`](stdlib/gc.md#threads-sharing-a-heap-stdgil).
@@ -918,9 +935,11 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md). Not built:
   `Incremental` policy (tri-color, snapshot-at-the-beginning barrier);
 - lazy sweeping in a non-generational heap, card marking, aging of small
   objects before promotion, a moving collector;
-- roots generated from `vm` state kinds and frame structs (write a root
-  scanner), `Root<T>`, `GcVec<T>`;
-- finalizers, poisoning, heap snapshots;
+- roots generated from vm stacks and frame structs (write a root
+  scanner; traced `state` variables are rooted automatically),
+  `Root<T>`, `GcVec<T>`;
+- finalizers that run guest code (free hooks for host memory are
+  built), heap snapshots, poisoning outside `--gc-check-roots` builds;
 - inline caches in bytecode as weak roots (caches cannot hold GC
   references; language.md §7.1).
 
@@ -1032,6 +1051,8 @@ access is compiled in only when the program uses it.
   `c.count(i)`, `c.count_of("ADD")`, `c.total()`, `c.reset()` (op counts,
   pairs and sequences: measure one phase, or skip a warmup; the report
   at exit covers what ran since) and `c.report()` (the exit report, now).
+  The exit report (language.md §7.3) also counts entries into each
+  `cold` block, per op, with its source location.
 
 ### Design (not built)
 
