@@ -19,7 +19,8 @@
 // the dict is compacted; `version` changes on every insertion of a new
 // key, removal, compaction and `clear` (not on value updates), so an
 // inline cache can hold an entry index and check the key at it, or hold
-// the version.
+// the version. Functions that may allocate take the heap; like `new`,
+// they never collect, so `insert` can run in a handler's fast path.
 
 import std.gc;
 import std.mem;
@@ -46,7 +47,7 @@ pub object Dict<K: hash.Hash, V> {
 }
 
 /// A dict with room for `n` entries before it resizes.
-pub fn Dict<K, V>.new(h: *gc.Heap, n: u64) -> Gc<Dict<K, V>> uses gc {
+pub fn Dict<K, V>.new(h: *gc.Heap, n: u64) -> Gc<Dict<K, V>> {
     let sz = map.index_size_for<K>(n);
     let index = new(h, DictIndex {}, sz);
     let ents: Gc<DictEntries<K, V>> = new(h, DictEntries {}, map.usable_for<K>(sz));
@@ -56,13 +57,11 @@ pub fn Dict<K, V>.new(h: *gc.Heap, n: u64) -> Gc<Dict<K, V>> uses gc {
 /// Resize (and compact) for `n` live entries.
 #[cold]
 #[inline(never)]
-fn Dict<K, V>.resize(d: Gc<Dict<K, V>>, h: *gc.Heap, n: u64) uses gc {
+fn Dict<K, V>.resize(d: Gc<Dict<K, V>>, h: *gc.Heap, n: u64) {
     let sz = map.index_size_for<K>(n);
     let index = new(h, DictIndex {}, sz);
     let ents: Gc<DictEntries<K, V>> = new(h, DictEntries {}, map.usable_for<K>(sz));
-    // No allocation from here on: the raw copies below go into objects
-    // that are young unless a generational heap promoted them, hence the
-    // barrier after.
+    // The raw copy bypasses the compiler's barriers: one for the object.
     d.used = map.probe_rebuild(index.s.ptr, sz - 1, ents.e.ptr, d.ents.e.ptr, d.used);
     gc.write_barrier(h, ents as *u8);
     d.index = index;
@@ -107,9 +106,49 @@ pub fn Dict<K, V>.try_insert_new(d: Gc<Dict<K, V>>, hv: u64, key: K, value: V) -
 }
 
 /// Append a new entry for a key the caller knows is absent; its index.
-pub fn Dict<K, V>.insert_new(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V) -> u64 uses gc {
+pub fn Dict<K, V>.insert_new(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V) -> u64 {
     if d.used >= d.ents.e.len { d.resize(h, d.len * 2 + 1); }
     d.try_insert_new(hv, key, value).unwrap()
+}
+
+/// Entry `e` := (hash, key, value), indexed at `slot`.
+#[inline(always)]
+fn Dict<K, V>.place(d: Gc<Dict<K, V>>, slot: u64, hs: u64, key: K, value: V) -> u64 {
+    let e = d.used;
+    let p = d.ents.e.ptr + e;
+    p.hash = hs;
+    p.key = key;
+    p.value = value;
+    gc.barrier(d.ents as *u8);
+    (d.index.s.ptr)[slot] = (e as u32) + map.SLOT_BASE;
+    d.used = e + 1;
+    d.len += 1;
+    d.version += 1;
+    e
+}
+
+/// Insert or replace in one probe, with the caller's hash and equality
+/// (as `find_by`). Returns the entry index and whether the key was new.
+pub fn Dict<K, V>.put_by(d: Gc<Dict<K, V>>, h: *gc.Heap, hv: u64, key: K, value: V, eq: block fn(K) -> bool) -> (u64, bool) {
+    let hs = map.stored_hash<K>(hv);
+    let (r, found) = map.probe_lookup(d.index.s.ptr, d.mask, d.ents.e.ptr, hs, eq);
+    if found {
+        d.ents.e[r].value = value;
+        return (r, false);
+    }
+    if d.used < d.ents.e.len { return (d.place(r, hs, key, value), true); }
+    (d.insert_new(h, hv, key, value), true)
+}
+
+/// Insert a key that `eq` finds absent, in one probe, if the dict has
+/// room without resizing: the new entry's index; None if the key is
+/// present or the dict is full (nothing done). Does not allocate.
+pub fn Dict<K, V>.try_add_by(d: Gc<Dict<K, V>>, hv: u64, key: K, value: V, eq: block fn(K) -> bool) -> ?u64 {
+    if d.used >= d.ents.e.len { return None; }
+    let hs = map.stored_hash<K>(hv);
+    let (r, found) = map.probe_lookup(d.index.s.ptr, d.mask, d.ents.e.ptr, hs, eq);
+    if found { return None; }
+    Some(d.place(r, hs, key, value))
 }
 
 /// Key, value and stored hash of entry `e` (a live entry index).
@@ -145,14 +184,8 @@ pub fn Dict<K, V>.contains(d: Gc<Dict<K, V>>, key: K) -> bool {
 }
 
 /// Insert or replace (a replaced key keeps its place). True if the key was new.
-pub fn Dict<K, V>.insert(d: Gc<Dict<K, V>>, h: *gc.Heap, key: K, value: V) -> bool uses gc {
-    let hv = key.hash();
-    if let Some(e) = d.find_by(hv, |k| k.eq(key)) {
-        d.ents.e[e].value = value;
-        return false;
-    }
-    d.insert_new(h, hv, key, value);
-    true
+pub fn Dict<K, V>.insert(d: Gc<Dict<K, V>>, h: *gc.Heap, key: K, value: V) -> bool {
+    d.put_by(h, key.hash(), key, value, |k| k.eq(key)).1
 }
 
 /// Remove `key`; its value if it was present.
@@ -198,7 +231,7 @@ pub fn Dict<K, V>.clear(d: Gc<Dict<K, V>>) {
 }
 
 /// A new dict with the live entries of `d`, in order (compacted).
-pub fn Dict<K, V>.copy(d: Gc<Dict<K, V>>, h: *gc.Heap) -> Gc<Dict<K, V>> uses gc {
+pub fn Dict<K, V>.copy(d: Gc<Dict<K, V>>, h: *gc.Heap) -> Gc<Dict<K, V>> {
     let r: Gc<Dict<K, V>> = Dict.new(h, d.len);
     r.used = map.probe_rebuild(r.index.s.ptr, r.mask, r.ents.e.ptr, d.ents.e.ptr, d.used);
     r.len = r.used;

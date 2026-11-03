@@ -2,7 +2,8 @@
 // and values. Run against a plain heap, a stress heap (collect at every
 // safepoint) and a generational stress heap with verify (a missing write
 // barrier aborts), and built with `--gc-check-roots` (the matrix).
-// `find_with` runs an equality that allocates and changes the dict.
+// `find_with` runs an equality that collects and changes the dict.
+// (Allocating never collects; the explicit collects are the safepoints.)
 // matrix: check-roots
 import std.io;
 import std.gc;
@@ -110,6 +111,7 @@ fn effectful(h: *gc.Heap) uses reenter {
     let r: Result<?u64, str> = d.find_with(key.hash(), |k| -> Result<bool, str> {
         calls += 1;
         let junk = boxed(h, 12345);
+        gc.collect(h);
         if !mutated {
             mutated = true;
             for j in 100..200 {

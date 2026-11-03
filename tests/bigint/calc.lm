@@ -5,8 +5,8 @@
 // integers in hexadecimal with an optional `-`. Writes one result line
 // per case. Operations whose name starts with `g` go through the GC API
 // (`gc_add`, ...), the others through the owned `BigInt` API, so both
-// are checked against the same expected output. `LOIMI_GC_STRESS=1`
-// collects at every allocation.
+// are checked against the same expected output. A second argument `1`
+// collects between the steps of the GC operations.
 import std.io;
 import std.os;
 import std.mem;
@@ -15,6 +15,9 @@ import std.gc;
 import std.hash;
 import std.bigint;
 import std.bigint.{Num, BigInt, Big, Arg};
+
+/// Collect between the steps of the GC operations.
+var STRESS: bool = false;
 
 fn int(s: str) -> BigInt {
     if s.len > 0 and s[0] == '-' {
@@ -43,7 +46,7 @@ fn arg(h: *gc.Heap, x: *BigInt) -> Arg uses gc {
 
 fn main() uses gc {
     var h = gc.Heap.new();
-    if let Some(s) = os.arg(2) { if s.len > 0 and s[0] == '1' { h.set_stress(true); } }
+    if let Some(s) = os.arg(2) { if s.len > 0 and s[0] == '1' { STRESS = true; } }
     let input = io.read_file(os.arg(1).unwrap()).unwrap();
     var o = text.StrBuf.new();
     var w: mem.Vec<str> = mem.Vec.new();
@@ -154,8 +157,14 @@ fn run_gc(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
     var b = int(w[2]);
     let y = arg(h, &b);
     b.free();
+    // Under stress, collect while the operands are only in locals.
+    if STRESS { gc.collect(h); }
     match op {
-        "gadd" => put(o, bigint.gc_add(h, x, y).num()),
+        "gadd" => {
+            let r = bigint.gc_add(h, x, y);
+            if STRESS { gc.collect(h); }
+            put(o, r.num());
+        }
         "gsub" => put(o, bigint.gc_sub(h, x, y).num()),
         "gmul" => put(o, bigint.gc_mul(h, x, y).num()),
         "gand" => put(o, bigint.gc_and(h, x, y).num()),
@@ -165,6 +174,7 @@ fn run_gc(h: *gc.Heap, o: *text.StrBuf, w: []str) uses gc {
             match bigint.gc_divmod(h, x, y, op.eq("gfdiv")) {
                 Some(qr) => {
                     let (q, r) = qr;
+                    if STRESS { gc.collect(h); }
                     put(o, q.num());
                     o.push(' ');
                     put(o, r.num());

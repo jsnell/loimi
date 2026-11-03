@@ -184,6 +184,29 @@ pub fn probe_slot_of<K>(idx: *u32, mask: u64, hash: u64, e: u64) -> u64 {
     }
 }
 
+/// One probe for find-or-insert: `(e, true)` if `eq` accepts the key of
+/// entry `e`, else `(slot, false)` with the first empty or deleted index
+/// slot on the path, where the key goes.
+#[inline]
+pub fn probe_lookup<K, V>(idx: *u32, mask: u64, ents: *Entry<K, V>, hash: u64, eq: block fn(K) -> bool) -> (u64, bool) {
+    var i = hash & mask;
+    var perturb = hash;
+    var free = NO_ENTRY;
+    loop {
+        let s = idx[i];
+        if s == SLOT_EMPTY { return (if free == NO_ENTRY { i } else { free }, false); }
+        if s >= SLOT_BASE {
+            let e = (s - SLOT_BASE) as u64;
+            let p = ents + e;
+            if p.hash == hash and eq(p.key) { return (e, true); }
+        } else if free == NO_ENTRY {
+            free = i;
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & mask;
+    }
+}
+
 /// Point the first empty or deleted slot on `hash`'s probe path at entry `e`.
 #[inline]
 pub fn probe_put<K>(idx: *u32, mask: u64, hash: u64, e: u64) {
@@ -368,13 +391,26 @@ pub fn OrderedMap<K, V>.contains(m: *OrderedMap<K, V>, key: K) -> bool {
 /// Insert or replace (a replaced key keeps its place in the order).
 /// Returns true if the key was new.
 pub fn OrderedMap<K, V>.insert(m: *OrderedMap<K, V>, key: K, value: V) -> bool {
-    let h = key.hash();
-    if let Some(e) = m.find_by(h, |k| k.eq(key)) {
-        (m.ents + e).value = value;
-        return false;
+    m.put_by(key.hash(), key, value, |k| k.eq(key)).1
+}
+
+/// Insert or replace in one probe, with the caller's hash and equality
+/// (as `find_by`). Returns the entry index and whether the key was new.
+pub fn OrderedMap<K, V>.put_by(m: *OrderedMap<K, V>, h: u64, key: K, value: V, eq: block fn(K) -> bool) -> (u64, bool) {
+    let hs = stored_hash<K>(h);
+    let (r, found) = probe_lookup(m.idx, m.mask, m.ents, hs, eq);
+    if found {
+        (m.ents + r).value = value;
+        return (r, false);
     }
-    m.insert_new(h, key, value);
-    true
+    if m.used == m.cap { return (m.insert_new(h, key, value), true); }
+    let e = m.used;
+    m.ents[e] = Entry { hash: hs, key: key, value: value };
+    m.idx[r] = (e as u32) + SLOT_BASE;
+    m.used = e + 1;
+    m.len += 1;
+    m.version += 1;
+    (e, true)
 }
 
 /// Remove `key`; its value if it was present.

@@ -15,7 +15,8 @@
 //   `bigint.add(a, b) -> BigInt`, freed with `x.free()`.
 // - `Big` is a GC object holding limbs, and `gc_add(h, a, b) -> Gc<Big>`
 //   computes straight into a new one. Operands are `Arg`s (a small `i64`
-//   or a `Gc<Big>`), which stay rooted while the result is allocated.
+//   or a `Gc<Big>`). Allocating does not collect (collections run at the
+//   interpreter's safepoints), so none of these has an effect.
 //
 // Small integers are the interpreter's business: keep them unboxed in the
 // value type and come here on overflow (`num.add_overflow`), making a
@@ -1097,8 +1098,8 @@ pub object Big { neg: bool, len: u64, d: [u64] }
 pub fn Big.num(b: Gc<Big>) -> Num { Num { neg: b.neg, d: b.d[0..b.len] } }
 
 /// An operand of the GC functions: a small integer (the interpreter's
-/// unboxed case) or a `Gc<Big>`. Being a traced value, it keeps the
-/// object alive while the result is allocated.
+/// unboxed case) or a `Gc<Big>`, so that callers need no temporary
+/// object for a small operand.
 pub enum Arg { Small(i64), Ref(Gc<Big>) }
 
 /// The view of a; `buf` holds the limb of a small one.
@@ -1110,12 +1111,12 @@ pub fn Arg.num(a: Arg, buf: *u64) -> Num {
 }
 
 /// A new `Big` with room for n limbs, zero.
-pub fn new_big(h: *gc.Heap, n: u64) -> Gc<Big> uses gc {
+pub fn new_big(h: *gc.Heap, n: u64) -> Gc<Big> {
     new(h, Big { neg: false, len: 0 }, n)
 }
 
 /// A copy of a in the GC heap.
-pub fn gc_copy(h: *gc.Heap, a: Num) -> Gc<Big> uses gc {
+pub fn gc_copy(h: *gc.Heap, a: Num) -> Gc<Big> {
     let o = new_big(h, a.d.len);
     mem.copy(o.d.ptr, a.d.ptr, a.d.len);
     o.len = a.d.len;
@@ -1129,27 +1130,27 @@ fn set(o: Gc<Big>, r: Num) -> Gc<Big> {
     o
 }
 
-fn gc_bin(h: *gc.Heap, a: Arg, b: Arg, size: fn(Num, Num) -> u64, op: fn([]u64, Num, Num) -> Num) -> Gc<Big> uses gc {
+fn gc_bin(h: *gc.Heap, a: Arg, b: Arg, size: fn(Num, Num) -> u64, op: fn([]u64, Num, Num) -> Num) -> Gc<Big> {
     var x: u64 = 0;
     var y: u64 = 0;
     let o = new_big(h, size(a.num(&x), b.num(&y)));
     set(o, op(o.d, a.num(&x), b.num(&y)))
 }
 
-pub fn gc_add(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, add_size, add_into) }
-pub fn gc_sub(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, add_size, sub_into) }
-pub fn gc_mul(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, mul_size, mul_into) }
-pub fn gc_and(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, bitop_size, and_into) }
-pub fn gc_or(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, bitop_size, or_into) }
-pub fn gc_xor(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> uses gc { gc_bin(h, a, b, bitop_size, xor_into) }
+pub fn gc_add(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, add_size, add_into) }
+pub fn gc_sub(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, add_size, sub_into) }
+pub fn gc_mul(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, mul_size, mul_into) }
+pub fn gc_and(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, and_into) }
+pub fn gc_or(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, or_into) }
+pub fn gc_xor(h: *gc.Heap, a: Arg, b: Arg) -> Gc<Big> { gc_bin(h, a, b, bitop_size, xor_into) }
 
-pub fn gc_not(h: *gc.Heap, a: Arg) -> Gc<Big> uses gc {
+pub fn gc_not(h: *gc.Heap, a: Arg) -> Gc<Big> {
     var x: u64 = 0;
     let o = new_big(h, not_size(a.num(&x)));
     set(o, not_into(o.d, a.num(&x)))
 }
 
-pub fn gc_neg(h: *gc.Heap, a: Arg) -> Gc<Big> uses gc {
+pub fn gc_neg(h: *gc.Heap, a: Arg) -> Gc<Big> {
     var x: u64 = 0;
     let n = a.num(&x).d.len;
     let o = new_big(h, n);
@@ -1158,20 +1159,20 @@ pub fn gc_neg(h: *gc.Heap, a: Arg) -> Gc<Big> uses gc {
     set(o, neg(Num { neg: v.neg, d: o.d[0..n] }))
 }
 
-pub fn gc_shl(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> uses gc {
+pub fn gc_shl(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> {
     var x: u64 = 0;
     let o = new_big(h, shl_size(a.num(&x), n));
     set(o, shl_into(o.d, a.num(&x), n))
 }
 
-pub fn gc_shr(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> uses gc {
+pub fn gc_shr(h: *gc.Heap, a: Arg, n: u64) -> Gc<Big> {
     var x: u64 = 0;
     let o = new_big(h, shr_size(a.num(&x), n));
     set(o, shr_into(o.d, a.num(&x), n))
 }
 
 /// a ** e (panics if the size does not fit a u64).
-pub fn gc_pow(h: *gc.Heap, a: Arg, e: u64) -> Gc<Big> uses gc {
+pub fn gc_pow(h: *gc.Heap, a: Arg, e: u64) -> Gc<Big> {
     var x: u64 = 0;
     let Some(n) = pow_size(a.num(&x), e) else { fail("std.bigint: pow result too large\n"); return new_big(h, 0); };
     let o = new_big(h, n);
@@ -1179,7 +1180,7 @@ pub fn gc_pow(h: *gc.Heap, a: Arg, e: u64) -> Gc<Big> uses gc {
 }
 
 /// (quotient, remainder) or None if b is zero; see `divmod_into`.
-pub fn gc_divmod(h: *gc.Heap, a: Arg, b: Arg, floor: bool) -> ?(Gc<Big>, Gc<Big>) uses gc {
+pub fn gc_divmod(h: *gc.Heap, a: Arg, b: Arg, floor: bool) -> ?(Gc<Big>, Gc<Big>) {
     var x: u64 = 0;
     var y: u64 = 0;
     if b.num(&y).d.len == 0 { return None; }
@@ -1190,20 +1191,20 @@ pub fn gc_divmod(h: *gc.Heap, a: Arg, b: Arg, floor: bool) -> ?(Gc<Big>, Gc<Big>
 }
 
 /// The integer part of x, or None for inf and nan.
-pub fn gc_from_f64(h: *gc.Heap, x: f64) -> ?Gc<Big> uses gc {
+pub fn gc_from_f64(h: *gc.Heap, x: f64) -> ?Gc<Big> {
     let o = new_big(h, f64_size(x));
     let Some(r) = from_f64_into(o.d, x) else { return None; };
     Some(set(o, r))
 }
 
 /// Parse digits (see `parse_into`).
-pub fn gc_parse(h: *gc.Heap, s: str, radix: u32) -> ?Gc<Big> uses gc {
+pub fn gc_parse(h: *gc.Heap, s: str, radix: u32) -> ?Gc<Big> {
     let o = new_big(h, parse_size(s.len, radix));
     let Some(r) = parse_into(o.d, s, radix) else { return None; };
     Some(set(o, r))
 }
 
-pub fn gc_of_i64(h: *gc.Heap, x: i64) -> Gc<Big> uses gc {
+pub fn gc_of_i64(h: *gc.Heap, x: i64) -> Gc<Big> {
     let o = new_big(h, 1);
     set(o, from_i64(o.d, x))
 }

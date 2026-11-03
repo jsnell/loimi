@@ -4,6 +4,7 @@ import std.mem;
 import std.text;
 import std.hash;
 import std.num;
+import std.dict;
 import big;
 import vm.{Proto};
 
@@ -13,11 +14,9 @@ pub object Str { hash: u64, data: [u8] }
 pub object Arr { items: [Value] }
 pub object List { len: u64, arr: Gc<Arr> }
 pub object Tuple { items: [Value] }
-/// Index table of a dict: -1 empty, -2 deleted, else an entry number.
-pub object Idx { s: [i32] }
-/// An insertion-ordered dict (CPython's compact layout): `ent` holds
-/// key, value pairs in insertion order; deleted keys are `Undef`.
-pub object Dict { len: u64, used: u64, mask: u64, keyver: u64, idx: Gc<Idx>, ent: Gc<Arr> }
+/// An insertion-ordered dict: std.dict's (CPython's compact layout).
+/// Entry numbers are stable until a resize, which bumps `version`.
+pub type Dict = dict.Dict<Value, Value>;
 /// An instance of a user class (exceptions too).
 pub object Inst { cls: Gc<Box>, dict: Gc<Dict> }
 pub object Func {
@@ -187,19 +186,7 @@ pub fn is_kind(v: Value, k: u32) -> bool {
 
 // ── dicts ───────────────────────────────────────────────────────────
 
-const EMPTY: i32 = -1;
-const DELETED: i32 = -2;
-
-pub fn new_dict(h: *gc.Heap, n: u64) -> Gc<Dict> {
-    var sz: u64 = 8;
-    while sz * 2 < n * 3 { sz *= 2; }
-    let idx = new(h, Idx {}, sz);
-    for i in 0..sz { idx.s[i] = EMPTY; }
-    let cap = (sz * 2) / 3;
-    let ent = new(h, Arr {}, cap * 2);
-    for i in 0..cap * 2 { ent.items[i] = Value.Undef; }
-    new(h, Dict { len: 0, used: 0, mask: sz - 1, keyver: 0, idx: idx, ent: ent })
-}
+pub fn new_dict(h: *gc.Heap, n: u64) -> Gc<Dict> { Dict.new(h, n) }
 
 /// Hash for builtin key types; None for unhashable values and for
 /// instances (which hash by identity: the caller decides).
@@ -270,14 +257,9 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
         (Dict(x), Dict(y)) => {
             if x.len != y.len { return false; }
             var i: u64 = 0;
-            while i < x.used {
-                let k = x.ent.items[2 * i];
-                if k != Value.Undef {
-                    let Some(hv) = hash_of(k) else { return false; };
-                    let Some(v) = dict_get(y, k, hv) else { return false; };
-                    if !eq_builtin(x.ent.items[2 * i + 1], v) { return false; }
-                }
-                i += 1;
+            while let Some(e) = x.next(&i) {
+                let Some(v) = dict_get(y, x.key(e), x.hash_at(e)) else { return false; };
+                if !eq_builtin(x.value(e), v) { return false; }
             }
             true
         }
@@ -288,13 +270,8 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
                 let dy = y.dict.unwrap();
                 if dx.len != dy.len { return false; }
                 var i: u64 = 0;
-                while i < dx.used {
-                    let k = dx.ent.items[2 * i];
-                    if k != Value.Undef {
-                        let Some(hv) = hash_of(k) else { return false; };
-                        if dict_get(dy, k, hv).is_none() { return false; }
-                    }
-                    i += 1;
+                while let Some(e) = dx.next(&i) {
+                    if dict_get(dy, dx.key(e), dx.hash_at(e)).is_none() { return false; }
                 }
                 return true;
             }
@@ -308,196 +285,71 @@ pub fn eq_builtin(a: Value, b: Value) -> bool {
 
 /// Entry number of `key` in `d`, if present.
 pub fn dict_find(d: Gc<Dict>, key: Value, hv: u64) -> ?u64 {
-    var i = hv & d.mask;
-    var perturb = hv;
-    loop {
-        let ix = d.idx.s[i];
-        if ix == EMPTY { return None; }
-        if ix >= 0 {
-            let k = d.ent.items[2 * (ix as u64)];
-            if k == key or eq_builtin(k, key) { return Some(ix as u64); }
-        }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
+    d.find_by(hv, |k| k == key or eq_builtin(k, key))
 }
 
 /// Fast path for interned attribute names: pointer comparison first.
+#[inline]
 pub fn dict_find_str(d: Gc<Dict>, key: Gc<Str>) -> ?u64 {
-    let hv = str_hash(key);
-    var i = hv & d.mask;
-    var perturb = hv;
     let kv = Value.Str(key);
-    loop {
-        let ix = d.idx.s[i];
-        if ix == EMPTY { return None; }
-        if ix >= 0 {
-            let k = d.ent.items[2 * (ix as u64)];
-            if k == kv { return Some(ix as u64); }
-            if let Str(ks) = k and str_eq(ks, key) { return Some(ix as u64); }
-        }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
+    d.find_by(str_hash(key), |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    })
 }
 
-/// Append `key` (an interned name) with `v` if it is not present and the
-/// dict has room; false (nothing done) otherwise.
+/// Append `key` (an interned name with its hash computed) with `v` if it
+/// is not present and the dict has room; false (nothing done) otherwise.
 pub fn dict_append_new(d: Gc<Dict>, key: Gc<Str>, v: Value) -> bool {
-    if (d.used + 1) * 2 > d.ent.items.len { return false; }
     let hv = key.hash;
     if hv == 0 { return false; }
-    var i = hv & d.mask;
-    var perturb = hv;
     let kv = Value.Str(key);
-    var slot: u64 = 0xffffffffffffffff;
-    loop {
-        let ix = d.idx.s[i];
-        if ix == EMPTY { if slot == 0xffffffffffffffff { slot = i; } break; }
-        if ix == DELETED { if slot == 0xffffffffffffffff { slot = i; } }
-        else {
-            let k = d.ent.items[2 * (ix as u64)];
-            if k == kv { return false; }
-            if let Str(ks) = k and str_eq(ks, key) { return false; }
-        }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
-    let e = d.used;
-    d.ent.items[2 * e] = kv;
-    d.ent.items[2 * e + 1] = v;
-    d.idx.s[slot] = e as i32;
-    d.used += 1;
-    d.len += 1;
-    d.keyver += 1;
-    true
+    d.try_add_by(hv, kv, v, |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    }).is_some()
 }
 
 pub fn dict_get(d: Gc<Dict>, key: Value, hv: u64) -> ?Value {
     let Some(e) = dict_find(d, key, hv) else { return None; };
-    Some(d.ent.items[2 * e + 1])
+    Some(d.value(e))
 }
 
 pub fn dict_get_str(d: Gc<Dict>, key: Gc<Str>) -> ?Value {
     let Some(e) = dict_find_str(d, key) else { return None; };
-    Some(d.ent.items[2 * e + 1])
-}
-
-fn dict_insert_slot(d: Gc<Dict>, hv: u64, e: u64) {
-    var i = hv & d.mask;
-    var perturb = hv;
-    loop {
-        if d.idx.s[i] < 0 { d.idx.s[i] = e as i32; return; }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
-}
-
-fn dict_resize(h: *gc.Heap, d: Gc<Dict>, n: u64) {
-    var sz: u64 = 8;
-    while sz * 2 < n * 3 { sz *= 2; }
-    let idx = new(h, Idx {}, sz);
-    for i in 0..sz { idx.s[i] = EMPTY; }
-    let cap = (sz * 2) / 3;
-    let ent = new(h, Arr {}, cap * 2);
-    for i in 0..cap * 2 { ent.items[i] = Value.Undef; }
-    let old = d.ent;
-    let oldn = d.used;
-    d.idx = idx;
-    d.ent = ent;
-    d.mask = sz - 1;
-    var j: u64 = 0;
-    for i in 0..oldn {
-        let k = old.items[2 * i];
-        if k != Value.Undef {
-            ent.items[2 * j] = k;
-            ent.items[2 * j + 1] = old.items[2 * i + 1];
-            dict_insert_slot(d, hash_of(k) ?? hash.mix(k as u64), j);
-            j += 1;
-        }
-    }
-    d.used = j;
-    d.keyver += 1;
+    Some(d.value(e))
 }
 
 pub fn dict_set(h: *gc.Heap, d: Gc<Dict>, key: Value, hv: u64, v: Value) {
-    if let Some(e) = dict_find(d, key, hv) {
-        d.ent.items[2 * e + 1] = v;
-        return;
-    }
-    if d.used * 2 >= d.ent.items.len { dict_resize(h, d, d.len + 1); }
-    let e = d.used;
-    d.ent.items[2 * e] = key;
-    d.ent.items[2 * e + 1] = v;
-    d.used += 1;
-    d.len += 1;
-    d.keyver += 1;
-    dict_insert_slot(d, hv, e);
+    d.put_by(h, hv, key, v, |k| k == key or eq_builtin(k, key));
 }
 
 pub fn dict_set_str(h: *gc.Heap, d: Gc<Dict>, key: Gc<Str>, v: Value) {
-    if let Some(e) = dict_find_str(d, key) {
-        d.ent.items[2 * e + 1] = v;
-        return;
-    }
-    dict_set(h, d, Value.Str(key), str_hash(key), v);
+    let kv = Value.Str(key);
+    d.put_by(h, str_hash(key), kv, v, |k| -> bool {
+        if k == kv { return true; }
+        if let Str(ks) = k { return str_eq(ks, key); }
+        false
+    });
 }
 
 pub fn dict_del(d: Gc<Dict>, key: Value, hv: u64) -> bool {
-    var i = hv & d.mask;
-    var perturb = hv;
-    loop {
-        let ix = d.idx.s[i];
-        if ix == EMPTY { return false; }
-        if ix >= 0 {
-            let k = d.ent.items[2 * (ix as u64)];
-            if k == key or eq_builtin(k, key) {
-                d.idx.s[i] = DELETED;
-                d.ent.items[2 * (ix as u64)] = Value.Undef;
-                d.ent.items[2 * (ix as u64) + 1] = Value.Undef;
-                d.len -= 1;
-                d.keyver += 1;
-                return true;
-            }
-        }
-        perturb = perturb >> 5;
-        i = (i * 5 + 1 + perturb) & d.mask;
-    }
+    let Some(e) = dict_find(d, key, hv) else { return false; };
+    d.remove_at(e);
+    true
 }
 
-pub fn dict_clear(h: *gc.Heap, d: Gc<Dict>) {
-    let n = new_dict(h, 0);
-    d.idx = n.idx;
-    d.ent = n.ent;
-    d.mask = n.mask;
-    d.len = 0;
-    d.used = 0;
-    d.keyver += 1;
-}
+pub fn dict_clear(h: *gc.Heap, d: Gc<Dict>) { d.clear(); }
 
-pub fn dict_copy(h: *gc.Heap, d: Gc<Dict>) -> Gc<Dict> {
-    let r = new_dict(h, d.len);
-    var i: u64 = 0;
-    while i < d.used {
-        let k = d.ent.items[2 * i];
-        if k != Value.Undef { dict_set(h, r, k, hash_of(k) ?? hash.mix(k as u64), d.ent.items[2 * i + 1]); }
-        i += 1;
-    }
-    r
-}
+pub fn dict_copy(h: *gc.Heap, d: Gc<Dict>) -> Gc<Dict> { d.copy(h) }
 
 /// Next live entry at or after `*i`.
-pub fn dict_next(d: Gc<Dict>, i: *u64) -> ?u64 {
-    while *i < d.used {
-        let e = *i;
-        *i += 1;
-        if d.ent.items[2 * e] != Value.Undef { return Some(e); }
-    }
-    None
-}
+pub fn dict_next(d: Gc<Dict>, i: *u64) -> ?u64 { d.next(i) }
 
-pub fn dict_key(d: Gc<Dict>, e: u64) -> Value { d.ent.items[2 * e] }
-pub fn dict_val(d: Gc<Dict>, e: u64) -> Value { d.ent.items[2 * e + 1] }
+pub fn dict_key(d: Gc<Dict>, e: u64) -> Value { d.key(e) }
+pub fn dict_val(d: Gc<Dict>, e: u64) -> Value { d.value(e) }
 
 // ── numbers ─────────────────────────────────────────────────────────
 

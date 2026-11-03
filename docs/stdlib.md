@@ -16,7 +16,8 @@ says so. Some modules are design only; their sections say so at the top.
 | `std.mem` | built | `std/mem.lm` |
 | `std.hash`, `std.map` | built (`HashMap` only) | `std/hash.lm`, `std/map.lm` |
 | `std.text` | built (`StrBuf` with `{}` formatting, `Interner`, small helpers) | `std/text.lm` |
-| `std.num` | built (no `BigInt`) | `std/num.lm` |
+| `std.num` | built | `std/num.lm` |
+| `std.bigint` | built (no subquadratic division) | `std/bigint.lm` |
 | `std.io`, `std.os` | built (minimal) | `std/io.lm`, `std/os.lm` |
 | `std.lex` | built (a cursor toolkit, no generator) | `std/lex.lm` |
 | `std.parse` | built (`Pratt`, `Parser`; no `TokenStream`) | `std/parse.lm` |
@@ -272,10 +273,163 @@ and validation, and case mapping.
 
 ### Design (not built)
 
-`BigInt` with a small-int fast path (Python- and Ruby-style integers);
 Ryu formatting and Eisel-Lemire parsing (snprintf and strtod are used
 instead); binary literals, digit separators and per-language literal
 configuration.
+
+## `std.bigint`
+
+`std/bigint.lm`: arbitrary-precision integers with Python's semantics
+(floor and truncating division, infinite two's complement for bitwise
+operations on negative numbers, correctly rounded conversion to `f64`,
+Python's `hash`). Tested by `tests/test/bigint.lm` and by a differential
+test against CPython (`tests/bigint/diff.py`, run by `cargo test`
+as `bigint_vs_python`: 3000 random cases, and 1000 more collecting
+between the steps of the GC operations; longer runs by hand).
+
+**Representation.** A magnitude of 64-bit limbs, least significant
+first, normalized (no zero limb at the top; zero has no limbs), and a
+sign. Limbs are `u64` because `a.mul_wide(b)` and `hi.div_wide(lo, d)`
+(`std.core`) give the 128-bit products and quotients that 64-bit limbs
+need; that makes multiplication about four times the work per
+instruction of 32-bit limbs (CPython's are 30 bits).
+
+The small case is the interpreter's: an unboxed integer in its value
+type, with overflow checks (`num.add_overflow`, `x.mul_checked(y)`)
+sending it here. std.bigint handles only the big case, through three
+layers over one representation:
+
+- **`Num`, a view**: `struct Num { neg: bool, d: []u64 }`, limbs that
+  someone else owns. Every operation reads `Num`s and writes its result
+  into a buffer the caller provides, sized by a matching function, and
+  returns the result as a `Num` over the start of that buffer:
+  `add_into(out, a, b)` with `add_size(a, b)` limbs, `sub_into`,
+  `mul_into` (`mul_size`), `divmod_into(q, r, a, b, floor)` (`quot_size`,
+  `rem_size`; None for a zero divisor; `floor` rounds the quotient down
+  and gives the remainder the divisor's sign, Python's `//` and `%` and
+  Scheme's `floor/`, else it truncates, C's and Scheme's `truncate/`),
+  `shl_into` / `shr_into` (arithmetic: `-1 >> n` is -1), `and_into`,
+  `or_into`, `xor_into` (`bitop_size`), `not_into`, `pow_into`
+  (`pow_size -> ?u64`, None when the size overflows), `from_i64`,
+  `from_u64` (one limb), `from_f64_into` (`f64_size`, truncates; None
+  for inf and nan), `parse_into(out, digits, radix)` (`parse_size`).
+  Views need no buffer: `neg`, `abs`, `cmp`, `cmp_abs`, `eq`, `sign`,
+  `is_zero`, `is_odd`, `bit_length`, `to_i64` / `to_u64 -> ?..`,
+  `to_u64_wrapping`, `to_f64` (nearest, ties to even; ±inf beyond the
+  range), `hash_py` and `hash_i64` (CPython's `hash` of an int: modulo
+  2^61 - 1 with the sign, -1 becomes -2), `of_limbs(p, n, neg)` (a view
+  of limbs from elsewhere, normalized). Nothing allocates except scratch
+  space inside the algorithms, freed before returning, so a view of a GC
+  object's trailing array is a valid operand, and its limbs can be the
+  output.
+- **`BigInt`, owned**: `struct BigInt { neg: bool, d: mem.Vec<u64> }` on
+  the C heap. `bigint.add(a, b) -> BigInt` (and `sub`, `mul`, `divmod(a,
+  b, floor) -> ?(BigInt, BigInt)`, `pow`, `shl`, `shr`, `bit_and`,
+  `bit_or`, `bit_xor`, `bit_not`, `copy`, `of_i64`, `of_u64`, `of_f64`,
+  `parse(s, radix) -> ?BigInt`) take views, so owned and GC numbers mix;
+  `x.num()` is an owned number's view, `x.free()` releases it.
+- **`Big`, in the GC heap**: `object Big { neg: bool, len: u64, d: [u64] }`
+  (`len` limbs of `d` are the number: results are allocated at their
+  size bound). `gc_add(h, a, b) -> Gc<Big>` (and `gc_sub`, `gc_mul`,
+  `gc_divmod`, `gc_pow`, `gc_shl`, `gc_shr`, `gc_and`, `gc_or`,
+  `gc_xor`, `gc_not`, `gc_neg`, `gc_copy`, `gc_of_i64`, `gc_from_f64`,
+  `gc_parse`) take `Arg`s, `enum Arg { Small(i64), Ref(Gc<Big>) }`, so
+  a small operand needs no object. `b.num()` is a `Big`'s view. Allocating
+  does not collect (collections run at the interpreter's safepoints), so
+  these have no effect. An interpreter can store `Gc<Big>` in its own
+  objects (Python's `Box.big`) or as a `value` variant's payload.
+
+Formatting: `bigint.write(b, x, radix)` appends to a `text.StrBuf`
+(radix 2 to 36, lowercase, `-` for negatives, no prefix);
+`parse_into` takes digits only (no sign, prefix, spaces or underscores:
+the language's syntax is the caller's).
+
+Algorithms: schoolbook multiplication, Karatsuba from `KARATSUBA` (32)
+limbs (an unbalanced product is cut into balanced pieces), Knuth's
+algorithm D for division (one `div_wide` per quotient limb), left to
+right binary powering, power-of-two radixes by bit extraction, other
+radixes by dividing out the largest power of the radix that fits a limb
+up to `DC_LIMBS` (30) limbs and above that divide and conquer (split by
+radix^(k·2^i), the halves formatted recursively, the low ones padded with
+zeros), parsing by multiplying in a limb's worth of digits at a time.
+
+<!-- snippet: run "93326215443944152681699238856266700490715968264381621468592963895217599993229915608941463976156518286253697920827223758251185210916864000000000000000000000000" "-ff" -->
+```loimi
+import std.io;
+import std.text;
+import std.bigint;
+import std.bigint.{BigInt};
+
+fn main() {
+    var f = bigint.of_i64(1);
+    var one: [u64; 1] = [0; 1];
+    for i in 2..101 {
+        // A small factor as a view of one limb on the stack.
+        let g = bigint.mul(f.num(), bigint.from_i64(one[0..1], i));
+        f.free();
+        f = g;
+    }
+    var b = text.StrBuf.new();
+    bigint.write(&b, f.num(), 10);          // 100!
+    b.push(' ');
+    var m = bigint.of_i64(-255);
+    bigint.write(&b, m.num(), 16);
+    io.println(b.as_str());
+    f.free(); m.free(); b.free();
+}
+```
+
+In an interpreter, the overflow of a small-int fast path goes to the GC
+layer with the operands as `Arg`s, and a result that fits the small case
+again goes back to it (examples/python/big.lm is this, with an i64
+"medium" box in between):
+
+<!-- snippet: check
+import std.gc;
+import std.bigint;
+import std.bigint.{Arg, Big};
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Big(Gc<Big>), Nil }
+{snippet}
+fn main() {}
+-->
+```loimi
+fn arg(v: Value) -> Arg {
+    match v { Int(i) => Arg.Small(i as i64), Big(b) => Arg.Ref(b), _ => Arg.Small(0) }
+}
+
+fn add(h: *gc.Heap, a: Value, b: Value) -> Value {
+    if let (Int(x), Int(y)) = (a, b) {
+        if let Some(r) = x.add_checked(y) { return Value.Int(r); }
+    }
+    let r = bigint.gc_add(h, arg(a), arg(b));
+    if let Some(x) = bigint.to_i64(r.num()) {
+        if x >= -2147483648 and x <= 2147483647 { return Value.Int(x as i32); }
+    }
+    Value.Big(r)
+}
+```
+
+Performance (`bench/bigint/bench.lm` against the same work in
+`bench/bigint/bench.py` on CPython 3.13, best of 5, one machine):
+
+| | std.bigint | CPython 3.13 |
+|---|---|---|
+| factorial(5000), a running product | 1.8 ms | 4.9 ms |
+| fib(100000) by fast doubling | 0.58 ms | 1.7 ms |
+| `str` of a 99,722-digit number | 20 ms | 33 ms |
+| `int` of it | 9.7 ms | 17 ms |
+| product, 99,722 by 20,899 digits | 2.0 ms | 7.5 ms |
+| `divmod`, 120,621 by 20,899 digits | 6.4 ms | 15 ms |
+
+### Design (not built)
+
+Subquadratic division (Burnikel-Ziegler or Newton) and with it
+subquadratic radix conversion (formatting is divide and conquer over
+schoolbook division, so still quadratic; CPython 3.12+ converts huge
+numbers with `_pylong`, which is asymptotically faster), divide-and-conquer
+parsing, a squaring routine, FFT multiplication, `gcd`, integer square
+root, correctly rounded `a / b` to `f64`, and in-place operations on an
+owned `BigInt` (each operation returns a new one).
 
 ## `std.io` and `std.os`
 

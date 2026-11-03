@@ -353,19 +353,12 @@ pub fn float_to_int(c: *Ctx, x: f64) -> Result<Value, Value> {
 
 pub fn write_radix(h: *gc.Heap, b: *text.StrBuf, v: Value, radix: u64, upper: bool) {
     // v >= 0
-    var digits: mem.Vec<u8> = mem.Vec.new();
-    var x = v;
-    if let Int(0) = x { b.push('0'); return; }
-    while true {
-        if let Int(0) = x { break; }
-        let Some((q, r)) = big.divmod(h, x, Value.Int(radix as i32)) else { break; };
-        let d = (value.as_i64(r) ?? 0) as u8;
-        digits.push(if d < 10 { '0' + d } else if upper { 'A' + d - 10 } else { 'a' + d - 10 });
-        x = q;
+    let start = b.len();
+    big.write_radix(b, v, radix as u32);
+    if upper {
+        let p = b.bytes.ptr;
+        for i in start..b.len() { if p[i] >= 'a' and p[i] <= 'z' { p[i] = p[i] - 32; } }
     }
-    var i = digits.len;
-    while i > 0 { i -= 1; b.push(digits.at(i)); }
-    digits.free();
 }
 
 /// The items of any iterable.
@@ -1495,13 +1488,10 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         DPopitem => {
             let Dict(d) = selfv else { trap() };
             if d.len == 0 { return Err(exc(c, E_KEY, "popitem(): dictionary is empty")); }
-            var e = d.used;
-            while e > 0 { e -= 1; if value.dict_key(d, e) != Value.Undef { break; } }
-            let k = value.dict_key(d, e);
             let t = value.new_tuple(&c.heap, 2);
+            let (k, v) = d.pop_last().unwrap();
             t.items[0] = k;
-            t.items[1] = value.dict_val(d, e);
-            value.dict_del(d, k, ops.hash_key(c, k)?);
+            t.items[1] = v;
             Ok(Value.Tuple(t))
         }
         DFromkeys => {
