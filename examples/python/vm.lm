@@ -264,7 +264,9 @@ pub vm Py {
             match callee {
                 Func(f) => {
                     let p = f.proto;
+                    builtins.count(330);
                     if p.simple == nn as u32 and kw == Nil { push_frame(f, regs + w, regs + b, flags) }
+                    builtins.count(331);
                     if !ensure(regs + w + p.nregs as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                     ops.bind_args(ctx, f, regs + w, nn, kw)?;
                     if (p.flags & P_GEN) != 0 {
@@ -293,6 +295,7 @@ pub vm Py {
                 }
                 Obj(o) => {
                     if o.kind == K_BOUND {
+                        builtins.count(332);
                         if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
@@ -302,6 +305,7 @@ pub vm Py {
                         continue;
                     }
                     if o.kind == K_CLASS {
+                        builtins.count(333);
                         if o.n != 0 {
                             if kw == Nil and nn == 1 and value.is_kind(regs[w], K_GEN) and o.n < 1000 {
                                 let t = (o.n - 1) as u64;
@@ -851,6 +855,8 @@ pub vm Py {
                     (Float(x), Int(j)) => { let y = j as f64; dst = Bool(test); next }
                     _ => {}
                 }
+                let q = ops.identity_eq(ctx, opn, a, b);
+                if q != 2 { dst = Bool(q == 1); next }
                 if let Some(f) = ops.cmp_method(ctx, opn, a, b) {
                     if let Inst(_) = a { call2(f, a, b, dst.raw) }
                     call2(f, b, a, dst.raw)
@@ -920,6 +926,8 @@ pub vm Py {
                     (Float(x), Int(j)) => { let y = j as f64; branch(test, then.target) }
                     _ => {}
                 }
+                let q = ops.identity_eq(ctx, opn, a, b);
+                if q != 2 { branch(q == 1, then.target) }
                 branch(ops.compare(ctx, opn, a, b)?, then.target)
             }
         }

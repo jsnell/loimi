@@ -79,6 +79,24 @@ pub fn cmp_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
     None
 }
 
+/// `a == b` / `a != b` when an instance without __eq__/__ne__ is
+/// involved: identity. 1 true, 0 false, 2 not decided here.
+pub fn identity_eq(c: *Ctx, op: u32, a: Value, b: Value) -> u32 {
+    if op != C_EQ and op != C_NE { return 2; }
+    var inst = false;
+    if let Inst(i) = a {
+        inst = true;
+        if class_lookup(i.cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(i.cls, dn(c, DN_CMP + C_NE as u64)).is_some() { return 2; }
+    }
+    if let Inst(i) = b {
+        inst = true;
+        if class_lookup(i.cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(i.cls, dn(c, DN_CMP + C_NE as u64)).is_some() { return 2; }
+    }
+    if !inst { return 2; }
+    let same = a == b;
+    if (op == C_EQ) == same { 1 } else { 0 }
+}
+
 pub const C_LT: u32 = 0;
 pub const C_LE: u32 = 1;
 pub const C_GT: u32 = 2;

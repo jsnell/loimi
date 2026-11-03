@@ -63,6 +63,7 @@ optimization work) was at 0.68x CPython's time by geomean.
 | Mixed int/float arithmetic and comparisons handled at the top of the cold block, before the general (re-entrant, synced) path | part of the line above |
 | Inline caches for attributes of classes and modules (`Strength.REQUIRED`, `math.sqrt`), for static and class methods called through the class, and `super()` methods returned unbound; two-entry attribute and method caches | deltablue 0.77 → 0.60 s, hexiom 0.68 → 0.59 s |
 | `in` / `not in` against dicts, sets, lists and tuples of builtin values without a call | hexiom 0.55 → 0.53 s |
+| `==`/`!=` with an instance whose class defines neither `__eq__` nor `__ne__` decided by identity at the top of the cold block | deltablue's 538K slow comparisons gone; time within noise |
 | `x is None` compiled to one compare-and-branch op; `return local` without a MOVE | within noise |
 | Generator arguments of consuming builtins (`tuple(g)`, `sum(g)`, `"".join(g)`, ...) collected by a function written in Python (a prelude), so the generator runs in the loop rather than one nested run per item | `tuple(genexp)` micro now equal to CPython; nqueens within noise |
 | GC growth 300% / 8 MiB minimum (`set_growth`) | raytrace did 448 collections (55 ms); a few % |
