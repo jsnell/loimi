@@ -1,0 +1,41 @@
+// std.map is `#![safe]`: its safe methods keep a map valid. After
+// `free`, a HashMap or OrderedMap is empty and usable again (it points at
+// a shared zeroed table and allocates on the next insertion), and freeing
+// twice is fine. An entry index that is not live panics.
+import std.io;
+import std.map;
+
+fn main() {
+    var h: map.HashMap<i64, i64> = map.HashMap.new();
+    for i in 0..100 { h.insert(i, i * 2); }
+    h.free();
+    io.print_int(h.len as i64);
+    io.print(" ");
+    io.print_int(if h.get(5).is_none() { 1 } else { 0 });
+    var it: u64 = 0;
+    io.print(if h.next(&it).is_none() { " none" } else { " some" });
+    h.remove(7);
+    h.clear();
+    h.free();
+    for i in 0..20 { h.insert(i, i + 1); }
+    io.print(" ");
+    io.print_int(h.get(19) ?? -1);
+    h.free();
+
+    var o: map.OrderedMap<i64, i64> = map.OrderedMap.new();
+    for i in 0..50 { o.insert(i, i); }
+    o.free();
+    o.free();
+    io.print(" ");
+    io.print_int(if o.get(3).is_none() and !o.is_live(0) and o.pop_last().is_none() { 1 } else { 0 });
+    o.clear();
+    for i in 0..30 { o.insert(i, i * 3); }
+    io.print(" ");
+    io.print_int(o.get(29) ?? -1);
+    io.println("");
+    o.remove(4);
+    o.entry(4);
+}
+// expect: 0 1 none 20 1 87
+// expect-exit: 134
+// expect-stderr: map.OrderedMap: not a live entry index
