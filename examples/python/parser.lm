@@ -584,7 +584,7 @@ fn P.factor(p: *P) -> *Expr {
             let x = p.factor();
             // Fold negative literals so that -2147483648 stays small.
             if let Int(v) = x.e { return p.mk(E.Int(0 - v), line); }
-            if let Float(v) = x.e { return p.mk(E.Float(0.0 - v), line); }
+            if let Float(v) = x.e { return p.mk(E.Float(-v), line); }
             return p.mk(E.Un(UnOp.Neg, x), line);
         }
         Plus => { p.bump(); return p.mk(E.Un(UnOp.Pos, p.factor()), line); }
@@ -876,7 +876,11 @@ fn P.fstring(p: *P, s: str, line: u32, parts: *mem.Vec<FPart>) {
     b.free();
 }
 
-fn P.sub_expr(p: *P, src: str, line: u32) -> *Expr {
+fn P.sub_expr(p: *P, src0: str, line: u32) -> *Expr {
+    // Replacement fields may start with spaces, which must not read as an indent.
+    var a: u64 = 0;
+    while a < src0.len and (src0[a] == ' ' or src0[a] == '\t') { a += 1; }
+    let src = src0[a..src0.len];
     var lx = Lexer.new(src, p.arena);
     lx.line = line;
     lx.run();

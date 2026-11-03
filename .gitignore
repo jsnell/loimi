@@ -27,3 +27,4 @@ __pycache__/
 /bench/python/install
 /bench/python/out
 examples/python/scratch/
+examples/python/out/

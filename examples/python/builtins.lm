@@ -97,6 +97,7 @@ pub enum B {
     IBitLength, FIsInteger, IConjugate,
     // generator
     GSend, GClose, GThrow,
+    PropSetter, PropGetter,
     // math
     MSqrt, MSin, MCos, MTan, MAsin, MAcos, MAtan, MAtan2, MExp, MLog, MLog10, MLog2, MPow, MFloor, MCeil, MFabs,
     MHypot, MIsnan, MIsinf, MIsfinite, MRadians, MDegrees, MGcd, MFactorial, MTrunc, MCopysign, MSinh, MCosh, MTanh,
@@ -224,6 +225,8 @@ pub fn setup(c: *Ctx) {
     meth(c, T_INT, "bit_length", B.IBitLength);
     meth(c, T_INT, "conjugate", B.IConjugate);
     meth(c, T_FLOAT, "is_integer", B.FIsInteger);
+    meth(c, T_PROPERTY, "setter", B.PropSetter);
+    meth(c, T_PROPERTY, "getter", B.PropGetter);
     meth(c, T_GEN, "send", B.GSend);
     meth(c, T_GEN, "close", B.GClose);
     meth(c, T_GEN, "throw", B.GThrow);
@@ -1452,8 +1455,9 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         DFromkeys => {
             let d = value.new_dict(&c.heap, 0);
-            let l = items_of(c, args[1])?;
-            let v = if np > 2 { args[2] } else { Value.Nil };
+            let off: u64 = if value.is_kind(args[0], K_CLASS) { 1 } else { 0 };
+            let l = items_of(c, args[off])?;
+            let v = if np > off + 1 { args[off + 1] } else { Value.Nil };
             for i in 0..l.len { ops.dict_put(c, d, l.arr.items[i], v)?; }
             Ok(Value.Dict(d))
         }
@@ -1549,6 +1553,13 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         GClose => { let Obj(g) = selfv else { trap() }; g.m = GEN_DONE; Ok(Value.Nil) }
         GThrow => Err(ops.make_exc(c, args[1])?),
+        PropSetter | PropGetter => {
+            let Obj(o) = selfv else { trap() };
+            let p = value.new_box(&c.heap, K_PROPERTY, 0);
+            p.a = if b == B.PropGetter { args[1] } else { o.a };
+            p.b = if b == B.PropSetter { args[1] } else { o.b };
+            Ok(Value.Obj(p))
+        }
         _ => module_call(c, b, args, n, kw),
     }
 }

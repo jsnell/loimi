@@ -1,0 +1,45 @@
+finally 0
+value: zero
+finally 1
+ZeroDivisionError: division by zero
+finally 2
+IndexError: list index out of range
+finally 3
+key error 'k' KeyError('k')
+finally 4
+ok
+MyError 42 code 42 ('code 42',)
+inner finally
+caught inner
+outer caught outer
+re-raising
+lookup KeyError('a')
+[0, 'f0', 'f1', 2, 'f2', 'f3']
+NameError: name 'undefined_name' is not defined
+TypeError: can only concatenate str (not "int") to str
+invalid literal for int() with base 10: 'xyz'
+stop
+11
+enter a
+body a
+exit a None
+enter swallow
+exit swallow ValueError
+enter b
+enter c
+exit c IndexError
+exit b IndexError
+propagated
+enter r
+exit r None
+5
+assert: math is broken
+from deep: bottom
+f1
+f2
+inner
+KeyError 'missing'
+pop from empty list
+'NoneType' object has no attribute 'foo'
+object of type 'int' has no len()
+['other ValueError', 'TypeError', 'KeyError']

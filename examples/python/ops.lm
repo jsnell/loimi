@@ -527,7 +527,10 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
     } else if npos > np {
         var b = text.StrBuf.new();
         b.push_str(f.proto.name);
-        b.fmt2("() takes {} positional arguments but {} were given", np, npos);
+        b.fmt("() takes {} positional argument", np);
+        if np != 1 { b.push('s'); }
+        b.fmt(" but {} ", npos);
+        b.push_str(if npos == 1 { "was given" } else { "were given" });
         args.free();
         return Err(exc_buf(c, E_TYPE, &b));
     }
@@ -586,7 +589,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
             } else {
                 var b = text.StrBuf.new();
                 b.push_str(f.proto.name);
-                b.push_str("() missing required positional argument: '");
+                b.push_str("() missing 1 required positional argument: '");
                 if let Str(pn) = p.pnames[i] { b.push_str(pn.data); }
                 b.push('\'');
                 return Err(exc_buf(c, E_TYPE, &b));
@@ -851,6 +854,18 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
         return float_arith(c, op, x, y);
     }
     match (a, b) {
+        (Str(_), _) => if op == O_ADD and !value.is_kind(b, K_NOTIMPL) {
+            if let Str(_) = b {} else if let Inst(_) = b {} else {
+                var m = text.StrBuf.new();
+                m.push_str("can only concatenate str (not \"");
+                m.push_str(type_name(c, b));
+                m.push_str("\") to str");
+                return Err(exc_buf(c, E_TYPE, &m));
+            }
+        } else {},
+        _ => {}
+    }
+    match (a, b) {
         (Str(x), Str(y)) => if op == O_ADD {
             let s = new(&c.heap, Str { hash: 0 }, x.data.len + y.data.len);
             mem.copy(s.data.ptr, x.data.ptr, x.data.len);
@@ -982,7 +997,9 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
         O_TRUEDIV => {
             let y = value.to_f64(b).unwrap();
             if y == 0.0 { return Err(zero_div(c, "division by zero")); }
-            Ok(Value.Float(value.to_f64(a).unwrap() / y))
+            // Exact quotient first, so that big multiples divide exactly.
+            let Some((q, r)) = big.divmod(h, a, b) else { return Err(zero_div(c, "division by zero")); };
+            Ok(Value.Float(value.to_f64(q).unwrap() + value.to_f64(r).unwrap() / y))
         }
         O_POW => {
             if big.is_neg(b) {
@@ -1171,6 +1188,10 @@ pub fn equal(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
         if let Float(f) = a { return Ok(f == f); }
         return Ok(true);
     }
+    if value.is_num(a) and value.is_num(b) {
+        let Some(r) = order(c, a, b)? else { return Ok(false); };
+        return Ok(r == 0);
+    }
     match (a, b) {
         (Inst(_), _) => {
             let args = [b];
@@ -1262,8 +1283,36 @@ pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
     Ok(hv)
 }
 
+/// Entry of an instance key whose class defines __eq__: probe calling it.
+fn dict_find_user(c: *Ctx, d: Gc<Dict>, k: Value, hv: u64) -> Result<?u64, Value> uses reenter {
+    var i = hv & d.mask;
+    var perturb = hv;
+    loop {
+        let ix = d.idx.s[i];
+        if ix == -1 { return Ok(None); }
+        if ix >= 0 {
+            let e = ix as u64;
+            let key = value.dict_key(d, e);
+            if key == k { return Ok(Some(e)); }
+            if let Inst(_) = key {
+                if equal(c, key, k)? { return Ok(Some(e)); }
+            }
+        }
+        perturb = perturb >> 5;
+        i = (i * 5 + 1 + perturb) & d.mask;
+    }
+}
+
+fn has_user_eq(c: *Ctx, k: Value) -> bool {
+    if let Inst(i) = k { return class_lookup(i.cls, vm.intern(c, "__eq__")).is_some(); }
+    false
+}
+
 pub fn dict_put(c: *Ctx, d: Gc<Dict>, k: Value, v: Value) -> Result<(), Value> uses reenter {
     let hv = hash_key(c, k)?;
+    if has_user_eq(c, k) {
+        if let Some(e) = dict_find_user(c, d, k, hv)? { d.ent.items[2 * e + 1] = v; return Ok(()); }
+    }
     value.dict_set(&c.heap, d, k, hv, v);
     Ok(())
 }
@@ -1271,6 +1320,10 @@ pub fn dict_put(c: *Ctx, d: Gc<Dict>, k: Value, v: Value) -> Result<(), Value> u
 pub fn dict_lookup(c: *Ctx, d: Gc<Dict>, k: Value) -> Result<?Value, Value> uses reenter {
     if let Str(s) = k { return Ok(value.dict_get_str(d, s)); }
     let hv = hash_key(c, k)?;
+    if has_user_eq(c, k) {
+        let Some(e) = dict_find_user(c, d, k, hv)? else { return Ok(None); };
+        return Ok(Some(value.dict_val(d, e)));
+    }
     Ok(value.dict_get(d, k, hv))
 }
 
@@ -1287,9 +1340,7 @@ pub fn new_set(c: *Ctx, frozen: bool) -> Value {
 
 pub fn set_add(c: *Ctx, s: Value, v: Value) -> Result<(), Value> uses reenter {
     let Obj(b) = s else { trap() };
-    let hv = hash_key(c, v)?;
-    value.dict_set(&c.heap, b.dict.unwrap(), v, hv, Value.Nil);
-    Ok(())
+    dict_put(c, b.dict.unwrap(), v, Value.Nil)
 }
 
 fn index_error(c: *Ctx, what: str) -> Value {

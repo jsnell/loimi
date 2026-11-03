@@ -330,7 +330,7 @@ pub vm Py {
 
     /// Resume generator `g`: on yield the value goes to `slot` and
     /// execution continues at `next_pc`; when it finishes, at `alt`.
-    fn resume(g: Gc<Box>, slot: *Value, alt: *u32) -> never {
+    fn resume(g: Gc<Box>, slot: *Value, cont: *u32, alt: *u32) -> never {
         if g.m == GEN_DONE { jump alt }
         if g.m == GEN_RUNNING { raise ops.exc(ctx, builtins.E_VALUE, "generator already executing") }
         let Func(f) = g.a else { trap() };
@@ -347,7 +347,7 @@ pub vm Py {
         nf.base = win;
         nf.k = p.consts.ptr;
         nf.proto = p;
-        nf.ret_pc = next_pc;
+        nf.ret_pc = cont;
         nf.ret_slot = slot;
         nf.alt_pc = alt;
         nf.flags = F_GEN;
@@ -897,7 +897,7 @@ pub vm Py {
                     _ => {}
                 }
             }
-            if b.kind == K_GEN { resume(b, regs + dst.raw, then.target) }
+            if b.kind == K_GEN { resume(b, regs + dst.raw, pc + 2, then.target) }
         }
         cold {
             gc_point();

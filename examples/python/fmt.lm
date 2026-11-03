@@ -52,7 +52,10 @@ pub fn write_str(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses r
                 let args = value.dict_get_str(i.dict, vm.intern(c, "args")) ?? Value.Nil;
                 if let Tuple(t) = args {
                     if t.items.len == 0 { return Ok(()); }
-                    if t.items.len == 1 { return write_str(c, b, t.items[0]); }
+                    if t.items.len == 1 {
+                        if ops.subclass(i.cls, c.excs[builtins.E_KEY].unwrap()) { return write_repr(c, b, t.items[0]); }
+                        return write_str(c, b, t.items[0]);
+                    }
                 }
                 return write_repr(c, b, args);
             }
