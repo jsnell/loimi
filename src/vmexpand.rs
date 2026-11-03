@@ -1327,6 +1327,105 @@ fn is_label_kind(v: &VmDecl, kind: &str) -> bool {
 ///
 /// `set_label` and `label` have the shapes `std.bc` takes as its patch
 /// and jump-threading functions.
+/// `Vm.accumulate(code, first_temp)` (vms with an `accumulator`): where an
+/// op writes a slot at or above `first_temp` that the next op (not a jump
+/// target) reads as a source of the same accumulator, and names in no
+/// other field, the first writes the accumulator instead and the second
+/// reads it (their variants, `vmacc`). The caller promises that such a
+/// slot is not read again before it is written (an operand stack
+/// temporary popped once). Runs on unverified words, before `verify`.
+/// `Vm.acc_variant(op, d, s)`: the variant of `op` with its result in the
+/// accumulator (d = 1) and source s (1-based, 0 for none) from one.
+fn generate_accumulate(v: &VmDecl, l: &VmLayout) -> String {
+    let n = &v.name.name;
+    let w = format!("u{}", l.word_bits);
+    let vis = if v.is_pub { "pub " } else { "" };
+    let mut s = String::new();
+    let opc = |name: &str| l.ops.iter().find(|o| o.name == name && o.parts.is_empty()).map(|o| o.opcode).unwrap();
+    let field = |op: u32, pi: usize, word: &str| {
+        let (_, bits, shift, signed) = l.ops[op as usize].fields[pi];
+        format!("({{ let __w = {word}; {} }} as u64)", decode_src(l.word_bits, bits, shift, signed))
+    };
+    let _ = writeln!(s, "{vis}fn {n}__acc_variant(op: {w}, d: u64, s: u64) -> {w} {{\n  let __k = d * 256 + s;\n  match op {{");
+    for a in &v.acc_ops {
+        let arms: Vec<String> = a.variants.iter().map(|(d, sv, name)| format!("{} => {}", (*d as usize) * 256 + sv, opc(name))).collect();
+        let _ = writeln!(s, "    {} => match __k {{ {}, _ => op }},", opc(&a.op), arms.join(", "));
+    }
+    let _ = writeln!(s, "    _ => op\n  }}\n}}");
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__accumulate(code: []{w}, first_temp: u64) {{\n\
+         \x20 let __n = code.len;\n\
+         \x20 if __n < 2 {{ return; }}\n\
+         \x20 let __tg = __extern_calloc(__n + 1, 1);\n\
+         \x20 let __d = __extern_calloc(__n + 1, 1);\n\
+         \x20 let __s = __extern_calloc(__n + 1, 1);\n\
+         \x20 var i: u64 = 0;\n\
+         \x20 while i < __n {{\n\
+         \x20   if let Some(__o) = {n}__label(code[i]) {{ let __t = (i as i64) + __o; if __t >= 0 and (__t as u64) <= __n {{ __tg[__t as u64] = 1; }} }}\n\
+         \x20   i += {n}__op_size(code[i]);\n\
+         \x20 }}\n\
+         \x20 i = 0;\n\
+         \x20 while i < __n {{\n\
+         \x20   let __j = i + {n}__op_size(code[i]);\n\
+         \x20   if __j < __n and __tg[__j] == 0 {{\n\
+         \x20     var __slot: u64 = 0;\n\
+         \x20     var __acc: u64 = 0;\n\
+         \x20     match {n}__opcode(code[i]) {{"
+    );
+    for a in &v.acc_ops {
+        if let Some((di, ai)) = a.dst {
+            let o = opc(&a.op);
+            let _ = writeln!(s, "      {o} => {{ __slot = {}; __acc = {}; }},", field(o, di, "code[i]"), ai + 1);
+        }
+    }
+    let _ = writeln!(
+        s,
+        "      _ => {{}}\n\
+         \x20     }}\n\
+         \x20     if __acc != 0 and __slot >= first_temp {{\n\
+         \x20       var __sel: u64 = 0;\n\
+         \x20       var __c: u64 = 0;\n\
+         \x20       match {n}__opcode(code[__j]) {{"
+    );
+    for a in &v.acc_ops {
+        let o = opc(&a.op);
+        let mut body = String::new();
+        for pi in 0..l.ops[o as usize].fields.len() {
+            if a.dst.map(|d| d.0) == Some(pi) {
+                continue;
+            }
+            let pick = match a.srcs.iter().position(|x| x.0 == pi) {
+                Some(si) => format!(" if __acc == {} {{ __sel = {}; }}", a.srcs[si].1 + 1, si + 1),
+                None => String::new(),
+            };
+            let _ = write!(body, "if {} == __slot {{ __c += 1;{pick} }} ", field(o, pi, "code[__j]"));
+        }
+        let _ = writeln!(s, "        {o} => {{ {body}}},");
+    }
+    let _ = writeln!(
+        s,
+        "        _ => {{}}\n\
+         \x20       }}\n\
+         \x20       if __sel != 0 and __c == 1 {{ __d[i] = 1; __s[__j] = __sel as u8; }}\n\
+         \x20     }}\n\
+         \x20   }}\n\
+         \x20   i = __j;\n\
+         \x20 }}\n\
+         \x20 i = 0;\n\
+         \x20 while i < __n {{\n\
+         \x20   let __sz = {n}__op_size(code[i]);\n\
+         \x20   if __d[i] != 0 or __s[i] != 0 {{ code[i] = {n}__with_opcode(code[i], {n}__acc_variant({n}__opcode(code[i]), __d[i] as u64, __s[i] as u64)); }}\n\
+         \x20   i += __sz;\n\
+         \x20 }}\n\
+         \x20 __extern_free(__tg);\n\
+         \x20 __extern_free(__d);\n\
+         \x20 __extern_free(__s);\n\
+         }}"
+    );
+    s
+}
+
 fn generate_labels(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
     let n = &v.name.name;
     let jw = maps_words(l, jit);
@@ -1451,7 +1550,7 @@ fn mark_lazy(v: &VmDecl, items: &mut [Item]) {
                     v.formats.iter().any(|f| f.fields.iter().any(|x| x.name.name != "op" && r == format!("{}_{}", f.name.name, x.name.name)))
                 });
                 let encoder = short.strip_prefix("encode_").is_some_and(|r| v.formats.iter().any(|f| r == f.name.name));
-                if setter || encoder {
+                if setter || encoder || short == "accumulate" || short == "acc_variant" {
                     f.attrs.list.push((LAZY_ATTR.to_string(), vec![], f.name.span));
                 }
             }
@@ -1727,6 +1826,10 @@ fn generate_disasm(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         let mut body = String::new();
         for (fi, (pname, bits, shift, signed)) in o.fields.iter().enumerate() {
             let kind = &o.kinds[fi];
+            if kind == crate::vmacc::ACC_KIND {
+                let _ = write!(body, "__out.push_str({}); ", str_lit(&format!(" {}", pname)));
+                continue;
+            }
             let decl = v.operands.iter().find(|k| k.name.name == *kind);
             let (pre, post) = match decl.and_then(|k| k.display.as_ref()) {
                 Some(d) => {
@@ -1951,6 +2054,13 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                     // The verifier's scratch arrays (see `c_externs`).
                     src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
                     externs = true;
+                }
+                if !v.accs.is_empty() {
+                    if !externs {
+                        src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
+                        externs = true;
+                    }
+                    src.push_str(&generate_accumulate(v, &l));
                 }
                 src.push_str(&generate_labels(v, &l, jit));
                 src.push_str(&generate_disasm(v, &l, jit));

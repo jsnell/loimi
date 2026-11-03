@@ -75,6 +75,29 @@ pub struct OpDecl {
     pub then: Option<Ident>,
     /// `stack(a b -- c)`: the op's stack effect (stack VMs).
     pub stack: Option<StackEffect>,
+    /// `#[accumulate]`: derive accumulator variants (see `vmacc`).
+    pub accumulate: bool,
+}
+
+/// `accumulator acc: T for k1, k2;`: a state register that holds one
+/// value between adjacent ops, in place of a slot of kinds k1, k2.
+#[derive(Clone, Debug)]
+pub struct AccDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub kinds: Vec<Ident>,
+}
+
+/// What `Vm.accumulate` needs to know of an `#[accumulate]` op: the
+/// operand (index) it writes and those it reads, each with the
+/// accumulator (index into `VmDecl.accs`) of its kind, and the variant
+/// per (result in the accumulator, source from it: operand index + 1, or 0).
+#[derive(Clone, Debug)]
+pub struct AccOp {
+    pub op: String,
+    pub dst: Option<(usize, usize)>,
+    pub srcs: Vec<(usize, usize)>,
+    pub variants: Vec<(bool, usize, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +165,11 @@ pub struct VmDecl {
     /// `stack_entry EXPR;`: the operand stack depth code starts with (an
     /// expression of the verify context; 0 if absent).
     pub stack_entry: Option<Expr>,
+    /// `accumulator` declarations, and the `#[accumulate]` ops' variants.
+    pub accs: Vec<AccDecl>,
+    /// `accumulate OP, OP;`: more ops to derive variants of.
+    pub acc_list: Vec<Ident>,
+    pub acc_ops: Vec<AccOp>,
     pub is_pub: bool,
 }
 

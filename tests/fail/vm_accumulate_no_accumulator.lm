@@ -1,0 +1,11 @@
+// error: `#[accumulate]` needs an `accumulator` declaration in the vm
+vm M {
+    state { pc: *u32, regs: *i64 }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    #[accumulate] op ADD(d: reg, a: reg, b: reg) : ABC { d = a + b; next }
+    op HALT() : ABC { exit 0 }
+    entry run(code: *u32, r: *i64) -> i64 { regs = r; jump code }
+}
+
+fn main() {}

@@ -1211,6 +1211,8 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     let n = t.code.len();
     let words = mem.alloc<u64>(n);
     t.code.copy_into(words.slice(n));
+    // Operand stack homes (slots from nlocals on) are popped once.
+    W.accumulate(words.slice(n), t.nlocals);
     let ks = mem.alloc<u64>(t.kvals.len + 1);
     for i in 0..t.kvals.len { ks[i] = t.kvals.at(i); }
     Ok(Compiled {

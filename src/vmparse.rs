@@ -32,6 +32,9 @@ impl Parser {
             verify_owner: None,
             checks: vec![],
             stack_entry: None,
+            accs: vec![],
+            acc_list: vec![],
+            acc_ops: vec![],
             is_pub,
         };
         // `inline for` variables replace every matching token in the body,
@@ -52,7 +55,8 @@ impl Parser {
                 "fn" => ("a vm function".into(), crate::parser::FN_ATTRS),
                 "super" => ("a `super`".into(), &["forward"]),
                 "on" => ("`on raise`".into(), &[]),
-                "operand" | "entry" | "op" => (format!("an `{}`", kw), &[]),
+                "op" => ("an `op`".into(), &["accumulate"]),
+                "operand" | "entry" => (format!("an `{}`", kw), &[]),
                 _ => (format!("a `{}`", kw), &[]),
             };
             crate::parser::check_attrs(&item_attrs, &what, known)?;
@@ -165,7 +169,7 @@ impl Parser {
                     self.bump();
                     let (name, params, format, cache, then, stack) = self.parse_op_head()?;
                     let body = self.vm_block()?;
-                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then, stack });
+                    vm.ops.push(OpDecl { name, params, format, cache, body, family: None, then, stack, accumulate: item_attrs.has("accumulate") });
                 }
                 "family" => {
                     self.bump();
@@ -188,6 +192,7 @@ impl Parser {
                             family: Some(name.name.clone()),
                             then: then.clone(),
                             stack: stack.clone(),
+                            accumulate: false,
                         });
                     }
                 }
@@ -310,6 +315,29 @@ impl Parser {
                     vm.stack_entry = Some(self.parse_expr()?);
                     self.expect(";")?;
                 }
+                "accumulator" => {
+                    // `accumulator acc: u64 for ri, rq;`
+                    self.bump();
+                    let n = self.ident()?;
+                    self.expect(":")?;
+                    let ty = self.parse_type()?;
+                    self.expect_kw("for")?;
+                    let mut kinds = vec![self.ident()?];
+                    while self.eat(",") {
+                        kinds.push(self.ident()?);
+                    }
+                    self.expect(";")?;
+                    vm.accs.push(AccDecl { name: n, ty, kinds });
+                }
+                "accumulate" => {
+                    // `accumulate ADD, SUB;`: as `#[accumulate]` on each.
+                    self.bump();
+                    vm.acc_list.push(self.ident()?);
+                    while self.eat(",") {
+                        vm.acc_list.push(self.ident()?);
+                    }
+                    self.expect(";")?;
+                }
                 "sync" => {
                     self.bump();
                     vm.sync = Some(self.vm_block()?);
@@ -350,6 +378,7 @@ impl Parser {
             self.close_allows(mark);
         }
         loop_vars.append(&mut self.vm_loop_vars);
+        crate::vmacc::desugar(&mut vm)?;
         for v in &loop_vars {
             if vm.state.iter().chain(vm.context.iter()).any(|p| p.name.name == v.name) {
                 return Err(crate::diag::Diag::new(
