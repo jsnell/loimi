@@ -1034,6 +1034,30 @@ type.
 | `Vm.depth: u32` | thread-local count of active nested runs, if the vm has a nested entry (section 10) |
 | `Vm.ENTRY(..)` | each `entry` (section 3.6) |
 
+**Errors in generated code, and `LOIMI_DUMP_VM_EXPANSION`.** Part of
+the API is generated as Loimi source, the vm's *expansion*, which is
+type-checked like the rest of the program. Text written in the vm
+declaration that lands there (`verify` and `const` clauses,
+`verify_context` types, `verify NAME { .. }` blocks, stack effect counts,
+`stack_entry`) keeps its location: an error in it is reported where it
+was written, with a note naming the generated code it is part of, and a
+panic in it (a bounds check in a `verify` block) names that line too:
+
+```
+error: mismatched types: expected `u64`, found `u32`
+  --> mini.lm:9:40
+    9 |     operand reg = regs[it] verify it < proto.nregs;
+      |                                        ^^^^^^^^^^^
+note: in the generated verifier, checking operand kind `reg`
+```
+
+(`it` is the decoded field, a `u64`: write `(it as u32) < proto.nregs`.)
+An error elsewhere in the expansion is the compiler's (`note: internal:
+generated code`). Setting `LOIMI_DUMP_VM_EXPANSION=1` prints each vm's
+expansion to stderr as the compiler generates it, to read what the
+generated items do or to report such a bug; `<vm NAME expansion>:LINE`
+locations refer to its lines.
+
 In more detail:
 
 - opcode constants (`Vm.OP_ADD`), `Vm.opcode(w)`, and the per-op

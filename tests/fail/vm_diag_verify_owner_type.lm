@@ -1,0 +1,27 @@
+// An unknown type in an `owner` verify_context is reported at the declaration.
+// error: unknown type `Protoo`
+// error: vm_diag_verify_owner_type.lm:12:36
+// error: note: in the generated verifier's parameters (verify_context `proto`)
+import std.gc;
+
+object Proto { nregs: u32, code: verified [u32] by V }
+
+vm V {
+    context heap: *gc.Heap;
+    state { pc: *u32, regs: *i64 }
+    verify_context owner proto: Gc<Protoo>;
+
+    operand reg = regs[it] verify (it as u32) < proto.nregs;
+
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+
+    op RET(src: reg) : AB { exit src }
+
+    entry run(h: *gc.Heap, code: Verified<V>, r: *i64) -> i64 { heap = h; pc = code.start(); regs = r; jump code }
+}
+
+fn main() {
+    var heap = gc.Heap.new();
+    var words: [u32; 1] = [V.RET(0)];
+    let _ = V.build_verified(&heap, Proto { nregs: 1 }, words[..]);
+}

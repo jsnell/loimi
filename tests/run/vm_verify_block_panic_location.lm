@@ -1,0 +1,33 @@
+// A panic in user text the vm expansion copies into the verifier (a
+// `verify` block, a `verify` clause) names the user's line, not the
+// expansion's.
+import std.io;
+
+struct Proto { tab: [u8; 2], limit: u64 }
+
+vm M {
+    state { pc: *u32, regs: *i64 }
+    verify_context proto: *Proto;
+
+    operand reg = regs[it] verify proto.tab[it] == 1;
+
+    encoding fixed(u32) { format AB { op: 8, a: 8, b: 16 } }
+
+    op RET(src: reg) : AB { exit src }
+
+    verify table { proto.tab[proto.limit] == 1 }
+
+    entry run(code: *u32, r: *i64) -> i64 { pc = code; regs = r; jump pc }
+}
+
+fn main() {
+    var p = Proto { tab: [1, 1], limit: 0 };
+    var code: [u32; 1] = [M.RET(1)];
+    match M.verify(code[..], &p) { Ok(_) => io.println("ok"), Err(_) => io.println("bad") }
+    // `limit` 5 indexes past `tab` in the verify block.
+    p.limit = 5;
+    match M.verify(code[..], &p) { Ok(_) => io.println("ok"), Err(_) => io.println("bad") }
+}
+// expect: ok
+// expect-exit: 134
+// expect-stderr: vm_verify_block_panic_location.lm:18:20: index out of bounds

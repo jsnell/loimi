@@ -309,6 +309,9 @@ impl<'p> Codegen<'p> {
     }
 
     pub fn location(&self, span: Span) -> String {
+        // User text in a vm's expansion (a `verify` clause, ...): where the
+        // user wrote it.
+        let span = self.sm.user_span(span);
         if (span.file as usize) < self.sm.files.len() {
             let (l, c) = self.sm.line_col(span.file, span.lo);
             format!("{}:{}:{}", self.sm.files[span.file as usize].path, l, c)
