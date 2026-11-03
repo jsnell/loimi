@@ -57,6 +57,9 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Raw string literals** `r"..."` and `r#"..."#`: no escapes, may
+  span lines ([§1.2](docs/language.md#lexical-structure)).
+
 - **Constants in patterns** match their value; the `unreachable_arm`
   warning; or-patterns with bindings
   ([§1.2](docs/language.md#12-basics)).

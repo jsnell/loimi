@@ -13,7 +13,8 @@ between this design and the compiler.
 - [0. Principles](#0-principles)
 - [1. Core language](#1-core-language):
   [1.1 Types](#11-types) (including `iN`/`uN`),
-  [1.2 Basics](#12-basics) ([bindings and loops](#bindings-loops-and-types),
+  [1.2 Basics](#12-basics) ([lexical structure](#lexical-structure),
+  [bindings and loops](#bindings-loops-and-types),
   [patterns](#patterns-literals-and-match),
   [warnings and attributes](#warnings-attributes-and-tests),
   [generics and traits](#generics-and-traits),
@@ -119,6 +120,23 @@ struct Span { start: u32, end: u32 }
 
 enum Token { Num(f64), Ident(Symbol), Punct(u8), Eof }
 ```
+
+#### Lexical structure
+
+- Comments are `// ..` to the end of the line and `/* .. */`, which
+  nest.
+- Integer literals are decimal, `0x`, `0o` or `0b`, with `_` between
+  digits allowed (`1_000_000`); float literals have a fraction or an
+  exponent (`1.5`, `2e-3`; `1..2` is a range).
+- Character literals (`'a'`, `'\n'`, same escapes as strings) are byte values: integers.
+- String literals (`"..."`, type `str`) take the escapes `\n`, `\t`,
+  `\r`, `\0`, `\\`, `\'`, `\"` and `\xHH`, and may span lines.
+- **Raw string literals** `r"..."` process no escapes: a backslash is
+  a backslash, so text in another language's syntax (a Prolog library,
+  a regular expression, a grammar) is written as is. `r#"..."#` may
+  contain `"`: it ends at `"` followed by as many `#`s as it began
+  with (`r##"say "#hi"#"##`). They may span lines and have type `str`,
+  like other string literals.
 
 #### Bindings, loops and types
 

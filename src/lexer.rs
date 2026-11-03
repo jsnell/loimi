@@ -74,7 +74,23 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
             continue;
         }
         let start = i;
-        let tok = if c.is_ascii_alphabetic() || c == b'_' {
+        let tok = if let Some(hashes) = raw_string_start(b, i) {
+            // r"..." or r#"..."#: no escapes; ends at `"` and as many `#`.
+            i += 2 + hashes;
+            let body = i;
+            loop {
+                if i >= b.len() {
+                    return Err(Diag::new(sp(start, body), "unterminated raw string literal"));
+                }
+                if b[i] == b'"' && b.len() - i > hashes && b[i + 1..i + 1 + hashes].iter().all(|&h| h == b'#') {
+                    break;
+                }
+                i += 1;
+            }
+            let s = b[body..i].to_vec();
+            i += 1 + hashes;
+            Tok::Str(s)
+        } else if c.is_ascii_alphabetic() || c == b'_' {
             while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
                 i += 1;
             }
@@ -137,6 +153,19 @@ pub fn lex(file: u32, src: &str) -> Result<Vec<Token>, Diag> {
     }
     out.push(Token { tok: Tok::Eof, span: sp(b.len(), b.len()), space_before: true });
     Ok(out)
+}
+
+/// The number of `#`s if a raw string literal (`r"`, `r#"`, `r##"`, ..)
+/// starts at `i`.
+fn raw_string_start(b: &[u8], i: usize) -> Option<usize> {
+    if b[i] != b'r' || (i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < b.len() && b[j] == b'#' {
+        j += 1;
+    }
+    (j < b.len() && b[j] == b'"').then_some(j - i - 1)
 }
 
 fn lex_escape(b: &[u8], i: &mut usize, file: u32) -> Result<u8, Diag> {
