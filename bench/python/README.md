@@ -95,3 +95,11 @@ Matching the `.expected` output of chaos and go requires a `random` that
 reproduces CPython's exactly (Mersenne Twister, `seed(int)` via
 `init_by_array`, `randrange` via `getrandbits`-based `_randbelow`,
 `random()` as 53-bit `(a*67108864+b)/2**53`).
+
+## Results
+
+`examples/python` (python-loimi, tail-call release build) against both
+references, `compare.py -n 3`: 0.53x CPython 3.13.18's time and 0.20x
+MicroPython's by geometric mean; every program prints CPython's output.
+The per-program table, the optimization log and the dispatch-mode
+comparison are in `examples/python/FRICTION.md`.
