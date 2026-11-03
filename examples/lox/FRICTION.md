@@ -16,6 +16,32 @@ loimi test examples/lox/lox_test.lm                    # unit tests (std.test)
 ./lox FILE.lox [--disasm] [--disasm-after] [--gc-stress]
 ```
 
+## Follow-up (what has been done since)
+
+This report is kept as written. Since then:
+
+| # | Status |
+|---|---|
+| 1 | Fixed: `poly_get_at`, `mega_get_at` and `read_miss_at` return the hit's depth (0 own, n inherited, `obj.ABSENT`); it was already in the cache entry, so a hit costs a register (MiniJS unchanged). Lox binds when the depth is nonzero; the `Method` variant is gone (`stdlib/obj.md`, "Where a value came from"). |
+| 2 | Fixed: `gc.WeakInterner.key(s)` pins an interned string and returns its address, a key for good; `stdlib/obj.md` has a "Keys for guest strings" section (pinned strings, or `text.Interner` ids as MiniJS does). Lox pins every property-name constant. |
+| 3 | Fixed: the hit helpers (`poly_get`, `mega_get`, their `_at` forms, `proto_load`, `load_ref`) are `#[inline]` (the attribute existed; the report missed it). `trees` 0.58x -> 0.55x of clox; MiniJS within noise. |
+| 4 | Open: still seven pointer variants. With `Method` gone Lox needs six, so it no longer hits the limit. |
+| 5 | Fixed: `gc.WeakInterner<X>` over the interpreter's string object (or the ready-made `gc.Str`): `intern`, `find`, `key`, a sweeper drops dead strings. Lox's 60 hand-written lines are gone. |
+| 6 | Fixed (opt-in): lint `hot_gc`, `-W hot_gc`, warns about `uses gc` calls on an op's fast path outside `cold` (calls inside plain vm functions are not seen). |
+| 7 | Unchanged (by design; tutorial chapter 9). |
+| 8 | Fixed: branch relaxation in std.bc (`set_relax(Vm.label, invert, Vm.JMP(0))`, `relax()`): a JF/JT that does not fit becomes the opposite jump over a JMP. Lox uses it for forward jumps and checks clox's loop limit itself (a loop spans at most 32767 words), reporting `Error at '}': Loop body too large.`: 246 of 246 tests pass. |
+| 9 | Fixed: `Cursor.skip_space()`, an infallible `skip_trivia` for syntaxes without block comments. Numerals and strings are still hand-scanned. |
+| 10 | Unchanged (not Loimi's). |
+
+Lox is now in the golden tests (`tests/golden.rs`): `lox_test.lm`, and
+`examples/lox/tests/*.lox` (own programs in the official format, with
+`// expect-exit:` and `// expect-stderr:`) run normally and with
+`--gc-stress`. Benchmarks after these changes (best of 5, interleaved, `--align-functions=64`):
+geomean 0.45x of clox's time, as before; `trees` 0.57x -> 0.55x (inlined
+polymorphic hits), `fib` 0.43x -> 0.40x (code layout: nothing it runs changed), `instantiation` 0.69x -> 0.71x
+(identical handler code and GC work; not explained), the rest within 1%.
+All 246 tests pass, also with `--gc-stress` and under AddressSanitizer.
+
 ## Results
 
 **Test suite**: 245 of 246 tests pass (all of `test/` except the
