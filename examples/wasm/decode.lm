@@ -11,6 +11,7 @@ pub const T_I32: u8 = 0x7F;
 pub const T_I64: u8 = 0x7E;
 pub const T_F32: u8 = 0x7D;
 pub const T_F64: u8 = 0x7C;
+pub const T_V128: u8 = 0x7B;
 pub const T_FUNCREF: u8 = 0x70;
 pub const T_EXTERNREF: u8 = 0x6F;
 
@@ -26,8 +27,9 @@ pub struct FuncType { params: []u8, results: []u8 }
 
 /// A constant expression. `ok` is false if it is anything but one
 /// constant instruction followed by `end` (the validator reports it).
-/// op: 0x41..0x44 consts, 0x23 global.get, 0xD0 ref.null, 0xD2 ref.func.
-pub struct ConstExpr { op: u8, bits: u64, idx: u32, ok: bool, nops: u32 }
+/// op: 0x41..0x44 consts, 0xFD v128.const (`bits` the low half, `hi`
+/// the high one), 0x23 global.get, 0xD0 ref.null, 0xD2 ref.func.
+pub struct ConstExpr { op: u8, bits: u64, hi: u64, idx: u32, ok: bool, nops: u32 }
 
 pub struct Import {
     module: str,
@@ -198,7 +200,7 @@ pub fn Reader.name(r: *Reader) -> Result<str, str> {
 }
 
 pub fn is_valtype(t: u8) -> bool {
-    t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 or t == T_FUNCREF or t == T_EXTERNREF
+    t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 or t == T_V128 or t == T_FUNCREF or t == T_EXTERNREF
 }
 
 pub fn Reader.valtype(r: *Reader) -> Result<u8, str> {
@@ -243,6 +245,16 @@ pub fn Reader.memarg(r: *Reader) -> Result<(u32, u32), str> {
     let align = r.u32()?;
     let offset = r.u32()?;
     Ok((align, offset))
+}
+
+/// The SIMD opcodes (after the 0xFD prefix) that exist: 0x00..0xFF but
+/// for the gaps the proposal left (relaxed SIMD is not supported).
+fn simd_known(sub: u32) -> bool {
+    match sub {
+        0x9A | 0xA2 | 0xA5 | 0xA6 | 0xAF | 0xB0 | 0xB2 | 0xB3 | 0xB4 | 0xBB | 0xC2 | 0xC5 | 0xC6
+            | 0xCF | 0xD0 | 0xD2 | 0xD3 | 0xD4 | 0xE2 | 0xEE => false,
+        _ => true,
+    }
 }
 
 /// Reads one instruction's opcode and immediates without interpreting
@@ -297,6 +309,18 @@ pub fn Reader.skip_instr(r: *Reader) -> Result<u32, str> {
             }
             return Ok(0xFC00 + sub);
         }
+        0xFD => {
+            let sub = r.u32()?;
+            if sub > 0xFF or !simd_known(sub) { return Err("illegal opcode"); }
+            match sub {
+                0x00..=0x0B | 0x5C | 0x5D => { r.memarg()?; }
+                0x0C | 0x0D => { r.bytes(16)?; }
+                0x15..=0x22 => { r.byte()?; }
+                0x54..=0x5B => { r.memarg()?; r.byte()?; }
+                _ => {}
+            }
+            return Ok(0xFD00 + sub);
+        }
         _ => return Err("illegal opcode"),
     }
     Ok(op as u32)
@@ -305,7 +329,7 @@ pub fn Reader.skip_instr(r: *Reader) -> Result<u32, str> {
 /// A constant expression: instructions up to `end`. Records the first
 /// instruction if it is the only one.
 pub fn Reader.const_expr(r: *Reader) -> Result<ConstExpr, str> {
-    var e = ConstExpr { op: 0, bits: 0, idx: 0, ok: false, nops: 0 };
+    var e = ConstExpr { op: 0, bits: 0, hi: 0, idx: 0, ok: false, nops: 0 };
     var depth: u32 = 0;
     loop {
         let start = r.pos;
@@ -329,6 +353,13 @@ pub fn Reader.const_expr(r: *Reader) -> Result<ConstExpr, str> {
                 0x23 => { e.idx = s.u32()?; e.ok = true; }
                 0xD0 => { e.idx = s.byte()? as u32; e.ok = true; }
                 0xD2 => { e.idx = s.u32()?; e.ok = true; }
+                0xFD0C => {
+                    s.u32()?;
+                    e.op = 0xFD;
+                    e.bits = s.fixed64()?;
+                    e.hi = s.fixed64()?;
+                    e.ok = true;
+                }
                 _ => { e.op = 0xFF; }
             }
         } else {
@@ -410,7 +441,7 @@ fn Module.section(m: *Module, id: u8, r: *Reader, nfuncs_declared: *u64) -> Resu
                         imp.gmut = mu == 1;
                         m.globals.push(GlobalDef {
                             ty: imp.gtype, mutable: imp.gmut,
-                            init: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 },
+                            init: ConstExpr { op: 0, bits: 0, hi: 0, idx: 0, ok: true, nops: 0 },
                         });
                         m.nglobal_imports += 1;
                     }
@@ -511,7 +542,7 @@ fn Module.section(m: *Module, id: u8, r: *Reader, nfuncs_declared: *u64) -> Resu
                     1 => {
                         let len = r.u32()? as u64;
                         let bytes = r.bytes(len)?;
-                        m.datas.push(DataSeg { active: false, mem: 0, offset: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 }, bytes: bytes });
+                        m.datas.push(DataSeg { active: false, mem: 0, offset: ConstExpr { op: 0, bits: 0, hi: 0, idx: 0, ok: true, nops: 0 }, bytes: bytes });
                     }
                     2 => {
                         let mi = r.u32()?;
@@ -530,13 +561,13 @@ fn Module.section(m: *Module, id: u8, r: *Reader, nfuncs_declared: *u64) -> Resu
     Ok(())
 }
 
-fn funcref_expr(idx: u32) -> ConstExpr { ConstExpr { op: 0xD2, bits: 0, idx: idx, ok: true, nops: 1 } }
+fn funcref_expr(idx: u32) -> ConstExpr { ConstExpr { op: 0xD2, bits: 0, hi: 0, idx: idx, ok: true, nops: 1 } }
 
 pub fn Reader.elem_seg(r: *Reader) -> Result<ElemSeg, str> {
     let flag = r.u32()?;
     if flag > 7 { return Err("malformed elements segment kind"); }
     var seg = ElemSeg {
-        mode: 0, table: 0, offset: ConstExpr { op: 0, bits: 0, idx: 0, ok: true, nops: 0 },
+        mode: 0, table: 0, offset: ConstExpr { op: 0, bits: 0, hi: 0, idx: 0, ok: true, nops: 0 },
         reftype: T_FUNCREF, funcs: mem.Vec.new(),
     };
     // bit 0: passive/declarative, bit 1: explicit table (active) or
@@ -622,7 +653,7 @@ pub fn decode(buf: []u8) -> Result<Module, str> {
 pub fn type_name(t: u8) -> str {
     match t {
         0x7F => "i32", 0x7E => "i64", 0x7D => "f32", 0x7C => "f64",
-        0x70 => "funcref", 0x6F => "externref",
+        0x7B => "v128", 0x70 => "funcref", 0x6F => "externref",
         _ => "?",
     }
 }
