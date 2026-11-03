@@ -749,9 +749,6 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
         if t.items.len == 1 {
             let Obj(b) = t.items[0] else { return Err(exc(c, E_TYPE, "bases must be types")); };
             if b.kind != K_CLASS { return Err(exc(c, E_TYPE, "bases must be types")); }
-            if b.n != 0 and b.n != (vm.T_OBJECT + 1) as i64 {
-                return Err(exc(c, E_TYPE, "subclassing builtin types is not supported"));
-            }
             base = b;
         }
     }
@@ -761,7 +758,11 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
     cls.base = Some(base);
     cls.id = c.next_cls;
     c.next_cls += 1;
-    cls.s = base.s;  // exception classes inherit the flag
+    cls.s = base.s;
+    // A subclass of a builtin type (other than object) makes instances of
+    // that type: `class C(list): pass` works, but methods C adds are not
+    // seen by its instances (SPEC.md).
+    if base.n != 0 and base.n != (vm.T_OBJECT + 1) as i64 { cls.n = base.n; }
     // Methods learn their class (for super()).
     var it: u64 = 0;
     while let Some(e) = value.dict_next(d, &it) {
