@@ -8,7 +8,7 @@ you having to write assembly, macros, or `__attribute__` soup.
 
 Status: **working, pre-1.0**. The compiler, the dispatch strategies,
 value representations, the GC, generated verifiers, instrumentation, C
-embedding, a test runner and an opt-in copy-and-patch JIT work, and six
+embedding, a test runner and an opt-in copy-and-patch JIT work, and seven
 example interpreters are written in Loimi. See
 [`docs/status.md`](docs/status.md) for what is built and how it differs
 from the design.
@@ -32,7 +32,7 @@ time and 0.47× of Guile 3's time with Guile's JIT off, and is on par with
 Guile with its JIT (1.02×)
 ([`bench/scheme/README.md`](bench/scheme/README.md)).
 
-Three more examples were written by agents that read only the docs, as
+Four more examples were written by agents that read only the docs, as
 usability studies (each has a `FRICTION.md` report):
 [`examples/lox`](examples/lox) implements Lox from *Crafting
 Interpreters*. It passes all 246 tests of the book's official suite and
@@ -41,7 +41,9 @@ mean over its official benchmarks (faster on all 10).
 [`examples/regex`](examples/regex) is a backtracking regex engine shipped
 as a C library, checked against Python's `re`.
 [`examples/stack`](examples/stack) is a Forth-like stack VM using
-declared stack effects.
+declared stack effects. [`examples/wasm`](examples/wasm) is a
+WebAssembly interpreter that passes every non-SIMD file of the spec
+test suite.
 
 `loimi build --jit-stencils` (x86-64 Linux) generates a copy-and-patch
 JIT from the same `vm` declarations, with no extra interpreter source:
@@ -127,8 +129,8 @@ infrastructure out of macros, compiler extensions, and convention:
 - [`examples/minijs/`](examples/minijs): a JavaScript subset on shapes and
   inline caches from `std.obj`.
 - [`examples/lox/`](examples/lox), [`examples/regex/`](examples/regex),
-  [`examples/stack/`](examples/stack): written from the docs alone, with
-  usability reports.
+  [`examples/stack/`](examples/stack), [`examples/wasm/`](examples/wasm):
+  written from the docs alone, with usability reports.
 - [`bench/`](bench): the dispatch benchmark against hand-written C, and
   [`bench/mini`](bench/mini): Mini vs PUC-Lua and LuaJIT.
 
