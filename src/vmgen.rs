@@ -204,7 +204,7 @@ pub fn epilogue(g: &mut FnGen) {
         for (l, ld) in hf.locals.iter().enumerate() {
             match hf.vm_state.iter().position(|s| *s as usize == l) {
                 Some(i) => slots.push(hg.state_slots[i].clone()),
-                None => slots.push(g.alloca(&ld.ty)),
+                None => slots.push(g.local_slot(&ld.ty)),
             }
         }
         g.slots = slots;

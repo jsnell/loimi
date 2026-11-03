@@ -30,16 +30,67 @@ pub fn gc_enabled(p: &Program) -> bool {
     p.fns.iter().any(|f| f.symbol == "std.gc.mark_ptr" && f.body.is_some())
 }
 
+/// `--gc-check-roots`: every reference that generated code marks (roots
+/// in shadow-stack frames, state copies, `gc_mark` in scanners, fields
+/// traced by `loimi_trace_object`) goes through `std.gc.rootck_mark`,
+/// which validates it before `mark_ptr` reads its header. What is being
+/// marked is kept in two thread-locals for the report: the info record
+/// (`rootck_info`) of the frame, object type or `gc_mark` call, and an
+/// index (the root's slot in its frame, or the object's address).
+pub fn check_roots(g: &FnGen) -> bool {
+    g.cg.opts.gc_check_roots
+}
+
+fn mark_call(g: &mut FnGen, h: &str, v: &str) {
+    let f = if check_roots(g) { "std.gc.rootck_mark" } else { "std.gc.mark_ptr" };
+    g.emit(format!("call void @\"{}\"(ptr {}, ptr {})", f, h, v));
+}
+
+/// Kinds of `rootck_info` records (`std.gc.rootck_fail` reads them).
+pub const RC_FRAME: u32 = 0;
+pub const RC_OBJECT: u32 = 1;
+pub const RC_GC_MARK: u32 = 2;
+
+/// A constant `{ str text, i64 kind }` describing what is being marked.
+pub fn rootck_info(cg: &mut Codegen, kind: u32, text: &str) -> String {
+    let s = cg.string_const(text.as_bytes());
+    let name = format!("@\"loimi.rootck.{}\"", cg.rootck_count);
+    cg.rootck_count += 1;
+    let _ = writeln!(cg.globals, "{} = private unnamed_addr constant {{ ptr, i64, i64 }} {{ ptr {}, i64 {}, i64 {} }}", name, s, text.len(), kind);
+    name
+}
+
+/// Set the current `rootck_info` record and index.
+pub fn rootck_set(g: &mut FnGen, info: &str, idx: &str) {
+    g.emit(format!("store ptr {}, ptr @loimi.rootck.what", info));
+    g.emit(format!("store i64 {}, ptr @loimi.rootck.idx", idx));
+}
+
+/// A readable type name for the reports of `--gc-check-roots`.
+pub fn ty_str(p: &Program, t: &Ty) -> String {
+    match t {
+        Ty::Gc(i) => format!("Gc<{}>", ty_str(p, i)),
+        Ty::Option(i) => format!("?{}", ty_str(p, i)),
+        Ty::Struct(i) => p.structs[*i as usize].name.clone(),
+        Ty::Enum(i) => p.enums[*i as usize].name.clone(),
+        Ty::Value(i) => p.values[*i as usize].name.clone(),
+        Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| ty_str(p, t)).collect::<Vec<_>>().join(", ")),
+        Ty::Array(e, n) => format!("[{}; {}]", ty_str(p, e), n),
+        Ty::Result(a, b) => format!("Result<{}, {}>", ty_str(p, a), ty_str(p, b)),
+        _ => format!("{:?}", t),
+    }
+}
+
 /// Emit code marking every GC reference in `v` (a value of type `t`).
 pub fn mark_expr(g: &mut FnGen, t: &Ty, v: &str, h: &str) {
     let p = g.p();
     match t {
         Ty::Gc(_) => {
-            g.emit(format!("call void @\"std.gc.mark_ptr\"(ptr {}, ptr {})", h, v));
+            mark_call(g, h, v);
         }
         Ty::Option(inner) if inner.is_nullable_ptr() => {
             if is_traced(p, inner) {
-                g.emit(format!("call void @\"std.gc.mark_ptr\"(ptr {}, ptr {})", h, v));
+                mark_call(g, h, v);
             }
         }
         Ty::Option(inner) => {
@@ -153,7 +204,7 @@ pub fn mark_expr(g: &mut FnGen, t: &Ty, v: &str, h: &str) {
                 g.cond_br(&c, &l_yes, &l_no);
                 g.label(&l_yes);
                 let ptr = crate::values::payload(g, d, i as u32, v);
-                g.emit(format!("call void @\"std.gc.mark_ptr\"(ptr {}, ptr {})", h, ptr));
+                mark_call(g, h, &ptr);
                 g.br(&l_no);
                 g.label(&l_no);
             }
@@ -193,6 +244,12 @@ pub fn mark_fn(cg: &mut Codegen, t: &Ty) -> String {
     let name = format!("@\"loimi.mark.{}\"", cg.mark_fns.len());
     cg.mark_fns.insert(key, name.clone());
     let mut g = FnGen::new(cg, 0);
+    if check_roots(&g) {
+        // The root's index in its frame (`loimi_rootck_frame` resets it).
+        let i = g.inst("load i64, ptr @loimi.rootck.idx");
+        let i2 = g.inst(format!("add i64 {}, 1", i));
+        g.emit(format!("store i64 {}, ptr @loimi.rootck.idx", i2));
+    }
     let v = g.load(t, "%slot");
     mark_expr(&mut g, t, &v, "%h");
     if !g.terminated {
@@ -219,7 +276,15 @@ pub fn emit_runtime(cg: &mut Codegen) {
         return;
     }
     cg.decls.0.remove("loimi_trace_object");
+    if cg.opts.gc_check_roots {
+        emit_rootck_runtime(cg);
+    }
     let mut g = FnGen::new(cg, 0);
+    if check_roots(&g) {
+        // What `rootck_mark` reports for a bad field: the object.
+        let a = g.inst("ptrtoint ptr %obj to i64");
+        g.emit(format!("store i64 {}, ptr @loimi.rootck.idx", a));
+    }
     let objects: Vec<(usize, u32)> =
         p.structs.iter().enumerate().filter(|(_, s)| !s.pattern).filter_map(|(i, s)| s.object.map(|t| (i, t))).collect();
     let l_end = g.fresh_label("traced");
@@ -233,6 +298,11 @@ pub fn emit_runtime(cg: &mut Codegen) {
     g.term(format!("switch i32 %tid, label %{} [{} ]", l_end, cases));
     for ((sid, _), l) in objects.iter().zip(labels.iter()) {
         g.label(l);
+        if check_roots(&g) {
+            let text = format!("a field of an object of type {}", p.structs[*sid].name);
+            let info = rootck_info(g.cg, RC_OBJECT, &text);
+            g.emit(format!("store ptr {}, ptr @loimi.rootck.what", info));
+        }
         let st = Ty::Struct(*sid as u32);
         let lt = g.ty(&st);
         let s = &p.structs[*sid];
@@ -278,6 +348,60 @@ pub fn emit_runtime(cg: &mut Codegen) {
     );
 }
 
+/// `--gc-check-roots`: the thread-locals naming what is being marked,
+/// and the accessors `std.gc.rootck_*` declares.
+fn emit_rootck_runtime(cg: &mut Codegen) {
+    let _ = writeln!(cg.globals, "@loimi.rootck.what = internal thread_local(initialexec) global ptr null");
+    let _ = writeln!(cg.globals, "@loimi.rootck.idx = internal thread_local(initialexec) global i64 0");
+    for d in ["loimi_rootck_what", "loimi_rootck_kind", "loimi_rootck_idx", "loimi_rootck_info"] {
+        cg.decls.0.remove(d);
+    }
+    let _ = write!(
+        cg.fns,
+        "define internal void @loimi_rootck_frame(ptr %h, ptr %info) nounwind {{
+  store ptr %info, ptr @loimi.rootck.what
+  store i64 -1, ptr @loimi.rootck.idx
+  ret void
+}}
+
+define internal {{ ptr, i64 }} @loimi_rootck_what() nounwind {{
+  %w = load ptr, ptr @loimi.rootck.what
+  %z = icmp eq ptr %w, null
+  br i1 %z, label %none, label %some
+none:
+  ret {{ ptr, i64 }} zeroinitializer
+some:
+  %s = load {{ ptr, i64 }}, ptr %w
+  ret {{ ptr, i64 }} %s
+}}
+
+define internal i64 @loimi_rootck_kind() nounwind {{
+  %w = load ptr, ptr @loimi.rootck.what
+  %z = icmp eq ptr %w, null
+  br i1 %z, label %none, label %some
+none:
+  ret i64 -1
+some:
+  %p = getelementptr inbounds {{ ptr, i64, i64 }}, ptr %w, i32 0, i32 2
+  %k = load i64, ptr %p
+  ret i64 %k
+}}
+
+define internal i64 @loimi_rootck_idx() nounwind {{
+  %i = load i64, ptr @loimi.rootck.idx
+  ret i64 %i
+}}
+
+define internal i64 @loimi_rootck_info() nounwind {{
+  %w = load ptr, ptr @loimi.rootck.what
+  %i = ptrtoint ptr %w to i64
+  ret i64 %i
+}}
+
+"
+    );
+}
+
 /// `new(heap, init, len?)`
 pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>) -> String {
     let p = g.p();
@@ -297,7 +421,10 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
         _ => ("0".to_string(), size.to_string()),
     };
     let tid = s.object.unwrap();
-    let obj = g.inst(format!("call ptr @\"std.gc.alloc\"(ptr {}, i64 {}, i32 {}, i64 {})", h, total, tid, n));
+    // `--gc-check-roots`: `rootck_alloc` installs the sweeper that
+    // poisons freed objects before the heap's first collection.
+    let alloc = if check_roots(g) { "std.gc.rootck_alloc" } else { "std.gc.alloc" };
+    let obj = g.inst(format!("call ptr @\"{}\"(ptr {}, i64 {}, i32 {}, i64 {})", alloc, h, total, tid, n));
     if !s.fields.is_empty() {
         let lt = llty(p, &init.ty);
         g.emit(format!("store {} {}, ptr {}", lt, v, obj));
@@ -348,9 +475,30 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     let mut roots: Vec<(String, Ty)> =
         ids.iter().map(|l| (g.slots[*l as usize].clone(), fd.locals[*l as usize].ty.clone())).collect();
     roots.extend(g.pending.iter().cloned());
+    let nlocal = roots.len();
     state_roots(g, f, &mut roots);
     if roots.is_empty() {
         return None;
+    }
+    if check_roots(g) {
+        // A first entry that names the frame (`loimi_rootck_frame`).
+        let callee = match f.kind {
+            TK::FnRef(id) => p.fns[id as usize].symbol.clone(),
+            _ => "a function value".into(),
+        };
+        let mut text = format!("{} at {} (call of {}); roots:", fd.symbol, g.cg.location(f.span), callee);
+        for (i, (_, t)) in roots.iter().enumerate() {
+            let what = if i < ids.len() {
+                fd.locals[ids[i] as usize].name.clone()
+            } else if i < nlocal {
+                "(a value kept for defers, or a scrutinee during a guard)".into()
+            } else {
+                "(a copy of a state variable)".into()
+            };
+            text.push_str(&format!(" #{} {}: {};", i, what, ty_str(p, t)));
+        }
+        let info = rootck_info(g.cg, RC_FRAME, &text);
+        roots.insert(0, (info, Ty::Unit));
     }
     let n = roots.len();
     let ft = format!("{{ ptr, i64, [{} x {{ ptr, ptr }}] }}", n);
@@ -361,7 +509,7 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     let np = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 1", ft, fr));
     g.emit(format!("store i64 {}, ptr {}", n, np));
     for (i, (slot, t)) in roots.iter().enumerate() {
-        let mf = mark_fn(g.cg, t);
+        let mf = if i == 0 && check_roots(g) { "@loimi_rootck_frame".to_string() } else { mark_fn(g.cg, t) };
         let sp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 0", ft, fr, i));
         g.emit(format!("store ptr {}, ptr {}", slot, sp));
         let mp = g.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 2, i64 {}, i32 1", ft, fr, i));

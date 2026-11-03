@@ -31,7 +31,7 @@ in [`language.md`](language.md). Updated 2026-11-03.
 | `std.bc` | Bytecode construction over any vm's generated encoders: `Code<W>` (given `Vm.op_size` and a jump-patch function: `op` reserves inline-cache words, labels with fixups, jump lists, range-checked patching with sticky errors, a run-length position table with per-word expansion and a delta-encoded form, `last`/`truncate` for peepholes, jump threading, branch relaxation into a long-jump form), `Field` (encoded bit fields), `Pool<K: hash.Hash>` (deduplicating constant pool with a limit) and `Regs` (Lua-style locals/temporaries register allocator with maximum tracking). |
 | `std.obj` | Hidden-class objects over a generic `obj.Obj<V>` or the interpreter's own object type: shapes in a transition tree with weak edges (cleared by a sweeper) and never-reused ids, inline and overflow slots, dictionary mode, prototype chains with validity cells, monomorphic cache fill helpers (shape id + SlotRef in two cache words; a hit is two loads, a compare and the slot load), `Poly`, a global `MegaCache` (hits inlined into handlers, and reporting whether the value was own or inherited), allocation templates, per-property attribute bits (`define`, `set_attrs`, `attrs`, `keys_where`; `ic.readonly` keeps write caches off read-only properties). No elements, global property cells or `SetError`. |
 | Example | `examples/mini/`: a Lua-like interpreter (single-pass compiler on std.lex, std.parse, std.diag and std.bc; VM; GC'd strings and tables; `table.sort` with Lua comparators through re-entry; Lua 5.4 coroutines, each with its own GC'd, growing stacks swapped into the vm state at resume, a yield leaving the coroutine's nested run (`examples/mini/COROUTINES.md`; PUC-Lua's coroutine.lua reduced to the subset passes)), tested with GC stress, and embeddable in C (`embed.lm`), with natives that call back. `examples/scheme/`: an R7RS-small subset (reader on std.lex and std.num, code generator on std.bc). `examples/minijs/`: a JavaScript subset on std.lex, std.parse, std.bc, std.obj and std.num (shapes, mono/poly/mega inline caches, prototype validity cells), tested with GC stress. `examples/lox/`: a Lox VM (all 246 of the book's clox tests; 0.45x clox's time), with unit tests and programs run with GC stress. `examples/wasm/`: a WebAssembly interpreter (MVP plus sign extension, saturating conversions, multi-value, reference types and bulk memory; every non-SIMD spec test file passes; 0.87x wasm3's time by geometric mean, with accumulators, `#[forward]` supers for float chains and constant slots). |
-| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, `loimi test` (`tests/test/`), the Mini, Scheme and MiniJS test programs (and Stak's, `examples/stack/check.sh`, in all three dispatch modes) and conformance suites normally, with GC stress, and in verify mode (generational heap under stress, checking the write barriers at every collection), a few seconds of bytecode fuzzing (below), and C hosts built against `--lib` and `--shared` libraries and their generated headers (`tests/embed/`: the C ABI, caught panics of every kind, also through nested vm runs and host callbacks, ASan builds, two `--vm-stats` libraries in one host; the regex library's `check.sh`; and embedded Mini with two states, natives calling back, and GC stress). Re-entry: `tests/run/vm_reenter.lm` (all three modes, a stack that moves on every callback), Mini's sort and coroutine scripts in all three modes. |
+| Tests | `cargo test`: golden programs (every vm test in all three dispatch modes), expected compile errors, `loimi test` (`tests/test/`), the Mini, Scheme and MiniJS test programs (and Stak's, `examples/stack/check.sh`, in all three dispatch modes) and conformance suites normally, with GC stress, and in verify mode (generational heap under stress, checking the write barriers at every collection), a few seconds of bytecode fuzzing and of GC rooting fuzzing (below), and C hosts built against `--lib` and `--shared` libraries and their generated headers (`tests/embed/`: the C ABI, caught panics of every kind, also through nested vm runs and host callbacks, ASan builds, two `--vm-stats` libraries in one host; the regex library's `check.sh`; and embedded Mini with two states, natives calling back, and GC stress). Re-entry: `tests/run/vm_reenter.lm` (all three modes, a stack that moves on every callback), Mini's sort and coroutine scripts in all three modes. |
 
 ## Bytecode fuzzing (M5)
 
@@ -87,6 +87,51 @@ register from the instruction word (`Mini.ABC_a(*pc) + it <= nregs`);
 the kinds decode to the plain field, so handlers are unchanged.
 `tests/fuzz/mini_holes.lm` checks that all nine reproducers are
 rejected (run by `cargo test`).
+
+## GC rooting fuzzing
+
+`loimi build --gc-check-roots` makes the collector check every
+reference it marks (shadow-stack roots, copies of vm state, `gc_mark`
+in scanners, traced fields) before reading its header, fills unassigned
+traced slots and freed objects with 0x01 bytes, and reports a bad root
+with its frame, function, call site and slot (lowering.md §9).
+`tests/fuzz/rootgen.rs` generates random programs that mix traced
+locals (`Gc`, options, a struct, a tuple, an enum, a nanbox `value`, an
+array) with every binding form (`let`/`var`, `let .. else` (also `else
+cold`), `if let` chains, `while let`, `match` with guards that collect
+and fail, or-patterns and tuple patterns, `for`, `loop` with `break`
+values, `defer`, closures), early exits, stores, and calls that collect,
+in plain functions and in a vm's handlers, `cold` blocks, vm functions
+and `on raise`. Each is built in this mode and run without collections,
+under GC stress, and under generational stress with verify; the outputs
+(digests that read through every reference) must agree across runs and
+dispatch modes, and objects only out-of-scope locals reached must be
+gone after a full collection (`Weak` probes). It keeps to what the
+language promises: no traced temporary is held across a call that may
+collect.
+
+    cargo test --release --test fuzz fuzz_gc_roots       # smoke: 18 fixed seeds, ~20 s
+    ROOTFUZZ_SECS=300 ROOTFUZZ_JOBS=2 ROOTFUZZ_FIRST=1000 \
+      cargo test --release --test fuzz fuzz_gc_roots_long -- --ignored --nocapture
+    ROOTFUZZ_SEEDS=17,42 ROOTFUZZ_KEEP=1 ...              # rerun seeds, keep target/rootfuzz/roots-SEED.lm
+
+(`ROOTFUZZ_PLAIN=1` builds without `--gc-check-roots`.) Seeded bugs,
+detected by the 18 smoke seeds with the checks (without):
+let-else bindings rooted in the else block (the bug of commit 334d6cc)
+18 (16); a match arm's bindings not rooted 10 (2); a block's locals
+rooted after their scope 18 (18, as leaks); `if let` bindings rooted
+in the else branch 14 (13); a match scrutinee not rooted during guards
+(the bug below) 5 (0).
+
+**Run so far: 14 minutes** (2026-11-03), 535 programs, each in
+three dispatch modes and three GC settings. Found and fixed: a `match`
+guard that collects ran with a temporary scrutinee (`match f() {..}`)
+unrooted, so arms after a failing guard bound freed objects; in vm
+code also with the earlier fix, since a call there is a vm node
+(`tests/run/gc_roots_match_guard.lm`). Found, not fixed: LLVM 19
+crashes in `LoopSimplifyCFG` (at `-O1` and `-O3`) on the goto-mode run
+loop of about 1% of the generated programs; the IR verifies, and the
+fuzzer skips that build (reproduce: `ROOTFUZZ_SEEDS=1088`).
 
 ## Differences from the design
 

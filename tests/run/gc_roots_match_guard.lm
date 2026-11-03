@@ -1,0 +1,69 @@
+// matrix: dispatch
+// A `match` guard that collects runs before later arms bind from the
+// scrutinee. When the scrutinee is a temporary (a call's result), only
+// that temporary references its objects while the guard runs: it is
+// rooted there. It was not: the node below was freed by the guard's
+// collection and reused before `E.Two(n, j)` bound it (found while
+// writing the rooting fuzzer, tests/fuzz/rootgen.rs, which finds it).
+// In a function, and the same match in an op handler (where the freed
+// node happened not to be reused).
+import std.io;
+import std.gc;
+
+object Node { v: i64 }
+enum E { Nil, One(Gc<Node>), Two(Gc<Node>, i64) }
+
+struct Ctx { heap: gc.Heap }
+
+/// Collects, then allocates garbage that reuses what was freed.
+fn churn(h: *gc.Heap) -> bool uses gc {
+    gc.collect(h);
+    for i in 0..10 { let _ = new(h, Node { v: 7 }); }
+    true
+}
+
+fn make(h: *gc.Heap, k: i64) -> E { if k > 0 { E.Two(new(h, Node { v: 40 + k }), k) } else { E.Nil } }
+
+fn f(h: *gc.Heap, k: i64) -> i64 uses gc {
+    match make(h, k) {
+        E.One(_) if churn(h) => 1,
+        _ if churn(h) and k < 0 => 2,
+        E.Two(n, j) => n.v + j,
+        _ => 0,
+    }
+}
+
+vm M {
+    context ctx: *Ctx;
+    state { pc: *u32, acc: i64 }
+    encoding fixed(u32) { format N { op: 8, x: 24 } }
+
+    op ADD(k: imm) : N {
+        acc += match make(&ctx.heap, k as i64) {
+            E.One(_) if churn(&ctx.heap) => 1,
+            _ if churn(&ctx.heap) and k > 100 => 2,
+            E.Two(n, j) => n.v + j,
+            _ => 3,
+        };
+        next
+    }
+    op HALT() : N { exit acc }
+
+    operand imm = it;
+
+    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; acc = 0; jump code }
+}
+
+fn main() uses gc {
+    var c = Ctx { heap: gc.Heap.new() };
+    var t: i64 = 0;
+    for i in 0..20 { t += f(&c.heap, 2); }
+    io.print_int(t);
+    io.println("");
+    var code: [u32; 3] = [M.ADD(2), M.ADD(5), M.HALT()];
+    io.print_int(M.run(&c, &code[0]));
+    io.println("");
+    c.heap.free();
+}
+// expect: 880
+// expect: 94
