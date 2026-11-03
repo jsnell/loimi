@@ -130,7 +130,7 @@ fn sweep_strings(h: *gc.Heap, data: *u8) {
     let slots = st.slots;
     for i in 0..st.cap {
         let w = slots[i];
-        if w > TOMB and !gc.is_marked((w & ADDR) as *u8) {
+        if w > TOMB and !h.is_marked((w & ADDR) as *u8) {
             slots[i] = TOMB;
             st.live -= 1;
         }

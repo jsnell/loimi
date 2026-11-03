@@ -434,10 +434,18 @@ fn add_chunk(h: *Heap, c: u64) {
 
 /// Whether the object at `p` survived marking. Meaningful only in a
 /// sweeper (see `add_sweeper`). In a minor collection, old objects count
-/// as marked.
+/// as marked. `h.is_marked(p)` is the same, faster.
 pub fn is_marked(p: *u8) -> bool {
     let hd = (p - HEADER) as *Header;
     hd.mark == head_of(p).rs.epoch
+}
+
+/// Whether the object at `p`, in heap `h`, survived marking (see the
+/// free function `is_marked`).
+#[inline]
+pub fn Heap.is_marked(h: *Heap, p: *u8) -> bool {
+    let hd = (p - HEADER) as *Header;
+    hd.mark == h.epoch
 }
 
 /// The `ChunkHead` of the chunk holding `obj` (or of a large object).
@@ -930,9 +938,9 @@ fn clear_weaks(h: *Heap) {
     var out: u64 = 0;
     for i in 0..h.weaks.len {
         let p = h.weaks.at(i);
-        if !is_marked(p) { continue; }
+        if !h.is_marked(p) { continue; }
         let a = p as *u64;
-        if *a != 0 and !is_marked(*a as *u8) { *a = 0; }
+        if *a != 0 and !h.is_marked(*a as *u8) { *a = 0; }
         h.weaks.set(out, p);
         out += 1;
     }
@@ -1076,7 +1084,7 @@ fn eph_mark<K, V>(h: *Heap, data: *u8) -> bool {
     let before = h.stack.len;
     for i in 0..t.cap {
         let a = t.keys[i];
-        if a > EPH_DEL and is_marked(a as *u8) { gc_mark(h, t.vals[i]); }
+        if a > EPH_DEL and h.is_marked(a as *u8) { gc_mark(h, t.vals[i]); }
     }
     h.stack.len != before
 }
@@ -1086,7 +1094,7 @@ fn eph_sweep<K, V>(h: *Heap, data: *u8) {
     let t = data as *Ephemerons<K, V>;
     for i in 0..t.cap {
         let a = t.keys[i];
-        if a > EPH_DEL and !is_marked(a as *u8) {
+        if a > EPH_DEL and !h.is_marked(a as *u8) {
             t.keys[i] = EPH_DEL;
             t.live -= 1;
         }
@@ -1331,7 +1339,7 @@ fn wi_sweep<X>(h: *Heap, data: *u8) {
     let t = data as *WeakInterner<X>;
     for i in 0..t.cap {
         let w = t.slots[i];
-        if w > WI_DEL and !is_marked((w & WI_ADDR) as *u8) {
+        if w > WI_DEL and !h.is_marked((w & WI_ADDR) as *u8) {
             t.slots[i] = WI_DEL;
             t.live -= 1;
         }

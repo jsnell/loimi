@@ -238,7 +238,7 @@ fn Shapes.shape_at(s: *Shapes, a: u64) -> Gc<Shape> {
     x
 }
 
-fn marked(a: u64) -> bool { gc.is_marked(a as *u8) }
+fn marked(h: *gc.Heap, a: u64) -> bool { h.is_marked(a as *u8) }
 
 /// After marking: note dead shapes in the transition table (forgetting
 /// all of them past `retain`), and kill the cells of dead objects.
@@ -246,7 +246,7 @@ fn sweep_shapes(h: *gc.Heap, data: *u8) {
     let s = data as *Shapes;
     for i in 0..s.tcap {
         let e = s.trans + i;
-        if e.id != 0 and e.addr != 0 and !marked(e.addr) {
+        if e.id != 0 and e.addr != 0 and !marked(h, e.addr) {
             e.addr = 0;
             s.tlive -= 1;
             s.swept += 1;
@@ -255,7 +255,7 @@ fn sweep_shapes(h: *gc.Heap, data: *u8) {
     if s.tused - s.tlive > s.retain { s.forget(); }
     var it: u64 = 0;
     while let Some(slot) = s.cells.next(&it) {
-        if !marked(slot.key) {
+        if !marked(h, slot.key) {
             s.kill(slot.value as u32);
             s.cells.remove(slot.key);
         }
