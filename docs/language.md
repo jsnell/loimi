@@ -1846,7 +1846,12 @@ same register. The load waits for the store (a store-to-load round
 trip, about 5 cycles on x86). In `#[forward] super A_B = A; B;`, an
 operand of a later part that may name the register the previous part
 writes (same operand kind, not written by the part itself; at most two
-per part and three per super) is a *link*. The vm gets one more opcode
+per part and three per super) is a *link*. Two kinds that are views of
+one register file count as the same kind: place kinds whose bodies and
+`verify` clauses differ only in the types they cast to, such as
+`operand ri = *((regs + it) as *i32)` and `operand rd = *((regs + it)
+as *f64)` over untyped 64-bit slots (forwarding needs the two views to
+have the same size; otherwise the load stays). The vm gets one more opcode
 per nonempty set of links, a *forwarding variant* `A_B__fN` (N a bit
 mask over the links), whose handler uses the previous part's field for
 the linked operands, so LLVM forwards the stored value in a machine
