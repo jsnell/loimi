@@ -1,5 +1,5 @@
 // `#[allow(..)]` names a known lint.
-// error: unknown lint `match_falout` (known: match_fallout, super_overlap, state_root, hot_gc)
+// error: unknown lint `match_falout` (known: match_fallout, super_overlap, hot_gc)
 #[allow(match_falout)]
 fn f() {}
 

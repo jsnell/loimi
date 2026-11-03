@@ -343,10 +343,12 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
             }
         }
     }
-    // (slot, type) of each root: traced locals, then pending values.
+    // (slot, type) of each root: traced locals, then pending values, then
+    // the traced vm state.
     let mut roots: Vec<(String, Ty)> =
         ids.iter().map(|l| (g.slots[*l as usize].clone(), fd.locals[*l as usize].ty.clone())).collect();
     roots.extend(g.pending.iter().cloned());
+    state_roots(g, f, &mut roots);
     if roots.is_empty() {
         return None;
     }
@@ -367,6 +369,67 @@ pub fn push_frame(g: &mut FnGen, f: &TExpr) -> Option<String> {
     }
     g.emit(format!("store ptr {}, ptr @loimi.shadow_top", fr));
     Some(prev)
+}
+
+/// In vm code, the state variables of traced types (a cached top of
+/// stack, `state { .., tos: Value }`; a current closure, `cl: Gc<Closure>`)
+/// are roots at every call that may collect. Each is copied, at the call,
+/// into a slot of its own that the frame lists: the state variable itself
+/// never has its address taken, so it stays in a register everywhere
+/// else, and only the path that makes the call pays (one store per
+/// variable, next to the stores of the vm's `sync`). In a vm function the
+/// state arrives as pointers to the caller's variables: the copy is read
+/// through them. A call of a vm function of the same vm roots no state:
+/// the function roots it itself at its own calls that may collect, so a
+/// `gc_point()` that collects only on a cold path costs its callers
+/// nothing. (Not built: a moving collector, which would also copy the
+/// slots back after the call.)
+fn state_roots(g: &mut FnGen, callee: &TExpr, roots: &mut Vec<(String, Ty)>) {
+    let p = g.p();
+    let fd = g.f();
+    let Some(vm) = fd.vm else { return };
+    if let TK::FnRef(id) = callee.kind {
+        let cf = &p.fns[id as usize];
+        if cf.vm_role == VmRole::VmFn && cf.vm == Some(vm) {
+            return;
+        }
+    }
+    let by_ptr = fd.vm_role == VmRole::VmFn;
+    for &l in &fd.vm_state {
+        let lt = &fd.locals[l as usize].ty;
+        let t = match (by_ptr, lt) {
+            (true, Ty::Ptr(inner)) => (**inner).clone(),
+            (true, _) => continue,
+            (false, t) => t.clone(),
+        };
+        if !is_traced(p, &t) {
+            continue;
+        }
+        let slot = g.slots[l as usize].clone();
+        let at = if by_ptr { g.inst(format!("load ptr, ptr {}", slot)) } else { slot };
+        let v = g.load(&t, &at);
+        let copy = g.alloca(&t);
+        g.store(&t, &v, &copy);
+        roots.push((copy, t));
+    }
+}
+
+/// Entries start with their traced state variables zeroed: every later
+/// call that may collect roots them (`state_roots`), also those the entry
+/// never assigns, and zero is a valid value of every traced type.
+pub fn zero_traced_state(g: &mut FnGen) {
+    let p = g.p();
+    let fd = g.f();
+    if fd.vm.is_none() || fd.vm_role != VmRole::Entry {
+        return;
+    }
+    for &l in &fd.vm_state {
+        let t = fd.locals[l as usize].ty.clone();
+        if is_traced(p, &t) {
+            let slot = g.slots[l as usize].clone();
+            g.store(&t, "zeroinitializer", &slot);
+        }
+    }
 }
 
 pub fn pop_frame(g: &mut FnGen, prev: Option<String>) {

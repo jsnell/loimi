@@ -34,9 +34,10 @@ pub struct Machine {
     globals: *Value,
     nglobals: u32,
     heap: gc.Heap,
-    /// The state as of the last sync, for the root scanner.
+    /// The state as of the last sync, for the root scanner. (The cached
+    /// top of stack, state variable `tos`, needs no copy here: the
+    /// compiler roots traced state itself at calls that may collect.)
     sp: *Value,
-    tos: Value,
     lp: *Value,
     fp: *Frame,
     out: text.StrBuf,
@@ -52,13 +53,13 @@ pub struct Machine {
 /// The longest array `array` makes (a fuzzer-proof bound on allocation).
 pub const MAX_LEN: i32 = 1 << 24;
 
-/// GC roots: the data stack up to `sp`, the locals of every active frame,
+/// GC roots: the data stack up to `sp` (the top value, `tos`, is rooted
+/// by the compiler), the locals of every active frame,
 /// the globals and the constants.
 pub fn scan_roots(h: *gc.Heap, data: *u8) {
     let m = data as *Machine;
     var p = m.stack;
     while p <= m.sp { gc_mark(h, *p); p = p + 1; }
-    gc_mark(h, m.tos);
     let ltop = m.lp + m.fp.word.nlocals as u64;
     p = m.lstack;
     while p < ltop { gc_mark(h, *p); p = p + 1; }
@@ -164,7 +165,7 @@ pub vm Stak {
     operand cnt = it;
     operand label = pc + it verify is_insn_boundary(pc + it);
 
-    sync { ctx.sp = sp; ctx.tos = tos; ctx.lp = lp; ctx.fp = fp; }
+    sync { ctx.sp = sp; ctx.lp = lp; ctx.fp = fp; }
 
     encoding fixed(u32) {
         format N  { op: 8, x: 24 }
@@ -498,7 +499,6 @@ pub vm Stak {
         sp = m.stack - 1;
         tos = Nil;
         m.sp = sp;
-        m.tos = tos;
         m.lp = lp;
         m.fp = fp;
         jump main.code

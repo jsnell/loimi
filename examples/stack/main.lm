@@ -71,7 +71,7 @@ fn main() -> i32 uses gc {
         lstack: mem.alloc(LSTACK), lstack_end: 0 as *Value,
         frames: mem.alloc(FRAMES), frames_end: 0 as *Frame,
         words: 0 as *mem.Vec<*Word>, consts: 0 as *Value, globals: 0 as *Value, heap: gc.Heap.new(),
-        sp: 0 as *Value, tos: Value.Nil, lp: 0 as *Value, fp: 0 as *Frame,
+        sp: 0 as *Value, lp: 0 as *Value, fp: 0 as *Frame,
         out: text.StrBuf.new(), tmp: text.StrBuf.new(), err: text.StrBuf.new(),
         ..zero
     };

@@ -597,7 +597,12 @@ impl<'a, 'p> FnGen<'a, 'p> {
             }
             let slot = self.slots[lid as usize].clone();
             self.store(t, &pname, &slot);
-            self.live[0].push(lid);
+            // Vm state arrives in parameters in tail-call mode: it is
+            // rooted at calls that may collect by copy (`state_roots`),
+            // not through its own slot, which then stays in a register.
+            if !f.vm_state.contains(&lid) {
+                self.live[0].push(lid);
+            }
         }
         if let Some(x) = crate::vmgen::extra_param(p, f) {
             params.push(x);
@@ -626,6 +631,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
             self.live[0].push(r);
         }
         crate::vmgen::handler_prologue(&mut self);
+        crate::gcgen::zero_traced_state(&mut self);
         if f.track_caller && self.cold.is_none() {
             self.cg.caller_globals();
             self.emit("%caller.ptr = load ptr, ptr @loimi.caller_ptr");

@@ -209,7 +209,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     let mut allows = Vec::new();
     let mut modules = load(sm, input, &mut allows, opts.test)?;
     for (name, span, _) in &allows {
-        if !diag::LINTS.contains(&name.as_str()) {
+        if !diag::LINTS.contains(&name.as_str()) && !diag::RETIRED.contains(&name.as_str()) {
             return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
         }
     }

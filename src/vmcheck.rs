@@ -849,7 +849,6 @@ fn check_collects(c: &mut Checker, d: &VmDecl, i: usize) -> Res<()> {
                 .note(site, format!("{} may collect here", callee)));
             }
         }
-        warn_unsynced_roots(c, d, i, site);
     }
     Ok(())
 }
@@ -1284,47 +1283,6 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
     }
     set_body(c, fid, state.clone(), cx.locals, body, state);
     Ok(())
-}
-
-/// Lint `state_root`: vm code may collect, and a state variable holds GC
-/// references, but `sync` never reads it. A collection then cannot see
-/// what only a register holds (the root scanner reads memory), so the
-/// object it references may be freed while the register still points to
-/// it. Storing the variable in `sync` (`ctx.tos = tos`), where a root
-/// scanner marks it, is the fix.
-fn warn_unsynced_roots(c: &mut Checker, d: &VmDecl, i: usize, site: Span) {
-    for p in &d.state {
-        // By name: the checked state list starts with the context, if any.
-        let Some((_, ty)) = c.vms[i].state.iter().find(|(n, _)| *n == p.name.name) else { continue };
-        let ty = ty.clone();
-        if !crate::gcgen::is_traced(&c.prog, &ty) {
-            continue;
-        }
-        if d.sync.as_ref().is_some_and(|b| block_reads(b, &p.name.name)) {
-            continue;
-        }
-        let w = Diag::warning(
-            "state_root",
-            p.name.span,
-            format!(
-                "state variable `{}` holds GC references (`{}`), but `sync` does not store it: vm code may collect, and a collection sees only what a root scanner can read, not registers; store it in `sync` (`ctx.{} = {}`) and mark it in the scanner",
-                p.name.name,
-                c.ty_name(&ty),
-                p.name.name,
-                p.name.name
-            ),
-        )
-        .note(site, "vm code may collect here");
-        c.warnings.push(w);
-    }
-}
-
-/// Whether `b` mentions the name `x` anywhere (conservatively: as a
-/// read). Every construct is looked into, closure bodies included, so no
-/// mention is missed, and literals and other leaves mention nothing.
-fn block_reads(b: &Block, x: &str) -> bool {
-    let hit = |e: &Expr| matches!(&e.kind, ExprKind::Ident(n) if n == x);
-    AstAny { hit: &hit, vm: true, closures: true }.block(b)
 }
 
 /// Whether `b` assigns to the name `x` (`x = ..` or `x op= ..`), for

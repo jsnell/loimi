@@ -1,40 +1,129 @@
-// expect-stderr: state variable `acc` holds GC references (`V`), but `sync` does not store it
-// expect-no-stderr: state variable `top`
-// A state variable of a traced type (a cached top of stack) lives in a
-// register: a collection in vm code cannot see it unless `sync` stores
-// it where a root scanner reads it. Lint `state_root` warns when vm code
-// may collect and `sync` never mentions such a variable (`top` here is
-// stored, `acc` is not).
+// matrix: dispatch
+// expect: 42 5 2
+// expect: 42 5 2
+// expect: 42 5 2
+// expect: 42 5 2
+// expect: 42 5 2
+// expect: 42 5 4
+// expect: -1 0
+// State variables of traced types (a cached top of stack `top: V`, a
+// current object `cur: Gc<Str>`) are roots at every call that may
+// collect: the compiler copies them into the call's shadow-stack frame,
+// so `sync` and the root scanner need not know them. Nothing here roots
+// them by hand. Each program collects with only the state registers
+// holding objects, notes how many survived (the third number), then
+// allocates to reuse freed memory (a freed `Str { n: 42 }` would read
+// back as 7), at a call in an op's
+// fast path, in a `cold` block, in a vm function, in `on raise`, in an
+// entry before the first dispatch, and around a nested run that itself
+// collects.
 import std.io;
 import std.gc;
 
-object Str { data: [u8] }
+object Str { n: i64 }
 value V repr nanbox { Num(f64) unboxed, S(Gc<Str>), Nil }
 
-struct Ctx { heap: gc.Heap, top: V }
+struct Ctx { heap: gc.Heap, flag: bool, inner: *u32, live: u64 }
+
+/// Collect, note the objects that survived, and allocate garbage of
+/// `Str`'s size, which reuses freed `Str`s.
+fn collect(c: *Ctx) uses gc {
+    gc.collect(&c.heap);
+    c.live = c.heap.count;
+    for i in 0..256 { let _ = new(&c.heap, Str { n: 7 }); }
+}
+
+fn n_of(v: V) -> i64 {
+    match v { S(s) => s.n, _ => -1 }
+}
+
+/// Runs the nested program, which collects with its own `top`.
+fn nested(c: *Ctx) -> i64 uses reenter {
+    match M.inner(c, c.inner) { Ok(v) => v, Err(_) => -2 }
+}
 
 vm M {
     context ctx: *Ctx;
-    state { pc: *u32, top: V, acc: V }
+    // `spare` is never assigned: entries zero it, so rooting it is safe.
+    state { pc: *u32, top: V, cur: Gc<Str>, spare: V }
     encoding fixed(u32) { format N { op: 8, x: 24 } }
 
-    sync { ctx.top = top; }
+    reload { }
 
-    op NEW() : N {
-        let s = new(&ctx.heap, Str {}, 1);
-        top = S(s);
+    /// Collects through the state pointers a vm function sees.
+    fn collect_here() { collect(ctx); }
+
+    op NEW() : N { top = S(new(&ctx.heap, Str { n: 42 })); cur = new(&ctx.heap, Str { n: 5 }); next }
+    op GC() : N { collect(ctx); next }
+    op GCCOLD() : N {
+        if ctx.flag { cold { collect(ctx); next } }
         next
     }
-    op GC() : N { gc.collect(&ctx.heap); next }
-    op HALT() : N { acc = top; exit 0 }
+    op GCFN() : N { collect_here(); next }
+    op NEST() : N {
+        cold {
+            let r = nested(ctx);
+            if r != 42 { top = Nil; }
+            next
+        }
+    }
+    op RAISE() : N { raise 0 }
+    op HALT() : N { io.print_int(n_of(top)); io.print(" "); io.print_int(cur.n); io.print(" "); io.print_int(ctx.live as i64); exit Ok(0) }
+    op IHALT() : N { exit Ok(n_of(top)) }
 
-    entry run(c: *Ctx, code: *u32) -> i64 uses gc { ctx = c; pc = code; top = Nil; acc = Nil; jump code }
+    entry run(c: *Ctx, code: *u32) -> Result<i64, i64> uses gc { ctx = c; pc = code; top = Nil; jump code }
+    entry run_nil(c: *Ctx, code: *u32) -> Result<i64, i64> uses gc { ctx = c; pc = code; jump code }
+    /// Collects before the first dispatch, with the state already set.
+    entry run_pre(c: *Ctx, code: *u32) -> Result<i64, i64> uses gc {
+        ctx = c;
+        pc = code;
+        top = S(new(&c.heap, Str { n: 42 }));
+        cur = new(&c.heap, Str { n: 5 });
+        collect(c);
+        jump code
+    }
+    entry inner(c: *Ctx, code: *u32) -> Result<i64, i64> uses reenter {
+        ctx = c; pc = code; top = Nil;
+        jump code
+    }
+
+    on raise(e: i64) {
+        collect(ctx);
+        io.print_int(n_of(top)); io.print(" "); io.print_int(cur.n); io.print(" "); io.print_int(ctx.live as i64);
+        fail e
+    }
 }
 
-fn main() uses gc {
-    var c = Ctx { heap: gc.Heap.new(), top: V.Nil };
-    var code: [u32; 3] = [M.NEW(), M.GC(), M.HALT()];
-    io.print_int(M.run(&c, &code[0]));
+fn go(c: *Ctx, code: []u32, pre: bool) uses gc {
+    let r = if pre { M.run_pre(c, code.ptr) } else { M.run(c, code.ptr) };
+    match r {
+        Ok(_) => {}
+        Err(_) => {}
+    }
     io.println("");
 }
-// expect: 0
+
+fn main() uses reenter {
+    var c = Ctx { heap: gc.Heap.new(), flag: true, inner: 0 as *u32, live: 0 };
+    // The nested program exits with its own `top`'s `n`: `NEST` checks it.
+    var inner: [u32; 4] = [M.NEW(), M.GC(), M.GCFN(), M.IHALT()];
+    c.inner = &inner[0];
+    var a: [u32; 3] = [M.NEW(), M.GC(), M.HALT()];
+    go(&c, a[..], false);
+    var b: [u32; 3] = [M.NEW(), M.GCCOLD(), M.HALT()];
+    go(&c, b[..], false);
+    var d: [u32; 3] = [M.NEW(), M.GCFN(), M.HALT()];
+    go(&c, d[..], false);
+    var e: [u32; 3] = [M.NEW(), M.RAISE(), M.HALT()];
+    go(&c, e[..], false);
+    var f: [u32; 1] = [M.HALT()];
+    go(&c, f[..], true);
+    var g: [u32; 3] = [M.NEW(), M.NEST(), M.HALT()];
+    go(&c, g[..], false);
+    var z: [u32; 2] = [M.GC(), M.IHALT()];
+    // A state variable no one assigned reads as zero (`Num(0.0)`).
+    match M.run_nil(&c, &z[0]) { Ok(v) => io.print_int(v), Err(_) => {} }
+    io.print(" ");
+    io.print_int(c.live as i64);
+    io.println("");
+}

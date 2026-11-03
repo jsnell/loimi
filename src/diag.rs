@@ -26,7 +26,13 @@ pub struct Diag {
 }
 
 /// The warnings the compiler knows, for `#[allow(..)]`.
-pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "state_root", "hot_gc"];
+pub const LINTS: &[&str] = &["match_fallout", "super_overlap", "hot_gc"];
+
+/// Lints that no longer exist, still accepted by `#[allow(..)]` (which
+/// then has no effect) so that code naming them keeps building:
+/// `state_root` warned about traced vm state that `sync` did not store,
+/// before the compiler rooted such state itself (language.md section 8).
+pub const RETIRED: &[&str] = &["state_root"];
 
 /// Lints that are off unless turned on with `-W name`.
 pub const OPT_IN: &[&str] = &["hot_gc"];
