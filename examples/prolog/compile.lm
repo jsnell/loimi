@@ -66,6 +66,7 @@ pub fn key_of(t: Term) -> u64 {
         Ref(_) => 0,
         Lst(_) => KEY_LIST,
         Str(s) => (Term.Atom(s.f) as u64) | (1 << 40),
+        Big(_) => 0,      // equal values are different objects: not indexed
         _ => t as u64,
     }
 }
@@ -428,6 +429,7 @@ fn C.get_arg(c: *C, t0: Term, a: u8) {
             else { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
         }
         Flt(_) => { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
+        Big(_) => { let k = c.konst(t); c.emit(Wam.GET_CONST(a, k)); }
         Str(s) => {
             if s.f >= 65536 { c.error = Some("too many functors"); return; }
             c.emit(Wam.GET_STRUCT(a, s.f as u16));
@@ -476,6 +478,7 @@ fn C.unify_args(c: *C, t0: Term) {
                     else { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
                 }
                 Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+                Big(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
                 _ => {
                     let r = c.temp();
                     c.emit(Wam.UNIFY_VAR_X(r as u8));
@@ -526,6 +529,7 @@ fn C.put_arg(c: *C, t0: Term, a: u8) {
             else { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
         }
         Flt(_) => { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
+        Big(_) => { let k = c.konst(t); c.emit(Wam.PUT_CONST(a, k)); }
         _ => c.build(t, a),
     }
 }
@@ -554,6 +558,7 @@ fn C.set_simple(c: *C, a: Term) {
             else { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
         }
         Flt(_) => { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
+        Big(_) => { let k = c.konst(a); c.emit(Wam.SET_CONST(k as u32)); }
         _ => {}
     }
 }
@@ -640,6 +645,7 @@ fn C.arith_ok(c: *C, t0: Term, depth: u32) -> bool {
     match t {
         Int(_) => true,
         Flt(_) => true,
+        Big(_) => true,
         Ref(_) => { let vi = c.info(t); vi.seen and !vi.level }
         Str(s) => {
             let name = c.m.db.name(c.m.db.fname(s.f));

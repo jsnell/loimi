@@ -10,6 +10,8 @@ import std.io;
 import std.map.{HashMap};
 import term.{Term, Var, Struct, Cons, Db, deref};
 import term;
+import std.bigint;
+import arith;
 import compile.{Pred, Clause};
 
 pub const NREGS: u64 = 256;
@@ -205,6 +207,7 @@ pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
                 a = deref(x.tail);
                 b = deref(y.tail);
             }
+            (Big(x), Big(y)) => return bigint.eq(x.num(), y.num()),
             (Str(x), Str(y)) => {
                 if x.f != y.f { return false; }
                 let n = x.args.len;
@@ -225,6 +228,7 @@ fn order_class(t: Term) -> i32 {
         Ref(_) => 0,
         Flt(_) => 1,
         Int(_) => 1,
+        Big(_) => 1,
         Atom(_) => 3,
         _ => 4,
     }
@@ -233,17 +237,13 @@ fn order_class(t: Term) -> i32 {
 fn cmp_i(a: i64, b: i64) -> i32 { if a < b { -1 } else if a > b { 1 } else { 0 } }
 
 fn cmp_num(a: Term, b: Term) -> i32 {
+    let c = arith.cmp(a, b);
+    if c != 0 { return c; }
+    // Equal values: a float comes before an integer.
     match (a, b) {
-        (Int(x), Int(y)) => cmp_i(x as i64, y as i64),
-        (Flt(x), Flt(y)) => if x < y { -1 } else if x > y { 1 } else { 0 },
-        (Int(x), Flt(y)) => {
-            let fx = x as f64;
-            if fx < y { -1 } else if fx > y { 1 } else { 1 }    // equal: Float < Int
-        }
-        (Flt(x), Int(y)) => {
-            let fy = y as f64;
-            if x < fy { -1 } else if x > fy { 1 } else { -1 }
-        }
+        (Flt(_), Flt(_)) => 0,
+        (Flt(_), _) => -1,
+        (_, Flt(_)) => 1,
         _ => 0,
     }
 }
@@ -373,6 +373,8 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, m.ball);
     for i in 0..m.bags.len { gc_mark(h, m.bags.ptr[i]); }
     for i in 0..m.inits.len { gc_mark(h, m.inits.ptr[i]); }
+    // Code constants: big integers are in the heap.
+    for i in 0..m.consts.len { gc_mark(h, m.consts.ptr[i]); }
     for i in 0..m.tr { gc_mark(h, m.trail[i]); }
     // Environments: everything below the live top is scanned. Frames hold
     // raw pointers next to terms, which read as floats (term.lm). Above the

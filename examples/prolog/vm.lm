@@ -127,7 +127,8 @@ pub vm Wam {
                 if quick_bind(v) { store_bind(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
-            backtrack()
+            // Big integers are equal by value.
+            cold { if unify(ctx, t, value) { next } backtrack() }
         }
     }
     op GET_INT(r: xr, k: simm) : RsB {
@@ -216,7 +217,7 @@ pub vm Wam {
                 if quick_bind(v) { store_bind(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
-            backtrack()
+            cold { if unify(ctx, t, value) { next } backtrack() }
         }
     }
     op UNIFY_INT(k: simm) : sA {

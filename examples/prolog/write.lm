@@ -8,6 +8,7 @@ import term.{Term, Var, Struct, Cons, deref};
 import term;
 import machine.{Machine};
 import reader;
+import std.bigint;
 
 pub struct WOpts { quoted: bool, ignore_ops: bool, numbervars: bool }
 
@@ -128,6 +129,7 @@ fn W.number(w: *W, t: Term) {
     match t {
         Int(i) => tmp.push_int(i as i64),
         Flt(x) => write_float(&tmp, x),
+        Big(b) => bigint.write(&tmp, b.num(), 10),
         _ => {}
     }
     w.token(tmp.as_str());
@@ -156,6 +158,7 @@ fn W.write(w: *W, t0: Term, prec: u32) {
         Flt(_) => {
             if prec < 200 and is_negative(t) { w.b.push('('); w.number(t); w.b.push(')'); } else { w.number(t); }
         }
+        Big(_) => w.number(t),
         Atom(a) => {
             if prec < 999 and !w.o.ignore_ops and reader.is_op(m, a) {
                 // An operator as an operand of an operator: parenthesize.
@@ -309,7 +312,7 @@ fn term_prec(m: *Machine, t: Term) -> u32 {
 }
 
 fn is_number(t: Term) -> bool {
-    match t { Int(_) => true, Flt(_) => true, _ => false }
+    match t { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }
 }
 
 pub fn write_term(m: *Machine, b: *text.StrBuf, t: Term, o: WOpts) {

@@ -17,6 +17,7 @@ import compile;
 import write;
 import reader;
 import arith;
+import std.bigint;
 
 extern "C" fn clock() -> i64;
 extern "C" fn time(p: *u8) -> i64;
@@ -159,6 +160,7 @@ fn text_of(m: *Machine, t: Term, b: *text.StrBuf) -> bool {
         Atom(a) => { b.push_str(m.db.name(a)); true }
         Int(i) => { b.push_int(i as i64); true }
         Flt(f) => { write.write_float(b, f); true }
+        Big(n) => { bigint.write(b, n.num(), 10); true }
         _ => false,
     }
 }
@@ -463,6 +465,7 @@ fn format(m: *Machine, to_err: bool, f0: Term, args0: Term) -> Result<bool, Term
             'q' => write.write_term(m, &out, arg, write.quoted()),
             'a' => { if !text_of(m, arg, &out) { return Err(type_error(m, "atomic", arg)); } }
             'd' => {
+                if let Big(bn) = arg { bigint.write(&out, bn.num(), 10); continue; }
                 let v = get_int(m, arg)?;
                 if numarg > 0 {
                     var tmp = text.StrBuf.new();
@@ -584,8 +587,8 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
         IsVar => Ok(match x(m, 0) { Ref(_) => true, _ => false }),
         NonVar => Ok(match x(m, 0) { Ref(_) => false, _ => true }),
         IsAtom => Ok(match x(m, 0) { Atom(_) => true, _ => false }),
-        IsNumber => Ok(match x(m, 0) { Int(_) => true, Flt(_) => true, _ => false }),
-        IsInteger => Ok(match x(m, 0) { Int(_) => true, _ => false }),
+        IsNumber => Ok(match x(m, 0) { Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }),
+        IsInteger => Ok(match x(m, 0) { Int(_) => true, Big(_) => true, _ => false }),
         IsFloat => Ok(match x(m, 0) { Flt(_) => true, _ => false }),
         IsAtomic => Ok(term.is_atomic(x(m, 0))),
         IsCompound => Ok(match x(m, 0) { Str(_) => true, Lst(_) => true, _ => false }),

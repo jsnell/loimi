@@ -7,6 +7,8 @@ import term.{Term, deref};
 import term;
 import machine.{Machine};
 import builtins;
+import std.bigint;
+import std.bigint.{Big, Arg};
 
 extern "C" fn pow(x: f64, y: f64) -> f64;
 extern "C" fn exp(x: f64) -> f64;
@@ -25,9 +27,74 @@ extern "C" fn tanh(x: f64) -> f64;
 extern "C" fn round(x: f64) -> f64;
 
 fn int_result(m: *Machine, v: i64) -> Result<Term, Term> {
-    if !term.fits_int(v) { return Err(builtins.eval_error(m, "int_overflow")); }
+    if !term.fits_int(v) { return Ok(Term.Big(bigint.gc_of_i64(&m.heap, v))); }
     Ok(term.mk_int(v))
 }
+
+/// A big result back in the small representation if it fits.
+pub fn norm(b: Gc<Big>) -> Term {
+    if let Some(v) = bigint.to_i64(b.num()) { if term.fits_int(v) { return term.mk_int(v); } }
+    Term.Big(b)
+}
+
+fn barg(t: Term) -> Arg {
+    match t { Int(i) => Arg.Small(i as i64), Big(b) => Arg.Ref(b), _ => Arg.Small(0) }
+}
+
+fn is_big(t: Term) -> bool { match t { Big(_) => true, _ => false } }
+
+/// Binary integer arithmetic where an operand is big (or a small result
+/// overflowed).
+fn big_binary(m: *Machine, name: str, x: Term, y: Term) -> Result<Term, Term> {
+    let h = &m.heap;
+    let ys = cmp(y, term.mk_int(0));
+    match name {
+        "+" => Ok(norm(bigint.gc_add(h, barg(x), barg(y)))),
+        "-" => Ok(norm(bigint.gc_sub(h, barg(x), barg(y)))),
+        "*" => Ok(norm(bigint.gc_mul(h, barg(x), barg(y)))),
+        "//" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (q, _) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap(); Ok(norm(q)) }
+        "div" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (q, _) = bigint.gc_divmod(h, barg(x), barg(y), true).unwrap(); Ok(norm(q)) }
+        "mod" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (_, r) = bigint.gc_divmod(h, barg(x), barg(y), true).unwrap(); Ok(norm(r)) }
+        "rem" => { if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } let (_, r) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap(); Ok(norm(r)) }
+        "/" => {
+            if ys == 0 { return Err(builtins.eval_error(m, "zero_divisor")); }
+            let (q, r) = bigint.gc_divmod(h, barg(x), barg(y), false).unwrap();
+            if bigint.is_zero(r.num()) { return Ok(norm(q)); }
+            flt(m, to_f(x) / to_f(y))
+        }
+        "min" => Ok(if cmp(x, y) <= 0 { x } else { y }),
+        "max" => Ok(if cmp(x, y) >= 0 { x } else { y }),
+        "/\\" => Ok(norm(bigint.gc_and(h, barg(x), barg(y)))),
+        "\\/" => Ok(norm(bigint.gc_or(h, barg(x), barg(y)))),
+        "xor" => Ok(norm(bigint.gc_xor(h, barg(x), barg(y)))),
+        "gcd" => Ok(norm(bigint.gc_gcd(h, barg(x), barg(y)))),
+        ">>" => {
+            let Int(n) = y else { return Err(builtins.resource_error(m, "memory")); };
+            let k = n as i64;
+            if k < 0 { return Ok(norm(bigint.gc_shl(h, barg(x), (0 - k) as u64))); }
+            Ok(norm(bigint.gc_shr(h, barg(x), k as u64)))
+        }
+        "<<" => {
+            let Int(n) = y else { return Err(builtins.resource_error(m, "memory")); };
+            let k = n as i64;
+            if k < 0 { return Ok(norm(bigint.gc_shr(h, barg(x), (0 - k) as u64))); }
+            Ok(norm(bigint.gc_shl(h, barg(x), k as u64)))
+        }
+        "**" => big_pow(m, x, y),
+        "^" => big_pow(m, x, y),
+        _ => Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.atom(name), 2))),
+    }
+}
+
+fn big_pow(m: *Machine, x: Term, y: Term) -> Result<Term, Term> {
+    let Int(e) = y else { return Err(builtins.resource_error(m, "memory")); };
+    if (e as i64) < 0 {
+        if cmp(x, term.mk_int(1)) == 0 { return Ok(term.mk_int(1)); }
+        return Err(builtins.type_error(m, "float", x));
+    }
+    Ok(norm(bigint.gc_pow(&m.heap, barg(x), e as u64)))
+}
+
 
 fn flt(m: *Machine, x: f64) -> Result<Term, Term> {
     if x.is_nan() { return Err(builtins.eval_error(m, "undefined")); }
@@ -36,7 +103,7 @@ fn flt(m: *Machine, x: f64) -> Result<Term, Term> {
 }
 
 fn to_f(t: Term) -> f64 {
-    match t { Int(i) => i as f64, Flt(x) => x, _ => 0.0 }
+    match t { Int(i) => i as f64, Flt(x) => x, Big(b) => bigint.to_f64(b.num()), _ => 0.0 }
 }
 
 fn need_int(m: *Machine, t: Term) -> Result<i64, Term> {
@@ -47,7 +114,8 @@ fn need_int(m: *Machine, t: Term) -> Result<i64, Term> {
 }
 
 fn f_to_int(m: *Machine, x: f64) -> Result<Term, Term> {
-    if x.is_nan() or x > 9.0e18 or x < -9.0e18 { return Err(builtins.eval_error(m, "int_overflow")); }
+    if x.is_nan() or x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(builtins.eval_error(m, "undefined")); }
+    if x > 9.0e18 or x < -9.0e18 { return Ok(norm(bigint.gc_from_f64(&m.heap, x).unwrap())); }
     int_result(m, x as i64)
 }
 
@@ -56,6 +124,7 @@ pub fn eval(m: *Machine, t0: Term) -> Result<Term, Term> {
     let t = deref(t0);
     match t {
         Int(_) => return Ok(t),
+        Big(_) => return Ok(t),
         Flt(_) => return Ok(t),
         Ref(_) => return Err(builtins.inst_error(m)),
         Atom(a) => {
@@ -100,6 +169,22 @@ pub fn eval(m: *Machine, t0: Term) -> Result<Term, Term> {
 }
 
 fn unary(m: *Machine, name: str, x: Term, t: Term) -> Result<Term, Term> {
+    if let Big(b) = x {
+        match name {
+            "-" => return Ok(norm(bigint.gc_neg(&m.heap, Arg.Ref(b)))),
+            "+" => return Ok(x),
+            "abs" => return Ok(if b.neg { norm(bigint.gc_neg(&m.heap, Arg.Ref(b))) } else { x }),
+            "sign" => return Ok(term.mk_int(if b.neg { -1 } else { 1 })),
+            "integer" => return Ok(x),
+            "truncate" => return Ok(x),
+            "round" => return Ok(x),
+            "ceiling" => return Ok(x),
+            "floor" => return Ok(x),
+            "\\" => return Ok(norm(bigint.gc_not(&m.heap, Arg.Ref(b)))),
+            "msb" => return Ok(term.mk_int(bigint.bit_length(b.num()) as i64 - 1)),
+            _ => {}
+        }
+    }
     match name {
         "-" => match x { Int(i) => int_result(m, 0 - i as i64), _ => flt(m, 0.0 - to_f(x)) },
         "+" => Ok(x),
@@ -156,21 +241,24 @@ fn ipow(m: *Machine, b: i64, e: i64) -> Result<Term, Term> {
     var r: i64 = 1;
     var i: i64 = 0;
     while i < e {
-        match r.mul_checked(b) { Some(v) => r = v, None => return Err(builtins.eval_error(m, "int_overflow")) }
-        if !term.fits_int(r) { return Err(builtins.eval_error(m, "int_overflow")); }
+        match r.mul_checked(b) { Some(v) => r = v, None => return big_pow(m, term.mk_int(b), term.mk_int(e)) }
+        if !term.fits_int(r) { return big_pow(m, term.mk_int(b), term.mk_int(e)); }
         i += 1;
     }
     Ok(term.mk_int(r))
 }
 
 fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Term> {
+    if (is_big(x) or is_big(y)) and !is_flt(x) and !is_flt(y) {
+        if !(name.eq("atan2") or name.eq("atan") or name.eq("copysign") or name.eq("log")) { return big_binary(m, name, x, y); }
+    }
     if let (Int(a), Int(b)) = (x, y) {
         let a = a as i64;
         let b = b as i64;
         match name {
             "+" => return int_result(m, a + b),
             "-" => return int_result(m, a - b),
-            "*" => return match a.mul_checked(b) { Some(v) => int_result(m, v), None => Err(builtins.eval_error(m, "int_overflow")) },
+            "*" => return match a.mul_checked(b) { Some(v) => int_result(m, v), None => big_binary(m, name, x, y) },
             "//" => { if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); } return int_result(m, num.trunc_div(a, b).unwrap()); }
             "/" => {
                 if b == 0 { return Err(builtins.eval_error(m, "zero_divisor")); }
@@ -184,10 +272,9 @@ fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Ter
             "max" => return Ok(if a >= b { x } else { y }),
             ">>" => return Ok(term.mk_int(a >> (if b > 63 { 63 } else { b }))),
             "<<" => {
-                if b > 47 { return Err(builtins.eval_error(m, "int_overflow")); }
-                let r = a << b;
-                if (r >> b) != a { return Err(builtins.eval_error(m, "int_overflow")); }
-                return int_result(m, r);
+                if b < 0 { return Ok(term.mk_int(a >> (if -b > 63 { 63 } else { -b }))); }
+                if b > 15 { return big_binary(m, name, x, y); }
+                return int_result(m, a << b);
             }
             "/\\" => return Ok(term.mk_int(a & b)),
             "\\/" => return Ok(term.mk_int(a | b)),
@@ -246,13 +333,19 @@ fn binary(m: *Machine, name: str, x: Term, y: Term, t: Term) -> Result<Term, Ter
 pub fn cmp(x: Term, y: Term) -> i32 {
     match (x, y) {
         (Int(a), Int(b)) => if (a as i64) < (b as i64) { -1 } else if (a as i64) > (b as i64) { 1 } else { 0 },
+        (Flt(_), _) => fcmp(to_f(x), to_f(y)),
+        (_, Flt(_)) => fcmp(to_f(x), to_f(y)),
         _ => {
-            let a = to_f(x);
-            let b = to_f(y);
-            if a < b { -1 } else if a > b { 1 } else { 0 }
+            var la: [u64; 1] = [0; 1];
+            var lb: [u64; 1] = [0; 1];
+            let na = match x { Big(b) => b.num(), Int(i) => bigint.from_i64(la[0..1], i as i64), _ => bigint.from_i64(la[0..1], 0) };
+            let nb = match y { Big(b) => b.num(), Int(i) => bigint.from_i64(lb[0..1], i as i64), _ => bigint.from_i64(lb[0..1], 0) };
+            bigint.cmp(na, nb)
         }
     }
 }
+
+fn fcmp(a: f64, b: f64) -> i32 { if a < b { -1 } else if a > b { 1 } else { 0 } }
 fn is_flt(t: Term) -> bool { match t { Flt(_) => true, _ => false } }
 
 const OPNAMES: [str; 15] = ["+", "-", "*", "//", "mod", ">>", "<<", "/\\", "\\/", "div", "rem", "xor", "min", "max", "/"];

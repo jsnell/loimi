@@ -10,6 +10,7 @@ import std.mem;
 import std.text;
 import std.hash;
 import std.map.{HashMap};
+import std.bigint.{Big};
 
 /// A logic variable. `stamp` is the choicepoint counter when it was made: a
 /// binding is trailed only if the variable is older than the newest
@@ -33,6 +34,8 @@ pub value Term repr nanbox {
     Str(Gc<Struct>),
     Lst(Gc<Cons>),
     Unb,
+    /// An integer outside the 48-bit range (std.bigint, in the GC heap).
+    Big(Gc<Big>),
 }
 
 pub const MAX_INT: i64 = 140737488355327;     // 2^47 - 1
@@ -127,7 +130,7 @@ pub fn is_callable(t: Term) -> bool {
 }
 
 pub fn is_atomic(t: Term) -> bool {
-    match t { Atom(_) => true, Int(_) => true, Flt(_) => true, _ => false }
+    match t { Atom(_) => true, Int(_) => true, Flt(_) => true, Big(_) => true, _ => false }
 }
 
 /// A term's name and arity (lists are '[|]'/2), if it is callable or atomic.

@@ -9,6 +9,9 @@ import std.map.{HashMap};
 import term.{Term, Var, Struct, Cons, deref};
 import term;
 import machine.{Machine};
+import std.bigint;
+import std.bigint.{Arg};
+import arith;
 
 // Operator types.
 pub const XFX: u32 = 0;
@@ -117,7 +120,7 @@ pub fn op_def(m: *Machine, a: u32, kind: u64) -> ?u32 { m.ops.get(op_key(a, kind
 
 // ---- tokens --------------------------------------------------------------
 
-pub enum Tk { Atom, Var, Int, Flt, Str, BackQ, Open, OpenCT, Close, Comma, Bar, OpenList, CloseList, OpenCurly, CloseCurly, End, Eof }
+pub enum Tk { BigInt, Atom, Var, Int, Flt, Str, BackQ, Open, OpenCT, Close, Comma, Bar, OpenList, CloseList, OpenCurly, CloseCurly, End, Eof }
 
 pub struct Token {
     kind: Tk,
@@ -321,9 +324,9 @@ fn Reader.number(r: *Reader) {
         t.kind = Tk.Int;
         match num.parse_i64(r.buf.as_str(), 10) {
             Ok(v) => t.int = v,
-            Err(_) => { r.fail("integer too large"); t.int = 0; }
+            Err(_) => { t.kind = Tk.BigInt; t.text = r.arena.str(r.buf.as_str()); }
         }
-        if !term.fits_int(t.int) { r.fail("integer too large (this Prolog has 48-bit integers)"); }
+        if t.kind == Tk.Int and !term.fits_int(t.int) { t.kind = Tk.BigInt; t.text = r.arena.str(r.buf.as_str()); }
     }
 }
 
@@ -507,6 +510,7 @@ fn Reader.primary(r: *Reader, maxp: u32) -> (Term, u32) {
     let t = r.next();
     match t.kind {
         Int => return (term.mk_int(t.int), 0),
+        BigInt => { let s = t.text; return (big_of(r.m, s, false), 0); }
         Flt => return (Term.Flt(t.flt), 0),
         Var => { let name = t.text; return (r.variable(name), 0); }
         Str => {
@@ -569,9 +573,10 @@ fn Reader.after_atom(r: *Reader, a: u32, maxp: u32, quoted: bool) -> (Term, u32)
         r.next();
         return (r.arglist(a), 0);
     }
-    if !quoted and (a == term.A_MINUS or a == term.A_PLUS) and !nx.layout and (nx.kind == Tk.Int or nx.kind == Tk.Flt) {
+    if !quoted and (a == term.A_MINUS or a == term.A_PLUS) and !nx.layout and (nx.kind == Tk.Int or nx.kind == Tk.Flt or nx.kind == Tk.BigInt) {
         r.next();
         let t = &r.tok;
+        if t.kind == Tk.BigInt { let s = t.text; return (big_of(m, s, a == term.A_MINUS), 0); }
         if t.kind == Tk.Int {
             return (term.mk_int(if a == term.A_MINUS { 0 - t.int } else { t.int }), 0);
         }
@@ -694,6 +699,13 @@ pub fn Reader.var_list(r: *Reader) -> Term {
     t
 }
 
+/// A decimal integer literal too large for 48 bits.
+fn big_of(m: *Machine, digits: str, neg: bool) -> Term {
+    let b = bigint.gc_parse(&m.heap, digits, 10).unwrap();
+    if neg { return arith.norm(bigint.gc_neg(&m.heap, Arg.Ref(b))); }
+    arith.norm(b)
+}
+
 /// Parse a number from text (number_codes/2, atom_number/2).
 pub fn parse_number(m: *Machine, s: str) -> ?Term {
     var r = Reader.new(m, s);
@@ -709,6 +721,7 @@ pub fn parse_number(m: *Machine, s: str) -> ?Term {
     if r.error.is_some() { return None; }
     var res = Term.Unb;
     if kind == Tk.Int { res = term.mk_int(if neg { 0 - r.tok.int } else { r.tok.int }); }
+    else if kind == Tk.BigInt { res = big_of(m, r.tok.text, neg); }
     else if kind == Tk.Flt { res = Term.Flt(if neg { -r.tok.flt } else { r.tok.flt }); }
     else { return None; }
     r.skip_layout();
