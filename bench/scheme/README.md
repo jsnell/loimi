@@ -124,6 +124,9 @@ interesting size, takes 4.5 s).
 
 ## Results
 
+(See [`docs/results.md`](../../docs/results.md) for current numbers,
+all dispatch modes and the JIT, measured 2026-11-03.)
+
 `compare.py -n 3 --align 128` and the same with `--inner`, minimum of 3
 interleaved runs, seconds; ours is `--dispatch=tailcall` at commit
 84da73f. Intel i7-6700, gcc 14 / clang 19, 2026-11-02, one benchmark at a

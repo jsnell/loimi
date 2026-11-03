@@ -16,22 +16,24 @@ from the design.
 **Results so far.** `examples/mini` implements a Lua 5.4 subset
 ([spec](examples/mini/SPEC.md)). On 14 benchmarks written clean-room
 from that spec, it is faster than PUC-Lua 5.4 on all of them, taking
-0.36–0.76× of Lua's time. It is also faster than LuaJIT's hand-written
-assembly interpreter (`luajit -joff`) on 11 of them, and within 8% on
-the other three.
-See [`bench/mini/RESULTS.md`](bench/mini/RESULTS.md). Mini has Lua 5.4's
+0.29–0.76× of Lua's time (0.53× by geometric mean). It also takes less
+time than LuaJIT's hand-written assembly interpreter (`luajit -joff`) on
+13 of them and the same on the 14th (0.83× by geometric mean).
+All current numbers, for every example in every dispatch mode, are in
+[`docs/results.md`](docs/results.md); the optimization history is in
+[`bench/mini/RESULTS.md`](bench/mini/RESULTS.md). Mini has Lua 5.4's
 coroutines too ([design and notes](examples/mini/COROUTINES.md)): on
-three public coroutine benchmarks it takes about half of PUC-Lua's time.
+three coroutine benchmarks it takes 0.53–0.59× of PUC-Lua's time.
 
 [`examples/minijs`](examples/minijs) implements a JavaScript subset on
 the standard library's shape and inline-cache support. On its 14
 clean-room benchmarks it is faster than V8's bytecode interpreter
-(`node --jitless`: 0.53× of its time by geometric mean, 0.23–0.82× per
+(`node --jitless`: 0.52× of its time by geometric mean, 0.23–0.76× per
 benchmark) and faster than QuickJS (0.40×), on every one ([`bench/minijs/RESULTS.md`](bench/minijs/RESULTS.md)).
 [`examples/scheme`](examples/scheme) runs 41 unmodified programs from the
-public r7rs-benchmarks suite. By geometric mean it takes 0.29× of Gauche's
-time and 0.47× of Guile 3's time with Guile's JIT off, and is on par with
-Guile with its JIT (1.02×)
+public r7rs-benchmarks suite. By geometric mean it takes 0.27× of Gauche's
+time and 0.44× of Guile 3's time with Guile's JIT off, and 0.96× of
+Guile's with its JIT on
 ([`bench/scheme/README.md`](bench/scheme/README.md)).
 
 Four more examples were written by agents that read only the docs, as
@@ -41,15 +43,16 @@ Interpreters*. It passes all 246 tests of the book's official suite and
 takes 0.45× of the time of the book's C interpreter, clox, by geometric
 mean over its official benchmarks (faster on all 10).
 [`examples/regex`](examples/regex) is a backtracking regex engine shipped
-as a C library, checked against Python's `re`.
+as a C library, checked against Python's `re` (0.42× of its time and
+0.44× of the PCRE2 interpreter's by geometric mean over 8 patterns).
 [`examples/stack`](examples/stack) is a Forth-like stack VM using
 declared stack effects. [`examples/wasm`](examples/wasm) is a
 WebAssembly interpreter that passes every non-SIMD file of the spec
-test suite.
+test suite (0.91× of wasm3's time by geometric mean over 7 programs).
 
 `loimi build --jit-stencils` (x86-64 Linux) generates a copy-and-patch
 JIT from the same `vm` declarations, with no extra interpreter source:
-0.77–0.86 of the interpreter's time for Mini, MiniJS and Scheme
+0.75–0.86 of the interpreter's time for Mini, MiniJS and Scheme
 ([`docs/design/copy-and-patch.md`](docs/design/copy-and-patch.md)).
 
 ## Getting started
@@ -67,6 +70,7 @@ cargo test                                             # all tests
 tests/fuzz/run.sh -t 600 vm mini                       # bytecode fuzzing under ASan
 bench/run.sh                                           # Loimi VM vs hand-written C
 bench/lua/install.sh && bench/mini/compare.py          # Mini vs PUC-Lua / LuaJIT
+bench/run_all.py --quick                               # every example vs its references (docs/results.md)
 ./target/release/loimi test examples/lox/lox_test.lm   # #[test] functions
 ```
 

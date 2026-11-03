@@ -26,14 +26,17 @@ Progress (2026-11-02):
   `examples/scheme` (an R7RS-small subset) and `examples/minijs` (a
   JavaScript subset).
 - **Speed criterion 1 is met.** Mini beats PUC-Lua 5.4 on all 14
-  clean-room benchmarks, by 0.36–0.76× of Lua's time.
-- **The stretch goal is met.** Mini is faster than LuaJIT's interpreter
-  (`-joff`) on 11 of the 14, and within 8% on the rest.
-- MiniJS beats `node --jitless` (0.53× by geometric mean) and QuickJS
+  clean-room benchmarks, taking 0.29–0.76× of Lua's time (0.53× by
+  geometric mean). Current numbers for every interpreter:
+  [`results.md`](results.md).
+- **The stretch goal is met.** Mini takes less time than LuaJIT's
+  interpreter (`-joff`) on 13 of the 14 and the same on the last
+  (0.83× by geometric mean).
+- MiniJS beats `node --jitless` (0.52× by geometric mean) and QuickJS
   (0.40×) on all 14 of its clean-room benchmarks.
 - Scheme runs 41 unmodified r7rs-benchmarks programs. By geometric mean
-  it takes 0.29× of Gauche's time and 0.47× of Guile's with Guile's JIT
-  off, and about the same time as Guile with its JIT on.
+  it takes 0.27× of Gauche's time and 0.44× of Guile's with Guile's JIT
+  off, and 0.96× of Guile's with its JIT on.
 - Beyond the plan:
   - closures (non-escaping `block fn`, escaping `closure fn`) and traits;
   - C embedding (`--lib`, `--shared`, `--header`) with re-entrant natives;
@@ -241,8 +244,9 @@ quickening on/off.
      all their tests with the JIT forced on, with no change to their
      source. JIT against interpreter, by geometric mean: Mini 0.77,
      MiniJS 0.85, Scheme 0.79 (Scheme with the JIT is 0.80 of Guile 3's
-     time with its JIT). A JIT build with the JIT off now runs the
-     default build's handlers (counting copies are swapped in only with
+     time with its JIT). Remeasured 2026-11-03
+     ([`results.md`](results.md)): 0.75, 0.86, 0.81. A JIT build with
+     the JIT off now runs the default build's handlers (counting copies are swapped in only with
      `LOIMI_JIT=1`) and is within noise of a default build (was +5%).
      Stencil builds take a third less time.
    - *Where the time goes.* Dispatch and operand decoding were 20–40% of
@@ -364,7 +368,8 @@ quickening on/off.
       each op's "result to the accumulator" and "operand from it"
       variants, and `Vm.accumulate` selects them where a temporary goes
       from one op to the next. The wasm interpreter got 0.91 of its time
-      (geometric mean of seven programs; 0.87 of wasm3's), and 0.79 with
+      (geometric mean of seven programs; 0.87 of wasm3's then, 0.91 in
+      `results.md`, where wasm3 ran fasta faster), and 0.79 with
       supers over the variants (`examples/wasm/FRICTION.md`). Open:
       selection is a greedy pass over adjacent pairs (the goto-mode
       build's cost, which grew about 7x per doubling of the op count, is

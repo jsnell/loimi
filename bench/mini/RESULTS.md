@@ -12,6 +12,9 @@ well with Loimi because every handler is its own symbol.
 
 ## Current results
 
+(See [`docs/results.md`](../../docs/results.md) for current numbers,
+all dispatch modes and the JIT, measured 2026-11-03.)
+
 Commit fe6c642 (second phase). `--dispatch=tailcall` and `goto` are the
 same source; "(before)" is Mini/-joff at the end of the first phase
 (87cd496). Machine load was low for this run (load average below 2.5 at
