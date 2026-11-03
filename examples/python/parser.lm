@@ -103,7 +103,7 @@ fn P.statement(p: *P, out: Body) {
                 let c = p.test();
                 var v: ?*Expr = None;
                 if p.eat(T.As) { v = Some(p.target()); }
-                items.push(WithItem { ctx: c, var: v });
+                items.push(WithItem { ctx: c, target: v });
                 if !p.eat(T.Comma) { break; }
             }
             let b = p.block();

@@ -70,7 +70,7 @@ pub struct FuncDef {
 pub struct ClassDef { name: str, bases: Exprs, body: Body, decorators: Exprs, line: u32 }
 pub struct Handler { typ: ?*Expr, name: ?str, body: Body, line: u32 }
 pub struct TryS { body: Body, handlers: *mem.Vec<Handler>, orelse: Body, finalbody: Body }
-pub struct WithItem { ctx: *Expr, var: ?*Expr }
+pub struct WithItem { ctx: *Expr, target: ?*Expr }
 
 pub enum S {
     ExprS(*Expr),

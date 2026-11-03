@@ -1,0 +1,502 @@
+// str(), repr(), format specs and %-formatting.
+import std.gc;
+import std.mem;
+import std.text;
+import std.num;
+import value;
+import value.{Value, Str, List, Tuple, Dict, Inst, Func, Box,
+              K_CLASS, K_BOUND, K_BIG, K_RANGE, K_SET, K_FROZENSET, K_MODULE, K_DICTVIEW, K_GEN, K_NOTIMPL};
+import big;
+import vm;
+import vm.{Ctx};
+import ops;
+import builtins;
+import builtins.{E_TYPE, E_VALUE};
+
+extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
+
+fn mkstr(c: *Ctx, b: *text.StrBuf) -> Value {
+    let s = value.new_str(&c.heap, b.as_str());
+    b.free();
+    Value.Str(s)
+}
+
+pub fn to_str(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
+    if let Str(_) = v { return Ok(v); }
+    var b = text.StrBuf.new();
+    let r = write_str(c, &b, v);
+    if let Err(e) = r { b.free(); return Err(e); }
+    Ok(mkstr(c, &b))
+}
+
+pub fn repr(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
+    var b = text.StrBuf.new();
+    let r = write_repr(c, &b, v);
+    if let Err(e) = r { b.free(); return Err(e); }
+    Ok(mkstr(c, &b))
+}
+
+/// str(v) appended to b.
+pub fn write_str(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses reenter {
+    match v {
+        Str(s) => { b.push_str(s.data); Ok(()) }
+        Inst(i) => {
+            if let Some(m) = ops.class_lookup(i.cls, vm.intern(c, "__str__")) {
+                let args = [v];
+                let r = vm.invoke(c, m, args[..])?;
+                let Str(s) = r else { return Err(ops.exc(c, E_TYPE, "__str__ returned non-string")); };
+                b.push_str(s.data);
+                return Ok(());
+            }
+            if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) and ops.class_lookup(i.cls, vm.intern(c, "__repr__")).is_none() {
+                let args = value.dict_get_str(i.dict, vm.intern(c, "args")) ?? Value.Nil;
+                if let Tuple(t) = args {
+                    if t.items.len == 0 { return Ok(()); }
+                    if t.items.len == 1 { return write_str(c, b, t.items[0]); }
+                }
+                return write_repr(c, b, args);
+            }
+            write_repr(c, b, v)
+        }
+        _ => write_repr(c, b, v),
+    }
+}
+
+fn hexdigit(x: u8) -> u8 { if x < 10 { '0' + x } else { 'a' + x - 10 } }
+
+pub fn write_str_repr(b: *text.StrBuf, s: str) {
+    var has_sq = false;
+    var has_dq = false;
+    for i in 0..s.len { if s[i] == '\'' { has_sq = true; } if s[i] == '"' { has_dq = true; } }
+    let q: u8 = if has_sq and !has_dq { '"' } else { '\'' };
+    b.push(q);
+    for i in 0..s.len {
+        let ch = s[i];
+        if ch == q or ch == '\\' { b.push('\\'); b.push(ch); }
+        else if ch == '\n' { b.push_str("\\n"); }
+        else if ch == '\t' { b.push_str("\\t"); }
+        else if ch == '\r' { b.push_str("\\r"); }
+        else if ch < 32 or ch == 127 { b.push_str("\\x"); b.push(hexdigit(ch >> 4)); b.push(hexdigit(ch & 15)); }
+        else { b.push(ch); }
+    }
+    b.push(q);
+}
+
+fn write_hex_addr(b: *text.StrBuf, x: u64) {
+    b.push_str("0x");
+    num.write_hex(b, x);
+}
+
+pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses reenter {
+    match v {
+        Nil => b.push_str("None"),
+        Undef => b.push_str("<undefined>"),
+        Bool(x) => b.push_str(if x { "True" } else { "False" }),
+        Int(i) => b.push_int(i as i64),
+        Float(f) => value.write_float(b, f),
+        Str(s) => write_str_repr(b, s.data),
+        List(l) => {
+            if c.vm_depth > 150 { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
+            b.push('[');
+            for i in 0..l.len {
+                if i > 0 { b.push_str(", "); }
+                write_repr(c, b, l.arr.items[i])?;
+            }
+            b.push(']');
+        }
+        Tuple(t) => {
+            b.push('(');
+            for i in 0..t.items.len {
+                if i > 0 { b.push_str(", "); }
+                write_repr(c, b, t.items[i])?;
+            }
+            if t.items.len == 1 { b.push(','); }
+            b.push(')');
+        }
+        Dict(d) => {
+            b.push('{');
+            var it: u64 = 0;
+            var first = true;
+            while let Some(e) = value.dict_next(d, &it) {
+                if !first { b.push_str(", "); }
+                first = false;
+                write_repr(c, b, value.dict_key(d, e))?;
+                b.push_str(": ");
+                write_repr(c, b, value.dict_val(d, e))?;
+            }
+            b.push('}');
+        }
+        Func(f) => { b.push_str("<function "); b.push_str(f.proto.name); b.push_str(" at "); write_hex_addr(b, f as u64); b.push('>'); }
+        Builtin(_) => b.push_str("<built-in function>"),
+        Inst(i) => {
+            if let Some(m) = ops.class_lookup(i.cls, vm.intern(c, "__repr__")) {
+                let args = [v];
+                let r = vm.invoke(c, m, args[..])?;
+                let Str(s) = r else { return Err(ops.exc(c, E_TYPE, "__repr__ returned non-string")); };
+                b.push_str(s.data);
+                return Ok(());
+            }
+            if ops.subclass(i.cls, c.excs[builtins.E_BASE].unwrap()) {
+                b.push_str(ops.class_name(i.cls));
+                let args = value.dict_get_str(i.dict, vm.intern(c, "args")) ?? Value.Nil;
+                if let Tuple(t) = args and t.items.len == 1 {
+                    b.push('(');
+                    write_repr(c, b, t.items[0])?;
+                    b.push(')');
+                } else {
+                    write_repr(c, b, args)?;
+                }
+                return Ok(());
+            }
+            b.push_str("<__main__.");
+            b.push_str(ops.class_name(i.cls));
+            b.push_str(" object at ");
+            write_hex_addr(b, i as u64);
+            b.push('>');
+        }
+        Obj(o) => {
+            match o.kind {
+                K_BIG => big.write(b, v),
+                K_CLASS => {
+                    b.push_str("<class '");
+                    if o.n == 0 and !is_builtin_exc(c, o) { b.push_str("__main__."); }
+                    b.push_str(ops.class_name(o));
+                    b.push_str("'>");
+                }
+                K_RANGE => {
+                    b.push_str("range(");
+                    b.push_int(o.n);
+                    b.push_str(", ");
+                    b.push_int(o.m);
+                    if o.s != 1 { b.push_str(", "); b.push_int(o.s); }
+                    b.push(')');
+                }
+                K_SET | K_FROZENSET => {
+                    let d = o.dict.unwrap();
+                    if d.len == 0 { b.push_str(if o.kind == K_SET { "set()" } else { "frozenset()" }); return Ok(()); }
+                    if o.kind == K_FROZENSET { b.push_str("frozenset("); }
+                    b.push('{');
+                    var it: u64 = 0;
+                    var first = true;
+                    while let Some(e) = value.dict_next(d, &it) {
+                        if !first { b.push_str(", "); }
+                        first = false;
+                        write_repr(c, b, value.dict_key(d, e))?;
+                    }
+                    b.push('}');
+                    if o.kind == K_FROZENSET { b.push(')'); }
+                }
+                K_DICTVIEW => {
+                    b.push_str(if o.m == 0 { "dict_keys([" } else if o.m == 1 { "dict_values([" } else { "dict_items([" });
+                    let Dict(d) = o.a else { trap() };
+                    var it: u64 = 0;
+                    var first = true;
+                    while let Some(e) = value.dict_next(d, &it) {
+                        if !first { b.push_str(", "); }
+                        first = false;
+                        if o.m == 0 { write_repr(c, b, value.dict_key(d, e))?; }
+                        else if o.m == 1 { write_repr(c, b, value.dict_val(d, e))?; }
+                        else {
+                            b.push('(');
+                            write_repr(c, b, value.dict_key(d, e))?;
+                            b.push_str(", ");
+                            write_repr(c, b, value.dict_val(d, e))?;
+                            b.push(')');
+                        }
+                    }
+                    b.push_str("])");
+                }
+                K_MODULE => {
+                    b.push_str("<module '");
+                    if let Str(s) = o.a { b.push_str(s.data); }
+                    b.push_str("'>");
+                }
+                K_NOTIMPL => b.push_str("NotImplemented"),
+                K_BOUND => {
+                    b.push_str("<bound method ");
+                    if let Func(f) = o.b { b.push_str(f.proto.name); }
+                    b.push_str(" of ");
+                    write_repr(c, b, o.a)?;
+                    b.push('>');
+                }
+                K_GEN => { b.push_str("<generator object at "); write_hex_addr(b, o as u64); b.push('>'); }
+                _ => {
+                    b.push('<');
+                    b.push_str(ops.type_name(c, v));
+                    b.push_str(" object at ");
+                    write_hex_addr(b, o as u64);
+                    b.push('>');
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_builtin_exc(c: *Ctx, cls: Gc<Box>) -> bool {
+    for i in 0..32 {
+        if let Some(e) = c.excs[i] and (e as u64) == (cls as u64) { return true; }
+    }
+    false
+}
+
+// ── format specs ────────────────────────────────────────────────────
+
+struct Spec { fill: u8, align: u8, sign: u8, alt: bool, zero: bool, width: u64, comma: u8, prec: i64, ty: u8 }
+
+fn isalign(ch: u8) -> bool { ch == '<' or ch == '>' or ch == '^' or ch == '=' }
+
+fn parse_spec(s: str) -> ?Spec {
+    var sp = Spec { fill: ' ', align: 0, sign: '-', alt: false, zero: false, width: 0, comma: 0, prec: -1, ty: 0 };
+    var i: u64 = 0;
+    if s.len >= 2 and isalign(s[1]) { sp.fill = s[0]; sp.align = s[1]; i = 2; }
+    else if s.len >= 1 and isalign(s[0]) { sp.align = s[0]; i = 1; }
+    if i < s.len and (s[i] == '+' or s[i] == '-' or s[i] == ' ') { sp.sign = s[i]; i += 1; }
+    if i < s.len and s[i] == '#' { sp.alt = true; i += 1; }
+    if i < s.len and s[i] == '0' { sp.zero = true; i += 1; }
+    while i < s.len and text.is_digit(s[i]) { sp.width = sp.width * 10 + (s[i] - '0') as u64; i += 1; }
+    if i < s.len and (s[i] == ',' or s[i] == '_') { sp.comma = s[i]; i += 1; }
+    if i < s.len and s[i] == '.' {
+        i += 1;
+        sp.prec = 0;
+        while i < s.len and text.is_digit(s[i]) { sp.prec = sp.prec * 10 + (s[i] - '0') as i64; i += 1; }
+    }
+    if i < s.len { sp.ty = s[i]; i += 1; }
+    if i != s.len { return None; }
+    Some(sp)
+}
+
+pub fn write_c_float_pub(b: *text.StrBuf, ty: u8, prec: i64, x: f64) { write_c_float(b, ty, prec, x); }
+
+fn write_c_float(b: *text.StrBuf, ty: u8, prec: i64, x: f64) {
+    var buf: [u8; 512] = [0; 512];
+    var f: [u8; 6] = ['%', '.', '*', 'f', 0, 0];
+    f[3] = ty;
+    let n = snprintf(&buf[0], 512, &f[0], prec as i32, x);
+    let m = if n > 511 { 511 } else { n as u64 };
+    b.push_str(buf[0..m]);
+}
+
+/// Insert thousands separators into the digits of b[start..].
+fn group(b: *text.StrBuf, start: u64, sep: u8) {
+    let s = b.as_str();
+    var digits_end = start;
+    while digits_end < s.len and text.is_digit(s[digits_end]) { digits_end += 1; }
+    let nd = digits_end - start;
+    if nd <= 3 { return; }
+    var t = text.StrBuf.new();
+    for i in 0..nd {
+        if i > 0 and (nd - i) % 3 == 0 { t.push(sep); }
+        t.push(s[start + i]);
+    }
+    t.push_str(s[digits_end..s.len]);
+    b.bytes.len = start;
+    b.push_str(t.as_str());
+    t.free();
+}
+
+fn pad(b: *text.StrBuf, body: str, sp: *Spec, numeric: bool) {
+    let n = body.len;
+    if sp.width <= n { b.push_str(body); return; }
+    let padn = sp.width - n;
+    var align = sp.align;
+    var fill = sp.fill;
+    if align == 0 {
+        if sp.zero and numeric { align = '='; fill = '0'; }
+        else { align = if numeric { '>' } else { '<' }; }
+    }
+    if align == '<' { b.push_str(body); for _i in 0..padn { b.push(fill); } }
+    else if align == '>' { for _i in 0..padn { b.push(fill); } b.push_str(body); }
+    else if align == '^' {
+        let l = padn / 2;
+        for _i in 0..l { b.push(fill); }
+        b.push_str(body);
+        for _i in 0..padn - l { b.push(fill); }
+    } else {
+        // '=': padding after the sign
+        var k: u64 = 0;
+        if n > 0 and (body[0] == '-' or body[0] == '+' or body[0] == ' ') { b.push(body[0]); k = 1; }
+        for _i in 0..padn { b.push(fill); }
+        b.push_str(body[k..n]);
+    }
+}
+
+pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter {
+    if spec.len == 0 { return to_str(c, v); }
+    if let Inst(_) = v {
+        let args = [Value.Str(value.new_str(&c.heap, spec))];
+        if let Some(r) = ops.call_method(c, v, "__format__", args[..])? { return Ok(r); }
+    }
+    let Some(sp0) = parse_spec(spec) else { return Err(ops.exc(c, E_VALUE, "Invalid format specifier")); };
+    var sp = sp0;
+    var body = text.StrBuf.new();
+    var numeric = false;
+    let ty = sp.ty;
+    if value.is_num(v) and !(ty == 's') {
+        numeric = true;
+        let isfloat = if let Float(_) = v { true } else { false };
+        if ty == 'd' or ty == 'n' or ((ty == 0) and !isfloat) or ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' or ty == 'c' {
+            if isfloat { body.free(); return Err(ops.exc(c, E_VALUE, "Unknown format code 'd' for object of type 'float'")); }
+            let neg = big.is_neg(v);
+            if neg { body.push('-'); } else if sp.sign == '+' { body.push('+'); } else if sp.sign == ' ' { body.push(' '); }
+            let start = body.len();
+            let av = big.abs(&c.heap, v);
+            if ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' {
+                let radix: u64 = if ty == 'o' { 8 } else if ty == 'b' { 2 } else { 16 };
+                if sp.alt { body.push('0'); body.push(if ty == 'o' { 'o' } else if ty == 'b' { 'b' } else { ty }); }
+                builtins.write_radix(&c.heap, &body, av, radix, ty == 'X');
+            } else if ty == 'c' {
+                body.push((value.as_i64(av) ?? 63) as u8);
+            } else {
+                big.write(&body, av);
+                if sp.comma != 0 { group(&body, start, sp.comma); }
+            }
+        } else {
+            var x = value.to_f64(v).unwrap();
+            let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
+            if neg { x = 0.0 - x; body.push('-'); } else if sp.sign == '+' { body.push('+'); } else if sp.sign == ' ' { body.push(' '); }
+            let start = body.len();
+            if x != x { body.push_str("nan"); }
+            else if x == 1.0 / 0.0 { body.push_str("inf"); }
+            else if ty == 'f' or ty == 'F' { write_c_float(&body, 'f', if sp.prec < 0 { 6 } else { sp.prec }, x); }
+            else if ty == 'e' or ty == 'E' { write_c_float(&body, ty, if sp.prec < 0 { 6 } else { sp.prec }, x); }
+            else if ty == '%' { write_c_float(&body, 'f', if sp.prec < 0 { 6 } else { sp.prec }, x * 100.0); body.push('%'); }
+            else if ty == 'g' or ty == 'G' {
+                write_c_float(&body, ty, if sp.prec < 0 { 6 } else if sp.prec == 0 { 1 } else { sp.prec }, x);
+            } else {
+                // no type: like repr, or %g-ish with precision
+                if sp.prec < 0 { value.write_float(&body, x); }
+                else {
+                    write_c_float(&body, 'g', if sp.prec == 0 { 1 } else { sp.prec }, x);
+                    let s = body.as_str();
+                    var dot = false;
+                    for i in start..s.len { if s[i] == '.' or s[i] == 'e' or s[i] == 'n' or s[i] == 'i' { dot = true; } }
+                    if !dot { body.push_str(".0"); }
+                }
+            }
+            if sp.comma != 0 { group(&body, start, sp.comma); }
+        }
+    } else {
+        let s = to_str(c, v)?;
+        let Str(ss) = s else { trap() };
+        let d = ss.data;
+        let n = if sp.prec >= 0 and (sp.prec as u64) < d.len { sp.prec as u64 } else { d.len };
+        body.push_str(d[0..n]);
+    }
+    var out = text.StrBuf.new();
+    pad(&out, body.as_str(), &sp, numeric);
+    body.free();
+    Ok(mkstr(c, &out))
+}
+
+// ── % formatting ────────────────────────────────────────────────────
+
+pub fn percent(c: *Ctx, fs: Gc<Str>, args: Value) -> Result<Value, Value> uses reenter {
+    let f = fs.data;
+    var b = text.StrBuf.new();
+    var ai: u64 = 0;
+    let tup = if let Tuple(t) = args { Some(t) } else { None };
+    let nargs = if let Some(t) = tup { t.items.len } else { 1 };
+    var i: u64 = 0;
+    while i < f.len {
+        let ch = f[i];
+        if ch != '%' { b.push(ch); i += 1; continue; }
+        i += 1;
+        if i >= f.len { b.free(); return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        if f[i] == '%' { b.push('%'); i += 1; continue; }
+        // Mapping key.
+        var arg: Value = Value.Nil;
+        var keyed = false;
+        if f[i] == '(' {
+            let ks = i + 1;
+            while i < f.len and f[i] != ')' { i += 1; }
+            let key = value.new_str(&c.heap, f[ks..i]);
+            i += 1;
+            let Dict(d) = args else { b.free(); return Err(ops.exc(c, E_TYPE, "format requires a mapping")); };
+            let Some(v) = value.dict_get_str(d, key) else { b.free(); return Err(ops.key_error(c, Value.Str(key))); };
+            arg = v;
+            keyed = true;
+        }
+        var spec = text.StrBuf.new();
+        var flags_minus = false;
+        while i < f.len and (f[i] == '-' or f[i] == '+' or f[i] == ' ' or f[i] == '0' or f[i] == '#') {
+            if f[i] == '-' { flags_minus = true; } else { spec.push(f[i]); }
+            i += 1;
+        }
+        var width = text.StrBuf.new();
+        if i < f.len and f[i] == '*' {
+            i += 1;
+            let wv = if let Some(t) = tup { if ai < t.items.len { t.items[ai] } else { Value.Nil } } else { args };
+            ai += 1;
+            width.push_int(value.as_i64(wv) ?? 0);
+        }
+        while i < f.len and text.is_digit(f[i]) { width.push(f[i]); i += 1; }
+        var prec = text.StrBuf.new();
+        if i < f.len and f[i] == '.' {
+            prec.push('.');
+            i += 1;
+            while i < f.len and text.is_digit(f[i]) { prec.push(f[i]); i += 1; }
+            if prec.len() == 1 { prec.push('0'); }
+        }
+        if i >= f.len { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        let conv = f[i];
+        i += 1;
+        if !keyed {
+            if let Some(t) = tup {
+                if ai >= t.items.len { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_TYPE, "not enough arguments for format string")); }
+                arg = t.items[ai];
+            } else {
+                if ai >= 1 { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_TYPE, "not enough arguments for format string")); }
+                arg = args;
+            }
+            ai += 1;
+        }
+        // Build a format spec and reuse format().
+        var full = text.StrBuf.new();
+        if flags_minus { full.push('<'); } else if conv == 's' or conv == 'r' or conv == 'a' { full.push('>'); }
+        full.push_str(spec.as_str());
+        full.push_str(width.as_str());
+        var piece: Value = Value.Nil;
+        if conv == 's' or conv == 'r' or conv == 'a' {
+            let sv = if conv == 's' { to_str(c, arg)? } else { repr(c, arg)? };
+            full.push_str(prec.as_str());
+            piece = format(c, sv, full.as_str())?;
+        } else if conv == 'd' or conv == 'i' or conv == 'u' {
+            var iv = arg;
+            if let Float(x) = arg { iv = builtins.float_to_int(c, x)?; }
+            if !value.is_int(iv) {
+                full.free(); spec.free(); width.free(); prec.free(); b.free();
+                var m = text.StrBuf.new();
+                m.push_str("%d format: a real number is required, not ");
+                m.push_str(ops.type_name(c, arg));
+                return Err(ops.exc_buf(c, E_TYPE, &m));
+            }
+            full.push('d');
+            piece = format(c, iv, full.as_str())?;
+        } else if conv == 'f' or conv == 'F' or conv == 'e' or conv == 'E' or conv == 'g' or conv == 'G' {
+            let Some(x) = value.to_f64(arg) else {
+                full.free(); spec.free(); width.free(); prec.free(); b.free();
+                var m = text.StrBuf.new();
+                m.push_str("must be real number, not ");
+                m.push_str(ops.type_name(c, arg));
+                return Err(ops.exc_buf(c, E_TYPE, &m));
+            };
+            full.push_str(prec.as_str());
+            full.push(conv);
+            piece = format(c, Value.Float(x), full.as_str())?;
+        } else if conv == 'x' or conv == 'X' or conv == 'o' or conv == 'c' {
+            full.push(conv);
+            piece = format(c, arg, full.as_str())?;
+        } else {
+            full.free(); spec.free(); width.free(); prec.free(); b.free();
+            return Err(ops.exc(c, E_VALUE, "unsupported format character"));
+        }
+        if let Str(ps) = piece { b.push_str(ps.data); }
+        full.free(); spec.free(); width.free(); prec.free();
+    }
+    if tup.is_some() and ai < nargs {
+        b.free();
+        return Err(ops.exc(c, E_TYPE, "not all arguments converted during string formatting"));
+    }
+    Ok(mkstr(c, &b))
+}

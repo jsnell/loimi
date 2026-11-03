@@ -1,0 +1,1719 @@
+// Scope analysis and bytecode generation.
+import std.gc;
+import std.mem;
+import std.text;
+import std.map;
+import std.bc;
+import std.io;
+import lexer;
+import lexer.{Lexer};
+import parser;
+import parser.{P};
+import ast;
+import ast.{E, Expr, S, Stmt, Exprs, Body, BinOp, CmpOp, UnOp, Arg, Comp, FPart, Param, FuncDef, ClassDef, Handler, TryS, WithItem};
+import value;
+import value.{Value, Str, Tuple, Dict, Func};
+import big;
+import vm;
+import vm.{Ctx, Proto, Py, P_VARARGS, P_VARKW, P_GEN};
+import ops;
+import builtins;
+
+// ── scopes ──────────────────────────────────────────────────────────
+
+const SC_MODULE: u8 = 0;
+const SC_FUNC: u8 = 1;
+const SC_CLASS: u8 = 2;
+
+type Set = map.HashMap<str, bool>;
+
+struct Scope {
+    kind: u8,
+    parent: ?*Scope,
+    bound: Set,
+    order: mem.Vec<str>,
+    globals: Set,
+    nonlocals: Set,
+    uses: mem.Vec<str>,
+    cells: Set,
+    frees: mem.Vec<str>,
+    children: mem.Vec<*Scope>,
+    is_gen: bool,
+    uses_super: bool,
+}
+
+struct An {
+    arena: *mem.Arena,
+    scopes: map.HashMap<u64, *Scope>,
+    comp: mem.Vec<str>,
+}
+
+fn new_scope(a: *An, kind: u8, parent: ?*Scope) -> *Scope {
+    let s = new(a.arena, Scope { kind: kind, parent: parent, bound: map.HashMap.new(), order: mem.Vec.new(),
+        globals: map.HashMap.new(), nonlocals: map.HashMap.new(), uses: mem.Vec.new(), cells: map.HashMap.new(),
+        frees: mem.Vec.new(), children: mem.Vec.new(), is_gen: false, uses_super: false });
+    if let Some(p) = parent { p.children.push(s); }
+    s
+}
+
+fn Scope.bind(s: *Scope, name: str) {
+    if s.globals.contains(name) or s.nonlocals.contains(name) { return; }
+    if s.bound.insert(name, true) { s.order.push(name); }
+}
+
+fn An.in_comp(a: *An, name: str) -> bool {
+    for i in 0..a.comp.len { if a.comp.at(i).eq(name) { return true; } }
+    false
+}
+
+fn An.target(a: *An, s: *Scope, t: *Expr) {
+    match t.e {
+        Name(n) => if !a.in_comp(n) { s.bind(n); },
+        Tuple(_) | List(_) => { let xs = seq_items(t).unwrap(); for i in 0..xs.len { a.target(s, xs.at(i)); } }
+        Starred(x) => a.target(s, x),
+        _ => a.expr(s, t),
+    }
+}
+
+fn seq_items(e: *Expr) -> ?Exprs {
+    match e.e { Tuple(xs) => Some(xs), List(xs) => Some(xs), Set(xs) => Some(xs), _ => None }
+}
+
+fn bool_parts(e: *Expr) -> (*Expr, *Expr) {
+    match e.e { And(a, b) => (a, b), Or(a, b) => (a, b), _ => trap() }
+}
+
+fn comp_parts(e: *Expr) -> (*Expr, *mem.Vec<Comp>) {
+    match e.e { ListComp(x, cs) => (x, cs), SetComp(x, cs) => (x, cs), _ => trap() }
+}
+
+fn names_of(t: *Expr, out: *mem.Vec<str>) {
+    match t.e {
+        Name(n) => out.push(n),
+        Tuple(_) | List(_) => { let xs = seq_items(t).unwrap(); for i in 0..xs.len { names_of(xs.at(i), out); } }
+        Starred(x) => names_of(x, out),
+        _ => {}
+    }
+}
+
+fn An.body(a: *An, s: *Scope, b: Body) { for i in 0..b.len { a.stmt(s, b.at(i)); } }
+
+fn An.func(a: *An, s: *Scope, f: *FuncDef) {
+    // Defaults and decorators are evaluated in the enclosing scope.
+    for i in 0..f.params.len { if let Some(d) = f.params.at(i).default { a.expr(s, d); } }
+    for i in 0..f.decorators.len { a.expr(s, f.decorators.at(i)); }
+    let fs = new_scope(a, SC_FUNC, Some(s));
+    a.scopes.insert(f as u64, fs);
+    // Declarations first, so binding respects them.
+    pre_decl(fs, f.body);
+    for i in 0..f.params.len { fs.bind(f.params.at(i).name); }
+    let saved = a.comp;
+    a.comp = mem.Vec.new();
+    if let Some(cs) = f.gencomps {
+        fs.bind(".0");
+        fs.is_gen = true;
+        for i in 0..cs.len {
+            let c = cs.at(i);
+            if i > 0 { a.expr(fs, c.iter); }
+            a.target(fs, c.target);
+            for j in 0..c.ifs.len { a.expr(fs, c.ifs.at(j)); }
+        }
+        a.expr(fs, f.genexp.unwrap());
+    } else {
+        a.body(fs, f.body);
+    }
+    a.comp.free();
+    a.comp = saved;
+}
+
+fn pre_decl(s: *Scope, b: Body) {
+    for i in 0..b.len {
+        let st = b.at(i);
+        match st.s {
+            Global(ns) => { for j in 0..ns.len { s.globals.insert(ns.at(j), true); } }
+            Nonlocal(ns) => { for j in 0..ns.len { s.nonlocals.insert(ns.at(j), true); } }
+            If(_, x, y) => { pre_decl(s, x); pre_decl(s, y); }
+            While(_, x, y) => { pre_decl(s, x); pre_decl(s, y); }
+            For(_, _, x, y) => { pre_decl(s, x); pre_decl(s, y); }
+            With(_, x) => pre_decl(s, x),
+            Try(t) => {
+                pre_decl(s, t.body); pre_decl(s, t.orelse); pre_decl(s, t.finalbody);
+                for j in 0..t.handlers.len { pre_decl(s, t.handlers.at(j).body); }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn An.stmt(a: *An, s: *Scope, st: *Stmt) {
+    match st.s {
+        ExprS(e) => a.expr(s, e),
+        Assign(ts, v) => { a.expr(s, v); for i in 0..ts.len { a.target(s, ts.at(i)); } }
+        AugAssign(_, t, v) => { a.expr(s, v); a.expr(s, t); a.target(s, t); }
+        AnnAssign(t, v) => { if let Some(x) = v { a.expr(s, x); a.target(s, t); } }
+        If(c, x, y) => { a.expr(s, c); a.body(s, x); a.body(s, y); }
+        While(c, x, y) => { a.expr(s, c); a.body(s, x); a.body(s, y); }
+        For(t, it, x, y) => { a.expr(s, it); a.target(s, t); a.body(s, x); a.body(s, y); }
+        Def(f) => { a.func(s, f); s.bind(f.name); }
+        Class(cd) => {
+            for i in 0..cd.bases.len { a.expr(s, cd.bases.at(i)); }
+            for i in 0..cd.decorators.len { a.expr(s, cd.decorators.at(i)); }
+            let cs = new_scope(a, SC_CLASS, Some(s));
+            a.scopes.insert(cd as u64, cs);
+            a.body(cs, cd.body);
+            s.bind(cd.name);
+        }
+        Return(v) => if let Some(x) = v { a.expr(s, x); },
+        Pass | Break | Continue | Global(_) | Nonlocal(_) => {}
+        Del(ts) => { for i in 0..ts.len { a.expr(s, ts.at(i)); a.target(s, ts.at(i)); } }
+        Raise(e, c) => { if let Some(x) = e { a.expr(s, x); } if let Some(x) = c { a.expr(s, x); } }
+        Try(t) => {
+            a.body(s, t.body);
+            for i in 0..t.handlers.len {
+                let h = t.handlers.at(i);
+                if let Some(ty) = h.typ { a.expr(s, ty); }
+                if let Some(n) = h.name { s.bind(n); }
+                a.body(s, h.body);
+            }
+            a.body(s, t.orelse);
+            a.body(s, t.finalbody);
+        }
+        With(items, b) => {
+            for i in 0..items.len {
+                let it = items.at(i);
+                a.expr(s, it.ctx);
+                if let Some(v) = it.target { a.target(s, v); }
+            }
+            a.body(s, b);
+        }
+        Assert(c, m) => { a.expr(s, c); if let Some(x) = m { a.expr(s, x); } }
+        Import(n, al) => {
+            if let Some(x) = al { s.bind(x); }
+            else {
+                var k = n.len;
+                if let Some(d) = mem.find_byte(n, '.') { k = d; }
+                s.bind(n[0..k]);
+            }
+        }
+        ImportFrom(_, _ns, als) => { for i in 0..als.len { s.bind(als.at(i)); } }
+    }
+}
+
+fn An.use(a: *An, s: *Scope, n: str) {
+    if a.in_comp(n) { return; }
+    s.uses.push(n);
+}
+
+fn An.comps(a: *An, s: *Scope, cs: *mem.Vec<Comp>) -> u64 {
+    let base = a.comp.len;
+    for i in 0..cs.len {
+        let c = cs.at(i);
+        a.expr(s, c.iter);
+        var ns: mem.Vec<str> = mem.Vec.new();
+        names_of(c.target, &ns);
+        for j in 0..ns.len { a.comp.push(ns.at(j)); }
+        ns.free();
+        for j in 0..c.ifs.len { a.expr(s, c.ifs.at(j)); }
+    }
+    base
+}
+
+fn An.expr(a: *An, s: *Scope, e: *Expr) {
+    match e.e {
+        Name(n) => a.use(s, n),
+        Int(_) | Big(_, _) | Float(_) | Str(_) | Bool(_) | NoneE | Ellipsis => {}
+        FStr(ps) => {
+            for i in 0..ps.len {
+                let p = ps.at(i);
+                if let Some(x) = p.expr { a.expr(s, x); }
+                if let Some(x) = p.spec { a.expr(s, x); }
+            }
+        }
+        Bin(_, x, y) => { a.expr(s, x); a.expr(s, y); }
+        And(x, y) => { a.expr(s, x); a.expr(s, y); }
+        Or(x, y) => { a.expr(s, x); a.expr(s, y); }
+        Un(_, x) => a.expr(s, x),
+        Cmp(x, _, ys) => { a.expr(s, x); for i in 0..ys.len { a.expr(s, ys.at(i)); } }
+        Call(f, args) => {
+            a.expr(s, f);
+            if let Name(n) = f.e and n.eq("super") and args.len == 0 { s.uses_super = true; }
+            for i in 0..args.len { a.expr(s, args.at(i).value); }
+        }
+        Attr(x, _) => a.expr(s, x),
+        Index(x, y) => { a.expr(s, x); a.expr(s, y); }
+        Slice(x, y, z) => {
+            if let Some(v) = x { a.expr(s, v); }
+            if let Some(v) = y { a.expr(s, v); }
+            if let Some(v) = z { a.expr(s, v); }
+        }
+        List(_) | Tuple(_) | Set(_) => { let xs = seq_items(e).unwrap(); for i in 0..xs.len { a.expr(s, xs.at(i)); } }
+        Dict(ks, vs) => { for i in 0..ks.len { a.expr(s, ks.at(i)); a.expr(s, vs.at(i)); } }
+        IfExp(c, x, y) => { a.expr(s, c); a.expr(s, x); a.expr(s, y); }
+        Lambda(f) => a.func(s, f),
+        ListComp(_, _) | SetComp(_, _) => {
+            let (x, cs) = comp_parts(e);
+            let base = a.comps(s, cs);
+            a.expr(s, x);
+            a.comp.truncate(base);
+        }
+        DictComp(k, v, cs) => {
+            let base = a.comps(s, cs);
+            a.expr(s, k);
+            a.expr(s, v);
+            a.comp.truncate(base);
+        }
+        GenExp(f, first) => { a.expr(s, first); a.func(s, f); }
+        Starred(x) => a.expr(s, x),
+        Yield(x) => { s.is_gen = true; if let Some(v) = x { a.expr(s, v); } }
+        YieldFrom(x) => { s.is_gen = true; a.expr(s, x); }
+        Walrus(n, x) => { a.expr(s, x); s.bind(n); }
+    }
+}
+
+fn add_unique(v: *mem.Vec<str>, n: str) {
+    for i in 0..v.len { if v.at(i).eq(n) { return; } }
+    v.push(n);
+}
+
+/// Decide, for every name a function uses, whether it is local, a cell,
+/// free (from an enclosing function) or global.
+fn resolve(s: *Scope) {
+    if s.kind == SC_FUNC {
+        var names: mem.Vec<str> = mem.Vec.new();
+        for i in 0..s.uses.len { names.push(s.uses.at(i)); }
+        var it: u64 = 0;
+        while let Some(sl) = s.nonlocals.next(&it) { names.push(sl.key); }
+        for i in 0..names.len {
+            let n = names.at(i);
+            if s.bound.contains(n) or s.globals.contains(n) { continue; }
+            // Search enclosing functions.
+            var p = s.parent;
+            while let Some(q) = p {
+                if q.kind == SC_FUNC and q.bound.contains(n) and !q.globals.contains(n) {
+                    q.cells.insert(n, true);
+                    var r: ?*Scope = Some(s);
+                    while let Some(x) = r {
+                        if (x as u64) == (q as u64) { break; }
+                        if x.kind == SC_FUNC { add_unique(&x.frees, n); }
+                        r = x.parent;
+                    }
+                    break;
+                }
+                if q.kind == SC_MODULE { break; }
+                p = q.parent;
+            }
+        }
+        names.free();
+    }
+    for i in 0..s.children.len { resolve(s.children.at(i)); }
+}
+
+// ── code generation ─────────────────────────────────────────────────
+
+struct Pending { start: u32, end: u32, label: bc.Label, reg: u32 }
+struct ActiveH { start: u32, label: bc.Label, reg: u32 }
+/// A finally body (or a with's exit call) that break/continue/return
+/// must run on the way out.
+struct Fin { body: Body, with_exit: u32, hdepth: u64 }
+struct Loop { brk: bc.Label, cont: bc.Label, fdepth: u64 }
+
+pub struct Unit {
+    c: *Ctx,
+    arena: *mem.Arena,
+    an: *An,
+    err: ?str,
+    err_line: u32,
+}
+
+struct C {
+    u: *Unit,
+    s: *Scope,
+    code: bc.Code<u32>,
+    consts: bc.Pool<Value>,
+    regs: bc.Regs,
+    locals: map.HashMap<str, u32>,
+    shadow: mem.Vec<(str, u32)>,
+    pending: mem.Vec<Pending>,
+    hs: mem.Vec<ActiveH>,
+    fins: mem.Vec<Fin>,
+    loops: mem.Vec<Loop>,
+    class_ns: u32,
+    line: u32,
+    first_param_reg: u32,
+    has_params: bool,
+}
+
+enum NK { Local(u32), Cell(u32), Free(u32), Global, ClassNs }
+
+fn new_c(u: *Unit, s: *Scope) -> C {
+    C { u: u, s: s, code: bc.Code.new(Py.op_size, Py.set_label), consts: bc.Pool.new(65536), regs: bc.Regs.new(250),
+        locals: map.HashMap.new(), shadow: mem.Vec.new(), pending: mem.Vec.new(), hs: mem.Vec.new(), fins: mem.Vec.new(),
+        loops: mem.Vec.new(), class_ns: 255, line: 0, first_param_reg: 0, has_params: false }
+}
+
+fn C.fail(c: *C, msg: str) {
+    if c.u.err.is_none() { c.u.err = Some(msg); c.u.err_line = c.line; }
+}
+
+fn C.k(c: *C, v: Value) -> u32 {
+    let Some(i) = c.consts.add(v) else { c.fail("too many constants"); return 0; };
+    i
+}
+
+fn C.kstr(c: *C, s: str) -> u32 { c.k(Value.Str(vm.intern(c.u.c, s))) }
+
+fn C.k8(c: *C, v: Value) -> u8 {
+    let i = c.k(v);
+    if i > 255 { c.fail("too many constants for an 8-bit operand"); }
+    i as u8
+}
+
+fn C.name8(c: *C, s: str) -> u8 { c.k8(Value.Str(vm.intern(c.u.c, s))) }
+
+fn C.alloc(c: *C, n: u32) -> u32 {
+    let r = c.regs.alloc(n);
+    if c.regs.failed() { c.fail("too many registers in one function"); }
+    r
+}
+
+fn C.emit(c: *C, w: u32) { c.code.op(w); }
+
+fn C.kind(c: *C, name: str) -> NK {
+    var i = c.shadow.len;
+    while i > 0 {
+        i -= 1;
+        let (n, r) = c.shadow.at(i);
+        if n.eq(name) { return NK.Local(r); }
+    }
+    let s = c.s;
+    if s.kind == SC_CLASS { return NK.ClassNs; }
+    if s.kind == SC_MODULE { return NK.Global; }
+    if s.globals.contains(name) { return NK.Global; }
+    for j in 0..s.frees.len { if s.frees.at(j).eq(name) { return NK.Free(j as u32); } }
+    if let Some(r) = c.locals.get(name) {
+        if s.cells.contains(name) { return NK.Cell(r); }
+        return NK.Local(r);
+    }
+    NK.Global
+}
+
+// ── handler ranges ──────────────────────────────────────────────────
+
+fn C.pc32(c: *C) -> u32 { c.code.pc() as u32 }
+
+fn C.push_handler(c: *C, l: bc.Label, reg: u32) {
+    c.hs.push(ActiveH { start: c.pc32(), label: l, reg: reg });
+}
+
+/// Close the range of handlers from index `from` up (they stop
+/// protecting code here).
+fn C.suspend(c: *C, from: u64) {
+    var i = c.hs.len;
+    while i > from {
+        i -= 1;
+        let h = c.hs.at(i);
+        if c.pc32() > h.start { c.pending.push(Pending { start: h.start, end: c.pc32(), label: h.label, reg: h.reg }); }
+        c.hs.set(i, ActiveH { start: 0xffffffff, label: h.label, reg: h.reg });
+    }
+}
+
+fn C.resume(c: *C, from: u64) {
+    for i in from..c.hs.len {
+        let h = c.hs.at(i);
+        if h.start == 0xffffffff { c.hs.set(i, ActiveH { start: c.pc32(), label: h.label, reg: h.reg }); }
+    }
+}
+
+fn C.pop_handler(c: *C) {
+    let h = c.hs.pop().unwrap();
+    if h.start != 0xffffffff and c.pc32() > h.start {
+        c.pending.push(Pending { start: h.start, end: c.pc32(), label: h.label, reg: h.reg });
+    }
+}
+
+/// Run the finally bodies (and with-exits) from the innermost down to
+/// depth `to`, for a jump out of them.
+fn C.unwind_fins(c: *C, to: u64) {
+    var i = c.fins.len;
+    let saved_fins = c.fins.len;
+    while i > to {
+        i -= 1;
+        let f = c.fins.at(i);
+        c.suspend(f.hdepth);
+        // The finally body runs outside its own try.
+        c.fins.len = i;
+        if f.with_exit != 0xffffffff {
+            let base = c.alloc(4);
+            c.emit(Py.MOVE(base as u8, f.with_exit as u8));
+            for j: u32 in 1..4 { c.emit(Py.LOADNIL((base + j) as u8)); }
+            c.emit(Py.CALL(base as u8, 3));
+            c.regs.reset(base);
+        } else {
+            c.block(f.body);
+        }
+    }
+    c.fins.len = saved_fins;
+}
+
+// ── statements ──────────────────────────────────────────────────────
+
+fn C.block(c: *C, b: Body) {
+    for i in 0..b.len {
+        if c.u.err.is_some() { return; }
+        c.stmt(b.at(i));
+    }
+}
+
+fn C.set_line(c: *C, line: u32) {
+    c.line = line;
+    c.code.set_loc(line);
+}
+
+fn C.stmt(c: *C, st: *Stmt) {
+    c.set_line(st.line);
+    let mark = c.regs.mark();
+    match st.s {
+        ExprS(e) => {
+            let r = c.alloc(1);
+            c.expr_to(e, r);
+        }
+        Assign(ts, v) => {
+            if ts.len == 1 {
+                c.assign_expr(ts.at(0), v);
+            } else {
+                let r = c.alloc(1);
+                c.expr_to(v, r);
+                for i in 0..ts.len { c.assign(ts.at(i), r); }
+            }
+        }
+        AugAssign(op, t, v) => c.augassign(op, t, v),
+        AnnAssign(t, v) => if let Some(x) = v { c.assign_expr(t, x); },
+        If(cond, body, orelse) => {
+            let els = c.code.label();
+            c.jump_if_false(cond, els);
+            c.regs.reset(mark);
+            c.block(body);
+            if orelse.len > 0 {
+                let end = c.code.label();
+                c.code.jump(Py.JMP(0), end);
+                c.code.bind(els);
+                c.block(orelse);
+                c.code.bind(end);
+            } else {
+                c.code.bind(els);
+            }
+        }
+        While(cond, body, orelse) => {
+            let top = c.code.here();
+            let brk = c.code.label();
+            let els = c.code.label();
+            c.jump_if_false(cond, els);
+            c.regs.reset(mark);
+            c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
+            c.block(body);
+            c.loops.pop();
+            c.code.jump(Py.JMP(0), top);
+            c.code.bind(els);
+            c.block(orelse);
+            c.code.bind(brk);
+        }
+        For(t, iter, body, orelse) => c.for_stmt(t, iter, body, orelse),
+        Def(f) => {
+            let r = c.alloc(1);
+            c.make_function(f, r);
+            c.store_name(f.name, r);
+        }
+        Class(cd) => c.class_def(cd),
+        Return(v) => {
+            if c.s.kind != SC_FUNC { c.fail("'return' outside function"); return; }
+            let r = c.alloc(1);
+            match v {
+                Some(x) => c.expr_to(x, r),
+                None => c.emit(Py.LOADNIL(r as u8)),
+            }
+            if c.fins.len > 0 {
+                let h0 = c.hs.len;
+                c.unwind_fins(0);
+                c.emit(Py.RET(r as u8));
+                c.resume(0);
+                let _ = h0;
+            } else {
+                c.emit(Py.RET(r as u8));
+            }
+        }
+        Pass => {}
+        Break | Continue => {
+            if c.loops.len == 0 { c.fail("'break' outside loop"); return; }
+            let l = c.loops.at(c.loops.len - 1);
+            let is_break = if let Break = st.s { true } else { false };
+            if c.fins.len > l.fdepth {
+                c.unwind_fins(l.fdepth);
+                c.code.jump(Py.JMP(0), if is_break { l.brk } else { l.cont });
+                c.resume(0);
+            } else {
+                c.code.jump(Py.JMP(0), if is_break { l.brk } else { l.cont });
+            }
+        }
+        Global(_) | Nonlocal(_) => {}
+        Del(ts) => {
+            for i in 0..ts.len {
+                let t = ts.at(i);
+                match t.e {
+                    Name(n) => match c.kind(n) {
+                        Local(r) => c.emit(Py.LOADK(r as u8, c.k(Value.Undef) as u16)),
+                        Global => c.emit(Py.DELGLOBAL(0, c.kstr(n) as u16)),
+                        _ => c.fail("del of this name is not supported"),
+                    },
+                    Index(o, k) => {
+                        let ro = c.operand(o);
+                        if let Slice(lo, hi, stp) = k.e {
+                            let base = c.slice_regs(lo, hi, stp);
+                            let sl = c.alloc(1);
+                            c.emit(Py.LOADK(sl as u8, c.k(Value.Obj(c.u.c.types[vm.T_SLICE].unwrap())) as u16));
+                            let cb = c.alloc(4);
+                            c.emit(Py.MOVE(cb as u8, sl as u8));
+                            for j: u32 in 0..3 { c.emit(Py.MOVE((cb + 1 + j) as u8, (base + j) as u8)); }
+                            c.emit(Py.CALL(cb as u8, 3));
+                            c.emit(Py.DELINDEX(ro as u8, cb as u8));
+                        } else {
+                            let rk = c.operand(k);
+                            c.emit(Py.DELINDEX(ro as u8, rk as u8));
+                        }
+                    }
+                    Attr(o, n) => {
+                        let ro = c.operand(o);
+                        c.emit(Py.DELATTR(ro as u8, c.name8(n)));
+                    }
+                    _ => c.fail("cannot delete this target"),
+                }
+            }
+        }
+        Raise(e, _cause) => {
+            match e {
+                Some(x) => {
+                    let r = c.operand(x);
+                    c.emit(Py.RAISE(r as u8));
+                }
+                None => {
+                    // Re-raise the exception being handled.
+                    if let Some(r) = c.current_exc() { c.emit(Py.RERAISE(r as u8)); }
+                    else { c.fail("bare 'raise' outside an except clause is not supported"); }
+                }
+            }
+        }
+        Try(t) => c.try_stmt(t),
+        With(items, body) => c.with_stmt(items, 0, body),
+        Assert(cond, msg) => {
+            let ok = c.code.label();
+            c.jump_if_true(cond, ok);
+            let base = c.alloc(2);
+            c.load_name("AssertionError", base);
+            var n: u8 = 0;
+            if let Some(m) = msg { c.expr_to(m, base + 1); n = 1; }
+            c.emit(Py.CALL(base as u8, n));
+            c.emit(Py.RAISE(base as u8));
+            c.code.bind(ok);
+        }
+        Import(n, al) => {
+            let r = c.alloc(1);
+            var top = n;
+            if let Some(d) = mem.find_byte(n, '.') { top = n[0..d]; }
+            c.emit(Py.IMPORT(r as u8, c.kstr(if al.is_some() { n } else { top }) as u16));
+            c.store_name(al ?? top, r);
+        }
+        ImportFrom(m, names, als) => {
+            let r = c.alloc(1);
+            c.emit(Py.IMPORT(r as u8, c.kstr(m) as u16));
+            let t = c.alloc(1);
+            for i in 0..names.len {
+                if names.at(i).eq("*") { c.fail("import * is not supported"); return; }
+                c.emit(Py.GETATTR(t as u8, r as u8, c.name8(names.at(i))));
+                c.store_name(als.at(i), t);
+            }
+        }
+    }
+    c.regs.reset(mark);
+}
+
+/// The register holding the exception of the innermost except clause.
+fn C.current_exc(c: *C) -> ?u32 {
+    var i = c.shadow.len;
+    while i > 0 {
+        i -= 1;
+        let (n, r) = c.shadow.at(i);
+        if n.eq(" exc") { return Some(r); }
+    }
+    None
+}
+
+fn C.for_stmt(c: *C, t: *Expr, iter: *Expr, body: Body, orelse: Body) {
+    let it = c.alloc(1);
+    let src = c.operand(iter);
+    c.emit(Py.GETITER(it as u8, src as u8));
+    c.regs.reset(it + 1);
+    let top = c.code.here();
+    let brk = c.code.label();
+    let els = c.code.label();
+    // Loop variable: straight into a plain local's register.
+    var dst: u32 = 0;
+    var direct = false;
+    if let Name(n) = t.e and let Local(r) = c.kind(n) { dst = r; direct = true; }
+    if !direct { dst = c.alloc(1); }
+    c.emit(Py.FORITER(dst as u8, it as u8));
+    c.code.jump(Py.JMP(0), els);
+    if !direct { c.assign(t, dst); }
+    c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
+    let m2 = c.regs.mark();
+    c.block(body);
+    c.regs.reset(m2);
+    c.loops.pop();
+    c.code.jump(Py.JMP(0), top);
+    c.code.bind(els);
+    c.block(orelse);
+    c.code.bind(brk);
+}
+
+fn C.try_stmt(c: *C, t: *TryS) {
+    let has_fin = t.finalbody.len > 0;
+    var fin_label = c.code.label();
+    var fin_reg: u32 = 0;
+    if has_fin {
+        fin_reg = c.alloc(1);
+        c.fins.push(Fin { body: t.finalbody, with_exit: 0xffffffff, hdepth: c.hs.len });
+        c.push_handler(fin_label, fin_reg);
+    }
+    if t.handlers.len > 0 {
+        let exc_reg = c.alloc(1);
+        let hl = c.code.label();
+        let after = c.code.label();
+        c.push_handler(hl, exc_reg);
+        c.block(t.body);
+        c.pop_handler();
+        c.block(t.orelse);
+        c.code.jump(Py.JMP(0), after);
+        c.code.bind(hl);
+        for i in 0..t.handlers.len {
+            let h = t.handlers.at(i);
+            c.set_line(h.line);
+            let next = c.code.label();
+            let m = c.regs.mark();
+            if let Some(ty) = h.typ {
+                let tr = c.operand(ty);
+                let ok = c.alloc(1);
+                c.emit(Py.EXCMATCH(ok as u8, exc_reg as u8, tr as u8));
+                c.code.jump(Py.JF(ok as u8, 0), next);
+            }
+            c.regs.reset(m);
+            if let Some(n) = h.name { c.store_name(n, exc_reg); }
+            c.shadow.push((" exc", exc_reg));
+            c.block(h.body);
+            c.shadow.pop();
+            c.code.jump(Py.JMP(0), after);
+            c.code.bind(next);
+        }
+        c.emit(Py.RERAISE(exc_reg as u8));
+        c.code.bind(after);
+    } else {
+        c.block(t.body);
+        c.block(t.orelse);
+    }
+    if has_fin {
+        c.pop_handler();
+        c.fins.pop();
+        c.block(t.finalbody);
+        let end = c.code.label();
+        c.code.jump(Py.JMP(0), end);
+        c.code.bind(fin_label);
+        c.shadow.push((" exc", fin_reg));
+        c.block(t.finalbody);
+        c.shadow.pop();
+        c.emit(Py.RERAISE(fin_reg as u8));
+        c.code.bind(end);
+    }
+}
+
+fn C.with_stmt(c: *C, items: *mem.Vec<WithItem>, i: u64, body: Body) {
+    if i >= items.len { c.block(body); return; }
+    let item = items.at(i);
+    let mgr = c.alloc(1);
+    c.expr_to(item.ctx, mgr);
+    let ex = c.alloc(1);
+    c.emit(Py.GETATTR(ex as u8, mgr as u8, c.name8("__exit__")));
+    let val = c.alloc(2);
+    c.emit(Py.LOADMETHOD(val as u8, mgr as u8, c.name8("__enter__")));
+    c.emit(Py.CALLMETHOD(val as u8, 0));
+    if let Some(v) = item.target { c.assign(v, val); }
+    let exc_reg = c.alloc(1);
+    let hl = c.code.label();
+    c.fins.push(Fin { body: body, with_exit: ex, hdepth: c.hs.len });
+    c.push_handler(hl, exc_reg);
+    c.with_stmt(items, i + 1, body);
+    c.pop_handler();
+    c.fins.pop();
+    // Normal exit: __exit__(None, None, None).
+    let base = c.alloc(4);
+    c.emit(Py.MOVE(base as u8, ex as u8));
+    for j: u32 in 1..4 { c.emit(Py.LOADNIL((base + j) as u8)); }
+    c.emit(Py.CALL(base as u8, 3));
+    let end = c.code.label();
+    c.code.jump(Py.JMP(0), end);
+    c.code.bind(hl);
+    // Exceptional exit: __exit__(type(e), e, None); swallow if true.
+    c.emit(Py.MOVE(base as u8, ex as u8));
+    let tb = c.alloc(2);
+    c.emit(Py.LOADK(tb as u8, c.k(Value.Obj(c.u.c.types[vm.T_TYPE].unwrap())) as u16));
+    c.emit(Py.MOVE((tb + 1) as u8, exc_reg as u8));
+    c.emit(Py.CALL(tb as u8, 1));
+    c.emit(Py.MOVE((base + 1) as u8, tb as u8));
+    c.emit(Py.MOVE((base + 2) as u8, exc_reg as u8));
+    c.emit(Py.LOADNIL((base + 3) as u8));
+    c.emit(Py.CALL(base as u8, 3));
+    c.code.jump(Py.JT(base as u8, 0), end);
+    c.emit(Py.RERAISE(exc_reg as u8));
+    c.code.bind(end);
+}
+
+fn C.class_def(c: *C, cd: *ClassDef) {
+    let base = c.alloc(3);
+    c.emit(Py.LOADK(base as u8, c.kstr(cd.name) as u16));
+    let bt = c.alloc(cd.bases.len as u32 + 1);
+    for i in 0..cd.bases.len { c.expr_to(cd.bases.at(i), bt + i as u32); }
+    c.emit(Py.NEWTUPLE((base + 1) as u8, bt as u8, cd.bases.len as u8));
+    c.emit(Py.NEWDICT((base + 2) as u8, 0, 0));
+    // The body runs here, with names in the namespace dict.
+    let cs = c.u.an.scopes.get(cd as u64).unwrap();
+    let saved_s = c.s;
+    let saved_ns = c.class_ns;
+    let saved_shadow = c.shadow.len;
+    c.s = cs;
+    c.class_ns = base + 2;
+    c.block(cd.body);
+    c.s = saved_s;
+    c.class_ns = saved_ns;
+    c.shadow.len = saved_shadow;
+    let dst = c.alloc(1);
+    c.emit(Py.BUILDCLASS(dst as u8, base as u8));
+    c.apply_decorators(cd.decorators, dst);
+    c.store_name(cd.name, dst);
+}
+
+fn C.apply_decorators(c: *C, decs: Exprs, r: u32) {
+    var i = decs.len;
+    while i > 0 {
+        i -= 1;
+        let b = c.alloc(2);
+        c.expr_to(decs.at(i), b);
+        c.emit(Py.MOVE((b + 1) as u8, r as u8));
+        c.emit(Py.CALL(b as u8, 1));
+        c.emit(Py.MOVE(r as u8, b as u8));
+        c.regs.reset(b);
+    }
+}
+
+// ── names and assignment ────────────────────────────────────────────
+
+fn C.load_name(c: *C, n: str, dst: u32) {
+    match c.kind(n) {
+        Local(r) => if r != dst { c.emit(Py.MOVE(dst as u8, r as u8)); },
+        Cell(r) => c.emit(Py.LOADCELL(dst as u8, r as u8)),
+        Free(i) => c.emit(Py.LOADFREE(dst as u8, i as u8)),
+        Global => c.emit(Py.GETGLOBAL(dst as u8, c.kstr(n) as u16)),
+        ClassNs => c.emit(Py.LOADNAME(dst as u8, c.class_ns as u8, c.name8(n))),
+    }
+}
+
+fn C.store_name(c: *C, n: str, src: u32) {
+    match c.kind(n) {
+        Local(r) => if r != src { c.emit(Py.MOVE(r as u8, src as u8)); },
+        Cell(r) => c.emit(Py.STORECELL(r as u8, src as u8)),
+        Free(i) => c.emit(Py.STOREFREE(src as u8, i as u8)),
+        Global => c.emit(Py.SETGLOBAL(src as u8, c.kstr(n) as u16)),
+        ClassNs => c.emit(Py.STORENAME(src as u8, c.class_ns as u8, c.name8(n))),
+    }
+}
+
+/// Assign the value of `v` to target `t`, computing straight into a
+/// local's register when possible.
+fn C.assign_expr(c: *C, t: *Expr, v: *Expr) {
+    if let Name(n) = t.e and let Local(r) = c.kind(n) {
+        c.expr_to(v, r);
+        return;
+    }
+    let r = c.alloc(1);
+    c.expr_to(v, r);
+    c.assign(t, r);
+}
+
+fn C.assign(c: *C, t: *Expr, src: u32) {
+    let mark = c.regs.mark();
+    match t.e {
+        Name(n) => c.store_name(n, src),
+        Attr(o, n) => {
+            let ro = c.operand(o);
+            c.emit(Py.SETATTR(ro as u8, c.name8(n), src as u8));
+        }
+        Index(o, k) => {
+            let ro = c.operand(o);
+            if let Slice(lo, hi, st) = k.e {
+                let base = c.slice_regs(lo, hi, st);
+                c.emit(Py.SETSLICE(ro as u8, base as u8, src as u8));
+            } else {
+                let rk = c.operand(k);
+                c.emit(Py.SETINDEX(ro as u8, rk as u8, src as u8));
+            }
+        }
+        Tuple(_) | List(_) => {
+            let xs = seq_items(t).unwrap();
+            var star: i64 = -1;
+            for i in 0..xs.len { if let Starred(_) = xs.at(i).e { star = i as i64; } }
+            let n = xs.len as u32;
+            let base = c.alloc(n);
+            if star < 0 {
+                c.emit(Py.UNPACK(base as u8, src as u8, n as u8));
+            } else {
+                let before = star as u32;
+                let after = n - before - 1;
+                c.emit(Py.UNPACKEX(base as u8, src as u8, (before | (after << 4)) as u8));
+            }
+            for i in 0..xs.len {
+                var x = xs.at(i);
+                if let Starred(y) = x.e { x = y; }
+                c.assign(x, base + i as u32);
+            }
+        }
+        Starred(x) => c.assign(x, src),
+        _ => c.fail("cannot assign to this expression"),
+    }
+    c.regs.reset(mark);
+}
+
+fn arith_op(op: BinOp) -> u32 {
+    match op {
+        Add => Py.OP_ADD, Sub => Py.OP_SUB, Mul => Py.OP_MUL, Div => Py.OP_TRUEDIV, FloorDiv => Py.OP_FLOORDIV,
+        Mod => Py.OP_MOD, Pow => Py.OP_POW, LShift => Py.OP_LSHIFT, RShift => Py.OP_RSHIFT, BitAnd => Py.OP_BAND,
+        BitOr => Py.OP_BOR, BitXor => Py.OP_BXOR, MatMul => Py.OP_MATMUL,
+    }
+}
+
+fn C.binop(c: *C, op: BinOp, dst: u32, a: u32, b: *Expr) {
+    // K forms for small constants on the right.
+    if op == BinOp.Add or op == BinOp.Sub or op == BinOp.Mul {
+        if let Some(k) = c.small_const(b) {
+            let opc = if op == BinOp.Add { Py.OP_ADDK } else if op == BinOp.Sub { Py.OP_SUBK } else { Py.OP_MULK };
+            c.emit(Py.encode.ABC(opc, dst as u8, a as u8, k));
+            return;
+        }
+    }
+    let rb = c.operand(b);
+    c.emit(Py.encode.ABC(arith_op(op), dst as u8, a as u8, rb as u8));
+}
+
+fn C.augassign(c: *C, op: BinOp, t: *Expr, v: *Expr) {
+    let inplace = op == BinOp.Add;
+    match t.e {
+        Name(n) => {
+            if let Local(r) = c.kind(n) {
+                if inplace {
+                    let rv = c.operand(v);
+                    c.emit(Py.IADD(r as u8, r as u8, rv as u8));
+                } else {
+                    c.binop(op, r, r, v);
+                }
+                return;
+            }
+            let r = c.alloc(1);
+            c.load_name(n, r);
+            if inplace { let rv = c.operand(v); c.emit(Py.IADD(r as u8, r as u8, rv as u8)); }
+            else { c.binop(op, r, r, v); }
+            c.store_name(n, r);
+        }
+        Attr(o, n) => {
+            let ro = c.operand(o);
+            let r = c.alloc(1);
+            c.emit(Py.GETATTR(r as u8, ro as u8, c.name8(n)));
+            if inplace { let rv = c.operand(v); c.emit(Py.IADD(r as u8, r as u8, rv as u8)); }
+            else { c.binop(op, r, r, v); }
+            c.emit(Py.SETATTR(ro as u8, c.name8(n), r as u8));
+        }
+        Index(o, k) => {
+            let ro = c.operand(o);
+            let rk = c.operand(k);
+            let r = c.alloc(1);
+            c.emit(Py.GETINDEX(r as u8, ro as u8, rk as u8));
+            if inplace { let rv = c.operand(v); c.emit(Py.IADD(r as u8, r as u8, rv as u8)); }
+            else { c.binop(op, r, r, v); }
+            c.emit(Py.SETINDEX(ro as u8, rk as u8, r as u8));
+        }
+        _ => c.fail("illegal expression for augmented assignment"),
+    }
+}
+
+// ── expressions ─────────────────────────────────────────────────────
+
+/// A register holding the value of `e`: a local's own register, or a
+/// new temporary.
+fn C.operand(c: *C, e: *Expr) -> u32 {
+    if let Name(n) = e.e and let Local(r) = c.kind(n) { return r; }
+    let r = c.alloc(1);
+    c.expr_to(e, r);
+    r
+}
+
+fn C.small_const(c: *C, e: *Expr) -> ?u8 {
+    let v = match e.e {
+        Int(i) => if i >= -2147483648 and i <= 2147483647 { Value.Int(i as i32) } else { return None; },
+        Float(x) => Value.Float(x),
+        _ => return None,
+    };
+    let k = c.consts.add(v)?;
+    if k < 256 { Some(k as u8) } else { None }
+}
+
+fn C.const_value(c: *C, e: *Expr) -> ?Value {
+    match e.e {
+        Int(i) => Some(value.int_val(&c.u.c.heap, i)),
+        Float(x) => Some(Value.Float(x)),
+        Str(s) => Some(Value.Str(vm.intern(c.u.c, s))),
+        Bool(b) => Some(Value.Bool(b)),
+        NoneE => Some(Value.Nil),
+        Big(s, radix) => big.parse(&c.u.c.heap, s, radix as u32, false),
+        _ => None,
+    }
+}
+
+fn C.load_const(c: *C, v: Value, dst: u32) {
+    if let Int(i) = v and i >= -32768 and i <= 32767 { c.emit(Py.LOADI(dst as u8, i as i16)); return; }
+    if v == Value.Nil { c.emit(Py.LOADNIL(dst as u8)); return; }
+    c.emit(Py.LOADK(dst as u8, c.k(v) as u16));
+}
+
+fn C.slice_regs(c: *C, lo: ?*Expr, hi: ?*Expr, st: ?*Expr) -> u32 {
+    let base = c.alloc(3);
+    match lo { Some(x) => c.expr_to(x, base), None => c.emit(Py.LOADNIL(base as u8)) }
+    match hi { Some(x) => c.expr_to(x, base + 1), None => c.emit(Py.LOADNIL((base + 1) as u8)) }
+    match st { Some(x) => c.expr_to(x, base + 2), None => c.emit(Py.LOADNIL((base + 2) as u8)) }
+    base
+}
+
+fn cmp_opcode(op: CmpOp) -> u32 {
+    match op {
+        Lt => Py.OP_LT, Le => Py.OP_LE, Gt => Py.OP_GT, Ge => Py.OP_GE, Eq => Py.OP_EQ, Ne => Py.OP_NE,
+        In => Py.OP_IN, NotIn => Py.OP_NOTIN, Is => Py.OP_IS, IsNot => Py.OP_ISNOT,
+    }
+}
+
+fn C.expr_to(c: *C, e: *Expr, dst: u32) {
+    if c.u.err.is_some() { return; }
+    let mark = c.regs.mark();
+    let d = dst as u8;
+    match e.e {
+        Name(n) => c.load_name(n, dst),
+        Int(_) | Float(_) | Str(_) | Bool(_) | NoneE | Big(_, _) => {
+            let Some(v) = c.const_value(e) else { c.fail("bad constant"); return; };
+            c.load_const(v, dst);
+        }
+        Ellipsis => c.emit(Py.LOADNIL(d)),
+        FStr(parts) => c.fstring(parts, dst),
+        Bin(op, a, b) => {
+            let ra = c.operand(a);
+            c.binop(op, dst, ra, b);
+        }
+        Un(op, a) => {
+            if op == UnOp.Not {
+                let ra = c.operand(a);
+                c.emit(Py.NOT(d, ra as u8));
+            } else {
+                let ra = c.operand(a);
+                c.emit(match op { Neg => Py.NEG(d, ra as u8), Pos => Py.POS(d, ra as u8), _ => Py.INVERT(d, ra as u8) });
+            }
+        }
+        And(_, _) | Or(_, _) => {
+            let (a, b) = bool_parts(e);
+            let is_and = if let And(_, _) = e.e { true } else { false };
+            let end = c.code.label();
+            c.expr_to(a, dst);
+            c.code.jump(if is_and { Py.JF(d, 0) } else { Py.JT(d, 0) }, end);
+            c.expr_to(b, dst);
+            c.code.bind(end);
+        }
+        Cmp(first, opsv, rest) => {
+            if opsv.len == 1 {
+                let ra = c.operand(first);
+                let rb = c.operand(rest.at(0));
+                c.emit(Py.encode.ABC(cmp_opcode(opsv.at(0)), d, ra as u8, rb as u8));
+            } else {
+                let end = c.code.label();
+                var ra = c.operand(first);
+                for i in 0..opsv.len {
+                    let rb = c.alloc(1);
+                    c.expr_to(rest.at(i), rb);
+                    c.emit(Py.encode.ABC(cmp_opcode(opsv.at(i)), d, ra as u8, rb as u8));
+                    if i + 1 < opsv.len { c.code.jump(Py.JF(d, 0), end); }
+                    ra = rb;
+                }
+                c.code.bind(end);
+            }
+        }
+        Call(f, args) => c.call(f, args, dst),
+        Attr(o, n) => {
+            let ro = c.operand(o);
+            c.emit(Py.GETATTR(d, ro as u8, c.name8(n)));
+        }
+        Index(o, k) => {
+            let ro = c.operand(o);
+            if let Slice(lo, hi, st) = k.e {
+                let base = c.slice_regs(lo, hi, st);
+                c.emit(Py.GETSLICE(d, ro as u8, base as u8));
+            } else {
+                let rk = c.operand(k);
+                c.emit(Py.GETINDEX(d, ro as u8, rk as u8));
+            }
+        }
+        Slice(lo, hi, st) => {
+            let base = c.alloc(4);
+            c.emit(Py.LOADK(base as u8, c.k(Value.Obj(c.u.c.types[vm.T_SLICE].unwrap())) as u16));
+            let s = c.slice_regs(lo, hi, st);
+            for j: u32 in 0..3 { c.emit(Py.MOVE((base + 1 + j) as u8, (s + j) as u8)); }
+            c.emit(Py.CALL(base as u8, 3));
+            c.emit(Py.MOVE(d, base as u8));
+        }
+        List(_) | Tuple(_) | Set(_) => {
+            let xs = seq_items(e).unwrap();
+            var starred = false;
+            for i in 0..xs.len { if let Starred(_) = xs.at(i).e { starred = true; } }
+            let kind = match e.e { List(_) => 0, Tuple(_) => 1, _ => 2 };
+            if starred {
+                let l = c.alloc(1);
+                c.emit(Py.NEWLIST(l as u8, 0, 0));
+                for i in 0..xs.len {
+                    let x = xs.at(i);
+                    let m = c.regs.mark();
+                    if let Starred(y) = x.e {
+                        let r = c.operand(y);
+                        c.emit(Py.LISTEXTEND(l as u8, r as u8));
+                    } else {
+                        let r = c.operand(x);
+                        c.emit(Py.LISTAPPEND(l as u8, r as u8));
+                    }
+                    c.regs.reset(m);
+                }
+                if kind == 0 { c.emit(Py.MOVE(d, l as u8)); }
+                else if kind == 1 { c.emit(Py.TOTUPLE(d, l as u8)); }
+                else {
+                    let b = c.alloc(2);
+                    c.load_name("set", b);
+                    c.emit(Py.MOVE((b + 1) as u8, l as u8));
+                    c.emit(Py.CALL(b as u8, 1));
+                    c.emit(Py.MOVE(d, b as u8));
+                }
+            } else {
+                let base = c.alloc(xs.len as u32);
+                for i in 0..xs.len { c.expr_to(xs.at(i), base + i as u32); }
+                if xs.len > 255 { c.fail("too many elements in a literal"); }
+                c.emit(if kind == 0 { Py.NEWLIST(d, base as u8, xs.len as u8) }
+                       else if kind == 1 { Py.NEWTUPLE(d, base as u8, xs.len as u8) }
+                       else { Py.NEWSET(d, base as u8, xs.len as u8) });
+            }
+        }
+        Dict(ks, vs) => {
+            if ks.len <= 64 {
+                let base = c.alloc(2 * ks.len as u32);
+                for i in 0..ks.len {
+                    c.expr_to(ks.at(i), base + 2 * i as u32);
+                    c.expr_to(vs.at(i), base + 2 * i as u32 + 1);
+                }
+                c.emit(Py.NEWDICT(d, base as u8, ks.len as u8));
+            } else {
+                let t = c.alloc(1);
+                c.emit(Py.NEWDICT(t as u8, 0, 0));
+                for i in 0..ks.len {
+                    let m = c.regs.mark();
+                    let rk = c.operand(ks.at(i));
+                    let rv = c.operand(vs.at(i));
+                    c.emit(Py.DICTSET(t as u8, rk as u8, rv as u8));
+                    c.regs.reset(m);
+                }
+                c.emit(Py.MOVE(d, t as u8));
+            }
+        }
+        IfExp(cond, a, b) => {
+            let els = c.code.label();
+            let end = c.code.label();
+            c.jump_if_false(cond, els);
+            c.expr_to(a, dst);
+            c.code.jump(Py.JMP(0), end);
+            c.code.bind(els);
+            c.expr_to(b, dst);
+            c.code.bind(end);
+        }
+        Lambda(f) => c.make_function(f, dst),
+        ListComp(x, cs) => {
+            let r = c.alloc(1);
+            c.emit(Py.NEWLIST(r as u8, 0, 0));
+            c.comp(cs, 0, 0, r, x, x);
+            c.emit(Py.MOVE(d, r as u8));
+        }
+        SetComp(x, cs) => {
+            let r = c.alloc(1);
+            c.emit(Py.NEWSET(r as u8, 0, 0));
+            c.comp(cs, 0, 2, r, x, x);
+            c.emit(Py.MOVE(d, r as u8));
+        }
+        DictComp(k, v, cs) => {
+            let r = c.alloc(1);
+            c.emit(Py.NEWDICT(r as u8, 0, 0));
+            c.comp(cs, 0, 1, r, k, v);
+            c.emit(Py.MOVE(d, r as u8));
+        }
+        GenExp(f, first) => {
+            // gen = <genexpr>(iter(first))
+            let base = c.alloc(2);
+            c.make_function(f, base);
+            let src = c.operand(first);
+            c.emit(Py.GETITER((base + 1) as u8, src as u8));
+            c.emit(Py.CALL(base as u8, 1));
+            c.emit(Py.MOVE(d, base as u8));
+        }
+        Starred(_) => c.fail("can't use starred expression here"),
+        Yield(x) => {
+            if c.s.kind != SC_FUNC { c.fail("'yield' outside function"); return; }
+            let r = c.alloc(1);
+            match x { Some(v) => c.expr_to(v, r), None => c.emit(Py.LOADNIL(r as u8)) }
+            c.emit(Py.YIELD(d, r as u8));
+        }
+        YieldFrom(x) => {
+            // for v in x: yield v   (sent values are not forwarded)
+            let it = c.alloc(1);
+            let src = c.operand(x);
+            c.emit(Py.GETITER(it as u8, src as u8));
+            let v = c.alloc(1);
+            let top = c.code.here();
+            let done = c.code.label();
+            c.emit(Py.FORITER(v as u8, it as u8));
+            c.code.jump(Py.JMP(0), done);
+            let t = c.alloc(1);
+            c.emit(Py.YIELD(t as u8, v as u8));
+            c.code.jump(Py.JMP(0), top);
+            c.code.bind(done);
+            c.emit(Py.LOADNIL(d));
+        }
+        Walrus(n, x) => {
+            c.expr_to(x, dst);
+            c.store_name(n, dst);
+        }
+    }
+    c.regs.reset(if mark > dst + 1 { mark } else { if dst + 1 > mark and c.regs.is_temp(dst) { dst + 1 } else { mark } });
+}
+
+fn C.comp(c: *C, cs: *mem.Vec<Comp>, i: u64, kind: u32, acc: u32, x: *Expr, y: *Expr) {
+    if i >= cs.len {
+        let m = c.regs.mark();
+        if kind == 0 { let r = c.operand(x); c.emit(Py.LISTAPPEND(acc as u8, r as u8)); }
+        else if kind == 2 { let r = c.operand(x); c.emit(Py.SETADD(acc as u8, r as u8)); }
+        else { let rk = c.operand(x); let rv = c.operand(y); c.emit(Py.DICTSET(acc as u8, rk as u8, rv as u8)); }
+        c.regs.reset(m);
+        return;
+    }
+    let cm = cs.at(i);
+    let it = c.alloc(1);
+    let src = c.operand(cm.iter);
+    c.emit(Py.GETITER(it as u8, src as u8));
+    // The targets are registers of their own, visible only inside.
+    var ns: mem.Vec<str> = mem.Vec.new();
+    names_of(cm.target, &ns);
+    let saved = c.shadow.len;
+    var single: u32 = 0;
+    for j in 0..ns.len {
+        let r = c.alloc(1);
+        if j == 0 { single = r; }
+        c.shadow.push((ns.at(j), r));
+    }
+    let simple = if let Name(_) = cm.target.e { true } else { false };
+    let v = if simple { single } else { c.alloc(1) };
+    let top = c.code.here();
+    let done = c.code.label();
+    c.emit(Py.FORITER(v as u8, it as u8));
+    c.code.jump(Py.JMP(0), done);
+    if !simple { c.assign(cm.target, v); }
+    for j in 0..cm.ifs.len { c.jump_if_false(cm.ifs.at(j), top); }
+    c.comp(cs, i + 1, kind, acc, x, y);
+    c.code.jump(Py.JMP(0), top);
+    c.code.bind(done);
+    c.shadow.len = saved;
+    ns.free();
+}
+
+fn C.fstring(c: *C, parts: *mem.Vec<FPart>, dst: u32) {
+    let n = parts.len as u32;
+    let base = c.alloc(n);
+    for i in 0..parts.len {
+        let p = parts.at(i);
+        let r = base + i as u32;
+        match p.expr {
+            None => c.emit(Py.LOADK(r as u8, c.kstr(p.lit) as u16)),
+            Some(x) => {
+                let m = c.regs.mark();
+                let v = c.operand(x);
+                var src = v;
+                if p.conv != 0 {
+                    c.emit(Py.CONVERT(r as u8, v as u8, p.conv));
+                    src = r;
+                }
+                match p.spec {
+                    Some(sp) => {
+                        let sr = c.alloc(1);
+                        c.expr_to(sp, sr);
+                        c.emit(Py.FORMAT(r as u8, src as u8, sr as u8));
+                    }
+                    None => c.emit(Py.FORMAT(r as u8, src as u8, 255)),
+                }
+                c.regs.reset(m);
+            }
+        }
+    }
+    c.emit(Py.BUILDSTR(dst as u8, base as u8, n as u8));
+}
+
+fn C.call(c: *C, f: *Expr, args: *mem.Vec<Arg>, dst: u32) {
+    let d = dst as u8;
+    var nkw: u64 = 0;
+    var star = false;
+    for i in 0..args.len {
+        let a = args.at(i);
+        if a.star != 0 { star = true; }
+        if a.name.is_some() { nkw += 1; }
+    }
+    // super() with no arguments.
+    if let Name(n) = f.e and n.eq("super") and args.len == 0 and c.is_global("super") and c.has_params {
+        var selfr = c.first_param_reg;
+        if c.s.cells.contains(c.first_param_name()) {
+            let t = c.alloc(1);
+            c.emit(Py.LOADCELL(t as u8, selfr as u8));
+            selfr = t;
+        }
+        c.emit(Py.SUPER(d, selfr as u8));
+        return;
+    }
+    if star {
+        // f(*a, **k): build an argument list and a keyword dict.
+        let base = c.alloc(3);
+        c.expr_to(f, base);
+        c.emit(Py.NEWLIST((base + 1) as u8, 0, 0));
+        var has_kw = false;
+        for i in 0..args.len {
+            let a = args.at(i);
+            let m = c.regs.mark();
+            if a.star == 1 {
+                let r = c.operand(a.value);
+                c.emit(Py.LISTEXTEND((base + 1) as u8, r as u8));
+            } else if a.star == 2 or a.name.is_some() {
+                if !has_kw { c.emit(Py.NEWDICT((base + 2) as u8, 0, 0)); has_kw = true; }
+                if a.star == 2 {
+                    let mb = c.alloc(3);
+                    c.emit(Py.LOADMETHOD(mb as u8, (base + 2) as u8, c.name8("update")));
+                    c.expr_to(a.value, mb + 2);
+                    c.emit(Py.CALLMETHOD(mb as u8, 1));
+                } else {
+                    let rk = c.alloc(1);
+                    c.emit(Py.LOADK(rk as u8, c.kstr(a.name.unwrap()) as u16));
+                    let rv = c.operand(a.value);
+                    c.emit(Py.DICTSET((base + 2) as u8, rk as u8, rv as u8));
+                }
+            } else {
+                let r = c.operand(a.value);
+                c.emit(Py.LISTAPPEND((base + 1) as u8, r as u8));
+            }
+            c.regs.reset(m);
+        }
+        if !has_kw { c.emit(Py.LOADNIL((base + 2) as u8)); }
+        c.set_line(c.line);
+        c.emit(Py.CALLEX(base as u8));
+        if base != dst { c.emit(Py.MOVE(d, base as u8)); }
+        return;
+    }
+    let n = args.len as u32;
+    var kwk: u32 = 0;
+    if nkw > 0 {
+        // Keyword arguments come last; their names are a constant tuple.
+        var names: mem.Vec<Value> = mem.Vec.new();
+        var seen_kw = false;
+        for i in 0..args.len {
+            let a = args.at(i);
+            if let Some(nm) = a.name { names.push(Value.Str(vm.intern(c.u.c, nm))); seen_kw = true; }
+            else if seen_kw { c.fail("positional argument follows keyword argument"); }
+        }
+        kwk = c.k8(Value.Tuple(value.tuple_of(&c.u.c.heap, names.items()))) as u32;
+        names.free();
+    }
+    if let Attr(o, mname) = f.e {
+        let base = c.alloc(2 + n);
+        let ro = c.operand(o);
+        c.emit(Py.LOADMETHOD(base as u8, ro as u8, c.name8(mname)));
+        for i in 0..args.len { c.expr_to(args.at(i).value, base + 2 + i as u32); }
+        c.set_line(c.line);
+        if nkw > 0 { c.emit(Py.CALLMETHODKW(base as u8, n as u8, kwk as u8)); }
+        else { c.emit(Py.CALLMETHOD(base as u8, n as u8)); }
+        if base != dst { c.emit(Py.MOVE(d, base as u8)); }
+        return;
+    }
+    // In place when dst is the topmost temporary.
+    let mark = c.regs.mark();
+    let in_place = c.regs.is_temp(dst) and dst + 1 == mark;
+    let base = if in_place { c.alloc(n); dst } else { c.alloc(1 + n) };
+    c.expr_to(f, base);
+    for i in 0..args.len { c.expr_to(args.at(i).value, base + 1 + i as u32); }
+    if nkw > 0 { c.emit(Py.CALLKW(base as u8, n as u8, kwk as u8)); }
+    else { c.emit(Py.CALL(base as u8, n as u8)); }
+    if base != dst { c.emit(Py.MOVE(d, base as u8)); }
+}
+
+fn C.is_global(c: *C, n: str) -> bool {
+    match c.kind(n) { Global => true, _ => false }
+}
+
+fn C.first_param_name(c: *C) -> str {
+    if c.s.order.len > 0 { c.s.order.at(0) } else { "" }
+}
+
+// ── conditions ──────────────────────────────────────────────────────
+
+fn branch_ops(op: CmpOp, k: bool) -> ?u32 {
+    if k {
+        match op {
+            Lt => Some(Py.OP_JNLTK), Le => Some(Py.OP_JNLEK), Gt => Some(Py.OP_JNGTK), Ge => Some(Py.OP_JNGEK),
+            Eq => Some(Py.OP_JNEQK), Ne => Some(Py.OP_JNNEK), _ => None,
+        }
+    } else {
+        match op {
+            Lt => Some(Py.OP_JNLT), Le => Some(Py.OP_JNLE), Gt => Some(Py.OP_JNGT), Ge => Some(Py.OP_JNGE),
+            Eq => Some(Py.OP_JNEQ), Ne => Some(Py.OP_JNNE), _ => None,
+        }
+    }
+}
+
+fn negate(op: CmpOp) -> ?CmpOp {
+    // Only exact for == and != (NaN makes < and >= different).
+    match op { Eq => Some(CmpOp.Ne), Ne => Some(CmpOp.Eq), _ => None }
+}
+
+fn C.jump_if_false(c: *C, cond: *Expr, l: bc.Label) {
+    let mark = c.regs.mark();
+    match cond.e {
+        Cmp(a, opsv, rest) => if opsv.len == 1 {
+            let op = opsv.at(0);
+            if let Some(k) = c.small_const(rest.at(0)) and let Some(w) = branch_ops(op, true) {
+                let ra = c.operand(a);
+                c.emit(Py.encode.ABC(w, ra as u8, k, 0));
+                c.code.jump(Py.JMP(0), l);
+                c.regs.reset(mark);
+                return;
+            }
+            if let Some(w) = branch_ops(op, false) {
+                let ra = c.operand(a);
+                let rb = c.operand(rest.at(0));
+                c.emit(Py.encode.ABC(w, ra as u8, rb as u8, 0));
+                c.code.jump(Py.JMP(0), l);
+                c.regs.reset(mark);
+                return;
+            }
+        },
+        And(a, b) => {
+            c.jump_if_false(a, l);
+            c.jump_if_false(b, l);
+            return;
+        }
+        Or(a, b) => {
+            let t = c.code.label();
+            c.jump_if_true(a, t);
+            c.jump_if_false(b, l);
+            c.code.bind(t);
+            return;
+        }
+        Un(op, a) => if op == UnOp.Not { c.jump_if_true(a, l); return; },
+        Bool(b) => { if !b { c.code.jump(Py.JMP(0), l); } return; }
+        Int(i) => { if i == 0 { c.code.jump(Py.JMP(0), l); } return; }
+        _ => {}
+    }
+    let r = c.operand(cond);
+    c.code.jump(Py.JF(r as u8, 0), l);
+    c.regs.reset(mark);
+}
+
+fn C.jump_if_true(c: *C, cond: *Expr, l: bc.Label) {
+    let mark = c.regs.mark();
+    match cond.e {
+        Cmp(a, opsv, rest) => if opsv.len == 1 and let Some(nop) = negate(opsv.at(0)) {
+            if let Some(w) = branch_ops(nop, false) {
+                let ra = c.operand(a);
+                let rb = c.operand(rest.at(0));
+                c.emit(Py.encode.ABC(w, ra as u8, rb as u8, 0));
+                c.code.jump(Py.JMP(0), l);
+                c.regs.reset(mark);
+                return;
+            }
+        },
+        And(a, b) => {
+            let f = c.code.label();
+            c.jump_if_false(a, f);
+            c.jump_if_true(b, l);
+            c.code.bind(f);
+            return;
+        }
+        Or(a, b) => {
+            c.jump_if_true(a, l);
+            c.jump_if_true(b, l);
+            return;
+        }
+        Un(op, a) => if op == UnOp.Not { c.jump_if_false(a, l); return; },
+        _ => {}
+    }
+    let r = c.operand(cond);
+    c.code.jump(Py.JT(r as u8, 0), l);
+    c.regs.reset(mark);
+}
+
+// ── functions ───────────────────────────────────────────────────────
+
+fn C.make_function(c: *C, f: *FuncDef, dst: u32) {
+    let fs = c.u.an.scopes.get(f as u64).unwrap();
+    let pidx = compile_function(c.u, fs, f);
+    let Some(p) = c.u.c.protos.get(pidx as u64) else { return; };
+    fill_freesrc(c.u, c, fs, p);
+    // Defaults into dst+1.., then the kw-only defaults dict.
+    let mark = c.regs.mark();
+    let base = if dst + 1 == mark and c.regs.is_temp(dst) { dst } else { c.alloc(1) };
+    var nd: u32 = 0;
+    var nkd: u32 = 0;
+    for i in 0..f.params.len {
+        let pa = f.params.at(i);
+        if pa.default.is_some() { if pa.kind == 3 { nkd += 1; } else { nd += 1; } }
+    }
+    if nd > 0 or p.nkwonly > 0 {
+        let r = c.alloc(nd + 1);
+        var j: u32 = 0;
+        for i in 0..f.params.len {
+            let pa = f.params.at(i);
+            if pa.kind != 3 and let Some(dv) = pa.default { c.expr_to(dv, r + j); j += 1; }
+        }
+        if p.nkwonly > 0 {
+            let kd = r + nd;
+            c.emit(Py.NEWDICT(kd as u8, 0, 0));
+            for i in 0..f.params.len {
+                let pa = f.params.at(i);
+                if pa.kind == 3 and let Some(dv) = pa.default {
+                    let m = c.regs.mark();
+                    let rk = c.alloc(1);
+                    c.emit(Py.LOADK(rk as u8, c.kstr(pa.name) as u16));
+                    let rv = c.operand(dv);
+                    c.emit(Py.DICTSET(kd as u8, rk as u8, rv as u8));
+                    c.regs.reset(m);
+                }
+            }
+        }
+        if r != base + 1 { c.fail("internal: default registers"); }
+    }
+    p.ndefaults = nd;
+    c.emit(Py.MAKEFUNC(base as u8, pidx as u16));
+    if base != dst { c.emit(Py.MOVE(dst as u8, base as u8)); }
+    c.apply_decorators(f.decorators, dst);
+    c.regs.reset(mark);
+}
+
+/// Compile a function body to a new prototype; returns its index.
+fn compile_function(u: *Unit, s: *Scope, f: *FuncDef) -> u32 {
+    var c = new_c(u, s);
+    c.set_line(f.line);
+    // Parameters: positional, *args, keyword-only, **kwargs.
+    var pnames: mem.Vec<Value> = mem.Vec.new();
+    var np: u32 = 0;
+    var nk: u32 = 0;
+    var flags: u32 = 0;
+    var order: mem.Vec<str> = mem.Vec.new();
+    for i in 0..f.params.len { let p = f.params.at(i); if p.kind == 0 { order.push(p.name); np += 1; } }
+    for i in 0..f.params.len { let p = f.params.at(i); if p.kind == 1 { order.push(p.name); flags |= P_VARARGS; } }
+    for i in 0..f.params.len { let p = f.params.at(i); if p.kind == 3 { order.push(p.name); nk += 1; } }
+    for i in 0..f.params.len { let p = f.params.at(i); if p.kind == 2 { order.push(p.name); flags |= P_VARKW; } }
+    if f.gencomps.is_some() { order.push(".0"); np = 1; }
+    for i in 0..order.len {
+        let r = c.alloc(1);
+        c.locals.insert(order.at(i), r);
+        pnames.push(Value.Str(vm.intern(u.c, order.at(i))));
+    }
+    c.has_params = order.len > 0;
+    c.first_param_reg = 0;
+    // Other locals.
+    for i in 0..s.order.len {
+        let n = s.order.at(i);
+        if !c.locals.contains(n) { let r = c.alloc(1); c.locals.insert(n, r); }
+    }
+    c.regs.activate(c.regs.mark());
+    // Cells.
+    for i in 0..s.order.len {
+        let n = s.order.at(i);
+        if s.cells.contains(n) {
+            let r = c.locals.get(n).unwrap();
+            c.emit(Py.MAKECELL(r as u8));
+        }
+    }
+    if let Some(cs) = f.gencomps {
+        // for target in .0: ... yield elt
+        let r0 = c.locals.get(".0").unwrap();
+        c.gen_comp(cs, 0, f.genexp.unwrap(), r0);
+    } else {
+        c.block(f.body);
+    }
+    c.emit(Py.RETNIL());
+    if s.is_gen { flags |= P_GEN; }
+    let simple = flags == 0 and nk == 0;
+    let pidx = finish(&c, f.name, np, nk, flags, pnames.items(), simple, f.line);
+    pnames.free();
+    order.free();
+    pidx
+}
+
+fn C.gen_comp(c: *C, cs: *mem.Vec<Comp>, i: u64, elt: *Expr, first_iter: u32) {
+    if i >= cs.len {
+        let m = c.regs.mark();
+        let r = c.operand(elt);
+        let t = c.alloc(1);
+        c.emit(Py.YIELD(t as u8, r as u8));
+        c.regs.reset(m);
+        return;
+    }
+    let cm = cs.at(i);
+    var it = first_iter;
+    if i > 0 {
+        it = c.alloc(1);
+        let src = c.operand(cm.iter);
+        c.emit(Py.GETITER(it as u8, src as u8));
+    }
+    let v = c.alloc(1);
+    let top = c.code.here();
+    let done = c.code.label();
+    c.emit(Py.FORITER(v as u8, it as u8));
+    c.code.jump(Py.JMP(0), done);
+    c.assign(cm.target, v);
+    for j in 0..cm.ifs.len { c.jump_if_false(cm.ifs.at(j), top); }
+    c.gen_comp(cs, i + 1, elt, first_iter);
+    c.code.jump(Py.JMP(0), top);
+    c.code.bind(done);
+}
+
+fn finish(c: *C, name: str, np: u32, nk: u32, flags: u32, pnames: []Value, simple: bool, line: u32) -> u32 {
+    let u = c.u;
+    if let Some(e) = c.code.check() {
+        if u.err.is_none() { u.err = Some(e.message()); u.err_line = line; }
+    }
+    // Handler table: targets are known now.
+    var hs: mem.Vec<vm.ExcEntry> = mem.Vec.new();
+    for i in 0..c.pending.len {
+        let p = c.pending.at(i);
+        let t = c.code.label_pc(p.label) ?? 0;
+        hs.push(vm.ExcEntry { start: p.start, end: p.end, target: t as u32, reg: p.reg });
+    }
+    let n = c.code.len();
+    let words: *u32 = mem.alloc(n);
+    c.code.copy_into(words.slice(n));
+    let lines: *u32 = mem.alloc(n);
+    c.code.locs_into(lines.slice(n));
+    let nc = c.consts.len();
+    let consts: *Value = mem.alloc(if nc == 0 { 1 } else { nc });
+    for i in 0..nc { consts[i] = c.consts.get(i as u32); }
+    let pn: *Value = mem.alloc(if pnames.len == 0 { 1 } else { pnames.len });
+    for i in 0..pnames.len { pn[i] = pnames[i]; }
+    let fr: *u32 = mem.alloc(if c.s.frees.len == 0 { 1 } else { c.s.frees.len });
+    let hv: *vm.ExcEntry = mem.alloc(if hs.len == 0 { 1 } else { hs.len });
+    for i in 0..hs.len { hv[i] = hs.at(i); }
+    let nregs = c.regs.frame_size(1) + 1;
+    let p: *Proto = mem.alloc(1);
+    *p = Proto {
+        name: u.arena.str(name), nparams: np, nkwonly: nk, flags: flags, nregs: nregs,
+        simple: if simple { np } else { 0xffffffff },
+        pnames: pn.slice(pnames.len), freesrc: fr.slice(c.s.frees.len), words: words.slice(n),
+        code: Py.placeholder(), consts: consts.slice(nc), lines: lines.slice(n), handlers: hv.slice(hs.len),
+        ndefaults: 0,
+    };
+    hs.free();
+    let idx = u.c.protos.len as u32;
+    u.c.protos.push(p);
+    p.simple = if simple { np } else { 0xffffffff };
+    idx
+}
+
+/// Free-variable sources of the functions `c` creates: filled once the
+/// creator's registers are known (called by MAKEFUNC users at compile time).
+fn fill_freesrc(u: *Unit, creator: *C, child: *Scope, p: *Proto) {
+    for i in 0..child.frees.len {
+        let n = child.frees.at(i);
+        var src: u32 = 0;
+        match creator.kind(n) {
+            Free(j) => src = 0x80000000 | j,
+            Cell(r) => src = r,
+            Local(r) => src = r,
+            _ => { creator.fail("internal: free variable not found"); }
+        }
+        p.freesrc[i] = src;
+    }
+    let _ = u;
+}
+
+// ── programs ────────────────────────────────────────────────────────
+
+pub struct CompileError { msg: str, line: u32 }
+
+/// Compile a module's source; returns the module function's prototype index.
+pub fn compile_source(c: *Ctx, src: str, arena: *mem.Arena) -> Result<u32, CompileError> {
+    var lx = Lexer.new(src, arena);
+    lx.run();
+    if let Some(m) = lx.err { let l = lx.err_line; lx.free(); return Err(CompileError { msg: m, line: l }); }
+    var p = P.new(lx.toks.items(), arena);
+    let body = p.file();
+    if let Some(m) = p.err { let l = p.err_line; return Err(CompileError { msg: m, line: l }); }
+    var an = An { arena: arena, scopes: map.HashMap.new(), comp: mem.Vec.new() };
+    let ms = new_scope(&an, SC_MODULE, None);
+    an.body(ms, body);
+    resolve(ms);
+    var u = Unit { c: c, arena: arena, an: &an, err: None, err_line: 0 };
+    var cc = new_c(&u, ms);
+    cc.block(body);
+    cc.emit(Py.RETNIL());
+    let idx = finish(&cc, "<module>", 0, 0, 0, [], true, 1);
+    if let Some(m) = u.err { return Err(CompileError { msg: m, line: u.err_line }); }
+    Ok(idx)
+}
+
+/// Verify every prototype not verified yet (from index `from`).
+pub fn verify_from(c: *Ctx, from: u64) -> Result<(), str> {
+    vm.NPROTOS = c.protos.len;
+    for i in from..c.protos.len {
+        let p = c.protos.at(i);
+        match Py.verify(p.words, p) {
+            Ok(v) => p.code = v,
+            Err(e) => {
+                var b = text.StrBuf.new();
+                b.push_str("bytecode failed verification in ");
+                b.push_str(p.name);
+                b.push_str(": ");
+                e.write(&b);
+                io.eprintln(b.as_str());
+                return Err("internal error: bad bytecode");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run Python source as a module whose globals are `d` (for modules
+/// written in Python, such as io).
+pub fn run_module_source(c: *Ctx, src: str, d: Gc<Dict>) -> Result<(), Value> uses reenter {
+    let first = c.protos.len;
+    let arena: *mem.Arena = mem.alloc(1);
+    *arena = mem.Arena.new();
+    let r = compile_source(c, src, arena);
+    let Ok(idx) = r else { return Err(ops.exc(c, builtins.E_RUNTIME, "cannot compile builtin module")); };
+    if let Err(_) = verify_from(c, first) { return Err(ops.exc(c, builtins.E_RUNTIME, "builtin module failed verification")); }
+    let p = c.protos.at(idx as u64);
+    let f = new(&c.heap, Func { proto: p, defaults: None, kwdefaults: None, cells: None, globals: d, owner: None });
+    vm.invoke(c, Value.Func(f), [])?;
+    Ok(())
+}
