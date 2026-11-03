@@ -2625,12 +2625,22 @@ impl<'a, 'p> FnGen<'a, 'p> {
 /// generated code calls, and std.gc's free hooks and dirty pinning,
 /// so that the IR of programs that do not use them stays the same.
 fn is_lazy(f: &FnDef) -> bool {
-    f.lazy || f.symbol.starts_with("std.gc.rootck_") || f.symbol.starts_with("loimi_rootck_") || LAZY_STD.contains(&f.symbol.as_str())
+    f.lazy
+        || f.symbol.starts_with("std.gc.rootck_")
+        || f.symbol.starts_with("loimi_rootck_")
+        || LAZY_STD.contains(&f.symbol.as_str())
+        || LAZY_STD_PREFIX.iter().any(|p| f.symbol.starts_with(p))
+        || f.symbol.contains("<u64, OpBits>")
 }
+
+/// Prefixes of std functions emitted only where used (newer modules'
+/// parts, so that programs that do not use them keep their IR).
+const LAZY_STD_PREFIX: &[&str] =
+    &["std.io.Out.", "std.io.write_all", "std.parse.Ops.", "std.parse.OpType.", "std.parse.op_type", "std.parse.fixity_of", "std.parse.decode", "std.map.HashMap<u64, OpBits>."];
 
 /// std struct types whose LLVM definition is emitted only where used, so
 /// that the IR of programs that do not use them stays the same.
-const LAZY_STD_TYPES: &[&str] = &["std.mem.Malloc"];
+const LAZY_STD_TYPES: &[&str] = &["std.mem.Malloc", "std.io.Out", "std.parse.Ops", "std.parse.Op", "std.parse.OpEntry", "std.parse.OpBits"];
 
 const LAZY_STD: &[&str] = &[
     "std.gc.Heap.on_free",

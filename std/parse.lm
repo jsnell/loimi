@@ -382,8 +382,12 @@ pub struct OpEntry { name: u64, op: Op }
 /// postfix definition per name. Names must be below 2^62.
 pub struct Ops {
     /// (name << 2 | fixity) -> (priority << 3 | type)
-    map: map.HashMap<u64, u32>,
+    map: map.HashMap<u64, OpBits>,
 }
+
+/// A definition's priority and type, packed (its own type, so that the
+/// map's methods are emitted only for programs that use `Ops`).
+struct OpBits { v: u32 }
 
 pub fn Ops.new() -> Ops { Ops { map: map.HashMap.new() } }
 
@@ -394,10 +398,11 @@ pub fn Ops.free(o: *Ops) { o.map.free(); }
 pub fn Ops.add(o: *Ops, name: u64, prio: u32, typ: OpType) {
     let k = (name << 2) | fixity_of(typ);
     if prio == 0 { o.map.remove(k); return; }
-    o.map.insert(k, (prio << 3) | (typ as u32));
+    o.map.insert(k, OpBits { v: (prio << 3) | (typ as u32) });
 }
 
-fn decode(v: u32) -> Op {
+fn decode(b: OpBits) -> Op {
+    let v = b.v;
     let p = v >> 3;
     let t = op_type_of(v & 7);
     match t {
@@ -430,7 +435,7 @@ pub fn Ops.is_op(o: *Ops, name: u64) -> bool {
 pub fn Ops.max_prio(o: *Ops, name: u64) -> u32 {
     var p: u32 = 0;
     for f in [FIX_PREFIX, FIX_INFIX, FIX_POSTFIX] {
-        if let Some(v) = o.map.get((name << 2) | f) { if (v >> 3) > p { p = v >> 3; } }
+        if let Some(b) = o.map.get((name << 2) | f) { if (b.v >> 3) > p { p = b.v >> 3; } }
     }
     p
 }

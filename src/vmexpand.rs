@@ -1009,6 +1009,15 @@ fn generate_resume_caches(v: &VmDecl, l: &VmLayout) -> String {
     s
 }
 
+/// Whether any source file names an `emit.OP_cached` emitter: only then
+/// are they generated, so that other programs' code does not change.
+fn uses_cached_emitters(sm: &SourceMap) -> bool {
+    sm.files.iter().any(|f| {
+        f.generated.is_none()
+            && crate::lexer::lex(0, &f.text).is_ok_and(|t| t.iter().any(|t| matches!(&t.tok, crate::lexer::Tok::Ident(x) if x.ends_with("_cached"))))
+    })
+}
+
 /// Whether any source file names a resume point item (`next_resume`,
 /// `Vm.Resume`, `resume_at`, `assume_resume`): only then are they
 /// generated (`generate_resume`).
@@ -1238,7 +1247,7 @@ fn generate_build_verified(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool, 
     s
 }
 
-pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
+pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool, cached: bool) -> String {
     let n = &v.name.name;
     let w = format!("u{}", l.word_bits);
     let mask = (1u64 << l.op_bits) - 1;
@@ -1302,7 +1311,7 @@ pub fn generate(v: &VmDecl, l: &VmLayout, jit: bool) -> String {
         // the inline cache's initial contents (its integer, `bool` and
         // pointer fields, in declaration order; `Vm.Resume` fields are set
         // after verification, by `fill_resumes`).
-        if let Some(c) = o.cache {
+        if let Some(c) = o.cache.filter(|_| cached) {
             if let Some((cps, puts)) = cached_emitter_parts(v, &v.caches[c], l.word_bits / 8, n) {
                 let mut ps = ps.clone();
                 ps.extend(cps);
@@ -2229,6 +2238,7 @@ fn c_externs(items: &mut [Item]) {
 /// Expand every vm in every module: append generated items.
 pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> {
     let resume = uses_resume(sm);
+    let cached = uses_cached_emitters(sm);
     for m in modules.iter_mut() {
         let mut extra = Vec::new();
         // Each C function is declared once per module.
@@ -2237,7 +2247,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
         for it in &m.items {
             if let Item::Vm(v) = it {
                 let l = layout(v)?;
-                let mut src = generate(v, &l, jit);
+                let mut src = generate(v, &l, jit, cached);
                 if jit && !jit_externs {
                     // `--jit-stencils`: the run-time JIT learns of every
                     // verified code object, and of rewrites of its words.
