@@ -279,6 +279,11 @@ family GETPROP(dst: reg, o: reg, key: kst) : ABC + PropIC {
   the slow paths of a vm that only wants monomorphic own-property caches
   (`tests/run/std_obj_ic.lm`).
 
+The hit helpers (`load_ref`, `proto_load`, `poly_get`, `poly_get_at`,
+`mega_get`, `mega_get_at`) are `#[inline]`, so a handler's hit path has
+no call and no stack frame (Lox's `trees`, whose sites are polymorphic,
+ran 5% faster when they were inlined; MiniJS unchanged within noise).
+
 A hit costs two dependent loads (`o.shape`, `shape.id`), a compare
 against the cache word and the slot load: 0.8 ns over a register move on
 an i7-6700 (`bench/obj/README.md`, which shows the machine code).

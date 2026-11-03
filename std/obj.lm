@@ -542,6 +542,7 @@ pub struct MegaCache { e: *MegaEntry, mask: u64 }
 /// `n` entries (a power of two).
 pub fn MegaCache.new(n: u64) -> MegaCache { MegaCache { e: mem.alloc(n), mask: n - 1 } }
 
+#[inline]
 fn MegaCache.entry(c: *MegaCache, sid: u32, key: u64) -> *MegaEntry {
     c.e + (hash.mix(key ^ ((sid as u64) << 32)) & c.mask)
 }
@@ -778,6 +779,7 @@ pub fn Model<O, S, V>.store(m: *Model<O, S, V>, o: O, i: u32, v: V) {
 
 /// The value at a SlotRef (from a cache hit: no bounds checks, since the
 /// shape check implies the slot exists).
+#[inline]
 pub fn Model<O, S, V>.load_ref(m: *Model<O, S, V>, o: O, r: u32) -> V {
     if r & OUT == 0 { return o.inline.ptr[r]; }
     let Some(s) = o.overflow else { unreachable };
@@ -1186,6 +1188,7 @@ fn Model<O, S, V>.chain_at(m: *Model<O, S, V>, o: O, key: u64, depth: *u32) -> ?
 
 /// A cached prototype hit, after the vm checked the receiver's shape
 /// (`o.shape.id == sid`): the value if the cell is still valid.
+#[inline]
 pub fn Model<O, S, V>.proto_load(m: *Model<O, S, V>, o: O, slot: u32, cell: u32, depth: u32) -> ?V {
     if m.shapes.cvalid.ptr[cell] == 0 { return None; }
     let Some(p) = o.proto else { return None; };
@@ -1208,6 +1211,7 @@ pub fn Model<O, S, V>.hit(m: *Model<O, S, V>, o: O, h: *Hit) -> ?V {
 }
 
 /// A hit in Poly entry `ent` (index + 1 in `m.ic.poly`).
+#[inline]
 pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
     let p = m.ic.poly.ptr + (ent - 1) as u64;
     let sid = o.shape.id;
@@ -1229,6 +1233,7 @@ pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
 /// For languages that treat the two differently: Lox, Python and Ruby
 /// bind a method found on the class, but not a function stored in a
 /// field (`if d != 0 { bind }`).
+#[inline]
 pub fn Model<O, S, V>.poly_get_at(m: *Model<O, S, V>, o: O, ent: u32) -> ?(V, u32) {
     let p = m.ic.poly.ptr + (ent - 1) as u64;
     let sid = o.shape.id;
@@ -1250,6 +1255,7 @@ pub fn Model<O, S, V>.poly_get_at(m: *Model<O, S, V>, o: O, ent: u32) -> ?(V, u3
 }
 
 /// A hit in the shared MegaCache (no fill).
+#[inline]
 pub fn Model<O, S, V>.mega_get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
     let x = m.ic.mega.entry(o.shape.id, key);
     if x.sid != o.shape.id or x.key != key { return None; }
@@ -1259,6 +1265,7 @@ pub fn Model<O, S, V>.mega_get(m: *Model<O, S, V>, o: O, key: u64) -> ?V {
 }
 
 /// `mega_get` with the hit's provenance, as `poly_get_at`.
+#[inline]
 pub fn Model<O, S, V>.mega_get_at(m: *Model<O, S, V>, o: O, key: u64) -> ?(V, u32) {
     let x = m.ic.mega.entry(o.shape.id, key);
     if x.sid != o.shape.id or x.key != key { return None; }
@@ -1331,6 +1338,7 @@ fn Model<O, S, V>.absent_hit(m: *Model<O, S, V>, o: O, h: *Hit) {
 }
 
 /// An absent-property hit with cell `c`: nil while the chain is unchanged.
+#[inline]
 fn Model<O, S, V>.absent(m: *Model<O, S, V>, c: u32) -> ?V {
     if c == 0 or m.shapes.cvalid.ptr[c] != 0 { return Some(m.nil); }
     None
