@@ -330,6 +330,45 @@ quickening on/off.
    length. Operand access is verified, but computed indices
    (`regs.at(f.ret_reg)`) need `unsafe`. Is a "trusted index" type flowing
    from verified operands worth it?
+
+   *Answered (2026-11-03): no new type; the verifier already is the
+   trusted-index mechanism, and a run-time check costs 2–9%.* Raw pointer
+   indexing never needed `unsafe` (`language.md` §1.3); the `unsafe`
+   blocks the examples had were reader markers around float reads of a
+   register (`*((regs + a.raw) as *f64)`, Mini and MiniJS) plus one
+   `p as Gc<T>` in Mini's free hook. Those are gone: `f64.from_bits(a as
+   u64)` on an operand now compiles to the same `load double` (identical
+   handler asm), and `heap.on_free_gc(obj, f)` gives the hook a
+   `Gc<T>`. The examples have no `unsafe` left. Their computed register
+   accesses are of three kinds:
+   - *Operand plus a constant or a count* (`regs[a + 3]` in FORLOOP,
+     `regs + base + 1 .. + nargs` in CALL): the operand kind's `verify`
+     clause states the whole range (`forbase` checks `it + 3 < nregs`,
+     `nargs` checks `A + it < nregs`), so the raw field *is* a trusted
+     index, checked once per load. What nothing checks is that a handler
+     stays within the range its kind verified (`regs[a + 4]` with
+     `forbase`); a lint for constant offsets would close that, at no run
+     time cost (not built).
+   - *Frame-relative* (`*(regs - 1) = v` in RET, `fp.base`): invariants
+     of the calling convention that the verified CALL established, not
+     indices; an index type cannot express them.
+   - *Indices stored in memory* (Mini's `ydst`, the CALL base saved for a
+     coroutine's results): verified when stored, but a type would have to
+     survive a round trip through a heap object and be tied to a frame
+     size, which is a run-time value again.
+   Measured: a checked accessor (`slot(f, i)`: trap unless `i <
+   f.cl.proto.nregs`, trap inline) on Mini's FORPREP/FORLOOP accesses and
+   RET1's store into the caller, best of 3, interleaved,
+   `--align-functions=64`, tail-call: per access, fib +5%, sieve +6%,
+   spectral_norm +6%, nbody +4%, fannkuch/queens/mandelbrot +1–3%; one
+   check per op (`a + 3 < nregs` at the top of FOR*), sieve, queens,
+   fannkuch and mandelbrot within noise, but fib still +5% (RET1's check
+   of the caller's frame: two more dependent loads) and nbody +7%.
+   FORLOOP grows from 57 to 88 instructions per access-checked (62 with
+   one check), RET1 from 50 to 62 (the hot path gains two loads, a
+   subtract, shift, compare and branch). So a checked `Window` is affordable only where the check can
+   be hoisted to once per op, and then it adds nothing the verify clause
+   did not already prove.
 8. **Syntax.** Everything is provisional. Control words (`next`, `jump`,
    `become`, `redo`) read well, but `inline for` generating items and `#name`
    splicing may want a proper macro design.

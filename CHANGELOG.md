@@ -82,6 +82,8 @@ implementation; `git log` has the details.
 
 ### GC
 
+- **`heap.on_free_gc(obj, f)`**: a free hook typed `fn(Gc<T>)`, no
+  `unsafe` cast from `*u8` ([stdlib/gc.md](docs/stdlib/gc.md)).
 - **Generational mode** with epoch marks, lazy sweeping and large-object
   aging; Scheme runs on it
   ([stdlib/gc.md](docs/stdlib/gc.md#generational-mode-sticky-mark-bits-non-moving)).
@@ -131,6 +133,11 @@ implementation; `git log` has the details.
 
 ### Examples
 
+- No `unsafe` left in the example interpreters: `f64.from_bits(a as
+  u64)` on a register operand compiles to a `double` load of the slot
+  ([language.md](docs/language.md), [lowering.md §2](docs/lowering.md)),
+  and a checked register window was measured and declined
+  ([roadmap question 7](docs/roadmap.md)).
 - [`examples/wasm`](examples/wasm): a WebAssembly interpreter that
   passes every non-SIMD spec test file.
 - [`examples/python`](examples/python): a Python 3 subset running 11
