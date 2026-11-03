@@ -88,6 +88,51 @@ the kinds decode to the plain field, so handlers are unchanged.
 `tests/fuzz/mini_holes.lm` checks that all nine reproducers are
 rejected (run by `cargo test`).
 
+## GC rooting fuzzing
+
+`loimi build --gc-check-roots` makes the collector check every
+reference it marks (shadow-stack roots, copies of vm state, `gc_mark`
+in scanners, traced fields) before reading its header, fills unassigned
+traced slots and freed objects with 0x01 bytes, and reports a bad root
+with its frame, function, call site and slot (lowering.md §9).
+`tests/fuzz/rootgen.rs` generates random programs that mix traced
+locals (`Gc`, options, a struct, a tuple, an enum, a nanbox `value`, an
+array) with every binding form (`let`/`var`, `let .. else` (also `else
+cold`), `if let` chains, `while let`, `match` with guards that collect
+and fail, or-patterns and tuple patterns, `for`, `loop` with `break`
+values, `defer`, closures), early exits, stores, and calls that collect,
+in plain functions and in a vm's handlers, `cold` blocks, vm functions
+and `on raise`. Each is built in this mode and run without collections,
+under GC stress, and under generational stress with verify; the outputs
+(digests that read through every reference) must agree across runs and
+dispatch modes, and objects only out-of-scope locals reached must be
+gone after a full collection (`Weak` probes). It keeps to what the
+language promises: no traced temporary is held across a call that may
+collect.
+
+    cargo test --release --test fuzz fuzz_gc_roots       # smoke: 18 fixed seeds, ~20 s
+    ROOTFUZZ_SECS=300 ROOTFUZZ_JOBS=2 ROOTFUZZ_FIRST=1000 \
+      cargo test --release --test fuzz fuzz_gc_roots_long -- --ignored --nocapture
+    ROOTFUZZ_SEEDS=17,42 ROOTFUZZ_KEEP=1 ...              # rerun seeds, keep target/rootfuzz/roots-SEED.lm
+
+(`ROOTFUZZ_PLAIN=1` builds without `--gc-check-roots`.) Seeded bugs,
+detected by the 18 smoke seeds with the checks (without):
+let-else bindings rooted in the else block (the bug of commit 334d6cc)
+18 (16); a match arm's bindings not rooted 10 (2); a block's locals
+rooted after their scope 18 (18, as leaks); `if let` bindings rooted
+in the else branch 14 (13); a match scrutinee not rooted during guards
+(the bug below) 5 (0).
+
+**Run so far: 14 minutes** (2026-11-03), 535 programs, each in
+three dispatch modes and three GC settings. Found and fixed: a `match`
+guard that collects ran with a temporary scrutinee (`match f() {..}`)
+unrooted, so arms after a failing guard bound freed objects; in vm
+code also with the earlier fix, since a call there is a vm node
+(`tests/run/gc_roots_match_guard.lm`). Found, not fixed: LLVM 19
+crashes in `LoopSimplifyCFG` (at `-O1` and `-O3`) on the goto-mode run
+loop of about 1% of the generated programs; the IR verifies, and the
+fuzzer skips that build (reproduce: `ROOTFUZZ_SEEDS=1088`).
+
 ## Differences from the design
 
 - **Collection happens only at safepoints.** Allocation never collects;
