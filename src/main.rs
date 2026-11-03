@@ -232,9 +232,18 @@ const GOTO_LLVM_ARGS: &[&str] = &[
     "-tail-dup-placement=false",
 ];
 
+/// LLVM options for clang (`-mllvm`) when the program has a `switch`-mode
+/// vm (docs/lowering.md §6). Tail merging (branch folding) keeps one copy
+/// of the handlers' common tails (store the result, advance `pc`, branch
+/// back to the switch), so a handler jumps through two or three shared
+/// tails before it reaches the dispatch block. The option applies to the
+/// whole module; it only costs code size.
+const SWITCH_LLVM_ARGS: &[&str] = &["-enable-tail-merge=false"];
+
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
-/// The flag: the program has a goto-mode vm (see `GOTO_LLVM_ARGS`).
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, bool), Diag> {
+/// The options: the LLVM options the program's dispatch modes need
+/// (`GOTO_LLVM_ARGS`, `SWITCH_LLVM_ARGS`).
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     let mut modules = load(sm, input, &mut allows, opts.test)?;
@@ -272,7 +281,13 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         std::process::exit(0);
     }
     let prog = c.prog;
-    let has_goto = prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Goto);
+    let mut llvm_args: Vec<&'static str> = Vec::new();
+    if prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Goto) {
+        llvm_args.extend(GOTO_LLVM_ARGS);
+    }
+    if prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Switch) {
+        llvm_args.extend(SWITCH_LLVM_ARGS);
+    }
     let library = opts.kind != OutKind::Exe;
     if library {
         header::check_exports(&prog)?;
@@ -341,7 +356,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     } else {
         ir
     };
-    Ok((ir, header, jit, has_goto))
+    Ok((ir, header, jit, llvm_args))
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -624,7 +639,7 @@ fn compiler_main() -> ExitCode {
         }
     };
     let mut sm = SourceMap::default();
-    let (mut ir, header, jit, has_goto) = match compile(&mut sm, &opts) {
+    let (mut ir, header, jit, llvm_args) = match compile(&mut sm, &opts) {
         Ok(r) => r,
         Err(d) => {
             eprint!("{}", sm.render(&d));
@@ -718,10 +733,8 @@ fn compiler_main() -> ExitCode {
         // stable before/after benchmarking.
         cmd.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
     }
-    if has_goto {
-        for a in GOTO_LLVM_ARGS {
-            cmd.arg("-mllvm").arg(a);
-        }
+    for a in &llvm_args {
+        cmd.arg("-mllvm").arg(a);
     }
     // Libraries carry the instrumentation only: the host links the ASan
     // or TSan runtime (docs/language.md §10.1).
