@@ -26,6 +26,9 @@ pub struct HandlerGen {
     pub insn_slot: Option<String>,
     /// Generating an outlined cold block.
     pub outlined: bool,
+    /// Goto mode: the slot holding the next handler's address, read by the
+    /// one shared `indirectbr` at `dispatch_label` (docs/lowering.md §5).
+    pub target_slot: Option<String>,
 }
 
 fn takes_insn(p: &Program, f: &FnDef) -> bool {
@@ -143,6 +146,7 @@ pub fn handler_prologue(g: &mut FnGen) {
         labels_global: format!("@\"{}.labels\"", f.symbol),
         insn_slot: None,
         outlined: g.cold.is_some(),
+        target_slot: None,
     };
     if takes_insn(p, f) {
         let wt = Ty::Int(vd.word);
@@ -173,6 +177,11 @@ pub fn handler_prologue(g: &mut FnGen) {
             .collect();
         if let Some(rt) = &vd.raise_ty {
             hg.raise_slot = g.alloca(rt);
+        }
+        if vd.dispatch == Dispatch::Goto {
+            let ts = g.fresh();
+            let _ = writeln!(g.allocas, "  {} = alloca ptr, align 8", ts);
+            hg.target_slot = Some(ts);
         }
     }
     g.vm = Some(hg);
@@ -278,6 +287,13 @@ pub fn epilogue(g: &mut FnGen) {
             }
         }
     } else {
+        // The shared dispatch block. Every handler's `next` stores its
+        // target and branches here; LLVM copies this block back into each
+        // handler after register allocation (`GOTO_LLVM_ARGS` in main.rs).
+        let ts = hg.target_slot.as_ref().expect("goto entry without a target slot");
+        g.label(&hg.dispatch_label);
+        let h = g.inst(format!("load ptr, ptr {}", ts));
+        g.term(format!("indirectbr ptr {}, [{}]", h, goto_dests(&hg)));
         for t in 0..=ntables {
             let mut entries = Vec::new();
             for i in 0..n {
@@ -405,14 +421,16 @@ fn dispatch(g: &mut FnGen, target: &str) {
             };
             let a = g.inst(format!("getelementptr inbounds ptr, ptr {}, i64 {}", tbl, opc));
             let h = g.inst(format!("load ptr, ptr {}", a));
-            let mut dests: Vec<String> = hg.op_labels.iter().map(|l| format!("label %{}", l)).collect();
-            for ws in &hg.wrapper_labels {
-                for (_, l) in ws {
-                    dests.push(format!("label %{}", l));
-                }
-            }
-            dests.push(format!("label %{}", hg.invalid_label));
-            g.term(format!("indirectbr ptr {}, [{}]", h, dests.join(", ")));
+            // An empty asm hides the handler address from LLVM, so it cannot
+            // fold the table loads of all handlers into one load in the shared
+            // block: that block stays a lone `jmp *reg`, which tail
+            // duplication copies into every handler after register
+            // allocation. (Copied before it, every handler gets a phi per
+            // state variable per dispatch site: quadratic in the op count.)
+            let h = g.inst(format!("call ptr asm \"\", \"=r,0\"(ptr {})", h));
+            let ts = hg.target_slot.as_ref().expect("goto handler without a target slot");
+            g.emit(format!("store ptr {}, ptr {}", h, ts));
+            g.br(&hg.dispatch_label);
         }
     } else {
         let (opc, word) = opcode_and_word(g, vd, target);
@@ -1199,3 +1217,14 @@ pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty) {
 }
 
 
+/// Goto mode: the destinations of the dispatch `indirectbr`.
+fn goto_dests(hg: &HandlerGen) -> String {
+    let mut dests: Vec<String> = hg.op_labels.iter().map(|l| format!("label %{}", l)).collect();
+    for ws in &hg.wrapper_labels {
+        for (_, l) in ws {
+            dests.push(format!("label %{}", l));
+        }
+    }
+    dests.push(format!("label %{}", hg.invalid_label));
+    dests.join(", ")
+}

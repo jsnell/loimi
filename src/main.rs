@@ -206,8 +206,29 @@ struct JitParts {
     nops: u32,
 }
 
+/// LLVM options for clang (`-mllvm`) when the program has a `goto`-mode vm.
+///
+/// Goto-mode entries emit one shared dispatch block, a lone `indirectbr`
+/// that every handler's `next` branches to (docs/lowering.md §5), and rely
+/// on tail duplication after register allocation to copy it back into
+/// each handler. Before register allocation, the copies would give every
+/// handler a phi per state variable per dispatch site, a cost quadratic in
+/// the op count (and more for the passes that follow): an indirect branch
+/// block of zero instructions is never tail-duplicated there. Since LLVM 18,
+/// tail duplication skips blocks with more than 16 predecessors and 16
+/// successors, which is exactly the dispatch block: lift the limits.
+/// Tail duplication during block placement adds nothing for dispatch (the
+/// copies exist by then) but costs time cubic in the op count: off.
+const GOTO_LLVM_ARGS: &[&str] = &[
+    "-tail-dup-indirect-size=0",
+    "-tail-dup-pred-size=1000000",
+    "-tail-dup-succ-size=1000000",
+    "-tail-dup-placement=false",
+];
+
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>), Diag> {
+/// The flag: the program has a goto-mode vm (see `GOTO_LLVM_ARGS`).
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, bool), Diag> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     let mut modules = load(sm, input, &mut allows, opts.test)?;
@@ -241,6 +262,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         ));
     }
     let prog = c.prog;
+    let has_goto = prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Goto);
     let library = opts.kind != OutKind::Exe;
     if library {
         header::check_exports(&prog)?;
@@ -308,7 +330,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     } else {
         ir
     };
-    Ok((ir, header, jit))
+    Ok((ir, header, jit, has_goto))
 }
 
 /// `--jit-stencils`: compile the stencils to an object file, read them
@@ -584,7 +606,7 @@ fn compiler_main() -> ExitCode {
         }
     };
     let mut sm = SourceMap::default();
-    let (mut ir, header, jit) = match compile(&mut sm, &opts) {
+    let (mut ir, header, jit, has_goto) = match compile(&mut sm, &opts) {
         Ok(r) => r,
         Err(d) => {
             eprint!("{}", sm.render(&d));
@@ -677,6 +699,11 @@ fn compiler_main() -> ExitCode {
         // so unrelated code changes do not shift handler placement. Useful for
         // stable before/after benchmarking.
         cmd.arg("-mllvm").arg(format!("-align-all-functions={}", n.trailing_zeros()));
+    }
+    if has_goto {
+        for a in GOTO_LLVM_ARGS {
+            cmd.arg("-mllvm").arg(a);
+        }
     }
     // Libraries carry the instrumentation only: the host links the ASan
     // or TSan runtime (docs/language.md §10.1).
