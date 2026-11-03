@@ -1139,6 +1139,7 @@ pub vm Mini {
     /// install the coroutine's and continue it: after its yield's CALL,
     /// with `args[0..n]` as that CALL's results, or at the start of its
     /// body with them as arguments. `wrap`: through its wrap function.
+    #[inline]
     fn switch_in(co: Gc<Coro>, args: *V, n: u64, dst: u64, nres: u64, wrap: bool) -> never {
         ctx.fp = fp;
         let me = ctx.cur;
@@ -1175,6 +1176,7 @@ pub vm Mini {
     /// A CALL of coroutine.yield in a coroutine resumed in this run, with
     /// `vals[0..n]` to pass: suspend it (its CALL's `nres` results will go
     /// to R[dst..]) and continue its resumer.
+    #[inline]
     fn switch_out(vals: *V, n: u64, dst: u64, nres: u64) -> never {
         let co = ctx.cur;
         coro.suspend(ctx, co, fp, next_resume, dst as u32, nres as u32);
@@ -1190,6 +1192,7 @@ pub vm Mini {
     /// Continue the thread that resumed `co` (whose state is saved, or
     /// which is `dead`) in this run: its CALL gets `first` (if `lead`)
     /// and `vals[0..n]`, which may be in `co`'s stack.
+    #[inline]
     fn back(co: Gc<Coro>, first: V, lead: bool, vals: *V, n: u64, dead: bool) -> never {
         ctx.nco -= 1;
         let r = coro.leave(ctx, co);
