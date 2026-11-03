@@ -46,6 +46,7 @@
 // through its parser state.
 
 import std.mem;
+import std.map;
 
 /// The binding powers of an infix operator.
 pub struct Prec { left: u32, right: u32 }
@@ -293,4 +294,274 @@ pub fn Parser<P, K, E, X>.free(pr: *Parser<P, K, E, X>) {
     pr.infix_bp.free();
     pr.prefix_bp.free();
     pr.is_led.free();
+}
+
+// ── Ops: operators defined at run time (Prolog's op/3) ──────────────────
+//
+// `Pratt` and `Parser` index a table by a token-kind enum fixed when the
+// parser is built. Prolog-family languages instead define operators while
+// parsing (`:- op(700, xfx, ===)`), name them by an interned atom, and
+// give each a priority (1..1200, larger binds looser) and a type:
+//
+//   xfx xfy yfx   infix (y: the argument on that side may have the
+//                 operator's own priority; x: only a strictly lower one)
+//   fy fx         prefix
+//   xf yf         postfix
+//
+// A name can have a prefix definition and an infix or postfix one at the
+// same time (`-`). `Ops` is that table, keyed by a `u64` name (an atom
+// id), and `Ops.parse` is the operator-precedence driver ("a term of
+// priority at most `max`") with its hooks as trait methods of the parser
+// state (`OpHooks`), as for `Parser`.
+//
+// The driver handles:
+//   - prefix, infix and postfix operators and their argument priorities;
+//   - a prefix operator that is an atom: `- = x`, `f(-)`, `[-|T]`,
+//     `- , a`: when the next token cannot start a term (`Tok.End`,
+//     `Tok.Sep`) or is an infix operator that is not also a prefix one;
+//   - an operator as an atom has its priority (0 if above `max`, so
+//     `f(:-)` and `X = (-)` parse);
+//   - a prefix operator above `max` is read at 999 (`X = \+a`), as
+//     SWI-Prolog does;
+//   - `parse_arg`: an argument of a compound or a list, priority 999,
+//     except that infix operators above 999 other than the separators
+//     (`Tok.Sep`: `,` and `|`) are accepted (`f(a :- b)`), as SWI-Prolog
+//     does.
+// The hooks handle tokens: `peek` classifies the current token and is
+// told whether a term starts there (`prefix`), so that a name followed
+// directly by `(` (functional notation) and a `-` followed directly by a
+// number (a negative literal) are `Tok.Term` there but infix operators
+// after a term (`X-1`, `a -(b)`). Everything that is not an operator
+// application (numbers, variables, strings, compound terms, lists,
+// `(..)`, `{..}`) is `primary`'s, which recurses through the table for
+// bracketed terms and arguments (`ops.parse(p, 1200)`, `ops.parse_arg(p)`).
+// Hooks have no effects, as for `Parser`.
+
+const FIX_PREFIX: u64 = 0;
+const FIX_INFIX: u64 = 1;
+const FIX_POSTFIX: u64 = 2;
+
+/// An operator type, as in Prolog's op/3.
+pub enum OpType { XFX, XFY, YFX, FY, FX, XF, YF }
+
+/// The type named by `s` ("xfx", "fy", ..), if any.
+pub fn op_type(s: str) -> ?OpType {
+    match s {
+        "xfx" => Some(OpType.XFX), "xfy" => Some(OpType.XFY), "yfx" => Some(OpType.YFX),
+        "fy" => Some(OpType.FY), "fx" => Some(OpType.FX), "xf" => Some(OpType.XF), "yf" => Some(OpType.YF),
+        _ => None,
+    }
+}
+
+/// The type's name: "xfx", "fy", ..
+pub fn OpType.name(t: OpType) -> str {
+    match t {
+        XFX => "xfx", XFY => "xfy", YFX => "yfx", FY => "fy", FX => "fx", XF => "xf", YF => "yf",
+    }
+}
+
+fn op_type_of(v: u32) -> OpType {
+    match v {
+        0 => OpType.XFX, 1 => OpType.XFY, 2 => OpType.YFX, 3 => OpType.FY, 4 => OpType.FX, 5 => OpType.XF, _ => OpType.YF,
+    }
+}
+
+fn fixity_of(t: OpType) -> u64 {
+    match t { XFX => FIX_INFIX, XFY => FIX_INFIX, YFX => FIX_INFIX, FY => FIX_PREFIX, FX => FIX_PREFIX, _ => FIX_POSTFIX }
+}
+
+/// One definition: the priority, the type, and the highest priorities its
+/// arguments may have: `left` for infix and postfix operators, `right`
+/// for infix and prefix ones (the other is 0).
+pub struct Op { prio: u32, typ: OpType, left: u32, right: u32 }
+
+/// One entry of `Ops.next`.
+pub struct OpEntry { name: u64, op: Op }
+
+/// Operator definitions by name: at most one prefix, one infix and one
+/// postfix definition per name. Names must be below 2^62.
+pub struct Ops {
+    /// (name << 2 | fixity) -> (priority << 3 | type)
+    map: map.HashMap<u64, u32>,
+}
+
+pub fn Ops.new() -> Ops { Ops { map: map.HashMap.new() } }
+
+pub fn Ops.free(o: *Ops) { o.map.free(); }
+
+/// Define `name` as an operator (op/3): replaces its definition of the
+/// same kind (prefix, infix or postfix); priority 0 removes it.
+pub fn Ops.add(o: *Ops, name: u64, prio: u32, typ: OpType) {
+    let k = (name << 2) | fixity_of(typ);
+    if prio == 0 { o.map.remove(k); return; }
+    o.map.insert(k, (prio << 3) | (typ as u32));
+}
+
+fn decode(v: u32) -> Op {
+    let p = v >> 3;
+    let t = op_type_of(v & 7);
+    match t {
+        XFX => Op { prio: p, typ: t, left: p - 1, right: p - 1 },
+        XFY => Op { prio: p, typ: t, left: p - 1, right: p },
+        YFX => Op { prio: p, typ: t, left: p, right: p - 1 },
+        FY => Op { prio: p, typ: t, left: 0, right: p },
+        FX => Op { prio: p, typ: t, left: 0, right: p - 1 },
+        XF => Op { prio: p, typ: t, left: p - 1, right: 0 },
+        YF => Op { prio: p, typ: t, left: p, right: 0 },
+    }
+}
+
+/// The prefix definition of `name`.
+pub fn Ops.prefix(o: *Ops, name: u64) -> ?Op { Some(decode(o.map.get((name << 2) | FIX_PREFIX)?)) }
+
+/// The infix definition of `name`.
+pub fn Ops.infix(o: *Ops, name: u64) -> ?Op { Some(decode(o.map.get((name << 2) | FIX_INFIX)?)) }
+
+/// The postfix definition of `name`.
+pub fn Ops.postfix(o: *Ops, name: u64) -> ?Op { Some(decode(o.map.get((name << 2) | FIX_POSTFIX)?)) }
+
+/// Whether `name` has any operator definition.
+pub fn Ops.is_op(o: *Ops, name: u64) -> bool {
+    o.map.contains((name << 2) | FIX_PREFIX) or o.map.contains((name << 2) | FIX_INFIX)
+        or o.map.contains((name << 2) | FIX_POSTFIX)
+}
+
+/// The highest priority of `name`'s definitions (0: not an operator).
+pub fn Ops.max_prio(o: *Ops, name: u64) -> u32 {
+    var p: u32 = 0;
+    for f in [FIX_PREFIX, FIX_INFIX, FIX_POSTFIX] {
+        if let Some(v) = o.map.get((name << 2) | f) { if (v >> 3) > p { p = v >> 3; } }
+    }
+    p
+}
+
+/// The definitions, in no particular order (current_op/3): start with
+/// `at = 0`; None at the end. Do not add or remove while iterating.
+pub fn Ops.next(o: *Ops, at: *u64) -> ?OpEntry {
+    let s = o.map.next(at)?;
+    Some(OpEntry { name: s.key >> 2, op: decode(s.value) })
+}
+
+/// The current token, as the driver sees it.
+pub enum Tok {
+    /// A name that may be an operator (in Prolog: an unquoted atom; at a
+    /// term start, not one followed directly by `(`).
+    Name(u64),
+    /// An argument separator that is also an infix operator (Prolog's
+    /// `,` and `|`): an infix operator after a term; never starts a term;
+    /// ends an argument even above priority 999 (`parse_arg`).
+    Sep(u64),
+    /// Any other token that starts a term: parsed by `primary`.
+    Term,
+    /// A token that neither starts a term nor is an operator (`)`, `]`,
+    /// the end of a clause, the end of input): ends the term.
+    End,
+}
+
+/// The hooks of a parser state for `Ops.parse`.
+pub trait OpHooks<E, X> {
+    /// Classify the current token without consuming it. `prefix`: a term
+    /// starts here (no left operand), so a name followed directly by `(`
+    /// and a negative number literal are `Tok.Term`.
+    fn peek(p: *Self, prefix: bool) -> Tok;
+    /// Consume the current token.
+    fn advance(p: *Self) -> Result<(), X>;
+    /// A term that is not an operator application, from the current
+    /// token (`Tok.Term`; also called at `Tok.End` and `Tok.Sep`, to
+    /// report the error).
+    fn primary(p: *Self) -> Result<E, X>;
+    /// An operator name (consumed) as an atom.
+    fn atom(p: *Self, name: u64) -> Result<E, X>;
+    /// `name(arg)` for a prefix operator.
+    fn prefix(p: *Self, name: u64, arg: E) -> Result<E, X>;
+    /// `name(lhs, rhs)` for an infix operator.
+    fn infix(p: *Self, name: u64, lhs: E, rhs: E) -> Result<E, X>;
+    /// `name(lhs)` for a postfix operator.
+    fn postfix(p: *Self, name: u64, lhs: E) -> Result<E, X>;
+
+    // The driver, provided (as methods of the state, so that `E` and `X`
+    // come from its `impl`):
+
+    /// Parse a term of priority at most `max` with the operators of `ops`
+    /// (1200 for a clause or a bracketed term, 999 for a strict
+    /// argument); returns the term and its priority.
+    fn op_parse(p: *Self, ops: *Ops, max: u32) -> Result<(E, u32), X> {
+        ops.parse<Self, E, X>(p, max)
+    }
+    /// Parse an argument of a compound term or a list element: priority
+    /// 999, except that an infix operator above 999 that is not a
+    /// `Tok.Sep` is accepted (`f(a :- b)`), as in SWI-Prolog.
+    fn op_parse_arg(p: *Self, ops: *Ops) -> Result<E, X> {
+        ops.parse_arg<Self, E, X>(p)
+    }
+}
+
+/// `p.op_parse(o, max)` with the type arguments given:
+/// `ops.parse<P, E, X>(p, max)`.
+pub fn Ops.parse<P: OpHooks<E, X>, E, X>(o: *Ops, p: *P, max: u32) -> Result<(E, u32), X> {
+    o.climb<P, E, X>(p, max, false)
+}
+
+/// `p.op_parse_arg(o)` with the type arguments given.
+pub fn Ops.parse_arg<P: OpHooks<E, X>, E, X>(o: *Ops, p: *P) -> Result<E, X> {
+    let (t, _) = o.climb<P, E, X>(p, 999, true)?;
+    Ok(t)
+}
+
+/// The left operand: a prefix operator application, an operator as an
+/// atom, or a primary; and its priority.
+fn Ops.left<P: OpHooks<E, X>, E, X>(o: *Ops, p: *P, max: u32) -> Result<(E, u32), X> {
+    let Name(a) = p.peek(true) else { return Ok((p.primary()?, 0)); };
+    p.advance()?;
+    if let Some(d) = o.prefix(a) {
+        // An operand follows unless the next token cannot start a term
+        // or is an infix operator that is not also a prefix one.
+        let operand = match p.peek(true) {
+            Name(b) => o.prefix(b).is_some() or o.infix(b).is_none(),
+            Term => true,
+            _ => false,
+        };
+        if operand {
+            let (pp, am) = if d.prio > max { (999 as u32, 999 as u32) } else { (d.prio, d.right) };
+            let (x, _) = o.climb<P, E, X>(p, am, false)?;
+            return Ok((p.prefix(a, x)?, pp));
+        }
+        return Ok((p.atom(a)?, if d.prio > max { 0 } else { d.prio }));
+    }
+    let mp = o.max_prio(a);
+    Ok((p.atom(a)?, if mp > max { 0 } else { mp }))
+}
+
+fn Ops.climb<P: OpHooks<E, X>, E, X>(o: *Ops, p: *P, max0: u32, arg: bool) -> Result<(E, u32), X> {
+    var max = max0;
+    var (lhs, lp) = o.left<P, E, X>(p, max)?;
+    loop {
+        var name: u64 = 0;
+        var sep = false;
+        match p.peek(false) {
+            Name(a) => name = a,
+            Sep(a) => { name = a; sep = true; }
+            _ => break,
+        }
+        if let Some(d) = o.infix(name) {
+            if arg and d.prio > max and !sep { max = 1200; }
+            if d.prio <= max and lp <= d.left {
+                p.advance()?;
+                let (rhs, _) = o.climb<P, E, X>(p, d.right, false)?;
+                lhs = p.infix(name, lhs, rhs)?;
+                lp = d.prio;
+                continue;
+            }
+        }
+        if let Some(d) = o.postfix(name) {
+            if d.prio <= max and lp <= d.left {
+                p.advance()?;
+                lhs = p.postfix(name, lhs)?;
+                lp = d.prio;
+                continue;
+            }
+        }
+        break;
+    }
+    Ok((lhs, lp))
 }

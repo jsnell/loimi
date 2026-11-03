@@ -1,0 +1,310 @@
+// std.parse.Ops: Prolog-style operators defined at run time (op/3), keyed
+// by an interned name, and the `Ops.parse` driver. A toy reader of
+// Prolog terms prints them in canonical form: prefix and infix
+// definitions of the same name (`-`), xfx/xfy/yfx associativity, fy/fx,
+// postfix xf/yf, prefix operators as atoms (`- = x`, `f(-)`, `[-]`,
+// `- , a`), argument priority 999 with `f(a :- b)` accepted, `- 1` vs
+// `-1` vs `a-1`, functional notation `-(1)`, an operator defined and
+// removed between parses, and current_op-style iteration.
+
+// expect: a :- b , c ; d  =>  :-(a,;(','(b,c),d))  @1200
+// expect: 1 - 2 - 3  =>  -(-(1,2),3)  @500
+// expect: 2 ^ 3 ^ 4  =>  ^(2,^(3,4))  @200
+// expect: a = b = c  =>  error: operator expected
+// expect: - a * b  =>  *(-(a),b)  @400
+// expect: - - a  =>  -(-(a))  @200
+// expect: - 1 + 2  =>  +(-(1),2)  @500
+// expect: -1 + 2  =>  +(neg(1),2)  @500
+// expect: X-1  =>  -(X,1)  @500
+// expect: -(1)  =>  -(1)  @0
+// expect: - (1)  =>  -(1)  @200
+// expect: - = x  =>  =(-,x)  @700
+// expect: f(-)  =>  f(-)  @0
+// expect: f(- , a)  =>  f(-,a)  @0
+// expect: [-]  =>  list(-)  @0
+// expect: [a, b | T]  =>  list(a,b,tail(T))  @0
+// expect: f(a :- b)  =>  f(:-(a,b))  @0
+// expect: f((a , b))  =>  f(','(a,b))  @0
+// expect: X = \+ a  =>  =(X,\+(a))  @700
+// expect: \+ \+ a  =>  \+(\+(a))  @900
+// expect: \+ - 1  =>  \+(-(1))  @900
+// expect: a ! !  =>  !(!(a))  @100
+// expect: a # #  =>  error: operator expected
+// expect: a ! * b  =>  *(!(a),b)  @400
+// expect: X = :-  =>  =(X,:-)  @700
+// expect: f(a  =>  error: expected , or )
+// expect: a === b  =>  error: operator expected
+// expect: a === b === c  =>  error: operator expected
+// expect: a === b  =>  ===(a,b)  @700
+// expect: a === b  =>  error: operator expected
+// expect: - a - b  =>  -(-(a,b))  @200
+// expect: prefix -: 200 fy arg 200
+// expect: max_prio(:-) = 1200
+// expect: is_op(foo) = false
+// expect: definitions: 15, infix: 10
+
+import std.io;
+import std.mem;
+import std.parse;
+import std.parse.{Ops, OpType, Tok};
+import std.text;
+
+enum K { Name, Var, Int, Open, OpenCT, Close, OpenList, CloseList, Comma, Bar, Eof }
+
+struct R {
+    src: str,
+    pos: u64,
+    /// The current token (always peeked).
+    kind: K,
+    text: str,
+    layout: bool,
+    names: *mem.Vec<str>,
+    ops: *Ops,
+    arena: mem.Arena,
+    error: ?str,
+}
+
+fn intern(names: *mem.Vec<str>, s: str) -> u64 {
+    for i in 0..names.len { if names.at(i).eq(s) { return i; } }
+    names.push(s);
+    names.len - 1
+}
+
+fn is_sym(c: u8) -> bool {
+    c == '+' or c == '-' or c == '*' or c == '/' or c == '\\' or c == '^' or c == '<' or c == '>'
+        or c == '=' or c == ':' or c == '?' or c == '@' or c == '#' or c == '&' or c == '!'
+}
+
+fn R.lex(r: *R) {
+    let start0 = r.pos;
+    while r.pos < r.src.len and r.src[r.pos] == ' ' { r.pos += 1; }
+    r.layout = r.pos != start0;
+    if r.pos >= r.src.len { r.kind = K.Eof; return; }
+    let start = r.pos;
+    let c = r.src[r.pos];
+    r.pos += 1;
+    if text.is_digit(c) {
+        while r.pos < r.src.len and text.is_digit(r.src[r.pos]) { r.pos += 1; }
+        r.kind = K.Int;
+    } else if text.is_alpha(c) {
+        while r.pos < r.src.len and (text.is_alpha(r.src[r.pos]) or text.is_digit(r.src[r.pos])) { r.pos += 1; }
+        r.kind = if c == '_' or (c >= 'A' and c <= 'Z') { K.Var } else { K.Name };
+    } else if is_sym(c) {
+        while r.pos < r.src.len and is_sym(r.src[r.pos]) { r.pos += 1; }
+        r.kind = K.Name;
+    } else {
+        r.kind = match c {
+            '(' => if r.layout or start == 0 { K.Open } else { K.OpenCT },
+            ';' => K.Name, ')' => K.Close, '[' => K.OpenList, ']' => K.CloseList, ',' => K.Comma, '|' => K.Bar,
+            _ => { r.error = Some("bad character"); K.Eof }
+        };
+    }
+    r.text = r.src[start..r.pos];
+}
+
+fn R.at(r: *R, i: u64) -> u8 { if r.pos + i < r.src.len { r.src[r.pos + i] } else { 0 } }
+
+fn R.fail(r: *R, msg: str) -> Result<str, str> {
+    if r.error.is_none() { r.error = Some(msg); }
+    Err(msg)
+}
+
+fn R.expect(r: *R, k: K, msg: str) -> Result<(), str> {
+    if r.kind != k { r.fail(msg)?; }
+    r.lex();
+    Ok(())
+}
+
+fn R.app1(r: *R, f: str, x: str) -> str {
+    var v: mem.Vec<str> = mem.Vec.new();
+    v.push(x);
+    let s = r.app(f, v.items());
+    v.free();
+    s
+}
+
+fn R.app2(r: *R, f: str, x: str, y: str) -> str {
+    var v: mem.Vec<str> = mem.Vec.new();
+    v.push(x);
+    v.push(y);
+    let s = r.app(f, v.items());
+    v.free();
+    s
+}
+
+fn R.app(r: *R, f: str, args: []str) -> str {
+    var b = text.StrBuf.new();
+    b.push_str(f);
+    b.push('(');
+    for i in 0..args.len { if i > 0 { b.push(','); } b.push_str(args[i]); }
+    b.push(')');
+    let s = r.arena.str(b.as_str());
+    b.free();
+    s
+}
+
+fn R.name(r: *R, a: u64) -> str { r.names.at(a) }
+
+impl parse.OpHooks<str, str> for R;
+
+fn R.peek(r: *R, prefix: bool) -> Tok {
+    if r.error.is_some() { return Tok.End; }
+    match r.kind {
+        Name => {
+            // At a term start, `f(` is functional notation and `-1` a
+            // negative number.
+            if prefix and r.at(0) == '(' { return Tok.Term; }
+            if prefix and r.text.eq("-") and text.is_digit(r.at(0)) { return Tok.Term; }
+            Tok.Name(intern(r.names, r.text))
+        }
+        Comma => Tok.Sep(intern(r.names, ",")),
+        Bar => Tok.Sep(intern(r.names, "|")),
+        Var => Tok.Term, Int => Tok.Term, Open => Tok.Term, OpenCT => Tok.Term, OpenList => Tok.Term,
+        _ => Tok.End,
+    }
+}
+
+fn R.advance(r: *R) -> Result<(), str> { r.lex(); Ok(()) }
+
+fn R.primary(r: *R) -> Result<str, str> {
+    let t = r.text;
+    match r.kind {
+        Int => { r.lex(); Ok(t) }
+        Var => { r.lex(); Ok(t) }
+        Name => {
+            if t.eq("-") and text.is_digit(r.at(0)) {
+                r.lex();
+                let n = r.text;
+                r.lex();
+                return Ok(r.app1("neg", n));
+            }
+            r.lex();
+            r.expect(K.OpenCT, "expected (")?;
+            var args: mem.Vec<str> = mem.Vec.new();
+            loop {
+                args.push(r.op_parse_arg(r.ops)?);
+                if r.kind == K.Comma { r.lex(); continue; }
+                r.expect(K.Close, "expected , or )")?;
+                break;
+            }
+            let s = r.app(t, args.items());
+            args.free();
+            Ok(s)
+        }
+        Open => { r.lex(); let (x, _) = r.op_parse(r.ops, 1200)?; r.expect(K.Close, "expected )")?; Ok(x) }
+        OpenCT => { r.lex(); let (x, _) = r.op_parse(r.ops, 1200)?; r.expect(K.Close, "expected )")?; Ok(x) }
+        OpenList => {
+            r.lex();
+            var items: mem.Vec<str> = mem.Vec.new();
+            loop {
+                items.push(r.op_parse_arg(r.ops)?);
+                if r.kind == K.Comma { r.lex(); continue; }
+                if r.kind == K.Bar { r.lex(); let (tl, _) = r.op_parse(r.ops, 999)?; items.push(r.app1("tail", tl)); }
+                r.expect(K.CloseList, "expected ]")?;
+                break;
+            }
+            let s = r.app("list", items.items());
+            items.free();
+            Ok(s)
+        }
+        _ => r.fail("unexpected token"),
+    }
+}
+
+fn R.atom(r: *R, a: u64) -> Result<str, str> { Ok(r.name(a)) }
+
+fn R.prefix(r: *R, a: u64, x: str) -> Result<str, str> { Ok(r.app1(r.name(a), x)) }
+
+fn R.infix(r: *R, a: u64, x: str, y: str) -> Result<str, str> {
+    let n = r.name(a);
+    Ok(r.app2(if n.eq(",") { "','" } else { n }, x, y))
+}
+
+fn R.postfix(r: *R, a: u64, x: str) -> Result<str, str> { Ok(r.app1(r.name(a), x)) }
+
+fn op(ops: *Ops, names: *mem.Vec<str>, prio: u32, typ: str, name: str) {
+    ops.add(intern(names, name), prio, parse.op_type(typ).unwrap());
+}
+
+fn show(ops: *Ops, names: *mem.Vec<str>, src: str) {
+    var r = R { src: src, pos: 0, kind: K.Eof, text: "", layout: false, names: names, ops: ops, arena: mem.Arena.new(), error: None };
+    r.lex();
+    io.print(src);
+    io.print("  =>  ");
+    let res = r.op_parse(ops, 1200);
+    match res {
+        Ok((t, p)) => {
+            if r.error.is_some() { io.print("error: "); io.println(r.error.unwrap()); }
+            else if r.kind != K.Eof { io.println("error: operator expected"); }
+            else { io.print(t); io.print("  @"); io.print_int(p as i64); io.println(""); }
+        }
+        Err(e) => { io.print("error: "); io.println(e); }
+    }
+    r.arena.free();
+}
+
+fn main() {
+    var names: mem.Vec<str> = mem.Vec.new();
+    var ops = Ops.new();
+    let table = [
+        (1200, "xfx", ":-"), (1200, "fx", ":-"), (1100, "xfy", ";"), (1100, "xfy", "|"),
+        (1000, "xfy", ","), (900, "fy", "\\+"), (700, "xfx", "="), (700, "xfx", "<"),
+        (500, "yfx", "+"), (500, "yfx", "-"), (400, "yfx", "*"), (200, "xfy", "^"),
+        (200, "fy", "-"), (100, "yf", "!"), (100, "xf", "#"),
+    ];
+    for e in table { let (p, t, n) = e; op(&ops, &names, p as u32, t, n); }
+
+    show(&ops, &names, "a :- b , c ; d");
+    show(&ops, &names, "1 - 2 - 3");
+    show(&ops, &names, "2 ^ 3 ^ 4");
+    show(&ops, &names, "a = b = c");
+    show(&ops, &names, "- a * b");
+    show(&ops, &names, "- - a");
+    show(&ops, &names, "- 1 + 2");
+    show(&ops, &names, "-1 + 2");
+    show(&ops, &names, "X-1");
+    show(&ops, &names, "-(1)");
+    show(&ops, &names, "- (1)");
+    show(&ops, &names, "- = x");
+    show(&ops, &names, "f(-)");
+    show(&ops, &names, "f(- , a)");
+    show(&ops, &names, "[-]");
+    show(&ops, &names, "[a, b | T]");
+    show(&ops, &names, "f(a :- b)");
+    show(&ops, &names, "f((a , b))");
+    show(&ops, &names, "X = \\+ a");
+    show(&ops, &names, "\\+ \\+ a");
+    show(&ops, &names, "\\+ - 1");
+    show(&ops, &names, "a ! !");
+    show(&ops, &names, "a # #");
+    show(&ops, &names, "a ! * b");
+    show(&ops, &names, "X = :-");
+    show(&ops, &names, "f(a");
+
+    // op/3 at run time: a new operator, then removed again.
+    show(&ops, &names, "a === b");
+    op(&ops, &names, 700, "xfx", "===");
+    show(&ops, &names, "a === b === c");
+    show(&ops, &names, "a === b");
+    op(&ops, &names, 0, "xfx", "===");
+    show(&ops, &names, "a === b");
+    // Redefining `-` as infix only changes the infix definition.
+    op(&ops, &names, 200, "xfx", "-");
+    show(&ops, &names, "- a - b");
+
+    let mi = ops.prefix(intern(&names, "-")).unwrap();
+    io.print("prefix -: "); io.print_int(mi.prio as i64); io.print(" "); io.print(mi.typ.name());
+    io.print(" arg "); io.print_int(mi.right as i64); io.println("");
+    io.print("max_prio(:-) = "); io.print_int(ops.max_prio(intern(&names, ":-")) as i64); io.println("");
+    io.print("is_op(foo) = "); io.print_bool(ops.is_op(intern(&names, "foo"))); io.println("");
+    var n: i64 = 0;
+    var at: u64 = 0;
+    var infix: i64 = 0;
+    while let Some(e) = ops.next(&at) {
+        n += 1;
+        if e.op.typ == OpType.YFX or e.op.typ == OpType.XFY or e.op.typ == OpType.XFX { infix += 1; }
+    }
+    io.print("definitions: "); io.print_int(n); io.print(", infix: "); io.print_int(infix); io.println("");
+    ops.free();
+    names.free();
+}
