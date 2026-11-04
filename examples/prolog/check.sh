@@ -11,7 +11,9 @@
 # Default: release builds in all three dispatch modes, each test run
 # normally, with --gc-stress (collect at every safepoint) and --gc-verify
 # (generational heap, stress, write-barrier verification); then a
-# --gc-check-roots build run with --gc-stress. -q: the tail-call build only,
+# --gc-check-roots build run with --gc-stress; and a --jit-stencils build run
+# with the JIT on (LOIMI_JIT=1, LOIMI_JIT_HOT=2: code is compiled at its
+# second call), normally and with --gc-stress. -q: the tail-call build only,
 # normally and with --gc-stress (what `cargo test` runs).
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -48,6 +50,8 @@ FAIL=0
 COUNT=0
 run_suite() {    # exe label runs...
     local exe=$1 label=$2
+    local env=()
+    [ "$label" = jit ] && env=(LOIMI_JIT=1 LOIMI_JIT_HOT=2)
     shift 2
     for t in "${TESTS[@]}"; do
         for run in "$@"; do
@@ -59,7 +63,7 @@ run_suite() {    # exe label runs...
             [ "$run" = verify ] && flag=--gc-verify
             [ "$run" = tiny ] && flag=--gc-tiny
             COUNT=$((COUNT + 1))
-            (cd "$DIR/tests" && ulimit -v 2500000 && timeout 300 "$exe" "$t.pl" $flag > "$TMP/out" 2> "$TMP/err")
+            (cd "$DIR/tests" && ulimit -v 2500000 && env "${env[@]}" timeout 300 "$exe" "$t.pl" $flag > "$TMP/out" 2> "$TMP/err")
             if ! cmp -s "$TMP/out" "$DIR/tests/$t.expected"; then
                 echo "FAIL $t ($label, $run)"
                 diff "$DIR/tests/$t.expected" "$TMP/out" | head -20
@@ -88,6 +92,7 @@ else
         build "$TMP/pl-$mode" --dispatch=$mode && run_suite "$TMP/pl-$mode" $mode normal stress verify
     done
     build "$TMP/pl-roots" --gc-check-roots && run_suite "$TMP/pl-roots" check-roots stress
+    build "$TMP/pl-jit" --jit-stencils && run_suite "$TMP/pl-jit" jit normal stress
 fi
 if [ $FAIL = 0 ]; then echo "ok: $COUNT runs"; fi
 exit $FAIL

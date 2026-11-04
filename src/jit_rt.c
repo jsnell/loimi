@@ -99,6 +99,9 @@ struct alt {
 struct rec {
     uint32_t *code;
     uint64_t n;
+    /* The treap of records (below). */
+    struct rec *left, *right;
+    uint32_t prio;
     /* The constant pool of `const` operands (patched into the code), or
      * NULL. Verified code's pool does not change. */
     const uint64_t *pool;
@@ -120,8 +123,9 @@ struct rec {
 static int enabled, stats, debug, inited, max_recompile = MAX_COMPILES;
 static FILE *mapf;
 static uint16_t threshold = 50;
-static struct rec **recs;
-static size_t nrecs, caprecs;
+/* Code objects: a treap ordered by address, max-heap ordered by `prio`. */
+static struct rec *recs;
+static size_t nrecs;
 static size_t nentries, capentries;
 /* Per entry index: the code word it was made for (see loimi_jit_word).
  * Entry indices are never reused. */
@@ -132,7 +136,7 @@ static uint8_t *region, *region_end, *bump, *rodata, *helpers, *exit_code;
 static int64_t *tlsoff;
 static struct {
     uint64_t compiles, failures, invalidations, given_up, insns, exits, bytes, patched, ns, max_ns;
-    uint64_t retargets, copies, reused, fallbacks, recompiles, interp;
+    uint64_t retargets, copies, reused, fallbacks, recompiles, interp, registered;
 } st;
 
 static uint64_t now_ns(void) {
@@ -157,6 +161,7 @@ static void report(void) {
     fprintf(stderr, "jit: rewrites of compiled code: %llu recompiles, %llu retargets (%llu to existing code, %llu new copies, %llu left to the interpreter), %llu dropped the code\n",
             (unsigned long long)st.recompiles, (unsigned long long)st.retargets, (unsigned long long)st.reused,
             (unsigned long long)st.copies, (unsigned long long)st.interp, (unsigned long long)st.fallbacks);
+    fprintf(stderr, "jit: %llu code objects registered, %zu kept\n", (unsigned long long)st.registered, nrecs);
 }
 
 __attribute__((constructor)) static void jit_init(void) {
@@ -320,16 +325,24 @@ static int init_region(void) {
     return 1;
 }
 
+/* The record of the code object containing pc. The last one found or
+ * registered is tried first: a host that builds code usually registers it
+ * and then rewrites it (`Vm.optimize`), which looks it up twice. */
+static struct rec *last_rec;
 static struct rec *lookup(const uint32_t *pc) {
-    size_t lo = 0, hi = nrecs;
-    while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        if (recs[mid]->code <= pc) lo = mid + 1;
-        else hi = mid;
+    if (last_rec && last_rec->code <= pc && pc < last_rec->code + last_rec->n) return last_rec;
+    struct rec *t = recs, *best = NULL;
+    while (t) {
+        if (t->code <= pc) {
+            best = t;
+            t = t->right;
+        } else {
+            t = t->left;
+        }
     }
-    if (lo == 0) return NULL;
-    struct rec *r = recs[lo - 1];
-    return pc < r->code + r->n ? r : NULL;
+    if (!best || pc >= best->code + best->n) return NULL;
+    last_rec = best;
+    return best;
 }
 
 static void free_compiled(struct rec *r) {
@@ -350,38 +363,103 @@ static void free_compiled(struct rec *r) {
 }
 
 static void free_rec(struct rec *r) {
+    if (r == last_rec) last_rec = NULL;
     free_compiled(r);
     free(r->read);
     free(r);
 }
 
+/* The treap of records: split t into the records below `code` (*l) and
+ * the others (*r); join l and r (every record of l below every one of r). */
+static void split(struct rec *t, const uint32_t *code, struct rec **l, struct rec **r) {
+    if (!t) {
+        *l = *r = NULL;
+    } else if (t->code < code) {
+        split(t->right, code, &t->right, r);
+        *l = t;
+    } else {
+        split(t->left, code, l, &t->left);
+        *r = t;
+    }
+}
+
+static struct rec *join(struct rec *l, struct rec *r) {
+    if (!l) return r;
+    if (!r) return l;
+    if (l->prio > r->prio) {
+        l->right = join(l->right, r);
+        return l;
+    }
+    r->left = join(l, r->left);
+    return r;
+}
+
+static void free_tree(struct rec *t) {
+    while (t) {
+        free_tree(t->left);
+        struct rec *r = t->right;
+        free_rec(t);
+        nrecs--;
+        t = r;
+    }
+}
+
 /* A new verified code object. Records overlapping it are of objects the
- * collector freed (their memory is being reused), so they go. */
+ * collector freed (their memory is being reused), so they go. (A sorted
+ * array with an insert's memmove made Prolog's sieve, which asserts and
+ * retracts clauses, quadratic in the number of clauses made.) */
+static struct rec *insert(struct rec *t, struct rec *nr) {
+    if (!t) return nr;
+    if (nr->prio > t->prio) {
+        split(t, nr->code, &nr->left, &nr->right);
+        return nr;
+    }
+    if (nr->code < t->code) t->left = insert(t->left, nr);
+    else t->right = insert(t->right, nr);
+    return t;
+}
+
 void loimi_jit_register(uint32_t *code, uint64_t n, const void *pool) {
     if (!enabled || n == 0) return;
-    size_t lo = 0, hi = nrecs;
-    while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        if (recs[mid]->code < code) lo = mid + 1;
-        else hi = mid;
+    st.registered++;
+    /* The record starting last below code + n overlaps it if any does. */
+    struct rec *t = recs, *prev = NULL;
+    while (t) {
+        if (t->code < code + n) {
+            prev = t;
+            t = t->right;
+        } else {
+            t = t->left;
+        }
     }
-    size_t a = lo, b = lo;
-    while (a > 0 && recs[a - 1]->code + recs[a - 1]->n > code) a--;
-    while (b < nrecs && recs[b]->code < code + n) b++;
-    for (size_t i = a; i < b; i++) free_rec(recs[i]);
-    memmove(recs + a, recs + b, (nrecs - b) * sizeof *recs);
-    nrecs -= b - a;
-    if (nrecs == caprecs) {
-        caprecs = caprecs ? caprecs * 2 : 256;
-        recs = realloc(recs, caprecs * sizeof *recs);
+    if (prev && prev->code + prev->n > code) {
+        struct rec *l, *m, *r;
+        split(recs, code, &l, &r);
+        split(r, code + n, &m, &r);
+        free_tree(m);
+        /* The last record below code may reach into it. */
+        struct rec *last = l;
+        while (last && last->right) last = last->right;
+        if (last && last->code + last->n > code) {
+            struct rec *l2;
+            split(l, last->code, &l, &l2);
+            free_tree(l2);
+        }
+        recs = join(l, r);
     }
-    memmove(recs + a + 1, recs + a, (nrecs - a) * sizeof *recs);
-    struct rec *r = calloc(1, sizeof *r);
-    r->code = code;
-    r->n = n;
-    r->pool = pool;
-    recs[a] = r;
+    struct rec *nr = calloc(1, sizeof *nr);
+    nr->code = code;
+    nr->n = n;
+    nr->pool = pool;
+    /* xorshift: the treap's priorities. */
+    static uint32_t seed = 2463534242u;
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    nr->prio = seed;
+    recs = insert(recs, nr);
     nrecs++;
+    last_rec = nr;
 }
 
 #define OPMASK ((1u << loimi_jit_op_bits) - 1)
