@@ -10,6 +10,11 @@ tak(X, Y, Z, A) :- X > Y,
     Z1 is Z - 1, tak(Z1, X, Y, A3),
     tak(A1, A2, A3, A).
 
+% Complementary comparisons with an integer, the second clause with an
+% environment (its comparison runs before it is made).
+fib(N, F) :- N < 2, F = N.
+fib(N, F) :- 2 =< N, N1 is N - 1, N2 is N - 2, fib(N1, F1), fib(N2, F2), F is F1 + F2.
+
 % Swapped operands: Y < X is X > Y.
 sw(X, Y, le) :- X =< Y.
 sw(X, Y, gt) :- Y < X.
@@ -79,6 +84,14 @@ t_compare :-
     ( compare(<, 1, 2) -> write(yes) ; write(no) ), nl,
     catch(compare(foo, 1, 2), error(E, _), (write(E), nl)).
 
+% Integer division on registers (32-bit and 64-bit paths).
+dv(X, Y, [Q, R, M]) :- Q is X // Y, R is X rem Y, M is X mod Y.
+
+t_div :-
+    findall(X/Y=L, (member(X-Y, [7-2, -7-2, 7-(-2), -7-(-2), 0-5, 4294967295-7, 4294967296-7, 99999999999-4294967296, 5-4294967297, -1-3]), dv(X, Y, L)), L1),
+    write(L1), nl,
+    catch(dv(1, 0, _), error(E, _), (write(E), nl)).
+
 t_functor :-
     findall(F/N, (member(T, [f(a, b), [x], abc, 3, 2.5, g(_)]), fr(T, F, N)), L1), write(L1), nl,
     fp(h(1, 2, 3), P1), write(P1), nl,
@@ -100,8 +113,11 @@ t_arg :-
     ( ga(f(Y0, Y0), 1, 2) -> write(bad) ; write(ok) ), nl.
 
 main :-
-    t_functor, t_arg, t_compare,
+    t_functor, t_arg, t_compare, t_div,
     tak(18, 12, 6, T), write(tak(T)), nl,
+    fib(15, Fb), fib(1.5, Fb2), write(fib(Fb, Fb2)), nl,
+    catch(fib(_, _), error(Ef, _), (write(Ef), nl)),
+    findall(Fc, fib(3.0, Fc), Lfc), write(Lfc), nl,
     findall(R, sw(1, 2, R), L1), findall(R, sw(2, 1, R), L2), findall(R, sw(1, 1, R), L3),
     write(sw(L1, L2, L3)), nl,
     findall(R, ov(1, 1, R), L4), findall(R, ov(1, 2, R), L5), findall(R, ov(2, 1, R), L6),

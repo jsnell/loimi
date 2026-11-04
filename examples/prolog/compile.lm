@@ -247,6 +247,14 @@ fn excludes(c0: *Clause, c: *Clause) -> bool {
     false
 }
 
+/// `c`'s first comparison holds whenever `c0`'s fails (`excludes` held:
+/// together they cover every outcome).
+fn complements(c0: *Clause, c: *Clause) -> bool {
+    let m = if c.ea == c0.ea and c.eb == c0.eb { c.emask }
+        else { (c.emask & 2) | ((c.emask & 1) << 2) | ((c.emask >> 2) & 1) };
+    (c0.emask | m) == 7
+}
+
 /// Code that tries `cs` in order, the first clause's guards without a
 /// choicepoint if it has them (`Clause.guard`): they jump to the code of
 /// the other clauses when they fail, and into the clause at its neck cut
@@ -256,10 +264,11 @@ fn excludes(c0: *Clause, c: *Clause) -> bool {
 fn guard_chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> ?Verified<Wam> {
     let c0 = cs.ptr[0];
     var glen = c0.guard;
+    var excl = false;
     if glen == 0 and c0.eguard > 0 and c0.emask != 0 {
         var all = true;
         for i in 1..cs.len { if !excludes(c0, cs.ptr[i]) { all = false; } }
-        if all { glen = c0.eguard; }
+        if all { glen = c0.eguard; excl = true; }
     }
     if glen == 0 { return None; }
     let Some(at) = c0.code.resume_at(glen) else { return None; };
@@ -267,7 +276,16 @@ fn guard_chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> ?Verified<Wam> {
     for i in 1..cs.len { rest.push(cs.ptr[i]); }
     let other = chain(m, p, &rest);
     rest.free();
-    let Some(alt) = other.resume_at(0) else { return None; };
+    let Some(alt0) = other.resume_at(0) else { return None; };
+    var alt = alt0;
+    // The only other clause starts with the complement of the comparison
+    // (tak: X =< Y, X > Y): it is known to hold there, skip it.
+    if excl and cs.len == 2 {
+        let c1 = cs.ptr[1];
+        if c1.eguard == 1 and complements(c0, c1) {
+            if let Some(r) = c1.code.resume_at(1) { alt = r; }
+        }
+    }
     var v: mem.Vec<u32> = mem.Vec.new();
     var to: mem.Vec<Wam.Resume> = mem.Vec.new();
     var i: u64 = 0;
@@ -1068,6 +1086,48 @@ fn C.inline_builtin(c: *C, g: Term) -> bool {
     false
 }
 
+fn cmp_op_of(name: str) -> ?u32 {
+    match name {
+        "<" => Some(Wam.OP_LT), "=<" => Some(Wam.OP_LE), ">" => Some(Wam.OP_GT), ">=" => Some(Wam.OP_GE),
+        "=:=" => Some(Wam.OP_NEQ), "=\\=" => Some(Wam.OP_NNE), _ => None,
+    }
+}
+
+/// The head's arguments are distinct variables.
+fn distinct_vars(head: Term, arity: u64) -> bool {
+    for i in 0..arity {
+        let a = deref(term.arg_of(head, i));
+        let Ref(_) = a else { return false; };
+        for j in 0..i { if deref(term.arg_of(head, j)) == a { return false; } }
+    }
+    true
+}
+
+/// `t0` can be an early comparison's operand: a head variable or a small
+/// integer.
+fn C.early_ok(c: *C, t0: Term, head: Term, arity: u64) -> bool {
+    let t = deref(t0);
+    match t {
+        Int(k) => small16(k as i64),
+        Ref(_) => occurs(head, t),
+        _ => false,
+    }
+}
+
+/// The register holding early operand `t0` (`early_ok`), before the head
+/// code: a head variable's argument register, or a temporary (owned) with
+/// the integer.
+fn C.early_operand(c: *C, t0: Term, head: Term, arity: u64) -> (u32, bool) {
+    let t = deref(t0);
+    if let Int(k) = t {
+        let r = c.temp();
+        c.emit(Wam.PUT_INT(r as u8, k as i16));
+        return (r, true);
+    }
+    for i in 0..arity { if deref(term.arg_of(head, i)) == t { return (i as u32, false); } }
+    (0, false)
+}
+
 fn C.inline_arith(c: *C, g: Term) -> bool {
     let Str(s) = g else { return false; };
     if s.args.len != 2 { return false; }
@@ -1494,6 +1554,25 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     }
     if c.next_temp >= 255 { c.error = Some("clause needs too many registers"); }
     c.has_env = env;
+    // A head of distinct variables binds nothing: leading comparisons of
+    // its arguments (and integers) run first, on the argument registers,
+    // before the environment and the moves into it (tak's `X > Y`).
+    var early: u64 = 0;
+    if env and distinct_vars(head, arity) {
+        while early < goals.len and goals.ptr[early].kind == GoalKind.Builtin {
+            let g = goals.ptr[early].t;
+            let (gn, ga) = term.name_arity(&m.db, g);
+            if ga != 2 { break; }
+            let Some(op) = cmp_op_of(m.db.name(gn)) else { break; };
+            if !c.early_ok(term.arg_of(g, 0), head, arity) or !c.early_ok(term.arg_of(g, 1), head, arity) { break; }
+            let (a, oa) = c.early_operand(term.arg_of(g, 0), head, arity);
+            let (b, ob) = c.early_operand(term.arg_of(g, 1), head, arity);
+            c.emit(Wam.encode.R3(op, a as u8, b as u8, 0));
+            if ob { c.release(b); }
+            if oa { c.release(a); }
+            early += 1;
+        }
+    }
     if env {
         c.emit(Wam.ALLOCATE(c.nperm));
         if c.level_used {
@@ -1504,6 +1583,7 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     for i in 0..arity { c.get_arg(term.arg_of(head, i), i as u8); }
     var called = false;
     for i in 0..goals.len {
+        if i < early { continue; }
         let g = goals.ptr[i];
         let last = i + 1 == goals.len;
         match g.kind {
