@@ -1,0 +1,61 @@
+mul 12 number false
+mul ovf 4294967296 number false
+mul -0 0 number true
+mul -0b 0 number true
+mul ovf neg -4294967296 number false
+add ovf 2147483648 number false
+add 3 number false
+sub ovf -2147483649 number false
+seed 24794531 number false
+div 6/3 2 number false
+div 7/2 3.5 number false
+div 0/5 0 number false
+div 0/-5 0 number true
+div 1/0 Infinity number false
+div -1/0 -Infinity number false
+div 0/0 NaN number false
+div -2147483648/-1 2147483648 number false
+div 7.5/2.5 3 number false
+div 1/3 0.3333333333333333 number false
+div 9/1.5 6 number false
+div 2.5/5 0.5 number false
+div -6/3 -2 number false
+div 6/-3 -2 number false
+fdiv 3 number false
+fdiv int 2.5 number false
+fdiv int exact 2 number false
+fdiv -0 0 number true
+fdiv str 3 number false
+acc 171705.18737751766 number false
+cmp 0 acfgjkmn
+cmp 4999 acegjlmn
+cmp 5000 bcegjlm
+cmp 5001 bdegilm
+cmp 1000.5 acfgjlmn
+cmp 1000.75 acegjlmn
+cmp -300 acfgjkmn
+cmp -301 acfhjkmn
+cmp 0.25 acfgjkmn
+cmp NaN bdfhjln
+cmp 6000 bdegilm
+cmp abc bdfhjln
+cmp null acfgjkmn
+cmp undefined bdfhjln
+cmp true acfgjlmn
+cmp 70000 bdegil
+loops 5601
+3 x1 1y ab 1,23 [object Object]! nulln uundefined
+110 0,1,2,3,4,5,6,7,8,9, 44
+big 2147483700 number false
+a b undefined undefined b true
+eq 3 true,false,false,false,true,false
+eq 3 true,false,false,false,true,false
+eq 2.5 false,true,false,false,false,false
+eq s false,true,true,false,true,false
+eq 3 false,true,false,false,true,false
+eq null false,true,false,true,true,false
+eq undefined false,true,false,false,true,true
+eq NaN false,true,false,false,true,false
+eq 0 false,true,false,false,true,false
+eq 0 false,true,false,false,true,false
+eq true false,true,false,false,true,false

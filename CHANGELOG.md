@@ -408,6 +408,15 @@ implementation; `git log` has the details.
   deltablue 0.71, raytrace 0.75 of the time before; float's peak RSS
   105 → 36 MB
   ([FRICTION.md](examples/python/FRICTION.md#instance-layout-inline-slots-behind-shapes-2026-11-04)).
+- MiniJS takes 0.48 of node --jitless's time and 0.37 of QuickJS's
+  (0.939 of the time before): Int overflow and string concatenation
+  without cold calls, a DIV family, compare-and-branch with pool
+  constants (`JLTK`..) and `EQK`/`NEK`, handlers without stack frames
+  (`try_new` in NEW, slow paths in cold blocks; std.obj's Poly hits
+  without bounds checks, which also removed frames in Lox), and calls
+  that no longer clear the callee's registers (the collector clears the
+  stack above the innermost window up to a high-water mark)
+  ([bench/minijs/RESULTS.md](bench/minijs/RESULTS.md#second-performance-pass-2026-11-04)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
 - The Prolog takes 0.53x SWI-Prolog's time and 0.13x Trealla's (0.92

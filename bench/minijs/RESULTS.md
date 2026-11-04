@@ -1,7 +1,8 @@
 # MiniJS results
 
-(See [`docs/results.md`](../../docs/results.md) for current numbers,
-all dispatch modes and the JIT, measured 2026-11-03.)
+(See [`docs/results.md`](../../docs/results.md) for all dispatch modes
+and the JIT, measured 2026-11-03, and the second performance pass at the
+end of this file, 2026-11-04: 0.48 of node --jitless, 0.37 of QuickJS.)
 
 `bench/minijs/compare.py -n 3 --align 64` on 2026-11-02, at the end of
 the performance pass below, tailcall dispatch. Times are the minimum
@@ -181,3 +182,107 @@ word-count sort (`counts["w_" + b]`) builds a key string, interns it
 (the 31,000-key table misses the cache) and looks it up in a
 dictionary-mode object: that phase alone takes 0.6 s against V8's
 0.39 s, while MiniJS wins every other phase.
+
+## Second performance pass (2026-11-04)
+
+Starting point 573511e (the full results run), end b71ab20.
+`compare.py -n 3 --align 64 --exe <573511e build> --refs
+node-jitless,qjs`: minimum wall-clock seconds over 3 interleaved runs,
+outputs checked, tail-call dispatch, host at load 3-6 (other agents):
+
+| Benchmark | after | before | node --jitless | QuickJS | after/before | after/jitless | after/QuickJS | before/jitless | before/QuickJS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| awfy_micro | 0.744 | 0.752 | 1.540 | 1.974 | 0.99 | 0.48 | 0.38 | 0.49 | 0.38 |
+| binary_trees | 0.894 | 0.963 | 1.715 | 4.646 | 0.93 | 0.52 | 0.19 | 0.56 | 0.21 |
+| bitops | 0.666 | 0.801 | 1.550 | 1.387 | 0.83 | 0.43 | 0.48 | 0.52 | 0.58 |
+| closures | 0.865 | 0.955 | 1.445 | 2.510 | 0.91 | 0.60 | 0.34 | 0.66 | 0.38 |
+| deltablue | 0.796 | 0.838 | 1.454 | 2.548 | 0.95 | 0.55 | 0.31 | 0.58 | 0.33 |
+| fannkuch | 0.442 | 0.459 | 1.303 | 1.477 | 0.96 | 0.34 | 0.30 | 0.35 | 0.31 |
+| json | 0.857 | 0.885 | 1.457 | 2.165 | 0.97 | 0.59 | 0.40 | 0.61 | 0.41 |
+| nbody | 0.411 | 0.415 | 1.788 | 1.288 | 0.99 | 0.23 | 0.32 | 0.23 | 0.32 |
+| properties | 0.797 | 0.819 | 1.511 | 1.589 | 0.97 | 0.53 | 0.50 | 0.54 | 0.52 |
+| raytrace | 0.439 | 0.487 | 1.394 | 2.118 | 0.90 | 0.31 | 0.21 | 0.35 | 0.23 |
+| richards | 0.721 | 0.735 | 1.405 | 1.948 | 0.98 | 0.51 | 0.37 | 0.52 | 0.38 |
+| sort | 0.784 | 0.830 | 1.297 | 1.680 | 0.94 | 0.60 | 0.47 | 0.64 | 0.49 |
+| spectral_norm | 0.818 | 0.903 | 1.551 | 1.361 | 0.91 | 0.53 | 0.60 | 0.58 | 0.66 |
+| strings | 1.105 | 1.197 | 1.494 | 2.163 | 0.92 | 0.74 | 0.51 | 0.80 | 0.55 |
+| geometric mean | | | | | **0.939** | **0.48** | **0.37** | **0.51** | **0.39** |
+
+After/before by user+sys CPU time during the pass (min of 5, interleaved)
+agrees: about 0.935 by geometric mean, bitops 0.82, binary_trees 0.83
+to 0.93, sort 0.88, strings 0.90. Where we stood at the start, against
+QuickJS: spectral_norm 0.65, strings 0.58, bitops 0.57, properties
+0.51, sort 0.49 were the weakest ratios; against node --jitless,
+strings 0.79, closures 0.64, binary_trees 0.63 (profiles with the
+LD_PRELOAD sampler: `vm.arith` and `Ctx.key` in strings, DIV in
+spectral_norm, NEW and the GC in binary_trees, CALL/RET and property
+loads elsewhere).
+
+What changed, in order:
+
+1. **Arithmetic without cold calls** (c9e11ba). ADD/SUB/MUL's generic
+   member turns an Int overflow (and MUL's -0) into the double inline;
+   it went to a cold block every time before (strings' `seed * 16807`,
+   bitops' sums). `a + b` with a string goes straight to `Ctx.concat`.
+   `DIV` is a family: the generic member divides two Ints first (one
+   `divsd`; it divided the NaN-tagged words first, then again), `DIV_F`
+   the raw words first. `JLTK`/`JLEK`/`JGTK`/`JGEK` compare with a
+   number constant from the pool (`k <= 5000`, `i < N` for a folded
+   `const`), saving the `LOADI`. A string-method site takes an already
+   flattened rope inline (json's `const t = this.text` per method went
+   through a cold block 4.5M times).
+2. **No stack frames on fast paths** (c9e11ba, deb3c5d). `-W
+   handler_frame` listed 59 framed handlers; now 17 (MOD/MODK and NEW
+   for spills, GETINDEX_SETINDEX, and rare ops). NEW
+   allocates up to 8 inline slots with `try_new` at a constant size (no
+   `memset` call, which with the refill gave NEW a 176-byte frame);
+   BOXNEW/REBOX use `try_new`; collections before an allocation are
+   cold blocks that `redo`. The compare-and-branch ops, EQ/NE, the bit
+   ops and MOD keep numbers inline (ToInt32 of a double below 2^63
+   without `fmod`, `>>>` giving a double) and move `less`, `strict_eq`
+   and `fmod` into cold blocks; Math.floor and SWITCHI floor without a
+   libm call; GETINDEX/charAt take ASCII one-character strings with no
+   bounds-checked `Vec.at`. std.obj's `poly_get`/`poly_set` assume at
+   most 8 entries (no bounds-check panic) and `store_ref` is inline, so
+   the POLY/MEGA members lost their frames (Lox: 22 framed handlers to
+   18, times unchanged within noise). binary_trees 0.87, bitops 0.82,
+   closures 0.80-0.97 across runs, fannkuch, sort and spectral_norm
+   0.84-0.93 (user+sys, min of 5).
+3. **Calls do not clear registers** (a802af8, 4d33b2f). The compiler
+   writes every register before reading it (a `var` binding now gets
+   undefined when its scope starts: the one case found by running all
+   tests with poisoned registers instead of cleared ones). A stale
+   register must never refer to a freed object: `Ctx.hw` is the stack's
+   high-water mark since the last collection, `scan_roots` clears the
+   stack from the innermost window up to it, and a call whose window
+   reaches it raises it (one compare, replacing the stack-overflow
+   check). deltablue, richards, raytrace, awfy_micro 0.94-0.97.
+4. **Supers and constant forms** (adfaaee, b71ab20): `ADDI; JLTK`,
+   `ADDI; JLEK`, `GETINDEX; TEST`; EQK/NEK for `===`/`!==` with a
+   constant as a value, and the K bit ops and MODK with a folded
+   `const` (`state & STATE_HELD`). Each within ±2%.
+
+Checked: the MiniJS tests and benchmarks normally, under GC stress and
+verify, with `--gc-check-roots`, and `cargo test --release`.
+
+Tried and dropped:
+
+- The shape id copied into every object (`Obj.sid`, std.obj keeping it
+  in step), so an IC hit loads one word less: 0.998 overall, binary_trees
+  1.06 (objects 8 bytes bigger).
+- std.text's Interner with the key's bytes in a 2- or 4-word slot (no
+  name-list or memcmp miss for keys up to 7 or 15 bytes): `Ctx.key`
+  stayed at 13% of strings (hashing and the one remaining miss), 0.994.
+- Supers `ADD; RET`, `SUB; RET`, `LOADI; RET`, `GETINDEX; RET`,
+  `GETLEN; RET`, `SETPROP_IN; RETU`, `SETPROP_ADD; SETPROP_ADD`,
+  `GETMETHOD_POLY; CALL`, `GETINDEX; GETINDEX`: 0.996 together.
+- `% 2^k` as a mask, and one-byte string compares inline in
+  JEQ/JEQK/EQ: 1.005.
+- ADD_F/SUB_F/MUL_F handling Int pairs inline after the NaN test: nbody
+  5% slower (the float path got a register copy), kept in the cold block.
+
+Where the time goes now: strings spends 13% in `Ctx.key` (interning
+`"w_" + b` in the sort comparator: 31,000 keys) and 7% in `concat`;
+CALL/RET and the property loads elsewhere (`GETPROP_IN` is a dependent
+load of the shape id; the Obj.sid experiment above did not pay);
+`MODK` by non-power-of-two constants is an `idiv` (closures 8%).

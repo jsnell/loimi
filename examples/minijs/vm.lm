@@ -106,11 +106,39 @@ fn eq_slow(a: V, b: V) -> bool {
 }
 
 #[inline(always)]
+fn is_str(v: V) -> bool {
+    match v { S(_) | R(_) => true, _ => false }
+}
+
+#[inline(always)]
 fn int32(v: V) -> i32 {
     match v {
         Int(i) => i,
         Num(x) => if x >= -2147483648.0 and x <= 2147483647.0 { x as i32 } else { value.to_int32(x) },
         _ => value.to_int32(value.to_number(v)),
+    }
+}
+
+/// x / y for two Ints: integral quotients stay Int (no -0: a zero
+/// quotient of a nonzero divisor with x == 0 needs y > 0).
+#[inline(always)]
+fn int_div(x: i32, y: i32) -> V {
+    let r = x as f64 / y as f64;
+    if r >= -2147483648.0 and r <= 2147483647.0 {
+        let q = r as i32;
+        if q as f64 == r and (q != 0 or y > 0) { return V.Int(q); }
+    }
+    V.Num(r)
+}
+
+/// ToInt32 of a number without a call: (value, true) for Ints and for
+/// doubles below 2^63 in magnitude (NaN gives 0, as ToInt32 does).
+#[inline(always)]
+fn i32_of(v: V) -> (i32, bool) {
+    match v {
+        Int(i) => (i, true),
+        Num(x) => if x > -9.2e18 and x < 9.2e18 or x != x { ((x as i64) as i32, true) } else { (0, false) },
+        _ => (0, false),
     }
 }
 
@@ -424,16 +452,20 @@ pub vm JS {
     }
     /// Put R[r] in a new box (a captured variable that is assigned).
     op BOXNEW(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
         let v = r;
-        r = B(new(&ctx.heap, Box { v: v }));
+        let Some(b) = try_new(&ctx.heap, Box { v: v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+        r = B(b);
         next
     }
     /// A fresh box holding the value of the box in R[r] (per-iteration
     /// bindings of `for (let ...)`).
     op REBOX(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        if let B(b) = r { r = B(new(&ctx.heap, Box { v: b.v })); }
+        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+        if let B(b) = r {
+            let Some(nb) = try_new(&ctx.heap, Box { v: b.v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+            r = B(nb);
+        }
         next
     }
     op BOXGET(dst: reg, b: reg) : ABC {
@@ -570,6 +602,9 @@ pub vm JS {
                         next
                     }
                 }
+                // A rope already flattened (`const t = this.text` in each
+                // method of json's lexer): no cold call.
+                if let R(r) = obj and let Some(f) = r.flat { obj = S(f); redo }
                 if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
                 cold { become #fam; redo }
             }
@@ -694,8 +729,8 @@ pub vm JS {
             next
         }
         if let (S(s), Int(i)) = (obj, key) and (i as u32 as u64) < s.data.len {
-            dst = S(ctx.char_str(s.data[i as u32 as u64]));
-            next
+            // One-character strings of ASCII bytes are made at startup.
+            if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { dst = S(c); next }
         }
         cold {
             if let R(r) = obj { obj = S(value.flatten(r)); redo }
@@ -751,11 +786,21 @@ pub vm JS {
     ] {
         family #name(dst: reg, a: reg, b: reg) : ABC {
             generic {
-                if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) {
-                    dst = Int(r);
+                // Two Ints: an Int, or the double result on overflow (and
+                // for MUL's -0) without leaving the fast path.
+                if let (Int(x), Int(y)) = (a, b) {
+                    if let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) { dst = Int(r); next }
+                    dst = Num(x as f64 sym y as f64);
                     next
                 }
                 cold {
+                    // String concatenation (either operand a string or
+                    // rope): straight to concat.
+                    if code == 0 and (is_str(a) or is_str(b)) {
+                        if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                        dst = ctx.concat(a, b);
+                        next
+                    }
                     match (a, b) {
                         (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; refuse(fp.cl); next }
                         (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
@@ -799,26 +844,28 @@ pub vm JS {
             }
         }
     }
-    op DIV(dst: reg, a: reg, b: reg) : ABC {
-        let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
-        if likely(r == r) { dst = r.to_bits() as V; next }
-        match (a, b) {
-            (Int(x), Int(y)) => {
-                // Integral quotients stay Int (no -0: a zero quotient of
-                // a nonzero divisor with x == 0 needs y > 0).
-                let r = x as f64 / y as f64;
-                if r >= -2147483648.0 and r <= 2147483647.0 {
-                    let q = r as i32;
-                    if q as f64 == r and (q != 0 or y > 0) { dst = Int(q); next }
-                }
-                dst = Num(r);
-                next
-            }
-            (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
-            (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
-            _ => {}
+    /// `/`: the generic member divides two Ints first (spectral_norm's
+    /// `n / 2` and `1 / n`); a site that sees two floats becomes DIV_F,
+    /// which divides the raw words first.
+    family DIV(dst: reg, a: reg, b: reg) : ABC {
+        generic {
+            if let (Int(x), Int(y)) = (a, b) { dst = int_div(x, y); next }
+            if let (Int(x), Num(y)) = (a, b) { dst = Num(x as f64 / y); next }
+            if let (Num(x), Int(y)) = (a, b) { dst = Num(x / y as f64); next }
+            if let (Num(x), Num(y)) = (a, b) { cold { become DIV_F; refuse(fp.cl); redo } }
+            cold { dst = arith(ctx, 3, a, b)?; next }
         }
-        cold { dst = arith(ctx, 3, a, b)?; next }
+        DIV_F {
+            let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
+            if likely(r == r) { dst = r.to_bits() as V; next }
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = int_div(x, y); next }
+                (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
+                (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
+                _ => {}
+            }
+            cold { dst = arith(ctx, 3, a, b)?; next }
+        }
     }
     /// `%` with a positive Int divisor is exact in integers when the
     /// dividend is integral (an Int, or a Num below 2^53).
@@ -838,8 +885,11 @@ pub vm JS {
                 if r != 0 or xi > 0 { dst = Int(r as i32); next }
             }
         }
-        if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
-        cold { dst = arith(ctx, 4, a, b)?; next }
+        cold {
+            if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
+            dst = arith(ctx, 4, a, b)?;
+            next
+        }
     }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
@@ -885,29 +935,42 @@ pub vm JS {
                 if code == 4 { dst = Int(x >> (y & 31)); next }
                 if x >= 0 { dst = Int(((x as u32) >> ((y & 31) as u32)) as i32); next }
             }
-            dst = bitop(code, a, b);
-            next
+            let (x, okx) = i32_of(a);
+            let (y, oky) = i32_of(b);
+            if okx and oky {
+                if code == 0 { dst = Int(x & y); next }
+                if code == 1 { dst = Int(x | y); next }
+                if code == 2 { dst = Int(x ^ y); next }
+                if code == 3 { dst = Int(((x as u32) << ((y & 31) as u32)) as i32); next }
+                if code == 4 { dst = Int(x >> (y & 31)); next }
+                let u = (x as u32) >> ((y & 31) as u32);
+                if u <= 2147483647 { dst = Int(u as i32); next }
+                dst = Num(u as f64);
+                next
+            }
+            cold { dst = bitop(code, a, b); next }
         }
     }
 
     // Comparisons producing booleans.
-    op EQ(dst: reg, a: reg, b: reg) : ABC {
+    // `===` and `!==` producing booleans; the K forms compare with a
+    // constant (`return x === 0`, `t = s !== "x"`).
+    inline for (name, neg, bkind) in [("EQ", false, reg), ("NE", true, reg), ("EQK", false, kst), ("NEK", true, kst)] {
+    op #name(dst: reg, a: reg, b: bkind) : ABC {
         if a == b {
-            if let Num(x) = a { dst = Bool(x == x); next }
-            dst = Bool(true);
+            if let Num(x) = a { dst = Bool((x == x) != neg); next }
+            dst = Bool(!neg);
             next
         }
-        dst = Bool(eq_slow(a, b));
-        next
+        if let (Int(_), Int(_)) = (a, b) { dst = Bool(neg); next }
+        match (a, b) {
+            (Num(x), Num(y)) => { dst = Bool((x == y) != neg); next }
+            (Int(x), Num(y)) => { dst = Bool((x as f64 == y) != neg); next }
+            (Num(x), Int(y)) => { dst = Bool((x == y as f64) != neg); next }
+            _ => {}
+        }
+        cold { dst = Bool(eq_slow(a, b) != neg); next }
     }
-    op NE(dst: reg, a: reg, b: reg) : ABC {
-        if a == b {
-            if let Num(x) = a { dst = Bool(x != x); next }
-            dst = Bool(false);
-            next
-        }
-        dst = Bool(!eq_slow(a, b));
-        next
     }
     op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
     op LT(dst: reg, a: reg, b: reg) : ABC {
@@ -916,8 +979,7 @@ pub vm JS {
             (Num(x), Num(y)) => { dst = Bool(x < y); next }
             _ => {}
         }
-        dst = Bool(less(ctx, a, b, false));
-        next
+        cold { dst = Bool(less(ctx, a, b, false)); next }
     }
     op LE(dst: reg, a: reg, b: reg) : ABC {
         match (a, b) {
@@ -925,8 +987,7 @@ pub vm JS {
             (Num(x), Num(y)) => { dst = Bool(x <= y); next }
             _ => {}
         }
-        dst = Bool(less(ctx, a, b, true));
-        next
+        cold { dst = Bool(less(ctx, a, b, true)); next }
     }
 
     /// The end of a compare-and-branch: jump to the following JMP's
@@ -945,7 +1006,7 @@ pub vm JS {
             (Num(x), Num(y)) => branch((x < y) == want, then.target),
             _ => {}
         }
-        branch(less(ctx, a, b, false) == want, then.target)
+        cold { branch(less(ctx, a, b, false) == want, then.target) }
     }
     op JLE(pol: imm, a: reg, b: reg) : ABC then JMP {
         let want = pol != 0;
@@ -954,7 +1015,7 @@ pub vm JS {
             (Num(x), Num(y)) => branch((x <= y) == want, then.target),
             _ => {}
         }
-        branch(less(ctx, a, b, true) == want, then.target)
+        cold { branch(less(ctx, a, b, true) == want, then.target) }
     }
     op JEQ(pol: imm, a: reg, b: reg) : ABC then JMP {
         let want = pol != 0;
@@ -965,7 +1026,13 @@ pub vm JS {
         }
         // Different words: two Ints (the usual case) are not equal.
         if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
-        branch(eq_slow(a, b) == want, then.target)
+        match (a, b) {
+            (Num(x), Num(y)) => branch((x == y) == want, then.target),
+            (Int(x), Num(y)) => branch((x as f64 == y) == want, then.target),
+            (Num(x), Int(y)) => branch((x == y as f64) == want, then.target),
+            _ => {}
+        }
+        cold { branch(eq_slow(a, b) == want, then.target) }
     }
 
     /// Compare against a small integer constant and branch: R[a] < sc,
@@ -979,8 +1046,41 @@ pub vm JS {
             let c = sc as i32;
             if let Int(xi) = a { branch(icmp == want, then.target) }
             if let Num(xf) = a { branch(fcmp == want, then.target) }
-            let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
-            branch(r == want, then.target)
+            cold {
+                let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
+                branch(r == want, then.target)
+            }
+        }
+    }
+
+    /// Compare against a number constant k[kc] (`i <= 5000`, `x < N` with
+    /// N a folded `const`, `d < 0.5`) and branch.
+    inline for (name, swap, oreq) in [
+        ("JLTK", false, false), ("JLEK", false, true), ("JGTK", true, false), ("JGEK", true, true),
+    ] {
+        op #name(pol: imm, a: reg, kc: kst) : ABC then JMP {
+            let want = pol != 0;
+            if let (Int(xi), Int(c)) = (a, kc) {
+                let t = if swap { if oreq { xi >= c } else { xi > c } } else { if oreq { xi <= c } else { xi < c } };
+                branch(t == want, then.target)
+            }
+            if let Num(xf) = a {
+                var c = 0.0;
+                var ok = true;
+                match kc {
+                    Int(ci) => { c = ci as f64; }
+                    Num(cf) => { c = cf; }
+                    _ => { ok = false; }
+                }
+                if ok {
+                    let t = if swap { if oreq { xf >= c } else { xf > c } } else { if oreq { xf <= c } else { xf < c } };
+                    branch(t == want, then.target)
+                }
+            }
+            cold {
+                let r = if swap { less(ctx, kc, a, oreq) } else { less(ctx, a, kc, oreq) };
+                branch(r == want, then.target)
+            }
         }
     }
 
@@ -994,7 +1094,13 @@ pub vm JS {
         }
         // Different words: two Ints (the usual case) are not equal.
         if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
-        branch(eq_slow(a, b) == want, then.target)
+        match (a, b) {
+            (Num(x), Num(y)) => branch((x == y) == want, then.target),
+            (Int(x), Num(y)) => branch((x as f64 == y) == want, then.target),
+            (Num(x), Int(y)) => branch((x == y as f64) == want, then.target),
+            _ => {}
+        }
+        cold { branch(eq_slow(a, b) == want, then.target) }
     }
 
     /// `switch` on Int cases lo .. lo+n-1: followed by n JMPs (one per
@@ -1002,7 +1108,7 @@ pub vm JS {
     op SWITCHI(r: reg, lo: kst, n: ncases) : ABC {
         var i = n as u64;
         if let (Int(x), Int(l)) = (r, lo) and ((x as i64 - l as i64) as u64) < n as u64 { i = (x as i64 - l as i64) as u64; }
-        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and x == x.floor() {
+        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and (x as i64) as f64 == x {
             i = (x as i64 - l as i64) as u64;
         }
         jump pc + 1 + i
@@ -1054,6 +1160,7 @@ pub vm JS {
             callee[i] = Undef;
             i += 1;
         }
+        if callee + n + 1 > ctx.hw { ctx.hw = callee + n + 1; }
         fp.resume = pc + 1;
         fp = fp + 1;
         fp.cl = cl;
@@ -1063,6 +1170,18 @@ pub vm JS {
         fp.k = k;
         regs = callee;
         jump p.code
+    }
+
+    /// CALL's window reaches the stack's high-water mark: check for
+    /// overflow, raise the mark, and run the op again. (Not for NEW, whose
+    /// collection check before allocating would run again: under GC stress
+    /// that collection lowers the mark every time.)
+    fn grow_stack(end: *V) -> never {
+        cold {
+            if end >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+            ctx.hw = end + 1;
+            redo
+        }
     }
 
     /// A native call from CALL's members (their callee is the native
@@ -1085,26 +1204,24 @@ pub vm JS {
                 if likely(p.fixed <= 255) {
                     let callee = regs + base + 1;
                     let n = p.nregs as u64;
-                    if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    // The callee's registers past its parameters keep what
+                    // they held (the compiler writes every register before
+                    // reading it). They are valid values: the collector
+                    // clears the stack above the innermost window up to
+                    // the high-water mark ctx.hw (rt.scan_roots), so a
+                    // stale register never refers to a freed object.
+                    if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
+                    if fp + 1 >= ctx.frames_end {
                         cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
                     }
-                    // Missing arguments are undefined; extra ones are dropped
-                    // (their registers are the callee's locals, cleared with
-                    // the rest). Two registers per store pair: the register
-                    // after the window may be cleared too (it is free).
+                    // Missing arguments are undefined; extra ones are the
+                    // callee's locals.
                     let fx = p.fixed as u64;
                     if (nargs as u64) < fx {
                         cold {
                             var i = nargs as u64 + 1;
                             while i <= fx { callee[i] = Undef; i += 1; }
                         }
-                    }
-                    var q = callee + fx + 1;
-                    let e = callee + n;
-                    while q < e {
-                        q[0] = Undef;
-                        q[1] = Undef;
-                        q = q + 2;
                     }
                     fp.resume = pc + 1;
                     fp = fp + 1;
@@ -1151,8 +1268,7 @@ pub vm JS {
         CALL_CHARAT {
             if regs[base] == ctx.f_charat and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
                     and (i as u32 as u64) < s.data.len {
-                regs[base] = S(ctx.char_str(s.data[i as u32 as u64]));
-                next
+                if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { regs[base] = S(c); next }
             }
             cold {
                 if regs[base] != ctx.f_charat { become CALL; redo }
@@ -1179,12 +1295,11 @@ pub vm JS {
             if regs[base] == ctx.f_floor {
                 let x = regs[base + 2];
                 if let Int(_) = x { regs[base] = x; next }
-                if let Num(d) = x {
-                    let f = d.floor();
-                    if f >= -2147483648.0 and f <= 2147483647.0 and (f != 0.0 or d > 0.0) {
-                        regs[base] = Int(f as i32);
-                        next
-                    }
+                // floor of a double in Int range, without a libm call.
+                if let Num(d) = x and d > -2147483648.0 and d < 2147483647.0 {
+                    var i = d as i64;
+                    if (i as f64) > d { i -= 1; }
+                    if i != 0 or d > 0.0 { regs[base] = Int(i as i32); next }
                 }
             }
             cold {
@@ -1211,23 +1326,20 @@ pub vm JS {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+        // As in CALL.
+        if callee + n + 1 >= ctx.hw {
+            if callee + n + 1 >= ctx.stack_end { cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") } }
+            ctx.hw = callee + n + 2;
+        }
+        if fp + 1 >= ctx.frames_end {
             cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         }
-        // As in CALL.
         let np = p.nparams as u64;
         if nargs < np {
             cold {
                 var i = nargs + 1;
                 while i <= np { callee[i] = Undef; i += 1; }
             }
-        }
-        var q = callee + np + 1;
-        let e = callee + n;
-        while q < e {
-            q[0] = Undef;
-            q[1] = Undef;
-            q = q + 2;
         }
         fp.resume = pc + 1;
         fp = fp + 1;
@@ -1240,16 +1352,36 @@ pub vm JS {
         jump p.code
     }
 
+    /// A `new` object with `n` (at most 8) inline slots, if the
+    /// allocator's current run has room; constant lengths, so the zeroing
+    /// is inline.
+    fn try_obj(sh: Gc<obj.Shape>, cp: Gc<Obj>, n: u64) -> ?Gc<Obj> {
+        inline for i in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+            if n == i { return try_new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, i); }
+        }
+        None
+    }
+
     /// R[base] = new R[base](R[base+2] ..).
     op NEW(base: callbase, nargs: imm) : ABC {
         // A constructor whose objects' root shape is cached for its
         // current prototype: allocate here and enter it.
         if let F(cl) = regs[base] and cl.native == 0 and let Some(sh) = cl.ctor_shape and let Some(cp) = cl.ctor_proto
                 and let Some(bag) = cl.props and bag.dict.is_none() and bag.shape.count >= 1 and bag.inline.ptr[0] == V.O(cp) {
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            let o = new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, cl.hint as u64);
-            regs[base + 1] = O(o);
-            enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+            // Up to 8 inline slots: the allocator's inline path with a
+            // constant size (no call, so no stack frame).
+            let n = cl.hint as u64;
+            if n <= 8 {
+                let Some(o) = try_obj(sh, cp, n) else cold { gc.make_room(&ctx.heap, size_of<Obj>() + n * 8); redo };
+                regs[base + 1] = O(o);
+                enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            }
+            cold {
+                let o = new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, n);
+                regs[base + 1] = O(o);
+                enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            }
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
@@ -1400,6 +1532,12 @@ pub vm JS {
     // Overlaps another super, but runs where no ADD_F follows: 14% of nbody's ops.
     #[allow(super_overlap)]
     #[forward] super MUL_F_MUL_F = MUL_F; MUL_F;
+    // Loop tails against constants (JLTK/JLEK) and `if (a[i])`; supers
+    // for returns, constructors' adds and POLY calls measured within
+    // noise and were not kept.
+    #[forward] super ADDI_JLTK = ADDI; JLTK;
+    #[forward] super ADDI_JLEK = ADDI; JLEK;
+    #[forward] super GETINDEX_TEST = GETINDEX; TEST;
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
         ctx = c;
@@ -1407,6 +1545,7 @@ pub vm JS {
         c.stack[0] = Undef;
         regs = c.stack + 1;
         for i in 0..p.nregs as u64 { regs[i] = Undef; }
+        if regs + p.nregs as u64 + 1 > c.hw { c.hw = regs + p.nregs as u64 + 1; }
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;

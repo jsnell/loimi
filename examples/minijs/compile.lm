@@ -578,6 +578,10 @@ fn Gen.enter_vars(g: *Gen, vars: *mem.Vec<*Var>) {
         if v.kind != VK.Global and boxed(v) {
             g.emit(JS.LOADU(v.reg as u8));
             g.emit(JS.BOXNEW(v.reg as u8));
+        } else if v.kind == VK.Var {
+            // `var x;` assigns nothing, and a call leaves the callee's
+            // registers as they were (CALL does not clear them).
+            g.emit(JS.LOADU(v.reg as u8));
         }
     }
 }
@@ -651,6 +655,16 @@ fn Gen.const_value(g: *Gen, n: *Node) -> ?V {
             let c = const_global(n.vr);
             if is_null(c) { None } else { g.const_value(c) }
         }
+        _ => None,
+    }
+}
+
+/// The number a literal or a folded `const` stands for (not -0 or NaN).
+fn num_const(g: *Gen, n: *Node) -> ?V {
+    let Some(v) = g.const_value(n) else { return None; };
+    match v {
+        Int(_) => Some(v),
+        Num(x) => if x == x and x != 0.0 { Some(v) } else { None },
         _ => None,
     }
 }
@@ -776,11 +790,25 @@ g.closure(n.fun, dst);
                 }
             }
             if n.op == T.Instanceof { fail(n.line, "instanceof is not supported"); }
-            // Bit operations and `%` with an Int constant.
             let kop = n.op == T.Amp or n.op == T.Pipe or n.op == T.Caret or n.op == T.Shl or n.op == T.Shr or n.op == T.UShr or n.op == T.Percent;
-            if kop and n.b.kind == K.Num and let Int(_) = value.number(n.b.num) {
+            // `===`/`!==` with a constant (a literal or a folded const).
+            if (n.op == T.EqEqEq or n.op == T.NotEqEq) and let Some(kv) = g.const_value(n.b) {
+                let k = g.konst(kv);
+                if k < 256 {
+                    let a = g.any(n.a);
+                    if n.op == T.EqEqEq { g.emit(JS.EQK(dst as u8, a as u8, k as u8)); } else { g.emit(JS.NEK(dst as u8, a as u8, k as u8)); }
+                    g.reset(m);
+                    return;
+                }
+            }
+            // Bit operations and `%` with an Int constant (a literal or a
+            // folded const).
+            var kint = false;
+            if let Some(Int(_)) = num_const(g, n.b) { kint = true; }
+            if kop and kint {
+                let kv = num_const(g, n.b) ?? V.Undef;
                 let a = g.any(n.a);
-                let k = g.konst(value.number(n.b.num));
+                let k = g.konst(kv);
                 if k < 256 {
                     let (d, x, y) = (dst as u8, a as u8, k as u8);
                     match n.op {
@@ -796,7 +824,7 @@ g.closure(n.fun, dst);
                     return;
                 }
                 let b = g.temp();
-                g.load_const(value.number(n.b.num), b);
+                g.load_const(kv, b);
                 g.arith(n.op, dst, a, b);
                 g.reset(m);
                 return;
@@ -1221,6 +1249,35 @@ fn Gen.cond(g: *Gen, n: *Node, jump_if: bool, l: bc.Label) {
                 g.jump(l);
                 g.reset(m);
                 return;
+            }
+            // Against another number constant (`i <= 5000`, `x < N` with N
+            // a folded const): JLTK ... with the constant in the pool.
+            if ordered and (num_const(g, n.b).is_some() or num_const(g, n.a).is_some()) {
+                let pol: u8 = if jump_if { 1 } else { 0 };
+                var o = op;
+                var x = n.a;
+                var cv = V.Undef;
+                if let Some(v) = num_const(g, n.b) {
+                    cv = v;
+                } else {
+                    cv = num_const(g, n.a) ?? V.Undef;
+                    x = n.b;
+                    o = match op { Lt => T.Gt, Gt => T.Lt, Le => T.Ge, _ => T.Le };
+                }
+                let k = g.konst(cv);
+                if k < 256 {
+                    let a = g.any(x);
+                    let (r, kk) = (a as u8, k as u8);
+                    match o {
+                        Lt => g.emit(JS.JLTK(pol, r, kk)),
+                        Le => g.emit(JS.JLEK(pol, r, kk)),
+                        Gt => g.emit(JS.JGTK(pol, r, kk)),
+                        _ => g.emit(JS.JGEK(pol, r, kk)),
+                    };
+                    g.jump(l);
+                    g.reset(m);
+                    return;
+                }
             }
             if op == T.Lt or op == T.Gt or op == T.Le or op == T.Ge or op == T.EqEqEq or op == T.NotEqEq {
                 let a = g.any_before(n.a, n.b);
