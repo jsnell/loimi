@@ -617,3 +617,9 @@ Trealla's by geometric mean, against 0.83x and 0.20x for the build above
 in the same (loaded) run; tak 0.41x, queens_8 0.47x, sieve 0.90x, boyer
 1.05x of SWI-Prolog (`bench/prolog/README.md`). The other columns of this
 table were not rerun.
+
+*2026-11-04, later:* after a third round (FRICTION.md, "Optimizations,
+third round"; Prolog-only changes), 0.53x SWI-Prolog's time and 0.13x
+Trealla's, against 0.57x and 0.14x for the code before (with the
+sweep-free std.gc) in the same run: tak 0.21x, boyer 0.52x, sieve 0.92x
+of SWI-Prolog; ours is faster than SWI-Prolog on all 30.

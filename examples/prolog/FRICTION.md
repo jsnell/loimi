@@ -484,6 +484,85 @@ round); 0.76 of the time before by geometric mean, from 0.44 (queens_8),
 serialise). Ours now takes less time than SWI-Prolog on 29 of the 30
 (boyer 1.05x; sieve 0.90x). Table in bench/prolog/README.md.
 
+## Optimizations, third round (2026-11-04)
+
+Same method as the second round (sampler, `--disasm`, `LOIMI_GC_STATS`),
+on a machine loaded by other agents' builds (load 6-8 on 8 threads):
+wall-clock minima of 5-9 interleaved runs moved by up to ±10% between
+two columns of the same binary, CPU time (user+sys) by more, and running
+the builds concurrently did not help. Only changes well outside that
+noise, or seen directly in the profile, were kept.
+
+| Change | Effect (time, new/old) |
+|---|---|
+| A first clause whose first goal compares head arguments (or integers), when every other clause of the chain starts with a comparison of the same operands that excludes it (`X =< Y` / `X > Y`), runs as a guard chain: no choicepoint. Without it tak left a choicepoint per call, which kept every environment alive and trailed every binding (1.4 MB live, root scanning 10% of the time) | tak 0.57 |
+| arg/3, functor/3 and compare/3 whose output variable is new write its register (ARG_V, FUNCTOR_R, FUNCTOR_W, COMPARE_V): no variable object made to be bound at once, no `builtins.call`; compare/3 no longer interns its result atom by name | boyer 0.76 (arg/3), then 0.69 (functor/3): 0.52 together; flatten 0.87, unify 0.95 |
+| IDIV, MOD, REM divide as `u32` when both operands are non-negative and below 2^32 (64-bit `idiv` is several times slower on this Skylake) | MOD 21% to 14% of crypt's samples; crypt, query 0.95-0.97 |
+| A clause whose head is distinct variables runs its leading comparisons on the argument registers before ALLOCATE; when the exclusion above commits and the only other clause starts with the complement, failure jumps past it | tak 0.97 |
+| Minimum heap 2 MiB (was 1 MiB): without sweeping, a collection costs mostly its roots, and every collection marks the ~1000 code objects of the library and program again | 0.98 over the suite (4 MiB: poly_10 0.91, reducer 0.89, but nreverse 1.06) |
+
+Tried and dropped:
+
+- **Shallow backtracking** for first clauses whose head binds before a
+  neck cut (d/3 in the derive family, qsort's partition): SH_TRY saved
+  the argument registers and the trail height, raised the newest
+  choicepoint's stamp so that every binding of an older variable was
+  trailed, and NECK_CUT committed (restoring the stamp and dropping the
+  trail entries of new variables); `backtrack` undid the bindings and
+  went to the other clauses. Correct (the test clauses.pl covers it),
+  but no faster: derive 0.99, log10 1.09, ops8 1.02, times10 1.05. A
+  choicepoint here is 12 stores; the shallow form still does about 8,
+  plus a trail entry for the output argument and its removal at the
+  cut, and the same dispatches.
+- **An iterative evaluator** for left-nested expressions (eval's
+  `((1+1)+2)+...+1000`): the left spine on a stack, no recursion. eval
+  unchanged (46% of samples in the evaluator either way): each node is
+  a structure and a bound variable (`add/2` makes `Expr+N` with `Expr` a
+  variable bound by the next call), two dependent loads per node.
+- Var-var binding inline in `unify`'s argument loop, and SET_VOID /
+  UNIFY_VOID making several variables inline (zebra): no change.
+- The structural fix for variable objects (a variable as the cell of
+  the structure it is in, the WAM's representation) was not attempted:
+  a register would then hold a pointer into a structure, which std.gc
+  does not trace (no interior pointers), and every op reading a register
+  would have to handle it. The inline builtins above remove the
+  variables that were made only to be bound at once; the rest (output
+  arguments, nreverse's list tails, eval's `Expr`) need that fix.
+
+What remains (sampler, final build): clause selection (TRY,
+`backtrack`: 10-17% in the derive family, browse, mu, qsort), zebra
+`unify` 47% (structures against structures, mostly failing on an early
+argument), eval's evaluator 47% (pointer chasing), sendmore's `=\=` on
+permanent variables 34%, queens_8's `=\=` 14%, crypt's MOD/IDIV 27%
+(division by constant 10 could multiply by a reciprocal, if an op knew
+its divisor at verification time), the collector 2-10% (poly_10,
+browse, reducer).
+
+Friction: (a) `-W handler_frame` caught the 32-bit division at once
+(the division-by-zero panic of `x / y` is not proved dead by a guard in
+the caller; an explicit `yy != 0` test next to the division fixed it).
+(b) `inline_builtin`'s new-variable outputs needed the clause compiler's
+variable state (`seen`, `perm`, a temporary for a permanent variable):
+three small helpers (`is_new`, `dest_begin`, `dest_end`) made them one
+pattern for arg/3, functor/3 and compare/3. (c) Measuring was the hard
+part: no performance counters (`perf_event_paranoid` 3, no valgrind),
+and a loaded machine.
+
+Checks: `check.sh` (120 runs: the new test `clauses.pl` covers the
+exclusion commit, the early comparisons, arg/3, functor/3, compare/3
+and division against SWI-Prolog's output), `cargo test --release`, and
+an ASan build running the 12 tests (normally and under GC stress) and
+eleven benchmarks.
+
+Result: **0.53x SWI-Prolog's time, 0.13x Trealla's** by geometric mean
+over the 30, against 0.57x and 0.14x for the code before (commit
+a739a25, with the sweep-free std.gc) in the same run; 0.92 of the time
+before by geometric mean: tak 0.55, boyer 0.53, simple_analyzer 0.81,
+flatten 0.82, reducer 0.86, unify 0.87, the rest 0.94-1.01 (no change
+beyond noise). Ours now takes less time than SWI-Prolog on all 30
+(boyer 0.52x, sieve 0.92x, reducer 0.76x). Table in
+bench/prolog/README.md.
+
 ## Benchmarks (first round)
 
 `bench/prolog/run.py -n 3`: wall-clock seconds, best of three
