@@ -315,6 +315,91 @@ the shape (an absent-name proof per shape) and the class epoch; and
 attribute reads of `self` in methods could skip the tag test when the
 compiler knows the register holds the receiver.
 
+## Optimizations, third round: calls, generator expressions, slices (2026-11-04)
+
+Same method as the second round: the timer sampler (now also with a
+variant that scans the stack for return addresses to name callers),
+`PYLOIMI_COUNTS=1` slow-path counters, and A/B decisions on CPU time
+(user + sys) of interleaved runs, best of 5-9 (host load 2-3; identical
+builds moved by about ±1.5%). Interpreter changes only (compile.lm,
+parser.lm and the runtime); no compiler or std change.
+
+`bench/python/compare.py -n 5`, tail-call builds with
+`--align-functions=64`, before (b9e179a) and after (1b6c661)
+interleaved with CPython 3.13.18, wall clock, best of 5 (load average
+1.8-3.3):
+
+| benchmark | before (s) | after (s) | CPython (s) | before/CPython | after/CPython | after/before |
+|---|---:|---:|---:|---:|---:|---:|
+| chaos | 0.256 | 0.242 | 0.682 | 0.38 | 0.35 | 0.95 |
+| deltablue | 0.362 | 0.340 | 0.934 | 0.39 | 0.36 | 0.94 |
+| fannkuch | 0.327 | 0.264 | 0.878 | 0.37 | 0.30 | 0.81 |
+| float | 0.224 | 0.202 | 0.826 | 0.27 | 0.24 | 0.90 |
+| go | 0.311 | 0.276 | 0.766 | 0.41 | 0.36 | 0.89 |
+| hexiom | 0.372 | 0.290 | 0.659 | 0.56 | 0.44 | 0.78 |
+| nbody | 0.351 | 0.352 | 0.926 | 0.38 | 0.38 | 1.00 |
+| nqueens | 0.517 | 0.318 | 0.764 | 0.68 | 0.42 | 0.62 |
+| raytrace | 0.326 | 0.294 | 0.855 | 0.38 | 0.34 | 0.90 |
+| richards | 0.173 | 0.175 | 0.797 | 0.22 | 0.22 | 1.01 |
+| spectral_norm | 0.197 | 0.195 | 0.676 | 0.29 | 0.29 | 0.99 |
+| **geomean** | | | | **0.38** | **0.33** | **0.88** |
+
+MicroPython 1.29.0 in the same run: 0.13 → 0.11 (the eight programs
+whose output matches).
+
+Per change (CPU time, that step's build over the one before it):
+
+| change | why (profile, counters) | effect |
+|---|---|---|
+| A call of a user class whose `__init__` takes the arguments as given allocates and pushes `__init__`'s frame from CALL's cold block, the result slot being the self slot (so RET stays on its fast path, no `F_DISCARD`); calls that leave out defaulted trailing parameters fill them in and push the frame (CALL, CALLMETHOD, `call_slow`); `bind_args` binds up to 8 arguments with keywords to plain positional parameters without copying them aside (a `mem.Vec` per call) | float, raytrace, chaos: 1M instance creations through `call_slow`'s loop; go: 755k calls of `find(self, update=False)` through `bind_args` | float 0.97, raytrace 0.96, go 0.96, chaos 0.97 |
+| `tuple`/`list`/`set`/`sum`/`min`/`max`/`sorted` of a generator expression (the only argument, no lambda or generator expression inside): the comprehension runs inline into a list (a set for `set`) while GETGLOBAL finds the builtin (an `IS` against it), else the generator is made as written. `--cfg debug` builds keep the generator (the debugger steps into its frame, as pdb does) | nqueens: per permutation `tuple(..)` and two `set(..)` of generator expressions, each a generator, `bind_args` (generator functions are not "simple"), the prelude call and a resume/YIELD per item (1.6M constructs, 662k `bind_args`) | nqueens 0.66, hexiom 0.79 |
+| `super(C, self).m(..)` and `super().m(..)` compile to SUPERMETHOD, which leaves the method and self as LOADMETHOD does, without the super object; cached per class id and class epoch (the lookup does not depend on self's class). The two-argument form runs it while `super` is the builtin (`IS` against it) | deltablue: 332k LOADMETHOD slow paths on super objects, 154k super constructions | deltablue 0.94 |
+| Builtin types (and subclasses of them: deltablue's `OrderedCollection(list)`) are constructed from CALL's cold block, and `object.__init__(self)` (`super(..).__init__()` in a class without other bases) is a no-op in CALLMETHOD's | deltablue: 543k `call_slow` class paths; chaos: `int(..)`, `range(..)` | float 0.95, chaos 0.96, deltablue 0.98 |
+| List slices with int or None bounds and steps of 1 and -1 compute their bounds inline and copy with raw stores and one barrier; `list_grow` copies the same way | fannkuch: `getslice` + `setslice` + `slice_indices` + `new_list` 46% (a barrier test and a bounds check per item; `slice_indices` returned a 4-tuple through memory) | fannkuch 0.76, nqueens 0.94 |
+| Per-class flags (refreshed with the cached `__init__` at each class epoch) for `__hash__` and `__bool__`/`__len__`; interned names for `__call__`, `__iter__`, `__getitem__` in the runtime (they interned the name, a string hash and map probe, per use); SETGLOBAL keeps the entry number as GETGLOBAL_C does | go: `vm.intern` from `truthy` on instances (71k), `put_by` from SETGLOBAL (`TIMESTAMP`, `MOVES`) | go 0.96 |
+| `&`, `|`, `^` of ints that fit an i64 (medium `Long`s) in the handlers' cold blocks | go: 805k `ops.arith` calls for its 63-bit Zobrist hashes | go 0.98 |
+| CALL is a family: CALL_NEW (class instantiation, the first change's path) and CALL_M1 (one-argument `math` functions imported as names) run without entering the generic op's cold block (a 0x90-byte frame and the checks before them) | float, raytrace: `CALL.cold` 5-8% after the first change | raytrace 0.95, float 0.97 then 0.96 |
+| SETATTR's add path checks the shape instead of the site: the shape reached by adding a name records the class epoch at which the class had no attribute of that name (shape trees are per class), so the cache holds only the slot of existing attributes (one word instead of three) | deltablue: `Constraint.__init__` adds `strength` at slot 0 or 3 (`ScaleConstraint` sets three attributes first): 57k SETATTR slow paths | slow paths 57k → 2.6k; time within noise (kept: smaller cache, simpler check) |
+
+Also fixed on the way: `True & False` (and `|`, `^` of two bools) gave
+an int; CPython gives a bool.
+
+Checked and not changed:
+
+- *Register clearing on calls* (what MiniJS and Scheme gained from
+  today): Python's calls never cleared the callee's registers; the stack
+  is scanned up to a high-water mark (`Ctx.hw`) since the first version.
+- *SETATTR's stack frame* (item 6): `std.gc`'s barrier no longer calls
+  `remember` (the slow path is inline), and SETATTR's remaining
+  `push %rbp` is register pressure in the add path, not a call.
+- *Class attributes read through instances* (`self.CONST`): GETATTR's
+  slow path runs 30k times in raytrace and fewer elsewhere; not worth a
+  cache.
+
+Dropped, measured:
+
+- *`x in list` with an int: a loop over ints that compares bits only*
+  (no `surely_unequal`/`eq_builtin` per item): hexiom 0.998, go 1.018.
+  `contains_fast` is 8% of hexiom, spread over many short lists.
+- *CALLMETHODKW binding keywords in the handler* (`bind_kw_fast`, then
+  `push_frame`, skipping `call_slow`): go 0.999 after `bind_args` had
+  its own keyword fast path.
+
+Where the time goes now: GETATTR hits (deltablue 26%, go 13%) and
+method calls (LOADMETHOD_CALLMETHOD 18% of deltablue: about 70
+instructions on a hit, with the new frame's eight stores); libm (`pow` 14%
+of nbody, `sin`/`cos` 15% of float); nqueens: set building (`put_by`,
+`hash_key` 12%), slicing, the `pool` cell the generator expression's
+fallback still captures (LOADCELL 3%); hexiom: `x in list` and
+`__getitem__` through `call2`.
+
+Next candidates: frames with fewer stores (`k` and `proto` follow from
+the function, `gen` matters only with `F_GEN`); operator dunders on
+instances (`Vector - Vector`: SUB's cold block, 3% of raytrace) as
+family members like CALL_NEW; generators that resume without copying
+their registers when the window is where they left it; set/dict
+building from comprehensions sized up front.
+
 ## Friction, by impact
 
 ### 1. Compiler bug: two structs with the same name in different modules collide in generic instances

@@ -629,6 +629,17 @@ Times in seconds.
 
 Times in seconds.
 
+**Update 2026-11-04 (1b6c661, tailcall only).** After a third round of
+interpreter work (class instantiation and default arguments without the
+generic call path, generator expressions consumed by builtins run
+inline, `super(..).m(..)` as one op, list slices with raw copies;
+[examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-third-round-calls-generator-expressions-slices-2026-11-04)),
+`compare.py -n 5` against b9e179a in one interleaved run: ours/before
+0.88 (nqueens 0.62, hexiom 0.78, fannkuch 0.81; nbody, richards,
+spectral_norm unchanged); CPython 0.38 → 0.33, MicroPython 0.13 → 0.11
+(host load 2-3, so the absolute times are lower than above). goto and
+switch builds were not rerun.
+
 ### prolog
 
 | benchmark | tailcall | goto | switch | jit | swipl | trealla | tailcall/swipl | tailcall/trealla | jit/swipl | jit/trealla |

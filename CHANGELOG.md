@@ -430,6 +430,15 @@ implementation; `git log` has the details.
   deltablue 0.71, raytrace 0.75 of the time before; float's peak RSS
   105 → 36 MB
   ([FRICTION.md](examples/python/FRICTION.md#instance-layout-inline-slots-behind-shapes-2026-11-04)).
+- The Python subset takes 0.33 of CPython 3.13's time by geometric
+  mean (was 0.38 in the same run; 0.88 of its previous time): class
+  instantiation and default/keyword arguments without `call_slow`'s
+  loop (CALL_NEW, CALL_M1 family members), `tuple`/`set`/`sum`.. of a
+  generator expression run inline while the name is the builtin,
+  `super(..).m(..)` as one cached op, list slices with raw copies,
+  per-class `__hash__`/`__bool__` flags; nqueens 0.62, hexiom 0.78,
+  fannkuch 0.81; interpreter changes only
+  ([FRICTION.md](examples/python/FRICTION.md#optimizations-third-round-calls-generator-expressions-slices-2026-11-04)).
 - MiniJS takes 0.48 of node --jitless's time and 0.37 of QuickJS's
   (0.939 of the time before): Int overflow and string concatenation
   without cold calls, a DIV family, compare-and-branch with pool
