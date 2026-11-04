@@ -245,10 +245,11 @@ pub vm Py {
     /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
     cache SetIC { idx: u32, cls: u32, epoch: u32 }
     /// Two classes (deltablue's call sites see several).
-    /// Instances: two entries (class id, the method's bits) valid at class
-    /// epoch `epoch` (see ops.method_value); modules and classes (epoch
-    /// 0xfffffffe) and builtin types (0xffffffff) use `idx`.
-    cache MethIC { cls: u32, epoch: u32, idx: u32, fnv: u64, cls2: u32, fnv2: u64 }
+    /// Instances: four entries (class id, the method's bits), most recent
+    /// first, valid at class epoch `epoch` (see ops.method_value); modules
+    /// and classes (epoch 0xfffffffe) and builtin types (0xffffffff) use
+    /// `idx`.
+    cache MethIC { cls: u32, epoch: u32, idx: u32, fnv: u64, cls2: u32, fnv2: u64, cls3: u32, fnv3: u64, cls4: u32, fnv4: u64 }
 
     sync { ctx.fp = fp; #[cfg(debug)] fp.at = pc; } // --cfg debug: where a frame calling a native is (backtraces)
     reload { fp = ctx.fp; regs = fp.base; k = fp.k; #[cfg(debug)] if debugger.stepping() { use_variant step; } } // --cfg debug: the native ran Python code that steps
@@ -657,6 +658,16 @@ pub vm Py {
                     regs[base.raw + 1] = o;
                     next
                 }
+                if cls.id == cache.cls3 {
+                    regs[base.raw] = ops.method_value(cache.fnv3);
+                    regs[base.raw + 1] = o;
+                    next
+                }
+                if cls.id == cache.cls4 {
+                    regs[base.raw] = ops.method_value(cache.fnv4);
+                    regs[base.raw + 1] = o;
+                    next
+                }
             }
         } else if let Obj(b) = o and cache.epoch == 0xfffffffe and let Some(d) = b.dict {
             // A function in a module's or class's own dict, called without self.
@@ -679,7 +690,7 @@ pub vm Py {
         }
         cold {
             let Str(s) = name else { trap() };
-            // Keep the previous class as the second entry.
+            // The previous entries move down one.
             let (pc_, pe, pf) = (cache.cls, cache.epoch, cache.fnv);
             var m = Value.Nil;
             var selfv = o;
@@ -696,10 +707,16 @@ pub vm Py {
             }
             cache.fnv = f;
             if pe == cache.epoch and pe != 0xffffffff and pe != 0xfffffffe and pc_ != cache.cls and pc_ != 0 {
+                cache.cls4 = cache.cls3;
+                cache.fnv4 = cache.fnv3;
+                cache.cls3 = cache.cls2;
+                cache.fnv3 = cache.fnv2;
                 cache.cls2 = pc_;
                 cache.fnv2 = pf;
             } else if pe != cache.epoch {
                 cache.cls2 = 0;
+                cache.cls3 = 0;
+                cache.cls4 = 0;
             }
             regs[base.raw] = m;
             regs[base.raw + 1] = selfv;
