@@ -94,9 +94,9 @@ pub const T_NOTIMPL: u64 = 23;
 
 /// An entry of the global method cache (`Ctx.mcache`, ops.loadmethod's
 /// miss path): name `name` (an interned string's address) looked up on
-/// class `cls` at class epoch `epoch` is entry `idx` of the dict of the
-/// class `depth` steps up the chain (a function).
-pub struct MCEnt { cls: u32, epoch: u32, name: u64, idx: u32, depth: u32 }
+/// class `cls` at class epoch `epoch` is the function with bits `fnv`
+/// (ops.method_value).
+pub struct MCEnt { cls: u32, epoch: u32, name: u64, fnv: u64 }
 pub const MC_SIZE: u64 = 1024;
 
 pub struct Ctx {
@@ -148,6 +148,11 @@ pub struct Ctx {
     pre_via2: Value,
     /// Interned dunder names (ops.DN_*).
     dn: [Value; 40],
+    /// Empty instance shapes by slot count, for builtin classes (user
+    /// classes have their own), and the shape of dict-mode instances
+    /// (ops.new_inst, value.Inst).
+    shape_roots: [?Gc<Box>; 65],
+    shape_dict: ?Gc<Box>,
 }
 
 /// Interned string for a name (kept alive for the run).
@@ -189,6 +194,8 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.pre_via1);
     gc_mark(h, c.pre_via2);
     for i in 0..40 { gc_mark(h, c.dn[i]); }
+    for i in 0..65 { gc_mark(h, c.shape_roots[i]); }
+    gc_mark(h, c.shape_dict);
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
@@ -239,7 +246,11 @@ pub vm Py {
     /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
     cache SetIC { idx: u32, cls: u32, epoch: u32 }
     /// Two classes (deltablue's call sites see several).
-    cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32, cls2: u32, idx2: u32, depth2: u32 }
+    /// Instances: four entries (class id, the method's bits), most recent
+    /// first, valid at class epoch `epoch` (see ops.method_value); modules
+    /// and classes (epoch 0xfffffffe) and builtin types (0xffffffff) use
+    /// `idx`.
+    cache MethIC { cls: u32, epoch: u32, idx: u32, fnv: u64, cls2: u32, fnv2: u64, cls3: u32, fnv3: u64, cls4: u32, fnv4: u64 }
 
     sync { ctx.fp = fp; #[cfg(debug)] fp.at = pc; } // --cfg debug: where a frame calling a native is (backtraces)
     reload { fp = ctx.fp; regs = fp.base; k = fp.k; #[cfg(debug)] if debugger.stepping() { use_variant step; } } // --cfg debug: the native ran Python code that steps
@@ -557,16 +568,18 @@ pub vm Py {
 
     op GETATTR(dst: reg, obj: reg, name: kst) : ABC + AttrIC {
         if let Inst(o) = obj {
-            let d = o.dict;
+            // Attribute i is `name` if the shape's name i is (interned: one
+            // compare); it is in slot i if i is below the shape's inline
+            // count `s` (the others: value.inst_at, in the cold block).
+            let sh = o.keys;
+            let ni = sh.s as u64;
             let i = cache.idx as u64;
-            if likely(i < d.used) {
-                let e = d.ents.e.ptr + i;
-                if e.key == name { dst = e.value; next }
+            if likely(i < ni) {
+                if *(sh.extra.ptr + i) == name { dst = *(o.slots.ptr + i); next }
             }
             let j = cache.idx2 as u64;
-            if j < d.used {
-                let e = d.ents.e.ptr + j;
-                if e.key == name { dst = e.value; next }
+            if j < ni {
+                if *(sh.extra.ptr + j) == name { dst = *(o.slots.ptr + j); next }
             }
         } else if let Obj(b) = obj and (b.kind == K_CLASS or b.kind == K_MODULE) and let Some(d) = b.dict {
             // A plain attribute of the class (or module) itself; ops.getattr
@@ -578,6 +591,7 @@ pub vm Py {
             }
         }
         cold {
+            if let Inst(o) = obj and let Some(v) = ops.inst_cached(o, name, cache.idx) { dst = v; next }
             let Str(s) = name else { trap() };
             let old = cache.idx;
             dst = ops.getattr(ctx, obj, s, &cache.idx)?;
@@ -587,21 +601,31 @@ pub vm Py {
     }
     op SETATTR(obj: reg, name: kst, src: reg) : ABC + SetIC {
         if let Inst(o) = obj {
-            let d = o.dict;
+            let sh = o.keys;
+            let n = sh.extra.len;
             let i = cache.idx as u64;
-            if likely(i < d.used) {
-                let e = d.ents.e.ptr + i;
-                if e.key == name {
-                    e.value = src;
-                    gc.write_barrier(&ctx.heap, d.ents as *u8);
+            if likely(i < sh.s as u64) {
+                if *(sh.extra.ptr + i) == name {
+                    *(o.slots.ptr + i) = src;
+                    gc.write_barrier(&ctx.heap, o as *u8);
                     next
                 }
-            } else if i == d.used and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
-                let Str(s) = name else { trap() };
-                if value.attr_append_new(d, s, src) { next }
+            } else if i == n and i < o.slots.len and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
+                // Adding attribute i: the shape's last transition, if it
+                // was for `name` (the dict-mode shape has none).
+                if let Obj(t) = sh.c and *(t.extra.ptr + i) == name {
+                    *(o.slots.ptr + i) = src;
+                    o.keys = t;
+                    gc.write_barrier(&ctx.heap, o as *u8);
+                    next
+                }
             }
         }
         cold {
+            if let Inst(o) = obj and ops.inst_cached(o, name, cache.idx).is_some() {
+                value.inst_set_at(o, cache.idx as u64, src);
+                next
+            }
             gc_point();
             let Str(s) = name else { trap() };
             ops.setattr(ctx, obj, s, src, &cache.idx, &cache.cls, &cache.epoch)?;
@@ -619,27 +643,25 @@ pub vm Py {
         if let Inst(i) = o {
             let cls = i.cls;
             if ctx.epoch == cache.epoch {
-                // Class chains and class dicts are never None on these paths
-                // (the cache was filled through them); `??` avoids a panic call.
                 if cls.id == cache.cls {
-                    var owner = cls;
-                    var d = cache.depth;
-                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-                    if let Some(od) = owner.dict {
-                        regs[base.raw] = (od.ents.e.ptr + (cache.idx as u64)).value;
-                        regs[base.raw + 1] = o;
-                        next
-                    }
+                    regs[base.raw] = ops.method_value(cache.fnv);
+                    regs[base.raw + 1] = o;
+                    next
                 }
                 if cls.id == cache.cls2 {
-                    var owner = cls;
-                    var d = cache.depth2;
-                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-                    if let Some(od) = owner.dict {
-                        regs[base.raw] = (od.ents.e.ptr + (cache.idx2 as u64)).value;
-                        regs[base.raw + 1] = o;
-                        next
-                    }
+                    regs[base.raw] = ops.method_value(cache.fnv2);
+                    regs[base.raw + 1] = o;
+                    next
+                }
+                if cls.id == cache.cls3 {
+                    regs[base.raw] = ops.method_value(cache.fnv3);
+                    regs[base.raw + 1] = o;
+                    next
+                }
+                if cls.id == cache.cls4 {
+                    regs[base.raw] = ops.method_value(cache.fnv4);
+                    regs[base.raw + 1] = o;
+                    next
                 }
             }
         } else if let Obj(b) = o and cache.epoch == 0xfffffffe and let Some(d) = b.dict {
@@ -663,26 +685,33 @@ pub vm Py {
         }
         cold {
             let Str(s) = name else { trap() };
-            // Keep the previous class as the second entry.
-            let (pc_, pe, pi, pd) = (cache.cls, cache.epoch, cache.idx, cache.depth);
+            // The previous entries move down one.
+            let (pc_, pe, pf) = (cache.cls, cache.epoch, cache.fnv);
             var m = Value.Nil;
             var selfv = o;
             // The global method cache first, without the call (sites that
             // see more classes than their two entries).
-            if let Inst(i) = o and let Some(v) = ops.mc_fill(ctx, i.cls, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth) {
+            var f = pf;
+            if let Inst(i) = o and let Some(v) = ops.mc_fill(ctx, i.cls, s, &cache.cls, &cache.epoch, &f) {
                 m = v;
             } else {
                 gc_point();
-                let (m2, s2) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+                let (m2, s2) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &f)?;
                 m = m2;
                 selfv = s2;
             }
+            cache.fnv = f;
             if pe == cache.epoch and pe != 0xffffffff and pe != 0xfffffffe and pc_ != cache.cls and pc_ != 0 {
+                cache.cls4 = cache.cls3;
+                cache.fnv4 = cache.fnv3;
+                cache.cls3 = cache.cls2;
+                cache.fnv3 = cache.fnv2;
                 cache.cls2 = pc_;
-                cache.idx2 = pi;
-                cache.depth2 = pd;
+                cache.fnv2 = pf;
             } else if pe != cache.epoch {
                 cache.cls2 = 0;
+                cache.cls3 = 0;
+                cache.cls4 = 0;
             }
             regs[base.raw] = m;
             regs[base.raw + 1] = selfv;
@@ -1307,10 +1336,10 @@ pub vm Py {
         next
     }
     /// R[dst] = class named R[base] with bases tuple R[base+1] and
-    /// namespace R[base+2].
-    op BUILDCLASS(dst: reg, base: reg) : ABC {
+    /// namespace R[base+2]; its methods set `hint` attributes on self.
+    op BUILDCLASS(dst: reg, base: reg, hint: imm) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
-        dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2])?;
+        dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2], hint as u64)?;
         next
     }
     op RAISE(e: reg) : ABC {

@@ -8,7 +8,7 @@ import value;
 import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box, Limbs,
               K_CLASS, K_BOUND, K_RANGE, K_RANGEIT, K_SEQIT, K_DICTIT, K_GEN, K_SUPER,
               K_PROPERTY, K_STATICM, K_CLASSM, K_SET, K_MODULE, K_SLICE, K_ENUMIT, K_ZIPIT, K_MAPIT,
-              K_FILTERIT, K_DICTVIEW, K_REVIT, K_NOTIMPL, K_FROZENSET,
+              K_FILTERIT, K_DICTVIEW, K_REVIT, K_NOTIMPL, K_FROZENSET, K_SHAPE,
               GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
 import big;
 import vm;
@@ -67,8 +67,12 @@ pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func>
     simple_method_lookup(c, cls, which, nargs)
 }
 
-/// Slots of a class box's `extra`: simple_method's cache, by dunder number.
+/// Slots of a class box's `extra`: simple_method's cache, by dunder number;
+/// a user class's `extra` has one more, CLASS_SHAPE.
 pub const CLASS_SLOTS: u64 = 33;
+/// The class's own empty instance shape (ops.new_inst): a root per class,
+/// so the shapes' last-transition caches see one class's instances.
+pub const CLASS_SHAPE: u64 = 33;
 
 fn simple_method_lookup(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
     let Str(name) = c.dn[which] else { return None; };
@@ -144,11 +148,10 @@ pub fn exc(c: *Ctx, kind: u64, msg: str) -> Value {
 }
 
 pub fn exc_of(c: *Ctx, cls: Gc<Box>, arg: Value) -> Value {
-    let d = value.new_attrs(&c.heap, 1);
-    let inst = new(&c.heap, Inst { cls: cls, dict: d });
+    let inst = new_inst(c, cls);
     let args = value.new_tuple(&c.heap, 1);
     args.items[0] = arg;
-    value.attr_set(&c.heap, d, vm.intern(c, "args"), Value.Tuple(args));
+    inst_put(c, inst, vm.intern(c, "args"), Value.Tuple(args));
     Value.Inst(inst)
 }
 
@@ -314,25 +317,138 @@ pub fn class_lookup(cls: Gc<Box>, name: Gc<Str>) -> ?Value {
     None
 }
 
-/// Like class_lookup, also giving the entry number and the depth of the
-/// class that has it.
-fn class_lookup_at(cls: Gc<Box>, name: Gc<Str>) -> ?(Value, u64, u32) {
-    var k: ?Gc<Box> = Some(cls);
-    var depth: u32 = 0;
-    while let Some(x) = k {
-        if let Some(d) = x.dict {
-            if let Some(e) = value.dict_find_str(d, name) { return Some((value.dict_val(d, e), e, depth)); }
-        }
-        k = x.base;
-        depth += 1;
+pub fn new_instance(c: *Ctx, cls: Gc<Box>) -> Value { Value.Inst(new_inst(c, cls)) }
+
+// ── instance layout (value.Inst) ────────────────────────────────────
+
+/// Most attributes an instance keeps in slots; more go to dict mode.
+pub const MAX_SLOTS: u64 = 64;
+/// Most transitions from one shape; more names make instances go to
+/// dict mode (bounds the shapes made by `setattr` with computed names).
+const MAX_CHILDREN: i64 = 64;
+
+/// How many slots new instances of `cls` get: bits 8..16 of `cls.s`, at
+/// first the attributes its methods and its bases' set on self (the
+/// compiler counts them: BUILDCLASS's `hint`), raised by `inst_set`
+/// whenever an instance of the class needs more.
+#[inline]
+fn class_cap(cls: Gc<Box>) -> u64 { ((cls.s >> 8) & 0xff) as u64 }
+
+fn set_class_cap(cls: Gc<Box>, n: u64) {
+    let m = if n > MAX_SLOTS { MAX_SLOTS } else { n };
+    if m > class_cap(cls) { cls.s = (cls.s & ~0xff00) | ((m as i64) << 8); }
+}
+
+pub fn new_inst(c: *Ctx, cls: Gc<Box>) -> Gc<Inst> {
+    var n = class_cap(cls);
+    if n == 0 { n = 1; }
+    // The empty shape for n slots: the class's, made again when its slot
+    // count grows (instances made before keep theirs); for builtin
+    // classes (exceptions) one per slot count.
+    let own = CLASS_SHAPE < cls.extra.len;
+    var root: ?Gc<Box> = if own { None } else { c.shape_roots[n] };
+    if own and let Obj(r) = cls.extra[CLASS_SHAPE] and r.b == Value.Int(n as i48) { root = Some(r); }
+    if root.is_none() {
+        let r = value.new_box(&c.heap, K_SHAPE, 0);
+        r.b = Value.Int(n as i48);
+        if own { cls.extra[CLASS_SHAPE] = Value.Obj(r); } else { c.shape_roots[n] = Some(r); }
+        root = Some(r);
     }
+    // Slots past the shape's names are never read: their zero fill
+    // (Float 0.0) is left as it is.
+    new(&c.heap, Inst { cls: cls, keys: root.unwrap() }, n)
+}
+
+/// Attribute `cache` of `o` if its name there is `name` (GETATTR's and
+/// SETATTR's cold blocks: attributes past the inline ones).
+#[inline]
+pub fn inst_cached(o: Gc<Inst>, name: Value, cache: u32) -> ?Value {
+    let i = cache as u64;
+    if i >= o.keys.extra.len or o.keys.extra[i] != name { return None; }
+    Some(value.inst_at(o, i))
+}
+
+/// The shape after adding `name` to shape `k` (made on first use), or
+/// None past MAX_SLOTS / MAX_CHILDREN.
+fn shape_child(c: *Ctx, k: Gc<Box>, name: Gc<Str>) -> ?Gc<Box> {
+    let n = k.extra.len;
+    if let Obj(t) = k.c and t.extra[n] == Value.Str(name) { return Some(t); }
+    if let Some(d) = k.dict and let Some(Obj(t)) = value.dict_get_str(d, name) {
+        k.c = Value.Obj(t);
+        return Some(t);
+    }
+    if n >= MAX_SLOTS or k.m >= MAX_CHILDREN { return None; }
+    // Names in shapes are interned, so the caches' pointer compares hit
+    // for names that came from setattr() too.
+    let nm = vm.intern(c, value.sv(name));
+    let t = value.new_box(&c.heap, K_SHAPE, n + 1);
+    for i in 0..n { t.extra[i] = k.extra[i]; }
+    t.extra[n] = Value.Str(nm);
+    t.base = Some(k);
+    t.b = k.b;
+    let Int(cap) = k.b else { trap() };
+    t.s = if (n as i64) + 1 <= (cap as i64) { (n as i64) + 1 } else { (cap as i64) - 1 };
+    if k.dict.is_none() { k.dict = Some(value.new_dict(&c.heap, 2)); }
+    value.dict_set_str(&c.heap, k.dict.unwrap(), nm, Value.Obj(t));
+    k.m += 1;
+    k.c = Value.Obj(t);
+    Some(t)
+}
+
+/// Move `o` to dict mode (if it is not already): its attributes, in
+/// order, go to a Dict in `slots[0]`.
+fn inst_to_dict(c: *Ctx, o: Gc<Inst>) -> Gc<Dict> {
+    if let Some(d) = value.inst_dictmode(o) { return d; }
+    builtins.count(builtins.CNT_DICTMODE);
+    let d = value.inst_attrs_dict(&c.heap, o);
+    o.keys = c.shape_dict.unwrap();
+    o.slots[0] = Value.Dict(d);
+    for i in 1..o.slots.len { o.slots[i] = Value.Undef; }
+    d
+}
+
+/// Set attribute `name` of `o` (no class checks): the slot it went to, or
+/// None in dict mode.
+fn inst_set(c: *Ctx, o: Gc<Inst>, name: Gc<Str>, v: Value) -> ?u64 {
+    if let Some(i) = value.inst_slot(o, name) { value.inst_set_at(o, i, v); return Some(i); }
+    if value.inst_dictmode(o).is_none() {
+        let n = o.keys.extra.len;
+        set_class_cap(o.cls, n + 1);
+        if let Some(t) = shape_child(c, o.keys, name) {
+            let cap = o.slots.len;
+            if n >= cap {
+                // Past the slots: the last slot's value and the rest go
+                // to a tuple there (value.inst_at), doubled as needed.
+                let j = n - (cap - 1);
+                if n == cap {
+                    let x = value.new_tuple(&c.heap, 4);
+                    for q in 0..4 { x.items[q] = Value.Undef; }
+                    x.items[0] = o.slots[cap - 1];
+                    o.slots[cap - 1] = Value.Tuple(x);
+                } else {
+                    let Tuple(x) = o.slots[cap - 1] else { trap() };
+                    if j >= x.items.len {
+                        let y = value.new_tuple(&c.heap, x.items.len * 2);
+                        for q in 0..y.items.len { y.items[q] = if q < x.items.len { x.items[q] } else { Value.Undef }; }
+                        o.slots[cap - 1] = Value.Tuple(y);
+                    }
+                }
+                let Tuple(x) = o.slots[cap - 1] else { trap() };
+                x.items[j] = v;
+            } else {
+                o.slots[n] = v;
+            }
+            o.keys = t;
+            return Some(n);
+        }
+    }
+    let d = inst_to_dict(c, o);
+    value.dict_set_str(&c.heap, d, name, v);
     None
 }
 
-pub fn new_instance(c: *Ctx, cls: Gc<Box>) -> Value {
-    let d = value.new_attrs(&c.heap, 4);
-    Value.Inst(new(&c.heap, Inst { cls: cls, dict: d }))
-}
+/// Set an attribute of an instance the runtime made (exceptions' `args`).
+pub fn inst_put(c: *Ctx, o: Gc<Inst>, name: Gc<Str>, v: Value) { inst_set(c, o, name, v); }
 
 fn bound(c: *Ctx, selfv: Value, f: Value) -> Value {
     let b = value.new_box(&c.heap, K_BOUND, 0);
@@ -382,15 +498,15 @@ fn bind_attr(c: *Ctx, selfv: Value, v: Value) -> Result<Value, Value> uses reent
     }
 }
 
-/// Instance attribute `name` (filling the GETATTR cache with its entry),
-/// from the AttrDict or, once `__dict__` was taken, the Dict.
+/// Instance attribute `name` (filling the GETATTR cache with its slot),
+/// from its slots or, in dict mode, the Dict.
 #[inline]
 fn inst_get(o: Gc<Inst>, name: Gc<Str>, ic: *u32) -> ?Value {
-    if let Some(e) = value.attr_find(o.dict, name) {
-        *ic = e as u32;
-        return Some(o.dict.value(e));
+    if let Some(i) = value.inst_slot(o, name) {
+        *ic = i as u32;
+        return Some(value.inst_at(o, i));
     }
-    if let Some(d) = value.attrs_full(o.dict) { return value.dict_get_str(d, name); }
+    if let Some(d) = value.inst_dictmode(o) { return value.dict_get_str(d, name); }
     None
 }
 
@@ -398,10 +514,10 @@ fn inst_get(o: Gc<Inst>, name: Gc<Str>, ic: *u32) -> ?Value {
 /// it bypass setattr, so the class's method caches go off (as when an
 /// instance attribute hides a class attribute).
 pub fn inst_dict(c: *Ctx, o: Gc<Inst>) -> Gc<Dict> {
-    if let Some(d) = value.attrs_full(o.dict) { return d; }
+    if let Some(d) = value.inst_dictmode(o) { return d; }
     o.cls.m = 1;
     c.epoch +%= 1;
-    value.attrs_view(&c.heap, o)
+    inst_to_dict(c, o)
 }
 
 pub fn getattr(c: *Ctx, obj: Value, name: Gc<Str>, ic: *u32) -> Result<Value, Value> uses reenter {
@@ -530,7 +646,7 @@ fn class_refresh(c: *Ctx, cls: Gc<Box>) {
     cls.c = class_lookup(cls, c.n_init.unwrap()) ?? Value.Undef;
     let eq = class_lookup(cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(cls, dn(c, DN_CMP + C_NE as u64)).is_some();
     cls.s = (cls.s & ~4) | (if eq { 4 } else { 0 });
-    for i in 0..cls.extra.len { cls.extra[i] = Value.Undef; }
+    for i in 0..CLASS_SLOTS { if i < cls.extra.len { cls.extra[i] = Value.Undef; } }
     cls.b = Value.Int(c.epoch as i48);
 }
 
@@ -545,16 +661,15 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
                 vm.invoke(c, b.b, args[..])?;
                 return Ok(());
             }
-            let d = o.dict;
-            if let Some(e) = value.attr_find(d, name) {
-                d.set_value(e, v);
-                *ic = e as u32;
+            if let Some(i) = value.inst_slot(o, name) {
+                value.inst_set_at(o, i, v);
+                *ic = i as u32;
                 return Ok(());
             }
             if name.data.eq("__dict__") {
                 let Dict(nd) = v else { return Err(exc(c, E_TYPE, "__dict__ must be set to a dictionary")); };
                 inst_dict(c, o);
-                value.attrs_replace(&c.heap, o, nd);
+                o.slots[0] = Value.Dict(nd);
                 return Ok(());
             }
             if cv.is_some() {
@@ -563,11 +678,11 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
                 o.cls.m = 1;
                 c.epoch +%= 1;
             }
-            value.attr_set(&c.heap, d, name, v);
-            if let Some(e) = value.attr_find(d, name) {
-                *ic = e as u32;
-                // Appending this name to dicts of this size is safe for
-                // instances of this class while no class changes.
+            if let Some(i) = inst_set(c, o, name, v) {
+                *ic = i as u32;
+                // Adding this name to instances of this class with `i`
+                // attributes (SETATTR's add path, through the shape's last
+                // transition) is safe while no class changes.
                 if cv.is_none() { *icls = o.cls.id; *iepoch = c.epoch; }
                 else { *icls = 0; }
             }
@@ -592,8 +707,10 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
 }
 
 pub fn delattr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<(), Value> {
-    if let Inst(o) = obj {
-        if value.attr_del(o.dict, name) { return Ok(()); }
+    if let Inst(o) = obj and (value.inst_slot(o, name).is_some() or value.inst_dictmode(o).is_some()) {
+        // Deleting keeps the order of the rest only in dict mode.
+        let d = inst_to_dict(c, o);
+        if value.dict_del(d, Value.Str(name), value.str_hash(name)) { return Ok(()); }
     }
     if let Obj(b) = obj and b.kind == K_CLASS and b.n == 0 {
         if value.dict_del(b.dict.unwrap(), Value.Str(name), value.str_hash(name)) { c.epoch +%= 1; return Ok(()); }
@@ -603,24 +720,23 @@ pub fn delattr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<(), Value> {
 
 /// For LOADMETHOD: (callable, self or Undef), filling the cache when the
 /// lookup can be repeated without the instance dict.
-pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32)
+pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cfn: *u64)
     -> Result<(Value, Value), Value> uses reenter {
     builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
             let cls = o.cls;
             let me = c.mcache + mc_slot(cls.id, name);
-            if let Some(v) = mc_fill(c, cls, name, ccls, cepoch, cidx, cdepth) { return Ok((v, obj)); }
+            if let Some(v) = mc_fill(c, cls, name, ccls, cepoch, cfn) { return Ok((v, obj)); }
             var ic0: u32 = 0;
             if inst_get(o, name, &ic0).is_none() {
-                if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
+                if let Some(v) = class_lookup(o.cls, name) {
                     if let Func(_) = v {
                         if o.cls.m == 0 {
                             *ccls = o.cls.id;
                             *cepoch = c.epoch;
-                            *cidx = e as u32;
-                            *cdepth = depth;
-                            *me = vm.MCEnt { cls: cls.id, epoch: c.epoch, name: name as u64, idx: e as u32, depth: depth };
+                            *cfn = v as u64;
+                            *me = vm.MCEnt { cls: cls.id, epoch: c.epoch, name: name as u64, fnv: v as u64 };
                         }
                         return Ok((v, obj));
                     }
@@ -670,22 +786,23 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
 /// (what the call site's own cache would hold, for sites that see more
 /// classes than it has entries); None on a miss.
 /// On a hit it also fills the LOADMETHOD cache words as ops.loadmethod would.
-pub fn mc_fill(c: *Ctx, cls: Gc<Box>, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32) -> ?Value {
+pub fn mc_fill(c: *Ctx, cls: Gc<Box>, name: Gc<Str>, ccls: *u32, cepoch: *u32, cfn: *u64) -> ?Value {
     let me = c.mcache + mc_slot(cls.id, name);
     if cls.m != 0 or me.cls != cls.id or me.epoch != c.epoch or me.name != (name as u64) { return None; }
-    var owner = cls;
-    var d = me.depth;
-    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-    let Some(od) = owner.dict else { return None; };
-    if (me.idx as u64) >= od.used { return None; }
-    let e = od.ents.e.ptr + (me.idx as u64);
-    if e.key != Value.Str(name) { return None; }
     *ccls = cls.id;
     *cepoch = c.epoch;
-    *cidx = me.idx;
-    *cdepth = me.depth;
-    Some(e.value)
+    *cfn = me.fnv;
+    Some(method_value(me.fnv))
 }
+
+/// The method a LOADMETHOD cache entry (or MCEnt) holds as bits: a Func
+/// found on the instance's class (id `cls`) at class epoch `epoch`. Only
+/// read while both still match, so it is alive: the class is (one of its
+/// instances is being called on; class ids are never reused), and its
+/// chain's dicts, which hold the function, are unchanged (each change
+/// bumps the epoch).
+#[inline]
+pub fn method_value(bits: u64) -> Value { unsafe { bits as Value } }
 
 fn mc_slot(cls: u32, name: Gc<Str>) -> u64 {
     (((name as u64) >> 3) *% 0x9e3779b97f4a7c15 +% (cls as u64) *% 0x2545f4914f6cdd1d) >> 54
@@ -978,7 +1095,7 @@ pub fn make_func(c: *Ctx, creator: Value, p: *Proto, regs: *Value, dst: u64) -> 
                                       globals: cf.globals, owner: None })))
 }
 
-pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Value, Value> {
+pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> Result<Value, Value> {
     let Dict(d) = ns else { trap() };
     var base: Gc<Box> = c.types[vm.T_OBJECT].unwrap();
     if let Tuple(t) = bases {
@@ -989,13 +1106,14 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
             base = b;
         }
     }
-    let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS);
+    let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS + 1);
     cls.a = name;
     cls.dict = Some(d);
     cls.base = Some(base);
     cls.id = c.next_cls;
     c.next_cls += 1;
     cls.s = base.s & 2;
+    set_class_cap(cls, class_cap(base) + hint);
     // A subclass of a builtin type (other than object) makes instances of
     // that type: `class C(list): pass` works, but methods C adds are not
     // seen by its instances (SPEC.md).
@@ -1197,7 +1315,7 @@ fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
 /// Sequence repetition `seq * n`.
 fn exc_of_empty_kind(c: *Ctx, kind: u64) -> Value {
     let e = exc_of(c, c.excs[kind].unwrap(), Value.Nil);
-    if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0))); }
+    if let Inst(i) = e { inst_put(c, i, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0))); }
     e
 }
 
@@ -1330,7 +1448,7 @@ fn float_pow(c: *Ctx, x: f64, y: f64) -> Result<Value, Value> {
             let t = value.new_tuple(&c.heap, 2);
             t.items[0] = Value.Int(34);
             t.items[1] = Value.Str(vm.intern(c, "Numerical result out of range"));
-            value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+            inst_put(c, i, vm.intern(c, "args"), Value.Tuple(t));
         }
         return Err(e);
     }

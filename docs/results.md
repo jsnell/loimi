@@ -570,6 +570,17 @@ nqueens 0.93 → 0.76, hexiom 0.74 → 0.60, float 0.52 → 0.40, fannkuch
 nbody and raytrace within 5%. Per-benchmark table and what changed:
 [examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-second-round-2026-11-04).
 
+**2026-11-04, after the instance layout change** (interpreter changes
+only; tail-call build only): instances keep their attributes in inline
+slots behind per-class shapes, and LOADMETHOD caches the method itself.
+`bench/python/compare.py -n 5`, before and after interleaved, load
+average 4.9-5.4: geomean against CPython 0.45 → **0.39** (after/before
+0.87): float 0.41 → 0.27, richards 0.33 → 0.22, deltablue 0.55 → 0.39,
+raytrace 0.54 → 0.40, chaos 0.47 → 0.40; the others within 5% (go and
+hexiom 5% slower in that wall-clock run, 0.88 and 0.94 of the time
+before in CPU time, best of 9). Peak RSS of float 105 → 36 MB.
+[examples/python/FRICTION.md](../examples/python/FRICTION.md#instance-layout-inline-slots-behind-shapes-2026-11-04).
+
 ### prolog
 
 | benchmark | tailcall | goto | switch | jit | swipl | trealla | tailcall/swipl | tailcall/trealla | jit/swipl | jit/trealla |
