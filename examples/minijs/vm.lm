@@ -1183,8 +1183,10 @@ pub vm JS {
         jump p.code
     }
 
-    /// A call whose window reaches the stack's high-water mark: check for
-    /// overflow, raise the mark, and run the op again.
+    /// CALL's window reaches the stack's high-water mark: check for
+    /// overflow, raise the mark, and run the op again. (Not for NEW, whose
+    /// collection check before allocating would run again: under GC stress
+    /// that collection lowers the mark every time.)
     fn grow_stack(end: *V) -> never {
         cold {
             if end >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
@@ -1336,7 +1338,10 @@ pub vm JS {
         let callee = regs + base + 1;
         let n = p.nregs as u64;
         // As in CALL.
-        if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
+        if callee + n + 1 >= ctx.hw {
+            if callee + n + 1 >= ctx.stack_end { cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") } }
+            ctx.hw = callee + n + 2;
+        }
         if fp + 1 >= ctx.frames_end {
             cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         }
