@@ -67,8 +67,12 @@ pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func>
     simple_method_lookup(c, cls, which, nargs)
 }
 
-/// Slots of a class box's `extra`: simple_method's cache, by dunder number.
+/// Slots of a class box's `extra`: simple_method's cache, by dunder number;
+/// a user class's `extra` has one more, CLASS_SHAPE.
 pub const CLASS_SLOTS: u64 = 33;
+/// The class's own empty instance shape (ops.new_inst): a root per class,
+/// so the shapes' last-transition caches see one class's instances.
+pub const CLASS_SHAPE: u64 = 33;
 
 fn simple_method_lookup(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
     let Str(name) = c.dn[which] else { return None; };
@@ -353,7 +357,9 @@ fn set_class_cap(cls: Gc<Box>, n: u64) {
 pub fn new_inst(c: *Ctx, cls: Gc<Box>) -> Gc<Inst> {
     var n = class_cap(cls);
     if n == 0 { n = 1; }
-    let o = new(&c.heap, Inst { cls: cls, keys: c.shape_root.unwrap() }, n);
+    var root = c.shape_root.unwrap();
+    if CLASS_SHAPE < cls.extra.len and let Obj(r) = cls.extra[CLASS_SHAPE] { root = r; }
+    let o = new(&c.heap, Inst { cls: cls, keys: root }, n);
     for i in 0..n { o.slots[i] = Value.Undef; }
     o
 }
@@ -633,7 +639,7 @@ fn class_refresh(c: *Ctx, cls: Gc<Box>) {
     cls.c = class_lookup(cls, c.n_init.unwrap()) ?? Value.Undef;
     let eq = class_lookup(cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(cls, dn(c, DN_CMP + C_NE as u64)).is_some();
     cls.s = (cls.s & ~4) | (if eq { 4 } else { 0 });
-    for i in 0..cls.extra.len { cls.extra[i] = Value.Undef; }
+    for i in 0..CLASS_SLOTS { if i < cls.extra.len { cls.extra[i] = Value.Undef; } }
     cls.b = Value.Int(c.epoch as i48);
 }
 
@@ -1093,7 +1099,8 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> 
             base = b;
         }
     }
-    let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS);
+    let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS + 1);
+    cls.extra[CLASS_SHAPE] = Value.Obj(value.new_box(&c.heap, K_SHAPE, 0));
     cls.a = name;
     cls.dict = Some(d);
     cls.base = Some(base);
