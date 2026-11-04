@@ -212,6 +212,24 @@ pub fn Machine.mk1(m: *Machine, name: u32, a: Term) -> Term {
     Term.Str(s)
 }
 
+/// One argument pair of `unify`: the common cases (identical terms, a
+/// variable against a non-variable) without a call.
+#[inline]
+fn unify_arg(m: *Machine, a0: Term, b0: Term) -> bool {
+    if a0 == b0 { return true; }
+    let a = deref(a0);
+    let b = deref(b0);
+    if a == b { return true; }
+    match (a, b) {
+        (Ref(_), Ref(_)) => unify(m, a, b),
+        (Ref(va), _) => { m.bind(va, b); true }
+        (_, Ref(vb)) => { m.bind(vb, a); true }
+        (Atom(_), Atom(_)) => false,
+        (Int(_), Int(_)) => false,
+        _ => unify(m, a, b),
+    }
+}
+
 /// Unify two terms, binding (and trailing) variables. Recursion follows the
 /// arguments except the last, which is a loop, so long lists do not recurse.
 pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
@@ -227,7 +245,7 @@ pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
             (Ref(va), _) => { m.bind(va, b); return true; }
             (_, Ref(vb)) => { m.bind(vb, a); return true; }
             (Lst(x), Lst(y)) => {
-                if !unify(m, x.head, y.head) { return false; }
+                if !unify_arg(m, x.head, y.head) { return false; }
                 a = deref(x.tail);
                 b = deref(y.tail);
             }
@@ -236,7 +254,7 @@ pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
                 if x.f != y.f { return false; }
                 let n = x.args.len;
                 for i in 0..n - 1 {
-                    if !unify(m, x.args[i], y.args[i]) { return false; }
+                    if !unify_arg(m, x.args.ptr[i], y.args.ptr[i]) { return false; }
                 }
                 a = deref(x.args[n - 1]);
                 b = deref(y.args[n - 1]);
