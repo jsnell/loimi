@@ -458,6 +458,11 @@ clause's verified code: `resume_at(word)` gives that resume point when
 the word is an instruction boundary of the optimized code, which made
 this safe to build without trusting the word index.
 
+Checks: `check.sh` (110 runs: three dispatch modes, GC stress and
+verify, `--gc-check-roots`), `cargo test --release`, and an ASan build
+running the 11 tests (normally and under GC stress) and eight
+benchmarks with two iterations each: all pass.
+
 Compiler and std changes, and their effect elsewhere: the verifier
 change touches every vm's generated `Vm__verify` (now a wrapper around
 `Vm__verify_in` with a 256-byte stack bitmap or a calloc'd one), which
