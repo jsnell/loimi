@@ -131,6 +131,17 @@ fn int_div(x: i32, y: i32) -> V {
     V.Num(r)
 }
 
+/// ToInt32 of a number without a call: (value, true) for Ints and for
+/// doubles below 2^63 in magnitude (NaN gives 0, as ToInt32 does).
+#[inline(always)]
+fn i32_of(v: V) -> (i32, bool) {
+    match v {
+        Int(i) => (i, true),
+        Num(x) => if x > -9.2e18 and x < 9.2e18 or x != x { ((x as i64) as i32, true) } else { (0, false) },
+        _ => (0, false),
+    }
+}
+
 /// Bitwise ops: 0 and, 1 or, 2 xor, 3 shl, 4 shr, 5 ushr.
 #[inline(always)]
 fn bitop(op: i64, a: V, b: V) -> V {
@@ -874,8 +885,11 @@ pub vm JS {
                 if r != 0 or xi > 0 { dst = Int(r as i32); next }
             }
         }
-        if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
-        cold { dst = arith(ctx, 4, a, b)?; next }
+        cold {
+            if let (Num(x), Num(y)) = (a, b) { dst = Num(value.js_mod(x, y)); next }
+            dst = arith(ctx, 4, a, b)?;
+            next
+        }
     }
     }
     op POW(dst: reg, a: reg, b: reg) : ABC {
@@ -921,8 +935,20 @@ pub vm JS {
                 if code == 4 { dst = Int(x >> (y & 31)); next }
                 if x >= 0 { dst = Int(((x as u32) >> ((y & 31) as u32)) as i32); next }
             }
-            dst = bitop(code, a, b);
-            next
+            let (x, okx) = i32_of(a);
+            let (y, oky) = i32_of(b);
+            if okx and oky {
+                if code == 0 { dst = Int(x & y); next }
+                if code == 1 { dst = Int(x | y); next }
+                if code == 2 { dst = Int(x ^ y); next }
+                if code == 3 { dst = Int(((x as u32) << ((y & 31) as u32)) as i32); next }
+                if code == 4 { dst = Int(x >> (y & 31)); next }
+                let u = (x as u32) >> ((y & 31) as u32);
+                if u <= 2147483647 { dst = Int(u as i32); next }
+                dst = Num(u as f64);
+                next
+            }
+            cold { dst = bitop(code, a, b); next }
         }
     }
 
@@ -933,8 +959,14 @@ pub vm JS {
             dst = Bool(true);
             next
         }
-        dst = Bool(eq_slow(a, b));
-        next
+        if let (Int(_), Int(_)) = (a, b) { dst = Bool(false); next }
+        match (a, b) {
+            (Num(x), Num(y)) => { dst = Bool(x == y); next }
+            (Int(x), Num(y)) => { dst = Bool(x as f64 == y); next }
+            (Num(x), Int(y)) => { dst = Bool(x == y as f64); next }
+            _ => {}
+        }
+        cold { dst = Bool(eq_slow(a, b)); next }
     }
     op NE(dst: reg, a: reg, b: reg) : ABC {
         if a == b {
@@ -942,8 +974,14 @@ pub vm JS {
             dst = Bool(false);
             next
         }
-        dst = Bool(!eq_slow(a, b));
-        next
+        if let (Int(_), Int(_)) = (a, b) { dst = Bool(true); next }
+        match (a, b) {
+            (Num(x), Num(y)) => { dst = Bool(x != y); next }
+            (Int(x), Num(y)) => { dst = Bool(x as f64 != y); next }
+            (Num(x), Int(y)) => { dst = Bool(x != y as f64); next }
+            _ => {}
+        }
+        cold { dst = Bool(!eq_slow(a, b)); next }
     }
     op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
     op LT(dst: reg, a: reg, b: reg) : ABC {
@@ -952,8 +990,7 @@ pub vm JS {
             (Num(x), Num(y)) => { dst = Bool(x < y); next }
             _ => {}
         }
-        dst = Bool(less(ctx, a, b, false));
-        next
+        cold { dst = Bool(less(ctx, a, b, false)); next }
     }
     op LE(dst: reg, a: reg, b: reg) : ABC {
         match (a, b) {
@@ -961,8 +998,7 @@ pub vm JS {
             (Num(x), Num(y)) => { dst = Bool(x <= y); next }
             _ => {}
         }
-        dst = Bool(less(ctx, a, b, true));
-        next
+        cold { dst = Bool(less(ctx, a, b, true)); next }
     }
 
     /// The end of a compare-and-branch: jump to the following JMP's
@@ -981,7 +1017,7 @@ pub vm JS {
             (Num(x), Num(y)) => branch((x < y) == want, then.target),
             _ => {}
         }
-        branch(less(ctx, a, b, false) == want, then.target)
+        cold { branch(less(ctx, a, b, false) == want, then.target) }
     }
     op JLE(pol: imm, a: reg, b: reg) : ABC then JMP {
         let want = pol != 0;
@@ -990,7 +1026,7 @@ pub vm JS {
             (Num(x), Num(y)) => branch((x <= y) == want, then.target),
             _ => {}
         }
-        branch(less(ctx, a, b, true) == want, then.target)
+        cold { branch(less(ctx, a, b, true) == want, then.target) }
     }
     op JEQ(pol: imm, a: reg, b: reg) : ABC then JMP {
         let want = pol != 0;
@@ -1001,7 +1037,13 @@ pub vm JS {
         }
         // Different words: two Ints (the usual case) are not equal.
         if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
-        branch(eq_slow(a, b) == want, then.target)
+        match (a, b) {
+            (Num(x), Num(y)) => branch((x == y) == want, then.target),
+            (Int(x), Num(y)) => branch((x as f64 == y) == want, then.target),
+            (Num(x), Int(y)) => branch((x == y as f64) == want, then.target),
+            _ => {}
+        }
+        cold { branch(eq_slow(a, b) == want, then.target) }
     }
 
     /// Compare against a small integer constant and branch: R[a] < sc,
@@ -1015,8 +1057,10 @@ pub vm JS {
             let c = sc as i32;
             if let Int(xi) = a { branch(icmp == want, then.target) }
             if let Num(xf) = a { branch(fcmp == want, then.target) }
-            let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
-            branch(r == want, then.target)
+            cold {
+                let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
+                branch(r == want, then.target)
+            }
         }
     }
 
@@ -1044,8 +1088,10 @@ pub vm JS {
                     branch(t == want, then.target)
                 }
             }
-            let r = if swap { less(ctx, kc, a, oreq) } else { less(ctx, a, kc, oreq) };
-            branch(r == want, then.target)
+            cold {
+                let r = if swap { less(ctx, kc, a, oreq) } else { less(ctx, a, kc, oreq) };
+                branch(r == want, then.target)
+            }
         }
     }
 
@@ -1059,7 +1105,13 @@ pub vm JS {
         }
         // Different words: two Ints (the usual case) are not equal.
         if let (Int(_), Int(_)) = (a, b) { branch(!want, then.target) }
-        branch(eq_slow(a, b) == want, then.target)
+        match (a, b) {
+            (Num(x), Num(y)) => branch((x == y) == want, then.target),
+            (Int(x), Num(y)) => branch((x as f64 == y) == want, then.target),
+            (Num(x), Int(y)) => branch((x == y as f64) == want, then.target),
+            _ => {}
+        }
+        cold { branch(eq_slow(a, b) == want, then.target) }
     }
 
     /// `switch` on Int cases lo .. lo+n-1: followed by n JMPs (one per
@@ -1067,7 +1119,7 @@ pub vm JS {
     op SWITCHI(r: reg, lo: kst, n: ncases) : ABC {
         var i = n as u64;
         if let (Int(x), Int(l)) = (r, lo) and ((x as i64 - l as i64) as u64) < n as u64 { i = (x as i64 - l as i64) as u64; }
-        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and x == x.floor() {
+        if let (Num(x), Int(l)) = (r, lo) and x >= l as f64 and x < (l as f64) + (n as f64) and (x as i64) as f64 == x {
             i = (x as i64 - l as i64) as u64;
         }
         jump pc + 1 + i
@@ -1243,12 +1295,11 @@ pub vm JS {
             if regs[base] == ctx.f_floor {
                 let x = regs[base + 2];
                 if let Int(_) = x { regs[base] = x; next }
-                if let Num(d) = x {
-                    let f = d.floor();
-                    if f >= -2147483648.0 and f <= 2147483647.0 and (f != 0.0 or d > 0.0) {
-                        regs[base] = Int(f as i32);
-                        next
-                    }
+                // floor of a double in Int range, without a libm call.
+                if let Num(d) = x and d > -2147483648.0 and d < 2147483647.0 {
+                    var i = d as i64;
+                    if (i as f64) > d { i -= 1; }
+                    if i != 0 or d > 0.0 { regs[base] = Int(i as i32); next }
                 }
             }
             cold {

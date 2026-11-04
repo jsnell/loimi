@@ -792,6 +792,7 @@ pub fn Model<O, S, V>.load_ref(m: *Model<O, S, V>, o: O, r: u32) -> V {
     s.data.ptr[r & !OUT]
 }
 
+#[inline]
 #[raw]
 pub fn Model<O, S, V>.store_ref(m: *Model<O, S, V>, o: O, r: u32, v: V) {
     if r & OUT == 0 { o.inline.ptr[r] = v; return; }
@@ -1227,6 +1228,9 @@ pub fn Model<O, S, V>.hit(m: *Model<O, S, V>, o: O, h: *Hit) -> ?V {
 pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
     let p = m.ic.poly.ptr + (ent - 1) as u64;
     let sid = o.shape.id;
+    // At most 8 entries: no bounds checks (a panic call would give a
+    // handler that inlines this a stack frame).
+    assume(p.n <= 8);
     for i in 0..p.n {
         if p.sids[i] == sid {
             let c = p.cells[i];
@@ -1250,6 +1254,9 @@ pub fn Model<O, S, V>.poly_get(m: *Model<O, S, V>, o: O, ent: u32) -> ?V {
 pub fn Model<O, S, V>.poly_get_at(m: *Model<O, S, V>, o: O, ent: u32) -> ?(V, u32) {
     let p = m.ic.poly.ptr + (ent - 1) as u64;
     let sid = o.shape.id;
+    // At most 8 entries: no bounds checks (a panic call would give a
+    // handler that inlines this a stack frame).
+    assume(p.n <= 8);
     for i in 0..p.n {
         if p.sids[i] == sid {
             let c = p.cells[i];
@@ -1532,6 +1539,9 @@ pub fn Model<O, S, V>.write_miss_in(m: *Model<O, S, V>, s: *Site, st: IcState, o
 pub fn Model<O, S, V>.poly_set(m: *Model<O, S, V>, o: O, ent: u32, v: V) -> bool {
     let p = m.ic.poly.ptr + (ent - 1) as u64;
     let sid = o.shape.id;
+    // At most 8 entries: no bounds checks (a panic call would give a
+    // handler that inlines this a stack frame).
+    assume(p.n <= 8);
     for i in 0..p.n {
         if p.sids[i] == sid {
             m.store_ref(o, p.slots[i], v);
