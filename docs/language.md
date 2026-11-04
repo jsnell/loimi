@@ -973,7 +973,7 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   spare capacity, an arena chunk's unused tail), so ASan reports a
   stale pointer into it as well as into freed memory; other builds are
   unchanged. `std.lex`, `std.parse`, `std.diag`, `std.text`,
-  `std.hash`, `std.io`, `std.bc` and `std.map` are `#![safe]`; see
+  `std.hash`, `std.io`, `std.bc`, `std.map` and `std.dict` are `#![safe]`; see
   `docs/design/safety.md` for the rule's holes and the cost.
 
   <!-- snippet: fail "indexing a raw pointer"

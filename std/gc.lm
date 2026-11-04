@@ -581,6 +581,7 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
 
 /// The write barrier, called by compiled code after storing a traced
 /// value into the object at `obj`.
+#[raw]
 #[inline]
 pub fn barrier(obj: *u8) {
     let hd = (obj - HEADER) as *Header;
@@ -620,6 +621,7 @@ fn log_obj(obj: *u8) {
 /// object (not an interior pointer). Without it a generational heap can
 /// free the stored object while it is still referenced. Free in a
 /// non-generational heap except for one byte test.
+#[raw]
 #[inline]
 pub fn write_barrier(h: *Heap, obj: *u8) {
     let hd = (obj - HEADER) as *Header;

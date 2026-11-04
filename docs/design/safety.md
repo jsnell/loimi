@@ -18,9 +18,9 @@ dangles once the container grows, shrinks or is freed, and nothing
 stops safe code from keeping it at compile time (section 2); built with
 `--sanitize=address`, std's containers poison the memory they keep but
 no longer use, so most such uses are reported at run time (section 7).
-Eight std modules (`lex`,
-`parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`) are now safe;
-`dict` is not (section 5). It is a check only: no example's IR changed
+Nine std modules (`lex`,
+`parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`, `dict`) are now safe
+(section 5). It is a check only: no example's IR changed
 from adding `#![safe]` and `#[raw]`, and the migrations' own IR changes
 (slices instead of pointer arithmetic, so bounds checks) are measured
 in section 6.
@@ -159,6 +159,17 @@ unsafe { write(fd, s.ptr, s.len) }
    from the safe module. A struct of the safe module that reaches it
    through another module's generic type (`lib.Lookup<Mine>` bound in a
    pattern) is not followed: its pointer fields are its own module's.
+
+9. **GC objects.** The field rule is about raw pointers, so the fields
+   of another module's `object` that holds only `Gc`s, values and
+   trailing arrays can be written (`d.used = 0` on a `dict.Dict`); a
+   safe GC container must not rely on its fields for memory safety
+   (`std.dict` does not, section 5). A GC reference stored through a
+   slice kept in a local (`let s = o.items; s[i] = v;`) gets no write
+   barrier (the compiler emits one only for a store through the
+   trailing-array expression itself), which can break the generational
+   collector's invariant. And `new(h, X { }, n)` zero-fills trailing
+   arrays of any element type, `Gc` and `value` types included (item 4).
 
 Section 3a lists the adversarial pass that closed the other bypasses
 (struct-destructuring was on this list: Loimi has no struct patterns,
@@ -328,17 +339,53 @@ Two soundness bugs in the API were fixed on the way:
   write or release, so the map stays usable and the next insert
   allocates (`tests/run/map_free_reuse.lm`).
 
-**`std.dict` stays non-safe.** It is the same table in the GC heap: 41
-raw-pointer sites (14 `.ptr` reads of trailing arrays, 11 casts, 8
-pointer arithmetic, 8 pointer indexing), plus about 14 calls of the
-now-`#[raw]` probe core. Every probe passes `d.index.s.ptr` and
-`d.ents.e.ptr` (raw pointers into GC trailing arrays); write barriers
-take `Gc` objects cast to `*u8`; `place()` stores without barriers on
-purpose. A safe `dict` would need slice-taking probe functions (a
-bounds check per probe on Python's hottest path), a `gc.barrier` that
-takes a `Gc<T>`, and checked entry-index methods; without those it
-would be 15–20 `unsafe` blocks for little gain. Its public API keeps the
-`OrderedMap`-style unchecked entry indices, documented as such.
+**`std.dict` is `#![safe]` too** (it was left non-safe at first: 41
+raw-pointer sites, every probe passing `d.index.s.ptr` and `d.ents.e.ptr`
+into the `#[raw]` probe core). The argument used for `map` does not
+carry over: `Dict` and `KeyDict` are GC objects holding `Gc`s and
+trailing arrays, not raw pointers, so any module may write `d.mask`,
+`d.used`, `d.index` or an index slot (`d.index.s[i] = ..`), and Python
+does write some of them. So dict's memory safety no longer rests on its
+fields:
+
+- The probes are private safe functions over the trailing arrays as
+  slices (`find_in`, `lookup_in`, `put_in`, `slot_of`, `rebuild_in`, and
+  `key_*` ones for `KeyDict`), replacing the calls of map's `#[raw]`
+  `probe_*` (which `OrderedMap` still uses). Each takes its mask from
+  the index's own length (`mask_of(idx)`: panics on an empty index, else
+  length - 1), so LLVM removes the bounds check from the slot reads
+  (the probe loop has no slot compare); entry reads keep one compare
+  per candidate key. `d.mask` is still maintained for the API but not
+  trusted.
+- Three `unsafe` blocks, no `#[raw]` function:
+  `// unsafe: \`o\` is a live object, whose header is what the barrier reads.`
+  (`barrier(o: Gc<T>)`, after slice copies),
+  `// unsafe: memset writes exactly the s.len * size_of<T>() bytes of \`s\`.`
+  (`zero(s: []T)`), and
+  `// unsafe: reads only the size_of<K>() bytes of the one K at \`k\` (as u64 words when the size is a multiple of 8).`
+  (`key_live`). `place()` stores a whole entry through `d.ents.e[e]`, so
+  the compiler emits its barrier; the hand-written stores are gone.
+- A bad field can now cause a panic or an endless probe, never an access
+  outside the tables. `remove_at(e)` panics unless `e` is a live entry
+  (it looped forever on a dead one, as `OrderedMap`'s did); `key`,
+  `value`, `hash_at`, `set_value` stay unchecked for liveness (a dead
+  entry reads as zero bytes) but are bounds-checked.
+
+Cost (Python, release, `--align-functions=64`, base and new interleaved,
+best of 10, twice; outliers best of 15, twice): geomean 1.002 and 0.999
+(range 0.978–1.017); reruns of deltablue, hexiom, richards, nqueens
+1.006 and 1.003. `richards` is about 1% slower in every run (+0.3% to
++1.3%): below the noise threshold but consistent (the per-candidate
+entry bounds check in attribute lookups that miss the inline caches). A
+first version that also bounds-checked slot reads cost `richards` 2.3–3%
+and was replaced. No vm op handler's machine code changed; the IR
+changes are confined to `std.dict` and its callers.
+
+Found on the way (holes, section 2 item 9): GC objects' fields are not
+protected by the field rule; `gc.barrier(obj: *u8)` and
+`gc.write_barrier` read the header before `obj` and are now `#[raw]`
+(no IR change); a store of a GC reference through a slice held in a
+local (`let s = o.items; s[i] = v;`) gets no write barrier.
 
 ## 6. Cost
 

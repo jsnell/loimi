@@ -193,7 +193,7 @@ those builds.
   `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
   longer use, so stale pointers into it are reported at run time.
   `std.lex`, `parse`, `diag`, `text`, `hash`,
-  `io`, `bc` and `map` are safe (`design/safety.md`).
+  `io`, `bc`, `map` and `dict` are safe (`design/safety.md`).
   The example interpreters contain no `unsafe`: float reads of a
   register use `f64.from_bits(a as u64)` (compiled to a `double` load
   of the slot), and Mini's coroutine free hook uses `heap.on_free_gc`.

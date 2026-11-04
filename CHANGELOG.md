@@ -218,7 +218,7 @@ implementation; `git log` has the details.
 ### Standard library
 
 - **Memory-safe std modules**: `std.lex`, `std.parse`, `std.diag`,
-  `std.text`, `std.hash`, `std.io`, `std.bc` and `std.map` are
+  `std.text`, `std.hash`, `std.io`, `std.bc`, `std.map` and `std.dict` are
   `#![safe]`, with justified `unsafe` blocks around C calls and the
   hash tables' masked indexing. `OrderedMap.entry`/`set_value`/`remove_at`
   panic on an index that is not a live entry (they read out of bounds
@@ -229,7 +229,12 @@ implementation; `git log` has the details.
   `io.free_file` is `#[raw]` ([design/safety.md](docs/design/safety.md)).
   `std.obj`'s inline-cache API that trusts cache words without checking
   them (`Model.load_ref`, `hit`, `poly_get`, `MegaCache.put`, ..., 15
-  functions) is `#[raw]` too (no IR change).
+  functions) is `#[raw]` too, as are `gc.barrier` and `gc.write_barrier`
+  (no IR change). `std.dict` probes its GC tables through slices (masked
+  by the index length, so no slot bounds check) and does not trust its
+  fields; `Dict.remove_at`/`KeyDict.remove_at` panic on a dead entry
+  (they looped forever). Python benchmarks: geomean within ±0.5%,
+  `richards` consistently about 1% slower.
 - **`std.bigint`**: arbitrary-precision integers with Python's semantics
   ([stdlib.md](docs/stdlib.md#stdbigint)).
 - **`std.map.OrderedMap`, `std.dict.Dict`, `std.dict.KeyDict`**:

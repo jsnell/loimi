@@ -53,7 +53,7 @@ Design rules for the library:
   is released with `io.free_file`. Freeing a container does not free what
   its elements point to.
 - **Checked where it can be.** `std.lex`, `std.parse`, `std.diag`,
-  `std.text`, `std.hash`, `std.io`, `std.bc` and `std.map` are
+  `std.text`, `std.hash`, `std.io`, `std.bc`, `std.map` and `std.dict` are
   `#![safe]` modules (`language.md` §1.3): no raw-pointer indexing, arithmetic or
   casts outside a few commented `unsafe { }` blocks around C calls.
   Functions that take a pointer and a length, free, or return raw
@@ -288,7 +288,7 @@ key. Probing is CPython's (`i = 5i + 1 + perturb`, `perturb >>= 5`).
   eq) -> (u64, bool)` inserts or replaces in one probe; `insert_new(hash,
   k, v)` appends a key the caller knows is absent; `entry(e) -> *Entry`,
   `set_value(e, v)`, `is_live(e)`, `remove_at(e)` (for `OrderedMap`,
-  an `e` that is not a live entry is a panic; `dict.Dict` does not check). `eq` gets a copy of
+  an `e` that is not a live entry is a panic; `dict.Dict` checks only `remove_at` and bounds: a dead entry reads as zeros). `eq` gets a copy of
   each candidate key whose hash matches.
 - **Entry indices and `version`.** An entry index stays valid until the
   table is compacted. `version` changes on every insertion of a new key,
