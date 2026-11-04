@@ -706,7 +706,14 @@ pub vm Py {
                 regs[base.raw] = Bool(ops.subclass(o.cls, cls));
                 next
             }
+            if n == 1 and let Builtin(id) = base and let Some(r) = builtins.math1(id, regs[base.raw + 1]) { regs[base.raw] = r; next }
             gc_point();
+            // A bound list method (`pop = l.pop; pop(0)`).
+            if let Obj(bm) = base and bm.kind == K_BOUND and let Builtin(id) = bm.b and let List(l) = bm.a
+                and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 1, n as u64) {
+                regs[base.raw] = r;
+                next
+            }
             call_slow(base.raw, base.raw + 1, n as u64, Nil)
         }
     }
@@ -728,15 +735,19 @@ pub vm Py {
             }
             cold {
                 gc_point();
-                if let Builtin(id) = f and id == builtins.b_list_append() and n == 1 and let List(l) = s {
-                    value.list_push(&ctx.heap, l, regs[base.raw + 2]);
-                    regs[base.raw] = Nil;
+                if let Builtin(id) = f and let List(l) = s and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 2, n as u64) {
+                    regs[base.raw] = r;
                     next
                 }
                 call_slow(base.raw, base.raw + 1, n as u64 + 1, Nil)
             }
         }
-        cold { gc_point(); call_slow(base.raw, base.raw + 2, n as u64, Nil) }
+        cold {
+            // math.sqrt(x) & co.: a function of a module, called without self.
+            if n == 1 and let Builtin(id) = f and let Some(r) = builtins.math1(id, regs[base.raw + 2]) { regs[base.raw] = r; next }
+            gc_point();
+            call_slow(base.raw, base.raw + 2, n as u64, Nil)
+        }
     }
     /// CALL with keyword arguments: the last len(K[kw]) of the n
     /// arguments are named by the tuple K[kw].

@@ -1490,6 +1490,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         LExtend => { ops.list_extend(c, selfv, args[1])?; Ok(Value.Nil) }
         LPop => {
             let List(l) = selfv else { trap() };
+            if np > 2 { var m = text.StrBuf.new(); m.fmt("pop expected at most 1 argument, got {}", np - 1); return Err(exc_buf(c, E_TYPE, &m)); }
             if l.len == 0 { return Err(exc(c, E_INDEX, "pop from empty list")); }
             var i = l.len as i64 - 1;
             if np > 1 { i = want_int(c, args[1])?; if i < 0 { i += l.len as i64; } }
@@ -1503,6 +1504,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
         }
         LInsert => {
             let List(l) = selfv else { trap() };
+            if np != 3 { var m = text.StrBuf.new(); m.fmt("insert expected 2 arguments, got {}", np - 1); return Err(exc_buf(c, E_TYPE, &m)); }
             var i = want_int(c, args[1])?;
             if i < 0 { i += l.len as i64; if i < 0 { i = 0; } }
             if i > l.len as i64 { i = l.len as i64; }
@@ -1889,6 +1891,69 @@ fn randbelow(c: *Ctx, n: Value) -> Result<Value, Value> {
     loop {
         let r = getrandbits(c, k);
         if big.cmp(r, n) < 0 { return Ok(r); }
+    }
+}
+
+/// list.pop(), list.pop(i), list.insert(i, x) and list.append(x) with
+/// int indexes, without the call machinery (CALL and CALLMETHOD's cold
+/// blocks; `args` are the n arguments after self); None: call it.
+pub fn list_fast(c: *Ctx, id: u32, l: Gc<List>, args: *Value, n: u64) -> ?Value {
+    match id as B {
+        LPop => {
+            let len = l.len;
+            if len == 0 or n > 1 { return None; }
+            var j = len - 1;
+            if n == 1 {
+                let Int(i) = args[0] else { return None; };
+                let k = if i < 0 { i as i64 + len as i64 } else { i as i64 };
+                if k < 0 or k >= len as i64 { return None; }
+                j = k as u64;
+            }
+            let p = l.arr.items.ptr;
+            let v = p[j];
+            mem.copy(p + j, p + j + 1, len - 1 - j);
+            p[len - 1] = Value.Nil;
+            l.len = len - 1;
+            Some(v)
+        }
+        LInsert => {
+            if n != 2 { return None; }
+            let Int(i0) = args[0] else { return None; };
+            let x = args[1];
+            let len = l.len as i64;
+            var i = i0 as i64;
+            if i < 0 { i += len; if i < 0 { i = 0; } }
+            if i > len { i = len; }
+            value.list_push(&c.heap, l, x);
+            let p = l.arr.items.ptr;
+            let j = i as u64;
+            mem.copy(p + j + 1, p + j, l.len - 1 - j);
+            p[j] = x;
+            gc.write_barrier(&c.heap, l.arr as *u8);
+            Some(Value.Nil)
+        }
+        LAppend => {
+            if n != 1 { return None; }
+            value.list_push(&c.heap, l, args[0]);
+            Some(Value.Nil)
+        }
+        _ => None,
+    }
+}
+
+/// A math function of one int or float that cannot fail, without the
+/// call machinery (CALL and CALLMETHOD's cold blocks); None: call it.
+pub fn math1(id: u32, x: Value) -> ?Value {
+    let f = match x { Float(f) => f, Int(i) => i as f64, _ => return None };
+    match id as B {
+        MSqrt => if f >= 0.0 { Some(Value.Float(f.sqrt())) } else { None },
+        MSin => Some(Value.Float(sin(f))),
+        MCos => Some(Value.Float(cos(f))),
+        MTan => Some(Value.Float(tan(f))),
+        MAtan => Some(Value.Float(atan(f))),
+        MExp => Some(Value.Float(exp(f))),
+        MFabs => Some(Value.Float(f.abs())),
+        _ => None,
     }
 }
 

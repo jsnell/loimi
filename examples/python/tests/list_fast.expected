@@ -1,0 +1,19 @@
+5 1 4 3 [2]
+[3, 4, 1, 5, 6, 2, 7, 8, 0, 9]
+['b', 'a', 3, 4, 1, 5, 6, 2, 7, 8, 0, 9, 'y', 'z']
+IndexError pop from empty list
+IndexError pop index out of range
+IndexError pop index out of range
+TypeError 'str' object cannot be interpreted as an integer
+TypeError 'float' object cannot be interpreted as an integer
+TypeError insert expected 2 arguments, got 1
+TypeError pop expected at most 1 argument, got 2
+[0, 0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13, -13, 14, -14, 15, -15, 16, -16, 17, -17, 18, -18, 19, -19] 40
+[[27, 24, 21, 18, 15, 12, 9, 6, 3, 0], [28, 25, 22, 19, 16, 13, 10, 7, 4, 1], [29, 26, 23, 20, 17, 14, 11, 8, 5, 2]]
+[24, 25, 26]
+4.0 1.4142135623730951 0.0 1.0 0.5463024898437905 0.7853981633974483 2.718281828459045 3.0
+3.0 7.0 1.0
+ValueError math domain error
+TypeError must be real number, not str
+TypeError must be real number, not NoneType
+5.0 1.0 1.0
