@@ -28,8 +28,10 @@
 // for memory safety. Probing goes over the trailing arrays as slices,
 // masked by the index's own length and bounds-checked against the
 // entries' real length; inconsistent fields can make a probe panic or
-// never end, not reach outside the tables. The `unsafe` blocks are the write
-// barrier on a `Gc`, zeroing whole entries, and reading a key's bytes.
+// never end, not reach outside the tables. The `unsafe` blocks are
+// zeroing whole entries and reading a key's bytes. Stores through the
+// trailing arrays passed as slices (`rebuild_in`, `zero`) get the write
+// barrier from the compiler, after the call (src/objref.rs).
 // Entry-index methods (`key`, `value`, `hash_at`, `set_value`) take any
 // index below the entries' capacity: an entry that is dead or not yet
 // used reads as zero bytes, as a fresh trailing array does; `remove_at`
@@ -52,14 +54,6 @@ pub object DictIndex { s: [u32] }
 pub object DictEntries<K, V> { e: [Entry<K, V>] }
 
 // ── the unsafe parts ─────────────────────────────────────────────────
-
-/// The write barrier for `o`, after stores that bypass the compiler's
-/// (through a slice that is not the trailing array expression itself).
-#[inline(always)]
-fn barrier<T>(o: Gc<T>) {
-    // unsafe: `o` is a live object, whose header is what the barrier reads.
-    unsafe { gc.barrier(o as *u8); }
-}
 
 /// Zero the elements of `s`: dead entries and a cleared index become what
 /// a fresh trailing array holds (zero bytes, as `new` makes them).
@@ -182,8 +176,8 @@ fn slot_of(idx: []u32, hash: u64, e: u64) -> u64 {
 }
 
 /// Copy the live entries of `src` to `dst` (in order) and index them in
-/// `idx` (all slots empty). Returns how many. The caller runs the write
-/// barrier on `dst`'s object.
+/// `idx` (all slots empty). Returns how many. The compiler runs the
+/// write barrier on `dst`'s object after the call.
 fn rebuild_in<K, V>(idx: []u32, dst: []Entry<K, V>, src: []Entry<K, V>) -> u64 {
     var j: u64 = 0;
     for i in 0..src.len {
@@ -226,9 +220,8 @@ fn Dict<K, V>.resize(d: Gc<Dict<K, V>>, h: *gc.Heap, n: u64) {
     let sz = map.index_size_for<K>(n);
     let index = new(h, DictIndex {}, sz);
     let ents: Gc<DictEntries<K, V>> = new(h, DictEntries {}, map.usable_for<K>(sz));
-    // The copy bypasses the compiler's barriers: one for the object.
+    // The compiler runs the barrier on `ents` after the copy.
     d.used = rebuild_in(index.s, ents.e, d.ents.e[0..d.used]);
-    barrier(ents);
     d.index = index;
     d.ents = ents;
     d.mask = sz - 1;
@@ -359,7 +352,7 @@ pub fn Dict<K, V>.remove_at(d: Gc<Dict<K, V>>, e: u64) {
     let hs = ents[e].hash;
     idx[slot_of(idx, hs, e)] = map.SLOT_DELETED;
     // Zeroed, the entry keeps nothing alive.
-    zero(ents[e..e + 1]);
+    zero(d.ents.e[e..e + 1]);
     ents[e].hash = map.DEAD;
     d.len -= 1;
     d.version += 1;
@@ -432,7 +425,6 @@ pub fn Dict<K, V>.copy(d: Gc<Dict<K, V>>, h: *gc.Heap) -> Gc<Dict<K, V>> {
     let r: Gc<Dict<K, V>> = Dict.new(h, d.len);
     r.used = rebuild_in(r.index.s, r.ents.e, d.ents.e[0..d.used]);
     r.len = r.used;
-    barrier(r.ents);
     r
 }
 
@@ -549,9 +541,8 @@ fn KeyDict<K, V>.resize(d: Gc<KeyDict<K, V>>, h: *gc.Heap, n: u64) {
     let sz = map.index_size_for<K>(n);
     let index = new(h, DictIndex {}, sz);
     let ents: Gc<KeyEntries<K, V>> = new(h, KeyEntries {}, map.usable_for<K>(sz));
-    // The copy bypasses the compiler's barriers: one for the object.
+    // The compiler runs the barrier on `ents` after the copy.
     d.used = key_rebuild_in(index.s, ents.e, d.ents.e[0..d.used]);
-    barrier(ents);
     d.index = index;
     d.ents = ents;
     d.mask = sz - 1;
@@ -671,7 +662,7 @@ pub fn KeyDict<K, V>.remove_at(d: Gc<KeyDict<K, V>>, e: u64) {
     let ents = d.ents.e;
     idx[slot_of(idx, key_hash(&ents[e]), e)] = map.SLOT_DELETED;
     // Zeroed (all-zero key bytes: dead), the entry keeps nothing alive.
-    zero(ents[e..e + 1]);
+    zero(d.ents.e[e..e + 1]);
     d.len -= 1;
     d.version += 1;
 }
@@ -739,6 +730,5 @@ pub fn KeyDict<K, V>.copy(d: Gc<KeyDict<K, V>>, h: *gc.Heap) -> Gc<KeyDict<K, V>
     let r: Gc<KeyDict<K, V>> = KeyDict.new(h, d.len);
     r.used = key_rebuild_in(r.index.s, r.ents.e, d.ents.e[0..d.used]);
     r.len = r.used;
-    barrier(r.ents);
     r
 }

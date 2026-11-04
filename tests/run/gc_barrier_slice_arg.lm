@@ -1,0 +1,44 @@
+// A slice of an object's traced trailing array passed to a function that
+// stores through it gets the write barrier after the call (src/objref.rs):
+// directly, through a sub-slice, and through a function that passes the
+// slice on. Before, nothing logged the object, and verify mode aborted at
+// the next collection with "missing write barrier". A function that only
+// reads its slice parameter costs no barrier, and `let` may keep a slice
+// it only reads.
+import std.io;
+import std.gc;
+
+object Node { value: i64, next: ?Gc<Node> }
+object Arr { fixed: [?Gc<Node>; 4], items: [?Gc<Node>] }
+
+fn young(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { value: v, next: None }) }
+fn age(h: *gc.Heap) uses gc { gc.collect(h); gc.collect(h); }
+
+fn put(s: []?Gc<Node>, i: u64, n: Gc<Node>) { s[i] = Some(n); }
+fn put_via(s: []?Gc<Node>, i: u64, n: Gc<Node>) { put(s[1..], i - 1, n); }
+fn sum(s: []?Gc<Node>) -> i64 {
+    var t = 0;
+    for x in s { if let Some(n) = x { t += n.value; } }
+    t
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    let a = new(h, Arr { fixed: [None, None, None, None] }, 4);
+    age(h);
+    put(a.items, 0, young(h, 1));
+    age(h);
+    put(a.items[2..], 0, young(h, 20));
+    age(h);
+    put_via(a.items, 3, young(h, 300));
+    age(h);
+    put(a.fixed[..], 1, young(h, 4000));
+    age(h);
+    let s = a.items;
+    io.print_int(sum(a.items) + sum(s) + sum(a.fixed[..])); io.println("");
+}
+
+// expect: 4642

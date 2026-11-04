@@ -10,6 +10,7 @@ mod gcgen;
 mod generics;
 mod header;
 mod jitgen;
+mod objref;
 mod layout;
 mod lexer;
 mod parser;
@@ -333,6 +334,15 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     c.dispatch_override = opts.dispatch;
     c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
     c.run()?;
+    // References into objects that a store could skip the write barrier
+    // through (src/objref.rs).
+    let safe_files: std::collections::HashSet<u32> = modules
+        .iter()
+        .filter(|m| m.safe)
+        .flat_map(|m| m.items.iter().filter_map(|it| if let ast::Item::Fn(f) = it { Some(f.name.span.file) } else { None }))
+        .collect();
+    let unsafe_spans = std::mem::take(&mut c.unsafe_spans);
+    objref::check(&mut c.prog, &objref::Ctx { safe_files: &safe_files, unsafe_spans: &unsafe_spans }, sm)?;
     if let Some(a) = &c.safety_audit {
         // `LOIMI_SAFETY_AUDIT=1`: raw-pointer operations by module and kind.
         let a = a.borrow();

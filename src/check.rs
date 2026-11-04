@@ -182,6 +182,8 @@ pub struct Checker<'a> {
     pub value_module: HashMap<u32, usize>,
     /// Generated source files (vm expansions): exempt from `#![safe]`.
     pub generated_files: std::collections::HashSet<u32>,
+    /// The `unsafe { }` blocks checked (`objref` exempts them).
+    pub unsafe_spans: Vec<Span>,
     /// `LOIMI_SAFETY_AUDIT=1`: every module is checked as if `#![safe]`,
     /// and the raw-pointer operations are counted instead of reported.
     pub safety_audit: Option<std::cell::RefCell<std::collections::BTreeSet<(String, &'static str, u32, u32)>>>,
@@ -284,6 +286,7 @@ impl<'a> Checker<'a> {
             enum_module: HashMap::new(),
             value_module: HashMap::new(),
             generated_files: Default::default(),
+            unsafe_spans: Vec::new(),
             safety_audit: std::env::var_os("LOIMI_SAFETY_AUDIT").map(|_| Default::default()),
             encoder_notes: HashMap::new(),
         }
@@ -2207,6 +2210,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Block(b) => self.block(cx, b, exp),
             ExprKind::Unsafe(b) => {
+                self.unsafe_spans.push(e.span);
                 cx.unsafe_depth += 1;
                 let r = self.block(cx, b, exp);
                 cx.unsafe_depth -= 1;

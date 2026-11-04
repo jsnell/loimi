@@ -1,0 +1,16 @@
+// A function that may collect and stores through its slice parameter:
+// a minor collection between the store and the barrier after the call
+// would free the young object.
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [?Gc<Node>] }
+fn put(h: *gc.Heap, s: []?Gc<Node>) uses gc {
+    s[0] = Some(new(h, Node { v: 1 }));
+    gc.collect(h);
+}
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 2);
+    put(&heap, a.items);
+}
+// error: a slice of an object's traced trailing array is passed to a call that may collect and may store through it: a store through it would skip the write barrier

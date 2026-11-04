@@ -2364,7 +2364,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
         // auto-refs `&o.pair`): the callee may store references there, so
         // they get the write barrier after the call.
         let mut barriers = Vec::new();
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
             if let TK::AddrOf(inner) = &a.kind {
                 if crate::gcgen::needs_barrier(self, inner) {
                     let (addr, obj) = crate::gcgen::object_place(self, inner);
@@ -2372,6 +2372,14 @@ impl<'a, 'p> FnGen<'a, 'p> {
                     avs.push(format!("ptr {}", addr));
                     continue;
                 }
+            }
+            // A slice of an object's traced trailing array that the callee
+            // may store through: the barrier follows the call (the callee
+            // cannot collect: src/objref.rs).
+            if let Some((sv, obj)) = crate::gcgen::obj_slice_arg(self, f, i, a) {
+                barriers.push(obj);
+                avs.push(format!("{{ ptr, i64 }} {}", sv));
+                continue;
             }
             let v = self.val(a);
             if let Ty::Block(..) = a.ty {

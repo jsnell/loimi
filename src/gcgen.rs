@@ -616,7 +616,7 @@ pub fn pop_frame(g: &mut FnGen, prev: Option<String>) {
 /// an array field, or field of a struct field) of an object reached
 /// through a `Gc`, or an element of an object's trailing array. Stores of
 /// traced values there go through the write barrier.
-fn in_object(e: &TExpr) -> bool {
+pub fn in_object(e: &TExpr) -> bool {
     match &e.kind {
         TK::Deref(x) => matches!(x.ty, Ty::Gc(_)),
         TK::Field(b, _) => matches!(b.ty, Ty::Struct(_) | Ty::Tuple(_)) && in_object(b),
@@ -633,7 +633,7 @@ fn in_object(e: &TExpr) -> bool {
 
 /// Whether the slice `e` points into an object: a trailing array, or a
 /// sub-slice of one or of an array field (`o.items[1..][0] = v`).
-fn slice_in_object(e: &TExpr) -> bool {
+pub fn slice_in_object(e: &TExpr) -> bool {
     match &e.kind {
         TK::Trailing(_) => true,
         TK::SliceRange(b, _, _) => match &b.ty {
@@ -798,6 +798,20 @@ pub fn object_place(g: &mut FnGen, e: &TExpr) -> (String, String) {
         },
         _ => unreachable!(),
     }
+}
+
+/// An argument `a` of a call of `f` that is a slice of an object's
+/// traced trailing array (or array field) which the callee may store
+/// through (`objref`): its value, and the object to pass to the write
+/// barrier after the call.
+pub fn obj_slice_arg(g: &mut FnGen, f: &TExpr, i: usize, a: &TExpr) -> Option<(String, String)> {
+    if !crate::objref::traced_obj_slice(g.p(), a) || !crate::objref::call_writes(g.p(), f, i) || !has_barrier(g) {
+        return None;
+    }
+    let (ptr, len, obj) = slice_place(g, a);
+    let s = g.inst(format!("insertvalue {{ ptr, i64 }} poison, ptr {}, 0", ptr));
+    let s = g.inst(format!("insertvalue {{ ptr, i64 }} {}, i64 {}, 1", s, len));
+    Some((s, obj))
 }
 
 /// `lhs = v` into an object, followed by the write barrier on the object.

@@ -1,0 +1,12 @@
+// In a `#![safe]` module `&o.f` is not a raw-pointer operation, so a
+// store through it must not skip the write barrier.
+#![safe]
+import std.gc;
+object Node { v: i64, next: ?Gc<Node> }
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Node { v: 0, next: None });
+    let p = &a.next;
+    *p = Some(new(&heap, Node { v: 1, next: None }));
+}
+// error: the address of a traced place inside an object is stored through (held in a local): a store through it would skip the write barrier

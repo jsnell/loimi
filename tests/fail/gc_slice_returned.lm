@@ -1,0 +1,8 @@
+// Returning a slice of an object's traced trailing array: the caller
+// could store through it without the write barrier.
+import std.gc;
+object Node { v: i64 }
+object Arr { len: u64, items: [?Gc<Node>] }
+fn live(a: Gc<Arr>) -> []?Gc<Node> { a.items[0..a.len] }
+fn main() {}
+// error: a slice of an object's traced trailing array is kept: a store through it would skip the write barrier

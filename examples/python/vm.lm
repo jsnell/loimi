@@ -1046,7 +1046,7 @@ pub vm Py {
     op TOTUPLE(dst: reg, src: reg) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let List(l) = src else { trap() };
-        dst = Tuple(value.tuple_of(&ctx.heap, value.list_items(l)));
+        dst = Tuple(value.tuple_of(&ctx.heap, l.arr.items[0..l.len]));
         next
     }
     /// Unpack R[src] into R[base..base+n].

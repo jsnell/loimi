@@ -655,4 +655,9 @@ pub struct Program {
     /// `#[c_const(p, ..)]` on an export, by symbol: parameters that are
     /// `const` pointers in C.
     pub c_const_params: std::collections::BTreeMap<String, Vec<(String, crate::diag::Span)>>,
+    /// Per function, the parameters (bit i: parameter i) of slice or
+    /// pointer type with traced elements that it may store through, let
+    /// escape, or pass on to one that does (`objref`). A call passing an
+    /// object's traced trailing array there gets the write barrier after it.
+    pub ref_writes: std::collections::HashMap<FnId, u64>,
 }

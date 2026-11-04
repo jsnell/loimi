@@ -173,8 +173,6 @@ pub fn list_grow(h: *gc.Heap, l: Gc<List>, need: u64) {
     l.arr = a;
 }
 
-pub fn list_items(l: Gc<List>) -> []Value { l.arr.items[0..l.len] }
-
 pub fn new_tuple(h: *gc.Heap, n: u64) -> Gc<Tuple> {
     let t = new(h, Tuple {}, n);
     for i in 0..n { t.items[i] = Value.Nil; }

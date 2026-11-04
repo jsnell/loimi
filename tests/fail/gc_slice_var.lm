@@ -1,0 +1,10 @@
+// A `var` holding a slice of an object's traced trailing array.
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [?Gc<Node>] }
+fn f(a: Gc<Arr>) -> u64 {
+    var s = a.items;
+    s.len
+}
+fn main() {}
+// error: a slice of an object's traced trailing array is kept: a store through it would skip the write barrier

@@ -1406,7 +1406,7 @@ pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
     }
     match (a, b) {
         (Str(x), Str(y)) => Ok(Some(mem.compare_bytes(x.data, y.data))),
-        (List(x), List(y)) => seq_order(c, value.list_items(x), value.list_items(y)),
+        (List(x), List(y)) => seq_order(c, x.arr.items[0..x.len], y.arr.items[0..y.len]),
         (Tuple(x), Tuple(y)) => seq_order(c, x.items, y.items),
         (Inst(_), _) | (_, Inst(_)) => {
             if compare(c, C_LT, a, b)? { return Ok(Some(-1)); }
@@ -1724,7 +1724,7 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
     let n = src.len;
     if (src as u64) == (l as u64) {
         // l[a:b] = l: copy the source first.
-        let cp = value.list_of(&c.heap, value.list_items(src));
+        let cp = value.list_of(&c.heap, src.arr.items[0..src.len]);
         return setslice(c, obj, lo, hi, st, Value.List(cp));
     }
     let old_n = stop - a0;

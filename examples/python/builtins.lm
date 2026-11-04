@@ -608,7 +608,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         Sorted => {
             let src = items_of(c, args[0])?;
-            let l = value.list_of(&c.heap, value.list_items(src));
+            let l = value.list_of(&c.heap, src.arr.items[0..src.len]);
             let key = kwarg(kw, args, n, "key") ?? Value.Nil;
             let rev = kwarg(kw, args, n, "reverse") ?? Value.Bool(false);
             sort_list(c, l, key, ops.truthy(c, rev)?)?;
@@ -628,7 +628,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
                         if let Some(r) = ops.call_method(c, v, "__reversed__", [])? { return Ok(r); }
                     }
                     let l = items_of(c, v)?;
-                    let cp = value.list_of(&c.heap, value.list_items(l));
+                    let cp = value.list_of(&c.heap, l.arr.items[0..l.len]);
                     let r = value.new_box(&c.heap, K_REVIT, 0);
                     r.a = Value.List(cp);
                     r.n = cp.len as i64;
@@ -905,7 +905,7 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
             if np == 0 { return Ok(Value.Tuple(value.new_tuple(&c.heap, 0))); }
             if let Tuple(_) = args[0] { return Ok(args[0]); }
             let l = items_of(c, args[0])?;
-            Ok(Value.Tuple(value.tuple_of(&c.heap, value.list_items(l))))
+            Ok(Value.Tuple(value.tuple_of(&c.heap, l.arr.items[0..l.len])))
         }
         T_DICT => {
             let d = value.new_dict(&c.heap, 0);
@@ -1385,13 +1385,13 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Err(exc(c, E_VALUE, "list.remove(x): x not in list"))
         }
         LIndex | TIndex => {
-            let xs = if let List(l) = selfv { value.list_items(l) } else if let Tuple(t) = selfv { t.items } else { trap() };
+            let xs = if let List(l) = selfv { l.arr.items[0..l.len] } else if let Tuple(t) = selfv { t.items } else { trap() };
             let (a, z) = bounds(c, args, np, 2, xs.len)?;
             for i in a..z { if ops.equal(c, xs[i], args[1])? { return Ok(value.int_val(&c.heap, i as i64)); } }
             Err(exc(c, E_VALUE, if b == B.LIndex { "list.index(x): x not in list" } else { "tuple.index(x): x not in tuple" }))
         }
         LCount | TCount => {
-            let xs = if let List(l) = selfv { value.list_items(l) } else if let Tuple(t) = selfv { t.items } else { trap() };
+            let xs = if let List(l) = selfv { l.arr.items[0..l.len] } else if let Tuple(t) = selfv { t.items } else { trap() };
             var k: i64 = 0;
             for i in 0..xs.len { if ops.equal(c, xs[i], args[1])? { k += 1; } }
             Ok(value.int_val(&c.heap, k))
@@ -1412,7 +1412,7 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
             Ok(Value.Nil)
         }
-        LCopy => { let List(l) = selfv else { trap() }; Ok(Value.List(value.list_of(&c.heap, value.list_items(l)))) }
+        LCopy => { let List(l) = selfv else { trap() }; Ok(Value.List(value.list_of(&c.heap, l.arr.items[0..l.len]))) }
         LClear => {
             let List(l) = selfv else { trap() };
             for i in 0..l.len { l.arr.items[i] = Value.Nil; }
@@ -1874,7 +1874,7 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
         RSample => {
             let src = items_of(c, args[0])?;
             let k = want_int(c, args[1])? as u64;
-            let pool = value.list_of(&c.heap, value.list_items(src));
+            let pool = value.list_of(&c.heap, src.arr.items[0..src.len]);
             let r = value.new_list(&c.heap, k);
             let nn = pool.len;
             for i in 0..k {

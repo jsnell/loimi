@@ -1,0 +1,13 @@
+// A slice of an object's traced trailing array kept in a local and
+// stored through would skip the write barrier (generational heaps:
+// tests/run/gc_barrier_slice_arg.lm).
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [?Gc<Node>] }
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 2);
+    let s = a.items;
+    s[0] = Some(new(&heap, Node { v: 1 }));
+}
+// error: a slice of an object's traced trailing array is stored through (held in a local): a store through it would skip the write barrier
