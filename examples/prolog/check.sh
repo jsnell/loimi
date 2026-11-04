@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Prolog interpreter and run its tests.
 #
-#   examples/prolog/check.sh [-q] [-u] [TEST ...]
+#   examples/prolog/check.sh [-q] [-j] [-u] [TEST ...]
 #
 # Every tests/NAME.pl must print tests/NAME.expected on stdout (stderr is
 # ignored: warnings differ between systems). The expected files are
@@ -14,7 +14,8 @@
 # --gc-check-roots build run with --gc-stress; and a --jit-stencils build run
 # with the JIT on (LOIMI_JIT=1, LOIMI_JIT_HOT=2: code is compiled at its
 # second call), normally and with --gc-stress. -q: the tail-call build only,
-# normally and with --gc-stress (what `cargo test` runs).
+# normally and with --gc-stress (what `cargo test` runs). -j: the JIT build
+# only (cargo test's prolog_jit_stencils).
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DIR=$ROOT/examples/prolog
@@ -22,10 +23,12 @@ LOIMI=${LOIMI:-$ROOT/target/release/loimi}
 export LOIMI_STD=${LOIMI_STD:-$ROOT}
 SWIPL=$ROOT/bench/prolog/install/swipl/bin/swipl
 QUICK=0
+JIT=0
 UPDATE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -q) QUICK=1; shift ;;
+        -j) JIT=1; shift ;;
         -u) UPDATE=1; shift ;;
         *) break ;;
     esac
@@ -87,6 +90,8 @@ build() {    # out flags...
 
 if [ $QUICK = 1 ]; then
     build "$TMP/pl" && run_suite "$TMP/pl" tailcall normal stress
+elif [ $JIT = 1 ]; then
+    build "$TMP/pl-jit" --jit-stencils && run_suite "$TMP/pl-jit" jit normal stress
 else
     for mode in tailcall goto switch; do
         build "$TMP/pl-$mode" --dispatch=$mode && run_suite "$TMP/pl-$mode" $mode normal stress verify

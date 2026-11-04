@@ -796,6 +796,31 @@ fn prolog_programs() {
     );
 }
 
+/// The Prolog interpreter built with `--jit-stencils` (check.sh -j): every
+/// test with the JIT on and code compiled at its second call
+/// (`LOIMI_JIT_HOT=2`), normally and under GC stress.
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn prolog_jit_stencils() {
+    if cross() {
+        return;
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bash")
+        .arg(root.join("examples/prolog/check.sh"))
+        .arg("-j")
+        .env("LOIMI", env!("CARGO_BIN_EXE_loimi"))
+        .env("LOIMI_STD", root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "examples/prolog/check.sh -j failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The Python-subset interpreter (examples/python/check.sh -q): a tail-call
 /// build, every tests/NAME.py prints tests/NAME.expected (CPython 3.13's
 /// output, committed), normally and under GC stress. Needs no reference
