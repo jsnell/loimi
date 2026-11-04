@@ -849,9 +849,58 @@ fn C.class_def(c: *C, cd: *ClassDef) {
     c.class_ns = saved_ns;
     c.shadow.len = saved_shadow;
     let dst = c.alloc(1);
-    c.emit(Py.BUILDCLASS(dst as u8, base as u8));
+    c.emit(Py.BUILDCLASS(dst as u8, base as u8, attr_hint(cd) as u8));
     c.apply_decorators(cd.decorators, dst);
     c.store_name(cd.name, dst);
+}
+
+/// How many attributes the class's own methods give an instance: the
+/// distinct names assigned as `self.NAME` (`self` the first parameter) in
+/// the methods of its body, at most 255. Instances get that many slots
+/// (plus their base class's), so the first ones need no dict mode
+/// (ops.new_inst).
+fn attr_hint(cd: *ClassDef) -> u64 {
+    var names: mem.Vec<str> = mem.Vec.new();
+    for i in 0..cd.body.len {
+        if let Def(f) = cd.body.at(i).s and f.params.len > 0 { hint_body(f.params.at(0).name, f.body, &names); }
+    }
+    let n = if names.len > 255 { 255 } else { names.len };
+    names.free();
+    n
+}
+
+fn hint_body(me: str, b: Body, names: *mem.Vec<str>) {
+    for i in 0..b.len {
+        match b.at(i).s {
+            Assign(ts, _) => { for j in 0..ts.len { hint_target(me, ts.at(j), names); } }
+            AugAssign(_, t, _) => hint_target(me, t, names),
+            AnnAssign(t, _) => hint_target(me, t, names),
+            If(_, x, y) => { hint_body(me, x, names); hint_body(me, y, names); }
+            While(_, x, y) => { hint_body(me, x, names); hint_body(me, y, names); }
+            For(t, _, x, y) => { hint_target(me, t, names); hint_body(me, x, names); hint_body(me, y, names); }
+            With(_, x) => hint_body(me, x, names),
+            Try(t) => {
+                hint_body(me, t.body, names); hint_body(me, t.orelse, names); hint_body(me, t.finalbody, names);
+                for j in 0..t.handlers.len { hint_body(me, t.handlers.at(j).body, names); }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn hint_target(me: str, t: *Expr, names: *mem.Vec<str>) {
+    match t.e {
+        Attr(o, a) => {
+            let Name(n) = o.e else { return; };
+            if !n.eq(me) { return; }
+            for i in 0..names.len { if names.at(i).eq(a) { return; } }
+            names.push(a);
+        }
+        Tuple(xs) => { for i in 0..xs.len { hint_target(me, xs.at(i), names); } }
+        List(xs) => { for i in 0..xs.len { hint_target(me, xs.at(i), names); } }
+        Starred(x) => hint_target(me, x, names),
+        _ => {}
+    }
 }
 
 fn C.apply_decorators(c: *C, decs: Exprs, r: u32) {

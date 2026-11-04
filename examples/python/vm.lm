@@ -148,6 +148,10 @@ pub struct Ctx {
     pre_via2: Value,
     /// Interned dunder names (ops.DN_*).
     dn: [Value; 40],
+    /// The empty instance shape (the root of all shapes) and the shape of
+    /// dict-mode instances (ops.new_inst, value.Inst).
+    shape_root: ?Gc<Box>,
+    shape_dict: ?Gc<Box>,
 }
 
 /// Interned string for a name (kept alive for the run).
@@ -189,6 +193,8 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.pre_via1);
     gc_mark(h, c.pre_via2);
     for i in 0..40 { gc_mark(h, c.dn[i]); }
+    gc_mark(h, c.shape_root);
+    gc_mark(h, c.shape_dict);
 }
 
 pub fn line_of(p: *Proto, pc: *u32) -> u32 {
@@ -557,16 +563,26 @@ pub vm Py {
 
     op GETATTR(dst: reg, obj: reg, name: kst) : ABC + AttrIC {
         if let Inst(o) = obj {
-            let d = o.dict;
+            // Attribute i is `name` if the shape's name i is (interned: one
+            // compare); it is in slot i unless the instance has more
+            // attributes than slots and i is the last slot or past it
+            // (value.inst_at).
+            let sh = o.keys;
+            let n = sh.extra.len;
+            let cap = o.slots.len;
             let i = cache.idx as u64;
-            if likely(i < d.used) {
-                let e = d.ents.e.ptr + i;
-                if e.key == name { dst = e.value; next }
+            if likely(i < n) {
+                if *(sh.extra.ptr + i) == name {
+                    if likely(n <= cap or i + 1 < cap) { dst = *(o.slots.ptr + i); next }
+                    cold { dst = value.inst_at(o, i); next }
+                }
             }
             let j = cache.idx2 as u64;
-            if j < d.used {
-                let e = d.ents.e.ptr + j;
-                if e.key == name { dst = e.value; next }
+            if j < n {
+                if *(sh.extra.ptr + j) == name {
+                    if likely(n <= cap or j + 1 < cap) { dst = *(o.slots.ptr + j); next }
+                    cold { dst = value.inst_at(o, j); next }
+                }
             }
         } else if let Obj(b) = obj and (b.kind == K_CLASS or b.kind == K_MODULE) and let Some(d) = b.dict {
             // A plain attribute of the class (or module) itself; ops.getattr
@@ -587,18 +603,27 @@ pub vm Py {
     }
     op SETATTR(obj: reg, name: kst, src: reg) : ABC + SetIC {
         if let Inst(o) = obj {
-            let d = o.dict;
+            let sh = o.keys;
+            let n = sh.extra.len;
             let i = cache.idx as u64;
-            if likely(i < d.used) {
-                let e = d.ents.e.ptr + i;
-                if e.key == name {
-                    e.value = src;
-                    gc.write_barrier(&ctx.heap, d.ents as *u8);
+            if likely(i < n) {
+                if *(sh.extra.ptr + i) == name {
+                    if likely(n <= o.slots.len or i + 1 < o.slots.len) {
+                        *(o.slots.ptr + i) = src;
+                        gc.write_barrier(&ctx.heap, o as *u8);
+                        next
+                    }
+                    cold { value.inst_set_at(o, i, src); next }
+                }
+            } else if i == n and i < o.slots.len and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
+                // Adding attribute i: the shape's last transition, if it
+                // was for `name` (the dict-mode shape has none).
+                if let Obj(t) = sh.c and *(t.extra.ptr + i) == name {
+                    *(o.slots.ptr + i) = src;
+                    o.keys = t;
+                    gc.write_barrier(&ctx.heap, o as *u8);
                     next
                 }
-            } else if i == d.used and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
-                let Str(s) = name else { trap() };
-                if value.attr_append_new(d, s, src) { next }
             }
         }
         cold {
@@ -1307,10 +1332,10 @@ pub vm Py {
         next
     }
     /// R[dst] = class named R[base] with bases tuple R[base+1] and
-    /// namespace R[base+2].
-    op BUILDCLASS(dst: reg, base: reg) : ABC {
+    /// namespace R[base+2]; its methods set `hint` attributes on self.
+    op BUILDCLASS(dst: reg, base: reg, hint: imm) : ABC {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
-        dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2])?;
+        dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2], hint as u64)?;
         next
     }
     op RAISE(e: reg) : ABC {

@@ -148,6 +148,11 @@ fn meth(c: *Ctx, t: u64, name: str, b: B) {
 }
 
 pub fn setup(c: *Ctx) {
+    // Instance shapes (value.Inst): the empty one, and dict mode's.
+    c.shape_root = Some(value.new_box(&c.heap, value.K_SHAPE, 0));
+    let sd = value.new_box(&c.heap, value.K_SHAPE, 0);
+    sd.n = 1;
+    c.shape_dict = Some(sd);
     let obj = new_class(c, "object", None, (T_OBJECT + 1) as i64);
     c.types[T_OBJECT] = Some(obj);
     let tnames = ["NoneType", "bool", "int", "float", "str", "list", "tuple", "dict", "set", "function",
@@ -543,6 +548,8 @@ pub const CNT_SETINDEX: u64 = 310;
 pub const CNT_INVOKE: u64 = 311;
 pub const CNT_GENNEXT: u64 = 312;
 pub const CNT_CONTAINS: u64 = 313;
+/// Instances moved to dict mode (ops.inst_to_dict).
+pub const CNT_DICTMODE: u64 = 500;
 
 pub fn count(i: u64) { COUNTS[i] += 1; }
 
@@ -891,7 +898,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         ExcInit => {
             let Inst(i) = args[0] else { return Ok(Value.Nil); };
             let t = value.tuple_of(&c.heap, (args + 1).slice(np - 1));
-            value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+            ops.inst_put(c, i, vm.intern(c, "args"), Value.Tuple(t));
             Ok(Value.Nil)
         }
         ObjEq => Ok(Value.Bool(args[0] == args[1])),
@@ -967,7 +974,7 @@ fn stop_iteration(c: *Ctx, it: Value) -> Value {
         let v = g.b;
         g.b = Value.Nil;
         let e = ops.exc_of(c, c.excs[E_STOPITER].unwrap(), v);
-        if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "value"), v); }
+        if let Inst(i) = e { ops.inst_put(c, i, vm.intern(c, "value"), v); }
         return e;
     }
     exc_of_empty(c, E_STOPITER)
@@ -975,9 +982,8 @@ fn stop_iteration(c: *Ctx, it: Value) -> Value {
 
 fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
     let cls = c.excs[kind].unwrap();
-    let d = value.new_attrs(&c.heap, 1);
-    let inst = new(&c.heap, Inst { cls: cls, dict: d });
-    value.attr_set(&c.heap, d, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
+    let inst = ops.new_inst(c, cls);
+    ops.inst_put(c, inst, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0)));
     Value.Inst(inst)
 }
 
