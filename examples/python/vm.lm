@@ -92,6 +92,13 @@ pub const T_SUPER: u64 = 21;
 pub const T_CELL: u64 = 22;
 pub const T_NOTIMPL: u64 = 23;
 
+/// An entry of the global method cache (`Ctx.mcache`, ops.loadmethod's
+/// miss path): name `name` (an interned string's address) looked up on
+/// class `cls` at class epoch `epoch` is entry `idx` of the dict of the
+/// class `depth` steps up the chain (a function).
+pub struct MCEnt { cls: u32, epoch: u32, name: u64, idx: u32, depth: u32 }
+pub const MC_SIZE: u64 = 1024;
+
 pub struct Ctx {
     heap: gc.Heap,
     stack: *Value,
@@ -112,6 +119,8 @@ pub struct Ctx {
     names: mem.Arena,
     /// Bumped whenever a class dict changes (method caches check it).
     epoch: u32,
+    /// MC_SIZE entries (zeroed: class ids start at 1).
+    mcache: *MCEnt,
     next_cls: u32,
     gen_done: bool,
     err_line: u32,
@@ -690,7 +699,16 @@ pub vm Py {
                 _ => {}
             }
         }
-        cold { gc_point(); call_slow(base.raw, base.raw + 1, n as u64, Nil) }
+        cold {
+            // isinstance(instance, class), without the builtin call.
+            if let Builtin(id) = base and id == builtins.b_isinstance() and n == 2 and let Inst(o) = regs[base.raw + 1]
+                and let Obj(cls) = regs[base.raw + 2] and cls.kind == K_CLASS {
+                regs[base.raw] = Bool(ops.subclass(o.cls, cls));
+                next
+            }
+            gc_point();
+            call_slow(base.raw, base.raw + 1, n as u64, Nil)
+        }
     }
     /// Method call after LOADMETHOD: R[base] callee, R[base+1] self or
     /// Undef, then the n arguments.
@@ -708,7 +726,15 @@ pub vm Py {
                 regs[base.raw] = Nil;
                 next
             }
-            cold { gc_point(); call_slow(base.raw, base.raw + 1, n as u64 + 1, Nil) }
+            cold {
+                gc_point();
+                if let Builtin(id) = f and id == builtins.b_list_append() and n == 1 and let List(l) = s {
+                    value.list_push(&ctx.heap, l, regs[base.raw + 2]);
+                    regs[base.raw] = Nil;
+                    next
+                }
+                call_slow(base.raw, base.raw + 1, n as u64 + 1, Nil)
+            }
         }
         cold { gc_point(); call_slow(base.raw, base.raw + 2, n as u64, Nil) }
     }
@@ -779,7 +805,11 @@ pub vm Py {
         }
     }
     op TRUEDIV(dst: reg, a: reg, b: reg) : ABC {
-        if let (Float(x), Float(y)) = (a, b) and y != 0.0 { dst = Float(x / y); next }
+        match (a, b) {
+            (Float(x), Float(y)) => if y != 0.0 { dst = Float(x / y); next },
+            (Float(x), Int(y)) => if y != 0 { dst = Float(x / (y as f64)); next },
+            _ => {}
+        }
         cold {
             match (a, b) {
                 (Int(x), Float(y)) => if y != 0.0 { dst = Float((x as f64) / y); next },

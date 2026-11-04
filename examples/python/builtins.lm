@@ -110,6 +110,8 @@ pub enum B {
 
 #[inline(always)]
 pub fn b_len() -> u32 { B.Len as u32 }
+#[inline(always)]
+pub fn b_isinstance() -> u32 { B.IsInstance as u32 }
 
 #[inline(always)]
 pub fn b_list_append() -> u32 { B.LAppend as u32 }

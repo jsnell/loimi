@@ -99,11 +99,11 @@ pub fn identity_eq(c: *Ctx, op: u32, a: Value, b: Value) -> u32 {
     var inst = false;
     if let Inst(i) = a {
         inst = true;
-        if class_lookup(i.cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(i.cls, dn(c, DN_CMP + C_NE as u64)).is_some() { return 2; }
+        if class_has_eq(c, i.cls) { return 2; }
     }
     if let Inst(i) = b {
         inst = true;
-        if class_lookup(i.cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(i.cls, dn(c, DN_CMP + C_NE as u64)).is_some() { return 2; }
+        if class_has_eq(c, i.cls) { return 2; }
     }
     if !inst { return 2; }
     let same = a == b;
@@ -494,14 +494,25 @@ fn builtin_attr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<Value, Value> uses
 /// The class's __init__ (None if it has none), cached in the class box
 /// (`c`, valid while `b` holds the current class epoch).
 pub fn cached_init(c: *Ctx, cls: Gc<Box>) -> ?Value {
-    if cls.b == Value.Int(c.epoch as i48) {
-        if cls.c == Value.Undef { return None; }
-        return Some(cls.c);
-    }
-    let r = class_lookup(cls, c.n_init.unwrap());
-    cls.c = r ?? Value.Undef;
+    if cls.b != Value.Int(c.epoch as i48) { class_refresh(c, cls); }
+    if cls.c == Value.Undef { return None; }
+    Some(cls.c)
+}
+
+/// The class (or a base) defines `__eq__` or `__ne__` (cached with
+/// `__init__`: flag 4 in `s`).
+pub fn class_has_eq(c: *Ctx, cls: Gc<Box>) -> bool {
+    if cls.b != Value.Int(c.epoch as i48) { class_refresh(c, cls); }
+    (cls.s & 4) != 0
+}
+
+/// Recompute what the class box caches for epoch `c.epoch`: `__init__`
+/// in `c` (Undef: none) and the `__eq__`/`__ne__` flag.
+fn class_refresh(c: *Ctx, cls: Gc<Box>) {
+    cls.c = class_lookup(cls, c.n_init.unwrap()) ?? Value.Undef;
+    let eq = class_lookup(cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(cls, dn(c, DN_CMP + C_NE as u64)).is_some();
+    cls.s = (cls.s & ~4) | (if eq { 4 } else { 0 });
     cls.b = Value.Int(c.epoch as i48);
-    r
 }
 
 pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u32, iepoch: *u32) -> Result<(), Value> uses reenter {
@@ -578,6 +589,25 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
     builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
+            let cls = o.cls;
+            // The global method cache: what the call site's own cache would
+            // hold, for sites that see more classes than it has entries.
+            let me = c.mcache + mc_slot(cls.id, name);
+            if cls.m == 0 and me.cls == cls.id and me.epoch == c.epoch and me.name == (name as u64) {
+                var owner = cls;
+                var d = me.depth;
+                while d > 0 { owner = owner.base ?? owner; d -= 1; }
+                if let Some(od) = owner.dict and (me.idx as u64) < od.used {
+                    let e = od.ents.e.ptr + (me.idx as u64);
+                    if e.key == Value.Str(name) {
+                        *ccls = cls.id;
+                        *cepoch = c.epoch;
+                        *cidx = me.idx;
+                        *cdepth = me.depth;
+                        return Ok((e.value, obj));
+                    }
+                }
+            }
             var ic0: u32 = 0;
             if inst_get(o, name, &ic0).is_none() {
                 if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
@@ -587,6 +617,7 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
                             *cepoch = c.epoch;
                             *cidx = e as u32;
                             *cdepth = depth;
+                            *me = vm.MCEnt { cls: cls.id, epoch: c.epoch, name: name as u64, idx: e as u32, depth: depth };
                         }
                         return Ok((v, obj));
                     }
@@ -630,6 +661,10 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
         }
         _ => builtin_method(c, obj, name, ccls, cepoch, cidx),
     }
+}
+
+fn mc_slot(cls: u32, name: Gc<Str>) -> u64 {
+    (((name as u64) >> 3) *% 0x9e3779b97f4a7c15 +% (cls as u64) *% 0x2545f4914f6cdd1d) >> 54
 }
 
 fn builtin_method(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32)
@@ -1909,7 +1944,10 @@ pub fn slice_indices(c: *Ctx, lo: Value, hi: Value, st: Value, n: u64) -> Result
         else { if stop < -1 { stop = -1; } if stop >= len { stop = len - 1; } }
     }
     var count: i64 = 0;
-    if step > 0 { if stop > start { count = (stop - start + step - 1) / step; } }
+    // Steps of 1 and -1 (nearly all slices) without a division.
+    if step == 1 { if stop > start { count = stop - start; } }
+    else if step == -1 { if start > stop { count = start - stop; } }
+    else if step > 0 { if stop > start { count = (stop - start + step - 1) / step; } }
     else { if start > stop { count = (start - stop + (0 - step) - 1) / (0 - step); } }
     Ok((start, stop, step, count as u64))
 }
