@@ -474,6 +474,21 @@ pub vm Scheme {
         }
         cold { raise index_err(ctx, "vector-ref", v, i) }
     }
+    /// vector-ref with a constant index (record fields, small tuples).
+    op VREFI(dst: reg, v: reg, i: imm) : ABC {
+        if let Vec(x) = v and (i as u64) < x.data.len {
+            dst = x.data.ptr[i as u64];
+            next
+        }
+        cold { raise index_err(ctx, "vector-ref", v, Int(i as i32)) }
+    }
+    op VSETI(v: reg, i: imm, src: reg) : ABC {
+        if let Vec(x) = v and (i as u64) < x.data.len {
+            x.data.ptr[i as u64] = src;
+            next
+        }
+        cold { raise index_err(ctx, "vector-set!", v, Int(i as i32)) }
+    }
     op VSET(v: reg, i: reg, src: reg) : ABC {
         if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
             x.data.ptr[j as u32 as u64] = src;
@@ -719,6 +734,18 @@ pub vm Scheme {
     #[forward] super EQ_TEST = EQ; TEST;
     #[forward] super NOT_TEST = NOT; TEST;
     #[forward] super ZEROP_TEST = ZEROP; TEST;
+    #[forward] super NUMEQ_TESTT = NUMEQ; TESTT;
+    #[forward] super EQ_TESTT = EQ; TESTT;
+    #[forward] super EQV_TEST = EQV; TEST;
+    // Overlaps another super, but runs outside TESTT; RET: 4% of nboyer's ops.
+    #[allow(super_overlap)]
+    #[forward] super PAIRP_TESTT = PAIRP; TESTT;
+    // Returning a constant ('(), #t, #f): 13 of the programs.
+    super LOADK_RET = LOADK; RET;
+    #[forward] super CAR_CAR = CAR; CAR;
+    // Overlaps CAR_CAR, but runs outside it: (cadr x), (caddr x).
+    #[allow(super_overlap)]
+    #[forward] super CDR_CAR = CDR; CAR;
     // Loops, argument set-up and list walking.
     #[forward] super MOVE_MOVE = MOVE; MOVE;
     // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.

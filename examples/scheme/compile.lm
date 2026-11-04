@@ -1867,6 +1867,14 @@ fn Gen.effect(g: *Gen, n: *Node) {
         Prim => {
             // Mutators need no result.
             if n.po == PO.SetCar or n.po == PO.SetCdr or n.po == PO.Vset {
+                if n.po == PO.Vset and let Some(k) = small_const(n.list.at(1)) and k >= 0 {
+                    let a = g.any(n.list.at(0)) as u8;
+                    let c = g.any(n.list.at(2)) as u8;
+                    g.emit(Scheme.VSETI(a, k as u8, c));
+                    g.reset(save);
+                    g.fs.line = saved_line;
+                    return;
+                }
                 let a = g.any(n.list.at(0)) as u8;
                 let b = g.any(n.list.at(1)) as u8;
                 if n.po == PO.Vset {
@@ -2380,6 +2388,17 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
             _ => Scheme.CDR(d, a),
         };
         g.emit(w);
+        return;
+    }
+    if (po == PO.Vref or po == PO.Vset) and let Some(k) = small_const(args.at(1)) and k >= 0 {
+        let a = g.any(args.at(0)) as u8;
+        if po == PO.Vref {
+            g.emit(Scheme.VREFI(d, a, k as u8));
+        } else {
+            let c = g.any(args.at(2)) as u8;
+            g.emit(Scheme.VSETI(a, k as u8, c));
+            g.load_const(value.unspec(), dst);
+        }
         return;
     }
     let a = g.any(args.at(0)) as u8;
