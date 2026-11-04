@@ -91,10 +91,13 @@ pub value V repr nanbox {
 /// bits of its hash above them, so probes rarely touch the strings. 0 is
 /// an empty slot and 1 a tombstone. Weak: a sweeper turns strings the
 /// collector did not mark into tombstones. Reached through the heap's
-/// `user` pointer.
-pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64 }
+/// `user` pointer. `buf` is a byte buffer kept between the natives that
+/// build strings (`take_buf`).
+pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, buf: text.StrBuf }
 
 const TOMB: u64 = 1;
+/// Prefetch distance of `sweep_strings`, in slots.
+const PF: u64 = 16;
 const ADDR: u64 = 0xFFFFFFFFFFFF;
 const HTAG: u64 = 0xFFFF000000000000;
 
@@ -109,6 +112,7 @@ fn str_at(w: u64) -> Gc<Str> {
 pub fn init_strings(h: *gc.Heap) {
     let st: *Strings = mem.alloc(1);
     st.cap = 0;
+    st.buf = text.StrBuf.new();
     strings_resize(st, 1024);
     h.user = st as *u8;
     h.add_sweeper(st as *u8, sweep_strings);
@@ -140,7 +144,12 @@ fn strings_resize(st: *Strings, cap: u64) {
 fn sweep_strings(h: *gc.Heap, data: *u8) {
     let st = data as *Strings;
     let slots = st.slots;
-    for i in 0..st.cap {
+    let cap = st.cap;
+    for i in 0..cap {
+        // The live strings' headers are scattered over the heap: start
+        // loading the one PF slots ahead (empty slots and tombstones
+        // prefetch near address 0, which is harmless).
+        if i + PF < cap { (((slots[i + PF] & ADDR) -% 16) as *u8).prefetch(); }
         let w = slots[i];
         if w > TOMB and !h.is_marked((w & ADDR) as *u8) {
             slots[i] = TOMB;
@@ -148,6 +157,28 @@ fn sweep_strings(h: *gc.Heap, data: *u8) {
         }
     }
     if st.cap > 1024 and st.live * 8 < st.cap { strings_resize(st, st.cap / 2); }
+}
+
+/// An empty buffer to build a string in: the kept one if it is free
+/// (saving a malloc and its regrowth per call), else a new one. Hand it
+/// back with `give_buf` (or free it).
+pub fn take_buf(h: *gc.Heap) -> text.StrBuf {
+    let st = h.user as *Strings;
+    var b = st.buf;
+    st.buf = text.StrBuf.new();
+    b.clear();
+    b
+}
+
+/// Keep `b` for the next `take_buf` if none is kept, else free it.
+pub fn give_buf(h: *gc.Heap, b: *text.StrBuf) {
+    let st = h.user as *Strings;
+    if st.buf.bytes.cap == 0 {
+        st.buf = *b;
+        *b = text.StrBuf.new();
+    } else {
+        b.free();
+    }
 }
 
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {

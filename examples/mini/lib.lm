@@ -205,7 +205,7 @@ fn arg(args: *V, n: u64, i: u64) -> V {
 
 fn take_str(h: *gc.Heap, b: *text.StrBuf) -> V {
     let v = V.S(value.new_str(h, b.as_str()));
-    b.free();
+    value.give_buf(h, b);
     v
 }
 
@@ -285,10 +285,10 @@ fn check_table(h: *gc.Heap, args: *V, n: u64, i: u64, fname: str) -> Result<Gc<T
 /// `v` converted as by tostring.
 fn to_str(h: *gc.Heap, v: V) -> Gc<Str> {
     if let S(s) = v { return s; }
-    var b = text.StrBuf.new();
+    var b = value.take_buf(h);
     value.write_value(&b, v);
     let s = value.new_str(h, b.as_str());
-    b.free();
+    value.give_buf(h, &b);
     s
 }
 
@@ -494,7 +494,15 @@ fn str_byte(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
 }
 
 fn str_char(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
-    var b = text.StrBuf.new();
+    if n == 1 {
+        if let Int(c) = args[0] {
+            if c >= 0 and c <= 255 {
+                var one: [u8; 1] = [c as u8];
+                return Ok(V.S(value.new_str(h, one[0..1])));
+            }
+        }
+    }
+    var b = value.take_buf(h);
     for i in 0..n {
         let c = check_int(h, args, n, i, "char")?;
         if c < 0 or c > 255 {
@@ -514,7 +522,7 @@ fn str_rep(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
     if (k as u64) >= (1 << 31) / l {
         return Err(V.S(value.new_str(h, "resulting string too large")));
     }
-    var b = text.StrBuf.new();
+    var b = value.take_buf(h);
     for r in 0..k as u64 { b.push_str(s.data); }
     Ok(take_str(h, &b))
 }
@@ -554,7 +562,7 @@ fn bad_spec(h: *gc.Heap, spec: str, b: *text.StrBuf, known: bool) -> V {
 fn str_format(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
     let fs = check_str(h, args, n, 0, "format")?;
     let f = fs.data;
-    var b = text.StrBuf.new();
+    var b = value.take_buf(h);
     var buf: [u8; 512] = [0; 512];
     var form: [u8; 32] = [0; 32];
     var argi: u64 = 0;
@@ -693,7 +701,7 @@ fn tab_concat(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
     if arg(args, n, 1) != V.Nil { sep = check_str(h, args, n, 1, "concat")?.data; }
     let i = opt_int(h, args, n, 2, "concat", 1)?;
     let j = opt_int(h, args, n, 3, "concat", value.table_len(t))?;
-    var b = text.StrBuf.new();
+    var b = value.take_buf(h);
     var k = i;
     while k <= j {
         let v = value.table_get(t, key(k));
