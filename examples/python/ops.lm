@@ -676,7 +676,7 @@ fn class_refresh(c: *Ctx, cls: Gc<Box>) {
     cls.b = Value.Int(c.epoch as i48);
 }
 
-pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u32, iepoch: *u32) -> Result<(), Value> uses reenter {
+pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32) -> Result<(), Value> uses reenter {
     builtins.count(builtins.CNT_SETATTR);
     match obj {
         Inst(o) => {
@@ -706,11 +706,12 @@ pub fn setattr(c: *Ctx, obj: Value, name: Gc<Str>, v: Value, ic: *u32, icls: *u3
             }
             if let Some(i) = inst_set(c, o, name, v) {
                 *ic = i as u32;
-                // Adding this name to instances of this class with `i`
-                // attributes (SETATTR's add path, through the shape's last
-                // transition) is safe while no class changes.
-                if cv.is_none() { *icls = o.cls.id; *iepoch = c.epoch; }
-                else { *icls = 0; }
+                // Adding this name through the shape's last transition
+                // (SETATTR's add path) is safe while no class changes: the
+                // shape reached records the epoch at which the class had
+                // no attribute `name`. Only in a class's own shape tree,
+                // whose shapes no other class's instances use.
+                if cv.is_none() and CLASS_SHAPE < o.cls.extra.len { o.keys.a = Value.Int(c.epoch as i48); }
             }
             Ok(())
         }

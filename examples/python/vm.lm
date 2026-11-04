@@ -243,9 +243,8 @@ pub vm Py {
     cache SetGIC { idx: u32 }
     /// Two entry numbers: attribute reads see instances of two layouts.
     cache AttrIC { idx: u32, idx2: u32 }
-    /// SETATTR: idx is where the attribute is (or, for instances of class
-    /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
-    cache SetIC { idx: u32, cls: u32, epoch: u32 }
+    /// SETATTR: idx is where the attribute is (adding one does not use it).
+    cache SetIC { idx: u32 }
     /// Two classes (deltablue's call sites see several).
     /// Instances: four entries (class id, the method's bits), most recent
     /// first, valid at class epoch `epoch` (see ops.method_value); modules
@@ -635,7 +634,6 @@ pub vm Py {
     op SETATTR(obj: reg, name: kst, src: reg) : ABC + SetIC {
         if let Inst(o) = obj {
             let sh = o.keys;
-            let n = sh.extra.len;
             let i = cache.idx as u64;
             if likely(i < sh.s as u64) {
                 if *(sh.extra.ptr + i) == name {
@@ -643,15 +641,18 @@ pub vm Py {
                     gc.write_barrier(&ctx.heap, o as *u8);
                     next
                 }
-            } else if i == n and i < o.slots.len and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
-                // Adding attribute i: the shape's last transition, if it
-                // was for `name` (the dict-mode shape has none).
-                if let Obj(t) = sh.c and *(t.extra.ptr + i) == name {
-                    *(o.slots.ptr + i) = src;
-                    o.keys = t;
-                    gc.write_barrier(&ctx.heap, o as *u8);
-                    next
-                }
+            }
+            // Adding attribute n (whatever the cache says: sites in a
+            // base's __init__ add at different positions): the shape's last
+            // transition, if it was for `name` (the dict-mode shape has
+            // none) and the class had no attribute `name` at this epoch
+            // (ops.setattr records it in the shape, `a`).
+            let n = sh.extra.len;
+            if n < o.slots.len and let Obj(t) = sh.c and *(t.extra.ptr + n) == name and t.a == Int(ctx.epoch as i48) {
+                *(o.slots.ptr + n) = src;
+                o.keys = t;
+                gc.write_barrier(&ctx.heap, o as *u8);
+                next
             }
         }
         cold {
@@ -661,7 +662,7 @@ pub vm Py {
             }
             gc_point();
             let Str(s) = name else { trap() };
-            ops.setattr(ctx, obj, s, src, &cache.idx, &cache.cls, &cache.epoch)?;
+            ops.setattr(ctx, obj, s, src, &cache.idx)?;
             next
         }
     }
