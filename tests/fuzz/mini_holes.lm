@@ -36,7 +36,8 @@ import coro;
 /// did not, the Proto holds it anyway (`build_assume_verified`): the
 /// reproducers exist to run code that the verifier used to accept.
 fn proto(h: *gc.Heap, nregs: u32, code: []u32, kids: []Gc<Proto>) -> (Gc<Proto>, bool) {
-    let protos = new(h, Protos {}, kids.len);
+    // unsafe: zero-filled (null `Gc`s), every element set on the next line.
+    let protos = unsafe { new(h, Protos {}, kids.len) };
     for i in 0..kids.len { protos.data[i] = kids[i]; }
     let lines = new(h, Lines {}, code.len);
     for i in 0..code.len { lines.data[i] = 0; }

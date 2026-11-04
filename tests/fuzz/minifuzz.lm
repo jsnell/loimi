@@ -113,7 +113,8 @@ fn gen_proto(h: *gc.Heap, r: *Rng, children: []Gc<Proto>, parent_nregs: u32, top
             else { V.Nil };
     }
     let lines = new(h, Lines {}, len);
-    let protos = new(h, Protos {}, children.len);
+    // unsafe: zero-filled (null `Gc`s), every element set on the next line.
+    let protos = unsafe { new(h, Protos {}, children.len) };
     for i in 0..children.len { protos.data[i] = children[i]; }
     let updesc = new(h, UpDescs {}, nup);
     for i in 0..nup { updesc.data[i] = 256 | r.below(parent_nregs as u64) as u32; }

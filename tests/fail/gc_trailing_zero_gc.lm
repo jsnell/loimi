@@ -1,0 +1,10 @@
+// A zero-filled trailing array of `Gc`s would hold null references
+// (`0 as Gc<T>` needs `unsafe`).
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [Gc<Node>] }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 4);
+}
+// error: `new` would zero-fill the trailing array `items: [Gc<Node>]`, and zero is a null `Gc<Node>`

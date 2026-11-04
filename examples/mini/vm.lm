@@ -588,7 +588,9 @@ pub vm Mini {
         let parent = fp.cl;
         let p = parent.proto.protos.data.ptr[i];
         let n = p.nupvals as u64;
-        let c = new(&ctx.heap, Closure { proto: p }, n);
+        // unsafe: zero-filled (null `Gc`s); the loop below sets every
+        // upvalue before the closure is reachable.
+        let c = unsafe { new(&ctx.heap, Closure { proto: p }, n) };
         for j in 0..n {
             let d = p.updesc.data.ptr[j];
             if d >= 256 {

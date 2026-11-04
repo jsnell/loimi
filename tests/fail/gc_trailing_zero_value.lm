@@ -1,0 +1,9 @@
+// A nanbox without an unboxed variant: the word 0 encodes no variant.
+import std.gc;
+value V repr nanbox { Int(i32), Nil }
+object Arr { items: [V] }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 4);
+}
+// error: zero is no variant of `V` (the word 0 encodes none)

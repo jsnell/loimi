@@ -179,6 +179,22 @@ implementation; `git log` has the details.
 
 ### GC
 
+- **GC objects are checked in every module**
+  ([design/safety.md §8](docs/design/safety.md),
+  [language.md §8](docs/language.md#8-gc-integration)): a slice of an
+  object's traced trailing array passed to a function that may store
+  through it gets the write barrier after the call (it got none, and
+  generational heaps could free a young object it stored; std.dict's
+  hand-written barrier is gone); keeping such a slice (`var`, return,
+  field) or storing through a `let` that holds one is an error, as is
+  passing it to a function that may collect and store. Trailing arrays
+  start zero-filled only where zero is a valid element (no null `Gc`, no
+  word that is no variant of a `value` type); otherwise `new(h, X { .. },
+  n, v)` fills them, or `unsafe { new(..) }`. The objects of a
+  `#![safe]` module are built and written only by that module (Python's
+  one write to a dict field is `KeyDict.use_up_room()` now), and in a
+  `#![safe]` module another module's objects are treated like structs
+  with raw pointers.
 - **Frameless allocation and barriers in handlers**: `try_new(h, T { .. })
   -> ?Gc<T>` (no refill call) with `gc.make_room` in a cold block that
   `redo`es; the write barrier's slow path makes no call (a full
@@ -273,7 +289,9 @@ implementation; `git log` has the details.
   u64)` on a register operand compiles to a `double` load of the slot
   ([language.md](docs/language.md), [lowering.md §2](docs/lowering.md)),
   and a checked register window was measured and declined
-  ([roadmap question 7](docs/roadmap.md)).
+  ([roadmap question 7](docs/roadmap.md)). (Since the zero-fill rule,
+  five `unsafe { new(..) }` allocate `Gc` arrays that are filled right
+  after: [design/safety.md §8](docs/design/safety.md).)
 - [`examples/wasm`](examples/wasm): a WebAssembly interpreter that
   passes every non-SIMD spec test file.
 - [`examples/python`](examples/python): a Python 3 subset running 11

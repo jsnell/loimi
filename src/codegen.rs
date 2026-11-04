@@ -1336,7 +1336,7 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.poison(&e.ty)
             }
             TK::Vm(v) => crate::vmgen::vm_expr(self, e, v),
-            TK::New { heap, init, len, fast } => crate::gcgen::new_object(self, e, heap, init, len.as_deref(), *fast),
+            TK::New { heap, init, len, fill, fast } => crate::gcgen::new_object(self, e, heap, init, len.as_deref(), fill.as_deref(), *fast),
             TK::Trailing(obj) => crate::gcgen::trailing(self, obj),
         }
     }

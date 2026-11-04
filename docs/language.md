@@ -1025,7 +1025,15 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   from `new`, from a field or value that holds one, or from
   `unsafe { p as Gc<T> }`. The collector marks through every `Gc` it
   finds, so a bad one corrupts the heap far from the bug; that is the one
-  conversion the compiler makes you mark.
+  conversion the compiler makes you mark. For the same reason a
+  trailing array starts zero-filled only where zero is a valid element
+  (not a null `Gc`, not a word that encodes no variant of a `value`
+  type: section 8), and the compiler keeps the write barrier on stores
+  through slices of an object's trailing array (section 8). In every
+  module, the objects of a `#![safe]` module are built and written only
+  by that module's code; in a `#![safe]` module, another module's
+  `object` is treated like a struct with raw pointers
+  (`docs/design/safety.md` section 8).
 - **Bytecode is checked once, by the verifier** (section 6), and operand
   accesses in handlers are unchecked because it ran, not because of an
   annotation.
@@ -3052,7 +3060,31 @@ enough to make it precise and cheap:
 
 - **`object` declarations** are GC-managed structs. The compiler generates the
   header (type id, mark bits) and the trace function from field types.
-  A trailing variable-length array is allowed (`slots: [Value]`).
+  A trailing variable-length array is allowed (`slots: [Value]`):
+  `new(h, Obj { .. }, n)` allocates it with `n` elements, zero-filled.
+  That is allowed only where zero is a valid element: numbers, `bool`,
+  options, slices, raw pointers (outside `#![safe]` modules), aggregates
+  of those, an enum whose discriminant-0 variant is, and a `value` type
+  whose word 0 encodes a variant without a reference (a nanbox's unboxed
+  `0.0`, a low-tag integer with tag 0); generic objects are checked per
+  instance. Otherwise pass a fill value, `new(h, Obj { .. }, n, v)`, use
+  `?Gc<T>` elements, or write `unsafe { new(h, Obj { .. }, n) }` where
+  every element is set before anything reads it. A literal length `0`
+  needs none of these.
+
+  <!-- snippet: fail "zero is a null `Gc<Node>`"
+  import std.gc;
+  object Node { v: i64 }
+  object Arr { items: [Gc<Node>] }
+  fn f(h: *gc.Heap, one: Gc<Node>) {
+  {snippet}
+  }
+  fn main() {}
+  -->
+  ```loimi
+  let a = new(h, Arr {}, 4);              // error: four null Gc<Node>s
+  let b = new(h, Arr {}, 4, one);         // four references to `one`
+  ```
 - **Custom tracing.** `#[trace(f)]` on an `object` names a function of
   the same module, `fn f(h: *gc.Heap, obj: Gc<Obj>)` without effects,
   that the trace function calls after tracing the declared fields,
@@ -3089,6 +3121,36 @@ enough to make it precise and cheap:
   [`stdlib/gc.md`](stdlib/gc.md#as-implemented). Stores through other
   raw pointers into objects need `gc.write_barrier(h, obj)`, and
   `heap.set_verify(true)` finds the missing ones.)
+- **Slices of trailing arrays.** `o.items` is a `[]T` slice, which does
+  not know its object, so the compiler restricts where one with traced
+  elements can go (in every module): it may be indexed, sub-sliced,
+  iterated, bound by `let` and read, or passed straight to a function.
+  Each function's traced slice and pointer parameters are summarized
+  (does it store a reference through it, keep it beyond the call, or
+  pass it on to one that does?); a call that may store gets the barrier
+  on `o` after it, and must not collect, since a collection between the
+  store and the barrier would miss the young object. Keeping such a
+  slice in a `var`, a field or a return value, storing through a `let`
+  that holds one, passing one to a function that may keep it, or to one
+  that may collect and store, is an error. In `#![safe]` modules the same holds for `&o.f` of a traced
+  field (elsewhere that is a raw pointer, under the rule above).
+
+  <!-- snippet: fail "is stored through (held in a local)"
+  import std.gc;
+  object Node { v: i64 }
+  object Arr { items: [?Gc<Node>] }
+  fn put(s: []?Gc<Node>, n: Gc<Node>) { s[0] = Some(n); }
+  fn f(a: Gc<Arr>, n: Gc<Node>) {
+  {snippet}
+  }
+  fn main() {}
+  -->
+  ```loimi
+  put(a.items, n);          // the barrier on `a` follows the call
+  let s = a.items;
+  let k = s.len;            // reading through `s` is fine
+  s[0] = Some(n);           // error: no barrier would run
+  ```
 - **Weak references** are library types: `heap.new_weak(x)` gives a
   `Gc<gc.Weak<T>>` that reads None once `x` died, and
   `gc.Ephemerons<K, V>` maps objects to values that only the key keeps

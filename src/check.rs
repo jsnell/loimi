@@ -2098,6 +2098,7 @@ impl<'a> Checker<'a> {
                     return Err(Diag::new(span, format!("`{}` is not a struct", name.name)));
                 };
                 let defs = self.prog.structs[sid as usize].fields.clone();
+                self.check_safe_object_literal(cx, sid, span)?;
                 if self.foreign_raw_struct(cx, &ty) {
                     self.raw_op(cx, span, "struct_lit", || format!("building a `{}` (another module's struct with raw pointers) with a literal", name.name), "use its module's constructor (`Vec.new()`)")?;
                 }
@@ -4209,8 +4210,11 @@ impl<'a> Checker<'a> {
         }
         if name == "new" || name == "try_new" {
             let fast = name == "try_new";
-            if args.len() != 2 && args.len() != 3 {
-                return Err(Diag::new(span, format!("`{}` takes a heap, an object literal, and (for trailing arrays) a length", name)));
+            if !(2..=4).contains(&args.len()) {
+                return Err(Diag::new(
+                    span,
+                    format!("`{}` takes a heap, an object literal, and (for trailing arrays) a length and optionally a fill value", name),
+                ));
             }
             let h = match heap.take() {
                 Some(h) => h,
@@ -4251,17 +4255,50 @@ impl<'a> Checker<'a> {
                     ));
                 }
             }
-            let len = match (&sd.trailing, args.len()) {
-                (Some(_), 3) => Some(Box::new(self.expr_coerce(cx, &args[2], &Ty::Int(IntTy::U64))?)),
+            let verified = sd.verified.is_some();
+            let trailing = sd.trailing.clone();
+            let len = match (&trailing, args.len()) {
+                (Some(_), 3 | 4) => Some(Box::new(self.expr_coerce(cx, &args[2], &Ty::Int(IntTy::U64))?)),
                 (None, 2) => None,
                 (Some(_), _) => return Err(Diag::new(span, "this object has a trailing array: pass its length")),
                 (None, _) => return Err(Diag::new(span, "this object has no trailing array")),
             };
+            let fill = match (&trailing, args.get(3)) {
+                (Some((_, et)), Some(a)) => {
+                    let et = et.clone();
+                    Some(Box::new(self.expr_coerce(cx, a, &et)?))
+                }
+                _ => None,
+            };
+            // Zero-filled, the trailing array must hold valid values: no
+            // null `Gc` (which only `unsafe` can make), no word that
+            // encodes no variant of a `value` type.
+            if let (Some((tn, et)), None, Some(l)) = (&trailing, &fill, &len) {
+                let empty = matches!(l.kind, TK::Int(0));
+                let safe = self.modules[cx.module].safe;
+                if !empty && !verified && cx.unsafe_depth == 0 {
+                    if let Some(why) = self.zero_invalid(et, safe, 0) {
+                        let (tn, etn, on) = (tn.clone(), self.ty_name(et), self.ty_name(&init.ty));
+                        let opt = if matches!(et, Ty::Gc(_)) { format!(", use `?{}` elements", etn) } else { String::new() };
+                        return Err(Diag::new(
+                            span,
+                            format!("`{}` would zero-fill the trailing array `{}: [{}]`, and zero is {}", name, tn, etn, why),
+                        )
+                        .note(
+                            span,
+                            format!(
+                                "pass the value to fill it with (`{}(h, {} {{ .. }}, n, v)`){}, or, if every element is set before anything reads it, write the `{}` inside `unsafe {{ }}`",
+                                name, on, opt, name
+                            ),
+                        ));
+                    }
+                }
+            }
             let mut t = Ty::Gc(Box::new(init.ty.clone()));
             if fast {
                 t = Ty::Option(Box::new(t));
             }
-            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len, fast }, span)));
+            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len, fill, fast }, span)));
         }
         if name == "__verified_words" {
             // In a vm's generated code (`Vm.build_verified`): the words of

@@ -19,9 +19,8 @@ fn push<T>(h: *gc.Heap, l: ?Gc<Cell<T>>, v: T) -> Gc<Cell<T>> {
 }
 
 fn make<V>(h: *gc.Heap, tag: u64, n: u64, fill: V) -> Gc<Obj<V>> {
-    let o: Gc<Obj<V>> = new(h, Obj { tag: tag }, n);
-    for i in 0..o.inline.len { o.inline[i] = fill; }
-    o
+    // A fill value: zero is no valid `Gc<Leaf>` (language.md section 8).
+    new(h, Obj { tag: tag }, n, fill)
 }
 
 /// `Gc<T>` for any object type T: the reference survives a collection

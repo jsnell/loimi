@@ -292,7 +292,9 @@ pub enum TK {
     /// `new(heap, Obj { .. })` / `new(heap, Obj { .. }, n)`: allocate a GC object.
     /// `fast`: `try_new`, which only takes the allocator's inline path and
     /// gives `None` where `new` would refill a free list.
-    New { heap: B, init: B, len: Option<B>, fast: bool },
+    /// `fill`: `new(heap, Obj { .. }, n, v)`, the value every element of
+    /// the trailing array starts as (else zero bytes).
+    New { heap: B, init: B, len: Option<B>, fill: Option<B>, fast: bool },
     /// The trailing array of an object, as a slice.
     Trailing(B),
     /// A closure literal: the closure's function and the captured locals,
@@ -660,4 +662,7 @@ pub struct Program {
     /// escape, or pass on to one that does (`objref`). A call passing an
     /// object's traced trailing array there gets the write barrier after it.
     pub ref_writes: std::collections::HashMap<FnId, u64>,
+    /// As `ref_writes`, the parameters it may keep beyond the call (return,
+    /// store, capture): no object slice may be passed there.
+    pub ref_keeps: std::collections::HashMap<FnId, u64>,
 }

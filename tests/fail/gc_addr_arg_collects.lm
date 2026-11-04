@@ -1,0 +1,17 @@
+// A method on a traced field of an object (`o.pair.set(..)` passes
+// `&o.pair`) gets the write barrier after the call; that cannot cover a
+// method that may collect after storing, in any module.
+import std.gc;
+object Node { v: i64 }
+struct Pair { a: ?Gc<Node>, b: ?Gc<Node> }
+object Holder { pair: Pair }
+fn Pair.fill(p: *Pair, h: *gc.Heap) uses gc {
+    p.a = Some(new(h, Node { v: 1 }));
+    gc.collect(h);
+}
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let o = new(&heap, Holder { pair: Pair { a: None, b: None } });
+    o.pair.fill(&heap);
+}
+// error: the address of a traced place inside an object is passed to a call that may collect and may store through it

@@ -1,0 +1,8 @@
+// ... and built only by it.
+import std.gc;
+import safe_mod.safelib;
+fn main() {
+    var heap = gc.Heap.new();
+    let c = new(&heap, safelib.Counter { n: 7 }, 2);
+}
+// error: building a `Counter`: the objects of `safe_mod.safelib` (a `#![safe]` module) are made and written only by its own code

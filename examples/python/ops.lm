@@ -1406,8 +1406,7 @@ pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
     }
     match (a, b) {
         (Str(x), Str(y)) => Ok(Some(mem.compare_bytes(x.data, y.data))),
-        (List(x), List(y)) => seq_order(c, x.arr.items[0..x.len], y.arr.items[0..y.len]),
-        (Tuple(x), Tuple(y)) => seq_order(c, x.items, y.items),
+        (List(_), List(_)) | (Tuple(_), Tuple(_)) => seq_order(c, a, b),
         (Inst(_), _) | (_, Inst(_)) => {
             if compare(c, C_LT, a, b)? { return Ok(Some(-1)); }
             if compare(c, C_GT, a, b)? { return Ok(Some(1)); }
@@ -1423,14 +1422,21 @@ pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
     }
 }
 
-fn seq_order(c: *Ctx, xs: []Value, ys: []Value) -> Result<?i32, Value> uses reenter {
-    let n = if xs.len < ys.len { xs.len } else { ys.len };
-    for i in 0..n {
-        if !equal(c, xs[i], ys[i])? {
-            return order(c, xs[i], ys[i]);
+/// Lexicographic order of two lists or two tuples. `__eq__` may change
+/// a list (and move its items to a new array, letting the
+/// collector free the old one), so each step reads the current items, as
+/// CPython does.
+fn seq_order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
+    var i: u64 = 0;
+    loop {
+        let (Some(x), Some(y)) = (value.seq_at(a, i), value.seq_at(b, i)) else { break; };
+        if !equal(c, x, y)? {
+            return order(c, x, y);
         }
+        i += 1;
     }
-    Ok(Some(if xs.len < ys.len { -1 } else if xs.len > ys.len { 1 } else { 0 }))
+    let (n, m) = (value.seq_len(a), value.seq_len(b));
+    Ok(Some(if n < m { -1 } else if n > m { 1 } else { 0 }))
 }
 
 // ── containers ──────────────────────────────────────────────────────

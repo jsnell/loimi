@@ -78,13 +78,83 @@ impl Checker<'_> {
     /// and enum type (`Outer { inner: Inner }` with `Inner { p: *u8 }`,
     /// a struct holding a `Vec`), since the outer module's invariants may
     /// tie the inner pointers to its other fields.
+    ///
+    /// An `object` of another module counts too, whatever its fields: its
+    /// module's code relies on them (a `std.dict.Dict`'s `used` and
+    /// `popped`, an inline cache's shape), and objects have no other way
+    /// to keep them private.
     pub fn foreign_raw_struct(&self, cx: &FnCx, t: &Ty) -> bool {
         let Ty::Struct(sid) = t else { return false };
         let Some(&m) = self.struct_module.get(sid) else { return false };
         if m == cx.module {
             return false;
         }
-        self.prog.structs[*sid as usize].fields.iter().any(|(_, t)| self.deep_raw(t, 0))
+        let sd = &self.prog.structs[*sid as usize];
+        sd.object.is_some() || sd.fields.iter().any(|(_, t)| self.deep_raw(t, 0))
+    }
+
+    /// The `object` type whose field or trailing array place `e` writes
+    /// directly (`o.f`, `o.f.g`, `o.f[i]`, `o.items[i]`, `o.items[a..b][i]`),
+    /// if any.
+    fn written_object(e: &TExpr) -> Option<&Ty> {
+        match &e.kind {
+            TK::Field(b, _) => match &b.kind {
+                TK::Deref(o) if matches!(o.ty, Ty::Gc(_)) => Some(&b.ty),
+                _ if matches!(b.ty, Ty::Struct(_) | Ty::Tuple(_) | Ty::Array(..)) => Self::written_object(b),
+                _ => None,
+            },
+            TK::Index(b, _) | TK::SliceRange(b, _, _) => match &b.kind {
+                TK::Trailing(o) => match &o.ty {
+                    Ty::Gc(t) => Some(&**t),
+                    _ => None,
+                },
+                TK::SliceRange(..) => Self::written_object(b),
+                _ if matches!(b.ty, Ty::Array(..)) => Self::written_object(b),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A literal of an `object` of another, `#![safe]` module (`new(h,
+    /// dict.Dict { .. })`): its fields are that module's to set.
+    pub fn check_safe_object_literal(&self, cx: &FnCx, sid: u32, span: Span) -> Res<()> {
+        if cx.unsafe_depth > 0 || cx.vm.is_some() || self.generated_files.contains(&span.file) || self.prog.structs[sid as usize].object.is_none() {
+            return Ok(());
+        }
+        let Some(&m) = self.struct_module.get(&sid) else { return Ok(()) };
+        if m == cx.module || !self.modules[m].safe {
+            return Ok(());
+        }
+        let mname = self.modules[m].path.join(".");
+        Err(Diag::new(
+            span,
+            format!("building a `{}`: the objects of `{}` (a `#![safe]` module) are made and written only by its own code", self.ty_name(&Ty::Struct(sid)), mname),
+        )
+        .note(span, format!("use the functions of `{}`", mname)))
+    }
+
+    /// Writing place `e` (or taking its address) from another module
+    /// than the one declaring the `object` it lies in, when that module is
+    /// `#![safe]`: its objects' fields and trailing arrays are written
+    /// only by its own code (or in `unsafe { }`), so it can rely on them.
+    /// In every module.
+    pub fn check_safe_object_write(&self, cx: &FnCx, e: &TExpr, span: Span) -> Res<()> {
+        if cx.unsafe_depth > 0 || cx.vm.is_some() || self.generated_files.contains(&span.file) {
+            return Ok(());
+        }
+        let Some(Ty::Struct(sid)) = Self::written_object(e) else { return Ok(()) };
+        let Some(&m) = self.struct_module.get(sid) else { return Ok(()) };
+        if m == cx.module || !self.modules[m].safe {
+            return Ok(());
+        }
+        let what = match &e.kind {
+            TK::Field(b, idx) if matches!(b.kind, TK::Deref(_)) => self.field_name(&b.ty, *idx),
+            _ => format!("a field or element of `{}`", self.ty_name(&Ty::Struct(*sid))),
+        };
+        let mname = self.modules[m].path.join(".");
+        Err(Diag::new(span, format!("writing {}: the objects of `{}` (a `#![safe]` module) are written only by its own code", what, mname))
+            .note(span, format!("use the functions of `{}`, which relies on its objects' fields for memory safety (or write it in `unsafe {{ }}`)", mname)))
     }
 
     /// Whether `t` contains a raw pointer anywhere by value: through
@@ -120,6 +190,57 @@ impl Checker<'_> {
             Ty::Struct(s) => self.prog.structs[*s as usize].fields.iter().any(|(_, t)| self.zero_is_null_ptr(t, depth + 1)),
             Ty::Enum(e) => self.prog.enums[*e as usize].variants.first().is_some_and(|v| v.fields.iter().any(|t| self.zero_is_null_ptr(t, depth + 1))),
             _ => false,
+        }
+    }
+
+    /// Why the all-zero bytes are not a valid value of `t`, if they are
+    /// not: what `new(h, X { .. }, n)` zero-fills a trailing array with.
+    /// Zero is valid for numbers, `bool`, options (None), slices (empty),
+    /// raw pointers outside `#![safe]` modules (null, as `..zero` makes
+    /// them), and aggregates of those; for an enum, the variant with
+    /// discriminant 0 if its payload is; for a `value` type, the variant
+    /// that the word 0 encodes (a nanbox's unboxed 0.0, a low-tag
+    /// integer), if its payload is not a reference. Type parameters are
+    /// checked per instance.
+    pub fn zero_invalid(&self, t: &Ty, safe: bool, depth: u32) -> Option<String> {
+        if depth > 32 {
+            return None;
+        }
+        let n = |c: &Self, t: &Ty| c.ty_name(t);
+        match t {
+            Ty::Gc(_) => Some(format!("a null `{}`", n(self, t))),
+            Ty::Fn(..) | Ty::Closure(..) | Ty::Block(..) => Some(format!("a null function (`{}`)", n(self, t))),
+            Ty::Ptr(_) if safe => Some(format!("a null `{}` (in a `#![safe]` module)", n(self, t))),
+            Ty::Array(i, _) => self.zero_invalid(i, safe, depth + 1),
+            Ty::Tuple(ts) => ts.iter().find_map(|t| self.zero_invalid(t, safe, depth + 1)),
+            Ty::Result(a, b) => self.zero_invalid(a, safe, depth + 1).or_else(|| self.zero_invalid(b, safe, depth + 1)),
+            Ty::Struct(sid) => {
+                let sd = &self.prog.structs[*sid as usize];
+                if let Some((f, _)) = sd.fields.iter().find(|(f, _)| f.starts_with("__")) {
+                    return Some(format!("`{}` with its private field `{}` zeroed", n(self, t), f));
+                }
+                sd.fields.iter().find_map(|(_, t)| self.zero_invalid(t, safe, depth + 1))
+            }
+            Ty::Enum(e) => {
+                let ed = &self.prog.enums[*e as usize];
+                match ed.variants.iter().find(|v| v.discr == 0) {
+                    None => Some(format!("no variant of `{}` (none has discriminant 0)", n(self, t))),
+                    Some(v) => v.fields.iter().find_map(|t| self.zero_invalid(t, safe, depth + 1)),
+                }
+            }
+            Ty::Value(vi) => {
+                let d = &self.prog.values[*vi as usize];
+                match crate::values::zero_variant(d) {
+                    None => Some(format!("no variant of `{}` (the word 0 encodes none)", n(self, t))),
+                    Some(i) => match &d.variants[i].payload {
+                        Some(pt @ (Ty::Gc(_) | Ty::Ptr(_))) => {
+                            Some(format!("`{}.{}` with a null `{}`", n(self, t), d.variants[i].name, n(self, pt)))
+                        }
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
         }
     }
 
@@ -206,6 +327,7 @@ impl Checker<'_> {
     /// Writing to (or taking the address of) place `e`: an error if it is
     /// inside a foreign struct with raw pointers.
     pub fn check_raw_place(&self, cx: &FnCx, e: &TExpr, span: Span) -> Res<()> {
+        self.check_safe_object_write(cx, e, span)?;
         if !self.safe_here(cx) {
             return Ok(());
         }
@@ -219,13 +341,29 @@ impl Checker<'_> {
                             cx,
                             span,
                             "field_write",
-                            || format!("writing {} (a field of another module's struct with raw pointers)", f),
+                            || format!("writing {} (a field of another module's object, or struct with raw pointers)", f),
                             "use the methods of its module (`v.clear()`, not `v.len = 0`)",
                         );
                     }
                     e = b;
                 }
                 TK::Index(b, _) if matches!(b.ty, Ty::Array(..)) => e = b,
+                // `o.items[i]`: an element of another module's object.
+                TK::Index(b, _) | TK::SliceRange(b, _, _) if matches!(b.kind, TK::Trailing(_) | TK::SliceRange(..)) => e = b,
+                TK::Trailing(o) => {
+                    let Ty::Gc(t) = &o.ty else { return Ok(()) };
+                    if self.foreign_raw_struct(cx, t) {
+                        let n = self.ty_name(t);
+                        return self.raw_op(
+                            cx,
+                            span,
+                            "field_write",
+                            || format!("writing the trailing array of `{}` (another module's object)", n),
+                            "use the methods of its module",
+                        );
+                    }
+                    return Ok(());
+                }
                 _ => return Ok(()),
             }
         }

@@ -983,7 +983,11 @@ trailing array's pointer (`o.items.ptr[i]`, recognized syntactically).
 A call that takes the address of such a place of a traced type as an
 argument (`o.pair.set(x)`, which auto-refs `&o.pair`, or `f(&o.pair)`)
 is followed by the barrier on the object, since the callee may store
-through it.
+through it. So is a call that passes `o.items` (or a sub-slice) of a
+traced element type to a parameter that the callee may store references
+through (`src/objref.rs` summarizes each function's slice and pointer
+parameters; the callee must not collect, and such slices cannot be kept
+elsewhere: `design/safety.md` section 8).
 Other stores through raw pointers get no barrier: the code that makes
 them calls `gc.write_barrier(h, obj)` (see
 [`stdlib/gc.md`](stdlib/gc.md#as-implemented)), or the object is pinned

@@ -409,10 +409,11 @@ define internal i64 @loimi_rootck_info() nounwind {{
 
 /// `new(heap, init, len?)`, or `try_new` (`fast`): null (`None`) where
 /// the allocator would refill a free list.
-pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>, fast: bool) -> String {
+pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>, fill: Option<&TExpr>, fast: bool) -> String {
     let p = g.p();
     let h = g.val(heap);
     let v = g.val(init);
+    let fv = fill.map(|f| g.val(f));
     let Ty::Struct(sid) = init.ty else { unreachable!() };
     let s = &p.structs[sid as usize];
     let size = layout::size_of(p, &init.ty);
@@ -454,6 +455,38 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
         } else {
             g.emit(format!("store {} {}, ptr {}{}", lt, v, obj, al));
         }
+    }
+    if let (Some(fv), Some((_, et))) = (fv, &s.trailing) {
+        // `new(h, X { .. }, n, v)`: store `v` into each element (a young
+        // object: no barrier).
+        let et = et.clone();
+        let l_head = g.fresh_label("fill_head");
+        let l_body = g.fresh_label("fill_body");
+        let l_done = g.fresh_label("fill_done");
+        let entry = g.fresh_label("fill_entry");
+        if fast && !check_roots(g) {
+            let ok = g.inst(format!("icmp ne ptr {}, null", obj));
+            g.cond_br(&ok, &entry, &l_done);
+        } else {
+            g.br(&entry);
+        }
+        g.label(&entry);
+        let base = g.inst(format!("getelementptr inbounds i8, ptr {}, i64 {}", obj, size));
+        let i = g.alloca(&Ty::Int(IntTy::U64));
+        g.emit(format!("store i64 0, ptr {}", i));
+        g.br(&l_head);
+        g.label(&l_head);
+        let iv = g.inst(format!("load i64, ptr {}", i));
+        let more = g.inst(format!("icmp ult i64 {}, {}", iv, n));
+        g.cond_br(&more, &l_body, &l_done);
+        g.label(&l_body);
+        let el = g.ty(&et);
+        let ep = g.inst(format!("getelementptr inbounds {}, ptr {}, i64 {}", el, base, iv));
+        g.store(&et, &fv, &ep);
+        let nx = g.inst(format!("add i64 {}, 1", iv));
+        g.emit(format!("store i64 {}, ptr {}", nx, i));
+        g.br(&l_head);
+        g.label(&l_done);
     }
     let _ = e;
     obj

@@ -770,6 +770,28 @@ pub fn variant_const(d: &ValueDef, idx: u32, name: &str) -> Result<(i128, bool),
     }
 }
 
+/// The variant that the all-zero word (or, boxed, the zero tag) encodes,
+/// if any: what a zero-filled trailing array of `d` holds.
+pub fn zero_variant(d: &ValueDef) -> Option<usize> {
+    if d.repr == ValueRepr::Boxed {
+        return d.variants.iter().position(|v| v.tag == 0);
+    }
+    if d.repr == ValueRepr::NanBox && d.variants.iter().any(|v| v.unboxed) {
+        // Words below `num_limit` are the unboxed f64: 0 is 0.0.
+        return d.variants.iter().position(|v| v.unboxed);
+    }
+    d.variants.iter().position(|v| {
+        if v.unboxed {
+            return false;
+        }
+        if d.repr == ValueRepr::LowTag && v.shift >= 64 {
+            return v.tag == 0;
+        }
+        let (_, tag) = mask_tag(d, v);
+        tag == 0
+    })
+}
+
 /// A tagged variant's (mask, tag): a word `w` holds it iff `w & mask == tag`.
 fn mask_tag(d: &ValueDef, v: &ValueVariantDef) -> (u64, u64) {
     if let Some(l) = v.sub {

@@ -1385,15 +1385,22 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             Err(exc(c, E_VALUE, "list.remove(x): x not in list"))
         }
         LIndex | TIndex => {
-            let xs = if let List(l) = selfv { l.arr.items[0..l.len] } else if let Tuple(t) = selfv { t.items } else { trap() };
-            let (a, z) = bounds(c, args, np, 2, xs.len)?;
-            for i in a..z { if ops.equal(c, xs[i], args[1])? { return Ok(value.int_val(&c.heap, i as i64)); } }
+            // `__eq__` may change the list: each step reads its current
+            // items (seq_order in ops.lm).
+            let (a, z) = bounds(c, args, np, 2, value.seq_len(selfv))?;
+            for i in a..z {
+                let Some(x) = value.seq_at(selfv, i) else { break; };
+                if ops.equal(c, x, args[1])? { return Ok(value.int_val(&c.heap, i as i64)); }
+            }
             Err(exc(c, E_VALUE, if b == B.LIndex { "list.index(x): x not in list" } else { "tuple.index(x): x not in tuple" }))
         }
         LCount | TCount => {
-            let xs = if let List(l) = selfv { l.arr.items[0..l.len] } else if let Tuple(t) = selfv { t.items } else { trap() };
             var k: i64 = 0;
-            for i in 0..xs.len { if ops.equal(c, xs[i], args[1])? { k += 1; } }
+            var i: u64 = 0;
+            while let Some(x) = value.seq_at(selfv, i) {
+                if ops.equal(c, x, args[1])? { k += 1; }
+                i += 1;
+            }
             Ok(value.int_val(&c.heap, k))
         }
         LSort => {

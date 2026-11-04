@@ -173,6 +173,24 @@ pub fn list_grow(h: *gc.Heap, l: Gc<List>, need: u64) {
     l.arr = a;
 }
 
+/// Item `i` of a list or tuple, if it has one now.
+pub fn seq_at(v: Value, i: u64) -> ?Value {
+    match v {
+        List(l) => if i < l.len { Some(l.arr.items[i]) } else { None },
+        Tuple(t) => if i < t.items.len { Some(t.items[i]) } else { None },
+        _ => None,
+    }
+}
+
+/// The length of a list or tuple (0 for anything else).
+pub fn seq_len(v: Value) -> u64 {
+    match v {
+        List(l) => l.len,
+        Tuple(t) => t.items.len,
+        _ => 0,
+    }
+}
+
 pub fn new_tuple(h: *gc.Heap, n: u64) -> Gc<Tuple> {
     let t = new(h, Tuple {}, n);
     for i in 0..n { t.items[i] = Value.Nil; }
@@ -428,7 +446,7 @@ pub fn attrs_view(h: *gc.Heap, o: Gc<Inst>) -> Gc<Dict> {
 pub fn attrs_replace(h: *gc.Heap, o: Gc<Inst>, r: Gc<Dict>) {
     let m = new_attrs(h, 0);
     m.insert_new(h, 0, Value.Undef, Value.Dict(r));
-    m.popped = m.ents.e.len;
+    m.use_up_room();
     o.dict = m;
 }
 

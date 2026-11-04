@@ -1,0 +1,14 @@
+// A function that returns (or stores) its slice parameter lets the
+// caller's object slice escape: the barrier after the call would not
+// cover stores through the copy.
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [?Gc<Node>] }
+fn tail(s: []?Gc<Node>) -> []?Gc<Node> { s[1..] }
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 2);
+    let t = tail(a.items);
+    t[0] = Some(new(&heap, Node { v: 1 }));
+}
+// error: a slice of an object's traced trailing array is passed to a function that may keep it (return or store it)

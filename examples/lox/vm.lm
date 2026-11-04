@@ -403,7 +403,10 @@ pub vm Lox {
         gc_point();
         let p = fp.cl.proto.children[f];
         let n = p.captures.len;
-        let cl = new(&ctx.heap, Closure { proto: p }, n);
+        // unsafe: zero-filled (null `Gc`s); the loop below sets every
+        // upvalue before the closure is reachable (a bad capture raises
+        // and drops it).
+        let cl = unsafe { new(&ctx.heap, Closure { proto: p }, n) };
         // The captures come from the compiler, not the bytecode, but they
         // are checked anyway: a bad one would read outside the frame.
         let me = fp.cl;

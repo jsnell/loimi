@@ -1,0 +1,9 @@
+// The trailing array of a `#![safe]` module's object, likewise.
+import std.gc;
+import safe_mod.safelib;
+fn main() {
+    var heap = gc.Heap.new();
+    let c = safelib.Counter.new(&heap);
+    c.slots[1] = 5;
+}
+// error: writing a field or element of `Counter`: the objects of `safe_mod.safelib` (a `#![safe]` module) are written only by its own code

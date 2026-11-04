@@ -1,0 +1,7 @@
+// Helper for gc_safe_object_*.lm: a #![safe] module's object, which only
+// this module may build and write.
+#![safe]
+import std.gc;
+pub object Counter { n: u64, slots: [u64] }
+pub fn Counter.new(h: *gc.Heap) -> Gc<Counter> { new(h, Counter { n: 0 }, 2) }
+pub fn Counter.bump(c: Gc<Counter>) { c.n += 1; }

@@ -144,6 +144,17 @@ pub fn barrier(obj: *u8) {
 - A store of a value statically free of references (a variant without
   a `Gc` payload, such as `Term.Unb` or `Int(n)`, `None`, or a literal
   tuple or struct of such) gets no barrier.
+- **Slices of trailing arrays.** A store through `o.items[i]` or a
+  sub-slice of it gets the barrier. Passed to a function that may store
+  references through it (`fill(o.items, v)`, a summary the compiler
+  computes per function and parameter), `o.items` gets the barrier on
+  `o` after the call; that function must not collect, nor keep the
+  slice. A slice of a traced trailing array cannot be kept anywhere a
+  store through it would escape the compiler (a `var`, a field, a return
+  value) or be stored through from a `let`: those are compile errors
+  ([`../design/safety.md`](../design/safety.md) section 8).
+  `o.items.ptr` is a raw pointer: stores through it need
+  `gc.write_barrier`.
 - **Stores through raw pointers** bypass the compiler's barrier:
   `gc.write_barrier(h, obj)` after them, naming the object that contains
   the slot (not an interior pointer). `gc.needs_barrier(obj)` and
@@ -598,7 +609,10 @@ Objects with a trailing array (`slots: [Value]`) take the length at
 allocation: `heap.new_with_len(Object { shape }, n)`. The size class is then
 computed at run time through a lookup table indexed by `(size + 15) >> 4`
 below 1 KiB. Trailing elements are initialized to the element type's default
-(`Nil` for `Value`) so the GC never sees uninitialized memory.
+(`Nil` for `Value`) so the GC never sees uninitialized memory. (As built:
+`new(h, Obj { .. }, n)` zero-fills them, which is allowed only where zero
+is a valid element, else `new(h, Obj { .. }, n, v)` fills them with `v`:
+language.md section 8.)
 
 ---
 

@@ -27,7 +27,8 @@
 //!   A call that may store through an object slice gets the barrier on
 //!   the object after it (`&o.f` arguments always did), and must not
 //!   collect: a collection between the store and the barrier would miss
-//!   the young object.
+//!   the young object. A function that may keep the parameter (return
+//!   it, store it, capture it) must not get one at all.
 //!
 //! The slice rule holds in every module (a slice is the checked type).
 //! The address rule holds in `#![safe]` modules; elsewhere `&o.f` is a
@@ -80,8 +81,18 @@ pub fn may_collect(p: &Program, f: &TExpr) -> bool {
 /// Whether the call of `f` may store through argument `i`: always for a
 /// callee the summary does not know (a function value, an extern).
 pub fn call_writes(p: &Program, f: &TExpr, i: usize) -> bool {
+    summary(p, &p.ref_writes, f, i)
+}
+
+/// Whether the call of `f` may keep argument `i` beyond the call (return
+/// it, store it, capture it): always for an unknown callee.
+pub fn call_keeps(p: &Program, f: &TExpr, i: usize) -> bool {
+    summary(p, &p.ref_keeps, f, i)
+}
+
+fn summary(p: &Program, m: &HashMap<FnId, u64>, f: &TExpr, i: usize) -> bool {
     match f.kind {
-        TK::FnRef(id) if p.fns[id as usize].body.is_some() => p.ref_writes.get(&id).is_some_and(|w| i < 64 && w & (1 << i) != 0),
+        TK::FnRef(id) if p.fns[id as usize].body.is_some() => m.get(&id).is_some_and(|w| i < 64 && w & (1 << i) != 0),
         _ => true,
     }
 }
@@ -119,6 +130,7 @@ struct Fa<'a> {
     callee: Vec<&'a TExpr>,
     tracked: HashMap<LocalId, Origin>,
     written: u64,
+    kept: u64,
     /// Report errors (the last pass), else only summarize.
     report: bool,
     safe: bool,
@@ -152,9 +164,21 @@ impl<'a> Fa<'a> {
         self.errs.push(Diag::new(span, format!("{} {}: a store through it would skip the write barrier", thing, what)).note(span, hint.to_string()));
     }
 
-    fn arg_info(&self, idx: usize) -> (bool, bool) {
+    /// (may store through, may keep, may collect) for argument `idx` of
+    /// the innermost call.
+    /// `LOIMI_OBJREF_AUDIT`: an object slice that may be read across a
+    /// collection (it dangles if nothing else keeps its object alive: not
+    /// an error, the lifetime hole of safety.md section 2).
+    fn audit_lifetime(&self, span: Span, what: &str) {
+        if let (Some(sm), true) = (self.audit, self.report) {
+            let (l, c) = sm.line_col(span.file, span.lo);
+            eprintln!("objref-lifetime {}:{}:{} {} ({})", sm.files[span.file as usize].path, l, c, what, self.f.symbol);
+        }
+    }
+
+    fn arg_info(&self, idx: usize) -> (bool, bool, bool) {
         let f = *self.callee.last().unwrap();
-        (call_writes(self.p, f, idx), may_collect(self.p, f))
+        (call_writes(self.p, f, idx), call_keeps(self.p, f, idx), may_collect(self.p, f))
     }
 
     /// An object reference made at `e` and used as `u`.
@@ -166,9 +190,13 @@ impl<'a> Fa<'a> {
             Use::Write => self.error(e.span, slice, false, "is stored through"),
             Use::Value => self.error(e.span, slice, false, "is kept"),
             Use::Arg(i) => {
-                let (writes, collects) = self.arg_info(i);
-                if writes && collects {
+                let (writes, keeps, collects) = self.arg_info(i);
+                if keeps {
+                    self.error(e.span, slice, false, "is passed to a function that may keep it (return or store it)");
+                } else if writes && collects {
                     self.error(e.span, slice, true, "is passed to a call that may collect and may store through it");
+                } else if collects && slice {
+                    self.audit_lifetime(e.span, "object slice passed to a call that may collect");
                 }
             }
         }
@@ -176,24 +204,35 @@ impl<'a> Fa<'a> {
 
     /// A use of a tracked local.
     fn local(&mut self, o: Origin, u: Use, span: Span) {
-        let bad = match u {
-            Use::Read | Use::Alias => None,
+        // Inside `unsafe { }` a parameter's other uses are raw (a cast to
+        // read its bytes): trusted not to keep it, counted as storing.
+        let u = if u == Use::Value && matches!(o, Origin::Param(_)) && self.in_unsafe(span) { Use::Raw } else { u };
+        // (stores through it, keeps it, what to say)
+        let (w, k, what) = match u {
+            Use::Read | Use::Alias => return,
             Use::Raw => match o {
-                Origin::Direct(..) => None,
-                Origin::Param(_) => Some(""),
+                Origin::Direct(..) => return,
+                Origin::Param(_) => (true, false, ""),
             },
-            Use::Write => Some("is stored through (held in a local)"),
-            Use::Value => Some("is kept (held in a local)"),
+            Use::Write => (true, false, "is stored through (held in a local)"),
+            Use::Value => (false, true, "is kept (held in a local)"),
             Use::Arg(i) => {
-                let (writes, _) = self.arg_info(i);
-                writes.then_some("is passed (held in a local) to a function that may store through it")
+                let (writes, keeps, _) = self.arg_info(i);
+                if !writes && !keeps {
+                    return;
+                }
+                (writes, keeps, "is passed (held in a local) to a function that may store through it or keep it")
             }
         };
-        let Some(what) = bad else { return };
         match o {
             Origin::Param(i) => {
                 if i < 64 {
-                    self.written |= 1 << i;
+                    if w {
+                        self.written |= 1 << i;
+                    }
+                    if k {
+                        self.kept |= 1 << i;
+                    }
                 }
             }
             Origin::Direct(slice) => self.error(span, slice, false, what),
@@ -338,6 +377,9 @@ impl<'a> Fa<'a> {
                 self.walk(r, Use::Value);
             }
             TK::Call(f, args) => {
+                if may_collect(self.p, f) && self.tracked.values().any(|o| matches!(o, Origin::Direct(true))) {
+                    self.audit_lifetime(e.span, "call that may collect while a local holds an object slice");
+                }
                 self.walk(f, Use::Value);
                 self.callee.push(f);
                 for (i, a) in args.iter().enumerate() {
@@ -438,11 +480,11 @@ fn children<'a>(e: &'a TExpr, out: &mut Vec<&'a TExpr>) {
         }
         TK::Intrinsic(_, args) | TK::Struct(args) | TK::Tuple(args) | TK::Array(args) | TK::Variant(_, args) => out.extend(args.iter()),
         TK::Break(_, Some(v)) | TK::Return(Some(v)) => out.push(v),
-        TK::New { heap, init, len, .. } => {
+        TK::New { heap, init, len, fill, .. } => {
             out.push(heap);
             out.push(init);
-            if let Some(l) = len {
-                out.push(l);
+            for x in [len, fill].into_iter().flatten() {
+                out.push(x);
             }
         }
         TK::Vm(v) => match v {
@@ -472,14 +514,15 @@ pub struct Ctx<'a> {
     pub unsafe_spans: &'a [Span],
 }
 
-fn analyze<'a>(p: &'a Program, f: &'a FnDef, cx: &Ctx<'a>, report: bool, audit: Option<&'a crate::diag::SourceMap>) -> (u64, Vec<Diag>) {
-    let Some(b) = &f.body else { return (0, Vec::new()) };
+fn analyze<'a>(p: &'a Program, f: &'a FnDef, cx: &Ctx<'a>, report: bool, audit: Option<&'a crate::diag::SourceMap>) -> (u64, u64, Vec<Diag>) {
+    let Some(b) = &f.body else { return (0, 0, Vec::new()) };
     let mut fa = Fa {
         p,
         f,
         callee: Vec::new(),
         tracked: HashMap::new(),
         written: 0,
+        kept: 0,
         report,
         safe: cx.safe_files.contains(&f.span.file),
         unsafe_spans: cx.unsafe_spans,
@@ -492,7 +535,7 @@ fn analyze<'a>(p: &'a Program, f: &'a FnDef, cx: &Ctx<'a>, report: bool, audit: 
         }
     }
     fa.walk(b, Use::Value);
-    (fa.written, fa.errs)
+    (fa.written, fa.kept, fa.errs)
 }
 
 /// Summarize which parameters each function may store through
@@ -511,21 +554,23 @@ pub fn check(p: &mut Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> 
     loop {
         let mut changed = Vec::new();
         for &i in &with_params {
-            let (w, _) = analyze(p, &p.fns[i], cx, false, None);
-            let old = p.ref_writes.get(&(i as FnId)).copied().unwrap_or(0);
-            if w | old != old {
-                changed.push((i as FnId, w | old));
+            let (w, k, _) = analyze(p, &p.fns[i], cx, false, None);
+            let ow = p.ref_writes.get(&(i as FnId)).copied().unwrap_or(0);
+            let ok = p.ref_keeps.get(&(i as FnId)).copied().unwrap_or(0);
+            if w | ow != ow || k | ok != ok {
+                changed.push((i as FnId, w | ow, k | ok));
             }
         }
         if changed.is_empty() {
             break;
         }
-        for (i, w) in changed {
+        for (i, w, k) in changed {
             p.ref_writes.insert(i, w);
+            p.ref_keeps.insert(i, k);
         }
     }
     for f in &p.fns {
-        let (_, errs) = analyze(p, f, cx, true, audit);
+        let (_, _, errs) = analyze(p, f, cx, true, audit);
         if let Some(d) = errs.into_iter().next() {
             return Err(d);
         }

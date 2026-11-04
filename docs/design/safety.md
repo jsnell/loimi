@@ -18,6 +18,11 @@ dangles once the container grows, shrinks or is freed, and nothing
 stops safe code from keeping it at compile time (section 2); built with
 `--sanitize=address`, std's containers poison the memory they keep but
 no longer use, so most such uses are reported at run time (section 7).
+GC objects have three rules of their own, in every module (section 8):
+a slice of an object's traced trailing array cannot be kept where a
+store through it would skip the write barrier, a trailing array starts
+zero-filled only where zero is a valid element, and the objects of a
+`#![safe]` module are built and written only by that module.
 Nine std modules (`lex`,
 `parse`, `diag`, `text`, `hash`, `io`, `bc`, `map`, `dict`) are now safe
 (section 5). It is a check only: no example's IR changed
@@ -160,16 +165,18 @@ unsafe { write(fd, s.ptr, s.len) }
    through another module's generic type (`lib.Lookup<Mine>` bound in a
    pattern) is not followed: its pointer fields are its own module's.
 
-9. **GC objects.** The field rule is about raw pointers, so the fields
-   of another module's `object` that holds only `Gc`s, values and
-   trailing arrays can be written (`d.used = 0` on a `dict.Dict`); a
-   safe GC container must not rely on its fields for memory safety
-   (`std.dict` does not, section 5). A GC reference stored through a
-   slice kept in a local (`let s = o.items; s[i] = v;`) gets no write
-   barrier (the compiler emits one only for a store through the
-   trailing-array expression itself), which can break the generational
-   collector's invariant. And `new(h, X { }, n)` zero-fills trailing
-   arrays of any element type, `Gc` and `value` types included (item 4).
+9. **GC objects** (closed, section 8, except as listed there). The
+   field rule was about raw pointers, so the fields of another module's
+   `object` holding only `Gc`s, values and trailing arrays could be
+   written (`d.used = 0` on a `dict.Dict`); a GC reference stored
+   through a slice kept in a local (`let s = o.items; s[i] = v;`) got no
+   write barrier; and `new(h, X { }, n)` zero-filled trailing arrays of
+   any element type, `Gc` and `value` types included (item 4). What is
+   left: a module that is not `#![safe]` can still store through
+   `&o.f` or `o.items.ptr` (raw pointers: `gc.write_barrier` is its
+   job), and a slice of an object's trailing array that is read across a
+   collection dangles if nothing else keeps that object alive (the
+   lifetime hole, item 1, for the GC heap).
 
 Section 3a lists the adversarial pass that closed the other bypasses
 (struct-destructuring was on this list: Loimi has no struct patterns,
@@ -357,9 +364,9 @@ fields:
   (the probe loop has no slot compare); entry reads keep one compare
   per candidate key. `d.mask` is still maintained for the API but not
   trusted.
-- Three `unsafe` blocks, no `#[raw]` function:
-  `// unsafe: \`o\` is a live object, whose header is what the barrier reads.`
-  (`barrier(o: Gc<T>)`, after slice copies),
+- Two `unsafe` blocks, no `#[raw]` function (a third, a hand-written
+  write barrier after the copies through slices, went away when the
+  compiler started emitting it, section 8):
   `// unsafe: memset writes exactly the s.len * size_of<T>() bytes of \`s\`.`
   (`zero(s: []T)`), and
   `// unsafe: reads only the size_of<K>() bytes of the one K at \`k\` (as u64 words when the size is a multiple of 8).`
@@ -381,11 +388,15 @@ first version that also bounds-checked slot reads cost `richards` 2.3–3%
 and was replaced. No vm op handler's machine code changed; the IR
 changes are confined to `std.dict` and its callers.
 
-Found on the way (holes, section 2 item 9): GC objects' fields are not
-protected by the field rule; `gc.barrier(obj: *u8)` and
-`gc.write_barrier` read the header before `obj` and are now `#[raw]`
-(no IR change); a store of a GC reference through a slice held in a
-local (`let s = o.items; s[i] = v;`) gets no write barrier.
+Found on the way (holes, section 2 item 9, closed in section 8): GC
+objects' fields were not protected by the field rule; `gc.barrier(obj:
+*u8)` and `gc.write_barrier` read the header before `obj` and are now
+`#[raw]` (no IR change); a store of a GC reference through a slice held
+in a local (`let s = o.items; s[i] = v;`) got no write barrier. Since
+section 8, other modules cannot write a dict's fields or build one
+(Python's one write, `m.popped = m.ents.e.len`, is now
+`m.use_up_room()`), so `std.dict` could rely on them; it still does
+not, and its probes stay as above.
 
 ## 6. Cost
 
@@ -506,3 +517,174 @@ no report.
 one program per row above that must be reported, and one that uses
 every poisoned container correctly and must run clean. Release IR of
 every example is unchanged apart from `Arena.free`.
+
+## 8. GC objects
+
+Three holes of section 2, item 9, closed for every module (not only
+`#![safe]` ones: the first is a collector soundness bug wherever it
+happens). Written 2026-11-04.
+
+### 8.1 Stores through slices of an object's trailing array
+
+The compiler emits the write barrier after a store of a reference whose
+place it can see is inside an object: `o.f = v`, `o.items[i] = v`,
+`o.items[a..b][i] = v`. A slice is a plain (pointer, length) pair, so
+`let s = o.items; s[i] = v` (or passing `o.items` to a function that
+stores into it) stored a young object into an old one with no barrier,
+and a minor collection then freed it. Verify mode caught it at run time
+(`tests/run/gc_barrier_slice_arg.lm` aborts with "missing write
+barrier" when built by the previous compiler); now the compiler
+prevents it.
+
+**Options considered.** A slice type that remembers its object
+(`ObjSlice<T>`: three words, every store a barrier) would change every
+signature that takes `[]Value` and make host-memory slices pay;
+read-only slices need a type the language does not have; a barrier that
+finds the object from an interior address (the chunk header) would cost
+every store through any traced slice, register files included. What
+the programs actually do (an audit pass over every example, listing
+each use of such a slice that is not an index, `.len` or `for`) made
+the choice: six places in three interpreters, all reads but one, plus
+`std.dict`, which passes its trailing arrays to its own helpers and
+logged the objects by hand afterwards.
+
+**The rule** (`src/objref.rs`, after checking, so every function's
+effects are known). An *object slice* is `o.items`, a sub-slice of it,
+or `o.arr[..]` of an array field, with elements of a traced type
+(`Gc`, a `value` with references, a struct holding one). It may be
+
+- indexed, sub-sliced, iterated, `.len`'d; stores `o.items[i] = v` get
+  the barrier as before; `o.items.ptr` is a raw pointer (stores through
+  it need `gc.write_barrier`, as through any raw pointer);
+- bound by `let` to a local that is only read through (indexed, its
+  fields read, passed where nothing stores);
+- passed straight to a function. Each function's parameters of type
+  `[]T` or `*T` with traced `T` are summarized twice: may the function
+  store a reference through it (also through `.ptr`), and may it keep
+  it beyond the call (in a `var`, a field, a return value, a capture)?
+  Passing it on to a parameter that does counts as doing it (a fixpoint
+  over the call graph; a function value or an extern counts as both). A
+  call that may store through an object slice gets the barrier on the
+  object after the call, and must not collect (`uses gc`): a minor
+  collection between the store and that barrier would miss the young
+  object. A call that may keep it is an error: the copy would outlive
+  the barrier.
+
+Everything else is an error, with what to write instead: keeping the
+slice (`var`, return, field, capture), storing through a `let` that
+holds one, passing a held one to a function that stores or keeps,
+passing one to a function that keeps it, or to one that may collect and
+store:
+
+```
+error: a slice of an object's traced trailing array is stored through (held in a local): a store through it would skip the write barrier
+  --> tests/fail/gc_slice_kept.lm:11:5
+note: store through the object (`o.items[i] = v` gets the write barrier); a slice of it may be bound by `let` and read, or passed to a function that cannot collect (the barrier follows the call)
+```
+
+A store of a value without references (`Nil`, an integer field of an
+entry) needs no barrier and is not a store for the rule. The same rule
+covers `&o.f` of a traced place in `#![safe]` modules, where taking an
+address is not a raw-pointer operation; elsewhere `&o.f` is a raw
+pointer, as before, except that passing it (also implicitly, as a
+method's receiver) to a call that may collect and store through it is an
+error everywhere, since the compiler's barrier after the call would not
+cover it. `unsafe { }` exempts both.
+
+**What changed in the programs.** Python's `value.list_items(l)`
+returned `l.arr.items[0..l.len]`; its 11 callers now write the slice
+inline (they pass it to `tuple_of`, `list_of`, `seq_order`, ..., which
+only read). `std.dict`'s `remove_at` zeroes through `d.ents.e[e..e +
+1]` instead of a `let` copy, and its hand-written `barrier(ents)` after
+`rebuild_in`/`key_rebuild_in` is gone with the helper and its `unsafe`
+block: the compiler emits the same barrier. Lox's `let c =
+fp.cl.upvals` only reads, Mini's coroutine code stores through raw
+`&co.open` pointers and logs the objects with `gc.remember` itself
+(raw pointers in a module without `#![safe]`): both unchanged. No
+example interpreter had a missing barrier: the only stores through
+object slices in examples and std were std.dict's, which logged by hand.
+
+**A use-after-free found on the way** (the lifetime hole, not the
+barrier): Python's `list.index`, `list.count` and list/tuple ordering
+(`<`) held a slice of the list's array while calling `__eq__`,
+which may grow the list (moving its items to a new array) and collect.
+The old array was then unreachable and freed, and the scan went on
+reading it: `examples/python/tests/mutating_eq.py` printed "list.index(x):
+x not in list" under `--gc-stress`. They now read the list's current
+items at each step, as CPython does (`value.seq_at`). The rule above
+does not catch this (the slice is only read); `LOIMI_OBJREF_AUDIT=1`
+lists object slices passed to, or held in a local across, calls that
+may collect, for review: after the fix, the remaining ones in the
+examples keep their object alive (a rooted tuple, a list that the
+callee only reads before allocating, which does not collect).
+
+### 8.2 Zero-filled trailing arrays
+
+`new(h, X { .. }, n)` allocates zeroed memory. For `[Gc<T>]` that is n
+null references, which outside `unsafe` cannot be made (`0 as Gc<T>`);
+for a `value` type it is whatever the word 0 encodes. Zero-filling is
+now allowed only where zero is a valid element: numbers, `bool`,
+options (None), slices, raw pointers (outside `#![safe]` modules, as for
+`..zero`), and tuples, arrays and structs of those (no private `__`
+fields); an enum's variant with discriminant 0 if its payload is; a
+`value` type's variant that the word 0 encodes (a nanbox's unboxed
+`0.0`; a low-tag or boxed variant with tag 0) unless its payload is a
+reference. Generic objects are checked per instance. Elsewhere:
+
+- `new(h, X { .. }, n, v)` fills the array with `v` (a loop of stores;
+  no barrier: the object is young), or
+- `?Gc<T>` elements, or
+- `unsafe { new(h, X { .. }, n) }` for code that sets every element
+  before anything reads it. A length that is the literal `0` needs
+  none of these.
+
+All value types of the example interpreters zero-fill to their unboxed
+`0.0` (`Value`, `V`, `Term`), and std.dict's entries to all-zero keys
+(dead entries, as before; a dict over `Gc` keys or values would not
+compile, and it would have handed out null references for dead
+entries). Five places allocate `Gc` arrays and fill them right after:
+Lox's and Mini's `CLOSURE` (upvalue cells) and the three compilers'
+`Protos` tables (Mini, MiniJS, Scheme), plus the two fuzzers' copies.
+They are `unsafe { new(..) }` with a comment, so the example
+interpreters now have five `unsafe` blocks; a fill value would have
+added a loop to `CLOSURE`, and `?Gc` elements a test to every upvalue
+access. The IR of those five is unchanged.
+
+### 8.3 The objects of a `#![safe]` module
+
+A safe module's code may rely on its own structs' fields only if no
+other module can write them; the field rule (section 1) protected
+structs with raw pointers, and only from safe modules. Two extensions:
+
+- **In every module**, an `object` declared in a `#![safe]` module is
+  built (`new(h, M.X { .. })`) and written (`o.f = v`, `o.items[i] =
+  v`, `&o.f`) only by that module's code, or in `unsafe { }`. Reading
+  is unrestricted. This is what `std.dict` needed: Python wrote
+  `m.popped = m.ents.e.len` to mark an attribute dict full; it now
+  calls `m.use_up_room()` (new in `KeyDict` and `Dict`).
+- **In a `#![safe]` module**, another module's `object` is treated as a
+  struct with raw pointers: writing its fields or trailing array,
+  taking their address and building one with a literal need `unsafe`.
+
+Modules without `#![safe]` can still write a safe module's objects
+through raw pointers (`&o.f` there is raw, as is `o.items.ptr`) and
+through slices of their trailing arrays: they are trusted, as for any
+`#[raw]` contract (section 2, item 3). Why not a field visibility
+(`pub(read)`, private by default): Loimi's only field privacy is the
+file-private `__` prefix for generated types, which hides reads too;
+"objects belong to their safe module" needs no new syntax and covers
+the one module that relies on it.
+
+### 8.4 Cost
+
+Release IR of Lox, Mini, MiniJS, Prolog, Scheme, Stack, Wasm, the Mini
+embedding, the regex library and the tutorial is unchanged (panic
+locations aside). Python's changes are where intended:
+
+| function | change |
+|---|---|
+| `std.dict.Dict/KeyDict.resize`, `Dict.copy` | the compiler's barrier after `rebuild_in` replaces dict's own call (same code after inlining) |
+| `Dict/KeyDict.remove_at`, `Dict.clear` (`value.dict_clear`, `ops.delattr`) | one barrier (a header-byte test) after zeroing entries |
+| `builtins.call`, `call_method_builtin`, `construct`, `module_call`, `ops.order`, `ops.setslice`, `vm.Py.op.TOTUPLE` | `list_items` inlined by hand (2-3 instructions difference) |
+
+BENCH

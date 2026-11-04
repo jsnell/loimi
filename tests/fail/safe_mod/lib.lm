@@ -4,3 +4,4 @@ pub struct Holder { tup: (*u8, u64), arr: [*u8; 2], cb: fn(*u8), n: u64 }
 pub struct Inner { p: *u8 }
 pub struct Outer { inner: Inner, n: u64 }
 pub enum Buf { Bytes(*u8, u64), Empty }
+pub object Obj { n: u64, items: [u64] }

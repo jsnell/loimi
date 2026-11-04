@@ -1,0 +1,44 @@
+// Trailing arrays start zero-filled only where zero is a valid element
+// (tests/fail/gc_trailing_zero_*.lm): numbers, options, a nanbox's
+// unboxed 0.0, a low-tag value whose tag 0 is an integer. Otherwise
+// `new(h, X { .. }, n, v)` fills them with `v`, or `unsafe { new(..) }`
+// zero-fills them for code that sets every element before reading it.
+import std.io;
+import std.gc;
+
+object Node { v: i64 }
+value N repr nanbox { Num(f64) unboxed, Ref(Gc<Node>), Nil }
+value L repr lowtag { Int(i32), Ref(Gc<Node>), Nil }
+object Refs { items: [Gc<Node>] }
+object Opts { items: [?Gc<Node>] }
+object Ns { items: [N] }
+object Ls { items: [L] }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    h.set_verify(true);
+    let one = new(h, Node { v: 1 });
+    let r = new(h, Refs {}, 3, one);
+    let o = new(h, Opts {}, 3);
+    let n = new(h, Ns {}, 2);
+    let l = new(h, Ls {}, 2);
+    let nl = new(h, Ls {}, 2, L.Nil);
+    let empty = new(h, Refs {}, 0);
+    // unsafe: zero-filled; both elements are set before any read.
+    let u = unsafe { new(h, Refs {}, 2) };
+    u.items[0] = one;
+    u.items[1] = new(h, Node { v: 10 });
+    gc.collect(h);
+    var t: i64 = 0;
+    for x in r.items { t += x.v; }
+    for x in o.items { if let Some(y) = x { t += y.v; } else { t += 100; } }
+    for x in n.items { if let Num(f) = x { t += (f as i64) + 1000; } }
+    for x in l.items { if let Int(i) = x { t += (i as i64) + 10000; } }
+    for x in nl.items { if let Nil = x { t += 100000; } }
+    for x in u.items { t += x.v; }
+    io.print_int(t + empty.items.len as i64); io.println("");
+}
+
+// expect: 222314

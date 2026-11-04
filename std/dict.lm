@@ -272,6 +272,10 @@ pub fn Dict<K, V>.find_with<E>(d: Gc<Dict<K, V>>, hv: u64, eq: block fn(K) -> Re
 #[inline]
 pub fn Dict<K, V>.has_room(d: Gc<Dict<K, V>>) -> bool { d.used + d.popped < d.ents.e.len }
 
+/// Leave no room: `has_room` is false, and the appends that do not
+/// resize fail, until an insertion resizes the dict.
+pub fn Dict<K, V>.use_up_room(d: Gc<Dict<K, V>>) { d.popped = d.ents.e.len; }
+
 /// Append a new entry for a key the caller knows is absent, if there is
 /// room without resizing (`has_room`); its index, else None. Does not
 /// allocate.
@@ -587,6 +591,11 @@ pub fn KeyDict<K, V>.find_with<E>(d: Gc<KeyDict<K, V>>, hv: u64, eq: block fn(K)
 /// Whether `insert_new` would not resize.
 #[inline]
 pub fn KeyDict<K, V>.has_room(d: Gc<KeyDict<K, V>>) -> bool { d.used + d.popped < d.ents.e.len }
+
+/// Leave no room: `has_room` is false, and the appends that do not
+/// resize fail, until an insertion resizes the dict (Python's instance
+/// dicts use this to mark one that holds a single marker entry).
+pub fn KeyDict<K, V>.use_up_room(d: Gc<KeyDict<K, V>>) { d.popped = d.ents.e.len; }
 
 /// Append a new entry for a key the caller knows is absent, if there is
 /// room without resizing; its index, else None. Does not allocate.

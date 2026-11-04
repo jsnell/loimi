@@ -1,0 +1,7 @@
+// ... and its trailing array.
+#![safe]
+import std.gc;
+import safe_mod.lib;
+fn f(o: Gc<lib.Obj>) { o.items[0] = 1; }
+fn main() {}
+// error: writing the trailing array of `Obj` (another module's object)

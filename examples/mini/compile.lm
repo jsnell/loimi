@@ -1450,7 +1450,8 @@ fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
     for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
     let lines = new(h, Lines {}, fs.code.len());
     fs.code.locs_into(lines.data);
-    let protos = new(h, Protos {}, fs.protos.len);
+    // unsafe: zero-filled (null `Gc`s), every element set on the next line.
+    let protos = unsafe { new(h, Protos {}, fs.protos.len) };
     for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
     let updesc = new(h, UpDescs {}, fs.upvals.len);
     for i in 0..fs.upvals.len {

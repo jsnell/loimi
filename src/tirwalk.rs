@@ -265,11 +265,11 @@ fn walk<'a>(e: &'a TExpr, f: &mut dyn FnMut(Event<'a>)) {
                 go(x, f);
             }
         }
-        TK::New { heap, init, len, .. } => {
+        TK::New { heap, init, len, fill, .. } => {
             go(heap, f);
             go(init, f);
-            if let Some(l) = len {
-                go(l, f);
+            for x in [len, fill].into_iter().flatten() {
+                go(x, f);
             }
         }
         TK::Vm(v) => match v {

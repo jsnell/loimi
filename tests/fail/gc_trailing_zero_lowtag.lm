@@ -1,0 +1,10 @@
+// A low-tag value whose tag 0 is a reference variant: zero is a null `Gc`.
+import std.gc;
+object Node { v: i64 }
+value V repr lowtag { N(Gc<Node>), Int(i32), Nil }
+object Arr { items: [V] }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = new(&heap, Arr {}, 4);
+}
+// error: zero is `V.N` with a null `Gc<Node>`

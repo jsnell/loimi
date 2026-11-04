@@ -31,7 +31,8 @@ fn main() uses gc {
     h.set_verify(true);
     let b = new(h, Box { pair: Pair { a: None, n: 0 }, arr: [None, None, None] }, 3);
     let g: Gc<Gen<V>> = new(h, Gen { x: V.Nil }, 2);
-    let gn: Gc<Gen<Gc<Node>>> = new(h, Gen { x: young(h, 0) }, 2);
+    let n0 = young(h, 0);
+    let gn: Gc<Gen<Gc<Node>>> = new(h, Gen { x: n0 }, 2, n0);
     age(h);
     // closure stores
     each(3, |i| { b.arr[i] = Some(young(h, i)); });

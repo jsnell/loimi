@@ -1350,7 +1350,8 @@ fn Gen.finish(g: *Gen, fs: *FS) -> Gc<Proto> {
     if fs.regs.failed() { fail(f.line, "function needs too many registers"); }
     let consts = rt.new_vals(h, fs.consts.len());
     for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }
-    let protos = new(h, Protos {}, fs.protos.len);
+    // unsafe: zero-filled (null `Gc`s), every element set on the next line.
+    let protos = unsafe { new(h, Protos {}, fs.protos.len) };
     for i in 0..fs.protos.len { protos.data[i] = fs.protos.at(i); }
     if f.free.len > 255 { fail(f.line, "too many captured variables"); }
     let desc = new(h, Descs {}, f.free.len);

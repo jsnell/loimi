@@ -1,0 +1,8 @@
+// In a `#![safe]` module, another module's object is like a struct with
+// raw pointers: its fields carry that module's invariants.
+#![safe]
+import std.gc;
+import safe_mod.lib;
+fn f(o: Gc<lib.Obj>) { o.n = 0; }
+fn main() {}
+// error: writing `Obj.n` (a field of another module's object, or struct with raw pointers)

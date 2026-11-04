@@ -9,4 +9,4 @@ fn main() uses gc {
     let s = a.items;
     put(s, new(&heap, Node { v: 1 }));
 }
-// error: a slice of an object's traced trailing array is passed (held in a local) to a function that may store through it: a store through it would skip the write barrier
+// error: a slice of an object's traced trailing array is passed (held in a local) to a function that may store through it or keep it: a store through it would skip the write barrier

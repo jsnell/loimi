@@ -1,0 +1,12 @@
+// The fields of a `#![safe]` module's objects are written only by that
+// module (it may rely on them), from every module.
+import std.gc;
+import safe_mod.safelib;
+fn main() {
+    var heap = gc.Heap.new();
+    let c = safelib.Counter.new(&heap);
+    c.bump();
+    let n = c.n;
+    c.n = n + 10;
+}
+// error: writing `Counter.n`: the objects of `safe_mod.safelib` (a `#![safe]` module) are written only by its own code
