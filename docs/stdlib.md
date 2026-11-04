@@ -1174,9 +1174,13 @@ into. Not built:
   [`stdlib/gc.md`](stdlib/gc.md#threads-sharing-a-heap-stdgil).
   `gc.mark_shadow_stack(h, top)` marks another thread's saved roots.
 
-Every object has a 16-byte header (slot size, type id, mark bits, and
-the trailing-array length, which compiled code reads at object - 8), so
-a two-word object such as a Lisp pair takes a 32-byte slot.
+Every object has a 16-byte header (size, type id, mark, flags, and the
+trailing-array length, which compiled code reads at object - 8), so a
+two-word object such as a Lisp pair takes 32 bytes. Small objects (up
+to 512 bytes with the header) live in 64 KiB chunks of one size class
+each; marking sets a bit per 16-byte granule in the chunk's bitmap, and
+the allocator bump-allocates through the runs of clear bits, so nothing
+is swept ([details](stdlib/gc.md#heap-layout)).
 
 **Growth policy.** After a collection, `percent`% of the live bytes (at
 least `min_heap`) may be allocated before the next one. The default,
@@ -1202,7 +1206,7 @@ Full design: [`stdlib/gc.md`](stdlib/gc.md). Not built:
 
 - heap policies as a compile-time parameter (`#![heap = ...]`) and the
   `Incremental` policy (tri-color, snapshot-at-the-beginning barrier);
-- lazy sweeping in a non-generational heap, card marking, aging of small
+- card marking, aging of small
   objects before promotion, a moving collector;
 - roots generated from vm stacks and frame structs (write a root
   scanner; traced `state` variables are rooted automatically),

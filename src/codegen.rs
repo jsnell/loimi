@@ -2281,7 +2281,10 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let env = if gc {
                     let size = layout::size_of(p, &st);
                     let tid = p.structs[sid as usize].object.unwrap();
-                    let obj = self.inst(format!("call ptr @\"std.gc.alloc\"(ptr {}, i64 {}, i32 {}, i64 0)", m, size, tid));
+                    // `--gc-check-roots`: `rootck_alloc` records where
+                    // the object starts.
+                    let alloc = if self.cg.opts.gc_check_roots { "std.gc.rootck_alloc" } else { "std.gc.alloc" };
+                    let obj = self.inst(format!("call ptr @\"{}\"(ptr {}, i64 {}, i32 {}, i64 0)", alloc, m, size, tid));
                     let cp = self.inst(format!("getelementptr inbounds {}, ptr {}, i32 0, i32 0", lt, obj));
                     self.emit(format!("store ptr @\"{}\", ptr {}", sym, cp));
                     obj

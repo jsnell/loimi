@@ -16,7 +16,7 @@ every interpreter test run in three modes: normal, `stress`, and
 
 ### Heap layout
 
-- **Chunks, not segments with side bitmaps.** Small objects (header
+- **Chunks.** Small objects (header
   included, up to 512 bytes; classes step by 16 bytes) live in 64 KiB
   chunks aligned to 64 KiB, carved out of 2 MiB segments mapped aligned
   to 2 MiB (`mmap`, with `MADV_HUGEPAGE`), so that each can be a
@@ -25,24 +25,47 @@ every interpreter test run in three modes: normal, `stress`, and
   than with the old allocator's chunks in the brk heap (which got huge
   pages); with 2 MiB segments it is back within 1%. The start of a chunk holds a 16-byte `ChunkHead`
   pointing at the heap's remembered set, so the write barrier finds it
-  from an object's address alone. The slots then start at an offset that
+  from an object's address alone; the mark bitmap follows it (below).
+  The objects then start at an offset that
   varies from chunk to chunk, from 0 to 4 KiB (cache coloring). Without
   it, objects at the start of fresh chunks shared their page offset with
   the VM stack and frame arrays (also allocated page-aligned), and loads
   from them waited on unrelated stores (4K aliasing): Mini's
   `spectral_norm` ran 20% slower.
 - **The header is 16 bytes**, `{ size: u32, tid: u16, mark: u8, flags:
-  u8, len: u64 }`, with the mark in the header (no side bitmap). `len`
-  is the trailing array's length, or the free-list link of a free slot.
-  Flags: `LOG` (old and not in the remembered set), `LARGE`, and in
-  generational mode `AGED` and `INRS` (below).
-- Each chunk keeps its own free list. The allocator pops the current
-  chunk's list (the inlined fast path) and, when it is empty, takes the
-  next chunk of the class with free slots, in index order (`refill`).
-  A non-generational heap sweeps eagerly, at the end of each collection;
-  a generational heap sweeps lazily (below).
+  u8, len: u64 }`. `len` is the trailing array's length. Flags: `LOG`
+  (old and not in the remembered set), `LARGE`, and in generational mode
+  `AGED` and `INRS` (below). The mark byte holds the heap's *epoch* (1 or
+  2) when the object is marked; every major collection (in both modes)
+  flips the epoch, which unmarks every object at once.
+- **Mark bitmaps, no sweep** (2026-11-04). After the `ChunkHead`, each
+  chunk has a 512-byte bitmap with a bit per 16-byte granule of the
+  chunk; marking a small object sets the bits of all its granules (one or
+  two word ORs; the header's mark byte stays the "already marked" test).
+  The clear bits are the free memory, so a collection frees dead small
+  objects without touching them: no sweep. Each size class (16-byte steps
+  up to 512 bytes with the header) bump-allocates through a *run* of
+  clear bits in one of its chunks (`h.cur[c]` .. `h.lim[c]`); when the
+  run is used up, `refill` finds the class's next run from the bitmap
+  (word-at-a-time, `ctz`), in chunk order. Every object of a chunk has
+  the chunk's class, so runs start and end at object boundaries and no
+  memory is lost to holes too small for the class. After each collection
+  the chunks are relinked per class in index order, and a chunk with no
+  marked bit goes to a pool that any class takes from (before adding new
+  chunks): an all-dead chunk is reused without a per-object pass.
+  A major collection clears the bitmaps (512 bytes per chunk) before
+  marking; a minor one keeps them (old objects stay marked).
+  The sweep it replaced read and wrote every slot of every chunk
+  allocated from (the heap's whole allocation budget) at each
+  collection: 3-29% of Prolog's run time, and as lazy sweeping 13-23% of
+  Scheme's allocation-heavy programs (`deriv`, `diviter`, `cpstak`).
+  Measurements: [`../results.md`](../results.md), 2026-11-04.
+  Allocating all sizes from one run (Immix-like, with each object's
+  granules marked) was as fast for Prolog but made MiniJS's `sort` 4%
+  slower: records allocated between strings and arrays were spread over
+  more cache lines than in a chunk of their own class.
 - **`try_new(h, T { .. })`** (compiled to `gc.try_alloc`) is `new`
-  without the refill: it pops the free list or gives `None`, and makes
+  without the refill: it bumps the class's run or gives `None`, and makes
   no call, so a tail-call handler that allocates with it has no stack
   frame (`new`'s refill call site gives it one on every execution, even
   though the refill is rare). `gc.make_room(h, size)` refills the size
@@ -71,16 +94,10 @@ measurements are in [`../roadmap.md`](../roadmap.md), open question 2).
   12 ms of Scheme's `nboyer` 750 ms run went to it).
 - A **minor collection** marks from the roots and from the remembered set
   and stops at marked (old) objects. Marking an object sets its LOG flag
-  and counts its bytes, so the collection itself sweeps nothing but the
-  young large objects: the chunks that were allocated from since the
-  last collection (a chunk is marked `used` when it becomes a current
-  chunk) become *pending*.
-- **Lazy sweeping.** The allocator sweeps a pending chunk when it takes
-  it (`refill`), just before allocating from it, so the sweep's cache
-  misses are the ones allocation would take anyway. A major collection
-  makes every chunk pending; it first sweeps the chunks pending since
-  the previous major collection, whose dead objects may carry the epoch
-  that the flip brings back. Minor pauses are marking only.
+  and counts its bytes; the collection sweeps nothing but the young
+  large objects. A young small object that survives gets its mark bits;
+  the dead ones' granules stay clear, and the allocator reuses them (see
+  "Mark bitmaps" above). Minor pauses are marking only.
 - **Aging, for large objects.** A large object that survives its first
   minor collection stays young until the next one: it is marked with
   that collection's *young mark* (3 to 254, a new one each minor
@@ -92,8 +109,8 @@ measurements are in [`../roadmap.md`](../roadmap.md), open question 2).
   into the set. Small objects are promoted when they first survive:
   aging them too traced the survivors of programs with growing live
   data twice (Scheme `nboyer`, `earley` and `mperm` 5-8% slower).
-- A **major collection** runs a full mark-sweep whose survivors stay
-  marked. It runs once the old generation has grown by the growth budget
+- A **major collection** runs a full mark (bitmaps cleared, epoch
+  flipped) whose survivors stay marked. It runs once the old generation has grown by the growth budget
   since the last major collection.
 - **The nursery** is the same allocation budget as between full
   collections, computed from the live bytes after the last major
@@ -166,7 +183,8 @@ pub fn barrier(obj: *u8) {
   collection, every old object outside the remembered set (and every
   young survivor of the last minor collection counts as young) is traced
   without marking, and a reference to a young object (a missing barrier)
-  or to a free slot (a dangling reference) aborts with both type names:
+  or to freed memory (a dangling reference; verify mode fills free
+  memory with 0x01 bytes after each collection) aborts with both type names:
 
   ```
   gc verify: old object of type value.Arr points to a young object of type value.Str but is not in the remembered set: missing write barrier
@@ -462,8 +480,7 @@ it.gil.lock();
 
 Policies as a compile-time parameter (`#![heap = ..]`; generational is a
 run-time switch, and the barrier is always compiled in), incremental
-marking, lazy sweeping in a non-generational heap, side mark bitmaps,
-card marking (a large array stored into is retraced whole by each minor
+marking, card marking (a large array stored into is retraced whole by each minor
 collection), aging of small objects (measured, see above), finalizers that run guest
 code (free hooks for host memory are built, above), `Root<T>`/`GcVec<T>`, heap snapshots, poisoning (except in
 `--gc-check-roots` builds, above),
@@ -471,8 +488,9 @@ and the `weak` field qualifier (also for inline caches, language.md
 §7.1).
 
 `LOIMI_GC_STATS=1` prints a line per collection to stderr: kind, live
-(old) bytes, the remembered set's size, the mark and sweep times, and
-the time spent in deferred sweeps so far.
+(old) bytes, the remembered set's size, the mark and sweep times (the
+sweep is now only that of large objects), and the time spent in
+`refill` finding runs so far (still labelled "lazy sweep").
 
 ---
 
