@@ -860,7 +860,7 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
             // One copy: size the result first.
             var len: u64 = 0;
             for i in 0..n { len += str_arg(c, name, args[i])?.data.len; }
-            let r = new(h, Str {}, len);
+            let r = new_uninit(h, Str {}, len);
             var at: u64 = 0;
             for i in 0..n {
                 let Ok(s) = str_arg(c, name, args[i]) else { break; };
@@ -882,7 +882,7 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
             let Int(k) = a else { return Err(rt.type_err(c, name, "length", a)); };
             if k < 0 { return Err(rt.type_err(c, name, "length", a)); }
             let ch = if n > 1 { char_arg(c, name, b)? } else { 32 };
-            let s = new(h, Str {}, k as u64);
+            let s = new_uninit(h, Str {}, k as u64);
             for i in 0..k as u64 { s.data[i] = ch as u8; }
             Ok(V.S(s))
         }

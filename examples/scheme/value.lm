@@ -125,7 +125,7 @@ pub fn cons(h: *gc.Heap, a: V, d: V) -> V {
 }
 
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
-    let o = new(h, Str {}, s.len);
+    let o = new_uninit(h, Str {}, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
     o
 }
@@ -372,7 +372,7 @@ pub fn Symtab.new() -> Symtab {
 
 pub fn Symtab.intern(t: *Symtab, h: *gc.Heap, s: str) -> Gc<Sym> {
     if let Some(sym) = t.map.get(s) { return sym; }
-    let o = new(h, Sym { gidx: NO_GLOBAL }, s.len);
+    let o = new_uninit(h, Sym { gidx: NO_GLOBAL }, s.len);
     mem.memcpy(o.name.ptr, s.ptr, s.len);
     t.map.insert(o.name, o);
     t.all.push(o);
