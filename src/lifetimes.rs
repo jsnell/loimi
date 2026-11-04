@@ -370,34 +370,83 @@ struct Fa<'a> {
     p: &'a Program,
     fid: FnId,
     f: &'a FnDef,
-    sums: &'a HashMap<FnId, Summary>,
+    sums: &'a FxMap<FnId, Summary>,
     report: bool,
     unsafe_spans: &'a [Span],
     audit: Option<&'a crate::diag::SourceMap>,
     kinds: &'a mut Kinds,
     whys: Vec<(Span, Why)>,
-    why_ids: HashMap<(Span, Why), u32>,
+    why_ids: FxMap<(Span, Why), u32>,
     errs: Vec<Diag>,
     /// Audit mode: the `lifetime-site` lines.
     lines: Vec<String>,
-    err_spans: HashSet<(u32, u32)>,
-    breaks: HashMap<u32, (St, Val)>,
-    conts: HashMap<u32, St>,
+    err_spans: FxSet<(u32, u32)>,
+    breaks: FxMap<u32, (St, Val)>,
+    conts: FxMap<u32, St>,
     /// Per loop: the locals bound inside its body (dropped when it exits).
-    loop_locals: HashMap<u32, Vec<LocalId>>,
+    loop_locals: FxMap<u32, Vec<LocalId>>,
     defers: Vec<Vec<&'a TExpr>>,
     out: Summary,
-    param_idx: HashMap<LocalId, u32>,
+    param_idx: ParamIdx,
     /// (callee, argument, what it points into) whose restructures are
     /// already in `out`.
-    summed: HashSet<(FnId, u32, Path)>,
+    summed: FxSet<(FnId, u32, Path)>,
 }
+
+/// Local -> parameter index.
+struct ParamIdx(Vec<u32>);
+
+impl ParamIdx {
+    fn new(f: &FnDef) -> ParamIdx {
+        let mut v = vec![u32::MAX; f.locals.len()];
+        for (i, &l) in f.params.iter().enumerate() {
+            v[l as usize] = i as u32;
+        }
+        ParamIdx(v)
+    }
+    fn get(&self, l: &LocalId) -> Option<&u32> {
+        self.0.get(*l as usize).filter(|i| **i != u32::MAX)
+    }
+    fn contains_key(&self, l: &LocalId) -> bool {
+        self.get(l).is_some()
+    }
+}
+
+/// A fast hasher for the pass's maps of small keys (ids, addresses).
+#[derive(Default, Clone, Copy)]
+struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.write_u64(*b as u64);
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.write_u64(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+type FxSet<K> = HashSet<K, std::hash::BuildHasherDefault<Fx>>;
 
 /// `kind_of`, memoized by type and by the address of a type in the program.
 #[derive(Default)]
 struct Kinds {
     by_ty: HashMap<Ty, Kind>,
-    by_addr: HashMap<usize, Kind>,
+    by_addr: FxMap<usize, Kind>,
 }
 
 /// Why a local may dangle (formatted only for a message).
@@ -1515,7 +1564,7 @@ pub struct Ctx<'a> {
 fn analyze<'a>(
     p: &'a Program,
     fid: FnId,
-    sums: &'a HashMap<FnId, Summary>,
+    sums: &'a FxMap<FnId, Summary>,
     kinds: &'a mut Kinds,
     cx: &Ctx<'a>,
     report: bool,
@@ -1533,17 +1582,17 @@ fn analyze<'a>(
         audit,
         kinds,
         whys: Vec::new(),
-        why_ids: HashMap::new(),
+        why_ids: FxMap::default(),
         errs: Vec::new(),
         lines: Vec::new(),
-        err_spans: HashSet::new(),
-        breaks: HashMap::new(),
-        conts: HashMap::new(),
-        loop_locals: HashMap::new(),
+        err_spans: FxSet::default(),
+        breaks: FxMap::default(),
+        conts: FxMap::default(),
+        loop_locals: FxMap::default(),
         defers: Vec::new(),
         out: Summary::default(),
-        summed: HashSet::new(),
-        param_idx: f.params.iter().enumerate().map(|(i, &l)| (l, i as u32)).collect(),
+        summed: FxSet::default(),
+        param_idx: ParamIdx::new(f),
     };
     let _ = fa.fid;
     let mut st = St { reach: true, ..Default::default() };
@@ -1552,7 +1601,7 @@ fn analyze<'a>(
     // before they are read.
     let mut bound = Vec::new();
     bound_locals(b, &mut bound);
-    let bound: HashSet<LocalId> = bound.into_iter().collect();
+    let bound: FxSet<LocalId> = bound.into_iter().collect();
     for (l, _) in f.locals.iter().enumerate() {
         if bound.contains(&(l as LocalId)) {
             continue;
@@ -1588,9 +1637,9 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     }
     // Only what checked functions call (transitively) needs a summary.
     // Post-order, so callees are summarized before their callers.
-    let mut calls: HashMap<FnId, Vec<FnId>> = HashMap::new();
+    let mut calls: FxMap<FnId, Vec<FnId>> = FxMap::default();
     let mut fns: Vec<FnId> = Vec::new();
-    let mut seen: HashSet<FnId> = HashSet::new();
+    let mut seen: FxSet<FnId> = FxSet::default();
     for &c in &checked {
         let mut stack: Vec<(FnId, usize)> = Vec::new();
         if seen.insert(c) {
@@ -1619,26 +1668,30 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     }
     // Callers of each function, to revisit only what a changed summary
     // can change.
-    let mut callers: HashMap<FnId, Vec<FnId>> = HashMap::new();
+    let mut callers: FxMap<FnId, Vec<FnId>> = FxMap::default();
     for (&f, cs) in &calls {
         for &c in cs {
             callers.entry(c).or_default().push(f);
         }
     }
-    let mut sums: HashMap<FnId, Summary> = HashMap::new();
+    if std::env::var("LOIMI_LIFETIMES_STATS").is_ok() {
+        eprintln!("lifetimes: call graph {:.1} ms", t_start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let mut sums: FxMap<FnId, Summary> = FxMap::default();
     let mut kinds = Kinds::default();
-    let mut work: Vec<FnId> = fns.iter().rev().copied().collect();
-    let mut queued: HashSet<FnId> = fns.iter().copied().collect();
+    // The worklist in post-order (callees first): a function whose callee's
+    // summary changed waits until the rest of their cycle is done.
+    let order: FxMap<FnId, usize> = fns.iter().enumerate().map(|(k, &f)| (f, k)).collect();
+    let mut work: BTreeSet<(usize, FnId)> = fns.iter().enumerate().map(|(k, &f)| (k, f)).collect();
     let mut rounds = 0u64;
     // A function's last analysis saw the final summaries of its callees
     // (a change to one queues it again), so its errors are reported from
     // that analysis rather than from one more pass.
-    let checked_set: HashSet<FnId> = checked.iter().copied().collect();
-    let mut reports: HashMap<FnId, (Vec<Diag>, Vec<String>)> = HashMap::new();
+    let checked_set: FxSet<FnId> = checked.iter().copied().collect();
+    let mut reports: FxMap<FnId, (Vec<Diag>, Vec<String>)> = FxMap::default();
     let stats = std::env::var("LOIMI_LIFETIMES_STATS").is_ok();
-    let mut times: HashMap<FnId, (f64, u32)> = HashMap::new();
-    while let Some(i) = work.pop() {
-        queued.remove(&i);
+    let mut times: FxMap<FnId, (f64, u32)> = FxMap::default();
+    while let Some((_, i)) = work.pop_first() {
         rounds += 1;
         let t0 = std::time::Instant::now();
         let report = checked_set.contains(&i);
@@ -1653,7 +1706,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         }
         let old = sums.get(&i).cloned().unwrap_or_default();
         let mut merged = old.clone();
-        merged.restructs.extend(s.restructs);
+        merged.restructs.extend(s.restructs.into_iter().filter(|r| !r.trunc));
         merged.ret.extend(s.ret);
         merged.pairs.extend(s.pairs);
         for (j, d) in s.keeps {
@@ -1662,9 +1715,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         if merged != old {
             sums.insert(i, merged);
             for &c in callers.get(&i).map(|v| v.as_slice()).unwrap_or(&[]) {
-                if queued.insert(c) {
-                    work.push(c);
-                }
+                work.insert((order[&c], c));
             }
         }
     }
@@ -1672,7 +1723,24 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         eprintln!("lifetimes: {} functions, {} analyses", fns.len(), rounds);
         let mut v: Vec<_> = times.iter().collect();
         v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-        for (f, (t, n)) in v.iter().take(12) {
+        let tot: f64 = v.iter().map(|x| x.1.0).sum();
+        let mut acc = 0.0;
+        for (k, x) in v.iter().enumerate() {
+            acc += x.1.0;
+            if [10usize, 50, 100, 200, 500, 1000].contains(&(k + 1)) {
+                eprintln!("top {}: {:.0}%", k + 1, acc * 100.0 / tot);
+            }
+        }
+        if let Ok(fname) = std::env::var("LOIMI_LT_DUMP") {
+            for (f, s) in &sums {
+                if p.fns[*f as usize].symbol == fname {
+                    for r in &s.restructs {
+                        eprintln!("R {:?} {:?} {}", r.root, &*r.steps, r.trunc);
+                    }
+                }
+            }
+        }
+        for (f, (t, n)) in v.iter().take(30) {
             let s = sums.get(*f).cloned().unwrap_or_default();
             eprintln!("  {:8.1} ms {:3}x {} (restructs {} ret {} pairs {} keeps {})", t * 1000.0, n, p.fns[**f as usize].symbol, s.restructs.len(), s.ret.len(), s.pairs.len(), s.keeps.len());
         }
@@ -1691,6 +1759,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     }
     Ok(())
 }
+
 
 fn callees(e: &TExpr, out: &mut Vec<FnId>) {
     if let TK::FnRef(id) = e.kind {
