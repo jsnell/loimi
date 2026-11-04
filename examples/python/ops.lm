@@ -40,6 +40,11 @@ pub const DN_RBASE: u64 = 13;
 pub const DN_CMP: u64 = 26;
 pub const DN_GETITEM: u64 = 32;
 pub const DN_EQ: u64 = 30;
+pub const DN_HASH: u64 = 33;
+pub const DN_CALL: u64 = 34;
+pub const DN_ITER: u64 = 35;
+pub const DN_BOOL: u64 = 36;
+pub const DN_LEN: u64 = 37;
 
 pub fn init_dunders(c: *Ctx) {
     for op: u64 in 0..13 {
@@ -48,6 +53,11 @@ pub fn init_dunders(c: *Ctx) {
     }
     for op: u64 in 0..6 { c.dn[DN_CMP + op] = Value.Str(vm.intern(c, cmp_dunder(op as u32))); }
     c.dn[DN_GETITEM] = Value.Str(vm.intern(c, "__getitem__"));
+    c.dn[DN_HASH] = Value.Str(vm.intern(c, "__hash__"));
+    c.dn[DN_CALL] = Value.Str(vm.intern(c, "__call__"));
+    c.dn[DN_ITER] = Value.Str(vm.intern(c, "__iter__"));
+    c.dn[DN_BOOL] = Value.Str(vm.intern(c, "__bool__"));
+    c.dn[DN_LEN] = Value.Str(vm.intern(c, "__len__"));
 }
 
 /// A plain function `name` of the class with `nargs` parameters and no
@@ -640,12 +650,28 @@ pub fn class_has_eq(c: *Ctx, cls: Gc<Box>) -> bool {
     (cls.s & 4) != 0
 }
 
+/// The class (or a base) defines `__hash__` (cached with `__init__`:
+/// flag 16 in `s`).
+pub fn class_has_hash(c: *Ctx, cls: Gc<Box>) -> bool {
+    if cls.b != Value.Int(c.epoch as i48) { class_refresh(c, cls); }
+    (cls.s & 16) != 0
+}
+
+/// The class (or a base) defines `__bool__` or `__len__` (flag 32).
+pub fn class_has_truth(c: *Ctx, cls: Gc<Box>) -> bool {
+    if cls.b != Value.Int(c.epoch as i48) { class_refresh(c, cls); }
+    (cls.s & 32) != 0
+}
+
 /// Recompute what the class box caches for epoch `c.epoch`: `__init__`
-/// in `c` (Undef: none) and the `__eq__`/`__ne__` flag.
+/// in `c` (Undef: none), the `__eq__`/`__ne__` flag, the `__hash__` flag
+/// and the `__bool__`/`__len__` flag.
 fn class_refresh(c: *Ctx, cls: Gc<Box>) {
     cls.c = class_lookup(cls, c.n_init.unwrap()) ?? Value.Undef;
     let eq = class_lookup(cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(cls, dn(c, DN_CMP + C_NE as u64)).is_some();
-    cls.s = (cls.s & ~4) | (if eq { 4 } else { 0 });
+    let hs = class_lookup(cls, dn(c, DN_HASH)).is_some();
+    let tr = class_lookup(cls, dn(c, DN_BOOL)).is_some() or class_lookup(cls, dn(c, DN_LEN)).is_some();
+    cls.s = (cls.s & ~(4 | 16 | 32)) | (if eq { 4 } else { 0 }) | (if hs { 16 } else { 0 }) | (if tr { 32 } else { 0 });
     for i in 0..CLASS_SLOTS { if i < cls.extra.len { cls.extra[i] = Value.Undef; } }
     cls.b = Value.Int(c.epoch as i48);
 }
@@ -1085,7 +1111,7 @@ pub fn call_generic(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Va
             Err(not_callable(c, f))
         }
         Inst(o) => {
-            let Some(m) = class_lookup(o.cls, vm.intern(c, "__call__")) else { return Err(not_callable(c, f)); };
+            let Some(m) = class_lookup(o.cls, dn(c, DN_CALL)) else { return Err(not_callable(c, f)); };
             let need = top + n + 3;
             if need > c.hw { c.hw = need; }
             var i = n;
@@ -1113,7 +1139,7 @@ pub fn call_method_s(c: *Ctx, obj: Value, name: Gc<Str>, args: []Value) -> Resul
     Ok(Some(r?))
 }
 
-fn dn(c: *Ctx, i: u64) -> Gc<Str> {
+pub fn dn(c: *Ctx, i: u64) -> Gc<Str> {
     let Str(s) = c.dn[i] else { trap() };
     s
 }
@@ -1651,9 +1677,10 @@ pub fn truthy(c: *Ctx, v: Value) -> Result<bool, Value> uses reenter {
         List(l) => Ok(l.len != 0),
         Tuple(t) => Ok(t.items.len != 0),
         Dict(d) => Ok(d.len != 0),
-        Inst(_) => {
-            if let Some(r) = call_method(c, v, "__bool__", [])? { return truthy(c, r); }
-            if let Some(r) = call_method(c, v, "__len__", [])? { return truthy(c, r); }
+        Inst(i) => {
+            if !class_has_truth(c, i.cls) { return Ok(true); }
+            if let Some(r) = call_method_s(c, v, dn(c, DN_BOOL), [])? { return truthy(c, r); }
+            if let Some(r) = call_method_s(c, v, dn(c, DN_LEN), [])? { return truthy(c, r); }
             Ok(true)
         }
         Obj(b) => {
@@ -1918,8 +1945,9 @@ fn seq_compare(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> use
 
 /// Hash of a value usable as a dict key, calling __hash__ on instances.
 pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
-    if let Inst(_) = v {
-        if let Some(r) = call_method(c, v, "__hash__", [])? {
+    if let Inst(i) = v {
+        if !class_has_hash(c, i.cls) { return Ok(hash.mix(v as u64)); }
+        if let Some(r) = call_method_s(c, v, dn(c, DN_HASH), [])? {
             let Some(i) = value.as_i64(r) else { return Err(exc(c, E_TYPE, "__hash__ method should return an integer")); };
             return Ok(i as u64);
         }
@@ -1948,7 +1976,9 @@ fn dict_find_user(c: *Ctx, d: Gc<Dict>, k: Value, hv: u64) -> Result<?u64, Value
 }
 
 fn has_user_eq(c: *Ctx, k: Value) -> bool {
-    if let Inst(i) = k { return class_lookup(i.cls, vm.intern(c, "__eq__")).is_some(); }
+    // Also true for a class with only __ne__: dict_find_user then compares
+    // as `equal` does, by identity.
+    if let Inst(i) = k { return class_has_eq(c, i.cls); }
     false
 }
 
@@ -2548,8 +2578,8 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
             }
         }
         Inst(_) => {
-            if let Some(r) = call_method(c, v, "__iter__", [])? { return Ok(r); }
-            if class_lookup(class_of(c, v), vm.intern(c, "__getitem__")).is_some() {
+            if let Some(r) = call_method_s(c, v, dn(c, DN_ITER), [])? { return Ok(r); }
+            if class_lookup(class_of(c, v), dn(c, DN_GETITEM)).is_some() {
                 // Old-style sequence iteration.
                 let b = value.new_box(&c.heap, K_SEQIT, 0);
                 b.a = v;
