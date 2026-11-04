@@ -140,12 +140,14 @@ fn run_one(seed: u64, src: str, stress: bool, stack: *Value, lstack: *Value, fra
             Err(msg) => if msg.eq("step budget exhausted") { st.budget += 1; } else { st.raised += 1; },
         }
     }
-    prog.free();
+    // The machine points into the program (`words`, `consts`, read by
+    // its root scanner): free the program after it.
     m.heap.free();
     mem.release(m.globals);
     m.out.free();
     m.tmp.free();
     m.err.free();
+    prog.free();
     arena.free();
 }
 

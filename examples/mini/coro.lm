@@ -239,7 +239,8 @@ pub fn call(c: *Ctx, id: i32, args: *V, n: u64, from_vm: bool) -> Result<V, V> u
     if id == YIELD {
         if c.cur == c.main { return Err(msg(c, "attempt to yield from outside a coroutine")); }
         if !from_vm or c.base != c.frames { return Err(msg(c, "attempt to yield across a C-call boundary")); }
-        c.xfer = args;
+        // `xfer` (the values, in the CALL's window) is set by the CALL
+        // instruction itself: `args` is only lent for this call.
         c.nxfer = n;
         c.yielded = true;
         c.nret = 0;

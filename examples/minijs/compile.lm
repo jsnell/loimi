@@ -1311,6 +1311,8 @@ fn Gen.function(g: *Gen, f: *Func) -> Gc<Proto> {
 /// The program (or the prelude): a function without parameters whose
 /// top-level declarations are globals.
 fn Gen.top(g: *Gen, f: *Func) -> Gc<Proto> {
+    // `g.fs` points at a local only while it lives (as in `function`).
+    let parent = g.fs;
     var fs = FS.new(f, 0 as *FS);
     g.fs = &fs;
     fs.regs.activate(1);
@@ -1320,7 +1322,9 @@ fn Gen.top(g: *Gen, f: *Func) -> Gc<Proto> {
     let r = g.temp();
     g.emit(JS.LOADU(r as u8));
     g.emit(JS.RET(r as u8));
-    g.finish(&fs)
+    let p = g.finish(&fs);
+    g.fs = parent;
+    p
 }
 
 /// `this.x = ...` assignments in `n` (not in nested functions).

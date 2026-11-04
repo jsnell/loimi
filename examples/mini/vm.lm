@@ -1102,7 +1102,8 @@ pub vm Mini {
                 }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
-                if ctx.yielded { yield_exit(base as u64, nres as u64) }
+                // coroutine.yield: its values are this CALL's arguments.
+                if ctx.yielded { ctx.xfer = regs + base + 1; yield_exit(base as u64, nres as u64) }
                 native_results(base as u64, nres as u64, v)
             }
         }
