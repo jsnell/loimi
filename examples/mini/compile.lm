@@ -881,6 +881,57 @@ fn Parser.finish_binop(p: *Parser, op: T, w: u32) -> E {
 /// Evaluate an expression list into consecutive registers starting at
 /// the free register, adjusted to exactly `nvars` values. Only a call in
 /// the last position can produce several values.
+/// A constant that `store_var` can store without a register.
+fn is_const(e: E) -> bool {
+    match e {
+        True | False | Nil | I(_) | K(_) => true,
+        _ => false,
+    }
+}
+
+/// `explist_to` for a multiple assignment: the `nvars` values, each a
+/// register from the current top on, or a constant left unloaded (its
+/// register is reserved but not written), so that `t[i], u[j] = true,
+/// false` stores constants (SETINDEXK) instead of loading them first.
+fn Parser.explist_vals(p: *Parser, nvars: u32) -> mem.Vec<E> {
+    let start = p.fs.regs.top;
+    var vals: mem.Vec<E> = mem.Vec.new();
+    var n: u32 = 1;
+    var e = p.expr();
+    while p.accept(T.Comma) {
+        if is_const(e) {
+            p.reserve(1);
+            vals.push(e);
+        } else {
+            vals.push(E.Temp(p.to_next_reg(e)));
+        }
+        e = p.expr();
+        n += 1;
+    }
+    if let Call(base, at) = e and n < nvars {
+        if base != start + n - 1 { internal_error("misplaced call results"); }
+        let want = nvars - n + 1;
+        let w = p.fs.code.at(at);
+        p.fs.code.set(at, (w & 0x00FFFFFF) | (want << 24));
+        p.reserve(want - 1);
+        for i in 0..want { vals.push(E.Temp(base + i)); }
+        return vals;
+    }
+    if is_const(e) {
+        p.reserve(1);
+        vals.push(e);
+    } else {
+        vals.push(E.Temp(p.to_next_reg(e)));
+    }
+    while n < nvars {
+        p.reserve(1);
+        vals.push(E.Nil);
+        n += 1;
+    }
+    p.fs.regs.reset(start + nvars);
+    vals
+}
+
 fn Parser.explist_to(p: *Parser, nvars: u32) {
     let start = p.fs.regs.top;
     var n: u32 = 1;
@@ -972,7 +1023,7 @@ fn Parser.jump_if(p: *Parser, e: E, when: bool) -> ?u64 {
         if at > 0 and jump_op(Mini.opcode(code.at(at - 1))) != 0 and ((code.at(at - 1) >> 8) & 255) == src and p.fs.regs.is_temp(src) {
             e = E.Reloc(at - 1);
         } else {
-            return Some(p.emit(Mini.TESTT(src as u8, 0)));
+            return Some(p.emit(if when { Mini.TESTT(src as u8, 0) } else { Mini.TEST(src as u8, 0) }));
         }
     }
     // A comparison just emitted: compare and branch.
@@ -1077,6 +1128,33 @@ fn Parser.cond(p: *Parser) -> mem.Vec<u64> {
     p.patch_here(&t);
     t.free();
     f
+}
+
+/// Words of condition code that a while loop repeats after its body.
+const MAX_ROTATE: u64 = 16;
+
+/// A condition that jumps to `target` when true and falls through when
+/// false; returns the jumps taken when false (to be patched to the
+/// fall-through point, then freed). `cond` with the opposite sense, for
+/// the test at the bottom of a rotated while loop.
+fn Parser.cond_jump_true(p: *Parser, target: u64) -> mem.Vec<u64> {
+    loop {
+        // One and-chain: a false operand goes to the next alternative
+        // (or out), a true last operand to `target`.
+        var fails: mem.Vec<u64> = mem.Vec.new();
+        loop {
+            let e = p.subexpr(2);
+            if p.accept(T.And) {
+                if let Some(j) = p.jump_if(e, false) { fails.push(j); }
+                continue;
+            }
+            if let Some(j) = p.jump_if(e, true) { p.patch(j, target); }
+            break;
+        }
+        if !p.accept(T.Or) { return fails; }
+        p.patch_here(&fails);
+        fails.free();
+    }
 }
 
 fn Parser.loop_enter(p: *Parser) -> LoopSave {
@@ -1227,12 +1305,40 @@ fn Parser.statement_inner(p: *Parser) {
         While => {
             p.advance();
             let start = p.pc();
+            // Where the condition starts, to compile it again after the body.
+            let at_cond = p.lx;
+            let tok = p.tok;
+            let prev = p.prev;
+            let nprotos = p.fs.protos.len;
             var f = p.cond();
+            // Rotate small conditions that define no functions (below).
+            var rotate = p.pc() - start <= MAX_ROTATE and p.fs.protos.len == nprotos;
+            #[cfg(debug)] { rotate = false; } // --cfg debug: the jump back is a JMP, which polls for a pause
             p.check(T.Do, "'do'");
             let saved = p.loop_enter();
+            p.fs.code.mark_target();
+            let body = p.pc();
             p.block();
             p.check(T.End, "'end'");
-            p.patch(p.jump(), start);
+            if rotate {
+                // The condition again, jumping back to the body while it
+                // holds: one dispatch per iteration fewer than a JMP back
+                // to the test at the top.
+                let after = p.lx;
+                let atok = p.tok;
+                let aprev = p.prev;
+                p.lx = at_cond;
+                p.tok = tok;
+                p.prev = prev;
+                var g = p.cond_jump_true(body);
+                p.lx = after;
+                p.tok = atok;
+                p.prev = aprev;
+                p.patch_here(&g);
+                g.free();
+            } else {
+                p.patch(p.jump(), start);
+            }
             p.patch_here(&f);
             f.free();
             p.loop_exit(saved);
@@ -1333,14 +1439,14 @@ fn Parser.statement_inner(p: *Parser) {
                 targets.push(t);
             }
             p.check(T.Assign, "'='");
-            let base = p.fs.regs.top;
             let n = targets.len as u32;
-            p.explist_to(n);
+            var vals = p.explist_vals(n);
             var i = n;
             while i > 0 {
                 i -= 1;
-                p.store_var(targets.at(i as u64), E.Temp(base + i));
+                p.store_var(targets.at(i as u64), vals.at(i as u64));
             }
+            vals.free();
             targets.free();
         }
     }
@@ -1439,12 +1545,19 @@ fn FuncState.new(name: str, parent: ?*FuncState) -> FuncState {
     }
 }
 
+fn is_jmp(w: u32) -> bool { Mini.opcode(w) == Mini.OP_JMP }
+
 fn Parser.finish(p: *Parser, fs: *FuncState) -> Gc<Proto> {
     p.emit(Mini.RET0());
     if let Some(e) = fs.code.check() {
         let msg = match e.kind { JumpRange => "control structure too long", _ => e.message() };
         p.fail_at(p.sm.line_span(p.file, e.loc), msg);
     }
+    // A jump to a JMP goes to its target instead (the end of an `if`
+    // branch at the end of a loop body, for one). Not under `--cfg debug`,
+    // whose stepping sees the lines of the jumps.
+    #[cfg(not(debug))]
+    fs.code.thread_jumps(Mini.label, is_jmp);
     let h = p.heap;
     let consts = value.new_arr(h, fs.consts.len());
     for i in 0..fs.consts.len() { consts.data[i] = fs.consts.get(i as u32); }

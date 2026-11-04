@@ -91,10 +91,16 @@ pub value V repr nanbox {
 /// bits of its hash above them, so probes rarely touch the strings. 0 is
 /// an empty slot and 1 a tombstone. Weak: a sweeper turns strings the
 /// collector did not mark into tombstones. Reached through the heap's
-/// `user` pointer.
-pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64 }
+/// `user` pointer. `buf` is a byte buffer kept between the natives that
+/// build strings (`take_buf`). `young` holds the slot words of the
+/// strings made since the last sweep (and of large survivors, which stay
+/// young for one more collection): in a minor collection only those can
+/// die, so the sweeper checks them instead of the whole table.
+pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, buf: text.StrBuf, young: mem.Vec<u64> }
 
 const TOMB: u64 = 1;
+/// Prefetch distance of `sweep_strings`, in slots.
+const PF: u64 = 16;
 const ADDR: u64 = 0xFFFFFFFFFFFF;
 const HTAG: u64 = 0xFFFF000000000000;
 
@@ -109,6 +115,8 @@ fn str_at(w: u64) -> Gc<Str> {
 pub fn init_strings(h: *gc.Heap) {
     let st: *Strings = mem.alloc(1);
     st.cap = 0;
+    st.buf = text.StrBuf.new();
+    st.young = mem.Vec.new();
     strings_resize(st, 1024);
     h.user = st as *u8;
     h.add_sweeper(st as *u8, sweep_strings);
@@ -137,10 +145,51 @@ fn strings_resize(st: *Strings, cap: u64) {
     if n > 0 { mem.release(old); }
 }
 
+/// Strings longer than this may be large objects (over 496 bytes with
+/// the header), which are young until they survive two collections.
+const YOUNG_LARGE: u64 = 400;
+
 fn sweep_strings(h: *gc.Heap, data: *u8) {
     let st = data as *Strings;
     let slots = st.slots;
-    for i in 0..st.cap {
+    let cap = st.cap;
+    if h.is_minor() {
+        // Old strings count as marked: only `young` ones can die. A dead
+        // one is still intact here (no sweeper before this one reuses
+        // memory), so its hash finds its slot.
+        let mask = cap - 1;
+        var keep: u64 = 0;
+        for j in 0..st.young.len {
+            let w = st.young.at(j);
+            let o = str_at(w);
+            if h.is_marked((w & ADDR) as *u8) {
+                if o.data.len > YOUNG_LARGE {
+                    st.young.set(keep, w);
+                    keep += 1;
+                }
+            } else {
+                var i = o.hash & mask;
+                loop {
+                    let x = slots[i];
+                    if x == w {
+                        slots[i] = TOMB;
+                        st.live -= 1;
+                        break;
+                    }
+                    if x == 0 { break; }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        st.young.truncate(keep);
+        return;
+    }
+    st.young.clear();
+    for i in 0..cap {
+        // The live strings' headers are scattered over the heap: start
+        // loading the one PF slots ahead (empty slots and tombstones
+        // prefetch near address 0, which is harmless).
+        if i + PF < cap { (((slots[i + PF] & ADDR) -% 16) as *u8).prefetch(); }
         let w = slots[i];
         if w > TOMB and !h.is_marked((w & ADDR) as *u8) {
             slots[i] = TOMB;
@@ -148,6 +197,28 @@ fn sweep_strings(h: *gc.Heap, data: *u8) {
         }
     }
     if st.cap > 1024 and st.live * 8 < st.cap { strings_resize(st, st.cap / 2); }
+}
+
+/// An empty buffer to build a string in: the kept one if it is free
+/// (saving a malloc and its regrowth per call), else a new one. Hand it
+/// back with `give_buf` (or free it).
+pub fn take_buf(h: *gc.Heap) -> text.StrBuf {
+    let st = h.user as *Strings;
+    var b = st.buf;
+    st.buf = text.StrBuf.new();
+    b.clear();
+    b
+}
+
+/// Keep `b` for the next `take_buf` if none is kept, else free it.
+pub fn give_buf(h: *gc.Heap, b: *text.StrBuf) {
+    let st = h.user as *Strings;
+    if st.buf.bytes.cap == 0 {
+        st.buf = *b;
+        *b = text.StrBuf.new();
+    } else {
+        b.free();
+    }
 }
 
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
@@ -169,6 +240,7 @@ pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
     let o = new(h, Str { hash: hv }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
     slots[i] = (o as u64) | tag;
+    st.young.push((o as u64) | tag);
     st.live += 1;
     st.used += 1;
     if st.used * 2 > st.cap {
@@ -193,7 +265,7 @@ pub fn tbar(t: Gc<Table>) {
 }
 
 #[inline(never)]
-fn log_table(t: Gc<Table>) {
+pub fn log_table(t: Gc<Table>) {
     gc.remember(t as *u8);
     if let Some(a) = t.arr { gc.remember(a as *u8); }
     if let Some(a) = t.hash { gc.remember(a as *u8); }
@@ -247,6 +319,14 @@ pub fn type_name(v: V) -> str {
         T(_) => "table",
         F(_) | Native(_) => "function",
         Co(c) => if coro.is_wrap(c) { "function" } else { "thread" },
+    }
+}
+
+#[inline]
+pub fn is_number(v: V) -> bool {
+    match v {
+        Int(_) | Num(_) => true,
+        _ => false,
     }
 }
 
@@ -327,15 +407,17 @@ pub fn hash_get_str(t: Gc<Table>, k: V, hv: u64) -> V {
 }
 
 /// Overwrite the value of string key `k` (hash `hv`) if it is present
-/// (possibly as a tombstone); false if absent.
-pub fn hash_set_existing(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
+/// (possibly as a tombstone); false if absent. The caller does the
+/// write barrier (`tbar`) when it returns true.
+#[inline]
+pub fn hash_set_existing_nobar(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
     if t.hcap == 0 { return false; }
     let slots = t.hptr;
     let mask = t.hcap - 1;
     var i = hv & mask;
     loop {
         let key = slots[2 * i];
-        if key == k { slots[2 * i + 1] = v; tbar(t); return true; }
+        if key == k { slots[2 * i + 1] = v; return true; }
         if key == V.Nil { return false; }
         i = (i + 1) & mask;
     }
@@ -444,6 +526,22 @@ fn array_grow(h: *gc.Heap, t: Gc<Table>, n: u64) {
     t.arr = Some(na);
     t.aptr = p;
     t.acap = n;
+}
+
+/// Whether t[asize+1] = v can be stored by `append_in_place`: room in the
+/// array part, no hash part entries (so none for asize+2.. to move
+/// over), and a value that is not nil.
+#[inline]
+pub fn can_append(t: Gc<Table>, v: V) -> bool {
+    t.asize < t.acap and t.hused == 0 and v != V.Nil
+}
+
+/// t[asize+1] = v when `can_append`: no allocation, so no GC check.
+/// The caller does the write barrier (`tbar`).
+#[inline]
+pub fn append_in_place(t: Gc<Table>, v: V) {
+    t.aptr[t.asize] = v;
+    t.asize += 1;
 }
 
 /// Append at asize+1, then move the following integer keys over from the hash.

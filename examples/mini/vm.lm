@@ -286,6 +286,21 @@ fn field_set_slow(h: *gc.Heap, t: Gc<Table>, key: V, v: V, slot: *u32) {
     if let Some(i) = value.table_find(t, key) { *slot = i as u32; }
 }
 
+/// MODK's cache: m in the low 56 bits, s above, such that
+/// floor(x / d) = (x * m) >> s for every 0 <= x < 2^31 (d >= 1). With
+/// l = ceil(log2 d), s = 31 + l and m = ceil(2^s / d): m * d - 2^s < d <= 2^l,
+/// which is Granlund and Montgomery's condition (PLDI 1994, theorem 4.2)
+/// for 31-bit dividends; m <= 2^32, so x * m < 2^63 does not overflow.
+fn mod_magic(d: i32) -> u64 {
+    let dd = d as u64;
+    let l: u64 = if dd <= 1 { 0 } else { 64 - ((dd - 1).clz() as u64) };
+    let sh = 31 + l;
+    let m = (((1 as u64) << sh) + dd - 1) / dd;
+    m | (sh << 56)
+}
+pub const MAGIC_M: u64 = 0xFFFFFFFFFFFFFF;
+pub const MOD_MANY: u32 = 0xFFFFFFFF;
+
 /// Arithmetic outside the (Int, Int) and (Num, Num) fast paths: mixed
 /// int/float operands first, then everything else.
 fn arith_mixed(c: *Ctx, op: i64, a: V, b: V) -> Result<V, V> {
@@ -646,7 +661,7 @@ pub vm Mini {
             let i = cache.slot as u64;
             if likely(i < tab.hcap) {
                 let p = tab.hptr + 2 * i;
-                if p[0] == key { p[1] = v; value.tbar(tab); next }
+                if p[0] == key { p[1] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
@@ -662,46 +677,56 @@ pub vm Mini {
             if u < tab.asize { dst = tab.aptr[u]; next }
         }
         if let (T(tab), S(s)) = (t, key) { dst = value.hash_get_str(tab, key, s.hash); next }
-        if let T(tab) = t { dst = value.table_get(tab, key); next }
-        cold { raise error(ctx, "attempt to index a ", t) }
+        // Other keys in a cold block: the call would give the handler a frame.
+        cold {
+            if let T(tab) = t { dst = value.table_get(tab, key); next }
+            raise error(ctx, "attempt to index a ", t)
+        }
     }
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
+            if u < tab.asize { tab.aptr[u] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
         }
-        if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
-        if let T(tab) = t {
-            if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
-            if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            value.table_set(&ctx.heap, tab, key, v);
-            next
+        if let (T(tab), S(s)) = (t, key) and value.hash_set_existing_nobar(tab, key, s.hash, v) { if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+        // Calls only in cold blocks (here and the barriers'): a call would
+        // give the whole handler a stack frame.
+        cold {
+            if let T(tab) = t {
+                if key == V.Nil { raise error_msg(ctx, "table index is nil") }
+                if let Num(x) = key and x != x { raise error_msg(ctx, "table index is NaN") }
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                value.table_set(&ctx.heap, tab, key, v);
+                next
+            }
+            raise error(ctx, "attempt to index a ", t)
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// t[key] = k[c] (a constant value).
     op SETINDEXK(t: reg, key: reg, v: kst) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
+            if u < tab.asize { tab.aptr[u] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
         }
-        if let T(tab) = t {
-            if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
-            if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            value.table_set(&ctx.heap, tab, key, v);
-            next
+        cold {
+            if let T(tab) = t {
+                if key == V.Nil { raise error_msg(ctx, "table index is nil") }
+                if let Num(x) = key and x != x { raise error_msg(ctx, "table index is NaN") }
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                value.table_set(&ctx.heap, tab, key, v);
+                next
+            }
+            raise error(ctx, "attempt to index a ", t)
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// R[dst] = t[i] for an integer constant 1 <= i <= 255.
     op GETINDEXI(dst: reg, t: reg, i: index1) : ABC {
         if let T(tab) = t {
             let u = (i as u64) - 1;
             if u < tab.asize { dst = tab.aptr[u]; next }
-            dst = value.table_get(tab, Int(i as i32));
-            next
+            cold { dst = value.table_get(tab, Int(i as i32)); next }
         }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
@@ -787,7 +812,29 @@ pub vm Mini {
         if let Int(x) = a and let Some(r) = x.add_checked(sc as i32) { dst = Int(r); next }
         cold { dst = arith_slow(ctx, 0, a, Int(sc as i32))?; next }
     }
-    inline for (dname, mname, bkind, bbase) in [("DIV", "MOD", reg, regs), ("DIVK", "MODK", kst, k)] {
+    // `x % k` for a constant k divides by multiplying (Granlund and
+    // Montgomery): the site caches m and s (`mod_magic`) with
+    // floor(x / k) = (x * m) >> s for 0 <= x < 2^31. idiv takes about 26
+    // cycles, the multiply 3. Zero until the site first runs with an Int
+    // constant k > 0.
+    cache ModIC { magic: u64 }
+
+    op MODK(dst: reg, a: reg, b: kst) : ABC + ModIC {
+        if let (Int(x), Int(y)) = (a, b) and x >= 0 and cache.magic != 0 {
+            let mg = cache.magic;
+            let q = ((x as u64) * (mg & MAGIC_M)) >> (mg >> 56);
+            dst = Int(((x as u64) - q * (y as u64)) as i32);
+            next
+        }
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            if cache.magic == 0 { cache.magic = mod_magic(y); }
+            let r = x % y;
+            dst = Int(if r < 0 { r + y } else { r });
+            next
+        }
+        cold { dst = arith_slow(ctx, 4, a, b)?; next }
+    }
+    inline for (dname, bkind) in [("DIV", reg), ("DIVK", kst)] {
         op #dname(dst: reg, a: reg, b: bkind) : ABC {
             let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
             if likely(r == r) { dst = r.to_bits() as V; next }
@@ -800,14 +847,31 @@ pub vm Mini {
             }
             cold { dst = arith_slow(ctx, 3, a, b)?; next }
         }
-        op #mname(dst: reg, a: reg, b: bkind) : ABC {
-            if let (Int(x), Int(y)) = (a, b) and y > 0 {
-                let r = x % y;
-                dst = Int(if r < 0 { r + y } else { r });
-                next
-            }
-            cold { dst = arith_slow(ctx, 4, a, b)?; next }
+    }
+    // The same for a divisor in a register, keyed by the divisor seen
+    // first. A site that sees a second divisor gives up (d = MOD_MANY,
+    // never an Int > 0): recomputing m costs a 64-bit division.
+    cache ModRIC { d: u32, magic: u64 }
+
+    op MOD(dst: reg, a: reg, b: reg) : ABC + ModRIC {
+        if let (Int(x), Int(y)) = (a, b) and x >= 0 and y > 0 and (y as u32) == cache.d {
+            let mg = cache.magic;
+            let q = ((x as u64) * (mg & MAGIC_M)) >> (mg >> 56);
+            dst = Int(((x as u64) - q * (y as u64)) as i32);
+            next
         }
+        if let (Int(x), Int(y)) = (a, b) and y > 0 {
+            if cache.d == 0 {
+                cache.d = y as u32;
+                cache.magic = mod_magic(y);
+            } else if cache.d != y as u32 {
+                cache.d = MOD_MANY;
+            }
+            let r = x % y;
+            dst = Int(if r < 0 { r + y } else { r });
+            next
+        }
+        cold { dst = arith_slow(ctx, 4, a, b)?; next }
     }
     /// R[dst] = k[b] - R[a] and k[b] / R[a] (a constant left operand).
     op RSUBK(dst: reg, a: reg, b: kst) : ABC {
@@ -860,6 +924,8 @@ pub vm Mini {
                 dst = Bool(true);
                 next
             }
+            // Different bits: equal only if both are numbers (1 == 1.0).
+            if !value.is_number(a) or !value.is_number(b) { dst = Bool(false); next }
             cold { dst = Bool(value.raw_equal(a, b)); next }
         }
         op #lname(dst: reg, a: reg, b: bkind) : ABC {
@@ -935,6 +1001,8 @@ pub vm Mini {
                     if let Num(x) = a { eq = x == x; }
                     branch(eq == want, then.target)
                 }
+                // Different bits: equal only if both are numbers (1 == 1.0).
+                if !value.is_number(a) or !value.is_number(b) { branch(!want, then.target) }
                 cold { branch(value.raw_equal(a, b) == want, then.target) }
             }
         }
@@ -1100,6 +1168,21 @@ pub vm Mini {
                 if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
                     switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
                 }
+                // math.sqrt and math.floor of a number, for one result,
+                // without the native call (nbody, sort).
+                if nres == 1 and nargs != 0 {
+                    let x = regs[base + 1];
+                    if id == lib.M_SQRT and let Num(d) = x { regs[base] = Num(d.sqrt()); next }
+                    if id == lib.M_FLOOR {
+                        if let Int(_) = x { regs[base] = x; next }
+                        // Truncate and adjust (libm's floor is a call).
+                        if let Num(d) = x and d >= -2147483648.0 and d < 2147483648.0 {
+                            let t = d as i32;
+                            regs[base] = Int(if (t as f64) > d { t - 1 } else { t });
+                            next
+                        }
+                    }
+                }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
                 // coroutine.yield: its values are this CALL's arguments.
@@ -1235,7 +1318,7 @@ pub vm Mini {
     /// Return one value.
     op RET1(src: reg) : ABC {
         let v = src;
-        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); redo } }
         if fp == ctx.base {
             if ctx.cur.inrun and fp == ctx.frames { regs[0] = v; finish(regs, 1) }
             ctx.nxfer = 1;
@@ -1259,7 +1342,7 @@ pub vm Mini {
     }
     /// Return R[a .. a+n-1], adjusted to the number of results wanted.
     op RETN(a: reg, n: retn) : ABC {
-        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); redo } }
         if fp == ctx.base {
             if ctx.cur.inrun and fp == ctx.frames { finish(regs + a.raw as u64, n as u64) }
             ctx.xfer = regs + a.raw as u64;
@@ -1278,7 +1361,7 @@ pub vm Mini {
         jump fp.resume
     }
     op RET0() : ABC {
-        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); } }
+        if unlikely(ctx.open_level >= regs) { cold { close_upvals(ctx, regs); redo } }
         if fp == ctx.base {
             if ctx.cur.inrun and fp == ctx.frames { finish(regs, 0) }
             ctx.nxfer = 0;
@@ -1333,9 +1416,24 @@ pub vm Mini {
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
+    // Overlaps GETUPVAL; GETINDEX: `if not up[i]` in queens (14% of its ops).
+    #[allow(super_overlap)]
+    #[forward] super GETUPVAL_GETINDEX_TESTT = GETUPVAL; GETINDEX; TESTT;
+    // Overlap GETINDEX; GETINDEX and GETINDEX; ADDI: a lookup tested at
+    // once and a count stored back (`local c = t[k]; if c then t[k] = c + 1`),
+    // 15% of hash_strings' ops each.
+    #[allow(super_overlap)]
+    #[forward] super GETINDEX_GETINDEX_TEST = GETINDEX; GETINDEX; TEST;
+    #[allow(super_overlap)]
+    #[forward] super ADDI_SETINDEX = ADDI; SETINDEX;
+    // `f(n - 1)` for a function in an upvalue: fib 40%, coroutine_ring 17%.
+    #[allow(super_overlap)]
+    #[forward] super GETUPVAL_ADDI_CALL = GETUPVAL; ADDI; CALL;
     // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
+    // Overlaps ADDI; SETINDEX, which runs where no second ADDI precedes.
+    #[allow(super_overlap)]
     #[forward] super ADDI_ADDI = ADDI; ADDI;
     #[forward] super GETUPVAL_JEQN = GETUPVAL; JEQN;
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 2.3% of interp's ops.

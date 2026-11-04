@@ -333,6 +333,10 @@ implementation; `git log` has the details.
 
 ### Standard library
 
+- `std.hash.bytes` hashes eight bytes per multiply (was byte-at-a-time
+  FNV-1a), the length in the seed: Mini's string_build 0.92 of the time
+  before (Mini interns every string it makes); MiniJS and Python within
+  ±2% (2026-11-04).
 - **Memory-safe std modules**: `std.lex`, `std.parse`, `std.diag`,
   `std.text`, `std.hash`, `std.io`, `std.bc`, `std.map` and `std.dict` are
   `#![safe]`, with justified `unsafe` blocks around C calls and the
@@ -468,6 +472,18 @@ implementation; `git log` has the details.
   that no longer clear the callee's registers (the collector clears the
   stack above the innermost window up to a high-water mark)
   ([bench/minijs/RESULTS.md](bench/minijs/RESULTS.md#second-performance-pass-2026-11-04)).
+- Mini takes 0.49 of PUC-Lua's time and 0.77 of LuaJIT -joff's by
+  geometric mean (0.927 of the time before; string_build 0.77, sieve
+  0.83, oo_methods 0.86), less than -joff on all 14 programs, and 0.97
+  of -joff's on the coroutine suite (2026-11-04, third pass):
+  `%` by multiplication with the magic number in an inline cache,
+  while loops that test again at the bottom and threaded jumps, appends
+  in place, table and return handlers without stack frames (their rare
+  calls in cold blocks), string natives on one kept buffer, a minor
+  collection sweeping only the young strings of the intern table,
+  math.sqrt/floor without the native call, constants in multiple
+  assignment stored directly, four supers
+  ([bench/mini/RESULTS.md](bench/mini/RESULTS.md#third-phase-2026-11-04)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
 - The Prolog takes 0.53x SWI-Prolog's time and 0.13x Trealla's (0.92

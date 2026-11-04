@@ -400,6 +400,20 @@ changed, from `git log a663b98..95a227e`:
 
 Times in seconds.
 
+**2026-11-04, third Mini pass** (after this run; tail-call only,
+user+sys CPU time, minimum of 7 interleaved runs with the pass's
+starting build cdb5024 as a column): 0.927 of the time before by
+geometric mean, 0.49 of PUC-Lua's and 0.77 of LuaJIT -joff's (0.83 for
+the old build in the same run); less than -joff on all 14 (closest:
+hash_strings 0.96, queens and spectral_norm 0.94). string_build 0.77,
+sieve 0.83, oo_methods 0.86, sort 0.91, hash_strings 0.92, fannkuch
+0.92, interp 0.94; others 0.96-1.01. Coroutines 0.966 (chameneos 0.89;
+0.97 of -joff). A word-at-a-time `std.hash.bytes`, `%` by
+multiplication, rotated while loops, frameless table and return
+handlers, young-only sweeps of the string table
+([bench/mini/RESULTS.md](../bench/mini/RESULTS.md#third-phase-2026-11-04)).
+Other dispatch modes and the JIT build were not rerun.
+
 ### mini-coro
 
 | benchmark | tailcall | goto | switch | jit | lua | luajit-joff | tailcall/lua | tailcall/luajit-joff | jit/lua | jit/luajit-joff |

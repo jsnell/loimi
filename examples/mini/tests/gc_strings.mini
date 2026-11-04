@@ -1,0 +1,29 @@
+-- Interned strings across collections (the intern table's sweeper
+-- checks only young strings in minor ones): strings that die are made
+-- again, long ones (large objects, young for two collections) included,
+-- and table lookups must find the equal string.
+local keep = {}
+local t = {}
+local long = string.rep("x", 600)
+for round = 1, 30 do
+  for i = 1, 200 do
+    local s = "k" .. (i % 50) .. "-" .. round % 3
+    t[s] = (t[s] or 0) + 1
+    if i % 40 == 0 then keep[#keep + 1] = s end
+    local l = long .. (i % 7)          -- 601 bytes: a large object
+    local m = string.rep("y", 450) .. (i % 5)
+    t[l] = (t[l] or 0) + 1
+    t[m] = (t[m] or 0) + 1
+  end
+  local junk = {}
+  for i = 1, 300 do junk[i] = tostring(i * round) .. "z" end
+end
+local n = 0
+for k, v in pairs(t) do n = n + v end
+print(n, t["k7-1"], t[long .. "3"], t[string.rep("y", 450) .. "4"])
+print(#keep, keep[1] == "k40-1", keep[#keep] == ("k" .. 0 .. "-" .. 0))
+local again = string.rep("x", 600) .. "6"
+print(t[again], again == long .. "6")
+-- expect: 18000	40	870	1200
+-- expect: 150	true	true
+-- expect: 840	true

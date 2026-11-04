@@ -1,0 +1,63 @@
+-- While loops test their condition again after the body (compile.lm
+-- rotates them): every shape of condition, breaks, and jumps threaded
+-- through the JMP at the end of an if branch.
+local function count(f)
+  local n = 0
+  while f(n) do n = n + 1 end
+  return n
+end
+local t = {1, 2, 3, false, 5}
+local function empty() return #t == 0 end
+print(count(function(n) return n < 4 end),
+      count(function(n) return not (n >= 3) end),
+      count(function(n) return t[n + 1] end))
+local i = 0
+while not empty() do t[#t] = nil; i = i + 1 end
+print(i, #t)
+local a, b = 0, 10
+while a < 5 and b > 7 do a = a + 1; b = b - 1 end
+print(a, b)
+a, b = 0, 0
+while a < 3 or b < 5 do a = a + 1; b = b + 2 end
+print(a, b)
+a, b = 0, 0
+while (a < 3 and b < 2) or a == 7 do a = a + 1; b = b + 1 end
+print(a, b)
+a = 0
+while not (a > 4) and a ~= 3 do a = a + 1 end
+print(a)
+a = 0
+local x = nil
+while not x do a = a + 1; if a == 4 then x = true end end
+print(a)
+a = 0
+while a ~= 6 do
+  a = a + 1
+  if a % 2 == 0 then a = a + 1 else a = a + 0 end
+  if a > 100 then break end
+end
+print(a)
+a = 0
+while true do
+  a = a + 1
+  if a < 10 then a = a + 1 else break end
+end
+print(a)
+a = 0
+while false do a = 1 end
+print(a)
+-- A condition with a function in it is not repeated.
+a = 0
+while (function() return a end)() < 3 do a = a + 1 end
+print(a)
+-- expect: 4	3	3
+-- expect: 5	0
+-- expect: 3	7
+-- expect: 3	6
+-- expect: 2	2
+-- expect: 3
+-- expect: 4
+-- expect: 101
+-- expect: 11
+-- expect: 0
+-- expect: 3
