@@ -145,9 +145,9 @@ pub vm Wam {
         false
     }
 
-    inline for (name, kind, value) in [
-        ("GET_ATOM", atom, Term.Atom(c as u32)),
-        ("GET_CONST", kst, c),
+    inline for (name, kind, value, quick_fail) in [
+        ("GET_ATOM", atom, Term.Atom(c as u32), true),
+        ("GET_CONST", kst, c, false),
     ] {
         op #name(r: xr, c: kind) : RB {
             let t = deref(r);
@@ -156,7 +156,7 @@ pub vm Wam {
                 if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
-            if clash(t, value) { backtrack() }
+            if quick_fail and clash(t, value) { backtrack() }
             // Big integers are equal by value.
             cold { if unify(ctx, t, value) { next } backtrack() }
         }
@@ -683,6 +683,13 @@ pub vm Wam {
     super PVY2 = PUT_VAL_Y; PUT_VAL_Y;
     super PVX2 = PUT_VAL_X; PUT_VAL_X;
     super DEALLOC_EXEC = DEALLOCATE; EXECUTE;
+    super GVY2 = GET_VAR_Y; GET_VAR_Y;
+    super GVX2 = GET_VAR_X; GET_VAR_X;
+    super PVARY_CALL = PUT_VAR_Y; CALL;
+    super ALLOC_LEVEL = ALLOCATE; GET_LEVEL;
+    super GL_UATOM = GET_LIST; UNIFY_ATOM;
+    super GVALX_PROCEED = GET_VAL_X; PROCEED;
+    super GINT_PROCEED = GET_INT; PROCEED;
 
     entry run(m: *Machine, code: Verified<Wam>) -> i32 uses gc {
         ctx = m;
