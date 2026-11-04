@@ -96,6 +96,14 @@ fn read_stdin(c: *Ctx) -> V {
 pub const NPRIMS: i32 = 149;
 pub const P_APPLY: i32 = 55;
 pub const P_CALLCC: i32 = 132;
+pub const P_EVENP: i32 = 28;
+pub const P_ODDP: i32 = 29;
+pub const P_POSP: i32 = 30;
+pub const P_NEGP: i32 = 31;
+pub const P_LENGTH: i32 = 44;
+pub const P_APPEND: i32 = 45;
+pub const P_REVERSE: i32 = 46;
+pub const P_VLEN: i32 = 79;
 pub const P_RECORDP: i32 = 144;
 pub const P_RECORD_REF: i32 = 145;
 pub const P_RECORD_SET: i32 = 146;

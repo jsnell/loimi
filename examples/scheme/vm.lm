@@ -509,6 +509,106 @@ pub vm Scheme {
         cold { raise index_err(ctx, "vector-set!", v, i) }
     }
 
+    // Builtins of one argument with an inline fast path; the rest (other
+    // types, errors) is the native's, on the argument's register.
+    op LENGTH(dst: reg, a: callbase) : ABC {
+        var n: i32 = 0;
+        var cur = regs[a as u64];
+        while let P(p) = cur {
+            n += 1;
+            cur = p.cdr;
+        }
+        if cur == V.Imm(value.IMM_NIL) {
+            dst = Int(n);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_LENGTH, regs + a as u64, 1)?; next }
+    }
+    op ODDP(dst: reg, a: callbase) : ABC {
+        if let Int(x) = regs[a as u64] {
+            dst = value.boolean((x & 1) != 0);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_ODDP, regs + a as u64, 1)?; next }
+    }
+    op EVENP(dst: reg, a: callbase) : ABC {
+        if let Int(x) = regs[a as u64] {
+            dst = value.boolean((x & 1) == 0);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_EVENP, regs + a as u64, 1)?; next }
+    }
+    op POSP(dst: reg, a: callbase) : ABC {
+        if let Int(x) = regs[a as u64] {
+            dst = value.boolean(x > 0);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_POSP, regs + a as u64, 1)?; next }
+    }
+    op NEGP(dst: reg, a: callbase) : ABC {
+        if let Int(x) = regs[a as u64] {
+            dst = value.boolean(x < 0);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_NEGP, regs + a as u64, 1)?; next }
+    }
+    op VLEN(dst: reg, a: callbase) : ABC {
+        if let Vec(v) = regs[a as u64] {
+            dst = Int(v.data.len as i32);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_VLEN, regs + a as u64, 1)?; next }
+    }
+
+    // (reverse l) and (append l m), allocating from the allocator's
+    // current run of free memory; when it runs out (or on an improper
+    // list), the native does the whole call (what was allocated is
+    // garbage).
+    op REVERSE(dst: reg, a: callbase) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        var r = V.Imm(value.IMM_NIL);
+        var cur = regs[a as u64];
+        while let P(p) = cur {
+            let Some(c) = try_new(&ctx.heap, Pair { car: p.car, cdr: r }) else cold {
+                dst = builtins.call_native(ctx, builtins.P_REVERSE, regs + a as u64, 1)?;
+                next
+            };
+            r = P(c);
+            cur = p.cdr;
+        }
+        if cur != V.Imm(value.IMM_NIL) { cold { dst = builtins.call_native(ctx, builtins.P_REVERSE, regs + a as u64, 1)?; next } }
+        dst = r;
+        next
+    }
+    /// (append R[base] R[base+1]).
+    op APPEND2(dst: reg, base: callbase) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        let x = regs[base as u64];
+        if x == V.Imm(value.IMM_NIL) {
+            dst = regs[base as u64 + 1];
+            next
+        }
+        if let P(p0) = x and let Some(h) = try_new(&ctx.heap, Pair { car: p0.car, cdr: V.Imm(value.IMM_NIL) }) {
+            var last = h;
+            var cur = p0.cdr;
+            while let P(p) = cur {
+                let Some(c) = try_new(&ctx.heap, Pair { car: p.car, cdr: V.Imm(value.IMM_NIL) }) else cold {
+                    dst = builtins.call_native(ctx, builtins.P_APPEND, regs + base as u64, 2)?;
+                    next
+                };
+                last.cdr = P(c);
+                last = c;
+                cur = p.cdr;
+            }
+            if cur == V.Imm(value.IMM_NIL) {
+                last.cdr = regs[base as u64 + 1];
+                dst = P(h);
+                next
+            }
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_APPEND, regs + base as u64, 2)?; next }
+    }
+
     /// Records (define-record-type): `f` is the constant (rtd . i) of
     /// field i of record type rtd, `t` the rtd.
     op RREF(dst: reg, x: reg, f: kst) : ABC {

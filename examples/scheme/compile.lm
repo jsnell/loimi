@@ -38,7 +38,8 @@ enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Le
 
 /// Ops for builtins compiled inline.
 enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
-    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq, RRef, RSet, RecP }
+    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq, RRef, RSet, RecP,
+    Length, OddP, EvenP, PosP, NegP, VLen, Reverse, Append }
 
 struct Var {
     name: Gc<Sym>,
@@ -283,6 +284,14 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("vector?") { return Some((PO.VecP, 1)); }
     if name.eq("memq") { return Some((PO.Memq, 2)); }
     if name.eq("assq") { return Some((PO.Assq, 2)); }
+    if name.eq("length") { return Some((PO.Length, 1)); }
+    if name.eq("odd?") { return Some((PO.OddP, 1)); }
+    if name.eq("even?") { return Some((PO.EvenP, 1)); }
+    if name.eq("positive?") { return Some((PO.PosP, 1)); }
+    if name.eq("negative?") { return Some((PO.NegP, 1)); }
+    if name.eq("vector-length") { return Some((PO.VLen, 1)); }
+    if name.eq("reverse") { return Some((PO.Reverse, 1)); }
+    if name.eq("append") { return Some((PO.Append, 2)); }
     None
 }
 
@@ -2340,7 +2349,7 @@ fn is_boolean(n: *Node) -> bool {
     match n.kind {
         Const => n.v == value.t() or n.v == value.f(),
         Prim => match n.po {
-            NumEq | Lt | Gt | Le | Ge | Eq | Eqv | ZeroP | Not | NullP | PairP | SymP | NumP | FixP | StrP | VecP => true,
+            NumEq | Lt | Gt | Le | Ge | Eq | Eqv | ZeroP | Not | NullP | PairP | SymP | NumP | FixP | StrP | VecP | RecP | OddP | EvenP | PosP | NegP => true,
             _ => false,
         },
         And | Or => {
@@ -2536,6 +2545,15 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         ns.free();
         return;
     }
+    if po == PO.Append {
+        let base = g.top();
+        for i: u64 in 0..2 {
+            let r = g.alloc();
+            g.to(args.at(i), r);
+        }
+        g.emit(Scheme.APPEND2(d, base as u8));
+        return;
+    }
     if po == PO.Memq or po == PO.Assq {
         let a = g.any(args.at(0)) as u8;
         let b = g.any(args.at(1)) as u8;
@@ -2595,6 +2613,13 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
             StrP => Scheme.STRINGP(d, a),
             VecP => Scheme.VECTORP(d, a),
             Car => Scheme.CAR(d, a),
+            Length => Scheme.LENGTH(d, a),
+            OddP => Scheme.ODDP(d, a),
+            EvenP => Scheme.EVENP(d, a),
+            PosP => Scheme.POSP(d, a),
+            NegP => Scheme.NEGP(d, a),
+            VLen => Scheme.VLEN(d, a),
+            Reverse => Scheme.REVERSE(d, a),
             _ => Scheme.CDR(d, a),
         };
         g.emit(w);
