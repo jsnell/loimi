@@ -107,11 +107,16 @@ fn Lexer.next(lx: *Lexer) -> Result<Token, lex.Error> {
 
 // ── function state and expression descriptors ───────────────────────
 
-struct Local { name: str, reg: u32 }
+/// A local variable. `id` numbers the chunk's locals in the order of
+/// their declarations (the same in both passes of `compile`). `konst`:
+/// declared with a constant value `kv` and never assigned, so that the
+/// functions nested in its scope read the constant instead of an upvalue.
+struct Local { name: str, reg: u32, id: u32, konst: bool, kv: V }
 
 /// An upvalue of the function being compiled: register `idx` of the
-/// enclosing function (instack) or upvalue `idx` of the enclosing closure.
-struct UpDesc { name: str, instack: bool, idx: u32 }
+/// enclosing function (instack) or upvalue `idx` of the enclosing closure;
+/// `lid` is the id of the local it refers to.
+struct UpDesc { name: str, instack: bool, idx: u32, lid: u32 }
 
 /// A lexical block. `upval` is set when a nested function captures one of
 /// the block's locals, so that leaving the block must close upvalues.
@@ -135,7 +140,7 @@ struct FuncState {
     blocks: mem.Vec<Block>,
 }
 
-enum VarRef { Loc(u32), Up(u32), Glob }
+enum VarRef { Loc(u32), Up(u32), Glob, Const(V) }
 
 enum E {
     Nil,
@@ -171,7 +176,17 @@ struct Parser {
     exprs: parse.Pratt<Parser, T, E, ()>,
     sm: *diag.SourceMap,
     file: u32,
+    /// Constant locals (`compile`): FOLD_NONE, or the first pass, which
+    /// records in `assigned` (by local id) which locals some statement
+    /// assigns, or the second, which folds the others.
+    fold: u32,
+    nlocals: u32,
+    assigned: *mem.Vec<bool>,
 }
+
+const FOLD_NONE: u32 = 0;
+const FOLD_SCAN: u32 = 1;
+const FOLD_APPLY: u32 = 2;
 
 // ── errors ──────────────────────────────────────────────────────────
 
@@ -295,18 +310,26 @@ fn FuncState.resolve(fs: *FuncState, p: *Parser, name: str) -> VarRef {
     let Some(parent) = fs.parent else { return VarRef.Glob; };
     var instack = false;
     var idx: u32 = 0;
+    var lid: u32 = 0;
     if let Some(li) = parent.find_local(name) {
+        let l = parent.locals.at(li);
+        if l.konst { return VarRef.Const(l.kv); }
         parent.mark_captured(li);
         instack = true;
-        idx = parent.locals.at(li).reg;
+        idx = l.reg;
+        lid = l.id;
     } else {
         match parent.resolve(p, name) {
-            Up(i) => idx = i,
+            Up(i) => {
+                idx = i;
+                lid = parent.upvals.at(i as u64).lid;
+            }
+            Const(v) => return VarRef.Const(v),
             _ => return VarRef.Glob,
         }
     }
     if fs.upvals.len >= 255 { p.fail_prev("too many upvalues"); }
-    fs.upvals.push(UpDesc { name: name, instack: instack, idx: idx });
+    fs.upvals.push(UpDesc { name: name, instack: instack, idx: idx, lid: lid });
     VarRef.Up((fs.upvals.len - 1) as u32)
 }
 
@@ -415,6 +438,7 @@ fn reg_of(e: E) -> u32 {
 /// Assign the value of `v` to the variable `target`. Temporaries are
 /// not freed: statements reset the free register at their end.
 fn Parser.store_var(p: *Parser, target: E, v: E) {
+    if p.fold == FOLD_SCAN { p.note_assigned(target); }
     match target {
         Local(r) => p.discharge(v, r),
         Upval(i) => {
@@ -447,13 +471,46 @@ fn Parser.store_var(p: *Parser, target: E, v: E) {
     }
 }
 
+/// The first pass of `compile`: record that the local behind `target`
+/// (a register of this function or an upvalue) is assigned.
+fn Parser.note_assigned(p: *Parser, target: E) {
+    var id: u32 = 0;
+    match target {
+        Local(r) => {
+            var i = p.fs.locals.len;
+            loop {
+                if i == 0 { return; }
+                i -= 1;
+                if p.fs.locals.at(i).reg == r { break; }
+            }
+            id = p.fs.locals.at(i).id;
+        }
+        Upval(u) => id = p.fs.upvals.at(u as u64).lid,
+        _ => return,
+    }
+    p.assigned.set(id as u64, true);
+}
+
 // ── expressions ─────────────────────────────────────────────────────
+
+/// The constant expression for value `v` (of a constant local).
+fn Parser.const_exp(p: *Parser, v: V) -> E {
+    match v {
+        Nil => E.Nil,
+        Bool(b) => if b { E.True } else { E.False },
+        _ => {
+            if let Some(i) = small_int(v) { return E.I(i); }
+            E.K(p.constant(v))
+        }
+    }
+}
 
 fn Parser.singlevar(p: *Parser, name: str) -> E {
     match p.fs.resolve(p, name) {
         Loc(r) => E.Local(r),
         Up(i) => E.Upval(i),
         Glob => E.Global(p.str_const(name)),
+        Const(v) => p.const_exp(v),
     }
 }
 
@@ -994,7 +1051,9 @@ fn Parser.block(p: *Parser) {
 
 /// Make register `r` (already reserved) the local `name`.
 fn Parser.add_local(p: *Parser, name: str, r: u32) {
-    #[cfg(debug)] debugger.open_local(p.fs as *u8, name, r, p.fs.code.len()); p.fs.locals.push(Local { name: name, reg: r });
+    #[cfg(debug)] debugger.open_local(p.fs as *u8, name, r, p.fs.code.len()); p.fs.locals.push(Local { name: name, reg: r, id: p.nlocals, konst: false, kv: V.Nil });
+    if p.fold == FOLD_SCAN { p.assigned.push(false); }
+    p.nlocals += 1;
     p.fs.regs.activate(r + 1 - p.fs.regs.nactive);
 }
 
@@ -1237,6 +1296,34 @@ fn Parser.statement_inner(p: *Parser) {
             }
             let base = p.fs.regs.top;
             let n = names.len as u32;
+            if p.fold == FOLD_APPLY and p.accept(T.Assign) {
+                // Constants that are never assigned become constant
+                // locals; they are still stored in their registers.
+                var vals = p.explist_vals(n);
+                for i in 0..n {
+                    let e = vals.at(i as u64);
+                    let id = p.nlocals;
+                    p.add_local(names.at(i as u64), base + i);
+                    if is_const(e) {
+                        p.discharge(e, base + i);
+                        if !p.assigned.at(id as u64) {
+                            let l = p.fs.locals.ptr_at(p.fs.locals.len - 1);
+                            l.konst = true;
+                            l.kv = match e {
+                                Nil => V.Nil,
+                                True => V.Bool(true),
+                                False => V.Bool(false),
+                                I(k) => V.Int(k),
+                                K(k) => p.fs.consts.get(k),
+                                _ => V.Nil,
+                            };
+                        }
+                    }
+                }
+                vals.free();
+                names.free();
+                return;
+            }
             if p.accept(T.Assign) {
                 p.explist_to(n);
             } else {
@@ -1637,7 +1724,24 @@ fn Parser.function_body(p: *Parser, name: str, is_method: bool) -> u32 {
 
 /// Compile the chunk `src` (read from file `name`). Allocates in `h` but
 /// never collects. Syntax errors are reported on stderr and exit.
+///
+/// Locals declared with a constant (`local N, K = 10, "x"`) that nothing
+/// assigns read as that constant in the functions nested in their scope
+/// (no upvalue: `op == ADD` compiles as a compare with a constant). A
+/// first pass finds the assigned locals (the code it compiles is
+/// dropped). Not under `--cfg debug`, whose debugger shows upvalues and
+/// may assign variables.
 pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
+    var assigned: mem.Vec<bool> = mem.Vec.new();
+    var fold = FOLD_SCAN;
+    #[cfg(debug)] fold = FOLD_NONE;
+    if fold == FOLD_SCAN { compile_pass(h, name, src, FOLD_SCAN, &assigned); fold = FOLD_APPLY; }
+    let proto = compile_pass(h, name, src, fold, &assigned);
+    assigned.free();
+    proto
+}
+
+fn compile_pass(h: *gc.Heap, name: str, src: str, fold: u32, assigned: *mem.Vec<bool>) -> Gc<Proto> {
     var sm = diag.SourceMap.new();
     let file = sm.add(name, src);
     var tables = LexTables.new();
@@ -1652,6 +1756,9 @@ pub fn compile(h: *gc.Heap, name: str, src: str) -> Gc<Proto> {
         exprs: operators(),
         sm: &sm,
         file: file,
+        fold: fold,
+        nlocals: 0,
+        assigned: assigned,
     };
     p.advance();
     p.enter_block();

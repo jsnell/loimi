@@ -1,0 +1,100 @@
+-- Locals declared with a constant and never assigned are read as the
+-- constant by nested functions (compile.lm, `compile`); every other
+-- local stays a variable.
+local ADD, SUB, NAME, HALF, YES, NO, NOTHING = 1, 2, "op", 0.5, true, false, nil
+local BIG = 100000
+local function kind(op)
+  if op == ADD then return "add" elseif op == SUB then return "sub" end
+  return NAME .. tostring(op)
+end
+print(kind(1), kind(2), kind(3))
+print(HALF * 4, YES, NO, NOTHING, BIG + 1)
+-- two levels down
+local function outer()
+  return function() return ADD + SUB + BIG end
+end
+print(outer()())
+-- assigned after the closure is made: still a variable
+local x = 1
+local function getx() return x end
+x = 2
+print(getx())
+-- assigned only inside a closure
+local y = 10
+local function bump() y = y + 1 end
+local function gety() return y end
+bump(); bump()
+print(gety(), y)
+-- assigned two levels down
+local z = 5
+local function f1()
+  local function f2() z = z * 2 end
+  f2()
+  return function() return z end
+end
+print(f1()(), z)
+-- in a multiple assignment
+local p, q = 1, 2
+local function pq() return p, q end
+p, q = q, p
+local pa, pb = pq()
+print(pa, pb)
+-- a missing value is a constant nil; extra values are evaluated
+local m, n = 7
+local function mn() return m, n end
+local ma, mb = mn()
+print(ma, mb)
+local calls = 0
+local function tick() calls = calls + 1; return calls end
+local r1 = 3, tick()
+local function getr() return r1 end
+print(getr(), calls)
+-- with a call's results: only the constant ones fold
+local function two() return 8, 9 end
+local c1, c2, c3 = 4, two()
+local function cs() return c1, c2, c3 end
+local ca, cb, cc = cs()
+print(ca, cb, cc)
+-- shadowing: the inner local is a different variable
+local s = 1
+local function shadow()
+  local s = 2
+  local function g() return s end
+  s = 3
+  return g()
+end
+print(shadow(), (function() return s end)())
+-- a parameter, a loop variable or a function with the same name
+local w = 1
+local function param(w) return function() return w end end
+print(param(5)())
+local loops = {}
+for w = 1, 3 do loops[w] = function() return w end end
+print(loops[1](), loops[3](), w)
+local fn = 1
+function fn() return "now a function" end
+local function callfn() return fn() end
+print(callfn())
+-- in a rotated while loop's condition
+local LIMIT = 5
+local function count()
+  local i = 0
+  while i < LIMIT do i = i + 1 end
+  return i
+end
+print(count())
+-- expect: add	sub	op3
+-- expect: 2.0	true	false	nil	100001
+-- expect: 100003
+-- expect: 2
+-- expect: 12	12
+-- expect: 10	10
+-- expect: 2	1
+-- expect: 7	nil
+-- expect: 3	1
+-- expect: 4	8	9
+-- expect: 3	1
+-- expect: 5
+-- expect: 1	3	1
+-- expect: now a function
+-- expect: 5
