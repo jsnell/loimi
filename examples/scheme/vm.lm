@@ -530,6 +530,41 @@ pub vm Scheme {
         next
     }
 
+    /// (call/cc R[base+1]): run the procedure with an escape continuation
+    /// in a frame of the continuation prototype (see cont_proto).
+    fn callcc(base: u64, tail: bool) -> never {
+        let Some(cp) = ctx.cont_proto else { raise rt.err_msg(ctx, "call/cc: not initialized") };
+        var dst = regs + base + 1;
+        var nf = fp;
+        if !tail {
+            if fp + 1 >= ctx.frames_end { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
+            nf = fp + 1;
+        }
+        if tail { dst = regs; }
+        if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
+        let kc = new(&ctx.heap, Closure { proto: cp }, 1);
+        kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
+        dst[0] = regs[base + 1];
+        dst[1] = Clo(kc);
+        if !tail {
+            fp.resume = pc + 1;
+            fp = fp + 1;
+        }
+        fp.cl = kc;
+        fp.base = dst;
+        k = cp.consts.data.ptr;
+        fp.k = k;
+        regs = dst;
+        jump cp.code
+    }
+
+    /// R[base] = (call/cc R[base+1]) of the builtin (never redefined);
+    /// `tail`: return it.
+    op CALLCC(base: callbase, tail: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        callcc(base as u64, tail != 0)
+    }
+
     /// Everything but a call of a closure with exactly its number of
     /// (fixed) parameters: rest parameters, arity errors, builtins and
     /// `apply`. Sets up the state and continues there.
@@ -553,9 +588,9 @@ pub vm Scheme {
             f = regs[base];
         }
         if value.prim_of(f) == Some(builtins.P_CALLCC) {
-            // (call/cc proc): run proc with an escape continuation in a
-            // frame of the continuation prototype (see cont_proto).
             if n != 1 { raise rt.err_msg(ctx, "call-with-current-continuation: wrong number of arguments") }
+            // (Inline: a call of another vm function here would make
+            // CALL/TAILCALL look as if they could continue.)
             let Some(cp) = ctx.cont_proto else { raise rt.err_msg(ctx, "call/cc: not initialized") };
             var dst = regs + base + 1;
             var nf = fp;

@@ -351,7 +351,7 @@ fn Comp.build_inner(c: *Comp, x: V) -> *Node {
             // A builtin that the program never redefines is called directly.
             if n.a.kind == K.GRef and let Sym(s) = p.car and !c.redefined.contains(s as u64)
                 and let Some(id) = value.prim_of(c.ctx.gvals.at(n.a.g as u64))
-                and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+                and id != builtins.P_APPLY {
                 n.a = c.konst(value.prim(id));
             }
             var cur = p.cdr;
@@ -1429,16 +1429,6 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     n.c = c.inl(n.c, depth);
     for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
     if n.kind != K.Call { return n; }
-    // (map f l) and (for-each f l) of the prelude's procedures, whose rest
-    // parameter makes every call take the slow path: their one-list cases.
-    if n.a.kind == K.GRef and n.list.len == 2 and c.known_global(n.a.g as u64).is_some() {
-        let name = c.ctx.gsyms.at(n.a.g as u64).name;
-        let one = if name.eq("map") { "%map1" } else if name.eq("for-each") { "%for-each1" } else { "" };
-        if one.len > 0 {
-            let g1 = c.ctx.global(c.ctx.syms.intern(c.heap, one)) as u64;
-            if c.known_global(g1).is_some() { n.a.g = g1 as u32; }
-        }
-    }
     if n.a.kind == K.GRef and let Some(id) = c.galias.get(n.a.g as u64) {
         let g = n.a.g;
         n.a = c.konst(value.prim(id));
@@ -2396,6 +2386,14 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
         return;
     }
+    if f.kind == K.Const and value.prim_of(f.v) == Some(builtins.P_CALLCC) and nargs == 1 {
+        let r = g.alloc();
+        g.to(n.list.at(0), r);
+        g.emit(Scheme.CALLCC(base as u8, if tail { 1 } else { 0 }));
+        // (A tail CALLCC never continues here; the RET is for the verifier.)
+        if tail { g.emit(Scheme.RET(base as u8)); } else if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
+        return;
+    }
     if f.kind == K.Const and let Some(id) = value.prim_of(f.v)
         and id != builtins.P_APPLY and id != builtins.P_CALLCC {
         for i in 0..nargs {
@@ -2863,7 +2861,7 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
             c.galias.insert(gk, id);
         } else if let Some(id) = value.prim_of(c.ctx.gvals.at(h))
             and !c.redefined.contains(c.ctx.gsyms.at(h) as u64)
-            and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+            and id != builtins.P_APPLY {
             c.galias.insert(gk, id);
         } else if let Some((l, _, _)) = c.known(n.a) {
             c.glams.insert(gk, l);
