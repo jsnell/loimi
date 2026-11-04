@@ -39,6 +39,7 @@
 //! module instead (`lifetime-site` lines on stderr), without failing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::diag::{Diag, Res, Span};
 use crate::tir::*;
@@ -163,25 +164,63 @@ const ELSEWHERE: u32 = u32::MAX;
 /// arena's allocations).
 const FRAME: u32 = u32::MAX - 1;
 
+/// The flow state. Cloned at every branch and joined after it, so every
+/// part is shared (`Rc`) and copied only when a branch changes it; a join
+/// of two states that share a part skips it.
 #[derive(Clone, Default, PartialEq)]
 struct St {
     reach: bool,
     /// What each local may point into.
-    vals: BTreeMap<LocalId, Val>,
+    vals: Rc<BTreeMap<LocalId, Rc<Val>>>,
     /// Locals that may dangle, and why (an index into `Fa::whys`).
-    stale: BTreeMap<LocalId, u32>,
+    stale: Rc<BTreeMap<LocalId, u32>>,
     /// Locals pointing into memory of parameter j after a restructure
     /// through parameter i: (i, j) (summary `pairs` if used).
-    cst: BTreeMap<LocalId, BTreeSet<(u32, u32)>>,
+    cst: Rc<BTreeMap<LocalId, BTreeSet<(u32, u32)>>>,
     /// (local, place): the local holds a copy of the owning value at
     /// `place` (memory), so freeing through it leaves `place` dangling.
-    aliases: BTreeSet<(LocalId, Path)>,
+    aliases: Rc<BTreeSet<(LocalId, Path)>>,
     /// Places in memory whose owned buffers were freed through a copy.
-    stale_places: BTreeMap<Path, u32>,
+    stale_places: Rc<BTreeMap<Path, u32>>,
     /// Pending escapes: (place, stored pointer, why): the address of a
     /// local (or a parameter's pointee) stored in memory that outlives
     /// the call, unless overwritten before it returns.
-    esc: BTreeSet<(Path, Path, u32)>,
+    esc: Rc<BTreeSet<(Path, Path, u32)>>,
+}
+
+/// `a` |= `b` for a shared set, copying `a` only if it grows.
+fn union_set<T: Ord + Clone>(a: &mut Rc<BTreeSet<T>>, b: &Rc<BTreeSet<T>>) {
+    if Rc::ptr_eq(a, b) || b.iter().all(|x| a.contains(x)) {
+        return;
+    }
+    Rc::make_mut(a).extend(b.iter().cloned());
+}
+
+/// Keep the first value of each key of `b` missing in `a`.
+fn union_first<K: Ord + Clone, V: Copy>(a: &mut Rc<BTreeMap<K, V>>, b: &Rc<BTreeMap<K, V>>) {
+    if Rc::ptr_eq(a, b) || b.keys().all(|k| a.contains_key(k)) {
+        return;
+    }
+    let m = Rc::make_mut(a);
+    for (k, v) in b.iter() {
+        m.entry(k.clone()).or_insert(*v);
+    }
+}
+
+/// Remove the keys of a shared map not matching `f`, copying it only if
+/// any does not.
+fn retain_map<K: Ord + Clone, V: Clone>(a: &mut Rc<BTreeMap<K, V>>, mut f: impl FnMut(&K, &V) -> bool) {
+    if a.iter().all(|(k, v)| f(k, v)) {
+        return;
+    }
+    Rc::make_mut(a).retain(|k, v| f(k, v));
+}
+
+fn retain_set<T: Ord + Clone>(a: &mut Rc<BTreeSet<T>>, mut f: impl FnMut(&T) -> bool) {
+    if a.iter().all(|x| f(x)) {
+        return;
+    }
+    Rc::make_mut(a).retain(|x| f(x));
 }
 
 impl St {
@@ -193,29 +232,46 @@ impl St {
             *self = o.clone();
             return;
         }
-        for (l, v) in &o.vals {
-            self.vals.entry(*l).or_default().extend(v.iter().cloned());
+        if !Rc::ptr_eq(&self.vals, &o.vals) {
+            for (l, v) in o.vals.iter() {
+                match self.vals.get(l) {
+                    Some(sv) if Rc::ptr_eq(sv, v) || v.iter().all(|p| sv.contains(p)) => {}
+                    Some(_) => {
+                        let sv = Rc::make_mut(&mut self.vals).get_mut(l).unwrap();
+                        Rc::make_mut(sv).extend(v.iter().cloned());
+                    }
+                    None => {
+                        Rc::make_mut(&mut self.vals).insert(*l, v.clone());
+                    }
+                }
+            }
         }
-        for (l, w) in &o.stale {
-            self.stale.entry(*l).or_insert(*w);
+        union_first(&mut self.stale, &o.stale);
+        if !Rc::ptr_eq(&self.cst, &o.cst) {
+            for (l, v) in o.cst.iter() {
+                if !self.cst.get(l).is_some_and(|sv| v.iter().all(|x| sv.contains(x))) {
+                    Rc::make_mut(&mut self.cst).entry(*l).or_default().extend(v.iter().cloned());
+                }
+            }
         }
-        for (l, v) in &o.cst {
-            self.cst.entry(*l).or_default().extend(v.iter().cloned());
-        }
-        self.aliases.extend(o.aliases.iter().cloned());
-        for (p, w) in &o.stale_places {
-            self.stale_places.entry(p.clone()).or_insert(*w);
-        }
-        self.esc.extend(o.esc.iter().cloned());
+        union_set(&mut self.aliases, &o.aliases);
+        union_first(&mut self.stale_places, &o.stale_places);
+        union_set(&mut self.esc, &o.esc);
     }
 
     /// Locals whose scope ended: nothing reads them again before they
     /// are bound anew, so their entries only cost (cloned at every branch).
     fn drop_locals(&mut self, ls: &[LocalId]) {
         for l in ls {
-            self.vals.remove(l);
-            self.stale.remove(l);
-            self.cst.remove(l);
+            if self.vals.contains_key(l) {
+                Rc::make_mut(&mut self.vals).remove(l);
+            }
+            if self.stale.contains_key(l) {
+                Rc::make_mut(&mut self.stale).remove(l);
+            }
+            if self.cst.contains_key(l) {
+                Rc::make_mut(&mut self.cst).remove(l);
+            }
         }
     }
 }
@@ -264,6 +320,8 @@ struct Fa<'a> {
     kinds: &'a mut HashMap<Ty, Kind>,
     whys: Vec<(Span, String)>,
     errs: Vec<Diag>,
+    /// Audit mode: the `lifetime-site` lines.
+    lines: Vec<String>,
     err_spans: HashSet<(u32, u32)>,
     breaks: HashMap<u32, (St, Val)>,
     conts: HashMap<u32, St>,
@@ -344,7 +402,7 @@ impl<'a> Fa<'a> {
         }
         if let Some(sm) = self.audit {
             let (l, c) = sm.line_col(span.file, span.lo);
-            eprintln!("lifetime-site {}:{}:{} {} ({})", sm.files[span.file as usize].path, l, c, msg, self.f.symbol);
+            self.lines.push(format!("lifetime-site {}:{}:{} {} ({})", sm.files[span.file as usize].path, l, c, msg, self.f.symbol));
             return;
         }
         let mut d = Diag::new(span, msg);
@@ -400,7 +458,7 @@ impl<'a> Fa<'a> {
             Kind::None => Val::new(),
             Kind::Gc if !mutable => [Path::new(Root::GcLocal(l))].into_iter().collect(),
             k => {
-                let mut v = st.vals.get(&l).cloned().unwrap_or_else(|| self.symbolic(l));
+                let mut v = st.vals.get(&l).map(|v| (**v).clone()).unwrap_or_else(|| self.symbolic(l));
                 // An owning value (a `Vec`) read whole: its buffers.
                 if k == Kind::Agg && !matches!(t, Ty::Slice(_)) {
                     v.insert(Path::new(Root::Local(l)).push(Step::AnyD));
@@ -421,7 +479,7 @@ impl<'a> Fa<'a> {
     }
 
     fn check_place_read(&mut self, paths: &[Path], span: Span, st: &St) {
-        for (sp, w) in &st.stale_places {
+        for (sp, w) in st.stale_places.iter() {
             if paths.iter().any(|p| p.root == sp.root && p.steps.len() >= sp.steps.len() && p.steps[..sp.steps.len()] == sp.steps[..]) {
                 let (ws, what) = self.whys[*w as usize].clone();
                 self.error(
@@ -467,56 +525,89 @@ impl<'a> Fa<'a> {
         }
     }
 
-    /// Move or free the memory at `r`: what points into it may dangle.
-    fn restructure(&mut self, r: &Path, w: u32, st: &mut St) {
+    /// Move or free the memory at each of `rs`: what points into it may
+    /// dangle. One pass over the state for all of them (a call's summary
+    /// may name hundreds of blocks).
+    fn restructure(&mut self, rs: &[Path], w: u32, st: &mut St) {
+        if rs.is_empty() {
+            return;
+        }
+        let hit = |p: &Path| rs.iter().any(|r| hits(r, p));
         let mut newly = Vec::new();
-        for (l, v) in &st.vals {
-            if !st.stale.contains_key(l) && v.iter().any(|p| hits(r, p)) {
+        for (l, v) in st.vals.iter() {
+            if !st.stale.contains_key(l) && v.iter().any(hit) {
                 newly.push(*l);
             }
         }
-        for l in newly {
-            st.stale.insert(l, w);
+        if !newly.is_empty() {
+            let stale = Rc::make_mut(&mut st.stale);
+            for l in newly {
+                stale.insert(l, w);
+            }
         }
         // Through parameter i: values pointing into parameter j's memory
         // would dangle if j aliased it.
-        if let Root::Local(rl) = r.root {
-            if let (Some(&i), true) = (self.param_idx.get(&rl), r.has_deref()) {
-                for (l, v) in &st.vals {
-                    for p in v {
-                        if let Root::Local(pl) = p.root {
-                            if let Some(&j) = self.param_idx.get(&pl) {
-                                if j != i && p.has_deref() {
-                                    st.cst.entry(*l).or_default().insert((i, j));
+        let mut through: Vec<u32> = rs
+            .iter()
+            .filter_map(|r| match r.root {
+                Root::Local(rl) if r.has_deref() => self.param_idx.get(&rl).copied(),
+                _ => None,
+            })
+            .collect();
+        through.sort_unstable();
+        through.dedup();
+        if !through.is_empty() {
+            let mut add = Vec::new();
+            for (l, v) in st.vals.iter() {
+                for p in v.iter() {
+                    if let Root::Local(pl) = p.root {
+                        if let Some(&j) = self.param_idx.get(&pl) {
+                            if !p.has_deref() {
+                                continue;
+                            }
+                            for &i in &through {
+                                if j != i && !st.cst.get(l).is_some_and(|c| c.contains(&(i, j))) {
+                                    add.push((*l, (i, j)));
                                 }
                             }
                         }
                     }
                 }
             }
+            for (l, ij) in add {
+                Rc::make_mut(&mut st.cst).entry(l).or_default().insert(ij);
+            }
         }
         let mut places = Vec::new();
-        for (l, place) in &st.aliases {
-            if hits(r, &Path::new(Root::Local(*l)).push(Step::AnyD)) {
+        for (l, place) in st.aliases.iter() {
+            if hit(&Path::new(Root::Local(*l)).push(Step::AnyD)) {
                 places.push(place.clone());
             }
         }
         for pl in places {
-            st.stale_places.entry(pl).or_insert(w);
+            if !st.stale_places.contains_key(&pl) {
+                Rc::make_mut(&mut st.stale_places).insert(pl, w);
+            }
         }
         // The summary: restructures through parameters and globals.
-        match r.root {
-            Root::Local(l) if r.has_deref() => {
-                if let Some(&i) = self.param_idx.get(&l) {
-                    let mut q = r.clone();
-                    q.root = Root::Param(i);
-                    self.out.restructs.insert(q);
+        for r in rs {
+            match r.root {
+                Root::Local(l) if r.has_deref() => {
+                    if let Some(&i) = self.param_idx.get(&l) {
+                        let mut q = r.clone();
+                        q.root = Root::Param(i);
+                        if !self.out.restructs.contains(&q) {
+                            self.out.restructs.insert(q);
+                        }
+                    }
                 }
+                Root::Global(_) => {
+                    if !self.out.restructs.contains(r) {
+                        self.out.restructs.insert(r.clone());
+                    }
+                }
+                _ => {}
             }
-            Root::Global(_) => {
-                self.out.restructs.insert(r.clone());
-            }
-            _ => {}
         }
     }
 
@@ -531,8 +622,12 @@ impl<'a> Fa<'a> {
                 a.iter()
                     .map(|t| {
                         let mut q = t.clone();
-                        for s in rest {
-                            q = q.push(*s);
+                        if !q.trunc {
+                            let room = K - q.steps.len().min(K);
+                            q.steps.extend_from_slice(&rest[..rest.len().min(room)]);
+                            if rest.len() > room {
+                                q.trunc = true;
+                            }
                         }
                         if p.trunc {
                             q.trunc = true;
@@ -587,7 +682,7 @@ impl<'a> Fa<'a> {
             for pl in &ps {
                 if self.dest(pl) != FRAME {
                     let w = self.why(span, String::new());
-                    st.esc.insert((pl.clone(), q.clone(), w));
+                    Rc::make_mut(&mut st.esc).insert((pl.clone(), q.clone(), w));
                 }
             }
         }
@@ -595,7 +690,7 @@ impl<'a> Fa<'a> {
 
     /// At a return: what is still stored escapes.
     fn exit_escapes(&mut self, st: &St) {
-        for (pl, q, w) in st.esc.clone() {
+        for (pl, q, w) in st.esc.iter().cloned().collect::<Vec<_>>() {
             let d = self.dest(&pl);
             let span = self.whys[w as usize].0;
             self.escape(&q, d, span, "stores {} in memory that outlives the function");
@@ -621,19 +716,26 @@ impl<'a> Fa<'a> {
     fn assign_local(&mut self, l: LocalId, v: Val, st: &mut St) {
         let t = self.f.locals[l as usize].ty.clone();
         let k = self.kind(&t);
-        st.stale.remove(&l);
-        st.cst.remove(&l);
-        st.aliases.retain(|(x, _)| *x != l);
+        if st.stale.contains_key(&l) {
+            Rc::make_mut(&mut st.stale).remove(&l);
+        }
+        if st.cst.contains_key(&l) {
+            Rc::make_mut(&mut st.cst).remove(&l);
+        }
+        retain_set(&mut st.aliases, |(x, _)| *x != l);
         if k == Kind::Agg && !matches!(t, Ty::Slice(_)) {
             // `l`'s old buffers are no longer `l`'s: forget who aliased them.
-            for (x, vs) in st.vals.iter_mut() {
-                if *x != l {
-                    vs.retain(|p| !(p.root == Root::Local(l) && p.steps.first().is_some_and(is_d)));
-                }
+            let old = |p: &Path| p.root == Root::Local(l) && p.steps.first().is_some_and(is_d);
+            let hit: Vec<LocalId> = st.vals.iter().filter(|(x, vs)| **x != l && vs.iter().any(old)).map(|(x, _)| *x).collect();
+            for x in hit {
+                let vs = Rc::make_mut(Rc::make_mut(&mut st.vals).get_mut(&x).unwrap());
+                vs.retain(|p| !old(p));
             }
         }
         if k == Kind::Gc {
-            for vs in st.vals.values_mut() {
+            let hit: Vec<LocalId> = st.vals.iter().filter(|(_, vs)| vs.iter().any(|p| p.root == Root::GcLocal(l))).map(|(x, _)| *x).collect();
+            for x in hit {
+                let vs = Rc::make_mut(Rc::make_mut(&mut st.vals).get_mut(&x).unwrap());
                 let moved: Vec<Path> = vs.iter().filter(|p| p.root == Root::GcLocal(l)).cloned().collect();
                 for p in moved {
                     vs.remove(&p);
@@ -644,7 +746,7 @@ impl<'a> Fa<'a> {
             }
         }
         if k != Kind::None {
-            st.vals.insert(l, v);
+            Rc::make_mut(&mut st.vals).insert(l, Rc::new(v));
         }
     }
 
@@ -667,11 +769,16 @@ impl<'a> Fa<'a> {
         match src.root {
             Root::Local(m) if !src.has_deref() => {
                 if m != l {
-                    st.vals.entry(m).or_default().insert(Path::new(Root::Local(l)).push(Step::AnyD));
+                    let p = Path::new(Root::Local(l)).push(Step::AnyD);
+                    if !st.vals.get(&m).is_some_and(|v| v.contains(&p)) {
+                        Rc::make_mut(Rc::make_mut(&mut st.vals).entry(m).or_default()).insert(p);
+                    }
                 }
             }
             _ => {
-                st.aliases.insert((l, src));
+                if !st.aliases.contains(&(l, src.clone())) {
+                    Rc::make_mut(&mut st.aliases).insert((l, src));
+                }
             }
         }
     }
@@ -712,16 +819,24 @@ impl<'a> Fa<'a> {
         let mut res = Val::new();
         match callee {
             Some(id) if self.p.fns[id as usize].body.is_some() => {
-                let s = self.sums.get(&id).cloned().unwrap_or_default();
+                static EMPTY: std::sync::LazyLock<Summary> = std::sync::LazyLock::new(Summary::default);
+                let s: &'a Summary = self.sums.get(&id).unwrap_or(&EMPTY);
                 let may_alias = self.p.may_alias.get(&id).copied().unwrap_or(0);
+                // What it moves or frees, in this function's terms (and
+                // through which parameter).
+                let mut rsub: Vec<(Option<u32>, Path)> = Vec::new();
+                for r in &s.restructs {
+                    let i = if let Root::Param(i) = r.root { Some(i) } else { None };
+                    rsub.extend(self.subst(r, &vals).into_iter().map(|q| (i, q)));
+                }
                 // Arguments into what the callee moves through another.
                 for &(i, j) in &s.pairs {
                     if j < 64 && may_alias & (1 << j) != 0 {
                         continue;
                     }
-                    for r in s.restructs.iter().filter(|r| r.root == Root::Param(i)) {
-                        for rr in self.subst(r, &vals) {
-                            if vals[j as usize].iter().any(|p| hits(&rr, p)) {
+                    for (_, rr) in rsub.iter().filter(|(k, _)| *k == Some(i)) {
+                        {
+                            if vals[j as usize].iter().any(|p| hits(rr, p)) {
                                 let msg = format!(
                                     "this argument points into memory that {} may move or free (through argument {}) while it still uses this one",
                                     name,
@@ -768,12 +883,10 @@ impl<'a> Fa<'a> {
                         }
                     }
                 }
-                let rs: Vec<Path> = s.restructs.iter().flat_map(|r| self.subst(r, &vals)).collect();
-                if !rs.is_empty() {
+                if !rsub.is_empty() {
+                    let rs: Vec<Path> = rsub.into_iter().map(|(_, q)| q).collect();
                     let w = self.why(e.span, format!("the call of {}", name));
-                    for r in rs {
-                        self.restructure(&r, w, st);
-                    }
+                    self.restructure(&rs, w, st);
                 }
                 for r in &s.ret {
                     res.extend(self.subst(r, &vals));
@@ -786,9 +899,8 @@ impl<'a> Fa<'a> {
                 let fd = &self.p.fns[id as usize];
                 if matches!(fd.name.as_str(), "free" | "realloc") && !vals.is_empty() {
                     let w = self.why(e.span, format!("the call of {}", name));
-                    for r in vals[0].clone() {
-                        self.restructure(&r, w, st);
-                    }
+                    let rs: Vec<Path> = vals[0].iter().cloned().collect();
+                    self.restructure(&rs, w, st);
                 }
                 if fd.name != "realloc" && self.kind(&e.ty) != Kind::None {
                     for (a, v) in args.iter().zip(&vals) {
@@ -808,7 +920,7 @@ impl<'a> Fa<'a> {
         }
         if crate::objref::may_collect(self.p, f) {
             let w = self.why(e.span, format!("{} (which may collect)", if callee.is_some() { format!("the call of {}", name) } else { "this call".into() }));
-            self.restructure(&Path { root: Root::GcAny, steps: Vec::new(), trunc: true }, w, st);
+            self.restructure(&[Path { root: Root::GcAny, steps: Vec::new(), trunc: true }], w, st);
         }
         if self.kind(&e.ty) == Kind::Gc {
             return [Path::new(Root::GcAny)].into_iter().collect();
@@ -1075,30 +1187,32 @@ impl<'a> Fa<'a> {
                             // A part of a local aggregate.
                             for p in &ps {
                                 if let Root::Local(x) = p.root {
-                                    let cur = st.vals.get(&x).cloned().unwrap_or_else(|| self.symbolic(x));
+                                    let cur = st.vals.get(&x).map(|v| (**v).clone()).unwrap_or_else(|| self.symbolic(x));
                                     let mut n = cur;
                                     n.extend(v.iter().cloned());
                                     if self.kind(&self.f.locals[x as usize].ty.clone()) != Kind::None {
-                                        st.vals.insert(x, n);
+                                        Rc::make_mut(&mut st.vals).insert(x, Rc::new(n));
                                     }
                                 }
                             }
                         } else {
                             // The old value at the place is overwritten.
-                            st.esc.retain(|(pl, _, _)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
+                            retain_set(&mut st.esc, |(pl, _, _)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
                             self.store(&v, &ps, r.span, st);
                         }
                         // The old value at the place is gone: what pointed
                         // into its buffers points into a detached block.
                         if self.kind(&l.ty) != Kind::None {
-                            for vs in st.vals.values_mut() {
-                                vs.retain(|q| !ps.iter().any(|p| q.root == p.root && q.steps.len() > p.steps.len() && q.steps.starts_with(&p.steps) && is_d(&q.steps[p.steps.len()])));
+                            let det = |q: &Path| ps.iter().any(|p| q.root == p.root && q.steps.len() > p.steps.len() && q.steps.starts_with(&p.steps) && is_d(&q.steps[p.steps.len()]));
+                            let hit: Vec<LocalId> = st.vals.iter().filter(|(_, vs)| vs.iter().any(det)).map(|(x, _)| *x).collect();
+                            for x in hit {
+                                Rc::make_mut(Rc::make_mut(&mut st.vals).get_mut(&x).unwrap()).retain(|q| !det(q));
                             }
                         }
                         // A new value at the place: copies of the old one
                         // no longer share its buffers.
-                        st.aliases.retain(|(_, pl)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
-                        st.stale_places.retain(|pl, _| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
+                        retain_set(&mut st.aliases, |(_, pl)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
+                        retain_map(&mut st.stale_places, |pl, _| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
                     }
                     Err(_) => {}
                 }
@@ -1171,13 +1285,13 @@ impl<'a> Fa<'a> {
                     let mut ls = Vec::new();
                     assigned_locals(reload, &mut ls);
                     let w = self.why(call.span, "this `reenter` call (guest code may grow or move the vm's stacks; `reload` recomputes the state)".into());
+                    let mut targets = Val::new();
                     for l in ls {
-                        let mut targets = st.vals.get(&l).cloned().unwrap_or_else(|| self.symbolic(l));
+                        targets.extend(st.vals.get(&l).map(|v| (**v).clone()).unwrap_or_else(|| self.symbolic(l)));
                         targets.insert(Path::new(Root::Local(l)).push(Step::D));
-                        for t in targets {
-                            self.restructure(&t, w, st);
-                        }
                     }
+                    let rs: Vec<Path> = targets.into_iter().collect();
+                    self.restructure(&rs, w, st);
                     // `reload` itself sets them again.
                     self.eval(reload, st);
                 }
@@ -1243,9 +1357,9 @@ fn analyze<'a>(
     cx: &Ctx<'a>,
     report: bool,
     audit: Option<&'a crate::diag::SourceMap>,
-) -> (Summary, Vec<Diag>) {
+) -> (Summary, Vec<Diag>, Vec<String>) {
     let f = &p.fns[fid as usize];
-    let Some(b) = &f.body else { return (Summary::default(), Vec::new()) };
+    let Some(b) = &f.body else { return (Summary::default(), Vec::new(), Vec::new()) };
     let mut fa = Fa {
         p,
         fid,
@@ -1257,6 +1371,7 @@ fn analyze<'a>(
         kinds,
         whys: Vec::new(),
         errs: Vec::new(),
+        lines: Vec::new(),
         err_spans: HashSet::new(),
         breaks: HashMap::new(),
         conts: HashMap::new(),
@@ -1279,7 +1394,7 @@ fn analyze<'a>(
         }
         let v = fa.symbolic(l as LocalId);
         if !v.is_empty() {
-            st.vals.insert(l as LocalId, v);
+            Rc::make_mut(&mut st.vals).insert(l as LocalId, Rc::new(v));
         }
     }
     let v = fa.eval(b, &mut st);
@@ -1290,7 +1405,7 @@ fn analyze<'a>(
         fa.ret(&v, b.span);
         fa.exit_escapes(&st);
     }
-    (fa.out, fa.errs)
+    (fa.out, fa.errs, fa.lines)
 }
 
 /// Summarize every function (a least fixpoint over the call graph), then
@@ -1352,13 +1467,22 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     let mut work: Vec<FnId> = fns.iter().rev().copied().collect();
     let mut queued: HashSet<FnId> = fns.iter().copied().collect();
     let mut rounds = 0u64;
+    // A function's last analysis saw the final summaries of its callees
+    // (a change to one queues it again), so its errors are reported from
+    // that analysis rather than from one more pass.
+    let checked_set: HashSet<FnId> = checked.iter().copied().collect();
+    let mut reports: HashMap<FnId, (Vec<Diag>, Vec<String>)> = HashMap::new();
     let stats = std::env::var("LOIMI_LIFETIMES_STATS").is_ok();
     let mut times: HashMap<FnId, (f64, u32)> = HashMap::new();
     while let Some(i) = work.pop() {
         queued.remove(&i);
         rounds += 1;
         let t0 = std::time::Instant::now();
-        let (s, _) = analyze(p, i, &sums, &mut kinds, cx, false, None);
+        let report = checked_set.contains(&i);
+        let (s, errs, lines) = analyze(p, i, &sums, &mut kinds, cx, report, audit);
+        if report {
+            reports.insert(i, (errs, lines));
+        }
         if stats {
             let e = times.entry(i).or_default();
             e.0 += t0.elapsed().as_secs_f64();
@@ -1386,18 +1510,21 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         let mut v: Vec<_> = times.iter().collect();
         v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
         for (f, (t, n)) in v.iter().take(12) {
-            eprintln!("  {:8.1} ms {:3}x {}", t * 1000.0, n, p.fns[**f as usize].symbol);
-        }
-    }
-    let t1 = std::time::Instant::now();
-    for &i in &checked {
-        let (_, errs) = analyze(p, i, &sums, &mut kinds, cx, true, audit);
-        if let Some(d) = errs.into_iter().next() {
-            return Err(d);
+            let s = sums.get(*f).cloned().unwrap_or_default();
+            eprintln!("  {:8.1} ms {:3}x {} (restructs {} ret {} pairs {} keeps {})", t * 1000.0, n, p.fns[**f as usize].symbol, s.restructs.len(), s.ret.len(), s.pairs.len(), s.keeps.len());
         }
     }
     if stats {
-        eprintln!("lifetimes: summaries {:.1} ms, checks {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("lifetimes: analyses {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0);
+    }
+    for &i in &checked {
+        let Some((errs, lines)) = reports.remove(&i) else { continue };
+        for l in lines {
+            eprintln!("{}", l);
+        }
+        if let Some(d) = errs.into_iter().next() {
+            return Err(d);
+        }
     }
     Ok(())
 }
