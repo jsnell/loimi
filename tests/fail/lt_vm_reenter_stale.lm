@@ -1,0 +1,28 @@
+// Lifetimes (corpus 7): in a vm handler, a pointer computed from the
+// state before a `reenter` call (guest code may grow and move the stack;
+// `reload` recomputes `regs`) and used after it. Mini's coroutine
+// stacks and `call_value` had this shape (examples/mini/COROUTINES.md).
+#![lifetimes]
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Frame { base: u64, k: *Value }
+struct Ctx { fp: *Frame, stack: *Value }
+fn native(c: *Ctx, v: Value) -> Result<Value, str> uses reenter { Ok(v) }
+vm V {
+    context ctx: *Ctx;
+    state { pc: *u32, regs: *Value, k: *Value, fp: *Frame }
+    operand reg = regs[it];
+    operand imm = it;
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    sync { ctx.fp = fp; }
+    reload { fp = ctx.fp; regs = ctx.stack + fp.base; k = fp.k; }
+    op CALLN(a: imm, b: reg) : ABC {
+        let dst = regs + (a as u64);
+        let r = native(ctx, b)?;
+        *dst = r;
+        next
+    }
+    entry run(c: *Ctx, code: *u32) -> Result<Value, str> uses gc { ctx = c; fp = c.fp; regs = c.stack; k = fp.k; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+fn main() {}
+// error: `dst` may dangle

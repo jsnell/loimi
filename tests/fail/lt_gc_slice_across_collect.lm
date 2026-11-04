@@ -1,0 +1,26 @@
+// Lifetimes (corpus 2, 8): Python's `list.index` held a slice of the
+// list's item array across `__eq__`, which may grow the list (a new
+// array: the old one is unreachable) and collect. A slice of an object
+// that no local holds dangles after a call that may collect.
+import std.gc;
+object Arr { items: [i64] }
+object List { arr: Gc<Arr>, len: u64 }
+fn eq(h: *gc.Heap, l: Gc<List>, x: i64) -> bool uses gc {
+    l.arr = new(h, Arr {}, l.len * 2);
+    gc.collect(h);
+    x == 0
+}
+fn index(h: *gc.Heap, l: Gc<List>, x: i64) -> u64 uses gc {
+    let xs = l.arr.items;
+    for i in 0..xs.len {
+        if eq(h, l, xs[i]) { return i; }
+    }
+    0
+}
+#![lifetimes]
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let l = new(&heap, List { arr: new(&heap, Arr {}, 4), len: 4 });
+    let i = index(&heap, l, 3);
+}
+// error: `xs` may dangle: it points into memory that the call of `eq` (which may collect) may have moved or freed

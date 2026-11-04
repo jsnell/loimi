@@ -1,0 +1,12 @@
+// Lifetimes (corpus 4): a pointer into a HashMap's table used after
+// `free`.
+#![safe]
+import std.map;
+fn main() {
+    var m: map.HashMap<u64, u64> = map.HashMap.new();
+    m.insert(1, 10);
+    let Some(p) = m.get_ptr(1) else { return; };
+    m.free();
+    let x = *p;
+}
+// error: `p` may dangle

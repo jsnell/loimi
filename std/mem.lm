@@ -177,6 +177,9 @@ pub fn Vec<T>.set(v: *Vec<T>, i: u64, x: T) {
 
 /// Append the values of `s`. `s` may be (part of) `v`'s own items
 /// (`v.extend(v.items())`): it is read after the buffer moves.
+/// `#[may_alias(s)]`: the lifetime check (docs/design/lifetimes.md)
+/// trusts that, and lets callers pass a slice of `v` itself.
+#[may_alias(s)]
 pub fn Vec<T>.extend(v: *Vec<T>, s: []T) {
     var src = s.ptr;
     if v.len + s.len > v.cap { src = v.grow_for(s); }

@@ -1,0 +1,14 @@
+// Lifetimes (corpus 6): a slice of a local array handed to a function
+// that keeps it (here `SourceMap.add`, which borrows the file's text for
+// the map's lifetime; `rt.panic`'s message had the same shape).
+#![safe]
+import std.diag;
+fn add_file(sm: *diag.SourceMap) -> u32 {
+    var buf: [u8; 4] = ['a', 'b', 'c', '\n'];
+    sm.add("x.txt", buf[0..4])
+}
+fn main() {
+    var sm = diag.SourceMap.new();
+    let id = add_file(&sm);
+}
+// error: passes the address of local `buf` to `SourceMap.add`, which may keep it beyond the call

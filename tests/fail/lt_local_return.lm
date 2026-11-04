@@ -1,0 +1,9 @@
+// Lifetimes (corpus 6): the address of a local returned from its
+// function.
+#![safe]
+fn counter() -> *u64 {
+    var n: u64 = 0;
+    &n
+}
+fn main() { let p = counter(); }
+// error: returns the address of local `n`, which dies when the function returns

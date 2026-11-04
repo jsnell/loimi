@@ -1,0 +1,12 @@
+// Lifetimes (corpus 5): copying a Vec makes two owners of one buffer;
+// growing the copy frees the original's.
+#![safe]
+import std.mem;
+fn main() {
+    var a: mem.Vec<u64> = mem.Vec.new();
+    a.push(1);
+    var b = a;
+    for i in 0..100 { b.push(i as u64); }
+    let x = a.at(0);
+}
+// error: `a` may dangle

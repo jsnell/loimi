@@ -387,4 +387,7 @@ pub struct Module {
     /// `#![safe]`: raw-pointer operations need `unsafe { }`
     /// (language.md section 1.3).
     pub safe: bool,
+    /// `#![lifetimes]` (or `#![safe]`): pointer-stability checking
+    /// (src/lifetimes.rs, docs/design/lifetimes.md).
+    pub lifetimes: bool,
 }

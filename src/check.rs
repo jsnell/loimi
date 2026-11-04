@@ -835,6 +835,16 @@ impl<'a> Checker<'a> {
         if f.attrs.has("raw") || f.linkage == Linkage::Extern {
             self.raw_fns.insert(id);
         }
+        if let Some((_, args, sp)) = f.attrs.list.iter().find(|(n, _, _)| n == "may_alias") {
+            let mut bits = 0u64;
+            for a in args {
+                match f.params.iter().position(|p| p.name.name == *a) {
+                    Some(i) if i < 64 => bits |= 1 << i,
+                    _ => return Err(Diag::new(*sp, format!("`#[may_alias({})]`: no parameter `{}`", a, a))),
+                }
+            }
+            self.prog.may_alias.insert(id, bits);
+        }
         if let Some((_, args, sp)) = f.attrs.list.iter().find(|(n, _, _)| n == "c_const") {
             if f.linkage != Linkage::Export {
                 return Err(Diag::new(*sp, "`#[c_const(..)]` applies to `export \"C\"` functions"));

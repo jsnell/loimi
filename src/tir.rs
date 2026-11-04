@@ -665,4 +665,8 @@ pub struct Program {
     /// As `ref_writes`, the parameters it may keep beyond the call (return,
     /// store, capture): no object slice may be passed there.
     pub ref_keeps: std::collections::HashMap<FnId, u64>,
+    /// `#[may_alias(p)]`: per function, the parameters (bit i) that may
+    /// point into memory the function moves or frees (`Vec.extend`
+    /// re-derives such a slice): src/lifetimes.rs does not check them.
+    pub may_alias: std::collections::HashMap<FnId, u64>,
 }

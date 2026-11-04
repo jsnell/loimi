@@ -1,0 +1,13 @@
+// Lifetimes (corpus 6): the address of a local stored where it outlives
+// its function.
+#![safe]
+struct Ctx { cur: ?*u64 }
+fn set(c: *Ctx) {
+    var n: u64 = 7;
+    c.cur = Some(&n);
+}
+fn main() {
+    var c = Ctx { cur: None };
+    set(&c);
+}
+// error: stores the address of local `n` in memory that may outlive it

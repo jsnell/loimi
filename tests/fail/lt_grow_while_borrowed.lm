@@ -1,0 +1,12 @@
+// Lifetimes (docs/design/lifetimes.md, corpus 1): a slice of a Vec is
+// used after a push that may have moved the buffer.
+#![safe]
+import std.mem;
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    let s = v.items();
+    v.push(2);
+    let x = s[0];
+}
+// error: `s` may dangle: it points into memory that the call of `Vec<u64>.push` may have moved or freed

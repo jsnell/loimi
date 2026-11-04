@@ -1,0 +1,12 @@
+// Lifetimes (corpus 3): a pointer from `OrderedMap.get_ptr` used after an
+// insert that may resize the table.
+#![safe]
+import std.map;
+fn main() {
+    var m: map.OrderedMap<u64, u64> = map.OrderedMap.new();
+    m.insert(1, 10);
+    let Some(p) = m.get_ptr(1) else { return; };
+    for i in 2..100 { m.insert(i as u64, i as u64); }
+    *p = 11;
+}
+// error: `p` may dangle

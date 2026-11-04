@@ -1,0 +1,12 @@
+// Lifetimes (corpus 4): a node allocated in an arena used after
+// `Arena.free`.
+#![safe]
+import std.mem;
+struct Node { v: u64 }
+fn main() {
+    var a = mem.Arena.new();
+    let n = new(&a, Node { v: 1 });
+    a.free();
+    n.v = 2;
+}
+// error: `n` may dangle: it points into memory that the call of `Arena.free` may have moved or freed

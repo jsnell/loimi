@@ -1,0 +1,18 @@
+// Lifetimes (corpus 1): `StrBuf.push_str` as it was before `Vec.extend`:
+// it grows the buffer, then copies from `s`. Appending a buffer to itself
+// (`b.push_str(b.as_str())`) read freed memory. The callee's summary says
+// it uses argument 2 after moving argument 1's memory.
+#![safe]
+import std.mem;
+struct Buf { bytes: mem.Vec<u8> }
+fn Buf.push_str(b: *Buf, s: []u8) {
+    b.bytes.reserve(s.len);
+    for c in s { b.bytes.push(c); }
+}
+fn Buf.as_str(b: *Buf) -> []u8 { b.bytes.items() }
+fn main() {
+    var b = Buf { bytes: mem.Vec.new() };
+    b.push_str("abc");
+    b.push_str(b.as_str());
+}
+// error: this argument points into memory that `Buf.push_str` may move or free (through argument 1) while it still uses this one

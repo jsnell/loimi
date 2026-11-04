@@ -1,0 +1,16 @@
+// Lifetimes (corpus 5): a copy of a Vec held in a struct grows and frees
+// the buffer the struct still points to.
+#![safe]
+import std.mem;
+struct Ctx { stack: mem.Vec<u64> }
+fn grow_copy(c: *Ctx) {
+    var s = c.stack;
+    for i in 0..100 { s.push(i as u64); }
+    let x = c.stack.at(0);
+}
+fn main() {
+    var c = Ctx { stack: mem.Vec.new() };
+    c.stack.push(1);
+    grow_copy(&c);
+}
+// error: this place's buffers may have been freed through a copy of it
