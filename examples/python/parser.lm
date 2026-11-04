@@ -212,10 +212,10 @@ fn P.params(p: *P, close: T) -> *mem.Vec<Param> {
     while p.ok() and !p.at(close) {
         if p.eat(T.Star) {
             if p.at(T.Comma) { kwonly = true; }
-            else { ps.push(Param { name: p.name(), default: None, kind: 1 }); kwonly = true; if p.eat(T.Colon) { p.test(); } }
+            else { ps.push(Param { name: p.name(), default: None, kind: 1 }); kwonly = true; if close == T.RParen and p.eat(T.Colon) { p.test(); } }
         } else if p.eat(T.DStar) {
             ps.push(Param { name: p.name(), default: None, kind: 2 });
-            if p.eat(T.Colon) { p.test(); }
+            if close == T.RParen and p.eat(T.Colon) { p.test(); }
         } else if p.eat(T.Slash) {
             // positional-only marker: ignore
         } else {

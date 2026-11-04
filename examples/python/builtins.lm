@@ -723,6 +723,19 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(buf_str(c, &b2))
         }
         Divmod => {
+            let (a, d) = (args[0], args[1]);
+            if value.is_num(a) and value.is_num(d) and !(value.is_int(a) and value.is_int(d)) {
+                let y = value.to_f64(d).unwrap();
+                if y == 0.0 { return Err(exc(c, E_ZERODIV, "float divmod()")); }
+                let (q, r) = ops.float_divmod(value.to_f64(a).unwrap(), y);
+                let t = value.new_tuple(&c.heap, 2);
+                t.items[0] = Value.Float(q);
+                t.items[1] = Value.Float(r);
+                return Ok(Value.Tuple(t));
+            }
+            if !(value.is_num(a) and value.is_num(d)) and !ops.is_inst(a) and !ops.is_inst(d) {
+                return Err(ops.unsupported(c, "divmod()", a, d));
+            }
             let q = ops.arith(c, ops.O_FLOORDIV, args[0], args[1])?;
             let r = ops.arith(c, ops.O_MOD, args[0], args[1])?;
             let t = value.new_tuple(&c.heap, 2);
@@ -731,11 +744,20 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(Value.Tuple(t))
         }
         Pow => {
-            if np == 3 {
+            if np == 3 and args[2] != Value.Nil {
                 // modular exponentiation
-                var base = ops.arith(c, ops.O_MOD, args[0], args[2])?;
+                let m = args[2];
+                if !value.is_int(args[0]) or !value.is_int(args[1]) or !value.is_int(m) {
+                    return Err(exc(c, E_TYPE, "pow() 3rd argument not allowed unless all arguments are integers"));
+                }
+                if m == Value.Int(0) { return Err(exc(c, E_VALUE, "pow() 3rd argument cannot be 0")); }
+                var base = ops.arith(c, ops.O_MOD, args[0], m)?;
                 var e = args[1];
-                var r = Value.Int(1);
+                if big.is_neg(e) {
+                    base = mod_inverse(c, base, m)?;
+                    e = ops.unary(c, ops.U_NEG, e)?;
+                }
+                var r = ops.arith(c, ops.O_MOD, Value.Int(1), m)?;
                 while !(e == Value.Int(0)) {
                     if big.is_odd(e) { r = ops.arith(c, ops.O_MOD, ops.arith(c, ops.O_MUL, r, base)?, args[2])?; }
                     e = ops.arith(c, ops.O_FLOORDIV, e, Value.Int(2))?;
@@ -747,12 +769,18 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         }
         Round => {
             let x = args[0];
-            if value.is_int(x) { return Ok(x); }
+            if value.is_int(x) {
+                if np < 2 or args[1] == Value.Nil { return Ok(x); }
+                let nd = want_int(c, args[1])?;
+                if nd >= 0 { return Ok(x); }
+                return round_int(c, x, -nd);
+            }
             let f = want_f64(c, x)?;
             if np < 2 or args[1] == Value.Nil {
                 return float_to_int(c, f.nearest());
             }
             let nd = want_int(c, args[1])?;
+            if nd < 0 { return round_float_neg(c, f, -nd); }
             var buf = text.StrBuf.new();
             fmt.write_c_float_pub(&buf, 'f', nd, f);
             let r = text.parse_f64(buf.as_str()) ?? f;
@@ -858,6 +886,63 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         ObjStr => fmt.to_str(c, args[0]),
         _ => call_method_builtin(c, b, args, n, kw),
     }
+}
+
+/// The inverse of `a` modulo `m` (pow(a, -n, m)), in m's sign.
+fn mod_inverse(c: *Ctx, a: Value, m: Value) -> Result<Value, Value> uses reenter {
+    let am = if big.is_neg(m) { ops.unary(c, ops.U_NEG, m)? } else { m };
+    var r0 = ops.arith(c, ops.O_MOD, a, am)?;
+    var r1 = am;
+    var x0 = Value.Int(1);
+    var x1 = Value.Int(0);
+    while r1 != Value.Int(0) {
+        let q = ops.arith(c, ops.O_FLOORDIV, r0, r1)?;
+        let r2 = ops.arith(c, ops.O_SUB, r0, ops.arith(c, ops.O_MUL, q, r1)?)?;
+        r0 = r1;
+        r1 = r2;
+        let x2 = ops.arith(c, ops.O_SUB, x0, ops.arith(c, ops.O_MUL, q, x1)?)?;
+        x0 = x1;
+        x1 = x2;
+    }
+    if r0 != Value.Int(1) { return Err(exc(c, E_VALUE, "base is not invertible for the given modulus")); }
+    ops.arith(c, ops.O_MOD, x0, m)
+}
+
+/// 10**k as an int.
+fn pow10(c: *Ctx, k: i64) -> Result<Value, Value> uses reenter {
+    ops.arith(c, ops.O_POW, Value.Int(10), value.int_val(&c.heap, k))
+}
+
+/// round(x, -k) of an int: to a multiple of 10**k, half to even.
+fn round_int(c: *Ctx, x: Value, k: i64) -> Result<Value, Value> uses reenter {
+    if k as u64 > big.bit_length(x) / 3 + 2 { return Ok(Value.Int(0)); }
+    let p = pow10(c, k)?;
+    var q = ops.arith(c, ops.O_FLOORDIV, x, p)?;
+    let r = ops.arith(c, ops.O_MOD, x, p)?;
+    let r2 = ops.arith(c, ops.O_MUL, r, Value.Int(2))?;
+    let o = ops.order(c, r2, p)?.unwrap();
+    if o > 0 or (o == 0 and big.is_odd(q)) { q = ops.arith(c, ops.O_ADD, q, Value.Int(1))?; }
+    ops.arith(c, ops.O_MUL, q, p)
+}
+
+/// round(f, -k) of a float, rounding its exact value (as CPython does).
+fn round_float_neg(c: *Ctx, f: f64, k: i64) -> Result<Value, Value> uses reenter {
+    if f != f or f - f != 0.0 { return Ok(Value.Float(f)); }
+    let neg = (f.to_bits() >> 63) != 0;
+    if k > 330 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let n = float_to_int(c, f.floor())?;
+    let p = pow10(c, k)?;
+    var q = ops.arith(c, ops.O_FLOORDIV, n, p)?;
+    let r = ops.arith(c, ops.O_MOD, n, p)?;
+    let r2 = ops.arith(c, ops.O_MUL, r, Value.Int(2))?;
+    let o = ops.order(c, r2, p)?.unwrap();
+    let exact = f.floor() == f;
+    // Without a fraction r + frac > p/2 iff 2r >= p (p is even): no ties.
+    if o > 0 or (o == 0 and (!exact or big.is_odd(q))) { q = ops.arith(c, ops.O_ADD, q, Value.Int(1))?; }
+    let v = ops.arith(c, ops.O_MUL, q, p)?;
+    let r = value.to_f64(v).unwrap();
+    if r == 0.0 and neg { return Ok(Value.Float(-0.0)); }
+    Ok(Value.Float(r))
 }
 
 /// StopIteration for an exhausted iterator: with the return value of a

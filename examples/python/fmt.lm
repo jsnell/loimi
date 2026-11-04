@@ -11,7 +11,7 @@ import vm;
 import vm.{Ctx};
 import ops;
 import builtins;
-import builtins.{E_TYPE, E_VALUE};
+import builtins.{E_TYPE, E_VALUE, E_OVERFLOW};
 
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
@@ -283,70 +283,162 @@ fn is_builtin_exc(c: *Ctx, cls: Gc<Box>) -> bool {
 }
 
 // ── format specs ────────────────────────────────────────────────────
+// Follows CPython's Python/formatter_unicode.c: parse the spec, then lay
+// out [sign][prefix][digits][rest] with fill/align/width, where a '0' fill
+// with '=' alignment becomes leading zeros (grouped like the digits).
 
-struct Spec { fill: u8, align: u8, sign: u8, alt: bool, zero: bool, width: u64, comma: u8, prec: i64, ty: u8 }
+struct Spec { fill: u8, fill_set: bool, align: u8, sign: u8, alt: bool, width: u64, comma: u8, prec: i64, ty: u8 }
 
 fn isalign(ch: u8) -> bool { ch == '<' or ch == '>' or ch == '^' or ch == '=' }
 
-fn parse_spec(s: str) -> ?Spec {
-    var sp = Spec { fill: ' ', align: 0, sign: '-', alt: false, zero: false, width: 0, comma: 0, prec: -1, ty: 0 };
+/// Parse a spec; err: 1 = invalid, 2 = missing precision, 3 = both ',' and '_'.
+fn parse_spec(s: str, numeric: bool, sp: *Spec) -> u8 {
     var i: u64 = 0;
-    if s.len >= 2 and isalign(s[1]) { sp.fill = s[0]; sp.align = s[1]; i = 2; }
+    if s.len >= 2 and isalign(s[1]) { sp.fill = s[0]; sp.fill_set = true; sp.align = s[1]; i = 2; }
     else if s.len >= 1 and isalign(s[0]) { sp.align = s[0]; i = 1; }
     if i < s.len and (s[i] == '+' or s[i] == '-' or s[i] == ' ') { sp.sign = s[i]; i += 1; }
     if i < s.len and s[i] == '#' { sp.alt = true; i += 1; }
-    if i < s.len and s[i] == '0' { sp.zero = true; i += 1; }
+    if !sp.fill_set and i < s.len and s[i] == '0' {
+        sp.fill = '0';
+        if sp.align == 0 and numeric { sp.align = '='; }
+        i += 1;
+    }
     while i < s.len and text.is_digit(s[i]) { sp.width = sp.width * 10 + (s[i] - '0') as u64; i += 1; }
-    if i < s.len and (s[i] == ',' or s[i] == '_') { sp.comma = s[i]; i += 1; }
+    if i < s.len and (s[i] == ',' or s[i] == '_') {
+        sp.comma = s[i]; i += 1;
+        if i < s.len and (s[i] == ',' or s[i] == '_') { return 3; }
+    }
     if i < s.len and s[i] == '.' {
         i += 1;
+        if i >= s.len or !text.is_digit(s[i]) { return 2; }
         sp.prec = 0;
         while i < s.len and text.is_digit(s[i]) { sp.prec = sp.prec * 10 + (s[i] - '0') as i64; i += 1; }
     }
-    if i < s.len { sp.ty = s[i]; i += 1; }
-    if i != s.len { return None; }
-    Some(sp)
+    if s.len - i > 1 { return 1; }
+    if i < s.len { sp.ty = s[i]; }
+    0
 }
 
-pub fn write_c_float_pub(b: *text.StrBuf, ty: u8, prec: i64, x: f64) { write_c_float(b, ty, prec, x); }
+pub fn write_c_float_pub(b: *text.StrBuf, ty: u8, prec: i64, x: f64) { write_c_float(b, ty, prec, x, false); }
 
-fn write_c_float(b: *text.StrBuf, ty: u8, prec: i64, x: f64) {
+fn write_c_float(b: *text.StrBuf, ty: u8, prec: i64, x: f64, alt: bool) {
     var buf: [u8; 512] = [0; 512];
     var f: [u8; 6] = ['%', '.', '*', 'f', 0, 0];
     f[3] = ty;
+    if alt { f = ['%', '#', '.', '*', ty, 0]; }
     let n = snprintf(&buf[0], 512, &f[0], prec as i32, x);
-    let m = if n > 511 { 511 } else { n as u64 };
-    b.push_str(buf[0..m]);
+    if n > 511 {
+        // Long fixed-point output (e.g. '%f' % 1e300): retry with a big buffer.
+        let m = n as u64 + 1;
+        let p = mem.alloc<u8>(m);
+        snprintf(p, m, &f[0], prec as i32, x);
+        b.push_str(p.slice(m - 1));
+        mem.release(p);
+        return;
+    }
+    b.push_str(buf[0..n as u64]);
 }
 
-/// Insert thousands separators into the digits of b[start..].
-fn group(b: *text.StrBuf, start: u64, sep: u8) {
-    let s = b.as_str();
-    var digits_end = start;
-    while digits_end < s.len and text.is_digit(s[digits_end]) { digits_end += 1; }
-    let nd = digits_end - start;
-    if nd <= 3 { return; }
+/// Like '%.{p}g' but switching to exponent form already at decpt > p-1, and
+/// adding '.0' to integral fixed-point output (CPython's no-type float spec
+/// with a precision).
+fn write_g_dot0(b: *text.StrBuf, p: i64, x: f64, alt: bool) {
     var t = text.StrBuf.new();
-    for i in 0..nd {
-        if i > 0 and (nd - i) % 3 == 0 { t.push(sep); }
-        t.push(s[start + i]);
+    write_c_float(&t, 'e', p - 1, x, alt);
+    let s = t.as_str();
+    var e: u64 = 0;
+    while e < s.len and s[e] != 'e' { e += 1; }
+    var ex: i64 = 0;
+    var k = e + 2;
+    while k < s.len { ex = ex * 10 + (s[k] - '0') as i64; k += 1; }
+    if e + 1 < s.len and s[e + 1] == '-' { ex = 0 - ex; }
+    if ex < -4 or ex >= p - 1 {
+        var m = e;
+        if !alt {
+            var has_dot = false;
+            for j in 0..e { if s[j] == '.' { has_dot = true; } }
+            if has_dot {
+                while m > 0 and s[m - 1] == '0' { m -= 1; }
+                if m > 0 and s[m - 1] == '.' { m -= 1; }
+            }
+        }
+        b.push_str(s[0..m]);
+        b.push_str(s[e..s.len]);
+    } else {
+        let start = b.len();
+        write_c_float(b, 'g', p, x, alt);
+        let r = b.as_str();
+        var dot = false;
+        for j in start..r.len { if r[j] == '.' { dot = true; } }
+        if !dot { b.push_str(".0"); }
     }
-    t.push_str(s[digits_end..s.len]);
-    b.bytes.len = start;
-    b.push_str(t.as_str());
     t.free();
 }
 
-fn pad(b: *text.StrBuf, body: str, sp: *Spec, numeric: bool) {
+/// Append digits grouped by `g` with `sep` (sep 0: no grouping), zero-padded
+/// on the left to at least `mw` characters (CPython's
+/// _PyUnicode_InsertThousandsGrouping).
+fn group_digits(out: *text.StrBuf, digits: str, mw0: i64, sep: u8, g: u64) {
+    if sep == 0 {
+        var z = mw0 - digits.len as i64;
+        while z > 0 { out.push('0'); z -= 1; }
+        out.push_str(digits);
+        return;
+    }
+    var rev = text.StrBuf.new();
+    var remaining = digits.len as i64;
+    var mw = mw0;
+    var pos = digits.len;
+    var first = true;
+    loop {
+        var l = g as i64;
+        var m = if remaining > mw { remaining } else { mw };
+        if m < 1 { m = 1; }
+        if m < l { l = m; }
+        var nz = l - remaining;
+        if nz < 0 { nz = 0; }
+        var nc = if remaining < l { remaining } else { l };
+        if nc < 0 { nc = 0; }
+        if !first { rev.push(sep); }
+        first = false;
+        for _j in 0..nc as u64 { pos -= 1; rev.push(digits[pos]); }
+        for _j in 0..nz as u64 { rev.push('0'); }
+        remaining -= nc;
+        mw -= l;
+        if remaining <= 0 and mw <= 0 { break; }
+        mw -= 1;
+    }
+    let r = rev.as_str();
+    var j = r.len;
+    while j > 0 { j -= 1; out.push(r[j]); }
+    rev.free();
+}
+
+/// Lay out a number: sign (0 = none), prefix ('0x'), integer digits and the
+/// rest ('.5e+01', '%'), honouring fill/align/width/grouping.
+fn emit_number(out: *text.StrBuf, sp: *Spec, signch: u8, prefix: str, digits: str, rest: str, sep: u8, g: u64) {
+    let nnd: u64 = (if signch != 0 { 1 as u64 } else { 0 as u64 }) + prefix.len + rest.len;
+    var mw: i64 = 0;
+    if sp.fill == '0' and sp.align == '=' { mw = sp.width as i64 - nnd as i64; }
+    var num = text.StrBuf.new();
+    if signch != 0 { num.push(signch); }
+    num.push_str(prefix);
+    let lead = num.len();
+    if digits.len == 0 { group_digits(&num, digits, mw, 0, g); }
+    else { group_digits(&num, digits, mw, sep, g); }
+    num.push_str(rest);
+    pad(out, num.as_str(), sp, lead, '>');
+    num.free();
+}
+
+/// Pad body to the width; `lead` is how many leading bytes (sign, prefix)
+/// precede the '=' padding.
+fn pad(b: *text.StrBuf, body: str, sp: *Spec, lead: u64, default_align: u8) {
     let n = body.len;
     if sp.width <= n { b.push_str(body); return; }
     let padn = sp.width - n;
-    var align = sp.align;
-    var fill = sp.fill;
-    if align == 0 {
-        if sp.zero and numeric { align = '='; fill = '0'; }
-        else { align = if numeric { '>' } else { '<' }; }
-    }
+    let align = if sp.align == 0 { default_align } else { sp.align };
+    let fill = sp.fill;
     if align == '<' { b.push_str(body); for _i in 0..padn { b.push(fill); } }
     else if align == '>' { for _i in 0..padn { b.push(fill); } b.push_str(body); }
     else if align == '^' {
@@ -355,12 +447,79 @@ fn pad(b: *text.StrBuf, body: str, sp: *Spec, numeric: bool) {
         b.push_str(body);
         for _i in 0..padn - l { b.push(fill); }
     } else {
-        // '=': padding after the sign
-        var k: u64 = 0;
-        if n > 0 and (body[0] == '-' or body[0] == '+' or body[0] == ' ') { b.push(body[0]); k = 1; }
+        b.push_str(body[0..lead]);
         for _i in 0..padn { b.push(fill); }
-        b.push_str(body[k..n]);
+        b.push_str(body[lead..n]);
     }
+}
+
+fn verr(c: *Ctx, kind: u64, a: str, mid: str, z: str) -> Value {
+    var m = text.StrBuf.new();
+    m.push_str(a);
+    m.push_str(mid);
+    m.push_str(z);
+    ops.exc_buf(c, kind, &m)
+}
+
+fn verr_ch(c: *Ctx, a: str, ch: u8, z: str) -> Value {
+    var m = text.StrBuf.new();
+    m.push_str(a);
+    m.push(ch);
+    m.push_str(z);
+    ops.exc_buf(c, E_VALUE, &m)
+}
+
+/// A number as a float for float conversions; OverflowError for huge ints.
+fn num_f64(c: *Ctx, v: Value) -> Result<?f64, Value> {
+    let Some(x) = value.to_f64(v) else { return Ok(None); };
+    if let Float(_) = v { return Ok(Some(x)); }
+    if x == 1.0 / 0.0 or x == -1.0 / 0.0 { return Err(ops.exc(c, E_OVERFLOW, "int too large to convert to float")); }
+    Ok(Some(x))
+}
+
+/// Write the body of a float: abs(x) formatted for type ty (CPython's
+/// format_float_internal minus the sign).
+fn float_body(b: *text.StrBuf, ty0: u8, prec: i64, x: f64, alt: bool) {
+    var ty = ty0;
+    if ty == 'n' { ty = 'g'; }
+    let upper = ty == 'E' or ty == 'F' or ty == 'G';
+    if x != x { b.push_str(if upper { "NAN" } else { "nan" }); if ty == '%' { b.push('%'); } return; }
+    if x == 1.0 / 0.0 { b.push_str(if upper { "INF" } else { "inf" }); if ty == '%' { b.push('%'); } return; }
+    if ty == 0 {
+        if prec < 0 {
+            let start = b.len();
+            value.write_float(b, x);
+            if alt {
+                let s = b.as_str();
+                var dot = false;
+                var e = s.len;
+                for j in start..s.len { if s[j] == '.' { dot = true; } if s[j] == 'e' { e = j; } }
+                if !dot and e < s.len {
+                    var t = text.StrBuf.new();
+                    t.push_str(s[e..s.len]);
+                    b.bytes.len = e;
+                    b.push('.');
+                    b.push_str(t.as_str());
+                    t.free();
+                }
+            }
+        } else {
+            write_g_dot0(b, if prec == 0 { 1 } else { prec }, x, alt);
+        }
+        return;
+    }
+    let p = if prec < 0 { 6 } else { prec };
+    if ty == 'f' or ty == 'F' { write_c_float(b, 'f', p, x, alt); }
+    else if ty == 'e' or ty == 'E' { write_c_float(b, ty, p, x, alt); }
+    else if ty == 'g' or ty == 'G' { write_c_float(b, ty, if p == 0 { 1 } else { p }, x, alt); }
+    else { write_c_float(b, 'f', p, x * 100.0, alt); b.push('%'); }
+}
+
+/// Split a formatted unsigned number into its leading digits and the rest.
+fn digits_end(s: str) -> u64 {
+    var i: u64 = 0;
+    while i < s.len and text.is_digit(s[i]) { i += 1; }
+    i
 }
 
 pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter {
@@ -369,176 +528,299 @@ pub fn format(c: *Ctx, v: Value, spec: str) -> Result<Value, Value> uses reenter
         if let Some(r) = ops.call_method(c, v, "__format__", args[..])? { return Ok(r); }
     }
     if spec.len == 0 { return to_str(c, v); }
-    let Some(sp0) = parse_spec(spec) else { return Err(ops.exc(c, E_VALUE, "Invalid format specifier")); };
-    var sp = sp0;
-    var body = text.StrBuf.new();
-    var numeric = false;
-    let ty = sp.ty;
-    if value.is_num(v) and !(ty == 's') {
-        numeric = true;
-        let isfloat = if let Float(_) = v { true } else { false };
-        if ty == 'd' or ty == 'n' or ((ty == 0) and !isfloat) or ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' or ty == 'c' {
-            if isfloat { body.free(); return Err(ops.exc(c, E_VALUE, "Unknown format code 'd' for object of type 'float'")); }
-            let neg = big.is_neg(v);
-            if neg { body.push('-'); } else if sp.sign == '+' { body.push('+'); } else if sp.sign == ' ' { body.push(' '); }
-            let start = body.len();
-            let av = big.abs(&c.heap, v);
-            if ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' {
-                let radix: u64 = if ty == 'o' { 8 } else if ty == 'b' { 2 } else { 16 };
-                if sp.alt { body.push('0'); body.push(if ty == 'o' { 'o' } else if ty == 'b' { 'b' } else { ty }); }
-                builtins.write_radix(&c.heap, &body, av, radix, ty == 'X');
-            } else if ty == 'c' {
-                body.push((value.as_i64(av) ?? 63) as u8);
-            } else {
-                big.write(&body, av);
-                if sp.comma != 0 { group(&body, start, sp.comma); }
-            }
-        } else {
-            var x = value.to_f64(v).unwrap();
-            let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
-            if neg { x = 0.0 - x; body.push('-'); } else if sp.sign == '+' { body.push('+'); } else if sp.sign == ' ' { body.push(' '); }
-            let start = body.len();
-            if x != x { body.push_str("nan"); }
-            else if x == 1.0 / 0.0 { body.push_str("inf"); }
-            else if ty == 'f' or ty == 'F' { write_c_float(&body, 'f', if sp.prec < 0 { 6 } else { sp.prec }, x); }
-            else if ty == 'e' or ty == 'E' { write_c_float(&body, ty, if sp.prec < 0 { 6 } else { sp.prec }, x); }
-            else if ty == '%' { write_c_float(&body, 'f', if sp.prec < 0 { 6 } else { sp.prec }, x * 100.0); body.push('%'); }
-            else if ty == 'g' or ty == 'G' {
-                write_c_float(&body, ty, if sp.prec < 0 { 6 } else if sp.prec == 0 { 1 } else { sp.prec }, x);
-            } else {
-                // no type: like repr, or %g-ish with precision
-                if sp.prec < 0 { value.write_float(&body, x); }
-                else {
-                    write_c_float(&body, 'g', if sp.prec == 0 { 1 } else { sp.prec }, x);
-                    let s = body.as_str();
-                    var dot = false;
-                    for i in start..s.len { if s[i] == '.' or s[i] == 'e' or s[i] == 'n' or s[i] == 'i' { dot = true; } }
-                    if !dot { body.push_str(".0"); }
-                }
-            }
-            if sp.comma != 0 { group(&body, start, sp.comma); }
+    let isnum = value.is_num(v);
+    let isstr = if let Str(_) = v { true } else { false };
+    if !isnum and !isstr {
+        return Err(verr(c, E_TYPE, "unsupported format string passed to ", ops.type_name(c, v), ".__format__"));
+    }
+    var sp = Spec { fill: ' ', fill_set: false, align: 0, sign: 0, alt: false, width: 0, comma: 0, prec: -1, ty: 0 };
+    let perr = parse_spec(spec, isnum, &sp);
+    if perr == 1 {
+        var m = text.StrBuf.new();
+        m.push_str("Invalid format specifier '");
+        m.push_str(spec);
+        m.push_str("' for object of type '");
+        m.push_str(ops.type_name(c, v));
+        m.push('\'');
+        return Err(ops.exc_buf(c, E_VALUE, &m));
+    }
+    if perr == 2 { return Err(ops.exc(c, E_VALUE, "Format specifier missing precision")); }
+    if perr == 3 { return Err(ops.exc(c, E_VALUE, "Cannot specify both ',' and '_'.")); }
+    let isfloat = if let Float(_) = v { true } else { false };
+    var ty = sp.ty;
+    if ty == 0 and !isfloat { ty = if isstr { 's' } else { 'd' }; }
+    if sp.comma != 0 {
+        let ok = ty == 0 or ty == 'd' or ty == 'e' or ty == 'f' or ty == 'g' or ty == 'E' or ty == 'F' or ty == 'G' or ty == '%'
+            or (sp.comma == '_' and (ty == 'b' or ty == 'o' or ty == 'x' or ty == 'X'));
+        if !ok {
+            var m = text.StrBuf.new();
+            m.push_str("Cannot specify '");
+            m.push(sp.comma);
+            m.push_str("' with '");
+            m.push(ty);
+            m.push_str("'.");
+            return Err(ops.exc_buf(c, E_VALUE, &m));
         }
-    } else {
-        let s = to_str(c, v)?;
-        let Str(ss) = s else { trap() };
-        let d = ss.data;
-        let n = if sp.prec >= 0 and (sp.prec as u64) < d.len { sp.prec as u64 } else { d.len };
-        body.push_str(d[0..n]);
     }
     var out = text.StrBuf.new();
-    pad(&out, body.as_str(), &sp, numeric);
+    if isstr {
+        if ty != 's' {
+            out.free();
+            return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'str'"));
+        }
+        if sp.sign == ' ' { out.free(); return Err(ops.exc(c, E_VALUE, "Space not allowed in string format specifier")); }
+        if sp.sign != 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Sign not allowed in string format specifier")); }
+        if sp.alt { out.free(); return Err(ops.exc(c, E_VALUE, "Alternate form (#) not allowed in string format specifier")); }
+        if sp.align == '=' { out.free(); return Err(ops.exc(c, E_VALUE, "'=' alignment not allowed in string format specifier")); }
+        let Str(ss) = v else { trap() };
+        let d = ss.data;
+        let n = if sp.prec >= 0 and (sp.prec as u64) < d.len { sp.prec as u64 } else { d.len };
+        pad(&out, d[0..n], &sp, 0, '<');
+        return Ok(mkstr(c, &out));
+    }
+    let floaty = ty == 0 or ty == 'e' or ty == 'E' or ty == 'f' or ty == 'F' or ty == 'g' or ty == 'G' or ty == '%' or (ty == 'n' and isfloat);
+    if !isfloat and !floaty {
+        // integer presentation types
+        if !(ty == 'd' or ty == 'n' or ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' or ty == 'c') {
+            out.free();
+            return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'int'"));
+        }
+        if sp.prec >= 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Precision not allowed in integer format specifier")); }
+        if ty == 'c' {
+            if sp.sign != 0 { out.free(); return Err(ops.exc(c, E_VALUE, "Sign not allowed with integer format specifier 'c'")); }
+            if sp.alt { out.free(); return Err(ops.exc(c, E_VALUE, "Alternate form (#) not allowed with integer format specifier 'c'")); }
+            let cv = value.as_i64(v) ?? -1;
+            if cv < 0 or cv >= 0x110000 { out.free(); return Err(ops.exc(c, E_OVERFLOW, "%c arg not in range(0x110000)")); }
+            var ch: [u8; 1] = [(cv & 255) as u8];
+            emit_number(&out, &sp, 0, "", "", ch[0..1], 0, 3);
+            return Ok(mkstr(c, &out));
+        }
+        let neg = big.is_neg(v);
+        let signch: u8 = if neg { '-' } else if sp.sign == '+' { '+' } else if sp.sign == ' ' { ' ' } else { 0 };
+        let av = big.abs(&c.heap, v);
+        var digits = text.StrBuf.new();
+        var prefix = "";
+        if ty == 'x' or ty == 'X' or ty == 'o' or ty == 'b' {
+            let radix: u64 = if ty == 'o' { 8 } else if ty == 'b' { 2 } else { 16 };
+            if sp.alt { prefix = if ty == 'o' { "0o" } else if ty == 'b' { "0b" } else if ty == 'x' { "0x" } else { "0X" }; }
+            builtins.write_radix(&c.heap, &digits, av, radix, ty == 'X');
+        } else {
+            big.write(&digits, av);
+        }
+        let g: u64 = if ty == 'd' or ty == 'n' { 3 } else { 4 };
+        emit_number(&out, &sp, signch, prefix, digits.as_str(), "", sp.comma, g);
+        digits.free();
+        return Ok(mkstr(c, &out));
+    }
+    if !floaty {
+        out.free();
+        return Err(verr_ch(c, "Unknown format code '", ty, "' for object of type 'float'"));
+    }
+    let Some(x0) = num_f64(c, v)? else { trap() };
+    var x = x0;
+    let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
+    if neg { x = 0.0 - x; }
+    let signch: u8 = if neg { '-' } else if sp.sign == '+' { '+' } else if sp.sign == ' ' { ' ' } else { 0 };
+    var body = text.StrBuf.new();
+    float_body(&body, ty, sp.prec, x, sp.alt);
+    let s = body.as_str();
+    let finite = x == x and x != 1.0 / 0.0;
+    let de = digits_end(s);
+    emit_number(&out, &sp, signch, "", s[0..de], s[de..s.len], if finite { sp.comma } else { 0 }, 3);
     body.free();
     Ok(mkstr(c, &out))
 }
 
 // ── % formatting ────────────────────────────────────────────────────
+// Follows CPython's PyUnicode_Format.
+
+struct PctArgs { tup: ?Gc<Tuple>, args: Value, ai: u64 }
+
+fn pct_next(c: *Ctx, a: *PctArgs) -> Result<Value, Value> {
+    if let Some(t) = a.tup {
+        if a.ai < t.items.len { let v = t.items[a.ai]; a.ai += 1; return Ok(v); }
+    } else if a.ai == 0 {
+        a.ai = 1;
+        return Ok(a.args);
+    }
+    Err(ops.exc(c, E_TYPE, "not enough arguments for format string"))
+}
+
+/// Append body padded to width (spaces; or zeros after the first `lead`
+/// bytes when zero is set).
+fn pct_pad(b: *text.StrBuf, body: str, width: u64, ljust: bool, zero: bool, lead: u64) {
+    if body.len >= width { b.push_str(body); return; }
+    let n = width - body.len;
+    if ljust { b.push_str(body); for _i in 0..n { b.push(' '); } }
+    else if zero {
+        b.push_str(body[0..lead]);
+        for _i in 0..n { b.push('0'); }
+        b.push_str(body[lead..body.len]);
+    } else { for _i in 0..n { b.push(' '); } b.push_str(body); }
+}
 
 pub fn percent(c: *Ctx, fs: Gc<Str>, args: Value) -> Result<Value, Value> uses reenter {
-    let f = fs.data;
     var b = text.StrBuf.new();
-    var ai: u64 = 0;
+    let r = percent_(c, fs, args, &b);
+    if let Err(e) = r { b.free(); return Err(e); }
+    Ok(mkstr(c, &b))
+}
+
+fn percent_(c: *Ctx, fs: Gc<Str>, args: Value, b: *text.StrBuf) -> Result<(), Value> uses reenter {
+    let f = fs.data;
     let tup = if let Tuple(t) = args { Some(t) } else { None };
+    var pa = PctArgs { tup: tup, args: args, ai: 0 };
     let nargs = if let Some(t) = tup { t.items.len } else { 1 };
+    // Like CPython: a non-tuple, non-str argument with __getitem__ is a mapping
+    // (no "not all arguments converted" check).
+    let mapping = match args { Dict(_) => true, List(_) => true, _ => false };
     var i: u64 = 0;
     while i < f.len {
         let ch = f[i];
         if ch != '%' { b.push(ch); i += 1; continue; }
         i += 1;
-        if i >= f.len { b.free(); return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        if i >= f.len { return Err(ops.exc(c, E_VALUE, "incomplete format")); }
         if f[i] == '%' { b.push('%'); i += 1; continue; }
-        // Mapping key.
         var arg: Value = Value.Nil;
         var keyed = false;
         if f[i] == '(' {
-            let ks = i + 1;
-            while i < f.len and f[i] != ')' { i += 1; }
-            let key = value.new_str(&c.heap, f[ks..i]);
+            var depth: u64 = 1;
             i += 1;
-            let Dict(d) = args else { b.free(); return Err(ops.exc(c, E_TYPE, "format requires a mapping")); };
-            let Some(v) = value.dict_get_str(d, key) else { b.free(); return Err(ops.key_error(c, Value.Str(key))); };
-            arg = v;
+            let ks = i;
+            while i < f.len and depth > 0 {
+                if f[i] == '(' { depth += 1; } else if f[i] == ')' { depth -= 1; }
+                i += 1;
+            }
+            if depth > 0 { return Err(ops.exc(c, E_VALUE, "incomplete format key")); }
+            let Dict(d) = args else { return Err(ops.exc(c, E_TYPE, "format requires a mapping")); };
+            let key = value.new_str(&c.heap, f[ks..i - 1]);
+            let Some(kv) = value.dict_get_str(d, key) else { return Err(ops.key_error(c, Value.Str(key))); };
+            arg = kv;
             keyed = true;
         }
-        var spec = text.StrBuf.new();
-        var flags_minus = false;
+        var ljust = false;
+        var sign: u8 = 0;
+        var alt = false;
+        var zero = false;
         while i < f.len and (f[i] == '-' or f[i] == '+' or f[i] == ' ' or f[i] == '0' or f[i] == '#') {
-            if f[i] == '-' { flags_minus = true; } else { spec.push(f[i]); }
+            if f[i] == '-' { ljust = true; }
+            else if f[i] == '+' { sign = '+'; }
+            else if f[i] == ' ' { if sign == 0 { sign = ' '; } }
+            else if f[i] == '#' { alt = true; }
+            else { zero = true; }
             i += 1;
         }
-        var width = text.StrBuf.new();
+        var width: u64 = 0;
         if i < f.len and f[i] == '*' {
             i += 1;
-            let wv = if let Some(t) = tup { if ai < t.items.len { t.items[ai] } else { Value.Nil } } else { args };
-            ai += 1;
-            width.push_int(value.as_i64(wv) ?? 0);
-        }
-        while i < f.len and text.is_digit(f[i]) { width.push(f[i]); i += 1; }
-        var prec = text.StrBuf.new();
-        if i < f.len and f[i] == '.' {
-            prec.push('.');
-            i += 1;
-            while i < f.len and text.is_digit(f[i]) { prec.push(f[i]); i += 1; }
-            if prec.len() == 1 { prec.push('0'); }
-        }
-        if i >= f.len { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_VALUE, "incomplete format")); }
-        let conv = f[i];
-        i += 1;
-        if !keyed {
-            if let Some(t) = tup {
-                if ai >= t.items.len { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_TYPE, "not enough arguments for format string")); }
-                arg = t.items[ai];
-            } else {
-                if ai >= 1 { b.free(); spec.free(); width.free(); prec.free(); return Err(ops.exc(c, E_TYPE, "not enough arguments for format string")); }
-                arg = args;
-            }
-            ai += 1;
-        }
-        // Build a format spec and reuse format().
-        var full = text.StrBuf.new();
-        if flags_minus { full.push('<'); } else if conv == 's' or conv == 'r' or conv == 'a' { full.push('>'); }
-        full.push_str(spec.as_str());
-        full.push_str(width.as_str());
-        var piece: Value = Value.Nil;
-        if conv == 's' or conv == 'r' or conv == 'a' {
-            let sv = if conv == 's' { to_str(c, arg)? } else { repr(c, arg)? };
-            full.push_str(prec.as_str());
-            piece = format(c, sv, full.as_str())?;
-        } else if conv == 'd' or conv == 'i' or conv == 'u' {
-            var iv = arg;
-            if let Float(x) = arg { iv = builtins.float_to_int(c, x)?; }
-            if !value.is_int(iv) {
-                full.free(); spec.free(); width.free(); prec.free(); b.free();
-                var m = text.StrBuf.new();
-                m.push_str("%d format: a real number is required, not ");
-                m.push_str(ops.type_name(c, arg));
-                return Err(ops.exc_buf(c, E_TYPE, &m));
-            }
-            full.push('d');
-            piece = format(c, iv, full.as_str())?;
-        } else if conv == 'f' or conv == 'F' or conv == 'e' or conv == 'E' or conv == 'g' or conv == 'G' {
-            let Some(x) = value.to_f64(arg) else {
-                full.free(); spec.free(); width.free(); prec.free(); b.free();
-                var m = text.StrBuf.new();
-                m.push_str("must be real number, not ");
-                m.push_str(ops.type_name(c, arg));
-                return Err(ops.exc_buf(c, E_TYPE, &m));
-            };
-            full.push_str(prec.as_str());
-            full.push(conv);
-            piece = format(c, Value.Float(x), full.as_str())?;
-        } else if conv == 'x' or conv == 'X' or conv == 'o' or conv == 'c' {
-            full.push(conv);
-            piece = format(c, arg, full.as_str())?;
+            let wv = pct_next(c, &pa)?;
+            let Some(w) = value.as_i64(wv) else { return Err(ops.exc(c, E_TYPE, "* wants int")); };
+            if w < 0 { ljust = true; width = (0 - w) as u64; } else { width = w as u64; }
         } else {
-            full.free(); spec.free(); width.free(); prec.free(); b.free();
-            return Err(ops.exc(c, E_VALUE, "unsupported format character"));
+            while i < f.len and text.is_digit(f[i]) { width = width * 10 + (f[i] - '0') as u64; i += 1; }
         }
-        if let Str(ps) = piece { b.push_str(ps.data); }
-        full.free(); spec.free(); width.free(); prec.free();
+        var prec: i64 = -1;
+        if i < f.len and f[i] == '.' {
+            i += 1;
+            prec = 0;
+            if i < f.len and f[i] == '*' {
+                i += 1;
+                let pv = pct_next(c, &pa)?;
+                let Some(p) = value.as_i64(pv) else { return Err(ops.exc(c, E_TYPE, "* wants int")); };
+                prec = if p < 0 { 0 } else { p };
+            } else {
+                while i < f.len and text.is_digit(f[i]) { prec = prec * 10 + (f[i] - '0') as i64; i += 1; }
+            }
+        }
+        while i < f.len and (f[i] == 'h' or f[i] == 'l' or f[i] == 'L') { i += 1; }
+        if i >= f.len { return Err(ops.exc(c, E_VALUE, "incomplete format")); }
+        let conv = f[i];
+        let conv_at = i;
+        i += 1;
+        if !keyed { arg = pct_next(c, &pa)?; }
+        if conv == 's' or conv == 'r' or conv == 'a' {
+            let svv = if conv == 's' { to_str(c, arg)? } else { repr(c, arg)? };
+            let Str(ss) = svv else { trap() };
+            let d = ss.data;
+            let n = if prec >= 0 and (prec as u64) < d.len { prec as u64 } else { d.len };
+            pct_pad(b, d[0..n], width, ljust, false, 0);
+            continue;
+        }
+        // numeric conversions: fetch the value first (may fail)
+        var iv = arg;
+        var fx: f64 = 0.0;
+        if conv == 'd' or conv == 'i' or conv == 'u' or conv == 'x' or conv == 'X' or conv == 'o' {
+            if !value.is_int(arg) {
+                var bad = true;
+                if conv == 'd' or conv == 'i' or conv == 'u' {
+                    if let Float(x) = arg { iv = builtins.float_to_int(c, x)?; bad = false; }
+                }
+                if bad {
+                    var m = text.StrBuf.new();
+                    m.push('%');
+                    m.push(conv);
+                    m.push_str(if conv == 'x' or conv == 'X' or conv == 'o' { " format: an integer is required, not " } else { " format: a real number is required, not " });
+                    m.push_str(ops.type_name(c, arg));
+                    return Err(ops.exc_buf(c, E_TYPE, &m));
+                }
+            }
+        } else if conv == 'f' or conv == 'F' or conv == 'e' or conv == 'E' or conv == 'g' or conv == 'G' {
+            let Some(x0) = num_f64(c, arg)? else {
+                return Err(verr(c, E_TYPE, "must be real number, not ", ops.type_name(c, arg), ""));
+            };
+            fx = x0;
+        }
+        var body = text.StrBuf.new();
+        if conv == 'c' {
+            if let Str(ss) = arg and ss.data.len == 1 {
+                body.push(ss.data[0]);
+            } else if value.is_int(arg) {
+                let cv = value.as_i64(arg) ?? -1;
+                if cv < 0 or cv >= 0x110000 { body.free(); return Err(ops.exc(c, E_OVERFLOW, "%c arg not in range(0x110000)")); }
+                body.push((cv & 255) as u8);
+            } else {
+                body.free();
+                return Err(ops.exc(c, E_TYPE, "%c requires int or char"));
+            }
+            pct_pad(b, body.as_str(), width, ljust, false, 0);
+        } else if conv == 'd' or conv == 'i' or conv == 'u' or conv == 'x' or conv == 'X' or conv == 'o' {
+            let neg = big.is_neg(iv);
+            if neg { body.push('-'); } else if sign != 0 { body.push(sign); }
+            if alt and (conv == 'x' or conv == 'X' or conv == 'o') { body.push('0'); body.push(if conv == 'o' { 'o' } else { conv }); }
+            let lead = body.len();
+            let av = big.abs(&c.heap, iv);
+            var digits = text.StrBuf.new();
+            if conv == 'x' or conv == 'X' { builtins.write_radix(&c.heap, &digits, av, 16, conv == 'X'); }
+            else if conv == 'o' { builtins.write_radix(&c.heap, &digits, av, 8, false); }
+            else { big.write(&digits, av); }
+            var z = prec - digits.len() as i64;
+            while z > 0 { body.push('0'); z -= 1; }
+            body.push_str(digits.as_str());
+            digits.free();
+            pct_pad(b, body.as_str(), width, ljust, zero, lead);
+        } else if conv == 'f' or conv == 'F' or conv == 'e' or conv == 'E' or conv == 'g' or conv == 'G' {
+            var x = fx;
+            let neg = x < 0.0 or (x == 0.0 and (1.0 / x) < 0.0);
+            if neg { x = 0.0 - x; body.push('-'); } else if sign != 0 { body.push(sign); }
+            let lead = body.len();
+            float_body(&body, conv, if prec < 0 { 6 } else { prec }, x, alt);
+            pct_pad(b, body.as_str(), width, ljust, zero, lead);
+        } else {
+            body.free();
+            var m = text.StrBuf.new();
+            m.push_str("unsupported format character '");
+            m.push(conv);
+            m.push_str("' (0x");
+            m.push(hexdigit(conv >> 4));
+            m.push(hexdigit(conv & 15));
+            m.push_str(") at index ");
+            m.push_u64(conv_at);
+            return Err(ops.exc_buf(c, E_VALUE, &m));
+        }
+        body.free();
     }
-    if tup.is_some() and ai < nargs {
-        b.free();
+    if !mapping and pa.ai < nargs {
         return Err(ops.exc(c, E_TYPE, "not all arguments converted during string formatting"));
     }
-    Ok(mkstr(c, &b))
+    Ok(())
 }

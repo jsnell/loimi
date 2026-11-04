@@ -188,7 +188,7 @@ pub fn attr_error(c: *Ctx, v: Value, name: Gc<Str>) -> Value {
     exc_buf(c, E_ATTRIBUTE, &b)
 }
 
-fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
+pub fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
     var m = text.StrBuf.new();
     m.push_str("unsupported operand type(s) for ");
     m.push_str(op);
@@ -1030,6 +1030,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
     builtins.count(builtins.CNT_ARITH);
     if value.is_int(a) and value.is_int(b) { return int_arith(c, op, a, b); }
     if value.is_num(a) and value.is_num(b) {
+        if op >= O_LSHIFT { return Err(unsupported(c, op_sym(op), a, b)); }
         let x = value.to_f64(a).unwrap();
         let y = value.to_f64(b).unwrap();
         return float_arith(c, op, x, y);
@@ -1218,6 +1219,29 @@ fn small(v: Value) -> ?i64 {
     }
 }
 
+fn copysign0(s: f64) -> f64 { if (s.to_bits() >> 63) != 0 { -0.0 } else { 0.0 } }
+
+/// CPython's float_divmod (y != 0): floor quotient and modulo with the
+/// signs and infinities as CPython has them (`1/3 // -inf` is -1.0,
+/// `-0.0 % 5` is 0.0).
+pub fn float_divmod(x: f64, y: f64) -> (f64, f64) {
+    var m = x % y;
+    var div = (x - m) / y;
+    if m != 0.0 {
+        if (y < 0.0) != (m < 0.0) { m += y; div -= 1.0; }
+    } else {
+        m = copysign0(y);
+    }
+    var fd: f64 = 0.0;
+    if div != 0.0 {
+        fd = div.floor();
+        if div - fd > 0.5 { fd += 1.0; }
+    } else {
+        fd = copysign0(x / y);
+    }
+    (fd, m)
+}
+
 pub fn float_arith(c: *Ctx, op: u32, x: f64, y: f64) -> Result<Value, Value> {
     match op {
         O_ADD => Ok(Value.Float(x + y)),
@@ -1229,11 +1253,11 @@ pub fn float_arith(c: *Ctx, op: u32, x: f64, y: f64) -> Result<Value, Value> {
         }
         O_FLOORDIV => {
             if y == 0.0 { return Err(zero_div(c, "float floor division by zero")); }
-            Ok(Value.Float(num.floor_div_f64(x, y)))
+            Ok(Value.Float(float_divmod(x, y).0))
         }
         O_MOD => {
             if y == 0.0 { return Err(zero_div(c, "float modulo by zero")); }
-            Ok(Value.Float(num.floor_mod_f64(x, y)))
+            Ok(Value.Float(float_divmod(x, y).1))
         }
         O_POW => {
             if x == 0.0 and y < 0.0 { return Err(zero_div(c, "zero to a negative power")); }
@@ -1380,7 +1404,7 @@ fn rich_method(c: *Ctx, op: u32, x: Value, y: Value) -> Result<?Value, Value> us
     Ok(None)
 }
 
-fn is_inst(v: Value) -> bool {
+pub fn is_inst(v: Value) -> bool {
     if let Inst(_) = v { return true; }
     false
 }
@@ -1838,7 +1862,14 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
     let src = to_list(c, v)?;
     let (start, stop0, step, n) = slice_indices(c, lo, hi, st, l.len)?;
     if step != 1 {
-        if src.len != n { return Err(exc(c, E_VALUE, "attempt to assign sequence of wrong size to extended slice")); }
+        if src.len != n {
+            var m = text.StrBuf.new();
+            m.push_str("attempt to assign sequence of size ");
+            m.push_int(src.len as i64);
+            m.push_str(" to extended slice of size ");
+            m.push_int(n as i64);
+            return Err(exc_buf(c, E_VALUE, &m));
+        }
         var j = start;
         for i in 0..n { l.arr.items[j as u64] = src.arr.items[i]; j += step; }
         return Ok(());

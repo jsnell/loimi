@@ -47,7 +47,7 @@ def snippet_of(src, name):
     for i, ch in enumerate(chunks):
         if ("_run(%r" % name) in ch:
             j = i
-            while j > 1 and chunks[j - 1].startswith("class "):
+            while j > 1 and (chunks[j - 1].startswith("class ") or chunks[j - 1].startswith("def _%s(" % name)):
                 j -= 1
             keep += chunks[j:i + 1]
             break
@@ -68,6 +68,19 @@ def blocks(out):
     if pending:
         res["s999999"] = "\n".join(pending)
     return res
+
+
+def find_culprit(loimi, src, names, tmp, flags):
+    path = os.path.join(tmp, "culprit.py")
+    for name in names:
+        with open(path, "w") as f:
+            f.write(snippet_of(src, name))
+        rc, out, err = run([loimi, path] + flags, timeout=10)
+        if rc != 0:
+            os.remove(path)
+            return name, "<alone: rc %s, stderr %s>" % (rc, err.strip()[-200:])
+    os.remove(path)
+    return None
 
 
 def classify(a, b):
@@ -139,6 +152,12 @@ def main():
             if b == "<missing>" and rc_l != 0:
                 kind = "crash"
                 b = "<missing: rc %s, stderr %s>" % (rc_l, err_l.strip()[-200:])
+                # Whole-program failure (a timeout loses buffered output, a
+                # SyntaxError stops everything): find the snippet alone.
+                culprit = find_culprit(loimi, src, sorted(bc, key=lambda n: int(n[1:]) if n[1:].isdigit() else 0), tmp, flags)
+                if culprit:
+                    name, b = culprit
+                    a = bc.get(name, "<missing>")
             else:
                 kind = classify(a, b)
             counts[kind] += 1
