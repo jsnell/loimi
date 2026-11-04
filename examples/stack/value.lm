@@ -1,5 +1,5 @@
 // Stak's run-time values and the GC objects they point to.
-#![lifetimes]
+
 import std.gc;
 import std.hash;
 import std.mem;

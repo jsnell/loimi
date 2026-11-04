@@ -12,7 +12,7 @@ import vm.{Ctx};
 import ops;
 import builtins;
 import builtins.{E_TYPE, E_VALUE, E_OVERFLOW};
-#![lifetimes]
+
 extern "C" fn snprintf(buf: *u8, n: u64, fmt: *u8, ...) -> i32;
 
 fn mkstr(c: *Ctx, b: *text.StrBuf) -> Value {

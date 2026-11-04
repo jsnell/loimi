@@ -10,7 +10,7 @@ import std.bigint;
 import std.bigint.{Num, Arg, Big};
 import value;
 import value.{Value, Long};
-#![lifetimes]
+
 /// An operand for std.bigint: small (an i64) or the limbs of a big int.
 fn arg(v: Value) -> Arg {
     match v {

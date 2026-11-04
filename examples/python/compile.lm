@@ -18,7 +18,7 @@ import vm;
 import vm.{Ctx, Proto, Py, P_VARARGS, P_VARKW, P_GEN};
 import ops;
 import builtins; #[cfg(debug)] import debugger;
-#![lifetimes]
+
 // ── scopes ──────────────────────────────────────────────────────────
 
 const SC_MODULE: u8 = 0;

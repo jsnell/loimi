@@ -1,7 +1,7 @@
 // The machine's memory: argument registers, the environment stack, the
 // choicepoint stack, the trail, and the term operations that need them
 // (binding, unification, comparison, copying).
-#![lifetimes]
+
 import std.gc;
 import std.mem;
 import std.text;

@@ -2,7 +2,7 @@
 //
 // Nodes live in one vector and refer to each other by index. Character
 // classes are 256-bit sets kept in a second vector.
-#![lifetimes]
+
 import std.mem;
 
 /// A set of bytes: bit c of w[c >> 6].

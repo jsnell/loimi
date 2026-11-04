@@ -20,7 +20,7 @@
 // program's (not the prelude or a builtin module written in Python),
 // frames, and locals (the compiler reports each local's register and
 // where it is first bound; values are shown without running Python code).
-#![lifetimes]
+
 import std.debug;
 import std.io;
 import std.mem;

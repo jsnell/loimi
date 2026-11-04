@@ -3,7 +3,7 @@
 // executables).
 //
 //   loimi build examples/regex/stats.lm --release --vm-stats -o rxstats && ./rxstats
-#![lifetimes]
+
 import std.io;
 import std.mem;
 import lib;

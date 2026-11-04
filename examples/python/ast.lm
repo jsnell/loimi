@@ -1,6 +1,6 @@
 // Syntax tree of the Python subset. Everything lives in one arena.
 import std.mem;
-#![lifetimes]
+
 pub enum BinOp { Add, Sub, Mul, Div, FloorDiv, Mod, Pow, LShift, RShift, BitAnd, BitOr, BitXor, MatMul }
 pub enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, In, NotIn, Is, IsNot }
 pub enum UnOp { Neg, Pos, Not, Invert }

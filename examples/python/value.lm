@@ -8,7 +8,7 @@ import std.dict;
 import std.bigint;
 import big;
 import vm.{Proto};
-#![lifetimes]
+
 /// A string: bytes plus a cached hash (0: not computed yet).
 pub object Str { hash: u64, data: [u8] }
 /// Backing store of a list.

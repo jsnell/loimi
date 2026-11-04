@@ -4,7 +4,7 @@
 // both engines.
 //
 //   loimi test examples/regex/verify_test.lm [FILTER..]
-#![lifetimes]
+
 import std.test;
 import std.text;
 import vm.{Rx, Limits};

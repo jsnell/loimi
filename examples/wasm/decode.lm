@@ -6,7 +6,7 @@
 // validator's job (compile.lm), which runs only on modules that decoded.
 import std.mem;
 import std.text;
-#![lifetimes]
+
 pub const T_I32: u8 = 0x7F;
 pub const T_I64: u8 = 0x7E;
 pub const T_F32: u8 = 0x7D;

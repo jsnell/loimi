@@ -14,7 +14,7 @@ import ops;
 import fmt;
 import builtins;
 import compile; #[cfg(debug)] import debugger;
-#![lifetimes]
+
 extern "C" fn getenv(name: *u8) -> *u8;
 extern "C" fn getrlimit(resource: i32, rlim: *u64) -> i32;
 

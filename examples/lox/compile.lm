@@ -4,7 +4,7 @@
 // register i; slot 0 is the callee, or `this` in a method. Temporaries
 // live above the active locals. A local that a closure captures holds a
 // cell from its declaration on, and is read and written through it.
-#![lifetimes]
+
 import std.bc;
 import std.mem;
 import std.text;

@@ -4,7 +4,7 @@
 // Control constructs in bodies (`;`, `->`, `\+`) become auxiliary
 // predicates; a cut inside their branches cuts the parent clause through a
 // level variable passed to the auxiliary predicate.
-#![lifetimes]
+
 import std.mem;
 import std.text;
 import std.io;

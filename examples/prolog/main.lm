@@ -3,7 +3,7 @@
 // Consults FILE (running its directives), then runs the goals of its
 // `:- initialization(G)` directives, or `main` if it has none and defines
 // main/0, or GOAL.
-#![lifetimes]
+
 import std.io;
 import std.os;
 import std.mem;

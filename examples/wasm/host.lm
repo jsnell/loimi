@@ -9,7 +9,7 @@ import vm;
 import vm.{Machine, Memory, Table, Func, Trap};
 import rt;
 import rt.{Engine, ModInst, Extern};
-#![lifetimes]
+
 extern "C" fn write(fd: i32, buf: *u8, n: u64) -> i64;
 extern "C" fn writev(fd: i32, iov: *u64, n: i32) -> i64;
 extern "C" fn clock_gettime(clk: i32, ts: *i64) -> i32;

@@ -3,7 +3,7 @@
 //   loimi build examples/mini/main.lm -o mini && ./mini script.mini
 //
 // embed.lm builds the same interpreter as a C library.
-#![lifetimes]
+
 import std.io;
 import std.os;
 import std.text;

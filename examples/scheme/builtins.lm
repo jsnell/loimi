@@ -6,7 +6,7 @@
 // natives here serve every other call, e.g. `(map car l)`.
 //
 // `apply` is handled by the VM's call path, since it calls a procedure.
-#![lifetimes]
+
 import std.gc;
 import std.io;
 import std.os;

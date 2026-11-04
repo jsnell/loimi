@@ -4,7 +4,7 @@
 // registers. Natives allocate but never collect and never call back into
 // the VM: the array methods that take callbacks (map, filter, sort, ...)
 // are written in JavaScript, in the prelude.
-#![lifetimes]
+
 import std.gc;
 import std.mem;
 import std.text;

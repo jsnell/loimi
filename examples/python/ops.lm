@@ -16,7 +16,7 @@ import vm.{Ctx, Proto, Frame, Py, P_VARARGS, P_VARKW, P_GEN};
 import builtins;
 import builtins.{E_TYPE, E_VALUE, E_INDEX, E_KEY, E_ATTRIBUTE, E_NAME, E_ZERODIV, E_STOPITER, E_UNBOUND, E_OVERFLOW, E_RUNTIME, E_NOTIMPL};
 import fmt;
-#![lifetimes]
+
 pub const O_ADD: u32 = 0;
 pub const O_SUB: u32 = 1;
 pub const O_MUL: u32 = 2;

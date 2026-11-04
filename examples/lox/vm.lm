@@ -4,7 +4,7 @@
 // registers R[base], R[base+1], ...; the callee's register window starts
 // at R[base], so its slot 0 is the callee (or `this` for a method) and its
 // parameters are already in r1..rn. The result comes back in R[base].
-#![lifetimes]
+
 import std.io;
 import std.gc;
 import std.mem;

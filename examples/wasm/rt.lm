@@ -10,7 +10,7 @@ import decode.{Module, ConstExpr, Limits, T_I32, T_I64, T_F32, T_F64, T_V128, T_
 import compile;
 import vm;
 import vm.{W, Func, Inst, Machine, Memory, Table, Frame, Trap, HostFn};
-#![lifetimes]
+
 extern "C" fn memcpy(d: *u8, s: *u8, n: u64) -> *u8;
 
 /// What an export or import refers to.

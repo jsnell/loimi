@@ -6,7 +6,7 @@ import std.text;
 import std.lex;
 import std.hash;
 import std.map;
-#![lifetimes]
+
 pub enum T {
     Eof, Newline, Indent, Dedent,
     Name, Int, BigInt, Float, Str, FStr,

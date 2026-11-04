@@ -11,7 +11,7 @@ import value.{Value, Str, Arr, List, Tuple, Dict, Inst, Func, Box, K_MODULE, K_S
               K_CLASS, K_BOUND, K_RANGEIT, K_SEQIT, K_GEN, GEN_NEW, GEN_SUSPENDED, GEN_RUNNING, GEN_DONE};
 import ops;
 import builtins; #[cfg(debug)] import debugger;
-#![lifetimes]
+
 /// A handler table entry: words [start, end) are protected; an exception
 /// raised there is stored in `reg` and execution continues at `target`.
 pub struct ExcEntry { start: u32, end: u32, target: u32, reg: u32 }

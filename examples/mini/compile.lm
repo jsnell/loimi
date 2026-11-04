@@ -8,7 +8,7 @@
 // with hooks that generate code as it goes, std.diag reports syntax
 // errors with the source line and a caret, and std.bc holds the code
 // (with jump patching and labels), the constant pool and the registers.
-#![lifetimes]
+
 import std.io;
 import std.mem;
 import std.text;

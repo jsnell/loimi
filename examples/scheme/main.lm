@@ -2,7 +2,7 @@
 //
 //   loimi build examples/scheme/main.lm --release -o scheme
 //   ./scheme program.scm          (a second argument turns on GC stress)
-#![lifetimes]
+
 import std.io;
 import std.os;
 import std.gc;

@@ -12,7 +12,7 @@
 import std.io;
 import std.mem;
 import decode;
-#![lifetimes]
+
 pub enum Trap {
     Unreachable,
     MemOOB,
