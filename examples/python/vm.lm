@@ -777,63 +777,89 @@ pub vm Py {
 
     // ── calls ───────────────────────────────────────────────────────
 
-    op CALL(base: reg, n: nargs) : ABC {
-        if let Func(f) = base {
-            if f.proto.simple == n as u32 { push_frame(f, regs + base.raw + 1, regs + base.raw, 0) }
-        }
-        if let Builtin(id) = base and id == builtins.b_len() and n == 1 {
-            match regs[base.raw + 1] {
-                List(l) => { regs[base.raw] = Int(l.len as i48); next }
-                Tuple(t) => { regs[base.raw] = Int(t.items.len as i48); next }
-                Str(s) => { regs[base.raw] = Int(s.data.len as i48); next }
-                Dict(d) => { regs[base.raw] = Int(d.len as i48); next }
-                Obj(o) => if (o.kind == value.K_SET or o.kind == value.K_FROZENSET) and let Some(d) = o.dict {
-                    regs[base.raw] = Int(d.len as i48);
+    /// CALL_NEW: a call of a class (user classes) whose __init__ takes the
+    /// arguments as they are; CALL_M1: a one-argument math function. Both
+    /// were paths of the generic op's cold block.
+    family CALL(base: reg, n: nargs) : ABC {
+        generic {
+            if let Func(f) = base {
+                if f.proto.simple == n as u32 { push_frame(f, regs + base.raw + 1, regs + base.raw, 0) }
+            }
+            if let Builtin(id) = base and id == builtins.b_len() and n == 1 {
+                match regs[base.raw + 1] {
+                    List(l) => { regs[base.raw] = Int(l.len as i48); next }
+                    Tuple(t) => { regs[base.raw] = Int(t.items.len as i48); next }
+                    Str(s) => { regs[base.raw] = Int(s.data.len as i48); next }
+                    Dict(d) => { regs[base.raw] = Int(d.len as i48); next }
+                    Obj(o) => if (o.kind == value.K_SET or o.kind == value.K_FROZENSET) and let Some(d) = o.dict {
+                        regs[base.raw] = Int(d.len as i48);
+                        next
+                    },
+                    _ => {}
+                }
+            }
+            cold {
+                // A user class whose __init__ is a function that takes the
+                // arguments as they are: the instance, then __init__'s frame
+                // (its None result goes to the self slot, so RET needs no
+                // F_DISCARD).
+                if let Obj(cl) = base and cl.kind == K_CLASS {
+                    gc_point();
+                    if cl.n == 0 and let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
+                        let w = regs + base.raw + 1;
+                        if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+                        let inst = ops.new_instance(ctx, cl);
+                        var i = n as u64;
+                        while i > 0 { w[i] = w[i - 1]; i -= 1; }
+                        w[0] = inst;
+                        regs[base.raw] = inst;
+                        if init.proto.simple == n as u32 + 1 { become CALL_NEW; }
+                        push_args(init, w, w, n as u64 + 1, 0)
+                    }
+                    // A builtin type (or a subclass of one): its constructor,
+                    // unless a generator is to be collected (call_slow).
+                    if cl.n != 0 and cl.n < 1000 and (n == 0 or !value.is_kind(regs[base.raw + 1], K_GEN)) {
+                        regs[base.raw] = builtins.construct(ctx, cl, regs + base.raw + 1, n as u64, Nil)?;
+                        next
+                    }
+                }
+                if let Func(f) = base and ops.args_fast(f, n as u64) { push_args(f, regs + base.raw + 1, regs + base.raw, n as u64, 0) }
+                // isinstance(instance, class), without the builtin call.
+                if let Builtin(id) = base and id == builtins.b_isinstance() and n == 2 and let Inst(o) = regs[base.raw + 1]
+                    and let Obj(cls) = regs[base.raw + 2] and cls.kind == K_CLASS {
+                    regs[base.raw] = Bool(ops.subclass(o.cls, cls));
                     next
-                },
-                _ => {}
+                }
+                if n == 1 and let Builtin(id) = base and let Some(r) = builtins.math1(id, regs[base.raw + 1]) { regs[base.raw] = r; become CALL_M1; next }
+                gc_point();
+                // A bound list method (`pop = l.pop; pop(0)`).
+                if let Obj(bm) = base and bm.kind == K_BOUND and let Builtin(id) = bm.b and let List(l) = bm.a
+                    and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 1, n as u64) {
+                    regs[base.raw] = r;
+                    next
+                }
+                call_slow(base.raw, base.raw + 1, n as u64, Nil)
             }
         }
-        cold {
-            // A user class whose __init__ is a function that takes the
-            // arguments as they are: the instance, then __init__'s frame
-            // (its None result goes to the self slot, so RET needs no
-            // F_DISCARD).
-            if let Obj(cl) = base and cl.kind == K_CLASS {
-                gc_point();
-                if cl.n == 0 and let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
-                    let w = regs + base.raw + 1;
-                    if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+        CALL_NEW {
+            if let Obj(cl) = base and cl.kind == K_CLASS and cl.n == 0 and cl.b == Int(ctx.epoch as i48) and let Func(init) = cl.c
+                and init.proto.simple == n as u32 + 1 and ctx.heap.allocated <= ctx.heap.threshold {
+                let w = regs + base.raw + 1;
+                if ensure(w + n as u64 + 1) {
                     let inst = ops.new_instance(ctx, cl);
                     var i = n as u64;
                     while i > 0 { w[i] = w[i - 1]; i -= 1; }
                     w[0] = inst;
                     regs[base.raw] = inst;
-                    push_args(init, w, w, n as u64 + 1, 0)
-                }
-                // A builtin type (or a subclass of one): its constructor,
-                // unless a generator is to be collected (call_slow).
-                if cl.n != 0 and cl.n < 1000 and (n == 0 or !value.is_kind(regs[base.raw + 1], K_GEN)) {
-                    regs[base.raw] = builtins.construct(ctx, cl, regs + base.raw + 1, n as u64, Nil)?;
-                    next
+                    push_frame(init, w, w, 0)
                 }
             }
-            if let Func(f) = base and ops.args_fast(f, n as u64) { push_args(f, regs + base.raw + 1, regs + base.raw, n as u64, 0) }
-            // isinstance(instance, class), without the builtin call.
-            if let Builtin(id) = base and id == builtins.b_isinstance() and n == 2 and let Inst(o) = regs[base.raw + 1]
-                and let Obj(cls) = regs[base.raw + 2] and cls.kind == K_CLASS {
-                regs[base.raw] = Bool(ops.subclass(o.cls, cls));
-                next
-            }
-            if n == 1 and let Builtin(id) = base and let Some(r) = builtins.math1(id, regs[base.raw + 1]) { regs[base.raw] = r; next }
-            gc_point();
-            // A bound list method (`pop = l.pop; pop(0)`).
-            if let Obj(bm) = base and bm.kind == K_BOUND and let Builtin(id) = bm.b and let List(l) = bm.a
-                and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 1, n as u64) {
-                regs[base.raw] = r;
-                next
-            }
-            call_slow(base.raw, base.raw + 1, n as u64, Nil)
+            cold { become CALL; redo }
+        }
+        /// math.sqrt(x) & co. imported as names (builtins.math1).
+        CALL_M1 {
+            if let Builtin(id) = base and let Some(r) = builtins.math1(id, regs[base.raw + 1]) { regs[base.raw] = r; next }
+            cold { become CALL; redo }
         }
     }
     /// Method call after LOADMETHOD: R[base] callee, R[base+1] self or
