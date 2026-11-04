@@ -600,6 +600,8 @@ fn str_format(h: *gc.Heap, args: *V, n: u64) -> Result<V, V> {
                     Ok(x) => x,
                     Err(e) => { b.free(); return Err(e); }
                 };
+                // Plain %d: no snprintf.
+                if spec.len == 2 and (conv == 'd' or conv == 'i') { b.push_int(x); continue; }
                 let flags = if conv == 'd' or conv == 'i' { "-+0 " } else if conv == 'u' { "-0" } else if conv == 'c' { "-" } else { "-#0" };
                 if !spec_ok(spec, flags, conv != 'c') { return Err(bad_spec(h, spec, &b, true)); }
                 if conv != 'c' { form[fl] = 'l'; form[fl + 1] = 'l'; fl += 2; }
