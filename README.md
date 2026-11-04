@@ -111,14 +111,14 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 
 | Example | What it is | Headline |
 |---|---|---|
-| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.54× PUC-Lua 5.4, 0.85× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks; coroutines 0.41× PUC-Lua ([log](bench/mini/RESULTS.md)) |
-| [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.52× V8's interpreter (`node --jitless`), 0.40× QuickJS |
-| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.26× Gauche, 0.46× Guile 3 without JIT, 0.97× Guile with its JIT ([notes](bench/scheme/README.md)) |
-| [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.45× clox |
+| [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.52× PUC-Lua 5.4, 0.82× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks; coroutines 0.37× PUC-Lua ([log](bench/mini/RESULTS.md)) |
+| [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.50× V8's interpreter (`node --jitless`), 0.39× QuickJS |
+| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.25× Gauche, 0.45× Guile 3 without JIT, 0.94× Guile with its JIT ([notes](bench/scheme/README.md)) |
+| [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.44× clox |
 | [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
-| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.87× wasm3 |
-| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.39× CPython 3.13, 0.18× MicroPython (at 0.52× CPython) ([report](examples/python/FRICTION.md)) |
+| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.87× wasm3 on seven programs, 0.90× on 30 held-out PolyBench/C kernels |
+| [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.37× CPython 3.13, 0.13× MicroPython ([report](examples/python/FRICTION.md)) |
 | [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.53× SWI-Prolog 10 (`-O`), 0.13× Trealla ([report](examples/prolog/FRICTION.md)) |
 
 Lox, regex, stack, wasm, python and prolog were written by agents that read only
