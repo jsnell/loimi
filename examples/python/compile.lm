@@ -1471,6 +1471,49 @@ fn C.call(c: *C, f: *Expr, args: *mem.Vec<Arg>, dst: u32) {
         kwk = c.k8(Value.Tuple(value.tuple_of(&c.u.c.heap, names.items()))) as u32;
         names.free();
     }
+    if nkw == 0 and let Attr(o, mname) = f.e and let Call(sf, sargs) = o.e and let Name(sn) = sf.e
+        and sn.eq("super") and c.is_global("super") and (sargs.len == 2 or (sargs.len == 0 and c.has_params)) {
+        // super(C, self).m(..) and super().m(..): SUPERMETHOD, no super object.
+        var plain = true;
+        for i in 0..sargs.len { let a = sargs.at(i); if a.star != 0 or a.name.is_some() { plain = false; } }
+        if plain {
+            let base = c.alloc(2 + n);
+            if sargs.len == 0 {
+                let selfr = c.first_param_reg;
+                if c.s.cells.contains(c.first_param_name()) { c.emit(Py.LOADCELL((base + 1) as u8, selfr as u8)); }
+                else { c.emit(Py.MOVE((base + 1) as u8, selfr as u8)); }
+                c.set_line(c.line);
+                c.emit(Py.SUPERMETHOD(base as u8, 1, c.name8(mname)));
+            } else {
+                // Only while `super` is the builtin (IS against it).
+                let m = c.regs.mark();
+                let sr = c.alloc(1);
+                c.load_name("super", sr);
+                let t = c.alloc(1);
+                c.emit(Py.LOADK(t as u8, c.k(Value.Obj(c.u.c.types[vm.T_SUPER].unwrap())) as u16));
+                c.emit(Py.IS(t as u8, sr as u8, t as u8));
+                let slow = c.code.label();
+                let join = c.code.label();
+                c.code.jump(Py.JF(t as u8, 0), slow);
+                c.regs.reset(m);
+                c.expr_to(sargs.at(0).value, base);
+                c.expr_to(sargs.at(1).value, base + 1);
+                c.set_line(c.line);
+                c.emit(Py.SUPERMETHOD(base as u8, 0, c.name8(mname)));
+                c.code.jump(Py.JMP(0), join);
+                c.code.bind(slow);
+                let ro = c.operand(o);
+                c.emit(Py.LOADMETHOD(base as u8, ro as u8, c.name8(mname)));
+                c.regs.reset(m);
+                c.code.bind(join);
+            }
+            for i in 0..args.len { c.expr_to(args.at(i).value, base + 2 + i as u32); }
+            c.set_line(c.line);
+            c.emit(Py.CALLMETHOD(base as u8, n as u8));
+            if base != dst { c.emit(Py.MOVE(d, base as u8)); }
+            return;
+        }
+    }
     if let Attr(o, mname) = f.e {
         let base = c.alloc(2 + n);
         let ro = c.operand(o);

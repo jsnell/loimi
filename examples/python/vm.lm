@@ -252,6 +252,10 @@ pub vm Py {
     /// `idx`.
     cache MethIC { cls: u32, epoch: u32, idx: u32, fnv: u64, cls2: u32, fnv2: u64, cls3: u32, fnv3: u64, cls4: u32, fnv4: u64 }
 
+    /// SUPERMETHOD: the method (its bits, ops.method_value) found from
+    /// class id `cls` (the class super() starts after) at class epoch `epoch`.
+    cache SupIC { cls: u32, epoch: u32, fnv: u64 }
+
     sync { ctx.fp = fp; #[cfg(debug)] fp.at = pc; } // --cfg debug: where a frame calling a native is (backtraces)
     reload { fp = ctx.fp; regs = fp.base; k = fp.k; #[cfg(debug)] if debugger.stepping() { use_variant step; } } // --cfg debug: the native ran Python code that steps
 
@@ -733,6 +737,29 @@ pub vm Py {
         }
     }
 
+    /// `super(R[base], R[base+1]).name` (z = 0), or `super().name` in a
+    /// method with self in R[base+1] (z = 1: the class is the function's
+    /// owner), for a method call: R[base] = the method and R[base+1] self,
+    /// as LOADMETHOD leaves them, without making the super object.
+    op SUPERMETHOD(base: reg, z: imm, name: kst) : ABC + SupIC {
+        var kv = base;
+        if z != 0 { kv = Nil; if let Func(f) = fp.func and let Some(o) = f.owner { kv = Obj(o); } }
+        if let Obj(k) = kv and k.id == cache.cls and ctx.epoch == cache.epoch and k.kind == K_CLASS {
+            regs[base.raw] = ops.method_value(cache.fnv);
+            next
+        }
+        cold {
+            gc_point();
+            let Str(s) = name else { trap() };
+            var f = cache.fnv;
+            let (m, sv) = ops.super_method(ctx, kv, regs[base.raw + 1], s, &cache.cls, &cache.epoch, &f)?;
+            cache.fnv = f;
+            regs[base.raw] = m;
+            regs[base.raw + 1] = sv;
+            next
+        }
+    }
+
     // ── calls ───────────────────────────────────────────────────────
 
     op CALL(base: reg, n: nargs) : ABC {
@@ -757,9 +784,9 @@ pub vm Py {
             // arguments as they are: the instance, then __init__'s frame
             // (its None result goes to the self slot, so RET needs no
             // F_DISCARD).
-            if let Obj(cl) = base and cl.kind == K_CLASS and cl.n == 0 {
+            if let Obj(cl) = base and cl.kind == K_CLASS {
                 gc_point();
-                if let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
+                if cl.n == 0 and let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
                     let w = regs + base.raw + 1;
                     if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                     let inst = ops.new_instance(ctx, cl);
@@ -768,6 +795,12 @@ pub vm Py {
                     w[0] = inst;
                     regs[base.raw] = inst;
                     push_args(init, w, w, n as u64 + 1, 0)
+                }
+                // A builtin type (or a subclass of one): its constructor,
+                // unless a generator is to be collected (call_slow).
+                if cl.n != 0 and cl.n < 1000 and (n == 0 or !value.is_kind(regs[base.raw + 1], K_GEN)) {
+                    regs[base.raw] = builtins.construct(ctx, cl, regs + base.raw + 1, n as u64, Nil)?;
+                    next
                 }
             }
             if let Func(f) = base and ops.args_fast(f, n as u64) { push_args(f, regs + base.raw + 1, regs + base.raw, n as u64, 0) }
@@ -806,6 +839,9 @@ pub vm Py {
             }
             cold {
                 if let Func(fn_) = f and ops.args_fast(fn_, n as u64 + 1) { push_args(fn_, regs + base.raw + 1, regs + base.raw, n as u64 + 1, 0) }
+                // object.__init__(self) (super().__init__() in a class
+                // without other bases) does nothing.
+                if n == 0 and let Builtin(id) = f and id == builtins.b_object_init() { regs[base.raw] = Nil; next }
                 gc_point();
                 if let Builtin(id) = f and let List(l) = s and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 2, n as u64) {
                     regs[base.raw] = r;

@@ -1179,6 +1179,36 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> 
     Ok(Value.Obj(cls))
 }
 
+/// SUPERMETHOD's slow path: `super(kv, selfv).name` for a method call,
+/// (callable, self or Undef) as loadmethod gives them. A function or
+/// builtin found on the class chain after `kv` fills the cache
+/// (vm.SupIC): it depends only on the class and the class epoch. `kv` is
+/// Nil for a zero-argument super() outside a method.
+pub fn super_method(c: *Ctx, kv: Value, selfv: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cfn: *u64)
+    -> Result<(Value, Value), Value> uses reenter {
+    if kv == Value.Nil { return Err(exc(c, E_RUNTIME, "super(): no arguments")); }
+    let Obj(k) = kv else { return Err(exc(c, E_TYPE, "super() argument 1 must be a type")); };
+    if k.kind == K_CLASS and let Some(cls) = k.base and let Some(v) = class_lookup(cls, name) {
+        var plain = false;
+        if let Func(_) = v { plain = true; }
+        if let Builtin(_) = v { plain = true; }
+        if plain {
+            *ccls = k.id;
+            *cepoch = c.epoch;
+            *cfn = v as u64;
+            return Ok((v, selfv));
+        }
+    }
+    let b = value.new_box(&c.heap, K_SUPER, 0);
+    b.a = selfv;
+    b.base = Some(k);
+    var ic: u32 = 0;
+    var ie: u32 = 0;
+    var ix: u32 = 0;
+    var f: u64 = 0;
+    loadmethod(c, Value.Obj(b), name, &ic, &ie, &ix, &f)
+}
+
 pub fn make_super(c: *Ctx, func: Value, selfv: Value) -> Result<Value, Value> {
     let Func(f) = func else { trap() };
     let Some(owner) = f.owner else { return Err(exc(c, E_RUNTIME, "super(): no arguments")); };
