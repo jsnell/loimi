@@ -1,0 +1,5 @@
+// `#[shrinks(p)]` names a parameter of the function.
+#[shrinks(t)]
+fn f(s: []u8) {}
+fn main() {}
+// error: `#[shrinks(t)]`: no parameter `t`

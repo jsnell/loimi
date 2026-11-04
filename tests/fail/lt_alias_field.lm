@@ -1,0 +1,19 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 2): exclusivity
+// through a container. `sum_then_log` holds a slice of `xs` while it
+// grows `c.log`; the caller passes `&c.log` as `xs`, so `c` holds it.
+// The pair is inferred through `note`, which `sum_then_log` calls.
+#![safe]
+import std.mem;
+struct Ctx { log: mem.Vec<u64>, n: u64 }
+fn note(c: *Ctx, x: u64) { c.log.push(x); }
+fn sum_then_log(c: *Ctx, xs: *mem.Vec<u64>) -> u64 {
+    let s = xs.items();
+    note(c, 1);
+    s[0]
+}
+fn main() {
+    var c = Ctx { log: mem.Vec.new(), n: 0 };
+    c.log.push(5);
+    let x = sum_then_log(&c, &c.log);
+}
+// error: this argument may alias argument 1

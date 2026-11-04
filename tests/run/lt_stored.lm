@@ -1,0 +1,99 @@
+// Lifetimes (docs/design/lifetimes.md section 5): what the rules on
+// stored pointers (error 5), exclusivity at calls (error 2) and removed
+// elements (`#[shrinks]`) accept, next to tests/fail/lt_store_*.lm,
+// lt_alias_*.lm, lt_clear_slice.lm and lt_pop_ptr.lm.
+#![lifetimes]
+import std.io;
+import std.mem;
+import std.map;
+import std.text;
+
+struct Names { arena: mem.Arena, first: str, all: mem.Vec<u64>, cell: *u64 }
+
+/// Arena memory only goes away with the arena (`Arena.free`): its
+/// strings may be kept in a parameter's memory.
+fn Names.set_first(n: *Names, s: str) {
+    n.first = n.arena.str(s);
+}
+
+/// A malloc'd block that nothing moves, and an owning `Vec` handed over
+/// whole: both may be stored.
+fn Names.adopt(n: *Names, v: mem.Vec<u64>) {
+    n.cell = mem.alloc(1);
+    *n.cell = 7;
+    n.all.free();
+    n.all = v;
+}
+
+struct Lexer { text: str, pos: u64 }
+
+/// Kept in the memory it returns: the caller decides (a local here).
+fn Lexer.new(src: *text.StrBuf) -> *Lexer {
+    let l: *Lexer = mem.alloc(1);
+    l.text = src.as_str();
+    l.pos = 0;
+    l
+}
+
+/// Re-derives after growing `dst`: `f(&v, &v)` is fine.
+fn append_first(dst: *mem.Vec<u64>, src: *mem.Vec<u64>) {
+    dst.push(1);
+    dst.push(src.at(0));
+}
+
+fn main() {
+    var n = Names { arena: mem.Arena.new(), first: "", all: mem.Vec.new(), cell: 0 as *u64 };
+    n.set_first("ada");
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(3);
+    n.adopt(v);
+    io.print(n.first);
+    io.print_int((n.all.at(0) + *n.cell) as i64);
+    io.print("\n");
+
+    // A pointer into a Vec kept in a local aggregate: the check follows it.
+    var a: mem.Vec<u64> = mem.Vec.new();
+    a.push(5);
+    var view = Lexer { text: "", pos: 0 };
+    var b = text.StrBuf.new();
+    b.push_str("abc");
+    view.text = b.as_str();
+    io.print(view.text);
+    let l = Lexer.new(&b);
+    io.print(l.text);
+    io.print("\n");
+
+    // Distinct containers, and the same one to a callee that re-derives.
+    var c: mem.Vec<u64> = mem.Vec.new();
+    c.push(9);
+    append_first(&a, &c);
+    append_first(&a, &a);
+    io.print_int(a.len as i64);
+    io.print("\n");
+
+    // After `pop` or `clear`, take the slice again or keep an index.
+    let top = a.len - 1;
+    a.pop();
+    a.push(2);
+    var s = a.items();
+    io.print_int(s[top] as i64);
+    a.clear();
+    a.push(4);
+    s = a.items();
+    io.print_int(s[0] as i64);
+    io.print("\n");
+
+    // A map's value pointer, taken again after inserts.
+    var m: map.HashMap<u64, u64> = map.HashMap.new();
+    m.insert(1, 10);
+    for i in 2..50 { m.insert(i as u64, i as u64); }
+    let Some(p) = m.get_ptr(1) else { return; };
+    *p = 11;
+    io.print_int(m.get(1).unwrap() as i64);
+    io.print("\n");
+}
+// expect: ada10
+// expect: abcabc
+// expect: 5
+// expect: 24
+// expect: 11

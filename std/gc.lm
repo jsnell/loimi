@@ -1254,8 +1254,8 @@ pub fn Ephemerons<K, V>.set(t: *Ephemerons<K, V>, k: Gc<K>, v: V) {
     t.vals[i] = v;
     t.live += 1;
 }
-
 /// Remove the entry for `k`, if any.
+#[shrinks(t)]
 pub fn Ephemerons<K, V>.remove(t: *Ephemerons<K, V>, k: Gc<K>) {
     if let Some(i) = t.slot(k as u64) {
         t.keys[i] = EPH_DEL;

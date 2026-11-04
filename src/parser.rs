@@ -51,6 +51,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("safe", "modules (`#![safe]`: raw-pointer operations need `unsafe { }`)"),
     ("lifetimes", "modules (`#![lifetimes]`: pointers into containers are checked for use after the container may move or free them)"),
     ("may_alias", "functions (`#[may_alias(p)]`: argument `p` may point into memory the function moves or frees)"),
+    ("shrinks", "functions (`#[shrinks(v)]`: the function may remove elements of the container `v` points to, ending pointers into it)"),
     ("thread_local", "module-level `var`s"),
     ("require_verified", "`vm` declarations"),
     ("dispatch", "`vm` declarations"),
@@ -64,7 +65,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("scan_raw_words", "`value` types (words below 2^48 read as variants without references)"),
 ];
 /// Attributes on functions (also extern, trait and vm functions).
-pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "raw", "catch_panic", "c_const", "test", "track_caller", "may_alias"];
+pub const FN_ATTRS: &[&str] = &["inline", "cold", "unsafe", "raw", "catch_panic", "c_const", "test", "track_caller", "may_alias", "shrinks"];
 /// Attributes on `vm` declarations.
 pub const VM_ATTRS: &[&str] = &["require_verified", "dispatch"];
 

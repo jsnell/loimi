@@ -1,0 +1,17 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 5): a pointer
+// into growable memory (a `StrBuf`'s bytes, which `Vec.reserve` may
+// move) stored in a parameter's memory, which outlives the function.
+#![lifetimes]
+import std.text;
+struct Lexer { text: str, pos: u64 }
+fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
+    l.text = src.as_str();
+    l.pos = 0;
+}
+fn main() {
+    var b = text.StrBuf.new();
+    b.push_str("x = 1");
+    var l = Lexer { text: "", pos: 0 };
+    l.init(&b);
+}
+// error: stores a pointer into the block of `std.mem.Vec<u8>.ptr` (which `Vec<u8>.reserve` may move) in memory that outlives the function

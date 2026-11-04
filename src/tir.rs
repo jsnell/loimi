@@ -669,4 +669,8 @@ pub struct Program {
     /// point into memory the function moves or frees (`Vec.extend`
     /// re-derives such a slice): src/lifetimes.rs does not check them.
     pub may_alias: std::collections::HashMap<FnId, u64>,
+    /// `#[shrinks(v)]`: per function, the parameters (bit i) whose
+    /// container it may remove elements from (`Vec.clear`, `truncate`,
+    /// `pop`): src/lifetimes.rs ends pointers into what they point to.
+    pub shrinks: std::collections::HashMap<FnId, u64>,
 }

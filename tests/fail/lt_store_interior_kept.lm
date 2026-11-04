@@ -1,0 +1,15 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 5): `Vec.push`
+// keeps its argument in the Vec's buffer; the Vec is a parameter's, so a
+// pointer to an element of another Vec outlives the function.
+#![safe]
+import std.mem;
+fn remember(seen: *mem.Vec<*u64>, v: *mem.Vec<u64>) {
+    seen.push(v.ptr_at(0));
+}
+fn main() {
+    var seen: mem.Vec<*u64> = mem.Vec.new();
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    remember(&seen, &v);
+}
+// error: passes a pointer into the block of `std.mem.Vec<u64>.ptr` (which `Vec<u64>.grow_one` may move) to `Vec<*u64>.push`, which may keep it beyond the call

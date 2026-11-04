@@ -111,7 +111,7 @@ pub fn HashMap<K, V>.get_ptr(m: *HashMap<K, V>, key: K) -> ?*V {
 pub fn HashMap<K, V>.contains(m: *HashMap<K, V>, key: K) -> bool {
     m.probe(key).1
 }
-
+#[shrinks(m)]
 pub fn HashMap<K, V>.remove(m: *HashMap<K, V>, key: K) -> bool {
     let (s, found) = m.probe(key);
     if !found { return false; }
@@ -130,8 +130,8 @@ pub fn HashMap<K, V>.next(m: *HashMap<K, V>, at: *u64) -> ?*Slot<K, V> {
     }
     None
 }
-
 /// Remove every entry, keeping the table's memory.
+#[shrinks(m)]
 pub fn HashMap<K, V>.clear(m: *HashMap<K, V>) {
     if m.used == 0 { return; }
     for i in 0..m.cap { m.slot(i).state = EMPTY; }
@@ -497,8 +497,8 @@ pub fn OrderedMap<K, V>.is_live(m: *OrderedMap<K, V>, e: u64) -> bool {
 }
 
 pub fn OrderedMap<K, V>.set_value(m: *OrderedMap<K, V>, e: u64, value: V) { m.live(e).value = value; }
-
 /// Remove the live entry `e` (panics if it is not one).
+#[shrinks(m)]
 pub fn OrderedMap<K, V>.remove_at(m: *OrderedMap<K, V>, e: u64) {
     m.live(e);
     // unsafe: `e` is live (checked above), so indexed in the map's tables.
@@ -590,8 +590,8 @@ pub fn OrderedMap<K, V>.next(m: *OrderedMap<K, V>, at: *u64) -> ?*Entry<K, V> {
     }
     None
 }
-
 /// Remove every entry, keeping the memory.
+#[shrinks(m)]
 pub fn OrderedMap<K, V>.clear(m: *OrderedMap<K, V>) {
     if !is_empty_table(m.idx as u64) {
         // unsafe: `idx` holds mask + 1 four-byte slots (zero is empty).

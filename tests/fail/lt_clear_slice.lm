@@ -1,0 +1,13 @@
+// Lifetimes (docs/design/lifetimes.md section 5.2): `Vec.clear` is
+// `#[shrinks(v)]`: a slice taken before it points to removed elements.
+#![safe]
+import std.mem;
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    v.push(2);
+    let s = v.items();
+    v.clear();
+    let x = s[0];
+}
+// error: `s` may point to removed elements: the call of `Vec<u64>.clear` may have removed elements of the container it points into

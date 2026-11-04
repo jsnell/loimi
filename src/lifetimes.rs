@@ -21,14 +21,30 @@
 //!   it may move or free (`Vec.push`: `v.*.ptr.*`);
 //! - `ret`: the parameter paths its result may point into (`Vec.items`:
 //!   `v.*.ptr.*`; a result pointing nowhere known is a fresh value);
-//! - `pairs`: (i, j) when it uses argument j after moving or freeing
-//!   memory through argument i, so a call must not pass in j a pointer
-//!   into what it restructures through i (`b.push_str(b.as_str())`),
-//!   unless `#[may_alias(j)]` says the function copes (`Vec.extend`);
+//! - `pairs`: (i, block of j) when it uses a pointer into that block of
+//!   argument j's memory (its pointee, or a buffer it owns) after moving
+//!   or freeing memory through argument i, so a call must not pass
+//!   arguments for which what it restructures through i is that block:
+//!   a pointer into it (`b.push_str(b.as_str())`) or one holding it
+//!   (exclusivity: `f(&v, &v)`, `f(&c, &c.v)`), unless `#[may_alias(j)]`
+//!   says the function copes (`Vec.extend`);
 //! - `keeps`: the parameters whose pointee it may store in memory that
 //!   outlives the call (`Vec.push`'s `x`, `SourceMap.add`'s `text`), or
 //!   in fresh memory it returns (a constructor: then where the caller
-//!   puts the result decides).
+//!   puts the result decides);
+//! - `grows` and `frees`: which restructures move a block (`realloc`, or
+//!   freeing a place's old block for a new one) or free it; `shrinks`:
+//!   which remove elements (`#[shrinks(v)]` on `Vec.clear`, `truncate`,
+//!   `pop`, the maps' `remove` and `clear`), ending pointers into them
+//!   like a restructure.
+//!
+//! A struct field whose block some function moves holds *growable*
+//! memory (`Vec.ptr`, `HashMap.slots`): a pointer into it may be kept
+//! only in the function's own locals and their memory (followed here),
+//! or in fresh memory it returns (then the result points into the block
+//! for the caller); stored anywhere that outlives the function it is an
+//! error. Which fields grow is known once every summary is, so those
+//! stores are judged at the end.
 //!
 //! A call that may collect (`uses gc`, also `reenter`) invalidates
 //! pointers into GC objects other than those held by a `let` local or
@@ -147,11 +163,16 @@ struct Path {
     root: Root,
     steps: Steps,
     trunc: bool,
+    /// The block that a parameter's (or global's) place held before this
+    /// function assigned the place a new one (`m.slots = alloc(..)`):
+    /// freeing it is a restructure of the entry-time block for the
+    /// summary, but does not touch pointers into the new one.
+    old: bool,
 }
 
 impl Path {
     fn new(root: Root) -> Path {
-        Path { root, steps: Steps::new(), trunc: false }
+        Path { root, steps: Steps::new(), trunc: false, old: false }
     }
     fn push(&self, s: Step) -> Path {
         let mut p = self.clone();
@@ -184,7 +205,7 @@ fn hits(r: &Path, p: &Path) -> bool {
         // A collection: pointers into objects not held by a local.
         return p.root == Root::GcAny && !p.steps.is_empty();
     }
-    r.root == p.root && m(&r.steps, &p.steps, r.trunc, p.trunc)
+    r.root == p.root && r.old == p.old && m(&r.steps, &p.steps, r.trunc, p.trunc)
 }
 
 fn m(r: &[Step], p: &[Step], rt: bool, pt: bool) -> bool {
@@ -229,11 +250,37 @@ enum Kind {
 pub struct Summary {
     restructs: BTreeSet<Path>,
     ret: BTreeSet<Path>,
-    pairs: BTreeSet<(u32, u32)>,
+    pairs: BTreeSet<(u32, Path)>,
     /// Parameter j -> where it may be stored: parameter i's memory,
     /// `RET` (fresh memory the result points to: the caller decides) or
     /// `ELSEWHERE` (a global, a GC object, memory of unknown origin).
     keeps: BTreeMap<u32, BTreeSet<u32>>,
+    /// The restructures that may move a block: `realloc`, or freeing a
+    /// place's old block after giving it a new one (`HashMap.grow`).
+    /// Where the block hangs from a struct field, that field holds
+    /// growable memory (`Vec.ptr`), whose interior may not be stored in
+    /// memory that outlives a function.
+    grows: BTreeSet<Path>,
+    /// The restructures that free a block (`free`, not as part of a
+    /// move): with fresh memory given to the same field in the same
+    /// function, a move (`OrderedMap.resize`).
+    frees: BTreeSet<Path>,
+    /// Logical restructures (`#[shrinks(v)]`: `Vec.clear`, `pop`):
+    /// elements removed, memory kept.
+    shrinks: BTreeSet<Path>,
+}
+
+/// Which part of the summary a restructure goes to.
+#[derive(Clone, Copy, PartialEq)]
+enum RKind {
+    /// May move or free: a collection, a vm's re-entry.
+    Other,
+    /// May free.
+    Free,
+    /// May move: free or reallocate as part of replacing the block.
+    Grow,
+    /// May remove elements.
+    Shrink,
 }
 
 const ELSEWHERE: u32 = u32::MAX;
@@ -428,6 +475,26 @@ struct Fa<'a> {
     /// (callee, argument, what it points into) whose restructures are
     /// already in `out`.
     summed: FxSet<(FnId, u32, Path)>,
+    /// Struct fields (struct, field) whose block this function may move:
+    /// growable memory.
+    grown: FxSet<(u32, u32)>,
+    /// Struct fields whose block it may free, and those it gives fresh
+    /// memory (`m.idx = mem.alloc(..)`): both is a move (`OrderedMap.resize`
+    /// frees the old tables, then installs new ones).
+    freed: FxSet<(u32, u32)>,
+    fresh_fields: FxSet<(u32, u32)>,
+    /// Pointers into a struct field's block kept in memory that outlives
+    /// the function: errors if that field holds growable memory, known
+    /// once every summary is (`check`).
+    cands: Vec<Cand>,
+}
+
+/// A pointer into the block of a struct field, kept beyond the function.
+struct Cand {
+    field: (u32, u32),
+    span: Span,
+    /// The message, `{}` standing for what is kept.
+    how: String,
 }
 
 /// Local -> parameter index.
@@ -494,6 +561,8 @@ enum Why {
     Call(Option<FnId>),
     /// A call that may collect.
     Collect(Option<FnId>),
+    /// A call that may remove elements (`#[shrinks]`).
+    Shrink(Option<FnId>),
 }
 
 fn kind_of(p: &Program, t: &Ty, memo: &mut HashMap<Ty, Kind>, depth: u32) -> Kind {
@@ -585,6 +654,7 @@ impl<'a> Fa<'a> {
             Why::Text(t) => t.clone(),
             Why::Call(id) => name(id),
             Why::Collect(id) => format!("{} (which may collect)", name(id)),
+            Why::Shrink(id) => name(id),
         };
         (*s, t)
     }
@@ -630,6 +700,11 @@ impl<'a> Fa<'a> {
     fn use_local(&mut self, l: LocalId, span: Span, st: &St) {
         if let Some(&w) = st.stale.get(&l) {
             let (ws, what) = self.why_text(w);
+            if matches!(self.whys[w as usize].1, Why::Shrink(_)) {
+                let msg = format!("{} may point to removed elements: {} may have removed elements of the container it points into", self.local_name(l), what);
+                self.error(span, msg, vec![(ws, format!("{} may remove them here; take the pointer or slice again after this call, or keep an index", what))]);
+                return self.use_cst(l, st);
+            }
             let msg = format!("{} may dangle: it points into memory that {} may have moved or freed", self.local_name(l), what);
             self.error(
                 span,
@@ -637,8 +712,26 @@ impl<'a> Fa<'a> {
                 vec![(ws, format!("{} may move or free it here; take the pointer or slice again after this call, or keep an index", what))],
             );
         }
-        if let Some(ps) = st.cst.get(&l) {
-            self.out.pairs.extend(ps.iter().cloned());
+        self.use_cst(l, st);
+    }
+
+    /// `l` is used: what it points into of parameter j's memory, after a
+    /// restructure through parameter i, goes to the summary's `pairs`.
+    fn use_cst(&mut self, l: LocalId, st: &St) {
+        let Some(ps) = st.cst.get(&l) else { return };
+        let Some(vs) = st.vals.get(&l) else { return };
+        for &(i, j) in ps.iter() {
+            for p in vs.iter() {
+                if let Root::Local(pl) = p.root {
+                    if self.param_idx.get(&pl) == Some(&j) {
+                        if let Some(q) = pair_block(p, j) {
+                            if !self.out.pairs.contains(&(i, q.clone())) {
+                                self.out.pairs.insert((i, q));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -721,7 +814,7 @@ impl<'a> Fa<'a> {
     /// Move or free the memory at each of `rs`: what points into it may
     /// dangle. One pass over the state for all of them (a call's summary
     /// may name hundreds of blocks).
-    fn restructure(&mut self, rs: &[Path], w: u32, st: &mut St, summarize: bool) {
+    fn restructure(&mut self, rs: &[Path], w: u32, st: &mut St, summarize: Option<RKind>) {
         if rs.is_empty() {
             return;
         }
@@ -782,31 +875,93 @@ impl<'a> Fa<'a> {
                 Rc::make_mut(&mut st.stale_places).insert(pl, w);
             }
         }
-        if summarize {
+        if let Some(k) = summarize {
             for r in rs {
-                self.summarize(r);
+                let k = self.moved(r, k);
+                self.summarize(r, k);
             }
         }
     }
 
     /// The summary: restructures through parameters and globals.
-    fn summarize(&mut self, r: &Path) {
-        match r.root {
-            Root::Local(l) if r.has_deref() => {
-                if let Some(&i) = self.param_idx.get(&l) {
+    fn summarize(&mut self, r: &Path, k: RKind) {
+        let q = match r.root {
+            Root::Local(l) if r.has_deref() => match self.param_idx.get(&l) {
+                Some(&i) => {
                     let mut q = r.clone();
                     q.root = Root::Param(i);
-                    if !self.out.restructs.contains(&q) {
-                        self.out.restructs.insert(q);
-                    }
+                    q
+                }
+                None => return,
+            },
+            Root::Global(_) => r.clone(),
+            _ => return,
+        };
+        let mut q = q;
+        q.old = false;
+        let set = match k {
+            RKind::Shrink => &mut self.out.shrinks,
+            _ => &mut self.out.restructs,
+        };
+        if !set.contains(&q) {
+            set.insert(q.clone());
+        }
+        if k == RKind::Grow && !self.out.grows.contains(&q) {
+            self.out.grows.insert(q);
+        } else if k == RKind::Free && !self.out.frees.contains(&q) {
+            self.out.frees.insert(q);
+        }
+    }
+
+    /// Block `r` is restructured (kind `k`): freeing a place's old block
+    /// is a move. A block that moves and hangs from a struct field makes
+    /// that field growable.
+    fn moved(&mut self, r: &Path, k: RKind) -> RKind {
+        let k = if k == RKind::Free && r.old { RKind::Grow } else { k };
+        match k {
+            RKind::Grow => {
+                if let Some(f) = self.field_of(r) {
+                    self.grown.insert(f);
                 }
             }
-            Root::Global(_) => {
-                if !self.out.restructs.contains(r) {
-                    self.out.restructs.insert(r.clone());
+            RKind::Free => {
+                if let Some(f) = self.field_of(r) {
+                    self.freed.insert(f);
                 }
             }
-            _ => {}
+            RKind::Shrink | RKind::Other => {}
+        }
+        k
+    }
+
+    /// The struct field (struct, field) whose block `q` points into: the
+    /// field read just before its last dereference (`v.ptr.*`, also
+    /// `v.ptr.*.f`), typed from `q`'s root. None for a path cut at the
+    /// depth bound, one into an aggregate's buffers read whole (`AnyD`),
+    /// or a root without a type (any GC object, fresh memory).
+    fn field_of(&self, q: &Path) -> Option<(u32, u32)> {
+        if q.trunc {
+            return None;
+        }
+        let last = q.steps.iter().rposition(is_d)?;
+        if last == 0 || q.steps[last] != Step::D {
+            return None;
+        }
+        let Step::F(k) = q.steps[last - 1] else { return None };
+        let mut t: &Ty = match q.root {
+            Root::Local(l) | Root::GcLocal(l) => &self.f.locals[l as usize].ty,
+            Root::Global(g) => &self.p.globals[g as usize].ty,
+            _ => return None,
+        };
+        for s in &q.steps[..last - 1] {
+            t = step_ty(self.p, t, *s)?;
+        }
+        if let Ty::Gc(i) = t {
+            t = i;
+        }
+        match t {
+            Ty::Struct(sid) if k != TRAIL => Some((*sid, k)),
+            _ => None,
         }
     }
 
@@ -857,10 +1012,10 @@ impl<'a> Fa<'a> {
     }
 
     /// `v` is stored at places `ps` (memory): record what may escape.
-    fn store(&mut self, v: &Val, ps: &[Path], span: Span, st: &mut St) {
+    fn store(&mut self, v: &Val, t: &Ty, ps: &[Path], span: Span, st: &mut St) {
         let ps: Vec<Path> = if ps.is_empty() { vec![Path::new(Root::GcAny)] } else { ps.to_vec() };
         for q in v {
-            if self.storage_local(q).is_none() && self.param_pointee(q).is_none() {
+            if !self.tracked(q, t) {
                 continue;
             }
             for pl in &ps {
@@ -885,10 +1040,57 @@ impl<'a> Fa<'a> {
         }
     }
 
+    /// Whether storing pointer `q` in memory is followed: the address of
+    /// a local, a parameter's pointee (summary `keeps`), or a pointer into
+    /// the block of a struct field (growable or not: known at the end).
+    fn tracked(&self, q: &Path, t: &Ty) -> bool {
+        self.storage_local(q).is_some() || self.param_pointee(q).is_some() || self.field_of(q).is_some_and(|f| self.fits(f, t))
+    }
+
+    /// Whether a value of type `t` may point into the block of struct
+    /// field `f`, by the types: a `*R` or `[]R` points at `R` values, so
+    /// only if the block's elements are `R`s, hold one inline, or are of
+    /// unknown type. A byte buffer (`Vec<u8>`, a `StrBuf`) holds bytes:
+    /// a `*ModInst` beside a `str` in a `Result` does not point into one.
+    fn fits(&self, f: (u32, u32), t: &Ty) -> bool {
+        let Some((_, ft)) = self.p.structs[f.0 as usize].fields.get(f.1 as usize) else { return true };
+        let e = match ft {
+            Ty::Ptr(e) | Ty::Slice(e) => &**e,
+            _ => return true,
+        };
+        let mut rs = Vec::new();
+        if !pointees(self.p, t, &mut rs, 0) {
+            return true;
+        }
+        rs.iter().any(|r| r == e || opaque(r) || (!opaque(e) && inline_in(self.p, e, r, 0)))
+    }
+
     /// Pointer `q` ends up in memory of kind `d` (a parameter's, or
     /// elsewhere).
     fn escape(&mut self, q: &Path, d: u32, span: Span, how: &str) {
         let d = if d == FRESH || d == PENDING { ELSEWHERE } else { d };
+        if d != FRAME {
+            if let Some(field) = self.field_of(q) {
+                if d == RET {
+                    // Kept in the fresh memory the function returns: the
+                    // result points into the block for the caller, which
+                    // judges where it goes (and when it is stale).
+                    let r = match q.root {
+                        Root::Local(l) if q.has_deref() => self.param_idx.get(&l).map(|&i| Root::Param(i)),
+                        Root::Global(g) => Some(Root::Global(g)),
+                        _ => None,
+                    };
+                    if let Some(root) = r {
+                        let mut r = q.clone();
+                        r.root = root;
+                        r.old = false;
+                        self.out.ret.insert(r);
+                    }
+                } else if self.report && !self.in_unsafe(span) {
+                    self.cands.push(Cand { field, span, how: how.to_string() });
+                }
+            }
+        }
         // `main`'s locals live as long as the program.
         if d == FRAME || self.f.symbol == "main.main" {
             return;
@@ -983,7 +1185,7 @@ impl<'a> Fa<'a> {
 
     fn report_off<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let r = self.report;
-        let out = self.out.clone();
+        let out = std::mem::take(&mut self.out);
         let summed = std::mem::take(&mut self.summed);
         self.report = false;
         let x = f(self);
@@ -994,11 +1196,32 @@ impl<'a> Fa<'a> {
     }
 
     fn bind_pat(&mut self, pat: &TPat, v: &Val, st: &mut St) {
+        self.bind_part(pat, v, st, false);
+    }
+
+    /// `part`: `pat` binds a part of the value (a variant's payload, a
+    /// tuple's field), whose paths are the whole value's: what the part's
+    /// type cannot point into is dropped (`Ok(mi)` of a `Result<*ModInst,
+    /// Error>` whose error message points into a `StrBuf`).
+    fn bind_part(&mut self, pat: &TPat, v: &Val, st: &mut St, part: bool) {
         match &pat.kind {
-            TPK::Bind(l) => self.assign_local(*l, v.clone(), st),
-            TPK::Variant(_, ps) | TPK::Tuple(ps) | TPK::Or(ps) => {
+            TPK::Bind(l) => {
+                let t = &self.f.locals[*l as usize].ty;
+                let v = if part && v.iter().any(|q| self.field_of(q).is_some_and(|f| !self.fits(f, t))) {
+                    v.iter().filter(|q| self.field_of(q).is_none_or(|f| self.fits(f, t))).cloned().collect()
+                } else {
+                    v.clone()
+                };
+                self.assign_local(*l, v, st)
+            }
+            TPK::Variant(_, ps) | TPK::Tuple(ps) => {
                 for q in ps {
-                    self.bind_pat(q, v, st);
+                    self.bind_part(q, v, st, true);
+                }
+            }
+            TPK::Or(ps) => {
+                for q in ps {
+                    self.bind_part(q, v, st, part);
                 }
             }
             _ => {}
@@ -1041,53 +1264,84 @@ impl<'a> Fa<'a> {
                     fresh.push(f);
                 }
                 let fresh_globals = self.summed.insert((id, u32::MAX, Path::new(Root::GcAny)));
-                let mut rsub: Vec<(Option<u32>, Path)> = Vec::new();
-                for r in &s.restructs {
+                let mut rsub: Vec<(Option<u32>, Path, RKind)> = Vec::new();
+                for (r, k) in s.restructs.iter().map(|r| (r, RKind::Other)).chain(s.shrinks.iter().map(|r| (r, RKind::Shrink))) {
+                    let k = if k != RKind::Other {
+                        k
+                    } else if !s.grows.is_empty() && s.grows.contains(r) {
+                        RKind::Grow
+                    } else if !s.frees.is_empty() && s.frees.contains(r) {
+                        RKind::Free
+                    } else {
+                        k
+                    };
                     match r.root {
                         Root::Param(i) => {
                             let Some(pos) = r.steps.iter().position(is_d) else { continue };
                             let Some(a) = vals.get(i as usize) else { continue };
-                            for (k, t) in a.iter().enumerate() {
+                            for (n, t) in a.iter().enumerate() {
                                 let q = subst_one(r, pos, t);
-                                if fresh[i as usize][k] {
-                                    self.summarize(&q);
+                                let k = self.moved(&q, k);
+                                if fresh[i as usize][n] {
+                                    self.summarize(&q, k);
                                 }
-                                rsub.push((Some(i), q));
+                                rsub.push((Some(i), q, k));
                             }
                         }
                         Root::Global(_) | Root::GcAny => {
+                            let k = self.moved(r, k);
                             if fresh_globals {
-                                self.summarize(r);
+                                self.summarize(r, k);
                             }
-                            rsub.push((None, r.clone()));
+                            rsub.push((None, r.clone(), k));
                         }
                         _ => {}
                     }
                 }
-                // Arguments into what the callee moves through another.
-                for &(i, j) in &s.pairs {
+                // Arguments into what the callee moves through another,
+                // or (exclusivity) holding it, `f(&v, &v)`: the callee
+                // uses what it took through argument j (`jp`) after a
+                // restructure through argument i.
+                for (i, jp) in &s.pairs {
+                    let (i, Root::Param(j)) = (*i, jp.root) else { continue };
                     if j < 64 && may_alias & (1 << j) != 0 {
                         continue;
                     }
-                    for (_, rr) in rsub.iter().filter(|(k, _)| *k == Some(i)) {
-                        {
-                            if vals[j as usize].iter().any(|p| hits(rr, p)) {
-                                let msg = format!(
-                                    "this argument points into memory that {} may move or free (through argument {}) while it still uses this one",
-                                    name(),
-                                    i + 1
-                                );
-                                self.error(args[j as usize].span, msg, vec![(e.span, "pass a copy, or an index; or make the callee re-derive the pointer after it grows (see `Vec.extend`, `#[may_alias]`)".into())]);
-                            }
+                    let Some(vj) = vals.get(j as usize) else { continue };
+                    let targets = self.subst(jp, &vals);
+                    for (_, rr, _) in rsub.iter().filter(|(k, _, _)| *k == Some(i)) {
+                        if !targets.iter().any(|t| hits(rr, t)) {
+                            continue;
+                        }
+                        if vj.iter().any(|p| hits(rr, p)) {
+                            let msg = format!(
+                                "this argument points into memory that {} may move or free (through argument {}) while it still uses this one",
+                                name(),
+                                i + 1
+                            );
+                            self.error(args[j as usize].span, msg, vec![(e.span, "pass a copy, or an index; or make the callee re-derive the pointer after it grows (see `Vec.extend`, `#[may_alias]`)".into())]);
+                        } else {
+                            let msg = format!(
+                                "this argument may alias argument {}: {} may move or free memory through argument {} while it still uses a pointer it took through this one",
+                                i + 1,
+                                name(),
+                                i + 1
+                            );
+                            self.error(args[j as usize].span, msg, vec![(e.span, "pass distinct containers; or make the callee take the pointer again after it moves the memory (and mark the parameter `#[may_alias]`)".into())]);
                         }
                     }
                     // Propagate: both arguments are this function's parameters.
                     let pi: BTreeSet<u32> = vals[i as usize].iter().filter_map(|p| if let Root::Local(l) = p.root { self.param_idx.get(&l).copied() } else { None }).collect();
-                    let pj: BTreeSet<u32> = vals[j as usize].iter().filter_map(|p| if let Root::Local(l) = p.root { self.param_idx.get(&l).copied() } else { None }).collect();
-                    for a in &pi {
-                        for b in &pj {
-                            if a != b {
-                                self.out.pairs.insert((*a, *b));
+                    if pi.is_empty() {
+                        continue;
+                    }
+                    for t in targets {
+                        let Root::Local(l) = t.root else { continue };
+                        let Some(&b) = self.param_idx.get(&l) else { continue };
+                        let Some(q) = pair_block(&t, b) else { continue };
+                        for &a in &pi {
+                            if a != b && !self.out.pairs.contains(&(a, q.clone())) {
+                                self.out.pairs.insert((a, q.clone()));
                             }
                         }
                     }
@@ -1123,7 +1377,7 @@ impl<'a> Fa<'a> {
                     let how = format!("passes {{}} to {}, which may keep it beyond the call", name());
                     let span = args[j as usize].span;
                     for q in v.clone() {
-                        if self.storage_local(&q).is_none() && self.param_pointee(&q).is_none() {
+                        if !self.tracked(&q, &args[j as usize].ty) {
                             continue;
                         }
                         for &d in &dests {
@@ -1140,9 +1394,17 @@ impl<'a> Fa<'a> {
                     }
                 }
                 if !rsub.is_empty() {
-                    let rs: Vec<Path> = rsub.into_iter().map(|(_, q)| q).collect();
-                    let w = self.why(e.span, Why::Call(callee));
-                    self.restructure(&rs, w, st, false);
+                    let (shr, mv): (Vec<_>, Vec<_>) = rsub.into_iter().partition(|(_, _, k)| *k == RKind::Shrink);
+                    if !mv.is_empty() {
+                        let rs: Vec<Path> = mv.into_iter().map(|(_, q, _)| q).collect();
+                        let w = self.why(e.span, Why::Call(callee));
+                        self.restructure(&rs, w, st, None);
+                    }
+                    if !shr.is_empty() {
+                        let rs: Vec<Path> = shr.into_iter().map(|(_, q, _)| q).collect();
+                        let w = self.why(e.span, Why::Shrink(callee));
+                        self.restructure(&rs, w, st, None);
+                    }
                 }
                 for r in &s.ret {
                     res.extend(self.subst(r, &vals));
@@ -1156,7 +1418,8 @@ impl<'a> Fa<'a> {
                 if matches!(fd.name.as_str(), "free" | "realloc") && !vals.is_empty() {
                     let w = self.why(e.span, Why::Call(callee));
                     let rs: Vec<Path> = vals[0].iter().cloned().collect();
-                    self.restructure(&rs, w, st, true);
+                    let k = if fd.name == "realloc" { RKind::Grow } else { RKind::Free };
+                    self.restructure(&rs, w, st, Some(k));
                 }
                 if fd.name != "realloc" && self.kind(&e.ty) != Kind::None {
                     for (a, v) in args.iter().zip(&vals) {
@@ -1183,7 +1446,7 @@ impl<'a> Fa<'a> {
         }
         if may_collect(self.p, f) {
             let w = self.why(e.span, Why::Collect(callee));
-            self.restructure(&[Path { root: Root::GcAny, steps: Steps::new(), trunc: true }], w, st, true);
+            self.restructure(&[Path { root: Root::GcAny, steps: Steps::new(), trunc: true, old: false }], w, st, Some(RKind::Other));
         }
         if self.kind(&e.ty) == Kind::Gc {
             return [Path::new(Root::GcAny)].into_iter().collect();
@@ -1472,7 +1735,14 @@ impl<'a> Fa<'a> {
                             // The old value at the place is overwritten.
                             // (Fresh blocks share a root: never taken as overwritten.)
                             retain_set(&mut st.esc, |(pl, _, _)| pl.root == Root::Fresh || !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
-                            self.store(&v, &ps, r.span, st);
+                            self.store(&v, &r.ty, &ps, r.span, st);
+                            if v.iter().any(|q| q.root == Root::Fresh) {
+                                for p in &ps {
+                                    if let Some(f) = self.field_of(&p.push(Step::D)) {
+                                        self.fresh_fields.insert(f);
+                                    }
+                                }
+                            }
                         }
                         // What the call's result keeps goes where the result goes.
                         for (q, span, how) in pending {
@@ -1492,10 +1762,28 @@ impl<'a> Fa<'a> {
                         // The old value at the place is gone: what pointed
                         // into its buffers points into a detached block.
                         if self.kind(&l.ty) != Kind::None {
-                            let det = |q: &Path| ps.iter().any(|p| q.root == p.root && q.steps.len() > p.steps.len() && q.steps.starts_with(&p.steps) && is_d(&q.steps[p.steps.len()]));
+                            let det = |q: &Path| !q.old && ps.iter().any(|p| q.root == p.root && q.steps.len() > p.steps.len() && q.steps.starts_with(&p.steps) && is_d(&q.steps[p.steps.len()]));
                             let hit: Vec<LocalId> = st.vals.iter().filter(|(_, vs)| vs.iter().any(det)).map(|(x, _)| *x).collect();
+                            // The old block of a parameter's or a global's
+                            // place is the caller's: freeing it later
+                            // (`HashMap.grow`'s `release(old)`) is still a
+                            // restructure for the summary.
+                            let callers = |q: &Path| match q.root {
+                                Root::Local(l) => self.param_idx.contains_key(&l) && q.steps.first() == Some(&Step::D),
+                                Root::Global(_) => true,
+                                _ => false,
+                            };
                             for x in hit {
-                                Rc::make_mut(Rc::make_mut(&mut st.vals).get_mut(&x).unwrap()).retain(|q| !det(q));
+                                let vs = Rc::make_mut(Rc::make_mut(&mut st.vals).get_mut(&x).unwrap());
+                                let moved: Vec<Path> = vs.iter().filter(|q| det(q)).cloned().collect();
+                                for q in moved {
+                                    vs.remove(&q);
+                                    if callers(&q) {
+                                        let mut q = q;
+                                        q.old = true;
+                                        vs.insert(q);
+                                    }
+                                }
                             }
                         }
                         // A new value at the place: copies of the old one
@@ -1528,7 +1816,11 @@ impl<'a> Fa<'a> {
                 self.eval(a, st);
                 for l in caps {
                     let v = self.read_local(*l, e.span, st);
+                    let t = &self.f.locals[*l as usize].ty;
                     for q in v {
+                        if self.storage_local(&q).is_none() && self.param_pointee(&q).is_none() && !self.tracked(&q, t) {
+                            continue;
+                        }
                         self.escape(&q, ELSEWHERE, e.span, "an escaping closure captures {}, which may outlive it");
                     }
                 }
@@ -1580,7 +1872,7 @@ impl<'a> Fa<'a> {
                         targets.insert(Path::new(Root::Local(l)).push(Step::D));
                     }
                     let rs: Vec<Path> = targets.into_iter().collect();
-                    self.restructure(&rs, w, st, true);
+                    self.restructure(&rs, w, st, Some(RKind::Other));
                     // `reload` itself sets them again.
                     self.eval(reload, st);
                 }
@@ -1694,6 +1986,42 @@ fn inline_in(p: &Program, t: &Ty, r: &Ty, depth: u32) -> bool {
     }
 }
 
+/// For the summary's `pairs`: the block that `p`, a pointer into
+/// parameter j's memory, points into (the offset in it does not matter
+/// to what moves it): the parameter's pointee or a buffer it owns
+/// (`v.*.ptr.*`), at most two dereferences down. None otherwise: deeper
+/// blocks are reached through pointers stored in memory (hole 1; a
+/// recursive tree walker would list every combination of child fields),
+/// and paths cut at the depth bound are dropped as cut restructures are.
+fn pair_block(p: &Path, j: u32) -> Option<Path> {
+    if p.trunc || p.steps.iter().filter(|s| is_d(s)).count() > 2 {
+        return None;
+    }
+    let last = p.steps.iter().rposition(is_d)?;
+    let mut q = Path::new(Root::Param(j));
+    q.steps.extend_from_slice(&p.steps[..last + 1]);
+    Some(q)
+}
+
+/// The type reached from a value of type `t` by step `s` (None: unknown).
+fn step_ty<'t>(p: &'t Program, t: &'t Ty, s: Step) -> Option<&'t Ty> {
+    let t = match t {
+        Ty::Gc(i) if matches!(s, Step::F(_)) => &**i,
+        t => t,
+    };
+    match (s, t) {
+        (Step::F(TRAIL), Ty::Struct(sid)) => p.structs[*sid as usize].trailing.as_ref().map(|(_, x)| x),
+        (Step::F(k), Ty::Struct(sid)) => p.structs[*sid as usize].fields.get(k as usize).map(|(_, x)| x),
+        (Step::F(k), Ty::Tuple(ts)) => ts.get(k as usize),
+        (Step::D, Ty::Ptr(x) | Ty::Slice(x) | Ty::Gc(x)) => Some(&**x),
+        (Step::D, Ty::Option(o)) => match &**o {
+            Ty::Ptr(x) => Some(&**x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Parameter path `p` (its first dereference at `pos`) for an argument
 /// pointing into `t`.
 fn subst_one(p: &Path, pos: usize, t: &Path) -> Path {
@@ -1763,9 +2091,9 @@ fn analyze<'a>(
     cx: &Ctx<'a>,
     report: bool,
     audit: Option<&'a crate::diag::SourceMap>,
-) -> (Summary, Vec<Diag>, Vec<String>) {
+) -> (Summary, Report, FxSet<(u32, u32)>) {
     let f = &p.fns[fid as usize];
-    let Some(b) = &f.body else { return (Summary::default(), Vec::new(), Vec::new()) };
+    let Some(b) = &f.body else { return (Summary::default(), Report { errs: Vec::new(), lines: Vec::new(), cands: Vec::new() }, FxSet::default()) };
     let mut fa = Fa {
         p,
         fid,
@@ -1786,12 +2114,28 @@ fn analyze<'a>(
         defers: Vec::new(),
         out: Summary::default(),
         summed: FxSet::default(),
+        grown: FxSet::default(),
+        freed: FxSet::default(),
+        fresh_fields: FxSet::default(),
+        cands: Vec::new(),
         param_idx: ParamIdx::new(f),
         sink: ELSEWHERE,
         tail: tail_call(b),
         pending: Vec::new(),
     };
     let _ = fa.fid;
+    // `#[shrinks(v)]`: it may remove elements of `v`'s container (any of
+    // the buffers it owns).
+    if let Some(&bits) = p.shrinks.get(&fid) {
+        for i in 0..f.params.len().min(64) {
+            if bits & (1 << i) != 0 {
+                let mut r = Path::new(Root::Param(i as u32));
+                r.steps.push(Step::D);
+                r.steps.push(Step::AnyD);
+                fa.out.shrinks.insert(r);
+            }
+        }
+    }
     let mut st = St { reach: true, ..Default::default() };
     // Parameters and other locals not bound by a `let` or pattern (vm
     // state) start pointing at their own pointee; bound ones are assigned
@@ -1822,7 +2166,18 @@ fn analyze<'a>(
         fa.ret(&v, b.span);
         fa.exit_escapes(&st, &v);
     }
-    (fa.out, fa.errs, fa.lines)
+    for f in fa.freed.intersection(&fa.fresh_fields) {
+        fa.grown.insert(*f);
+    }
+    (fa.out, Report { errs: fa.errs, lines: fa.lines, cands: fa.cands }, fa.grown)
+}
+
+/// A checked function's findings, from its last analysis.
+struct Report {
+    errs: Vec<Diag>,
+    lines: Vec<String>,
+    cands: Vec<Cand>,
+
 }
 
 /// Summarize every function (a least fixpoint over the call graph), then
@@ -1894,36 +2249,51 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     // (a change to one queues it again), so its errors are reported from
     // that analysis rather than from one more pass.
     let checked_set: FxSet<FnId> = checked.iter().copied().collect();
-    let mut reports: FxMap<FnId, (Vec<Diag>, Vec<String>)> = FxMap::default();
+    let mut reports: FxMap<FnId, Report> = FxMap::default();
+    // Growable struct fields, and a function that may move their block.
+    let mut grown: FxMap<(u32, u32), FnId> = FxMap::default();
     let stats = std::env::var("LOIMI_LIFETIMES_STATS").is_ok();
     let mut times: FxMap<FnId, (f64, u32)> = FxMap::default();
     while let Some((_, i)) = work.pop_first() {
         rounds += 1;
         let t0 = std::time::Instant::now();
         let report = checked_set.contains(&i);
-        let (s, errs, lines) = analyze(p, i, &sums, &mut kinds, cx, report, audit);
+        let (s, r, g) = analyze(p, i, &sums, &mut kinds, cx, report, audit);
         if report {
-            reports.insert(i, (errs, lines));
+            reports.insert(i, r);
+        }
+        for f in g {
+            grown.entry(f).or_insert(i);
         }
         if stats {
             let e = times.entry(i).or_default();
             e.0 += t0.elapsed().as_secs_f64();
             e.1 += 1;
         }
-        let old = sums.get(&i).cloned().unwrap_or_default();
-        let mut merged = old.clone();
         // Restructures cut at the depth bound are dropped (section 6 of
         // the design note): deep in a chain, they cannot be told from
         // the blocks above them, and a recursive walker would list every
         // combination of child fields.
-        merged.restructs.extend(s.restructs.into_iter().filter(|r| !r.trunc));
-        merged.ret.extend(s.ret);
-        merged.pairs.extend(s.pairs);
-        for (j, d) in s.keeps {
-            merged.keeps.entry(j).or_default().extend(d);
+        let merged = sums.entry(i).or_default();
+        let mut changed = false;
+        fn add<T: Ord>(a: &mut BTreeSet<T>, b: BTreeSet<T>, keep: impl Fn(&T) -> bool, changed: &mut bool) {
+            for x in b {
+                if keep(&x) && !a.contains(&x) {
+                    a.insert(x);
+                    *changed = true;
+                }
+            }
         }
-        if merged != old {
-            sums.insert(i, merged);
+        add(&mut merged.restructs, s.restructs, |r| !r.trunc, &mut changed);
+        add(&mut merged.grows, s.grows, |r| !r.trunc, &mut changed);
+        add(&mut merged.frees, s.frees, |r| !r.trunc, &mut changed);
+        add(&mut merged.shrinks, s.shrinks, |r| !r.trunc, &mut changed);
+        add(&mut merged.ret, s.ret, |_| true, &mut changed);
+        add(&mut merged.pairs, s.pairs, |_| true, &mut changed);
+        for (j, d) in s.keeps {
+            add(merged.keeps.entry(j).or_default(), d, |_| true, &mut changed);
+        }
+        if changed {
             for &c in callers.get(&i).map(|v| v.as_slice()).unwrap_or(&[]) {
                 work.insert((order[&c], c));
             }
@@ -1942,8 +2312,39 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     if stats {
         eprintln!("lifetimes: analyses {:.1} ms, pass {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0, t_start.elapsed().as_secs_f64() * 1000.0);
     }
+    if stats {
+        eprintln!("lifetimes: {} growable fields", grown.len());
+    }
     for &i in &checked {
-        let Some((errs, lines)) = reports.remove(&i) else { continue };
+        let Some(r) = reports.remove(&i) else { continue };
+        let mut lines = r.lines;
+        let mut errs = r.errs;
+        // Pointers kept beyond a function into blocks that some function
+        // may move or free while their owner lives on.
+        let mut seen: FxSet<(u32, u32)> = FxSet::default();
+        for c in r.cands {
+            let Some(&g) = grown.get(&c.field) else { continue };
+            if !seen.insert((c.span.file, c.span.lo)) {
+                continue;
+            }
+            let sd = &p.structs[c.field.0 as usize];
+            let what = format!(
+                "a pointer into the block of `{}.{}` (which `{}` may move)",
+                sd.name,
+                sd.fields.get(c.field.1 as usize).map(|f| f.0.as_str()).unwrap_or("?"),
+                p.fns[g as usize].name
+            );
+            let msg = c.how.replace("{}", &what);
+            if let Some(sm) = audit {
+                let (l, col) = sm.line_col(c.span.file, c.span.lo);
+                lines.push(format!("lifetime-site {}:{}:{} {} ({})", sm.files[c.span.file as usize].path, l, col, msg, p.fns[i as usize].symbol));
+            } else {
+                errs.push(Diag::new(c.span, msg).note(
+                    p.fns[g as usize].span,
+                    "it may move that block (reallocate it, or free it for a new one) while its owner lives on; only locals may hold a pointer into it (the check follows them): keep an index or a key, or copy the data".to_string(),
+                ));
+            }
+        }
         for l in lines {
             eprintln!("{}", l);
         }

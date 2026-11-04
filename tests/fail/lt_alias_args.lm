@@ -1,0 +1,16 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 2): exclusivity
+// at calls. `append_first` takes a slice of `src`, grows `dst`, then
+// reads the slice: passing the same Vec as both makes the slice dangle.
+#![safe]
+import std.mem;
+fn append_first(dst: *mem.Vec<u64>, src: *mem.Vec<u64>) {
+    let s = src.items();
+    dst.push(1);
+    dst.push(s[0]);
+}
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(7);
+    append_first(&v, &v);
+}
+// error: this argument may alias argument 1: `append_first` may move or free memory through argument 1 while it still uses a pointer it took through this one

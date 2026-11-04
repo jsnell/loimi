@@ -1,0 +1,14 @@
+// Lifetimes (docs/design/lifetimes.md section 5.2): a pointer to the
+// top of a stack used after `pop` removed it. `Vec.pop` is
+// `#[shrinks(v)]`; conservatively, every pointer into the stack ends.
+#![safe]
+import std.mem;
+fn main() {
+    var stack: mem.Vec<u64> = mem.Vec.new();
+    stack.push(1);
+    stack.push(2);
+    let top = stack.ptr_at(stack.len - 1);
+    stack.pop();
+    *top = 3;
+}
+// error: `top` may point to removed elements

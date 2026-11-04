@@ -1,0 +1,13 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 5): a pointer
+// into a Vec's buffer cached in a global. Even in `main`, whose locals
+// live as long as the program: the buffer moves on the next push.
+#![safe]
+import std.mem;
+var CUR: ?*u64 = None;
+fn main() {
+    var names: mem.Vec<u64> = mem.Vec.new();
+    names.push(1);
+    CUR = Some(names.ptr_at(0));
+    names.push(2);
+}
+// error: stores a pointer into the block of `std.mem.Vec<u64>.ptr`

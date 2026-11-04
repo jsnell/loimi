@@ -1,0 +1,14 @@
+// Lifetimes (docs/design/lifetimes.md section 5.2): `OrderedMap.remove`
+// calls `remove_at` (`#[shrinks(m)]`): a value pointer from `get_ptr`
+// ends with it.
+#![safe]
+import std.map;
+fn main() {
+    var m: map.OrderedMap<u64, u64> = map.OrderedMap.new();
+    m.insert(1, 10);
+    m.insert(2, 20);
+    let Some(p) = m.get_ptr(1) else { return; };
+    m.remove(1);
+    *p = 11;
+}
+// error: `p` may point to removed elements

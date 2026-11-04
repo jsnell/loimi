@@ -1,0 +1,23 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4, error 5): a
+// constructor keeps a pointer into its argument's growable buffer in the
+// memory it returns: that is allowed (the caller decides), and the
+// result then points into the buffer for the caller, so it is stale
+// after the buffer grows.
+#![lifetimes]
+import std.io;
+import std.mem;
+import std.text;
+struct Lexer { text: str, pos: u64 }
+fn Lexer.new(src: *text.StrBuf) -> *Lexer {
+    let l: *Lexer = mem.alloc(1);
+    l.text = src.as_str();
+    l
+}
+fn main() {
+    var b = text.StrBuf.new();
+    b.push_str("x = 1");
+    let l = Lexer.new(&b);
+    b.push_str("; y = 2");
+    io.print(l.text);
+}
+// error: `l` may dangle: it points into memory that the call of `StrBuf.push_str` may have moved or freed

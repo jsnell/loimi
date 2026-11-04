@@ -1,0 +1,14 @@
+// Lifetimes (docs/design/lifetimes.md section 5.2): `HashMap.grow`
+// installs a new table, then frees the old one through a copy of the
+// field (`let old = m.slots; m.slots = ..; release(old)`): freeing the
+// place's old block still counts for `insert`'s summary.
+#![safe]
+import std.map;
+fn main() {
+    var m: map.HashMap<u64, u64> = map.HashMap.new();
+    m.insert(1, 10);
+    let Some(p) = m.get_ptr(1) else { return; };
+    for i in 2..100 { m.insert(i as u64, i as u64); }
+    *p = 11;
+}
+// error: `p` may dangle: it points into memory that the call of `HashMap<u64, u64>.insert` may have moved or freed
