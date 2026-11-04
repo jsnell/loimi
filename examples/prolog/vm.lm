@@ -87,10 +87,23 @@ pub vm Wam {
     // call), and allocations use `try_new`, whose refill is a `cold`
     // block ending in `redo`. Everything else is `cold`.
 
-    /// `v` can be bound without a trail entry, and its write barrier will
-    /// not log it (so LLVM drops the barrier's slow path: the inline
-    /// remembered-set push needs registers that GET_VAL_X would spill).
-    fn quick_bind(v: Gc<Var>) -> bool { v.stamp >= ctx.b.stamp and !gc.needs_barrier(v as *u8) }
+    /// `v` can be bound inline (`bind_now`): its write barrier will not
+    /// log it (so LLVM drops the barrier's slow path: the inline
+    /// remembered-set push needs registers that GET_VAL_X would spill),
+    /// and it needs no trail entry or the trail has room for one.
+    fn can_bind(v: Gc<Var>) -> bool {
+        !gc.needs_barrier(v as *u8) and (v.stamp >= ctx.b.stamp or ctx.tr < ctx.trail_cap)
+    }
+    /// Bind `v` (`can_bind` held), trailing it if it is older than the
+    /// newest choicepoint.
+    fn bind_now(v: Gc<Var>, t: Term) {
+        if v.stamp < ctx.b.stamp {
+            let tr = ctx.tr;
+            ctx.trail[tr] = Term.Ref(v);
+            ctx.tr = tr + 1;
+        }
+        v.val = t;
+    }
 
 
     // An unbound variable meeting a non-variable binds in place; anything
@@ -101,8 +114,8 @@ pub vm Wam {
             let x = deref(r);
             let y = deref(a);
             if x == y { next }
-            if let Ref(v) = x and !is_var(y) and quick_bind(v) { v.val = y; next }
-            if let Ref(v) = y and !is_var(x) and quick_bind(v) { v.val = x; next }
+            if let Ref(v) = x and !is_var(y) and can_bind(v) { bind_now(v, y); next }
+            if let Ref(v) = y and !is_var(x) and can_bind(v) { bind_now(v, x); next }
             cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
@@ -116,7 +129,7 @@ pub vm Wam {
             let t = deref(r);
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { v.val = value; next }
+                if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
             // Big integers are equal by value.
@@ -127,7 +140,7 @@ pub vm Wam {
         let t = deref(r);
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { v.val = Term.Int(k as i48); next }
+            if can_bind(v) { bind_now(v, Term.Int(k as i48)); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
@@ -140,9 +153,9 @@ pub vm Wam {
         }
         if let Ref(v) = t {
             let n = ctx.db.farity(f as u32) as u64;
-            if n <= 4 and quick_bind(v) {
+            if n <= 4 and can_bind(v) {
                 let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
-                v.val = Term.Str(st);
+                bind_now(v, Term.Str(st));
                 s = st.args.ptr;
                 wm = true;
                 next
@@ -171,9 +184,9 @@ pub vm Wam {
         let t = deref(r);
         if let Lst(c) = t { s = c as *Term; wm = false; next }
         if let Ref(v) = t {
-            if quick_bind(v) {
+            if can_bind(v) {
                 let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
-                v.val = Term.Lst(c);
+                bind_now(v, Term.Lst(c));
                 s = c as *Term;
                 wm = true;
                 next
@@ -222,7 +235,7 @@ pub vm Wam {
             s = s + 1;
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { v.val = value; next }
+                if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
             cold { if unify(ctx, t, value) { next } backtrack() }
@@ -234,7 +247,7 @@ pub vm Wam {
         s = s + 1;
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { v.val = Term.Int(k as i48); next }
+            if can_bind(v) { bind_now(v, Term.Int(k as i48)); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
@@ -471,7 +484,7 @@ pub vm Wam {
         if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
             let v = st.args.ptr[(i as u64) - 1];    // in bounds: checked above
             let x = deref(a);
-            if let Ref(xv) = x and quick_bind(xv) { xv.val = v; next }
+            if let Ref(xv) = x and can_bind(xv) { bind_now(xv, v); next }
             cold { if unify(ctx, x, v) { next } backtrack() }
         }
         cold {
