@@ -1,0 +1,58 @@
+True
+TypeError: '>' not supported between instances of 'G' and 'int'
+True
+TypeError: '<' not supported between instances of 'N' and 'int'
+TypeError: '<' not supported between instances of 'N' and 'int'
+TypeError: '>' not supported between instances of 'int' and 'N'
+TypeError: '<' not supported between instances of 'N' and 'N'
+TypeError: '<=' not supported between instances of 'N' and 'N'
+True
+TypeError: '<=' not supported between instances of 'G' and 'int'
+TypeError: '<' not supported between instances of 'NoneType' and 'int'
+TypeError: '<' not supported between instances of 'list' and 'tuple'
+TypeError: '<' not supported between instances of 'str' and 'int'
+TypeError: '<' not supported between instances of 'set' and 'list'
+False
+True
+True
+TypeError: '<' not supported between instances of 'str' and 'int'
+lt 1 2
+True
+lt 1 3
+TypeError: '<' not supported between instances of 'V' and 'int'
+lt 1 3
+TypeError: '>' not supported between instances of 'int' and 'V'
+W.gt 2
+from W
+lt 1 2
+True
+eq 1 1
+eq 2 3
+lt 2 3
+True
+eq 1 1
+True
+eq 1 1
+False
+eq 1 5
+True
+eq 1 5
+False
+eq 1 1
+True
+eq 1 2
+True
+gt 1 3
+gt 2 3
+3
+yes
+yes
+False
+1 False True 1 0
+A+A radd 1
+TypeError: unsupported operand type(s) for +: 'A' and 'int'
+C.radd
+TypeError: unsupported operand type(s) for +: 'B' and 'B'
+loop TypeError: unsupported operand type(s) for +: 'B' and 'int'
+loop TypeError: unsupported operand type(s) for +: 'B' and 'int'
+loop TypeError: unsupported operand type(s) for +: 'B' and 'int'

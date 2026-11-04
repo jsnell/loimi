@@ -98,7 +98,18 @@ Positional parameters, defaults (evaluated once), `*args`, keyword-only
 parameters, `**kwargs`; closures over enclosing function variables
 (cells), `nonlocal`, `global`; generators (`yield`, `send`, `close`,
 `return` ending the iteration); recursion up to the frame limit
-(4096 frames; deeper raises `RecursionError`).
+(4096 frames; deeper raises `RecursionError`). Recursion through the
+runtime (`__repr__`, `__eq__`, `__lt__`, key functions, generators
+resumed from builtins) is limited to about 180 nested calls, and the
+runtime's own recursion over nested values (`==`, `<`, `repr`, `hash`
+of lists, tuples and dicts) to 10000 levels and to the C stack (sized
+from `RLIMIT_STACK`); past them it raises `RecursionError` (CPython:
+1000 frames and 10000 C levels). Source nested deeper than 2000 levels
+(parentheses, unary operators, conditional expressions) or whose
+expression tree is deeper than 20000 (a chain such as `1 + 1 + ...` or
+`a or b or ...` with that many operators: CPython parses `or` chains
+flat) is a `SyntaxError`. The repr of a list or dict that contains
+itself prints `[...]` / `{...}`.
 
 ## Classes
 
@@ -121,10 +132,14 @@ __or__ __xor__ __matmul__` and their reflected `__r*__` forms.
 
 *Differences:* a subclass of a builtin type other than `object` and the
 exception classes (`class C(list): pass`) creates plain instances of that
-builtin type: methods it adds are not visible on them. Operator methods
-that return `NotImplemented` are honoured on the general path but not on
-the in-loop fast path (a plain-function `__add__` taking exactly two
-parameters), where `NotImplemented` is the result. `__eq__` on instances
+builtin type: methods it adds are not visible on them. Operator and
+comparison methods returning `NotImplemented` fall back to the reflected
+method and then to `TypeError` (or identity for `==`/`!=`) as in
+CPython, with one exception: the in-loop fast path (a plain-function
+`__add__` or `__lt__` taking exactly two parameters) is used for
+functions that do not name `NotImplemented`, and a `NotImplemented`
+they get elsewhere (say from another method) becomes the result.
+`__eq__` on instances
 used as dict keys is called; on keys looked up with `in` against a
 list of builtin values it is not.
 

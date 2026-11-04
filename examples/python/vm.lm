@@ -19,6 +19,10 @@ pub struct ExcEntry { start: u32, end: u32, target: u32, reg: u32 }
 pub const P_VARARGS: u32 = 1;
 pub const P_VARKW: u32 = 2;
 pub const P_GEN: u32 = 4;
+/// The function names `NotImplemented`: the vm loop does not call it as an
+/// operator method in place (ops.simple_method), whose result would be
+/// used without the reflected-operand fallback.
+pub const P_NOTIMPL: u32 = 8;
 
 pub struct Proto {
     name: str,
@@ -119,6 +123,16 @@ pub struct Ctx {
     mt: [u32; 624],
     mti: u64,
     vm_depth: u64,
+    /// Depth of the runtime's own recursion over values (repr, ==, <,
+    /// hash of nested containers): past ops.C_DEPTH_MAX it raises
+    /// RecursionError instead of overflowing the C stack.
+    c_depth: u64,
+    /// Lowest C stack address natives may recurse down to (main sets it
+    /// from the stack rlimit, keeping a reserve): ops.stack_low.
+    stack_low: u64,
+    /// Lists and dicts whose repr is being written (CPython's
+    /// Py_ReprEnter): a cycle prints as [...] / {...}.
+    repr_active: mem.Vec<u64>,
     /// Prelude functions (Python): list(g), f(list(g)), f(a, list(g)).
     pre_list: Value,
     pre_via1: Value,
@@ -1257,7 +1271,7 @@ pub fn invoke(c: *Ctx, f: Value, args: []Value) -> Result<Value, Value> uses ree
 pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_INVOKE);
     let caller = c.fp;
-    if caller + 2 >= c.frames_end or c.vm_depth > 180 {
+    if caller + 2 >= c.frames_end or c.vm_depth > 180 or ops.stack_low(c) {
         return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded"));
     }
     let f0 = top[0];
@@ -1303,7 +1317,7 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
     if g.m == GEN_DONE { return Ok(None); }
     if g.m == GEN_RUNNING { return Err(ops.exc(c, builtins.E_VALUE, "generator already executing")); }
     let caller = c.fp;
-    if caller + 2 >= c.frames_end or c.vm_depth > 180 {
+    if caller + 2 >= c.frames_end or c.vm_depth > 180 or ops.stack_low(c) {
         return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded"));
     }
     let Func(f) = g.a else { trap() };

@@ -240,14 +240,7 @@ pub fn hash_of(v: Value) -> ?u64 {
             if let Some(i) = num.to_i64_exact(f) { return Some(hash_int(i)); }
             Some(hash.mix(f.to_bits()))
         }
-        Tuple(t) => {
-            var hv: u64 = 0x345678;
-            for i in 0..t.items.len {
-                let Some(x) = hash_of(t.items[i]) else { return None; };
-                hv = (hv ^ x) *% 1000003 +% (i as u64);
-            }
-            Some(hv)
-        }
+        Tuple(t) => hash_tuple(t, 0),
         List(_) => None,
         Dict(_) => None,
         Long(b) => Some(big_hash(b)),
@@ -258,6 +251,32 @@ pub fn hash_of(v: Value) -> ?u64 {
         }
         _ => Some(hash.mix(v as u64)),
     }
+}
+
+/// Tuples nested deeper than this are unhashable (ops.hash_key raises
+/// RecursionError for them), which bounds the recursion.
+pub const HASH_DEPTH: u64 = 10000;
+
+fn hash_tuple(t: Gc<Tuple>, depth: u64) -> ?u64 {
+    if depth >= HASH_DEPTH { return None; }
+    var hv: u64 = 0x345678;
+    for i in 0..t.items.len {
+        let v = t.items[i];
+        let x = if let Tuple(u) = v { hash_tuple(u, depth + 1)? } else { hash_of(v)? };
+        hv = (hv ^ x) *% 1000003 +% (i as u64);
+    }
+    Some(hv)
+}
+
+/// Why hash_of(v) is None: Ok(the first unhashable item, v itself or an
+/// item of a tuple), Err when tuples nest past HASH_DEPTH.
+pub fn unhashable_part(v: Value, depth: u64) -> Result<?Value, ()> {
+    let Tuple(t) = v else { return Ok(if hash_of(v).is_none() { Some(v) } else { None }); };
+    if depth >= HASH_DEPTH { return Err(()); }
+    for i in 0..t.items.len {
+        if let Some(x) = unhashable_part(t.items[i], depth + 1)? { return Ok(Some(x)); }
+    }
+    Ok(None)
 }
 
 /// CPython's hash of an int (n mod 2^61 - 1, with its sign; -1 is -2).

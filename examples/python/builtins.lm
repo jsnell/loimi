@@ -433,6 +433,15 @@ fn lt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
     }
 }
 
+fn gt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
+    match (a, b) {
+        (Int(x), Int(y)) => Ok(x > y),
+        (Float(x), Float(y)) => Ok(x > y),
+        (Str(x), Str(y)) => Ok(mem.compare_bytes(x.data, y.data) > 0),
+        _ => ops.compare(c, ops.C_GT, a, b),
+    }
+}
+
 /// Stable sort of `vals` by `keys` with Python's < (`mem.try_sort_by`:
 /// the comparator may raise and may run `__lt__`). The caller keeps the
 /// keys and values reachable (tuples) while guest code runs.
@@ -490,7 +499,7 @@ fn minmax(c: *Ctx, args: *Value, n: u64, kw: Value, is_max: bool) -> Result<Valu
         let v = l.arr.items[i];
         var k = v;
         if key != Value.Nil { let a = [v]; k = vm.invoke(c, key, a[..])?; }
-        let better = if is_max { lt(c, bestk, k)? } else { lt(c, k, bestk)? };
+        let better = if is_max { gt(c, k, bestk)? } else { lt(c, k, bestk)? }; // CPython: item > best, item < best
         if better { best = v; bestk = k; }
     }
     Ok(best)

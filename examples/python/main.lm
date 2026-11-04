@@ -16,6 +16,20 @@ import builtins;
 import compile; #[cfg(debug)] import debugger;
 
 extern "C" fn getenv(name: *u8) -> *u8;
+extern "C" fn getrlimit(resource: i32, rlim: *u64) -> i32;
+
+/// The lowest address recursion in the runtime may reach: the C stack
+/// below `base` per RLIMIT_STACK (8 MB if unlimited or unknown, at most
+/// 256 MB), less a reserve for the frames between two checks.
+fn stack_floor(base: u64) -> u64 {
+    var rl: [u64; 2] = [0; 2];
+    var size: u64 = 8 << 20;
+    if getrlimit(3, &rl[0]) == 0 and rl[0] != 0xffffffffffffffff { size = rl[0]; } // RLIMIT_STACK
+    if size > (256 << 20) { size = 256 << 20; }
+    var reserve: u64 = 512 << 10;
+    if reserve > size / 2 { reserve = size / 2; }
+    base - size + reserve
+}
 
 const STACK: u64 = 1 << 20;
 const FRAMES: u64 = 4096;
@@ -53,11 +67,13 @@ fn main() -> i32 uses reenter {
         protos: mem.Vec.new(), globals: None, builtins: None, modules: None,
         types: [None; 24], excs: [None; 32], strs: map.HashMap.new(), names: mem.Arena.new(),
         epoch: 1, next_cls: 1, gen_done: false, err_line: 0, buf: text.StrBuf.new(),
-        n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0,
+        n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0, c_depth: 0, stack_low: 0, repr_active: mem.Vec.new(),
         pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil, dn: [Value.Nil; 40],
     };
     let c = ctx;
     c.stack_end = c.stack + STACK - 16;
+    var probe: u64 = 0;
+    c.stack_low = stack_floor((&probe) as u64);
     c.hw = c.stack;
     c.frames_end = c.frames + FRAMES - 4;
     c.heap.add_scanner(c as *u8, vm.scan_roots);

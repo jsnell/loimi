@@ -1,0 +1,11 @@
+eq list RecursionError
+lt list RecursionError
+eq tuple RecursionError
+eq dict RecursionError
+repr list RecursionError
+str tuple RecursionError
+repr dict RecursionError
+in RecursionError
+sorted RecursionError
+print RecursionError
+f-string RecursionError

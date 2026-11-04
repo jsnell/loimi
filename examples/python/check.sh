@@ -3,7 +3,8 @@
 # tests: each tests/NAME.py must print exactly tests/NAME.expected (CPython's
 # output, made by `check.sh -u` with bench/python/install/bin/python3 or
 # python3). Each test also runs under GC stress and, in the tail-call build,
-# under the generational verify mode and in a --gc-check-roots build.
+# under the generational verify mode and in a --gc-check-roots build
+# (except tests marked "check.sh: no --gc-stress", too slow there).
 #   check.sh            all modes
 #   check.sh -q         tail-call build only, normal and GC-stress runs (tests/golden.rs)
 #   check.sh -u         regenerate the .expected files with CPython
@@ -42,6 +43,8 @@ run() {     # run BINARY LABEL FLAGS...
     for t in "$here"/tests/*.py; do
         exp="${t%.py}.expected"
         [ -f "$exp" ] || continue
+        # Tests marked "check.sh: no --gc-stress" run without the GC modes.
+        case "$*" in *--gc-*) grep -q 'check.sh: no --gc-stress' "$t" && continue;; esac
         got=$("$bin" "$t" "$@" 2>/dev/null)
         if [ "$got" = "$(cat "$exp")" ]; then
             pass=$((pass + 1))

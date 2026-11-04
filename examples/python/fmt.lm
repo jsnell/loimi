@@ -90,7 +90,74 @@ fn write_hex_addr(b: *text.StrBuf, x: u64) {
     num.write_hex(b, x);
 }
 
+/// repr(v) appended to b. Containers count towards the native recursion
+/// limit; a list or dict already being written prints as [...] / {...}.
 pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses reenter {
+    match v {
+        List(_) | Dict(_) | Tuple(_) | Inst(_) | Obj(_) => {}
+        _ => return write_repr_(c, b, v),
+    }
+    var cyc = false;
+    match v {
+        List(_) | Dict(_) => {
+            let id = v as u64;
+            let act = &c.repr_active;
+            for i in 0..act.len {
+                if act.at(i) == id {
+                    b.push_str(if let List(_) = v { "[...]" } else { "{...}" });
+                    return Ok(());
+                }
+            }
+            cyc = true;
+        }
+        _ => {}
+    }
+    ops.enter(c, " while getting the repr of an object")?;
+    if cyc { c.repr_active.push(v as u64); }
+    // The recursion goes through small frames (write_repr_'s is large).
+    let r = match v {
+        List(_) | Tuple(_) => repr_seq(c, b, v),
+        Dict(d) => repr_dict(c, b, d),
+        _ => write_repr_(c, b, v),
+    };
+    if cyc { let _ = c.repr_active.pop(); }
+    c.c_depth -= 1;
+    r
+}
+
+#[inline(never)]
+fn repr_seq(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses reenter {
+    let tuple = if let Tuple(_) = v { true } else { false };
+    b.push(if tuple { '(' } else { '[' });
+    var i: u64 = 0;
+    while let Some(x) = value.seq_at(v, i) {
+        if i > 0 { b.push_str(", "); }
+        write_repr(c, b, x)?;
+        i += 1;
+    }
+    if tuple and i == 1 { b.push(','); }
+    b.push(if tuple { ')' } else { ']' });
+    Ok(())
+}
+
+#[inline(never)]
+fn repr_dict(c: *Ctx, b: *text.StrBuf, d: Gc<Dict>) -> Result<(), Value> uses reenter {
+    b.push('{');
+    var it: u64 = 0;
+    var first = true;
+    while let Some(e) = value.dict_next(d, &it) {
+        if !first { b.push_str(", "); }
+        first = false;
+        write_repr(c, b, value.dict_key(d, e))?;
+        b.push_str(": ");
+        write_repr(c, b, value.dict_val(d, e))?;
+    }
+    b.push('}');
+    Ok(())
+}
+
+#[inline(never)]
+fn write_repr_(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses reenter {
     match v {
         Nil => b.push_str("None"),
         Undef => b.push_str("<undefined>"),
@@ -100,37 +167,8 @@ pub fn write_repr(c: *Ctx, b: *text.StrBuf, v: Value) -> Result<(), Value> uses 
         Int(i) => b.push_int(i as i64),
         Float(f) => value.write_float(b, f),
         Str(s) => write_str_repr(b, s.data),
-        List(l) => {
-            if c.vm_depth > 150 { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
-            b.push('[');
-            for i in 0..l.len {
-                if i > 0 { b.push_str(", "); }
-                write_repr(c, b, l.arr.items[i])?;
-            }
-            b.push(']');
-        }
-        Tuple(t) => {
-            b.push('(');
-            for i in 0..t.items.len {
-                if i > 0 { b.push_str(", "); }
-                write_repr(c, b, t.items[i])?;
-            }
-            if t.items.len == 1 { b.push(','); }
-            b.push(')');
-        }
-        Dict(d) => {
-            b.push('{');
-            var it: u64 = 0;
-            var first = true;
-            while let Some(e) = value.dict_next(d, &it) {
-                if !first { b.push_str(", "); }
-                first = false;
-                write_repr(c, b, value.dict_key(d, e))?;
-                b.push_str(": ");
-                write_repr(c, b, value.dict_val(d, e))?;
-            }
-            b.push('}');
-        }
+        List(_) | Tuple(_) => return repr_seq(c, b, v),
+        Dict(d) => return repr_dict(c, b, d),
         Func(f) => { b.push_str("<function "); b.push_str(f.proto.name); b.push_str(" at "); write_hex_addr(b, f as u64); b.push('>'); }
         Builtin(_) => b.push_str("<built-in function>"),
         Inst(i) => {
