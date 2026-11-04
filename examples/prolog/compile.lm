@@ -29,8 +29,21 @@ pub struct Clause {
     /// and moves into temporaries (the head binds nothing): `guard_chain`
     /// can run them without a choicepoint. 0: not such a clause.
     guard: u64,
-    /// The guard words (unoptimized), when `guard` > 0.
+    /// The guard words (unoptimized), when `guard` or `eguard` > 0.
     gwords: *u32,
+    /// The words up to and including the first comparison, if the head
+    /// binds nothing before it (as for `guard`, without a neck cut); 0:
+    /// not such a clause. With `emask`, `guard_chain` commits to this
+    /// clause when the comparison holds and every other clause starts
+    /// with one that then fails (`excludes`).
+    eguard: u64,
+    /// The first body goal, if it is an arithmetic comparison of head
+    /// arguments (variables that are arguments of the head) and integers:
+    /// the outcomes (bits for <, =, >) in which it holds, 0 if no such
+    /// goal; and its operands (`cmp_operand`).
+    emask: u64,
+    ea: u64,
+    eb: u64,
     key: u64,
     term: Term,
     erased: bool,
@@ -166,7 +179,7 @@ fn guard_words(w: *mem.Vec<u32>, arity: u64) -> u64 {
         let r = ((x >> 8) & 255) as u64;
         if jump_form(op) != 0 { cmps += 1; }
         else if op == Wam.OP_GET_VAR_X or op == Wam.OP_ADD or op == Wam.OP_SUB or op == Wam.OP_MUL
-            or op == Wam.OP_ADDI or op == Wam.OP_SUBI or op == Wam.OP_MULI {
+            or op == Wam.OP_ADDI or op == Wam.OP_SUBI or op == Wam.OP_MULI or op == Wam.OP_PUT_INT {
             if r < arity { return 0; }
         } else {
             return 0;
@@ -176,14 +189,80 @@ fn guard_words(w: *mem.Vec<u32>, arity: u64) -> u64 {
     0
 }
 
+/// `Clause.eguard` of clause code `w`: the words up to and including the
+/// first comparison, if only moves, integers and arithmetic into
+/// temporaries come before it; else 0.
+fn first_guard_words(w: *mem.Vec<u32>, arity: u64) -> u64 {
+    var i: u64 = 0;
+    while i < w.len {
+        let x = w.ptr[i];
+        let op = Wam.base_op(x);
+        let r = ((x >> 8) & 255) as u64;
+        if jump_form(op) != 0 { return i + Wam.op_size(x); }
+        if op == Wam.OP_GET_VAR_X or op == Wam.OP_ADD or op == Wam.OP_SUB or op == Wam.OP_MUL
+            or op == Wam.OP_ADDI or op == Wam.OP_SUBI or op == Wam.OP_MULI or op == Wam.OP_PUT_INT {
+            if r < arity { return 0; }
+        } else {
+            return 0;
+        }
+        i += Wam.op_size(x);
+    }
+    0
+}
+
+/// The outcomes of a comparison (bits 1: <, 2: =, 4: >) in which `name`
+/// holds; 0 if it is not one.
+fn cmp_mask(name: str) -> u64 {
+    match name {
+        "<" => 1, "=<" => 3, ">" => 4, ">=" => 6, "=:=" => 2, "=\\=" => 5,
+        _ => 0,
+    }
+}
+
+/// An operand of a first-goal comparison (`Clause.ea`): an integer `k` is
+/// `2k+1`, a variable that is head argument `i` is `2i`; None otherwise.
+fn cmp_operand(t0: Term, head: Term, arity: u64) -> ?u64 {
+    let t = deref(t0);
+    match t {
+        Int(k) => Some((((k as i64) as u64) << 1) | 1),
+        Ref(_) => {
+            for i in 0..arity { if deref(term.arg_of(head, i)) == t { return Some(i << 1); } }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Clause `c` cannot succeed when `c0`'s first comparison held: its own
+/// first goal compares the same head arguments (or integers) with no
+/// outcome in common. Both compare the arguments' values: when `c0`'s
+/// comparison held they were ground, so `c`'s head cannot change them.
+fn excludes(c0: *Clause, c: *Clause) -> bool {
+    if c.emask == 0 { return false; }
+    if c.ea == c0.ea and c.eb == c0.eb { return (c0.emask & c.emask) == 0; }
+    if c.ea == c0.eb and c.eb == c0.ea {
+        let mirror = (c.emask & 2) | ((c.emask & 1) << 2) | ((c.emask >> 2) & 1);
+        return (c0.emask & mirror) == 0;
+    }
+    false
+}
+
 /// Code that tries `cs` in order, the first clause's guards without a
 /// choicepoint if it has them (`Clause.guard`): they jump to the code of
 /// the other clauses when they fail, and into the clause at its neck cut
-/// when they hold.
+/// when they hold. Without a neck cut, the same for a first comparison
+/// that every other clause's first comparison contradicts (`eguard`:
+/// `X =< Y, ...` and `X > Y, ...`).
 fn guard_chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> ?Verified<Wam> {
     let c0 = cs.ptr[0];
-    if c0.guard == 0 { return None; }
-    let Some(at) = c0.code.resume_at(c0.guard) else { return None; };
+    var glen = c0.guard;
+    if glen == 0 and c0.eguard > 0 and c0.emask != 0 {
+        var all = true;
+        for i in 1..cs.len { if !excludes(c0, cs.ptr[i]) { all = false; } }
+        if all { glen = c0.eguard; }
+    }
+    if glen == 0 { return None; }
+    let Some(at) = c0.code.resume_at(glen) else { return None; };
     var rest: mem.Vec<*Clause> = mem.Vec.new();
     for i in 1..cs.len { rest.push(cs.ptr[i]); }
     let other = chain(m, p, &rest);
@@ -192,7 +271,7 @@ fn guard_chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> ?Verified<Wam> {
     var v: mem.Vec<u32> = mem.Vec.new();
     var to: mem.Vec<Wam.Resume> = mem.Vec.new();
     var i: u64 = 0;
-    while i < c0.guard {
+    while i < glen {
         let x = c0.gwords[i];
         let op = Wam.base_op(x);
         let j = jump_form(op);
@@ -1385,11 +1464,11 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
         if env { c.emit(Wam.DEALLOCATE()); }
         c.emit(Wam.PROCEED());
     }
-    goals.free();
     c.vars.free();
     c.free_temps.free();
     c.kept.free();
     if let Some(msg) = c.error {
+        goals.free();
         io.eprint("error: ");
         io.eprintln(msg);
         c.code.free();
@@ -1399,10 +1478,28 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     cl.code = finish(m, &c.code, c.nperm as u64);
     cl.len = c.code.len;
     cl.guard = guard_words(&c.code, arity);
-    if cl.guard > 0 {
-        cl.gwords = mem.alloc<u32>(cl.guard);
-        for i in 0..cl.guard { cl.gwords[i] = c.code.ptr[i]; }
+    cl.eguard = first_guard_words(&c.code, arity);
+    let gl = if cl.guard > cl.eguard { cl.guard } else { cl.eguard };
+    if gl > 0 {
+        cl.gwords = mem.alloc<u32>(gl);
+        for i in 0..gl { cl.gwords[i] = c.code.ptr[i]; }
     }
+    cl.emask = 0;
+    cl.ea = 0;
+    cl.eb = 0;
+    if goals.len > 0 and goals.ptr[0].kind == GoalKind.Builtin {
+        let g = goals.ptr[0].t;
+        let (gn, ga) = term.name_arity(&m.db, g);
+        let mask = if ga == 2 { cmp_mask(m.db.name(gn)) } else { 0 };
+        if mask != 0 {
+            if let Some(a) = cmp_operand(term.arg_of(g, 0), head, arity) and let Some(b) = cmp_operand(term.arg_of(g, 1), head, arity) {
+                cl.emask = mask;
+                cl.ea = a;
+                cl.eb = b;
+            }
+        }
+    }
+    goals.free();
     cl.key = if arity > 0 { key_of(deref(term.arg_of(head, 0))) } else { 0 };
     cl.term = Term.Atom(term.A_TRUE);
     cl.erased = false;
