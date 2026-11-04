@@ -534,3 +534,11 @@ Times in seconds.
 Times in seconds.
 
 † jit on sieve: every assert/retract makes code objects that are never freed, and the JIT compiles each one as it gets hot.
+
+*2026-11-04:* after a second optimization round (examples/prolog/FRICTION.md,
+"Optimizations, second round"; a vm-verifier and a std.gc change among
+them), the tail-call build takes 0.63x SWI-Prolog's time and 0.15x
+Trealla's by geometric mean, against 0.83x and 0.20x for the build above
+in the same (loaded) run; tak 0.41x, queens_8 0.47x, sieve 0.90x, boyer
+1.05x of SWI-Prolog (`bench/prolog/README.md`). The other columns of this
+table were not rerun.

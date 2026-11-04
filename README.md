@@ -119,7 +119,7 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
 | [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.91× wasm3 |
 | [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.52× CPython 3.13, 0.18× MicroPython ([report](examples/python/FRICTION.md)) |
-| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.79× SWI-Prolog 10 (`-O`), 0.19× Trealla ([report](examples/prolog/FRICTION.md)) |
+| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.63× SWI-Prolog 10 (`-O`), 0.15× Trealla ([report](examples/prolog/FRICTION.md)) |
 
 Lox, regex, stack, wasm, python and prolog were written by agents that read only
 the docs, as usability studies; each has a `FRICTION.md` report.
