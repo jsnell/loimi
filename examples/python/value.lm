@@ -163,6 +163,13 @@ pub fn new_list(h: *gc.Heap, cap: u64) -> Gc<List> {
     new(h, List { len: 0, arr: a })
 }
 
+/// A list of length `n` whose items the caller stores (they are zero
+/// bits, Float 0.0, until then; also past `n`, never read).
+pub fn new_list_n(h: *gc.Heap, n: u64) -> Gc<List> {
+    let a = new(h, Arr {}, if n < 4 { 4 } else { n });
+    new(h, List { len: n, arr: a })
+}
+
 pub fn list_push(h: *gc.Heap, l: Gc<List>, v: Value) {
     if l.len == l.arr.items.len { list_grow(h, l, l.len + 1); }
     l.arr.items[l.len] = v;
@@ -174,9 +181,12 @@ pub fn list_grow(h: *gc.Heap, l: Gc<List>, need: u64) {
     if c < need { c = need; }
     if c < 4 { c = 4; }
     let a = new(h, Arr {}, c);
-    for i in 0..l.len { a.items[i] = l.arr.items[i]; }
-    for i in l.len..c { a.items[i] = Value.Nil; }
+    // Raw copies into the new array (the rest stays zero bits, never read).
+    let src = l.arr.items.ptr;
+    let dst = a.items.ptr;
+    for i in 0..l.len { *(dst + i) = *(src + i); }
     l.arr = a;
+    gc.write_barrier(h, a as *u8);
 }
 
 /// Item `i` of a list or tuple, if it has one now.
