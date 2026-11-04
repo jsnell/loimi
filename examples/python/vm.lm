@@ -1185,6 +1185,60 @@ pub vm Py {
             }
         }
     }
+    /// `for a, b in it` with two plain locals: the next item of R[it]
+    /// unpacked into R[d1] and R[d2], skipping the JMP; or take the JMP
+    /// when the iterator is exhausted. enumerate() and zip() of two
+    /// lists write the pair without making the tuple.
+    op FORITER2(d1: reg, it: reg, d2: reg) : ABC then JMP {
+        if let Obj(b) = it {
+            if b.kind == K_SEQIT and let List(l) = b.a {
+                let i = b.n as u64;
+                if i >= l.len { jump then.target }
+                if let Tuple(t) = *(l.arr.items.ptr + i) and t.items.len == 2 {
+                    b.n += 1;
+                    d1 = *t.items.ptr;
+                    d2 = *(t.items.ptr + 1);
+                    jump then_next_pc
+                }
+            } else if b.kind == value.K_ENUMIT and let Obj(s) = b.a and s.kind == K_SEQIT and let List(l) = s.a {
+                let i = s.n as u64;
+                if i >= l.len { jump then.target }
+                let n = b.n;
+                if n <= 140737488355327 {
+                    s.n += 1;
+                    b.n = n + 1;
+                    d1 = Int(n as i48);
+                    d2 = *(l.arr.items.ptr + i);
+                    jump then_next_pc
+                }
+            } else if b.kind == value.K_ZIPIT and let Tuple(its) = b.a and its.items.len == 2
+                and let Obj(s1) = *its.items.ptr and s1.kind == K_SEQIT and let List(l1) = s1.a
+                and let Obj(s2) = *(its.items.ptr + 1) and s2.kind == K_SEQIT and let List(l2) = s2.a {
+                let i = s1.n as u64;
+                if i >= l1.len { jump then.target }
+                s1.n += 1;
+                let j = s2.n as u64;
+                if j >= l2.len { jump then.target }
+                s2.n += 1;
+                d1 = *(l1.arr.items.ptr + i);
+                d2 = *(l2.arr.items.ptr + j);
+                jump then_next_pc
+            }
+        }
+        cold {
+            gc_point();
+            match ops.next(ctx, it)? {
+                Some(v) => {
+                    if let Tuple(t) = v and t.items.len == 2 { d1 = t.items[0]; d2 = t.items[1]; jump then_next_pc }
+                    let (x, y) = ops.unpack2(ctx, v)?;
+                    d1 = x;
+                    d2 = y;
+                    jump then_next_pc
+                }
+                None => jump then.target,
+            }
+        }
+    }
     /// R[dst] = (yield R[val]): suspend the generator.
     op YIELD(dst: reg, val: reg) : ABC {
         let v = val;

@@ -2190,8 +2190,35 @@ pub fn to_list(c: *Ctx, v: Value) -> Result<Gc<List>, Value> uses reenter {
     Ok(l)
 }
 
+/// `a, b = src` (FORITER2): the two values. No guest code runs after
+/// the items are collected.
+pub fn unpack2(c: *Ctx, src: Value) -> Result<(Value, Value), Value> uses reenter {
+    let l = unpack_list(c, src)?;
+    if l.len != 2 {
+        var m = text.StrBuf.new();
+        if l.len > 2 { m.fmt("too many values to unpack (expected {})", 2); }
+        else { m.fmt2("not enough values to unpack (expected {}, got {})", 2, l.len); }
+        return Err(exc_buf(c, E_VALUE, &m));
+    }
+    Ok((l.arr.items[0], l.arr.items[1]))
+}
+
+/// The items of `src` for an unpacking assignment.
+fn unpack_list(c: *Ctx, src: Value) -> Result<Gc<List>, Value> uses reenter {
+    match src {
+        Int(_) | Float(_) | Bool(_) | Nil | Long(_) | Func(_) | Builtin(_) => {
+            var m = text.StrBuf.new();
+            m.push_str("cannot unpack non-iterable ");
+            m.push_str(type_name(c, src));
+            m.push_str(" object");
+            Err(exc_buf(c, E_TYPE, &m))
+        }
+        _ => to_list(c, src),
+    }
+}
+
 pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Result<(), Value> uses reenter {
-    let l = to_list(c, src)?;
+    let l = unpack_list(c, src)?;
     if after == 0xff {
         if l.len != before {
             var m = text.StrBuf.new();

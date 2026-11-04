@@ -83,6 +83,15 @@ fn seq_items(e: *Expr) -> ?Exprs {
     match e.e { Tuple(xs) => Some(xs), List(xs) => Some(xs), Set(xs) => Some(xs), _ => None }
 }
 
+/// The two names of a `for a, b in ..` target (a tuple or list of two).
+fn for_pair(t: *Expr) -> ?Exprs {
+    match t.e {
+        Tuple(xs) => if xs.len == 2 { Some(xs) } else { None },
+        List(xs) => if xs.len == 2 { Some(xs) } else { None },
+        _ => None,
+    }
+}
+
 fn bool_parts(e: *Expr) -> (*Expr, *Expr) {
     match e.e { And(a, b) => (a, b), Or(a, b) => (a, b), _ => trap() }
 }
@@ -699,10 +708,17 @@ fn C.for_stmt(c: *C, t: *Expr, iter: *Expr, body: Body, orelse: Body) {
     var dst: u32 = 0;
     var direct = false;
     if let Name(n) = t.e and let Local(r) = c.kind(n) { dst = r; direct = true; }
-    if !direct { dst = c.alloc(1); }
-    c.emit(Py.FORITER(dst as u8, it as u8));
-    c.code.jump(Py.JMP(0), els); #[cfg(debug)] if let Name(n) = t.e and direct { debugger.store(c as *u8, n, c.pc32()); }
-    if !direct { c.assign(t, dst); }
+    // `for a, b in ..` with two plain locals: FORITER2 unpacks into them.
+    var pair = false;
+    var dst2: u32 = 0;
+    if let Some(xs) = for_pair(t) and let Name(n1) = xs.at(0).e and let Local(r1) = c.kind(n1)
+        and let Name(n2) = xs.at(1).e and let Local(r2) = c.kind(n2) and r1 != r2 {
+        dst = r1; dst2 = r2; pair = true;
+    }
+    if !direct and !pair { dst = c.alloc(1); }
+    if pair { c.emit(Py.FORITER2(dst as u8, it as u8, dst2 as u8)); } else { c.emit(Py.FORITER(dst as u8, it as u8)); }
+    c.code.jump(Py.JMP(0), els); #[cfg(debug)] if let Name(n) = t.e and direct { debugger.store(c as *u8, n, c.pc32()); } #[cfg(debug)] if pair { for i in 0..2 { if let Name(n) = seq_items(t).unwrap().at(i).e { debugger.store(c as *u8, n, c.pc32()); } } }
+    if !direct and !pair { c.assign(t, dst); }
     c.loops.push(Loop { brk: brk, cont: top, fdepth: c.fins.len });
     let m2 = c.regs.mark();
     c.block(body);
@@ -1282,12 +1298,19 @@ fn C.comp(c: *C, cs: *mem.Vec<Comp>, i: u64, kind: u32, acc: u32, x: *Expr, y: *
         c.shadow.push((ns.at(j), r));
     }
     let simple = if let Name(_) = cm.target.e { true } else { false };
-    let v = if simple { single } else { c.alloc(1) };
+    var pair = false;
+    var r1: u32 = 0;
+    var r2: u32 = 0;
+    if let Some(xs) = for_pair(cm.target) and let Name(n1) = xs.at(0).e and let Local(a) = c.kind(n1)
+        and let Name(n2) = xs.at(1).e and let Local(b) = c.kind(n2) and a != b {
+        pair = true; r1 = a; r2 = b;
+    }
+    let v = if simple { single } else if pair { 0 } else { c.alloc(1) };
     let top = c.code.here();
     let done = c.code.label();
-    c.emit(Py.FORITER(v as u8, it as u8));
+    if pair { c.emit(Py.FORITER2(r1 as u8, it as u8, r2 as u8)); } else { c.emit(Py.FORITER(v as u8, it as u8)); }
     c.code.jump(Py.JMP(0), done); #[cfg(debug)] c.debug_shadows(saved); // --cfg debug: the targets are locals from here
-    if !simple { c.assign(cm.target, v); }
+    if !simple and !pair { c.assign(cm.target, v); }
     for j in 0..cm.ifs.len { c.jump_if_false(cm.ifs.at(j), top); }
     c.comp(cs, i + 1, kind, acc, x, y);
     c.code.jump(Py.JMP(0), top);
