@@ -53,6 +53,24 @@ pub fn init_dunders(c: *Ctx) {
 /// A plain function `name` of the class with `nargs` parameters and no
 /// argument processing, for calling in the vm loop.
 pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
+    // Classes cache the answer for nargs 2 (`extra[which]`: Undef not
+    // looked up yet, Nil none), reset by class_refresh at each epoch.
+    if nargs == 2 and which < cls.extra.len {
+        if cls.b != Value.Int(c.epoch as i48) { class_refresh(c, cls); }
+        let v = cls.extra[which];
+        if let Func(f) = v { return Some(f); }
+        if v == Value.Nil { return None; }
+        let r = simple_method_lookup(c, cls, which, nargs);
+        cls.extra[which] = if let Some(f) = r { Value.Func(f) } else { Value.Nil };
+        return r;
+    }
+    simple_method_lookup(c, cls, which, nargs)
+}
+
+/// Slots of a class box's `extra`: simple_method's cache, by dunder number.
+pub const CLASS_SLOTS: u64 = 33;
+
+fn simple_method_lookup(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
     let Str(name) = c.dn[which] else { return None; };
     let Some(Func(f)) = class_lookup(cls, name) else { return None; };
     if f.proto.simple != nargs or (f.proto.flags & vm.P_NOTIMPL) != 0 { return None; }
@@ -512,6 +530,7 @@ fn class_refresh(c: *Ctx, cls: Gc<Box>) {
     cls.c = class_lookup(cls, c.n_init.unwrap()) ?? Value.Undef;
     let eq = class_lookup(cls, dn(c, DN_CMP + C_EQ as u64)).is_some() or class_lookup(cls, dn(c, DN_CMP + C_NE as u64)).is_some();
     cls.s = (cls.s & ~4) | (if eq { 4 } else { 0 });
+    for i in 0..cls.extra.len { cls.extra[i] = Value.Undef; }
     cls.b = Value.Int(c.epoch as i48);
 }
 
@@ -965,7 +984,7 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value) -> Result<Valu
             base = b;
         }
     }
-    let cls = value.new_box(&c.heap, K_CLASS, 0);
+    let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS);
     cls.a = name;
     cls.dict = Some(d);
     cls.base = Some(base);
@@ -2045,6 +2064,17 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
 }
 
 /// `x in container` without guest code: 1 yes, 0 no, 2 don't know.
+/// Two values that are not the same bits and that eq_builtin would find
+/// unequal without a call: two ints, two strings of different lengths.
+#[inline(always)]
+fn surely_unequal(e: Value, x: Value) -> bool {
+    match (e, x) {
+        (Int(_), Int(_)) => true,
+        (Str(a), Str(b)) => a.data.len != b.data.len,
+        _ => false,
+    }
+}
+
 pub fn contains_fast(container: Value, x: Value) -> u32 {
     let simple = match x { Int(_) => true, Str(_) => true, Nil => true, Bool(_) => true, Float(_) => true, _ => false };
     if !simple { return 2; }
@@ -2057,6 +2087,7 @@ pub fn contains_fast(container: Value, x: Value) -> u32 {
             for i in 0..l.len {
                 let e = l.arr.items[i];
                 if e == x { return 1; }
+                if surely_unequal(e, x) { continue; }
                 match e {
                     Inst(_) => return 2,
                     _ => if value.eq_builtin(e, x) { return 1; },
@@ -2068,6 +2099,7 @@ pub fn contains_fast(container: Value, x: Value) -> u32 {
             for i in 0..t.items.len {
                 let e = t.items[i];
                 if e == x { return 1; }
+                if surely_unequal(e, x) { continue; }
                 match e {
                     Inst(_) => return 2,
                     _ => if value.eq_builtin(e, x) { return 1; },
