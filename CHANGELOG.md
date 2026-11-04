@@ -262,7 +262,9 @@ implementation; `git log` has the details.
   later, which then saw dead objects as marked
   (`tests/run/gc_sweeper_after_check_roots.lm`);
   `tests/run/gc_torture.lm` is a random mutator over every size class,
-  weak references, ephemerons and free hooks in six heap configurations.
+  weak references, ephemerons and free hooks in six heap configurations;
+  the allocator's invariants are listed in
+  [stdlib/gc.md](docs/stdlib/gc.md#invariants-of-the-bitmap-allocator).
 
 - **GC objects are checked in every module**
   ([design/safety.md §8](docs/design/safety.md),
