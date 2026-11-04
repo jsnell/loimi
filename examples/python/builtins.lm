@@ -187,6 +187,10 @@ pub fn setup(c: *Ctx) {
                    ("range", T_RANGE), ("object", T_OBJECT), ("type", T_TYPE), ("property", T_PROPERTY),
                    ("super", T_SUPER), ("slice", T_SLICE)];
     for x in visible { let (n, t) = x; put(c, bd, n, Value.Obj(c.types[t].unwrap())); }
+    // For comprehensions compiled as list(<genexpr>) (parser.lm, P.comp).
+    put(c, bd, ".list", Value.Obj(c.types[T_LIST].unwrap()));
+    put(c, bd, ".set", Value.Obj(c.types[T_SET].unwrap()));
+    put(c, bd, ".dict", Value.Obj(c.types[T_DICT].unwrap()));
     let st = value.new_box(&c.heap, K_CLASS, 0);
     st.a = Value.Str(vm.intern(c, "staticmethod")); st.dict = Some(value.new_dict(&c.heap, 0)); st.base = Some(obj);
     st.n = 1000; st.id = c.next_cls; c.next_cls += 1;
@@ -433,6 +437,15 @@ fn lt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
     }
 }
 
+fn gt(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
+    match (a, b) {
+        (Int(x), Int(y)) => Ok(x > y),
+        (Float(x), Float(y)) => Ok(x > y),
+        (Str(x), Str(y)) => Ok(mem.compare_bytes(x.data, y.data) > 0),
+        _ => ops.compare(c, ops.C_GT, a, b),
+    }
+}
+
 /// Stable sort of `vals` by `keys` with Python's < (`mem.try_sort_by`:
 /// the comparator may raise and may run `__lt__`). The caller keeps the
 /// keys and values reachable (tuples) while guest code runs.
@@ -450,25 +463,39 @@ fn msort(c: *Ctx, keys: *mem.Vec<Value>, vals: *mem.Vec<Value>, reverse: bool) -
 
 /// Sort list `l` in place (key may be Nil).
 pub fn sort_list(c: *Ctx, l: Gc<List>, key: Value, reverse: bool) -> Result<(), Value> uses reenter {
-    var keys: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
-    var vals: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
-    for i in 0..l.len { vals.push(l.arr.items[i]); }
+    let n = l.len;
+    var keys: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    var vals: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    for i in 0..n { vals.push(l.arr.items[i]); }
     // Keep the values alive in a tuple while keys are computed (guest code may collect).
     let keep = value.tuple_of(&c.heap, vals.items());
-    let keept = value.new_tuple(&c.heap, l.len);
-    for i in 0..l.len {
+    let keept = value.new_tuple(&c.heap, n);
+    // As in CPython, the list is empty while it is sorted: key functions
+    // and comparisons see [], and a change is "list modified during sort".
+    let arr0 = l.arr;
+    l.len = 0;
+    var r: Result<(), Value> = Ok(());
+    for i in 0..n {
         if key == Value.Nil { keys.push(keep.items[i]); }
         else {
             let args = [keep.items[i]];
-            let r = vm.invoke(c, key, args[..]);
-            match r { Ok(k) => { keys.push(k); keept.items[i] = k; } Err(e) => { keys.free(); vals.free(); return Err(e); } }
+            match vm.invoke(c, key, args[..]) {
+                Ok(k) => { keys.push(k); keept.items[i] = k; }
+                Err(e) => { r = Err(e); break; }
+            }
         }
     }
-    let r = msort(c, &keys, &vals, reverse);
-    if let Err(e) = r { keys.free(); vals.free(); return Err(e); }
-    for i in 0..l.len { l.arr.items[i] = vals.at(i); }
+    if let Ok(_) = r { r = msort(c, &keys, &vals, reverse); }
+    let modified = l.len != 0 or (l.arr as u64) != (arr0 as u64);
+    l.len = 0;
+    if l.arr.items.len < n { value.list_grow(&c.heap, l, n); }
+    for i in 0..n { l.arr.items[i] = vals.at(i); }
+    for i in n..l.arr.items.len { l.arr.items[i] = Value.Nil; }
+    l.len = n;
     keys.free();
     vals.free();
+    r?;
+    if modified { return Err(exc(c, E_VALUE, "list modified during sort")); }
     Ok(())
 }
 
@@ -490,7 +517,7 @@ fn minmax(c: *Ctx, args: *Value, n: u64, kw: Value, is_max: bool) -> Result<Valu
         let v = l.arr.items[i];
         var k = v;
         if key != Value.Nil { let a = [v]; k = vm.invoke(c, key, a[..])?; }
-        let better = if is_max { lt(c, bestk, k)? } else { lt(c, k, bestk)? };
+        let better = if is_max { gt(c, k, bestk)? } else { lt(c, k, bestk)? }; // CPython: item > best, item < best
         if better { best = v; bestk = k; }
     }
     Ok(best)
@@ -669,7 +696,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         Next => {
             if let Some(v) = ops.next(c, args[0])? { return Ok(v); }
             if np > 1 { return Ok(args[1]); }
-            Err(exc_of_empty(c, E_STOPITER))
+            Err(stop_iteration(c, args[0]))
         }
         Hash => {
             let h = ops.hash_key(c, args[0])?;
@@ -696,6 +723,19 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(buf_str(c, &b2))
         }
         Divmod => {
+            let (a, d) = (args[0], args[1]);
+            if value.is_num(a) and value.is_num(d) and !(value.is_int(a) and value.is_int(d)) {
+                let y = value.to_f64(d).unwrap();
+                if y == 0.0 { return Err(exc(c, E_ZERODIV, "float divmod()")); }
+                let (q, r) = ops.float_divmod(value.to_f64(a).unwrap(), y);
+                let t = value.new_tuple(&c.heap, 2);
+                t.items[0] = Value.Float(q);
+                t.items[1] = Value.Float(r);
+                return Ok(Value.Tuple(t));
+            }
+            if !(value.is_num(a) and value.is_num(d)) and !ops.is_inst(a) and !ops.is_inst(d) {
+                return Err(ops.unsupported(c, "divmod()", a, d));
+            }
             let q = ops.arith(c, ops.O_FLOORDIV, args[0], args[1])?;
             let r = ops.arith(c, ops.O_MOD, args[0], args[1])?;
             let t = value.new_tuple(&c.heap, 2);
@@ -704,11 +744,20 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(Value.Tuple(t))
         }
         Pow => {
-            if np == 3 {
+            if np == 3 and args[2] != Value.Nil {
                 // modular exponentiation
-                var base = ops.arith(c, ops.O_MOD, args[0], args[2])?;
+                let m = args[2];
+                if !value.is_int(args[0]) or !value.is_int(args[1]) or !value.is_int(m) {
+                    return Err(exc(c, E_TYPE, "pow() 3rd argument not allowed unless all arguments are integers"));
+                }
+                if m == Value.Int(0) { return Err(exc(c, E_VALUE, "pow() 3rd argument cannot be 0")); }
+                var base = ops.arith(c, ops.O_MOD, args[0], m)?;
                 var e = args[1];
-                var r = Value.Int(1);
+                if big.is_neg(e) {
+                    base = mod_inverse(c, base, m)?;
+                    e = ops.unary(c, ops.U_NEG, e)?;
+                }
+                var r = ops.arith(c, ops.O_MOD, Value.Int(1), m)?;
                 while !(e == Value.Int(0)) {
                     if big.is_odd(e) { r = ops.arith(c, ops.O_MOD, ops.arith(c, ops.O_MUL, r, base)?, args[2])?; }
                     e = ops.arith(c, ops.O_FLOORDIV, e, Value.Int(2))?;
@@ -719,13 +768,19 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             ops.arith(c, ops.O_POW, args[0], args[1])
         }
         Round => {
-            let x = args[0];
-            if value.is_int(x) { return Ok(x); }
+            let x = if let Bool(v) = args[0] { Value.Int(if v { 1 } else { 0 }) } else { args[0] };
+            if value.is_int(x) {
+                if np < 2 or args[1] == Value.Nil { return Ok(x); }
+                let nd = want_int(c, args[1])?;
+                if nd >= 0 { return Ok(x); }
+                return round_int(c, x, -nd);
+            }
             let f = want_f64(c, x)?;
             if np < 2 or args[1] == Value.Nil {
                 return float_to_int(c, f.nearest());
             }
             let nd = want_int(c, args[1])?;
+            if nd < 0 { return round_float_neg(c, f, -nd); }
             var buf = text.StrBuf.new();
             fmt.write_c_float_pub(&buf, 'f', nd, f);
             let r = text.parse_f64(buf.as_str()) ?? f;
@@ -789,7 +844,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(Value.Bool(r))
         }
         Hex | Oct | Bin => {
-            let x = args[0];
+            let x = ops.index_of(c, args[0])?;
             if !value.is_int(x) { return Err(exc(c, E_TYPE, "an integer is required")); }
             var buf = text.StrBuf.new();
             if big.is_neg(x) { buf.push('-'); }
@@ -831,6 +886,76 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         ObjStr => fmt.to_str(c, args[0]),
         _ => call_method_builtin(c, b, args, n, kw),
     }
+}
+
+/// The inverse of `a` modulo `m` (pow(a, -n, m)), in m's sign.
+fn mod_inverse(c: *Ctx, a: Value, m: Value) -> Result<Value, Value> uses reenter {
+    let am = if big.is_neg(m) { ops.unary(c, ops.U_NEG, m)? } else { m };
+    var r0 = ops.arith(c, ops.O_MOD, a, am)?;
+    var r1 = am;
+    var x0 = Value.Int(1);
+    var x1 = Value.Int(0);
+    while r1 != Value.Int(0) {
+        let q = ops.arith(c, ops.O_FLOORDIV, r0, r1)?;
+        let r2 = ops.arith(c, ops.O_SUB, r0, ops.arith(c, ops.O_MUL, q, r1)?)?;
+        r0 = r1;
+        r1 = r2;
+        let x2 = ops.arith(c, ops.O_SUB, x0, ops.arith(c, ops.O_MUL, q, x1)?)?;
+        x0 = x1;
+        x1 = x2;
+    }
+    if r0 != Value.Int(1) { return Err(exc(c, E_VALUE, "base is not invertible for the given modulus")); }
+    ops.arith(c, ops.O_MOD, x0, m)
+}
+
+/// 10**k as an int.
+fn pow10(c: *Ctx, k: i64) -> Result<Value, Value> uses reenter {
+    ops.arith(c, ops.O_POW, Value.Int(10), value.int_val(&c.heap, k))
+}
+
+/// round(x, -k) of an int: to a multiple of 10**k, half to even.
+fn round_int(c: *Ctx, x: Value, k: i64) -> Result<Value, Value> uses reenter {
+    if k as u64 > big.bit_length(x) / 3 + 2 { return Ok(Value.Int(0)); }
+    let p = pow10(c, k)?;
+    var q = ops.arith(c, ops.O_FLOORDIV, x, p)?;
+    let r = ops.arith(c, ops.O_MOD, x, p)?;
+    let r2 = ops.arith(c, ops.O_MUL, r, Value.Int(2))?;
+    let o = ops.order(c, r2, p)?.unwrap();
+    if o > 0 or (o == 0 and big.is_odd(q)) { q = ops.arith(c, ops.O_ADD, q, Value.Int(1))?; }
+    ops.arith(c, ops.O_MUL, q, p)
+}
+
+/// round(f, -k) of a float, rounding its exact value (as CPython does).
+fn round_float_neg(c: *Ctx, f: f64, k: i64) -> Result<Value, Value> uses reenter {
+    if f != f or f - f != 0.0 { return Ok(Value.Float(f)); }
+    let neg = (f.to_bits() >> 63) != 0;
+    if k > 330 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let n = float_to_int(c, f.floor())?;
+    let p = pow10(c, k)?;
+    var q = ops.arith(c, ops.O_FLOORDIV, n, p)?;
+    let r = ops.arith(c, ops.O_MOD, n, p)?;
+    let r2 = ops.arith(c, ops.O_MUL, r, Value.Int(2))?;
+    let o = ops.order(c, r2, p)?.unwrap();
+    let exact = f.floor() == f;
+    // Without a fraction r + frac > p/2 iff 2r >= p (p is even): no ties.
+    if o > 0 or (o == 0 and (!exact or big.is_odd(q))) { q = ops.arith(c, ops.O_ADD, q, Value.Int(1))?; }
+    let v = ops.arith(c, ops.O_MUL, q, p)?;
+    let r = value.to_f64(v).unwrap();
+    if r == 0.0 and neg { return Ok(Value.Float(-0.0)); }
+    Ok(Value.Float(r))
+}
+
+/// StopIteration for an exhausted iterator: with the return value of a
+/// generator that just returned one (taken: later ones have none).
+fn stop_iteration(c: *Ctx, it: Value) -> Value {
+    if let Obj(g) = it and g.kind == K_GEN and g.b != Value.Nil {
+        let v = g.b;
+        g.b = Value.Nil;
+        let e = ops.exc_of(c, c.excs[E_STOPITER].unwrap(), v);
+        if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "value"), v); }
+        return e;
+    }
+    exc_of_empty(c, E_STOPITER)
 }
 
 fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
@@ -930,8 +1055,8 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
         T_RANGE => {
             let r = value.new_box(&c.heap, K_RANGE, 0);
             r.s = 1;
-            if np == 1 { r.m = want_int(c, args[0])?; }
-            else if np >= 2 { r.n = want_int(c, args[0])?; r.m = want_int(c, args[1])?; }
+            if np == 1 { r.m = want_int(c, ops.index_of(c, args[0])?)?; }
+            else if np >= 2 { r.n = want_int(c, ops.index_of(c, args[0])?)?; r.m = want_int(c, ops.index_of(c, args[1])?)?; }
             else { return Err(exc(c, E_TYPE, "range expected at least 1 argument, got 0")); }
             if np >= 3 {
                 r.s = want_int(c, args[2])?;
@@ -1392,7 +1517,12 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                 let Some(x) = value.seq_at(selfv, i) else { break; };
                 if ops.equal(c, x, args[1])? { return Ok(value.int_val(&c.heap, i as i64)); }
             }
-            Err(exc(c, E_VALUE, if b == B.LIndex { "list.index(x): x not in list" } else { "tuple.index(x): x not in tuple" }))
+            if b == B.TIndex { return Err(exc(c, E_VALUE, "tuple.index(x): x not in tuple")); }
+            let Str(r) = fmt.repr(c, args[1])? else { trap() };
+            var m = text.StrBuf.new();
+            m.push_str(r.data);
+            m.push_str(" is not in list");
+            Err(exc_buf(c, E_VALUE, &m))
         }
         LCount | TCount => {
             var k: i64 = 0;
@@ -1567,11 +1697,32 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
             match vm.gen_next(c, g, args[1])? {
                 Some(v) => Ok(v),
-                None => Err(exc_of_empty(c, E_STOPITER)),
+                None => Err(stop_iteration(c, selfv)),
             }
         }
-        GClose => { let Obj(g) = selfv else { trap() }; g.m = GEN_DONE; Ok(Value.Nil) }
-        GThrow => Err(ops.make_exc(c, args[1])?),
+        GClose => {
+            let Obj(g) = selfv else { trap() };
+            if g.m != value.GEN_SUSPENDED { g.m = GEN_DONE; return Ok(Value.Nil); }
+            let ge = exc_of_empty(c, E_GENEXIT);
+            match vm.gen_throw(c, g, ge) {
+                Ok(Some(_)) => Err(exc(c, E_RUNTIME, "generator ignored GeneratorExit")),
+                Ok(None) => Ok(Value.Nil),
+                Err(e) => {
+                    if ops.exc_match(c, e, Value.Obj(c.excs[E_GENEXIT].unwrap()))? or ops.exc_match(c, e, Value.Obj(c.excs[E_STOPITER].unwrap()))? {
+                        return Ok(Value.Nil);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        GThrow => {
+            let Obj(g) = selfv else { trap() };
+            let e = ops.make_exc(c, args[1])?;
+            match vm.gen_throw(c, g, e)? {
+                Some(v) => Ok(v),
+                None => Err(stop_iteration(c, selfv)),
+            }
+        }
         PropSetter | PropGetter => {
             let Obj(o) = selfv else { trap() };
             let p = value.new_box(&c.heap, K_PROPERTY, 0);

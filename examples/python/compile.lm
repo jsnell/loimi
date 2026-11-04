@@ -46,7 +46,11 @@ struct An {
     arena: *mem.Arena,
     scopes: map.HashMap<u64, *Scope>,
     comp: mem.Vec<str>,
+    depth: u64,     // nesting of expr/stmt: left-deep chains (`1+1+...`) the parser builds in loops
+    too_deep: bool, // past MAX_DEPTH: compile_source fails before the code generator recurses as deep
 }
+
+const MAX_DEPTH: u64 = 20000;
 
 fn new_scope(a: *An, kind: u8, parent: ?*Scope) -> *Scope {
     let s = new(a.arena, Scope { kind: kind, parent: parent, bound: map.HashMap.new(), order: mem.Vec.new(),
@@ -146,6 +150,12 @@ fn pre_decl(s: *Scope, b: Body) {
 }
 
 fn An.stmt(a: *An, s: *Scope, st: *Stmt) {
+    a.depth += 1;
+    if a.depth > MAX_DEPTH { a.too_deep = true; } else { a.stmt_(s, st); }
+    a.depth -= 1;
+}
+
+fn An.stmt_(a: *An, s: *Scope, st: *Stmt) {
     match st.s {
         ExprS(e) => a.expr(s, e),
         Assign(ts, v) => { a.expr(s, v); for i in 0..ts.len { a.target(s, ts.at(i)); } }
@@ -202,6 +212,13 @@ fn An.stmt(a: *An, s: *Scope, st: *Stmt) {
 fn An.use(a: *An, s: *Scope, n: str) {
     if a.in_comp(n) { return; }
     s.uses.push(n);
+    // A class body's names it does not bind are its function's (C.kind).
+    var p = s;
+    while p.kind == SC_CLASS {
+        let Some(q) = p.parent else { break; };
+        p = q;
+        if p.kind == SC_FUNC { p.uses.push(n); }
+    }
 }
 
 fn An.comps(a: *An, s: *Scope, cs: *mem.Vec<Comp>) -> u64 {
@@ -219,6 +236,12 @@ fn An.comps(a: *An, s: *Scope, cs: *mem.Vec<Comp>) -> u64 {
 }
 
 fn An.expr(a: *An, s: *Scope, e: *Expr) {
+    a.depth += 1;
+    if a.depth > MAX_DEPTH { a.too_deep = true; } else { a.expr_(s, e); }
+    a.depth -= 1;
+}
+
+fn An.expr_(a: *An, s: *Scope, e: *Expr) {
     match e.e {
         Name(n) => a.use(s, n),
         Int(_) | Big(_, _) | Float(_) | Str(_) | Bool(_) | NoneE | Ellipsis => {}
@@ -341,6 +364,7 @@ struct C {
     line: u32,
     first_param_reg: u32,
     has_params: bool,
+    uses_ni: bool,  // loads the global NotImplemented (vm.P_NOTIMPL)
 }
 
 enum NK { Local(u32), Cell(u32), Free(u32), Global, ClassNs }
@@ -348,7 +372,7 @@ enum NK { Local(u32), Cell(u32), Free(u32), Global, ClassNs }
 fn new_c(u: *Unit, s: *Scope) -> C {
     C { u: u, s: s, code: bc.Code.new(Py.op_size, Py.set_label), consts: bc.Pool.new(65536), regs: bc.Regs.new(250),
         locals: map.HashMap.new(), shadow: mem.Vec.new(), pending: mem.Vec.new(), hs: mem.Vec.new(), fins: mem.Vec.new(),
-        loops: mem.Vec.new(), class_ns: 255, line: 0, first_param_reg: 0, has_params: false }
+        loops: mem.Vec.new(), class_ns: 255, line: 0, first_param_reg: 0, has_params: false, uses_ni: false }
 }
 
 fn C.fail(c: *C, msg: str) {
@@ -386,7 +410,24 @@ fn C.kind(c: *C, name: str) -> NK {
         if n.eq(name) { return NK.Local(r); }
     }
     let s = c.s;
-    if s.kind == SC_CLASS { return NK.ClassNs; }
+    // A class body runs inline in the enclosing function's code: names it
+    // does not bind are that function's (or global).
+    if s.kind == SC_CLASS {
+        if s.bound.contains(name) { return NK.ClassNs; }
+        return c.kind_outer(name);
+    }
+    c.kind_in(s, name)
+}
+
+/// The kind of `name` in the nearest enclosing function or module scope,
+/// past class bodies (what a method's free variable refers to).
+fn C.kind_outer(c: *C, name: str) -> NK {
+    var s = c.s;
+    while s.kind == SC_CLASS { s = s.parent.unwrap(); }
+    c.kind_in(s, name)
+}
+
+fn C.kind_in(c: *C, s: *Scope, name: str) -> NK {
     if s.kind == SC_MODULE { return NK.Global; }
     if s.globals.contains(name) { return NK.Global; }
     for j in 0..s.frees.len { if s.frees.at(j).eq(name) { return NK.Free(j as u32); } }
@@ -817,7 +858,10 @@ fn C.load_name(c: *C, n: str, dst: u32) {
         Local(r) => if r != dst { c.emit(Py.MOVE(dst as u8, r as u8)); },
         Cell(r) => c.emit(Py.LOADCELL(dst as u8, r as u8)),
         Free(i) => c.emit(Py.LOADFREE(dst as u8, i as u8)),
-        Global => c.emit(Py.GETGLOBAL(dst as u8, c.kstr(n) as u16)),
+        Global => {
+            if n.eq("NotImplemented") { c.uses_ni = true; }
+            c.emit(Py.GETGLOBAL(dst as u8, c.kstr(n) as u16))
+        }
         ClassNs => c.emit(Py.LOADNAME(dst as u8, c.class_ns as u8, c.name8(n))),
     }
 }
@@ -1204,7 +1248,7 @@ fn C.expr_to(c: *C, e: *Expr, dst: u32) {
             c.emit(Py.YIELD(t as u8, v as u8));
             c.code.jump(Py.JMP(0), top);
             c.code.bind(done);
-            c.emit(Py.LOADNIL(d));
+            c.emit(Py.GENRESULT(d, it as u8));
         }
         Walrus(n, x) => {
             c.expr_to(x, dst);
@@ -1582,6 +1626,7 @@ fn compile_function(u: *Unit, s: *Scope, f: *FuncDef) -> u32 {
     c.emit(Py.RETNIL());
     if s.is_gen { flags |= P_GEN; }
     let simple = flags == 0 and nk == 0;
+    if c.uses_ni { flags |= vm.P_NOTIMPL; }
     let pidx = finish(&c, f.name, np, nk, flags, pnames.items(), simple, f.line);
     pnames.free();
     order.free();
@@ -1663,7 +1708,7 @@ fn fill_freesrc(u: *Unit, creator: *C, child: *Scope, p: *Proto) {
     for i in 0..child.frees.len {
         let n = child.frees.at(i);
         var src: u32 = 0;
-        match creator.kind(n) {
+        match creator.kind_outer(n) {
             Free(j) => src = 0x80000000 | j,
             Cell(r) => src = r,
             Local(r) => src = r,
@@ -1686,9 +1731,10 @@ pub fn compile_source(c: *Ctx, src: str, arena: *mem.Arena) -> Result<u32, Compi
     var p = P.new(lx.toks.items(), arena);
     let body = p.file();
     if let Some(m) = p.err { let l = p.err_line; return Err(CompileError { msg: m, line: l }); }
-    var an = An { arena: arena, scopes: map.HashMap.new(), comp: mem.Vec.new() };
+    var an = An { arena: arena, scopes: map.HashMap.new(), comp: mem.Vec.new(), depth: 0, too_deep: false };
     let ms = new_scope(&an, SC_MODULE, None);
     an.body(ms, body);
+    if an.too_deep { return Err(CompileError { msg: "expression too deeply nested (maximum recursion depth exceeded during compilation)", line: 1 }); }
     resolve(ms);
     var u = Unit { c: c, arena: arena, an: &an, err: None, err_line: 0 };
     var cc = new_c(&u, ms);

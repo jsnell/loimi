@@ -1,0 +1,21 @@
+calls RecursionError
+moderate ok
+8501
+[1, [...]] [1, [...]] [1, [...]]
+{'k': 1, 'self': {...}}
+[{'k': 1, 'self': {...}}, [1, [...]], [[1, [...]]]]
+__repr__ RecursionError
+__eq__ RecursionError
+__lt__/__gt__ RecursionError
+__hash__ RecursionError
+__iter__ RecursionError
+__getattr__ RecursionError
+key RecursionError
+nested __repr__ RecursionError
+Node([Node([Node([0])])])
+yield from RecursionError
+[0]
+again RecursionError
+again RecursionError
+again RecursionError
+done

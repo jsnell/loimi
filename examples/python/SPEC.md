@@ -89,16 +89,29 @@ expressions, lambdas, calls with positional, keyword, `*args` and
 `**kwargs` arguments, attribute access, subscripts and slices, list,
 tuple, dict and set displays (with `*x` in lists, tuples and sets and `**d` in dicts), list,
 set and dict comprehensions (several `for` and `if` clauses), generator
-expressions, `yield`, `yield from` (iteration only: sent values are not
-forwarded).
+expressions, `yield`, `yield from` (its value is the subgenerator's
+return value; sent values and `throw` are not forwarded to it).
 
 ## Functions
 
 Positional parameters, defaults (evaluated once), `*args`, keyword-only
 parameters, `**kwargs`; closures over enclosing function variables
-(cells), `nonlocal`, `global`; generators (`yield`, `send`, `close`,
-`return` ending the iteration); recursion up to the frame limit
-(4096 frames; deeper raises `RecursionError`).
+(cells), `nonlocal`, `global`; generators (`yield`, `send`, `throw`,
+`close` running `finally` blocks, `return` values in `StopIteration`;
+*difference:* a suspended generator that is dropped is not closed, so
+its `finally` blocks do not run); recursion up to the frame limit
+(4096 frames; deeper raises `RecursionError`). Recursion through the
+runtime (`__repr__`, `__eq__`, `__lt__`, key functions, generators
+resumed from builtins) is limited to about 180 nested calls, and the
+runtime's own recursion over nested values (`==`, `<`, `repr`, `hash`
+of lists, tuples and dicts) to 10000 levels and to the C stack (sized
+from `RLIMIT_STACK`); past them it raises `RecursionError` (CPython:
+1000 frames and 10000 C levels). Source nested deeper than 2000 levels
+(parentheses, unary operators, conditional expressions) or whose
+expression tree is deeper than 20000 (a chain such as `1 + 1 + ...` or
+`a or b or ...` with that many operators: CPython parses `or` chains
+flat) is a `SyntaxError`. The repr of a list or dict that contains
+itself prints `[...]` / `{...}`.
 
 ## Classes
 
@@ -121,10 +134,14 @@ __or__ __xor__ __matmul__` and their reflected `__r*__` forms.
 
 *Differences:* a subclass of a builtin type other than `object` and the
 exception classes (`class C(list): pass`) creates plain instances of that
-builtin type: methods it adds are not visible on them. Operator methods
-that return `NotImplemented` are honoured on the general path but not on
-the in-loop fast path (a plain-function `__add__` taking exactly two
-parameters), where `NotImplemented` is the result. `__eq__` on instances
+builtin type: methods it adds are not visible on them. Operator and
+comparison methods returning `NotImplemented` fall back to the reflected
+method and then to `TypeError` (or identity for `==`/`!=`) as in
+CPython, with one exception: the in-loop fast path (a plain-function
+`__add__` or `__lt__` taking exactly two parameters) is used for
+functions that do not name `NotImplemented`, and a `NotImplemented`
+they get elsewhere (say from another method) becomes the result.
+`__eq__` on instances
 used as dict keys is called; on keys looked up with `in` against a
 list of builtin values it is not.
 
@@ -141,10 +158,23 @@ Exceptions are instances of a class hierarchy rooted at `BaseException`:
 `e.args`, `str(e)` and `repr(e)` as in CPython; the messages of the
 common runtime errors match CPython's. An uncaught exception prints
 `Traceback (most recent call last):`, the line, and `Type: message` to
-stderr and exits with status 1 (no full traceback). *Difference:*
+stderr and exits with status 1 (no full traceback). *Differences:*
 reading a local before assignment is not detected (it reads whatever the
 register holds); free variables before assignment raise
-`UnboundLocalError`.
+`UnboundLocalError`; messages name functions and classes by their plain
+names, not CPython's qualified names (`f()` rather than
+`outer.<locals>.f()`, "property has no setter"); `raise X from Y` sets
+no `__cause__`; int-to-str conversion has no digit limit (CPython
+raises `ValueError` past 4300 digits) and huge results raise
+`OverflowError` ("exponent too large") where CPython runs out of memory.
+
+*Differential testing:* `fuzz/gen.py` generates random programs in this
+subset (comparisons and rich comparisons, int/float/bigint arithmetic,
+string methods and formatting, slicing, mutation during iteration,
+exceptions, generators, closures, default arguments, classes) and
+`fuzz/run.py` compares their output with CPython's, snippet by snippet;
+`check.sh -q` runs a short fixed-seed campaign when
+`bench/python/install` is built.
 
 ## Builtins
 

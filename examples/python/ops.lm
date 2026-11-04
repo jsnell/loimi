@@ -55,14 +55,17 @@ pub fn init_dunders(c: *Ctx) {
 pub fn simple_method(c: *Ctx, cls: Gc<Box>, which: u64, nargs: u32) -> ?Gc<Func> {
     let Str(name) = c.dn[which] else { return None; };
     let Some(Func(f)) = class_lookup(cls, name) else { return None; };
-    if f.proto.simple != nargs { return None; }
+    if f.proto.simple != nargs or (f.proto.flags & vm.P_NOTIMPL) != 0 { return None; }
     Some(f)
 }
 
 /// The operator method for `a op b` to call in the loop: a's __op__ if a
 /// is an instance, else b's __rop__ (called as (b, a)).
 pub fn binop_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
-    if let Inst(i) = a { return simple_method(c, i.cls, op as u64, 2); }
+    if let Inst(i) = a {
+        if reflected_first(a, b) { return None; }
+        return simple_method(c, i.cls, op as u64, 2);
+    }
     if let Inst(i) = b {
         if value.is_num(a) or a == Value.Nil {
             return simple_method(c, i.cls, DN_RBASE + op as u64, 2);
@@ -74,9 +77,19 @@ pub fn binop_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
 /// The comparison method to call in the loop (b's reflected one when a is
 /// not an instance).
 pub fn cmp_method(c: *Ctx, op: u32, a: Value, b: Value) -> ?Gc<Func> {
-    if let Inst(i) = a { return simple_method(c, i.cls, DN_CMP + op as u64, 2); }
+    if let Inst(i) = a {
+        if reflected_first(a, b) { return None; }
+        return simple_method(c, i.cls, DN_CMP + op as u64, 2);
+    }
     if let Inst(i) = b and value.is_num(a) { return simple_method(c, i.cls, DN_CMP + swap_op(op) as u64, 2); }
     None
+}
+
+/// b's class is a proper subclass of a's: Python tries b's reflected
+/// method first.
+fn reflected_first(a: Value, b: Value) -> bool {
+    let (Inst(i), Inst(j)) = (a, b) else { return false; };
+    (i.cls as u64) != (j.cls as u64) and subclass(j.cls, i.cls)
 }
 
 /// `a == b` / `a != b` when an instance without __eq__/__ne__ is
@@ -175,7 +188,7 @@ pub fn attr_error(c: *Ctx, v: Value, name: Gc<Str>) -> Value {
     exc_buf(c, E_ATTRIBUTE, &b)
 }
 
-fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
+pub fn unsupported(c: *Ctx, op: str, a: Value, b: Value) -> Value {
     var m = text.StrBuf.new();
     m.push_str("unsupported operand type(s) for ");
     m.push_str(op);
@@ -1017,6 +1030,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
     builtins.count(builtins.CNT_ARITH);
     if value.is_int(a) and value.is_int(b) { return int_arith(c, op, a, b); }
     if value.is_num(a) and value.is_num(b) {
+        if op >= O_LSHIFT { return Err(unsupported(c, op_sym(op), a, b)); }
         let x = value.to_f64(a).unwrap();
         let y = value.to_f64(b).unwrap();
         return float_arith(c, op, x, y);
@@ -1075,23 +1089,65 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
             }
         }
     }
-    // User-defined operators.
-    if let Inst(_) = a {
-        let args = [b];
-        if let Some(r) = call_method(c, a, dunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
-    }
-    if let Inst(_) = b {
+    // User-defined operators: b's reflected method first when b's class
+    // is a proper subclass of a's, never when both have the same class.
+    let rfirst = reflected_first(a, b);
+    if rfirst {
         let args = [a];
         if let Some(r) = call_method(c, b, rdunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
     }
-    Err(unsupported(c, op_sym(op), a, b))
+    if let Inst(i) = a {
+        let args = [b];
+        if let Some(r) = call_method(c, a, dunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+        if let Inst(j) = b and (i.cls as u64) == (j.cls as u64) { return Err(unsupported(c, op_sym(op), a, b)); }
+    }
+    if let Inst(_) = b and !rfirst {
+        let args = [a];
+        if let Some(r) = call_method(c, b, rdunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+    }
+    Err(arith_type_error(c, op, a, b))
+}
+
+/// CPython's messages for `+` and `*` on sequences, else "unsupported
+/// operand type(s)".
+fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
+    let seq = |v: Value| -> bool { match v { Str(_) | List(_) | Tuple(_) => true, _ => false } };
+    if op == O_ADD and !is_inst(b) {
+        let what = match a { List(_) => "list", Tuple(_) => "tuple", _ => "" };
+        if what.len > 0 {
+            var m = text.StrBuf.new();
+            m.push_str("can only concatenate ");
+            m.push_str(what);
+            m.push_str(" (not \"");
+            m.push_str(type_name(c, b));
+            m.push_str("\") to ");
+            m.push_str(what);
+            return exc_buf(c, E_TYPE, &m);
+        }
+    }
+    if op == O_MUL and (seq(a) or seq(b)) and !is_inst(a) and !is_inst(b) {
+        var m = text.StrBuf.new();
+        m.push_str("can't multiply sequence by non-int of type '");
+        m.push_str(type_name(c, if seq(a) { b } else { a }));
+        m.push('\'');
+        return exc_buf(c, E_TYPE, &m);
+    }
+    unsupported(c, op_sym(op), a, b)
 }
 
 /// Sequence repetition `seq * n`.
+fn exc_of_empty_kind(c: *Ctx, kind: u64) -> Value {
+    let e = exc_of(c, c.excs[kind].unwrap(), Value.Nil);
+    if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0))); }
+    e
+}
+
 fn repeat(c: *Ctx, seq: Value, n: Value) -> Result<?Value, Value> {
     let Some(k0) = value.as_i64(n) else { return Ok(None); };
     if let Float(_) = n { return Ok(None); }
     let k = if k0 < 0 { 0 } else { k0 as u64 };
+    let len = match seq { Str(s) => s.data.len, _ => value.seq_len(seq) };
+    if len > 0 and k > (1 << 27) / len { return Err(exc_of_empty_kind(c, builtins.E_MEMORY)); }
     match seq {
         Str(s) => {
             let r = new(&c.heap, Str { hash: 0 }, s.data.len * k);
@@ -1134,7 +1190,8 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             }
             O_TRUEDIV => {
                 if y == 0 { return Err(zero_div(c, "division by zero")); }
-                return Ok(Value.Float((x as f64) / (y as f64)));
+                let lim: i64 = 9007199254740992; // 2**53: exact as doubles
+                if x >= 0 - lim and x <= lim and y >= 0 - lim and y <= lim { return Ok(Value.Float((x as f64) / (y as f64))); }
             }
             O_BAND => return Ok(value.int_val(h, x & y)),
             O_BOR => return Ok(value.int_val(h, x | y)),
@@ -1163,18 +1220,18 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             Ok(r)
         }
         O_TRUEDIV => {
-            let y = value.to_f64(b).unwrap();
-            if y == 0.0 { return Err(zero_div(c, "division by zero")); }
-            // Exact quotient first, so that big multiples divide exactly.
-            let Some((q, r)) = big.divmod(h, a, b) else { return Err(zero_div(c, "division by zero")); };
-            Ok(Value.Float(value.to_f64(q).unwrap() + value.to_f64(r).unwrap() / y))
+            if big.bit_length(b) == 0 { return Err(zero_div(c, "division by zero")); }
+            if big.bit_length(a) <= 53 and big.bit_length(b) <= 53 {
+                return Ok(Value.Float(value.to_f64(a).unwrap() / value.to_f64(b).unwrap()));
+            }
+            int_true_div(c, a, b)
         }
         O_POW => {
             if big.is_neg(b) {
                 let x = value.to_f64(a).unwrap();
                 let y = value.to_f64(b).unwrap();
-                if x == 0.0 { return Err(zero_div(c, "zero to a negative power")); }
-                return Ok(Value.Float(builtins.pow_f(x, y)));
+                if x == 0.0 { return Err(zero_div(c, "0.0 cannot be raised to a negative power")); }
+                return Ok(float_pow(c, x, y)?);
             }
             let Some(e) = value.as_i64(b) else { return Err(exc(c, E_OVERFLOW, "exponent too large")); };
             Ok(big.pow(h, a, e as u64))
@@ -1205,6 +1262,69 @@ fn small(v: Value) -> ?i64 {
     }
 }
 
+/// x ** y for floats: OverflowError when finite operands overflow.
+fn float_pow(c: *Ctx, x: f64, y: f64) -> Result<Value, Value> {
+    let r = builtins.pow_f(x, y);
+    if r - r != 0.0 and r == r and x - x == 0.0 and y - y == 0.0 {
+        let e = exc_of(c, c.excs[E_OVERFLOW].unwrap(), Value.Int(34));
+        if let Inst(i) = e {
+            let t = value.new_tuple(&c.heap, 2);
+            t.items[0] = Value.Int(34);
+            t.items[1] = Value.Str(vm.intern(c, "Numerical result out of range"));
+            value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+        }
+        return Err(e);
+    }
+    Ok(Value.Float(r))
+}
+
+extern "C" fn ldexp(x: f64, e: i32) -> f64;
+
+/// a / b for ints, correctly rounded (CPython's long_true_divide): a
+/// quotient of at least 55 bits with a sticky bit for the remainder,
+/// converted once and scaled.
+fn int_true_div(c: *Ctx, a: Value, b: Value) -> Result<Value, Value> {
+    let h = &c.heap;
+    let neg = big.is_neg(a) != big.is_neg(b);
+    let x = big.abs(h, a);
+    let y = big.abs(h, b);
+    if big.bit_length(x) == 0 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let k = big.bit_length(x) as i64 - big.bit_length(y) as i64 - 56;
+    if k < -1200 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let (n, d) = if k >= 0 { (x, big.shl(h, y, k as u64)) } else { (big.shl(h, x, (0 - k) as u64), y) };
+    let Some((q0, r)) = big.divmod(h, n, d) else { return Err(zero_div(c, "division by zero")); };
+    var q = q0;
+    if big.bit_length(r) != 0 { q = big.bitop(h, q, Value.Int(1), 1); }
+    if k > 2000 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    let e = if k < -2000 { -2000 } else { k };
+    let f = ldexp(value.to_f64(q).unwrap(), e as i32);
+    if f - f != 0.0 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    Ok(Value.Float(if neg { -f } else { f }))
+}
+
+fn copysign0(s: f64) -> f64 { if (s.to_bits() >> 63) != 0 { -0.0 } else { 0.0 } }
+
+/// CPython's float_divmod (y != 0): floor quotient and modulo with the
+/// signs and infinities as CPython has them (`1/3 // -inf` is -1.0,
+/// `-0.0 % 5` is 0.0).
+pub fn float_divmod(x: f64, y: f64) -> (f64, f64) {
+    var m = x % y;
+    var div = (x - m) / y;
+    if m != 0.0 {
+        if (y < 0.0) != (m < 0.0) { m += y; div -= 1.0; }
+    } else {
+        m = copysign0(y);
+    }
+    var fd: f64 = 0.0;
+    if div != 0.0 {
+        fd = div.floor();
+        if div - fd > 0.5 { fd += 1.0; }
+    } else {
+        fd = copysign0(x / y);
+    }
+    (fd, m)
+}
+
 pub fn float_arith(c: *Ctx, op: u32, x: f64, y: f64) -> Result<Value, Value> {
     match op {
         O_ADD => Ok(Value.Float(x + y)),
@@ -1216,15 +1336,15 @@ pub fn float_arith(c: *Ctx, op: u32, x: f64, y: f64) -> Result<Value, Value> {
         }
         O_FLOORDIV => {
             if y == 0.0 { return Err(zero_div(c, "float floor division by zero")); }
-            Ok(Value.Float(num.floor_div_f64(x, y)))
+            Ok(Value.Float(float_divmod(x, y).0))
         }
         O_MOD => {
             if y == 0.0 { return Err(zero_div(c, "float modulo by zero")); }
-            Ok(Value.Float(num.floor_mod_f64(x, y)))
+            Ok(Value.Float(float_divmod(x, y).1))
         }
         O_POW => {
-            if x == 0.0 and y < 0.0 { return Err(zero_div(c, "zero to a negative power")); }
-            Ok(Value.Float(builtins.pow_f(x, y)))
+            if x == 0.0 and y < 0.0 { return Err(zero_div(c, "0.0 cannot be raised to a negative power")); }
+            Ok(float_pow(c, x, y)?)
         }
         _ => Err(unsupported(c, op_sym(op), Value.Float(x), Value.Float(y))),
     }
@@ -1244,7 +1364,7 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
             return Ok(Value.Int((~i) as i48));
         }
         Float(x) => {
-            if op == U_NEG { return Ok(Value.Float(0.0 - x)); }
+            if op == U_NEG { return Ok(Value.Float(-x)); }
             if op == U_POS { return Ok(a); }
         }
         Long(_) => {
@@ -1325,75 +1445,181 @@ pub fn compare(c: *Ctx, op: u32, a: Value, b: Value) -> Result<bool, Value> uses
     truthy(c, r)
 }
 
-/// Python rich comparison; the result may be any value for instances.
+/// Bound on the runtime's own recursion over nested values (repr, ==,
+/// <, hash); CPython's C recursion limit is 10000 too.
+pub const C_DEPTH_MAX: u64 = 10000;
+
+pub fn recursion_error(c: *Ctx, what: str) -> Value {
+    var m = text.StrBuf.new();
+    m.push_str("maximum recursion depth exceeded");
+    m.push_str(what);
+    exc_buf(c, builtins.E_RECURSION, &m)
+}
+
+/// The C stack is nearly used up (vm.Ctx.stack_low).
+pub fn stack_low(c: *Ctx) -> bool {
+    var probe: u64 = 0;
+    (&probe) as u64 < c.stack_low
+}
+
+/// Enter one level of native recursion (`c_depth`), or RecursionError.
+pub fn enter(c: *Ctx, what: str) -> Result<(), Value> {
+    if c.c_depth >= C_DEPTH_MAX or stack_low(c) { return Err(recursion_error(c, what)); }
+    c.c_depth += 1;
+    Ok(())
+}
+
+/// x's rich comparison method for `op` called with y: None when x has
+/// none or it returns NotImplemented. `__ne__` defaults to the inverse of
+/// `__eq__`, as object.__ne__ does.
+fn rich_method(c: *Ctx, op: u32, x: Value, y: Value) -> Result<?Value, Value> uses reenter {
+    let args = [y];
+    if let Some(r) = call_method_s(c, x, dn(c, DN_CMP + op as u64), args[..])? {
+        if is_notimpl(r) { return Ok(None); }
+        return Ok(Some(r));
+    }
+    if op == C_NE {
+        if let Some(r) = call_method_s(c, x, dn(c, DN_EQ), args[..])? {
+            if is_notimpl(r) { return Ok(None); }
+            return Ok(Some(Value.Bool(!truthy(c, r)?)));
+        }
+    }
+    Ok(None)
+}
+
+pub fn is_inst(v: Value) -> bool {
+    if let Inst(_) = v { return true; }
+    false
+}
+
+/// Python rich comparison (CPython's do_richcompare); the result may be
+/// any value for instances.
+/// (Recursion over nested lists goes through compare_value and
+/// seq_compare only, which keep small frames.)
 pub fn compare_value(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_COMPARE);
-    if let Inst(_) = a {
-        let args = [b];
-        if let Some(r) = call_method_s(c, a, dn(c, DN_CMP + op as u64), args[..])? { if !is_notimpl(r) { return Ok(r); } }
-    }
-    if let Inst(_) = b {
-        let args = [a];
-        if let Some(r) = call_method_s(c, b, dn(c, DN_CMP + swap_op(op) as u64), args[..])? { if !is_notimpl(r) { return Ok(r); } }
-    }
+    if is_inst(a) or is_inst(b) { return compare_inst(c, op, a, b); }
     if op == C_EQ { return Ok(Value.Bool(equal(c, a, b)?)); }
     if op == C_NE { return Ok(Value.Bool(!equal(c, a, b)?)); }
-    let Some(r) = order(c, a, b)? else {
-        var m = text.StrBuf.new();
-        m.push_str("'");
-        m.push_str(cmp_name(op));
-        m.push_str("' not supported between instances of '");
-        m.push_str(type_name(c, a));
-        m.push_str("' and '");
-        m.push_str(type_name(c, b));
-        m.push('\'');
-        return Err(exc_buf(c, E_TYPE, &m));
-    };
-    if r == 2 { return Ok(Value.Bool(false)); } // NaN
+    match (a, b) {
+        (List(_), List(_)) | (Tuple(_), Tuple(_)) => return seq_compare(c, op, a, b),
+        _ => {}
+    }
+    compare_order(c, op, a, b)
+}
+
+#[inline(never)]
+fn compare_order(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
+    let Some(r) = order(c, a, b)? else { return Err(cmp_type_error(c, op, a, b)); };
+    if r == 2 { return Ok(Value.Bool(false)); } // NaN, or sets neither subset nor superset
     Ok(Value.Bool(ord_result(op, r)))
 }
 
-/// Python ==, calling __eq__ on instances.
+/// `a op b` with an instance on either side.
+#[inline(never)]
+fn compare_inst(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
+    let ai = is_inst(a);
+    let bi = is_inst(b);
+    {
+        let rfirst = reflected_first(a, b);
+        if rfirst {
+            if let Some(r) = rich_method(c, swap_op(op), b, a)? { return Ok(r); }
+        }
+        if ai {
+            if let Some(r) = rich_method(c, op, a, b)? { return Ok(r); }
+        }
+        if bi and !rfirst {
+            if let Some(r) = rich_method(c, swap_op(op), b, a)? { return Ok(r); }
+        }
+        // object's comparisons: identity for == and !=, else unsupported.
+        if op == C_EQ { return Ok(Value.Bool(a == b)); }
+        if op == C_NE { return Ok(Value.Bool(a != b)); }
+        Err(cmp_type_error(c, op, a, b))
+    }
+}
+
+#[inline(never)]
+fn cmp_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
+    var m = text.StrBuf.new();
+    m.push_str("'");
+    m.push_str(cmp_name(op));
+    m.push_str("' not supported between instances of '");
+    m.push_str(type_name(c, a));
+    m.push_str("' and '");
+    m.push_str(type_name(c, b));
+    m.push('\'');
+    exc_buf(c, E_TYPE, &m)
+}
+
+/// Python ==, calling __eq__ on instances (with the identity shortcut
+/// containers use).
 pub fn equal(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
     if a == b {
         if let Float(f) = a { return Ok(f == f); }
         return Ok(true);
     }
-    if value.is_num(a) and value.is_num(b) {
-        let Some(r) = order(c, a, b)? else { return Ok(false); };
-        return Ok(r == 0);
-    }
     match (a, b) {
-        (Inst(_), _) => {
-            let args = [b];
-            if let Some(r) = call_method_s(c, a, dn(c, DN_EQ), args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
-            if let Inst(_) = b {
-                let args2 = [a];
-                if let Some(r) = call_method_s(c, b, dn(c, DN_EQ), args2[..])? { if !is_notimpl(r) { return truthy(c, r); } }
-            }
-            Ok(false)
+        (Inst(_), _) | (_, Inst(_)) => equal_inst(c, a, b),
+        (List(_), List(_)) | (Tuple(_), Tuple(_)) | (Dict(_), Dict(_)) => {
+            enter(c, " in comparison")?;
+            let r = container_equal(c, a, b);
+            c.c_depth -= 1;
+            r
         }
-        (_, Inst(_)) => {
-            let args = [a];
-            if let Some(r) = call_method_s(c, b, dn(c, DN_EQ), args[..])? { if !is_notimpl(r) { return truthy(c, r); } }
-            Ok(false)
-        }
-        (List(x), List(y)) => {
-            if x.len != y.len { return Ok(false); }
-            for i in 0..x.len { if !equal(c, x.arr.items[i], y.arr.items[i])? { return Ok(false); } }
-            Ok(true)
-        }
-        (Tuple(x), Tuple(y)) => {
-            if x.items.len != y.items.len { return Ok(false); }
-            for i in 0..x.items.len { if !equal(c, x.items[i], y.items[i])? { return Ok(false); } }
-            Ok(true)
-        }
-        _ => Ok(value.eq_builtin(a, b)),
+        _ => Ok(equal_scalar(c, a, b)),
     }
 }
 
-/// Three-way order: -1, 0, 1, 2 for unordered (NaN), None if not comparable.
-pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
+#[inline(never)]
+fn equal_scalar(c: *Ctx, a: Value, b: Value) -> bool {
+    if value.is_num(a) and value.is_num(b) {
+        if let Ok(Some(r)) = order(c, a, b) { return r == 0; }
+        return false;
+    }
+    value.eq_builtin(a, b)
+}
+
+#[inline(never)]
+fn equal_inst(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
+    let r = compare_value(c, C_EQ, a, b)?;
+    if let Bool(x) = r { return Ok(x); }
+    truthy(c, r)
+}
+
+/// == of two lists, two tuples or two dicts. `__eq__` may change a list
+/// or dict, so each step reads the current items, as CPython does.
+#[inline(never)]
+fn container_equal(c: *Ctx, a: Value, b: Value) -> Result<bool, Value> uses reenter {
+    if let (Dict(x), Dict(y)) = (a, b) { return dict_equal(c, x, y); }
+    if value.seq_len(a) != value.seq_len(b) { return Ok(false); }
+    var i: u64 = 0;
+    loop {
+        let (Some(x), Some(y)) = (value.seq_at(a, i), value.seq_at(b, i)) else { break; };
+        if !equal(c, x, y)? { return Ok(false); }
+        i += 1;
+    }
+    Ok(value.seq_len(a) == value.seq_len(b))
+}
+
+#[inline(never)]
+fn dict_equal(c: *Ctx, x: Gc<Dict>, y: Gc<Dict>) -> Result<bool, Value> uses reenter {
+    {
+        if x.len != y.len { return Ok(false); }
+        var it: u64 = 0;
+        while let Some(e) = value.dict_next(x, &it) {
+            let k = value.dict_key(x, e);
+            let v = value.dict_val(x, e);
+            let Some(w) = dict_lookup(c, y, k)? else { return Ok(false); };
+            if !equal(c, v, w)? { return Ok(false); }
+        }
+        Ok(true)
+    }
+}
+
+/// Three-way order of numbers, strings and sets: -1, 0, 1, 2 for
+/// unordered (NaN; sets neither subset nor superset), None if not
+/// comparable.
+pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> {
     if value.is_int(a) and value.is_int(b) {
         if let (Some(x), Some(y)) = (small(a), small(b)) { return Ok(Some(if x < y { -1 } else if x > y { 1 } else { 0 })); }
         return Ok(Some(big.cmp(a, b)));
@@ -1404,14 +1630,9 @@ pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
         if x != x or y != y { return Ok(Some(2)); }
         return Ok(Some(if x < y { -1 } else if x > y { 1 } else { 0 }));
     }
+    let _ = c;
     match (a, b) {
         (Str(x), Str(y)) => Ok(Some(mem.compare_bytes(x.data, y.data))),
-        (List(_), List(_)) | (Tuple(_), Tuple(_)) => seq_order(c, a, b),
-        (Inst(_), _) | (_, Inst(_)) => {
-            if compare(c, C_LT, a, b)? { return Ok(Some(-1)); }
-            if compare(c, C_GT, a, b)? { return Ok(Some(1)); }
-            Ok(Some(0))
-        }
         (Obj(x), Obj(y)) => {
             if (x.kind == K_SET or x.kind == K_FROZENSET) and (y.kind == K_SET or y.kind == K_FROZENSET) {
                 return Ok(Some(builtins.set_order(x, y)));
@@ -1422,21 +1643,23 @@ pub fn order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
     }
 }
 
-/// Lexicographic order of two lists or two tuples. `__eq__` may change
-/// a list (and move its items to a new array, letting the
-/// collector free the old one), so each step reads the current items, as
-/// CPython does.
-fn seq_order(c: *Ctx, a: Value, b: Value) -> Result<?i32, Value> uses reenter {
+/// `a op b` for two lists or two tuples (CPython's list_richcompare):
+/// the first items that differ decide, compared with `op` itself.
+#[inline(never)]
+fn seq_compare(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
     var i: u64 = 0;
     loop {
         let (Some(x), Some(y)) = (value.seq_at(a, i), value.seq_at(b, i)) else { break; };
         if !equal(c, x, y)? {
-            return order(c, x, y);
+            enter(c, " in comparison")?;
+            let r = compare_value(c, op, x, y);
+            c.c_depth -= 1;
+            return r;
         }
         i += 1;
     }
     let (n, m) = (value.seq_len(a), value.seq_len(b));
-    Ok(Some(if n < m { -1 } else if n > m { 1 } else { 0 }))
+    Ok(Value.Bool(ord_result(op, if n < m { -1 } else if n > m { 1 } else { 0 })))
 }
 
 // ── containers ──────────────────────────────────────────────────────
@@ -1451,9 +1674,11 @@ pub fn hash_key(c: *Ctx, v: Value) -> Result<u64, Value> uses reenter {
         return Ok(hash.mix(v as u64));
     }
     let Some(hv) = value.hash_of(v) else {
+        let Ok(part) = value.unhashable_part(v, 0) else { return Err(recursion_error(c, " while hashing")); };
+        let bad = part ?? v;
         var m = text.StrBuf.new();
         m.push_str("unhashable type: '");
-        m.push_str(type_name(c, v));
+        m.push_str(type_name(c, bad));
         m.push('\'');
         return Err(exc_buf(c, E_TYPE, &m));
     };
@@ -1532,8 +1757,26 @@ fn seq_index(c: *Ctx, key: Value, n: u64, what: str) -> Result<u64, Value> {
     Ok(j as u64)
 }
 
-pub fn getindex(c: *Ctx, obj: Value, key: Value) -> Result<Value, Value> uses reenter {
+/// An instance used as an index: its __index__ (else the instance).
+pub fn index_of(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
+    if let Inst(_) = v {
+        if let Some(r) = call_method(c, v, "__index__", [])? {
+            if !value.is_int(r) {
+                var m = text.StrBuf.new();
+                m.push_str("__index__ returned non-int (type ");
+                m.push_str(type_name(c, r));
+                m.push(')');
+                return Err(exc_buf(c, E_TYPE, &m));
+            }
+            return Ok(r);
+        }
+    }
+    Ok(v)
+}
+
+pub fn getindex(c: *Ctx, obj: Value, key0: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_GETINDEX);
+    let key = match obj { List(_) | Tuple(_) | Str(_) => index_of(c, key0)?, _ => key0 };
     if let Obj(sl) = key and sl.kind == K_SLICE { return getslice(c, obj, sl.a, sl.b, sl.c); }
     match obj {
         List(l) => Ok(l.arr.items[seq_index(c, key, l.len, "list")?]),
@@ -1572,8 +1815,9 @@ fn not_subscriptable(c: *Ctx, obj: Value) -> Value {
     exc_buf(c, E_TYPE, &m)
 }
 
-pub fn setindex(c: *Ctx, obj: Value, key: Value, v: Value) -> Result<(), Value> uses reenter {
+pub fn setindex(c: *Ctx, obj: Value, key0: Value, v: Value) -> Result<(), Value> uses reenter {
     builtins.count(builtins.CNT_SETINDEX);
+    let key = if let List(_) = obj { index_of(c, key0)? } else { key0 };
     if let Obj(sl) = key and sl.kind == K_SLICE { return setslice(c, obj, sl.a, sl.b, sl.c, v); }
     match obj {
         List(l) => {
@@ -1597,7 +1841,8 @@ pub fn setindex(c: *Ctx, obj: Value, key: Value, v: Value) -> Result<(), Value> 
     }
 }
 
-pub fn delindex(c: *Ctx, obj: Value, key: Value) -> Result<(), Value> uses reenter {
+pub fn delindex(c: *Ctx, obj: Value, key0: Value) -> Result<(), Value> uses reenter {
+    let key = if let List(_) = obj { index_of(c, key0)? } else { key0 };
     match obj {
         List(l) => {
             if let Obj(sl) = key and sl.kind == K_SLICE {
@@ -1720,7 +1965,14 @@ pub fn setslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value, v: Value) 
     let src = to_list(c, v)?;
     let (start, stop0, step, n) = slice_indices(c, lo, hi, st, l.len)?;
     if step != 1 {
-        if src.len != n { return Err(exc(c, E_VALUE, "attempt to assign sequence of wrong size to extended slice")); }
+        if src.len != n {
+            var m = text.StrBuf.new();
+            m.push_str("attempt to assign sequence of size ");
+            m.push_int(src.len as i64);
+            m.push_str(" to extended slice of size ");
+            m.push_int(n as i64);
+            return Err(exc_buf(c, E_VALUE, &m));
+        }
         var j = start;
         for i in 0..n { l.arr.items[j as u64] = src.arr.items[i]; j += step; }
         return Ok(());
@@ -1897,6 +2149,19 @@ pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Resu
 
 // ── iteration ───────────────────────────────────────────────────────
 
+/// An iterator over dict `d`: keys (mode 0), values (1), items (2) or a
+/// set's elements (3). `s` is the size it started with and `b` the
+/// number of entries still expected, for CPython's RuntimeErrors when
+/// the dict changes during iteration.
+fn dict_iter(c: *Ctx, d: Gc<Dict>, mode: i64) -> Value {
+    let b = value.new_box(&c.heap, K_DICTIT, 0);
+    b.a = Value.Dict(d);
+    b.m = mode;
+    b.s = d.len as i64;
+    b.b = Value.Int(d.len as i48);
+    Value.Obj(b)
+}
+
 pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_GETITER);
     match v {
@@ -1905,12 +2170,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
             b.a = v;
             Ok(Value.Obj(b))
         }
-        Dict(_) => {
-            let b = value.new_box(&c.heap, K_DICTIT, 0);
-            b.a = v;
-            b.m = 0;
-            Ok(Value.Obj(b))
-        }
+        Dict(d) => Ok(dict_iter(c, d, 0)),
         Obj(o) => {
             match o.kind {
                 K_RANGE => {
@@ -1918,17 +2178,10 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                     b.n = o.n; b.m = o.m; b.s = o.s;
                     Ok(Value.Obj(b))
                 }
-                K_SET | K_FROZENSET => {
-                    let b = value.new_box(&c.heap, K_DICTIT, 0);
-                    b.a = Value.Dict(o.dict.unwrap());
-                    b.m = 0;
-                    Ok(Value.Obj(b))
-                }
+                K_SET | K_FROZENSET => Ok(dict_iter(c, o.dict.unwrap(), 3)),
                 K_DICTVIEW => {
-                    let b = value.new_box(&c.heap, K_DICTIT, 0);
-                    b.a = o.a;
-                    b.m = o.m;
-                    Ok(Value.Obj(b))
+                    let Dict(d) = o.a else { trap() };
+                    Ok(dict_iter(c, d, o.m))
                 }
                 K_CLASS | K_BOUND | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
                     Err(not_iterable(c, v))
@@ -1993,11 +2246,22 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                 }
                 K_DICTIT => {
                     let Dict(d) = b.a else { trap() };
+                    if b.s != -1 and d.len as i64 != b.s {
+                        b.s = -2; // sticky, as in CPython
+                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary changed size during iteration" }));
+                    }
                     var i = b.n as u64;
                     let r = value.dict_next(d, &i);
                     b.n = i as i64;
                     let Some(e) = r else { return Ok(None); };
-                    if b.m == 0 { return Ok(Some(value.dict_key(d, e))); }
+                    let Int(left) = b.b else { trap() };
+                    if left == 0 and b.s >= 0 {
+                        b.s = -1; // exhausted from now on
+                        b.n = 0x7fffffffffffffff;
+                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary keys changed during iteration" }));
+                    }
+                    b.b = Value.Int(left - 1);
+                    if b.m == 0 or b.m == 3 { return Ok(Some(value.dict_key(d, e))); }
                     if b.m == 1 { return Ok(Some(value.dict_val(d, e))); }
                     let t = value.new_tuple(&c.heap, 2);
                     t.items[0] = value.dict_key(d, e);
