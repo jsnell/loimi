@@ -265,6 +265,37 @@ pub vm Wam {
     }
     }
 
+    /// The last argument of a head structure is a list cell, matched now:
+    /// `s` moves into it (read mode), or into a new cell stored there
+    /// (write mode, or binding a variable found there).
+    op UNIFY_LIST() : A {
+        if wm {
+            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            *s = Term.Lst(c);
+            s = c as *Term;
+            next
+        }
+        let t = deref(*s);
+        if let Lst(c) = t { s = c as *Term; next }
+        if let Ref(v) = t {
+            if can_bind(v) {
+                let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+                bind_now(v, Term.Lst(c));
+                s = c as *Term;
+                wm = true;
+                next
+            }
+            cold {
+                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
+                ctx.bind(v, Term.Lst(c));
+                s = c as *Term;
+                wm = true;
+                next
+            }
+        }
+        backtrack()
+    }
+
     /// A compound argument of a head structure, matched later by
     /// GET_NESTED/GET_NESTED_LIST `r`: read mode loads it, write mode
     /// leaves `Unb` in `r` and the slot in `ctx.pendp()[r]`.

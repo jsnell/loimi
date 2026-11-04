@@ -546,6 +546,9 @@ fn C.unify_args(c: *C, t0: Term) {
     loop {
         let n = match t { Str(s) => s.args.len, _ => 2 };
         var voids: u64 = 0;
+        // A list cell as the last argument, with nothing else pending, is
+        // matched next: UNIFY_LIST moves into it without a register.
+        var tail: ?Term = None;
         for i in 0..n {
             let a = deref(term.arg_of(t, i));
             if let Ref(_) = a {
@@ -572,6 +575,15 @@ fn C.unify_args(c: *C, t0: Term) {
                 }
                 Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
                 Big(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+                Lst(_) => {
+                    if i + 1 == n and wi == work.len {
+                        tail = Some(a);
+                    } else {
+                        let r = c.temp();
+                        c.emit(Wam.UNIFY_NESTED(r as u8));
+                        work.push((r, a));
+                    }
+                }
                 _ => {
                     let r = c.temp();
                     c.emit(Wam.UNIFY_NESTED(r as u8));
@@ -580,6 +592,11 @@ fn C.unify_args(c: *C, t0: Term) {
             }
         }
         if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); }
+        if let Some(a) = tail {
+            c.emit(Wam.UNIFY_LIST());
+            t = a;
+            continue;
+        }
         if wi == work.len { break; }
         let (r, a) = work.ptr[wi];
         wi += 1;
