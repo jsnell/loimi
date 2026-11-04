@@ -317,8 +317,8 @@ struct Fa<'a> {
     report: bool,
     unsafe_spans: &'a [Span],
     audit: Option<&'a crate::diag::SourceMap>,
-    kinds: &'a mut HashMap<Ty, Kind>,
-    whys: Vec<(Span, String)>,
+    kinds: &'a mut Kinds,
+    whys: Vec<(Span, Why)>,
     errs: Vec<Diag>,
     /// Audit mode: the `lifetime-site` lines.
     lines: Vec<String>,
@@ -330,6 +330,25 @@ struct Fa<'a> {
     defers: Vec<Vec<&'a TExpr>>,
     out: Summary,
     param_idx: HashMap<LocalId, u32>,
+    nev: u64,
+    nloop: u64,
+    ncall: u64,
+}
+
+/// `kind_of`, memoized by type and by the address of a type in the program.
+#[derive(Default)]
+struct Kinds {
+    by_ty: HashMap<Ty, Kind>,
+    by_addr: HashMap<usize, Kind>,
+}
+
+/// Why a local may dangle (formatted only for a message).
+enum Why {
+    Text(String),
+    /// The call of a function (or of a function value).
+    Call(Option<FnId>),
+    /// A call that may collect.
+    Collect(Option<FnId>),
 }
 
 fn kind_of(p: &Program, t: &Ty, memo: &mut HashMap<Ty, Kind>, depth: u32) -> Kind {
@@ -383,17 +402,39 @@ fn kind_of(p: &Program, t: &Ty, memo: &mut HashMap<Ty, Kind>, depth: u32) -> Kin
 }
 
 impl<'a> Fa<'a> {
-    fn kind(&mut self, t: &Ty) -> Kind {
-        kind_of(self.p, t, self.kinds, 0)
+    fn kind(&mut self, t: &'a Ty) -> Kind {
+        // Every type asked about is in the program (`'a`), so its
+        // address identifies it for the whole pass.
+        let a = t as *const Ty as usize;
+        if let Some(k) = self.kinds.by_addr.get(&a) {
+            return *k;
+        }
+        let k = kind_of(self.p, t, &mut self.kinds.by_ty, 0);
+        self.kinds.by_addr.insert(a, k);
+        k
     }
 
     fn in_unsafe(&self, s: Span) -> bool {
         self.unsafe_spans.iter().any(|u| u.file == s.file && u.lo <= s.lo && s.hi <= u.hi)
     }
 
-    fn why(&mut self, span: Span, what: String) -> u32 {
+    fn why(&mut self, span: Span, what: Why) -> u32 {
         self.whys.push((span, what));
         (self.whys.len() - 1) as u32
+    }
+
+    fn why_text(&self, w: u32) -> (Span, String) {
+        let (s, why) = &self.whys[w as usize];
+        let name = |id: &Option<FnId>| match id {
+            Some(id) => format!("the call of `{}`", self.p.fns[*id as usize].name),
+            None => "this call".into(),
+        };
+        let t = match why {
+            Why::Text(t) => t.clone(),
+            Why::Call(id) => name(id),
+            Why::Collect(id) => format!("{} (which may collect)", name(id)),
+        };
+        (*s, t)
     }
 
     fn error(&mut self, span: Span, msg: String, notes: Vec<(Span, String)>) {
@@ -420,9 +461,9 @@ impl<'a> Fa<'a> {
     /// What a local points into before it is assigned (parameters, vm
     /// state): its own pointee.
     fn symbolic(&mut self, l: LocalId) -> Val {
-        let t = self.f.locals[l as usize].ty.clone();
+        let t = &self.f.locals[l as usize].ty;
         let mut v = Val::new();
-        match self.kind(&t) {
+        match self.kind(t) {
             Kind::Ptr => {
                 v.insert(Path::new(Root::Local(l)).push(Step::D));
             }
@@ -436,7 +477,7 @@ impl<'a> Fa<'a> {
 
     fn use_local(&mut self, l: LocalId, span: Span, st: &St) {
         if let Some(&w) = st.stale.get(&l) {
-            let (ws, what) = self.whys[w as usize].clone();
+            let (ws, what) = self.why_text(w);
             let msg = format!("{} may dangle: it points into memory that {} may have moved or freed", self.local_name(l), what);
             self.error(
                 span,
@@ -452,9 +493,9 @@ impl<'a> Fa<'a> {
     fn read_local(&mut self, l: LocalId, span: Span, st: &St) -> Val {
         self.use_local(l, span, st);
         let ld = &self.f.locals[l as usize];
-        let t = ld.ty.clone();
+        let t = &ld.ty;
         let mutable = ld.mutable;
-        match self.kind(&t) {
+        match self.kind(t) {
             Kind::None => Val::new(),
             Kind::Gc if !mutable => [Path::new(Root::GcLocal(l))].into_iter().collect(),
             k => {
@@ -469,7 +510,7 @@ impl<'a> Fa<'a> {
     }
 
     /// The value read from memory at `paths`, of type `t`.
-    fn read_mem(&mut self, paths: &[Path], t: &Ty) -> Val {
+    fn read_mem(&mut self, paths: &[Path], t: &'a Ty) -> Val {
         match self.kind(t) {
             Kind::None => Val::new(),
             Kind::Ptr => paths.iter().map(|p| p.push(Step::D)).collect(),
@@ -481,7 +522,7 @@ impl<'a> Fa<'a> {
     fn check_place_read(&mut self, paths: &[Path], span: Span, st: &St) {
         for (sp, w) in st.stale_places.iter() {
             if paths.iter().any(|p| p.root == sp.root && p.steps.len() >= sp.steps.len() && p.steps[..sp.steps.len()] == sp.steps[..]) {
-                let (ws, what) = self.whys[*w as usize].clone();
+                let (ws, what) = self.why_text(*w);
                 self.error(
                     span,
                     format!("this place's buffers may have been freed through a copy of it ({})", what),
@@ -681,7 +722,7 @@ impl<'a> Fa<'a> {
             }
             for pl in &ps {
                 if self.dest(pl) != FRAME {
-                    let w = self.why(span, String::new());
+                    let w = self.why(span, Why::Text(String::new()));
                     Rc::make_mut(&mut st.esc).insert((pl.clone(), q.clone(), w));
                 }
             }
@@ -714,8 +755,8 @@ impl<'a> Fa<'a> {
     }
 
     fn assign_local(&mut self, l: LocalId, v: Val, st: &mut St) {
-        let t = self.f.locals[l as usize].ty.clone();
-        let k = self.kind(&t);
+        let t = &self.f.locals[l as usize].ty;
+        let k = self.kind(t);
         if st.stale.contains_key(&l) {
             Rc::make_mut(&mut st.stale).remove(&l);
         }
@@ -754,7 +795,7 @@ impl<'a> Fa<'a> {
     /// makes two owners of its buffers.
     fn note_copy(&mut self, l: LocalId, x: &'a TExpr, st: &mut St) {
         let t = &self.f.locals[l as usize].ty;
-        if matches!(t, Ty::Slice(_)) || self.kind(&t.clone()) != Kind::Agg {
+        if matches!(t, Ty::Slice(_)) || self.kind(t) != Kind::Agg {
             return;
         }
         let src = match &x.kind {
@@ -806,14 +847,16 @@ impl<'a> Fa<'a> {
     }
 
     fn call(&mut self, e: &'a TExpr, f: &'a TExpr, args: &'a [TExpr], st: &mut St) -> Val {
+        self.ncall += 1;
         self.eval(f, st);
         let vals: Vec<Val> = args.iter().map(|a| self.eval(a, st)).collect();
         let callee = match f.kind {
             TK::FnRef(id) => Some(id),
             _ => None,
         };
-        let name = match callee {
-            Some(id) => format!("`{}`", self.p.fns[id as usize].name),
+        let prog = self.p;
+        let name = move || match callee {
+            Some(id) => format!("`{}`", prog.fns[id as usize].name),
             None => "this call".into(),
         };
         let mut res = Val::new();
@@ -839,7 +882,7 @@ impl<'a> Fa<'a> {
                             if vals[j as usize].iter().any(|p| hits(rr, p)) {
                                 let msg = format!(
                                     "this argument points into memory that {} may move or free (through argument {}) while it still uses this one",
-                                    name,
+                                    name(),
                                     i + 1
                                 );
                                 self.error(args[j as usize].span, msg, vec![(e.span, "pass a copy, or an index; or make the callee re-derive the pointer after it grows (see `Vec.extend`, `#[may_alias]`)".into())]);
@@ -876,7 +919,7 @@ impl<'a> Fa<'a> {
                             }
                         }
                     }
-                    let how = format!("passes {{}} to {}, which may keep it beyond the call", name);
+                    let how = format!("passes {{}} to {}, which may keep it beyond the call", name());
                     for q in v.clone() {
                         for &d in &dests {
                             self.escape(&q, d, args[j as usize].span, &how);
@@ -885,7 +928,7 @@ impl<'a> Fa<'a> {
                 }
                 if !rsub.is_empty() {
                     let rs: Vec<Path> = rsub.into_iter().map(|(_, q)| q).collect();
-                    let w = self.why(e.span, format!("the call of {}", name));
+                    let w = self.why(e.span, Why::Call(callee));
                     self.restructure(&rs, w, st);
                 }
                 for r in &s.ret {
@@ -898,13 +941,13 @@ impl<'a> Fa<'a> {
                 // into their pointer arguments.
                 let fd = &self.p.fns[id as usize];
                 if matches!(fd.name.as_str(), "free" | "realloc") && !vals.is_empty() {
-                    let w = self.why(e.span, format!("the call of {}", name));
+                    let w = self.why(e.span, Why::Call(callee));
                     let rs: Vec<Path> = vals[0].iter().cloned().collect();
                     self.restructure(&rs, w, st);
                 }
                 if fd.name != "realloc" && self.kind(&e.ty) != Kind::None {
                     for (a, v) in args.iter().zip(&vals) {
-                        if self.kind(&a.ty.clone()) == Kind::Ptr {
+                        if self.kind(&a.ty) == Kind::Ptr {
                             res.extend(v.iter().cloned());
                         }
                     }
@@ -918,8 +961,8 @@ impl<'a> Fa<'a> {
                 }
             }
         }
-        if crate::objref::may_collect(self.p, f) {
-            let w = self.why(e.span, format!("{} (which may collect)", if callee.is_some() { format!("the call of {}", name) } else { "this call".into() }));
+        if may_collect(self.p, f) {
+            let w = self.why(e.span, Why::Collect(callee));
             self.restructure(&[Path { root: Root::GcAny, steps: Vec::new(), trunc: true }], w, st);
         }
         if self.kind(&e.ty) == Kind::Gc {
@@ -963,6 +1006,7 @@ impl<'a> Fa<'a> {
     }
 
     fn eval(&mut self, e: &'a TExpr, st: &mut St) -> Val {
+        self.nev += 1;
         if !st.reach {
             return Val::new();
         }
@@ -975,14 +1019,14 @@ impl<'a> Fa<'a> {
                         return if *k == 0 { v } else { Val::new() };
                     }
                 }
-                let t = e.ty.clone();
+                let t = &e.ty;
                 match self.place(e, st, true) {
                     Ok(ps) => {
                         self.check_place_read(&ps, e.span, st);
-                        self.read_mem(&ps, &t)
+                        self.read_mem(&ps, t)
                     }
                     Err(v) => {
-                        if self.kind(&t) == Kind::None {
+                        if self.kind(t) == Kind::None {
                             Val::new()
                         } else {
                             v
@@ -1131,6 +1175,7 @@ impl<'a> Fa<'a> {
                     let mut next = head.clone();
                     next.join(&s);
                     iters += 1;
+                    self.nloop += 1;
                     if next == head || iters > 20 {
                         break;
                     }
@@ -1190,7 +1235,7 @@ impl<'a> Fa<'a> {
                                     let cur = st.vals.get(&x).map(|v| (**v).clone()).unwrap_or_else(|| self.symbolic(x));
                                     let mut n = cur;
                                     n.extend(v.iter().cloned());
-                                    if self.kind(&self.f.locals[x as usize].ty.clone()) != Kind::None {
+                                    if self.kind(&self.f.locals[x as usize].ty) != Kind::None {
                                         Rc::make_mut(&mut st.vals).insert(x, Rc::new(n));
                                     }
                                 }
@@ -1284,7 +1329,7 @@ impl<'a> Fa<'a> {
                     // have moved (a stack that grew).
                     let mut ls = Vec::new();
                     assigned_locals(reload, &mut ls);
-                    let w = self.why(call.span, "this `reenter` call (guest code may grow or move the vm's stacks; `reload` recomputes the state)".into());
+                    let w = self.why(call.span, Why::Text("this `reenter` call (guest code may grow or move the vm's stacks; `reload` recomputes the state)".into()));
                     let mut targets = Val::new();
                     for l in ls {
                         targets.extend(st.vals.get(&l).map(|v| (**v).clone()).unwrap_or_else(|| self.symbolic(l)));
@@ -1321,6 +1366,21 @@ impl<'a> Fa<'a> {
     }
 }
 
+/// `objref::may_collect` without copying the callee's type.
+fn may_collect(p: &Program, f: &TExpr) -> bool {
+    let t = match &f.ty {
+        Ty::Gc(inner) if matches!(**inner, Ty::Closure(..)) => &**inner,
+        t => t,
+    };
+    let (Ty::Fn(_, _, mut effects) | Ty::Block(_, _, mut effects) | Ty::Closure(_, _, mut effects)) = *t else {
+        return false;
+    };
+    if let TK::FnRef(id) = f.kind {
+        effects |= p.fns[id as usize].sync_effects;
+    }
+    effects & EFF_GC != 0
+}
+
 /// The locals a `reload` block assigns.
 fn assigned_locals(e: &TExpr, out: &mut Vec<LocalId>) {
     match &e.kind {
@@ -1353,7 +1413,7 @@ fn analyze<'a>(
     p: &'a Program,
     fid: FnId,
     sums: &'a HashMap<FnId, Summary>,
-    kinds: &'a mut HashMap<Ty, Kind>,
+    kinds: &'a mut Kinds,
     cx: &Ctx<'a>,
     report: bool,
     audit: Option<&'a crate::diag::SourceMap>,
@@ -1378,6 +1438,7 @@ fn analyze<'a>(
         loop_locals: HashMap::new(),
         defers: Vec::new(),
         out: Summary::default(),
+        nev: 0, nloop: 0, ncall: 0,
         param_idx: f.params.iter().enumerate().map(|(i, &l)| (l, i as u32)).collect(),
     };
     let _ = fa.fid;
@@ -1405,6 +1466,7 @@ fn analyze<'a>(
         fa.ret(&v, b.span);
         fa.exit_escapes(&st);
     }
+    if std::env::var("LOIMI_LT_DBG").is_ok() && fa.nev > 20000 { eprintln!("{} evals {} loopiters {} calls {} locals {}", f.symbol, fa.nev, fa.nloop, fa.ncall, f.locals.len()); }
     (fa.out, fa.errs, fa.lines)
 }
 
@@ -1463,7 +1525,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         }
     }
     let mut sums: HashMap<FnId, Summary> = HashMap::new();
-    let mut kinds: HashMap<Ty, Kind> = HashMap::new();
+    let mut kinds = Kinds::default();
     let mut work: Vec<FnId> = fns.iter().rev().copied().collect();
     let mut queued: HashSet<FnId> = fns.iter().copied().collect();
     let mut rounds = 0u64;
