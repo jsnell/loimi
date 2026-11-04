@@ -286,14 +286,40 @@ fn addmul_2(r: *u64, a: *u64, n: u64, m0: u64, m1: u64, c: u64) -> u64 {
     c1
 }
 
-/// r[0..n] -= a * m; returns the borrow limb.
+/// r[0..n] -= a * m; returns the borrow limb. Four limbs a step: the
+/// four products summed into a four-limb row first (one add chain),
+/// then subtracted (one borrow chain), so the carry limb from step to
+/// step goes through two instructions instead of four a limb (1.35x the
+/// one-limb loop at 26 limbs).
 fn submul_1(r: *u64, a: *u64, n: u64, m: u64) -> u64 {
     var c: u64 = 0;
-    for i in 0..n {
+    var i: u64 = 0;
+    while i + 3 < n {
+        let (l0, h0) = a[i].mul_wide(m);
+        let (l1, h1) = a[i + 1].mul_wide(m);
+        let (l2, h2) = a[i + 2].mul_wide(m);
+        let (l3, h3) = a[i + 3].mul_wide(m);
+        let (t0, k0) = l0.add_carry(c, false);
+        let (t1, k1) = l1.add_carry(h0, k0);
+        let (t2, k2) = l2.add_carry(h1, k1);
+        let (t3, k3) = l3.add_carry(h2, k2);
+        let (d0, b0) = r[i].sub_borrow(t0, false);
+        let (d1, b1) = r[i + 1].sub_borrow(t1, b0);
+        let (d2, b2) = r[i + 2].sub_borrow(t2, b1);
+        let (d3, b3) = r[i + 3].sub_borrow(t3, b2);
+        r[i] = d0;
+        r[i + 1] = d1;
+        r[i + 2] = d2;
+        r[i + 3] = d3;
+        c = h3 + k3 as u64 + b3 as u64;
+        i += 4;
+    }
+    while i < n {
         let (lo, hi) = a[i].mul_add_wide(m, c, 0);
         let (d, bo) = r[i].sub_borrow(lo, false);
         r[i] = d;
         c = hi + bo as u64;
+        i += 1;
     }
     c
 }
@@ -560,11 +586,49 @@ fn mul_mag(r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
     mem.release(t);
 }
 
+/// floor((2^19 - 3 2^8) / i) for i = 256..511, the 11-bit start of
+/// `reciprocal`'s Newton iteration.
+const INV_TAB: [u16; 256] = [
+    2045, 2037, 2029, 2021, 2013, 2005, 1998, 1990, 1983, 1975, 1968, 1960,
+    1953, 1946, 1938, 1931, 1924, 1917, 1910, 1903, 1896, 1889, 1883, 1876,
+    1869, 1863, 1856, 1849, 1843, 1836, 1830, 1824, 1817, 1811, 1805, 1799,
+    1792, 1786, 1780, 1774, 1768, 1762, 1756, 1750, 1745, 1739, 1733, 1727,
+    1722, 1716, 1710, 1705, 1699, 1694, 1688, 1683, 1677, 1672, 1667, 1661,
+    1656, 1651, 1646, 1641, 1636, 1630, 1625, 1620, 1615, 1610, 1605, 1600,
+    1596, 1591, 1586, 1581, 1576, 1572, 1567, 1562, 1558, 1553, 1548, 1544,
+    1539, 1535, 1530, 1526, 1521, 1517, 1513, 1508, 1504, 1500, 1495, 1491,
+    1487, 1483, 1478, 1474, 1470, 1466, 1462, 1458, 1454, 1450, 1446, 1442,
+    1438, 1434, 1430, 1426, 1422, 1418, 1414, 1411, 1407, 1403, 1399, 1396,
+    1392, 1388, 1384, 1381, 1377, 1374, 1370, 1366, 1363, 1359, 1356, 1352,
+    1349, 1345, 1342, 1338, 1335, 1332, 1328, 1325, 1322, 1318, 1315, 1312,
+    1308, 1305, 1302, 1299, 1295, 1292, 1289, 1286, 1283, 1280, 1276, 1273,
+    1270, 1267, 1264, 1261, 1258, 1255, 1252, 1249, 1246, 1243, 1240, 1237,
+    1234, 1231, 1228, 1226, 1223, 1220, 1217, 1214, 1211, 1209, 1206, 1203,
+    1200, 1197, 1195, 1192, 1189, 1187, 1184, 1181, 1179, 1176, 1173, 1171,
+    1168, 1165, 1163, 1160, 1158, 1155, 1153, 1150, 1148, 1145, 1143, 1140,
+    1138, 1135, 1133, 1130, 1128, 1125, 1123, 1121, 1118, 1116, 1113, 1111,
+    1109, 1106, 1104, 1102, 1099, 1097, 1095, 1092, 1090, 1088, 1086, 1083,
+    1081, 1079, 1077, 1074, 1072, 1070, 1068, 1066, 1064, 1061, 1059, 1057,
+    1055, 1053, 1051, 1049, 1047, 1044, 1042, 1040, 1038, 1036, 1034, 1032,
+    1030, 1028, 1026, 1024
+];
+
 /// The reciprocal floor((B^2 - 1) / d) - B of a normalized limb d
-/// (top bit set), for `div_pi`.
+/// (top bit set), for `div_pi`: Moller and Granlund's table-based Newton
+/// iteration (their algorithm 2, GMP's `invert_limb`), multiplications
+/// only; `div_wide` is a `div` instruction of 40-90 cycles on older x86.
 fn reciprocal(d: u64) -> u64 {
-    let (v, _) = (~d).div_wide(0xffffffffffffffff, d);
-    v
+    let v0 = INV_TAB[(d >> 55) - 256] as u64;
+    let d40 = (d >> 24) + 1;
+    let v1 = (v0 << 11) -% ((v0 * v0 * d40) >> 40) -% 1;
+    let v2 = (v1 << 13) +% ((v1 *% ((1 << 60) -% v1 *% d40)) >> 47);
+    let d0 = d & 1;
+    let e = ((v2 >> 1) & (0 -% d0)) -% v2 *% ((d >> 1) + d0);
+    let (_, h) = v2.mul_wide(e);
+    let v3 = (v2 << 31) +% (h >> 1);
+    let (pl, ph) = v3.mul_wide(d);
+    let (_, c) = pl.add_carry(d, false);
+    v3 -% (ph +% d +% c as u64)
 }
 
 /// (nh nl) divmod d for nh < d, d normalized, di = reciprocal(d):
@@ -772,8 +836,8 @@ fn div_qr(q: *u64, n: *u64, nn: u64, d: *u64, dn: u64) -> u64 {
 /// b normalized. q and r must not overlap a or b.
 fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
     let s = b[nb - 1].clz() as u64;
-    let bn: *u64 = mem.alloc(nb);
-    let an: *u64 = mem.alloc(na + 1);
+    let an: *u64 = mem.alloc(na + 1 + nb);
+    let bn = an + na + 1;
     if s > 0 {
         lshift(bn, b, nb, s);
         an[na] = lshift(an, a, na, s);
@@ -786,7 +850,6 @@ fn divrem(q: *u64, r: *u64, a: *u64, na: u64, b: *u64, nb: u64) {
     div_qr(q, an, na + 1, bn, nb);
     if s > 0 { rshift(r, an, nb, s); } else { mem.copy(r, an, nb); }
     mem.release(an);
-    mem.release(bn);
 }
 
 /// Magnitude division into fresh buffers: (q, nq, r, nr), normalized.
@@ -1314,12 +1377,12 @@ pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
     let m = (n + 1) / 2;
     let pad = 2 * m - n;
     let sh = (a.d[n - 1].clz() as u64) & 62;
-    let w: *u64 = mem.alloc(2 * m + 2 * m + 1);
+    let w: *u64 = mem.alloc(2 * m + 2 * m + 1 + sqrt_scratch(m));
     let x = w;
     let s = w + 2 * m;
     let r = w + 3 * m;
     if sh > 0 { lshift(x + pad, a.d.ptr, n, sh); } else { mem.copy(x + pad, a.d.ptr, n); }
-    sqrtrem(s, r, x, m);
+    sqrtrem(s, r, x, m, w + 4 * m + 1);
     let t = sh / 2 + 32 * pad;
     if t > 0 { rshift(out.ptr, s, m, t); } else { mem.copy(out.ptr, s, m); }
     mem.release(w);
@@ -1359,7 +1422,7 @@ fn sqrtrem_2(a1: u64, a0: u64) -> (u64, u64, u64) {
 /// a0 (B = 2^64, l = m / 2): (s', r') = sqrtrem(ah), (q, u) = (r' B^l +
 /// a1) divmod 2 s', s = s' B^l + q, r = u B^l + a0 - q^2, and if r < 0
 /// one correction r += 2s - 1, s -= 1. Returns r's length.
-fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64) -> u64 {
+fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64) -> u64 {
     if m == 1 {
         let (s0, r0, r1) = sqrtrem_2(a[1], a[0]);
         s[0] = s0;
@@ -1370,15 +1433,16 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64) -> u64 {
     let l = m / 2;
     let h = m - l;
     let sh = s + l;
-    // Scratch: r' (h + 1), N (m + 2), q (m + 2), u (h + 3), R (m + 3), q^2 (2 l).
-    let t: *u64 = mem.alloc(5 * m + 2 * h + 11);
+    // Scratch (t, sqrt_scratch(m) limbs, zero: each level's part is
+    // used once): r' (h + 1), N (m + 2), q (m + 2), u (h + 3), R (m + 3),
+    // q^2 (2 l), then the recursion's.
     let rp = t;
     let nb = rp + h + 1;
     let qb = nb + m + 2;
     let ub = qb + m + 2;
     let rb = ub + h + 3;
     let q2 = rb + m + 3;
-    let rn = sqrtrem(sh, rp, a + 2 * l, h);
+    let rn = sqrtrem(sh, rp, a + 2 * l, h, t + 5 * m + 2 * h + 11);
     // N = (r' B^l + a1) / 2, and its low bit.
     mem.copy(nb, a + l, l);
     mem.copy(nb + l, rp, rn);
@@ -1391,7 +1455,12 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64) -> u64 {
     } else if h == 1 {
         ub[0] = divrem_1(qb, nb, nn, sh[0]);
     } else {
-        divrem(qb, ub, nb, nn, sh, h);
+        // s' is normalized (its top limb is at least 2^63): divide N in
+        // place, with a zero limb on top so that the quotient's top limb
+        // is in qb.
+        nb[nn] = 0;
+        div_qr(qb, nb, nn + 1, sh, h);
+        mem.copy(ub, nb, h);
     }
     ub[h] = lshift(ub, ub, h, 1);
     ub[0] = ub[0] | low;
@@ -1427,8 +1496,14 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64) -> u64 {
         decr(s, m);
         nr = norm(r, m + 1);
     }
-    mem.release(t);
     nr
+}
+
+/// The scratch limbs of `sqrtrem(.., m, ..)`.
+fn sqrt_scratch(m: u64) -> u64 {
+    if m == 1 { return 0; }
+    let h = m - m / 2;
+    5 * m + 2 * h + 11 + sqrt_scratch(h)
 }
 
 // ── text ────────────────────────────────────────────────────────────
