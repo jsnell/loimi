@@ -656,6 +656,19 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
                     if let Inst(_) = v {
                         if let Some(r) = ops.call_method(c, v, "__reversed__", [])? { return Ok(r); }
                     }
+                    // A range runs backwards as a range iterator (as in CPython).
+                    if let Obj(rg) = v and rg.kind == K_RANGE {
+                        let n = range_len(rg) as i64;
+                        let r = value.new_box(&c.heap, K_RANGEIT, 0);
+                        r.s = 0 - rg.s;
+                        if n == 0 { r.n = 0; r.m = 0; return Ok(Value.Obj(r)); }
+                        if let Some(span) = (n - 1).mul_checked(rg.s) and let Some(last) = rg.n.add_checked(span)
+                            and let Some(back) = r.s.mul_checked(n) and let Some(stop) = last.add_checked(back) {
+                            r.n = last;
+                            r.m = stop;
+                            return Ok(Value.Obj(r));
+                        }
+                    }
                     let l = items_of(c, v)?;
                     let cp = value.list_of(&c.heap, l.arr.items[0..l.len]);
                     let r = value.new_box(&c.heap, K_REVIT, 0);
@@ -2057,7 +2070,7 @@ fn module_call(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result<Value, 
 }
 
 /// Helpers written in Python (see vm.call_slow).
-pub const PRELUDE_SRC: str = "def __list(g):\n    r = []\n    for x in g:\n        r.append(x)\n    return r\ndef __via1(f, g):\n    return f(__list(g))\ndef __via2(f, a, g):\n    return f(a, __list(g))\n";
+pub const PRELUDE_SRC: str = "def __list(g):\n    return [x for x in g]\ndef __via1(f, g):\n    return f(__list(g))\ndef __via2(f, a, g):\n    return f(a, __list(g))\n";
 
 pub fn load_prelude(c: *Ctx) -> Result<(), Value> uses reenter {
     let d = value.new_dict(&c.heap, 8);
