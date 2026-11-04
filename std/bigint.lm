@@ -1179,6 +1179,12 @@ pub fn mul_into(out: []u64, a: Num, b: Num) -> Num {
     let nb = b.d.len;
     if na == 0 or nb == 0 { return zero(); }
     need(out, na + nb);
+    if na == 1 and nb == 1 {
+        let (lo, hi) = a.d[0].mul_wide(b.d[0]);
+        out[0] = lo;
+        out[1] = hi;
+        return view(out.ptr, 2, a.neg != b.neg);
+    }
     if na >= nb { mul_mag(out.ptr, a.d.ptr, na, b.d.ptr, nb); } else { mul_mag(out.ptr, b.d.ptr, nb, a.d.ptr, na); }
     view(out.ptr, na + nb, a.neg != b.neg)
 }
@@ -2060,6 +2066,8 @@ fn set(o: Gc<Big>, r: Num) -> Gc<Big> {
     o
 }
 
+// Inlined into each operation, so that `size` and `op` are direct calls.
+#[inline(always)]
 fn gc_bin(h: *gc.Heap, a: Arg, b: Arg, size: fn(Num, Num) -> u64, op: fn([]u64, Num, Num) -> Num) -> Gc<Big> {
     var x: u64 = 0;
     var y: u64 = 0;
