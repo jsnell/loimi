@@ -55,7 +55,52 @@ hb(_, _, third).
 hc(X, Y) :- X = g(Y), Y > 1, !.
 hc(_, none).
 
+% arg/3 into a new variable (temporary and permanent).
+ga(T, A, B) :- arg(1, T, A), arg(2, T, B).
+gp(T, L) :- arg(2, T, A), findall(x, true, _), arg(1, T, B), L = [A, B].
+gl(T, A) :- arg(1, T, A).
+gn(T, N, A) :- ( arg(N, T, A) -> true ; A = none ).
+
+% functor/3 inline: reading a term, building one.
+fr(T, F, N) :- functor(T, F0, N0), F = F0, N = N0.
+fp(T, L) :- functor(T, F, N), findall(x, true, _), L = F/N.
+fw(F, N, T) :- functor(T0, F, N), T = T0.
+fwp(F, N, L) :- functor(T, F, N), findall(x, true, _), L = [T].
+fe(T, F, N) :- catch(fw(F, N, T), error(E, _), (T = E)).
+
+% compare/3 into a new variable.
+co(A, B, O) :- compare(O0, A, B), O = O0.
+cop(A, B, L) :- compare(O, A, B), findall(x, true, _), L = [O].
+
+t_compare :-
+    findall(O, (member(A-B, [1-2, 2-1, 3-3, a-b, f(x)-f(x), 1.0-1, _-a, "ab"-"ab", f(a)-g(a), [1]-[1,2]]), co(A, B, O)), L1),
+    write(L1), nl,
+    cop(z, y, L2), write(L2), nl,
+    ( compare(<, 1, 2) -> write(yes) ; write(no) ), nl,
+    catch(compare(foo, 1, 2), error(E, _), (write(E), nl)).
+
+t_functor :-
+    findall(F/N, (member(T, [f(a, b), [x], abc, 3, 2.5, g(_)]), fr(T, F, N)), L1), write(L1), nl,
+    fp(h(1, 2, 3), P1), write(P1), nl,
+    fw(foo, 3, W1), functor(W1, WF, WN), write(WF/WN), nl,
+    fw('[|]', 2, W2), ( W2 = [_|_] -> write(list) ; write(nolist) ), nl,
+    fw(abc, 0, W3), write(W3), nl, fw(7, 0, W4), write(W4), nl,
+    fwp(bar, 2, [W5]), arg(1, W5, A5), ( var(A5) -> write(var) ; write(nonvar) ), nl,
+    fe(E1, _, 2), write(E1), nl, fe(E2, foo, _), write(E2), nl, fe(E3, foo, -1), write(E3), nl,
+    fe(E4, foo(a), 1), write(E4), nl, fe(E5, foo, a), write(E5), nl,
+    catch(fr(_, _, _), error(E6, _), true), write(E6), nl.
+
+t_arg :-
+    ga(f(a, g(X0)), A1, B1), write(A1), nl, X0 = 1, write(B1), nl,
+    gp(h(p, q, r), L0), write(L0), nl,
+    gl([h|t], H0), write(H0), nl,
+    gn(f(a), 2, N0), gn(f(a), 0, N1), gn(f(a, b), 2, N2), write([N0, N1, N2]), nl,
+    catch(gl(_, _), error(E0, _), (write(E0), nl)),
+    catch(gn(f(a), x, _), error(E1, _), (write(E1), nl)),
+    ( ga(f(Y0, Y0), 1, 2) -> write(bad) ; write(ok) ), nl.
+
 main :-
+    t_functor, t_arg, t_compare,
     tak(18, 12, 6, T), write(tak(T)), nl,
     findall(R, sw(1, 2, R), L1), findall(R, sw(2, 1, R), L2), findall(R, sw(1, 1, R), L3),
     write(sw(L1, L2, L3)), nl,

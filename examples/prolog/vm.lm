@@ -636,6 +636,85 @@ pub vm Wam {
         }
     }
 
+    /// arg(N, T, A) with A a new variable: A's register gets the argument.
+    op ARG_V(n: xr, t: xr, d: xr) : R3 {
+        let nn = deref(n);
+        let tt = deref(t);
+        if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
+            d = st.args.ptr[(i as u64) - 1];    // in bounds: checked above
+            next
+        }
+        cold {
+            let v = ctx.new_var();
+            d = v;
+            match builtins.arg3(ctx, nn, tt, v) {
+                Ok(true) => next,
+                Ok(false) => backtrack(),
+                Err(ball) => raise ball,
+            }
+        }
+    }
+
+    /// compare(O, A, B) with O a new variable.
+    op COMPARE_V(d: xr, a: xr, b: xr) : R3 {
+        let x = deref(a);
+        let y = deref(b);
+        if x == y { d = Term.Atom(ctx.order[1]); next }
+        if let (Int(i), Int(j)) = (x, y) {
+            d = Term.Atom(ctx.order[if i < j { 0 } else { 2 }]);
+            next
+        }
+        let c = machine.compare(ctx, x, y);
+        d = Term.Atom(ctx.order[(c + 1) as u64]);
+        next
+    }
+    /// functor(T, F, N) with F and N new variables: their registers get
+    /// T's name and arity.
+    op FUNCTOR_R(t: xr, f: xr, n: xr) : R3 {
+        let tt = deref(t);
+        match tt {
+            Str(st) => {
+                let fs = ctx.db.functors.ptr[st.f as u64];
+                f = Term.Atom(fs.name);
+                n = Term.Int(fs.arity as i48);
+                next
+            }
+            Lst(_) => { f = Term.Atom(term.A_DOT); n = Term.Int(2); next }
+            Ref(_) => {}
+            _ => { f = tt; n = Term.Int(0); next }
+        }
+        cold {
+            let vf = ctx.new_var();
+            let vn = ctx.new_var();
+            f = vf;
+            n = vn;
+            match builtins.functor3(ctx, tt, vf, vn) {
+                Ok(true) => next,
+                Ok(false) => backtrack(),
+                Err(ball) => raise ball,
+            }
+        }
+    }
+    /// functor(T, F, N) with T a new variable: T's register gets the new
+    /// term.
+    op FUNCTOR_W(d: xr, f: xr, n: xr) : R3 {
+        let ff = deref(f);
+        let nn = deref(n);
+        if let (Atom(name), Int(a)) = (ff, nn) and (a as i64) >= 1 and (a as i64) <= 255 {
+            d = builtins.new_compound(ctx, name, a as u64);
+            next
+        }
+        cold {
+            let v = ctx.new_var();
+            d = v;
+            match builtins.functor3(ctx, v, ff, nn) {
+                Ok(true) => next,
+                Ok(false) => backtrack(),
+                Err(ball) => raise ball,
+            }
+        }
+    }
+
     // ---- clause selection ----------------------------------------------
 
     fn push_choice(n: u64, alt: *u32) {

@@ -581,8 +581,7 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
                 if !(s.eq("<") or s.eq(">") or s.eq("=")) { return Err(domain_error(m, "order", o)); }
             } else if let Ref(_) = o {} else { return Err(type_error(m, "atom", o)); }
             let c = compare(m, m.x[1], m.x[2]);
-            let r = if c < 0 { "<" } else if c > 0 { ">" } else { "=" };
-            Ok(unify(m, m.x[0], Term.Atom(m.db.atom(r))))
+            Ok(unify(m, m.x[0], Term.Atom(m.order[(c + 1) as u64])))
         }
         IsVar => Ok(match x(m, 0) { Ref(_) => true, _ => false }),
         NonVar => Ok(match x(m, 0) { Ref(_) => false, _ => true }),
@@ -616,37 +615,7 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
         NumGt => Ok(num_eval2(m)? > 0),
         NumLe => Ok(num_eval2(m)? <= 0),
         NumGe => Ok(num_eval2(m)? >= 0),
-        Functor => {
-            let t = x(m, 0);
-            match t {
-                Ref(_) => {
-                    let n = x(m, 1);
-                    let a = get_int(m, x(m, 2))?;
-                    if a == 0 {
-                        if let Ref(_) = n { return Err(inst_error(m)); }
-                        return Ok(unify(m, t, n));
-                    }
-                    if a < 0 { return Err(domain_error(m, "not_less_than_zero", term.mk_int(a))); }
-                    let name = match n { Atom(q) => q, Ref(_) => return Err(inst_error(m)),
-                        _ => { if term.is_atomic(n) { return Err(type_error(m, "atomic", n)); } return Err(type_error(m, "atomic", n)); } };
-                    if name == term.A_DOT and a == 2 {
-                        let c = m.mk_cons(m.new_var(), m.new_var());
-                        return Ok(unify(m, t, c));
-                    }
-                    let f = m.db.functor(name, a as u32);
-                    let s = m.mk_struct(f, a as u64);
-                    for i in 0..a as u64 { s.args[i] = m.new_var(); }
-                    Ok(unify(m, t, Term.Str(s)))
-                }
-                Atom(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
-                Int(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
-                Flt(_) => Ok(unify(m, m.x[1], t) and unify(m, m.x[2], term.mk_int(0))),
-                _ => {
-                    let (name, a) = term.name_arity(&m.db, t);
-                    Ok(unify(m, m.x[1], Term.Atom(name)) and unify(m, m.x[2], term.mk_int(a as i64)))
-                }
-            }
-        }
+        Functor => functor3(m, x(m, 0), m.x[1], m.x[2]),
         Arg => {
             let n = get_int(m, x(m, 0))?;
             let t = x(m, 1);
@@ -1209,6 +1178,47 @@ pub fn call(m: *Machine, id: u64) -> Result<bool, Term> {
 }
 
 /// arg/3 outside the ARG op's fast path.
+/// A compound `name`/`n` (n >= 1) with new variables as arguments.
+pub fn new_compound(m: *Machine, name: u32, n: u64) -> Term {
+    if name == term.A_DOT and n == 2 { return m.mk_cons(m.new_var(), m.new_var()); }
+    let f = m.db.functor(name, n as u32);
+    let s = m.mk_struct(f, n);
+    for i in 0..n { s.args[i] = m.new_var(); }
+    Term.Str(s)
+}
+
+/// functor(T, F, N) (`t` dereferenced).
+pub fn functor3(m: *Machine, t: Term, f0: Term, n0: Term) -> Result<bool, Term> {
+    match t {
+        Ref(_) => {
+            let n = deref(f0);
+            let a = get_int(m, deref(n0))?;
+            if a == 0 {
+                if let Ref(_) = n { return Err(inst_error(m)); }
+                return Ok(unify(m, t, n));
+            }
+            if a < 0 { return Err(domain_error(m, "not_less_than_zero", term.mk_int(a))); }
+            let name = match n { Atom(q) => q, Ref(_) => return Err(inst_error(m)),
+                _ => { if term.is_atomic(n) { return Err(type_error(m, "atomic", n)); } return Err(type_error(m, "atomic", n)); } };
+            if name == term.A_DOT and a == 2 {
+                let c = m.mk_cons(m.new_var(), m.new_var());
+                return Ok(unify(m, t, c));
+            }
+            let f = m.db.functor(name, a as u32);
+            let s = m.mk_struct(f, a as u64);
+            for i in 0..a as u64 { s.args[i] = m.new_var(); }
+            Ok(unify(m, t, Term.Str(s)))
+        }
+        Atom(_) => Ok(unify(m, f0, t) and unify(m, n0, term.mk_int(0))),
+        Int(_) => Ok(unify(m, f0, t) and unify(m, n0, term.mk_int(0))),
+        Flt(_) => Ok(unify(m, f0, t) and unify(m, n0, term.mk_int(0))),
+        _ => {
+            let (name, a) = term.name_arity(&m.db, t);
+            Ok(unify(m, f0, Term.Atom(name)) and unify(m, n0, term.mk_int(a as i64)))
+        }
+    }
+}
+
 pub fn arg3(m: *Machine, n0: Term, t0: Term, a: Term) -> Result<bool, Term> {
     let n = get_int(m, deref(n0))?;
     let t = deref(t0);

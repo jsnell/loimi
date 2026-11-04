@@ -39,6 +39,7 @@ fn setup(m: *Machine) {
     m.heap = gc.Heap.new();
     m.out = io.Out.stdout();
     m.bags = mem.Vec.new();
+    m.order = [m.db.atom("<"), m.db.atom("="), m.db.atom(">")];
     m.preds = mem.Vec.new();
     m.consts = mem.Vec.new();
     m.clauses = mem.Vec.new();

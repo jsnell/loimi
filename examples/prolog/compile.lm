@@ -559,6 +559,28 @@ fn C.temp(c: *C) -> u32 {
 
 fn C.release(c: *C, r: u32) { c.free_temps.push(r); }
 
+/// `t` is a variable not seen yet (an inline builtin can write its
+/// value to its register: `dest_begin`, the op, `dest_end`).
+fn C.is_new(c: *C, t: Term) -> bool {
+    let Ref(_) = t else { return false; };
+    let vi = c.info(t);
+    !vi.seen and !vi.level
+}
+/// The register an op writes new variable `v`'s value to: its own, or a
+/// temporary moved to its permanent slot by `dest_end`.
+fn C.dest_begin(c: *C, v: Term) -> u32 {
+    let vi = c.info(v);
+    vi.seen = true;
+    if vi.perm { c.temp() } else { vi.reg }
+}
+fn C.dest_end(c: *C, v: Term, r: u32) {
+    let vi = c.info(v);
+    if vi.perm {
+        c.emit(Wam.GET_VAR_Y(vi.reg as u8, r as u8));
+        c.release(r);
+    }
+}
+
 fn C.emit(c: *C, w: u32) { c.code.push(w); }
 
 fn small16(i: i64) -> bool { i >= -32768 and i <= 32767 }
@@ -934,9 +956,63 @@ fn C.inline_builtin(c: *C, g: Term) -> bool {
         if owned { c.release(r); }
         return true;
     }
+    if ar == 3 and name.eq("compare") {
+        // compare(O, A, B) with O new: O's register gets <, = or >.
+        let o = deref(term.arg_of(g, 0));
+        if c.is_new(o) and !occurs(term.arg_of(g, 1), o) and !occurs(term.arg_of(g, 2), o) {
+            let (ra, oa) = c.operand(term.arg_of(g, 1));
+            let (rb, ob) = c.operand(term.arg_of(g, 2));
+            let d = c.dest_begin(o);
+            c.emit(Wam.COMPARE_V(d as u8, ra as u8, rb as u8));
+            c.dest_end(o, d);
+            if ob { c.release(rb); }
+            if oa { c.release(ra); }
+            return true;
+        }
+        return false;
+    }
+    if ar == 3 and name.eq("functor") {
+        let t = deref(term.arg_of(g, 0));
+        let f = deref(term.arg_of(g, 1));
+        let n = deref(term.arg_of(g, 2));
+        // functor(T, F, N) with F and N new: read T's name and arity.
+        if c.is_new(f) and c.is_new(n) and f != n and !occurs(t, f) and !occurs(t, n) {
+            let (rt, ot) = c.operand(t);
+            let df = c.dest_begin(f);
+            let dn = c.dest_begin(n);
+            c.emit(Wam.FUNCTOR_R(rt as u8, df as u8, dn as u8));
+            c.dest_end(n, dn);
+            c.dest_end(f, df);
+            if ot { c.release(rt); }
+            return true;
+        }
+        // With T new: build it.
+        if c.is_new(t) and !occurs(f, t) and !occurs(n, t) {
+            let (rf, of) = c.operand(f);
+            let (rn, on) = c.operand(n);
+            let d = c.dest_begin(t);
+            c.emit(Wam.FUNCTOR_W(d as u8, rf as u8, rn as u8));
+            c.dest_end(t, d);
+            if on { c.release(rn); }
+            if of { c.release(rf); }
+            return true;
+        }
+        return false;
+    }
     if ar == 3 and name.eq("arg") {
         let (rn, on) = c.operand(term.arg_of(g, 0));
         let (rt, ot) = c.operand(term.arg_of(g, 1));
+        // arg(N, T, A) with A new: the argument goes straight to A's
+        // register (no variable is made to be bound at once).
+        let a = deref(term.arg_of(g, 2));
+        if c.is_new(a) and !occurs(term.arg_of(g, 0), a) and !occurs(term.arg_of(g, 1), a) {
+            let d = c.dest_begin(a);
+            c.emit(Wam.ARG_V(rn as u8, rt as u8, d as u8));
+            c.dest_end(a, d);
+            if ot { c.release(rt); }
+            if on { c.release(rn); }
+            return true;
+        }
         let (ra, oa) = c.operand(term.arg_of(g, 2));
         c.emit(Wam.ARG(rn as u8, rt as u8, ra as u8));
         if oa { c.release(ra); }
