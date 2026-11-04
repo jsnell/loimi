@@ -2,6 +2,7 @@
 // list's item array across `__eq__`, which may grow the list (a new
 // array: the old one is unreachable) and collect. A slice of an object
 // that no local holds dangles after a call that may collect.
+#![lifetimes]
 import std.gc;
 object Arr { items: [i64] }
 object List { arr: Gc<Arr>, len: u64 }
@@ -17,7 +18,6 @@ fn index(h: *gc.Heap, l: Gc<List>, x: i64) -> u64 uses gc {
     }
     0
 }
-#![lifetimes]
 fn main() uses gc {
     var heap = gc.Heap.new();
     let l = new(&heap, List { arr: new(&heap, Arr {}, 4), len: 4 });

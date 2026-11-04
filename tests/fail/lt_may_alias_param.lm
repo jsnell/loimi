@@ -1,0 +1,5 @@
+// `#[may_alias(p)]` names a parameter of the function.
+#[may_alias(t)]
+fn f(s: []u8) {}
+fn main() {}
+// error: `#[may_alias(t)]`: no parameter `t`

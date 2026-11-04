@@ -10,4 +10,4 @@ fn main() {
     var c = Ctx { cur: None };
     set(&c);
 }
-// error: stores the address of local `n` in memory that may outlive it
+// error: stores the address of local `n` in memory that outlives the function

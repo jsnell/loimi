@@ -966,9 +966,19 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   nothing in modules without `#![safe]`. Vm code is exempt (its operand
   accesses rest on the verifier, section 6), as is code generated from
   a `vm` declaration; so a `#![safe]` module cannot declare a `vm`.
-  *Lifetimes are not checked*: a pointer or slice into
-  a `Vec` or map dangles once it grows or is freed, and `&local` may
-  outlive its function. Built with `--sanitize=address`, std's
+  *Pointer stability is checked* (prototype, `docs/design/lifetimes.md`),
+  in `#![safe]` modules and in modules marked `#![lifetimes]` (the
+  same check without the raw-pointer rule, so it can declare a `vm`):
+  a pointer or slice into a `Vec`, map, arena or GC object may not be
+  used after a call that may move or free that memory (inferred over
+  the call graph: `push`, `insert`, `free`, a call that may collect,
+  in vm code a `reenter` call), a copy of a `Vec` may not outlive a
+  growth of the other copy, and the address of a local may not be
+  returned or left stored where it outlives the function.
+  `#[may_alias(p)]` on a function says argument `p` may point into what
+  it grows (`Vec.extend`). A pointer stored in memory and loaded back
+  elsewhere is not followed, so a pointer into a `Vec` or map can still
+  dangle that way. Built with `--sanitize=address`, std's
   containers poison the memory they keep but no longer use (a `Vec`'s
   spare capacity, an arena chunk's unused tail), so ASan reports a
   stale pointer into it as well as into freed memory; other builds are

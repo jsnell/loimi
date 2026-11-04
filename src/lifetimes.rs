@@ -115,10 +115,18 @@ fn hits(r: &Path, p: &Path) -> bool {
 
 fn m(r: &[Step], p: &[Step], rt: bool, pt: bool) -> bool {
     if r.is_empty() {
-        return rt || pt || !p.iter().any(is_d);
+        // Both cut at the same depth: deep in some pointer chain; taken to
+        // be different blocks (the approximation of the depth bound).
+        if p.is_empty() && rt && pt {
+            return false;
+        }
+        return !p.iter().any(is_d);
     }
     if p.is_empty() {
-        return pt;
+        // `p` was cut: it stands for something below. A restructure of a
+        // block reached through further pointers is taken to be another
+        // block (an approximation for long pointer chains: `f = f.parent`).
+        return pt && !r.iter().any(is_d);
     }
     match (r[0], p[0]) {
         (Step::F(a), Step::F(b)) => a == b && m(&r[1..], &p[1..], rt, pt),
@@ -145,8 +153,15 @@ pub struct Summary {
     restructs: BTreeSet<Path>,
     ret: BTreeSet<Path>,
     pairs: BTreeSet<(u32, u32)>,
-    keeps: u64,
+    /// Parameter j -> where it may be stored: parameter i's memory, or
+    /// `ELSEWHERE` (a global, a GC object, memory of unknown origin).
+    keeps: BTreeMap<u32, BTreeSet<u32>>,
 }
+
+const ELSEWHERE: u32 = u32::MAX;
+/// Memory owned by a local of the function itself (its buffers, its
+/// arena's allocations).
+const FRAME: u32 = u32::MAX - 1;
 
 #[derive(Clone, Default, PartialEq)]
 struct St {
@@ -163,6 +178,10 @@ struct St {
     aliases: BTreeSet<(LocalId, Path)>,
     /// Places in memory whose owned buffers were freed through a copy.
     stale_places: BTreeMap<Path, u32>,
+    /// Pending escapes: (place, stored pointer, why): the address of a
+    /// local (or a parameter's pointee) stored in memory that outlives
+    /// the call, unless overwritten before it returns.
+    esc: BTreeSet<(Path, Path, u32)>,
 }
 
 impl St {
@@ -187,6 +206,7 @@ impl St {
         for (p, w) in &o.stale_places {
             self.stale_places.entry(p.clone()).or_insert(*w);
         }
+        self.esc.extend(o.esc.iter().cloned());
     }
 }
 
@@ -500,18 +520,56 @@ impl<'a> Fa<'a> {
         Some(j)
     }
 
-    /// `v` is stored in memory that may outlive this call.
-    fn escapes(&mut self, v: &Val, span: Span, how: &str) {
-        for p in v {
-            if let Some(l) = self.storage_local(p) {
-                let msg = how.replace("{}", &format!("the address of local {}", self.local_name(l)));
-                self.error(span, msg, vec![(self.f.span, "a local's memory is reused once its function returns; allocate it (`new(&arena, ..)`) or copy the value".into())]);
+    /// Where memory at path `p` belongs: a parameter's, the frame's, or
+    /// elsewhere.
+    fn dest(&self, p: &Path) -> u32 {
+        match p.root {
+            Root::Local(l) => match self.param_idx.get(&l) {
+                Some(&i) if p.has_deref() => i,
+                _ => FRAME,
+            },
+            _ => ELSEWHERE,
+        }
+    }
+
+    /// `v` is stored at places `ps` (memory): record what may escape.
+    fn store(&mut self, v: &Val, ps: &[Path], span: Span, st: &mut St) {
+        let ps: Vec<Path> = if ps.is_empty() { vec![Path::new(Root::GcAny)] } else { ps.to_vec() };
+        for q in v {
+            if self.storage_local(q).is_none() && self.param_pointee(q).is_none() {
+                continue;
             }
-            if let Some(j) = self.param_pointee(p) {
-                if j < 64 {
-                    self.out.keeps |= 1 << j;
+            for pl in &ps {
+                if self.dest(pl) != FRAME {
+                    let w = self.why(span, String::new());
+                    st.esc.insert((pl.clone(), q.clone(), w));
                 }
             }
+        }
+    }
+
+    /// At a return: what is still stored escapes.
+    fn exit_escapes(&mut self, st: &St) {
+        for (pl, q, w) in st.esc.clone() {
+            let d = self.dest(&pl);
+            let span = self.whys[w as usize].0;
+            self.escape(&q, d, span, "stores {} in memory that outlives the function");
+        }
+    }
+
+    /// Pointer `q` ends up in memory of kind `d` (a parameter's, or
+    /// elsewhere).
+    fn escape(&mut self, q: &Path, d: u32, span: Span, how: &str) {
+        // `main`'s locals live as long as the program.
+        if d == FRAME || self.f.symbol == "main.main" {
+            return;
+        }
+        if let Some(l) = self.storage_local(q) {
+            let msg = how.replace("{}", &format!("the address of local {}", self.local_name(l)));
+            self.error(span, msg, vec![(self.f.span, "a local's memory is reused once its function returns; allocate it (`new(&arena, ..)`), copy the value, or restore the place before returning".into())]);
+        }
+        if let Some(j) = self.param_pointee(q) {
+            self.out.keeps.entry(j).or_default().insert(d);
         }
     }
 
@@ -639,10 +697,30 @@ impl<'a> Fa<'a> {
                         }
                     }
                 }
-                for j in 0..args.len().min(64) {
-                    if s.keeps & (1 << j) != 0 {
-                        let v = vals[j].clone();
-                        self.escapes(&v, args[j].span, &format!("passes {{}} to {}, which may keep it beyond the call", name));
+                for (&j, ds) in &s.keeps {
+                    let Some(v) = vals.get(j as usize) else { continue };
+                    // Where the callee stores it, in this function's terms.
+                    let mut dests = BTreeSet::new();
+                    for &d in ds {
+                        match vals.get(d as usize) {
+                            Some(dv) if d < FRAME => {
+                                for p in dv {
+                                    dests.insert(self.dest(p));
+                                }
+                                if dv.is_empty() {
+                                    dests.insert(ELSEWHERE);
+                                }
+                            }
+                            _ => {
+                                dests.insert(ELSEWHERE);
+                            }
+                        }
+                    }
+                    let how = format!("passes {{}} to {}, which may keep it beyond the call", name);
+                    for q in v.clone() {
+                        for &d in &dests {
+                            self.escape(&q, d, args[j as usize].span, &how);
+                        }
                     }
                 }
                 let rs: Vec<Path> = s.restructs.iter().flat_map(|r| self.subst(r, &vals)).collect();
@@ -905,6 +983,7 @@ impl<'a> Fa<'a> {
                     let val = self.eval(x, st);
                     self.ret(&val, x.span);
                 }
+                self.exit_escapes(st);
                 st.reach = false;
                 Val::new()
             }
@@ -931,7 +1010,16 @@ impl<'a> Fa<'a> {
                                 }
                             }
                         } else {
-                            self.escapes(&v, r.span, "stores {} in memory that may outlive it");
+                            // The old value at the place is overwritten.
+                            st.esc.retain(|(pl, _, _)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
+                            self.store(&v, &ps, r.span, st);
+                        }
+                        // The old value at the place is gone: what pointed
+                        // into its buffers points into a detached block.
+                        if self.kind(&l.ty) != Kind::None {
+                            for vs in st.vals.values_mut() {
+                                vs.retain(|q| !ps.iter().any(|p| q.root == p.root && q.steps.len() > p.steps.len() && q.steps.starts_with(&p.steps) && is_d(&q.steps[p.steps.len()])));
+                            }
                         }
                         // A new value at the place: copies of the old one
                         // no longer share its buffers.
@@ -963,7 +1051,9 @@ impl<'a> Fa<'a> {
                 self.eval(a, st);
                 for l in caps {
                     let v = self.read_local(*l, e.span, st);
-                    self.escapes(&v, e.span, "an escaping closure captures {}, which may outlive it");
+                    for q in v {
+                        self.escape(&q, ELSEWHERE, e.span, "an escaping closure captures {}, which may outlive it");
+                    }
                 }
                 Val::new()
             }
@@ -1111,6 +1201,7 @@ fn analyze<'a>(
     let v = fa.eval(b, &mut st);
     if st.reach {
         fa.ret(&v, b.span);
+        fa.exit_escapes(&st);
     }
     (fa.out, fa.errs)
 }
@@ -1123,22 +1214,55 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         return Ok(());
     }
     let audit = (mode == "audit").then_some(sm);
-    let fns: Vec<FnId> = (0..p.fns.len() as FnId).filter(|&i| p.fns[i as usize].body.is_some()).collect();
+    let body = |i: FnId| p.fns[i as usize].body.is_some();
+    let checked: Vec<FnId> = (0..p.fns.len() as FnId)
+        .filter(|&i| body(i) && (audit.is_some() || cx.checked_files.contains(&p.fns[i as usize].span.file)))
+        .collect();
+    if checked.is_empty() {
+        return Ok(());
+    }
+    // Only what checked functions call (transitively) needs a summary.
+    // Post-order, so callees are summarized before their callers.
+    let mut calls: HashMap<FnId, Vec<FnId>> = HashMap::new();
+    let mut fns: Vec<FnId> = Vec::new();
+    let mut seen: HashSet<FnId> = HashSet::new();
+    for &c in &checked {
+        let mut stack: Vec<(FnId, usize)> = Vec::new();
+        if seen.insert(c) {
+            stack.push((c, 0));
+        }
+        while let Some(&mut (f, ref mut k)) = stack.last_mut() {
+            let cs = calls.entry(f).or_insert_with(|| {
+                let mut cs = Vec::new();
+                callees(p.fns[f as usize].body.as_ref().unwrap(), &mut cs);
+                cs.sort();
+                cs.dedup();
+                cs.retain(|&x| body(x));
+                cs
+            });
+            if *k < cs.len() {
+                let g = cs[*k];
+                *k += 1;
+                if seen.insert(g) {
+                    stack.push((g, 0));
+                }
+            } else {
+                fns.push(f);
+                stack.pop();
+            }
+        }
+    }
     // Callers of each function, to revisit only what a changed summary
     // can change.
     let mut callers: HashMap<FnId, Vec<FnId>> = HashMap::new();
-    for &i in &fns {
-        let mut cs = Vec::new();
-        callees(p.fns[i as usize].body.as_ref().unwrap(), &mut cs);
-        cs.sort();
-        cs.dedup();
-        for c in cs {
-            callers.entry(c).or_default().push(i);
+    for (&f, cs) in &calls {
+        for &c in cs {
+            callers.entry(c).or_default().push(f);
         }
     }
     let mut sums: HashMap<FnId, Summary> = HashMap::new();
     let mut kinds: HashMap<Ty, Kind> = HashMap::new();
-    let mut work: Vec<FnId> = fns.clone();
+    let mut work: Vec<FnId> = fns.iter().rev().copied().collect();
     let mut queued: HashSet<FnId> = fns.iter().copied().collect();
     let mut rounds = 0u64;
     while let Some(i) = work.pop() {
@@ -1150,7 +1274,9 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         merged.restructs.extend(s.restructs);
         merged.ret.extend(s.ret);
         merged.pairs.extend(s.pairs);
-        merged.keeps |= s.keeps;
+        for (j, d) in s.keeps {
+            merged.keeps.entry(j).or_default().extend(d);
+        }
         if merged != old {
             sums.insert(i, merged);
             for &c in callers.get(&i).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -1163,11 +1289,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     if std::env::var("LOIMI_LIFETIMES_STATS").is_ok() {
         eprintln!("lifetimes: {} functions, {} analyses", fns.len(), rounds);
     }
-    for &i in &fns {
-        let f = &p.fns[i as usize];
-        if audit.is_none() && !cx.checked_files.contains(&f.span.file) {
-            continue;
-        }
+    for &i in &checked {
         let (_, errs) = analyze(p, i, &sums, &mut kinds, cx, true, audit);
         if let Some(d) = errs.into_iter().next() {
             return Err(d);

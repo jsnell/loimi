@@ -102,6 +102,14 @@ implementation; `git log` has the details.
 
 ### Core language
 
+- **Pointer stability** (prototype; `docs/design/lifetimes.md`): in
+  `#![safe]` and `#![lifetimes]` modules, a pointer or slice into a
+  container used after a call that may move or free it (`push`,
+  `insert`, `free`, a collection, a `reenter` call in a vm handler), a
+  copied `Vec` grown while the other copy is used, and the address of a
+  local that outlives its function are compile errors. Inferred over
+  the call graph: std needed one `#[may_alias(s)]` (`Vec.extend`). No
+  IR change.
 - **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
   reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
   pointer casts, other modules' buffer pointers and invariant fields,

@@ -1,0 +1,115 @@
+// Pointer stability (docs/design/lifetimes.md): the patterns the check
+// accepts, next to those in tests/fail/lt_*.lm it rejects. Each is the
+// fix of a rejected one: take the slice again after the call, keep an
+// index, hold a GC object in a `let` (rooted, and the collector does not
+// move objects), move a Vec instead of copying it, restore a place that
+// held a local's address before returning.
+#![safe]
+import std.io;
+import std.mem;
+import std.map;
+import std.text;
+import std.diag;
+import std.gc;
+
+object Arr { items: [i64] }
+object List { arr: Gc<Arr>, len: u64 }
+
+fn eq(h: *gc.Heap, l: Gc<List>, x: i64) -> bool uses gc {
+    l.arr = new(h, Arr {}, 8);
+    gc.collect(h);
+    x == 3
+}
+
+/// The old array stays alive while `a` (a `let`) holds it.
+fn index(h: *gc.Heap, l: Gc<List>, x: i64) -> i64 uses gc {
+    let a = l.arr;
+    let xs = a.items;
+    for i in 0..xs.len {
+        if eq(h, l, xs[i]) { return i as i64; }
+    }
+    -1
+}
+
+struct Node { v: u64, next: ?*Node }
+
+struct Walker { cur: ?*u64 }
+
+fn with_local(w: *Walker) -> u64 {
+    var n: u64 = 5;
+    w.cur = Some(&n);
+    let r = match w.cur { Some(p) => *p, None => 0 };
+    w.cur = None;
+    r
+}
+
+fn main() uses gc {
+    // Re-derive after growing.
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    var s = v.items();
+    v.push(2);
+    for i in 0..v.len { v.push(v.at(i)); }
+    s = v.items();
+    io.print_int((s[0] + v.at(3)) as i64);
+    io.print("\n");
+    // A buffer appending its own text: `Vec.extend` is `#[may_alias(s)]`.
+    var b = text.StrBuf.new();
+    b.push_str("ab");
+    b.push_str(b.as_str());
+    io.print(b.as_str());
+    io.print("\n");
+    b.free();
+    // A map entry pointer used before the next insert.
+    var m: map.OrderedMap<u64, u64> = map.OrderedMap.new();
+    m.insert(1, 10);
+    if let Some(p) = m.get_ptr(1) { *p = 11; }
+    m.insert(2, 20);
+    io.print_int(m.get(1).unwrap() as i64);
+    io.print("\n");
+    m.free();
+    // Arena nodes link to each other; the arena is freed last.
+    var a = mem.Arena.new();
+    let n1 = new(&a, Node { v: 1, next: None });
+    let n2 = new(&a, Node { v: 2, next: Some(n1) });
+    var sum: u64 = 0;
+    var cur: ?*Node = Some(n2);
+    while let Some(n) = cur { sum += n.v; cur = n.next; }
+    io.print_int(sum as i64);
+    io.print("\n");
+    a.free();
+    // Moving a Vec (the original is not used again) is fine.
+    var c: mem.Vec<u64> = mem.Vec.new();
+    c.push(7);
+    var d = c;
+    d.push(8);
+    io.print_int(d.at(0) as i64);
+    io.print("\n");
+    d.free();
+    // A local's address stored and taken back before returning.
+    var w = Walker { cur: None };
+    io.print_int(with_local(&w) as i64);
+    io.print("\n");
+    // Source files and diagnostics: pointers into the maps used before
+    // they grow.
+    var sm = diag.SourceMap.new();
+    let id = sm.add("t.txt", "one\ntwo\n");
+    let lc = sm.line_col(id, 5);
+    io.print_int(lc.line as i64);
+    io.print("\n");
+    sm.free();
+    // GC: a slice of an object held by a `let`, across collections.
+    var heap = gc.Heap.new();
+    let l = new(&heap, List { arr: new(&heap, Arr {}, 4), len: 4 });
+    l.arr.items[3] = 3;
+    io.print_int(index(&heap, l, 3));
+    io.print("\n");
+}
+// expect: 3
+// expect: abab
+// expect: 11
+// expect: 3
+// expect: 7
+// expect: 5
+// expect: 2
+// expect: 3

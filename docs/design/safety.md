@@ -132,7 +132,10 @@ unsafe { write(fd, s.ptr, s.len) }
    11); index- and callback-based APIs (`Vec.at(i)`, `OrderedMap`
    entry indices with `version`) are the safe alternative where they
    are cheap. Built with `--sanitize=address`, most stale uses are
-   reported at run time (section 7).
+   reported at run time (section 7). *Update:* the uses within one
+   function, through calls, are now compile errors (pointer
+   stability, `docs/design/lifetimes.md`); pointers stored in memory
+   and loaded elsewhere remain this hole.
 2. **GC references in host memory.** A `Gc<T>` kept somewhere the
    collector does not scan (a `Vec<Gc<T>>` that is not a root) dangles
    after a collection. Unchanged by this work; `gc.Heap` roots and
