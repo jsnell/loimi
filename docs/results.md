@@ -165,6 +165,16 @@ suite).
   1.02–1.10× tail-call.
 - MiniJS takes 0.22–0.78 of `node --jitless`'s time and 0.20–0.65 of
   QuickJS's, less on all 14.
+  **2026-11-04, second MiniJS pass** (after this run; tail-call only,
+  `compare.py -n 3 --align 64` with the 573511e build as a column):
+  0.939 of the time before by geometric mean, 0.48 of node --jitless
+  and 0.37 of QuickJS (0.51 and 0.39 for the old build in the same
+  run); bitops 0.83, raytrace 0.90, closures and spectral_norm 0.91,
+  strings 0.92, binary_trees 0.93, others 0.94-0.99. Arithmetic slow
+  paths inline, a DIV family, constant compares, frameless handlers,
+  calls that do not clear registers
+  ([bench/minijs/RESULTS.md](../bench/minijs/RESULTS.md#second-performance-pass-2026-11-04)).
+  Other dispatch modes and the JIT build were not rerun.
 - Scheme takes less time than Guile with its JIT on 14 of 43 programs
   (geometric mean 0.94); with Loimi's JIT, on 21 (0.76). The bignum
   programs: pi 1.30× Guile (GMP's subquadratic division and square root

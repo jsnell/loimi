@@ -295,7 +295,7 @@ before `super()`.
 MiniJS took 0.53 of node --jitless's time and 0.40 of QuickJS's
 (geometric means over the 14 benchmarks), 0.23-0.82 per benchmark
 against V8's interpreter; the second pass (2026-11-04, same file) took
-it to SECOND_PASS_RATIOS. The tables below are from before the first pass.
+it to 0.48 and 0.37 (0.939 of the time before by geometric mean). The tables below are from before the first pass.
 
 CPU seconds (user + system), best of 3, `--dispatch=tailcall`, on the
 shared 8-core development machine while other agents were running
