@@ -376,6 +376,7 @@ struct Fa<'a> {
     audit: Option<&'a crate::diag::SourceMap>,
     kinds: &'a mut Kinds,
     whys: Vec<(Span, Why)>,
+    why_ids: HashMap<(Span, Why), u32>,
     errs: Vec<Diag>,
     /// Audit mode: the `lifetime-site` lines.
     lines: Vec<String>,
@@ -387,9 +388,9 @@ struct Fa<'a> {
     defers: Vec<Vec<&'a TExpr>>,
     out: Summary,
     param_idx: HashMap<LocalId, u32>,
-    nev: u64,
-    nloop: u64,
-    ncall: u64,
+    /// (callee, argument, what it points into) whose restructures are
+    /// already in `out`.
+    summed: HashSet<(FnId, u32, Path)>,
 }
 
 /// `kind_of`, memoized by type and by the address of a type in the program.
@@ -400,6 +401,7 @@ struct Kinds {
 }
 
 /// Why a local may dangle (formatted only for a message).
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Why {
     Text(String),
     /// The call of a function (or of a function value).
@@ -475,9 +477,16 @@ impl<'a> Fa<'a> {
         self.unsafe_spans.iter().any(|u| u.file == s.file && u.lo <= s.lo && s.hi <= u.hi)
     }
 
+    /// The same reason at the same place has the same index, so that a
+    /// loop's state reaches its fixpoint.
     fn why(&mut self, span: Span, what: Why) -> u32 {
-        self.whys.push((span, what));
-        (self.whys.len() - 1) as u32
+        if let Some(&w) = self.why_ids.get(&(span, what.clone())) {
+            return w;
+        }
+        self.whys.push((span, what.clone()));
+        let w = (self.whys.len() - 1) as u32;
+        self.why_ids.insert((span, what), w);
+        w
     }
 
     fn why_text(&self, w: u32) -> (Span, String) {
@@ -626,7 +635,7 @@ impl<'a> Fa<'a> {
     /// Move or free the memory at each of `rs`: what points into it may
     /// dangle. One pass over the state for all of them (a call's summary
     /// may name hundreds of blocks).
-    fn restructure(&mut self, rs: &[Path], w: u32, st: &mut St) {
+    fn restructure(&mut self, rs: &[Path], w: u32, st: &mut St, summarize: bool) {
         if rs.is_empty() {
             return;
         }
@@ -687,25 +696,31 @@ impl<'a> Fa<'a> {
                 Rc::make_mut(&mut st.stale_places).insert(pl, w);
             }
         }
-        // The summary: restructures through parameters and globals.
-        for r in rs {
-            match r.root {
-                Root::Local(l) if r.has_deref() => {
-                    if let Some(&i) = self.param_idx.get(&l) {
-                        let mut q = r.clone();
-                        q.root = Root::Param(i);
-                        if !self.out.restructs.contains(&q) {
-                            self.out.restructs.insert(q);
-                        }
-                    }
-                }
-                Root::Global(_) => {
-                    if !self.out.restructs.contains(r) {
-                        self.out.restructs.insert(r.clone());
-                    }
-                }
-                _ => {}
+        if summarize {
+            for r in rs {
+                self.summarize(r);
             }
+        }
+    }
+
+    /// The summary: restructures through parameters and globals.
+    fn summarize(&mut self, r: &Path) {
+        match r.root {
+            Root::Local(l) if r.has_deref() => {
+                if let Some(&i) = self.param_idx.get(&l) {
+                    let mut q = r.clone();
+                    q.root = Root::Param(i);
+                    if !self.out.restructs.contains(&q) {
+                        self.out.restructs.insert(q);
+                    }
+                }
+            }
+            Root::Global(_) => {
+                if !self.out.restructs.contains(r) {
+                    self.out.restructs.insert(r.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -715,24 +730,8 @@ impl<'a> Fa<'a> {
         match p.root {
             Root::Param(i) => {
                 let Some(pos) = p.steps.iter().position(is_d) else { return Vec::new() };
-                let rest = &p.steps[pos + 1..];
                 let Some(a) = args.get(i as usize) else { return Vec::new() };
-                a.iter()
-                    .map(|t| {
-                        let mut q = t.clone();
-                        if !q.trunc {
-                            let room = K - q.steps.len().min(K);
-                            q.steps.extend_from_slice(&rest[..rest.len().min(room)]);
-                            if rest.len() > room {
-                                q.trunc = true;
-                            }
-                        }
-                        if p.trunc {
-                            q.trunc = true;
-                        }
-                        q
-                    })
-                    .collect()
+                a.iter().map(|t| subst_one(p, pos, t)).collect()
             }
             Root::Global(_) | Root::GcAny => vec![p.clone()],
             _ => Vec::new(),
@@ -884,10 +883,12 @@ impl<'a> Fa<'a> {
     fn report_off<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let r = self.report;
         let out = self.out.clone();
+        let summed = std::mem::take(&mut self.summed);
         self.report = false;
         let x = f(self);
         self.report = r;
         self.out = out;
+        self.summed = summed;
         x
     }
 
@@ -904,7 +905,6 @@ impl<'a> Fa<'a> {
     }
 
     fn call(&mut self, e: &'a TExpr, f: &'a TExpr, args: &'a [TExpr], st: &mut St) -> Val {
-        self.ncall += 1;
         self.eval(f, st);
         let vals: Vec<Val> = args.iter().map(|a| self.eval(a, st)).collect();
         let callee = match f.kind {
@@ -924,10 +924,40 @@ impl<'a> Fa<'a> {
                 let may_alias = self.p.may_alias.get(&id).copied().unwrap_or(0);
                 // What it moves or frees, in this function's terms (and
                 // through which parameter).
+                // The summary takes them once per callee and argument path
+                // (a recursive walker's summary may name hundreds).
+                let mut fresh: Vec<Vec<bool>> = Vec::with_capacity(vals.len());
+                for (i, a) in vals.iter().enumerate() {
+                    let mut f = Vec::with_capacity(a.len());
+                    for t in a.iter() {
+                        let param = matches!(t.root, Root::Local(l) if self.param_idx.contains_key(&l));
+                        f.push(param && self.summed.insert((id, i as u32, t.clone())));
+                    }
+                    fresh.push(f);
+                }
+                let fresh_globals = self.summed.insert((id, u32::MAX, Path::new(Root::GcAny)));
                 let mut rsub: Vec<(Option<u32>, Path)> = Vec::new();
                 for r in &s.restructs {
-                    let i = if let Root::Param(i) = r.root { Some(i) } else { None };
-                    rsub.extend(self.subst(r, &vals).into_iter().map(|q| (i, q)));
+                    match r.root {
+                        Root::Param(i) => {
+                            let Some(pos) = r.steps.iter().position(is_d) else { continue };
+                            let Some(a) = vals.get(i as usize) else { continue };
+                            for (k, t) in a.iter().enumerate() {
+                                let q = subst_one(r, pos, t);
+                                if fresh[i as usize][k] {
+                                    self.summarize(&q);
+                                }
+                                rsub.push((Some(i), q));
+                            }
+                        }
+                        Root::Global(_) | Root::GcAny => {
+                            if fresh_globals {
+                                self.summarize(r);
+                            }
+                            rsub.push((None, r.clone()));
+                        }
+                        _ => {}
+                    }
                 }
                 // Arguments into what the callee moves through another.
                 for &(i, j) in &s.pairs {
@@ -986,7 +1016,7 @@ impl<'a> Fa<'a> {
                 if !rsub.is_empty() {
                     let rs: Vec<Path> = rsub.into_iter().map(|(_, q)| q).collect();
                     let w = self.why(e.span, Why::Call(callee));
-                    self.restructure(&rs, w, st);
+                    self.restructure(&rs, w, st, false);
                 }
                 for r in &s.ret {
                     res.extend(self.subst(r, &vals));
@@ -1000,7 +1030,7 @@ impl<'a> Fa<'a> {
                 if matches!(fd.name.as_str(), "free" | "realloc") && !vals.is_empty() {
                     let w = self.why(e.span, Why::Call(callee));
                     let rs: Vec<Path> = vals[0].iter().cloned().collect();
-                    self.restructure(&rs, w, st);
+                    self.restructure(&rs, w, st, true);
                 }
                 if fd.name != "realloc" && self.kind(&e.ty) != Kind::None {
                     for (a, v) in args.iter().zip(&vals) {
@@ -1020,7 +1050,7 @@ impl<'a> Fa<'a> {
         }
         if may_collect(self.p, f) {
             let w = self.why(e.span, Why::Collect(callee));
-            self.restructure(&[Path { root: Root::GcAny, steps: Steps::new(), trunc: true }], w, st);
+            self.restructure(&[Path { root: Root::GcAny, steps: Steps::new(), trunc: true }], w, st, true);
         }
         if self.kind(&e.ty) == Kind::Gc {
             return [Path::new(Root::GcAny)].into_iter().collect();
@@ -1063,7 +1093,6 @@ impl<'a> Fa<'a> {
     }
 
     fn eval(&mut self, e: &'a TExpr, st: &mut St) -> Val {
-        self.nev += 1;
         if !st.reach {
             return Val::new();
         }
@@ -1232,7 +1261,6 @@ impl<'a> Fa<'a> {
                     let mut next = head.clone();
                     next.join(&s);
                     iters += 1;
-                    self.nloop += 1;
                     if next == head || iters > 20 {
                         break;
                     }
@@ -1393,7 +1421,7 @@ impl<'a> Fa<'a> {
                         targets.insert(Path::new(Root::Local(l)).push(Step::D));
                     }
                     let rs: Vec<Path> = targets.into_iter().collect();
-                    self.restructure(&rs, w, st);
+                    self.restructure(&rs, w, st, true);
                     // `reload` itself sets them again.
                     self.eval(reload, st);
                 }
@@ -1421,6 +1449,24 @@ impl<'a> Fa<'a> {
             _ => Val::new(),
         }
     }
+}
+
+/// Parameter path `p` (its first dereference at `pos`) for an argument
+/// pointing into `t`.
+fn subst_one(p: &Path, pos: usize, t: &Path) -> Path {
+    let rest = &p.steps[pos + 1..];
+    let mut q = t.clone();
+    if !q.trunc {
+        let room = K - q.steps.len().min(K);
+        q.steps.extend_from_slice(&rest[..rest.len().min(room)]);
+        if rest.len() > room {
+            q.trunc = true;
+        }
+    }
+    if p.trunc {
+        q.trunc = true;
+    }
+    q
 }
 
 /// `objref::may_collect` without copying the callee's type.
@@ -1487,6 +1533,7 @@ fn analyze<'a>(
         audit,
         kinds,
         whys: Vec::new(),
+        why_ids: HashMap::new(),
         errs: Vec::new(),
         lines: Vec::new(),
         err_spans: HashSet::new(),
@@ -1495,7 +1542,7 @@ fn analyze<'a>(
         loop_locals: HashMap::new(),
         defers: Vec::new(),
         out: Summary::default(),
-        nev: 0, nloop: 0, ncall: 0,
+        summed: HashSet::new(),
         param_idx: f.params.iter().enumerate().map(|(i, &l)| (l, i as u32)).collect(),
     };
     let _ = fa.fid;
@@ -1516,14 +1563,10 @@ fn analyze<'a>(
         }
     }
     let v = fa.eval(b, &mut st);
-    if std::env::var("LOIMI_LT_DBG").is_ok() && f.symbol.ends_with("__verify") {
-        eprintln!("{}: locals {} vals {} paths {}", f.symbol, f.locals.len(), st.vals.len(), st.vals.values().map(|v| v.len()).sum::<usize>());
-    }
     if st.reach {
         fa.ret(&v, b.span);
         fa.exit_escapes(&st);
     }
-    if std::env::var("LOIMI_LT_DBG").is_ok() && fa.nev > 20000 { eprintln!("{} evals {} loopiters {} calls {} locals {}", f.symbol, fa.nev, fa.nloop, fa.ncall, f.locals.len()); }
     (fa.out, fa.errs, fa.lines)
 }
 
@@ -1535,6 +1578,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         return Ok(());
     }
     let audit = (mode == "audit").then_some(sm);
+    let t_start = std::time::Instant::now();
     let body = |i: FnId| p.fns[i as usize].body.is_some();
     let checked: Vec<FnId> = (0..p.fns.len() as FnId)
         .filter(|&i| body(i) && (audit.is_some() || cx.checked_files.contains(&p.fns[i as usize].span.file)))
@@ -1634,7 +1678,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         }
     }
     if stats {
-        eprintln!("lifetimes: analyses {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0);
+        eprintln!("lifetimes: analyses {:.1} ms, pass {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0, t_start.elapsed().as_secs_f64() * 1000.0);
     }
     for &i in &checked {
         let Some((errs, lines)) = reports.remove(&i) else { continue };
