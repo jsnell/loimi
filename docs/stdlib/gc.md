@@ -59,7 +59,11 @@ every interpreter test run in three modes: normal, `stress`, and
   allocated from (the heap's whole allocation budget) at each
   collection: 3-29% of Prolog's run time, and as lazy sweeping 13-23% of
   Scheme's allocation-heavy programs (`deriv`, `diviter`, `cpstak`).
-  Measurements: [`../results.md`](../results.md), 2026-11-04.
+  Without it Prolog takes 0.885 of its time before, Scheme 0.955,
+  Python 0.94 (geometric means), at the same peak memory; the
+  collector's remaining cost is marking (the bitmap writes make it
+  1.1-1.25 times as long) and `refill`. Measurements:
+  [`../results.md`](../results.md#gc-mark-bitmaps-instead-of-sweeping-2026-11-04).
   Allocating all sizes from one run (Immix-like, with each object's
   granules marked) was as fast for Prolog but made MiniJS's `sort` 4%
   slower: records allocated between strings and arrays were spread over
