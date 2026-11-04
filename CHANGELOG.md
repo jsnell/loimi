@@ -403,7 +403,14 @@ implementation; `git log` has the details.
   ([FRICTION.md](examples/python/FRICTION.md#instance-layout-inline-slots-behind-shapes-2026-11-04)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
-- The Prolog takes 0.63x SWI-Prolog's time and 0.15x Trealla's by
+- The Prolog takes 0.53x SWI-Prolog's time and 0.13x Trealla's (0.92
+  of the time before; tak 0.55, boyer 0.53): a first clause whose first
+  comparison excludes the other clauses' commits without a choicepoint;
+  arg/3, functor/3 and compare/3 write a new output variable's register
+  instead of binding a variable object; 32-bit division; comparisons
+  of head arguments before the environment; a 2 MiB minimum heap
+  ([FRICTION.md](examples/prolog/FRICTION.md#optimizations-third-round-2026-11-04)).
+- The Prolog took 0.63x SWI-Prolog's time and 0.15x Trealla's by
   geometric mean over its 30 benchmarks (was 0.79x and 0.19x):
   dereferenced arithmetic operands, inline structure allocation,
   trailing and failure in the head ops, nested head structures built in

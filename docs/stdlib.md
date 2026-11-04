@@ -155,7 +155,8 @@ import.
   `Result` has no methods: use `match`, `if let` or `?`.
 - **Pointers**: `p.offset(n)` (`i64` elements), `p.slice(n) -> []T`,
   `p + n`, `p[i]`, `*p`; `p.read_unaligned()` and `p.write_unaligned(v)`
-  for addresses that may not be aligned for `T` (language.md §1.3).
+  for addresses that may not be aligned for `T` (language.md §1.3);
+  `p.prefetch()`, a cache hint that never faults.
 - **Other built-ins**: `size_of<T>() -> u64`; `likely(c)`,
   `unlikely(c)`, `assume(c)`; `trap() -> never` and `unreachable`;
   `new(heap, Obj { .. }, n)` and `gc_mark(heap, v)` with `std.gc`

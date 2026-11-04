@@ -65,6 +65,8 @@ pub struct Machine {
     cend: *u64,
     ball: Term,
     bags: mem.Vec<Term>,
+    /// The atoms <, = and > (compare/3).
+    order: [u32; 3],
     preds: mem.Vec<*Pred>,
     consts: mem.Vec<Term>,
     out: io.Out,

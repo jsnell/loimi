@@ -68,6 +68,28 @@ every interpreter test run in three modes: normal, `stress`, and
   granules marked) was as fast for Prolog but made MiniJS's `sort` 4%
   slower: records allocated between strings and arrays were spread over
   more cache lines than in a chunk of their own class.
+- **Fragmented chunks after the pool** (2026-11-04). After marking,
+  `relink_chunks` counts each chunk's marked granules and free runs
+  (popcounts over the bitmap). A chunk whose runs hold fewer than
+  `POOR_RUN` (8) objects of its class on average goes on its class's
+  second list, which `refill` takes only once the pool of empty chunks
+  is used up: a run costs a `refill` call, and a heap whose survivors
+  are scattered (Prolog's boyer: 30 MB, 2-5 MB live) has thousands of
+  short runs. The other chunks of the class still come first, so memory
+  stays as it was: taking the pool before every chunk of the class cut
+  boyer's `refill` time to a third too, but made its peak memory 1.15
+  times as large (a class used the pool while its own chunks' runs went
+  unused, and another class then needed new chunks).
+- **Marking prefetches** (2026-11-04). In a major collection `mark_ptr`
+  does not read the object's header at once: it prefetches it
+  (`p.prefetch()`) and queues the reference in a 16-entry ring, marking
+  the reference it pushes out (and the rest when the mark stack runs
+  dry), so the cache misses of up to 16 headers overlap. Boyer's mark
+  time fell from 232 to 177 ms, tak's from 96 to 86 ms. Minor
+  collections mark at once: there `young_ref` must belong to the object
+  being traced. Reading the header early with a plain load instead of
+  a prefetch was slower than not deferring (boyer 252 ms), and tracing
+  popped objects through a FIFO, without prefetching, gained nothing.
 - **`try_new(h, T { .. })`** (compiled to `gc.try_alloc`) is `new`
   without the refill: it bumps the class's run or gives `None`, and makes
   no call, so a tail-call handler that allocates with it has no stack

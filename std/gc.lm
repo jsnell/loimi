@@ -10,7 +10,9 @@
 // the bits of a small object's granules; nothing is swept: per size
 // class, the allocator bump-allocates through runs of clear bits, which
 // it finds from the bitmaps in chunk order (`refill`), and chunks with
-// no marked object go to a pool that any class takes from. Larger
+// no marked object go to a pool that any class takes from (before its
+// chunks with only short runs). Marking prefetches each object's header
+// some references before it reads it. Larger
 // objects are calloc'd, with the same remembered-set pointer just before
 // their header, and kept in a vector.
 //
@@ -172,6 +174,9 @@ pub struct Heap {
     /// Per size class, the chunk where `refill` looks for the next run
     /// (index + 1; 0: none left), and the granule there.
     avail: [u64; 33],
+    /// Per size class, its fragmented chunks (`POOR_RUN`), which `refill`
+    /// takes after the pool.
+    frag: [u64; 33],
     scan_g: [u64; 33],
     /// The chunks with no marked object after the last collection, which
     /// any size class may take (index + 1; 0: none).
@@ -278,6 +283,11 @@ pub struct Heap {
     /// `--gc-check-roots`: a bit per granule of each chunk (BM_WORDS
     /// words per chunk, by chunk index) set where an object starts.
     starts: mem.Vec<u64>,
+    /// References `mark_ptr` has prefetched and not yet marked (null:
+    /// empty), when `deferred` is set; `ring_i` is the oldest.
+    ring: [*u8; 16],
+    ring_i: u64,
+    deferred: bool,
 }
 
 pub fn Heap.new() -> Heap {
@@ -292,6 +302,7 @@ pub fn Heap.new() -> Heap {
         cur: [0 as *u8; 33],
         lim: [0 as *u8; 33],
         avail: [0; 33],
+        frag: [0; 33],
         scan_g: [0; 33],
         pool: 0,
         chunks: mem.Vec.new(),
@@ -340,6 +351,9 @@ pub fn Heap.new() -> Heap {
         nyoung: 0,
         old_count: 0,
         starts: mem.Vec.new(),
+        ring: [0 as *u8; 16],
+        ring_i: 0,
+        deferred: false,
         user: 0 as *u8,
     }
 }
@@ -417,9 +431,12 @@ fn next_bit(bm: *u64, g: u64, set: bool) -> u64 {
 }
 
 /// Make the next run of free memory (granules with clear mark bits) in
-/// a chunk of size class `c` the class's run, taking an empty chunk (or a
-/// new one) when the class's chunks have none left; returns its start.
-/// After each collection a class takes its chunks' runs in chunk order.
+/// a chunk of size class `c` the class's run; returns its start. After
+/// each collection a class takes the runs of its chunks in chunk order,
+/// then empty chunks from the pool, then its fragmented chunks, then new
+/// chunks. (Taking the fragmented chunks before the pool made boyer's
+/// `refill` take three times as long; taking the pool before all of the
+/// class's chunks made its peak memory 1.15 times as large.)
 /// (A run in a chunk of the class starts and ends at object boundaries:
 /// dead objects' bits are clear and live ones' set.)
 #[inline(never)]
@@ -428,16 +445,19 @@ fn refill(h: *Heap, c: u64) -> *u8 {
     let sz = c << 4;
     loop {
         if h.avail[c] == 0 {
-            if h.pool == 0 {
-                add_chunk(h);
-                h.avail[c] = h.chunks.len;
-            } else {
+            if h.pool != 0 {
                 h.avail[c] = h.pool;
                 h.pool = h.chunks.at(h.pool - 1).next;
+                h.chunks.ptr_at(h.avail[c] - 1).next = 0;
+            } else if h.frag[c] != 0 {
+                h.avail[c] = h.frag[c];
+                h.frag[c] = 0;
+            } else {
+                add_chunk(h);
+                h.avail[c] = h.chunks.len;
             }
             let nc = h.chunks.ptr_at(h.avail[c] - 1);
             nc.class = c;
-            nc.next = 0;
             h.scan_g[c] = 0;
         }
         let ch = h.chunks.at(h.avail[c] - 1);
@@ -461,32 +481,53 @@ fn refill(h: *Heap, c: u64) -> *u8 {
     }
 }
 
+/// A chunk whose free runs hold fewer than this many objects of its class
+/// on average is *fragmented*: its class allocates there only once the
+/// pool of empty chunks is used up (each run costs a `refill`).
+const POOR_RUN: u64 = 8;
+
 /// After marking: reset the allocator's runs, and relink the chunks, in
-/// index order, per size class, except those with no marked object,
-/// which go to the empty chunks that any class can take.
+/// index order, per size class (the fragmented ones in a second list),
+/// except those with no marked object, which go to the empty chunks that
+/// any class can take.
 fn relink_chunks(h: *Heap) {
     var tail: [u64; 33] = [0; 33];
+    var ftail: [u64; 33] = [0; 33];
     var ptail: u64 = 0;
     h.pool = 0;
     for c in 0..NCLASS {
         h.cur[c] = 0 as *u8;
         h.lim[c] = 0 as *u8;
         h.avail[c] = 0;
+        h.frag[c] = 0;
         h.scan_g[c] = 0;
     }
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
         ch.next = 0;
         let bm = (ch.base + BITMAP) as *u64;
-        var any: u64 = 0;
-        for w in 0..BM_WORDS { any = any | bm[w]; }
-        if any == 0 {
+        var used: u64 = 0;
+        var runs: u64 = 1;
+        var prev: u64 = 0;
+        for w in 0..BM_WORDS {
+            let x = bm[w];
+            used += x.popcount();
+            runs += (!x & ((x << 1) | (prev >> 63))).popcount();
+            prev = x;
+        }
+        if used == 0 {
             if ptail == 0 { h.pool = ci + 1; } else { h.chunks.ptr_at(ptail - 1).next = ci + 1; }
             ptail = ci + 1;
         } else {
             let c = ch.class;
-            if tail[c] == 0 { h.avail[c] = ci + 1; } else { h.chunks.ptr_at(tail[c] - 1).next = ci + 1; }
-            tail[c] = ci + 1;
+            let free = GRANULES - ch.start - used;
+            if free >= runs * c * POOR_RUN {
+                if tail[c] == 0 { h.avail[c] = ci + 1; } else { h.chunks.ptr_at(tail[c] - 1).next = ci + 1; }
+                tail[c] = ci + 1;
+            } else {
+                if ftail[c] == 0 { h.frag[c] = ci + 1; } else { h.chunks.ptr_at(ftail[c] - 1).next = ci + 1; }
+                ftail[c] = ci + 1;
+            }
         }
     }
 }
@@ -628,9 +669,45 @@ fn head_of(obj: *u8) -> *ChunkHead {
 /// can skip work: only objects allocated since the last collection die).
 pub fn Heap.is_minor(h: *Heap) -> bool { h.minor }
 
-/// Mark the object at `p` (null is ignored). Called by generated tracing code.
+/// The length of `Heap.ring`, a power of two.
+const RING: u64 = 16;
+
+/// Mark the object at `p` (null is ignored). Called by generated tracing
+/// code. In a major collection (`deferred`) it prefetches the header and
+/// marks the reference RING calls later, so the cache misses of up to
+/// RING headers overlap (in a minor collection `young_ref` must belong to
+/// the object being traced, so it marks at once). Boyer's marking took
+/// 0.75 of the time; reading the header early with a plain load instead
+/// of a prefetch was slower than not deferring.
 pub fn mark_ptr(h: *Heap, p: *u8) {
     if (p as u64) == 0 { return; }
+    if h.deferred {
+        (p - HEADER).prefetch();
+        let i = h.ring_i;
+        let q = h.ring[i];
+        h.ring[i] = p;
+        h.ring_i = (i + 1) & (RING - 1);
+        if (q as u64) != 0 { mark_now(h, q); }
+        return;
+    }
+    mark_now(h, p);
+}
+
+/// Mark the references waiting in the ring (before anything that looks
+/// at marks or at the mark stack).
+fn flush_ring(h: *Heap) {
+    for k in 0..RING {
+        let i = (h.ring_i + k) & (RING - 1);
+        let q = h.ring[i];
+        if (q as u64) != 0 {
+            h.ring[i] = 0 as *u8;
+            mark_now(h, q);
+        }
+    }
+}
+
+#[inline]
+fn mark_now(h: *Heap, p: *u8) {
     let hd = (p - HEADER) as *Header;
     let ep = h.epoch;
     let m = hd.mark;
@@ -753,20 +830,25 @@ pub fn Heap.add_sweeper(h: *Heap, data: *u8, sweep: fn(*Heap, *u8)) {
 }
 
 fn drain(h: *Heap) {
-    while let Some(p) = h.stack.pop() {
-        let hd = (p - HEADER) as *Header;
-        if h.minor and hd.mark == h.epoch {
-            // Promoted in this minor collection: if it points to young
-            // survivors, it goes into the remembered set.
-            h.young_ref = false;
-            loimi_trace_object(h, p, hd.tid as u32);
-            if h.young_ref and (hd.flags & INRS) == 0 {
-                hd.flags = hd.flags | INRS;
-                h.rs.objs.push(p);
+    loop {
+        while let Some(p) = h.stack.pop() {
+            let hd = (p - HEADER) as *Header;
+            if h.minor and hd.mark == h.epoch {
+                // Promoted in this minor collection: if it points to young
+                // survivors, it goes into the remembered set.
+                h.young_ref = false;
+                loimi_trace_object(h, p, hd.tid as u32);
+                if h.young_ref and (hd.flags & INRS) == 0 {
+                    hd.flags = hd.flags | INRS;
+                    h.rs.objs.push(p);
+                }
+            } else {
+                loimi_trace_object(h, p, hd.tid as u32);
             }
-        } else {
-            loimi_trace_object(h, p, hd.tid as u32);
         }
+        if !h.deferred { break; }
+        flush_ring(h);
+        if h.stack.len == 0 { break; }
     }
 }
 
@@ -827,10 +909,13 @@ pub fn collect(h: *Heap) uses gc {
         h.rs.young = NO_YOUNG;
         h.rs.objs.clear();
     }
+    h.deferred = !minor;
     for i in 0..h.scanners.len {
         let s = h.scanners.at(i);
         s.scan(h, s.data);
     }
+    flush_ring(h);
+    h.deferred = false;
     // The shadow stack is the thread's, shared by every heap used on
     // it: in a nested run into another heap, its frames hold that heap's
     // objects too, which must keep their marks.
@@ -845,6 +930,7 @@ pub fn collect(h: *Heap) uses gc {
         fr = fr.prev;
     }
     h.checks = 0;
+    h.deferred = !minor;
     drain(h);
     // Ephemerons: mark the values of entries with marked keys until
     // nothing new is marked.
@@ -853,9 +939,11 @@ pub fn collect(h: *Heap) uses gc {
             let e = h.ephemerons.at(i);
             e.mark(h, e.data);
         }
+        flush_ring(h);
         if h.stack.len == 0 { break; }
         drain(h);
     }
+    h.deferred = false;
     for i in 0..h.ephemerons.len {
         let e = h.ephemerons.at(i);
         e.sweep(h, e.data);
@@ -1337,6 +1425,7 @@ fn eph_mark<K, V>(h: *Heap, data: *u8) -> bool {
         let a = t.keys[i];
         if a > EPH_DEL and h.is_marked(a as *u8) { gc_mark(h, t.vals[i]); }
     }
+    flush_ring(h);
     h.stack.len != before
 }
 

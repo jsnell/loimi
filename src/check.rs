@@ -3703,7 +3703,7 @@ impl<'a> Checker<'a> {
             let mut r = recv;
             while let Ty::Ptr(inner) = &r.ty {
                 if matches!(**inner, Ty::Option(_) | Ty::Int(_) | Ty::F64 | Ty::F32)
-                    && !matches!(name, "offset" | "slice" | "read_unaligned" | "write_unaligned")
+                    && !matches!(name, "offset" | "slice" | "read_unaligned" | "write_unaligned" | "prefetch")
                     && !name.starts_with("atomic_")
                 {
                     let t = (**inner).clone();
@@ -3828,6 +3828,10 @@ impl<'a> Checker<'a> {
                 argc(1)?;
                 let n = self.expr_coerce(cx, &args[0], &Ty::i64())?;
                 mk(t.clone(), TK::Intrinsic(Intr::PtrOffset, vec![recv, n]), span)
+            }
+            (Ty::Ptr(_), "prefetch") => {
+                argc(0)?;
+                mk(Ty::Unit, TK::Intrinsic(Intr::Prefetch, vec![recv]), span)
             }
             (Ty::Ptr(inner), "read_unaligned" | "write_unaligned") => {
                 if !matches!(**inner, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Ptr(_) | Ty::Vector(..)) {

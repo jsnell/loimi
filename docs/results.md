@@ -231,6 +231,27 @@ lines (`GETPROP_IN` 6% to 13% of samples). Per-class chunks keep them
 together; an all-dead chunk still goes back to a pool shared by the
 classes.
 
+**Follow-up (2026-11-04): prefetching marks, fragmented chunks last.**
+Marking in a major collection prefetches each header and marks the
+reference 16 `mark_ptr` calls later (a new intrinsic, `p.prefetch()`);
+chunks whose free runs average under 8 objects are allocated from after
+the pool of empty chunks ([stdlib/gc.md](stdlib/gc.md#heap-layout)).
+`LOIMI_GC_STATS`, min of 5, mark / refill ms before and after: boyer
+224 / 59 to 168 / 45, poly_10 108 / 39 to 113 / 9, tak 94 / 2 to 84 /
+2, nreverse 39 / 20 to 36 / 21. Interleaved A/B, user+sys CPU time
+(the machine was at load 6-7 on 8 threads; single programs moved by up
+to ±10% between runs), new/old geometric means: Prolog (29, not sieve,
+min of 5) 0.994, with boyer 0.94, poly_10 0.94, times10 0.94, tak 0.95,
+others within noise; Mini 0.995, MiniJS 1.007, Python 0.992, Scheme
+1.012 (min of 3; Scheme's tak, which never collects and runs the same
+handler code moved by 640 bytes, measured 1.05-1.10 in three runs: a
+layout effect). Peak RSS unchanged within noise everywhere (boyer 29.6
+MB both; taking the pool before *all* of a class's chunks cut boyer's
+refill to 21 ms but grew its peak to 33.5-35 MB). Dropped: tracing
+through a FIFO of popped objects without prefetching (no change), and a
+plain load instead of the prefetch (boyer mark 252 ms, slower than
+before).
+
 ## Changes since the previous run (68012bd)
 
 The previous tables (commit 68012bd, same machine and method, load
@@ -628,3 +649,9 @@ Trealla's by geometric mean, against 0.83x and 0.20x for the build above
 in the same (loaded) run; tak 0.41x, queens_8 0.47x, sieve 0.90x, boyer
 1.05x of SWI-Prolog (`bench/prolog/README.md`). The other columns of this
 table were not rerun.
+
+*2026-11-04, later:* after a third round (FRICTION.md, "Optimizations,
+third round"; Prolog-only changes), 0.53x SWI-Prolog's time and 0.13x
+Trealla's, against 0.57x and 0.14x for the code before (with the
+sweep-free std.gc) in the same run: tak 0.21x, boyer 0.52x, sieve 0.92x
+of SWI-Prolog; ours is faster than SWI-Prolog on all 30.

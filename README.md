@@ -117,9 +117,9 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 | [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.45× clox |
 | [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |
-| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.91× wasm3 |
+| [`wasm`](examples/wasm) | A WebAssembly interpreter (MVP plus reference types, bulk memory, multi-value, SIMD) | Every spec test file passes (SIMD's 57 included); 0.87× wasm3 |
 | [`python`](examples/python) | A Python 3 subset: classes, generators, exceptions, bigints, dicts ([spec](examples/python/SPEC.md)) | 11 pyperformance programs with CPython's output: 0.39× CPython 3.13, 0.18× MicroPython (at 0.52× CPython) ([report](examples/python/FRICTION.md)) |
-| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.63× SWI-Prolog 10 (`-O`), 0.15× Trealla ([report](examples/prolog/FRICTION.md)) |
+| [`prolog`](examples/prolog) | An ISO Prolog subset on a WAM ([spec](examples/prolog/SPEC.md)) | The 30 van Roy / Aquarius programs of SWI-Prolog's bench suite: 0.53× SWI-Prolog 10 (`-O`), 0.13× Trealla ([report](examples/prolog/FRICTION.md)) |
 
 Lox, regex, stack, wasm, python and prolog were written by agents that read only
 the docs, as usability studies; each has a `FRICTION.md` report.

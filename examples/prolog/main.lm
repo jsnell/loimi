@@ -39,6 +39,7 @@ fn setup(m: *Machine) {
     m.heap = gc.Heap.new();
     m.out = io.Out.stdout();
     m.bags = mem.Vec.new();
+    m.order = [m.db.atom("<"), m.db.atom("="), m.db.atom(">")];
     m.preds = mem.Vec.new();
     m.consts = mem.Vec.new();
     m.clauses = mem.Vec.new();
@@ -197,7 +198,8 @@ fn main() -> i32 uses gc {
     var gen = false;
     // After a collection, allocate 4x the live data before the next one
     // (std.gc's default is 1x): boyer 0.69 of the time, the rest within
-    // noise (FRICTION.md).
+    // noise (FRICTION.md). At least 2 MiB (since std.gc stopped sweeping,
+    // a collection's cost is mostly its roots: 1000 code objects).
     var growth: i64 = 400;
     var i: u64 = 1;
     while i < os.arg_count() {
@@ -229,7 +231,7 @@ fn main() -> i32 uses gc {
     consult(m, prelude.SOURCE, true);
     m.stress = disasm;
     if stress { m.heap.set_stress(true); }
-    if growth > 0 { m.heap.set_growth(growth as u64, 1 << 20); }
+    if growth > 0 { m.heap.set_growth(growth as u64, 1 << 21); }
     if tiny { m.heap.set_growth(50, 65536); }
     if gen { m.heap.set_generational(true); }
     if verify { m.heap.set_generational(true); m.heap.set_stress(true); m.heap.set_verify(true); }
