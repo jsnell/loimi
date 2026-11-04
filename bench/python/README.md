@@ -103,3 +103,16 @@ references, `compare.py -n 3`: 0.53x CPython 3.13.18's time and 0.20x
 MicroPython's by geometric mean; every program prints CPython's output.
 The per-program table, the optimization log and the dispatch-mode
 comparison are in `examples/python/FRICTION.md`.
+
+## Profiling notes (2026-11-04)
+
+`perf` is not available on the shared machine; the second optimization
+round (`examples/python/FRICTION.md`, "Optimizations, second round")
+used an `LD_PRELOAD` timer sampler (SIGPROF, rip plus return addresses
+found by scanning the stack), `--vm-stats` cold-block counts and
+`PYLOIMI_COUNTS=1`. Under load from other jobs, wall times of identical
+builds moved by up to ±7%; A/B decisions used CPU time (user + sys) of
+interleaved runs, which moved by about ±3%. On the set itself: 6 of the
+11 programs are dominated by instance attributes and method calls, and
+none uses dicts or strings heavily (go and hexiom aside), so dict and
+string work is barely measured here.

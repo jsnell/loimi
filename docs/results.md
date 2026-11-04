@@ -507,6 +507,16 @@ Times in seconds.
 
 Times in seconds.
 
+**2026-11-04, after the second Python optimization round** (interpreter
+changes only, no compiler or std change; tail-call build only, not a
+full `run_all.py` run): `bench/python/compare.py -n 5` with the builds
+before and after interleaved, load average 4.5-5.4. Geomean against
+CPython 0.53 → **0.45** (after/before 0.85): spectral_norm 0.44 → 0.28,
+nqueens 0.93 → 0.76, hexiom 0.74 → 0.60, float 0.52 → 0.40, fannkuch
+0.54 → 0.45, richards 0.38 → 0.31, deltablue 0.60 → 0.54; chaos, go,
+nbody and raytrace within 5%. Per-benchmark table and what changed:
+[examples/python/FRICTION.md](../examples/python/FRICTION.md#optimizations-second-round-2026-11-04).
+
 ### prolog
 
 | benchmark | tailcall | goto | switch | jit | swipl | trealla | tailcall/swipl | tailcall/trealla | jit/swipl | jit/trealla |

@@ -100,6 +100,86 @@ lookups and allocation, which in this design live in host functions
 reached from `cold` blocks, and the tools for seeing where *that* time
 goes are thin (item 13).
 
+## Optimizations, second round (2026-11-04)
+
+Where the time went, from a timer sampler (`LD_PRELOAD`, SIGPROF every
+37 µs, the interrupted `rip` plus return addresses found by scanning the
+stack, so callers of the runtime functions show), `--vm-stats` cold-block
+counts and `PYLOIMI_COUNTS=1`, per benchmark, and what was done about it.
+A/B numbers are CPU time (user + sys), best of 3-5 interleaved runs, on a
+machine with load 4-6 from other agents: wall times moved by ±7% between
+identical runs, CPU times by about ±3%.
+
+`bench/python/compare.py -n 5`, tail-call builds with
+`--align-functions=64` before (6187ede) and after, interleaved with
+CPython 3.13.18, wall clock, best of 5 (load average 4.5-5.4):
+
+| benchmark | before (s) | after (s) | CPython (s) | before/CPython | after/CPython | after/before |
+|---|---:|---:|---:|---:|---:|---:|
+| chaos | 0.423 | 0.416 | 0.862 | 0.49 | 0.48 | 0.98 |
+| deltablue | 0.713 | 0.645 | 1.195 | 0.60 | 0.54 | 0.90 |
+| fannkuch | 0.635 | 0.526 | 1.183 | 0.54 | 0.45 | 0.83 |
+| float | 0.595 | 0.462 | 1.151 | 0.52 | 0.40 | 0.78 |
+| go | 0.479 | 0.480 | 1.088 | 0.44 | 0.44 | 1.00 |
+| hexiom | 0.682 | 0.554 | 0.916 | 0.74 | 0.60 | 0.81 |
+| nbody | 0.471 | 0.461 | 1.231 | 0.38 | 0.37 | 0.98 |
+| nqueens | 0.993 | 0.813 | 1.063 | 0.93 | 0.76 | 0.82 |
+| raytrace | 0.666 | 0.635 | 1.170 | 0.57 | 0.54 | 0.95 |
+| richards | 0.407 | 0.332 | 1.070 | 0.38 | 0.31 | 0.82 |
+| spectral_norm | 0.413 | 0.265 | 0.939 | 0.44 | 0.28 | 0.64 |
+| **geomean** | | | | **0.53** | **0.45** | **0.85** |
+
+Per change (`after/before` of that step):
+
+| change | why (profile) | effect |
+|---|---|---|
+| `for a, b in ..` into two locals is one op, FORITER2: enumerate() and zip() of lists write the pair without the tuple, a list of pairs unpacks in the op; comprehensions too | spectral_norm: `ops.next` on enumerate 15%, a tuple and an UNPACK per item | spectral_norm 0.62-0.68 |
+| `x in list`/`tuple` skips `eq_builtin` for two different ints and for strings of different lengths | hexiom: `eq_builtin` 11%, called per element from `contains_fast` | hexiom 0.76 (with the next line) |
+| Operator-method lookup (`__getitem__`, `__add__`, `__eq__`, ..) cached per class in the class box, reset with the `__init__` cache at each class epoch; `==` on instances caches "no `__eq__`/`__ne__`" there too | hexiom's `Done.__getitem__` walked the class chain per index; deltablue's `identity_eq` did 4 dict probes per `!=` (8%) | deltablue 0.93 (with the next lines) |
+| A global method cache, `(class id, name) -> (entry, depth)`, 1024 entries, checked by the class epoch, probed from LOADMETHOD's cold block before `ops.loadmethod`; a hit fills the site's cache as the slow path would | richards: 2.3M LOADMETHOD misses (four Task classes at two-entry sites), `ops.loadmethod` 15% + its cold block 6% | richards 0.87, then 0.92 |
+| `isinstance(inst, class)` in CALL's cold block | richards: 1M `isinstance` calls through `call_slow`/`builtins.call` | part of richards above |
+| `list.pop()`, `pop(i)`, `insert(i, x)`, `append(x)` (also as bound methods) and one-argument `math` functions (`sqrt`, `sin`, `cos`, ..) run in CALL/CALLMETHOD's cold blocks without the call machinery | fannkuch: `pop(0)`/`insert` through bound methods, `call_slow` + `builtins.call` + `call_method_builtin` 17%; float: `math.sqrt/cos/sin` | fannkuch 0.84, float 0.76 |
+| `slice_indices` without a division for steps 1 and -1 | fannkuch: `slice_indices` 14% (an `idiv` per slice) | fannkuch 0.95 |
+| `reversed(range(..))` is a range iterator (was a list copy and a reverse iterator FORITER did not know); the prelude collecting a generator for `tuple()`/`set()`/`sum()` is a list comprehension (LISTAPPEND instead of LOADMETHOD/CALLMETHOD per item) | nqueens: 0.9M FORITER cold entries, 0.3M GETITER cold entries | nqueens 0.84, hexiom 0.95 |
+| POW: a float base to a float or int power with a finite result calls `pow()` in the handler; an int squared multiplies | chaos `x ** 2` went through `ops.arith` | chaos 0.93; nbody unchanged (libm's `pow` is the cost) |
+| TRUEDIV float/int on the fast path | spectral_norm's `1.0 / int` | within noise |
+
+Dropped, measured:
+
+- *The instance's entries array cached in `Inst`* (`o.ents`, checked
+  against `o.dict.ents` in parallel, so GETATTR loads inst → entry
+  instead of inst → dict → entries → entry): geomean 1.000, float 1.06
+  (24-byte instances instead of 16). GETATTR is still 14-23% of go,
+  deltablue and richards, nearly all of it waiting on those dependent
+  loads; see "Next" below.
+- *Generational GC* (`heap.set_generational(true)`): geomean 0.982
+  (hexiom 0.92, raytrace 0.94, float 1.05). Not kept: the collector is
+  being reworked in parallel; worth re-measuring after that.
+- *Min heap 32 MiB, or growth 600%*: 0.995-0.998, noise.
+- *The global method cache probed in LOADMETHOD's cold block without
+  filling the site's cache*: richards 0.92 but deltablue 1.06: a
+  two-class site stopped settling into its two entries.
+
+Where the time goes now (tail-call build, share of samples):
+
+- **Attribute access and instance creation** (deltablue, go, richards,
+  raytrace, chaos, float): GETATTR 14-23% (hits: four dependent loads,
+  register → instance → AttrDict → entries → entry), LOADMETHOD +
+  CALLMETHOD 10-25%, SETATTR's append path (`attr_append_new`, a probe
+  per new attribute) 6-9% in raytrace, chaos and float, plus `new_attrs`
+  3-4%: an instance is four objects (Inst, KeyDict, index, entries).
+  CPython 3.13 keeps the values inline in the object behind a shared
+  keys object; doing the same (a class-level layout plus inline slots,
+  the dict only when `__dict__` is used) is the largest remaining item
+  and touches about 75 sites in ops/builtins.
+- **GC**: `std.gc.collect` is 2-13% (nqueens 9-13%, raytrace and chaos
+  9-10%, fannkuch 8%, float 7%).
+- **Generators** (nqueens, hexiom): resume and YIELD copy every register
+  of the frame; a generator per `tuple(genexp)`/`set(genexp)` plus the
+  prelude call.
+- Float math in libm (nbody `pow` 13%, float `sin`/`cos` 12%), the same
+  calls CPython makes.
+
 ## Friction, by impact
 
 ### 1. Compiler bug: two structs with the same name in different modules collide in generic instances

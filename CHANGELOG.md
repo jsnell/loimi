@@ -368,6 +368,15 @@ implementation; `git log` has the details.
   ([`FRICTION.md`](examples/wasm/FRICTION.md), "A held-out set").
 - [`examples/python`](examples/python): a Python 3 subset running 11
   pyperformance programs, on `std.bigint` and `std.dict`.
+- The Python subset takes 0.45 of CPython 3.13's time by geometric
+  mean over its 11 pyperformance programs (was 0.52): `for a, b in ..`
+  as one op (enumerate/zip without tuples), a global method cache
+  behind the per-site caches, operator methods and `__eq__` presence
+  cached per class, `list.pop/insert/append` and one-argument `math`
+  functions without the call machinery, `reversed(range)` as a range
+  iterator, int/str filtering in `x in list`, division-free unit-step
+  slices; interpreter changes only
+  ([FRICTION.md](examples/python/FRICTION.md#optimizations-second-round-2026-11-04)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
 - The Prolog takes 0.63x SWI-Prolog's time and 0.15x Trealla's by
