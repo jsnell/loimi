@@ -1456,6 +1456,7 @@ fn C.call(c: *C, f: *Expr, args: *mem.Vec<Arg>, dst: u32) {
         if base != dst { c.emit(Py.MOVE(d, base as u8)); }
         return;
     }
+    if nkw == 0 and args.len == 1 and c.inline_genexp(f, args.at(0).value, dst) { return; }
     let n = args.len as u32;
     var kwk: u32 = 0;
     if nkw > 0 {
@@ -1490,6 +1491,59 @@ fn C.call(c: *C, f: *Expr, args: *mem.Vec<Arg>, dst: u32) {
     if nkw > 0 { c.emit(Py.CALLKW(base as u8, n as u8, kwk as u8)); }
     else { c.emit(Py.CALL(base as u8, n as u8)); }
     if base != dst { c.emit(Py.MOVE(d, base as u8)); }
+}
+
+/// `tuple(x for ..)`, and `list`, `set`, `sum`, `min`, `max`, `sorted`
+/// of a generator expression without functions inside: when the name is
+/// the builtin at run time (GETGLOBAL, then IS against the builtin), the
+/// comprehension runs inline into a list (a set for `set`), which is
+/// converted or passed to the builtin; else the generator is made and
+/// passed as written. All of these consume the whole generator, so only
+/// the order of the comprehension's work against the callee's start
+/// changes, and the callee is the builtin. Not in class bodies (the
+/// generator's names skip the class namespace).
+fn C.inline_genexp(c: *C, f: *Expr, arg: *Expr, dst: u32) -> bool {
+    let Name(fname) = f.e else { return false; };
+    let GenExp(gf, _) = arg.e else { return false; };
+    if !gf.flat or c.s.kind == SC_CLASS or !c.is_global(fname) { return false; }
+    var kind: u32 = 3;
+    if fname.eq("list") { kind = 0; }
+    else if fname.eq("tuple") { kind = 1; }
+    else if fname.eq("set") { kind = 2; }
+    else if !(fname.eq("sum") or fname.eq("min") or fname.eq("max") or fname.eq("sorted")) { return false; }
+    let Some(bd) = c.u.c.builtins else { return false; };
+    let Some(bv) = value.dict_get_str(bd, vm.intern(c.u.c, fname)) else { return false; };
+    let Some(x) = gf.genexp else { return false; };
+    let Some(cs) = gf.gencomps else { return false; };
+    let d = dst as u8;
+    let base = c.alloc(2);
+    c.load_name(fname, base);
+    let t = c.alloc(1);
+    c.emit(Py.LOADK(t as u8, c.k(bv) as u16));
+    c.emit(Py.IS(t as u8, base as u8, t as u8));
+    let slow = c.code.label();
+    let end = c.code.label();
+    c.code.jump(Py.JF(t as u8, 0), slow);
+    let acc = base + 1;
+    if kind == 2 {
+        c.emit(Py.NEWSET(acc as u8, 0, 0));
+        c.comp(cs, 0, 2, acc, x, x);
+    } else {
+        c.emit(Py.NEWLIST(acc as u8, 0, 0));
+        c.comp(cs, 0, 0, acc, x, x);
+    }
+    c.set_line(c.line);
+    if kind == 1 { c.emit(Py.TOTUPLE(d, acc as u8)); }
+    else if kind == 3 { c.emit(Py.CALL(base as u8, 1)); c.emit(Py.MOVE(d, base as u8)); }
+    else { c.emit(Py.MOVE(d, acc as u8)); }
+    c.code.jump(Py.JMP(0), end);
+    c.code.bind(slow);
+    c.expr_to(arg, base + 1);
+    c.set_line(c.line);
+    c.emit(Py.CALL(base as u8, 1));
+    c.emit(Py.MOVE(d, base as u8));
+    c.code.bind(end);
+    true
 }
 
 fn C.is_global(c: *C, n: str) -> bool {

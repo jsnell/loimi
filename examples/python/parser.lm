@@ -240,7 +240,7 @@ fn P.funcdef(p: *P, decs: Exprs) -> *FuncDef {
     if p.eat(T.Arrow) { p.test(); }
     let body = p.block();
     new(p.arena, FuncDef { name: name, params: ps, body: body, decorators: decs, is_lambda: false,
-                           genexp: None, gencomps: None, line: line })
+                           genexp: None, gencomps: None, flat: false, line: line })
 }
 
 fn P.classdef(p: *P, decs: Exprs) -> *ClassDef {
@@ -500,7 +500,7 @@ fn P.lambda(p: *P) -> *Expr {
     let body = p.body();
     body.push(p.st(S.Return(Some(e)), line));
     let f = new(p.arena, FuncDef { name: "<lambda>", params: ps, body: body, decorators: p.exprs(),
-                                   is_lambda: true, genexp: None, gencomps: None, line: line });
+                                   is_lambda: true, genexp: None, gencomps: None, flat: false, line: line });
     p.mk(E.Lambda(f), line)
 }
 
@@ -673,10 +673,12 @@ fn P.call_args(p: *P) -> *mem.Vec<Arg> {
             args.push(Arg { name: Some(n), value: p.test(), star: 0 });
         } else {
             let line = p.line();
+            let nf = p.nfuncs;
             let v = p.named_test();
             if p.at(T.For) {
                 // f(x for x in y)
                 let g = p.genexp(v, line);
+                if p.nfuncs == nf + 1 and let GenExp(gf, _) = g.e { gf.flat = true; }
                 args.push(Arg { name: None, value: g, star: 0 });
             } else {
                 args.push(Arg { name: None, value: v, star: 0 });
@@ -739,7 +741,7 @@ fn P.genexp(p: *P, elt: *Expr, line: u32) -> *Expr {
 fn P.genexp_of(p: *P, elt: *Expr, cs: *mem.Vec<Comp>, line: u32) -> *Expr {
     let first_iter = cs.at(0).iter;
     let f = new(p.arena, FuncDef { name: "<genexpr>", params: new(p.arena, mem.Vec.new()), body: p.body(),
-                                   decorators: p.exprs(), is_lambda: false, genexp: Some(elt), gencomps: Some(cs), line: line });
+                                   decorators: p.exprs(), is_lambda: false, genexp: Some(elt), gencomps: Some(cs), flat: false, line: line });
     p.mk(E.GenExp(f, first_iter), line)
 }
 

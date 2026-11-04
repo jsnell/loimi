@@ -64,6 +64,10 @@ pub struct FuncDef {
     /// For a generator expression: the comprehension it iterates.
     genexp: ?*Expr,
     gencomps: ?*mem.Vec<Comp>,
+    /// A generator expression with no lambda or generator expression
+    /// inside, a call's only argument: compile.lm's C.inline_genexp may
+    /// run it inline.
+    flat: bool,
     line: u32,
 }
 

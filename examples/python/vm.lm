@@ -286,6 +286,20 @@ pub vm Py {
         jump p.code
     }
 
+    /// push_frame for `f` called with `n` positional arguments at `win`
+    /// that ops.args_fast accepts: the missing ones are defaults.
+    fn push_args(f: Gc<Func>, win: *Value, slot: *Value, n: u64, flags: u64) -> never {
+        let p = f.proto;
+        let np = p.simple as u64;
+        if n < np {
+            if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+            let Some(d) = f.defaults else { trap() };
+            let nd = d.items.len;
+            for i in n..np { win[i] = *(d.items.ptr + (i + nd - np)); }
+        }
+        push_frame(f, win, slot, flags)
+    }
+
     /// Call R[b] with the `n` arguments at R[win..]; the result goes to R[b].
     /// `kw` is Nil or a tuple naming the last arguments.
     fn call_slow(b: u64, win: u64, n: u64, kw: Value) -> never {
@@ -299,7 +313,7 @@ pub vm Py {
                 Func(f) => {
                     let p = f.proto;
                     builtins.count(330);
-                    if p.simple == nn as u32 and kw == Nil { push_frame(f, regs + w, regs + b, flags) }
+                    if kw == Nil and ops.args_fast(f, nn) { push_args(f, regs + w, regs + b, nn, flags) }
                     builtins.count(331);
                     if !ensure(regs + w + p.nregs as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
                     ops.bind_args(ctx, f, regs + w, nn, kw)?;
@@ -739,6 +753,24 @@ pub vm Py {
             }
         }
         cold {
+            // A user class whose __init__ is a function that takes the
+            // arguments as they are: the instance, then __init__'s frame
+            // (its None result goes to the self slot, so RET needs no
+            // F_DISCARD).
+            if let Obj(cl) = base and cl.kind == K_CLASS and cl.n == 0 {
+                gc_point();
+                if let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
+                    let w = regs + base.raw + 1;
+                    if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.E_RECURSION, "maximum recursion depth exceeded") } }
+                    let inst = ops.new_instance(ctx, cl);
+                    var i = n as u64;
+                    while i > 0 { w[i] = w[i - 1]; i -= 1; }
+                    w[0] = inst;
+                    regs[base.raw] = inst;
+                    push_args(init, w, w, n as u64 + 1, 0)
+                }
+            }
+            if let Func(f) = base and ops.args_fast(f, n as u64) { push_args(f, regs + base.raw + 1, regs + base.raw, n as u64, 0) }
             // isinstance(instance, class), without the builtin call.
             if let Builtin(id) = base and id == builtins.b_isinstance() and n == 2 and let Inst(o) = regs[base.raw + 1]
                 and let Obj(cls) = regs[base.raw + 2] and cls.kind == K_CLASS {
@@ -773,6 +805,7 @@ pub vm Py {
                 next
             }
             cold {
+                if let Func(fn_) = f and ops.args_fast(fn_, n as u64 + 1) { push_args(fn_, regs + base.raw + 1, regs + base.raw, n as u64 + 1, 0) }
                 gc_point();
                 if let Builtin(id) = f and let List(l) = s and let Some(r) = builtins.list_fast(ctx, id, l, regs + base.raw + 2, n as u64) {
                     regs[base.raw] = r;

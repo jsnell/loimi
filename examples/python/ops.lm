@@ -837,6 +837,50 @@ fn arg_error(c: *Ctx, f: Gc<Func>, msg: str) -> Value {
 
 /// Rearrange the arguments at `win` (n values; the last ones named by the
 /// tuple `kw`) into `f`'s parameter registers.
+/// A call of `f` with `n` positional arguments and no keywords needs no
+/// argument processing other than filling in defaults (vm.push_args).
+#[inline]
+pub fn args_fast(f: Gc<Func>, n: u64) -> bool {
+    let p = f.proto;
+    let np = p.simple as u64; // u32 max unless all parameters are plain positional
+    if n == np { return true; }
+    if n > np or p.simple == 0xffffffff { return false; }
+    let Some(d) = f.defaults else { return false; };
+    n + d.items.len >= np
+}
+
+/// bind_args for up to 8 arguments, some by keyword, to a function with
+/// plain positional parameters, when every keyword names a parameter
+/// not given positionally (interned names: pointer compares) and every
+/// parameter left out has a default. False (and `win` unchanged)
+/// otherwise.
+fn bind_kw_fast(f: Gc<Func>, win: *Value, n: u64, kw: Gc<Tuple>) -> bool {
+    let p = f.proto;
+    let np = p.nparams as u64;
+    let nkw = kw.items.len;
+    if (p.flags & (P_VARARGS | P_VARKW)) != 0 or p.nkwonly != 0 or n > np or n > 8 or np > 32 or nkw > n { return false; }
+    let npos = n - nkw;
+    var at: [u64; 8] = [0; 8];
+    var given: u64 = (1 << npos) - 1;
+    for j in 0..nkw {
+        let name = kw.items[j];
+        var i = npos;
+        while i < np and p.pnames[i] != name { i += 1; }
+        if i == np or (given & (1 << i)) != 0 { return false; }
+        given |= 1 << i;
+        at[j] = i;
+    }
+    let nd = if let Some(d) = f.defaults { d.items.len } else { 0 };
+    for i in npos..np { if (given & (1 << i)) == 0 and i + nd < np { return false; } }
+    var vals: [Value; 8] = [Value.Undef; 8];
+    for j in 0..nkw { vals[j] = win[npos + j]; }
+    for i in npos..np {
+        if (given & (1 << i)) == 0 { win[i] = f.defaults.unwrap().items[i + nd - np]; }
+    }
+    for j in 0..nkw { win[at[j]] = vals[j]; }
+    true
+}
+
 pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result<(), Value> {
     let p = f.proto;
     // Positional arguments only, some defaults: no copying aside.
@@ -849,6 +893,7 @@ pub fn bind_args(c: *Ctx, f: Gc<Func>, win: *Value, n: u64, kw: Value) -> Result
             return Ok(());
         }
     }
+    if let Tuple(t) = kw and bind_kw_fast(f, win, n, t) { return Ok(()); }
     let nkw = if let Tuple(t) = kw { t.items.len } else { 0 };
     let npos = n - nkw;
     let np = p.nparams as u64;
