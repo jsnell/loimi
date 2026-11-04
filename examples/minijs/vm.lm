@@ -7,7 +7,6 @@
 //
 // Property access sites carry inline caches (std.obj shapes); the
 // families quicken a site to the member for what it has seen.
-
 #![lifetimes]
 import std.gc;
 import std.mem;

@@ -1,12 +1,11 @@
 // Recursive-descent parser for the Python subset.
-#![lifetimes]
 import std.mem;
 import std.text;
 import lexer;
 import lexer.{T, Token, Lexer};
 import ast;
 import ast.{E, Expr, S, Stmt, Exprs, Body, BinOp, CmpOp, UnOp, Arg, Comp, FPart, Param, FuncDef, ClassDef, Handler, TryS, WithItem};
-
+#![lifetimes]
 pub struct P {
     toks: []Token,
     i: u64,

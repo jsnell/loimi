@@ -12,7 +12,6 @@
 // address of its first pair, so the compiler can attach lines to code
 // (the heap does not move objects, and nothing is collected until the
 // whole program has been compiled).
-
 #![lifetimes]
 import std.gc;
 import std.io;

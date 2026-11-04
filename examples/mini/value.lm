@@ -1,6 +1,5 @@
 // Runtime values of the Mini language: NaN-boxed values, and GC-managed
 // strings, tables and function prototypes.
-
 #![lifetimes]
 import std.gc;
 import std.mem;

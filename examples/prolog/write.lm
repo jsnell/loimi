@@ -1,6 +1,5 @@
 // Term output: write/1, writeq/1, print/1, write_canonical/1, with
 // operators and SWI-Prolog's spacing and float format.
-
 #![lifetimes]
 import std.text;
 import std.num;

@@ -14,7 +14,6 @@
 // assigned, and for calls. Structured control flow becomes jumps to
 // labels of std.bc; a branch that carries values moves them to the
 // target's home slots first.
-#![lifetimes]
 import std.mem;
 import std.bc;
 import std.text;
@@ -22,7 +21,7 @@ import decode;
 import decode.{T_I32, T_I64, T_F32, T_F64, T_V128, T_FUNCREF, T_EXTERNREF};
 import vm;
 import vm.{W, Func, Inst};
-
+#![lifetimes]
 // Where a stack value is. (u8 consts at first; a const name in a pattern
 // then bound a new variable, so every value took the first arm. Constants
 // in patterns now match their value, but an enum is checked exhaustively.)

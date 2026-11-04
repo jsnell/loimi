@@ -1,5 +1,4 @@
 // Lox's run-time values and the objects that live in the GC heap.
-
 #![lifetimes]
 import std.gc;
 import std.hash;

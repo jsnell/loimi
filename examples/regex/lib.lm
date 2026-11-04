@@ -2,7 +2,6 @@
 // SPEC.md).
 //
 //   loimi build examples/regex/lib.lm --release --lib -o librx.a --header rx.h
-
 #![lifetimes]
 import std.mem;
 import std.rt;

@@ -27,7 +27,6 @@
 // an uncaught error is (`on_error`), and evaluating an expression in a
 // stopped frame (`Dbg.eval`: the expression compiled as a function of
 // the frame's locals, run nested with the breakpoints suspended).
-
 #![lifetimes]
 import std.debug;
 import std.gc;

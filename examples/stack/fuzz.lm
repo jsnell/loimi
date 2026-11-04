@@ -6,7 +6,6 @@
 //
 //   loimi build examples/stack/fuzz.lm --sanitize=address -o fuzz
 //   ./fuzz FIRST-SEED COUNT FILE.stk... [--gc-stress] [-v]
-
 #![lifetimes]
 import std.io;
 import std.os;

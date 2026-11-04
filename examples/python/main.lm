@@ -1,6 +1,5 @@
 // python-loimi: run a Python-subset program.
 //   main FILE.py [--gc-stress] [--gc-verify] [--disasm]
-#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;
@@ -15,7 +14,7 @@ import ops;
 import fmt;
 import builtins;
 import compile; #[cfg(debug)] import debugger;
-
+#![lifetimes]
 extern "C" fn getenv(name: *u8) -> *u8;
 extern "C" fn getrlimit(resource: i32, rlim: *u64) -> i32;
 

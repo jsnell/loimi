@@ -4,7 +4,6 @@
 // the fixnum fast paths never see a small `Big`, and `eqv?` on fixnums
 // stays a word compare. These functions allocate but never collect (the
 // callers are natives and the cold paths of the arithmetic ops).
-
 #![lifetimes]
 import std.gc;
 import std.text;

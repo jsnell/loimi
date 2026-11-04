@@ -1,7 +1,6 @@
 // Deterministic builtins, called by CALLB with their arguments in the
 // argument registers. Nondeterministic library predicates are in Prolog
 // (prelude.lm), on top of these.
-
 #![lifetimes]
 import std.mem;
 import std.text;

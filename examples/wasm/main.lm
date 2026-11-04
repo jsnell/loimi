@@ -5,7 +5,6 @@
 //   wasm --invoke F prog.wasm A..   call export F with i32/i64 args
 //   wasm --script cmds.txt      the spec test command protocol (below)
 //   wasm --disasm prog.wasm     print the translated code
-#![lifetimes]
 import std.io;
 import std.os;
 import std.mem;
@@ -16,7 +15,7 @@ import vm.{W, Func, Trap};
 import rt;
 import rt.{Engine, ModInst, Error, ErrKind};
 import host;
-
+#![lifetimes]
 fn usage() -> i32 {
     io.eprintln("usage: wasm prog.wasm | wasm --invoke F prog.wasm ARGS.. | wasm --script FILE | wasm --disasm prog.wasm");
     2

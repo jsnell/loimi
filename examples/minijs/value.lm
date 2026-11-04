@@ -1,6 +1,5 @@
 // Runtime values of MiniJS: the NaN-boxed `V`, the GC objects behind
 // it, and the conversions that need no interpreter context.
-
 #![lifetimes]
 import std.gc;
 import std.mem;

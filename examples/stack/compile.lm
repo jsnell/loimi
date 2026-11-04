@@ -6,7 +6,6 @@
 // underflow and unbalanced branches are compile-time errors with a
 // position in the source. (The verifier checks the same from the ops'
 // declared stack effects, and finds each word's maximum depth.)
-
 #![lifetimes]
 import std.bc;
 import std.diag;

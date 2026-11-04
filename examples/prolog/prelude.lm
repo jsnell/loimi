@@ -2,7 +2,6 @@
 // program that defines one of these (append/3, say) replaces it.
 //
 // A raw string: Prolog's backslashes (`\+`, `\==`) are written as is.
-
 #![lifetimes]
 pub const SOURCE: str = r"
 catch(G, _, _) :- '$catch_enter'(L), call(G), '$catch_exit'(L).

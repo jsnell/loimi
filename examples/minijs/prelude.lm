@@ -1,7 +1,6 @@
 // Builtins written in JavaScript: the array methods that call back into
 // the program. Running them as ordinary bytecode means natives never
 // re-enter the VM. Compiled and run before the program.
-
 #![lifetimes]
 pub fn source() -> str {
 "

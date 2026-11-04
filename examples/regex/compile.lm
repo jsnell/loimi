@@ -13,7 +13,6 @@
 // with `MARK m` ... `LOOP m, L`, which goes round again only if the
 // iteration consumed input (otherwise `(a*)*` would loop forever). x+
 // enters its first iteration after `UNMARK m`, so that one is not checked.
-
 #![lifetimes]
 import std.bc;
 import std.mem;

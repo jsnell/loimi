@@ -1,6 +1,5 @@
 // Builtin functions, builtin types and their methods, exceptions, and the
 // native modules (math, random, time, sys).
-#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;
@@ -20,7 +19,7 @@ import ops;
 import ops.{exc, exc_buf, type_name};
 import fmt;
 import compile;
-
+#![lifetimes]
 extern "C" fn sqrt(x: f64) -> f64;
 extern "C" fn sin(x: f64) -> f64;
 extern "C" fn cos(x: f64) -> f64;

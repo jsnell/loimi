@@ -1,7 +1,6 @@
 // The reader: Prolog tokens, and the hooks of std.parse.Ops (the operator
 // precedence parser) over the operator table that op/3 changes and the
 // writer consults.
-
 #![lifetimes]
 import std.text;
 import std.num;
