@@ -495,14 +495,43 @@ fuzzer (the order of frees).
 
 - **Run time: none.** The pass only rejects programs; the IR is
   unchanged (section 7).
-- **Compile time** (front end and IR, `--emit-llvm`, best of 3): Python
-  594 → 602 ms, Wasm 5030 → 4991 ms, Lox 328 → 323 ms (noise). Only
-  functions reachable from checked modules are summarized, and std's
-  safe modules reach little. Checking *everything* (the audit) costs
-  more: Python +0.5 s, Wasm +8.6 s (its large decoder functions: the
-  state is cloned at every branch; a sparse representation would fix
-  it if whole-program checking becomes the default).
-- **Implementation**: `src/lifetimes.rs` (~1400 lines, no dependency
+- **Compile time** (front end and IR, `--emit-llvm`, best of 3, against
+  `LOIMI_LIFETIMES=off`). Checking *everything* (the audit, which is also
+  what every build costs now that all example modules opt in) cost, in
+  the prototype: Lox +46%, Mini +88%, MiniJS +126%, Python +107% (+577
+  ms), Scheme +62%, Wasm +280% (3.0 → 11.5 s), the rest +16-40%. The
+  state was cloned at every branch: Wasm's generated verifier (5716
+  locals, a loop over a match of every opcode) took 4.5 s alone,
+  analyzed twice. Now:
+
+  | example | off | all modules checked | |
+  |---|---:|---:|---:|
+  | Lox | 264 ms | 283 ms | +7% |
+  | Mini (embedding) | 413 (430) | 448 (452) | +8% (+5%) |
+  | MiniJS | 531 | 566 | +7% |
+  | Prolog | 259 | 275 | +6% |
+  | Python | 535 | 592 | +10% (the pass: 52 ms) |
+  | regex (lib, fuzz, stats) | 68-70 | 72-73 | +4-7% |
+  | Scheme | 336 | 357 | +6% |
+  | Stack (fuzz) | 140 (140) | 148 (151) | +6% (+8%) |
+  | Wasm | 3052 | 3065 | +0.4% |
+  | tutorial step 9 | 165 | 171 | +4% |
+
+  Against a whole release build (clang -O3) the pass is under 1%
+  (Python: 52 ms of 11.8 s). What fixed it, in order of effect: locals
+  leave the state when their scope ends and only parameters and
+  unbound locals start with a value (the verifier: 4.5 s → 17 ms); the
+  state's parts are shared (`Rc`) and copied only when a branch changes
+  them, paths are inline arrays, and a join skips shared parts; each
+  function's errors come from its last summary analysis instead of one
+  more pass; one restructure scan per call for all of the callee's
+  paths, and the summary takes a callee's paths once per argument path;
+  the same reason at the same place has the same index (a loop's state
+  reached its fixpoint only at the iteration cap when a store was in
+  it); summaries drop restructures cut at the depth bound (section 6);
+  a post-order worklist; a fast hasher for ids. `LOIMI_LIFETIMES_STATS=1`
+  prints the pass's time and its slowest functions.
+- **Implementation**: `src/lifetimes.rs` (~2000 lines, no dependency
   on codegen), `#![lifetimes]` and `#[may_alias]` in the parser and
   checker, a summary map in `tir::Program`.
 
