@@ -290,6 +290,15 @@ implementation; `git log` has the details.
   handlers in the example interpreters 223 -> 200
   ([language.md §4](docs/language.md#4-slow-paths-cold-blocks),
   [stdlib/gc.md](docs/stdlib/gc.md), [lowering.md §3, §10](docs/lowering.md)).
+- **Unzeroed trailing arrays**: `new_uninit(h, T { .. }, n)` allocates
+  without zeroing the trailing array (no `memset`; large objects from
+  `malloc`), for element types the collector does not trace and of which
+  every bit pattern is valid (any untraced type inside `unsafe`); verify
+  mode and `--gc-check-roots` fill it with 0x01 bytes. Scheme's strings
+  and symbols, MiniJS's and Python's strings use it where the bytes are
+  copied in at once: Scheme `string` 0.019 -> 0.015 s
+  ([language.md §8](docs/language.md#8-gc-integration),
+  [stdlib/gc.md](docs/stdlib/gc.md)).
 
 - **`heap.on_free_gc(obj, f)`**: a free hook typed `fn(Gc<T>)`, no
   `unsafe` cast from `*u8` ([stdlib/gc.md](docs/stdlib/gc.md)).

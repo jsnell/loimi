@@ -3136,6 +3136,37 @@ enough to make it precise and cheap:
   let a = new(h, Arr {}, 4);              // error: four null Gc<Node>s
   let b = new(h, Arr {}, 4, one);         // four references to `one`
   ```
+- **Unzeroed trailing arrays.** `new_uninit(h, Obj { .. }, n)` is
+  `new(h, Obj { .. }, n)` without zeroing the trailing array: its
+  elements hold whatever bytes the memory held (the fixed fields are set
+  from the literal as by `new`). For an array that is written in full
+  right away, such as a string's bytes copied in, it saves the `memset`
+  (and for large objects `calloc`'s zeroing). The element type must not
+  hold references the collector traces (an error even in `unsafe`), and
+  outside `unsafe { }` every bit pattern must be a valid element:
+  numbers, SIMD vectors, and arrays, tuples and structs of those (not
+  `bool`, enums, options, raw pointers). Verify mode and
+  `--gc-check-roots` builds fill the array with 0x01 bytes
+  ([`stdlib/gc.md`](stdlib/gc.md), "Unzeroed allocation").
+
+  <!-- snippet: run "105"
+  import std.io;
+  import std.gc;
+  import std.mem;
+  object Str { hash: u64, data: [u8] }
+  fn main() uses gc {
+      var heap = gc.Heap.new();
+      let h = &heap;
+      let s = "hi";
+  {snippet}
+      io.print_int(o.data[1] as i64); io.println("");
+      heap.free();
+  }
+  -->
+  ```loimi
+  let o = new_uninit(h, Str { hash: 0 }, s.len);  // bytes not zeroed
+  mem.memcpy(o.data.ptr, s.ptr, s.len);           // every byte set
+  ```
 - **Custom tracing.** `#[trace(f)]` on an `object` names a function of
   the same module, `fn f(h: *gc.Heap, obj: Gc<Obj>)` without effects,
   that the trace function calls after tracing the declared fields,
