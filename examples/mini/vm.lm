@@ -299,6 +299,7 @@ fn mod_magic(d: i32) -> u64 {
     m | (sh << 56)
 }
 pub const MAGIC_M: u64 = 0xFFFFFFFFFFFFFF;
+pub const MOD_MANY: u32 = 0xFFFFFFFF;
 
 /// Arithmetic outside the (Int, Int) and (Num, Num) fast paths: mixed
 /// int/float operands first, then everything else.
@@ -839,7 +840,9 @@ pub vm Mini {
             cold { dst = arith_slow(ctx, 3, a, b)?; next }
         }
     }
-    // The same for a divisor in a register, keyed by the last divisor.
+    // The same for a divisor in a register, keyed by the divisor seen
+    // first. A site that sees a second divisor gives up (d = MOD_MANY,
+    // never an Int > 0): recomputing m costs a 64-bit division.
     cache ModRIC { d: u32, magic: u64 }
 
     op MOD(dst: reg, a: reg, b: reg) : ABC + ModRIC {
@@ -850,8 +853,12 @@ pub vm Mini {
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
-            cache.d = y as u32;
-            cache.magic = mod_magic(y);
+            if cache.d == 0 {
+                cache.d = y as u32;
+                cache.magic = mod_magic(y);
+            } else if cache.d != y as u32 {
+                cache.d = MOD_MANY;
+            }
             let r = x % y;
             dst = Int(if r < 0 { r + y } else { r });
             next
