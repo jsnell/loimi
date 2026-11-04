@@ -1336,7 +1336,9 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 self.poison(&e.ty)
             }
             TK::Vm(v) => crate::vmgen::vm_expr(self, e, v),
-            TK::New { heap, init, len, fill, fast } => crate::gcgen::new_object(self, e, heap, init, len.as_deref(), fill.as_deref(), *fast),
+            TK::New { heap, init, len, fill, fast, uninit } => {
+                crate::gcgen::new_object(self, e, heap, init, len.as_deref(), fill.as_deref(), *fast, *uninit)
+            }
             TK::Trailing(obj) => crate::gcgen::trailing(self, obj),
         }
     }
@@ -3118,6 +3120,7 @@ const LAZY_STD: &[&str] = &[
     "std.gc.mark_shadow_stack",
     "std.gc.shadow_top",
     "std.gc.try_alloc",
+    "std.gc.alloc_uninit",
     "std.gc.make_room",
     "std.mem.Arena.free_bytes",
     "std.mem.Malloc.new",
@@ -3133,20 +3136,23 @@ fn lazy_used(p: &Program, check_roots: bool) -> Vec<bool> {
     let mut work: Vec<usize> = (0..p.fns.len()).filter(|&i| !is_lazy(&p.fns[i])).collect();
     if check_roots {
         for (i, f) in p.fns.iter().enumerate() {
-            if f.symbol == "std.gc.rootck_mark" || f.symbol == "std.gc.rootck_alloc" {
+            if f.symbol == "std.gc.rootck_mark" || f.symbol == "std.gc.rootck_alloc" || f.symbol == "std.gc.rootck_alloc_uninit" {
                 used[i] = true;
                 work.push(i);
             }
         }
     }
-    // `try_new` calls `std.gc.try_alloc` (without `--gc-check-roots`).
+    // `try_new` calls `std.gc.try_alloc`, `new_uninit` `std.gc.alloc_uninit`
+    // (without `--gc-check-roots`).
     let try_alloc = p.fns.iter().position(|f| f.symbol == "std.gc.try_alloc");
+    let alloc_uninit = p.fns.iter().position(|f| f.symbol == "std.gc.alloc_uninit");
     while let Some(i) = work.pop() {
         let Some(body) = &p.fns[i].body else { continue };
         crate::tirwalk::for_each_expr(body, &mut |e| {
             let id = match &e.kind {
                 TK::FnRef(id) | TK::Closure(id, _) | TK::NewClosure(id, ..) => *id as usize,
                 TK::New { fast: true, .. } if !check_roots && try_alloc.is_some() => try_alloc.unwrap(),
+                TK::New { uninit: true, .. } if !check_roots && alloc_uninit.is_some() => alloc_uninit.unwrap(),
                 _ => return,
             };
             if is_lazy(&p.fns[id]) && !used[id] {

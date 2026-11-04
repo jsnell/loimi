@@ -3,10 +3,11 @@
 // small nursery, a tiny budget). Objects of every size class and large
 // ones are linked into a graph held by a root array; links through
 // fields and trailing arrays; weak references, an ephemeron table and
-// free hooks on some objects. Every object carries a payload derived from
-// its id, checked on every visit and by its free hook (which must run
-// before its memory is reused), so an object freed while reachable, or
-// memory handed out twice, shows up as a bad payload.
+// free hooks on some objects; half of the objects from `new_uninit`.
+// Every object carries a payload derived from its id, checked on every
+// visit and by its free hook (which must run before its memory is
+// reused), so an object freed while reachable, or memory handed out
+// twice, shows up as a bad payload.
 import std.io;
 import std.gc;
 
@@ -49,7 +50,9 @@ fn make(h: *gc.Heap) -> Gc<Node> {
     let len = if rnd(20) == 0 { 60 + rnd(200) } else { rnd(60) };
     let id = next_id;
     next_id += 1;
-    let n = new(h, Node { id: id, a: None, b: None }, len);
+    // Every other object unzeroed (`new_uninit`): its payload overwrites
+    // whatever the memory held (a dead object's words, verify's 0x01s).
+    let n = if (id & 1) == 0 { new_uninit(h, Node { id: id, a: None, b: None }, len) } else { new(h, Node { id: id, a: None, b: None }, len) };
     for i in 0..len { n.data[i] = word(id, i); }
     if rnd(16) == 0 { h.on_free_gc(n, on_free); }
     n

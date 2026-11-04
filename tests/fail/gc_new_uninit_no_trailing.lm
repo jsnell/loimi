@@ -1,0 +1,8 @@
+// `new_uninit` is for objects with a trailing array.
+import std.gc;
+object Node { v: i64 }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = new_uninit(&heap, Node { v: 1 }, 0);
+}
+// error: `new_uninit` is for objects with a trailing array

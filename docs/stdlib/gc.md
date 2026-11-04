@@ -101,6 +101,30 @@ every interpreter test run in three modes: normal, `stress`, and
   handler"). Large objects are allocated as by `new`.
 - **Large objects** are `calloc`'d with the remembered-set pointer in 16
   bytes before the header, and kept in a vector.
+- **Unzeroed allocation** (2026-11-04). `new_uninit(h, T { .. }, n)`
+  (compiled to `gc.alloc_uninit`) is `new` without zeroing: small
+  objects skip the `memset`, large ones come from `malloc` instead of
+  `calloc`, and the fixed fields are stored from the literal. Only for a
+  trailing array the collector does not trace (the compiler rejects
+  traced element types, also in `unsafe`) and, outside `unsafe { }`,
+  whose every bit pattern is a valid element (numbers, vectors, plain
+  structs of them): strings whose bytes are copied in at once. The
+  invariants above are untouched: the header (size, type id, mark 0,
+  flags 0 or `LARGE`, length) and a large object's `ChunkHead` are all
+  written as by `alloc`, nothing reads the array's old bytes (a dead
+  object's, which no sweeper reads any more after its collection,
+  invariant 5), and the tracer never looks at them. What the array
+  holds is zero in fresh memory and stale bytes in reused memory;
+  under verify mode (`set_verify`) `alloc_uninit` fills it with 0x01
+  bytes, as `poison_free` fills dead memory, and a `--gc-check-roots`
+  build allocates with `rootck_alloc_uninit` (`rootck_alloc`, which
+  records the object's start, then a 0x01 fill), so a program that
+  reads such an array before writing it reads the same bytes in every
+  run of those modes instead of zeros by luck. Scheme's `string` benchmark
+  (string-append, substring of strings of thousands of characters)
+  went from 0.019 to 0.015 s; it spent about a third of its time
+  zeroing them. Tested by `tests/run/gc_new_uninit.lm` and
+  `gc_torture.lm` (half of its objects).
 - **Collection triggers**: `growth` (percent of the live bytes),
   `min_heap` and `max_budget` (`set_growth`, `set_max_budget`).
   Interpreters test `heap.allocated > heap.threshold` in their handlers
@@ -704,7 +728,8 @@ below 1 KiB. Trailing elements are initialized to the element type's default
 (`Nil` for `Value`) so the GC never sees uninitialized memory. (As built:
 `new(h, Obj { .. }, n)` zero-fills them, which is allowed only where zero
 is a valid element, else `new(h, Obj { .. }, n, v)` fills them with `v`:
-language.md section 8.)
+language.md section 8. `new_uninit(h, Obj { .. }, n)` leaves an
+untraced array unset: "Unzeroed allocation" above.)
 
 ---
 

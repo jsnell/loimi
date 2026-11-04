@@ -409,7 +409,9 @@ define internal i64 @loimi_rootck_info() nounwind {{
 
 /// `new(heap, init, len?)`, or `try_new` (`fast`): null (`None`) where
 /// the allocator would refill a free list.
-pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>, fill: Option<&TExpr>, fast: bool) -> String {
+/// `new_uninit` (`uninit`): the trailing array is not zeroed.
+#[allow(clippy::too_many_arguments)]
+pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Option<&TExpr>, fill: Option<&TExpr>, fast: bool, uninit: bool) -> String {
     let p = g.p();
     let h = g.val(heap);
     let v = g.val(init);
@@ -432,7 +434,13 @@ pub fn new_object(g: &mut FnGen, e: &TExpr, heap: &TExpr, init: &TExpr, len: Opt
     // poisons freed objects before the heap's first collection.
     // (`try_new` under `--gc-check-roots` always allocates.)
     let alloc = if check_roots(g) {
-        "std.gc.rootck_alloc"
+        if uninit {
+            "std.gc.rootck_alloc_uninit"
+        } else {
+            "std.gc.rootck_alloc"
+        }
+    } else if uninit {
+        "std.gc.alloc_uninit"
     } else if fast {
         "std.gc.try_alloc"
     } else {

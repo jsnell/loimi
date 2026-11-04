@@ -1,0 +1,71 @@
+// matrix: check-roots
+// `new_uninit(h, X { .. }, n)`: `new` without zeroing the trailing array,
+// for arrays the collector does not trace and whose every bit pattern is
+// valid (numbers; tests/fail/gc_new_uninit_*.lm). The fixed fields are
+// set from the literal (references among them too). The array holds
+// whatever was there (0x01 bytes under verify mode and
+// `--gc-check-roots`); here every element is written before it is read.
+// Small and large objects, reusing the memory of dead ones.
+import std.io;
+import std.gc;
+import std.mem;
+
+object Node { v: i64 }
+object Bytes { tag: ?Gc<Node>, data: [u8] }
+object Words { data: [u64] }
+
+fn fill(h: *gc.Heap, n: u64, k: u8) -> Gc<Bytes> uses gc {
+    let tag = new(h, Node { v: k as i64 });
+    let b = new_uninit(h, Bytes { tag: Some(tag) }, n);
+    mem.memset(b.data.ptr, k as i32, n);
+    b
+}
+
+fn sum(b: Gc<Bytes>) -> i64 {
+    var t: i64 = 0;
+    for x in b.data { t += x as i64; }
+    t
+}
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    var keep = fill(h, 10, 3);
+    var t: i64 = 0;
+    for round: u64 in 0..200 {
+        // Garbage of zeroed objects, then unzeroed ones in their memory.
+        for i: u64 in 0..50 { let _ = new(h, Words {}, (i * 7) % 40); }
+        let a = fill(h, (round * 13) % 300, 2);
+        let big = fill(h, 5000 + round, 1);
+        t += sum(a) + sum(big) - (2 * a.data.len + big.data.len) as i64;
+        if let Some(n) = big.tag { t += n.v - 1; }
+        let w = new_uninit(h, Words {}, 3);
+        w.data[0] = 1;
+        w.data[1] = 2;
+        w.data[2] = 3;
+        gc.maybe_collect(h);
+        t += (w.data[0] + w.data[1] + w.data[2]) as i64 - 6;
+        if round % 50 == 0 {
+            gc.collect(h);
+            keep = fill(h, 10 + round, 3);
+        }
+    }
+    let empty = new_uninit(h, Words {}, 0);
+    io.print_int(t); io.println("");
+    io.print_int(sum(keep)); io.println("");
+    io.print_int(empty.data.len as i64); io.println("");
+    // Verify mode: an unwritten array reads as 0x01 bytes.
+    h.set_verify(true);
+    let v = new_uninit(h, Bytes { tag: None }, 4);
+    let lv = new_uninit(h, Words {}, 100);
+    io.print_int(v.data[3] as i64); io.println("");
+    io.print_bool(lv.data[99] == 0x0101010101010101); io.println("");
+    heap.free();
+}
+
+// expect: 0
+// expect: 480
+// expect: 0
+// expect: 1
+// expect: true

@@ -244,6 +244,26 @@ impl Checker<'_> {
         }
     }
 
+    /// Whether every bit pattern of `size_of<t>()` bytes is a valid `t`
+    /// (and holds no reference): numbers, vectors, and arrays, tuples and
+    /// structs (without private fields) of them. What `new_uninit` leaves
+    /// in a trailing array.
+    pub fn any_bits_valid(&self, t: &Ty, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match t {
+            Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Vector(..) | Ty::Unit => true,
+            Ty::Array(i, _) => self.any_bits_valid(i, depth + 1),
+            Ty::Tuple(ts) => ts.iter().all(|t| self.any_bits_valid(t, depth + 1)),
+            Ty::Struct(sid) => {
+                let sd = &self.prog.structs[*sid as usize];
+                sd.object.is_none() && sd.fields.iter().all(|(f, t)| !f.starts_with("__") && self.any_bits_valid(t, depth + 1))
+            }
+            _ => false,
+        }
+    }
+
     /// `new(a, v)` (and `new(a, |..| ..)`) trust `a.alloc_bytes(size,
     /// align)` to return `size` writable bytes: in a `#![safe]` module,
     /// only an `alloc_bytes` marked `#[raw]` (`mem.Arena`, `mem.Malloc`)
