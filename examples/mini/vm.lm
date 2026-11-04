@@ -909,6 +909,8 @@ pub vm Mini {
                 dst = Bool(true);
                 next
             }
+            // Different bits: equal only if both are numbers (1 == 1.0).
+            if !value.is_number(a) or !value.is_number(b) { dst = Bool(false); next }
             cold { dst = Bool(value.raw_equal(a, b)); next }
         }
         op #lname(dst: reg, a: reg, b: bkind) : ABC {
@@ -984,6 +986,8 @@ pub vm Mini {
                     if let Num(x) = a { eq = x == x; }
                     branch(eq == want, then.target)
                 }
+                // Different bits: equal only if both are numbers (1 == 1.0).
+                if !value.is_number(a) or !value.is_number(b) { branch(!want, then.target) }
                 cold { branch(value.raw_equal(a, b) == want, then.target) }
             }
         }
@@ -1382,6 +1386,9 @@ pub vm Mini {
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 14% of queens' and sort's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_GETINDEX = GETUPVAL; GETINDEX;
+    // Overlaps GETUPVAL; GETINDEX: `if not up[i]` in queens (14% of its ops).
+    #[allow(super_overlap)]
+    #[forward] super GETUPVAL_GETINDEX_TESTT = GETUPVAL; GETINDEX; TESTT;
     // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
