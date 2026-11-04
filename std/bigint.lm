@@ -713,8 +713,104 @@ fn decr(q: *u64, n: u64) -> u64 {
 // the remainder. Each routine writes nn - dn quotient limbs to q and
 // returns the quotient's limb above those (0 or 1).
 
-/// Knuth's algorithm D (nn >= dn >= 2).
+/// The reciprocal floor((B^3 - 1) / (d1 B + d0)) - B of a normalized
+/// two-limb divisor (d1's top bit set), for `div_3by2` (GMP's
+/// `invert_pi1`).
+fn reciprocal_2(d1: u64, d0: u64) -> u64 {
+    var v = reciprocal(d1);
+    var p = (d1 *% v) +% d0;
+    if p < d0 {
+        v = v -% 1;
+        let mask: u64 = if p >= d1 { 0xffffffffffffffff } else { 0 };
+        p = p -% d1;
+        v = v +% mask;
+        p = p -% (mask & d1);
+    }
+    let (t0, t1) = d0.mul_wide(v);
+    p = p +% t1;
+    if p < t1 {
+        v = v -% 1;
+        if p >= d1 and (p > d1 or t0 >= d0) { v = v -% 1; }
+    }
+    v
+}
+
+/// (n2 n1 n0) divmod (d1 d0) for (n2 n1) < (d1 d0), d1 normalized, dinv
+/// = reciprocal_2(d1, d0): (q, r1, r0), Moller and Granlund's 3/2
+/// division (GMP's `udiv_qr_3by2`).
+fn div_3by2(n2: u64, n1: u64, n0: u64, d1: u64, d0: u64, dinv: u64) -> (u64, u64, u64) {
+    let (ql, qh) = n2.mul_wide(dinv);
+    let (q0, c) = ql.add_carry(n1, false);
+    var q = qh +% n2 +% c as u64;
+    var r1 = n1 -% (d1 *% q);
+    let (ra, b0) = n0.sub_borrow(d0, false);
+    r1 = r1 -% d1 -% b0 as u64;
+    let (t0, t1) = d0.mul_wide(q);
+    let (rb, b1) = ra.sub_borrow(t0, false);
+    r1 = r1 -% t1 -% b1 as u64;
+    var r0 = rb;
+    q = q +% 1;
+    let mask: u64 = if r1 >= q0 { 0xffffffffffffffff } else { 0 };
+    q = q +% mask;
+    let (rc, c1) = r0.add_carry(mask & d0, false);
+    r1 = r1 +% (mask & d1) +% c1 as u64;
+    r0 = rc;
+    if r1 >= d1 and (r1 > d1 or r0 >= d0) {
+        q = q +% 1;
+        let (rd, b2) = r0.sub_borrow(d0, false);
+        r1 = r1 -% d1 -% b2 as u64;
+        r0 = rd;
+    }
+    (q, r1, r0)
+}
+
+/// Schoolbook division (nn >= dn >= 2): each quotient limb from the
+/// top three limbs of the remainder by the divisor's top two with
+/// `div_3by2`, exact but for a rare borrow, so the row subtracted is
+/// the divisor's dn - 2 low limbs (GMP's `mpn_sbpi1_div_qr`); Knuth's
+/// algorithm D for dn = 2.
 fn sb_div_qr(q: *u64, an: *u64, nn: u64, bn: *u64, nb: u64) -> u64 {
+    if nb < 3 { return knuth_div_qr(q, an, nn, bn, nb); }
+    var qh: u64 = 0;
+    if mag_cmp(an + nn - nb, nb, bn, nb) >= 0 {
+        sub_in(an + nn - nb, nb, bn, nb);
+        qh = 1;
+    }
+    let dn = nb - 2;
+    let d1 = bn[dn + 1];
+    let d0 = bn[dn];
+    let dinv = reciprocal_2(d1, d0);
+    // The remainder's top limb stays in n1, the limbs below it in an.
+    var n1 = an[nn - 1];
+    var j = nn - nb;
+    while j > 0 {
+        j -= 1;
+        let p = j + dn;
+        var qq: u64 = 0xffffffffffffffff;
+        if n1 == d1 and an[p + 1] == d0 {
+            submul_1(an + j, bn, nb, qq);
+            n1 = an[p + 1];
+        } else {
+            let (q3, r1, r0) = div_3by2(n1, an[p + 1], an[p], d1, d0, dinv);
+            qq = q3;
+            let cy = submul_1(an + j, bn, dn, qq);
+            let (n0, cy1) = r0.sub_borrow(cy, false);
+            let (t, cy2) = r1.sub_borrow(0, cy1);
+            n1 = t;
+            an[p] = n0;
+            if cy2 {
+                n1 = n1 +% d1 +% add_n(an + j, an + j, bn, dn + 1) as u64;
+                qq -= 1;
+            }
+        }
+        q[j] = qq;
+    }
+    an[nb - 1] = n1;
+    qh
+}
+
+/// Knuth's algorithm D (nn >= dn >= 2).
+fn knuth_div_qr(q: *u64, an: *u64, nn: u64, bn: *u64, nb: u64) -> u64 {
     var qh: u64 = 0;
     if mag_cmp(an + nn - nb, nb, bn, nb) >= 0 {
         sub_in(an + nn - nb, nb, bn, nb);
