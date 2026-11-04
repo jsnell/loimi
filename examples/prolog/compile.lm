@@ -870,6 +870,50 @@ fn C.inline_arith(c: *C, g: Term) -> bool {
 
 // Goals -----------------------------------------------------------------
 
+/// A type test or arithmetic comparison whose variables all occur in the
+/// head: it compiles inline (`inline_builtin`, `inline_arith`: the head
+/// has bound its variables), reading registers and writing only
+/// temporaries above the argument registers. Register allocation lets
+/// chunk 0's call keep head variables in their argument registers across
+/// such guards (`X =< Y, !, p(..)`).
+fn inline_guard(m: *Machine, g: Term, head: Term) -> bool {
+    let (name_a, ar) = term.name_arity(&m.db, g);
+    let name = m.db.name(name_a);
+    if ar == 1 {
+        return match name {
+            "var" => true, "nonvar" => true, "atom" => true, "atomic" => true,
+            "integer" => true, "number" => true, "compound" => true, "callable" => true,
+            _ => false,
+        };
+    }
+    if ar != 2 { return false; }
+    let cmp = match name {
+        "<" => true, "=<" => true, ">" => true, ">=" => true, "=:=" => true, "=\\=" => true,
+        _ => false,
+    };
+    cmp and head_arith(m, term.arg_of(g, 0), head, 0) and head_arith(m, term.arg_of(g, 1), head, 0)
+}
+
+/// `C.arith_ok` before compiling: numbers, variables of the head, and the
+/// inlined operators.
+fn head_arith(m: *Machine, t0: Term, head: Term, depth: u32) -> bool {
+    if depth > 20 { return false; }
+    let t = deref(t0);
+    match t {
+        Int(_) => true,
+        Flt(_) => true,
+        Big(_) => true,
+        Ref(_) => occurs(head, t),
+        Str(s) => {
+            let name = m.db.name(m.db.fname(s.f));
+            if s.args.len == 2 and arith_op(name).is_some() { return head_arith(m, s.args[0], head, depth + 1) and head_arith(m, s.args[1], head, depth + 1); }
+            if s.args.len == 1 and name.eq("-") { return head_arith(m, s.args[0], head, depth + 1); }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// A body goal after flattening: a call (of a predicate or a builtin), or
 /// a cut of this clause.
 enum GoalKind { Call, Builtin, Cut }
@@ -1110,13 +1154,15 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     if ncalls > 1 { env = true; }
     if ncalls == 1 and (last_call as u64) + 1 < goals.len { env = true; }
     // Head variables may stay in the argument register they arrive in if
-    // chunk 0 has at most one goal (cuts aside) and that goal leaves the
+    // chunk 0 has at most one goal (cuts, and guards that compile inline
+    // and write no argument register, aside) and that goal leaves the
     // register alone (has the variable at the same position, or fewer
     // arguments).
     var chunk0: mem.Vec<u64> = mem.Vec.new();
     for i in 0..goals.len {
         let g = goals.ptr[i];
         if g.kind == GoalKind.Cut { continue; }
+        if g.kind == GoalKind.Builtin and inline_guard(m, g.t, head) { continue; }
         chunk0.push(i);
         if g.kind == GoalKind.Call { break; }
     }
