@@ -106,12 +106,29 @@ fn eq_slow(a: V, b: V) -> bool {
 }
 
 #[inline(always)]
+fn is_str(v: V) -> bool {
+    match v { S(_) | R(_) => true, _ => false }
+}
+
+#[inline(always)]
 fn int32(v: V) -> i32 {
     match v {
         Int(i) => i,
         Num(x) => if x >= -2147483648.0 and x <= 2147483647.0 { x as i32 } else { value.to_int32(x) },
         _ => value.to_int32(value.to_number(v)),
     }
+}
+
+/// x / y for two Ints: integral quotients stay Int (no -0: a zero
+/// quotient of a nonzero divisor with x == 0 needs y > 0).
+#[inline(always)]
+fn int_div(x: i32, y: i32) -> V {
+    let r = x as f64 / y as f64;
+    if r >= -2147483648.0 and r <= 2147483647.0 {
+        let q = r as i32;
+        if q as f64 == r and (q != 0 or y > 0) { return V.Int(q); }
+    }
+    V.Num(r)
 }
 
 /// Bitwise ops: 0 and, 1 or, 2 xor, 3 shl, 4 shr, 5 ushr.
@@ -424,16 +441,20 @@ pub vm JS {
     }
     /// Put R[r] in a new box (a captured variable that is assigned).
     op BOXNEW(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
         let v = r;
-        r = B(new(&ctx.heap, Box { v: v }));
+        let Some(b) = try_new(&ctx.heap, Box { v: v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+        r = B(b);
         next
     }
     /// A fresh box holding the value of the box in R[r] (per-iteration
     /// bindings of `for (let ...)`).
     op REBOX(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        if let B(b) = r { r = B(new(&ctx.heap, Box { v: b.v })); }
+        if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+        if let B(b) = r {
+            let Some(nb) = try_new(&ctx.heap, Box { v: b.v }) else cold { gc.make_room(&ctx.heap, size_of<Box>()); redo };
+            r = B(nb);
+        }
         next
     }
     op BOXGET(dst: reg, b: reg) : ABC {
@@ -570,6 +591,9 @@ pub vm JS {
                         next
                     }
                 }
+                // A rope already flattened (`const t = this.text` in each
+                // method of json's lexer): no cold call.
+                if let R(r) = obj and let Some(f) = r.flat { obj = S(f); redo }
                 if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
                 cold { become #fam; redo }
             }
@@ -694,8 +718,8 @@ pub vm JS {
             next
         }
         if let (S(s), Int(i)) = (obj, key) and (i as u32 as u64) < s.data.len {
-            dst = S(ctx.char_str(s.data[i as u32 as u64]));
-            next
+            // One-character strings of ASCII bytes are made at startup.
+            if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { dst = S(c); next }
         }
         cold {
             if let R(r) = obj { obj = S(value.flatten(r)); redo }
@@ -751,11 +775,21 @@ pub vm JS {
     ] {
         family #name(dst: reg, a: reg, b: reg) : ABC {
             generic {
-                if let (Int(x), Int(y)) = (a, b) and let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) {
-                    dst = Int(r);
+                // Two Ints: an Int, or the double result on overflow (and
+                // for MUL's -0) without leaving the fast path.
+                if let (Int(x), Int(y)) = (a, b) {
+                    if let Some(r) = x.#checked(y) and (code != 2 or r != 0 or (x | y) >= 0) { dst = Int(r); next }
+                    dst = Num(x as f64 sym y as f64);
                     next
                 }
                 cold {
+                    // String concatenation (either operand a string or
+                    // rope): straight to concat.
+                    if code == 0 and (is_str(a) or is_str(b)) {
+                        if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                        dst = ctx.concat(a, b);
+                        next
+                    }
                     match (a, b) {
                         (Num(x), Num(y)) => { dst = Num(x sym y); become #fname; refuse(fp.cl); next }
                         (Int(x), Num(y)) => { dst = Num(x as f64 sym y); become #ifname; refuse(fp.cl); next }
@@ -799,26 +833,28 @@ pub vm JS {
             }
         }
     }
-    op DIV(dst: reg, a: reg, b: reg) : ABC {
-        let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
-        if likely(r == r) { dst = r.to_bits() as V; next }
-        match (a, b) {
-            (Int(x), Int(y)) => {
-                // Integral quotients stay Int (no -0: a zero quotient of
-                // a nonzero divisor with x == 0 needs y > 0).
-                let r = x as f64 / y as f64;
-                if r >= -2147483648.0 and r <= 2147483647.0 {
-                    let q = r as i32;
-                    if q as f64 == r and (q != 0 or y > 0) { dst = Int(q); next }
-                }
-                dst = Num(r);
-                next
-            }
-            (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
-            (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
-            _ => {}
+    /// `/`: the generic member divides two Ints first (spectral_norm's
+    /// `n / 2` and `1 / n`); a site that sees two floats becomes DIV_F,
+    /// which divides the raw words first.
+    family DIV(dst: reg, a: reg, b: reg) : ABC {
+        generic {
+            if let (Int(x), Int(y)) = (a, b) { dst = int_div(x, y); next }
+            if let (Int(x), Num(y)) = (a, b) { dst = Num(x as f64 / y); next }
+            if let (Num(x), Int(y)) = (a, b) { dst = Num(x / y as f64); next }
+            if let (Num(x), Num(y)) = (a, b) { cold { become DIV_F; refuse(fp.cl); redo } }
+            cold { dst = arith(ctx, 3, a, b)?; next }
         }
-        cold { dst = arith(ctx, 3, a, b)?; next }
+        DIV_F {
+            let r = f64.from_bits(a as u64) / f64.from_bits(b as u64);
+            if likely(r == r) { dst = r.to_bits() as V; next }
+            match (a, b) {
+                (Int(x), Int(y)) => { dst = int_div(x, y); next }
+                (Int(x), Num(y)) => { dst = Num(x as f64 / y); next }
+                (Num(x), Int(y)) => { dst = Num(x / y as f64); next }
+                _ => {}
+            }
+            cold { dst = arith(ctx, 3, a, b)?; next }
+        }
     }
     /// `%` with a positive Int divisor is exact in integers when the
     /// dividend is integral (an Int, or a Num below 2^53).
@@ -980,6 +1016,35 @@ pub vm JS {
             if let Int(xi) = a { branch(icmp == want, then.target) }
             if let Num(xf) = a { branch(fcmp == want, then.target) }
             let r = if swap { less(ctx, Int(c), a, oreq) } else { less(ctx, a, Int(c), oreq) };
+            branch(r == want, then.target)
+        }
+    }
+
+    /// Compare against a number constant k[kc] (`i <= 5000`, `x < N` with
+    /// N a folded `const`, `d < 0.5`) and branch.
+    inline for (name, swap, oreq) in [
+        ("JLTK", false, false), ("JLEK", false, true), ("JGTK", true, false), ("JGEK", true, true),
+    ] {
+        op #name(pol: imm, a: reg, kc: kst) : ABC then JMP {
+            let want = pol != 0;
+            if let (Int(xi), Int(c)) = (a, kc) {
+                let t = if swap { if oreq { xi >= c } else { xi > c } } else { if oreq { xi <= c } else { xi < c } };
+                branch(t == want, then.target)
+            }
+            if let Num(xf) = a {
+                var c = 0.0;
+                var ok = true;
+                match kc {
+                    Int(ci) => { c = ci as f64; }
+                    Num(cf) => { c = cf; }
+                    _ => { ok = false; }
+                }
+                if ok {
+                    let t = if swap { if oreq { xf >= c } else { xf > c } } else { if oreq { xf <= c } else { xf < c } };
+                    branch(t == want, then.target)
+                }
+            }
+            let r = if swap { less(ctx, kc, a, oreq) } else { less(ctx, a, kc, oreq) };
             branch(r == want, then.target)
         }
     }
@@ -1151,8 +1216,7 @@ pub vm JS {
         CALL_CHARAT {
             if regs[base] == ctx.f_charat and let S(s) = regs[base + 1] and let Int(i) = regs[base + 2]
                     and (i as u32 as u64) < s.data.len {
-                regs[base] = S(ctx.char_str(s.data[i as u32 as u64]));
-                next
+                if let Some(c) = ctx.ascii_str(s.data.ptr[i as u32 as u64]) { regs[base] = S(c); next }
             }
             cold {
                 if regs[base] != ctx.f_charat { become CALL; redo }
@@ -1240,16 +1304,36 @@ pub vm JS {
         jump p.code
     }
 
+    /// A `new` object with `n` (at most 8) inline slots, if the
+    /// allocator's current run has room; constant lengths, so the zeroing
+    /// is inline.
+    fn try_obj(sh: Gc<obj.Shape>, cp: Gc<Obj>, n: u64) -> ?Gc<Obj> {
+        inline for i in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
+            if n == i { return try_new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, i); }
+        }
+        None
+    }
+
     /// R[base] = new R[base](R[base+2] ..).
     op NEW(base: callbase, nargs: imm) : ABC {
         // A constructor whose objects' root shape is cached for its
         // current prototype: allocate here and enter it.
         if let F(cl) = regs[base] and cl.native == 0 and let Some(sh) = cl.ctor_shape and let Some(cp) = cl.ctor_proto
                 and let Some(bag) = cl.props and bag.dict.is_none() and bag.shape.count >= 1 and bag.inline.ptr[0] == V.O(cp) {
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            let o = new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, cl.hint as u64);
-            regs[base + 1] = O(o);
-            enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            if ctx.heap.allocated > ctx.heap.threshold { cold { gc.collect(&ctx.heap); redo } }
+            // Up to 8 inline slots: the allocator's inline path with a
+            // constant size (no call, so no stack frame).
+            let n = cl.hint as u64;
+            if n <= 8 {
+                let Some(o) = try_obj(sh, cp, n) else cold { gc.make_room(&ctx.heap, size_of<Obj>() + n * 8); redo };
+                regs[base + 1] = O(o);
+                enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            }
+            cold {
+                let o = new(&ctx.heap, Obj { shape: sh, dict: None, overflow: None, proto: Some(cp) }, n);
+                regs[base + 1] = O(o);
+                enter(cl, base as u64, nargs as u64, rt.FR_NEW)
+            }
         }
         cold {
             if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }

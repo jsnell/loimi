@@ -294,6 +294,14 @@ pub fn Ctx.key_of(c: *Ctx, v: V) -> u64 {
 
 pub fn Ctx.str(c: *Ctx, s: str) -> Gc<Str> { value.new_str(&c.heap, s) }
 
+/// The one-character string of an ASCII byte (all 128 are made by
+/// `init`), with no call: for handlers' fast paths.
+#[inline(always)]
+pub fn Ctx.ascii_str(c: *Ctx, b: u8) -> ?Gc<Str> {
+    if b < 128 { return c.chars.ptr[b as u64]; }
+    None
+}
+
 pub fn Ctx.char_str(c: *Ctx, b: u8) -> Gc<Str> {
     if b < 128 { if let Some(s) = c.chars.at(b as u64) { return s; } }
     let s = value.alloc_str(&c.heap, 1);
