@@ -89,6 +89,30 @@ pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
     }
 }
 
+/// A closure of `p` with more than 4 free variables (CLOSURE's rare case).
+#[cold]
+fn big_closure(h: *gc.Heap, parent: Gc<Closure>, p: Gc<Proto>, regs: *V) -> Gc<Closure> {
+    let n = p.nfree as u64;
+    let c = new(h, Closure { proto: p }, n);
+    for j in 0..n {
+        let d = p.desc.data.ptr[j];
+        if d >= 256 {
+            c.free.ptr[j] = regs[(d & 255) as u64];
+        } else {
+            c.free.ptr[j] = parent.free.ptr[d as u64];
+        }
+    }
+    c
+}
+
+/// A vector (or record, by `rtd`) of the `n` values at `src`.
+#[cold]
+fn big_vect(h: *gc.Heap, rtd: V, src: *V, n: u64) -> Gc<Vect> {
+    let v = new(h, Vect { rtd: rtd }, n);
+    for i in 0..n { v.data.ptr[i] = src[i]; }
+    v
+}
+
 #[require_verified]
 pub vm Scheme {
     context ctx: *Ctx;
@@ -172,9 +196,14 @@ pub vm Scheme {
     }
     /// Box R[r] (an assigned variable that is captured by a closure).
     op MKBOX(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let v = r;
-        r = Vec(value.new_vect(&ctx.heap, 1, v));
+        let Some(b) = try_new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, 1) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + size_of<V>());
+            redo
+        };
+        b.data.ptr[0] = v;
+        r = Vec(b);
         next
     }
     op BOXGET(dst: reg, b: reg) : ABC {
@@ -188,11 +217,15 @@ pub vm Scheme {
     /// R[dst] = a new closure of child prototype `i`, capturing values as
     /// its descriptors say.
     op CLOSURE(dst: reg, i: child) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let parent = fp.cl;
         let p = parent.proto.protos.data.ptr[i];
         let n = p.nfree as u64;
-        let c = new(&ctx.heap, Closure { proto: p }, n);
+        if n > 4 { cold { dst = Clo(big_closure(&ctx.heap, parent, p, regs)); next } }
+        let Some(c) = try_closure(p, n) else cold {
+            gc.make_room(&ctx.heap, size_of<Closure>() + n * size_of<V>());
+            redo
+        };
         for j in 0..n {
             let d = p.desc.data.ptr[j];
             if d >= 256 {
@@ -347,16 +380,24 @@ pub vm Scheme {
         cold { raise rt.type_err(ctx, "cdr", "pair", a) }
     }
     op CONS(dst: reg, a: reg, b: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        dst = P(new(&ctx.heap, Pair { car: a, cdr: b }));
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        let Some(c) = try_new(&ctx.heap, Pair { car: a, cdr: b }) else cold {
+            gc.make_room(&ctx.heap, size_of<Pair>());
+            redo
+        };
+        dst = P(c);
         next
     }
     /// R[dst] = (vector R[base] .. R[base+n-1]).
     op VECTOR(dst: reg, base: callbase, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let cnt = n as u64;
-        let v = new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, cnt);
         let src = regs + base as u64;
+        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, V.Imm(value.IMM_NIL), src, cnt)); next } }
+        let Some(v) = try_vect(V.Imm(value.IMM_NIL), cnt) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
+            redo
+        };
         for i in 0..cnt { v.data.ptr[i] = src[i]; }
         dst = Vec(v);
         next
@@ -364,13 +405,35 @@ pub vm Scheme {
     /// R[dst] = a record of type R[base] with fields R[base+1] .. R[base+n]
     /// (the constructor of a define-record-type).
     op RECORD(dst: reg, base: callbase, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let cnt = n as u64;
         let src = regs + base as u64;
-        let v = new(&ctx.heap, Vect { rtd: src[0] }, cnt);
+        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, src[0], src + 1, cnt)); next } }
+        let Some(v) = try_vect(src[0], cnt) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
+            redo
+        };
         for i in 0..cnt { v.data.ptr[i] = src[i + 1]; }
         dst = Vec(v);
         next
+    }
+    /// A closure or vector of 1 to 4 slots without the allocator's refill
+    /// (constant lengths: the zeroing is inline, not a memset call).
+    fn try_closure(p: Gc<Proto>, n: u64) -> ?Gc<Closure> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Closure { proto: p }, 1) }
+            else if n == 2 { try_new(&ctx.heap, Closure { proto: p }, 2) }
+            else { try_new(&ctx.heap, Closure { proto: p }, 0) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Closure { proto: p }, 3) } else { try_new(&ctx.heap, Closure { proto: p }, 4) }
+        }
+    }
+    fn try_vect(rtd: V, n: u64) -> ?Gc<Vect> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Vect { rtd: rtd }, 1) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 2) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Vect { rtd: rtd }, 3) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 4) }
+        }
     }
     /// (memq x l): a loop in the handler instead of a native call.
     op MEMQ(dst: reg, x: reg, l: reg) : ABC {

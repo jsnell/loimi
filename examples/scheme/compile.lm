@@ -1341,13 +1341,25 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     n.c = c.inl(n.c, depth);
     for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
     if n.kind != K.Call { return n; }
+    // A builtin substituted for a parameter, as in (map car l): an op.
+    if n.a.kind == K.Const and let Some(id) = value.prim_of(n.a.v) {
+        let (name, _, _) = builtins.prim_info(id);
+        if let Some((po, want)) = inline_prim(name) and want as u64 == n.list.len {
+            n.kind = K.Prim;
+            n.po = po;
+            n.a = null_node();
+            return n;
+        }
+    }
     let Some((l, g, self_v)) = c.known(n.a) else { return n; };
     if n.a.kind == K.GRef { n.lam = l; }
     if depth >= INLINE_DEPTH { return n; }
     if l.rest or l.nparams as u64 != n.list.len { return n; }
     var limit = INLINE_SIZE;
     for i in 0..n.list.len {
-        if n.list.at(i).kind == K.Lambda or c.bound_known(n.list.at(i)) { limit = INLINE_SIZE_HO; }
+        let a = n.list.at(i);
+        if a.kind == K.Lambda or c.bound_known(a)
+            or (a.kind == K.Const and value.prim_of(a.v).is_some()) { limit = INLINE_SIZE_HO; }
     }
     if inline_size(l.body, g, self_v) > limit { return n; }
     // (let ((p arg) ...) body), substituting constants and unassigned
