@@ -35,3 +35,4 @@ examples/python/python-loimi
 /bench/prolog/out
 /examples/prolog/.build
 /bench/prolog/__pycache__
+/bench/wasm/polybench-out

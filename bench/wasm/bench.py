@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Time the wasm32-wasi benchmarks in programs-out/ under several interpreters.
 
-    bench.py [-n 3] [--timeout 300] [--interp NAME=CMD ...] [BENCH ...]
+    bench.py [-n 3] [--timeout 300] [--dir DIR] [--interp NAME=CMD ...] [BENCH ...]
 
 CMD is a shell-style command line; "{wasm}" is replaced by the module path
 (appended if absent). Default interpreters: wasm3 and wabt's wasm-interp
@@ -72,8 +72,12 @@ def main():
                     help="interpreter to time (repeatable; replaces the defaults)")
     ap.add_argument("--add-default", action="store_true",
                     help="keep the default interpreters in front of --interp ones")
-    ap.add_argument("benchmarks", nargs="*", help="subset of programs-out/*.wasm names")
+    ap.add_argument("--dir", default=OUT,
+                    help="directory of the modules (default programs-out; polybench.sh "
+                         "builds polybench-out)")
+    ap.add_argument("benchmarks", nargs="*", help="subset of the directory's *.wasm names")
     a = ap.parse_args()
+    wdir = a.dir
 
     interps = []
     if not a.interp or a.add_default:
@@ -84,11 +88,11 @@ def main():
             ap.error("--interp wants NAME=CMD")
         interps.append((name, cmd))
 
-    names = a.benchmarks or sorted(f[:-5] for f in os.listdir(OUT) if f.endswith(".wasm"))
+    names = a.benchmarks or sorted(f[:-5] for f in os.listdir(wdir) if f.endswith(".wasm"))
     results = {}  # (bench, interp) -> seconds | "timeout" | "FAIL ..." | "WRONG"
     for b in names:
-        wasm = os.path.join(OUT, b + ".wasm")
-        exp_path = os.path.join(OUT, b + ".expected")
+        wasm = os.path.join(wdir, b + ".wasm")
+        exp_path = os.path.join(wdir, b + ".expected")
         expected = None
         if os.path.exists(exp_path):
             with open(exp_path, "rb") as f:
