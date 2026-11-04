@@ -1418,6 +1418,9 @@ pub vm Mini {
     #[forward] super GETINDEX_GETINDEX_TEST = GETINDEX; GETINDEX; TEST;
     #[allow(super_overlap)]
     #[forward] super ADDI_SETINDEX = ADDI; SETINDEX;
+    // `f(n - 1)` for a function in an upvalue: fib 40%, coroutine_ring 17%.
+    #[allow(super_overlap)]
+    #[forward] super GETUPVAL_ADDI_CALL = GETUPVAL; ADDI; CALL;
     // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
