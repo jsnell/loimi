@@ -342,6 +342,14 @@ implementation; `git log` has the details.
   after: [design/safety.md §8](docs/design/safety.md).)
 - [`examples/wasm`](examples/wasm): a WebAssembly interpreter that
   passes every non-SIMD spec test file.
+- The wasm interpreter takes 0.976 of its previous time (0.87 of wasm3's,
+  was 0.90 in the same run): calls zero only the locals a read can see
+  unwritten (a forward pass over each body), `p + k` addresses fold into
+  loads and stores at offset 0, bit tests and loads fuse with the branch
+  after them, direct calls of the module's own functions skip the host
+  test ([`FRICTION.md`](examples/wasm/FRICTION.md), "Where the time goes
+  against wasm3", which also has a per-benchmark profile and what did
+  not help).
 - [`examples/python`](examples/python): a Python 3 subset running 11
   pyperformance programs, on `std.bigint` and `std.dict`.
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run

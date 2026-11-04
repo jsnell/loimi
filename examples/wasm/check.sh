@@ -5,6 +5,7 @@
 #
 # - builds with -W error (every dispatch mode; --fast: tail calls only)
 # - compiles tests/*.c to wasm32 with clang-19 (skipped without wasm-ld)
+#   and tests/*.wat with wabt's wat2wasm (from bench/wasm/install.sh),
 #   and compares each program's output with tests/NAME.expected
 #   (-u rewrites them)
 # - LOIMI_RUNNER (e.g. qemu) runs the interpreter when LOIMI_TARGET cross-builds it
@@ -51,6 +52,20 @@ for mode in $modes; do
         done
     else
         echo "skip: tests/*.c (no clang-19/wasm-ld)"
+    fi
+    WAT2WASM=$ROOT/bench/wasm/install/bin/wat2wasm
+    if [ -x "$WAT2WASM" ]; then
+        for src in "$DIR"/tests/*.wat; do
+            name=$(basename "$src" .wat)
+            "$WAT2WASM" "$src" -o "$TMP/$name.wasm" || { echo "FAIL: assembling $name"; FAIL=1; continue; }
+            (ulimit -v 2500000; ${LOIMI_RUNNER:-} "$TMP/wasm-$mode" "$TMP/$name.wasm") > "$TMP/out" 2>&1
+            if [ $UPDATE = 1 ] && [ $mode = tailcall ]; then cp "$TMP/out" "$DIR/tests/$name.expected"; fi
+            if ! cmp -s "$TMP/out" "$DIR/tests/$name.expected"; then
+                echo "FAIL: $name ($mode)"; diff "$TMP/out" "$DIR/tests/$name.expected" | head -10; FAIL=1
+            fi
+        done
+    else
+        echo "skip: tests/*.wat (no wat2wasm: bench/wasm/install.sh)"
     fi
     if [ -d "$ROOT/bench/wasm/spec-json" ]; then
         files=$SPEC_ALL

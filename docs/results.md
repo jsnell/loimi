@@ -452,6 +452,14 @@ Times in milliseconds.
 
 Times in seconds.
 
+*Note, 2026-11-04:* after the translator changes in
+`examples/wasm/FRICTION.md` ("Where the time goes against wasm3"),
+tail-call times were 0.976 of the previous build's by geometric mean
+(binarytrees 0.93, spectralnorm 1.02, the others 0.97-0.98) and **0.87
+of wasm3's** (0.90 for the previous build in the same run: best of 7,
+interleaved, on a busier machine, so absolute times are about 10% above
+this table's). Not a full `run_all.py` run.
+
 ### wasm-simd
 
 | benchmark | tailcall | goto | switch | mvp | tailcall/mvp |

@@ -25,13 +25,20 @@ import vm.{W, Func, Inst};
 // Where a stack value is. (u8 consts at first; a const name in a pattern
 // then bound a new variable, so every value took the first arm. Constants
 // in patterns now match their value, but an enum is checked exhaustively.)
-enum Loc { Home, Local, Const }
+enum Loc { Home, Local, Const, AddK }
 
 /// An operand stack entry: its type (0 = unknown, in unreachable code),
-/// where its value is (`x`: a local's slot, or a constant's bits), and
+/// where its value is (`x`: a local's slot, or a constant's bits, or for
+/// `AddK`, an i32 that is a slot's value plus a 16-bit constant, the slot
+/// in the low 16 bits and the constant above: `addk_slot`, `addk_k`), and
 /// its home slot, `s` slots above the first home (a v128 takes two
 /// slots, so homes are not simply nlocals + position). `push` sets `s`.
 struct Val { ty: u8, loc: Loc, x: u64, s: u64 }
+
+fn addk_slot(v: Val) -> u64 { v.x & 0xFFFF }
+fn addk_k(v: Val) -> i64 { (((v.x >> 16) as u16) as i16) as i64 }
+fn addk(slot: u64, k: i64) -> u64 { slot | (((k as u16) as u64) << 16) }
+fn addk_op(d: u64, v: Val) -> u64 { W.encode.RRK(W.OP_I32_ADDK, d as u16, addk_slot(v) as u16, addk_k(v) as i16) }
 
 /// Slots a value of type `ty` takes: 2 for v128, else 1.
 fn width(ty: u8) -> u64 { if ty == T_V128 { 2 } else { 1 } }
@@ -159,6 +166,7 @@ fn T.reg(t: *T, v: Val) -> u64 {
             if let Some(k) = t.kslot(v.x) { return k; }
             let h = t.nlocals + v.s; t.write_const(h, v.ty, v.x); h
         }
+        AddK => { let h = t.nlocals + v.s; t.emit_def(addk_op(h, v), h); h }
         _ => t.nlocals + v.s,
     }
 }
@@ -246,6 +254,7 @@ fn T.flush_at(t: *T, i: u64) {
     let h = t.home(i);
     if !t.dead() {
         if v.loc == Loc.Local { t.emit_def(mov(v.ty, h, v.x), h); }
+        else if v.loc == Loc.AddK { t.emit_def(addk_op(h, v), h); }
         else { t.write_const(h, v.ty, v.x); }
     }
     t.vals.set(i, Val { ty: v.ty, loc: Loc.Home, x: 0, s: v.s });
@@ -256,7 +265,7 @@ fn T.flush_all(t: *T) {
 fn T.flush_local(t: *T, x: u64) {
     for i in 0..t.vals.len {
         let v = t.vals.at(i);
-        if v.loc == Loc.Local and v.x == x { t.flush_at(i); }
+        if (v.loc == Loc.Local and v.x == x) or (v.loc == Loc.AddK and addk_slot(v) == x) { t.flush_at(i); }
     }
 }
 
@@ -297,6 +306,7 @@ fn T.move_top(t: *T, n: u64, dst: u64) {
         match v.loc {
             Local => { t.emit(mov(v.ty, d, v.x)); }
             Const => { t.write_const(d, v.ty, v.x); }
+            AddK => { t.emit(addk_op(d, v)); }
             _ => if t.home(i) != d { t.emit(mov(v.ty, d, t.home(i))); },
         }
     }
@@ -708,6 +718,33 @@ fn memop(op: u32) -> ?(u64, u64, u8, u32, bool) {
     }
 }
 
+/// The form of a scalar load or store that adds a 16-bit constant to the
+/// address (i32.add, wrapping) instead of an offset: (op, K op).
+fn kmems() -> [(u64, u64); 23] {
+    [
+        (W.OP_I32_LOAD, W.OP_I32_LOADK), (W.OP_I64_LOAD, W.OP_I64_LOADK),
+        (W.OP_F32_LOAD, W.OP_F32_LOADK), (W.OP_F64_LOAD, W.OP_F64_LOADK),
+        (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_SK), (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_UK),
+        (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_SK), (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_UK),
+        (W.OP_I64_LOAD8_S, W.OP_I64_LOAD8_SK), (W.OP_I64_LOAD8_U, W.OP_I64_LOAD8_UK),
+        (W.OP_I64_LOAD16_S, W.OP_I64_LOAD16_SK), (W.OP_I64_LOAD16_U, W.OP_I64_LOAD16_UK),
+        (W.OP_I64_LOAD32_S, W.OP_I64_LOAD32_SK), (W.OP_I64_LOAD32_U, W.OP_I64_LOAD32_UK),
+        (W.OP_I32_STORE, W.OP_I32_STOREK), (W.OP_I64_STORE, W.OP_I64_STOREK),
+        (W.OP_F32_STORE, W.OP_F32_STOREK), (W.OP_F64_STORE, W.OP_F64_STOREK),
+        (W.OP_I32_STORE8, W.OP_I32_STORE8K), (W.OP_I32_STORE16, W.OP_I32_STORE16K),
+        (W.OP_I64_STORE8, W.OP_I64_STORE8K), (W.OP_I64_STORE16, W.OP_I64_STORE16K),
+        (W.OP_I64_STORE32, W.OP_I64_STORE32K),
+    ]
+}
+
+/// The K form of memory op `vop` for an address `a` pending as an AddK
+/// and offset 0.
+fn kmem(vop: u64, a: Val, offset: u64) -> ?u64 {
+    if a.loc != Loc.AddK or offset != 0 { return None; }
+    for row in kmems() { let (o, k) = row; if o == vop { return Some(k); } }
+    None
+}
+
 fn is_num(t: u8) -> bool { t == T_I32 or t == T_I64 or t == T_F32 or t == T_F64 }
 
 fn T.global_type(t: *T, g: u64) -> Result<(u8, bool), str> {
@@ -752,6 +789,29 @@ fn kforms() -> [(u64, u64, bool); 38] {
         (W.OP_I64_GE_S, W.OP_I64_GE_SK, false), (W.OP_I64_GE_U, W.OP_I64_GE_UK, false),
         (W.OP_I32_SUB, W.OP_I32_ADDK, false), (W.OP_I64_SUB, W.OP_I64_ADDK, false),
     ]
+}
+
+/// `x + k` (or `x - k`) for an i32 `x` in a local or in the home slot of
+/// position `p` (where the sum goes) and a constant `k` of 16 bits stays
+/// pending, as an AddK: a load or store at offset 0 then adds it itself
+/// (I32_LOADK), anything else materializes it as an I32_ADDK.
+fn T.pending_add(t: *T, op: u64, a: Val, b: Val, p: u64) -> ?u64 {
+    if op != W.OP_I32_ADD and op != W.OP_I32_SUB { return None; }
+    var x = a;
+    var c = b;
+    if op == W.OP_I32_ADD and a.loc == Loc.Const and b.loc == Loc.Local { x = b; c = a; }
+    if c.loc != Loc.Const { return None; }
+    var k = const_value(c);
+    if op == W.OP_I32_SUB { k = 0 - k; }
+    match x.loc {
+        Local => if fits16(k) { Some(addk(x.x, k)) } else { None },
+        Home => if fits16(k) { Some(addk(t.home(p), k)) } else { None },
+        AddK => {
+            let k2 = addk_k(x) + k;
+            if fits16(k2) { Some(addk(addk_slot(x), k2)) } else { None }
+        }
+        _ => None,
+    }
 }
 
 fn T.binop(t: *T, op: u64, a: Val, b: Val, p: u64) {
@@ -830,6 +890,18 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
                     t.has_def = false;
                     return;
                 }
+                if op == W.OP_I32_ANDK {
+                    t.code.truncate(last);
+                    let bop = if when { W.OP_BR_I32_ANDK_NZ } else { W.OP_BR_I32_ANDK_Z };
+                    t.code.op(W.encode.RI(bop, W.RRK_b(w) as u16, W.RRK_k(w) as i32));
+                    t.code.jump(W.JMP(0), l);
+                    t.has_def = false;
+                    return;
+                }
+                if op == W.OP_I32_LOAD {
+                    t.fuse_load_branch(last, w, when, l);
+                    return;
+                }
                 for row in fusions() {
                     let (cop, bt, bf, k) = row;
                     if cop != op { continue; }
@@ -850,8 +922,28 @@ fn T.cond_jump(t: *T, cond: Val, p: u64, when: bool, l: bc.Label) {
             }
         }
     }
+    // `i32.load; local.tee x; br_if`: the load was retargeted to x.
+    if cond.loc == Loc.Local {
+        if let Some(last) = t.code.last() {
+            let w = t.code.at(last);
+            if W.opcode(w) == W.OP_I32_LOAD and W.RRR_a(w) == cond.x {
+                t.fuse_load_branch(last, w, when, l);
+                return;
+            }
+        }
+    }
     let rc = t.reg(cond);
     t.code.jump(if when { W.BRNZ(rc as u16, 0) } else { W.BRZ(rc as u16, 0) }, l);
+    t.has_def = false;
+}
+
+/// Replaces the I32_LOAD `w` at `last` (the last op) by a load that also
+/// branches to `l` on the loaded word being nonzero (`when`) or zero.
+fn T.fuse_load_branch(t: *T, last: u64, w: u64, when: bool, l: bc.Label) {
+    t.code.truncate(last);
+    let bop = if when { W.OP_BR_I32_LOAD_NZ } else { W.OP_BR_I32_LOAD_Z };
+    t.code.op(rrr(bop, W.RRR_a(w), W.RRR_b(w), W.RRR_c(w)));
+    t.code.jump(W.JMP(0), l);
     t.has_def = false;
 }
 
@@ -873,6 +965,10 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let b = t.pop(n.b)?;
             let a = t.pop(n.a)?;
             let p = t.vals.len;
+            if let Some(x) = t.pending_add(n.op, a, b, p) {
+                t.push(Val { ty: T_I32, loc: Loc.AddK, x: x, s: 0 });
+                return Ok(true);
+            }
             if !t.dead() { t.binop(n.op, a, b, p); }
         }
         t.push_home(n.r);
@@ -888,6 +984,11 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let a = t.pop(T_I32)?;
             let p = t.vals.len;
             if !t.dead() {
+                if let Some(kop) = kmem(vop, a, offset) {
+                    let rv = t.reg(v);
+                    t.emit(W.encode.RRK(kop, addk_slot(a) as u16, rv as u16, addk_k(a) as i16));
+                    return Ok(true);
+                }
                 let ra = t.reg(a);
                 let rv = t.reg(v);
                 if offset < 65536 {
@@ -903,6 +1004,12 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let a = t.pop(T_I32)?;
             let p = t.vals.len;
             if !t.dead() {
+                if let Some(kop) = kmem(vop, a, offset) {
+                    let h = t.home(p);
+                    t.emit_def(W.encode.RRK(kop, h as u16, addk_slot(a) as u16, addk_k(a) as i16), h);
+                    t.push_home(ty);
+                    return Ok(true);
+                }
                 let ra = t.reg(a);
                 let h = t.home(p);
                 if offset < 65536 {
@@ -981,7 +1088,10 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 for j in 0..results.len { if c.params[j] != results[j] { return Err("type mismatch"); } }
             }
             if c.kind == K_FUNC {
-                if !c.dead {
+                // Branches to the return label leave the results in their
+                // home slots; without any, RET1 reads a pending local or
+                // constant where it is.
+                if !c.dead and t.ret_used {
                     for i in c.height..t.vals.len { t.flush_at(i); }
                 }
                 if t.ret_used { t.code.bind(t.ret_label); }
@@ -1087,7 +1197,8 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let fi = r.u32()? as u64;
             if fi >= t.m.funcs.len { return Err("unknown function"); }
             let ft = t.m.types.at(t.m.funcs.at(fi) as u64);
-            t.call(ft, W.CALL(0, fi as u32), 0, false, 0)?;
+            let w = if fi >= (t.m.nfunc_imports as u64) { W.CALL_LOCAL(0, fi as u32) } else { W.CALL(0, fi as u32) };
+            t.call(ft, w, 0, false, 0)?;
         }
         0x11 => {
             let ti = r.u32()? as u64;
@@ -1142,6 +1253,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 match a.loc {
                     Local => { t.emit(W.MOV(h as u16, a.x as u16)); }
                     Const => { t.write_const(h, a.ty, a.x); }
+                    AddK => { t.emit(addk_op(h, a)); }
                     _ => {}
                 }
                 t.emit(W.SELECT(h as u16, rb as u16, rc as u16));
@@ -1188,6 +1300,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     match v.loc {
                         Const => { t.write_const(x, ty, v.x); }
                         Local => { if v.x != x { t.emit(mov(ty, x, v.x)); } }
+                        AddK => { t.emit(addk_op(x, v)); }
                         _ => { t.emit(mov(ty, x, t.home(p))); }
                     }
                 }
@@ -1248,6 +1361,11 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 0xBE => (T_I32, T_F32), _ => (T_I64, T_F64),
             };
             let v = t.pop(from)?;
+            if v.loc == Loc.AddK {
+                if !t.dead() { t.reg(v); }
+                t.push_home(to);
+                return Ok(true);
+            }
             t.push(Val { ty: to, loc: v.loc, x: v.x, s: v.s });
         }
         0xD0 => {
@@ -1572,8 +1690,132 @@ fn T.call(t: *T, ft: decode.FuncType, w: u64, ti: u64, indirect: bool, ri: u64) 
     Ok(())
 }
 
+/// Which locals (indices from `nparams` on) a `local.get` may read
+/// before any write, so that they need the zero a call gives them: a
+/// forward pass over the structured code with the set of locals written
+/// on every path so far. At a construct's `end` that set is what every
+/// way of reaching it has: each branch to it (not to a loop, whose
+/// branches go to its head), the fall-through of its last instruction
+/// and of an `if`'s then arm, and for an `if` without `else` the path
+/// around it, which writes nothing. Code after `br`, `br_table`,
+/// `return` and `unreachable` is not reached that way and adds nothing;
+/// a read in it may still count, which is only conservative.
+fn needs_zero(code: []u8, nlocals: u64, nparams: u64, need: *mem.Vec<bool>) -> Result<(), str> {
+    var assigned: mem.Vec<bool> = mem.Vec.new();
+    defer assigned.free();
+    // First writes, in order: what a construct wrote is log[start..].
+    var log: mem.Vec<u64> = mem.Vec.new();
+    defer log.free();
+    // Per open construct: where its writes start in the log, its opcode
+    // (0x05 after `else`), and the locals that every path reaching its end
+    // so far has written (`m_has`: there was such a path).
+    var m_at: mem.Vec<u64> = mem.Vec.new();
+    defer m_at.free();
+    var m_kind: mem.Vec<u8> = mem.Vec.new();
+    defer m_kind.free();
+    var m_has: mem.Vec<bool> = mem.Vec.new();
+    defer m_has.free();
+    var m_acc: mem.Vec<mem.Vec<u64>> = mem.Vec.new();
+    defer { for i in 0..m_acc.len { m_acc.ptr_at(i).free(); } m_acc.free(); }
+    var depth: u64 = 0;
+    var dead = false;
+    for i in 0..nlocals { assigned.push(i < nparams); need.push(false); }
+    var r = decode.Reader.new(code);
+    while !r.at_end() {
+        let op = code[r.pos];
+        if op == 0x20 or op == 0x21 or op == 0x22 {
+            r.pos += 1;
+            let x = r.u32()? as u64;
+            if x >= nlocals { return Err("unknown local"); }
+            if op == 0x20 {
+                if !assigned.at(x) { need.set(x, true); }
+            } else if !assigned.at(x) {
+                assigned.set(x, true);
+                log.push(x);
+            }
+            continue;
+        }
+        if op == 0x0C or op == 0x0D or op == 0x0E {
+            r.pos += 1;
+            var n: u64 = 1;
+            if op == 0x0E { n = (r.u32()? as u64) + 1; }
+            for i in 0..n {
+                let d = r.u32()? as u64;
+                if !dead and d < depth and m_kind.at(depth - 1 - d) != 0x03 {
+                    contribute(depth - 1 - d, &m_at, &m_has, &m_acc, &log, &assigned);
+                }
+            }
+            if op != 0x0D { dead = true; }
+            continue;
+        }
+        let o = r.skip_instr()?;
+        if o == 0x00 or o == 0x0F {
+            dead = true;
+        } else if o == 0x02 or o == 0x03 or o == 0x04 {
+            if m_acc.len == depth { m_acc.push(mem.Vec.new()); }
+            m_acc.ptr_at(depth).truncate(0);
+            m_at.push(log.len); m_kind.push(o as u8); m_has.push(false);
+            depth += 1;
+        } else if o == 0x05 {
+            if depth == 0 { return Err("else without if"); }
+            let c = depth - 1;
+            if !dead { contribute(c, &m_at, &m_has, &m_acc, &log, &assigned); }
+            m_kind.set(c, 0x05);
+            while log.len > m_at.at(c) { assigned.set(log.pop().unwrap(), false); }
+            dead = false;
+        } else if o == 0x0B {
+            if depth == 0 { break; }
+            let c = depth - 1;
+            let kind = m_kind.at(c);
+            if kind == 0x03 {
+                // A loop's writes stand: its end follows its last instruction.
+                m_has.set(c, true);
+                let acc = m_acc.ptr_at(c);
+                acc.truncate(0);
+                for j in m_at.at(c)..log.len { acc.push(log.at(j)); }
+            } else if kind == 0x04 {
+                m_has.set(c, true);
+                m_acc.ptr_at(c).truncate(0);
+            } else if !dead {
+                contribute(c, &m_at, &m_has, &m_acc, &log, &assigned);
+            }
+            while log.len > m_at.at(c) { assigned.set(log.pop().unwrap(), false); }
+            if m_has.at(c) {
+                let acc = m_acc.ptr_at(c);
+                for j in 0..acc.len {
+                    let x = acc.at(j);
+                    if !assigned.at(x) { assigned.set(x, true); log.push(x); }
+                }
+            }
+            m_at.pop(); m_kind.pop(); m_has.pop();
+            depth -= 1;
+            dead = false;
+        }
+    }
+    Ok(())
+}
+
+/// A path reaches the end of construct `c` with the current writes.
+fn contribute(c: u64, m_at: *mem.Vec<u64>, m_has: *mem.Vec<bool>, m_acc: *mem.Vec<mem.Vec<u64>>, log: *mem.Vec<u64>, assigned: *mem.Vec<bool>) {
+    let acc = m_acc.ptr_at(c);
+    if !m_has.at(c) {
+        m_has.set(c, true);
+        acc.truncate(0);
+        for j in m_at.at(c)..log.len { acc.push(log.at(j)); }
+        return;
+    }
+    var k: u64 = 0;
+    for j in 0..acc.len {
+        let x = acc.at(j);
+        if assigned.at(x) { acc.set(k, x); k += 1; }
+    }
+    acc.truncate(k);
+}
+
 /// `consts`: the values of the constant slots, which follow the locals.
-pub struct Compiled { words: []u64, nslots: u32, nparams: u32, nlocals: u32, nconsts: u32, consts: *u64 }
+/// Calls zero the slots from `nparams` to `nzero` (the locals that may be
+/// read before they are written, laid out first).
+pub struct Compiled { words: []u64, nslots: u32, nparams: u32, nzero: u32, nlocals: u32, nconsts: u32, consts: *u64 }
 
 /// Validates and translates the body of function `fidx` (a defined one).
 pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result<Compiled, str> {
@@ -1584,7 +1826,22 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     var ns: u64 = 0;
     for i in 0..ft.params.len { t.locals.push(ft.params[i]); t.lslots.push(ns); ns += width(ft.params[i]); }
     let nparams = ns;
-    for i in 0..body.locals.len { let ty = body.locals.at(i); t.locals.push(ty); t.lslots.push(ns); ns += width(ty); }
+    let np = ft.params.len;
+    var nzero = nparams;
+    for i in 0..body.locals.len { t.locals.push(body.locals.at(i)); t.lslots.push(0); }
+    // The locals a read may see unwritten first: calls zero only them.
+    var need: mem.Vec<bool> = mem.Vec.new();
+    defer need.free();
+    if let Err(_) = needs_zero(body.code, t.locals.len, np, &need) {
+        need.truncate(0);
+        for i in 0..t.locals.len { need.push(true); }
+    }
+    for pass in 0..2 {
+        for i in np..t.locals.len {
+            if need.at(i) == (pass == 0) { t.lslots.set(i, ns); ns += width(t.locals.at(i)); }
+        }
+        if pass == 0 { nzero = ns; }
+    }
     t.nlocals0 = ns;
     // Constant slots follow the locals; a malformed body is reported by
     // the translation proper.
@@ -1608,7 +1865,7 @@ pub fn compile(m: *decode.Module, fidx: u64, declared: *mem.Vec<bool>) -> Result
     let ks = mem.alloc<u64>(t.kvals.len + 1);
     for i in 0..t.kvals.len { ks[i] = t.kvals.at(i); }
     Ok(Compiled {
-        words: words.slice(n), nslots: nslots as u32, nparams: nparams as u32, nlocals: t.nlocals0 as u32,
+        words: words.slice(n), nslots: nslots as u32, nparams: nparams as u32, nzero: nzero as u32, nlocals: t.nlocals0 as u32,
         nconsts: t.kvals.len as u32, consts: ks,
     })
 }
