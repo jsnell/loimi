@@ -1,0 +1,4 @@
+// `#![lifetimes]` takes no argument or `off`.
+#![lifetimes(no)]
+fn main() {}
+// error: `#![lifetimes]` takes no argument or `off`

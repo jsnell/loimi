@@ -207,9 +207,10 @@ fn scan(h: *gc.Heap, data: *u8) {
 
 /// Shapes nobody uses are collected; their edges are cleared, and the
 /// tree is rebuilt on demand.
-fn weak(w: *World) uses gc {
-    var keep: mem.Vec<Gc<Obj>> = mem.Vec.new();
-    w.heap.add_scanner(&keep as *u8, scan);
+/// `keep` is a root for as long as the heap lives: the heap keeps its
+/// address, so it is `main`'s (a local of `weak` registered here would
+/// dangle once `weak` returned).
+fn weak(w: *World, keep: *mem.Vec<Gc<Obj>>) uses gc {
     let a = w.obj(None, 3);
     keep.push(a);
     w.m.set(a, X, Value.Int(1));
@@ -234,7 +235,6 @@ fn weak(w: *World) uses gc {
     show("b", int(w.m.get(b, 5000)));
     gc.collect(&w.heap);
     show("a.x", int(w.m.get(a, X)));
-    keep.free();
 }
 
 fn main() uses gc {
@@ -245,7 +245,9 @@ fn main() uses gc {
     shapes(&w);
     caches(&w);
     protos(&w);
-    weak(&w);
+    var keep: mem.Vec<Gc<Obj>> = mem.Vec.new();
+    w.heap.add_scanner(&keep as *u8, scan);
+    weak(&w, &keep);
 }
 // expect: same order shares a shape true
 // expect: other order differs true

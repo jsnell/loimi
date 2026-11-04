@@ -1,0 +1,19 @@
+// Lifetimes are checked in every module by default; `#![lifetimes(off)]`
+// opts this one out (docs/design/lifetimes.md section 5.5). The pointer
+// survives the second push only because of the `reserve`, a protocol
+// the check cannot see: without the attribute, `p` "may dangle".
+// tests/run/lt_*.lm with a bare `#![lifetimes]` (the old opt-in) check
+// that it is still accepted.
+#![lifetimes(off)]
+import std.io;
+import std.mem;
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.reserve(4);
+    v.push(1);
+    let p = v.ptr_at(0);
+    v.push(2);
+    io.print_int(*p as i64);
+    v.free();
+}
+// expect: 1

@@ -1,0 +1,7 @@
+// Lifetimes are checked by default: no attribute, and an imported
+// module's function is checked as well as the root's.
+import lt_default_mod.lib;
+fn main() {
+    lib.first_after_push();
+}
+// error: `s` may dangle

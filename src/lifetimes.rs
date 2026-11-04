@@ -52,9 +52,11 @@
 //! not move objects). In vm code, a `reenter` call invalidates pointers
 //! derived from the state that the vm's `reload` block recomputes.
 //!
-//! Errors are reported in modules with `#![safe]` or `#![lifetimes]`,
-//! outside `unsafe { }`; `LOIMI_LIFETIMES=audit` lists the sites of every
-//! module instead (`lifetime-site` lines on stderr), without failing.
+//! Errors are reported in every module but those with
+//! `#![lifetimes(off)]`, outside `unsafe { }`; `LOIMI_LIFETIMES=audit`
+//! lists the sites of every module instead, opted-out ones included
+//! (`lifetime-site` lines on stderr), without failing;
+//! `LOIMI_LIFETIMES=off` skips the pass.
 //!
 //! **Cost.** The flow state is cloned at every branch, so its parts are
 //! shared (`Rc`, copied when a branch changes one) and paths are inline;
@@ -2077,9 +2079,10 @@ fn assigned_locals(e: &TExpr, out: &mut Vec<LocalId>) {
     }
 }
 
-/// Where the checker found checked modules and `unsafe { }` blocks.
+/// The files of modules that opted out (`#![lifetimes(off)]`), and the
+/// `unsafe { }` blocks.
 pub struct Ctx<'a> {
-    pub checked_files: &'a HashSet<u32>,
+    pub unchecked_files: &'a HashSet<u32>,
     pub unsafe_spans: &'a [Span],
 }
 
@@ -2191,7 +2194,7 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     let t_start = std::time::Instant::now();
     let body = |i: FnId| p.fns[i as usize].body.is_some();
     let checked: Vec<FnId> = (0..p.fns.len() as FnId)
-        .filter(|&i| body(i) && (audit.is_some() || cx.checked_files.contains(&p.fns[i as usize].span.file)))
+        .filter(|&i| body(i) && (audit.is_some() || !cx.unchecked_files.contains(&p.fns[i as usize].span.file)))
         .collect();
     if checked.is_empty() {
         return Ok(());

@@ -1,6 +1,9 @@
 // expect-stderr: use-after-poison
 // A pointer to an element that `pop` removed: the slot is spare
 // capacity now, poisoned in ASan builds.
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.mem;
 

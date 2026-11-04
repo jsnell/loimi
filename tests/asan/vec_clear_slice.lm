@@ -1,6 +1,9 @@
 // expect-stderr: use-after-poison
 // A slice of a `Vec`'s items kept across `clear` (its length is the old
 // one, so the bounds check passes).
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.mem;
 

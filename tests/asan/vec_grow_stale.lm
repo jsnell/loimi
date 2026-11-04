@@ -1,6 +1,9 @@
 // expect-stderr: heap-use-after-free
 // A pointer into a `Vec` that grew: the old buffer was freed (ASan's
 // realloc always moves).
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.mem;
 

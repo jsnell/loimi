@@ -237,7 +237,7 @@ fn load(sm: &mut SourceMap, root: &Path, allows: &mut Vec<(String, Span, Span)>,
                 queue.push((ipath, base.join(rel).with_extension("lm"), imp.span));
             }
         }
-        modules.push(ast::Module { path, items, safe: mod_attrs.has("safe"), lifetimes: mod_attrs.has("safe") || mod_attrs.has("lifetimes") });
+        modules.push(ast::Module { path, items, file: fid, safe: mod_attrs.has("safe"), lifetimes: !mod_attrs.list.iter().any(|(n, a, _)| n == "lifetimes" && !a.is_empty()) });
     }
     Ok(modules)
 }
@@ -346,12 +346,9 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     objref::check(&mut c.prog, &objref::Ctx { safe_files: &safe_files, unsafe_spans: &unsafe_spans }, sm)?;
     // Pointers into containers used after the container may have moved
     // or freed them (src/lifetimes.rs).
-    let checked_files: std::collections::HashSet<u32> = modules
-        .iter()
-        .filter(|m| m.lifetimes)
-        .flat_map(|m| m.items.iter().filter_map(|it| if let ast::Item::Fn(f) = it { Some(f.name.span.file) } else { None }))
-        .collect();
-    lifetimes::check(&c.prog, &lifetimes::Ctx { checked_files: &checked_files, unsafe_spans: &unsafe_spans }, sm)?;
+    // On for every module but those with `#![lifetimes(off)]`.
+    let unchecked_files: std::collections::HashSet<u32> = modules.iter().filter(|m| !m.lifetimes).map(|m| m.file).collect();
+    lifetimes::check(&c.prog, &lifetimes::Ctx { unchecked_files: &unchecked_files, unsafe_spans: &unsafe_spans }, sm)?;
     if let Some(a) = &c.safety_audit {
         // `LOIMI_SAFETY_AUDIT=1`: raw-pointer operations by module and kind.
         let a = a.borrow();

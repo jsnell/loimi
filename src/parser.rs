@@ -49,7 +49,7 @@ const ATTRS: &[(&str, &str)] = &[
     ("unsafe", "functions"),
     ("raw", "functions (a raw-pointer operation: `unsafe { }` in a `#![safe]` module)"),
     ("safe", "modules (`#![safe]`: raw-pointer operations need `unsafe { }`)"),
-    ("lifetimes", "modules (`#![lifetimes]`: pointers into containers are checked for use after the container may move or free them)"),
+    ("lifetimes", "modules (`#![lifetimes(off)]`: pointers into containers are not checked for use after the container may move or free them; checked by default)"),
     ("may_alias", "functions (`#[may_alias(p)]`: argument `p` may point into memory the function moves or frees)"),
     ("shrinks", "functions (`#[shrinks(v)]`: the function may remove elements of the container `v` points to, ending pointers into it)"),
     ("thread_local", "module-level `var`s"),
@@ -105,12 +105,17 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "raw" | "safe" | "lifetimes" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "raw" | "safe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }
             if n == "inline" && !(args.is_empty() || (args.len() == 1 && (args[0] == "always" || args[0] == "never"))) {
                 return Err(Diag::new(*sp, "`#[inline]` takes no argument, `always` or `never`"));
+            }
+            // `#![lifetimes(off)]` opts a module out of the pointer-stability
+            // check (on by default); a bare `#![lifetimes]` is the default.
+            if n == "lifetimes" && !(args.is_empty() || (args.len() == 1 && args[0] == "off")) {
+                return Err(Diag::new(*sp, "`#![lifetimes]` takes no argument or `off`: `#![lifetimes(off)]` turns the pointer-stability check off for the module"));
             }
             if n == "catch_panic" && args.len() > 1 {
                 return Err(Diag::new(*sp, "`#[catch_panic]` takes at most one value: what the function returns after a panic"));
@@ -519,6 +524,9 @@ impl Parser {
             if keep {
                 items.push(item);
             }
+        }
+        if let Some((_, _, sp)) = mod_attrs.list.iter().find(|(n, a, _)| n == "lifetimes" && !a.is_empty()).filter(|_| mod_attrs.has("safe")) {
+            return Err(Diag::new(*sp, "a `#![safe]` module is always checked for pointer stability: `#![lifetimes(off)]` does not apply (use `unsafe { }` at the site)"));
         }
         // `#![allow(..)]`: the whole file.
         let file = self.toks.last().map(|t| t.span.file).unwrap_or(0);

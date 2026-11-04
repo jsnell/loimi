@@ -1,0 +1,6 @@
+// A `#![safe]` module promises the pointer-stability check: it cannot
+// opt out of it (docs/design/lifetimes.md section 5.5).
+#![safe]
+#![lifetimes(off)]
+fn main() {}
+// error: a `#![safe]` module is always checked for pointer stability

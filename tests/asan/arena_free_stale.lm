@@ -1,5 +1,8 @@
 // expect-stderr: heap-use-after-free
 // A value from an arena used after `Arena.free`.
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.mem;
 

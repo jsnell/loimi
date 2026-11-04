@@ -1,0 +1,9 @@
+// No attribute: checked by default (tests/fail/lt_default.lm).
+import std.mem;
+pub fn first_after_push() -> u64 {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    let s = v.items();
+    v.push(2);
+    s[0]
+}

@@ -1,5 +1,8 @@
 // expect-stderr: use-after-poison
 // A `StrBuf`'s text kept across `clear`.
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.text;
 

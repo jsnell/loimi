@@ -1,6 +1,9 @@
 // expect-stderr: use-after-poison
 // An `OrderedMap` entry pointer kept across `clear` (the table is kept,
 // its entries are dead).
+// The stale use is the point (ASan reports it at run time), so the
+// compile-time check that rejects it is off.
+#![lifetimes(off)]
 import std.io;
 import std.map;
 

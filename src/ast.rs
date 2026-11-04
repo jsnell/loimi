@@ -384,10 +384,12 @@ pub enum Item {
 pub struct Module {
     pub path: Vec<String>,
     pub items: Vec<Item>,
+    /// The source file (`SourceMap` id).
+    pub file: u32,
     /// `#![safe]`: raw-pointer operations need `unsafe { }`
     /// (language.md section 1.3).
     pub safe: bool,
-    /// `#![lifetimes]` (or `#![safe]`): pointer-stability checking
-    /// (src/lifetimes.rs, docs/design/lifetimes.md).
+    /// Pointer-stability checking (src/lifetimes.rs,
+    /// docs/design/lifetimes.md): on unless `#![lifetimes(off)]`.
     pub lifetimes: bool,
 }

@@ -1,0 +1,16 @@
+// Lifetimes, on by default (no module attribute): a local registered as a
+// GC root scanner outlives its function in the heap's scanner list
+// (tests/run/std_obj.lm did this until the check became the default; it
+// went unnoticed because nothing collected after the function returned).
+import std.gc;
+import std.mem;
+fn scan(h: *gc.Heap, data: *u8) {}
+fn register(h: *gc.Heap) {
+    var keep: mem.Vec<u64> = mem.Vec.new();
+    h.add_scanner(&keep as *u8, scan);
+}
+fn main() {
+    var h = gc.Heap.new();
+    register(&h);
+}
+// error: passes the address of local `keep` to `Heap.add_scanner`, which may keep it beyond the call
