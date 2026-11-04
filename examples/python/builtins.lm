@@ -1,5 +1,6 @@
 // Builtin functions, builtin types and their methods, exceptions, and the
 // native modules (math, random, time, sys).
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

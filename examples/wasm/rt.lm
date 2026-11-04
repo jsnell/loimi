@@ -1,5 +1,6 @@
 // Module validation (everything but function bodies), linking,
 // instantiation and invocation.
+#![lifetimes]
 import std.mem;
 import std.map;
 import std.hash;

@@ -10,6 +10,7 @@
 // Output from print and io.write goes through C stdio's stdout buffer
 // (a static buffer, flushed when full); `flush` writes out what is left.
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.hash;

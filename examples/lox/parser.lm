@@ -8,6 +8,7 @@
 // declaration (captured locals live in heap cells). Expressions go through
 // std.parse's Pratt driver.
 
+#![lifetimes]
 import std.io;
 import std.mem;
 import std.parse;

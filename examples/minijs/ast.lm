@@ -6,6 +6,7 @@
 // front, so the parser can look ahead freely (arrow functions need to see
 // past a parenthesized parameter list).
 
+#![lifetimes]
 import std.mem;
 import std.text;
 import std.lex;

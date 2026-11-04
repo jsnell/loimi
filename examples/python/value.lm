@@ -1,4 +1,5 @@
 // Values and heap objects of the Python subset.
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

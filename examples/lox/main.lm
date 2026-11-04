@@ -4,6 +4,7 @@
 //
 // Exit status as clox: 65 for a compile error, 70 for a run-time error.
 
+#![lifetimes]
 import std.io;
 import std.os;
 import driver;

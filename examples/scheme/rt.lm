@@ -1,6 +1,7 @@
 // Interpreter context: the VM stacks, globals, symbols and output buffer,
 // and the GC root scanner.
 
+#![lifetimes]
 import std.gc;
 import std.io;
 import std.mem;

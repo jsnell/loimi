@@ -4,6 +4,7 @@
 // calls "malformed" (LEB128 encodings, section order and sizes, UTF-8
 // names, opcode syntax inside function bodies). Type checking is the
 // validator's job (compile.lm), which runs only on modules that decoded.
+#![lifetimes]
 import std.mem;
 import std.text;
 

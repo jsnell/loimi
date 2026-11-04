@@ -3,6 +3,7 @@
 //   loimi build examples/minijs/main.lm --release -o minijs
 //   ./minijs program.js          (a second argument turns on GC stress)
 
+#![lifetimes]
 import std.io;
 import std.os;
 import std.gc;

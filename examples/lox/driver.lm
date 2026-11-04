@@ -1,5 +1,6 @@
 // Compile and run one Lox program: parse, compile, verify, run.
 
+#![lifetimes]
 import std.io;
 import std.gc;
 import std.mem;

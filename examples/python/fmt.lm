@@ -1,4 +1,5 @@
 // str(), repr(), format specs and %-formatting.
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

@@ -1,6 +1,7 @@
 // Host modules: `spectest` (for the official test suite), a tiny `env`
 // (print_i32, print_i64, print_f64, putchar) and a minimal WASI preview 1
 // subset (enough for wasi-libc programs that print and exit).
+#![lifetimes]
 import std.io;
 import std.mem;
 import std.text;

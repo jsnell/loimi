@@ -3,6 +3,7 @@
 // `big` None and the number in `n`; a big one has `big` a std.bigint
 // `Big` (limbs and sign). `s` is the sign (1 or -1) in both. Every
 // result is normalized to the smallest of the three forms.
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

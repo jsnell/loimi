@@ -1,6 +1,7 @@
 // An indentation-sensitive tokenizer for the Python subset. It turns the
 // whole source into a token vector up front, with NEWLINE, INDENT and
 // DEDENT tokens as Python's tokenizer makes them.
+#![lifetimes]
 import std.mem;
 import std.text;
 import std.lex;

@@ -4,6 +4,7 @@
 // `:- initialization(G)` directives, or `main` if it has none and defines
 // main/0, or GOAL.
 
+#![lifetimes]
 import std.io;
 import std.os;
 import std.mem;

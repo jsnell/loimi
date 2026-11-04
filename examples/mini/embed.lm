@@ -36,6 +36,7 @@
 // abandoned an API call. A native whose nested call came back poisoned
 // re-panics when it returns, so the run it was called from stops too.
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.rt;

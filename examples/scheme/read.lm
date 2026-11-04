@@ -13,6 +13,7 @@
 // (the heap does not move objects, and nothing is collected until the
 // whole program has been compiled).
 
+#![lifetimes]
 import std.gc;
 import std.io;
 import std.os;

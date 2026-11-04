@@ -2,6 +2,7 @@
 // (Term.Int(i48)); results that overflow raise evaluation_error(int_overflow)
 // where SWI-Prolog would switch to big integers.
 
+#![lifetimes]
 import std.num;
 import term.{Term, deref};
 import term;

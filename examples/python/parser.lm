@@ -1,4 +1,5 @@
 // Recursive-descent parser for the Python subset.
+#![lifetimes]
 import std.mem;
 import std.text;
 import lexer;

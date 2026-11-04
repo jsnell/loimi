@@ -1,5 +1,6 @@
 // python-loimi: run a Python-subset program.
 //   main FILE.py [--gc-stress] [--gc-verify] [--disasm]
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

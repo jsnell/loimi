@@ -5,6 +5,7 @@
 // a compound term is a `Struct` with its arguments as a trailing array, and a
 // list cell is a `Cons`. Atoms and integers are immediate.
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

@@ -1,5 +1,6 @@
 // The Mini virtual machine: a register machine in the style of Lua 5.
 
+#![lifetimes]
 import std.gc;
 import std.text;
 import std.mem;

@@ -7,6 +7,7 @@
 // position in the source. (The verifier checks the same from the ops'
 // declared stack effects, and finds each word's maximum depth.)
 
+#![lifetimes]
 import std.bc;
 import std.diag;
 import std.gc;

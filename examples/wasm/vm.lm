@@ -9,6 +9,7 @@
 // The wasm validator has proved the types, so an op never reads a slot
 // as a type that was not written there; the vm verifier proves that
 // every slot index is inside the frame.
+#![lifetimes]
 import std.io;
 import std.mem;
 import decode;

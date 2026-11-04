@@ -5,6 +5,7 @@
 // Nothing here collects. Allocation never collects (std.gc); the VM
 // collects only at its safepoints.
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.map;

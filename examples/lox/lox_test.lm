@@ -4,6 +4,7 @@
 // these check the parts from inside, and run small programs in-process,
 // normally and with a collection at every safepoint.
 
+#![lifetimes]
 import std.mem;
 import std.test;
 import std.text;

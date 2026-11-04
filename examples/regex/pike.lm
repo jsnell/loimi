@@ -9,6 +9,7 @@
 // only once per pc per step, which gives the same leftmost-first answer
 // (and captures) as the backtracker.
 
+#![lifetimes]
 import std.mem;
 import std.map;
 import syntax.{Set};

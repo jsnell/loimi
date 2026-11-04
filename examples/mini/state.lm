@@ -1,6 +1,7 @@
 // Creating and freeing an interpreter state. Shared by the standalone
 // interpreter (main.lm) and the embedding API (embed.lm).
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.text;

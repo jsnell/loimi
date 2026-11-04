@@ -6,6 +6,7 @@
 // building nodes. Assignment, `?:` and `x => ...` are `led` hooks of the
 // driver; `(a, b) => ...` is recognized in `primary` by looking ahead.
 
+#![lifetimes]
 import std.mem;
 import std.parse;
 import ast;

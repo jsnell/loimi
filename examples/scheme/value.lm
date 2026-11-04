@@ -14,6 +14,7 @@
 // the block, tag and tests it had before (the fixnum and pair fast paths
 // do not change; `--explain-values` shows the layout).
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import std.hash;

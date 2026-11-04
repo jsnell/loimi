@@ -12,6 +12,7 @@
 // has rooted the state variables' copies in the handler's shadow-stack
 // frame, which the holder's collections walk (`std.gil`).
 
+#![lifetimes]
 import std.gc;
 import std.gil;
 import std.mem;

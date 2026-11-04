@@ -7,6 +7,7 @@
 //
 // `apply` is handled by the VM's call path, since it calls a procedure.
 
+#![lifetimes]
 import std.gc;
 import std.io;
 import std.os;

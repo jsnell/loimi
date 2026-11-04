@@ -12,6 +12,7 @@
 // backtracking restores captures. CSTAR and CPLUS push a pair: the lower
 // bound (`tag` 0), then the resume pc | 2 with the current end of the run.
 
+#![lifetimes]
 import std.mem;
 import std.text;
 import syntax.{Set};

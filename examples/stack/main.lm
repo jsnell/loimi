@@ -3,6 +3,7 @@
 //   loimi build examples/stack/main.lm --release -o stak
 //   ./stak FILE.stk [--disasm] [--disasm-after] [--gc-stress]
 
+#![lifetimes]
 import std.io;
 import std.os;
 import std.diag;

@@ -17,6 +17,7 @@
 // The compiler allocates in the heap but never collects, so the data being
 // compiled (and the line table keyed by pair addresses) stays valid.
 
+#![lifetimes]
 import std.io;
 import std.mem;
 import std.text;

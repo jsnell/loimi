@@ -21,6 +21,7 @@
 // function) is an error, as in PUC-Lua for C functions without
 // continuations.
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import value;

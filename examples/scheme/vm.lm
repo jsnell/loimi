@@ -4,6 +4,7 @@
 // starts at R[base+1], so arguments arrive in place. The result is stored
 // back into the caller's R[base]. Tail calls reuse the current frame.
 
+#![lifetimes]
 import std.gc;
 import std.io;
 import std.text;

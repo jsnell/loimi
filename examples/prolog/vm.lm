@@ -6,6 +6,7 @@
 // barrier are machine fields (they change on calls, not on every
 // instruction).
 
+#![lifetimes]
 import std.gc;
 import std.mem;
 import term.{Term, Var, Struct, Cons, deref};

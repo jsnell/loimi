@@ -2,6 +2,7 @@
 // precedence parser) over the operator table that op/3 changes and the
 // writer consults.
 
+#![lifetimes]
 import std.text;
 import std.num;
 import std.mem;

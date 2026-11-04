@@ -2,6 +2,7 @@
 // argument registers. Nondeterministic library predicates are in Prolog
 // (prelude.lm), on top of these.
 
+#![lifetimes]
 import std.mem;
 import std.text;
 import std.io;

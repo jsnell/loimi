@@ -5,6 +5,7 @@
 //   wasm --invoke F prog.wasm A..   call export F with i32/i64 args
 //   wasm --script cmds.txt      the spec test command protocol (below)
 //   wasm --disasm prog.wasm     print the translated code
+#![lifetimes]
 import std.io;
 import std.os;
 import std.mem;

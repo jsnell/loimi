@@ -6,6 +6,7 @@
 // checks, so they pop and push without underflow checks; CALL checks for
 // overflow once per call, against the callee's verified maximum depth.
 
+#![lifetimes]
 import std.io;
 import std.gc;
 import std.mem;

@@ -181,9 +181,12 @@ fn hits(r: &Path, p: &Path) -> bool {
 
 fn m(r: &[Step], p: &[Step], rt: bool, pt: bool) -> bool {
     if r.is_empty() {
-        // Both cut at the same depth: deep in some pointer chain; taken to
-        // be different blocks (the approximation of the depth bound).
-        if p.is_empty() && rt && pt {
+        // `r` cut where `p` ends (both cut, or `p` exactly at the depth
+        // bound): deep in some pointer chain, `r` stands for a block
+        // reached through steps that were cut; taken to be different
+        // blocks (the approximation of the depth bound, as for a cut `p`
+        // below).
+        if p.is_empty() && rt {
             return false;
         }
         return !p.iter().any(is_d);
@@ -1788,6 +1791,15 @@ fn analyze<'a>(
     let bound: FxSet<LocalId> = bound.into_iter().collect();
     for (l, _) in f.locals.iter().enumerate() {
         if bound.contains(&(l as LocalId)) {
+            continue;
+        }
+        // A closure's captured owning value (a `Vec`, a `StrBuf`) is the
+        // enclosing function's variable itself, not a view of someone
+        // else's buffers: like a `let` owner, it starts with no paths
+        // (reading it whole yields its current buffers), so growing it
+        // does not make it stale.
+        let lt = &f.locals[l];
+        if f.env.as_ref().is_some_and(|e| e.contains(&(l as LocalId))) && !matches!(lt.ty, Ty::Slice(_)) && kind_of(p, &lt.ty, &mut fa.kinds.by_ty, 0) == Kind::Agg {
             continue;
         }
         let v = fa.symbolic(l as LocalId);

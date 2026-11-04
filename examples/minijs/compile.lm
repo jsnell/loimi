@@ -15,6 +15,7 @@
 //
 // The compiler allocates in the GC heap but never collects.
 
+#![lifetimes]
 import std.mem;
 import std.map;
 import std.text;

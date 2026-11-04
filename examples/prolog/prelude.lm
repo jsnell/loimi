@@ -3,6 +3,7 @@
 //
 // A raw string: Prolog's backslashes (`\+`, `\==`) are written as is.
 
+#![lifetimes]
 pub const SOURCE: str = r"
 catch(G, _, _) :- '$catch_enter'(L), call(G), '$catch_exit'(L).
 catch(_, C, R) :- '$catch_ball'(C), call(R).

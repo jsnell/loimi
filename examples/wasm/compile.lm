@@ -14,6 +14,7 @@
 // assigned, and for calls. Structured control flow becomes jumps to
 // labels of std.bc; a branch that carries values moves them to the
 // target's home slots first.
+#![lifetimes]
 import std.mem;
 import std.bc;
 import std.text;

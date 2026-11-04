@@ -6,6 +6,7 @@
 //
 //   loimi build examples/regex/fuzz.lm --release -o rxfuzz && ./rxfuzz 20000 1
 
+#![lifetimes]
 import std.io;
 import std.mem;
 import std.os;

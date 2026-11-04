@@ -5,6 +5,7 @@
 // stays a word compare. These functions allocate but never collect (the
 // callers are natives and the cold paths of the arithmetic ops).
 
+#![lifetimes]
 import std.gc;
 import std.text;
 import std.bigint;

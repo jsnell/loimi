@@ -5,6 +5,7 @@
 // live above the active locals. A local that a closure captures holds a
 // cell from its declaration on, and is read and written through it.
 
+#![lifetimes]
 import std.bc;
 import std.mem;
 import std.text;
