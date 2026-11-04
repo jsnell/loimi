@@ -60,6 +60,11 @@ enum Root {
     GcLocal(LocalId),
     /// Any other GC object.
     GcAny,
+    /// Memory of unknown origin that this function obtained (`malloc`'s
+    /// result, an extern's pointer from no pointer argument): never
+    /// restructured here; a store into it is judged by whether the
+    /// function returns it.
+    Fresh,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -164,6 +169,9 @@ fn is_d(s: &Step) -> bool {
 /// into `p`: `r` is a prefix of `p` and the rest of `p` stays in the same
 /// block (no dereference). `AnyD` matches any fields and a dereference.
 fn hits(r: &Path, p: &Path) -> bool {
+    if r.root == Root::Fresh {
+        return false;
+    }
     if r.root == Root::GcAny && r.steps.is_empty() && r.trunc {
         // A collection: pointers into objects not held by a local.
         return p.root == Root::GcAny && !p.steps.is_empty();
@@ -220,6 +228,15 @@ const ELSEWHERE: u32 = u32::MAX;
 /// Memory owned by a local of the function itself (its buffers, its
 /// arena's allocations).
 const FRAME: u32 = u32::MAX - 1;
+/// The memory the function's result points to (fresh memory it returns):
+/// the caller judges where that goes.
+const RET: u32 = u32::MAX - 2;
+/// Fresh memory (`Root::Fresh`): `RET` if the function returns it, else
+/// elsewhere. Never in a summary.
+const FRESH: u32 = u32::MAX - 3;
+/// A call's result is being assigned to a place not yet known
+/// (`Fa::pending`).
+const PENDING: u32 = u32::MAX - 4;
 
 /// The flow state. Cloned at every branch and joined after it, so every
 /// part is shared (`Rc`) and copied only when a branch changes it; a join
@@ -388,6 +405,14 @@ struct Fa<'a> {
     defers: Vec<Vec<&'a TExpr>>,
     out: Summary,
     param_idx: ParamIdx,
+    /// Where the result of the call about to be evaluated goes (`FRAME`,
+    /// `RET`, `PENDING`, else `ELSEWHERE`), for what the callee keeps in
+    /// the memory its result points to.
+    sink: u32,
+    /// The call that is the body's value, if any (its result is returned).
+    tail: usize,
+    /// Kept pointers waiting for the place an assigned result goes to.
+    pending: Vec<(Path, Span, String)>,
     /// (callee, argument, what it points into) whose restructures are
     /// already in `out`.
     summed: FxSet<(FnId, u32, Path)>,
@@ -782,7 +807,7 @@ impl<'a> Fa<'a> {
                 let Some(a) = args.get(i as usize) else { return Vec::new() };
                 a.iter().map(|t| subst_one(p, pos, t)).collect()
             }
-            Root::Global(_) | Root::GcAny => vec![p.clone()],
+            Root::Global(_) | Root::GcAny | Root::Fresh => vec![p.clone()],
             _ => Vec::new(),
         }
     }
@@ -814,6 +839,7 @@ impl<'a> Fa<'a> {
                 Some(&i) if p.has_deref() => i,
                 _ => FRAME,
             },
+            Root::Fresh => FRESH,
             _ => ELSEWHERE,
         }
     }
@@ -835,9 +861,13 @@ impl<'a> Fa<'a> {
     }
 
     /// At a return: what is still stored escapes.
-    fn exit_escapes(&mut self, st: &St) {
+    fn exit_escapes(&mut self, st: &St, ret: &Val) {
+        let ret_fresh = ret.iter().any(|p| p.root == Root::Fresh);
         for (pl, q, w) in st.esc.iter().cloned().collect::<Vec<_>>() {
-            let d = self.dest(&pl);
+            let mut d = self.dest(&pl);
+            if d == FRESH {
+                d = if ret_fresh { RET } else { ELSEWHERE };
+            }
             let span = self.whys[w as usize].0;
             self.escape(&q, d, span, "stores {} in memory that outlives the function");
         }
@@ -846,6 +876,7 @@ impl<'a> Fa<'a> {
     /// Pointer `q` ends up in memory of kind `d` (a parameter's, or
     /// elsewhere).
     fn escape(&mut self, q: &Path, d: u32, span: Span, how: &str) {
+        let d = if d == FRESH || d == PENDING { ELSEWHERE } else { d };
         // `main`'s locals live as long as the program.
         if d == FRAME || self.f.symbol == "main.main" {
             return;
@@ -929,6 +960,15 @@ impl<'a> Fa<'a> {
         }
     }
 
+    /// The result of `x`, if it is a call, goes to `d`.
+    fn sink_for(&mut self, x: &TExpr, d: u32) {
+        let mut x = x;
+        while let TK::Try(a) | TK::Cast(a) = &x.kind {
+            x = a;
+        }
+        self.sink = if matches!(x.kind, TK::Call(..)) { d } else { ELSEWHERE };
+    }
+
     fn report_off<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let r = self.report;
         let out = self.out.clone();
@@ -954,6 +994,10 @@ impl<'a> Fa<'a> {
     }
 
     fn call(&mut self, e: &'a TExpr, f: &'a TExpr, args: &'a [TExpr], st: &mut St) -> Val {
+        let mut sink = std::mem::replace(&mut self.sink, ELSEWHERE);
+        if e as *const TExpr as usize == self.tail {
+            sink = RET;
+        }
         self.eval(f, st);
         let vals: Vec<Val> = args.iter().map(|a| self.eval(a, st)).collect();
         let callee = match f.kind {
@@ -1040,15 +1084,24 @@ impl<'a> Fa<'a> {
                     let Some(v) = vals.get(j as usize) else { continue };
                     // Where the callee stores it, in this function's terms.
                     let mut dests = BTreeSet::new();
+                    let mut fresh_places = Vec::new();
                     for &d in ds {
                         match vals.get(d as usize) {
                             Some(dv) if d < FRAME => {
-                                for p in dv {
-                                    dests.insert(self.dest(p));
+                                for p in dv.iter() {
+                                    match self.dest(p) {
+                                        FRESH => fresh_places.push(p.clone()),
+                                        x => {
+                                            dests.insert(x);
+                                        }
+                                    }
                                 }
                                 if dv.is_empty() {
                                     dests.insert(ELSEWHERE);
                                 }
+                            }
+                            _ if d == RET => {
+                                dests.insert(sink);
                             }
                             _ => {
                                 dests.insert(ELSEWHERE);
@@ -1056,9 +1109,21 @@ impl<'a> Fa<'a> {
                         }
                     }
                     let how = format!("passes {{}} to {}, which may keep it beyond the call", name());
+                    let span = args[j as usize].span;
                     for q in v.clone() {
+                        if self.storage_local(&q).is_none() && self.param_pointee(&q).is_none() {
+                            continue;
+                        }
                         for &d in &dests {
-                            self.escape(&q, d, args[j as usize].span, &how);
+                            if d == PENDING {
+                                self.pending.push((q.clone(), span, how.clone()));
+                            } else {
+                                self.escape(&q, d, span, &how);
+                            }
+                        }
+                        for pl in &fresh_places {
+                            let w = self.why(span, Why::Text(String::new()));
+                            Rc::make_mut(&mut st.esc).insert((pl.clone(), q.clone(), w));
                         }
                     }
                 }
@@ -1083,16 +1148,23 @@ impl<'a> Fa<'a> {
                 }
                 if fd.name != "realloc" && self.kind(&e.ty) != Kind::None {
                     for (a, v) in args.iter().zip(&vals) {
-                        if self.kind(&a.ty) == Kind::Ptr {
+                        if self.kind(&a.ty) == Kind::Ptr && may_point_into(self.p, &e.ty, &a.ty) {
                             res.extend(v.iter().cloned());
                         }
                     }
                 }
+                if res.is_empty() && self.kind(&e.ty) == Kind::Ptr {
+                    res.insert(Path::new(Root::Fresh));
+                }
             }
             None => {
+                // A function value: its result may point into what its
+                // arguments point into, where the types allow it.
                 if self.kind(&e.ty) != Kind::None {
-                    for v in &vals {
-                        res.extend(v.iter().cloned());
+                    for (a, v) in args.iter().zip(&vals) {
+                        if may_point_into(self.p, &e.ty, &a.ty) {
+                            res.extend(v.iter().cloned());
+                        }
                     }
                 }
             }
@@ -1114,6 +1186,7 @@ impl<'a> Fa<'a> {
             }
             match s {
                 TStmt::Let(l, Some(x)) => {
+                    self.sink_for(x, FRAME);
                     let v = self.eval(x, st);
                     self.assign_local(*l, v, st);
                     self.note_copy(*l, x, st);
@@ -1130,6 +1203,8 @@ impl<'a> Fa<'a> {
                     self.bind_pat(pat, &v, st);
                 }
                 TStmt::Expr(x) => {
+                    // A result dropped: nothing can reach it.
+                    self.sink_for(x, FRAME);
                     self.eval(x, st);
                 }
                 TStmt::Defer(x) => {
@@ -1345,23 +1420,29 @@ impl<'a> Fa<'a> {
             }
             TK::Return(v) => {
                 if let Some(x) = v {
+                    self.sink_for(x, RET);
                     let val = self.eval(x, st);
                     self.ret(&val, x.span);
+                    self.exit_escapes(st, &val);
+                } else {
+                    self.exit_escapes(st, &Val::new());
                 }
-                self.exit_escapes(st);
                 st.reach = false;
                 Val::new()
             }
             TK::Assign(l, r) => {
+                let to_local = matches!(l.kind, TK::Local(_));
+                self.sink_for(r, if to_local { FRAME } else { PENDING });
                 let v = self.eval(r, st);
                 if let TK::Local(x) = l.kind {
                     self.assign_local(x, v, st);
                     self.note_copy(x, r, st);
                     return Val::new();
                 }
+                let pending = std::mem::take(&mut self.pending);
                 match self.place(l, st, false) {
                     Ok(ps) => {
-                        let local = ps.iter().all(|p| matches!(p.root, Root::Local(_)) && !p.has_deref());
+                        let local = !ps.is_empty() && ps.iter().all(|p| matches!(p.root, Root::Local(_)) && !p.has_deref());
                         if local {
                             // A part of a local aggregate.
                             for p in &ps {
@@ -1376,8 +1457,24 @@ impl<'a> Fa<'a> {
                             }
                         } else {
                             // The old value at the place is overwritten.
-                            retain_set(&mut st.esc, |(pl, _, _)| !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
+                            // (Fresh blocks share a root: never taken as overwritten.)
+                            retain_set(&mut st.esc, |(pl, _, _)| pl.root == Root::Fresh || !ps.iter().any(|p| p.root == pl.root && pl.steps.starts_with(&p.steps)));
                             self.store(&v, &ps, r.span, st);
+                        }
+                        // What the call's result keeps goes where the result goes.
+                        for (q, span, how) in pending {
+                            if ps.is_empty() {
+                                self.escape(&q, ELSEWHERE, span, &how);
+                            }
+                            for pl in &ps {
+                                match self.dest(pl) {
+                                    FRESH | ELSEWHERE => {
+                                        let w = self.why(span, Why::Text(String::new()));
+                                        Rc::make_mut(&mut st.esc).insert((pl.clone(), q.clone(), w));
+                                    }
+                                    d => self.escape(&q, d, span, &how),
+                                }
+                            }
                         }
                         // The old value at the place is gone: what pointed
                         // into its buffers points into a detached block.
@@ -1445,7 +1542,7 @@ impl<'a> Fa<'a> {
                         }
                     }
                 }
-                Root::Global(_) => {
+                Root::Global(_) | Root::Fresh => {
                     self.out.ret.insert(p.clone());
                 }
                 _ => {}
@@ -1497,6 +1594,90 @@ impl<'a> Fa<'a> {
             }
             _ => Val::new(),
         }
+    }
+}
+
+/// The address of the call whose result is `b`'s value, if any.
+fn tail_call(b: &TExpr) -> usize {
+    let mut x = b;
+    loop {
+        match &x.kind {
+            TK::Block(_, Some(t)) => x = t,
+            TK::Try(a) | TK::Cast(a) => x = a,
+            TK::Call(..) => return x as *const TExpr as usize,
+            _ => return 0,
+        }
+    }
+}
+
+/// Whether a result of type `res` may point into the block that an
+/// argument of type `arg` points to, for a callee whose body is unknown
+/// (a function value, an extern): a `*R` or `[]R` points at `R` values, so
+/// only if some `R` of the result can be stored inline in the argument's
+/// pointee (`*Parser` cannot hold the `*Node` a parse hook returns, nor
+/// its `str` error). Byte pointers (`*u8`) and arguments that are not a
+/// plain pointer are taken to allow anything.
+fn may_point_into(p: &Program, res: &Ty, arg: &Ty) -> bool {
+    let t = match arg {
+        Ty::Ptr(t) => &**t,
+        Ty::Option(o) => match &**o {
+            Ty::Ptr(t) => &**t,
+            _ => return true,
+        },
+        _ => return true,
+    };
+    if opaque(t) {
+        return true;
+    }
+    let mut rs = Vec::new();
+    if !pointees(p, res, &mut rs, 0) {
+        return true;
+    }
+    rs.iter().any(|r| opaque(r) && !matches!(r, Ty::Int(_)) || inline_in(p, t, r, 0))
+}
+
+/// A type whose memory may hold anything (raw bytes, an unknown type).
+fn opaque(t: &Ty) -> bool {
+    matches!(t, Ty::Int(i) if i.bits == 8) || matches!(t, Ty::Unit | Ty::Param(_) | Ty::Opaque(_))
+}
+
+/// The types that the pointers and slices held by a value of type `t`
+/// point at (false: unknown, a closure's environment).
+fn pointees(p: &Program, t: &Ty, out: &mut Vec<Ty>, depth: u32) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match t {
+        Ty::Ptr(r) | Ty::Slice(r) => {
+            out.push((**r).clone());
+            true
+        }
+        Ty::Option(x) | Ty::Array(x, _) => pointees(p, x, out, depth + 1),
+        Ty::Result(a, b) => pointees(p, a, out, depth + 1) && pointees(p, b, out, depth + 1),
+        Ty::Tuple(ts) => ts.iter().all(|x| pointees(p, x, out, depth + 1)),
+        Ty::Struct(s) if p.structs[*s as usize].object.is_none() => p.structs[*s as usize].fields.iter().all(|(_, x)| pointees(p, x, out, depth + 1)),
+        Ty::Enum(e) => p.enums[*e as usize].variants.iter().all(|v| v.fields.iter().all(|x| pointees(p, x, out, depth + 1))),
+        Ty::Closure(..) | Ty::Block(..) | Ty::Param(_) | Ty::Opaque(_) => false,
+        _ => true,
+    }
+}
+
+/// Whether a value of type `r` may be stored inline (not behind a
+/// pointer) in a value of type `t`.
+fn inline_in(p: &Program, t: &Ty, r: &Ty, depth: u32) -> bool {
+    if t == r || opaque(t) {
+        return true;
+    }
+    if depth > 8 {
+        return true;
+    }
+    match t {
+        Ty::Array(x, _) | Ty::Option(x) => inline_in(p, x, r, depth + 1),
+        Ty::Result(a, b) => inline_in(p, a, r, depth + 1) || inline_in(p, b, r, depth + 1),
+        Ty::Tuple(ts) => ts.iter().any(|x| inline_in(p, x, r, depth + 1)),
+        Ty::Struct(s) => p.structs[*s as usize].fields.iter().any(|(_, x)| inline_in(p, x, r, depth + 1)),
+        Ty::Enum(e) => p.enums[*e as usize].variants.iter().any(|v| v.fields.iter().any(|x| inline_in(p, x, r, depth + 1))),
+        _ => false,
     }
 }
 
@@ -1593,6 +1774,9 @@ fn analyze<'a>(
         out: Summary::default(),
         summed: FxSet::default(),
         param_idx: ParamIdx::new(f),
+        sink: ELSEWHERE,
+        tail: tail_call(b),
+        pending: Vec::new(),
     };
     let _ = fa.fid;
     let mut st = St { reach: true, ..Default::default() };
@@ -1614,7 +1798,7 @@ fn analyze<'a>(
     let v = fa.eval(b, &mut st);
     if st.reach {
         fa.ret(&v, b.span);
-        fa.exit_escapes(&st);
+        fa.exit_escapes(&st, &v);
     }
     (fa.out, fa.errs, fa.lines)
 }
@@ -1733,10 +1917,12 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         }
         if let Ok(fname) = std::env::var("LOIMI_LT_DUMP") {
             for (f, s) in &sums {
-                if p.fns[*f as usize].symbol == fname {
+                if p.fns[*f as usize].symbol.starts_with(&fname) {
+                    eprint!("{} ", p.fns[*f as usize].symbol);
                     for r in &s.restructs {
-                        eprintln!("R {:?} {:?} {}", r.root, &*r.steps, r.trunc);
+                        if std::env::var("LOIMI_LT_R").is_ok() { eprintln!("R {:?} {:?} {}", r.root, &*r.steps, r.trunc); }
                     }
+                    eprintln!("K {:?} ret {:?} pairs {:?}", s.keeps, s.ret, s.pairs);
                 }
             }
         }

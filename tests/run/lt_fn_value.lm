@@ -1,0 +1,48 @@
+// Lifetimes (docs/design/lifetimes.md section 5.1): the result of a call
+// through a function value points into what its arguments point into
+// only where the types allow it. A parse hook given the parser returns a
+// node, which cannot be stored inside a parser, so storing the node does
+// not keep the parser: the parser may be a local of a function that is
+// not `main` (MiniJS's `compile` and its Pratt hooks).
+// tests/fail/lt_fn_value_kept.lm: a hook whose result may point into
+// the parser.
+#![lifetimes]
+import std.io;
+import std.mem;
+
+struct Node { v: u64, kid: ?*Node }
+struct Parser { hook: fn(*Parser) -> *Node, n: u64 }
+
+fn node(v: u64) -> *Node {
+    let n: *Node = mem.alloc(1);
+    n.v = v;
+    n.kid = None;
+    n
+}
+
+fn leaf(p: *Parser) -> *Node {
+    p.n += 1;
+    node(p.n)
+}
+
+fn Parser.parent(p: *Parser) -> *Node {
+    let h = p.hook;
+    let n = node(10);
+    n.kid = Some(h(p));
+    n
+}
+
+fn parse() -> u64 {
+    var p = Parser { hook: leaf, n: 0 };
+    let t = p.parent();
+    let r = t.v + match t.kid { Some(k) => k.v, None => 0 };
+    if let Some(k) = t.kid { mem.release(k); }
+    mem.release(t);
+    r
+}
+
+fn main() {
+    io.print_int(parse() as i64);
+    io.print("\n");
+}
+// expect: 11

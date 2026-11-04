@@ -1,0 +1,30 @@
+// Lifetimes: a hook called through a function value may return a
+// pointer into the parser it is given when the types allow it (here a
+// `*u64` into its counter): storing that result in memory that outlives
+// the call keeps the parser, so it must not be a local of the caller.
+// tests/run/lt_fn_value.lm: a hook returning a node.
+#![lifetimes]
+import std.mem;
+
+struct Parser { hook: fn(*Parser) -> *u64, n: u64 }
+struct Holder { p: *u64 }
+
+fn count(p: *Parser) -> *u64 { &p.n }
+
+fn Parser.keep(p: *Parser, h: *Holder) {
+    let f = p.hook;
+    let c: *Holder = mem.alloc(1);
+    c.p = f(p);
+    h.p = c.p;
+}
+
+fn parse(h: *Holder) {
+    var p = Parser { hook: count, n: 0 };
+    p.keep(h);
+}
+
+fn main() {
+    var h = Holder { p: 0 as *u64 };
+    parse(&h);
+}
+// error: passes the address of local `p` to `Parser.keep`, which may keep it beyond the call

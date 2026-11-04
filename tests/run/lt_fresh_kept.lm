@@ -1,0 +1,36 @@
+// Lifetimes (docs/design/lifetimes.md section 5.4): a constructor that
+// stores its argument in memory it allocates and returns keeps the
+// argument in *its result*, so where that goes decides: into a local of
+// the caller (here a field of a local struct, as Lox's driver does with
+// `gc.WeakInterner.new(&m.heap, ..)`) the local's address stays in the
+// frame. tests/fail/lt_fresh_kept.lm: the result stored in a global.
+#![lifetimes]
+import std.io;
+import std.mem;
+
+struct Counter { n: u64 }
+struct Table { owner: *Counter, size: u64 }
+struct Machine { c: Counter, t: *Table }
+
+fn Table.new(c: *Counter) -> *Table {
+    let t: *Table = mem.alloc(1);
+    *t = Table { owner: c, size: 4 };
+    t
+}
+
+fn Table.free(t: *Table) { mem.release(t); }
+
+fn run() -> u64 {
+    var m = Machine { c: Counter { n: 1 }, t: 0 as *Table };
+    m.t = Table.new(&m.c);
+    m.t.owner.n += m.t.size;
+    let r = m.c.n;
+    m.t.free();
+    r
+}
+
+fn main() {
+    io.print_int(run() as i64);
+    io.print("\n");
+}
+// expect: 5
