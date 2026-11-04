@@ -50,6 +50,12 @@ fn zero_slow(c: *Ctx, a: V) -> Result<V, V> {
 
 fn eqv_slow(a: V, b: V) -> V { value.boolean(value.eqv(a, b)) }
 
+/// A record access of field constant `f`, (rtd . i), on `x` that failed.
+fn record_fail(c: *Ctx, f: V, x: V) -> V {
+    let P(d) = f else { return rt.err_msg(c, "record: internal error"); };
+    builtins.record_err(c, d.car, x)
+}
+
 /// Source line of the instruction at `at` in `p` (0: unknown, e.g. prelude code).
 fn line_at(p: Gc<Proto>, at: *u32) -> u32 {
     let i = ((at as u64) - (p.code.start() as u64)) / 4;
@@ -393,7 +399,7 @@ pub vm Scheme {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let cnt = n as u64;
         let src = regs + base as u64;
-        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, V.Imm(value.IMM_NIL), src, cnt)); next } }
+        if cnt > 8 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, V.Imm(value.IMM_NIL), src, cnt)); next } }
         let Some(v) = try_vect(V.Imm(value.IMM_NIL), cnt) else cold {
             gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
             redo
@@ -408,7 +414,7 @@ pub vm Scheme {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let cnt = n as u64;
         let src = regs + base as u64;
-        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, src[0], src + 1, cnt)); next } }
+        if cnt > 8 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, src[0], src + 1, cnt)); next } }
         let Some(v) = try_vect(src[0], cnt) else cold {
             gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
             redo
@@ -417,7 +423,7 @@ pub vm Scheme {
         dst = Vec(v);
         next
     }
-    /// A closure or vector of 1 to 4 slots without the allocator's refill
+    /// A closure of 1 to 4 slots or a vector of 1 to 8 without the allocator's refill
     /// (constant lengths: the zeroing is inline, not a memset call).
     fn try_closure(p: Gc<Proto>, n: u64) -> ?Gc<Closure> {
         if n <= 2 {
@@ -429,10 +435,16 @@ pub vm Scheme {
         }
     }
     fn try_vect(rtd: V, n: u64) -> ?Gc<Vect> {
-        if n <= 2 {
-            if n == 1 { try_new(&ctx.heap, Vect { rtd: rtd }, 1) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 2) }
+        if n <= 4 {
+            if n <= 2 {
+                if n == 1 { try_new(&ctx.heap, Vect { rtd: rtd }, 1) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 2) }
+            } else {
+                if n == 3 { try_new(&ctx.heap, Vect { rtd: rtd }, 3) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 4) }
+            }
+        } else if n <= 6 {
+            if n == 5 { try_new(&ctx.heap, Vect { rtd: rtd }, 5) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 6) }
         } else {
-            if n == 3 { try_new(&ctx.heap, Vect { rtd: rtd }, 3) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 4) }
+            if n == 7 { try_new(&ctx.heap, Vect { rtd: rtd }, 7) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 8) }
         }
     }
     /// (memq x l): a loop in the handler instead of a native call.
@@ -495,6 +507,27 @@ pub vm Scheme {
             next
         }
         cold { raise index_err(ctx, "vector-set!", v, i) }
+    }
+
+    /// Records (define-record-type): `f` is the constant (rtd . i) of
+    /// field i of record type rtd, `t` the rtd.
+    op RREF(dst: reg, x: reg, f: kst) : ABC {
+        if let Vec(r) = x and let P(d) = f and r.rtd == d.car and let Int(i) = d.cdr and (i as u64) < r.data.len {
+            dst = r.data.ptr[i as u64];
+            next
+        }
+        cold { raise record_fail(ctx, f, x) }
+    }
+    op RSET(x: reg, f: kst, src: reg) : ABC {
+        if let Vec(r) = x and let P(d) = f and r.rtd == d.car and let Int(i) = d.cdr and (i as u64) < r.data.len {
+            r.data.ptr[i as u64] = src;
+            next
+        }
+        cold { raise record_fail(ctx, f, x) }
+    }
+    op RECP(dst: reg, x: reg, t: kst) : ABC {
+        dst = value.boolean(match x { Vec(r) => r.rtd == t, _ => false });
+        next
     }
 
     /// Everything but a call of a closure with exactly its number of
@@ -645,6 +678,56 @@ pub vm Scheme {
         fp.k = k;
         regs = callee;
         jump p.code
+    }
+
+    /// R[base] = the known top-level procedure k[f] (R[base+1] ..
+    /// R[base+nargs]): its closure is a constant, which the compiler emits
+    /// only where the procedure's definition has run, with its number of
+    /// parameters (a rest list made by the caller). R[base] is not read.
+    op CALLK(base: callbase, nargs: imm, f: kst) : ABC {
+        if let Clo(cl) = f {
+            let p = cl.proto;
+            let callee = regs + base + 1;
+            let n = p.nregs as u64;
+            if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+                cold {
+                    if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                        raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
+                    }
+                    redo
+                }
+            }
+            fp.resume = pc + 1;
+            fp = fp + 1;
+            fp.cl = cl;
+            fp.base = callee;
+            k = p.consts.data.ptr;
+            fp.k = k;
+            regs = callee;
+            jump p.code
+        }
+        cold { raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure") }
+    }
+    /// return k[f](R[base+1] .. R[base+nargs]) (as CALLK), reusing this frame.
+    op TAILCALLK(base: callbase, nargs: imm, f: kst) : ABC {
+        if let Clo(cl) = f {
+            let p = cl.proto;
+            let n = p.nregs as u64;
+            if regs + n >= ctx.hwm {
+                cold {
+                    if !rt.grow(ctx, regs + n) { raise rt.err_msg(ctx, "stack overflow") }
+                    redo
+                }
+            }
+            let args = regs + base + 1;
+            let na = nargs as u64;
+            for i in 0..na { regs[i] = args[i]; }
+            fp.cl = cl;
+            k = p.consts.data.ptr;
+            fp.k = k;
+            jump p.code
+        }
+        cold { raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure") }
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).

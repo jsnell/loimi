@@ -33,7 +33,7 @@ time (startup and compilation included; chibi's startup is about 0.3 s),
 or with --inner of the "Elapsed time" the benchmark itself reports. The
 ratio columns are the first of our columns over each reference.
 """
-import argparse, math, os, re, subprocess, sys, time
+import argparse, math, os, re, resource, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -251,19 +251,24 @@ def normalize(out):
 ELAPSED = re.compile(rb"^Elapsed time: ([0-9.eE+-]+) seconds", re.M)
 
 
-def run(cmd, stdin, runs, env=None, timeout=None, inner=False):
+def run(cmd, stdin, runs, env=None, timeout=None, inner=False, cpu=False):
     """(best time or None, normalized output, error text). The time is the
-    process's wall-clock time, or with `inner` the benchmark's own
-    "Elapsed time" (which excludes startup and compilation)."""
+    process's wall-clock time, with `cpu` its user+system CPU time, or
+    with `inner` the benchmark's own "Elapsed time" (which excludes
+    startup and compilation)."""
     best, out = None, None
     for _ in range(runs):
         t = time.perf_counter()
+        r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         try:
             p = subprocess.run(cmd, input=stdin.encode(), capture_output=True, cwd=SUITE,
                                env=env, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None, "", "timeout"
         dt = time.perf_counter() - t
+        if cpu:
+            r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            dt = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
         if inner:
             m = ELAPSED.search(p.stdout)
             dt = float(m.group(1)) if m else dt
@@ -289,6 +294,8 @@ def main():
     ap.add_argument("--count", type=int, help="override the iteration count (for quick checks)")
     ap.add_argument("--inner", action="store_true",
                     help="report the benchmarks' own elapsed time instead of process wall time")
+    ap.add_argument("--cpu", action="store_true",
+                    help="time the process's user+system CPU instead of wall-clock time")
     ap.add_argument("--align", type=int,
                     help="build ours with --align-functions=N (steadier A/B comparisons)")
     ap.add_argument("--exe", nargs="*", default=[],
@@ -338,7 +345,7 @@ def main():
             for k, i in enumerate(impls):
                 if failed[k]:
                     continue
-                t, o, e = run(i.cmd(progs[k]), stdin, 1, i.env, a.timeout, a.inner)
+                t, o, e = run(i.cmd(progs[k]), stdin, 1, i.env, a.timeout, a.inner, a.cpu)
                 outs[k], errs[k] = o, e
                 if t is None:
                     failed[k], times[k] = True, None

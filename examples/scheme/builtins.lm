@@ -71,7 +71,7 @@ fn stdin_text(c: *Ctx) -> str {
     s
 }
 
-fn record_err(c: *Ctx, rtd: V, v: V) -> V {
+pub fn record_err(c: *Ctx, rtd: V, v: V) -> V {
     c.tmp.clear();
     c.tmp.push_str("record accessor: expected a record of type ");
     if let P(t) = rtd { value.print(&c.tmp, t.car, false); }
@@ -96,6 +96,9 @@ fn read_stdin(c: *Ctx) -> V {
 pub const NPRIMS: i32 = 149;
 pub const P_APPLY: i32 = 55;
 pub const P_CALLCC: i32 = 132;
+pub const P_RECORDP: i32 = 144;
+pub const P_RECORD_REF: i32 = 145;
+pub const P_RECORD_SET: i32 = 146;
 
 /// (name, minimum arguments, maximum arguments or -1).
 #[inline]

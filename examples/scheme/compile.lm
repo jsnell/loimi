@@ -25,7 +25,7 @@ import std.map;
 import std.hash;
 import std.bc;
 import value;
-import value.{V, Sym, Str, Arr, Proto, Lines, Protos, Descs};
+import value.{V, Sym, Str, Arr, Proto, Closure, Lines, Protos, Descs};
 import rt.{Ctx};
 import read;
 import read.{fail, Reader};
@@ -38,7 +38,7 @@ enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Le
 
 /// Ops for builtins compiled inline.
 enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
-    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq }
+    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq, RRef, RSet, RecP }
 
 struct Var {
     name: Gc<Sym>,
@@ -93,6 +93,9 @@ struct Node {
     lam: *Lam,
     list: mem.Vec<*Node>,
     vars: mem.Vec<*Var>,
+    /// A Call of a known top-level procedure whose definition has run
+    /// whenever the call does (no guard needed): CALLK.
+    direct: bool,
 }
 
 fn null_node() -> *Node { 0 as *Node }
@@ -118,6 +121,8 @@ struct Comp {
     /// a procedure definition; and the globals that are set!.
     gdefs: map.HashMap<u64, u32>,
     glams: map.HashMap<u64, *Lam>,
+    /// The globals whose (one) definition is a lambda, not an alias.
+    gprocs: map.HashMap<u64, bool>,
     gsets: map.HashMap<u64, bool>,
     /// The top-level form that defines each global, the form being
     /// inlined into, and the first form that may run program code.
@@ -127,7 +132,14 @@ struct Comp {
     galias: map.HashMap<u64, i32>,
     cur_form: u64,
     first_impure: u64,
+    /// The known top-level procedure whose body is being inlined into
+    /// (NO_PROC in other code), and per known procedure the first form
+    /// that may run its body (absent: none can; see `reachability`).
+    cur_proc: u64,
+    reach: map.HashMap<u64, u64>,
 }
+
+const NO_PROC: u64 = 0xFFFFFFFFFFFFFFFF;
 
 fn Comp.node(c: *Comp, kind: K) -> *Node {
     let n: *Node = mem.alloc(1);
@@ -399,6 +411,21 @@ fn Comp.inline_call(c: *Comp, name: str, args: V, argc: i64) -> ?*Node {
     }
     if name.eq("vector") and argc <= 64 { return Some(c.prim(PO.Vector, c.args(args))); }
     if name.eq("%record") and argc >= 1 and argc <= 64 { return Some(c.prim(PO.Record, c.args(args))); }
+    // Record accessors, modifiers and predicates (record_defs): the
+    // constant is the op's operand.
+    if (name.eq("%record-ref") and argc == 2) or (name.eq("%record-set!") and argc == 3) or (name.eq("%record?") and argc == 2) {
+        var l = c.args(args);
+        let f = l.at(0);
+        if f.kind == K.Const {
+            var rest: mem.Vec<*Node> = mem.Vec.new();
+            for i in 1..l.len { rest.push(l.at(i)); }
+            l.free();
+            let n = c.prim(if name.eq("%record-ref") { PO.RRef } else if name.eq("%record?") { PO.RecP } else { PO.RSet }, rest);
+            n.v = f.v;
+            return Some(n);
+        }
+        l.free();
+    }
     let Some((po, want)) = inline_prim(name) else { return None; };
     if argc == want { return Some(c.prim(po, c.args(args))); }
     // Left-fold + and * over more operands; (- x) is (- 0 x).
@@ -571,9 +598,10 @@ fn Comp.list(c: *Comp, items: []V) -> V {
 /// (define-record-type T (ctor field ...) pred (field acc [modifier]) ...)
 /// → (begin (define T '(T))
 ///          (define (ctor a ...) (%record T <field value or #f> ...))
-///          (define (pred x) (%record? T x))
-///          (define (acc x) (%record-ref T x i))
-///          (define (modifier x v) (%record-set! T x i v)) ...)
+///          (define (pred x) (%record? 'rtd x))
+///          (define (acc x) (%record-ref '(rtd . i) x))
+///          (define (modifier x v) (%record-set! '(rtd . i) x v)) ...)
+/// where rtd is T's value, the list (T).
 /// A record is a Vect whose rtd is T, so vector? is false for it.
 fn Comp.record_defs(c: *Comp, x: V) -> V {
     let rest = cdr(c, x);
@@ -587,7 +615,10 @@ fn Comp.record_defs(c: *Comp, x: V) -> V {
     let quote = c.sym("quote");
     var defs: mem.Vec<V> = mem.Vec.new();
     defs.push(c.sym("begin"));
-    let tq = c.list([quote, value.cons(c.heap, tname, value.nil())][0..2]);
+    // The record type's value: accessors and the predicate name it as a
+    // constant, (quote rtd), and accessors as (quote (rtd . i)).
+    let rtd = value.cons(c.heap, tname, value.nil());
+    let tq = c.list([quote, rtd][0..2]);
     defs.push(c.list([define, tname, tq][0..3]));
     // Field names, in order.
     var fields: mem.Vec<V> = mem.Vec.new();
@@ -626,7 +657,7 @@ fn Comp.record_defs(c: *Comp, x: V) -> V {
     let xs = V.Sym(c.gensym("record"));
     let vs = V.Sym(c.gensym("value"));
     if let Sym(_) = pred {
-        let body = c.list([c.sym("%record?"), tname, xs][0..3]);
+        let body = c.list([c.sym("%record?"), tq, xs][0..3]);
         defs.push(c.list([define, c.list([pred, xs][0..2]), body][0..3]));
     }
     cur = specs;
@@ -635,12 +666,14 @@ fn Comp.record_defs(c: *Comp, x: V) -> V {
         if let P(q) = p.car {
             var r = q.cdr;
             if let P(acc) = r {
-                let body = c.list([c.sym("%record-ref"), tname, xs, V.Int(i)][0..4]);
+                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i))][0..2]);
+                let body = c.list([c.sym("%record-ref"), fq, xs][0..3]);
                 defs.push(c.list([define, c.list([acc.car, xs][0..2]), body][0..3]));
                 r = acc.cdr;
             }
             if let P(md) = r {
-                let body = c.list([c.sym("%record-set!"), tname, xs, V.Int(i), vs][0..5]);
+                let fq = c.list([quote, value.cons(c.heap, rtd, V.Int(i))][0..2]);
+                let body = c.list([c.sym("%record-set!"), fq, xs, vs][0..4]);
                 defs.push(c.list([define, c.list([md.car, xs, vs][0..3]), body][0..3]));
             }
         }
@@ -1110,7 +1143,10 @@ fn Comp.top(c: *Comp, x: V, out: *mem.Vec<*Node>) {
         n.a = c.def_value(s, x, val, is_proc);
         let k = n.g as u64;
         c.gdefs.insert(k, (c.gdefs.get(k) ?? 0) + 1);
-        if n.a.kind == K.Lambda { c.glams.insert(k, n.a.lam); }
+        if n.a.kind == K.Lambda {
+            c.glams.insert(k, n.a.lam);
+            c.gprocs.insert(k, true);
+        }
         out.push(n);
     } else {
         out.push(c.build(x));
@@ -1303,9 +1339,58 @@ fn Comp.known(c: *Comp, f: *Node) -> ?(*Lam, u64, *Var) {
 /// before g's definition? Not if the definition is in an earlier form, or
 /// if no form before it runs program code (they only define procedures
 /// and constants, so nothing can call anything until g is bound).
+///
+/// In the body of a known procedure P, also not if no form before g's
+/// can run P (P's first form in `reach` comes after g's definition).
 fn Comp.needs_guard(c: *Comp, g: u64) -> bool {
     let Some(f) = c.gform.get(g) else { return true; };
-    !(f < c.cur_form or f < c.first_impure)
+    if f < c.cur_form or f < c.first_impure { return false; }
+    if c.cur_proc != NO_PROC and f < (c.reach.get(c.cur_proc) ?? NO_PROC) { return false; }
+    true
+}
+
+/// Is global `g` a known procedure (defined once, by a lambda, never set!)?
+fn Comp.known_global(c: *Comp, g: u64) -> ?*Lam {
+    if (c.gdefs.get(g) ?? 0) != 1 or c.gsets.contains(g) { return None; }
+    c.glams.get(g)
+}
+
+/// Is global `g` a known procedure defined by a lambda (not an alias)?
+fn Comp.known_proc(c: *Comp, g: u64) -> bool {
+    c.known_global(g).is_some() and c.gprocs.contains(g)
+}
+
+/// The globals referenced anywhere in `n` (lambda bodies included).
+fn grefs(n: *Node, out: *mem.Vec<u64>) {
+    if is_null(n) { return; }
+    if n.kind == K.GRef { out.push(n.g as u64); }
+    if n.kind == K.Lambda { grefs(n.lam.body, out); return; }
+    grefs(n.a, out);
+    grefs(n.b, out);
+    grefs(n.c, out);
+    for i in 0..n.list.len { grefs(n.list.at(i), out); }
+}
+
+/// For each known procedure, the first top-level form that may run its
+/// body: a procedure's body runs only once something calls it, and a call
+/// needs a reference to it (by name, or a value that came from one).
+/// Every form but a procedure definition runs at once, and so may run
+/// whatever it references (or stores for later), and what those bodies
+/// reference in turn. (Builtins never call procedures but through `apply`
+/// and call/cc, whose arguments are such values.)
+fn Comp.reachability(c: *Comp, nodes: *mem.Vec<*Node>) {
+    var work: mem.Vec<u64> = mem.Vec.new();
+    for i in 0..nodes.len {
+        let n = nodes.at(i);
+        if n.kind == K.GDef and n.a.kind == K.Lambda { continue; }
+        grefs(n, &work);
+        while let Some(g) = work.pop() {
+            if c.reach.contains(g) { continue; }
+            c.reach.insert(g, i);
+            if let Some(l) = c.known_global(g) { grefs(l.body, &work); }
+        }
+    }
+    work.free();
 }
 
 /// Is `n` a reference to a known top-level procedure that is certainly
@@ -1344,6 +1429,16 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     n.c = c.inl(n.c, depth);
     for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
     if n.kind != K.Call { return n; }
+    // (map f l) and (for-each f l) of the prelude's procedures, whose rest
+    // parameter makes every call take the slow path: their one-list cases.
+    if n.a.kind == K.GRef and n.list.len == 2 and c.known_global(n.a.g as u64).is_some() {
+        let name = c.ctx.gsyms.at(n.a.g as u64).name;
+        let one = if name.eq("map") { "%map1" } else if name.eq("for-each") { "%for-each1" } else { "" };
+        if one.len > 0 {
+            let g1 = c.ctx.global(c.ctx.syms.intern(c.heap, one)) as u64;
+            if c.known_global(g1).is_some() { n.a.g = g1 as u32; }
+        }
+    }
     if n.a.kind == K.GRef and let Some(id) = c.galias.get(n.a.g as u64) {
         let g = n.a.g;
         n.a = c.konst(value.prim(id));
@@ -1369,7 +1464,10 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
         }
     }
     let Some((l, g, self_v)) = c.known(n.a) else { return n; };
-    if n.a.kind == K.GRef { n.lam = l; }
+    if n.a.kind == K.GRef {
+        n.lam = l;
+        n.direct = !c.needs_guard(g);
+    }
     if depth >= INLINE_DEPTH { return n; }
     if l.rest or l.nparams as u64 != n.list.len { return n; }
     var limit = INLINE_SIZE;
@@ -1622,7 +1720,28 @@ struct FS {
     fcache: mem.Vec<u32>,
 }
 
-struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
+struct Gen {
+    ctx: *Ctx,
+    heap: *gc.Heap,
+    fs: *FS,
+    comp: *Comp,
+    /// The closures of known top-level procedures without free variables,
+    /// made by the compiler (constants of CALLK and of their definitions),
+    /// and how many were made for a call before their definition was
+    /// compiled (their proto is a placeholder until then).
+    kclos: map.HashMap<u64, Gc<Closure> >,
+    kpending: u64,
+}
+
+/// The constant closure of known procedure `g` (see Gen.kclos).
+fn Gen.known_closure(g: *Gen, gl: u64) -> Gc<Closure> {
+    if let Some(cl) = g.kclos.get(gl) { return cl; }
+    let Some(cp) = g.ctx.cont_proto else { fail(0, "internal error: no placeholder proto") };
+    let cl = value.new_closure(g.heap, cp);
+    g.kclos.insert(gl, cl);
+    g.kpending += 1;
+    cl
+}
 
 fn FS.new(l: *Lam) -> FS {
     FS {
@@ -1834,8 +1953,27 @@ fn Gen.effect(g: *Gen, n: *Node) {
             g.emit(Scheme.SETGLOBAL(r as u8, n.g as u16));
         }
         GDef => {
-            let r = g.any(n.a);
-            g.emit(Scheme.DEFGLOBAL(r as u8, n.g as u16));
+            let gl = n.g as u64;
+            if n.a.kind == K.Lambda and n.a.lam.free.len == 0 and g.comp.known_proc(gl) {
+                // A known procedure: its closure is a constant.
+                let idx = g.lambda(n.a.lam);
+                let proto = g.fs.protos.at(idx as u64);
+                let cl = if let Some(c0) = g.kclos.get(gl) {
+                    g.kpending -= 1;
+                    c0
+                } else {
+                    let c1 = value.new_closure(g.heap, proto);
+                    g.kclos.insert(gl, c1);
+                    c1
+                };
+                cl.proto = proto;
+                let r = g.alloc();
+                g.load_const(V.Clo(cl), r);
+                g.emit(Scheme.DEFGLOBAL(r as u8, n.g as u16));
+            } else {
+                let r = g.any(n.a);
+                g.emit(Scheme.DEFGLOBAL(r as u8, n.g as u16));
+            }
         }
         If => {
             let j = g.cond(n.a);
@@ -2272,6 +2410,47 @@ fn Gen.call(g: *Gen, n: *Node, dst: u32, tail: bool) {
         }
         return;
     }
+    // A known top-level procedure that is certainly defined here: its
+    // closure is a constant and the arity is checked now (a rest list is
+    // made here).
+    if f.kind == K.GRef and n.direct and !is_null_lam(n.lam) and n.lam.free.len == 0
+        and g.comp.known_proc(f.g as u64) {
+        let l = n.lam;
+        let np = l.nparams as u64;
+        if nargs == np or (l.rest and nargs > np) {
+            let kidx = g.constant(V.Clo(g.known_closure(f.g as u64)));
+            if kidx < 256 {
+                for i in 0..np {
+                    let r = g.alloc();
+                    g.to(n.list.at(i), r);
+                }
+                var na = np;
+                if l.rest {
+                    var lst = g.konst_node(value.nil());
+                    var i = nargs;
+                    while i > np {
+                        i -= 1;
+                        let c = g.konst_node(value.nil());
+                        c.kind = K.Prim;
+                        c.po = PO.Cons;
+                        c.list.push(n.list.at(i));
+                        c.list.push(lst);
+                        lst = c;
+                    }
+                    let r = g.alloc();
+                    g.to(lst, r);
+                    na += 1;
+                }
+                if tail {
+                    g.emit(Scheme.TAILCALLK(base as u8, na as u8, kidx as u8));
+                } else {
+                    g.emit(Scheme.CALLK(base as u8, na as u8, kidx as u8));
+                    if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
+                }
+                return;
+            }
+        }
+    }
     g.to(f, base);
     for i in 0..nargs {
         let r = g.alloc();
@@ -2324,6 +2503,39 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         } else {
             g.emit(Scheme.RECORD(d, base as u8, (args.len - 1) as u8));
         }
+        return;
+    }
+    if po == PO.RRef or po == PO.RSet or po == PO.RecP {
+        let k = g.constant(n.v);
+        if k < 256 {
+            let x = g.any(args.at(0)) as u8;
+            if po == PO.RRef {
+                g.emit(Scheme.RREF(d, x, k as u8));
+            } else if po == PO.RecP {
+                g.emit(Scheme.RECP(d, x, k as u8));
+            } else {
+                let v = g.any(args.at(1)) as u8;
+                g.emit(Scheme.RSET(x, k as u8, v));
+                g.load_const(value.unspec(), dst);
+            }
+            return;
+        }
+        // Too many constants for the operand: the native, with the
+        // constant split back into its arguments.
+        var ns: mem.Vec<*Node> = mem.Vec.new();
+        let id = if po == PO.RRef { builtins.P_RECORD_REF } else if po == PO.RecP { builtins.P_RECORDP } else { builtins.P_RECORD_SET };
+        if po == PO.RecP {
+            ns.push(g.konst_node(n.v));
+            ns.push(args.at(0));
+        } else {
+            let P(d) = n.v else { fail(g.fs.line, "internal error: record field") };
+            ns.push(g.konst_node(d.car));
+            ns.push(args.at(0));
+            ns.push(g.konst_node(d.cdr));
+            if po == PO.RSet { ns.push(args.at(1)); }
+        }
+        g.prim_call(id, ns, dst);
+        ns.free();
         return;
     }
     if po == PO.Memq or po == PO.Assq {
@@ -2431,6 +2643,17 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
     };
     g.emit(w);
     if po == PO.SetCar or po == PO.SetCdr { g.load_const(value.unspec(), dst); }
+}
+
+/// R[dst] = builtin `id` of `args`, a PRIMCALL.
+fn Gen.prim_call(g: *Gen, id: i32, args: mem.Vec<*Node>, dst: u32) {
+    let base = g.alloc();
+    for i in 0..args.len {
+        let r = g.alloc();
+        g.to(args.at(i), r);
+    }
+    g.emit(Scheme.PRIMCALL(base as u8, args.len as u8, id as u8));
+    if base != dst { g.emit(Scheme.MOVE(dst as u8, base as u8)); }
 }
 
 /// Evaluate a let's inits into fresh registers and bind its variables.
@@ -2602,18 +2825,21 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         gensyms: 0,
         gdefs: map.HashMap.new(),
         glams: map.HashMap.new(),
+        gprocs: map.HashMap.new(),
         gsets: map.HashMap.new(),
         gform: map.HashMap.new(),
         galias: map.HashMap.new(),
         cur_form: 0,
         first_impure: 0,
+        cur_proc: NO_PROC,
+        reach: map.HashMap.new(),
     };
     var pre: mem.Vec<V> = mem.Vec.new();
     read_all(&c, prelude, false, &pre);
     var prog: mem.Vec<V> = mem.Vec.new();
     read_all(&c, src, true, &prog);
     var fs = FS.new(top);
-    var g = Gen { ctx: ctx, heap: &ctx.heap, fs: &fs };
+    var g = Gen { ctx: ctx, heap: &ctx.heap, fs: &fs, comp: &c, kclos: map.HashMap.new(), kpending: 0 };
     var nodes: mem.Vec<*Node> = mem.Vec.new();
     for i in 0..pre.len { c.top(pre.at(i), &nodes); }
     for i in 0..prog.len { c.scan_defs(prog.at(i)); }
@@ -2643,14 +2869,21 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
             c.glams.insert(gk, l);
         }
     }
+    c.reachability(&nodes);
     for i in 0..nodes.len {
         c.cur_form = i;
-        nodes.set(i, c.inl(nodes.at(i), 0));
+        let n = nodes.at(i);
+        c.cur_proc = NO_PROC;
+        if n.kind == K.GDef and n.a.kind == K.Lambda and c.known_global(n.g as u64).is_some() { c.cur_proc = n.g as u64; }
+        nodes.set(i, c.inl(n, 0));
     }
+    c.cur_proc = NO_PROC;
     for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { contify(nodes.at(i)); }
     for i in 0..nodes.len { reown(nodes.at(i), top); }
     for i in 0..nodes.len { g.effect(nodes.at(i)); }
+    if g.kpending != 0 { fail(0, "internal error: a called procedure was never compiled"); }
+    g.kclos.free();
     let r = g.alloc();
     g.load_const(value.unspec(), r);
     g.emit(Scheme.RET(r as u8));
