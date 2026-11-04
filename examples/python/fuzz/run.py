@@ -3,12 +3,14 @@ from gen.py.
 
     python3 run.py LOIMI_PY [--seeds A:B] [--snippets N] [--gc-stress-every K]
                             [--out DIR] [--only g_name,...] [--quiet]
+                            [--fail-on crash,semantic,message]
 
 Runs each seed's program on CPython (bench/python/install/bin/python3, or
 $CPYTHON) and on LOIMI_PY, compares stdout line by line and reports, per
 mismatching snippet, the snippet (a minimized program: the prelude and
-that snippet) and both outputs. Exit status 1 if anything differs, 0
-otherwise; 77 if CPython is not available.
+that snippet) and both outputs. Exit status 1 if a mismatch of a kind
+in --fail-on (default: all) was found, 0 otherwise; 77 if CPython is
+not available. check.sh -q runs a short fixed-seed smoke campaign.
 
 Mismatches are classified as `crash` (signal or internal error),
 `semantic` (a different value or exception type) and `message` (same
@@ -104,6 +106,7 @@ def main():
     outdir = None
     only = None
     quiet = False
+    fail_on = ["crash", "semantic", "message"]
     while args:
         a = args.pop(0)
         if a == "--seeds":
@@ -117,6 +120,8 @@ def main():
             outdir = args.pop(0)
         elif a == "--only":
             only = args.pop(0).split(",")
+        elif a == "--fail-on":
+            fail_on = args.pop(0).split(",")
         elif a == "--quiet":
             quiet = True
         else:
@@ -185,7 +190,7 @@ def main():
         os.rmdir(tmp)
     print("programs %d, snippets %d, mismatches: %s" % (programs, programs * nsnip,
           ", ".join("%s %d" % kv for kv in counts.items())))
-    return 1 if any(counts.values()) else 0
+    return 1 if any(counts[k] for k in fail_on) else 0
 
 
 if __name__ == "__main__":

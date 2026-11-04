@@ -59,6 +59,21 @@ run() {     # run BINARY LABEL FLAGS...
 build python-tailcall --dispatch=tailcall
 run "$out/python-tailcall" tailcall
 run "$out/python-tailcall" tailcall-stress --gc-stress
+# Differential fuzzing smoke run against CPython (fuzz/run.py), if built:
+# fixed seeds, failing on crashes and wrong values (not on messages, such
+# as CPython's qualified function names).
+if [ -x "$root/bench/python/install/bin/python3" ]; then
+    if "$root/bench/python/install/bin/python3" "$here/fuzz/run.py" "$out/python-tailcall" --seeds 0:12 \
+            --gc-stress-every 4 --quiet --fail-on crash,semantic --out "$out/fuzz" >"$out/fuzz.log" 2>&1; then
+        pass=$((pass + 1))
+    else
+        fail=$((fail + 1))
+        echo "FAIL [fuzz] differential smoke run: python3 $here/fuzz/run.py $out/python-tailcall --seeds 0:12"
+        tail -3 "$out/fuzz.log"
+    fi
+else
+    echo "fuzz smoke run skipped: no bench/python/install (bench/python/install.sh)"
+fi
 if [ $quick -eq 0 ]; then
     run "$out/python-tailcall" tailcall-verify --gc-verify
     build python-goto --dispatch=goto

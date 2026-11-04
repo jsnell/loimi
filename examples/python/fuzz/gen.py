@@ -213,6 +213,8 @@ class G:
         kind = self.pick(["s", "i", "f"])
         v = self.pick(STRS[:6]) if kind == "s" else self.pick(INTS[:16]) if kind == "i" else self.pick(FLOATS)
         sp = self.spec(kind)
+        if sp.endswith("c"):
+            v = self.pick(["65", "10", "0", "97", "True"])  # strings are bytes: no non-ASCII chr (SPEC.md)
         q = "'" if '"' in v else '"'  # an f-string's expressions may not contain its quote (SPEC.md)
         e = self.pick(["format(%s, %r)" % (v, sp), "f%s{%s:%s}%s" % (q, v, sp, q), "'{:%s}'.format(%s)" % (sp, v),
                        "'{0!r:>8}|{0}'.format(%s)" % v, "f%s{%s!r}%s" % (q, v, q)])
@@ -224,6 +226,8 @@ class G:
         width = self.pick(["", "", "5", "10", "*"])
         prec = self.pick(["", "", ".2", ".0", ".*"])
         v = self.pick(INTS[:12] + FLOATS[:8] + STRS[:4] + ["None", "[1, 2]", "(1,)"])
+        if conv == "c" and v in ("255", "-256", "2**31", "-2**31", "2**47", "-1", "-2", "-7"):
+            v = self.pick(["65", "97", "'q'"])  # strings are bytes: no non-ASCII chr (SPEC.md)
         args = []
         if width == "*":
             args.append(self.pick(["3", "-6"]))
