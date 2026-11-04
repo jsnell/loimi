@@ -122,6 +122,9 @@ struct Comp {
     /// The top-level form that defines each global, the form being
     /// inlined into, and the first form that may run program code.
     gform: map.HashMap<u64, u64>,
+    /// Globals defined once (never set!) as another name for a builtin:
+    /// (define make-node vector). Their calls call the builtin.
+    galias: map.HashMap<u64, i32>,
     cur_form: u64,
     first_impure: u64,
 }
@@ -1341,6 +1344,20 @@ fn Comp.inl(c: *Comp, n: *Node, depth: u32) -> *Node {
     n.c = c.inl(n.c, depth);
     for i in 0..n.list.len { n.list.set(i, c.inl(n.list.at(i), depth)); }
     if n.kind != K.Call { return n; }
+    if n.a.kind == K.GRef and let Some(id) = c.galias.get(n.a.g as u64) {
+        let g = n.a.g;
+        n.a = c.konst(value.prim(id));
+        if c.needs_guard(g as u64) {
+            let chk = c.node(K.GChk);
+            chk.line = n.line;
+            chk.g = g;
+            let sq = c.node(K.Seq);
+            sq.line = n.line;
+            sq.list.push(chk);
+            sq.list.push(c.inl(n, depth));
+            return sq;
+        }
+    }
     // A builtin substituted for a parameter, as in (map car l): an op.
     if n.a.kind == K.Const and let Some(id) = value.prim_of(n.a.v) {
         let (name, _, _) = builtins.prim_info(id);
@@ -1600,6 +1617,9 @@ struct FS {
     /// The pc of the last jump to a continuation's join, and its label.
     join_at: u64,
     join_id: u32,
+    /// Per free slot of `lam`: 1 + the register that holds its value
+    /// (loaded once on entry), or 0 (read with GETFREE at each use).
+    fcache: mem.Vec<u32>,
 }
 
 struct Gen { ctx: *Ctx, heap: *gc.Heap, fs: *FS }
@@ -1614,6 +1634,7 @@ fn FS.new(l: *Lam) -> FS {
         line: 0,
         join_at: 0xFFFFFFFFFFFFFFFF,
         join_id: 0,
+        fcache: mem.Vec.new(),
     }
 }
 
@@ -1666,9 +1687,36 @@ fn free_index(l: *Lam, v: *Var) -> u32 {
 
 fn is_local(g: *Gen, v: *Var) -> bool { (v.owner as u64) == (g.fs.lam as u64) }
 
+/// The register caching free variable `v` of the current procedure, if any.
+fn Gen.cached(g: *Gen, v: *Var) -> ?u32 {
+    if g.fs.fcache.len == 0 { return None; }
+    let r = g.fs.fcache.at(free_index(g.fs.lam, v) as u64);
+    if r == 0 { None } else { Some(r - 1) }
+}
+
+/// Static uses of the free variables of `l` in `n` (its frame's code:
+/// contified bodies included, closures not), weighted 10 inside loops.
+fn free_uses(l: *Lam, n: *Node, w: u32, uses: *mem.Vec<u32>) {
+    if is_null(n) { return; }
+    if (n.kind == K.Ref or n.kind == K.Set) and (n.vr.owner as u64) != (l as u64) {
+        for i in 0..l.free.len {
+            if (l.free.at(i) as u64) == (n.vr as u64) { uses.set(i, uses.at(i) + w); }
+        }
+    }
+    if n.kind == K.Lambda {
+        if n.lam.cont { free_uses(l, n.lam.body, 10, uses); }
+        return;
+    }
+    free_uses(l, n.a, w, uses);
+    free_uses(l, n.b, w, uses);
+    free_uses(l, n.c, w, uses);
+    for i in 0..n.list.len { free_uses(l, n.list.at(i), w, uses); }
+}
+
 /// A register holding the value of `n` (a local's own register if possible).
 fn Gen.any(g: *Gen, n: *Node) -> u32 {
     if n.kind == K.Ref and is_local(g, n.vr) and !boxed(n.vr) { return n.vr.reg; }
+    if n.kind == K.Ref and !is_local(g, n.vr) and !boxed(n.vr) and let Some(r) = g.cached(n.vr) { return r; }
     let r = g.alloc();
     g.to(n, r);
     r
@@ -1695,6 +1743,12 @@ fn Gen.to(g: *Gen, n: *Node, dst: u32) {
                     g.emit(Scheme.BOXGET(d, v.reg as u8));
                 } else if v.reg != dst {
                     g.emit(Scheme.MOVE(d, v.reg as u8));
+                }
+            } else if let Some(r) = g.cached(v) {
+                if boxed(v) {
+                    g.emit(Scheme.BOXGET(d, r as u8));
+                } else if r != dst {
+                    g.emit(Scheme.MOVE(d, r as u8));
                 }
             } else {
                 g.emit(Scheme.GETFREE(d, free_index(g.fs.lam, v) as u8));
@@ -1767,6 +1821,8 @@ fn Gen.effect(g: *Gen, n: *Node) {
                 } else if r != v.reg {
                     g.emit(Scheme.MOVE(v.reg as u8, r as u8));
                 }
+            } else if let Some(b) = g.cached(v) {
+                g.emit(Scheme.BOXSET(b as u8, r as u8));
             } else {
                 let t = g.alloc();
                 g.emit(Scheme.GETFREE(t as u8, free_index(g.fs.lam, v) as u8));
@@ -2010,6 +2066,28 @@ fn Gen.letrec_k(g: *Gen, n: *Node, k: Cont) {
         for j in 0..l.params.len { l.params.at(j).reg = g.alloc(); }
         l.label = g.fs.code.label();
     }
+    // The free variables the loops use are loaded into registers before
+    // entering them: closures are flat and their slots never change (an
+    // assigned variable's slot holds its box).
+    let fl = g.fs.lam;
+    var hoisted: mem.Vec<u32> = mem.Vec.new();
+    if fl.free.len > 0 {
+        var uses: mem.Vec<u32> = mem.Vec.new();
+        for i in 0..fl.free.len { uses.push(0); }
+        for i in 0..n.list.len {
+            let init = n.list.at(i);
+            if init.kind == K.Lambda and init.lam.cont { free_uses(fl, init.lam.body, 1, &uses); }
+        }
+        for i in 0..fl.free.len {
+            if uses.at(i) > 0 and g.fs.fcache.at(i) == 0 {
+                let r = g.alloc();
+                g.emit(Scheme.GETFREE(r as u8, i as u8));
+                g.fs.fcache.set(i, r + 1);
+                hoisted.push(i as u32);
+            }
+        }
+        uses.free();
+    }
     // A body that just enters a contified lambda (a named let) falls
     // through into it.
     let b = n.a;
@@ -2027,6 +2105,8 @@ fn Gen.letrec_k(g: *Gen, n: *Node, k: Cont) {
         if init.kind != K.Lambda or !init.lam.cont or (init.lam as u64) == (first as u64) { continue; }
         g.cont_body(init.lam, k);
     }
+    for i in 0..hoisted.len { g.fs.fcache.set(hoisted.at(i) as u64, 0); }
+    hoisted.free();
 }
 
 fn null_lam() -> *Lam { 0 as *Lam }
@@ -2416,6 +2496,7 @@ fn Gen.lambda(g: *Gen, l: *Lam) -> u32 {
         let v = l.params.at(i);
         if boxed(v) { g.emit(Scheme.MKBOX(v.reg as u8)); }
     }
+    for i in 0..l.free.len { fs.fcache.push(0); }
     g.tail(l.body);
     let proto = g.finish(&fs);
     g.fs = parent;
@@ -2504,6 +2585,7 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         glams: map.HashMap.new(),
         gsets: map.HashMap.new(),
         gform: map.HashMap.new(),
+        galias: map.HashMap.new(),
         cur_form: 0,
         first_impure: 0,
     };
@@ -2522,6 +2604,25 @@ pub fn compile(ctx: *Ctx, prelude: str, src: str) -> Gc<Proto> {
         let n = nodes.at(i);
         if n.kind == K.GDef { c.gform.insert(n.g as u64, i); }
         if c.first_impure == nodes.len and may_call(n) { c.first_impure = i; }
+    }
+    // Aliases: (define g h) of a builtin or a known procedure h, where g
+    // is defined once and never set!: calls of g are calls of h.
+    for i in 0..nodes.len {
+        let n = nodes.at(i);
+        if n.kind != K.GDef or n.a.kind != K.GRef { continue; }
+        let gk = n.g as u64;
+        let h = n.a.g as u64;
+        if (c.gdefs.get(gk) ?? 0) != 1 or c.gsets.contains(gk) { continue; }
+        if value.prim_of(c.ctx.gvals.at(gk)).is_some() { continue; }
+        if let Some(id) = c.galias.get(h) {
+            c.galias.insert(gk, id);
+        } else if let Some(id) = value.prim_of(c.ctx.gvals.at(h))
+            and !c.redefined.contains(c.ctx.gsyms.at(h) as u64)
+            and id != builtins.P_APPLY and id != builtins.P_CALLCC {
+            c.galias.insert(gk, id);
+        } else if let Some((l, _, _)) = c.known(n.a) {
+            c.glams.insert(gk, l);
+        }
     }
     for i in 0..nodes.len {
         c.cur_form = i;
