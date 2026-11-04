@@ -827,7 +827,7 @@ pub vm Mini {
             next
         }
         if let (Int(x), Int(y)) = (a, b) and y > 0 {
-            cache.magic = mod_magic(y);
+            if cache.magic == 0 { cache.magic = mod_magic(y); }
             let r = x % y;
             dst = Int(if r < 0 { r + y } else { r });
             next

@@ -322,7 +322,6 @@ pub fn type_name(v: V) -> str {
     }
 }
 
-/// Primitive equality: numbers by value, strings by content, others by identity.
 #[inline]
 pub fn is_number(v: V) -> bool {
     match v {
@@ -331,6 +330,7 @@ pub fn is_number(v: V) -> bool {
     }
 }
 
+/// Primitive equality: numbers by value, strings by content, others by identity.
 pub fn raw_equal(a: V, b: V) -> bool {
     match (a, b) {
         (Int(x), Int(y)) => x == y,
