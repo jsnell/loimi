@@ -881,6 +881,57 @@ fn Parser.finish_binop(p: *Parser, op: T, w: u32) -> E {
 /// Evaluate an expression list into consecutive registers starting at
 /// the free register, adjusted to exactly `nvars` values. Only a call in
 /// the last position can produce several values.
+/// A constant that `store_var` can store without a register.
+fn is_const(e: E) -> bool {
+    match e {
+        True | False | Nil | I(_) | K(_) => true,
+        _ => false,
+    }
+}
+
+/// `explist_to` for a multiple assignment: the `nvars` values, each a
+/// register from the current top on, or a constant left unloaded (its
+/// register is reserved but not written), so that `t[i], u[j] = true,
+/// false` stores constants (SETINDEXK) instead of loading them first.
+fn Parser.explist_vals(p: *Parser, nvars: u32) -> mem.Vec<E> {
+    let start = p.fs.regs.top;
+    var vals: mem.Vec<E> = mem.Vec.new();
+    var n: u32 = 1;
+    var e = p.expr();
+    while p.accept(T.Comma) {
+        if is_const(e) {
+            p.reserve(1);
+            vals.push(e);
+        } else {
+            vals.push(E.Temp(p.to_next_reg(e)));
+        }
+        e = p.expr();
+        n += 1;
+    }
+    if let Call(base, at) = e and n < nvars {
+        if base != start + n - 1 { internal_error("misplaced call results"); }
+        let want = nvars - n + 1;
+        let w = p.fs.code.at(at);
+        p.fs.code.set(at, (w & 0x00FFFFFF) | (want << 24));
+        p.reserve(want - 1);
+        for i in 0..want { vals.push(E.Temp(base + i)); }
+        return vals;
+    }
+    if is_const(e) {
+        p.reserve(1);
+        vals.push(e);
+    } else {
+        vals.push(E.Temp(p.to_next_reg(e)));
+    }
+    while n < nvars {
+        p.reserve(1);
+        vals.push(E.Nil);
+        n += 1;
+    }
+    p.fs.regs.reset(start + nvars);
+    vals
+}
+
 fn Parser.explist_to(p: *Parser, nvars: u32) {
     let start = p.fs.regs.top;
     var n: u32 = 1;
@@ -1388,14 +1439,14 @@ fn Parser.statement_inner(p: *Parser) {
                 targets.push(t);
             }
             p.check(T.Assign, "'='");
-            let base = p.fs.regs.top;
             let n = targets.len as u32;
-            p.explist_to(n);
+            var vals = p.explist_vals(n);
             var i = n;
             while i > 0 {
                 i -= 1;
-                p.store_var(targets.at(i as u64), E.Temp(base + i));
+                p.store_var(targets.at(i as u64), vals.at(i as u64));
             }
+            vals.free();
             targets.free();
         }
     }

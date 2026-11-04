@@ -1,0 +1,31 @@
+-- Multiple assignment with constant values: stored without loading
+-- them into registers first (SETINDEXK for table targets).
+local t, u = {}, {}
+local i, j = 1, 2
+t[i], u[j], t[3] = true, false, 7
+print(t[1], u[2], t[3])
+local a, b, c = 1, 2, 3
+a, t.x, b, u[a] = "s", 2.5, nil, a + 10
+print(a, t.x, b, u[1], c)
+local function two() return 8, 9 end
+a, b, c = 0, two()
+print(a, b, c)
+a, b, c = two(), 5
+print(a, b, c)
+a, b = 1
+print(a, b)
+a, b = nil, false, 99
+print(a, b)
+local k = 1
+k, t[k] = 2, "first"   -- t[1]: the index is evaluated before assigning
+print(k, t[1], t[2])
+x1, y1 = 4, true
+print(x1, y1)
+-- expect: true	false	7
+-- expect: s	2.5	nil	11	3
+-- expect: 0	8	9
+-- expect: 8	5	nil
+-- expect: 1	nil
+-- expect: nil	false
+-- expect: 2	first	nil
+-- expect: 4	true
