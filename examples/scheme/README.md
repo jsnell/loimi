@@ -106,8 +106,9 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
   UTF-8 when put into a string.
 - **Inline builtins.** Calls to `+ - * / quotient remainder modulo = < > <=
   >= zero? eq? eqv? not null? pair? car cdr cons set-car! set-cdr!
-  vector-ref vector-set! symbol? number? exact-integer? string? vector?`
-  and `cXr` are compiled to ops, and calls to the other builtins (except
+  vector-ref vector-set! symbol? number? exact-integer? string? vector?
+  memq assq list vector` and `cXr` are compiled to ops (`list` to a chain
+  of `CONS`; `vector` and record constructors to `VECTOR`/`RECORD`), and calls to the other builtins (except
   `apply` and `call/cc`) call the native directly (`PRIMCALL`), unless the
   program defines or `set!`s that name somewhere (then every call goes
   through the global). The prelude always uses the inline versions.
@@ -188,6 +189,9 @@ part of the point of the exercise.
    `(map (lambda (x) ...) l)` becomes a loop with the lambda's body in it
    (`map` and `for-each` with one list use the prelude's one-list versions).
    Recursive bodies are not inlined, and nesting stops at depth 3.
+   A global defined once, never `set!`, as another name for a builtin or a
+   known procedure (`(define make-node vector)`) is an alias: its calls
+   are calls of the builtin (an op, where it has one) or of the procedure.
 3. **Contify** (`contify`): a `letrec` lambda whose every use is a tail call
    from the letrec body or from another contified lambda of the same letrec
    (every named-let loop, mutually tail-recursive local procedures) is
@@ -216,7 +220,9 @@ into the new closure, following capture descriptors stored in the
 prototype ("register r of the parent" or "free slot i of the parent").
 Variables that are both captured and `set!` are **assignment-converted**:
 they live in a box (`MKBOX`, `BOXGET`, `BOXSET`). Free variables are read
-with `GETFREE`.
+with `GETFREE`; those a contified loop uses are read once into registers
+before the loop (a closure's slots never change: an assigned variable's
+slot holds its box).
 
 `letrec` (and internal defines) of lambdas, the common case for recursive
 local procedures and named `let`, are not boxed: the closures are created
@@ -229,8 +235,9 @@ initialized.
 
 Frames live on a separate frame stack (`rt.Frame`: closure, register base,
 return address, constants). `CALL base nargs` handles the common case in
-its hot path (a closure with exactly that many fixed parameters): clear
-the callee's remaining registers, push a frame, and jump. Everything else
+its hot path (a closure with exactly that many fixed parameters): check
+the stack, push a frame, and jump. The callee's registers are not
+cleared (see GC). Everything else
 (rest parameters, arity errors, builtins, `apply`, non-procedures) goes
 through a cold path, the vm function `call_slow`, which sets up the state
 and returns where to continue.
@@ -269,9 +276,18 @@ globals, the pending error, and every active frame's closure and whole
 register window. Every op that allocates (`CONS`, `CLOSURE`, `MKBOX`, and
 the call path, which covers builtins and rest lists) runs the collector,
 if due, *before* allocating, in a `cold` block, with the `sync` block
-publishing the frame pointer. Allocation never collects, so natives and
-the compiler allocate freely. Registers are cleared on entry to a frame,
-so the scanner never sees stale values.
+publishing the frame pointer; the ops allocate with `try_new` (refill in
+a cold block), so they have no stack frame. Allocation never collects, so
+natives and the compiler allocate freely.
+
+Registers are not cleared on entry to a frame, so the scanner sees stale
+values of dead frames in registers not yet written. That is safe because
+every stack slot below a high-water mark (`ctx.hwm`) holds a value that
+is safe to mark: a stale value inside a live window is marked (so its
+object stays allocated), and the scanner clears the slots above the top
+window and lowers the mark to it; a call whose window passes the mark
+clears the new slots first (`rt.grow`, on the cold path that also checks
+for stack overflow).
 
 ### Ops
 
@@ -281,8 +297,8 @@ TESTT`, `ADD SUB MUL ADDI DIV QUO REM MOD` (fixnum fast paths with
 overflow checks, flonum fast paths, everything else cold), `NUMEQ LT GT
 LE GE` and their compare-with-constant forms `NUMEQI LTI GTI LEI GEI`,
 `ZEROP EQ EQV NOT NULLP PAIRP SYMBOLP NUMBERP FIXNUMP STRINGP VECTORP CAR
-CDR CONS SETCAR SETCDR VREF VSET`, `CALL CALLSELF PRIMCALL TAILCALL RET`,
-and 29 superinstructions picked from `--vm-stats` over the benchmarks
+CDR CONS SETCAR SETCDR VREF VSET VREFI VSETI VECTOR RECORD MEMQ ASSQ`, `CALL CALLSELF PRIMCALL TAILCALL RET`,
+and 35 superinstructions picked from `--vm-stats` over the benchmarks
 (compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`, `ADDI_CALL`,
 ...).
 

@@ -89,6 +89,30 @@ pub fn cont_proto(h: *gc.Heap) -> Gc<Proto> {
     }
 }
 
+/// A closure of `p` with more than 4 free variables (CLOSURE's rare case).
+#[cold]
+fn big_closure(h: *gc.Heap, parent: Gc<Closure>, p: Gc<Proto>, regs: *V) -> Gc<Closure> {
+    let n = p.nfree as u64;
+    let c = new(h, Closure { proto: p }, n);
+    for j in 0..n {
+        let d = p.desc.data.ptr[j];
+        if d >= 256 {
+            c.free.ptr[j] = regs[(d & 255) as u64];
+        } else {
+            c.free.ptr[j] = parent.free.ptr[d as u64];
+        }
+    }
+    c
+}
+
+/// A vector (or record, by `rtd`) of the `n` values at `src`.
+#[cold]
+fn big_vect(h: *gc.Heap, rtd: V, src: *V, n: u64) -> Gc<Vect> {
+    let v = new(h, Vect { rtd: rtd }, n);
+    for i in 0..n { v.data.ptr[i] = src[i]; }
+    v
+}
+
 #[require_verified]
 pub vm Scheme {
     context ctx: *Ctx;
@@ -172,9 +196,14 @@ pub vm Scheme {
     }
     /// Box R[r] (an assigned variable that is captured by a closure).
     op MKBOX(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let v = r;
-        r = Vec(value.new_vect(&ctx.heap, 1, v));
+        let Some(b) = try_new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, 1) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + size_of<V>());
+            redo
+        };
+        b.data.ptr[0] = v;
+        r = Vec(b);
         next
     }
     op BOXGET(dst: reg, b: reg) : ABC {
@@ -188,11 +217,15 @@ pub vm Scheme {
     /// R[dst] = a new closure of child prototype `i`, capturing values as
     /// its descriptors say.
     op CLOSURE(dst: reg, i: child) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
         let parent = fp.cl;
         let p = parent.proto.protos.data.ptr[i];
         let n = p.nfree as u64;
-        let c = new(&ctx.heap, Closure { proto: p }, n);
+        if n > 4 { cold { dst = Clo(big_closure(&ctx.heap, parent, p, regs)); next } }
+        let Some(c) = try_closure(p, n) else cold {
+            gc.make_room(&ctx.heap, size_of<Closure>() + n * size_of<V>());
+            redo
+        };
         for j in 0..n {
             let d = p.desc.data.ptr[j];
             if d >= 256 {
@@ -347,8 +380,83 @@ pub vm Scheme {
         cold { raise rt.type_err(ctx, "cdr", "pair", a) }
     }
     op CONS(dst: reg, a: reg, b: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-        dst = P(new(&ctx.heap, Pair { car: a, cdr: b }));
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        let Some(c) = try_new(&ctx.heap, Pair { car: a, cdr: b }) else cold {
+            gc.make_room(&ctx.heap, size_of<Pair>());
+            redo
+        };
+        dst = P(c);
+        next
+    }
+    /// R[dst] = (vector R[base] .. R[base+n-1]).
+    op VECTOR(dst: reg, base: callbase, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        let cnt = n as u64;
+        let src = regs + base as u64;
+        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, V.Imm(value.IMM_NIL), src, cnt)); next } }
+        let Some(v) = try_vect(V.Imm(value.IMM_NIL), cnt) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
+            redo
+        };
+        for i in 0..cnt { v.data.ptr[i] = src[i]; }
+        dst = Vec(v);
+        next
+    }
+    /// R[dst] = a record of type R[base] with fields R[base+1] .. R[base+n]
+    /// (the constructor of a define-record-type).
+    op RECORD(dst: reg, base: callbase, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+        let cnt = n as u64;
+        let src = regs + base as u64;
+        if cnt > 4 or cnt == 0 { cold { dst = Vec(big_vect(&ctx.heap, src[0], src + 1, cnt)); next } }
+        let Some(v) = try_vect(src[0], cnt) else cold {
+            gc.make_room(&ctx.heap, size_of<Vect>() + cnt * size_of<V>());
+            redo
+        };
+        for i in 0..cnt { v.data.ptr[i] = src[i + 1]; }
+        dst = Vec(v);
+        next
+    }
+    /// A closure or vector of 1 to 4 slots without the allocator's refill
+    /// (constant lengths: the zeroing is inline, not a memset call).
+    fn try_closure(p: Gc<Proto>, n: u64) -> ?Gc<Closure> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Closure { proto: p }, 1) }
+            else if n == 2 { try_new(&ctx.heap, Closure { proto: p }, 2) }
+            else { try_new(&ctx.heap, Closure { proto: p }, 0) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Closure { proto: p }, 3) } else { try_new(&ctx.heap, Closure { proto: p }, 4) }
+        }
+    }
+    fn try_vect(rtd: V, n: u64) -> ?Gc<Vect> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Vect { rtd: rtd }, 1) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 2) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Vect { rtd: rtd }, 3) } else { try_new(&ctx.heap, Vect { rtd: rtd }, 4) }
+        }
+    }
+    /// (memq x l): a loop in the handler instead of a native call.
+    op MEMQ(dst: reg, x: reg, l: reg) : ABC {
+        let key = x;
+        var cur = l;
+        while let P(p) = cur {
+            if p.car == key { dst = cur; next }
+            cur = p.cdr;
+        }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    /// (assq x l).
+    op ASSQ(dst: reg, x: reg, l: reg) : ABC {
+        let key = x;
+        var cur = l;
+        while let P(p) = cur {
+            let e = p.car;
+            let P(q) = e else { cold { raise rt.type_err(ctx, "assoc", "pair", e) } };
+            if q.car == key { dst = e; next }
+            cur = p.cdr;
+        }
+        dst = Imm(value.IMM_FALSE);
         next
     }
     op SETCAR(a: reg, b: reg) : ABC {
@@ -365,6 +473,21 @@ pub vm Scheme {
             next
         }
         cold { raise index_err(ctx, "vector-ref", v, i) }
+    }
+    /// vector-ref with a constant index (record fields, small tuples).
+    op VREFI(dst: reg, v: reg, i: imm) : ABC {
+        if let Vec(x) = v and (i as u64) < x.data.len {
+            dst = x.data.ptr[i as u64];
+            next
+        }
+        cold { raise index_err(ctx, "vector-ref", v, Int(i as i32)) }
+    }
+    op VSETI(v: reg, i: imm, src: reg) : ABC {
+        if let Vec(x) = v and (i as u64) < x.data.len {
+            x.data.ptr[i as u64] = src;
+            next
+        }
+        cold { raise index_err(ctx, "vector-set!", v, Int(i as i32)) }
     }
     op VSET(v: reg, i: reg, src: reg) : ABC {
         if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
@@ -388,7 +511,7 @@ pub vm Scheme {
             n -= 2;
             var cur = lst;
             while let P(p) = cur {
-                if regs + base + n + 2 >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
+                if regs + base + n + 2 >= ctx.hwm and !rt.grow(ctx, regs + base + n + 2) { raise rt.err_msg(ctx, "stack overflow") }
                 regs[base + 1 + n] = p.car;
                 n += 1;
                 cur = p.cdr;
@@ -408,7 +531,7 @@ pub vm Scheme {
                 nf = fp + 1;
             }
             if tail { dst = regs; }
-            if dst + 3 >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
+            if dst + 3 >= ctx.hwm and !rt.grow(ctx, dst + 3) { raise rt.err_msg(ctx, "stack overflow") }
             let kc = new(&ctx.heap, Closure { proto: cp }, 1);
             kc.free.ptr[0] = Int((((nf as u64) - (ctx.frames as u64)) / size_of<Frame>()) as i32);
             dst[0] = regs[base + 1];
@@ -464,8 +587,7 @@ pub vm Scheme {
                 raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
             }
             let nr = p.nregs as u64;
-            if dst + nr >= ctx.stack_end { raise rt.err_msg(ctx, "stack overflow") }
-            for i in have..nr { dst[i] = Imm(value.IMM_UNSPEC); }
+            if dst + nr >= ctx.hwm and !rt.grow(ctx, dst + nr) { raise rt.err_msg(ctx, "stack overflow") }
             if !tail {
                 fp.resume = pc + 1;
                 fp = fp + 1;
@@ -508,13 +630,13 @@ pub vm Scheme {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-            cold { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
-        }
-        var i = nargs as u64;
-        while i < n {
-            callee[i] = Imm(value.IMM_UNSPEC);
-            i += 1;
+        if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+            cold {
+                if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                    raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
+                }
+                redo
+            }
         }
         fp.resume = pc + 1;
         fp = fp + 1;
@@ -532,13 +654,13 @@ pub vm Scheme {
             if likely(p.fixed == nargs as u32) {
                 let callee = regs + base + 1;
                 let n = p.nregs as u64;
-                if callee + n >= ctx.stack_end or fp + 1 >= ctx.frames_end {
-                    cold { raise rt.err_msg(ctx, "stack overflow (too many nested calls)") }
-                }
-                var i = nargs as u64;
-                while i < n {
-                    callee[i] = Imm(value.IMM_UNSPEC);
-                    i += 1;
+                if callee + n >= ctx.hwm or fp + 1 >= ctx.frames_end {
+                    cold {
+                        if fp + 1 >= ctx.frames_end or !rt.grow(ctx, callee + n) {
+                            raise rt.err_msg(ctx, "stack overflow (too many nested calls)")
+                        }
+                        redo
+                    }
                 }
                 fp.resume = pc + 1;
                 fp = fp + 1;
@@ -561,15 +683,15 @@ pub vm Scheme {
             let p = cl.proto;
             if likely(p.fixed == nargs as u32) {
                 let n = p.nregs as u64;
-                if regs + n >= ctx.stack_end { cold { raise rt.err_msg(ctx, "stack overflow") } }
+                if regs + n >= ctx.hwm {
+                    cold {
+                        if !rt.grow(ctx, regs + n) { raise rt.err_msg(ctx, "stack overflow") }
+                        redo
+                    }
+                }
                 let args = regs + base + 1;
                 let na = nargs as u64;
                 for i in 0..na { regs[i] = args[i]; }
-                var i = na;
-                while i < n {
-                    regs[i] = Imm(value.IMM_UNSPEC);
-                    i += 1;
-                }
                 fp.cl = cl;
                 k = p.consts.data.ptr;
                 fp.k = k;
@@ -612,6 +734,18 @@ pub vm Scheme {
     #[forward] super EQ_TEST = EQ; TEST;
     #[forward] super NOT_TEST = NOT; TEST;
     #[forward] super ZEROP_TEST = ZEROP; TEST;
+    #[forward] super NUMEQ_TESTT = NUMEQ; TESTT;
+    #[forward] super EQ_TESTT = EQ; TESTT;
+    #[forward] super EQV_TEST = EQV; TEST;
+    // Overlaps another super, but runs outside TESTT; RET: 4% of nboyer's ops.
+    #[allow(super_overlap)]
+    #[forward] super PAIRP_TESTT = PAIRP; TESTT;
+    // Returning a constant ('(), #t, #f): 13 of the programs.
+    super LOADK_RET = LOADK; RET;
+    #[forward] super CAR_CAR = CAR; CAR;
+    // Overlaps CAR_CAR, but runs outside it: (cadr x), (caddr x).
+    #[allow(super_overlap)]
+    #[forward] super CDR_CAR = CDR; CAR;
     // Loops, argument set-up and list walking.
     #[forward] super MOVE_MOVE = MOVE; MOVE;
     // Overlaps another super, but runs outside MOVE; MOVE: 25% of sum's ops, 6.5% of diviter's.
@@ -642,6 +776,10 @@ pub vm Scheme {
         c.stack[0] = Imm(value.IMM_UNSPEC);
         regs = c.stack + 1;
         for i in 0..p.nregs as u64 { regs[i] = Imm(value.IMM_UNSPEC); }
+        if regs + p.nregs as u64 >= c.hwm and !rt.grow(c, regs + p.nregs as u64) {
+            c.error = rt.err_msg(c, "stack overflow");
+            exit Imm(value.IMM_UNSPEC)
+        }
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;

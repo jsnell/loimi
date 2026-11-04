@@ -432,6 +432,95 @@ Not done, with reasons:
   under 2% of the executed ops except in cpstak and ctak, where the
   closures are continuations that escape.
 
+## Third phase: calls, allocation, builtins (2026-11-04)
+
+Profiled with an `LD_PRELOAD` sampler (per handler), `--vm-stats`,
+`-W handler_frame` and per-builtin call counts over the 43 programs,
+then changed `examples/scheme` only (no compiler or std change). Each
+step was an interleaved A/B (`--exe old new -n 5`, `--align 64`, wall
+time); the whole: `compare.py -n 3 --align 64` with the commit before
+(096e04e vs 091245f), host load 2-4.
+
+| geometric mean, wall | gauche | guile-nojit | guile (JIT) |
+|---|---|---|---|
+| before (091245f) | 0.251 | 0.446 | 0.945 |
+| after (096e04e) | **0.224** | **0.398** | **0.845** |
+| inner, before | | 0.477 | |
+| inner, after | | **0.426** | |
+
+Ours/before: 0.894 wall, 0.892 inner. In inner time ours is slower than
+Guile's VM only on pi and string (0.017 s vs 0.016). The largest changes (seconds, before → after, and
+after / guile-nojit): deriv 0.225 → 0.144 (0.38), gcbench 0.020 →
+0.013 (0.46), nucleic 0.069 → 0.053 (0.27), conform 0.119 → 0.094
+(0.52), fib 0.497 → 0.405 (0.37), simplex 0.120 → 0.098 (0.40), lattice
+0.055 → 0.044 (0.43), tak 0.458 → 0.386 (0.39), paraffins 0.037 →
+0.031 (0.58), earley 0.041 → 0.034 (0.52), peval 0.098 → 0.083 (0.41),
+nboyer 0.654 → 0.564 (0.64), sboyer 0.641 → 0.561 (0.59), cpstak 0.267
+→ 0.228 (0.53), fibfp 0.186 → 0.157. Unchanged within 3%: the flonum
+loops, puzzle, sum, array1, takl, ntakl, pi.
+
+1. **Builtins as ops** (58de404). `(list ...)` is a chain of `CONS`;
+   `(vector ...)` and record constructors are `VECTOR`/`RECORD`, which
+   allocate from consecutive registers; `memq` and `assq` loop in their
+   handler. Before, each was a `PRIMCALL` into the native dispatcher
+   (whose `prim_info` arity lookup was an out-of-line call; now
+   `#[inline]`, a table). deriv 0.228 → 0.176 (`list`: 2.75 million
+   calls), paraffins 0.039 → 0.029 (`vector`), gcbench 0.019 → 0.015
+   (records), earley 0.040 → 0.035, conform 0.117 → 0.106 (`memq`).
+2. **No stack frame on allocation** (a59e5b4). `CONS`, `MKBOX`,
+   `CLOSURE`, `VECTOR` allocate with `try_new` and refill in a cold
+   block (`-W handler_frame` flagged them); closures and vectors of 1-4
+   slots use constant lengths (no `memset` call), bigger ones a cold
+   path. cpstak 0.254 → 0.242, graphs 0.125 → 0.119, ctak and fibc -5%.
+3. **No register clearing on calls** (08b40eb). `CALL`, `CALLSELF` and
+   `TAILCALL` set every callee register to unspecified so the collector
+   never marked a stale value. Now every stack slot below a high-water
+   mark is safe to mark: stale values inside live windows are marked
+   (their objects stay allocated), the root scanner clears what lies
+   above the top window and lowers the mark, and a call that passes the
+   mark clears the new slots in the cold path that checks for stack
+   overflow (`rt.grow`). fib 0.496 → 0.400, tak 0.453 → 0.385, fibfp
+   0.187 → 0.158, ack 0.467 → 0.428, graphs 0.118 → 0.110.
+4. **Aliases and loop-invariant free variables** (df74c9c). A global
+   defined once and never `set!` as another name for a builtin or known
+   procedure (`(define make-internal-node vector)`, `(define
+   lattice->elements car)`, `(define operation blue-edge-operation)`)
+   calls it directly (an op where there is one, or inlined); a builtin
+   passed as an argument (`(map cdr l)`) counts as higher-order for
+   inlining. Free variables used in a contified loop are read into
+   registers once before the loop. conform 0.099 → 0.089, lattice 0.049
+   → 0.045, simplex 0.120 → 0.105.
+5. **Constant-index vector ops and supers** (096e04e). `VREFI`/`VSETI`
+   (record fields, `(vector-ref v 2)`); `NUMEQ_TESTT`, `EQ_TESTT`,
+   `PAIRP_TESTT`, `EQV_TEST`, `LOADK_RET`, `CAR_CAR`, `CDR_CAR`.
+   nucleic 0.064 → 0.054, nboyer 0.620 → 0.589, nqueens 0.309 → 0.297.
+
+Tried and dropped:
+
+- Free variables loaded into registers on procedure entry when used
+  twice or more (instead of before loops): simplex 0.101 (vs 0.105) but
+  peval 5% slower, as the hoisted loads run on paths that do not use
+  them (GETFREE count doubled).
+- Supers `ADDI_CALLSELF`, `LOADK_SUB`, `GETGLOBAL_B_VREF`, `VREF_VSET`
+  (suggested by `--vm-stats` for fib, fibfp, puzzle, array1): fib and
+  fibfp -5%, but divrec +6% and triangl +3% (handler placement);
+  0.993 overall.
+
+Where we still lose most (wall, vs guile-nojit): pi 1.30 and chudnovsky
+0.84 (std.bigint against GMP), string 0.71 (half the time in `memcpy`
+and the zeroing `memset` of `alloc_large` for strings that are
+overwritten right after: an uninitialized allocation for byte arrays in
+`std.gc` would remove the latter), mperm 0.70, nboyer 0.64, sboyer 0.59
+(list walking at memory latency and collection of large live heaps:
+`std.gc` marking is 8-12% of nboyer; Guile runs with a 100 MB initial
+heap), nqueens 0.59 (`append`, a native call), paraffins 0.58. Against
+Gauche the closest are nboyer 0.48 and sboyer 0.46. Next candidates:
+calls of known top-level procedures without `GETGLOBAL` (conform,
+triangl, puzzle: 10-18% of ops are `GETGLOBAL_B`), the remaining hot
+natives as ops or with a lighter call (`append`, `length`, `reverse`,
+`odd?`, `positive?`, `symbol->string`, record accessors), and
+continuation capture (`call_slow` is 25% of ctak and fibc).
+
 ## Bignums (2026-11-03)
 
 Exact bignums (`examples/scheme/bignum.lm`, on `std.bigint`) made pi
