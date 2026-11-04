@@ -106,6 +106,52 @@ every interpreter test run in three modes: normal, `stress`, and
   Interpreters test `heap.allocated > heap.threshold` in their handlers
   and call `gc.collect`.
 
+### Invariants of the bitmap allocator
+
+What the collector relies on (checked by `tests/run/gc_torture.lm`, a
+random mutator in six heap configurations, and by the interpreters'
+suites under stress, verify and `--gc-check-roots`):
+
+1. **One class per chunk, on a grid.** Every object in a chunk has the
+   chunk's size class and starts at `start + k * class` granules. A chunk
+   changes class only from the pool, that is with no mark bit set, so a
+   run of clear bits starts and ends at object boundaries of the class.
+2. **Clear bit = free, after every collection.** Marking sets the bits
+   of every granule of each small object it reaches; allocation never
+   sets bits. A minor collection keeps the bits of old objects and
+   promotes every small survivor (only large objects age), so after
+   marking in either kind of collection a clear bit is free memory or
+   a dead object. Between collections, objects allocated since the last
+   one have clear bits.
+3. **No granule is handed out twice in a cycle.** `refill` walks each
+   class's chunk list forward (`scan_g`) and takes a pool chunk out of
+   the pool; the lists are rebuilt only by `relink_chunks`, after
+   marking, which also resets every class's run (`cur`, `lim`).
+4. **Mark byte and bits agree for live objects.** The mark byte is the
+   "already marked" test. A live small object whose mark is the epoch
+   has its bits set: a major collection flips the epoch and clears the
+   bitmaps together, a minor one keeps both. Only `mark_now` sets a mark
+   on a small object, and it sets the bits with it.
+5. **Dead objects are never read.** Their headers keep whatever they
+   held (a stale mark may equal the epoch again two major collections
+   later), so nothing may reach a dead object: weak references,
+   ephemerons, free hooks and weak tables (sweepers, `is_marked`) drop
+   it in the collection that finds it dead, while its memory is intact.
+   What overwrites dead memory runs after them: verify mode's 0x01 fill
+   at the end of the collection, `--gc-check-roots`'s `rootck_poison` as
+   the last sweeper. In a generational heap an old object that died stays
+   allocated (its bits set) until the next major collection, so what an
+   old object references stays valid until then.
+6. **Only this heap's objects get this heap's marks.** A reference to
+   another heap's object may appear only on the shadow stack (nested
+   runs, `std.gil`'s saved frames); those walks check the chunk's heap
+   (`OWN_ONLY`) and mark at once, never through the prefetch ring
+   (a deferred mark would be made after the check is switched off).
+7. **The prefetch ring is empty whenever marks are read**: it is
+   flushed after the scanners, whenever the mark stack runs dry, and in
+   each ephemeron pass; minor collections and the shadow-stack walks do
+   not use it.
+
 ### Generational mode: sticky mark bits, non-moving
 
 `heap.set_generational(true)`, off by default (the decision and the
