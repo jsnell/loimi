@@ -855,7 +855,22 @@ pub vm Py {
         }
         cold { gc_point(); dst = ops.arith(ctx, ops.O_MOD, a, b)?; next }
     }
-    inline for (name, opn) in [("POW", ops.O_POW), ("LSHIFT", ops.O_LSHIFT), ("RSHIFT", ops.O_RSHIFT), ("MATMUL", ops.O_MATMUL)] {
+    op POW(dst: reg, a: reg, b: reg) : ABC {
+        // A float to a float or int power with a finite result (no error
+        // to raise: not 0.0 to a negative power, not a complex result).
+        let fy = match b { Float(y) => y, Int(y) => y as f64, _ => 0.5 };
+        if let Float(x) = a and x != 0.0 and (match b { Float(_) => true, Int(_) => true, _ => false }) {
+            let r = builtins.pow_f(x, fy);
+            if r - r == 0.0 { dst = Float(r); next }
+        }
+        if let (Int(x), Int(y)) = (a, b) and y == 2 and let Some(r) = x.mul_checked(x) { dst = Int(r); next }
+        cold {
+            gc_point();
+            dst = ops.arith(ctx, ops.O_POW, a, b)?;
+            next
+        }
+    }
+    inline for (name, opn) in [("LSHIFT", ops.O_LSHIFT), ("RSHIFT", ops.O_RSHIFT), ("MATMUL", ops.O_MATMUL)] {
         op #name(dst: reg, a: reg, b: reg) : ABC {
             gc_point();
             dst = ops.arith(ctx, opn, a, b)?;
