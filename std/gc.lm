@@ -2094,12 +2094,15 @@ pub fn rootck_hex(x: u64) {
     write(2, &buf[0], 16);
 }
 
-/// Install `rootck_poison` as a sweeper of `h` (once).
+/// Install `rootck_poison` as the last sweeper of `h`: it overwrites dead
+/// objects' headers, so a sweeper after it would read a mark byte of 1
+/// (marked, when the epoch is 1). Sweepers added since it was installed
+/// move it back to the end.
 pub fn rootck_install(h: *Heap) {
     let tag = h.rs as *u8;
-    for i in 0..h.sweepers.len {
-        if h.sweepers.ptr[i].data == tag { return; }
-    }
+    let n = h.sweepers.len;
+    if n > 0 and h.sweepers.ptr[n - 1].data == tag { return; }
+    unregister(&h.sweepers, tag);
     h.add_sweeper(tag, rootck_poison);
 }
 

@@ -373,9 +373,11 @@ fn main() uses gc {
 
 - **When.** Inside the collection, after marking, ephemerons and weak
   references (so no `Weak` reaches the object any more and ephemeron
-  entries keyed by it are gone), as the first sweeper, before
-  `rootck_poison` and the interpreter's sweepers. Not lazily: with lazy
-  sweeping the slot is freed later, but the hook has already run.
+  entries keyed by it are gone), as the first sweeper, before the
+  interpreter's sweepers (and `--gc-check-roots`'s `rootck_poison`,
+  always the last one: it overwrites dead objects, headers included).
+  Nothing is swept: the memory is reused only by allocations after the
+  collection.
   Objects that die together run their hooks in no particular order.
 - **What it may do.** Release host memory, close descriptors, update
   host counters. It reads the object's own non-reference fields (raw

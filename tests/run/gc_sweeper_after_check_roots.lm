@@ -1,0 +1,39 @@
+// A sweeper registered after the heap's first allocation sees the
+// objects that died as unmarked, also in a `--gc-check-roots` build,
+// whose own sweeper fills dead objects with 0x01 bytes, headers included:
+// it must run after every other sweeper (a mark byte of 1 read as marked
+// when the epoch is 1, and a weak table kept its dead entries).
+// matrix: check-roots
+import std.io;
+import std.gc;
+
+object Node { v: i64 }
+
+fn node(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { v: v }) }
+
+var dead_addr: u64 = 0;
+var seen: i64 = 0;
+var kept: i64 = 0;
+
+fn sweep(h: *gc.Heap, data: *u8) {
+    if dead_addr != 0 {
+        seen += 1;
+        if h.is_marked(dead_addr as *u8) { kept += 1; }
+    }
+}
+
+fn dead(h: *gc.Heap) -> u64 { node(h, 2) as u64 }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    let k = node(h, 1);
+    h.add_sweeper(0 as *u8, sweep);
+    for i in 0..4 {
+        dead_addr = dead(h);
+        gc.collect(h);
+    }
+    io.print_int(seen); io.print(" "); io.print_int(kept); io.print(" "); io.print_int(k.v); io.println("");
+    heap.free();
+}
+// expect: 4 0 1

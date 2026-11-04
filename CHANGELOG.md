@@ -257,7 +257,10 @@ implementation; `git log` has the details.
   this-heap-only check (`tests/run/gc_shadow_stack_other_heap.lm`);
   `--gc-check-roots` did not report a root to an object a generational
   heap had freed (the start bitmap was pruned only in non-generational
-  heaps; `tests/run/gc_check_roots_gen_freed.lm`);
+  heaps; `tests/run/gc_check_roots_gen_freed.lm`), and its sweeper,
+  which now fills dead objects' headers too, ran before sweepers added
+  later, which then saw dead objects as marked
+  (`tests/run/gc_sweeper_after_check_roots.lm`);
   `tests/run/gc_torture.lm` is a random mutator over every size class,
   weak references, ephemerons and free hooks in six heap configurations.
 
