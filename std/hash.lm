@@ -26,11 +26,41 @@ pub fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Hash a byte string (FNV-1a, then mixed).
+const WK: u64 = 0x9FB21C651E98DF25;
+
+/// Hash a byte string: eight bytes per multiply, then mixed. Strings of
+/// 8 bytes or more hash every whole word and then the last 8 bytes
+/// (overlapping the previous word when the length is not a multiple of
+/// 8); shorter ones read two overlapping 4-byte words, or the first,
+/// middle and last bytes. The length is part of the seed, so the
+/// overlaps cannot make strings of different lengths collide by
+/// construction. A string-interning interpreter hashes every string it
+/// makes, so this is on the hot path of string building
+/// (bench/mini/RESULTS.md); byte-at-a-time FNV-1a took 4 cycles a byte.
 pub fn bytes(s: str) -> u64 {
-    var h: u64 = 0xCBF29CE484222325;
-    for i in 0..s.len {
-        h = (h ^ s[i] as u64) *% 0x100000001B3;
+    let n = s.len;
+    var h: u64 = 0xCBF29CE484222325 ^ (n *% WK);
+    // unsafe: every read is of bytes p[0..n], unaligned (align 1)
+    unsafe {
+        let p = s.ptr;
+        if n >= 8 {
+            var i: u64 = 0;
+            while i + 8 < n {
+                let x = (h ^ ((p + i) as *u64).read_unaligned()) *% WK;
+                h = (x << 29) | (x >> 35);
+                i += 8;
+            }
+            h = (h ^ ((p + (n - 8)) as *u64).read_unaligned()) *% WK;
+        } else if n >= 4 {
+            let a = (p as *u32).read_unaligned() as u64;
+            let b = ((p + (n - 4)) as *u32).read_unaligned() as u64;
+            h = (h ^ ((a << 32) | b)) *% WK;
+        } else if n > 0 {
+            let a = p[0] as u64;
+            let b = p[n / 2] as u64;
+            let c = p[n - 1] as u64;
+            h = (h ^ ((a << 16) | (b << 8) | c)) *% WK;
+        }
     }
     mix(h)
 }
