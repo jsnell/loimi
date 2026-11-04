@@ -609,24 +609,8 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
     match obj {
         Inst(o) => {
             let cls = o.cls;
-            // The global method cache: what the call site's own cache would
-            // hold, for sites that see more classes than it has entries.
             let me = c.mcache + mc_slot(cls.id, name);
-            if cls.m == 0 and me.cls == cls.id and me.epoch == c.epoch and me.name == (name as u64) {
-                var owner = cls;
-                var d = me.depth;
-                while d > 0 { owner = owner.base ?? owner; d -= 1; }
-                if let Some(od) = owner.dict and (me.idx as u64) < od.used {
-                    let e = od.ents.e.ptr + (me.idx as u64);
-                    if e.key == Value.Str(name) {
-                        *ccls = cls.id;
-                        *cepoch = c.epoch;
-                        *cidx = me.idx;
-                        *cdepth = me.depth;
-                        return Ok((e.value, obj));
-                    }
-                }
-            }
+            if let Some(v) = mc_fill(c, cls, name, ccls, cepoch, cidx, cdepth) { return Ok((v, obj)); }
             var ic0: u32 = 0;
             if inst_get(o, name, &ic0).is_none() {
                 if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
@@ -680,6 +664,27 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
         }
         _ => builtin_method(c, obj, name, ccls, cepoch, cidx),
     }
+}
+
+/// The global method cache's function for `name` on instances of `cls`
+/// (what the call site's own cache would hold, for sites that see more
+/// classes than it has entries); None on a miss.
+/// On a hit it also fills the LOADMETHOD cache words as ops.loadmethod would.
+pub fn mc_fill(c: *Ctx, cls: Gc<Box>, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32) -> ?Value {
+    let me = c.mcache + mc_slot(cls.id, name);
+    if cls.m != 0 or me.cls != cls.id or me.epoch != c.epoch or me.name != (name as u64) { return None; }
+    var owner = cls;
+    var d = me.depth;
+    while d > 0 { owner = owner.base ?? owner; d -= 1; }
+    let Some(od) = owner.dict else { return None; };
+    if (me.idx as u64) >= od.used { return None; }
+    let e = od.ents.e.ptr + (me.idx as u64);
+    if e.key != Value.Str(name) { return None; }
+    *ccls = cls.id;
+    *cepoch = c.epoch;
+    *cidx = me.idx;
+    *cdepth = me.depth;
+    Some(e.value)
 }
 
 fn mc_slot(cls: u32, name: Gc<Str>) -> u64 {

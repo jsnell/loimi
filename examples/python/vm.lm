@@ -662,11 +662,21 @@ pub vm Py {
             next
         }
         cold {
-            gc_point();
             let Str(s) = name else { trap() };
             // Keep the previous class as the second entry.
             let (pc_, pe, pi, pd) = (cache.cls, cache.epoch, cache.idx, cache.depth);
-            let (m, selfv) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+            var m = Value.Nil;
+            var selfv = o;
+            // The global method cache first, without the call (sites that
+            // see more classes than their two entries).
+            if let Inst(i) = o and let Some(v) = ops.mc_fill(ctx, i.cls, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth) {
+                m = v;
+            } else {
+                gc_point();
+                let (m2, s2) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+                m = m2;
+                selfv = s2;
+            }
             if pe == cache.epoch and pe != 0xffffffff and pe != 0xfffffffe and pc_ != cache.cls and pc_ != 0 {
                 cache.cls2 = pc_;
                 cache.idx2 = pi;
