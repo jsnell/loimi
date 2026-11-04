@@ -19,7 +19,7 @@ arguments it uses after moving another's memory, and which it may keep
 are *inferred* over the whole call graph, so nothing is declared except
 one attribute on the one std function that handles self-aliasing on
 purpose (`#[may_alias(s)]` on `Vec.extend`). The prototype rejects every
-bug of the corpus below (16 test programs), accepts all nine `#![safe]`
+bug of the corpus below (12 test programs), accepts all nine `#![safe]`
 std modules (`text`, `diag`, `map`, `dict`, `lex`, `parse`, `hash`, `io`,
 `bc`) unchanged, finds 3 sites when *every* module of every example
 interpreter is checked (one a real dangling pointer), and leaves the
@@ -155,7 +155,7 @@ counts as "may free any GC object no local holds". Nothing about stored
 pointers changes: the rule is about *uses after a restructure*, and about
 the one thing that never outlives its function, the address of a local.
 
-- Corpus: all 8 (16 tests).
+- Corpus: all 8 (12 tests).
 - Burden: std.text, std.map, std.diag, and every other safe std module:
   **0 annotations, 0 changes**; std.mem: 1 (`#[may_alias(s)]` on
   `Vec.extend`). Every example module checked (`LOIMI_LIFETIMES=audit`):
