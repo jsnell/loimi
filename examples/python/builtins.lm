@@ -768,7 +768,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             ops.arith(c, ops.O_POW, args[0], args[1])
         }
         Round => {
-            let x = args[0];
+            let x = if let Bool(v) = args[0] { Value.Int(if v { 1 } else { 0 }) } else { args[0] };
             if value.is_int(x) {
                 if np < 2 or args[1] == Value.Nil { return Ok(x); }
                 let nd = want_int(c, args[1])?;

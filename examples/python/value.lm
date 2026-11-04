@@ -550,6 +550,27 @@ pub fn write_float(b: *text.StrBuf, f: f64) {
     if f != f { b.push_str("nan"); return; }
     if f == 1.0 / 0.0 { b.push_str("inf"); return; }
     if f == -1.0 / 0.0 { b.push_str("-inf"); return; }
+    if f >= 1e16 or f <= -1e16 {
+        // std's write_shortest keeps 17-digit integers (2**31 + 1e16) in
+        // fixed notation; Python's repr uses an exponent from 1e16 on.
+        var t = text.StrBuf.new();
+        num.write_shortest(&t, f);
+        let s = t.as_str();
+        var has_e = false;
+        for i in 0..s.len { if s[i] == 'e' { has_e = true; } }
+        if has_e { b.push_str(s); t.free(); return; }
+        var d: u64 = 0;
+        if s[0] == '-' { b.push('-'); d = 1; }
+        let exp = s.len - d - 1;
+        var end = s.len;
+        while end > d + 1 and s[end - 1] == '0' { end -= 1; }
+        b.push(s[d]);
+        if end > d + 1 { b.push('.'); b.push_str(s[d + 1..end]); }
+        b.push_str("e+");
+        b.push_int(exp as i64);
+        t.free();
+        return;
+    }
     let start = b.len();
     num.write_shortest(b, f);
     // Python writes 1e+16 for 1e16, and 1e-05 for 0.00001.
