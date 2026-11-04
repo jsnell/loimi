@@ -79,7 +79,7 @@ fn grow(r: *Regex, top: *Bt) -> ?*Bt {
     if cap >= BT_LIMIT { return None; }
     let ncap = cap * 2;
     r.bt_base = mem.grow(r.bt_base, ncap);
-    r.bt_end = r.bt_base + ncap;
+    r.bt_end = unsafe { r.bt_base + ncap }; // the end of the block just moved: moved with it, here
     Some(r.bt_base + used)
 }
 

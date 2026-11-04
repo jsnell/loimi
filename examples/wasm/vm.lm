@@ -124,9 +124,9 @@ pub struct Machine {
 
 pub fn Machine.switch_to(m: *Machine, i: *Inst) {
     m.inst = i;
-    m.funcs = i.funcs.ptr;
-    m.globals = i.globals.ptr;
-    m.sigs = i.sigs.ptr;
+    m.funcs = unsafe { i.funcs.ptr }; // unsafe: an instance's vectors are complete
+    m.globals = unsafe { i.globals.ptr }; // (`instantiate`) before any switch to it,
+    m.sigs = unsafe { i.sigs.ptr }; // so they do not move while cached here
     m.table = if i.tables.len > 0 { i.tables.at(0) } else { &m.empty_table };
     m.memory = i.memory ?? &m.empty_memory;
     m.mem_size = m.memory.size;

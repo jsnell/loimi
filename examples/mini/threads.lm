@@ -83,7 +83,7 @@ pub fn save(c: *Ctx, t: *CtxThread) {
     t.main = Some(c.main);
     t.nco = c.nco;
     t.nret = c.nret;
-    t.rbuf = c.rbuf;
+    t.rbuf = unsafe { c.rbuf }; // handed over: `load` gives `c` the next thread's before `c` grows it
     t.rcap = c.rcap;
     t.yielded = c.yielded;
     t.ypc = c.ypc;

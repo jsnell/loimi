@@ -834,12 +834,12 @@ export "C" fn mini_debug_eval(s: *MiniState, level: u32, expr: str, out: *str, c
         Ok(v) => {
             debugger.render(&d.out, v);
             *child = d.child_ref(v);
-            *out = d.out.as_str();
+            *out = unsafe { d.out.as_str() }; // lent to C until the next mini_debug_* call (above)
             MiniStatus.Ok
         }
         Err(e) => {
             value.write_value(&d.out, e);
-            *out = d.out.as_str();
+            *out = unsafe { d.out.as_str() }; // lent to C until the next mini_debug_* call (above)
             MiniStatus.Runtime
         }
     }
