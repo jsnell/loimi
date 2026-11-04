@@ -208,6 +208,49 @@ impl St {
         }
         self.esc.extend(o.esc.iter().cloned());
     }
+
+    /// Locals whose scope ended: nothing reads them again before they
+    /// are bound anew, so their entries only cost (cloned at every branch).
+    fn drop_locals(&mut self, ls: &[LocalId]) {
+        for l in ls {
+            self.vals.remove(l);
+            self.stale.remove(l);
+            self.cst.remove(l);
+        }
+    }
+}
+
+fn pat_locals(p: &TPat, out: &mut Vec<LocalId>) {
+    match &p.kind {
+        TPK::Bind(l) => out.push(*l),
+        TPK::Variant(_, ps) | TPK::Tuple(ps) | TPK::Or(ps) => ps.iter().for_each(|q| pat_locals(q, out)),
+        _ => {}
+    }
+}
+
+/// The locals bound by `let`s and patterns anywhere in `e`.
+fn bound_locals(e: &TExpr, out: &mut Vec<LocalId>) {
+    match &e.kind {
+        TK::Block(ss, _) => {
+            for s in ss {
+                match s {
+                    TStmt::Let(l, _) => out.push(*l),
+                    TStmt::LetPat(p, ..) => pat_locals(p, out),
+                    _ => {}
+                }
+            }
+        }
+        TK::If(cs, ..) => {
+            for c in cs {
+                if let TCond::Let(p, _) = c {
+                    pat_locals(p, out);
+                }
+            }
+        }
+        TK::Match(_, arms) => arms.iter().for_each(|a| pat_locals(&a.pat, out)),
+        _ => {}
+    }
+    walk_kids(e, &mut |k| bound_locals(k, out));
 }
 
 struct Fa<'a> {
@@ -224,6 +267,8 @@ struct Fa<'a> {
     err_spans: HashSet<(u32, u32)>,
     breaks: HashMap<u32, (St, Val)>,
     conts: HashMap<u32, St>,
+    /// Per loop: the locals bound inside its body (dropped when it exits).
+    loop_locals: HashMap<u32, Vec<LocalId>>,
     defers: Vec<Vec<&'a TExpr>>,
     out: Summary,
     param_idx: HashMap<LocalId, u32>,
@@ -891,6 +936,15 @@ impl<'a> Fa<'a> {
                 for d in ds.into_iter().rev() {
                     self.eval(d, st);
                 }
+                let mut ls = Vec::new();
+                for s in stmts {
+                    match s {
+                        TStmt::Let(l, _) => ls.push(*l),
+                        TStmt::LetPat(p, ..) => pat_locals(p, &mut ls),
+                        _ => {}
+                    }
+                }
+                st.drop_locals(&ls);
                 v
             }
             TK::If(conds, then, els) => {
@@ -911,6 +965,13 @@ impl<'a> Fa<'a> {
                     v.extend(self.eval(x, &mut s2));
                 }
                 st.join(&s2);
+                let mut ls = Vec::new();
+                for c in conds {
+                    if let TCond::Let(p, _) = c {
+                        pat_locals(p, &mut ls);
+                    }
+                }
+                st.drop_locals(&ls);
                 v
             }
             TK::Match(s, arms) => {
@@ -925,12 +986,23 @@ impl<'a> Fa<'a> {
                         self.eval(g, &mut s2);
                     }
                     v.extend(self.eval(&a.body, &mut s2));
+                    let mut ls = Vec::new();
+                    pat_locals(&a.pat, &mut ls);
+                    s2.drop_locals(&ls);
                     out.join(&s2);
                 }
                 *st = out;
                 v
             }
             TK::Loop { body, step, id } => {
+                let ls = self.loop_locals.entry(*id).or_insert_with(|| {
+                    let mut ls = Vec::new();
+                    bound_locals(body, &mut ls);
+                    if let Some(x) = step {
+                        bound_locals(x, &mut ls);
+                    }
+                    ls
+                }).clone();
                 let mut head = st.clone();
                 let mut iters = 0;
                 loop {
@@ -940,6 +1012,7 @@ impl<'a> Fa<'a> {
                     if let Some(c) = self.conts.remove(id) {
                         s.join(&c);
                     }
+                    s.drop_locals(&ls);
                     if let Some(x) = step {
                         self.eval(x, &mut s);
                     }
@@ -952,7 +1025,8 @@ impl<'a> Fa<'a> {
                     head = next;
                 }
                 match self.breaks.remove(id) {
-                    Some((s, v)) => {
+                    Some((mut s, v)) => {
+                        s.drop_locals(&ls);
                         *st = s;
                         v
                     }
@@ -1186,19 +1260,32 @@ fn analyze<'a>(
         err_spans: HashSet::new(),
         breaks: HashMap::new(),
         conts: HashMap::new(),
+        loop_locals: HashMap::new(),
         defers: Vec::new(),
         out: Summary::default(),
         param_idx: f.params.iter().enumerate().map(|(i, &l)| (l, i as u32)).collect(),
     };
     let _ = fa.fid;
     let mut st = St { reach: true, ..Default::default() };
+    // Parameters and other locals not bound by a `let` or pattern (vm
+    // state) start pointing at their own pointee; bound ones are assigned
+    // before they are read.
+    let mut bound = Vec::new();
+    bound_locals(b, &mut bound);
+    let bound: HashSet<LocalId> = bound.into_iter().collect();
     for (l, _) in f.locals.iter().enumerate() {
+        if bound.contains(&(l as LocalId)) {
+            continue;
+        }
         let v = fa.symbolic(l as LocalId);
         if !v.is_empty() {
             st.vals.insert(l as LocalId, v);
         }
     }
     let v = fa.eval(b, &mut st);
+    if std::env::var("LOIMI_LT_DBG").is_ok() && f.symbol.ends_with("__verify") {
+        eprintln!("{}: locals {} vals {} paths {}", f.symbol, f.locals.len(), st.vals.len(), st.vals.values().map(|v| v.len()).sum::<usize>());
+    }
     if st.reach {
         fa.ret(&v, b.span);
         fa.exit_escapes(&st);
@@ -1265,10 +1352,18 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     let mut work: Vec<FnId> = fns.iter().rev().copied().collect();
     let mut queued: HashSet<FnId> = fns.iter().copied().collect();
     let mut rounds = 0u64;
+    let stats = std::env::var("LOIMI_LIFETIMES_STATS").is_ok();
+    let mut times: HashMap<FnId, (f64, u32)> = HashMap::new();
     while let Some(i) = work.pop() {
         queued.remove(&i);
         rounds += 1;
+        let t0 = std::time::Instant::now();
         let (s, _) = analyze(p, i, &sums, &mut kinds, cx, false, None);
+        if stats {
+            let e = times.entry(i).or_default();
+            e.0 += t0.elapsed().as_secs_f64();
+            e.1 += 1;
+        }
         let old = sums.get(&i).cloned().unwrap_or_default();
         let mut merged = old.clone();
         merged.restructs.extend(s.restructs);
@@ -1288,12 +1383,21 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
     }
     if std::env::var("LOIMI_LIFETIMES_STATS").is_ok() {
         eprintln!("lifetimes: {} functions, {} analyses", fns.len(), rounds);
+        let mut v: Vec<_> = times.iter().collect();
+        v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        for (f, (t, n)) in v.iter().take(12) {
+            eprintln!("  {:8.1} ms {:3}x {}", t * 1000.0, n, p.fns[**f as usize].symbol);
+        }
     }
+    let t1 = std::time::Instant::now();
     for &i in &checked {
         let (_, errs) = analyze(p, i, &sums, &mut kinds, cx, true, audit);
         if let Some(d) = errs.into_iter().next() {
             return Err(d);
         }
+    }
+    if stats {
+        eprintln!("lifetimes: summaries {:.1} ms, checks {:.1} ms", times.values().map(|t| t.0).sum::<f64>() * 1000.0, t1.elapsed().as_secs_f64() * 1000.0);
     }
     Ok(())
 }
