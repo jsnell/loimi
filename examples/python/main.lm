@@ -69,7 +69,7 @@ fn main() -> i32 uses reenter {
         epoch: 1, mcache: mem.alloc(vm.MC_SIZE), next_cls: 1, gen_done: false, err_line: 0, buf: text.StrBuf.new(),
         n_init: None, n_str: Value.Nil, n_repr: Value.Nil, mt: [0; 624], mti: 625, vm_depth: 0, c_depth: 0, stack_low: 0, repr_active: mem.Vec.new(),
         pre_list: Value.Nil, pre_via1: Value.Nil, pre_via2: Value.Nil, dn: [Value.Nil; 40],
-        shape_root: None, shape_dict: None,
+        shape_roots: [None; 65], shape_dict: None,
     };
     let c = ctx;
     c.stack_end = c.stack + STACK - 16;

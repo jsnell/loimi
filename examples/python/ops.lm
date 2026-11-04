@@ -342,11 +342,30 @@ fn set_class_cap(cls: Gc<Box>, n: u64) {
 pub fn new_inst(c: *Ctx, cls: Gc<Box>) -> Gc<Inst> {
     var n = class_cap(cls);
     if n == 0 { n = 1; }
-    var root = c.shape_root.unwrap();
-    if CLASS_SHAPE < cls.extra.len and let Obj(r) = cls.extra[CLASS_SHAPE] { root = r; }
+    // The empty shape for n slots: the class's, made again when its slot
+    // count grows (instances made before keep theirs); for builtin
+    // classes (exceptions) one per slot count.
+    let own = CLASS_SHAPE < cls.extra.len;
+    var root: ?Gc<Box> = if own { None } else { c.shape_roots[n] };
+    if own and let Obj(r) = cls.extra[CLASS_SHAPE] and r.b == Value.Int(n as i48) { root = Some(r); }
+    if root.is_none() {
+        let r = value.new_box(&c.heap, K_SHAPE, 0);
+        r.b = Value.Int(n as i48);
+        if own { cls.extra[CLASS_SHAPE] = Value.Obj(r); } else { c.shape_roots[n] = Some(r); }
+        root = Some(r);
+    }
     // Slots past the shape's names are never read: their zero fill
     // (Float 0.0) is left as it is.
-    new(&c.heap, Inst { cls: cls, keys: root }, n)
+    new(&c.heap, Inst { cls: cls, keys: root.unwrap() }, n)
+}
+
+/// Attribute `cache` of `o` if its name there is `name` (GETATTR's and
+/// SETATTR's cold blocks: attributes past the inline ones).
+#[inline]
+pub fn inst_cached(o: Gc<Inst>, name: Value, cache: u32) -> ?Value {
+    let i = cache as u64;
+    if i >= o.keys.extra.len or o.keys.extra[i] != name { return None; }
+    Some(value.inst_at(o, i))
 }
 
 /// The shape after adding `name` to shape `k` (made on first use), or
@@ -366,6 +385,9 @@ fn shape_child(c: *Ctx, k: Gc<Box>, name: Gc<Str>) -> ?Gc<Box> {
     for i in 0..n { t.extra[i] = k.extra[i]; }
     t.extra[n] = Value.Str(nm);
     t.base = Some(k);
+    t.b = k.b;
+    let Int(cap) = k.b else { trap() };
+    t.s = if (n as i64) + 1 <= (cap as i64) { (n as i64) + 1 } else { (cap as i64) - 1 };
     if k.dict.is_none() { k.dict = Some(value.new_dict(&c.heap, 2)); }
     value.dict_set_str(&c.heap, k.dict.unwrap(), nm, Value.Obj(t));
     k.m += 1;
@@ -1085,7 +1107,6 @@ pub fn build_class(c: *Ctx, name: Value, bases: Value, ns: Value, hint: u64) -> 
         }
     }
     let cls = value.new_box(&c.heap, K_CLASS, CLASS_SLOTS + 1);
-    cls.extra[CLASS_SHAPE] = Value.Obj(value.new_box(&c.heap, K_SHAPE, 0));
     cls.a = name;
     cls.dict = Some(d);
     cls.base = Some(base);

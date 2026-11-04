@@ -114,7 +114,10 @@ pub const K_NOTIMPL: u32 = 23;
 pub const K_FROZENSET: u32 = 24;
 /// An instance shape (value.Inst): `extra` the names, `base` the parent
 /// shape, `c` the last child taken (or Nil), `dict` name -> child, `m` the
-/// number of children; `n` is 1 for the dict-mode shape.
+/// number of children; `n` is 1 for the dict-mode shape. Each tree of
+/// shapes is for instances with one slot count, `b` (an Int): `s` is how
+/// many of the names are in the slots of the same number (all of them,
+/// or one less than the slot count once they overflow, see `inst_at`).
 pub const K_SHAPE: u32 = 25;
 
 // Generator states (Box.m).

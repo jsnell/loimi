@@ -148,8 +148,7 @@ fn meth(c: *Ctx, t: u64, name: str, b: B) {
 }
 
 pub fn setup(c: *Ctx) {
-    // Instance shapes (value.Inst): the empty one, and dict mode's.
-    c.shape_root = Some(value.new_box(&c.heap, value.K_SHAPE, 0));
+    // The shape of dict-mode instances (value.Inst).
     let sd = value.new_box(&c.heap, value.K_SHAPE, 0);
     sd.n = 1;
     c.shape_dict = Some(sd);

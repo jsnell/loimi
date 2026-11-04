@@ -148,9 +148,10 @@ pub struct Ctx {
     pre_via2: Value,
     /// Interned dunder names (ops.DN_*).
     dn: [Value; 40],
-    /// The empty instance shape (the root of all shapes) and the shape of
-    /// dict-mode instances (ops.new_inst, value.Inst).
-    shape_root: ?Gc<Box>,
+    /// Empty instance shapes by slot count, for builtin classes (user
+    /// classes have their own), and the shape of dict-mode instances
+    /// (ops.new_inst, value.Inst).
+    shape_roots: [?Gc<Box>; 65],
     shape_dict: ?Gc<Box>,
 }
 
@@ -193,7 +194,7 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     gc_mark(h, c.pre_via1);
     gc_mark(h, c.pre_via2);
     for i in 0..40 { gc_mark(h, c.dn[i]); }
-    gc_mark(h, c.shape_root);
+    for i in 0..65 { gc_mark(h, c.shape_roots[i]); }
     gc_mark(h, c.shape_dict);
 }
 
@@ -568,25 +569,17 @@ pub vm Py {
     op GETATTR(dst: reg, obj: reg, name: kst) : ABC + AttrIC {
         if let Inst(o) = obj {
             // Attribute i is `name` if the shape's name i is (interned: one
-            // compare); it is in slot i unless the instance has more
-            // attributes than slots and i is the last slot or past it
-            // (value.inst_at).
+            // compare); it is in slot i if i is below the shape's inline
+            // count `s` (the others: value.inst_at, in the cold block).
             let sh = o.keys;
-            let n = sh.extra.len;
-            let cap = o.slots.len;
+            let ni = sh.s as u64;
             let i = cache.idx as u64;
-            if likely(i < n) {
-                if *(sh.extra.ptr + i) == name {
-                    if likely(n <= cap or i + 1 < cap) { dst = *(o.slots.ptr + i); next }
-                    cold { dst = value.inst_at(o, i); next }
-                }
+            if likely(i < ni) {
+                if *(sh.extra.ptr + i) == name { dst = *(o.slots.ptr + i); next }
             }
             let j = cache.idx2 as u64;
-            if j < n {
-                if *(sh.extra.ptr + j) == name {
-                    if likely(n <= cap or j + 1 < cap) { dst = *(o.slots.ptr + j); next }
-                    cold { dst = value.inst_at(o, j); next }
-                }
+            if j < ni {
+                if *(sh.extra.ptr + j) == name { dst = *(o.slots.ptr + j); next }
             }
         } else if let Obj(b) = obj and (b.kind == K_CLASS or b.kind == K_MODULE) and let Some(d) = b.dict {
             // A plain attribute of the class (or module) itself; ops.getattr
@@ -598,6 +591,7 @@ pub vm Py {
             }
         }
         cold {
+            if let Inst(o) = obj and let Some(v) = ops.inst_cached(o, name, cache.idx) { dst = v; next }
             let Str(s) = name else { trap() };
             let old = cache.idx;
             dst = ops.getattr(ctx, obj, s, &cache.idx)?;
@@ -610,14 +604,11 @@ pub vm Py {
             let sh = o.keys;
             let n = sh.extra.len;
             let i = cache.idx as u64;
-            if likely(i < n) {
+            if likely(i < sh.s as u64) {
                 if *(sh.extra.ptr + i) == name {
-                    if likely(n <= o.slots.len or i + 1 < o.slots.len) {
-                        *(o.slots.ptr + i) = src;
-                        gc.write_barrier(&ctx.heap, o as *u8);
-                        next
-                    }
-                    cold { value.inst_set_at(o, i, src); next }
+                    *(o.slots.ptr + i) = src;
+                    gc.write_barrier(&ctx.heap, o as *u8);
+                    next
                 }
             } else if i == n and i < o.slots.len and o.cls.id == cache.cls and ctx.epoch == cache.epoch {
                 // Adding attribute i: the shape's last transition, if it
@@ -631,6 +622,10 @@ pub vm Py {
             }
         }
         cold {
+            if let Inst(o) = obj and ops.inst_cached(o, name, cache.idx).is_some() {
+                value.inst_set_at(o, cache.idx as u64, src);
+                next
+            }
             gc_point();
             let Str(s) = name else { trap() };
             ops.setattr(ctx, obj, s, src, &cache.idx, &cache.cls, &cache.epoch)?;
