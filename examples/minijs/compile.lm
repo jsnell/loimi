@@ -578,6 +578,10 @@ fn Gen.enter_vars(g: *Gen, vars: *mem.Vec<*Var>) {
         if v.kind != VK.Global and boxed(v) {
             g.emit(JS.LOADU(v.reg as u8));
             g.emit(JS.BOXNEW(v.reg as u8));
+        } else if v.kind == VK.Var {
+            // `var x;` assigns nothing, and a call leaves the callee's
+            // registers as they were (CALL does not clear them).
+            g.emit(JS.LOADU(v.reg as u8));
         }
     }
 }

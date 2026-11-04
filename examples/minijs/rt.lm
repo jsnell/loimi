@@ -34,6 +34,11 @@ pub struct Ctx {
     m: obj.Model<Gc<Obj>, Gc<Vals>, V>,
     stack: *V,
     stack_end: *V,
+    /// High-water mark of the register stack since the last collection:
+    /// every slot from here up holds a value that refers to no freed
+    /// object (CALL does not clear registers; scan_roots clears the stack
+    /// above the innermost window up to here and lowers the mark).
+    hw: *V,
     frames: *Frame,
     frames_end: *Frame,
     /// The innermost frame (published by the vm's `sync` block).
@@ -115,6 +120,7 @@ pub fn Ctx.new() -> Ctx {
         ..zero
     };
     c.stack_end = c.stack + STACK_SLOTS;
+    c.hw = c.stack;
     c.frames_end = c.frames + FRAME_SLOTS;
     c.fp = c.frames;
     c
@@ -198,6 +204,16 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
         for i in 0..n { gc_mark(h, f.base[i]); }
         f = f + 1;
     }
+    // Registers above the innermost window are not scanned: clear them,
+    // so that a window that later covers them (without writing them
+    // first) holds nothing this collection frees.
+    var top = c.fp.base + c.fp.cl.proto.nregs as u64;
+    while top < c.hw {
+        *top = V.Undef;
+        top = top + 1;
+    }
+    let end = c.fp.base + c.fp.cl.proto.nregs as u64;
+    if end < c.hw { c.hw = end; }
 }
 
 pub fn Ctx.flush(c: *Ctx) {

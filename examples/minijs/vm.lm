@@ -1171,6 +1171,7 @@ pub vm JS {
             callee[i] = Undef;
             i += 1;
         }
+        if callee + n + 1 > ctx.hw { ctx.hw = callee + n + 1; }
         fp.resume = pc + 1;
         fp = fp + 1;
         fp.cl = cl;
@@ -1180,6 +1181,16 @@ pub vm JS {
         fp.k = k;
         regs = callee;
         jump p.code
+    }
+
+    /// A call whose window reaches the stack's high-water mark: check for
+    /// overflow, raise the mark, and run the op again.
+    fn grow_stack(end: *V) -> never {
+        cold {
+            if end >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+            ctx.hw = end + 1;
+            redo
+        }
     }
 
     /// A native call from CALL's members (their callee is the native
@@ -1202,26 +1213,24 @@ pub vm JS {
                 if likely(p.fixed <= 255) {
                     let callee = regs + base + 1;
                     let n = p.nregs as u64;
-                    if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+                    // The callee's registers past its parameters keep what
+                    // they held (the compiler writes every register before
+                    // reading it). They are valid values: the collector
+                    // clears the stack above the innermost window up to
+                    // the high-water mark ctx.hw (rt.scan_roots), so a
+                    // stale register never refers to a freed object.
+                    if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
+                    if fp + 1 >= ctx.frames_end {
                         cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
                     }
-                    // Missing arguments are undefined; extra ones are dropped
-                    // (their registers are the callee's locals, cleared with
-                    // the rest). Two registers per store pair: the register
-                    // after the window may be cleared too (it is free).
+                    // Missing arguments are undefined; extra ones are the
+                    // callee's locals.
                     let fx = p.fixed as u64;
                     if (nargs as u64) < fx {
                         cold {
                             var i = nargs as u64 + 1;
                             while i <= fx { callee[i] = Undef; i += 1; }
                         }
-                    }
-                    var q = callee + fx + 1;
-                    let e = callee + n;
-                    while q < e {
-                        q[0] = Undef;
-                        q[1] = Undef;
-                        q = q + 2;
                     }
                     fp.resume = pc + 1;
                     fp = fp + 1;
@@ -1326,23 +1335,17 @@ pub vm JS {
         let p = cl.proto;
         let callee = regs + base + 1;
         let n = p.nregs as u64;
-        if callee + n + 1 >= ctx.stack_end or fp + 1 >= ctx.frames_end {
+        // As in CALL.
+        if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
+        if fp + 1 >= ctx.frames_end {
             cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
         }
-        // As in CALL.
         let np = p.nparams as u64;
         if nargs < np {
             cold {
                 var i = nargs + 1;
                 while i <= np { callee[i] = Undef; i += 1; }
             }
-        }
-        var q = callee + np + 1;
-        let e = callee + n;
-        while q < e {
-            q[0] = Undef;
-            q[1] = Undef;
-            q = q + 2;
         }
         fp.resume = pc + 1;
         fp = fp + 1;
@@ -1542,6 +1545,7 @@ pub vm JS {
         c.stack[0] = Undef;
         regs = c.stack + 1;
         for i in 0..p.nregs as u64 { regs[i] = Undef; }
+        if regs + p.nregs as u64 + 1 > c.hw { c.hw = regs + p.nregs as u64 + 1; }
         fp = c.frames;
         fp.cl = cl;
         fp.base = regs;
