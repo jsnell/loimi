@@ -317,21 +317,6 @@ pub fn class_lookup(cls: Gc<Box>, name: Gc<Str>) -> ?Value {
     None
 }
 
-/// Like class_lookup, also giving the entry number and the depth of the
-/// class that has it.
-fn class_lookup_at(cls: Gc<Box>, name: Gc<Str>) -> ?(Value, u64, u32) {
-    var k: ?Gc<Box> = Some(cls);
-    var depth: u32 = 0;
-    while let Some(x) = k {
-        if let Some(d) = x.dict {
-            if let Some(e) = value.dict_find_str(d, name) { return Some((value.dict_val(d, e), e, depth)); }
-        }
-        k = x.base;
-        depth += 1;
-    }
-    None
-}
-
 pub fn new_instance(c: *Ctx, cls: Gc<Box>) -> Value { Value.Inst(new_inst(c, cls)) }
 
 // ── instance layout (value.Inst) ────────────────────────────────────
@@ -713,24 +698,23 @@ pub fn delattr(c: *Ctx, obj: Value, name: Gc<Str>) -> Result<(), Value> {
 
 /// For LOADMETHOD: (callable, self or Undef), filling the cache when the
 /// lookup can be repeated without the instance dict.
-pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32)
+pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cfn: *u64)
     -> Result<(Value, Value), Value> uses reenter {
     builtins.count(builtins.CNT_LOADMETHOD);
     match obj {
         Inst(o) => {
             let cls = o.cls;
             let me = c.mcache + mc_slot(cls.id, name);
-            if let Some(v) = mc_fill(c, cls, name, ccls, cepoch, cidx, cdepth) { return Ok((v, obj)); }
+            if let Some(v) = mc_fill(c, cls, name, ccls, cepoch, cfn) { return Ok((v, obj)); }
             var ic0: u32 = 0;
             if inst_get(o, name, &ic0).is_none() {
-                if let Some((v, e, depth)) = class_lookup_at(o.cls, name) {
+                if let Some(v) = class_lookup(o.cls, name) {
                     if let Func(_) = v {
                         if o.cls.m == 0 {
                             *ccls = o.cls.id;
                             *cepoch = c.epoch;
-                            *cidx = e as u32;
-                            *cdepth = depth;
-                            *me = vm.MCEnt { cls: cls.id, epoch: c.epoch, name: name as u64, idx: e as u32, depth: depth };
+                            *cfn = v as u64;
+                            *me = vm.MCEnt { cls: cls.id, epoch: c.epoch, name: name as u64, fnv: v as u64 };
                         }
                         return Ok((v, obj));
                     }
@@ -780,22 +764,23 @@ pub fn loadmethod(c: *Ctx, obj: Value, name: Gc<Str>, ccls: *u32, cepoch: *u32, 
 /// (what the call site's own cache would hold, for sites that see more
 /// classes than it has entries); None on a miss.
 /// On a hit it also fills the LOADMETHOD cache words as ops.loadmethod would.
-pub fn mc_fill(c: *Ctx, cls: Gc<Box>, name: Gc<Str>, ccls: *u32, cepoch: *u32, cidx: *u32, cdepth: *u32) -> ?Value {
+pub fn mc_fill(c: *Ctx, cls: Gc<Box>, name: Gc<Str>, ccls: *u32, cepoch: *u32, cfn: *u64) -> ?Value {
     let me = c.mcache + mc_slot(cls.id, name);
     if cls.m != 0 or me.cls != cls.id or me.epoch != c.epoch or me.name != (name as u64) { return None; }
-    var owner = cls;
-    var d = me.depth;
-    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-    let Some(od) = owner.dict else { return None; };
-    if (me.idx as u64) >= od.used { return None; }
-    let e = od.ents.e.ptr + (me.idx as u64);
-    if e.key != Value.Str(name) { return None; }
     *ccls = cls.id;
     *cepoch = c.epoch;
-    *cidx = me.idx;
-    *cdepth = me.depth;
-    Some(e.value)
+    *cfn = me.fnv;
+    Some(method_value(me.fnv))
 }
+
+/// The method a LOADMETHOD cache entry (or MCEnt) holds as bits: a Func
+/// found on the instance's class (id `cls`) at class epoch `epoch`. Only
+/// read while both still match, so it is alive: the class is (one of its
+/// instances is being called on; class ids are never reused), and its
+/// chain's dicts, which hold the function, are unchanged (each change
+/// bumps the epoch).
+#[inline]
+pub fn method_value(bits: u64) -> Value { unsafe { bits as Value } }
 
 fn mc_slot(cls: u32, name: Gc<Str>) -> u64 {
     (((name as u64) >> 3) *% 0x9e3779b97f4a7c15 +% (cls as u64) *% 0x2545f4914f6cdd1d) >> 54

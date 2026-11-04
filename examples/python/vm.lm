@@ -94,9 +94,9 @@ pub const T_NOTIMPL: u64 = 23;
 
 /// An entry of the global method cache (`Ctx.mcache`, ops.loadmethod's
 /// miss path): name `name` (an interned string's address) looked up on
-/// class `cls` at class epoch `epoch` is entry `idx` of the dict of the
-/// class `depth` steps up the chain (a function).
-pub struct MCEnt { cls: u32, epoch: u32, name: u64, idx: u32, depth: u32 }
+/// class `cls` at class epoch `epoch` is the function with bits `fnv`
+/// (ops.method_value).
+pub struct MCEnt { cls: u32, epoch: u32, name: u64, fnv: u64 }
 pub const MC_SIZE: u64 = 1024;
 
 pub struct Ctx {
@@ -245,7 +245,10 @@ pub vm Py {
     /// `cls` at `epoch` whose dict has `idx` entries, where it is appended).
     cache SetIC { idx: u32, cls: u32, epoch: u32 }
     /// Two classes (deltablue's call sites see several).
-    cache MethIC { cls: u32, epoch: u32, idx: u32, depth: u32, cls2: u32, idx2: u32, depth2: u32 }
+    /// Instances: two entries (class id, the method's bits) valid at class
+    /// epoch `epoch` (see ops.method_value); modules and classes (epoch
+    /// 0xfffffffe) and builtin types (0xffffffff) use `idx`.
+    cache MethIC { cls: u32, epoch: u32, idx: u32, fnv: u64, cls2: u32, fnv2: u64 }
 
     sync { ctx.fp = fp; #[cfg(debug)] fp.at = pc; } // --cfg debug: where a frame calling a native is (backtraces)
     reload { fp = ctx.fp; regs = fp.base; k = fp.k; #[cfg(debug)] if debugger.stepping() { use_variant step; } } // --cfg debug: the native ran Python code that steps
@@ -644,27 +647,15 @@ pub vm Py {
         if let Inst(i) = o {
             let cls = i.cls;
             if ctx.epoch == cache.epoch {
-                // Class chains and class dicts are never None on these paths
-                // (the cache was filled through them); `??` avoids a panic call.
                 if cls.id == cache.cls {
-                    var owner = cls;
-                    var d = cache.depth;
-                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-                    if let Some(od) = owner.dict {
-                        regs[base.raw] = (od.ents.e.ptr + (cache.idx as u64)).value;
-                        regs[base.raw + 1] = o;
-                        next
-                    }
+                    regs[base.raw] = ops.method_value(cache.fnv);
+                    regs[base.raw + 1] = o;
+                    next
                 }
                 if cls.id == cache.cls2 {
-                    var owner = cls;
-                    var d = cache.depth2;
-                    while d > 0 { owner = owner.base ?? owner; d -= 1; }
-                    if let Some(od) = owner.dict {
-                        regs[base.raw] = (od.ents.e.ptr + (cache.idx2 as u64)).value;
-                        regs[base.raw + 1] = o;
-                        next
-                    }
+                    regs[base.raw] = ops.method_value(cache.fnv2);
+                    regs[base.raw + 1] = o;
+                    next
                 }
             }
         } else if let Obj(b) = o and cache.epoch == 0xfffffffe and let Some(d) = b.dict {
@@ -689,23 +680,24 @@ pub vm Py {
         cold {
             let Str(s) = name else { trap() };
             // Keep the previous class as the second entry.
-            let (pc_, pe, pi, pd) = (cache.cls, cache.epoch, cache.idx, cache.depth);
+            let (pc_, pe, pf) = (cache.cls, cache.epoch, cache.fnv);
             var m = Value.Nil;
             var selfv = o;
             // The global method cache first, without the call (sites that
             // see more classes than their two entries).
-            if let Inst(i) = o and let Some(v) = ops.mc_fill(ctx, i.cls, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth) {
+            var f = pf;
+            if let Inst(i) = o and let Some(v) = ops.mc_fill(ctx, i.cls, s, &cache.cls, &cache.epoch, &f) {
                 m = v;
             } else {
                 gc_point();
-                let (m2, s2) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &cache.depth)?;
+                let (m2, s2) = ops.loadmethod(ctx, o, s, &cache.cls, &cache.epoch, &cache.idx, &f)?;
                 m = m2;
                 selfv = s2;
             }
+            cache.fnv = f;
             if pe == cache.epoch and pe != 0xffffffff and pe != 0xfffffffe and pc_ != cache.cls and pc_ != 0 {
                 cache.cls2 = pc_;
-                cache.idx2 = pi;
-                cache.depth2 = pd;
+                cache.fnv2 = pf;
             } else if pe != cache.epoch {
                 cache.cls2 = 0;
             }
