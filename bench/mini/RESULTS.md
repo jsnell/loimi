@@ -13,7 +13,10 @@ well with Loimi because every handler is its own symbol.
 ## Current results
 
 (See [`docs/results.md`](../../docs/results.md) for current numbers,
-all dispatch modes and the JIT, measured 2026-11-03.)
+all dispatch modes and the JIT, measured 2026-11-03. The third phase
+below, 2026-11-04, has a newer tail-call table: 0.49 of PUC-Lua's time
+and 0.77 of LuaJIT -joff's by geometric mean, 0.927 of the time
+before it.)
 
 Commit fe6c642 (second phase). `--dispatch=tailcall` and `goto` are the
 same source; "(before)" is Mini/-joff at the end of the first phase
@@ -290,6 +293,137 @@ Tried and dropped:
 - **Supers only spectral_norm uses** (MUL;MULK_IF, ADD_FI;RDIVK, ...):
   no measurable effect, removed.
 
+### Third phase (2026-11-04)
+
+Aimed at the benchmarks where LuaJIT's interpreter was closest:
+string_build (1.06 of -joff at the start), queens (0.98), sort (0.96),
+sieve (0.94), spectral_norm (0.93), hash_strings (0.89), and the
+coroutine suite. A/B numbers are user+sys CPU time, minimum of 5-9
+interleaved runs, `--align-functions=64`, against the build just before
+(the host was loaded, 1-minute load average 2-5; wall-clock runs moved
+by up to 10%).
+
+At the end of the phase (b2fbc43; the reorder of item 36 came after),
+user+sys CPU seconds, minimum of 7 interleaved runs, load average about
+3; "before" is the phase's starting commit (cdb5024), built the same way:
+
+| Benchmark | Mini | Mini (before) | LuaJIT -joff | PUC-Lua 5.4 | Mini/Lua | Mini/-joff | before/-joff | Mini/before |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| binary_trees | 0.765 | 0.758 | 1.369 | 2.489 | 0.31 | 0.56 | 0.55 | 1.009 |
+| closures | 0.446 | 0.455 | 0.963 | 1.240 | 0.36 | 0.46 | 0.47 | 0.980 |
+| fannkuch | 1.120 | 1.215 | 1.396 | 1.667 | 0.67 | 0.80 | 0.87 | 0.922 |
+| fib | 0.970 | 0.978 | 1.122 | 1.601 | 0.61 | 0.86 | 0.87 | 0.992 |
+| hash_strings | 0.978 | 1.069 | 1.019 | 1.643 | 0.60 | 0.96 | 1.05 | 0.915 |
+| interp | 0.906 | 0.965 | 1.113 | 2.008 | 0.45 | 0.81 | 0.87 | 0.939 |
+| mandelbrot | 0.637 | 0.642 | 0.781 | 1.205 | 0.53 | 0.82 | 0.82 | 0.992 |
+| nbody | 0.443 | 0.464 | 0.517 | 1.152 | 0.38 | 0.86 | 0.90 | 0.955 |
+| oo_methods | 0.683 | 0.795 | 1.025 | 1.382 | 0.49 | 0.67 | 0.78 | 0.859 |
+| queens | 0.884 | 0.924 | 0.945 | 1.233 | 0.72 | 0.94 | 0.98 | 0.957 |
+| sieve | 0.620 | 0.749 | 0.900 | 1.339 | 0.46 | 0.69 | 0.83 | 0.828 |
+| sort | 0.752 | 0.830 | 0.871 | 1.148 | 0.66 | 0.86 | 0.95 | 0.906 |
+| spectral_norm | 1.087 | 1.093 | 1.161 | 1.796 | 0.61 | 0.94 | 0.94 | 0.995 |
+| string_build | 0.634 | 0.828 | 0.820 | 2.135 | 0.30 | 0.77 | 1.01 | 0.766 |
+| **geomean** | | | | | **0.49** | **0.77** | 0.83 | **0.927** |
+| coro chameneos | 0.392 | 0.442 | 0.392 | 1.029 | 0.38 | 1.00 | 1.13 | 0.887 |
+| coro coroutine_ring | 0.357 | 0.347 | 0.374 | 1.007 | 0.35 | 0.95 | 0.93 | 1.029 |
+| coro sieve | 0.363 | 0.368 | 0.381 | 1.062 | 0.34 | 0.95 | 0.97 | 0.986 |
+| **coro geomean** | | | | | **0.36** | **0.97** | 1.00 | **0.966** |
+
+Mini now takes less time than LuaJIT's interpreter on all 14 programs
+(hash_strings 0.96, queens 0.94 and spectral_norm 0.94 are the closest;
+string_build went from 1.01 to 0.77) and ties it on chameneos. In
+other runs of the same builds binary_trees, fib and coroutine_ring were
+0.98-1.01 of before: within noise.
+
+29. **Word-at-a-time string hash** (a553d62, std). `std.hash.bytes` was
+    FNV-1a, a dependent multiply per byte. It now takes eight bytes per
+    multiply (overlapping reads for the tail and for strings under 8
+    bytes, the length in the seed) and mixes as before. Mini hashes
+    every string it makes, to intern it: string_build 0.92. MiniJS,
+    Python: within ±2% (MiniJS strings 0.98).
+30. **One buffer for the string natives** (3a304d7). string.char, rep,
+    format, table.concat and tostring built each result in a new
+    StrBuf (malloc, regrowth, free); they now borrow one kept in the
+    intern table's `Strings` (a nested user gets a fresh one).
+    string.char with one code uses a stack byte. The intern table's
+    sweeper prefetches the string 16 slots ahead (~1%).
+    string_build 0.93.
+31. **`%` by multiplication** (2646566, 1c3e20b). MODK caches
+    Granlund-Montgomery's m and s in an inline cache, so
+    floor(x / k) = (x * m) >> s for 0 <= x < 2^31 (3 cycles instead of
+    idiv's ~26). MOD caches them for the first divisor a site sees and
+    gives up on a second one: recomputing at every miss (a 64-bit
+    division) made the coroutine sieve, whose `n % p` sees every prime,
+    12% slower. closures 0.96, oo_methods 0.88.
+32. **Rotated while loops, threaded jumps** (0394dac, compiler). A
+    while loop with a condition of at most 16 words (and no function
+    literal) compiles the condition again after the body, re-lexed from
+    the saved lexer state, as a test that jumps back while it holds:
+    no JMP per iteration. `Parser.finish` threads jumps to JMPs
+    (`std.bc` `thread_jumps`: the end of an if branch at the end of a
+    loop body). Neither under `--cfg debug`. sort's JMPs went from 29M
+    to 9M: sort 0.977, interp 0.971, hash_strings 0.982. (Found a latent
+    bug: `jump_if` on `not x` emitted TESTT whatever the polarity.)
+33. **Appends in place** (b23667e). `t[#t + 1] = v` with room in the
+    array part and no hash part is stored by SETINDEX/SETINDEXK
+    themselves. sieve 0.895.
+34. **Unequal non-numbers compare false inline** (73c2c01; in EQ/EQK and the JEQ
+    family, which went to `raw_equal` in a cold block whenever the
+    words differed): chameneos 0.97.
+35. **Supers** (73c2c01, 826586b, ae8f557): GETUPVAL;GETINDEX;TESTT (queens 0.97), GETINDEX;
+    GETINDEX;TEST and ADDI;SETINDEX (the counting idiom of
+    hash_strings: 0.98), GETUPVAL;ADDI;CALL (`f(n - 1)` with `f` an
+    upvalue: fib 0.95, coroutine_ring 0.98).
+36. **math.sqrt and math.floor without the native call** (367c61a), at the start
+    of CALL's native cold block (floor by truncating, since libm's is a
+    call): nbody 0.95. In the hot part of CALL the same code made
+    closures 4-5% slower (code layout; the closure path's code was the
+    same), so it stays cold, after the coroutine.resume/yield tests
+    (in front of them it cost coroutine_ring ~3%; moving it, adc4f0d:
+    chameneos 0.96).
+37. **string.format's plain `%d`** (6a78cd0) with `push_int` instead of
+    snprintf: string_build 0.95.
+38. **Frameless table and return handlers** (6e611d3, 11a6663). Plain calls on rare paths
+    gave whole handlers a stack frame (the "Remaining issues" item
+    below): the table barrier's `log_table`, `table_set` and
+    `table_get` in SETINDEX, SETINDEXK, SETFIELD, GETINDEX, GETINDEXI
+    and supers containing them, and `close_upvals` in the returns. The
+    barrier's slow path and the generic paths are now cold blocks. A
+    cold block that falls through may stay inline with its call (the
+    returns' did), so theirs now ends in `redo`, which runs the return
+    again with the upvalues closed.
+    sieve 0.92, fannkuch 0.95, sort 0.94, hash_strings 0.98; closures
+    0.95 from the returns.
+39. **Constants in multiple assignment** (6f18646) stay unloaded until stored:
+    `cols[c], d1[a], d2[b] = true, true, true` is three SETINDEXK
+    instead of three LOADBOOLs and SETINDEXes. queens 0.96 (fannkuch,
+    whose code is unchanged, 1.02: layout).
+40. **Minor collections sweep only young strings** (b2fbc43). The intern table's
+    sweeper read the header of every live string in every collection
+    (a cache miss each) and scanned the whole table (up to 8 MB in
+    string_build). `Strings.young` now lists the strings made since the
+    last sweep; in a minor collection only those can die (old objects
+    count as marked), so the sweeper checks them and finds a dead one's
+    slot from its hash (dead objects are intact until the sweepers have
+    run). Strings over 400 bytes may be large objects, young for two
+    collections, so survivors that long stay listed. sweep_strings 8.3%
+    → 3.8% of string_build's samples; string_build 0.92-0.93 (two
+    rounds of 11 runs).
+
+Tried and dropped:
+
+- **Supers** SETINDEXK;FORLOOP and GETINDEX;TESTT (sieve 2.5% slower),
+  ADD;SUB (queens within 1%).
+- **Intern table shrink thresholds**: shrinking when live * 32 < cap
+  instead of live * 8 (fewer rehashes, a larger table): string_build
+  1.07; when live * 4 < cap: 1.04, hash_strings 1.015.
+- **LEN without its frame** (string fast path, `length` in a cold
+  block): within 1%.
+- **No register clearing in CALL**, as an upper bound (unsafe as is):
+  fib 0.92, binary_trees and spectral_norm 0.98, others within 2%.
+  Doing it safely needs MiniJS's high-water mark across coroutine
+  stacks, nested runs and the debugger; not attempted.
+
 ## Int(i48): measured, not adopted
 
 Mini keeps 32-bit integers (SPEC §2.1). Switching the payload to `i48`
@@ -336,9 +470,10 @@ and two benchmarks stay above 4%, the switch was not made.
 - `x % y` on `iN` wider than 32 bits keeps the MIN % -1 guard even when
   `y > 0` was tested on the same value (the test is on the shifted
   payload, the guard on the extended one).
-- Hot handlers that make a plain call on some path (GETINDEX's
-  `table_get`, SETINDEX's `table_set`, CALL's clearing loop) get a
-  stack frame (`push %rbp`) on every path; only `cold` keeps it off.
+- Hot handlers that make a plain call on some path get a stack frame
+  (`push %rbp`) on every path; only `cold` keeps it off, reliably only
+  for a cold block that ends in a control word (`next`, `redo`, ...):
+  one that falls through may stay inline with its call (item 38).
 - `cvtsi2sd` into a register with a stale upper half (no `xorps`
   break): a false dependency in the mixed int/float members.
 - No way to say "this pointer is dereferenceable", so loads cannot be
