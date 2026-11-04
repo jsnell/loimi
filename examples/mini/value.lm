@@ -92,8 +92,11 @@ pub value V repr nanbox {
 /// an empty slot and 1 a tombstone. Weak: a sweeper turns strings the
 /// collector did not mark into tombstones. Reached through the heap's
 /// `user` pointer. `buf` is a byte buffer kept between the natives that
-/// build strings (`take_buf`).
-pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, buf: text.StrBuf }
+/// build strings (`take_buf`). `young` holds the slot words of the
+/// strings made since the last sweep (and of large survivors, which stay
+/// young for one more collection): in a minor collection only those can
+/// die, so the sweeper checks them instead of the whole table.
+pub struct Strings { slots: *u64, cap: u64, live: u64, used: u64, buf: text.StrBuf, young: mem.Vec<u64> }
 
 const TOMB: u64 = 1;
 /// Prefetch distance of `sweep_strings`, in slots.
@@ -113,6 +116,7 @@ pub fn init_strings(h: *gc.Heap) {
     let st: *Strings = mem.alloc(1);
     st.cap = 0;
     st.buf = text.StrBuf.new();
+    st.young = mem.Vec.new();
     strings_resize(st, 1024);
     h.user = st as *u8;
     h.add_sweeper(st as *u8, sweep_strings);
@@ -141,10 +145,46 @@ fn strings_resize(st: *Strings, cap: u64) {
     if n > 0 { mem.release(old); }
 }
 
+/// Strings longer than this may be large objects (over 496 bytes with
+/// the header), which are young until they survive two collections.
+const YOUNG_LARGE: u64 = 400;
+
 fn sweep_strings(h: *gc.Heap, data: *u8) {
     let st = data as *Strings;
     let slots = st.slots;
     let cap = st.cap;
+    if h.is_minor() {
+        // Old strings count as marked: only `young` ones can die. A dead
+        // one is still intact here (no sweeper before this one reuses
+        // memory), so its hash finds its slot.
+        let mask = cap - 1;
+        var keep: u64 = 0;
+        for j in 0..st.young.len {
+            let w = st.young.at(j);
+            let o = str_at(w);
+            if h.is_marked((w & ADDR) as *u8) {
+                if o.data.len > YOUNG_LARGE {
+                    st.young.set(keep, w);
+                    keep += 1;
+                }
+            } else {
+                var i = o.hash & mask;
+                loop {
+                    let x = slots[i];
+                    if x == w {
+                        slots[i] = TOMB;
+                        st.live -= 1;
+                        break;
+                    }
+                    if x == 0 { break; }
+                    i = (i + 1) & mask;
+                }
+            }
+        }
+        st.young.truncate(keep);
+        return;
+    }
+    st.young.clear();
     for i in 0..cap {
         // The live strings' headers are scattered over the heap: start
         // loading the one PF slots ahead (empty slots and tombstones
@@ -200,6 +240,7 @@ pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
     let o = new(h, Str { hash: hv }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
     slots[i] = (o as u64) | tag;
+    st.young.push((o as u64) | tag);
     st.live += 1;
     st.used += 1;
     if st.used * 2 > st.cap {

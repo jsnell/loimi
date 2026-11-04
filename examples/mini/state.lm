@@ -72,6 +72,7 @@ pub fn free_ctx(c: *Ctx) {
     let st = c.heap.user as *Strings;
     mem.release(st.slots);
     st.buf.free();
+    st.young.free();
     mem.release(st);
     c.heap.free();
     #[cfg(gil)]
