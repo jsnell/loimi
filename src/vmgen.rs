@@ -713,7 +713,7 @@ fn jump_to(g: &mut FnGen, t: &TExpr) {
     let tv = g.val(t);
     if crate::jitgen::counting(g) && !g.vm.as_ref().unwrap().combined && g.f().vm_role != VmRole::Entry {
         let pc_local = g.f().vm_state[g.p().vms[g.vm.as_ref().unwrap().vm as usize].pc_idx];
-        let kind = crate::jitgen::jump_kind(t, pc_local);
+        let kind = crate::jitgen::jump_kind(g.p(), t, pc_local);
         jit_dispatch(g, &tv, kind);
     } else {
         dispatch(g, &tv);
@@ -817,9 +817,11 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
         match kind {
             JumpKind::Const(_) => {}
             JumpKind::PcRel => crate::jitgen::hot_count(g, vd, target, true),
-            // Calls count (as LuaJIT's function headers do); returns do
-            // not: a caller gets hot through its own calls and loops.
-            JumpKind::Entry => {
+            // Calls count (as LuaJIT's function headers do), and so do
+            // jumps to resume points (Prolog enters clauses from its try
+            // chains that way); returns do not: a caller gets hot through
+            // its own calls and loops.
+            JumpKind::Entry | JumpKind::Resume => {
                 crate::jitgen::enter_if_compiled(g, vd, target);
                 crate::jitgen::hot_count(g, vd, target, false)
             }
@@ -862,7 +864,7 @@ fn jit_dispatch(g: &mut FnGen, target: &str, kind: crate::jitgen::JumpKind) {
             }
             dispatch(g, target);
         }
-        JumpKind::Entry => {
+        JumpKind::Entry | JumpKind::Resume => {
             crate::jitgen::enter_if_compiled(g, vd, target);
             crate::jitgen::hot_count(g, vd, target, false);
             dispatch(g, target);

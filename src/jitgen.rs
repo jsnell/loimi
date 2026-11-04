@@ -213,7 +213,7 @@ pub fn counted_fns(p: &Program, vi: usize) -> std::collections::HashSet<FnId> {
         };
         crate::tirwalk::for_each_expr(body, &mut |e| match &e.kind {
             TK::Vm(TVm::Jump(t) | TVm::SharedNext(t, ..)) => {
-                if !matches!(jump_kind(t, pc_local), JumpKind::Const(_)) {
+                if !matches!(jump_kind(p, t, pc_local), JumpKind::Const(_)) {
                     base = true;
                 }
             }
@@ -459,11 +459,15 @@ pub enum JumpKind {
     PcRel,
     /// The start of a verified code object (`jump p.code`: a call).
     Entry,
+    /// A resume point (`jump r` with `r: Vm.Resume`): an instruction
+    /// boundary of verified code saved by vm code. Counted like a call:
+    /// Prolog's TRY/RETRY/TRUST and guard chains enter clauses this way.
+    Resume,
     /// Read from memory (returns).
     Dynamic,
 }
 
-pub fn jump_kind(t: &TExpr, pc_local: LocalId) -> JumpKind {
+pub fn jump_kind(p: &Program, t: &TExpr, pc_local: LocalId) -> JumpKind {
     match &t.kind {
         TK::Intrinsic(Intr::PtrOffset, args) => {
             if let (TK::Local(l), TK::Int(d)) = (&args[0].kind, &args[1].kind) {
@@ -475,13 +479,21 @@ pub fn jump_kind(t: &TExpr, pc_local: LocalId) -> JumpKind {
         }
         TK::Local(l) if *l == pc_local => JumpKind::Const(0),
         TK::Local(_) | TK::Binary(..) => JumpKind::PcRel,
-        TK::Block(_, Some(tail)) => match jump_kind(tail, pc_local) {
+        TK::Block(_, Some(tail)) => match jump_kind(p, tail, pc_local) {
             JumpKind::Const(_) => JumpKind::PcRel,
             k => k,
         },
         TK::Field(code, 0) if matches!(code.ty, Ty::Slice(_)) => JumpKind::Entry,
+        TK::Field(r, 0) if is_resume(p, &r.ty) => JumpKind::Resume,
         _ => JumpKind::Dynamic,
     }
+}
+
+/// Whether `t` is a vm's generated resume point type `Vm__Resume`.
+fn is_resume(p: &Program, t: &Ty) -> bool {
+    let Ty::Struct(sid) = t else { return false };
+    let sd = &p.structs[*sid as usize];
+    sd.name.ends_with("__Resume") && sd.fields.len() == 1 && sd.fields[0].0 == "__pc"
 }
 
 /// A dynamic jump (call, return) in a JIT build: if the target holds an
