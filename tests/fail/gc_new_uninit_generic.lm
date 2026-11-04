@@ -1,0 +1,12 @@
+// Checked per instance: an unzeroed trailing array of `T` is fine for
+// `i64` and not for `Gc<Node>`, also in `unsafe`.
+import std.gc;
+object Node { v: i64 }
+object Arr<T> { items: [T] }
+fn make<T>(h: *gc.Heap, n: u64) -> Gc<Arr<T>> { unsafe { new_uninit(h, Arr {}, n) } }
+fn main() {
+    var heap = gc.Heap.new();
+    let a: Gc<Arr<i64>> = make(&heap, 4);
+    let b: Gc<Arr<Gc<Node>>> = make(&heap, 4);
+}
+// error: `Gc<Node>` holds references the collector would trace
