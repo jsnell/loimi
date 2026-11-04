@@ -966,9 +966,10 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   nothing in modules without `#![safe]`. Vm code is exempt (its operand
   accesses rest on the verifier, section 6), as is code generated from
   a `vm` declaration; so a `#![safe]` module cannot declare a `vm`.
-  *Pointer stability is checked* (prototype, `docs/design/lifetimes.md`),
-  in `#![safe]` modules and in modules marked `#![lifetimes]` (the
-  same check without the raw-pointer rule, so it can declare a `vm`):
+  *Pointer stability is checked* (`docs/design/lifetimes.md`) in every
+  module, std's included, unless the module says **`#![lifetimes(off)]`**
+  (a `#![safe]` module cannot; a bare `#![lifetimes]`, the old opt-in,
+  is accepted and changes nothing):
   a pointer or slice into a `Vec`, map, arena or GC object may not be
   used after a call that may move or free that memory (inferred over
   the call graph: `push`, `insert`, `free`, a call that may collect,
@@ -976,9 +977,13 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   growth of the other copy, and the address of a local may not be
   returned or left stored where it outlives the function.
   `#[may_alias(p)]` on a function says argument `p` may point into what
-  it grows (`Vec.extend`). A pointer stored in memory and loaded back
-  elsewhere is not followed, so a pointer into a `Vec` or map can still
-  dangle that way. Built with `--sanitize=address`, std's
+  it grows (`Vec.extend`), `#[shrinks(v)]` that it removes elements of
+  `v` (`Vec.pop`), and `unsafe { }` silences the check inside it; those
+  are the finer escapes. `LOIMI_LIFETIMES=off` skips the check for a
+  build. A pointer into a `Vec`'s or a map's buffer may not be stored
+  where it outlives the function; other pointers stored in memory and
+  loaded back elsewhere are not followed, so they can still dangle that
+  way (an arena node after `Arena.free`). Built with `--sanitize=address`, std's
   containers poison the memory they keep but no longer use (a `Vec`'s
   spare capacity, an arena chunk's unused tail), so ASan reports a
   stale pointer into it as well as into freed memory; other builds are
@@ -997,6 +1002,38 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   fn second_raw(p: *u8) -> u8 {
       // unsafe: callers pass a buffer of at least two bytes
       unsafe { p[1] }
+  }
+  ```
+
+  Pointer stability, in a module without any attribute:
+
+  <!-- snippet: fail "`s` may dangle"
+  import std.mem;
+  {snippet}
+  fn main() {}
+  -->
+  ```loimi
+  fn first_after_push(v: *mem.Vec<u64>) -> u64 {
+      let s = v.items();
+      v.push(0);    // may move the buffer `s` points into
+      s[0]          // error: `s` may dangle
+  }
+  ```
+
+  and a module that opts out (an ASan test whose stale use is the
+  point, `tests/asan/`):
+
+  <!-- snippet: check
+  {snippet}
+  fn main() {}
+  -->
+  ```loimi
+  #![lifetimes(off)]
+  import std.mem;
+  fn first_after_push(v: *mem.Vec<u64>) -> u64 {
+      let s = v.items();
+      v.push(0);
+      s[0]          // not checked: reads freed memory if `push` moved it
   }
   ```
 - **Alignment.** `*p` assumes `p` is aligned for its type (LLVM may

@@ -139,6 +139,17 @@ implementation; `git log` has the details.
   `HashMap.insert` now counts as moving its table. In the examples: 7
   sites, safe by protocol, marked `unsafe { }` with the reason; no IR
   change.
+- **Pointer stability is checked by default** in every module, std's
+  unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`, ..) included
+  (`docs/design/lifetimes.md` section 10, question 5).
+  `#![lifetimes(off)]` opts a module out (not a `#![safe]` one);
+  `#[may_alias]`, `#[shrinks]` and `unsafe { }` stay the finer escapes;
+  a bare `#![lifetimes]` is accepted and does nothing, and the examples'
+  77 modules dropped it. Outside the examples it found 9 sites: a test
+  registered a dead local as a GC root scanner (`tests/run/std_obj.lm`,
+  fixed; `tests/fail/lt_scanner_local.lm`), and the 8 ASan tests whose
+  stale pointer is the point opt out. std, the tutorial, the benchmarks
+  and the doc snippets needed nothing. No IR change.
 - **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
   reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
   pointer casts, other modules' buffer pointers and invariant fields,

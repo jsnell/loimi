@@ -133,7 +133,7 @@ unsafe { write(fd, s.ptr, s.len) }
    entry indices with `version`) are the safe alternative where they
    are cheap. Built with `--sanitize=address`, most stale uses are
    reported at run time (section 7). *Update:* the uses within one
-   function, through calls, are now compile errors (pointer
+   function, through calls, are now compile errors in every module (pointer
    stability, `docs/design/lifetimes.md`); pointers stored in memory
    and loaded elsewhere remain this hole.
 2. **GC references in host memory.** A `Gc<T>` kept somewhere the

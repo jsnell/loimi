@@ -189,15 +189,17 @@ those builds.
   `unsafe { }`; so do reading pointers held in another module's
   tuple/array/function fields or enum payloads, zero-initialized
   pointers, `new` with an allocator whose `alloc_bytes` is not `#[raw]`,
-  and declaring a `vm`. Pointer stability is checked in `#![safe]` and
-  `#![lifetimes]` modules (prototype, `design/lifetimes.md`): a pointer
+  and declaring a `vm`. Pointer stability is checked in every module,
+  std's included (`design/lifetimes.md`; `#![lifetimes(off)]` opts a
+  non-`#![safe]` module out, as the ASan tests of stale pointers do;
+  `LOIMI_LIFETIMES=off` turns it off for a build): a pointer
   into a container used after a call that may move or free it or
   remove its elements (`#[shrinks]`), Vec copy aliasing, arguments
   aliasing what the callee moves, escaping local addresses, and a
   pointer into growable memory stored where it outlives the function
-  are errors; other pointers stored in memory are not followed. Every
-  module of the example
-  interpreters opts in (`#![lifetimes]`). Under
+  are errors; other pointers stored in memory are not followed. No
+  module of std, the examples, the tutorial or the benchmarks opts
+  out. Under
   `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
   longer use, so stale pointers into it are reported at run time.
   `std.lex`, `parse`, `diag`, `text`, `hash`,

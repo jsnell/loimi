@@ -1,12 +1,12 @@
 # Design note: lifetimes and pointer stability at compile time
 
-Status: **phase 1: design and prototype** (`src/lifetimes.rs`, opt-in:
-`#![safe]` and `#![lifetimes]` modules), **migration step 2 done**: every
-module of the example interpreters is `#![lifetimes]` (section 9), and
-checking all of them costs under 10% of the front end (section 8).
-**Phase 2, first part done**: questions 1, 2 and 6 of section 10 are
+Status: **on by default** (`src/lifetimes.rs`): every module is checked,
+std's included, unless it says `#![lifetimes(off)]` (section 5.5;
+migration step 3 of section 9, question 5 of section 10). Checking
+everything costs under 10% of the front end (section 8).
+**Phase 2, first part done**: questions 1, 2, 5 and 6 of section 10 are
 decided and built (stored pointers into growable memory, exclusivity at
-calls, `#[shrinks]`); 3, 4 and 5 are open. Written 2026-11-04.
+calls, default on, `#[shrinks]`); 3 and 4 are open. Written 2026-11-04.
 
 > Where real bugs keep appearing is lifetimes: a pointer or slice into a
 > container used after the container grew, was freed, or was collected.
@@ -27,8 +27,9 @@ bug of the corpus below (12 test programs), accepts all nine `#![safe]`
 std modules (`text`, `diag`, `map`, `dict`, `lex`, `parse`, `hash`, `io`,
 `bc`) unchanged, found 3 sites when *every* module of every example
 interpreter was first checked (one a real dangling pointer, since
-fixed), and leaves the release IR of every example byte-identical. The
-examples' 77 modules now opt in (section 7). What it does not do is
+fixed), and leaves the release IR of every example byte-identical. It
+is now on for every module (section 7: made the default, it found one
+more dead local outside the examples, in a test). What it does not do is
 follow a pointer once it has been stored in memory and loaded again
 somewhere else; since phase 2 it forbids storing a pointer into memory
 that moves (a `Vec`'s buffer, a map's table) where it outlives the
@@ -167,7 +168,7 @@ the one thing that never outlives its function, the address of a local.
 - Burden: std.text, std.map, std.diag, and every other safe std module:
   **0 annotations, 0 changes**; std.mem: 1 (`#[may_alias(s)]` on
   `Vec.extend`). Every example module checked (`LOIMI_LIFETIMES=audit`):
-  3 sites (section 7), since resolved; the examples now opt in. No
+  3 sites (section 7), since resolved; now on by default. No
   signature changes anywhere.
 - Interpreter cores: unchanged; vm handlers are checked for pointers
   derived from the state across `reenter` calls (corpus 7), which is the
@@ -175,7 +176,8 @@ the one thing that never outlives its function, the address of a local.
 - Messages: name the stale variable, the call that may have moved its
   memory, and the fix (section 5.6).
 - Implementation: one pass over the typed IR after objref, ~1400 lines,
-  no change to the language beyond `#![lifetimes]` and `#[may_alias]`.
+  no change to the language beyond `#![lifetimes(off)]`, `#[may_alias]`
+  and `#[shrinks]`.
 - Compile time: section 8.
 
 Its limit is the price of no annotations: a pointer stored in a struct
@@ -409,14 +411,34 @@ In a checked function, outside `unsafe { }`:
 
 ### 5.5 Where it applies
 
-Modules with `#![safe]` (implies it) or `#![lifetimes]` (the check
-without safe's raw-pointer rule, so a module with raw pointers and a
-`vm` can opt in). Summaries are computed for everything those modules
-call, in any module (std's unsafe core included: that is where `free`
-and `realloc` are). `unsafe { }` silences the errors inside it.
-`LOIMI_LIFETIMES=audit` checks every module and prints each site
-(`lifetime-site file:line:col message (function)`) without failing;
-`LOIMI_LIFETIMES=off` skips the pass.
+Every module, std's included, unless it opts out with
+**`#![lifetimes(off)]`**. Every function with a body is checked, each
+instance of a generic function (so a generic std function no build
+instantiates is not), vm handlers and generated code included.
+Summaries are computed for everything checked code calls, in any
+module (an opted-out one included: `free` and `realloc` are reached
+through std's unsafe core).
+
+The escapes, finest first: `unsafe { }` silences the errors inside it
+(a site safe by a protocol the check cannot see; the reason goes in a
+comment); `#[may_alias(p)]` and `#[shrinks(v)]` correct a function's
+summary for all its callers; `#![lifetimes(off)]` drops a whole module's
+errors (its summaries are still inferred and used). A `#![safe]` module
+cannot opt out (an error: it promises the checks), and nothing in std,
+the examples, the tutorial or the benchmarks does; the ASan tests of
+stale pointers (`tests/asan/*_stale.lm`) do, since the stale use is
+what they test. The opt-out is an argument of the old opt-in attribute
+rather than a new name: the attribute names the check, `off` is how
+`#[inline(never)]` already reads, and a bare `#![lifetimes]`, the
+opt-in that 77 example modules carried, stays accepted as the default
+it now is (no warning: the examples build with `-W error`, and code
+written for the opt-in should not break). The examples dropped it.
+
+`LOIMI_LIFETIMES=off` skips the pass for a build;
+`LOIMI_LIFETIMES=audit` checks every module, opted-out ones included,
+and prints each site (`lifetime-site file:line:col message (function)`)
+without failing: what an opt-out hides, and every site of a tree at
+once rather than the first error.
 
 ### 5.6 Messages
 
@@ -459,7 +481,6 @@ error: passes a pointer into the block of `std.mem.Vec<u64>.ptr` (which `Vec<u64
 ```
 
 <!-- snippet: fail "stores a pointer into the block of `std.mem.Vec<u8>.ptr`"
-#![lifetimes]
 import std.text;
 struct Lexer { text: str, pos: u64 }
 {snippet}
@@ -536,8 +557,9 @@ fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
    references, accessed by entry index and checked by `version`), and
    a slice of a rooted list's old array after guest code replaced it
    (CPython reads the current list; Python's fix does too).
-7. **Trusted code**: `unsafe { }` and modules that do not opt in are
-   not reported (their summaries are still inferred and used).
+7. **Trusted code**: `unsafe { }` and modules that opt out
+   (`#![lifetimes(off)]`) are not reported (their summaries are still
+   inferred and used); nor are generic functions no build instantiates.
 
 ## 7. Evidence
 
@@ -613,6 +635,35 @@ purpose:
 | `examples/regex/vm.lm` `grow`: `r.bt_end = r.bt_base + ncap` | the end of the block just moved, set by the function that moves it |
 | `examples/wasm/vm.lm` `Machine.switch_to` (3): `m.funcs = i.funcs.ptr`, `globals`, `sigs` | an instance's vectors are complete (`instantiate`) before any switch to it, and the machine takes them again at every switch |
 
+**Default on** (question 5): every module checked, std's unsafe core
+(`mem`, `gc`, `obj`, `bigint`, `gil`, `num`, `os`, `rt`, `test`,
+`prof`, `debug`) included, across every example in every configuration
+above plus `--sanitize=address` builds (std has `#[cfg(sanitize_address)]`
+code) and the tutorial's nine steps, the fuzzers of `tests/fuzz`, the
+four benchmarks written in Loimi (`bench/`), the C-library tests
+(`tests/embed`), the bigint calculator, the 209 programs of
+`tests/run`, the 348 of `tests/fail` (each must still fail with its own
+error), `loimi test` of `tests/test` and the examples' unit tests, and
+every doc snippet. New sites, all outside the examples (whose modules
+already opted in):
+
+| site | verdict | resolution |
+|---|---|---|
+| `tests/run/std_obj.lm` `weak`: `w.heap.add_scanner(&keep as *u8, scan)` with `keep` a local of `weak` (error 4: the heap keeps the address) | real dangling pointer, latent: the scanner outlived `weak`, and `keep` was freed in it, but nothing collected after `weak` returned (it ran last) | fixed: `keep` is `main`'s, registered there and passed to `weak`; `tests/fail/lt_scanner_local.lm` |
+| `tests/asan/*_stale.lm` (8: a pointer into a grown `Vec`, a grown map, a freed arena; a slice or pointer across `clear`, `pop`, `truncate`, `StrBuf.clear`, `OrderedMap.clear`) | the stale use is the point: ASan must report it at run time | `#![lifetimes(off)]` |
+
+std itself, the tutorial (so its text needs no change), the benchmarks,
+the fuzzers and every doc snippet: nothing; no inference change and no
+`unsafe { }` was needed. std's unsafe core passes because the pass
+already derived every summary from it, and its pointer arithmetic is
+not something the rule follows (computed addresses are fresh or keep
+their paths, section 5.1). `LOIMI_LIFETIMES=audit` over all of the
+above reports only the 8 opted-out ASan sites. Tests of the default:
+`tests/fail/lt_default.lm` (an imported module without attributes),
+`lt_off_safe.lm` and `lt_off_arg.lm` (the attribute's misuses),
+`tests/run/lt_off.lm` (an opted-out module that keeps a pointer across
+a `push` after a `reserve`).
+
 **IR**: release `--emit-llvm` of Lox, Mini, Mini's embedding, MiniJS,
 Prolog, Python, regex (library and fuzzer), Scheme, Stack (and fuzzer),
 Wasm and the tutorial, base compiler against the new one with the same
@@ -626,6 +677,12 @@ fuzzer (the order of frees). Phase 2 (std's `#[shrinks]` lines take
 the place of blank lines, the 7 `unsafe { }` are on their lines),
 master's compiler and tree against the new ones: byte-identical for
 every example and configuration above, the edited modules included.
+Default on (the examples' `#![lifetimes]` lines blanked), master's
+compiler and tree against the new ones, std at paths of the same
+length: byte-identical for all 55 builds (every example in every
+configuration above and with `--sanitize=address`, the tutorial's
+steps, the benchmarks, the fuzzers, `tests/embed`, the bigint
+calculator, the ASan tests that build without an opt-out).
 
 ## 8. Cost
 
@@ -633,7 +690,7 @@ every example and configuration above, the edited modules included.
   unchanged (section 7).
 - **Compile time** (front end and IR, `--emit-llvm`, best of 3, against
   `LOIMI_LIFETIMES=off`). Checking *everything* (the audit, which is also
-  what every build costs now that all example modules opt in) cost, in
+  what every build costs now that the check is on by default) cost, in
   the prototype: Lox +46%, Mini +88%, MiniJS +126%, Python +107% (+577
   ms), Scheme +62%, Wasm +280% (3.0 → 11.5 s), the rest +16-40%. The
   state was cloned at every branch: Wasm's generated verifier (5716
@@ -691,6 +748,32 @@ every example and configuration above, the edited modules included.
   Naming the block rather than the pointer, and only the parameter's
   pointee and the buffers it owns (two dereferences, section 6 item 2),
   brought it to 7.
+
+  **Default on** (question 5): the pass's time before (master: the
+  examples' modules and std's `#![safe]` ones checked) and after (every
+  module), and its share of the front end without it (`LOIMI_LIFETIMES=off`,
+  `--emit-llvm`, best of 3; the machine was busier than for the tables
+  above, so the absolute times are higher). The examples change little,
+  since their modules were checked already and std's unsafe core was
+  summarized anyway; programs that were not checked at all pay the
+  full pass now:
+
+  | build | front end without the pass | pass before | after | share |
+  |---|---:|---:|---:|---:|
+  | Lox | 367 ms | 21.3 ms | 22.6 ms | 6% |
+  | Mini (embedding) | 610 (627) | 29.8 (30.4) | 30.7 (30.9) | 5% (5%) |
+  | MiniJS | 747 | 51.9 | 52.4 | 7% |
+  | Prolog | 326 | 20.6 | 25.6 | 8% |
+  | Python | 706 | 66.0 | 67.9 | 10% |
+  | regex | 84 | 5.5 | 5.8 | 7% |
+  | Scheme | 458 | 35.9 | 34.9 | 8% |
+  | Stack | 164 | 11.0 | 12.4 | 8% |
+  | Wasm | 5729 | 55.4 | 56.5 | 1% |
+  | tutorial step 9 (not checked before) | 205 | 4.2 | 14.2 | 7% |
+  | `tests/run/std_obj.lm` (std's object model, GC) | 82 | 0.7 | 5.1 | 6% |
+  | `tests/bigint/calc.lm` (`std.bigint`) | 93 | 1.1 | 6.0 | 6% |
+  | `tests/fuzz/fuzzcombo.lm` (Mini's vm, fuzzed) | 440 | 1.1 | 13.7 | 3% |
+  | `bench/obj/ic.lm` (inline caches) | 75 | 0.7 | 4.4 | 6% |
 - **Implementation**: `src/lifetimes.rs` (~2450 lines, no dependency
   on codegen), `#![lifetimes]`, `#[may_alias]` and `#[shrinks]` in the
   parser and checker, a summary map in `tir::Program`.
@@ -698,22 +781,25 @@ every example and configuration above, the edited modules included.
 ## 9. Migration plan
 
 1. **std** (done): every `#![safe]` module is checked; `Vec.extend` is
-   `#[may_alias(s)]`. Next: `num`, `os`, `rt`, `test`, `prof` when they
-   become safe; the unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`,
-   `map`'s probes) is not checked but is what the summaries are inferred
-   from.
+   `#[may_alias(s)]`. Since step 3 every other std module is checked
+   too, the unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`, `map`'s
+   probes) included, which is also what the summaries are inferred
+   from: no change was needed.
 2. **Examples** (done): every module of the example interpreters is
    `#![lifetimes]`, front ends and vm modules alike (77 modules; the
    tutorial's steps excepted). The 3 audit sites and the 4 new findings
    are resolved (section 7): three code fixes, four inference
    refinements, no `unsafe { }`.
-3. **Default**: the examples opt in cleanly and the whole-program cost
-   is fixed (section 8); making the check the default for every module
-   (keeping `unsafe { }` and an opt-out) is question 5.
+3. **Default** (done): every module is checked, std's included;
+   `#![lifetimes(off)]` opts out, `unsafe { }`, `#[may_alias]` and
+   `#[shrinks]` stay (section 5.5). It found one latent dangling
+   pointer in a test, fixed, and 8 ASan tests opt out (section 7); the
+   examples' 77 `#![lifetimes]` lines went.
 4. **Phase 2 rules** (done): errors 2 (exclusivity) and 5 (stored
    pointers into growable memory) and `#[shrinks]` (questions 1, 2, 6);
    std gained eight `#[shrinks]` lines, the examples 7 `unsafe { }` at
-   stores safe by protocol (section 7). Questions 3-5 stay open.
+   stores safe by protocol (section 7). Questions 3 and 4 stay open
+   (5 is step 3).
 
 **What stays raw (`unsafe` or unchecked) and why**: the allocator, the
 collector, inline caches and limb arithmetic (`mem`, `gc`, `obj`,
@@ -751,8 +837,13 @@ promise for every pointer parameter.
 4. **A moving collector** (planned in language.md section 5): then no
    `let` exempts a slice of an object across a collection. Should the
    rule already be the strict one, to keep that option open?
-5. **Default on**: make `#![lifetimes]` the default for every module
-   (after the examples opt in), or keep it opt-in like `#![safe]`?
+5. **Default on** — **decided: yes**, for every module, std's
+   included, with `#![lifetimes(off)]` as the per-module opt-out
+   (section 5.5; migration step 3). The question was: make
+   `#![lifetimes]` the default for every module (after the examples opt
+   in), or keep it opt-in like `#![safe]`? Unlike `#![safe]`, the check
+   asks nothing of code that is right (no annotation, no `unsafe` for
+   raw pointers), so opting in only hid bugs: the default found one.
 6. **Logical staleness** — **decided: yes**, conservatively for every
    pointer into the container, seeded by `#[shrinks(v)]` on std's
    shrinking functions (section 5.2). The question was: should
