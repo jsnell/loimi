@@ -444,6 +444,12 @@ ops. Per benchmark, besides the collector: zebra is 44% general
 evaluator (a 1000-deep expression built at run time), sendmore 31%
 `=\=`, crypt 19% `mod`, boyer `arg/3`, `functor/3` and unification.
 
+*Update (later on 2026-11-04):* std.gc no longer sweeps (mark bitmaps
+and bump allocation through free runs; `docs/results.md`, "GC: mark
+bitmaps instead of sweeping"). Prolog then took 0.885 of this round's
+time by geometric mean; the collector's share fell to 8% on nreverse
+and 21% on boyer, where finding free runs (`refill`) is what remains.
+
 Friction this round: (a) adding `deref` to IDIV/REM's operands gave
 both a stack frame (`-W handler_frame`: the `i48` division's overflow
 panic was no longer proved dead behind the `y != -1` guard); dividing
