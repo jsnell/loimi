@@ -110,6 +110,21 @@ implementation; `git log` has the details.
   local that outlives its function are compile errors. Inferred over
   the call graph: std needed one `#[may_alias(s)]` (`Vec.extend`). No
   IR change.
+- **Every example interpreter checks pointer stability**: the 77
+  modules of Lox, Mini, MiniJS, Prolog, Python, regex, Scheme, Stack and
+  Wasm are `#![lifetimes]`. Found and fixed: MiniJS's `Gen.top` left
+  `g.fs` pointing at a dead local; Mini's `coroutine.yield` lent a
+  native's `args` to the context (the CALL instruction now sets
+  `xfer`); the Stack fuzzer freed the program before the machine
+  pointing into it. The inference got more precise (a function value's
+  result points into an argument only where the types allow it; memory
+  a function allocates and returns carries what it keeps to the
+  caller's use of the result; captured owners in closures; the depth
+  bound) and closed a hole (a store through a pointer of unknown origin
+  counted as local). Whole-program checking got 5-50x cheaper (copy-on-write
+  flow state, scoped locals, one analysis per function): under 10% of
+  the front end on every example (`docs/design/lifetimes.md` sections
+  7-9).
 - **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
   reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
   pointer casts, other modules' buffer pointers and invariant fields,

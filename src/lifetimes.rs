@@ -26,7 +26,9 @@
 //!   into what it restructures through i (`b.push_str(b.as_str())`),
 //!   unless `#[may_alias(j)]` says the function copes (`Vec.extend`);
 //! - `keeps`: the parameters whose pointee it may store in memory that
-//!   outlives the call (`Vec.push`'s `x`, `SourceMap.add`'s `text`).
+//!   outlives the call (`Vec.push`'s `x`, `SourceMap.add`'s `text`), or
+//!   in fresh memory it returns (a constructor: then where the caller
+//!   puts the result decides).
 //!
 //! A call that may collect (`uses gc`, also `reenter`) invalidates
 //! pointers into GC objects other than those held by a `let` local or
@@ -37,6 +39,12 @@
 //! Errors are reported in modules with `#![safe]` or `#![lifetimes]`,
 //! outside `unsafe { }`; `LOIMI_LIFETIMES=audit` lists the sites of every
 //! module instead (`lifetime-site` lines on stderr), without failing.
+//!
+//! **Cost.** The flow state is cloned at every branch, so its parts are
+//! shared (`Rc`, copied when a branch changes one) and paths are inline;
+//! locals leave the state when their scope ends; each function is
+//! analyzed until its summary is stable (a post-order worklist), and its
+//! errors come from its last analysis.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -222,7 +230,8 @@ pub struct Summary {
     restructs: BTreeSet<Path>,
     ret: BTreeSet<Path>,
     pairs: BTreeSet<(u32, u32)>,
-    /// Parameter j -> where it may be stored: parameter i's memory, or
+    /// Parameter j -> where it may be stored: parameter i's memory,
+    /// `RET` (fresh memory the result points to: the caller decides) or
     /// `ELSEWHERE` (a global, a GC object, memory of unknown origin).
     keeps: BTreeMap<u32, BTreeSet<u32>>,
 }
@@ -1221,6 +1230,7 @@ impl<'a> Fa<'a> {
 
     fn eval(&mut self, e: &'a TExpr, st: &mut St) -> Val {
         if !st.reach {
+            self.sink = ELSEWHERE;
             return Val::new();
         }
         match &e.kind {
@@ -1902,6 +1912,10 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
         }
         let old = sums.get(&i).cloned().unwrap_or_default();
         let mut merged = old.clone();
+        // Restructures cut at the depth bound are dropped (section 6 of
+        // the design note): deep in a chain, they cannot be told from
+        // the blocks above them, and a recursive walker would list every
+        // combination of child fields.
         merged.restructs.extend(s.restructs.into_iter().filter(|r| !r.trunc));
         merged.ret.extend(s.ret);
         merged.pairs.extend(s.pairs);
@@ -1915,30 +1929,12 @@ pub fn check(p: &Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
             }
         }
     }
-    if std::env::var("LOIMI_LIFETIMES_STATS").is_ok() {
+    if stats {
+        // `LOIMI_LIFETIMES_STATS=1`: the cost, and the slowest functions.
         eprintln!("lifetimes: {} functions, {} analyses", fns.len(), rounds);
         let mut v: Vec<_> = times.iter().collect();
-        v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-        let tot: f64 = v.iter().map(|x| x.1.0).sum();
-        let mut acc = 0.0;
-        for (k, x) in v.iter().enumerate() {
-            acc += x.1.0;
-            if [10usize, 50, 100, 200, 500, 1000].contains(&(k + 1)) {
-                eprintln!("top {}: {:.0}%", k + 1, acc * 100.0 / tot);
-            }
-        }
-        if let Ok(fname) = std::env::var("LOIMI_LT_DUMP") {
-            for (f, s) in &sums {
-                if p.fns[*f as usize].symbol.starts_with(&fname) {
-                    eprint!("{} ", p.fns[*f as usize].symbol);
-                    for r in &s.restructs {
-                        if std::env::var("LOIMI_LT_R").is_ok() { eprintln!("R {:?} {:?} {}", r.root, &*r.steps, r.trunc); }
-                    }
-                    eprintln!("K {:?} ret {:?} pairs {:?}", s.keeps, s.ret, s.pairs);
-                }
-            }
-        }
-        for (f, (t, n)) in v.iter().take(30) {
+        v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        for (f, (t, n)) in v.iter().take(10) {
             let s = sums.get(*f).cloned().unwrap_or_default();
             eprintln!("  {:8.1} ms {:3}x {} (restructs {} ret {} pairs {} keeps {})", t * 1000.0, n, p.fns[**f as usize].symbol, s.restructs.len(), s.ret.len(), s.pairs.len(), s.keeps.len());
         }

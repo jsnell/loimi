@@ -193,7 +193,8 @@ those builds.
   `#![lifetimes]` modules (prototype, `design/lifetimes.md`): a pointer
   into a container used after a call that may move or free it, Vec
   copy aliasing, and escaping local addresses are errors; pointers
-  stored in memory are not followed. Under
+  stored in memory are not followed. Every module of the example
+  interpreters opts in (`#![lifetimes]`). Under
   `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
   longer use, so stale pointers into it are reported at run time.
   `std.lex`, `parse`, `diag`, `text`, `hash`,

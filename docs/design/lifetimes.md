@@ -1,8 +1,10 @@
 # Design note: lifetimes and pointer stability at compile time
 
 Status: **phase 1: design and prototype** (`src/lifetimes.rs`, opt-in:
-`#![safe]` and `#![lifetimes]` modules). For review before phase 2.
-Written 2026-11-04.
+`#![safe]` and `#![lifetimes]` modules), **migration step 2 done**: every
+module of the example interpreters is `#![lifetimes]` (section 9), and
+checking all of them costs under 10% of the front end (section 8). For
+review before phase 2. Written 2026-11-04.
 
 > Where real bugs keep appearing is lifetimes: a pointer or slice into a
 > container used after the container grew, was freed, or was collected.
@@ -21,9 +23,10 @@ one attribute on the one std function that handles self-aliasing on
 purpose (`#[may_alias(s)]` on `Vec.extend`). The prototype rejects every
 bug of the corpus below (12 test programs), accepts all nine `#![safe]`
 std modules (`text`, `diag`, `map`, `dict`, `lex`, `parse`, `hash`, `io`,
-`bc`) unchanged, finds 3 sites when *every* module of every example
-interpreter is checked (one a real dangling pointer), and leaves the
-release IR of every example byte-identical. What it does not do is
+`bc`) unchanged, found 3 sites when *every* module of every example
+interpreter was first checked (one a real dangling pointer, since
+fixed), and leaves the release IR of every example byte-identical. The
+examples' 77 modules now opt in (section 7). What it does not do is
 follow a pointer once it has been stored in memory and loaded again
 somewhere else: section 6 lists that and the other holes, and section 9
 the questions for phase 2.
@@ -67,8 +70,8 @@ out of scope; so are stale *decoded* state bugs (0456845, 5a77ca9).
 | 8 | objref's remaining hole: a read-only slice of an object held across a call that may collect | safety.md section 8.1 | same as 2 | `lt_gc_slice_across_collect` |
 
 Two more found by the prototype itself (section 7): `minijs`'s
-`Gen.top` stores `&fs` (a local) in `g.fs` and returns without
-restoring it (latent: nothing reads `g.fs` afterwards today), and a
+`Gen.top` stored `&fs` (a local) in `g.fs` and returned without
+restoring it (latent: nothing read `g.fs` afterwards; fixed), and a
 false start of this note's own accepted test (`tests/run/lt_accepted.lm`
 used a slice after a loop of pushes).
 
@@ -159,7 +162,8 @@ the one thing that never outlives its function, the address of a local.
 - Burden: std.text, std.map, std.diag, and every other safe std module:
   **0 annotations, 0 changes**; std.mem: 1 (`#[may_alias(s)]` on
   `Vec.extend`). Every example module checked (`LOIMI_LIFETIMES=audit`):
-  3 sites (section 7). No signature changes anywhere.
+  3 sites (section 7), since resolved; the examples now opt in. No
+  signature changes anywhere.
 - Interpreter cores: unchanged; vm handlers are checked for pointers
   derived from the state across `reenter` calls (corpus 7), which is the
   `reload` contract of language.md section 5.1 made a check.
@@ -236,8 +240,18 @@ a `Gc`) is abstracted by a set of **paths**: a root, then field steps
   sub-slices keep the paths; integers point nowhere;
 - a call's result points where the callee's summary says (below), with
   the callee's parameters replaced by what the arguments point into;
-  anything else (`malloc`, a constant, an unknown function's result
-  from no pointer argument) is a fresh value that nothing tracks.
+- a callee without a body (an extern) or a function value: its result
+  points into what its pointer arguments point into, **where the types
+  allow it**: a `*R` or `[]R` points at `R` values, so an argument
+  `*T` counts only if some `R` of the result type can be stored inline
+  in a `T` (a parse hook given `*Parser` returns a `*Node` and a `str`
+  error, neither of which a `Parser` holds inline); byte pointers,
+  generic and non-pointer arguments count always
+  (`tests/run/lt_fn_value.lm`, `tests/fail/lt_fn_value_kept.lm`);
+- memory of unknown origin (`malloc`'s result, an extern's pointer
+  from no pointer argument) is the root **fresh**: never moved or freed
+  as far as the rule knows, and a store into it is judged by whether
+  the function returns it (section 5.4); a constant points nowhere.
 
 Paths are cut at 8 steps; long pointer chains (`f = f.parent` in a
 loop) are approximated (section 6).
@@ -308,6 +322,15 @@ In a checked function, outside `unsafe { }`:
    g.fs = parent` is fine), passing it to a function whose summary keeps
    it outside the caller's own locals, or capturing it in an escaping
    closure. `main`'s locals live as long as the program and may escape.
+   A store into memory of unknown origin (fresh, or reached through no
+   known path) counts as outliving the function; but when the function
+   returns that fresh memory, the summary says it keeps the pointer **in
+   its result**, and the caller judges where the result goes: into one
+   of its own locals or a field of one (`m.t = Table.new(&m.c)`, Lox's
+   `m.strings = gc.WeakInterner.new(&m.heap, ..)`) the address stays in
+   the frame; returned, it is kept in the caller's result in turn;
+   stored anywhere else, or passed on, it escapes
+   (`tests/run/lt_fresh_kept.lm`, `tests/fail/lt_fresh_kept.lm`).
 
 ### 5.5 Where it applies
 
@@ -376,12 +399,27 @@ error: passes the address of local `buf` to `SourceMap.add`, which may keep it b
    of a closure passed to a call is not part of that call's summary.
 4. **Approximations of the abstraction**: paths are cut at 8 steps,
    and two pointers both cut at the same depth are taken to be in
-   different blocks (pointer-chasing loops); a place assigned a new
+   different blocks (pointer-chasing loops); so is a restructure cut at
+   the depth bound and a pointer that ends exactly there (`release(&t.inner)`
+   with `t` 8 steps deep frees a block below `t`'s:
+   `tests/run/lt_inference.lm`), and summaries drop restructures cut at
+   the bound altogether (a recursive tree walker's summary otherwise
+   lists every combination of child fields 8 steps down: MiniJS's
+   `Res.stmt` had 758, 743 of them cut); a place assigned a new
    value detaches what pointed into its old buffers (`var s =
    p.items(); p.v = other; free through a copy` is missed); externs
    other than `free`/`realloc` are assumed not to free; `defer`s are
    evaluated at the end of their block only; a `?` or `never` call is
-   not an exit for the escape rule.
+   not an exit for the escape rule; all fresh memory is one root, so a
+   fresh block's stored pointers are never taken as overwritten.
+   Summaries are path-insensitive: a store guarded by a flag argument
+   counts for every caller (Mini's `coro.call` stored `args` only when
+   `from_vm`, which `call_value` passes false; section 7).
+   A closure's captured owning value (a `Vec`, a `StrBuf`) is the
+   enclosing variable itself and starts with no paths, like a `let`
+   owner, so growing it inside the closure does not make it stale
+   (Mini's debugger: `tests/run/lt_inference.lm`); what a captured
+   slice points into is not related to the captured owner (hole 3).
 5. **The collector is assumed not to move objects.** A slice of an
    object held by a `let` is accepted across a collection; a moving
    collector would make every such slice stale (the rule would then be
@@ -416,19 +454,42 @@ deep pointer chains; escapes judged at function exit and by
 destination: into the caller's own locals is fine, `main`'s locals live
 forever) removed the 36 false positives, leaving:
 
-| site | verdict |
-|---|---|
-| `examples/minijs/compile.lm` `Gen.top`: `g.fs = &fs`, never restored before returning (`Gen.function` restores it) | real dangling pointer, latent (nothing reads `g.fs` after `top` today): fix by restoring `g.fs` |
-| `examples/mini/vm.lm` `sort_less`: `&ab[0]` (a local array) passed as `args` to `call_value`, whose summary may keep `args` (through the coroutine and embedding paths, `s.args = args`) | to review: kept for the call's duration by design (`VStack.prev` exists for the same reason); a "keeps" that is restored before return in another function is beyond the rule |
-| `examples/minijs/compile.lm` `compile`: `&p` (a local parser) passed to `Parser.program`, which may keep it | false positive (summary imprecision in `keeps`), to investigate |
+| site | verdict | resolution |
+|---|---|---|
+| `examples/minijs/compile.lm` `Gen.top`: `g.fs = &fs`, never restored before returning (`Gen.function` restores it) | real dangling pointer, latent (nothing read `g.fs` after `top`) | fixed: `top` restores `g.fs` before returning, as `function` does |
+| `examples/mini/vm.lm` `sort_less`: `&ab[0]` (a local array) passed as `args` to `call_value`, whose summary keeps `args` in the context | no hazard today: the only store, `c.xfer = args` in `coro.call`'s yield, runs only when `from_vm`, and `call_value` passes false (a yield from host code is an error); the summary is path-insensitive (the embedding's `s.args = args` is on another path, not reached from `call_value`). But the store lent a pointer to the context through a native's arguments | fixed in the code: the CALL instruction sets `ctx.xfer` itself (the yield's values are its own arguments, `regs + base + 1`), so `coro.call` no longer stores `args`; IR changes in `coro.call` and the CALL handler's yield branch only |
+| `examples/minijs/compile.lm` `compile`: `&p` (a local parser) passed to `Parser.program`, which "may keep it" | false positive: the Pratt hooks are function values, whose result was taken to point into every pointer argument, so `Parser.primary`'s `*Node` "pointed into" the parser and storing a node in a node kept the parser | inference: a function value's (or extern's) result points into an argument's block only where the types allow it (section 5.1) |
 
-None in the example interpreters' vm handlers: they already recompute
-pointers after `reenter` calls.
+**Opting in** (migration step 2): all 77 modules of Lox, Mini (with its
+embedding, coroutines, threads and debugger), MiniJS, Prolog, Python
+(with its debugger), the regex library, Scheme, Stack and Wasm are
+`#![lifetimes]` (the tutorial's steps are not: they follow the
+tutorial's text). Built in every configuration the tests use (`--cfg
+debug`, `--cfg gil`, `--jit-stencils`, `--shared`), the new findings
+were:
+
+| finding | verdict | resolution |
+|---|---|---|
+| `examples/stack/fuzz.lm` `run_one`: the machine `m` used (`m.heap.free()`, ..) after `prog.free()`, while `m.words` and `m.consts` point into the program (not in the original audit list: it missed the fuzzer) | latent: the machine's root scanner reads `m.consts`, but freeing the heap does not scan | fixed: the program is freed after the machine |
+| (after fixing a hole: a store through a pointer of unknown origin, `*t = ..` with `t` from `malloc`, was taken as a store into a local) `examples/lox/driver.lm`: `gc.WeakInterner.new(&m.heap, ..)` keeps `&m.heap` in the table it allocates | false positive: the table is stored in `m.strings`, a field of the same local, and freed with it | inference: fresh memory and "kept in the result" (section 5.4) |
+| `examples/mini/debugger.lm` (`--cfg debug`): the key sorter's closure grows the captured `StrBuf`s `a`, `b` and reads them again | false positive: a captured owner started as "pointing into its own buffers" | inference: captured owners start pathless (section 6, item 4) |
+| `examples/mini/embed.lm` `mini_thread_detach` (`--cfg gil`): `t`, 8 steps deep, used after `threads.release(&t.core)` | false positive of the depth bound: the freed block is below `t`'s | inference: a restructure cut where an uncut pointer ends is another block (section 6, item 4) |
+
+No `unsafe { }` was needed. None in the example interpreters' vm
+handlers: they already recompute pointers after `reenter` calls. With
+every example module opted in, `LOIMI_LIFETIMES=audit` reports nothing
+on the examples.
 
 **IR**: release `--emit-llvm` of Lox, Mini, Mini's embedding, MiniJS,
 Prolog, Python, regex (library and fuzzer), Scheme, Stack (and fuzzer),
 Wasm and the tutorial, base compiler against the new one with the same
-std (the attribute line blanked for the base): byte-identical.
+std (the attribute line blanked for the base): byte-identical. After
+step 2 (the attribute takes the place of a blank line, so no line
+moves), against the tree before it: byte-identical for every example
+(also Mini `--cfg debug`, `--cfg gil` and Python `--cfg debug`) except
+the three intended code fixes: MiniJS (`Gen.top`), Mini and its
+embedding (`coro.call`, the CALL handler's yield branch) and the Stack
+fuzzer (the order of frees).
 
 ## 8. Cost
 
@@ -452,13 +513,14 @@ std (the attribute line blanked for the base): byte-identical.
    become safe; the unsafe core (`mem`, `gc`, `obj`, `bigint`, `gil`,
    `map`'s probes) is not checked but is what the summaries are inferred
    from.
-2. **Examples**: `#![lifetimes]` module by module (the audit says 3
-   sites in all of them): first the front ends (lexers, parsers,
-   compilers: no vm, pointer-heavy, where the corpus's container bugs
-   live), then the vm modules, whose handlers get the `reenter` rule.
-3. **Default**: once the examples opt in cleanly, make the check the
-   default for every module (keeping `unsafe { }` and an opt-out), with
-   the audit's cost fixed first (section 8).
+2. **Examples** (done): every module of the example interpreters is
+   `#![lifetimes]`, front ends and vm modules alike (77 modules; the
+   tutorial's steps excepted). The 3 audit sites and the 4 new findings
+   are resolved (section 7): three code fixes, four inference
+   refinements, no `unsafe { }`.
+3. **Default**: the examples opt in cleanly and the whole-program cost
+   is fixed (section 8); making the check the default for every module
+   (keeping `unsafe { }` and an opt-out) is question 5.
 
 **What stays raw (`unsafe` or unchecked) and why**: the allocator, the
 collector, inline caches and limb arithmetic (`mem`, `gc`, `obj`,
