@@ -26,8 +26,10 @@ import vm.{Scheme};
 pub object Pair { car: V, cdr: V }
 pub object Str { data: [u8] }
 /// An interned symbol. `gidx` is its global-variable slot (assigned by the
-/// compiler on first use as a global; NO_GLOBAL until then).
-pub object Sym { gidx: u32, name: [u8] }
+/// compiler on first use as a global; NO_GLOBAL until then). `sname` is
+/// the string symbol->string returns (made on first use; #f until then):
+/// R7RS makes mutating it an error, so every call can return the same one.
+pub object Sym { gidx: u32, sname: V, name: [u8] }
 /// Vectors; also used (length 1, never visible to programs) as the boxes
 /// that hold assigned captured variables, and for records: `rtd` is '() for
 /// a vector, and the record type (a list of its name) for a record.
@@ -372,7 +374,7 @@ pub fn Symtab.new() -> Symtab {
 
 pub fn Symtab.intern(t: *Symtab, h: *gc.Heap, s: str) -> Gc<Sym> {
     if let Some(sym) = t.map.get(s) { return sym; }
-    let o = new(h, Sym { gidx: NO_GLOBAL }, s.len);
+    let o = new(h, Sym { gidx: NO_GLOBAL, sname: V.Imm(IMM_FALSE) }, s.len);
     mem.memcpy(o.name.ptr, s.ptr, s.len);
     t.map.insert(o.name, o);
     t.all.push(o);

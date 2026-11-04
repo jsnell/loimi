@@ -609,6 +609,15 @@ pub vm Scheme {
         cold { dst = builtins.call_native(ctx, builtins.P_APPEND, regs + base as u64, 2)?; next }
     }
 
+    /// (string-ref R[base] R[base+1]).
+    op SREF(dst: reg, base: callbase) : ABC {
+        if let S(st) = regs[base as u64] and let Int(i) = regs[base as u64 + 1] and i >= 0 and (i as u64) < st.data.len {
+            dst = value.chr(st.data.ptr[i as u64] as i32);
+            next
+        }
+        cold { dst = builtins.call_native(ctx, builtins.P_SREF, regs + base as u64, 2)?; next }
+    }
+
     /// Records (define-record-type): `f` is the constant (rtd . i) of
     /// field i of record type rtd, `t` the rtd.
     op RREF(dst: reg, x: reg, f: kst) : ABC {

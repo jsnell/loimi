@@ -104,6 +104,7 @@ pub const P_LENGTH: i32 = 44;
 pub const P_APPEND: i32 = 45;
 pub const P_REVERSE: i32 = 46;
 pub const P_VLEN: i32 = 79;
+pub const P_SREF: i32 = 84;
 pub const P_RECORDP: i32 = 144;
 pub const P_RECORD_REF: i32 = 145;
 pub const P_RECORD_SET: i32 = 146;
@@ -907,7 +908,10 @@ pub fn call_native(c: *Ctx, id: i32, args: *V, n: u64) -> Result<V, V> {
         }
         95 => {
             let Sym(s) = a else { return Err(rt.type_err(c, name, "symbol", a)); };
-            Ok(V.S(value.new_str(h, s.name)))
+            if let S(_) = s.sname { return Ok(s.sname); }
+            let r = V.S(value.new_str(h, s.name));
+            s.sname = r;
+            Ok(r)
         }
         96 => {
             let s = str_arg(c, name, a)?;

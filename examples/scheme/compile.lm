@@ -39,7 +39,7 @@ enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Le
 /// Ops for builtins compiled inline.
 enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
     SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq, RRef, RSet, RecP,
-    Length, OddP, EvenP, PosP, NegP, VLen, Reverse, Append }
+    Length, OddP, EvenP, PosP, NegP, VLen, Reverse, Append, SRef }
 
 struct Var {
     name: Gc<Sym>,
@@ -169,7 +169,7 @@ fn Comp.new_var(c: *Comp, name: Gc<Sym>) -> *Var {
 /// An uninterned symbol (invisible to programs).
 fn Comp.gensym(c: *Comp, s: str) -> Gc<Sym> {
     c.gensyms += 1;
-    let o = new(c.heap, Sym { gidx: value.NO_GLOBAL }, s.len);
+    let o = new(c.heap, Sym { gidx: value.NO_GLOBAL, sname: value.f() }, s.len);
     mem.memcpy(o.name.ptr, s.ptr, s.len);
     o
 }
@@ -292,6 +292,7 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("vector-length") { return Some((PO.VLen, 1)); }
     if name.eq("reverse") { return Some((PO.Reverse, 1)); }
     if name.eq("append") { return Some((PO.Append, 2)); }
+    if name.eq("string-ref") { return Some((PO.SRef, 2)); }
     None
 }
 
@@ -2545,13 +2546,13 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
         ns.free();
         return;
     }
-    if po == PO.Append {
+    if po == PO.Append or po == PO.SRef {
         let base = g.top();
         for i: u64 in 0..2 {
             let r = g.alloc();
             g.to(args.at(i), r);
         }
-        g.emit(Scheme.APPEND2(d, base as u8));
+        g.emit(if po == PO.Append { Scheme.APPEND2(d, base as u8) } else { Scheme.SREF(d, base as u8) });
         return;
     }
     if po == PO.Memq or po == PO.Assq {

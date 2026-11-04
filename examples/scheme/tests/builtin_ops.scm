@@ -32,6 +32,11 @@
 (display (call-with-current-continuation (lambda (k) (+ 1 (k 41)))))
 (newline)
 ; expect: 41
+; string-ref; symbol->string returns the same string each time.
+(define s (symbol->string 'abc))
+(display (list s (string-ref s 1) (eq? s (symbol->string 'abc)) (string-ref "xyz" 2)))
+(newline)
+; expect: (abc b #t z)
 (append (cons 1 2) (list 3))
 ; expect-exit: 1
-; expect-stderr: error: line 35: append: expected list, got (1 . 2)
+; expect-stderr: error: line 40: append: expected list, got (1 . 2)
