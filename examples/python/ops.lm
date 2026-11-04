@@ -359,9 +359,9 @@ pub fn new_inst(c: *Ctx, cls: Gc<Box>) -> Gc<Inst> {
     if n == 0 { n = 1; }
     var root = c.shape_root.unwrap();
     if CLASS_SHAPE < cls.extra.len and let Obj(r) = cls.extra[CLASS_SHAPE] { root = r; }
-    let o = new(&c.heap, Inst { cls: cls, keys: root }, n);
-    for i in 0..n { o.slots[i] = Value.Undef; }
-    o
+    // Slots past the shape's names are never read: their zero fill
+    // (Float 0.0) is left as it is.
+    new(&c.heap, Inst { cls: cls, keys: root }, n)
 }
 
 /// The shape after adding `name` to shape `k` (made on first use), or
