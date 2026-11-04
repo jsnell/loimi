@@ -224,7 +224,7 @@ pub fn tbar(t: Gc<Table>) {
 }
 
 #[inline(never)]
-fn log_table(t: Gc<Table>) {
+pub fn log_table(t: Gc<Table>) {
     gc.remember(t as *u8);
     if let Some(a) = t.arr { gc.remember(a as *u8); }
     if let Some(a) = t.hash { gc.remember(a as *u8); }
@@ -366,15 +366,17 @@ pub fn hash_get_str(t: Gc<Table>, k: V, hv: u64) -> V {
 }
 
 /// Overwrite the value of string key `k` (hash `hv`) if it is present
-/// (possibly as a tombstone); false if absent.
-pub fn hash_set_existing(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
+/// (possibly as a tombstone); false if absent. The caller does the
+/// write barrier (`tbar`) when it returns true.
+#[inline]
+pub fn hash_set_existing_nobar(t: Gc<Table>, k: V, hv: u64, v: V) -> bool {
     if t.hcap == 0 { return false; }
     let slots = t.hptr;
     let mask = t.hcap - 1;
     var i = hv & mask;
     loop {
         let key = slots[2 * i];
-        if key == k { slots[2 * i + 1] = v; tbar(t); return true; }
+        if key == k { slots[2 * i + 1] = v; return true; }
         if key == V.Nil { return false; }
         i = (i + 1) & mask;
     }
@@ -494,10 +496,10 @@ pub fn can_append(t: Gc<Table>, v: V) -> bool {
 }
 
 /// t[asize+1] = v when `can_append`: no allocation, so no GC check.
+/// The caller does the write barrier (`tbar`).
 #[inline]
 pub fn append_in_place(t: Gc<Table>, v: V) {
     t.aptr[t.asize] = v;
-    tbar(t);
     t.asize += 1;
 }
 

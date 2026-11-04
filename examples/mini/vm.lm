@@ -661,7 +661,7 @@ pub vm Mini {
             let i = cache.slot as u64;
             if likely(i < tab.hcap) {
                 let p = tab.hptr + 2 * i;
-                if p[0] == key { p[1] = v; value.tbar(tab); next }
+                if p[0] == key { p[1] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
             }
             cold {
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
@@ -677,48 +677,56 @@ pub vm Mini {
             if u < tab.asize { dst = tab.aptr[u]; next }
         }
         if let (T(tab), S(s)) = (t, key) { dst = value.hash_get_str(tab, key, s.hash); next }
-        if let T(tab) = t { dst = value.table_get(tab, key); next }
-        cold { raise error(ctx, "attempt to index a ", t) }
+        // Other keys in a cold block: the call would give the handler a frame.
+        cold {
+            if let T(tab) = t { dst = value.table_get(tab, key); next }
+            raise error(ctx, "attempt to index a ", t)
+        }
     }
     op SETINDEX(t: reg, key: reg, v: reg) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
-            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); next }
+            if u < tab.asize { tab.aptr[u] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
         }
-        if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
-        if let T(tab) = t {
-            if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
-            if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            value.table_set(&ctx.heap, tab, key, v);
-            next
+        if let (T(tab), S(s)) = (t, key) and value.hash_set_existing_nobar(tab, key, s.hash, v) { if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+        // Calls only in cold blocks (here and the barriers'): a call would
+        // give the whole handler a stack frame.
+        cold {
+            if let T(tab) = t {
+                if key == V.Nil { raise error_msg(ctx, "table index is nil") }
+                if let Num(x) = key and x != x { raise error_msg(ctx, "table index is NaN") }
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                value.table_set(&ctx.heap, tab, key, v);
+                next
+            }
+            raise error(ctx, "attempt to index a ", t)
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// t[key] = k[c] (a constant value).
     op SETINDEXK(t: reg, key: reg, v: kst) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
-            if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
-            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); next }
+            if u < tab.asize { tab.aptr[u] = v; if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); if unlikely(gc.needs_barrier(tab as *u8)) { cold { value.log_table(tab); } } next }
         }
-        if let T(tab) = t {
-            if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }
-            if let Num(x) = key and x != x { cold { raise error_msg(ctx, "table index is NaN") } }
-            if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
-            value.table_set(&ctx.heap, tab, key, v);
-            next
+        cold {
+            if let T(tab) = t {
+                if key == V.Nil { raise error_msg(ctx, "table index is nil") }
+                if let Num(x) = key and x != x { raise error_msg(ctx, "table index is NaN") }
+                if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
+                value.table_set(&ctx.heap, tab, key, v);
+                next
+            }
+            raise error(ctx, "attempt to index a ", t)
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
     }
     /// R[dst] = t[i] for an integer constant 1 <= i <= 255.
     op GETINDEXI(dst: reg, t: reg, i: index1) : ABC {
         if let T(tab) = t {
             let u = (i as u64) - 1;
             if u < tab.asize { dst = tab.aptr[u]; next }
-            dst = value.table_get(tab, Int(i as i32));
-            next
+            cold { dst = value.table_get(tab, Int(i as i32)); next }
         }
         cold { raise error(ctx, "attempt to index a ", t) }
     }
