@@ -178,6 +178,59 @@ tail-call time of the MVP build in every row), `stack` (Stak),
   and without it. Stencils do not help a WAM whose ops mostly unify and
   allocate (the work is in the handlers' bodies, not in dispatch).
 
+## GC: mark bitmaps instead of sweeping (2026-11-04)
+
+A dated A/B of one change, not a rerun of the tables above. `std.gc`
+stopped sweeping: marking sets a bit per 16-byte granule in each chunk's
+bitmap, and each size class bump-allocates through the runs of clear
+bits ([stdlib/gc.md](stdlib/gc.md#heap-layout)).
+
+**Where the time went before.** With `LOIMI_GC_STATS=1` (per-collection
+mark and sweep times), the sweep was most of the collector's time
+everywhere: Prolog (non-generational, 1 MiB budget, 40-1500 KB live)
+spent 3-29% of its run time in the collector, 80-90% of that in the
+sweep (nreverse: 2434 collections, 247 ms sweep, 35 ms mark, of 1.07
+s); Python (non-generational) 2-11% (nqueens: 111 ms sweep, 3 ms mark,
+of 1.0 s); Scheme, Mini and MiniJS (generational) spent it in lazy
+sweeping, 13-23% of Scheme's deriv, diviter, divrec, cpstak and primes
+and 9-14% of Mini's closures and binary_trees, against 0-2% in minor
+marking. The sweep read and wrote every slot of every chunk allocated
+from since the last collection: work in proportion to the allocation
+budget, almost all of it on dead objects.
+
+**Result.** Interleaved A/B of the committed std against the one before
+(same compiler), `--release --align-functions=64`, tail-call dispatch,
+minimum of 3 runs, on a machine shared with another agent (load average
+4.5-6 on 8 threads). Time new/old, geometric means; the noise is the
+geometric mean of two columns built from the same code in the same run.
+
+| Suite | new/old | range | noise |
+|---|---|---|---|
+| Prolog (29, not sieve) | 0.885 (0.876, 0.885 in two other runs) | 0.79 qsort, 0.80 nreverse, 0.82 derive .. 0.97 reducer | |
+| Scheme (43) | 0.955 (0.949, 0.942) | 0.77 diviter, 0.83 deriv, 0.84 cpstak, 0.86 peval, gcbench .. 1.10 earley (0.91 noise) | 0.996 |
+| Python (11) | 0.943 (0.914) | 0.88 nqueens, 0.89 fannkuch, 0.90 chaos .. 1.01 | |
+| Mini (14) | 0.979 (0.977) | 0.82 binary_trees, 0.88 closures, 0.93 string_build; others ±3%, spectral_norm 1.07 (no GC; 0.95 noise) | 0.998 |
+| MiniJS (14) | 0.975 (0.989) | 0.83 closures, 0.92 binary_trees, 0.95 strings; others ±5% | 0.989 |
+
+Peak RSS is unchanged within 1% (Prolog boyer 30.1 to 30.2 MB, sieve
+203 to 205 MB, tak 22.7 to 20.8 MB; Scheme nboyer 154.5 to 154.4 MB,
+mperm 94.1 to 93.9 MB; Mini binary_trees 139.7 to 139.5 MB; MiniJS
+binary_trees 90.6 to 90.7 MB, sort 76.5 to 76.4 MB; Python float 107.6
+to 107.5 MB): the heap-growth policy is unchanged and the per-class
+chunks leave no holes. What is left of the collector is marking (now
+with the bitmap writes, 1.1-1.25 times the old mark time on Prolog)
+and `refill` finding runs: nreverse 39 ms mark and 20 ms refill, 8% of
+its time (from 26%); boyer 255 ms and 69 ms, 21% (from 28%), its 30 MB
+heap leaving many short runs between survivors.
+
+Tried and dropped: allocating every size from one bump run (bits set
+over each marked object's granules, so any size fits any hole) was as
+fast on Prolog (0.885) but made MiniJS's `sort` 4% slower: its records,
+allocated between strings and array storage, spread over more cache
+lines (`GETPROP_IN` 6% to 13% of samples). Per-class chunks keep them
+together; an all-dead chunk still goes back to a pool shared by the
+classes.
+
 ## Changes since the previous run (68012bd)
 
 The previous tables (commit 68012bd, same machine and method, load

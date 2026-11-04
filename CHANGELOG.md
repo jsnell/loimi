@@ -231,6 +231,20 @@ implementation; `git log` has the details.
 
 ### GC
 
+- **No sweep** ([stdlib/gc.md](docs/stdlib/gc.md#heap-layout)): marking
+  sets a bit per 16-byte granule in each chunk's mark bitmap, and each
+  size class bump-allocates through the runs of clear bits (found
+  word-at-a-time when a run is used up); dead objects are never read,
+  and chunks with nothing marked go to a pool any class takes from.
+  Both modes flip the mark epoch at each major collection. Geometric
+  means of new/old time: Prolog 0.885 (nreverse, qsort 0.80), Scheme
+  0.955 (diviter 0.77, deriv 0.83), Python 0.94, Mini 0.98
+  (binary_trees 0.82), MiniJS 0.975 (closures 0.83), at the same peak
+  memory
+  ([results.md](docs/results.md#gc-mark-bitmaps-instead-of-sweeping-2026-11-04)).
+  Verify mode fills free memory with 0x01 bytes so that dangling
+  references are still reported; `--gc-check-roots` keeps a start bitmap.
+
 - **GC objects are checked in every module**
   ([design/safety.md §8](docs/design/safety.md),
   [language.md §8](docs/language.md#8-gc-integration)): a slice of an

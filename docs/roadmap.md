@@ -169,10 +169,14 @@ quickening on/off.
      `nboyer` 0.798 s against 0.762 s without aging,
      `earley` +9%, `mperm` +7%. Small objects are promoted at their
      first survival.
+   - *Done* (2026-11-04): **mark bitmaps instead of sweeping**, in both
+     modes: marking sets a per-chunk bitmap bit per 16-byte granule, and
+     each size class bump-allocates through the runs of clear bits; no
+     collection or allocation reads dead objects, and chunks with nothing
+     marked go to a pool shared by the classes (`stdlib/gc.md`, "Mark
+     bitmaps"; this replaces the lazy sweeping above).
    - *Left open*: card marking for large arrays (stored into, they are
-     retraced whole by each minor collection), lazy sweeping in
-     non-generational heaps (it needs the epochs, and a flip at every
-     collection), and aging that targets objects in use at a minor
+     retraced whole by each minor collection), and aging that targets objects in use at a minor
      collection (by allocation time, for example) rather than all of
      them, for `string_build`-like programs.
 3. **Variable-length encodings and superinstructions.** Reusing words for

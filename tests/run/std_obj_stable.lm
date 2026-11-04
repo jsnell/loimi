@@ -39,8 +39,7 @@ fn yes(label: str, b: bool) { io.print(label); io.print(" "); io.print_bool(b); 
 /// the method through a cache. Both are dropped.
 fn World.proto_hit(w: *World, h: *obj.Hit) -> u64 {
     let none: ?Gc<obj.Obj<Value>> = None;
-    // 6 inline slots: a size class nothing else here uses, so the next
-    // such object after a collection takes this one's address.
+    // 6 inline slots: a size nothing else here uses.
     let p = obj.new_obj(&w.heap, w.m.root(6), none, 6);
     w.m.set(p, 10, Value.Int(7));
     let r = obj.new_obj(&w.heap, w.m.root_for(Some(p), 2), Some(p), 2);
@@ -83,7 +82,11 @@ fn main() uses gc {
     // A cached prototype hit whose prototype died never hits again, even
     // on a new receiver of the same layout under a new prototype at the
     // old address.
+    // (A collection first, so that the allocations after the ones below
+    // repeat these from the same free memory: the allocator takes free
+    // memory in address order after each collection.)
     var e = obj.Hit.empty();
+    gc.collect(&w.heap);
     let pa = w.proto_hit(&e);
     yes("filled", e.sid != 0 and e.cell != 0 and w.m.shapes.valid(e.cell));
     let cells = w.m.shapes.cells.len;

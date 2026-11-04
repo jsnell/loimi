@@ -1,13 +1,16 @@
 // Garbage-collected heap: precise, non-moving mark-sweep, optionally
 // generational (sticky mark bits).
 //
-// Small objects (header included, up to 512 bytes) come from size-class
-// free lists in 64 KiB chunks, aligned to their size (carved out of 2 MiB
-// segments, aligned so that they can be huge pages). The start of a chunk
-// is its header, which points at the
-// heap's remembered set, so a write barrier finds it from an object's
-// address alone. Each chunk keeps its own free list; per size class, the
-// allocator takes chunks with free slots in address order. Larger
+// Small objects (header included, up to 512 bytes, in size classes of 16
+// bytes) live in 64 KiB chunks of one size class each, aligned to their
+// size (carved out of 2 MiB segments, aligned so that they can be huge
+// pages). The start of a chunk is its header, which points at the heap's
+// remembered set, so a write barrier finds it from an object's address
+// alone, then a mark bitmap with a bit per 16-byte granule. Marking sets
+// the bits of a small object's granules; nothing is swept: per size
+// class, the allocator bump-allocates through runs of clear bits, which
+// it finds from the bitmaps in chunk order (`refill`), and chunks with
+// no marked object go to a pool that any class takes from. Larger
 // objects are calloc'd, with the same remembered-set pointer just before
 // their header, and kept in a vector.
 //
@@ -25,10 +28,10 @@
 // mark bits: an object is *old* once it survived a collection (a large
 // object: two), and old objects keep their mark. A minor collection marks
 // from the roots and the remembered set and treats marked (old) objects
-// as done; the chunks allocated from since the last collection are swept
-// lazily, by the allocator. A major collection flips the mark epoch,
-// which unmarks every object, and runs a full mark (its sweep is lazy
-// too). The write barrier keeps the invariant that an old
+// as done (their mark bits stay set). A major collection flips the mark
+// epoch, which unmarks every object, clears the bitmaps, and runs a full
+// mark. (A non-generational heap's collections are all major.) The write
+// barrier keeps the invariant that an old
 // object not in the remembered set points to no young object: the
 // compiler calls `barrier(obj)` after every store of a traced value
 // (`Gc`, a `value` type with references, a struct or option holding
@@ -68,8 +71,11 @@ fn now_ns() -> u64 {
 }
 
 const HEADER: u64 = 16;
-/// Size classes are multiples of 16 bytes, header included: class c holds
-/// objects of up to 16 * c bytes, for c in 1..NCLASS.
+/// The largest small object, header included; sizes are rounded up to a
+/// multiple of 16 bytes (a granule). Larger objects are calloc'd.
+const MAX_SMALL: u64 = 512;
+/// Size classes: class c holds objects of 16 * c bytes, header included,
+/// for c in 1..NCLASS.
 const NCLASS: u64 = 33;
 const CHUNK: u64 = 65536;
 /// Chunks are carved out of segments of this many (2 MiB, mapped aligned
@@ -78,8 +84,16 @@ const CHUNK: u64 = 65536;
 /// richards ran 7% slower than with chunks in the brk heap.)
 const SEG_CHUNKS: u64 = 32;
 const SEG: u64 = 2097152;
-/// The `tid` of a free small-object slot.
-const FREE: u16 = 0xFFFF;
+/// Each chunk's mark bitmap, one bit per 16-byte granule of the chunk
+/// (GRANULES bits in BM_WORDS words), follows its `ChunkHead`: a marked
+/// small object has the bits of all its granules set. The allocator
+/// allocates in the runs of clear bits (`refill`); nothing is swept.
+const BITMAP: u64 = 16;
+const BM_WORDS: u64 = 64;
+const GRANULES: u64 = 4096;
+/// The first granule after the chunk head and the bitmap.
+const FIRST_GRANULE: u64 = 33;
+const ONES: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Header flag: the object is old and not in the remembered set, so a
 /// store into it must log it (`barrier`). Set only in generational mode.
@@ -104,31 +118,19 @@ const YOUNG1: u8 = 254;
 const NO_YOUNG: u8 = 255;
 
 /// Lives just before every object (16 bytes, so a pair of two words takes
-/// a 32-byte slot). `size` is the slot size; `len` is the length of the
-/// trailing array (compiled code reads it at object - 8), and on a free
-/// small slot it links the next free slot instead.
+/// 32 bytes). `size` is the object's size with the header, rounded up to
+/// 16 bytes; `len` is the length of the trailing array (compiled code
+/// reads it at object - 8).
 struct Header { size: u32, tid: u16, mark: u8, flags: u8, len: u64 }
 
-fn next_free(hd: *Header) -> *Header { hd.len as *Header }
-
-/// A chunk of `n` slots of `size` bytes each, starting at `base`: after
-/// the `ChunkHead` at the start of the (aligned) chunk, and an offset
-/// that varies from chunk to chunk (cache coloring: with every chunk
-/// aligned alike, objects at the same place in different chunks would
-/// compete for the same cache sets).
-/// `free` lists its free slots while it is not the size class's current
-/// chunk, `nfree` counts them, and `next` links the class's chunks with
-/// free slots (chunk index + 1; 0 ends the list). `used` is set while the
-/// chunk is (or since the last collection was) a current chunk, i.e. it
-/// may hold objects allocated since then: a minor collection sweeps only
-/// those. `pending`: the chunk still needs sweeping (generational mode
-/// sweeps lazily, when the allocator takes the chunk); `free` and
-/// `nfree` are then meaningless. `stale`: it has been pending since the
-/// last major collection, so it may hold dead objects marked with the
-/// epoch before, and must be swept before the next flip brings that
-/// epoch back. (Chunks made pending by a minor collection were swept
-/// since.)
-struct Chunk { base: *u8, size: u64, n: u64, nfree: u64, free: *Header, next: u64, used: bool, pending: bool, stale: bool }
+/// A 64 KiB chunk at `base` (aligned to its size): the `ChunkHead`, the
+/// mark bitmap, then objects of size class `class` from granule `start`
+/// on, every 16 * `class` bytes. `start` varies from chunk to chunk (cache
+/// coloring: with every chunk aligned alike, objects at the same place in
+/// different chunks would compete for the same cache sets). `next` links
+/// the chunks of a class, or the empty chunks (index + 1; 0 ends the
+/// list).
+struct Chunk { base: *u8, start: u64, class: u64, next: u64 }
 
 /// At the start of each chunk (and 16 bytes before a large object's
 /// header): where the write barrier logs objects.
@@ -163,10 +165,17 @@ pub struct Heap {
     /// Large objects; those before `large_old` are old (generational mode).
     large: mem.Vec<*Header>,
     large_old: u64,
-    /// The current chunk's free slots, per size class.
-    free: [*Header; 33],
-    /// First chunk with free slots per size class (index + 1; 0: none).
+    /// Per size class, the run of free memory the allocator bumps
+    /// through: the next object goes at `cur`, up to `lim`.
+    cur: [*u8; 33],
+    lim: [*u8; 33],
+    /// Per size class, the chunk where `refill` looks for the next run
+    /// (index + 1; 0: none left), and the granule there.
     avail: [u64; 33],
+    scan_g: [u64; 33],
+    /// The chunks with no marked object after the last collection, which
+    /// any size class may take (index + 1; 0: none).
+    pool: u64,
     chunks: mem.Vec<Chunk>,
     /// Raw segment allocations, and the next unused chunk of the last one.
     segments: mem.Vec<*u8>,
@@ -233,14 +242,14 @@ pub struct Heap {
     /// Free for the embedder (for example, runtime data that allocation
     /// helpers need but that is not passed to them).
     user: *u8,
-    // Fields added for the generational mode's epochs, lazy sweeping and
-    // aging (after the others, so that their offsets stay put).
-    /// The mark byte of a marked object (1 or 2). A generational heap's
-    /// major collection flips it instead of clearing every mark first:
-    /// after a major collection every allocated object is unmarked (0) or
-    /// marked with the current epoch, so after the flip all are unmarked.
-    /// (A non-generational heap clears the marks as it sweeps; its epoch
-    /// stays 1.)
+    // Fields added for the generational mode's epochs and aging (after
+    // the others, so that their offsets stay put).
+    /// The mark byte of a marked object (1 or 2). Every major collection
+    /// flips it instead of clearing every mark first: the objects alive
+    /// after the last collection are unmarked (0) or marked with the
+    /// current epoch, so after the flip all are unmarked. (Dead objects
+    /// keep whatever mark they had, but nothing reaches them, and their
+    /// mark bits are clear.)
     epoch: u8,
     /// Flags that marking sets: LOG in a generational heap (a survivor is
     /// old), else none.
@@ -258,8 +267,17 @@ pub struct Heap {
     young_ref: bool,
     /// Spare vector for rebuilding the remembered set.
     rs_tmp: mem.Vec<*u8>,
-    /// Time in deferred sweeps (`sweep_chunk`).
+    /// Time in `refill` (finding runs of free granules).
     lazy_ns: u64,
+    /// Objects marked in the collection in progress: with the epoch, and
+    /// with a young mark.
+    nold: u64,
+    nyoung: u64,
+    /// Objects marked with the epoch (old, in a generational heap).
+    old_count: u64,
+    /// `--gc-check-roots`: a bit per granule of each chunk (BM_WORDS
+    /// words per chunk, by chunk index) set where an object starts.
+    starts: mem.Vec<u64>,
 }
 
 pub fn Heap.new() -> Heap {
@@ -271,8 +289,11 @@ pub fn Heap.new() -> Heap {
     Heap {
         large: mem.Vec.new(),
         large_old: 0,
-        free: [0 as *Header; 33],
+        cur: [0 as *u8; 33],
+        lim: [0 as *u8; 33],
         avail: [0; 33],
+        scan_g: [0; 33],
+        pool: 0,
         chunks: mem.Vec.new(),
         segments: mem.Vec.new(),
         seg_next: 0 as *u8,
@@ -315,6 +336,10 @@ pub fn Heap.new() -> Heap {
         mark_ns: 0,
         sweep_ns: 0,
         lazy_ns: 0,
+        nold: 0,
+        nyoung: 0,
+        old_count: 0,
+        starts: mem.Vec.new(),
         user: 0 as *u8,
     }
 }
@@ -323,40 +348,42 @@ pub fn Heap.new() -> Heap {
 pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
     if c >= NCLASS { return alloc_large(h, size, tid, n); }
-    var hd = h.free[c];
-    if (hd as u64) == 0 { hd = refill(h, c); }
-    h.free[c] = next_free(hd);
-    // tid, mark and flags in one store, on the path after the refill: the
-    // flags are 0 (young), which lets LLVM drop the write barriers of
-    // stores into the new object that follow.
-    *((hd as *u8 + 4) as *u32) = tid & 0xFFFF;
-    hd.len = n;
+    let sz = c << 4;
+    var hd = h.cur[c];
+    if (h.lim[c] as u64) - (hd as u64) < sz { hd = refill(h, c); }
+    h.cur[c] = hd + sz;
+    // size, tid, mark and flags in one store, on the path after the
+    // refill: the flags are 0 (young), which lets LLVM drop the write
+    // barriers of stores into the new object that follow.
+    *(hd as *u64) = sz | (((tid & 0xFFFF) as u64) << 32);
+    (hd as *Header).len = n;
     h.count += 1;
-    h.allocated += c << 4;
-    let p = hd as *u8 + HEADER;
+    h.allocated += sz;
+    let p = hd + HEADER;
     mem.memset(p, 0, size);
     p
 }
 
 /// Called by compiled code for `try_new`: `alloc` without its refill, so
 /// that it makes no call (in a tail-call handler, a call anywhere gives
-/// the handler a stack frame on every execution). Null if the size
-/// class's free list is empty; `make_room` refills it. Large objects (over
-/// 496 bytes with the header) are allocated as by `alloc` (a call), and
-/// a trailing array's zeroing is a `memset` call unless its length is a
-/// constant.
+/// the handler a stack frame on every execution). Null if the current run
+/// of free memory is too short; `make_room` refills it. Large objects
+/// (over 496 bytes with the header) are allocated as by `alloc` (a call),
+/// and a trailing array's zeroing is a `memset` call unless its length is
+/// a constant.
 #[inline]
 pub fn try_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
     if c >= NCLASS { return alloc_large(h, size, tid, n); }
-    let hd = h.free[c];
-    if (hd as u64) == 0 { return 0 as *u8; }
-    h.free[c] = next_free(hd);
-    *((hd as *u8 + 4) as *u32) = tid & 0xFFFF;
-    hd.len = n;
+    let sz = c << 4;
+    let hd = h.cur[c];
+    if (h.lim[c] as u64) - (hd as u64) < sz { return 0 as *u8; }
+    h.cur[c] = hd + sz;
+    *(hd as *u64) = sz | (((tid & 0xFFFF) as u64) << 32);
+    (hd as *Header).len = n;
     h.count += 1;
-    h.allocated += c << 4;
-    let p = hd as *u8 + HEADER;
+    h.allocated += sz;
+    let p = hd + HEADER;
     mem.memset(p, 0, size);
     p
 }
@@ -370,75 +397,146 @@ pub fn try_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
 #[inline(never)]
 pub fn make_room(h: *Heap, size: u64) {
     let c = (HEADER + size + 15) >> 4;
-    if c < NCLASS and (h.free[c] as u64) == 0 { refill(h, c); }
+    if c < NCLASS and (h.lim[c] as u64) - (h.cur[c] as u64) < (c << 4) { refill(h, c); }
 }
 
-/// Make the next chunk of class `c` with free slots (or a new one) the
-/// current chunk; returns its first free slot.
+/// The first granule at or after `g` whose bit in `bm` is set (`set`) or
+/// clear; GRANULES if none.
+#[inline]
+fn next_bit(bm: *u64, g: u64, set: bool) -> u64 {
+    if g >= GRANULES { return GRANULES; }
+    let flip = if set { 0 } else { ONES };
+    var w = g >> 6;
+    var x = (bm[w] ^ flip) & (ONES << (g & 63));
+    while x == 0 {
+        w += 1;
+        if w == BM_WORDS { return GRANULES; }
+        x = bm[w] ^ flip;
+    }
+    (w << 6) + x.ctz()
+}
+
+/// Make the next run of free memory (granules with clear mark bits) in
+/// a chunk of size class `c` the class's run, taking an empty chunk (or a
+/// new one) when the class's chunks have none left; returns its start.
+/// After each collection a class takes its chunks' runs in chunk order.
+/// (A run in a chunk of the class starts and ends at object boundaries:
+/// dead objects' bits are clear and live ones' set.)
 #[inline(never)]
-fn refill(h: *Heap, c: u64) -> *Header {
-    loop {
-        let a = h.avail[c];
-        if a == 0 {
-            add_chunk(h, c);
-            return h.free[c];
-        }
-        let ch = h.chunks.ptr_at(a - 1);
-        h.avail[c] = ch.next;
-        ch.next = 0;
-        if ch.pending { sweep_chunk(h, ch); }
-        if ch.nfree != 0 {
-            ch.used = true;
-            h.free[c] = ch.free;
-            ch.free = 0 as *Header;
-            ch.nfree = 0;
-            return h.free[c];
-        }
-    }
-}
-
-/// Sweep a chunk of a generational heap whose sweep was deferred: free the
-/// objects not marked with the current epoch (survivors keep their mark
-/// and their LOG flag, set when they were marked).
-fn sweep_chunk(h: *Heap, ch: *Chunk) {
+fn refill(h: *Heap, c: u64) -> *u8 {
     let ts = if h.stats { now_ns() } else { 0 };
-    let ep = h.epoch;
-    let yg = h.young;
-    var head = 0 as *Header;
-    var nfree: u64 = 0;
-    var freed: u64 = 0;
-    var i = ch.n;
-    while i > 0 {
-        i -= 1;
-        let hd = (ch.base + i * ch.size) as *Header;
-        if hd.tid != FREE {
-            let m = hd.mark;
-            if m == ep or m == yg { continue; }
-            hd.tid = FREE;
-            hd.flags = 0;
-            freed += 1;
+    let sz = c << 4;
+    loop {
+        if h.avail[c] == 0 {
+            if h.pool == 0 {
+                add_chunk(h);
+                h.avail[c] = h.chunks.len;
+            } else {
+                h.avail[c] = h.pool;
+                h.pool = h.chunks.at(h.pool - 1).next;
+            }
+            let nc = h.chunks.ptr_at(h.avail[c] - 1);
+            nc.class = c;
+            nc.next = 0;
+            h.scan_g[c] = 0;
         }
-        hd.mark = 0;
-        hd.len = head as u64;
-        head = hd;
-        nfree += 1;
+        let ch = h.chunks.at(h.avail[c] - 1);
+        let bm = (ch.base + BITMAP) as *u64;
+        var g = if h.scan_g[c] < ch.start { ch.start } else { h.scan_g[c] };
+        while g < GRANULES {
+            let a = next_bit(bm, g, false);
+            if a >= GRANULES { break; }
+            let b = next_bit(bm, a + 1, true);
+            g = b;
+            if ((b - a) << 4) >= sz {
+                h.scan_g[c] = b;
+                h.cur[c] = ch.base + (a << 4);
+                h.lim[c] = ch.base + (b << 4);
+                if h.stats { h.lazy_ns += now_ns() - ts; }
+                return h.cur[c];
+            }
+        }
+        h.avail[c] = ch.next;
+        h.scan_g[c] = 0;
     }
-    ch.free = head;
-    ch.nfree = nfree;
-    ch.pending = false;
-    ch.stale = false;
-    h.freed += freed;
-    h.count -= freed;
-    if h.stats { h.lazy_ns += now_ns() - ts; }
 }
 
-/// Sweep the chunks whose sweep is still pending (`all`), or only the
-/// stale ones.
-fn finish_sweep(h: *Heap, all: bool) {
+/// After marking: reset the allocator's runs, and relink the chunks, in
+/// index order, per size class, except those with no marked object,
+/// which go to the empty chunks that any class can take.
+fn relink_chunks(h: *Heap) {
+    var tail: [u64; 33] = [0; 33];
+    var ptail: u64 = 0;
+    h.pool = 0;
+    for c in 0..NCLASS {
+        h.cur[c] = 0 as *u8;
+        h.lim[c] = 0 as *u8;
+        h.avail[c] = 0;
+        h.scan_g[c] = 0;
+    }
     for ci in 0..h.chunks.len {
         let ch = h.chunks.ptr_at(ci);
-        if ch.pending and (all or ch.stale) { sweep_chunk(h, ch); }
+        ch.next = 0;
+        let bm = (ch.base + BITMAP) as *u64;
+        var any: u64 = 0;
+        for w in 0..BM_WORDS { any = any | bm[w]; }
+        if any == 0 {
+            if ptail == 0 { h.pool = ci + 1; } else { h.chunks.ptr_at(ptail - 1).next = ci + 1; }
+            ptail = ci + 1;
+        } else {
+            let c = ch.class;
+            if tail[c] == 0 { h.avail[c] = ci + 1; } else { h.chunks.ptr_at(tail[c] - 1).next = ci + 1; }
+            tail[c] = ci + 1;
+        }
     }
+}
+
+/// Set the mark bits of the granules of the small object whose header is
+/// at `hd`, of `sz` bytes.
+#[inline]
+fn set_bits(hd: *u8, sz: u64) {
+    let a = hd as u64;
+    let bm = ((a & !(CHUNK - 1)) + BITMAP) as *u64;
+    let g = (a & (CHUNK - 1)) >> 4;
+    let n = sz >> 4;
+    let w = g >> 6;
+    let b = g & 63;
+    if b + n <= 64 {
+        bm[w] = bm[w] | ((((1 as u64) << n) - 1) << b);
+    } else {
+        bm[w] = bm[w] | (ONES << b);
+        bm[w + 1] = bm[w + 1] | (((1 as u64) << (b + n - 64)) - 1);
+    }
+}
+
+/// Clear every chunk's mark bitmap (before a full collection).
+fn clear_bitmaps(h: *Heap) {
+    for ci in 0..h.chunks.len {
+        mem.memset(h.chunks.at(ci).base + BITMAP, 0, BM_WORDS * 8);
+    }
+}
+
+/// The headers of the small objects whose mark bits are set (in a
+/// generational heap between collections: the old ones), chunk by chunk:
+/// `var it = MarkedIter.new(h); while let Some(hd) = it.next() { .. }`.
+struct MarkedIter { h: *Heap, ci: u64, g: u64 }
+
+fn MarkedIter.new(h: *Heap) -> MarkedIter { MarkedIter { h: h, ci: 0, g: 0 } }
+
+fn MarkedIter.next(it: *MarkedIter) -> ?*Header {
+    while it.ci < it.h.chunks.len {
+        let ch = it.h.chunks.at(it.ci);
+        let bm = (ch.base + BITMAP) as *u64;
+        let g = next_bit(bm, if it.g < ch.start { ch.start } else { it.g }, true);
+        if g < GRANULES {
+            let hd = (ch.base + (g << 4)) as *Header;
+            it.g = g + ((hd.size as u64) >> 4);
+            return Some(hd);
+        }
+        it.ci += 1;
+        it.g = 0;
+    }
+    None
 }
 
 #[inline(never)]
@@ -479,8 +577,9 @@ fn new_segment() -> *u8 {
     seg
 }
 
-/// A new chunk for class `c`, made its current chunk.
-fn add_chunk(h: *Heap, c: u64) {
+/// A new chunk (all free: a fresh segment is zeroed), at the end of the
+/// chunk list.
+fn add_chunk(h: *Heap) {
     if h.seg_left == 0 {
         let seg = new_segment();
         h.segments.push(seg);
@@ -490,27 +589,11 @@ fn add_chunk(h: *Heap, c: u64) {
     let base = h.seg_next;
     h.seg_next = base + CHUNK;
     h.seg_left -= 1;
-    let size = c << 4;
     let head = base as *ChunkHead;
     head.rs = h.rs;
     head.pad = 0;
-    let start = 16 + ((h.chunks.len * 37 + 11) % 64) * 64;
-    let n = (CHUNK - start) / size;
-    let slots = base + start;
-    var list = 0 as *Header;
-    var i = n;
-    while i > 0 {
-        i -= 1;
-        let hd = (slots + i * size) as *Header;
-        hd.size = size as u32;
-        hd.tid = FREE;
-        hd.mark = 0;
-        hd.flags = 0;
-        hd.len = list as u64;
-        list = hd;
-    }
-    h.chunks.push(Chunk { base: slots, size: size, n: n, nfree: 0, free: 0 as *Header, next: 0, used: true, pending: false, stale: false });
-    h.free[c] = list;
+    let start = FIRST_GRANULE + ((h.chunks.len * 37 + 11) % 64) * 4;
+    h.chunks.push(Chunk { base: base, start: start, class: 0, next: 0 });
 }
 
 /// Whether the object at `p` survived marking. Meaningful only in a
@@ -568,11 +651,16 @@ pub fn mark_ptr(h: *Heap, p: *u8) {
     let nm = if (hd.flags & (AGED | LARGE)) != LARGE { ep } else { h.first_mark };
     hd.mark = nm;
     if nm == ep {
-        hd.flags = hd.flags | h.mark_flags;
-        h.marked += hd.size as u64;
+        let f = hd.flags;
+        hd.flags = f | h.mark_flags;
+        let sz = hd.size as u64;
+        h.marked += sz;
+        h.nold += 1;
+        if (f & LARGE) == 0 { set_bits(hd as *u8, sz); }
     } else {
         hd.flags = hd.flags | AGED;
         h.young_ref = true;
+        h.nyoung += 1;
     }
     h.stack.push(p);
 }
@@ -691,17 +779,18 @@ pub fn collect(h: *Heap) uses gc {
     if h.verify and h.sticky { verify_heap(h); }
     let minor = h.gen and h.sticky and !h.want_major and h.rs.missed == 0;
     if !minor {
-        // A major collection. Chunks still pending since the last major
-        // collection may hold dead objects marked with the epoch that the
-        // flip brings back: sweep them first. (The chunks that minor
-        // collections left pending hold marks of the current epoch or 0,
-        // which the flip turns into dead; they are swept later.)
-        finish_sweep(h, !h.gen);
-        if h.sticky {
-            if h.gen { new_epoch(h); } else { clear_marks(h); }
-        }
+        // A major collection: flip the epoch, which unmarks every object
+        // (dead objects keep their old marks, but nothing reaches them),
+        // and clear the mark bitmaps. A heap that was generational first
+        // drops its old objects' LOG flags.
+        if h.sticky and !h.gen { clear_marks(h); }
+        new_epoch(h);
+        clear_bitmaps(h);
     }
     let rs_n = h.rs.objs.len;
+    let before = h.count;
+    h.nold = 0;
+    h.nyoung = 0;
     h.marked = 0;
     h.mark_flags = if h.gen { LOG } else { 0 };
     h.minor = minor;
@@ -779,75 +868,9 @@ pub fn collect(h: *Heap) uses gc {
     let t1 = if h.stats { now_ns() } else { 0 };
     let keep = h.gen;
     let ep = h.epoch;
-    // Bytes of the survivors (generational: counted when marked).
-    var live: u64 = 0;
-    var freed: u64 = 0;
-    // Small objects: sweep the chunks (in a minor collection, those
-    // allocated from), rebuild their free lists in address order, and
-    // relink the chunks with free slots per class in index order. A
-    // generational heap defers the sweeps to the allocator (`refill`):
-    // the chunks are linked as pending.
-    var tail: [u64; 33] = [0; 33];
-    for c in 0..NCLASS {
-        h.free[c] = 0 as *Header;
-        h.avail[c] = 0;
-    }
-    for ci in 0..h.chunks.len {
-        let ch = h.chunks.ptr_at(ci);
-        if keep {
-            if !minor {
-                ch.stale = true;
-                ch.pending = true;
-                ch.used = false;
-            } else if ch.used {
-                ch.pending = true;
-                ch.used = false;
-            }
-        } else if !ch.used and ch.nfree == ch.n {
-            // Empty at the last sweep and not allocated from since: still
-            // empty (its free list stands). A heap whose live data shrank
-            // keeps its chunks; sweeping them all at every collection made
-            // the sweep cost follow the heap's high-water mark instead of
-            // what was allocated.
-        } else if ch.used or !minor {
-            var head = 0 as *Header;
-            var nfree: u64 = 0;
-            var i = ch.n;
-            while i > 0 {
-                i -= 1;
-                let hd = (ch.base + i * ch.size) as *Header;
-                if hd.tid != FREE {
-                    if hd.mark == ep {
-                        hd.mark = 0;
-                        live += ch.size;
-                        continue;
-                    }
-                    hd.tid = FREE;
-                    hd.flags = 0;
-                    freed += 1;
-                }
-                // A free slot may have been marked through a dangling
-                // reference (a missed root); never hand out a marked slot.
-                hd.mark = 0;
-                hd.len = head as u64;
-                head = hd;
-                nfree += 1;
-            }
-            ch.free = head;
-            ch.nfree = nfree;
-            ch.used = false;
-        }
-        ch.next = 0;
-        if ch.nfree != 0 or ch.pending {
-            let c = ch.size >> 4;
-            if tail[c] == 0 {
-                h.avail[c] = ci + 1;
-            } else {
-                h.chunks.ptr_at(tail[c] - 1).next = ci + 1;
-            }
-            tail[c] = ci + 1;
-        }
-    }
+    // Small objects: nothing to sweep. Their mark bits are set, and the
+    // allocator takes the runs of clear bits, from the first chunk on.
+    relink_chunks(h);
     // Large objects (in a minor collection, the young ones).
     let first = if minor { h.large_old } else { 0 };
     let yg = h.young;
@@ -855,12 +878,9 @@ pub fn collect(h: *Heap) uses gc {
     for i in first..h.large.len {
         let cur = h.large.at(i);
         if cur.mark == ep or cur.mark == yg {
-            if !keep { cur.mark = 0; }
-            live += cur.size as u64;
             h.large.set(out, cur);
             out += 1;
         } else {
-            freed += 1;
             free(cur as *u8 - 16);
         }
     }
@@ -880,12 +900,21 @@ pub fn collect(h: *Heap) uses gc {
         nold = out;
     }
     h.large_old = if keep { nold } else { 0 };
-    h.freed += freed;
-    h.count -= freed;
+    // Objects known to be alive: in a minor collection the old ones and
+    // the young survivors (dead old objects are found by the next major
+    // collection).
+    if minor {
+        h.count = h.old_count + h.nold + h.nyoung;
+        h.old_count += h.nold;
+    } else {
+        h.count = h.nold + h.nyoung;
+        h.old_count = h.nold;
+    }
+    h.freed += before - h.count;
     h.allocated = 0;
     h.collections += 1;
     h.sticky = keep;
-    if keep { live = h.marked; }
+    let live = h.marked;
     if minor {
         h.minors += 1;
         // Every object marked in a minor collection was young.
@@ -905,6 +934,11 @@ pub fn collect(h: *Heap) uses gc {
         h.rs.objs.reserve(if want > RS_MIN { want } else { RS_MIN });
     }
     h.rs.missed = 0;
+    // Verify mode: fill the free runs with 0x01 bytes, so that a dangling
+    // reference reads a header of 0x01 bytes (`verify_fail`). Every small
+    // survivor is marked (a minor collection promotes them), so a clear
+    // bit is free memory.
+    if h.verify { poison_free(h); }
     // In stress mode a generational heap still runs a major collection
     // now and then, so both kinds are exercised.
     if h.stress and h.gen and h.collections % 8 == 7 { h.want_major = true; }
@@ -933,9 +967,9 @@ pub fn collect(h: *Heap) uses gc {
     }
 }
 
-/// Before a major collection of a generational heap: flip the epoch, which
+/// Before a major collection: flip the epoch, which
 /// unmarks every object, and forget the remembered set. (Old objects keep
-/// their LOG flag; the sweep sets it again on the survivors.)
+/// their LOG flag; marking sets it again on the survivors.)
 fn new_epoch(h: *Heap) {
     h.epoch = 3 - h.epoch;
     h.rs.epoch = h.epoch;
@@ -948,22 +982,30 @@ fn new_epoch(h: *Heap) {
     h.sticky = false;
 }
 
-/// Clear every mark bit and LOG flag, and forget the remembered set
-/// (before a full collection of a heap that was generational).
-fn clear_marks(h: *Heap) {
+/// Fill every run of free granules (clear mark bits) with 0x01 bytes.
+fn poison_free(h: *Heap) {
     for ci in 0..h.chunks.len {
-        let ch = h.chunks.ptr_at(ci);
-        var i = ch.n;
-        while i > 0 {
-            i -= 1;
-            let hd = (ch.base + i * ch.size) as *Header;
-            hd.mark = 0;
-            hd.flags = 0;
+        let ch = h.chunks.at(ci);
+        let bm = (ch.base + BITMAP) as *u64;
+        var g = ch.start;
+        while g < GRANULES {
+            let a = next_bit(bm, g, false);
+            if a >= GRANULES { break; }
+            let b = next_bit(bm, a + 1, true);
+            mem.memset(ch.base + (a << 4), 1, (b - a) << 4);
+            g = b;
         }
     }
+}
+
+/// Before a full collection of a heap that was generational: clear the
+/// flags of the old objects (LOG, INRS, AGED), and forget the remembered
+/// set. (`new_epoch` then unmarks them.)
+fn clear_marks(h: *Heap) {
+    var it = MarkedIter.new(h);
+    while let Some(hd) = it.next() { hd.flags = 0; }
     for i in 0..h.large.len {
         let cur = h.large.at(i);
-        cur.mark = 0;
         cur.flags = LARGE;
     }
     h.large_old = 0;
@@ -1069,17 +1111,12 @@ pub fn maybe_collect(h: *Heap) uses gc {
 
 fn verify_heap(h: *Heap) {
     h.checks = VERIFYING;
-    for ci in 0..h.chunks.len {
-        let ch = h.chunks.ptr_at(ci);
-        var i = ch.n;
-        while i > 0 {
-            i -= 1;
-            let hd = (ch.base + i * ch.size) as *Header;
-            if hd.tid != FREE and hd.mark == h.epoch and (hd.flags & (LOG | INRS)) == LOG {
-                let p = hd as *u8 + HEADER;
-                h.vparent = p;
-                loimi_trace_object(h, p, hd.tid as u32);
-            }
+    var it = MarkedIter.new(h);
+    while let Some(hd) = it.next() {
+        if hd.mark == h.epoch and (hd.flags & (LOG | INRS)) == LOG {
+            let p = hd as *u8 + HEADER;
+            h.vparent = p;
+            loimi_trace_object(h, p, hd.tid as u32);
         }
     }
     for i in 0..h.large.len {
@@ -1111,8 +1148,8 @@ fn verify_fail(h: *Heap, p: *u8) {
     let hd = (p - HEADER) as *Header;
     io.eprint("gc verify: old object of type ");
     io.eprint(loimi_type_name(hp.tid as u32));
-    if hd.tid == FREE {
-        io.eprintln(" points to a free slot");
+    if hd.size == 0x01010101 {
+        io.eprintln(" points to a freed object");
     } else {
         io.eprint(" points to a young object of type ");
         io.eprint(loimi_type_name(hd.tid as u32));
@@ -1325,9 +1362,13 @@ pub fn Heap.free(h: *Heap) {
     h.segments.free();
     h.chunks.free();
     for c in 0..NCLASS {
-        h.free[c] = 0 as *Header;
+        h.cur[c] = 0 as *u8;
+        h.lim[c] = 0 as *u8;
         h.avail[c] = 0;
     }
+    h.pool = 0;
+    h.old_count = 0;
+    h.starts.free();
     h.seg_left = 0;
     h.count = 0;
     h.stack.free();
@@ -1838,7 +1879,31 @@ pub fn rootck_mark(h: *Heap, p: *u8) {
 /// `alloc` for `new` in `--gc-check-roots` builds.
 pub fn rootck_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     rootck_install(h);
-    alloc(h, size, tid, n)
+    let p = alloc(h, size, tid, n);
+    let hd = (p - HEADER) as *Header;
+    if (hd.flags & LARGE) == 0 {
+        // Record the start (and that no other object starts inside it).
+        let ci = rootck_chunk(h, p as u64);
+        while h.starts.len < h.chunks.len * BM_WORDS { h.starts.push(0); }
+        let bm = h.starts.ptr + ci * BM_WORDS;
+        let g = ((hd as u64) & (CHUNK - 1)) >> 4;
+        for i in 0..(hd.size as u64) >> 4 {
+            let k = g + i;
+            bm[k >> 6] = bm[k >> 6] & !((1 as u64) << (k & 63));
+        }
+        bm[g >> 6] = bm[g >> 6] | ((1 as u64) << (g & 63));
+    }
+    p
+}
+
+/// The index of the chunk holding address `a` (a small object of `h`).
+fn rootck_chunk(h: *Heap, a: u64) -> u64 {
+    for si in 0..h.segments.len {
+        let seg = h.segments.ptr[si] as u64;
+        if a >= seg and a < seg + SEG { return si * SEG_CHUNKS + (a - seg) / CHUNK; }
+    }
+    abort_msg("gc check-roots: allocation outside the heap");
+    0
 }
 
 /// 0 if `p` is the start of an allocated object of `h`, else why not.
@@ -1853,12 +1918,13 @@ pub fn rootck_check(h: *Heap, p: *u8) -> u64 {
             if ci >= h.chunks.len { return 3; }
             let ch = h.chunks.ptr + ci;
             let base = ch.base as u64;
-            if (base & !(CHUNK - 1)) != seg + ((a - seg) & !(CHUNK - 1)) { return 6; }
-            if a < base + HEADER { return 4; }
-            let off = a - HEADER - base;
-            if off % ch.size != 0 or off / ch.size >= ch.n { return 4; }
+            if base != seg + ((a - seg) & !(CHUNK - 1)) { return 6; }
+            let g = (a - HEADER - base) >> 4;
+            if a < base + HEADER or g < ch.start { return 4; }
             let hd = (a - HEADER) as *Header;
-            if hd.tid == FREE { return 5; }
+            if ci * BM_WORDS >= h.starts.len or (h.starts.ptr[ci * BM_WORDS + (g >> 6)] & ((1 as u64) << (g & 63))) == 0 {
+                return if hd.size == 0x01010101 { 5 } else { 4 };
+            }
             return 0;
         }
     }
@@ -1947,15 +2013,15 @@ pub fn rootck_install(h: *Heap) {
 /// Fill the objects this collection frees with 0x01 bytes.
 pub fn rootck_poison(h: *Heap, data: *u8) {
     if h.gen { return; }
+    // Forget the starts of the dead objects, and poison them.
     for ci in 0..h.chunks.len {
-        let ch = h.chunks.ptr + ci;
-        for i in 0..ch.n {
-            let hd = (ch.base + i * ch.size) as *Header;
-            if hd.tid != FREE and hd.mark != h.epoch {
-                mem.memset(hd as *u8 + HEADER, 1, ch.size - HEADER);
-            }
+        if ci * BM_WORDS >= h.starts.len { break; }
+        let bm = (h.chunks.at(ci).base + BITMAP) as *u64;
+        for w in 0..BM_WORDS {
+            h.starts.ptr[ci * BM_WORDS + w] = h.starts.ptr[ci * BM_WORDS + w] & bm[w];
         }
     }
+    poison_free(h);
     for i in 0..h.large.len {
         let hd = h.large.ptr[i];
         if hd.mark != h.epoch { mem.memset(hd as *u8 + HEADER, 1, hd.size as u64 - HEADER); }

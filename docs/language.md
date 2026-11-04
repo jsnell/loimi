@@ -3668,7 +3668,7 @@ loimi build embed.lm --shared -o libmini.so --header mini.h   # shared object
   | shadow-stack top (GC roots of compiled code) | thread-local |
   | `Vm.depth`, vm scratch slots (`cold` captures, `-> never` arguments, aggregate results, `raise` values) | thread-local |
   | `rt.protect`/`catch_panic` handler chain, caught panic message and its 512-byte copy, `#[track_caller]` location | thread-local |
-  | GC heaps: chunks, segments, free lists, remembered set, scanners, weak tables, interners | per heap (`std.gc` has no globals) |
+  | GC heaps: chunks, segments, mark bitmaps, remembered set, scanners, weak tables, interners | per heap (`std.gc` has no globals) |
   | inline caches, rewritten opcodes, constant pools | per state (in its code) |
   | dispatch tables, string constants, `TypeInfo` | read-only data |
   | `loimi.argc`/`argv` | written once by `main` (executables only) |
