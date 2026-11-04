@@ -191,14 +191,14 @@ pub value V repr nanbox {
 // ── strings ─────────────────────────────────────────────────────────
 
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
-    let o = new(h, Str { hash: 0, key: 0 }, s.len);
+    let o = new_uninit(h, Str { hash: 0, key: 0 }, s.len);
     mem.memcpy(o.data.ptr, s.ptr, s.len);
     o
 }
 
 /// A string of `n` bytes to be filled in by the caller.
 pub fn alloc_str(h: *gc.Heap, n: u64) -> Gc<Str> {
-    new(h, Str { hash: 0, key: 0 }, n)
+    new_uninit(h, Str { hash: 0, key: 0 }, n)
 }
 
 pub fn str_eq(a: Gc<Str>, b: Gc<Str>) -> bool {

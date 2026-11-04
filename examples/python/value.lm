@@ -133,7 +133,7 @@ impl hash.Hash for Value;
 // ── strings ─────────────────────────────────────────────────────────
 
 pub fn new_str(h: *gc.Heap, s: str) -> Gc<Str> {
-    let o = new(h, Str { hash: 0 }, s.len);
+    let o = new_uninit(h, Str { hash: 0 }, s.len);
     mem.copy(o.data.ptr, s.ptr, s.len);
     o
 }

@@ -1334,7 +1334,7 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
     }
     match (a, b) {
         (Str(x), Str(y)) => if op == O_ADD {
-            let s = new(&c.heap, Str { hash: 0 }, x.data.len + y.data.len);
+            let s = new_uninit(&c.heap, Str { hash: 0 }, x.data.len + y.data.len);
             mem.copy(s.data.ptr, x.data.ptr, x.data.len);
             mem.copy(s.data.ptr + x.data.len, y.data.ptr, y.data.len);
             return Ok(Value.Str(s));
@@ -1435,7 +1435,7 @@ fn repeat(c: *Ctx, seq: Value, n: Value) -> Result<?Value, Value> {
     if len > 0 and k > (1 << 27) / len { return Err(exc_of_empty_kind(c, builtins.E_MEMORY)); }
     match seq {
         Str(s) => {
-            let r = new(&c.heap, Str { hash: 0 }, s.data.len * k);
+            let r = new_uninit(&c.heap, Str { hash: 0 }, s.data.len * k);
             for i in 0..k { mem.copy(r.data.ptr + i * s.data.len, s.data.ptr, s.data.len); }
             Ok(Some(Value.Str(r)))
         }
@@ -2274,7 +2274,7 @@ pub fn getslice(c: *Ctx, obj: Value, lo: Value, hi: Value, st: Value) -> Result<
         }
         Str(s) => {
             let (start, _s, step, n) = slice_indices(c, lo, hi, st, s.data.len)?;
-            let r = new(&c.heap, Str { hash: 0 }, n);
+            let r = new_uninit(&c.heap, Str { hash: 0 }, n);
             var j = start;
             for i in 0..n { r.data[i] = s.data[j as u64]; j += step; }
             Ok(Value.Str(r))
@@ -2759,7 +2759,7 @@ fn not_iterator(c: *Ctx, v: Value) -> Value {
 pub fn join_strs(c: *Ctx, base: *Value, n: u64) -> Value {
     var len: u64 = 0;
     for i in 0..n { if let Str(s) = base[i] { len += s.data.len; } }
-    let r = new(&c.heap, Str { hash: 0 }, len);
+    let r = new_uninit(&c.heap, Str { hash: 0 }, len);
     var at: u64 = 0;
     for i in 0..n {
         if let Str(s) = base[i] {
