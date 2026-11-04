@@ -139,8 +139,15 @@ pub vm Wam {
             backtrack()
         }
         if let Ref(v) = t {
+            let n = ctx.db.farity(f as u32) as u64;
+            if n <= 4 and quick_bind(v) {
+                let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+                v.val = Term.Str(st);
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
             cold {
-                let n = ctx.db.farity(f as u32) as u64;
                 let st = ctx.mk_struct(f as u32, n);
                 ctx.bind(v, Term.Str(st));
                 s = st.args.ptr;
@@ -150,6 +157,16 @@ pub vm Wam {
         }
         backtrack()
     }
+    /// A structure of arity `n` (1 to 4) without the allocator's refill
+    /// (constant lengths: the zeroing is inline, not a memset call).
+    fn try_struct(f: u32, n: u64) -> ?Gc<Struct> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Struct { f: f }, 1) } else { try_new(&ctx.heap, Struct { f: f }, 2) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Struct { f: f }, 3) } else { try_new(&ctx.heap, Struct { f: f }, 4) }
+        }
+    }
+
     op GET_LIST(r: xr) : RR {
         let t = deref(r);
         if let Lst(c) = t { s = c as *Term; wm = false; next }
@@ -249,6 +266,13 @@ pub vm Wam {
     op PUT_INT(r: xr, v: simm) : RsB { r = Term.Int(v as i48); next }
     op PUT_CONST(r: xr, k: kst) : RB { r = k; next }
     op PUT_STRUCT(r: xr, f: fun) : RB {
+        let n = ctx.db.farity(f as u32) as u64;
+        if n <= 4 {
+            let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+            r = Term.Str(st);
+            s = st.args.ptr;
+            next
+        }
         cold {
             let n = ctx.db.farity(f as u32) as u64;
             let st = ctx.mk_struct(f as u32, n);
@@ -349,12 +373,12 @@ pub vm Wam {
     // Integer fast paths; everything else (floats, bound variables,
     // errors) is the generic evaluator's.
     inline for (name, kind, guard, result) in [
-        ("IDIV", 3, y != 0 and !(y == -1), x / y),
+        ("IDIV", 3, y != 0 and !(y == -1), ((x as i64) / (y as i64)) as i48),
         ("MOD", 4, y > 0, ((x % y) + y) % y),
         ("SHR", 5, y >= 0 and y < 48, x >> y),
         ("AND", 7, true, x & y),
         ("OR", 8, true, x | y),
-        ("REM", 10, y != 0 and !(y == -1), x % y),
+        ("REM", 10, y != 0 and !(y == -1), ((x as i64) % (y as i64)) as i48),
         ("XOR", 11, true, x ^ y),
         ("MIN", 12, true, if x <= y { x } else { y }),
         ("MAX", 13, true, if x >= y { x } else { y }),
@@ -445,7 +469,7 @@ pub vm Wam {
         let nn = deref(n);
         let tt = deref(t);
         if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
-            let v = st.args[(i as u64) - 1];
+            let v = st.args.ptr[(i as u64) - 1];    // in bounds: checked above
             let x = deref(a);
             if let Ref(xv) = x and quick_bind(xv) { xv.val = v; next }
             cold { if unify(ctx, x, v) { next } backtrack() }

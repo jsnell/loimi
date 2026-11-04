@@ -161,6 +161,10 @@ pub fn Machine.try_cons(m: *Machine) -> ?Gc<Cons> {
 #[cold]
 pub fn Machine.make_room(m: *Machine) { gc.make_room(&m.heap, size_of<Cons>()); }
 
+/// Room for a structure of arity `n` (`try_struct` in the vm).
+#[cold]
+pub fn Machine.make_room_struct(m: *Machine, n: u64) { gc.make_room(&m.heap, size_of<Struct>() + n * 8); }
+
 #[inline]
 pub fn Machine.new_var(m: *Machine) -> Term {
     Term.Ref(new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }))
