@@ -16,6 +16,9 @@ pub struct Ctx {
     heap: gc.Heap,
     stack: *V,
     stack_end: *V,
+    /// Every slot below this holds a valid value (see `grow`): the frames'
+    /// windows need no clearing on entry.
+    hwm: *V,
     frames: *Frame,
     frames_end: *Frame,
     /// The innermost frame (published by the vm's `sync` block).
@@ -57,6 +60,7 @@ pub fn Ctx.new() -> Ctx {
         ..zero
     };
     c.stack_end = c.stack + STACK_SLOTS;
+    c.hwm = c.stack;
     c.frames_end = c.frames + FRAME_SLOTS;
     c.fp = c.frames;
     c
@@ -85,12 +89,41 @@ pub fn scan_roots(h: *gc.Heap, data: *u8) {
     // registers above it must stay valid (they are read again, by a later
     // collection, once the callee returns).
     var f = c.frames;
+    var top = c.stack;
     while f <= c.fp {
         gc_mark(h, f.cl);
         let n = f.cl.proto.nregs as u64;
         for i in 0..n { gc_mark(h, f.base[i]); }
+        if f.base + n > top { top = f.base + n; }
         f = f + 1;
     }
+    // The slots above every window were not marked: what they point to
+    // may be freed now, so they are cleared, and the mark lowered to the
+    // top window (calls above it clear their slots first, in `grow`).
+    var q = top;
+    while q < c.hwm {
+        *q = value.unspec();
+        q = q + 1;
+    }
+    if c.hwm > top { c.hwm = top; }
+}
+
+/// Make the slots below `top` valid for a frame's window: registers are
+/// not cleared on entry to a frame, so every slot a window can cover must
+/// hold a value that is safe to mark (stale values of dead frames are;
+/// see scan_roots). False if `top` is beyond the stack.
+#[cold]
+pub fn grow(c: *Ctx, top: *V) -> bool {
+    if top + 1 >= c.stack_end { return false; }
+    var end = top + 1024;
+    if end > c.stack_end { end = c.stack_end; }
+    var q = c.hwm;
+    while q < end {
+        *q = value.unspec();
+        q = q + 1;
+    }
+    c.hwm = end;
+    true
 }
 
 pub fn Ctx.flush(c: *Ctx) {
