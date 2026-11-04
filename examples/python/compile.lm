@@ -1546,6 +1546,7 @@ fn C.call(c: *C, f: *Expr, args: *mem.Vec<Arg>, dst: u32) {
 /// changes, and the callee is the builtin. Not in class bodies (the
 /// generator's names skip the class namespace).
 fn C.inline_genexp(c: *C, f: *Expr, arg: *Expr, dst: u32) -> bool {
+    #[cfg(debug)] return false; // --cfg debug: generator expressions keep their frames (the debugger steps into them, as pdb does)
     let Name(fname) = f.e else { return false; };
     let GenExp(gf, _) = arg.e else { return false; };
     if !gf.flat or c.s.kind == SC_CLASS or !c.is_global(fname) { return false; }
