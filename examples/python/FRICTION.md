@@ -208,8 +208,8 @@ the header); it was four, about 256 bytes.
   shares the prefix: subclasses that call the base's `__init__` first,
   sibling classes, objects of different classes built the same way
   (deltablue's constraint hierarchy, richards' tasks). A GETATTR hit is
-  22 instructions: register → instance → shape (count and name) and
-  instance → slot, the two loads independent.
+  about 28 instructions with the dispatch: register → instance, then
+  instance → shape (count and name) and instance → slot, independent.
 - *Adding an attribute* (SETATTR's add path) follows the shape's last
   transition if it is for this name, with the old class-id and
   class-epoch guard (no property or shadowed class attribute can be
