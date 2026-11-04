@@ -125,6 +125,20 @@ implementation; `git log` has the details.
   flow state, scoped locals, one analysis per function): under 10% of
   the front end on every example (`docs/design/lifetimes.md` sections
   7-9).
+- **Pointer stability, phase 2** (`docs/design/lifetimes.md` section
+  10, questions 1, 2 and 6): a pointer into *growable* memory (a struct
+  field whose block some function moves: `Vec.ptr`, `HashMap.slots`,
+  inferred) may not be stored where it outlives the function (a
+  parameter's memory, a global, a GC object, an escaping closure; fresh
+  memory the function returns hands it to the caller). A call passing
+  two arguments that alias a block the callee uses after moving it
+  through the other is rejected (`f(&v, &v)`, `f(&c, &c.v)`;
+  `#[may_alias]` stays the escape hatch). New `#[shrinks(v)]`
+  (`Vec.pop`/`truncate`/`clear`, the maps' `remove`/`clear`): pointers
+  into the container end, also through callers (`StrBuf.clear`).
+  `HashMap.insert` now counts as moving its table. In the examples: 7
+  sites, safe by protocol, marked `unsafe { }` with the reason; no IR
+  change.
 - **`#![safe]` modules**: a module marked `#![safe]` treats `*T` as a
   reference to one value; pointer indexing, arithmetic, `p.slice(n)`,
   pointer casts, other modules' buffer pointers and invariant fields,

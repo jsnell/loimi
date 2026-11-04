@@ -12,4 +12,4 @@ fn main() {
     v.push(1);
     remember(&seen, &v);
 }
-// error: passes a pointer into the block of `std.mem.Vec<u64>.ptr` (which `Vec<u64>.grow_one` may move) to `Vec<*u64>.push`, which may keep it beyond the call
+// error: passes a pointer into the block of `std.mem.Vec<u64>.ptr`

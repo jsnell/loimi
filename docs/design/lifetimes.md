@@ -3,8 +3,10 @@
 Status: **phase 1: design and prototype** (`src/lifetimes.rs`, opt-in:
 `#![safe]` and `#![lifetimes]` modules), **migration step 2 done**: every
 module of the example interpreters is `#![lifetimes]` (section 9), and
-checking all of them costs under 10% of the front end (section 8). For
-review before phase 2. Written 2026-11-04.
+checking all of them costs under 10% of the front end (section 8).
+**Phase 2, first part done**: questions 1, 2 and 6 of section 10 are
+decided and built (stored pointers into growable memory, exclusivity at
+calls, `#[shrinks]`); 3, 4 and 5 are open. Written 2026-11-04.
 
 > Where real bugs keep appearing is lifetimes: a pointer or slice into a
 > container used after the container grew, was freed, or was collected.
@@ -28,8 +30,11 @@ interpreter was first checked (one a real dangling pointer, since
 fixed), and leaves the release IR of every example byte-identical. The
 examples' 77 modules now opt in (section 7). What it does not do is
 follow a pointer once it has been stored in memory and loaded again
-somewhere else: section 6 lists that and the other holes, and section 9
-the questions for phase 2.
+somewhere else; since phase 2 it forbids storing a pointer into memory
+that moves (a `Vec`'s buffer, a map's table) where it outlives the
+function, which closes that hole for growable containers (section 5.4,
+error 5). Section 6 lists the remaining holes, and section 10 the
+questions (1, 2 and 6 decided).
 
 ## 1. The problem
 
@@ -175,7 +180,8 @@ the one thing that never outlives its function, the address of a local.
 
 Its limit is the price of no annotations: a pointer stored in a struct
 and loaded elsewhere is tracked only as "the memory at that field", not
-as "a pointer into that container" (section 6).
+as "a pointer into that container" (section 6). Phase 2 added the one
+cheap rule of section 4 for memory that moves (question 1).
 
 ### D. Regions / scoped allocation
 
@@ -206,7 +212,7 @@ variant for changing representations).
 | annotations, std.text+map+diag | 4 struct params, 6 signatures, 6 rewrites | 0 syntax; 9 fields change type | 0 | region params on stored pointers | 0 |
 | Lox front end | ≈15 struct params, ≈27 signatures, ≈20 sites (5 redesigns) | ≈50 fields change type | 0 (all examples: 3 sites) | `Expr<'a>` everywhere | 0 |
 | interpreter cores | `unsafe`/raw only | `unsafe`/raw only | checked where possible (reenter rule), raw elsewhere as today | raw | slower |
-| stored pointers | checked | forbidden | not followed (hole) | checked for regions | checked |
+| stored pointers | checked | forbidden | into growable memory: only in locals; others not followed (hole) | checked for regions | checked |
 | run-time cost | 0 | 0 (but copies/indices) | 0 | 0 | per access |
 | compiler work | a new type system dimension | moderate (new handle types) | one inference pass | new types | runtime + codegen |
 
@@ -220,6 +226,8 @@ rule: a pointer derived from a container's *growable* interior
 memory that outlives the function, only arena allocations and
 long-lived owners may. That is B restricted to the one kind of pointer
 that dangles on growth, and the audit says it would touch few sites.
+**Decided and built** (error 5 of section 5.4): the audit found 7 sites,
+each safe by a protocol the check cannot see (section 7).
 
 ## 5. The rules (as built)
 
@@ -272,7 +280,36 @@ buffer (`v.ptr.*.name.*` lies in another block). Sources:
   scope, and the collector does not move objects (question 4);
 - in vm code, a call that may re-enter (`TVm::Synced` with a `reload`)
   restructures what the state variables assigned by `reload` pointed
-  into: a pointer computed from `regs` before the call is stale after it.
+  into: a pointer computed from `regs` before the call is stale after it;
+- freeing a block that a parameter's (or a global's) place held before
+  the function gave the place a new one (`HashMap.grow`: `let old =
+  m.slots; m.slots = mem.alloc(..); ..; mem.release(old)`) restructures
+  the block the caller knew, for the summary, without touching pointers
+  into the new one (so `HashMap.insert` moves its table:
+  `tests/fail/lt_hashmap_insert.lm`);
+- a call of a `#[shrinks(v)]` function (`Vec.pop`, `truncate`, `clear`;
+  `HashMap.remove`, `clear`; `OrderedMap.remove_at`, `clear`;
+  `Ephemerons.remove`), or of one whose summary has it through its
+  callees (`StrBuf.clear`, `OrderedMap.remove`, `pop_last`, `Code.clear`),
+  *removes elements*: every pointer into the buffers of the container
+  `v` points to ends, as for a restructure, though the memory stays
+  (question 6). Conservatively all of them, not only those into the
+  removed range.
+
+**Growable memory.** A restructure *moves* a block if it reallocates it
+(`realloc`, so `mem.grow`) or frees a place's old block for a new one
+(above), or if one function frees the block of a struct field and gives
+that field fresh memory (`OrderedMap.resize` frees the old tables, then
+installs new ones). A struct field whose block some function in the
+program may move holds *growable* memory: `Vec.ptr` (also inside a
+`StrBuf`), `HashMap.slots`, `OrderedMap.idx` and `ents`, an
+interpreter's own `realloc`'d buffers (regex's backtrack stack, Mini's
+result buffer). Blocks that are only ever freed (an arena's chunks, a
+list node, a GC object, Mini's coroutine stacks, which `grow` copies and
+retires instead of freeing) are not growable. Fields are told apart by
+their struct type: a path's last dereference is typed from its root
+(`p.*.lexer.*.toks.ptr.*` hangs from `Vec<Tok>.ptr`), and which fields
+grow is known when every summary is, so error 5 is judged at the end.
 
 A local whose paths are invalidated is **stale** until it is assigned
 again; flow-sensitive, joined at branches and iterated to a fixpoint in
@@ -287,8 +324,10 @@ the call graph (a worklist, callees first):
 |---|---|---|
 | restructs | parameter (or global) paths it may move or free | `Vec.push`: `v.*.ptr.*`; `Arena.free`: `a.*.chunk.*`, ...; `Arena.alloc_bytes`: only `a.*.chunks.ptr.*` |
 | ret | parameter paths its result may point into | `Vec.items`: `v.*.ptr.*`; `SourceMap.file`: `sm.*.files.ptr.*` |
-| pairs | (i, j): it uses argument j after restructuring through argument i | the old `push_str`: (b, s) |
+| pairs | (i, B): it uses a pointer into block B of argument j's memory (j's pointee, or a buffer it owns: at most two dereferences down) after restructuring through argument i | the old `push_str`: (b, `s.*`); `fn f(a, b) { let s = a.items(); b.push(1); s[0] }`: (b, `a.*.ptr.*`) |
 | keeps | parameter j's pointee may be stored in parameter i's memory, or elsewhere | `Vec.push`: `x` into `v`; `SourceMap.add`: `name`, `text` into `sm` |
+| grows, frees | which restructures move a block (section 5.2), which free one | `Vec.reserve` grows `v.*.ptr.*`; `Vec.free` frees it |
+| shrinks | parameter paths whose elements it may remove | `Vec.clear`: `v.*`'s buffers; `StrBuf.clear`: `b.*.bytes`'s |
 
 `Arena.alloc_bytes` shows why inference beats declarations here: it
 reallocates its chunk *list* (a `Vec`) but never the chunks, so pointers
@@ -300,16 +339,30 @@ memory the function restructures through another argument: its
 `pairs` with `p` are not checked or propagated. Only `Vec.extend` has it
 (its cold path re-derives `s` inside the moved buffer).
 
+`#[shrinks(v)]` on a function says that it may remove elements of the
+container `v` points to (section 5.2): the summary's `shrinks` gets
+`v.*`'s buffers. It is the one seed the inference cannot find (removing
+elements is a store of a smaller length), so std declares it on its
+eight shrinking functions; everything that calls them inherits it.
+
 ### 5.4 The errors
 
 In a checked function, outside `unsafe { }`:
 
 1. **Use after restructure**: reading a stale local (also through `&x`
-   or a method call).
-2. **Argument into what the callee moves**: a call whose summary has
-   pair (i, j), passing in j a pointer into what it restructures
-   through i (`b.push_str(b.as_str())` with a `push_str` that grows
-   first), unless `#[may_alias(j)]`.
+   or a method call), or one pointing into a container whose elements a
+   call may have removed (`#[shrinks]`: "may point to removed
+   elements").
+2. **Arguments aliasing what the callee moves** (exclusivity): a call
+   whose summary has pair (i, B), when what it restructures through
+   argument i is, in the caller's terms, block B of argument j: argument
+   j points into it (`b.push_str(b.as_str())` with a `push_str` that
+   grows first), or holds it (`f(&v, &v)` where `f` takes `a.items()`,
+   grows `b`, then reads the slice; `f(&c, &c.v)` where `f` grows `c.v`
+   through `c`), unless `#[may_alias(j)]`. Only what the callee uses
+   after the restructure counts: `f(&v, &v)` is fine when `f` takes its
+   pointers again (`tests/run/lt_stored.lm`), so the check costs no
+   `&mut`-style exclusivity on calls that do not need it.
 3. **Copy of an owning value**: a struct value holding pointers copied
    (`var w = v`) makes two owners of the same buffers; a restructure
    through either makes the other stale (a local), or the place it was
@@ -331,6 +384,28 @@ In a checked function, outside `unsafe { }`:
    the frame; returned, it is kept in the caller's result in turn;
    stored anywhere else, or passed on, it escapes
    (`tests/run/lt_fresh_kept.lm`, `tests/fail/lt_fresh_kept.lm`).
+5. **Pointer into growable memory kept**: a pointer into the block of a
+   growable field (section 5.2) stored in memory that outlives the
+   function, directly or through a callee's `keeps` (`seen.push(v.ptr_at(0))`
+   with `seen` a parameter's `Vec`), or captured by an escaping closure.
+   **Memory that outlives the function** is what a parameter points to
+   (and everything reached from it), a global, a GC object, memory of
+   unknown origin the function does not return, and an escaping
+   closure's environment; *not* the function's own locals and the
+   buffers they own, where the check follows the pointer (a local
+   struct holding `b.as_str()` is stale when `b` grows), and not fresh
+   memory the function returns: then the result points into the block
+   for the caller (`Lexer.new(&b)`'s result is stale when `b` grows:
+   `tests/fail/lt_fresh_kept_interior.lm`). A place restored before the
+   function returns is not kept, as for error 4; `main` gets no
+   exemption (the block moves while the program runs). What may still
+   be stored: arena allocations (`a.str(..)`, `new(&a, ..)`), malloc'd
+   blocks, freed-only blocks, GC objects, statics, an owning value moved
+   whole (`n.all = v`). By the types, a pointer to `T` cannot point
+   into a block of `U` that cannot hold a `T` inline, and a byte buffer
+   (`Vec<u8>`) holds no typed values: so `Ok(mi)` of a result whose
+   error message points into a `StrBuf` does not point into it
+   (`tests/fail/lt_store_interior*.lm`, `tests/run/lt_stored.lm`).
 
 ### 5.5 Where it applies
 
@@ -377,23 +452,50 @@ error: `xs` may dangle: it points into memory that the call of `eq` (which may c
 error: `dst` may dangle: it points into memory that this `reenter` call (guest code may grow or move the vm's stacks; `reload` recomputes the state) may have moved or freed
 error: stores the address of local `n` in memory that outlives the function
 error: passes the address of local `buf` to `SourceMap.add`, which may keep it beyond the call
+error: this argument may alias argument 1: `append_first` may move or free memory through argument 1 while it still uses a pointer it took through this one
+error: `s` may point to removed elements: the call of `Vec<u64>.clear` may have removed elements of the container it points into
+error: stores a pointer into the block of `std.mem.Vec<u8>.ptr` (which `Vec<u8>.reserve` may move) in memory that outlives the function
+error: passes a pointer into the block of `std.mem.Vec<u64>.ptr` (which `Vec<u64>.grow_one` may move) to `Vec<*u64>.push`, which may keep it beyond the call
+```
+
+<!-- snippet: fail "stores a pointer into the block of `std.mem.Vec<u8>.ptr`"
+#![lifetimes]
+import std.text;
+struct Lexer { text: str, pos: u64 }
+{snippet}
+fn main() {}
+-->
+```loimi
+fn Lexer.init(l: *Lexer, src: *text.StrBuf) {
+    l.text = src.as_str();
+}
 ```
 
 ## 6. What it does not check (the holes)
 
 1. **Pointers stored in memory.** A pointer loaded from a field is
    tracked as "the memory that field points to", not as what it was
-   derived from. `ctx.cur = ctx.frames.ptr_at(i)` in one function and
-   `ctx.frames.push(..); *ctx.cur` in another is not caught (in one
-   function it is not either, once it went through memory). Arena
-   pointers stored in nodes and used after `a.free()` elsewhere: same.
-   This is the main hole; question 1.
+   derived from. Into growable memory, the store itself is now an error
+   where it outlives the function (error 5: `ctx.cur =
+   ctx.frames.ptr_at(i)` with `ctx` a parameter). What remains: such a
+   pointer kept in the function's own memory (a local `Vec<*T>` of
+   element pointers) is not followed once stored there; pointers into
+   blocks that are only freed (arena nodes used after `a.free()`
+   elsewhere: question 3; a freed list node); a store through `unsafe
+   { }` (the 7 protocol sites of section 7); a GC object's growable
+   field reached as "some GC object" (its type is not known, so it is
+   not judged); a growable block of bytes holding typed values through
+   casts (taken to hold bytes); a pointer into a *local*'s growable
+   buffer kept in fresh memory the function returns (the local is gone,
+   so nothing follows its buffer).
 2. **Parameters are assumed not to alias each other's buffers** inside
    a function body (`fn f(a: *Vec<u8>, b: *Vec<u8>)` taking `a.items()`
-   and pushing to `b`); the `pairs` summary catches the caller passing a
-   pointer into the same container (`b.push_str(b.as_str())`), but not
-   two pointers to the same `Vec` (`f(&v, &v)`). Rust's `&mut`
-   exclusivity is what closes this; question 2.
+   and pushing to `b`); the caller is checked instead (error 2, question
+   2): `f(&v, &v)` and `f(&c, &c.v)` are rejected when `f` uses what it
+   took through one after moving memory through the other. Not checked:
+   blocks more than two dereferences below a parameter (reached through
+   pointers stored in memory, hole 1), and two different GC objects or
+   fresh blocks, which share a root and are taken not to alias.
 3. **Closures and function values.** A call through a function value
    restructures nothing (except by its `uses gc` effect), and the body
    of a closure passed to a call is not part of that call's summary.
@@ -414,7 +516,9 @@ error: passes the address of local `buf` to `SourceMap.add`, which may keep it b
    fresh block's stored pointers are never taken as overwritten.
    Summaries are path-insensitive: a store guarded by a flag argument
    counts for every caller (Mini's `coro.call` stored `args` only when
-   `from_vm`, which `call_value` passes false; section 7).
+   `from_vm`, which `call_value` passes false; section 7). The values
+   of a pattern's parts (`Ok(x)`, a tuple's fields) are the whole
+   value's paths, less those their type cannot point into.
    A closure's captured owning value (a `Vec`, a `StrBuf`) is the
    enclosing variable itself and starts with no paths, like a `let`
    owner, so growing it inside the closure does not make it stale
@@ -424,11 +528,14 @@ error: passes the address of local `buf` to `SourceMap.add`, which may keep it b
    object held by a `let` is accepted across a collection; a moving
    collector would make every such slice stale (the rule would then be
    one line: no GC root is exempt).
-6. **Logical staleness is not memory unsafety**: a slice kept across
-   `v.clear()` or `truncate` still points into allocated memory and is
-   accepted (ASan builds poison it, safety.md section 7); so is a slice
-   of a rooted list's old array after guest code replaced it (CPython
-   reads the current list; Python's fix does too).
+6. **Logical staleness**: since phase 2 (question 6) a pointer kept
+   across `v.clear()`, `truncate`, `pop` or a map's `remove` is an error
+   (`#[shrinks]`), though the memory stays allocated. Not covered: a
+   container shrunk by assigning its length (`v.len = n` in user code),
+   std's GC dictionaries (`Dict`, `KeyDict`: their parameters are GC
+   references, accessed by entry index and checked by `version`), and
+   a slice of a rooted list's old array after guest code replaced it
+   (CPython reads the current list; Python's fix does too).
 7. **Trusted code**: `unsafe { }` and modules that do not opt in are
    not reported (their summaries are still inferred and used).
 
@@ -439,11 +546,16 @@ error: passes the address of local `buf` to `SourceMap.add`, which may keep it b
 `tests/run/lt_accepted.lm` runs the fixed version of each (re-derive
 after growth, `let`-held GC object, arena nodes freed last, moving a
 `Vec`, a local's address stored and restored, self-append through
-`Vec.extend`).
+`Vec.extend`). Phase 2 added 12 more: `lt_alias_args`, `lt_alias_field`
+(exclusivity); `lt_store_interior`, `_kept`, `_global` and
+`lt_fresh_kept_interior` (stored pointers); `lt_clear_slice`,
+`lt_pop_ptr`, `lt_strbuf_clear`, `lt_map_remove_ptr` (removed
+elements); `lt_hashmap_insert` (a place's old block); `lt_shrinks_param`
+(the attribute); `tests/run/lt_stored.lm` runs what they accept.
 
 **std**: the nine `#![safe]` modules are checked in every build that
 uses them (all example interpreters and tests): no error, no change but
-the one attribute.
+the one attribute (phase 2: `#[shrinks]` on eight functions).
 
 **Audit of all examples** (`LOIMI_LIFETIMES=audit`, every module and
 function of Lox, Mini, Mini's embedding, MiniJS, Prolog, Python, the
@@ -480,6 +592,27 @@ handlers: they already recompute pointers after `reenter` calls. With
 every example module opted in, `LOIMI_LIFETIMES=audit` reports nothing
 on the examples.
 
+**Phase 2 rules** (questions 1, 2 and 6), audited with the same builds
+(every example under `--cfg debug`, `--cfg gil`, `--jit-stencils`,
+`--shared`, the fuzzers, regex's stats driver, the tutorial; every
+module, std's included):
+
+| rule | sites, first version | refinements | sites left | resolution |
+|---|---:|---|---:|---|
+| exclusivity (error 2) | 103 | `pairs` name the block of j that is used, not just j (a pointer *value* stored, as `Vec.push(v, x)` does with `x`, is not a use of what it points to) | 0 | none needed |
+| stored pointers (error 5) | 39 | growable means *moved*, not freed (Mini's coroutine stacks are copied and retired, a GIL's thread record is freed: 30 sites); types filter what a pattern's part and a stored value may point into (Wasm's `Ok(mi)` beside an error message in a `StrBuf`: 2) | 7 | `unsafe { }` with the reason, on the same line (below) |
+| removed elements (`#[shrinks]`) | 0 | | 0 | |
+
+The 7 sites of error 5, each a pointer into growable memory kept on
+purpose:
+
+| site | why it is safe |
+|---|---|
+| `examples/mini/embed.lm` `mini_debug_eval` (2): `*out = d.out.as_str()` | the C API lends the text until the next `mini_debug_*` call (documented above the API) |
+| `examples/mini/threads.lm` `save`: `t.rbuf = c.rbuf` | the result buffer is handed to the saved thread; `load` gives the context the next thread's before anything grows it |
+| `examples/regex/vm.lm` `grow`: `r.bt_end = r.bt_base + ncap` | the end of the block just moved, set by the function that moves it |
+| `examples/wasm/vm.lm` `Machine.switch_to` (3): `m.funcs = i.funcs.ptr`, `globals`, `sigs` | an instance's vectors are complete (`instantiate`) before any switch to it, and the machine takes them again at every switch |
+
 **IR**: release `--emit-llvm` of Lox, Mini, Mini's embedding, MiniJS,
 Prolog, Python, regex (library and fuzzer), Scheme, Stack (and fuzzer),
 Wasm and the tutorial, base compiler against the new one with the same
@@ -489,7 +622,10 @@ moves), against the tree before it: byte-identical for every example
 (also Mini `--cfg debug`, `--cfg gil` and Python `--cfg debug`) except
 the three intended code fixes: MiniJS (`Gen.top`), Mini and its
 embedding (`coro.call`, the CALL handler's yield branch) and the Stack
-fuzzer (the order of frees).
+fuzzer (the order of frees). Phase 2 (std's `#[shrinks]` lines take
+the place of blank lines, the 7 `unsafe { }` are on their lines),
+master's compiler and tree against the new ones: byte-identical for
+every example and configuration above, the edited modules included.
 
 ## 8. Cost
 
@@ -531,9 +667,33 @@ fuzzer (the order of frees).
   it); summaries drop restructures cut at the depth bound (section 6);
   a post-order worklist; a fast hasher for ids. `LOIMI_LIFETIMES_STATS=1`
   prints the pass's time and its slowest functions.
-- **Implementation**: `src/lifetimes.rs` (~2000 lines, no dependency
-  on codegen), `#![lifetimes]` and `#[may_alias]` in the parser and
-  checker, a summary map in `tir::Program`.
+
+  **Phase 2** (errors 2 and 5, `#[shrinks]`): the pass's own time
+  (`LOIMI_LIFETIMES_STATS=1`), before and after, and its share of the
+  front end without it:
+
+  | example | pass before | after | share of front end |
+  |---|---:|---:|---:|
+  | Lox | 15.6 ms | 17.6 ms | 6% |
+  | Mini (embedding) | 26.2 (24.2) | 27.4 (28.2) | 5% (5%) |
+  | MiniJS | 34.4 | 45.5 | 7% |
+  | Prolog | 16.0 | 18.7 | 7% |
+  | Python | 50.0 | 57.0 | 9% |
+  | regex | 3.9 | 4.4 | 7% |
+  | Scheme | 23.1 | 34.3 | 9% |
+  | Stack | 8.9 | 10.3 | 7% |
+  | Wasm | 52.3 | 54.0 | 1% |
+  | tutorial step 9 | 3.3 | 3.6 | 2% |
+
+  The first version of the exclusivity `pairs` named every block of
+  argument j used after the restructure: a recursive tree walker
+  (MiniJS's `Gen.stmt`) listed 1357, and MiniJS's pass took 489 ms.
+  Naming the block rather than the pointer, and only the parameter's
+  pointee and the buffers it owns (two dereferences, section 6 item 2),
+  brought it to 7.
+- **Implementation**: `src/lifetimes.rs` (~2450 lines, no dependency
+  on codegen), `#![lifetimes]`, `#[may_alias]` and `#[shrinks]` in the
+  parser and checker, a summary map in `tir::Program`.
 
 ## 9. Migration plan
 
@@ -550,6 +710,10 @@ fuzzer (the order of frees).
 3. **Default**: the examples opt in cleanly and the whole-program cost
    is fixed (section 8); making the check the default for every module
    (keeping `unsafe { }` and an opt-out) is question 5.
+4. **Phase 2 rules** (done): errors 2 (exclusivity) and 5 (stored
+   pointers into growable memory) and `#[shrinks]` (questions 1, 2, 6);
+   std gained eight `#[shrinks]` lines, the examples 7 `unsafe { }` at
+   stores safe by protocol (section 7). Questions 3-5 stay open.
 
 **What stays raw (`unsafe` or unchecked) and why**: the allocator, the
 collector, inline caches and limb arithmetic (`mem`, `gc`, `obj`,
@@ -564,14 +728,20 @@ promise for every pointer parameter.
 
 ## 10. Open questions for the user
 
-1. **Stored pointers** (hole 1): accept the hole, or forbid storing a
+1. **Stored pointers** (hole 1) — **decided: forbid, for growable
+   memory** (error 5; growable inferred from what moves, section 5.2).
+   The question was: accept the hole, or forbid storing a
    pointer into a *growable* container's interior in memory that
    outlives the function (a second-class rule for `ptr_at`, `items`,
    `get_ptr`, `entry`, `SourceMap.file`, `Diagnostics.at` results), with
    arena allocations and owner pointers still storable? It needs a way
    to tell growable from stable memory: inferred (some function other
    than the owner's `free` restructures it) or declared on the field.
-2. **Aliasing of pointer parameters** (hole 2): add an exclusivity
+2. **Aliasing of pointer parameters** (hole 2) — **decided: check at
+   call sites** (error 2), only where the callee uses what it took
+   through one argument after moving memory through the other, so
+   `f(&v, &v)` stays legal when the callee re-derives; `#[may_alias]` is
+   the escape hatch. The question was: add an exclusivity
    check at call sites (two arguments pointing to the same container,
    one restructured), at the cost of rejecting `f(&v, &v)`-style calls
    that are fine today?
@@ -583,6 +753,9 @@ promise for every pointer parameter.
    rule already be the strict one, to keep that option open?
 5. **Default on**: make `#![lifetimes]` the default for every module
    (after the examples opt in), or keep it opt-in like `#![safe]`?
-6. **Logical staleness**: should `clear`/`truncate`/`pop` also end
-   pointers into the dropped elements (memory-safe today, but always a
-   bug)? It is one more seed in the summaries.
+6. **Logical staleness** — **decided: yes**, conservatively for every
+   pointer into the container, seeded by `#[shrinks(v)]` on std's
+   shrinking functions (section 5.2). The question was: should
+   `clear`/`truncate`/`pop` also end pointers into the dropped elements
+   (memory-safe today, but always a bug)? It is one more seed in the
+   summaries.

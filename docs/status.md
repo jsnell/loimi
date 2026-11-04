@@ -1,7 +1,7 @@
 # Implementation status
 
 What exists today, and where the implementation differs from the design
-in [`language.md`](language.md). Updated 2026-11-03. What changed
+in [`language.md`](language.md). Updated 2026-11-04. What changed
 recently, by topic: [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Built
@@ -191,9 +191,12 @@ those builds.
   pointers, `new` with an allocator whose `alloc_bytes` is not `#[raw]`,
   and declaring a `vm`. Pointer stability is checked in `#![safe]` and
   `#![lifetimes]` modules (prototype, `design/lifetimes.md`): a pointer
-  into a container used after a call that may move or free it, Vec
-  copy aliasing, and escaping local addresses are errors; pointers
-  stored in memory are not followed. Every module of the example
+  into a container used after a call that may move or free it or
+  remove its elements (`#[shrinks]`), Vec copy aliasing, arguments
+  aliasing what the callee moves, escaping local addresses, and a
+  pointer into growable memory stored where it outlives the function
+  are errors; other pointers stored in memory are not followed. Every
+  module of the example
   interpreters opts in (`#![lifetimes]`). Under
   `--sanitize=address`, `Vec` and `Arena` poison memory they keep but no
   longer use, so stale pointers into it are reported at run time.

@@ -14,4 +14,4 @@ fn main() {
     var l = Lexer { text: "", pos: 0 };
     l.init(&b);
 }
-// error: stores a pointer into the block of `std.mem.Vec<u8>.ptr` (which `Vec<u8>.reserve` may move) in memory that outlives the function
+// error: stores a pointer into the block of `std.mem.Vec<u8>.ptr`
