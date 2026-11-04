@@ -684,7 +684,13 @@ locations aside). Python's changes are where intended:
 | function | change |
 |---|---|
 | `std.dict.Dict/KeyDict.resize`, `Dict.copy` | the compiler's barrier after `rebuild_in` replaces dict's own call (same code after inlining) |
-| `Dict/KeyDict.remove_at`, `Dict.clear` (`value.dict_clear`, `ops.delattr`) | one barrier (a header-byte test) after zeroing entries |
-| `builtins.call`, `call_method_builtin`, `construct`, `module_call`, `ops.order`, `ops.setslice`, `vm.Py.op.TOTUPLE` | `list_items` inlined by hand (2-3 instructions difference) |
+| `Dict/KeyDict.remove_at`, `Dict.clear` (inlined into `value.dict_clear`, `ops.delattr`) | one barrier (a header-byte test) after zeroing entries; `KeyDict.resize` also logs the old entries (it reads them through a pointer passed to dict's `unsafe` key test, counted as a store) |
+| `builtins.call`, `construct`, `module_call`, `ops.setslice`, `vm.Py.op.TOTUPLE` | `list_items` inlined by hand (0-2 instructions difference) |
+| `builtins.call_method_builtin` (`list.index`, `count`), `ops.order`, `ops.seq_order`, new `value.seq_at`/`seq_len` | the use-after-free fix: read the list at each step |
+| `value.attrs_replace`, new `KeyDict.use_up_room` | the dict field write moved into std.dict |
 
-BENCH
+Machine code (release, `--align-functions=64`) differs in those
+functions only; no vm op handler changed. Python's 11 benchmarks, base
+and new interleaved, best of 3 (`bench/python/compare.py --exe`):
+geomean new/base 0.999 (range 0.976–1.019), within noise.
+The other interpreters' IR did not change, so they were not rerun.
