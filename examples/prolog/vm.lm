@@ -114,12 +114,36 @@ pub vm Wam {
             let x = deref(r);
             let y = deref(a);
             if x == y { next }
-            if let Ref(v) = x and !is_var(y) and can_bind(v) { bind_now(v, y); next }
-            if let Ref(v) = y and !is_var(x) and can_bind(v) { bind_now(v, x); next }
+            if quick_unify(x, y) { next }
+            if clash(x, y) { backtrack() }
             cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
     fn is_var(t: Term) -> bool { match t { Ref(_) => true, _ => false } }
+    /// An atom or a small integer: equal only to the same word.
+    fn is_small_atomic(t: Term) -> bool { match t { Atom(_) => true, Int(_) => true, _ => false } }
+    /// Dereferenced `x` and `y` (not the same word) cannot unify: neither
+    /// is a variable and one is an atom or small integer.
+    fn clash(x: Term, y: Term) -> bool {
+        !is_var(x) and !is_var(y) and (is_small_atomic(x) or is_small_atomic(y))
+    }
+    /// Unify dereferenced `x` and `y` (not the same word) inline where one
+    /// is a variable that `can_bind` (the younger of two variables is
+    /// bound to the older); false if that is not the case (nothing done).
+    fn quick_unify(x: Term, y: Term) -> bool {
+        if let Ref(v) = x {
+            if let Ref(w) = y {
+                if v.stamp < w.stamp {
+                    if can_bind(w) { bind_now(w, x); return true; }
+                    return false;
+                }
+            }
+            if can_bind(v) { bind_now(v, y); return true; }
+            return false;
+        }
+        if let Ref(v) = y and can_bind(v) { bind_now(v, x); return true; }
+        false
+    }
 
     inline for (name, kind, value) in [
         ("GET_ATOM", atom, Term.Atom(c as u32)),
@@ -132,6 +156,7 @@ pub vm Wam {
                 if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
+            if clash(t, value) { backtrack() }
             // Big integers are equal by value.
             cold { if unify(ctx, t, value) { next } backtrack() }
         }
@@ -275,7 +300,12 @@ pub vm Wam {
             let t = *s;
             s = s + 1;
             if t == r { next }
-            cold { if unify(ctx, r, t) { next } backtrack() }
+            let x = deref(r);
+            let y = deref(t);
+            if x == y { next }
+            if quick_unify(x, y) { next }
+            if clash(x, y) { backtrack() }
+            cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
     inline for (name, kind, value) in [
@@ -291,6 +321,7 @@ pub vm Wam {
                 if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
+            if clash(t, value) { backtrack() }
             cold { if unify(ctx, t, value) { next } backtrack() }
         }
     }
@@ -307,6 +338,12 @@ pub vm Wam {
     }
     op UNIFY_VOID(n: imm) : A {
         if wm {
+            if n == 1 {
+                let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+                *s = v;
+                s = s + 1;
+                next
+            }
             cold {
                 for i in 0..n { *s = ctx.new_var(); s = s + 1; }
                 next
@@ -368,6 +405,12 @@ pub vm Wam {
     op SET_INT(v: simm) : sA { *s = Term.Int(v as i48); s = s + 1; next }
     op SET_CONST(k: kst) : A { *s = k; s = s + 1; next }
     op SET_VOID(n: imm) : A {
+        if n == 1 {
+            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+            *s = v;
+            s = s + 1;
+            next
+        }
         cold {
             for i in 0..n { *s = ctx.new_var(); s = s + 1; }
             next
