@@ -1382,7 +1382,7 @@ pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
     let s = w + 2 * m;
     let r = w + 3 * m;
     if sh > 0 { lshift(x + pad, a.d.ptr, n, sh); } else { mem.copy(x + pad, a.d.ptr, n); }
-    sqrtrem(s, r, x, m, w + 4 * m + 1);
+    sqrtrem(s, r, x, m, w + 4 * m + 1, true);
     let t = sh / 2 + 32 * pad;
     if t > 0 { rshift(out.ptr, s, m, t); } else { mem.copy(out.ptr, s, m); }
     mem.release(w);
@@ -1394,13 +1394,20 @@ pub fn isqrt_into(out: []u64, a: Num) -> ?Num {
 fn sqrtrem_2(a1: u64, a0: u64) -> (u64, u64, u64) {
     let f = ((a1 as f64) * 18446744073709551616.0 + (a0 as f64)).sqrt();
     var s: u64 = if f >= 18446744073709551615.0 { 0xffffffffffffffff } else { f as u64 };
-    // One Newton step from within 2^-50 of the root, then at most a few
-    // corrections. The step needs a1 < s for the 128 by 64 division.
-    if a1 < s {
-        let (q, _) = a1.div_wide(a0, s);
-        s = (s >> 1) + (q >> 1) + (s & q & 1);
+    // f is within 2^12 of the root: one Newton step in floating point,
+    // s + (a - s^2) / 2s with a - s^2 exact (below 2^77 in magnitude),
+    // leaves it within one (no 128-bit division, a `div` of 40-90
+    // cycles on older x86).
+    let (lo, hi) = s.mul_wide(s);
+    let (dl, b) = a0.sub_borrow(lo, false);
+    let dh = (a1 -% hi -% b as u64) as i64;
+    let delta = ((dh as f64) * 18446744073709551616.0 + (dl as f64)) * (0.5 / f);
+    let di = delta as i64;
+    if di >= 0 {
+        let (t, c) = s.add_carry(di as u64, false);
+        s = if c { 0xffffffffffffffff } else { t };
     } else {
-        s = 0xffffffffffffffff;
+        s = s -% ((0 - di) as u64);
     }
     loop {
         let (lo, hi) = s.mul_wide(s);
@@ -1422,7 +1429,11 @@ fn sqrtrem_2(a1: u64, a0: u64) -> (u64, u64, u64) {
 /// a0 (B = 2^64, l = m / 2): (s', r') = sqrtrem(ah), (q, u) = (r' B^l +
 /// a1) divmod 2 s', s = s' B^l + q, r = u B^l + a0 - q^2, and if r < 0
 /// one correction r += 2s - 1, s -= 1. Returns r's length.
-fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64) -> u64 {
+///
+/// With `root_only`, s alone: r is not written, and the sign of
+/// u B^l + a0 - q^2 comes from the top limbs of u and q when they decide
+/// it (all but about 2^-62 of the time), without the square.
+fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64, root_only: bool) -> u64 {
     if m == 1 {
         let (s0, r0, r1) = sqrtrem_2(a[1], a[0]);
         s[0] = s0;
@@ -1442,7 +1453,7 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64) -> u64 {
     let ub = qb + m + 2;
     let rb = ub + h + 3;
     let q2 = rb + m + 3;
-    let rn = sqrtrem(sh, rp, a + 2 * l, h, t + 5 * m + 2 * h + 11);
+    let rn = sqrtrem(sh, rp, a + 2 * l, h, t + 5 * m + 2 * h + 11, false);
     // N = (r' B^l + a1) / 2, and its low bit.
     mem.copy(nb, a + l, l);
     mem.copy(nb + l, rp, rn);
@@ -1472,6 +1483,11 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64) -> u64 {
         add_in(ub, h + 3, sh, h);
     }
     mem.copy(s, qb, l);
+    if root_only {
+        let c = root_check(ub, h + 3, qb, l);
+        if c < 0 or (c == 0 and !sqr_fits(a, ub, h + 3, qb, l, rb, q2)) { decr(s, m); }
+        return 0;
+    }
     // R = u B^l + a0 - q^2
     mem.copy(rb, a, l);
     mem.copy(rb + l, ub, h + 2);
@@ -1497,6 +1513,47 @@ fn sqrtrem(s: *u64, r: *u64, a: *u64, m: u64, t: *u64) -> u64 {
         nr = norm(r, m + 1);
     }
     nr
+}
+
+/// For `sqrtrem`'s root: whether R = u B^l + a0 >= q^2 (1), < (-1), or
+/// undecided (0), from u's limbs l - 1 and l - 2 and q's top limb t:
+/// in units of B^(2l - 2), q^2 is in [t^2, (t + 1)^2) and R in
+/// [X, X + 2) for X = floor(u / B^(l - 2)) when u < B^l (a0 < B^l is
+/// at most one unit for l >= 2).
+fn root_check(u: *u64, un: u64, q: *u64, l: u64) -> i32 {
+    if norm(u, un) > l { return 1; }
+    if l < 2 { return 0; }
+    let xh = u[l - 1];
+    let xl = u[l - 2];
+    let t = q[l - 1];
+    let (tl, th) = t.mul_wide(t);
+    // (t + 1)^2 = t^2 + 2t + 1, below 2^128 unless t = B - 1.
+    if t != 0xffffffffffffffff {
+        let (ul, c0) = tl.add_carry(t, false);
+        let (ul2, c1) = ul.add_carry(t + 1, false);
+        let uh = th + c0 as u64 + c1 as u64;
+        if xh > uh or (xh == uh and xl >= ul2) { return 1; }
+    }
+    // X + 2 <= t^2
+    let (yl, c) = xl.add_carry(2, false);
+    let (yh, c2) = xh.add_carry(0, c);
+    if !c2 and (yh < th or (yh == th and yl <= tl)) { return -1; }
+    0
+}
+
+/// Whether u B^l + a0 >= q^2, exactly (r: m + 3 limbs of scratch, q2:
+/// 2l).
+fn sqr_fits(a: *u64, u: *u64, un: u64, q: *u64, l: u64, r: *u64, q2: *u64) -> bool {
+    mem.copy(r, a, l);
+    mem.copy(r + l, u, un);
+    let nr = norm(r, l + un);
+    let ql = norm(q, l);
+    var n2: u64 = 0;
+    if ql > 0 {
+        sqr_mag(q2, q, ql);
+        n2 = norm(q2, 2 * ql);
+    }
+    mag_cmp(r, nr, q2, n2) >= 0
 }
 
 /// The scratch limbs of `sqrtrem(.., m, ..)`.
