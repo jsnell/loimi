@@ -1396,9 +1396,18 @@ pub vm Mini {
     // Overlaps GETUPVAL; GETINDEX: `if not up[i]` in queens (14% of its ops).
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_GETINDEX_TESTT = GETUPVAL; GETINDEX; TESTT;
+    // Overlap GETINDEX; GETINDEX and GETINDEX; ADDI: a lookup tested at
+    // once and a count stored back (`local c = t[k]; if c then t[k] = c + 1`),
+    // 15% of hash_strings' ops each.
+    #[allow(super_overlap)]
+    #[forward] super GETINDEX_GETINDEX_TEST = GETINDEX; GETINDEX; TEST;
+    #[allow(super_overlap)]
+    #[forward] super ADDI_SETINDEX = ADDI; SETINDEX;
     // Overlaps another super, but runs outside the MOVE supers: 8% of binary_trees' and spectral_norm's ops.
     #[allow(super_overlap)]
     #[forward] super GETUPVAL_MOVE = GETUPVAL; MOVE;
+    // Overlaps ADDI; SETINDEX, which runs where no second ADDI precedes.
+    #[allow(super_overlap)]
     #[forward] super ADDI_ADDI = ADDI; ADDI;
     #[forward] super GETUPVAL_JEQN = GETUPVAL; JEQN;
     // Overlaps another super, but runs outside GETINDEX; GETINDEX: 2.3% of interp's ops.
