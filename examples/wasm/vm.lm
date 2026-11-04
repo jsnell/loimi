@@ -52,7 +52,9 @@ pub type HostFn = fn(*Machine, *u64) -> bool;
 pub struct Func {
     code: Verified<W>,
     nparams: u32,
-    /// Parameters and locals (zeroed by calls from nparams on).
+    /// Parameters and locals; calls zero the slots from nparams to
+    /// nzero (the locals that may be read before they are written).
+    nzero: u32,
     nlocals: u32,
     /// The whole frame: locals, constant slots, operand stack, scratch.
     nslots: u32,
@@ -275,6 +277,9 @@ pub vm W {
         I32_WRAP_I64, I64_EXTEND_I32_S, I64_EXTEND_I32_U, I32_DIV_U, I32_REM_U,
         I32_LOAD, I64_LOAD, F64_LOAD, I32_LOAD8_U, I32_LOAD8_S, I32_LOAD16_U, I32_LOAD16_S,
         I32_STORE, I64_STORE, F64_STORE, I32_STORE8, I32_STORE16,
+        I32_LOADK, I64_LOADK, F64_LOADK, I32_LOAD8_UK, I32_LOAD8_SK, I32_LOAD16_UK, I32_LOAD16_SK,
+        I32_STOREK, I64_STOREK, F64_STOREK, I32_STORE8K, I32_STORE16K,
+        BR_I32_ANDK_NZ, BR_I32_ANDK_Z, BR_I32_LOAD_NZ, BR_I32_LOAD_Z,
         BR_I32_EQ, BR_I32_NE, BR_I32_LT_S, BR_I32_LT_U, BR_I32_GT_S, BR_I32_GT_U,
         BR_I32_LE_S, BR_I32_LE_U, BR_I32_GE_S, BR_I32_GE_U,
         BR_F64_LT, BR_F64_LE, BR_F64_GT, BR_F64_GE,
@@ -606,8 +611,11 @@ pub vm W {
 
     // The caller continues at `next_pc`, after the calling op whatever
     // its size (CALL_INDIRECT_X has a cache word).
-    fn do_call(f: *Func, b: u64) -> never {
-        if f.inst != ctx.inst or f.host.is_some() { cold { call_slow(f, b) } }
+    // `local`: f is a function of the running instance (a direct call
+    // of one the module defines), so neither a host function nor another
+    // instance's.
+    fn do_call(f: *Func, b: u64, local: bool) -> never {
+        if !local and (f.inst != ctx.inst or f.host.is_some()) { cold { call_slow(f, b) } }
         let nr = regs + b;
         if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
             cold { raise Trap.Exhausted }
@@ -616,8 +624,9 @@ pub vm W {
         // not turn loops in handlers into memset calls, which would give
         // CALL a stack frame.)
         var i = f.nparams as u64;
+        let z = f.nzero as u64;
+        while i < z { nr[i] = 0; i += 1; }
         let n = f.nlocals as u64;
-        while i < n { nr[i] = 0; i += 1; }
         // Constant slots (the pointer read once: the stores could alias f).
         let ks = f.consts;
         let nk = f.nconsts as u64;
@@ -641,8 +650,9 @@ pub vm W {
             raise Trap.Exhausted
         }
         var i = f.nparams as u64;
+        let z = f.nzero as u64;
+        while i < z { nr[i] = 0; i += 1; }
         let n = f.nlocals as u64;
-        while i < n { nr[i] = 0; i += 1; }
         // Constant slots (the pointer read once: the stores could alias f).
         let ks = f.consts;
         let nk = f.nconsts as u64;
@@ -662,7 +672,7 @@ pub vm W {
         jump f.code
     }
 
-    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw) }
+    op CALL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw, false) }
 
     op CALL_INDIRECT(b: base, t: tidx, i: ru) : RRR {
         let tab = ctx.table;
@@ -671,7 +681,7 @@ pub vm W {
         if fv == 0 { cold { raise Trap.UninitElem } }
         let f = fv as *Func;
         if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
-        do_call(f, b.raw)
+        do_call(f, b.raw, false)
     }
     // call_indirect through a table other than 0 (index in the cache word,
     // checked here: the verifier does not see cache words).
@@ -684,7 +694,7 @@ pub vm W {
         if fv == 0 { cold { raise Trap.UninitElem } }
         let f = fv as *Func;
         if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
-        do_call(f, b.raw)
+        do_call(f, b.raw, false)
     }
 
     // ── reference types and bulk memory ─────────────────────────────
@@ -974,6 +984,69 @@ pub vm W {
         }
     }
 
+    // ── accesses at an address plus a constant ───────────────────────
+    // `local.get p; i32.const 8; i32.add; f64.load` (C code compiled to
+    // wasm adds a constant to a pointer where it cannot use the offset,
+    // which does not wrap): the add and the access in one op, with offset
+    // 0. The add wraps at 32 bits as i32.add does.
+    inline for (name, dk, ty, conv, size) in [
+        ("I32_LOADK", ri, i32, x, 4), ("I64_LOADK", rl, i64, x, 8),
+        ("F32_LOADK", rf, f32, x, 4), ("F64_LOADK", rd, f64, x, 8),
+        ("I32_LOAD8_SK", ri, i8, x as i32, 1), ("I32_LOAD8_UK", ri, u8, x as i32, 1),
+        ("I32_LOAD16_SK", ri, i16, x as i32, 2), ("I32_LOAD16_UK", ri, u16, x as i32, 2),
+        ("I64_LOAD8_SK", rl, i8, x as i64, 1), ("I64_LOAD8_UK", rl, u8, x as i64, 1),
+        ("I64_LOAD16_SK", rl, i16, x as i64, 2), ("I64_LOAD16_UK", rl, u16, x as i64, 2),
+        ("I64_LOAD32_SK", rl, i32, x as i64, 4), ("I64_LOAD32_UK", rl, u32, x as i64, 4),
+    ] {
+        op #name(d: dk, a: ru, k: imm) : RRK {
+            let ea = (a +% (k as u32)) as u64;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *ty).read_unaligned();
+            d = conv;
+            next
+        }
+    }
+    inline for (name, vk, ty, conv, size) in [
+        ("I32_STOREK", ri, i32, v, 4), ("I64_STOREK", rl, i64, v, 8),
+        ("F32_STOREK", ru, u32, v, 4), ("F64_STOREK", rd, f64, v, 8),
+        ("I32_STORE8K", ri, u8, v as u8, 1), ("I32_STORE16K", ri, u16, v as u16, 2),
+        ("I64_STORE8K", rl, u8, v as u8, 1), ("I64_STORE16K", rl, u16, v as u16, 2),
+        ("I64_STORE32K", rl, u32, v as u32, 4),
+    ] {
+        op #name(a: ru, v: vk, k: imm) : RRK {
+            let ea = (a +% (k as u32)) as u64;
+            if ea + size > msize { cold { raise Trap.MemOOB } }
+            ((mem + ea) as *ty).write_unaligned(conv);
+            next
+        }
+    }
+
+    // A call of a function the module defines (compile.lm).
+    op CALL_LOCAL(b: base, fi: fidx) : RU { do_call(ctx.funcs[fi], b.raw, true) }
+
+    // ── more compare-and-branch ──────────────────────────────────────
+    // A bit test (`x & k; br_if`) and a test of a loaded word against
+    // zero (`p->next != 0`, `i32.load; local.tee; br_if`), which also
+    // stores the word to d. The JMP after them holds the target.
+    op BR_I32_ANDK_NZ(a: ri, c: imm) : RI then JMP {
+        if (a & (c as i32)) != 0 { jump then.t }
+        jump pc + 2
+    }
+    op BR_I32_ANDK_Z(a: ri, c: imm) : RI then JMP {
+        if (a & (c as i32)) == 0 { jump then.t }
+        jump pc + 2
+    }
+    inline for (name, nz) in [("BR_I32_LOAD_NZ", true), ("BR_I32_LOAD_Z", false)] {
+        op #name(d: ri, a: ru, off: imm) : RRR then JMP {
+            let ea = (a as u64) + off;
+            if ea + 4 > msize { cold { raise Trap.MemOOB } }
+            let x = ((mem + ea) as *i32).read_unaligned();
+            d = x;
+            if (x != 0) == nz { jump then.t }
+            jump pc + 2
+        }
+    }
+
     verify brtable {
         var ok = true;
         var i: u64 = 0;
@@ -1017,6 +1090,8 @@ pub vm W {
     #[allow(super_overlap)] #[forward] super I32_ADD_I32_ADDK = I32_ADD; I32_ADDK;
     #[allow(super_overlap)] #[forward] super I32_ADDK_BR_I32_NE = I32_ADDK; BR_I32_NE;
     #[allow(super_overlap)] #[forward] super I32_ADDK_BRNZ = I32_ADDK; BRNZ;
+    // Two counters or pointers stepped together (loops, unrolled ones).
+    #[allow(super_overlap)] #[forward] super I32_ADDK_I32_ADDK = I32_ADDK; I32_ADDK;
 
     on raise(t: Trap) { fail t }
 
@@ -1029,8 +1104,9 @@ pub vm W {
         fp.inst = m.inst;
         mem = m.memory.data; msize = m.mem_size;
         var i = f.nparams as u64;
+        let z = f.nzero as u64;
+        while i < z { args[i] = 0; i += 1; }
         let n = f.nlocals as u64;
-        while i < n { args[i] = 0; i += 1; }
         // Constant slots (the pointer read once: the stores could alias f).
         let ks = f.consts;
         let nk = f.nconsts as u64;

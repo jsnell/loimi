@@ -251,7 +251,7 @@ fn disasm(path: str) -> i32 {
     for i in (inst.module.nfunc_imports as u64)..inst.funcs.len {
         let f = inst.funcs.at(i);
         b.clear();
-        b.fmt("func {}", i).fmt2(": {} slots, {} locals\n", f.nslots, f.nlocals);
+        b.fmt("func {}", i).fmt2(": {} slots, {} locals", f.nslots, f.nlocals).fmt(" ({} zeroed by calls)\n", f.nzero - f.nparams);
         W.disasm(f.code.words(), &b);
         io.print(b.as_str());
     }

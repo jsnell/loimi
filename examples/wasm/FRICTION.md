@@ -363,6 +363,126 @@ mode.
   rounding, `minimum`/`maximum`, 64-bit compares); none of these
   benchmarks does. The default stays the portable baseline.
 
+### Where the time goes against wasm3, and four translator changes (2026-11-04)
+
+**Profiling without `perf`.** `perf_event_paranoid` is 3 on this
+machine, so no hardware counters. A 40-line `LD_PRELOAD` sampler (a
+`CLOCK_MONOTONIC` POSIX timer every 37 µs whose `SIGPROF` handler records
+`rip` and `r13`, the vm's `pc`) attributes time per handler (each op is
+its own symbol) and per vm instruction (hot code shows as runs of `pc`
+values 8 bytes apart), which with `--disasm` finds the hot loops. Not
+committed (it is a scratch tool), but worth a `std.prof` feature: a
+sampling profiler that maps samples to vm `pc`s needs nothing from the
+kernel.
+
+Per benchmark (handler profile, `--vm-stats`):
+
+- **binarytrees** (malloc/free-bound): `CALL` alone is 14% of the time,
+  most of it the loop that zeroes the callee's locals (a data-dependent
+  trip count, so its exit branch mispredicts across callees); then
+  `I32_LOAD`/`I32_STORE` (12.5/7.5%, dlmalloc's free lists), `MOV`
+  (6.5%), `CONST32` (5.7%, constant arguments and local inits) and
+  `GLOBAL_SET` of the stack pointer (3.9%: three dependent loads).
+- **coremark**: spread out; 11% is one pointer-reversal loop (`MOV;
+  I32_LOAD; I32_STORE; MOV; BRNZ`), which is load-latency-bound through
+  slots, and the state machine's `BR_TABLE`.
+- **fannkuchredux**: `I32_ADDK` 11%, `I32_LOAD` 12%, `MOV` 10%; address
+  arithmetic (`I32_ADDK t, p, 28` then a store at offset 0: clang adds
+  the constant where the offset cannot be used, since offsets do not
+  wrap) and bit tests (`I32_ANDK; BRZ`, 3.4% of dispatches).
+- **fasta**: the random-number loop is `I32_REM_U` and `F64_DIV`
+  latency (17%), and the cumulative-probability search two `SELECT4`s
+  (12%) on an `F64_LT` result; at parity with wasm3, as before.
+- **nbody**, **spectralnorm**, **mandelbrot**: float chains, already
+  ahead of wasm3; nbody's next items are `I32_ADDK__AR; F64_LOAD__AA`
+  pairs (4.9% of dispatches).
+
+**Changes** (examples/wasm only; the compiler is unchanged):
+
+1. *Calls zero only the locals a read can see unwritten.* A forward pass
+   over each body (`needs_zero` in compile.lm) tracks the locals written
+   on every path: at a construct's `end`, what every way of reaching it
+   wrote (each branch to it, the fall-through of its last instruction
+   and of an `if`'s then arm; a loop's end is only reached by falling
+   through; an `if` without `else` adds the empty path around it).
+   Those locals get slots right after the parameters, and `Func.nzero`
+   ends the zeroed range. clang hardly reads an unwritten local: one
+   function of the seven benchmarks (in fasta) still zeroes any (dlmalloc zeroed
+   10 of its 11 locals on each call). `tests/zero_locals.wat` (now run by
+   `check.sh`, with wabt's `wat2wasm`) reads locals that one path leaves
+   unwritten, after a call that leaves 99s in the same slots; a build that
+   zeroes nothing prints the 99s.
+2. *`CALL_LOCAL`*, the call of a function the module defines, skips the
+   test for a host function or another instance's (two loads and two
+   branches).
+3. *Address plus constant.* `local.get p; i32.const 8; i32.add` (or a
+   value in its home slot plus a 16-bit constant) stays pending, like a
+   pending local (`Loc.AddK`), and a load or store at offset 0 takes it
+   whole: `F64_LOADK d, p, 8` computes `(p + 8) mod 2^32`, as `i32.add`
+   wraps (23 ops, 12 with accumulator variants). Anything else
+   materializes it as the `I32_ADDK` it was. nbody 1.80 G to 1.68 G
+   dispatches, fasta 0.79 to 0.75 G, binarytrees and coremark 3% fewer.
+   In fannkuchredux the address is usually `local.tee`d first, so it
+   stays two ops.
+4. *More compare-and-branch*: `x & k; br_if` is `BR_I32_ANDK_NZ/Z`, and
+   `i32.load` (also `i32.load; local.tee x`) followed by `br_if`/`if` is
+   `BR_I32_LOAD_NZ/Z d, a, off`, which also writes the word to d
+   (linked-list walks, `if (p->next)`). And a function whose end no
+   branch reaches returns a pending local or constant directly (`RET1 x`
+   instead of `MOV; RET1`), plus one generic super, `I32_ADDK;
+   I32_ADDK` (two counters or pointers stepped together: in coremark,
+   fannkuchredux and fasta).
+
+**Results** (best of 7, interleaved, `--align-functions=64`, tail calls;
+the machine was shared with another agent's builds, load average 4–5,
+so ±3–4% per benchmark is noise):
+
+| benchmark | wasm3 | before | after | after / before | before / wasm3 | after / wasm3 |
+|---|---:|---:|---:|---:|---:|---:|
+| binarytrees | 1.686 | 1.646 | 1.537 | 0.93 | 0.98 | 0.91 |
+| coremark | 2.347 | 2.180 | 2.128 | 0.98 | 0.93 | 0.91 |
+| fannkuchredux | 1.926 | 1.692 | 1.642 | 0.97 | 0.88 | 0.85 |
+| fasta | 1.332 | 1.317 | 1.274 | 0.97 | 0.99 | 0.96 |
+| mandelbrot | 2.246 | 1.716 | 1.688 | 0.98 | 0.76 | 0.75 |
+| nbody | 2.325 | 2.170 | 2.126 | 0.98 | 0.93 | 0.91 |
+| spectralnorm | 2.211 | 1.823 | 1.860 | 1.02 | 0.82 | 0.84 |
+| **geomean** | 1.975 | 1.769 | 1.726 | **0.976** | 0.90 | **0.87** |
+
+Of that, the zeroing is the largest part (a build that zeroed nothing
+measured binarytrees 0.96, coremark 0.97, fannkuchredux 0.97 of before),
+the K loads and stores gave nbody 0.95–0.96 in two runs, the rest is
+within noise each.
+
+**Tried and dropped.**
+
+- *Operand fields loaded from the code instead of shifted out of the
+  instruction word* (a compiler change: a 16-bit field at a byte offset
+  becomes `movzwl 2(%r13),%eax`; `I32_ADD` 14 instructions to 11): 1.044
+  of the time by geometric mean (mandelbrot 1.16, binarytrees 1.09, only
+  coremark faster). The handlers trade ALU work (shifts, which have four
+  ports) for loads, which have two and which the slot accesses, the next
+  word and the table entry already use: `I32_ADD` goes from 4 loads to 7.
+  Not kept.
+- *`super`s from the union of the seven `--vm-stats` reports*: with the
+  accumulator variants, the frequent pairs split into many variants
+  (`I32_ADDK__AR; F64_LOAD__AA` in nbody, `I32_ADDK__AA; F64_LOAD__AA` in
+  fasta), and of the top 70 pairs only five recur in two or more
+  benchmarks. Supers that pay are per benchmark, so the translator
+  changes above were made instead (3 and 4 cover the recurring ones),
+  and only `I32_ADDK; I32_ADDK` was added.
+
+**Not done, the next candidates.** Local-to-local `MOV`s are 7–10% of
+dispatches in binarytrees, coremark, fannkuchredux and mandelbrot
+(clang's own copies, often loop-carried: coalescing them needs liveness
+over the wasm locals). `CONST32` into locals and as call arguments (12%
+of binarytrees' dispatches). `GLOBAL_GET`/`GLOBAL_SET` of the stack
+pointer read `ctx.globals[g]` and then the cell: globals of the instance
+in one array would save a dependent load. An address that is
+`local.tee`d (fannkuchredux) or used with a nonzero offset keeps its
+`I32_ADDK`. A held-out benchmark set would show how much of this is
+specific to these seven programs; all four changes are about how clang
+compiles C, not about one program.
+
 ## Summary
 
 | File | Lines | What |
