@@ -1160,6 +1160,14 @@ pub vm Mini {
         }
         if let Native(id) = f {
             cold {
+                // coroutine.resume and coroutine.yield switch threads in
+                // this run when they can; the native reports the rest.
+                if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
+                    switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
+                }
+                if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
+                    switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
+                }
                 // math.sqrt and math.floor of a number, for one result,
                 // without the native call (nbody, sort).
                 if nres == 1 and nargs != 0 {
@@ -1174,14 +1182,6 @@ pub vm Mini {
                             next
                         }
                     }
-                }
-                // coroutine.resume and coroutine.yield switch threads in
-                // this run when they can; the native reports the rest.
-                if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
-                    switch_in(co, regs + base + 2, nargs as u64 - 1, base as u64, nres as u64, false)
-                }
-                if id == coro.YIELD and ctx.cur.inrun and ctx.base == ctx.frames {
-                    switch_out(regs + base + 1, nargs as u64, base as u64, nres as u64)
                 }
                 if ctx.heap.allocated > ctx.heap.threshold { gc.collect(&ctx.heap); }
                 let v = call_native(ctx, id, regs + base + 1, nargs as u64, true)?;
