@@ -4225,11 +4225,15 @@ impl<'a> Checker<'a> {
                 Err(a) => heap = Some(a),
             }
         }
-        if (name == "new" || name == "try_new" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
+        if (name == "new" || name == "try_new" || name == "new_uninit" || name == "gc_mark") && !self.modules.iter().any(|m| m.path == ["std", "gc"]) {
             return Err(Diag::new(span, format!("`{}` needs the GC runtime: add `import std.gc;`", name)));
         }
-        if name == "new" || name == "try_new" {
+        if name == "new" || name == "try_new" || name == "new_uninit" {
             let fast = name == "try_new";
+            let uninit = name == "new_uninit";
+            if uninit && args.len() != 3 {
+                return Err(Diag::new(span, "`new_uninit` takes a heap, an object literal, and the length of its trailing array"));
+            }
             if !(2..=4).contains(&args.len()) {
                 return Err(Diag::new(
                     span,
@@ -4277,6 +4281,32 @@ impl<'a> Checker<'a> {
             }
             let verified = sd.verified.is_some();
             let trailing = sd.trailing.clone();
+            if uninit {
+                // The trailing array keeps whatever bytes were there: the
+                // collector must not trace it, and outside `unsafe { }`
+                // every bit pattern must be a valid element.
+                let Some((tn, et)) = &trailing else {
+                    return Err(Diag::new(span, "`new_uninit` is for objects with a trailing array"));
+                };
+                let (tn, etn, on) = (tn.clone(), self.ty_name(et), self.ty_name(&init.ty));
+                if verified {
+                    return Err(Diag::new(span, format!("`{}` holds verified code: `new_uninit` cannot create it", on)));
+                }
+                if crate::gcgen::is_traced(&self.prog, et) {
+                    return Err(Diag::new(
+                        span,
+                        format!("`new_uninit` leaves the trailing array `{}: [{}]` unset, and `{}` holds references the collector would trace", tn, etn, etn),
+                    )
+                    .note(span, "use `new` (zero-filled) or `new(h, X { .. }, n, v)`"));
+                }
+                if cx.unsafe_depth == 0 && !self.any_bits_valid(et, 0) {
+                    return Err(Diag::new(
+                        span,
+                        format!("`new_uninit` leaves the trailing array `{}: [{}]` unset, and not every bit pattern is a `{}`", tn, etn, etn),
+                    )
+                    .note(span, format!("use `new` or `new(h, {} {{ .. }}, n, v)`, or, if every element is set before anything reads it, write the `new_uninit` inside `unsafe {{ }}`", on)));
+                }
+            }
             let len = match (&trailing, args.len()) {
                 (Some(_), 3 | 4) => Some(Box::new(self.expr_coerce(cx, &args[2], &Ty::Int(IntTy::U64))?)),
                 (None, 2) => None,
@@ -4293,7 +4323,7 @@ impl<'a> Checker<'a> {
             // Zero-filled, the trailing array must hold valid values: no
             // null `Gc` (which only `unsafe` can make), no word that
             // encodes no variant of a `value` type.
-            if let (Some((tn, et)), None, Some(l)) = (&trailing, &fill, &len) {
+            if let (Some((tn, et)), None, Some(l), false) = (&trailing, &fill, &len, uninit) {
                 let empty = matches!(l.kind, TK::Int(0));
                 let safe = self.modules[cx.module].safe;
                 if !empty && !verified && cx.unsafe_depth == 0 {
@@ -4318,7 +4348,7 @@ impl<'a> Checker<'a> {
             if fast {
                 t = Ty::Option(Box::new(t));
             }
-            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len, fill, fast }, span)));
+            return Ok(Some(mk(t, TK::New { heap: Box::new(h), init: Box::new(init), len, fill, fast, uninit }, span)));
         }
         if name == "__verified_words" {
             // In a vm's generated code (`Vm.build_verified`): the words of

@@ -1,0 +1,9 @@
+// Outside `unsafe`, `new_uninit` needs elements whose every bit pattern
+// is valid: not `bool`.
+import std.gc;
+object Flags { fs: [bool] }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = new_uninit(&heap, Flags {}, 4);
+}
+// error: `new_uninit` leaves the trailing array `fs: [bool]` unset, and not every bit pattern is a `bool`

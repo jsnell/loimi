@@ -297,7 +297,9 @@ pub enum TK {
     /// gives `None` where `new` would refill a free list.
     /// `fill`: `new(heap, Obj { .. }, n, v)`, the value every element of
     /// the trailing array starts as (else zero bytes).
-    New { heap: B, init: B, len: Option<B>, fill: Option<B>, fast: bool },
+    /// `uninit`: `new_uninit(heap, Obj { .. }, n)`, whose trailing array
+    /// (untraced, any bits valid) is not zeroed.
+    New { heap: B, init: B, len: Option<B>, fill: Option<B>, fast: bool, uninit: bool },
     /// The trailing array of an object, as a slice.
     Trailing(B),
     /// A closure literal: the closure's function and the captured locals,

@@ -1,0 +1,10 @@
+// `new_uninit` leaves the trailing array unset: not for arrays the
+// collector traces, even in `unsafe`.
+import std.gc;
+object Node { v: i64 }
+object Arr { items: [?Gc<Node>] }
+fn main() {
+    var heap = gc.Heap.new();
+    let a = unsafe { new_uninit(&heap, Arr {}, 4) };
+}
+// error: `new_uninit` leaves the trailing array `items: [?Gc<Node>]` unset, and `?Gc<Node>` holds references the collector would trace

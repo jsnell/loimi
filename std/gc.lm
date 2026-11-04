@@ -55,6 +55,7 @@ extern "C" fn loimi_trace_object(h: *Heap, obj: *u8, tid: u32);
 extern "C" fn loimi_shadow_top() -> *ShadowFrame;
 extern "C" fn loimi_type_name(tid: u32) -> str;
 extern "C" fn calloc(n: u64, size: u64) -> *u8;
+extern "C" fn malloc(size: u64) -> *u8;
 extern "C" fn free(p: *u8);
 extern "C" fn mmap(addr: *u8, len: u64, prot: i32, flags: i32, fd: i32, off: i64) -> *u8;
 extern "C" fn munmap(addr: *u8, len: u64) -> i32;
@@ -361,7 +362,7 @@ pub fn Heap.new() -> Heap {
 /// Called by compiled code for `new`. The object is zeroed.
 pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
-    if c >= NCLASS { return alloc_large(h, size, tid, n); }
+    if c >= NCLASS { return alloc_large(h, size, tid, n, true); }
     let sz = c << 4;
     var hd = h.cur[c];
     if (h.lim[c] as u64) - (hd as u64) < sz { hd = refill(h, c); }
@@ -388,7 +389,7 @@ pub fn alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
 #[inline]
 pub fn try_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     let c = (HEADER + size + 15) >> 4;
-    if c >= NCLASS { return alloc_large(h, size, tid, n); }
+    if c >= NCLASS { return alloc_large(h, size, tid, n, true); }
     let sz = c << 4;
     let hd = h.cur[c];
     if (h.lim[c] as u64) - (hd as u64) < sz { return 0 as *u8; }
@@ -399,6 +400,28 @@ pub fn try_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
     h.allocated += sz;
     let p = hd + HEADER;
     mem.memset(p, 0, size);
+    p
+}
+
+/// Called by compiled code for `new_uninit`: `alloc` without zeroing
+/// the object's bytes (`new_uninit` stores the fixed fields; its trailing
+/// array holds no references and whatever bytes were there: zero in fresh
+/// memory, a dead object's, verify mode's 0x01 fill). With verify on
+/// they are 0x01 bytes, so that reading them before writing is the same
+/// in every run.
+pub fn alloc_uninit(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let c = (HEADER + size + 15) >> 4;
+    if c >= NCLASS { return alloc_large(h, size, tid, n, false); }
+    let sz = c << 4;
+    var hd = h.cur[c];
+    if (h.lim[c] as u64) - (hd as u64) < sz { hd = refill(h, c); }
+    h.cur[c] = hd + sz;
+    *(hd as *u64) = sz | (((tid & 0xFFFF) as u64) << 32);
+    (hd as *Header).len = n;
+    h.count += 1;
+    h.allocated += sz;
+    let p = hd + HEADER;
+    if h.verify { mem.memset(p, 1, size); }
     p
 }
 
@@ -581,16 +604,20 @@ fn MarkedIter.next(it: *MarkedIter) -> ?*Header {
 }
 
 #[inline(never)]
-fn alloc_large(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
-    let p = calloc(1, 16 + HEADER + size);
+fn alloc_large(h: *Heap, size: u64, tid: u32, n: u64, zero: bool) -> *u8 {
+    // Unzeroed (`alloc_uninit`): from malloc, every header byte set here.
+    let p = if zero { calloc(1, 16 + HEADER + size) } else { malloc(16 + HEADER + size) };
     if (p as u64) == 0 { oom(); }
     let head = p as *ChunkHead;
     head.rs = h.rs;
+    head.pad = 0;
     let hd = (p + 16) as *Header;
     hd.size = (HEADER + size) as u32;
     hd.tid = tid as u16;
+    hd.mark = 0;
     hd.flags = LARGE;
     hd.len = n;
+    if !zero and h.verify { mem.memset(p + 16 + HEADER, 1, size); }
     h.large.push(hd);
     h.count += 1;
     h.allocated += HEADER + size;
@@ -1988,6 +2015,16 @@ pub fn rootck_alloc(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
         }
         bm[g >> 6] = bm[g >> 6] | ((1 as u64) << (g & 63));
     }
+    p
+}
+
+/// `alloc_uninit` for `new_uninit` in `--gc-check-roots` builds: the
+/// object's bytes are 0x01 (as freed memory is there), so that a program
+/// reading its trailing array before writing it reads the same bytes in
+/// every run, and not zeros by luck.
+pub fn rootck_alloc_uninit(h: *Heap, size: u64, tid: u32, n: u64) -> *u8 {
+    let p = rootck_alloc(h, size, tid, n);
+    mem.memset(p, 1, size);
     p
 }
 
