@@ -330,7 +330,9 @@ pub vm Wam {
         ("SUB", "SUBI", "sub_checked", -, 1),
         ("MUL", "MULI", "mul_checked", *, 2),
     ] {
-        op #name(d: xr, a: xr, b: xr) : R3 {
+        op #name(d: xr, a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             match (a, b) {
                 (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { d = Term.Int(r); next },
                 (Flt(x), Flt(y)) => { d = Term.Flt(x sym y); next }
@@ -338,7 +340,8 @@ pub vm Wam {
             }
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
-        op #iname(d: xr, a: xr, k: simm) : R3s {
+        op #iname(d: xr, a0: xr, k: simm) : R3s {
+            let a = deref(a0);
             if let Int(x) = a and let Some(r) = x.#checked(k as i48) { d = Term.Int(r); next }
             cold { d = arith.arith2(ctx, kind, a, Term.Int(k as i48))?; next }
         }
@@ -356,7 +359,9 @@ pub vm Wam {
         ("MIN", 12, true, if x <= y { x } else { y }),
         ("MAX", 13, true, if x >= y { x } else { y }),
     ] {
-        op #name(d: xr, a: xr, b: xr) : R3 {
+        op #name(d: xr, a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) and guard { d = Term.Int(result); next }
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
@@ -366,12 +371,15 @@ pub vm Wam {
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
     }
-    op NEG(d: xr, a: xr) : R3 {
+    op NEG(d: xr, a0: xr) : R3 {
+        let a = deref(a0);
         if let Int(x) = a and let Some(r) = (0 as i48).sub_checked(x) { d = Term.Int(r); next }
         cold { d = arith.arith2(ctx, 1, Term.Int(0), a)?; next }
     }
     inline for (name, test) in [("LT", c < 0), ("LE", c <= 0), ("GT", c > 0), ("GE", c >= 0), ("NEQ", c == 0), ("NNE", c != 0)] {
-        op #name(a: xr, b: xr) : R3 {
+        op #name(a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) {
                 let c: i32 = if x < y { -1 } else if x > y { 1 } else { 0 };
                 if test { next }
