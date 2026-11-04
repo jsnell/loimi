@@ -1136,10 +1136,18 @@ fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
 }
 
 /// Sequence repetition `seq * n`.
+fn exc_of_empty_kind(c: *Ctx, kind: u64) -> Value {
+    let e = exc_of(c, c.excs[kind].unwrap(), Value.Nil);
+    if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(value.new_tuple(&c.heap, 0))); }
+    e
+}
+
 fn repeat(c: *Ctx, seq: Value, n: Value) -> Result<?Value, Value> {
     let Some(k0) = value.as_i64(n) else { return Ok(None); };
     if let Float(_) = n { return Ok(None); }
     let k = if k0 < 0 { 0 } else { k0 as u64 };
+    let len = match seq { Str(s) => s.data.len, _ => value.seq_len(seq) };
+    if len > 0 and k > (1 << 27) / len { return Err(exc_of_empty_kind(c, builtins.E_MEMORY)); }
     match seq {
         Str(s) => {
             let r = new(&c.heap, Str { hash: 0 }, s.data.len * k);
@@ -1182,7 +1190,8 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             }
             O_TRUEDIV => {
                 if y == 0 { return Err(zero_div(c, "division by zero")); }
-                return Ok(Value.Float((x as f64) / (y as f64)));
+                let lim: i64 = 9007199254740992; // 2**53: exact as doubles
+                if x >= 0 - lim and x <= lim and y >= 0 - lim and y <= lim { return Ok(Value.Float((x as f64) / (y as f64))); }
             }
             O_BAND => return Ok(value.int_val(h, x & y)),
             O_BOR => return Ok(value.int_val(h, x | y)),
@@ -1211,11 +1220,11 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             Ok(r)
         }
         O_TRUEDIV => {
-            let y = value.to_f64(b).unwrap();
-            if y == 0.0 { return Err(zero_div(c, "division by zero")); }
-            // Exact quotient first, so that big multiples divide exactly.
-            let Some((q, r)) = big.divmod(h, a, b) else { return Err(zero_div(c, "division by zero")); };
-            Ok(Value.Float(value.to_f64(q).unwrap() + value.to_f64(r).unwrap() / y))
+            if big.bit_length(b) == 0 { return Err(zero_div(c, "division by zero")); }
+            if big.bit_length(a) <= 53 and big.bit_length(b) <= 53 {
+                return Ok(Value.Float(value.to_f64(a).unwrap() / value.to_f64(b).unwrap()));
+            }
+            int_true_div(c, a, b)
         }
         O_POW => {
             if big.is_neg(b) {
@@ -1267,6 +1276,30 @@ fn float_pow(c: *Ctx, x: f64, y: f64) -> Result<Value, Value> {
         return Err(e);
     }
     Ok(Value.Float(r))
+}
+
+extern "C" fn ldexp(x: f64, e: i32) -> f64;
+
+/// a / b for ints, correctly rounded (CPython's long_true_divide): a
+/// quotient of at least 55 bits with a sticky bit for the remainder,
+/// converted once and scaled.
+fn int_true_div(c: *Ctx, a: Value, b: Value) -> Result<Value, Value> {
+    let h = &c.heap;
+    let neg = big.is_neg(a) != big.is_neg(b);
+    let x = big.abs(h, a);
+    let y = big.abs(h, b);
+    if big.bit_length(x) == 0 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let k = big.bit_length(x) as i64 - big.bit_length(y) as i64 - 56;
+    if k < -1200 { return Ok(Value.Float(if neg { -0.0 } else { 0.0 })); }
+    let (n, d) = if k >= 0 { (x, big.shl(h, y, k as u64)) } else { (big.shl(h, x, (0 - k) as u64), y) };
+    let Some((q0, r)) = big.divmod(h, n, d) else { return Err(zero_div(c, "division by zero")); };
+    var q = q0;
+    if big.bit_length(r) != 0 { q = big.bitop(h, q, Value.Int(1), 1); }
+    if k > 2000 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    let e = if k < -2000 { -2000 } else { k };
+    let f = ldexp(value.to_f64(q).unwrap(), e as i32);
+    if f - f != 0.0 { return Err(exc(c, E_OVERFLOW, "integer division result too large for a float")); }
+    Ok(Value.Float(if neg { -f } else { f }))
 }
 
 fn copysign0(s: f64) -> f64 { if (s.to_bits() >> 63) != 0 { -0.0 } else { 0.0 } }
