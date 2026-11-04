@@ -28,7 +28,7 @@ This report is kept as written. Since then:
 | 8 | Unchanged. |
 | 9 | Fixed: `mem.try_sort_by(p, n, less)` / `Vec.try_sort_by(less)`, a stable sort whose comparator returns `Result<bool, E>` and is `uses reenter`; it sorts indices and permutes once, so elements stay in place (reachable) while guest code runs, and the data is unchanged on error (stdlib.md). `sorted`/`list.sort` use it (the 40-line merge sort is gone). Mini's `table.sort` cannot: it reproduces Lua's quicksort (unstable, and its "invalid order function" detection depends on that algorithm). |
 | 10 | Mostly fixed: `0 as *T` in global initializers; enum-to-int casts in constants (they failed whenever the constant was used); `A(a, b) \| B(a, b) =>` with bindings (one arm per alternative); `let f = \|x: T\| ..;` is a local `block fn` (called or passed on, never stored, so it cannot outlive its captures); a mismatch in the body of `for j in 0..3` notes that `j` is `i64`; `unknown name std` (and an unimported std module that is loaded) suggests the import; a mismatched encoder argument notes which format field the operand is ("operand `name` of `DELGLOBAL` is field `a` of format `ABx` (8 bits) .. a placeholder operand such as `z: imm` moves the next ones along"). Literal-only expressions are still typed `i64` without context. |
-| 11 | Unchanged. |
+| 11 | Changed: instances keep their attributes in inline slots behind shapes, with dicts only for the dynamic cases ("Instance layout" above); the caches check the name at the cached slot, which is the "entry index for key K" rule asked for here, with the shape as the layout. Nothing generic was added to std: `std.obj` did not fit (same section). |
 | 12 | Unchanged (by design). |
 | 13 | Fixed: `--vm-stats` counts entries into each `cold` block, per op, with its source location (`CALL (cold block at examples/python/vm.lm:681:9)`; blocks in plain vm functions under `fn name`), at no cost without `--vm-stats` (language.md section 7.3). richards: LOADMETHOD_CALLMETHOD's slow path 1.6M times, CALL's 0.99M. |
 
@@ -179,6 +179,141 @@ Where the time goes now (tail-call build, share of samples):
   prelude call.
 - Float math in libm (nbody `pow` 13%, float `sin`/`cos` 12%), the same
   calls CPython makes.
+
+## Instance layout: inline slots behind shapes (2026-11-04)
+
+The second round's profile put attribute access and instance creation
+first: GETATTR waited on four dependent loads (register → instance →
+AttrDict → entries → entry), an instance was four objects (Inst,
+KeyDict, its index, its entries) and adding an attribute probed the
+index (`attr_append_new`, 6-9% of raytrace, chaos and float). This round
+changes the layout of instances; interpreter changes only, no compiler
+or std change.
+
+**The layout.** An instance is one object, `Inst { cls, keys, slots:
+[Value] }`: its class, its *shape* and its attribute values in a
+trailing array, in the order they were added. A shape is a `K_SHAPE`
+box whose `extra` lists the attribute names (interned strings) in
+order; instances that add the same names in the same order share it.
+Shapes form a transition tree (child by name in a small Dict, plus the
+last child taken), with one empty root per class and slot count. A
+3-attribute instance (float's `Point`) is one 64-byte allocation (with
+the header); it was four, about 256 bytes.
+
+- *GETATTR/SETATTR caches* stay what they were, a slot number (two for
+  GETATTR), but are checked against the shape: slot `i` is `name` if
+  `keys.extra[i] == name` (one compare of interned pointers) and `i` is
+  below the shape's inline count. So the check is not "same shape" but
+  "same name at that slot", and one entry hits for every shape that
+  shares the prefix: subclasses that call the base's `__init__` first,
+  sibling classes, objects of different classes built the same way
+  (deltablue's constraint hierarchy, richards' tasks). A GETATTR hit is
+  22 instructions: register → instance → shape (count and name) and
+  instance → slot, the two loads independent.
+- *Adding an attribute* (SETATTR's add path) follows the shape's last
+  transition if it is for this name, with the old class-id and
+  class-epoch guard (no property or shadowed class attribute can be
+  involved): a store, a shape store and a barrier, no probe.
+- *Slot counts* are fixed at allocation. The compiler counts the
+  distinct `self.NAME = ..` targets in the methods of each class body
+  (first parameter as `self`; BUILDCLASS's new `hint` operand); a class
+  starts with its own count plus its base's, and the slow path raises
+  it whenever an instance of the class needs more. New instances get
+  that many slots (a new root shape for the new count; old instances
+  keep theirs). An instance that still runs out (go's `Square`s get two
+  attributes from outside the class after all 81 exist) keeps the last
+  slot's value and the rest in a tuple stored in the last slot; the
+  shape's inline count then excludes those, and GETATTR/SETATTR find
+  them in their cold blocks (`ops.inst_cached`) without the full
+  lookup.
+- *Dict mode* for the dynamic cases: `__dict__`/`vars()` (the live dict
+  CPython gives), `obj.__dict__ = d`, `del obj.x` (keeps the order of
+  the rest) and more than 64 attributes or 64 transitions from one
+  shape (setattr with computed names). The instance gets the dict-mode
+  shape (no names, so every cache misses) and a Python `Dict` in
+  `slots[0]`; nothing else changes (method caches go off for the class
+  as before).
+- *Names from `setattr`* are interned when they enter a shape, so the
+  caches' pointer compares hit for them too; odd names (`setattr(o, "a
+  b", 1)`) are ordinary entries.
+
+**LOADMETHOD** (the method-call side of attribute access, 16-25% of
+deltablue and richards after the layout change): its instance entries
+cached (class id, epoch, owner depth, entry number), and a hit walked
+the class chain and loaded the function through the owner's dict. They
+now hold the function itself (its value bits in a 64-bit cache word,
+also in the global method cache), read only while the class id and the
+class epoch match; then the class is alive (an instance of it is the
+receiver, ids are not reused) and its chain's dicts, which hold the
+function, are unchanged. That is one `unsafe { bits as Value }`
+(`ops.method_value`). Four entries instead of two: richards' sites see
+the four `Task` classes.
+
+**Why not `std.obj`.** It has the same model (shapes, transitions,
+dictionary mode) and its design shaped this one, but three things did
+not fit. Its keys are untraced `u64` symbols, so attribute names (GC
+strings, some from `setattr`) would need pinning and a string → symbol
+step in every slow path. Its caches are (shape id, slot): a site is
+monomorphic per shape, while the Python benchmarks' polymorphic sites
+see many shapes with a common prefix, which the name-at-slot check
+covers with one entry. And Python's dict mode must be a real `dict`
+object that user code holds and mutates (`__dict__`), not a key → slot
+index beside the slots. What could be shared is the transition table,
+which is 30 lines here.
+
+**Results.** `bench/python/compare.py -n 5`, tail-call builds with
+`--align-functions=64`, before (d1cae11) and after interleaved with
+CPython 3.13.18, wall clock, best of 5 (load average 4.9-5.4):
+
+| benchmark | before (s) | after (s) | CPython (s) | before/CPython | after/CPython | after/before |
+|---|---:|---:|---:|---:|---:|---:|
+| chaos | 0.460 | 0.395 | 0.976 | 0.47 | 0.40 | 0.86 |
+| deltablue | 0.729 | 0.518 | 1.328 | 0.55 | 0.39 | 0.71 |
+| fannkuch | 0.516 | 0.513 | 1.194 | 0.43 | 0.43 | 0.99 |
+| float | 0.482 | 0.319 | 1.190 | 0.41 | 0.27 | 0.66 |
+| go | 0.490 | 0.515 | 1.193 | 0.41 | 0.43 | 1.05 |
+| hexiom | 0.563 | 0.591 | 1.004 | 0.56 | 0.59 | 1.05 |
+| nbody | 0.445 | 0.448 | 1.285 | 0.35 | 0.35 | 1.01 |
+| nqueens | 0.802 | 0.802 | 1.023 | 0.78 | 0.78 | 1.00 |
+| raytrace | 0.629 | 0.473 | 1.174 | 0.54 | 0.40 | 0.75 |
+| richards | 0.335 | 0.228 | 1.026 | 0.33 | 0.22 | 0.68 |
+| spectral_norm | 0.236 | 0.236 | 0.852 | 0.28 | 0.28 | 1.00 |
+| **geomean** | | | | **0.45** | **0.39** | **0.87** |
+
+go and hexiom came out 5% slower in this wall-clock run; in CPU time,
+best of 9 interleaved right after, go took 0.88 and hexiom 0.94 of the
+time before (fannkuch 0.94, nqueens 0.96: the noise floor).
+
+Per step, CPU time (user + sys) of interleaved runs, best of 3-9 (load
+average 4-7: wall and CPU times both moved by up to ±10% between
+identical runs, so only the steps that held up in reruns are listed):
+
+| change | effect |
+|---|---|
+| inline slots behind shapes, one global root | float 0.74, raytrace 0.83-0.85, chaos 0.85-0.86, deltablue 0.87-0.89, go 0.99-1.12 (the first version moved instances that outgrew their slots to dict mode: all of go's `Square`s), geomean 0.93-0.94 |
+| a root shape per class | raytrace 0.91 of the step before: with one root, the root's last-transition cache alternated between `Vector`, `Ray` and `Sphere` (SETATTR add misses 589k → 74) |
+| LOADMETHOD caches the function | deltablue 0.83-0.85, richards 0.86 |
+| four LOADMETHOD entries | richards 0.79-0.87 |
+| shapes with an inline count (no overflow test on hits) | eight instructions fewer per GETATTR hit; within noise |
+
+Peak RSS (`ru_maxrss`): float 105 → 36 MB (CPython 27), the others
+within ±2 MB. Instances move to dict mode only for the reasons above:
+`PYLOIMI_COUNTS` counter 500 is 0 on all 11 benchmarks.
+
+Where the time goes now (tail-call, share of samples): GETATTR is still
+13-24% of go, deltablue and richards, now as dispatch plus two
+dependent loads per hit rather than misses (GETATTR's slow path runs
+120 times in go, 6k in deltablue); LOADMETHOD_CALLMETHOD 10-16% of
+deltablue and richards; SETATTR 5-9% (its barrier's `remember` call
+gives it a frame, item 6); instance creation in float, raytrace and
+chaos is `call_slow`'s class path plus the `__init__` frame (5-8%).
+
+Next candidates: a CALL fast path for classes whose `__init__` is a
+simple function (allocate, push the frame, no `call_slow` loop);
+caching class attributes read through instances (`self.CONST`) with
+the shape (an absent-name proof per shape) and the class epoch; and
+attribute reads of `self` in methods could skip the tag test when the
+compiler knows the register holds the receiver.
 
 ## Friction, by impact
 

@@ -377,6 +377,16 @@ implementation; `git log` has the details.
   iterator, int/str filtering in `x in list`, division-free unit-step
   slices; interpreter changes only
   ([FRICTION.md](examples/python/FRICTION.md#optimizations-second-round-2026-11-04)).
+- The Python subset's instances are one object with inline attribute
+  slots behind shapes (transition trees per class and slot count, slot
+  counts from a compiler hint), with a dict only for `__dict__`,
+  deletion and many attributes; attribute caches check the name at the
+  cached slot, so subclass-polymorphic sites hit with one entry, and
+  LOADMETHOD caches the method itself (four entries). 0.39 of CPython
+  3.13's time by geometric mean (was 0.45): float 0.66, richards 0.68,
+  deltablue 0.71, raytrace 0.75 of the time before; float's peak RSS
+  105 → 36 MB
+  ([FRICTION.md](examples/python/FRICTION.md#instance-layout-inline-slots-behind-shapes-2026-11-04)).
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
 - The Prolog takes 0.63x SWI-Prolog's time and 0.15x Trealla's by
