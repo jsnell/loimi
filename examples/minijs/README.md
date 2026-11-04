@@ -65,9 +65,16 @@ two floats becomes `_F`, which adds the raw words as doubles and keeps a
 result that is not a NaN (a tagged word is a NaN as a double), and a site
 that first sees an Int and a Num becomes `_IF`/`_FI`. Quickening re-runs
 `JS.optimize` on the function, so supers of quickened members
-(`MUL_F; ADD_F`) form. `DIV` divides the raw words first. Bit operations
-and `%` have forms with an Int constant (`SHLK`, `BORK`, `MODK`, ...),
-and conditions compare with small constants directly (`JLTI`, `JGEI`).
+(`MUL_F; ADD_F`) form. An Int overflow gives the double inline, without
+leaving the generic member. `DIV` is a family too: the generic member
+divides two Ints first (an exact quotient stays Int), `DIV_F` divides the
+raw words first. Bit operations and `%` have forms with an Int constant
+(`SHLK`, `BORK`, `MODK`, ...), conditions compare with small constants
+directly (`JLTI`, `JGEI`) and with other number constants from the pool
+(`JLTK`, `JLEK`, ...: `i <= 5000`, `x < N` with a folded `const`), and
+`===`/`!==` producing a boolean have constant forms (`EQK`, `NEK`). The
+slow paths of all of these are `cold` blocks, so the handlers have no
+stack frame (`-W handler_frame`).
 
 **The compiler** folds top-level `const`s initialized with literals
 (SPEC.md rules out reading them before their declaration), compiles
@@ -174,10 +181,16 @@ R0 is `this`, R1.. the parameters. `CALL base n` takes the callee from
 R[base], `this` from R[base+1] and the arguments above it, so the
 callee's window starts at base+1 and nothing is copied. The fast path
 covers every bytecode function except class constructors, whatever the
-argument count: the registers above the fixed parameters are cleared
-two at a time (the register after the window may be cleared too: it is
-free), missing arguments in a cold block, and extra arguments are
-overwritten by locals. `new` frames and the bottom frame are flagged, so
+argument count: missing arguments are set to undefined in a cold block,
+and nothing else is cleared. The compiler writes every register before
+reading it (`var` bindings get undefined when their scope starts), so
+the callee's other registers may hold stale values. They are still valid
+values for the collector: `Ctx.hw` is the stack's high-water mark since
+the last collection, `scan_roots` clears the stack from the innermost
+window up to it (and lowers it), and a call whose window reaches the
+mark raises it, a compare that replaces the stack-overflow check. A
+stale register therefore never refers to an object a collection freed;
+at worst it keeps a dead object until the next collection. `new` frames and the bottom frame are flagged, so
 `RET` tests one word before returning. A call's result is used where it
 lands (`return f(x)` returns from the call base).
 
@@ -279,9 +292,10 @@ before `super()`.
 
 **Current numbers and the changelog of the performance pass are in
 [`bench/minijs/RESULTS.md`](../../bench/minijs/RESULTS.md)**: after it,
-MiniJS takes 0.53 of node --jitless's time and 0.40 of QuickJS's
+MiniJS took 0.53 of node --jitless's time and 0.40 of QuickJS's
 (geometric means over the 14 benchmarks), 0.23-0.82 per benchmark
-against V8's interpreter. The tables below are from before that pass.
+against V8's interpreter; the second pass (2026-11-04, same file) took
+it to SECOND_PASS_RATIOS. The tables below are from before the first pass.
 
 CPU seconds (user + system), best of 3, `--dispatch=tailcall`, on the
 shared 8-core development machine while other agents were running

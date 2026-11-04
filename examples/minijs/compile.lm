@@ -790,11 +790,25 @@ g.closure(n.fun, dst);
                 }
             }
             if n.op == T.Instanceof { fail(n.line, "instanceof is not supported"); }
-            // Bit operations and `%` with an Int constant.
             let kop = n.op == T.Amp or n.op == T.Pipe or n.op == T.Caret or n.op == T.Shl or n.op == T.Shr or n.op == T.UShr or n.op == T.Percent;
-            if kop and n.b.kind == K.Num and let Int(_) = value.number(n.b.num) {
+            // `===`/`!==` with a constant (a literal or a folded const).
+            if (n.op == T.EqEqEq or n.op == T.NotEqEq) and let Some(kv) = g.const_value(n.b) {
+                let k = g.konst(kv);
+                if k < 256 {
+                    let a = g.any(n.a);
+                    if n.op == T.EqEqEq { g.emit(JS.EQK(dst as u8, a as u8, k as u8)); } else { g.emit(JS.NEK(dst as u8, a as u8, k as u8)); }
+                    g.reset(m);
+                    return;
+                }
+            }
+            // Bit operations and `%` with an Int constant (a literal or a
+            // folded const).
+            var kint = false;
+            if let Some(Int(_)) = num_const(g, n.b) { kint = true; }
+            if kop and kint {
+                let kv = num_const(g, n.b) ?? V.Undef;
                 let a = g.any(n.a);
-                let k = g.konst(value.number(n.b.num));
+                let k = g.konst(kv);
                 if k < 256 {
                     let (d, x, y) = (dst as u8, a as u8, k as u8);
                     match n.op {
@@ -810,7 +824,7 @@ g.closure(n.fun, dst);
                     return;
                 }
                 let b = g.temp();
-                g.load_const(value.number(n.b.num), b);
+                g.load_const(kv, b);
                 g.arith(n.op, dst, a, b);
                 g.reset(m);
                 return;

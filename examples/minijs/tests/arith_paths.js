@@ -70,3 +70,12 @@ show("big", big);
 // Indexing out of range.
 const u = "ab";
 console.log(u[0], u[1], u[2], u[-1], u.charAt(1), u.charAt(9) === "");
+
+// `===` and `!==` against constants, as values.
+const KIND = 3;
+function eqs(x) {
+  const a = x === 3, b = x !== KIND, c = x === "s", d = x === null, e = x !== 2.5, f = x === undefined;
+  return [a, b, c, d, e, f].join(",");
+}
+for (const x of [3, 3.0, 2.5, "s", "3", null, undefined, NaN, 0, -0, true])
+  console.log("eq", String(x), eqs(x));

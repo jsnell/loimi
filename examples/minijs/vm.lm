@@ -953,35 +953,24 @@ pub vm JS {
     }
 
     // Comparisons producing booleans.
-    op EQ(dst: reg, a: reg, b: reg) : ABC {
+    // `===` and `!==` producing booleans; the K forms compare with a
+    // constant (`return x === 0`, `t = s !== "x"`).
+    inline for (name, neg, bkind) in [("EQ", false, reg), ("NE", true, reg), ("EQK", false, kst), ("NEK", true, kst)] {
+    op #name(dst: reg, a: reg, b: bkind) : ABC {
         if a == b {
-            if let Num(x) = a { dst = Bool(x == x); next }
-            dst = Bool(true);
+            if let Num(x) = a { dst = Bool((x == x) != neg); next }
+            dst = Bool(!neg);
             next
         }
-        if let (Int(_), Int(_)) = (a, b) { dst = Bool(false); next }
+        if let (Int(_), Int(_)) = (a, b) { dst = Bool(neg); next }
         match (a, b) {
-            (Num(x), Num(y)) => { dst = Bool(x == y); next }
-            (Int(x), Num(y)) => { dst = Bool(x as f64 == y); next }
-            (Num(x), Int(y)) => { dst = Bool(x == y as f64); next }
+            (Num(x), Num(y)) => { dst = Bool((x == y) != neg); next }
+            (Int(x), Num(y)) => { dst = Bool((x as f64 == y) != neg); next }
+            (Num(x), Int(y)) => { dst = Bool((x == y as f64) != neg); next }
             _ => {}
         }
-        cold { dst = Bool(eq_slow(a, b)); next }
+        cold { dst = Bool(eq_slow(a, b) != neg); next }
     }
-    op NE(dst: reg, a: reg, b: reg) : ABC {
-        if a == b {
-            if let Num(x) = a { dst = Bool(x != x); next }
-            dst = Bool(false);
-            next
-        }
-        if let (Int(_), Int(_)) = (a, b) { dst = Bool(true); next }
-        match (a, b) {
-            (Num(x), Num(y)) => { dst = Bool(x != y); next }
-            (Int(x), Num(y)) => { dst = Bool(x as f64 != y); next }
-            (Num(x), Int(y)) => { dst = Bool(x != y as f64); next }
-            _ => {}
-        }
-        cold { dst = Bool(!eq_slow(a, b)); next }
     }
     op LOOSEEQ(dst: reg, a: reg, b: reg) : ABC { dst = Bool(loose_eq(a, b)); next }
     op LT(dst: reg, a: reg, b: reg) : ABC {
