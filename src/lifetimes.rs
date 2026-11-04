@@ -72,16 +72,73 @@ enum Step {
     AnyD,
 }
 
+/// At most `K` steps, inline: paths are copied at every branch and call,
+/// so they must not allocate.
+#[derive(Clone, Copy)]
+struct Steps {
+    a: [Step; K],
+    n: u8,
+}
+
+impl Steps {
+    fn new() -> Steps {
+        Steps { a: [Step::D; K], n: 0 }
+    }
+    fn push(&mut self, s: Step) {
+        self.a[self.n as usize] = s;
+        self.n += 1;
+    }
+    fn extend_from_slice(&mut self, ss: &[Step]) {
+        for s in ss {
+            self.push(*s);
+        }
+    }
+}
+
+impl std::ops::Deref for Steps {
+    type Target = [Step];
+    fn deref(&self) -> &[Step] {
+        &self.a[..self.n as usize]
+    }
+}
+
+impl PartialEq for Steps {
+    fn eq(&self, o: &Steps) -> bool {
+        **self == **o
+    }
+}
+impl Eq for Steps {}
+impl PartialOrd for Steps {
+    fn partial_cmp(&self, o: &Steps) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Steps {
+    fn cmp(&self, o: &Steps) -> std::cmp::Ordering {
+        (**self).cmp(&**o)
+    }
+}
+impl std::hash::Hash for Steps {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (**self).hash(h)
+    }
+}
+impl std::fmt::Debug for Steps {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct Path {
     root: Root,
-    steps: Vec<Step>,
+    steps: Steps,
     trunc: bool,
 }
 
 impl Path {
     fn new(root: Root) -> Path {
-        Path { root, steps: Vec::new(), trunc: false }
+        Path { root, steps: Steps::new(), trunc: false }
     }
     fn push(&self, s: Step) -> Path {
         let mut p = self.clone();
@@ -963,7 +1020,7 @@ impl<'a> Fa<'a> {
         }
         if may_collect(self.p, f) {
             let w = self.why(e.span, Why::Collect(callee));
-            self.restructure(&[Path { root: Root::GcAny, steps: Vec::new(), trunc: true }], w, st);
+            self.restructure(&[Path { root: Root::GcAny, steps: Steps::new(), trunc: true }], w, st);
         }
         if self.kind(&e.ty) == Kind::Gc {
             return [Path::new(Root::GcAny)].into_iter().collect();
