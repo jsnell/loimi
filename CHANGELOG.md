@@ -387,6 +387,14 @@ implementation; `git log` has the details.
   one op, one MOV less for a tee over a pending read): 0.893 of wasm3 on
   PolyBench, 0.872 on the original seven
   ([`FRICTION.md`](examples/wasm/FRICTION.md), "A held-out set").
+- The Scheme interpreter takes 0.894 of its previous time over the 43
+  r7rs-benchmarks programs (0.40 of Guile's VM, was 0.45; 0.22 of
+  Gauche, was 0.25): `list`, `vector`, record constructors, `memq` and
+  `assq` as ops, allocation without a stack frame, no register clearing
+  on calls (a stack high-water mark keeps stale slots safe for the
+  collector), aliases of builtins and known procedures, free variables
+  hoisted out of loops, constant-index vector ops; interpreter changes
+  only ([bench/scheme/README.md](bench/scheme/README.md#third-phase-calls-allocation-builtins-2026-11-04)).
 - [`examples/python`](examples/python): a Python 3 subset running 11
   pyperformance programs, on `std.bigint` and `std.dict`.
 - The Python subset takes 0.45 of CPython 3.13's time by geometric

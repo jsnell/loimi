@@ -482,6 +482,16 @@ Times in seconds.
 
 Times in seconds.
 
+**Update 2026-11-04 (096e04e, tailcall only).** After a third round of
+interpreter work (builtins as ops, allocation without a stack frame, no
+register clearing on calls, aliases, loop-invariant free variables;
+[bench/scheme/README.md](../bench/scheme/README.md#third-phase-calls-allocation-builtins-2026-11-04)),
+`compare.py -n 3 --align 64` against the commit of this table (091245f)
+in one interleaved run: ours/before 0.894; Gauche 0.251 → 0.224, Guile
+without JIT 0.446 → 0.398, Guile with JIT 0.945 → 0.845 (host load 2-4,
+so the absolute times are lower than above). goto, switch and jit
+builds were not rerun.
+
 ### lox
 
 | benchmark | tailcall | goto | switch | clox | tailcall/clox |
