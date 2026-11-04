@@ -25,9 +25,9 @@
 // Algorithms (thresholds below, in limbs, measured; docs/stdlib.md has
 // the numbers): schoolbook multiplication (row by row, two rows a
 // pass), Karatsuba, Toom-3; the same three for
-// squaring, used whenever both operands are the same limbs; Knuth's
-// algorithm D (dividing by a precomputed reciprocal, not `div_wide`,
-// which is a libcall) and above DIV_DC recursive divide-and-conquer
+// squaring, used whenever both operands are the same limbs; schoolbook
+// division by 3/2 quotient limbs (GMP's mpn_sbpi1_div_qr; precomputed
+// reciprocals, no `div_wide`) and above DIV_DC recursive divide-and-conquer
 // division (Burnikel-Ziegler, as in GMP's mpn_dcpi1_div_qr); Zimmermann's
 // Karatsuba square root; binary powering; divide-and-conquer formatting
 // (over the fast division) and parsing. Not built: FFT multiplication,

@@ -178,7 +178,9 @@ suite).
 - Scheme takes less time than Guile with its JIT on 14 of 43 programs
   (geometric mean 0.94); with Loimi's JIT, on 21 (0.76). The bignum
   programs: pi 1.30× Guile (GMP's subquadratic division and square root
-  against std.bigint's), chudnovsky 1.10×.
+  against std.bigint's), chudnovsky 1.10×. (After this run, std.bigint's
+  faster division and square root: pi 0.84 and chudnovsky 0.89 of the
+  time; [stdlib.md](stdlib.md#stdbigint).)
 - Lox takes 0.25–0.66 of clox's time. Switch mode is within 3% of
   tail-call except `equality` (1.17×); goto mode took 1.08× tail-call by
   geometric mean in this run (1.03 in the previous one; invocation, zoo
