@@ -201,18 +201,19 @@ fn T.scan_consts(t: *T, code: []u8) -> Result<(), str> {
         match op {
             // Integers that fit a K form's 16 bits are mostly used by one
             // (I32_ADDK, BR_I32_LT_SK): only 0 (an absolute address's
-            // base, a stored zero) gets a slot among them.
+            // base, a stored zero) gets a slot among them, and those that
+            // an op without a K form takes next (`i % 4000`, a store of 1).
             0x41 => {
                 r.pos += 1;
                 let v = r.sleb(32)?;
                 bits = (v as u64) & 0xFFFFFFFF;
-                is_const = v == 0 or !fits16(v);
+                is_const = v == 0 or !fits16(v) or (!r.at_end() and no_kform(code[r.pos]));
             }
             0x42 => {
                 r.pos += 1;
                 let v = r.sleb(64)?;
                 bits = v as u64;
-                is_const = v == 0 or !fits16(v);
+                is_const = v == 0 or !fits16(v) or (!r.at_end() and no_kform(code[r.pos]));
             }
             0x43 => { r.pos += 1; bits = r.fixed32()? as u64; }
             0x44 => { r.pos += 1; bits = r.fixed64()?; }
@@ -232,6 +233,15 @@ fn T.scan_consts(t: *T, code: []u8) -> Result<(), str> {
         }
     }
     Ok(())
+}
+
+/// Whether an i32/i64 constant right before opcode `op` is its operand
+/// in a slot, for want of a K form: division and remainder, rotations,
+/// the value of a store, select's second operand.
+fn no_kform(op: u8) -> bool {
+    (op >= 0x6D and op <= 0x70) or op == 0x77 or op == 0x78
+        or (op >= 0x7F and op <= 0x82) or op == 0x89 or op == 0x8A
+        or (op >= 0x36 and op <= 0x3E) or op == 0x1B
 }
 
 fn T.write_const(t: *T, slot: u64, ty: u8, bits: u64) {
@@ -267,6 +277,38 @@ fn T.flush_local(t: *T, x: u64) {
         let v = t.vals.at(i);
         if (v.loc == Loc.Local and v.x == x) or (v.loc == Loc.AddK and addk_slot(v) == x) { t.flush_at(i); }
     }
+}
+
+/// Whether a pending stack entry reads local slot `x`.
+fn T.reads_local(t: *T, x: u64) -> bool {
+    for i in 0..t.vals.len {
+        let v = t.vals.at(i);
+        if (v.loc == Loc.Local and v.x == x) or (v.loc == Loc.AddK and addk_slot(v) == x) { return true; }
+    }
+    false
+}
+
+/// `local.set x` of the value the last op computed, while entries below
+/// still read x: their flush goes before that op (which reads none of
+/// their home slots), so that the op can still be retargeted to write x
+/// (`i32.load (local.get 9); local.tee 9` with the old 9 pending below
+/// as an address is one MOV, not two).
+fn T.flush_before_last(t: *T, x: u64) {
+    let Some(last) = t.code.last() else { t.flush_local(x); return; };
+    // (Not under an op that writes a second slot, x itself maybe.)
+    if last != t.last_def_pc or is_tk(W.opcode(t.code.at(last))) { t.flush_local(x); return; }
+    let slot = t.last_def_slot;
+    let n = W.op_size(t.code.at(last));
+    var ws: mem.Vec<u64> = mem.Vec.new();
+    defer ws.free();
+    for i in 0..n { ws.push(t.code.at(last + i)); }
+    t.code.truncate(last);
+    t.flush_local(x);
+    let pc = t.code.op(ws.at(0));
+    for i in 1..n { t.code.set(pc + i, ws.at(i)); }
+    t.last_def_pc = pc;
+    t.last_def_slot = slot;
+    t.has_def = true;
 }
 
 fn T.label_types(t: *T, c: *Ctl) -> []u8 { if c.kind == K_LOOP { c.params } else { c.results } }
@@ -737,6 +779,41 @@ fn kmems() -> [(u64, u64); 23] {
     ]
 }
 
+fn is_tk(op: u64) -> bool {
+    for row in tkloads() { let (_, tk) = row; if tk == op { return true; } }
+    false
+}
+
+/// (load, its _TK form)
+fn tkloads() -> [(u64, u64); 8] {
+    [
+        (W.OP_I32_LOAD, W.OP_I32_LOAD_TK), (W.OP_I64_LOAD, W.OP_I64_LOAD_TK),
+        (W.OP_F32_LOAD, W.OP_F32_LOAD_TK), (W.OP_F64_LOAD, W.OP_F64_LOAD_TK),
+        (W.OP_I32_LOAD8_U, W.OP_I32_LOAD8_U_TK), (W.OP_I32_LOAD8_S, W.OP_I32_LOAD8_S_TK),
+        (W.OP_I32_LOAD16_U, W.OP_I32_LOAD16_U_TK), (W.OP_I32_LOAD16_S, W.OP_I32_LOAD16_S_TK),
+    ]
+}
+
+/// A load at offset 0 from local `a`, which the last op set to a local
+/// or home plus a constant (`local.tee`'d address): that I32_ADDK is
+/// replaced, and the word of the fused op (writing `h`) returned.
+fn T.tee_load(t: *T, vop: u64, a: Val, offset: u64, h: u64) -> ?u64 {
+    if a.loc != Loc.Local or offset != 0 { return None; }
+    let Some(last) = t.code.last() else { return None; };
+    let w = t.code.at(last);
+    if W.opcode(w) != W.OP_I32_ADDK or W.RRK_a(w) != a.x { return None; }
+    let src = W.RRK_b(w);
+    let k = W.RRK_k(w) as i64;
+    if h >= 4096 or a.x >= 4096 or src >= 4096 or k < -2048 or k > 2047 { return None; }
+    for row in tkloads() {
+        let (o, tk) = row;
+        if o != vop { continue; }
+        t.code.truncate(last);
+        return Some(W.encode.R4(tk, h as u16, a.x as u16, src as u16, (k as u64 & 0xFFF) as u16));
+    }
+    None
+}
+
 /// The K form of memory op `vop` for an address `a` pending as an AddK
 /// and offset 0.
 fn kmem(vop: u64, a: Val, offset: u64) -> ?u64 {
@@ -874,6 +951,46 @@ fn fusions() -> [(u64, u64, u64, bool); 52] {
     ]
 }
 
+/// (compare op, SEL op, SEL op with the operands swapped)
+fn selects() -> [(u64, u64, u64); 12] {
+    [
+        (W.OP_I32_LT_S, W.OP_SEL_I32_LT_S, W.OP_SEL_I32_GT_S), (W.OP_I32_GT_S, W.OP_SEL_I32_GT_S, W.OP_SEL_I32_LT_S),
+        (W.OP_I32_LE_S, W.OP_SEL_I32_LE_S, W.OP_SEL_I32_GE_S), (W.OP_I32_GE_S, W.OP_SEL_I32_GE_S, W.OP_SEL_I32_LE_S),
+        (W.OP_I32_LT_U, W.OP_SEL_I32_LT_U, W.OP_SEL_I32_GT_U), (W.OP_I32_GT_U, W.OP_SEL_I32_GT_U, W.OP_SEL_I32_LT_U),
+        (W.OP_I32_LE_U, W.OP_SEL_I32_LE_U, W.OP_SEL_I32_GE_U), (W.OP_I32_GE_U, W.OP_SEL_I32_GE_U, W.OP_SEL_I32_LE_U),
+        (W.OP_F64_LT, W.OP_SEL_F64_LT, W.OP_SEL_F64_GT), (W.OP_F64_GT, W.OP_SEL_F64_GT, W.OP_SEL_F64_LT),
+        (W.OP_F64_LE, W.OP_SEL_F64_LE, W.OP_SEL_F64_GE), (W.OP_F64_GE, W.OP_SEL_F64_GE, W.OP_SEL_F64_LE),
+    ]
+}
+
+/// The slot of `v` if reading it emits nothing (a local or a home).
+fn T.slot_of(t: *T, v: Val) -> ?u64 {
+    match v.loc { Local => Some(v.x), Home => Some(t.nlocals + v.s), _ => None }
+}
+
+/// `select(a, b, a < b)` and the like, where the compare is the last op
+/// (writing c's home, at position p + 2): that op is replaced, and the
+/// word of the fused op returned, for the home of position p.
+fn T.min_max(t: *T, a: Val, b: Val, c: Val, p: u64) -> ?u64 {
+    if c.loc != Loc.Home or !t.has_def or t.last_def_slot != t.nlocals + c.s { return None; }
+    let Some(last) = t.code.last() else { return None; };
+    if last != t.last_def_pc { return None; }
+    let Some(ra) = t.slot_of(a) else { return None; };
+    let Some(rb) = t.slot_of(b) else { return None; };
+    let w = t.code.at(last);
+    let op = W.opcode(w);
+    let (x, y) = (W.RRR_b(w), W.RRR_c(w));
+    for row in selects() {
+        let (cop, sel, swapped) = row;
+        if cop != op { continue; }
+        var f: u64 = 0;
+        if x == ra and y == rb { f = sel; } else if x == rb and y == ra { f = swapped; } else { return None; }
+        t.code.truncate(last);
+        return Some(rrr(f, t.home(p), ra, rb));
+    }
+    None
+}
+
 /// Jumps to `l` if `cond` (just popped, at position p) is nonzero
 /// (`when` true) or zero. A comparison emitted just before is fused
 /// into a compare-and-branch followed by its JMP.
@@ -1007,6 +1124,11 @@ fn T.instr(t: *T) -> Result<bool, str> {
                 if let Some(kop) = kmem(vop, a, offset) {
                     let h = t.home(p);
                     t.emit_def(W.encode.RRK(kop, h as u16, addk_slot(a) as u16, addk_k(a) as i16), h);
+                    t.push_home(ty);
+                    return Ok(true);
+                }
+                if let Some(w) = t.tee_load(vop, a, offset, t.home(p)) {
+                    t.emit_def(w, t.home(p));
                     t.push_home(ty);
                     return Ok(true);
                 }
@@ -1243,6 +1365,11 @@ fn T.instr(t: *T) -> Result<bool, str> {
                     t.push_home(ty);
                     return Ok(true);
                 }
+                if let Some(w) = t.min_max(a, b, c, p) {
+                    t.emit_def(w, h);
+                    t.push_home(ty);
+                    return Ok(true);
+                }
                 if h < 4096 and rb < 4096 and rc < 4096 and (a.loc != Loc.Local or a.x < 4096) {
                     let ra = t.reg(a);
                     t.emit_def(W.SELECT4(h as u16, ra as u16, rb as u16, rc as u16), h);
@@ -1275,7 +1402,11 @@ fn T.instr(t: *T) -> Result<bool, str> {
             let v = t.pop(ty)?;
             let p = t.vals.len;
             if !t.dead() {
-                t.flush_local(x);
+                if v.loc == Loc.Home and t.has_def and t.last_def_slot == t.home(p) and t.reads_local(x) {
+                    t.flush_before_last(x);
+                } else {
+                    t.flush_local(x);
+                }
                 let mut_ok = v.loc == Loc.Home and t.has_def and t.last_def_slot == t.home(p);
                 var retargeted = false;
                 if mut_ok {
@@ -1284,7 +1415,7 @@ fn T.instr(t: *T) -> Result<bool, str> {
                             let w = t.code.at(last);
                             // The destination is field `a`: 12 bits in SELECT4's
                             // format, 16 in the others.
-                            if W.opcode(w) == W.OP_SELECT4 {
+                            if W.opcode(w) == W.OP_SELECT4 or is_tk(W.opcode(w)) {
                                 match W.set_R4_a(w, x) {
                                     Some(w2) => t.code.set(last, w2),
                                     None => { t.emit(mov(ty, x, t.home(p))); }

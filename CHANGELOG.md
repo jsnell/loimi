@@ -350,6 +350,14 @@ implementation; `git log` has the details.
   test ([`FRICTION.md`](examples/wasm/FRICTION.md), "Where the time goes
   against wasm3", which also has a per-benchmark profile and what did
   not help).
+- A held-out wasm benchmark set, the 30 PolyBench/C kernels
+  (`bench/wasm/polybench.sh`, with an array check against wasm3): the
+  round above took the interpreter from 0.998 to 0.919 of wasm3's time
+  there. A second round (min/max selects as one op, constant slots for
+  operands of ops without a K form, `local.tee`'d address plus load as
+  one op, one MOV less for a tee over a pending read): 0.893 of wasm3 on
+  PolyBench, 0.872 on the original seven
+  ([`FRICTION.md`](examples/wasm/FRICTION.md), "A held-out set").
 - [`examples/python`](examples/python): a Python 3 subset running 11
   pyperformance programs, on `std.bigint` and `std.dict`.
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run

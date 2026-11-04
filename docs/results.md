@@ -459,6 +459,10 @@ tail-call times were 0.976 of the previous build's by geometric mean
 of wasm3's** (0.90 for the previous build in the same run: best of 7,
 interleaved, on a busier machine, so absolute times are about 10% above
 this table's). Not a full `run_all.py` run.
+A second round (FRICTION.md, "A held-out set"): 0.872 of wasm3 on
+these seven, and 0.893 on a held-out set, the 30 PolyBench/C kernels
+(`bench/wasm/polybench.sh`), where the build before both rounds took
+0.998.
 
 ### wasm-simd
 

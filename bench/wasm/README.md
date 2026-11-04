@@ -16,6 +16,7 @@ committed. Generated directories (`src/`, `install/`, `spec-json/`,
 | WebAssembly/testsuite f3f04866 | commit tarball | spec tests (the commit wabt 1.0.36 itself tests against) |
 | eembc/coremark 1f483d5b | commit tarball | CoreMark |
 | benchmarksgame-team/benchmarksgame 40296663 | commit tarball | Benchmarks Game C programs |
+| PolyBench/C 4.2.1-beta | release tarball (SourceForge) | held-out set: 30 kernels (`polybench.sh`) |
 
 ## Usage
 
@@ -27,6 +28,9 @@ bench/wasm/programs.sh     # benchmarks -> bench/wasm/programs-out/<name>.wasm
 bench/wasm/programs-simd.sh  # nbody, fannkuchredux, spectralnorm with -msimd128 -> <name>_simd.wasm
 bench/wasm/bench.py        # time wasm3 and wasm-interp (best of 3, markdown table)
 bench/wasm/bench.py -n 1 --add-default --interp loimi='path/to/interp {wasm}' nbody
+bench/wasm/polybench.sh   # PolyBench/C kernels -> bench/wasm/polybench-out/ (+ check/ builds)
+bench/wasm/polybench.sh --check path/to/interp   # arrays of SMALL runs vs wasm3
+bench/wasm/bench.py --dir bench/wasm/polybench-out --interp loimi='path/to/interp {wasm}'
 ```
 
 `spec-json/STATUS` lists every top-level `.wast` and how it converted
@@ -73,3 +77,16 @@ timing lines when comparing outputs.
 
 Imports (all `wasi_snapshot_preview1`): `fd_write`, `fd_seek`, `fd_close`,
 `fd_fdstat_get`, `proc_exit`, plus `clock_time_get` for CoreMark.
+
+## Held-out set: PolyBench/C
+
+The interpreter's optimizations were measured on the seven programs
+above, so `polybench.sh` builds a second, independent set: the 30
+PolyBench/C 4.2.1 kernels (linear algebra, solvers, stencils, data
+mining, dynamic programming), unmodified, with the same toolchain and
+flags, problem size fixed per kernel (`MEDIUM`, `LARGE` or `EXTRALARGE`:
+the largest that runs in at most about 2 s under wasm3; 0.05 to 1.7 s).
+The timed builds print nothing; `check/NAME.wasm` are `SMALL_DATASET`
+builds with `POLYBENCH_DUMP_ARRAYS`, whose stderr `--check` compares
+with wasm3's. Results are in `examples/wasm/FRICTION.md`.
+

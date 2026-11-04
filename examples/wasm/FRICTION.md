@@ -483,6 +483,111 @@ in one array would save a dependent load. An address that is
 specific to these seven programs; all four changes are about how clang
 compiles C, not about one program.
 
+### A held-out set (PolyBench/C), and round two (2026-11-04)
+
+Every change above was measured on the same seven programs, so
+`bench/wasm/polybench.sh` adds a second set the interpreter was never
+tuned on: the 30 PolyBench/C 4.2.1 kernels, unmodified, built like the
+others (MVP wasm32-wasi, clang 19 `-O2`), each at the largest standard
+size that runs in at most about 2 s under wasm3. `polybench.sh --check`
+compares the arrays of `SMALL_DATASET` builds with wasm3's (all 30 match).
+
+**Did round one generalize?** Yes, more than on the set it was tuned
+on (best of 5, interleaved; round one is the section above): the
+interpreter before it took 0.998 of wasm3's time on PolyBench, after it
+0.919 (0.92 of its own time; 0.976 on the tuning set). Slowest against
+wasm3 were floyd-warshall (1.14, a min loop), gramschmidt (1.12),
+gesummv and bicg (1.07: a constant divisor in the initialization loop).
+
+**Round two.** Profiles of the PolyBench kernels (`--vm-stats` over both
+sets) pointed at four more translator changes:
+
+1. *Min and max*: `select(a, b, a < b)` (C's `x < y ? x : y`) after the
+   compare is one op, `SEL_I32_LT_S d, a, b` and so on (signed, unsigned
+   and f64 orders; the swapped compare too), the same expression as the
+   select, so NaNs behave as they did. floyd-warshall 0.86, nussinov 0.80.
+2. *Constant slots for operands without a K form*: a small constant in a
+   loop that a division, remainder, rotation, store or select takes next
+   gets a constant slot (`i % 4000` was `CONST32; I32_REM_U` on every
+   iteration). gesummv, atax, bicg 0.93–0.96.
+3. *`local.tee` of a loaded value over a pending read of the same
+   local*: the flush of that read goes before the op instead of after,
+   so the op still writes the local (one MOV instead of two;
+   gramschmidt 0.85).
+4. *A `local.tee`'d address*: `I32_ADDK q, p, 4; I32_LOAD d, q` is
+   `I32_LOAD_TK d, q, p, 4` (writes q and loads from it; 12-bit fields).
+   fannkuchredux 0.94–0.97. A fault in its first version (the flush of 3
+   moved before an op that writes a second slot) was caught by the
+   PolyBench check, not by the spec tests; `tests/fusions.wat` now covers
+   it and the others.
+
+**Results** (best of 7, interleaved, `--align-functions=64`, tail calls;
+load average 4–5 from other agents, so ±3–4% per benchmark):
+
+| set | wasm3 | before round one | round one | round two | round two / round one |
+|---|---:|---:|---:|---:|---:|
+| tuning set (7), geomean | 1.921 | | 1.683 (0.876) | 1.674 (0.872) | 0.995 |
+| PolyBench (30), geomean | 0.214 | 0.214 (0.998) | 0.197 (0.919) | 0.191 (0.893) | 0.97 |
+
+(Ratios to wasm3 in parentheses.) On the tuning set round two is within
+noise (fannkuchredux 0.96, nbody 0.96, binarytrees 1.03, the others ±1%);
+on PolyBench 21 of 30 kernels take less time than after round
+one. Per kernel, wasm3 / round one / round two (seconds):
+
+| kernel | wasm3 | round one | round two | round two / wasm3 |
+|---|---:|---:|---:|---:|
+| 2mm | 0.134 | 0.123 | 0.129 | 0.97 |
+| 3mm | 0.208 | 0.207 | 0.204 | 0.98 |
+| adi | 0.272 | 0.236 | 0.235 | 0.86 |
+| atax | 0.111 | 0.109 | 0.106 | 0.96 |
+| bicg | 0.111 | 0.119 | 0.114 | 1.03 |
+| cholesky | 0.804 | 0.723 | 0.736 | 0.92 |
+| correlation | 0.071 | 0.065 | 0.066 | 0.93 |
+| covariance | 0.067 | 0.066 | 0.067 | 1.01 |
+| deriche | 1.246 | 0.956 | 0.899 | 0.72 |
+| doitgen | 0.064 | 0.055 | 0.055 | 0.87 |
+| durbin | 0.162 | 0.149 | 0.146 | 0.91 |
+| fdtd-2d | 0.204 | 0.178 | 0.177 | 0.87 |
+| floyd-warshall | 1.600 | 1.823 | 1.530 | 0.96 |
+| gemm | 0.113 | 0.107 | 0.109 | 0.96 |
+| gemver | 0.903 | 0.763 | 0.750 | 0.83 |
+| gesummv | 0.289 | 0.310 | 0.291 | 1.01 |
+| gramschmidt | 0.111 | 0.125 | 0.112 | 1.01 |
+| heat-3d | 0.315 | 0.263 | 0.252 | 0.80 |
+| jacobi-1d | 0.094 | 0.088 | 0.080 | 0.85 |
+| jacobi-2d | 0.228 | 0.170 | 0.177 | 0.78 |
+| lu | 0.921 | 0.798 | 0.828 | 0.90 |
+| ludcmp | 0.918 | 0.813 | 0.770 | 0.84 |
+| mvt | 0.577 | 0.508 | 0.502 | 0.87 |
+| nussinov | 0.283 | 0.247 | 0.207 | 0.73 |
+| seidel-2d | 0.387 | 0.329 | 0.323 | 0.83 |
+| symm | 0.094 | 0.081 | 0.081 | 0.86 |
+| syr2k | 0.114 | 0.115 | 0.113 | 0.99 |
+| syrk | 0.066 | 0.061 | 0.058 | 0.88 |
+| trisolv | 0.134 | 0.126 | 0.125 | 0.93 |
+| trmm | 0.051 | 0.045 | 0.044 | 0.86 |
+
+**Tried and dropped in round two** (each measured on both sets):
+
+- *Merging adjacent MOVs into one `MOV2`* (12-bit fields; 3,700 pairs
+  in the 37 programs): with it, 0.997 (tuning set) and 0.998 (PolyBench) of the time without it, noise on
+  both. The hot MOVs are loop-carried rotations (seidel-2d's three
+  values per row, mandelbrot's `zi`) and call arguments, which no
+  coalescing over liveness removes either: the values are live at once.
+  So local-to-local MOV elimination by liveness was not built.
+- *Globals in one array per instance* (`GLOBAL_GET_L`: one dependent
+  load less): no PolyBench kernel has a global in a loop, and
+  binarytrees, the one program with a hot global (the stack pointer,
+  4% of its time), measured 1.04–1.08 of the time without it in two
+  runs. Not kept.
+- `CONST32` into locals and as call arguments (binarytrees' 12% of
+  dispatches): these are real assignments and argument moves, one op
+  either way; only the in-loop operands above were worth a slot.
+
+**Still slow against wasm3**: bicg, covariance, gesummv and gramschmidt
+at about 1.0 (short runs, 0.07–0.3 s, so start-up and noise weigh
+more), and fasta (0.97).
+
 ## Summary
 
 | File | Lines | What |
