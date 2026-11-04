@@ -1949,8 +1949,8 @@ pub fn shadow_top() -> *ShadowFrame { loimi_shadow_top() }
 // function, call site and the frame's roots) and the frame's depth on
 // the shadow stack; or the object or `gc_mark` call. The compiler also
 // fills traced locals' slots with 0x01 bytes where they are unassigned
-// (on entry, and when their scope ends), and the first check of a
-// non-generational heap installs a sweeper that fills the objects about
+// (on entry, and when their scope ends), and the first check of a heap
+// installs a sweeper that fills the objects about
 // to be freed with 0x01 bytes, so that a use after free reads garbage
 // instead of the old values. These functions are emitted only in that
 // mode (src/codegen.rs, `is_lazy`), so other builds' IR is unchanged.
@@ -2094,10 +2094,8 @@ pub fn rootck_hex(x: u64) {
     write(2, &buf[0], 16);
 }
 
-/// Install `rootck_poison` as a sweeper of `h` (once; not in a
-/// generational heap, whose unmarked objects are not all dead).
+/// Install `rootck_poison` as a sweeper of `h` (once).
 pub fn rootck_install(h: *Heap) {
-    if h.gen { return; }
     let tag = h.rs as *u8;
     for i in 0..h.sweepers.len {
         if h.sweepers.ptr[i].data == tag { return; }
@@ -2105,9 +2103,11 @@ pub fn rootck_install(h: *Heap) {
     h.add_sweeper(tag, rootck_poison);
 }
 
-/// Fill the objects this collection frees with 0x01 bytes.
+/// Fill the objects this collection frees with 0x01 bytes. Also in a
+/// minor collection: every small survivor has its mark bits (old objects
+/// keep theirs), so a clear bit is free memory, and the large objects
+/// freed are those `is_marked` rejects (old ones count as marked).
 pub fn rootck_poison(h: *Heap, data: *u8) {
-    if h.gen { return; }
     // Forget the starts of the dead objects, and poison them.
     for ci in 0..h.chunks.len {
         if ci * BM_WORDS >= h.starts.len { break; }
@@ -2119,6 +2119,6 @@ pub fn rootck_poison(h: *Heap, data: *u8) {
     poison_free(h);
     for i in 0..h.large.len {
         let hd = h.large.ptr[i];
-        if hd.mark != h.epoch { mem.memset(hd as *u8 + HEADER, 1, hd.size as u64 - HEADER); }
+        if !h.is_marked(hd as *u8 + HEADER) { mem.memset(hd as *u8 + HEADER, 1, hd.size as u64 - HEADER); }
     }
 }

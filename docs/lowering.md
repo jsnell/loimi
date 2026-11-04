@@ -947,10 +947,12 @@ every reference that generated code hands it before reading a header:
   shows 0x0101010101010101, a non-canonical address that no heap holds.
 - Freed objects are made recognizable: `new` calls `std.gc.rootck_alloc`,
   which registers (once per heap) a sweeper that fills every object
-  about to be freed with 0x01 bytes (not in a generational heap, where
-  an unmarked object may be old and alive in a minor collection). A
-  reference that outlived its object then reads 0x01 bytes, and a
-  traced field read from it is reported as above.
+  about to be freed with 0x01 bytes and forgets where they started, in
+  both heap modes (in a minor collection old objects count as marked:
+  a small object's granules keep their mark bits, `is_marked` accepts a
+  large one). A reference that outlived its object is then reported
+  when it is marked ("a freed object"), and a traced field read from it
+  reads 0x01 bytes, reported as above.
 
 The `rootck_*` functions of `std.gc` and the externs they use are
 emitted only when this mode references them (`is_lazy` in

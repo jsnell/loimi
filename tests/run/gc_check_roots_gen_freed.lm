@@ -1,0 +1,31 @@
+// `--gc-check-roots` in a generational heap: a root that still points to
+// an object a minor collection freed is reported. (The start bitmap was
+// pruned, and freed memory filled with 0x01, only in non-generational
+// heaps: the freed object passed the check and was marked again.)
+// args: --gc-check-roots
+import std.io;
+import std.gc;
+
+object Node { v: i64 }
+
+fn node(h: *gc.Heap, v: i64) -> Gc<Node> { new(h, Node { v: v }) }
+
+/// The address of an object nothing references.
+fn dead(h: *gc.Heap) -> u64 { node(h, 2) as u64 }
+
+fn main() uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    h.set_generational(true);
+    let keep = node(h, 1);
+    gc.collect(h);              // major: `keep` is old
+    let a = dead(h);
+    gc.collect(h);              // minor: frees the object at `a`
+    io.println("collected");
+    let stale: Gc<Node> = unsafe { a as Gc<Node> };
+    gc.collect(h);              // marks `stale`: reported
+    io.print_int(stale.v + keep.v); io.println("");
+}
+// expect: collected
+// expect-exit: 134
+// expect-stderr: gc check-roots: bad reference

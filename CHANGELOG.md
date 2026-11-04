@@ -255,6 +255,9 @@ implementation; `git log` has the details.
   other threads' frames) marked another heap's objects in a major
   collection, through the new prefetch ring, which bypassed its
   this-heap-only check (`tests/run/gc_shadow_stack_other_heap.lm`);
+  `--gc-check-roots` did not report a root to an object a generational
+  heap had freed (the start bitmap was pruned only in non-generational
+  heaps; `tests/run/gc_check_roots_gen_freed.lm`);
   `tests/run/gc_torture.lm` is a random mutator over every size class,
   weak references, ephemerons and free hooks in six heap configurations.
 
