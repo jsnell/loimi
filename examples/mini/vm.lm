@@ -683,6 +683,7 @@ pub vm Mini {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); next }
         }
         if let (T(tab), S(s)) = (t, key) and value.hash_set_existing(tab, key, s.hash, v) { next }
         if let T(tab) = t {
@@ -699,6 +700,7 @@ pub vm Mini {
         if let (T(tab), Int(_)) = (t, key) {
             let u = value.int_index(key);
             if u < tab.asize { tab.aptr[u] = v; value.tbar(tab); next }
+            if u == tab.asize and value.can_append(tab, v) { value.append_in_place(tab, v); next }
         }
         if let T(tab) = t {
             if key == V.Nil { cold { raise error_msg(ctx, "table index is nil") } }

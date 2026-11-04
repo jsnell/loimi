@@ -477,6 +477,22 @@ fn array_grow(h: *gc.Heap, t: Gc<Table>, n: u64) {
     t.acap = n;
 }
 
+/// Whether t[asize+1] = v can be stored by `append_in_place`: room in the
+/// array part, no hash part entries (so none for asize+2.. to move
+/// over), and a value that is not nil.
+#[inline]
+pub fn can_append(t: Gc<Table>, v: V) -> bool {
+    t.asize < t.acap and t.hused == 0 and v != V.Nil
+}
+
+/// t[asize+1] = v when `can_append`: no allocation, so no GC check.
+#[inline]
+pub fn append_in_place(t: Gc<Table>, v: V) {
+    t.aptr[t.asize] = v;
+    tbar(t);
+    t.asize += 1;
+}
+
 /// Append at asize+1, then move the following integer keys over from the hash.
 fn array_append(h: *gc.Heap, t: Gc<Table>, v: V) {
     var v = v;
