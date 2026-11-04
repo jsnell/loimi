@@ -577,10 +577,10 @@ best of 3 interleaved runs of 7 batches):
 | square (both operands the same limbs: `mul(x, x)`, `pow`, and the algorithms below) | schoolbook with each cross product once, two rows a pass (`addmul_2` after the rows' corner product), then the doubling and the diagonal squares in one pass; 5-19% faster than Comba | |
 | | Karatsuba squaring (2 a0 a1 = a0² + a1² − (a1 − a0)²) | `KARATSUBA_SQR` = 40 |
 | | Toom-3 squaring | `TOOM3_SQR` = 500 |
-| division | Knuth's algorithm D, each quotient limb estimated by Möller and Granlund's division by a precomputed reciprocal (`div_wide` compiles to a `__udivti3` libcall, 2-3x slower) | |
+| division | schoolbook, each quotient limb from the remainder's top three limbs by the divisor's top two (Möller and Granlund's 3/2 division by a precomputed reciprocal, GMP's `mpn_sbpi1_div_qr`): exact but for a rare borrow, so no correction loop, and the row subtracted (`submul_1`, four limbs a step) is two limbs shorter than the divisor; Knuth's algorithm D for two-limb divisors | |
 | | recursive divide and conquer (Burnikel-Ziegler, with GMP's `mpn_dcpi1_div_qr` structure: the quotient's high half from the top halves, recursively, the product of that half by the divisor's low half subtracted, at most a few corrections, then the low half; a long quotient in blocks of the divisor's length): about two products of the same size | `DIV_DC` = 40 (divisor and quotient) |
-| one-limb divisor | Möller-Granlund, one reciprocal for the whole number | |
-| square root | Zimmermann's Karatsuba square root (GMP's `mpn_dc_sqrtrem`): the root and remainder of the top half recursively, then one division of about n/2 by n/4 limbs and one square of n/4, one correction; on one limb a floating-point estimate and a Newton step | |
+| one-limb divisor | Möller-Granlund, one reciprocal for the whole number (the reciprocal from a 256-entry table and Newton steps, GMP's `invert_limb`: multiplications only; `div_wide` is a `div` instruction, 40-90 cycles on Skylake) | |
+| square root | Zimmermann's Karatsuba square root (GMP's `mpn_dc_sqrtrem`): the root and remainder of the top half recursively, then one division of about n/2 by n/4 limbs and one square of n/4, one correction; on one limb a floating-point estimate and a Newton step (in floating point, on the exact 128-bit a - s²: no division). `isqrt` needs only the root: at the top level the correction's sign comes from the top limbs of u and q (all but about 2^-62 of the time) instead of the square and the remainder | |
 | power | left-to-right binary (squarings) | |
 | formatting, radix 2^k | bit extraction | |
 | formatting, other radixes | dividing out the largest power of the radix that fits a limb, a limb's worth of digits at a time (constant division for radix 10) | |
@@ -713,6 +713,29 @@ assembly uses `mulx` and the two carry chains of `adcx`/`adox`, which
 need BMI2 and ADX, beyond the baseline x86-64 that Loimi targets). Quotients of up to 16 limbs and decimal formatting are
 unchanged: their time is the quotient-limb estimates and the per-call
 work, not carries.
+
+Division, square root and the GC layer, again (2026-11-04: the 3/2
+quotient limbs, the table reciprocal, `submul_1` four limbs a step, the
+root without the remainder, one allocation per division and per root,
+`gc_bin` inlined): ns per operation through the `*_into` functions,
+before → after, GMP 6.3's `mpz` functions in parentheses (`mpz_tdiv_qr`,
+`mpz_sqrt`, `mpz_get_str`; best of 5 batches, best of 5 interleaved
+runs):
+
+| limbs | quotient 2n by n | isqrt of 2n | `write` decimal of n |
+|---|---|---|---|
+| 4 | 127 → 99 (90) | 295 → 183 (116) | 374 → 298 (182) |
+| 8 | 209 → 166 (128) | 490 → 360 (247) | 785 → 698 (399) |
+| 13 | 368 → 317 (251) | 727 → 528 (323) | 1341 → 1182 (751) |
+| 26 | 1142 → 952 (800) | 1316 → 957 (574) | 3397 → 3050 (1862) |
+| 52 | 3593 → 3089 (2594) | 3047 → 2046 (1312) | 7846 → 6837 (4382) |
+| 104 | 10955 → 9976 (7906) | 8187 → 5583 (3331) | 19436 → 17449 (10499) |
+
+Products and squares are unchanged (1.2-1.45x GMP's). In the Scheme
+example, pi took 0.84 of its time and chudnovsky 0.89 (mostly
+one-limb operands: the GC layer's per-call work); against Guile 3's VM
+(GMP), pi 1.31x -> 1.10x wall and chudnovsky 0.84x -> 0.74x (best of 9,
+interleaved, on a shared machine).
 
 ### Design (not built)
 

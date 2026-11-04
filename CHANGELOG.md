@@ -343,7 +343,10 @@ implementation; `git log` has the details.
   (they looped forever). Python benchmarks: geomean within ±0.5%,
   `richards` consistently about 1% slower.
 - **`std.bigint`**: arbitrary-precision integers with Python's semantics
-  ([stdlib.md](docs/stdlib.md#stdbigint)).
+  ([stdlib.md](docs/stdlib.md#stdbigint)). Schoolbook division by 3/2
+  quotient limbs (GMP's `sbpi1_div_qr`), reciprocals by table and Newton
+  steps instead of `div`, `isqrt` without the top-level remainder:
+  quotients 1.1-1.3x and square roots 1.4-1.6x faster at 4-100 limbs.
 - **`std.map.OrderedMap`, `std.dict.Dict`, `std.dict.KeyDict`**:
   insertion-ordered maps in CPython's compact layout
   ([stdlib.md](docs/stdlib.md#ordered-maps-maporderedmap-and-dictdict)).
