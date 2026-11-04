@@ -1538,6 +1538,12 @@ pub vm JS {
     // Overlaps another super, but runs where no ADD_F follows: 14% of nbody's ops.
     #[allow(super_overlap)]
     #[forward] super MUL_F_MUL_F = MUL_F; MUL_F;
+    // Loop tails against constants (JLTK/JLEK) and `if (a[i])`; supers
+    // for returns, constructors' adds and POLY calls measured within
+    // noise and were not kept.
+    #[forward] super ADDI_JLTK = ADDI; JLTK;
+    #[forward] super ADDI_JLEK = ADDI; JLEK;
+    #[forward] super GETINDEX_TEST = GETINDEX; TEST;
 
     entry run(c: *Ctx, cl: Gc<Fn>) -> V uses gc {
         ctx = c;
