@@ -1914,6 +1914,11 @@ fn release_hooks(h: *Heap) {
 pub fn mark_shadow_stack(h: *Heap, top: *ShadowFrame) {
     let saved = h.checks;
     h.checks = OWN_ONLY;
+    // Mark at once: a deferred mark (`Heap.ring`, in the scanners of a
+    // major collection) would be made after `checks` is restored, and
+    // mark another heap's object.
+    let deferred = h.deferred;
+    h.deferred = false;
     var fr = top;
     while (fr as u64) != 0 {
         let entries = (fr as *u8 + 16) as *ShadowEntry;
@@ -1924,6 +1929,7 @@ pub fn mark_shadow_stack(h: *Heap, top: *ShadowFrame) {
         fr = fr.prev;
     }
     h.checks = saved;
+    h.deferred = deferred;
 }
 
 /// This thread's shadow-stack top: the innermost frame of GC roots that

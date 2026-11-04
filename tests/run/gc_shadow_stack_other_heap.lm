@@ -1,0 +1,31 @@
+// `gc.mark_shadow_stack` (std.gil's scanner of the other threads' saved
+// frames) marks only the collected heap's objects, also in a major
+// collection, where `mark_ptr` defers marks through the prefetch ring.
+// Here a scanner of heap `a` walks this thread's own frames, which hold
+// an object of heap `b`: marking it with `a`'s epoch (and setting `b`'s
+// mark bits) made `b`'s next major collection take it for marked, skip
+// its children and free them (verify mode fills freed memory with 0x01).
+import std.io;
+import std.gc;
+
+object Leaf { v: i64 }
+object Box { leaf: Gc<Leaf> }
+
+fn make(b: *gc.Heap) -> Gc<Box> { new(b, Box { leaf: new(b, Leaf { v: 42 }) }) }
+
+fn scan_frames(h: *gc.Heap, data: *u8) { gc.mark_shadow_stack(h, gc.shadow_top()); }
+
+fn main() uses gc {
+    var a = gc.Heap.new();
+    var b = gc.Heap.new();
+    b.set_verify(true);
+    a.add_scanner(0 as *u8, scan_frames);
+    let x = make(&b);
+    gc.collect(&a);
+    gc.collect(&b);
+    for i in 0..1000 { new(&b, Leaf { v: 7 }); }
+    io.print_int(x.leaf.v); io.println("");
+    a.free();
+    b.free();
+}
+// expect: 42

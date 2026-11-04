@@ -1,0 +1,138 @@
+// A random mutator against std.gc's bitmap allocator, in six heap
+// configurations (non-generational and generational; stress, verify, a
+// small nursery, a tiny budget). Objects of every size class and large
+// ones are linked into a graph held by a root array; links through
+// fields and trailing arrays; weak references, an ephemeron table and
+// free hooks on some objects. Every object carries a payload derived from
+// its id, checked on every visit and by its free hook (which must run
+// before its memory is reused), so an object freed while reachable, or
+// memory handed out twice, shows up as a bad payload.
+import std.io;
+import std.gc;
+
+object Node { id: u64, a: ?Gc<Node>, b: ?Gc<Node>, data: [u64] }
+object Roots { slots: [?Gc<Node>] }
+object Weaks { ws: [?Gc<gc.Weak<Node>>] }
+
+const NROOT: u64 = 64;
+const NWEAK: u64 = 16;
+
+var seed: u64 = 1;
+var bad: u64 = 0;
+var hooks_run: u64 = 0;
+var next_id: u64 = 1;
+
+fn rnd(n: u64) -> u64 {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ (seed >> 7);
+    seed = seed ^ (seed << 17);
+    seed % n
+}
+
+fn word(id: u64, i: u64) -> u64 { id *% 0x9E3779B97F4A7C15 +% i }
+
+fn check(n: Gc<Node>) {
+    if n.id == 0 or n.id >= next_id { bad += 1; return; }
+    for i in 0..n.data.len {
+        if n.data[i] != word(n.id, i) { bad += 1; return; }
+    }
+}
+
+fn on_free(n: Gc<Node>) {
+    hooks_run += 1;
+    check(n);
+}
+
+/// Sizes over every small class (16 * 1..32 bytes with the header) and
+/// some large objects.
+fn make(h: *gc.Heap) -> Gc<Node> {
+    let len = if rnd(20) == 0 { 60 + rnd(200) } else { rnd(60) };
+    let id = next_id;
+    next_id += 1;
+    let n = new(h, Node { id: id, a: None, b: None }, len);
+    for i in 0..len { n.data[i] = word(id, i); }
+    if rnd(16) == 0 { h.on_free_gc(n, on_free); }
+    n
+}
+
+/// Check what is reachable from `n`, to depth `d`.
+fn walk(n: ?Gc<Node>, d: u64) {
+    if let Some(x) = n {
+        check(x);
+        if d > 0 {
+            walk(x.a, d - 1);
+            walk(x.b, d - 1);
+        }
+    }
+}
+
+fn pick(r: Gc<Roots>) -> ?Gc<Node> { r.slots[rnd(NROOT)] }
+
+fn step(h: *gc.Heap, r: Gc<Roots>, w: Gc<Weaks>, t: *gc.Ephemerons<Node, Gc<Node>>) uses gc {
+    let k = rnd(100);
+    if k < 35 {
+        r.slots[rnd(NROOT)] = Some(make(h));
+    } else if k < 55 {
+        if let Some(x) = pick(r) { x.a = pick(r); }
+    } else if k < 70 {
+        if let Some(x) = pick(r) { x.b = Some(make(h)); }
+    } else if k < 78 {
+        let i = rnd(NROOT);
+        if let Some(x) = r.slots[i] { r.slots[i] = if rnd(2) == 0 { x.a } else { x.b }; }
+    } else if k < 82 {
+        r.slots[rnd(NROOT)] = None;
+    } else if k < 87 {
+        if let Some(x) = pick(r) { w.ws[rnd(NWEAK)] = Some(h.new_weak(x)); }
+    } else if k < 92 {
+        if let Some(x) = pick(r) { t.set(x, make(h)); }
+    } else if k < 93 {
+        gc.collect(h);
+    }
+    gc.maybe_collect(h);
+}
+
+fn verify(r: Gc<Roots>, w: Gc<Weaks>, t: *gc.Ephemerons<Node, Gc<Node>>) {
+    for i in 0..NROOT {
+        walk(r.slots[i], 4);
+        if let Some(x) = r.slots[i] {
+            if let Some(v) = t.get(x) { walk(Some(v), 2); }
+        }
+    }
+    for i in 0..NWEAK {
+        if let Some(wr) = w.ws[i] {
+            if let Some(x) = wr.get() { check(x); }
+        }
+    }
+}
+
+fn run(mode: u64, steps: u64) uses gc {
+    var heap = gc.Heap.new();
+    let h = &heap;
+    if mode >= 2 { h.set_generational(true); }
+    if mode == 1 or mode == 3 { h.set_stress(true); }
+    if mode == 3 or mode == 5 { h.set_verify(true); }
+    if mode == 4 { h.set_nursery(32768); }
+    if mode == 5 { h.set_growth(10, 65536); }
+    seed = 0x2545F4914F6CDD1D +% mode;
+    let r: Gc<Roots> = new(h, Roots {}, NROOT);
+    let w: Gc<Weaks> = new(h, Weaks {}, NWEAK);
+    let t: *gc.Ephemerons<Node, Gc<Node>> = gc.Ephemerons.new(h);
+    for s in 0..steps {
+        step(h, r, w, t);
+        if s % 512 == 0 { verify(r, w, t); }
+    }
+    verify(r, w, t);
+    t.free();
+    heap.free();
+}
+
+fn main() -> i32 uses gc {
+    for mode: u64 in 0..6 {
+        run(mode, if mode == 1 or mode == 3 { 6000 } else { 200000 });
+    }
+    io.print("bad "); io.print_int(bad as i64); io.println("");
+    io.print_bool(hooks_run > 1000); io.println("");
+    0
+}
+// expect: bad 0
+// expect: true

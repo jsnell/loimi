@@ -251,6 +251,12 @@ implementation; `git log` has the details.
   ([results.md](docs/results.md#gc-mark-bitmaps-instead-of-sweeping-2026-11-04)).
   Verify mode fills free memory with 0x01 bytes so that dangling
   references are still reported; `--gc-check-roots` keeps a start bitmap.
+  Fixed after review: `gc.mark_shadow_stack` (std.gil's scan of the
+  other threads' frames) marked another heap's objects in a major
+  collection, through the new prefetch ring, which bypassed its
+  this-heap-only check (`tests/run/gc_shadow_stack_other_heap.lm`);
+  `tests/run/gc_torture.lm` is a random mutator over every size class,
+  weak references, ephemerons and free hooks in six heap configurations.
 
 - **GC objects are checked in every module**
   ([design/safety.md §8](docs/design/safety.md),
