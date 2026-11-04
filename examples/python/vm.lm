@@ -382,7 +382,7 @@ pub vm Py {
         cold {
             let fl = fp.flags;
             if (fl & F_GEN) != 0 {
-                if let Obj(g) = fp.gen { g.m = GEN_DONE; }
+                if let Obj(g) = fp.gen { g.m = GEN_DONE; g.b = v; } // the return value, for StopIteration and `yield from`
                 if (fl & F_BASE) != 0 { ctx.gen_done = true; exit Ok(v) }
                 let r = fp.alt_pc;
                 fp = fp - 1;
@@ -1215,6 +1215,13 @@ pub vm Py {
         next
     }
     op NOP() : ABC { next }
+    /// R[dst] = the return value of generator R[it] (None for other
+    /// iterators), after `yield from` exhausted it.
+    op GENRESULT(dst: reg, it: reg) : ABC {
+        if let Obj(g) = it and g.kind == K_GEN { dst = g.b; g.b = Nil; next }
+        dst = Nil;
+        next
+    }
 
     entry call(c: *Ctx, at: *Frame, code: *u32) -> Result<Value, Value> uses reenter {
         ctx = c;
@@ -1313,6 +1320,19 @@ pub fn invoke_at(c: *Ctx, top: *Value, n: u64, kw: Value) -> Result<Value, Value
 /// Resume generator `g` from host code: Ok(Some(v)) for a yielded value,
 /// Ok(None) when it finished.
 pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses reenter {
+    gen_resume(c, g, send, Value.Nil)
+}
+
+/// gen.throw(e) / gen.close(): raise `e` in the generator where it is
+/// suspended (its handlers run), or right away if it has not started
+/// or has finished.
+pub fn gen_throw(c: *Ctx, g: Gc<Box>, e: Value) -> Result<?Value, Value> uses reenter {
+    if g.m == GEN_RUNNING { return Err(ops.exc(c, builtins.E_VALUE, "generator already executing")); }
+    if g.m != GEN_SUSPENDED { g.m = GEN_DONE; return Err(e); }
+    gen_resume(c, g, Value.Nil, e)
+}
+
+fn gen_resume(c: *Ctx, g: Gc<Box>, send: Value, throw: Value) -> Result<?Value, Value> uses reenter {
     builtins.count(builtins.CNT_GENNEXT);
     if g.m == GEN_DONE { return Ok(None); }
     if g.m == GEN_RUNNING { return Err(ops.exc(c, builtins.E_VALUE, "generator already executing")); }
@@ -1327,7 +1347,22 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
     if need > c.stack_end { return Err(ops.exc(c, builtins.E_RECURSION, "maximum recursion depth exceeded")); }
     if need > c.hw { c.hw = need; }
     for i in 0..p.nregs as u64 { win[i] = g.extra[i]; }
-    if g.m == GEN_SUSPENDED { win[g.s as u64] = send; }
+    var at = g.n as u64;
+    if throw != Value.Nil {
+        // The handler around the YIELD (the word before the resume point).
+        let off = (g.n - 1) as u32;
+        var found = false;
+        for i in 0..p.handlers.len {
+            let h = p.handlers[i];
+            if off >= h.start and off < h.end {
+                win[h.reg as u64] = throw;
+                at = h.target as u64;
+                found = true;
+                break;
+            }
+        }
+        if !found { g.m = GEN_DONE; return Err(throw); }
+    } else if g.m == GEN_SUSPENDED { win[g.s as u64] = send; }
     g.m = GEN_RUNNING;
     let nf = caller + 1;
     nf.func = g.a;
@@ -1340,7 +1375,7 @@ pub fn gen_next(c: *Ctx, g: Gc<Box>, send: Value) -> Result<?Value, Value> uses 
     nf.flags = F_GEN | F_BASE;
     c.gen_done = false;
     c.vm_depth += 1;
-    let r = Py.call(c, nf, p.code.start() + g.n as u64);
+    let r = Py.call(c, nf, p.code.start() + at);
     c.vm_depth -= 1; #[cfg(debug)] debugger.left(c, nf);
     c.fp = caller;
     match r {

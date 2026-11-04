@@ -1,0 +1,9 @@
+m1 EXC RuntimeError dictionary changed size during iteration
+m2 EXC RuntimeError dictionary keys changed during iteration
+m3 EXC RuntimeError dictionary changed size during iteration
+m4 EXC RuntimeError Set changed size during iteration
+m5 {1: 5, 2: 10}
+m6 EXC ValueError list modified during sort
+m7 ([1, 2, 3], [0, 0, 0])
+first dictionary changed size during iteration
+m8 EXC RuntimeError dictionary changed size during iteration

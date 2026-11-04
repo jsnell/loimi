@@ -13,11 +13,12 @@ pub struct P {
     err: ?str,
     err_line: u32,
     genexps: u64,
+    nfuncs: u64,  // lambdas and generator expressions parsed so far (comprehensions check it)
     depth: u64,  // nesting of test/not_test/factor/statement: bounds the parser's recursion
 }
 
 pub fn P.new(toks: []Token, arena: *mem.Arena) -> P {
-    P { toks: toks, i: 0, arena: arena, err: None, err_line: 0, genexps: 0, depth: 0 }
+    P { toks: toks, i: 0, arena: arena, err: None, err_line: 0, genexps: 0, nfuncs: 0, depth: 0 }
 }
 
 fn P.ok(p: *P) -> bool { p.err.is_none() }
@@ -491,6 +492,7 @@ fn P.test_nocond(p: *P) -> *Expr {
 
 fn P.lambda(p: *P) -> *Expr {
     let line = p.line();
+    p.nfuncs += 1;
     p.bump();
     let ps = p.params(T.Colon);
     p.expect(T.Colon, "expected ':'");
@@ -729,11 +731,41 @@ fn P.comps(p: *P) -> *mem.Vec<Comp> {
 }
 
 fn P.genexp(p: *P, elt: *Expr, line: u32) -> *Expr {
+    p.nfuncs += 1;
     let cs = p.comps();
+    p.genexp_of(elt, cs, line)
+}
+
+fn P.genexp_of(p: *P, elt: *Expr, cs: *mem.Vec<Comp>, line: u32) -> *Expr {
     let first_iter = cs.at(0).iter;
     let f = new(p.arena, FuncDef { name: "<genexpr>", params: new(p.arena, mem.Vec.new()), body: p.body(),
                                    decorators: p.exprs(), is_lambda: false, genexp: Some(elt), gencomps: Some(cs), line: line });
     p.mk(E.GenExp(f, first_iter), line)
+}
+
+/// A list, set or dict comprehension. Comprehensions compile inline, with
+/// their variables in registers; one with a lambda or generator
+/// expression inside, which may capture those variables, becomes
+/// `list(<genexpr>)` (`set`, `dict` of pairs) so they live in the
+/// generator's frame, as in CPython's comprehension function. The names
+/// `.list`, `.set`, `.dict` are the builtins (a program cannot shadow them).
+fn P.comp(p: *P, kind: str, elt: *Expr, val: ?*Expr, cs: *mem.Vec<Comp>, line: u32, nfuncs0: u64) -> *Expr {
+    if p.nfuncs == nfuncs0 {
+        if let Some(v) = val { return p.mk(E.DictComp(elt, v, cs), line); }
+        if kind.eq(".set") { return p.mk(E.SetComp(elt, cs), line); }
+        return p.mk(E.ListComp(elt, cs), line);
+    }
+    var x = elt;
+    if let Some(v) = val {
+        let kv = p.exprs();
+        kv.push(elt);
+        kv.push(v);
+        x = p.mk(E.Tuple(kv), line);
+    }
+    let g = p.genexp_of(x, cs, line);
+    let args: *mem.Vec<Arg> = new(p.arena, mem.Vec.new());
+    args.push(Arg { name: None, value: g, star: 0 });
+    p.mk(E.Call(p.mk(E.Name(kind), line), args), line)
 }
 
 fn P.atom(p: *P) -> *Expr {
@@ -780,11 +812,12 @@ fn P.atom(p: *P) -> *Expr {
             p.bump();
             let xs = p.exprs();
             if p.eat(T.RBrack) { return p.mk(E.List(xs), line); }
+            let nf = p.nfuncs;
             let first = p.test_star();
             if p.at(T.For) {
                 let cs = p.comps();
                 p.expect(T.RBrack, "expected ']'");
-                return p.mk(E.ListComp(first, cs), line);
+                return p.comp(".list", first, None, cs, line, nf);
             }
             xs.push(first);
             while p.eat(T.Comma) {
@@ -816,13 +849,14 @@ fn P.atom(p: *P) -> *Expr {
                 p.expect(T.RBrace, "expected '}'");
                 return p.mk(E.Dict(ks, vs), line);
             }
+            let nf = p.nfuncs;
             let first = p.test_star();
             if p.eat(T.Colon) {
                 let v = p.test();
                 if p.at(T.For) {
                     let cs = p.comps();
                     p.expect(T.RBrace, "expected '}'");
-                    return p.mk(E.DictComp(first, v, cs), line);
+                    return p.comp(".dict", first, Some(v), cs, line, nf);
                 }
                 ks.push(first);
                 vs.push(v);
@@ -844,7 +878,7 @@ fn P.atom(p: *P) -> *Expr {
             if p.at(T.For) {
                 let cs = p.comps();
                 p.expect(T.RBrace, "expected '}'");
-                return p.mk(E.SetComp(first, cs), line);
+                return p.comp(".set", first, None, cs, line, nf);
             }
             ks.push(first);
             while p.eat(T.Comma) {

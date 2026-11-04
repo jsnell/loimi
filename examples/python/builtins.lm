@@ -187,6 +187,10 @@ pub fn setup(c: *Ctx) {
                    ("range", T_RANGE), ("object", T_OBJECT), ("type", T_TYPE), ("property", T_PROPERTY),
                    ("super", T_SUPER), ("slice", T_SLICE)];
     for x in visible { let (n, t) = x; put(c, bd, n, Value.Obj(c.types[t].unwrap())); }
+    // For comprehensions compiled as list(<genexpr>) (parser.lm, P.comp).
+    put(c, bd, ".list", Value.Obj(c.types[T_LIST].unwrap()));
+    put(c, bd, ".set", Value.Obj(c.types[T_SET].unwrap()));
+    put(c, bd, ".dict", Value.Obj(c.types[T_DICT].unwrap()));
     let st = value.new_box(&c.heap, K_CLASS, 0);
     st.a = Value.Str(vm.intern(c, "staticmethod")); st.dict = Some(value.new_dict(&c.heap, 0)); st.base = Some(obj);
     st.n = 1000; st.id = c.next_cls; c.next_cls += 1;
@@ -459,25 +463,39 @@ fn msort(c: *Ctx, keys: *mem.Vec<Value>, vals: *mem.Vec<Value>, reverse: bool) -
 
 /// Sort list `l` in place (key may be Nil).
 pub fn sort_list(c: *Ctx, l: Gc<List>, key: Value, reverse: bool) -> Result<(), Value> uses reenter {
-    var keys: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
-    var vals: mem.Vec<Value> = mem.Vec.with_capacity(l.len);
-    for i in 0..l.len { vals.push(l.arr.items[i]); }
+    let n = l.len;
+    var keys: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    var vals: mem.Vec<Value> = mem.Vec.with_capacity(n);
+    for i in 0..n { vals.push(l.arr.items[i]); }
     // Keep the values alive in a tuple while keys are computed (guest code may collect).
     let keep = value.tuple_of(&c.heap, vals.items());
-    let keept = value.new_tuple(&c.heap, l.len);
-    for i in 0..l.len {
+    let keept = value.new_tuple(&c.heap, n);
+    // As in CPython, the list is empty while it is sorted: key functions
+    // and comparisons see [], and a change is "list modified during sort".
+    let arr0 = l.arr;
+    l.len = 0;
+    var r: Result<(), Value> = Ok(());
+    for i in 0..n {
         if key == Value.Nil { keys.push(keep.items[i]); }
         else {
             let args = [keep.items[i]];
-            let r = vm.invoke(c, key, args[..]);
-            match r { Ok(k) => { keys.push(k); keept.items[i] = k; } Err(e) => { keys.free(); vals.free(); return Err(e); } }
+            match vm.invoke(c, key, args[..]) {
+                Ok(k) => { keys.push(k); keept.items[i] = k; }
+                Err(e) => { r = Err(e); break; }
+            }
         }
     }
-    let r = msort(c, &keys, &vals, reverse);
-    if let Err(e) = r { keys.free(); vals.free(); return Err(e); }
-    for i in 0..l.len { l.arr.items[i] = vals.at(i); }
+    if let Ok(_) = r { r = msort(c, &keys, &vals, reverse); }
+    let modified = l.len != 0 or (l.arr as u64) != (arr0 as u64);
+    l.len = 0;
+    if l.arr.items.len < n { value.list_grow(&c.heap, l, n); }
+    for i in 0..n { l.arr.items[i] = vals.at(i); }
+    for i in n..l.arr.items.len { l.arr.items[i] = Value.Nil; }
+    l.len = n;
     keys.free();
     vals.free();
+    r?;
+    if modified { return Err(exc(c, E_VALUE, "list modified during sort")); }
     Ok(())
 }
 
@@ -678,7 +696,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         Next => {
             if let Some(v) = ops.next(c, args[0])? { return Ok(v); }
             if np > 1 { return Ok(args[1]); }
-            Err(exc_of_empty(c, E_STOPITER))
+            Err(stop_iteration(c, args[0]))
         }
         Hash => {
             let h = ops.hash_key(c, args[0])?;
@@ -840,6 +858,19 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
         ObjStr => fmt.to_str(c, args[0]),
         _ => call_method_builtin(c, b, args, n, kw),
     }
+}
+
+/// StopIteration for an exhausted iterator: with the return value of a
+/// generator that just returned one (taken: later ones have none).
+fn stop_iteration(c: *Ctx, it: Value) -> Value {
+    if let Obj(g) = it and g.kind == K_GEN and g.b != Value.Nil {
+        let v = g.b;
+        g.b = Value.Nil;
+        let e = ops.exc_of(c, c.excs[E_STOPITER].unwrap(), v);
+        if let Inst(i) = e { value.attr_set(&c.heap, i.dict, vm.intern(c, "value"), v); }
+        return e;
+    }
+    exc_of_empty(c, E_STOPITER)
 }
 
 fn exc_of_empty(c: *Ctx, kind: u64) -> Value {
@@ -1576,11 +1607,32 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
             }
             match vm.gen_next(c, g, args[1])? {
                 Some(v) => Ok(v),
-                None => Err(exc_of_empty(c, E_STOPITER)),
+                None => Err(stop_iteration(c, selfv)),
             }
         }
-        GClose => { let Obj(g) = selfv else { trap() }; g.m = GEN_DONE; Ok(Value.Nil) }
-        GThrow => Err(ops.make_exc(c, args[1])?),
+        GClose => {
+            let Obj(g) = selfv else { trap() };
+            if g.m != value.GEN_SUSPENDED { g.m = GEN_DONE; return Ok(Value.Nil); }
+            let ge = exc_of_empty(c, E_GENEXIT);
+            match vm.gen_throw(c, g, ge) {
+                Ok(Some(_)) => Err(exc(c, E_RUNTIME, "generator ignored GeneratorExit")),
+                Ok(None) => Ok(Value.Nil),
+                Err(e) => {
+                    if ops.exc_match(c, e, Value.Obj(c.excs[E_GENEXIT].unwrap()))? or ops.exc_match(c, e, Value.Obj(c.excs[E_STOPITER].unwrap()))? {
+                        return Ok(Value.Nil);
+                    }
+                    Err(e)
+                }
+            }
+        }
+        GThrow => {
+            let Obj(g) = selfv else { trap() };
+            let e = ops.make_exc(c, args[1])?;
+            match vm.gen_throw(c, g, e)? {
+                Some(v) => Ok(v),
+                None => Err(stop_iteration(c, selfv)),
+            }
+        }
         PropSetter | PropGetter => {
             let Obj(o) = selfv else { trap() };
             let p = value.new_box(&c.heap, K_PROPERTY, 0);

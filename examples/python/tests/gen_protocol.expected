@@ -1,0 +1,17 @@
+[1, 5, (7,), 7, ()]
+[1, 'ret', 1, 2, None]
+1
+closed
+[]
+1
+caught boom
+after
+end
+propagated KeyError('x')
+[]
+unstarted t
+[]
+closed ok
+inner finally
+outer finally
+0 0 1 2

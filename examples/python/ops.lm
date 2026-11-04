@@ -2015,6 +2015,19 @@ pub fn unpack(c: *Ctx, src: Value, dst: *Value, before: u64, after: u64) -> Resu
 
 // ── iteration ───────────────────────────────────────────────────────
 
+/// An iterator over dict `d`: keys (mode 0), values (1), items (2) or a
+/// set's elements (3). `s` is the size it started with and `b` the
+/// number of entries still expected, for CPython's RuntimeErrors when
+/// the dict changes during iteration.
+fn dict_iter(c: *Ctx, d: Gc<Dict>, mode: i64) -> Value {
+    let b = value.new_box(&c.heap, K_DICTIT, 0);
+    b.a = Value.Dict(d);
+    b.m = mode;
+    b.s = d.len as i64;
+    b.b = Value.Int(d.len as i48);
+    Value.Obj(b)
+}
+
 pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_GETITER);
     match v {
@@ -2023,12 +2036,7 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
             b.a = v;
             Ok(Value.Obj(b))
         }
-        Dict(_) => {
-            let b = value.new_box(&c.heap, K_DICTIT, 0);
-            b.a = v;
-            b.m = 0;
-            Ok(Value.Obj(b))
-        }
+        Dict(d) => Ok(dict_iter(c, d, 0)),
         Obj(o) => {
             match o.kind {
                 K_RANGE => {
@@ -2036,17 +2044,10 @@ pub fn getiter(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
                     b.n = o.n; b.m = o.m; b.s = o.s;
                     Ok(Value.Obj(b))
                 }
-                K_SET | K_FROZENSET => {
-                    let b = value.new_box(&c.heap, K_DICTIT, 0);
-                    b.a = Value.Dict(o.dict.unwrap());
-                    b.m = 0;
-                    Ok(Value.Obj(b))
-                }
+                K_SET | K_FROZENSET => Ok(dict_iter(c, o.dict.unwrap(), 3)),
                 K_DICTVIEW => {
-                    let b = value.new_box(&c.heap, K_DICTIT, 0);
-                    b.a = o.a;
-                    b.m = o.m;
-                    Ok(Value.Obj(b))
+                    let Dict(d) = o.a else { trap() };
+                    Ok(dict_iter(c, d, o.m))
                 }
                 K_CLASS | K_BOUND | K_SUPER | K_PROPERTY | K_STATICM | K_CLASSM | K_MODULE | K_SLICE | K_NOTIMPL => {
                     Err(not_iterable(c, v))
@@ -2111,11 +2112,22 @@ pub fn next(c: *Ctx, it: Value) -> Result<?Value, Value> uses reenter {
                 }
                 K_DICTIT => {
                     let Dict(d) = b.a else { trap() };
+                    if b.s != -1 and d.len as i64 != b.s {
+                        b.s = -2; // sticky, as in CPython
+                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary changed size during iteration" }));
+                    }
                     var i = b.n as u64;
                     let r = value.dict_next(d, &i);
                     b.n = i as i64;
                     let Some(e) = r else { return Ok(None); };
-                    if b.m == 0 { return Ok(Some(value.dict_key(d, e))); }
+                    let Int(left) = b.b else { trap() };
+                    if left == 0 and b.s >= 0 {
+                        b.s = -1; // exhausted from now on
+                        b.n = 0x7fffffffffffffff;
+                        return Err(exc(c, E_RUNTIME, if b.m == 3 { "Set changed size during iteration" } else { "dictionary keys changed during iteration" }));
+                    }
+                    b.b = Value.Int(left - 1);
+                    if b.m == 0 or b.m == 3 { return Ok(Some(value.dict_key(d, e))); }
                     if b.m == 1 { return Ok(Some(value.dict_val(d, e))); }
                     let t = value.new_tuple(&c.heap, 2);
                     t.items[0] = value.dict_key(d, e);
