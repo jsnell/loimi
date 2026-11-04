@@ -1306,6 +1306,12 @@ fn is_notimpl(v: Value) -> bool { value.is_kind(v, K_NOTIMPL) }
 
 pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_ARITH);
+    // bool & | ^ bool is a bool.
+    if let (Bool(x), Bool(y)) = (a, b) {
+        if op == O_BAND { return Ok(Value.Bool(x and y)); }
+        if op == O_BOR { return Ok(Value.Bool(x or y)); }
+        if op == O_BXOR { return Ok(Value.Bool(x != y)); }
+    }
     if value.is_int(a) and value.is_int(b) { return int_arith(c, op, a, b); }
     if value.is_num(a) and value.is_num(b) {
         if op >= O_LSHIFT { return Err(unsupported(c, op_sym(op), a, b)); }
@@ -1664,6 +1670,16 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
     m.push_str(type_name(c, a));
     m.push('\'');
     Err(exc_buf(c, E_TYPE, &m))
+}
+
+/// An int (not a bool) that fits an i64: Int or a medium Long.
+#[inline]
+pub fn i64_int(v: Value) -> ?i64 {
+    match v {
+        Int(i) => Some(i as i64),
+        Long(b) => if b.big.is_none() { Some(b.n) } else { None },
+        _ => None,
+    }
 }
 
 pub fn truthy(c: *Ctx, v: Value) -> Result<bool, Value> uses reenter {

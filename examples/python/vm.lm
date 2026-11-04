@@ -1003,7 +1003,13 @@ pub vm Py {
     inline for (name, sym, opn) in [("BAND", &, ops.O_BAND), ("BOR", |, ops.O_BOR), ("BXOR", ^, ops.O_BXOR)] {
         op #name(dst: reg, a: reg, b: reg) : ABC {
             if let (Int(x), Int(y)) = (a, b) { dst = Int(x sym y); next }
-            cold { gc_point(); dst = ops.arith(ctx, opn, a, b)?; next }
+            cold {
+                gc_point();
+                // Ints that fit an i64 (go's 63-bit Zobrist hashes).
+                if let Some(x) = ops.i64_int(a) and let Some(y) = ops.i64_int(b) { dst = value.int_val(&ctx.heap, x sym y); next }
+                dst = ops.arith(ctx, opn, a, b)?;
+                next
+            }
         }
     }
     op NEG(dst: reg, a: reg) : ABC {
