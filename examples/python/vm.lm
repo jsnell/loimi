@@ -830,7 +830,7 @@ pub vm Py {
     op NEG(dst: reg, a: reg) : ABC {
         match a {
             Int(x) => if x != -140737488355328 { dst = Int(0 - x); next },
-            Float(x) => { dst = Float(0.0 - x); next }
+            Float(x) => { dst = Float(-x); next }
             _ => {}
         }
         cold { gc_point(); dst = ops.unary(ctx, ops.U_NEG, a)?; next }

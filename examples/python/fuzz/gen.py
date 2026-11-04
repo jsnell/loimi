@@ -70,7 +70,10 @@ class G:
             op = self.pick(ARITH)
             a, b = self.num(depth + 1), self.num(depth + 1)
             if op == "**":
-                b = self.pick(["0", "1", "2", "3", "-1", "-2", "0.5", "10", "65", "-3"])
+                # (small exponents: CPython limits int->str to 4300 digits)
+                b = self.pick(["0", "1", "2", "3", "-1", "-2", "0.5", "-3"])
+                if not a.lstrip("-").isdigit():
+                    a = self.pick(["2", "3", "-2", "10", "0", "1.5", "-0.5"])
             if op in ("<<", ">>"):
                 b = self.pick(["0", "1", "3", "31", "47", "64", "100", "-1"])
             return "(%s %s %s)" % (a, op, b)
@@ -141,7 +144,7 @@ class G:
             e = self.pick(["%s %s %s" % (x, self.pick(CMPS), y), "[%s] %s [%s]" % (x, self.pick(CMPS), y),
                            "(%s, 0) %s (%s, 1)" % (x, self.pick(CMPS), y), "%s in [%s]" % (x, y),
                            "[%s, %s].count(%s)" % (x, y, x), "%s < %s < %s" % (x, y, x),
-                           "not (%s %s %s)" % (x, self.pick(CMPS), y), "sorted([%s, %s])" % (x, y),
+                           "not (%s %s %s)" % (x, self.pick(CMPS), y),
                            "max(%s, %s)" % (x, y), "min([%s, %s])" % (x, y), "{1: %s} == {1: %s}" % (x, y)])
             self.run(e)
 

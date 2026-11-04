@@ -844,7 +844,7 @@ pub fn call(c: *Ctx, id: u32, args: *Value, n: u64, kw: Value) -> Result<Value, 
             Ok(Value.Bool(r))
         }
         Hex | Oct | Bin => {
-            let x = args[0];
+            let x = ops.index_of(c, args[0])?;
             if !value.is_int(x) { return Err(exc(c, E_TYPE, "an integer is required")); }
             var buf = text.StrBuf.new();
             if big.is_neg(x) { buf.push('-'); }
@@ -1055,8 +1055,8 @@ pub fn construct(c: *Ctx, cls: Gc<Box>, args: *Value, n: u64, kw: Value) -> Resu
         T_RANGE => {
             let r = value.new_box(&c.heap, K_RANGE, 0);
             r.s = 1;
-            if np == 1 { r.m = want_int(c, args[0])?; }
-            else if np >= 2 { r.n = want_int(c, args[0])?; r.m = want_int(c, args[1])?; }
+            if np == 1 { r.m = want_int(c, ops.index_of(c, args[0])?)?; }
+            else if np >= 2 { r.n = want_int(c, ops.index_of(c, args[0])?)?; r.m = want_int(c, ops.index_of(c, args[1])?)?; }
             else { return Err(exc(c, E_TYPE, "range expected at least 1 argument, got 0")); }
             if np >= 3 {
                 r.s = want_int(c, args[2])?;
@@ -1517,7 +1517,12 @@ fn call_method_builtin(c: *Ctx, b: B, args: *Value, n: u64, kw: Value) -> Result
                 let Some(x) = value.seq_at(selfv, i) else { break; };
                 if ops.equal(c, x, args[1])? { return Ok(value.int_val(&c.heap, i as i64)); }
             }
-            Err(exc(c, E_VALUE, if b == B.LIndex { "list.index(x): x not in list" } else { "tuple.index(x): x not in tuple" }))
+            if b == B.TIndex { return Err(exc(c, E_VALUE, "tuple.index(x): x not in tuple")); }
+            let Str(r) = fmt.repr(c, args[1])? else { trap() };
+            var m = text.StrBuf.new();
+            m.push_str(r.data);
+            m.push_str(" is not in list");
+            Err(exc_buf(c, E_VALUE, &m))
         }
         LCount | TCount => {
             var k: i64 = 0;

@@ -1089,16 +1089,50 @@ pub fn arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> uses 
             }
         }
     }
-    // User-defined operators.
-    if let Inst(_) = a {
-        let args = [b];
-        if let Some(r) = call_method(c, a, dunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
-    }
-    if let Inst(_) = b {
+    // User-defined operators: b's reflected method first when b's class
+    // is a proper subclass of a's, never when both have the same class.
+    let rfirst = reflected_first(a, b);
+    if rfirst {
         let args = [a];
         if let Some(r) = call_method(c, b, rdunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
     }
-    Err(unsupported(c, op_sym(op), a, b))
+    if let Inst(i) = a {
+        let args = [b];
+        if let Some(r) = call_method(c, a, dunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+        if let Inst(j) = b and (i.cls as u64) == (j.cls as u64) { return Err(unsupported(c, op_sym(op), a, b)); }
+    }
+    if let Inst(_) = b and !rfirst {
+        let args = [a];
+        if let Some(r) = call_method(c, b, rdunder(op), args[..])? { if !is_notimpl(r) { return Ok(r); } }
+    }
+    Err(arith_type_error(c, op, a, b))
+}
+
+/// CPython's messages for `+` and `*` on sequences, else "unsupported
+/// operand type(s)".
+fn arith_type_error(c: *Ctx, op: u32, a: Value, b: Value) -> Value {
+    let seq = |v: Value| -> bool { match v { Str(_) | List(_) | Tuple(_) => true, _ => false } };
+    if op == O_ADD and !is_inst(b) {
+        let what = match a { List(_) => "list", Tuple(_) => "tuple", _ => "" };
+        if what.len > 0 {
+            var m = text.StrBuf.new();
+            m.push_str("can only concatenate ");
+            m.push_str(what);
+            m.push_str(" (not \"");
+            m.push_str(type_name(c, b));
+            m.push_str("\") to ");
+            m.push_str(what);
+            return exc_buf(c, E_TYPE, &m);
+        }
+    }
+    if op == O_MUL and (seq(a) or seq(b)) and !is_inst(a) and !is_inst(b) {
+        var m = text.StrBuf.new();
+        m.push_str("can't multiply sequence by non-int of type '");
+        m.push_str(type_name(c, if seq(a) { b } else { a }));
+        m.push('\'');
+        return exc_buf(c, E_TYPE, &m);
+    }
+    unsupported(c, op_sym(op), a, b)
 }
 
 /// Sequence repetition `seq * n`.
@@ -1187,8 +1221,8 @@ pub fn int_arith(c: *Ctx, op: u32, a: Value, b: Value) -> Result<Value, Value> {
             if big.is_neg(b) {
                 let x = value.to_f64(a).unwrap();
                 let y = value.to_f64(b).unwrap();
-                if x == 0.0 { return Err(zero_div(c, "zero to a negative power")); }
-                return Ok(Value.Float(builtins.pow_f(x, y)));
+                if x == 0.0 { return Err(zero_div(c, "0.0 cannot be raised to a negative power")); }
+                return Ok(float_pow(c, x, y)?);
             }
             let Some(e) = value.as_i64(b) else { return Err(exc(c, E_OVERFLOW, "exponent too large")); };
             Ok(big.pow(h, a, e as u64))
@@ -1217,6 +1251,22 @@ fn small(v: Value) -> ?i64 {
         Long(b) => if b.big.is_none() { Some(b.n) } else { None },
         _ => None,
     }
+}
+
+/// x ** y for floats: OverflowError when finite operands overflow.
+fn float_pow(c: *Ctx, x: f64, y: f64) -> Result<Value, Value> {
+    let r = builtins.pow_f(x, y);
+    if r - r != 0.0 and r == r and x - x == 0.0 and y - y == 0.0 {
+        let e = exc_of(c, c.excs[E_OVERFLOW].unwrap(), Value.Int(34));
+        if let Inst(i) = e {
+            let t = value.new_tuple(&c.heap, 2);
+            t.items[0] = Value.Int(34);
+            t.items[1] = Value.Str(vm.intern(c, "Numerical result out of range"));
+            value.attr_set(&c.heap, i.dict, vm.intern(c, "args"), Value.Tuple(t));
+        }
+        return Err(e);
+    }
+    Ok(Value.Float(r))
 }
 
 fn copysign0(s: f64) -> f64 { if (s.to_bits() >> 63) != 0 { -0.0 } else { 0.0 } }
@@ -1260,8 +1310,8 @@ pub fn float_arith(c: *Ctx, op: u32, x: f64, y: f64) -> Result<Value, Value> {
             Ok(Value.Float(float_divmod(x, y).1))
         }
         O_POW => {
-            if x == 0.0 and y < 0.0 { return Err(zero_div(c, "zero to a negative power")); }
-            Ok(Value.Float(builtins.pow_f(x, y)))
+            if x == 0.0 and y < 0.0 { return Err(zero_div(c, "0.0 cannot be raised to a negative power")); }
+            Ok(float_pow(c, x, y)?)
         }
         _ => Err(unsupported(c, op_sym(op), Value.Float(x), Value.Float(y))),
     }
@@ -1281,7 +1331,7 @@ pub fn unary(c: *Ctx, op: u32, a: Value) -> Result<Value, Value> uses reenter {
             return Ok(Value.Int((~i) as i48));
         }
         Float(x) => {
-            if op == U_NEG { return Ok(Value.Float(0.0 - x)); }
+            if op == U_NEG { return Ok(Value.Float(-x)); }
             if op == U_POS { return Ok(a); }
         }
         Long(_) => {
@@ -1674,8 +1724,26 @@ fn seq_index(c: *Ctx, key: Value, n: u64, what: str) -> Result<u64, Value> {
     Ok(j as u64)
 }
 
-pub fn getindex(c: *Ctx, obj: Value, key: Value) -> Result<Value, Value> uses reenter {
+/// An instance used as an index: its __index__ (else the instance).
+pub fn index_of(c: *Ctx, v: Value) -> Result<Value, Value> uses reenter {
+    if let Inst(_) = v {
+        if let Some(r) = call_method(c, v, "__index__", [])? {
+            if !value.is_int(r) {
+                var m = text.StrBuf.new();
+                m.push_str("__index__ returned non-int (type ");
+                m.push_str(type_name(c, r));
+                m.push(')');
+                return Err(exc_buf(c, E_TYPE, &m));
+            }
+            return Ok(r);
+        }
+    }
+    Ok(v)
+}
+
+pub fn getindex(c: *Ctx, obj: Value, key0: Value) -> Result<Value, Value> uses reenter {
     builtins.count(builtins.CNT_GETINDEX);
+    let key = match obj { List(_) | Tuple(_) | Str(_) => index_of(c, key0)?, _ => key0 };
     if let Obj(sl) = key and sl.kind == K_SLICE { return getslice(c, obj, sl.a, sl.b, sl.c); }
     match obj {
         List(l) => Ok(l.arr.items[seq_index(c, key, l.len, "list")?]),
@@ -1714,8 +1782,9 @@ fn not_subscriptable(c: *Ctx, obj: Value) -> Value {
     exc_buf(c, E_TYPE, &m)
 }
 
-pub fn setindex(c: *Ctx, obj: Value, key: Value, v: Value) -> Result<(), Value> uses reenter {
+pub fn setindex(c: *Ctx, obj: Value, key0: Value, v: Value) -> Result<(), Value> uses reenter {
     builtins.count(builtins.CNT_SETINDEX);
+    let key = if let List(_) = obj { index_of(c, key0)? } else { key0 };
     if let Obj(sl) = key and sl.kind == K_SLICE { return setslice(c, obj, sl.a, sl.b, sl.c, v); }
     match obj {
         List(l) => {
@@ -1739,7 +1808,8 @@ pub fn setindex(c: *Ctx, obj: Value, key: Value, v: Value) -> Result<(), Value> 
     }
 }
 
-pub fn delindex(c: *Ctx, obj: Value, key: Value) -> Result<(), Value> uses reenter {
+pub fn delindex(c: *Ctx, obj: Value, key0: Value) -> Result<(), Value> uses reenter {
+    let key = if let List(_) = obj { index_of(c, key0)? } else { key0 };
     match obj {
         List(l) => {
             if let Obj(sl) = key and sl.kind == K_SLICE {

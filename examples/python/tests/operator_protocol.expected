@@ -1,0 +1,26 @@
+TypeError unsupported operand type(s) for +: 'A' and 'A'
+'B.radd'
+'A.radd'
+TypeError unsupported operand type(s) for +: 'A' and 'int'
+3
+3
+'c'
+'0x2'
+'0b10'
+[0, 1]
+[2, 3, 4]
+[2, 9]
+TypeError can only concatenate tuple (not "list") to tuple
+TypeError can only concatenate list (not "tuple") to list
+TypeError can't multiply sequence by non-int of type 'str'
+TypeError can't multiply sequence by non-int of type 'float'
+TypeError can't multiply sequence by non-int of type 'float'
+ZeroDivisionError 0.0 cannot be raised to a negative power
+ZeroDivisionError 0.0 cannot be raised to a negative power
+OverflowError (34, 'Numerical result out of range')
+OverflowError (34, 'Numerical result out of range')
+-0.0
+-0.0
+ValueError 4 is not in list
+ValueError 'x' is not in list
+ValueError tuple.index(x): x not in tuple
