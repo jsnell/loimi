@@ -1,0 +1,57 @@
+-- Integer % by constants (MODK) and by registers (MOD), which divide by
+-- multiplying with a per-site magic number: checked against the
+-- definition a - floor(a / b) * b in floats (exact below 2^53).
+local bad = 0
+local function check(a, b, r)
+  local want = a - math.floor(a / b) * b
+  if r ~= want then
+    bad = bad + 1
+    if bad <= 5 then print("wrong", a, b, r, want) end
+  end
+end
+
+local xs = { 0, 1, 2, 3, 6, 7, 8, 9, 99, 1000, 65535, 65536, 999999,
+             1000002, 1000003, 1000004, 2147483646, 2147483647,
+             -1, -2, -7, -8, -1000003, -2147483647, -2147483648 }
+local seed = 7
+local function rand() -- Numerical Recipes LCG, within 31 bits
+  seed = (seed * 1366 + 150889) % 714025
+  return seed
+end
+-- 0 <= big() < 2^31, all Ints
+local function big() return rand() * 3007 + rand() % 3007 end
+for i = 1, 400 do
+  local x = big()
+  xs[#xs + 1] = x
+  xs[#xs + 1] = 0 - x
+end
+
+for _, a in ipairs(xs) do
+  check(a, 1, a % 1); check(a, 2, a % 2); check(a, 3, a % 3)
+  check(a, 7, a % 7); check(a, 10, a % 10); check(a, 16, a % 16)
+  check(a, 977, a % 977); check(a, 65521, a % 65521)
+  check(a, 99991, a % 99991); check(a, 1000003, a % 1000003)
+  check(a, 1073741824, a % 1073741824); check(a, 1073741825, a % 1073741825)
+  check(a, 2147483647, a % 2147483647)
+  check(a, -3, a % -3)
+end
+
+-- One MOD site with changing divisors (its cache is keyed by the last).
+local ds = { 1, 2, 3, 5, 7, 7, 7, 64, 641, 6700417, 2147483647, 2147483646,
+             1073741823, -1, -5, 3, 3 }
+for _, b in ipairs(ds) do
+  for _, a in ipairs(xs) do check(a, b, a % b) end
+end
+for i = 1, 2000 do
+  local b = rand() % 100000 + 1
+  if i % 3 == 0 then b = big() + 1 end
+  for j = 1, 5 do
+    local a = big()
+    check(a, b, a % b)
+  end
+end
+
+print("bad", bad)
+print(5 % 0.5, 7 % 2.5, -7 % 3, 7 % -3)
+-- expect: bad	0
+-- expect: 0.0	2.0	2	-2
