@@ -1152,6 +1152,21 @@ pub vm Mini {
         }
         if let Native(id) = f {
             cold {
+                // math.sqrt and math.floor of a number, for one result,
+                // without the native call (nbody, sort).
+                if nres == 1 and nargs != 0 {
+                    let x = regs[base + 1];
+                    if id == lib.M_SQRT and let Num(d) = x { regs[base] = Num(d.sqrt()); next }
+                    if id == lib.M_FLOOR {
+                        if let Int(_) = x { regs[base] = x; next }
+                        // Truncate and adjust (libm's floor is a call).
+                        if let Num(d) = x and d >= -2147483648.0 and d < 2147483648.0 {
+                            let t = d as i32;
+                            regs[base] = Int(if (t as f64) > d { t - 1 } else { t });
+                            next
+                        }
+                    }
+                }
                 // coroutine.resume and coroutine.yield switch threads in
                 // this run when they can; the native reports the rest.
                 if id == coro.RESUME and nargs != 0 and let Co(co) = regs[base + 1] and !coro.is_wrap(co) and coro.can_switch(ctx, co) {
