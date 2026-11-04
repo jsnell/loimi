@@ -494,6 +494,15 @@ without JIT 0.446 → 0.398, Guile with JIT 0.945 → 0.845 (host load 2-4,
 so the absolute times are lower than above). goto, switch and jit
 builds were not rerun.
 
+**Update 2026-11-04, later (tailcall only).** A fourth round (known
+calls as `CALLK`, records, `call/cc`, `reverse`, `append`, `length` and
+other builtins as ops, `symbol->string` cached, unzeroed strings with
+`std.gc`'s `new_uninit`, faster `std.bigint` division and square roots;
+[bench/scheme/README.md](../bench/scheme/README.md#fourth-phase-known-calls-more-builtins-as-ops-strings-bigints-2026-11-04-later)):
+against 5f50eb4, interleaved, `-n 3 --align 64`, ours/before 0.941;
+Gauche 0.218 → 0.205, Guile without JIT 0.398 → 0.374, Guile with JIT
+0.848 → 0.797 (host load about 3).
+
 ### lox
 
 | benchmark | tailcall | goto | switch | clox | tailcall/clox |

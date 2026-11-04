@@ -113,7 +113,7 @@ the JIT, is in [`docs/results.md`](docs/results.md) (made with
 |---|---|---|
 | [`mini`](examples/mini) | A Lua 5.4 subset ([spec](examples/mini/SPEC.md)) with coroutines that switch inside the dispatch loop ([notes](examples/mini/COROUTINES.md)); also a C library ([`examples/embed`](examples/embed)) | 0.52× PUC-Lua 5.4, 0.82× LuaJIT's assembly interpreter (`-joff`), on 14 clean-room benchmarks; coroutines 0.37× PUC-Lua ([log](bench/mini/RESULTS.md)) |
 | [`minijs`](examples/minijs) | A JavaScript subset on `std.obj` shapes and inline caches | 0.48× V8's interpreter (`node --jitless`), 0.37× QuickJS |
-| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.22× Gauche, 0.40× Guile 3 without JIT, 0.85× Guile with its JIT ([notes](bench/scheme/README.md)) |
+| [`scheme`](examples/scheme) | An R7RS-small subset with proper tail calls, flat closures and a generational heap | 43 unmodified r7rs-benchmarks programs: 0.21× Gauche, 0.37× Guile 3 without JIT, 0.80× Guile with its JIT ([notes](bench/scheme/README.md)) |
 | [`lox`](examples/lox) | Lox from *Crafting Interpreters* | All 246 tests of the book's suite; 0.44× clox |
 | [`regex`](examples/regex) | A backtracking regex engine shipped as a C library | 0.44× the PCRE2 interpreter, 0.41× Python's `re` |
 | [`stack`](examples/stack) | Stak, a Forth with statically checked stack effects | (no reference) |

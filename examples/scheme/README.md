@@ -107,9 +107,13 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
 - **Inline builtins.** Calls to `+ - * / quotient remainder modulo = < > <=
   >= zero? eq? eqv? not null? pair? car cdr cons set-car! set-cdr!
   vector-ref vector-set! symbol? number? exact-integer? string? vector?
-  memq assq list vector` and `cXr` are compiled to ops (`list` to a chain
-  of `CONS`; `vector` and record constructors to `VECTOR`/`RECORD`), and calls to the other builtins (except
-  `apply` and `call/cc`) call the native directly (`PRIMCALL`), unless the
+  memq assq list vector length odd? even? positive? negative?
+  vector-length reverse string-ref`, two-list `append`, `call/cc`, record
+  constructors, accessors, modifiers and predicates, and `cXr` are compiled
+  to ops (`list` to a chain of `CONS`; `vector` and record constructors to
+  `VECTOR`/`RECORD`; the others have a fast path and leave every other
+  case to the native), and calls to the other builtins (except `apply`)
+  call the native directly (`PRIMCALL`), unless the
   program defines or `set!`s that name somewhere (then every call goes
   through the global). The prelude always uses the inline versions.
 - **Inlined procedures.** A top-level procedure that is defined once and
@@ -117,7 +121,13 @@ public r7rs-benchmarks suite, run unmodified against chibi-scheme.
   is an unassigned `let`/`letrec` lambda: small ones are inlined at their
   calls (see "Compiler"). A call of an inlined top-level procedure that
   could run before its definition is guarded, so it still fails with
-  `unbound variable`.
+  `unbound variable`. Other calls of a known top-level procedure without
+  free variables whose definition has certainly run are `CALLK`: the
+  compiler makes the procedure's closure (the definition stores that
+  object), so the call takes it from the constant pool, with no global
+  load and no arity check (the caller makes a rest list). Whether a
+  definition has run: it is in an earlier form, or no earlier form can
+  reach the body the call is in (`Comp.reachability`).
 - Symbols are never collected. `eq?` on flonums compares bits.
 - **Continuations are escape-only.** A continuation can be invoked while
   the `call/cc` that made it is still active (early exit from loops,
@@ -297,14 +307,18 @@ TESTT`, `ADD SUB MUL ADDI DIV QUO REM MOD` (fixnum fast paths with
 overflow checks, flonum fast paths, everything else cold), `NUMEQ LT GT
 LE GE` and their compare-with-constant forms `NUMEQI LTI GTI LEI GEI`,
 `ZEROP EQ EQV NOT NULLP PAIRP SYMBOLP NUMBERP FIXNUMP STRINGP VECTORP CAR
-CDR CONS SETCAR SETCDR VREF VSET VREFI VSETI VECTOR RECORD MEMQ ASSQ`, `CALL CALLSELF PRIMCALL TAILCALL RET`,
+CDR CONS SETCAR SETCDR VREF VSET VREFI VSETI VECTOR RECORD MEMQ ASSQ`,
+`LENGTH ODDP EVENP POSP NEGP VLEN REVERSE APPEND2 SREF`, `RREF RSET RECP`
+(records, the type and field as a constant operand), `CALL CALLSELF CALLK
+TAILCALLK CALLCC PRIMCALL TAILCALL RET`,
 and 35 superinstructions picked from `--vm-stats` over the benchmarks
 (compare-and-branch pairs, `MOVE_MOVE`, `MOVE_JMP`, `CDR_CDR`, `ADDI_CALL`,
 ...).
 
 ## Escape continuations; why no full call/cc, dynamic-wind or syntax-rules
 
-`call/cc` is handled in `call_slow`, like `apply`. It allocates a
+`call/cc` is the `CALLCC` op (or, called as a value, handled in
+`call_slow`, like `apply`). It allocates a
 continuation, a closure of a fixed prototype (`vm.cont_proto`) whose one
 free slot is a frame depth, and pushes a frame of that prototype (or, for
 a tail call, replaces the current frame) with R0 = the procedure and R1 =

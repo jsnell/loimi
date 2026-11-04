@@ -421,6 +421,14 @@ implementation; `git log` has the details.
   collector), aliases of builtins and known procedures, free variables
   hoisted out of loops, constant-index vector ops; interpreter changes
   only ([bench/scheme/README.md](bench/scheme/README.md#third-phase-calls-allocation-builtins-2026-11-04)).
+- The Scheme interpreter takes 0.941 of its previous time over the 43
+  r7rs-benchmarks programs (0.37 of Guile's VM, was 0.40; 0.21 of
+  Gauche, was 0.22): calls of known top-level procedures take their
+  closure from the constant pool (`CALLK`), record accessors, `call/cc`,
+  `reverse`, `append`, `length`, `odd?` and other builtins as ops,
+  `symbol->string` cached, unzeroed strings (`new_uninit`), and the
+  faster `std.bigint` division and square roots
+  ([bench/scheme/README.md](bench/scheme/README.md#fourth-phase-known-calls-more-builtins-as-ops-strings-bigints-2026-11-04-later)).
 - [`examples/python`](examples/python): a Python 3 subset running 11
   pyperformance programs, on `std.bigint` and `std.dict`.
 - The Python subset takes 0.45 of CPython 3.13's time by geometric

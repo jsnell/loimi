@@ -67,6 +67,7 @@ bench/scheme/compare.py --refs gauche,guile-nojit  # a subset of the references 
 bench/scheme/compare.py --check --count 1          # quick correctness pass, failures in full
 bench/scheme/compare.py --dispatch tailcall goto switch
 bench/scheme/compare.py --align 128                # build ours with --align-functions=128
+bench/scheme/compare.py --cpu fib tak               # user+system CPU time instead of wall time (a loaded host)
 bench/scheme/compare.py --refs '' --dispatch --exe old new -n 5   # A/B of two builds
 ```
 
@@ -520,6 +521,96 @@ triangl, puzzle: 10-18% of ops are `GETGLOBAL_B`), the remaining hot
 natives as ops or with a lighter call (`append`, `length`, `reverse`,
 `odd?`, `positive?`, `symbol->string`, record accessors), and
 continuation capture (`call_slow` is 25% of ctak and fibc).
+
+## Fourth phase: known calls, more builtins as ops, strings, bigints (2026-11-04, later)
+
+Interpreter changes in `examples/scheme`, plus `new_uninit` in `std.gc`
+and faster `std.bigint` division and square roots (both by sub-agents).
+Each step was an interleaved A/B (`--exe old new`, `--align 64`, CPU
+time with the new `compare.py --cpu`: the host load was 3-6 from other
+agents); the whole: `compare.py -n 3 --align 64`, wall time, three runs
+of 14-15 programs, before (5f50eb4) and after interleaved:
+
+| geometric mean, wall | gauche | guile-nojit | guile (JIT) |
+|---|---|---|---|
+| before (5f50eb4) | 0.218 | 0.398 | 0.848 |
+| after | **0.205** | **0.374** | **0.797** |
+
+Ours/before: 0.941. The largest changes (seconds, before → after, and
+after / guile-nojit): gcbench 0.013 → 0.008 (0.28), paraffins 0.033 →
+0.026 (0.48), string 0.019 → 0.015 (0.58), browse 0.015 → 0.011 (0.39),
+maze 0.034 → 0.028 (0.38), pi 0.137 → 0.118 (1.08), ctak 0.020 → 0.017,
+fibc 0.031 → 0.027, deriv 0.145 → 0.126 (0.32), nqueens 0.302 → 0.274
+(0.54), chudnovsky 0.166 → 0.154 (0.71), matrix 0.066 → 0.061, mazefun
+0.128 → 0.120, simplex 0.100 → 0.095, destruc 0.125 → 0.118. Slower:
+triangl 0.159 → 0.170 (reproducible, 6%; its hot procedure's bytecode
+is unchanged: handler placement after the new ops).
+
+1. **Known calls (`CALLK`, `TAILCALLK`).** A call of a top-level
+   procedure defined once by a lambda, never `set!`, without free
+   variables, whose definition has certainly run, takes the closure
+   from the constant pool: the compiler makes the closure and the
+   definition stores that same object (`LOADK; DEFGLOBAL` instead of
+   `CLOSURE`). No `GETGLOBAL`, no arity check; for a rest parameter the
+   caller conses the list, so `values` and `(h a . r)` calls no longer
+   take `call_slow`. "Certainly run" got a reachability analysis
+   (`Comp.reachability`): in the body of a known procedure, a later
+   definition needs no guard if no earlier form can reach that body.
+   Small alone (conform -4%, ctak and pi a few percent) since most hot
+   calls were already `CALLSELF` or inlined.
+2. **Records as ops** (`RREF`, `RSET`, `RECP`). Accessors expand to
+   `(%record-ref '(rtd . i) x)`; the op takes the constant pair as its
+   operand and checks the record's type against it. gcbench 0.013 →
+   0.008.
+3. **Vectors and records of up to 8 slots on the fast path** (was 4):
+   paraffins' 5-element vectors went to `big_vect` (16% of its time).
+4. **`CALLCC`**: `call/cc` and `call-with-current-continuation` of the
+   builtin (and its prelude alias) are an op that pushes the
+   continuation frame itself. ctak 0.021 → 0.018, fibc 0.032 → 0.028.
+5. **More builtins as ops**: `length odd? even? positive? negative?
+   vector-length string-ref` (inline fast path, the native for every
+   other case, on the argument registers), `reverse` and two-list
+   `append` (allocating with `try_new` in the handler; when the
+   allocator's current run ends the native redoes the whole call).
+   deriv -14% (`reverse` in the inlined `map`), destruc -7%
+   (`length`), maze -12% (`odd?`), lattice -9%, matrix -10%.
+6. **`symbol->string`** returns one string per symbol (cached in the
+   symbol; R7RS makes mutating it an error): browse -20%.
+7. **`new_uninit`** (std.gc, [gc.md](../../docs/stdlib/gc.md)): strings
+   that are filled right after allocation are not zeroed first. string
+   0.019 → 0.015 s; what remains of string is mostly `memcpy`.
+8. **std.bigint** ([stdlib.md](../../docs/stdlib.md), "std.bigint"):
+   reciprocals without `div` (GMP's `invert_limb`), 3/2 schoolbook
+   division (`sbpi1_div_qr`), a four-limb `submul_1`, a square root that
+   computes only the root at the top and does its base-case Newton step
+   in floating point, one scratch area for the recursion. Per operation
+   against GMP 6.3 at pi's sizes: quotients 1.1-1.3x (were 1.4-1.6x),
+   square roots 1.5-1.7x (2.3-2.5x); products are unchanged at
+   1.2-1.45x (GMP's `mulx`/`adx` base cases). pi 1.31 → 1.08 of
+   guile-nojit, chudnovsky 0.84 → 0.71.
+
+Tried and dropped:
+
+- Escape-continuation invocations handled in `CALL`'s and `TAILCALL`'s
+  cold blocks instead of `call_slow`: ctak unchanged, fibc -5%, tak +4%
+  (placement).
+- A larger minimum heap budget (`set_growth(400, 8 or 16 MiB)` instead
+  of 2 MiB): paraffins -15%, earley -12..-21%, graphs -3%, but mperm
+  +17..31% and string +40..60%; geomean 1.02.
+- An i64 fast path in `bignum.add/sub/mul/divmod` for operands and
+  results that fit (chudnovsky's mostly do, beyond the 32-bit
+  fixnums): chudnovsky 1.01, pi 1.01 (the `Big` allocation stays).
+
+Where we still lose most (wall, vs guile-nojit): pi 1.08, mperm 0.74,
+chudnovsky 0.71, nboyer 0.65, string 0.58, sboyer 0.58, nqueens 0.54,
+quicksort 0.53, cpstak 0.53, ntakl 0.53. Next candidates: data globals
+(`GETGLOBAL_B` is 17-27% of puzzle's, triangl's and string's ops: a
+global vector read is two dispatches), conform's guards (`CHKGLOBAL_B`
+7.6% of its ops, for later definitions used in escaping closures, which
+the reachability analysis cannot place), the collector on large live
+heaps (nboyer, sboyer, mperm: marking is 8-15%), products in std.bigint
+(base-case code generation), and glibc's heap growth and trimming for
+large strings (`brk` is 5% of string).
 
 ## Bignums (2026-11-03)
 
