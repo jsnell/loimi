@@ -1,0 +1,13 @@
+// `p.prefetch()`: a cache hint (`llvm.prefetch`, read, high locality) on
+// any raw pointer; it never faults, so a null or dangling one is fine.
+import std.io;
+import std.mem;
+
+fn main() {
+    let buf = mem.alloc<u64>(8);
+    buf[3] = 42;
+    (buf + 3).prefetch();
+    (0 as *u8).prefetch();
+    io.print_int(buf[3] as i64); io.println("");
+}
+// expect: 42

@@ -1044,6 +1044,10 @@ allocator copies `v` into memory from `a.alloc_bytes` and gives a `*T`
   x86-64 and AArch64 they compile to the same single `mov`/`ldr` as an
   aligned access. Vectors are the exception to the rule: `*p` on a
   vector pointer assumes no alignment either (section 1.2, "Vectors").
+- **Prefetch.** `p.prefetch()` on any raw pointer asks the CPU to bring
+  the cache line at `p` into the cache (`llvm.prefetch`, read, high
+  locality); it never faults, whatever `p` is. For loops that know
+  addresses well ahead of their use, such as `std.gc`'s marking.
 - **Atomics.** For memory that threads share outside a lock, a pointer
   to an 8-, 16-, 32- or 64-bit integer (or to a pointer) has
   `p.atomic_load()` (acquire), `p.atomic_load_relaxed()` (monotonic),
