@@ -55,6 +55,9 @@ struct Opts {
     /// `-W lint`: opt-in lints turned on.
     warn: Vec<String>,
     align_functions: Option<u32>,
+    /// `--no-branch-align` clears it: x86-64 vm programs keep indirect
+    /// branches off 32-byte boundaries (`BRANCH_ALIGN_LLVM_ARGS`).
+    branch_align: bool,
     /// What to build: an executable, a static archive or a shared object.
     kind: OutKind,
     /// `--header out.h`: also write a C header for the `export "C"` functions.
@@ -175,7 +178,7 @@ enum Tls {
 }
 
 const USAGE: &str = "\
-usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N]
+usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N] [--no-branch-align]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc] [-W handler_frame]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
                   [--cfg NAME]   (keep code marked #[cfg(NAME)], drop #[cfg(not(NAME))]; docs/language.md section 1.4)
@@ -305,6 +308,23 @@ const GOTO_LLVM_ARGS: &[&str] = &[
 /// whole module; it only costs code size.
 const SWITCH_LLVM_ARGS: &[&str] = &["-enable-tail-merge=false"];
 
+/// LLVM options for x86-64 programs with a vm (docs/lowering.md §3): no
+/// branch (the dispatch `jmp *%rax` that ends every handler, a
+/// conditional jump, a macro-fused compare and jump) crosses or ends at a
+/// 32-byte boundary. On Skylake-derived cores the microcode fix for the
+/// JCC erratum keeps such a branch's 32-byte block out of the decoded-uop
+/// cache, so a hot handler whose dispatch jump ends there runs from the
+/// legacy decoders (the wasm interpreter: 1.4x the time on three PolyBench
+/// kernels, depending only on where the linker put one handler). Clang's
+/// `-mbranches-within-32B-boundaries` covers jumps but not indirect ones;
+/// these options add those. The padding is prefixes on earlier
+/// instructions where they fit, else nops. `--no-branch-align` drops it.
+const BRANCH_ALIGN_LLVM_ARGS: &[&str] = &[
+    "-x86-align-branch-boundary=32",
+    "-x86-align-branch=fused+jcc+jmp+indirect",
+    "-x86-pad-max-prefix-size=5",
+];
+
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
 /// The options: the LLVM options the program's dispatch modes need
 /// (`GOTO_LLVM_ARGS`, `SWITCH_LLVM_ARGS`).
@@ -408,6 +428,9 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     }
     if prog.vms.iter().any(|v| v.dispatch == tir::Dispatch::Switch) {
         llvm_args.extend(SWITCH_LLVM_ARGS);
+    }
+    if opts.branch_align && !prog.vms.is_empty() && opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::X86_64 {
+        llvm_args.extend(BRANCH_ALIGN_LLVM_ARGS);
     }
     let library = opts.kind != OutKind::Exe;
     if library {
@@ -622,6 +645,7 @@ fn parse_args() -> Result<Opts, String> {
         deny_warnings: false,
         warn: vec![],
         align_functions: None,
+        branch_align: true,
         kind: OutKind::Exe,
         header: None,
         header_prefix: String::new(),
@@ -657,6 +681,7 @@ fn parse_args() -> Result<Opts, String> {
             "--release" | "-O" => o.release = true,
             "--emit-llvm" => o.emit_llvm = true,
             "--keep-ll" => o.keep_ll = true,
+            "--no-branch-align" => o.branch_align = false,
             "--lib" => o.kind = OutKind::Static,
             "--shared" => o.kind = OutKind::Shared,
             "--header" => o.header = Some(PathBuf::from(args.next().ok_or("--header needs a path")?)),

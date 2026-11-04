@@ -1116,7 +1116,30 @@ interleaved, `--align-functions=64`).
 | target check: `preserve_none` available? otherwise warn and fall back to `goto` (not implemented: both targets have it) | portability |
 | executables `-fno-pic -no-pie`; `--lib`/`--shared` `-fPIC` | absolute dispatch-table addresses; libraries link anywhere |
 | initial-exec TLS; local-dynamic for `--shared` (`--tls=`) | `dlopen`-safe shared objects (§4) |
+| x86-64 programs with a vm: `-mllvm -x86-align-branch-boundary=32 -x86-align-branch=fused+jcc+jmp+indirect -x86-pad-max-prefix-size=5` (`--no-branch-align` drops them) | no branch, dispatch jumps included, crosses or ends at a 32-byte boundary (the JCC erratum, below) |
 | `--cpu=NAME` (or `LOIMI_CPU`): `-march=NAME` on x86-64, `-mcpu=NAME` on AArch64, for every clang run of the build (the program, JIT stencils, C runtimes, `-W handler_frame`'s assembly); default none, the target's baseline (SSE2, NEON) | portable binaries by default; vector code for a newer CPU when asked (below) |
+
+**Branch alignment.** On Skylake-derived Intel cores (Skylake to
+Comet Lake, Cascade Lake; the i7-6700 here) the microcode fix for the
+JCC erratum keeps any 32-byte code block with a branch that crosses or
+ends at its end out of the decoded-uop cache: that code runs from the
+legacy decoders. A handler is short, so one badly placed dispatch
+`jmp *%rax` puts most of it there, and which handlers that hits depends
+only on where the linker put them. In the wasm interpreter one such
+handler (`F64_LOAD__AR`, whose dispatch jump ended exactly at a 64-byte
+boundary) made three PolyBench kernels take 1.4 times as long
+(cholesky 0.92 s against 0.63 s; examples/wasm/FRICTION.md, round
+three), and moving every handler by 128 bytes made the effect go away.
+Clang's `-mbranches-within-32B-boundaries` pads conditional and direct
+jumps but not indirect ones, which are the ones that matter in a
+threaded interpreter, so the driver passes the underlying options with
+`indirect` added. The padding is a prefix on an earlier instruction
+where one fits (no extra uop), else a nop; the binaries grow by about
+1%. Measured, `--align-functions=64`, best of 5 interleaved, with against
+without: wasm PolyBench 0.963 (geometric mean of 30; the three kernels
+0.67-0.70), wasm tuning set 1.003, Mini 0.99 (14 programs), MiniJS 1.01
+(14), per program within ±4% for the interpreters without such a
+handler, both ways: the padding moves code, so other placements change.
 
 **`--cpu`.** The driver asks clang which extensions the CPU has
 (`clang -march=NAME -E -dM`: `__SSSE3__`, `__SSE4_1__`), so `native` and
