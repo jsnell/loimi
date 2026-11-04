@@ -351,6 +351,51 @@ pub vm Scheme {
         dst = P(new(&ctx.heap, Pair { car: a, cdr: b }));
         next
     }
+    /// R[dst] = (vector R[base] .. R[base+n-1]).
+    op VECTOR(dst: reg, base: callbase, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let cnt = n as u64;
+        let v = new(&ctx.heap, Vect { rtd: V.Imm(value.IMM_NIL) }, cnt);
+        let src = regs + base as u64;
+        for i in 0..cnt { v.data.ptr[i] = src[i]; }
+        dst = Vec(v);
+        next
+    }
+    /// R[dst] = a record of type R[base] with fields R[base+1] .. R[base+n]
+    /// (the constructor of a define-record-type).
+    op RECORD(dst: reg, base: callbase, n: imm) : ABC {
+        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
+        let cnt = n as u64;
+        let src = regs + base as u64;
+        let v = new(&ctx.heap, Vect { rtd: src[0] }, cnt);
+        for i in 0..cnt { v.data.ptr[i] = src[i + 1]; }
+        dst = Vec(v);
+        next
+    }
+    /// (memq x l): a loop in the handler instead of a native call.
+    op MEMQ(dst: reg, x: reg, l: reg) : ABC {
+        let key = x;
+        var cur = l;
+        while let P(p) = cur {
+            if p.car == key { dst = cur; next }
+            cur = p.cdr;
+        }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
+    /// (assq x l).
+    op ASSQ(dst: reg, x: reg, l: reg) : ABC {
+        let key = x;
+        var cur = l;
+        while let P(p) = cur {
+            let e = p.car;
+            let P(q) = e else { cold { raise rt.type_err(ctx, "assoc", "pair", e) } };
+            if q.car == key { dst = e; next }
+            cur = p.cdr;
+        }
+        dst = Imm(value.IMM_FALSE);
+        next
+    }
     op SETCAR(a: reg, b: reg) : ABC {
         if let P(p) = a { p.car = b; next }
         cold { raise rt.type_err(ctx, "set-car!", "pair", a) }

@@ -38,7 +38,7 @@ enum K { Const, Ref, GRef, Set, GSet, GDef, If, Lambda, Seq, Call, Prim, Let, Le
 
 /// Ops for builtins compiled inline.
 enum PO { Add, Sub, Mul, Div, Quo, Rem, Mod, NumEq, Lt, Gt, Le, Ge, Eq, Eqv, Cons, Vref, ZeroP, Not, NullP, PairP, Car, Cdr, SetCar, SetCdr, Vset,
-    SymP, NumP, FixP, StrP, VecP }
+    SymP, NumP, FixP, StrP, VecP, Vector, Record, Memq, Assq }
 
 struct Var {
     name: Gc<Sym>,
@@ -266,6 +266,8 @@ fn inline_prim(name: str) -> ?(PO, i64) {
     if name.eq("exact-integer?") { return Some((PO.FixP, 1)); }
     if name.eq("string?") { return Some((PO.StrP, 1)); }
     if name.eq("vector?") { return Some((PO.VecP, 1)); }
+    if name.eq("memq") { return Some((PO.Memq, 2)); }
+    if name.eq("assq") { return Some((PO.Assq, 2)); }
     None
 }
 
@@ -379,6 +381,21 @@ fn Comp.inline_call(c: *Comp, name: str, args: V, argc: i64) -> ?*Node {
             return Some(n);
         }
     }
+    // (list a b ...) is a chain of conses; (vector a b ...) and the
+    // constructors of records allocate from consecutive registers.
+    if name.eq("list") and argc <= 16 {
+        var l = c.args(args);
+        var n = c.konst(value.nil());
+        var i = l.len;
+        while i > 0 {
+            i -= 1;
+            n = c.prim2(PO.Cons, l.at(i), n);
+        }
+        l.free();
+        return Some(n);
+    }
+    if name.eq("vector") and argc <= 64 { return Some(c.prim(PO.Vector, c.args(args))); }
+    if name.eq("%record") and argc >= 1 and argc <= 64 { return Some(c.prim(PO.Record, c.args(args))); }
     let Some((po, want)) = inline_prim(name) else { return None; };
     if argc == want { return Some(c.prim(po, c.args(args))); }
     // Left-fold + and * over more operands; (- x) is (- 0 x).
@@ -2196,6 +2213,25 @@ fn Gen.prim(g: *Gen, n: *Node, dst: u32) {
     let d = dst as u8;
     let po = n.po;
     var args = n.list;
+    if po == PO.Vector or po == PO.Record {
+        let base = g.top();
+        for i in 0..args.len {
+            let r = g.alloc();
+            g.to(args.at(i), r);
+        }
+        if po == PO.Vector {
+            g.emit(Scheme.VECTOR(d, base as u8, args.len as u8));
+        } else {
+            g.emit(Scheme.RECORD(d, base as u8, (args.len - 1) as u8));
+        }
+        return;
+    }
+    if po == PO.Memq or po == PO.Assq {
+        let a = g.any(args.at(0)) as u8;
+        let b = g.any(args.at(1)) as u8;
+        g.emit(if po == PO.Memq { Scheme.MEMQ(d, a, b) } else { Scheme.ASSQ(d, a, b) });
+        return;
+    }
     // x + c, c + x, x - c with a small constant c.
     if po == PO.Add or po == PO.Sub {
         if let Some(k) = small_const(args.at(1)) {

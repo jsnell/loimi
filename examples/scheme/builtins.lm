@@ -98,6 +98,7 @@ pub const P_APPLY: i32 = 55;
 pub const P_CALLCC: i32 = 132;
 
 /// (name, minimum arguments, maximum arguments or -1).
+#[inline]
 pub fn prim_info(id: i32) -> (str, i32, i32) {
     match id {
         0 => ("+", 0, -1),
