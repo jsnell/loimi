@@ -55,6 +55,9 @@ pub struct Pred {
     vals: *Verified<Wam>,
     mask: u64,
     dynamic: bool,
+    /// `code` is the INDEX block: calls index the first argument
+    /// themselves (vm `enter`), one dispatch less.
+    indexed: bool,
     defined: bool,
     system: bool,
     library: bool,
@@ -165,6 +168,7 @@ pub fn new_pred(m: *Machine, f: u32) -> *Pred {
     p.kvar = 0;
     p.mask = 0;
     p.dynamic = false;
+    p.indexed = false;
     p.defined = false;
     p.system = false;
     p.library = false;
@@ -247,6 +251,7 @@ pub fn unlink(p: *Pred, c: *Clause) {
 
 pub fn mark_dirty(p: *Pred) {
     p.code = p.stub;
+    p.indexed = false;
 }
 
 /// Rebuild a predicate's entry code from its live clauses.
@@ -255,6 +260,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
     var cur = p.first;
     while let Some(c) = cur { if !c.erased { live.push(c); } cur = c.next; }
     p.mask = 0;
+    p.indexed = false;
     if live.len == 0 {
         p.code = if p.dynamic or p.defined { m.fail_code } else { block1(m, Wam.UNDEF(p.f)) };
         live.free();
@@ -314,6 +320,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
     sub.free();
     live.free();
     p.code = block1(m, Wam.INDEX(p.f));
+    p.indexed = true;
 }
 
 // ---- the clause compiler ------------------------------------------------

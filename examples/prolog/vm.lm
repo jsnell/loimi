@@ -342,20 +342,33 @@ pub vm Wam {
         e = e.ce;
         next
     }
+    /// Enter predicate `pr`: through its first-argument index (the INDEX
+    /// op's work, without dispatching to it), or its code.
+    fn enter(pr: *Pred) -> never {
+        if pr.indexed {
+            let t = deref(ctx.x[0]);
+            match t {
+                Ref(_) => jump pr.var_code,
+                Lst(_) => jump pr.lst_code,
+                _ => jump pr.lookup(compile.key_of(t)),
+            }
+        }
+        jump pr.code
+    }
     op CALL(p: pred) : A {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) {
             cold { gc.collect(&ctx.heap); ctx.cp = next_pc; ctx.b0 = ctx.b; jump ctx.preds.ptr[p].code }
         }
         ctx.cp = next_pc;
         ctx.b0 = ctx.b;
-        jump ctx.preds.ptr[p].code
+        enter(ctx.preds.ptr[p])
     }
     op EXECUTE(p: pred) : A {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) {
             cold { gc.collect(&ctx.heap); ctx.b0 = ctx.b; jump ctx.preds.ptr[p].code }
         }
         ctx.b0 = ctx.b;
-        jump ctx.preds.ptr[p].code
+        enter(ctx.preds.ptr[p])
     }
     op PROCEED() : A { jump ctx.cp }
     op FAIL() : A { backtrack() }
