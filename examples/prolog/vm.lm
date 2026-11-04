@@ -145,8 +145,33 @@ pub vm Wam {
         }
         backtrack()
     }
-    op GET_STRUCT(r: xr, f: fun) : RB {
-        let t = deref(r);
+    // GET_NESTED and GET_NESTED_LIST match a compound inside a head
+    // structure, in the register its UNIFY_NESTED loaded; in write mode
+    // that register holds `Unb` and `ctx.pend` the slot to build it in
+    // (no variable is made for the slot, to be bound at once).
+    inline for (name, kind, val, pending, slot) in [
+        ("GET_STRUCT", xr, r, false, s),
+        ("GET_NESTED", imm, ctx.xregs()[r], ctx.xregs()[r] == Term.Unb, ctx.pendp()[r]),
+    ] {
+    op #name(r: kind, f: fun) : RB {
+        if pending {
+            let n = ctx.db.farity(f as u32) as u64;
+            if n <= 4 {
+                let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+                *slot = Term.Str(st);
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
+            cold {
+                let st = ctx.mk_struct(f as u32, n);
+                *slot = Term.Str(st);
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
+        }
+        let t = deref(val);
         if let Str(st) = t {
             if st.f == f as u32 { s = st.args.ptr; wm = false; next }
             backtrack()
@@ -170,6 +195,7 @@ pub vm Wam {
         }
         backtrack()
     }
+    }
     /// A structure of arity `n` (1 to 4) without the allocator's refill
     /// (constant lengths: the zeroing is inline, not a memset call).
     fn try_struct(f: u32, n: u64) -> ?Gc<Struct> {
@@ -180,8 +206,19 @@ pub vm Wam {
         }
     }
 
-    op GET_LIST(r: xr) : RR {
-        let t = deref(r);
+    inline for (name, kind, val, pending, slot) in [
+        ("GET_LIST", xr, r, false, s),
+        ("GET_NESTED_LIST", imm, ctx.xregs()[r], ctx.xregs()[r] == Term.Unb, ctx.pendp()[r]),
+    ] {
+    op #name(r: kind) : RR {
+        if pending {
+            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            *slot = Term.Lst(c);
+            s = c as *Term;
+            wm = true;
+            next
+        }
+        let t = deref(val);
         if let Lst(c) = t { s = c as *Term; wm = false; next }
         if let Ref(v) = t {
             if can_bind(v) {
@@ -200,6 +237,22 @@ pub vm Wam {
             }
         }
         backtrack()
+    }
+    }
+
+    /// A compound argument of a head structure, matched later by
+    /// GET_NESTED/GET_NESTED_LIST `r`: read mode loads it, write mode
+    /// leaves `Unb` in `r` and the slot in `ctx.pendp()[r]`.
+    op UNIFY_NESTED(r: imm) : RR {
+        if wm {
+            ctx.pendp()[r] = s;
+            ctx.xregs()[r] = Term.Unb;
+            s = s + 1;
+            next
+        }
+        ctx.xregs()[r] = *s;
+        s = s + 1;
+        next
     }
 
     inline for (name, kind) in [("UNIFY_VAR_X", xr), ("UNIFY_VAR_Y", yr)] {

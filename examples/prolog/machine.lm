@@ -45,6 +45,9 @@ pub const CHOICE_WORDS: u64 = 9;
 
 pub struct Machine {
     x: [Term; 256],
+    /// Slots of head structures being built, per register (vm
+    /// UNIFY_NESTED).
+    pend: [*Term; 256],
     heap: gc.Heap,
     db: Db,
     cp: *u32,
@@ -90,6 +93,8 @@ pub struct Machine {
 pub fn Frame.ys(f: *Frame) -> *Term { (f + 1) as *Term }
 /// The argument registers as a raw pointer (no bounds checks).
 pub fn Machine.xregs(m: *Machine) -> *Term { &m.x[0] }
+/// `pend` as a raw pointer (no bounds checks).
+pub fn Machine.pendp(m: *Machine) -> **Term { &m.pend[0] }
 pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n }
 pub fn Choice.args(c: *Choice) -> *Term { (c + 1) as *Term }
 pub fn Choice.end(c: *Choice) -> *Choice { ((((c + 1) as *Term) + c.n) as *Choice) }

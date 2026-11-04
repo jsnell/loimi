@@ -500,7 +500,7 @@ fn C.unify_args(c: *C, t0: Term) {
                 Big(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
                 _ => {
                     let r = c.temp();
-                    c.emit(Wam.UNIFY_VAR_X(r as u8));
+                    c.emit(Wam.UNIFY_NESTED(r as u8));
                     work.push((r, a));
                 }
             }
@@ -513,9 +513,9 @@ fn C.unify_args(c: *C, t0: Term) {
         match a {
             Str(s) => {
                 if s.f >= 65536 { c.error = Some("too many functors"); break; }
-                c.emit(Wam.GET_STRUCT(r as u8, s.f as u16));
+                c.emit(Wam.GET_NESTED(r as u8, s.f as u16));
             }
-            _ => c.emit(Wam.GET_LIST(r as u8)),
+            _ => c.emit(Wam.GET_NESTED_LIST(r as u8)),
         }
         t = a;
     }
