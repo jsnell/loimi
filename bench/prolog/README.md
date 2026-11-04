@@ -186,6 +186,53 @@ startup included: ~0.02 s for swipl, ~0.03 s for tpl). All programs print
 
 ## Results: the Loimi Prolog (examples/prolog)
 
+`run.py -n 3 --exe before=OLD --exe loimi=NEW`, 2026-11-04, release
+builds (`loimi build examples/prolog/main.lm --release
+--align-functions=64 -o ...`, tail-call dispatch) of the code before
+(commit 90e86d0) and after the second optimization round, best of 3
+interleaved runs, on a machine shared with another agent (load 4-6 on
+8 threads: SWI-Prolog took 1.2-1.4 s where it took 1.0 s on 2026-11-03,
+so compare ratios within a run). Geometric means: 0.63x SWI-Prolog,
+0.15x Trealla; the code before took 0.83x and 0.20x in the same run
+(0.79x and 0.19x in the quieter run below). What changed:
+`examples/prolog/FRICTION.md`, "Optimizations, second round".
+
+| benchmark | K | swipl s | trealla s | before s | loimi s | before/swipl | loimi/swipl | loimi/trealla |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| boyer | 57 | 1.236 | 5.987 | 1.525 | 1.297 | 1.23 | 1.05 | 0.22 |
+| browse | 41 | 1.218 | 7.628 | 1.092 | 0.914 | 0.90 | 0.75 | 0.12 |
+| chat_parser | 160 | 1.265 | 4.317 | 1.175 | 0.961 | 0.93 | 0.76 | 0.22 |
+| crypt | 7900 | 1.201 | 4.539 | 0.700 | 0.571 | 0.58 | 0.48 | 0.13 |
+| derive | 290000 | 1.212 | 3.295 | 0.848 | 0.649 | 0.70 | 0.54 | 0.20 |
+| divide10 | 630000 | 1.301 | 3.313 | 0.977 | 0.700 | 0.75 | 0.54 | 0.21 |
+| eval | 11000 | 1.152 | 3.029 | 0.808 | 0.604 | 0.70 | 0.52 | 0.20 |
+| fast_mu | 29000 | 1.194 | 4.688 | 0.999 | 0.730 | 0.84 | 0.61 | 0.16 |
+| flatten | 48000 | 1.221 | 6.411 | 1.007 | 0.828 | 0.82 | 0.68 | 0.13 |
+| log10 | 1300000 | 1.236 | 4.327 | 0.724 | 0.624 | 0.59 | 0.50 | 0.14 |
+| meta_qsort | 4700 | 1.180 | 6.143 | 0.760 | 0.653 | 0.64 | 0.55 | 0.11 |
+| mu | 30000 | 1.175 | 5.118 | 0.757 | 0.600 | 0.64 | 0.51 | 0.12 |
+| nand | 1100 | 1.165 | 4.484 | 0.936 | 0.799 | 0.80 | 0.69 | 0.18 |
+| nreverse | 83000 | 1.198 | 9.766 | 0.993 | 0.917 | 0.83 | 0.77 | 0.09 |
+| ops8 | 920000 | 1.316 | 4.274 | 0.921 | 0.757 | 0.70 | 0.57 | 0.18 |
+| perfect | 3900 | 1.315 | 6.486 | 1.159 | 0.874 | 0.88 | 0.66 | 0.13 |
+| poly_10 | 510 | 1.199 | 3.634 | 1.250 | 0.792 | 1.04 | 0.66 | 0.22 |
+| prover | 25000 | 1.308 | 4.856 | 0.806 | 0.724 | 0.62 | 0.55 | 0.15 |
+| qsort | 47000 | 1.352 | 8.169 | 0.873 | 0.843 | 0.65 | 0.62 | 0.10 |
+| queens_8 | 560 | 1.311 | 7.163 | 1.404 | 0.618 | 1.07 | 0.47 | 0.09 |
+| query | 11000 | 1.343 | 6.379 | 1.409 | 0.639 | 1.05 | 0.48 | 0.10 |
+| reducer | 640 | 1.343 | 6.406 | 1.432 | 1.211 | 1.07 | 0.90 | 0.19 |
+| sendmore | 410 | 1.269 | 4.562 | 1.396 | 0.698 | 1.10 | 0.55 | 0.15 |
+| serialise | 78000 | 1.318 | 6.893 | 0.976 | 0.947 | 0.74 | 0.72 | 0.14 |
+| sieve | 61 | 1.421 | 3.409 | 2.464 | 1.274 | 1.73 | 0.90 | 0.37 |
+| simple_analyzer | 1500 | 1.346 | 6.687 | 1.202 | 0.994 | 0.89 | 0.74 | 0.15 |
+| tak | 160 | 1.332 | 4.903 | 0.810 | 0.549 | 0.61 | 0.41 | 0.11 |
+| times10 | 670000 | 1.303 | 3.815 | 0.910 | 0.738 | 0.70 | 0.57 | 0.19 |
+| unify | 13000 | 1.301 | 8.713 | 1.317 | 1.039 | 1.01 | 0.80 | 0.12 |
+| zebra | 680 | 1.336 | 4.735 | 1.187 | 1.025 | 0.89 | 0.77 | 0.22 |
+| geomean |  |  |  |  |  | 0.83 | 0.63 | 0.15 |
+
+## Results before the second round (2026-11-03)
+
 `run.py -n 3 --loimi examples/prolog/.build/pl` with a release build
 (`loimi build examples/prolog/main.lm --release -o ...`, tail-call
 dispatch), 2026-11-03, best of 3 interleaved runs, on a shared machine.

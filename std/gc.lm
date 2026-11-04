@@ -803,6 +803,12 @@ pub fn collect(h: *Heap) uses gc {
                 ch.pending = true;
                 ch.used = false;
             }
+        } else if !ch.used and ch.nfree == ch.n {
+            // Empty at the last sweep and not allocated from since: still
+            // empty (its free list stands). A heap whose live data shrank
+            // keeps its chunks; sweeping them all at every collection made
+            // the sweep cost follow the heap's high-water mark instead of
+            // what was allocated.
         } else if ch.used or !minor {
             var head = 0 as *Header;
             var nfree: u64 = 0;

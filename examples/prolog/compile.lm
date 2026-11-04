@@ -25,6 +25,12 @@ pub object Code { code: verified [u32] by Wam }
 pub struct Clause {
     code: Verified<Wam>,
     len: u64,
+    /// The words before the neck cut, if they are only arithmetic guards
+    /// and moves into temporaries (the head binds nothing): `guard_chain`
+    /// can run them without a choicepoint. 0: not such a clause.
+    guard: u64,
+    /// The guard words (unoptimized), when `guard` > 0.
+    gwords: *u32,
     key: u64,
     term: Term,
     erased: bool,
@@ -55,6 +61,9 @@ pub struct Pred {
     vals: *Verified<Wam>,
     mask: u64,
     dynamic: bool,
+    /// `code` is the INDEX block: calls index the first argument
+    /// themselves (vm `enter`), one dispatch less.
+    indexed: bool,
     defined: bool,
     system: bool,
     library: bool,
@@ -137,10 +146,78 @@ pub fn push_target(v: *mem.Vec<u32>, w: u32) {
     for _ in 0..Wam.CW_Target { v.push(0); }
 }
 
+/// The comparison ops and their guard-chain forms.
+fn jump_form(op: u32) -> u32 {
+    if op == Wam.OP_LT { Wam.OP_JLT } else if op == Wam.OP_LE { Wam.OP_JLE } else if op == Wam.OP_GT { Wam.OP_JGT }
+    else if op == Wam.OP_GE { Wam.OP_JGE } else if op == Wam.OP_NEQ { Wam.OP_JNEQ } else if op == Wam.OP_NNE { Wam.OP_JNNE } else { 0 }
+}
+
+/// `Clause.guard` of clause code `w` (unoptimized words) for a predicate
+/// of `arity`: the words before a NECK_CUT that are only comparisons,
+/// arithmetic into temporaries and GET_VAR_X into temporaries (registers
+/// at or above `arity`), with at least one comparison; else 0.
+fn guard_words(w: *mem.Vec<u32>, arity: u64) -> u64 {
+    var i: u64 = 0;
+    var cmps: u64 = 0;
+    while i < w.len {
+        let x = w.ptr[i];
+        let op = Wam.base_op(x);
+        if op == Wam.OP_NECK_CUT { return if cmps > 0 { i } else { 0 }; }
+        let r = ((x >> 8) & 255) as u64;
+        if jump_form(op) != 0 { cmps += 1; }
+        else if op == Wam.OP_GET_VAR_X or op == Wam.OP_ADD or op == Wam.OP_SUB or op == Wam.OP_MUL
+            or op == Wam.OP_ADDI or op == Wam.OP_SUBI or op == Wam.OP_MULI {
+            if r < arity { return 0; }
+        } else {
+            return 0;
+        }
+        i += Wam.op_size(x);
+    }
+    0
+}
+
+/// Code that tries `cs` in order, the first clause's guards without a
+/// choicepoint if it has them (`Clause.guard`): they jump to the code of
+/// the other clauses when they fail, and into the clause at its neck cut
+/// when they hold.
+fn guard_chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> ?Verified<Wam> {
+    let c0 = cs.ptr[0];
+    if c0.guard == 0 { return None; }
+    let Some(at) = c0.code.resume_at(c0.guard) else { return None; };
+    var rest: mem.Vec<*Clause> = mem.Vec.new();
+    for i in 1..cs.len { rest.push(cs.ptr[i]); }
+    let other = chain(m, p, &rest);
+    rest.free();
+    let Some(alt) = other.resume_at(0) else { return None; };
+    var v: mem.Vec<u32> = mem.Vec.new();
+    var to: mem.Vec<Wam.Resume> = mem.Vec.new();
+    var i: u64 = 0;
+    while i < c0.guard {
+        let x = c0.gwords[i];
+        let op = Wam.base_op(x);
+        let j = jump_form(op);
+        if j != 0 {
+            push_target(&v, (x & !(255 as u32)) | j);
+            to.push(alt);
+        } else {
+            for k in 0..Wam.op_size(x) { v.push(c0.gwords[i + k]); }
+        }
+        i += Wam.op_size(x);
+    }
+    push_target(&v, Wam.JUMP());
+    to.push(at);
+    let r = finish(m, &v, 0);
+    r.fill_resumes(to.ptr.slice(to.len));
+    v.free();
+    to.free();
+    Some(r)
+}
+
 /// Code that tries `cs` in order.
 fn chain(m: *Machine, p: *Pred, cs: *mem.Vec<*Clause>) -> Verified<Wam> {
     if cs.len == 0 { return m.fail_code; }
     if cs.len == 1 { return cs.ptr[0].code; }
+    if let Some(g) = guard_chain(m, p, cs) { return g; }
     var v: mem.Vec<u32> = mem.Vec.new();
     var to: mem.Vec<Wam.Resume> = mem.Vec.new();
     for i in 0..cs.len {
@@ -165,6 +242,7 @@ pub fn new_pred(m: *Machine, f: u32) -> *Pred {
     p.kvar = 0;
     p.mask = 0;
     p.dynamic = false;
+    p.indexed = false;
     p.defined = false;
     p.system = false;
     p.library = false;
@@ -247,6 +325,7 @@ pub fn unlink(p: *Pred, c: *Clause) {
 
 pub fn mark_dirty(p: *Pred) {
     p.code = p.stub;
+    p.indexed = false;
 }
 
 /// Rebuild a predicate's entry code from its live clauses.
@@ -255,6 +334,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
     var cur = p.first;
     while let Some(c) = cur { if !c.erased { live.push(c); } cur = c.next; }
     p.mask = 0;
+    p.indexed = false;
     if live.len == 0 {
         p.code = if p.dynamic or p.defined { m.fail_code } else { block1(m, Wam.UNDEF(p.f)) };
         live.free();
@@ -314,6 +394,7 @@ pub fn reindex(m: *Machine, p: *Pred) {
     sub.free();
     live.free();
     p.code = block1(m, Wam.INDEX(p.f));
+    p.indexed = true;
 }
 
 // ---- the clause compiler ------------------------------------------------
@@ -465,6 +546,9 @@ fn C.unify_args(c: *C, t0: Term) {
     loop {
         let n = match t { Str(s) => s.args.len, _ => 2 };
         var voids: u64 = 0;
+        // A list cell as the last argument, with nothing else pending, is
+        // matched next: UNIFY_LIST moves into it without a register.
+        var tail: ?Term = None;
         for i in 0..n {
             let a = deref(term.arg_of(t, i));
             if let Ref(_) = a {
@@ -491,14 +575,28 @@ fn C.unify_args(c: *C, t0: Term) {
                 }
                 Flt(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
                 Big(_) => { let k = c.konst(a); c.emit(Wam.UNIFY_CONST(k as u32)); }
+                Lst(_) => {
+                    if i + 1 == n and wi == work.len {
+                        tail = Some(a);
+                    } else {
+                        let r = c.temp();
+                        c.emit(Wam.UNIFY_NESTED(r as u8));
+                        work.push((r, a));
+                    }
+                }
                 _ => {
                     let r = c.temp();
-                    c.emit(Wam.UNIFY_VAR_X(r as u8));
+                    c.emit(Wam.UNIFY_NESTED(r as u8));
                     work.push((r, a));
                 }
             }
         }
         if voids > 0 { c.emit(Wam.UNIFY_VOID(voids as u32)); }
+        if let Some(a) = tail {
+            c.emit(Wam.UNIFY_LIST());
+            t = a;
+            continue;
+        }
         if wi == work.len { break; }
         let (r, a) = work.ptr[wi];
         wi += 1;
@@ -506,9 +604,9 @@ fn C.unify_args(c: *C, t0: Term) {
         match a {
             Str(s) => {
                 if s.f >= 65536 { c.error = Some("too many functors"); break; }
-                c.emit(Wam.GET_STRUCT(r as u8, s.f as u16));
+                c.emit(Wam.GET_NESTED(r as u8, s.f as u16));
             }
-            _ => c.emit(Wam.GET_LIST(r as u8)),
+            _ => c.emit(Wam.GET_NESTED_LIST(r as u8)),
         }
         t = a;
     }
@@ -863,6 +961,57 @@ fn C.inline_arith(c: *C, g: Term) -> bool {
 
 // Goals -----------------------------------------------------------------
 
+/// A type test or arithmetic comparison whose variables all occur in the
+/// head: it compiles inline (`inline_builtin`, `inline_arith`: the head
+/// has bound its variables), reading registers and writing only
+/// temporaries above the argument registers. Register allocation lets
+/// chunk 0's call keep head variables in their argument registers across
+/// such guards (`X =< Y, !, p(..)`).
+fn inline_guard(m: *Machine, g: Term, head: Term) -> bool {
+    let (name_a, ar) = term.name_arity(&m.db, g);
+    let name = m.db.name(name_a);
+    if ar == 1 {
+        return match name {
+            "var" => true, "nonvar" => true, "atom" => true, "atomic" => true,
+            "integer" => true, "number" => true, "compound" => true, "callable" => true,
+            _ => false,
+        };
+    }
+    if ar != 2 { return false; }
+    // `=` always compiles inline; it writes temporaries and the registers
+    // of the variables it gives a value (as `is` does its left side's).
+    if name.eq("=") { return true; }
+    if name.eq("is") {
+        let Ref(_) = deref(term.arg_of(g, 0)) else { return false; };
+        return head_arith(m, term.arg_of(g, 1), head, 0);
+    }
+    let cmp = match name {
+        "<" => true, "=<" => true, ">" => true, ">=" => true, "=:=" => true, "=\\=" => true,
+        _ => false,
+    };
+    cmp and head_arith(m, term.arg_of(g, 0), head, 0) and head_arith(m, term.arg_of(g, 1), head, 0)
+}
+
+/// `C.arith_ok` before compiling: numbers, variables of the head, and the
+/// inlined operators.
+fn head_arith(m: *Machine, t0: Term, head: Term, depth: u32) -> bool {
+    if depth > 20 { return false; }
+    let t = deref(t0);
+    match t {
+        Int(_) => true,
+        Flt(_) => true,
+        Big(_) => true,
+        Ref(_) => occurs(head, t),
+        Str(s) => {
+            let name = m.db.name(m.db.fname(s.f));
+            if s.args.len == 2 and arith_op(name).is_some() { return head_arith(m, s.args[0], head, depth + 1) and head_arith(m, s.args[1], head, depth + 1); }
+            if s.args.len == 1 and name.eq("-") { return head_arith(m, s.args[0], head, depth + 1); }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// A body goal after flattening: a call (of a predicate or a builtin), or
 /// a cut of this clause.
 enum GoalKind { Call, Builtin, Cut }
@@ -1103,13 +1252,15 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     if ncalls > 1 { env = true; }
     if ncalls == 1 and (last_call as u64) + 1 < goals.len { env = true; }
     // Head variables may stay in the argument register they arrive in if
-    // chunk 0 has at most one goal (cuts aside) and that goal leaves the
+    // chunk 0 has at most one goal (cuts, and guards that compile inline
+    // and write no argument register, aside) and that goal leaves the
     // register alone (has the variable at the same position, or fewer
     // arguments).
     var chunk0: mem.Vec<u64> = mem.Vec.new();
     for i in 0..goals.len {
         let g = goals.ptr[i];
         if g.kind == GoalKind.Cut { continue; }
+        if g.kind == GoalKind.Builtin and inline_guard(m, g.t, head) { continue; }
         chunk0.push(i);
         if g.kind == GoalKind.Call { break; }
     }
@@ -1247,6 +1398,11 @@ pub fn compile_clause(m: *Machine, head0: Term, body: Term, cv: ?Term) -> ?*Clau
     let cl = mem.alloc<Clause>(1);
     cl.code = finish(m, &c.code, c.nperm as u64);
     cl.len = c.code.len;
+    cl.guard = guard_words(&c.code, arity);
+    if cl.guard > 0 {
+        cl.gwords = mem.alloc<u32>(cl.guard);
+        for i in 0..cl.guard { cl.gwords[i] = c.code.ptr[i]; }
+    }
     cl.key = if arity > 0 { key_of(deref(term.arg_of(head, 0))) } else { 0 };
     cl.term = Term.Atom(term.A_TRUE);
     cl.erased = false;

@@ -151,16 +151,24 @@ pub fn eval(m: *Machine, t0: Term) -> Result<Term, Term> {
             return Err(builtins.type_error(m, "evaluable", t));
         }
         Str(s) => {
-            let name = m.db.name(m.db.fname(s.f));
             let n = s.args.len;
-            if n == 1 {
-                let x = eval(m, s.args[0])?;
-                return unary(m, name, x, t);
-            }
             if n == 2 {
                 let x = eval(m, s.args[0])?;
                 let y = eval(m, s.args[1])?;
-                return binary(m, name, x, y, t);
+                let a = m.db.fname(s.f);
+                // + - * on small integers without looking up the name
+                // (`binary` matches it as a string).
+                if let (Int(i), Int(j)) = (x, y) {
+                    if a == term.A_PLUS { if let Some(r) = i.add_checked(j) { return Ok(Term.Int(r)); } }
+                    else if a == term.A_MINUS { if let Some(r) = i.sub_checked(j) { return Ok(Term.Int(r)); } }
+                    else if a == term.A_STAR { if let Some(r) = i.mul_checked(j) { return Ok(Term.Int(r)); } }
+                }
+                return binary(m, m.db.name(a), x, y, t);
+            }
+            let name = m.db.name(m.db.fname(s.f));
+            if n == 1 {
+                let x = eval(m, s.args[0])?;
+                return unary(m, name, x, t);
             }
             return Err(builtins.type_error(m, "evaluable", builtins.pi(m, m.db.fname(s.f), n as u32)));
         }

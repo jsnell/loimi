@@ -87,10 +87,23 @@ pub vm Wam {
     // call), and allocations use `try_new`, whose refill is a `cold`
     // block ending in `redo`. Everything else is `cold`.
 
-    /// `v` can be bound without a trail entry, and its write barrier will
-    /// not log it (so LLVM drops the barrier's slow path: the inline
-    /// remembered-set push needs registers that GET_VAL_X would spill).
-    fn quick_bind(v: Gc<Var>) -> bool { v.stamp >= ctx.b.stamp and !gc.needs_barrier(v as *u8) }
+    /// `v` can be bound inline (`bind_now`): its write barrier will not
+    /// log it (so LLVM drops the barrier's slow path: the inline
+    /// remembered-set push needs registers that GET_VAL_X would spill),
+    /// and it needs no trail entry or the trail has room for one.
+    fn can_bind(v: Gc<Var>) -> bool {
+        !gc.needs_barrier(v as *u8) and (v.stamp >= ctx.b.stamp or ctx.tr < ctx.trail_cap)
+    }
+    /// Bind `v` (`can_bind` held), trailing it if it is older than the
+    /// newest choicepoint.
+    fn bind_now(v: Gc<Var>, t: Term) {
+        if v.stamp < ctx.b.stamp {
+            let tr = ctx.tr;
+            ctx.trail[tr] = Term.Ref(v);
+            ctx.tr = tr + 1;
+        }
+        v.val = t;
+    }
 
 
     // An unbound variable meeting a non-variable binds in place; anything
@@ -101,24 +114,49 @@ pub vm Wam {
             let x = deref(r);
             let y = deref(a);
             if x == y { next }
-            if let Ref(v) = x and !is_var(y) and quick_bind(v) { v.val = y; next }
-            if let Ref(v) = y and !is_var(x) and quick_bind(v) { v.val = x; next }
+            if quick_unify(x, y) { next }
+            if clash(x, y) { backtrack() }
             cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
     fn is_var(t: Term) -> bool { match t { Ref(_) => true, _ => false } }
+    /// An atom or a small integer: equal only to the same word.
+    fn is_small_atomic(t: Term) -> bool { match t { Atom(_) => true, Int(_) => true, _ => false } }
+    /// Dereferenced `x` and `y` (not the same word) cannot unify: neither
+    /// is a variable and one is an atom or small integer.
+    fn clash(x: Term, y: Term) -> bool {
+        !is_var(x) and !is_var(y) and (is_small_atomic(x) or is_small_atomic(y))
+    }
+    /// Unify dereferenced `x` and `y` (not the same word) inline where one
+    /// is a variable that `can_bind` (the younger of two variables is
+    /// bound to the older); false if that is not the case (nothing done).
+    fn quick_unify(x: Term, y: Term) -> bool {
+        if let Ref(v) = x {
+            if let Ref(w) = y {
+                if v.stamp < w.stamp {
+                    if can_bind(w) { bind_now(w, x); return true; }
+                    return false;
+                }
+            }
+            if can_bind(v) { bind_now(v, y); return true; }
+            return false;
+        }
+        if let Ref(v) = y and can_bind(v) { bind_now(v, x); return true; }
+        false
+    }
 
-    inline for (name, kind, value) in [
-        ("GET_ATOM", atom, Term.Atom(c as u32)),
-        ("GET_CONST", kst, c),
+    inline for (name, kind, value, quick_fail) in [
+        ("GET_ATOM", atom, Term.Atom(c as u32), true),
+        ("GET_CONST", kst, c, false),
     ] {
         op #name(r: xr, c: kind) : RB {
             let t = deref(r);
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { v.val = value; next }
+                if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
+            if quick_fail and clash(t, value) { backtrack() }
             // Big integers are equal by value.
             cold { if unify(ctx, t, value) { next } backtrack() }
         }
@@ -127,20 +165,52 @@ pub vm Wam {
         let t = deref(r);
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { v.val = Term.Int(k as i48); next }
+            if can_bind(v) { bind_now(v, Term.Int(k as i48)); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
     }
-    op GET_STRUCT(r: xr, f: fun) : RB {
-        let t = deref(r);
+    // GET_NESTED and GET_NESTED_LIST match a compound inside a head
+    // structure, in the register its UNIFY_NESTED loaded; in write mode
+    // that register holds `Unb` and `ctx.pend` the slot to build it in
+    // (no variable is made for the slot, to be bound at once).
+    inline for (name, kind, val, pending, slot) in [
+        ("GET_STRUCT", xr, r, false, s),
+        ("GET_NESTED", imm, ctx.xregs()[r], ctx.xregs()[r] == Term.Unb, ctx.pendp()[r]),
+    ] {
+    op #name(r: kind, f: fun) : RB {
+        if pending {
+            let n = ctx.db.farity(f as u32) as u64;
+            if n <= 4 {
+                let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+                *slot = Term.Str(st);
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
+            cold {
+                let st = ctx.mk_struct(f as u32, n);
+                *slot = Term.Str(st);
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
+        }
+        let t = deref(val);
         if let Str(st) = t {
             if st.f == f as u32 { s = st.args.ptr; wm = false; next }
             backtrack()
         }
         if let Ref(v) = t {
+            let n = ctx.db.farity(f as u32) as u64;
+            if n <= 4 and can_bind(v) {
+                let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+                bind_now(v, Term.Str(st));
+                s = st.args.ptr;
+                wm = true;
+                next
+            }
             cold {
-                let n = ctx.db.farity(f as u32) as u64;
                 let st = ctx.mk_struct(f as u32, n);
                 ctx.bind(v, Term.Str(st));
                 s = st.args.ptr;
@@ -150,13 +220,35 @@ pub vm Wam {
         }
         backtrack()
     }
-    op GET_LIST(r: xr) : RR {
-        let t = deref(r);
+    }
+    /// A structure of arity `n` (1 to 4) without the allocator's refill
+    /// (constant lengths: the zeroing is inline, not a memset call).
+    fn try_struct(f: u32, n: u64) -> ?Gc<Struct> {
+        if n <= 2 {
+            if n == 1 { try_new(&ctx.heap, Struct { f: f }, 1) } else { try_new(&ctx.heap, Struct { f: f }, 2) }
+        } else {
+            if n == 3 { try_new(&ctx.heap, Struct { f: f }, 3) } else { try_new(&ctx.heap, Struct { f: f }, 4) }
+        }
+    }
+
+    inline for (name, kind, val, pending, slot) in [
+        ("GET_LIST", xr, r, false, s),
+        ("GET_NESTED_LIST", imm, ctx.xregs()[r], ctx.xregs()[r] == Term.Unb, ctx.pendp()[r]),
+    ] {
+    op #name(r: kind) : RR {
+        if pending {
+            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            *slot = Term.Lst(c);
+            s = c as *Term;
+            wm = true;
+            next
+        }
+        let t = deref(val);
         if let Lst(c) = t { s = c as *Term; wm = false; next }
         if let Ref(v) = t {
-            if quick_bind(v) {
+            if can_bind(v) {
                 let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
-                v.val = Term.Lst(c);
+                bind_now(v, Term.Lst(c));
                 s = c as *Term;
                 wm = true;
                 next
@@ -170,6 +262,53 @@ pub vm Wam {
             }
         }
         backtrack()
+    }
+    }
+
+    /// The last argument of a head structure is a list cell, matched now:
+    /// `s` moves into it (read mode), or into a new cell stored there
+    /// (write mode, or binding a variable found there).
+    op UNIFY_LIST() : A {
+        if wm {
+            let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+            *s = Term.Lst(c);
+            s = c as *Term;
+            next
+        }
+        let t = deref(*s);
+        if let Lst(c) = t { s = c as *Term; next }
+        if let Ref(v) = t {
+            if can_bind(v) {
+                let Some(c) = ctx.try_cons() else cold { ctx.make_room(); redo };
+                bind_now(v, Term.Lst(c));
+                s = c as *Term;
+                wm = true;
+                next
+            }
+            cold {
+                let c = new(&ctx.heap, Cons { head: Term.Unb, tail: Term.Unb });
+                ctx.bind(v, Term.Lst(c));
+                s = c as *Term;
+                wm = true;
+                next
+            }
+        }
+        backtrack()
+    }
+
+    /// A compound argument of a head structure, matched later by
+    /// GET_NESTED/GET_NESTED_LIST `r`: read mode loads it, write mode
+    /// leaves `Unb` in `r` and the slot in `ctx.pendp()[r]`.
+    op UNIFY_NESTED(r: imm) : RR {
+        if wm {
+            ctx.pendp()[r] = s;
+            ctx.xregs()[r] = Term.Unb;
+            s = s + 1;
+            next
+        }
+        ctx.xregs()[r] = *s;
+        s = s + 1;
+        next
     }
 
     inline for (name, kind) in [("UNIFY_VAR_X", xr), ("UNIFY_VAR_Y", yr)] {
@@ -192,7 +331,12 @@ pub vm Wam {
             let t = *s;
             s = s + 1;
             if t == r { next }
-            cold { if unify(ctx, r, t) { next } backtrack() }
+            let x = deref(r);
+            let y = deref(t);
+            if x == y { next }
+            if quick_unify(x, y) { next }
+            if clash(x, y) { backtrack() }
+            cold { if unify(ctx, x, y) { next } backtrack() }
         }
     }
     inline for (name, kind, value) in [
@@ -205,9 +349,10 @@ pub vm Wam {
             s = s + 1;
             if t == value { next }
             if let Ref(v) = t {
-                if quick_bind(v) { v.val = value; next }
+                if can_bind(v) { bind_now(v, value); next }
                 cold { ctx.bind(v, value); next }
             }
+            if clash(t, value) { backtrack() }
             cold { if unify(ctx, t, value) { next } backtrack() }
         }
     }
@@ -217,13 +362,19 @@ pub vm Wam {
         s = s + 1;
         if t == Term.Int(k as i48) { next }
         if let Ref(v) = t {
-            if quick_bind(v) { v.val = Term.Int(k as i48); next }
+            if can_bind(v) { bind_now(v, Term.Int(k as i48)); next }
             cold { ctx.bind(v, Term.Int(k as i48)); next }
         }
         backtrack()
     }
     op UNIFY_VOID(n: imm) : A {
         if wm {
+            if n == 1 {
+                let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+                *s = v;
+                s = s + 1;
+                next
+            }
             cold {
                 for i in 0..n { *s = ctx.new_var(); s = s + 1; }
                 next
@@ -249,6 +400,13 @@ pub vm Wam {
     op PUT_INT(r: xr, v: simm) : RsB { r = Term.Int(v as i48); next }
     op PUT_CONST(r: xr, k: kst) : RB { r = k; next }
     op PUT_STRUCT(r: xr, f: fun) : RB {
+        let n = ctx.db.farity(f as u32) as u64;
+        if n <= 4 {
+            let Some(st) = try_struct(f as u32, n) else cold { ctx.make_room_struct(n); redo };
+            r = Term.Str(st);
+            s = st.args.ptr;
+            next
+        }
         cold {
             let n = ctx.db.farity(f as u32) as u64;
             let st = ctx.mk_struct(f as u32, n);
@@ -278,6 +436,12 @@ pub vm Wam {
     op SET_INT(v: simm) : sA { *s = Term.Int(v as i48); s = s + 1; next }
     op SET_CONST(k: kst) : A { *s = k; s = s + 1; next }
     op SET_VOID(n: imm) : A {
+        if n == 1 {
+            let Some(v) = ctx.try_var() else cold { ctx.make_room(); redo };
+            *s = v;
+            s = s + 1;
+            next
+        }
         cold {
             for i in 0..n { *s = ctx.new_var(); s = s + 1; }
             next
@@ -305,20 +469,33 @@ pub vm Wam {
         e = e.ce;
         next
     }
+    /// Enter predicate `pr`: through its first-argument index (the INDEX
+    /// op's work, without dispatching to it), or its code.
+    fn enter(pr: *Pred) -> never {
+        if pr.indexed {
+            let t = deref(ctx.x[0]);
+            match t {
+                Ref(_) => jump pr.var_code,
+                Lst(_) => jump pr.lst_code,
+                _ => jump pr.lookup(compile.key_of(t)),
+            }
+        }
+        jump pr.code
+    }
     op CALL(p: pred) : A {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) {
             cold { gc.collect(&ctx.heap); ctx.cp = next_pc; ctx.b0 = ctx.b; jump ctx.preds.ptr[p].code }
         }
         ctx.cp = next_pc;
         ctx.b0 = ctx.b;
-        jump ctx.preds.ptr[p].code
+        enter(ctx.preds.ptr[p])
     }
     op EXECUTE(p: pred) : A {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) {
             cold { gc.collect(&ctx.heap); ctx.b0 = ctx.b; jump ctx.preds.ptr[p].code }
         }
         ctx.b0 = ctx.b;
-        jump ctx.preds.ptr[p].code
+        enter(ctx.preds.ptr[p])
     }
     op PROCEED() : A { jump ctx.cp }
     op FAIL() : A { backtrack() }
@@ -330,7 +507,9 @@ pub vm Wam {
         ("SUB", "SUBI", "sub_checked", -, 1),
         ("MUL", "MULI", "mul_checked", *, 2),
     ] {
-        op #name(d: xr, a: xr, b: xr) : R3 {
+        op #name(d: xr, a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             match (a, b) {
                 (Int(x), Int(y)) => if let Some(r) = x.#checked(y) { d = Term.Int(r); next },
                 (Flt(x), Flt(y)) => { d = Term.Flt(x sym y); next }
@@ -338,7 +517,8 @@ pub vm Wam {
             }
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
-        op #iname(d: xr, a: xr, k: simm) : R3s {
+        op #iname(d: xr, a0: xr, k: simm) : R3s {
+            let a = deref(a0);
             if let Int(x) = a and let Some(r) = x.#checked(k as i48) { d = Term.Int(r); next }
             cold { d = arith.arith2(ctx, kind, a, Term.Int(k as i48))?; next }
         }
@@ -346,17 +526,19 @@ pub vm Wam {
     // Integer fast paths; everything else (floats, bound variables,
     // errors) is the generic evaluator's.
     inline for (name, kind, guard, result) in [
-        ("IDIV", 3, y != 0 and !(y == -1), x / y),
+        ("IDIV", 3, y != 0 and !(y == -1), ((x as i64) / (y as i64)) as i48),
         ("MOD", 4, y > 0, ((x % y) + y) % y),
         ("SHR", 5, y >= 0 and y < 48, x >> y),
         ("AND", 7, true, x & y),
         ("OR", 8, true, x | y),
-        ("REM", 10, y != 0 and !(y == -1), x % y),
+        ("REM", 10, y != 0 and !(y == -1), ((x as i64) % (y as i64)) as i48),
         ("XOR", 11, true, x ^ y),
         ("MIN", 12, true, if x <= y { x } else { y }),
         ("MAX", 13, true, if x >= y { x } else { y }),
     ] {
-        op #name(d: xr, a: xr, b: xr) : R3 {
+        op #name(d: xr, a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) and guard { d = Term.Int(result); next }
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
@@ -366,12 +548,15 @@ pub vm Wam {
             cold { d = arith.arith2(ctx, kind, a, b)?; next }
         }
     }
-    op NEG(d: xr, a: xr) : R3 {
+    op NEG(d: xr, a0: xr) : R3 {
+        let a = deref(a0);
         if let Int(x) = a and let Some(r) = (0 as i48).sub_checked(x) { d = Term.Int(r); next }
         cold { d = arith.arith2(ctx, 1, Term.Int(0), a)?; next }
     }
     inline for (name, test) in [("LT", c < 0), ("LE", c <= 0), ("GT", c > 0), ("GE", c >= 0), ("NEQ", c == 0), ("NNE", c != 0)] {
-        op #name(a: xr, b: xr) : R3 {
+        op #name(a0: xr, b0: xr) : R3 {
+            let a = deref(a0);
+            let b = deref(b0);
             if let (Int(x), Int(y)) = (a, b) {
                 let c: i32 = if x < y { -1 } else if x > y { 1 } else { 0 };
                 if test { next }
@@ -437,9 +622,9 @@ pub vm Wam {
         let nn = deref(n);
         let tt = deref(t);
         if let (Int(i), Str(st)) = (nn, tt) and (i as i64) >= 1 and (i as u64) <= st.args.len {
-            let v = st.args[(i as u64) - 1];
+            let v = st.args.ptr[(i as u64) - 1];    // in bounds: checked above
             let x = deref(a);
-            if let Ref(xv) = x and quick_bind(xv) { xv.val = v; next }
+            if let Ref(xv) = x and can_bind(xv) { bind_now(xv, v); next }
             cold { if unify(ctx, x, v) { next } backtrack() }
         }
         cold {
@@ -488,6 +673,28 @@ pub vm Wam {
         jump cache.code
     }
 
+    // Guard chains (compile.guard_chain): a first clause whose head binds
+    // nothing and whose arithmetic guards come before its neck cut runs
+    // its guards without a choicepoint; a failed guard jumps to the
+    // other clauses' code, a passed one into the clause after the guards.
+    inline for (name, test) in [("JLT", c < 0), ("JLE", c <= 0), ("JGT", c > 0), ("JGE", c >= 0), ("JNEQ", c == 0), ("JNNE", c != 0)] {
+        op #name(a0: xr, b0: xr) : R3 + Target {
+            let a = deref(a0);
+            let b = deref(b0);
+            if let (Int(x), Int(y)) = (a, b) {
+                let c: i32 = if x < y { -1 } else if x > y { 1 } else { 0 };
+                if test { next }
+                jump cache.code
+            }
+            cold {
+                let c = arith.cmp2(ctx, a, b)?;
+                if test { next }
+                jump cache.code
+            }
+        }
+    }
+    op JUMP() : A + Target { jump cache.code }
+
     /// First-argument indexing: pick the clauses that can match A1.
     op INDEX(p: pred) : A {
         let pr = ctx.preds.ptr[p];
@@ -529,6 +736,13 @@ pub vm Wam {
     super PVY2 = PUT_VAL_Y; PUT_VAL_Y;
     super PVX2 = PUT_VAL_X; PUT_VAL_X;
     super DEALLOC_EXEC = DEALLOCATE; EXECUTE;
+    super GVY2 = GET_VAR_Y; GET_VAR_Y;
+    super GVX2 = GET_VAR_X; GET_VAR_X;
+    super PVARY_CALL = PUT_VAR_Y; CALL;
+    super ALLOC_LEVEL = ALLOCATE; GET_LEVEL;
+    super GL_UATOM = GET_LIST; UNIFY_ATOM;
+    super GVALX_PROCEED = GET_VAL_X; PROCEED;
+    super GINT_PROCEED = GET_INT; PROCEED;
 
     entry run(m: *Machine, code: Verified<Wam>) -> i32 uses gc {
         ctx = m;

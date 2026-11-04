@@ -81,6 +81,10 @@ implementation; `git log` has the details.
   ([lowering.md §6](docs/lowering.md#6-switch-mode)).
 - **AArch64**: the tail-call dispatch table's address stays in a
   register ([lowering.md §3](docs/lowering.md#3-handlers-in-tailcall-mode)).
+- **The generated verifier** sizes its instruction-boundary bitmap to
+  the code (a 256-byte stack array up to 2048 words, else calloc'd)
+  instead of zeroing 64 KiB per call: Prolog's `assertz`, which verifies
+  each new clause, spent half its time there.
 
 ### Values
 
@@ -267,6 +271,10 @@ implementation; `git log` has the details.
   `match`-guard rooting bug
   ([stdlib/gc.md](docs/stdlib/gc.md#checking-roots---gc-check-roots),
   [status.md](docs/status.md#gc-rooting-fuzzing)).
+- A non-generational collection no longer sweeps chunks that were empty
+  after the last sweep and not allocated from since: the sweep followed
+  the heap's high-water mark (Prolog's boyer 0.91, poly_10 0.85 of the
+  time).
 
 ### Embedding and threads
 
@@ -362,3 +370,11 @@ implementation; `git log` has the details.
   pyperformance programs, on `std.bigint` and `std.dict`.
 - Mini has Lua 5.4 coroutines that switch threads inside the vm run
   ([`examples/mini/COROUTINES.md`](examples/mini/COROUTINES.md)).
+- The Prolog takes 0.63x SWI-Prolog's time and 0.15x Trealla's by
+  geometric mean over its 30 benchmarks (was 0.79x and 0.19x):
+  dereferenced arithmetic operands, inline structure allocation,
+  trailing and failure in the head ops, nested head structures built in
+  place, calls that index the first argument themselves,
+  choicepoint-free guard chains, register allocation across guards,
+  supers
+  ([FRICTION.md](examples/prolog/FRICTION.md#optimizations-second-round-2026-11-04)).

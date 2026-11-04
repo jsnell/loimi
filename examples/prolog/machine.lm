@@ -45,6 +45,9 @@ pub const CHOICE_WORDS: u64 = 9;
 
 pub struct Machine {
     x: [Term; 256],
+    /// Slots of head structures being built, per register (vm
+    /// UNIFY_NESTED).
+    pend: [*Term; 256],
     heap: gc.Heap,
     db: Db,
     cp: *u32,
@@ -90,6 +93,8 @@ pub struct Machine {
 pub fn Frame.ys(f: *Frame) -> *Term { (f + 1) as *Term }
 /// The argument registers as a raw pointer (no bounds checks).
 pub fn Machine.xregs(m: *Machine) -> *Term { &m.x[0] }
+/// `pend` as a raw pointer (no bounds checks).
+pub fn Machine.pendp(m: *Machine) -> **Term { &m.pend[0] }
 pub fn Frame.end(f: *Frame) -> *Term { ((f + 1) as *Term) + f.n }
 pub fn Choice.args(c: *Choice) -> *Term { (c + 1) as *Term }
 pub fn Choice.end(c: *Choice) -> *Choice { ((((c + 1) as *Term) + c.n) as *Choice) }
@@ -161,6 +166,10 @@ pub fn Machine.try_cons(m: *Machine) -> ?Gc<Cons> {
 #[cold]
 pub fn Machine.make_room(m: *Machine) { gc.make_room(&m.heap, size_of<Cons>()); }
 
+/// Room for a structure of arity `n` (`try_struct` in the vm).
+#[cold]
+pub fn Machine.make_room_struct(m: *Machine, n: u64) { gc.make_room(&m.heap, size_of<Struct>() + n * 8); }
+
 #[inline]
 pub fn Machine.new_var(m: *Machine) -> Term {
     Term.Ref(new(&m.heap, Var { val: Term.Unb, stamp: m.cstamp }))
@@ -208,6 +217,24 @@ pub fn Machine.mk1(m: *Machine, name: u32, a: Term) -> Term {
     Term.Str(s)
 }
 
+/// One argument pair of `unify`: the common cases (identical terms, a
+/// variable against a non-variable) without a call.
+#[inline]
+fn unify_arg(m: *Machine, a0: Term, b0: Term) -> bool {
+    if a0 == b0 { return true; }
+    let a = deref(a0);
+    let b = deref(b0);
+    if a == b { return true; }
+    match (a, b) {
+        (Ref(_), Ref(_)) => unify(m, a, b),
+        (Ref(va), _) => { m.bind(va, b); true }
+        (_, Ref(vb)) => { m.bind(vb, a); true }
+        (Atom(_), Atom(_)) => false,
+        (Int(_), Int(_)) => false,
+        _ => unify(m, a, b),
+    }
+}
+
 /// Unify two terms, binding (and trailing) variables. Recursion follows the
 /// arguments except the last, which is a loop, so long lists do not recurse.
 pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
@@ -223,7 +250,7 @@ pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
             (Ref(va), _) => { m.bind(va, b); return true; }
             (_, Ref(vb)) => { m.bind(vb, a); return true; }
             (Lst(x), Lst(y)) => {
-                if !unify(m, x.head, y.head) { return false; }
+                if !unify_arg(m, x.head, y.head) { return false; }
                 a = deref(x.tail);
                 b = deref(y.tail);
             }
@@ -232,7 +259,7 @@ pub fn unify(m: *Machine, a0: Term, b0: Term) -> bool {
                 if x.f != y.f { return false; }
                 let n = x.args.len;
                 for i in 0..n - 1 {
-                    if !unify(m, x.args[i], y.args[i]) { return false; }
+                    if !unify_arg(m, x.args.ptr[i], y.args.ptr[i]) { return false; }
                 }
                 a = deref(x.args[n - 1]);
                 b = deref(y.args[n - 1]);

@@ -618,7 +618,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     for (_, b) in &v.checks {
         check_call_arity(sm, b.span, &[("is_insn_boundary", 1), ("reject", 2)])?;
     }
-    let boundary = format!("{n}__boundary(__code, &__bits, ");
+    let boundary = format!("{n}__boundary(__code, __bits, ");
     let clause = |kind: &str| -> Option<String> {
         let e = v.operands.iter().find(|o| o.name.name == kind)?.verify.as_ref()?;
         let ctx = format!("the generated verifier, checking operand kind `{kind}`");
@@ -628,7 +628,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     let stack = has_stack(v);
     let _ = writeln!(
         s,
-        "fn {n}__boundary(code: []{w}, bits: *[u8; 65536], p: *{w}) -> bool {{\n\
+        "fn {n}__boundary(code: []{w}, bits: *u8, p: *{w}) -> bool {{\n\
          \x20 if p < code.ptr or p >= code.ptr + code.len {{ return false; }}\n\
          \x20 let i = ((p as u64) - (code.ptr as u64)) / {};\n\
          \x20 (bits[i >> 3] >> ((i & 7) as u8)) & 1 == 1\n}}",
@@ -664,10 +664,27 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     let fail = |at: &str, reason: &str, op: &str| format!("return {n}__verr({at}, {n}__VerifyReason.{reason}, {op}, 0, {nk});");
     let jw = maps_words(l, jit);
     let op_at = |at: &str| format!("{n}__opcode(__code[{at}]) as u64");
-    let _ = writeln!(s, "{vis}fn {n}__verify({}) -> Result<{n}__Verified, {n}__VerifyError> {{", params.join(", "));
+    // The instruction-boundary bitmap: on the stack for blocks of up to
+    // 2048 words (zeroing a fixed 64 KiB array cost more than verifying a
+    // small block: a Prolog `assertz` spent half its time in that memset),
+    // calloc'd for larger ones.
+    let ctx_args: String = v.verify_ctx.iter().map(|p| format!(", {}", p.name.name)).collect();
+    let _ = writeln!(
+        s,
+        "{vis}fn {n}__verify({}) -> Result<{n}__Verified, {n}__VerifyError> {{\n\
+         \x20 if __code.len <= 2048 {{\n\
+         \x20   var __small: [u8; 256] = [0; 256];\n\
+         \x20   return {n}__verify_in(__code{ctx_args}, &__small[0]);\n\
+         \x20 }}\n\
+         \x20 let __big = __extern_calloc((__code.len >> 3) + 1, 1);\n\
+         \x20 let __r = {n}__verify_in(__code{ctx_args}, __big);\n\
+         \x20 __extern_free(__big);\n\
+         \x20 __r\n}}",
+        params.join(", ")
+    );
+    let _ = writeln!(s, "fn {n}__verify_in({}, __bits: *u8) -> Result<{n}__Verified, {n}__VerifyError> {{", params.join(", "));
     let _ = writeln!(s, "  if __code.len == 0 {{ {} }}", fail("0", "Empty", &format!("{n}__NUM_OPS")));
     let _ = writeln!(s, "  if __code.len > 524288 {{ {} }}", fail("0", "TooLong", &format!("{n}__NUM_OPS")));
-    let _ = writeln!(s, "  var __bits: [u8; 65536] = [0; 65536];");
     let _ = writeln!(s, "  var __i: u64 = 0;");
     let _ = writeln!(s, "  var __last: u64 = 0;");
     let _ = writeln!(s, "  while __i < __code.len {{");
@@ -748,7 +765,6 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
     }
     let _ = writeln!(s, "      _ => {{}}\n    }}");
     let _ = writeln!(s, "    __i += {n}__base_size(__code[__i]);\n  }}");
-    let ctx_args: String = v.verify_ctx.iter().map(|p| format!(", {}", p.name.name)).collect();
     let ctx_params: String = params[1..].iter().map(|p| format!(", {p}")).collect();
     // Stack effects: the depth pass (see `generate_stack`).
     if stack {
@@ -779,12 +795,12 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
                 s,
                 "  let __base = __extern_calloc(__code.len, {}) as *{w};\n\
                  \x20 {n}__base_copy(__code, __base);\n\
-                 \x20 let __r = {n}__checks(__base.slice(__code.len), &__bits{ctx_args});\n\
+                 \x20 let __r = {n}__checks(__base.slice(__code.len), __bits{ctx_args});\n\
                  \x20 __extern_free(__base as *u8);",
                 l.word_bits / 8
             );
         } else {
-            let _ = writeln!(s, "  let __r = {n}__checks(__code, &__bits{ctx_args});");
+            let _ = writeln!(s, "  let __r = {n}__checks(__code, __bits{ctx_args});");
         }
         let _ = writeln!(s, "  if let Err(__e) = __r {{ return Err(__e); }}");
     }
@@ -816,7 +832,7 @@ fn generate_verifier(sm: &SourceMap, v: &VmDecl, l: &VmLayout, jit: bool) -> Res
              \x20 let op = if at < code.len {{ {n}__base_op(code[at]) as u64 }} else {{ {n}__NUM_OPS }};\n\
              \x20 Err({n}__VerifyError {{ at: at, reason: {n}__VerifyReason.Check, op: op, operand: check, kind: {nk}, msg: if msg.len == 0 {{ \"rejected\" }} else {{ msg }} }})\n}}"
         );
-        let _ = writeln!(s, "fn {n}__checks(code: []{w}, __bits: *[u8; 65536]{ctx_params}) -> Result<(), {n}__VerifyError> {{");
+        let _ = writeln!(s, "fn {n}__checks(code: []{w}, __bits: *u8{ctx_params}) -> Result<(), {n}__VerifyError> {{");
         for (i, (name, b)) in v.checks.iter().enumerate() {
             if v.verify_ctx.iter().any(|p| p.name.name == "code") {
                 return Err(Diag::new(name.span, "`verify` blocks see the code as `code`; rename the verify_context `code`"));
@@ -2348,7 +2364,7 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
                 if has_stack(v) {
                     src.push_str(&generate_stack(sm, v, &l, jit)?);
                 }
-                if (has_stack(v) || !v.checks.is_empty() || !v.supers.is_empty()) && !externs {
+                if !externs {
                     // The verifier's scratch arrays (see `c_externs`).
                     src.push_str("extern \"C\" fn __extern_calloc(n: u64, size: u64) -> *u8;\nextern \"C\" fn __extern_free(p: *u8);\n");
                     externs = true;
