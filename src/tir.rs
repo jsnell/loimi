@@ -187,6 +187,9 @@ pub enum Intr {
     /// `align 1`.
     LoadUnaligned,
     StoreUnaligned,
+    /// `p.prefetch()`: a hint to bring the cache line at `p` into the
+    /// cache for reading (`llvm.prefetch`); never faults.
+    Prefetch,
     /// `p.atomic_load()` (acquire), `p.atomic_load_relaxed()`
     /// (monotonic), `p.atomic_store(v)` (release), `p.atomic_swap(v)`,
     /// `p.atomic_add(v)` (the old value) and `p.atomic_cas(old, new)`

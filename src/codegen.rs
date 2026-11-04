@@ -2604,6 +2604,11 @@ impl<'a, 'p> FnGen<'a, 'p> {
                 let lt = self.ty(&e.ty);
                 self.inst(format!("load {}, ptr {}, align 1", lt, vals[0]))
             }
+            Intr::Prefetch => {
+                decl(self.cg, "declare void @llvm.prefetch.p0(ptr, i32, i32, i32)");
+                self.emit(format!("call void @llvm.prefetch.p0(ptr {}, i32 0, i32 3, i32 1)", vals[0]));
+                "zeroinitializer".into()
+            }
             Intr::StoreUnaligned => {
                 let lt = self.ty(&args[1].ty);
                 self.emit(format!("store {} {}, ptr {}, align 1", lt, vals[1], vals[0]));
