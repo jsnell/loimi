@@ -642,6 +642,28 @@ pub vm Wam {
         jump cache.code
     }
 
+    // Guard chains (compile.guard_chain): a first clause whose head binds
+    // nothing and whose arithmetic guards come before its neck cut runs
+    // its guards without a choicepoint; a failed guard jumps to the
+    // other clauses' code, a passed one into the clause after the guards.
+    inline for (name, test) in [("JLT", c < 0), ("JLE", c <= 0), ("JGT", c > 0), ("JGE", c >= 0), ("JNEQ", c == 0), ("JNNE", c != 0)] {
+        op #name(a0: xr, b0: xr) : R3 + Target {
+            let a = deref(a0);
+            let b = deref(b0);
+            if let (Int(x), Int(y)) = (a, b) {
+                let c: i32 = if x < y { -1 } else if x > y { 1 } else { 0 };
+                if test { next }
+                jump cache.code
+            }
+            cold {
+                let c = arith.cmp2(ctx, a, b)?;
+                if test { next }
+                jump cache.code
+            }
+        }
+    }
+    op JUMP() : A + Target { jump cache.code }
+
     /// First-argument indexing: pick the clauses that can match A1.
     op INDEX(p: pred) : A {
         let pr = ctx.preds.ptr[p];
