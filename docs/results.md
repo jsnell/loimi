@@ -205,6 +205,16 @@ suite).
   objects that are never freed and the JIT compiles each as it gets hot
   (`examples/prolog/FRICTION.md`, item 6): that cell is marked † and the
   summary gives the geometric means with and without it.
+  *Note, 2026-11-04 (after this run):* both were the JIT's. Clauses
+  entered from try chains (`jump` through a `Wam.Resume`) never counted
+  toward compiling, so most clause code stayed interpreted, and the
+  registry of code objects was a sorted array kept by `memmove`, which
+  sieve's 700,000 asserted clauses made quadratic. With both fixed the
+  JIT build takes 0.98 of the interpreter's time over the 29 (1.04 for
+  the old build in the same A/B, CPU time, best of 3; unify and tak
+  0.83, mu and prover 1.16) and 1.30 on sieve (46 for the old build).
+  Not rerun here; see
+  [design/copy-and-patch.md §14](design/copy-and-patch.md#14-prolog-2026-11-04).
 
 ## GC: mark bitmaps instead of sweeping (2026-11-04)
 

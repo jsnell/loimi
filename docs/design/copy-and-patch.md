@@ -13,7 +13,9 @@ neither faster), section 11 sketches immutable operand kinds, and
 section 12 is the fourth phase, which implements them (no measurable
 gain). Section 13 measures keeping guest registers in machine registers
 (worth little over the suite; recommendation: stop the template-JIT
-line).
+line). Section 14 is Prolog (`examples/prolog`): clauses entered through
+resume points were never compiled, and the code-object registry was
+quadratic for programs that assert clauses.
 
 > Handlers are separate functions with a fixed register interface, which
 > is close to what a copy-and-patch template compiler needs. Can `vm`
@@ -1005,3 +1007,58 @@ time. If the speed matters later, start an optimizing tier over traces
 or loops, not more stencil variants. `LOIMI_JIT_REGDELAY` stays as a
 probe; the cache is kept on branch `jit-regcache-experiment` for
 reproduction.
+
+## 14. Prolog (2026-11-04)
+
+The Prolog interpreter (`examples/prolog`, a WAM) builds with
+`--jit-stencils` unchanged, every op has a stencil (116, 34 KB) and none
+exits to the interpreter. After its second and third optimization
+rounds, the JIT build took 1.11x the interpreter's time over 29 of the
+30 benchmarks (`results.md`, 2026-11-04; 0.92 unify to 1.43
+meta_qsort), and 48x on sieve. Two causes, both in the JIT, not in
+Prolog:
+
+- **Clauses entered through resume points never got hot.** Prolog's try
+  chains and guard chains (TRY/RETRY/TRUST, JLT..) enter a clause with
+  `jump cache.code`, a `Wam.Resume`. `jump_kind` classified that as
+  `Dynamic` (a return): it entered compiled code if there was some, but
+  never counted. Only chains and clauses called directly got compiled:
+  on times10, 21% of the samples were in compiled code. A jump through a
+  `Vm.Resume` is now its own kind (`JumpKind::Resume`) and counts like a
+  call, in the counting copies and, on the not-compiled path, in
+  stencils: 91% in compiled code. (Mini's coroutine resume is the only
+  other user; its JIT times are unchanged, 1.006 by geometric mean,
+  noise.)
+- **The registry was a sorted array**, kept by `memmove` on every
+  `loimi_jit_register`. Prolog verifies a code object per asserted
+  clause, never frees them (`FRICTION.md`, item 6), and the collector
+  reuses addresses, so inserts land anywhere: sieve registers 700,000
+  objects, and 85% of its time was that `memmove` (it compiled only 31
+  objects). The registry is now a treap: one descent to look for an
+  overlapping (freed) record, one to insert; lookups try the last
+  record found or registered first (a host registers code and then
+  `optimize`s it, two lookups of the same object). `LOIMI_JIT_STATS`
+  prints the objects registered. The policy question (do not JIT code
+  that is rewritten often, or JIT lazily) did not arise: the JIT
+  compiled little of sieve; it paid for knowing about the rest.
+
+Results (CPU time, best of 3, interleaved, `--align-functions=64`, one
+build of each, against the tail-call interpreter of the same source):
+over the 29, the JIT build took 1.04 of the interpreter's time before
+and **0.98 after** (unify 0.83, tak 0.83, crypt 0.86 .. prover 1.16,
+mu 1.16); sieve **1.30** (was 46 in this run). Default builds'
+IR of Mini, MiniJS, Scheme and Prolog is byte-identical.
+
+**What is left.** Prolog does not gain what Mini (0.78) does. Its ops
+do much more work per dispatch (unification, binding with trailing,
+allocation, hash lookup for first-argument indexing), so the dispatch
+and decoding a template JIT removes are a small share. And the JIT
+makes some control transfers harder to predict: `backtrack` jumps to
+`b.alt` and PROCEED to `ctx.cp` through one indirect jump each, whose
+target in the interpreter is the handler of an op (RETRY or TRUST; the
+op after a call: a few targets) but in compiled code is the address of
+that chain position or return point (one per clause). On mu, the most
+backtracking-heavy program, `backtrack` and TRY are the ops that grow
+(about 6% of the time) and the JIT build takes 1.16. Aligning compiled
+instructions to 16, 32 or 64 bytes (an experiment, not kept) changed
+nothing (0.996, 1.001, 1.008 of the time over 12 programs).

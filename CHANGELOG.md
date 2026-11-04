@@ -85,6 +85,13 @@ implementation; `git log` has the details.
   the code (a 256-byte stack array up to 2048 words, else calloc'd)
   instead of zeroing 64 KiB per call: Prolog's `assertz`, which verifies
   each new clause, spent half its time there.
+- **JIT (`--jit-stencils`)**: jumps to a `Vm.Resume` count toward
+  compiling like calls (Prolog enters clauses from its try chains that
+  way, and their code was never compiled), and the registry of code
+  objects is a treap instead of a sorted array (Prolog's sieve, which
+  asserts 700,000 clauses, spent 85% of its time in its inserts). Prolog's
+  JIT build: 1.04 → 0.98 of the interpreter's time, sieve 46 → 1.3
+  ([design/copy-and-patch.md §14](docs/design/copy-and-patch.md#14-prolog-2026-11-04)).
 
 ### Values
 

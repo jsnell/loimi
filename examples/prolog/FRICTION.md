@@ -563,6 +563,36 @@ beyond noise). Ours now takes less time than SWI-Prolog on all 30
 (boyer 0.52x, sieve 0.92x, reducer 0.76x). Table in
 bench/prolog/README.md.
 
+## The JIT build (2026-11-04)
+
+After the rounds above the `--jit-stencils` build (`LOIMI_JIT=1`) took
+1.11x the interpreter's time over the 29 programs other than sieve, and
+48x on sieve. Both causes were in the JIT, and Prolog's source did not
+change (design/copy-and-patch.md section 14):
+
+- The clauses of a try chain are entered by `jump cache.code` (a
+  `Wam.Resume`), which the JIT took for a return: it never counted, so
+  only the chains and the clauses called directly were compiled
+  (times10: 21% of the time in compiled code). Such jumps now count like
+  calls (91%).
+- Every asserted clause is a verified code object the JIT registers;
+  the registry was a sorted array kept by `memmove`, and sieve's 700,000
+  clauses made that quadratic (85% of its time). It is a treap now.
+
+JIT build against the interpreter, CPU time, best of 3: 0.98 over the
+29 (was 1.04 in the same run; unify 0.83, tak 0.83, mu and prover
+1.16), sieve 1.30 (was 46). The JIT gains less here than on Mini (0.78):
+the ops do most of their work in their bodies, and `backtrack` and
+PROCEED, whose indirect jumps reach a few handlers in the interpreter,
+reach one address per clause in compiled code (mu, which backtracks
+most, is the slowest). `check.sh` (full, and `-j`, which `cargo test`
+runs as `prolog_jit_stencils`) now runs the tests under the JIT with
+`LOIMI_JIT_HOT=2`, normally and under GC stress.
+
+Friction: none in the language; finding the first cause took a
+`LOIMI_JIT_DEBUG` listing (which code objects were compiled), as the
+statistics count compiles, not where the time is.
+
 ## Benchmarks (first round)
 
 `bench/prolog/run.py -n 3`: wall-clock seconds, best of three
