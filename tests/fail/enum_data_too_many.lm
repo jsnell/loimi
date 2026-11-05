@@ -1,0 +1,5 @@
+// Names and data on enum variants: enum data too many.
+// error: too many values: `P` declares 1 data key
+#[data(min: i32)]
+enum P { #[data(1, 2)] A }
+fn main() {}

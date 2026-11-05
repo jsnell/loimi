@@ -5,6 +5,7 @@ mod closures;
 mod codegen;
 mod diag;
 mod elf;
+mod enumgen;
 mod framelint;
 mod gcgen;
 mod generics;
@@ -354,6 +355,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
             return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
         }
     }
+    enumgen::expand(sm, &mut modules)?;
     vmexpand::expand(sm, &mut modules, opts.jit)?;
     let mut c = check::Checker::new(&modules);
     c.generated_files = sm.files.iter().enumerate().filter(|(_, f)| f.generated.is_some()).map(|(i, _)| i as u32).collect();

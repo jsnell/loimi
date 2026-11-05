@@ -1,0 +1,4 @@
+// Names and data on enum variants: enum name generic.
+// error: `P` is generic: names and data are for enums without type parameters
+enum P<T> { #[name("a")] A(T) }
+fn main() {}

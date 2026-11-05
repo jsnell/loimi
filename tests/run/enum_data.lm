@@ -1,0 +1,60 @@
+// Names and constant data on enum variants (`#[name]`, `#[data]`):
+// generated `name`, `from_name` and one accessor per data key.
+import std.io;
+
+#[data(min: i32, max: i32 = -1, pure: bool = true)]
+pub enum Prim: i32 {
+    #[name("+"), data(0)] Add,
+    #[name("car"), data(1, 1)] Car,
+    #[name("display"), data(1, 2, pure = false)] Display,
+    #[data(min = 0)] Vector,
+}
+
+// Payloads: `name` matches any payload; `from_name` needs none.
+enum Shape { #[name("circle")] Circle(f64), Square(f64, f64) }
+
+// `#[names]`: every variant named as written.
+#[names]
+enum Exc { TypeError, ValueError }
+
+// Data of other types: strings, enum values, options, tuples.
+#[data(sym: str, dual: ?Op = None, prec: (u8, bool) = (0, false))]
+enum Op {
+    #[data("<", Some(Op.Ge), (4, true))] Lt,
+    #[data(">=", Some(Op.Lt), (4, true))] Ge,
+    #[data(sym = "+", prec = (6, true))] Plus,
+}
+
+fn main() {
+    for i: i32 in 0..Prim.COUNT {
+        let p = i as Prim;
+        io.print(p.name()); io.print(" "); io.print_int(p.min() as i64); io.print(" ");
+        io.print_int(Prim.max(p) as i64); io.print(" "); io.print_bool(p.pure()); io.println("");
+    }
+    match Prim.from_name("car") { Some(p) => io.print_int(p as i64), None => io.print("none") }
+    io.println("");
+    io.println(if Prim.from_name("cdr").is_none() { "no cdr" } else { "?" });
+    io.println(Shape.Square(1.0, 2.0).name());
+    io.println(Shape.Circle(1.0).name());
+    io.println(Exc.ValueError.name());
+    io.print_bool(Exc.from_name("TypeError") == Some(Exc.TypeError)); io.println("");
+    for o in [Op.Lt, Op.Ge, Op.Plus] {
+        io.print(o.sym());
+        match o.dual() { Some(d) => { io.print(" dual "); io.print(d.sym()); }, None => io.print(" no dual") }
+        let (p, l) = o.prec();
+        io.print(" "); io.print_int(p as i64); io.print(" "); io.print_bool(l); io.println("");
+    }
+}
+// expect: + 0 -1 true
+// expect: car 1 1 true
+// expect: display 1 2 false
+// expect: Vector 0 -1 true
+// expect: 1
+// expect: no cdr
+// expect: Square
+// expect: circle
+// expect: ValueError
+// expect: true
+// expect: < dual >= 4 true
+// expect: >= dual < 4 true
+// expect: + no dual 6 true

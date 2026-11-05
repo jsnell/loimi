@@ -1,0 +1,4 @@
+// Names and data on enum variants: enum data no keys.
+// error: `P` declares no data keys: declare them on the enum
+enum P { #[data(1)] A }
+fn main() {}

@@ -105,7 +105,7 @@ pub fn check_attrs(attrs: &Attrs, what: &str, known: &[&str]) -> Res<()> {
             continue; // effects, recorded as attributes by `parse_fn`
         }
         if n == "allow" || known.contains(&n.as_str()) {
-            let flag = matches!(n.as_str(), "cold" | "unsafe" | "raw" | "safe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words");
+            let flag = matches!(n.as_str(), "cold" | "unsafe" | "raw" | "safe" | "thread_local" | "require_verified" | "forward" | "accumulate" | "test" | "track_caller" | "scan_raw_words" | "names");
             if flag && !args.is_empty() {
                 return Err(Diag::new(*sp, format!("`#[{}]` takes no arguments", n)));
             }
@@ -514,7 +514,7 @@ impl Parser {
                 self.bump();
                 let first = mod_attrs.list.len();
                 self.parse_attr_body(&mut mod_attrs)?;
-                check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec() }, "a module (`#![..]`)", &["safe", "lifetimes"])?;
+                check_attrs(&Attrs { list: mod_attrs.list[first..].to_vec(), data: vec![] }, "a module (`#![..]`)", &["safe", "lifetimes"])?;
                 continue;
             }
             let keep = self.take_cfg()?;
@@ -556,7 +556,22 @@ impl Parser {
             // `#[unsafe]` marks a function that only `unsafe { }` may name.
             let name = if self.is_kw("unsafe") { self.bump(); "unsafe".to_string() } else { self.ident()?.name };
             let mut args = Vec::new();
-            if self.eat("(") {
+            if name == "data" && self.eat("(") {
+                // `#[data(key: T = e, key = e, e)]`: entries are parsed as
+                // types and expressions (src/enumgen.rs checks them).
+                while !self.is(")") {
+                    let lo = self.span();
+                    let keyed = matches!(self.peek(), Tok::Ident(_)) && (self.is_at(1, ":") || self.is_at(1, "="));
+                    let key = if keyed { Some(self.ident()?) } else { None };
+                    let ty = if key.is_some() && self.eat(":") { Some(self.parse_type()?) } else { None };
+                    let value = if key.is_none() || self.eat("=") { Some(self.parse_expr()?) } else { None };
+                    attrs.data.push(DataArg { key, ty, value, span: lo.to(self.prev_span()) });
+                    if !self.eat(",") {
+                        break;
+                    }
+                }
+                self.expect(")")?;
+            } else if self.eat("(") {
                 while !self.is(")") {
                     let t = self.bump();
                     match t.tok {
@@ -645,7 +660,7 @@ impl Parser {
             "fn" | "extern" | "export" => ("a function".into(), FN_ATTRS),
             "var" => ("a module-level `var`".into(), &["thread_local"]),
             "vm" => ("a vm".into(), VM_ATTRS),
-            "enum" => ("an `enum`".into(), &["c_name"]),
+            "enum" => ("an `enum`".into(), &["c_name", "data", "names"]),
             "struct" => ("a `struct`".into(), &["c_name"]),
             "object" => ("an `object`".into(), &["trace"]),
             "value" => ("a `value` type".into(), &["scan_raw_words"]),
@@ -783,7 +798,7 @@ impl Parser {
             let mut variants = Vec::new();
             while !self.is("}") {
                 let fattrs = self.parse_attrs()?;
-                check_attrs(&fattrs, "an enum variant", &[])?;
+                check_attrs(&fattrs, "an enum variant", &["name", "data"])?;
                 let vname = self.ident()?;
                 let mut fields = Vec::new();
                 if self.eat("(") {
@@ -796,14 +811,14 @@ impl Parser {
                     self.expect(")")?;
                 }
                 let discr = if self.eat("=") { Some(self.int_lit()?) } else { None };
-                variants.push(Variant { name: vname, fields, discr });
+                variants.push(Variant { name: vname, fields, discr, attrs: fattrs });
                 if !self.eat(",") {
                     break;
                 }
             }
             self.expect("}")?;
             let c_name = attrs.get("c_name").map(|a| a[0].clone());
-            return Ok(Item::Enum(EnumDecl { name, generics, bounds, repr, variants, is_pub, c_name }));
+            return Ok(Item::Enum(EnumDecl { name, generics, bounds, repr, variants, is_pub, c_name, attrs }));
         }
         if self.eat_kw("var") {
             let name = self.ident()?;

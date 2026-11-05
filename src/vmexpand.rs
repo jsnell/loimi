@@ -1886,7 +1886,7 @@ enum Seg {
 /// The user's text at `span`, to splice into generated source as part of
 /// `ctx` (what the note on a diagnostic in it says it is in: "the
 /// generated verifier, ...").
-fn splice(sm: &SourceMap, span: Span, ctx: &str) -> String {
+pub(crate) fn splice(sm: &SourceMap, span: Span, ctx: &str) -> String {
     splice_calls(sm, span, ctx, &[])
 }
 
@@ -1998,7 +1998,7 @@ fn check_call_arity(sm: &SourceMap, span: Span, calls: &[(&str, usize)]) -> Res<
 
 /// The generated source without the markers `splice` adds, and where the
 /// spliced pieces came from.
-fn strip_marks(src: &str) -> (String, Vec<Origin>) {
+pub(crate) fn strip_marks(src: &str) -> (String, Vec<Origin>) {
     let mut out = String::with_capacity(src.len());
     let mut origins = Vec::new();
     let mut rest = src;
@@ -2027,7 +2027,7 @@ fn strip_marks(src: &str) -> (String, Vec<Origin>) {
 }
 
 /// A string as a Loimi string literal.
-fn str_lit(s: &str) -> String {
+pub(crate) fn str_lit(s: &str) -> String {
     let mut bytes = Vec::new();
     for b in s.bytes() {
         match b {

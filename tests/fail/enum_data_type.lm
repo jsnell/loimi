@@ -1,0 +1,5 @@
+// A data value has the key's type; the error points at the value.
+// error: `P.min` (`#[data]`)
+#[data(min: i32)]
+enum P { #[data("one")] A }
+fn main() { let _ = P.A.min(); }

@@ -1,0 +1,4 @@
+// Names and data on enum variants: enum name twice.
+// error: `P.A` and `P.B` have the same name "x"
+enum P { #[name("x")] A, #[name("x")] B }
+fn main() {}

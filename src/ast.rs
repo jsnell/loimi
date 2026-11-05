@@ -210,6 +210,18 @@ pub enum Stmt {
 #[derive(Clone, Debug, Default)]
 pub struct Attrs {
     pub list: Vec<(String, Vec<String>, Span)>,
+    /// The entries of `#[data(..)]` (enums and their variants; src/enumgen.rs).
+    pub data: Vec<DataArg>,
+}
+
+/// An entry of `#[data(..)]`: `key: Type`, `key: Type = default` (on an
+/// enum), `key = value` or a positional `value` (on a variant).
+#[derive(Clone, Debug)]
+pub struct DataArg {
+    pub key: Option<Ident>,
+    pub ty: Option<TypeExpr>,
+    pub value: Option<Expr>,
+    pub span: Span,
 }
 
 impl Attrs {
@@ -314,6 +326,8 @@ pub struct Variant {
     pub name: Ident,
     pub fields: Vec<TypeExpr>,
     pub discr: Option<i128>,
+    /// `#[name("..")]`, `#[data(..)]` (src/enumgen.rs).
+    pub attrs: Attrs,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +340,8 @@ pub struct EnumDecl {
     pub is_pub: bool,
     /// `#[c_name("..")]`: its name in a C header.
     pub c_name: Option<String>,
+    /// `#[names]`, `#[data(..)]` (src/enumgen.rs).
+    pub attrs: Attrs,
 }
 
 #[derive(Clone, Debug)]

@@ -195,9 +195,10 @@ impl SourceMap {
                     first_note = Some(format!("in {ctx}"));
                 }
                 None => {
+                    let what = if g.vm.starts_with("enum ") { format!("`{}`", g.vm) } else { format!("vm `{}`", g.vm) };
                     first_note = Some(format!(
-                        "internal: generated code: the compiler generated this for vm `{}` and it should compile (a compiler bug); LOIMI_DUMP_VM_EXPANSION=1 prints the generated code",
-                        g.vm
+                        "internal: generated code: the compiler generated this for {} and it should compile (a compiler bug); LOIMI_DUMP_VM_EXPANSION=1 prints the generated code",
+                        what
                     ))
                 }
             }

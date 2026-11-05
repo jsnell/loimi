@@ -1,0 +1,5 @@
+// Names and data on enum variants: enum data reserved.
+// error: `name` cannot be a data key
+#[data(name: str)]
+enum P { #[data("a")] A }
+fn main() {}
