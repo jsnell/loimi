@@ -57,10 +57,8 @@ WASM_MVP = ["binarytrees", "coremark", "fannkuchredux", "fasta", "mandelbrot", "
 WASM_SIMD = ["fannkuchredux_simd", "nbody_simd", "spectralnorm_simd"]
 # (suite, column, benchmark) cells marked in the tables and left out of a
 # second geometric mean in the summary.
-PATHOLOGICAL = {
-    ("prolog", "jit", "sieve"): "every assert/retract makes code objects that are never freed, "
-                                "and the JIT compiles each one as it gets hot",
-}
+# (suite, column, benchmark) -> why that cell is not representative; marked † in the tables.
+PATHOLOGICAL = {}
 QUICK = {"mini": "fib", "mini-coro": "coroutine_ring", "minijs": "richards", "scheme": "fib",
          "lox": "fib", "regex": None, "wasm": "nbody", "stack": None,
          "python": "richards", "wasm-simd": "nbody_simd", "prolog": "nreverse"}
