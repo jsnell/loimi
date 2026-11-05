@@ -39,7 +39,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::diag::{Diag, Res, Span};
+use crate::diag::{Diag, Span};
 use crate::gcgen::is_traced;
 use crate::tir::*;
 
@@ -540,7 +540,8 @@ fn analyze<'a>(p: &'a Program, f: &'a FnDef, cx: &Ctx<'a>, report: bool, audit: 
 
 /// Summarize which parameters each function may store through
 /// (`Program::ref_writes`), then check every function.
-pub fn check(p: &mut Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> {
+/// All errors found, each function checked.
+pub fn check(p: &mut Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Result<(), Vec<Diag>> {
     let audit = std::env::var("LOIMI_OBJREF_AUDIT").is_ok().then_some(sm);
     let with_params: Vec<usize> = (0..p.fns.len())
         .filter(|&i| {
@@ -569,11 +570,15 @@ pub fn check(p: &mut Program, cx: &Ctx, sm: &crate::diag::SourceMap) -> Res<()> 
             p.ref_keeps.insert(i, k);
         }
     }
+    // A function's first error: the others may follow from it.
+    let mut all = Vec::new();
     for f in &p.fns {
         let (_, _, errs) = analyze(p, f, cx, true, audit);
-        if let Some(d) = errs.into_iter().next() {
-            return Err(d);
-        }
+        all.extend(errs.into_iter().next());
     }
-    Ok(())
+    if all.is_empty() {
+        Ok(())
+    } else {
+        Err(all)
+    }
 }

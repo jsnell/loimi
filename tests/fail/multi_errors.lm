@@ -1,0 +1,42 @@
+// Checking goes on past an error: each function body, and each statement
+// of a body, is checked whatever the earlier ones' errors. A binding whose
+// initializer failed is poisoned, so its uses report nothing more.
+struct P { x: i64, y: i64 }
+
+fn f(p: P) -> i64 {
+    let a = p.z;
+    let b = a + 1;
+    let c: i64 = "s";
+    c + b + a.w
+}
+
+fn g(n: i32) -> i32 {
+    let q = undefined_name;
+    if q > 0 { return 1; }
+    let (s, t) = (q, q.len());
+    let r: i32 = s + t;
+    r + true
+}
+
+fn h() {
+    let v = 1;
+    v = 2;
+    for i in 0..3 {
+        foo(i);
+        let w: bool = i;
+    }
+}
+
+fn main() -> i32 {
+    f(P { x: 1, y: 2 }) as i32 + g(1)
+}
+// errors: 7
+// error: no field `z` on type `P`
+// error: multi_errors.lm:7:15
+// error: multi_errors.lm:9:18
+// error: unknown name `undefined_name`
+// error: multi_errors.lm:18:9
+// error: cannot assign to `v`: declared with `let`
+// error: unknown name `foo`
+// error: multi_errors.lm:26:23
+// error: error: 7 errors

@@ -1,0 +1,19 @@
+// An `if`, `match` or block whose results are all literals takes its type
+// from the other operand, as a literal does (python FRICTION 577).
+import std.io;
+
+fn pick(x: bool, y: i32, z: u8) -> i32 {
+    var n: i32 = 0;
+    if (if x { 1 } else { 0 }) == y { n = n + 1; }
+    let k = (if x { 10 } else { 20 }) + y;
+    let m = match z { 0 => 1, 1 => 2, _ => 3 } * z;
+    let b = { 7 } - z;
+    n + k + (m as i32) + (b as i32)
+}
+
+fn main() {
+    io.print_int(pick(true, 1, 2) as i64); io.println("");
+    io.print_int(pick(false, 0, 1) as i64); io.println("");
+}
+// expect: 23
+// expect: 29

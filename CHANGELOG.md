@@ -400,6 +400,16 @@ implementation; `git log` has the details.
   locations, constant and local names, metadata numbering and function
   order, so a refactor that moves lines can be shown to be zero-cost
   ([status.md](docs/status.md#comparing-builds-loimi-ir-diff)).
+- **Every error of a build, not just the first**: function bodies, vm
+  handlers and the statements of a body are checked past an error, with
+  bindings of a failed statement poisoned so that one mistake gives one
+  error; errors print in source order, at most `--max-errors N`
+  (default 20). Imports, types and signatures still stop at their first
+  error ([status.md](docs/status.md), Compiler row;
+  [design/ergonomics-audit.md](docs/design/ergonomics-audit.md) item 7).
+- An `if`, `match` or block whose results are all literals is typed
+  from the other operand, as a literal is: `(if c { 1 } else { 0 }) == y`
+  with `y: i32` ([language.md §1.2](docs/language.md#12-basics)).
 - **`--vm-stats`** counts entries into each `cold` block, per op, with
   its source location ([status.md](docs/status.md), Instrumentation row).
 - **Doc-snippet test**: every `loimi` code block in the README and

@@ -1,0 +1,62 @@
+// Checking goes on past an error in a vm: each handler, vm function and
+// entry is checked whatever the others' errors, and so are the plain
+// functions after the vm. A super is not checked again for its parts'
+// errors, and a failed statement leaves no "can reach its end" behind.
+struct Machine { limit: i64 }
+
+vm Calc {
+    context ctx: *Machine;
+    state { pc: *u32, regs: *i64 }
+
+    operand reg = regs[it];
+    operand imm = it;
+    operand label = pc + it;
+
+    encoding fixed(u32) {
+        format ABC { op: 8, a: 8, b: 8, c: 8 }
+        format AsBx { op: 8, a: 8, sbx: s16 }
+    }
+
+    op LOADI(dst: reg, v: imm) : AsBx { dst = v as i64; next }
+    op ADD(dst: reg, a: reg, b: reg) : ABC { dst = a + true; next }
+    op MOV(dst: reg, src: reg) : ABC { dst = src; next }
+    op CHECK(a: reg) : ABC {
+        if a > ctx.limt { raise a }
+        next
+    }
+    op BAD(a: reg) : ABC {
+        let k = missing(a);
+        dst = k;
+        next
+    }
+    op RET(src: reg) : ABC { exit src }
+
+    super ADD_MOV = ADD; MOV;
+
+    fn helper(x: i64) -> i64 { x + "one" }
+
+    entry run(m: *Machine, code: *u32, r: *i64) -> i64 {
+        ctx = m;
+        pc = code;
+        regs = r;
+        jump pc
+    }
+
+    on raise(e: i64) { exit 0 - e }
+}
+
+fn host(n: i64) -> bool { n }
+
+fn main() {
+    var m = Machine { limit: 10 };
+    var code: [u32; 4] = [0; 4];
+    var regs: [i64; 4] = [0; 4];
+    Calc.run(&m, &code[0], &regs[0]);
+}
+// errors: 6
+// error: multi_errors_vm.lm:21:56
+// error: no field `limt`
+// error: unknown name `missing`
+// error: unknown name `dst`
+// error: multi_errors_vm.lm:36:36
+// error: multi_errors_vm.lm:48:27

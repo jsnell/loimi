@@ -1,0 +1,33 @@
+// A condition or scrutinee that fails (here because it reads a poisoned
+// binding) does not hide the errors in the branches; what an `if let`
+// binds from a bad value is poisoned too.
+fn f(n: u64) -> u64 {
+    let offset = no_such_a;
+    let end = offset + (1 << n);
+    if end < 65536 {
+        bad_one(1);
+    } else {
+        bad_two(2);
+    }
+    match offset {
+        1 => bad_three(),
+        _ => {}
+    }
+    while offset.more {
+        bad_four();
+    }
+    if let Some(x) = no_such_b {
+        x.anything();
+        bad_five();
+    }
+    end
+}
+fn main() {}
+// errors: 7
+// error: unknown name `no_such_a`
+// error: unknown name `bad_one`
+// error: unknown name `bad_two`
+// error: unknown name `bad_three`
+// error: unknown name `bad_four`
+// error: unknown name `no_such_b`
+// error: unknown name `bad_five`

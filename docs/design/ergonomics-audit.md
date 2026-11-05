@@ -1,6 +1,6 @@
 # Design note: an ergonomics audit (zero run-time cost)
 
-Status: **proposal; items 2 and 4 (step 1) built.** Written 2026-11-05
+Status: **proposal; items 2, 4 (step 1) and 7, and part of section 2, built.** Written 2026-11-05
 against master at 627c1ca.
 - **Item 2** (names and data on enum variants): built as `#[name]`,
   `#[names]` and `#[data(key: Type = default)]`
@@ -10,6 +10,7 @@ against master at 627c1ca.
 - **Item 4, step 1** (`loimi ir-diff`): built
   ([status.md](../status.md#comparing-builds-loimi-ir-diff)). The
   examples' `#[cfg]` lines are not unpacked yet.
+- **Item 7** (every error of a build): built; see its row below and section 2.
 
 > Where could we give the user meaningfully better ergonomics at no
 > run-time cost, even if it makes the Loimi implementation itself more
@@ -69,7 +70,7 @@ interpreters affected) against the compiler cost. Cost is S (days), M
 | 4 | Panic locations out of the IR identity check (`loimi ir-diff`: **built**), then `extend vm` blocks | 97 `#[cfg(..)]` lines in Mini (71) and Python (26) packed onto existing lines; Python/Mini `on break` and variants on the line closing `on raise` | S, then M |
 | 5 | Cache layouts from structs; cache handles for plain functions | 31 `&cache.f` sites; `PropIC` copies `obj.Site` field by field in Lox and MiniJS, plus 22 `as *obj.Site` casts | S |
 | 6 | Terminal `raise`, `fail` and `become ..; redo` are cold by default | 119 `cold { raise .. }` in 8 vms; 21 `cold { become X; redo }` | S–M |
-| 7 | Report more than one error per build | Python: ~15 fix-and-rebuild cycles for 10k lines (FRICTION 582) | S |
+| 7 | Report more than one error per build (**built**) | Python: ~15 fix-and-rebuild cycles for 10k lines (FRICTION 582) | S |
 | 8 | Infer effects of private functions | 136 `uses` on signatures (73 non-`pub`), 18 on fn types; Python `ops.lm` alone 43 | M |
 | 9 | Derived root scanning for context structs; a typed `add_scanner` | 93 `gc_mark` calls in hand-written scanners, ~45 of them fixed fields or arrays; 10 `add_scanner(.. as *u8, ..)` with casts back | S–M |
 | 10 | `is` patterns and checked unwrap | 36 `=> true, _ => false` predicates; 79 `let X(v) = e else { trap() }` | S |
@@ -643,6 +644,31 @@ only 3 cold raises, so it would want `#[hot]` on few sites, if any.
 
 ### 7. Report more than one error per build
 
+**Status: built** (2026-11-05). Function bodies, generic instances
+(first error each), vm handlers, vm functions, entries, `on raise`,
+variant `before` blocks and the statements of every body are checked
+past an error. A failed statement's bindings are poisoned: they have
+type `never`, and errors in statements that read them are dropped, as
+are errors of the statements enclosing the failed one. After an error in
+an `if`/`while` condition or a `match` scrutinee, the branches are still
+checked. The `objref` and lifetimes passes report the first error of
+each function. Output is in source order, one error per place, capped by
+`--max-errors N` (default 20). Parsing, expansion, imports, type
+definitions, signatures, impls and module-level `var`s stay fatal, as
+proposed. The speculative checks (probes, a local closure retried with
+effects) run without recovery; an `if`/`match` without an expected type
+is checked first exactly as before, and again with recovery only after
+an error, so a program that compiles keeps the same locals. The release
+IR of Lox, Python, Wasm, Stack and Prolog in the three dispatch modes,
+of Mini with and without `--cfg debug`, and of the 216 programs of
+`tests/run`, is byte-identical to master's. Tests:
+`tests/fail/multi_errors*.lm` (the `// errors: N` directive checks the
+exact count). Mutation trials on eight examples, 6 to 8 statements or
+conditions broken in different functions, gave one error per break and
+no cascades (the other trials broke a file outside the build, or a
+line into one that did not parse).
+`status.md`'s Compiler row lists what continues.
+
 **Pattern.** The checker returns at the first `Diag`, so getting a new
 interpreter to build is one compile per error. Python's author needed
 about fifteen cycles for 10,000 lines (python FRICTION 582, open).
@@ -978,12 +1004,18 @@ match Rx.decode(w) { .CHAR { c } => { .. }, .SPLIT { x, y } => { .. }, .. }
 Better errors are zero-cost by definition. These are the ones that
 still cost authors time:
 
-- **One error per build:** item 7.
+- **One error per build:** item 7. **Built.**
 - **Literal-only expressions typed `i64` without context** (python
   FRICTION 577, partly fixed). `(if x { 1 } else { 0 }) == y` with
   `y: i32` fails. Infer the literal's type from the other operand of a
   comparison or arithmetic operator, as the Prolog fix (FRICTION 243)
-  did for some forms.
+  did for some forms. **Built for the operator case:** an `if`, `match`
+  or block whose results are all literals is typed from the other
+  operand. The right operand is checked first with the type the left
+  would have had alone, so programs that compiled are typed as before.
+  The second half of the friction entry, `for j in 0..3` used with a
+  `u32`, needs inference from later uses and is not done (the error
+  already has a note suggesting `for j: u32 in ..`).
 - **`-W handler_frame` says *that* a frame appeared, not *why* it
   appeared.** Prolog FRICTION 453 (open): adding a `deref` stopped LLVM
   proving an `i48` division's overflow panic dead, and only the warning
@@ -993,20 +1025,25 @@ still cost authors time:
     of `/` at vm.lm:512", would answer this directly.
   - `hot_gc` does not see calls inside plain vm functions (Lox FRICTION
     219, partly fixed). The same mapping would cover them.
+  - Not done: it needs a panic-site table from codegen to the
+    assembly lint, outside the checker.
 - **`--vm-stats` super suggestions that are really missing constant
   operands** (Wasm FRICTION 1166, open). `CONST32_I32_ADD_CONST32` is
   the symptom of a missing `K` form. When a suggested super's head is a
   constant load, the report could say "or a constant-operand form of
-  ADD".
+  ADD". Not done: the report is printed by the stats runtime
+  (`vmgen.rs`), which would need to know which ops load constants.
 - **Embedded guest-language source** (the Prolog prelude in a Loimi
   string, FRICTION 251, partly fixed): errors report lines of the
   string. A `include_str("prelude.pl")` that keeps a file name for host
   diagnostics would fix it; it is zero-cost because the bytes are the
-  same constant.
+  same constant. Not done: a new expression form in the parser and
+  loader, which are another lane's.
 - **Operands map to format fields by position**, so `op DELGLOBAL(z:
   imm, name: kst) : ABx` needs a dummy operand (Python FRICTION 579; 6
   sites in 4 vms, e.g. Mini's `unused: imm` at `vm.lm:997`). The message was fixed. A named binding (`name: kst @ bx`)
-  removes the dummy, and is S.
+  removes the dummy, and is S. Not done: it changes the vm parser and
+  the operand layout in `vmexpand.rs`.
 
 ## 2a. Smaller items
 

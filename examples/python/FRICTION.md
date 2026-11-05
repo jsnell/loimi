@@ -574,14 +574,15 @@ Result<bool, E> uses reenter) -> Result<(), E>`.
 | `And(a, b) \| Or(a, b) => ..` | `bindings in \`\|\` patterns are not supported` | 9 arms split or rewritten with helper functions | support or-patterns with the same bindings |
 | `let f = \|x\| ..;` local helper closure | `a closure can only be an argument for a block fn parameter ...` | top-level functions | allow non-escaping closures in `let` when only called |
 | `struct WithItem { ctx: *Expr, var: ?*Expr }` | `expected identifier, found var, which is a reserved word` | `target` | (fine, the message says what to do) |
-| `(if x { 1 } else { 0 }) == y` with `y: i32`; `for j in 0..3 { .. j + base_u32 .. }` | `mismatched types: expected i64, found i32` | annotations (`for j: u32 in 0..3`) | infer literal-only expressions from the other operand |
+| `(if x { 1 } else { 0 }) == y` with `y: i32`; `for j in 0..3 { .. j + base_u32 .. }` | `mismatched types: expected i64, found i32` | annotations (`for j: u32 in 0..3`) | infer literal-only expressions from the other operand (2026-11-05: done for `if`/`match`/block operands; the `for` range still needs the annotation) |
 | `std.lex.push_utf8(..)` without `import std.lex` | `unknown name std` | import it | allow fully qualified std paths, or suggest the import |
 | `op DELGLOBAL(name: kst) : ABx` | `mismatched types: expected u8, found u16` at the encoder call | a dummy first operand `z: imm` | operands map to fields by position, which the docs say; an op with fewer operands than fields could warn when the operand lands in a narrower field than the format's widest |
 | raising from a plain vm function | `control words are not allowed in vm functions; return a value instead` | return `bool`, raise in the caller | (clear) |
 
 The compiler reports one error at a time; getting 10,000 freshly
 written lines to build took about fifteen fix-and-rebuild cycles of ~10
-seconds each, which was fine.
+seconds each, which was fine. (Fixed 2026-11-05: a build reports
+every independent error, up to `--max-errors N`.)
 
 ### 11. Instance attributes as dicts: no help from std for the dict+IC combination
 

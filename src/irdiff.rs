@@ -84,7 +84,7 @@ fn load_input(opts: &mut Opts, path: &Path) -> Result<Input, String> {
     let mut sm = SourceMap::default();
     match crate::compile(&mut sm, opts) {
         Ok((ir, _, _, llvm_args, _)) => Ok(Input { label, ir, llvm_args }),
-        Err(d) => Err(format!("{}error: ir-diff: {} does not build", sm.render(&d), label)),
+        Err(d) => Err(format!("{}error: ir-diff: {} does not build", sm.render_all(&d.0, opts.max_errors), label)),
     }
 }
 
