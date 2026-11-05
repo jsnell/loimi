@@ -169,7 +169,7 @@ pub vm Scheme {
     family GETGLOBAL(dst: reg, g: gl) : ABx {
         generic {
             let v = ctx.gvals.ptr[g];
-            if v == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+            if v == V.Imm(value.IMM_UNDEF) { raise unbound_err(ctx, g as u64) }
             dst = v;
             become GETGLOBAL_B;
             next
@@ -183,7 +183,7 @@ pub vm Scheme {
     /// procedure runs only once its definition has).
     family CHKGLOBAL(unused: imm, g: gl) : ABx {
         generic {
-            if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+            if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { raise unbound_err(ctx, g as u64) }
             become CHKGLOBAL_B;
             next
         }
@@ -191,7 +191,7 @@ pub vm Scheme {
     }
     /// set! of a global: it must already be bound.
     op SETGLOBAL(src: reg, g: gl) : ABx {
-        if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { cold { raise unbound_err(ctx, g as u64) } }
+        if ctx.gvals.ptr[g] == V.Imm(value.IMM_UNDEF) { raise unbound_err(ctx, g as u64) }
         ctx.gvals.ptr[g] = src;
         next
     }
@@ -380,11 +380,11 @@ pub vm Scheme {
 
     op CAR(dst: reg, a: reg) : ABC {
         if let P(p) = a { dst = p.car; next }
-        cold { raise rt.type_err(ctx, "car", "pair", a) }
+        raise rt.type_err(ctx, "car", "pair", a)
     }
     op CDR(dst: reg, a: reg) : ABC {
         if let P(p) = a { dst = p.cdr; next }
-        cold { raise rt.type_err(ctx, "cdr", "pair", a) }
+        raise rt.type_err(ctx, "cdr", "pair", a)
     }
     #[poll(gc)] op CONS(dst: reg, a: reg, b: reg) : ABC {
         let c = new(&ctx.heap, Pair { car: a, cdr: b });
@@ -459,7 +459,7 @@ pub vm Scheme {
         var cur = l;
         while let P(p) = cur {
             let e = p.car;
-            let P(q) = e else { cold { raise rt.type_err(ctx, "assoc", "pair", e) } };
+            let P(q) = e else { raise rt.type_err(ctx, "assoc", "pair", e) };
             if q.car == key { dst = e; next }
             cur = p.cdr;
         }
@@ -468,18 +468,18 @@ pub vm Scheme {
     }
     op SETCAR(a: reg, b: reg) : ABC {
         if let P(p) = a { p.car = b; next }
-        cold { raise rt.type_err(ctx, "set-car!", "pair", a) }
+        raise rt.type_err(ctx, "set-car!", "pair", a)
     }
     op SETCDR(a: reg, b: reg) : ABC {
         if let P(p) = a { p.cdr = b; next }
-        cold { raise rt.type_err(ctx, "set-cdr!", "pair", a) }
+        raise rt.type_err(ctx, "set-cdr!", "pair", a)
     }
     op VREF(dst: reg, v: reg, i: reg) : ABC {
         if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
             dst = x.data.ptr[j as u32 as u64];
             next
         }
-        cold { raise index_err(ctx, "vector-ref", v, i) }
+        raise index_err(ctx, "vector-ref", v, i)
     }
     /// vector-ref with a constant index (record fields, small tuples).
     op VREFI(dst: reg, v: reg, i: imm) : ABC {
@@ -487,21 +487,21 @@ pub vm Scheme {
             dst = x.data.ptr[i as u64];
             next
         }
-        cold { raise index_err(ctx, "vector-ref", v, Int(i as i32)) }
+        raise index_err(ctx, "vector-ref", v, Int(i as i32))
     }
     op VSETI(v: reg, i: imm, src: reg) : ABC {
         if let Vec(x) = v and (i as u64) < x.data.len {
             x.data.ptr[i as u64] = src;
             next
         }
-        cold { raise index_err(ctx, "vector-set!", v, Int(i as i32)) }
+        raise index_err(ctx, "vector-set!", v, Int(i as i32))
     }
     op VSET(v: reg, i: reg, src: reg) : ABC {
         if let (Vec(x), Int(j)) = (v, i) and (j as u32 as u64) < x.data.len {
             x.data.ptr[j as u32 as u64] = src;
             next
         }
-        cold { raise index_err(ctx, "vector-set!", v, i) }
+        raise index_err(ctx, "vector-set!", v, i)
     }
 
     // Builtins of one argument with an inline fast path; the rest (other
@@ -618,14 +618,14 @@ pub vm Scheme {
             dst = r.data.ptr[i as u64];
             next
         }
-        cold { raise record_fail(ctx, f, x) }
+        raise record_fail(ctx, f, x)
     }
     op RSET(x: reg, f: kst, src: reg) : ABC {
         if let Vec(r) = x and let P(d) = f and r.rtd == d.car and let Int(i) = d.cdr and (i as u64) < r.data.len {
             r.data.ptr[i as u64] = src;
             next
         }
-        cold { raise record_fail(ctx, f, x) }
+        raise record_fail(ctx, f, x)
     }
     op RECP(dst: reg, x: reg, t: kst) : ABC {
         dst = value.boolean(match x { Vec(r) => r.rtd == t, _ => false });
@@ -841,7 +841,7 @@ pub vm Scheme {
             regs = callee;
             jump p.code
         }
-        cold { raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure") }
+        raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure")
     }
     /// return k[f](R[base+1] .. R[base+nargs]) (as CALLK), reusing this frame.
     op TAILCALLK(base: callbase, nargs: imm, f: kst) : ABC {
@@ -862,7 +862,7 @@ pub vm Scheme {
             fp.k = k;
             jump p.code
         }
-        cold { raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure") }
+        raise rt.err_msg(ctx, "internal error: CALLK of a non-procedure")
     }
 
     /// R[base] = R[base](R[base+1] .. R[base+nargs]).

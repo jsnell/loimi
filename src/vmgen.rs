@@ -363,6 +363,42 @@ pub fn load_pc(g: &mut FnGen) -> String {
     g.inst(format!("load ptr, ptr {}", s))
 }
 
+/// Whether vm code may read the instruction word of the handler it runs
+/// in: directly (`TVm::Word(0)`), or by passing it on to another shared
+/// copy, a chained op, a super's next part, or `on raise` if that reads it
+/// (`raise_reads`; a `?` raises too).
+fn reads_insn(p: &Program, body: &TExpr, raise_reads: bool) -> bool {
+    let mut reads = false;
+    crate::tirwalk::for_each_expr(body, &mut |e| {
+        if let TK::Vm(v) = &e.kind {
+            match v {
+                // A shared copy is passed the word unless it is
+                // `#[inline(never)]` and does not read it (`TVm::Shared`
+                // in `vm_expr`).
+                TVm::Shared(fid, ..) => reads |= !(p.fns[*fid as usize].inline == Some(false) && !shared_reads_insn(p, *fid)),
+                TVm::Word(0) | TVm::Chain(_) | TVm::SharedNext(..) | TVm::Fallthrough(..) | TVm::Part(..) => reads = true,
+                TVm::Raise(_) => reads |= raise_reads,
+                _ => {}
+            }
+        }
+        if matches!(e.kind, TK::Try(_)) {
+            reads |= raise_reads;
+        }
+    });
+    reads
+}
+
+/// Whether the vm's `on raise` reads the instruction word it is passed (a
+/// raise passes the raising handler's): if not, raises pass `poison`, so
+/// that a handler whose raise follows a call need not keep its word live
+/// across the call, in a register it would have to save.
+pub fn on_raise_reads_insn(p: &Program, vd: &VmDef) -> bool {
+    match vd.on_raise.and_then(|r| p.fns[r as usize].body.as_ref()) {
+        Some(b) => reads_insn(p, b, true),
+        None => true,
+    }
+}
+
 /// Whether shared copy `fid` may read the instruction word it is passed
 /// (the calling instruction's): directly, or by passing it on to a cold
 /// block, `on raise`, another shared copy or a chained op.
@@ -806,7 +842,11 @@ fn outline(g: &mut FnGen, b: &TExpr) {
         let v = g.load(&t, &slot);
         g.store(&t, &v, &gname);
     }
-    let w = current_word(g, vd);
+    // A cold function that decodes no operand and reads no word (one that
+    // raises, for an `on raise` that does not read it) is passed none, so
+    // that the hot path need not keep the word live across a call before
+    // the branch.
+    let w = if redo.is_empty() && !reads_insn(p, b, on_raise_reads_insn(p, vd)) { "poison".to_string() } else { current_word(g, vd) };
     tail_to(g, vd, &format!("@\"{}\"", sym), &w);
     if stencil_sym.is_none() {
         let count = g.jit_count;
@@ -1326,7 +1366,7 @@ pub fn raise_value(g: &mut FnGen, err: &str, t: &Ty) {
         g.br(&hg.raise_label);
     } else {
         let sym = format!("@\"{}\"", p.fns[vd.on_raise.unwrap() as usize].symbol);
-        let w = current_word(g, vd);
+        let w = if on_raise_reads_insn(p, vd) { current_word(g, vd) } else { "poison".to_string() };
         tail_to(g, vd, &sym, &w);
     }
 }

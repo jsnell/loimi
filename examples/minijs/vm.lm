@@ -440,7 +440,7 @@ pub vm JS {
     op GETGLOBAL(dst: reg, g: gl) : ABx { dst = ctx.gvals.ptr[g]; next }
     op SETGLOBAL(src: reg, g: gl) : ABx { ctx.gvals.ptr[g] = src; next }
     /// Reading an undeclared variable (k[name] is its name).
-    op THROWREF(pad: imm, name: kst) : ABx { cold { raise ref_error(ctx, name) } }
+    op THROWREF(pad: imm, name: kst) : ABx { raise ref_error(ctx, name) }
 
     /// R[dst] = the running function (named function expressions).
     op SELF(dst: reg) : ABC { dst = F(fp.cl); next }
@@ -543,7 +543,7 @@ pub vm JS {
                     regs[dst.raw] = o.inline.ptr[cache.slot];
                     next
                 }
-                cold { become #missm; redo }
+                become #missm; redo
             }
             #own_out {
                 if let O(o) = obj and o.shape.id == cache.sid {
@@ -551,7 +551,7 @@ pub vm JS {
                     regs[dst.raw] = ctx.m.load_out(o, cache.slot & !obj.OUT);
                     next
                 }
-                cold { become #missm; redo }
+                become #missm; redo
             }
             #protom {
                 if let O(o) = obj and o.shape.id == cache.sid and let Some(v) = ctx.m.proto_load(o, cache.slot, cache.cell, cache.depth) {
@@ -559,7 +559,7 @@ pub vm JS {
                     regs[dst.raw] = v;
                     next
                 }
-                cold { become #missm; redo }
+                become #missm; redo
             }
             // A monomorphic member missed: std.obj refills the site or
             // makes it polymorphic.
@@ -589,7 +589,7 @@ pub vm JS {
                         next
                     }
                 }
-                cold { become #fam; redo }
+                become #fam; redo
             }
             // A rope receiver is replaced by its flat string in its
             // register (so a loop calling `s.charCodeAt(i)` on a rope
@@ -607,7 +607,7 @@ pub vm JS {
                 // method of json's lexer): no cold call.
                 if let R(r) = obj and let Some(f) = r.flat { obj = S(f); redo }
                 if let R(r) = obj { cold { obj = S(value.flatten(r)); redo } }
-                cold { become #fam; redo }
+                become #fam; redo
             }
             // Up to eight (shape, own slot or prototype hit) pairs.
             #polym {
@@ -703,7 +703,7 @@ pub vm JS {
                 ctx.m.add_hit(o, cache.ent, cache.slot, val);
                 next
             }
-            cold { become SETPROP; redo }
+            become SETPROP; redo
         }
         SETPROP_POLY {
             if let O(o) = obj and ctx.m.poly_set(o, cache.ent, val) { next }
@@ -834,14 +834,14 @@ pub vm JS {
                     let r = x as f64 sym f64.from_bits(b as u64);
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; refuse(fp.cl); redo }
+                become #fname; refuse(fp.cl); redo
             }
             #finame {
                 if let Int(y) = b {
                     let r = f64.from_bits(a as u64) sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; refuse(fp.cl); redo }
+                become #fname; refuse(fp.cl); redo
             }
         }
     }
@@ -853,7 +853,7 @@ pub vm JS {
             if let (Int(x), Int(y)) = (a, b) { dst = int_div(x, y); next }
             if let (Int(x), Num(y)) = (a, b) { dst = Num(x as f64 / y); next }
             if let (Num(x), Int(y)) = (a, b) { dst = Num(x / y as f64); next }
-            if let (Num(x), Num(y)) = (a, b) { cold { become DIV_F; refuse(fp.cl); redo } }
+            if let (Num(x), Num(y)) = (a, b) { become DIV_F; refuse(fp.cl); redo }
             cold { dst = arith(ctx, 3, a, b)?; next }
         }
         DIV_F {
@@ -1213,7 +1213,7 @@ pub vm JS {
                     // stale register never refers to a freed object.
                     if callee + n + 1 >= ctx.hw { grow_stack(callee + n + 1) }
                     if fp + 1 >= ctx.frames_end {
-                        cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+                        raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
                     }
                     // Missing arguments are undefined; extra ones are the
                     // callee's locals.
@@ -1329,11 +1329,11 @@ pub vm JS {
         let n = p.nregs as u64;
         // As in CALL.
         if callee + n + 1 >= ctx.hw {
-            if callee + n + 1 >= ctx.stack_end { cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") } }
+            if callee + n + 1 >= ctx.stack_end { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
             ctx.hw = callee + n + 2;
         }
         if fp + 1 >= ctx.frames_end {
-            cold { raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded") }
+            raise ctx.new_error(ctx.err_proto(), "Maximum call stack size exceeded")
         }
         let np = p.nparams as u64;
         if nargs < np {
@@ -1430,7 +1430,7 @@ pub vm JS {
     op RETU() : ABC {
         // A constructor returning normally (`new` frames are common).
         if fp.flags == rt.FR_NEW {
-            let O(o) = regs[0] else { cold { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") } };
+            let O(o) = regs[0] else { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") };
             observe(fp.cl, o);
             *(regs - 1) = regs[0];
             fp = fp - 1;
@@ -1461,14 +1461,14 @@ pub vm JS {
         jump fp.resume
     }
     op THROW(src: reg) : ABC {
-        cold { raise src }
+        raise src
     }
 
     /// R[dst] = the constructor `super(...)` calls.
     op GETPARENT(dst: reg) : ABC {
         let p = fp.cl.parent;
         if let F(_) = p { dst = p; next }
-        cold { raise ctx.type_error("'super' keyword unexpected here") }
+        raise ctx.type_error("'super' keyword unexpected here")
     }
     /// R[dst] = super[k[key]].
     op GETSUPER(dst: reg, key: kst) : ABC {
@@ -1500,11 +1500,11 @@ pub vm JS {
     /// Reading `this` in a derived constructor before super().
     op CHECKTHIS(r: reg) : ABC {
         if r != V.Undef { next }
-        cold { raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor") }
+        raise ctx.new_error(ctx.err_proto(), "Must call super constructor in derived class before accessing 'this' or returning from derived constructor")
     }
     /// After super(...) returned: `this` becomes R[h].
     op SUPERDONE(h: reg) : ABC {
-        if regs[0] != V.Undef { cold { raise ctx.new_error(ctx.err_proto(), "Super constructor may only be called once") } }
+        if regs[0] != V.Undef { raise ctx.new_error(ctx.err_proto(), "Super constructor may only be called once") }
         regs[0] = h;
         next
     }

@@ -261,8 +261,8 @@ pub vm Py {
     /// Push a frame for `f` whose arguments are in place at `win`, and run it.
     fn push_frame(f: Gc<Func>, win: *Value, slot: *Value, flags: u64) -> never {
         let p = f.proto;
-        if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
-        if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+        if !ensure(win + p.nregs as u64) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
+        if fp + 1 >= ctx.frames_end { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
         let nf = fp + 1;
         nf.func = Func(f);
         nf.gen = Nil;
@@ -284,7 +284,7 @@ pub vm Py {
         let p = f.proto;
         let np = p.simple as u64;
         if n < np {
-            if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+            if !ensure(win + p.nregs as u64) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
             let d = f.defaults as! Some;
             let nd = d.items.len;
             for i in n..np { win[i] = *(d.items.ptr + (i + nd - np)); }
@@ -307,7 +307,7 @@ pub vm Py {
                     builtins.count(330);
                     if kw == Nil and ops.args_fast(f, nn) { push_args(f, regs + w, regs + b, nn, flags) }
                     builtins.count(331);
-                    if !ensure(regs + w + p.nregs as u64 + 1) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                    if !ensure(regs + w + p.nregs as u64 + 1) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                     ops.bind_args(ctx, f, regs + w, nn, kw)?;
                     if (p.flags & P_GEN) != 0 {
                         let g = ops.make_gen(ctx, f, regs + w);
@@ -321,7 +321,7 @@ pub vm Py {
                     // in Python (prelude), so it runs in this loop rather than
                     // through a nested run per item.
                     if kw == Nil and nn >= 1 and nn <= 2 and value.is_kind(regs[w + nn - 1], K_GEN) and builtins.consumes(id) {
-                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = callee;
@@ -336,7 +336,7 @@ pub vm Py {
                 Obj(o) => {
                     if o.kind == K_BOUND {
                         builtins.count(332);
-                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = o.a;
@@ -351,7 +351,7 @@ pub vm Py {
                                 let t = (o.n - 1) as u64;
                                 if t == T_LIST { callee = ctx.pre_list; continue; }
                                 if t == T_TUPLE or t == T_SET or t == T_FROZENSET or t == T_DICT {
-                                    if !ensure(regs + w + 3) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                                    if !ensure(regs + w + 3) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                                     regs[w + 1] = regs[w];
                                     regs[w] = callee;
                                     callee = ctx.pre_via1;
@@ -369,7 +369,7 @@ pub vm Py {
                             if nn > 0 or kw != Nil { raise ops.type_error(ctx, "takes no arguments", inst) }
                             next
                         };
-                        if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                        if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                         var i = nn;
                         while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                         regs[w] = inst;
@@ -382,7 +382,7 @@ pub vm Py {
                 }
                 Inst(o) => {
                     let Some(m) = ops.class_lookup(o.cls, ops.dn(ctx, ops.DN_CALL)) else { raise ops.not_callable(ctx, callee) };
-                    if !ensure(regs + w + nn + 2) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                    if !ensure(regs + w + nn + 2) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                     var i = nn;
                     while i > 0 { regs[w + i] = regs[w + i - 1]; i -= 1; }
                     regs[w] = callee;
@@ -430,12 +430,12 @@ pub vm Py {
     /// execution continues at `cont` (FORITER: `then_next_pc`); when done, at `alt`.
     fn resume(g: Gc<Box>, slot: *Value, cont: *u32, alt: *u32) -> never {
         if g.m == GEN_DONE { jump alt }
-        if g.m == GEN_RUNNING { cold { raise ops.exc(ctx, builtins.Exc.ValueError, "generator already executing") } }
+        if g.m == GEN_RUNNING { raise ops.exc(ctx, builtins.Exc.ValueError, "generator already executing") }
         let f = g.a as! Func;
         let p = f.proto;
         let win = regs + fp.proto.nregs as u64;
-        if !ensure(win + p.nregs as u64) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
-        if fp + 1 >= ctx.frames_end { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+        if !ensure(win + p.nregs as u64) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
+        if fp + 1 >= ctx.frames_end { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
         let saved = g.extra.ptr;
         for i in 0..p.nregs as u64 { win[i] = saved[i]; }
         if g.m == GEN_SUSPENDED { win[g.s as u64] = Nil; }
@@ -460,7 +460,7 @@ pub vm Py {
     /// operator methods (__add__, __getitem__, ...).
     fn call2(f: Gc<Func>, x: Value, y: Value, dst: u64) -> never {
         let win = regs + fp.proto.nregs as u64;
-        if !ensure(win + 2) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+        if !ensure(win + 2) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
         win[0] = x;
         win[1] = y;
         push_frame(f, win, regs + dst, 0)
@@ -497,7 +497,7 @@ pub vm Py {
                 let e = d.ents.e.ptr + i;
                 if e.key == name { dst = e.value; next }
             }
-            cold { become GETGLOBAL; redo }
+            become GETGLOBAL; redo
         }
         GETGLOBAL_B {
             let f = fp.func as! Func;
@@ -507,7 +507,7 @@ pub vm Py {
                 dst = (bd.ents.e.ptr + (cache.idx as u64)).value;
                 next
             }
-            cold { become GETGLOBAL; redo }
+            become GETGLOBAL; redo
         }
     }
     /// The entry number is checked as GETGLOBAL_C checks it.
@@ -801,7 +801,7 @@ pub vm Py {
                     gc_point();
                     if cl.n == 0 and let Some(iv) = ops.cached_init(ctx, cl) and let Func(init) = iv and ops.args_fast(init, n as u64 + 1) {
                         let w = regs + base.raw + 1;
-                        if !ensure(w + n as u64 + 1) { cold { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") } }
+                        if !ensure(w + n as u64 + 1) { raise ops.exc(ctx, builtins.Exc.RecursionError, "maximum recursion depth exceeded") }
                         let inst = ops.new_instance(ctx, cl);
                         var i = n as u64;
                         while i > 0 { w[i] = w[i - 1]; i -= 1; }
@@ -848,12 +848,12 @@ pub vm Py {
                     push_frame(init, w, w, 0)
                 }
             }
-            cold { become CALL; redo }
+            become CALL; redo
         }
         /// math.sqrt(x) & co. imported as names (builtins.math1).
         CALL_M1 {
             if let Builtin(id) = base and let Some(r) = builtins.math1(id, regs[base.raw + 1]) { regs[base.raw] = r; next }
-            cold { become CALL; redo }
+            become CALL; redo
         }
     }
     /// Method call after LOADMETHOD: R[base] callee, R[base+1] self or

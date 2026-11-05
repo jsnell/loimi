@@ -1,0 +1,84 @@
+// args: --vm-stats
+// matrix: dispatch
+// Errors and deoptimization are cold by default: a `raise`, `fail` or
+// `become ..; redo` reached on some paths only is compiled as if written
+// in `cold { }` (a branch that ends in one; the rest of a block after a
+// statement that leaves it), so `--vm-stats` counts it as a cold block,
+// at the branch's location. `#[hot]` keeps one inline; a `raise` the op
+// always reaches is not cold.
+// expect-stderr: cold blocks entered:
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:40:19)
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:41:32)
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:42:66)
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:34:49)
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:45:19)
+// expect-stderr: 1  CHK (cold block at vm_auto_cold.lm:47:9)
+// expect-stderr: 1  INC_S (cold block at vm_auto_cold.lm:52:26)
+// expect-no-stderr: lm:44:
+// expect: 0 ok 8
+// expect: 1 err 101
+// expect: 2 err 102
+// expect: 3 err 103
+// expect: 4 err 104
+// expect: 5 err 105
+// expect: 6 err 106
+// expect: 7 err 107
+import std.io;
+
+vm V {
+    state { pc: *u32, r: *i64 }
+    operand reg = r[it];
+    operand imm = it;
+    encoding fixed(u32) { format A { op: 8, a: 8, b: 8, c: 8 } }
+
+    fn need(ok: bool, e: i64) -> never { if !ok { raise e } next }
+
+    // CHK x, k: raise 100 + k for k in 1..3 (a branch, a match arm, a
+    // `let .. else`), 104 in a vm function, 105 at the end of the op, 106
+    // from a `#[hot]` arm.
+    op CHK(x: reg, k: imm) : A {
+        if k == 1 { raise 101 }
+        let y = match k { 2 => raise 102, _ => x };
+        let Some(z) = (if k == 3 { None } else { Some(y) }) else { raise 103 };
+        if k == 4 { need(false, 104) }
+        if k == 6 { #[hot] raise 106 }
+        if k == 7 { fail 107 }
+        if k == 0 { x = z + 7; next }
+        raise 105
+    }
+    // A member that gives up when its operand is negative.
+    family INC(x: reg) : A {
+        generic { if x >= 0 { become INC_S; } x = x + 1; next }
+        INC_S { if x < 0 { become INC; redo } x = x + 1; next }
+    }
+    op ALWAYS(x: reg) : A { raise x }
+    op RET(x: reg) : A { exit Ok(x) }
+    entry run(code: *u32, regs: *i64) -> Result<i64, i64> { pc = code; r = regs; jump pc }
+    on raise(e: i64) { exit Err(e) }
+}
+
+fn main() {
+    var k: u64 = 0;
+    while k < 8 {
+        var code: [u32; 8] = [0; 8];
+        let s = code[..];
+        var at: u64 = 0;
+        at = V.emit.INC(s, at, 0);
+        at = V.emit.CHK(s, at, 0, k as u8);
+        at = V.emit.RET(s, at, 0);
+        var regs: [i64; 2] = [0, 0];
+        // INC runs twice per program: generic, then INC_S after a negative
+        // operand is seen once (k == 0 makes it give up).
+        io.print_int(k as i64);
+        match V.run(&code[0], &regs[0]) {
+            Ok(v) => { io.print(" ok "); io.print_int(v); }
+            Err(e) => { io.print(" err "); io.print_int(e); }
+        }
+        io.println("");
+        if k == 0 {
+            regs = [-5, 0];
+            match V.run(&code[0], &regs[0]) { Ok(_) => {}, Err(_) => {} }
+        }
+        k += 1;
+    }
+}

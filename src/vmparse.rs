@@ -78,12 +78,14 @@ impl Parser {
             accs: vec![],
             acc_list: vec![],
             acc_ops: vec![],
+            auto_cold: vec![],
             is_pub,
         };
         // `inline for` variables replace every matching token in the body,
         // so one named like a state variable would silently replace it.
         let mut loop_vars: Vec<Ident> = Vec::new();
         self.vm_polls.clear();
+        self.vm_hot.clear();
         while !self.eat("}") {
             if self.is_kw("inline") && self.is_kw_at(1, "for") {
                 loop_vars.extend(self.expand_inline_for(false)?);
@@ -92,7 +94,7 @@ impl Parser {
             // `#[cfg(NAME)]` on a vm item: parsed, then dropped when NAME
             // is not enabled (the vm is as if the item were not written).
             let keep = self.take_cfg()?;
-            let saved = if keep { None } else { Some((vm.clone(), self.vm_loop_vars.len())) };
+            let saved = if keep { None } else { Some((vm.clone(), self.vm_loop_vars.len(), self.vm_hot.len())) };
             let mark = self.allow_mark();
             let item_attrs = self.parse_attrs()?;
             let kw = match self.peek() {
@@ -458,12 +460,14 @@ impl Parser {
                 _ => return self.err(format!("unknown vm item `{}`", kw)),
             }
             self.close_allows(mark);
-            if let Some((v, n)) = saved {
+            if let Some((v, n, h)) = saved {
                 vm = v;
                 self.vm_loop_vars.truncate(n);
+                self.vm_hot.truncate(h);
             }
         }
         loop_vars.append(&mut self.vm_loop_vars);
+        vm.auto_cold = crate::autocold::run(&mut vm, &self.vm_hot)?;
         desugar_break(&mut vm)?;
         crate::vmacc::desugar(&mut vm)?;
         for v in &loop_vars {

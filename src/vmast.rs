@@ -181,6 +181,9 @@ pub struct VmDecl {
     /// `accumulate OP, OP;`: more ops to derive variants of.
     pub acc_list: Vec<Ident>,
     pub acc_ops: Vec<AccOp>,
+    /// The branches made cold by default (src/autocold.rs), for
+    /// `LOIMI_COLD_AUDIT=1`.
+    pub auto_cold: Vec<crate::autocold::Site>,
     pub is_pub: bool,
 }
 

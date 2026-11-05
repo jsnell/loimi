@@ -1,0 +1,10 @@
+// `#[hot]` goes on the control word that ends a branch.
+vm V {
+    state { pc: *u32, n: i64 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op STEP() : A { if n == 0 { #[hot] n = 1; raise 1 } next }
+    entry run(c: *u32) -> i64 { pc = c; n = 0; jump pc }
+    on raise(e: i64) { exit e }
+}
+fn main() {}
+// error: `#[hot]` goes on a `raise`, `fail` or `redo` that ends a branch

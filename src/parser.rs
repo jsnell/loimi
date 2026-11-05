@@ -20,6 +20,8 @@ pub struct Parser {
     /// and body (None: dropped by `#[cfg]`, so its uses expand to
     /// nothing).
     pub vm_polls: Vec<(Ident, Option<Block>)>,
+    /// Control words marked `#[hot]` in the vm being parsed (src/autocold.rs).
+    pub vm_hot: Vec<Span>,
     /// `#[allow(lint)]` attributes: (lint, attribute span, region). The
     /// region runs from the attribute to the end of what it is attached to
     /// (an item, a vm item, a match arm), or is the whole file for
@@ -173,6 +175,7 @@ impl Parser {
             cast_type: false,
             vm_loop_vars: Vec::new(),
             vm_polls: Vec::new(),
+            vm_hot: Vec::new(),
             allows: Vec::new(),
             open_allows: Vec::new(),
         }
@@ -1209,8 +1212,23 @@ impl Parser {
                 }
                 continue;
             }
+            // `#[hot]` on a `raise`, `fail` or `redo` that ends a branch:
+            // the branch is not made cold (src/autocold.rs).
+            let hot = self.in_vm && self.is("#") && self.is_at(1, "[") && self.is_kw_at(2, "hot") && self.is_at(3, "]");
+            if hot {
+                let sp = self.span();
+                for _ in 0..4 {
+                    self.bump();
+                }
+                if !(self.is_kw("raise") || self.is_kw("fail") || self.is_kw("redo")) {
+                    return Err(Diag::new(sp, "`#[hot]` goes on a `raise`, `fail` or `redo` that ends a branch, to keep the branch from being made cold"));
+                }
+            }
             let st = self.parse_stmt()?;
             if keep {
+                if let (true, Stmt::Expr { expr, .. }) = (hot, &st) {
+                    self.vm_hot.push(expr.span);
+                }
                 stmts.push(st);
             }
         }

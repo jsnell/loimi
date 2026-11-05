@@ -384,6 +384,18 @@ Notes:
   in goto and switch modes. The same goes for `next` in a shared copy of
   a `-> never` vm function called from such a part, which gets the resume
   function in a thread-local slot.
+- **The instruction word, only where it is read.** A raise tail-calls
+  `on raise` with the handler signature; when the vm's `on raise` never
+  reads the word it is passed (no `Word(0)`, chain, super part or shared
+  call that is passed it; `vmgen::on_raise_reads_insn`), the raise passes
+  `poison`. An outlined cold block likewise gets `poison` when it decodes
+  no operand and reads no word (`reads_insn`). Before, every outlined
+  cold block was passed the handler's word, so a handler whose cold
+  branch follows a call kept the word in a callee-saved register across
+  the call (a `push`, a `mov`), and one whose cold branch needed nothing
+  else went through a `mov %eax, %esi; jmp cold` trampoline instead of
+  branching to the cold function directly. Measured on the examples
+  (`docs/design/ergonomics-audit.md`, item 6): only shorter handlers.
 - Each handler is a separate symbol (`Mini.op.ADD`), so `perf` and other
   profilers attribute time per opcode without any extra tooling.
 - **Loops in tail-call vm code** (handlers, cold blocks, vm functions)

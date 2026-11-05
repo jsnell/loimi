@@ -2463,6 +2463,13 @@ pub fn expand(sm: &mut SourceMap, modules: &mut [Module], jit: bool) -> Res<()> 
         check_reserved_names(&m.items)?;
         for it in &m.items {
             if let Item::Vm(v) = it {
+                if std::env::var_os("LOIMI_COLD_AUDIT").is_some() {
+                    // The branches made cold by default, one per line.
+                    for s in &v.auto_cold {
+                        let (line, col) = sm.line_col(s.span.file, s.span.lo);
+                        eprintln!("{}:{}:{}: vm {}, {}: `{}` branch made cold", sm.files[s.span.file as usize].path, line, col, v.name.name, s.item, s.what);
+                    }
+                }
                 let l = layout(v)?;
                 let mut src = generate(v, &l, jit, cached);
                 if jit && !jit_externs {

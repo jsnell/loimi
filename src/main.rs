@@ -1,4 +1,5 @@
 mod ast;
+mod autocold;
 mod traits;
 mod check;
 mod closures;

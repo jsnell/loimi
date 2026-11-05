@@ -396,15 +396,15 @@ pub vm W {
     // Division: traps on a zero divisor and on MIN / -1; x rem -1 is 0.
     inline for (name, k, min) in [("I32_DIV_S", ri, (-2147483647 - 1)), ("I64_DIV_S", rl, (-9223372036854775807 - 1))] {
         op #name(d: k, a: k, b: k) : RRR {
-            if b == 0 { cold { raise Trap.DivZero } }
-            if b == -1 and a == min { cold { raise Trap.IntOverflow } }
+            if b == 0 { raise Trap.DivZero }
+            if b == -1 and a == min { raise Trap.IntOverflow }
             d = a / b;
             next
         }
     }
     inline for (name, k) in [("I32_REM_S", ri), ("I64_REM_S", rl)] {
         op #name(d: k, a: k, b: k) : RRR {
-            if b == 0 { cold { raise Trap.DivZero } }
+            if b == 0 { raise Trap.DivZero }
             if b == -1 { d = 0; next }
             d = a % b;
             next
@@ -415,7 +415,7 @@ pub vm W {
         ("I64_DIV_U", rq, a / b), ("I64_REM_U", rq, a % b),
     ] {
         op #name(d: k, a: k, b: k) : RRR {
-            if b == 0 { cold { raise Trap.DivZero } }
+            if b == 0 { raise Trap.DivZero }
             d = expr; next
         }
     }
@@ -489,7 +489,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: ru, end: ek) : RRR {
             let top = (a as u64) + end;
-            if top > msize { cold { raise Trap.MemOOB } }
+            if top > msize { raise Trap.MemOOB }
             let x = ((mem + top - size) as *ty).read_unaligned();
             d = conv;
             next
@@ -504,7 +504,7 @@ pub vm W {
     ] {
         op #name(a: ru, v: vk, end: ek) : RRR {
             let top = (a as u64) + end;
-            if top > msize { cold { raise Trap.MemOOB } }
+            if top > msize { raise Trap.MemOOB }
             ((mem + top - size) as *ty).write_unaligned(conv);
             next
         }
@@ -523,7 +523,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: rq) : RRR {
             let ea = a;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -538,7 +538,7 @@ pub vm W {
     ] {
         op #name(a: rq, v: vk) : RRR {
             let ea = a;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
@@ -551,13 +551,13 @@ pub vm W {
         next
     }
     op MEM_FILL(dst: ru, v: ri, n: ru) : RRR {
-        if (dst as u64) + (n as u64) > msize { cold { raise Trap.MemOOB } }
+        if (dst as u64) + (n as u64) > msize { raise Trap.MemOOB }
         memset(mem + (dst as u64), v, n as u64);
         next
     }
     op MEM_COPY(dst: ru, src: ru, n: ru) : RRR {
         if (dst as u64) + (n as u64) > msize or (src as u64) + (n as u64) > msize {
-            cold { raise Trap.MemOOB }
+            raise Trap.MemOOB
         }
         memmove(mem + (dst as u64), mem + (src as u64), n as u64);
         next
@@ -632,7 +632,7 @@ pub vm W {
         if !local and (f.inst != ctx.inst or f.host.is_some()) { cold { call_slow(f, b) } }
         let nr = regs + b;
         if nr + (f.nslots as u64) > ctx.stack_end or fp + 2 >= ctx.frames_end {
-            cold { raise Trap.Exhausted }
+            raise Trap.Exhausted
         }
         // Zero the non-parameter locals. (The loop stays a loop: LLVM does
         // not turn loops in handlers into memset calls, which would give
@@ -690,24 +690,24 @@ pub vm W {
 
     op CALL_INDIRECT(b: base, t: tidx, i: ru) : RRR {
         let tab = ctx.table;
-        if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
+        if (i as u64) >= tab.size { raise Trap.UndefElem }
         let fv = tab.elems[i as u64];
-        if fv == 0 { cold { raise Trap.UninitElem } }
+        if fv == 0 { raise Trap.UninitElem }
         let f = fv as *Func;
-        if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
+        if f.sig != ctx.sigs[t.raw] { raise Trap.SigMismatch }
         do_call(f, b.raw, false)
     }
     // call_indirect through a table other than 0 (index in the cache word,
     // checked here: the verifier does not see cache words).
     op CALL_INDIRECT_X(b: base, t: tidx, i: ru) : RRR + Imm64 {
         let ti = cache.v;
-        if ti >= ctx.inst.tables.len { cold { raise Trap.TableOOB } }
+        if ti >= ctx.inst.tables.len { raise Trap.TableOOB }
         let tab = ctx.inst.tables.at(ti);
-        if (i as u64) >= tab.size { cold { raise Trap.UndefElem } }
+        if (i as u64) >= tab.size { raise Trap.UndefElem }
         let fv = tab.elems[i as u64];
-        if fv == 0 { cold { raise Trap.UninitElem } }
+        if fv == 0 { raise Trap.UninitElem }
         let f = fv as *Func;
-        if f.sig != ctx.sigs[t.raw] { cold { raise Trap.SigMismatch } }
+        if f.sig != ctx.sigs[t.raw] { raise Trap.SigMismatch }
         do_call(f, b.raw, false)
     }
 
@@ -947,14 +947,14 @@ pub vm W {
     ] {
         op #name(d: dk, a: ru, end: ek) : RRR {
             let top = (a as u64) + end;
-            if top > msize { cold { raise Trap.MemOOB } }
+            if top > msize { raise Trap.MemOOB }
             let x = ((mem + top - size) as *ty).read_unaligned();
             d = conv;
             next
         }
         op #(name ++ "_X")(d: dk, a: rq) : RRR {
             let ea = a;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -962,13 +962,13 @@ pub vm W {
     }
     op V128_STORE(a: ru, v: vul, end: e16) : RRR {
         let top = (a as u64) + end;
-        if top > msize { cold { raise Trap.MemOOB } }
+        if top > msize { raise Trap.MemOOB }
         ((mem + top - 16) as *u64x2).write_unaligned(v);
         next
     }
     op V128_STORE_X(a: rq, v: vul) : RRR {
         let ea = a;
-        if ea + 16 > msize { cold { raise Trap.MemOOB } }
+        if ea + 16 > msize { raise Trap.MemOOB }
         ((mem + ea) as *u64x2).write_unaligned(v);
         next
     }
@@ -980,7 +980,7 @@ pub vm W {
     ] {
         op #name(d: vk, a: ru, v: vk) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = v.with_lane_at(cache.v >> 32, x);
             next
@@ -992,7 +992,7 @@ pub vm W {
     ] {
         op #name(a: ru, v: vk, z: imm) : RRR + Imm64 {
             let ea = (a as u64) + (cache.v & 0xFFFFFFFF);
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(v.lane_at(cache.v >> 32));
             next
         }
@@ -1014,7 +1014,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: ru, k: imm) : RRK {
             let ea = (a +% (k as u32)) as u64;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -1029,7 +1029,7 @@ pub vm W {
     ] {
         op #name(a: ru, v: vk, k: imm) : RRK {
             let ea = (a +% (k as u32)) as u64;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             ((mem + ea) as *ty).write_unaligned(conv);
             next
         }
@@ -1065,7 +1065,7 @@ pub vm W {
             let v = a +% (((k << 52) as i64 >> 52) as u32);
             t = v;
             let ea = v as u64;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -1084,7 +1084,7 @@ pub vm W {
     ] {
         op #name(d: dk, a: ru, b: ru) : RRR {
             let ea = (a +% b) as u64;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -1093,7 +1093,7 @@ pub vm W {
             let v = a +% b;
             t = v;
             let ea = v as u64;
-            if ea + size > msize { cold { raise Trap.MemOOB } }
+            if ea + size > msize { raise Trap.MemOOB }
             let x = ((mem + ea) as *ty).read_unaligned();
             d = conv;
             next
@@ -1115,7 +1115,7 @@ pub vm W {
     inline for (name, nz) in [("BR_I32_LOAD_NZ", true), ("BR_I32_LOAD_Z", false)] {
         op #name(d: ri, a: ru, end: e4) : RRR then JMP {
             let top = (a as u64) + end;
-            if top > msize { cold { raise Trap.MemOOB } }
+            if top > msize { raise Trap.MemOOB }
             let x = ((mem + top - 4) as *i32).read_unaligned();
             d = x;
             if (x != 0) == nz { jump then.t }

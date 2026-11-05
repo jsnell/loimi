@@ -600,7 +600,7 @@ pub vm Mini {
                     next
                 }
             }
-            cold { become GETGLOBAL; redo }
+            become GETGLOBAL; redo
         }
     }
     #[poll(gc)] op SETGLOBAL(src: reg, name: kst) : ABx {
@@ -672,7 +672,7 @@ pub vm Mini {
             }
             cold { dst = field_get_slow(tab, key, &cache.slot); next }
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
+        raise error(ctx, "attempt to index a ", t)
     }
     op SETFIELD(t: reg, key: kst, v: reg) : ABC + FieldIC {
         if let T(tab) = t {
@@ -687,7 +687,7 @@ pub vm Mini {
                 next
             }
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
+        raise error(ctx, "attempt to index a ", t)
     }
     op GETINDEX(dst: reg, t: reg, key: reg) : ABC {
         if let (T(tab), Int(_)) = (t, key) {
@@ -746,7 +746,7 @@ pub vm Mini {
             if u < tab.asize { dst = tab.aptr[u]; next }
             cold { dst = value.table_get(tab, Int(i as i32)); next }
         }
-        cold { raise error(ctx, "attempt to index a ", t) }
+        raise error(ctx, "attempt to index a ", t)
     }
     /// Method lookup: R[a+1] = obj; R[a] = obj[key].
     op SELF(a: selfbase, obj: reg, key: kst) : ABC + FieldIC {
@@ -760,7 +760,7 @@ pub vm Mini {
             }
             cold { regs[a] = field_get_slow(tab, key, &cache.slot); next }
         }
-        cold { raise error(ctx, "attempt to index a ", o) }
+        raise error(ctx, "attempt to index a ", o)
     }
 
     // Arithmetic: one declaration, six families (register and constant
@@ -814,14 +814,14 @@ pub vm Mini {
                     let r = x as f64 sym f64.from_bits(b as u64);
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; refuse(fp.cl); redo }
+                become #fname; refuse(fp.cl); redo
             }
             #finame {
                 if let Int(y) = b {
                     let r = f64.from_bits(a as u64) sym y as f64;
                     if likely(r == r) { dst = r.to_bits() as V; next }
                 }
-                cold { become #fname; refuse(fp.cl); redo }
+                become #fname; refuse(fp.cl); redo
             }
         }
     }
@@ -1071,7 +1071,7 @@ pub vm Mini {
     op FORPREP(a: forbase, target: label) : AsBx {
         match (regs[a], regs[a + 1], regs[a + 2]) {
             (Int(i), Int(l), Int(s)) => {
-                if s == 0 { cold { raise error_msg(ctx, "'for' step is zero") } }
+                if s == 0 { raise error_msg(ctx, "'for' step is zero") }
                 if (s > 0 and i > l) or (s < 0 and i < l) { jump target }
                 regs[a + 1] = for_count(i as i64, l as i64, s as i64);
                 regs[a + 3] = Int(i);
@@ -1145,7 +1145,7 @@ pub vm Mini {
             }
             next
         }
-        cold { raise iter_error(ctx, regs[a]) }
+        raise iter_error(ctx, regs[a])
     }
     /// ipairs loop: R[a] table, R[a+1] last index, R[a+2], R[a+3] index and value.
     op INEXT(a: forbase, target: label) : AsBx {
@@ -1158,7 +1158,7 @@ pub vm Mini {
             regs[a + 3] = v;
             poll gil; poll pause; jump target
         }
-        cold { raise iter_error(ctx, regs[a]) }
+        raise iter_error(ctx, regs[a])
     }
 
     /// R[base .. base+nres-1] = R[base](R[base+1] .. R[base+nargs]).
@@ -1234,7 +1234,7 @@ pub vm Mini {
                 native_results(base as u64, nres as u64, v)
             }
         }
-        cold { raise error(ctx, "attempt to call a ", f) }
+        raise error(ctx, "attempt to call a ", f)
     }
     /// After a native returned `v` to CALL: store its results in
     /// R[base .. base+nres-1].

@@ -1,0 +1,10 @@
+// `#[hot]` on a `raise` the op always reaches does nothing.
+vm V {
+    state { pc: *u32 }
+    encoding fixed(u32) { format A { op: 8 } }
+    op THROW() : A { #[hot] raise 1 }
+    entry run(c: *u32) -> i64 { pc = c; jump pc }
+    on raise(e: i64) { exit e }
+}
+fn main() {}
+// error: `#[hot]` does nothing here

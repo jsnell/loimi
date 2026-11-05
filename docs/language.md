@@ -2446,9 +2446,73 @@ example interpreters (the others also make other calls), so it was not
 kept. A `cold` block is also an expression:
 `let ok = match (a, b) { ..., _ => cold { compare_slow(ctx, a, b)? } };`
 
+**Errors and deoptimization are cold by default.** In an op handler
+or a `-> never` vm function, a `raise e` or `fail e`, or a `redo` after
+a `become` (a family member giving up on its guard), that the code
+reaches only on some paths is compiled as if it were written in a
+`cold` block:
+
+- a branch that ends in one, the block of an `if` or an `else`, a
+  `match` arm or the `else` of a `let .. else`, is cold as a whole;
+- a block that ends in one after a statement that can leave the block
+  (one with `next`, `jump`, `exit`, `raise` or `fail` in it, a call of a
+  `-> never` vm function, `return`, `break` or `continue`) is cold from
+  the statement after that one.
+
+<!-- snippet: check
+value Value repr nanbox { Num(f64) unboxed, Int(i32), Nil }
+struct Interp { x: i64 }
+vm V {
+    context ctx: *Interp;
+    state { pc: *u32, regs: *Value }
+    operand reg = regs[it];
+    encoding fixed(u32) { format ABC { op: 8, a: 8, b: 8, c: 8 } }
+    family NEG(dst: reg, a: reg) : ABC {
+        generic { if let Num(x) = a { become NEG_N; } dst = Nil; next }
+{snippet}
+    }
+    entry run(c: *Interp, code: *u32, r: *Value) -> Result<Value, str> { ctx = c; regs = r; jump code }
+    on raise(e: str) { exit Err(e) }
+}
+fn main() {}
+-->
+```loimi
+NEG_N {
+    if let Num(x) = a { dst = Num(-x); next }
+    if a is Nil { raise "operand is nil" }      // if a is Nil { cold { raise "operand is nil" } }
+    let Int(i) = a else { become NEG; redo };   // else cold { become NEG; redo }
+    dst = Int(-i);
+    next
+}
+```
+
+That is the tree the hand-written `cold` gives, so it is the same code,
+and the fast path of an op whose error branch was not written `cold`
+can only lose instructions (the branch is outlined in tail-call mode,
+and weighted unlikely in every mode). The rule leaves alone:
+
+- a `raise` the code always reaches, such as all of `op THROW(e: reg) :
+  ABC { raise e }`: there is no fast path to keep it off (write `cold {
+  raise e }` to outline it anyway);
+- `?`, whose error arm is part of every call of a function that returns
+  a `Result` (Considered and rejected in the ergonomics audit,
+  `docs/design/ergonomics-audit.md` section 3);
+- `redo` without a `become`, and a statement that only `redo`es (a poll,
+  a refill): they write their own `cold` block, and what follows them is
+  still the op's path, so they do not make the rest of a block cold;
+- `on raise`, entries and plain vm functions (which cannot use control
+  words), and code already in a `cold` block.
+
+`#[hot]` on the `raise`, `fail` or `redo` keeps its branch inline, for an
+interpreter that raises on a path it expects to be common (a guest
+`throw` used for control flow): `Err(ball) => { #[hot] raise ball }`.
+`LOIMI_COLD_AUDIT=1 loimi build ..` lists every branch the rule made
+cold, which is how the examples' sites that were not written `cold`
+were found (`docs/design/ergonomics-audit.md` item 6).
+
 To see which slow paths actually run, `loimi build --vm-stats` counts
 the entries into each `cold` block, per op, with its source location
-(section 7.3).
+(section 7.3); the blocks made cold by default are counted too.
 
 ---
 

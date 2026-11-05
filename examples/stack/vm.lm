@@ -329,7 +329,7 @@ pub vm Stak {
             if a >= b { jump target }
             next
         }
-        cold { raise "do: the bounds must be integers" }
+        raise "do: the bounds must be integers"
     }
     op LOOP(s: dslot, target: label) : LS stack(--) {
         if let (Int(i), Int(n)) = (s, lp[s.raw + 1]) {
@@ -338,7 +338,7 @@ pub vm Stak {
             if j < n { jump target }
             next
         }
-        cold { raise "loop: corrupted index" }
+        raise "loop: corrupted index"
     }
 
     // Calls. Arguments stay where they are on the data stack; the callee
@@ -348,7 +348,7 @@ pub vm Stak {
         let nlp = lp + fp.word.nlocals as u64;
         if sp + callee.code.max_stack() as u64 >= ctx.stack_end or nlp + callee.nlocals as u64 > ctx.lstack_end
             or fp + 1 == ctx.frames_end {
-            cold { raise "stack overflow" }
+            raise "stack overflow"
         }
         // Slots past the caller's may hold dead objects from earlier
         // calls; the root scanner reads them, so clear them.
@@ -402,7 +402,7 @@ pub vm Stak {
             Arr(a) => { tos = Int(a.items.len as i32); next }
             _ => {}
         }
-        cold { raise type_error("len", tos, ctx) }
+        raise type_error("len", tos, ctx)
     }
     /// `poll gc;`: collect if the heap has grown, then go on with the op.
     poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } } }
@@ -412,7 +412,7 @@ pub vm Stak {
             tos = Arr(value.new_arr(&ctx.heap, n as u64));
             next
         }
-        cold { raise "array: the size must be an integer from 0 to 2^24" }
+        raise "array: the size must be an integer from 0 to 2^24"
     }
     /// The top `n` values become an array.
     #[poll(gc)] op MKARRAY(n: cnt) : N stack(xs[n] -- arr) {
@@ -430,9 +430,9 @@ pub vm Stak {
         if let (Arr(a), Int(i)) = (*sp, tos) {
             let u = i as u64;
             if u < a.items.len { put2(a.items.ptr[u]); next }
-            cold { raise "index out of range" }
+            raise "index out of range"
         }
-        cold { raise type_error("@", *sp, ctx) }
+        raise type_error("@", *sp, ctx)
     }
     op STORE() : N stack(v arr i --) {
         if let (Arr(a), Int(i)) = (*sp, tos) {
@@ -443,13 +443,13 @@ pub vm Stak {
                 sp = sp - 3;
                 next
             }
-            cold { raise "index out of range" }
+            raise "index out of range"
         }
-        cold { raise type_error("!", *sp, ctx) }
+        raise type_error("!", *sp, ctx)
     }
     op SQRT() : N stack(x -- y) {
         if let Some(x) = value.to_f64(tos) { tos = Num(sqrt(x)); next }
-        cold { raise type_error("sqrt", tos, ctx) }
+        raise type_error("sqrt", tos, ctx)
     }
     op TOINT() : N stack(x -- n) {
         match tos {
@@ -457,7 +457,7 @@ pub vm Stak {
             Num(x) => if x > -2147483649.0 and x < 2147483648.0 { tos = Int(x as i32); next },
             _ => {}
         }
-        cold { raise "int: not a number in the int range" }
+        raise "int: not a number in the int range"
     }
 
     // Superinstructions, from `--vm-stats` on the benchmarks.
@@ -512,7 +512,7 @@ pub vm Stak {
     variant budget wraps [JMP, JZ, LOOP, CALL, PUSHI_LT_JZ, LT_JZ, LE_JZ, GT_JZ, DUP_PUSHI_LT_JZ] {
         before {
             ctx.steps -= 1;
-            if ctx.steps < 0 { cold { raise "step budget exhausted" } }
+            if ctx.steps < 0 { raise "step budget exhausted" }
         }
     }
 
