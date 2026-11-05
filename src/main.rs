@@ -30,7 +30,7 @@ mod vmparse;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use diag::{Diag, SourceMap, Span};
+use diag::{Diag, Diags, SourceMap, Span};
 
 struct Opts {
     input: Option<PathBuf>,
@@ -85,6 +85,8 @@ struct Opts {
     /// `--cpu=NAME` (or `LOIMI_CPU`): the CPU to compile for (clang's
     /// `-march` on x86-64, `-mcpu` on AArch64). None: the target's baseline.
     cpu: Option<Cpu>,
+    /// `--max-errors N`: how many errors to print (0: all).
+    max_errors: usize,
 }
 
 /// A `--cpu`: its name and what clang says it has.
@@ -181,6 +183,7 @@ const USAGE: &str = "\
 usage: loimi build <file.lm> [-o out] [--release | -O] [--emit-llvm] [--dispatch=tailcall|goto|switch] [--vm-stats] [--align-functions=N] [--no-branch-align]
                   [--sanitize=address|thread] [-W error | -Werror | --deny-warnings] [-W hot_gc] [-W handler_frame]
                   [--lib | --shared] [--header out.h [--header-prefix p]] [--tls=initial-exec|local-dynamic|global-dynamic] [--jit-stencils]
+                  [--max-errors N]   (print at most N errors, default 20; 0: all)
                   [--cfg NAME]   (keep code marked #[cfg(NAME)], drop #[cfg(not(NAME))]; docs/language.md section 1.4)
                   [--gc-check-roots]   (the collector validates every reference it marks; docs/lowering.md section 9)
                   [--keep-ll]   (keep the IR as <out>.ll, or <file>.ll without -o)
@@ -328,7 +331,7 @@ const BRANCH_ALIGN_LLVM_ARGS: &[&str] = &[
 /// Compile to LLVM IR, and the C header if `--header` asked for one.
 /// The options: the LLVM options the program's dispatch modes need
 /// (`GOTO_LLVM_ARGS`, `SWITCH_LLVM_ARGS`).
-fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, Vec<framelint::Site>), Diag> {
+fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, Option<JitParts>, Vec<&'static str>, Vec<framelint::Site>), Diags> {
     let input = opts.input.as_ref().unwrap();
     let mut allows = Vec::new();
     // `--sanitize=address` also sets `#[cfg(sanitize_address)]`: std's
@@ -346,7 +349,7 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     let mut modules = load(sm, input, &mut allows, opts.test)?;
     for (name, span, _) in &allows {
         if !diag::LINTS.contains(&name.as_str()) && !diag::RETIRED.contains(&name.as_str()) {
-            return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))));
+            return Err(Diag::new(*span, format!("unknown lint `{}` (known: {})", name, diag::LINTS.join(", "))).into());
         }
     }
     vmexpand::expand(sm, &mut modules, opts.jit)?;
@@ -354,7 +357,9 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
     c.generated_files = sm.files.iter().enumerate().filter(|(_, f)| f.generated.is_some()).map(|(i, _)| i as u32).collect();
     c.dispatch_override = opts.dispatch;
     c.table_in_state = opts.target.as_ref().map_or(codegen::Arch::host(), |t| t.arch) == codegen::Arch::AArch64;
-    c.run()?;
+    // Checking goes on past errors in bodies; the passes after it run
+    // only on a program that checked.
+    c.run_all().map_err(Diags)?;
     // References into objects that a store could skip the write barrier
     // through (src/objref.rs).
     let safe_files: std::collections::HashSet<u32> = modules
@@ -363,12 +368,12 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         .flat_map(|m| m.items.iter().filter_map(|it| if let ast::Item::Fn(f) = it { Some(f.name.span.file) } else { None }))
         .collect();
     let unsafe_spans = std::mem::take(&mut c.unsafe_spans);
-    objref::check(&mut c.prog, &objref::Ctx { safe_files: &safe_files, unsafe_spans: &unsafe_spans }, sm)?;
+    objref::check(&mut c.prog, &objref::Ctx { safe_files: &safe_files, unsafe_spans: &unsafe_spans }, sm).map_err(Diags)?;
     // Pointers into containers used after the container may have moved
     // or freed them (src/lifetimes.rs).
     // On for every module but those with `#![lifetimes(off)]`.
     let unchecked_files: std::collections::HashSet<u32> = modules.iter().filter(|m| !m.lifetimes).map(|m| m.file).collect();
-    lifetimes::check(&c.prog, &lifetimes::Ctx { unchecked_files: &unchecked_files, unsafe_spans: &unsafe_spans }, sm)?;
+    lifetimes::check(&c.prog, &lifetimes::Ctx { unchecked_files: &unchecked_files, unsafe_spans: &unsafe_spans }, sm).map_err(Diags)?;
     if let Some(a) = &c.safety_audit {
         // `LOIMI_SAFETY_AUDIT=1`: raw-pointer operations by module and kind.
         let a = a.borrow();
@@ -402,7 +407,8 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         return Err(Diag::new(
             Span { file: u32::MAX, lo: 0, hi: 0 },
             format!("{} warning{} treated as error{} (-W error)", n, if n == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" }),
-        ));
+        )
+        .into());
     }
     if opts.explain_values {
         print!("{}", values::explain(&c));
@@ -449,7 +455,8 @@ fn compile(sm: &mut SourceMap, opts: &Opts) -> Result<(String, Option<String>, O
         return Err(Diag::new(
             Span { file: u32::MAX, lo: 0, hi: 0 },
             "no `main` function (build a library with --lib or --shared)",
-        ));
+        )
+        .into());
     }
     let jit = if opts.jit {
         let vi = jitgen::jit_vm(&prog).map_err(|e| Diag::new(Span { file: u32::MAX, lo: 0, hi: 0 }, e))?;
@@ -662,6 +669,7 @@ fn parse_args() -> Result<Opts, String> {
         sysroot: std::env::var_os("LOIMI_SYSROOT").filter(|s| !s.is_empty()).map(PathBuf::from),
         cfg: vec![],
         cpu: None,
+        max_errors: diag::MAX_ERRORS,
     };
     // `LOIMI_CPU`: a default for `--cpu` (for running whole test suites
     // for one CPU).
@@ -704,6 +712,14 @@ fn parse_args() -> Result<Opts, String> {
             s if s.starts_with("--sysroot=") => o.sysroot = Some(PathBuf::from(&s["--sysroot=".len()..])),
             "--cfg" => o.cfg.push(args.next().ok_or("--cfg needs a name")?),
             s if s.starts_with("--cfg=") => o.cfg.push(s["--cfg=".len()..].to_string()),
+            "--max-errors" => {
+                let n = args.next().ok_or("--max-errors needs a number")?;
+                o.max_errors = n.parse().map_err(|_| format!("--max-errors takes a number, not `{}`", n))?;
+            }
+            s if s.starts_with("--max-errors=") => {
+                let n = &s["--max-errors=".len()..];
+                o.max_errors = n.parse().map_err(|_| format!("--max-errors takes a number, not `{}`", n))?;
+            }
             "--vm-stats" => o.vm_stats = true,
             "--gc-check-roots" => o.gc_check_roots = true,
             "--explain-values" => o.explain_values = true,
@@ -806,8 +822,8 @@ fn compiler_main() -> ExitCode {
     let mut sm = SourceMap::default();
     let (mut ir, header, jit, llvm_args, frame_sites) = match compile(&mut sm, &opts) {
         Ok(r) => r,
-        Err(d) => {
-            eprint!("{}", sm.render(&d));
+        Err(Diags(ds)) => {
+            eprint!("{}", sm.render_all(&ds, opts.max_errors));
             return ExitCode::from(1);
         }
     };

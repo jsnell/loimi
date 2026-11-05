@@ -52,6 +52,20 @@ impl Diag {
 
 pub type Res<T> = Result<T, Diag>;
 
+/// The errors of a build: one from a pass that stops at its first, or
+/// all those a pass that goes on past errors found.
+#[derive(Debug)]
+pub struct Diags(pub Vec<Diag>);
+
+impl From<Diag> for Diags {
+    fn from(d: Diag) -> Diags {
+        Diags(vec![d])
+    }
+}
+
+/// The default of `--max-errors`.
+pub const MAX_ERRORS: usize = 20;
+
 pub struct SourceFile {
     pub path: String,
     pub text: String,
@@ -167,6 +181,30 @@ impl SourceMap {
             let _ = writeln!(out, "{:>5} | {}", line, text);
             let _ = writeln!(out, "      | {}{} {}", " ".repeat(col - 1), "^".repeat(width), label);
         }
+    }
+
+    /// A build's errors: in source order (where they point in the user's
+    /// source), each place once, at most `max` of them (0: all), then
+    /// how many there were if more than one.
+    pub fn render_all(&self, ds: &[Diag], max: usize) -> String {
+        let key = |d: &Diag| {
+            let s = self.user_span(d.span);
+            (self.files.get(s.file as usize).map_or("", |f| f.path.as_str()), s.lo, s.hi)
+        };
+        let mut v: Vec<&Diag> = ds.iter().collect();
+        v.sort_by_key(|d| key(d));
+        v.dedup_by(|a, b| key(a) == key(b));
+        let mut out = String::new();
+        let shown = if max == 0 { v.len() } else { v.len().min(max) };
+        for d in &v[..shown] {
+            out.push_str(&self.render(d));
+        }
+        if v.len() > shown {
+            let _ = writeln!(out, "error: {} errors; the first {} are shown (--max-errors N shows more, 0 all)", v.len(), shown);
+        } else if v.len() > 1 {
+            let _ = writeln!(out, "error: {} errors", v.len());
+        }
+        out
     }
 
     pub fn render(&self, d: &Diag) -> String {

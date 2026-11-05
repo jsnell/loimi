@@ -793,9 +793,14 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         collects: None,
     });
 
-    // Bodies.
+    // Bodies. Each is checked whatever the others' errors (recorded in
+    // `c.errors`); the checks of the vm as a whole after them stop at
+    // the first error.
+    let before = c.errors.len();
     for (fid, f) in fn_decls {
-        check_vm_fn(c, vm, fid, &f)?;
+        if let Err(d) = check_vm_fn(c, vm, fid, &f) {
+            c.errors.push(d);
+        }
     }
     // A vm function calling one whose calls are synced has those effects
     // too (for rooting at its own call sites).
@@ -813,28 +818,48 @@ pub fn check_vm(c: &mut Checker, i: usize) -> Res<()> {
         }
     }
     for j in 0..c.vms[i].never_fns.len() {
-        check_never_fn(c, vm, j)?;
+        if let Err(d) = check_never_fn(c, vm, j) {
+            c.errors.push(d);
+        }
     }
     for k in 0..c.vms[i].ops.len() {
-        check_handler(c, vm, k)?;
+        if let Err(d) = check_handler(c, vm, k) {
+            c.errors.push(d);
+            continue;
+        }
         // The resume functions its parts asked for (which may ask for
         // more: a resume function's parts call shared copies too).
         while let Some(j) = (0..c.prog.vms[i].ops[k].resume.len())
             .find(|&j| c.prog.vms[i].ops[k].resume[j].is_some_and(|f| c.prog.fns[f as usize].body.is_none()))
         {
-            check_resume(c, vm, k, j)?;
+            if let Err(d) = check_resume(c, vm, k, j) {
+                c.errors.push(d);
+                break;
+            }
         }
     }
     shared_conts(c, i);
     for (fid, e) in entries {
-        check_entry(c, vm, fid, &e)?;
+        if let Err(d) = check_entry(c, vm, fid, &e) {
+            c.errors.push(d);
+        }
     }
     if let (Some(fid), Some(r)) = (raise_fid, &d.on_raise) {
-        check_raise(c, vm, fid, r)?;
+        if let Err(d) = check_raise(c, vm, fid, r) {
+            c.errors.push(d);
+        }
     }
-    check_const_writes(c, i)?;
-    check_pc_writes(c, i)?;
+    // These read the bodies: after an error in one, what they find may
+    // follow from it (a statement left out), so they are not reported.
+    let failed = c.errors.len() > before;
+    let r = check_const_writes(c, i).and_then(|_| check_pc_writes(c, i));
+    if !failed {
+        r?;
+    }
     check_variants(c, &d, i, &prefix, cc)?;
+    if failed || c.errors.len() > before {
+        return Ok(());
+    }
     check_collects(c, &d, i)?;
     check_shared_next(c, i)
 }
@@ -931,6 +956,7 @@ fn check_wrapper(c: &mut Checker, vm: u32, fid: FnId, k: usize, before: &Block) 
     let m = info.module;
     let opcode = info.ops[k].opcode;
     let mut cx = FnCx::new(m, info.ret.clone());
+    cx.recover = true;
     let state = declare_state(c, vm, &mut cx);
     let opc = cx.declare("opcode", Ty::Int(IntTy::U32), false);
     cx.vm = Some(HandlerCx { op: Some(k), ..HandlerCx::new(vm, state.clone()) });
@@ -965,6 +991,7 @@ fn check_never_fn(c: &mut Checker, vm: u32, j: usize) -> Res<()> {
     let pcaches = nf.caches.clone();
     let shared = nf.shared;
     let mut cx = FnCx::new(m, info.ret.clone());
+    cx.recover = true;
     cx.fn_name = decl.name.name.clone();
     let state = declare_state(c, vm, &mut cx);
     let span = decl.name.span;
@@ -1153,6 +1180,7 @@ fn check_vm_fn(c: &mut Checker, vm: u32, fid: FnId, f: &FnDecl) -> Res<()> {
     let st = info.state.clone();
     let ret = c.prog.fns[fid as usize].ret.clone();
     let mut cx = FnCx::new(m, ret.clone());
+    cx.recover = true;
     cx.effects = c.prog.fns[fid as usize].effects;
     cx.fn_name = f.name.name.clone();
     let mut params = Vec::new();
@@ -1260,6 +1288,7 @@ fn check_parts(c: &mut Checker, vm: u32, k: usize, start: usize, fid: FnId) -> R
     let fwd = info.ops[k].fwd.clone();
     let ret = info.ret.clone();
     let mut cx = FnCx::new(m, ret);
+    cx.recover = true;
     let state = declare_state(c, vm, &mut cx);
     let mut exprs = Vec::new();
     let n = parts.len();
@@ -1426,6 +1455,7 @@ fn check_entry(c: &mut Checker, vm: u32, fid: FnId, e: &EntryDecl) -> Res<()> {
     let m = info.module;
     let ret = info.ret.clone();
     let mut cx = FnCx::new(m, ret.clone());
+    cx.recover = true;
     cx.effects = c.prog.fns[fid as usize].effects;
     cx.fn_name = e.name.name.clone();
     let mut params = Vec::new();
@@ -1458,6 +1488,7 @@ fn check_raise(c: &mut Checker, vm: u32, fid: FnId, r: &RaiseDecl) -> Res<()> {
     let m = info.module;
     let rt = info.raise_ty.clone().unwrap();
     let mut cx = FnCx::new(m, info.ret.clone());
+    cx.recover = true;
     let state = declare_state(c, vm, &mut cx);
     let err = cx.declare(&r.param.name.name, rt.clone(), true);
     cx.vm = Some(HandlerCx::new(vm, state.clone()));

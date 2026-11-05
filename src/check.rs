@@ -64,6 +64,19 @@ pub struct FnCx {
     pub block_use: bool,
     /// Inside a closure body: the closure's type (for messages).
     pub closure_ty: Option<Ty>,
+    /// Error recovery (`Checker::errors`): a block records the error of a
+    /// statement and goes on with the next one. Off in speculative
+    /// checks (probes, and checks retried on error), whose errors are
+    /// part of their result.
+    pub recover: bool,
+    /// Locals bound by a statement that failed (or that read one): they
+    /// have type `never`, and an error in a statement that reads one is
+    /// not reported, since it may follow from the first.
+    pub poison: Vec<LocalId>,
+    /// Set by `lookup` when it finds a poisoned local, and by a block
+    /// that recorded an error: the statement being checked depends on an
+    /// error already reported. Shared with probes.
+    pub tainted: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl FnCx {
@@ -81,6 +94,9 @@ impl FnCx {
             unsafe_depth: 0,
             block_use: false,
             closure_ty: None,
+            recover: false,
+            poison: vec![],
+            tainted: Default::default(),
         }
     }
     pub fn declare(&mut self, name: &str, ty: Ty, mutable: bool) -> LocalId {
@@ -104,6 +120,9 @@ impl FnCx {
             unsafe_depth: self.unsafe_depth,
             block_use: false,
             closure_ty: self.closure_ty.clone(),
+            recover: false,
+            poison: self.poison.clone(),
+            tainted: self.tainted.clone(),
         }
     }
     /// A local not visible by name.
@@ -116,6 +135,9 @@ impl FnCx {
         for s in self.scopes.iter().rev() {
             for (n, id) in s.iter().rev() {
                 if n == name {
+                    if !self.poison.is_empty() && self.poison.contains(id) {
+                        self.tainted.set(true);
+                    }
                     return Some(*id);
                 }
             }
@@ -154,6 +176,10 @@ pub struct Checker<'a> {
     /// Warnings, in the order found (deduplicated by span: handler
     /// bodies can be checked more than once).
     pub warnings: Vec<Diag>,
+    /// Errors recorded so that checking can go on (function bodies,
+    /// handlers, statements: `run_all`). Errors of the passes that later
+    /// ones depend on (names, types, signatures) are returned instead.
+    pub errors: Vec<Diag>,
     /// Declaring a signature-only function (an instance over opaque type
     /// parameters, or a trait method without a default): no body needed.
     pub sig_only: bool,
@@ -277,6 +303,7 @@ impl<'a> Checker<'a> {
             object_count: 0,
             aliases: vec![],
             warnings: vec![],
+            errors: vec![],
             sig_only: false,
             closure_count: 0,
             unsafe_fns: Default::default(),
@@ -332,6 +359,21 @@ impl<'a> Checker<'a> {
     /// The value (function, const, global) named `name` in module `m`.
     pub fn value_def(&self, m: usize, name: &str) -> Option<(Def, bool)> {
         self.values[m].get(name).cloned()
+    }
+
+    /// Check the program, going on past errors where later checks do not
+    /// depend on what failed: every function body and every vm handler
+    /// is checked, and inside a body every statement. All errors found,
+    /// or none.
+    pub fn run_all(&mut self) -> Result<(), Vec<Diag>> {
+        if let Err(d) = self.run() {
+            self.errors.push(d);
+        }
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
     }
 
     pub fn run(&mut self) -> Res<()> {
@@ -606,9 +648,28 @@ impl<'a> Checker<'a> {
         for (id, m, f) in fn_decls {
             self.pending.push((id, m, f, vec![]));
         }
+        // Bodies are independent of each other: an error in one is
+        // recorded and the next is checked.
         while let Some((id, m, f, env)) = self.pending.pop() {
-            self.check_against_bounds(id).map_err(|d| self.instance_note(d, id))?;
-            self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)).map_err(|d| self.instance_note(d, id))?;
+            let before = self.errors.len();
+            let r = self.check_against_bounds(id).and_then(|_| self.with_tenv(env, |c| c.check_fn_body(id, m, &f, None)));
+            if let Err(d) = r {
+                self.errors.push(d);
+            }
+            if self.errors.len() > before {
+                // An instance of a generic function: its first error only
+                // (the others may follow from the type arguments).
+                if self.generics.fn_site.contains_key(&id) {
+                    self.errors.truncate(before + 1);
+                }
+                for i in before..self.errors.len() {
+                    let d = std::mem::replace(&mut self.errors[i], Diag::new(Span::default(), ""));
+                    self.errors[i] = self.instance_note(d, id);
+                }
+            }
+        }
+        if !self.errors.is_empty() {
+            return Ok(());
         }
         // `export "C" const`s, for the header.
         for id in 0..self.consts.len() {
@@ -915,6 +976,7 @@ impl<'a> Checker<'a> {
             params.push(cx.declare(&p.name.name, t.clone(), true));
         }
         let ret = def.ret.clone();
+        cx.recover = true;
         let b = self.block(&mut cx, body, Some(&ret))?;
         let b = self.coerce(b, &ret)?;
         let fd = &mut self.prog.fns[id as usize];
@@ -1463,17 +1525,92 @@ impl<'a> Checker<'a> {
         let mut stmts = Vec::new();
         let mut tail = None;
         let mut diverges = false;
+        // With recovery: a statement's error was recorded (or follows
+        // from one already reported).
+        let mut failed = false;
+        let outer_taint = cx.recover && cx.tainted.replace(false);
         let n = b.stmts.len();
         for (i, s) in b.stmts.iter().enumerate() {
+            if !cx.recover {
+                self.stmt(cx, s, i + 1 == n, exp, &mut stmts, &mut tail, &mut diverges)?;
+                continue;
+            }
+            let mark = CxMark::new(cx);
+            let taint = cx.tainted.replace(false);
+            let r = self.stmt(cx, s, i + 1 == n, exp, &mut stmts, &mut tail, &mut diverges);
+            let tainted = cx.tainted.get();
+            match r {
+                Ok(()) => {
+                    // A binding computed from a poisoned local is poisoned.
+                    if tainted {
+                        if let (Stmt::Let { .. }, Some(TStmt::Let(..) | TStmt::LetPat(..))) = (s, stmts.last()) {
+                            let to = cx.locals.len() as LocalId;
+                            cx.poison.extend(mark.locals..to);
+                        }
+                    }
+                }
+                Err(d) => {
+                    mark.restore(cx);
+                    if !tainted {
+                        self.errors.push(d);
+                    }
+                    failed = true;
+                    // What the statement binds is poisoned: declared (so
+                    // that it still shadows) with type `never`.
+                    if let Stmt::Let { pat, ty, .. } = s {
+                        let annotated = match (&pat.kind, ty) {
+                            (PatKind::Ident(..), Some(t)) => self.resolve_type(cx.module, t).ok(),
+                            _ => None,
+                        };
+                        let mut names = Vec::new();
+                        pat_names(pat, &mut names);
+                        for name in names {
+                            match &annotated {
+                                Some(t) => {
+                                    cx.declare(&name, t.clone(), true);
+                                }
+                                None => {
+                                    let id = cx.declare(&name, Ty::Never, true);
+                                    cx.poison.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx.tainted.set(taint || tainted);
+        }
+        if cx.recover {
+            let t = cx.tainted.get() || failed;
+            cx.tainted.set(outer_taint || t);
+            if failed {
+                // Its type is unknown: `never` fits any context, so the
+                // enclosing code is checked without errors that follow
+                // from this one.
+                return Ok(mk(Ty::Never, TK::Block(stmts, None), b.span));
+            }
+        }
+        let ty = match &tail {
+            Some(t) => t.ty.clone(),
+            None if diverges => Ty::Never,
+            None => Ty::Unit,
+        };
+        Ok(mk(ty, TK::Block(stmts, tail), b.span))
+    }
+
+    /// One statement of a block (`last`: the block's last).
+    #[allow(clippy::too_many_arguments)]
+    fn stmt(&mut self, cx: &mut FnCx, s: &Stmt, last: bool, exp: Option<&Ty>, stmts: &mut Vec<TStmt>, tail: &mut Option<Box<TExpr>>, diverges: &mut bool) -> Res<()> {
+        {
             match s {
-                Stmt::Expr { expr, semi: false } if i == n - 1 => {
+                Stmt::Expr { expr, semi: false } if last => {
                     let e = self.expr(cx, expr, exp)?;
-                    tail = Some(Box::new(e));
+                    *tail = Some(Box::new(e));
                 }
                 Stmt::Expr { expr, .. } => {
                     let e = self.expr(cx, expr, None)?;
                     if e.ty == Ty::Never {
-                        diverges = true;
+                        *diverges = true;
                     }
                     stmts.push(TStmt::Expr(e));
                 }
@@ -1508,7 +1645,11 @@ impl<'a> Checker<'a> {
                             // the enclosing function's.
                             let want = |eff| Ty::Block(vec![Ty::Param(HOLE); ps.len()], Box::new(Ty::Param(HOLE)), eff);
                             let (nscopes, nloops) = (cx.scopes.len(), cx.loops.len());
-                            match self.block_arg(cx, e, &want(0)) {
+                            // Speculative: its error is the reason to retry.
+                            let recover = std::mem::replace(&mut cx.recover, false);
+                            let first = self.block_arg(cx, e, &want(0));
+                            cx.recover = recover;
+                            match first {
                                 Ok(v) => Some(v),
                                 Err(_) if cx.effects != 0 => {
                                     cx.scopes.truncate(nscopes);
@@ -1529,7 +1670,7 @@ impl<'a> Checker<'a> {
                     };
                     if let Some(init) = &init {
                         if init.ty == Ty::Never {
-                            diverges = true;
+                            *diverges = true;
                         }
                     }
                     let simple = matches!(&pat.kind, PatKind::Ident(name, _) if !self.names_unit_variant(name, init.as_ref().map(|e| &e.ty).or(decl_ty.as_ref())));
@@ -1574,12 +1715,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let ty = match &tail {
-            Some(t) => t.ty.clone(),
-            None if diverges => Ty::Never,
-            None => Ty::Unit,
-        };
-        Ok(mk(ty, TK::Block(stmts, tail), b.span))
+        Ok(())
     }
 
     fn names_unit_variant(&self, name: &str, ty: Option<&Ty>) -> bool {
@@ -2353,21 +2489,27 @@ impl<'a> Checker<'a> {
                 let id = self.push_loop(cx, false);
                 cx.scopes.push(vec![]);
                 let user = cx.declare(&var.name, ity.clone(), false);
+                // A range of literals is i64: say so where a mismatch may
+                // come from it (also on the errors the body recorded).
+                let literal_range = ann.is_none() && is_literal_expr(lo) && is_literal_expr(hi);
+                let before = self.errors.len();
                 let b = self.block(cx, body, Some(&Ty::Unit));
                 cx.scopes.pop();
                 cx.loops.pop();
                 cx.scopes.pop();
-                // A range of literals is i64: say so where a mismatch may
-                // come from it.
-                let literal_range = ann.is_none() && is_literal_expr(lo) && is_literal_expr(hi);
-                let b = b.map_err(|d| {
-                    if literal_range && d.msg.starts_with("mismatched types") && d.msg.contains(&format!("`{}`", self.ty_name(&ity))) {
-                        let t = self.ty_name(&ity);
+                let note = |c: &Self, d: Diag| {
+                    if literal_range && d.msg.starts_with("mismatched types") && d.msg.contains(&format!("`{}`", c.ty_name(&ity))) {
+                        let t = c.ty_name(&ity);
                         d.note(lo.span.to(hi.span), format!("`{}` is `{}`: its range has only literals; write `for {}: T in ..` for another type", var.name, t, var.name))
                     } else {
                         d
                     }
-                })?;
+                };
+                for i in before..self.errors.len() {
+                    let d = std::mem::replace(&mut self.errors[i], Diag::new(Span::default(), ""));
+                    self.errors[i] = note(self, d);
+                }
+                let b = b.map_err(|d| note(self, d))?;
                 let local = |id| mk(ity.clone(), TK::Local(id), span);
                 let cond = mk(Ty::Bool, TK::Binary(BinOp::Lt, Box::new(local(ctr)), Box::new(local(end))), span);
                 let inner = mk(
@@ -2529,25 +2671,35 @@ impl<'a> Checker<'a> {
             ExprKind::Match(scrut, arms) => c.match_expr(cx, scrut, arms, exp, e.span),
             _ => unreachable!(),
         };
-        let err = match check(self, cx, None) {
-            Ok(v) => return Ok(v),
-            Err(d) => d,
-        };
-        if !err.msg.starts_with("cannot infer") {
-            return Err(err);
+        // With recovery, a branch's error is recorded rather than returned:
+        // a recorded "cannot infer" is a reason to check again too. The
+        // errors of the first check are dropped if the second succeeds.
+        let before = self.errors.len();
+        let taint = cx.tainted.get();
+        let first = check(self, cx, None);
+        let infer = |d: &Diag| d.msg.starts_with("cannot infer");
+        if !(matches!(&first, Err(d) if infer(d)) || self.errors[before..].iter().any(infer)) {
+            return first;
         }
+        let errs: Vec<Diag> = self.errors.drain(before..).collect();
+        let first_taint = cx.tainted.replace(taint);
         cx.scopes.truncate(nscopes);
         cx.loops.truncate(nloops);
         let guess = self.guess_ty(cx, e);
         if has_hole(&guess) {
-            return Err(err);
+            self.errors.extend(errs);
+            cx.tainted.set(first_taint);
+            return first;
         }
         match check(self, cx, Some(&guess)) {
             Ok(v) => Ok(v),
             Err(_) => {
+                self.errors.truncate(before);
+                self.errors.extend(errs);
+                cx.tainted.set(first_taint);
                 cx.scopes.truncate(nscopes);
                 cx.loops.truncate(nloops);
-                Err(err)
+                first
             }
         }
     }
@@ -5000,4 +5152,62 @@ pub fn wrap_int(v: i128, it: IntTy) -> i128 {
     let mask: i128 = if bits >= 128 { -1 } else { (1i128 << bits) - 1 };
     let u = v & mask;
     if it.signed && u > it.max() { u - (1i128 << bits) } else { u }
+}
+
+/// What a statement that fails may leave changed in a `FnCx`, to undo
+/// when checking goes on after it.
+struct CxMark {
+    locals: LocalId,
+    scopes: usize,
+    last_scope: usize,
+    loops: usize,
+    unsafe_depth: u32,
+    ret: Ty,
+    effects: u8,
+    closure_ty: Option<Ty>,
+    vm: Option<crate::vmcheck::HandlerCx>,
+}
+
+impl CxMark {
+    fn new(cx: &FnCx) -> CxMark {
+        CxMark {
+            locals: cx.locals.len() as LocalId,
+            scopes: cx.scopes.len(),
+            last_scope: cx.scopes.last().map_or(0, |s| s.len()),
+            loops: cx.loops.len(),
+            unsafe_depth: cx.unsafe_depth,
+            ret: cx.ret.clone(),
+            effects: cx.effects,
+            closure_ty: cx.closure_ty.clone(),
+            vm: cx.vm.clone(),
+        }
+    }
+    fn restore(self, cx: &mut FnCx) {
+        cx.scopes.truncate(self.scopes);
+        if let Some(s) = cx.scopes.last_mut() {
+            s.truncate(self.last_scope);
+        }
+        cx.loops.truncate(self.loops);
+        cx.unsafe_depth = self.unsafe_depth;
+        cx.ret = self.ret;
+        cx.effects = self.effects;
+        cx.closure_ty = self.closure_ty;
+        cx.vm = self.vm;
+        cx.block_use = false;
+    }
+}
+
+/// The names a `let` pattern binds (by the convention that variants are
+/// capitalized, so that a poisoned binding does not shadow `None`).
+fn pat_names(p: &Pat, out: &mut Vec<String>) {
+    match &p.kind {
+        PatKind::Ident(n, _) if n.starts_with(|c: char| c.is_lowercase() || c == '_') => out.push(n.clone()),
+        PatKind::Variant(_, Some(ps)) | PatKind::Tuple(ps) => ps.iter().for_each(|q| pat_names(q, out)),
+        PatKind::Or(ps) => {
+            if let Some(q) = ps.first() {
+                pat_names(q, out)
+            }
+        }
+        _ => {}
+    }
 }

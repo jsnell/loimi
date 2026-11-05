@@ -16,6 +16,9 @@
 //!   // matrix: check-roots     run as is and built with --gc-check-roots
 //!   // env: K=V ...            environment of the program (e.g. LOIMI_JIT=1)
 //!   // error: <text>           (tests/fail) substring of the compile error
+//!   // errors: <n>             (tests/fail) exactly n errors are reported
+//!                              (checking goes on past errors; none may be
+//!                              a cascade of another)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +199,19 @@ fn run_programs_with(xenv: &[(String, String)], select: impl Fn(&str, &str) -> b
     }
 }
 
+/// The errors in a compiler's output: `error: ..` and `error[lint]: ..`
+/// lines, but not the closing count (`error: 3 errors`).
+fn error_count(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("error:") || l.starts_with("error["))
+        .filter(|l| {
+            let r = l.trim_start_matches("error: ");
+            !(r.ends_with(" errors") && r.trim_end_matches(" errors").parse::<usize>().is_ok()) && !r.contains("are shown (--max-errors")
+        })
+        .count()
+}
+
 #[test]
 fn compile_errors() {
     let mut failures = Vec::new();
@@ -216,6 +232,13 @@ fn compile_errors() {
         for w in &want {
             if !stderr.contains(w.as_str()) {
                 failures.push(format!("{}: error lacks `{}`:\n{}", name, w, stderr));
+            }
+        }
+        if let Some(n) = directives(&text, "errors").first() {
+            let n: usize = n.trim().parse().expect("`// errors:` takes a number");
+            let got = error_count(&stderr);
+            if got != n {
+                failures.push(format!("{}: {} errors reported, expected {}:\n{}", name, got, n, stderr));
             }
         }
     }

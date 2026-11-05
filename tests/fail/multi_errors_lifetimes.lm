@@ -1,0 +1,25 @@
+// The lifetimes check runs on a program that type-checked, and reports
+// the first error of each function.
+#![safe]
+import std.mem;
+fn one(v: *mem.Vec<u64>) -> u64 {
+    let s = v.items();
+    v.push(2);
+    s[0]
+}
+fn two() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    let s = v.items();
+    v.push(2);
+    let x = s[0];
+}
+fn main() {
+    var v: mem.Vec<u64> = mem.Vec.new();
+    v.push(1);
+    one(&v);
+    two();
+}
+// errors: 2
+// error: multi_errors_lifetimes.lm:8:5
+// error: multi_errors_lifetimes.lm:15:13
