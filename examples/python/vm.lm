@@ -469,6 +469,9 @@ pub vm Py {
     fn gc_point() {
         if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); } }
     }
+    /// `#[poll(gc)]`: collect at the start of an op that allocates, then
+    /// run it again (nothing before the poll has happened yet).
+    poll gc { if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } } }
 
     // ── moves and constants ─────────────────────────────────────────
 
@@ -552,8 +555,7 @@ pub vm Py {
 
     // ── cells (closures) ────────────────────────────────────────────
 
-    op MAKECELL(r: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op MAKECELL(r: reg) : ABC {
         r = Cell(new(&ctx.heap, value.Cell { v: r }));
         next
     }
@@ -768,7 +770,10 @@ pub vm Py {
 
     /// CALL_NEW: a call of a class (user classes) whose __init__ takes the
     /// arguments as they are; CALL_M1: a one-argument math function. Both
-    /// were paths of the generic op's cold block.
+    /// were paths of the generic op's cold block. (CALL_NEW redoes as
+    /// CALL after `ensure`, which only ever raises the stack's high-water
+    /// mark: CALL raises it again, to the same height.)
+    #[allow(redo_effect)]
     family CALL(base: reg, n: nargs) : ABC {
         generic {
             if let Func(f) = base {
@@ -889,18 +894,15 @@ pub vm Py {
     }
     /// CALL with keyword arguments: the last len(K[kw]) of the n
     /// arguments are named by the tuple K[kw].
-    op CALLKW(base: reg, n: nargs, kw: kst) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op CALLKW(base: reg, n: nargs, kw: kst) : ABC {
         call_slow(base.raw, base.raw + 1, n as u64, kw)
     }
-    op CALLMETHODKW(base: reg, n: imm, kw: kst) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op CALLMETHODKW(base: reg, n: imm, kw: kst) : ABC {
         if regs[base.raw + 1] != Undef { call_slow(base.raw, base.raw + 1, n as u64 + 1, kw) }
         call_slow(base.raw, base.raw + 2, n as u64, kw)
     }
     /// R[base](*R[base+1], **R[base+2]) (R[base+2] may be None).
-    op CALLEX(base: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op CALLEX(base: reg) : ABC {
         let (n, kw) = ops.spread_args(ctx, regs + base.raw + 1)?;
         call_slow(base.raw, base.raw + 1, n, kw)
     }
@@ -1193,29 +1195,24 @@ pub vm Py {
     }
     op DELINDEX(obj: reg, key: reg) : ABC { ops.delindex(ctx, obj, key)?; next }
     /// R[dst] = R[obj][R[lo]:R[lo+1]:R[lo+2]]
-    op GETSLICE(dst: reg, obj: reg, lo: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op GETSLICE(dst: reg, obj: reg, lo: reg) : ABC {
         dst = ops.getslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2])?;
         next
     }
-    op SETSLICE(obj: reg, lo: reg, src: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op SETSLICE(obj: reg, lo: reg, src: reg) : ABC {
         ops.setslice(ctx, obj, lo, regs[lo.raw + 1], regs[lo.raw + 2], src)?;
         next
     }
-    op NEWLIST(dst: reg, base: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op NEWLIST(dst: reg, base: reg, n: imm) : ABC {
         dst = List(value.list_of(&ctx.heap, (regs + base.raw).slice(n)));
         next
     }
-    op NEWTUPLE(dst: reg, base: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op NEWTUPLE(dst: reg, base: reg, n: imm) : ABC {
         dst = Tuple(value.tuple_of(&ctx.heap, (regs + base.raw).slice(n)));
         next
     }
     /// R[dst] = {R[base]: R[base+1], ...} (n pairs)
-    op NEWDICT(dst: reg, base: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op NEWDICT(dst: reg, base: reg, n: imm) : ABC {
         let d = value.new_dict(&ctx.heap, n);
         for i in 0..n {
             ops.dict_put(ctx, d, regs[base.raw + 2 * i], regs[base.raw + 2 * i + 1])?;
@@ -1223,8 +1220,7 @@ pub vm Py {
         dst = Dict(d);
         next
     }
-    op NEWSET(dst: reg, base: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op NEWSET(dst: reg, base: reg, n: imm) : ABC {
         let s = ops.new_set(ctx, false);
         for i in 0..n { ops.set_add(ctx, s, regs[base.raw + i])?; }
         dst = s;
@@ -1245,20 +1241,17 @@ pub vm Py {
         }
     }
     /// list.extend for [*a] and f(*a): R[l] must be a list.
-    op LISTEXTEND(l: reg, v: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op LISTEXTEND(l: reg, v: reg) : ABC {
         ops.list_extend(ctx, l, v)?;
         next
     }
     op SETADD(s: reg, v: reg) : ABC { gc_point(); ops.set_add(ctx, s, v)?; next }
-    op DICTSET(d: reg, key: reg, v: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op DICTSET(d: reg, key: reg, v: reg) : ABC {
         let x = d as! Dict;
         ops.dict_put(ctx, x, key, v)?;
         next
     }
-    op TOTUPLE(dst: reg, src: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op TOTUPLE(dst: reg, src: reg) : ABC {
         let l = src as! List;
         dst = Tuple(value.tuple_of(&ctx.heap, l.arr.items[0..l.len]));
         next
@@ -1277,8 +1270,7 @@ pub vm Py {
     }
     /// Starred unpack: n = before | (after << 4); the starred list goes
     /// between them.
-    op UNPACKEX(base: reg, src: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op UNPACKEX(base: reg, src: reg, n: imm) : ABC {
         ops.unpack(ctx, src, regs + base.raw, n & 15, n >> 4)?;
         next
     }
@@ -1287,26 +1279,22 @@ pub vm Py {
 
     /// R[dst] = format(R[v], R[spec]) after conversion `conv` ('r', 's', 'a' or 0);
     /// spec register 255 means no spec.
-    op FORMAT(dst: reg, v: reg, spec: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op FORMAT(dst: reg, v: reg, spec: imm) : ABC {
         dst = ops.format_field(ctx, v, if spec == 255 { Nil } else { regs[spec] }, 0)?;
         next
     }
-    op CONVERT(dst: reg, v: reg, conv: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op CONVERT(dst: reg, v: reg, conv: imm) : ABC {
         dst = ops.convert(ctx, v, conv)?;
         next
     }
-    op BUILDSTR(dst: reg, base: reg, n: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op BUILDSTR(dst: reg, base: reg, n: imm) : ABC {
         dst = ops.join_strs(ctx, regs + base.raw, n);
         next
     }
 
     // ── iteration ───────────────────────────────────────────────────
 
-    op GETITER(dst: reg, src: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op GETITER(dst: reg, src: reg) : ABC {
         match src {
             List(_) | Tuple(_) => {
                 let b = value.new_box(&ctx.heap, K_SEQIT, 0);
@@ -1435,20 +1423,17 @@ pub vm Py {
     /// R[dst] = a function of prototype `p`; its defaults are in
     /// R[dst+1 ..] (the prototype says how many), then its kw-only
     /// defaults as a dict or None.
-    op MAKEFUNC(dst: reg, p: pidx) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op MAKEFUNC(dst: reg, p: pidx) : ABx {
         dst = ops.make_func(ctx, fp.func, ctx.protos.at(p), regs, dst.raw)?;
         next
     }
     /// R[dst] = class named R[base] with bases tuple R[base+1] and
     /// namespace R[base+2]; its methods set `hint` attributes on self.
-    op BUILDCLASS(dst: reg, base: reg, hint: imm) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op BUILDCLASS(dst: reg, base: reg, hint: imm) : ABC {
         dst = ops.build_class(ctx, base, regs[base.raw + 1], regs[base.raw + 2], hint as u64)?;
         next
     }
-    op RAISE(e: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op RAISE(e: reg) : ABC {
         let x = ops.make_exc(ctx, e)?;
         raise x
     }
@@ -1458,13 +1443,11 @@ pub vm Py {
         dst = Bool(ops.exc_match(ctx, e, cls)?);
         next
     }
-    op SUPER(dst: reg, selfv: reg) : ABC {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op SUPER(dst: reg, selfv: reg) : ABC {
         dst = ops.make_super(ctx, fp.func, selfv)?;
         next
     }
-    op IMPORT(dst: reg, name: kst) : ABx {
-        if unlikely(ctx.heap.allocated > ctx.heap.threshold) { cold { gc.collect(&ctx.heap); redo } }
+    #[poll(gc)] op IMPORT(dst: reg, name: kst) : ABx {
         dst = builtins.import_module(ctx, name)?;
         next
     }
